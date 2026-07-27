@@ -1,0 +1,12 @@
+SOLVER Z3 version 5.0.0 - 64 bit
+DIR testdata/smt
+SCRIPT testdata/smt/info_word_disjoint.smt2
+RESULT unsat
+VERDICT PASS
+SCRIPT testdata/smt/info_word.smt2
+RESULT unsat
+VERDICT PASS
+SCRIPT testdata/smt/narrow_span.smt2
+RESULT unsat
+VERDICT PASS
+SUMMARY scripts=3 fail=0

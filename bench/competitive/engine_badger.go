@@ -1,0 +1,307 @@
+package competitive
+
+import (
+	"errors"
+
+	badger "github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
+)
+
+type badgerEngine struct {
+	cfg  Config
+	db   *badger.DB
+	read *badger.Txn
+}
+
+// scanOptions is the iterator configuration every full-corpus walk here uses.
+//
+// PrefetchValues defaults to true, and leaving it on costs Badger a large
+// factor on this corpus. Badger's prefetcher hands each item to a worker pool
+// to have its value resolved ahead of the cursor, which pays when values are
+// large and live in the value log, and does not pay when they are ~250 bytes
+// and already inline in the LSM tables. Leaving it on the default published
+// Badger as the slowest engine in the scan row when it is not.
+// BenchmarkTuning/badger measures the pair; do not quote the effect from here.
+func (b *badgerEngine) scanOptions() badger.IteratorOptions {
+	opt := badger.DefaultIteratorOptions
+	opt.PrefetchValues = b.cfg.Untuned
+	if opt.PrefetchValues {
+		opt.PrefetchSize = 256
+	}
+	return opt
+}
+
+func newBadger(cfg Config) (Engine, error) {
+	mode, err := ResolveDurabilityMode("badger", cfg.Durability)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Durability = mode
+	opt := badger.DefaultOptions(cfg.Dir).
+		// Badger logs to stderr at INFO by default, which would pollute
+		// benchmark output and cost real time during a 100k-document load.
+		WithLogger(nil).
+		// Default is Snappy. None of bbolt, pebble-as-configured, SQLite, or
+		// either vibejson mode compresses, so leaving Badger compressed would
+		// make the bytes-on-disk column incomparable and charge Badger CPU
+		// nobody else pays.
+		WithCompression(options.None).
+		// The default value-log file size is 1 GiB, which Badger mmaps. With
+		// ~250-byte values that reserves three orders of magnitude more
+		// address space than the data needs and distorts RSS badly. 64 MiB
+		// still amortises rotation across the whole corpus.
+		WithValueLogFileSize(64 << 20).
+		// Give Badger the same 64 MiB read-cache budget as everyone else.
+		// With compression and encryption off, Badger's own guidance is to
+		// leave the block cache at zero and let it read from the mmapped
+		// tables directly, so the whole budget goes to the index cache.
+		WithBlockCacheSize(0).
+		WithIndexCacheSize(cfg.CacheBytes).
+		// The harness never runs concurrent conflicting transactions, so
+		// conflict detection is pure overhead here.
+		WithDetectConflicts(false).
+		WithNumVersionsToKeep(1).
+		WithSyncWrites(cfg.Durability == DurabilityOrdinarySync)
+	db, err := badger.Open(opt)
+	if err != nil {
+		return nil, err
+	}
+	return &badgerEngine{cfg: cfg, db: db}, nil
+}
+
+func (b *badgerEngine) Name() string { return "badger" }
+
+func (b *badgerEngine) DurabilityMode() DurabilityMode { return b.cfg.Durability }
+
+func (b *badgerEngine) Durability() string {
+	if b.cfg.Durability == DurabilityOrdinarySync {
+		// NOT matched with the other engines on darwin, and the report must
+		// say so. Badger's log files are mmapped and its Sync is
+		// unix.Msync(MS_SYNC) (ristretto/z/mmap_unix.go), which pushes dirty
+		// pages to the filesystem but does not force the drive to flush its
+		// write cache. bbolt and Pebble issue plain fsync and have the same
+		// limitation. vibejson explicitly issues F_FULLFSYNC, and SQLite is
+		// given PRAGMA fullfsync to match it. Badger exposes no option to
+		// request F_FULLFSYNC, so its sync=true row is not comparable with
+		// those two crash-safe rows.
+		return "SyncWrites=true, but msync(MS_SYNC) only — NOT power-loss comparable with F_FULLFSYNC on darwin"
+	}
+	return "SyncWrites=false, Badger's default (mmap-backed writes are visible without msync; documented for process-crash, not hard-reboot survival)"
+}
+
+func (b *badgerEngine) Tuning() string {
+	return "Logger=nil; Compression=None (to match the uncompressed competitors and make bytes-on-disk comparable); " +
+		"ValueLogFileSize=64 MiB instead of the 1 GiB default, which would otherwise mmap a gigabyte for a 25 MiB corpus; " +
+		"BlockCacheSize=0 with IndexCacheSize=64 MiB, which is Badger's own recommendation when compression is off; " +
+		"DetectConflicts=false (no concurrent transactions here); NumVersionsToKeep=1; " +
+		"IteratorOptions.PrefetchValues=false on every full-corpus walk, against Badger's default of true, because the " +
+		"prefetch worker pool only pays for large value-log-resident values and these are ~250 bytes inline in the LSM " +
+		"tables; point reads run inside one long-lived read transaction rather than opening a badger.Txn per Get, " +
+		"matching the transaction-free read that store/durable's AppendRaw gets (the write path drops it, as a writer " +
+		"must). Both are reverted by Config.Untuned and both effects are measured by BenchmarkTuning/badger, so neither " +
+		"is a claim you have to take on trust"
+}
+
+func (b *badgerEngine) Load(docs []Doc) error {
+	wb := b.db.NewWriteBatch()
+	defer wb.Cancel()
+	for i := range docs {
+		if err := wb.Set([]byte(docs[i].Key), docs[i].JSON); err != nil {
+			return err
+		}
+	}
+	return wb.Flush()
+}
+
+// readTxn lazily opens, and then caches, one read transaction for point reads.
+//
+// It mirrors what bbolt needed and why: store/durable's AppendRaw takes no
+// transaction at all, so charging the competitors a transaction begin/discard
+// per Get measured a difference the API shapes do not actually have.
+//
+// Put drops it, and that is correctness rather than hygiene: a Badger read
+// transaction pins a read timestamp, so a Get issued through one opened before
+// a Put would return the pre-Put value. The read-only workloads never write, so
+// they never observe a stale snapshot; the write workloads never hold one.
+func (b *badgerEngine) readTxn() *badger.Txn {
+	if b.read == nil {
+		b.read = b.db.NewTransaction(false)
+	}
+	return b.read
+}
+
+func (b *badgerEngine) dropReadTxn() {
+	if b.read != nil {
+		b.read.Discard()
+		b.read = nil
+	}
+}
+
+func (b *badgerEngine) Get(dst []byte, key string) ([]byte, error) {
+	if b.cfg.Untuned {
+		// Badger's own idiom: a transaction per read.
+		err := b.db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte(key))
+			if err != nil {
+				return err
+			}
+			dst, err = item.ValueCopy(dst)
+			return err
+		})
+		return dst, err
+	}
+	item, err := b.readTxn().Get([]byte(key))
+	if err != nil {
+		return dst, err
+	}
+	return item.ValueCopy(dst)
+}
+
+func (b *badgerEngine) Put(key string, doc []byte) error {
+	b.dropReadTxn()
+	return b.db.Update(func(txn *badger.Txn) error {
+		rawKey := []byte(key)
+		if _, err := txn.Get(rawKey); err != nil {
+			return err
+		}
+		return txn.Set(rawKey, doc)
+	})
+}
+
+func (b *badgerEngine) Upsert(key string, doc []byte) error {
+	b.dropReadTxn()
+	return b.db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(key), doc)
+	})
+}
+
+func (b *badgerEngine) Delete(key string) error {
+	b.dropReadTxn()
+	return b.db.Update(func(txn *badger.Txn) error {
+		rawKey := []byte(key)
+		if _, err := txn.Get(rawKey); err != nil {
+			return err
+		}
+		return txn.Delete(rawKey)
+	})
+}
+
+func (b *badgerEngine) Scan() (int, error) {
+	n := 0
+	var sink byte
+	err := b.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(b.scanOptions())
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			if err := it.Item().Value(func(v []byte) error {
+				if len(v) > 0 {
+					sink ^= v[0]
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	scanSink ^= sink
+	return n, err
+}
+
+func (b *badgerEngine) ScanAllBytes() (int, error) {
+	n := 0
+	var sink byte
+	err := b.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(b.scanOptions())
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			if err := it.Item().Value(func(v []byte) error {
+				sink ^= touchAll(v)
+				return nil
+			}); err != nil {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	scanSink ^= sink
+	return n, err
+}
+
+func (b *badgerEngine) Visit(fn func(key string, value []byte) error) error {
+	return b.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(b.scanOptions())
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+			if err := item.Value(func(v []byte) error { return fn(key, v) }); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *badgerEngine) FilterCount(value string) (int, error) {
+	needle := jsonScalarNeedle(value)
+	n := 0
+	err := b.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(b.scanOptions())
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			if err := it.Item().Value(func(v []byte) error {
+				ok, err := matchesCountry(v, needle)
+				if err != nil {
+					return err
+				}
+				if ok {
+					n++
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return n, err
+}
+
+func (b *badgerEngine) IndexedCount(string) (int, error) { return 0, ErrNoIndex }
+
+func (b *badgerEngine) DiskBytes() (int64, error) {
+	if err := b.Checkpoint(); err != nil {
+		return 0, err
+	}
+	return dirBytes(b.cfg.Dir)
+}
+
+func (b *badgerEngine) Checkpoint() error { return b.db.Sync() }
+
+func (b *badgerEngine) MaintenanceFloor() error {
+	b.dropReadTxn()
+	if err := b.db.Flatten(2); err != nil {
+		return err
+	}
+	for {
+		err := b.db.RunValueLogGC(0.5)
+		if errors.Is(err, badger.ErrNoRewrite) {
+			return b.db.Sync()
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (b *badgerEngine) MaintenanceFloorDescription() string {
+	return "Flatten(2), then RunValueLogGC(0.5) until ErrNoRewrite, then Sync"
+}
+
+func (b *badgerEngine) Close() error {
+	b.dropReadTxn()
+	return b.db.Close()
+}
