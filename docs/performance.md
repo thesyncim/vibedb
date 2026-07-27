@@ -1,8 +1,39 @@
 # Performance
 
+> **The pinned mixed-workload tables below are SUPERSEDED history.** They
+> were measured before the 2026-07-27 engine work (checkpoint sync
+> contract, cache capacity stack, frame-native staging, canonical-frame
+> acknowledgements, deferred parent materialization) and before the
+> harness's checkpoint-timing correction, which excluded competitors'
+> stalls while charging ours. They are retained only for reproducibility
+> of history and must not be quoted as current standing.
+
+## Current standing — quiet-machine diagnostics, 2026-07-27
+
+Single-run diagnostics (cmd/mixed, YCSB-A, buffered-visible, matched
+checkpoint every 64 mutations, 100k documents, M4 Max) on the legacy
+default engine after the day's fixes:
+
+| Metric | vibedb | Pebble |
+| --- | ---: | ---: |
+| Total throughput | ~39,000-40,000 ops/s | 13,507 ops/s |
+| Read p50 | 1.3-1.7 us | 1.5 us |
+| Update p50 | 18-23 us | 2.4 us |
+| Checkpoint p50 / p95 | 1.7 / 2.1 ms | 8.8 / 14.4 ms |
+| Disk | 36.6 MiB | 44.2 MiB |
+
+The ordered primary graph (not yet the harness default) additionally
+measures 412 ns hot in-place acknowledgements, 8.3 us uniform
+ref-changing writes, 446 ns point reads, and 20.7 ns/doc all-byte
+ordered scans — see the benchmarks in store/durable. These are
+diagnostics, not the publishable protocol: the official replacement of
+every pinned table is the 10-repetition mixedsuite run across all five
+workloads and three durability lanes on a quiet machine, which is the
+next scheduled measurement action.
+
 The authoritative measured tables live in
 [bench/competitive/RESULTS.md](../bench/competitive/RESULTS.md). This document
-explains their provenance, reproduces the current headline tables, and states
+explains their provenance, reproduces the historical tables, and states
 the rules a replacement measurement must satisfy.
 
 ## Provenance of the checked-in baseline

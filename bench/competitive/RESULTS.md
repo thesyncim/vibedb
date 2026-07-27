@@ -1,5 +1,11 @@
 # Competitive results
 
+> **SUPERSEDED 2026-07-27:** every mixed-workload table below predates the
+> engine work of 2026-07-27 and the harness timing correction. Current
+> diagnostic standing is summarized in
+> [docs/performance.md](../../docs/performance.md); the full refresh via
+> cmd/mixedsuite on a quiet machine replaces this file's tables.
+
 This is the current reproducible baseline. It is deliberately blunt: a row is
 included only when the harness drove equivalent operations and the result has
 multiple isolated samples. Historical tables remain available in Git history;
