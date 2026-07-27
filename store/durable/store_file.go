@@ -1481,12 +1481,18 @@ func Open(file *os.File, options Options) (*Collection, error) {
 	return collection, nil
 }
 
+// storeCommitterFactory constructs the persistence committer for a collection.
+// It is a package variable so durability crash tests can interpose a
+// fault-injecting Device between the committer and the platform backend;
+// production keeps the platform committer.
+var storeCommitterFactory = storeio.NewCommitter
+
 func newCollectionResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte) (*Collection, error) {
 	writeFile, directWrite, err := storeio.OpenPageCommitFile(file, storeio.DirectMode(options.WriteMode))
 	if err != nil {
 		return nil, err
 	}
-	committer, err := storeio.NewCommitter(writeFile, storeio.DeviceOptions{
+	committer, err := storeCommitterFactory(writeFile, storeio.DeviceOptions{
 		Backend: storeio.Backend(options.Backend), BufferCount: options.BufferCount,
 		BufferSize: max(options.MaxPageSize, os.Getpagesize()), QueueDepth: options.BufferCount,
 		CheckpointSync: storeio.CheckpointSync(options.CheckpointStrength),

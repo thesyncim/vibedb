@@ -489,6 +489,20 @@ func NewCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 	return newCommitter(file, deviceOptions, options, OpenDevice)
 }
 
+// NewCommitterWithDevice is NewCommitter with a caller-supplied Device opener.
+// It exists so durability crash tests can interpose a fault-injecting Device
+// between the committer and the platform backend; a nil opener falls back to
+// the platform Device. Production uses NewCommitter.
+func NewCommitterWithDevice(
+	file *os.File, deviceOptions DeviceOptions, options CommitterOptions,
+	open func(*os.File, DeviceOptions) (Device, error),
+) (*Committer, error) {
+	if open == nil {
+		open = OpenDevice
+	}
+	return newCommitter(file, deviceOptions, options, open)
+}
+
 func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterOptions, open deviceOpener) (*Committer, error) {
 	normalizedDevice, err := deviceOptions.normalized()
 	if err != nil {
