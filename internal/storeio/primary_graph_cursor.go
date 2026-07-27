@@ -50,6 +50,15 @@ type PrimaryGraphCursor struct {
 	leafLease   PageLease
 	rows        CommonPrimaryLeafIterator
 
+	// Template-columnar leaves reconstruct documents by splice, so the cursor
+	// dispatches on the leaf class and, for the template class, walks ranks and
+	// splices each surviving row into spliceScratch. The scratch is reused across
+	// rows and leaves within one scan.
+	leafClass     CommonPrimaryLeafClass
+	tcLeaf        CommonPrimaryTemplateLeafView
+	tcRank        int
+	spliceScratch []byte
+
 	done bool
 }
 
@@ -298,16 +307,69 @@ func (c *PrimaryGraphCursor) openLeaf(
 	if err != nil {
 		return err
 	}
+	c.leafLease = lease
+	c.leafClass = PrimaryLeafClass(lease.Page())
+	if c.leafClass == CommonPrimaryLeafTemplate {
+		tv, ok := AdmittedCommonPrimaryTemplateLeaf(
+			lease.Page(), route.Bucket, c.leafBounds,
+		)
+		if !ok {
+			return fmt.Errorf(
+				"%w: template primary leaf", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		c.tcLeaf = tv
+		c.rows = CommonPrimaryLeafIterator{}
+		if lowerBound {
+			c.tcRank = tv.FirstRankFrom(c.lower)
+		} else {
+			c.tcRank = 0
+		}
+		return nil
+	}
 	leaf := AdmittedCommonPrimaryLeaf(
 		lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
 	)
-	c.leafLease = lease
 	if lowerBound {
 		c.rows = leaf.Range(c.lower, nil)
 	} else {
 		c.rows = leaf.AllRows()
 	}
 	return nil
+}
+
+// nextRawBorrowed yields the next row of the current leaf, dispatching on the
+// leaf class. Template rows are spliced into the reused scratch; the returned
+// value borrows that scratch and is valid only until the next call.
+func (c *PrimaryGraphCursor) nextRawBorrowed() (
+	key, raw []byte, overflow, ok bool,
+) {
+	if c.leafClass != CommonPrimaryLeafTemplate {
+		return c.rows.NextRawBorrowed()
+	}
+	if c.tcRank >= c.tcLeaf.Len() {
+		return nil, nil, false, false
+	}
+	k, ti, rowOK := c.tcLeaf.RowAt(c.tcRank)
+	if !rowOK {
+		return nil, nil, false, false
+	}
+	c.spliceScratch = c.tcLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
+	c.tcRank++
+	return k, c.spliceScratch, false, true
+}
+
+func (c *PrimaryGraphCursor) nextBorrowed() (
+	key, inline []byte, overflow PageRef, ok bool,
+) {
+	key, raw, isOverflow, ok := c.nextRawBorrowed()
+	if !ok {
+		return nil, nil, PageRef{}, false
+	}
+	if isOverflow {
+		return key, nil, decodePageRef(raw), true
+	}
+	return key, raw, PageRef{}, true
 }
 
 // Next returns the next globally bytewise-lexical row. Exhaustion closes the
@@ -318,7 +380,7 @@ func (c *PrimaryGraphCursor) Next() (PrimaryGraphRow, bool, error) {
 		return PrimaryGraphRow{}, false, nil
 	}
 	for {
-		key, inline, overflow, ok := c.rows.NextBorrowed()
+		key, inline, overflow, ok := c.nextBorrowed()
 		if ok {
 			if len(c.upper) != 0 && bytes.Compare(key, c.upper) >= 0 ||
 				len(c.prefix) != 0 && !bytes.HasPrefix(key, c.prefix) {
@@ -354,7 +416,7 @@ func (c *PrimaryGraphCursor) VisitInline(
 	}
 	for {
 		for {
-			key, raw, overflow, ok := c.rows.NextRawBorrowed()
+			key, raw, overflow, ok := c.nextRawBorrowed()
 			if !ok {
 				break
 			}
@@ -385,7 +447,7 @@ func (c *PrimaryGraphCursor) visitAllInline(
 ) (PageRef, error) {
 	for {
 		for {
-			key, raw, overflow, ok := c.rows.NextRawBorrowed()
+			key, raw, overflow, ok := c.nextRawBorrowed()
 			if !ok {
 				break
 			}
@@ -519,6 +581,9 @@ func (c *PrimaryGraphCursor) nextTablet() (PageRef, bool, error) {
 func (c *PrimaryGraphCursor) releaseAnchor() {
 	c.leafLease.Release()
 	c.rows = CommonPrimaryLeafIterator{}
+	c.leafClass = 0
+	c.tcLeaf = CommonPrimaryTemplateLeafView{}
+	c.tcRank = 0
 	c.anchorLease.Release()
 	c.anchor = GlobalTabletCatalogAnchorView{}
 	c.rowRank = 0

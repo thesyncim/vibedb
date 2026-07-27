@@ -25,6 +25,10 @@ type filePrimaryMutationPath struct {
 	tablet  storeio.GlobalTabletCatalogTabletRootView
 	anchor  storeio.GlobalTabletCatalogAnchorView
 	leaf    storeio.CommonPrimaryLeafView
+	// detemplated is true when leaf is a raw view de-templated from a template
+	// leaf. Its bytes do not alias the resident page, so an in-place patch is
+	// invalid and the mutation must take the copy-on-write rewrite path.
+	detemplated bool
 
 	rootRoute    storeio.GlobalTabletCatalogNodeRoute
 	catalogRoute storeio.GlobalTabletCatalogNodeRoute
@@ -178,7 +182,7 @@ func (c *Collection) acquirePrimaryMutationPath(
 	if err != nil {
 		return err
 	}
-	path.leaf = storeio.AdmittedCommonPrimaryLeaf(
+	path.leaf, path.detemplated, err = storeio.AdmittedPrimaryLeafForMutation(
 		path.leafLease.Page(), c.storeID, path.leafRoute.Bucket,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.super.FileEnd,
@@ -186,7 +190,7 @@ func (c *Collection) acquirePrimaryMutationPath(
 			AllocationQuantum: state.root.PageSize,
 		},
 	)
-	return nil
+	return err
 }
 
 func (c *Collection) currentPrimaryResidentRoute(
@@ -414,7 +418,7 @@ func (c *Collection) putPrimary(
 	if err != nil {
 		return false, err
 	}
-	leaf := storeio.AdmittedCommonPrimaryLeaf(
+	leaf, detemplated, err := storeio.AdmittedPrimaryLeafForMutation(
 		leafLease.Page(), c.storeID, resident.Bucket,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.super.FileEnd,
@@ -422,6 +426,10 @@ func (c *Collection) putPrimary(
 			AllocationQuantum: state.root.PageSize,
 		},
 	)
+	if err != nil {
+		leafLease.Release()
+		return false, err
+	}
 	slot, raw, overflow, found := leaf.LookupRawHashed(
 		resident.Hash, keyBytes,
 	)
@@ -434,7 +442,10 @@ func (c *Collection) putPrimary(
 	}
 	created = !found
 	trackFirstTouch := false
-	if found {
+	// A de-templated leaf's bytes do not alias the resident page, so the
+	// buffered in-place patch cannot apply: the rewrite below replaces the
+	// template page with a raw leaf.
+	if found && !detemplated {
 		handled, track, inplaceErr := c.tryBufferedPrimaryInplace(
 			state, src, raw, resident.Ref, &leafLease,
 		)
@@ -599,7 +610,7 @@ func (c *Collection) deletePrimary(
 		if acquireErr != nil {
 			return false, acquireErr
 		}
-		leaf := storeio.AdmittedCommonPrimaryLeaf(
+		leaf, _, detemplateErr := storeio.AdmittedPrimaryLeafForMutation(
 			leafLease.Page(), c.storeID, resident.Bucket,
 			storeio.CommonPrimaryLeafBounds{
 				FileEnd:           state.super.FileEnd,
@@ -607,6 +618,10 @@ func (c *Collection) deletePrimary(
 				AllocationQuantum: state.root.PageSize,
 			},
 		)
+		if detemplateErr != nil {
+			leafLease.Release()
+			return false, detemplateErr
+		}
 		slot, _, overflow, found := leaf.LookupRawHashed(
 			resident.Hash, keyBytes,
 		)

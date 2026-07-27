@@ -40,6 +40,143 @@ func buildFilePrimaryCorpus(
 	return built, keys, values
 }
 
+// redundantPrimaryDocument is a low-cardinality shape whose structure and
+// constant fields ("kind","active","tier","region") are shared across
+// documents, so the bulk builder selects the template-columnar leaf class for
+// it. It stays under 128 bytes so warmed point-read buffers remain allocation
+// free.
+func redundantPrimaryDocument(at int) []byte {
+	return fmt.Appendf(nil,
+		`{"id":%d,"kind":"document","group":%d,"active":%t,`+
+			`"tier":"standard","region":"eu-west-1","name":"row %d"}`,
+		at, at%997, at%3 == 0, at)
+}
+
+// buildRedundantPrimaryCorpus mirrors buildFilePrimaryCorpus but with the
+// template-friendly shape, so the differential tests exercise the
+// template-columnar leaf class end to end.
+func buildRedundantPrimaryCorpus(
+	t testing.TB, count int,
+) (*store.Collection, []string, [][]byte) {
+	t.Helper()
+	builder, err := store.NewBuilder(store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := make([]string, count)
+	values := make([][]byte, count)
+	for at := range count {
+		keys[at] = fmt.Sprintf("primary-key-%09d", at)
+		values[at] = redundantPrimaryDocument(at)
+		if err := builder.Append(keys[at], values[at]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	built, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return built, keys, values
+}
+
+// filePrimaryLeafClassCounts walks every ordered-graph leaf and tallies the
+// durable leaf class recorded in each page. It is the ground-truth build-stats
+// counter: index by CommonPrimaryLeafClass value (1 narrow, 2 wide, 3 template).
+func filePrimaryLeafClassCounts(
+	t testing.TB, file *os.File, root storeio.StateRoot,
+) [4]int {
+	t.Helper()
+	var counts [4]int
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bounds := storeio.GlobalTabletCatalogBounds{
+		StoreID: root.StoreID, SelectedRootGeneration: root.Generation,
+		FileEnd: uint64(info.Size()), NextLogicalID: root.NextLogicalID,
+	}
+	openNode := func(ref storeio.PageRef) storeio.GlobalTabletCatalogNodeView {
+		node, openErr := storeio.OpenGlobalTabletCatalogNode(
+			readPrimaryOpenTestPage(t, file, ref), ref, bounds,
+		)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		return node
+	}
+	catalogRoot := openNode(root.PrimaryRoot)
+	var catalogLeaves []storeio.GlobalTabletCatalogNodeView
+	rootCursor := catalogRoot.LowerBound(nil)
+	for {
+		route, ok := rootCursor.Route()
+		if !ok {
+			break
+		}
+		child := openNode(route.Ref)
+		if catalogRoot.ChildLevel() == storeio.GlobalTabletCatalogBranch {
+			branchCursor := child.LowerBound(nil)
+			for {
+				leafRoute, leafOK := branchCursor.Route()
+				if !leafOK {
+					break
+				}
+				catalogLeaves = append(catalogLeaves, openNode(leafRoute.Ref))
+				if !branchCursor.Next() {
+					break
+				}
+			}
+		} else {
+			catalogLeaves = append(catalogLeaves, child)
+		}
+		if !rootCursor.Next() {
+			break
+		}
+	}
+	for leafAt := range catalogLeaves {
+		cursor := catalogLeaves[leafAt].LowerBound(nil)
+		for {
+			route, ok := cursor.Route()
+			if !ok {
+				break
+			}
+			tablet, openErr := storeio.OpenGlobalTabletCatalogTabletRoot(
+				readPrimaryOpenTestPage(t, file, route.Ref), route.Ref, bounds,
+			)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			for anchorAt := 0; anchorAt < tablet.AnchorCount(); anchorAt++ {
+				anchorRoute, anchorOK := tablet.AnchorAt(anchorAt)
+				if !anchorOK {
+					t.Fatal("primary tablet anchor iteration")
+				}
+				anchor, anchorErr := storeio.OpenGlobalTabletCatalogAnchor(
+					readPrimaryOpenTestPage(t, file, anchorRoute.Ref),
+					&tablet, anchorRoute.PageID,
+				)
+				if anchorErr != nil {
+					t.Fatal(anchorErr)
+				}
+				for leafRank := 0; leafRank < anchor.Count(); leafRank++ {
+					leafRoute, leafOK := anchor.RouteAt(leafRank, 0)
+					if !leafOK {
+						t.Fatal("primary anchor leaf iteration")
+					}
+					page := readPrimaryOpenTestPage(t, file, leafRoute.Ref)
+					class := storeio.PrimaryLeafClass(page)
+					if int(class) < len(counts) {
+						counts[class]++
+					}
+				}
+			}
+			if !cursor.Next() {
+				break
+			}
+		}
+	}
+	return counts
+}
+
 func createPrimaryPointFile(
 	t testing.TB,
 	built *store.Collection,
@@ -64,7 +201,7 @@ func createPrimaryPointFile(
 
 func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 	const count = 100_000
-	built, keys, values := buildFilePrimaryCorpus(t, count)
+	built, keys, values := buildRedundantPrimaryCorpus(t, count)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 128 << 20,
 	}
@@ -126,6 +263,7 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 	regions := filePrimaryRegionAccounting(
 		t, primaryFile, primaryRoot,
 	)
+	classCounts := filePrimaryLeafClassCounts(t, primaryFile, primaryRoot)
 	t.Logf(
 		"100k disk bytes: primary=%d legacy=%d leaves=%d anchors=%d "+
 			"tablet_roots=%d locators=%d catalog=%d metadata=%d",
@@ -134,6 +272,18 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 		regions.locators, regions.catalog,
 		primaryInfo.Size()-regions.total(),
 	)
+	t.Logf(
+		"100k leaf class split: narrow=%d wide=%d template=%d",
+		classCounts[storeio.CommonPrimaryLeafNarrow],
+		classCounts[storeio.CommonPrimaryLeafWide],
+		classCounts[storeio.CommonPrimaryLeafTemplate],
+	)
+	if classCounts[storeio.CommonPrimaryLeafTemplate] == 0 {
+		t.Fatalf(
+			"expected template-columnar leaves to be selected; class split = %v",
+			classCounts,
+		)
+	}
 
 	legacySnapshot, err := legacy.Snapshot()
 	if err != nil {

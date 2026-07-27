@@ -74,6 +74,21 @@ func ShortestPrimaryFence(dst, leftMax, rightMin []byte) ([]byte, error) {
 	return dst[:length], nil
 }
 
+// PrimaryGraphBuildStats reports how many leaves the bulk builder staged in
+// each leaf class. LeavesByClass is indexed by CommonPrimaryLeafClass value
+// (1 narrow, 2 wide, 3 template-columnar); index 0 is unused. It exists so a
+// caller can assert the adopted class mix deterministically without re-reading
+// the durable graph.
+type PrimaryGraphBuildStats struct {
+	LeavesByClass [4]int
+}
+
+// Leaves returns the total leaf count across classes.
+func (s PrimaryGraphBuildStats) Leaves() int {
+	return s.LeavesByClass[0] + s.LeavesByClass[1] +
+		s.LeavesByClass[2] + s.LeavesByClass[3]
+}
+
 // BuildPrimaryGraph deterministically stages one complete ordered primary
 // graph in tx. Records must be strictly bytewise lexical and contain inline
 // non-empty values. Passing no policy selects PrimaryLeafAdaptive; at most one
@@ -87,45 +102,67 @@ func BuildPrimaryGraph(
 	records []PrimaryGraphRecord,
 	policy ...PrimaryLeafClassPolicy,
 ) (PageRef, error) {
+	ref, _, err := BuildPrimaryGraphWithStats(tx, records, policy...)
+	return ref, err
+}
+
+// BuildPrimaryGraphWithStats is BuildPrimaryGraph plus the per-class leaf split
+// decided during planning. Under the adaptive policy a candidate leaf is staged
+// as the template-columnar class when that class packs strictly more documents
+// into a 4 KiB page than the raw leaf would — a measured saving well past the
+// adoption threshold, since the same documents otherwise require the 8 KiB wide
+// class. Explicit narrow/wide policies never select the template class.
+func BuildPrimaryGraphWithStats(
+	tx *WriteTransaction,
+	records []PrimaryGraphRecord,
+	policy ...PrimaryLeafClassPolicy,
+) (PageRef, PrimaryGraphBuildStats, error) {
+	var stats PrimaryGraphBuildStats
 	if tx == nil || !tx.active || tx.options.PageSize != physicalPageQuantum ||
 		tx.options.StoreID == ([16]byte{}) ||
 		tx.options.Generation == 0 ||
 		tx.nextID < PrimaryFirstDynamicLogicalID ||
 		len(records) == 0 || len(policy) > 1 {
-		return PageRef{}, fmt.Errorf("%w: primary graph transaction or input", ErrInvalidWrite)
+		return PageRef{}, stats, fmt.Errorf("%w: primary graph transaction or input", ErrInvalidWrite)
 	}
 	selected := PrimaryLeafAdaptive
 	if len(policy) == 1 {
 		selected = policy[0]
 	}
 	if selected > PrimaryLeafWide {
-		return PageRef{}, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
+		return PageRef{}, stats, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
 	}
 	for at := range records {
 		if len(records[at].Key) == 0 ||
 			len(records[at].Key) > CommonPrimaryLeafMaxKeyBytes ||
 			len(records[at].Value) == 0 ||
 			at != 0 && bytes.Compare(records[at-1].Key, records[at].Key) >= 0 {
-			return PageRef{}, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
+			return PageRef{}, stats, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
 		}
 	}
 
 	plans, err := planPrimaryLeaves(tx, records, selected)
 	if err != nil {
-		return PageRef{}, err
+		return PageRef{}, stats, err
 	}
 	if len(plans) > TabletLocalIdentityTabletCount*TabletLocalIdentityLocalCount {
-		return PageRef{}, fmt.Errorf("%w: primary leaf namespace exhausted", ErrInvalidWrite)
+		return PageRef{}, stats, fmt.Errorf("%w: primary leaf namespace exhausted", ErrInvalidWrite)
+	}
+	for at := range plans {
+		if class := plans[at].class; int(class) < len(stats.LeavesByClass) {
+			stats.LeavesByClass[class]++
+		}
 	}
 	built, err := buildPrimaryLeaves(tx, records, plans)
 	if err != nil {
-		return PageRef{}, err
+		return PageRef{}, stats, err
 	}
 	tablets, err := buildPrimaryTablets(tx, built)
 	if err != nil {
-		return PageRef{}, err
+		return PageRef{}, stats, err
 	}
-	return buildPrimaryCatalog(tx, tablets)
+	root, err := buildPrimaryCatalog(tx, tablets)
+	return root, stats, err
 }
 
 // PrimaryGraphPageCount returns the exact number of transaction pages
@@ -247,10 +284,114 @@ func planPrimaryLeaves(
 		if chosen.last == 0 {
 			return nil, fmt.Errorf("%w: primary record does not fit wide leaf", ErrInvalidWrite)
 		}
+		// Template-columnar class selection is per leaf and adaptive-only. The raw
+		// packing above already fills the class it chose (narrow or wide); the
+		// template class wins when it stores the same documents at a lower page
+		// cost per document. A template leaf fills one 4 KiB page, so its per-doc
+		// cost is 4096/tcCount, and it is adopted only when that is at least 25%
+		// below the raw leaf's page cost per document — the adoption threshold.
+		// tcCount is capped at what a raw wide leaf can hold so a later mutation
+		// can always de-template it back into the raw envelope.
+		if policy == PrimaryLeafAdaptive {
+			rawCount := count
+			rawPageBytes := CommonPrimaryLeafNarrowBytes
+			if chosen.class == CommonPrimaryLeafWide {
+				rawPageBytes = CommonPrimaryLeafWideBytes
+			}
+			tcCount := planTemplateLeafCount(records, first)
+			// 4096/tcCount <= 0.75 * rawPageBytes/rawCount, cross-multiplied with
+			// the 3/4 factor to stay in integer arithmetic.
+			if tcCount > 0 &&
+				4*CommonPrimaryLeafNarrowBytes*rawCount <=
+					3*rawPageBytes*tcCount {
+				tcRecords := make([]CommonPrimaryLeafRecord, tcCount)
+				for at := range tcRecords {
+					row := records[first+at]
+					tcRecords[at] = CommonPrimaryLeafRecord{
+						Key:   row.Key,
+						Value: CommonPrimaryLeafValue{Inline: row.Value},
+					}
+				}
+				chosen = primaryLeafPlan{
+					first: first, last: first + tcCount,
+					class: CommonPrimaryLeafTemplate, records: tcRecords,
+				}
+			}
+		}
 		plans = append(plans, chosen)
 		first = chosen.last
 	}
 	return plans, nil
+}
+
+// planTemplateLeafCount returns the largest number of records from first that a
+// template-columnar leaf should hold: the most that fit one 4 KiB template page,
+// capped at the raw wide-leaf capacity (so the leaf can be de-templated back for
+// mutation) and the template row-count ceiling. It returns 0 when not even one
+// record fits. The template image grows monotonically with the record count, so
+// the bound is found by binary search.
+func planTemplateLeafCount(records []PrimaryGraphRecord, first int) int {
+	tcPayloadCap := CommonPrimaryLeafNarrowBytes - PageHeaderSize - PageTrailerSize
+	maxCount := min(
+		len(records)-first,
+		min(templateColumnarLeafSlots-1, primaryLeafRawWideCapacity(records, first)),
+	)
+	if maxCount < 1 {
+		return 0
+	}
+	scratch := make([]CommonPrimaryLeafRecord, 0, maxCount)
+	fits := func(count int) bool {
+		scratch = scratch[:0]
+		for at := 0; at < count; at++ {
+			row := records[first+at]
+			scratch = append(scratch, CommonPrimaryLeafRecord{
+				Key: row.Key, Value: CommonPrimaryLeafValue{Inline: row.Value},
+			})
+		}
+		payload, err := TemplateColumnarLeafImagePayloadBytes(scratch)
+		return err == nil && payload <= tcPayloadCap
+	}
+	if !fits(1) {
+		return 0
+	}
+	low, high, best := 1, maxCount, 1
+	for low <= high {
+		mid := (low + high) / 2
+		if fits(mid) {
+			best = mid
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	return best
+}
+
+// primaryLeafRawWideCapacity returns the largest number of records from first
+// that fit one raw wide leaf. The de-templating fallback re-encodes a template
+// leaf into this envelope, so a template leaf never holds more.
+func primaryLeafRawWideCapacity(
+	records []PrimaryGraphRecord, first int,
+) int {
+	capacity := CommonPrimaryLeafWideBytes - PageHeaderSize - PageTrailerSize
+	recordBytes := 0
+	count := 0
+	for count < CommonPrimaryLeafWideSlots && first+count < len(records) {
+		row := records[first+count]
+		grown := recordBytes + len(row.Key) + len(row.Value)
+		if len(row.Key) >= commonPrimaryLeafEscapeLength {
+			grown++
+		}
+		layout := commonPrimaryLeafLayoutFor(
+			CommonPrimaryLeafWide, count+1, CommonPrimaryLeafWideBytes,
+		)
+		if layout.heapStart+grown > capacity {
+			break
+		}
+		recordBytes = grown
+		count++
+	}
+	return count
 }
 
 func fitPrimaryLeaf(
@@ -324,12 +465,18 @@ func buildPrimaryLeaves(
 			return nil, err
 		}
 		bounds.FileEnd = tx.fileEnd
-		if _, err := EncodeCommonPrimaryLeaf(
-			page.Bytes(), plans[rank].class,
-			CommonPrimaryLeafHeader{
-				StoreID: tx.options.StoreID, Generation: tx.options.Generation,
-				Bucket: BucketID(bucket), PageSize: pageSize,
-			},
+		leafHeader := CommonPrimaryLeafHeader{
+			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+			Bucket: BucketID(bucket), PageSize: pageSize,
+		}
+		if plans[rank].class == CommonPrimaryLeafTemplate {
+			if _, err := EncodeCommonPrimaryTemplateLeaf(
+				page.Bytes(), leafHeader, plans[rank].records, bounds,
+			); err != nil {
+				return nil, err
+			}
+		} else if _, err := EncodeCommonPrimaryLeaf(
+			page.Bytes(), plans[rank].class, leafHeader,
 			tx.options.StoreID, plans[rank].records, bounds,
 		); err != nil {
 			return nil, err

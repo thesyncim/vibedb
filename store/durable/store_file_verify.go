@@ -509,11 +509,35 @@ func (w *verifyWalker) walkLeaf(route storeio.SegmentedTabletRouterRoute) {
 			"read: %v", err)
 		return
 	}
-	// OpenCommonPrimaryLeaf proves common framing, the selecting PageRef, the
-	// succinct/hash structures, lexical order inside the leaf, that BucketID
-	// matches the leaf logical identity the anchor routed to, and every overflow
-	// PageRef. It is the leaf half of "BucketIDs match locators, leaf keys within
-	// fences".
+	// The class byte selects the decoder. Both openers prove common framing, the
+	// selecting PageRef, lexical order inside the leaf, and that BucketID matches
+	// the leaf logical identity the anchor routed to — the leaf half of "BucketIDs
+	// match locators, leaf keys within fences". checkLeafOrder then applies the
+	// cross-leaf order proof over the decoded keys, which is codec-agnostic.
+	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafTemplate {
+		tv, err := storeio.OpenCommonPrimaryTemplateLeaf(
+			page, w.storeID, route.Bucket, route.Ref,
+			w.root.Generation, w.leafBounds,
+		)
+		if err != nil {
+			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+				"open template: %v", err)
+			return
+		}
+		w.count("primary-leaf")
+		for rank := 0; rank < tv.Len(); rank++ {
+			key, _, ok := tv.RowAt(rank)
+			if !ok {
+				w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+					"template row %d", rank)
+				break
+			}
+			w.checkLeafOrder(route, key)
+		}
+		return
+	}
+	// OpenCommonPrimaryLeaf additionally proves the succinct/hash structures and
+	// every overflow PageRef.
 	leaf, err := storeio.OpenCommonPrimaryLeaf(
 		page, w.storeID, route.Bucket, route.Ref, w.root.Generation, w.leafBounds,
 	)
@@ -529,19 +553,25 @@ func (w *verifyWalker) walkLeaf(route storeio.SegmentedTabletRouterRoute) {
 		if !ok {
 			break
 		}
-		// The catalog, tablet, anchor, and leaf iterators are each lexical, so a
-		// left-to-right traversal must yield globally non-decreasing keys. A leaf
-		// holding a key outside its routed fence breaks this order; the check is a
-		// sound, cross-leaf proof of the fences-ordered / keys-within-fences
-		// invariant without re-deriving the separators.
-		if w.haveLast && bytes.Compare(w.lastKey, row.Key) >= 0 {
-			w.fail("leaf-order", route.Ref.Offset, route.Ref.LogicalID,
-				"key %q not greater than previous %q", row.Key, w.lastKey)
-		}
-		w.lastKey = append(w.lastKey[:0], row.Key...)
-		w.haveLast = true
-		w.report.Documents++
+		w.checkLeafOrder(route, row.Key)
 	}
+}
+
+// checkLeafOrder proves globally non-decreasing keys across leaves. The catalog,
+// tablet, anchor, and leaf iterators are each lexical, so a left-to-right
+// traversal must yield increasing keys. A leaf holding a key outside its routed
+// fence breaks this order; the check is a sound, cross-leaf proof of the
+// fences-ordered / keys-within-fences invariant without re-deriving separators.
+func (w *verifyWalker) checkLeafOrder(
+	route storeio.SegmentedTabletRouterRoute, key []byte,
+) {
+	if w.haveLast && bytes.Compare(w.lastKey, key) >= 0 {
+		w.fail("leaf-order", route.Ref.Offset, route.Ref.LogicalID,
+			"key %q not greater than previous %q", key, w.lastKey)
+	}
+	w.lastKey = append(w.lastKey[:0], key...)
+	w.haveLast = true
+	w.report.Documents++
 }
 
 // checkReachableOverlap proves that no two reachable pages claim overlapping
@@ -730,10 +760,22 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Generation: header.Generation, Length: header.PageSize,
 			Kind: storeio.PagePrimaryLeaf,
 		}
-		if _, err := storeio.OpenCommonPrimaryLeaf(
-			buf[:extent], bootstrap.StoreID, bucket, expected,
-			salvageSelectingGeneration, leafBounds,
-		); err != nil {
+		leafValid := func() bool {
+			if storeio.PrimaryLeafClass(buf[:extent]) ==
+				storeio.CommonPrimaryLeafTemplate {
+				_, err := storeio.OpenCommonPrimaryTemplateLeaf(
+					buf[:extent], bootstrap.StoreID, bucket, expected,
+					salvageSelectingGeneration, leafBounds,
+				)
+				return err == nil
+			}
+			_, err := storeio.OpenCommonPrimaryLeaf(
+				buf[:extent], bootstrap.StoreID, bucket, expected,
+				salvageSelectingGeneration, leafBounds,
+			)
+			return err == nil
+		}()
+		if !leafValid {
 			// Checksum-valid page in the leaf identity band but not a valid leaf.
 			offset += extent
 			continue
@@ -761,6 +803,31 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Offset: hit.offset, LogicalID: logicalID,
 			Generation: hit.generation, Length: uint32(hit.length),
 			Kind: storeio.PagePrimaryLeaf,
+		}
+		if storeio.PrimaryLeafClass(buf) == storeio.CommonPrimaryLeafTemplate {
+			tv, err := storeio.OpenCommonPrimaryTemplateLeaf(
+				buf, bootstrap.StoreID, bucket, expected,
+				salvageSelectingGeneration, leafBounds,
+			)
+			if err != nil {
+				return report, fmt.Errorf(
+					"vibejson: salvage re-open template leaf: %w", err,
+				)
+			}
+			report.BucketsKept++
+			for rank := 0; rank < tv.Len(); rank++ {
+				key, ti, ok := tv.RowAt(rank)
+				if !ok {
+					return report, fmt.Errorf(
+						"vibejson: salvage template row %d", rank,
+					)
+				}
+				records = append(records, salvagedRecord{
+					key:   append([]byte(nil), key...),
+					value: tv.AppendRawRank(nil, rank, ti),
+				})
+			}
+			continue
 		}
 		leaf, err := storeio.OpenCommonPrimaryLeaf(
 			buf, bootstrap.StoreID, bucket, expected,

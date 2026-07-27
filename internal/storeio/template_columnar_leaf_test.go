@@ -14,9 +14,9 @@ import (
 	"github.com/thesyncim/vibejson/document"
 )
 
-func templateColumnarLeafLabRows(t testing.TB, count int, uniqueShape bool) []TemplateColumnarLeafLabRow {
+func templateColumnarLeafRows(t testing.TB, count int, uniqueShape bool) []TemplateColumnarLeafRow {
 	t.Helper()
-	rows := make([]TemplateColumnarLeafLabRow, count)
+	rows := make([]TemplateColumnarLeafRow, count)
 	for i := range rows {
 		var doc []byte
 		if uniqueShape {
@@ -27,7 +27,7 @@ func templateColumnarLeafLabRows(t testing.TB, count int, uniqueShape bool) []Te
 				`"nested":{"note":"exact spelling \u263a","nil":null}}`,
 				i, i, i%1000, i&1 == 0)
 		}
-		rows[i] = TemplateColumnarLeafLabRow{
+		rows[i] = TemplateColumnarLeafRow{
 			Slot: uint8((i*197 + 17) & 255),
 			Key:  []byte(fmt.Sprintf("doc:%08d", i)),
 			JSON: doc,
@@ -36,7 +36,7 @@ func templateColumnarLeafLabRows(t testing.TB, count int, uniqueShape bool) []Te
 	return rows
 }
 
-func TestTemplateColumnarLeafLabExtractionExact(t *testing.T) {
+func TestTemplateColumnarLeafExtractionExact(t *testing.T) {
 	docs := [][]byte{
 		[]byte(`{"a":1,"b":"x","c":null,"d":true}`),
 		[]byte(" \n { \"escaped\\u006b\" : -0.00e+2, \"a\" : [false,{\"z\":\"\\\\u263a\"}] } \t"),
@@ -52,7 +52,7 @@ func TestTemplateColumnarLeafLabExtractionExact(t *testing.T) {
 	}
 	for i, src := range docs {
 		storage := make([]vibejson.IndexEntry, len(src)+2)
-		got, err := ExtractTemplateColumnarLeafLab(src, storage)
+		got, err := ExtractTemplateColumnarLeaf(src, storage)
 		if err != nil {
 			t.Fatalf("doc %d: %v", i, err)
 		}
@@ -60,20 +60,20 @@ func TestTemplateColumnarLeafLabExtractionExact(t *testing.T) {
 		if !ok || !bytes.Equal(dst, src) {
 			t.Fatalf("doc %d exact splice mismatch:\n got %q\nwant %q", i, dst, src)
 		}
-		again, err := ExtractTemplateColumnarLeafLab(src, storage)
+		again, err := ExtractTemplateColumnarLeaf(src, storage)
 		if err != nil || got.ID != again.ID {
 			t.Fatalf("doc %d unstable fused fingerprint", i)
 		}
 	}
 }
 
-func TestTemplateColumnarLeafLabRoundTripStableSlotsAndFields(t *testing.T) {
-	rows := templateColumnarLeafLabRows(t, 190, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func TestTemplateColumnarLeafRoundTripStableSlotsAndFields(t *testing.T) {
+	rows := templateColumnarLeafRows(t, 190, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,13 +116,13 @@ func TestTemplateColumnarLeafLabRoundTripStableSlotsAndFields(t *testing.T) {
 	}
 }
 
-func TestTemplateColumnarLeafLabRegionCorruptionFailClosed(t *testing.T) {
-	rows := templateColumnarLeafLabRows(t, 32, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func TestTemplateColumnarLeafRegionCorruptionFailClosed(t *testing.T) {
+	rows := templateColumnarLeafRows(t, 32, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,28 +138,28 @@ func TestTemplateColumnarLeafLabRegionCorruptionFailClosed(t *testing.T) {
 		}
 		bad := append([]byte(nil), image...)
 		bad[region[0]+(region[1]-region[0])/2] ^= 0x40
-		if _, err := OpenTemplateColumnarLeafLab(bad); !errors.Is(err, ErrTemplateColumnarLeafLabCorrupt) {
+		if _, err := OpenTemplateColumnarLeaf(bad); !errors.Is(err, ErrTemplateColumnarLeafCorrupt) {
 			t.Fatalf("region %d accepted: %v", i, err)
 		}
 	}
 }
 
-func TestTemplateColumnarLeafLabRejectsGraftedDictionary(t *testing.T) {
-	a, err := EncodeTemplateColumnarLeafLab(templateColumnarLeafLabRows(t, 16, false))
+func TestTemplateColumnarLeafRejectsGraftedDictionary(t *testing.T) {
+	a, err := EncodeTemplateColumnarLeaf(templateColumnarLeafRows(t, 16, false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherRows := templateColumnarLeafLabRows(t, 16, false)
+	otherRows := templateColumnarLeafRows(t, 16, false)
 	for i := range otherRows {
 		// Same byte length, different invariant key spelling.
 		otherRows[i].JSON = bytes.Replace(otherRows[i].JSON, []byte(`"name"`), []byte(`"nAme"`), 1)
 	}
-	b, err := EncodeTemplateColumnarLeafLab(otherRows)
+	b, err := EncodeTemplateColumnarLeaf(otherRows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	av, _ := OpenTemplateColumnarLeafLab(a)
-	bv, _ := OpenTemplateColumnarLeafLab(b)
+	av, _ := OpenTemplateColumnarLeaf(a)
+	bv, _ := OpenTemplateColumnarLeaf(b)
 	if av.dictEnd-av.metadataEnd != bv.dictEnd-bv.metadataEnd {
 		t.Fatal("graft fixture dictionary sizes differ")
 	}
@@ -168,26 +168,26 @@ func TestTemplateColumnarLeafLabRejectsGraftedDictionary(t *testing.T) {
 	// Also graft the dictionary checksum. The checksum root still binds the
 	// checksum vector to this leaf, and must reject the pair.
 	copy(graft[av.dataEnd+4:av.dataEnd+8], b[bv.dataEnd+4:bv.dataEnd+8])
-	if _, err := OpenTemplateColumnarLeafLab(graft); !errors.Is(err, ErrTemplateColumnarLeafLabCorrupt) {
+	if _, err := OpenTemplateColumnarLeaf(graft); !errors.Is(err, ErrTemplateColumnarLeafCorrupt) {
 		t.Fatalf("grafted dictionary accepted: %v", err)
 	}
 }
 
-func TestTemplateColumnarLeafLabRejectsProgramBoundsAndLengthOverflow(t *testing.T) {
-	rows := templateColumnarLeafLabRows(t, 16, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func TestTemplateColumnarLeafRejectsProgramBoundsAndLengthOverflow(t *testing.T) {
+	rows := templateColumnarLeafRows(t, 16, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, _ := OpenTemplateColumnarLeafLab(image)
+	view, _ := OpenTemplateColumnarLeaf(image)
 
 	badProgram := append([]byte(nil), image...)
 	tplAt := int(uintptr(unsafe.Pointer(&view.tplDir[0])) - uintptr(unsafe.Pointer(&view.image[0])))
 	binary.LittleEndian.PutUint32(badProgram[tplAt+52:tplAt+56], math.MaxUint32)
-	if err := ResealTemplateColumnarLeafLab(badProgram); err != nil {
+	if err := ResealTemplateColumnarLeaf(badProgram); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenTemplateColumnarLeafLab(badProgram); !errors.Is(err, ErrTemplateColumnarLeafLabCorrupt) {
+	if _, err := OpenTemplateColumnarLeaf(badProgram); !errors.Is(err, ErrTemplateColumnarLeafCorrupt) {
 		t.Fatalf("program bounds accepted: %v", err)
 	}
 
@@ -195,21 +195,21 @@ func TestTemplateColumnarLeafLabRejectsProgramBoundsAndLengthOverflow(t *testing
 	rowAt := 0
 	lengthStart := int(binary.LittleEndian.Uint32(view.rowDir[rowAt+12:]))
 	badLength[lengthStart] = 0xfe
-	if err := ResealTemplateColumnarLeafLab(badLength); err != nil {
+	if err := ResealTemplateColumnarLeaf(badLength); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenTemplateColumnarLeafLab(badLength); !errors.Is(err, ErrTemplateColumnarLeafLabCorrupt) {
+	if _, err := OpenTemplateColumnarLeaf(badLength); !errors.Is(err, ErrTemplateColumnarLeafCorrupt) {
 		t.Fatalf("length overflow accepted: %v", err)
 	}
 }
 
-func TestTemplateColumnarLeafLabPredicateSplicesSurvivorsOnly(t *testing.T) {
-	rows := templateColumnarLeafLabRows(t, 32, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func TestTemplateColumnarLeafPredicateSplicesSurvivorsOnly(t *testing.T) {
+	rows := templateColumnarLeafRows(t, 32, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,17 +219,17 @@ func TestTemplateColumnarLeafLabPredicateSplicesSurvivorsOnly(t *testing.T) {
 	}
 }
 
-func TestTemplateColumnarLeafLabPatchAndReseal(t *testing.T) {
-	rows := templateColumnarLeafLabRows(t, 64, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func TestTemplateColumnarLeafPatchAndReseal(t *testing.T) {
+	rows := templateColumnarLeafRows(t, 64, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		t.Fatal(err)
 	}
 	slot := rows[10].Slot
-	if err := PatchTemplateColumnarLeafLabFieldFixed(image, slot, 2, []byte("11")); err != nil {
+	if err := PatchTemplateColumnarLeafFieldFixed(image, slot, 2, []byte("11")); err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,14 +237,14 @@ func TestTemplateColumnarLeafLabPatchAndReseal(t *testing.T) {
 	if !ok || string(field) != "11" {
 		t.Fatalf("patched field=%q ok=%v", field, ok)
 	}
-	if err := PatchTemplateColumnarLeafLabFieldFixed(image, slot, 2, []byte("longer")); !errors.Is(err, ErrTemplateColumnarLeafLabShape) {
+	if err := PatchTemplateColumnarLeafFieldFixed(image, slot, 2, []byte("longer")); !errors.Is(err, ErrTemplateColumnarLeafShape) {
 		t.Fatalf("width-changing patch err=%v", err)
 	}
 }
 
-func TestTemplateColumnarLeafLabMeasuredRawFallback(t *testing.T) {
-	plan, _, err := PlanTemplateColumnarLeafLab(
-		templateColumnarLeafLabRows(t, 64, true),
+func TestTemplateColumnarLeafMeasuredRawFallback(t *testing.T) {
+	plan, _, err := PlanTemplateColumnarLeaf(
+		templateColumnarLeafRows(t, 64, true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -255,18 +255,18 @@ func TestTemplateColumnarLeafLabMeasuredRawFallback(t *testing.T) {
 	}
 }
 
-func TestTemplateColumnarLeafLabHotPathsZeroAlloc(t *testing.T) {
-	rows := templateColumnarLeafLabRows(t, 190, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func TestTemplateColumnarLeafHotPathsZeroAlloc(t *testing.T) {
+	rows := templateColumnarLeafRows(t, 190, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if allocs := testing.AllocsPerRun(1000, func() {
-		_, openErr := OpenTemplateColumnarLeafLab(image)
+		_, openErr := OpenTemplateColumnarLeaf(image)
 		if openErr != nil {
 			panic(openErr)
 		}
@@ -314,14 +314,14 @@ func TestTemplateColumnarLeafLabHotPathsZeroAlloc(t *testing.T) {
 	}
 }
 
-func FuzzTemplateColumnarLeafLabLengthVectors(f *testing.F) {
-	rows := templateColumnarLeafLabRows(f, 8, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func FuzzTemplateColumnarLeafLengthVectors(f *testing.F) {
+	rows := templateColumnarLeafRows(f, 8, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		f.Fatal(err)
 	}
-	view, _ := OpenTemplateColumnarLeafLab(image)
-	at := 0 * templateColumnarLeafLabRowBytes
+	view, _ := OpenTemplateColumnarLeaf(image)
+	at := 0 * templateColumnarLeafRowBytes
 	start := int(binary.LittleEndian.Uint32(view.rowDir[at+12:]))
 	f.Add(uint16(0), uint32(0))
 	f.Add(uint16(5), uint32(len(image)))
@@ -334,10 +334,10 @@ func FuzzTemplateColumnarLeafLabLengthVectors(f *testing.F) {
 		}
 		// Deliberately reseal to force length-vector validation rather than
 		// letting the data-region checksum reject first.
-		if err := ResealTemplateColumnarLeafLab(bad); err != nil {
+		if err := ResealTemplateColumnarLeaf(bad); err != nil {
 			return
 		}
-		opened, err := OpenTemplateColumnarLeafLab(bad)
+		opened, err := OpenTemplateColumnarLeaf(bad)
 		if err == nil {
 			dst := make([]byte, 0, 256)
 			_, _ = opened.AppendRaw(dst, rows[0].Slot, rows[0].Key)

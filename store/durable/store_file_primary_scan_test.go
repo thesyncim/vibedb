@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
 func openPrimaryScanPair(
@@ -44,9 +46,58 @@ func openPrimaryScanPair(
 	return legacy, primary, keys, values
 }
 
+func openRedundantPrimaryScanPair(
+	t testing.TB, count int,
+) (*Collection, *Collection, []string, [][]byte) {
+	t.Helper()
+	built, keys, values := buildRedundantPrimaryCorpus(t, count)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 128 << 20,
+	}
+	legacyFile, err := os.OpenFile(
+		filepath.Join(t.TempDir(), "legacy-scan.vibe"),
+		os.O_RDWR|os.O_CREATE, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacyFile.Close() })
+	if _, err := CreateFrom(built, legacyFile, options); err != nil {
+		t.Fatal(err)
+	}
+	primaryFile := createPrimaryPointFile(
+		t, built, options, "primary-scan.vibe",
+	)
+	legacy, err := Open(legacyFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+	primary, err := Open(primaryFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = primary.Close() })
+	primaryRoot := primary.state.Load().root
+	classCounts := filePrimaryLeafClassCounts(t, primaryFile, primaryRoot)
+	t.Logf(
+		"scan leaf class split: narrow=%d wide=%d template=%d",
+		classCounts[storeio.CommonPrimaryLeafNarrow],
+		classCounts[storeio.CommonPrimaryLeafWide],
+		classCounts[storeio.CommonPrimaryLeafTemplate],
+	)
+	if classCounts[storeio.CommonPrimaryLeafTemplate] == 0 {
+		t.Fatalf(
+			"expected template-columnar leaves to be selected; class split = %v",
+			classCounts,
+		)
+	}
+	return legacy, primary, keys, values
+}
+
 func TestFilePrimaryOrderedScanDifferential100K(t *testing.T) {
 	const count = 100_000
-	legacy, primary, keys, values := openPrimaryScanPair(t, count)
+	legacy, primary, keys, values := openRedundantPrimaryScanPair(t, count)
 	legacySnapshot, err := legacy.Snapshot()
 	if err != nil {
 		t.Fatal(err)

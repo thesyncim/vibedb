@@ -1,6 +1,11 @@
 # Template-columnar leaves
 
-**Status:** isolated v2 lab measured; not integrated into the primary.
+**Status:** integrated. The promoted codec lives in
+internal/storeio/template_columnar_leaf.go and is wrapped as the third primary
+leaf class (CommonPrimaryLeafTemplate) in internal/storeio/common_primary_template_leaf.go.
+The bulk builder (BuildPrimaryGraph) selects it per leaf when it lowers page cost
+per document by at least the adoption threshold; point reads splice, ordered
+scans reconstruct surviving rows, and mutations de-template on first write.
 
 **Idea:** keep the ordered leaf envelope, store repeated JSON structure once,
 and address varying fields as packed slots. Selection is per leaf, with raw

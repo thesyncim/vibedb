@@ -59,29 +59,55 @@ func (c *Collection) resolvePrimaryGraph(
 	if err != nil {
 		return dst, false, err
 	}
-	leaf := storeio.AdmittedCommonPrimaryLeaf(
-		leafLease.Page(), state.root.StoreID, route.Bucket,
+	dst, found, err := appendPrimaryLeafValue(
+		dst, leafLease.Page(), state.root.StoreID, route.Bucket,
+		route.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.super.FileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
 	)
-	_, raw, overflow, found := leaf.LookupRawHashed(route.Hash, keyBytes)
+	leafLease.Release()
+	return dst, found, err
+}
+
+// appendPrimaryLeafValue reads one exact inline value from an admitted primary
+// leaf, dispatching on the leaf class recorded in the page. Template leaves
+// splice the exact JSON into dst; raw leaves append the borrowed inline bytes.
+// It allocates nothing when dst has capacity for the value.
+func appendPrimaryLeafValue(
+	dst []byte,
+	page []byte,
+	storeID [16]byte,
+	bucket storeio.BucketID,
+	hash uint64,
+	keyBytes []byte,
+	bounds storeio.CommonPrimaryLeafBounds,
+) ([]byte, bool, error) {
+	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafTemplate {
+		tv, ok := storeio.AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
+		if !ok {
+			return dst, false, fmt.Errorf(
+				"%w: template primary leaf",
+				storeio.ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		out, found := tv.AppendRawByKey(dst, keyBytes)
+		return out, found, nil
+	}
+	leaf := storeio.AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
+	_, raw, overflow, found := leaf.LookupRawHashed(hash, keyBytes)
 	if !found {
-		leafLease.Release()
 		return dst, false, nil
 	}
 	if overflow {
-		leafLease.Release()
 		return dst, false, fmt.Errorf(
 			"%w: overflow ordered-primary value",
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
-	dst = append(dst, raw...)
-	leafLease.Release()
-	return dst, true, nil
+	return append(dst, raw...), true, nil
 }
 
 // resolvePrimaryGraphPageWalk is the rooted resolver retained both as a
@@ -210,31 +236,17 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	if err != nil {
 		return dst, false, err
 	}
-	leaf := storeio.AdmittedCommonPrimaryLeaf(
-		leafLease.Page(), state.root.StoreID, leafRoute.Bucket,
+	dst, found, err := appendPrimaryLeafValue(
+		dst, leafLease.Page(), state.root.StoreID, leafRoute.Bucket,
+		leafRoute.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.super.FileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
 	)
-	_, raw, overflow, found := leaf.LookupRawHashed(
-		leafRoute.Hash, keyBytes,
-	)
-	if !found {
-		leafLease.Release()
-		return dst, false, nil
-	}
-	if overflow {
-		leafLease.Release()
-		return dst, false, fmt.Errorf(
-			"%w: overflow ordered-primary value",
-			ErrPrimaryCutoverUnsupported,
-		)
-	}
-	dst = append(dst, raw...)
 	leafLease.Release()
-	return dst, true, nil
+	return dst, found, err
 }
 
 // validateOpenedPrimaryGraph walks the catalog levels selected by PrimaryRoot

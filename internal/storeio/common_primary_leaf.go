@@ -71,6 +71,12 @@ type CommonPrimaryLeafClass uint8
 const (
 	CommonPrimaryLeafNarrow CommonPrimaryLeafClass = 1
 	CommonPrimaryLeafWide   CommonPrimaryLeafClass = 2
+	// CommonPrimaryLeafTemplate is the template-columnar class. Its payload is a
+	// template-columnar image, not the narrow/wide succinct envelope, so the
+	// slot/hash-directory machinery below returns zero for it: readers dispatch
+	// on this class byte and route to common_primary_template_leaf.go, never to
+	// the narrow/wide decoder.
+	CommonPrimaryLeafTemplate CommonPrimaryLeafClass = 3
 )
 
 func (class CommonPrimaryLeafClass) slots() int {

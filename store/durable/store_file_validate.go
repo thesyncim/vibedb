@@ -257,12 +257,21 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 		bucket := storeio.BucketID(
 			ref.LogicalID - storeio.PrimaryLeafLogicalIDBase,
 		)
+		leafBounds := storeio.CommonPrimaryLeafBounds{
+			FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(),
+			AllocationQuantum: v.pageSize,
+		}
+		// The class byte selects the decoder without probing. An unknown class
+		// falls through to the raw decoder, which rejects it as corrupt.
+		if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafTemplate {
+			_, err = storeio.OpenCommonPrimaryTemplateLeaf(
+				page, header.StoreID, bucket, ref, v.generation.Load(),
+				leafBounds,
+			)
+			return err
+		}
 		_, err = storeio.OpenCommonPrimaryLeaf(
-			page, header.StoreID, bucket, ref, v.generation.Load(),
-			storeio.CommonPrimaryLeafBounds{
-				FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(),
-				AllocationQuantum: v.pageSize,
-			},
+			page, header.StoreID, bucket, ref, v.generation.Load(), leafBounds,
 		)
 		return err
 	case storeio.PageTabletDirectory:

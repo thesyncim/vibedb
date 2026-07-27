@@ -11,7 +11,7 @@ import (
 )
 
 // Qualification command:
-//   go test ./internal/storeio -run '^$' -bench '^BenchmarkTemplateColumnarLeafLab' -benchmem -benchtime=250ms -count=5
+//   go test ./internal/storeio -run '^$' -bench '^BenchmarkTemplateColumnarLeaf' -benchmem -benchtime=250ms -count=5
 //
 // Gates are metrics, not test assertions: low/high saving >=40%/>=25%;
 // selected adversarial overhead <=2%; splice <=60ns for competitive reads
@@ -20,18 +20,18 @@ import (
 // than a stale checked-in verdict.
 
 var (
-	templateColumnarLeafLabBenchBytes []byte
-	templateColumnarLeafLabBenchKind  uint8
-	templateColumnarLeafLabBenchBool  bool
-	templateColumnarLeafLabBenchView  TemplateColumnarLeafLabView
-	templateColumnarLeafLabBenchExt   TemplateColumnarLeafLabExtraction
+	templateColumnarLeafBenchBytes []byte
+	templateColumnarLeafBenchKind  uint8
+	templateColumnarLeafBenchBool  bool
+	templateColumnarLeafBenchView  TemplateColumnarLeafView
+	templateColumnarLeafBenchExt   TemplateColumnarLeafExtraction
 )
 
-func templateColumnarLeafLabCompetitiveRows(
+func templateColumnarLeafCompetitiveRows(
 	count int, high, uniqueShape bool,
-) []TemplateColumnarLeafLabRow {
+) []TemplateColumnarLeafRow {
 	rng := rand.New(rand.NewSource(0x5deece66d))
-	rows := make([]TemplateColumnarLeafLabRow, count)
+	rows := make([]TemplateColumnarLeafRow, count)
 	notes := []string{
 		"steady state, no anomalies observed in the last reporting window",
 		"migrated from the legacy pipeline during the maintenance window",
@@ -60,7 +60,7 @@ func templateColumnarLeafLabCompetitiveRows(
 				`"tags":["alpha","beta","gamma"],"note":"%s"%s}`,
 			i, i, []string{"PT", "ES", "FR", "DE"}[i&3], i%1000, i%3 != 0,
 			tier, region, 1+i%28, note, shape)
-		rows[i] = TemplateColumnarLeafLabRow{
+		rows[i] = TemplateColumnarLeafRow{
 			Slot: uint8((i*197 + 17) & 255),
 			Key:  []byte(fmt.Sprintf("doc:%08d", i)),
 			JSON: json,
@@ -69,7 +69,7 @@ func templateColumnarLeafLabCompetitiveRows(
 	return rows
 }
 
-func BenchmarkTemplateColumnarLeafLabSpace(b *testing.B) {
+func BenchmarkTemplateColumnarLeafSpace(b *testing.B) {
 	for _, tc := range []struct {
 		name         string
 		high, unique bool
@@ -78,12 +78,12 @@ func BenchmarkTemplateColumnarLeafLabSpace(b *testing.B) {
 		{name: "CompetitiveHigh", high: true},
 		{name: "AdversarialUniqueShape", high: true, unique: true},
 	} {
-		rows := templateColumnarLeafLabCompetitiveRows(190, tc.high, tc.unique)
-		image, err := EncodeTemplateColumnarLeafLab(rows)
+		rows := templateColumnarLeafCompetitiveRows(190, tc.high, tc.unique)
+		image, err := EncodeTemplateColumnarLeaf(rows)
 		if err != nil {
 			b.Fatal(err)
 		}
-		raw := TemplateColumnarLeafLabRawBytes(rows)
+		raw := TemplateColumnarLeafRawBytes(rows)
 		selected := min(raw, len(image))
 		saving := float64(raw-selected) / float64(raw) * 100
 		overhead := float64(selected-raw) / float64(raw) * 100
@@ -100,13 +100,13 @@ func BenchmarkTemplateColumnarLeafLabSpace(b *testing.B) {
 	}
 }
 
-func BenchmarkTemplateColumnarLeafLabAppendRaw(b *testing.B) {
-	rows := templateColumnarLeafLabCompetitiveRows(190, true, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func BenchmarkTemplateColumnarLeafAppendRaw(b *testing.B) {
+	rows := templateColumnarLeafCompetitiveRows(190, true, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		b.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -120,14 +120,14 @@ func BenchmarkTemplateColumnarLeafLabAppendRaw(b *testing.B) {
 	b.Run("TemplateSplice", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			templateColumnarLeafLabBenchBytes,
-				templateColumnarLeafLabBenchBool = view.AppendRaw(dst[:0], row.Slot, row.Key)
+			templateColumnarLeafBenchBytes,
+				templateColumnarLeafBenchBool = view.AppendRaw(dst[:0], row.Slot, row.Key)
 		}
 	})
 	b.Run("BatchedResolution", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			templateColumnarLeafLabBenchBytes, _, _ =
+			templateColumnarLeafBenchBytes, _, _ =
 				view.appendRawBatched(dst[:0], rank, ti, false)
 		}
 	})
@@ -138,7 +138,7 @@ func BenchmarkTemplateColumnarLeafLabAppendRaw(b *testing.B) {
 		}
 		b.ReportAllocs()
 		for b.Loop() {
-			templateColumnarLeafLabBenchBytes, _, _ =
+			templateColumnarLeafBenchBytes, _, _ =
 				view.appendRawBatched(dst[:0], rank, ti, true)
 		}
 		b.ReportMetric(float64(before), "segments-before/splice")
@@ -147,25 +147,25 @@ func BenchmarkTemplateColumnarLeafLabAppendRaw(b *testing.B) {
 	b.Run("SkeletonFirstOverlay", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			templateColumnarLeafLabBenchBytes =
+			templateColumnarLeafBenchBytes =
 				view.appendRawSkeletonFirst(dst[:0], rank, ti)
 		}
 	})
 	b.Run("RawLeafCopy", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			templateColumnarLeafLabBenchBytes = append(dst[:0], row.JSON...)
+			templateColumnarLeafBenchBytes = append(dst[:0], row.JSON...)
 		}
 	})
 }
 
-func BenchmarkTemplateColumnarLeafLabField(b *testing.B) {
-	rows := templateColumnarLeafLabCompetitiveRows(190, true, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func BenchmarkTemplateColumnarLeafField(b *testing.B) {
+	rows := templateColumnarLeafCompetitiveRows(190, true, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		b.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -173,20 +173,20 @@ func BenchmarkTemplateColumnarLeafLabField(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var kind document.Kind
-		templateColumnarLeafLabBenchBytes, kind,
-			templateColumnarLeafLabBenchBool = view.Field(slot, 3)
-		templateColumnarLeafLabBenchKind = uint8(kind)
+		templateColumnarLeafBenchBytes, kind,
+			templateColumnarLeafBenchBool = view.Field(slot, 3)
+		templateColumnarLeafBenchKind = uint8(kind)
 	}
 }
 
-func BenchmarkTemplateColumnarLeafLabExtraction(b *testing.B) {
-	row := templateColumnarLeafLabCompetitiveRows(1, true, false)[0]
+func BenchmarkTemplateColumnarLeafExtraction(b *testing.B) {
+	row := templateColumnarLeafCompetitiveRows(1, true, false)[0]
 	storage := make([]vibejson.IndexEntry, len(row.JSON)+2)
-	scratch := TemplateColumnarLeafLabExtraction{
+	scratch := TemplateColumnarLeafExtraction{
 		Skeleton: make([]byte, 0, len(row.JSON)),
-		Holes:    make([]TemplateColumnarLeafLabHole, 0, 32),
+		Holes:    make([]TemplateColumnarLeafHole, 0, 32),
 		Fields:   make([][]byte, 0, 32),
-		Runs:     make([]templateColumnarLeafLabRun, 0, 33),
+		Runs:     make([]templateColumnarLeafRun, 0, 33),
 	}
 	b.Run("ValidationOnly", func(b *testing.B) {
 		b.ReportAllocs()
@@ -200,23 +200,23 @@ func BenchmarkTemplateColumnarLeafLabExtraction(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			var err error
-			templateColumnarLeafLabBenchExt, err =
-				ExtractTemplateColumnarLeafLabInto(row.JSON, storage, &scratch)
+			templateColumnarLeafBenchExt, err =
+				ExtractTemplateColumnarLeafInto(row.JSON, storage, &scratch)
 			if err != nil {
 				b.Fatal(err)
 			}
-			scratch = templateColumnarLeafLabBenchExt
+			scratch = templateColumnarLeafBenchExt
 		}
 	})
 }
 
-func BenchmarkTemplateColumnarLeafLabScan(b *testing.B) {
-	rows := templateColumnarLeafLabCompetitiveRows(190, true, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func BenchmarkTemplateColumnarLeafScan(b *testing.B) {
+	rows := templateColumnarLeafCompetitiveRows(190, true, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		b.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -228,30 +228,30 @@ func BenchmarkTemplateColumnarLeafLabScan(b *testing.B) {
 			out := dst[:0]
 			for rank := range rows {
 				key, _, _ := view.row(rank)
-				out, templateColumnarLeafLabBenchBool =
+				out, templateColumnarLeafBenchBool =
 					view.AppendRaw(out, view.rankSlots[rank], key)
 			}
-			templateColumnarLeafLabBenchBytes = out
+			templateColumnarLeafBenchBytes = out
 		}
 	})
 	b.Run("PredicateSurvivors", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			var survivors int
-			templateColumnarLeafLabBenchBytes, survivors =
+			templateColumnarLeafBenchBytes, survivors =
 				view.AppendEqualRaw(dst[:0], 0, 4, []byte("true"))
-			templateColumnarLeafLabBenchKind = uint8(survivors)
+			templateColumnarLeafBenchKind = uint8(survivors)
 		}
 	})
 }
 
-func BenchmarkTemplateColumnarLeafLabLengthMetadata(b *testing.B) {
-	rows := templateColumnarLeafLabCompetitiveRows(190, true, false)
-	image, err := EncodeTemplateColumnarLeafLab(rows)
+func BenchmarkTemplateColumnarLeafLengthMetadata(b *testing.B) {
+	rows := templateColumnarLeafCompetitiveRows(190, true, false)
+	image, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		b.Fatal(err)
 	}
-	view, err := OpenTemplateColumnarLeafLab(image)
+	view, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -260,23 +260,23 @@ func BenchmarkTemplateColumnarLeafLabLengthMetadata(b *testing.B) {
 	b.ReportMetric(after, "length-vector-B/doc")
 }
 
-func BenchmarkTemplateColumnarLeafLabReseal(b *testing.B) {
-	rows := templateColumnarLeafLabCompetitiveRows(190, false, false)
-	original, err := EncodeTemplateColumnarLeafLab(rows)
+func BenchmarkTemplateColumnarLeafReseal(b *testing.B) {
+	rows := templateColumnarLeafCompetitiveRows(190, false, false)
+	original, err := EncodeTemplateColumnarLeaf(rows)
 	if err != nil {
 		b.Fatal(err)
 	}
 	slot := rows[10].Slot // score is two bytes and replacement preserves width.
 	b.Run("FieldPatchRegionAndRoot", func(b *testing.B) {
 		image := append([]byte(nil), original...)
-		view, err := OpenTemplateColumnarLeafLab(image)
+		view, err := OpenTemplateColumnarLeaf(image)
 		if err != nil {
 			b.Fatal(err)
 		}
 		b.ReportAllocs()
 		b.SetBytes(2)
 		for b.Loop() {
-			if err := patchTemplateColumnarLeafLabFieldFixedAdmitted(
+			if err := patchTemplateColumnarLeafFieldFixedAdmitted(
 				view, slot, 3, []byte("11"),
 			); err != nil {
 				b.Fatal(err)
@@ -288,7 +288,7 @@ func BenchmarkTemplateColumnarLeafLabReseal(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(image)))
 		for b.Loop() {
-			if err := ResealTemplateColumnarLeafLab(image); err != nil {
+			if err := ResealTemplateColumnarLeaf(image); err != nil {
 				b.Fatal(err)
 			}
 		}

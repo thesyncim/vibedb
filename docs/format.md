@@ -324,6 +324,18 @@ logical-ID bands below `NextLogicalID`. Every populated top-level ref has
 `Generation <= root.Generation`; all six are pairwise distinct in both
 `LogicalID` and `Offset`.
 
+Ordered-primary leaves are all `PagePrimaryLeaf` pages; their payload byte
+`[2]` low seven bits are the leaf-class discriminator, read only after the
+common-page checksum has validated the payload. Class `1` is the 4 KiB narrow
+succinct envelope, `2` the 8 KiB wide envelope, and `3` the template-columnar
+class, whose payload from byte `3` on is a template-columnar image (a
+content-addressed template skeleton per shape, packed field slots, a per-leaf
+value dictionary, per-field zone vectors, and region checksums). The bulk
+builder stages the template class per leaf when it lowers the page cost per
+document by at least a quarter versus the raw envelope; readers dispatch on the
+class byte with no payload probing, and a mutation de-templates a template leaf
+back into a raw envelope on first write.
+
 ### Options bits
 
 ```go
