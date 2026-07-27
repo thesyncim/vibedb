@@ -331,47 +331,229 @@ func parseBufferedInplaceValue(raw []byte) (int, bool) {
 	return version, err == nil
 }
 
+// TestFileStoreBufferedInplaceSnapshotForcesCOWFallback pins the per-frame
+// observability rule. A snapshot at generation S can only observe a frame whose
+// current identity was published at or before S, so it forces a copy-on-write
+// fallback only for frames it can actually read. A frame first published inside
+// the buffered window -- born after the newest active snapshot -- is invisible
+// to every reader and stays eligible for the in-place small-update path even
+// while that snapshot is held. The two subtests write both halves explicitly.
 func TestFileStoreBufferedInplaceSnapshotForcesCOWFallback(t *testing.T) {
 	previousZones := store.SetZonePruning(false)
 	defer store.SetZonePruning(previousZones)
 
-	file, err := os.CreateTemp(t.TempDir(), "buffered-inplace-snapshot-*")
-	if err != nil {
-		t.Fatal(err)
+	t.Run("observable frame forces fallback", func(t *testing.T) {
+		file, err := os.CreateTemp(t.TempDir(), "buffered-inplace-observed-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		collection, err := Create(file, bufferedInplaceOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer collection.Close()
+		createValue := bufferedInplaceValue(1)
+		firstTouchValue := bufferedInplaceValue(2)
+		updateValue := bufferedInplaceValue(3)
+		if _, err := collection.Put("key", createValue); err != nil {
+			t.Fatal(err)
+		}
+		if err := collection.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		// The first touch copies the value into a brand-new frame. Snapshot AFTER
+		// that COW so the lease pins the exact frame a second touch would patch;
+		// its birth generation equals the snapshot generation, so it is observable
+		// and in-place must be refused.
+		if _, err := collection.Put("key", firstTouchValue); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := collection.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer snapshot.Close()
+		baseline := collection.Stats().BufferedInplaceUpdates
+		if _, err := collection.Put("key", updateValue); err != nil {
+			t.Fatal(err)
+		}
+		if got := collection.Stats().BufferedInplaceUpdates; got != baseline {
+			t.Fatalf("observable frame allowed in-place update: %d -> %d", baseline, got)
+		}
+		got, found, err := snapshot.AppendRaw(nil, "key")
+		if err != nil || !found || !bytes.Equal(got, firstTouchValue) {
+			t.Fatalf("snapshot value = (%q, %v, %v), want %q", got, found, err, firstTouchValue)
+		}
+		got, found, err = collection.AppendRaw(nil, "key")
+		if err != nil || !found || !bytes.Equal(got, updateValue) {
+			t.Fatalf("current value = (%q, %v, %v), want %q", got, found, err, updateValue)
+		}
+	})
+
+	t.Run("frame born after snapshot goes in-place", func(t *testing.T) {
+		file, err := os.CreateTemp(t.TempDir(), "buffered-inplace-born-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		collection, err := Create(file, bufferedInplaceOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer collection.Close()
+		observedValue := bufferedInplaceValue(1)
+		firstTouchValue := bufferedInplaceValue(2)
+		updateValue := bufferedInplaceValue(3)
+		if _, err := collection.Put("key", observedValue); err != nil {
+			t.Fatal(err)
+		}
+		if err := collection.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		// Snapshot BEFORE the frame's first COW in this window. It observes the
+		// pre-COW frame; the first touch then rehomes the value into a frame born
+		// after the lease, which the second touch may patch in place without the
+		// snapshot ever seeing the mutation.
+		snapshot, err := collection.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer snapshot.Close()
+		if _, err := collection.Put("key", firstTouchValue); err != nil {
+			t.Fatal(err)
+		}
+		baseline := collection.Stats().BufferedInplaceUpdates
+		if _, err := collection.Put("key", updateValue); err != nil {
+			t.Fatal(err)
+		}
+		if got := collection.Stats().BufferedInplaceUpdates; got != baseline+1 {
+			t.Fatalf("post-snapshot frame refused in-place update: %d -> %d", baseline, got)
+		}
+		got, found, err := snapshot.AppendRaw(nil, "key")
+		if err != nil || !found || !bytes.Equal(got, observedValue) {
+			t.Fatalf("snapshot value = (%q, %v, %v), want %q", got, found, err, observedValue)
+		}
+		got, found, err = collection.AppendRaw(nil, "key")
+		if err != nil || !found || !bytes.Equal(got, updateValue) {
+			t.Fatalf("current value = (%q, %v, %v), want %q", got, found, err, updateValue)
+		}
+	})
+}
+
+// TestFileStoreBufferedInplaceLongLivedSnapshotKeepsEngagement holds a snapshot
+// over the pre-mutation image for the entire run and drives hot same-size
+// updates on keys whose frames are all born after the lease. The old
+// collection-wide veto would force every one of those updates to copy-on-write;
+// the per-frame rule keeps in-place engagement identical to the no-snapshot
+// baseline while the snapshot keeps returning its bytes unchanged.
+func TestFileStoreBufferedInplaceLongLivedSnapshotKeepsEngagement(t *testing.T) {
+	previousZones := store.SetZonePruning(false)
+	defer store.SetZonePruning(previousZones)
+
+	const keys = 16
+	const rounds = 64
+	keyName := func(index int) string { return fmt.Sprintf("key-%03d", index) }
+
+	// run creates keys, flushes, optionally opens a long-lived snapshot, then
+	// COWs each key once (a frame born after that lease) before driving rounds of
+	// same-size hot updates. It returns the in-place updates admitted during the
+	// hot loop, the fallbacks it took, and any automatic checkpoints it forced.
+	// Automatic capacity checkpoints periodically reset the first-touch window,
+	// so a handful of hot updates re-pay a first-touch COW; that noise is
+	// identical with and without the snapshot, which is the whole point.
+	run := func(t *testing.T, holdSnapshot bool) (inplace, fallbacks, forced uint64) {
+		t.Helper()
+		file, err := os.CreateTemp(t.TempDir(), "buffered-inplace-longlived-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		collection, err := Create(file, bufferedInplaceOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer collection.Close()
+
+		baseValues := make([][]byte, keys)
+		for index := range keys {
+			baseValues[index] = bufferedInplaceValue(0)
+			if _, err := collection.Put(keyName(index), baseValues[index]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := collection.Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		var snapshot *Snapshot
+		if holdSnapshot {
+			snapshot, err = collection.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer snapshot.Close()
+		}
+
+		// First touch each key: an ordinary COW that rehomes the value into a
+		// frame whose birth generation is newer than the snapshot above.
+		for index := range keys {
+			if _, err := collection.Put(keyName(index), bufferedInplaceValue(1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		before := collection.Stats()
+		for round := 2; round < 2+rounds; round++ {
+			value := bufferedInplaceValue(round)
+			for index := range keys {
+				if _, err := collection.Put(keyName(index), value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !holdSnapshot {
+				continue
+			}
+			// The long-lived lease must return the pre-mutation image byte-for-byte
+			// throughout, proving the in-place patches never disturbed it.
+			for index := range keys {
+				got, found, err := snapshot.AppendRaw(nil, keyName(index))
+				if err != nil || !found || !bytes.Equal(got, baseValues[index]) {
+					t.Fatalf("snapshot key %d round %d = (%q, %v, %v), want %q",
+						index, round, got, found, err, baseValues[index])
+				}
+			}
+		}
+		after := collection.Stats()
+		return after.BufferedInplaceUpdates - before.BufferedInplaceUpdates,
+			after.BufferedInplaceFallbacks - before.BufferedInplaceFallbacks,
+			after.AutomaticCheckpoints - before.AutomaticCheckpoints
 	}
-	defer file.Close()
-	collection, err := Create(file, bufferedInplaceOptions())
-	if err != nil {
-		t.Fatal(err)
+
+	withoutInplace, withoutFallbacks, withoutForced := run(t, false)
+	withInplace, withFallbacks, withForced := run(t, true)
+	total := uint64(keys * rounds)
+	t.Logf("hot in-place engagement over %d updates: without snapshot=%d "+
+		"(fallbacks=%d, forced-cp=%d), with old snapshot=%d (fallbacks=%d, forced-cp=%d)",
+		total, withoutInplace, withoutFallbacks, withoutForced,
+		withInplace, withFallbacks, withForced)
+
+	// The per-frame rule must make the held snapshot free: identical in-place
+	// engagement, identical fallbacks, identical forced checkpoints. Under the
+	// former collection-wide veto the with-snapshot run would have fallen back on
+	// every hot update instead.
+	if withInplace != withoutInplace {
+		t.Fatalf("old snapshot forfeited in-place engagement: with=%d, without=%d",
+			withInplace, withoutInplace)
 	}
-	defer collection.Close()
-	oldValue := bufferedInplaceValue(1)
-	newValue := bufferedInplaceValue(2)
-	if _, err := collection.Put("key", oldValue); err != nil {
-		t.Fatal(err)
+	if withFallbacks != withoutFallbacks {
+		t.Fatalf("old snapshot forced extra fallbacks: with=%d, without=%d",
+			withFallbacks, withoutFallbacks)
 	}
-	if err := collection.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := collection.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	baseline := collection.Stats().BufferedInplaceUpdates
-	if _, err := collection.Put("key", newValue); err != nil {
-		t.Fatal(err)
-	}
-	if got := collection.Stats().BufferedInplaceUpdates; got != baseline {
-		t.Fatalf("snapshot allowed in-place update: %d -> %d", baseline, got)
-	}
-	got, found, err := snapshot.AppendRaw(nil, "key")
-	if err != nil || !found || !bytes.Equal(got, oldValue) {
-		t.Fatalf("snapshot value = (%q, %v, %v), want %q", got, found, err, oldValue)
-	}
-	got, found, err = collection.AppendRaw(nil, "key")
-	if err != nil || !found || !bytes.Equal(got, newValue) {
-		t.Fatalf("current value = (%q, %v, %v), want %q", got, found, err, newValue)
+	// Engagement must stay high: only the occasional post-checkpoint first-touch
+	// COW is allowed to miss the in-place path.
+	if withInplace*10 < total*9 {
+		t.Fatalf("in-place engagement collapsed: %d of %d (<90%%)", withInplace, total)
 	}
 }
 
