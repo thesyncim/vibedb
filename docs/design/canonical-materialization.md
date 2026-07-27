@@ -1,5 +1,17 @@
 # Canonical materialization
 
+**Status:** narrow, capability-gated implementation. Same-length,
+projection-safe asynchronous updates can qualify; the broader mutation set
+remains gated.
+
+**Idea:** overwrite a canonical page only after proving exclusive ownership,
+and protect recovery with a durable before-image capsule. Every failed
+eligibility check falls back to copy-on-write.
+
+The implementation does not graduate by local latency alone. The crash,
+snapshot, read-path, scan, and index requirements in
+[Required gates](#required-gates) are the decision.
+
 ## Decision
 
 Small updates and deletes may overwrite their canonical pages only when the

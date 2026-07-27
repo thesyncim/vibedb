@@ -1,188 +1,145 @@
 # Contributing
 
-Changes must preserve correctness, ownership, portability, and the documented
-allocation contract before they improve a benchmark.
+vibedb changes must preserve storage correctness, snapshot isolation,
+durability, bounded memory, and format validation before improving a benchmark.
+The repository targets Go 1.26 and has no compatibility promise before v1, but
+every format or API break must still leave the current tree internally
+consistent.
 
-## Toolchains
+## Start focused
 
-Use the latest Go 1.26 patch release for the stable portable lane. SIMD changes
-also require the exact development compiler built by:
+Run the smallest package and test that exercise the change while iterating:
 
 ```sh
-./scripts/bootstrap-gotip.sh "$HOME/sdk/vibejson-gotip"
+go test ./internal/storeio -run 'TestName' -count=1
+go test ./store/durable -run 'TestName' -count=1
+go test ./query -run 'TestName' -count=1
 ```
 
-Stable Go builds the portable implementation. The pinned development compiler
-must pass both portable and `GOEXPERIMENT=simd` modes on amd64 and arm64;
-unvalidated compiler families keep the portable source set.
+Use `-count=1` when cached success would hide the run. Add `-race` for
+concurrency, snapshot, cache, combiner, or lease changes. Storage failures need
+the existing fault-injection and reopen oracles, not only a successful happy
+path.
 
-## Required local checks
+## Before handing off
 
-Start with the stable lane:
-
-```sh
-GOTOOLCHAIN=local go test ./...
-GOTOOLCHAIN=local go vet ./...
-```
-
-Then run the pinned compiler in both source modes:
+The local equivalent of the main CI lane is:
 
 ```sh
-export GOTIP="$HOME/sdk/vibejson-gotip/bin/go"
-GOTOOLCHAIN=local "$GOTIP" test ./...
-GOTOOLCHAIN=local GOEXPERIMENT=simd "$GOTIP" test ./...
-GOTOOLCHAIN=local "$GOTIP" vet ./...
-```
-
-Before committing:
-
-```sh
-go generate ./...
-go mod tidy
-go run ./internal/cmd/testcontracts -check
+go build ./...
+go vet ./...
+go test -timeout=25m ./...
+go test -race -timeout=25m \
+  -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' \
+  ./internal/storeio/ ./store/durable/
 git diff --check
 ```
 
-Generated output belongs in the same commit as its generator or source change.
+CI runs these checks on linux/amd64 and linux/arm64. Platform-specific I/O
+changes also require the affected platform: Darwin durability work must prove
+the `F_FULLFSYNC`/`F_BARRIERFSYNC` path; Linux direct-I/O or io_uring work must
+prove fallback and required-mode behavior.
 
-## Correctness
-
-Add the smallest permanent test that proves the changed contract:
-
-- parser and codec behavior needs differential coverage where
-  `encoding/json` has the same semantics;
-- stream changes need fragmented-I/O, boundary, and terminal-state coverage;
-- ownership changes need retained-result, forced-GC, and stack-growth coverage;
-- persistence changes need fault injection, reopen, and previous-generation
-  recovery coverage;
-- optimized routes need portable/accelerated parity and a malformed-input path.
-
-`internal/cmd/testcontracts/contracts.txt` is the machine-checked ownership map
-for test files, fuzz targets, and checked-in corpus seeds. It is checker input,
-not user documentation.
-
-## Unsafe and external memory
-
-Unsafe code is permitted only for a bounded, measured path that ordinary Go
-cannot express without violating a maintained contract.
-
-Do not hide a Go pointer in `uintptr`, depend on a private runtime layout, or
-place Go pointers in external memory.
-
-After changing an unsafe scope:
-
-```sh
-"$GOTIP" run ./internal/cmd/unsafeinventory -write UNSAFE.md
-"$GOTIP" run ./internal/cmd/unsafeinventory -check UNSAFE.md
-"$GOTIP" test -race -skip 'Alloc|ZeroCost|StaysOnStack' ./...
-GOEXPERIMENT=simd "$GOTIP" test \
-  -gcflags=all=-d=checkptr=2 \
-  -skip 'Alloc|ZeroCost|StaysOnStack' ./...
-```
-
-Review the affected bounds, GC visibility, ownership, aliases, and fallback
-behavior in [UNSAFE.md](UNSAFE.md).
-
-## Performance
-
-Compare the change with its merge base using the same compiler, CPU, operating
-system, input, and benchmark duration. Report time, bytes, and allocations.
-Inspect retained memory and generated code when the change affects either.
-
-Use `scripts/bench-gate.sh` for maintained root benchmarks:
-
-```sh
-BENCH_GO="$(command -v go)" BENCH_GOEXPERIMENT= \
-  ./scripts/bench-gate.sh -b HEAD~1 -c 63
-```
-
-The gate rejects statistically significant time regressions above 2% and any
-significant bytes/op or allocations/op increase. A targeted run must record its
-exact selector and row count.
-
-A synthetic kernel result does not justify a specialization by itself. Keep a
-portable implementation and add a route test that proves when the optimized
-path is selected.
-
-### Competitive benchmarks
-
-`bench/competitive` measures `store` and `store/durable` against bbolt, Badger,
-Pebble, and pure-Go SQLite on one shared JSON corpus. It is a **separate Go
-module** with its own `go.mod` that replaces vibejson with `../..`, because the
-root module's dependency set is maintained deliberately: `golang.org/x/sys` and
-nothing else. Never add a competitor dependency to the root `go.mod`;
-`git diff go.mod` must stay empty when this harness changes, and the `competitive`
-CI job fails if any import outside `golang.org/x/sys` reaches the root module.
+The nested competitive harness is a separate module and is not covered by
+`go test ./...` at the root:
 
 ```sh
 cd bench/competitive
-go test -run TestFullEquivalence -v .                      # every engine must agree, on every key
-go test -run '^$' -bench=. -count=6 -timeout=180m . | tee bench.txt
-go build -o /tmp/footprint ./cmd/footprint                 # memory and disk, one engine per process
-/tmp/footprint -engine=baseline -header
-for e in $(/tmp/footprint -list); do /tmp/footprint -engine="$e"; done
+go test -run 'TestFullEquivalence|TestCorpusVariantsAreShapeMatched' \
+  -count=1 -timeout=60m .
 ```
 
-`TestFullEquivalence` is the test that licenses every number the harness
-produces: it checks all 100,000 keys through `Get` byte for byte and checks that
-a scan visits every key exactly once with those same bytes. It is what CI runs.
-A performance number taken from a tree where it does not pass is not a
-measurement.
+Do not add competitor dependencies to the root `go.mod`.
 
-Report medians of `-count=6`, never a single run, and state the machine, the Go
-version, and the corpus variant. Every measured figure belongs in
-[bench/competitive/RESULTS.md](bench/competitive/RESULTS.md) and nowhere else;
-prose refers to it rather than quoting it, because both sides of this comparison
-change and a number pasted into a paragraph goes stale silently.
+## Test discipline
 
-Rules that exist because the harness previously broke each of them and published
-a wrong comparative number:
+Add the smallest permanent test that proves the contract:
 
-- **Disk is reported as apparent size and allocated blocks, and every
-  comparison uses allocated.** Several engines create sparse or preallocated
-  files; summing `st_size` overstated one engine's footprint by 9.7x.
-- **Every disk figure is published for both corpus variants.** The shipped
-  corpus is ~92% redundant and only `store/durable`'s bulk writer exploits that.
-  A single-corpus disk column credits vibejson for the corpus.
-- **`store/durable`'s bulk and `Put`-loop footprints are separate rows.** They
-  are different artifacts; only the bulk path emits the compact representation.
-- **A scan column is labelled "iteration only" unless it reads every byte**, and
-  stands beside an all-bytes column.
-- **`store` is in-memory and is not a competitor.** Its numbers get their own
-  table, captioned as an upper bound on what removing durability buys.
+- Codec changes need byte-exact golden images, checksum-valid semantic
+  corruption cases, reserved-zero validation, and truncation bounds.
+- COW or publication changes need failure injection before and after each
+  write/barrier, reopen, and previous-generation fallback.
+- Canonical materialization needs every capsule/data/root crash cut and
+  idempotent second recovery.
+- Snapshot or reclamation changes need held-old-generation tests, bounded
+  pressure, release/retry, and race coverage.
+- Index changes need hash-collision candidates, exact-value rechecks, aliases,
+  mutation maintenance, and scan differentials.
+- Optimized read/write routes need allocation assertions and a structural
+  oracle such as page acquisitions, device bytes, or route selection.
+- Query changes need heap/durable differential coverage and reusable-workspace
+  tests where the API promises a warmed allocation boundary.
 
-Durability must be matched across every row of a write comparison — on darwin
-that means checking whether an engine reaches `F_FULLFSYNC` or only
-`fsync`/`msync`, which differ by three orders of magnitude. Any non-default
-setting applied to any engine, vibejson's included, must be recorded in that
-engine's `Tuning()` string with its reason, and any setting that changes a call
-shape must be revertible through `Config.Untuned` so `BenchmarkTuning` can
-measure what the correction was worth. A tuning claim that is not a benchmark
-row is not evidence. See
-[bench/competitive/README.md](bench/competitive/README.md) for the full caveats.
+A benchmark is not a correctness test. Keep a deterministic oracle beside each
+new measured phase.
 
-## Documentation
+## Storage-format changes
 
-Update one canonical document:
+[docs/format.md](docs/format.md) is the readable specification; codecs are
+authoritative. Change them together. Preserve or regenerate byte-exact fixtures
+under `internal/storeio/testdata/format0`, and make old or malformed
+development layouts fail closed. Do not add a compatibility branch unless the
+project explicitly adopts a released format.
 
-- [README.md](README.md) for the product surface;
-- [docs/store.md](docs/store.md) for storage and durability behavior;
-- [docs/format.md](docs/format.md) for the durable on-disk byte format;
-- [CONTRIBUTING.md](CONTRIBUTING.md) for build, compiler, test, and benchmark
-  policy;
-- [docs/provenance.md](docs/provenance.md) or [UNSAFE.md](UNSAFE.md) for their
-  machine-checked inventories.
+Update [docs/architecture.md](docs/architecture.md) when a representation or
+root graph changes, and [docs/durability.md](docs/durability.md) when an
+acknowledgement, checkpoint, platform barrier, or recovery window changes.
 
-Do not add historical implementation journals or a second roadmap beside the
-current contract. Describe implemented behavior, measured conditions, and known
-limits. Do not publish product comparisons, unmeasured superlatives, or a
-partial memory counter as total database size.
+## Benchmark discipline
 
-Comparative figures have exactly one home:
-[bench/competitive/RESULTS.md](bench/competitive/RESULTS.md), where every number
-carries its machine, Go version, corpus variant, repetition count, and run mode.
-Nothing in the documents above may quote one; they link. This is not
-bureaucracy — the documents above outlive any particular measurement, and a
-figure pasted into a paragraph keeps asserting itself after the code underneath
-it has changed. The same rule applies to `bench/competitive/README.md`, which
-describes the harness and states no results.
+Follow [docs/performance.md](docs/performance.md). In particular:
+
+- compare the same commit pair, compiler, CPU, OS, filesystem, corpus, seed,
+  duration, writer count, and durability lane;
+- report time, bytes, allocations, device I/O, and tail latency relevant to the
+  changed path;
+- use repeated isolated samples and medians;
+- run correctness before performance;
+- label every value measured, projected, or a gate;
+- never replace a database-level table with an isolated primitive result.
+
+Cross-engine figures have one authoritative home:
+[bench/competitive/RESULTS.md](bench/competitive/RESULTS.md). Record the exact
+commit, dirty state, machine, Go version, corpus variant, mode, and sampling
+method there.
+
+## Adding a research phase
+
+A phase is a bounded experiment that may graduate into the sole production
+path. Add it in this order:
+
+1. State the idea, current status, and invariant it must preserve in one design
+   document under `docs/design/`.
+2. Define explicit correctness, read-path, space, allocation, and latency
+   gates before implementing the lab.
+3. Build the smallest isolated codec or routing experiment under
+   `internal/storeio`, with differential and corruption tests.
+4. Record every measured number with commit, machine, input shape, repetition,
+   and units. Keep projections labeled.
+5. Integrate reads first when the phase changes representation; stop if the
+   standing read gates fail.
+6. Integrate mutation and recovery paths, then run the crash, snapshot, churn,
+   and whole-file matrices.
+7. Promote one representation and remove obsolete paths. Do not leave a
+   permanent reader-visible fallback or overlay to rescue a failed gate.
+
+Rejected ideas and failed gates remain in the design record with their reason;
+they prevent the same unmeasured proposal from recurring.
+
+## Ownership and unsafe code
+
+The caller owns files and explicit snapshot leases. Returned borrowed bytes
+must not outlive their documented owner. Keep Go pointers out of external
+memory, do not retain pointers as `uintptr`, and preserve pointer-free durable
+and mmap-backed layouts.
+
+Review [UNSAFE.md](UNSAFE.md) before changing an unsafe scope and update it only
+when the inventory or its links actually change. Preserve
+[docs/provenance.md](docs/provenance.md) and its evidence requirements for
+externally derived algorithms or source.
+
+## Documentation links
+
+Use relative in-repository links and run the repository link sanity check
+described in the task or review. A moved design document requires updating
+every inbound link in the same change.

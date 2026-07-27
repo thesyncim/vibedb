@@ -1,9 +1,22 @@
 # Ordered hybrid store
 
-This is the promotion specification for the next durable primary and exact
-index format. It is intentionally stricter than a design sketch: every number
-is labeled as measured, projected, or a gate, and no isolated primitive becomes
-the default until the complete store passes the gates at the end.
+**Status:** promotion specification; candidate primitives are measured, the
+complete primary is not the default.
+
+**Idea:** route lexically to a tablet and leaf, use bounded hashes inside that
+leaf, and keep exact key/value bytes in lexical order. Readers retain one
+canonical representation; mutations publish complete generations.
+
+**Decision rule:** every number below is measured, projected, or a gate. No
+isolated primitive becomes the default until the complete store passes
+[the promotion gates](#promotion-gates).
+
+**Measured evidence:** in the [cited M4 Max runs](#ordered-hash-leaf), the
+isolated ordered leaf measures 30.0–31.1 ns hits, 49.3–50.9 ns misses, and
+5.14–5.17 ns/document lexical iteration; the combined resident route measures
+185.8 ns with hashing included. These omit publication, snapshot COW,
+secondary maintenance, and I/O. The complete store is therefore still judged
+by the end-to-end gates, not these primitive results.
 
 The target is not an LSM. Readers consult one immutable published generation,
 with no memtable, delta, tombstone, version-chain, or merge cursor. Mutations
@@ -494,6 +507,8 @@ the ordered-scan mix. Those are explicit open gaps, not projected wins.
 
 ## Design references
 
+- [Architecture overview](../architecture.md)
+- [Performance baseline](../performance.md)
 - [Wormhole: A Fast Ordered Index for In-memory Data Management](https://wuxb45.github.io/papers/wormhole.pdf)
 - [Abseil Swiss Tables design notes](https://abseil.io/about/design/swisstables)
 - [Faster Go maps with Swiss Tables](https://go.dev/blog/swisstable)

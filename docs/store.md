@@ -6,8 +6,8 @@ methods and option fields.
 
 The proposed sole next-generation primary, its invariants, 100-billion-key
 bounds, space accounting, weaknesses, and promotion gates are specified in
-[ordered-hybrid-store.md](ordered-hybrid-store.md). That document describes a
-target; this file describes the APIs and formats that are implemented today.
+[design/ordered-hybrid-store.md](design/ordered-hybrid-store.md). That document
+describes a target; this file describes the APIs and formats implemented today.
 
 ## Storage surfaces
 

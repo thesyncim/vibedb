@@ -1,7 +1,13 @@
 # Recovery-only redo journal
 
-Design for closing the synchronous-write gap without touching the read
-path. Everything here is projected until the qualification benchmarks run.
+**Status:** future design. Every performance effect below is projected until
+the qualification benchmarks and crash matrix run.
+
+**Idea:** sync a bounded redo record in a separate file for acknowledgement,
+while readers continue to use canonical frames only. Checkpoint later folds
+the records into the ordinary root publication protocol.
+
+Promotion is controlled by [Projected effect and gates](#projected-effect-and-gates).
 
 ## The insight
 

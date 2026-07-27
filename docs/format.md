@@ -1,12 +1,12 @@
 # On-disk format
 
-This document specifies the byte-level mutable on-disk format written and read
-by `store/durable` (backed by `internal/storeio`): the fixed file prefix, the
-inline generation root, the common page envelope, every page kind's payload
-layout, the checksum scheme, and both commit/crash-recovery protocols.
+This document is the readable map of the current mutable byte format written
+by `store/durable` and decoded by `internal/storeio`. It covers the fixed
+prefix, alternating inline roots, common envelope, every current page payload,
+checksums, publication, recovery, and reclamation.
 
 It does not cover API surface, `Options` semantics, defaults, or mutation
-behavior (snapshots and index construction) — see `docs/store.md` for that.
+behavior (snapshots and index construction) — see [store.md](store.md).
 It does not cover the two I/O backends' wire protocol with the kernel
 (`internal/storeio/ring_linux.go`, `device_portable.go`) beyond noting their
 existence in the commit-protocol section; that is an implementation detail of
@@ -15,6 +15,21 @@ itself.
 
 All multi-byte integers are little-endian. All sizes are in bytes unless
 stated otherwise.
+
+## How to read this specification
+
+Start with [Overview](#overview), [Mutable file prefix](#mutable-file-prefix),
+[Inline root](#inline-root-sjinl001), [Common page envelope](#common-page-envelope),
+and [StateRoot](#stateroot). Then follow the `PageRef` from `StateRoot` into the
+payload section for the required page kind. Publication and recovery are in
+[Commit and durability protocol](#commit-and-durability-protocol).
+
+The words **must**, **required**, and **reject** describe decoder validation.
+Reserved bytes are zero unless a table states otherwise. Offsets are relative
+to the start of the enclosing record or payload; ranges are half-open.
+
+Every byte-layout table below is normative for this development tree, subject
+to the codec-authority rule in the next section.
 
 ## Authority and development lineage
 
@@ -1121,12 +1136,14 @@ The remaining format-0 completion gates are:
 
 ## See also
 
-- `docs/store.md` — public API, `Options` semantics and defaults, mutation
+- [store.md](store.md) — public API, `Options` semantics and defaults, mutation
   and query behavior, snapshots, and index construction.
-- `docs/provenance.md` — externally derived source/algorithm inventory; the
+- [durability.md](durability.md) — acknowledgement and platform persistence
+  contracts layered over this publication format.
+- [provenance.md](provenance.md) — externally derived source/algorithm inventory; the
   on-disk format itself is original to this repository and has no
   provenance-ledger entry (the Roaring-inspired posting/candidate execution
   strategy it stores is ledger entry `ALGO-ROARING-001`, but that entry
   covers in-memory execution, not this file format).
-- `UNSAFE.md` — safety invariants for the `unsafe`-using code that
+- [UNSAFE.md](../UNSAFE.md) — safety invariants for the `unsafe`-using code that
   interprets these bytes.

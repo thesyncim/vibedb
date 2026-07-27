@@ -1,7 +1,13 @@
 # Parallel tablet writers
 
-Design of record for intra-collection write concurrency on the ordered
-primary graph. Projections only until the harness's multi-writer lanes run.
+**Status:** future design; projections only until the harness's 8- and
+64-writer lanes run.
+
+**Idea:** serialize mutations within one tablet, execute distinct tablets in
+parallel, and batch only shared catalog/root edits through an epoch publisher.
+
+The single-writer lane must not regress, and the honest serialization floor is
+recorded in [Honest limits](#honest-limits).
 
 ## Why the format already permits this
 

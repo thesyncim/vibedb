@@ -1,8 +1,15 @@
 # Template-columnar leaves
 
-This is the design and qualification plan for a third primary-leaf class.
-Every number here is a projection or a gate until the lab says otherwise;
-nothing in this document licenses a performance claim.
+**Status:** isolated v2 lab measured; not integrated into the primary.
+
+**Idea:** keep the ordered leaf envelope, store repeated JSON structure once,
+and address varying fields as packed slots. Selection is per leaf, with raw
+fallback.
+
+The [v2 verdict](#v2-verdict-and-adoption-policy) records measured results.
+The earlier table remains projected, and the
+[qualification gates](#qualification-gates-isolated-lab-first) remain the
+integration contract. Nothing here is a database-level performance claim.
 
 ## Observation
 

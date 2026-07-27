@@ -1,5 +1,11 @@
 # Engine unification: one in-memory durable store
 
+**Status:** plan of record; not the current public surface.
+
+**Idea:** one `Collection` operates on canonical frames, with either a real
+device or a null device. Durability becomes a mode rather than a second
+mutable engine.
+
 This is the plan of record for collapsing the two mutable engines into one.
 The goal is a single `Collection` that is simultaneously the in-memory store
 and the durable store: reads and buffered writes execute against canonical
@@ -40,7 +46,7 @@ page codecs. They are not a second engine.
 
 1. **vNext primary read paths** (ordered-hybrid steps 4–5): tablet catalog
    root, point read, lexical cursors, with the promotion gates from
-   docs/ordered-hybrid-store.md. The cutover must not hand unified users a
+   [ordered-hybrid-store.md](ordered-hybrid-store.md). The cutover must not hand unified users a
    slower read path than the heap engine they lose.
 2. **vNext bulk build and mutations** (steps 6–7): stable-slot update/delete,
    buffered acknowledgement against owned canonical leaf frames.

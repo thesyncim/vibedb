@@ -1,8 +1,26 @@
 # Read-neutral hybrid mutations
 
+**Status:** batched directory/key work and automatic combining are implemented;
+canonical-frame coalescing across a buffered checkpoint epoch remains future
+work.
+
+**Idea:** batch aggressively on the writer side, then publish one complete
+canonical generation. No queue or intermediate representation is reachable
+from a reader.
+
+The acceptance matrix and measured random-mutation evidence are
+[front-line gates](#workload-and-acceptance-matrix), not optional follow-up.
+
+**Measured evidence:** in the
+[cited 4,096-row asynchronous matrix](#current-random-mutation-evidence),
+batch-64 replace/delete paths measure 20.8–35.9 µs/document versus
+379–465 µs/document for batch 1, depending on operation and index state. Those
+results prove batching leverage; they do not meet the ordered primary's
+sub-microsecond acknowledgement gates.
+
 ## Decision
 
-VibeJSON should not put an LSM tree, persistent mutation log, tombstone table,
+vibedb should not put an LSM tree, persistent mutation log, tombstone table,
 or delta chain in front of the durable collection.
 
 The durable mutation path should instead become a **materialized mutation
@@ -170,7 +188,7 @@ strict size bound reduce the cost of the first choice but do not remove it.
 This is why Bw-tree-style page deltas, FASTER-style hybrid-log records, a
 WiredTiger-style update chain, and a one-level mini-LSM are not the core design
 here. They are useful designs with different read/visibility trade-offs. The
-VibeJSON requirement selects materialization before publication.
+vibedb requirement selects materialization before publication.
 
 ## What exists now
 
@@ -495,7 +513,7 @@ The design uses ideas selectively:
   a search walks the delta chain before the base page.
 - [FASTER](https://www.microsoft.com/en-us/research/uploads/prod/2018/03/faster-sigmod18.pdf)
   demonstrates adaptive hot in-place updates plus a colder append path. Its
-  hybrid-log trade-off is useful context, but VibeJSON's immutable snapshots
+  hybrid-log trade-off is useful context, but vibedb's immutable snapshots
   and strict canonical-read requirement select a different boundary.
 
 The result is deliberately narrower than all three: batch aggressively on the
