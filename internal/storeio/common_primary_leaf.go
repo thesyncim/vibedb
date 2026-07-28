@@ -21,6 +21,11 @@ import (
 const (
 	CommonPrimaryLeafNarrowBytes = 4 << 10
 	CommonPrimaryLeafWideBytes   = 8 << 10
+	// CommonPrimaryLeafMaxExtentBytes is the largest physical extent any primary
+	// leaf may occupy. The succinct classes are 4/8 KiB, but a compact leaf may
+	// use up to this extent, and a mutation de-compacts one into a raw leaf of up
+	// to this size before the structural path re-fits it into wide leaves.
+	CommonPrimaryLeafMaxExtentBytes = 64 << 10
 
 	CommonPrimaryLeafNormalSlots = 192
 	CommonPrimaryLeafNarrowSlots = 217
@@ -91,6 +96,15 @@ const (
 	// on this class byte and route to common_primary_template_leaf.go, never to
 	// the narrow/wide decoder.
 	CommonPrimaryLeafTemplate CommonPrimaryLeafClass = 3
+	// CommonPrimaryLeafCompact is the compact document-group class. Its payload
+	// is an embedded document-group image (one shared shape template table and
+	// value dictionary per leaf, each row a token stream) addressed by lexical
+	// rank, not the narrow/wide succinct envelope. It is the ordered-primary form
+	// of DocumentFormatCompact: readers dispatch on this class byte and route to
+	// common_primary_compact_leaf.go, which reconstructs the exact original JSON
+	// per row. Like the template class its stable posting slot is the lexical
+	// rank, so slots()/stashSlots() return zero for it.
+	CommonPrimaryLeafCompact CommonPrimaryLeafClass = 4
 )
 
 func (class CommonPrimaryLeafClass) slots() int {

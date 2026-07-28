@@ -263,8 +263,15 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 		}
 		// The class byte selects the decoder without probing. An unknown class
 		// falls through to the raw decoder, which rejects it as corrupt.
-		if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafTemplate {
+		switch storeio.PrimaryLeafClass(page) {
+		case storeio.CommonPrimaryLeafTemplate:
 			_, err = storeio.OpenCommonPrimaryTemplateLeaf(
+				page, header.StoreID, bucket, ref, v.generation.Load(),
+				leafBounds,
+			)
+			return err
+		case storeio.CommonPrimaryLeafCompact:
+			_, err = storeio.OpenCommonPrimaryCompactLeaf(
 				page, header.StoreID, bucket, ref, v.generation.Load(),
 				leafBounds,
 			)

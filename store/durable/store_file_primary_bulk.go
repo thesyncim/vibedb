@@ -54,9 +54,9 @@ func CreateFromPrimary(
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
-	if options.DocumentFormat != DocumentFormatVerbatim {
+	if options.DocumentFormat > DocumentFormatCompact {
 		return 0, fmt.Errorf(
-			"%w: compact documents are not available in CreateFromPrimary",
+			"%w: unknown document format",
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
@@ -123,8 +123,16 @@ func CreateFromPrimary(
 		)
 	}
 
-	storeID := primaryBulkStoreID(records, normalized)
-	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records)
+	// DocumentFormatCompact stages every leaf as the compact document-group
+	// class; verbatim uses the adaptive succinct/template classes. The policy is
+	// threaded identically into the page-count reservation and the build so the
+	// single staging transaction reserves exactly the leaves the build produces.
+	leafPolicy := storeio.PrimaryLeafAdaptive
+	if options.DocumentFormat == DocumentFormatCompact {
+		leafPolicy = storeio.PrimaryLeafCompact
+	}
+	storeID := primaryBulkStoreID(records, normalized, options.DocumentFormat)
+	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records, leafPolicy)
 	if err != nil {
 		return 0, err
 	}
@@ -213,7 +221,7 @@ func CreateFromPrimary(
 		return 0, err
 	}
 	placements := make([]storeio.PrimaryGraphPlacement, len(records))
-	primaryRoot, err := storeio.BuildPrimaryGraphPlaced(tx, records, placements)
+	primaryRoot, err := storeio.BuildPrimaryGraphPlaced(tx, records, placements, leafPolicy)
 	if err != nil {
 		_ = tx.Abort()
 		_ = committer.Close()
@@ -324,9 +332,14 @@ func sortPrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error {
 func primaryBulkStoreID(
 	records []storeio.PrimaryGraphRecord,
 	options normalizedFileStoreOptions,
+	format DocumentFormat,
 ) [16]byte {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("vibejson primary bulk v1\x00"))
+	// The document format changes the physical leaf image byte for byte, so a
+	// compact build must not share an identity with a verbatim one over the same
+	// records and policy.
+	_, _ = hash.Write([]byte{byte(format)})
 	var fixed [8]byte
 	writeUint64 := func(value uint64) {
 		binary.LittleEndian.PutUint64(fixed[:], value)

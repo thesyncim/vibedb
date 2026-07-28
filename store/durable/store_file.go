@@ -200,11 +200,13 @@ const (
 	// holding contiguous JSON, which a scan hands to its callback as a
 	// borrowed slice with no decoding at all.
 	DocumentFormatVerbatim DocumentFormat = iota
-	// DocumentFormatCompact packs consecutive chunks into PageDocumentGroup
-	// extents that store one shape template and one value dictionary per page
-	// and reduce each row to a token stream. Reading a row means reassembling
-	// it from roughly two dozen fragments, which is where the scan cost is; see
-	// DocumentFormat for the numbers.
+	// DocumentFormatCompact stores documents as a grouped image that keeps one
+	// shape template and one value dictionary per container and reduces each row
+	// to a token stream: on the chunk layout consecutive chunks become
+	// PageDocumentGroup extents, and on the ordered primary graph each leaf
+	// embeds the same grouped payload as the compact leaf class. Reading a row
+	// means reassembling it from roughly two dozen fragments, which is where the
+	// scan cost is; see DocumentFormat for the numbers.
 	DocumentFormatCompact
 )
 
@@ -227,9 +229,11 @@ type Options struct {
 	// can reduce these values without parsing JSON. Missing, non-numeric, and
 	// non-finite values are omitted from the column.
 	Float64Columns []string
-	// DocumentFormat selects how CreateFrom stores document bytes. It has no
-	// effect on Open, Put, or Update: a collection reads both representations
-	// unconditionally, and ordinary writes always produce the verbatim one.
+	// DocumentFormat selects how a bulk build (CreateFrom on the chunk layout,
+	// CreateFromPrimary on the ordered primary graph) stores document bytes. It
+	// has no effect on Open, Put, or Update: a collection reads both
+	// representations unconditionally, and ordinary writes always produce the
+	// verbatim one (a compact leaf de-compacts on its first mutation).
 	DocumentFormat DocumentFormat
 
 	PageSize      int
@@ -1670,8 +1674,13 @@ func Open(file *os.File, options Options) (*Collection, error) {
 		return nil, err
 	}
 	if root.PrimaryRoot != (storeio.PageRef{}) {
+		// A compact leaf packs far more rows than a wide leaf holds raw, so its
+		// first mutation de-compacts it into a leaf as large as the 64 KiB maximum
+		// leaf extent before the structural path re-fits and splits it back into
+		// wide leaves. The mutation scratch must therefore cover the largest leaf,
+		// not just the wide class.
 		collection.primaryLeafScratch = make(
-			[]byte, storeio.CommonPrimaryLeafWideBytes,
+			[]byte, storeio.CommonPrimaryLeafMaxExtentBytes,
 		)
 		collection.primaryRootScratch = make(
 			[]byte, storeio.SegmentedTabletRouterRootBytes,

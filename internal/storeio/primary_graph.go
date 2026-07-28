@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 )
 
 // PrimaryGraphRecord is one immutable key/value row supplied to
@@ -34,6 +35,14 @@ const (
 	PrimaryLeafAdaptive PrimaryLeafClassPolicy = iota
 	PrimaryLeafNarrow
 	PrimaryLeafWide
+	// PrimaryLeafCompact stages every leaf as the compact document-group class
+	// (CommonPrimaryLeafCompact), the ordered-primary form of
+	// DocumentFormatCompact. It is orthogonal to the succinct narrow/wide extent
+	// choice: a compact leaf packs its rows into whichever power-of-two extent
+	// best fills, and a run that cannot be grouped (a single trailing row, or a
+	// document too large to co-locate) falls back to an adaptive raw leaf, since
+	// readers dispatch per leaf on the class byte.
+	PrimaryLeafCompact
 )
 
 const (
@@ -50,6 +59,10 @@ type primaryLeafPlan struct {
 	last    int
 	class   CommonPrimaryLeafClass
 	records []CommonPrimaryLeafRecord
+	// extent is the chosen physical page size for a compact leaf, whose extent
+	// is packing-dependent rather than fixed by class. Zero means "derive from
+	// class" (narrow=4 KiB, wide=8 KiB, template=4 KiB).
+	extent int
 }
 
 type primaryBuiltLeaf struct {
@@ -85,17 +98,20 @@ func ShortestPrimaryFence(dst, leftMax, rightMin []byte) ([]byte, error) {
 
 // PrimaryGraphBuildStats reports how many leaves the bulk builder staged in
 // each leaf class. LeavesByClass is indexed by CommonPrimaryLeafClass value
-// (1 narrow, 2 wide, 3 template-columnar); index 0 is unused. It exists so a
-// caller can assert the adopted class mix deterministically without re-reading
-// the durable graph.
+// (1 narrow, 2 wide, 3 template-columnar, 4 compact); index 0 is unused. It
+// exists so a caller can assert the adopted class mix deterministically without
+// re-reading the durable graph.
 type PrimaryGraphBuildStats struct {
-	LeavesByClass [4]int
+	LeavesByClass [5]int
 }
 
 // Leaves returns the total leaf count across classes.
 func (s PrimaryGraphBuildStats) Leaves() int {
-	return s.LeavesByClass[0] + s.LeavesByClass[1] +
-		s.LeavesByClass[2] + s.LeavesByClass[3]
+	total := 0
+	for _, count := range s.LeavesByClass {
+		total += count
+	}
+	return total
 }
 
 // BuildPrimaryGraph deterministically stages one complete ordered primary
@@ -164,7 +180,7 @@ func buildPrimaryGraphPlaced(
 	if len(policy) == 1 {
 		selected = policy[0]
 	}
-	if selected > PrimaryLeafWide {
+	if selected > PrimaryLeafCompact {
 		return PageRef{}, stats, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
 	}
 	for at := range records {
@@ -216,7 +232,7 @@ func PrimaryGraphPageCount(
 	if len(policy) == 1 {
 		selected = policy[0]
 	}
-	if selected > PrimaryLeafWide {
+	if selected > PrimaryLeafCompact {
 		return 0, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
 	}
 	for at := range records {
@@ -281,6 +297,9 @@ func planPrimaryLeaves(
 	records []PrimaryGraphRecord,
 	policy PrimaryLeafClassPolicy,
 ) ([]primaryLeafPlan, error) {
+	if policy == PrimaryLeafCompact {
+		return planCompactPrimaryLeaves(tx, records)
+	}
 	plans := make([]primaryLeafPlan, 0,
 		(len(records)+CommonPrimaryLeafNarrowLive-1)/CommonPrimaryLeafNarrowLive)
 	scratch := make([]byte, CommonPrimaryLeafWideBytes)
@@ -395,6 +414,157 @@ func planPrimaryLeaves(
 	return plans, nil
 }
 
+// compactLeafExtents are the physical extents a compact leaf may occupy, from
+// the 4 KiB minimum to the 64 KiB maximum. A leaf picks the one that packs its
+// rows at the lowest byte-per-row cost, so small documents fill a small extent
+// densely while large ones spread into a larger extent rather than wasting a
+// fixed one.
+var compactLeafExtents = [...]int{
+	CommonPrimaryLeafNarrowBytes, CommonPrimaryLeafWideBytes,
+	16 << 10, 32 << 10, 64 << 10,
+}
+
+// planCompactPrimaryLeaves packs records into compact document-group leaves.
+// Each leaf takes the row count and extent that minimise byte-per-row within the
+// row-slot ceiling, and any run that cannot be grouped — a lone trailing row, or
+// a document too large to co-locate with a neighbour — falls back to one adaptive
+// raw leaf, which reads dispatch to on the class byte just like the compact ones.
+func planCompactPrimaryLeaves(
+	tx *WriteTransaction,
+	records []PrimaryGraphRecord,
+) ([]primaryLeafPlan, error) {
+	var plans []primaryLeafPlan
+	builder := NewCompactPrimaryLeafBuilder()
+	scratch := make([]byte, CommonPrimaryLeafWideBytes)
+	bounds := CommonPrimaryLeafBounds{
+		FileEnd:           tx.fileEnd,
+		NextLogicalID:     tx.nextID,
+		AllocationQuantum: tx.options.PageSize,
+	}
+	window := make([]CommonPrimaryLeafRecord, 0, CommonPrimaryCompactLeafMaxRows)
+	rawLeaf := func(first int) (primaryLeafPlan, error) {
+		candidate := []CommonPrimaryLeafRecord{{
+			Key:   records[first].Key,
+			Value: CommonPrimaryLeafValue{Inline: records[first].Value},
+		}}
+		class, err := fitPrimaryLeaf(scratch, tx, bounds, candidate, PrimaryLeafAdaptive)
+		if err != nil {
+			return primaryLeafPlan{}, fmt.Errorf(
+				"%w: compact leaf raw fallback", err)
+		}
+		return primaryLeafPlan{
+			first: first, last: first + 1, class: class, records: candidate,
+		}, nil
+	}
+	for first := 0; first < len(records); {
+		remaining := len(records) - first
+		if remaining >= 2 {
+			hi := min(CommonPrimaryCompactLeafMaxRows, remaining)
+			window = window[:0]
+			for at := range hi {
+				window = append(window, CommonPrimaryLeafRecord{
+					Key:   records[first+at].Key,
+					Value: CommonPrimaryLeafValue{Inline: records[first+at].Value},
+				})
+			}
+			count, extent, err := planCompactLeaf(builder, window)
+			if err != nil {
+				return nil, err
+			}
+			if count >= 2 {
+				plans = append(plans, primaryLeafPlan{
+					first: first, last: first + count,
+					class:   CommonPrimaryLeafCompact,
+					records: append([]CommonPrimaryLeafRecord(nil), window[:count]...),
+					extent:  extent,
+				})
+				first += count
+				continue
+			}
+		}
+		plan, err := rawLeaf(first)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, plan)
+		first++
+	}
+	return plans, nil
+}
+
+// planCompactLeaf chooses the row count and extent for one compact leaf from the
+// front of window, minimising byte-per-row. It returns count 0 when not even two
+// rows can be grouped into the largest extent, signalling a raw fallback.
+func planCompactLeaf(
+	builder *CompactPrimaryLeafBuilder, window []CommonPrimaryLeafRecord,
+) (int, int, error) {
+	if len(window) < 2 {
+		return 0, 0, nil
+	}
+	// A compact leaf de-compacts into a raw wide leaf on its first mutation, so
+	// it must never hold more rows than a 64 KiB wide leaf can carry raw.
+	hiRows := commonPrimaryLeafRawWideCapacity(window, 64<<10)
+	if hiRows < 2 {
+		return 0, 0, nil
+	}
+	window = window[:hiRows]
+	if err := builder.extractRecords(window); err != nil {
+		return 0, 0, err
+	}
+	memo := make(map[int]int, len(window))
+	imageBytes := func(count int) (int, error) {
+		if cached, ok := memo[count]; ok {
+			return cached, nil
+		}
+		size, err := builder.prefixImageBytes(count)
+		if err != nil {
+			return 0, err
+		}
+		memo[count] = size
+		return size, nil
+	}
+	// maxFitting returns the largest count in [2, hi] whose image fits cap, or 0.
+	// The image grows monotonically with count, so a binary search suffices.
+	maxFitting := func(capacity, hi int) (int, error) {
+		if hi < 2 {
+			return 0, nil
+		}
+		best := 0
+		lo, high := 2, hi
+		for lo <= high {
+			mid := (lo + high) / 2
+			size, err := imageBytes(mid)
+			if err != nil {
+				return 0, err
+			}
+			if size <= capacity {
+				best = mid
+				lo = mid + 1
+			} else {
+				high = mid - 1
+			}
+		}
+		return best, nil
+	}
+	bestCount, bestExtent := 0, 0
+	bestRatio := math.MaxFloat64
+	for _, extent := range compactLeafExtents {
+		capacity := extent - PageHeaderSize - PageTrailerSize
+		count, err := maxFitting(capacity, len(window))
+		if err != nil {
+			return 0, 0, err
+		}
+		if count < 2 {
+			continue
+		}
+		ratio := float64(extent) / float64(count)
+		if ratio < bestRatio {
+			bestCount, bestExtent, bestRatio = count, extent, ratio
+		}
+	}
+	return bestCount, bestExtent, nil
+}
+
 // planTemplateLeafCount returns the largest number of records from first that a
 // template-columnar leaf should hold: the most that fit one 4 KiB template page,
 // capped at the raw wide-leaf capacity (so the leaf can be de-templated back for
@@ -465,6 +635,35 @@ func primaryLeafRawWideCapacity(
 	return count
 }
 
+// commonPrimaryLeafRawWideCapacity returns the largest prefix of records that
+// fits one raw wide leaf of extentBytes. A compact leaf de-compacts back into a
+// raw wide envelope on its first mutation, so the compact planner caps a leaf's
+// rows at this value for the 64 KiB maximum extent — otherwise a full compact
+// leaf could not be rewritten as a raw leaf and a Put on it would fail.
+func commonPrimaryLeafRawWideCapacity(
+	records []CommonPrimaryLeafRecord, extentBytes int,
+) int {
+	capacity := extentBytes - PageHeaderSize - PageTrailerSize
+	recordBytes := 0
+	count := 0
+	for count < CommonPrimaryLeafWideSlots && count < len(records) {
+		row := records[count]
+		grown := recordBytes + len(row.Key) + len(row.Value.Inline)
+		if len(row.Key) >= commonPrimaryLeafEscapeLength {
+			grown++
+		}
+		layout := commonPrimaryLeafLayoutFor(
+			CommonPrimaryLeafWide, count+1, extentBytes,
+		)
+		if layout.heapStart+grown > capacity {
+			break
+		}
+		recordBytes = grown
+		count++
+	}
+	return count
+}
+
 func fitPrimaryLeaf(
 	scratch []byte,
 	tx *WriteTransaction,
@@ -520,6 +719,7 @@ func buildPrimaryLeaves(
 		NextLogicalID:     tx.nextID,
 		AllocationQuantum: tx.options.PageSize,
 	}
+	var compactBuilder *CompactPrimaryLeafBuilder
 	for rank := range plans {
 		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
 		localID := uint32(rank % TabletLocalIdentityLocalCount)
@@ -529,8 +729,11 @@ func buildPrimaryLeaves(
 			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
 		}
 		pageSize := uint32(CommonPrimaryLeafNarrowBytes)
-		if plans[rank].class == CommonPrimaryLeafWide {
+		switch plans[rank].class {
+		case CommonPrimaryLeafWide:
 			pageSize = CommonPrimaryLeafWideBytes
+		case CommonPrimaryLeafCompact:
+			pageSize = uint32(plans[rank].extent)
 		}
 		page, err := tx.Allocate(PagePrimaryLeaf, pageSize, logicalID)
 		if err != nil {
@@ -541,17 +744,29 @@ func buildPrimaryLeaves(
 			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
 			Bucket: BucketID(bucket), PageSize: pageSize,
 		}
-		if plans[rank].class == CommonPrimaryLeafTemplate {
+		switch plans[rank].class {
+		case CommonPrimaryLeafTemplate:
 			if _, err := EncodeCommonPrimaryTemplateLeaf(
 				page.Bytes(), leafHeader, plans[rank].records, bounds,
 			); err != nil {
 				return nil, err
 			}
-		} else if _, err := EncodeCommonPrimaryLeaf(
-			page.Bytes(), plans[rank].class, leafHeader,
-			tx.options.StoreID, plans[rank].records, bounds,
-		); err != nil {
-			return nil, err
+		case CommonPrimaryLeafCompact:
+			if compactBuilder == nil {
+				compactBuilder = NewCompactPrimaryLeafBuilder()
+			}
+			if _, err := EncodeCommonPrimaryCompactLeaf(
+				page.Bytes(), leafHeader, plans[rank].records, bounds, compactBuilder,
+			); err != nil {
+				return nil, err
+			}
+		default:
+			if _, err := EncodeCommonPrimaryLeaf(
+				page.Bytes(), plans[rank].class, leafHeader,
+				tx.options.StoreID, plans[rank].records, bounds,
+			); err != nil {
+				return nil, err
+			}
 		}
 		if placements != nil {
 			if err := recordPrimaryPlacements(
@@ -574,10 +789,11 @@ func buildPrimaryLeaves(
 }
 
 // recordPrimaryPlacements fills the posting-stable slot for every input row of
-// one just-encoded leaf. A template leaf assigns slot = ordinal within the leaf
-// (the lexical rank the template builder stamped as each row's Slot); a succinct
-// leaf resolves the row's stable hash-directory slot from the encoded image, so
-// the placement matches exactly what a later lookup recovers.
+// one just-encoded leaf. The template and compact classes assign slot = ordinal
+// within the leaf (the lexical rank, which VisitPrimaryLeafPostingRows yields for
+// those classes); a succinct leaf resolves the row's stable hash-directory slot
+// from the encoded image, so the placement matches exactly what a later lookup
+// recovers.
 func recordPrimaryPlacements(
 	placements []PrimaryGraphPlacement,
 	input []PrimaryGraphRecord,
@@ -587,7 +803,8 @@ func recordPrimaryPlacements(
 	storeID [16]byte,
 	bounds CommonPrimaryLeafBounds,
 ) error {
-	if plan.class == CommonPrimaryLeafTemplate {
+	if plan.class == CommonPrimaryLeafTemplate ||
+		plan.class == CommonPrimaryLeafCompact {
 		for at := plan.first; at < plan.last; at++ {
 			placements[at] = PrimaryGraphPlacement{
 				Bucket: bucket, Slot: uint8(at - plan.first),

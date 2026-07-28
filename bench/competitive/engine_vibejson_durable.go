@@ -280,15 +280,17 @@ func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 }
 
 // primaryCapable reports whether this instance can use the ordered primary
-// graph. Exact secondary indexes are now maintained on the graph (posting tiles
+// graph. Exact secondary indexes are maintained on the graph (posting tiles
 // updated in the same publish as each Put/Delete), so indexed rows measure the
-// primary graph too. Float64 columns, schemas, and compact documents are still
-// carried only by the chunk layout (CreateFromPrimary and the primary mutation
-// path reject them), so those instances stay on chunk until the unification
-// cutover deletes it. Everything else -- the point, scan, filter, and mutation
-// workloads -- is measured against the primary graph.
+// primary graph too, and DocumentFormatCompact is now a leaf class on the graph
+// (CreateFromPrimary stages compact document-group leaves), so compact instances
+// measure the primary graph as well. This harness's Config exposes no float64
+// column or schema capability, the two features still carried only by the chunk
+// layout, so every instance it can construct is primary-capable. Point, scan,
+// filter, and mutation workloads, verbatim and compact alike, are measured
+// against the primary graph.
 func (v *vibeDurable) primaryCapable() bool {
-	return !v.cfg.Compact
+	return true
 }
 
 // primaryBulkOptions is the tuned options with BufferCount cleared. The single

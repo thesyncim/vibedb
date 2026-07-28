@@ -229,7 +229,8 @@ func VisitPrimaryLeafPostingRows(
 	bounds CommonPrimaryLeafBounds, scratch []byte,
 	fn func(slot uint8, key, raw []byte, overflow bool) error,
 ) ([]byte, error) {
-	if PrimaryLeafClass(page) == CommonPrimaryLeafTemplate {
+	switch PrimaryLeafClass(page) {
+	case CommonPrimaryLeafTemplate:
 		tv, ok := AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
 		if !ok {
 			return scratch, primaryExactCorrupt("template leaf")
@@ -240,6 +241,22 @@ func VisitPrimaryLeafPostingRows(
 				return scratch, primaryExactCorrupt("template row")
 			}
 			scratch = tv.AppendRawRank(scratch[:0], rank, ti)
+			if err := fn(uint8(rank), key, scratch, false); err != nil {
+				return scratch, err
+			}
+		}
+		return scratch, nil
+	case CommonPrimaryLeafCompact:
+		cv, ok := AdmittedCommonPrimaryCompactLeaf(page, bucket, bounds)
+		if !ok {
+			return scratch, primaryExactCorrupt("compact leaf")
+		}
+		for rank := 0; rank < cv.Len(); rank++ {
+			key, ti, ok := cv.RowAt(rank)
+			if !ok {
+				return scratch, primaryExactCorrupt("compact row")
+			}
+			scratch = cv.AppendRawRank(scratch[:0], rank, ti)
 			if err := fn(uint8(rank), key, scratch, false); err != nil {
 				return scratch, err
 			}

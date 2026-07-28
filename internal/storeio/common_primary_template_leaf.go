@@ -259,42 +259,70 @@ func AdmittedPrimaryLeafForMutation(
 	bucket BucketID,
 	bounds CommonPrimaryLeafBounds,
 ) (CommonPrimaryLeafView, bool, error) {
-	if PrimaryLeafClass(page) != CommonPrimaryLeafTemplate {
+	var (
+		records    []CommonPrimaryLeafRecord
+		generation uint64
+	)
+	switch PrimaryLeafClass(page) {
+	case CommonPrimaryLeafTemplate:
+		tv, ok := AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
+		if !ok {
+			return CommonPrimaryLeafView{}, false, fmt.Errorf(
+				"%w: template primary leaf", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		detemplateEvents.Add(1)
+		var err error
+		records, _, err = tv.DetemplateRecords(nil, nil)
+		if err != nil {
+			return CommonPrimaryLeafView{}, false, err
+		}
+		generation = tv.Header().Generation
+	case CommonPrimaryLeafCompact:
+		cv, ok := AdmittedCommonPrimaryCompactLeaf(page, bucket, bounds)
+		if !ok {
+			return CommonPrimaryLeafView{}, false, fmt.Errorf(
+				"%w: compact primary leaf", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		detemplateEvents.Add(1)
+		var err error
+		records, _, err = cv.DetemplateRecords(nil, nil)
+		if err != nil {
+			return CommonPrimaryLeafView{}, false, err
+		}
+		generation = cv.Header().Generation
+	default:
 		return AdmittedCommonPrimaryLeaf(page, seed, bucket, bounds), false, nil
 	}
-	tv, ok := AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
-	if !ok {
-		return CommonPrimaryLeafView{}, false, fmt.Errorf(
-			"%w: template primary leaf", ErrCommonPrimaryLeafCorrupt,
-		)
-	}
-	detemplateEvents.Add(1)
-	records, _, err := tv.DetemplateRecords(nil, nil)
-	if err != nil {
-		return CommonPrimaryLeafView{}, false, err
-	}
-	generation := tv.Header().Generation
-	for _, class := range [...]CommonPrimaryLeafClass{
-		CommonPrimaryLeafNarrow, CommonPrimaryLeafWide,
+	// A template leaf is capped at the 8 KiB wide raw capacity and de-templates
+	// there; a compact leaf packs many more rows, so its raw envelope may need a
+	// larger extent. Try the narrow class, then the wide class at each extent up
+	// to 64 KiB, and take the first that holds every row.
+	for _, attempt := range [...]struct {
+		class    CommonPrimaryLeafClass
+		pageSize uint32
+	}{
+		{CommonPrimaryLeafNarrow, CommonPrimaryLeafNarrowBytes},
+		{CommonPrimaryLeafWide, CommonPrimaryLeafWideBytes},
+		{CommonPrimaryLeafWide, 16 << 10},
+		{CommonPrimaryLeafWide, 32 << 10},
+		{CommonPrimaryLeafWide, 64 << 10},
 	} {
-		pageSize := uint32(CommonPrimaryLeafNarrowBytes)
-		if class == CommonPrimaryLeafWide {
-			pageSize = CommonPrimaryLeafWideBytes
-		}
 		if placeErr := PlaceCommonPrimaryLeafRecords(
-			class, seed, records,
+			attempt.class, seed, records,
 		); placeErr != nil {
 			if errors.Is(placeErr, ErrCommonPrimaryLeafNeedsWide) {
 				continue
 			}
 			return CommonPrimaryLeafView{}, false, placeErr
 		}
-		buf := make([]byte, pageSize)
+		buf := make([]byte, attempt.pageSize)
 		if _, encErr := EncodeCommonPrimaryLeaf(
-			buf, class,
+			buf, attempt.class,
 			CommonPrimaryLeafHeader{
 				StoreID: seed, Generation: generation,
-				Bucket: bucket, PageSize: pageSize,
+				Bucket: bucket, PageSize: attempt.pageSize,
 			},
 			seed, records, bounds,
 		); encErr != nil {

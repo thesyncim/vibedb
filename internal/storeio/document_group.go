@@ -156,6 +156,25 @@ func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []Docume
 	if err != nil {
 		return nil, err
 	}
+	if err := writeDocumentGroupPayload(payload, header, chunks, workspace, layout); err != nil {
+		return nil, err
+	}
+	page := dst[:int(header.PageSize)]
+	if _, err := sealInitializedPage(page); err != nil {
+		return nil, err
+	}
+	return page, nil
+}
+
+// writeDocumentGroupPayload writes the exact grouped payload — directory,
+// row records, keys, token bodies, templates, dictionary, and any typed
+// columns — into payload, which must be exactly layout.payloadBytes long and
+// zeroed. It is the container-independent half of EncodeDocumentGroup: the
+// legacy chunk page frames these bytes with a common PageHeader and CRC, while
+// the ordered-primary compact leaf embeds the identical bytes behind its class
+// discriminator. Both paths therefore share one encoder, which is why a compact
+// document is byte-for-byte the same regardless of which container carried it.
+func writeDocumentGroupPayload(payload []byte, header DocumentGroupHeader, chunks []DocumentGroupChunk, workspace *DocumentGroupWorkspace, layout documentGroupLayout) error {
 	binary.LittleEndian.PutUint32(payload[0:4], documentGroupVersion)
 	binary.LittleEndian.PutUint32(payload[4:8], header.FirstChunk)
 	binary.LittleEndian.PutUint16(payload[8:10], uint16(layout.chunks))
@@ -220,7 +239,7 @@ func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []Docume
 		}
 	}
 	if keyEnd != layout.keyBytes || bodyEnd != layout.bodyBytes {
-		return nil, fmt.Errorf("%w: document-group encoding plan drift", ErrInvalidWrite)
+		return fmt.Errorf("%w: document-group encoding plan drift", ErrInvalidWrite)
 	}
 
 	entryCursor := templateStart + len(workspace.templates)*4
@@ -252,11 +271,11 @@ func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []Docume
 		entryCursor += written
 		binary.LittleEndian.PutUint32(payload[templateStart+id*4:templateStart+(id+1)*4], uint32(entryCursor-templateStart-len(workspace.templates)*4))
 		if entryCursor-entryStart != template.bytes {
-			return nil, fmt.Errorf("%w: template encoding plan drift", ErrInvalidWrite)
+			return fmt.Errorf("%w: template encoding plan drift", ErrInvalidWrite)
 		}
 	}
 	if entryCursor != dictionaryStart {
-		return nil, fmt.Errorf("%w: template section length drift", ErrInvalidWrite)
+		return fmt.Errorf("%w: template section length drift", ErrInvalidWrite)
 	}
 
 	dictionaryData := dictionaryStart + len(workspace.dictionary)*4
@@ -269,7 +288,7 @@ func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []Docume
 		)
 	}
 	if cursor != columnStart {
-		return nil, fmt.Errorf("%w: dictionary section length drift", ErrInvalidWrite)
+		return fmt.Errorf("%w: dictionary section length drift", ErrInvalidWrite)
 	}
 	for _, chunk := range chunks {
 		for column, mask := range chunk.Columns.Masks {
@@ -284,13 +303,9 @@ func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []Docume
 		}
 	}
 	if cursor != len(payload) {
-		return nil, fmt.Errorf("%w: column section length drift", ErrInvalidWrite)
+		return fmt.Errorf("%w: column section length drift", ErrInvalidWrite)
 	}
-	page := dst[:int(header.PageSize)]
-	if _, err := sealInitializedPage(page); err != nil {
-		return nil, err
-	}
-	return page, nil
+	return nil
 }
 
 func planDocumentGroup(chunks []DocumentGroupChunk, workspace *DocumentGroupWorkspace) (documentGroupLayout, error) {
@@ -1227,4 +1242,162 @@ func (v DocumentGroupChunkView) Float64Column(column int) (DocumentFloat64Column
 		cursor += valueBytes
 	}
 	return DocumentFloat64ColumnView{}, false
+}
+
+// --- Ordered-primary compact-leaf embedding support ---
+//
+// A compact primary leaf embeds a document-group payload (produced by
+// writeDocumentGroupPayload) behind its class byte, addressed by global row
+// rank rather than by chunk/slot. The helpers below let that leaf reuse the
+// group's template/dictionary/token decoder without materialising a chunk view
+// per row. They read the same flat row directory, key section, token bodies,
+// templates, and dictionary that the chunk path writes, so a compact document
+// reconstructs byte-for-byte identically in either container.
+
+// documentGroupViewFromPayload reconstructs a group view over an embedded
+// payload whose enclosing common page (the compact leaf) has already been
+// checksum-admitted. It is the embedded twin of AdmittedDocumentGroup and reads
+// no PageHeader identity, because a leaf's reads never consult the group's
+// StoreID/Generation/LogicalID.
+func documentGroupViewFromPayload(payload []byte) DocumentGroupView {
+	lengths := [7]int{}
+	for i := range lengths {
+		lengths[i] = int(binary.LittleEndian.Uint32(payload[16+i*4 : 20+i*4]))
+	}
+	offsets := [8]int{DocumentGroupPayloadHeaderSize}
+	for i, length := range lengths {
+		offsets[i+1] = offsets[i] + length
+	}
+	return DocumentGroupView{
+		header: DocumentGroupHeader{
+			PageSize:    0,
+			FirstChunk:  binary.LittleEndian.Uint32(payload[4:8]),
+			ChunkCount:  binary.LittleEndian.Uint16(payload[8:10]),
+			RowCount:    binary.LittleEndian.Uint16(payload[10:12]),
+			ColumnCount: binary.LittleEndian.Uint16(payload[44:46]),
+			Flags:       binary.LittleEndian.Uint16(payload[46:48]),
+		},
+		payload: payload, chunkStart: offsets[0], rowStart: offsets[1],
+		keyStart: offsets[2], bodyStart: offsets[3], templateStart: offsets[4],
+		dictionaryStart: offsets[5], columnStart: offsets[6],
+		templateCount:   int(binary.LittleEndian.Uint16(payload[12:14])),
+		dictionaryCount: int(binary.LittleEndian.Uint16(payload[14:16])),
+	}
+}
+
+// openDocumentGroupEmbeddedPayload fully validates an embedded group payload
+// using identity synthesized from the enclosing leaf. chunkHighWater is set to
+// the leaf's own chunk coverage and nextLogicalID one past the leaf logical ID,
+// so the group's self-consistency checks (consecutive chunk IDs, row directory,
+// token bounds, template and dictionary directories) run exactly as they do for
+// a standalone grouped extent.
+func openDocumentGroupEmbeddedPayload(payload []byte, storeID [16]byte, generation, logicalID uint64) (DocumentGroupView, error) {
+	if len(payload) < DocumentGroupPayloadHeaderSize {
+		return DocumentGroupView{}, fmt.Errorf("%w: embedded payload length", ErrDocumentGroupCorrupt)
+	}
+	chunkCount := uint64(binary.LittleEndian.Uint16(payload[8:10]))
+	firstChunk := binary.LittleEndian.Uint32(payload[4:8])
+	header := PageHeader{
+		StoreID: storeID, Generation: generation, LogicalID: logicalID,
+		PageSize: uint32(len(payload)) + PageHeaderSize + PageTrailerSize,
+		Kind:     PageDocumentGroup, PayloadLength: uint32(len(payload)),
+		Flags: uint8(binary.LittleEndian.Uint16(payload[46:48])),
+	}
+	highWater := uint64(firstChunk) + chunkCount
+	if highWater > uint64(^uint32(0)) {
+		return DocumentGroupView{}, fmt.Errorf("%w: embedded chunk coverage", ErrDocumentGroupCorrupt)
+	}
+	return openDocumentGroupPayload(header, payload, uint32(highWater), logicalID+1)
+}
+
+// RowCount returns the total number of live rows across every chunk, which is
+// the compact leaf's live row count.
+func (v DocumentGroupView) RowCount() int { return int(v.header.RowCount) }
+
+// rowDirectory reads the global row record at rank: its key span, token-body
+// span, exact decoded JSON length, and template identifier.
+func (v DocumentGroupView) rowDirectory(rank int) (keyBegin, keyEnd, bodyBegin, bodyEnd int, jsonLength uint32, templateID int, ok bool) {
+	if rank < 0 || rank >= int(v.header.RowCount) {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	rd := v.rowStart + rank*DocumentGroupRecordSize
+	keyEnd = int(binary.LittleEndian.Uint32(v.payload[rd : rd+4]))
+	bodyEnd = int(binary.LittleEndian.Uint32(v.payload[rd+4 : rd+8]))
+	jsonLength = binary.LittleEndian.Uint32(v.payload[rd+8 : rd+12])
+	templateID = int(binary.LittleEndian.Uint16(v.payload[rd+12 : rd+14]))
+	if rank != 0 {
+		keyBegin = int(binary.LittleEndian.Uint32(v.payload[rd-DocumentGroupRecordSize : rd-DocumentGroupRecordSize+4]))
+		bodyBegin = int(binary.LittleEndian.Uint32(v.payload[rd-DocumentGroupRecordSize+4 : rd-DocumentGroupRecordSize+8]))
+	}
+	if keyBegin > keyEnd || v.keyStart+keyEnd > v.bodyStart ||
+		bodyBegin > bodyEnd || v.bodyStart+bodyEnd > v.templateStart {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return keyBegin, keyEnd, bodyBegin, bodyEnd, jsonLength, templateID, true
+}
+
+// RowKeyAt returns the borrowed primary key of the global row at rank.
+func (v DocumentGroupView) RowKeyAt(rank int) ([]byte, bool) {
+	keyBegin, keyEnd, _, _, _, _, ok := v.rowDirectory(rank)
+	if !ok {
+		return nil, false
+	}
+	return v.payload[v.keyStart+keyBegin : v.keyStart+keyEnd : v.keyStart+keyEnd], true
+}
+
+// AppendRowRawAt splices the exact original JSON of the global row at rank onto
+// dst, interleaving its shared template's static segments with its per-row
+// dictionary/literal tokens. It reproduces the document byte for byte and, with
+// enough dst capacity, allocates nothing.
+func (v DocumentGroupView) AppendRowRawAt(dst []byte, rank int) ([]byte, bool) {
+	_, _, bodyBegin, bodyEnd, jsonLength, templateID, ok := v.rowDirectory(rank)
+	if !ok {
+		return dst, false
+	}
+	template, ok := v.template(templateID)
+	if !ok {
+		return dst, false
+	}
+	decoder := (&v).rowDecoder()
+	cursor := v.bodyStart + bodyBegin
+	end := v.bodyStart + bodyEnd
+	start := len(dst)
+	staticData := template.data
+	staticEnds := template.ends
+	staticPrevious := uint32(0)
+	for value := 0; value < template.values; value++ {
+		staticEnd := binary.LittleEndian.Uint32(staticEnds[value*4 : (value+1)*4])
+		dst = append(dst, staticData[staticPrevious:staticEnd]...)
+		staticPrevious = staticEnd
+		if cursor >= end {
+			return dst, false
+		}
+		token := decoder.payload[cursor]
+		cursor++
+		if int(token) < decoder.dictionaryCount {
+			entry, valid := decoder.value(int(token))
+			if !valid {
+				return dst, false
+			}
+			dst = append(dst, entry...)
+			continue
+		}
+		length, n := uint32(0), 0
+		if token >= documentGroupShortLiteral && token < documentGroupLongLiteral {
+			length = uint32(token-documentGroupShortLiteral) + 1
+		} else {
+			var okLength bool
+			if length, n, okLength = readDocumentGroupUvarint(decoder.payload[cursor:end]); !okLength {
+				return dst, false
+			}
+			cursor += n
+		}
+		if uint64(cursor)+uint64(length) > uint64(end) {
+			return dst, false
+		}
+		dst = append(dst, decoder.payload[cursor:cursor+int(length)]...)
+		cursor += int(length)
+	}
+	dst = append(dst, staticData[staticPrevious:]...)
+	return dst, cursor == end && len(dst)-start == int(jsonLength)
 }

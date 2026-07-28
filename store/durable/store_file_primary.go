@@ -90,7 +90,8 @@ func appendPrimaryLeafValue(
 	keyBytes []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) ([]byte, bool, error) {
-	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafTemplate {
+	switch storeio.PrimaryLeafClass(page) {
+	case storeio.CommonPrimaryLeafTemplate:
 		tv, ok := storeio.AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
 		if !ok {
 			return dst, false, fmt.Errorf(
@@ -99,6 +100,16 @@ func appendPrimaryLeafValue(
 			)
 		}
 		out, found := tv.AppendRawByKey(dst, keyBytes)
+		return out, found, nil
+	case storeio.CommonPrimaryLeafCompact:
+		cv, ok := storeio.AdmittedCommonPrimaryCompactLeaf(page, bucket, bounds)
+		if !ok {
+			return dst, false, fmt.Errorf(
+				"%w: compact primary leaf",
+				storeio.ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		out, found := cv.AppendRawByKey(dst, keyBytes)
 		return out, found, nil
 	}
 	leaf := storeio.AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)

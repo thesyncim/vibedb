@@ -361,6 +361,39 @@ document by at least a quarter versus the raw envelope; readers dispatch on the
 class byte with no payload probing, and a mutation de-templates a template leaf
 back into a raw envelope on first write.
 
+Class `4` is the compact document-group class, the ordered-primary form of
+`DocumentFormatCompact`. Its payload from byte `3` on is a `PageDocumentGroup`
+payload (see below) embedded verbatim — one shared shape-template table and
+value dictionary per leaf, each row reduced to a dictionary/literal token
+stream — so the leaf is self-describing behind its class byte and needs no
+separate format flag on the collection. The embedded payload's rows are keyed
+by lexical rank rather than a chunk/slot directory; a compact leaf's
+posting-stable slot is that lexical rank (as for the template class). The
+enclosing common-page CRC covers the embedded bytes, so the group payload
+carries no second checksum. `CreateFromPrimary` stages class-4 leaves only when
+`DocumentFormat` is `Compact`; each leaf packs as many rows as minimise its
+byte-per-row within the 64 KiB maximum extent and the 256-row posting-slot
+ceiling, capped so its rows still fit a 64 KiB raw wide leaf. A run that cannot
+be grouped (a lone trailing row, or a document too large to co-locate) falls
+back to one adaptive raw leaf, which reads dispatch to on the class byte just
+like the compact ones.
+
+Reads reconstruct each compact row's exact original JSON by splicing the
+shared template's static segments with the row's decoded values; a point read
+decodes into a caller-owned scratch (the verbatim path's zero-allocation
+borrow does not apply, because a compact value is assembled from fragments
+rather than stored contiguously), and an ordered scan reconstructs per row into
+one reused scratch. A `Put`/`Update`/`Delete` on a compact collection does
+**not** patch the compact image in place: like the template class it
+de-compacts the whole leaf into a raw envelope on first write, then the ordinary
+structural path re-fits and splits it into wide leaves (so ordinary writes
+always leave verbatim leaves behind). The de-compacted leaf can be as large as
+the 64 KiB maximum before that re-fit, which is why the mutation leaf scratch
+covers the maximum leaf extent rather than only the wide class. The exact-index
+maintainer enumerates compact rows through the same `VisitPrimaryLeafPostingRows`
+enumerator every class uses, decoding each row's field bytes before extraction,
+so a compact leaf's postings match what a lookup selects it by.
+
 ### Options bits
 
 ```go

@@ -974,10 +974,6 @@ func TestCreateFromPrimaryRejectsUnsupportedOptions(t *testing.T) {
 			name:    "float64 columns",
 			options: Options{Float64Columns: []string{"/id"}},
 		},
-		{
-			name:    "compact",
-			options: Options{DocumentFormat: DocumentFormatCompact},
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			file, err := os.CreateTemp(t.TempDir(), "unsupported-*")

@@ -50,12 +50,14 @@ type PrimaryGraphCursor struct {
 	leafLease   PageLease
 	rows        CommonPrimaryLeafIterator
 
-	// Template-columnar leaves reconstruct documents by splice, so the cursor
-	// dispatches on the leaf class and, for the template class, walks ranks and
-	// splices each surviving row into spliceScratch. The scratch is reused across
-	// rows and leaves within one scan.
+	// Template-columnar and compact leaves reconstruct documents by splice, so
+	// the cursor dispatches on the leaf class and, for those classes, walks ranks
+	// and reconstructs each surviving row into spliceScratch. The scratch is
+	// reused across rows and leaves within one scan. tcRank is the shared rank
+	// cursor for both reconstructed classes.
 	leafClass     CommonPrimaryLeafClass
 	tcLeaf        CommonPrimaryTemplateLeafView
+	compactLeaf   CommonPrimaryCompactLeafView
 	tcRank        int
 	spliceScratch []byte
 
@@ -327,6 +329,24 @@ func (c *PrimaryGraphCursor) openLeaf(
 		}
 		return nil
 	}
+	if c.leafClass == CommonPrimaryLeafCompact {
+		cv, ok := AdmittedCommonPrimaryCompactLeaf(
+			lease.Page(), route.Bucket, c.leafBounds,
+		)
+		if !ok {
+			return fmt.Errorf(
+				"%w: compact primary leaf", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		c.compactLeaf = cv
+		c.rows = CommonPrimaryLeafIterator{}
+		if lowerBound {
+			c.tcRank = cv.FirstRankFrom(c.lower)
+		} else {
+			c.tcRank = 0
+		}
+		return nil
+	}
 	leaf := AdmittedCommonPrimaryLeaf(
 		lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
 	)
@@ -344,19 +364,32 @@ func (c *PrimaryGraphCursor) openLeaf(
 func (c *PrimaryGraphCursor) nextRawBorrowed() (
 	key, raw []byte, overflow, ok bool,
 ) {
-	if c.leafClass != CommonPrimaryLeafTemplate {
+	switch c.leafClass {
+	case CommonPrimaryLeafTemplate:
+		if c.tcRank >= c.tcLeaf.Len() {
+			return nil, nil, false, false
+		}
+		k, ti, rowOK := c.tcLeaf.RowAt(c.tcRank)
+		if !rowOK {
+			return nil, nil, false, false
+		}
+		c.spliceScratch = c.tcLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
+		c.tcRank++
+		return k, c.spliceScratch, false, true
+	case CommonPrimaryLeafCompact:
+		if c.tcRank >= c.compactLeaf.Len() {
+			return nil, nil, false, false
+		}
+		k, ti, rowOK := c.compactLeaf.RowAt(c.tcRank)
+		if !rowOK {
+			return nil, nil, false, false
+		}
+		c.spliceScratch = c.compactLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
+		c.tcRank++
+		return k, c.spliceScratch, false, true
+	default:
 		return c.rows.NextRawBorrowed()
 	}
-	if c.tcRank >= c.tcLeaf.Len() {
-		return nil, nil, false, false
-	}
-	k, ti, rowOK := c.tcLeaf.RowAt(c.tcRank)
-	if !rowOK {
-		return nil, nil, false, false
-	}
-	c.spliceScratch = c.tcLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
-	c.tcRank++
-	return k, c.spliceScratch, false, true
 }
 
 func (c *PrimaryGraphCursor) nextBorrowed() (
@@ -446,9 +479,11 @@ func (c *PrimaryGraphCursor) visitAllInline(
 	fn func(key, value []byte) error,
 ) (PageRef, error) {
 	for {
-		if c.leafClass != CommonPrimaryLeafTemplate {
-			// The raw classes drain each leaf in one fused call; only the
-			// template class still steps row by row for its splice scratch.
+		if c.leafClass != CommonPrimaryLeafTemplate &&
+			c.leafClass != CommonPrimaryLeafCompact {
+			// The raw classes drain each leaf in one fused call; the template
+			// and compact classes step row by row because each row is
+			// reconstructed through class-specific scratch, not borrowed.
 			raw, err := c.rows.VisitRawBorrowed(fn)
 			if err != nil {
 				return PageRef{}, err
@@ -595,6 +630,7 @@ func (c *PrimaryGraphCursor) releaseAnchor() {
 	c.rows = CommonPrimaryLeafIterator{}
 	c.leafClass = 0
 	c.tcLeaf = CommonPrimaryTemplateLeafView{}
+	c.compactLeaf = CommonPrimaryCompactLeafView{}
 	c.tcRank = 0
 	c.anchorLease.Release()
 	c.anchor = GlobalTabletCatalogAnchorView{}

@@ -590,6 +590,28 @@ func (w *verifyWalker) walkLeaf(route storeio.SegmentedTabletRouterRoute) {
 		}
 		return
 	}
+	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafCompact {
+		cv, err := storeio.OpenCommonPrimaryCompactLeaf(
+			page, w.storeID, route.Bucket, route.Ref,
+			w.root.Generation, w.leafBounds,
+		)
+		if err != nil {
+			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+				"open compact: %v", err)
+			return
+		}
+		w.count("primary-leaf")
+		for rank := 0; rank < cv.Len(); rank++ {
+			key, _, ok := cv.RowAt(rank)
+			if !ok {
+				w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+					"compact row %d", rank)
+				break
+			}
+			w.checkLeafOrder(route, key)
+		}
+		return
+	}
 	// OpenCommonPrimaryLeaf additionally proves the succinct/hash structures and
 	// every overflow PageRef.
 	leaf, err := storeio.OpenCommonPrimaryLeaf(
@@ -812,9 +834,15 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Kind: storeio.PagePrimaryLeaf,
 		}
 		leafValid := func() bool {
-			if storeio.PrimaryLeafClass(buf[:extent]) ==
-				storeio.CommonPrimaryLeafTemplate {
+			switch storeio.PrimaryLeafClass(buf[:extent]) {
+			case storeio.CommonPrimaryLeafTemplate:
 				_, err := storeio.OpenCommonPrimaryTemplateLeaf(
+					buf[:extent], bootstrap.StoreID, bucket, expected,
+					salvageSelectingGeneration, leafBounds,
+				)
+				return err == nil
+			case storeio.CommonPrimaryLeafCompact:
+				_, err := storeio.OpenCommonPrimaryCompactLeaf(
 					buf[:extent], bootstrap.StoreID, bucket, expected,
 					salvageSelectingGeneration, leafBounds,
 				)
@@ -876,6 +904,31 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 				records = append(records, salvagedRecord{
 					key:   append([]byte(nil), key...),
 					value: tv.AppendRawRank(nil, rank, ti),
+				})
+			}
+			continue
+		}
+		if storeio.PrimaryLeafClass(buf) == storeio.CommonPrimaryLeafCompact {
+			cv, err := storeio.OpenCommonPrimaryCompactLeaf(
+				buf, bootstrap.StoreID, bucket, expected,
+				salvageSelectingGeneration, leafBounds,
+			)
+			if err != nil {
+				return report, fmt.Errorf(
+					"vibejson: salvage re-open compact leaf: %w", err,
+				)
+			}
+			report.BucketsKept++
+			for rank := 0; rank < cv.Len(); rank++ {
+				key, ti, ok := cv.RowAt(rank)
+				if !ok {
+					return report, fmt.Errorf(
+						"vibejson: salvage compact row %d", rank,
+					)
+				}
+				records = append(records, salvagedRecord{
+					key:   append([]byte(nil), key...),
+					value: cv.AppendRawRank(nil, rank, ti),
 				})
 			}
 			continue
