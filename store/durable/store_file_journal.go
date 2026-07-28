@@ -40,6 +40,30 @@ const (
 	recoveryJournalMaxCapacityBytes = uint64(16) << 20
 )
 
+// journalFailureBox carries the sticky journal poison behind an atomic pointer.
+type journalFailureBox struct{ err error }
+
+// poisonJournalLocked records a terminal journal failure and rolls the reader
+// view to the committer's poison rules, then returns the sticky error. It is
+// idempotent: the first failure wins so later callers report the original cause.
+// The caller holds the writer.
+func (c *Collection) poisonJournalLocked(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	c.journalFailure.CompareAndSwap(nil, &journalFailureBox{
+		err: fmt.Errorf(
+			"vibejson: recovery journal acknowledgement failed, reopen required: %w",
+			cause,
+		),
+	})
+	// Roll the reader view exactly as an automatic-persistence failure does. The
+	// journal is buffered-only, so this preserves the last admitted immutable view
+	// while every later mutation is rejected by PersistenceError.
+	c.poisonPersistence(cause)
+	return c.journalFailure.Load().err
+}
+
 // recoveryJournalFaultHook, when non-nil, is invoked with each journal this
 // collection creates or opens. The exhaustive store-level crash sweep sets it to
 // install a FaultJournal over the journal's raw writes; production leaves it nil.
@@ -301,10 +325,12 @@ func (c *Collection) journalAckLocked(
 			c.chainAcks.Add(1)
 			return nil
 		}
-		return err
+		// A raw append error (a device write failure such as ENOSPC or EIO) is
+		// terminal for the journal lane: poison die-don't-retry.
+		return c.poisonJournalLocked(err)
 	}
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return err
+		return c.poisonJournalLocked(err)
 	}
 	c.journalAcks.Add(1)
 	return nil

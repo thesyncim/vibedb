@@ -240,6 +240,72 @@ func TestRecoveryJournalAppendCrashMatrix(t *testing.T) {
 	t.Logf("journal append crash matrix: %d points; outcomes %v", exercised, tally)
 }
 
+// TestRecoveryJournalSyncFailurePoisons proves a terminal journal append failure
+// is die-don't-retry: the failing Put reports it, and every later mutation is
+// rejected with the same sticky error until the collection is reopened — after
+// which replay recovers exactly the acknowledgements that landed before the
+// failure.
+func TestRecoveryJournalSyncFailurePoisons(t *testing.T) {
+	options := journalTestOptions(CheckpointPowerSafe)
+	get, restore := installJournalFaultSeam(t)
+	defer restore()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.vibe")
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFromPrimary(seedPrimaryCollection(t), file, options); err != nil {
+		t.Fatalf("CreateFromPrimary: %v", err)
+	}
+	_ = file.Close()
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	fj := get()
+	// Two acknowledgements land, the third append is ENOSPC'd.
+	fj.Program(storeio.JournalFaultPlan{Phase: storeio.JournalFaultENOSPCAppend, AppendIndex: 2})
+	if _, err := coll.Put(journalCrashKey(0), journalValue(0)); err != nil {
+		t.Fatalf("put 0: %v", err)
+	}
+	if _, err := coll.Put(journalCrashKey(1), journalValue(1)); err != nil {
+		t.Fatalf("put 1: %v", err)
+	}
+	if _, err := coll.Put(journalCrashKey(2), journalValue(2)); err == nil {
+		t.Fatal("put 2 succeeded despite an ENOSPC'd journal append")
+	}
+	if coll.PersistenceError() == nil {
+		t.Fatal("collection not poisoned after journal append failure")
+	}
+	// Die-don't-retry: a later mutation is rejected with the sticky error.
+	if _, err := coll.Put(journalCrashKey(3), journalValue(3)); err == nil {
+		t.Fatal("mutation accepted after journal poison")
+	}
+	image := captureJournalImage(t, path)
+	_ = coll.Close()
+	_ = file.Close()
+	restore()
+
+	// Reopen: the two landed acknowledgements replay; the poisoned ones do not.
+	want := map[string]string{
+		"seed":             `{"v":0}`,
+		journalCrashKey(0): string(journalValue(0)),
+		journalCrashKey(1): string(journalValue(1)),
+	}
+	outcome := verifyJournalCrashImage(
+		t, options, image, []map[string]string{want}, "poison-reopen",
+	)
+	if outcome != "recovered" {
+		t.Fatalf("reopen after poison: outcome %s (want recovered)", outcome)
+	}
+}
+
 // TestRecoveryJournalRecycleCrashMatrix crashes the checkpoint's journal recycle
 // header write. The store root was already fenced durable before the recycle, so
 // a torn or ENOSPC'd recycle must leave a reopen that recovers to the fully

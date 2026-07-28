@@ -1,5 +1,7 @@
 package durable
 
+import "errors"
+
 const defaultFileVisibilitySlots = 64
 
 type filePendingState struct {
@@ -137,7 +139,14 @@ func (c *Collection) PersistenceError() error {
 	if c == nil || c.committer == nil {
 		return ErrClosed
 	}
-	return c.committer.Failure()
+	committerFailure := c.committer.Failure()
+	if box := c.journalFailure.Load(); box != nil {
+		if committerFailure != nil {
+			return errors.Join(committerFailure, box.err)
+		}
+		return box.err
+	}
+	return committerFailure
 }
 
 // readerFileState is called while snapshotGate prevents the failure callback

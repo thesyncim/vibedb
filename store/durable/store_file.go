@@ -1014,6 +1014,12 @@ type Collection struct {
 	// records through the ordinary mutation path: those records are already
 	// durable, and the recycle that follows replay discards them regardless.
 	journalReplaying bool
+	// journalFailure is the sticky poison set when a journal append or sync fails.
+	// A journal fsync-class error is terminal — the platform may drop the very
+	// dirty pages a retry would need — so like the committer's own poisoning it is
+	// die-don't-retry: every later mutation, checkpoint, and Close is rejected
+	// until the collection is reopened and recovers through replay.
+	journalFailure atomic.Pointer[journalFailureBox]
 	// writeTransaction and the point-mutation scratch below are protected by
 	// writer. The automatic mutation combiner's leader also holds writer while
 	// applying its batch, so no transaction can overlap a Reset.
