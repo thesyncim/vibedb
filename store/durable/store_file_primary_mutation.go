@@ -1925,6 +1925,19 @@ func (c *Collection) primaryMutationBounds(
 	}
 }
 
+// primaryLeafBounds are the leaf-admission bounds for the published state, used
+// by read-only leaf peeks (merge/reclass evaluation) that admit a leaf image
+// without a write transaction.
+func (c *Collection) primaryLeafBounds(
+	state *fileStoreState,
+) storeio.CommonPrimaryLeafBounds {
+	return storeio.CommonPrimaryLeafBounds{
+		FileEnd:           state.super.FileEnd,
+		NextLogicalID:     state.root.NextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
+}
+
 func (c *Collection) appendPrimaryRetirement(
 	state *fileStoreState,
 	ref storeio.PageRef,

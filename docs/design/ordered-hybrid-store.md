@@ -309,6 +309,44 @@ Splits and merges are bounded structural transactions:
 - every affected exact-index tile is rebuilt atomically;
 - p50, p95, and p99 structural latency is reported separately.
 
+The merge floor and the wide->narrow reclass gate are **capacity-relative, not
+an absolute live count.** A leaf's achievable capacity is `min(slotCapacity,
+byteCapacity)`: a leaf is slot-limited when its rows are tiny (an 8-byte value
+narrow leaf holds ~195) and byte-limited when its rows are large (a 250-byte
+document wide leaf holds ~28 before the 8 KiB heap is full). An absolute live
+floor conflates the two: it declares every byte-full wide leaf permanently below
+floor, so on a low-cardinality corpus (wide leaves at ~28 documents) every single
+delete evaluates "warranted", flushes a full checkpoint, and then discovers there
+is nothing to merge or reclaim -- a measured churn p50 of ~7.8 ms per delete.
+
+The floor is therefore two conjuncts, expanded from `min(slotCap, byteCap)/4 < n`
+so no division or per-row averaging is needed:
+
+- **slot conjunct:** live count below ~25% of the narrow class's live slot
+  budget (48 of 195), preserving the historical behaviour for the tiny-value
+  geometry where a leaf really is slot-limited;
+- **byte conjunct:** live key/value heap below 25% of the leaf's own byte
+  capacity, so a leaf that is byte-full for its row size is never a merge
+  candidate however few rows it holds.
+
+The reclass gate is capacity-relative on the same two axes: a wide leaf is
+reclaimed to narrow only when its rows fit the narrow class comfortably by
+slots *and* by bytes, so a byte-full wide leaf is never re-encoded into a no-op
+that falls back to wide yet still commits a checkpoint.
+
+Merge/reclass evaluation is **read-only until a concrete transaction is viable.**
+The routed leaf's own occupancy is peeked without a flush; for a below-floor
+leaf a viable absorbing neighbour is confirmed by a read-only peek through the
+resident router before any checkpoint. Only a selected, viable empty-removal,
+merge, or reclass pays the pre-transaction flush (the structural commit already
+flushes post-publish). Every other outcome -- ample leaf, byte-full leaf, no
+viable neighbour -- returns in nanoseconds. Hysteresis is a per-leaf stamp of
+the live count at the last no-viable-neighbour abort: the leaf is not
+re-evaluated at that exact count until its own count changes (or a sibling's
+own delete-side evaluation merges into it). The engagement counters
+(evaluations, warranted, commits, aborts, hysteresis skips) make the
+wasted-evaluation rate observable; only commits pay a flush.
+
 The tradeoff is real: many secondary indexes make a slot-class rewrite more
 expensive. Hiding that work behind an overlay would only move the cost to every
 read and is not permitted.

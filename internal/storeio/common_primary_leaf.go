@@ -248,6 +248,23 @@ func CommonPrimaryLeafStructuralBytes(
 	return PageHeaderSize + layout.heapStart + PageTrailerSize
 }
 
+// CommonPrimaryLeafNarrowHeapCapacity is the key/value heap byte budget of a
+// full narrow-class leaf, computed at its densest live count so the value is a
+// conservative floor. Merge/reclass evaluation compares a wide leaf's live heap
+// against it to reject a reclass whose rows cannot fit the narrow class -- a
+// re-encode that would fall back to wide and cost a full checkpoint for no
+// space gain (the low-cardinality corpus's byte-full ~28-doc wide leaves).
+func CommonPrimaryLeafNarrowHeapCapacity() int {
+	structural := CommonPrimaryLeafStructuralBytes(
+		CommonPrimaryLeafNarrow, CommonPrimaryLeafNarrowLive,
+		CommonPrimaryLeafNarrowBytes,
+	)
+	if structural == 0 {
+		return 0
+	}
+	return CommonPrimaryLeafNarrowBytes - structural
+}
+
 // CommonPrimaryLeafStructuralBytesPerKey reports the leaf's fixed structural
 // overhead (everything but key and value bytes) amortized over live records, a
 // space-accounting probe used to compare classes and extents.
@@ -1289,6 +1306,35 @@ func (v *CommonPrimaryLeafView) Len() int {
 		return 0
 	}
 	return int(v.count)
+}
+
+// HeapOccupancy reports the key/value heap bytes the live records currently
+// occupy and the heap byte capacity of the leaf's physical extent. Merge
+// evaluation uses the ratio to separate a genuinely sparse leaf (few small rows,
+// far below capacity) from a byte-full one (few large rows that already pack the
+// heap): the merge floor is then relative to what this leaf can actually hold
+// rather than an absolute slot count. Record boundaries are absolute payload
+// offsets whose first equals heapStart, so the last live record's end minus
+// heapStart is exactly the occupied heap span. A template leaf (heapStart == 0)
+// reports a zero capacity; callers treat that as "not a sparse merge candidate".
+func (v *CommonPrimaryLeafView) HeapOccupancy() (used, capacity int) {
+	if v == nil || v.layout.heapStart == 0 ||
+		len(v.payload) <= v.layout.heapStart {
+		return 0, 0
+	}
+	capacity = len(v.payload) - v.layout.heapStart
+	if v.count == 0 {
+		return 0, capacity
+	}
+	_, end, ok := v.recordBounds(int(v.count) - 1)
+	if !ok || end < v.layout.heapStart {
+		return 0, capacity
+	}
+	used = end - v.layout.heapStart
+	if used > capacity {
+		used = capacity
+	}
+	return used, capacity
 }
 
 // PersistentBytes returns the borrowed on-disk image. It aliases the admitted

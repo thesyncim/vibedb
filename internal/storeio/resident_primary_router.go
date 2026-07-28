@@ -26,6 +26,7 @@ type ResidentPrimaryRouter struct {
 	rows       []uint64
 	hints      []pageCacheFrameHint
 	empty      []atomic.Uint32
+	mergeAbort []atomic.Uint32
 	buildNS    int64
 	generation atomic.Uint64
 	version    atomic.Uint64
@@ -69,6 +70,7 @@ func BuildResidentPrimaryRouter(
 	}
 	router.hints = make([]pageCacheFrameHint, router.Len())
 	router.empty = make([]atomic.Uint32, router.Len())
+	router.mergeAbort = make([]atomic.Uint32, router.Len())
 	router.generation.Store(bounds.SelectedRootGeneration)
 	router.buildNS = time.Since(started).Nanoseconds()
 	return router, nil
@@ -343,6 +345,76 @@ func (r *ResidentPrimaryRouter) AcquireLeaf(
 	return cache.acquireFrameHinted(route.Ref, &r.hints[route.rank])
 }
 
+// NeighborRoute returns the current leaf handle at the lexical rank offset delta
+// (-1 or +1) from route, for a read-only merge-viability peek: the caller
+// already holds the routed leaf and only needs a neighbour's live occupancy, so
+// no key is hashed. The handle words are sampled under the same version protocol
+// as Route so a concurrent single-writer COW handle swap is observed coherently.
+func (r *ResidentPrimaryRouter) NeighborRoute(
+	route ResidentPrimaryRoute, delta int,
+) (ResidentPrimaryRoute, bool) {
+	if r == nil {
+		return ResidentPrimaryRoute{}, false
+	}
+	rank := int(route.rank) + delta
+	if rank < 0 || rank >= r.Len() {
+		return ResidentPrimaryRoute{}, false
+	}
+	at := rank * residentPrimaryRouterWords
+	for {
+		before := r.version.Load()
+		if before&1 != 0 {
+			continue
+		}
+		offset := atomic.LoadUint64(&r.rows[at+1])
+		generation := atomic.LoadUint64(&r.rows[at+2])
+		meta := atomic.LoadUint64(&r.rows[at+3])
+		if before != r.version.Load() {
+			continue
+		}
+		bucket := BucketID(uint32(meta >> 32))
+		logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
+		if !ok {
+			return ResidentPrimaryRoute{}, false
+		}
+		return ResidentPrimaryRoute{
+			Ref: PageRef{
+				Offset: offset, LogicalID: logicalID,
+				Generation: generation, Length: uint32(meta),
+				Kind: PagePrimaryLeaf,
+			},
+			Bucket: bucket,
+			rank:   uint32(rank),
+		}, true
+	}
+}
+
+// MergeAbortedAt reports the live count at which route's leaf last aborted a
+// merge evaluation, or zero if none is recorded. The merge floor uses it for
+// hysteresis: a below-floor leaf that already found no viable neighbour at its
+// current count is skipped read-only until its count changes.
+func (r *ResidentPrimaryRouter) MergeAbortedAt(
+	route ResidentPrimaryRoute,
+) uint32 {
+	if r == nil || int(route.rank) >= len(r.mergeAbort) {
+		return 0
+	}
+	return r.mergeAbort[route.rank].Load()
+}
+
+// RecordMergeAbort stamps the live count at which route's leaf found no viable
+// merge, so the next equal-count evaluation is skipped. A subsequent insert or
+// delete changes the leaf's count and the stamp no longer matches, re-arming the
+// evaluation. A structural rebuild allocates a fresh stamp array, clearing all.
+func (r *ResidentPrimaryRouter) RecordMergeAbort(
+	route ResidentPrimaryRoute, liveCount uint32,
+) {
+	if r == nil || int(route.rank) >= len(r.mergeAbort) {
+		return
+	}
+	r.mergeAbort[route.rank].Store(liveCount)
+}
+
 func (r *ResidentPrimaryRouter) fence(rank int) []byte {
 	word := r.rows[rank*residentPrimaryRouterWords]
 	return r.fences[uint32(word):uint32(word>>32)]
@@ -361,7 +433,7 @@ func (r *ResidentPrimaryRouter) ResidentBytes() int {
 		return 0
 	}
 	return cap(r.fences) + cap(r.rows)*8 + cap(r.hints)*8 +
-		cap(r.empty)*4
+		cap(r.empty)*4 + cap(r.mergeAbort)*4
 }
 
 // BuildDuration reports the wall time spent walking and packing the graph,

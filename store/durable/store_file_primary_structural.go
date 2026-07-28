@@ -34,10 +34,13 @@ const (
 	// placement cycle rather than looping forever.
 	primaryStructuralRetryLimit = 4
 
-	// primaryMergeFloor is ~25% of the narrow live capacity. A leaf whose live
-	// count falls below it is a merge candidate. The band up to
-	// primaryMergeAbsorbCeiling is the hysteresis gap that stops a just-merged
-	// leaf from immediately re-splitting.
+	// primaryMergeFloor is ~25% of the narrow live *slot* capacity: the slot
+	// conjunct of the capacity-relative merge floor (primaryLeafBelowMergeFloor).
+	// It preserves the historical 48-of-195 threshold for tiny values -- the churn
+	// geometry, where a narrow leaf is slot-limited -- while the paired byte
+	// conjunct makes the floor relative to what the leaf can actually hold. The
+	// band up to primaryMergeAbsorbCeiling is the hysteresis gap that stops a
+	// just-merged leaf from immediately re-splitting.
 	primaryMergeFloor = storeio.CommonPrimaryLeafNarrowLive / 4
 
 	// primaryMergeAbsorbCeiling is ~75% of narrow live capacity. A neighbor may
@@ -806,52 +809,194 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 	)
 }
 
-// structuralMergeReclassPrimaryLeaf is the delete-side structural evaluation. A
-// leaf emptied by the delete is removed; a leaf below the merge floor is merged
-// right-into-left with a same-anchor-page neighbor that has room; otherwise a
-// wide leaf that now fits the narrow class comfortably is reclassed. It is
-// best-effort structural hygiene: any failure aborts its own transaction and
-// leaves the published post-delete state intact.
-// mergeReclassWarranted peeks the current routed leaf (the volatile buffered
-// frame in buffered mode) without flushing, so an ordinary delete that leaves an
-// ample leaf never forces a checkpoint. Only an empty, below-floor, or reclaimable
-// wide leaf justifies the flush and structural transaction.
-func (c *Collection) mergeReclassWarranted(keyBytes []byte) (bool, error) {
+// primaryLeafBelowMergeFloor is the capacity-relative merge floor. A leaf is a
+// merge candidate only when BOTH conjuncts hold: its live count is below ~25% of
+// the narrow class's live slot budget (primaryMergeFloor), AND its live
+// key/value heap fills below 25% of the leaf's own byte capacity. The slot
+// conjunct preserves the historical 48-of-195 threshold for tiny values, where a
+// narrow leaf is slot-limited (the churn geometry). The byte conjunct is what
+// makes the floor capacity-relative rather than absolute: a leaf that is
+// byte-full for its own row size -- a handful of large documents that already
+// pack the heap, such as the low-cardinality competitive corpus's ~28-doc wide
+// leaves -- is never sparse and never a merge candidate, even though its slot
+// count sits below the absolute floor. Before this, every delete on such a leaf
+// evaluated "warranted" and paid a full checkpoint before discovering nothing to
+// merge. The two conjuncts are exactly min(slotCapacity, byteCapacity)/4 < n
+// expanded so no division or average-row arithmetic is needed.
+func primaryLeafBelowMergeFloor(liveCount, heapUsed, heapCapacity int) bool {
+	if liveCount <= 0 || heapCapacity <= 0 {
+		return false
+	}
+	return liveCount < primaryMergeFloor && heapUsed*4 < heapCapacity
+}
+
+// primaryWideLeafReclaimable reports whether a wide leaf's live rows would fit
+// the narrow class comfortably, and so a wide->narrow reclass genuinely reclaims
+// the 8 KiB->4 KiB slack. It is capacity-relative on BOTH axes: at most
+// primaryNarrowComfortable live rows (~70% of narrow slots, the historical slot
+// gate) AND a live heap at most ~70% of the narrow heap byte budget. The byte
+// gate is what stops the low-cardinality corpus's byte-full wide leaves -- a
+// handful of large documents that cannot fit the 4 KiB narrow class at all --
+// from being reclassed on every delete into a no-op re-encode that falls back to
+// wide yet still commits a full checkpoint.
+func primaryWideLeafReclaimable(liveCount, heapUsed int) bool {
+	if liveCount <= 0 || liveCount > primaryNarrowComfortable {
+		return false
+	}
+	narrowHeap := storeio.CommonPrimaryLeafNarrowHeapCapacity()
+	return narrowHeap > 0 && heapUsed*10 <= narrowHeap*7
+}
+
+// primaryMergeKind is the read-only classification of a routed leaf's own
+// occupancy after a delete: which structural transaction, if any, it warrants.
+type primaryMergeKind uint8
+
+const (
+	primaryMergeNone       primaryMergeKind = iota
+	primaryMergeEmpty                       // emptied leaf: remove it
+	primaryMergeBelowFloor                  // below the capacity floor: try a merge
+	primaryMergeReclaim                     // wide leaf now fits narrow: reclass
+)
+
+// primaryMergeEval is one read-only merge/reclass evaluation of a routed leaf.
+type primaryMergeEval struct {
+	route       storeio.ResidentPrimaryRoute
+	kind        primaryMergeKind
+	liveCount   int
+	wideReclaim bool // wide and <= narrowComfortable: a reclass fallback for merge
+}
+
+// evaluateMergeReclass peeks the routed leaf (the volatile buffered frame in
+// buffered mode) and classifies its own occupancy WITHOUT flushing. An ordinary
+// delete that leaves an ample or byte-full leaf returns primaryMergeNone here in
+// nanoseconds, never touching the checkpoint path.
+func (c *Collection) evaluateMergeReclass(
+	keyBytes []byte,
+) (primaryMergeEval, error) {
 	state := c.state.Load()
 	if state == nil {
-		return false, ErrClosed
+		return primaryMergeEval{}, ErrClosed
 	}
 	route, err := c.currentPrimaryResidentRoute(state, keyBytes)
 	if err != nil {
-		return false, nil
+		// The routed leaf is gone (e.g. a concurrent structural rebuild); nothing
+		// to evaluate. Treat as no-op rather than an error: hygiene is best-effort.
+		return primaryMergeEval{}, nil
 	}
 	lease, err := c.primaryRouter.Load().AcquireLeaf(c.cache, route)
 	if err != nil {
-		return false, err
+		return primaryMergeEval{}, err
 	}
 	leaf, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
-		lease.Page(), c.storeID, route.Bucket,
-		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
-			NextLogicalID:     state.root.NextLogicalID,
-			AllocationQuantum: state.root.PageSize,
-		},
+		lease.Page(), c.storeID, route.Bucket, c.primaryLeafBounds(state),
 	)
 	if admitErr != nil {
 		lease.Release()
-		return false, admitErr
+		return primaryMergeEval{}, admitErr
 	}
 	n := leaf.Len()
 	wide := leaf.Class() == storeio.CommonPrimaryLeafWide
+	used, capacity := leaf.HeapOccupancy()
 	lease.Release()
-	return n == 0 || n < primaryMergeFloor ||
-		(wide && n <= primaryNarrowComfortable), nil
+
+	eval := primaryMergeEval{
+		route: route, liveCount: n,
+		wideReclaim: wide && primaryWideLeafReclaimable(n, used),
+	}
+	switch {
+	case n == 0:
+		eval.kind = primaryMergeEmpty
+	case primaryLeafBelowMergeFloor(n, used, capacity):
+		eval.kind = primaryMergeBelowFloor
+	case eval.wideReclaim:
+		eval.kind = primaryMergeReclaim
+	}
+	return eval, nil
 }
 
+// mergeNeighborViable peeks the routed leaf's two lexical neighbours through the
+// resident router -- read-only, no flush -- and reports whether either one's
+// combined live count would fit the absorb ceiling. It is intentionally
+// count-only and anchor-page-agnostic: a positive answer means the flush is
+// worth paying so the committing path can confirm and repair the real tablet; a
+// negative answer proves no merge can commit, so the abort stays checkpoint-free.
+func (c *Collection) mergeNeighborViable(eval primaryMergeEval) bool {
+	router := c.primaryRouter.Load()
+	state := c.state.Load()
+	if router == nil || state == nil {
+		return false
+	}
+	bounds := c.primaryLeafBounds(state)
+	for _, delta := range [2]int{-1, +1} {
+		neighbor, ok := router.NeighborRoute(eval.route, delta)
+		if !ok {
+			continue
+		}
+		lease, err := router.AcquireLeaf(c.cache, neighbor)
+		if err != nil {
+			continue
+		}
+		leaf, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+			lease.Page(), c.storeID, neighbor.Bucket, bounds,
+		)
+		if admitErr != nil {
+			lease.Release()
+			continue
+		}
+		fits := eval.liveCount+leaf.Len() <= primaryMergeAbsorbCeiling
+		lease.Release()
+		if fits {
+			return true
+		}
+	}
+	return false
+}
+
+// structuralMergeReclassPrimaryLeaf is the delete-side structural evaluation. It
+// first classifies the routed leaf read-only (evaluateMergeReclass) and, for a
+// merge candidate, confirms a viable neighbour read-only (mergeNeighborViable)
+// and consults the per-leaf hysteresis stamp. Only when a concrete, viable
+// transaction is selected does it flush the tablet's buffered parents and commit
+// one bounded structural transaction: a leaf emptied by the delete is removed; a
+// below-floor leaf is merged right-into-left with a same-anchor-page neighbour
+// that has room; otherwise a wide leaf that now fits the narrow class comfortably
+// is reclassed. Every other outcome -- ample leaf, byte-full leaf, no viable
+// neighbour, or a hysteresis skip -- returns without a checkpoint. It is
+// best-effort hygiene: any failure aborts its own transaction and leaves the
+// published post-delete state intact.
 func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
-	if warranted, err := c.mergeReclassWarranted(keyBytes); err != nil || !warranted {
+	c.mergeReclassEvaluations.Add(1)
+	eval, err := c.evaluateMergeReclass(keyBytes)
+	if err != nil || eval.kind == primaryMergeNone {
 		return err
 	}
+
+	router := c.primaryRouter.Load()
+	// The read-only skip/abort applies only when merge is the leaf's sole option.
+	// A wide leaf that also qualifies for reclass always has a viable transaction,
+	// so it bypasses the hysteresis and neighbour-viability gates and proceeds to
+	// commit (the committing path tries the merge first, then falls back to the
+	// reclass).
+	if eval.kind == primaryMergeBelowFloor && !eval.wideReclaim {
+		// Hysteresis: a below-floor leaf that already found no viable neighbour at
+		// this exact live count cannot become viable until its own count changes (a
+		// delete/insert re-arms it by changing the stamp comparison) or a sibling's
+		// own delete-side evaluation merges into it. Skip it read-only.
+		if router.MergeAbortedAt(eval.route) == uint32(eval.liveCount) {
+			c.mergeReclassSkips.Add(1)
+			return nil
+		}
+		// Read-only viability: prove a neighbour can absorb this leaf before paying
+		// the flush. If none can, abort now, stamping the count so the next
+		// equal-count delete is skipped outright.
+		if !c.mergeNeighborViable(eval) {
+			router.RecordMergeAbort(eval.route, uint32(eval.liveCount))
+			c.mergeReclassAborts.Add(1)
+			return nil
+		}
+	}
+
+	c.mergeReclassWarrantedHits.Add(1)
 	if err := c.flushPendingForStructural(); err != nil {
 		return err
 	}
@@ -882,6 +1027,7 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 
 	if ourLen == 0 {
 		if len(current) <= 1 {
+			c.mergeReclassAborts.Add(1)
 			return nil
 		}
 		if err := c.commitRemoveEmptyLeaf(
@@ -890,22 +1036,40 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 			return err
 		}
 		c.removePrimaryEmptyLeaf()
+		c.mergeReclassCommits.Add(1)
 		return nil
 	}
 
-	if ourLen < primaryMergeFloor {
+	used, capacity := path.leaf.HeapOccupancy()
+	if primaryLeafBelowMergeFloor(ourLen, used, capacity) {
 		merged, err := c.tryStructuralMerge(
 			state, &path, current, sourceIndex,
 		)
-		if err != nil || merged {
+		if err != nil {
 			return err
+		}
+		if merged {
+			c.mergeReclassCommits.Add(1)
+			return nil
 		}
 	}
 
 	if path.leaf.Class() == storeio.CommonPrimaryLeafWide &&
-		ourLen <= primaryNarrowComfortable {
-		return c.reclassPrimaryLeaf(state, &path, current, sourceIndex)
+		primaryWideLeafReclaimable(ourLen, used) {
+		if err := c.reclassPrimaryLeaf(
+			state, &path, current, sourceIndex,
+		); err != nil {
+			return err
+		}
+		c.mergeReclassCommits.Add(1)
+		return nil
 	}
+
+	// Warranted and flushed, but the real tablet offered nothing to commit (the
+	// only count-viable neighbour is on a different anchor page). Stamp the abort
+	// so this leaf is not re-evaluated at this count.
+	router.RecordMergeAbort(route, uint32(ourLen))
+	c.mergeReclassAborts.Add(1)
 	return nil
 }
 
