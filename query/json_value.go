@@ -1,7 +1,6 @@
 package query
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/thesyncim/vibejson"
@@ -133,11 +132,7 @@ func (q qvalue) text(c *Compiler) (string, bool) {
 		s, ok := q.lit.(string)
 		return s, ok
 	}
-	raw, ok := q.node.StringBytes()
-	if !ok {
-		return "", false
-	}
-	if bytes.IndexByte(raw, '\\') < 0 {
+	if raw, ok := q.node.StringBytes(); ok {
 		return c.intern(raw), true
 	}
 	decoded, ok := q.node.AppendText(c.scratch[:0])
@@ -351,11 +346,7 @@ func (q qvalue) fields(c *Compiler, fn func(key qkey, value qvalue) error) error
 // holding the name past this visit that it must copy first. An unescaped name
 // borrows the document, which outlives the whole compilation.
 func objectKeyBytes(key vibejson.Node, scratch *[]byte) ([]byte, bool, error) {
-	raw, ok := key.StringBytes()
-	if !ok {
-		return nil, false, fmt.Errorf("query: unreadable object key in query document")
-	}
-	if bytes.IndexByte(raw, '\\') < 0 {
+	if raw, ok := key.StringBytes(); ok {
 		return raw, false, nil
 	}
 	decoded, ok := key.AppendText((*scratch)[:0])
