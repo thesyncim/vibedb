@@ -40,6 +40,95 @@ func TestVibeDurableCompactBulkIsExplicitAndCannotBePutReplay(t *testing.T) {
 	}
 }
 
+// TestVibeDurableOrdinarySyncJournalsThroughPrimary proves the adapter now
+// measures the ordered primary graph: loadBulk builds through CreateFromPrimary,
+// so every Put routes through the primary mutation path, and ordinary-sync's
+// journalAckLocked -- which fires ONLY from that path -- records one
+// acknowledgement per mutation. journalAcks being non-zero and accounting for
+// the whole window (with chainAcks) is the primary-routing proof: a chunk-layout
+// store would journal nothing.
+func TestVibeDurableOrdinarySyncJournalsThroughPrimary(t *testing.T) {
+	factory, ok := FactoryNamed("vibejson-durable")
+	if !ok {
+		t.Fatal("vibejson-durable factory missing")
+	}
+	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityOrdinarySync})
+	defer cleanup()
+	v := e.(*vibeDurable)
+
+	base := v.coll.Stats()
+	const puts = 200
+	scratch := make([]byte, 0, 512)
+	for i := 0; i < puts; i++ {
+		idx := i % len(docs)
+		scratch = AppendSameSizeUpdatedJSON(scratch[:0], docs, idx)
+		if err := e.Put(docs[idx].Key, scratch); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	stats := v.coll.Stats()
+	journal := stats.JournalAcks - base.JournalAcks
+	chain := stats.ChainAcks - base.ChainAcks
+	if journal == 0 {
+		t.Fatalf("ordinary-sync recorded no journal acknowledgements (journal=%d chain=%d)",
+			stats.JournalAcks, stats.ChainAcks)
+	}
+	// Every mutation is acknowledged through exactly one lane: the per-mutation
+	// journal append, or -- when the journal fills and forces a checkpoint -- the
+	// chain. Together they must account for the whole window, and the journal lane
+	// must dominate for a store with a comfortably sized journal.
+	if journal+chain != uint64(puts) {
+		t.Fatalf("acknowledgements journal=%d + chain=%d != %d mutations", journal, chain, puts)
+	}
+	if journal <= chain {
+		t.Fatalf("journal lane did not dominate: journal=%d chain=%d", journal, chain)
+	}
+}
+
+// TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary proves the buffered
+// lane is also on the primary graph: MergeReclassEvaluations increments only in
+// the primary delete path (deletePrimaryWithMerge), so a non-zero count after
+// deletes is proof the chunk layout is not being measured.
+func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
+	factory, ok := FactoryNamed("vibejson-durable")
+	if !ok {
+		t.Fatal("vibejson-durable factory missing")
+	}
+	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityBufferedVisible})
+	defer cleanup()
+	v := e.(*vibeDurable)
+
+	base := v.coll.Stats().MergeReclassEvaluations
+	for i := 0; i < 64 && i < len(docs); i++ {
+		if err := e.Delete(docs[i].Key); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	if got := v.coll.Stats().MergeReclassEvaluations - base; got == 0 {
+		t.Fatal("buffered-visible deletes did not run the primary merge/reclass evaluation (chunk layout still measured?)")
+	}
+}
+
+// TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot confirms the query
+// FromFile filter path opens the primary-layout snapshot the unindexed instance
+// now loads through CreateFromPrimary: a full scan-and-filter must return the
+// corpus's ~1% FilterValue population, not error on the layout.
+func TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
+	factory, ok := FactoryNamed("vibejson-durable")
+	if !ok {
+		t.Fatal("vibejson-durable factory missing")
+	}
+	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityBufferedVisible})
+	defer cleanup()
+	n, err := e.FilterCount(FilterValue)
+	if err != nil {
+		t.Fatalf("FilterCount on primary snapshot: %v", err)
+	}
+	if n <= 0 {
+		t.Fatalf("FilterCount(%q) = %d on primary snapshot, want > 0", FilterValue, n)
+	}
+}
+
 func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 	engine, err := newVibeDurable(Config{
 		Durability: DurabilityBufferedVisible,

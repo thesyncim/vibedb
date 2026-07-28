@@ -55,9 +55,9 @@ func (v *vibeDurable) Durability() string {
 	case DurabilityPowerSafe:
 		return "DurabilitySync (each generation fenced to stable storage before Put returns or becomes visible)"
 	case DurabilityBufferedVisible:
-		return "DurabilityBufferedVisible + CheckpointFilesystem (ordinary admission stages bounded reader-visible COW pages without waking the device worker; staging pressure may checkpoint early; scheduled checkpoints use ordinary two-phase fsync)"
+		return "DurabilityBufferedVisible + CheckpointFilesystem over the ordered primary graph (routed splits/merges, resident router; ordinary admission stages bounded reader-visible COW pages without waking the device worker; staging pressure may checkpoint early; scheduled checkpoints use ordinary two-phase fsync)"
 	case DurabilityOrdinarySync:
-		return "DurabilityBufferedVisible + CheckpointFilesystem + RecoveryJournal (every Put appends one redo record to the paired journal and syncs it at ordinary filesystem strength before returning; a checkpoint folds the deferred mutations into a durable root and recycles the journal)"
+		return "DurabilityBufferedVisible + CheckpointFilesystem + RecoveryJournal over the ordered primary graph (every Put/Delete routes through the primary mutation path and appends one redo record to the paired journal, synced at ordinary filesystem strength before returning; a checkpoint folds the deferred mutations into a durable root and recycles the journal)"
 	default:
 		return "DurabilityAsyncVisible (accepted into a private queue and immediately visible; may be lost before a process-crash kernel write; background worker uses the normal stable-storage fences)"
 	}
@@ -75,7 +75,8 @@ func (v *vibeDurable) Tuning() string {
 	if v.cfg.Durability == DurabilityBufferedVisible {
 		mode = "Buffered-visible ordinarily keeps the persistence worker asleep until Checkpoint, uses bounded fresh-COW staging, groups the captured cut under one alternate root, and explicitly selects the ordinary two-phase filesystem-sync checkpoint used by this comparison; staging pressure can force an earlier checkpoint and comparative runs must verify the selected interval stays below that bound; "
 	}
-	return format + "; " + mode +
+	layout := "the ordered primary graph (CreateFromPrimary bulk / the primary mutation path for Put and Delete) is what is measured; indexed and compact rows stay on the chunk layout the primary graph does not yet carry; "
+	return format + "; " + mode + layout +
 		"ResidentBytes=64 MiB (the default, and the read-cache budget every other engine was matched to); " +
 		"PageSize=4 KiB default; buffered read and write modes (O_DIRECT is Linux-only); " +
 		"MaxBatchDocuments=1 and MaxDocumentBytes=1 KiB because this harness exposes only point mutations over a corpus whose largest document is below that bound; the restriction cuts worst-case staging reservation without changing any measured value; " +
@@ -174,7 +175,14 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 	if err != nil {
 		return err
 	}
-	if _, err := durable.CreateFrom(built, f, opts); err != nil {
+	// The ordered primary graph is the real engine (routed splits/merges, the
+	// resident router, journal-wired acknowledgements). Build through it whenever
+	// the instance uses no capability the chunk layout still exclusively carries.
+	if v.primaryCapable() {
+		if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
+			return err
+		}
+	} else if _, err := durable.CreateFrom(built, f, opts); err != nil {
 		return err
 	}
 	db, err := durable.Open(f, opts)
@@ -188,7 +196,44 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 // loadByPut is the mutation-replay path, measured separately because the gap
 // between it and loadBulk is one of the more useful numbers in the report.
 func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
-	db, err := durable.Create(f, v.options())
+	opts := v.options()
+	if v.primaryCapable() {
+		if len(docs) == 0 {
+			return fmt.Errorf("vibejson-durable: put-loop load needs at least one document")
+		}
+		// The ordered primary graph has no empty-store constructor, so seed the
+		// graph with the first document through the bulk path, then replay the rest
+		// through Put. Those Puts route through the primary mutation path -- and, for
+		// ordinary-sync, its wired recovery journal -- exactly like the measured
+		// workload. Seeding one document of a large corpus is a negligible share of
+		// the replay it precedes.
+		builder, err := store.NewBuilder(store.Options{})
+		if err != nil {
+			return err
+		}
+		if err := builder.Append(docs[0].Key, docs[0].JSON); err != nil {
+			return err
+		}
+		built, err := builder.Build()
+		if err != nil {
+			return err
+		}
+		if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
+			return err
+		}
+		db, err := durable.Open(f, opts)
+		if err != nil {
+			return err
+		}
+		v.coll = db
+		for i := 1; i < len(docs); i++ {
+			if _, err := db.Put(docs[i].Key, docs[i].JSON); err != nil {
+				return err
+			}
+		}
+		return db.Flush()
+	}
+	db, err := durable.Create(f, opts)
 	if err != nil {
 		return err
 	}
@@ -199,6 +244,29 @@ func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 		}
 	}
 	return db.Flush()
+}
+
+// primaryCapable reports whether this instance can use the ordered primary
+// graph. Indexes, float64 columns, schemas, and compact documents are still
+// carried only by the chunk layout (CreateFromPrimary and the primary mutation
+// path reject them), so those instances stay on chunk until the unification
+// cutover deletes it. Everything else -- the point, scan, and mutation
+// workloads -- is measured against the primary graph.
+func (v *vibeDurable) primaryCapable() bool {
+	return !v.cfg.Compact && !v.cfg.Indexed
+}
+
+// primaryBulkOptions is the tuned options with BufferCount cleared. The single
+// CreateFromPrimary transaction stages the whole graph at once and needs at
+// least pageCount+1 commit buffers, which for a large corpus exceeds the small
+// BufferCount the mutation workload is tuned to; zeroing it lets the bulk write
+// auto-size its own pool. Open still uses the tuned BufferCount, so the measured
+// mutation staging depth -- the thing the tuning fixes -- is unchanged.
+func (v *vibeDurable) primaryBulkOptions() durable.Options {
+	opts := v.options()
+	opts.BufferCount = 0
+	opts.QueueSlots = 0
+	return opts
 }
 
 // snapshot lazily opens, and then caches, the read snapshot the scan and
