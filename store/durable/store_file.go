@@ -1113,6 +1113,25 @@ type Collection struct {
 	primaryRootScratch     []byte
 	primaryPendingParents  []filePrimaryPendingParent
 	primaryVolatileRetired []storeio.PageRef
+	// primaryCheckpointBase is the last buffered primary checkpoint materialize
+	// published, held only while it is newer than durableState. A materialize
+	// derives its whole base -- the parent graph it re-checkpoints, the FileEnd it
+	// allocates past, and the generation it stamps on the extents it retires --
+	// from the previous checkpoint. checkpointBufferedLocked keeps durableState
+	// current by flushing after it materializes, but Snapshot() and a
+	// snapshot-contended mutation materialize with no flush, so durableState is
+	// left behind. Without this field the next materialize would re-derive from the
+	// stale durableState: re-retire that base's root a second time (the
+	// "overlapping retired extent" the reclaimer rejects), allocate past its stale
+	// FileEnd over the un-flushed checkpoint's pages, and rebuild from its stale
+	// root, silently reverting the intervening materialize. Advancing this base in
+	// memory instead of forcing a device flush keeps the buffered cut off the
+	// steady-state persistence path; the crash-recovery fence is unaffected because
+	// it keys off the committer's on-disk FallbackGeneration, not this pointer, so
+	// every un-flushed checkpoint's extents stay fenced from reuse until a real
+	// flush advances the durable floor. Writer-lock owned; a flush advancing
+	// durableState past it clears it lazily in the next materialize.
+	primaryCheckpointBase *fileStoreState
 	// structuralRows is reused row scratch for a leaf split/merge re-encode. Its
 	// records borrow the source leaf page and are valid only while that page is
 	// leased inside the structural transaction.

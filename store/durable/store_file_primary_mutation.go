@@ -1269,7 +1269,22 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 			cap(c.primaryVolatileRetired),
 		)
 	}
+	// The base is the previous primary checkpoint, not necessarily the durable
+	// one. A flush-less materialize (Snapshot, snapshot-contended mutation) leaves
+	// durableState behind but records its published cut in primaryCheckpointBase;
+	// deriving the next checkpoint from that in-memory cut is what keeps repeated
+	// buffered materializes between flushes from re-retiring the durable root and
+	// rebuilding from a stale graph. Once a flush advances durableState past the
+	// recorded cut, the stale pointer is dropped and the durable state resumes as
+	// the base. See primaryCheckpointBase.
 	base := c.durableState.Load()
+	if cp := c.primaryCheckpointBase; cp != nil {
+		if base == nil || cp.root.Generation > base.root.Generation {
+			base = cp
+		} else {
+			c.primaryCheckpointBase = nil
+		}
+	}
 	visible := c.state.Load()
 	if base == nil || visible == nil ||
 		visible.root.Generation <= base.root.Generation ||
@@ -1860,6 +1875,11 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	c.inlineFree = nextInline
 	clear(c.primaryPendingParents)
 	c.primaryPendingParents = c.primaryPendingParents[:0]
+	// Record the published cut so the next materialize derives its base from it
+	// rather than a durableState a flush has not yet advanced. A following
+	// checkpointBufferedLocked flush advances durableState past this generation,
+	// and the base selection above then drops the pointer.
+	c.primaryCheckpointBase = nextState
 	return nil
 }
 
@@ -2053,5 +2073,10 @@ func (c *Collection) publishStagedPrimaryMutation(
 	c.finalizeReusable()
 	c.commitFreeLog(freeLog)
 	c.inlineFree = nextInline
+	// A snapshot-contended buffered mutation publishes a fresh primary root with no
+	// flush, exactly like a materialize. Record it as the checkpoint base so the
+	// next materialize allocates past this cut's FileEnd and retires its root, not
+	// a stale durableState's. See primaryCheckpointBase.
+	c.primaryCheckpointBase = nextState
 	return nil
 }
