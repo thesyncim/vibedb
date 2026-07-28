@@ -118,10 +118,11 @@ checkpoints, and close-drain work return the sticky `PersistenceError`.
 the last committed generation. Close the collection and reopen the file; do
 not retry the logical mutation against the poisoned live handle.
 
-## Future recovery journal
+## Recovery journal
 
-The [recovery-only redo journal](design/recovery-journal.md) is a future
-design, not part of the current durability contract. It would reduce
-synchronous acknowledgement to one bounded append and one sync while keeping
-the journal out of every read path. Its projected effects are not current
-performance claims.
+The [recovery-only redo journal](design/recovery-journal.md) is the current
+ordered-primary `DurabilitySync` acknowledgement path and an opt-in for
+ordered-primary buffered-visible collections. It reduces acknowledgement to
+one bounded append and one sync while keeping the journal out of every read
+path. Comparative performance effects in the design remain projected until
+their qualification runs.

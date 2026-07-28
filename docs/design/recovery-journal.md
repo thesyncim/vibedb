@@ -1,13 +1,15 @@
 # Recovery-only redo journal
 
-**Status:** future design. Every performance effect below is projected until
-the qualification benchmarks and crash matrix run.
+**Status:** implemented for ordered-primary `DurabilitySync` and opt-in
+ordered-primary buffered-visible acknowledgement. Comparative performance
+effects remain projected until their qualification benchmarks run.
 
 **Idea:** sync a bounded redo record in a separate file for acknowledgement,
 while readers continue to use canonical frames only. Checkpoint later folds
 the records into the ordinary root publication protocol.
 
-Promotion is controlled by [Projected effect and gates](#projected-effect-and-gates).
+Further performance claims are controlled by
+[Projected effect and gates](#projected-effect-and-gates).
 
 ## The insight
 
@@ -141,6 +143,14 @@ not a replacement for COW publication. The journal is recovery metadata
 with a strict lifetime: checkpoint truncates it; steady state without
 crashes never reads it. The existing materialization journal precedent
 already established this class of structure in the format.
+
+It is also not a CDC stream. Recovery may omit a logical record once a
+checkpoint makes that mutation durable, and recycle intentionally destroys old
+records. The future [retained logical change log](retained-change-log.md)
+captures every effective transaction above all physical mutation lanes and
+keeps immutable slot incarnations under an explicit hard disk budget. That
+opt-in mode reuses one commit log for recovery and replay; it does not tail or
+pin this bounded recovery-only ring.
 
 ## Projected effect and gates
 

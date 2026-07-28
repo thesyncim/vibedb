@@ -38,6 +38,17 @@ correctness when one sharer is deleted.
 
 ## Durability and crash recovery
 
+**Opt-in retained logical change log.** Promote the logical recovery record
+into one transaction-framed, segmented commit log only while a change feed is
+active. It provides atomic snapshot-plus-cursor bootstrap and ordered replay
+without entering the ordinary read path. Allocated log bytes have a hard
+configured ceiling; at capacity the default expires lagging cursors and reuses
+whole circular-log slots rather than growing until the filesystem fills. See
+[the retained change-log design](retained-change-log.md). Gates: disabled-mode
+write parity, zero read-path deltas, one transaction-durability fence on the
+prepared steady path, whole-transaction crash replay, bounded open work, and an
+indefinite stalled consumer proving allocated bytes never cross the cap.
+
 **Exhaustive crash-point enumeration.** A fault-injecting Device wrapper
 enumerates every commit's write sequence and induces a crash after every
 write and sync, plus torn tails, dropped writes, bounded reorderings,

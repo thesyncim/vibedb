@@ -198,7 +198,9 @@ admissible optimizations because they do not change what readers consult.
   in-place updates with recovery undo.
 - [Template-columnar leaves](design/template-columnar-leaves.md): optional
   leaf codec and typed access.
-- [Recovery journal](design/recovery-journal.md): future recovery-only redo.
+- [Recovery journal](design/recovery-journal.md): current recovery-only redo.
+- [Retained change log](design/retained-change-log.md): optional bounded logical
+  commit history for crash recovery and CDC replay.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
   per-tablet concurrency.
 - [Unification](design/unification.md): one eventual mutable collection.
