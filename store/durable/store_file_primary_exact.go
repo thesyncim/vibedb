@@ -96,8 +96,12 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 		return err
 	}
 	c.primaryLive = live
+	// Close over this specific live map, not c.primaryLive: an incremental
+	// mutation installs a fresh (term leaves, live map) pair by swapping the
+	// collection fields, and a snapshot that captured this view must keep reading
+	// the live map this view was admitted against.
 	liveLookup := func(tileID uint32) *[storeio.TermPostingTileChunks]uint64 {
-		return c.primaryLive[tileID]
+		return live[tileID]
 	}
 	rootLease, err := c.cache.Acquire(state.root.ExactIndexRoot)
 	if err != nil {
@@ -170,11 +174,11 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	if workspace != nil {
 		workspace.lastProbe = IndexProbeStats{}
 	}
-	if int(indexID) >= len(s.collection.primaryExact) ||
-		!s.collection.primaryExact[indexID].present {
+	if int(indexID) >= len(s.exact) ||
+		!s.exact[indexID].present {
 		return dst, nil
 	}
-	match, found := s.collection.primaryExact[indexID].view.Lookup(key)
+	match, found := s.exact[indexID].view.Lookup(key)
 	if !found {
 		return dst, nil
 	}
@@ -185,8 +189,8 @@ func (s *Snapshot) appendPrimaryExactMasks(
 			break
 		}
 		if mask.Chunk != 0 || mask.Bits == 0 ||
-			s.collection.primaryLive[tileID] == nil ||
-			mask.Bits&^s.collection.primaryLive[tileID][0] != 0 {
+			s.live[tileID] == nil ||
+			mask.Bits&^s.live[tileID][0] != 0 {
 			return dst, storeio.ErrPrimaryExactIndexCorrupt
 		}
 		dst = append(dst, store.Mask{Chunk: tileID, Bits: mask.Bits})

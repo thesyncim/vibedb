@@ -1,6 +1,7 @@
 package competitive
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,9 +56,9 @@ func (v *vibeDurable) Durability() string {
 	case DurabilityPowerSafe:
 		return "DurabilitySync (each generation fenced to stable storage before Put returns or becomes visible)"
 	case DurabilityBufferedVisible:
-		return "DurabilityBufferedVisible + CheckpointFilesystem over the ordered primary graph (routed splits/merges, resident router; ordinary admission stages bounded reader-visible COW pages without waking the device worker; staging pressure may checkpoint early; scheduled checkpoints use ordinary two-phase fsync)"
+		return "DurabilityBufferedVisible + CheckpointFilesystem over the ordered primary graph (routed splits/merges, resident router; exact secondary-index posting tiles are maintained in the same publish as each mutation, so a reader's index is never stale; ordinary admission stages bounded reader-visible COW pages without waking the device worker; staging pressure may checkpoint early; scheduled checkpoints fold the deferred mutations and their posting pages into a durable root with ordinary two-phase fsync)"
 	case DurabilityOrdinarySync:
-		return "DurabilityBufferedVisible + CheckpointFilesystem + RecoveryJournal over the ordered primary graph (every Put/Delete routes through the primary mutation path and appends one redo record to the paired journal, synced at ordinary filesystem strength before returning; a checkpoint folds the deferred mutations into a durable root and recycles the journal)"
+		return "DurabilityBufferedVisible + CheckpointFilesystem + RecoveryJournal over the ordered primary graph (every Put/Delete routes through the primary mutation path, maintains the exact-index posting tiles, and appends one redo record to the paired journal, synced at ordinary filesystem strength before returning; on recovery the record replays through the same path and rebuilds an identical posting index; a checkpoint folds the deferred mutations and posting pages into a durable root and recycles the journal)"
 	default:
 		return "DurabilityAsyncVisible (accepted into a private queue and immediately visible; may be lost before a process-crash kernel write; background worker uses the normal stable-storage fences)"
 	}
@@ -75,7 +76,7 @@ func (v *vibeDurable) Tuning() string {
 	if v.cfg.Durability == DurabilityBufferedVisible {
 		mode = "Buffered-visible ordinarily keeps the persistence worker asleep until Checkpoint, uses bounded fresh-COW staging, groups the captured cut under one alternate root, and explicitly selects the ordinary two-phase filesystem-sync checkpoint used by this comparison; staging pressure can force an earlier checkpoint and comparative runs must verify the selected interval stays below that bound; "
 	}
-	layout := "the ordered primary graph (CreateFromPrimary bulk / the primary mutation path for Put and Delete) is what is measured; indexed and compact rows stay on the chunk layout the primary graph does not yet carry; "
+	layout := "the ordered primary graph (CreateFromPrimary bulk / the primary mutation path for Put and Delete) is what is measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; compact and float64-column rows stay on the chunk layout the primary graph does not yet carry; "
 	return format + "; " + mode + layout +
 		"ResidentBytes=64 MiB (the default, and the read-cache budget every other engine was matched to); " +
 		"PageSize=4 KiB default; buffered read and write modes (O_DIRECT is Linux-only); " +
@@ -176,14 +177,36 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 		return err
 	}
 	// The ordered primary graph is the real engine (routed splits/merges, the
-	// resident router, journal-wired acknowledgements). Build through it whenever
-	// the instance uses no capability the chunk layout still exclusively carries.
+	// resident router, journal-wired acknowledgements, and now on-graph exact
+	// secondary-index posting tiles). Build through it whenever the instance uses
+	// no capability the chunk layout still exclusively carries.
+	//
+	// The exact-index format holds one physical index's postings in a single term
+	// leaf (bounded to 65,535 postings / 64 KiB). A large low-cardinality corpus
+	// spreads one term across enough posting tiles to exceed that, which the bulk
+	// build reports as ErrPrimaryCutoverUnsupported. Multi-leaf term indexes are
+	// not landed, so an oversized index falls back to the chunk layout for this
+	// instance; smaller indexed corpora (and every unindexed corpus) measure the
+	// primary graph. The fallback keeps the comparison honest -- it never silently
+	// drops the index -- and is bounded to corpora past the single-leaf cap.
+	usedPrimary := false
 	if v.primaryCapable() {
-		if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
+		_, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions())
+		switch {
+		case err == nil:
+			usedPrimary = true
+		case v.cfg.Indexed && errors.Is(err, durable.ErrPrimaryCutoverUnsupported):
+			if truncErr := truncateForRebuild(f); truncErr != nil {
+				return truncErr
+			}
+		default:
 			return err
 		}
-	} else if _, err := durable.CreateFrom(built, f, opts); err != nil {
-		return err
+	}
+	if !usedPrimary {
+		if _, err := durable.CreateFrom(built, f, opts); err != nil {
+			return err
+		}
 	}
 	db, err := durable.Open(f, opts)
 	if err != nil {
@@ -191,6 +214,16 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 	}
 	v.coll = db
 	return nil
+}
+
+// truncateForRebuild resets f to empty so a fallback CreateFrom writes a clean
+// image over whatever a failed CreateFromPrimary left behind.
+func truncateForRebuild(f *os.File) error {
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	_, err := f.Seek(0, 0)
+	return err
 }
 
 // loadByPut is the mutation-replay path, measured separately because the gap
@@ -247,13 +280,15 @@ func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 }
 
 // primaryCapable reports whether this instance can use the ordered primary
-// graph. Indexes, float64 columns, schemas, and compact documents are still
+// graph. Exact secondary indexes are now maintained on the graph (posting tiles
+// updated in the same publish as each Put/Delete), so indexed rows measure the
+// primary graph too. Float64 columns, schemas, and compact documents are still
 // carried only by the chunk layout (CreateFromPrimary and the primary mutation
 // path reject them), so those instances stay on chunk until the unification
-// cutover deletes it. Everything else -- the point, scan, and mutation
+// cutover deletes it. Everything else -- the point, scan, filter, and mutation
 // workloads -- is measured against the primary graph.
 func (v *vibeDurable) primaryCapable() bool {
-	return !v.cfg.Compact && !v.cfg.Indexed
+	return !v.cfg.Compact
 }
 
 // primaryBulkOptions is the tuned options with BufferCount cleared. The single

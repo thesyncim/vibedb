@@ -83,20 +83,24 @@ type structuralLeaf struct {
 	zone    storeio.BucketZone
 }
 
-// structuralRepairPostingsHook is the named attachment point for exact-index
-// posting-tile repair when rows change BucketID during a split or merge.
-//
-// Exact posting tiles have landed on the ordered graph (see
-// store_file_primary_exact.go), but they are build-and-read: putPrimaryWithSplit
-// and deletePrimaryWithMerge reject a mutation of an indexed ordered-primary
-// collection with ErrPrimaryExactIndexReadOnly before any structural transaction
-// can fire. A structural transaction is therefore never reached with active
-// exact indexes, and this hook is a no-op guarded upstream rather than a live
-// repair. When incremental (or bounded-rebuild-at-checkpoint) posting
-// maintenance replaces that gate, the atomic per-tablet posting rebuild for the
-// moved buckets attaches here, inside the one bounded structural transaction.
-func (c *Collection) structuralRepairPostingsHook(moved []storeio.BucketID) {
-	_ = moved
+// structuralRepairPostingsHook repairs the exact-index postings for rows a
+// structural transaction removes from the tablet. A split reassigns slots within
+// re-encoded leaves and a merge/reclass re-encodes a survivor; every such leaf's
+// new posting contribution is captured in encodeStructuralLeaf as it is fitted.
+// What that capture cannot see is a bucket that vanishes entirely -- a merged-away
+// or emptied leaf whose rows moved into a survivor with fresh slots -- so this
+// hook records those removed buckets. prepareStructuralExactLocked then drops the
+// removed and re-encoded buckets' tiles and merges the captured contributions,
+// and stagePrimaryExactPagesLocked writes the result inside the same bounded
+// transaction that rebuilds the tablet, so the postings and the graph publish in
+// one atomic generation.
+func (c *Collection) structuralRepairPostingsHook(removed []storeio.BucketID) {
+	if !c.primaryExactActive() {
+		return
+	}
+	for _, bucket := range removed {
+		c.recordStructuralRemovedBucketLocked(bucket)
+	}
 }
 
 func updateMaxU64(dst *atomic.Uint64, value uint64) {
@@ -317,6 +321,19 @@ func (c *Collection) encodeStructuralLeaf(
 	if err != nil {
 		return storeio.PageRef{}, err
 	}
+	// Capture this re-encoded leaf's exact-index contribution from the fitted
+	// image before the scratch is reused, so the structural transaction can
+	// rebuild the affected postings atomically with the tablet.
+	if err := c.accumulateStructuralLeafLocked(
+		bucket, c.primaryLeafScratch[:extent],
+		storeio.CommonPrimaryLeafBounds{
+			FileEnd:           tx.FileEnd(),
+			NextLogicalID:     tx.NextLogicalID(),
+			AllocationQuantum: uint32(c.options.PageSize),
+		},
+	); err != nil {
+		return storeio.PageRef{}, err
+	}
 	logicalID, ok := storeio.CommonPrimaryLeafLogicalID(bucket)
 	if !ok {
 		return storeio.PageRef{}, storeio.ErrCommonPrimaryLeafCorrupt
@@ -395,6 +412,7 @@ func (c *Collection) commitPrimaryStructural(
 	}()
 	c.retireScratch = c.retireScratch[:0]
 	c.retireRefScratch = c.retireRefScratch[:0]
+	c.resetStructuralExactLocked()
 
 	finalLeaves, retiredLeaves, err := stage(tx)
 	if err != nil {
@@ -630,6 +648,24 @@ func (c *Collection) commitPrimaryStructural(
 		return err
 	}
 
+	// Rebuild the affected exact-index postings from the leaves this transaction
+	// re-encoded (captured in encodeStructuralLeaf) and the buckets it removed,
+	// and stage them as durable pages in this same transaction so the postings
+	// and the rearranged tablet publish in one atomic generation.
+	preparedExact, prepareExactErr := c.prepareStructuralExactLocked()
+	if prepareExactErr != nil {
+		return prepareExactErr
+	}
+	var exactRoot storeio.PageRef
+	if preparedExact.active {
+		exactRoot, err = c.stagePrimaryExactPagesLocked(
+			tx, state, generation, preparedExact.exact,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	freeLog, err := c.syncFreeLogFor(tx, state, c.options.freeFoldLimit)
 	if err != nil {
 		return fmt.Errorf(
@@ -643,6 +679,9 @@ func (c *Collection) commitPrimaryStructural(
 	)
 	if err != nil {
 		return err
+	}
+	if preparedExact.active {
+		nextState.root.ExactIndexRoot = exactRoot
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return fmt.Errorf(
@@ -665,6 +704,7 @@ func (c *Collection) commitPrimaryStructural(
 		return err
 	}
 	abort = false
+	c.installPrimaryExactResidentLocked(preparedExact)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	if retiring {
@@ -791,7 +831,8 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 			if encErr != nil {
 				return nil, nil, encErr
 			}
-			c.structuralRepairPostingsHook([]storeio.BucketID{rightBucket})
+			// A split re-encodes both halves; their new posting contributions were
+			// captured in encodeStructuralLeaf, and no bucket is removed.
 			final := make(
 				[]storeio.SegmentedTabletRouterLeaf, 0, len(current)+1,
 			)
@@ -1094,6 +1135,10 @@ func (c *Collection) commitRemoveEmptyLeaf(
 		func(tx *storeio.WriteTransaction) (
 			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef, error,
 		) {
+			// The emptied bucket vanishes; drop its (already empty) postings.
+			c.structuralRepairPostingsHook(
+				[]storeio.BucketID{current[sourceIndex].bucket},
+			)
 			final := make(
 				[]storeio.SegmentedTabletRouterLeaf, 0, len(current)-1,
 			)
@@ -1194,9 +1239,11 @@ func (c *Collection) commitMerge(
 			if err != nil {
 				return nil, nil, err
 			}
-			// The right leaf's rows now carry the survivor's BucketID.
+			// The right leaf's rows now carry the survivor's BucketID (the
+			// survivor's new contribution was captured in encodeStructuralLeaf); the
+			// right bucket vanishes, so its postings must be dropped.
 			c.structuralRepairPostingsHook(
-				[]storeio.BucketID{survivorBucket},
+				[]storeio.BucketID{current[rightIdx].bucket},
 			)
 			final := make(
 				[]storeio.SegmentedTabletRouterLeaf, 0, len(current)-1,
@@ -1271,9 +1318,6 @@ func (c *Collection) reclassPrimaryLeaf(
 func (c *Collection) putPrimaryWithSplit(
 	key string, src []byte,
 ) (created bool, err error) {
-	if c.primaryExactActive() {
-		return false, ErrPrimaryExactIndexReadOnly
-	}
 	for attempt := 0; ; attempt++ {
 		created, err = c.putPrimary(key, src)
 		if !errors.Is(err, ErrPrimaryLeafSplitRequired) {
@@ -1338,9 +1382,6 @@ func (c *Collection) splitPrimaryLeafForKey(key string) (err error) {
 func (c *Collection) deletePrimaryWithMerge(
 	key string,
 ) (deleted bool, err error) {
-	if c.primaryExactActive() {
-		return false, ErrPrimaryExactIndexReadOnly
-	}
 	deleted, err = c.deletePrimary(key)
 	if err != nil || !deleted {
 		return deleted, err

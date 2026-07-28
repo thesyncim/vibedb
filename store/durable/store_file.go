@@ -50,16 +50,6 @@ var (
 	ErrPrimaryCutoverUnsupported = errors.New(
 		"vibejson: ordered primary cutover feature is unsupported",
 	)
-	// ErrPrimaryExactIndexReadOnly rejects an in-place mutation of an ordered
-	// primary collection that carries exact posting tiles. Posting tiles are
-	// built once during CreateFromPrimary; incremental maintenance is a bounded
-	// full rebuild that is not wired on the mutation path yet, so a collection
-	// with exact indexes is build-and-read. Refusing the mutation is fail-closed:
-	// it never serves or persists a stale posting index. See
-	// docs/design/ordered-hybrid-store.md, "Exact posting tiles".
-	ErrPrimaryExactIndexReadOnly = errors.New(
-		"vibejson: ordered primary exact indexes are build-and-read; mutation is unsupported",
-	)
 	// ErrWriterLocked reports that another mutable collection owns the
 	// page file. A durable file has exactly one generation publisher.
 	ErrWriterLocked = storeio.ErrWriterLocked
@@ -829,8 +819,8 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		) {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibejson: collection MaxBatchDocuments or maximum document requires too many transaction pages")
 	}
-	maxTransactionPages := overflowPages + metadataPageLimit
-	singleDocumentTransactionPages :=
+	docMaxTransactionPages := overflowPages + metadataPageLimit
+	docSingleDocumentPages :=
 		overflowPages + singleDocumentMetadataPageLimit
 	// One document and its overflow chain may use maximum-size extents. A
 	// categorical cover can replace one packed catalog, while a numeric
@@ -845,14 +835,39 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	if len(columns) != 0 {
 		largePages++
 	}
-	metadataPages := maxTransactionPages - largePages
-	maxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
+	metadataPages := docMaxTransactionPages - largePages
+	docMaxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
 		uint64(metadataPages)*uint64(o.PageSize)
 	singleDocumentMetadataPages :=
-		singleDocumentTransactionPages - largePages
-	singleDocumentTransactionBytes :=
+		docSingleDocumentPages - largePages
+	docSingleDocumentBytes :=
 		uint64(largePages)*uint64(o.MaxPageSize) +
 			uint64(singleDocumentMetadataPages)*uint64(o.PageSize)
+	// Incremental exact-index maintenance stages, in the same transaction as the
+	// document mutation, the term leaves that mutation can touch plus the
+	// reference-root page. A leaf owns four posting tiles, so a mutation's whole
+	// posting effect is one term leaf per physical index (an in-place value change
+	// removes the old posting and inserts the new one in that same leaf), and a
+	// single document can carry a value for every index -- so the worst case is
+	// one term leaf for each of the fileStoreMaxPhysicalIndexes-bounded physical
+	// indexes plus one PagePrimaryExactRoot. Each term leaf may reach
+	// IndexTermLeafMaxBytes and so rounds up to a full MaxPageSize extent; the
+	// root is exactly PageSize. This is the term-leaf reservation the design's
+	// bounded exact-tile rebuild names, derived rather than fudged. It is zero for
+	// an unindexed collection, so the unindexed mutation reserves exactly what it
+	// did before.
+	exactIndexLeafPages := len(compiled)
+	exactIndexRootPages := 0
+	if len(compiled) != 0 {
+		exactIndexRootPages = 1
+	}
+	exactIndexPages := exactIndexLeafPages + exactIndexRootPages
+	exactIndexBytes := uint64(exactIndexLeafPages)*uint64(o.MaxPageSize) +
+		uint64(exactIndexRootPages)*uint64(o.PageSize)
+	maxTransactionPages := docMaxTransactionPages + exactIndexPages
+	singleDocumentTransactionPages := docSingleDocumentPages + exactIndexPages
+	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
+	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
 	if o.MaxRetiredExtents < maxTransactionPages {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibejson: collection MaxRetiredExtents must retain one worst-case transaction")
 	}
@@ -1020,6 +1035,14 @@ type Collection struct {
 	// protected by the same writer/snapshotGate discipline as primaryRouter.
 	primaryExact []primaryExactResident
 	primaryLive  map[uint32]*[storeio.TermPostingTileChunks]uint64
+	// structuralExactReencoded and structuralExactRemoved accumulate, within one
+	// bounded structural transaction, the exact-index contribution of every leaf
+	// the transaction re-encodes plus the buckets it removes outright, so the
+	// affected postings are rebuilt atomically with the tablet (see
+	// structuralRepairPostingsHook). They are writer-owned scratch reset at the
+	// start of each structural transaction.
+	structuralExactReencoded map[storeio.BucketID]*structuralBucketContribution
+	structuralExactRemoved   []storeio.BucketID
 	readFile      *os.File
 	writeFile     *os.File
 	directRead    bool
@@ -2194,8 +2217,15 @@ func (c *Collection) cacheStoreID() [16]byte {
 type Snapshot struct {
 	collection *Collection
 	state      *fileStoreState
-	lease      storeio.GenerationLease
-	once       sync.Once
+	// exact and live are the immutable resident exact-index posting snapshot
+	// captured at Snapshot creation under snapshotGate. An incremental mutation
+	// installs a fresh pair by swapping the collection fields, so capturing them
+	// once here pins a consistent (term leaves, live map) view for this reader's
+	// whole lifetime even as the writer maintains the index.
+	exact []primaryExactResident
+	live  map[uint32]*[storeio.TermPostingTileChunks]uint64
+	lease storeio.GenerationLease
+	once  sync.Once
 }
 
 // IndexWorkspace retains the transient routing entries, their copied
@@ -2302,12 +2332,16 @@ func (c *Collection) pinSnapshot() (*Snapshot, error) {
 		c.snapshotGate.RUnlock()
 		return nil, stateErr
 	}
+	exact := c.primaryExact
+	live := c.primaryLive
 	lease, err := c.leases.Acquire(state.root.Generation)
 	c.snapshotGate.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{collection: c, state: state, lease: lease}, nil
+	return &Snapshot{
+		collection: c, state: state, exact: exact, live: live, lease: lease,
+	}, nil
 }
 
 // pinSnapshotLocked is pinSnapshot for callers already holding the writer
@@ -2325,6 +2359,8 @@ func (s *Snapshot) Close() error {
 		s.lease.Release()
 		s.collection = nil
 		s.state = nil
+		s.exact = nil
+		s.live = nil
 	})
 	return nil
 }

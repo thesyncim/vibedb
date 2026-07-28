@@ -297,7 +297,7 @@ func (s *Snapshot) rangePrimaryMasks(
 		return scratch, store.ErrMaskChunk
 	}
 	bounds := s.collection.primaryLeafBounds(state)
-	enforceLive := s.collection.primaryLive != nil
+	enforceLive := s.live != nil
 	var previous uint32
 	for at := 0; at < len(masks); {
 		if at != 0 && masks[at].Chunk <= previous {
@@ -315,7 +315,7 @@ func (s *Snapshot) rangePrimaryMasks(
 			}
 			previous = mask.Chunk
 			quadrant := mask.Chunk & 3
-			live := s.collection.primaryLive[mask.Chunk]
+			live := s.live[mask.Chunk]
 			if mask.Bits != 0 && enforceLive &&
 				(live == nil || mask.Bits&^live[0] != 0) {
 				return scratch, store.ErrMaskChunk

@@ -457,22 +457,41 @@ closed. `RangeMasksRaw` materializes selected rows by resolving each tile's
 bucket through the resident router and visiting the leaf's live rows in lexical
 order.
 
-**Mutation (build-and-read).** An indexed ordered-primary collection is
-currently build-and-read: `Put`/`Delete` on it fail closed with
-`ErrPrimaryExactIndexReadOnly` rather than publish a stale posting index. The
-read path couples the live-slot map and the postings tightly — a delete that
-left postings behind would make reads fail closed, an insert would make them
-silently miss — so nothing between the two is acceptable. The honest maintenance
-path is a bounded full rebuild of the exact tiles from the current graph at a
-checkpoint that can afford the up-to-`fileStoreMaxPhysicalIndexes` term-leaf
-reservation; it is not wired on the mutation path yet, so mutation refuses
-instead of diverging. `structuralRepairPostingsHook` marks where the per-tablet
-rebuild attaches once that lands, and is a no-op because the upstream gate keeps
-structural transactions from ever firing on an indexed collection.
+**Mutation (incremental maintenance).** An indexed ordered-primary collection is
+mutable: a `Put`/`Delete` updates the affected term leaves in the same publish as
+the document, so the index is never stale in any lane (buffered, buffered+journal,
+sync-journal). A leaf owns exactly four posting tiles (`bucket<<2 | q`), so a
+mutation's whole posting effect is confined to those tiles; the maintainer
+re-derives them from the rewritten leaf image (`VisitPrimaryLeafPostingRows`,
+`deriveBucketExactContribution`) and splices them into a fresh resident term-leaf
+snapshot, dropping the bucket's old tiles and adding the new ones. Because the
+resident encoded bytes are reconstructed from the same canonical
+term→tile→mask map a bulk build produces, an incrementally maintained leaf is
+byte-identical to a fresh build of the same final graph — the correctness anchor.
+The resident snapshot is captured by each reader at `Snapshot` and swapped whole
+under `snapshotGate`, so a concurrent reader keeps a consistent (term leaves, live
+map) pair. Durable posting pages (`stagePrimaryExactPagesLocked`) are staged in
+the same write transaction as the graph on the real-transaction path and folded
+at each checkpoint on the buffered path; the single-document reservation grows by
+one term leaf per physical index plus one root (the
+`fileStoreMaxPhysicalIndexes`-bounded worst case a single document can touch).
+`structuralRepairPostingsHook` is live: a split/merge/reclass captures each
+re-encoded leaf's contribution and records removed buckets, and the per-tablet
+posting rebuild is staged inside the one bounded structural transaction so moved
+rows keep correct postings.
+
+**Term-leaf capacity.** One physical index's postings live in a single term leaf,
+bounded to 65,535 postings / 64 KiB. A large low-cardinality corpus can exceed
+that at build time (`ErrPrimaryCutoverUnsupported`); multi-leaf term indexes are
+the pending extension. Until then, an oversized index falls back to the chunk
+layout in the competitive harness rather than dropping postings.
 
 **Crash safety and verify.** Exact-index pages are staged and published through
 the same committer as the graph in one atomic generation, so they add no new
-commit-window shape. `cmd/vibedb-verify` walks `ExactIndexRoot` → every
+commit-window shape — a crash at any write point of the commit window recovers an
+index consistent with the recovered graph (proven by the indexed commit-crash
+sweep and the sync-journal replay-after-crash test). `cmd/vibedb-verify` walks
+`ExactIndexRoot` → every
 `PagePrimaryExactLeaf`, admitting the reference catalog (bounds, ordering,
 distinctness) and each leaf envelope, and records their extents for the
 reachable-overlap check; recovery re-admits the exact root through

@@ -145,11 +145,12 @@ func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
 	}
 }
 
-// TestPrimaryExactIndexRejectsMutation pins the build-and-read contract: a
-// mutation of an indexed ordered-primary collection fails closed rather than
-// silently leaving a stale posting index, and reopening still succeeds because
-// no divergent state was ever published.
-func TestPrimaryExactIndexRejectsMutation(t *testing.T) {
+// TestPrimaryExactIndexMutable proves the exact index is maintained in the same
+// publish as each Put/Delete: an in-place value change moves the row between
+// terms, a delete drops its posting, an insert adds one, and the index answers
+// correctly both live and after a Flush + reopen (durable). It replaces the old
+// build-and-read read-only contract.
+func TestPrimaryExactIndexMutable(t *testing.T) {
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +172,7 @@ func TestPrimaryExactIndexRejectsMutation(t *testing.T) {
 			{Name: "country", Paths: []string{"/country"}},
 		},
 	}
-	file, err := os.CreateTemp(t.TempDir(), "primary-exact-readonly-*")
+	file, err := os.CreateTemp(t.TempDir(), "primary-exact-mutable-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,32 +184,71 @@ func TestPrimaryExactIndexRejectsMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := collection.Put("k0000", []byte(`{"country":"cXX","row":0}`)); err !=
-		ErrPrimaryExactIndexReadOnly {
-		collection.Close()
-		t.Fatalf("indexed primary Put = %v, want %v",
-			err, ErrPrimaryExactIndexReadOnly)
+
+	// An oracle: country -> set of live keys, mutated alongside the collection.
+	oracle := map[string]map[string]bool{}
+	for row := range 512 {
+		country := fmt.Sprintf("c%02d", row%20)
+		key := fmt.Sprintf("k%04d", row)
+		if oracle[country] == nil {
+			oracle[country] = map[string]bool{}
+		}
+		oracle[country][key] = true
 	}
-	if _, err := collection.Delete("k0000"); err != ErrPrimaryExactIndexReadOnly {
-		collection.Close()
-		t.Fatalf("indexed primary Delete = %v, want %v",
-			err, ErrPrimaryExactIndexReadOnly)
+	checkIndex := func(when string, coll *Collection) {
+		t.Helper()
+		for country, keys := range oracle {
+			needle := primaryExactTestNeedle(t, `"`+country+`"`)
+			got := primaryExactTestKeys(t, coll, "country", needle)
+			gotSet := map[string]bool{}
+			for _, k := range got {
+				gotSet[k] = true
+			}
+			if len(gotSet) != len(keys) {
+				t.Fatalf("%s: country=%s rows = %d, want %d",
+					when, country, len(gotSet), len(keys))
+			}
+			for k := range keys {
+				if !gotSet[k] {
+					t.Fatalf("%s: country=%s missing key %s", when, country, k)
+				}
+			}
+		}
+	}
+
+	// In-place value change: move k0000 from c00 to c19.
+	if _, err := collection.Put("k0000", []byte(`{"country":"c19","row":0}`)); err != nil {
+		t.Fatalf("indexed value change Put: %v", err)
+	}
+	delete(oracle["c00"], "k0000")
+	oracle["c19"]["k0000"] = true
+
+	// Delete k0001 (was c01).
+	if _, err := collection.Delete("k0001"); err != nil {
+		t.Fatalf("indexed Delete: %v", err)
+	}
+	delete(oracle["c01"], "k0001")
+
+	// Insert a fresh key with a fresh scalar the corpus never used.
+	if _, err := collection.Put("k9999", []byte(`{"country":"czz","row":9999}`)); err != nil {
+		t.Fatalf("indexed insert Put: %v", err)
+	}
+	oracle["czz"] = map[string]bool{"k9999": true}
+
+	checkIndex("live", collection)
+
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The refused mutations published nothing, so the exact index still opens and
-	// answers, proving nothing diverged.
 	reopened, err := Open(file, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	needle := primaryExactTestNeedle(t, `"c07"`)
-	keys := primaryExactTestKeys(t, reopened, "country", needle)
-	if len(keys) != 512/20 && len(keys) != 512/20+1 {
-		t.Fatalf("reopened indexed primary lookup rows = %d", len(keys))
-	}
+	checkIndex("reopened", reopened)
 }
 
 // TestCreateFromPrimaryExactIndexDeterministic pins byte-identical rebuilds of

@@ -992,6 +992,21 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		indexRoot: state.indexRoot, freeHead: state.freeHead,
 	}
 
+	// Re-derive the rewritten bucket's exact-index postings from the new leaf
+	// image as a fallible prepare step: a fresh resident term-leaf snapshot is
+	// built here so the point-of-no-return install below cannot fail and leave a
+	// journaled mutation with a stale index. The durable posting pages are not
+	// written now — a buffered leaf frame is volatile until checkpoint, and the
+	// checkpoint materialize wraps this snapshot into durable pages then. On
+	// recovery the journaled Put/Delete replays through this same path, so the
+	// index is rebuilt identically.
+	preparedExact, err := c.preparePrimaryExactLeaf(
+		leafImage, resident.Bucket, c.primaryLeafBounds(nextState),
+	)
+	if err != nil {
+		return storeio.PageRef{}, false, false, err
+	}
+
 	// Point of no return: every fallible prepare step above has succeeded, the
 	// dirty frame is admitted, and nothing is reader-visible or committed to the
 	// pending-parent set yet. The journal-backed sync lane appends and syncs its
@@ -1018,6 +1033,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	c.primaryRouter.Load().UpdateLeaf(
 		resident, nextLeaf, generation,
 	)
+	c.installPrimaryExactResidentLocked(preparedExact)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	c.retirePrimaryVolatileRefLocked(previousVolatile)
@@ -1051,6 +1067,17 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	becameEmpty = deleting && path.leaf.Len() == 1
 	filledEmpty = !deleting && !found && path.leaf.Len() == 0
+	// Re-derive the rewritten bucket's exact-index postings before opening the
+	// transaction, so a build failure aborts without staging anything. The fresh
+	// resident snapshot is wrapped into durable pages inside this same
+	// transaction below and installed at publish, keeping the index and the graph
+	// in one atomic generation.
+	preparedExact, prepareExactErr := c.preparePrimaryExactLeaf(
+		leafImage, resident.Bucket, c.primaryLeafBounds(state),
+	)
+	if prepareExactErr != nil {
+		return storeio.PageRef{}, false, false, prepareExactErr
+	}
 	if err := c.refreshReusableFor(
 		state,
 		c.options.singleDocumentTransactionPages,
@@ -1254,6 +1281,18 @@ func (c *Collection) cowPrimaryMutation(
 	); err != nil {
 		return storeio.PageRef{}, false, false, err
 	}
+	// Stage the maintained exact-index pages inside this transaction and retire
+	// the superseded ones, so the posting index and the graph publish in one
+	// atomic generation with no new commit-window shape.
+	var exactRoot storeio.PageRef
+	if preparedExact.active {
+		exactRoot, err = c.stagePrimaryExactPagesLocked(
+			tx, state, generation, preparedExact.exact,
+		)
+		if err != nil {
+			return storeio.PageRef{}, false, false, err
+		}
+	}
 	freeLog, err := c.syncFreeLogFor(
 		tx, state, c.options.singleDocumentFreeFoldLimit,
 	)
@@ -1277,6 +1316,9 @@ func (c *Collection) cowPrimaryMutation(
 	if err != nil {
 		return storeio.PageRef{}, false, false, err
 	}
+	if preparedExact.active {
+		nextState.root.ExactIndexRoot = exactRoot
+	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return storeio.PageRef{}, false, false,
 			fmt.Errorf("vibejson: reserve retired extents: %w", err)
@@ -1284,7 +1326,7 @@ func (c *Collection) cowPrimaryMutation(
 	retirementReserved = true
 	if err := c.publishStagedPrimaryMutation(
 		tx, nextState, nextInline, freeLog,
-		resident, nextLeaf,
+		resident, nextLeaf, preparedExact,
 	); err != nil {
 		return storeio.PageRef{}, false, false, err
 	}
@@ -1847,6 +1889,22 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		return err
 	}
 
+	// Fold the maintained resident postings into durable exact pages in the same
+	// checkpoint transaction that seals the graph. Per-mutation buffered edits
+	// only touch the in-memory posting snapshot; this is where they become
+	// durable and where the state root's ExactIndexRoot advances to match, so a
+	// crash after this checkpoint recovers a consistent index without replay.
+	var exactRoot storeio.PageRef
+	exactActive := c.primaryExactActive()
+	if exactActive {
+		exactRoot, err = c.stagePrimaryExactPagesLocked(
+			tx, base, generation, c.primaryExact,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	freeLog, err := c.syncFreeLogFor(
 		tx, base, c.options.freeFoldLimit,
 	)
@@ -1863,6 +1921,9 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	)
 	if err != nil {
 		return err
+	}
+	if exactActive {
+		nextState.root.ExactIndexRoot = exactRoot
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return fmt.Errorf(
@@ -2067,6 +2128,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 	freeLog freeLogCommit,
 	route storeio.ResidentPrimaryRoute,
 	nextLeaf storeio.PageRef,
+	preparedExact primaryExactPrepared,
 ) error {
 	publish := func(retiring bool) error {
 		if retiring {
@@ -2087,6 +2149,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 		c.primaryRouter.Load().UpdateLeaf(
 			route, nextLeaf, nextState.root.Generation,
 		)
+		c.installPrimaryExactResidentLocked(preparedExact)
 		c.pageValidator.update(nextState)
 		c.publishFileState(nextState)
 		c.snapshotGate.Unlock()
@@ -2102,6 +2165,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 	c.primaryRouter.Load().UpdateLeaf(
 		route, nextLeaf, nextState.root.Generation,
 	)
+	c.installPrimaryExactResidentLocked(preparedExact)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	if retiring {
