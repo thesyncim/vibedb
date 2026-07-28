@@ -385,6 +385,7 @@ func validateInlineFreeRef(ref PageRef, kind PageKind, root *InlineSuperblock) e
 		root.State.Float64ScanHead,
 		root.State.IndexGroupHead,
 		root.State.PrimaryRoot,
+		root.State.ExactIndexRoot,
 	}
 	for _, stateRef := range stateRefs {
 		if stateRef == (PageRef{}) {
@@ -452,6 +453,7 @@ func inlineExtentOverlapsRoot(extent FreeExtent, root *InlineSuperblock) bool {
 		root.State.Float64ScanHead,
 		root.State.IndexGroupHead,
 		root.State.PrimaryRoot,
+		root.State.ExactIndexRoot,
 		root.FreeDelta.externalPrev,
 		root.FreeDelta.indexHead,
 	}

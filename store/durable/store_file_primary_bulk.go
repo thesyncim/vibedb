@@ -21,9 +21,10 @@ import (
 // roots remain empty. The resulting collection supports point reads,
 // snapshots, and serialized Put/Delete through the ordered-primary COW path.
 //
-// Indexes, float64 columns, schemas, compact document groups, overflow values,
-// and scan/zone construction are not implemented by this entry. Use
-// CreateFrom when those features are required.
+// Exact indexes are built as posting tiles beside the ordered primary. Float64
+// columns, schemas, compact document groups, overflow values, and scan/zone
+// construction are not implemented by this entry. Use CreateFrom when those
+// features are required.
 func CreateFromPrimary(
 	collection *store.Collection,
 	file *os.File,
@@ -40,12 +41,6 @@ func CreateFromPrimary(
 	}
 	if info.Size() != 0 {
 		return 0, ErrNotEmpty
-	}
-	if len(options.Indexes) != 0 {
-		return 0, fmt.Errorf(
-			"%w: indexes are not available in CreateFromPrimary",
-			ErrPrimaryCutoverUnsupported,
-		)
 	}
 	if len(options.Float64Columns) != 0 {
 		return 0, fmt.Errorf(
@@ -129,9 +124,17 @@ func CreateFromPrimary(
 	}
 
 	storeID := primaryBulkStoreID(records, normalized)
-	pageCount, err := storeio.PrimaryGraphPageCount(storeID, records)
+	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records)
 	if err != nil {
 		return 0, err
+	}
+	pageCount := primaryPageCount
+	if len(normalized.indexes) != 0 {
+		// One bounded term leaf per physical index plus its canonical root.
+		// Empty physical indexes consume only their zero root entry, so this is
+		// a safe upper bound for the single transaction that stages the graph
+		// and every exact-index page together.
+		pageCount += len(normalized.indexes) + 1
 	}
 	bufferCount := pageCount + 1
 	if requestedBuffers != 0 {
@@ -209,7 +212,17 @@ func CreateFromPrimary(
 		_ = committer.Close()
 		return 0, err
 	}
-	primaryRoot, err := storeio.BuildPrimaryGraph(tx, records)
+	placements := make([]storeio.PrimaryGraphPlacement, len(records))
+	primaryRoot, err := storeio.BuildPrimaryGraphPlaced(tx, records, placements)
+	if err != nil {
+		_ = tx.Abort()
+		_ = committer.Close()
+		return 0, err
+	}
+	exactIndexRoot, err := buildPrimaryExactIndexes(
+		tx, records, placements, normalized.indexes,
+		uint32(normalized.PageSize), uint32(normalized.MaxPageSize),
+	)
 	runtime.KeepAlive(source)
 	if err != nil {
 		_ = tx.Abort()
@@ -218,10 +231,12 @@ func CreateFromPrimary(
 	}
 	root := storeio.StateRoot{
 		StoreID: storeID, Generation: 1,
-		PageSize:       uint32(normalized.PageSize),
-		DocumentCount:  uint64(len(records)),
-		NextLogicalID:  tx.NextLogicalID(),
-		ChunkDocuments: uint32(normalized.Collection.ChunkDocuments),
+		PageSize:         uint32(normalized.PageSize),
+		DocumentCount:    uint64(len(records)),
+		NextLogicalID:    tx.NextLogicalID(),
+		ChunkDocuments:   uint32(normalized.Collection.ChunkDocuments),
+		IndexCount:       uint32(len(normalized.indexes)),
+		IndexCatalogHash: normalized.indexCatalogHash,
 		IndexMaxDepth: uint32(max(
 			normalized.Collection.IndexOptions.MaxDepth, 0,
 		)),
@@ -229,6 +244,7 @@ func CreateFromPrimary(
 		InlineValueBytes: uint32(normalized.InlineValueBytes),
 		MaxDocumentBytes: uint32(normalized.MaxDocumentBytes),
 		PrimaryRoot:      primaryRoot,
+		ExactIndexRoot:   exactIndexRoot,
 	}
 	root.Options = fileStoreCollectionOptionFlags(normalized.Collection)
 	if err := catalog.apply(
@@ -321,6 +337,12 @@ func primaryBulkStoreID(
 	writeUint64(uint64(options.InlineValueBytes))
 	writeUint64(uint64(options.MaxDocumentBytes))
 	writeUint64(uint64(fileStoreCollectionOptionFlags(options.Collection)))
+	// The canonical index catalog is part of the immutable file image: a build
+	// with different indexes must produce a different identity. indexCatalogHash
+	// is the deterministic FNV of the canonical alias names and paths, so it
+	// makes the identity index-aware without re-walking the definitions here.
+	writeUint64(uint64(len(options.indexes)))
+	writeUint64(options.indexCatalogHash)
 	writeUint64(uint64(len(records)))
 	for _, record := range records {
 		writeUint64(uint64(len(record.Key)))

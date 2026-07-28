@@ -501,7 +501,9 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"stateRootPrimaryEnd":               {stateRootPrimaryEnd, 320},
 		"stateRootJournalIDOffset":          {stateRootJournalIDOffset, 320},
 		"stateRootJournalIDEnd":             {stateRootJournalIDEnd, 336},
-		"stateRootReservedOffset":           {stateRootReservedOffset, 336},
+		"stateRootExactIndexOffset":         {stateRootExactIndexOffset, 336},
+		"stateRootExactIndexEnd":            {stateRootExactIndexEnd, 368},
+		"stateRootReservedOffset":           {stateRootReservedOffset, 368},
 		"PageRefSize":                       {PageRefSize, 32},
 		"InlineSuperblockSize":              {InlineSuperblockSize, 4096},
 		"InlineFreeDeltaCapacity":           {InlineFreeDeltaCapacity, 106},
@@ -557,6 +559,8 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		PageTabletRoute,
 		PagePrimaryAnchor,
 		PagePrimaryLeaf,
+		PagePrimaryExactRoot,
+		PagePrimaryExactLeaf,
 	}
 	for index, kind := range kinds {
 		if want := PageKind(index + 1); kind != want {

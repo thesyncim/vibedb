@@ -254,6 +254,67 @@ func (r *ResidentPrimaryRouter) Route(key []byte) (ResidentPrimaryRoute, bool) {
 	}
 }
 
+// RouteAtRank returns the leaf route stored at one router row, reading its
+// current mutable handle under the version seqlock. rank is the lexical row
+// ordinal, not a bucket identity, so it is stable regardless of local-ID
+// contiguity. It is the ordered-enumeration entry the exact-index build and
+// live-slot derivation walk every leaf through.
+func (r *ResidentPrimaryRouter) RouteAtRank(rank int) (ResidentPrimaryRoute, bool) {
+	if r == nil || rank < 0 || rank >= r.Len() {
+		return ResidentPrimaryRoute{}, false
+	}
+	at := rank * residentPrimaryRouterWords
+	for {
+		before := r.version.Load()
+		if before&1 != 0 {
+			continue
+		}
+		offset := atomic.LoadUint64(&r.rows[at+1])
+		generation := atomic.LoadUint64(&r.rows[at+2])
+		meta := atomic.LoadUint64(&r.rows[at+3])
+		if before != r.version.Load() {
+			continue
+		}
+		bucket := BucketID(uint32(meta >> 32))
+		logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
+		if !ok {
+			return ResidentPrimaryRoute{}, false
+		}
+		return ResidentPrimaryRoute{
+			Ref: PageRef{
+				Offset: offset, LogicalID: logicalID,
+				Generation: generation, Length: uint32(meta),
+				Kind: PagePrimaryLeaf,
+			},
+			Bucket: bucket, rank: uint32(rank),
+		}, true
+	}
+}
+
+// ResolveBucketID returns the leaf route for one stable BucketID. A bottom-up
+// bulk build assigns bucket == row ordinal, so the packed row is found in O(1);
+// a graph reshaped by splits/merges may hold non-contiguous local IDs, so a
+// mismatch falls back to a lexical scan for the matching identity. It is the
+// posting-driven route the exact-index read path selects a tile's leaf by.
+func (r *ResidentPrimaryRouter) ResolveBucketID(
+	bucket BucketID,
+) (ResidentPrimaryRoute, bool) {
+	if r == nil {
+		return ResidentPrimaryRoute{}, false
+	}
+	if int(bucket) < r.Len() {
+		if route, ok := r.RouteAtRank(int(bucket)); ok && route.Bucket == bucket {
+			return route, true
+		}
+	}
+	for rank := 0; rank < r.Len(); rank++ {
+		if route, ok := r.RouteAtRank(rank); ok && route.Bucket == bucket {
+			return route, true
+		}
+	}
+	return ResidentPrimaryRoute{}, false
+}
+
 // Generation reports the state-root generation represented by the current
 // mutable leaf handles.
 func (r *ResidentPrimaryRouter) Generation() uint64 {

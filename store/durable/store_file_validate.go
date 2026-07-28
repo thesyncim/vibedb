@@ -274,6 +274,36 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 			page, header.StoreID, bucket, ref, v.generation.Load(), leafBounds,
 		)
 		return err
+	case storeio.PagePrimaryExactRoot:
+		header, _, err := storeio.OpenPage(page)
+		if err != nil {
+			return err
+		}
+		_, err = storeio.OpenPrimaryExactRootPage(
+			page, ref, storeio.PrimaryExactIndexBounds{
+				StoreID: header.StoreID, Generation: v.generation.Load(),
+				FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(),
+				AllocationQuantum: v.pageSize,
+				MaxPageSize:       storeio.MaxPhysicalPageSize,
+				IndexCount:        v.indexHighWater,
+			},
+		)
+		return err
+	case storeio.PagePrimaryExactLeaf:
+		header, _, err := storeio.OpenPage(page)
+		if err != nil {
+			return err
+		}
+		_, err = storeio.OpenPrimaryExactLeafPage(
+			page, ref, storeio.PrimaryExactIndexBounds{
+				StoreID: header.StoreID, Generation: v.generation.Load(),
+				FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(),
+				AllocationQuantum: v.pageSize,
+				MaxPageSize:       storeio.MaxPhysicalPageSize,
+				IndexCount:        v.indexHighWater,
+			},
+		)
+		return err
 	case storeio.PageTabletDirectory:
 		// Reserved by format 0, but not selected by the phase-4a graph.
 		return fmt.Errorf("%w: tablet directory has no selected codec",

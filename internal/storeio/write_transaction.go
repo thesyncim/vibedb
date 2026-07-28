@@ -481,7 +481,8 @@ func variableTransactionExtent(kind PageKind) bool {
 	switch kind {
 	case PageDocument, PageOverflow, PageFloat64Stripe,
 		PageIndexGroupCatalog, PagePrimaryCatalog, PageTabletDirectory,
-		PagePrimaryLocator, PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf:
+		PagePrimaryLocator, PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf,
+		PagePrimaryExactRoot, PagePrimaryExactLeaf:
 		return true
 	default:
 		return false
@@ -686,6 +687,14 @@ func (t *WriteTransaction) Generation() uint64 {
 		return 0
 	}
 	return t.options.Generation
+}
+
+// StoreID returns the transaction's immutable collection identity.
+func (t *WriteTransaction) StoreID() [16]byte {
+	if t == nil {
+		return [16]byte{}
+	}
+	return t.options.StoreID
 }
 
 // Publish selects stateRef through the alternate superblock. stateRef must be

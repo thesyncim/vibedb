@@ -84,9 +84,17 @@ type structuralLeaf struct {
 }
 
 // structuralRepairPostingsHook is the named attachment point for exact-index
-// posting-tile repair when rows change BucketID during a split or merge. Exact
-// indexes have not landed, so it is intentionally a no-op; invariant 6's atomic
-// posting rebuild lands here inside this one bounded transaction.
+// posting-tile repair when rows change BucketID during a split or merge.
+//
+// Exact posting tiles have landed on the ordered graph (see
+// store_file_primary_exact.go), but they are build-and-read: putPrimaryWithSplit
+// and deletePrimaryWithMerge reject a mutation of an indexed ordered-primary
+// collection with ErrPrimaryExactIndexReadOnly before any structural transaction
+// can fire. A structural transaction is therefore never reached with active
+// exact indexes, and this hook is a no-op guarded upstream rather than a live
+// repair. When incremental (or bounded-rebuild-at-checkpoint) posting
+// maintenance replaces that gate, the atomic per-tablet posting rebuild for the
+// moved buckets attaches here, inside the one bounded structural transaction.
 func (c *Collection) structuralRepairPostingsHook(moved []storeio.BucketID) {
 	_ = moved
 }
@@ -1263,6 +1271,9 @@ func (c *Collection) reclassPrimaryLeaf(
 func (c *Collection) putPrimaryWithSplit(
 	key string, src []byte,
 ) (created bool, err error) {
+	if c.primaryExactActive() {
+		return false, ErrPrimaryExactIndexReadOnly
+	}
 	for attempt := 0; ; attempt++ {
 		created, err = c.putPrimary(key, src)
 		if !errors.Is(err, ErrPrimaryLeafSplitRequired) {
@@ -1322,6 +1333,9 @@ func (c *Collection) splitPrimaryLeafForKey(key string) (err error) {
 func (c *Collection) deletePrimaryWithMerge(
 	key string,
 ) (deleted bool, err error) {
+	if c.primaryExactActive() {
+		return false, ErrPrimaryExactIndexReadOnly
+	}
 	deleted, err = c.deletePrimary(key)
 	if err != nil || !deleted {
 		return deleted, err

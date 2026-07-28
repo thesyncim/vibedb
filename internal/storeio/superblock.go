@@ -338,7 +338,8 @@ func stateRootReferencesOffset(root StateRoot, offset uint64) bool {
 		root.IndexDirectory.Offset == offset ||
 		root.Float64ScanHead.Offset == offset ||
 		root.IndexGroupHead.Offset == offset ||
-		root.PrimaryRoot.Offset == offset {
+		root.PrimaryRoot.Offset == offset ||
+		root.ExactIndexRoot.Offset == offset {
 		return true
 	}
 	catalog, _, ok := stateRootPageCatalogRun(root)
@@ -357,6 +358,7 @@ func readStateRootRefs(
 		root.KeyDirectory,
 		root.IndexDirectory,
 		root.PrimaryRoot,
+		root.ExactIndexRoot,
 	}
 	for _, ref := range refs {
 		if ref == (PageRef{}) {

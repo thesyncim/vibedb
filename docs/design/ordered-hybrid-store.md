@@ -397,6 +397,69 @@ explicitly requests lexical index results intersects candidates while walking
 the ordered primary cursor or sorts its bounded result. The API must state
 which order it promises.
 
+### Exact posting tiles on the ordered graph
+
+Exact indexes are published beside the ordered primary graph, so a store that
+declares indexes no longer needs the legacy chunk layout to carry the "indexed"
+leg. Two self-describing page kinds carry them:
+
+- `PagePrimaryExactLeaf` wraps exactly one canonical `IndexTermLeaf` byte stream
+  (the adaptive posting codec above) in the common page envelope. One leaf holds
+  the complete posting set for one physical index.
+- `PagePrimaryExactRoot` is a `PageSize` reference catalog: an ordered record per
+  physical index id, each either zero (an empty physical index) or a strictly
+  ascending `PagePrimaryExactLeaf` reference. `StateRoot.ExactIndexRoot` names it.
+  It is required exactly when the ordered primary declares indexes and keeps no
+  legacy `IndexDirectory`, and is forbidden otherwise (`validateStateExactIndexRoot`).
+
+**Build.** `CreateFromPrimary` builds the tiles inside the same transaction that
+stages the graph. The bottom-up builder returns a posting-stable placement
+(`BucketID`, slot) for every input row through `BuildPrimaryGraphPlaced`; the
+exact build groups rows by canonical term, keys each posting by
+`TileID = (BucketID << 2) | (slot >> 6)` with bit `slot & 63`, and encodes one
+term leaf per non-empty index plus the root. The whole file image is a
+deterministic function of the input and the canonical index catalog, so rebuilds
+are byte-identical (`TestCreateFromPrimaryExactIndexDeterministic`), and the
+catalog identity is folded into the reproducible `StoreID`.
+
+**Slot model across leaf classes.** The posting-stable slot must mean the same
+thing at build and at read. For the succinct narrow/wide leaves it is the leaf's
+stable hash-directory slot; for the template-columnar class — which has no hash
+directory — it is the lexical rank the template builder stamps as each row's
+slot. `VisitPrimaryLeafPostingRows` is the single enumerator both the build
+placement and the read path route through, so a row is always read under the
+posting it was written under, regardless of class. Template ranks are bounded by
+256, so they fit the four-quadrant tile model unchanged.
+
+**Read.** A resident `IndexTermLeafView` per physical index answers exact
+lookups; `AppendIndexMasksInto` canonicalizes the needle and returns one
+`(tile, mask)` per live posting. Every posting bit is rechecked against a
+live-slot map derived from the current graph, so a stale or grafted posting fails
+closed. `RangeMasksRaw` materializes selected rows by resolving each tile's
+bucket through the resident router and visiting the leaf's live rows in lexical
+order.
+
+**Mutation (build-and-read).** An indexed ordered-primary collection is
+currently build-and-read: `Put`/`Delete` on it fail closed with
+`ErrPrimaryExactIndexReadOnly` rather than publish a stale posting index. The
+read path couples the live-slot map and the postings tightly — a delete that
+left postings behind would make reads fail closed, an insert would make them
+silently miss — so nothing between the two is acceptable. The honest maintenance
+path is a bounded full rebuild of the exact tiles from the current graph at a
+checkpoint that can afford the up-to-`fileStoreMaxPhysicalIndexes` term-leaf
+reservation; it is not wired on the mutation path yet, so mutation refuses
+instead of diverging. `structuralRepairPostingsHook` marks where the per-tablet
+rebuild attaches once that lands, and is a no-op because the upstream gate keeps
+structural transactions from ever firing on an indexed collection.
+
+**Crash safety and verify.** Exact-index pages are staged and published through
+the same committer as the graph in one atomic generation, so they add no new
+commit-window shape. `cmd/vibedb-verify` walks `ExactIndexRoot` → every
+`PagePrimaryExactLeaf`, admitting the reference catalog (bounds, ordering,
+distinctness) and each leaf envelope, and records their extents for the
+reachable-overlap check; recovery re-admits the exact root through
+`validateRecoveredStateRef`.
+
 ## Allocator and locality
 
 The free-space index uses a 64-way hierarchical maximum over the exact

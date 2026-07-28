@@ -1539,6 +1539,23 @@ func (v *CommonPrimaryLeafView) LookupSlot(
 	return v.lookupRank(rank, key)
 }
 
+// LookupSlotRaw resolves one posting-stable slot without a primary-key
+// comparison. It is safe only after an admitted exact posting selected the
+// slot; key and raw borrow the leaf page for its lease lifetime.
+func (v *CommonPrimaryLeafView) LookupSlotRaw(
+	slot uint8,
+) (key, raw []byte, overflow, ok bool) {
+	rank, ok := v.slotRank(slot)
+	if !ok {
+		return nil, nil, false, false
+	}
+	key, valueStart, end, ok := v.keyBounds(rank)
+	if !ok || valueStart >= end {
+		return nil, nil, false, false
+	}
+	return key, v.payload[valueStart:end:end], v.rankOverflow(rank), true
+}
+
 // LowerBound returns the lexical rank of the first key greater than or equal to
 // key, in [0, Len]. It is the entry point for ordered range and prefix scans.
 func (v *CommonPrimaryLeafView) LowerBound(key []byte) int {

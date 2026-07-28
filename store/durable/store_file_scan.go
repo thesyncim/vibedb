@@ -192,6 +192,14 @@ func (s *Snapshot) RangeMasksRawBuffer(masks []store.Mask, scratch []byte, fn fu
 		return scratch, nil
 	}
 	state := s.state
+	if state.root.PrimaryRoot != (storeio.PageRef{}) {
+		return s.rangePrimaryMasks(
+			masks, scratch,
+			func(_ store.Location, key, value []byte) error {
+				return fn(key, value)
+			},
+		)
+	}
 	bounds := storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
 	}
@@ -239,6 +247,9 @@ func (s *Snapshot) RangeMasksRawRowsBuffer(
 		return scratch, nil
 	}
 	state := s.state
+	if state.root.PrimaryRoot != (storeio.PageRef{}) {
+		return s.rangePrimaryMasks(masks, scratch, fn)
+	}
 	bounds := storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
 	}
@@ -263,6 +274,82 @@ func (s *Snapshot) RangeMasksRawRowsBuffer(
 		if err := s.rangeFileDocumentRows(
 			state, mask.Chunk, ref, mask.Bits, &scratch, fn,
 		); err != nil {
+			return scratch, err
+		}
+	}
+	return scratch, nil
+}
+
+// rangePrimaryMasks materializes selected rows from the ordered primary graph.
+// Masks are grouped by bucket (four quadrant tiles per bucket), the bucket's
+// leaf is resolved through the resident router, and its live rows are visited in
+// lexical order with their posting-stable slot; a row whose tile/bit is selected
+// is delivered. For an indexed primary every selected bit is rechecked against
+// the live-slot map, so a mask that names a dead or absent slot fails closed.
+func (s *Snapshot) rangePrimaryMasks(
+	masks []store.Mask,
+	scratch []byte,
+	fn func(row store.Location, key, value []byte) error,
+) ([]byte, error) {
+	state := s.state
+	router := s.collection.primaryRouter.Load()
+	if router == nil {
+		return scratch, store.ErrMaskChunk
+	}
+	bounds := s.collection.primaryLeafBounds(state)
+	enforceLive := s.collection.primaryLive != nil
+	var previous uint32
+	for at := 0; at < len(masks); {
+		if at != 0 && masks[at].Chunk <= previous {
+			return scratch, store.ErrMaskOrder
+		}
+		bucket := masks[at].Chunk >> 2
+		if bucket >= storeio.PrimaryBucketIDLimit {
+			return scratch, store.ErrMaskChunk
+		}
+		var selected [4]uint64
+		for at < len(masks) && masks[at].Chunk>>2 == bucket {
+			mask := masks[at]
+			if at != 0 && mask.Chunk <= previous {
+				return scratch, store.ErrMaskOrder
+			}
+			previous = mask.Chunk
+			quadrant := mask.Chunk & 3
+			live := s.collection.primaryLive[mask.Chunk]
+			if mask.Bits != 0 && enforceLive &&
+				(live == nil || mask.Bits&^live[0] != 0) {
+				return scratch, store.ErrMaskChunk
+			}
+			selected[quadrant] = mask.Bits
+			at++
+		}
+		route, ok := router.ResolveBucketID(storeio.BucketID(bucket))
+		if !ok {
+			return scratch, store.ErrMaskChunk
+		}
+		lease, err := router.AcquireLeaf(s.collection.cache, route)
+		if err != nil {
+			return scratch, err
+		}
+		scratch, err = storeio.VisitPrimaryLeafPostingRows(
+			lease.Page(), state.root.StoreID, route.Bucket, bounds, scratch,
+			func(slot uint8, key, raw []byte, overflow bool) error {
+				quadrant := slot >> 6
+				bit := uint64(1) << uint(slot&63)
+				if selected[quadrant]&bit == 0 {
+					return nil
+				}
+				if overflow {
+					return ErrPrimaryCutoverUnsupported
+				}
+				return fn(store.Location{
+					Chunk: uint32(route.Bucket)<<2 | uint32(quadrant),
+					Slot:  slot & 63,
+				}, key, raw)
+			},
+		)
+		lease.Release()
+		if err != nil {
 			return scratch, err
 		}
 	}

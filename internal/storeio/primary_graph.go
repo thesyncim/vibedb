@@ -16,6 +16,15 @@ type PrimaryGraphRecord struct {
 // PrimaryRecord is the concise spelling used by store/durable bulk callers.
 type PrimaryRecord = PrimaryGraphRecord
 
+// PrimaryGraphPlacement is the posting-stable location assigned to one input
+// record by the bottom-up builder: the leaf's stable BucketID and the row's
+// stable slot within it (see VisitPrimaryLeafPostingRows for the per-class slot
+// model). Exact-index posting tiles are keyed by this placement.
+type PrimaryGraphPlacement struct {
+	Bucket BucketID
+	Slot   uint8
+}
+
 // PrimaryLeafClassPolicy controls the aligned class selected by a bottom-up
 // build. Adaptive is the zero value: it first targets the 4 KiB narrow class
 // and uses the 8 KiB wide class only when the same rows exceed that budget.
@@ -112,9 +121,35 @@ func BuildPrimaryGraph(
 // into a 4 KiB page than the raw leaf would — a measured saving well past the
 // adoption threshold, since the same documents otherwise require the 8 KiB wide
 // class. Explicit narrow/wide policies never select the template class.
+// BuildPrimaryGraphPlaced is BuildPrimaryGraph with caller-owned placement
+// output: placements must have exactly one element per input record, and each
+// receives the posting-stable location the builder assigned that row. It is the
+// entry the ordered-primary exact-index build uses to key posting tiles.
+func BuildPrimaryGraphPlaced(
+	tx *WriteTransaction,
+	records []PrimaryGraphRecord,
+	placements []PrimaryGraphPlacement,
+	policy ...PrimaryLeafClassPolicy,
+) (PageRef, error) {
+	if len(placements) != len(records) {
+		return PageRef{}, fmt.Errorf("%w: primary placement output", ErrInvalidWrite)
+	}
+	ref, _, err := buildPrimaryGraphPlaced(tx, records, placements, policy...)
+	return ref, err
+}
+
 func BuildPrimaryGraphWithStats(
 	tx *WriteTransaction,
 	records []PrimaryGraphRecord,
+	policy ...PrimaryLeafClassPolicy,
+) (PageRef, PrimaryGraphBuildStats, error) {
+	return buildPrimaryGraphPlaced(tx, records, nil, policy...)
+}
+
+func buildPrimaryGraphPlaced(
+	tx *WriteTransaction,
+	records []PrimaryGraphRecord,
+	placements []PrimaryGraphPlacement,
 	policy ...PrimaryLeafClassPolicy,
 ) (PageRef, PrimaryGraphBuildStats, error) {
 	var stats PrimaryGraphBuildStats
@@ -153,7 +188,7 @@ func BuildPrimaryGraphWithStats(
 			stats.LeavesByClass[class]++
 		}
 	}
-	built, err := buildPrimaryLeaves(tx, records, plans)
+	built, err := buildPrimaryLeaves(tx, records, plans, placements)
 	if err != nil {
 		return PageRef{}, stats, err
 	}
@@ -478,6 +513,7 @@ func buildPrimaryLeaves(
 	tx *WriteTransaction,
 	input []PrimaryGraphRecord,
 	plans []primaryLeafPlan,
+	placements []PrimaryGraphPlacement,
 ) ([]primaryBuiltLeaf, error) {
 	built := make([]primaryBuiltLeaf, len(plans))
 	bounds := CommonPrimaryLeafBounds{
@@ -517,6 +553,14 @@ func buildPrimaryLeaves(
 		); err != nil {
 			return nil, err
 		}
+		if placements != nil {
+			if err := recordPrimaryPlacements(
+				placements, input, plans[rank], BucketID(bucket),
+				page.Bytes(), tx.options.StoreID, bounds,
+			); err != nil {
+				return nil, err
+			}
+		}
 		if err := page.Stage(); err != nil {
 			return nil, err
 		}
@@ -527,6 +571,42 @@ func buildPrimaryLeaves(
 		}
 	}
 	return built, nil
+}
+
+// recordPrimaryPlacements fills the posting-stable slot for every input row of
+// one just-encoded leaf. A template leaf assigns slot = ordinal within the leaf
+// (the lexical rank the template builder stamped as each row's Slot); a succinct
+// leaf resolves the row's stable hash-directory slot from the encoded image, so
+// the placement matches exactly what a later lookup recovers.
+func recordPrimaryPlacements(
+	placements []PrimaryGraphPlacement,
+	input []PrimaryGraphRecord,
+	plan primaryLeafPlan,
+	bucket BucketID,
+	page []byte,
+	storeID [16]byte,
+	bounds CommonPrimaryLeafBounds,
+) error {
+	if plan.class == CommonPrimaryLeafTemplate {
+		for at := plan.first; at < plan.last; at++ {
+			placements[at] = PrimaryGraphPlacement{
+				Bucket: bucket, Slot: uint8(at - plan.first),
+			}
+		}
+		return nil
+	}
+	view := AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
+	for at := plan.first; at < plan.last; at++ {
+		key := input[at].Key
+		slot, _, _, found := view.LookupRawHashed(
+			KeyHashBytes(storeID, key), key,
+		)
+		if !found {
+			return fmt.Errorf("%w: primary placement lookup", ErrInvalidWrite)
+		}
+		placements[at] = PrimaryGraphPlacement{Bucket: bucket, Slot: slot}
+	}
+	return nil
 }
 
 func buildPrimaryTablets(

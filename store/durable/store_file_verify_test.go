@@ -3,11 +3,13 @@ package durable
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 )
 
 // verifyScanFile returns the physical offset and length of every checksum-valid
@@ -114,6 +116,51 @@ func TestVerifyCleanPrimaryStoreVerifiesClean(t *testing.T) {
 	}
 	if report.Generation == 0 || report.FileEnd == 0 || report.RootSlot < 0 {
 		t.Fatalf("verify summary incomplete: %+v", report)
+	}
+}
+
+func TestVerifyIndexedPrimaryStoreVerifiesClean(t *testing.T) {
+	builder, err := store.NewBuilder(store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range 4000 {
+		raw := fmt.Appendf(nil, `{"country":"c%03d","row":%d}`, row%100, row)
+		if err := builder.Append(fmt.Sprintf("k%05d", row), raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Indexes: []store.IndexDefinition{
+			{Name: "country", Paths: []string{"/country"}},
+			{Name: "country_alias", Paths: []string{"/country"}},
+		},
+	}
+	file, err := os.CreateTemp(t.TempDir(), "verify-indexed-primary-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := CreateFromPrimary(source, file, options); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Verify(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.OK() {
+		t.Fatalf("indexed primary store reported %d findings: %+v",
+			len(report.Findings), report.Findings)
+	}
+	if report.PageCounts["primary-exact-root"] != 1 ||
+		report.PageCounts["primary-exact-leaf"] == 0 {
+		t.Fatalf("verify did not walk the exact-index subtree: %+v",
+			report.PageCounts)
 	}
 }
 

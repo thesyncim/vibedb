@@ -128,6 +128,12 @@ const (
 	PagePrimaryAnchor
 	// PagePrimaryLeaf is a primary leaf holding the ordered key/value records.
 	PagePrimaryLeaf
+	// PagePrimaryExactRoot names the immutable physical exact-index leaves built
+	// beside an ordered primary graph: a canonical physical-index-id to
+	// PagePrimaryExactLeaf reference catalog. PagePrimaryExactLeaf wraps one
+	// canonical IndexTermLeaf byte stream in the common page envelope.
+	PagePrimaryExactRoot
+	PagePrimaryExactLeaf
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -280,7 +286,7 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageStateRoot && kind <= PagePrimaryLeaf
+	return kind >= PageStateRoot && kind <= PagePrimaryExactLeaf
 }
 
 func validPageFlags(kind PageKind, flags uint8) bool {

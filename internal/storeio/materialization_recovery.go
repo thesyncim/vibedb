@@ -453,6 +453,7 @@ func inlineRecoveryScratchNeed(root InlineSuperblock) int {
 		root.State.IndexGroupHead,
 		root.State.PageCatalogHead,
 		root.State.PrimaryRoot,
+		root.State.ExactIndexRoot,
 		root.FreeDelta.IndexHead(),
 		root.FreeDelta.ExternalPrev(),
 	}
@@ -618,6 +619,7 @@ func validateRecoveredInlineRefs(
 		root.State.Float64ScanHead,
 		root.State.IndexGroupHead,
 		root.State.PrimaryRoot,
+		root.State.ExactIndexRoot,
 	}
 	for _, ref := range stateRefs {
 		if ref == (PageRef{}) {
@@ -732,6 +734,15 @@ func validateRecoveredStateRef(
 				StoreID:                state.StoreID,
 				SelectedRootGeneration: state.Generation,
 				FileEnd:                root.FileEnd, NextLogicalID: state.NextLogicalID,
+			},
+		)
+	case PagePrimaryExactRoot:
+		_, openErr = OpenPrimaryExactRootPage(
+			page, ref, PrimaryExactIndexBounds{
+				StoreID: state.StoreID, Generation: state.Generation,
+				FileEnd: root.FileEnd, NextLogicalID: state.NextLogicalID,
+				AllocationQuantum: state.PageSize,
+				MaxPageSize:       state.MaxPageSize, IndexCount: state.IndexCount,
 			},
 		)
 	default:

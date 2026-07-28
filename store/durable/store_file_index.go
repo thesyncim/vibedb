@@ -51,6 +51,9 @@ func (s *Snapshot) AppendIndexMasksInto(dst []store.Mask, workspace *IndexWorksp
 		var local IndexWorkspace
 		workspace = &local
 	}
+	if s.state.root.ExactIndexRoot != (storeio.PageRef{}) {
+		return s.appendPrimaryExactMasks(dst, workspace, name, values)
+	}
 	workspace.lastProbe = IndexProbeStats{}
 	probe, err := s.prepareFileIndexProbe(workspace, name, values)
 	if err != nil {
@@ -273,6 +276,9 @@ func (s *Snapshot) AppendIndexCandidateMasksInto(dst []store.Mask, workspace *In
 	if workspace == nil {
 		var local IndexWorkspace
 		workspace = &local
+	}
+	if s.state.root.ExactIndexRoot != (storeio.PageRef{}) {
+		return s.appendPrimaryExactMasks(dst, workspace, name, values)
 	}
 	workspace.lastProbe = IndexProbeStats{}
 	probe, err := s.prepareFileIndexProbe(workspace, name, values)

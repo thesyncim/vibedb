@@ -50,6 +50,16 @@ var (
 	ErrPrimaryCutoverUnsupported = errors.New(
 		"vibejson: ordered primary cutover feature is unsupported",
 	)
+	// ErrPrimaryExactIndexReadOnly rejects an in-place mutation of an ordered
+	// primary collection that carries exact posting tiles. Posting tiles are
+	// built once during CreateFromPrimary; incremental maintenance is a bounded
+	// full rebuild that is not wired on the mutation path yet, so a collection
+	// with exact indexes is build-and-read. Refusing the mutation is fail-closed:
+	// it never serves or persists a stale posting index. See
+	// docs/design/ordered-hybrid-store.md, "Exact posting tiles".
+	ErrPrimaryExactIndexReadOnly = errors.New(
+		"vibejson: ordered primary exact indexes are build-and-read; mutation is unsupported",
+	)
 	// ErrWriterLocked reports that another mutable collection owns the
 	// page file. A durable file has exactly one generation publisher.
 	ErrWriterLocked = storeio.ErrWriterLocked
@@ -992,6 +1002,14 @@ type Collection struct {
 	// transaction and mutated in place by ordinary COW UpdateLeaf. Lock-free
 	// point reads load it once; an atomic pointer keeps that swap race-free.
 	primaryRouter atomic.Pointer[storeio.ResidentPrimaryRouter]
+	// primaryExact holds the resident exact-term leaves published on the ordered
+	// graph, one per physical index; primaryLive is the live posting-slot map the
+	// read-side posting recheck validates against. Both are non-nil only for an
+	// indexed ordered-primary collection and are rebuilt wholesale after a
+	// mutation changes the graph (see rebuildPrimaryExactIndexes). They are
+	// protected by the same writer/snapshotGate discipline as primaryRouter.
+	primaryExact []primaryExactResident
+	primaryLive  map[uint32]*[storeio.TermPostingTileChunks]uint64
 	readFile      *os.File
 	writeFile     *os.File
 	directRead    bool
@@ -1628,6 +1646,12 @@ func Open(file *os.File, options Options) (*Collection, error) {
 			collection.primaryVolatileRetired = make(
 				[]storeio.PageRef, 0,
 				pendingCapacity,
+			)
+		}
+		if err := collection.openPrimaryExactIndexes(state); err != nil {
+			_ = collection.closeResources()
+			return nil, fmt.Errorf(
+				"vibejson: open ordered-primary exact indexes: %w", err,
 			)
 		}
 	}

@@ -954,12 +954,6 @@ func TestCreateFromPrimaryRejectsUnsupportedOptions(t *testing.T) {
 		options Options
 	}{
 		{
-			name: "indexes",
-			options: Options{Indexes: []store.IndexDefinition{
-				{Name: "id", Paths: []string{"/id"}},
-			}},
-		},
-		{
 			name:    "float64 columns",
 			options: Options{Float64Columns: []string{"/id"}},
 		},

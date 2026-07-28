@@ -123,6 +123,9 @@ func Verify(file *os.File) (VerifyReport, error) {
 	if report.Primary {
 		w.walkPrimary()
 	}
+	if root.ExactIndexRoot != (storeio.PageRef{}) {
+		w.walkExactIndexes()
+	}
 	// Legacy chunk/fingerprint primaries (PrimaryRoot zero) have their recovery
 	// root, every top-level directory/catalog root, and free set proven above and
 	// below; their interior document-page graph is validated by the online Open
@@ -167,6 +170,57 @@ func (w *verifyWalker) fail(
 }
 
 func (w *verifyWalker) count(kind string) { w.report.PageCounts[kind]++ }
+
+// walkExactIndexes proves the ordered-primary exact-index subtree: the
+// PagePrimaryExactRoot reference catalog opens and admits (which validates that
+// its leaf references are in-bounds, strictly ordered, and distinct from the
+// root), and every non-empty PagePrimaryExactLeaf envelope opens with a matching
+// identity. Each extent is recorded so the overlap check proves the posting
+// tiles never alias a live routing page. The term-codec's semantic admission
+// against the graph's live slot masks is proven by the online Open path.
+func (w *verifyWalker) walkExactIndexes() {
+	rootRef := w.root.ExactIndexRoot
+	bounds := storeio.PrimaryExactIndexBounds{
+		StoreID: w.storeID, Generation: w.root.Generation,
+		FileEnd: w.fileEnd, NextLogicalID: w.root.NextLogicalID,
+		AllocationQuantum: w.pageSize, MaxPageSize: w.maxPageSize,
+		IndexCount: w.root.IndexCount,
+	}
+	w.record(rootRef, "primary-exact-root")
+	page, ok := w.openAndCheckIdentity(rootRef, "primary-exact-root")
+	if !ok {
+		return
+	}
+	view, err := storeio.OpenPrimaryExactRootPage(page, rootRef, bounds)
+	if err != nil {
+		w.fail("primary-exact-root", rootRef.Offset, rootRef.LogicalID,
+			"admit: %v", err)
+		return
+	}
+	w.count("primary-exact-root")
+	for indexID := 0; indexID < view.Len(); indexID++ {
+		ref, ok := view.Leaf(uint32(indexID))
+		if !ok {
+			w.fail("primary-exact-root", rootRef.Offset, rootRef.LogicalID,
+				"leaf catalog entry %d", indexID)
+			return
+		}
+		if ref == (storeio.PageRef{}) {
+			continue
+		}
+		w.record(ref, "primary-exact-leaf")
+		leaf, ok := w.openAndCheckIdentity(ref, "primary-exact-leaf")
+		if !ok {
+			continue
+		}
+		if _, err := storeio.OpenPrimaryExactLeafPage(leaf, ref, bounds); err != nil {
+			w.fail("primary-exact-leaf", ref.Offset, ref.LogicalID,
+				"admit: %v", err)
+			continue
+		}
+		w.count("primary-exact-leaf")
+	}
+}
 
 func (w *verifyWalker) record(ref storeio.PageRef, kind string) {
 	// Record the extent claimed by the routing reference regardless of whether

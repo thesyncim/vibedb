@@ -242,6 +242,8 @@ const (
 	PageTabletRoute                   // 21
 	PagePrimaryAnchor                 // 22
 	PagePrimaryLeaf                   // 23
+	PagePrimaryExactRoot              // 24
+	PagePrimaryExactLeaf              // 25
 )
 ```
 
@@ -270,6 +272,8 @@ const (
 | 21 | `PageTabletRoute` | tablet segmented route block over its primary leaves |
 | 22 | `PagePrimaryAnchor` | tablet lexical anchor map: immutable interval fences routing to stable `BucketID`s |
 | 23 | `PagePrimaryLeaf` | ordered primary leaf holding the key/value records |
+| 24 | `PagePrimaryExactRoot` | physical exact-index id to term-leaf reference catalog built beside `PrimaryRoot` (`StateRoot.ExactIndexRoot`); aliases share physical leaf entries |
+| 25 | `PagePrimaryExactLeaf` | common-page envelope around one canonical adaptive `IndexTermLeaf` byte stream (exact posting tiles for one physical index) |
 
 ### PageRef — 32 bytes
 
@@ -329,15 +333,19 @@ accepted.
 | 284:288 | MaxDocumentBytes | u32 | immutable complete-document bound |
 | 288:320 | PrimaryRoot | `PageRef` | zero selects the current fingerprint/chunk primary; otherwise the 64 KiB `PagePrimaryCatalog` root at `PrimaryCatalogRootLogicalID` |
 | 320:336 | JournalID | 16 bytes | UUID of the paired recovery journal file; zero means no journal is referenced |
-| 336:512 | reserved | — | zero |
+| 336:368 | ExactIndexRoot | `PageRef` | `PagePrimaryExactRoot` for exact indexes built beside `PrimaryRoot`; aliases share physical leaf entries. Zero unless the ordered primary declares indexes and keeps no legacy `IndexDirectory` |
+| 368:512 | reserved | — | zero |
 
 The chunk, key, index, and float64 directory roots have
 `Length == PageSize`. `IndexGroupHead` may be a larger valid physical extent
 that is a whole `PageSize` multiple. `PrimaryRoot` has the fixed production
 catalog identity, kind, and 64 KiB length and requires the reserved primary
-logical-ID bands below `NextLogicalID`. Every populated top-level ref has
-`Generation <= root.Generation`; all six are pairwise distinct in both
-`LogicalID` and `Offset`.
+logical-ID bands below `NextLogicalID`. `ExactIndexRoot` is one `PageSize`
+catalog whose ordered records each contain either zero (an empty physical index)
+or a `PagePrimaryExactLeaf` reference; leaf extents are powers of two up to
+`MaxPageSize`, and each leaf payload is exactly `AppendIndexTermLeaf` output.
+Every populated top-level ref has `Generation <= root.Generation`; all roots are
+pairwise distinct in both `LogicalID` and `Offset`.
 
 Ordered-primary leaves are all `PagePrimaryLeaf` pages; their payload byte
 `[2]` low seven bits are the leaf-class discriminator, read only after the

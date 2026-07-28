@@ -67,9 +67,17 @@ const (
 	// carries {StoreID, JournalID}; recovery cross-checks both before replaying.
 	stateRootJournalIDOffset = stateRootPrimaryEnd
 	stateRootJournalIDEnd    = stateRootJournalIDOffset + 16
+	// stateRootExactIndexOffset names the PagePrimaryExactRoot published beside
+	// PrimaryRoot for exact indexes carried as posting tiles on the ordered
+	// graph. It occupies 32 bytes of the previously zero-filled reserve, so a
+	// store without ordered-primary exact indexes encodes exactly the bytes it
+	// did before (an all-zero ExactIndexRoot). No existing offset moves and the
+	// payload length is unchanged.
+	stateRootExactIndexOffset = stateRootJournalIDEnd
+	stateRootExactIndexEnd    = stateRootExactIndexOffset + PageRefSize
 	// stateRootReservedOffset begins the zero-filled suffix described on
 	// StateRootPayloadSize.
-	stateRootReservedOffset = stateRootJournalIDEnd
+	stateRootReservedOffset = stateRootExactIndexEnd
 )
 
 // State-root option bits are durable equivalents of Store construction
@@ -186,6 +194,12 @@ type StateRoot struct {
 	// PrimaryRoot selects the ordered tablet graph. Zero keeps the current
 	// fingerprint/chunk primary authoritative during the staged cutover.
 	PrimaryRoot PageRef
+	// ExactIndexRoot names the PagePrimaryExactRoot carrying the physical
+	// exact-term posting leaves associated with PrimaryRoot. It is absent for an
+	// ordered primary without indexes, and never coexists with IndexDirectory:
+	// exact indexes live either on the chunk store (IndexDirectory) or on the
+	// ordered graph (ExactIndexRoot), not both.
+	ExactIndexRoot PageRef
 	// JournalID is the UUID of the recovery journal file paired with this store.
 	// Zero means no journal is referenced: the store never acknowledged a
 	// mutation through the redo journal, and recovery must find no journal to
@@ -280,6 +294,10 @@ func encodeStateRootPayload(payload []byte, root StateRoot) {
 		root.PrimaryRoot,
 	)
 	copy(payload[stateRootJournalIDOffset:stateRootJournalIDEnd], root.JournalID[:])
+	encodePageRef(
+		payload[stateRootExactIndexOffset:stateRootExactIndexEnd],
+		root.ExactIndexRoot,
+	)
 }
 
 // DecodeStateRootPage verifies a complete common page and its state-root
@@ -313,6 +331,7 @@ func decodeStateRootPayload(
 		!pageRefReservedZero(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd]) ||
 		!pageRefReservedZero(payload[stateRootPageCatalogOffset:stateRootPageCatalogEnd]) ||
 		!pageRefReservedZero(payload[stateRootPrimaryOffset:stateRootPrimaryEnd]) ||
+		!pageRefReservedZero(payload[stateRootExactIndexOffset:stateRootExactIndexEnd]) ||
 		!allZero(payload[stateRootReservedOffset:]) {
 		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
 	}
@@ -361,6 +380,9 @@ func decodeStateRootPayload(
 		IndexGroupHead:  indexGroupHead,
 		PrimaryRoot: decodePageRef(
 			payload[stateRootPrimaryOffset:stateRootPrimaryEnd],
+		),
+		ExactIndexRoot: decodePageRef(
+			payload[stateRootExactIndexOffset:stateRootExactIndexEnd],
 		),
 	}
 	copy(root.JournalID[:], payload[stateRootJournalIDOffset:stateRootJournalIDEnd])
@@ -519,6 +541,22 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 			}
 		}
 	}
+	if err := validateStateExactIndexRoot(root, fileEnd); err != nil {
+		return err
+	}
+	if root.ExactIndexRoot != (PageRef{}) {
+		for i := range refs {
+			if refs[i].ref != (PageRef{}) &&
+				(refs[i].ref.LogicalID == root.ExactIndexRoot.LogicalID ||
+					refs[i].ref.Offset == root.ExactIndexRoot.Offset) {
+				return fmt.Errorf("%w: duplicate exact-index root", ErrInvalidWrite)
+			}
+		}
+		if root.PrimaryRoot.LogicalID == root.ExactIndexRoot.LogicalID ||
+			root.PrimaryRoot.Offset == root.ExactIndexRoot.Offset {
+			return fmt.Errorf("%w: duplicate primary/exact-index root", ErrInvalidWrite)
+		}
+	}
 	if root.Float64ScanHead != (PageRef{}) {
 		ref := root.Float64ScanHead
 		length := uint64(ref.Length)
@@ -542,6 +580,11 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 			(root.PrimaryRoot.LogicalID == ref.LogicalID ||
 				root.PrimaryRoot.Offset == ref.Offset) {
 			return fmt.Errorf("%w: duplicate primary/float64 root", ErrInvalidWrite)
+		}
+		if root.ExactIndexRoot != (PageRef{}) &&
+			(root.ExactIndexRoot.LogicalID == ref.LogicalID ||
+				root.ExactIndexRoot.Offset == ref.Offset) {
+			return fmt.Errorf("%w: duplicate exact-index/float64 root", ErrInvalidWrite)
 		}
 	}
 	if root.IndexGroupHead != (PageRef{}) {
@@ -574,6 +617,11 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 				root.PrimaryRoot.Offset == ref.Offset) {
 			return fmt.Errorf("%w: duplicate primary/aggregate root", ErrInvalidWrite)
 		}
+		if root.ExactIndexRoot != (PageRef{}) &&
+			(root.ExactIndexRoot.LogicalID == ref.LogicalID ||
+				root.ExactIndexRoot.Offset == ref.Offset) {
+			return fmt.Errorf("%w: duplicate exact-index/aggregate root", ErrInvalidWrite)
+		}
 	}
 	if hasCatalog {
 		if err := validateStatePageCatalog(root, fileEnd); err != nil {
@@ -602,6 +650,7 @@ func validateStatePageCatalog(root StateRoot, fileEnd uint64) error {
 		root.Float64ScanHead,
 		root.IndexGroupHead,
 		root.PrimaryRoot,
+		root.ExactIndexRoot,
 	}
 	for _, ref := range refs {
 		if ref == (PageRef{}) {
@@ -644,6 +693,36 @@ func validateStatePrimaryRoot(root StateRoot, fileEnd uint64) error {
 		length > fileEnd || ref.Offset > maxSuperblockFileOffset ||
 		ref.Offset > fileEnd-length {
 		return fmt.Errorf("%w: invalid ordered primary root", ErrInvalidWrite)
+	}
+	return nil
+}
+
+// validateStateExactIndexRoot validates the PagePrimaryExactRoot published for
+// exact indexes carried as posting tiles on the ordered graph. The root is
+// required exactly when an ordered primary declares indexes but keeps no legacy
+// chunk-store IndexDirectory, and is forbidden otherwise.
+func validateStateExactIndexRoot(root StateRoot, fileEnd uint64) error {
+	ref := root.ExactIndexRoot
+	required := root.PrimaryRoot != (PageRef{}) && root.IndexCount != 0 &&
+		root.IndexDirectory == (PageRef{})
+	if ref == (PageRef{}) {
+		if required {
+			return fmt.Errorf("%w: missing ordered-primary exact-index root", ErrInvalidWrite)
+		}
+		return nil
+	}
+	if !required {
+		return fmt.Errorf("%w: unneeded ordered-primary exact-index root", ErrInvalidWrite)
+	}
+	bounds := PrimaryExactIndexBounds{
+		StoreID: root.StoreID, Generation: root.Generation,
+		FileEnd: fileEnd, NextLogicalID: root.NextLogicalID,
+		AllocationQuantum: root.PageSize, MaxPageSize: root.MaxPageSize,
+		IndexCount: root.IndexCount,
+	}
+	if ref.Kind != PagePrimaryExactRoot ||
+		!validPrimaryExactRef(ref, PagePrimaryExactRoot, bounds) {
+		return fmt.Errorf("%w: invalid ordered-primary exact-index root", ErrInvalidWrite)
 	}
 	return nil
 }
