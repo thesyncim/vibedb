@@ -149,7 +149,8 @@ The initial contract does **not** claim:
 - automatic discovery of a correct application shard key;
 - global lexical locality after hash-based placement;
 - availability in both sides of a network partition; or
-- that an asynchronous replica protects an acknowledged write.
+- that an asynchronous replica protects an acknowledged write;
+- a globally ordered change-data-capture stream or cross-shard changefeed.
 
 Optional two-phase commit may later provide atomic cross-shard writes, but 2PC
 alone does not provide serializable isolation or prevent fractured reads.
@@ -410,7 +411,9 @@ For one stable term:
 
 RF2 and RF3 acknowledgement therefore covers two durable failure domains; RF1
 covers only the owner's domain. It does not wait for a replica to make the row
-reader-visible.
+reader-visible. Records and chosen-watermark notifications may be pipelined
+across bounded per-follower windows; the numbered steps define ordering and
+acknowledgement semantics, not a stop-and-wait transport.
 
 A failure after local acceptance but before the client receives success is an
 ambiguous outcome. The owner may not skip or discard that sequence and
@@ -418,9 +421,12 @@ continue; it must choose the record, choose a no-op resolution under the same
 request contract, or stop serving. Promotion preserves every possibly chosen
 record and may adopt an accepted ambiguous tail. Durable request IDs make a
 retry return the resolved result rather than apply the mutation twice.
+The request ID and its resolved result are replicated state covered by the
+same choice rule, included in snapshots, and retained across owner failover.
 Deduplication retention is a declared time/space contract carried in the
 client token; after it expires, the service returns a typed indeterminate
-result rather than silently reapplying an old request.
+result rather than silently reapplying an old request. An owner-local cache
+may accelerate lookup but is never the authority.
 
 The protocol must never fall back from synchronous to asynchronous
 acknowledgement. An unavailable eligible replica applies backpressure or fails
@@ -451,13 +457,18 @@ partitioned old owner cannot see a replacement term.
 The owner holds a topology-backed lease for `(ShardID, ShardTerm)` and converts
 the authority's expiry into a conservative monotonic local deadline. It stops
 admitting writes before that deadline can become uncertain. Replicas stop
-acknowledging the owner at the same term deadline. The next term cannot be
+acknowledging the owner at the same term deadline. The owner piggybacks the
+authority-issued lease deadline on replication records and bounded-frequency
+heartbeats; a replica accepts it only for the matching installed term and
+applies the same conservative clock-error margin. The next term cannot be
 granted until the prior lease is expired or the old owner is hard-fenced.
 
 The clock-error budget, renewal interval, and safety margin are configuration
 and qualification inputs. If the required bound cannot be established, the
 deployment uses manual or infrastructure hard fencing rather than lease-based
-automatic failover.
+automatic failover. If per-shard renewals dominate the topology service, a
+future node-liveness or epoch-lease layer may amortize them, but it must retain
+the same fail-closed deadline and term-binding contract.
 
 All data-plane servers start non-serving and read-only. Direct access that
 bypasses the router and ownership check is outside the supported deployment.
@@ -483,21 +494,30 @@ Emergency promotion:
 
 1. acquire the workflow lock;
 2. prove the old lease expired or hard-fence the old owner;
-3. collect replica-set version, installed term, accepted/chosen sequence, and
-   digest state from a replica quorum;
-4. reconcile one contiguous prefix that preserves every record that could have
-   been chosen by a prior quorum, resolving an ambiguous accepted tail
-   deterministically;
-5. durably install the new term and adopted prefix on a data quorum;
+3. choose a candidate term greater than every observed term and obtain a data
+   quorum of durable promises for that term. A promise records the
+   `ReplicaSetVersion`, prevents the member from accepting any earlier-term
+   record, and returns its accepted/chosen sequences, record digests, and
+   retained tail. State from a member is trusted only after its promise is
+   durable;
+4. from the promised members, reconcile one contiguous prefix that preserves
+   every record that could have been chosen by a prior quorum. For an
+   ambiguous final position, adopt the record with the highest
+   `(ShardTerm, CommitSequence)`, comparing term before sequence, and resolve
+   any remaining same-term conflict by the protocol's deterministic digest
+   rule;
+5. durably install the promised term and adopted prefix on a data quorum;
 6. grant the matching ownership lease and publish the route;
 7. make the candidate owner-current readable or writable only after it has
    applied the adopted prefix; and
 8. keep divergent or unreachable replicas non-serving until repaired.
 
 Selection is not "pick the most advanced replica." The protocol model must
-define the term-install and prefix-selection rule and prove quorum
-intersection across repeated promotions. This is the safety-critical core of
-the design.
+define the promise, term-install, and prefix-selection rules and prove quorum
+intersection across repeated promotions. The promise quorum fences prior-term
+writes; lease expiry or hard fencing separately prevents a deposed owner from
+serving stale `owner-current` reads. This is the safety-critical core of the
+design.
 
 There is no automatic promotion without a control-plane quorum and a data
 replica quorum. The minority remains unavailable.
@@ -655,11 +675,14 @@ The snapshot vector is stable for the query lifetime but does not claim that
 all roots coexisted at one real-time instant. A global-snapshot mode waits for
 the future safe-time phase.
 
-Every participant must accept the same `RoutingVersion` before the coordinator
-emits a row. If any shard reports `MOVED`, the coordinator releases all pins
+The coordinator records the participating route set as
+`(keyspace interval, ShardID, ShardTerm)` entries. Before it emits a row, every
+participant must accept its recorded entry. A global `RoutingVersion` change
+outside those intervals does not invalidate the scan. If a participating
+entry changes or any shard reports `MOVED`, the coordinator releases all pins
 and restarts the whole query on one newer manifest; it never combines partial
-results from different route versions. A route switch keeps already pinned
-source snapshots readable until their leases expire.
+results across different participating route sets. A route switch keeps
+already pinned source snapshots readable until their leases expire.
 
 ### Lightweight scan metadata
 
@@ -980,6 +1003,9 @@ Correctness precedes competitive measurement.
   retention expiry;
 - exercise ambiguous accepted tails, repeated promotion, and replica
   replacement at every persisted transition;
+- check generated protocol histories with a linearizability checker such as
+  Porcupine and run partition-oriented workload histories through Elle-style
+  anomaly analysis;
 - exercise mixed-version rolling upgrade, schema-version skew, and downgrade
   rejection;
 - hold old snapshots through write, failover, split, rollback, and retirement;
@@ -1056,6 +1082,18 @@ coordination disappear.
 
 These sources inform the architecture; no implementation source is copied:
 
+- [PacificA](https://www.microsoft.com/en-us/research/wp-content/uploads/2008/02/tr-2008-25.pdf)
+  describes a primary/backup replicated log coordinated by an external
+  configuration manager and leases.
+- [Raft](https://raft.github.io/raft.pdf) and
+  [Viewstamped Replication Revisited](https://www.cs.princeton.edu/courses/archive/fall19/cos418/papers/vr-revisited.pdf)
+  provide comparable term/view-change and quorum-intersection models.
+- [Paxos Made Live](https://research.google.com/archive/paxos_made_live.html)
+  documents the engineering gap between a consensus proof and a production
+  replicated system.
+- [Porcupine](https://github.com/anishathalye/porcupine) and
+  [Elle](https://github.com/jepsen-io/elle) provide practical history-checking
+  techniques for linearizability and transactional anomalies.
 - [Vitess topology service](https://vitess.io/docs/24.0/concepts/topology-service/)
   describes cached consistent metadata outside the steady query path.
 - [Vitess replication](https://vitess.io/docs/archive/21.0/reference/features/mysql-replication/)
