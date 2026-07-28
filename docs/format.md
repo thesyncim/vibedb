@@ -37,8 +37,10 @@ This is **development format 0**. The repository has not released a persistent
 format, deliberately provides no backward-compatibility or migration promise,
 and may reject files written by any superseded development layout. A schema
 change edits format 0 in place; it does not add a compatibility branch. The
-common page envelope is currently version `3` specifically to make pages from
-the pre-TTL-renumbering development layout fail closed.
+common page envelope is currently version `4` specifically to make pages from
+superseded development layouts fail closed; each in-place development
+renumbering bumps it so a valid checksum is never the only thing selecting a
+decoder.
 The current StateRoot and `PageKind` set contain no TTL/expiration counter,
 directory, or page kind.
 The few payload-local tag `1` forms documented below are branches that the
@@ -190,7 +192,7 @@ the conservative reclamation fence when it remains independently readable.
 | Offset | Field | Type | Notes |
 | --- | --- | --- | --- |
 | 0:8 | magic | `"SJPAGE01"` | fixed |
-| 8:10 | version | u16 | `3`; rejects the pre-TTL-renumbering development kinds |
+| 8:10 | version | u16 | `4` (`pageVersion`); rejects every superseded development layout |
 | 10:12 | headerLength | u16 | `PageHeaderSize` = `64`, self-describing |
 | 12 | Kind | u8 | `PageKind`, see table below |
 | 13 | Flags | u8 | kind-specific; `0` for every kind except `PageDocumentGroup` |
