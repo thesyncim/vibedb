@@ -193,8 +193,6 @@ func runDMLRejections(t *testing.T, cases []dmlRejection) {
 // is what they get instead of a result.
 func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 	runDMLRejections(t, []dmlRejection{
-		{"a column list", `INSERT INTO t (name, age) VALUES (?, ?)`, -1, "this store has none"},
-		{"a one-value row", `INSERT INTO t VALUES (?)`, -1, "the primary key and the document"},
 		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "exactly two values"},
 		{"a numeric key", `INSERT INTO t VALUES (1, ?)`, -1, "keys are opaque bytes"},
 		{"a NULL document", `INSERT INTO t VALUES ('k', NULL)`, -1, "not a document"},
@@ -224,6 +222,35 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"DROP", `DROP TABLE t`, 0, "DROP"},
 		{"ALTER", `ALTER TABLE t ADD COLUMN a STRING`, 0, "ALTER"},
 	})
+}
+
+func TestDocumentDerivedInsertGrammar(t *testing.T) {
+	cases := []struct {
+		name    string
+		src     string
+		columns int
+		values  int
+	}{
+		{"whole document", `INSERT INTO t VALUES (?)`, 0, 1},
+		{"flat document", `INSERT INTO t (name, age) VALUES (?, ?)`, 2, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			statement, err := ParseStatement(tc.src)
+			if err != nil {
+				t.Fatalf("ParseStatement(%q) = %v", tc.src, err)
+			}
+			if !statement.Insert.DerivedKey {
+				t.Fatal("DerivedKey = false, want true")
+			}
+			if got := len(statement.Insert.Columns); got != tc.columns {
+				t.Fatalf("len(Columns) = %d, want %d", got, tc.columns)
+			}
+			if got := len(statement.Insert.Rows[0].Values); got != tc.values {
+				t.Fatalf("len(Values) = %d, want %d", got, tc.values)
+			}
+		})
+	}
 }
 
 // TestRejectsDefinitionsTheEngineCannotEnforce asserts the DDL refusals. Every

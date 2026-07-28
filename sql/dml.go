@@ -170,6 +170,13 @@ type InsertStmt struct {
 	// are one atomic batch, which is the reason multi-row VALUES exists here at
 	// all rather than being sugar for a loop.
 	Rows []InsertRow
+	// Columns names the flat document fields synthesized by
+	// INSERT INTO t (a, b) VALUES (?, ?). It is nil when VALUES carries a
+	// whole JSON document or uses the legacy ("$key", "$doc") form.
+	Columns []*PathExpr
+	// DerivedKey reports that the primary key is derived from the table's
+	// declared PRIMARY KEY path rather than supplied as "$key".
+	DerivedKey bool
 	// Explicit records that the statement wrote the ("$key", "$doc") column
 	// list, purely so a diagnostic can echo the statement back accurately.
 	Explicit bool
@@ -190,7 +197,11 @@ type InsertRow struct {
 	// the lexer already delimits structurally. Its syntax is validated by the
 	// same parser that will index it, at execution.
 	Doc Operand
-	Pos int
+	// Values holds either the one whole-document operand of VALUES (?) or the
+	// flat field operands corresponding to InsertStmt.Columns. It is nil for
+	// the explicit key/document form.
+	Values []Operand
+	Pos    int
 }
 
 // An UpdateStmt is one parsed UPDATE.

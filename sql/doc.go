@@ -1,10 +1,10 @@
 // Package sql parses a deliberately small SQL dialect into an abstract syntax
-// tree, for a front end that lowers to the [query] engine's compiled plan.
+// tree for front ends that lower to the [query] engine's compiled plan.
 //
-// It is a parser and an AST and nothing else: it holds no data, executes
-// nothing, and depends on nothing outside the standard library and one internal
-// view helper. Lowering the tree to a [query.Query] and exposing the result as
-// a database/sql driver are separate layers, built on the types here.
+// This root package is the tokenizer, recursive-descent parser, positioned
+// errors, and AST. Execution remains a separate layer to avoid an import cycle:
+// package query imports this AST, and package sql/driver imports both packages
+// to register the "vibedb" database/sql driver.
 //
 // # The governing rule
 //
@@ -70,10 +70,13 @@
 //	             | "OFFSET" count [ "LIMIT" count ] ;
 //	count        = integer | "?" ;
 //
-//	insert       = "INSERT" "INTO" name [ "(" pseudo-columns ")" ]
+//	insert       = "INSERT" "INTO" name [ "(" insert-columns ")" ]
 //	               "VALUES" row { "," row } [ ";" ] EOF ;
+//	insert-columns = pseudo-columns | path { "," path } ;
 //	pseudo-columns = '"$key"' "," '"$doc"' ;
-//	row          = "(" key "," document ")" ;
+//	row          = "(" document ")"
+//	             | "(" value { "," value } ")"
+//	             | "(" key "," document ")" ;
 //	key          = string | "?" ;
 //	document     = "?" | string | json-object | json-array ;
 //

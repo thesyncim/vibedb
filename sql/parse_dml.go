@@ -130,7 +130,6 @@ func (p *Parser) parseInsert() error {
 		if err := p.parseInsertColumns(); err != nil {
 			return err
 		}
-		p.ins.Explicit = true
 	}
 	switch {
 	case p.atKeyword(kwSelect):
@@ -176,6 +175,37 @@ func (p *Parser) parseInsert() error {
 // make the document's shape a property of the statement text.
 func (p *Parser) parseInsertColumns() error {
 	p.advance() // '('
+	if !(p.tok.kind == tokQuotedIdent && !p.tok.esc &&
+		(p.tok.text == KeyColumn || p.tok.text == DocumentColumn)) {
+		paths := p.idxPaths[:0]
+		for {
+			path, err := p.parsePath(false)
+			if err != nil {
+				return err
+			}
+			if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+				return p.errAt(path.Pos, "an INSERT column list builds a flat JSON object, so each column must be one top-level field")
+			}
+			for _, prior := range paths {
+				if sameSpec(prior, path) {
+					return p.errfAt(path.Pos, "INSERT column %q is named twice", path.Spec())
+				}
+			}
+			paths = append(paths, path)
+			if len(paths) > maxClauseItems {
+				return p.errfAt(path.Pos, "an INSERT may name at most %d columns", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		p.idxPaths = paths
+		p.ins.Columns = paths
+		p.ins.DerivedKey = true
+		return p.expect(tokRParen, "')'")
+	}
+	p.ins.Explicit = true
 	seen := [2]bool{}
 	order := [2]int{-1, -1}
 	for i := 0; ; i++ {
@@ -240,6 +270,68 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 		return row, p.errHere("expected '(' to open a VALUES row")
 	}
 	p.advance()
+	if len(p.ins.Columns) != 0 {
+		values := make([]Operand, 0, len(p.ins.Columns))
+		for i := range p.ins.Columns {
+			if i != 0 {
+				if p.tok.kind != tokComma {
+					return row, p.errfHere("the VALUES row has %d value(s), but the column list has %d", i, len(p.ins.Columns))
+				}
+				p.advance()
+			}
+			value, err := p.parseOperand()
+			if err != nil {
+				return row, err
+			}
+			values = append(values, value)
+		}
+		if p.tok.kind == tokComma {
+			return row, p.errfHere("the VALUES row has more values than its %d-column list", len(p.ins.Columns))
+		}
+		if err := p.expect(tokRParen, "')'"); err != nil {
+			return row, err
+		}
+		row.Values = values
+		return row, nil
+	}
+	// A single value is a complete JSON document whose key is derived from the
+	// table's declared PRIMARY KEY path.
+	if p.tok.kind == tokParam || p.tok.kind == tokString ||
+		p.tok.kind == tokLBracket ||
+		p.tok.kind == tokError && p.tok.pos < len(p.lx.src) && p.lx.src[p.tok.pos] == '{' {
+		first, err := p.parseDocumentOperand()
+		if err != nil {
+			return row, err
+		}
+		if p.tok.kind == tokRParen {
+			p.ins.DerivedKey = true
+			row.Values = []Operand{first}
+			p.advance()
+			return row, nil
+		}
+		// A leading placeholder or string followed by a comma is the legacy
+		// caller-supplied key/document form.
+		row.Key = first
+		if first.Kind != OperandParam && first.Kind != OperandString {
+			return row, p.errAt(first.Pos, "a caller-supplied primary key must be a string literal or '?'")
+		}
+		if p.tok.kind != tokComma {
+			return row, p.errHere("expected ',' between the primary key and document")
+		}
+		p.advance()
+		doc, err := p.parseDocumentOperand()
+		if err != nil {
+			return row, err
+		}
+		row.Doc = doc
+		if p.tok.kind == tokComma {
+			return row, p.errHere("a VALUES row holds exactly two values, the primary key and the document")
+		}
+		if err := p.expect(tokRParen, "')'"); err != nil {
+			return row, err
+		}
+		return row, nil
+	}
 	key, err := p.parseKeyOperand("a primary key")
 	if err != nil {
 		return row, err
