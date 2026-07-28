@@ -219,3 +219,6 @@ optimizations because they do not change what readers consult.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
   per-tablet concurrency.
 - [Unification](design/unification.md): one eventual mutable collection.
+- [Native JSON query subset](design/native-json-query-language.md):
+  bounded, versioned application queries plus separate schema and initial-index
+  catalog definitions.

@@ -201,3 +201,9 @@ The implementation encountered these engine boundaries:
 4. `query` imports the root `sql` AST package, so a driver in that same package
    cannot import `query` without a cycle. The registered implementation lives
    in `sql/driver`.
+
+## See also
+
+- [Native JSON query subset](native-json-query-language.md): the planned
+  bounded application-query surface and separate collection-definition
+  commands. SQL remains the broader relational language.

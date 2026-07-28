@@ -15,13 +15,17 @@ describes a target; this file describes the APIs and formats implemented today.
 | --- | --- | --- |
 | `store.Segment` | Immutable self-contained batch of documents with its own tape, shape, and column machinery | Explicit segment image |
 | `store.Collection` | Mutable in-memory keyed collection with immutable snapshots | Explicit full checkpoint |
+| `store.Database` | In-memory catalog and consistent snapshot of independent collections | None beyond each collection |
 | `store.Builder` | Bulk construction of a `store.Collection` | None |
 | `durable.Collection` | Bounded-residency durable collection | Automatic incremental commits |
+| `durable.Database` | Directory catalog and process-consistent snapshot; one durable file per collection | Per-collection automatic commits |
 | `Collection.WriteTo` / `store.Open` | Portable immutable collection image | Explicit full checkpoint |
 
-A collection is one physical JSON namespace. `store.Database` is an in-memory
-catalog of independent `store.Collection` handles; it is not a durable
-multi-collection database.
+A collection is one physical JSON namespace. `store.Database` catalogs
+in-memory collections. `durable.Database` catalogs one collection file per
+name in a directory. Its multi-collection snapshot is a consistent in-process
+read cut; it does not make separate collection writes one crash-atomic or
+transactional operation.
 
 ## In-memory collections
 
@@ -322,9 +326,10 @@ direct-I/O choices after fallback.
 
 ### Durable indexes and numeric covers
 
-`durable.Options.Indexes` declares up to 64 exact scalar or compound indexes.
-Definitions are fixed at creation and verified when reopened. Each write
-maintains its postings transactionally.
+`durable.Options.Indexes` declares up to 4,096 logical exact scalar or compound
+index names over at most 64 distinct ordered path definitions. Logical aliases
+share one physical index. Definitions are fixed at creation and verified when
+reopened. Each write maintains their postings transactionally.
 
 `Float64Columns` declares up to 256 RFC 6901 paths. Numeric sidecars support
 predicate-free `SUM`, `AVG`, `MIN`, and `MAX` without reopening JSON when the
@@ -395,6 +400,9 @@ for another.
 ## Current product boundaries
 
 The repository currently has no replication, backup manager, point-in-time
-restore, network protocol, distributed execution, cross-file transaction, or
-durable multi-collection catalog. Query joins are not implemented. Those
-features are not implied by the storage APIs above.
+restore, network protocol, distributed execution, or cross-file transaction.
+Heap and durable databases provide multi-collection catalogs and consistent
+database snapshots. Query existence joins run on both backends; fan-out joins
+run on heap snapshots and are deliberately rejected by durable execution until
+joined-row ownership and resource bounds are portable. Broader features are
+not implied by the storage APIs above.
