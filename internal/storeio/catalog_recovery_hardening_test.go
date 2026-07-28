@@ -262,7 +262,7 @@ func TestMutableRecoveryAuthenticatesCompleteCatalogRunAtEveryPageSize(
 		Float64Paths: []string{"/score"},
 		Schema:       &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 2_400; i++ {
+	for i := range 2_400 {
 		definition.Schema.Fields = append(
 			definition.Schema.Fields,
 			PageCatalogSchemaField{
@@ -654,7 +654,7 @@ func TestRecoveryCatalogRejectsChecksummedCanonicalByteCorruption(
 	definition := PageCatalogDefinition{
 		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 900; i++ {
+	for i := range 900 {
 		definition.Schema.Fields = append(
 			definition.Schema.Fields,
 			PageCatalogSchemaField{

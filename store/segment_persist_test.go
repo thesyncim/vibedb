@@ -91,7 +91,7 @@ func buildPersistCases(t *testing.T) []persistCase {
 func bigFlatObject(n int) string {
 	var b strings.Builder
 	b.WriteByte('{')
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			b.WriteByte(',')
 		}
@@ -533,7 +533,7 @@ func TestSegmentPersistCorruptInput(t *testing.T) {
 		{"truncatedFooter", func(b []byte) []byte { return b[:len(b)-4] }, nil},
 		{"truncatedHalf", func(b []byte) []byte { return b[:len(b)/2] }, nil},
 		{"manifestOffsetHuge", func(b []byte) []byte {
-			for i := 0; i < 8; i++ {
+			for i := range 8 {
 				b[len(b)-ImageFooterLen+8+i] = 0xFF
 			}
 			return b
@@ -714,13 +714,13 @@ func TestGCPersistBorrowedImage(t *testing.T) {
 		return reopened
 	}
 
-	for iter := 0; iter < 8; iter++ {
+	for iter := range 8 {
 		reopened := build()
 		// Churn the heap and force collections so any unpinned image would be
 		// reclaimed before the reads below.
 		runtime.GC()
 		sink := 0
-		for j := 0; j < 4096; j++ {
+		for j := range 4096 {
 			b := make([]byte, 512)
 			sink += len(b)
 			if j%512 == 0 {

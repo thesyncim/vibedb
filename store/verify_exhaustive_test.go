@@ -256,14 +256,14 @@ func bexChildSeqs(children []*exhaustiveValue, width, budget int) [][]*exhaustiv
 // of the available keys.
 func bexKeyAssignments(n int) [][]string {
 	total := 1
-	for i := 0; i < n; i++ {
+	for range n {
 		total *= len(bexKeyAlphabet)
 	}
 	out := make([][]string, 0, total)
 	for a := 0; a < total; a++ {
 		ks := make([]string, n)
 		x := a
-		for i := 0; i < n; i++ {
+		for i := range n {
 			ks[i] = bexKeyAlphabet[x%len(bexKeyAlphabet)]
 			x /= len(bexKeyAlphabet)
 		}

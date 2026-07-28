@@ -13,6 +13,8 @@ const (
 	float64StripeVersion           = DevelopmentFormatVersion
 )
 
+// ErrFloat64StripeCorrupt reports that a float64 stripe image failed checksum
+// or structural admission and must not be read.
 var ErrFloat64StripeCorrupt = errors.New("vibejson: corrupt Store float64 scan stripe")
 
 // Float64StripeColumn is one transient dense column supplied to the encoder.
@@ -22,6 +24,8 @@ type Float64StripeColumn struct {
 	Values   []byte
 }
 
+// Float64StripeHeader is the stable identity of one float64 stripe: the store
+// and generation that sealed it and its stable logical ID.
 type Float64StripeHeader struct {
 	StoreID     [16]byte
 	Generation  uint64
@@ -33,6 +37,9 @@ type Float64StripeHeader struct {
 	ColumnCount uint16
 }
 
+// Float64StripeView is a borrowed, allocation-free read view over one admitted
+// float64 stripe image. It aliases the page bytes and is valid only while the
+// page lease is held.
 type Float64StripeView struct {
 	header         Float64StripeHeader
 	payload        []byte

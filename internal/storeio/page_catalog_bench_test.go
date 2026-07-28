@@ -15,7 +15,7 @@ func benchmarkPageCatalogDefinition() PageCatalogDefinition {
 	definition := PageCatalogDefinition{
 		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		path := fmt.Sprintf("/tenant/fields/%03d", i)
 		definition.Indexes = append(definition.Indexes, PageCatalogIndex{
 			Name: fmt.Sprintf("index_%03d", i), Paths: []string{path},
@@ -27,7 +27,7 @@ func benchmarkPageCatalogDefinition() PageCatalogDefinition {
 			},
 		)
 	}
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		definition.Float64Paths = append(
 			definition.Float64Paths, fmt.Sprintf("/metrics/%03d", i),
 		)

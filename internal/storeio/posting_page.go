@@ -358,7 +358,7 @@ func PostingPagePrefix(entries []PostingEntry, encodedCapacity int) (count, enco
 	}
 	previous := entries[0].Chunk
 	limit := min(len(entries), int(^uint16(0)))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		entry := entries[i]
 		entrySize, entryErr := PostingEntryEncodedSize(previous, entry, i == 0)
 		if entryErr != nil {

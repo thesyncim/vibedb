@@ -3,9 +3,9 @@ package durable
 import (
 	"fmt"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 var fileIndexGroupNull = [...]byte{'n', 'u', 'l', 'l'}

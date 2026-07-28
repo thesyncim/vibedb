@@ -200,7 +200,7 @@ func openFloat64DirectoryPayload(
 	}
 	var previous uint32
 	var seen chunkDirectoryRefSet
-	for i := 0; i < count; i++ {
+	for i := range count {
 		record := payload[Float64DirectoryPayloadHeaderSize+i*Float64DirectoryRecordSize:]
 		first := binary.LittleEndian.Uint32(record[0:4])
 		ref := decodePageRef(record[8 : 8+PageRefSize])

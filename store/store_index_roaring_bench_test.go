@@ -13,7 +13,7 @@ var (
 func benchmarkStoreIndexInterleaved(words int) (storeIndexMasks, []storeIndexChunkMask) {
 	current := make([]storeIndexChunkMask, words)
 	changes := make([]storeIndexChunkMask, words)
-	for i := 0; i < words; i++ {
+	for i := range words {
 		current[i] = storeIndexChunkMask{chunk: uint32(i * 2), mask: 1}
 		changes[i] = storeIndexChunkMask{chunk: uint32(i*2 + 1), mask: 2}
 	}

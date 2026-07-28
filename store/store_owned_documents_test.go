@@ -42,7 +42,7 @@ func TestStoreBuilderSelectsOwnedNarrowTapeWidths(t *testing.T) {
 			if state.mappedDocs.compactRefs == nil {
 				t.Fatal("small owned publication did not select compact row refs")
 			}
-			for row := uint64(0); row < 2; row++ {
+			for row := range uint64(2) {
 				ref := state.mappedDocs.refAt(row)
 				if ref.kind != tc.kind {
 					t.Fatalf("row %d tape kind = %d, want %d", row, ref.kind, tc.kind)
@@ -83,7 +83,7 @@ func TestStoreBuilderSelectsOwnedTemplateSpanWidths(t *testing.T) {
 			if len(state.mappedDocs.templates) != 1 {
 				t.Fatalf("template count = %d, want 1", len(state.mappedDocs.templates))
 			}
-			for row := uint64(0); row < 2; row++ {
+			for row := range uint64(2) {
 				ref := state.mappedDocs.refAt(row)
 				if ref.kind != tc.kind || ref.shapeID != 0 {
 					t.Fatalf("row %d ref = %+v, want kind %d template 0", row, ref, tc.kind)
@@ -102,7 +102,7 @@ func TestStoreBuilderTemplatesComposeWithValueDictionary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for row := 0; row < rows; row++ {
+	for row := range rows {
 		if err := builder.Append(fmt.Sprintf("k%d", row), []byte(doc)); err != nil {
 			t.Fatal(err)
 		}
@@ -179,7 +179,7 @@ func TestStoreReclaimsOwnedDocumentBaseAfterAllChunksDetach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for row := 0; row < 4; row++ {
+	for row := range 4 {
 		if err := builder.Append(fmt.Sprintf("k%d", row), []byte(fmt.Sprintf(`{"n":%d}`, row))); err != nil {
 			t.Fatal(err)
 		}
@@ -208,7 +208,7 @@ func TestStoreReclaimsOwnedDocumentBaseAfterAllChunksDetach(t *testing.T) {
 	if collection.Stats().ExternalDocumentBytes != 0 {
 		t.Fatal("current generation still reports detached document storage")
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		runtime.GC()
 		if raw, ok := retained.GetRaw("k0"); !ok || string(raw.Bytes()) != `{"n":0}` {
 			t.Fatalf("retained k0 after GC = (%q, %v)", raw.Bytes(), ok)
@@ -240,7 +240,7 @@ func buildOwnedDetachFixture(t *testing.T) *Collection {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for row := 0; row < 4; row++ {
+	for row := range 4 {
 		if err := builder.Append(fmt.Sprintf("k%d", row), []byte(fmt.Sprintf(`{"n":%d}`, row))); err != nil {
 			t.Fatal(err)
 		}
@@ -270,7 +270,7 @@ func buildOwnedLayoutCollection(t *testing.T, doc string, rows int) *Collection 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for row := 0; row < rows; row++ {
+	for row := range rows {
 		if err := builder.Append(fmt.Sprintf("k%d", row), []byte(doc)); err != nil {
 			t.Fatal(err)
 		}

@@ -868,7 +868,7 @@ func pageCatalogDigest(src []byte) [PageCatalogDigestSize]byte {
 
 func comparePageCatalogPhysical(a, b pageCatalogPhysicalDefinition) int {
 	limit := min(len(a.paths), len(b.paths))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		if order := strings.Compare(a.paths[i], b.paths[i]); order != 0 {
 			return order
 		}

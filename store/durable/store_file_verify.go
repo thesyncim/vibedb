@@ -266,7 +266,7 @@ func (w *verifyWalker) walkPageCatalog() {
 	}
 	head := w.root.PageCatalogHead
 	segments := extent.Length / uint64(w.pageSize)
-	for i := uint64(0); i < segments; i++ {
+	for i := range segments {
 		ref := storeio.PageRef{
 			Offset:     head.Offset + i*uint64(w.pageSize),
 			LogicalID:  head.LogicalID + i,
@@ -597,10 +597,7 @@ func (w *verifyWalker) checkReachableOverlap() {
 // every segment forced resident) and proves no free extent overlaps a reachable
 // page. A store must never advertise a live page as reusable.
 func (w *verifyWalker) walkFreeSet(inlineFree *storeio.InlineFreeDelta) {
-	residentBudget := int64(w.maxPageSize) * 64
-	if residentBudget < 8<<20 {
-		residentBudget = 8 << 20
-	}
+	residentBudget := max(int64(w.maxPageSize)*64, 8<<20)
 	cache, err := storeio.NewPageCache(w.file, storeio.PageCacheOptions{
 		PageSize:      int(w.pageSize),
 		MaxPageSize:   int(w.maxPageSize),

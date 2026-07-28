@@ -236,6 +236,9 @@ type Float64Aggregate struct {
 	Max   float64
 }
 
+// Add folds one value into the running count, sum, and min/max. The first Add
+// seeds Min and Max from the value itself, so a zero Float64Aggregate is the
+// correct empty accumulator and needs no separate initialization.
 func (a *Float64Aggregate) Add(value float64) {
 	if a.Count == 0 {
 		a.Min, a.Max = value, value

@@ -457,7 +457,7 @@ func TestMaterializationJournalRejectsEverySingleBitCorruptionAndTruncation(t *t
 			t.Fatalf("byte %d = %v, want %v", at, err, ErrMaterializationJournalCorrupt)
 		}
 	}
-	for cut := 0; cut < len(encoded); cut++ {
+	for cut := range encoded {
 		if _, err := OpenMaterializationJournal(encoded[:cut]); !errors.Is(err, ErrMaterializationJournalCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrMaterializationJournalCorrupt)
 		}

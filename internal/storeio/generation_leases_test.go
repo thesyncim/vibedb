@@ -210,16 +210,14 @@ func TestGenerationLeasesSafeFromSnapshotsConcurrent(t *testing.T) {
 
 	var unsafeTrue atomic.Bool
 	var group sync.WaitGroup
-	group.Add(1)
-	go func() {
-		defer group.Done()
+	group.Go(func() {
 		for range 20_000 {
 			if leases.SafeFromSnapshots(target) {
 				unsafeTrue.Store(true)
 				return
 			}
 		}
-	}()
+	})
 	for worker := range 8 {
 		group.Add(1)
 		go func(generation uint64) {

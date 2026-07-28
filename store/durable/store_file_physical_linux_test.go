@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 	"golang.org/x/sys/unix"
 )
 

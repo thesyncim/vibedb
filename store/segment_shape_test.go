@@ -63,11 +63,11 @@ func shapeTapeSegment(t testing.TB, docs []string, hashKeys bool) *Segment {
 func shapeTapeClusteredDocs(count, shapes, width int) []string {
 	docs := make([]string, 0, count)
 	var b strings.Builder
-	for i := 0; i < count; i++ {
+	for i := range count {
 		b.Reset()
 		prefix := fmt.Sprintf("s%02d", i%shapes)
 		b.WriteByte('{')
-		for f := 0; f < width; f++ {
+		for f := range width {
 			if f > 0 {
 				b.WriteByte(',')
 			}
@@ -108,7 +108,7 @@ func shapeTapeCorpora() map[string][]string {
 	// and pointer-metacharacter keys, so the compiled shape carries raw
 	// spellings that differ from the queried names.
 	var escaped []string
-	for i := 0; i < 24; i++ {
+	for i := range 24 {
 		escaped = append(escaped, fmt.Sprintf(
 			`{"plain":%d,"tab\tkey":%d,"été":"%d","a/b":true,"":null}`, i, i*3, i))
 	}
@@ -118,7 +118,7 @@ func shapeTapeCorpora() map[string][]string {
 	// around the object, so the widening scan must walk real gaps between
 	// keys, colons, and values.
 	var padded []string
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		padded = append(padded, fmt.Sprintf(
 			"  {\n\t\"a\" : %d ,\n\t\"b\"\t:\t\"x-%d\" ,\n\t\"c\" : [] \n}  ", i, i))
 	}
@@ -127,7 +127,7 @@ func shapeTapeCorpora() map[string][]string {
 	// Empty objects between conformers: {} is flat but has nothing to
 	// deduplicate and must stay classic without polluting the cache.
 	var empties []string
-	for i := 0; i < 18; i++ {
+	for i := range 18 {
 		if i%3 == 0 {
 			empties = append(empties, `{}`)
 		} else {
@@ -140,7 +140,7 @@ func shapeTapeCorpora() map[string][]string {
 	// dupKeys gate must keep every one classic, and lookups keep the
 	// last-duplicate rule.
 	var dups []string
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		dups = append(dups, fmt.Sprintf(`{"k":%d,"other":true,"k":%d}`, i, i+100))
 	}
 	corpora["rootdup"] = dups
@@ -150,7 +150,7 @@ func shapeTapeCorpora() map[string][]string {
 	// adversarial spans at 65535 (the last narrow root) and 65536 (the
 	// first wide one).
 	var boundary []string
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		for _, end := range []int{64, 1 << 10, ShapeNarrowMaxEnd - 1, ShapeNarrowMaxEnd,
 			ShapeNarrowMaxEnd + 1, ShapeNarrowMaxEnd + 2} {
 			boundary = append(boundary, shapeTapeBoundaryDoc(end, 0, i))
@@ -164,7 +164,7 @@ func shapeTapeCorpora() map[string][]string {
 	// empty-container kinds and the extractors must switch widths per
 	// document.
 	var widthmix []string
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		pad := 40
 		if i%2 == 1 {
 			pad = 70_000
@@ -357,7 +357,7 @@ func TestSegmentShapeTapesDocContract(t *testing.T) {
 		heldDoc := taped.Doc(2)
 		var cache ShapeCache
 		heldCol := cache.AppendField(nil, taped, "s02_f02")
-		for i := 0; i < 40; i++ {
+		for i := range 40 {
 			if _, err := taped.Append([]byte(docs[i%len(docs)])); err != nil {
 				t.Fatal(err)
 			}
@@ -490,7 +490,7 @@ func TestSegmentShapeTapesReadFrom(t *testing.T) {
 	// Wide-width conformers: past the narrow bound, large enough for the
 	// framing slow path, and recurring so the stream must classify both
 	// entry widths exactly as Append does.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		docs = append(docs, shapeTapeBoundaryDoc(ShapeNarrowMaxEnd+2, 0, i))
 	}
 	var stream strings.Builder
@@ -532,13 +532,13 @@ func TestSegmentShapeTapesReadFrom(t *testing.T) {
 func TestSegmentShapeTapesLateEnable(t *testing.T) {
 	doc := `{"a":1,"b":"x"}`
 	var seg Segment
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if _, err := seg.Append([]byte(doc)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	seg.ShapeTapes = true
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if _, err := seg.Append([]byte(doc)); err != nil {
 			t.Fatal(err)
 		}
@@ -572,7 +572,7 @@ func TestSegmentShapeTapesConcurrentDoc(t *testing.T) {
 	const workers = 8
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
@@ -601,7 +601,7 @@ func TestSegmentShapeTapesConcurrentDoc(t *testing.T) {
 // pointer to the reconstituted entry.
 func TestSegmentShapeTapesSteadyAllocs(t *testing.T) {
 	docs := shapeTapeClusteredDocs(64, 2, 8)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		docs = append(docs, shapeTapeBoundaryDoc(ShapeNarrowMaxEnd+2, 0, i))
 	}
 	seg := shapeTapeSegment(t, docs, true)
@@ -643,7 +643,7 @@ func TestSegmentShapeTapesSteadyAllocs(t *testing.T) {
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestGCCorruptionShapeTapes -count=5 -cpu=1,4,8 ./
 func TestGCCorruptionShapeTapes(t *testing.T) {
 	docs := shapeTapeClusteredDocs(36, 3, 9)
-	for i := 0; i < 3; i++ { // wide-width conformers among the narrow ones
+	for i := range 3 { // wide-width conformers among the narrow ones
 		docs = append(docs, shapeTapeBoundaryDoc(ShapeNarrowMaxEnd+2, 0, i))
 	}
 	names := []string{"s00_f00", "s01_f01", "s02_f02", "s00_f03", "pad", "absent"}
@@ -675,14 +675,14 @@ func TestGCCorruptionShapeTapes(t *testing.T) {
 	const iters = 24
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			var cache ShapeCache
 			ints := make([]int64, 0, len(docs))
 			valid := make([]bool, 0, len(docs))
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(48+id, it)
 				seg, err := buildShapeTapeSet(docs, true)
 				if err != nil {
@@ -719,7 +719,7 @@ func TestGCCorruptionShapeTapes(t *testing.T) {
 				// Widen a rotating subset under churn and hold the tapes
 				// across a collection before verifying them.
 				var widened []vibejson.Index
-				for k := 0; k < 6; k++ {
+				for k := range 6 {
 					widened = append(widened, seg.Doc((it*7+k*5)%seg.Len()))
 				}
 				runtime.GC()
@@ -764,7 +764,7 @@ func TestStoreShapeTapeHeaderSlabAllocOnlyWhenConforming(t *testing.T) {
 	refsPerChunk := func(t *testing.T, doc func(int) string) (refs, docs int) {
 		t.Helper()
 		collection := &Collection{Options: Options{ChunkDocuments: 8, ShapeTapes: true}}
-		for i := 0; i < 64; i++ {
+		for i := range 64 {
 			if _, err := collection.Put(fmt.Sprintf("k%02d", i), []byte(doc(i))); err != nil {
 				t.Fatal(err)
 			}

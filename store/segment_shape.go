@@ -128,9 +128,11 @@ type ShapeNarrowValue struct {
 	Info uint32 // the classic value entry's packed Info word, verbatim
 }
 
-// start and end unpack the span's document coordinates.
+// Start returns the value's start offset within the document's source bytes.
 func (n ShapeNarrowValue) Start() uint32 { return n.Span & 0xFFFF }
-func (n ShapeNarrowValue) End() uint32   { return n.Span >> 16 }
+
+// End returns the value's end offset within the document's source bytes.
+func (n ShapeNarrowValue) End() uint32 { return n.Span >> 16 }
 
 // widen reconstitutes the classic 16-byte entry this value was packed from,
 // bit-identical by the dedup invariants: next is 1 for every single-entry
@@ -251,7 +253,7 @@ func shapeTapeConforms(index vibejson.Index, rec *ShapeRecord) bool {
 // tape into s's narrow slab and returns their first offset.
 func (s *Segment) appendNarrowShapeValues(entries []vibejson.IndexEntry, count int) uint32 {
 	off := uint32(len(s.narrow))
-	for m := 0; m < count; m++ {
+	for m := range count {
 		value := &entries[2*m+2]
 		s.narrow = append(s.narrow, ShapeNarrowValue{
 			Span: value.Start | value.End<<16,
@@ -324,7 +326,7 @@ func (s *Segment) shapeTapeCompact(index vibejson.Index) (vibejson.Index, ShapeT
 		index.Entries = nil
 		return index, ref
 	}
-	for m := 0; m < count; m++ {
+	for m := range count {
 		entries[m] = entries[2*m+2]
 	}
 	index.Entries = entries[:count:count]

@@ -112,7 +112,7 @@ func vdCheckDoubleAppend(t *testing.T, doc *exhaustiveValue, opts document.Index
 func vdCheckCorpus(t *testing.T, docs []*exhaustiveValue) (backed int) {
 	t.Helper()
 	seg := &Segment{ValueDict: true, valueFloor: 1}
-	for pass := 0; pass < 2; pass++ {
+	for range 2 {
 		for _, doc := range docs {
 			if _, err := seg.Append(doc.json); err != nil {
 				t.Fatalf("corpus Append(%s): %v", doc.json, err)
@@ -366,7 +366,7 @@ func TestValueDictSightingEconomics(t *testing.T) {
 // out-save its bytes.
 func TestValueDictFloorKeepsShortInline(t *testing.T) {
 	seg := &Segment{ValueDict: true} // default floor (valueDictMinSpan)
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		if _, err := seg.Append([]byte(`{"a":1,"b":1,"c":1}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -383,7 +383,7 @@ func TestValueDictFloorKeepsShortInline(t *testing.T) {
 func TestValueDictComposesWithShapeTapes(t *testing.T) {
 	doc := []byte(`{"venue":"GRAND_AUDITORIUM_MAIN","status":"AVAILABLE_NOW"}`)
 	seg := &Segment{ShapeTapes: true, ValueDict: true, valueFloor: 1}
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if _, err := seg.Append(doc); err != nil {
 			t.Fatal(err)
 		}
@@ -432,13 +432,13 @@ func TestGCCorruptionValueDict(t *testing.T) {
 	const iters = 20
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			var retained []*Segment
 			values := make([]vibejson.RawValue, 0, len(want))
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(51+id, it)
 				seg := &Segment{ValueDict: true, valueFloor: 1}
 				for _, doc := range docs {
@@ -512,7 +512,7 @@ func valueDictEnumCorpus(n int) [][]byte {
 	categories := []string{"CATEGORY_PREMIUM", "CATEGORY_STANDARD", "CATEGORY_ECONOMY"}
 	statuses := []string{"AVAILABLE_FOR_SALE", "SOLD_OUT_NOW"}
 	docs := make([][]byte, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		doc := fmt.Sprintf(
 			`{"id":%d,"venue":"%s","category":"%s","area":{"areaId":205705999,"blockIds":[]},"status":"%s"}`,
 			i, venues[i%len(venues)], categories[(i/3)%len(categories)], statuses[i%len(statuses)],

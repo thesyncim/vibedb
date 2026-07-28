@@ -31,10 +31,7 @@ type streamBenchCorpus struct {
 // scalar identity fields, a small tag array, a nested object, and a text
 // field padded to reach the target.
 func streamBenchDoc(dst []byte, r *rand.Rand, i, size int) []byte {
-	pad := size - 150
-	if pad < 0 {
-		pad = 0
-	}
+	pad := max(size-150, 0)
 	text := make([]byte, pad)
 	for j := range text {
 		text[j] = byte('a' + (i+j)%26)

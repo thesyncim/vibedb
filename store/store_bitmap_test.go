@@ -20,7 +20,7 @@ func TestStoreDenseBitmapBooleanDifferential(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < 137; i++ {
+	for i := range 137 {
 		doc := fmt.Sprintf(`{"profile":{"country":"%s"},"active":%t,"tier":%d}`,
 			[]string{"PT", "US", "DE"}[i%3], i%2 == 0, i%5)
 		if err := builder.Append(fmt.Sprintf("key:%03d", i), []byte(doc)); err != nil {
@@ -62,7 +62,7 @@ func TestStoreDenseBitmapBooleanDifferential(t *testing.T) {
 	all := AppendBitmapOr(nil, countryWords, notCountry)
 
 	var wantAnd, wantAnd3, wantNot []string
-	for i := 0; i < 137; i++ {
+	for i := range 137 {
 		key := fmt.Sprintf("key:%03d", i)
 		isPT, isActive, isTier := i%3 == 0, i%2 == 0, i%5 == 2
 		if isPT && isActive {
@@ -91,7 +91,7 @@ func TestStoreDenseBitmapBooleanDifferential(t *testing.T) {
 
 func TestStoreDenseBitmapSteadyAllocs(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 8, ShapeTapes: true}}
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		if _, err := collection.Put(fmt.Sprintf("k:%02d", i), []byte(`{"v":1}`)); err != nil {
 			t.Fatal(err)
 		}

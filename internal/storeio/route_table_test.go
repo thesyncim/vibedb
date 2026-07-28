@@ -241,12 +241,12 @@ func TestRouteBucketTableBudgetFailsClosed(t *testing.T) {
 			found[sum] = true
 		}
 	}
-	for bucket := 0; bucket < buckets; bucket++ {
+	for bucket := range buckets {
 		sum := (2*bucket + 1) % buckets
 		if !found[sum] {
 			t.Fatalf("missing tag sum %d", sum)
 		}
-		for slot := 0; slot < routeBucketTableBucketSlots; slot++ {
+		for slot := range routeBucketTableBucketSlots {
 			table.put(bucket, slot, uint32(bucket*routeBucketTableBucketSlots+slot)|uint32(tags[sum])<<16)
 		}
 	}
@@ -254,8 +254,8 @@ func TestRouteBucketTableBudgetFailsClosed(t *testing.T) {
 	if placed || path != 0 || work != routeBucketTableSearchBudget {
 		t.Fatalf("budget=(%v,%d,%d)", placed, path, work)
 	}
-	for bucket := 0; bucket < buckets; bucket++ {
-		for slot := 0; slot < routeBucketTableBucketSlots; slot++ {
+	for bucket := range buckets {
+		for slot := range routeBucketTableBucketSlots {
 			if uint16(table.word(bucket, slot)) != uint16(bucket*routeBucketTableBucketSlots+slot) {
 				t.Fatal("failed relocation mutated table")
 			}

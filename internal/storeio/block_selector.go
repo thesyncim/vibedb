@@ -10,6 +10,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/storemem"
 )
 
+// ErrBlockSelectorCorrupt reports that a block-selector page failed checksum or
+// structural admission and must not be routed against.
 var ErrBlockSelectorCorrupt = errors.New("vibejson: corrupt Store block selector page")
 
 // BlockSelectorBoundary describes one already lexically ordered immutable
@@ -466,10 +468,7 @@ func (p *BlockSelectorPage) selectRank(target []byte, c *BlockSelectorCursor) (i
 			lo = mid + 1
 		}
 	}
-	group := lo - 1
-	if group < 0 {
-		group = 0
-	}
+	group := max(lo-1, 0)
 	if rank, ok := p.selectGroup(target, group, key); ok {
 		return rank, true
 	}

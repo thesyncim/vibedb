@@ -115,7 +115,7 @@ func TestKeyInternerArenaStability(t *testing.T) {
 		held[i] = in.Key(id)
 		base[i] = unsafe.SliceData(held[i])
 	}
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		in.InternString(fmt.Sprintf("filler-key-%05d-%s", i, strings.Repeat("y", i%97)))
 	}
 	if in.Len() != 32+10000 {
@@ -143,7 +143,7 @@ func TestKeyInternerArenaStability(t *testing.T) {
 func TestKeyInternerCollisions(t *testing.T) {
 	seen := make(map[uint32]string)
 	var a, b string
-	for i := 0; i < 1<<20; i++ {
+	for i := range 1 << 20 {
 		key := fmt.Sprintf("collision-probe-%07x", i)
 		h := vibejson.HashKey(key)
 		if prev, ok := seen[h]; ok {
@@ -172,7 +172,7 @@ func TestKeyInternerCollisions(t *testing.T) {
 	}
 
 	const bulk = 1 << 17
-	for i := 0; i < bulk; i++ {
+	for i := range bulk {
 		key := fmt.Sprintf("collision-probe-%07x", i)
 		want, ok := in.LookupString(key)
 		id := in.InternString(key)

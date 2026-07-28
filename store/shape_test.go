@@ -29,7 +29,7 @@ import (
 func shapeFlatDoc(width int, pad string) string {
 	var sb strings.Builder
 	sb.WriteString("{")
-	for i := 0; i < width; i++ {
+	for i := range width {
 		if i > 0 {
 			sb.WriteString(",")
 		}
@@ -172,7 +172,7 @@ func TestShapeSameShapeBatch(t *testing.T) {
 	for _, hashKeys := range []bool{false, true} {
 		var set Segment
 		set.Options = document.IndexOptions{HashKeys: hashKeys}
-		for i := 0; i < 256; i++ {
+		for i := range 256 {
 			doc := fmt.Sprintf(
 				`{"id":%d,"name":"user-%04d","active":%t,"score":%d.%02d,"region":"eu-west-%d","tier":%d,"ts":%d,"flags":null}`,
 				i, i, i%2 == 0, i%100, i%97, i%3, i%5, 1700000000+i)
@@ -254,7 +254,7 @@ func TestShapeSightingGate(t *testing.T) {
 	if !ok {
 		t.Fatal("second sighting declined")
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		again, ok := cache.Resolve(tape.Root())
 		if !ok || again != shape {
 			t.Fatalf("sighting %d: Resolve = (%v, %v), want the compiled shape", i+3, again, ok)
@@ -328,7 +328,7 @@ func TestShapeMismatchSafety(t *testing.T) {
 func findKeyHashCollision(t *testing.T) (string, string) {
 	t.Helper()
 	seen := make(map[uint32]string, 1<<18)
-	for i := 0; i < 1<<21; i++ {
+	for i := range 1 << 21 {
 		key := fmt.Sprintf("c%08x", i)
 		h := vibejson.HashKey(key)
 		if prev, ok := seen[h]; ok {
@@ -464,7 +464,7 @@ func TestShapeCacheGrowth(t *testing.T) {
 	var cache ShapeCache
 	tapes := make([]vibejson.Index, shapes)
 	first := make([]Shape, shapes)
-	for i := 0; i < shapes; i++ {
+	for i := range shapes {
 		doc := fmt.Sprintf(`{"field_%d_a":1,"field_%d_b":2,"shared":%d}`, i, i, i)
 		src := []byte(doc)
 		tape, err := vibejson.BuildIndexOptions(src, make([]vibejson.IndexEntry, len(src)+2), document.IndexOptions{HashKeys: true})
@@ -478,7 +478,7 @@ func TestShapeCacheGrowth(t *testing.T) {
 		}
 		first[i] = shape
 	}
-	for i := 0; i < shapes; i++ {
+	for i := range shapes {
 		shape, ok := cache.Resolve(tapes[i].Root())
 		if !ok || shape != first[i] {
 			t.Fatalf("shape %d lost identity after growth", i)
@@ -531,7 +531,7 @@ func TestGCCorruptionShapeResolve(t *testing.T) {
 	const iters = 40
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -539,7 +539,7 @@ func TestGCCorruptionShapeResolve(t *testing.T) {
 			var shape Shape
 			refs := make([]FieldRef, len(names))
 			storage := make([]vibejson.IndexEntry, need+slack)
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(48+id, it)
 				for i := need; i < len(storage); i++ {
 					storage[i] = sentinel
@@ -564,7 +564,7 @@ func TestGCCorruptionShapeResolve(t *testing.T) {
 					}
 					// Grow the cache arenas past the compiled shape so later
 					// iterations exercise a long-lived record amid turnover.
-					for extra := 0; extra < 64; extra++ {
+					for extra := range 64 {
 						doc := fmt.Sprintf(`{"w%d_x%d":1,"w%d_y%d":"padpadpadpadpadpad"}`, id, extra, id, extra)
 						extraTape, err := vibejson.BuildIndexOptions([]byte(doc), make([]vibejson.IndexEntry, len(doc)+2), opts)
 						if err != nil {

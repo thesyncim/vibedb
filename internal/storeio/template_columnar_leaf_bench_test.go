@@ -23,7 +23,6 @@ var (
 	templateColumnarLeafBenchBytes []byte
 	templateColumnarLeafBenchKind  uint8
 	templateColumnarLeafBenchBool  bool
-	templateColumnarLeafBenchView  TemplateColumnarLeafView
 	templateColumnarLeafBenchExt   TemplateColumnarLeafExtraction
 )
 

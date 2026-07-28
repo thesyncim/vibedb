@@ -50,7 +50,7 @@ func TestPageCodecRoundTripAndEveryByteCorruption(t *testing.T) {
 		}
 		page[i] ^= 1
 	}
-	for cut := 0; cut < len(page); cut++ {
+	for cut := range page {
 		if _, _, err := OpenPage(page[:cut]); !errors.Is(err, ErrPageCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrPageCorrupt)
 		}

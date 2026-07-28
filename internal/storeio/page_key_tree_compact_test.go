@@ -282,7 +282,7 @@ func TestPageKeyTreePointDeletesNinetyPercentMaintainOccupancyAndReuse(t *testin
 	oldRoot := h.root
 	low, high := 0, len(entries)-1
 	var last PageKeyTreeMutation
-	for deleted := 0; deleted < 234; deleted++ {
+	for deleted := range 234 {
 		index := low
 		if deleted&1 != 0 {
 			index = high

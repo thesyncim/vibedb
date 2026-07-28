@@ -86,7 +86,7 @@ func shapeColumnQueries(s *Segment) []string {
 func checkAppendField(t *testing.T, cache *ShapeCache, s *Segment, name, label string) {
 	t.Helper()
 	want := refAppendField(s, name)
-	for pass := 0; pass < 2; pass++ {
+	for pass := range 2 {
 		got := cache.AppendField(nil, s, name)
 		if len(got) != len(want) {
 			t.Fatalf("%s pass %d: AppendField(%q) appended %d values for %d documents",
@@ -117,7 +117,7 @@ func shapeColumnCorpora() map[string][]string {
 
 	// One 8-field layout repeated: the pure run the hint serves.
 	var homogeneous []string
-	for i := 0; i < 48; i++ {
+	for i := range 48 {
 		homogeneous = append(homogeneous, fmt.Sprintf(
 			`{"id":%d,"name":"u-%03d","active":%t,"score":%d.%02d,"region":"eu-%d","tier":%d,"ts":%d,"flags":null}`,
 			i, i, i%2 == 0, i%100, i%97, i%3, i%5, 1700000000+i))
@@ -128,7 +128,7 @@ func shapeColumnCorpora() map[string][]string {
 	// at different positions, so every document rejects the leading hint and
 	// must be served by the displaced slot.
 	var shifted []string
-	for i := 0; i < 48; i++ {
+	for i := range 48 {
 		if i%2 == 0 {
 			shifted = append(shifted, fmt.Sprintf(`{"ts":%d,"a0":0,"a1":1,"a2":2,"id":%d}`, i, i))
 		} else {
@@ -155,7 +155,7 @@ func shapeColumnCorpora() map[string][]string {
 	// alternation: exercises the sticky-absent run, its promotion between
 	// hint slots, and recovery.
 	var absent []string
-	for i := 0; i < 48; i++ {
+	for i := range 48 {
 		if i%2 == 0 {
 			absent = append(absent, fmt.Sprintf(`{"ts":%d,"a":1,"b":2}`, i))
 		} else {
@@ -167,7 +167,7 @@ func shapeColumnCorpora() map[string][]string {
 	// All-distinct equal-width layouts, deep enough that the hunt backoff
 	// engages and skips resolutions mid-corpus.
 	var distinct []string
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		distinct = append(distinct, fmt.Sprintf(
 			`{"d%02d_a":1,"d%02d_b":2,"d%02d_c":3,"d%02d_d":4,"shared":%d}`, i, i, i, i, i))
 	}
@@ -176,7 +176,7 @@ func shapeColumnCorpora() map[string][]string {
 	// Clustered runs whose boundaries interleave non-flat and non-object
 	// documents, so runs are broken by unresolvable roots.
 	var broken []string
-	for i := 0; i < 48; i++ {
+	for i := range 48 {
 		switch {
 		case i%12 == 6:
 			broken = append(broken, `{"nested":{"deep":1},"ts":2}`)
@@ -214,7 +214,7 @@ func TestAppendFieldDifferential(t *testing.T) {
 // through the same compiled shape, hashed and plain suffix scans included.
 func TestAppendFieldMixedEnrichment(t *testing.T) {
 	var set Segment
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		set.Options = document.IndexOptions{HashKeys: i%2 == 0}
 		doc := fmt.Sprintf(`{"a":%d,"dup":1,"b":%d,"dup":2,"ts":%d}`, i, i, i)
 		if _, err := set.Append([]byte(doc)); err != nil {
@@ -244,7 +244,7 @@ func TestAppendFieldsDifferential(t *testing.T) {
 			set := shapeColumnSegment(t, docs, hashKeys)
 			for _, names := range groups {
 				var cache ShapeCache
-				for pass := 0; pass < 2; pass++ {
+				for pass := range 2 {
 					cols := cache.AppendFields(nil, set, names...)
 					if len(cols) != len(names) {
 						t.Fatalf("%s: AppendFields grew %d columns for %d names", label, len(cols), len(names))
@@ -370,10 +370,10 @@ func TestGCCorruptionShapeColumn(t *testing.T) {
 	// adjacent to the poisoned tail — is served by the hint fast path, whose
 	// suffix scan runs to the tape's last key entry.
 	var docs []string
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		docs = append(docs, fmt.Sprintf(`{"pre%d":%d,"nested":{"x":1}}`, i, i))
 	}
-	for i := 0; i < 24; i++ {
+	for i := range 24 {
 		docs = append(docs, fmt.Sprintf(`{"q":%d,"c0":%d,"c1":"v-%02d","c2":%d}`, i, i*3, i, i%7))
 	}
 	names := []string{"q", "c1", "c2", "absent"}
@@ -394,7 +394,7 @@ func TestGCCorruptionShapeColumn(t *testing.T) {
 	const iters = 32
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -403,7 +403,7 @@ func TestGCCorruptionShapeColumn(t *testing.T) {
 			cols := make([][]vibejson.RawValue, len(names))
 			var retained [][]vibejson.RawValue
 			var retainedSets []*Segment
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(48+id, it)
 				set, err := buildShapeColumnSet(docs, true)
 				if err != nil {
@@ -502,7 +502,7 @@ func TestAppendFieldRowsResolvesTemplatedDocuments(t *testing.T) {
 		t.Fatalf("NewBuilder: %v", err)
 	}
 	const rows = 32
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		doc := fmt.Appendf(nil, `{"id":%d,"name":"user-%04d"}`, i, i)
 		if err := builder.Append(fmt.Sprintf("k%04d", i), doc); err != nil {
 			t.Fatalf("Append: %v", err)
@@ -530,7 +530,7 @@ func TestAppendFieldRowsResolvesTemplatedDocuments(t *testing.T) {
 	}
 
 	var locations []Location
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		locations = append(locations, Location{Chunk: uint32(i / 8), Slot: uint8(i % 8)})
 	}
 	sparse := snapshot.AppendFieldRows(nil, locations, "id", nil)

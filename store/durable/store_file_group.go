@@ -5,9 +5,9 @@ import (
 	"math"
 	"math/bits"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // IndexScalarGroup is one collision-certified scalar group read directly

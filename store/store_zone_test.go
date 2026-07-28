@@ -132,7 +132,7 @@ func TestZoneFoldNeverPrunesAMatchingDocument(t *testing.T) {
 	}
 	probeValues := append([]string{}, values...)
 
-	for iteration := 0; iteration < 3000; iteration++ {
+	for range 3000 {
 		count := 1 + rng.IntN(8)
 		docs := make([]string, count)
 		for i := range docs {
@@ -339,7 +339,7 @@ func TestZoneSnapshotMasksSkipOnlyImpossibleChunks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		if _, err := collection.Put(fmt.Sprintf("k%03d", i), fmt.Appendf(nil, `{"v":%d}`, i)); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
@@ -393,7 +393,7 @@ func TestZoneOverflowDisablesTheAbsentPathDeduction(t *testing.T) {
 	var wide chunkZone
 	var fields []byte
 	fields = append(fields, '{')
-	for i := 0; i < ZonePaths+2; i++ {
+	for i := range ZonePaths + 2 {
 		if i > 0 {
 			fields = append(fields, ',')
 		}
@@ -457,7 +457,7 @@ func TestZoneRestoredChunkIsStaleUntilRewritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), fmt.Appendf(nil, `{"v":%d}`, i)); err != nil {
 			t.Fatalf("Put: %v", err)
 		}

@@ -18,7 +18,7 @@ func resetCorpus(tag string, count, members int) [][]byte {
 	docs := make([][]byte, count)
 	for i := range docs {
 		doc := fmt.Appendf(nil, `{"tag":%q,"id":%d,"label":"%s-%04d"`, tag, i, tag, i)
-		for m := 0; m < members; m++ {
+		for m := range members {
 			doc = fmt.Appendf(doc, `,"f%d":%d`, m, i*(m+1))
 		}
 		if i%3 == 0 {

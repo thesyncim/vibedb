@@ -10,9 +10,9 @@ import (
 	"slices"
 	"sync/atomic"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 const (
@@ -271,10 +271,7 @@ func WritePageFile(collection *store.Collection, file *os.File, options StorePag
 	if err := file.Truncate(int64(fileEnd)); err != nil {
 		return 0, err
 	}
-	maxScratch := int(options.MaxDocumentPageBytes)
-	if maxScratch < int(storePageQuantum) {
-		maxScratch = int(storePageQuantum)
-	}
+	maxScratch := max(int(options.MaxDocumentPageBytes), int(storePageQuantum))
 	scratch := make([]byte, maxScratch)
 	if err := catalogPlan.write(
 		file, fileEnd, nextLogicalID, scratch,
@@ -870,10 +867,6 @@ func nextStorePageKeyLeaf(pages *storeio.PageFile,
 		return ref, true, nil
 	}
 	return storeio.PageRef{}, false, nil
-}
-
-func (r *StorePageReader) resolveDocumentPage(pages *storeio.PageFile, chunkID uint32) (storeio.PageRef, bool, error) {
-	return resolveStoreDocumentPage(pages, r.root.ChunkDirectory, chunkID)
 }
 
 func resolveStoreDocumentPage(pages *storeio.PageFile, chunkRoot storeio.PageRef,

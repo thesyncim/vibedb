@@ -57,6 +57,10 @@ type RouteBucketTableEntry struct {
 	RowID uint16
 }
 
+// RouteBucketTableAccounting is the itemized physical-cost breakdown of one
+// route bucket table, splitting page, directory, block-map, resident, and
+// allocator-padding bytes. It exists so space benchmarks can attribute the
+// per-key budget to a component rather than reporting one opaque total.
 type RouteBucketTableAccounting struct {
 	PageBytes             int
 	RootDirectoryBytes    int
@@ -90,8 +94,12 @@ const routeBucketTableBlockHandleBytes = int(unsafe.Sizeof([3]uintptr{}))
 const routeBucketTableEmptyRow = ^uint16(0)
 
 var (
+	// ErrRouteBucketTableIncomplete reports that a build did not supply an entry
+	// for every bucket the table must cover.
 	ErrRouteBucketTableIncomplete = errors.New("vibejson: route bucket table incomplete")
-	ErrRouteBucketTableCorrupt    = errors.New("vibejson: corrupt route bucket table")
+	// ErrRouteBucketTableCorrupt reports that a table image failed checksum or
+	// structural admission and must not be routed against.
+	ErrRouteBucketTableCorrupt = errors.New("vibejson: corrupt route bucket table")
 )
 
 var routeBucketTableZeroChecksumWord [4]byte
@@ -163,7 +171,7 @@ func newRouteBucketTable(buckets, rows int) (*RouteBucketTable, error) {
 	binary.LittleEndian.PutUint32(table.root[8:12], uint32(buckets))
 	binary.LittleEndian.PutUint32(table.root[12:16], uint32(rows))
 	binary.LittleEndian.PutUint32(table.root[16:20], uint32(pages))
-	for page := 0; page < pages; page++ {
+	for page := range pages {
 		block, err := storemem.Allocate(RouteBucketTablePageBytes)
 		if err != nil {
 			_ = table.Close()
@@ -182,7 +190,7 @@ func newRouteBucketTable(buckets, rows int) (*RouteBucketTable, error) {
 		binary.LittleEndian.PutUint32(data[16:20], uint32(buckets))
 		binary.LittleEndian.PutUint16(data[20:22], uint16(page))
 		binary.LittleEndian.PutUint16(data[22:24], uint16(pages))
-		for slot := 0; slot < routeBucketTablePageCapacity; slot++ {
+		for slot := range routeBucketTablePageCapacity {
 			binary.LittleEndian.PutUint32(data[routeBucketTablePageHeaderBytes+slot*4:], uint32(routeBucketTableEmptyRow))
 		}
 	}
@@ -198,7 +206,7 @@ func (t *RouteBucketTable) seal() error {
 	for page, block := range t.pages {
 		data := block.Bytes()
 		pageLive := 0
-		for slot := 0; slot < routeBucketTablePageCapacity; slot++ {
+		for slot := range routeBucketTablePageCapacity {
 			if uint16(binary.LittleEndian.Uint32(data[routeBucketTablePageHeaderBytes+slot*4:])) != routeBucketTableEmptyRow {
 				pageLive++
 			}
@@ -242,7 +250,7 @@ func routeBucketTablePageValid(data []byte, page, buckets, pages int) bool {
 	}
 	live := 0
 	activeSlots := int(binary.LittleEndian.Uint16(data[12:14])) * routeBucketTableBucketSlots
-	for slot := 0; slot < routeBucketTablePageCapacity; slot++ {
+	for slot := range routeBucketTablePageCapacity {
 		word := binary.LittleEndian.Uint32(data[routeBucketTablePageHeaderBytes+slot*4:])
 		if slot >= activeSlots {
 			if word != uint32(routeBucketTableEmptyRow) {
@@ -273,7 +281,7 @@ func (t *RouteBucketTable) put(bucket, slot int, word uint32) {
 	binary.LittleEndian.PutUint32(data[routeBucketTablePageHeaderBytes+(local*routeBucketTableBucketSlots+slot)*4:], word)
 }
 func (t *RouteBucketTable) place(bucket int, word uint32) bool {
-	for slot := 0; slot < routeBucketTableBucketSlots; slot++ {
+	for slot := range routeBucketTableBucketSlots {
 		if uint16(t.word(bucket, slot)) == routeBucketTableEmptyRow {
 			t.put(bucket, slot, word)
 			return true
@@ -337,7 +345,7 @@ func routeBucketTableRelocate(t *RouteBucketTable, bucket int, pending uint32, b
 			pageSeen[page>>6] |= uint64(1) << uint(page&63)
 			pages++
 		}
-		for slot := 0; slot < routeBucketTableBucketSlots; slot++ {
+		for slot := range routeBucketTableBucketSlots {
 			if work == budget {
 				return false, 0, work, pages
 			}
@@ -391,7 +399,7 @@ func (t *RouteBucketTable) Lookup(hash uint64, verify func(rowID uint16) bool) (
 		if attempt == 1 && second == first {
 			continue
 		}
-		for slot := 0; slot < routeBucketTableBucketSlots; slot++ {
+		for slot := range routeBucketTableBucketSlots {
 			word := t.word(bucket, slot)
 			if uint16(word) == routeBucketTableEmptyRow || uint16(word>>16) != tag {
 				continue

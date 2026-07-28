@@ -50,6 +50,11 @@ var (
 	ErrMaskChunk = errors.New("vibejson: collection mask chunk is not live")
 )
 
+// ExactIndex is the compiled, allocation-free form of one exact-index
+// definition: the ordered set of column pointers extracted from each document,
+// the source path spellings, and the hash seed that turns a column tuple into a
+// posting key. It is immutable after CompileExactIndex and shared by every
+// snapshot that maintains the index. N is the number of active columns.
 type ExactIndex struct {
 	Paths [MaxIndexColumns]vibejson.CompiledPointer
 	Specs [MaxIndexColumns]string
@@ -75,6 +80,11 @@ type Mask struct {
 	Bits  uint64
 }
 
+// CompileExactIndex validates one IndexDefinition and compiles its paths into
+// an ExactIndex ready for extraction and posting maintenance. It rejects empty,
+// oversized, or malformed definitions so the returned index can be used without
+// re-checking, and derives a deterministic seed from the paths so the same
+// definition always hashes tuples identically.
 func CompileExactIndex(def IndexDefinition) (*ExactIndex, error) {
 	if def.Name == "" {
 		return nil, fmt.Errorf("%w: name is empty", ErrIndexDefinition)
@@ -166,6 +176,12 @@ func storeIndexExtract(chunk *Chunk, slot int, exact *ExactIndex, out *[MaxIndex
 	return storeIndexTupleHash(exact.seed, out[:exact.N])
 }
 
+// ExtractIndexColumns fills out with the indexed column values for one live
+// document slot and reports whether the row is indexable. It returns false when
+// the slot is dead or any indexed path is absent or empty, which is how a
+// document is correctly excluded from an exact index rather than stored under a
+// null tuple. out is caller-owned scratch; the written values borrow the
+// chunk's document bytes.
 func ExtractIndexColumns(chunk *Chunk, slot int, exact *ExactIndex, out *[MaxIndexColumns]vibejson.RawValue) bool {
 	if chunk == nil || chunk.Live&(uint64(1)<<uint(slot)) == 0 {
 		return false

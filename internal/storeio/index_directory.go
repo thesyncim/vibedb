@@ -290,7 +290,7 @@ func validateIndexDirectoryLeafRecords(header IndexDirectoryHeader, payload []by
 	var previousKey IndexDirectoryKey
 	var previous []byte
 	expected, shared := heapStart, 0
-	for i := 0; i < count; i++ {
+	for i := range count {
 		record := payload[IndexDirectoryPayloadHeaderSize+i*IndexDirectoryLeafRecordSize:]
 		key := decodeIndexDirectoryKey(record)
 		flags := binary.LittleEndian.Uint16(record[28:30])
@@ -344,7 +344,7 @@ func validateIndexDirectoryLeafRecords(header IndexDirectoryHeader, payload []by
 func validateIndexDirectoryBranchRecords(header IndexDirectoryHeader, payload []byte, count int, fileEnd, nextLogicalID uint64, indexHighWater uint32) error {
 	var previousKey IndexDirectoryKey
 	var seen chunkDirectoryRefSet
-	for i := 0; i < count; i++ {
+	for i := range count {
 		record := payload[IndexDirectoryPayloadHeaderSize+i*IndexDirectoryBranchRecordSize:]
 		key := decodeIndexDirectoryKey(record)
 		if key.IndexID >= indexHighWater || i != 0 && compareIndexDirectoryKey(previousKey, key) >= 0 ||

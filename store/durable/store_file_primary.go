@@ -3,8 +3,8 @@ package durable
 import (
 	"fmt"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 func (c *Collection) primaryGraphReadOnly() bool {
@@ -39,11 +39,16 @@ func (c *Collection) resolvePrimaryGraph(
 	// newest published generation. A snapshot whose rooted graph predates a
 	// handle rewrite must retain its old physical route, so it uses the rooted
 	// page-walk oracle instead.
-	if c.primaryRouter == nil ||
-		c.primaryRouter.Generation() != state.root.Generation {
+	// Load the router pointer once: a structural split/merge/reclass swaps the
+	// whole instance, so re-reading the field mid-read could observe two
+	// generations. One consistent instance plus the generation guard keeps a
+	// concurrent swap correct (a mismatch falls back to the rooted oracle).
+	router := c.primaryRouter.Load()
+	if router == nil ||
+		router.Generation() != state.root.Generation {
 		return c.resolvePrimaryGraphPageWalk(dst, state, key)
 	}
-	route, ok := c.primaryRouter.Route(keyBytes)
+	route, ok := router.Route(keyBytes)
 	if !ok {
 		return dst, false, fmt.Errorf(
 			"%w: resident primary route",
@@ -52,10 +57,10 @@ func (c *Collection) resolvePrimaryGraph(
 	}
 	// Close the race in which the serialized writer advances the router after
 	// the generation check but while this reader is selecting its handle.
-	if c.primaryRouter.Generation() != state.root.Generation {
+	if router.Generation() != state.root.Generation {
 		return c.resolvePrimaryGraphPageWalk(dst, state, key)
 	}
-	leafLease, err := c.primaryRouter.AcquireLeaf(c.cache, route)
+	leafLease, err := router.AcquireLeaf(c.cache, route)
 	if err != nil {
 		return dst, false, err
 	}

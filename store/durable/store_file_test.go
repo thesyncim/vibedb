@@ -15,9 +15,9 @@ import (
 	"time"
 	"unsafe"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func testFileStoreOptions() Options {
@@ -92,7 +92,7 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 		t.Fatal("retirement capacity beyond allocator limit accepted")
 	}
 	options = testFileStoreOptions()
-	options.MaxRetiredExtents = 1<<24
+	options.MaxRetiredExtents = 1 << 24
 	options.ResidentBytes = 128 << 20
 	options.BufferCount = 32_768
 	if _, err := options.normalized(); err != nil {

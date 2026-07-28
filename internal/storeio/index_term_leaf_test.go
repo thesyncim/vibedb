@@ -554,13 +554,13 @@ func makeIndexTermLeafFixture(
 		expected: make(map[string]map[uint32][TermPostingTileChunks]uint64),
 	}
 	tileID := uint32(7)
-	for term := 0; term < termCount; term++ {
+	for term := range termCount {
 		key := mustIndexTermLeafKey(t, fmt.Sprintf("term/common/%04d", term))
 		fixture.terms[term].Key = key
 		fixture.terms[term].Postings =
 			make([]IndexTermLeafPosting, postingsPerTerm)
 		expected := make(map[uint32][TermPostingTileChunks]uint64)
-		for postingIndex := 0; postingIndex < postingsPerTerm; postingIndex++ {
+		for postingIndex := range postingsPerTerm {
 			var posting, live [TermPostingTileChunks]uint64
 			makeIndexTermLeafPattern(term%6, &posting, &live)
 			input := buildIndexTermLeafPosting(

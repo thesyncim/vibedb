@@ -232,7 +232,7 @@ func EncodeFloat64Group(dst []byte, header Float64GroupHeader, chunks []Document
 		)
 	}
 	cursor := dataStart
-	for column := 0; column < columns; column++ {
+	for column := range columns {
 		encoding := float64GroupColumnEncoding(chunks, column)
 		width := encoding.ByteWidth()
 		for _, chunk := range chunks {
@@ -585,7 +585,7 @@ func (v Float64GroupView) Float64ColumnRangeValues(column int, first, count uint
 	masksStart := v.dataStart + int(start)
 	valuesStart := masksStart + int(v.header.ChunkCount)*8
 	valueOffset := 0
-	for chunk := uint64(0); chunk < ordinal; chunk++ {
+	for chunk := range ordinal {
 		mask := binary.LittleEndian.Uint64(v.payload[masksStart+int(chunk)*8:])
 		valueOffset += bits.OnesCount64(mask) * width
 	}

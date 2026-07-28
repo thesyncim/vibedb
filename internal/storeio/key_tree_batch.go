@@ -212,7 +212,7 @@ func (b *keyTreeBatch) rewriteBranch(
 	}
 	assembled := b.assembly[depth][:0]
 	at := 0
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		child, _ := view.ChildAt(rank)
 		// Every edit below the first child's lower bound belongs to that child:
 		// the branch owns the whole key space beneath it, and a batch inserting

@@ -8,18 +8,28 @@ import (
 
 const indexTreeMaxLevel = uint8(10)
 
+// ErrIndexTreeDepth reports that an index-tree edit would exceed the maximum
+// branch depth, a fail-closed guard against an unbounded tree.
 var ErrIndexTreeDepth = errors.New("vibejson: Store index tree depth exhausted")
 
 // ErrIndexProbeCertificates reports a probe whose copied certificates would
 // exceed the 32-bit arena the returned spans address.
 var ErrIndexProbeCertificates = errors.New("vibejson: Store index probe certificate arena exhausted")
 
+// IndexTreeBounds are the selecting state-root bounds an index-tree edit
+// validates its PageRefs against: the file end, the next logical ID to assign,
+// and the index high-water mark. They fail-close a mutation that references a
+// page outside the current generation.
 type IndexTreeBounds struct {
 	FileEnd        uint64
 	NextLogicalID  uint64
 	IndexHighWater uint32
 }
 
+// IndexTreeMutation is the result of an index-tree edit: the new root PageRef
+// and the fixed-capacity set of pages the edit retired. The committer publishes
+// Root and frees the retired extents as one atomic step, so no reachable page is
+// ever reused.
 type IndexTreeMutation struct {
 	Root         PageRef
 	Retired      [16]PageRef

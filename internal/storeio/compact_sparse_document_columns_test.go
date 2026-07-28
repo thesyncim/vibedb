@@ -16,7 +16,7 @@ func compactSparseFloat64TestColumns(live uint64) DocumentFloat64Columns {
 		0,
 	}
 	values := make([]float64, len(masks)*SparseDocumentPageSlotCount)
-	for slot := 0; slot < SparseDocumentPageSlotCount; slot++ {
+	for slot := range SparseDocumentPageSlotCount {
 		values[slot] = float64(slot) + 0.25
 	}
 	values[SparseDocumentPageSlotCount+0] = math.SmallestNonzeroFloat64
@@ -84,7 +84,7 @@ func TestCompactSparseDocumentPageFloat64ColumnsExactRoundTrip(t *testing.T) {
 		if !ok || got.Mask() != wantMask {
 			t.Fatalf("column %d = (mask=%016x,%v), want %016x", column, got.Mask(), ok, wantMask)
 		}
-		for slot := uint8(0); slot < SparseDocumentPageSlotCount; slot++ {
+		for slot := range uint8(SparseDocumentPageSlotCount) {
 			value, present := got.Lookup(slot)
 			wantPresent := wantMask&(uint64(1)<<slot) != 0
 			if present != wantPresent {
@@ -241,7 +241,7 @@ func requireCompactSparseColumnsEqual(tb testing.TB, before, after CompactSparse
 		if !leftOK || !rightOK {
 			tb.Fatalf("column %d missing: before=%v after=%v", column, leftOK, rightOK)
 		}
-		for slot := uint8(0); slot < SparseDocumentPageSlotCount; slot++ {
+		for slot := range uint8(SparseDocumentPageSlotCount) {
 			if int(slot) == ignoredSlot || mask&(uint64(1)<<slot) == 0 {
 				continue
 			}

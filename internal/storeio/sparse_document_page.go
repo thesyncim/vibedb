@@ -251,7 +251,7 @@ func openSparseDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID, fi
 
 	var occupied [SparseDocumentPageSlotCount]sparseDocumentInterval
 	trailer := len(page) - PageTrailerSize
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		descriptor := directoryStart + rank*SparseDocumentPageRecordSize
 		start := int(binary.LittleEndian.Uint16(page[descriptor : descriptor+2]))
 		keyLength := int(binary.LittleEndian.Uint16(page[descriptor+2 : descriptor+4]))

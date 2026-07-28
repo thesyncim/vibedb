@@ -885,13 +885,6 @@ func (c *Collection) planFreeFoldWithRepackFor(
 	return plan, live, err
 }
 
-func (c *Collection) freeFoldPageLimit() int {
-	if c == nil {
-		return storeio.FreeLogMaxFoldSegments
-	}
-	return c.freeFoldPageLimitFor(c.freeFoldLimit)
-}
-
 func (c *Collection) freeFoldPageLimitFor(limit int) int {
 	if limit < storeio.FreeLogMaxFoldSegments {
 		return storeio.FreeLogMaxFoldSegments

@@ -342,7 +342,7 @@ func planTemplateLeafCount(records []PrimaryGraphRecord, first int) int {
 	scratch := make([]CommonPrimaryLeafRecord, 0, maxCount)
 	fits := func(count int) bool {
 		scratch = scratch[:0]
-		for at := 0; at < count; at++ {
+		for at := range count {
 			row := records[first+at]
 			scratch = append(scratch, CommonPrimaryLeafRecord{
 				Key: row.Key, Value: CommonPrimaryLeafValue{Inline: row.Value},
@@ -504,7 +504,7 @@ func buildPrimaryTablets(
 	}
 	tablets := make([]primaryCatalogChild, tabletCount)
 	var previousTabletMax []byte
-	for tabletAt := 0; tabletAt < tabletCount; tabletAt++ {
+	for tabletAt := range tabletCount {
 		first := tabletAt * TabletLocalIdentityLocalCount
 		last := min(first+TabletLocalIdentityLocalCount, len(leaves))
 		tabletLeaves := leaves[first:last]
@@ -541,7 +541,7 @@ func buildPrimaryTablets(
 			SegmentedTabletRouterRowsPerPage
 		anchorPages := make([]TransactionPage, pageCount)
 		anchorRefs := make([]PageRef, pageCount)
-		for pageID := 0; pageID < pageCount; pageID++ {
+		for pageID := range pageCount {
 			logicalID, _ := GlobalTabletCatalogAnchorLogicalID(
 				tabletID, uint8(pageID),
 			)
@@ -725,7 +725,7 @@ func buildPrimaryCatalogLevel(
 		return nil, fmt.Errorf("%w: primary catalog level capacity", ErrInvalidWrite)
 	}
 	result := make([]primaryCatalogChild, count)
-	for pageID := 0; pageID < count; pageID++ {
+	for pageID := range count {
 		first := pageID * fanout
 		last := min(first+fanout, len(children))
 		logicalID, ok := GlobalTabletCatalogCatalogLeafLogicalID(uint32(pageID))

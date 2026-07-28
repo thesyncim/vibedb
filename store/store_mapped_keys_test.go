@@ -17,7 +17,7 @@ func TestStoreMappedKeysPointerFreeBaseAndOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 17; i++ {
+	for i := range 17 {
 		if err := builder.Append(fmt.Sprintf("key:%02d", i), []byte(fmt.Sprintf(`{"n":%d}`, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,7 @@ func TestStoreMappedKeysPointerFreeBaseAndOverlay(t *testing.T) {
 
 	// Aggressive collection cannot finalize the external table while either a
 	// current or retained state can still reach it.
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		runtime.GC()
 		if raw, ok := old.GetRaw("key:03"); !ok || string(raw.Bytes()) != `{"n":3}` {
 			t.Fatalf("old snapshot after GC = (%q, %v)", raw.Bytes(), ok)
@@ -95,7 +95,7 @@ func TestStoreMappedBaseConcurrentReadersAndWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 128; i++ {
+	for i := range 128 {
 		if err := builder.Append(fmt.Sprintf("key:%03d", i), []byte(fmt.Sprintf(`{"n":%d}`, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -116,12 +116,10 @@ func TestStoreMappedBaseConcurrentReadersAndWriter(t *testing.T) {
 
 	start := make(chan struct{})
 	var readers sync.WaitGroup
-	for worker := 0; worker < 8; worker++ {
-		readers.Add(1)
-		go func() {
-			defer readers.Done()
+	for range 8 {
+		readers.Go(func() {
 			<-start
-			for i := 0; i < 2_000; i++ {
+			for range 2_000 {
 				snapshot, _ := collection.Snapshot()
 				raw, ok := snapshot.GetRaw("key:002")
 				if !ok || len(raw.Bytes()) == 0 {
@@ -129,10 +127,10 @@ func TestStoreMappedBaseConcurrentReadersAndWriter(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	close(start)
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		if _, err := collection.Put("key:002", []byte(fmt.Sprintf(`{"n":%d}`, 1_000+i))); err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +154,7 @@ func TestStoreMappedKeysGroupProbeCollisionDifferential(t *testing.T) {
 	defer mapped.release()
 	seed := maphash.MakeSeed()
 	want := make(map[string]Location, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		key := fmt.Sprintf("collision-key-%03d", i)
 		off := len(source)
 		source = append(source, key...)
@@ -166,7 +164,7 @@ func TestStoreMappedKeysGroupProbeCollisionDifferential(t *testing.T) {
 		want[key] = loc
 	}
 	mapped.source = source
-	for i := 0; i < count; i++ {
+	for i := range count {
 		key := fmt.Sprintf("collision-key-%03d", i)
 		// Retain only three initial hash bits to force long, wrapping clusters;
 		// exact spelling must still distinguish every key.

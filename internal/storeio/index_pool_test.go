@@ -54,7 +54,7 @@ func TestIndexPoolConcurrentReuse(t *testing.T) {
 func TestIndexPoolMaximumDeviceIndex(t *testing.T) {
 	const count = 1 << 16
 	pool := newIndexPool(count)
-	for want := uint32(0); want < count; want++ {
+	for want := range uint32(count) {
 		got, ok := pool.pop()
 		if !ok || got != want {
 			t.Fatalf("pop = (%d, %v), want (%d, true)", got, ok, want)

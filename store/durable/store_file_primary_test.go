@@ -161,14 +161,14 @@ func TestOpenValidatesPrimaryCatalog(t *testing.T) {
 			// The one-child root has no fences or common bytes. Its embedded
 			// map bucket follows the 64-byte header, 514-byte accelerator,
 			// and one terminal offset.
-			bucketAt := mapStart + storeio.TabletAnchorMapLabHeaderSize +
-				storeio.TabletAnchorMapLabAcceleratorSlots*2 + 2
+			bucketAt := mapStart + storeio.TabletAnchorMapHeaderSize +
+				storeio.TabletAnchorMapAcceleratorSlots*2 + 2
 			binary.LittleEndian.PutUint32(
 				page[bucketAt:bucketAt+4],
 				storeio.GlobalTabletCatalogMaxLeafPages,
 			)
 			resealPrimaryOpenTestTrailer(
-				page, mapStart+mapBytes-storeio.TabletAnchorMapLabTrailerSize,
+				page, mapStart+mapBytes-storeio.TabletAnchorMapTrailerSize,
 			)
 			if _, err := storeio.SealPage(page); err != nil {
 				t.Fatal(err)

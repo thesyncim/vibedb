@@ -9,9 +9,9 @@ import (
 	"runtime"
 	"slices"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // CreateFromPrimary writes one immutable ordered primary graph and publishes it

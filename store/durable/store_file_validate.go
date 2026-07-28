@@ -6,8 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // fileStorePageValidator carries monotonic publication bounds into PageCache's

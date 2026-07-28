@@ -117,10 +117,7 @@ func (r *tornReader) Read(p []byte) (int, error) {
 	r.state ^= r.state << 13
 	r.state ^= r.state >> 7
 	r.state ^= r.state << 17
-	n := 1 + int(r.state%97)
-	if n > len(r.data) {
-		n = len(r.data)
-	}
+	n := min(1+int(r.state%97), len(r.data))
 	if n > len(p) {
 		n = len(p)
 	}
@@ -175,7 +172,7 @@ func forceStackMovement(depth int, acc int) int {
 func keyHashWideDoc(width int, padValue string) string {
 	var sb strings.Builder
 	sb.WriteString("{")
-	for i := 0; i < width; i++ {
+	for i := range width {
 		if i > 0 {
 			sb.WriteString(",")
 		}

@@ -291,7 +291,7 @@ func TestStoreExactIndexMutationDifferential(t *testing.T) {
 	for _, chunkDocuments := range []int{1, 3, 8, 64} {
 		t.Run(fmt.Sprintf("chunk=%d", chunkDocuments), func(t *testing.T) {
 			collection := &Collection{Options: Options{ChunkDocuments: chunkDocuments, ShapeTapes: true}}
-			for i := 0; i < 97; i++ {
+			for i := range 97 {
 				doc := fmt.Sprintf(`{"tenant":"t%d","profile":{"bucket":%d},"seq":%d}`, i%7, i%11, i)
 				if _, err := collection.Put(fmt.Sprintf("k%03d", i), []byte(doc)); err != nil {
 					t.Fatal(err)
@@ -313,7 +313,7 @@ func TestStoreExactIndexMutationDifferential(t *testing.T) {
 			}
 
 			retained, _ := collection.Snapshot()
-			for step := 0; step < 240; step++ {
+			for step := range 240 {
 				i := (step*37 + 13) % 131
 				key := fmt.Sprintf("k%03d", i)
 				if step%9 == 0 {
@@ -341,8 +341,8 @@ func checkCollectionExactIndexDifferential(t testing.TB, snapshot Snapshot, name
 	t.Helper()
 	tenantPath := vibejson.MustCompilePointer("/tenant")
 	bucketPath := vibejson.MustCompilePointer("/profile/bucket")
-	for tenant := 0; tenant < 7; tenant++ {
-		for bucket := 0; bucket < 11; bucket++ {
+	for tenant := range 7 {
+		for bucket := range 11 {
 			want := make([]string, 0)
 			tenantNeedle := testScalarIndex(t, fmt.Sprintf(`"t%d"`, tenant)).Root().Raw()
 			bucketNeedle := testScalarIndex(t, fmt.Sprint(bucket)).Root().Raw()
@@ -572,7 +572,7 @@ func TestStoreIndexMaskRadixFootprint(t *testing.T) {
 	if _, err := collection.CreateIndex(IndexDefinition{Name: "v", Paths: []string{"/v"}}); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		if _, err := collection.Put(strconv.Itoa(i), []byte(`{"v":`+strconv.Itoa(i%4)+`}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -689,13 +689,13 @@ func TestStoreIndexMergeBulkMasksInterleaved(t *testing.T) {
 	const words = 2048
 	currentEntries := make([]storeIndexChunkMask, words)
 	changes := make([]storeIndexChunkMask, words)
-	for i := 0; i < words; i++ {
+	for i := range words {
 		currentEntries[i] = storeIndexChunkMask{chunk: uint32(i * 2), mask: 1}
 		changes[i] = storeIndexChunkMask{chunk: uint32(i*2 + 1), mask: 2}
 	}
 	merged := storeIndexMergeBulkMasks(storeIndexMasksFromSorted(currentEntries), changes)
 	it := merged.iterator()
-	for i := 0; i < words*2; i++ {
+	for i := range words * 2 {
 		chunk, mask, ok := it.next()
 		wantMask := uint64(1)
 		if i&1 != 0 {
@@ -727,7 +727,7 @@ func TestStoreIndexMergeBulkMasksDifferential(t *testing.T) {
 		state ^= state >> 27
 		return state * 0x2545f4914f6cdd1d
 	}
-	for trial := 0; trial < 500; trial++ {
+	for trial := range 500 {
 		currentMap := make(map[uint32]uint64)
 		changeMap := make(map[uint32]uint64)
 		for len(currentMap) < 1+int(random()%160) {
@@ -784,7 +784,7 @@ func TestStoreIndexMergeBulkMasksDifferential(t *testing.T) {
 
 func TestStoreIndexPostingBulkBuild(t *testing.T) {
 	pending := make(map[uint64][]storeIndexChunkMask, 2048)
-	for i := uint64(0); i < 2048; i++ {
+	for i := range uint64(2048) {
 		// Hold the first radix digit constant and vary later digits. This is
 		// the adversarial ordering for a builder that incorrectly sorts by the
 		// ordinary high-to-low integer order.
@@ -802,7 +802,7 @@ func TestStoreIndexPostingBulkBuild(t *testing.T) {
 
 func TestStoreExactIndexSteadyLookupAllocs(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 8, ShapeTapes: true}}
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		doc := []byte(`{"tenant":"acme","bucket":3}`)
 		if _, err := collection.Put(string(rune(i+1)), doc); err != nil {
 			t.Fatal(err)
@@ -851,7 +851,7 @@ func TestStoreExactIndexSteadyLookupAllocs(t *testing.T) {
 
 func TestStoreExactIndexStats(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 2}}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		doc := fmt.Sprintf(`{"v":%d}`, i&1)
 		if _, err := collection.Put(fmt.Sprint(i), []byte(doc)); err != nil {
 			t.Fatal(err)

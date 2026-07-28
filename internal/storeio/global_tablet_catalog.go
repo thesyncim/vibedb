@@ -60,9 +60,13 @@ const (
 )
 
 var (
+	// ErrGlobalTabletCatalogCorrupt reports that a catalog page failed checksum
+	// or structural admission and must not be routed against.
 	ErrGlobalTabletCatalogCorrupt = errors.New(
 		"vibejson: corrupt global tablet catalog page",
 	)
+	// ErrGlobalTabletCatalogNoSpace reports that a node cannot admit another
+	// child; the builder must add a level or split.
 	ErrGlobalTabletCatalogNoSpace = errors.New(
 		"vibejson: global tablet catalog page has no space",
 	)
@@ -113,7 +117,7 @@ type GlobalTabletCatalogNodeView struct {
 	payload     []byte
 	handles     []byte
 	heads       []byte
-	floors      TabletAnchorMapLabView
+	floors      TabletAnchorMapView
 	header      PageHeader
 	level       GlobalTabletCatalogNodeLevel
 	childLevel  GlobalTabletCatalogNodeLevel
@@ -141,9 +145,12 @@ type GlobalTabletCatalogNodeHandleRewrite struct {
 	Ref PageRef
 }
 
+// GlobalTabletCatalogNodeCursor walks the tablet entries of one catalog node in
+// lexical fence order, layering a TabletAnchorMapCursor over the node's borrowed
+// view. It never follows child PageRefs.
 type GlobalTabletCatalogNodeCursor struct {
 	node   *GlobalTabletCatalogNodeView
-	cursor TabletAnchorMapLabCursor
+	cursor TabletAnchorMapCursor
 }
 
 // GlobalTabletCatalogLocatorState occupies the high two bits of each packed
@@ -159,6 +166,8 @@ const (
 	globalTabletCatalogLocatorReserved
 )
 
+// GlobalTabletCatalogLocatorEntry is one locator row: a LocalID and the anchor
+// page and row slot it currently resolves to, plus the slot's lifecycle State.
 type GlobalTabletCatalogLocatorEntry struct {
 	LocalID uint16
 	PageID  uint8
@@ -166,6 +175,9 @@ type GlobalTabletCatalogLocatorEntry struct {
 	State   GlobalTabletCatalogLocatorState
 }
 
+// GlobalTabletCatalogLocatorView is a borrowed, allocation-free read view over
+// one admitted locator image. It resolves a tablet's LocalIDs to their current
+// anchor page and slot and aliases the page bytes for the lease's lifetime.
 type GlobalTabletCatalogLocatorView struct {
 	image      []byte
 	packed     []byte
@@ -208,6 +220,8 @@ type globalTabletCatalogSegmentedRootView struct {
 	leafKind    PageKind
 }
 
+// GlobalTabletCatalogAnchorRoute pairs an anchor page's stable page ID within
+// its tablet with that page's current physical PageRef.
 type GlobalTabletCatalogAnchorRoute struct {
 	PageID uint8
 	Ref    PageRef
@@ -228,6 +242,9 @@ type GlobalTabletCatalogAnchorRefRewrite struct {
 	Ref    PageRef
 }
 
+// GlobalTabletCatalogAnchorView is a borrowed view binding one tablet anchor
+// page to its locator page and tablet identity, so a lexical route and its
+// LocalID resolution share one admitted image.
 type GlobalTabletCatalogAnchorView struct {
 	page     segmentedTabletRouterAnchorView
 	ref      PageRef
@@ -249,6 +266,10 @@ type GlobalTabletCatalogSpace struct {
 	BytesPerDoc  float64
 }
 
+// GlobalTabletCatalogCatalogBounds is the computed geometry of a catalog tree
+// for a given tablet count and worst-case fence width: fanouts, page and level
+// counts, and the COW, disk, and resident byte budgets. The builder uses it to
+// size the catalog and fail closed before it exceeds MaximumTablets.
 type GlobalTabletCatalogCatalogBounds struct {
 	Tablets        uint64
 	MaxFenceBytes  int
@@ -334,7 +355,7 @@ func GlobalTabletCatalogWorstCaseFanout(pageBytes, maxFenceBytes int) int {
 		maxFenceBytes <= 0 || maxFenceBytes > int(^uint16(0)) {
 		return 0
 	}
-	for count := 1; count <= TabletAnchorMapLabMaxFences; count++ {
+	for count := 1; count <= TabletAnchorMapMaxFences; count++ {
 		fences := count - 1
 		// A zero common prefix and no restart sharing is a valid upper bound
 		// on the exact codec, independent of the corpus.
@@ -342,14 +363,14 @@ func GlobalTabletCatalogWorstCaseFanout(pageBytes, maxFenceBytes int) int {
 		if keyBytes > int(^uint16(0)) {
 			return count - 1
 		}
-		mapBytes := tabletAnchorMapLabImageBytes(fences, 0, keyBytes)
+		mapBytes := tabletAnchorMapImageBytes(fences, 0, keyBytes)
 		payload := GlobalTabletCatalogNodePayloadHeaderBytes + mapBytes +
 			count*GlobalTabletCatalogHandleBytes
 		if payload > pageBytes-PageHeaderSize-PageTrailerSize {
 			return count - 1
 		}
 	}
-	return TabletAnchorMapLabMaxFences
+	return TabletAnchorMapMaxFences
 }
 
 // GlobalTabletCatalogCatalogGeometry computes the guaranteed catalog shape
@@ -424,7 +445,7 @@ func EncodeGlobalTabletCatalogNode(
 		header.ChildLength != wantChildLength {
 		return nil, fmt.Errorf("%w: catalog node namespace", ErrInvalidWrite)
 	}
-	anchors := make([]TabletAnchorMapLabAnchor, len(entries)-1)
+	anchors := make([]TabletAnchorMapAnchor, len(entries)-1)
 	for at, entry := range entries {
 		bucket, ok := globalTabletCatalogNodeBucket(
 			header.Level, childLevel, entry.ID,
@@ -433,7 +454,7 @@ func EncodeGlobalTabletCatalogNode(
 			at != 0 && bytes.Compare(entries[at-1].Floor, entry.Floor) >= 0 {
 			return nil, fmt.Errorf("%w: catalog node floor or child ID", ErrInvalidWrite)
 		}
-		for prior := 0; prior < at; prior++ {
+		for prior := range at {
 			if entries[prior].ID == entry.ID {
 				return nil, fmt.Errorf("%w: duplicate catalog child ID", ErrInvalidWrite)
 			}
@@ -448,16 +469,16 @@ func EncodeGlobalTabletCatalogNode(
 			return nil, fmt.Errorf("%w: catalog child reference", ErrInvalidWrite)
 		}
 		if at != 0 {
-			anchors[at-1] = TabletAnchorMapLabAnchor{
+			anchors[at-1] = TabletAnchorMapAnchor{
 				Fence: entry.Floor, Bucket: bucket,
 			}
 		}
 	}
-	common, _, keyBytes, err := tabletAnchorMapLabMeasure(anchors)
+	common, _, keyBytes, err := tabletAnchorMapMeasure(anchors)
 	if err != nil {
 		return nil, err
 	}
-	mapBytes := tabletAnchorMapLabImageBytes(len(anchors), common, keyBytes)
+	mapBytes := tabletAnchorMapImageBytes(len(anchors), common, keyBytes)
 	basePayloadBytes := GlobalTabletCatalogNodePayloadHeaderBytes + mapBytes +
 		len(entries)*GlobalTabletCatalogHandleBytes
 	headBytes := globalTabletCatalogChooseHeadBytes(
@@ -488,9 +509,9 @@ func EncodeGlobalTabletCatalogNode(
 	firstBucket, _ := globalTabletCatalogNodeBucket(
 		header.Level, childLevel, entries[0].ID,
 	)
-	if _, err := EncodeTabletAnchorMapLab(
+	if _, err := EncodeTabletAnchorMap(
 		payload[GlobalTabletCatalogNodePayloadHeaderBytes:GlobalTabletCatalogNodePayloadHeaderBytes+mapBytes],
-		TabletAnchorMapLabHeader{
+		TabletAnchorMapHeader{
 			TabletID: header.LogicalID, Generation: header.Generation,
 		},
 		firstBucket, anchors,
@@ -549,13 +570,13 @@ func OpenGlobalTabletCatalogNode(
 		PageKind(payload[5]) != childKind ||
 		header.LogicalID != wantLogicalID || count == 0 ||
 		childLength != binary.LittleEndian.Uint32(payload[16:20]) ||
-		mapBytes < TabletAnchorMapLabHeaderSize+TabletAnchorMapLabTrailerSize ||
+		mapBytes < TabletAnchorMapHeaderSize+TabletAnchorMapTrailerSize ||
 		GlobalTabletCatalogNodePayloadHeaderBytes+mapBytes+
 			count*(GlobalTabletCatalogHandleBytes+headBytes) != len(payload) {
 		return GlobalTabletCatalogNodeView{},
 			globalTabletCatalogCorrupt("node identity or sections")
 	}
-	floors, err := OpenTabletAnchorMapLab(
+	floors, err := OpenTabletAnchorMap(
 		payload[GlobalTabletCatalogNodePayloadHeaderBytes : GlobalTabletCatalogNodePayloadHeaderBytes+mapBytes],
 	)
 	if err != nil || floors.Header().TabletID != header.LogicalID ||
@@ -578,7 +599,7 @@ func OpenGlobalTabletCatalogNode(
 		return GlobalTabletCatalogNodeView{},
 			globalTabletCatalogCorrupt("node first head")
 	}
-	for ordinal := 0; ordinal < count; ordinal++ {
+	for ordinal := range count {
 		bucket := floors.bucketAt(ordinal)
 		id, ok := globalTabletCatalogNodeID(level, childLevel, bucket)
 		wantChild, childOK := globalTabletCatalogChildLogicalID(
@@ -632,7 +653,7 @@ func AdmittedGlobalTabletCatalogNode(
 	return GlobalTabletCatalogNodeView{
 		image: src[:header.PageSize], payload: payload,
 		handles: payload[handleAt:headAt], heads: payload[headAt:],
-		floors: AdmittedTabletAnchorMapLab(
+		floors: AdmittedTabletAnchorMap(
 			payload[GlobalTabletCatalogNodePayloadHeaderBytes:handleAt],
 		),
 		header: header, level: level, childLevel: childLevel,
@@ -825,7 +846,7 @@ func (v *GlobalTabletCatalogNodeView) RewriteHandles(
 	// that arena after an eligibility error, and the point RewriteHandle API
 	// has always left it untouched on rejection.
 	for rank, rewrite := range rewrites {
-		for prior := 0; prior < rank; prior++ {
+		for prior := range rank {
 			if rewrites[prior].ID == rewrite.ID {
 				return nil, fmt.Errorf(
 					"%w: duplicate catalog COW child",
@@ -873,7 +894,7 @@ func (v *GlobalTabletCatalogNodeView) RewriteHandles(
 	mapBytes := int(binary.LittleEndian.Uint32(payload[12:16]))
 	mapStart := GlobalTabletCatalogNodePayloadHeaderBytes
 	mapEnd := mapStart + mapBytes
-	if mapBytes < TabletAnchorMapLabHeaderSize+TabletAnchorMapLabTrailerSize ||
+	if mapBytes < TabletAnchorMapHeaderSize+TabletAnchorMapTrailerSize ||
 		mapEnd > len(payload) {
 		return nil, globalTabletCatalogCorrupt("COW floor-map geometry")
 	}
@@ -883,9 +904,9 @@ func (v *GlobalTabletCatalogNodeView) RewriteHandles(
 	binary.LittleEndian.PutUint64(
 		payload[mapStart+24:mapStart+32], generation,
 	)
-	tabletAnchorMapLabSeal(payload[mapStart:mapEnd])
+	tabletAnchorMapSeal(payload[mapStart:mapEnd])
 	for rank, rewrite := range rewrites {
-		for prior := 0; prior < rank; prior++ {
+		for prior := range rank {
 			if rewrites[prior].ID == rewrite.ID {
 				return nil, fmt.Errorf(
 					"%w: duplicate catalog COW child",
@@ -1013,6 +1034,36 @@ func EncodeGlobalTabletCatalogLocator(
 	return dst[:GlobalTabletCatalogLocatorBytes], nil
 }
 
+// EncodeGlobalTabletCatalogLocatorPage is the durable-transaction entry point
+// for a rebuilt locator page. It derives the exact page header (logical ID and
+// payload length) for tabletID so the durable structural split/merge writer
+// need not repeat the private packed-locator geometry, and encodes entries into
+// dst, which must be one freshly allocated GlobalTabletCatalogLocatorBytes page.
+func EncodeGlobalTabletCatalogLocatorPage(
+	dst []byte, storeID [16]byte, generation uint64,
+	tabletID uint32, reuseFloor uint64,
+	bounds GlobalTabletCatalogBounds,
+	entries []GlobalTabletCatalogLocatorEntry,
+) ([]byte, error) {
+	logicalID, ok := GlobalTabletCatalogLocatorLogicalID(tabletID)
+	if !ok {
+		return nil, fmt.Errorf(
+			"%w: locator page tablet identity", ErrInvalidWrite,
+		)
+	}
+	return EncodeGlobalTabletCatalogLocator(
+		dst,
+		PageHeader{
+			StoreID: storeID, Generation: generation, LogicalID: logicalID,
+			PageSize: GlobalTabletCatalogLocatorBytes,
+			PayloadLength: GlobalTabletCatalogLocatorHeader +
+				globalTabletCatalogPackedBytes,
+			Kind: PagePrimaryLocator,
+		},
+		bounds, tabletID, reuseFloor, entries,
+	)
+}
+
 func OpenGlobalTabletCatalogLocator(
 	src []byte, expected PageRef, bounds GlobalTabletCatalogBounds,
 ) (GlobalTabletCatalogLocatorView, error) {
@@ -1043,7 +1094,7 @@ func OpenGlobalTabletCatalogLocator(
 		bounds:     bounds,
 	}
 	var live, retired uint16
-	for localID := uint16(0); localID < TabletLocalIdentityLocalCount; localID++ {
+	for localID := range uint16(TabletLocalIdentityLocalCount) {
 		code := globalTabletCatalogGet14(view.packed, localID)
 		state := GlobalTabletCatalogLocatorState(code >> 12)
 		switch state {
@@ -1440,7 +1491,7 @@ func (v *GlobalTabletCatalogTabletRootView) RewriteAnchorHandles(
 				ErrInvalidWrite,
 			)
 		}
-		for prior := 0; prior < rank; prior++ {
+		for prior := range rank {
 			if rewrites[prior].Route.RowSlot == route.RowSlot {
 				return nil, fmt.Errorf(
 					"%w: duplicate global tablet anchor row",
@@ -1518,7 +1569,7 @@ func (v *GlobalTabletCatalogTabletRootView) RewriteAnchorRefs(
 				ErrInvalidWrite,
 			)
 		}
-		for prior := 0; prior < rank; prior++ {
+		for prior := range rank {
 			if rewrites[prior].PageID == rewrite.PageID {
 				return nil, fmt.Errorf(
 					"%w: duplicate global tablet root page",
@@ -1576,6 +1627,25 @@ func (v *GlobalTabletCatalogAnchorView) RouteAt(
 		return SegmentedTabletRouterRoute{}, false
 	}
 	return v.page.routeAt(rank, hash), true
+}
+
+// FenceAt returns a freshly allocated copy of the lexical fence at rank in flat
+// form. Rank 0 of the first anchor page is the empty tablet floor. It is the
+// enumeration counterpart to RouteAt: a structural split/merge transaction
+// rebuilds a tablet from its current leaf set, pairing each RouteAt handle with
+// its fence to feed EncodeSegmentedTabletRouter. The copy is owned by the
+// caller because the source anchor page is retired in the same transaction.
+func (v *GlobalTabletCatalogAnchorView) FenceAt(rank int) ([]byte, bool) {
+	if v == nil {
+		return nil, false
+	}
+	fence, ok := v.page.fenceAtChecked(rank)
+	if !ok {
+		return nil, false
+	}
+	out := make([]byte, fence.length())
+	fence.copyTo(out, 0)
+	return out, true
 }
 
 // ResolveBucket is the posting path. It verifies tablet identity, live locator
@@ -2000,7 +2070,7 @@ func globalTabletCatalogOpenSegmentedRootOnly(
 	}
 	var seen uint16
 	var previous segmentedTabletRouterFence
-	for rank := 0; rank < pageCount; rank++ {
+	for rank := range pageCount {
 		start := int(binary.LittleEndian.Uint16(view.rootOffsets[rank*2:]))
 		end := int(binary.LittleEndian.Uint16(view.rootOffsets[(rank+1)*2:]))
 		pageID := view.rootRanks[rank]
@@ -2023,7 +2093,7 @@ func globalTabletCatalogOpenSegmentedRootOnly(
 		}
 		previous = fence
 	}
-	for pageID := 0; pageID < SegmentedTabletRouterMaxPages; pageID++ {
+	for pageID := range SegmentedTabletRouterMaxPages {
 		start := pageID * segmentedTabletRouterRootRefBytes
 		if seen&(uint16(1)<<pageID) == 0 &&
 			!allZero(view.rootRefs[start:start+segmentedTabletRouterRootRefBytes]) {

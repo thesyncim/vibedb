@@ -143,7 +143,7 @@ func recoverMutableInlineStateRoot(
 	}
 
 	scratchNeed := int(pageSize)
-	for rank := 0; rank < candidateCount; rank++ {
+	for rank := range candidateCount {
 		scratchNeed = max(scratchNeed, inlineRecoveryScratchNeed(candidates[rank].root))
 	}
 	if journalPresent {
@@ -166,13 +166,13 @@ func recoverMutableInlineStateRoot(
 	var exactTargetRootSlots uint8
 	if journalPresent {
 		targetGeneration := journal.Header().TargetGeneration
-		for rank := 0; rank < candidateCount; rank++ {
+		for rank := range candidateCount {
 			if candidates[rank].root.Generation == targetGeneration {
 				exactTargetRootSlots |= uint8(1) << candidates[rank].slot
 			}
 		}
 	}
-	for rank := 0; rank < candidateCount; rank++ {
+	for rank := range candidateCount {
 		candidate := candidates[rank]
 		root := candidate.root
 		if root.PageSize != pageSize || root.FileEnd > fileSize {
@@ -350,7 +350,7 @@ func invalidateRecoveryInlineRoots(
 		return ErrInvalidWrite
 	}
 	wrote := false
-	for slot := 0; slot < superblockCopies; slot++ {
+	for slot := range superblockCopies {
 		if slots&(uint8(1)<<slot) == 0 {
 			continue
 		}

@@ -204,7 +204,7 @@ func storePackedIndexPrefix(entries []storeIndexChunkMask, capacity int) (count,
 	}
 	previous := entries[0].chunk
 	limit := min(len(entries), int(^uint16(0)))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		entry := storeio.PostingEntry{Chunk: entries[i].chunk, Bits: entries[i].mask}
 		size, sizeErr := storeio.PostingEntryEncodedSize(previous, entry, i == 0)
 		if sizeErr != nil {

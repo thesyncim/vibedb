@@ -187,7 +187,7 @@ func TestCommonPrimaryLeafRoundTripAndScan(t *testing.T) {
 				t.Fatal("unexpected miss hit")
 			}
 			it := view.AllRows()
-			for index := 0; index < len(records); index++ {
+			for index := range records {
 				row, ok := it.Next()
 				if !ok || !bytes.Equal(row.Key, records[index].Key) ||
 					!bytes.Equal(row.Value.Inline, records[index].Value.Inline) {

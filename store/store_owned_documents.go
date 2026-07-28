@@ -8,8 +8,8 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storemem"
+	"github.com/thesyncim/vibejson"
 )
 
 // compactDocuments moves a completed builder's exact source bytes and

@@ -162,7 +162,7 @@ func TestPageCatalogFrontCodingAndExactCanonicalGolden(t *testing.T) {
 	cursor := PageCatalogCanonicalHeaderSize
 	previous := ""
 	saved := 0
-	for i := 0; i < stringCount; i++ {
+	for range stringCount {
 		prefix := int(binary.LittleEndian.Uint16(image[cursor : cursor+2]))
 		suffix := int(binary.LittleEndian.Uint16(image[cursor+2 : cursor+4]))
 		value := previous[:prefix] + string(image[cursor+4:cursor+4+suffix])
@@ -482,7 +482,7 @@ func TestPageCatalogSegmentChainRoundTripAndCorruption(t *testing.T) {
 		},
 		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 700; i++ {
+	for i := range 700 {
 		definition.Schema.Fields = append(
 			definition.Schema.Fields,
 			PageCatalogSchemaField{
@@ -673,7 +673,7 @@ func TestPageCatalogSegmentFollowsStoreAllocationQuantum(t *testing.T) {
 	definition := PageCatalogDefinition{
 		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 2_000; i++ {
+	for i := range 2_000 {
 		definition.Schema.Fields = append(
 			definition.Schema.Fields,
 			PageCatalogSchemaField{

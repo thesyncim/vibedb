@@ -7,9 +7,9 @@ import (
 	"runtime"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/storemem"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
-	"github.com/thesyncim/vibedb/internal/storemem"
 )
 
 // storeMappedKeyRef is the compact, pointer-free authority for one key in a
@@ -372,7 +372,7 @@ func (m *storeMappedKeys) insert(hash, ref uint64) bool {
 			matches &= matches - 1
 		}
 		if storeMappedKeyHasEmpty(word) {
-			for lane := uint64(0); lane < storeMappedKeyGroup; lane++ {
+			for lane := range uint64(storeMappedKeyGroup) {
 				controlIndex := index + lane
 				if m.controls[controlIndex] != 0 {
 					continue

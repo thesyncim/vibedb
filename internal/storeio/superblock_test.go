@@ -14,7 +14,7 @@ func TestPageChecksumMatchesStandardLibrary(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i*131 + i>>3)
 	}
-	for alignment := 0; alignment < 16; alignment++ {
+	for alignment := range 16 {
 		for _, size := range []int{0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 119, 120, 127, 128, 255, 256, 257, 511, 512, 1023, 1024, 1025, 4095, 4096, 4097, 64 << 10, 128 << 10} {
 			input := data[alignment : alignment+size]
 			if got, want := PageChecksum(input), crc32.Checksum(input, table); got != want {

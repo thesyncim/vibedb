@@ -272,7 +272,7 @@ func OpenPageCatalogChainAt(
 
 	canonical := make([]byte, int(bounds.TotalBytes))
 	page := scratch[:int(pageSize):int(pageSize)]
-	for ordinal := uint16(0); ordinal < count; ordinal++ {
+	for ordinal := range count {
 		ordinal64 := uint64(ordinal)
 		ref := PageRef{
 			Offset:     head.Offset + ordinal64*uint64(pageSize),

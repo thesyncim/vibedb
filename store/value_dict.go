@@ -171,10 +171,7 @@ func (in *ValueInterner) insert(hash uint32, value string) uint32 {
 		in.grow()
 	}
 	if len(in.chunk)+len(value) > cap(in.chunk) {
-		size := 2 * cap(in.chunk)
-		if size < valueDictMinChunk {
-			size = valueDictMinChunk
-		}
+		size := max(2*cap(in.chunk), valueDictMinChunk)
 		if size > valueDictMaxChunk {
 			size = valueDictMaxChunk
 		}
@@ -202,10 +199,7 @@ func (in *ValueInterner) insert(hash uint32, value string) uint32 {
 // grow doubles the table and reinserts every id from its stored hash. Only slots
 // move; value bytes, identifiers, and counts are untouched.
 func (in *ValueInterner) grow() {
-	size := 2 * len(in.table)
-	if size < valueDictMinTable {
-		size = valueDictMinTable
-	}
+	size := max(2*len(in.table), valueDictMinTable)
 	table := make([]uint32, size)
 	mask := uint32(size - 1)
 	for id, hash := range in.hashes {

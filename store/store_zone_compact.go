@@ -152,11 +152,11 @@ func (z *ZoneSummary) Encode(dst *[ZoneCompactBytes]byte) {
 	if z.overflow {
 		status |= 1 << 2
 	}
-	for i := 0; i < ZoneCompactPaths; i++ {
+	for i := range ZoneCompactPaths {
 		status |= uint16(z.flag[i]&7) << (5 + 3*i)
 	}
 	binary.LittleEndian.PutUint16(dst[0:2], status)
-	for i := 0; i < ZoneCompactPaths; i++ {
+	for i := range ZoneCompactPaths {
 		binary.LittleEndian.PutUint16(dst[2+2*i:4+2*i], z.tag[i])
 		zonePut24(dst[8+3*i:], z.min[i])
 		zonePut24(dst[17+3*i:], z.max[i])
@@ -182,7 +182,7 @@ func (z *ZoneSummary) Decode(src *[ZoneCompactBytes]byte) {
 		*z = ZoneSummary{state: ZoneCompactStale}
 		return
 	}
-	for i := 0; i < ZoneCompactPaths; i++ {
+	for i := range ZoneCompactPaths {
 		z.flag[i] = uint8(status >> (5 + 3*i) & 7)
 		z.tag[i] = binary.LittleEndian.Uint16(src[2+2*i : 4+2*i])
 		z.min[i] = zoneGet24(src[8+3*i:])

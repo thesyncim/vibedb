@@ -80,7 +80,7 @@ func TestStoreBuilderPageArenaAllocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := pages * MaxChunkDocuments
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		if err := builder.Append(fmt.Sprintf("doc:%08d", i), storeBulkDoc(i)); err != nil {
 			t.Fatal(err)
 		}
@@ -181,7 +181,7 @@ func TestStoreBuilderBulkLoadAllocation(t *testing.T) {
 // sealIngest then discarded inside the same rebuild.
 func TestStoreCollectionReplaceAllocation(t *testing.T) {
 	collection := &Collection{}
-	for i := 0; i < MaxChunkDocuments; i++ {
+	for i := range MaxChunkDocuments {
 		if _, err := collection.Put(fmt.Sprintf("k%02d", i), storeBulkDoc(i)); err != nil {
 			t.Fatal(err)
 		}
@@ -217,7 +217,7 @@ func TestStoreCollectionReplaceReservationKeepsExactTapes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			collection := &Collection{}
 			want := make(map[string]string)
-			for i := 0; i < MaxChunkDocuments; i++ {
+			for i := range MaxChunkDocuments {
 				key := fmt.Sprintf("k%02d", i)
 				body := storeBulkDoc(i)
 				if _, err := collection.Put(key, body); err != nil {
@@ -240,7 +240,7 @@ func TestStoreCollectionReplaceReservationKeepsExactTapes(t *testing.T) {
 					`"tags":["a","b","c"],"note":"n"}`)
 			case "longer":
 				body := `{"id":7,"tags":[`
-				for i := 0; i < 400; i++ {
+				for i := range 400 {
 					if i > 0 {
 						body += ","
 					}
@@ -313,7 +313,7 @@ func TestStoreBuilderPageReservationRoundTrips(t *testing.T) {
 			}
 			const rows = 200
 			want := make(map[string]string, rows)
-			for i := 0; i < rows; i++ {
+			for i := range rows {
 				key := fmt.Sprintf("doc:%04d", i)
 				var body []byte
 				switch {
@@ -358,7 +358,7 @@ func TestStoreBuilderPageReservationRoundTrips(t *testing.T) {
 
 func storeBulkRepeat(s string, n int) string {
 	out := make([]byte, 0, len(s)*n)
-	for i := 0; i < n; i++ {
+	for range n {
 		out = append(out, s...)
 	}
 	return string(out)

@@ -367,7 +367,7 @@ func (s *Segment) writeToPersistWriter(pw *persistWriter, base int64) {
 		docOffsets = make([]uint64, docCount)
 	}
 	var narrowTotal uint64
-	for i := 0; i < docCount; i++ {
+	for i := range docCount {
 		docOffsets[i] = pw.writeDocRecord(s, i, shapeID, &narrowTotal, base)
 	}
 
@@ -483,7 +483,7 @@ func (pw *persistWriter) writeTemplateDoc(s *Segment, doc int, template *Documen
 // Open zero-allocation per row and avoids materializing a second tape.
 func (pw *persistWriter) writeNarrowDoc(s *Segment, doc int, ref ShapeTapeRef, entries uint32) {
 	var raw [8]byte
-	for i := uint32(0); i < entries; i++ {
+	for i := range entries {
 		value := s.NarrowAt(doc, ref, int(i))
 		binary.LittleEndian.PutUint32(raw[0:4], value.Span)
 		binary.LittleEndian.PutUint32(raw[4:8], value.Info)
@@ -878,13 +878,13 @@ func (s *Segment) openShapes(table []byte) ([]*ShapeRecord, error) {
 	}
 	recs := make([]*ShapeRecord, 0, shapeCount)
 	var synth []byte
-	for k := uint32(0); k < shapeCount; k++ {
+	for k := range shapeCount {
 		fieldCount := r.u32()
 		if !r.ok || fieldCount == 0 || fieldCount > shapeMaxFields {
 			return nil, fmt.Errorf("%w: shape %d field count %d", ErrPersistCorrupt, k, fieldCount)
 		}
 		synth = append(synth[:0], '{')
-		for m := uint32(0); m < fieldCount; m++ {
+		for m := range fieldCount {
 			rawLen := r.u32()
 			raw := r.bytes(uint64(rawLen))
 			if !r.ok {
@@ -991,7 +991,7 @@ func appendNarrow(dst []ShapeNarrowValue, data []byte, off, count uint64) []Shap
 			return append(dst, unsafe.Slice((*ShapeNarrowValue)(p), int(count))...)
 		}
 	}
-	for i := uint64(0); i < count; i++ {
+	for i := range count {
 		b := data[off+i*8:]
 		dst = append(dst, ShapeNarrowValue{
 			Span: binary.LittleEndian.Uint32(b[0:4]),

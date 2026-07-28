@@ -457,7 +457,7 @@ func validatePageKeyDirectoryHeader(header PageKeyDirectoryHeader, count int, fi
 
 func validateEncodedPageKeyLeaf(payload []byte, count int, header PageKeyDirectoryHeader, fileEnd, nextLogicalID uint64, chunkHighWater, chunkDocuments uint32, kind PageKind) error {
 	var previous PageKeyLocation
-	for i := 0; i < count; i++ {
+	for i := range count {
 		start := PageKeyDirectoryPayloadHeaderSize + i*PageKeyLeafEntrySize
 		entry := PageKeyLocation{
 			Hash:  binary.LittleEndian.Uint64(payload[start : start+8]),
@@ -491,7 +491,7 @@ func PageKeyLeafEncodedSize(entries []PageKeyLocation) int {
 func validateEncodedPageKeyBranch(payload []byte, count int, header PageKeyDirectoryHeader, fileEnd, nextLogicalID uint64, kind PageKind) error {
 	var previous uint64
 	children := newPageKeyBranchRefSet(count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		start := PageKeyDirectoryPayloadHeaderSize + i*PageKeyBranchEntrySize
 		maxHash := binary.LittleEndian.Uint64(payload[start : start+8])
 		encoded := payload[start+8 : start+PageKeyBranchEntrySize]

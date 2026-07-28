@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // storePageDBInsertSlot owns at most one admitted document lease while an

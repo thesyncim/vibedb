@@ -80,7 +80,7 @@ func refIndex(t *testing.T, doc string) vibejson.Index {
 // equal, repeated values.
 func postingsAdversarialCorpus() []string {
 	var docs []string
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		// A recurring flat shape: same key sequence, varying scalar values,
 		// with a repeated enum value across documents.
 		docs = append(docs, fmt.Sprintf(`{"id":%d,"status":%q,"score":%d,"active":%t}`,
@@ -412,7 +412,7 @@ func TestSegmentPostingsExhaustive(t *testing.T) {
 	// shape's document list holds more than one ordinal.
 	var docJSON []string
 	s := &Segment{Postings: true, ShapeTapes: true}
-	for rep := 0; rep < 3; rep++ {
+	for range 3 {
 		for _, d := range universe {
 			docJSON = append(docJSON, string(d.json))
 		}
@@ -421,7 +421,7 @@ func TestSegmentPostingsExhaustive(t *testing.T) {
 
 	// The AST-backed reference, aligned with the tripled ordinal order.
 	asts := make([]*exhaustiveValue, 0, len(docJSON))
-	for rep := 0; rep < 3; rep++ {
+	for range 3 {
 		asts = append(asts, universe...)
 	}
 

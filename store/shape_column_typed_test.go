@@ -85,7 +85,7 @@ func checkTypedField(t *testing.T, cache *ShapeCache, s *Segment, name, label st
 	wantInts, wantIntOK := refFieldInt64(s, name)
 	wantFloats, wantFloatOK := refFieldFloat64(s, name)
 	wantBools, wantBoolOK := refFieldBool(s, name)
-	for pass := 0; pass < 2; pass++ {
+	for pass := range 2 {
 		ints, intOK := cache.AppendFieldInt64(nil, nil, s, name)
 		if len(ints) != s.Len() || len(intOK) != s.Len() {
 			t.Fatalf("%s pass %d: AppendFieldInt64(%q) grew %d cells, %d flags for %d documents",
@@ -194,7 +194,7 @@ func TestAppendFieldTypedDifferential(t *testing.T) {
 func typedColumnMixedValiditySet(t testing.TB, count int) *Segment {
 	t.Helper()
 	docs := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		switch {
 		case i%20 >= 13 && i%20 <= 16: // absent: same width, no "v"
 			docs = append(docs, fmt.Sprintf(`{"pad":%d,"a":1,"b":2}`, i))
@@ -317,10 +317,10 @@ func TestGCCorruptionShapeColumnTyped(t *testing.T) {
 	// tape's last entries. Cell values cover both digit-kernel widths and
 	// the fallback verdicts.
 	var docs []string
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		docs = append(docs, fmt.Sprintf(`{"pre%d":%d,"nested":{"x":1}}`, i, i))
 	}
-	for i := 0; i < 24; i++ {
+	for i := range 24 {
 		docs = append(docs, fmt.Sprintf(
 			`{"q":%d,"f":%d.%02d,"flag":%t,"w":922337203685477580%d}`,
 			i*7-3, i, i%97, i%3 == 0, i%10))
@@ -351,7 +351,7 @@ func TestGCCorruptionShapeColumnTyped(t *testing.T) {
 	const iters = 32
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -360,7 +360,7 @@ func TestGCCorruptionShapeColumnTyped(t *testing.T) {
 			floats := make([]float64, 0, len(docs))
 			bools := make([]bool, 0, len(docs))
 			valid := make([]bool, 0, len(docs))
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(48+id, it)
 				set, err := buildShapeColumnSet(docs, true)
 				if err != nil {

@@ -17,74 +17,86 @@ import (
 // arena limit. If unusually long fences exceed that bound, the tablet must
 // split instead of silently widening every anchor.
 const (
-	TabletAnchorMapLabHeaderSize       = 64
-	TabletAnchorMapLabAcceleratorSlots = 257
-	TabletAnchorMapLabRestart          = 16
-	TabletAnchorMapLabTrailerSize      = 8
-	TabletAnchorMapLabMaxFences        = 65535
+	TabletAnchorMapHeaderSize       = 64
+	TabletAnchorMapAcceleratorSlots = 257
+	TabletAnchorMapRestart          = 16
+	TabletAnchorMapTrailerSize      = 8
+	TabletAnchorMapMaxFences        = 65535
 
-	tabletAnchorMapLabAcceleratorBytes = TabletAnchorMapLabAcceleratorSlots * 2
-	tabletAnchorMapLabMagic            = "AMLAB001"
-	tabletAnchorMapLabVersion          = uint32(1)
+	tabletAnchorMapAcceleratorBytes = TabletAnchorMapAcceleratorSlots * 2
+	tabletAnchorMapMagic            = "AMLAB001"
+	tabletAnchorMapVersion          = uint32(1)
 )
 
 var (
-	ErrTabletAnchorMapLabCorrupt = errors.New(
+	// ErrTabletAnchorMapCorrupt reports that an anchor-map image failed
+	// checksum or structural admission; a rejected image must never be routed.
+	ErrTabletAnchorMapCorrupt = errors.New(
 		"vibejson: corrupt tablet anchor-map lab image",
 	)
-	ErrTabletAnchorMapLabScratch = errors.New(
+	// ErrTabletAnchorMapScratch reports that ApplyBatch was handed a scratch
+	// buffer too small to stage the edited fence set.
+	ErrTabletAnchorMapScratch = errors.New(
 		"vibejson: tablet anchor-map lab scratch is too small",
 	)
-	ErrTabletAnchorHandleLabCorrupt = errors.New(
+	// ErrTabletAnchorHandleCorrupt reports that an anchor-handle image failed
+	// checksum or structural admission.
+	ErrTabletAnchorHandleCorrupt = errors.New(
 		"vibejson: corrupt tablet anchor-handle lab image",
 	)
 )
 
-// TabletAnchorMapLabHeader is the stable identity of one immutable macro
+// TabletAnchorMapHeader is the stable identity of one immutable macro
 // tablet routing image. Hash seeds remain a store-root property and are not
 // repeated in every tablet.
-type TabletAnchorMapLabHeader struct {
+type TabletAnchorMapHeader struct {
 	TabletID   uint64
 	Generation uint64
 }
 
-// TabletAnchorMapLabAnchor is one right-hand interval fence and the stable
+// TabletAnchorMapAnchor is one right-hand interval fence and the stable
 // bucket entered at that fence. The first bucket covers (-infinity, fence[0]).
-type TabletAnchorMapLabAnchor struct {
+type TabletAnchorMapAnchor struct {
 	Fence  []byte
 	Bucket BucketID
 }
 
-type TabletAnchorMapLabEditOperation uint8
+// TabletAnchorMapEditOperation names the structural change one canonical edit
+// applies to a fence.
+type TabletAnchorMapEditOperation uint8
 
 const (
-	TabletAnchorMapLabInsert TabletAnchorMapLabEditOperation = iota + 1
-	TabletAnchorMapLabDelete
-	TabletAnchorMapLabReplace
+	// TabletAnchorMapInsert adds a new fence and the bucket entered at it.
+	TabletAnchorMapInsert TabletAnchorMapEditOperation = iota + 1
+	// TabletAnchorMapDelete removes a fence and folds its right-hand bucket
+	// into the preceding interval.
+	TabletAnchorMapDelete
+	// TabletAnchorMapReplace keeps a fence but changes the bucket it enters.
+	TabletAnchorMapReplace
 )
 
-// TabletAnchorMapLabEdit is one canonical structural edit. Edits must be in
+// TabletAnchorMapEdit is one canonical structural edit. Edits must be in
 // strict fence order. Delete removes the right-hand bucket at Fence; Replace
 // preserves the fence while changing that bucket. Ordinary document writes do
 // not touch this map.
-type TabletAnchorMapLabEdit struct {
-	Operation TabletAnchorMapLabEditOperation
+type TabletAnchorMapEdit struct {
+	Operation TabletAnchorMapEditOperation
 	Fence     []byte
 	Bucket    BucketID
 }
 
-// TabletAnchorMapLabRoute carries the hash needed by the ordered leaf, so a
+// TabletAnchorMapRoute carries the hash needed by the ordered leaf, so a
 // caller that starts at the lexical router never hashes the primary key twice.
-type TabletAnchorMapLabRoute struct {
+type TabletAnchorMapRoute struct {
 	Bucket  BucketID
 	Hash    uint64
 	Ordinal uint16
 }
 
-// TabletAnchorMapLabView borrows one checksum- and structure-admitted image.
+// TabletAnchorMapView borrows one checksum- and structure-admitted image.
 // Every read method is allocation-free.
-type TabletAnchorMapLabView struct {
-	header       TabletAnchorMapLabHeader
+type TabletAnchorMapView struct {
+	header       TabletAnchorMapHeader
 	image        []byte
 	accelerator  []byte
 	common       []byte
@@ -96,10 +108,10 @@ type TabletAnchorMapLabView struct {
 	commonLength uint16
 }
 
-// TabletAnchorMapLabCursor walks stable bucket identities in lexical interval
+// TabletAnchorMapCursor walks stable bucket identities in lexical interval
 // order. It never follows leaf sibling PageRefs.
-type TabletAnchorMapLabCursor struct {
-	view    TabletAnchorMapLabView
+type TabletAnchorMapCursor struct {
+	view    TabletAnchorMapView
 	ordinal uint16
 	valid   bool
 }
@@ -114,34 +126,40 @@ type TabletAnchorMapLabCursor struct {
 // BucketID, Kind is fixed by the tablet, and flags are zero. Four opaque zone
 // bytes bring the exact handle to 17 bytes.
 const (
-	TabletAnchorHandleLabHeaderSize  = 64
-	TabletAnchorHandleLabHandleSize  = 17
-	TabletAnchorHandleLabTrailerSize = 8
+	TabletAnchorHandleHeaderSize  = 64
+	TabletAnchorHandleHandleSize  = 17
+	TabletAnchorHandleTrailerSize = 8
 
-	tabletAnchorHandleLabMagic   = "AHLAB001"
-	tabletAnchorHandleLabVersion = uint32(1)
-	tabletAnchorHandleLabMissing = uint16(0xffff)
-	tabletAnchorHandleLabMaxPage = uint64(1) << 48
+	tabletAnchorHandleMagic   = "AHLAB001"
+	tabletAnchorHandleVersion = uint32(1)
+	tabletAnchorHandleMissing = uint16(0xffff)
+	tabletAnchorHandleMaxPage = uint64(1) << 48
 )
 
-type TabletAnchorHandleLabLeaf struct {
+// TabletAnchorHandleLeaf is one bucket's current physical binding: the stable
+// BucketID, the PageRef of the leaf that presently holds it, and the zone
+// summary that lets scans prune the leaf without reading it.
+type TabletAnchorHandleLeaf struct {
 	Bucket BucketID
 	Ref    PageRef
 	Zone   BucketZone
 }
 
-type TabletAnchorHandleLabRoute struct {
-	TabletAnchorMapLabRoute
+// TabletAnchorHandleRoute is a lexical route resolved to physical state: the
+// fence route plus the current leaf PageRef and its zone summary, so one lookup
+// yields both the logical bucket and where to read it.
+type TabletAnchorHandleRoute struct {
+	TabletAnchorMapRoute
 	Ref  PageRef
 	Zone BucketZone
 }
 
-// TabletAnchorHandleLabView binds one lexical fence image to its compact
+// TabletAnchorHandleView binds one lexical fence image to its compact
 // current handles and dense LocalLeafID resolver. The dense value is a stable
 // anchor-page/slot locator in the segmented design; this monolithic lab spells
 // the same 16-bit field as a lexical ordinal to isolate lookup cost.
-type TabletAnchorHandleLabView struct {
-	anchors   TabletAnchorMapLabView
+type TabletAnchorHandleView struct {
+	anchors   TabletAnchorMapView
 	image     []byte
 	locators  []byte
 	handles   []byte
@@ -150,24 +168,24 @@ type TabletAnchorHandleLabView struct {
 	leafKind  PageKind
 }
 
-// EncodeTabletAnchorMapLab writes one exact immutable image. Anchors must be
+// EncodeTabletAnchorMap writes one exact immutable image. Anchors must be
 // strictly ordered by Fence. The returned slice aliases dst.
-func EncodeTabletAnchorMapLab(
+func EncodeTabletAnchorMap(
 	dst []byte,
-	header TabletAnchorMapLabHeader,
+	header TabletAnchorMapHeader,
 	firstBucket BucketID,
-	anchors []TabletAnchorMapLabAnchor,
+	anchors []TabletAnchorMapAnchor,
 ) ([]byte, error) {
 	if header.TabletID == 0 || header.Generation == 0 ||
 		uint32(firstBucket) >= PrimaryBucketIDLimit ||
-		len(anchors) > TabletAnchorMapLabMaxFences {
+		len(anchors) > TabletAnchorMapMaxFences {
 		return nil, fmt.Errorf("%w: anchor-map identity or count", ErrInvalidWrite)
 	}
-	commonLength, maxFence, keyBytes, err := tabletAnchorMapLabMeasure(anchors)
+	commonLength, maxFence, keyBytes, err := tabletAnchorMapMeasure(anchors)
 	if err != nil {
 		return nil, err
 	}
-	total := tabletAnchorMapLabImageBytes(
+	total := tabletAnchorMapImageBytes(
 		len(anchors), commonLength, keyBytes,
 	)
 	if len(dst) < total {
@@ -178,13 +196,13 @@ func EncodeTabletAnchorMapLab(
 	}
 	image := dst[:total]
 	clear(image)
-	tabletAnchorMapLabWriteHeader(
+	tabletAnchorMapWriteHeader(
 		image, header, len(anchors), commonLength, maxFence, keyBytes,
 	)
-	layout := tabletAnchorMapLabLayoutFor(
+	layout := tabletAnchorMapLayoutFor(
 		len(anchors), commonLength, keyBytes,
 	)
-	accelerator := image[TabletAnchorMapLabHeaderSize:layout.commonAt]
+	accelerator := image[TabletAnchorMapHeaderSize:layout.commonAt]
 	common := image[layout.commonAt:layout.offsetsAt]
 	offsets := image[layout.offsetsAt:layout.bucketsAt]
 	buckets := image[layout.bucketsAt:layout.keysAt]
@@ -210,17 +228,17 @@ func EncodeTabletAnchorMapLab(
 			buckets[(rank+1)*4:], uint32(anchor.Bucket),
 		)
 		shared := 0
-		if rank%TabletAnchorMapLabRestart == 0 {
+		if rank%TabletAnchorMapRestart == 0 {
 			restart = stripped
 		} else {
-			shared = tabletAnchorMapLabPrefix(restart, stripped)
+			shared = tabletAnchorMapPrefix(restart, stripped)
 		}
 		binary.LittleEndian.PutUint16(keys[keyAt:keyAt+2], uint16(shared))
 		keyAt += 2
 		copy(keys[keyAt:], stripped[shared:])
 		keyAt += len(stripped) - shared
 	}
-	for acceleratorByte < TabletAnchorMapLabAcceleratorSlots {
+	for acceleratorByte < TabletAnchorMapAcceleratorSlots {
 		binary.LittleEndian.PutUint16(
 			accelerator[acceleratorByte*2:], uint16(len(anchors)),
 		)
@@ -229,25 +247,25 @@ func EncodeTabletAnchorMapLab(
 	binary.LittleEndian.PutUint16(
 		offsets[len(anchors)*2:], uint16(keyAt),
 	)
-	tabletAnchorMapLabSeal(image)
+	tabletAnchorMapSeal(image)
 	return image, nil
 }
 
-// OpenTabletAnchorMapLab verifies checksum, canonical section geometry,
+// OpenTabletAnchorMap verifies checksum, canonical section geometry,
 // accelerator ranks, front coding, strict lexical ordering, and every 30-bit
 // BucketID before returning a borrowed view.
-func OpenTabletAnchorMapLab(src []byte) (TabletAnchorMapLabView, error) {
-	if len(src) < TabletAnchorMapLabHeaderSize+
-		tabletAnchorMapLabAcceleratorBytes+4+TabletAnchorMapLabTrailerSize ||
-		string(src[0:8]) != tabletAnchorMapLabMagic ||
-		binary.LittleEndian.Uint32(src[8:12]) != tabletAnchorMapLabVersion ||
+func OpenTabletAnchorMap(src []byte) (TabletAnchorMapView, error) {
+	if len(src) < TabletAnchorMapHeaderSize+
+		tabletAnchorMapAcceleratorBytes+4+TabletAnchorMapTrailerSize ||
+		string(src[0:8]) != tabletAnchorMapMagic ||
+		binary.LittleEndian.Uint32(src[8:12]) != tabletAnchorMapVersion ||
 		binary.LittleEndian.Uint16(src[12:14]) !=
-			TabletAnchorMapLabHeaderSize ||
-		src[14] != TabletAnchorMapLabRestart ||
+			TabletAnchorMapHeaderSize ||
+		src[14] != TabletAnchorMapRestart ||
 		src[15] != 0 {
-		return TabletAnchorMapLabView{}, tabletAnchorMapLabCorrupt("header")
+		return TabletAnchorMapView{}, tabletAnchorMapCorrupt("header")
 	}
-	header := TabletAnchorMapLabHeader{
+	header := TabletAnchorMapHeader{
 		TabletID:   binary.LittleEndian.Uint64(src[16:24]),
 		Generation: binary.LittleEndian.Uint64(src[24:32]),
 	}
@@ -257,26 +275,26 @@ func OpenTabletAnchorMapLab(src []byte) (TabletAnchorMapLabView, error) {
 	keyBytes := int(binary.LittleEndian.Uint16(src[38:40]))
 	imageBytes := int(binary.LittleEndian.Uint32(src[40:44]))
 	if header.TabletID == 0 || header.Generation == 0 ||
-		imageBytes != len(src) || !allZero(src[44:TabletAnchorMapLabHeaderSize]) {
-		return TabletAnchorMapLabView{}, tabletAnchorMapLabCorrupt(
+		imageBytes != len(src) || !allZero(src[44:TabletAnchorMapHeaderSize]) {
+		return TabletAnchorMapView{}, tabletAnchorMapCorrupt(
 			"identity, length, or reserved bytes",
 		)
 	}
-	layout := tabletAnchorMapLabLayoutFor(
+	layout := tabletAnchorMapLayoutFor(
 		fenceCount, commonLength, keyBytes,
 	)
-	if layout.trailerAt+TabletAnchorMapLabTrailerSize != len(src) {
-		return TabletAnchorMapLabView{}, tabletAnchorMapLabCorrupt("section geometry")
+	if layout.trailerAt+TabletAnchorMapTrailerSize != len(src) {
+		return TabletAnchorMapView{}, tabletAnchorMapCorrupt("section geometry")
 	}
 	checksum := binary.LittleEndian.Uint32(src[layout.trailerAt:])
 	if binary.LittleEndian.Uint32(src[layout.trailerAt+4:]) != ^checksum ||
 		PageChecksum(src[:layout.trailerAt]) != checksum {
-		return TabletAnchorMapLabView{}, tabletAnchorMapLabCorrupt("checksum")
+		return TabletAnchorMapView{}, tabletAnchorMapCorrupt("checksum")
 	}
-	view := TabletAnchorMapLabView{
+	view := TabletAnchorMapView{
 		header:       header,
 		image:        src,
-		accelerator:  src[TabletAnchorMapLabHeaderSize:layout.commonAt],
+		accelerator:  src[TabletAnchorMapHeaderSize:layout.commonAt],
 		common:       src[layout.commonAt:layout.offsetsAt],
 		offsets:      src[layout.offsetsAt:layout.bucketsAt],
 		buckets:      src[layout.bucketsAt:layout.keysAt],
@@ -286,29 +304,29 @@ func OpenTabletAnchorMapLab(src []byte) (TabletAnchorMapLabView, error) {
 		commonLength: uint16(commonLength),
 	}
 	if err := view.validateCanonical(); err != nil {
-		return TabletAnchorMapLabView{}, err
+		return TabletAnchorMapView{}, err
 	}
 	return view, nil
 }
 
-// AdmittedTabletAnchorMapLab reconstructs a view whose checksum, section
+// AdmittedTabletAnchorMap reconstructs a view whose checksum, section
 // geometry, accelerators, front coding, ordering, and bucket identities were
 // already validated by the admitting page cache. Calling it on arbitrary
 // bytes is invalid.
-func AdmittedTabletAnchorMapLab(src []byte) TabletAnchorMapLabView {
+func AdmittedTabletAnchorMap(src []byte) TabletAnchorMapView {
 	fenceCount := int(binary.LittleEndian.Uint16(src[32:34]))
 	commonLength := int(binary.LittleEndian.Uint16(src[34:36]))
 	keyBytes := int(binary.LittleEndian.Uint16(src[38:40]))
-	layout := tabletAnchorMapLabLayoutFor(
+	layout := tabletAnchorMapLayoutFor(
 		fenceCount, commonLength, keyBytes,
 	)
-	return TabletAnchorMapLabView{
-		header: TabletAnchorMapLabHeader{
+	return TabletAnchorMapView{
+		header: TabletAnchorMapHeader{
 			TabletID:   binary.LittleEndian.Uint64(src[16:24]),
 			Generation: binary.LittleEndian.Uint64(src[24:32]),
 		},
 		image:        src,
-		accelerator:  src[TabletAnchorMapLabHeaderSize:layout.commonAt],
+		accelerator:  src[TabletAnchorMapHeaderSize:layout.commonAt],
 		common:       src[layout.commonAt:layout.offsetsAt],
 		offsets:      src[layout.offsetsAt:layout.bucketsAt],
 		buckets:      src[layout.bucketsAt:layout.keysAt],
@@ -319,26 +337,35 @@ func AdmittedTabletAnchorMapLab(src []byte) TabletAnchorMapLabView {
 	}
 }
 
-func (v TabletAnchorMapLabView) Header() TabletAnchorMapLabHeader {
+// Header returns the tablet identity and generation this image was sealed with.
+func (v TabletAnchorMapView) Header() TabletAnchorMapHeader {
 	return v.header
 }
 
-func (v TabletAnchorMapLabView) FenceCount() int {
+// FenceCount returns the number of interval fences, which is one fewer than the
+// number of buckets the map routes to.
+func (v TabletAnchorMapView) FenceCount() int {
 	return int(v.fenceCount)
 }
 
-func (v TabletAnchorMapLabView) BucketCount() int {
+// BucketCount returns the number of stable buckets the map routes to, or zero
+// for an empty image.
+func (v TabletAnchorMapView) BucketCount() int {
 	if len(v.image) == 0 {
 		return 0
 	}
 	return int(v.fenceCount) + 1
 }
 
-func (v TabletAnchorMapLabView) PersistentBytes() []byte {
+// PersistentBytes returns the borrowed on-disk image. It aliases the admitted
+// page and must not be mutated or retained past the page's lease.
+func (v TabletAnchorMapView) PersistentBytes() []byte {
 	return v.image
 }
 
-func (v TabletAnchorMapLabView) BytesPerAnchor() float64 {
+// BytesPerAnchor reports the sealed image size amortized over its fences, a
+// space-accounting probe used by benchmarks rather than the read path.
+func (v TabletAnchorMapView) BytesPerAnchor() float64 {
 	if v.fenceCount == 0 {
 		return 0
 	}
@@ -347,20 +374,20 @@ func (v TabletAnchorMapLabView) BytesPerAnchor() float64 {
 
 // Route hashes key exactly once and returns both the lexical interval and the
 // hash consumed by the ordered leaf.
-func (v TabletAnchorMapLabView) Route(
+func (v TabletAnchorMapView) Route(
 	seed [16]byte, key []byte,
-) TabletAnchorMapLabRoute {
+) TabletAnchorMapRoute {
 	hash := KeyHashBytes(seed, key)
 	return v.RouteHashed(hash, key)
 }
 
 // RouteHashed reuses a hash already computed by a batch router or exact-index
 // path. Tags never determine identity; the ordered leaf still verifies key.
-func (v TabletAnchorMapLabView) RouteHashed(
+func (v TabletAnchorMapView) RouteHashed(
 	hash uint64, key []byte,
-) TabletAnchorMapLabRoute {
+) TabletAnchorMapRoute {
 	ordinal := v.upperBound(key)
-	return TabletAnchorMapLabRoute{
+	return TabletAnchorMapRoute{
 		Bucket:  v.bucketAt(ordinal),
 		Hash:    hash,
 		Ordinal: uint16(ordinal),
@@ -371,32 +398,38 @@ func (v TabletAnchorMapLabView) RouteHashed(
 // interval. A shortened separator can leave a keyless gap after the left leaf;
 // if that leaf is exhausted, Next advances by anchor order, never a sibling
 // pointer.
-func (v TabletAnchorMapLabView) LowerBound(
+func (v TabletAnchorMapView) LowerBound(
 	target []byte,
-) TabletAnchorMapLabCursor {
+) TabletAnchorMapCursor {
 	if len(v.image) == 0 {
-		return TabletAnchorMapLabCursor{}
+		return TabletAnchorMapCursor{}
 	}
-	return TabletAnchorMapLabCursor{
+	return TabletAnchorMapCursor{
 		view: v, ordinal: uint16(v.upperBound(target)), valid: true,
 	}
 }
 
-func (c *TabletAnchorMapLabCursor) Bucket() (BucketID, bool) {
+// Bucket returns the stable BucketID at the cursor's current interval, or false
+// once the cursor is exhausted.
+func (c *TabletAnchorMapCursor) Bucket() (BucketID, bool) {
 	if c == nil || !c.valid {
 		return 0, false
 	}
 	return c.view.bucketAt(int(c.ordinal)), true
 }
 
-func (c *TabletAnchorMapLabCursor) Ordinal() (int, bool) {
+// Ordinal returns the cursor's current lexical position, or false once the
+// cursor is exhausted.
+func (c *TabletAnchorMapCursor) Ordinal() (int, bool) {
 	if c == nil || !c.valid {
 		return 0, false
 	}
 	return int(c.ordinal), true
 }
 
-func (c *TabletAnchorMapLabCursor) Next() bool {
+// Next advances to the next interval in lexical order and reports whether one
+// exists, invalidating the cursor when it walks off the end.
+func (c *TabletAnchorMapCursor) Next() bool {
 	if c == nil || !c.valid ||
 		int(c.ordinal)+1 >= c.view.BucketCount() {
 		if c != nil {
@@ -411,7 +444,7 @@ func (c *TabletAnchorMapLabCursor) Next() bool {
 // FenceAt returns one borrowed, non-contiguous fence spelling. The common,
 // restart-prefix, and suffix parts concatenate to the exact fence without
 // reconstruction or allocation.
-func (v TabletAnchorMapLabView) FenceAt(
+func (v TabletAnchorMapView) FenceAt(
 	rank int,
 ) (common, restartPrefix, suffix []byte, ok bool) {
 	if rank < 0 || rank >= int(v.fenceCount) {
@@ -424,22 +457,22 @@ func (v TabletAnchorMapLabView) FenceAt(
 // ApplyBatch performs one immutable structural rewrite with caller-owned
 // scratch. scratch must hold two maximum-length fences. Inserts and deletes
 // change only stable BucketID order; the physical BucketMap is independent.
-func (v TabletAnchorMapLabView) ApplyBatch(
+func (v TabletAnchorMapView) ApplyBatch(
 	dst, scratch []byte,
 	generation uint64,
-	edits []TabletAnchorMapLabEdit,
+	edits []TabletAnchorMapEdit,
 ) ([]byte, error) {
 	if len(v.image) == 0 || generation <= v.header.Generation {
 		return nil, fmt.Errorf("%w: anchor-map generation", ErrInvalidWrite)
 	}
 	maxFence := int(v.maxFence)
-	if err := tabletAnchorMapLabValidateEdits(edits, &maxFence); err != nil {
+	if err := tabletAnchorMapValidateEdits(edits, &maxFence); err != nil {
 		return nil, err
 	}
 	if maxFence != 0 && len(scratch) < maxFence*2 {
 		return nil, fmt.Errorf(
 			"%w: have %d bytes, need %d",
-			ErrTabletAnchorMapLabScratch, len(scratch), maxFence*2,
+			ErrTabletAnchorMapScratch, len(scratch), maxFence*2,
 		)
 	}
 	base := scratch[:maxFence:maxFence]
@@ -451,24 +484,24 @@ func (v TabletAnchorMapLabView) ApplyBatch(
 	needsMeasure := v.fenceCount == 0
 	for _, edit := range edits {
 		switch edit.Operation {
-		case TabletAnchorMapLabInsert:
+		case TabletAnchorMapInsert:
 			count++
 			if !bytes.HasPrefix(edit.Fence, v.common) {
 				needsMeasure = true
 			}
 			measuredMax = max(measuredMax, len(edit.Fence))
-		case TabletAnchorMapLabDelete:
+		case TabletAnchorMapDelete:
 			count--
 			// Removing the shortest or a common-prefix-limiting fence may
 			// change both canonical prefix length and maximum length.
 			needsMeasure = true
 		}
 	}
-	if count < 0 || count > TabletAnchorMapLabMaxFences {
+	if count < 0 || count > TabletAnchorMapMaxFences {
 		return nil, fmt.Errorf("%w: anchor fence count", ErrInvalidWrite)
 	}
 
-	merged := tabletAnchorMapLabMerge{view: v, edits: edits, work: work}
+	merged := tabletAnchorMapMerge{view: v, edits: edits, work: work}
 	if needsMeasure {
 		count, measuredMax = 0, 0
 		minimum := 0
@@ -487,13 +520,13 @@ func (v TabletAnchorMapLabView) ApplyBatch(
 			} else {
 				commonLength = min(
 					commonLength,
-					tabletAnchorMapLabPrefix(base[:commonLength], fence),
+					tabletAnchorMapPrefix(base[:commonLength], fence),
 				)
 				minimum = min(minimum, len(fence))
 			}
 			measuredMax = max(measuredMax, len(fence))
 			count++
-			if count > TabletAnchorMapLabMaxFences {
+			if count > TabletAnchorMapMaxFences {
 				return nil, fmt.Errorf(
 					"%w: too many anchor fences", ErrInvalidWrite,
 				)
@@ -510,20 +543,20 @@ func (v TabletAnchorMapLabView) ApplyBatch(
 	// encode directly and discover the exact trailer position. Insert/replace
 	// split batches whose fences retain the existing common prefix take only
 	// this single merge pass.
-	layout := tabletAnchorMapLabLayoutFor(count, commonLength, 0)
-	if len(dst) < layout.keysAt+TabletAnchorMapLabTrailerSize {
+	layout := tabletAnchorMapLayoutFor(count, commonLength, 0)
+	if len(dst) < layout.keysAt+TabletAnchorMapTrailerSize {
 		return nil, fmt.Errorf(
 			"%w: anchor-map buffer has %d bytes, need at least %d",
 			ErrInvalidWrite, len(dst),
-			layout.keysAt+TabletAnchorMapLabTrailerSize,
+			layout.keysAt+TabletAnchorMapTrailerSize,
 		)
 	}
 	clear(dst[:layout.keysAt])
-	accelerator := dst[TabletAnchorMapLabHeaderSize:layout.commonAt]
+	accelerator := dst[TabletAnchorMapHeaderSize:layout.commonAt]
 	common := dst[layout.commonAt:layout.offsetsAt]
 	offsets := dst[layout.offsetsAt:layout.bucketsAt]
 	buckets := dst[layout.bucketsAt:layout.keysAt]
-	keys := dst[layout.keysAt : len(dst)-TabletAnchorMapLabTrailerSize]
+	keys := dst[layout.keysAt : len(dst)-TabletAnchorMapTrailerSize]
 	if commonLength != 0 {
 		if needsMeasure {
 			copy(common, base[:commonLength])
@@ -556,11 +589,11 @@ func (v TabletAnchorMapLabView) ApplyBatch(
 			buckets[(rank+1)*4:], uint32(bucket),
 		)
 		shared := 0
-		if rank%TabletAnchorMapLabRestart == 0 {
+		if rank%TabletAnchorMapRestart == 0 {
 			copy(base, stripped)
 			restartLength = len(stripped)
 		} else {
-			shared = tabletAnchorMapLabPrefix(
+			shared = tabletAnchorMapPrefix(
 				base[:restartLength], stripped,
 			)
 		}
@@ -578,36 +611,36 @@ func (v TabletAnchorMapLabView) ApplyBatch(
 		keyAt += len(stripped) - shared
 		rank++
 	}
-	for acceleratorByte < TabletAnchorMapLabAcceleratorSlots {
+	for acceleratorByte < TabletAnchorMapAcceleratorSlots {
 		binary.LittleEndian.PutUint16(
 			accelerator[acceleratorByte*2:], uint16(count),
 		)
 		acceleratorByte++
 	}
 	binary.LittleEndian.PutUint16(offsets[count*2:], uint16(keyAt))
-	total := layout.keysAt + keyAt + TabletAnchorMapLabTrailerSize
+	total := layout.keysAt + keyAt + TabletAnchorMapTrailerSize
 	image := dst[:total]
-	tabletAnchorMapLabWriteHeader(
+	tabletAnchorMapWriteHeader(
 		image,
-		TabletAnchorMapLabHeader{
+		TabletAnchorMapHeader{
 			TabletID: v.header.TabletID, Generation: generation,
 		},
 		count, commonLength, measuredMax, keyAt,
 	)
-	tabletAnchorMapLabSeal(image)
+	tabletAnchorMapSeal(image)
 	return image, nil
 }
 
-// ShortestTabletAnchorMapLabFence derives the shortest prefix of rightMin that
+// ShortestTabletAnchorMapFence derives the shortest prefix of rightMin that
 // is strictly greater than leftMax. The returned fence is <= rightMin, so it
 // cannot route any right-leaf key left.
-func ShortestTabletAnchorMapLabFence(
+func ShortestTabletAnchorMapFence(
 	dst, leftMax, rightMin []byte,
 ) ([]byte, error) {
 	if bytes.Compare(leftMax, rightMin) >= 0 {
 		return nil, fmt.Errorf("%w: overlapping split ranges", ErrInvalidWrite)
 	}
-	length := tabletAnchorMapLabPrefix(leftMax, rightMin) + 1
+	length := tabletAnchorMapPrefix(leftMax, rightMin) + 1
 	if len(dst) < length {
 		return nil, fmt.Errorf(
 			"%w: split-fence buffer has %d bytes, need %d",
@@ -631,6 +664,9 @@ func ComposeTabletAnchorBucketID(
 	return BucketID(tabletID<<localBits | uint32(localID)), true
 }
 
+// SplitTabletAnchorBucketID inverts ComposeTabletAnchorBucketID, recovering the
+// tablet ID and local leaf ID from a BucketID given the tablet's local-ID bit
+// width. It returns false for an out-of-range width or bucket.
 func SplitTabletAnchorBucketID(
 	bucket BucketID, localBits uint8,
 ) (tabletID uint32, localID uint16, ok bool) {
@@ -642,16 +678,16 @@ func SplitTabletAnchorBucketID(
 	return uint32(bucket) >> localBits, uint16(uint32(bucket) & mask), true
 }
 
-// EncodeTabletAnchorHandlesLab writes every current PageRef/zone exactly once
+// EncodeTabletAnchorHandles writes every current PageRef/zone exactly once
 // and a dense LocalLeafID resolver. The fence image remains separate only so
 // benchmarks can compare the old and combined physical charges; the segmented
 // production codec interleaves each handle with its fence row.
-func EncodeTabletAnchorHandlesLab(
+func EncodeTabletAnchorHandles(
 	dst []byte,
-	anchors TabletAnchorMapLabView,
+	anchors TabletAnchorMapView,
 	localBits uint8,
 	leafKind PageKind,
-	leaves []TabletAnchorHandleLabLeaf,
+	leaves []TabletAnchorHandleLeaf,
 ) ([]byte, error) {
 	if len(anchors.image) == 0 || anchors.header.TabletID >
 		uint64(^uint32(0)) ||
@@ -665,9 +701,9 @@ func EncodeTabletAnchorHandlesLab(
 	}
 	tabletID := uint32(anchors.header.TabletID)
 	locatorBytes := (1 << localBits) * 2
-	total := TabletAnchorHandleLabHeaderSize + locatorBytes +
-		len(leaves)*TabletAnchorHandleLabHandleSize +
-		TabletAnchorHandleLabTrailerSize
+	total := TabletAnchorHandleHeaderSize + locatorBytes +
+		len(leaves)*TabletAnchorHandleHandleSize +
+		TabletAnchorHandleTrailerSize
 	if len(dst) < total {
 		return nil, fmt.Errorf(
 			"%w: anchor-handle buffer has %d bytes, need %d",
@@ -676,19 +712,19 @@ func EncodeTabletAnchorHandlesLab(
 	}
 	image := dst[:total]
 	clear(image)
-	copy(image[0:8], tabletAnchorHandleLabMagic)
+	copy(image[0:8], tabletAnchorHandleMagic)
 	binary.LittleEndian.PutUint32(
-		image[8:12], tabletAnchorHandleLabVersion,
+		image[8:12], tabletAnchorHandleVersion,
 	)
 	binary.LittleEndian.PutUint16(
-		image[12:14], TabletAnchorHandleLabHeaderSize,
+		image[12:14], TabletAnchorHandleHeaderSize,
 	)
 	image[14] = localBits
 	image[15] = byte(leafKind)
 	binary.LittleEndian.PutUint32(image[16:20], tabletID)
 	binary.LittleEndian.PutUint16(image[20:22], uint16(len(leaves)))
 	binary.LittleEndian.PutUint16(
-		image[22:24], TabletAnchorHandleLabHandleSize,
+		image[22:24], TabletAnchorHandleHandleSize,
 	)
 	binary.LittleEndian.PutUint64(
 		image[24:32], anchors.header.Generation,
@@ -697,11 +733,11 @@ func EncodeTabletAnchorHandlesLab(
 	binary.LittleEndian.PutUint32(
 		image[36:40], PageChecksum(anchors.image),
 	)
-	locators := image[TabletAnchorHandleLabHeaderSize : TabletAnchorHandleLabHeaderSize+locatorBytes]
+	locators := image[TabletAnchorHandleHeaderSize : TabletAnchorHandleHeaderSize+locatorBytes]
 	for at := range locators {
 		locators[at] = 0xff
 	}
-	handles := image[TabletAnchorHandleLabHeaderSize+locatorBytes : total-TabletAnchorHandleLabTrailerSize]
+	handles := image[TabletAnchorHandleHeaderSize+locatorBytes : total-TabletAnchorHandleTrailerSize]
 	for ordinal, leaf := range leaves {
 		if leaf.Bucket != anchors.bucketAt(ordinal) {
 			return nil, fmt.Errorf(
@@ -713,12 +749,12 @@ func EncodeTabletAnchorHandlesLab(
 		)
 		if !ok || bucketTablet != tabletID ||
 			binary.LittleEndian.Uint16(locators[int(localID)*2:]) !=
-				tabletAnchorHandleLabMissing {
+				tabletAnchorHandleMissing {
 			return nil, fmt.Errorf(
 				"%w: duplicate or foreign local leaf", ErrInvalidWrite,
 			)
 		}
-		if err := tabletAnchorHandleLabValidateRef(
+		if err := tabletAnchorHandleValidateRef(
 			leaf.Ref, leaf.Bucket, leafKind,
 		); err != nil {
 			return nil, err
@@ -726,33 +762,33 @@ func EncodeTabletAnchorHandlesLab(
 		binary.LittleEndian.PutUint16(
 			locators[int(localID)*2:], uint16(ordinal),
 		)
-		tabletAnchorHandleLabEncode(
-			handles[ordinal*TabletAnchorHandleLabHandleSize:],
+		tabletAnchorHandleEncode(
+			handles[ordinal*TabletAnchorHandleHandleSize:],
 			leaf.Ref, leaf.Zone,
 		)
 	}
-	tabletAnchorHandleLabSeal(image)
+	tabletAnchorHandleSeal(image)
 	return image, nil
 }
 
-// OpenTabletAnchorHandlesLab binds a compact handle image to the exact
+// OpenTabletAnchorHandles binds a compact handle image to the exact
 // checksum-admitted fence map and validates the complete dense inverse map.
-func OpenTabletAnchorHandlesLab(
+func OpenTabletAnchorHandles(
 	src []byte,
-	anchors TabletAnchorMapLabView,
-) (TabletAnchorHandleLabView, error) {
-	if len(src) < TabletAnchorHandleLabHeaderSize+
-		TabletAnchorHandleLabTrailerSize ||
-		string(src[0:8]) != tabletAnchorHandleLabMagic ||
+	anchors TabletAnchorMapView,
+) (TabletAnchorHandleView, error) {
+	if len(src) < TabletAnchorHandleHeaderSize+
+		TabletAnchorHandleTrailerSize ||
+		string(src[0:8]) != tabletAnchorHandleMagic ||
 		binary.LittleEndian.Uint32(src[8:12]) !=
-			tabletAnchorHandleLabVersion ||
+			tabletAnchorHandleVersion ||
 		binary.LittleEndian.Uint16(src[12:14]) !=
-			TabletAnchorHandleLabHeaderSize ||
+			TabletAnchorHandleHeaderSize ||
 		binary.LittleEndian.Uint16(src[22:24]) !=
-			TabletAnchorHandleLabHandleSize ||
-		!allZero(src[40:TabletAnchorHandleLabHeaderSize]) {
-		return TabletAnchorHandleLabView{},
-			tabletAnchorHandleLabCorrupt("header")
+			TabletAnchorHandleHandleSize ||
+		!allZero(src[40:TabletAnchorHandleHeaderSize]) {
+		return TabletAnchorHandleView{},
+			tabletAnchorHandleCorrupt("header")
 	}
 	localBits := src[14]
 	leafKind := PageKind(src[15])
@@ -767,27 +803,27 @@ func OpenTabletAnchorHandlesLab(
 		generation != anchors.header.Generation ||
 		count != anchors.BucketCount() ||
 		anchorChecksum != PageChecksum(anchors.image) {
-		return TabletAnchorHandleLabView{},
-			tabletAnchorHandleLabCorrupt("identity or binding")
+		return TabletAnchorHandleView{},
+			tabletAnchorHandleCorrupt("identity or binding")
 	}
 	locatorBytes := (1 << localBits) * 2
-	trailer := TabletAnchorHandleLabHeaderSize + locatorBytes +
-		count*TabletAnchorHandleLabHandleSize
-	if trailer+TabletAnchorHandleLabTrailerSize != len(src) {
-		return TabletAnchorHandleLabView{},
-			tabletAnchorHandleLabCorrupt("section geometry")
+	trailer := TabletAnchorHandleHeaderSize + locatorBytes +
+		count*TabletAnchorHandleHandleSize
+	if trailer+TabletAnchorHandleTrailerSize != len(src) {
+		return TabletAnchorHandleView{},
+			tabletAnchorHandleCorrupt("section geometry")
 	}
 	checksum := binary.LittleEndian.Uint32(src[trailer:])
 	if binary.LittleEndian.Uint32(src[trailer+4:]) != ^checksum ||
 		PageChecksum(src[:trailer]) != checksum {
-		return TabletAnchorHandleLabView{},
-			tabletAnchorHandleLabCorrupt("checksum")
+		return TabletAnchorHandleView{},
+			tabletAnchorHandleCorrupt("checksum")
 	}
-	view := TabletAnchorHandleLabView{
+	view := TabletAnchorHandleView{
 		anchors:   anchors,
 		image:     src,
-		locators:  src[TabletAnchorHandleLabHeaderSize : TabletAnchorHandleLabHeaderSize+locatorBytes],
-		handles:   src[TabletAnchorHandleLabHeaderSize+locatorBytes : trailer],
+		locators:  src[TabletAnchorHandleHeaderSize : TabletAnchorHandleHeaderSize+locatorBytes],
+		handles:   src[TabletAnchorHandleHeaderSize+locatorBytes : trailer],
 		tabletID:  tabletID,
 		localBits: localBits,
 		leafKind:  leafKind,
@@ -795,20 +831,20 @@ func OpenTabletAnchorHandlesLab(
 	live := 0
 	for localID := 0; localID < 1<<localBits; localID++ {
 		ordinal := binary.LittleEndian.Uint16(view.locators[localID*2:])
-		if ordinal == tabletAnchorHandleLabMissing {
+		if ordinal == tabletAnchorHandleMissing {
 			continue
 		}
 		if int(ordinal) >= count {
-			return TabletAnchorHandleLabView{},
-				tabletAnchorHandleLabCorrupt("locator ordinal")
+			return TabletAnchorHandleView{},
+				tabletAnchorHandleCorrupt("locator ordinal")
 		}
 		live++
 	}
 	if live != count {
-		return TabletAnchorHandleLabView{},
-			tabletAnchorHandleLabCorrupt("locator cardinality")
+		return TabletAnchorHandleView{},
+			tabletAnchorHandleCorrupt("locator cardinality")
 	}
-	for ordinal := 0; ordinal < count; ordinal++ {
+	for ordinal := range count {
 		bucket := anchors.bucketAt(ordinal)
 		bucketTablet, localID, ok := SplitTabletAnchorBucketID(
 			bucket, localBits,
@@ -816,45 +852,49 @@ func OpenTabletAnchorHandlesLab(
 		if !ok || bucketTablet != tabletID ||
 			binary.LittleEndian.Uint16(view.locators[int(localID)*2:]) !=
 				uint16(ordinal) {
-			return TabletAnchorHandleLabView{},
-				tabletAnchorHandleLabCorrupt("locator binding")
+			return TabletAnchorHandleView{},
+				tabletAnchorHandleCorrupt("locator binding")
 		}
 		ref, _ := view.handleAt(ordinal, bucket)
-		if err := tabletAnchorHandleLabValidateRef(
+		if err := tabletAnchorHandleValidateRef(
 			ref, bucket, leafKind,
 		); err != nil {
-			return TabletAnchorHandleLabView{},
-				tabletAnchorHandleLabCorrupt("leaf reference")
+			return TabletAnchorHandleView{},
+				tabletAnchorHandleCorrupt("leaf reference")
 		}
 	}
 	return view, nil
 }
 
-func (v TabletAnchorHandleLabView) Route(
+// Route resolves key through the lexical fences and binds the result to the
+// current leaf PageRef and zone in one pass, hashing the primary key only once.
+func (v TabletAnchorHandleView) Route(
 	seed [16]byte, key []byte,
-) TabletAnchorHandleLabRoute {
+) TabletAnchorHandleRoute {
 	return v.route(v.anchors.Route(seed, key))
 }
 
-func (v TabletAnchorHandleLabView) RouteHashed(
+// RouteHashed is Route for a caller that already holds the primary-key hash and
+// so avoids rehashing it.
+func (v TabletAnchorHandleView) RouteHashed(
 	hash uint64, key []byte,
-) TabletAnchorHandleLabRoute {
+) TabletAnchorHandleRoute {
 	return v.route(v.anchors.RouteHashed(hash, key))
 }
 
-func (v TabletAnchorHandleLabView) route(
-	route TabletAnchorMapLabRoute,
-) TabletAnchorHandleLabRoute {
+func (v TabletAnchorHandleView) route(
+	route TabletAnchorMapRoute,
+) TabletAnchorHandleRoute {
 	ref, zone := v.handleAt(int(route.Ordinal), route.Bucket)
-	return TabletAnchorHandleLabRoute{
-		TabletAnchorMapLabRoute: route, Ref: ref, Zone: zone,
+	return TabletAnchorHandleRoute{
+		TabletAnchorMapRoute: route, Ref: ref, Zone: zone,
 	}
 }
 
 // ResolveBucketID is the posting-driven route. Production interprets the
 // 16-bit locator as stable anchor-page ID plus stable row slot, asks the tablet
 // root for that page's current PageRef, and decodes this same handle.
-func (v TabletAnchorHandleLabView) ResolveBucketID(
+func (v TabletAnchorHandleView) ResolveBucketID(
 	bucket BucketID,
 ) (PageRef, BucketZone, bool) {
 	tabletID, localID, ok := SplitTabletAnchorBucketID(
@@ -864,7 +904,7 @@ func (v TabletAnchorHandleLabView) ResolveBucketID(
 		return PageRef{}, BucketZone{}, false
 	}
 	ordinal := binary.LittleEndian.Uint16(v.locators[int(localID)*2:])
-	if ordinal == tabletAnchorHandleLabMissing ||
+	if ordinal == tabletAnchorHandleMissing ||
 		int(ordinal) >= v.anchors.BucketCount() ||
 		v.anchors.bucketAt(int(ordinal)) != bucket {
 		return PageRef{}, BucketZone{}, false
@@ -873,13 +913,13 @@ func (v TabletAnchorHandleLabView) ResolveBucketID(
 	return ref, zone, true
 }
 
-func (v TabletAnchorHandleLabView) handleAt(
+func (v TabletAnchorHandleView) handleAt(
 	ordinal int, bucket BucketID,
 ) (PageRef, BucketZone) {
-	start := ordinal * TabletAnchorHandleLabHandleSize
-	src := v.handles[start : start+TabletAnchorHandleLabHandleSize]
-	page := tabletAnchorHandleLabGetUint48(src[0:6])
-	generation := tabletAnchorHandleLabGetUint48(src[6:12])
+	start := ordinal * TabletAnchorHandleHandleSize
+	src := v.handles[start : start+TabletAnchorHandleHandleSize]
+	page := tabletAnchorHandleGetUint48(src[0:6])
+	generation := tabletAnchorHandleGetUint48(src[6:12])
 	length := uint32(4096) << src[12]
 	var zone BucketZone
 	copy(zone[:], src[13:17])
@@ -892,13 +932,15 @@ func (v TabletAnchorHandleLabView) handleAt(
 	}, zone
 }
 
-func (v TabletAnchorHandleLabView) PersistentBytes() []byte {
+// PersistentBytes returns the borrowed combined-handle image. It aliases the
+// admitted page and must not be mutated or retained past the page's lease.
+func (v TabletAnchorHandleView) PersistentBytes() []byte {
 	return v.image
 }
 
 // CombinedBytesPerAnchor projects the canonical interleaved codec: local IDs
 // are two bytes rather than the comparison codec's four-byte global IDs.
-func (v TabletAnchorHandleLabView) CombinedBytesPerAnchor() float64 {
+func (v TabletAnchorHandleView) CombinedBytesPerAnchor() float64 {
 	count := v.anchors.BucketCount()
 	if count == 0 {
 		return 0
@@ -907,22 +949,22 @@ func (v TabletAnchorHandleLabView) CombinedBytesPerAnchor() float64 {
 	return float64(projected) / float64(count)
 }
 
-func tabletAnchorHandleLabValidateRef(
+func tabletAnchorHandleValidateRef(
 	ref PageRef, bucket BucketID, leafKind PageKind,
 ) error {
 	if ref.Offset == 0 || ref.Offset&4095 != 0 ||
-		ref.Offset>>12 >= tabletAnchorHandleLabMaxPage ||
+		ref.Offset>>12 >= tabletAnchorHandleMaxPage ||
 		ref.Generation == 0 ||
-		ref.Generation >= tabletAnchorHandleLabMaxPage ||
+		ref.Generation >= tabletAnchorHandleMaxPage ||
 		ref.LogicalID != uint64(bucket)+1 ||
 		ref.Kind != leafKind || ref.Flags != 0 || ref.Aux != 0 ||
-		tabletAnchorHandleLabExtentClass(ref.Length) < 0 {
+		tabletAnchorHandleExtentClass(ref.Length) < 0 {
 		return fmt.Errorf("%w: non-canonical compact leaf ref", ErrInvalidWrite)
 	}
 	return nil
 }
 
-func tabletAnchorHandleLabExtentClass(length uint32) int {
+func tabletAnchorHandleExtentClass(length uint32) int {
 	switch length {
 	case 4 << 10:
 		return 0
@@ -939,16 +981,16 @@ func tabletAnchorHandleLabExtentClass(length uint32) int {
 	}
 }
 
-func tabletAnchorHandleLabEncode(
+func tabletAnchorHandleEncode(
 	dst []byte, ref PageRef, zone BucketZone,
 ) {
-	tabletAnchorHandleLabPutUint48(dst[0:6], ref.Offset>>12)
-	tabletAnchorHandleLabPutUint48(dst[6:12], ref.Generation)
-	dst[12] = byte(tabletAnchorHandleLabExtentClass(ref.Length))
+	tabletAnchorHandlePutUint48(dst[0:6], ref.Offset>>12)
+	tabletAnchorHandlePutUint48(dst[6:12], ref.Generation)
+	dst[12] = byte(tabletAnchorHandleExtentClass(ref.Length))
 	copy(dst[13:17], zone[:])
 }
 
-func tabletAnchorHandleLabGetUint48(src []byte) uint64 {
+func tabletAnchorHandleGetUint48(src []byte) uint64 {
 	return uint64(src[0]) |
 		uint64(src[1])<<8 |
 		uint64(src[2])<<16 |
@@ -957,7 +999,7 @@ func tabletAnchorHandleLabGetUint48(src []byte) uint64 {
 		uint64(src[5])<<40
 }
 
-func tabletAnchorHandleLabPutUint48(dst []byte, value uint64) {
+func tabletAnchorHandlePutUint48(dst []byte, value uint64) {
 	dst[0] = byte(value)
 	dst[1] = byte(value >> 8)
 	dst[2] = byte(value >> 16)
@@ -966,27 +1008,27 @@ func tabletAnchorHandleLabPutUint48(dst []byte, value uint64) {
 	dst[5] = byte(value >> 40)
 }
 
-func tabletAnchorHandleLabSeal(image []byte) {
-	trailer := len(image) - TabletAnchorHandleLabTrailerSize
+func tabletAnchorHandleSeal(image []byte) {
+	trailer := len(image) - TabletAnchorHandleTrailerSize
 	checksum := PageChecksum(image[:trailer])
 	binary.LittleEndian.PutUint32(image[trailer:trailer+4], checksum)
 	binary.LittleEndian.PutUint32(image[trailer+4:], ^checksum)
 }
 
-func tabletAnchorHandleLabCorrupt(reason string) error {
-	return fmt.Errorf("%w: %s", ErrTabletAnchorHandleLabCorrupt, reason)
+func tabletAnchorHandleCorrupt(reason string) error {
+	return fmt.Errorf("%w: %s", ErrTabletAnchorHandleCorrupt, reason)
 }
 
-type tabletAnchorMapLabLayout struct {
+type tabletAnchorMapLayout struct {
 	commonAt, offsetsAt, bucketsAt, keysAt, trailerAt int
 }
 
-func tabletAnchorMapLabLayoutFor(
+func tabletAnchorMapLayoutFor(
 	fenceCount, commonLength, keyBytes int,
-) tabletAnchorMapLabLayout {
-	layout := tabletAnchorMapLabLayout{
-		commonAt: TabletAnchorMapLabHeaderSize +
-			tabletAnchorMapLabAcceleratorBytes,
+) tabletAnchorMapLayout {
+	layout := tabletAnchorMapLayout{
+		commonAt: TabletAnchorMapHeaderSize +
+			tabletAnchorMapAcceleratorBytes,
 	}
 	layout.offsetsAt = layout.commonAt + commonLength
 	layout.bucketsAt = layout.offsetsAt + (fenceCount+1)*2
@@ -995,25 +1037,25 @@ func tabletAnchorMapLabLayoutFor(
 	return layout
 }
 
-func tabletAnchorMapLabImageBytes(
+func tabletAnchorMapImageBytes(
 	fenceCount, commonLength, keyBytes int,
 ) int {
-	return tabletAnchorMapLabLayoutFor(
+	return tabletAnchorMapLayoutFor(
 		fenceCount, commonLength, keyBytes,
-	).trailerAt + TabletAnchorMapLabTrailerSize
+	).trailerAt + TabletAnchorMapTrailerSize
 }
 
-func tabletAnchorMapLabWriteHeader(
+func tabletAnchorMapWriteHeader(
 	image []byte,
-	header TabletAnchorMapLabHeader,
+	header TabletAnchorMapHeader,
 	fenceCount, commonLength, maxFence, keyBytes int,
 ) {
-	copy(image[0:8], tabletAnchorMapLabMagic)
-	binary.LittleEndian.PutUint32(image[8:12], tabletAnchorMapLabVersion)
+	copy(image[0:8], tabletAnchorMapMagic)
+	binary.LittleEndian.PutUint32(image[8:12], tabletAnchorMapVersion)
 	binary.LittleEndian.PutUint16(
-		image[12:14], TabletAnchorMapLabHeaderSize,
+		image[12:14], TabletAnchorMapHeaderSize,
 	)
-	image[14] = TabletAnchorMapLabRestart
+	image[14] = TabletAnchorMapRestart
 	binary.LittleEndian.PutUint64(image[16:24], header.TabletID)
 	binary.LittleEndian.PutUint64(image[24:32], header.Generation)
 	binary.LittleEndian.PutUint16(image[32:34], uint16(fenceCount))
@@ -1023,15 +1065,15 @@ func tabletAnchorMapLabWriteHeader(
 	binary.LittleEndian.PutUint32(image[40:44], uint32(len(image)))
 }
 
-func tabletAnchorMapLabSeal(image []byte) {
-	trailer := len(image) - TabletAnchorMapLabTrailerSize
+func tabletAnchorMapSeal(image []byte) {
+	trailer := len(image) - TabletAnchorMapTrailerSize
 	checksum := PageChecksum(image[:trailer])
 	binary.LittleEndian.PutUint32(image[trailer:trailer+4], checksum)
 	binary.LittleEndian.PutUint32(image[trailer+4:], ^checksum)
 }
 
-func tabletAnchorMapLabMeasure(
-	anchors []TabletAnchorMapLabAnchor,
+func tabletAnchorMapMeasure(
+	anchors []TabletAnchorMapAnchor,
 ) (commonLength, maxFence, keyBytes int, err error) {
 	if len(anchors) == 0 {
 		return 0, 0, 0, nil
@@ -1051,7 +1093,7 @@ func tabletAnchorMapLabMeasure(
 		if rank != 0 {
 			commonLength = min(
 				commonLength,
-				tabletAnchorMapLabPrefix(
+				tabletAnchorMapPrefix(
 					anchors[0].Fence[:commonLength], anchor.Fence,
 				),
 			)
@@ -1065,10 +1107,10 @@ func tabletAnchorMapLabMeasure(
 	for rank, anchor := range anchors {
 		stripped := anchor.Fence[commonLength:]
 		shared := 0
-		if rank%TabletAnchorMapLabRestart == 0 {
+		if rank%TabletAnchorMapRestart == 0 {
 			restart = stripped
 		} else {
-			shared = tabletAnchorMapLabPrefix(restart, stripped)
+			shared = tabletAnchorMapPrefix(restart, stripped)
 		}
 		keyBytes += 2 + len(stripped) - shared
 		if keyBytes > int(^uint16(0)) {
@@ -1080,26 +1122,26 @@ func tabletAnchorMapLabMeasure(
 	return commonLength, maxFence, keyBytes, nil
 }
 
-func (v TabletAnchorMapLabView) validateCanonical() error {
+func (v TabletAnchorMapView) validateCanonical() error {
 	count := int(v.fenceCount)
-	if len(v.accelerator) != tabletAnchorMapLabAcceleratorBytes ||
+	if len(v.accelerator) != tabletAnchorMapAcceleratorBytes ||
 		len(v.offsets) != (count+1)*2 ||
 		len(v.buckets) != (count+1)*4 ||
 		len(v.common) != int(v.commonLength) ||
 		binary.LittleEndian.Uint16(v.offsets[0:2]) != 0 ||
 		int(binary.LittleEndian.Uint16(v.offsets[count*2:])) != len(v.keys) {
-		return tabletAnchorMapLabCorrupt("section sizes or terminal offset")
+		return tabletAnchorMapCorrupt("section sizes or terminal offset")
 	}
 	if uint32(v.bucketAt(0)) >= PrimaryBucketIDLimit {
-		return tabletAnchorMapLabCorrupt("first bucket")
+		return tabletAnchorMapCorrupt("first bucket")
 	}
 	if count == 0 {
 		if len(v.common) != 0 || len(v.keys) != 0 || v.maxFence != 0 {
-			return tabletAnchorMapLabCorrupt("empty map metadata")
+			return tabletAnchorMapCorrupt("empty map metadata")
 		}
-		for slot := 0; slot < TabletAnchorMapLabAcceleratorSlots; slot++ {
+		for slot := range TabletAnchorMapAcceleratorSlots {
 			if binary.LittleEndian.Uint16(v.accelerator[slot*2:]) != 0 {
-				return tabletAnchorMapLabCorrupt("empty accelerator")
+				return tabletAnchorMapCorrupt("empty accelerator")
 			}
 		}
 		return nil
@@ -1110,16 +1152,16 @@ func (v TabletAnchorMapLabView) validateCanonical() error {
 	firstByte := -1
 	acceleratorSlot := 0
 	var previous [3][]byte
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		start := int(binary.LittleEndian.Uint16(v.offsets[rank*2:]))
 		end := int(binary.LittleEndian.Uint16(v.offsets[(rank+1)*2:]))
 		if start < 0 || end < start+2 || end > len(v.keys) ||
 			uint32(v.bucketAt(rank+1)) >= PrimaryBucketIDLimit {
-			return tabletAnchorMapLabCorrupt("entry offset or bucket")
+			return tabletAnchorMapCorrupt("entry offset or bucket")
 		}
 		shared := int(binary.LittleEndian.Uint16(v.keys[start : start+2]))
-		restartRank := rank / TabletAnchorMapLabRestart *
-			TabletAnchorMapLabRestart
+		restartRank := rank / TabletAnchorMapRestart *
+			TabletAnchorMapRestart
 		restartStart := int(binary.LittleEndian.Uint16(
 			v.offsets[restartRank*2:],
 		))
@@ -1127,27 +1169,27 @@ func (v TabletAnchorMapLabView) validateCanonical() error {
 			v.offsets[(restartRank+1)*2:],
 		))
 		if restartEnd < restartStart+2 || restartEnd > len(v.keys) {
-			return tabletAnchorMapLabCorrupt("restart offset")
+			return tabletAnchorMapCorrupt("restart offset")
 		}
 		restart := v.keys[restartStart+2 : restartEnd]
-		if rank%TabletAnchorMapLabRestart == 0 {
+		if rank%TabletAnchorMapRestart == 0 {
 			if shared != 0 {
-				return tabletAnchorMapLabCorrupt("restart sharing")
+				return tabletAnchorMapCorrupt("restart sharing")
 			}
 		} else if shared > len(restart) {
-			return tabletAnchorMapLabCorrupt("shared prefix")
+			return tabletAnchorMapCorrupt("shared prefix")
 		}
 		suffix := v.keys[start+2 : end]
 		length := len(v.common) + shared + len(suffix)
 		if length == 0 || length > int(^uint16(0)) {
-			return tabletAnchorMapLabCorrupt("fence length")
+			return tabletAnchorMapCorrupt("fence length")
 		}
 		observedMax = max(observedMax, length)
 		minimum = min(minimum, length)
 		current := [3][]byte{v.common, restart[:shared], suffix}
 		if rank != 0 &&
-			tabletAnchorMapLabCompareParts(previous, current) >= 0 {
-			return tabletAnchorMapLabCorrupt("fence order")
+			tabletAnchorMapCompareParts(previous, current) >= 0 {
+			return tabletAnchorMapCorrupt("fence order")
 		}
 		previous = current
 		strippedFirst := 0
@@ -1157,52 +1199,52 @@ func (v TabletAnchorMapLabView) validateCanonical() error {
 			strippedFirst = int(current[1][0])
 		}
 		if strippedFirst < firstByte {
-			return tabletAnchorMapLabCorrupt("accelerator order")
+			return tabletAnchorMapCorrupt("accelerator order")
 		}
 		for acceleratorSlot <= strippedFirst {
 			if int(binary.LittleEndian.Uint16(
 				v.accelerator[acceleratorSlot*2:],
 			)) != rank {
-				return tabletAnchorMapLabCorrupt("accelerator rank")
+				return tabletAnchorMapCorrupt("accelerator rank")
 			}
 			acceleratorSlot++
 		}
 		firstByte = strippedFirst
 	}
-	for acceleratorSlot < TabletAnchorMapLabAcceleratorSlots {
+	for acceleratorSlot < TabletAnchorMapAcceleratorSlots {
 		if int(binary.LittleEndian.Uint16(
 			v.accelerator[acceleratorSlot*2:],
 		)) != count {
-			return tabletAnchorMapLabCorrupt("accelerator tail")
+			return tabletAnchorMapCorrupt("accelerator tail")
 		}
 		acceleratorSlot++
 	}
 	if observedMax != int(v.maxFence) {
-		return tabletAnchorMapLabCorrupt("maximum fence")
+		return tabletAnchorMapCorrupt("maximum fence")
 	}
 	// The common prefix is canonical and maximal, except that one byte remains
 	// in every stripped fence for the accelerator.
 	if len(v.common) >= minimum {
-		return tabletAnchorMapLabCorrupt("common prefix length")
+		return tabletAnchorMapCorrupt("common prefix length")
 	}
 	if minimum > len(v.common)+1 && firstByte ==
-		tabletAnchorMapLabFirstStrippedByte(v, 0) {
+		tabletAnchorMapFirstStrippedByte(v, 0) {
 		allEqual := true
-		want := tabletAnchorMapLabFirstStrippedByte(v, 0)
+		want := tabletAnchorMapFirstStrippedByte(v, 0)
 		for rank := 1; rank < count; rank++ {
-			if tabletAnchorMapLabFirstStrippedByte(v, rank) != want {
+			if tabletAnchorMapFirstStrippedByte(v, rank) != want {
 				allEqual = false
 				break
 			}
 		}
 		if allEqual {
-			return tabletAnchorMapLabCorrupt("non-maximal common prefix")
+			return tabletAnchorMapCorrupt("non-maximal common prefix")
 		}
 	}
 	return nil
 }
 
-func (v TabletAnchorMapLabView) upperBound(target []byte) int {
+func (v TabletAnchorMapView) upperBound(target []byte) int {
 	if v.fenceCount == 0 {
 		return 0
 	}
@@ -1233,7 +1275,7 @@ func (v TabletAnchorMapLabView) upperBound(target []byte) int {
 	return low
 }
 
-func (v TabletAnchorMapLabView) compareStrippedFence(
+func (v TabletAnchorMapView) compareStrippedFence(
 	rank int, target []byte,
 ) int {
 	_, prefix, suffix := v.fenceParts(rank)
@@ -1258,14 +1300,14 @@ func (v TabletAnchorMapLabView) compareStrippedFence(
 	return 0
 }
 
-func (v TabletAnchorMapLabView) fenceParts(
+func (v TabletAnchorMapView) fenceParts(
 	rank int,
 ) (common, restartPrefix, suffix []byte) {
 	start := int(binary.LittleEndian.Uint16(v.offsets[rank*2:]))
 	end := int(binary.LittleEndian.Uint16(v.offsets[(rank+1)*2:]))
 	shared := int(binary.LittleEndian.Uint16(v.keys[start : start+2]))
-	restartRank := rank / TabletAnchorMapLabRestart *
-		TabletAnchorMapLabRestart
+	restartRank := rank / TabletAnchorMapRestart *
+		TabletAnchorMapRestart
 	restartStart := int(binary.LittleEndian.Uint16(
 		v.offsets[restartRank*2:],
 	))
@@ -1276,7 +1318,7 @@ func (v TabletAnchorMapLabView) fenceParts(
 	return v.common, restart[:shared], v.keys[start+2 : end]
 }
 
-func (v TabletAnchorMapLabView) materializeFence(
+func (v TabletAnchorMapView) materializeFence(
 	rank int, dst []byte,
 ) []byte {
 	common, prefix, suffix := v.fenceParts(rank)
@@ -1288,12 +1330,12 @@ func (v TabletAnchorMapLabView) materializeFence(
 	return out
 }
 
-func (v TabletAnchorMapLabView) bucketAt(ordinal int) BucketID {
+func (v TabletAnchorMapView) bucketAt(ordinal int) BucketID {
 	return BucketID(binary.LittleEndian.Uint32(v.buckets[ordinal*4:]))
 }
 
-func tabletAnchorMapLabFirstStrippedByte(
-	v TabletAnchorMapLabView, rank int,
+func tabletAnchorMapFirstStrippedByte(
+	v TabletAnchorMapView, rank int,
 ) int {
 	_, prefix, suffix := v.fenceParts(rank)
 	if len(prefix) != 0 {
@@ -1302,7 +1344,7 @@ func tabletAnchorMapLabFirstStrippedByte(
 	return int(suffix[0])
 }
 
-func tabletAnchorMapLabCompareParts(left, right [3][]byte) int {
+func tabletAnchorMapCompareParts(left, right [3][]byte) int {
 	leftPart, rightPart := 0, 0
 	leftAt, rightAt := 0, 0
 	for {
@@ -1335,7 +1377,7 @@ func tabletAnchorMapLabCompareParts(left, right [3][]byte) int {
 	}
 }
 
-func tabletAnchorMapLabPrefix(left, right []byte) int {
+func tabletAnchorMapPrefix(left, right []byte) int {
 	limit := min(len(left), len(right))
 	at := 0
 	for at < limit && left[at] == right[at] {
@@ -1344,19 +1386,19 @@ func tabletAnchorMapLabPrefix(left, right []byte) int {
 	return at
 }
 
-func tabletAnchorMapLabCorrupt(reason string) error {
-	return fmt.Errorf("%w: %s", ErrTabletAnchorMapLabCorrupt, reason)
+func tabletAnchorMapCorrupt(reason string) error {
+	return fmt.Errorf("%w: %s", ErrTabletAnchorMapCorrupt, reason)
 }
 
-func tabletAnchorMapLabValidateEdits(
-	edits []TabletAnchorMapLabEdit, maxFence *int,
+func tabletAnchorMapValidateEdits(
+	edits []TabletAnchorMapEdit, maxFence *int,
 ) error {
 	for rank, edit := range edits {
 		if len(edit.Fence) == 0 || len(edit.Fence) > int(^uint16(0)) ||
 			rank != 0 && bytes.Compare(edits[rank-1].Fence, edit.Fence) >= 0 ||
-			edit.Operation < TabletAnchorMapLabInsert ||
-			edit.Operation > TabletAnchorMapLabReplace ||
-			edit.Operation != TabletAnchorMapLabDelete &&
+			edit.Operation < TabletAnchorMapInsert ||
+			edit.Operation > TabletAnchorMapReplace ||
+			edit.Operation != TabletAnchorMapDelete &&
 				uint32(edit.Bucket) >= PrimaryBucketIDLimit {
 			return fmt.Errorf(
 				"%w: non-canonical anchor edit at rank %d",
@@ -1368,18 +1410,18 @@ func tabletAnchorMapLabValidateEdits(
 	return nil
 }
 
-type tabletAnchorMapLabMerge struct {
-	view              TabletAnchorMapLabView
-	edits             []TabletAnchorMapLabEdit
+type tabletAnchorMapMerge struct {
+	view              TabletAnchorMapView
+	edits             []TabletAnchorMapEdit
 	work              []byte
 	oldRank, editRank int
 }
 
-func (m *tabletAnchorMapLabMerge) reset() {
+func (m *tabletAnchorMapMerge) reset() {
 	m.oldRank, m.editRank = 0, 0
 }
 
-func (m *tabletAnchorMapLabMerge) next() (fence []byte, bucket BucketID, ok bool, err error) {
+func (m *tabletAnchorMapMerge) next() (fence []byte, bucket BucketID, ok bool, err error) {
 	for m.oldRank < int(m.view.fenceCount) ||
 		m.editRank < len(m.edits) {
 		haveOld := m.oldRank < int(m.view.fenceCount)
@@ -1387,7 +1429,7 @@ func (m *tabletAnchorMapLabMerge) next() (fence []byte, bucket BucketID, ok bool
 		comparison := -1
 		if haveOld && haveEdit {
 			common, prefix, suffix := m.view.fenceParts(m.oldRank)
-			comparison = tabletAnchorMapLabCompareParts(
+			comparison = tabletAnchorMapCompareParts(
 				[3][]byte{common, prefix, suffix},
 				[3][]byte{m.edits[m.editRank].Fence, nil, nil},
 			)
@@ -1404,7 +1446,7 @@ func (m *tabletAnchorMapLabMerge) next() (fence []byte, bucket BucketID, ok bool
 		case comparison > 0:
 			edit := m.edits[m.editRank]
 			m.editRank++
-			if edit.Operation != TabletAnchorMapLabInsert {
+			if edit.Operation != TabletAnchorMapInsert {
 				return nil, 0, false, fmt.Errorf(
 					"%w: edit fence does not exist", ErrInvalidWrite,
 				)
@@ -1415,13 +1457,13 @@ func (m *tabletAnchorMapLabMerge) next() (fence []byte, bucket BucketID, ok bool
 			m.oldRank++
 			m.editRank++
 			switch edit.Operation {
-			case TabletAnchorMapLabInsert:
+			case TabletAnchorMapInsert:
 				return nil, 0, false, fmt.Errorf(
 					"%w: inserted fence already exists", ErrInvalidWrite,
 				)
-			case TabletAnchorMapLabDelete:
+			case TabletAnchorMapDelete:
 				continue
-			case TabletAnchorMapLabReplace:
+			case TabletAnchorMapReplace:
 				fence, bucket = edit.Fence, edit.Bucket
 			}
 		}

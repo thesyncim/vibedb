@@ -228,7 +228,7 @@ func TestGlobalTabletCatalogCOWIsCanonicalAcrossHistories(t *testing.T) {
 	payload := corrupt[PageHeaderSize:]
 	mapStart := GlobalTabletCatalogNodePayloadHeaderBytes
 	binary.LittleEndian.PutUint64(payload[mapStart+24:], 101)
-	tabletAnchorMapLabSeal(
+	tabletAnchorMapSeal(
 		payload[mapStart : mapStart+
 			int(binary.LittleEndian.Uint32(payload[12:16]))],
 	)

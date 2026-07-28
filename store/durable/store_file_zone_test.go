@@ -63,7 +63,7 @@ func zoneNumberCode(t *testing.T, spelling string) uint32 {
 func TestFileStoreZoneMapsPruneClusteredChunks(t *testing.T) {
 	collection := newZoneTestStore(t, zoneTestOptions(4))
 	const documents = 200
-	for i := 0; i < documents; i++ {
+	for i := range documents {
 		if _, err := collection.Put(fmt.Sprintf("k%05d", i), []byte(zoneTestDocument(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -194,7 +194,7 @@ func TestFileStoreZoneMapsSurviveReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 128; i++ {
+	for i := range 128 {
 		if _, err := collection.Put(fmt.Sprintf("k%05d", i), []byte(zoneTestDocument(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -284,13 +284,13 @@ func TestFileStoreZoneMapsFoldBatchedUpdates(t *testing.T) {
 // surprise.
 func TestFileStoreZoneMapsWidenOnReplacement(t *testing.T) {
 	collection := newZoneTestStore(t, zoneTestOptions(4))
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if _, err := collection.Put(fmt.Sprintf("k%05d", i), []byte(zoneTestDocument(i))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Replace every document in chunk 0 with a far larger price.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		document := fmt.Sprintf(`{"id":%d,"price":%d,"name":"n%04d"}`, i, 1_000_000+i, i)
 		if _, err := collection.Put(fmt.Sprintf("k%05d", i), []byte(document)); err != nil {
 			t.Fatal(err)
@@ -318,7 +318,7 @@ func TestFileStoreZoneMapsDisabledWriteNothing(t *testing.T) {
 	previous := store.SetZonePruning(false)
 	defer store.SetZonePruning(previous)
 	collection := newZoneTestStore(t, zoneTestOptions(4))
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		if _, err := collection.Put(fmt.Sprintf("k%05d", i), []byte(zoneTestDocument(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -358,7 +358,7 @@ func TestFileStoreZoneMapsRebuildFromStale(t *testing.T) {
 		store.SetZonePruning(previous)
 		t.Fatal(err)
 	}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if _, err := collection.Put(fmt.Sprintf("k%05d", i), []byte(zoneTestDocument(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -439,7 +439,7 @@ func TestFileStoreZoneMapsPoisonOverflowRows(t *testing.T) {
 
 func stringRepeat(s string, n int) string {
 	out := make([]byte, 0, len(s)*n)
-	for i := 0; i < n; i++ {
+	for range n {
 		out = append(out, s...)
 	}
 	return string(out)

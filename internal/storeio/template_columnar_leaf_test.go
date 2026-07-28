@@ -44,7 +44,7 @@ func TestTemplateColumnarLeafExtractionExact(t *testing.T) {
 		[]byte(`"root scalar"`),
 	}
 	rng := rand.New(rand.NewSource(0x501))
-	for i := 0; i < 250; i++ {
+	for i := range 250 {
 		docs = append(docs, fmt.Appendf(nil,
 			`{"id":%d,"s":"v-%08x","n":%d.%02d,"b":%t,"a":[%d,null,"%c"]}`,
 			i, rng.Uint32(), rng.Intn(10000), rng.Intn(100), i&1 == 0,

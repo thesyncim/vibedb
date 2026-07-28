@@ -7,10 +7,7 @@ import (
 	"testing"
 )
 
-var (
-	indexTermLeafBenchRows uint64
-	indexTermLeafBenchOK   bool
-)
+var indexTermLeafBenchRows uint64
 
 func BenchmarkIndexTermLeafBytes(b *testing.B) {
 	for _, cardinality := range []struct {
@@ -20,7 +17,7 @@ func BenchmarkIndexTermLeafBytes(b *testing.B) {
 		{name: "low-cardinality", terms: 1, postings: 64},
 		{name: "high-cardinality", terms: 96, postings: 1},
 	} {
-		for pattern := 0; pattern < 6; pattern++ {
+		for pattern := range 6 {
 			name := fmt.Sprintf("%s/%s", cardinality.name, indexTermLeafPatternName(pattern))
 			b.Run(name, func(b *testing.B) {
 				fixture := makeIndexTermLeafPatternFixture(
@@ -61,7 +58,7 @@ func BenchmarkIndexTermLeafHotEquality(b *testing.B) {
 		{name: "low-cardinality", terms: 1, postings: 64},
 		{name: "high-cardinality", terms: 96, postings: 1},
 	} {
-		for pattern := 0; pattern < 6; pattern++ {
+		for pattern := range 6 {
 			name := fmt.Sprintf("%s/%s", cardinality.name, indexTermLeafPatternName(pattern))
 			fixture := makeIndexTermLeafPatternFixture(
 				b, cardinality.terms, cardinality.postings, pattern,
@@ -211,7 +208,7 @@ func BenchmarkIndexTermLeafOrderedIteration(b *testing.B) {
 		{name: "low-cardinality", terms: 1, postings: 64},
 		{name: "high-cardinality", terms: 96, postings: 1},
 	} {
-		for pattern := 0; pattern < 6; pattern++ {
+		for pattern := range 6 {
 			name := fmt.Sprintf("%s/%s", cardinality.name, indexTermLeafPatternName(pattern))
 			fixture := makeIndexTermLeafPatternFixture(
 				b, cardinality.terms, cardinality.postings, pattern,
@@ -417,14 +414,14 @@ func makeIndexTermLeafPatternFixture(
 		expected: make(map[string]map[uint32][TermPostingTileChunks]uint64),
 	}
 	tileID := uint32(11)
-	for term := 0; term < termCount; term++ {
+	for term := range termCount {
 		key := mustIndexTermLeafKey(t, fmt.Sprintf("bench/common/%04d", term))
 		fixture.terms[term] = IndexTermLeafTerm{
 			Key:      key,
 			Postings: make([]IndexTermLeafPosting, postingsPerTerm),
 		}
 		expected := make(map[uint32][TermPostingTileChunks]uint64)
-		for postingIndex := 0; postingIndex < postingsPerTerm; postingIndex++ {
+		for postingIndex := range postingsPerTerm {
 			var posting, live [TermPostingTileChunks]uint64
 			makeIndexTermLeafPattern(pattern, &posting, &live)
 			input := buildIndexTermLeafPosting(t, tileID, &posting, &live)

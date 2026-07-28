@@ -217,7 +217,7 @@ func (b *chunkTreeBatch) rewriteVirtual(
 	var refs [64]PageRef
 	var bitmap uint64
 	at := 0
-	for lane := uint8(0); lane < 64; lane++ {
+	for lane := range uint8(64) {
 		start := at
 		for at < len(edits) && uint8(edits[at].Chunk>>shift&63) == lane {
 			at++
@@ -321,7 +321,7 @@ func (b *chunkTreeBatch) rewritePage(
 	} else {
 		nextShift := shift - chunkDirectoryRadixBits
 		at := 0
-		for lane := uint8(0); lane < 64; lane++ {
+		for lane := range uint8(64) {
 			start := at
 			for at < len(edits) && uint8(edits[at].Chunk>>shift&63) == lane {
 				at++

@@ -19,7 +19,7 @@ func BenchmarkStoreExactIndexAliasMutation(b *testing.B) {
 			collection := &Collection{Options: Options{ChunkDocuments: 64}}
 			doc0 := []byte(`{"v0":0,"v1":0,"v2":0,"v3":0,"v4":0,"v5":0,"v6":0,"v7":0}`)
 			doc1 := []byte(`{"v0":1,"v1":1,"v2":1,"v3":1,"v4":1,"v5":1,"v6":1,"v7":1}`)
-			for i := 0; i < 64; i++ {
+			for i := range 64 {
 				if _, err := collection.Put(fmt.Sprintf("k%02d", i), doc0); err != nil {
 					b.Fatal(err)
 				}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibejson"
@@ -33,7 +34,7 @@ func TestStoreBuilderEquivalentAndMutable(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := make(map[string]string)
-			for i := 0; i < 257; i++ {
+			for i := range 257 {
 				key := fmt.Sprintf("key-%03d", i)
 				doc := fmt.Sprintf(`{"id":%d,"profile":{"geo":{"country":"c%d"}},"active":%t}`, i, i%9, i%2 == 0)
 				input := []byte(doc)
@@ -112,7 +113,7 @@ func buildNestedTemplateCollection(t *testing.T) *Collection {
 	if err := builder.CreateIndex(IndexDefinition{Name: "country", Paths: []string{"/profile/geo/country"}}); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < storeBuilderTemplateRows; i++ {
+	for i := range storeBuilderTemplateRows {
 		doc := fmt.Sprintf(`{"id":%d,"profile":{"geo":{"country":"c%d"}},"active":%t}`, i, i%4, i&1 == 0)
 		if err := builder.Append(fmt.Sprintf("k%02d", i), []byte(doc)); err != nil {
 			t.Fatal(err)
@@ -222,12 +223,7 @@ func TestStoreBuilderNestedStructuralTemplateAllocs(t *testing.T) {
 }
 
 func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, want)
 }
 
 func TestStoreBuilderCompactsKeyDirectory(t *testing.T) {
@@ -295,7 +291,7 @@ func TestStoreBuilderCompactsNonPowerOfTwoKeyDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for row := 0; row < 7; row++ {
+	for row := range 7 {
 		if err := builder.Append(fmt.Sprintf("key-%d", row), []byte(fmt.Sprintf(`{"n":%d}`, row))); err != nil {
 			t.Fatal(err)
 		}
@@ -308,7 +304,7 @@ func TestStoreBuilderCompactsNonPowerOfTwoKeyDirectory(t *testing.T) {
 	if base == nil || base.compact == nil || base.dense != nil || base.refs != nil {
 		t.Fatalf("non-power-of-two chunks did not select explicit compact refs: %+v", base)
 	}
-	for row := 0; row < 7; row++ {
+	for row := range 7 {
 		key := fmt.Sprintf("key-%d", row)
 		if raw, ok := collection.GetRaw(key); !ok || string(raw.Bytes()) != fmt.Sprintf(`{"n":%d}`, row) {
 			t.Fatalf("GetRaw(%q) = (%q, %v)", key, raw.Bytes(), ok)
@@ -365,7 +361,7 @@ func TestStoreBuilderSharesImmutableShapesAcrossChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if err := builder.Append(string(rune('a'+i)), []byte(`{"a":1,"b":"x"}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -401,7 +397,7 @@ func TestStoreBuilderReservesOneBoundedSourceArena(t *testing.T) {
 		t.Fatal(err)
 	}
 	document := []byte(`{"a":"0123456789abcdef","b":123456789}`)
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		if err := builder.Append(string(rune(i+1)), document); err != nil {
 			t.Fatal(err)
 		}

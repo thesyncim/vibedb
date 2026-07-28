@@ -35,9 +35,7 @@ const (
 
 	// InlineFreeDeltaCapacity is the maximum cumulative free-set diff carried
 	// by one fixed root page at the minimum 4 KiB page size.
-	InlineFreeDeltaCapacity   = (inlineSuperblockChecksumFrom - inlineFreeDeltaRecordsOffset) / FreeDeltaRecordSize
-	inlineFreeDeltaRecordsEnd = inlineFreeDeltaRecordsOffset +
-		InlineFreeDeltaCapacity*FreeDeltaRecordSize
+	InlineFreeDeltaCapacity = (inlineSuperblockChecksumFrom - inlineFreeDeltaRecordsOffset) / FreeDeltaRecordSize
 )
 
 // ErrInlineFreeDeltaFull tells a writer to spill the cumulative records into
@@ -546,7 +544,7 @@ func RecoverInlineStateRootWithFallback(
 			fmt.Errorf("%w: have=%d need=%d", ErrRecoveryBufferTooSmall, len(pageScratch), pageSize)
 	}
 	var headers [superblockCopies * InlineSuperblockSize]byte
-	for slot := 0; slot < superblockCopies; slot++ {
+	for slot := range superblockCopies {
 		buf := headers[slot*InlineSuperblockSize : (slot+1)*InlineSuperblockSize]
 		n, err := file.ReadAt(buf, int64(layout.RootOffsets[slot]))
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -573,7 +571,7 @@ func RecoverInlineStateRootWithFallback(
 	var selected InlineSuperblock
 	selectedSlot := -1
 	var catalogErr error
-	for i := 0; i < count; i++ {
+	for i := range count {
 		candidate := candidates[i]
 		root := candidate.root
 		state := root.State

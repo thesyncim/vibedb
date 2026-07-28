@@ -65,9 +65,9 @@ func appendFieldResolveEach(c *ShapeCache, dst []vibejson.RawValue, s *Segment, 
 func shapeColumnClusteredDocs(runLen, runs int, b testing.TB) *Segment {
 	var set Segment
 	set.Options = document.IndexOptions{HashKeys: true}
-	for r := 0; r < runs; r++ {
+	for r := range runs {
 		layout := r % 4
-		for i := 0; i < runLen; i++ {
+		for i := range runLen {
 			doc := fmt.Appendf(nil,
 				`{"id":%d,"ts":%d,"name":"u-%04d","flags":%d,"v%d_a":1,"v%d_b":2,"v%d_c":3,"v%d_d":4,"v%d_e":5,"v%d_f":6,"v%d_g":7,"v%d_h":8,"v%d_i":9,"v%d_j":10,"v%d_k":11,"v%d_l":12}`,
 				i, 1700000000+i, i, i%8,
@@ -87,7 +87,7 @@ func shapeColumnClusteredDocs(runLen, runs int, b testing.TB) *Segment {
 func shapeColumnNestedDocs(count int, b testing.TB) *Segment {
 	var set Segment
 	set.Options = document.IndexOptions{HashKeys: true}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		doc := fmt.Appendf(nil,
 			`{"id":%d,"user":{"name":"u-%04d","tier":%d},"tags":[%d,%d],"ts":%d,"score":%d.%02d,"meta":{"region":"eu-west-%d"}}`,
 			i, i, i%5, i, i+1, 1700000000+i, i%100, i%97, i%3)
@@ -160,7 +160,7 @@ func BenchmarkShapeColumnSteadyState(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			dst = dst[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				root := set.Doc(d).Root()
 				if _, ok := cache.Resolve(root); !ok {
 					b.Fatal("shape miss")
@@ -197,7 +197,7 @@ func BenchmarkShapeColumnSteadyState(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			dst = dst[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				dst = appendFieldGet(dst, set.Doc(d).Root(), key)
 			}
 		}
@@ -246,7 +246,7 @@ func BenchmarkShapeColumnClustered(b *testing.B) {
 func shapeColumnShiftedDocs(b testing.TB) *Segment {
 	var set Segment
 	set.Options = document.IndexOptions{HashKeys: true}
-	for i := 0; i < 1024; i++ {
+	for i := range 1024 {
 		var doc []byte
 		if i%2 == 0 {
 			doc = fmt.Appendf(nil,
@@ -342,7 +342,7 @@ func BenchmarkShapeColumnAdversarial(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			dst = dst[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				dst = appendFieldGet(dst, set.Doc(d).Root(), key)
 			}
 		}
@@ -372,7 +372,7 @@ func BenchmarkShapeColumnAdversarial(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			dst = dst[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				dst = appendFieldGet(dst, set.Doc(d).Root(), key)
 			}
 		}
@@ -402,7 +402,7 @@ func BenchmarkShapeColumnAdversarial(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			dst = dst[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				dst = appendFieldGet(dst, set.Doc(d).Root(), key)
 			}
 		}
@@ -474,7 +474,7 @@ func BenchmarkShapeColumnMultiField(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				cols = resetColumns(cols)
-				for d := 0; d < docs; d++ {
+				for d := range docs {
 					root := set.Doc(d).Root()
 					if _, ok := cache.Resolve(root); !ok {
 						b.Fatal("shape miss")
@@ -512,7 +512,7 @@ func BenchmarkShapeColumnMultiField(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				cols = resetColumns(cols)
-				for d := 0; d < docs; d++ {
+				for d := range docs {
 					root := set.Doc(d).Root()
 					for j := range keys {
 						cols[j] = appendFieldGet(cols[j], root, keys[j])

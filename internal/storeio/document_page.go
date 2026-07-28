@@ -270,7 +270,7 @@ func openDocumentPagePayload(pageHeader PageHeader, payload []byte, chunkHighWat
 	}
 	var previousEnd uint32
 	var overflowCount uint8
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 		keyEnd := binary.LittleEndian.Uint32(payload[descriptor : descriptor+4])
 		encodedEnd := binary.LittleEndian.Uint32(payload[descriptor+4 : descriptor+8])

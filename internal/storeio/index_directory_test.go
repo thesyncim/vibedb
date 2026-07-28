@@ -339,7 +339,7 @@ func TestIndexDirectoryLeafSplitsByBytes(t *testing.T) {
 	maxCertificate := IndexDirectoryMaxCertificate(testSuperblockPageSize)
 	var arena []byte
 	var entries []IndexDirectoryEntry
-	for i := 0; i < 26; i++ {
+	for i := range 26 {
 		length := 1
 		if i < 6 {
 			length = maxCertificate
@@ -380,7 +380,7 @@ func TestIndexDirectoryMaximumCertificate(t *testing.T) {
 	maxCertificate := IndexDirectoryMaxCertificate(testSuperblockPageSize)
 	var arena []byte
 	var entries []IndexDirectoryEntry
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		span := CertSpan{Offset: uint32(len(arena)), Length: uint16(maxCertificate)}
 		arena = append(arena, bytes.Repeat([]byte{byte('a' + i)}, maxCertificate)...)
 		entries = append(entries, IndexDirectoryEntry{

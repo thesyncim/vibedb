@@ -5,9 +5,9 @@ import (
 	"math"
 	"math/bits"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // fileFloat64ProjectionEqual reports whether replacing one live document can
@@ -175,7 +175,7 @@ func (c *Collection) rebuildFileFloat64Stripe(
 	var ends [fileStoreMaxFloat64Columns]int
 	var encodings [fileStoreMaxFloat64Columns]storeio.Float64GroupEncoding
 	dataBytes := 0
-	for column := 0; column < columns; column++ {
+	for column := range columns {
 		encoding := fileFloat64StripeEncoding(ranks[column])
 		width := encoding.ByteWidth()
 		bytes := uint64(counts[column]) * uint64(width)
@@ -235,7 +235,7 @@ func (c *Collection) rebuildFileFloat64Stripe(
 	if err != nil {
 		return storeio.PageRef{}, false, err
 	}
-	for column := 0; column < columns; column++ {
+	for column := range columns {
 		if cursors[column] != ends[column] {
 			return storeio.PageRef{}, false, storeio.ErrFloat64StripeCorrupt
 		}
@@ -247,7 +247,7 @@ func (c *Collection) rebuildFileFloat64Stripe(
 	} else {
 		c.float64StripeColumns = c.float64StripeColumns[:columns]
 	}
-	for column := 0; column < columns; column++ {
+	for column := range columns {
 		c.float64StripeColumns[column] = storeio.Float64StripeColumn{
 			Encoding: encodings[column],
 			Values:   c.float64StripeBytes[starts[column]:ends[column]:ends[column]],
@@ -311,7 +311,7 @@ func (c *Collection) visitFileFloat64StripeRange(
 	fn func(column int, value float64) error,
 ) (uint64, error) {
 	var rows uint64
-	for ordinal := uint32(0); ordinal < count; ordinal++ {
+	for ordinal := range count {
 		chunk := first + ordinal
 		_, view, leases, err := c.loadFileChunk(state, chunk)
 		if err != nil {

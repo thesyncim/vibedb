@@ -505,6 +505,68 @@ the ordered-scan mix. Those are explicit open gaps, not projected wins.
 - Isolated leaf numbers omit router, cache, checksum, durability, and index
   maintenance costs; they are evidence, not database-level victories.
 
+## Harvested layout-qualification verdicts
+
+These per-primitive verdicts were proven in a separate `internal/storeio/vnext`
+qualification shelf. Each primitive has since graduated into the production
+`storeio` package, so the shelf was retired; the conclusions that still bind the
+production codecs are recorded here. The comparative harness was not an LSM and
+never published a reader-visible journal, tombstone, forwarding page, or delta
+overlay: one immutable root continues to name one canonical state.
+
+- Keyed fingerprint directory: stores no key bytes and routes only; the complete
+  key in the record block decides identity. A 4 KiB leaf holds 316 entries, each
+  an implied eight-bit hash prefix, a 56-bit hash suffix, and a packed 26-bit
+  stable block ID plus six-bit slot. Gate: at most 24 physical bytes per key at
+  70% occupancy. An existing-key replacement never rewrites the directory unless
+  its stable location changes.
+- Stable block map: replaces the chunk radix and must match or improve its depth,
+  cache footprint, and zone-summary behavior; it must never become a third
+  lookup layer. Ordinary block references use a 12-byte physical locator (43-bit
+  quantum offset, 48-bit generation, four-bit extent span, one-bit kind), or
+  0.1875 bytes per full 64-row block; stable block IDs never encode physical
+  offsets.
+- Raw blocks: at most 64 stable slots, each a four-byte `(row start, key end)`
+  record with JSON ending at the next live slot, ordered by a fixed 48-byte
+  six-bit lexical permutation so a cross-block ordered tree needs only fences and
+  block references, never one copied key per document. Gate: raw physical bytes
+  at most 1.20 times key plus JSON on the representative small-document corpus.
+- Packed blocks: one shared JSON prefix and suffix plus one contiguous
+  independently decodable middle per row, retaining the raw four-byte stable-slot
+  directory and permutation. A block stays raw unless packing saves at least one
+  4 KiB quantum and 12.5% of the raw physical span, and packed promotion stays
+  disabled until the integrated reader clears the read-latency gate. Gate: packed
+  physical bytes at most 0.75 times key plus JSON on repetitive blocks;
+  incompressible blocks keep exactly one canonical raw representation and readers
+  never probe a packed alternative.
+- Immutable route shard: the 50-bit collision-correct control (16-bit independent
+  tag, 32-bit stable location, two state bits), not the final space target. A tag
+  match always performs a complete-key comparison and never becomes identity, and
+  at least 99.9% of random absent probes must acquire no document extent.
+  Production scale instead needs shard-local row IDs and a separately accounted
+  immutable block map so the resident route stays at or below 5.00 bytes per
+  current key at 100 million, one billion, and modeled 100-billion-key scale;
+  retained snapshot history is reported separately against an explicit cap.
+- Posting tiles: one tile covers 64 stable chunks (4,096 rows) and
+  deterministically picks the smallest of empty, all-live, dense, maximal runs,
+  sparse chunk masks, and sparse row deltas; dense tiles are bounded at 512 bytes
+  and payloads of at most 24 bytes stay inline in the term leaf, with no
+  directory-to-posting layer. Against the 32-byte `(index, hash, chunk, mask)`
+  record the per-tile space kill gates are all-live ≤1%, dense ≤30%, maximal runs
+  ≤5%, one wide sparse mask ≤60%, one row per chunk ≤10%, and one inline
+  singleton ≤30%. The all-live codec may be promoted only when the live mask is
+  already co-resident with the term-leaf/manifest lookup.
+- Manifest posting components: a typed 128-bit content identity where hash
+  equality is only a lookup accelerator — type, length, and complete bytes must
+  match before sharing. Components are immutable and reclaimed by root
+  reachability and generation leases, never by an in-place refcount.
+- Corruption boundary: the encoder deterministically emits maximal common JSON
+  edges while the decoder accepts any structurally valid decomposition, so
+  canonicality is a writer/publication invariant and the checksum plus structural
+  validation are the sole corruption boundary. Data spans may be any 4 KiB
+  multiple from 4 through 64 KiB; metadata stays fixed at one quantum until the
+  cache and allocator support exact spans.
+
 ## Design references
 
 - [Architecture overview](../architecture.md)

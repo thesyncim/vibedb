@@ -21,7 +21,7 @@ var shapeBenchSink int
 func shapeBenchDocs(count int, hashKeys bool, b *testing.B) *Segment {
 	var set Segment
 	set.Options = document.IndexOptions{HashKeys: hashKeys}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		doc := fmt.Appendf(nil,
 			`{"id":%d,"user_id":%d,"name":"user-%04d","email":"u%d@example.com","active":%t,"score":%d.%02d,"tier":%d,"region":"eu-west-%d","ts":%d,"visits":%d,"balance":%d,"lang":"en","theme":"dark","tz":"UTC","ref":"organic","flags":%d}`,
 			i, i*7, i, i, i%2 == 0, i%100, i%97, i%5, i%3, 1700000000+i, i%1000, i*13, i%8)
@@ -37,9 +37,9 @@ func shapeBenchDocs(count int, hashKeys bool, b *testing.B) *Segment {
 func shapeBenchHeteroDocs(count int, b *testing.B) *Segment {
 	var set Segment
 	set.Options = document.IndexOptions{HashKeys: true}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		doc := []byte("{")
-		for f := 0; f < 16; f++ {
+		for f := range 16 {
 			if f > 0 {
 				doc = append(doc, ',')
 			}
@@ -81,7 +81,7 @@ func BenchmarkShapeSteadyState(b *testing.B) {
 		b.ReportAllocs()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				root := set.Doc(d).Root()
 				s, ok := cache.Resolve(root)
 				if !ok || s != shape {
@@ -98,7 +98,7 @@ func BenchmarkShapeSteadyState(b *testing.B) {
 		b.ReportAllocs()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				if _, ok := ref.In(set.Doc(d).Root()); ok {
 					hits++
 				}
@@ -110,7 +110,7 @@ func BenchmarkShapeSteadyState(b *testing.B) {
 		b.ReportAllocs()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				if _, ok := set.Doc(d).Root().Get("ts"); ok {
 					hits++
 				}
@@ -122,7 +122,7 @@ func BenchmarkShapeSteadyState(b *testing.B) {
 		b.ReportAllocs()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				if _, ok := set.Doc(d).Root().GetCompiled(key); ok {
 					hits++
 				}
@@ -135,7 +135,7 @@ func BenchmarkShapeSteadyState(b *testing.B) {
 		b.ReportAllocs()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				probe, ok := vibejson.BuildObjectProbe(set.Doc(d).Root(), storage)
 				if !ok {
 					b.Fatal("probe declined")
@@ -210,7 +210,7 @@ func BenchmarkShapeMiss(b *testing.B) {
 		declines := 0
 		for i := 0; i < b.N; i++ {
 			var cache ShapeCache
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				if _, ok := cache.Resolve(set.Doc(d).Root()); !ok {
 					declines++
 				}
@@ -227,10 +227,10 @@ func BenchmarkShapeMiss(b *testing.B) {
 		hits := 0
 		for i := 0; i < b.N; i++ {
 			var cache ShapeCache
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				cache.Resolve(set.Doc(d).Root())
 			}
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				root := set.Doc(d).Root()
 				shape, ok := cache.Resolve(root)
 				if !ok {
@@ -251,7 +251,7 @@ func BenchmarkShapeMiss(b *testing.B) {
 		b.ReportAllocs()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				probe, ok := vibejson.BuildObjectProbe(set.Doc(d).Root(), storage)
 				if !ok {
 					b.Fatal("probe declined")
@@ -266,7 +266,7 @@ func BenchmarkShapeMiss(b *testing.B) {
 	})
 	b.Run("SteadyHetero", func(b *testing.B) {
 		var cache ShapeCache
-		for d := 0; d < docs; d++ {
+		for d := range docs {
 			if _, ok := resolveCompiled(&cache, set.Doc(d).Root()); !ok {
 				b.Fatal("Resolve declined")
 			}
@@ -275,7 +275,7 @@ func BenchmarkShapeMiss(b *testing.B) {
 		b.ResetTimer()
 		hits := 0
 		for i := 0; i < b.N; i++ {
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				if _, ok := cache.Resolve(set.Doc(d).Root()); ok {
 					hits++
 				}
@@ -316,7 +316,7 @@ func BenchmarkShapeMultiField(b *testing.B) {
 			b.ReportAllocs()
 			hits := 0
 			for i := 0; i < b.N; i++ {
-				for d := 0; d < docs; d++ {
+				for d := range docs {
 					root := set.Doc(d).Root()
 					s, ok := cache.Resolve(root)
 					if !ok || s != shape {
@@ -336,7 +336,7 @@ func BenchmarkShapeMultiField(b *testing.B) {
 			b.ReportAllocs()
 			hits := 0
 			for i := 0; i < b.N; i++ {
-				for d := 0; d < docs; d++ {
+				for d := range docs {
 					root := set.Doc(d).Root()
 					for k := range keys {
 						if _, ok := root.GetCompiled(keys[k]); ok {
@@ -353,7 +353,7 @@ func BenchmarkShapeMultiField(b *testing.B) {
 			b.ReportAllocs()
 			hits := 0
 			for i := 0; i < b.N; i++ {
-				for d := 0; d < docs; d++ {
+				for d := range docs {
 					probe, ok := vibejson.BuildObjectProbe(set.Doc(d).Root(), storage)
 					if !ok {
 						b.Fatal("probe declined")

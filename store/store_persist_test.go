@@ -31,7 +31,7 @@ func buildStorePersistFixture(t testing.TB) (*Collection, map[string]string) {
 		t.Fatal(err)
 	}
 	want := make(map[string]string)
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		country := []string{"PT", "US", "DE"}[i%3]
 		status := []string{"active", "idle"}[i%2]
 		key := fmt.Sprintf("key:%02d", i)
@@ -211,7 +211,7 @@ func TestOpenStoreRejectsMalformedFramingAndManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	image := buf.Bytes()
-	for cut := 0; cut < len(image); cut++ {
+	for cut := range image {
 		if _, err := Open(image[:cut]); err == nil {
 			t.Fatalf("truncation at %d bytes opened", cut)
 		}

@@ -4,12 +4,46 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const filePrimaryPendingParentLimit = 64
+
+// primaryLeafPlacementStride is the per-rank spacing of the placement target
+// below: a wide leaf extent plus half a narrow one of slack. It must be at least
+// the widest leaf extent, since a churn insert promotes a leaf to the wide class
+// and distinct ranks' targets must not overlap; the extra half page budgets for
+// the anchor/tablet/catalog framing interleaved with the leaves so a target does
+// not fall on a neighbour's live page. Undersizing it packs targets so tightly
+// that a rank's slot is usually occupied and nearest-fit snaps the leaf onto a
+// far free extent, scattering the order the hint is restoring; oversizing it
+// spreads leaves wider than they need and grows the file with reclaimable gaps.
+// Measured on the churn qualification (100k mutations, 513 leaves): this value
+// holds the adjacency plateau near 25x for a ~7% file-size cost, an 8 KiB stride
+// only reaches ~50x, and a 12 KiB stride reaches ~5x for a ~19% file-size cost.
+// Nearest-fit only needs the stride monotonic in rank; the value is the knob.
+const primaryLeafPlacementStride = uint64(storeio.CommonPrimaryLeafWideBytes +
+	storeio.CommonPrimaryLeafNarrowBytes/2)
+
+// primaryLeafPlacementHint maps a leaf's stable lexical rank to a target file
+// offset, the placement hint a churned leaf's copy-on-write is drawn toward.
+//
+// A BucketID is tabletID<<localBits | localID, and both tablet and local ids are
+// assigned in key order at build time and preserved across every rewrite, so the
+// bucket increases monotonically with lexical order — it is the leaf's sorted
+// rank. Hinting toward rank*stride rather than the leaf's last physical offset is
+// what makes placement a restoring force instead of a random walk: a leaf that
+// churned away from its sorted position is pulled back toward it, so the physical
+// order converges on the lexical order the adjacency metric rewards. Nearest-fit
+// snaps the target to the closest reusable extent, so the stride only needs to be
+// monotonic in rank; the DataStart base keeps the hint non-zero, since a zero
+// hint disables placement.
+func primaryLeafPlacementHint(bucket storeio.BucketID, dataStart uint64) uint64 {
+	return dataStart + uint64(bucket)*primaryLeafPlacementStride
+}
 
 type filePrimaryMutationPath struct {
 	rootLease    storeio.PageLease
@@ -197,13 +231,14 @@ func (c *Collection) currentPrimaryResidentRoute(
 	state *fileStoreState,
 	key []byte,
 ) (storeio.ResidentPrimaryRoute, error) {
-	if c.primaryRouter == nil ||
-		c.primaryRouter.Generation() != state.root.Generation {
+	router := c.primaryRouter.Load()
+	if router == nil ||
+		router.Generation() != state.root.Generation {
 		return storeio.ResidentPrimaryRoute{},
 			storeio.ErrSegmentedTabletRouterCorrupt
 	}
-	route, ok := c.primaryRouter.Route(key)
-	if !ok || c.primaryRouter.Generation() != state.root.Generation {
+	route, ok := router.Route(key)
+	if !ok || router.Generation() != state.root.Generation {
 		return storeio.ResidentPrimaryRoute{},
 			storeio.ErrSegmentedTabletRouterCorrupt
 	}
@@ -414,7 +449,7 @@ func (c *Collection) putPrimary(
 			return false, err
 		}
 	}
-	leafLease, err := c.primaryRouter.AcquireLeaf(c.cache, resident)
+	leafLease, err := c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
 	if err != nil {
 		return false, err
 	}
@@ -468,6 +503,9 @@ func (c *Collection) putPrimary(
 			)
 		leafLease.Release()
 		if mutationErr != nil {
+			// A split-required signal must leave the tablet's parents durable
+			// before the caller acts on it: the split transaction (when routed)
+			// or the caller's own retry both need real pages, not pending edits.
 			if errors.Is(
 				mutationErr, ErrPrimaryLeafSplitRequired,
 			) && c.primaryPendingTablet(resident.Bucket) {
@@ -481,10 +519,10 @@ func (c *Collection) putPrimary(
 		if trackFirstTouch {
 			c.rememberBufferedFirstTouch(nextLeaf)
 		}
-		if becameEmpty && c.primaryRouter.MarkEmpty(resident) {
+		if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 			c.primaryEmptyLeaves.Add(1)
 		}
-		if filledEmpty && c.primaryRouter.ClearEmpty(resident) {
+		if filledEmpty && c.primaryRouter.Load().ClearEmpty(resident) {
 			c.removePrimaryEmptyLeaf()
 		}
 		generation = state.root.Generation + 1
@@ -542,10 +580,10 @@ func (c *Collection) putPrimary(
 	if trackFirstTouch {
 		c.rememberBufferedFirstTouch(nextLeaf)
 	}
-	if becameEmpty && c.primaryRouter.MarkEmpty(resident) {
+	if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 		c.primaryEmptyLeaves.Add(1)
 	}
-	if filledEmpty && c.primaryRouter.ClearEmpty(resident) {
+	if filledEmpty && c.primaryRouter.Load().ClearEmpty(resident) {
 		c.removePrimaryEmptyLeaf()
 	}
 	generation = state.root.Generation + 1
@@ -606,7 +644,7 @@ func (c *Collection) deletePrimary(
 			return false, err
 		}
 		leafLease, acquireErr :=
-			c.primaryRouter.AcquireLeaf(c.cache, resident)
+			c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
 		if acquireErr != nil {
 			return false, acquireErr
 		}
@@ -653,7 +691,7 @@ func (c *Collection) deletePrimary(
 			}
 			return false, mutationErr
 		}
-		if becameEmpty && c.primaryRouter.MarkEmpty(resident) {
+		if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 			c.primaryEmptyLeaves.Add(1)
 		}
 		generation = state.root.Generation + 1
@@ -706,7 +744,7 @@ func (c *Collection) deletePrimary(
 	if err != nil {
 		return false, err
 	}
-	if becameEmpty && c.primaryRouter.MarkEmpty(resident) {
+	if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 		c.primaryEmptyLeaves.Add(1)
 	}
 	generation = state.root.Generation + 1
@@ -802,7 +840,7 @@ func (c *Collection) replaceBufferedPrimaryInplace(
 		}
 		return false, replaceErr
 	}
-	c.primaryRouter.AdvanceGeneration(generation)
+	c.primaryRouter.Load().AdvanceGeneration(generation)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	c.snapshotGate.Unlock()
@@ -885,7 +923,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		Generation: generation, Length: uint32(leafBytes),
 		Kind: storeio.PagePrimaryLeaf,
 	}
-	if !c.primaryRouter.CanUpdateLeaf(
+	if !c.primaryRouter.Load().CanUpdateLeaf(
 		resident, nextLeaf, generation,
 	) {
 		return storeio.PageRef{}, false, false,
@@ -924,7 +962,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	}
 
 	c.snapshotGate.Lock()
-	c.primaryRouter.UpdateLeaf(
+	c.primaryRouter.Load().UpdateLeaf(
 		resident, nextLeaf, generation,
 	)
 	c.pageValidator.update(nextState)
@@ -998,9 +1036,19 @@ func (c *Collection) cowPrimaryMutation(
 	c.retireScratch = c.retireScratch[:0]
 	c.retireRefScratch = c.retireRefScratch[:0]
 
-	leafPage, err := tx.Allocate(
+	// Draw the rewritten leaf toward its sorted-rank target so churn pulls leaves
+	// back into lexical order instead of scattering them to the file tail and
+	// destroying scan locality (see primaryLeafPlacementHint). The parent COW
+	// pages below stay near their own retired offsets, which is enough for the
+	// handful of them a point mutation touches.
+	layout, layoutErr := storeio.MutableStoreLayout(uint32(c.options.PageSize))
+	if layoutErr != nil {
+		return storeio.PageRef{}, false, false, layoutErr
+	}
+	leafPage, err := tx.AllocateNear(
 		storeio.PagePrimaryLeaf, uint32(leafBytes),
 		path.leafRoute.Ref.LogicalID,
+		primaryLeafPlacementHint(path.leafRoute.Bucket, layout.DataStart),
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false, err
@@ -1011,10 +1059,10 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	nextLeaf = leafPage.Ref()
 
-	anchorPage, err := tx.Allocate(
+	anchorPage, err := tx.AllocateNear(
 		storeio.PagePrimaryAnchor,
 		storeio.SegmentedTabletRouterAnchorPageBytes,
-		path.anchorRoute.Ref.LogicalID,
+		path.anchorRoute.Ref.LogicalID, path.anchorRoute.Ref.Offset,
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false, err
@@ -1032,10 +1080,10 @@ func (c *Collection) cowPrimaryMutation(
 		return storeio.PageRef{}, false, false, err
 	}
 
-	tabletPage, err := tx.Allocate(
+	tabletPage, err := tx.AllocateNear(
 		storeio.PageTabletRoute,
 		storeio.GlobalTabletCatalogTabletBytes,
-		path.tabletRoute.Ref.LogicalID,
+		path.tabletRoute.Ref.LogicalID, path.tabletRoute.Ref.Offset,
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false, err
@@ -1064,10 +1112,10 @@ func (c *Collection) cowPrimaryMutation(
 		return storeio.PageRef{}, false, false, err
 	}
 
-	catalogPage, err := tx.Allocate(
+	catalogPage, err := tx.AllocateNear(
 		storeio.PagePrimaryCatalog,
 		storeio.GlobalTabletCatalogNodeBytes,
-		path.catalogLease.Header().LogicalID,
+		path.catalogLease.Header().LogicalID, path.catalogRef.Offset,
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false, err
@@ -1086,10 +1134,10 @@ func (c *Collection) cowPrimaryMutation(
 	childID := path.catalogRoute.ID
 	childRef := catalogPage.Ref()
 	if path.hasBranch {
-		branchPage, allocateErr := tx.Allocate(
+		branchPage, allocateErr := tx.AllocateNear(
 			storeio.PagePrimaryCatalog,
 			storeio.GlobalTabletCatalogNodeBytes,
-			path.branchLease.Header().LogicalID,
+			path.branchLease.Header().LogicalID, path.branchRef.Offset,
 		)
 		if allocateErr != nil {
 			return storeio.PageRef{}, false, false, allocateErr
@@ -1108,10 +1156,10 @@ func (c *Collection) cowPrimaryMutation(
 		childRef = branchPage.Ref()
 	}
 
-	rootPage, err := tx.Allocate(
+	rootPage, err := tx.AllocateNear(
 		storeio.PagePrimaryCatalog,
 		storeio.GlobalTabletCatalogRootBytes,
-		state.root.PrimaryRoot.LogicalID,
+		state.root.PrimaryRoot.LogicalID, state.root.PrimaryRoot.Offset,
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false, err
@@ -1125,7 +1173,7 @@ func (c *Collection) cowPrimaryMutation(
 	if err := rootPage.Stage(); err != nil {
 		return storeio.PageRef{}, false, false, err
 	}
-	if !c.primaryRouter.CanUpdateLeaf(
+	if !c.primaryRouter.Load().CanUpdateLeaf(
 		resident, nextLeaf, generation,
 	) {
 		return storeio.PageRef{}, false, false,
@@ -1261,6 +1309,28 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	c.retireScratch = c.retireScratch[:0]
 	c.retireRefScratch = c.retireRefScratch[:0]
 
+	layout, layoutErr := storeio.MutableStoreLayout(uint32(c.options.PageSize))
+	if layoutErr != nil {
+		return layoutErr
+	}
+
+	// Allocate the checkpointed leaves in ascending lexical rank so consecutive
+	// ranks claim consecutive reusable extents. The nearest-fit placement below
+	// only preserves order if the requests arrive in order: an out-of-order high
+	// rank would otherwise take a low reusable slot a lower rank wanted. The
+	// subsequent parent loops group by page reference and are order independent,
+	// so this reordering is confined to placement quality.
+	slices.SortFunc(c.primaryPendingParents, func(a, b filePrimaryPendingParent) int {
+		switch {
+		case a.leafRoute.Bucket < b.leafRoute.Bucket:
+			return -1
+		case a.leafRoute.Bucket > b.leafRoute.Bucket:
+			return 1
+		default:
+			return 0
+		}
+	})
+
 	for index := range c.primaryPendingParents {
 		pending := &c.primaryPendingParents[index]
 		lease, acquireErr := c.cache.Acquire(
@@ -1270,9 +1340,13 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 			return acquireErr
 		}
 		header := lease.Header()
-		page, allocateErr := tx.Allocate(
+		// Draw the checkpointed leaf toward its sorted-rank target rather than its
+		// last physical offset, so churn pulls each leaf back into lexical order
+		// instead of scattering it. See primaryLeafPlacementHint.
+		page, allocateErr := tx.AllocateNear(
 			storeio.PagePrimaryLeaf, header.PageSize,
 			pending.volatileRef.LogicalID,
+			primaryLeafPlacementHint(pending.leafRoute.Bucket, layout.DataStart),
 		)
 		if allocateErr != nil {
 			lease.Release()
@@ -1355,10 +1429,10 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 				}
 			rewriteCount++
 		}
-		anchorPage, allocateErr := tx.Allocate(
+		anchorPage, allocateErr := tx.AllocateNear(
 			storeio.PagePrimaryAnchor,
 			storeio.SegmentedTabletRouterAnchorPageBytes,
-			pending.anchorRoute.Ref.LogicalID,
+			pending.anchorRoute.Ref.LogicalID, pending.anchorRoute.Ref.Offset,
 		)
 		if allocateErr == nil {
 			_, allocateErr = tablet.RewriteAnchorHandles(
@@ -1435,10 +1509,10 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 				}
 			rewriteCount++
 		}
-		tabletPage, allocateErr := tx.Allocate(
+		tabletPage, allocateErr := tx.AllocateNear(
 			storeio.PageTabletRoute,
 			storeio.GlobalTabletCatalogTabletBytes,
-			pending.tabletRoute.Ref.LogicalID,
+			pending.tabletRoute.Ref.LogicalID, pending.tabletRoute.Ref.Offset,
 		)
 		var rawRoot []byte
 		if allocateErr == nil {
@@ -1536,10 +1610,10 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 				}
 			rewriteCount++
 		}
-		catalogPage, allocateErr := tx.Allocate(
+		catalogPage, allocateErr := tx.AllocateNear(
 			storeio.PagePrimaryCatalog,
 			storeio.GlobalTabletCatalogNodeBytes,
-			pending.catalogRef.LogicalID,
+			pending.catalogRef.LogicalID, pending.catalogRef.Offset,
 		)
 		if allocateErr == nil {
 			_, allocateErr = catalog.RewriteHandles(
@@ -1612,10 +1686,10 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 				}
 			rewriteCount++
 		}
-		branchPage, allocateErr := tx.Allocate(
+		branchPage, allocateErr := tx.AllocateNear(
 			storeio.PagePrimaryCatalog,
 			storeio.GlobalTabletCatalogNodeBytes,
-			pending.branchRef.LogicalID,
+			pending.branchRef.LogicalID, pending.branchRef.Offset,
 		)
 		if allocateErr == nil {
 			_, allocateErr = branch.RewriteHandles(
@@ -1681,10 +1755,10 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 			}
 		rewriteCount++
 	}
-	rootPage, err := tx.Allocate(
+	rootPage, err := tx.AllocateNear(
 		storeio.PagePrimaryCatalog,
 		storeio.GlobalTabletCatalogRootBytes,
-		base.root.PrimaryRoot.LogicalID,
+		base.root.PrimaryRoot.LogicalID, base.root.PrimaryRoot.Offset,
 	)
 	if err == nil {
 		_, err = root.RewriteHandles(
@@ -1746,7 +1820,7 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	abort = false
 	for index := range c.primaryPendingParents {
 		pending := &c.primaryPendingParents[index]
-		c.primaryRouter.UpdateLeaf(
+		c.primaryRouter.Load().UpdateLeaf(
 			pending.resident, pending.checkpointLeaf,
 			generation,
 		)
@@ -1924,7 +1998,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 		c.commitFreeLog(freeLog)
 		c.inlineFree = nextInline
 		c.snapshotGate.Lock()
-		c.primaryRouter.UpdateLeaf(
+		c.primaryRouter.Load().UpdateLeaf(
 			route, nextLeaf, nextState.root.Generation,
 		)
 		c.pageValidator.update(nextState)
@@ -1939,7 +2013,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 		c.snapshotGate.Unlock()
 		return err
 	}
-	c.primaryRouter.UpdateLeaf(
+	c.primaryRouter.Load().UpdateLeaf(
 		route, nextLeaf, nextState.root.Generation,
 	)
 	c.pageValidator.update(nextState)

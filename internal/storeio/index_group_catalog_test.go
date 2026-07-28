@@ -91,7 +91,7 @@ func TestIndexGroupCatalogRoundTrip(t *testing.T) {
 			err, ErrIndexGroupCatalogCorrupt,
 		)
 	}
-	for cut := 0; cut < len(encoded); cut++ {
+	for cut := range encoded {
 		if _, err := OpenIndexGroupCatalog(
 			encoded[:cut], 3, 1, 8, 64*uint64(testSuperblockPageSize), 32,
 			testSuperblockPageSize,

@@ -87,7 +87,7 @@ func TestStorePackedIndexDeltaShadowsWholeChunk(t *testing.T) {
 	if err := builder.CreateIndex(IndexDefinition{Name: "v", Paths: []string{"/v"}}); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if err := builder.Append(string(rune('a'+i)), []byte(`{"v":1}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +162,7 @@ func TestStoreIndexMasksNextMatchesOrderedTraversal(t *testing.T) {
 
 func TestStoreOnlineBackfillFoldsPackedBase(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 2}}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if _, err := collection.Put(string(rune('a'+i)), []byte(`{"nested":{"v":1}}`)); err != nil {
 			t.Fatal(err)
 		}

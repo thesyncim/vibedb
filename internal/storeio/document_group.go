@@ -882,7 +882,7 @@ func (v DocumentGroupView) Chunk(chunkID uint32) (DocumentGroupChunkView, bool) 
 	firstRow := int(binary.LittleEndian.Uint16(v.payload[descriptor+12 : descriptor+14]))
 	count := int(v.payload[descriptor+14])
 	columnOffset := v.columnStart
-	for chunk := 0; chunk < ordinal; chunk++ {
+	for chunk := range ordinal {
 		cd := v.chunkStart + chunk*DocumentGroupChunkSize
 		live := binary.LittleEndian.Uint64(v.payload[cd+4 : cd+12])
 		for range int(v.header.ColumnCount) {

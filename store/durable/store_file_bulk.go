@@ -10,11 +10,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
-	"github.com/thesyncim/vibedb/internal/storeio"
-	"github.com/thesyncim/vibedb/store"
 )
 
 // CreateFrom writes a completed in-memory store.Collection as one durable
@@ -347,7 +347,7 @@ func (b *fileStoreBulkBuild) prepareGroupedChunks(first, last int, documents boo
 		clear(b.groupValues)
 	}
 
-	for chunkOrdinal := 0; chunkOrdinal < chunkCount; chunkOrdinal++ {
+	for chunkOrdinal := range chunkCount {
 		plan := &b.documents[first+chunkOrdinal]
 		if plan.overflow {
 			return nil, fmt.Errorf("%w: overflow row in document group", storeio.ErrInvalidWrite)
@@ -1111,7 +1111,7 @@ func (b *fileStoreBulkBuild) planFloat64Stripes() error {
 			storeio.PageHeaderSize + storeio.PageTrailerSize +
 				storeio.Float64StripePayloadHeaderSize + columns*storeio.Float64StripeColumnSize,
 		)
-		for column := 0; column < columns; column++ {
+		for column := range columns {
 			offset := document*columns + column
 			nextCount := counts[column] + uint64(b.float64Counts[offset])
 			nextEncoding := max(encodings[column], b.float64Encodings[offset])
@@ -1137,7 +1137,7 @@ func (b *fileStoreBulkBuild) planFloat64Stripes() error {
 		if tooLarge {
 			return storeio.ErrInvalidWrite
 		}
-		for column := 0; column < columns; column++ {
+		for column := range columns {
 			offset := document*columns + column
 			counts[column] += uint64(b.float64Counts[offset])
 			encodings[column] = max(encodings[column], b.float64Encodings[offset])
@@ -1200,7 +1200,7 @@ func (b *fileStoreBulkBuild) float64GroupExtent(first, last int) (uint32, bool) 
 		len(b.options.float64Columns)*4 +
 		(last-first)*len(b.options.float64Columns)*8
 	columns := len(b.options.float64Columns)
-	for column := 0; column < columns; column++ {
+	for column := range columns {
 		encoding := uint8(0)
 		count := 0
 		for document := first; document < last; document++ {
@@ -2194,7 +2194,7 @@ func (b *fileStoreBulkBuild) writeFloat64StripePages(file *os.File, scratch []by
 		if cap(b.float64StripeValues) < int(plan.ref.Length) {
 			b.float64StripeValues = make([]byte, 0, plan.ref.Length)
 		}
-		for column := 0; column < columns; column++ {
+		for column := range columns {
 			encodingRank := uint8(0)
 			for document := plan.first; document < plan.last; document++ {
 				encodingRank = max(
@@ -2241,7 +2241,7 @@ func (b *fileStoreBulkBuild) writeFloat64StripePages(file *os.File, scratch []by
 				Encoding: encoding,
 			}
 		}
-		for column := 0; column < columns; column++ {
+		for column := range columns {
 			b.float64StripeColumns[column].Values =
 				b.float64StripeValues[starts[column]:ends[column]:ends[column]]
 		}

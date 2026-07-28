@@ -4,8 +4,8 @@ import (
 	"math"
 	"testing"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func TestFileMaterializationProjectionsEqual(t *testing.T) {

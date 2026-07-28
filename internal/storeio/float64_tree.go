@@ -197,14 +197,14 @@ func walkFloat64DirectoryPage(
 	}
 	var entries [Float64DirectoryFanout]Float64DirectoryEntry
 	count := view.Len()
-	for i := 0; i < count; i++ {
+	for i := range count {
 		entries[i], _ = view.EntryAt(i)
 	}
 	lease.Release()
 	if count == 0 || entries[0].FirstChunk != expectedLower {
 		return ErrFloat64CatalogCorrupt
 	}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if err := walkFloat64DirectoryPage(
 			cache, entries[i].Ref, expectedLevel-1,
 			entries[i].FirstChunk, bounds, allocationQuantum, fn,
@@ -292,7 +292,7 @@ func walkFloat64DirectoryLevel(
 	}
 	var entries [Float64DirectoryFanout]Float64DirectoryEntry
 	count := view.Len()
-	for i := 0; i < count; i++ {
+	for i := range count {
 		entries[i], _ = view.EntryAt(i)
 	}
 	lease.Release()
@@ -305,7 +305,7 @@ func walkFloat64DirectoryLevel(
 	if expectedLevel < targetLevel {
 		return ErrFloat64CatalogCorrupt
 	}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if err := walkFloat64DirectoryLevel(
 			cache, entries[i].Ref, expectedLevel-1,
 			entries[i].FirstChunk, targetLevel, bounds,
@@ -372,7 +372,7 @@ func rewriteFloat64DirectoryPage(
 	header := view.Header()
 	var entries [Float64DirectoryFanout]Float64DirectoryEntry
 	count := view.Len()
-	for i := 0; i < count; i++ {
+	for i := range count {
 		entries[i], _ = view.EntryAt(i)
 	}
 	lease.Release()

@@ -48,22 +48,34 @@ const (
 )
 
 var (
+	// ErrTabletLocalIdentityCorrupt reports that an identity image failed
+	// checksum or structural admission and must not be read.
 	ErrTabletLocalIdentityCorrupt = errors.New(
 		"vibejson: corrupt tablet-local identity image",
 	)
+	// ErrTabletLocalIdentityScratch reports that a retirement batch was handed a
+	// scratch buffer too small to stage its work.
 	ErrTabletLocalIdentityScratch = errors.New(
 		"vibejson: tablet-local identity retirement scratch is too small",
 	)
+	// ErrTabletLocalIdentityReuse reports that a LocalID cannot be reassigned
+	// yet because its retirement is still reachable by the selecting snapshot.
 	ErrTabletLocalIdentityReuse = errors.New(
 		"vibejson: tablet-local identity is not safe to reuse",
 	)
 )
 
+// TabletLocalIdentityState is the lifecycle state of one LocalID slot in a
+// tablet's local-identity image.
 type TabletLocalIdentityState uint8
 
 const (
+	// TabletLocalIdentityEmpty is a LocalID that has never been assigned.
 	TabletLocalIdentityEmpty TabletLocalIdentityState = iota
+	// TabletLocalIdentityLive is a LocalID bound to a current anchor location.
 	TabletLocalIdentityLive
+	// TabletLocalIdentityRetired is a LocalID whose binding has been dropped;
+	// its slot is not reusable until its retirement generation clears ReuseFloor.
 	TabletLocalIdentityRetired
 )
 
@@ -113,11 +125,19 @@ type TabletLocalIdentityView struct {
 	descriptor  TabletLocalIdentityDescriptor
 }
 
+// TabletLocalIdentityOperation names the structural edit one batch applies to a
+// LocalID slot.
 type TabletLocalIdentityOperation uint8
 
 const (
+	// TabletLocalIdentityAssign binds a fresh or safely reusable LocalID to an
+	// anchor location.
 	TabletLocalIdentityAssign TabletLocalIdentityOperation = iota + 1
+	// TabletLocalIdentityMove preserves a LocalID's identity while changing the
+	// anchor row it points at.
 	TabletLocalIdentityMove
+	// TabletLocalIdentityRetire drops a LocalID's binding, moving it to the
+	// retired state.
 	TabletLocalIdentityRetire
 )
 
@@ -251,7 +271,7 @@ func OpenTabletLocalIdentity(
 	live := 0
 	retired := 0
 	retirementAt := 0
-	for localID := 0; localID < TabletLocalIdentityLocalCount; localID++ {
+	for localID := range TabletLocalIdentityLocalCount {
 		code := binary.LittleEndian.Uint16(image[localID*2:])
 		switch {
 		case code < tabletLocalIdentityLiveEnd:
@@ -444,7 +464,7 @@ func RewriteTabletLocalIdentity(
 	editAt := 0
 	retirementAt := 0
 	liveCount := 0
-	for local := 0; local < TabletLocalIdentityLocalCount; local++ {
+	for local := range TabletLocalIdentityLocalCount {
 		localID := uint16(local)
 		code := binary.LittleEndian.Uint16(base.image[local*2:])
 		state := TabletLocalIdentityEmpty

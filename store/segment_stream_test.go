@@ -101,7 +101,7 @@ func TestSegmentReadFromChunkStraddle(t *testing.T) {
 	follower := `{"id":123,"tags":["a","b"],"nested":{"deep":true}}`
 	for _, variant := range segmentOptionVariants() {
 		var docs []string
-		for pad := 0; pad < 96; pad++ {
+		for pad := range 96 {
 			docs = append(docs, fmt.Sprintf(`{"pad":"%s"}`, strings.Repeat("x", 64+pad*7)))
 			docs = append(docs, follower)
 		}
@@ -163,7 +163,7 @@ func TestSegmentReadFromWindowBoundary(t *testing.T) {
 // post-refill commits interleave without disturbing each other.
 func TestSegmentReadFromLargeDocStream(t *testing.T) {
 	var docs []string
-	for i := 0; i < 24; i++ {
+	for i := range 24 {
 		docs = append(docs, fmt.Sprintf(`{"seq":%d,"pad":"%s"}`, i, strings.Repeat("z", 500<<10+i*257)))
 	}
 	stream := joinDocs(docs, "\n")
@@ -183,10 +183,7 @@ func largeDocFixture(seq, size int) string {
 	head := fmt.Sprintf(`{"seq":%d,"active":%t,"score":%d.%02d,"tags":["go","json","doc-%d"],"meta":{"tier":%d,"ratio":0.%04d},"text":"`,
 		seq, seq%2 == 0, seq%100, seq%97, seq%16, seq%8, seq%9973)
 	const tail = `"}`
-	pad := size - len(head) - len(tail)
-	if pad < 1 {
-		pad = 1
-	}
+	pad := max(size-len(head)-len(tail), 1)
 	var sb strings.Builder
 	sb.Grow(len(head) + pad + len(tail))
 	sb.WriteString(head)
@@ -210,7 +207,7 @@ func TestSegmentReadFromLargeDocFastWalk(t *testing.T) {
 	const docBytes = 466 << 10
 	count := testIterations(12, 4)
 	var docs []string
-	for i := 0; i < count; i++ {
+	for i := range count {
 		docs = append(docs, largeDocFixture(i, docBytes))
 	}
 	stream := joinDocs(docs, "\n")
@@ -374,7 +371,7 @@ func TestSegmentReadFromHandleStability(t *testing.T) {
 
 	count := testIterations(100_000, 10_000)
 	var sb strings.Builder
-	for i := 0; i < count; i++ {
+	for i := range count {
 		fmt.Fprintf(&sb, "{\"seq\":%d,\"pad\":\"%s\"}\n", i, strings.Repeat("p", i%53))
 	}
 	if _, err := s.ReadFrom(strings.NewReader(sb.String())); err != nil {
@@ -443,7 +440,7 @@ func TestGCCorruptionSegmentReadFrom(t *testing.T) {
 	// the torn iterations roll them through the slow lane.
 	docs := segmentTestCorpus()
 	docs = append(docs, `{"big":"`+strings.Repeat("g", 200<<10)+`"}`)
-	for i := 0; i < 400; i++ {
+	for i := range 400 {
 		docs = append(docs, fmt.Sprintf(`{"filler":%d,"pad":"%s"}`, i, strings.Repeat("f", i%211)))
 	}
 	docs = append(docs, `{"bigger":"`+strings.Repeat("h", 700<<10)+`"}`)
@@ -462,12 +459,12 @@ func TestGCCorruptionSegmentReadFrom(t *testing.T) {
 	const iters = 12
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			var retained []*Segment
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(48+id, it)
 				seg := &Segment{Options: opts}
 				var in io.Reader

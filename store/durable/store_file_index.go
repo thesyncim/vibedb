@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"math/bits"
 
-	vibejson "github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // AppendIndexes appends the frozen exact-index catalog visible to this file

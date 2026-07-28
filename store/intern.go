@@ -178,10 +178,7 @@ func (in *KeyInterner) nextChunk(need int) {
 		return
 	}
 
-	size := 2 * cap(in.chunk)
-	if size < internMinChunk {
-		size = internMinChunk
-	}
+	size := max(2*cap(in.chunk), internMinChunk)
 	if size > internMaxChunk {
 		size = internMaxChunk
 	}
@@ -196,10 +193,7 @@ func (in *KeyInterner) nextChunk(need int) {
 // grow doubles the table and reinserts every id from its stored hash. Only
 // slots move; key bytes and identifiers are untouched.
 func (in *KeyInterner) grow() {
-	size := 2 * len(in.table)
-	if size < internMinTable {
-		size = internMinTable
-	}
+	size := max(2*len(in.table), internMinTable)
 	table := make([]uint32, size)
 	mask := uint32(size - 1)
 	for id, hash := range in.hashes {

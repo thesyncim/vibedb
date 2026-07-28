@@ -217,7 +217,7 @@ func OpenKeyDirectoryPage(src []byte, fileEnd, nextLogicalID uint64, chunkHighWa
 	var previous []byte
 	var previousEnd uint32
 	var seen chunkDirectoryRefSet
-	for i := 0; i < count; i++ {
+	for i := range count {
 		record := payload[KeyDirectoryPayloadHeaderSize+i*recordSize:]
 		keyEnd := binary.LittleEndian.Uint32(record[0:4])
 		if keyEnd < previousEnd || uint64(keyEnd) > uint64(dataLength) {

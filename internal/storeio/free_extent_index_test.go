@@ -131,6 +131,182 @@ func TestFreeExtentIndexRandomizedDifferential(t *testing.T) {
 	}
 }
 
+func TestFreeExtentIndexNearestFitBoundaries(t *testing.T) {
+	// Offsets are (i+4)*4KiB, so extent i sits at offset (i+4)*4096.
+	extents := freeExtentIndexTestExtents(130)
+	for i := range extents {
+		extents[i].Length = 4 << 10
+	}
+	// Only two extents can hold a 64 KiB request: one low, one high.
+	extents[20].Length = 64 << 10
+	extents[100].Length = 64 << 10
+
+	var index FreeExtentIndex
+	storage := make([]uint64, FreeExtentIndexCapacity(len(extents)))
+	if !index.Rebuild(extents, storage) {
+		t.Fatal("Rebuild failed")
+	}
+
+	offsetOf := func(i int) uint64 { return uint64(i+4) * (4 << 10) }
+
+	// A 4 KiB request finds the extent whose offset is nearest the hint, on
+	// either side, exactly at a boundary, and clamped past both ends.
+	cases := []struct {
+		hint uint64
+		want uint64
+		idx  int
+		ok   bool
+	}{
+		{hint: 0, want: 4 << 10, idx: 0, ok: true},                           // below all
+		{hint: offsetOf(129) + (1 << 20), want: 4 << 10, idx: 129, ok: true}, // above all
+		{hint: offsetOf(50), want: 4 << 10, idx: 50, ok: true},               // exact hit
+		{hint: offsetOf(50) + (1 << 10), want: 4 << 10, idx: 50, ok: true},   // just above 50
+		{hint: offsetOf(50) - (1 << 10), want: 4 << 10, idx: 50, ok: true},   // just below 50
+		// Exactly midway between offsets 50 and 51: tie favours the lower offset.
+		{hint: offsetOf(50) + (2 << 10), want: 4 << 10, idx: 50, ok: true},
+		// A 64 KiB request only fits at 20 or 100; the nearer wins, ties low.
+		{hint: offsetOf(0), want: 64 << 10, idx: 20, ok: true},
+		{hint: offsetOf(129), want: 64 << 10, idx: 100, ok: true},
+		{hint: offsetOf(60), want: 64 << 10, idx: 20, ok: true},  // 40 vs 40 -> lower
+		{hint: offsetOf(61), want: 64 << 10, idx: 100, ok: true}, // 41 vs 39 -> high
+		{hint: offsetOf(60), want: 128 << 10, idx: 0, ok: false}, // nothing fits
+	}
+	for _, c := range cases {
+		got, ok := index.NearestFit(extents, c.want, c.hint)
+		if got != c.idx || ok != c.ok {
+			t.Fatalf(
+				"NearestFit(want=%d hint=%d) = %d, %v; want %d, %v",
+				c.want, c.hint, got, ok, c.idx, c.ok,
+			)
+		}
+	}
+
+	// A zero-length request, a resized slice, and an unbuilt index all miss.
+	if _, ok := index.NearestFit(extents, 0, offsetOf(50)); ok {
+		t.Fatal("zero-length NearestFit succeeded")
+	}
+	if _, ok := index.NearestFit(extents[:64], 4<<10, offsetOf(10)); ok {
+		t.Fatal("resized NearestFit succeeded")
+	}
+	var empty FreeExtentIndex
+	if _, ok := empty.NearestFit(extents, 4<<10, offsetOf(10)); ok {
+		t.Fatal("unbuilt NearestFit succeeded")
+	}
+}
+
+func TestFreeExtentIndexNearestFitSingleGroup(t *testing.T) {
+	// A single leaf group (<= fan-out extents) exercises the direct-scan paths
+	// with no hierarchy ascent on either side.
+	for _, count := range []int{1, 2, 63, 64} {
+		t.Run(testCountName(count), func(t *testing.T) {
+			extents := freeExtentIndexTestExtents(count)
+			for i := range extents {
+				extents[i].Length = 4 << 10
+			}
+			var index FreeExtentIndex
+			storage := make([]uint64, FreeExtentIndexCapacity(count))
+			if !index.Rebuild(extents, storage) {
+				t.Fatal("Rebuild failed")
+			}
+			for hintScale := 0; hintScale < count+8; hintScale++ {
+				hint := uint64(hintScale) * (4 << 10)
+				got, ok := index.NearestFit(extents, 4<<10, hint)
+				wantIdx, wantOK := linearFreeExtentNearestFit(extents, 4<<10, hint)
+				if got != wantIdx || ok != wantOK {
+					t.Fatalf(
+						"count %d hint %d: indexed = %d, %v; linear = %d, %v",
+						count, hint, got, ok, wantIdx, wantOK,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestFreeExtentIndexNearestFitRandomizedDifferential(t *testing.T) {
+	random := rand.New(rand.NewSource(0x4ea5_e57f))
+	for _, count := range []int{1, 2, 63, 64, 65, 255, 256, 4_096, 46_200} {
+		extents := freeExtentIndexTestExtents(count)
+		for i := range extents {
+			extents[i].Length = uint64(random.Intn(33)) * (4 << 10)
+		}
+		storage := make([]uint64, FreeExtentIndexCapacity(count))
+		var index FreeExtentIndex
+		if !index.Rebuild(extents, storage) {
+			t.Fatalf("count %d: Rebuild failed", count)
+		}
+		// Hints span below the first offset through above the last so both
+		// directional descents, boundary clamping, and exact hits are covered.
+		span := uint64(count+8) * (4 << 10)
+		iterations := 4_000
+		if count == 46_200 {
+			iterations = 12_000
+		}
+		for iteration := 0; iteration < iterations; iteration++ {
+			want := uint64(random.Intn(40)+1) * (4 << 10)
+			hint := uint64(random.Int63n(int64(span)))
+			got, gotOK := index.NearestFit(extents, want, hint)
+			wantIdx, wantOK := linearFreeExtentNearestFit(extents, want, hint)
+			if got != wantIdx || gotOK != wantOK {
+				t.Fatalf(
+					"count %d iteration %d want %d hint %d: indexed = %d, %v; linear = %d, %v",
+					count, iteration, want, hint, got, gotOK, wantIdx, wantOK,
+				)
+			}
+			changed := random.Intn(count)
+			extents[changed].Length = uint64(random.Intn(33)) * (4 << 10)
+			if !index.Update(extents, changed) {
+				t.Fatalf("count %d iteration %d: Update(%d) failed", count, iteration, changed)
+			}
+		}
+	}
+}
+
+func TestFreeExtentIndexNearestFitZeroAllocation(t *testing.T) {
+	extents := freeExtentIndexTestExtents(46_200)
+	for i := range extents {
+		extents[i].Length = uint64(i%32+1) * (4 << 10)
+	}
+	storage := make([]uint64, FreeExtentIndexCapacity(len(extents)))
+	var index FreeExtentIndex
+	if !index.Rebuild(extents, storage) {
+		t.Fatal("Rebuild failed")
+	}
+	hint := uint64(20_000) * (4 << 10)
+	if allocations := testing.AllocsPerRun(1_000, func() {
+		if _, ok := index.NearestFit(extents, 64<<10, hint); !ok {
+			panic("NearestFit failed")
+		}
+	}); allocations != 0 {
+		t.Fatalf("NearestFit allocations = %g, want 0", allocations)
+	}
+}
+
+// linearFreeExtentNearestFit is the O(n) reference: the offset-nearest extent
+// that satisfies want, ties resolved toward the lower offset (the first seen in
+// ascending order).
+func linearFreeExtentNearestFit(extents []FreeExtent, want, hint uint64) (int, bool) {
+	best := -1
+	var bestDistance uint64
+	for i := range extents {
+		if extents[i].Length < want {
+			continue
+		}
+		distance := extents[i].Offset - hint
+		if extents[i].Offset < hint {
+			distance = hint - extents[i].Offset
+		}
+		if best < 0 || distance < bestDistance {
+			best = i
+			bestDistance = distance
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
+}
+
 func TestFreeExtentIndexRejectsInvalidUse(t *testing.T) {
 	extents := freeExtentIndexTestExtents(65)
 	required := FreeExtentIndexCapacity(len(extents))

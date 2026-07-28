@@ -187,7 +187,7 @@ func OpenChunkDirectoryPage(src []byte, fileEnd, nextLogicalID uint64) (ChunkDir
 		return ChunkDirectoryView{}, fmt.Errorf("%w: %v", ErrChunkDirectoryCorrupt, err)
 	}
 	var seen chunkDirectoryRefSet
-	for i := 0; i < count; i++ {
+	for i := range count {
 		start := ChunkDirectoryPayloadHeaderSize + i*PageRefSize
 		encoded := payload[start : start+PageRefSize]
 		ref := decodePageRef(encoded)

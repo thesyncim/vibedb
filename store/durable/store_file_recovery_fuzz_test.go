@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // Recovery is the one entry point that must accept bytes it did not write.

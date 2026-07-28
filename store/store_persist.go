@@ -550,7 +550,7 @@ func (m storePersistManifest) open(data []byte) (*Collection, error) {
 			zone: chunkZone{state: zoneStateStale},
 		}
 		var slotsSeen, ordSeen uint64
-		for i := uint32(0); i < count; i++ {
+		for range count {
 			keyHeader := r.bytes(8)
 			if !r.ok {
 				return nil, fmt.Errorf("%w: chunk %d key header", ErrCheckpointCorrupt, id)

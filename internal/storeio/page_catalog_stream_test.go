@@ -40,7 +40,7 @@ func TestOpenPageCatalogChainAtAllocationQuanta(t *testing.T) {
 		Float64Paths: []string{"/score", "/metrics/latency"},
 		Schema:       &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 2_000; i++ {
+	for i := range 2_000 {
 		definition.Schema.Fields = append(
 			definition.Schema.Fields,
 			PageCatalogSchemaField{
@@ -299,7 +299,7 @@ func pageCatalogStreamingTestCatalog(
 	definition := PageCatalogDefinition{
 		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
-	for i := 0; i < 900; i++ {
+	for i := range 900 {
 		definition.Schema.Fields = append(
 			definition.Schema.Fields,
 			PageCatalogSchemaField{

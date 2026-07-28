@@ -324,12 +324,12 @@ func BenchmarkFilePrimaryPointRead(b *testing.B) {
 		b.StopTimer()
 		reportReadResidency(b, collection.Stats(), base)
 		b.ReportMetric(
-			float64(collection.primaryRouter.ResidentBytes())/
+			float64(collection.primaryRouter.Load().ResidentBytes())/
 				float64(benchReadCorpusSize),
 			"router-B/doc",
 		)
 		b.ReportMetric(
-			float64(collection.primaryRouter.BuildDuration().Nanoseconds()),
+			float64(collection.primaryRouter.Load().BuildDuration().Nanoseconds()),
 			"router-build-ns",
 		)
 	})
@@ -359,7 +359,7 @@ func BenchmarkFilePrimaryPointRead(b *testing.B) {
 		b.StopTimer()
 		reportReadResidency(b, collection.Stats(), base)
 		b.ReportMetric(
-			float64(collection.primaryRouter.ResidentBytes())/
+			float64(collection.primaryRouter.Load().ResidentBytes())/
 				float64(benchReadCorpusSize),
 			"router-B/doc",
 		)

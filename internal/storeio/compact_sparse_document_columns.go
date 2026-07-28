@@ -283,7 +283,7 @@ func rewriteCompactSparseFloat64Row(dst []byte, view CompactSparseDocumentPageVi
 
 func compactSparseDocumentMaxRecordEnd(page []byte, count int) int {
 	maxEnd := CompactSparseDocumentPageHeapStart
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		start, keyLength, valueLength := compactSparseDocumentDescriptor(page, rank)
 		if valueLength == 0 {
 			valueLength = DocumentOverflowDescriptorSize

@@ -325,7 +325,7 @@ func primaryLTRPrefetch(
 	t.Helper()
 	var refs [64]storeio.PageRef
 	for at, key := range keys {
-		route, ok := collection.primaryRouter.Route([]byte(key))
+		route, ok := collection.primaryRouter.Load().Route([]byte(key))
 		if !ok {
 			t.Fatalf("prefetch route %q not found", key)
 		}

@@ -206,14 +206,14 @@ func TestVerifyDetectsExistingPrimaryCatalogCorruptionClasses(t *testing.T) {
 			mapBytes := int(binary.LittleEndian.Uint32(payload[12:16]))
 			mapStart := storeio.PageHeaderSize +
 				storeio.GlobalTabletCatalogNodePayloadHeaderBytes
-			bucketAt := mapStart + storeio.TabletAnchorMapLabHeaderSize +
-				storeio.TabletAnchorMapLabAcceleratorSlots*2 + 2
+			bucketAt := mapStart + storeio.TabletAnchorMapHeaderSize +
+				storeio.TabletAnchorMapAcceleratorSlots*2 + 2
 			binary.LittleEndian.PutUint32(
 				page[bucketAt:bucketAt+4],
 				storeio.GlobalTabletCatalogMaxLeafPages,
 			)
 			resealPrimaryOpenTestTrailer(
-				page, mapStart+mapBytes-storeio.TabletAnchorMapLabTrailerSize,
+				page, mapStart+mapBytes-storeio.TabletAnchorMapTrailerSize,
 			)
 			if _, err := storeio.SealPage(page); err != nil {
 				t.Fatal(err)

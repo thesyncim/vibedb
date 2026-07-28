@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func TestWriteFileStoreBulkPreservesDocumentsIndexesAndMutation(t *testing.T) {

@@ -227,9 +227,7 @@ func TestFileStoreBufferedInplaceConcurrentReadsNeverSeeTornVersion(
 	startReaders := make(chan struct{})
 	var readers sync.WaitGroup
 	for range 2 {
-		readers.Add(1)
-		go func() {
-			defer readers.Done()
+		readers.Go(func() {
 			<-startReaders
 			for !stop.Load() {
 				if pause.Load() {
@@ -266,7 +264,7 @@ func TestFileStoreBufferedInplaceConcurrentReadsNeverSeeTornVersion(
 				// transition while the reader goroutine remains concurrent.
 				time.Sleep(time.Microsecond)
 			}
-		}()
+		})
 	}
 
 	baseline := collection.Stats().BufferedInplaceUpdates

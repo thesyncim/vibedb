@@ -134,7 +134,7 @@ func TestFilePrimaryOrderedScanDifferential100K(t *testing.T) {
 	verifyFull("primary", primarySnapshot)
 
 	random := rand.New(rand.NewSource(2203))
-	for sample := 0; sample < 1_000; sample++ {
+	for sample := range 1_000 {
 		first := random.Intn(count)
 		last := min(first+random.Intn(128), count)
 		lower := []byte(keys[first])
@@ -167,7 +167,7 @@ func TestFilePrimaryOrderedScanDifferential100K(t *testing.T) {
 		}
 	}
 
-	for sample := 0; sample < 1_000; sample++ {
+	for sample := range 1_000 {
 		selected := random.Intn(count)
 		// Dropping one or two decimal digits exercises prefixes spanning leaf
 		// boundaries without turning each sample into another full scan.

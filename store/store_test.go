@@ -16,10 +16,10 @@ import (
 func TestStoreChunkVectorSparseTraversal(t *testing.T) {
 	var vector storeChunkVector
 	keep := map[uint32]bool{0: true, 31: true, 32: true, 1023: true, 1024: true, 1099: true}
-	for id := uint32(0); id < 1100; id++ {
+	for range uint32(1100) {
 		vector, _ = vector.append(&Chunk{})
 	}
-	for id := uint32(0); id < 1100; id++ {
+	for id := range uint32(1100) {
 		if !keep[id] {
 			vector = vector.set(id, nil)
 		}
@@ -216,7 +216,7 @@ func TestStoreMutationSnapshotDifferential(t *testing.T) {
 			want := make(map[string]string)
 			rng := rand.New(rand.NewSource(7))
 			var held []Snapshot
-			for step := 0; step < 4000; step++ {
+			for step := range 4000 {
 				key := fmt.Sprintf("key-%03d", rng.Intn(300))
 				switch rng.Intn(5) {
 				case 0:
@@ -268,7 +268,7 @@ func TestStoreMutationSnapshotDifferential(t *testing.T) {
 
 func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 8, ShapeTapes: true}}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		doc := fmt.Sprintf(`{"id":%d,"group":1,"active":true,"name":"old"}`, i)
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(doc)); err != nil {
 			t.Fatal(err)
@@ -313,7 +313,7 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 	replacement[7] = '8'
 	after, _ := collection.Snapshot()
 	afterChunk := after.state.Chunks.Get(0)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		current := lookupSource(fmt.Sprintf("k%d", i))
 		if i == 3 {
 			if &current[0] == &beforeSources[i][0] {
@@ -340,7 +340,7 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 		t.Fatal("Delete(k4) missed")
 	}
 	deleted, _ := collection.Snapshot()
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if i == 4 {
 			continue
 		}
@@ -363,11 +363,11 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 	// Replace the complete live A layout with B. The final cache must contain
 	// only B: sharing live immutable records cannot turn into shape history.
 	churn := &Collection{Options: Options{ChunkDocuments: 3, ShapeTapes: true}}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		_, _ = churn.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"a":%d,"x":true}`, i)))
 	}
 	oldRec := churn.state.Load().Chunks.Get(0).Docs.shapes.shapes[0]
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, err := churn.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"b":%d,"y":false}`, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -414,7 +414,7 @@ func TestStoreInvalidPutRollbackAndChunkReuse(t *testing.T) {
 	if collection.Len() != 0 || collection.Generation() != 0 {
 		t.Fatalf("failed Put changed visible state: Len=%d Generation=%d", collection.Len(), collection.Generation())
 	}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"n":%d}`, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -422,7 +422,7 @@ func TestStoreInvalidPutRollbackAndChunkReuse(t *testing.T) {
 	snap48, _ := collection.Snapshot()
 	high := snap48.state.Chunks.Count
 	old, _ := collection.Snapshot()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		del55, _ := collection.Delete(fmt.Sprintf("k%d", i))
 		if !del55 {
 			t.Fatal("delete miss")
@@ -431,7 +431,7 @@ func TestStoreInvalidPutRollbackAndChunkReuse(t *testing.T) {
 	if stats := collection.Stats(); stats.Chunks != 0 || stats.ChunkHighWater != high {
 		t.Fatalf("post-delete stats = %+v, want zero live chunks and high-water %d", stats, high)
 	}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if _, err := collection.Put(fmt.Sprintf("r%d", i), []byte(fmt.Sprintf(`{"n":%d}`, -i))); err != nil {
 			t.Fatal(err)
 		}
@@ -466,7 +466,7 @@ func TestStoreAddressSpaceOverflow(t *testing.T) {
 
 func TestStoreSnapshotReadSteadyAllocs(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 8, ShapeTapes: true}}
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"n":%d,"s":"x"}`, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -508,23 +508,21 @@ func TestStoreSnapshotReadSteadyAllocs(t *testing.T) {
 
 func TestStoreConcurrentSnapshots(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 8, ShapeTapes: true, ValueDict: true, Postings: true}}
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		_, _ = collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"n":%d,"s":"same"}`, i)))
 	}
 	var wg sync.WaitGroup
-	for reader := 0; reader < 8; reader++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 1000; i++ {
+	for range 8 {
+		wg.Go(func() {
+			for i := range 1000 {
 				snapshot, _ := collection.Snapshot()
 				if raw, ok := snapshot.GetRaw(fmt.Sprintf("k%d", i%64)); ok && !vibejson.Valid(raw.Bytes()) {
 					t.Error("reader observed invalid JSON")
 				}
 			}
-		}()
+		})
 	}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		key := fmt.Sprintf("k%d", i%64)
 		if i%7 == 0 {
 			collection.Delete(key)
@@ -537,7 +535,7 @@ func TestStoreConcurrentSnapshots(t *testing.T) {
 
 func TestStoreOnlinePostingsIndex(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 4, ShapeTapes: true}}
-	for i := 0; i < 14; i++ {
+	for i := range 14 {
 		_, _ = collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"g":%d,"v":%d}`, i%3, i)))
 	}
 	old, _ := collection.Snapshot()
@@ -628,7 +626,7 @@ func TestStoreOnlinePostingsIndex(t *testing.T) {
 
 func TestStoreIndexedSnapshotProbeSteadyAllocs(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 4, ShapeTapes: true}}
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"g":%d,"v":%d}`, i%3, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -677,7 +675,7 @@ func TestStoreIndexedSnapshotProbeSteadyAllocs(t *testing.T) {
 
 func TestStoreSharedIndexAndReclaimRestart(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 2}}
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		_, _ = collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"v":%d}`, i)))
 	}
 	a, err := collection.AddIndex("a", IndexPostings)
@@ -735,7 +733,7 @@ func TestStoreSharedIndexAndReclaimRestart(t *testing.T) {
 
 func TestStoreIndexBackfillBudgetIncludesCoveredCandidates(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 1}}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"v":%d}`, i))); err != nil {
 			t.Fatal(err)
 		}
@@ -747,7 +745,7 @@ func TestStoreIndexBackfillBudgetIncludesCoveredCandidates(t *testing.T) {
 	// Concurrent writes cover the first 99 chunks before backfill visits them.
 	// A budget of one must still examine only one start-snapshot candidate per
 	// call instead of scanning through all 99 to find the remaining rebuild.
-	for i := 0; i < 99; i++ {
+	for i := range 99 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"v":%d}`, i+1000))); err != nil {
 			t.Fatal(err)
 		}
@@ -796,7 +794,7 @@ func TestStoreOwnershipOptionsAndEmptyKey(t *testing.T) {
 	// Options are a construction-time policy. Mutating the public field after
 	// initialization must not change the representation of later chunks.
 	collection.Options.ChunkDocuments = 64
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(`{"v":1}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -873,7 +871,7 @@ func TestStoreMixedLifecycleDifferential(t *testing.T) {
 		}
 	}
 
-	for step := 0; step < 5000; step++ {
+	for step := range 5000 {
 		switch step {
 		case 100:
 			var err error
@@ -1045,7 +1043,7 @@ func TestStoreChunkRetainsNoIngestScratch(t *testing.T) {
 		t.Run(variant.name, func(t *testing.T) {
 			collection := &Collection{Options: variant.options}
 			want := make(map[string]string, 10)
-			for i := 0; i < 10; i++ {
+			for i := range 10 {
 				key := fmt.Sprintf("k%d", i)
 				if _, err := collection.Put(key, []byte(doc(i))); err != nil {
 					t.Fatal(err)
@@ -1083,7 +1081,7 @@ func TestStoreChunkRetainsNoIngestScratch(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := make(map[string]string, 10)
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			key := fmt.Sprintf("k%d", i)
 			if err := builder.Append(key, []byte(doc(i))); err != nil {
 				t.Fatal(err)

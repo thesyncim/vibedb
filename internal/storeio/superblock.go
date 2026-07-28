@@ -234,7 +234,7 @@ func recoverRoots(
 		return Superblock{}, StateRoot{}, -1, 0, fmt.Errorf("%w: have=%d need=%d", ErrRecoveryBufferTooSmall, len(pageScratch), pageSize)
 	}
 	var headers [superblockCopies * SuperblockSize]byte
-	for slot := 0; slot < superblockCopies; slot++ {
+	for slot := range superblockCopies {
 		buf := headers[slot*SuperblockSize : (slot+1)*SuperblockSize]
 		n, err := file.ReadAt(buf, int64(layout.RootOffsets[slot]))
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -260,7 +260,7 @@ func recoverRoots(
 	var selectedState StateRoot
 	selectedSlot := -1
 	var catalogErr error
-	for i := 0; i < count; i++ {
+	for i := range count {
 		candidate := candidates[i]
 		root := candidate.root
 		if root.PageSize != pageSize || root.FileEnd > fileSize {

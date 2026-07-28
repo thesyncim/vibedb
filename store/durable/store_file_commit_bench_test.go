@@ -19,9 +19,7 @@ func runCollectionWriters(b *testing.B, collection *Collection, writers int) {
 	var group sync.WaitGroup
 	limit := int64(b.N)
 	for range writers {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			for {
 				i := next.Add(1) - 1
 				if i >= limit {
@@ -32,7 +30,7 @@ func runCollectionWriters(b *testing.B, collection *Collection, writers int) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	group.Wait()
 }

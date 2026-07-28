@@ -550,7 +550,7 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 	}
 
 	hotKeys := make([]pageCacheKey, 0, 3)
-	for index := 0; index < 3; index++ {
+	for index := range 3 {
 		frame := &cache.frames[index]
 		frame.referenced = true
 		frame.hits = 100
@@ -566,7 +566,7 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 	}
 	cache.hand = 0
 
-	for reservation := 0; reservation < 4; reservation++ {
+	for reservation := range 4 {
 		before := cache.evictions
 		index, ok := cache.reserveLocked(span)
 		if !ok {
@@ -1252,7 +1252,7 @@ func TestPageCacheMixedNonPowerReservationSymmetry(t *testing.T) {
 		t.Fatalf("ReservationBytes allocations = %v, want 0", allocs)
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		lease, acquireErr := cache.Acquire(refs[i])
 		if acquireErr != nil || lease.Payload()[0] != byte(i+1) {
 			t.Fatalf("mixed Acquire(%d) = (%v,%v)", i, lease.Payload(), acquireErr)
@@ -1271,14 +1271,14 @@ func TestPageCacheMixedNonPowerReservationSymmetry(t *testing.T) {
 	if stats := cache.Stats(); stats.Evictions == 0 {
 		t.Fatalf("15-page demand did not evict mixed reservations: %+v", stats)
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		cache.Invalidate(refs[i])
 	}
 	if stats := cache.Stats(); stats.ResidentBytes != 0 || stats.ReservedBytes != 0 {
 		t.Fatalf("mixed demand reservations did not return to zero: %+v", stats)
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := cache.AdmitDirty(refs[i], pages[i], 2); err != nil {
 			t.Fatalf("AdmitDirty(%d): %v", i, err)
 		}
@@ -1289,7 +1289,7 @@ func TestPageCacheMixedNonPowerReservationSymmetry(t *testing.T) {
 		t.Fatalf("mixed dirty stats = %+v, available=%d", stats, cache.DirtyCapacityAvailable())
 	}
 	cache.MarkDurable(2)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if !cache.Invalidate(refs[i]) {
 			t.Fatalf("Invalidate durable mixed extent %d", i)
 		}
@@ -2084,9 +2084,7 @@ func TestPageCacheConcurrentAcquireReleaseAndMarkUnreachable(t *testing.T) {
 	readerErrors := make(chan error, 4)
 	var readers sync.WaitGroup
 	for range 4 {
-		readers.Add(1)
-		go func() {
-			defer readers.Done()
+		readers.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -2116,7 +2114,7 @@ func TestPageCacheConcurrentAcquireReleaseAndMarkUnreachable(t *testing.T) {
 				runtime.Gosched()
 				lease.Release()
 			}
-		}()
+		})
 	}
 
 	var publishErr error

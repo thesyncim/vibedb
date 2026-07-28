@@ -220,6 +220,9 @@ type IndexTermLeafDirectBlockIterator struct {
 	second    bool
 }
 
+// IndexTermLeafSingletonBlockIterator is an allocation-free cursor over a
+// singleton posting block, yielding each posting's (tile, row) directly from the
+// borrowed payload without materializing a list.
 type IndexTermLeafSingletonBlockIterator struct {
 	payload   []byte
 	tile      uint32
@@ -228,6 +231,9 @@ type IndexTermLeafSingletonBlockIterator struct {
 	constant  bool
 }
 
+// IndexTermLeafOneMaskBlockIterator is an allocation-free cursor over a one-mask
+// posting block, yielding each posting as a (tile, chunk, mask) triple from the
+// borrowed payload.
 type IndexTermLeafOneMaskBlockIterator struct {
 	payload   []byte
 	tile      uint32
@@ -2070,7 +2076,7 @@ func (v IndexTermLeafView) admitTermsAndPostings() error {
 		allDirect := true
 		directShape := byte(0xff)
 		contiguousDirect := true
-		for j := 0; j < count; j++ {
+		for j := range count {
 			posting, ok := v.decodePosting(
 				position, end, previousTile, j != 0, false,
 			)
@@ -2177,7 +2183,7 @@ func (v IndexTermLeafView) admitDirectBlock(
 			position+count*8 != end {
 			return false
 		}
-		for i := 0; i < count; i++ {
+		for i := range count {
 			tileID := uint32(base) + uint32(i)
 			live := v.live(tileID)
 			mask := binary.LittleEndian.Uint64(
@@ -2199,7 +2205,7 @@ func (v IndexTermLeafView) admitDirectBlock(
 		if row >= TermPostingTileRows {
 			return false
 		}
-		for i := 0; i < count; i++ {
+		for i := range count {
 			live := v.live(uint32(base) + uint32(i))
 			if live == nil ||
 				live[row>>6]&(uint64(1)<<uint(row&63)) == 0 {
@@ -2218,7 +2224,7 @@ func (v IndexTermLeafView) admitDirectBlock(
 		if chunk >= TermPostingTileChunks || bits.OnesCount64(mask) <= 1 {
 			return false
 		}
-		for i := 0; i < count; i++ {
+		for i := range count {
 			live := v.live(uint32(base) + uint32(i))
 			if live == nil || mask&^live[chunk] != 0 {
 				return false
@@ -2231,7 +2237,7 @@ func (v IndexTermLeafView) admitDirectBlock(
 	if position+count*bytesPerPosting != end {
 		return false
 	}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		tileID := uint32(base) + uint32(i)
 		live := v.live(tileID)
 		if live == nil {
@@ -2331,7 +2337,7 @@ func (v IndexTermLeafView) admitPosting(posting indexTermLeafDecodedPosting) boo
 		count := int(posting.direct[0])
 		rows := 0
 		previousChunk := -1
-		for i := 0; i < count; i++ {
+		for i := range count {
 			record := posting.direct[1+i*9:]
 			chunk := int(record[0])
 			mask := binary.LittleEndian.Uint64(record[1:9])
@@ -2433,7 +2439,7 @@ func (v IndexTermLeafView) walkPostings(
 			continue
 		}
 		var previousTile uint32
-		for j := 0; j < count; j++ {
+		for j := range count {
 			posting, ok := v.decodePosting(
 				position, end, previousTile, j != 0, true,
 			)
@@ -2497,7 +2503,7 @@ func (v IndexTermLeafView) decodePosting(
 			return result, false
 		}
 		result.direct = v.encoded[position : position+1+count*9]
-		for i := 0; i < count; i++ {
+		for i := range count {
 			result.rows += uint16(bits.OnesCount64(binary.LittleEndian.Uint64(
 				result.direct[1+i*9+1 : 1+i*9+9],
 			)))

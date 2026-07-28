@@ -757,7 +757,7 @@ func pageKeyTreeBatchBranchSpans(
 	base, extra := count/pages, count%pages
 	spans := make([][2]int, pages)
 	first := 0
-	for index := 0; index < pages; index++ {
+	for index := range pages {
 		length := base
 		if index < extra {
 			length++
@@ -1097,7 +1097,7 @@ func pageKeyTreeBatchParents(
 
 func comparePageKeyTreeBatchPosition(left, right pageKeyTreeBatchPosition) int {
 	depth := min(left.depth, right.depth)
-	for index := 0; index < depth; index++ {
+	for index := range depth {
 		if left.path[index].rank < right.path[index].rank {
 			return -1
 		}

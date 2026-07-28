@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 func ExampleCollection() {

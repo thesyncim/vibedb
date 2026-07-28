@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 // The multi-column exact probe is the one read path that opens a candidate's

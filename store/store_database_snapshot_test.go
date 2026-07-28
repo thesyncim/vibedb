@@ -160,9 +160,7 @@ func TestDatabaseSnapshotIsASingleInstant(t *testing.T) {
 	}
 
 	var wgReader sync.WaitGroup
-	wgReader.Add(1)
-	go func() {
-		defer wgReader.Done()
+	wgReader.Go(func() {
 		captures := 0
 		for {
 			select {
@@ -187,7 +185,7 @@ func TestDatabaseSnapshotIsASingleInstant(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	wg.Wait()
 	close(stop)
@@ -217,16 +215,14 @@ func TestDatabaseSnapshotConcurrentCapturesDoNotDeadlock(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 200 {
 				if snapshot := db.Snapshot(); snapshot.Len() != 5 {
 					t.Errorf("Len=%d want 5", snapshot.Len())
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }

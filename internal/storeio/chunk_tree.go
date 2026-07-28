@@ -185,7 +185,7 @@ func walkChunkTreePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds, ex
 	var lanes [64]uint8
 	count := view.Len()
 	bitmap := header.Bitmap
-	for i := 0; i < count; i++ {
+	for i := range count {
 		refs[i], _ = view.RefAt(i)
 		lanes[i] = uint8(bits.TrailingZeros64(bitmap))
 		bitmap &= bitmap - 1
@@ -193,7 +193,7 @@ func walkChunkTreePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds, ex
 	prefix := header.Prefix
 	shift := header.Shift
 	lease.Release()
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if shift == 0 {
 			if err := fn(prefix|uint32(lanes[i]), refs[i]); err != nil {
 				return err
@@ -253,14 +253,14 @@ func walkChunkTreeZonePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds
 		var lanes [64]uint8
 		count := view.Len()
 		bitmap := header.Bitmap
-		for i := 0; i < count; i++ {
+		for i := range count {
 			zones[i] = view.ZoneAt(i)
 			lanes[i] = uint8(bits.TrailingZeros64(bitmap))
 			bitmap &= bitmap - 1
 		}
 		prefix := header.Prefix
 		lease.Release()
-		for i := 0; i < count; i++ {
+		for i := range count {
 			if err := fn(prefix|uint32(lanes[i]), zones[i]); err != nil {
 				return err
 			}
@@ -269,12 +269,12 @@ func walkChunkTreeZonePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds
 	}
 	var refs [64]PageRef
 	count := view.Len()
-	for i := 0; i < count; i++ {
+	for i := range count {
 		refs[i], _ = view.RefAt(i)
 	}
 	shift := header.Shift
 	lease.Release()
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if err := walkChunkTreeZonePage(cache, refs[i], bounds, int(shift-chunkDirectoryRadixBits), fn); err != nil {
 			return err
 		}

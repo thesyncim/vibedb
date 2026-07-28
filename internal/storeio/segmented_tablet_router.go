@@ -75,12 +75,18 @@ const (
 )
 
 var (
+	// ErrSegmentedTabletRouterCorrupt reports that a router image failed
+	// checksum or structural admission and must not be routed against.
 	ErrSegmentedTabletRouterCorrupt = errors.New(
 		"vibejson: corrupt segmented tablet router image",
 	)
+	// ErrSegmentedTabletRouterNoSpace reports that the image cannot admit
+	// another route entry.
 	ErrSegmentedTabletRouterNoSpace = errors.New(
 		"vibejson: segmented tablet router image has no space",
 	)
+	// ErrSegmentedTabletRouterNotFound reports that no bucket routes the queried
+	// key.
 	ErrSegmentedTabletRouterNotFound = errors.New(
 		"vibejson: segmented tablet router bucket not found",
 	)
@@ -214,39 +220,12 @@ func segmentedTabletRouterFencePrefix(
 	left, right segmentedTabletRouterFence,
 ) int {
 	limit := min(left.length(), right.length())
-	for at := 0; at < limit; at++ {
+	for at := range limit {
 		if left.at(at) != right.at(at) {
 			return at
 		}
 	}
 	return limit
-}
-
-func segmentedTabletRouterCompareFenceKey(
-	fence segmentedTabletRouterFence, key []byte,
-) int {
-	keyAt := 0
-	for _, part := range [...][]byte{fence.a, fence.b, fence.c} {
-		remaining := len(key) - keyAt
-		if remaining <= 0 {
-			if len(part) != 0 {
-				return 1
-			}
-			continue
-		}
-		compared := min(len(part), remaining)
-		if order := bytes.Compare(part[:compared], key[keyAt:keyAt+compared]); order != 0 {
-			return order
-		}
-		keyAt += compared
-		if compared != len(part) {
-			return 1
-		}
-	}
-	if keyAt < len(key) {
-		return -1
-	}
-	return 0
 }
 
 func segmentedTabletRouterCompareFenceSuffixKey(
@@ -277,7 +256,7 @@ func segmentedTabletRouterCompareFences(
 	left, right segmentedTabletRouterFence,
 ) int {
 	limit := min(left.length(), right.length())
-	for at := 0; at < limit; at++ {
+	for at := range limit {
 		if left.at(at) < right.at(at) {
 			return -1
 		}
@@ -455,7 +434,7 @@ func OpenSegmentedTabletRouter(
 		return SegmentedTabletRouterView{},
 			segmentedTabletRouterCorrupt("root terminal offset")
 	}
-	for rank := 0; rank < pageCount; rank++ {
+	for rank := range pageCount {
 		start := int(binary.LittleEndian.Uint16(view.rootOffsets[rank*2:]))
 		end := int(binary.LittleEndian.Uint16(view.rootOffsets[(rank+1)*2:]))
 		if start > end || end > rootKeyBytes {
@@ -474,7 +453,7 @@ func OpenSegmentedTabletRouter(
 			segmentedTabletRouterCorrupt("root non-canonical padding")
 	}
 	var seenPages uint16
-	for rank := 0; rank < pageCount; rank++ {
+	for rank := range pageCount {
 		pageID := view.rootRanks[rank]
 		if int(pageID) >= pageCount ||
 			seenPages&(uint16(1)<<pageID) != 0 {
@@ -510,7 +489,7 @@ func OpenSegmentedTabletRouter(
 				segmentedTabletRouterCorrupt("root lexical floors")
 		}
 	}
-	for pageID := 0; pageID < SegmentedTabletRouterMaxPages; pageID++ {
+	for pageID := range SegmentedTabletRouterMaxPages {
 		start := pageID * segmentedTabletRouterRootRefBytes
 		if seenPages&(uint16(1)<<pageID) == 0 &&
 			!allZero(view.rootRefs[start:start+
@@ -527,7 +506,7 @@ func OpenSegmentedTabletRouter(
 
 func (v *SegmentedTabletRouterView) validateLocator() error {
 	live := 0
-	for localID := 0; localID < TabletLocalIdentityLocalCount; localID++ {
+	for localID := range TabletLocalIdentityLocalCount {
 		code := binary.LittleEndian.Uint16(v.locator[localID*2:])
 		if code == segmentedTabletRouterEmpty {
 			continue
@@ -543,7 +522,7 @@ func (v *SegmentedTabletRouterView) validateLocator() error {
 		live++
 	}
 	rows := 0
-	for pageID := 0; pageID < SegmentedTabletRouterMaxPages; pageID++ {
+	for pageID := range SegmentedTabletRouterMaxPages {
 		page := &v.pages[pageID]
 		if len(page.image) == 0 {
 			continue
@@ -648,7 +627,7 @@ func segmentedTabletRouterOpenAnchor(
 	var previous segmentedTabletRouterFence
 	var restart segmentedTabletRouterFence
 	expectedCommon := -1
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		slot := view.ranks[rank]
 		word, bit := slot>>6, uint64(1)<<(slot&63)
 		if seen[word]&bit != 0 {
@@ -731,7 +710,7 @@ func segmentedTabletRouterOpenAnchor(
 				segmentedTabletRouterCorrupt("anchor head validity")
 		}
 		if valid {
-			for at := 0; at < headBytes; at++ {
+			for at := range headBytes {
 				if view.heads[rank*headBytes+at] != fence.at(common+at) {
 					return segmentedTabletRouterAnchorView{},
 						segmentedTabletRouterCorrupt("anchor head value")
@@ -744,7 +723,7 @@ func segmentedTabletRouterOpenAnchor(
 				segmentedTabletRouterCorrupt("anchor short head")
 		}
 	}
-	for slot := 0; slot < SegmentedTabletRouterRowsPerPage; slot++ {
+	for slot := range SegmentedTabletRouterRowsPerPage {
 		word, bit := uint8(slot)>>6, uint64(1)<<(uint8(slot)&63)
 		localID := binary.LittleEndian.Uint16(view.localIDs[slot*2:])
 		handle := view.handles[slot*SegmentedTabletRouterHandleBytes : (slot+1)*SegmentedTabletRouterHandleBytes]
@@ -1468,7 +1447,7 @@ func segmentedTabletRouterEncodeAnchor(
 	keyAt := common
 	var seen [4]uint64
 	var restart segmentedTabletRouterFence
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		fence := fenceAt(rank)
 		slot, localID, ref, zone := rowAt(rank)
 		word, bit := slot>>6, uint64(1)<<(slot&63)
@@ -1532,7 +1511,7 @@ func segmentedTabletRouterEncodeAnchor(
 	if headBytes != 0 {
 		heads := keys[keyAt : keyAt+count*headBytes]
 		valid := keys[keyAt+count*headBytes : keyAt+count*headBytes+validBytes]
-		for rank := 0; rank < count; rank++ {
+		for rank := range count {
 			fence := fenceAt(rank)
 			if fence.length()-common < headBytes {
 				continue
@@ -1577,7 +1556,7 @@ func segmentedTabletRouterEncodeRootInitial(
 	)
 	copy(root[44:60], header.StoreID[:])
 	keyAt := 0
-	for rank := 0; rank < pageCount; rank++ {
+	for rank := range pageCount {
 		root[segmentedTabletRouterRootRanksAt+rank] = byte(rank)
 		segmentedTabletRouterEncodeAnchorRef(
 			root[segmentedTabletRouterRootRefsAt+
@@ -1621,7 +1600,7 @@ func (v *SegmentedTabletRouterView) encodeSplitRoot(
 	binary.LittleEndian.PutUint64(root[24:32], header.Generation)
 	binary.LittleEndian.PutUint16(root[34:36], uint16(v.pageCount)+1)
 	binary.LittleEndian.PutUint32(root[36:40], PageChecksum(locator))
-	for stableID := uint8(0); stableID < SegmentedTabletRouterMaxPages; stableID++ {
+	for stableID := range uint8(SegmentedTabletRouterMaxPages) {
 		if stableID == pageID {
 			segmentedTabletRouterEncodeAnchorRef(
 				root[segmentedTabletRouterRootRefsAt+
@@ -1779,7 +1758,7 @@ func segmentedTabletRouterEncodeLeafHandle(
 func segmentedTabletRouterEncodeAnchorRef(dst []byte, ref PageRef) {
 	segmentedTabletRouterPutUint48(dst, ref.Offset>>12)
 	segmentedTabletRouterPutUint48(dst[6:], ref.Generation)
-	dst[12] = byte(tabletAnchorHandleLabExtentClass(ref.Length))
+	dst[12] = byte(tabletAnchorHandleExtentClass(ref.Length))
 }
 
 func segmentedTabletRouterGetUint48(src []byte) uint64 {

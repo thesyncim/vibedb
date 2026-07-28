@@ -613,10 +613,16 @@ const (
 	// ZoneOpEq covers equality and membership alike: Lo and Hi bound the
 	// candidate literal codes, and for a single equality they are equal.
 	ZoneOpEq
+	// ZoneOpNe is inequality. The zone tier cannot prune on it, so a summary
+	// only ever confirms a chunk may match; Lo and Hi are unused.
 	ZoneOpNe
+	// ZoneOpLt is the strict-less-than half-open range with Hi as the bound.
 	ZoneOpLt
+	// ZoneOpLe is the less-than-or-equal range with Hi as the inclusive bound.
 	ZoneOpLe
+	// ZoneOpGt is the strict-greater-than range with Lo as the bound.
 	ZoneOpGt
+	// ZoneOpGe is the greater-than-or-equal range with Lo as the inclusive bound.
 	ZoneOpGe
 	// ZoneOpIsNull matches an absent path or an explicit null, the two the
 	// query treats as one value.

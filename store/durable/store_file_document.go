@@ -100,21 +100,6 @@ func (v fileDocumentChunk) lookup(slot uint8) (fileDocumentRecord, bool) {
 	}, true
 }
 
-func (v fileDocumentChunk) lookupString(slot uint8, key string) (fileDocumentValue, bool) {
-	if v.grouped {
-		record, ok := v.group.LookupString(slot, key)
-		if !ok {
-			return fileDocumentValue{}, false
-		}
-		return fileDocumentValue{
-			value: storeio.DocumentValue{Length: uint64(record.JSONLength)},
-			slot:  slot, grouped: true,
-		}, true
-	}
-	value, ok := v.page.LookupStringValue(slot, key)
-	return fileDocumentValue{value: value, slot: slot}, ok
-}
-
 func (v fileDocumentChunk) lookupKey(slot uint8, key []byte) (fileDocumentValue, bool) {
 	record, ok := v.lookup(slot)
 	return record.value, ok && bytes.Equal(record.key, key)

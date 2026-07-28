@@ -410,7 +410,7 @@ func TestCommitterStickyFailure(t *testing.T) {
 }
 
 func TestCommitterConcurrentPublishAndClose(t *testing.T) {
-	for iteration := 0; iteration < 100; iteration++ {
+	for iteration := range 100 {
 		committer, file, _ := newPortableCommitter(t, 1, 0)
 		batch, err := committer.Begin(0)
 		if err != nil {

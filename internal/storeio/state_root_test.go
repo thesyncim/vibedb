@@ -59,7 +59,7 @@ func TestStateRootPageRoundTrip(t *testing.T) {
 	if err != nil || got != want {
 		t.Fatalf("DecodeStateRootPage = (%+v,%v), want (%+v,nil)", got, err, want)
 	}
-	for cut := 0; cut < len(encoded); cut++ {
+	for cut := range encoded {
 		if _, err := DecodeStateRootPage(encoded[:cut], fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrStateRootCorrupt)
 		}

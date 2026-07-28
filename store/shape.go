@@ -392,7 +392,7 @@ func (c *ShapeCache) compile(v vibejson.Node, count int, fp uint64) *ShapeRecord
 		rec.table = c.allocSlots(capacity)
 		rec.mask = uint32(capacity - 1)
 		hashed := v.Entry.KeysHashed()
-		for m := 0; m < count; m++ {
+		for m := range count {
 			ke := vibejson.EntryAt(v.Entry, uintptr(2*m)+1)
 			content := byteview.SliceRange(v.Src, ke.Start+1, ke.End-1)
 			raw := c.internBytes(content)
@@ -523,10 +523,7 @@ func (c *ShapeCache) insertPending(fp uint64) {
 // fingerprints, and arena bytes are untouched, and pending entries whose
 // slots were promoted are no longer referenced and simply do not carry over.
 func (c *ShapeCache) grow() {
-	size := 2 * len(c.table)
-	if size < shapeMinTable {
-		size = shapeMinTable
-	}
+	size := max(2*len(c.table), shapeMinTable)
 	table := make([]uint32, size)
 	mask := uint32(size - 1)
 	for _, stored := range c.table {

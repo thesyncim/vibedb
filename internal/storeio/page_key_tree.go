@@ -1005,10 +1005,7 @@ func pageKeyTreeBranchBalancedSplit(
 	if capacity <= 0 || len(children) > 2*capacity {
 		return 0
 	}
-	split := len(children) / 2
-	if split < minimum {
-		split = minimum
-	}
+	split := max(len(children)/2, minimum)
 	if len(children)-split < minimum {
 		split = len(children) - minimum
 	}
@@ -1707,10 +1704,7 @@ func pageKeyTreeBranchSplit(pageSize uint32, children []PageKeyBranch) int {
 	if capacity <= 0 || len(children) <= capacity {
 		return 0
 	}
-	split := len(children) / 2
-	if split > capacity {
-		split = capacity
-	}
+	split := min(len(children)/2, capacity)
 	if len(children)-split > capacity {
 		split = len(children) - capacity
 	}

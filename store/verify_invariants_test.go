@@ -93,8 +93,8 @@ func TestInfoWordFieldsDisjoint(t *testing.T) {
 func TestInfoWordRoundTrip(t *testing.T) {
 	// Every kind and flags value, against a boundary-and-random count set.
 	counts := infoWordCountProbes()
-	for kind := uint32(0); kind < infoKindFieldW; kind++ {
-		for flags := uint32(0); flags < infoFlagsFieldW; flags++ {
+	for kind := range infoKindFieldW {
+		for flags := range infoFlagsFieldW {
 			for _, count := range counts {
 				assertInfoRoundTrip(t, count, kind, flags)
 				if t.Failed() {
@@ -123,7 +123,7 @@ func TestInfoWordRoundTrip(t *testing.T) {
 	// setCount and bumpCount must move only the count field.
 	rng := rand.New(rand.NewSource(0x5e7c0117))
 	setBumpIters := testIterations(1<<20, 1<<12)
-	for i := 0; i < setBumpIters; i++ {
+	for range setBumpIters {
 		kind := document.Kind(rng.Uint32() % infoKindFieldW)
 		flags := uint8(rng.Uint32() % infoFlagsFieldW)
 		count := rng.Uint32() & vibejson.InfoCountMask
@@ -166,7 +166,7 @@ func assertInfoRoundTrip(t *testing.T, count, kind, flags uint32) {
 func infoWordCountProbes() []uint32 {
 	probes := []uint32{0, 1, 2, 3, 7, 8, 63, 64, 1 << 12, 1 << 20, 1 << 25, vibejson.InfoMaxCount - 2, vibejson.InfoMaxCount - 1, vibejson.InfoMaxCount}
 	rng := rand.New(rand.NewSource(0x1f0c0de))
-	for i := 0; i < 2048; i++ {
+	for range 2048 {
 		probes = append(probes, rng.Uint32()&vibejson.InfoCountMask)
 	}
 	return probes
@@ -205,7 +205,7 @@ func TestNarrowSpanRoundTrip(t *testing.T) {
 	// Randomized saturation of the joint 32-bit span space.
 	rng := rand.New(rand.NewSource(0x0ff5e701))
 	randPairs := testIterations(1<<21, 1<<14)
-	for i := 0; i < randPairs; i++ {
+	for range randPairs {
 		start := rng.Uint32() & max
 		end := rng.Uint32() & max
 		assertNarrowRoundTrip(t, start, end)

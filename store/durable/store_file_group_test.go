@@ -7,9 +7,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/document"
 )
 
 func TestFileSnapshotIndexScalarGroupsAndResidual(t *testing.T) {

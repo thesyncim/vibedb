@@ -7,8 +7,6 @@ import (
 var (
 	commonPrimaryLeafBenchmarkSlot     uint8
 	commonPrimaryLeafBenchmarkBytes    []byte
-	commonPrimaryLeafBenchmarkValue    CommonPrimaryLeafValue
-	commonPrimaryLeafBenchmarkRow      CommonPrimaryLeafRow
 	commonPrimaryLeafBenchmarkView     CommonPrimaryLeafView
 	commonPrimaryLeafBenchmarkPage     []byte
 	commonPrimaryLeafBenchmarkBool     bool
@@ -28,41 +26,6 @@ func commonPrimaryLeafBenchmarkFixture(
 		b, CommonPrimaryLeafNarrow, 4<<10, records,
 	)
 	return records, page, view, ref, bounds
-}
-
-func commonPrimaryLeafAdaptiveBenchmarkFixture(
-	b testing.TB,
-	records []CommonPrimaryLeafRecord,
-) AdaptiveOrderedLeafLabView {
-	b.Helper()
-	adaptive := make([]AdaptiveOrderedLeafLabRecord, len(records))
-	for index := range records {
-		adaptive[index] = AdaptiveOrderedLeafLabRecord{
-			Key: records[index].Key, Value: records[index].Value.Inline,
-		}
-	}
-	if err := PlaceAdaptiveOrderedLeafLabRecords(
-		AdaptiveOrderedLeafLabNarrow,
-		commonPrimaryLeafTestSeed, adaptive,
-	); err != nil {
-		b.Fatal(err)
-	}
-	page, err := EncodeAdaptiveOrderedLeafLab(
-		make([]byte, AdaptiveOrderedLeafLabNarrowBytes),
-		AdaptiveOrderedLeafLabNarrow,
-		AdaptiveOrderedLeafLabHeader{BucketID: 991, Generation: 17},
-		commonPrimaryLeafTestSeed, adaptive,
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
-	view, err := OpenAdaptiveOrderedLeafLab(
-		page, commonPrimaryLeafTestSeed,
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
-	return view
 }
 
 func BenchmarkCommonPrimaryLeafPointLookup(b *testing.B) {
@@ -139,25 +102,10 @@ func BenchmarkCommonPrimaryLeafPointLookup(b *testing.B) {
 			"ns/key",
 		)
 	})
-	adaptive := commonPrimaryLeafAdaptiveBenchmarkFixture(b, records)
-	adaptiveMissHash := adaptiveOrderedLeafLabKeyHash(
-		commonPrimaryLeafTestSeed, miss,
-	)
-	b.Run("FairAdaptive/Miss/Prehashed", func(b *testing.B) {
-		b.ReportAllocs()
-		for range b.N {
-			commonPrimaryLeafBenchmarkSlot,
-				commonPrimaryLeafBenchmarkBytes,
-				commonPrimaryLeafBenchmarkOverflow,
-				commonPrimaryLeafBenchmarkBool =
-				adaptive.LookupHashed(adaptiveMissHash, miss)
-		}
-	})
 }
 
 func BenchmarkCommonPrimaryLeafScan(b *testing.B) {
 	records, _, view, _, _ := commonPrimaryLeafBenchmarkFixture(b)
-	adaptive := commonPrimaryLeafAdaptiveBenchmarkFixture(b, records)
 	b.Run("CommonPage", func(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(records)))
@@ -171,30 +119,6 @@ func BenchmarkCommonPrimaryLeafScan(b *testing.B) {
 				}
 				commonPrimaryLeafBenchmarkBytes = value
 				commonPrimaryLeafBenchmarkOverflow = overflow
-				commonPrimaryLeafBenchmarkInt = len(key)
-			}
-		}
-		b.StopTimer()
-		b.ReportMetric(
-			float64(b.Elapsed().Nanoseconds())/
-				float64(int64(b.N)*int64(len(records))),
-			"ns/doc",
-		)
-	})
-	b.Run("AdaptiveLab", func(b *testing.B) {
-		b.ReportAllocs()
-		b.SetBytes(int64(len(records)))
-		b.ResetTimer()
-		for range b.N {
-			it := adaptive.AllRows()
-			for {
-				key, value, overflow, ok := it.NextBorrowed()
-				if !ok {
-					break
-				}
-				commonPrimaryLeafBenchmarkValue =
-					CommonPrimaryLeafValue{Inline: value}
-				commonPrimaryLeafBenchmarkBool = overflow
 				commonPrimaryLeafBenchmarkInt = len(key)
 			}
 		}

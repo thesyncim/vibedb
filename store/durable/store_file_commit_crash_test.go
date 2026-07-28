@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // Fault injection for the whole commit, not just the free set.
@@ -1281,14 +1281,4 @@ func TestCollectionUpdateSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 			sessions, multiEnd, singleEnd, multiEnd-singleEnd,
 			(multiEnd-singleEnd)/uint64(options.PageSize), heldBack, singleFile.Name())
 	}
-}
-
-func commitCrashFreeCovers(free []storeio.FreeExtent, ref storeio.PageRef) bool {
-	for _, extent := range free {
-		if extent.Offset <= ref.Offset &&
-			ref.Offset+uint64(ref.Length) <= extent.Offset+extent.Length {
-			return true
-		}
-	}
-	return false
 }

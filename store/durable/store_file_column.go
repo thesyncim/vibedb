@@ -225,7 +225,7 @@ func (s *Snapshot) reduceFloat64MappedRun(
 		lease.Release()
 		return nil
 	}
-	for chunkOrdinal := uint32(0); chunkOrdinal < chunks; chunkOrdinal++ {
+	for chunkOrdinal := range chunks {
 		view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+chunkOrdinal)
 		if viewErr != nil {
 			lease.Release()

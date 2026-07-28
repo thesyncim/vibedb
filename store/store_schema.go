@@ -18,12 +18,20 @@ import (
 type SchemaType uint16
 
 const (
+	// SchemaNull admits the JSON null literal.
 	SchemaNull SchemaType = 1 << iota
+	// SchemaBool admits the JSON true and false literals.
 	SchemaBool
+	// SchemaNumber admits any JSON number, integer-valued or not.
 	SchemaNumber
+	// SchemaInteger admits only numbers written without a fraction or exponent;
+	// it is a strict subset of SchemaNumber, not an independent type.
 	SchemaInteger
+	// SchemaString admits any JSON string.
 	SchemaString
+	// SchemaArray admits any JSON array.
 	SchemaArray
+	// SchemaObject admits any JSON object.
 	SchemaObject
 
 	schemaKnownTypes = SchemaNull | SchemaBool | SchemaNumber |
@@ -88,6 +96,9 @@ type SchemaViolationError struct {
 	Missing  bool
 }
 
+// Error renders the offending path together with the expected type set and the
+// value actually found, so a rejected Put explains itself without the caller
+// re-deriving the constraint. It wraps ErrSchemaViolation for errors.Is.
 func (e *SchemaViolationError) Error() string {
 	if e == nil {
 		return ErrSchemaViolation.Error()
@@ -191,6 +202,10 @@ func canonicalSchemaTypes(types SchemaType) SchemaType {
 	return types
 }
 
+// Valid reports whether s is a fully compiled schema whose identity hash still
+// matches its canonicalized contents. A nil, zero, or tampered schema is
+// rejected, so callers can treat Valid as the precondition for trusting a
+// schema recovered from disk or handed in through Options.
 func (s *Schema) Valid() bool {
 	if s == nil || !validSchemaTypes(s.root) ||
 		s.root != canonicalSchemaTypes(s.root) ||

@@ -15,11 +15,11 @@ import (
 	"time"
 	"unsafe"
 
-	vibejson "github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/internal/storemem"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 var (
@@ -70,8 +70,15 @@ var (
 type Backend uint8
 
 const (
+	// BackendAuto is the safe zero value. It selects the native asynchronous
+	// engine (io_uring on Linux) when the platform and build support it and
+	// otherwise falls back to BackendPortable, so callers need not probe.
 	BackendAuto Backend = iota
+	// BackendPortable forces the dependency-free engine that runs on every
+	// supported platform, trading peak throughput for portability.
 	BackendPortable
+	// BackendIOUring forces the Linux io_uring engine and fails construction
+	// where it is unavailable, rather than silently degrading to portable.
 	BackendIOUring
 )
 
@@ -80,6 +87,8 @@ const (
 type ReadMode uint8
 
 const (
+	// ReadBuffered is the safe zero value. Cache misses use ordinary buffered
+	// file reads served through the operating system page cache.
 	ReadBuffered ReadMode = iota
 	// ReadDirectTry uses O_DIRECT when the platform and filesystem
 	// accept it, otherwise Stats reports the observable buffered fallback.
@@ -94,6 +103,9 @@ const (
 type WriteMode uint8
 
 const (
+	// WriteBuffered is the safe zero value. Durable commits use ordinary
+	// buffered writes made durable by the configured checkpoint barrier. It is
+	// the only mode that currently accepts canonical sparse writes.
 	WriteBuffered WriteMode = iota
 	// WriteDirectTry uses O_DIRECT when the platform and filesystem
 	// accept it, otherwise Stats reports the observable buffered fallback.
@@ -197,6 +209,11 @@ const (
 	DocumentFormatCompact
 )
 
+// Options fixes the durable collection's schema, exact indexes, memory bounds,
+// engine selection, and durability contract at construction. It embeds the
+// in-memory store.Options for shared collection settings and adds the on-disk
+// concerns the resident engine does not have. The zero value is a working
+// power-safe configuration; every field below documents what it overrides.
 type Options struct {
 	Collection store.Options
 	// Indexes are frozen exact scalar definitions maintained from the first
@@ -958,9 +975,12 @@ type Collection struct {
 	visibilityMu   sync.Mutex
 	pendingVisible []filePendingState
 
-	committer     *storeio.Committer
-	cache         *storeio.PageCache
-	primaryRouter *storeio.ResidentPrimaryRouter
+	committer *storeio.Committer
+	cache     *storeio.PageCache
+	// primaryRouter is swapped wholesale by a structural split/merge/reclass
+	// transaction and mutated in place by ordinary COW UpdateLeaf. Lock-free
+	// point reads load it once; an atomic pointer keeps that swap race-free.
+	primaryRouter atomic.Pointer[storeio.ResidentPrimaryRouter]
 	readFile      *os.File
 	writeFile     *os.File
 	directRead    bool
@@ -993,6 +1013,16 @@ type Collection struct {
 	bufferedFirstTouchOverflows   atomic.Uint64
 	primaryLeafSplitRequired      atomic.Uint64
 	primaryEmptyLeaves            atomic.Uint64
+	// Structural-transaction accounting for phase-8 split/merge/reclass. The
+	// *MaxNS fields are the observed high-water bounded-transaction latency so a
+	// harness can gate p-max without a full histogram allocation.
+	primaryLeafSplits         atomic.Uint64
+	primaryLeafMerges         atomic.Uint64
+	primaryLeafReclass        atomic.Uint64
+	primaryMacroSplitRequired atomic.Uint64
+	primarySplitMaxNS         atomic.Uint64
+	primaryMergeMaxNS         atomic.Uint64
+	primaryReclassMaxNS       atomic.Uint64
 
 	parseScratch            []vibejson.IndexEntry
 	oldParseScratch         []vibejson.IndexEntry
@@ -1024,6 +1054,10 @@ type Collection struct {
 	primaryRootScratch     []byte
 	primaryPendingParents  []filePrimaryPendingParent
 	primaryVolatileRetired []storeio.PageRef
+	// structuralRows is reused row scratch for a leaf split/merge re-encode. Its
+	// records borrow the source leaf page and are valid only while that page is
+	// leased inside the structural transaction.
+	structuralRows []storeio.CommonPrimaryLeafRecord
 	float64Masks           []uint64
 	float64Values          []float64
 	float64StripeBytes     []byte
@@ -1203,10 +1237,26 @@ type Stats struct {
 	// PrimaryLeafSplitRequired counts inserts rejected before publication
 	// because the selected wide leaf needs the deferred structural split.
 	PrimaryLeafSplitRequired uint64
-	// PrimaryEmptyLeaves counts routed leaves made empty, and not subsequently
-	// refilled, during this open session. Empty-leaf removal is deferred with
-	// split/merge structural work; the counter is rebuilt from zero on Open.
+	// PrimaryEmptyLeaves counts routed leaves currently empty (made empty and
+	// not yet refilled or reclaimed by a merge). A merge that retires an empty
+	// leaf decrements it. The counter is rebuilt from zero on Open.
 	PrimaryEmptyLeaves uint64
+	// PrimaryLeafSplits, PrimaryLeafMerges, and PrimaryLeafReclass count the
+	// phase-8 bounded structural transactions performed this session. Reclass
+	// counts wide->narrow slot-class rewrites folded into a split or merge.
+	PrimaryLeafSplits   uint64
+	PrimaryLeafMerges   uint64
+	PrimaryLeafReclass  uint64
+	// PrimaryMacroSplitRequired counts structural transactions that could not
+	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
+	// and a macro-tablet split (the next phase) is required.
+	PrimaryMacroSplitRequired uint64
+	// PrimarySplitMaxNS, PrimaryMergeMaxNS, and PrimaryReclassMaxNS report the
+	// high-water bounded-transaction latency in nanoseconds for each structural
+	// kind, so a harness can bound p-max without a resident histogram.
+	PrimarySplitMaxNS   uint64
+	PrimaryMergeMaxNS   uint64
+	PrimaryReclassMaxNS uint64
 	// PrimaryMutationScratchBytes is the fixed leaf-promotion and raw
 	// segmented-root writer scratch, allocated only for PrimaryRoot stores.
 	PrimaryMutationScratchBytes uint64
@@ -1447,13 +1497,17 @@ func Open(file *os.File, options Options) (*Collection, error) {
 		collection.primaryRootScratch = make(
 			[]byte, storeio.SegmentedTabletRouterRootBytes,
 		)
-		collection.primaryRouter, err = storeio.BuildResidentPrimaryRouter(
+		builtRouter, buildErr := storeio.BuildResidentPrimaryRouter(
 			collection.cache, root.PrimaryRoot,
 			storeio.GlobalTabletCatalogBounds{
 				StoreID: root.StoreID, SelectedRootGeneration: root.Generation,
 				FileEnd: super.FileEnd, NextLogicalID: root.NextLogicalID,
 			},
 		)
+		err = buildErr
+		if err == nil {
+			collection.primaryRouter.Store(builtRouter)
+		}
 		if err != nil {
 			_ = collection.closeResources()
 			return nil, fmt.Errorf("vibejson: build resident primary router: %w", err)
@@ -2021,7 +2075,7 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 	// pending parents so a later router advance can fall back to the snapshot's
 	// immutable rooted walk without losing its acknowledged view. This stages
 	// the cut but does not make it durable; Flush/Close retain that boundary.
-	if c.buffered() && c.primaryRouter != nil {
+	if c.buffered() && c.primaryRouter.Load() != nil {
 		c.writer.Lock()
 		if len(c.primaryPendingParents) != 0 {
 			if err := c.materializePrimaryParentsLocked(); err != nil {
@@ -2356,6 +2410,13 @@ func (c *Collection) Stats() Stats {
 		BufferedFirstTouchOverflows:   c.bufferedFirstTouchOverflows.Load(),
 		PrimaryLeafSplitRequired:      c.primaryLeafSplitRequired.Load(),
 		PrimaryEmptyLeaves:            c.primaryEmptyLeaves.Load(),
+		PrimaryLeafSplits:             c.primaryLeafSplits.Load(),
+		PrimaryLeafMerges:             c.primaryLeafMerges.Load(),
+		PrimaryLeafReclass:            c.primaryLeafReclass.Load(),
+		PrimaryMacroSplitRequired:     c.primaryMacroSplitRequired.Load(),
+		PrimarySplitMaxNS:             c.primarySplitMaxNS.Load(),
+		PrimaryMergeMaxNS:             c.primaryMergeMaxNS.Load(),
+		PrimaryReclassMaxNS:           c.primaryReclassMaxNS.Load(),
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch) + len(c.primaryRootScratch),
 		),
@@ -3139,10 +3200,7 @@ func (c *Collection) deleteLocked(
 }
 
 func (c *Collection) validateDocument(src []byte) (vibejson.Index, error) {
-	estimate := len(src)/8 + 8
-	if estimate < 8 {
-		estimate = 8
-	}
+	estimate := max(len(src)/8+8, 8)
 	if cap(c.parseScratch) < estimate {
 		c.parseScratch = make([]vibejson.IndexEntry, estimate)
 	}

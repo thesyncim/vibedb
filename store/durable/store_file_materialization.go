@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"errors"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibejson"
 )
 
 // tryMaterializeFileUpdate replaces one projection-neutral inline document
@@ -157,7 +157,7 @@ func (c *Collection) tryMaterializeFileUpdate(
 		var zones [64]storeio.ChunkZone
 		count := leafView.Len()
 		laneRank := -1
-		for rank := 0; rank < count; rank++ {
+		for rank := range count {
 			child, ok := leafView.RefAt(rank)
 			if !ok {
 				return false, storeio.ErrChunkDirectoryCorrupt

@@ -369,17 +369,14 @@ func TestSegmentedTabletRouterRejectsCollidingLogicalIDs(t *testing.T) {
 func TestSegmentedTabletRouterRandomizedRouting(t *testing.T) {
 	view, leaves, _ := segmentedTabletRouterTestView(t, 3072)
 	random := rand.New(rand.NewSource(7))
-	for iteration := 0; iteration < 20_000; iteration++ {
+	for iteration := range 20_000 {
 		value := random.Intn(3072*230 + 230)
 		key := []byte(fmt.Sprintf(
 			"tenant/0042/document/%010d", value,
 		))
-		want := sort.Search(len(leaves), func(rank int) bool {
+		want := max(sort.Search(len(leaves), func(rank int) bool {
 			return bytes.Compare(leaves[rank].Fence, key) > 0
-		}) - 1
-		if want < 0 {
-			want = 0
-		}
+		})-1, 0)
 		got := view.RouteHashed(123, key)
 		if got.Bucket != segmentedTabletRouterTestBucket(leaves[want].Ref) {
 			t.Fatalf(
@@ -461,12 +458,9 @@ func TestSegmentedTabletRouterBinaryShortAndTiedHeads(t *testing.T) {
 		[]byte{2},
 	)
 	for _, key := range queries {
-		want := sort.Search(len(fences), func(rank int) bool {
+		want := max(sort.Search(len(fences), func(rank int) bool {
 			return bytes.Compare(fences[rank], key) > 0
-		}) - 1
-		if want < 0 {
-			want = 0
-		}
+		})-1, 0)
 		route := view.RouteHashed(9, key)
 		if route.Bucket !=
 			segmentedTabletRouterTestBucket(leaves[want].Ref) {

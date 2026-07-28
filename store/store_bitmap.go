@@ -4,8 +4,8 @@ import (
 	"math"
 	"math/bits"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/bitset"
+	"github.com/thesyncim/vibejson"
 )
 
 // Collection bitmap workspaces use one uint64 per logical micro-page and one
@@ -78,7 +78,7 @@ func (s Snapshot) AppendBitmapRows(dst []Location, words []uint64) []Location {
 		return dst
 	}
 	n := min(len(words), s.BitmapWords())
-	for chunkID := 0; chunkID < n; chunkID++ {
+	for chunkID := range n {
 		chunk := s.state.Chunks.Get(uint32(chunkID))
 		if chunk == nil {
 			continue
@@ -96,7 +96,7 @@ func (s Snapshot) AppendBitmapKeys(dst []string, words []uint64) []string {
 		return dst
 	}
 	n := min(len(words), s.BitmapWords())
-	for chunkID := 0; chunkID < n; chunkID++ {
+	for chunkID := range n {
 		chunk := s.state.Chunks.Get(uint32(chunkID))
 		if chunk == nil {
 			continue

@@ -28,8 +28,12 @@ var (
 	// reference before any file I/O is attempted.
 	ErrPageCacheReference = errors.New("vibejson: invalid Store page cache reference")
 	// Compatibility names used by the immutable StorePageReader surface.
-	ErrPageCacheFull   = ErrPageCachePinned
-	ErrPageReference   = ErrPageCacheReference
+	ErrPageCacheFull = ErrPageCachePinned
+	// ErrPageReference is the StorePageReader-surface alias for
+	// ErrPageCacheReference.
+	ErrPageReference = ErrPageCacheReference
+	// ErrPageLeaseClosed reports a read or release against a page lease that has
+	// already been closed.
 	ErrPageLeaseClosed = errors.New("vibejson: Store page lease already closed")
 )
 
@@ -1234,7 +1238,7 @@ func (c *PageCache) findWindowLocked(
 	bestStart := 0
 	best := pageCacheWindowScore{}
 	found := false
-	for scannedZone := 0; scannedZone < scanZones; scannedZone++ {
+	for scannedZone := range scanZones {
 		zone := startZone + scannedZone
 		if zone >= zoneCount {
 			zone -= zoneCount
@@ -1256,7 +1260,7 @@ func (c *PageCache) findWindowLocked(
 			firstOffset = c.hand - zoneStart
 		}
 		startCount := lastStart - zoneStart + 1
-		for scannedStart := 0; scannedStart < startCount; scannedStart++ {
+		for scannedStart := range startCount {
 			offset := firstOffset + scannedStart
 			if offset >= startCount {
 				offset -= startCount

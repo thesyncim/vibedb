@@ -174,9 +174,7 @@ func TestDurableDatabaseSnapshotIsASingleInstant(t *testing.T) {
 	}
 
 	var reader sync.WaitGroup
-	reader.Add(1)
-	go func() {
-		defer reader.Done()
+	reader.Go(func() {
 		var capture DatabaseSnapshot
 		defer func() { _ = capture.Close() }()
 		captures := 0
@@ -206,7 +204,7 @@ func TestDurableDatabaseSnapshotIsASingleInstant(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	wg.Wait()
 	close(stop)
@@ -299,9 +297,7 @@ func TestDurableDatabaseSnapshotConcurrentCapturesDoNotDeadlock(t *testing.T) {
 	})
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var capture DatabaseSnapshot
 			defer func() { _ = capture.Close() }()
 			for range 100 {
@@ -314,7 +310,7 @@ func TestDurableDatabaseSnapshotConcurrentCapturesDoNotDeadlock(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }

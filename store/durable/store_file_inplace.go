@@ -3,6 +3,7 @@ package durable
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -179,12 +180,7 @@ func (c *Collection) replaceBufferedFileInplace(
 }
 
 func (c *Collection) bufferedFirstTouchContains(ref storeio.PageRef) bool {
-	for index := range c.bufferedFirstTouches {
-		if c.bufferedFirstTouches[index] == ref {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.bufferedFirstTouches, ref)
 }
 
 func (c *Collection) takeBufferedFirstTouch(ref storeio.PageRef) bool {

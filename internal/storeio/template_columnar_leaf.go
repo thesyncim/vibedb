@@ -37,10 +37,17 @@ const (
 var (
 	templateColumnarLeafMagic = [8]byte{'T', 'C', 'L', 'E', 'A', 'F', '2', 0}
 
+	// ErrTemplateColumnarLeafCorrupt reports that a template-columnar image
+	// failed checksum or structural admission and must not be read.
 	ErrTemplateColumnarLeafCorrupt = errors.New("vibejson: corrupt template-columnar leaf lab")
-	ErrTemplateColumnarLeafShape   = errors.New("vibejson: incompatible template-columnar leaf shape")
+	// ErrTemplateColumnarLeafShape reports that a row's shape is incompatible
+	// with the leaf's template and cannot be admitted.
+	ErrTemplateColumnarLeafShape = errors.New("vibejson: incompatible template-columnar leaf shape")
 )
 
+// TemplateColumnarLeafHole marks where a shared skeleton has a per-row scalar
+// spliced in: the byte offset into the template skeleton and the JSON kind the
+// packed field slot supplies there.
 type TemplateColumnarLeafHole struct {
 	SkeletonOffset uint32
 	Kind           document.Kind
@@ -55,6 +62,11 @@ type templateColumnarLeafRun struct {
 	End   uint32
 }
 
+// TemplateColumnarLeafExtraction is the fused output of validating one row: its
+// shape fingerprint (ID), the borrowed invariant runs and scalar holes that
+// separate template from data, and the per-field byte spans, all produced in a
+// single tape pass so admission and projection never re-walk the document. The
+// slices borrow src; only admission fills Skeleton.
 type TemplateColumnarLeafExtraction struct {
 	// Skeleton is populated only by template admission. Extraction itself does
 	// not copy it; this keeps the validation hot path genuinely fused.
@@ -66,10 +78,15 @@ type TemplateColumnarLeafExtraction struct {
 	ID       [32]byte
 }
 
+// ExtractTemplateColumnarLeaf validates one document and returns its shape
+// fingerprint and borrowed invariant runs, scalar holes, and field spans in a
+// single tape pass. storage is caller-owned index scratch reused across rows.
 func ExtractTemplateColumnarLeaf(src []byte, storage []vibejson.IndexEntry) (TemplateColumnarLeafExtraction, error) {
 	return ExtractTemplateColumnarLeafInto(src, storage, nil)
 }
 
+// ExtractTemplateColumnarLeafInto is ExtractTemplateColumnarLeaf that reuses the
+// slices in dst, so a bulk build extracts every row without per-row allocation.
 func ExtractTemplateColumnarLeafInto(src []byte, storage []vibejson.IndexEntry, dst *TemplateColumnarLeafExtraction) (TemplateColumnarLeafExtraction, error) {
 	index, err := vibejson.BuildIndex(src, storage)
 	if err != nil {
@@ -123,6 +140,9 @@ func ExtractTemplateColumnarLeafInto(src []byte, storage []vibejson.IndexEntry, 
 	return out, nil
 }
 
+// Append reconstructs the original document bytes by splicing the extraction's
+// fields back between its invariant runs and appends them to dst. It returns
+// false if the runs, holes, and fields are inconsistent.
 func (e TemplateColumnarLeafExtraction) Append(dst []byte) ([]byte, bool) {
 	if len(e.Runs) != len(e.Fields)+1 || len(e.Holes) != len(e.Fields) {
 		return dst, false
@@ -142,6 +162,9 @@ func (e TemplateColumnarLeafExtraction) Append(dst []byte) ([]byte, bool) {
 	return append(dst, e.Src[r.Start:r.End]...), true
 }
 
+// TemplateColumnarLeafRow is one input row to the template-columnar builder:
+// its stable slot, key, and raw JSON. All slices are borrowed until the encoder
+// returns.
 type TemplateColumnarLeafRow struct {
 	Slot uint8
 	Key  []byte
@@ -176,6 +199,9 @@ type templateColumnarLeafDictValue struct {
 	value []byte
 }
 
+// TemplateColumnarLeafRawBytes returns the physical size the rows would occupy
+// as a raw (untemplated) leaf. It is the baseline PlanTemplateColumnarLeaf
+// compares the template encoding against.
 func TemplateColumnarLeafRawBytes(rows []TemplateColumnarLeafRow) int {
 	if len(rows) == 0 || len(rows) >= CommonPrimaryLeafWideSlots {
 		return 0
@@ -191,6 +217,10 @@ func TemplateColumnarLeafRawBytes(rows []TemplateColumnarLeafRow) int {
 	return n
 }
 
+// TemplateColumnarLeafPlan is the size decision for a candidate leaf: the raw
+// versus template-encoded byte counts and which the adoption policy selected. It
+// lets the bulk builder compare this class against the raw leaf before
+// committing to it.
 type TemplateColumnarLeafPlan struct {
 	UseTemplate   bool
 	RawBytes      int
@@ -198,6 +228,9 @@ type TemplateColumnarLeafPlan struct {
 	SelectedBytes int
 }
 
+// PlanTemplateColumnarLeaf encodes the rows once and reports whether the
+// template class beats the raw baseline, returning the decision, the encoded
+// image, and the byte counts so the bulk builder chooses without encoding twice.
 func PlanTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) (TemplateColumnarLeafPlan, []byte, error) {
 	raw := TemplateColumnarLeafRawBytes(rows)
 	if raw == 0 {
@@ -214,6 +247,10 @@ func PlanTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) (TemplateColumnarL
 	return p, image, nil
 }
 
+// EncodeTemplateColumnarLeaf encodes rows into one immutable template-columnar
+// image, deriving the shared skeletons, offset-indexed field slots, per-leaf
+// value dictionary, zone vectors, and region checksums. Row bytes are borrowed;
+// the returned image is freshly allocated.
 func EncodeTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) ([]byte, error) {
 	if len(rows) == 0 || len(rows) >= templateColumnarLeafSlots {
 		return nil, fmt.Errorf("%w: row count", ErrInvalidWrite)
@@ -482,6 +519,11 @@ func encodeTemplateColumnarLeafImage(rows []templateColumnarLeafBuildRow, templa
 	return image, nil
 }
 
+// TemplateColumnarLeafView is a borrowed, allocation-free read view over one
+// admitted template-columnar image. OpenTemplateColumnarLeaf validates every
+// region and checksum first, so read, splice, projection, and zone methods may
+// trust the directories; the view aliases the image and is valid only while its
+// page lease is held.
 type TemplateColumnarLeafView struct {
 	image       []byte
 	count       uint16
@@ -500,6 +542,9 @@ type TemplateColumnarLeafView struct {
 	valueDir    []byte
 }
 
+// TemplateColumnarLeafZone is one field's pruning summary: its JSON kind and the
+// borrowed min, max, and presence vectors a query uses to skip the leaf without
+// decoding any row.
 type TemplateColumnarLeafZone struct {
 	Kind               document.Kind
 	Min, Max, Presence []byte
@@ -516,6 +561,9 @@ func sealTemplateColumnarLeaf(image []byte) {
 	binary.LittleEndian.PutUint32(table[12:16], PageChecksum(table[:12]))
 }
 
+// OpenTemplateColumnarLeaf validates every region, directory, and checksum and
+// returns a borrowed read view, or ErrTemplateColumnarLeafCorrupt. It allocates
+// nothing on success; the view aliases src for the lease's lifetime.
 func OpenTemplateColumnarLeaf(src []byte) (TemplateColumnarLeafView, error) {
 	v, ok := parseTemplateColumnarLeafDirectories(src)
 	if !ok {
@@ -639,7 +687,7 @@ func (v TemplateColumnarLeafView) validate() bool {
 			return false
 		}
 		var prior uint32
-		for i := 0; i < n; i++ {
+		for i := range n {
 			ha := (first + i) * 8
 			off := binary.LittleEndian.Uint32(v.holeDir[ha:])
 			run := binary.LittleEndian.Uint16(v.holeDir[ha+4:])
@@ -733,6 +781,8 @@ func (v TemplateColumnarLeafView) columnFor(t, h uint16) (int, bool) {
 	return int(base + h), true
 }
 
+// Zone returns the pruning summary for template t's hole h, or false if that
+// field has no column. It lets a query skip the leaf without decoding rows.
 func (v TemplateColumnarLeafView) Zone(t, h uint16) (TemplateColumnarLeafZone, bool) {
 	ci, ok := v.columnFor(t, h)
 	if !ok {
@@ -795,6 +845,9 @@ func (v TemplateColumnarLeafView) fieldRank(rank int, hole uint16) ([]byte, docu
 	return nil, document.Invalid, false
 }
 
+// Field returns the borrowed bytes and JSON kind of one field (hole) for one
+// slot without reconstructing the row, or false if the slot or field is absent.
+// The bytes alias the page image.
 func (v TemplateColumnarLeafView) Field(slot uint8, hole uint16) ([]byte, document.Kind, bool) {
 	rank := v.slotRanks[slot]
 	if rank == 0xff || int(rank) >= int(v.count) {
@@ -826,6 +879,9 @@ func templateColumnarLeafCopySpan(dst []byte, out int, src []byte, a, b, end int
 	copy(dst[out:out+n], src[a:b])
 }
 
+// AppendRaw reconstructs one slot's full JSON by splicing its packed fields into
+// the shared skeleton and appends it to dst, returning false for an empty slot.
+// It is the detemplating read the common-page wrapper uses to serve a document.
 func (v TemplateColumnarLeafView) AppendRaw(dst []byte, slot uint8, key []byte) ([]byte, bool) {
 	rank := v.slotRanks[slot]
 	if rank == 0xff || int(rank) >= int(v.count) {
@@ -852,7 +908,7 @@ func (v TemplateColumnarLeafView) appendRawDirect(dst []byte, rank int, ti uint1
 	start := len(dst)
 	dst = append(dst, make([]byte, total)...)
 	out, sk := start, ss
-	for i := 0; i < n; i++ {
+	for i := range n {
 		token := uint64(v.image[lp])
 		lp++
 		if token >= 0x80 {
@@ -908,7 +964,7 @@ func (v TemplateColumnarLeafView) appendRawBatched(dst []byte, rank int, ti uint
 	total := int(binary.LittleEndian.Uint16(v.rowDir[at+10:]))
 
 	var spans [templateColumnarLeafMaxSpliceHoles*2 + 1]uint64
-	for i := 0; i < n; i++ {
+	for i := range n {
 		token, z := binary.Uvarint(v.image[lp:le])
 		lp += z
 		var a, b int
@@ -924,7 +980,7 @@ func (v TemplateColumnarLeafView) appendRawBatched(dst []byte, rank int, ti uint
 		spans[i*2+1] = uint64(uint32(a))<<32 | uint64(uint32(b))
 	}
 	sk := ss
-	for i := 0; i < n; i++ {
+	for i := range n {
 		ha := (first + i) * 8
 		run := int(binary.LittleEndian.Uint16(v.holeDir[ha+4:]))
 		spans[i*2] = uint64(uint32(sk))<<32 | uint64(uint32(sk+run))
@@ -976,7 +1032,7 @@ func (v TemplateColumnarLeafView) appendRawSkeletonFirst(dst []byte, rank int, t
 	dp := int(binary.LittleEndian.Uint32(v.rowDir[at+20:]))
 	total := int(binary.LittleEndian.Uint16(v.rowDir[at+10:]))
 	var values [templateColumnarLeafMaxSpliceHoles]uint64
-	for i := 0; i < n; i++ {
+	for i := range n {
 		token, z := binary.Uvarint(v.image[lp:le])
 		lp += z
 		var a, b int
@@ -1019,7 +1075,7 @@ func (v TemplateColumnarLeafView) appendRawSkeletonFirst(dst []byte, rank int, t
 		}
 	}
 	out := start
-	for i := 0; i < n; i++ {
+	for i := range n {
 		run := int(binary.LittleEndian.Uint16(v.holeDir[(first+i)*8+4:]))
 		out += run
 		a, b := int(uint32(values[i]>>32)), int(uint32(values[i]))
@@ -1052,6 +1108,10 @@ func (v TemplateColumnarLeafView) AppendEqualRaw(dst []byte, template, hole uint
 	return dst, survivors
 }
 
+// PatchTemplateColumnarLeafFieldFixed rewrites one equal-length field value in
+// place and reseals the affected region, so an update that does not change a
+// field's width avoids re-encoding the whole leaf. It fails closed if the
+// replacement length differs or the image is corrupt.
 func PatchTemplateColumnarLeafFieldFixed(image []byte, slot uint8, hole uint16, replacement []byte) error {
 	v, err := OpenTemplateColumnarLeaf(image)
 	if err != nil {
@@ -1086,6 +1146,8 @@ func patchTemplateColumnarLeafFieldFixedAdmitted(v TemplateColumnarLeafView, slo
 	return nil
 }
 
+// ResealTemplateColumnarLeaf recomputes the region checksums of an image edited
+// in place, restoring the corruption boundary after a fixed-width field patch.
 func ResealTemplateColumnarLeaf(image []byte) error {
 	if _, ok := parseTemplateColumnarLeafDirectories(image); !ok {
 		return ErrTemplateColumnarLeafCorrupt

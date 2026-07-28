@@ -6,8 +6,8 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storemem"
+	"github.com/thesyncim/vibejson"
 )
 
 // storeMappedDocRef is the pointer-free description of one document in a
@@ -276,6 +276,10 @@ func (m *storeMappedDocs) externalBytes() uint64 {
 	return bytes
 }
 
+// DocAt returns a read-only vibejson.Index over row i, decoding a mapped or
+// template-encoded document on demand and returning an owned heap row directly.
+// The returned Index borrows this segment's backing bytes and is valid only
+// while this generation is reachable.
 func (s *Segment) DocAt(i int) vibejson.Index {
 	if s.mappedDocs == nil {
 		return s.docs[i]
@@ -343,6 +347,10 @@ func storeRootSpan(src []byte) (uint32, uint32) {
 	return uint32(start), uint32(end)
 }
 
+// NarrowAt returns the packed narrow index value at the given shape-tape ref
+// and ordinal for row i, materializing it from the mapped document when the row
+// is not backed by an owned narrow tape. It is the shape-column read primitive
+// that keeps index probes from widening a full document tape.
 func (s *Segment) NarrowAt(i int, ref ShapeTapeRef, ordinal int) ShapeNarrowValue {
 	if s.mappedDocs == nil {
 		return s.narrow[int(ref.off)+ordinal]

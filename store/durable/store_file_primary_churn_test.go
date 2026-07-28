@@ -382,7 +382,7 @@ func primaryChurnOracleCheck(
 ) {
 	tb.Helper()
 	buffer := make([]byte, 0, 64)
-	for i := 0; i < probe; i++ {
+	for range probe {
 		id := rng.IntN(universe)
 		want, wantOK := oracle[id]
 		got, ok, err := collection.AppendRaw(buffer[:0], primaryChurnKey(id))
@@ -411,7 +411,7 @@ func newPrimaryChurnPartition(universe int) *primaryChurnPartition {
 		isPresent: make([]bool, universe),
 		pos:       make([]int, universe),
 	}
-	for id := 0; id < universe; id++ {
+	for id := range universe {
 		if id%2 == 0 {
 			p.pos[id] = len(p.present)
 			p.present = append(p.present, id)
@@ -521,10 +521,7 @@ func primaryChurnCollectSample(
 		}
 		adjSum += float64(delta)
 	}
-	pairs := len(leaves) - 1
-	if pairs < 1 {
-		pairs = 1
-	}
+	pairs := max(len(leaves)-1, 1)
 	meanAdj := adjSum / float64(pairs)
 	meanExtent := float64(extentSum) / float64(len(leaves))
 	adjRatio := 0.0
@@ -663,7 +660,7 @@ func primaryChurnWalkGraph(
 		childrenAreTablets := view.Level() == storeio.GlobalTabletCatalogLeaf
 		count := view.Count()
 		childRefs := make([]storeio.PageRef, 0, count)
-		for i := 0; i < count; i++ {
+		for i := range count {
 			route, ok := view.RouteAt(i)
 			if !ok {
 				lease.Release()

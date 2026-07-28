@@ -85,6 +85,9 @@ func (o Options) stateOptions() StateOptions {
 	}
 }
 
+// MaxChunkDocuments is the fixed number of documents a single chunk addresses.
+// It bounds the per-chunk slot arrays and the eight-bit slot index, and it is
+// the ceiling and default for Options.ChunkDocuments.
 const MaxChunkDocuments = 64
 
 // ErrTooLarge reports that the persistent chunk address space is full.
@@ -95,6 +98,10 @@ var ErrTooLarge = errors.New("vibejson: collection chunk address space exhausted
 
 func maphashString(seed maphash.Seed, Key string) uint64 { return maphash.String(seed, Key) }
 
+// Normalized returns o with zero fields resolved to their defaults and every
+// bound validated, or an error describing the first invalid setting. Callers
+// pass the result to collection construction so later code can assume settled,
+// in-range values.
 func (o Options) Normalized() (Options, error) {
 	if o.ChunkDocuments == 0 {
 		o.ChunkDocuments = MaxChunkDocuments
@@ -172,6 +179,12 @@ func (c *Collection) WithBulkSnapshot(fn func(state *State) error) error {
 	return fn(state)
 }
 
+// State is one immutable generation of a collection: its documents, keys, and
+// exact-index snapshots at a single point in time. Mutations path-copy the
+// structures they touch and publish a new State, so a captured pointer keeps
+// naming the generation it was taken from even as writers advance. Exported
+// fields describe that generation; the unexported fields track how much of it
+// is borrowed from a mapped source versus owned Go heap.
 type State struct {
 	Generation uint64
 	Count      int
@@ -198,6 +211,12 @@ type State struct {
 	source []byte
 }
 
+// Chunk is the unit of document storage and copy-on-write publication: up to
+// MaxChunkDocuments documents addressed by an eight-bit slot, plus the ordering
+// permutation, liveness mask, and zone-pruning summary that let scans and index
+// probes work without decoding rows. A chunk may borrow its keys and bytes from
+// a mapped source or own them on the Go heap; a mutation rebuilds and republishes
+// the whole chunk rather than editing it in place.
 type Chunk struct {
 	Docs       Segment
 	keys       []string
@@ -421,16 +440,14 @@ func storeReplacementEntries(old *Chunk, replaceSlot, replaceBytes int) int {
 	// so their product overflows a 32-bit int on GOARCH=386 well inside the
 	// sizes this store accepts. The len(src)+2 ceiling below returns the result
 	// to int range on every platform.
-	scaled := (uint64(replaceBytes)*uint64(entries) + uint64(len(index.Src)) - 1) /
-		uint64(len(index.Src))
-	// Entry count tracks structure, not length, so a body that is merely
-	// shorter than its predecessor usually has exactly as many members. Taking
-	// the measured row as a floor covers that case — the ordinary shape of a
-	// field-level edit — where pure length scaling would under-reserve and
-	// spill on every write that shortens a string.
-	if scaled < uint64(entries) {
-		scaled = uint64(entries)
-	}
+	scaled := max(
+		// Entry count tracks structure, not length, so a body that is merely
+		// shorter than its predecessor usually has exactly as many members. Taking
+		// the measured row as a floor covers that case — the ordinary shape of a
+		// field-level edit — where pure length scaling would under-reserve and
+		// spill on every write that shortens a string.
+		(uint64(replaceBytes)*uint64(entries)+uint64(len(index.Src))-1)/
+			uint64(len(index.Src)), uint64(entries))
 	// Two entries of slack, not a percentage: the arena outlives the rebuild
 	// that fills it — the new row's tape is carried by reference into every
 	// later generation of this chunk — so every reserved entry the document
@@ -466,7 +483,7 @@ func appendStoreDoc(dst *Segment, old *Segment, oldOrd int) int {
 		n := uint32(len(ref.Rec.Fields))
 		oldRef := ref
 		ref.off = uint32(len(dst.narrow))
-		for i := uint32(0); i < n; i++ {
+		for i := range n {
 			dst.narrow = append(dst.narrow, old.NarrowAt(oldOrd, oldRef, int(i)))
 		}
 	}
@@ -710,6 +727,9 @@ func cloneStoreChunk(
 	)
 }
 
+// Key returns the document key stored at the given physical slot. The result
+// is borrowed: it aliases the chunk's owned key slice or the underlying mapped
+// source and stays valid only while this chunk generation is reachable.
 func (c *Chunk) Key(slot int) string {
 	if c.keys != nil {
 		return c.keys[slot]

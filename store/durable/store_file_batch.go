@@ -5,9 +5,9 @@ import (
 	"math/bits"
 	"slices"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // ErrBatchTooLarge reports a batch whose mutations do not fit the reservation

@@ -256,10 +256,7 @@ func (d *FaultDevice) Commit(pages []Write, root Write) error {
 		if derr != nil {
 			return derr
 		}
-		prefix := len(data) / 2
-		if prefix < 1 {
-			prefix = 1
-		}
+		prefix := max(len(data)/2, 1)
 		if n, werr := d.file.WriteAt(data[:prefix], root.Offset); werr != nil {
 			return d.fault(werr, true)
 		} else if n != prefix {

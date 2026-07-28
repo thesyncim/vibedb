@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -311,10 +312,8 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 	secondKey := keys[secondIndex]
 	sealedRefs := make([]storeio.PageRef, 0, 12)
 	addSealed := func(ref storeio.PageRef) {
-		for _, existing := range sealedRefs {
-			if existing == ref {
-				return
-			}
+		if slices.Contains(sealedRefs, ref) {
+			return
 		}
 		sealedRefs = append(sealedRefs, ref)
 	}
@@ -540,7 +539,7 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 	}
 	defer collection.Close()
 	var splitErr error
-	for at := 0; at < 512; at++ {
+	for at := range 512 {
 		key := fmt.Sprintf("key-%04d", at)
 		_, splitErr = collection.Put(key, []byte(`{"v":1}`))
 		if splitErr != nil {
@@ -652,11 +651,9 @@ func TestFilePrimaryConcurrentRouterPublication(t *testing.T) {
 		writerWG  sync.WaitGroup
 		writerErr error
 	)
-	writerWG.Add(1)
-	go func() {
-		defer writerWG.Done()
+	writerWG.Go(func() {
 		defer done.Store(true)
-		for at := 0; at < 200; at++ {
+		for at := range 200 {
 			value := first
 			if at&1 != 0 {
 				value = second
@@ -666,7 +663,7 @@ func TestFilePrimaryConcurrentRouterPublication(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 	currentBuffer := make([]byte, 0, 128)
 	snapshotBuffer := make([]byte, 0, 128)
 	for !done.Load() {

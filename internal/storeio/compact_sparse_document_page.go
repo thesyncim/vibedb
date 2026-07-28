@@ -467,7 +467,7 @@ func openCompactSparseDocumentPage(src []byte, chunkHighWater uint32, nextLogica
 
 	var occupied [SparseDocumentPageSlotCount]sparseDocumentInterval
 	heapEnd := float64Start
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		start, keyLength, valueLength := compactSparseDocumentDescriptor(page, rank)
 		recordLength := keyLength + valueLength
 		if valueLength == 0 {

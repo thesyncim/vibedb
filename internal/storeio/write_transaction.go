@@ -370,6 +370,23 @@ func (t *WriteTransaction) StageBuiltMaterializationTarget(
 // Allocate reserves one append-only extent. logicalID zero allocates a new
 // logical identity; non-zero rewrites that logical page at the new generation.
 func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint64) (TransactionPage, error) {
+	return t.allocate(kind, length, logicalID, 0)
+}
+
+// AllocateNear is Allocate with a placement hint: a preferred file offset,
+// typically the current offset of the page this copy-on-write replaces. When a
+// reusable extent large enough for the request exists, the allocator takes the
+// one physically nearest hint rather than the lowest-offset first fit, so a
+// retired page's neighbourhood is recycled in place instead of the request
+// growing the file tail. A zero hint, an absent reusable index, or the absence
+// of any reusable fit falls back to exact Allocate behaviour, so AllocateNear
+// never changes which requests can be satisfied — only where a reused extent is
+// taken from.
+func (t *WriteTransaction) AllocateNear(kind PageKind, length uint32, logicalID, hint uint64) (TransactionPage, error) {
+	return t.allocate(kind, length, logicalID, hint)
+}
+
+func (t *WriteTransaction) allocate(kind PageKind, length uint32, logicalID, hint uint64) (TransactionPage, error) {
 	validLength := validPhysicalPageSize(length)
 	if kind == PageDocument || kind == PageOverflow {
 		validLength = validPageExtentSize(kind, length)
@@ -402,7 +419,7 @@ func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint
 	if kind == PageStateRoot && logicalID != StateRootLogicalID || kind != PageStateRoot && logicalID == StateRootLogicalID {
 		return TransactionPage{}, fmt.Errorf("%w: state-root logical id", ErrInvalidWrite)
 	}
-	offset, reused, err := t.allocatePhysical(length)
+	offset, reused, err := t.allocatePhysicalNear(length, hint)
 	if err != nil {
 		return TransactionPage{}, err
 	}
@@ -469,6 +486,25 @@ func variableTransactionExtent(kind PageKind) bool {
 	default:
 		return false
 	}
+}
+
+// allocatePhysicalNear prefers the resident reusable extent nearest hint before
+// falling back to lowest-offset first fit. It only diverges from allocatePhysical
+// when a hint is present, reuse is live, an index is available, and that index
+// finds a resident fit: exactly the copy-on-write case that wants to stay in its
+// physical neighbourhood. Every other case, including a hinted request with no
+// nearby resident fit, defers to allocatePhysical so the promoter and file-tail
+// append still serve requests the resident set cannot.
+func (t *WriteTransaction) allocatePhysicalNear(length uint32, hint uint64) (uint64, bool, error) {
+	if hint != 0 && t.reuseEnabled && t.options.ReusableIndex != nil {
+		want := uint64(length)
+		if index, found := t.options.ReusableIndex.NearestFit(
+			t.options.Reusable, want, hint,
+		); found {
+			return t.allocateFromReusable(index, t.options.Reusable[index], want)
+		}
+	}
+	return t.allocatePhysical(length)
 }
 
 // allocatePhysical takes the first extent large enough, scanning the whole

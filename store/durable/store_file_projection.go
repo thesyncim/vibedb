@@ -3,9 +3,9 @@ package durable
 import (
 	"math"
 
+	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
-	"github.com/thesyncim/vibedb/store"
 )
 
 // fileMaterializationProjectionsEqual reports whether replacing an existing

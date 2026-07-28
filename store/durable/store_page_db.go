@@ -10,10 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	vibejson "github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 const (
@@ -47,11 +47,19 @@ var (
 type StorePageCommitBackend uint8
 
 const (
+	// StorePageCommitAuto is the safe zero value. It selects io_uring on Linux
+	// when available and falls back to the portable committer elsewhere.
 	StorePageCommitAuto StorePageCommitBackend = iota
+	// StorePageCommitPortable forces the dependency-free committer on every
+	// platform.
 	StorePageCommitPortable
+	// StorePageCommitIOUring forces the Linux io_uring committer and fails
+	// where it is unavailable rather than degrading to portable.
 	StorePageCommitIOUring
 )
 
+// String returns the lower-case engine name ("auto", "portable", "io_uring")
+// for logs and Stats; it never fails and reports "unknown" for stray values.
 func (b StorePageCommitBackend) String() string {
 	switch b {
 	case StorePageCommitAuto:
@@ -547,7 +555,7 @@ func (db *StorePageDB) loadDirectoryPath(pages *storeio.PageFile, root storeio.S
 	ref := root.ChunkDirectory
 	expectedShift := uint8(0)
 	haveExpectedShift := false
-	for depth := 0; depth < len(db.path); depth++ {
+	for depth := range len(db.path) {
 		if ref == (storeio.PageRef{}) {
 			return 0, corruptStorePage("mutable missing chunk path", storeio.ErrChunkDirectoryCorrupt)
 		}

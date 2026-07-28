@@ -306,14 +306,8 @@ func (s *Snapshot) fileScanReadAheadWindow() (int, uint64) {
 	if s.collection.cache.ReadBackend() == storeio.BackendIOUring {
 		parallelLimit = options.ReadQueueDepth
 	}
-	pageLimit := min(fileScanReadAheadLimit, options.PrefetchQueue, parallelLimit)
-	if pageLimit < 1 {
-		pageLimit = 1
-	}
-	byteLimit := uint64(options.ResidentBytes / 2)
-	if byteLimit < uint64(options.MaxPageSize) {
-		byteLimit = uint64(options.MaxPageSize)
-	}
+	pageLimit := max(min(fileScanReadAheadLimit, options.PrefetchQueue, parallelLimit), 1)
+	byteLimit := max(uint64(options.ResidentBytes/2), uint64(options.MaxPageSize))
 	return pageLimit, byteLimit
 }
 
@@ -379,7 +373,7 @@ func (s *Snapshot) rangeFileDocumentRun(
 		return err
 	}
 	defer lease.Release()
-	for ordinal := uint32(0); ordinal < chunks; ordinal++ {
+	for ordinal := range chunks {
 		view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+ordinal)
 		if viewErr != nil {
 			return viewErr

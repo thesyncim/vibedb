@@ -211,7 +211,7 @@ func validateIndexGroupCatalogEntries(
 	if seen != header.CoveredIndexes {
 		return 0, fmt.Errorf("%w: index group coverage", ErrInvalidWrite)
 	}
-	for indexID := uint32(0); indexID < indexHighWater; indexID++ {
+	for indexID := range indexHighWater {
 		if seen&(uint64(1)<<indexID) != 0 && totals[indexID] != header.DocumentCount {
 			return 0, fmt.Errorf("%w: index group document count", ErrInvalidWrite)
 		}
@@ -497,7 +497,7 @@ func openIndexGroupCatalogPayload(
 	var totals [64]uint64
 	var seen uint64
 	var previous uint32
-	for position := 0; position < count; position++ {
+	for position := range count {
 		if len(payload)-cursor < IndexGroupCatalogEntryHeaderSize ||
 			!allZero(payload[cursor+24:cursor+IndexGroupCatalogEntryHeaderSize]) {
 			return IndexGroupCatalogView{}, fmt.Errorf("%w: entry header", ErrIndexGroupCatalogCorrupt)
@@ -545,7 +545,7 @@ func openIndexGroupCatalogPayload(
 		return IndexGroupCatalogView{}, fmt.Errorf("%w: coverage", ErrIndexGroupCatalogCorrupt)
 	}
 	if version == indexGroupCatalogVersionV1 {
-		for indexID := uint32(0); indexID < indexHighWater; indexID++ {
+		for indexID := range indexHighWater {
 			if seen&(uint64(1)<<indexID) != 0 &&
 				totals[indexID] != header.DocumentCount {
 				return IndexGroupCatalogView{}, fmt.Errorf(

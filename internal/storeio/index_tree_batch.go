@@ -221,7 +221,7 @@ func (b *indexTreeBatch) rewriteBranch(
 	}
 	assembled := b.assembly[depth][:0]
 	at := 0
-	for rank := 0; rank < count; rank++ {
+	for rank := range count {
 		child, _ := view.ChildAt(rank)
 		end := len(edits)
 		if rank+1 < count {

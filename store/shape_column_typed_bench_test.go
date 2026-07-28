@@ -59,7 +59,7 @@ func appendFieldNodes(c *ShapeCache, dst []vibejson.Node, s *Segment, name strin
 func typedColumnFloatDocs(count int, b testing.TB) *Segment {
 	var set Segment
 	set.Options = document.IndexOptions{HashKeys: true}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		var m string
 		switch i % 3 {
 		case 0:
@@ -157,7 +157,7 @@ func BenchmarkTypedColumnInt64(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			cells, valid = cells[:0], valid[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				var n int64
 				var ok bool
 				if v, present := set.Doc(d).Root().GetCompiled(key); present {
@@ -235,7 +235,7 @@ func BenchmarkTypedColumnFloat64(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				cells, valid = cells[:0], valid[:0]
-				for d := 0; d < docs; d++ {
+				for d := range docs {
 					var f float64
 					var ok bool
 					if v, present := set.Doc(d).Root().GetCompiled(key); present {
@@ -280,7 +280,7 @@ func BenchmarkTypedColumnBool(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			cells, valid = cells[:0], valid[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				var bl bool
 				var ok bool
 				if v, present := set.Doc(d).Root().GetCompiled(key); present {
@@ -345,7 +345,7 @@ func BenchmarkTypedColumnMixedValidity(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			cells, valid = cells[:0], valid[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				var n int64
 				var ok bool
 				if v, present := set.Doc(d).Root().GetCompiled(key); present {
@@ -391,7 +391,7 @@ func BenchmarkTypedColumnAdversarial(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			cells, valid = cells[:0], valid[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				var n int64
 				var ok bool
 				if v, present := set.Doc(d).Root().GetCompiled(key); present {
@@ -432,7 +432,7 @@ func BenchmarkTypedColumnAdversarial(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			cells, valid = cells[:0], valid[:0]
-			for d := 0; d < docs; d++ {
+			for d := range docs {
 				var n int64
 				var ok bool
 				if v, present := set.Doc(d).Root().GetCompiled(key); present {

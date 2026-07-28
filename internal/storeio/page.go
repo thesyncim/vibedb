@@ -48,17 +48,36 @@ const DevelopmentFormatVersion = uint32(0)
 type PageKind uint8
 
 const (
+	// PageStateRoot is the published generation root; it names every current
+	// durable structure and is the page recovery selects an image from.
 	PageStateRoot PageKind = iota + 1
+	// PageDocument is one verbatim JSON document extent: a chunk's contiguous
+	// bytes handed to a scan callback without decoding.
 	PageDocument
+	// PageOverflow is a continuation extent for a document or value too large
+	// for one home page; the home page holds a PageRef into this chain.
 	PageOverflow
+	// PageChunkDirectory is a chunk-radix directory node mapping chunk IDs to
+	// their document pages.
 	PageChunkDirectory
+	// PageKeyDirectory is the pre-hybrid primary-key directory (branch or leaf).
+	// It remains a distinct discriminator so a reader never mistakes it for the
+	// fingerprint directory or a primary-graph node.
 	PageKeyDirectory
+	// PageIndexDirectory is one exact secondary-index directory node.
 	PageIndexDirectory
+	// PageIndexPosting is a packed posting-list page for a secondary index.
 	PageIndexPosting
+	// PageDocumentGroup is a compact-format group page: one shape template and
+	// value dictionary plus per-row token streams packing several chunks.
 	PageDocumentGroup
+	// PageFloat64Group is one columnar float64 group page.
 	PageFloat64Group
+	// PageFloat64Catalog names the float64 groups and stripes of a column.
 	PageFloat64Catalog
+	// PageFloat64Stripe is one float64 column stripe.
 	PageFloat64Stripe
+	// PageIndexGroupCatalog names the durable index groups.
 	PageIndexGroupCatalog
 	// PageFreeImage and PageFreeDelta carry the free set as a base image plus a
 	// chain of per-commit diffs. They replaced a B+tree of PageFreeDirectory
@@ -67,6 +86,8 @@ const (
 	// hole would invite a reader to treat an old node as a valid page of some
 	// other kind instead of failing the way a removed format should.
 	PageFreeImage
+	// PageFreeDelta is one per-commit free-set diff in the image-plus-delta
+	// chain described above.
 	PageFreeDelta
 	// PageFreeIndex names the image's segments. It exists so a fold rewrites the
 	// segments a commit touched instead of the whole image; see free_index.go
@@ -89,11 +110,23 @@ const (
 	// The hybrid primary is one durable graph, but each independently cached
 	// schema has its own kind. Readers therefore select exactly one decoder from
 	// the common header; no byte probing or legacy fallback is permitted.
+	//
+	// PagePrimaryCatalog is the graph root: the exact lexical catalog whose
+	// leaves name each macro-tablet's root PageRef, suitable for
+	// StateRoot.PrimaryRoot.
 	PagePrimaryCatalog
+	// PageTabletDirectory is a tablet-directory node of that catalog, routing a
+	// key to the tablet that owns it.
 	PageTabletDirectory
+	// PagePrimaryLocator is a tablet's local-ID locator page, mapping a stable
+	// BucketID to the current leaf page and slot holding it.
 	PagePrimaryLocator
+	// PageTabletRoute is a tablet's segmented route block over its leaves.
 	PageTabletRoute
+	// PagePrimaryAnchor is a tablet's lexical anchor map: immutable interval
+	// fences that route to stable BucketIDs.
 	PagePrimaryAnchor
+	// PagePrimaryLeaf is a primary leaf holding the ordered key/value records.
 	PagePrimaryLeaf
 )
 

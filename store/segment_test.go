@@ -119,7 +119,7 @@ func TestSegmentHandleStability(t *testing.T) {
 	}
 
 	appended := []string{first}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		doc := fmt.Sprintf(`{"filler":%d,"pad":"%s"}`, i, strings.Repeat("p", i%257))
 		if i%97 == 0 {
 			doc = keyHashWideDoc(600, "spill-") // outgrows the entry chunk tail
@@ -308,7 +308,7 @@ func TestSegmentSparseGatherDifferential(t *testing.T) {
 		`{"a":1,"a":2,"nested":{"x":"n1"}}`,
 		`{"b":3}`,
 	}
-	for i := 0; i < 24; i++ {
+	for i := range 24 {
 		docs = append(docs, fmt.Sprintf(`{"a":%d,"b":"repeat-value-long","empty":[]}`, i+10))
 	}
 	rows := []int{len(docs) - 1, 2, 7, 7, 0, 19, 1}
@@ -457,14 +457,14 @@ func TestGCCorruptionSegmentMultiDoc(t *testing.T) {
 	const iters = 20
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			var retained []*Segment
 			ids := make([]uint32, 0, len(wantIDs))
 			values := make([]vibejson.RawValue, 0, len(wantValues))
-			for it := 0; it < iters; it++ {
+			for it := range iters {
 				forceStackMovement(48+id, it)
 				seg := &Segment{Options: opts}
 				for _, doc := range docs {

@@ -401,12 +401,12 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 	errs := make(chan error, writers)
 	var wait sync.WaitGroup
 	wait.Add(writers)
-	for writer := 0; writer < writers; writer++ {
+	for writer := range writers {
 		writer := writer
 		go func() {
 			defer wait.Done()
 			<-start
-			for item := 0; item < perWriter; item++ {
+			for item := range perWriter {
 				key := fmt.Sprintf("key-%02d-%03d", writer, item)
 				value := []byte(fmt.Sprintf(`{"writer":%d,"item":%d}`, writer, item))
 				if created, putErr := collection.Put(key, value); putErr != nil {

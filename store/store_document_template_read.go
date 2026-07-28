@@ -12,6 +12,10 @@ import (
 // tape. Batch paths retain compact spans; only the general Index API widens
 // and caches a classic tape.
 
+// TemplateAt returns the shared structural template for row i, or false when
+// the row is not template-encoded (heap-built rows and non-template mapped rows
+// never are). The returned template is immutable and borrowed from mapped
+// state; the caller must not retain it past this segment generation.
 func (s *Segment) TemplateAt(i int) (*DocumentTemplate, bool) {
 	if s.mappedDocs == nil {
 		return nil, false
@@ -38,6 +42,10 @@ func (s *Segment) TemplateAt(i int) (*DocumentTemplate, bool) {
 	return template, true
 }
 
+// TemplateSpan returns one field's source coordinates for a templated row,
+// packed as start | end<<16 into the row's original document bytes. Ordinal 0
+// is the whole-document root span; higher ordinals index template fields. It
+// lets a batch reader locate a field without widening the row to a classic tape.
 func (s *Segment) TemplateSpan(i int, template *DocumentTemplate, ordinal int) uint32 {
 	index := s.mappedBase + uint64(i)
 	if ordinal == 0 {

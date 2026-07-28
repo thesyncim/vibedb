@@ -422,7 +422,7 @@ func BenchmarkGlobalTabletCatalogRootAndSelectedAnchor(b *testing.B) {
 
 func BenchmarkGlobalTabletCatalogPacked14Decode(b *testing.B) {
 	var packed [globalTabletCatalogPackedBytes]byte
-	for id := uint16(0); id < TabletLocalIdentityLocalCount; id++ {
+	for id := range uint16(TabletLocalIdentityLocalCount) {
 		code := uint16(GlobalTabletCatalogLocatorLive)<<12 |
 			uint16(id&0x0fff)
 		globalTabletCatalogPut14(packed[:], id, code)

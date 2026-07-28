@@ -6,53 +6,53 @@ import (
 )
 
 var (
-	tabletAnchorMapLabBenchmarkRoute  TabletAnchorMapLabRoute
-	tabletAnchorMapLabBenchmarkID     BucketID
-	tabletAnchorMapLabBenchmarkImage  []byte
-	tabletAnchorMapLabBenchmarkCursor TabletAnchorMapLabCursor
-	tabletAnchorHandleBenchmarkRoute  TabletAnchorHandleLabRoute
-	tabletAnchorHandleBenchmarkRef    PageRef
-	tabletAnchorHandleBenchmarkZone   BucketZone
+	tabletAnchorMapBenchmarkRoute    TabletAnchorMapRoute
+	tabletAnchorMapBenchmarkID       BucketID
+	tabletAnchorMapBenchmarkImage    []byte
+	tabletAnchorMapBenchmarkCursor   TabletAnchorMapCursor
+	tabletAnchorHandleBenchmarkRoute TabletAnchorHandleRoute
+	tabletAnchorHandleBenchmarkRef   PageRef
+	tabletAnchorHandleBenchmarkZone  BucketZone
 )
 
-func BenchmarkTabletAnchorMapLabRoute(b *testing.B) {
-	anchors := tabletAnchorMapLabTestAnchors(4300)
-	view := openTabletAnchorMapLabTest(b, anchors)
+func BenchmarkTabletAnchorMapRoute(b *testing.B) {
+	anchors := tabletAnchorMapTestAnchors(4300)
+	view := openTabletAnchorMapTest(b, anchors)
 	key := []byte("tenant/0042/document/00054321")
-	hash := KeyHashBytes(tabletAnchorMapLabTestSeed, key)
+	hash := KeyHashBytes(tabletAnchorMapTestSeed, key)
 	b.ReportMetric(view.BytesPerAnchor(), "B/anchor")
 	b.ReportMetric(view.BytesPerAnchor()/230, "B/document")
 
 	b.Run("hash-included", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		var route TabletAnchorMapLabRoute
+		var route TabletAnchorMapRoute
 		for b.Loop() {
-			route = view.Route(tabletAnchorMapLabTestSeed, key)
+			route = view.Route(tabletAnchorMapTestSeed, key)
 		}
-		tabletAnchorMapLabBenchmarkRoute = route
+		tabletAnchorMapBenchmarkRoute = route
 		b.ReportMetric(view.BytesPerAnchor(), "B/anchor")
 		b.ReportMetric(view.BytesPerAnchor()/230, "B/document")
 	})
 	b.Run("reused-hash", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		var route TabletAnchorMapLabRoute
+		var route TabletAnchorMapRoute
 		for b.Loop() {
 			route = view.RouteHashed(hash, key)
 		}
-		tabletAnchorMapLabBenchmarkRoute = route
+		tabletAnchorMapBenchmarkRoute = route
 		b.ReportMetric(view.BytesPerAnchor(), "B/anchor")
 		b.ReportMetric(view.BytesPerAnchor()/230, "B/document")
 	})
 	b.Run("lower-bound", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		var cursor TabletAnchorMapLabCursor
+		var cursor TabletAnchorMapCursor
 		for b.Loop() {
 			cursor = view.LowerBound(key)
 		}
-		tabletAnchorMapLabBenchmarkCursor = cursor
+		tabletAnchorMapBenchmarkCursor = cursor
 		b.ReportMetric(view.BytesPerAnchor(), "B/anchor")
 		b.ReportMetric(view.BytesPerAnchor()/230, "B/document")
 	})
@@ -67,13 +67,13 @@ func BenchmarkTabletAnchorMapLabRoute(b *testing.B) {
 				cursor.Next()
 			}
 		}
-		tabletAnchorMapLabBenchmarkID = bucket
+		tabletAnchorMapBenchmarkID = bucket
 		b.ReportMetric(view.BytesPerAnchor(), "B/anchor")
 		b.ReportMetric(view.BytesPerAnchor()/230, "B/document")
 	})
 }
 
-func BenchmarkTabletAnchorHandleLabCombinedRoute(b *testing.B) {
+func BenchmarkTabletAnchorHandleCombinedRoute(b *testing.B) {
 	for _, geometry := range []struct {
 		name      string
 		localBits uint8
@@ -84,14 +84,14 @@ func BenchmarkTabletAnchorHandleLabCombinedRoute(b *testing.B) {
 		{name: "17-13/4300-leaves", localBits: 13, leafCount: 4300, rows: 187},
 	} {
 		b.Run(geometry.name, func(b *testing.B) {
-			view, leaves := tabletAnchorHandleLabTest(
+			view, leaves := tabletAnchorHandleTest(
 				b, geometry.localBits, geometry.leafCount,
 			)
 			target := geometry.leafCount / 2
 			key := []byte(fmt.Sprintf(
 				"tenant/0042/document/%08d", target*230,
 			))
-			hash := KeyHashBytes(tabletAnchorMapLabTestSeed, key)
+			hash := KeyHashBytes(tabletAnchorMapTestSeed, key)
 			b.ReportMetric(
 				view.CombinedBytesPerAnchor(), "B/anchor",
 			)
@@ -101,9 +101,9 @@ func BenchmarkTabletAnchorHandleLabCombinedRoute(b *testing.B) {
 			)
 			b.Run("hash-included", func(b *testing.B) {
 				b.ReportAllocs()
-				var route TabletAnchorHandleLabRoute
+				var route TabletAnchorHandleRoute
 				for b.Loop() {
-					route = view.Route(tabletAnchorMapLabTestSeed, key)
+					route = view.Route(tabletAnchorMapTestSeed, key)
 				}
 				tabletAnchorHandleBenchmarkRoute = route
 				b.ReportMetric(
@@ -116,7 +116,7 @@ func BenchmarkTabletAnchorHandleLabCombinedRoute(b *testing.B) {
 			})
 			b.Run("reused-hash", func(b *testing.B) {
 				b.ReportAllocs()
-				var route TabletAnchorHandleLabRoute
+				var route TabletAnchorHandleRoute
 				for b.Loop() {
 					route = view.RouteHashed(hash, key)
 				}
@@ -152,21 +152,21 @@ func BenchmarkTabletAnchorHandleLabCombinedRoute(b *testing.B) {
 	}
 }
 
-func BenchmarkTabletAnchorMapLabCOWBatchRewrite(b *testing.B) {
-	anchors := tabletAnchorMapLabTestAnchors(4300)
-	view := openTabletAnchorMapLabTest(b, anchors)
+func BenchmarkTabletAnchorMapCOWBatchRewrite(b *testing.B) {
+	anchors := tabletAnchorMapTestAnchors(4300)
+	view := openTabletAnchorMapTest(b, anchors)
 	maxFence := int(view.maxFence)
 	scratch := make([]byte, maxFence*2)
 	dst := make([]byte, 1<<20)
 
 	for _, editCount := range []int{1, 8} {
-		edits := make([]TabletAnchorMapLabEdit, editCount)
+		edits := make([]TabletAnchorMapEdit, editCount)
 		for rank := range edits {
 			// Existing fences are multiples of 230; these lie strictly between
 			// neighbors and model batched ordered-leaf splits.
 			value := 500_001 + rank*10_001
-			edits[rank] = TabletAnchorMapLabEdit{
-				Operation: TabletAnchorMapLabInsert,
+			edits[rank] = TabletAnchorMapEdit{
+				Operation: TabletAnchorMapInsert,
 				Fence: []byte(fmt.Sprintf(
 					"tenant/0042/document/%08d", value,
 				)),
@@ -187,7 +187,7 @@ func BenchmarkTabletAnchorMapLabCOWBatchRewrite(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			tabletAnchorMapLabBenchmarkImage = image
+			tabletAnchorMapBenchmarkImage = image
 		})
 	}
 }

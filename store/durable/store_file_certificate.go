@@ -3,8 +3,8 @@ package durable
 import (
 	"encoding/binary"
 
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
