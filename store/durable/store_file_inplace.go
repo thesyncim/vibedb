@@ -226,6 +226,15 @@ func (c *Collection) checkpointBufferedLocked() error {
 		return err
 	}
 	c.cache.MarkDurable(c.committer.DurableGeneration())
+	// The store root is now durable through this generation. Recycling the
+	// journal head past it is the journal half of the same publication: a crash
+	// between the root fence and this recycle leaves the old header, whose records
+	// recovery re-applies idempotently onto the newer root.
+	if err := c.recycleRecoveryJournalLocked(
+		c.committer.DurableGeneration(),
+	); err != nil {
+		return err
+	}
 	c.clearBufferedInplaceLocked()
 	return nil
 }

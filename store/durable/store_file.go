@@ -306,6 +306,17 @@ type Options struct {
 	// option is explicit and restricted to buffered-visible copy-on-write
 	// checkpoints; it can never weaken DurabilitySync or AsyncVisible.
 	CheckpointStrength CheckpointStrength
+	// RecoveryJournal, on a DurabilityBufferedVisible collection, gives every
+	// frame-deferred acknowledgement a bounded redo record synced to a sibling
+	// journal file, turning buffered-visible's volatile acknowledgement into a
+	// durable one at one bounded append plus one sync — no page copy-on-write and
+	// no root fence. Readers are untouched: visibility still comes from the
+	// canonical frames, and the journal is write-only until crash recovery replays
+	// it through the ordinary mutation path. It has no effect on any other
+	// Durability mode; the journal's sync strength follows CheckpointStrength
+	// (power-safe issues the F_FULLFSYNC-class barrier, filesystem the ordinary
+	// fdatasync-class one).
+	RecoveryJournal bool
 	// MaterializationDamageGranule enables recovery-journaled canonical page
 	// replacement for mutations whose complete before-image sectors fit the
 	// fixed capsule. Zero disables it. A non-zero value is a storage-stack
@@ -989,6 +1000,20 @@ type Collection struct {
 	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
 	combiner      *fileMutationCombiner
+	// journal is the bounded redo log paired with this store. It is non-nil only
+	// for a DurabilityBufferedVisible collection opened or created with
+	// Options.RecoveryJournal. It is owned by the serialized writer exactly like
+	// the committer, appended and synced under c.writer, and recycled inside the
+	// checkpoint's root publication. journalID mirrors the header identity written
+	// into the state root so recovery cannot pair a stray file; journalPowerSafe
+	// selects the acknowledgement barrier strength from CheckpointStrength.
+	journal          *storeio.RecoveryJournal
+	journalID        [16]byte
+	journalPowerSafe bool
+	// journalReplaying suppresses journal appends while Open re-applies recovered
+	// records through the ordinary mutation path: those records are already
+	// durable, and the recycle that follows replay discards them regardless.
+	journalReplaying bool
 	// writeTransaction and the point-mutation scratch below are protected by
 	// writer. The automatic mutation combiner's leader also holds writer while
 	// applying its batch, so no transaction can overlap a Reset.
@@ -1011,8 +1036,16 @@ type Collection struct {
 	bufferedInplaceUpdates        atomic.Uint64
 	bufferedInplaceFallbacks      atomic.Uint64
 	bufferedFirstTouchOverflows   atomic.Uint64
-	primaryLeafSplitRequired      atomic.Uint64
-	primaryEmptyLeaves            atomic.Uint64
+	// journalAcks counts frame-deferred mutations made durable by a single journal
+	// append plus one sync, the redo lane's fast acknowledgement. chainAcks counts
+	// mutations whose durability instead came from a committer root fence — the
+	// snapshot-contended chain path and every forced or explicit checkpoint. The
+	// split is how a bench distinguishes the bounded-append lane from the
+	// full-publication lane at the store level.
+	journalAcks              atomic.Uint64
+	chainAcks                atomic.Uint64
+	primaryLeafSplitRequired atomic.Uint64
+	primaryEmptyLeaves       atomic.Uint64
 	// Structural-transaction accounting for phase-8 split/merge/reclass. The
 	// *MaxNS fields are the observed high-water bounded-transaction latency so a
 	// harness can gate p-max without a full histogram allocation.
@@ -1057,13 +1090,13 @@ type Collection struct {
 	// structuralRows is reused row scratch for a leaf split/merge re-encode. Its
 	// records borrow the source leaf page and are valid only while that page is
 	// leased inside the structural transaction.
-	structuralRows []storeio.CommonPrimaryLeafRecord
-	float64Masks           []uint64
-	float64Values          []float64
-	float64StripeBytes     []byte
-	float64StripeColumns   []storeio.Float64StripeColumn
-	pointKeyScratch        []byte
-	pointChunkEdit         [1]fileChunkEdit
+	structuralRows       []storeio.CommonPrimaryLeafRecord
+	float64Masks         []uint64
+	float64Values        []float64
+	float64StripeBytes   []byte
+	float64StripeColumns []storeio.Float64StripeColumn
+	pointKeyScratch      []byte
+	pointChunkEdit       [1]fileChunkEdit
 	// inlineFree is writer-only durable free-log lineage. Snapshots never need
 	// it, so keeping its fixed record arena off fileStoreState avoids copying a
 	// multi-kilobyte value into every tiny published state object.
@@ -1234,6 +1267,14 @@ type Stats struct {
 	// that could not be remembered because the bounded per-checkpoint set was
 	// full. Those frames remain on the ordinary COW path.
 	BufferedFirstTouchOverflows uint64
+	// JournalAcks counts frame-deferred mutations acknowledged through a single
+	// recovery-journal append plus one sync, with the root publication deferred to
+	// the next checkpoint. ChainAcks counts mutations whose durability instead
+	// came from a committer root fence: the snapshot-contended chain path and
+	// every forced or explicit checkpoint. Both are zero unless a recovery journal
+	// is configured.
+	JournalAcks uint64
+	ChainAcks   uint64
 	// PrimaryLeafSplitRequired counts inserts rejected before publication
 	// because the selected wide leaf needs the deferred structural split.
 	PrimaryLeafSplitRequired uint64
@@ -1244,9 +1285,9 @@ type Stats struct {
 	// PrimaryLeafSplits, PrimaryLeafMerges, and PrimaryLeafReclass count the
 	// phase-8 bounded structural transactions performed this session. Reclass
 	// counts wide->narrow slot-class rewrites folded into a split or merge.
-	PrimaryLeafSplits   uint64
-	PrimaryLeafMerges   uint64
-	PrimaryLeafReclass  uint64
+	PrimaryLeafSplits  uint64
+	PrimaryLeafMerges  uint64
+	PrimaryLeafReclass uint64
 	// PrimaryMacroSplitRequired counts structural transactions that could not
 	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
 	// and a macro-tablet split (the next phase) is required.
@@ -1531,6 +1572,25 @@ func Open(file *os.File, options Options) (*Collection, error) {
 	if err := collection.restoreAppendChunk(state); err != nil {
 		_ = collection.closeResources()
 		return nil, err
+	}
+	// A root that names a journal must pair, replay, and recycle it before the
+	// collection is reachable. A non-zero JournalID is authoritative regardless of
+	// the caller's option: the store may have acknowledged mutations only the
+	// journal records, so a missing or mismatched file fails closed here.
+	if root.JournalID != ([16]byte{}) {
+		if !collection.buffered() {
+			_ = collection.closeResources()
+			return nil, fmt.Errorf(
+				"vibejson: journaled store must reopen buffered-visible")
+		}
+		if err := collection.openRecoveryJournalLocked(root.JournalID); err != nil {
+			_ = collection.closeResources()
+			return nil, err
+		}
+		if err := collection.replayRecoveryJournalLocked(root.Generation); err != nil {
+			_ = collection.closeResources()
+			return nil, err
+		}
 	}
 	return collection, nil
 }
@@ -1956,6 +2016,16 @@ func (c *Collection) createInitialState() error {
 	if err := catalog.apply(&root, uint32(c.options.MaxPageSize)); err != nil {
 		_ = tx.Abort()
 		return err
+	}
+	// Mint the paired journal before the root that names it is published, so a
+	// crash after the root is durable always finds the journal file present. A
+	// referenced-but-absent journal fails closed on reopen.
+	if c.journalConfigured() {
+		if err := c.mintRecoveryJournalLocked(1); err != nil {
+			_ = tx.Abort()
+			return err
+		}
+		root.JournalID = c.journalID
 	}
 	inlineFree := storeio.NewInlineFreeDelta(storeio.PageRef{}, storeio.PageRef{})
 	if err := tx.PublishInline(root, inlineFree); err != nil {
@@ -2408,6 +2478,8 @@ func (c *Collection) Stats() Stats {
 		BufferedInplaceUpdates:        c.bufferedInplaceUpdates.Load(),
 		BufferedInplaceFallbacks:      c.bufferedInplaceFallbacks.Load(),
 		BufferedFirstTouchOverflows:   c.bufferedFirstTouchOverflows.Load(),
+		JournalAcks:                   c.journalAcks.Load(),
+		ChainAcks:                     c.chainAcks.Load(),
 		PrimaryLeafSplitRequired:      c.primaryLeafSplitRequired.Load(),
 		PrimaryEmptyLeaves:            c.primaryEmptyLeaves.Load(),
 		PrimaryLeafSplits:             c.primaryLeafSplits.Load(),
@@ -4551,6 +4623,9 @@ func (c *Collection) closeResources() error {
 // reclaimer whose backing mmap has already been unmapped.
 func (c *Collection) closeResourcesLocked() error {
 	var result error
+	if err := c.closeRecoveryJournalLocked(); err != nil {
+		result = errors.Join(result, err)
+	}
 	if c.committer != nil {
 		if err := c.committer.Close(); err != nil {
 			result = errors.Join(result, err)

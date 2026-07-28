@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -236,6 +237,31 @@ func CreateFromPrimary(
 		_ = tx.Abort()
 		_ = committer.Close()
 		return 0, err
+	}
+	// Mint the paired journal before the root that names it is published, so a
+	// crash after the root is durable finds the journal file present. Buffered
+	// only: other durability modes never carry a journal.
+	if normalized.RecoveryJournal &&
+		normalized.Durability == DurabilityBufferedVisible {
+		var journalID [16]byte
+		if _, err := rand.Read(journalID[:]); err != nil {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, fmt.Errorf(
+				"vibejson: mint recovery journal identity: %w", err)
+		}
+		if err := createSiblingRecoveryJournal(
+			file.Name(),
+			recoveryJournalHeaderFor(
+				storeID, journalID, uint32(normalized.PageSize),
+				normalized.MaxKeyBytes, normalized.InlineValueBytes, 1,
+			),
+		); err != nil {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, err
+		}
+		root.JournalID = journalID
 	}
 	if err := tx.PublishInline(
 		root,

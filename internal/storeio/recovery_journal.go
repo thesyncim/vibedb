@@ -80,7 +80,22 @@ const (
 	// the full-chain path today, but the record schema carries the kind so the
 	// format need not change when a delete fast path lands.
 	recoveryRecordKindDelete = uint16(2)
+
+	// RecoveryRecordKindPut and RecoveryRecordKindDelete are the exported record
+	// kinds a store passes to Append and matches on during Replay. The internal
+	// values stay unexported so the encoder validates them, but a caller in
+	// another package needs a name for the redo verb it is journaling.
+	RecoveryRecordKindPut    = recoveryRecordKindPut
+	RecoveryRecordKindDelete = recoveryRecordKindDelete
 )
+
+// RecoveryRecordPaddedSize returns the on-disk byte cost of one record whose key
+// and value have the given lengths, padded to the sector granule. A store sizes
+// its preallocated journal capacity from this so a chosen record budget maps to
+// an exact byte reservation.
+func RecoveryRecordPaddedSize(sectorSize uint32, keyLen, valueLen int) int {
+	return recoveryRecordPadded(sectorSize, keyLen, valueLen)
+}
 
 var (
 	// ErrRecoveryJournalCorrupt reports a header whose framing, checksum, or

@@ -492,6 +492,11 @@ func (c *Collection) putPrimary(
 		if handled {
 			leafLease.Release()
 			generation = state.root.Generation + 1
+			if err := c.journalAckLocked(
+				storeio.RecoveryRecordKindPut, generation, keyBytes, src,
+			); err != nil {
+				return false, err
+			}
 			return false, nil
 		}
 	}
@@ -526,6 +531,11 @@ func (c *Collection) putPrimary(
 			c.removePrimaryEmptyLeaf()
 		}
 		generation = state.root.Generation + 1
+		if err := c.journalAckLocked(
+			storeio.RecoveryRecordKindPut, generation, keyBytes, src,
+		); err != nil {
+			return created, err
+		}
 		return created, nil
 	}
 	leafLease.Release()
@@ -695,6 +705,11 @@ func (c *Collection) deletePrimary(
 			c.primaryEmptyLeaves.Add(1)
 		}
 		generation = state.root.Generation + 1
+		if err := c.journalAckLocked(
+			storeio.RecoveryRecordKindDelete, generation, keyBytes, nil,
+		); err != nil {
+			return true, err
+		}
 		return true, nil
 	}
 	if c.buffered() && len(c.primaryPendingParents) != 0 {
