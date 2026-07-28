@@ -163,3 +163,12 @@ func (fj *FaultJournal) fault(n int, err error) (int, error) {
 	fj.mu.Unlock()
 	return n, err
 }
+
+// Recycles reports how many header rewrites were observed since the wrapper
+// was created; replay-safety tests assert a recovering Open performs exactly
+// one, after the post-replay fold.
+func (fj *FaultJournal) Recycles() int {
+	fj.mu.Lock()
+	defer fj.mu.Unlock()
+	return fj.recycles
+}

@@ -251,11 +251,19 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 		// its next recycle rides the first ordinary checkpoint.
 		return nil
 	}
-	// Fold the replayed acknowledgements into a durable root and empty the
-	// journal so a second crash before any new write replays nothing.
+	// Fold the replayed acknowledgements into a durable root, then — and only
+	// then — empty the journal, so a crash at any point during replay or the
+	// fold finds every record still on disk and replays idempotently. Recycling
+	// is suppressed while journalReplaying is set, so a mid-replay checkpoint
+	// forced by staging pressure cannot consume records the replay cursor has
+	// not reached.
 	c.writer.Lock()
 	defer c.writer.Unlock()
-	return c.checkpointBufferedLocked()
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return err
+	}
+	c.journalReplaying = false
+	return c.recycleRecoveryJournalLocked(c.committer.DurableGeneration())
 }
 
 // recycleRecoveryJournalLocked advances the journal head past a checkpointed
@@ -263,6 +271,13 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 // journal is configured. The caller holds the writer and has already made the
 // checkpointed generation durable.
 func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
+	if c.journalReplaying {
+		// A checkpoint forced mid-replay (staging pressure from the replayed
+		// mutations) must leave the journal intact: records past the replay
+		// cursor exist nowhere else, and a crash before replay completes must
+		// find them again. The post-replay checkpoint recycles explicitly.
+		return nil
+	}
 	if !c.journalEnabled() || baseGeneration == 0 {
 		return nil
 	}

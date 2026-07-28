@@ -2269,12 +2269,15 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 	if c == nil {
 		return nil, ErrClosed
 	}
-	// A buffered primary router may be newer than its sealed parent graph.
-	// Before handing that generation to a long-lived snapshot, materialize the
-	// pending parents so a later router advance can fall back to the snapshot's
-	// immutable rooted walk without losing its acknowledged view. This stages
-	// the cut but does not make it durable; Flush/Close retain that boundary.
-	if c.buffered() && c.primaryRouter.Load() != nil {
+	// Any deferred canonical lane's primary router may be newer than its
+	// sealed parent graph — buffered and journal-backed synchronous alike.
+	// A snapshot's point reads and ordered scans must agree, so the pending
+	// parents are materialized and the state captured under one writer hold:
+	// releasing the lock between the two hands a concurrent publication a
+	// window to advance the router past the root the snapshot walks. This
+	// stages the cut but does not make it durable; Flush/Close keep that
+	// boundary.
+	if c.deferredCanonicalLane() && c.primaryRouter.Load() != nil {
 		c.writer.Lock()
 		if len(c.primaryPendingParents) != 0 {
 			if err := c.materializePrimaryParentsLocked(); err != nil {
@@ -2282,8 +2285,17 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 				return nil, err
 			}
 		}
+		snap, err := c.pinSnapshotLocked()
 		c.writer.Unlock()
+		return snap, err
 	}
+	return c.pinSnapshot()
+}
+
+// pinSnapshot captures the reader state and acquires its lease under the
+// snapshot gate alone; deferred canonical lanes use pinSnapshotLocked under
+// the writer instead.
+func (c *Collection) pinSnapshot() (*Snapshot, error) {
 	c.snapshotGate.RLock()
 	state, stateErr := c.readerFileState()
 	if stateErr != nil {
@@ -2296,6 +2308,12 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 		return nil, err
 	}
 	return &Snapshot{collection: c, state: state, lease: lease}, nil
+}
+
+// pinSnapshotLocked is pinSnapshot for callers already holding the writer
+// lock, which no gate writer can be inside.
+func (c *Collection) pinSnapshotLocked() (*Snapshot, error) {
+	return c.pinSnapshot()
 }
 
 // Close releases the snapshot generation. It is idempotent.
