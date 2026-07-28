@@ -392,7 +392,7 @@ func compareFormat0Golden(t *testing.T, name string, got []byte) {
 	}
 	limit := min(len(got), len(want))
 	at := limit
-	for index := 0; index < limit; index++ {
+	for index := range limit {
 		if got[index] != want[index] {
 			at = index
 			break
@@ -499,7 +499,9 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"stateRootMaxDocumentBytesEnd":      {stateRootMaxDocumentBytesEnd, 288},
 		"stateRootPrimaryOffset":            {stateRootPrimaryOffset, 288},
 		"stateRootPrimaryEnd":               {stateRootPrimaryEnd, 320},
-		"stateRootReservedOffset":           {stateRootReservedOffset, 320},
+		"stateRootJournalIDOffset":          {stateRootJournalIDOffset, 320},
+		"stateRootJournalIDEnd":             {stateRootJournalIDEnd, 336},
+		"stateRootReservedOffset":           {stateRootReservedOffset, 336},
 		"PageRefSize":                       {PageRefSize, 32},
 		"InlineSuperblockSize":              {InlineSuperblockSize, 4096},
 		"InlineFreeDeltaCapacity":           {InlineFreeDeltaCapacity, 106},

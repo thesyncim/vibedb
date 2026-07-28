@@ -235,6 +235,13 @@ const (
 	PageFreeDelta                     // 14
 	PageFreeIndex                     // 15
 	PageFingerprintDirectory          // 16
+	PageCatalogSegment                // 17
+	PagePrimaryCatalog                // 18
+	PageTabletDirectory               // 19
+	PagePrimaryLocator                // 20
+	PageTabletRoute                   // 21
+	PagePrimaryAnchor                 // 22
+	PagePrimaryLeaf                   // 23
 )
 ```
 
@@ -256,6 +263,13 @@ const (
 | 14 | `PageFreeDelta` | one free-set diff page and predecessor link |
 | 15 | `PageFreeIndex` | directory naming independent free-image segments |
 | 16 | `PageFingerprintDirectory` | keyed-hash B+tree to candidate `(chunk, slot)` locations; exact document-key recheck is authoritative |
+| 17 | `PageCatalogSegment` | self-describing canonical Store catalog segment; reopen selects this decoder by durable kind, never by probing payload |
+| 18 | `PagePrimaryCatalog` | hybrid-primary graph root: exact lexical catalog whose leaves name each macro-tablet's root `PageRef` (`StateRoot.PrimaryRoot`) |
+| 19 | `PageTabletDirectory` | tablet-directory node of the primary catalog, routing a key to the macro-tablet that owns it |
+| 20 | `PagePrimaryLocator` | tablet local-ID locator mapping a stable `BucketID` to the current leaf page and slot holding it |
+| 21 | `PageTabletRoute` | tablet segmented route block over its primary leaves |
+| 22 | `PagePrimaryAnchor` | tablet lexical anchor map: immutable interval fences routing to stable `BucketID`s |
+| 23 | `PagePrimaryLeaf` | ordered primary leaf holding the key/value records |
 
 ### PageRef — 32 bytes
 
@@ -314,7 +328,8 @@ accepted.
 | 280:284 | InlineValueBytes | u32 | immutable inline-value bound |
 | 284:288 | MaxDocumentBytes | u32 | immutable complete-document bound |
 | 288:320 | PrimaryRoot | `PageRef` | zero selects the current fingerprint/chunk primary; otherwise the 64 KiB `PagePrimaryCatalog` root at `PrimaryCatalogRootLogicalID` |
-| 320:512 | reserved | — | zero |
+| 320:336 | JournalID | 16 bytes | UUID of the paired recovery journal file; zero means no journal is referenced |
+| 336:512 | reserved | — | zero |
 
 The chunk, key, index, and float64 directory roots have
 `Length == PageSize`. `IndexGroupHead` may be a larger valid physical extent
@@ -1008,6 +1023,55 @@ The capsule is deliberately bounded. An update whose complete undo sectors and
 metadata do not fit must use ordinary copy-on-write; the format never creates
 a read-visible delta chain.
 
+## Recovery journal (`RJRNL01`)
+
+`internal/storeio/recovery_journal.go`. A bounded redo log kept in a **separate
+preallocated file beside the store**, not a region inside it: `fdatasync`
+flushes every dirty page of the file it is called on, so an in-store journal
+region would drag concurrently pre-written checkpoint pages into every
+acknowledgement sync. A dedicated file keeps the sync domain to the journal's
+own preallocated pages. Readers never consult it; it is write-only until crash
+recovery replays it. The `StateRoot.JournalID` (payload `320:336`) names the
+paired journal file, and the journal header repeats `{StoreID, JournalID}` so
+recovery cannot pair mismatched files. A referenced-but-missing journal fails
+closed; a cleanly-recycled journal with no live records is the ordinary empty
+state.
+
+The file begins with two alternating 512-byte header slots (record region
+starts at `1024`). Recycle rewrites the slot opposite the live one and syncs,
+so a torn recycle leaves the previous header intact and recovery falls back to
+it — the same double-publication reason the store keeps two roots. Each header:
+
+| Offset | Field | Notes |
+| --- | --- | --- |
+| 0:8 | magic | `"RJRNL01\0"` |
+| 8:12 | version | development format `0` |
+| 12:16 | header size | `512` |
+| 16:32 | StoreID | must equal the paired store |
+| 32:48 | JournalID | must equal `StateRoot.JournalID` |
+| 48:52 | PageSize | store page size |
+| 52:56 | SectorSize | append/damage granule, power of two, at least `512` |
+| 56:64 | BaseGeneration | records `<=` this are folded into the root; replay skips them |
+| 64:72 | BaseSequence | first live record must carry `BaseSequence+1` |
+| 72:80 | Capacity | preallocated record-region bytes, a whole multiple of `SectorSize` |
+| 80:88 | RecycleCount | strictly monotonic; recovery selects the highest valid slot |
+| 504:508 | checksum | CRC32C over `[0:504)` |
+| 508:512 | ~checksum | complement |
+
+Records are appended at the write cursor, each padded up to a whole
+`SectorSize` so a torn append can only damage its own tail. The 32-byte fixed
+prefix is magic (`"RRJ1"`), kind (u16: `1` put, `2` delete-reserved), two
+reserved bytes, sequence (u64), generation (u64), key length (u32), and value
+length (u32), followed by the key bytes, the value bytes, a CRC32C over the
+prefix-through-value body, and its complement. Recovery scans from the region
+start validating strict-monotonic sequence (`BaseSequence+1`, then `+1` each)
+and framing; the first invalid record is the truncation point of a torn or
+reordered tail. Records whose generation exceeds the selected root's generation
+are replayed through the ordinary mutation path; the rest are already durable
+in the root. A record that will not fit the preallocated capacity forces a
+checkpoint, which recycles the head — the file never extends per record, so an
+acknowledgement sync never commits filesystem metadata.
+
 ## Checksum and integrity
 
 Every inline root, materialization capsule, and common page is protected by
@@ -1023,6 +1087,10 @@ Coverage:
 
 - **Inline root**: CRC32C over bytes `[0:4088)` of its 4096-byte prefix.
 - **Materialization journal**: CRC32C over bytes `[0:4088)`.
+- **Recovery journal header**: CRC32C over bytes `[0:504)` of each 512-byte
+  header slot.
+- **Recovery journal record**: CRC32C over the record's prefix, key, and value
+  (excluding the sector padding), stored with its complement at the body end.
 - **Common page**: CRC32C over bytes `[0 : PageSize-8)` — the full 64-byte
   header, the payload, and the zero padding between the payload and the
   trailer. Padding is checksum-covered even though readers never re-scan it

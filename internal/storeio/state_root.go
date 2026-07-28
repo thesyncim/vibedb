@@ -58,9 +58,18 @@ const (
 	stateRootMaxDocumentBytesEnd   = stateRootInlineValueBytesEnd + 4
 	stateRootPrimaryOffset         = stateRootMaxDocumentBytesEnd
 	stateRootPrimaryEnd            = stateRootPrimaryOffset + PageRefSize
+	// stateRootJournalIDOffset names the paired recovery journal. It occupies 16
+	// bytes of the previously zero-filled reserve, so a store that never uses a
+	// journal encodes exactly the bytes it did before (an all-zero JournalID),
+	// and existing golden roots decode unchanged. This is the smaller of the two
+	// pairing formats: the reserve exists for exactly this, no field offset
+	// moves, and the payload length is unchanged. The journal file's own header
+	// carries {StoreID, JournalID}; recovery cross-checks both before replaying.
+	stateRootJournalIDOffset = stateRootPrimaryEnd
+	stateRootJournalIDEnd    = stateRootJournalIDOffset + 16
 	// stateRootReservedOffset begins the zero-filled suffix described on
 	// StateRootPayloadSize.
-	stateRootReservedOffset = stateRootPrimaryEnd
+	stateRootReservedOffset = stateRootJournalIDEnd
 )
 
 // State-root option bits are durable equivalents of Store construction
@@ -177,6 +186,13 @@ type StateRoot struct {
 	// PrimaryRoot selects the ordered tablet graph. Zero keeps the current
 	// fingerprint/chunk primary authoritative during the staged cutover.
 	PrimaryRoot PageRef
+	// JournalID is the UUID of the recovery journal file paired with this store.
+	// Zero means no journal is referenced: the store never acknowledged a
+	// mutation through the redo journal, and recovery must find no journal to
+	// replay. A non-zero value binds a specific sibling journal file; recovery
+	// fails closed if that journal is missing or its header identity does not
+	// match both StoreID and this JournalID.
+	JournalID [16]byte
 }
 
 // EncodeStateRootPage writes and seals one complete common-format page into
@@ -263,6 +279,7 @@ func encodeStateRootPayload(payload []byte, root StateRoot) {
 		payload[stateRootPrimaryOffset:stateRootPrimaryEnd],
 		root.PrimaryRoot,
 	)
+	copy(payload[stateRootJournalIDOffset:stateRootJournalIDEnd], root.JournalID[:])
 }
 
 // DecodeStateRootPage verifies a complete common page and its state-root
@@ -346,6 +363,7 @@ func decodeStateRootPayload(
 			payload[stateRootPrimaryOffset:stateRootPrimaryEnd],
 		),
 	}
+	copy(root.JournalID[:], payload[stateRootJournalIDOffset:stateRootJournalIDEnd])
 	copy(
 		root.PageCatalogDigest[:],
 		payload[stateRootPageCatalogEnd:stateRootPageCatalogDigestEnd],
@@ -482,7 +500,7 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 		if refs[i].ref == (PageRef{}) {
 			continue
 		}
-		for j := 0; j < i; j++ {
+		for j := range i {
 			if refs[j].ref != (PageRef{}) &&
 				(refs[j].ref.LogicalID == refs[i].ref.LogicalID || refs[j].ref.Offset == refs[i].ref.Offset) {
 				return fmt.Errorf("%w: duplicate root reference", ErrInvalidWrite)
