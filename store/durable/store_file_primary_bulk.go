@@ -255,10 +255,13 @@ func CreateFromPrimary(
 		return 0, err
 	}
 	// Mint the paired journal before the root that names it is published, so a
-	// crash after the root is durable finds the journal file present. Buffered
-	// only: other durability modes never carry a journal.
-	if normalized.RecoveryJournal &&
-		normalized.Durability == DurabilityBufferedVisible {
+	// crash after the root is durable finds the journal file present.
+	// DurabilitySync is journal-backed on the primary graph unconditionally — it
+	// is how sync acknowledges — while buffered-visible carries a journal only on
+	// the RecoveryJournal opt-in. Async-visible never carries one.
+	if normalized.Durability == DurabilitySync ||
+		normalized.RecoveryJournal &&
+			normalized.Durability == DurabilityBufferedVisible {
 		var journalID [16]byte
 		if _, err := rand.Read(journalID[:]); err != nil {
 			_ = tx.Abort()

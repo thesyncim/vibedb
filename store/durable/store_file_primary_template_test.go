@@ -161,7 +161,15 @@ func mustPrimaryRoot(t testing.TB, file *os.File, options Options) storeio.State
 
 func TestFilePrimaryTemplateLeafDeterministic(t *testing.T) {
 	built, _, _ := buildRedundantPrimaryCorpus(t, 3000)
-	options := Options{Backend: BackendPortable, ResidentBytes: 32 << 20}
+	// Template-leaf encoding is what this test pins, and it is byte-deterministic.
+	// The store root is not under the default DurabilitySync, which mints a
+	// per-store-unique recovery journal and stamps its random identity into the
+	// root — the same non-determinism buffered-visible+RecoveryJournal has. Use a
+	// non-journaled mode so the comparison isolates the graph encoding.
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityAsyncVisible,
+	}
 	write := func(name string) []byte {
 		f, err := os.OpenFile(filepath.Join(t.TempDir(), name), os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {

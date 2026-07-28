@@ -235,6 +235,9 @@ func TestCreateFromPrimaryExactIndexDeterministic(t *testing.T) {
 	}
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		// Byte determinism holds only without a recovery journal: the sync
+		// lane mints a random per-store JournalID into the state root.
+		Durability: DurabilityAsyncVisible,
 		Indexes: []store.IndexDefinition{
 			{Name: "country", Paths: []string{"/country"}},
 			{Name: "country_active", Paths: []string{"/country", "/active"}},

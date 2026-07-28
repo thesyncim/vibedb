@@ -31,6 +31,17 @@ func journalTestOptions(strength CheckpointStrength) Options {
 	}
 }
 
+// syncPrimaryJournalTestOptions is a DurabilitySync primary configuration. The
+// journal is unconditional on this lane (RecoveryJournal is neither required nor
+// consulted), and sync always uses the power-safe barrier, so unlike the
+// buffered helper there is no filesystem-strength variant.
+func syncPrimaryJournalTestOptions() Options {
+	o := journalTestOptions(CheckpointPowerSafe)
+	o.Durability = DurabilitySync
+	o.RecoveryJournal = false
+	return o
+}
+
 // seedPrimaryCollection builds a one-document ordered primary graph so a plain
 // CreateFromPrimary produces a mutable primary store.
 func seedPrimaryCollection(t testing.TB) *store.Collection {
@@ -130,6 +141,193 @@ func TestRecoveryJournalRoundTrip(t *testing.T) {
 			t.Fatalf("key %s: got %q want %q", key, got[key], journalValue(i))
 		}
 	}
+}
+
+// TestSyncPrimaryJournalRoundTrip proves the unified durability mechanism: a
+// DurabilitySync primary store mints a sibling journal unconditionally,
+// acknowledges every mutation through a journal append+sync BEFORE publishing it
+// (so JournalAcks accrues and no chain fence runs), makes each acknowledged value
+// immediately visible, and reopens with every acknowledgement intact after a
+// clean checkpointing Close.
+func TestSyncPrimaryJournalRoundTrip(t *testing.T) {
+	options := syncPrimaryJournalTestOptions()
+	built := seedPrimaryCollection(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.vibe")
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFromPrimary(built, file, options); err != nil {
+		t.Fatalf("CreateFromPrimary: %v", err)
+	}
+	_ = file.Close()
+
+	if _, err := os.Stat(path + ".rjournal"); err != nil {
+		t.Fatalf("sync primary store minted no sibling journal: %v", err)
+	}
+
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	const n = 40
+	want := map[string]string{"seed": `{"v":0}`}
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := journalValue(i)
+		if _, err := coll.Put(key, val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		want[key] = string(val)
+		// Visibility follows durability: the value is readable on the live reader
+		// immediately after the acknowledging Put returns (a snapshot pins the
+		// durable checkpoint root and would not yet see the un-checkpointed ack).
+		if got, found, err := coll.AppendRaw(nil, key); err != nil ||
+			!found || string(got) != string(val) {
+			t.Fatalf("key %s not visible after sync ack: got %q found=%v err=%v want %q",
+				key, got, found, err, val)
+		}
+	}
+	stats := coll.Stats()
+	if stats.JournalAcks == 0 {
+		t.Fatalf("sync primary Put took no journal acknowledgements (journal=%d chain=%d)",
+			stats.JournalAcks, stats.ChainAcks)
+	}
+	if stats.ChainAcks != 0 {
+		t.Fatalf("sync primary lane must not take the retired chain fence, got chain=%d",
+			stats.ChainAcks)
+	}
+	t.Logf("sync round-trip acks: journal=%d chain=%d", stats.JournalAcks, stats.ChainAcks)
+	if err := coll.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_ = file.Close()
+
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	coll, err = Open(file, options)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer coll.Close()
+	if got := snapshotCollectionContent(t, coll); !mapsEqual(got, want) {
+		t.Fatalf("reopen after clean close mismatched: got %d keys want %d", len(got), len(want))
+	}
+}
+
+// TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow exercises the exact
+// window the reversed ordering opens: the redo record is appended and synced
+// durable, but the mutation is NOT yet applied to memory or published. The
+// post-sync fault seam captures the on-disk store and journal at precisely that
+// instant — the record is durable, the store root still predates it — and a
+// reopen of that image must replay the record. This proves a crash between the
+// journal sync and the in-memory publish loses nothing.
+func TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow(t *testing.T) {
+	options := syncPrimaryJournalTestOptions()
+	built := seedPrimaryCollection(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.vibe")
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFromPrimary(built, file, options); err != nil {
+		t.Fatalf("CreateFromPrimary: %v", err)
+	}
+	_ = file.Close()
+
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	want := map[string]string{"seed": `{"v":0}`}
+	const baseline = 8
+	for i := 0; i < baseline; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := journalValue(i)
+		if _, err := coll.Put(key, val); err != nil {
+			t.Fatalf("baseline put %d: %v", i, err)
+		}
+		want[key] = string(val)
+	}
+
+	// Arm the seam to snapshot the files exactly once, at the sync-but-unpublished
+	// instant of the next Put. At that point its record is durable on disk while
+	// the store root still predates it and no in-memory publish has happened.
+	crashStore := filepath.Join(dir, "crash.vibe")
+	crashKey := "crash-key"
+	crashVal := journalValue(999)
+	var captured bool
+	recoveryJournalPostSyncHook = func() {
+		if captured {
+			return
+		}
+		captured = true
+		copyFileForCrash(t, path, crashStore)
+		copyFileForCrash(t, path+".rjournal", crashStore+".rjournal")
+	}
+	defer func() { recoveryJournalPostSyncHook = nil }()
+
+	if _, err := coll.Put(crashKey, crashVal); err != nil {
+		t.Fatalf("crash-window put: %v", err)
+	}
+	if !captured {
+		t.Fatal("post-sync seam never fired: the sync lane did not journal before publishing")
+	}
+	want[crashKey] = string(crashVal)
+	// The live writer published normally after the seam; the value is visible on
+	// the live reader.
+	if got, found, err := coll.AppendRaw(nil, crashKey); err != nil ||
+		!found || string(got) != string(crashVal) {
+		t.Fatalf("crash key not visible on live store after publish: got %q found=%v err=%v",
+			got, found, err)
+	}
+	if err := coll.Close(); err != nil {
+		t.Fatalf("close live: %v", err)
+	}
+	_ = file.Close()
+
+	// Reopen the crash image captured mid-Put. Replay must reconstruct every
+	// baseline acknowledgement AND the record whose in-memory publish never ran.
+	verify := func(label string) {
+		cf, err := os.OpenFile(crashStore, os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := Open(cf, options)
+		if err != nil {
+			t.Fatalf("%s: reopen crash image: %v", label, err)
+		}
+		got := snapshotCollectionContent(t, rc)
+		if got[crashKey] != string(crashVal) {
+			t.Fatalf("%s: synced-but-unpublished record was not replayed: got %q want %q",
+				label, got[crashKey], crashVal)
+		}
+		if !mapsEqual(got, want) {
+			t.Fatalf("%s: recovered %d keys, want %d", label, len(got), len(want))
+		}
+		if err := rc.Close(); err != nil {
+			t.Fatalf("%s: close: %v", label, err)
+		}
+		_ = cf.Close()
+	}
+	verify("first-open-replay")
+	verify("second-open-idempotent")
 }
 
 // TestRecoveryJournalReplayReconstructsAcks copies the store and journal at a
@@ -382,6 +580,55 @@ func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
 	if acks := primary.Stats().JournalAcks; acks == 0 {
 		t.Fatalf("primary Put recorded no journal acknowledgement (journal=%d chain=%d)",
 			acks, primary.Stats().ChainAcks)
+	}
+}
+
+// TestChunkSyncMintsNoJournal completes the journal biconditional on the
+// synchronous side: a journal exists iff the store is primary-layout AND either
+// buffered-visible opted in or the lane is synchronous. A chunk-layout
+// DurabilitySync store has no journal mutation lane, so it mints no sibling
+// journal, acknowledges through the committer chain fence, and reopens cleanly.
+func TestChunkSyncMintsNoJournal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chunk-sync.vibe")
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilitySync,
+	}
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := Create(file, options)
+	if err != nil {
+		t.Fatalf("Create chunk sync store: %v", err)
+	}
+	if _, err := coll.Put("k", []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("chunk sync put: %v", err)
+	}
+	if got := coll.Stats().JournalAcks; got != 0 {
+		t.Fatalf("chunk sync took a journal acknowledgement: journal=%d", got)
+	}
+	if err := coll.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	_ = file.Close()
+	if _, err := os.Stat(path + ".rjournal"); !os.IsNotExist(err) {
+		t.Fatalf("chunk sync store minted a sibling journal (stat err=%v)", err)
+	}
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("reopen chunk sync store: %v", err)
+	}
+	defer reopened.Close()
+	if got, found, err := reopened.AppendRaw(nil, "k"); err != nil ||
+		!found || string(got) != `{"v":1}` {
+		t.Fatalf("chunk sync value lost: got %q found=%v err=%v", got, found, err)
 	}
 }
 

@@ -32,11 +32,25 @@ is a separate file. The store file records the journal's identity
 missing-but-referenced journal fails closed while a cleanly truncated
 one is the ordinary empty state:
 
-- A synchronous mutation is applied to the canonical in-memory frames
-  exactly as buffered-visible does today (in-place patch or COW), then
-  appends one redo record — key, value bytes, generation, checksum — and
-  issues the mode's sync primitive on the journal alone. Acknowledgement
-  returns after that single bounded append+sync.
+- Both synchronous and buffered-visible mutations are applied to the same
+  canonical in-memory frames (in-place patch or frame COW); one redo record
+  — key, value bytes, generation, checksum — is the unit of durability for
+  each. The two lanes differ only in ORDER, because they make different
+  visibility promises:
+  - DurabilitySync appends the record and issues the mode's sync primitive
+    on the journal alone BEFORE the mutation is applied and published, so
+    visibility strictly follows durability. A concurrent reader in the
+    append window sees the pre-mutation state — nothing is published yet —
+    and a sync failure leaves nothing visible and sticky-poisons the
+    collection per the journal poison rules. The record may only be synced
+    once the apply is committed to succeed, so the primary commit is split
+    into a fallible prepare (routing, eligibility, split/capacity checks —
+    no visibility) and an infallible publish; the journal sync sits at that
+    point of no return.
+  - Buffered-visible applies and publishes first, then appends+syncs the
+    record. Its acknowledgement contract already permits a volatile window,
+    so the cheaper apply-then-journal order is correct there.
+  Acknowledgement returns after that single bounded append+sync.
 - Readers never consult the journal. Visibility comes from the canonical
   frames, exactly as now; the journal is write-only until recovery.
 - Checkpoints are unchanged: materialize dirty frames, publish the
@@ -50,10 +64,27 @@ one is the ordinary empty state:
 - Torn or reordered journal tails are detected per record (checksum +
   monotonic generation); a torn tail truncates, never corrupts — the root
   and its graph were never touched before their own two-phase publication.
-- DurabilitySync keeps its platform barrier on the journal append
-  (F_FULLFSYNC on Darwin); the two-phase root protocol keeps its own
-  barriers at checkpoint time. Buffered-visible gains an optional
-  per-mutation durable acknowledgement at the same journal price.
+- On a primary-layout store DurabilitySync's per-mutation acknowledgement
+  IS the journal append plus its platform barrier (F_FULLFSYNC on Darwin);
+  the deferred root is published on the same checkpoint cadence as
+  buffered-visible, with the two-phase root protocol's own barriers at
+  checkpoint time. The old chain-fence acknowledgement — publish a full
+  copy-on-write generation and wait on the committer's root fence per
+  mutation, two ordered device fences — is retired for this lane: nothing on
+  the primary sync path waits on committer.Wait. A chunk-layout
+  DurabilitySync store has no journal mutation lane and keeps the chain
+  fence until the chunk store is deleted. The journal is therefore
+  UNCONDITIONAL for primary DurabilitySync — it is how sync acknowledges,
+  not an option — while the RecoveryJournal option remains the opt-in only
+  for buffered-visible.
+- Because visibility follows durability on the sync lane, a reader can never
+  observe an acknowledged-but-not-yet-durable mutation, so that lane needs
+  none of the fail-closed read logic the old publish-before-durable sync
+  path required. A journal-backed collection retains its last admitted
+  immutable view after a failure exactly as buffered-visible does — every
+  visible generation is journal-durable. The fail-closed-if-visible-leads-
+  durable read path survives only for the chunk sync lane and async
+  canonical materialization, and is deleted with the chunk store.
 - Linux cost parity with a production WAL requires three specifics, not
   optimizations: journal extents are preallocated and recycled so a
   record sync never commits filesystem metadata; record syncs use

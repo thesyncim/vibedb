@@ -130,7 +130,12 @@ type DurabilityMode uint8
 
 const (
 	// DurabilitySync is the safe zero value. A mutation becomes visible and
-	// returns success only after its data and root durability barriers finish.
+	// returns success only after it is durable. On a primary-layout store that
+	// durability is a bounded recovery-journal record appended and synced before
+	// the mutation is applied and published — its root is folded in at the next
+	// checkpoint — so visibility strictly follows durability; on the chunk layout
+	// it is the committer's data and root barriers. Either way no reader observes
+	// an un-durable acknowledged mutation.
 	DurabilitySync DurabilityMode = iota
 	// DurabilityAsyncVisible explicitly publishes after bounded queue
 	// admission while persistence continues in the background.
@@ -316,16 +321,21 @@ type Options struct {
 	// option is explicit and restricted to buffered-visible copy-on-write
 	// checkpoints; it can never weaken DurabilitySync or AsyncVisible.
 	CheckpointStrength CheckpointStrength
-	// RecoveryJournal, on a DurabilityBufferedVisible collection, gives every
-	// frame-deferred acknowledgement a bounded redo record synced to a sibling
-	// journal file, turning buffered-visible's volatile acknowledgement into a
-	// durable one at one bounded append plus one sync — no page copy-on-write and
-	// no root fence. Readers are untouched: visibility still comes from the
-	// canonical frames, and the journal is write-only until crash recovery replays
-	// it through the ordinary mutation path. It has no effect on any other
-	// Durability mode; the journal's sync strength follows CheckpointStrength
-	// (power-safe issues the F_FULLFSYNC-class barrier, filesystem the ordinary
-	// fdatasync-class one).
+	// RecoveryJournal is the opt-in that gives a DurabilityBufferedVisible
+	// collection every frame-deferred acknowledgement a bounded redo record
+	// synced to a sibling journal file, turning buffered-visible's volatile
+	// acknowledgement into a durable one at one bounded append plus one sync — no
+	// page copy-on-write and no root fence. Readers are untouched: visibility
+	// still comes from the canonical frames, and the journal is write-only until
+	// crash recovery replays it through the ordinary mutation path. The journal's
+	// sync strength follows CheckpointStrength (power-safe issues the
+	// F_FULLFSYNC-class barrier, filesystem the ordinary fdatasync-class one).
+	//
+	// It has no effect on DurabilityAsyncVisible, and none on DurabilitySync: a
+	// primary-layout synchronous store is journal-backed UNCONDITIONALLY (the
+	// journal is how sync acknowledges, appended and synced before visibility, at
+	// the power-safe strength sync always uses), so this flag is neither required
+	// nor consulted there.
 	RecoveryJournal bool
 	// MaterializationDamageGranule enables recovery-journaled canonical page
 	// replacement for mutations whose complete before-image sectors fit the
@@ -1498,7 +1508,10 @@ func Create(file *os.File, options Options) (*Collection, error) {
 	if _, err := rand.Read(storeID[:]); err != nil {
 		return nil, fmt.Errorf("vibejson: create collection identity: %w", err)
 	}
-	collection, err := newCollectionResources(file, normalized, storeID)
+	// A freshly created store is always chunk-layout (createInitialState leaves
+	// PrimaryRoot zero); a journaled primary store is built by CreateFromPrimary
+	// and reached through Open.
+	collection, err := newCollectionResources(file, normalized, storeID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1569,7 +1582,10 @@ func Open(file *os.File, options Options) (*Collection, error) {
 		root.MaxPageSize != uint32(normalized.MaxPageSize) {
 		return nil, fmt.Errorf("vibejson: collection options or unsupported durable catalog mismatch")
 	}
-	collection, err := newCollectionResources(file, normalized, root.StoreID)
+	collection, err := newCollectionResources(
+		file, normalized, root.StoreID,
+		root.PrimaryRoot != (storeio.PageRef{}),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1635,7 +1651,11 @@ func Open(file *os.File, options Options) (*Collection, error) {
 			_ = collection.closeResources()
 			return nil, fmt.Errorf("vibejson: build resident primary router: %w", err)
 		}
-		if collection.buffered() {
+		// Both buffered-visible and the journal-backed synchronous lane apply
+		// through the deferred canonical-frame path, so both need the pending
+		// parent and volatile-retire scratch. Async-visible on a primary graph
+		// uses the committer path and does not.
+		if collection.buffered() || collection.synchronous() {
 			pendingCapacity := min(
 				normalized.MaxRetiredExtents,
 				filePrimaryPendingParentLimit,
@@ -1675,10 +1695,15 @@ func Open(file *os.File, options Options) (*Collection, error) {
 	// the caller's option: the store may have acknowledged mutations only the
 	// journal records, so a missing or mismatched file fails closed here.
 	if root.JournalID != ([16]byte{}) {
-		if !collection.buffered() {
+		// A journaled root reopens only on a lane that consults the journal:
+		// buffered-visible (its opt-in) or the synchronous lane (where the journal
+		// is how sync acknowledges). Async-visible has no journal lane, so it must
+		// not adopt a root that may reference acknowledgements only the journal
+		// records.
+		if !collection.buffered() && !collection.synchronous() {
 			_ = collection.closeResources()
 			return nil, fmt.Errorf(
-				"vibejson: journaled store must reopen buffered-visible")
+				"vibejson: journaled store must reopen buffered-visible or synchronous")
 		}
 		if err := collection.openRecoveryJournalLocked(root.JournalID); err != nil {
 			_ = collection.closeResources()
@@ -1698,7 +1723,14 @@ func Open(file *os.File, options Options) (*Collection, error) {
 // production keeps the platform committer.
 var storeCommitterFactory = storeio.NewCommitter
 
-func newCollectionResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte) (*Collection, error) {
+// newCollectionResources builds the committer and cache for a collection.
+// primaryLayout reports whether the store carries an ordered primary graph,
+// known from the recovered root at Open (and always false for a freshly created
+// chunk store). It selects the committer's deferred-root manual checkpoint mode
+// for both buffered-visible and the journal-backed synchronous lane, which
+// stages canonical frames and publishes the root at checkpoints rather than
+// fencing one per mutation.
+func newCollectionResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte, primaryLayout bool) (*Collection, error) {
 	writeFile, directWrite, err := storeio.OpenPageCommitFile(file, storeio.DirectMode(options.WriteMode))
 	if err != nil {
 		return nil, err
@@ -1712,7 +1744,8 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		QueueSlots:         options.QueueSlots, MaxPagesPerBatch: options.maxTransactionPages,
 		GroupLimit: options.GroupLimit, CoalesceDelay: options.CommitCoalesce,
 		MaterializationDamageGranule: uint32(options.MaterializationDamageGranule),
-		ManualCheckpoint:             options.Durability == DurabilityBufferedVisible,
+		ManualCheckpoint: options.Durability == DurabilityBufferedVisible ||
+			options.Durability == DurabilitySync && primaryLayout,
 	})
 	if err != nil {
 		if writeFile != file {
@@ -4658,7 +4691,13 @@ func (c *Collection) Flush() error {
 	if c == nil || c.committer == nil {
 		return ErrClosed
 	}
-	if c.buffered() {
+	// The deferred canonical-frame lanes — buffered-visible and the
+	// journal-backed synchronous lane — hold acknowledged mutations in staged
+	// frames plus (on the sync lane) durable journal records, so Flush folds them
+	// into a checkpointed root and recycles the journal. The chunk sync and
+	// async-visible lanes already fence per generation, so Flush waits on the
+	// current one.
+	if c.buffered() || c.syncJournalLane() {
 		c.writer.Lock()
 		defer c.writer.Unlock()
 		if c.closed {
@@ -4699,7 +4738,10 @@ func (c *Collection) Close() error {
 	if c.closeDone {
 		return nil
 	}
-	if c.buffered() {
+	// Fold the final deferred window into a durable root and recycle the journal
+	// so a reopen replays nothing, for both buffered-visible and the
+	// journal-backed synchronous lane.
+	if c.buffered() || c.syncJournalLane() {
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return err
 		}

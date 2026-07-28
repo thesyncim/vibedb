@@ -823,9 +823,16 @@ func runPrimaryMutationDifferential(
 				operation, key, got, ok, readErr, want, wantOK,
 			)
 		}
-		if durability != DurabilityBufferedVisible ||
-			operation%64 == 63 {
-			if durability == DurabilityBufferedVisible {
+		// A deferred canonical-frame lane — buffered-visible or the journal-backed
+		// synchronous lane — keeps mutations in volatile frames until a checkpoint,
+		// so the persistent-graph page-walk only reflects them after a Flush. The
+		// old per-mutation-durable-root sync contract is retired, so sync now
+		// follows the same cadence as buffered here. A non-deferred lane (async
+		// visible) publishes a full generation per mutation, so its persistent
+		// graph reflects every mutation immediately.
+		deferred := collection.deferredCanonicalLane()
+		if !deferred || operation%64 == 63 {
+			if deferred {
 				if flushErr := collection.Flush(); flushErr != nil {
 					t.Fatalf(
 						"checkpoint %d: %v", operation, flushErr,

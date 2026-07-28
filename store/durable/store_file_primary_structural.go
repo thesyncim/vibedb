@@ -1295,7 +1295,12 @@ func (c *Collection) splitPrimaryLeafForKey(key string) (err error) {
 	c.writer.Lock()
 	var generation uint64
 	defer func() {
-		wait := generation != 0 && c.synchronous()
+		// The journal-backed sync lane makes no chain-fence acknowledgement: a
+		// structural split or merge changes no logical key/value, so recovery
+		// reconstructs it by replaying the triggering Put/Delete through the
+		// ordinary mutation path. Only the chunk sync lane (and a defensive
+		// primary-sync store without a journal) still waits on the root fence.
+		wait := generation != 0 && c.chainFenceSync()
 		if wait {
 			c.durabilityWait.Add(1)
 		}
@@ -1351,7 +1356,12 @@ func (c *Collection) mergeReclassPrimaryLeafForKey(key string) (err error) {
 	c.writer.Lock()
 	var generation uint64
 	defer func() {
-		wait := generation != 0 && c.synchronous()
+		// The journal-backed sync lane makes no chain-fence acknowledgement: a
+		// structural split or merge changes no logical key/value, so recovery
+		// reconstructs it by replaying the triggering Put/Delete through the
+		// ordinary mutation path. Only the chunk sync lane (and a defensive
+		// primary-sync store without a journal) still waits on the root fence.
+		wait := generation != 0 && c.chainFenceSync()
 		if wait {
 			c.durabilityWait.Add(1)
 		}

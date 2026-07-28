@@ -661,8 +661,13 @@ func TestCreateFromPrimaryLexicalCodecIteration1K(t *testing.T) {
 
 func TestCreateFromPrimaryDeterministic(t *testing.T) {
 	built, _, _ := buildFilePrimaryCorpus(t, 1_000)
+	// The default DurabilitySync now mints a per-store-unique recovery journal and
+	// stamps its random identity into the store root, so a journaled build is not
+	// byte-reproducible (the same is true of buffered-visible+RecoveryJournal).
+	// Determinism of the graph encoding is isolated with a non-journaled mode.
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityAsyncVisible,
 	}
 	first := createPrimaryPointFile(t, built, options, "first.vibe")
 	second := createPrimaryPointFile(t, built, options, "second.vibe")

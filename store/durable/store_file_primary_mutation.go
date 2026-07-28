@@ -378,6 +378,19 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 		}
 		c.automaticCheckpoints.Add(1)
 	}
+	// The journal-backed sync lane appends its record at the point of no return,
+	// after the leaf frame is admitted dirty, so it cannot force a checkpoint
+	// there. Fold and recycle a full journal now — before the frame is prepared —
+	// using the worst-case record size so any admitted mutation is guaranteed to
+	// fit. This is the sync lane's checkpoint cadence, the journal analogue of
+	// pending-parent pressure above.
+	if c.syncJournalLane() &&
+		!c.journal.Fits(c.options.MaxKeyBytes, c.options.InlineValueBytes) {
+		if err := c.checkpointBufferedLocked(); err != nil {
+			return err
+		}
+		c.automaticCheckpoints.Add(1)
+	}
 	return c.ensureDirtyCapacityFor(
 		0,
 		c.cache.ReservationBytes(
@@ -432,7 +445,7 @@ func (c *Collection) putPrimary(
 	if err != nil {
 		return false, err
 	}
-	if c.buffered() && !c.leases.AnyActive() {
+	if c.canonicalFramePathEligible() {
 		if err := c.ensureBufferedPrimaryMutationCapacity(
 			resident,
 		); err != nil {
@@ -500,7 +513,7 @@ func (c *Collection) putPrimary(
 			return false, nil
 		}
 	}
-	if c.buffered() && !c.leases.AnyActive() {
+	if c.canonicalFramePathEligible() {
 		nextLeaf, becameEmpty, filledEmpty, mutationErr :=
 			c.cowBufferedPrimaryMutation(
 				state, keyBytes, src, false, found, slot,
@@ -530,16 +543,23 @@ func (c *Collection) putPrimary(
 		if filledEmpty && c.primaryRouter.Load().ClearEmpty(resident) {
 			c.removePrimaryEmptyLeaf()
 		}
-		generation = state.root.Generation + 1
-		if err := c.journalAckLocked(
-			storeio.RecoveryRecordKindPut, generation, keyBytes, src,
-		); err != nil {
-			return created, err
+		ackGeneration := state.root.Generation + 1
+		// The journal-backed sync lane already appended and synced this record
+		// inside cowBufferedPrimaryMutation, before the frame was published, so
+		// the outer generation stays zero and this ack never takes the retired
+		// committer chain fence. Buffered-visible makes its volatile
+		// acknowledgement durable here instead.
+		if c.buffered() {
+			if err := c.journalAckLocked(
+				storeio.RecoveryRecordKindPut, ackGeneration, keyBytes, src,
+			); err != nil {
+				return created, err
+			}
 		}
 		return created, nil
 	}
 	leafLease.Release()
-	if c.buffered() && len(c.primaryPendingParents) != 0 {
+	if c.deferredCanonicalLane() && len(c.primaryPendingParents) != 0 {
 		if err := c.materializePrimaryParentsLocked(); err != nil {
 			return false, err
 		}
@@ -637,7 +657,7 @@ func (c *Collection) deletePrimary(
 	if err != nil {
 		return false, err
 	}
-	if c.buffered() && !c.leases.AnyActive() {
+	if c.canonicalFramePathEligible() {
 		if err := c.ensureBufferedPrimaryMutationCapacity(
 			resident,
 		); err != nil {
@@ -704,15 +724,21 @@ func (c *Collection) deletePrimary(
 		if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 			c.primaryEmptyLeaves.Add(1)
 		}
-		generation = state.root.Generation + 1
-		if err := c.journalAckLocked(
-			storeio.RecoveryRecordKindDelete, generation, keyBytes, nil,
-		); err != nil {
-			return true, err
+		ackGeneration := state.root.Generation + 1
+		// The journal-backed sync lane journaled this delete before publish
+		// inside cowBufferedPrimaryMutation, so the outer generation stays zero
+		// and it never takes the retired chain fence. Buffered-visible makes its
+		// volatile acknowledgement durable here.
+		if c.buffered() {
+			if err := c.journalAckLocked(
+				storeio.RecoveryRecordKindDelete, ackGeneration, keyBytes, nil,
+			); err != nil {
+				return true, err
+			}
 		}
 		return true, nil
 	}
-	if c.buffered() && len(c.primaryPendingParents) != 0 {
+	if c.deferredCanonicalLane() && len(c.primaryPendingParents) != 0 {
 		if err := c.materializePrimaryParentsLocked(); err != nil {
 			return false, err
 		}
@@ -876,7 +902,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	filledEmpty bool,
 	err error,
 ) {
-	if state == nil || leaf == nil || !c.buffered() {
+	if state == nil || leaf == nil || !c.deferredCanonicalLane() {
 		return storeio.PageRef{}, false, false,
 			storeio.ErrInvalidWrite
 	}
@@ -964,6 +990,18 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		root: nextRoot, super: nextSuper,
 		keyRoot: state.keyRoot, chunkRoot: state.chunkRoot,
 		indexRoot: state.indexRoot, freeHead: state.freeHead,
+	}
+
+	// Point of no return: every fallible prepare step above has succeeded, the
+	// dirty frame is admitted, and nothing is reader-visible or committed to the
+	// pending-parent set yet. The journal-backed sync lane appends and syncs its
+	// redo record here, so a reader never observes this mutation before it is
+	// durable; a sync failure poisons and publishes nothing. Buffered-visible is
+	// a no-op here and journals after publishing.
+	if err := c.journalBeforePublishLocked(
+		deleting, generation, key, src,
+	); err != nil {
+		return storeio.PageRef{}, false, false, err
 	}
 
 	previousVolatile := pending.volatileRef

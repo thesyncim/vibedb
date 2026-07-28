@@ -271,19 +271,37 @@ unchanged because the anchor page and row slot are stable. A same-length,
 projection-neutral update may use recovery-journaled canonical materialization
 only when no snapshot can observe the old bytes. Otherwise it uses COW.
 
-That per-mutation anchor-path rewrite is the synchronous and async-visible
-contract. Buffered-visible mode uses the canonical-frame model from
-[hybrid-mutations.md](hybrid-mutations.md), and the two documents share one
-definition: an acknowledgement edits only the owned canonical leaf frame in
-place (readerExclusive) and marks it dirty; anchor pages, tablet roots,
-catalog nodes, and the state root are materialized once per checkpoint by the
-bottom-up dirty-frame walk, not once per mutation. Repeated updates to one
-leaf coalesce into its single after-image. This is the mechanism behind the
-0.45 µs acknowledgement gate: route (~0.19 µs measured) plus one bounded
-in-frame edit, with parent amplification amortized across the checkpoint
-window. A snapshot or sealed checkpoint that can observe the frame forces the
-ordinary COW path; the crash contract is unchanged because buffered
-acknowledgements were never durable before their checkpoint.
+On a primary-layout store the synchronous lane now shares that
+canonical-frame model too. Buffered-visible mode uses the canonical-frame
+model from [hybrid-mutations.md](hybrid-mutations.md), and these documents
+share one definition: an acknowledgement edits only the owned canonical leaf
+frame in place (readerExclusive) and marks it dirty; anchor pages, tablet
+roots, catalog nodes, and the state root are materialized once per checkpoint
+by the bottom-up dirty-frame walk, not once per mutation. The lanes differ
+only in how the acknowledgement is made durable and in what order relative to
+visibility:
+
+- DurabilitySync appends and syncs one bounded recovery-journal record (see
+  [recovery-journal.md](recovery-journal.md)) BEFORE the frame edit is
+  published, so a reader never observes a mutation that is not already
+  durable. Its old per-mutation full-generation COW publish and committer
+  root fence — two ordered device fences — is retired; the deferred root
+  rides the buffered checkpoint cadence (a full journal or staging pressure
+  forces a checkpoint, exactly as buffered). The journal is unconditional
+  here, not an option.
+- Buffered-visible publishes the frame edit first and, with RecoveryJournal,
+  appends the record after; without it the acknowledgement stays volatile
+  until the next checkpoint. Its crash contract is unchanged because buffered
+  acknowledgements were never durable before their checkpoint.
+- async-visible keeps the background full-generation publish, and a
+  chunk-layout synchronous store keeps the old chain fence until the chunk
+  store is deleted.
+
+Repeated updates to one leaf coalesce into its single after-image. This is
+the mechanism behind the 0.45 µs acknowledgement gate: route (~0.19 µs
+measured) plus one bounded in-frame edit, with parent amplification amortized
+across the checkpoint window. A snapshot or sealed checkpoint that can observe
+the frame forces the ordinary COW path.
 
 The collection-local resident router records the newest state generation its
 mutable leaf handles reflect. A snapshot selecting an older generation falls

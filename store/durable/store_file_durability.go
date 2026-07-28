@@ -28,6 +28,52 @@ func (c *Collection) buffered() bool {
 	return c.options.Durability == DurabilityBufferedVisible
 }
 
+// syncJournalLane reports whether this collection acknowledges DurabilitySync
+// mutations through the recovery journal. It is true only for a synchronous
+// store whose journal is open, which is exactly a primary-layout synchronous
+// store (the journal has a mutation lane only there and is minted
+// unconditionally for it). On this lane the redo record is appended and synced
+// BEFORE the mutation is applied and published, so visibility strictly follows
+// durability and no reader observes an un-durable acknowledged mutation.
+func (c *Collection) syncJournalLane() bool {
+	return c.synchronous() && c.journalEnabled()
+}
+
+// chainFenceSync reports whether a synchronous collection still acknowledges
+// through the committer's root fence (publish, then wait) rather than the
+// journal: the chunk-layout sync lane, and the defensive primary-sync store
+// whose journal never opened. It is the only configuration that transiently
+// holds a visible generation ahead of its durable one, so it is precisely the
+// set the fail-closed read path still has to guard.
+func (c *Collection) chainFenceSync() bool {
+	return c.synchronous() && !c.journalEnabled()
+}
+
+// deferredCanonicalLane reports whether mutations are applied to canonical
+// in-memory frames and published with the durable root deferred to a
+// checkpoint, rather than through a per-mutation committer generation.
+// Buffered-visible always uses it; the journal-backed synchronous lane joins
+// it, differing only in that it makes each acknowledgement durable with a
+// journal append plus sync before the frame is published.
+func (c *Collection) deferredCanonicalLane() bool {
+	return c.buffered() || c.syncJournalLane()
+}
+
+// canonicalFramePathEligible reports whether this mutation takes the canonical
+// copy-on-write frame path rather than the committer full-generation path.
+// Buffered-visible steps aside for the committer path while a snapshot is
+// observable — it needs no per-mutation durability, so it can afford that
+// path's fence. The journal-backed sync lane cannot: its committer runs in
+// manual-checkpoint mode with no per-generation root fence to wait on, and it
+// must acknowledge through the journal, so it stays on the copy-on-write
+// canonical path even under an active lease (the old bytes are retained by the
+// copy-on-write, and the retired frame's reclaim is deferred until the lease
+// closes).
+func (c *Collection) canonicalFramePathEligible() bool {
+	return c.deferredCanonicalLane() &&
+		(!c.leases.AnyActive() || c.syncJournalLane())
+}
+
 func (c *Collection) initializeFileState(state *fileStoreState) {
 	c.state.Store(state)
 	c.durableState.Store(state)
@@ -50,7 +96,11 @@ func (c *Collection) publishFileState(state *fileStoreState) {
 		generation: state.root.Generation,
 		state:      state,
 	}
-	if !c.synchronous() {
+	// The journal-backed synchronous lane appended and synced its redo record
+	// before this publish, so the state is already durable and may become
+	// visible now. Only the chain-fence sync lane must withhold visibility until
+	// its root fence lands (promoteDurableStateLocked).
+	if !c.chainFenceSync() {
 		c.visibleState.Store(state)
 	}
 	c.promoteDurableStateLocked(c.committer.DurableGeneration())
@@ -97,7 +147,11 @@ func (c *Collection) promoteDurableStateLocked(generation uint64) {
 		return
 	}
 	c.durableState.Store(candidate)
-	if c.synchronous() {
+	// Only the chain-fence sync lane ties visibility to durability here; the
+	// journal-backed sync lane already advanced visibleState at publish (its
+	// record was durable then), and moving it back to the lagging checkpoint
+	// root would regress reads.
+	if c.chainFenceSync() {
 		c.visibleState.Store(candidate)
 	}
 }
@@ -116,10 +170,12 @@ func (c *Collection) poisonPersistence(_ error) {
 	// by the last durable root before its journal/root sequence failed. Only
 	// reopen recovery can repair/select that image, so reject reads instead of
 	// pretending the retained root pointer is safe to serve live.
-	if c.buffered() {
-		// Preserve the last admitted immutable COW view. No canonical
-		// materialization is allowed in this mode, so a failed checkpoint
-		// cannot have modified any page reachable from the retained view.
+	if c.buffered() || c.journalEnabled() {
+		// Preserve the last admitted immutable view. Both buffered-visible and
+		// the journal-backed sync lane publish only copy-on-write frames, so a
+		// failed checkpoint cannot have modified any page reachable from the
+		// retained view, and on the sync lane every visible generation is also
+		// journal-durable.
 	} else if !c.synchronous() &&
 		c.options.MaterializationDamageGranule != 0 {
 		c.visibleState.Store(nil)
@@ -160,7 +216,13 @@ func (c *Collection) readerFileState() (*fileStoreState, error) {
 	state := c.visibleState.Load()
 	failure := c.PersistenceError()
 	if failure != nil {
-		if !c.buffered() &&
+		// A journal-backed collection (buffered-visible, or the synchronous lane
+		// whose records are synced before visibility) never holds a visible
+		// generation the journal has not already made durable, so it retains its
+		// last admitted view. The fail-closed-if-visible-leads-durable guard
+		// survives only for the chunk sync lane's committer chain fence and for
+		// async canonical materialization, and dies with the chunk store.
+		if !c.buffered() && !c.journalEnabled() &&
 			(c.options.MaterializationDamageGranule != 0 ||
 				state != c.durableState.Load()) {
 			return nil, failure
@@ -184,7 +246,7 @@ func (c *Collection) readerFileStateNoError() *fileStoreState {
 		return nil
 	}
 	if c.committer != nil && c.committer.Failure() != nil {
-		if c.buffered() {
+		if c.buffered() || c.journalEnabled() {
 			return c.visibleState.Load()
 		}
 		if c.options.MaterializationDamageGranule != 0 {

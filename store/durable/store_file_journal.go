@@ -78,6 +78,15 @@ func (c *Collection) poisonJournalLocked(cause error) error {
 // install a FaultJournal over the journal's raw writes; production leaves it nil.
 var recoveryJournalFaultHook func(*storeio.RecoveryJournal)
 
+// recoveryJournalPostSyncHook, when non-nil, is invoked on the journal-backed
+// synchronous lane immediately after a redo record has been appended and synced
+// durable but BEFORE the mutation is applied to memory and published. It exists
+// only so the synced-but-unpublished crash-window test can capture the on-disk
+// store and journal at exactly that instant — the record is durable, the store
+// root still predates it, and no in-memory publish has happened — and prove that
+// a crash there replays the record on reopen. Production leaves it nil.
+var recoveryJournalPostSyncHook func()
+
 // journalEnabled reports whether this collection acknowledges through a recovery
 // journal. It is true only for a buffered-visible collection configured with
 // Options.RecoveryJournal whose journal file is open.
@@ -303,6 +312,41 @@ func (c *Collection) journalAckLocked(
 	}
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
 		return c.poisonJournalLocked(err)
+	}
+	c.journalAcks.Add(1)
+	return nil
+}
+
+// journalBeforePublishLocked is the journal-backed synchronous lane's
+// acknowledgement. It appends one redo record and syncs it at the point of no
+// return of a primary canonical-frame mutation — after every fallible prepare
+// step (routing, eligibility, split detection, dirty admission) has succeeded
+// and before any reader-visible or in-memory-committed state changes — so
+// visibility strictly follows durability. It is a no-op for buffered-visible
+// (which journals after publishing, per its volatile-window contract) and during
+// replay. Journal capacity is ensured before the leaf frame is prepared
+// (ensureBufferedPrimaryMutationCapacity), so the append cannot report full
+// here; any append or sync error is a device failure and is terminal for the
+// journal lane, poisoning die-don't-retry with nothing published.
+func (c *Collection) journalBeforePublishLocked(
+	deleting bool, generation uint64, key, value []byte,
+) error {
+	if !c.syncJournalLane() || c.journalReplaying {
+		return nil
+	}
+	kind := uint16(storeio.RecoveryRecordKindPut)
+	if deleting {
+		kind = storeio.RecoveryRecordKindDelete
+		value = nil
+	}
+	if _, err := c.journal.Append(kind, generation, key, value); err != nil {
+		return c.poisonJournalLocked(err)
+	}
+	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
+		return c.poisonJournalLocked(err)
+	}
+	if recoveryJournalPostSyncHook != nil {
+		recoveryJournalPostSyncHook()
 	}
 	c.journalAcks.Add(1)
 	return nil
