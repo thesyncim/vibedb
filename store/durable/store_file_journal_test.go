@@ -301,6 +301,90 @@ func TestRecoveryJournalFullForcesCheckpoint(t *testing.T) {
 	}
 }
 
+// TestRecoveryJournalRequiresPrimaryLayout proves the journal fails closed on a
+// chunk-layout store, where no mutation would ever append to it. Create rejects
+// the request outright; opening an existing chunk store with the option set is
+// rejected the same way; and the primary path (CreateFromPrimary) both succeeds
+// and actually acknowledges through the journal.
+func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
+	options := journalTestOptions(CheckpointFilesystem)
+	dir := t.TempDir()
+
+	// Create on a fresh (chunk-layout) store must fail closed: the chunk mutation
+	// path never calls journalAckLocked, so a minted journal would be a lie. A
+	// failed Create may leave a partially-initialised file, so this store uses its
+	// own path.
+	rejectPath := filepath.Join(dir, "reject.vibe")
+	rf, err := os.OpenFile(rejectPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(rf, options); !errors.Is(err, ErrRecoveryJournalRequiresPrimary) {
+		t.Fatalf("Create chunk store with RecoveryJournal: got %v, want ErrRecoveryJournalRequiresPrimary", err)
+	}
+	_ = rf.Close()
+
+	// Build a real chunk store WITHOUT a journal, then reopen it with the option
+	// set: Open must also fail closed rather than pretend it can journal.
+	chunkPath := filepath.Join(dir, "chunk.vibe")
+	cf, err := os.OpenFile(chunkPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noJournal := options
+	noJournal.RecoveryJournal = false
+	coll, err := Create(cf, noJournal)
+	if err != nil {
+		t.Fatalf("Create chunk store without journal: %v", err)
+	}
+	if _, err := coll.Put("k", []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("chunk put: %v", err)
+	}
+	if err := coll.Close(); err != nil {
+		t.Fatalf("close chunk: %v", err)
+	}
+	_ = cf.Close()
+
+	cf, err = os.OpenFile(chunkPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cf.Close()
+	if _, err := Open(cf, options); !errors.Is(err, ErrRecoveryJournalRequiresPrimary) {
+		t.Fatalf("Open chunk store with RecoveryJournal: got %v, want ErrRecoveryJournalRequiresPrimary", err)
+	}
+
+	// The primary path succeeds and journals: a Put must record at least one
+	// journal acknowledgement.
+	built := seedPrimaryCollection(t)
+	primaryPath := filepath.Join(dir, "primary.vibe")
+	pf, err := os.OpenFile(primaryPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFromPrimary(built, pf, options); err != nil {
+		t.Fatalf("CreateFromPrimary with RecoveryJournal: %v", err)
+	}
+	_ = pf.Close()
+	pf, err = os.OpenFile(primaryPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pf.Close()
+	primary, err := Open(pf, options)
+	if err != nil {
+		t.Fatalf("Open primary journaled store: %v", err)
+	}
+	defer primary.Close()
+	if _, err := primary.Put("key-0001", journalValue(1)); err != nil {
+		t.Fatalf("primary put: %v", err)
+	}
+	if acks := primary.Stats().JournalAcks; acks == 0 {
+		t.Fatalf("primary Put recorded no journal acknowledgement (journal=%d chain=%d)",
+			acks, primary.Stats().ChainAcks)
+	}
+}
+
 // TestRecoveryJournalMissingFailsClosed proves a root that references a journal
 // whose file is absent fails closed rather than silently dropping acknowledged
 // mutations.

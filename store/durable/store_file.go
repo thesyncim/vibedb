@@ -1059,6 +1059,26 @@ type Collection struct {
 	primaryLeafMerges         atomic.Uint64
 	primaryLeafReclass        atomic.Uint64
 	primaryMacroSplitRequired atomic.Uint64
+	// mergeReclassEvaluations counts every post-delete merge/reclass evaluation
+	// (the second writer-lock acquisition after a routed delete). The rest
+	// decompose its outcome, and the whole point of the capacity-relative floor is
+	// that evaluations vastly exceeds the flush count on a byte-full corpus:
+	//   - mergeReclassWarrantedHits: passed every read-only gate and PAID A FLUSH.
+	//     This is the only counter that implies a checkpoint. It equals commits
+	//     plus the rare post-flush abort (a count-viable neighbour that turned out
+	//     to be on a different anchor page).
+	//   - mergeReclassCommits: published a structural transaction.
+	//   - mergeReclassAborts: identified a candidate but committed nothing --
+	//     mostly the read-only no-viable-neighbour abort (checkpoint-free), plus
+	//     the rare post-flush abort. Recorded as a hysteresis stamp.
+	//   - mergeReclassSkips: below-floor evaluations elided read-only because the
+	//     leaf already aborted at this exact live count (checkpoint-free).
+	// evaluations - warranted is the read-only fraction; only warranted flushes.
+	mergeReclassEvaluations   atomic.Uint64
+	mergeReclassWarrantedHits atomic.Uint64
+	mergeReclassCommits       atomic.Uint64
+	mergeReclassAborts        atomic.Uint64
+	mergeReclassSkips         atomic.Uint64
 	primarySplitMaxNS         atomic.Uint64
 	primaryMergeMaxNS         atomic.Uint64
 	primaryReclassMaxNS       atomic.Uint64
@@ -1294,6 +1314,25 @@ type Stats struct {
 	PrimaryLeafSplits  uint64
 	PrimaryLeafMerges  uint64
 	PrimaryLeafReclass uint64
+	// MergeReclassEvaluations counts post-delete merge/reclass evaluations (the
+	// second writer-lock acquisition each routed delete pays);
+	// MergeReclassWarranted counts the subset that proceeded to a structural
+	// transaction. PrimaryTemplateDetemplateEvents counts template-leaf
+	// de-template splices for mutation; PrimaryTemplateReplanEvents counts full
+	// template dictionary re-dedup encodes. These are process-global storeio
+	// counters, reset by ResetTemplateColumnarDiag.
+	MergeReclassEvaluations         uint64
+	MergeReclassWarranted           uint64
+	// MergeReclassCommits, MergeReclassAborts, and MergeReclassSkips decompose the
+	// merge-floor engagement. Commits published a structural transaction; aborts
+	// were warranted but found nothing viable (a checkpoint-free abort recorded
+	// for hysteresis); skips were elided read-only because the leaf already
+	// aborted at this live count. Only commits pay a flush.
+	MergeReclassCommits             uint64
+	MergeReclassAborts              uint64
+	MergeReclassSkips               uint64
+	PrimaryTemplateDetemplateEvents uint64
+	PrimaryTemplateReplanEvents     uint64
 	// PrimaryMacroSplitRequired counts structural transactions that could not
 	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
 	// and a macro-tablet split (the next phase) is required.
@@ -1578,6 +1617,15 @@ func Open(file *os.File, options Options) (*Collection, error) {
 	if err := collection.restoreAppendChunk(state); err != nil {
 		_ = collection.closeResources()
 		return nil, err
+	}
+	// The recovery journal only has a mutation lane on the ordered primary graph.
+	// Opening a chunk-layout store with Options.RecoveryJournal would acknowledge
+	// nothing through the journal, and a root that names a journal but carries no
+	// primary graph is corrupt: both fail closed rather than lie about durability.
+	if root.PrimaryRoot == (storeio.PageRef{}) &&
+		(collection.journalConfigured() || root.JournalID != ([16]byte{})) {
+		_ = collection.closeResources()
+		return nil, ErrRecoveryJournalRequiresPrimary
 	}
 	// A root that names a journal must pair, replay, and recycle it before the
 	// collection is reachable. A non-zero JournalID is authoritative regardless of
@@ -2023,15 +2071,14 @@ func (c *Collection) createInitialState() error {
 		_ = tx.Abort()
 		return err
 	}
-	// Mint the paired journal before the root that names it is published, so a
-	// crash after the root is durable always finds the journal file present. A
-	// referenced-but-absent journal fails closed on reopen.
+	// createInitialState builds a chunk-layout store (StateRoot.PrimaryRoot stays
+	// zero). The recovery journal has no mutation lane there -- journalAckLocked
+	// fires only from putPrimary/deletePrimary -- so minting one here would pair a
+	// file that no acknowledgement ever appends to, a silent durability lie. Fail
+	// closed; a journaled store is built through CreateFromPrimary.
 	if c.journalConfigured() {
-		if err := c.mintRecoveryJournalLocked(1); err != nil {
-			_ = tx.Abort()
-			return err
-		}
-		root.JournalID = c.journalID
+		_ = tx.Abort()
+		return ErrRecoveryJournalRequiresPrimary
 	}
 	inlineFree := storeio.NewInlineFreeDelta(storeio.PageRef{}, storeio.PageRef{})
 	if err := tx.PublishInline(root, inlineFree); err != nil {
@@ -2457,44 +2504,51 @@ func (c *Collection) Stats() Stats {
 		PublishedGeneration: commit.PublishedGeneration, DurableGeneration: commit.DurableGeneration,
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
-		SuppressedRootWrites:          commit.SuppressedRootWrites,
-		SuppressedRootBytes:           commit.SuppressedRootBytes,
-		SupersededRootWrites:          commit.SupersededRootWrites,
-		SupersededRootBytes:           commit.SupersededRootBytes,
-		SupersededPageWrites:          commit.SupersededPageWrites,
-		SupersededPageBytes:           commit.SupersededPageBytes,
-		TailWitnessWrites:             commit.TailWitnessWrites,
-		TailWitnessBytes:              commit.TailWitnessBytes,
-		PrewrittenPageWrites:          commit.PrewrittenPageWrites,
-		PrewrittenPageBytes:           commit.PrewrittenPageBytes,
-		AutomaticCheckpoints:          c.automaticCheckpoints.Load(),
-		RetirementPressureCheckpoints: c.retirementPressureCheckpoints.Load(),
-		DeviceBytes:                   commit.DeviceBytes,
-		MaterializedBatches:           commit.MaterializedBatches,
-		MaterializationJournalBytes:   commit.MaterializationJournalBytes,
-		MaterializationTargetBytes:    commit.MaterializationTargetBytes,
-		MaterializationFullWriteBytes: commit.MaterializationFullWriteBytes,
-		MaterializationBarriers:       commit.MaterializationBarriers,
-		MaterializationAttempts:       c.materializationAttempts.Load(),
-		MaterializationUpdates:        c.materializationUpdates.Load(),
-		MaterializationFallbacks:      c.materializationFallbacks.Load(),
-		MaterializationSnapshotSkips:  c.materializationSnapshotSkips.Load(),
-		MaterializationBusySkips:      c.materializationBusySkips.Load(),
-		BufferedInplaceAttempts:       c.bufferedInplaceAttempts.Load(),
-		BufferedInplaceUpdates:        c.bufferedInplaceUpdates.Load(),
-		BufferedInplaceFallbacks:      c.bufferedInplaceFallbacks.Load(),
-		BufferedFirstTouchOverflows:   c.bufferedFirstTouchOverflows.Load(),
-		JournalAcks:                   c.journalAcks.Load(),
-		ChainAcks:                     c.chainAcks.Load(),
-		PrimaryLeafSplitRequired:      c.primaryLeafSplitRequired.Load(),
-		PrimaryEmptyLeaves:            c.primaryEmptyLeaves.Load(),
-		PrimaryLeafSplits:             c.primaryLeafSplits.Load(),
-		PrimaryLeafMerges:             c.primaryLeafMerges.Load(),
-		PrimaryLeafReclass:            c.primaryLeafReclass.Load(),
-		PrimaryMacroSplitRequired:     c.primaryMacroSplitRequired.Load(),
-		PrimarySplitMaxNS:             c.primarySplitMaxNS.Load(),
-		PrimaryMergeMaxNS:             c.primaryMergeMaxNS.Load(),
-		PrimaryReclassMaxNS:           c.primaryReclassMaxNS.Load(),
+		SuppressedRootWrites:            commit.SuppressedRootWrites,
+		SuppressedRootBytes:             commit.SuppressedRootBytes,
+		SupersededRootWrites:            commit.SupersededRootWrites,
+		SupersededRootBytes:             commit.SupersededRootBytes,
+		SupersededPageWrites:            commit.SupersededPageWrites,
+		SupersededPageBytes:             commit.SupersededPageBytes,
+		TailWitnessWrites:               commit.TailWitnessWrites,
+		TailWitnessBytes:                commit.TailWitnessBytes,
+		PrewrittenPageWrites:            commit.PrewrittenPageWrites,
+		PrewrittenPageBytes:             commit.PrewrittenPageBytes,
+		AutomaticCheckpoints:            c.automaticCheckpoints.Load(),
+		RetirementPressureCheckpoints:   c.retirementPressureCheckpoints.Load(),
+		DeviceBytes:                     commit.DeviceBytes,
+		MaterializedBatches:             commit.MaterializedBatches,
+		MaterializationJournalBytes:     commit.MaterializationJournalBytes,
+		MaterializationTargetBytes:      commit.MaterializationTargetBytes,
+		MaterializationFullWriteBytes:   commit.MaterializationFullWriteBytes,
+		MaterializationBarriers:         commit.MaterializationBarriers,
+		MaterializationAttempts:         c.materializationAttempts.Load(),
+		MaterializationUpdates:          c.materializationUpdates.Load(),
+		MaterializationFallbacks:        c.materializationFallbacks.Load(),
+		MaterializationSnapshotSkips:    c.materializationSnapshotSkips.Load(),
+		MaterializationBusySkips:        c.materializationBusySkips.Load(),
+		BufferedInplaceAttempts:         c.bufferedInplaceAttempts.Load(),
+		BufferedInplaceUpdates:          c.bufferedInplaceUpdates.Load(),
+		BufferedInplaceFallbacks:        c.bufferedInplaceFallbacks.Load(),
+		BufferedFirstTouchOverflows:     c.bufferedFirstTouchOverflows.Load(),
+		JournalAcks:                     c.journalAcks.Load(),
+		ChainAcks:                       c.chainAcks.Load(),
+		PrimaryLeafSplitRequired:        c.primaryLeafSplitRequired.Load(),
+		PrimaryEmptyLeaves:              c.primaryEmptyLeaves.Load(),
+		PrimaryLeafSplits:               c.primaryLeafSplits.Load(),
+		PrimaryLeafMerges:               c.primaryLeafMerges.Load(),
+		PrimaryLeafReclass:              c.primaryLeafReclass.Load(),
+		MergeReclassEvaluations:         c.mergeReclassEvaluations.Load(),
+		MergeReclassWarranted:           c.mergeReclassWarrantedHits.Load(),
+		MergeReclassCommits:             c.mergeReclassCommits.Load(),
+		MergeReclassAborts:              c.mergeReclassAborts.Load(),
+		MergeReclassSkips:               c.mergeReclassSkips.Load(),
+		PrimaryTemplateDetemplateEvents: storeio.TemplateColumnarDetemplateEvents(),
+		PrimaryTemplateReplanEvents:     storeio.TemplateColumnarReplanEvents(),
+		PrimaryMacroSplitRequired:       c.primaryMacroSplitRequired.Load(),
+		PrimarySplitMaxNS:               c.primarySplitMaxNS.Load(),
+		PrimaryMergeMaxNS:               c.primaryMergeMaxNS.Load(),
+		PrimaryReclassMaxNS:             c.primaryReclassMaxNS.Load(),
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch) + len(c.primaryRootScratch),
 		),

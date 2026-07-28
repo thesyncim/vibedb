@@ -1,7 +1,6 @@
 package durable
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -38,6 +37,16 @@ const recoveryJournalCheckpointRecords = 2048
 const (
 	recoveryJournalMinCapacityBytes = uint64(512) << 10
 	recoveryJournalMaxCapacityBytes = uint64(16) << 20
+)
+
+// ErrRecoveryJournalRequiresPrimary reports that Options.RecoveryJournal was
+// requested for a store whose root has no ordered primary graph. Only the
+// primary mutation path acknowledges through the journal (journalAckLocked fires
+// from putPrimary/deletePrimary); a chunk-layout store would pair a journal that
+// no acknowledgement ever appends to, so the request fails closed rather than
+// mint a file that silently carries no per-mutation durability.
+var ErrRecoveryJournalRequiresPrimary = errors.New(
+	"vibejson: recovery journal requires an ordered primary-graph store",
 )
 
 // journalFailureBox carries the sticky journal poison behind an atomic pointer.
@@ -157,43 +166,6 @@ func createSiblingRecoveryJournal(
 		return fmt.Errorf("vibejson: create recovery journal: %w", err)
 	}
 	return journal.Close()
-}
-
-// mintRecoveryJournalLocked generates a fresh journal identity and preallocates
-// the sibling journal file paired at baseGeneration, keeping it open on the
-// collection. It is called during Create before the first root — which records
-// JournalID — is published, so a crash after the root is durable always finds
-// the journal file present. The caller must hold the writer.
-func (c *Collection) mintRecoveryJournalLocked(baseGeneration uint64) error {
-	if _, err := rand.Read(c.journalID[:]); err != nil {
-		return fmt.Errorf("vibejson: mint recovery journal identity: %w", err)
-	}
-	path, err := c.journalSiblingPath()
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("vibejson: create recovery journal file: %w", err)
-	}
-	journal, err := storeio.CreateRecoveryJournal(
-		file,
-		recoveryJournalHeaderFor(
-			c.storeID, c.journalID, uint32(c.options.PageSize),
-			c.options.MaxKeyBytes, c.options.InlineValueBytes, baseGeneration,
-		),
-	)
-	if err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return fmt.Errorf("vibejson: create recovery journal: %w", err)
-	}
-	c.journalPowerSafe = c.options.CheckpointStrength != CheckpointFilesystem
-	c.journal = journal
-	if recoveryJournalFaultHook != nil {
-		recoveryJournalFaultHook(journal)
-	}
-	return nil
 }
 
 // openRecoveryJournalLocked opens and pairs the sibling journal named by a
