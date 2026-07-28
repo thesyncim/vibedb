@@ -1037,18 +1037,18 @@ type Collection struct {
 	// start of each structural transaction.
 	structuralExactReencoded map[storeio.BucketID]*structuralBucketContribution
 	structuralExactRemoved   []storeio.BucketID
-	readFile      *os.File
-	writeFile     *os.File
-	directRead    bool
-	directWrite   bool
-	leases        *storeio.GenerationLeases
+	readFile                 *os.File
+	writeFile                *os.File
+	directRead               bool
+	directWrite              bool
+	leases                   *storeio.GenerationLeases
 	// readEpochs is the direct-read fast path's reader registry. A point read
 	// claims one epoch slot instead of a snapshot-gate round trip plus a
 	// mutex-guarded generation lease; long-lived Snapshots keep their leases.
 	// Writer-side decisions that consult reader presence must combine both
 	// tables (anyActiveReaders/safeFromReaders) inside a reader fence.
-	readEpochs *storeio.ReadEpochs
-	reclaimer  *storeio.ExtentReclaimer
+	readEpochs    *storeio.ReadEpochs
+	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
 	combiner      *fileMutationCombiner
 	// journal is the bounded redo log paired with this store. It is non-nil only
@@ -1745,7 +1745,9 @@ func Open(file *os.File, options Options) (*Collection, error) {
 			return nil, fmt.Errorf(
 				"vibejson: journaled store must reopen buffered-visible or synchronous")
 		}
-		if err := collection.openRecoveryJournalLocked(root.JournalID); err != nil {
+		if err := collection.openRecoveryJournalLocked(
+			root.JournalID, root.Generation,
+		); err != nil {
 			_ = collection.closeResources()
 			return nil, err
 		}

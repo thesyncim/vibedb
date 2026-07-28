@@ -174,7 +174,7 @@ func TestRecoveryJournalAppendReopenReplay(t *testing.T) {
 
 	rj = reopenTestJournal(t, path)
 	defer rj.Close()
-	if err := rj.Pair(rj.header.StoreID, rj.header.JournalID); err != nil {
+	if err := rj.Pair(rj.header.StoreID, rj.header.JournalID, rj.header.PageSize, rj.header.BaseGeneration); err != nil {
 		t.Fatalf("pair: %v", err)
 	}
 	// scanTail must position the cursor and next sequence exactly past the five
@@ -348,17 +348,39 @@ func TestRecoveryJournalIdentityPairing(t *testing.T) {
 	rj = reopenTestJournal(t, path)
 	defer rj.Close()
 	good := rj.header
-	if err := rj.Pair(good.StoreID, good.JournalID); err != nil {
+	if err := rj.Pair(good.StoreID, good.JournalID, good.PageSize, good.BaseGeneration); err != nil {
 		t.Fatalf("matching identity rejected: %v", err)
 	}
 	var wrong [16]byte
 	wrong[0] = 0xaa
-	if err := rj.Pair(wrong, good.JournalID); !errors.Is(err, ErrRecoveryJournalIdentity) {
+	if err := rj.Pair(wrong, good.JournalID, good.PageSize, good.BaseGeneration); !errors.Is(err, ErrRecoveryJournalIdentity) {
 		t.Fatalf("wrong store id = %v, want identity mismatch", err)
 	}
-	if err := rj.Pair(good.StoreID, wrong); !errors.Is(err, ErrRecoveryJournalIdentity) {
+	if err := rj.Pair(good.StoreID, wrong, good.PageSize, good.BaseGeneration); !errors.Is(err, ErrRecoveryJournalIdentity) {
 		t.Fatalf("wrong journal id = %v, want identity mismatch", err)
 	}
+	if err := rj.Pair(
+		good.StoreID, good.JournalID, good.PageSize*2, good.BaseGeneration,
+	); !errors.Is(err, ErrRecoveryJournalGeometry) {
+		t.Fatalf("wrong page size = %v, want geometry mismatch", err)
+	}
+	if good.BaseGeneration == 0 {
+		// A journal ahead of the root that selected it is a mixed-epoch
+		// bundle: the store half is older, and acknowledgements recycled in
+		// the gap are unrecoverable, so the pair fails closed.
+		if err := rj.Pair(
+			good.StoreID, good.JournalID, good.PageSize, 0,
+		); err != nil {
+			t.Fatalf("equal-generation pair = %v, want nil", err)
+		}
+	}
+	rj.header.BaseGeneration = 7
+	if err := rj.Pair(
+		good.StoreID, good.JournalID, good.PageSize, 3,
+	); !errors.Is(err, ErrRecoveryJournalEpoch) {
+		t.Fatalf("journal ahead of root = %v, want epoch mismatch", err)
+	}
+	rj.header.BaseGeneration = good.BaseGeneration
 }
 
 func TestRecoveryJournalENOSPCAppend(t *testing.T) {

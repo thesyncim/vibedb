@@ -128,6 +128,18 @@ var (
 	// not pair with the selected store root (StoreID or JournalID mismatch). A
 	// referenced-but-mismatched journal must never be replayed onto the store.
 	ErrRecoveryJournalIdentity = errors.New("vibejson: recovery journal identity mismatch")
+
+	// ErrRecoveryJournalGeometry reports a paired journal whose page geometry
+	// does not match the store that names it — the bundle halves were built
+	// for different stores even though the identities collide.
+	ErrRecoveryJournalGeometry = errors.New("vibejson: recovery journal geometry mismatch")
+
+	// ErrRecoveryJournalEpoch reports a journal whose base generation is ahead
+	// of the root that selected it: the store file is older than the journal
+	// (a mixed-epoch bundle, typically a restored store beside a live
+	// journal), so acknowledgements recycled during the gap are gone and the
+	// pair must fail closed rather than open with silent loss.
+	ErrRecoveryJournalEpoch = errors.New("vibejson: recovery journal is ahead of the store root")
 	// ErrRecoveryJournalMissing reports a store root that references a journal
 	// (non-zero JournalID) whose file is absent. This fails closed: the store
 	// may have acknowledged mutations that only the missing journal records.
@@ -634,9 +646,17 @@ func (rj *RecoveryJournal) Header() RecoveryJournalHeader { return rj.header }
 // Pair fails closed unless this journal's header identity matches the selected
 // store root. It is the recovery gate that forbids replaying a stray or
 // mismatched journal onto a store.
-func (rj *RecoveryJournal) Pair(storeID, journalID [16]byte) error {
+func (rj *RecoveryJournal) Pair(
+	storeID, journalID [16]byte, pageSize uint32, rootGeneration uint64,
+) error {
 	if rj.header.StoreID != storeID || rj.header.JournalID != journalID {
 		return ErrRecoveryJournalIdentity
+	}
+	if rj.header.PageSize != pageSize {
+		return ErrRecoveryJournalGeometry
+	}
+	if rj.header.BaseGeneration > rootGeneration {
+		return ErrRecoveryJournalEpoch
 	}
 	return nil
 }

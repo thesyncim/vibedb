@@ -181,7 +181,9 @@ func createSiblingRecoveryJournal(
 // recovered root. A referenced-but-absent journal fails closed: the store may
 // have acknowledged mutations only the journal records. The caller must hold the
 // writer and must not yet have made the collection reachable.
-func (c *Collection) openRecoveryJournalLocked(journalID [16]byte) error {
+func (c *Collection) openRecoveryJournalLocked(
+	journalID [16]byte, rootGeneration uint64,
+) error {
 	path, err := c.journalSiblingPath()
 	if err != nil {
 		return err
@@ -198,7 +200,9 @@ func (c *Collection) openRecoveryJournalLocked(journalID [16]byte) error {
 		_ = file.Close()
 		return err
 	}
-	if err := journal.Pair(c.storeID, journalID); err != nil {
+	if err := journal.Pair(
+		c.storeID, journalID, uint32(c.options.PageSize), rootGeneration,
+	); err != nil {
 		_ = journal.Close()
 		return err
 	}
