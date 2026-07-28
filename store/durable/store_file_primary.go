@@ -434,3 +434,9 @@ func withOpenedPrimaryCatalogNode(
 	}
 	return visit(&node)
 }
+
+// ResetPrimaryTemplateDiag zeroes the process-global template-columnar mutation
+// diagnostics (de-template and re-plan event counters). It is a thin re-export
+// of the storeio counter reset so out-of-tree diagnostics can attribute runtime
+// cost without importing the internal package.
+func ResetPrimaryTemplateDiag() { storeio.ResetTemplateColumnarDiag() }

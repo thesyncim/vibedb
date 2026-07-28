@@ -255,6 +255,7 @@ func EncodeTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) ([]byte, error) 
 	if len(rows) == 0 || len(rows) >= templateColumnarLeafSlots {
 		return nil, fmt.Errorf("%w: row count", ErrInvalidWrite)
 	}
+	replanEvents.Add(1)
 	buildRows := make([]templateColumnarLeafBuildRow, len(rows))
 	templates := make([]templateColumnarLeafTemplate, 0, 8)
 	var occupied [4]uint64

@@ -4,7 +4,32 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync/atomic"
 )
+
+// Template-columnar mutation diagnostics. detemplateEvents counts how many times
+// a resident template-columnar leaf was spliced back into a raw envelope for a
+// mutation (the "de-template on first write" tax); replanEvents counts full
+// EncodeTemplateColumnarLeaf dictionary re-dedup passes. Both are process-global
+// and cheap; a harness resets them after bulk load to attribute runtime cost.
+var (
+	detemplateEvents atomic.Uint64
+	replanEvents     atomic.Uint64
+)
+
+// TemplateColumnarDetemplateEvents reports how many times a template leaf was
+// de-templated for a mutation since the last reset.
+func TemplateColumnarDetemplateEvents() uint64 { return detemplateEvents.Load() }
+
+// TemplateColumnarReplanEvents reports how many full template re-plan (dictionary
+// re-dedup) encodes have run since the last reset.
+func TemplateColumnarReplanEvents() uint64 { return replanEvents.Load() }
+
+// ResetTemplateColumnarDiag zeroes the template mutation diagnostics.
+func ResetTemplateColumnarDiag() {
+	detemplateEvents.Store(0)
+	replanEvents.Store(0)
+}
 
 // A template-columnar primary leaf is a PagePrimaryLeaf physical page whose
 // payload carries the class discriminator in payload[2] (the same byte the
@@ -243,6 +268,7 @@ func AdmittedPrimaryLeafForMutation(
 			"%w: template primary leaf", ErrCommonPrimaryLeafCorrupt,
 		)
 	}
+	detemplateEvents.Add(1)
 	records, _, err := tv.DetemplateRecords(nil, nil)
 	if err != nil {
 		return CommonPrimaryLeafView{}, false, err
