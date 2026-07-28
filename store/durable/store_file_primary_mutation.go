@@ -314,26 +314,29 @@ func (c *Collection) clearPrimaryVolatileRetiredLocked() {
 		return
 	}
 	c.snapshotGate.Lock()
-	if !c.leases.AnyActive() {
+	c.beginReaderFence()
+	if !c.anyActiveReaders() {
 		c.cache.MarkUnreachable(c.primaryVolatileRetired)
 		clear(c.primaryVolatileRetired)
 		c.primaryVolatileRetired =
 			c.primaryVolatileRetired[:0]
 	}
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 }
 
-// retirePrimaryVolatileRefLocked runs while snapshotGate is held. A selected
-// route can race from the router to PageCache without holding that gate, so an
-// active generation lease defers removal instead of turning a cache miss into
-// an impossible read from the memory-only virtual extent.
+// retirePrimaryVolatileRefLocked runs while snapshotGate is held and a reader
+// fence is raised. A selected route can race from the router to PageCache
+// without holding that gate, so an active generation lease or epoch reader
+// defers removal instead of turning a cache miss into an impossible read from
+// the memory-only virtual extent.
 func (c *Collection) retirePrimaryVolatileRefLocked(
 	ref storeio.PageRef,
 ) {
 	if ref == (storeio.PageRef{}) {
 		return
 	}
-	if !c.leases.AnyActive() {
+	if !c.anyActiveReaders() {
 		c.cache.MarkUnreachable([]storeio.PageRef{ref})
 		return
 	}
@@ -445,7 +448,15 @@ func (c *Collection) putPrimary(
 	if err != nil {
 		return false, err
 	}
-	if c.canonicalFramePathEligible() {
+	// One sample steers both the capacity ensure and the lane selection below.
+	// Sampling reader presence twice let a reader arrive or leave in between,
+	// choosing the canonical lane without its capacity ensure and surfacing
+	// ErrCheckpointRequired to the caller. canonicalFramePathEligible folds the
+	// epoch table into its veto (anyActiveReaders), so an active point read
+	// defers the canonical lane exactly as an active lease does; the sync
+	// journal lane stays eligible regardless of readers.
+	canonicalPath := c.canonicalFramePathEligible()
+	if canonicalPath {
 		if err := c.ensureBufferedPrimaryMutationCapacity(
 			resident,
 		); err != nil {
@@ -513,7 +524,7 @@ func (c *Collection) putPrimary(
 			return false, nil
 		}
 	}
-	if c.canonicalFramePathEligible() {
+	if canonicalPath {
 		nextLeaf, becameEmpty, filledEmpty, mutationErr :=
 			c.cowBufferedPrimaryMutation(
 				state, keyBytes, src, false, found, slot,
@@ -862,7 +873,9 @@ func (c *Collection) replaceBufferedPrimaryInplace(
 	before := c.bufferedValueBefore
 
 	c.snapshotGate.Lock()
-	if c.leases.AnyActive() {
+	c.beginReaderFence()
+	if c.anyActiveReaders() {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		c.bufferedInplaceFallbacks.Add(1)
 		return false, nil
@@ -873,6 +886,7 @@ func (c *Collection) replaceBufferedPrimaryInplace(
 		valueOffset, before, src, math.MaxUint64,
 	)
 	if replaceErr != nil {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		if errors.Is(replaceErr, storeio.ErrCanonicalPageBusy) ||
 			errors.Is(replaceErr, storeio.ErrCanonicalPageChanged) {
@@ -884,6 +898,7 @@ func (c *Collection) replaceBufferedPrimaryInplace(
 	c.primaryRouter.Load().AdvanceGeneration(generation)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.bufferedInplaceUpdates.Add(1)
 	return true, nil
@@ -1030,6 +1045,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	}
 
 	c.snapshotGate.Lock()
+	c.beginReaderFence()
 	c.primaryRouter.Load().UpdateLeaf(
 		resident, nextLeaf, generation,
 	)
@@ -1037,6 +1053,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	c.retirePrimaryVolatileRefLocked(previousVolatile)
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	return nextLeaf, becameEmpty, filledEmpty, nil
 }
@@ -1339,7 +1356,7 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		return nil
 	}
 	c.clearPrimaryVolatileRetiredLocked()
-	if c.leases.AnyActive() &&
+	if c.anyActiveReaders() &&
 		len(c.primaryVolatileRetired)+
 			len(c.primaryPendingParents) >
 			cap(c.primaryVolatileRetired) {
@@ -1934,7 +1951,8 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	retirementReserved = true
 
 	c.snapshotGate.Lock()
-	retiring := !c.leases.AnyActive()
+	c.beginReaderFence()
+	retiring := !c.anyActiveReaders()
 	if retiring {
 		err = tx.PublishInlineRetiring(
 			nextState.root, nextInline, c.retireRefScratch,
@@ -1943,6 +1961,7 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		err = tx.PublishInline(nextState.root, nextInline)
 	}
 	if err != nil {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
 	}
@@ -1968,6 +1987,7 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 			c.primaryPendingParents[index].volatileRef,
 		)
 	}
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.finalizeReusable()
 	c.commitFreeLog(freeLog)
@@ -2157,8 +2177,10 @@ func (c *Collection) publishStagedPrimaryMutation(
 	}
 
 	c.snapshotGate.Lock()
-	retiring := !c.leases.AnyActive()
+	c.beginReaderFence()
+	retiring := !c.anyActiveReaders()
 	if err := publish(retiring); err != nil {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
 	}
@@ -2171,6 +2193,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 	if retiring {
 		c.cache.MarkUnreachable(c.retireRefScratch)
 	}
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.finalizeReusable()
 	c.commitFreeLog(freeLog)

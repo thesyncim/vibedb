@@ -1042,7 +1042,13 @@ type Collection struct {
 	directRead    bool
 	directWrite   bool
 	leases        *storeio.GenerationLeases
-	reclaimer     *storeio.ExtentReclaimer
+	// readEpochs is the direct-read fast path's reader registry. A point read
+	// claims one epoch slot instead of a snapshot-gate round trip plus a
+	// mutex-guarded generation lease; long-lived Snapshots keep their leases.
+	// Writer-side decisions that consult reader presence must combine both
+	// tables (anyActiveReaders/safeFromReaders) inside a reader fence.
+	readEpochs *storeio.ReadEpochs
+	reclaimer  *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
 	combiner      *fileMutationCombiner
 	// journal is the bounded redo log paired with this store. It is non-nil only
@@ -1904,10 +1910,12 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 	)
 	retiredExtentStorage := reusableBlock.Bytes()[reusableMetadataBytes : reusableMetadataBytes+retiredExtentArenaBytes]
 	retiredIntervalIndexStorage := reusableBlock.Bytes()[reusableMetadataBytes+retiredExtentArenaBytes:]
+	readEpochs := storeio.NewReadEpochs()
 	reclaimer, err := storeio.NewExtentReclaimer(
 		leases,
 		storeio.ExtentReclaimerOptions{
 			MaxRetiredExtents:    options.MaxRetiredExtents,
+			Epochs:               readEpochs,
 			IntervalIndexStorage: retiredIntervalIndexStorage,
 			RetiredExtentStorage: retiredExtentStorage,
 		},
@@ -2013,7 +2021,7 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
 		readFile: ownedRead, writeFile: ownedWrite,
 		directRead: directRead, directWrite: directWrite,
-		leases: leases, reclaimer: reclaimer,
+		leases: leases, readEpochs: readEpochs, reclaimer: reclaimer,
 		// A fold retires the whole superseded chain on top of the commit's own
 		// retirements, so the scratch reserves both.
 		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+
@@ -2315,9 +2323,11 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 	// A snapshot's point reads and ordered scans must agree, so the pending
 	// parents are materialized and the state captured under one writer hold:
 	// releasing the lock between the two hands a concurrent publication a
-	// window to advance the router past the root the snapshot walks. This
-	// stages the cut but does not make it durable; Flush/Close keep that
-	// boundary.
+	// window to advance the router past the root the snapshot walks — and
+	// that stray volatile publication handed the snapshot a root whose
+	// DocumentCount counted a row its still-unsealed rooted graph did not, so
+	// a scan came up one row short of Len. This stages the cut but does not
+	// make it durable; Flush/Close keep that boundary.
 	if c.deferredCanonicalLane() && c.primaryRouter.Load() != nil {
 		c.writer.Lock()
 		if len(c.primaryPendingParents) != 0 {
@@ -2335,7 +2345,8 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 
 // pinSnapshot captures the reader state and acquires its lease under the
 // snapshot gate alone; deferred canonical lanes use pinSnapshotLocked under
-// the writer instead.
+// the writer instead. Snapshots hold a long-lived generation lease, not an
+// epoch slot, so the reader-fence protocol does not enter here.
 func (c *Collection) pinSnapshot() (*Snapshot, error) {
 	c.snapshotGate.RLock()
 	state, stateErr := c.readerFileState()
@@ -2547,11 +2558,29 @@ func (c *Collection) appendOverflowAtState(
 	return dst, nil
 }
 
-// AppendRaw is the current-snapshot convenience form.
+// AppendRaw is the current-snapshot convenience form. It protects the read
+// with one epoch slot — no lock, no per-call generation lease — and falls back
+// to the gated lease path only when the epoch table declines the entry (full
+// table, an active writer fence, Close, or a persistence failure that needs
+// the slow path's exact error).
 func (c *Collection) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 	if c == nil {
 		return dst, false, ErrClosed
 	}
+	state, epoch, ok := c.enterReadEpoch()
+	if !ok {
+		return c.appendRawLeased(dst, key)
+	}
+	out, found, err := c.appendRawAtState(dst, key, state)
+	epoch.Exit()
+	return out, found, err
+}
+
+// appendRawLeased is the pre-epoch read entry, retained as the slow path every
+// declined or diverted epoch entry falls back to. A writer fence points new
+// readers here exactly because this path blocks on the snapshot gate until the
+// writer's decision window closes.
+func (c *Collection) appendRawLeased(dst []byte, key string) ([]byte, bool, error) {
 	c.snapshotGate.RLock()
 	state, stateErr := c.readerFileState()
 	if stateErr != nil {
@@ -3972,8 +4001,10 @@ func (c *Collection) publishStagedFileMutation(
 	}
 
 	c.snapshotGate.Lock()
-	retiring := !c.leases.AnyActive()
+	c.beginReaderFence()
+	retiring := !c.anyActiveReaders()
 	if err := publish(retiring); err != nil {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
 	}
@@ -3985,6 +4016,7 @@ func (c *Collection) publishStagedFileMutation(
 	if retiring {
 		c.cache.MarkUnreachable(c.retireRefScratch)
 	}
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.finalizeReusable()
 	c.commitFreeLog(freeLog)
@@ -4810,6 +4842,13 @@ func (c *Collection) Close() error {
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return err
 		}
+	}
+	// The epoch table closes before the lease table for the same reason the
+	// lease table closes before resources: a still-in-flight direct read must
+	// fail Close (and divert every later read) rather than race the arena
+	// release below.
+	if err := c.readEpochs.Close(); err != nil {
+		return err
 	}
 	if err := c.leases.Close(); err != nil {
 		return err

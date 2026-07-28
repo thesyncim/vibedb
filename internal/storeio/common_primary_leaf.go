@@ -1715,6 +1715,79 @@ func (it *CommonPrimaryLeafIterator) NextRawBorrowed() (
 	return key, raw, overflow, true
 }
 
+// VisitRawBorrowed drains the iterator through fn in one call. It performs
+// exactly NextRawBorrowed's decode per row but keeps the payload, layout, and
+// row counters in locals for the whole leaf, removing the per-row call
+// round trip and prologue the full-scan profile measured at over 1ns/doc.
+// fn receives only inline rows; the first overflow row stops the drain and is
+// returned as its borrowed raw descriptor with the iterator advanced past it.
+// A nil return with a nil error means the leaf is exhausted or a bound
+// terminated it, exactly as NextRawBorrowed's ok=false.
+func (it *CommonPrimaryLeafIterator) VisitRawBorrowed(
+	fn func(key, raw []byte) error,
+) ([]byte, error) {
+	if it == nil || it.finished || fn == nil {
+		return nil, nil
+	}
+	payload := it.payload
+	layout := &it.layout
+	count := int(it.count)
+	rank := int(it.rank)
+	bitPos := int(it.bitPos)
+	offset := int(it.offset)
+	bounded := len(it.upper) != 0 || len(it.prefix) != 0
+	for rank < count {
+		nextPosition, ok := commonPrimaryLeafNextHighBitAt(
+			payload, layout.highStart, layout.highBytes, bitPos+1,
+		)
+		if !ok {
+			break
+		}
+		nextRank := rank + 1
+		end := uint16(
+			(nextPosition-nextRank)<<commonPrimaryLeafLowerBits,
+		) | uint16(payload[layout.lowStart+nextRank])
+		keyLength := commonPrimaryLeafKeyCode(payload, layout, rank)
+		start := offset
+		if keyLength == commonPrimaryLeafEscapeLength {
+			keyLength = int(payload[start]) + 1
+			start++
+		}
+		key := payload[start : start+keyLength : start+keyLength]
+		if bounded &&
+			(len(it.upper) != 0 && bytes.Compare(key, it.upper) >= 0 ||
+				len(it.prefix) != 0 && !bytes.HasPrefix(key, it.prefix)) {
+			break
+		}
+		valueStart := start + keyLength
+		overflow := payload[layout.overflowStart+rank/8]&
+			(byte(1)<<uint(rank&7)) != 0
+		raw := payload[valueStart:int(end):int(end)]
+		rank = nextRank
+		bitPos = nextPosition
+		offset = int(end)
+		if overflow {
+			it.rank = uint16(rank)
+			it.bitPos = uint16(bitPos)
+			it.offset = uint16(offset)
+			it.finished = rank >= count
+			return raw, nil
+		}
+		if err := fn(key, raw); err != nil {
+			it.rank = uint16(rank)
+			it.bitPos = uint16(bitPos)
+			it.offset = uint16(offset)
+			it.finished = rank >= count
+			return nil, err
+		}
+	}
+	it.rank = uint16(rank)
+	it.bitPos = uint16(bitPos)
+	it.offset = uint16(offset)
+	it.finished = true
+	return nil, nil
+}
+
 func (v *CommonPrimaryLeafView) rankSlots() (
 	[CommonPrimaryLeafWideSlots]uint8, bool,
 ) {

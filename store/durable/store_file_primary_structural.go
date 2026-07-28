@@ -691,7 +691,8 @@ func (c *Collection) commitPrimaryStructural(
 	retirementReserved = true
 
 	c.snapshotGate.Lock()
-	retiring := !c.leases.AnyActive()
+	c.beginReaderFence()
+	retiring := !c.anyActiveReaders()
 	if retiring {
 		err = tx.PublishInlineRetiring(
 			nextState.root, nextInline, c.retireRefScratch,
@@ -700,6 +701,7 @@ func (c *Collection) commitPrimaryStructural(
 		err = tx.PublishInline(nextState.root, nextInline)
 	}
 	if err != nil {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
 	}
@@ -710,6 +712,7 @@ func (c *Collection) commitPrimaryStructural(
 	if retiring {
 		c.cache.MarkUnreachable(c.retireRefScratch)
 	}
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.finalizeReusable()
 	c.commitFreeLog(freeLog)

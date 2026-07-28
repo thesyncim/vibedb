@@ -27,6 +27,24 @@ type ResidentPrimaryRouter struct {
 	hints      []pageCacheFrameHint
 	empty      []atomic.Uint32
 	mergeAbort []atomic.Uint32
+	// searchKeys accelerates the fence binary search: one big-endian packed
+	// word per rank holding the first eight fence bytes past searchSkip, the
+	// prefix every routed fence shares. A probe is then one integer compare
+	// instead of a bytes.Compare against a cold fence-arena line; only packed
+	// equality falls back to the exact bytes. Zero-padding is order-safe
+	// because zero is the minimum byte: strict packed inequality always
+	// matches strict lexical order, and ties defer to the full compare.
+	// Immutable after build, like the fences it summarizes: UpdateLeaf swaps
+	// handles, never fences. Costs 8 bytes per leaf, bought against the
+	// measured ~90ns per point read the byte-wise search cost at 100k keys.
+	searchKeys []uint64
+	// searchTops holds every searchTopGroup'th packed window (rank 1, 1+g,
+	// 1+2g, ...). A point lookup binary-searches this small dense array first
+	// — it stays L1-resident under random probing where the full searchKeys
+	// span does not — and finishes inside one eight-word group, cutting the
+	// search's cache-missing probes from log2(leaves) to three.
+	searchTops []uint64
+	searchSkip int
 	buildNS    int64
 	generation atomic.Uint64
 	version    atomic.Uint64
@@ -71,9 +89,54 @@ func BuildResidentPrimaryRouter(
 	router.hints = make([]pageCacheFrameHint, router.Len())
 	router.empty = make([]atomic.Uint32, router.Len())
 	router.mergeAbort = make([]atomic.Uint32, router.Len())
+	router.buildSearchKeys()
 	router.generation.Store(bounds.SelectedRootGeneration)
 	router.buildNS = time.Since(started).Nanoseconds()
 	return router, nil
+}
+
+// buildSearchKeys derives the shared fence prefix and packs each fence's next
+// eight bytes. Rank zero's fence is the empty floor and is never probed, so
+// the prefix is the common prefix of the first and last real fences; lexical
+// ordering guarantees every fence between them shares it and is at least that
+// long (a shorter fence would be a proper prefix and sort before rank one).
+func (r *ResidentPrimaryRouter) buildSearchKeys() {
+	count := r.Len()
+	r.searchKeys = make([]uint64, count)
+	if count < 2 {
+		return
+	}
+	first := r.fence(1)
+	last := r.fence(count - 1)
+	skip := 0
+	for skip < len(first) && skip < len(last) && first[skip] == last[skip] {
+		skip++
+	}
+	r.searchSkip = skip
+	for rank := 1; rank < count; rank++ {
+		r.searchKeys[rank] = packLexicalWindow(r.fence(rank)[skip:])
+	}
+	groups := (count - 2 + searchTopGroup) / searchTopGroup
+	r.searchTops = make([]uint64, groups)
+	for group := range groups {
+		r.searchTops[group] = r.searchKeys[1+group*searchTopGroup]
+	}
+}
+
+// searchTopGroup is eight packed windows — exactly one cache line — so the
+// second-level search after the top-index narrowing touches one line.
+const searchTopGroup = 8
+
+// packLexicalWindow packs up to eight bytes big-endian with zero padding, so
+// unsigned comparison of two windows matches bytes.Compare whenever the
+// windows differ; equal windows require the exact compare.
+func packLexicalWindow(b []byte) uint64 {
+	var window uint64
+	limit := min(len(b), 8)
+	for at := 0; at < limit; at++ {
+		window |= uint64(b[at]) << (56 - 8*at)
+	}
+	return window
 }
 
 func (r *ResidentPrimaryRouter) walkCatalog(
@@ -210,21 +273,88 @@ func (r *ResidentPrimaryRouter) Route(key []byte) (ResidentPrimaryRoute, bool) {
 		return ResidentPrimaryRoute{}, false
 	}
 	hash := KeyHashBytes(r.storeID, key)
-	low, high := 1, r.Len()
-	for low < high {
-		middle := int(uint(low+high) >> 1)
-		if bytes.Compare(r.fence(middle), key) <= 0 {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	rank := low - 1
+	rank := r.searchRank(key)
 	if rank < 0 || bytes.Compare(r.fence(rank), key) > 0 ||
 		rank+1 < r.Len() && bytes.Compare(key, r.fence(rank+1)) >= 0 {
 		return ResidentPrimaryRoute{}, false
 	}
 	at := rank * residentPrimaryRouterWords
+	return r.routeAtRankHashed(at, rank, hash)
+}
+
+// searchRank finds the last fence at or below key. The exact full-byte
+// interval check in Route re-verifies the answer, so a packed-search defect
+// can only surface as a routing miss, never a wrong leaf.
+func (r *ResidentPrimaryRouter) searchRank(key []byte) int {
+	count := r.Len()
+	if count < 2 {
+		return 0
+	}
+	skip := r.searchSkip
+	if skip != 0 {
+		prefix := r.fence(1)[:skip]
+		head := key
+		if len(head) > skip {
+			head = head[:skip]
+		}
+		if c := bytes.Compare(head, prefix); c != 0 {
+			if c < 0 {
+				// Below every real fence; the empty rank-zero floor holds it.
+				return 0
+			}
+			return count - 1
+		}
+		if len(key) < skip {
+			// key is a proper prefix of the shared fence prefix: below rank 1.
+			return 0
+		}
+	}
+	window := packLexicalWindow(key[skip:])
+	// Level one: the predicate fence(rank) <= key is monotone in rank, so a
+	// binary search over the group heads and one in-group finish computes the
+	// same rank the flat search did; only the memory it touches changes.
+	lowGroup, highGroup := 0, len(r.searchTops)
+	for lowGroup < highGroup {
+		middle := int(uint(lowGroup+highGroup) >> 1)
+		if r.fenceBelowOrEqual(1+middle*searchTopGroup, window, key) {
+			lowGroup = middle + 1
+		} else {
+			highGroup = middle
+		}
+	}
+	if lowGroup == 0 {
+		// key sits below the first real fence; the empty floor routes it.
+		return 0
+	}
+	low := 1 + (lowGroup-1)*searchTopGroup
+	high := min(low+searchTopGroup, count)
+	for low < high {
+		middle := int(uint(low+high) >> 1)
+		if r.fenceBelowOrEqual(middle, window, key) {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low - 1
+}
+
+// fenceBelowOrEqual reports fence(rank) <= key using the packed window and
+// falling back to exact bytes only on packed equality, where zero-padded
+// big-endian packing cannot order the pair.
+func (r *ResidentPrimaryRouter) fenceBelowOrEqual(
+	rank int, window uint64, key []byte,
+) bool {
+	packed := r.searchKeys[rank]
+	if packed != window {
+		return packed < window
+	}
+	return bytes.Compare(r.fence(rank), key) <= 0
+}
+
+func (r *ResidentPrimaryRouter) routeAtRankHashed(
+	at, rank int, hash uint64,
+) (ResidentPrimaryRoute, bool) {
 	for {
 		before := r.version.Load()
 		if before&1 != 0 {
@@ -494,6 +624,7 @@ func (r *ResidentPrimaryRouter) ResidentBytes() int {
 		return 0
 	}
 	return cap(r.fences) + cap(r.rows)*8 + cap(r.hints)*8 +
+		cap(r.searchKeys)*8 + cap(r.searchTops)*8 +
 		cap(r.empty)*4 + cap(r.mergeAbort)*4
 }
 

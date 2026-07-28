@@ -522,6 +522,15 @@ func (c *Collection) unadmitPrimaryBatchLeaves() {
 // step here is infallible by construction — routing, admission, split detection,
 // and capacity all succeeded in prepare — so a reader that samples the router
 // after the snapshotGate sees every rewritten leaf or, before it, none of them.
+//
+// The reader fence wraps the swap exactly as the single-document canonical
+// publish does: retirePrimaryVolatileRefLocked decides each superseded volatile
+// frame's immediate-versus-deferred reclaim from anyActiveReaders, which is a
+// meaningful veto only while the fence diverts new epoch entries to the gated
+// path and the writer holds the snapshot gate. The router flip and state
+// publish precede the retirement scans, so a reader admitted before the fence
+// is seen by those scans and its frame is deferred, and a reader arriving after
+// the fence takes the gated slow path against the new root.
 func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint64) {
 	totalDelta := 0
 	for i := range c.batchPrimaryLeaves {
@@ -560,6 +569,7 @@ func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint6
 
 	router := c.primaryRouter.Load()
 	c.snapshotGate.Lock()
+	c.beginReaderFence()
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]
 		if leaf.skip {
@@ -572,6 +582,7 @@ func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint6
 	for _, prev := range c.batchPrimaryPrevVolatile {
 		c.retirePrimaryVolatileRefLocked(prev)
 	}
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 
 	for i := range c.batchPrimaryLeaves {

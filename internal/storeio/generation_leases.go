@@ -276,6 +276,11 @@ func generationSuccessor(generation uint64) uint64 {
 // ExtentReclaimerOptions fixes retained copy-on-write metadata.
 type ExtentReclaimerOptions struct {
 	MaxRetiredExtents int
+	// Epochs optionally adds the direct-read epoch table to the reclamation
+	// floor. Nil keeps the lease-only floor for standalone users. When set,
+	// no extent is reused while an epoch reader still protects a generation
+	// that could reference it, exactly as for lease holders.
+	Epochs *ReadEpochs
 	// IntervalIndexStorage optionally supplies exact, aligned, pointer-free
 	// backing from the collection's existing metadata arena. Nil keeps the
 	// standalone constructor self-contained. A non-nil slice transfers
@@ -334,6 +339,7 @@ const retiredIntervalIndexThreshold = 256
 type ExtentReclaimer struct {
 	mu           sync.Mutex
 	leases       *GenerationLeases
+	epochs       *ReadEpochs
 	pending      []FreeExtent
 	pendingHead  int
 	pendingBytes uint64
@@ -404,7 +410,7 @@ func NewExtentReclaimer(leases *GenerationLeases, options ExtentReclaimerOptions
 		}
 	}
 	return &ExtentReclaimer{
-		leases: leases, pending: pending,
+		leases: leases, epochs: normalized.Epochs, pending: pending,
 		limit:     normalized.MaxRetiredExtents,
 		intervals: intervals,
 	}, nil
@@ -578,7 +584,14 @@ func (r *ExtentReclaimer) AppendReusable(
 		return dst, nil
 	}
 	readerFloor := r.leases.Minimum(currentGeneration)
-	floor := min(readerFloor, oldestRecoveryGeneration)
+	// Epoch readers publish before re-validating the visible state, so any
+	// reader this scan misses observed a root at least as new as the one whose
+	// retirements are being drained; see the ReadEpochs reclaim protocol.
+	floor := min(
+		readerFloor,
+		r.epochs.Minimum(currentGeneration),
+		oldestRecoveryGeneration,
+	)
 	r.mu.Lock()
 	pending := r.activePendingLocked()
 	eligible := len(pending)

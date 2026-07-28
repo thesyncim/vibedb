@@ -126,21 +126,25 @@ func (c *Collection) replaceBufferedFileInplace(
 
 	// Put, automatic capacity checkpoints, Flush, and Close all hold c.writer
 	// in buffered mode. Consequently no checkpoint seal can overlap this
-	// admission. snapshotGate closes the remaining race: while it is held no new
-	// snapshot can be acquired, so the per-frame observability test taken here
-	// stays true through cache replacement and root publication.
+	// admission. snapshotGate plus the reader fence close the remaining race:
+	// while they are held no new snapshot lease can be acquired and new epoch
+	// readers divert to the gated path, so the per-frame observability test
+	// taken here stays true through cache replacement and root publication.
 	//
 	// A snapshot at generation S observes only frames whose identity was
 	// published at or before S. This frame keeps the immutable birth generation
 	// assigned by its first-touch COW (match.documentRef.Generation); an in-place
 	// patch preserves that identity rather than rehoming it. The patch is thus
 	// invisible to every active reader exactly when the birth generation is newer
-	// than every active lease -- SafeFromSnapshots. The former collection-wide
-	// AnyActive veto was over-broad: a frame born after the newest active
-	// snapshot can never be one that snapshot reads, so holding any lease no
-	// longer forfeits the small-update win for frames born inside the window.
+	// than every active lease and epoch slot -- safeFromReaders. The former
+	// collection-wide AnyActive veto was over-broad: a frame born after the
+	// newest active snapshot can never be one that snapshot reads, so holding
+	// any lease no longer forfeits the small-update win for frames born inside
+	// the window.
 	c.snapshotGate.Lock()
-	if !c.leases.SafeFromSnapshots(match.documentRef.Generation) {
+	c.beginReaderFence()
+	if !c.safeFromReaders(match.documentRef.Generation) {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		c.bufferedInplaceFallbacks.Add(1)
 		return false, nil
@@ -151,6 +155,7 @@ func (c *Collection) replaceBufferedFileInplace(
 		valueOffset, before, src, generation,
 	)
 	if replaceErr != nil {
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		if errors.Is(replaceErr, storeio.ErrCanonicalPageBusy) ||
 			errors.Is(replaceErr, storeio.ErrCanonicalPageChanged) {
@@ -165,6 +170,7 @@ func (c *Collection) replaceBufferedFileInplace(
 			match.documentRef, match.documentRef,
 			valueOffset, before, src, generation, previousDirty,
 		)
+		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return false, fmt.Errorf(
 			"vibejson: publish buffered in-place token: %w",
@@ -174,6 +180,7 @@ func (c *Collection) replaceBufferedFileInplace(
 	abort = false
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
+	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.bufferedInplaceUpdates.Add(1)
 	return true, nil

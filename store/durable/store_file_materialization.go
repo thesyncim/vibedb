@@ -313,17 +313,20 @@ func (c *Collection) tryMaterializeFileUpdate(
 	}
 
 	// Drop the resolving lease before taking the publication gate. Existing
-	// readers retain generation leases, which SafeFromSnapshots checks while
-	// this gate prevents a new old-generation snapshot from appearing.
+	// readers retain generation leases or epoch slots, which safeFromReaders
+	// checks while the gate plus the reader fence prevent a new old-generation
+	// reader from appearing.
 	match.Release()
 	leafLease.Release()
 	c.snapshotGate.Lock()
 	defer c.snapshotGate.Unlock()
+	c.beginReaderFence()
+	defer c.endReaderFence()
 	oldestMaterializedGeneration := ref.Generation
 	if zoneChanged && leafRef.Generation < oldestMaterializedGeneration {
 		oldestMaterializedGeneration = leafRef.Generation
 	}
-	if !c.leases.SafeFromSnapshots(oldestMaterializedGeneration) {
+	if !c.safeFromReaders(oldestMaterializedGeneration) {
 		c.materializationSnapshotSkips.Add(1)
 		return fallback()
 	}

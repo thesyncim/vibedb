@@ -61,17 +61,20 @@ func (c *Collection) deferredCanonicalLane() bool {
 
 // canonicalFramePathEligible reports whether this mutation takes the canonical
 // copy-on-write frame path rather than the committer full-generation path.
-// Buffered-visible steps aside for the committer path while a snapshot is
-// observable — it needs no per-mutation durability, so it can afford that
-// path's fence. The journal-backed sync lane cannot: its committer runs in
-// manual-checkpoint mode with no per-generation root fence to wait on, and it
-// must acknowledge through the journal, so it stays on the copy-on-write
-// canonical path even under an active lease (the old bytes are retained by the
-// copy-on-write, and the retired frame's reclaim is deferred until the lease
-// closes).
+// Buffered-visible steps aside for the committer path while any reader is
+// observable — a snapshot's lease or a direct point read's epoch slot, both
+// consulted through anyActiveReaders — because it needs no per-mutation
+// durability and can afford that path's fence. The journal-backed sync lane
+// cannot: its committer runs in manual-checkpoint mode with no per-generation
+// root fence to wait on, and it must acknowledge through the journal, so it
+// stays on the copy-on-write canonical path even under an active reader (the
+// old bytes are retained by the copy-on-write, and the retired frame's reclaim
+// is deferred until every reader releases). This is a lane heuristic, not a
+// veto: the canonical publish sites re-check reader presence under a raised
+// reader fence, so a reader that arrives after this sample is still honored.
 func (c *Collection) canonicalFramePathEligible() bool {
 	return c.deferredCanonicalLane() &&
-		(!c.leases.AnyActive() || c.syncJournalLane())
+		(!c.anyActiveReaders() || c.syncJournalLane())
 }
 
 func (c *Collection) initializeFileState(state *fileStoreState) {

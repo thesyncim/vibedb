@@ -446,16 +446,28 @@ func (c *PrimaryGraphCursor) visitAllInline(
 	fn func(key, value []byte) error,
 ) (PageRef, error) {
 	for {
-		for {
-			key, raw, overflow, ok := c.nextRawBorrowed()
-			if !ok {
-				break
+		if c.leafClass != CommonPrimaryLeafTemplate {
+			// The raw classes drain each leaf in one fused call; only the
+			// template class still steps row by row for its splice scratch.
+			raw, err := c.rows.VisitRawBorrowed(fn)
+			if err != nil {
+				return PageRef{}, err
 			}
-			if overflow {
+			if raw != nil {
 				return decodePageRef(raw), nil
 			}
-			if err := fn(key, raw); err != nil {
-				return PageRef{}, err
+		} else {
+			for {
+				key, raw, overflow, ok := c.nextRawBorrowed()
+				if !ok {
+					break
+				}
+				if overflow {
+					return decodePageRef(raw), nil
+				}
+				if err := fn(key, raw); err != nil {
+					return PageRef{}, err
+				}
 			}
 		}
 		if err := c.advanceLeaf(); err != nil {

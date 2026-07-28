@@ -546,7 +546,7 @@ func KeyHash(storeID [16]byte, key string) uint64 {
 		m := uint64(key[i]) | uint64(key[i+1])<<8 | uint64(key[i+2])<<16 | uint64(key[i+3])<<24 |
 			uint64(key[i+4])<<32 | uint64(key[i+5])<<40 | uint64(key[i+6])<<48 | uint64(key[i+7])<<56
 		v3 ^= m
-		sipRound(&v0, &v1, &v2, &v3)
+		v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
 		v0 ^= m
 	}
 	b := uint64(len(key)) << 56
@@ -554,12 +554,12 @@ func KeyHash(storeID [16]byte, key string) uint64 {
 		b |= uint64(key[j]) << uint(8*(j-i))
 	}
 	v3 ^= b
-	sipRound(&v0, &v1, &v2, &v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
 	v0 ^= b
 	v2 ^= 0xff
-	sipRound(&v0, &v1, &v2, &v3)
-	sipRound(&v0, &v1, &v2, &v3)
-	sipRound(&v0, &v1, &v2, &v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
 	return v0 ^ v1 ^ v2 ^ v3
 }
 
@@ -578,7 +578,7 @@ func KeyHashBytes(storeID [16]byte, key []byte) uint64 {
 	for ; i+8 <= len(key); i += 8 {
 		m := binary.LittleEndian.Uint64(key[i : i+8])
 		v3 ^= m
-		sipRound(&v0, &v1, &v2, &v3)
+		v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
 		v0 ^= m
 	}
 	b := uint64(len(key)) << 56
@@ -586,28 +586,34 @@ func KeyHashBytes(storeID [16]byte, key []byte) uint64 {
 		b |= uint64(key[j]) << uint(8*(j-i))
 	}
 	v3 ^= b
-	sipRound(&v0, &v1, &v2, &v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
 	v0 ^= b
 	v2 ^= 0xff
-	sipRound(&v0, &v1, &v2, &v3)
-	sipRound(&v0, &v1, &v2, &v3)
-	sipRound(&v0, &v1, &v2, &v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
+	v0, v1, v2, v3 = sipRound(v0, v1, v2, v3)
 	return v0 ^ v1 ^ v2 ^ v3
 }
 
-func sipRound(v0, v1, v2, v3 *uint64) {
-	*v0 += *v1
-	*v1 = bits.RotateLeft64(*v1, 13)
-	*v1 ^= *v0
-	*v0 = bits.RotateLeft64(*v0, 32)
-	*v2 += *v3
-	*v3 = bits.RotateLeft64(*v3, 16)
-	*v3 ^= *v2
-	*v0 += *v3
-	*v3 = bits.RotateLeft64(*v3, 21)
-	*v3 ^= *v0
-	*v2 += *v1
-	*v1 = bits.RotateLeft64(*v1, 17)
-	*v1 ^= *v2
-	*v2 = bits.RotateLeft64(*v2, 32)
+// sipRound passes state by value so the compiler keeps the whole permutation
+// in registers and inlines it. The former pointer-parameter spelling exceeded
+// the inlining budget: every round paid a call plus four spilled words each
+// way, which the point-read profile measured as the single largest cost of a
+// warm read (~84ns of SipHash for a 14-byte key against ~20ns inlined).
+func sipRound(v0, v1, v2, v3 uint64) (uint64, uint64, uint64, uint64) {
+	v0 += v1
+	v1 = bits.RotateLeft64(v1, 13)
+	v1 ^= v0
+	v0 = bits.RotateLeft64(v0, 32)
+	v2 += v3
+	v3 = bits.RotateLeft64(v3, 16)
+	v3 ^= v2
+	v0 += v3
+	v3 = bits.RotateLeft64(v3, 21)
+	v3 ^= v0
+	v2 += v1
+	v1 = bits.RotateLeft64(v1, 17)
+	v1 ^= v2
+	v2 = bits.RotateLeft64(v2, 32)
+	return v0, v1, v2, v3
 }
