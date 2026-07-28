@@ -120,10 +120,17 @@ func (c *Collection) recordStructuralLatency(
 // hook the split path requires; flushing all pending parents is a safe superset.
 func (c *Collection) flushPendingForStructural() error {
 	if c.buffered() {
-		// Full checkpoint (materialize + device flush) so durableState catches up
-		// to visible: the structural transaction then reuses only durably-free
-		// extents. A partial materialize leaves visibly-free but not-yet-durable
-		// extents reusable and double-retires them at the next checkpoint.
+		// Full checkpoint (materialize + device flush), for two reasons. First, the
+		// structural transaction rebuilds the tablet from the published graph and
+		// then rebuilds the resident router from it, so every acknowledged buffered
+		// edit must already be a real page or it is lost. Second, and load-bearing
+		// for the retirement accounting: this advances durableState to a clean,
+		// fully-durable baseline *before* the structural transaction retires any of
+		// that baseline's pages. If the structural transaction then aborts, or a
+		// merge/reclass evaluation commits nothing, durableState still names live
+		// pages -- never ones a half-done structural attempt already retired. The
+		// commit itself finishes the job by flushing again afterward so durableState
+		// advances past the structural generation too (see commitPrimaryStructural).
 		return c.checkpointBufferedLocked()
 	}
 	return nil
@@ -673,6 +680,26 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	c.primaryRouter.Store(newRouter)
 	c.recordStructuralLatency(kind, start)
+
+	// A buffered structural transaction is a checkpoint, not a volatile edit.
+	// Ordinary buffered mutations copy-on-write into memory-only virtual extents
+	// and defer every real retirement to the next materialize; a structural
+	// transaction instead allocates and retires REAL durable-graph pages
+	// (anchors, locator, tablet root, catalog path, and the primary root). If it
+	// only PublishInline'd like a buffered put, durableState — the crash-recovery
+	// baseline — would stay behind still referencing the pages this transaction
+	// just retired, and the next materialize would load that stale base and retire
+	// its root a second time (the "overlapping retired extent" defect). Flushing
+	// here advances durableState past the structural generation so its retirements
+	// are durably superseded and never re-collected. Structural transactions are
+	// amortized rare (one per full/empty leaf), so this device flush is not on the
+	// steady-state mutation path.
+	if c.buffered() {
+		if flushErr := c.committer.Flush(); flushErr != nil {
+			return flushErr
+		}
+		c.cache.MarkDurable(c.committer.DurableGeneration())
+	}
 	return nil
 }
 

@@ -254,35 +254,71 @@ func planPrimaryLeaves(
 		NextLogicalID:     tx.nextID,
 		AllocationQuantum: tx.options.PageSize,
 	}
-	for first := 0; first < len(records); {
-		count := min(CommonPrimaryLeafNarrowLive, len(records)-first)
-		var chosen primaryLeafPlan
-		for count > 0 {
-			candidate := make([]CommonPrimaryLeafRecord, count)
-			for at := range candidate {
-				row := records[first+at]
-				candidate[at] = CommonPrimaryLeafRecord{
-					Key: row.Key, Value: CommonPrimaryLeafValue{Inline: row.Value},
-				}
+	candidateAt := func(count int, first int) []CommonPrimaryLeafRecord {
+		candidate := make([]CommonPrimaryLeafRecord, count)
+		for at := range candidate {
+			row := records[first+at]
+			candidate[at] = CommonPrimaryLeafRecord{
+				Key: row.Key, Value: CommonPrimaryLeafValue{Inline: row.Value},
 			}
-			class, fitErr := fitPrimaryLeaf(
-				scratch, tx, bounds, candidate, policy,
-			)
-			if fitErr == nil {
-				chosen = primaryLeafPlan{
-					first: first, last: first + count,
-					class: class, records: candidate,
-				}
-				break
-			}
-			if !errors.Is(fitErr, ErrCommonPrimaryLeafFull) &&
-				!errors.Is(fitErr, ErrCommonPrimaryLeafNeedsWide) {
-				return nil, fitErr
-			}
-			count--
 		}
-		if chosen.last == 0 {
+		return candidate
+	}
+	// count keeps the largest fitting batch found, and best/bestClass keep its
+	// already-placed candidate so the winning leaf is never re-placed.
+	var (
+		count     int
+		best      []CommonPrimaryLeafRecord
+		bestClass CommonPrimaryLeafClass
+	)
+	consider := func(n, first int) (bool, error) {
+		candidate := candidateAt(n, first)
+		class, fitErr := fitPrimaryLeaf(scratch, tx, bounds, candidate, policy)
+		if fitErr == nil {
+			if n > count {
+				count, best, bestClass = n, candidate, class
+			}
+			return true, nil
+		}
+		if !errors.Is(fitErr, ErrCommonPrimaryLeafFull) &&
+			!errors.Is(fitErr, ErrCommonPrimaryLeafNeedsWide) {
+			return false, fitErr
+		}
+		return false, nil
+	}
+	for first := 0; first < len(records); {
+		hi := min(CommonPrimaryLeafNarrowLive, len(records)-first)
+		count, best, bestClass = 0, nil, 0
+		// A leaf only grows as records are added, so "these count records fit a leaf
+		// class" is monotone in count: if count fits, count-1 fits. Binary-search
+		// the largest fitting count. The old code decremented one record at a time,
+		// re-hashing and re-encoding a full O(NarrowLive) candidate on every step,
+		// so a large-document corpus that packs one row per leaf paid
+		// O(NarrowLive^2) placement work per leaf -- the dominant cost of the
+		// larger-than-cache build. Probing the midpoint keeps every trial candidate
+		// no larger than the true answer's neighbourhood, so a one-row-per-leaf
+		// corpus never pays to place a near-full candidate it will reject; that is
+		// why a plain binary search beats a hi-first fast path here, where placement
+		// cost grows super-linearly in the candidate size. A non-fit error other
+		// than full/needs-wide is a real failure and aborts the plan.
+		for lo, high := 1, hi; lo <= high; {
+			mid := (lo + high) / 2
+			fits, err := consider(mid, first)
+			if err != nil {
+				return nil, err
+			}
+			if fits {
+				lo = mid + 1
+			} else {
+				high = mid - 1
+			}
+		}
+		if count == 0 {
 			return nil, fmt.Errorf("%w: primary record does not fit wide leaf", ErrInvalidWrite)
+		}
+		chosen := primaryLeafPlan{
+			first: first, last: first + count,
+			class: bestClass, records: best,
 		}
 		// Template-columnar class selection is per leaf and adaptive-only. The raw
 		// packing above already fills the class it chose (narrow or wide); the

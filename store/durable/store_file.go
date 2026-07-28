@@ -2507,7 +2507,7 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 		return false, ErrClosed
 	}
 	if c.primaryGraphReadOnly() {
-		return c.putPrimary(key, src)
+		return c.putPrimaryWithSplit(key, src)
 	}
 	writerAcquired := false
 	if c.combiner != nil {
@@ -2934,7 +2934,7 @@ func (c *Collection) Delete(key string) (deleted bool, err error) {
 		return false, ErrClosed
 	}
 	if c.primaryGraphReadOnly() {
-		return c.deletePrimary(key)
+		return c.deletePrimaryWithMerge(key)
 	}
 	writerAcquired := false
 	if c.combiner != nil {

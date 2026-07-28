@@ -538,37 +538,68 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer collection.Close()
-	var splitErr error
-	for at := range 512 {
+
+	// Routed contract: with putPrimaryWithSplit live, a full leaf performs a
+	// bounded structural split and the mutation succeeds. Insert well past a
+	// single narrow leaf's ~195-live capacity so several splits fire, and assert
+	// every Put is accepted -- ErrPrimaryLeafSplitRequired must never surface to
+	// the caller at leaf scale. The only remaining signal is
+	// ErrPrimaryMacroSplitRequired, which needs a tablet's full 4096 local IDs
+	// (~400k keys) and so is a bound, not a leaf-scale event.
+	const inserts = 2048
+	oracle := make(map[string][]byte, inserts)
+	for at := range inserts {
 		key := fmt.Sprintf("key-%04d", at)
-		_, splitErr = collection.Put(key, []byte(`{"v":1}`))
-		if splitErr != nil {
-			generationAtSplit := collection.Generation()
-			if _, retryErr := collection.Put(
-				key, []byte(`{"v":1}`),
-			); !errors.Is(retryErr, ErrPrimaryLeafSplitRequired) {
-				t.Fatalf("split retry = %v", retryErr)
-			}
-			if collection.Generation() != generationAtSplit {
-				t.Fatal("split signal published a generation")
-			}
-			break
+		value := []byte(fmt.Sprintf(`{"v":%d}`, at))
+		created, putErr := collection.Put(key, value)
+		if errors.Is(putErr, ErrPrimaryLeafSplitRequired) {
+			t.Fatalf("routed put %q surfaced a leaf-split signal", key)
 		}
+		if putErr != nil || !created {
+			t.Fatalf("routed put %q = created %v, err %v", key, created, putErr)
+		}
+		oracle[key] = value
 	}
-	if !errors.Is(splitErr, ErrPrimaryLeafSplitRequired) {
-		t.Fatalf(
-			"full leaf error = %v, want %v",
-			splitErr, ErrPrimaryLeafSplitRequired,
-		)
+	if got := collection.Stats().PrimaryLeafSplits; got == 0 {
+		t.Fatal("no leaf split fired across 2048 inserts into one tablet")
 	}
-	if collection.Stats().PrimaryLeafSplitRequired != 2 {
-		t.Fatalf(
-			"split counter = %d, want 2",
-			collection.Stats().PrimaryLeafSplitRequired,
-		)
+	if got := collection.Stats().PrimaryMacroSplitRequired; got != 0 {
+		t.Fatalf("unexpected macro-split at leaf scale: %d", got)
+	}
+
+	// A completed structural transaction is a checkpoint, and Flush drains any
+	// buffered puts trailing the last split, so no pending parents survive it.
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	if len(collection.primaryPendingParents) != 0 {
-		t.Fatal("split signal did not flush its pending tablet parents")
+		t.Fatalf(
+			"pending parents after routed splits and Flush = %d, want 0",
+			len(collection.primaryPendingParents),
+		)
+	}
+	if after := collection.Stats(); after.DurableGeneration != collection.Generation() {
+		t.Fatalf(
+			"routed splits left durable %d behind visible %d",
+			after.DurableGeneration, collection.Generation(),
+		)
+	}
+
+	buf := make([]byte, 0, 32)
+	for key, want := range oracle {
+		got, ok, readErr := collection.AppendRaw(buf[:0], key)
+		if readErr != nil || !ok || !bytes.Equal(got, want) {
+			t.Fatalf(
+				"routed split readback %q = %q,%v,%v want %q",
+				key, got, ok, readErr, want,
+			)
+		}
+		buf = got
+	}
+	if got, ok, readErr := collection.AppendRaw(
+		buf[:0], "seed",
+	); readErr != nil || !ok || !bytes.Equal(got, []byte(`{"v":0}`)) {
+		t.Fatalf("seed readback across splits = %q,%v,%v", got, ok, readErr)
 	}
 }
 
@@ -867,4 +898,120 @@ func clonePrimaryCrashFile(
 		t.Fatal(err)
 	}
 	return file
+}
+
+// TestFilePrimaryRoutedSplitDifferential net-grows a primary graph from a single
+// seed to 30k keys in shuffled order so leaf splits fire continuously through the
+// routed Put path, validating every insert against a map oracle and then the full
+// ordered contents. Short mode grows to 10k. This is the routed-split correctness
+// gate: the structural transactions must preserve exact point and ordered-scan
+// semantics against the oracle.
+func TestFilePrimaryRoutedSplitDifferential(t *testing.T) {
+	target := 30_000
+	if testing.Short() {
+		target = 10_000
+	}
+	builder, err := store.NewBuilder(store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Append("seed", []byte(`{"v":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	built, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 64 << 20,
+		Durability: DurabilityBufferedVisible,
+	}
+	file := createPrimaryPointFile(t, built, options, "routed-split-diff.vibe")
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+
+	// Shuffle the insert order (xorshift Fisher-Yates, no import) so splits land
+	// across the whole keyspace instead of always at the tail.
+	order := make([]int, target)
+	for i := range order {
+		order[i] = i
+	}
+	rng := uint64(0x9e3779b97f4a7c15)
+	for i := target - 1; i > 0; i-- {
+		rng ^= rng << 7
+		rng ^= rng >> 9
+		rng ^= rng << 8
+		j := int(rng % uint64(i+1))
+		order[i], order[j] = order[j], order[i]
+	}
+
+	oracle := map[string][]byte{"seed": []byte(`{"v":0}`)}
+	buffer := make([]byte, 0, 64)
+	for at, id := range order {
+		key := fmt.Sprintf("rk-%08d", id)
+		value := []byte(fmt.Sprintf(`{"id":%d,"n":%d}`, id, at))
+		created, putErr := collection.Put(key, value)
+		if putErr != nil || !created {
+			t.Fatalf("insert %d %q = created %v, err %v", at, key, created, putErr)
+		}
+		oracle[key] = value
+		got, ok, readErr := collection.AppendRaw(buffer[:0], key)
+		if readErr != nil || !ok || !bytes.Equal(got, value) {
+			t.Fatalf("post-insert read %q = %q,%v,%v want %q", key, got, ok, readErr, value)
+		}
+		buffer = got
+		if at%256 == 255 {
+			if flushErr := collection.Flush(); flushErr != nil {
+				t.Fatalf("checkpoint at insert %d: %v", at, flushErr)
+			}
+		}
+	}
+	if flushErr := collection.Flush(); flushErr != nil {
+		t.Fatal(flushErr)
+	}
+	if stats := collection.Stats(); stats.PrimaryLeafSplits == 0 {
+		t.Fatalf("net growth to %d keys fired no leaf splits", target)
+	}
+	if got := int(collection.Len()); got != len(oracle) {
+		t.Fatalf("Len = %d, want %d", got, len(oracle))
+	}
+
+	// Point differential: every oracle key resolves byte-exact.
+	for key, want := range oracle {
+		got, ok, readErr := collection.AppendRaw(buffer[:0], key)
+		if readErr != nil || !ok || !bytes.Equal(got, want) {
+			t.Fatalf("point differential %q = %q,%v,%v want %q", key, got, ok, readErr, want)
+		}
+		buffer = got
+	}
+
+	// Ordered-scan differential: the full scan yields exactly the oracle keys in
+	// strict lexical order with byte-exact values.
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	seen := 0
+	var prevKey string
+	if err := snapshot.RangeRaw(func(key, value []byte) error {
+		if seen > 0 && string(key) <= prevKey {
+			t.Fatalf("scan order violation: %q after %q", key, prevKey)
+		}
+		prevKey = string(key)
+		want, ok := oracle[string(key)]
+		if !ok || !bytes.Equal(value, want) {
+			t.Fatalf("scan differential %q = %q, want %q (present=%v)", key, value, want, ok)
+		}
+		seen++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != len(oracle) {
+		t.Fatalf("scan visited %d keys, want %d", seen, len(oracle))
+	}
 }
