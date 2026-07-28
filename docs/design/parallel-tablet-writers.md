@@ -47,19 +47,22 @@ at all. The write path therefore splits naturally:
    waits only for in-flight holders of the old epoch (token generation
    stamps, bounded), and captures — new mutations proceed in the next
    epoch. No global write stall.
-5. **The recovery journal composes multiplicatively.** Writers append
-   redo records concurrently; a group-commit leader shares one journal
-   sync per window across every waiting writer, so the synchronous lane's
-   throughput scales with writer count instead of dividing the fsync
-   budget.
+5. **The recovery journal composes multiplicatively.** The single-writer
+   journal and its batch record — one record, one CRC, one sync for a whole
+   group — have landed as the sync lane's acknowledgement; the group-commit
+   primitive is [already the write batch's mechanism](recovery-journal.md#batch-records--the-group-commit-primitive).
+   This phase generalizes it: writers append redo records concurrently and a
+   group-commit leader shares one journal sync per window across every waiting
+   writer, so the synchronous lane's throughput scales with writer count
+   instead of dividing the fsync budget.
 6. **Backpressure** stays bounded per tablet (dirty frames, staged edits)
    and globally (existing budgets). A tablet split under token ownership
    follows the spec's bounded structural transaction unchanged.
 
 ## Sequencing
 
-1. Step 7 first: primary-graph mutations, single-writer, stable slots,
-   COW publication — the existing promotion spec's path, unchanged.
+1. Single-writer primary-graph mutations (stable slots, COW publication,
+   the journal-backed sync lane) have landed and are unchanged by this phase.
 2. Tablet tokens + epoch publisher behind the same single public writer
    entry (the combiner becomes the multi-writer front door).
 3. Journal group commit across writers.

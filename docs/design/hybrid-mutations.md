@@ -1,7 +1,12 @@
 # Read-neutral hybrid mutations
 
-**Status:** batched directory/key work and automatic combining are implemented;
-canonical-frame coalescing across a buffered checkpoint epoch remains future
+**Status:** batched directory/key work, automatic combining, and — on the
+ordered primary graph — canonical-frame in-place coalescing are implemented: an
+eligible same-size update patches an exclusively owned leaf frame in place, its
+reseal is deferred to the checkpoint worker, and repeated updates to one frame
+collapse into a single checkpoint after-image. The exact secondary index is
+maintained in the same publish. Deferred COW-leaf reseal (moving the
+ref-changing leaf's checksum off the acknowledgement path too) remains future
 work.
 
 **Idea:** batch aggressively on the writer side, then publish one complete
@@ -53,10 +58,11 @@ and rollout gates are specified in
 
 ## Buffered-visible checkpoint mode
 
-Status: the current primary implements the crash-correct first slice with
-fresh COW generations retained in bounded staging until `Flush` or `Close`.
-Canonical-frame coalescing and overlapping sealed/mutable epochs remain future
-work.
+Status: the ordered primary graph implements the buffered-visible contract on
+canonical in-memory frames. Same-size updates patch an owned frame in place and
+coalesce, ref-changing updates COW the leaf into a frame-native staging frame,
+and both are retained in bounded staging until `Flush` or `Close`. Overlapping
+sealed/mutable epochs and deferred COW-leaf reseal remain future work.
 
 `DurabilityAsyncVisible` hides the stable-storage fence, but it still constructs
 and queues one complete COW generation per logical mutation. It is therefore
@@ -192,29 +198,29 @@ vibedb requirement selects materialization before publication.
 
 ## What exists now
 
-`durable.Collection.Update` already supplies most of the materializer:
+`durable.Collection.Update` is the transactional `WriteBatch` and supplies the
+materializer:
 
 - duplicate keys collapse to their final mutation;
-- every touched document chunk is rebuilt once;
-- key and exact-index edits use batched tree descents;
+- every touched leaf is rewritten once;
+- key resolution and exact-index edits use batched tree descents;
+- the exact secondary index for each rewritten bucket is re-derived and
+  installed in the same publish, not rebuilt from the whole graph;
 - one state root and one generation are published;
+- on a journal-backed lane the whole batch is one redo record with one CRC and
+  one sync;
 - the operation is failure-atomic.
 
-The first read-neutral improvement closes the remaining directory gap.
-Previously the chunk radix was updated once per touched chunk, so later edits
-inside a transaction rewrote directory pages staged by earlier edits. The
-batched radix descent partitions edits by lane and writes every visited node
-once.
+The batched descent partitions edits by lane and writes every visited directory
+node once rather than once per touched key, so a transaction never rewrites a
+directory page an earlier edit already staged. The published format and
+point-read traversal are unchanged. (On the transitional chunk layout the same
+discipline applies to the chunk radix: 128 replacements across 128 chunks retire
+three directory pages instead of 256.)
 
-For 128 replacements across 128 chunks, the sequential directory path retires
-256 directory pages (one leaf and one root per replacement). The batched
-descent retires three: the two leaves and their root. The published format and
-point-read traversal are unchanged.
-
-Per-chunk zone summaries are finalized while each replacement row set is still
-available, then carried with the corresponding radix edit. The leaf publishes
-the document reference and summary under one checksum, exactly as the
-single-chunk path does.
+Per-bucket zone summaries are finalized while each replacement row set is still
+available and carried with the corresponding directory edit, so the leaf
+publishes the document reference and summary under one checksum.
 
 ## Automatic mutation combining
 

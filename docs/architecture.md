@@ -1,8 +1,11 @@
 # Architecture
 
-This is the front door to vibedb's storage design. It separates the invariants
-that apply today from the ordered-tablet primary being qualified for promotion.
-For public APIs, see [store.md](store.md); for bytes on disk, see
+This is the front door to vibedb's storage design. The ordered-tablet primary
+graph is the layout: bulk-built and reopened collections read, mutate,
+checkpoint, and index against it. A freshly `Create`d empty collection still
+opens on the older chunk layout, which is scheduled for deletion; where the two
+differ this document describes the primary graph and flags the chunk layout as
+transitional. For public APIs, see [store.md](store.md); for bytes on disk, see
 [format.md](format.md).
 
 ## The central rule: one reader-visible representation
@@ -27,14 +30,15 @@ That rule expands into a family of invariants:
 6. Publication happens only after every query-visible structure for the new
    generation is complete.
 
-The current primary realizes this with a `StateRoot`, chunk directory,
-fingerprint directory, document pages, and exact-index directory. The
-promotion target replaces that primary with ordered tablets while preserving
-the same invariant family.
+The primary graph realizes this with a `StateRoot` selecting an ordered-tablet
+catalog, its leaves, and an exact-index root. The transitional chunk layout
+realizes the same invariant family with a chunk directory, fingerprint
+directory, document pages, and exact-index directory; it is deleted with the
+last empty-created collection path.
 
 ## The ordered-tablet graph
 
-The target graph is:
+The graph is:
 
 ```text
 StateRoot
@@ -59,18 +63,21 @@ The resulting identity is hierarchical:
 BucketID = (18-bit TabletID << 12) | 12-bit LocalLeafID
 ```
 
-Exact-term postings name stable `(BucketID, slot)` locations. A complete key
-comparison still decides every primary hit. See the
-[ordered-hybrid promotion specification](design/ordered-hybrid-store.md) for
-measured primitives, scale bounds, and promotion gates.
+Exact-term postings name stable `(BucketID, slot)` locations, and the exact
+secondary index that maps a JSON term to those postings is maintained in the
+same publish as the document mutation that changes it — never rebuilt. A
+complete key comparison still decides every primary hit. See the
+[ordered-hybrid store specification](design/ordered-hybrid-store.md) for the
+measured primitives, scale bounds, and structural gates.
 
 ## Canonical frames and frame-native staging
 
-The page cache is not merely a copy of durable bytes. In buffered-visible mode,
-an owned cache frame is the canonical reader-visible page for its stable
-reference. A mutation edits or replaces complete frames, then publishes a new
-in-process root. Repeated changes to the same owned frame can coalesce into one
-checkpoint after-image without adding a reader overlay.
+The page cache is not merely a copy of durable bytes. In the deferred-canonical
+lanes (buffered-visible and the journal-backed synchronous lane), an owned cache
+frame is the canonical reader-visible page for its stable reference. A mutation
+edits or replaces complete frames, then publishes a new in-process root.
+Repeated changes to the same owned frame can coalesce into one checkpoint
+after-image without adding a reader overlay.
 
 Two ownership questions must remain separate:
 
@@ -87,21 +94,10 @@ pinned until the durability or checkpoint boundary releases them.
 
 ## Read path
 
-For the current primary, a point read follows:
+A point read on the primary graph follows:
 
 ```text
-snapshot root
-  → fingerprint directory candidate
-  → chunk directory
-  → document page
-  → exact key confirmation
-  → exact JSON bytes
-```
-
-The ordered-tablet target follows:
-
-```text
-snapshot root
+read root
   → tablet catalog
   → tablet root
   → anchor page
@@ -110,11 +106,23 @@ snapshot root
   → exact key confirmation
 ```
 
-An ordered scan follows the rooted directory or tablet cursor for that
-snapshot. It never trusts a physical sibling pointer that a later COW
-generation could make stale, and it never sorts hash order or subtracts
-tombstones. Query execution takes an explicit heap or durable snapshot and
-uses the same source for indexes, scans, and document rechecks.
+The transitional chunk layout instead follows the fingerprint directory, chunk
+directory, and document page to the same exact-key confirmation.
+
+The direct point read (`Collection.AppendRaw`) protects the read with one
+epoch slot — no lock, no per-call generation lease. A reader announces the
+generation it is about to read in a padded per-core slot; the serialized writer
+scans those slots lock-free, and a retired extent is not reused until no
+epoch or lease can still reach its generation. The read falls back to the older
+generation-lease path only when the epoch table declines the entry (full,
+writer fence, or Close). A long-lived `Snapshot` still holds a generation lease
+rather than an epoch slot.
+
+An ordered scan follows the rooted tablet cursor for that snapshot. It never
+trusts a physical sibling pointer that a later COW generation could make stale,
+and it never sorts hash order or subtracts tombstones. Query execution takes an
+explicit heap or durable snapshot and uses the same source for indexes, scans,
+and document rechecks.
 
 ## Write path
 
@@ -125,21 +133,28 @@ A mutation is planned against one state:
 3. Construct complete after-images for every touched leaf/page and metadata
    path.
 4. Recheck ownership and the source generation.
-5. COW any snapshot-visible or durable-reachable bytes; use qualified canonical
-   materialization only when every eligibility check passes.
-6. Publish one new root after the selected acknowledgement boundary.
+5. COW any snapshot-visible or durable-reachable bytes; patch an exclusively
+   owned frame in place when every eligibility check passes.
+6. Update the exact index for the rewritten bucket in the same publish.
+7. Publish one new root after the selected acknowledgement boundary. On the
+   journal-backed synchronous lane the redo record is appended and synced
+   before that publish, so visibility follows durability.
 
-`Update` batches distinct keys, rebuilds each touched chunk once, descends each
-directory once, and publishes one failure-atomic generation. Automatic
-combining applies the same machinery to overlapping `Put` and `Delete` calls.
-The query-visible graph is complete at publication; writer-only planning state
-is never published.
+`Update` batches distinct keys, rewrites each touched leaf once, descends each
+directory once, and publishes one failure-atomic generation. It is the
+transactional `WriteBatch` — the SQL driver's `COMMIT` and the group-commit
+primitive both flow through it, and the whole batch is one journal record with
+one CRC and one sync. Automatic combining applies the same machinery to
+overlapping `Put` and `Delete` calls. The query-visible graph is complete at
+publication; writer-only planning state is never published.
 
 ## Checkpoint path
 
-Buffered-visible mutations normally perform no device write. `Flush` captures
-the current visible generation and materializes only its reachable dirty/new
-frames:
+Deferred-canonical mutations normally perform no root device write per mutation.
+Buffered-visible does no device write at all on ordinary admission; the
+journal-backed synchronous lane makes each acknowledgement durable with one
+journal append plus sync and still defers its root. `Flush` captures the current
+visible generation and materializes only its reachable dirty/new frames:
 
 ```text
 seal visible root
@@ -184,21 +199,23 @@ vibedb chooses the opposite trade: bounded writer work produces one canonical
 generation before publication. Deletes reclaim their logical representation
 immediately, scans walk one ordered view, and snapshots pin roots rather than
 versions inside a shared read path. The cost is real: isolated random writes
-can rewrite page paths, and the current mixed-workload results expose that
-gap. Writer batching, owned-frame updates, and recovery-only journaling are
-admissible optimizations because they do not change what readers consult.
+can rewrite page paths, and it shows in the synchronous lane, where a
+per-mutation durable acknowledgement currently trails SQLite. Writer batching,
+owned-frame in-place updates, and the recovery-only journal are admissible
+optimizations because they do not change what readers consult.
 
 ## Design map
 
-- [Ordered hybrid store](design/ordered-hybrid-store.md): target primary and
+- [Ordered hybrid store](design/ordered-hybrid-store.md): the primary graph and
   exact-term index.
 - [Hybrid mutations](design/hybrid-mutations.md): read-neutral batching and
   buffered checkpoints.
-- [Canonical materialization](design/canonical-materialization.md): qualified
-  in-place updates with recovery undo.
-- [Template-columnar leaves](design/template-columnar-leaves.md): optional
-  leaf codec and typed access.
-- [Recovery journal](design/recovery-journal.md): future recovery-only redo.
+- [Canonical materialization](design/canonical-materialization.md): in-place
+  frame updates and the gated async capsule path with recovery undo.
+- [Template-columnar leaves](design/template-columnar-leaves.md): the leaf
+  codec that adopts 0% under the honest gates, and the compact leaf that won.
+- [Recovery journal](design/recovery-journal.md): the recovery-only redo that
+  now backs the synchronous lane.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
   per-tablet concurrency.
 - [Unification](design/unification.md): one eventual mutable collection.

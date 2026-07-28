@@ -1,6 +1,9 @@
 # Engine unification: one in-memory durable store
 
-**Status:** plan of record; not the current public surface.
+**Status:** in progress. The durable primary graph is now a mutable in-memory
+canonical-frame engine with a transactional batch and one SQL product; what
+remains is demoting the heap engine's mutable API, collapsing the query
+language, parallel writers, and freezing the format.
 
 **Idea:** one `Collection` operates on canonical frames, with either a real
 device or a null device. Durability becomes a mode rather than a second
@@ -22,10 +25,11 @@ end state deletes duplicated machinery instead of deprecating it.
   feature, bug class, and benchmark is paid twice, and the architecture
   review lists the overlap as an open defect.
 - The buffered-visible durable collection already holds its working set in
-  canonical page-cache frames; with the ordered-hybrid primary its read and
-  acknowledgement gates (≤300 ns point, ≤0.45 µs update p50) are in-memory
-  numbers. At those gates a separate heap engine has no performance reason
-  to exist.
+  canonical page-cache frames, and the ordered primary graph now mutates them
+  in place: hot acknowledgements and point reads are measured in the sub-
+  microsecond range (see [performance.md](../performance.md)). Once the read
+  and acknowledgement targets (≤300 ns point, ≤0.45 µs update p50) are fully
+  met, a separate heap engine has no performance reason to exist.
 - An ephemeral collection is the same engine with a null device: identical
   API, identical semantics, durability disabled. One way of doing things.
 
@@ -44,20 +48,33 @@ page codecs. They are not a second engine.
 
 ## Sequencing (performance first, cutover second)
 
-1. **vNext primary read paths** (ordered-hybrid steps 4–5): tablet catalog
-   root, point read, lexical cursors, with the promotion gates from
-   [ordered-hybrid-store.md](ordered-hybrid-store.md). The cutover must not hand unified users a
-   slower read path than the heap engine they lose.
-2. **vNext bulk build and mutations** (steps 6–7): stable-slot update/delete,
-   buffered acknowledgement against owned canonical leaf frames.
-3. **API cutover**: merge the public durable surface into the one collection
-   package; `Builder` feeds the bulk path directly; add the null-device
-   ephemeral mode; port `query`, `sql`, `pgwire`, and `vibesql` to the one
-   engine.
-4. **Deletions** (step 11): legacy fingerprint/chunk primary, the heap
-   engine's public mutable API, and every codepath that exists only to keep
-   two engines behaving alike. Golden tests and docs/format.md follow the
-   surviving format only.
+Executed:
+
+1. **Primary read paths — done.** Tablet catalog root, point read, and lexical
+   cursors read against the ordered primary graph, with epoch-protected direct
+   reads (`93834e8`) replacing the per-call lease on the hot path.
+2. **Bulk build and mutations — done.** Stable-slot update/delete and buffered
+   acknowledgement against owned canonical leaf frames; the write batch is
+   transactional on the primary graph (`a3ee052`), exact indexes are maintained
+   in the same publish (`7e6f28e`), and the synchronous lane acknowledges
+   through the journal (`70d39ea`).
+3. **One SQL product — done.** A `database/sql` driver runs over the ordered
+   primary graph (`886c5fe`) with transactions on the atomic batch; the second
+   SQL surface was deleted, leaving one product (`0611fb9`).
+
+Remaining:
+
+4. **Heap mutable API demotion.** Collapse the heap `store.Collection` mutable
+   surface into the one durable engine with a null device for the ephemeral
+   mode; `Builder` feeds the bulk path directly. (Owned by later work.)
+5. **Query collapse.** Retire the JSON query language for the Go-native +
+   `database/sql` surface. (Owned elsewhere.)
+6. **Parallel tablet writers.** See
+   [parallel-tablet-writers.md](parallel-tablet-writers.md).
+7. **Deletions and format freeze.** Delete the legacy fingerprint/chunk
+   primary and every codepath that exists only to keep two engines behaving
+   alike; freeze the surviving format. Golden tests and docs/format.md follow
+   the surviving format only.
 
 Each stage lands only behind the measured gates; a stage that regresses a
 published read/scan/space number does not merge.

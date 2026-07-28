@@ -1,152 +1,150 @@
 # Template-columnar leaves
 
-**Status:** integrated. The promoted codec lives in
-internal/storeio/template_columnar_leaf.go and is wrapped as the third primary
-leaf class (CommonPrimaryLeafTemplate) in internal/storeio/common_primary_template_leaf.go.
-The bulk builder (BuildPrimaryGraph) selects it per leaf when it lowers page cost
-per document by at least the adoption threshold; point reads splice, ordered
-scans reconstruct surviving rows, and mutations de-template on first write.
+**Status:** the codec is built and wired as primary leaf class 3
+(`CommonPrimaryLeafTemplate`, internal/storeio/template_columnar_leaf.go
+wrapped in internal/storeio/common_primary_template_leaf.go), and the bulk
+builder is able to select it per leaf. But the honest leaf-geometry
+investigation found it **adopts 0% under the production gates at every leaf
+size** on the corpora that matter, so it is not on any real write path. The
+space win that actually landed on the primary graph is a different codec — the
+compact document-group leaf (class 4) — recorded in
+[The space that landed: the compact leaf](#the-space-that-landed-the-compact-leaf).
+One template hypothesis survives, in
+[The surviving hypothesis](#the-surviving-hypothesis).
 
 **Idea:** keep the ordered leaf envelope, store repeated JSON structure once,
 and address varying fields as packed slots. Selection is per leaf, with raw
 fallback.
 
-The [v2 verdict](#v2-verdict-and-adoption-policy) records measured results.
-The earlier table remains projected, and the
-[qualification gates](#qualification-gates-isolated-lab-first) remain the
-integration contract. Nothing here is a database-level performance claim.
-
 ## Observation
 
-The ordered primary graph now stores document bytes verbatim in its
-leaves. For realistic small JSON documents, a large fraction of those
-bytes — field names, punctuation, repeated structure — is identical
-across documents that share a shape, and the remaining costs of the
-store trace back to that redundancy: the space floor is raw bytes, every
-typed access re-parses text, every filter scans text, every same-shape
-update rewrites bytes that did not change, and every checkpoint reseal
-hashes them.
+The ordered primary graph stores document bytes verbatim in its leaves. For
+realistic small JSON documents, a large fraction of those bytes — field names,
+punctuation, repeated structure — is identical across documents that share a
+shape, and the remaining costs of the store trace back to that redundancy: the
+space floor is raw bytes, every typed access re-parses text, every filter scans
+text, every same-shape update rewrites bytes that did not change, and every
+checkpoint reseal hashes them.
 
 ## Design
 
-A template-columnar leaf keeps the existing envelope — stable slots,
-control bytes, lexical rank permutation, key heap, adaptive 4-64 KiB
-classes, checksums — and changes only how document bytes are laid out:
+A template-columnar leaf keeps the existing envelope — stable slots, control
+bytes, lexical rank permutation, key heap, adaptive 4-64 KiB classes,
+checksums — and changes only how document bytes are laid out:
 
-- A per-leaf, content-addressed **template dictionary**. A template is
-  the exact byte skeleton of one document shape: every invariant byte,
-  with typed holes where values vary. Reconstruction is a deterministic
-  splice, so the exact original JSON spelling round-trips byte for byte.
-- Each document row stores its template reference plus **packed field
-  slots**: the variant bytes for each hole, offset-indexed so one field
-  is addressable without touching the rest.
-- A per-field **zone vector** in the leaf header: min/max (bytewise for
-  strings, numeric for canonical numbers) plus a null/absent mask per
-  template hole. Range and equality predicates prune whole leaves before
-  touching rows, for every field, with no secondary index and no
-  write-path index maintenance.
-- **Region checksums**: the leaf checksum tree covers the template
-  dictionary and each column region separately, so an in-place field
-  patch reseals only its region and the root, not the whole leaf.
-- Class selection stays measured and per leaf: a leaf whose documents do
-  not share templates profitably stays raw. The bulk builder chooses by
-  measured encoded size; runtime reclassification follows the existing
-  bounded slot-class rewrite rules.
+- A per-leaf, content-addressed **template dictionary**. A template is the
+  exact byte skeleton of one document shape: every invariant byte, with typed
+  holes where values vary. Reconstruction is a deterministic splice, so the
+  exact original JSON spelling round-trips byte for byte.
+- Each document row stores its template reference plus **packed field slots**:
+  the variant bytes for each hole, offset-indexed so one field is addressable
+  without touching the rest.
+- A per-field **zone vector** in the leaf header: min/max plus a null/absent
+  mask per template hole, so range and equality predicates prune whole leaves
+  before touching rows, with no secondary index and no write-path index
+  maintenance.
+- **Region checksums**: the leaf checksum tree covers the template dictionary
+  and each column region separately, so an in-place field patch reseals only
+  its region and the root, not the whole leaf.
+- Class selection is measured and per leaf: a leaf whose documents do not share
+  templates profitably stays raw. The bulk builder chooses by measured encoded
+  size (`planTemplateLeafCount`); the row count is capped at what a raw wide
+  leaf holds so a later mutation can always de-template it back into the raw
+  envelope.
 
-Read paths:
+This is a leaf codec and access-path change, not an engine: tablet routing,
+BucketID stability, snapshots, COW, frame-native staging, epoch-protected
+reads, and durability contracts are untouched.
 
-- `AppendRaw` splices template segments with field bytes — a handful of
-  bounded memcpys instead of one.
-- Field projection (`GetRaw` pointer, SQL column access, query
-  predicates) reads one slot through the offset index — no JSON scan.
-- Ordered scans with predicates evaluate column-wise over the leaf and
-  materialize only surviving rows.
+## The lab verdict was strong in isolation
 
-Write paths:
+The v2 lab measured, on the codec alone: 64.9% space saving on the
+low-cardinality competitive shape (258.4 to 90.6 B/doc), 35.2% on
+high-cardinality, 0% adversarial overhead with raw fallback, 20.4 ns field
+access, and region reseal 2.5x cheaper than a whole-leaf reseal — with two
+honest misses: 102.7 ns splice against the 30 ns aspiration, and fused
+extraction at +55.7% of a bare validation pass. Two of those mechanisms —
+region reseal and offset-indexed field access — are unambiguous wins that
+survive independently of the class decision.
 
-- Ingest already parses for validation; the same pass yields the
-  template and field extraction at marginal cost.
-- A same-template update diffs field slots; unchanged fields are
-  untouched bytes, the exclusive in-place window shrinks to the changed
-  slots, and the reseal covers only dirtied regions.
-- Cross-template updates fall back to whole-row replacement inside the
-  leaf, and COW/split rules are unchanged.
+## Why the class adopts 0% on the real graph
 
-Everything else — tablet routing, BucketID stability, snapshots, COW,
-frame-native staging, optimistic reads, durability contracts — is
-untouched. This is a leaf codec and access-path change, not an engine.
+Integrating the class and measuring the leaf geometry the graph actually
+builds retired the "blanket default" hypothesis. Under the adaptive selection
+rule — adopt the template class only when it stores the same rows at least 25%
+below the raw leaf's page cost per document — the census on the exact
+competitive corpus adopts it for **zero** leaves
+(internal/storeio/store_file_primary_tc_census_test.go,
+`TestPhase0TCCensus`). The measured reasons compound:
 
-## Why this is the highest-leverage remaining change
+- The graph's leaves are small (a template row count capped at raw wide leaf
+  capacity so it stays de-templatable), the per-document values are near-unique,
+  and the fixed per-document row plus column/zone directory overhead dominates
+  the per-doc byte cost — exactly the regime where structure-once saves little.
+- Making the leaf larger would amortize that fixed directory overhead and let
+  the space case close, but a larger template leaf loses on mutation cost:
+  de-templating and region reseal both scale with leaf size, so the geometry
+  that would pay for space costs more on every write. No single leaf size wins
+  both axes, so the honest gate adopts the class nowhere.
 
-| Axis | Mechanism | Status |
-| --- | --- | --- |
-| Disk and cache space | structure stored once per leaf | projected 35-55% below verbatim leaves on representative corpora; lab gate |
-| Typed/field access | column offsets, no parse | projected order-of-magnitude on field reads; lab gate |
-| Predicate scans | leaf zone vectors + column evaluation | projected leaf pruning comparable to indexed access for selective ranges; lab gate |
-| Update bytes | field-slot diff + region reseal | projected reseal cost O(changed region); lab gate |
-| Raw point read | template splice overhead | projected small regression vs one memcpy; hard gate: within the existing read budgets |
-| Secondary-index pressure | zone vectors absorb range predicates | postings remain for high-selectivity exact terms |
+The class byte, the codec, and the selection rule remain in the tree because
+they are correct and the two surviving mechanisms depend on the codec; the
+class is simply never chosen by a production build.
 
-## First lab verdict and the v2 mechanisms
+## The space that landed: the compact leaf
 
-The v1 lab (template + offset-indexed slots, naive extraction, memcpy
-splice) measured: field access 14.1ns and region reseal 26x cheaper than
-whole-leaf — both promoted mechanisms — but only 15.5% space on the
-competitive shape, 96.6ns splice, and extraction at 2.3x a bare
-validation pass. Three lessons, three v2 mechanisms:
+The space win on the primary graph came from a different, byte-exact codec: the
+**compact document-group leaf**, primary leaf class 4
+(`CommonPrimaryLeafCompact`, internal/storeio/common_primary_compact_leaf.go),
+selected by `PrimaryLeafCompact` / `DocumentFormat: DocumentFormatCompact`. It
+embeds the container-independent grouped payload — one shared shape-template
+table and value dictionary per leaf, each row reduced to a dictionary/literal
+token stream — so a document stored compact on the ordered primary graph
+reconstructs byte for byte identically to the same document stored compact in
+the legacy chunk layout. It reuses the `PagePrimaryLeaf` kind and the leaf's
+stable BucketID, so the router, catalog, COW, snapshots, and the exact-index
+maintainer route to it exactly as to any other leaf; only the payload codec
+differs.
 
-- **Fused extraction.** The structural validation pass already visits
-  every boundary byte; the shape fingerprint and value spans must be
-  emitted by that pass, never by a second walk.
-- **Compiled splice programs.** A template compiles once into a gather
-  program executed with the encoder-execute overlapping-store
-  discipline; per-segment cost falls from memcpy-call overhead to
-  vector-store cost. Predicated scans never splice rejected rows.
-- **Value tier.** Structure is a minority of representative corpora; the
-  space gate needs the per-leaf content-addressed value dictionary for
-  repeated value spans, and per-doc metadata becomes varint length
-  vectors reconstructed by prefix sum instead of offset directories.
+As a measured diagnostic (not yet a published competitive table), a 100k-doc
+compact primary graph occupies roughly **7.8 MiB low-cardinality / 17.6 MiB
+high-cardinality** — below the legacy chunk-layout compact footprint at both
+cardinalities. It is bulk-only, explicitly selected evidence, and the reader
+never has to know which format wrote the file.
 
-## v2 verdict and adoption policy
+## The surviving hypothesis
 
-The v2 lab measured: 64.9% space saving on the low-cardinality
-competitive shape (258.4 to 90.6 B/doc), 35.2% on high-cardinality, 0%
-adversarial overhead with raw fallback, 20.4ns field access, region
-reseal 2.5x cheaper than whole-leaf — and two honest misses: 102.7ns
-splice against the 30ns aspiration and fused extraction at +55.7% of a
-bare validation pass (+84ns/doc, which is single-digit percent of the
-complete bulk pipeline; the validation-relative gate used the wrong
-denominator and is superseded).
+One template idea is not refuted, only unbuilt: a **TC-dedicated
+split-on-write class** whose split policy is chosen for template density rather
+than shared with the raw adaptive selection — packing same-shape rows into a
+leaf sized to amortize the directory while keeping the mutation granule small,
+instead of asking one adaptive size to win both axes. A back-of-envelope
+projection puts it near **128.5 B/doc**. It is a projection with no code; it
+gates on a lab that measures the split policy's space and mutation cost
+together, exactly as the codec lab measured the codec.
 
-Adoption is therefore per-leaf class policy, not a blanket default: the
-builder selects the template-columnar class when the measured leaf-level
-saving is at least 25% and the collection policy accepts splice-priced
-full-document reads; raw remains the class for full-scan-dominated
-tablets. Field projection, predicated scans, and zone pruning are
-strictly faster under the class; whole-document materialization pays the
-splice and is said so plainly. One further splice iteration (run
-coalescing, batched dictionary resolution) may narrow the gap but does
-not gate integration.
+## Mechanisms worth keeping regardless of class
 
-## Qualification gates (isolated lab first)
+| Mechanism | Status |
+| --- | --- |
+| Region reseal (checksum only the dirtied region) | measured 2.5x cheaper than whole-leaf; codec-level win |
+| Offset-indexed field access, zero-alloc | measured 20.4 ns/field; codec-level win |
+| Blanket template default | retired: 0% adoption under the honest gates |
+| Compact document-group leaf (class 4) | landed; the space win on the primary graph |
 
-1. Encoded bytes per document vs the raw leaf, per corpus: ≥40% on the
-   low-cardinality competitive corpus (templates plus value dictionary),
-   ≥25% on the high-cardinality variant (structure only), ≤2% overhead
-   on the adversarial unique-shape corpus (raw fallback evidence).
-2. Compiled `AppendRaw` splice ≤30ns at the representative shape;
-   ordered all-bytes scan within the 60ns/doc gate; predicated scans
-   splice only surviving rows.
-3. Field access: ≤25ns per field local, zero allocations.
-4. Fused template extraction: ≤15% over the bare validation pass,
-   measured as one pass, not validation plus a second walk.
-5. Same-template field patch + region reseal: measured against the
+## Qualification gates (the codec lab contract)
+
+The isolated codec passed these; the class did not clear the graph-level
+adoption gate above. They remain the contract any future template-density class
+(the surviving hypothesis) must re-run against its own split policy:
+
+1. Encoded bytes per document vs the raw leaf, per corpus.
+2. Compiled `AppendRaw` splice cost; ordered all-bytes scan within the scan
+   gate; predicated scans splice only surviving rows.
+3. Field access: local, zero allocations.
+4. Fused template extraction measured as one pass, not validation plus a second
+   walk.
+5. Same-template field patch plus region reseal, measured against the
    whole-leaf reseal it replaces.
 6. Corruption: every region independently fail-closed; grafted template
    dictionaries rejected; splice never reads outside its slot bounds.
-
-Integration only after the lab passes: bulk-build class selection first,
-read paths second, mutations third, exactly like the primary graph's own
-sequence. The lab lives in internal/storeio as an isolated codec with
-benchmarks, following the promotion discipline every other candidate has
-used.

@@ -12,9 +12,9 @@ honor successful writes and synchronization calls.
 
 | Contract | Go option | Acknowledgement and visibility | Stable-storage work | Loss window |
 | --- | --- | --- | --- | --- |
-| buffered-visible | `DurabilityBufferedVisible` | success after bounded canonical COW staging; immediately reader-visible | none on ordinary admission | process or machine failure may lose every acknowledged generation after the last successful `Flush` |
+| buffered-visible | `DurabilityBufferedVisible` | success after bounded canonical COW staging; immediately reader-visible | none on ordinary admission, unless `RecoveryJournal` is set (one redo append plus sync per mutation) | process or machine failure may lose every acknowledged generation after the last successful `Flush`, or after the last synced journal record when `RecoveryJournal` is set |
 | async-stable-in-flight | `DurabilityAsyncVisible` | success after the bounded committer accepts the generation; immediately reader-visible | the background worker continuously writes ordered COW generations and roots | failure may lose acknowledged generations newer than `DurableGeneration`; `Flush` closes the window |
-| synchronous, power-safe | `DurabilitySync` (zero value) | success and visibility wait for data and alternate-root barriers | strongest supported platform sequence | after success, recovery selects the complete new generation; before success, outcome may require reopen |
+| synchronous, power-safe | `DurabilitySync` (zero value) | on the primary graph, success waits for one journal append plus its power-safe sync, then applies and publishes — visibility strictly follows durability; on the transitional chunk layout, success and visibility wait for data and alternate-root barriers | strongest supported platform sequence: one journaled record barrier per mutation (primary graph) or per-mutation COW plus two ordered root barriers (chunk layout) | after success, recovery selects the acknowledged generation; before success, outcome may require reopen |
 
 All modes are linearizable inside the live process. “Buffered” weakens crash
 survival, not read ordering. Bounded staging or retirement pressure may force a
@@ -99,7 +99,20 @@ If persistence fails, ordinary COW readers roll back to the last confirmed
 durable state. A failed asynchronous canonical replacement rejects reads until
 reopen because recovery must first restore or select the page image.
 
-### Synchronous
+### Synchronous, journal-backed (primary graph)
+
+- Before the journal record's sync completes: the call has not succeeded and
+  nothing is applied or visible; recovery selects the last checkpointed root
+  and replays the journal records that preceded this one.
+- After the record's sync but before the next checkpoint: the mutation is
+  durable and visible; a crash replays it from the journal onto the selected
+  root. This is the window the deferred root trades for a single fence.
+- After a checkpoint folds the record in: the mutation is part of a
+  power-safe root and the journal head is recycled past it.
+- A checkpoint's own final-root barrier reporting an error yields
+  `ErrCommitOutcomeUnknown`; reopen determines which root won.
+
+### Synchronous, chain-fence (transitional chunk layout)
 
 - Before the data barrier: the call has not succeeded; recovery selects a
   complete root.
@@ -112,16 +125,32 @@ reopen because recovery must first restore or select the page image.
 
 ## Persistence failures
 
-Any write or synchronization failure poisons the writer. Later mutations,
-checkpoints, and close-drain work return the sticky `PersistenceError`.
-`errors.Is` may match `ErrCommitOutcomeUnknown` when only recovery can decide
-the last committed generation. Close the collection and reopen the file; do
-not retry the logical mutation against the poisoned live handle.
+Any write or synchronization failure poisons the writer. A journal append or
+sync failure is terminal in the same way: after an fsync-class error the kernel
+may have dropped the dirty pages a retry would need, so the failure is sticky
+and die-don't-retry, never a retry loop. Later mutations, checkpoints, and
+close-drain work return the sticky `PersistenceError`, which joins any committer
+failure with the journal failure. `errors.Is` may match
+`ErrCommitOutcomeUnknown` when only recovery can decide the last committed
+generation. Close the collection and reopen the file; do not retry the logical
+mutation against the poisoned live handle.
 
-## Future recovery journal
+## Recovery journal
 
-The [recovery-only redo journal](design/recovery-journal.md) is a future
-design, not part of the current durability contract. It would reduce
-synchronous acknowledgement to one bounded append and one sync while keeping
-the journal out of every read path. Its projected effects are not current
-performance claims.
+On the ordered primary graph the [recovery-only redo journal][journal] backs
+`DurabilitySync`: it is minted unconditionally for a primary-layout synchronous
+store and is how that lane acknowledges — one bounded append plus one sync,
+before the mutation is applied and published — not an option. Buffered-visible
+opts in with `Options.RecoveryJournal` for the same per-mutation durable
+acknowledgement. Readers never consult it; the journal is write-only until
+recovery replays the records after the newest valid root's generation. The
+store root records the journal's identity, and recovery pairs the two files by
+identity, page geometry, and a base-generation epoch, failing closed on a
+missing or mismatched journal. The transitional chunk sync lane has no journal
+and keeps the chain-fence acknowledgement until the chunk store is deleted;
+requesting a journal on a layout that cannot feed it fails closed. See
+[the design][journal] for the record format, batch group-commit, and the
+projected competitive effects, which are not yet reflected in the published
+tables.
+
+[journal]: design/recovery-journal.md

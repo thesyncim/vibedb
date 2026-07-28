@@ -1,8 +1,12 @@
 # Canonical materialization
 
-**Status:** narrow, capability-gated implementation. Same-length,
-projection-safe asynchronous updates can qualify; the broader mutation set
-remains gated.
+**Status:** narrow, capability-gated implementation. The durable
+before-image capsule path described here qualifies same-length, projection-safe
+*asynchronous* updates; the broader mutation set remains gated. Separately, the
+buffered-visible and journal-backed synchronous lanes now patch an exclusively
+owned canonical leaf frame in place with no capsule — the frame is volatile
+until the next checkpoint materializes it — which is the primary graph's
+everyday in-place realization; this document covers the async capsule variant.
 
 **Idea:** overwrite a canonical page only after proving exclusive ownership,
 and protect recovery with a durable before-image capsule. Every failed
@@ -53,8 +57,9 @@ publication gate while checking all of the following:
    root.
 5. Every target is a uniquely owned canonical extent, not a grouped or shared
    representation.
-6. Every active user snapshot is strictly older than the target page's
-   generation.
+6. Every active reader — a snapshot's generation lease or a direct point read's
+   epoch slot, both consulted together — is strictly older than the target
+   page's generation.
 7. Every target cache frame is ready, clean, and unpinned.
 8. The encoded extent and its `PageRef` identity remain unchanged.
 9. No split, merge, relocation, separator, fence, selector, or overflow
