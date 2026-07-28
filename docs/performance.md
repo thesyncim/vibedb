@@ -8,28 +8,27 @@
 > stalls while charging ours. They are retained only for reproducibility
 > of history and must not be quoted as current standing.
 
-## Current standing — quiet-machine diagnostics, 2026-07-27
+## Current standing — official mixedsuite refresh, 2026-07-28
 
-Single-run diagnostics (cmd/mixed, YCSB-A, buffered-visible, matched
-checkpoint every 64 mutations, 100k documents, M4 Max) on the legacy
-default engine after the day's fixes:
+The 10-repetition mixedsuite protocol ran across all five workloads and
+all three durability lanes on a quiet machine, measuring the ordered
+primary graph (now the harness default). The results replaced every
+pinned table in [bench/competitive/RESULTS.md](../bench/competitive/RESULTS.md);
+headline standing: buffered-visible leads every engine except Badger on
+every workload (1.9-3.6x SQLite, up to 1.01M ops/s on ycsb-b, beating
+Badger there and on scan-mix at a fraction of its disk); ordinary-sync
+is honestly LOSING to SQLite and Badger (32.5 us per journal
+acknowledgement vs their cheaper commits — the sync-lane unification and
+group-committed journal work targets this); power-safe trails SQLite by
+8-13% pending the single-fence journal sync lane. Space: compact is the
+smallest footprint at both corpus cardinalities; churn steady state is
+36.0 MiB flat with no maintenance operation.
 
-| Metric | vibedb | Pebble |
-| --- | ---: | ---: |
-| Total throughput | ~39,000-40,000 ops/s | 13,507 ops/s |
-| Read p50 | 1.3-1.7 us | 1.5 us |
-| Update p50 | 18-23 us | 2.4 us |
-| Checkpoint p50 / p95 | 1.7 / 2.1 ms | 8.8 / 14.4 ms |
-| Disk | 36.6 MiB | 44.2 MiB |
-
-The ordered primary graph (not yet the harness default) additionally
-measures 412 ns hot in-place acknowledgements, 8.3 us uniform
-ref-changing writes, 446 ns point reads, and 20.7 ns/doc all-byte
-ordered scans — see the benchmarks in store/durable. These are
-diagnostics, not the publishable protocol: the official replacement of
-every pinned table is the 10-repetition mixedsuite run across all five
-workloads and three durability lanes on a quiet machine, which is the
-next scheduled measurement action.
+The ordered primary graph additionally measures 412 ns hot in-place
+acknowledgements, 437-446 ns point reads, and 20.7 ns/doc all-byte
+ordered scans in the store/durable benchmarks; inside the mixed
+workloads its point reads (0.33-0.38 us p50) are the fastest of all
+five engines.
 
 The authoritative measured tables live in
 [bench/competitive/RESULTS.md](../bench/competitive/RESULTS.md). This document
