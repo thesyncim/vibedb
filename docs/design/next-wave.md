@@ -77,4 +77,7 @@ tablet writers are next among engine work, since the journal's group commit
 multiplies with them. The reseal-deferral item slots after the publishable
 suite refresh so its gate measures against a published baseline. The
 fault-device sweep and verify/salvage tooling are parallel-safe and may start
-any time; the overflow dedup and corner lanes ride the harness cadence.
+any time; the overflow dedup and corner lanes ride the harness cadence. The
+[distributed-sharding plan](distributed-sharding.md) has its own gated
+sequence after the shard-local storage contract is stable; it does not turn
+local `TabletID` partitions into network ownership units.

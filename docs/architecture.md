@@ -218,4 +218,7 @@ optimizations because they do not change what readers consult.
   now backs the synchronous lane.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
   per-tablet concurrency.
+- [Distributed sharding](design/distributed-sharding.md): future routed
+  ownership, replication, failover, and online resharding across independent
+  durable roots.
 - [Unification](design/unification.md): one eventual mutable collection.

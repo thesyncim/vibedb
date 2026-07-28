@@ -6,6 +6,11 @@
 **Idea:** serialize mutations within one tablet, execute distinct tablets in
 parallel, and batch only shared catalog/root edits through an epoch publisher.
 
+This design is intra-process concurrency inside one physical collection.
+Distributed ownership and replication use
+[distributed sharding](distributed-sharding.md); they do not reuse `TabletID`
+as a network-shard identity.
+
 The single-writer lane must not regress, and the honest serialization floor is
 recorded in [Honest limits](#honest-limits).
 
