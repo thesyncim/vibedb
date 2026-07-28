@@ -15,13 +15,27 @@
 // first use durable Snapshot.AppendRaw point reads, while other supported
 // predicates run through query's scan and exact-posting candidate paths.
 // COUNT(*), LIMIT, prepared placeholders, concurrent readers, whole-document
-// UPDATE, and DELETE work on unindexed tables.
+// UPDATE, DELETE, and transactions work on unindexed tables.
 //
-// Exact indexes are frozen into the first durable generation. Once an indexed
-// table has materialized, INSERT, UPDATE, and DELETE return
-// ErrIndexedTableReadOnly until mutable exact postings land. BEGIN returns
-// ErrAutocommitOnly until the ordered-primary transactional batch surface
-// lands. These refusals fail before mutation; neither feature is simulated.
+// BEGIN captures a generation-leased snapshot of every table then present in
+// the catalog. Every transactional SELECT and mutation reads that fixed
+// generation overlaid with the transaction's own bounded write set, providing
+// repeatable reads, phantom exclusion, and read-your-writes. The current
+// implementation materializes that merged view in one pass per statement.
+// Writes in one transaction must name one table, because one
+// durable.Collection.Update is the engine's atomic publication unit. COMMIT
+// checks each written key's begin-time pre-image (first committer wins), then
+// records all changes in one durable.WriteBatch; ROLLBACK discards the overlay.
+//
+// Exact indexes are frozen into the first durable generation. Autocommit
+// mutations return ErrIndexedTableReadOnly. Transactional indexed mutations
+// return ErrTransactionIndexedTable, wrapping
+// durable.ErrPrimaryBatchIndexedUnsupported. Transactions that exceed the
+// collection's document or byte reservation return ErrTransactionTooLarge,
+// wrapping durable.ErrBatchTooLarge. An ordered-primary async-visible lane
+// returns ErrTransactionUnsupportedLane, wrapping
+// durable.ErrPrimaryBatchUnsupportedLane. These gates fail without publishing
+// a partial transaction.
 //
 // JSON null and a missing projected path both scan as nil. bool scans as bool;
 // an integral JSON number that fits scans as int64; other numbers retain their

@@ -90,6 +90,7 @@ type conn struct {
 	exec       query.Exec
 	args       []any
 	open       bool
+	tx         *tx
 	closed     bool
 	standalone *dbConnector
 }
@@ -157,14 +158,22 @@ func (c *conn) ExecContext(ctx context.Context, src string, args []sqldriver.Nam
 }
 
 func (c *conn) Begin() (sqldriver.Tx, error) {
-	return nil, ErrAutocommitOnly
+	return c.BeginTx(context.Background(), sqldriver.TxOptions{})
 }
 
-func (c *conn) BeginTx(ctx context.Context, _ sqldriver.TxOptions) (sqldriver.Tx, error) {
+func (c *conn) BeginTx(ctx context.Context, options sqldriver.TxOptions) (sqldriver.Tx, error) {
 	if err := c.usable(ctx); err != nil {
 		return nil, err
 	}
-	return nil, ErrAutocommitOnly
+	if c.tx != nil {
+		return nil, errors.New("vibedb: this connection already has an open transaction")
+	}
+	transaction, err := c.beginTx(options)
+	if err != nil {
+		return nil, err
+	}
+	c.tx = transaction
+	return transaction, nil
 }
 
 func (c *conn) Close() error {
@@ -172,6 +181,9 @@ func (c *conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.tx != nil {
+		_ = c.tx.Rollback()
+	}
 	c.exec.Release()
 	if c.standalone != nil {
 		return c.standalone.Close()

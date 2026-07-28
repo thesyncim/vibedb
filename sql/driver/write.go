@@ -11,6 +11,8 @@ import (
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 var errNoLastInsertID = errors.New("vibedb: LastInsertId is unavailable; primary keys come from JSON documents")
@@ -346,6 +348,60 @@ func (c *conn) matchingKeysLocked(
 		return filter.Add(key, document)
 	}); err != nil {
 		return nil, err
+	}
+	if err := filter.Done(); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func (c *conn) matchingKeysSnapshot(
+	statement *query.DMLStatement,
+	args []any,
+	t *table,
+	snapshot store.Snapshot,
+) ([]string, error) {
+	var where *sqlast.Expr
+	switch statement.Tree().Kind {
+	case sqlast.KindUpdate:
+		if statement.Tree().Update.Filter != nil {
+			where = statement.Tree().Update.Filter.Where
+		}
+	case sqlast.KindDelete:
+		if statement.Tree().Delete.Filter != nil {
+			where = statement.Tree().Delete.Filter.Where
+		}
+	}
+	if keys, point, err := primaryPredicateKeys(where, t.meta.PrimaryKey, args); point || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		present := keys[:0]
+		var scratch []byte
+		for _, key := range keys {
+			var found bool
+			scratch, found = snapshot.AppendRaw(scratch[:0], key)
+			if found {
+				present = append(present, key)
+			}
+		}
+		return present, nil
+	}
+	var keys []string
+	filter, err := statement.Filter(&c.exec, args, func(key, _ []byte) error {
+		keys = append(keys, string(key))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var filterErr error
+	snapshot.Range(func(key string, document vibejson.RawValue) bool {
+		filterErr = filter.Add([]byte(key), document.Bytes())
+		return filterErr == nil
+	})
+	if filterErr != nil {
+		return nil, filterErr
 	}
 	if err := filter.Done(); err != nil {
 		return nil, err

@@ -390,9 +390,8 @@
 // FOREIGN KEY.
 //
 // Which backend accepts which statement is a property of the engine rather than
-// of this grammar, and belongs to the layer that executes: see the vibesql
-// package documentation for the two definitions that are heap-only today and
-// why.
+// of this grammar, and belongs to the layer that executes: see the sql/driver
+// package documentation.
 //
 // A join condition is deliberately not the general predicate grammar. The
 // engine joins on one key equality, so ON accepts exactly "left.key =

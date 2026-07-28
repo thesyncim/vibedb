@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"context"
 	stdsql "database/sql"
 	"errors"
 	"path/filepath"
@@ -137,11 +136,58 @@ func TestFlatInsertAndConcurrentReaders(t *testing.T) {
 	}
 }
 
-func TestTransactionsAreTypedFeatureGate(t *testing.T) {
+// Ported from vibesql/write_test.go TestTransactionCommitsAndRollsBackAsAWhole.
+func TestTransactionCommitsAndRollsBackAsAWhole(t *testing.T) {
 	db := openTestDB(t)
-	_, err := db.BeginTx(context.Background(), nil)
-	if !errors.Is(err, ErrAutocommitOnly) {
-		t.Fatalf("BeginTx error = %v, want ErrAutocommitOnly", err)
+	db.SetMaxOpenConns(2)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"base","n":0}`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"committed","n":1}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`DELETE FROM docs WHERE id = ?`, "base"); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE id = ?`, "committed").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("uncommitted insert was externally visible")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE id = ?`, "committed").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("committed insert was not visible")
+	}
+
+	rolled, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rolled.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"rolled","n":2}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rolled.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE id = ?`, "rolled").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("rolled-back insert was visible")
 	}
 }
 

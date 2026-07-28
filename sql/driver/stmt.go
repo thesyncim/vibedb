@@ -64,6 +64,18 @@ func (s *stmt) QueryContext(ctx context.Context, arguments []sqldriver.NamedValu
 	if err != nil {
 		return nil, err
 	}
+	if s.conn.tx != nil {
+		source, err := s.conn.tx.querySource(s.query.Collection())
+		if err != nil {
+			return nil, err
+		}
+		cursor, err := s.query.RunInto(&s.conn.exec, source, args)
+		if err != nil {
+			return nil, err
+		}
+		s.conn.open = true
+		return &rows{stmt: s, cursor: cursor}, nil
+	}
 	s.conn.db.mu.RLock()
 	t, ok := s.conn.db.tables[s.query.Collection()]
 	if !ok {
@@ -140,6 +152,9 @@ func (s *stmt) ExecContext(ctx context.Context, arguments []sqldriver.NamedValue
 	args, err := s.conn.values(arguments)
 	if err != nil {
 		return nil, err
+	}
+	if s.conn.tx != nil {
+		return s.conn.tx.execMutation(s.mutation, args)
 	}
 	return s.conn.execMutation(s.mutation, args)
 }

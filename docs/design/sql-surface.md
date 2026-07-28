@@ -106,12 +106,41 @@ document.
 
 ### Transactions
 
-`BEGIN`, `COMMIT`, and `ROLLBACK` are intended to map to an engine-owned
-transactional multi-document write batch. The ordered-primary transaction
-capability is not exported in this revision. `Begin` and `BeginTx` therefore
-return the typed `driver.ErrAutocommitOnly`; no SQL-layer transaction is
-simulated. This gate is removed when the sibling transactional WriteBatch
-landing exposes an ordered-primary-capable batch/capability surface.
+`BEGIN` takes a generation-leased durable snapshot of every table present in
+the SQL catalog at that instant. Every later SELECT and mutation in the
+transaction is evaluated against that fixed generation overlaid with the
+transaction's own staged writes. The implementation deliberately materializes
+that merged view in one pass per statement. The resulting visibility is exact:
+repeatable point reads, phantom exclusion, and read-your-writes for INSERT,
+whole-document UPDATE, and DELETE. Nothing committed after BEGIN is visible.
+
+A transaction may read several tables but may write exactly one. Durable
+collections have independent roots, generations, and writer locks, so the
+engine has no atomic publication spanning two tables. DDL is refused inside a
+transaction for the same catalog-lifecycle reason.
+
+`COMMIT` maps to one `Collection.Update` on the written table. Before filling
+its `WriteBatch`, the callback compares every written key's live document with
+the exact pre-image captured from the BEGIN snapshot. A changed key returns
+`driver.ErrTransactionConflict` and publishes nothing (snapshot isolation with
+first-committer-wins, not serializability). Otherwise every staged PUT and
+DELETE is recorded in that one batch, producing one failure-atomic generation.
+`ROLLBACK` closes the retained snapshots and discards the overlay.
+
+Only the default and `database/sql` snapshot isolation levels are accepted.
+Read-only transactions reject mutations. The engine's batch limits and gates
+remain visible through driver sentinels:
+
+- document-count or aggregate-byte overflow returns
+  `driver.ErrTransactionTooLarge` wrapping `durable.ErrBatchTooLarge`;
+- an indexed table returns `driver.ErrTransactionIndexedTable` wrapping
+  `durable.ErrPrimaryBatchIndexedUnsupported`, because the batch does not yet
+  run the posting maintainer;
+- an ordered-primary async-visible lane returns
+  `driver.ErrTransactionUnsupportedLane` wrapping
+  `durable.ErrPrimaryBatchUnsupportedLane`.
+
+All three abort without partial publication.
 
 ## NULL, missing fields, and types
 
@@ -154,8 +183,6 @@ can represent a broader query:
   duplicate-key, array, and missing-intermediate semantics.
 - `ALTER`, `DROP`, constraints, defaults, and generated keys wait for durable
   catalog mutation and enforcement primitives.
-- Transactional `BEGIN` waits for the sibling ordered-primary transactional
-  WriteBatch landing.
 - Mutating an indexed table waits for the sibling mutable exact-posting
   maintenance landing; current posting tiles are build-and-read and fail closed
   with `durable.ErrPrimaryExactIndexReadOnly`.
@@ -168,12 +195,9 @@ The implementation encountered these engine boundaries:
    records CREATE TABLE lazily and creates the file on first INSERT.
 2. Ordered-primary exact postings have no mutable maintenance surface.
    Indexed INSERT/UPDATE/DELETE are feature-gated.
-3. There is no exported ordered-primary transaction capability marker or
-   begin/commit batch handle for `database/sql` transactions. BEGIN is
-   feature-gated.
-4. The store does not persist a SQL primary-key declaration or derive a storage
+3. The store does not persist a SQL primary-key declaration or derive a storage
    key from a JSON path. The SQL catalog records the path and owns the
    conversion.
-5. `query` imports the root `sql` AST package, so a driver in that same package
+4. `query` imports the root `sql` AST package, so a driver in that same package
    cannot import `query` without a cycle. The registered implementation lives
    in `sql/driver`.
