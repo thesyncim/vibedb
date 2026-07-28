@@ -183,27 +183,6 @@ func BenchmarkDecodeComposite3(b *testing.B) {
 	}
 }
 
-// ComponentSpan is the level-walk primitive; it must not decode values.
-func BenchmarkComponentSpanLevel2(b *testing.B) {
-	key := benchKey(b, func(dst []byte) ([]byte, bool) {
-		dst, ok := AppendString(dst, benchShort, Ascending)
-		if !ok {
-			return dst, false
-		}
-		dst, ok = AppendNumber(dst, benchInt, Descending)
-		if !ok {
-			return dst, false
-		}
-		return AppendBool(dst, true, Ascending)
-	})
-	b.ReportAllocs()
-	for b.Loop() {
-		if _, _, err := ComponentSpan(key, 2); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 // Decoding must not allocate either, or returning key columns would cost more
 // than the copy it exists to avoid.
 func TestDecodeZeroAllocation(t *testing.T) {
@@ -228,18 +207,6 @@ func TestDecodeZeroAllocation(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-		}
-	}); allocations != 0 {
-		t.Fatalf("allocations = %v", allocations)
-	}
-}
-
-func TestComponentSpanZeroAllocation(t *testing.T) {
-	key, _ := AppendString(nil, []byte("tenant"), Ascending)
-	key, _ = AppendNumber(key, []byte("42"), Ascending)
-	if allocations := testing.AllocsPerRun(1000, func() {
-		if _, _, err := ComponentSpan(key, 1); err != nil {
-			panic(err)
 		}
 	}); allocations != 0 {
 		t.Fatalf("allocations = %v", allocations)

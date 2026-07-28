@@ -347,20 +347,6 @@ func AppendJSONString(dst, raw []byte, direction Direction) ([]byte, bool) {
 	return dst, true
 }
 
-// AppendPrefixEnd appends the exclusive upper bound of an equality prefix.
-// False means prefix is the all-0xff sentinel and has no finite successor.
-func AppendPrefixEnd(dst, prefix []byte) ([]byte, bool) {
-	start := len(dst)
-	dst = append(dst, prefix...)
-	for i := len(dst) - 1; i >= start; i-- {
-		if dst[i] != 0xff {
-			dst[i]++
-			return dst[:i+1], true
-		}
-	}
-	return dst[:start], false
-}
-
 func appendStringByte(dst []byte, b byte) []byte {
 	if b == 0 {
 		return append(dst, 0, 0xff)

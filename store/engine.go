@@ -96,8 +96,6 @@ const MaxChunkDocuments = 64
 // than an ordinary capacity event. The guard prevents uint32 wraparound.
 var ErrTooLarge = errors.New("vibejson: collection chunk address space exhausted")
 
-func maphashString(seed maphash.Seed, Key string) uint64 { return maphash.String(seed, Key) }
-
 // Normalized returns o with zero fields resolved to their defaults and every
 // bound validated, or an error describing the first invalid setting. Callers
 // pass the result to collection construction so later code can assume settled,

@@ -376,29 +376,6 @@ func TestThreeComponentOrderMatchesReference(t *testing.T) {
 // A prefix range must contain exactly the keys carrying that prefix. This is
 // simultaneously the range-query bound and the shard boundary, so an off-by-one
 // here would both drop rows and misroute them.
-func TestPrefixRangeContainsExactlyMatchingKeys(t *testing.T) {
-	values := compositeCorpus(t)
-	for _, p := range values {
-		prefix := encodeValue(t, nil, p, Ascending)
-		end, ok := AppendPrefixEnd(nil, prefix)
-		if !ok {
-			t.Fatalf("no successor for %s", p)
-		}
-		for _, a := range values {
-			for _, b := range values {
-				key := encodeValue(t, nil, a, Ascending)
-				key = encodeValue(t, key, b, Ascending)
-				inRange := bytes.Compare(key, prefix) >= 0 && bytes.Compare(key, end) < 0
-				hasPrefix := bytes.HasPrefix(key, prefix)
-				if inRange != hasPrefix {
-					t.Fatalf("prefix %s key (%s,%s): inRange=%v hasPrefix=%v",
-						p, a, b, inRange, hasPrefix)
-				}
-			}
-		}
-	}
-}
-
 // jsonSpelling renders a decoded string as JSON source, escaping the characters
 // JSON requires plus every control byte, so the escaped and raw entry points can
 // be compared on the same content.

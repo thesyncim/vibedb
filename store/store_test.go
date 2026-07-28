@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"math/bits"
 	"math/rand"
 	"slices"
@@ -277,7 +278,7 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 
 	lookupSource := func(key string) []byte {
 		state := collection.state.Load()
-		loc, ok := storeKeyLookup(state.keys, maphashString(state.seed, key), key)
+		loc, ok := storeKeyLookup(state.keys, maphash.String(state.seed, key), key)
 		if !ok {
 			t.Fatalf("missing key %q", key)
 		}
@@ -346,7 +347,7 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 		}
 		current := lookupSource(fmt.Sprintf("k%d", i))
 		state := after.state
-		loc, _ := storeKeyLookup(state.keys, maphashString(state.seed, fmt.Sprintf("k%d", i)), fmt.Sprintf("k%d", i))
+		loc, _ := storeKeyLookup(state.keys, maphash.String(state.seed, fmt.Sprintf("k%d", i)), fmt.Sprintf("k%d", i))
 		chunk := state.Chunks.Get(loc.Chunk)
 		prior := chunk.Docs.RawAt(int(chunk.Ord[loc.Slot]))
 		if &current[0] != &prior[0] {

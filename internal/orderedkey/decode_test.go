@@ -190,95 +190,6 @@ func TestDecodeRejectsNonCanonicalDigits(t *testing.T) {
 	}
 }
 
-// Level-wise access is what Leapfrog Triejoin walks: component k's span must be
-// discoverable in one forward pass, and comparing that span alone must be a
-// valid comparison at that level.
-func TestComponentSpanIsForwardDiscoverableAndComparable(t *testing.T) {
-	values := compositeCorpus(t)
-	dirs := []Direction{Ascending, Descending, Ascending}
-	type entry struct {
-		key   []byte
-		parts [][]byte
-	}
-	var entries []entry
-	for _, a := range values {
-		for _, b := range values {
-			c := values[(len(values)+3)/2]
-			parts := [][]byte{
-				encodeValue(t, nil, a, dirs[0]),
-				encodeValue(t, nil, b, dirs[1]),
-				encodeValue(t, nil, c, dirs[2]),
-			}
-			var key []byte
-			for _, p := range parts {
-				key = append(key, p...)
-			}
-			entries = append(entries, entry{key: key, parts: parts})
-		}
-	}
-	for _, e := range entries {
-		if n, err := CountComponents(e.key); err != nil || n != 3 {
-			t.Fatalf("CountComponents = %d, %v", n, err)
-		}
-		off := 0
-		for k, want := range e.parts {
-			start, end, err := ComponentSpan(e.key, k)
-			if err != nil {
-				t.Fatalf("span %d: %v", k, err)
-			}
-			if start != off || !bytes.Equal(e.key[start:end], want) {
-				t.Fatalf("component %d span %d:%d = %x want %x", k, start, end, e.key[start:end], want)
-			}
-			off = end
-		}
-		if off != len(e.key) {
-			t.Fatalf("spans did not cover key")
-		}
-		if _, _, err := ComponentSpan(e.key, 3); err == nil {
-			t.Fatal("accepted out-of-range component")
-		}
-	}
-	// Comparing one level in isolation must agree with comparing that level
-	// inside whole keys that share every earlier component.
-	for i := range entries {
-		for j := range entries {
-			if !bytes.Equal(entries[i].parts[0], entries[j].parts[0]) {
-				continue
-			}
-			s1, e1, _ := ComponentSpan(entries[i].key, 1)
-			s2, e2, _ := ComponentSpan(entries[j].key, 1)
-			iso := sign(bytes.Compare(entries[i].key[s1:e1], entries[j].key[s2:e2]))
-			full := sign(bytes.Compare(entries[i].key, entries[j].key))
-			if iso != 0 && iso != full {
-				t.Fatalf("level compare %d vs full %d", iso, full)
-			}
-		}
-	}
-}
-
-// A seek target is built by encoding one component on its own. That is only
-// valid because a component's bytes do not depend on what precedes them, so the
-// standalone encoding is byte-identical to the same value's span inside a key.
-func TestSeekTargetMatchesInKeySpan(t *testing.T) {
-	values := compositeCorpus(t)
-	for _, d := range []Direction{Ascending, Descending} {
-		for _, prefix := range values {
-			for _, v := range values {
-				head := encodeValue(t, nil, prefix, Ascending)
-				key := encodeValue(t, append([]byte(nil), head...), v, d)
-				target := encodeValue(t, nil, v, d)
-				start, end, err := ComponentSpan(key, 1)
-				if err != nil {
-					t.Fatalf("span: %v", err)
-				}
-				if !bytes.Equal(key[start:end], target) {
-					t.Fatalf("%s: seek target %x != in-key span %x", v, target, key[start:end])
-				}
-			}
-		}
-	}
-}
-
 // Decoding is a storage boundary that can be handed corrupted pages, so it must
 // be total: never panic, never read out of bounds, and reject what it cannot
 // canonically reproduce. Anything it does accept must re-encode to the same
@@ -308,10 +219,6 @@ func FuzzDecodeKey(f *testing.F) {
 			}
 			if next <= off || next > len(data) {
 				t.Fatalf("decode did not advance: off=%d next=%d", off, next)
-			}
-			end, err := ComponentEnd(data, off)
-			if err != nil || end != next {
-				t.Fatalf("ComponentEnd=%d,%v disagrees with decode next=%d", end, err, next)
 			}
 			d := Ascending
 			if c.Descending {

@@ -50,8 +50,6 @@ var (
 	ErrMalformedKey = errors.New("orderedkey: malformed key")
 	// ErrKeyTruncated reports a component that runs past the end of the key.
 	ErrKeyTruncated = errors.New("orderedkey: truncated key")
-	// ErrComponentIndex reports a component index past the end of the key.
-	ErrComponentIndex = errors.New("orderedkey: component index out of range")
 )
 
 // Component describes one decoded component. Payload names the span appended to
@@ -81,50 +79,6 @@ func maskAt(key []byte, off int) (tag, mask byte, err error) {
 	default:
 		return 0, 0, ErrMalformedKey
 	}
-}
-
-// ComponentEnd returns the offset just past the component beginning at off,
-// using one forward pass and no value decoding. It is the primitive a trie
-// reader walks levels with.
-func ComponentEnd(key []byte, off int) (int, error) {
-	tag, mask, err := maskAt(key, off)
-	if err != nil {
-		return 0, err
-	}
-	switch tag {
-	case tagNull, tagFalse, tagTrue:
-		return off + 1, nil
-	case tagString:
-		return stringEnd(key, off+1, mask)
-	default:
-		_, _, _, end, err := numberSpan(key, off+1, mask)
-		return end, err
-	}
-}
-
-// stringEnd finds the 0x00,0x00 terminator, honouring the 0x00,0xff escape that
-// lets a string contain the terminator byte. Without the escape, a stored 0x00
-// would end the component early and a key such as ("a\x00b","c") would both
-// mis-parse and sort as if it were ("a", ...).
-func stringEnd(key []byte, i int, mask byte) (int, error) {
-	for i < len(key) {
-		if key[i]^mask != 0 {
-			i++
-			continue
-		}
-		if i+1 >= len(key) {
-			return 0, ErrKeyTruncated
-		}
-		switch key[i+1] ^ mask {
-		case 0x00:
-			return i + 2, nil
-		case 0xff:
-			i += 2
-		default:
-			return 0, ErrMalformedKey
-		}
-	}
-	return 0, ErrKeyTruncated
 }
 
 // numberSpan locates a number's parts starting at the sign byte. digitsStart and
@@ -168,43 +122,6 @@ func numberSpan(key []byte, i int, mask byte) (adjusted int64, digitsStart, digi
 		i++
 	}
 	return 0, 0, 0, 0, ErrKeyTruncated
-}
-
-// ComponentSpan returns the byte span of component k, scanning forward from the
-// start of the key. Comparing the returned span of two keys with bytes.Compare
-// is a valid comparison of that component alone, in that component's own
-// direction, because each component is encoded independently of its neighbours.
-func ComponentSpan(key []byte, k int) (start, end int, err error) {
-	if k < 0 {
-		return 0, 0, ErrComponentIndex
-	}
-	start = 0
-	for i := 0; ; i++ {
-		if start == len(key) {
-			return 0, 0, ErrComponentIndex
-		}
-		end, err = ComponentEnd(key, start)
-		if err != nil {
-			return 0, 0, err
-		}
-		if i == k {
-			return start, end, nil
-		}
-		start = end
-	}
-}
-
-// CountComponents returns the number of components in a well-formed key.
-func CountComponents(key []byte) (int, error) {
-	n, off := 0, 0
-	for off < len(key) {
-		end, err := ComponentEnd(key, off)
-		if err != nil {
-			return 0, err
-		}
-		off, n = end, n+1
-	}
-	return n, nil
 }
 
 // DecodeComponent decodes the component at key[off:], appending its payload to

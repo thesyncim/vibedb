@@ -57,10 +57,6 @@ func TestCompoundPrefixAndDirection(t *testing.T) {
 	if !ok || !bytes.HasPrefix(key, prefix) {
 		t.Fatalf("compound prefix: %x, %x", prefix, key)
 	}
-	end, ok := AppendPrefixEnd(nil, prefix)
-	if !ok || bytes.Compare(prefix, key) > 0 || bytes.Compare(key, end) >= 0 {
-		t.Fatalf("prefix bounds: prefix=%x key=%x end=%x", prefix, key, end)
-	}
 }
 
 func TestRejectsMalformedAndHugeValues(t *testing.T) {
