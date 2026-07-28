@@ -134,10 +134,10 @@ func (c *Collection) recordStructuralLatency(
 // mutation for the tablet. This is the "flush the tablet's pending parents"
 // hook the split path requires; flushing all pending parents is a safe superset.
 func (c *Collection) flushPendingForStructural() error {
-	if c.buffered() {
+	if c.deferredCanonicalLane() {
 		// Full checkpoint (materialize + device flush), for two reasons. First, the
 		// structural transaction rebuilds the tablet from the published graph and
-		// then rebuilds the resident router from it, so every acknowledged buffered
+		// then rebuilds the resident router from it, so every acknowledged canonical
 		// edit must already be a real page or it is lost. Second, and load-bearing
 		// for the retirement accounting: this advances durableState to a clean,
 		// fully-durable baseline *before* the structural transaction retires any of
@@ -146,6 +146,12 @@ func (c *Collection) flushPendingForStructural() error {
 		// pages -- never ones a half-done structural attempt already retired. The
 		// commit itself finishes the job by flushing again afterward so durableState
 		// advances past the structural generation too (see commitPrimaryStructural).
+		//
+		// Both deferred-canonical lanes need this: buffered-visible and the
+		// journal-backed synchronous lane run the committer in manual-checkpoint
+		// mode, so both leave durableState behind a plain inline publish. The sync
+		// lane's per-mutation durability comes from its journal, but the durable
+		// *root* it recovers from still lags until a checkpoint folds it forward.
 		return c.checkpointBufferedLocked()
 	}
 	return nil
@@ -735,20 +741,27 @@ func (c *Collection) commitPrimaryStructural(
 	c.primaryRouter.Store(newRouter)
 	c.recordStructuralLatency(kind, start)
 
-	// A buffered structural transaction is a checkpoint, not a volatile edit.
-	// Ordinary buffered mutations copy-on-write into memory-only virtual extents
-	// and defer every real retirement to the next materialize; a structural
-	// transaction instead allocates and retires REAL durable-graph pages
+	// A deferred-canonical structural transaction is a checkpoint, not a volatile
+	// edit. Ordinary deferred-canonical mutations copy-on-write into memory-only
+	// virtual extents and defer every real retirement to the next materialize; a
+	// structural transaction instead allocates and retires REAL durable-graph pages
 	// (anchors, locator, tablet root, catalog path, and the primary root). If it
-	// only PublishInline'd like a buffered put, durableState — the crash-recovery
+	// only PublishInline'd like an ordinary put, durableState — the crash-recovery
 	// baseline — would stay behind still referencing the pages this transaction
 	// just retired, and the next materialize would load that stale base and retire
-	// its root a second time (the "overlapping retired extent" defect). Flushing
-	// here advances durableState past the structural generation so its retirements
-	// are durably superseded and never re-collected. Structural transactions are
-	// amortized rare (one per full/empty leaf), so this device flush is not on the
-	// steady-state mutation path.
-	if c.buffered() {
+	// its root a second time (the "overlapping retired extent" defect); the
+	// following structural transaction, re-planning against that stale durable
+	// root, would also stage a tablet root the fresh bounds reject ("cacheable
+	// tablet-root identity"). Flushing here advances durableState past the
+	// structural generation so its retirements are durably superseded and never
+	// re-collected. This holds for both deferred-canonical lanes: buffered-visible
+	// and the journal-backed synchronous lane both run the committer in
+	// manual-checkpoint mode and both publish structural pages inline, so both must
+	// force the durable root forward here — the sync lane's journal makes each
+	// mutation durable but does not by itself advance the recovered root. Structural
+	// transactions are amortized rare (one per full/empty leaf), so this device
+	// flush is not on the steady-state mutation path.
+	if c.deferredCanonicalLane() {
 		if flushErr := c.committer.Flush(); flushErr != nil {
 			return flushErr
 		}
