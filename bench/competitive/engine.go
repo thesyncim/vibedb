@@ -147,6 +147,7 @@ func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityM
 	case "vibejson-durable":
 		supported = requested == DurabilityBufferedVisible ||
 			requested == DurabilityAsyncStableInFlight ||
+			requested == DurabilityOrdinarySync ||
 			requested == DurabilityPowerSafe
 	case "bbolt", "badger", "pebble":
 		supported = requested == DurabilityBufferedVisible ||
@@ -178,6 +179,7 @@ func BenchmarkDurabilityModes(engine string) []DurabilityMode {
 		return []DurabilityMode{
 			DurabilityBufferedVisible,
 			DurabilityAsyncStableInFlight,
+			DurabilityOrdinarySync,
 			DurabilityPowerSafe,
 		}
 	case "sqlite":

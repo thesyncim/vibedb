@@ -56,6 +56,8 @@ func (v *vibeDurable) Durability() string {
 		return "DurabilitySync (each generation fenced to stable storage before Put returns or becomes visible)"
 	case DurabilityBufferedVisible:
 		return "DurabilityBufferedVisible + CheckpointFilesystem (ordinary admission stages bounded reader-visible COW pages without waking the device worker; staging pressure may checkpoint early; scheduled checkpoints use ordinary two-phase fsync)"
+	case DurabilityOrdinarySync:
+		return "DurabilityBufferedVisible + CheckpointFilesystem + RecoveryJournal (every Put appends one redo record to the paired journal and syncs it at ordinary filesystem strength before returning; a checkpoint folds the deferred mutations into a durable root and recycles the journal)"
 	default:
 		return "DurabilityAsyncVisible (accepted into a private queue and immediately visible; may be lost before a process-crash kernel write; background worker uses the normal stable-storage fences)"
 	}
@@ -96,6 +98,16 @@ func (v *vibeDurable) options() durable.Options {
 		opts.Durability = durable.DurabilityBufferedVisible
 		opts.Backend = durable.BackendPortable
 		opts.CheckpointStrength = durable.CheckpointFilesystem
+	case DurabilityOrdinarySync:
+		// The recovery journal gives buffered-visible a per-mutation durable
+		// acknowledgement at ordinary filesystem-sync strength: one redo record
+		// appended and synced before Put returns, recycled at each checkpoint.
+		// That is the same guarantee class as bbolt/badger/pebble's sync modes
+		// on this platform, which also stop at the ordinary fsync fence.
+		opts.Durability = durable.DurabilityBufferedVisible
+		opts.Backend = durable.BackendPortable
+		opts.CheckpointStrength = durable.CheckpointFilesystem
+		opts.RecoveryJournal = true
 	case DurabilityAsyncStableInFlight:
 		opts.Durability = durable.DurabilityAsyncVisible
 	}

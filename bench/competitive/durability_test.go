@@ -60,7 +60,6 @@ func TestUnsupportedDurabilityModesFailClosed(t *testing.T) {
 		engine string
 		mode   DurabilityMode
 	}{
-		{engine: "vibejson-durable", mode: DurabilityOrdinarySync},
 		{engine: "pebble", mode: DurabilityAsyncStableInFlight},
 		{engine: "pebble", mode: DurabilityPowerSafe},
 		{engine: "bbolt", mode: DurabilityPowerSafe},
