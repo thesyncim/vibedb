@@ -181,32 +181,43 @@ func zoneFileRunBothWays(t testing.TB, q *Query, snapshot *durable.Snapshot) (Re
 func TestZonePruningFileFuzzDifferential(t *testing.T) {
 	rng := rand.New(rand.NewPCG(0xF11E, 0x2ABC))
 	pruningRuns, executions := 0, 0
+	// Each iteration builds its own durable collection, and on the io_uring
+	// backend every open collection pins a fixed-buffer ring. Sixty of them
+	// held open at once — which is what a flat loop does, because build()
+	// defers Close through t.Cleanup to the end of the *test* — exhausts the
+	// ring/locked-memory budget on Linux (io_uring_setup: ENOMEM) before a
+	// single differential is ever compared. Scoping each iteration to a
+	// subtest runs that iteration's cleanups the moment it returns, so at most
+	// one collection is open at a time and the comparison is what runs, not the
+	// allocator.
 	for iteration := 0; iteration < 60; iteration++ {
-		count := 1 + rng.IntN(20)
-		docs := make([][]byte, count)
-		narrow := rng.IntN(2) == 0
-		base := rng.IntN(len(zoneAdversarialDocs))
-		for i := range docs {
-			if narrow {
-				docs[i] = []byte(zoneAdversarialDocs[(base+rng.IntN(3))%len(zoneAdversarialDocs)])
-			} else {
-				docs[i] = []byte(zoneAdversarialDocs[rng.IntN(len(zoneAdversarialDocs))])
+		t.Run(fmt.Sprintf("iteration-%02d", iteration), func(t *testing.T) {
+			count := 1 + rng.IntN(20)
+			docs := make([][]byte, count)
+			narrow := rng.IntN(2) == 0
+			base := rng.IntN(len(zoneAdversarialDocs))
+			for i := range docs {
+				if narrow {
+					docs[i] = []byte(zoneAdversarialDocs[(base+rng.IntN(3))%len(zoneAdversarialDocs)])
+				} else {
+					docs[i] = []byte(zoneAdversarialDocs[rng.IntN(len(zoneAdversarialDocs))])
+				}
 			}
-		}
-		chunkDocuments := []int{1, 2, 3, 8, 64}[rng.IntN(5)]
-		constructor := zoneFileConstructors[rng.IntN(len(zoneFileConstructors))]
-		snapshot := constructor.build(t, chunkDocuments, docs)
+			chunkDocuments := []int{1, 2, 3, 8, 64}[rng.IntN(5)]
+			constructor := zoneFileConstructors[rng.IntN(len(zoneFileConstructors))]
+			snapshot := constructor.build(t, chunkDocuments, docs)
 
-		for probe := 0; probe < 8; probe++ {
-			q := Select(Path("v"), Path("w")).Where(zoneFuzzPredicates(rng))
-			if rng.IntN(3) == 0 {
-				q = Select(Count(), Sum("v"), Min("v"), Max("v")).Where(zoneFuzzPredicates(rng))
+			for probe := 0; probe < 8; probe++ {
+				q := Select(Path("v"), Path("w")).Where(zoneFuzzPredicates(rng))
+				if rng.IntN(3) == 0 {
+					q = Select(Count(), Sum("v"), Min("v"), Max("v")).Where(zoneFuzzPredicates(rng))
+				}
+				executions++
+				if _, skipped := zoneFileRunBothWays(t, q, snapshot); skipped > 0 {
+					pruningRuns++
+				}
 			}
-			executions++
-			if _, skipped := zoneFileRunBothWays(t, q, snapshot); skipped > 0 {
-				pruningRuns++
-			}
-		}
+		})
 	}
 	if pruningRuns == 0 {
 		t.Fatal("no execution pruned a chunk: the durable fuzz differential is vacuous")
@@ -225,16 +236,20 @@ func TestZonePruningFileBatteryDifferential(t *testing.T) {
 		docs = append(docs, []byte(doc))
 	}
 	pruningRuns := 0
+	// One subtest per (constructor, chunk size) so each durable collection's
+	// io_uring ring is closed before the next is built. Held open together they
+	// overrun the Linux ring/locked-memory budget (io_uring_setup: ENOMEM); see
+	// the note in TestZonePruningFileFuzzDifferential.
 	for _, constructor := range zoneFileConstructors {
 		for _, chunkDocuments := range []int{1, 4, 64} {
-			snapshot := constructor.build(t, chunkDocuments, docs)
-			for qi, q := range battery {
-				_, skipped := zoneFileRunBothWays(t, q, snapshot)
-				if skipped > 0 {
-					pruningRuns++
+			t.Run(fmt.Sprintf("%s/chunk-%d", constructor.name, chunkDocuments), func(t *testing.T) {
+				snapshot := constructor.build(t, chunkDocuments, docs)
+				for _, q := range battery {
+					if _, skipped := zoneFileRunBothWays(t, q, snapshot); skipped > 0 {
+						pruningRuns++
+					}
 				}
-				_ = qi
-			}
+			})
 		}
 	}
 	if pruningRuns == 0 {
