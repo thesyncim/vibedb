@@ -33,12 +33,6 @@ var (
 	// ErrDocumentTooLarge reports a JSON value beyond the configured
 	// transaction bound.
 	ErrDocumentTooLarge = errors.New("vibejson: collection document exceeds configured bound")
-	// ErrPrimaryReadOnly reports a mutation surface not yet wired to the
-	// ordered-primary graph, such as WriteBatch. Point Put/Delete use the
-	// primary COW path.
-	ErrPrimaryReadOnly = errors.New(
-		"vibejson: ordered primary graph is read-only during cutover",
-	)
 	// ErrPrimaryLeafSplitRequired reports a correct deferred structural insert.
 	// The mutation was not published; the next ordered-primary phase replaces
 	// this signal with an atomic leaf split.
@@ -1268,6 +1262,23 @@ type Collection struct {
 	batchTreeCerts      []byte
 	batchCertArena      []byte
 	batchRetired        []storeio.PageRef
+
+	// Ordered-primary batch scratch. One Update over the primary graph resolves
+	// every mutation, rewrites one frame per touched leaf, and publishes them all
+	// under one generation; these are reset per Update and reused so a batch's
+	// steady-state cost is the frames it publishes, not the slices it plans with.
+	// batchPrimaryLeafArena holds the finalized image of every touched leaf at
+	// once (they must coexist until the single admit-all step), and
+	// batchPrimaryLeafImage is the rolling accumulator for one leaf whose several
+	// mutations fold onto the same frame.
+	batchPrimaryLeaves       []primaryBatchLeaf
+	batchPrimaryMutations    []primaryBatchMutation
+	batchJournalEntries      []storeio.RecoveryBatchEntry
+	batchPrimaryAdmitted     []storeio.PageRef
+	batchPrimaryPrevVolatile []storeio.PageRef
+	batchPrimaryLeafArena    []byte
+	batchPrimaryLeafImage    []byte
+	batchPrimaryFileEnd      uint64
 }
 
 // Stats is a point-in-time resource and I/O accounting snapshot.
@@ -1391,8 +1402,8 @@ type Stats struct {
 	// de-template splices for mutation; PrimaryTemplateReplanEvents counts full
 	// template dictionary re-dedup encodes. These are process-global storeio
 	// counters, reset by ResetTemplateColumnarDiag.
-	MergeReclassEvaluations         uint64
-	MergeReclassWarranted           uint64
+	MergeReclassEvaluations uint64
+	MergeReclassWarranted   uint64
 	// MergeReclassCommits, MergeReclassAborts, and MergeReclassSkips decompose the
 	// merge-floor engagement. Commits published a structural transaction; aborts
 	// were warranted but found nothing viable (a checkpoint-free abort recorded

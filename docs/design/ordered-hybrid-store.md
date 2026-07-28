@@ -303,6 +303,55 @@ measured) plus one bounded in-frame edit, with parent amplification amortized
 across the checkpoint window. A snapshot or sealed checkpoint that can observe
 the frame forces the ordinary COW path.
 
+### Multi-document batches (`Update`)
+
+`Update` publishes an arbitrary set of puts and deletes as one failure-atomic
+generation, the primary-graph transactional surface the Go-native/database/sql
+direction needs. It reuses the single-mutation canonical-frame primitives per
+document — the same `preparePrimaryLeafMutation` and dirty-frame admission —
+rather than a second mutation engine, so posting maintenance and leaf geometry
+compose into it unchanged. The commit runs in three strict phases:
+
+- **Prepare (fallible).** Every document is routed and its target leaf frame is
+  rewritten. Documents that land on the same leaf fold onto ONE after-image, so
+  a batch touches a crowded leaf once, not once per document — the same
+  write-amplification win the chunk batch has. Folds chain through strictly
+  increasing generations because each leaf codec rejects a non-advancing
+  rewrite; the frames therefore carry a small spread of generations and the
+  batch publishes the state at the highest, which is fine because a leaf frame
+  lagging the state generation is the resting shape of the graph. A member that
+  needs a leaf split commits that split as its OWN structural transaction and
+  the batch re-plans: **structure is not content**, so splitting mid-batch
+  moves keys between leaves without changing any value, and a crash sees the
+  split (a pure re-shaping) or not while the batch's content still recovers
+  whole or not at all on its own record.
+- **Durability (one sync).** One batch journal record covers every document
+  with one append and one sync at the lane's strength (see
+  [recovery-journal.md](recovery-journal.md)). The sync lane appends at the
+  batch's point of no return, before any leaf pointer is published; buffered
+  publishes then appends; buffered without a journal defers to the next
+  checkpoint. Readers see all of the batch or none of it because the leaf
+  pointers all flip under one `snapshotGate`-guarded publication.
+- **Publish (infallible).** Every fallible check already passed, so publication
+  only flips router leaf handles and the state root; it cannot fail for any
+  reason prepare could have detected. Any prepare error — a malformed document,
+  a callback error, an exceeded bound — rejects the whole batch with nothing
+  visible and nothing journaled (an ordinary rejection, no poison); only a
+  journal sync failure poisons, per the standing rules.
+
+Reservation is bounded by `Options.MaxBatchDocuments`: the batch reserves one
+pending-parent slot, one dirty leaf frame, and one deferred volatile-reference
+slot per distinct touched leaf, checkpointing to make room before it prepares
+anything. A batch that would touch more distinct leaves than one generation can
+hold pending is refused whole with `ErrBatchTooLarge` rather than split across
+generations. The single-document path's reservation is unchanged. An active
+snapshot forces the same copy-on-write canonical path a single mutation uses:
+superseded frames are retained and their reclaim deferred until the lease
+closes, so the batch is isolated from the snapshot exactly as a point mutation
+is. Only the three deferred-canonical lanes carry `Update` on the primary
+graph; an async-visible primary batch reports `ErrPrimaryBatchUnsupportedLane`,
+and the chunk layout keeps its own committer-generation batch path untouched.
+
 The collection-local resident router records the newest state generation its
 mutable leaf handles reflect. A snapshot selecting an older generation falls
 back to the rooted catalog/tablet/anchor page walk, so a current-generation

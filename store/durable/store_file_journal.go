@@ -221,11 +221,10 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
 	applied := 0
-	err := c.journal.Replay(rootGeneration, func(rec storeio.RecoveryRecord) error {
-		key := string(rec.Key)
-		switch rec.Kind {
+	apply := func(kind uint16, key string, value []byte) error {
+		switch kind {
 		case storeio.RecoveryRecordKindPut:
-			_, putErr := c.Put(key, rec.Value)
+			_, putErr := c.Put(key, value)
 			if putErr == nil {
 				applied++
 			}
@@ -238,8 +237,23 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 			return delErr
 		default:
 			return fmt.Errorf("%w: unknown replay kind %d",
-				storeio.ErrRecoveryJournalRecord, rec.Kind)
+				storeio.ErrRecoveryJournalRecord, kind)
 		}
+	}
+	err := c.journal.Replay(rootGeneration, func(rec storeio.RecoveryRecord) error {
+		if rec.Kind == storeio.RecoveryRecordKindBatch {
+			// A batch record replays as its entries applied in order through the
+			// ordinary mutation path. The record is present in whole (its single CRC
+			// validated) or not at all, so this loop never sees a partial batch.
+			for i := range rec.Entries {
+				entry := rec.Entries[i]
+				if err := apply(entry.Kind, string(entry.Key), entry.Value); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return apply(rec.Kind, string(rec.Key), rec.Value)
 	})
 	if err != nil {
 		return err
@@ -364,6 +378,87 @@ func (c *Collection) journalBeforePublishLocked(
 		recoveryJournalPostSyncHook()
 	}
 	c.journalAcks.Add(1)
+	return nil
+}
+
+// journalBatchBeforePublishLocked is the sync lane's batch acknowledgement: it
+// appends the batch's single redo record and syncs it at the batch's point of no
+// return — after every document's fallible prepare and every leaf frame's dirty
+// admission, and before any leaf pointer is published — so no reader observes any
+// member of the batch before the whole group is durable. Journal capacity is
+// ensured for the whole record before prepare (ensurePrimaryBatchJournalRoom), so
+// the append cannot report full here; an append or sync error is a device failure
+// and poisons die-don't-retry with nothing published. It is a no-op for
+// buffered-visible (which journals its batch after publishing) and during replay.
+func (c *Collection) journalBatchBeforePublishLocked(
+	generation uint64, entries []storeio.RecoveryBatchEntry,
+) error {
+	if !c.syncJournalLane() || c.journalReplaying {
+		return nil
+	}
+	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
+		return c.poisonJournalLocked(err)
+	}
+	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
+		return c.poisonJournalLocked(err)
+	}
+	if recoveryJournalPostSyncHook != nil {
+		recoveryJournalPostSyncHook()
+	}
+	c.journalAcks.Add(1)
+	return nil
+}
+
+// journalBatchAckLocked is the buffered-visible lane's batch acknowledgement: it
+// makes an already-published batch durable with one append plus one sync, the
+// group-commit analogue of journalAckLocked. Capacity is ensured before prepare,
+// but the full-journal fallback is kept for the same reason the single-record
+// path keeps it — a checkpoint folds the just-published batch into a durable root
+// and recycles, after which the batch is durable without its own record. The
+// caller holds the writer and has already published the batch's state.
+func (c *Collection) journalBatchAckLocked(
+	generation uint64, entries []storeio.RecoveryBatchEntry,
+) error {
+	if !c.journalEnabled() || c.journalReplaying {
+		return nil
+	}
+	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
+		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
+			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
+				return cpErr
+			}
+			c.automaticCheckpoints.Add(1)
+			c.chainAcks.Add(1)
+			return nil
+		}
+		return c.poisonJournalLocked(err)
+	}
+	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
+		return c.poisonJournalLocked(err)
+	}
+	c.journalAcks.Add(1)
+	return nil
+}
+
+// ensurePrimaryBatchJournalRoom guarantees the whole batch record fits the
+// preallocated journal before the batch prepares any frame, folding and recycling
+// a full journal now — exactly as the single-document sync lane folds a full
+// journal in ensureBufferedPrimaryMutationCapacity — so neither the sync lane's
+// point-of-no-return append nor the buffered lane's post-publish append can meet
+// a full journal mid-commit. It is a no-op when no journal is configured.
+func (c *Collection) ensurePrimaryBatchJournalRoom(
+	entries []storeio.RecoveryBatchEntry,
+) error {
+	if !c.journalEnabled() || c.journalReplaying {
+		return nil
+	}
+	if c.journal.FitsBatch(entries) {
+		return nil
+	}
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return err
+	}
+	c.automaticCheckpoints.Add(1)
 	return nil
 }
 

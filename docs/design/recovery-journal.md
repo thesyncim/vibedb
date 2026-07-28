@@ -96,6 +96,44 @@ one is the ordinary empty state:
   existing sticky-failure poisoning covers the journal path with
   die-don't-retry semantics, never a retry loop.
 
+## Batch records — the group-commit primitive
+
+A multi-document `Update` on the primary graph makes its whole group
+durable with ONE append and ONE sync, not one per document. The record
+format carries this directly rather than framing it as first/continuation/
+commit records across separate appends:
+
+- A batch record reuses the 32-byte record prefix with `kind = Batch` and
+  repurposes the two length words as `entryCount` and `bodyLen`. The body
+  is a run of `entryCount` entries, each a 12-byte header (entry kind,
+  reserved, keyLen, valueLen) followed by the key and value bytes. One CRC
+  (and its complement) covers the prefix and the entire body; the record is
+  padded to the sector granule exactly like a single record.
+- **One CRC over the whole record is the atomicity mechanism.** A batch is
+  a single sector-aligned append, so a torn or dropped append damages only
+  this record's own tail; the CRC then fails and recovery truncates BEFORE
+  it. Replay therefore replays either every entry of the group or none —
+  there is no framing state in which half a batch survives. This is why the
+  single-record-per-CRC choice beats a first/continuation/commit framing: a
+  commit marker would need its own ordering argument against a torn tail,
+  and the single self-contained record needs none.
+- The record consumes ONE monotonic sequence number and carries ONE
+  generation. Replay applies its entries in order through the ordinary
+  Put/Delete path (an absent-key delete replays as a harmless no-op), the
+  same reconstruction single records use, so a batch and the point mutations
+  it is equivalent to recover identically.
+- Ordering across the lanes is the single-record ordering applied to the
+  group: the sync lane appends+syncs the batch record at the batch's point
+  of no return, before any leaf pointer is published; buffered-visible
+  publishes the batch and then appends+syncs it. Journal capacity for the
+  whole record is reserved before the batch prepares a frame, so the sync
+  lane's fence append cannot meet a full journal; a full journal folds into
+  a checkpoint and recycles exactly as the single-record path does.
+- This is the group-commit primitive the parallel-writer phase builds on: a
+  future group of INDEPENDENT acknowledgements sharing one sync is the same
+  record with unrelated entries. The multi-document batch is its first
+  caller, not a special case of it.
+
 ## What this deliberately is not
 
 Not a WAL the engine reads, not a second reader-visible representation,

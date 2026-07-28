@@ -381,10 +381,22 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 	if deleted, err := primary.Delete(keys[0]); err != nil || !deleted {
 		t.Fatalf("primary Delete = %v,%v, want true,nil", deleted, err)
 	}
+	// A multi-document Update is now first-class on the ordered primary graph: it
+	// publishes every mutation under one generation, all-or-nothing.
 	if err := primary.Update(func(batch *WriteBatch) error {
-		return batch.Put("new", []byte(`{"v":1}`))
-	}); !errors.Is(err, ErrPrimaryReadOnly) {
-		t.Fatalf("primary Update = %v, want %v", err, ErrPrimaryReadOnly)
+		if err := batch.Put("batched", []byte(`{"v":2}`)); err != nil {
+			return err
+		}
+		return batch.Delete(keys[1])
+	}); err != nil {
+		t.Fatalf("primary Update = %v, want nil", err)
+	}
+	if value, ok, err := primary.AppendRaw(nil, "batched"); err != nil || !ok ||
+		string(value) != `{"v":2}` {
+		t.Fatalf("primary batched Put = %q,%v,%v, want {\"v\":2},true,nil", value, ok, err)
+	}
+	if value, ok, err := primary.AppendRaw(nil, keys[1]); err != nil || ok || len(value) != 0 {
+		t.Fatalf("primary batched Delete keys[1] = %q,%v,%v, want absent", value, ok, err)
 	}
 }
 

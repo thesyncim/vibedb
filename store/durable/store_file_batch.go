@@ -161,13 +161,20 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 	entry.valueLength = len(src)
 }
 
-// Update applies every mutation fn records as one failure-atomic generation:
-// one document-page rebuild per touched chunk, one batched descent per
-// directory, one publication root, and one durability fence.
+// Update applies every mutation fn records as one failure-atomic generation.
 //
-// The batch either publishes whole or publishes nothing. An error returned by
-// fn, or by any mutation the batch stages, aborts the transaction and leaves
-// the collection exactly as it was.
+// The batch either publishes whole or publishes nothing: an error returned by
+// fn, or by any mutation the batch stages, aborts the transaction and leaves the
+// collection exactly as it was. A prepare-time rejection — a malformed document,
+// an exceeded bound — is ordinary and never poisons; only a durability fence
+// failure does.
+//
+// On the chunk layout the commit is one document-page rebuild per touched chunk,
+// one batched descent per directory, one publication root, and one durability
+// fence. On the ordered-primary graph it is one rewritten leaf frame per touched
+// leaf, one batch journal record synced once, and every leaf pointer flipped
+// under one generation (see updatePrimaryBatch); the primary batch is carried
+// only by the buffered-visible and sync-journal lanes.
 func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 	if c == nil {
 		return ErrClosed
@@ -176,7 +183,7 @@ func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 		return errors.New("vibejson: collection Update requires a function")
 	}
 	if c.primaryGraphReadOnly() {
-		return ErrPrimaryReadOnly
+		return c.updatePrimaryBatch(fn)
 	}
 	c.writer.Lock()
 	var generation uint64

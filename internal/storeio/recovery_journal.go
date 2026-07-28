@@ -45,6 +45,15 @@ import (
 // through the ordinary mutation path, stopping at the first framing-invalid
 // record. A torn or reordered tail therefore truncates and never corrupts: the
 // root and its graph were never touched before their own two-phase publication.
+//
+// A batch record (recoveryRecordKindBatch) is the group-commit form of the same
+// protocol: one sequence, one generation, and an ordered list of put/delete
+// entries, all under a single CRC and made durable by one append plus one sync.
+// Because the whole record is framed by that one CRC, a torn append fails
+// validation and replay truncates before it, so recovery replays either every
+// entry of the group or none — the atomicity a multi-document Update needs, and
+// the primitive a future group of independent acknowledgements sharing one sync
+// builds on.
 const (
 	// RecoveryJournalHeaderSize is one full damage-granule-aligned header
 	// sector. The header is rewritten only on create and on recycle, never per
@@ -76,17 +85,30 @@ const (
 
 	// RecordKindPut marks a same-size inline value replacement.
 	recoveryRecordKindPut = uint16(1)
-	// recoveryRecordKindDelete is reserved: deletes are ref-changing and take
-	// the full-chain path today, but the record schema carries the kind so the
-	// format need not change when a delete fast path lands.
+	// recoveryRecordKindDelete marks a key removal.
 	recoveryRecordKindDelete = uint16(2)
+	// recoveryRecordKindBatch marks a group-commit record: a single sequence and
+	// generation covering an ordered list of put/delete entries, framed by one
+	// CRC. It is the group-commit primitive — the whole record is durable after
+	// one sync, and a torn append fails framing so recovery replays either every
+	// entry or none. A multi-document Update rides it; a future group of
+	// independent acknowledgements sharing one sync is the same record with
+	// unrelated entries.
+	recoveryRecordKindBatch = uint16(3)
 
-	// RecoveryRecordKindPut and RecoveryRecordKindDelete are the exported record
-	// kinds a store passes to Append and matches on during Replay. The internal
-	// values stay unexported so the encoder validates them, but a caller in
-	// another package needs a name for the redo verb it is journaling.
+	// RecoveryRecordKindPut, RecoveryRecordKindDelete, and RecoveryRecordKindBatch
+	// are the exported record kinds a store passes to Append/AppendBatch and
+	// matches on during Replay. The internal values stay unexported so the encoder
+	// validates them, but a caller in another package needs a name for the redo
+	// verb it is journaling.
 	RecoveryRecordKindPut    = recoveryRecordKindPut
 	RecoveryRecordKindDelete = recoveryRecordKindDelete
+	RecoveryRecordKindBatch  = recoveryRecordKindBatch
+
+	// RecoveryBatchEntryHeaderSize is the fixed per-entry framing inside a batch
+	// record that precedes the entry's variable key and value bytes:
+	// kind (2) + reserved (2) + keyLen (4) + valueLen (4).
+	RecoveryBatchEntryHeaderSize = 12
 )
 
 // RecoveryRecordPaddedSize returns the on-disk byte cost of one record whose key
@@ -142,12 +164,25 @@ type RecoveryJournalHeader struct {
 
 // RecoveryRecord is one decoded redo record. Key and Value borrow the decode
 // buffer and must be copied if retained past the next decode.
+//
+// For a batch record (Kind == RecoveryRecordKindBatch) the logical mutations are
+// carried in Entries instead of Key/Value; Sequence and Generation are the
+// group's single sequence and generation.
 type RecoveryRecord struct {
 	Sequence   uint64
 	Generation uint64
 	Kind       uint16
 	Key        []byte
 	Value      []byte
+	Entries    []RecoveryBatchEntry
+}
+
+// RecoveryBatchEntry is one put or delete inside a batch record. Key and Value
+// borrow the decode buffer, exactly like RecoveryRecord's own fields.
+type RecoveryBatchEntry struct {
+	Kind  uint16
+	Key   []byte
+	Value []byte
 }
 
 // recoveryRecordPadded returns the sector-padded on-disk size of a record whose
@@ -155,8 +190,33 @@ type RecoveryRecord struct {
 func recoveryRecordPadded(sectorSize uint32, keyLen, valueLen int) int {
 	raw := RecoveryJournalRecordPrefixSize + keyLen + valueLen +
 		RecoveryJournalRecordTrailerSize
+	return recoveryPadRaw(sectorSize, raw)
+}
+
+// recoveryPadRaw rounds a raw record byte count up to the sector granule.
+func recoveryPadRaw(sectorSize uint32, raw int) int {
 	sector := int(sectorSize)
 	return (raw + sector - 1) / sector * sector
+}
+
+// recoveryBatchBodyLen sums the framed length of every entry in a batch record
+// (each entry's fixed header plus its key and value bytes).
+func recoveryBatchBodyLen(entries []RecoveryBatchEntry) int {
+	body := 0
+	for i := range entries {
+		body += RecoveryBatchEntryHeaderSize +
+			len(entries[i].Key) + len(entries[i].Value)
+	}
+	return body
+}
+
+// RecoveryBatchRecordPaddedSize returns the on-disk byte cost of one batch
+// record carrying entries, padded to the sector granule. A store sizes a batch's
+// journal reservation from this so one Update maps to one bounded append.
+func RecoveryBatchRecordPaddedSize(sectorSize uint32, entries []RecoveryBatchEntry) int {
+	raw := RecoveryJournalRecordPrefixSize + recoveryBatchBodyLen(entries) +
+		RecoveryJournalRecordTrailerSize
+	return recoveryPadRaw(sectorSize, raw)
 }
 
 // validateRecoveryJournalHeader enforces the geometry invariants every header
@@ -287,6 +347,64 @@ func EncodeRecoveryRecord(
 	return padded, nil
 }
 
+// EncodeRecoveryBatchRecord writes one sector-padded batch record into dst and
+// returns the exact padded length. The record carries one sequence and
+// generation over rec.Entries; a single CRC (and its complement) covers the
+// prefix and every framed entry, so a torn append fails validation and recovery
+// replays either all entries or none. dst must be at least the padded length.
+func EncodeRecoveryBatchRecord(
+	dst []byte, sectorSize uint32, rec RecoveryRecord,
+) (int, error) {
+	if rec.Sequence == 0 || rec.Generation == 0 {
+		return 0, fmt.Errorf("%w: zero sequence or generation", ErrInvalidWrite)
+	}
+	if len(rec.Entries) == 0 || len(rec.Entries) > int(^uint32(0)) {
+		return 0, fmt.Errorf("%w: batch entry count", ErrInvalidWrite)
+	}
+	body := recoveryBatchBodyLen(rec.Entries)
+	if body > int(^uint32(0)) {
+		return 0, fmt.Errorf("%w: batch body length", ErrInvalidWrite)
+	}
+	padded := recoveryPadRaw(sectorSize,
+		RecoveryJournalRecordPrefixSize+body+RecoveryJournalRecordTrailerSize)
+	if len(dst) < padded {
+		return 0, fmt.Errorf("%w: batch record buffer has %d bytes, need %d",
+			ErrInvalidWrite, len(dst), padded)
+	}
+	buf := dst[:padded]
+	clear(buf)
+	binary.LittleEndian.PutUint32(buf[0:4], recoveryRecordMagic)
+	binary.LittleEndian.PutUint16(buf[4:6], recoveryRecordKindBatch)
+	// buf[6:8] reserved zero.
+	binary.LittleEndian.PutUint64(buf[8:16], rec.Sequence)
+	binary.LittleEndian.PutUint64(buf[16:24], rec.Generation)
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(rec.Entries)))
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(body))
+	cursor := RecoveryJournalRecordPrefixSize
+	for i := range rec.Entries {
+		entry := rec.Entries[i]
+		if entry.Kind != recoveryRecordKindPut &&
+			entry.Kind != recoveryRecordKindDelete {
+			return 0, fmt.Errorf("%w: batch entry kind", ErrInvalidWrite)
+		}
+		if len(entry.Key) == 0 || len(entry.Key) > int(^uint32(0)) ||
+			len(entry.Value) > int(^uint32(0)) {
+			return 0, fmt.Errorf("%w: batch entry key or value length", ErrInvalidWrite)
+		}
+		binary.LittleEndian.PutUint16(buf[cursor:cursor+2], entry.Kind)
+		// buf[cursor+2:cursor+4] reserved zero.
+		binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], uint32(len(entry.Key)))
+		binary.LittleEndian.PutUint32(buf[cursor+8:cursor+12], uint32(len(entry.Value)))
+		cursor += RecoveryBatchEntryHeaderSize
+		cursor += copy(buf[cursor:], entry.Key)
+		cursor += copy(buf[cursor:], entry.Value)
+	}
+	checksum := PageChecksum(buf[:cursor])
+	binary.LittleEndian.PutUint32(buf[cursor:cursor+4], checksum)
+	binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], ^checksum)
+	return padded, nil
+}
+
 // DecodeRecoveryRecord validates one record at the start of src against the
 // expected sequence and returns the borrowed record and its padded size. A
 // record whose magic, framing, checksum, or sequence is wrong returns
@@ -302,9 +420,14 @@ func DecodeRecoveryRecord(
 		return RecoveryRecord{}, 0, fmt.Errorf("%w: magic", ErrRecoveryJournalRecord)
 	}
 	kind := binary.LittleEndian.Uint16(src[4:6])
-	if binary.LittleEndian.Uint16(src[6:8]) != 0 ||
-		(kind != recoveryRecordKindPut && kind != recoveryRecordKindDelete) {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: kind or reserved", ErrRecoveryJournalRecord)
+	if binary.LittleEndian.Uint16(src[6:8]) != 0 {
+		return RecoveryRecord{}, 0, fmt.Errorf("%w: reserved", ErrRecoveryJournalRecord)
+	}
+	if kind == recoveryRecordKindBatch {
+		return decodeRecoveryBatchRecord(src, sectorSize, expectedSequence)
+	}
+	if kind != recoveryRecordKindPut && kind != recoveryRecordKindDelete {
+		return RecoveryRecord{}, 0, fmt.Errorf("%w: kind", ErrRecoveryJournalRecord)
 	}
 	sequence := binary.LittleEndian.Uint64(src[8:16])
 	generation := binary.LittleEndian.Uint64(src[16:24])
@@ -330,6 +453,74 @@ func DecodeRecoveryRecord(
 		Kind:       kind,
 		Key:        src[RecoveryJournalRecordPrefixSize : RecoveryJournalRecordPrefixSize+keyLen],
 		Value:      src[RecoveryJournalRecordPrefixSize+keyLen : bodyEnd],
+	}
+	return rec, padded, nil
+}
+
+// decodeRecoveryBatchRecord validates one batch record at the start of src. The
+// single CRC over the prefix and every framed entry is what gives the batch its
+// all-or-nothing recovery: a torn append damages the record's own tail, the CRC
+// fails, and replay truncates before it — so no entry of a half-appended batch
+// is ever replayed, and every entry of a fully-synced one is.
+func decodeRecoveryBatchRecord(
+	src []byte, sectorSize uint32, expectedSequence uint64,
+) (RecoveryRecord, int, error) {
+	sequence := binary.LittleEndian.Uint64(src[8:16])
+	generation := binary.LittleEndian.Uint64(src[16:24])
+	entryCount := binary.LittleEndian.Uint32(src[24:28])
+	bodyLen := binary.LittleEndian.Uint32(src[28:32])
+	if sequence != expectedSequence || generation == 0 || entryCount == 0 {
+		return RecoveryRecord{}, 0, fmt.Errorf("%w: sequence or framing", ErrRecoveryJournalRecord)
+	}
+	bodyEnd := uint64(RecoveryJournalRecordPrefixSize) + uint64(bodyLen)
+	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
+		return RecoveryRecord{}, 0, fmt.Errorf("%w: length overruns region", ErrRecoveryJournalRecord)
+	}
+	checksum := PageChecksum(src[:bodyEnd])
+	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
+	if stored != checksum ||
+		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
+		return RecoveryRecord{}, 0, fmt.Errorf("%w: checksum", ErrRecoveryJournalRecord)
+	}
+	entries := make([]RecoveryBatchEntry, 0, entryCount)
+	cursor := uint64(RecoveryJournalRecordPrefixSize)
+	for i := uint32(0); i < entryCount; i++ {
+		if cursor+RecoveryBatchEntryHeaderSize > bodyEnd {
+			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry header overruns", ErrRecoveryJournalRecord)
+		}
+		entryKind := binary.LittleEndian.Uint16(src[cursor : cursor+2])
+		if binary.LittleEndian.Uint16(src[cursor+2:cursor+4]) != 0 ||
+			(entryKind != recoveryRecordKindPut && entryKind != recoveryRecordKindDelete) {
+			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry kind or reserved", ErrRecoveryJournalRecord)
+		}
+		keyLen := uint64(binary.LittleEndian.Uint32(src[cursor+4 : cursor+8]))
+		valueLen := uint64(binary.LittleEndian.Uint32(src[cursor+8 : cursor+12]))
+		if keyLen == 0 {
+			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry key length", ErrRecoveryJournalRecord)
+		}
+		keyStart := cursor + RecoveryBatchEntryHeaderSize
+		valueStart := keyStart + keyLen
+		entryEnd := valueStart + valueLen
+		if entryEnd > bodyEnd {
+			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry overruns body", ErrRecoveryJournalRecord)
+		}
+		entries = append(entries, RecoveryBatchEntry{
+			Kind:  entryKind,
+			Key:   src[keyStart:valueStart],
+			Value: src[valueStart:entryEnd],
+		})
+		cursor = entryEnd
+	}
+	if cursor != bodyEnd {
+		return RecoveryRecord{}, 0, fmt.Errorf("%w: batch body length mismatch", ErrRecoveryJournalRecord)
+	}
+	padded := recoveryPadRaw(sectorSize,
+		RecoveryJournalRecordPrefixSize+int(bodyLen)+RecoveryJournalRecordTrailerSize)
+	rec := RecoveryRecord{
+		Sequence:   sequence,
+		Generation: generation,
+		Kind:       recoveryRecordKindBatch,
+		Entries:    entries,
 	}
 	return rec, padded, nil
 }
@@ -531,6 +722,48 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 func (rj *RecoveryJournal) Fits(keyLen, valueLen int) bool {
 	padded := recoveryRecordPadded(rj.header.SectorSize, keyLen, valueLen)
 	return rj.cursor+uint64(padded) <= rj.header.Capacity
+}
+
+// FitsBatch reports whether one batch record carrying entries would fit in the
+// remaining preallocated capacity without a recycle.
+func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
+	padded := RecoveryBatchRecordPaddedSize(rj.header.SectorSize, entries)
+	return rj.cursor+uint64(padded) <= rj.header.Capacity
+}
+
+// AppendBatch writes one batch record carrying entries at the cursor and
+// advances it, consuming a single sequence number. Like Append it never extends
+// the file — a record that would overrun capacity returns ErrRecoveryJournalFull
+// so the caller forces a checkpoint — and it does not sync: the caller issues the
+// lane's single sync once after the append, which is the whole point of a batch
+// record. The group is durable, atomically, after that one sync.
+func (rj *RecoveryJournal) AppendBatch(
+	generation uint64, entries []RecoveryBatchEntry,
+) (uint64, error) {
+	padded := RecoveryBatchRecordPaddedSize(rj.header.SectorSize, entries)
+	if rj.cursor+uint64(padded) > rj.header.Capacity {
+		return 0, ErrRecoveryJournalFull
+	}
+	if cap(rj.scratch) < padded {
+		rj.scratch = make([]byte, padded)
+	}
+	rec := RecoveryRecord{
+		Sequence:   rj.nextSequence,
+		Generation: generation,
+		Kind:       recoveryRecordKindBatch,
+		Entries:    entries,
+	}
+	if _, err := EncodeRecoveryBatchRecord(rj.scratch[:padded], rj.header.SectorSize, rec); err != nil {
+		return 0, err
+	}
+	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
+	if _, err := rj.writeAt(rj.scratch[:padded], offset); err != nil {
+		return 0, err
+	}
+	rj.cursor += uint64(padded)
+	sequence := rj.nextSequence
+	rj.nextSequence++
+	return sequence, nil
 }
 
 // Sync issues the lane's sync on the journal file alone. powerSafe selects the
