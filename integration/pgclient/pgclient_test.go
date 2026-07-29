@@ -344,25 +344,39 @@ type catalogServer struct {
 
 func serveCatalog(t *testing.T, database *vibedriver.Database) (*catalogServer, string) {
 	t.Helper()
+	return serveCatalogAt(t, database, "127.0.0.1:0", nil)
+}
+
+func serveCatalogAt(
+	t *testing.T,
+	database *vibedriver.Database,
+	address string,
+	configure func(*pgwire.Options),
+) (*catalogServer, string) {
+	t.Helper()
 	verifier, err := pgwire.NewVerifier(testPassword)
 	if err != nil {
 		t.Fatalf("derive SCRAM verifier: %v", err)
 	}
+	options := pgwire.Options{
+		Auth: pgwire.SCRAM(func(user string) (pgwire.Verifier, bool) {
+			return verifier, user == testUser
+		}),
+		Database: testDatabase,
+	}
+	if configure != nil {
+		configure(&options)
+	}
 	server, err := pgwire.NewServer(
 		pgwire.FromSQLDatabase(database),
-		pgwire.Options{
-			Auth: pgwire.SCRAM(func(user string) (pgwire.Verifier, bool) {
-				return verifier, user == testUser
-			}),
-			Database: testDatabase,
-		},
+		options,
 	)
 	if err != nil {
 		t.Fatalf("create pgwire server: %v", err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		t.Fatalf("listen on loopback: %v", err)
+		t.Fatalf("listen on %s: %v", address, err)
 	}
 	h := &catalogServer{
 		t: t, server: server, listener: listener, served: make(chan error, 1),

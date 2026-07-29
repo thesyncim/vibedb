@@ -86,16 +86,27 @@ go func() { log.Print(srv.Serve(ln)) }()
 
 pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
 parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
-`SELECT`, inner joins, prepared statements, and explicit transactions.
-Whole-document parameters are described as PostgreSQL `json`; projected JSON
-values preserve their exact wire spelling.
+`SELECT`, inner joins, prepared statements, and explicit transactions. Stock
+`psql` can connect and issue the same supported direct SQL. Whole-document
+parameters are described as PostgreSQL `json`; projected JSON values preserve
+their exact wire spelling.
+
+For example, the server above accepts a direct psql session with the documented
+cleartext fallback:
+
+```sh
+psql -X "host=127.0.0.1 port=5433 user=demo dbname=demo sslmode=prefer"
+```
 
 A read-only heap `*store.Database` or one `*durable.Collection` can still be
 served with `FromDatabase` or `FromCollection`. A
 [nested integration gate](integration/pgclient/pgclient_test.go) exercises
-pinned pgx v5 and lib/pq releases over loopback TCP in CI, including SCRAM,
-schema validation, indexes, writes, a join, rollback/read-your-writes, stable
-SQLSTATEs, and close/reopen persistence.
+pinned pgx v5 and lib/pq releases over loopback TCP in CI. A separate
+[psql gate](integration/pgclient/psql_test.go) drives the official PostgreSQL
+18.4 client through encryption fallback, SCRAM, SQL execution, error recovery,
+and clean termination. Together they cover schema validation, indexes, writes,
+a join, rollback/read-your-writes, stable SQLSTATEs, and close/reopen
+persistence.
 
 This is a PostgreSQL client protocol and SQL-subset implementation, not a
 PostgreSQL catalog emulator. TLS, `pg_catalog`, ORM/BI schema discovery, psql
