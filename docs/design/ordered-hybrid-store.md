@@ -617,9 +617,9 @@ release gates even when the original bug is closed:
 | files are not self-describing | closed: exact canonical definitions, geometry, and admission bounds are durable; zero-option reopen rehydrates them before runtime resources | corrupt/missing/grafted catalog rejection, exact round trip, and current-device reassertion for in-place materialization |
 | overlapping mutable engines and representations | open: vNext must become the only public mutable path; compact bulk cannot silently change performance class | API inventory plus deletion of obsolete paths after migration tests |
 | compact bulk creates a read cliff | rejected as the default; paired point and all-byte benchmarks are mandatory | no promoted codec may regress point, random, lower-bound, or ordered scan gates |
-| one collection is too large a 100 TB ownership unit | in progress: stable tablet/block identities and a shared-runtime-compatible catalog | split/merge, snapshot ownership, bounded resident metadata, and 100-billion-row simulations |
+| one collection is too large a 100 TB ownership unit | in progress locally; network ownership is specified separately in [distributed sharding](distributed-sharding.md) | split/merge, snapshot ownership, bounded resident metadata, and 100-billion-row simulations |
 | backup, verify, salvage, and physical space return are missing | open | live-snapshot export, offline verify/salvage, and `vacuum-into` workflows |
-| cross-tablet durability and snapshots are unspecified | intentionally after the local vNext format | leader epoch/sequence fencing, retained root history, safe-time reads, and GC watermark model |
+| cross-shard durability and snapshots are unspecified | future contract in [distributed sharding](distributed-sharding.md), intentionally after the local vNext format | shard-term/sequence fencing, retained root history, safe-time reads, and GC watermark model |
 
 Closing a row does not remove its tests. A rewrite that reintroduces one of
 these failures is rejected even if its isolated codec benchmark is faster or

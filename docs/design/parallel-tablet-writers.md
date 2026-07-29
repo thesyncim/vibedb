@@ -15,6 +15,11 @@ parallel, fence as a group, publish as a group* — and the pipeline lands
 first on today's single writer (where it already wins the ordinary-sync lane)
 before any sharding exists.
 
+This design is intra-process concurrency inside one physical collection.
+Distributed ownership and replication use
+[distributed sharding](distributed-sharding.md); they do not reuse `TabletID`
+as a network-shard identity.
+
 ---
 
 ## 1. What this design reconciles with

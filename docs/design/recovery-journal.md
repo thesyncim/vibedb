@@ -165,6 +165,10 @@ lifetime: checkpoint recycles it; steady state without crashes never reads it.
 The materialization journal precedent already established this class of
 structure in the format.
 
+It is also not the distributed replication/changefeed log. That log has
+independent shard-term, commit-sequence, and retention semantics in
+[distributed sharding](distributed-sharding.md).
+
 ## Projected effect and gates
 
 The mechanism has landed; these are the still-open measurements and extensions.
