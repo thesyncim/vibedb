@@ -12,9 +12,12 @@ var (
 	// ErrIndexExists reports CREATE INDEX without IF NOT EXISTS naming an
 	// existing index.
 	ErrIndexExists = errors.New("vibedb: SQL index already exists")
-	// ErrIndexLayoutFrozen reports CREATE INDEX after the table's first write.
-	// Durable exact indexes are part of the collection's physical definition
-	// and must be declared before materialization.
+	// ErrIndexBuildInProgress reports a second CREATE INDEX on a table whose
+	// online build has not reached its atomic catalog cutover.
+	ErrIndexBuildInProgress = errors.New("vibedb: SQL index build is already in progress")
+	// ErrIndexLayoutFrozen remains for source compatibility. Online index
+	// creation means current driver paths no longer return it.
+	// Deprecated: CREATE INDEX is supported on populated tables.
 	ErrIndexLayoutFrozen = errors.New("vibedb: SQL table index layout is frozen")
 	// ErrDuplicatePrimaryKey reports an INSERT whose document-derived primary
 	// key already exists, or appears twice in one VALUES batch. INSERT never

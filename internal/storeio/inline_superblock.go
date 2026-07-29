@@ -690,12 +690,7 @@ func sameImmutableInlineConfiguration(
 		left.State.MaxDocumentBytes == right.State.MaxDocumentBytes &&
 		left.State.Options == right.State.Options &&
 		left.State.ChunkDocuments == right.State.ChunkDocuments &&
-		left.State.IndexCount == right.State.IndexCount &&
 		left.State.IndexMaxDepth == right.State.IndexMaxDepth &&
-		left.State.IndexCatalogHash == right.State.IndexCatalogHash &&
 		left.State.MaterializationDamageGranule ==
-			right.State.MaterializationDamageGranule &&
-		left.State.PageCatalogHead == right.State.PageCatalogHead &&
-		left.State.PageCatalogDigest == right.State.PageCatalogDigest &&
-		left.State.PageCatalogBytes == right.State.PageCatalogBytes
+			right.State.MaterializationDamageGranule
 }

@@ -76,8 +76,14 @@ func DiscoverMutableInlineBootstrap(
 				!sameImmutableInlineConfiguration(discovered, root)) {
 			return ErrSuperblockConflict
 		}
-		discovered = root
-		found = true
+		if found && discovered.Generation == root.Generation &&
+			discovered != root {
+			return ErrSuperblockConflict
+		}
+		if !found || root.Generation > discovered.Generation {
+			discovered = root
+			found = true
+		}
 		return nil
 	}
 

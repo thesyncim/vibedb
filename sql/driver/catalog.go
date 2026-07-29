@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"unicode/utf8"
 
@@ -217,13 +218,29 @@ func openDatabaseWithSync(
 			_ = d.close()
 			return nil, openErr
 		}
-		collection, openErr := durable.Open(file, durableOptions(t))
+		openOptions := durableOptions(t)
+		// The durable page catalog is the atomic authority for online indexes.
+		// Passing nil lets Open rehydrate its complete definition after a crash
+		// between durable publication and the SQL catalog mirror.
+		openOptions.Indexes = nil
+		collection, openErr := durable.Open(file, openOptions)
 		if openErr != nil {
 			_ = file.Close()
 			_ = d.close()
 			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
 		}
 		t.file, t.collection = file, collection
+		changed, syncErr := syncTableIndexMeta(t)
+		if syncErr != nil {
+			_ = d.close()
+			return nil, fmt.Errorf(
+				"vibedb: read durable table %q index catalog: %w",
+				name, syncErr,
+			)
+		}
+		if changed {
+			d.catalogWritePending = true
+		}
 		if !meta.Materialized {
 			// Catalog v2 predates the explicit materialization bit. Presence
 			// of a valid durable file is authoritative and can be upgraded
@@ -373,6 +390,42 @@ func durableOptions(t *table) durable.Options {
 		})
 	}
 	return options
+}
+
+func syncTableIndexMeta(t *table) (bool, error) {
+	if t == nil || t.collection == nil {
+		return false, nil
+	}
+	snapshot, err := t.collection.Snapshot()
+	if err != nil {
+		return false, err
+	}
+	infos := snapshot.AppendIndexes(nil)
+	if err := snapshot.Close(); err != nil {
+		return false, err
+	}
+	next := make([]indexMeta, len(infos))
+	for i := range infos {
+		next[i].Name = infos[i].Name
+		next[i].Paths = append(
+			[]string(nil), infos[i].Columns[:infos[i].ColumnCount]...,
+		)
+	}
+	if len(next) == len(t.meta.Indexes) {
+		equal := true
+		for i := range next {
+			if next[i].Name != t.meta.Indexes[i].Name ||
+				!slices.Equal(next[i].Paths, t.meta.Indexes[i].Paths) {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			return false, nil
+		}
+	}
+	t.meta.Indexes = next
+	return true, nil
 }
 
 func compileSchemaMeta(meta *schemaMeta) (*store.Schema, error) {

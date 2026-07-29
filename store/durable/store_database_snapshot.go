@@ -382,16 +382,23 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	if stateErr != nil {
 		return nil, stateErr
 	}
-	// The epoch pointer pins the primary index's fold base and overlay for
-	// the captured generation, exactly as pinSnapshot does; a database
-	// snapshot that dropped it would answer an indexed mask probe against a
-	// nil catalog and silently degrade a covered query to a full scan.
+	// The catalog and epoch pointer must come from one publication generation,
+	// exactly as in pinSnapshot. Online CREATE INDEX replaces both under
+	// snapshotGate, so a database-wide capture cannot read either later.
+	indexes := c.options.indexes
+	indexNameIDs := c.options.indexNameIDs
+	indexDefinitions := c.options.Indexes
 	epoch := c.primaryEpoch
 	lease, err := c.leases.Acquire(state.root.Generation)
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{collection: c, state: state, epoch: epoch, lease: lease}, nil
+	return &Snapshot{
+		collection: c, state: state,
+		indexes: indexes, indexNameIDs: indexNameIDs,
+		indexDefinitions: indexDefinitions,
+		epoch:            epoch, lease: lease,
+	}, nil
 }
 
 // Collection returns the captured view of name, reporting whether the
