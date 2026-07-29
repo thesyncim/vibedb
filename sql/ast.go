@@ -61,9 +61,7 @@ type SelectStmt struct {
 	Params int
 }
 
-// A JoinKind names a join's flavour. Only [JoinInner] exists, because an inner
-// equi-join on a key is the only join the engine has; the type exists so a
-// later outer join is an added constant rather than a changed field.
+// A JoinKind names a join's flavour.
 type JoinKind uint8
 
 const (
@@ -71,6 +69,8 @@ const (
 	JoinNone JoinKind = iota
 	// JoinInner is an inner equi-join.
 	JoinInner
+	// JoinLeft is a left outer equi-join.
+	JoinLeft
 )
 
 // A TableRef is one range variable: a collection, the name paths use to
@@ -85,7 +85,7 @@ type TableRef struct {
 	// HasAlias records whether Alias was written explicitly, purely so a
 	// diagnostic can echo the statement back accurately.
 	HasAlias bool
-	// Join is JoinNone for From[0] and JoinInner for the rest.
+	// Join is JoinNone for From[0] and the requested join kind for the rest.
 	Join JoinKind
 	// On is the equi-join condition, or nil for From[0]. Left always binds to
 	// a range variable declared before this one and Right always binds to this

@@ -12,7 +12,7 @@
 // express. A construct is accepted only where it maps onto something the
 // executor already has — comparison, membership, null and existence tests,
 // jsonb containment, boolean combination, projection, grouping, the five
-// reductions, ordering, and an inner equi-join. Everything else is refused
+// reductions, ordering, and inner or left equi-joins. Everything else is refused
 // here, with a position and a reason.
 //
 // That is a stronger rule than it sounds, and it is the reason for most of the
@@ -47,7 +47,8 @@
 //	             | ( "SUM" | "AVG" | "MIN" | "MAX" ) "(" path ")" ;
 //
 //	table-ref    = name [ [ "AS" ] name ] ;
-//	join         = [ "INNER" ] "JOIN" table-ref "ON" join-cond ;
+//	join         = ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN" )
+//	               table-ref "ON" join-cond ;
 //	join-cond    = [ "(" ] path "=" path [ ")" ] ;
 //
 //	predicate    = disjunction ;
@@ -338,8 +339,8 @@
 // SELECT DISTINCT and COUNT(DISTINCT ...) (no distinct operator); LIKE, ILIKE,
 // SIMILAR TO, and regular-expression operators (no pattern operator);
 // subqueries in any position, including EXISTS and IN (SELECT ...) (no nested
-// execution); outer, cross, and natural joins and comma-separated FROM items
-// (the engine matches a key on both sides, so a non-match has no row to emit);
+// execution); right/full, cross, and natural joins and comma-separated FROM
+// items;
 // JOIN ... USING (schemaless documents have no declared columns to match by
 // name); set operations, common table expressions, window functions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine

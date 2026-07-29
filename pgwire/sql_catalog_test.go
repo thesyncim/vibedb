@@ -158,6 +158,34 @@ func TestSQLCatalogInsertReturning(t *testing.T) {
 	}
 }
 
+func TestSQLCatalogLeftJoinNullExtension(t *testing.T) {
+	c := connectSQLCatalog(t)
+	for _, setup := range []struct {
+		statement string
+		tag       string
+	}{
+		{`CREATE TABLE users (id STRING PRIMARY KEY, name STRING NOT NULL)`, "CREATE TABLE"},
+		{`CREATE TABLE orders (id STRING PRIMARY KEY, user_id STRING, total INTEGER)`, "CREATE TABLE"},
+		{`INSERT INTO users VALUES ({"id":"u1","name":"Ada"}), ({"id":"u2","name":"Lin"})`, "INSERT 0 2"},
+		{`INSERT INTO orders VALUES ({"id":"o1","user_id":"u1","total":10})`, "INSERT 0 1"},
+	} {
+		if got := commandTagOf(t, c.query(setup.statement)); got != setup.tag {
+			t.Fatalf("%s tag = %q, want %q", setup.statement, got, setup.tag)
+		}
+	}
+
+	rows := rowsOf(t, c.query(`
+		SELECT u.name, o.total
+		FROM users AS u
+		LEFT JOIN orders AS o ON u.id = o.user_id
+		ORDER BY u.name`))
+	if len(rows) != 2 ||
+		string(rows[0][0]) != `"Ada"` || string(rows[0][1]) != "10" ||
+		string(rows[1][0]) != `"Lin"` || rows[1][1] != nil {
+		t.Fatalf("LEFT JOIN rows = %q", rows)
+	}
+}
+
 func TestSQLCatalogTransactionsAndFailedState(t *testing.T) {
 	c := connectSQLCatalog(t)
 	c.query(`CREATE TABLE docs (id STRING PRIMARY KEY, name STRING NOT NULL)`)
