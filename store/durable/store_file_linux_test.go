@@ -39,7 +39,7 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 	for row := range documents {
 		key := fmt.Sprintf("linux:direct:%04d", row)
 		value := fmt.Appendf(nil, `{"v":%d}`, row)
-		if _, err := collection.Put(key, value); err != nil {
+		if _, err := collection.Put([]byte(key), value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -51,7 +51,7 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got, ok, err := reopened.AppendRaw(nil, "linux:direct:0001"); err != nil || !ok || string(got) != `{"v":1}` {
+	if got, ok, err := reopened.AppendRaw(nil, []byte("linux:direct:0001")); err != nil || !ok || string(got) != `{"v":1}` {
 		t.Fatalf("required direct read = (%q,%v,%v)", got, ok, err)
 	}
 	snapshot, err := reopened.Snapshot()
@@ -100,7 +100,7 @@ func TestFileStoreRequiredDirectWrites(t *testing.T) {
 	for row := range 64 {
 		key := fmt.Sprintf("linux:direct-write:%02d", row)
 		value := fmt.Appendf(nil, `{"v":%d}`, row)
-		if _, err := collection.Put(key, value); err != nil {
+		if _, err := collection.Put([]byte(key), value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -114,7 +114,7 @@ func TestFileStoreRequiredDirectWrites(t *testing.T) {
 	if stats := reopened.Stats(); !stats.DirectWrites || stats.DirectReads {
 		t.Fatalf("reopened direct-write stats = %+v", stats)
 	}
-	if got, ok, err := reopened.AppendRaw(nil, "linux:direct-write:63"); err != nil || !ok || string(got) != `{"v":63}` {
+	if got, ok, err := reopened.AppendRaw(nil, []byte("linux:direct-write:63")); err != nil || !ok || string(got) != `{"v":63}` {
 		t.Fatalf("required direct write = (%q,%v,%v)", got, ok, err)
 	}
 	if err := reopened.Close(); err != nil {
@@ -145,7 +145,7 @@ func TestFileStoreRequiredDirectReadWrite(t *testing.T) {
 	for row := range 64 {
 		key := fmt.Sprintf("linux:direct-rw:%02d", row)
 		value := fmt.Appendf(nil, `{"v":%d}`, row)
-		if _, err := collection.Put(key, value); err != nil {
+		if _, err := collection.Put([]byte(key), value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -157,7 +157,7 @@ func TestFileStoreRequiredDirectReadWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got, ok, err := reopened.AppendRaw(nil, "linux:direct-rw:31"); err != nil || !ok || string(got) != `{"v":31}` {
+	if got, ok, err := reopened.AppendRaw(nil, []byte("linux:direct-rw:31")); err != nil || !ok || string(got) != `{"v":31}` {
 		t.Fatalf("required direct read/write = (%q,%v,%v)", got, ok, err)
 	}
 	if stats := reopened.Stats(); !stats.DirectReads || !stats.DirectWrites || stats.PageReads == 0 {
@@ -212,7 +212,7 @@ func TestFileStoreDirectReadWriteUnderCachePressure(t *testing.T) {
 	for row := 0; row < maximumRecords; row++ {
 		key := pressureKey(uint32(row))
 		value := fmt.Appendf(nil, `{"id":%d,"version":0,"payload":"%064d"}`, row, row)
-		if _, err := collection.Put(key, value); err != nil {
+		if _, err := collection.Put([]byte(key), value); err != nil {
 			t.Fatal(err)
 		}
 		records = row + 1
@@ -251,7 +251,7 @@ func TestFileStoreDirectReadWriteUnderCachePressure(t *testing.T) {
 					failures <- err
 					return
 				}
-				value, ok, readErr := snapshot.AppendRaw(dst[:0], key)
+				value, ok, readErr := snapshot.AppendRaw(dst[:0], []byte(key))
 				closeErr := snapshot.Close()
 				if readErr != nil {
 					failures <- readErr
@@ -274,14 +274,14 @@ func TestFileStoreDirectReadWriteUnderCachePressure(t *testing.T) {
 		row := version & 63
 		key := pressureKey(uint32(row))
 		if version%32 == 0 {
-			if deleted, err := collection.Delete(key); err != nil || !deleted {
+			if deleted, err := collection.Delete([]byte(key)); err != nil || !deleted {
 				close(stop)
 				readers.Wait()
 				t.Fatalf("Delete(%s) = (%v,%v)", key, deleted, err)
 			}
 		}
 		value := fmt.Appendf(nil, `{"id":%d,"version":%d,"payload":"%064d"}`, row, version, version)
-		if _, err := collection.Put(key, value); err != nil {
+		if _, err := collection.Put([]byte(key), value); err != nil {
 			close(stop)
 			readers.Wait()
 			t.Fatal(err)
@@ -345,7 +345,7 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 	for row := range 64 {
 		key := fmt.Sprintf("ring:%02d", row)
 		value := fmt.Appendf(nil, `{"v":%d}`, row)
-		if _, err := collection.Put(key, value); err != nil {
+		if _, err := collection.Put([]byte(key), value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -362,9 +362,9 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	keys := make([]string, 16)
+	keys := make([][]byte, 16)
 	for row := range keys {
-		keys[row] = fmt.Sprintf("ring:%02d", row)
+		keys[row] = fmt.Appendf(nil, "ring:%02d", row)
 	}
 	if queued, err := reopened.PrefetchKeys(keys); err != nil || queued == 0 {
 		t.Fatalf("direct io_uring prefetch = (%d,%v)", queued, err)
@@ -373,7 +373,7 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 	for reopened.Stats().AsyncReadBatches == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got, ok, err := reopened.AppendRaw(nil, "ring:63"); err != nil || !ok || string(got) != `{"v":63}` {
+	if got, ok, err := reopened.AppendRaw(nil, []byte("ring:63")); err != nil || !ok || string(got) != `{"v":63}` {
 		t.Fatalf("direct io_uring read = (%q,%v,%v)", got, ok, err)
 	}
 	snapshot, err := reopened.Snapshot()

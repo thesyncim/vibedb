@@ -100,7 +100,7 @@ func TestFileStorePhysicalHundredXMemory(t *testing.T) {
 		key = fmt.Appendf(key[:0], "row:%08d", row)
 		document = appendFileStoreScaleDocumentPayload(document[:0], row, false, int(payloadBytes))
 		sourceBytes += uint64(len(key) + len(document))
-		if created, putErr := db.Put(string(key), document); putErr != nil || !created {
+		if created, putErr := db.Put([]byte(string(key)), document); putErr != nil || !created {
 			t.Fatalf("Put(%d) = (%v,%v)", row, created, putErr)
 		}
 		if sourceBytes >= nextProgress {
@@ -145,7 +145,7 @@ func TestFileStorePhysicalHundredXMemory(t *testing.T) {
 	} {
 		key = fmt.Appendf(key[:0], "row:%08d", row)
 		want := appendFileStoreScaleDocumentPayload(document[:0], row, false, int(payloadBytes))
-		got, ok, readErr := reopened.AppendRaw(readBuffer[:0], string(key))
+		got, ok, readErr := reopened.AppendRaw(readBuffer[:0], []byte(string(key)))
 		if readErr != nil || !ok || !bytes.Equal(got, want) {
 			t.Fatalf("pressure read %d = (%d bytes,%v,%v)", row, len(got), ok, readErr)
 		}
@@ -180,11 +180,11 @@ func TestFileStorePhysicalHundredXMemory(t *testing.T) {
 	updatedRow := records / 2
 	updatedKey := fmt.Sprintf("row:%08d", updatedRow)
 	updated := appendFileStoreScaleDocumentPayload(document[:0], updatedRow, true, int(payloadBytes))
-	if created, err := reopened.Put(updatedKey, updated); err != nil || created {
+	if created, err := reopened.Put([]byte(updatedKey), updated); err != nil || created {
 		t.Fatalf("pressure update = (%v,%v)", created, err)
 	}
 	deletedKey := fmt.Sprintf("row:%08d", min(17, records-1))
-	if deleted, err := reopened.Delete(deletedKey); err != nil || !deleted {
+	if deleted, err := reopened.Delete([]byte(deletedKey)); err != nil || !deleted {
 		t.Fatalf("pressure delete = (%v,%v)", deleted, err)
 	}
 	if err := reopened.Flush(); err != nil {
@@ -205,10 +205,10 @@ func TestFileStorePhysicalHundredXMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, err := final.AppendRaw(readBuffer[:0], updatedKey); err != nil || !ok || !bytes.Equal(got, updated) {
+	if got, ok, err := final.AppendRaw(readBuffer[:0], []byte(updatedKey)); err != nil || !ok || !bytes.Equal(got, updated) {
 		t.Fatalf("reopened update = (%d bytes,%v,%v)", len(got), ok, err)
 	}
-	if _, ok, err := final.AppendRaw(readBuffer[:0], deletedKey); err != nil || ok {
+	if _, ok, err := final.AppendRaw(readBuffer[:0], []byte(deletedKey)); err != nil || ok {
 		t.Fatalf("reopened delete = (%v,%v)", ok, err)
 	}
 	if err := final.Close(); err != nil {
