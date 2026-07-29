@@ -5,33 +5,22 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-// *Collection and *Snapshot satisfy store's shared Mutable and IndexSource
-// shapes with their existing exported methods — no adapter needed for basic
-// conformance. Index-lifecycle mutation is deliberately absent: collection's
-// indexes are frozen at construction (Options.Indexes), so it does
-// not, and should not, implement store.IndexManager.
-var (
-	_ store.Mutable[*Snapshot] = (*Collection)(nil)
-	_ store.IndexSource        = (*Snapshot)(nil)
-)
+// *Snapshot satisfies store's shared IndexSource shape with its existing
+// exported methods — no adapter needed for basic conformance. Repeated probing
+// should go through QuerySnapshot below, which reuses one workspace.
+var _ store.IndexSource = (*Snapshot)(nil)
 
-// SupportsUpdate reports whether the collection's current immutable layout and
-// durability lane can publish [Collection.Update] batches. It describes a
+// SupportsUpdate reports whether the collection's durability lane and index
+// configuration can publish [Collection.Update] batches. It describes a
 // structural capability, not a size guarantee: an individual batch may still
 // exceed its configured document or byte bounds.
 //
-// Chunk-layout collections support Update, including exact-index maintenance.
-// Ordered-primary collections support it only on a deferred-canonical lane and
-// only without exact indexes; their single-document Put/Delete path maintains
-// exact indexes, but their batch publisher deliberately rejects them.
+// Update is available only on a deferred-canonical lane and only without exact
+// indexes; the single-document Put/Delete path maintains exact indexes, but the
+// batch publisher deliberately rejects them.
 func (c *Collection) SupportsUpdate() bool {
-	if c == nil || c.state.Load() == nil {
-		return false
-	}
-	if !c.primaryGraphReadOnly() {
-		return true
-	}
-	return len(c.options.indexes) == 0 && c.deferredCanonicalLane()
+	return c != nil && c.state.Load() != nil &&
+		len(c.options.indexes) == 0 && c.deferredCanonicalLane()
 }
 
 // QuerySnapshot adapts a Snapshot for repeated, zero-allocation index

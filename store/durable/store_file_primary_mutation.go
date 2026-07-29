@@ -926,7 +926,6 @@ func (c *Collection) tryBufferedPrimaryInplace(
 		return false, false, nil
 	}
 	if len(c.options.indexes) != 0 ||
-		len(c.options.float64Columns) != 0 ||
 		c.options.Collection.Schema != nil ||
 		len(before) == 0 || len(before) != len(src) {
 		return fallback()

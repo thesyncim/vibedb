@@ -10,25 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func openPageFile(path string, mode DirectMode) (*os.File, bool, error) {
-	if mode == DirectOff {
-		file, err := os.Open(path)
-		return file, false, err
-	}
-	file, err := openDirectReadFile(path, path)
-	if err == nil {
-		return file, true, nil
-	}
-	if mode == DirectRequire && directIOUnsupported(err) {
-		return nil, false, fmt.Errorf("%w: %w", ErrDirectIOUnsupported, err)
-	}
-	if !directIOUnsupported(err) {
-		return nil, false, fmt.Errorf("open direct Store page file %q: %w", path, err)
-	}
-	file, fallbackErr := os.Open(path)
-	return file, false, fallbackErr
-}
-
 func openPageCacheFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
 	if mode == DirectOff {
 		return file, false, nil
@@ -63,10 +44,6 @@ func openPageCommitFile(file *os.File, mode DirectMode) (*os.File, bool, error) 
 		return nil, false, fmt.Errorf("open direct Store page commit descriptor: %w", err)
 	}
 	return file, false, nil
-}
-
-func openDirectReadFile(path, name string) (*os.File, error) {
-	return openDirectFile(path, unix.O_RDONLY, name)
 }
 
 func openDirectFile(path string, access int, name string) (*os.File, error) {

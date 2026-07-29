@@ -315,15 +315,6 @@ func (s *Segment) AppendWhereExists(dst []int, path string) []int {
 	return dst
 }
 
-// whereExistsScan is WhereExists's full-scan fallback: it tests each document
-// for the key without postings. A shape-taped document answers from its proven
-// shape's field table — no widening, no source touch — and a classic document
-// through Get on its tape, so the scan is a fair columnar baseline and never
-// materializes a shape tape. Ordinals are produced in ascending order.
-func (s *Segment) whereExistsScan(path string) []int {
-	return s.appendWhereExistsScan(nil, path)
-}
-
 func (s *Segment) appendWhereExistsScan(dst []int, path string) []int {
 	key := vibejson.CompileKey(path)
 	for i := 0; i < s.Len(); i++ {
@@ -394,13 +385,6 @@ func (s *Segment) AppendWhereContainsIndex(dst []int, path string, needle vibejs
 	// Candidates are ascending and already deduplicated, so verified survivors
 	// come out ascending and unique with no further work.
 	return dst
-}
-
-// whereContainsScan is WhereContains's full-scan fallback and the reference its
-// pruned path must equal: every document's value at path tested against the
-// needle with the same Node.Contains verifier. Ordinals are produced ascending.
-func (s *Segment) whereContainsScan(path string, needle vibejson.Node) []int {
-	return s.appendWhereContainsScan(nil, path, needle)
 }
 
 func (s *Segment) appendWhereContainsScan(dst []int, path string, needle vibejson.Node) []int {

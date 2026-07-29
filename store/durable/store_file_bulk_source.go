@@ -11,13 +11,10 @@ import (
 
 // fileStoreBulkRow identifies one live document in an in-memory heap State by
 // its source chunk and stable slot. It is the row descriptor the ordered-primary
-// bulk builder (CreateFromPrimary) walks; the overflow fields are retained for
-// the descriptor shape but unused on the inline-only primary bulk path.
+// bulk builder (CreateFromPrimary) walks.
 type fileStoreBulkRow struct {
-	sourceChunk  uint32
-	sourceSlot   uint8
-	overflowBase int
-	overflowN    int
+	sourceChunk uint32
+	sourceSlot  uint8
 }
 
 // collectFileStoreBulkRows enumerates every live document of a heap State in
@@ -43,7 +40,7 @@ func collectFileStoreBulkRows(state *store.State, options normalizedFileStoreOpt
 				collectErr = ErrDocumentTooLarge
 				return false
 			}
-			rows = append(rows, fileStoreBulkRow{sourceChunk: chunkID, sourceSlot: slot, overflowBase: -1})
+			rows = append(rows, fileStoreBulkRow{sourceChunk: chunkID, sourceSlot: slot})
 		}
 		return true
 	})

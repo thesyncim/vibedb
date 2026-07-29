@@ -170,12 +170,10 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 // an exceeded bound — is ordinary and never poisons; only a durability fence
 // failure does.
 //
-// On the chunk layout the commit is one document-page rebuild per touched chunk,
-// one batched descent per directory, one publication root, and one durability
-// fence. On the ordered-primary graph it is one rewritten leaf frame per touched
-// leaf, one batch journal record synced once, and every leaf pointer flipped
-// under one generation (see updatePrimaryBatch); the primary batch is carried
-// only by the buffered-visible and sync-journal lanes.
+// The commit is one rewritten leaf frame per touched leaf, one batch journal
+// record synced once, and every leaf pointer flipped under one generation (see
+// updatePrimaryBatch); the batch is carried only by the buffered-visible and
+// sync-journal lanes.
 func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 	if c == nil {
 		return ErrClosed

@@ -157,33 +157,6 @@ func (p filePageCatalogPlan) ref(ordinal uint16) storeio.PageRef {
 	}
 }
 
-func openFilePageCatalog(
-	file *os.File,
-	root storeio.StateRoot,
-	fileEnd uint64,
-	pageScratch []byte,
-) (*storeio.CanonicalPageCatalog, error) {
-	if root.PageCatalogBytes == 0 {
-		return storeio.OpenCanonicalPageCatalog(nil)
-	}
-	layout, err := storeio.MutableStoreLayout(root.PageSize)
-	if err != nil {
-		return nil, err
-	}
-	return storeio.OpenPageCatalogChainAt(
-		file,
-		root.PageCatalogHead,
-		storeio.PageCatalogBounds{
-			StoreID: root.StoreID, Generation: root.Generation,
-			PageSize: root.PageSize, DataStart: layout.DataStart,
-			FileEnd: fileEnd, NextLogicalID: root.NextLogicalID,
-			TotalBytes: root.PageCatalogBytes, RequireDigest: true,
-			ExpectedDigest: root.PageCatalogDigest,
-		},
-		pageScratch,
-	)
-}
-
 // fileStoreCollectionOptionFlags returns the frozen, pointer-free collection
 // representation flags carried through every root generation.
 func fileStoreCollectionOptionFlags(options store.Options) uint32 {
@@ -225,7 +198,6 @@ func normalizeOpenedFileStoreOptions(
 	hasFloat64 := len(definition.Float64Paths) != 0
 	hasSchema := definition.Schema != nil
 	catalogAsserted := supplied.Indexes != nil ||
-		supplied.Float64Columns != nil ||
 		supplied.Collection.Schema != nil
 	if root.IndexCount != uint32(catalog.PhysicalIndexCount()) ||
 		(root.Options&storeio.StateOptionFloat64Columns != 0) != hasFloat64 ||
@@ -314,9 +286,6 @@ func normalizeOpenedFileStoreOptions(
 				Name: index.Name, Paths: slices.Clone(index.Paths),
 			}
 		}
-	}
-	if options.Float64Columns == nil {
-		options.Float64Columns = slices.Clone(definition.Float64Paths)
 	}
 	if options.Collection.Schema == nil && definition.Schema != nil {
 		fields := make(

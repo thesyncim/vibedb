@@ -29,8 +29,6 @@ type Stats struct {
 	IndexedChunks int
 	// IndexReclaiming reports detached physical postings still being removed.
 	IndexReclaiming bool
-	// MappedImageBytes is the caller-owned image retained by Open.
-	MappedImageBytes uint64
 	// ExternalKeyBytes is pointer-free mapped key-directory metadata outside
 	// Go HeapAlloc on supported Unix platforms. It remains process RSS.
 	ExternalKeyBytes uint64
@@ -69,7 +67,6 @@ func (c *Collection) Stats() Stats {
 		IndexedChunks:   len(c.postingChunks.ids),
 		IndexReclaiming: c.reclaim != nil,
 	}
-	stats.MappedImageBytes = uint64(len(state.source))
 	stats.ExternalKeyBytes = state.baseKeys.externalBytes()
 	stats.ExternalDocumentBytes = state.mappedDocs.externalBytes()
 	visit := c.nextExactIndexVisitLocked()

@@ -1223,9 +1223,9 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	stats := fs.Stats()
 	t.Logf("a snapshot pinned at generation %d absorbed %d writes before backpressure; "+
 		"%d bytes of retired extents were fenced, arena capacity %d extents, "+
-		"file %d bytes, %d extents abandoned",
+		"file %d bytes",
 		pinnedGeneration, writes, stats.PendingRetiredBytes, options.MaxRetiredExtents,
-		stats.FileEnd, stats.AbandonedExtents)
+		stats.FileEnd)
 
 	// Releasing the reader must clear it, and every document must survive: the
 	// resumed reclamation must not have handed out space the snapshot reached.
@@ -1291,7 +1291,7 @@ func TestFileStoreRetirementOverflowNeverAbandonsSpace(t *testing.T) {
 // extent that commit retired is already described there.
 //
 // This is a belt-and-suspenders ordering guarantee. A retirement is recorded by
-// syncFreeLog before reserveFileRetirements hands the same list to the
+// syncFreeLogFor before reserveFileRetirements hands the same list to the
 // reclaimer. A full retirement table now refuses the unpublished commit instead
 // of forgetting the extents, but recovery must still never observe a committed
 // root without the matching retirement metadata.

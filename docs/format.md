@@ -238,21 +238,21 @@ clipped view makes it unreachable.
 ```go
 const (
 	PageStateRoot PageKind = iota + 1 // 1
-	PageDocument                      // 2
+	_                                 // 2  (was PageDocument; retired)
 	PageOverflow                      // 3
-	PageChunkDirectory                // 4
-	PageKeyDirectory                  // 5
-	PageIndexDirectory                // 6
+	_                                 // 4  (was PageChunkDirectory; retired)
+	_                                 // 5  (was PageKeyDirectory; retired)
+	_                                 // 6  (was PageIndexDirectory; retired)
 	PageIndexPosting                  // 7
-	PageDocumentGroup                 // 8
-	PageFloat64Group                  // 9
-	PageFloat64Catalog                // 10
-	PageFloat64Stripe                 // 11
-	PageIndexGroupCatalog             // 12
+	_                                 // 8  (was PageDocumentGroup; retired)
+	_                                 // 9  (was PageFloat64Group; retired)
+	_                                 // 10 (was PageFloat64Catalog; retired)
+	_                                 // 11 (was PageFloat64Stripe; retired)
+	_                                 // 12 (was PageIndexGroupCatalog; retired)
 	PageFreeImage                     // 13
 	PageFreeDelta                     // 14
 	PageFreeIndex                     // 15
-	PageFingerprintDirectory          // 16
+	_                                 // 16 (was PageFingerprintDirectory; retired)
 	PageCatalogSegment                // 17
 	PagePrimaryCatalog                // 18
 	PageTabletDirectory               // 19
@@ -265,26 +265,31 @@ const (
 )
 ```
 
+Retired identifiers are held blank so every surviving durable kind keeps the
+on-disk value it already had; a page carrying a retired kind fails closed on
+decode. `PageIndexPosting` survives because the in-memory heap store encodes
+its query-time packed index in this format.
+
 | Value | Kind | Purpose |
 | --- | --- | --- |
 | 1 | `PageStateRoot` | standalone StateRoot envelope for lower-level/provisional use; mutable durable roots embed the payload |
-| 2 | `PageDocument` | stable-slot micro-page of up to 64 documents in one logical chunk |
+| 2 | — | retired (was the chunk-layout document micro-page) |
 | 3 | `PageOverflow` | one ordered piece of a JSON value too large to inline |
-| 4 | `PageChunkDirectory` | packed-radix routing from chunk id to `PageDocument`/`PageDocumentGroup` |
-| 5 | `PageKeyDirectory` | ambiguous development key-directory kind; not accepted as a populated current mutable store's primary directory |
-| 6 | `PageIndexDirectory` | B+tree from `(indexID, tupleHash, chunk)` to an inline stable-slot mask and certificate |
-| 7 | `PageIndexPosting` | packed exact-match posting codec; inert in the current mutable durable writer |
-| 8 | `PageDocumentGroup` | immutable multi-chunk compact/bulk document extent (template+dictionary compression) |
-| 9 | `PageFloat64Group` | detached column-major typed float64 sidecar for a `PageDocumentGroup` run |
-| 10 | `PageFloat64Catalog` | B-tree directory over `PageFloat64Stripe` leaves (scan accelerator) |
-| 11 | `PageFloat64Stripe` | aggregate-only, mask-free dense float64 projection for a chunk range |
-| 12 | `PageIndexGroupCatalog` | bounded aggregate-only categorical grouping cover |
+| 4 | — | retired (was the chunk-radix directory) |
+| 5 | — | retired (was the development key directory) |
+| 6 | — | retired (was the chunk exact-index directory) |
+| 7 | `PageIndexPosting` | packed exact-match posting codec; used by the in-memory heap store's packed index |
+| 8 | — | retired (was the chunk compact document-group extent) |
+| 9 | — | retired (was the float64 column-major sidecar) |
+| 10 | — | retired (was the float64 stripe directory) |
+| 11 | — | retired (was the float64 dense stripe) |
+| 12 | — | retired (was the categorical index-group cover) |
 | 13 | `PageFreeImage` | one free-set image segment, ordered by offset |
 | 14 | `PageFreeDelta` | one free-set diff page and predecessor link |
 | 15 | `PageFreeIndex` | directory naming independent free-image segments |
-| 16 | `PageFingerprintDirectory` | keyed-hash B+tree to candidate `(chunk, slot)` locations; exact document-key recheck is authoritative |
+| 16 | — | retired (was the fingerprint key directory) |
 | 17 | `PageCatalogSegment` | self-describing canonical Store catalog segment; reopen selects this decoder by durable kind, never by probing payload |
-| 18 | `PagePrimaryCatalog` | hybrid-primary graph root: exact lexical catalog whose leaves name each macro-tablet's root `PageRef` (`StateRoot.PrimaryRoot`) |
+| 18 | `PagePrimaryCatalog` | primary graph root: exact lexical catalog whose leaves name each macro-tablet's root `PageRef` (`StateRoot.PrimaryRoot`) |
 | 19 | `PageTabletDirectory` | tablet-directory node of the primary catalog, routing a key to the macro-tablet that owns it |
 | 20 | `PagePrimaryLocator` | tablet local-ID locator mapping a stable `BucketID` to the current leaf page and slot holding it |
 | 21 | `PageTabletRoute` | tablet segmented route block over its primary leaves |
@@ -334,13 +339,13 @@ accepted.
 | 32:36 | ChunkDocuments | u32 | documents per chunk, `1..64` |
 | 36:40 | IndexCount | u32 | number of declared exact indexes |
 | 40:44 | IndexMaxDepth | u32 | — |
-| 44:52 | IndexCatalogHash | u64 | binds the durable catalog (exact indexes, float64 covering columns, schema) |
+| 44:52 | IndexCatalogHash | u64 | binds the durable catalog (exact indexes, schema) |
 | 52:56 | FreeChunkHint | u32 | conservative lower bound of a chunk that may have a free slot |
-| 56:88 | ChunkDirectory | `PageRef` | required iff `LiveChunks != 0` |
-| 88:120 | KeyDirectory | `PageRef` | required iff `DocumentCount != 0`; current mutable stores require kind `PageFingerprintDirectory` |
-| 120:152 | IndexDirectory | `PageRef` | optional only when `IndexCount != 0` |
-| 152:184 | Float64ScanHead | `PageRef` | points at a `PageFloat64Catalog` root |
-| 184:216 | IndexGroupHead | `PageRef` | points at a `PageIndexGroupCatalog` chain head |
+| 56:88 | — | `PageRef` slot | retired (was the chunk directory root); held blank |
+| 88:120 | — | `PageRef` slot | retired (was the key/fingerprint directory root); held blank |
+| 120:152 | — | `PageRef` slot | retired (was the chunk exact-index directory root); held blank |
+| 152:184 | — | `PageRef` slot | retired (was the float64 scan head); held blank |
+| 184:216 | — | `PageRef` slot | retired (was the index-group head); held blank |
 | 216:220 | MaterializationDamageGranule | u32 | `0` disables canonical materialization; otherwise the persisted qualified power-loss damage granule |
 | 220:224 | MaxPageSize | u32 | largest physical extent admitted by this Store |
 | 224:256 | PageCatalogHead | `PageRef` | first segment of the exact canonical Store catalog |
@@ -349,16 +354,15 @@ accepted.
 | 276:280 | MaxKeyBytes | u32 | immutable key-admission bound |
 | 280:284 | InlineValueBytes | u32 | immutable inline-value bound |
 | 284:288 | MaxDocumentBytes | u32 | immutable complete-document bound |
-| 288:320 | PrimaryRoot | `PageRef` | zero selects the current fingerprint/chunk primary; otherwise the 64 KiB `PagePrimaryCatalog` root at `PrimaryCatalogRootLogicalID` |
+| 288:320 | PrimaryRoot | `PageRef` | the 64 KiB `PagePrimaryCatalog` root at `PrimaryCatalogRootLogicalID`; the sole document root — a zero `PrimaryRoot` fails `Open` |
 | 320:336 | JournalID | 16 bytes | UUID of the paired recovery journal file; zero means no journal is referenced |
-| 336:368 | ExactIndexRoot | `PageRef` | `PagePrimaryExactRoot` for exact indexes built beside `PrimaryRoot`; aliases share physical leaf entries. Zero unless the ordered primary declares indexes and keeps no legacy `IndexDirectory` |
+| 336:368 | ExactIndexRoot | `PageRef` | `PagePrimaryExactRoot` for exact indexes built beside `PrimaryRoot`; aliases share physical leaf entries. Zero when the collection declares no indexes |
 | 368:512 | reserved | — | zero |
 
-The chunk, key, index, and float64 directory roots have
-`Length == PageSize`. `IndexGroupHead` may be a larger valid physical extent
-that is a whole `PageSize` multiple. `PrimaryRoot` has the fixed production
-catalog identity, kind, and 64 KiB length and requires the reserved primary
-logical-ID bands below `NextLogicalID`. `ExactIndexRoot` is one `PageSize`
+The retired `PageRef` slots are held blank so the fields after them keep
+their byte offsets; nothing writes or reads them any longer. `PrimaryRoot` has
+the fixed production catalog identity, kind, and 64 KiB length and requires the
+reserved primary logical-ID bands below `NextLogicalID`. `ExactIndexRoot` is one `PageSize`
 catalog whose ordered records each contain either zero (an empty physical index)
 or a `PagePrimaryExactLeaf` reference; leaf extents are powers of two up to
 `MaxPageSize`, and each leaf payload is exactly `AppendIndexTermLeaf` output.
@@ -435,101 +439,13 @@ must divide `PageSize`; zero and the option bit must either both be absent or
 both be present.
 Any bit outside this known set fails closed on decode.
 
-## ChunkDirectory
+## ChunkDirectory (retired)
 
-`internal/storeio/chunk_directory.go`, kind `PageChunkDirectory`. A
-packed-radix (Patricia-trie-like) node over 32-bit chunk ids, 6 bits per
-level (`chunkDirectoryRadixBits = 6`), so each node has up to 64 children and
-`Shift` values are `0, 6, 12, 18, 24, 30` (`chunkDirectoryMaxShift = 30`; at
-shift 30 only the low 4 bits of a chunk id remain, so a top node's `Bitmap`
-may only use lanes 0–3). `Shift == 0` marks a leaf whose children are
-`PageDocument` or `PageDocumentGroup` references; several leaf lanes may
-name the same `PageDocumentGroup` extent (its `Aux`/`Flags` may carry the
-float64-sidecar routing bits described under Float64Group below), so those
-duplicates are exempted from the page's own child-uniqueness check.
-
-The tree's height is variable and is named by the root's own `Shift`: readers
-must take it from the page rather than assume `chunkDirectoryMaxShift`. A tree
-is only as tall as its live chunk ids require — one level while every chunk
-fits a single 64-lane leaf, and one more per factor of 64 — so a root may carry
-a non-zero `Prefix`, and a chunk id outside the span it covers is absent rather
-than corrupt. Writers raise the height by wrapping the existing root in new
-levels when an insert falls outside its span; the height tracks the monotone
-chunk high-water mark and so never shrinks. Only development format `0` is
-accepted; superseded fixed-height development pages are rejected.
-
-```text
- 0        4        8                16       17   18       20                  32
-+--------+--------+-----------------+--------+----+--------+-------------------+
-|version | Prefix |     Bitmap      | Shift  |cnt |  Flags | reserved (12B)    |
-+--------+--------+-----------------+--------+----+--------+-------------------+
- 32                    +32*count
-+---------------------------------------------------------+
-|      PageRef[count], ordered by increasing set bit lane  |
-+---------------------------------------------------------+
- 32+32*count           +30*count   (leaves with FlagZones only)
-+---------------------------------------------------------+
-|      ChunkZone[count], same packed lane order            |
-+---------------------------------------------------------+
-```
-
-| Offset | Field | Type | Notes |
-| --- | --- | --- | --- |
-| 0:4 | version | u32 | development format `0` |
-| 4:8 | Prefix | u32 | chunk-id prefix this node covers (`chunkID &^ ((1<<(Shift+6))-1)`) |
-| 8:16 | Bitmap | u64 | one bit per populated lane (0–63) |
-| 16 | Shift | u8 | multiple of 6, `0..30`; `0` = leaf |
-| 17 | count | u8 | `popcount(Bitmap)`, `<= 64` |
-| 18:20 | Flags | u16 | bit 0 = `ChunkDirectoryFlagZones`; every other bit must be `0` |
-| 20:32 | reserved | — | must be zero |
-| 32 : 32+32×count | refs | `PageRef[]` | packed in increasing set-bit-lane order (sparse — no empty slots stored) |
-| 32+32×count : +30×count | zones | `ChunkZone[]` | present only when `Flags & 1`; one 30-byte chunk summary per reference, same order |
-
-### Chunk summaries (zone maps)
-
-A leaf may carry one fixed-width 30-byte summary per lane
-(`ChunkZoneSize`), immediately after the reference array and in the same
-packed order. The flag is per page: a leaf without it is byte-identical to
-what earlier builds wrote, and a leaf with it must be a leaf — `Flags & 1`
-on a branch (`Shift != 0`) is rejected on both encode and decode.
-
-The array fits because a full 64-lane leaf is not full. In the smallest legal
-page (4096) the payload is 4024 bytes, of which the header takes 32 and
-64 references take 2048, leaving 1944 — exactly 30 bytes a lane with 24 to
-spare. Summaries therefore cost **no additional page**: a store with summaries
-and the same store without them occupy the same number of bytes.
-
-`internal/storeio` treats the 30 bytes as opaque and validates nothing about
-their content; they are covered by the page checksum like every other byte.
-Their schema is owned by `store` (`store/store_zone_compact.go`,
-`ZoneSummary.Encode`/`Decode`):
-
-| Offset | Field | Notes |
-| --- | --- | --- |
-| 0:2 | status | bits 0–1 state (`0` stale, `1` ok, `2` poisoned), bit 2 overflow, bits 3–4 entry count (0–3), bits 5–13 three 3-bit flag fields (absent / null / value), bits 14–15 reserved zero |
-| 2:8 | tags | 3 × u16, the top 16 bits of the FNV-1a path hash of a tracked top-level member name |
-| 8:17 | min | 3 × u24, the top 24 bits of the entry's minimum value code |
-| 17:26 | max | 3 × u24, the top 24 bits of the entry's maximum value code |
-| 26:30 | reserved | must be zero |
-
-An all-zero record decodes as *stale* — "no statistics" — so a lane written
-by a builder that computed no summary keeps every chunk rather than pruning
-on a record it cannot read. The same is true of any record whose state,
-entry count, or reserved bits are out of range.
-
-Because a summary lives in the same page, generation, and checksum as the
-chunk reference it describes, and is written by the same copy-on-write commit,
-there is no state in which a recovered generation has a chunk extent without
-its summary or a summary without its extent.
-
-**Lookup**: check `Prefix` matches the chunk id's prefix at this `Shift`,
-extract `lane = (chunkID >> Shift) & 63`, probe `Bitmap` for that bit, then
-`rank = popcount(Bitmap & (bit-1))` selects the packed reference —
-one bitmap probe, one popcount, no scan. Non-leaf refs must have `Kind ==
-PageChunkDirectory` and exact `Length == PageSize`; leaf refs must have `Kind
-∈ {PageDocument, PageDocumentGroup}` and `Length >= PageSize`. A
-`PageDocument` may use any whole multiple of the metadata quantum; a
-`PageDocumentGroup` retains its larger power-of-two geometry.
+Kind 4 carried the chunk layout's packed-radix routing from chunk id to
+document extents, with optional per-lane 30-byte zone summaries. The layout is
+gone: no current file contains one, the identifier is held blank, and a page
+claiming it fails closed on decode. The ordered primary graph routes through
+`PagePrimaryCatalog`/`PageTabletDirectory`/`PagePrimaryAnchor` instead.
 
 ## FingerprintDirectory
 

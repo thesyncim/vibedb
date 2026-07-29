@@ -228,11 +228,6 @@ func OpenTermPosting(
 	}, nil
 }
 
-func (v TermPostingView) TileID() uint32                  { return v.posting.TileID }
-func (v TermPostingView) Rows() uint16                    { return v.posting.Rows }
-func (v TermPostingView) Codec() TermPostingCodec         { return v.posting.Codec }
-func (v TermPostingView) Placement() TermPostingPlacement { return v.posting.Placement }
-
 // Iterator returns an independent, zero-allocation cursor.
 func (v TermPostingView) Iterator() TermPostingIterator {
 	return TermPostingIterator{
@@ -310,24 +305,6 @@ func (p TermPosting) ReachableBytes() int {
 		return TermPostingInlineHeaderBytes + int(p.EncodedBytes)
 	}
 	return TermPostingManifestEntryBytes + int(p.EncodedBytes)
-}
-
-// TermPostingComponentIdentity returns the content identity stored in a
-// manifest entry. It is exposed so the persistent component interner and
-// recovery verifier use exactly the encoder's domain separation. Callers must
-// byte-compare a candidate component after an identity match.
-func TermPostingComponentIdentity(
-	codec TermPostingCodec,
-	rows uint16,
-	payload []byte,
-) (TermPostingComponentID, error) {
-	if codec > TermPostingSparseRows || rows > TermPostingTileRows ||
-		len(payload) > TermPostingMaxPayloadBytes {
-		return TermPostingComponentID{}, fmt.Errorf(
-			"%w: term posting component identity", ErrInvalidWrite,
-		)
-	}
-	return termPostingComponentID(codec, rows, payload), nil
 }
 
 func (it *TermPostingIterator) payload() []byte {

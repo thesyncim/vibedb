@@ -1,12 +1,9 @@
 # Architecture
 
 This is the front door to vibedb's storage design. The ordered-tablet primary
-graph is the layout: bulk-built and reopened collections read, mutate,
-checkpoint, and index against it. A freshly `Create`d empty collection still
-opens on the older chunk layout, which is scheduled for deletion; where the two
-differ this document describes the primary graph and flags the chunk layout as
-transitional. For public APIs, see [store.md](store.md); for bytes on disk, see
-[format.md](format.md).
+graph is the layout: every collection — freshly created, bulk-built, or
+reopened — reads, mutates, checkpoints, and indexes against it. For public
+APIs, see [store.md](store.md); for bytes on disk, see [format.md](format.md).
 
 ## The central rule: one reader-visible representation
 
@@ -31,10 +28,7 @@ That rule expands into a family of invariants:
    generation is complete.
 
 The primary graph realizes this with a `StateRoot` selecting an ordered-tablet
-catalog, its leaves, and an exact-index root. The transitional chunk layout
-realizes the same invariant family with a chunk directory, fingerprint
-directory, document pages, and exact-index directory; it is deleted with the
-last empty-created collection path.
+catalog, its leaves, and an exact-index root.
 
 ## The ordered-tablet graph
 
@@ -106,9 +100,6 @@ read root
   → exact key confirmation
 ```
 
-The transitional chunk layout instead follows the fingerprint directory, chunk
-directory, and document page to the same exact-key confirmation.
-
 The direct point read (`Collection.AppendRaw`) protects the read with one
 epoch slot — no lock, no per-call generation lease. A reader announces the
 generation it is about to read in a padded per-core slot; the serialized writer
@@ -139,9 +130,10 @@ remain deliberately read-only SELECT sources.
 
 Each SQL table is a durable collection plus catalog metadata for a declared
 JSON schema, one scalar document-derived primary-key path, and frozen exact
-index definitions. SQL-created tables currently use the mutable chunk layout
-so single writes and `Update` batches maintain compound exact postings in the
-same publication. Catalog replacement and first table-file creation include the
+index definitions. SQL-created tables use the ordered primary graph; single
+writes maintain compound exact postings in the same publication, and the
+driver batches through `Update` only where the collection supports it.
+Catalog replacement and first table-file creation include the
 platform namespace durability fence in addition to the durable file fence. The
 catalog and collection are reopened together, so schema validation and index
 maintenance do not disappear across process restarts.

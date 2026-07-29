@@ -62,8 +62,7 @@ type primaryBatchLeaf struct {
 }
 
 // updatePrimaryBatch applies one WriteBatch to the ordered primary graph as a
-// single failure-atomic generation. It is the primary-layout half of
-// Collection.Update; the chunk layout keeps its own committer-generation path.
+// single failure-atomic generation. It is the engine of Collection.Update.
 //
 // The whole batch prepares before any of it is durable, and publishes after: every
 // document is routed and its leaf frame is rewritten (all fallible, including the

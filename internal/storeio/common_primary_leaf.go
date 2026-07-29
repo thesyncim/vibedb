@@ -1623,23 +1623,6 @@ func (v *CommonPrimaryLeafView) LookupSlot(
 	return v.lookupRank(rank, key)
 }
 
-// LookupSlotRaw resolves one posting-stable slot without a primary-key
-// comparison. It is safe only after an admitted exact posting selected the
-// slot; key and raw borrow the leaf page for its lease lifetime.
-func (v *CommonPrimaryLeafView) LookupSlotRaw(
-	slot uint8,
-) (key, raw []byte, overflow, ok bool) {
-	rank, ok := v.slotRank(slot)
-	if !ok {
-		return nil, nil, false, false
-	}
-	key, valueStart, end, ok := v.keyBounds(rank)
-	if !ok || valueStart >= end {
-		return nil, nil, false, false
-	}
-	return key, v.payload[valueStart:end:end], v.rankOverflow(rank), true
-}
-
 // LowerBound returns the lexical rank of the first key greater than or equal to
 // key, in [0, Len]. It is the entry point for ordered range and prefix scans.
 func (v *CommonPrimaryLeafView) LowerBound(key []byte) int {
@@ -1685,13 +1668,6 @@ func (v *CommonPrimaryLeafView) Range(
 	lower, upper []byte,
 ) CommonPrimaryLeafIterator {
 	return v.iteratorAt(v.LowerBound(lower), upper, nil)
-}
-
-// Prefix returns an iterator over rows whose key begins with prefix.
-func (v *CommonPrimaryLeafView) Prefix(
-	prefix []byte,
-) CommonPrimaryLeafIterator {
-	return v.iteratorAt(v.LowerBound(prefix), nil, prefix)
 }
 
 func (v *CommonPrimaryLeafView) iteratorAt(
@@ -2549,38 +2525,6 @@ func (v *CommonPrimaryLeafView) rebuildMutationStash(
 		}
 	}
 	return nil
-}
-
-// PromoteCommonPrimaryLeaf re-encodes a narrow leaf into the wide class in dst
-// under a newer generation, preserving every record and its stable slot. It is
-// the copy-on-write step taken when a narrow leaf reports ErrCommonPrimaryLeaf
-// NeedsWide, and it keeps slots stable so locators and postings stay valid.
-func PromoteCommonPrimaryLeaf(
-	dst []byte,
-	generation uint64,
-	pageSize uint32,
-	narrow *CommonPrimaryLeafView,
-) ([]byte, error) {
-	if narrow == nil || narrow.class != CommonPrimaryLeafNarrow ||
-		generation <= narrow.header.Generation || generation >= uint64(1)<<48 ||
-		!validPhysicalPageSize(pageSize) || pageSize > 64<<10 ||
-		len(dst) < int(pageSize) ||
-		commonPrimaryLeafOverlaps(dst, narrow.page) {
-		return nil, fmt.Errorf("%w: primary leaf promotion", ErrInvalidWrite)
-	}
-	var records [CommonPrimaryLeafWideSlots]CommonPrimaryLeafRecord
-	count, ok := narrow.copyRecords(records[:], -1)
-	if !ok {
-		return nil, ErrCommonPrimaryLeafCorrupt
-	}
-	return EncodeCommonPrimaryLeaf(
-		dst, CommonPrimaryLeafWide,
-		CommonPrimaryLeafHeader{
-			StoreID: narrow.header.StoreID, Generation: generation,
-			Bucket: narrow.header.Bucket, PageSize: pageSize,
-		},
-		narrow.seed, records[:count], narrow.bounds,
-	)
 }
 
 // PromoteCommonPrimaryLeafUpdateTo combines a narrow-to-wide promotion with

@@ -298,13 +298,6 @@ type GlobalTabletCatalogBounds struct {
 	NextLogicalID          uint64
 }
 
-func GlobalTabletCatalogLeafLogicalID(bucket BucketID) (uint64, bool) {
-	if uint32(bucket) >= PrimaryBucketIDLimit {
-		return 0, false
-	}
-	return GlobalTabletCatalogLeafLogicalIDBase + uint64(bucket), true
-}
-
 func GlobalTabletCatalogAnchorLogicalID(tabletID uint32, pageID uint8) (uint64, bool) {
 	if tabletID >= TabletLocalIdentityTabletCount ||
 		pageID >= SegmentedTabletRouterMaxPages {
@@ -1117,27 +1110,6 @@ func OpenGlobalTabletCatalogLocator(
 			globalTabletCatalogCorrupt("locator cardinality")
 	}
 	return view, nil
-}
-
-// AdmittedGlobalTabletCatalogLocator reconstructs a compact locator already
-// fully validated by PageCache admission. Calling it on arbitrary bytes is
-// invalid.
-func AdmittedGlobalTabletCatalogLocator(
-	src []byte, expected PageRef, bounds GlobalTabletCatalogBounds,
-) GlobalTabletCatalogLocatorView {
-	header, _ := decodePageHeader(src)
-	payloadEnd := PageHeaderSize + int(header.PayloadLength)
-	payload := src[PageHeaderSize:payloadEnd:payloadEnd]
-	return GlobalTabletCatalogLocatorView{
-		image:  src[:header.PageSize],
-		packed: payload[GlobalTabletCatalogLocatorHeader:],
-		header: header, ref: expected,
-		tabletID:   binary.LittleEndian.Uint32(payload[4:8]),
-		live:       binary.LittleEndian.Uint16(payload[8:10]),
-		retired:    binary.LittleEndian.Uint16(payload[10:12]),
-		reuseFloor: binary.LittleEndian.Uint64(payload[16:24]),
-		bounds:     bounds,
-	}
 }
 
 func (v *GlobalTabletCatalogLocatorView) Resolve(

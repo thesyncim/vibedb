@@ -14,12 +14,11 @@ describes a target; this file describes the APIs and formats implemented today.
 | Surface | Purpose | Persistence |
 | --- | --- | --- |
 | `store.Segment` | Immutable self-contained batch of documents with its own tape, shape, and column machinery | Explicit segment image |
-| `store.Collection` | Mutable in-memory keyed collection with immutable snapshots | Explicit full checkpoint |
+| `store.Collection` | Mutable in-memory keyed collection with immutable snapshots | None; bulk source for `durable.CreateFromPrimary` |
 | `store.Database` | In-memory catalog and consistent snapshot of independent collections | None beyond each collection |
 | `store.Builder` | Bulk construction of a `store.Collection` | None |
 | `durable.Collection` | Bounded-residency durable collection | Automatic incremental commits |
 | `durable.Database` | Directory catalog and process-consistent snapshot; one durable file per collection | Per-collection automatic commits |
-| `Collection.WriteTo` / `store.Open` | Portable immutable collection image | Explicit full checkpoint |
 
 A collection is one physical JSON namespace. `store.Database` catalogs
 in-memory collections. `durable.Database` catalogs one collection file per
@@ -65,9 +64,6 @@ Replacing a key:
 - shares unchanged immutable state with older snapshots;
 - rebuilds at most the configured chunk and bounded metadata paths.
 
-`Delete` removes the row from its chunk. It creates no tombstone, version chain,
-or later compaction obligation. An empty chunk is removed immediately.
-
 Writes are serialized. Each successful write publishes one immutable state
 through an atomic pointer.
 
@@ -86,10 +82,11 @@ err := collection.Update(func(b *durable.WriteBatch) error {
 })
 ```
 
-The batch rebuilds each touched chunk once rather than once per document,
-descends each directory once rather than once per key, and publishes one root
-behind one durability fence. It either publishes whole or publishes nothing: an
-error from the closure or from any staged mutation aborts the transaction.
+The batch rewrites each touched primary leaf once rather than once per
+document, covers the group with one journal record synced once, and flips every
+leaf pointer under one generation. It either publishes whole or publishes
+nothing: an error from the closure or from any staged mutation aborts the
+transaction.
 
 `Options.MaxBatchDocuments` bounds how many distinct keys one `Update` may carry
 and sizes the transaction reservation; zero selects 64. A larger batch reports
@@ -98,17 +95,10 @@ half-applied batch after a crash. Keys are deduplicated as they are recorded, so
 mutating the same key twice keeps only the last mutation. Document syntax is
 validated when `Update` applies the batch, not when `Put` records it.
 
-A collection built by `CreateFrom` carries two read accelerators that the batched
-path releases rather than maintains: the compact index-group catalog and the
-dense float64 scan projection. Exact postings and the chunk-tree scan stay
-authoritative and current, so releasing them costs query speed, never an answer.
-The single-document path already releases the projection on the first appending
-`Put` after a bulk build.
-
 ### Snapshots and reads
 
 `Snapshot` is O(1) and does not wait for an in-progress writer. A snapshot stays
-valid after any later update or delete.
+valid after any later write.
 
 `Snapshot.GetRaw` is lock-free, clock-free, and allocation-free. The returned
 `RawValue` borrows snapshot storage. Use `AppendRaw` when the bytes must outlive
@@ -190,32 +180,15 @@ into final chunks, and builds declared indexes before publishing one collection.
 builder. Once final key compaction succeeds, Build is terminal; a later failure
 releases every unpublished external block and the builder cannot be retried.
 
-Use the builder for an initial corpus, `Collection.Update` for subsequent bulk
-ingestion, and `Collection.Put` for individual mutations.
+Use the builder for an initial corpus and `Collection.Put` for individual
+mutations.
 
-## Collection checkpoints
+## Persisting an in-memory collection
 
-`Collection.WriteTo` writes a complete immutable checkpoint. It is not incremental:
-every live chunk is streamed on each call, and later writes do not modify the
-image.
-
-`store.Open` validates the complete image before publication and returns a
-normally mutable collection. Source and structural-tape bytes may borrow the
-input image. Keep that image immutable and alive until the collection, all
-snapshots, and all derived borrowed values are unreachable. Mutations after
-open are heap-only until another `WriteTo`.
-
-A checkpoint is a container, not a second document codec: its payload region is
-a concatenation of `Segment` images written by `Segment.WriteTo`, and the
-checkpoint manifest adds only the collection-level catalog (chunk directory, key
-spellings, schema, index definitions, and free chunk ids). The
-two formats share one fixed envelope — a 16-byte header (`ImageHeaderLen`) and a
-40-byte checksummed footer (`ImageFooterLen`) around a self-describing manifest —
-but keep independent magics, version lineages, and error taxonomies, so a
-segment image and a checkpoint can move apart without either dragging the other.
-
-The format is versioned and pre-v1. Cross-version compatibility is not promised
-until the format is declared stable.
+The heap store has no image checkpoint of its own. Persistence is bulk
+conversion: `durable.CreateFromPrimary` walks a completed in-memory collection
+once and writes one immutable ordered primary graph, after which reads and
+mutations continue against the durable collection.
 
 ## Durable collections
 
@@ -324,37 +297,28 @@ independently owned descriptors. `Backend` can select the portable engine or
 the pure-Go `io_uring` engine. `durable.Stats` reports the actual backend and
 direct-I/O choices after fallback.
 
-### Durable indexes and numeric covers
+### Durable indexes
 
 `durable.Options.Indexes` declares up to 4,096 logical exact scalar or compound
 index names over at most 64 distinct ordered path definitions. Logical aliases
 share one physical index. Definitions are fixed at creation and verified when
 reopened. Each write maintains their postings transactionally.
 
-`Float64Columns` declares up to 256 RFC 6901 paths. Numeric sidecars support
-the store's explicit float64 reduction APIs without reopening JSON when the
-request is fully covered. Missing, non-numeric, and non-finite values are
-absent from the cover. The SQL/query executor deliberately does not use these
-summaries for `SUM`, `AVG`, `MIN`, or `MAX`: its contract is exact decimal
-reduction, which a binary64 cover cannot certify.
-
 ### Bulk creation
 
-`durable.CreateFrom` converts a completed in-memory store directly into one
-durable generation. It preserves keys, schema, and declared exact indexes
-while packing documents and configured numeric covers without replaying
-individual `Put` calls.
+`durable.CreateFromPrimary` converts a completed in-memory store directly into
+one durable generation. It preserves keys and declared exact indexes without
+replaying individual `Put` calls.
 
-**The bulk path and a `Put` loop do not produce the same file.** Only the bulk
-writer emits the `DocumentGroup` extent described in
-[docs/format.md](format.md) — the page-local template table and value
-dictionary that deduplicate structural repetition and repeated exact leaf
-values. A collection built by replaying `Put` never reaches that
-representation, and on a corpus with repeated field values it is several times
-larger on disk than the same documents written in bulk. How much larger depends
-entirely on how repetitive the values are, so neither figure is "the" durable
-footprint; a measured comparison must state the corpus and report a
-high-cardinality control beside the redundant case.
+**The bulk path and a `Put` loop do not produce the same file when
+`DocumentFormat` selects compact.** Only the bulk writer emits compact leaves —
+the per-leaf template table and value dictionary that deduplicate structural
+repetition and repeated exact values. A collection built by replaying `Put`
+never reaches that representation, and on a corpus with repeated field values
+it is several times larger on disk than the same documents written in bulk.
+How much larger depends entirely on how repetitive the values are, so neither
+figure is "the" durable footprint; a measured comparison must state the corpus
+and report a high-cardinality control beside the redundant case.
 
 ## Allocation and ownership
 
@@ -400,14 +364,13 @@ the internal drain and cleanup protocol before returning `query.ErrCanceled`. Le
 `ExecOptions.Cancel` nil keeps the default hot path allocation-free and avoids
 an atomic load; installing a dormant flag also remains allocation-free.
 
-The in-memory store copies `Put` input. `store.Open` may borrow its image.
-`durable.Collection` copies writes and uses explicit snapshot leases for reads.
+The in-memory store copies `Put` input. `durable.Collection` copies writes and
+uses explicit snapshot leases for reads.
 
 ### Memory accounting
 
-`store.Stats` separates caller-owned mapped image bytes from external key,
-document, and packed-index bytes. Those counters do not include the Go heap or
-total process RSS.
+`store.Stats` reports external key, document, and packed-index bytes. Those
+counters do not include the Go heap or total process RSS.
 
 Bulk-built and opened immutable bases can use pointer-free external blocks, but
 the mutable key HAMT, recent index deltas, and chunk publication paths

@@ -105,15 +105,6 @@ type PrimaryGraphBuildStats struct {
 	LeavesByClass [5]int
 }
 
-// Leaves returns the total leaf count across classes.
-func (s PrimaryGraphBuildStats) Leaves() int {
-	total := 0
-	for _, count := range s.LeavesByClass {
-		total += count
-	}
-	return total
-}
-
 // BuildPrimaryGraph deterministically stages one complete ordered primary
 // graph in tx. Records must be strictly bytewise lexical and contain inline
 // non-empty values. Passing no policy selects PrimaryLeafAdaptive; at most one

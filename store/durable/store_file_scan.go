@@ -5,20 +5,9 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-const fileScanReadAheadLimit = 64
-
-type fileScanPage struct {
-	ref    storeio.PageRef
-	mask   uint64
-	chunk  uint32
-	chunks uint32
-}
-
-// RangeRaw visits live rows in the selected primary representation's order:
-// bytewise lexical order for an ordered primary graph, and ascending
-// chunk/slot order for the legacy graph. key and value are borrowed only for
-// the callback; overflow values reuse one bounded buffer. Returning an error
-// stops the scan immediately.
+// RangeRaw visits live rows in bytewise lexical key order. key and value are
+// borrowed only for the callback; overflow values reuse one bounded buffer.
+// Returning an error stops the scan immediately.
 func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
 	_, err := s.RangeRawBuffer(nil, fn)
 	return err
@@ -27,9 +16,6 @@ func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
 // RangeRawBuffer is RangeRaw with caller-owned overflow storage. The returned
 // slice preserves any grown capacity for the next scan. Inline-only scans and
 // warmed overflow scans allocate nothing when scratch has sufficient capacity.
-//
-// This method issues document reads serially. Use RangeRawReadAheadBuffer for
-// a cold scan whose corpus exceeds the resident page budget.
 func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return scratch, ErrClosed
@@ -40,17 +26,10 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
 }
 
-// RangeRawReadAheadBuffer is the bounded cold-scan form of RangeRawBuffer.
-// It discovers a small chunk-ordered window, submits its document extents in
-// physical order, and still invokes fn in exact chunk/slot order. The window
-// is capped by buddy reservation bytes equal to one half of ResidentBytes,
-// PrefetchQueue, 64 extents, and either ReadQueueDepth for io_uring or four
-// requests per portable worker. Queue pressure merely shortens read-ahead;
-// demand reads remain authoritative and return every validation or I/O error.
-//
-// Read-ahead is speculative: if fn stops early, at most one bounded window may
-// already have been submitted. The method retains no page lease across fn and
-// allocates nothing after caller overflow capacity is warm.
+// RangeRawReadAheadBuffer is currently an alias of RangeRawBuffer, retained
+// for its callers in the query layer: the ordered-primary scan reads inline
+// values from the leaves it already walks in order, so it has no separate
+// document-extent read-ahead lane.
 func (s *Snapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return scratch, ErrClosed
@@ -58,15 +37,11 @@ func (s *Snapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, value []
 	if fn == nil {
 		return scratch, nil
 	}
-	// The ordered-primary scan reads inline values from the leaves it already
-	// walks in order, so it has no separate document-extent read-ahead lane.
 	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
 }
 
 // rangePrimaryGraph is the ordered-primary scan core. lower is inclusive,
 // upper is exclusive, and a non-empty prefix additionally bounds the result.
-// It exists separately from the legacy chunk scan so one published state
-// consults exactly one primary representation.
 func (s *Snapshot) rangePrimaryGraph(
 	lower, upper, prefix []byte,
 	fn func(key, value []byte) error,

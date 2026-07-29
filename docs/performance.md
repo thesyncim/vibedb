@@ -30,9 +30,10 @@ was wired as the `DurabilitySync` lane (it measures 4.05 ms at store level
 against SQLite's comparable 4.09 ms, which the published two-fence power-safe
 row predates), and the compact document format was ported to the primary graph
 as leaf class 4 (a 100k-doc footprint diagnostic of roughly 7.8 MiB
-low-cardinality / 17.6 MiB high-cardinality, below the chunk-layout compact
-footprint the published table still cites). Neither is a published competitive
-number until the harness re-measures them.
+low-cardinality / 17.6 MiB high-cardinality, below the compact footprint the
+published table still cites, which was measured on the since-deleted chunk
+layout). Neither is a published competitive number until the harness
+re-measures them.
 
 The ordered primary graph additionally measures 412 ns hot in-place
 acknowledgements, 437-446 ns point reads, and 20.7 ns/doc all-byte
@@ -80,10 +81,10 @@ byte and is the scan-throughput result.
 | Pebble | 1,235 ns | 43.00 ns/doc | 112.4 ns/doc | 80 B / 2 | ~85 B / 1 |
 | SQLite | 2,838 ns | 170.4 ns/doc | 244.5 ns/doc | 1,092 B / 22 | 27.4 MiB / 200,017 |
 
-These rows measure the transitional chunk layout at the baseline commit, before
-the ordered primary graph became the harness default. The current cross-engine
-standing is the mixedsuite refresh above and in `RESULTS.md`; this table is
-retained as the read/scan baseline that refresh must replace.
+These rows were measured on the since-deleted chunk layout at the baseline
+commit, before the ordered primary graph became the only layout. The current
+cross-engine standing is the mixedsuite refresh above and in `RESULTS.md`; this
+table is retained as the read/scan baseline that refresh must replace.
 
 ## Pinned mixed-workload diagnostics
 

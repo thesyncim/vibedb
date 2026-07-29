@@ -121,7 +121,7 @@ resource bounds.
 | --- | --- | --- | --- |
 | `DurabilityBufferedVisible` | accepted into bounded canonical COW staging | immediate | acknowledged changes after the last successful `Flush` may be lost |
 | `DurabilityAsyncVisible` | accepted by the bounded background committer | immediate | acknowledged generations not yet reported by `DurableGeneration` may be lost |
-| `DurabilitySync` (zero value) | data and alternate root crossed the platform's power-safe barriers | after the barriers | recovery selects the complete old or new generation |
+| `DurabilitySync` (zero value) | one recovery-journal record appended and synced on the primary graph, then the mutation applies and publishes | after the journal sync — visibility strictly follows durability | recovery selects the last checkpointed root and replays the journal's acknowledged records |
 
 For buffered mode, `CheckpointPowerSafe` is the zero-value `Flush` strength;
 `CheckpointFilesystem` explicitly selects an ordinary filesystem boundary.

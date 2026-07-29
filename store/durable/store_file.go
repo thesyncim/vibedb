@@ -36,9 +36,11 @@ var (
 	// grow to MaxPageSize); variable base page sizes are no longer supported, so
 	// Create refuses a non-4096 PageSize and Open refuses a store that recorded one.
 	ErrUnsupportedPageSize = errors.New("vibejson: collection page size must be 4096")
-	// ErrPrimaryLeafSplitRequired reports a correct deferred structural insert.
-	// The mutation was not published; the next ordered-primary phase replaces
-	// this signal with an atomic leaf split.
+	// ErrPrimaryLeafSplitRequired reports that an insert landed on a leaf with
+	// no room for it. It is an internal retry signal: the mutation path catches
+	// it, commits an atomic leaf split as its own structural transaction, and
+	// retries the insert, so a successful mutation never surfaces it. It reaches
+	// a caller only when the bounded split-and-retry loop cannot make progress.
 	ErrPrimaryLeafSplitRequired = errors.New(
 		"vibejson: ordered primary leaf split required",
 	)
@@ -117,12 +119,11 @@ type DurabilityMode uint8
 
 const (
 	// DurabilitySync is the safe zero value. A mutation becomes visible and
-	// returns success only after it is durable. On a primary-layout store that
-	// durability is a bounded recovery-journal record appended and synced before
-	// the mutation is applied and published — its root is folded in at the next
-	// checkpoint — so visibility strictly follows durability; on the chunk layout
-	// it is the committer's data and root barriers. Either way no reader observes
-	// an un-durable acknowledged mutation.
+	// returns success only after it is durable: a bounded recovery-journal
+	// record is appended and synced before the mutation is applied and
+	// published — its root is folded in at the next checkpoint — so visibility
+	// strictly follows durability and no reader observes an un-durable
+	// acknowledged mutation.
 	DurabilitySync DurabilityMode = iota
 	// DurabilityAsyncVisible explicitly publishes after bounded queue
 	// admission while persistence continues in the background.
@@ -155,13 +156,13 @@ const (
 // Options fixes every collection-owned resident and in-flight memory
 // bound. The zero value selects 4 KiB metadata pages, 64 KiB
 // document/overflow extents, a 64 MiB read cache, and 4 MiB maximum documents.
-// DocumentFormat selects the physical representation CreateFrom gives document
-// bytes. It is a space-against-scan-speed decision, the two options are far
-// apart on both axes, and which one a workload wants is not obvious, so it is
-// stated explicitly rather than chosen silently.
+// DocumentFormat selects the physical representation CreateFromPrimary gives
+// document bytes. It is a space-against-scan-speed decision, the two options
+// are far apart on both axes, and which one a workload wants is not obvious, so
+// it is stated explicitly rather than chosen silently.
 //
 // Measured on 100,000 documents averaging 299 bytes, Apple M4 Max, medians of
-// -count=6, both files written by CreateFrom from the same source collection:
+// -count=6, both files bulk-built from the same source collection:
 //
 //	                          verbatim   compact
 //	file size                 52.7 MiB   27.1 MiB
@@ -193,23 +194,22 @@ const (
 // and they answer different questions; quote the one that matches the question
 // being asked.
 //
-// Verbatim is the default because a caller who reaches for CreateFrom is
+// Verbatim is the default because a caller who reaches for CreateFromPrimary is
 // usually after "write every page exactly once", and should not silently
 // receive an order-of-magnitude resident-scan regression they did not ask for.
 type DocumentFormat uint8
 
 const (
-	// DocumentFormatVerbatim stores each chunk as one PageDocument extent
-	// holding contiguous JSON, which a scan hands to its callback as a
-	// borrowed slice with no decoding at all.
+	// DocumentFormatVerbatim stores each document's exact JSON contiguously in
+	// ordinary primary leaves, which a scan hands to its callback as a borrowed
+	// slice with no decoding at all.
 	DocumentFormatVerbatim DocumentFormat = iota
 	// DocumentFormatCompact stores documents as a grouped image that keeps one
 	// shape template and one value dictionary per container and reduces each row
-	// to a token stream: on the chunk layout consecutive chunks become
-	// PageDocumentGroup extents, and on the ordered primary graph each leaf
-	// embeds the same grouped payload as the compact leaf class. Reading a row
-	// means reassembling it from roughly two dozen fragments, which is where the
-	// scan cost is; see DocumentFormat for the numbers.
+	// to a token stream: each primary leaf embeds the grouped payload as the
+	// compact leaf class. Reading a row means reassembling it from roughly two
+	// dozen fragments, which is where the scan cost is; see DocumentFormat for
+	// the numbers.
 	DocumentFormatCompact
 )
 
@@ -227,16 +227,11 @@ type Options struct {
 	// they share posting maintenance and durable bytes while remaining
 	// independently discoverable and queryable.
 	Indexes []store.IndexDefinition
-	// Float64Columns are frozen RFC 6901 paths stored beside each document
-	// micro-page as typed covering columns. Predicate-free numeric aggregates
-	// can reduce these values without parsing JSON. Missing, non-numeric, and
-	// non-finite values are omitted from the column.
-	Float64Columns []string
-	// DocumentFormat selects how a bulk build (CreateFrom on the chunk layout,
-	// CreateFromPrimary on the ordered primary graph) stores document bytes. It
-	// has no effect on Open, Put, or Update: a collection reads both
-	// representations unconditionally, and ordinary writes always produce the
-	// verbatim one (a compact leaf de-compacts on its first mutation).
+	// DocumentFormat selects how a bulk build (CreateFromPrimary) stores
+	// document bytes. It has no effect on Open, Put, or Update: a collection
+	// reads both representations unconditionally, and ordinary writes always
+	// produce the verbatim one (a compact leaf de-compacts on its first
+	// mutation).
 	DocumentFormat DocumentFormat
 
 	// PageSize is the base page of the ordered primary graph. It must be 4096:
@@ -258,11 +253,11 @@ type Options struct {
 	MaxKeyBytes      int
 	InlineValueBytes int
 	MaxDocumentBytes int
-	// BufferCount is retained for configuration compatibility through the
-	// storage unification cutover. It normalizes the maximum transaction and
-	// checkpoint descriptor geometry, but immutable data pages now encode
-	// directly in PageCache frames. The committer owns only a small fixed arena
-	// for alternate roots, recovery journals, and sparse canonical patches.
+	// BufferCount normalizes the maximum transaction and checkpoint descriptor
+	// geometry. Immutable data pages encode directly in PageCache frames; the
+	// committer owns only a small fixed arena for alternate roots, recovery
+	// journals, and sparse canonical patches, and BufferCount bounds how many
+	// page descriptors one transaction may stage.
 	//
 	// An explicit Update reserves the worst case for the configured
 	// MaxDocumentBytes and MaxBatchDocuments — overflow, indexes, free-space
@@ -274,9 +269,8 @@ type Options struct {
 	// worst-case transactions while the pool remains within a 32 MiB target.
 	// The legal minimum wins when one transaction already exceeds that target.
 	// With today's zero-value 64-document batch bound, the worst case is 663
-	// pages, so zero still normalizes to 1,024 descriptors. This knob is
-	// deprecated and may become fully vestigial at that cutover; explicit
-	// values remain accepted and validated meanwhile.
+	// pages, so zero normalizes to 1,024 descriptors. Explicit values are
+	// accepted and validated.
 	BufferCount int
 	QueueSlots  int
 	// GroupLimit caps how many adjacent generations share one durability
@@ -508,7 +502,6 @@ type normalizedFileStoreOptions struct {
 	pageCatalog                    *storeio.CanonicalPageCatalog
 	indexes                        []*store.ExactIndex
 	indexNameIDs                   map[string]uint32
-	float64Columns                 []fileStoreFloat64Column
 	indexCatalogHash               uint64
 }
 
@@ -521,13 +514,7 @@ const (
 	// bound so an untrusted configuration cannot force unbounded compilation,
 	// hashing, and lookup-map growth.
 	fileStoreMaxLogicalIndexes = 4096
-	fileStoreMaxFloat64Columns = 256
 )
-
-type fileStoreFloat64Column struct {
-	spec    string
-	pointer vibejson.CompiledPointer
-}
 
 func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	storeOptions, err := o.Collection.Normalized()
@@ -641,11 +628,6 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			store.ErrIndexDefinition, fileStoreMaxLogicalIndexes,
 		)
 	}
-	if len(o.Float64Columns) > fileStoreMaxFloat64Columns {
-		return normalizedFileStoreOptions{}, fmt.Errorf(
-			"vibejson: collection supports at most %d float64 columns", fileStoreMaxFloat64Columns,
-		)
-	}
 	inputIndexes := make([]storeio.PageCatalogIndex, len(o.Indexes))
 	seenIndexes := make(map[string]struct{}, len(o.Indexes))
 	for i, definition := range o.Indexes {
@@ -661,23 +643,6 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			Name:  strings.Clone(definition.Name),
 			Paths: slices.Clone(exact.Specs[:exact.N]),
 		}
-	}
-	inputColumns := make([]string, len(o.Float64Columns))
-	seenColumns := make(map[string]struct{}, len(o.Float64Columns))
-	for i, spec := range o.Float64Columns {
-		owned := strings.Clone(spec)
-		if _, exists := seenColumns[owned]; exists {
-			return normalizedFileStoreOptions{}, fmt.Errorf(
-				"%w: duplicate float64 column %q", store.ErrIndexDefinition, owned,
-			)
-		}
-		if _, compileErr := vibejson.CompilePointer(owned); compileErr != nil {
-			return normalizedFileStoreOptions{}, fmt.Errorf(
-				"%w: float64 column %d: %v", store.ErrIndexDefinition, i, compileErr,
-			)
-		}
-		seenColumns[owned] = struct{}{}
-		inputColumns[i] = owned
 	}
 	var catalogSchema *storeio.PageCatalogSchema
 	if o.Collection.Schema != nil {
@@ -700,8 +665,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	pageCatalog, catalogErr := storeio.BuildCanonicalPageCatalog(
 		storeio.PageCatalogDefinition{
-			Indexes: inputIndexes, Float64Paths: inputColumns,
-			Schema: catalogSchema,
+			Indexes: inputIndexes, Schema: catalogSchema,
 		},
 	)
 	if catalogErr != nil {
@@ -765,25 +729,6 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		}
 	}
 	o.Indexes = definitions
-	columns := make([]fileStoreFloat64Column, len(canonical.Float64Paths))
-	for i, spec := range canonical.Float64Paths {
-		pointer, compileErr := vibejson.CompilePointer(spec)
-		if compileErr != nil {
-			return normalizedFileStoreOptions{}, fmt.Errorf(
-				"%w: canonical float64 column %d: %v",
-				store.ErrIndexDefinition, i, compileErr,
-			)
-		}
-		columns[i] = fileStoreFloat64Column{spec: spec, pointer: pointer}
-	}
-	o.Float64Columns = slices.Clone(canonical.Float64Paths)
-	if len(columns) != 0 {
-		catalogHash = fileIndexHashBytes(catalogHash, []byte{0xfc, 0x64})
-		for _, column := range columns {
-			catalogHash = fileIndexHashBytes(catalogHash, []byte(column.spec))
-			catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
-		}
-	}
 	if o.Collection.Schema != nil {
 		catalogHash = fileIndexHashBytes(
 			catalogHash, []byte{0x53, 0x43, 0x48},
@@ -796,8 +741,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			catalogHash, identity[:],
 		)
 	}
-	if len(compiled) == 0 && len(columns) == 0 &&
-		o.Collection.Schema == nil {
+	if len(compiled) == 0 && o.Collection.Schema == nil {
 		catalogHash = 0
 	} else if catalogHash == 0 {
 		// StateRoot reserves zero to mean that no exact catalog exists. FNV is
@@ -845,9 +789,6 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// charging MaxPageSize for every metadata descriptor.
 	largePages := overflowPages + 1
 	if len(compiled) != 0 {
-		largePages++
-	}
-	if len(columns) != 0 {
 		largePages++
 	}
 	metadataPages := docMaxTransactionPages - largePages
@@ -905,7 +846,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		freeFoldLimit:                  freeFoldLimit,
 		pageCatalog:                    pageCatalog,
 		indexes:                        compiled, indexNameIDs: indexNameIDs,
-		float64Columns: columns, indexCatalogHash: catalogHash,
+		indexCatalogHash: catalogHash,
 	}, nil
 }
 
@@ -1069,7 +1010,7 @@ type Collection struct {
 	// claims one epoch slot instead of a snapshot-gate round trip plus a
 	// mutex-guarded generation lease; long-lived Snapshots keep their leases.
 	// Writer-side decisions that consult reader presence must combine both
-	// tables (anyActiveReaders/safeFromReaders) inside a reader fence.
+	// tables (anyActiveReaders) inside a reader fence.
 	readEpochs    *storeio.ReadEpochs
 	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
@@ -1514,20 +1455,12 @@ type Stats struct {
 	// FreeScratchLiveBytes is the portion occupied by the current fold's
 	// fenced/image/range/order slices. It returns to zero or a small retained
 	// plan without fragmenting the general heap.
-	FreeScratchLiveBytes uint64
-	// Float64ScratchBytes is the fixed pointer-free writer scratch used to
-	// rebuild typed covering columns during one chunk replacement.
-	Float64ScratchBytes   uint64
+	FreeScratchLiveBytes  uint64
 	PendingRetiredExtents uint64
 	PendingRetiredBytes   uint64
-	// AbandonedExtents and AbandonedBytes are retained for source compatibility
-	// and are always zero. Commits now fail before publication rather than
-	// forgetting reusable-space metadata.
-	AbandonedExtents uint64
-	AbandonedBytes   uint64
-	ReusableExtents  uint64
-	ReusableBytes    uint64
-	DocumentCount    uint64
+	ReusableExtents       uint64
+	ReusableBytes         uint64
+	DocumentCount         uint64
 	// ChunkSlots is the stable-slot capacity in live chunks. VacantChunkSlots
 	// is the immediately reusable logical space inside those chunks; it excludes
 	// absent chunks below ChunkHighWater, which an insert can also reclaim.
@@ -1575,7 +1508,7 @@ func Create(file *os.File, options Options) (*Collection, error) {
 	// createInitialState publishes an empty primary graph, and the committer's
 	// deferred-root checkpoint mode is selected for the buffered and journal-backed
 	// synchronous lanes exactly as it is for an opened primary store.
-	collection, err := newCollectionResources(file, normalized, storeID, true)
+	collection, err := newCollectionResources(file, normalized, storeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1646,10 +1579,7 @@ func Open(file *os.File, options Options) (*Collection, error) {
 		root.MaxPageSize != uint32(normalized.MaxPageSize) {
 		return nil, fmt.Errorf("vibejson: collection options or unsupported durable catalog mismatch")
 	}
-	collection, err := newCollectionResources(
-		file, normalized, root.StoreID,
-		root.PrimaryRoot != (storeio.PageRef{}),
-	)
+	collection, err := newCollectionResources(file, normalized, root.StoreID)
 	if err != nil {
 		return nil, err
 	}
@@ -1692,22 +1622,11 @@ func Open(file *os.File, options Options) (*Collection, error) {
 		_ = collection.closeResources()
 		return nil, err
 	}
-	if root.PrimaryRoot != (storeio.PageRef{}) {
-		if err := collection.setupResidentPrimaryLocked(state); err != nil {
-			_ = collection.closeResources()
-			return nil, err
-		}
+	if err := collection.setupResidentPrimaryLocked(state); err != nil {
+		_ = collection.closeResources()
+		return nil, err
 	}
 	collection.initializeFileState(state)
-	// The recovery journal only has a mutation lane on the ordered primary graph.
-	// Opening a chunk-layout store with Options.RecoveryJournal would acknowledge
-	// nothing through the journal, and a root that names a journal but carries no
-	// primary graph is corrupt: both fail closed rather than lie about durability.
-	if root.PrimaryRoot == (storeio.PageRef{}) &&
-		(collection.journalConfigured() || root.JournalID != ([16]byte{})) {
-		_ = collection.closeResources()
-		return nil, ErrRecoveryJournalRequiresPrimary
-	}
 	// A root that names a journal must pair, replay, and recycle it before the
 	// collection is reachable. A non-zero JournalID is authoritative regardless of
 	// the caller's option: the store may have acknowledged mutations only the
@@ -1743,14 +1662,12 @@ func Open(file *os.File, options Options) (*Collection, error) {
 // production keeps the platform committer.
 var storeCommitterFactory = storeio.NewCommitter
 
-// newCollectionResources builds the committer and cache for a collection.
-// primaryLayout reports whether the store carries an ordered primary graph,
-// known from the recovered root at Open (and always false for a freshly created
-// chunk store). It selects the committer's deferred-root manual checkpoint mode
-// for both buffered-visible and the journal-backed synchronous lane, which
-// stages canonical frames and publishes the root at checkpoints rather than
+// newCollectionResources builds the committer and cache for a collection. The
+// committer runs in deferred-root manual checkpoint mode on every lane except
+// async-visible: both buffered-visible and the journal-backed synchronous lane
+// stage canonical frames and publish the root at checkpoints rather than
 // fencing one per mutation.
-func newCollectionResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte, primaryLayout bool) (*Collection, error) {
+func newCollectionResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte) (*Collection, error) {
 	writeFile, directWrite, err := storeio.OpenPageCommitFile(file, storeio.DirectMode(options.WriteMode))
 	if err != nil {
 		return nil, err
@@ -1764,8 +1681,7 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		QueueSlots:         options.QueueSlots, MaxPagesPerBatch: options.maxTransactionPages,
 		GroupLimit: options.GroupLimit, CoalesceDelay: options.CommitCoalesce,
 		MaterializationDamageGranule: uint32(options.MaterializationDamageGranule),
-		ManualCheckpoint: options.Durability == DurabilityBufferedVisible ||
-			options.Durability == DurabilitySync && primaryLayout,
+		ManualCheckpoint:             options.Durability != DurabilityAsyncVisible,
 	})
 	if err != nil {
 		if writeFile != file {
@@ -2101,8 +2017,8 @@ func (c *Collection) beginWriteTransaction(
 // created store is primary-layout from its first byte: the root names an empty
 // primary graph (one empty leaf spanning the whole key range) and, when the
 // collection is indexed, an empty exact-index root. The first Put routes to that
-// empty leaf and fills it. Float64 columns and schemas were only ever available
-// on the deleted chunk layout, so a fresh store never sets those root flags.
+// empty leaf and fills it. A configured schema is recorded in the root's option
+// flags and catalog and enforced on every primary Put.
 func (c *Collection) createInitialState() error {
 	if c.options.PageSize != 4096 {
 		return fmt.Errorf(
@@ -2198,9 +2114,7 @@ func (c *Collection) createInitialState() error {
 	// synchronous lane is journal-backed on the primary graph unconditionally --
 	// it is how sync acknowledges -- while buffered-visible carries a journal only
 	// on the RecoveryJournal opt-in. Async-visible never carries one. This is the
-	// creation-time counterpart of CreateFromPrimary's journal mint; Create builds
-	// a primary store now, so a journaled Create succeeds where it once failed
-	// closed.
+	// creation-time counterpart of CreateFromPrimary's journal mint.
 	journalRequired := c.options.Durability == DurabilitySync ||
 		c.journalConfigured()
 	if journalRequired {
@@ -2849,7 +2763,7 @@ func (c *Collection) rememberRetiredRef(ref storeio.PageRef) {
 }
 
 // reserveFileRetirements hands the complete list to the reclaimer. It runs after
-// syncFreeLog so that the free log's own superseded pages — which a fold only
+// syncFreeLogFor so that the free log's own superseded pages — which a fold only
 // knows once it has decided to fold — are reserved with everything else, and so
 // that a failure here still precedes Publish and rolls the whole commit back.
 //

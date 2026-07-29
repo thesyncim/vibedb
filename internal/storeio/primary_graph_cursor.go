@@ -14,14 +14,6 @@ type primaryGraphCatalogPathEntry struct {
 	ordinal    uint16
 }
 
-// PrimaryGraphRow borrows its key and inline value from the cursor's current
-// leaf lease. They remain valid only until the next cursor operation or Close.
-type PrimaryGraphRow struct {
-	Key      []byte
-	Inline   []byte
-	Overflow PageRef
-}
-
 // PrimaryGraphCursor walks one snapshot-selected ordered primary graph.
 //
 // Successors are reconstructed exclusively from catalog ordinals, tablet
@@ -64,24 +56,6 @@ type PrimaryGraphCursor struct {
 	done bool
 }
 
-// OpenPrimaryGraphCursor positions a cursor at the first key >= lower. A
-// non-empty upper bound is exclusive.
-func OpenPrimaryGraphCursor(
-	cache *PageCache,
-	root PageRef,
-	bounds GlobalTabletCatalogBounds,
-	leafBounds CommonPrimaryLeafBounds,
-	lower, upper []byte,
-) (PrimaryGraphCursor, error) {
-	var cursor PrimaryGraphCursor
-	if err := InitPrimaryGraphCursor(
-		&cursor, cache, root, bounds, leafBounds, lower, upper,
-	); err != nil {
-		return PrimaryGraphCursor{}, err
-	}
-	return cursor, nil
-}
-
 // InitPrimaryGraphCursor is the zero-allocation initializer for callers that
 // keep the cursor in their own stack frame. dst must not be copied until it
 // has been closed because its page leases are single-owner values.
@@ -117,24 +91,6 @@ func InitPrimaryGraphCursor(
 	}
 	dst.done = false
 	return nil
-}
-
-// OpenPrimaryGraphPrefixCursor positions a cursor at the first key carrying
-// prefix. An empty prefix is equivalent to a full ordered scan.
-func OpenPrimaryGraphPrefixCursor(
-	cache *PageCache,
-	root PageRef,
-	bounds GlobalTabletCatalogBounds,
-	leafBounds CommonPrimaryLeafBounds,
-	prefix []byte,
-) (PrimaryGraphCursor, error) {
-	var cursor PrimaryGraphCursor
-	if err := InitPrimaryGraphPrefixCursor(
-		&cursor, cache, root, bounds, leafBounds, prefix,
-	); err != nil {
-		return PrimaryGraphCursor{}, err
-	}
-	return cursor, nil
 }
 
 // InitPrimaryGraphPrefixCursor is the zero-allocation prefix initializer.
@@ -389,48 +345,6 @@ func (c *PrimaryGraphCursor) nextRawBorrowed() (
 		return k, c.spliceScratch, false, true
 	default:
 		return c.rows.NextRawBorrowed()
-	}
-}
-
-func (c *PrimaryGraphCursor) nextBorrowed() (
-	key, inline []byte, overflow PageRef, ok bool,
-) {
-	key, raw, isOverflow, ok := c.nextRawBorrowed()
-	if !ok {
-		return nil, nil, PageRef{}, false
-	}
-	if isOverflow {
-		return key, nil, decodePageRef(raw), true
-	}
-	return key, raw, PageRef{}, true
-}
-
-// Next returns the next globally bytewise-lexical row. Exhaustion closes the
-// cursor. Bounds and prefixes are checked over the decoded key, so no separator
-// approximation can admit an out-of-range row.
-func (c *PrimaryGraphCursor) Next() (PrimaryGraphRow, bool, error) {
-	if c == nil || c.done {
-		return PrimaryGraphRow{}, false, nil
-	}
-	for {
-		key, inline, overflow, ok := c.nextBorrowed()
-		if ok {
-			if len(c.upper) != 0 && bytes.Compare(key, c.upper) >= 0 ||
-				len(c.prefix) != 0 && !bytes.HasPrefix(key, c.prefix) {
-				c.Close()
-				return PrimaryGraphRow{}, false, nil
-			}
-			return PrimaryGraphRow{
-				Key: key, Inline: inline, Overflow: overflow,
-			}, true, nil
-		}
-		if err := c.advanceLeaf(); err != nil {
-			c.Close()
-			return PrimaryGraphRow{}, false, err
-		}
-		if c.done {
-			return PrimaryGraphRow{}, false, nil
-		}
 	}
 }
 

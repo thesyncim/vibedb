@@ -14,7 +14,7 @@ honor successful writes and synchronization calls.
 | --- | --- | --- | --- | --- |
 | buffered-visible | `DurabilityBufferedVisible` | success after bounded canonical COW staging; immediately reader-visible | none on ordinary admission, unless `RecoveryJournal` is set (one redo append plus sync per mutation) | process or machine failure may lose every acknowledged generation after the last successful `Flush`, or after the last synced journal record when `RecoveryJournal` is set |
 | async-stable-in-flight | `DurabilityAsyncVisible` | success after the bounded committer accepts the generation; immediately reader-visible | the background worker continuously writes ordered COW generations and roots | failure may lose acknowledged generations newer than `DurableGeneration`; `Flush` closes the window |
-| synchronous, power-safe | `DurabilitySync` (zero value) | on the primary graph, success waits for one journal append plus its power-safe sync, then applies and publishes — visibility strictly follows durability; on the transitional chunk layout, success and visibility wait for data and alternate-root barriers | strongest supported platform sequence: one journaled record barrier per mutation (primary graph) or per-mutation COW plus two ordered root barriers (chunk layout) | after success, recovery selects the acknowledged generation; before success, outcome may require reopen |
+| synchronous, power-safe | `DurabilitySync` (zero value) | success waits for one journal append plus its power-safe sync, then applies and publishes — visibility strictly follows durability | strongest supported platform sequence: one journaled record barrier per mutation | after success, recovery selects the acknowledged generation; before success, outcome may require reopen |
 
 All modes are linearizable inside the live process. “Buffered” weakens crash
 survival, not read ordering. Bounded staging or retirement pressure may force a
@@ -112,16 +112,16 @@ reopen because recovery must first restore or select the page image.
 - A checkpoint's own final-root barrier reporting an error yields
   `ErrCommitOutcomeUnknown`; reopen determines which root won.
 
-### Synchronous, chain-fence (transitional chunk layout)
+### Synchronous, chain-fence (journal-less reopen)
 
-- Before the data barrier: the call has not succeeded; recovery selects a
-  complete root.
-- Between data and final root barriers: recovery normally selects the old root.
-- Once the alternate root may have reached storage but the final barrier
-  reports an error, the result is `ErrCommitOutcomeUnknown`. Reopen determines
-  which root won before the application retries.
-- After success: the new generation is visible and power-safe under the
-  platform assumptions above.
+One synchronous configuration acknowledges through the committer's root fence
+instead of the journal: a store created `DurabilityAsyncVisible` and reopened
+`DurabilitySync` carries no journal to open, so each mutation publishes a COW
+generation and waits for its root barriers. Before the data barrier the call
+has not succeeded; between the data and final root barriers recovery normally
+selects the old root; a final barrier error yields `ErrCommitOutcomeUnknown`
+and reopen determines which root won; after success the new generation is
+visible and power-safe under the platform assumptions above.
 
 ## Persistence failures
 
@@ -146,11 +146,10 @@ acknowledgement. Readers never consult it; the journal is write-only until
 recovery replays the records after the newest valid root's generation. The
 store root records the journal's identity, and recovery pairs the two files by
 identity, page geometry, and a base-generation epoch, failing closed on a
-missing or mismatched journal. The transitional chunk sync lane has no journal
-and keeps the chain-fence acknowledgement until the chunk store is deleted;
-requesting a journal on a layout that cannot feed it fails closed. See
-[the design][journal] for the record format, batch group-commit, and the
-projected competitive effects, which are not yet reflected in the published
-tables.
+missing or mismatched journal. A synchronous store whose root names no journal
+(created async-visible, reopened sync) acknowledges through the chain fence
+instead. See [the design][journal] for the record format, batch group-commit,
+and the projected competitive effects, which are not yet reflected in the
+published tables.
 
 [journal]: design/recovery-journal.md

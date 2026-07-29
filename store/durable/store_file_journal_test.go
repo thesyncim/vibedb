@@ -635,13 +635,7 @@ func TestRecoveryJournalFullForcesCheckpoint(t *testing.T) {
 
 // TestRecoveryJournalRequiresPrimaryLayout proves the primary journal lane is
 // live: a CreateFromPrimary store opened with Options.RecoveryJournal actually
-// acknowledges a Put through the journal. The former chunk-image cases (Create
-// and Open of a chunk-layout store failing closed with
-// ErrRecoveryJournalRequiresPrimary) were deleted with the chunk layout, which
-// can no longer be constructed. The production guard that fails an Open closed
-// when a root names a journal but carries no primary graph (store_file.go,
-// root.PrimaryRoot == zero && journal named) remains and is exercised by the
-// recovery/fuzz sweeps.
+// acknowledges a Put through the journal.
 func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
 	options := journalTestOptions(CheckpointFilesystem)
 	dir := t.TempDir()

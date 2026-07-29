@@ -16,15 +16,14 @@ import (
 )
 
 // CreateFromPrimary writes one immutable ordered primary graph and publishes it
-// through
-// StateRoot.PrimaryRoot. Legacy chunk, fingerprint, index, float64, and zone
-// roots remain empty. The resulting collection supports point reads,
-// snapshots, and serialized Put/Delete through the ordered-primary COW path.
+// through StateRoot.PrimaryRoot; the retired root slots stay empty. The
+// resulting collection supports point reads, snapshots, and serialized
+// Put/Delete through the ordered-primary COW path.
 //
-// Exact indexes are built as posting tiles beside the ordered primary. Float64
-// columns, schemas, compact document groups, overflow values, and scan/zone
-// construction are not implemented by this entry. Use CreateFrom when those
-// features are required.
+// Exact indexes are built as posting tiles beside the ordered primary, and
+// Options.DocumentFormat selects verbatim or compact leaves. Schemas and
+// overflow values are not implemented by this entry; create an empty collection
+// with Create and load it through Put when they are required.
 func CreateFromPrimary(
 	collection *store.Collection,
 	file *os.File,
@@ -41,12 +40,6 @@ func CreateFromPrimary(
 	}
 	if info.Size() != 0 {
 		return 0, ErrNotEmpty
-	}
-	if len(options.Float64Columns) != 0 {
-		return 0, fmt.Errorf(
-			"%w: float64 columns are not available in CreateFromPrimary",
-			ErrPrimaryCutoverUnsupported,
-		)
 	}
 	if options.Collection.Schema != nil {
 		return 0, fmt.Errorf(

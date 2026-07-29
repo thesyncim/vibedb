@@ -424,15 +424,6 @@ func (c *Collection) appendFreePending(delta storeio.FreeDelta) {
 	c.freePending = append(c.freePending, delta)
 }
 
-// syncFreeLog records this commit's complete free-set diff. The common path
-// appends it to the cumulative fixed-root delta and allocates no metadata page.
-// A full inline run spills into the bounded external chain; a dirty image folds
-// as before. It must run after every ordinary allocation because anything
-// allocated later would consume free space that no record describes.
-func (c *Collection) syncFreeLog(tx *storeio.WriteTransaction, state *fileStoreState) (freeLogCommit, error) {
-	return c.syncFreeLogFor(tx, state, c.freeFoldLimit)
-}
-
 func (c *Collection) syncFreeLogFor(
 	tx *storeio.WriteTransaction, state *fileStoreState, foldLimit int,
 ) (freeLogCommit, error) {

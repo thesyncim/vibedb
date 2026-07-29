@@ -187,12 +187,11 @@ type State struct {
 	Generation uint64
 	Count      int
 	ChunkCount uint32
-	seed       maphash.Seed
+	seed         maphash.Seed
 	StateOptions StateOptions
 	keys         *storeKeyNode
-	// baseKeys is the compact immutable directory created by Builder or
-	// Open. keys is then only the path-copied overlay for later insertions
-	// and moved keys.
+	// baseKeys is the compact immutable directory created by Builder. keys is
+	// then only the path-copied overlay for later insertions and moved keys.
 	baseKeys *storeMappedKeys
 	// mappedDocs pins the off-heap source block for the lifetime of every
 	// state, exactly like baseKeys. It must never be dropped early: a chunk
@@ -204,11 +203,6 @@ type State struct {
 	Chunks     storeChunkVector
 	Indexes    []IndexInfo
 	secondary  []storeIndexSnapshot
-	// source pins a collection image borrowed by Open. Ordinary heap-built
-	// states leave it nil. Every path copy carries the slice, so mapped source
-	// bytes remain reachable for the lifetime of current and retained snapshots;
-	// the caller still owns when an underlying mapping is unmapped.
-	source []byte
 }
 
 // Chunk is the unit of document storage and copy-on-write publication: up to

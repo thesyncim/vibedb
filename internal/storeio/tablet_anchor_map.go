@@ -932,12 +932,6 @@ func (v TabletAnchorHandleView) handleAt(
 	}, zone
 }
 
-// PersistentBytes returns the borrowed combined-handle image. It aliases the
-// admitted page and must not be mutated or retained past the page's lease.
-func (v TabletAnchorHandleView) PersistentBytes() []byte {
-	return v.image
-}
-
 // CombinedBytesPerAnchor projects the canonical interleaved codec: local IDs
 // are two bytes rather than the comparison codec's four-byte global IDs.
 func (v TabletAnchorHandleView) CombinedBytesPerAnchor() float64 {

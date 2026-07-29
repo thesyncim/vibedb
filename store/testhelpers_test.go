@@ -134,22 +134,6 @@ func sameRawValue(a, b vibejson.RawValue) bool {
 	return len(a.Src) == len(b.Src) && unsafe.SliceData(a.Src) == unsafe.SliceData(b.Src)
 }
 
-// escapePointerToken applies RFC 6901 tilde-escaping to a reference token.
-func escapePointerToken(k string) string {
-	out := make([]byte, 0, len(k))
-	for i := 0; i < len(k); i++ {
-		switch k[i] {
-		case '~':
-			out = append(out, '~', '0')
-		case '/':
-			out = append(out, '~', '1')
-		default:
-			out = append(out, k[i])
-		}
-	}
-	return string(out)
-}
-
 // forceStackMovement perturbs the goroutine stack to help surface pointer bugs
 // that only manifest after a stack move.
 func forceStackMovement(depth int, acc int) int {

@@ -41,10 +41,11 @@ func (c *Collection) syncJournalLane() bool {
 
 // chainFenceSync reports whether a synchronous collection still acknowledges
 // through the committer's root fence (publish, then wait) rather than the
-// journal: the chunk-layout sync lane, and the defensive primary-sync store
-// whose journal never opened. It is the only configuration that transiently
-// holds a visible generation ahead of its durable one, so it is precisely the
-// set the fail-closed read path still has to guard.
+// journal. One configuration reaches it today: a store created async-visible
+// and reopened DurabilitySync carries no journal to open, so its sync lane
+// falls back to the fence. It is the only configuration that transiently holds
+// a visible generation ahead of its durable one, so it is precisely the set
+// the fail-closed read path still has to guard.
 func (c *Collection) chainFenceSync() bool {
 	return c.synchronous() && !c.journalEnabled()
 }

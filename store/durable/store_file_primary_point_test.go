@@ -966,8 +966,8 @@ func TestCreateFromPrimaryRejectsUnsupportedOptions(t *testing.T) {
 		options Options
 	}{
 		{
-			name:    "float64 columns",
-			options: Options{Float64Columns: []string{"/id"}},
+			name:    "unknown document format",
+			options: Options{DocumentFormat: DocumentFormatCompact + 1},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

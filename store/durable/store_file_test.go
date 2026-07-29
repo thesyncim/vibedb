@@ -106,16 +106,6 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("batch byte bound that cannot hold every key accepted")
 	}
-	options = testFileStoreOptions()
-	options.Float64Columns = []string{"/score", "/score"}
-	if _, err := options.normalized(); err == nil {
-		t.Fatal("duplicate float64 covering column accepted")
-	}
-	options = testFileStoreOptions()
-	options.Float64Columns = []string{"not-an-rfc6901-pointer"}
-	if _, err := options.normalized(); err == nil {
-		t.Fatal("invalid float64 covering path accepted")
-	}
 }
 
 func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {

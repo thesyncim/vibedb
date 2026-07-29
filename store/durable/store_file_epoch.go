@@ -45,14 +45,6 @@ func (c *Collection) anyActiveReaders() bool {
 	return c.leases.AnyActive() || c.readEpochs.AnyActive()
 }
 
-// safeFromReaders reports whether a page first published at generation is
-// invisible to every active reader in either registry. Same fence requirement
-// as anyActiveReaders.
-func (c *Collection) safeFromReaders(generation uint64) bool {
-	return c.leases.SafeFromSnapshots(generation) &&
-		c.readEpochs.SafeFrom(generation)
-}
-
 // beginReaderFence diverts new epoch readers to the gated slow path. The
 // caller must hold snapshotGate's write side, so diverted readers block on the
 // gate instead of spinning, and must pair it with endReaderFence after its

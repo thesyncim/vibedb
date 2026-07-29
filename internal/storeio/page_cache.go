@@ -43,21 +43,18 @@ var (
 // extent reads exactly Length bytes and reserves exactly ceil(Length/PageSize)
 // arena slots. StoreID binds every admitted page to one file.
 type PageCacheOptions struct {
-	// FrameSize is the legacy StorePageReader spelling of MaxPageSize. When
-	// supplied without PageSize, metadata retains the 4 KiB file quantum.
-	FrameSize uint32
 	// Validate optionally applies a kind-specific payload check before a page
 	// becomes visible, so a reader that later reconstructs a zero-copy view over
 	// the resident bytes does not have to repeat whole-node work on every hit.
 	//
 	// A supplied Validate must be complete for every page kind whose reader
-	// reconstructs an unchecked view — today PageKeyDirectory and
-	// PageChunkDirectory, whose descents call AdmittedKeyDirectoryPage and
-	// AdmittedChunkDirectoryPage. Those views index into the payload with
-	// offsets read from the page itself, so a directory admitted without its
-	// structural check is not merely untrusted, it is a panic waiting for the
-	// first malformed offset. Leaving Validate nil is safe and simply keeps the
-	// descents on the fully validating openers.
+	// reconstructs an unchecked view — today the ordered-primary descents,
+	// whose cache hits call the Admitted* reconstructors (primary leaves,
+	// tablet catalog nodes and roots, anchor maps). Those views index into the
+	// payload with offsets read from the page itself, so a page admitted
+	// without its structural check is not merely untrusted, it is a panic
+	// waiting for the first malformed offset. Leaving Validate nil is safe and
+	// simply keeps the descents on the fully validating openers.
 	Validate func([]byte, PageRef) error
 	// PageSize is the Store allocation quantum and the exact size of metadata
 	// pages. Document and overflow extents may be larger whole multiples.
@@ -85,11 +82,7 @@ type PageCacheOptions struct {
 
 func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 	if o.PageSize == 0 {
-		if o.FrameSize != 0 {
-			o.PageSize = 4096
-		} else {
-			o.PageSize = defaultBufferSize
-		}
+		o.PageSize = defaultBufferSize
 	}
 	if o.StoreID == ([16]byte{}) || o.PageSize < 0 ||
 		uint64(o.PageSize) > uint64(^uint32(0)) || !validPhysicalPageSize(uint32(o.PageSize)) {
@@ -97,11 +90,6 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 	}
 	if o.MaxPageSize == 0 {
 		o.MaxPageSize = o.PageSize
-		if o.FrameSize != 0 {
-			o.MaxPageSize = int(o.FrameSize)
-		}
-	} else if o.FrameSize != 0 && o.MaxPageSize != int(o.FrameSize) {
-		return PageCacheOptions{}, 0, fmt.Errorf("%w: conflicting maximum page sizes", ErrPageCacheReference)
 	}
 	if o.MaxPageSize < o.PageSize || uint64(o.MaxPageSize) > uint64(^uint32(0)) ||
 		!validPhysicalPageSize(uint32(o.MaxPageSize)) || o.MaxPageSize%o.PageSize != 0 {
@@ -139,7 +127,6 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 		return PageCacheOptions{}, 0, fmt.Errorf("%w: read backend %d", ErrPageCacheReference, o.Backend)
 	}
 	o.ResidentBytes = slots64 * int64(o.PageSize)
-	o.FrameSize = uint32(o.MaxPageSize)
 	return o, int(slots64), nil
 }
 

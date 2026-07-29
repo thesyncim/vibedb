@@ -217,18 +217,6 @@ func recoveryRecordPadded(sectorSize uint32, keyLen, valueLen int) int {
 	return padded
 }
 
-// recoveryPadRaw rounds a raw record byte count up to the sector granule.
-func recoveryPadRaw(sectorSize uint32, raw int) int {
-	if raw < 0 {
-		return maxIntValue
-	}
-	padded, ok := checkedRecoveryPadRaw(sectorSize, uint64(raw))
-	if !ok {
-		return maxIntValue
-	}
-	return padded
-}
-
 func checkedRecoveryPadRaw(sectorSize uint32, raw uint64) (int, bool) {
 	if sectorSize == 0 {
 		return 0, false

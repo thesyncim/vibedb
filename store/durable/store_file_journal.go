@@ -39,16 +39,6 @@ const (
 	recoveryJournalMaxCapacityBytes = storeio.RecoveryJournalMaxCapacityBytes
 )
 
-// ErrRecoveryJournalRequiresPrimary reports that Options.RecoveryJournal was
-// requested for a store whose root has no ordered primary graph. Only the
-// primary mutation path acknowledges through the journal (journalAckLocked fires
-// from putPrimary/deletePrimary); a chunk-layout store would pair a journal that
-// no acknowledgement ever appends to, so the request fails closed rather than
-// mint a file that silently carries no per-mutation durability.
-var ErrRecoveryJournalRequiresPrimary = errors.New(
-	"vibejson: recovery journal requires an ordered primary-graph store",
-)
-
 // journalFailureBox carries the sticky journal poison behind an atomic pointer.
 type journalFailureBox struct{ err error }
 
@@ -93,8 +83,12 @@ var recoveryJournalFaultHook func(*storeio.RecoveryJournal)
 var recoveryJournalPostSyncHook func()
 
 // journalEnabled reports whether this collection acknowledges through a recovery
-// journal. It is true only for a buffered-visible collection configured with
-// Options.RecoveryJournal whose journal file is open.
+// journal. The synchronous lane is journal-backed unconditionally — Create and
+// CreateFromPrimary mint the journal with the store — and buffered-visible
+// carries one on the Options.RecoveryJournal opt-in; in both cases this is true
+// once the journal file is open. A synchronous store whose root names no
+// journal (created async-visible, reopened sync) has none and stays on the
+// committer fence (chainFenceSync).
 func (c *Collection) journalEnabled() bool {
 	return c != nil && c.journal != nil
 }

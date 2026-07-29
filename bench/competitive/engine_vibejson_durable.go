@@ -226,8 +226,8 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 // loadByPut is the mutation-replay path, measured separately because the gap
 // between it and loadBulk is one of the more useful numbers in the report. It
 // creates an empty ordered-primary collection and replays every document through
-// the primary mutation path — and, for ordinary-sync, its wired recovery
-// journal — exactly like the measured workload.
+// the primary mutation path — the synchronous lane acknowledging through its
+// recovery journal — exactly like the measured workload.
 func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 	opts := v.options()
 	db, err := durable.Create(f, opts)

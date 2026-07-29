@@ -170,8 +170,7 @@ func TestFileStoreExactCatalogZeroOptionReopenAndRootPreservation(
 		t.Fatal("Open accepted a caller catalog that differs from durable bytes")
 	}
 	explicitEmpty := Options{
-		Indexes:        []store.IndexDefinition{},
-		Float64Columns: []string{},
+		Indexes: []store.IndexDefinition{},
 	}
 	if _, err := Open(file, explicitEmpty); err == nil {
 		t.Fatal("Open treated explicit empty catalogs as unspecified")
@@ -311,5 +310,47 @@ func TestFileStoreMaterializationRequiresCurrentDeviceAssertion(
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestOpenRejectsPersistedFloat64ColumnCatalog pins the format-level guard for
+// the retired float64 covering-column state option. No current configuration
+// can create such a store, so a file whose root claims the option bit and whose
+// canonical catalog carries float64 paths must fail Open's option rehydration:
+// the catalog rebuilt from the rehydrated options can never equal the persisted
+// canonical bytes.
+func TestOpenRejectsPersistedFloat64ColumnCatalog(t *testing.T) {
+	catalog, err := storeio.BuildCanonicalPageCatalog(
+		storeio.PageCatalogDefinition{Float64Paths: []string{"/score"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults, err := Options{}.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := storeio.StateRoot{
+		StoreID:          [16]byte{1},
+		Generation:       1,
+		PageSize:         uint32(defaults.PageSize),
+		MaxPageSize:      uint32(defaults.MaxPageSize),
+		Options:          storeio.StateOptionFloat64Columns,
+		ChunkDocuments:   uint32(defaults.Collection.ChunkDocuments),
+		IndexMaxDepth:    uint32(max(defaults.Collection.IndexOptions.MaxDepth, 0)),
+		MaxKeyBytes:      uint32(defaults.MaxKeyBytes),
+		InlineValueBytes: uint32(defaults.InlineValueBytes),
+		MaxDocumentBytes: uint32(defaults.MaxDocumentBytes),
+		PageCatalogBytes: uint32(catalog.CanonicalSize()),
+	}
+	if _, err := normalizeOpenedFileStoreOptions(
+		Options{}, root, catalog,
+	); err == nil {
+		t.Fatal("Open rehydration accepted a persisted float64 column catalog")
+	} else if !errors.Is(err, storeio.ErrPageCatalogCorrupt) {
+		t.Fatalf(
+			"rehydration error = %v, want %v",
+			err, storeio.ErrPageCatalogCorrupt,
+		)
 	}
 }
