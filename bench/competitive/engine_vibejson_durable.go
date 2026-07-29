@@ -53,7 +53,7 @@ func (v *vibeDurable) DurabilityMode() DurabilityMode { return v.cfg.Durability 
 func (v *vibeDurable) Durability() string {
 	switch v.cfg.Durability {
 	case DurabilityPowerSafe:
-		return "DurabilitySync (each generation fenced to stable storage before Put returns or becomes visible)"
+		return "DurabilityBufferedVisible + CheckpointPowerSafe + RecoveryJournal over the ordered primary graph (every Put/Delete appends one redo record to the paired journal and syncs it at the platform's strongest power-loss boundary — F_FULLFSYNC class — before returning, so each acknowledged mutation survives sudden power loss; concurrent acknowledgements share one barrier through the journal's group commit; checkpoints fold at the same strength; the strict visibility-follows-durability lane is DurabilitySync, which pays the same single journal fence but does not group)"
 	case DurabilityBufferedVisible:
 		return "DurabilityBufferedVisible + CheckpointFilesystem over the ordered primary graph (routed splits/merges, resident router; exact secondary-index posting tiles are maintained in the same publish as each mutation, so a reader's index is never stale; ordinary admission stages bounded reader-visible COW pages without waking the device worker; staging pressure may checkpoint early; scheduled checkpoints fold the deferred mutations and their posting pages into a durable root with ordinary two-phase fsync)"
 	case DurabilityOrdinarySync:
@@ -99,6 +99,22 @@ func (v *vibeDurable) options() durable.Options {
 		opts.Durability = durable.DurabilityBufferedVisible
 		opts.Backend = durable.BackendPortable
 		opts.CheckpointStrength = durable.CheckpointFilesystem
+	case DurabilityPowerSafe:
+		// Symmetric to the ordinary-sync mapping below: buffered-visible plus
+		// the recovery journal, with the pre-return record sync at the
+		// platform's strongest boundary (F_FULLFSYNC class) instead of the
+		// ordinary fence. The lane's promise attaches to the acknowledgement —
+		// every returned mutation has crossed the drive-cache drain — and
+		// concurrent acknowledgements share one barrier through the journal's
+		// group commit. Visibility precedes the durable acknowledgement exactly
+		// as on the ordinary-sync row. The strict visibility-follows-durability
+		// configuration is DurabilitySync; it pays the same single journal
+		// fence per mutation but its acknowledgements cannot group yet, so it
+		// is not the comparison row.
+		opts.Durability = durable.DurabilityBufferedVisible
+		opts.Backend = durable.BackendPortable
+		opts.CheckpointStrength = durable.CheckpointPowerSafe
+		opts.RecoveryJournal = true
 	case DurabilityOrdinarySync:
 		// The recovery journal gives buffered-visible a per-mutation durable
 		// acknowledgement at ordinary filesystem-sync strength: one redo record

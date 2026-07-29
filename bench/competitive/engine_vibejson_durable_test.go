@@ -85,6 +85,50 @@ func TestVibeDurableOrdinarySyncJournalsThroughPrimary(t *testing.T) {
 	}
 }
 
+// TestVibeDurablePowerSafeJournalsEveryAcknowledgement holds the power-safe row
+// to the same engagement proof as ordinary-sync. This table was burned once by
+// a lane that silently disengaged its durability mechanism and published a win;
+// any journal-backed comparison row must therefore prove per-mutation journal
+// acknowledgements, not assume them from configuration. Fewer mutations than
+// the ordinary-sync variant because each acknowledgement here pays a real
+// drive-cache drain (~4 ms on this platform's F_FULLFSYNC class).
+func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
+	if testing.Short() {
+		t.Skip("each acknowledgement pays a full power-safe barrier")
+	}
+	factory, ok := FactoryNamed("vibejson-durable")
+	if !ok {
+		t.Fatal("vibejson-durable factory missing")
+	}
+	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityPowerSafe})
+	defer cleanup()
+	v := e.(*vibeDurable)
+
+	base := v.coll.Stats()
+	const puts = 50
+	scratch := make([]byte, 0, 512)
+	for i := 0; i < puts; i++ {
+		idx := i % len(docs)
+		scratch = AppendSameSizeUpdatedJSON(scratch[:0], docs, idx)
+		if err := e.Put(docs[idx].Key, scratch); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	stats := v.coll.Stats()
+	journal := stats.JournalAcks - base.JournalAcks
+	chain := stats.ChainAcks - base.ChainAcks
+	if journal == 0 {
+		t.Fatalf("power-safe recorded no journal acknowledgements (journal=%d chain=%d)",
+			stats.JournalAcks, stats.ChainAcks)
+	}
+	if journal+chain != uint64(puts) {
+		t.Fatalf("acknowledgements journal=%d + chain=%d != %d mutations", journal, chain, puts)
+	}
+	if journal <= chain {
+		t.Fatalf("journal lane did not dominate: journal=%d chain=%d", journal, chain)
+	}
+}
+
 // TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary proves the buffered
 // lane is also on the primary graph: MergeReclassEvaluations increments only in
 // the primary delete path (deletePrimaryWithMerge), so a non-zero count after
