@@ -52,17 +52,38 @@ func (c *conn) validateSurfaceContext(
 	}
 	defer c.db.mu.RUnlock()
 	if statement.Kind == sqlast.KindSelect {
-		for i := range statement.Select.From {
-			ref := &statement.Select.From[i]
-			name := ref.Name
-			if _, exists := c.db.tables[name]; !exists {
-				return fmt.Errorf("%w: %q", ErrTableNotFound, name)
-			}
-		}
-		return nil
+		return c.validateSelectTables(statement.Select)
 	}
 	if _, exists := c.db.tables[statement.Table()]; !exists {
 		return fmt.Errorf("%w: %q", ErrTableNotFound, statement.Table())
+	}
+	return nil
+}
+
+func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
+	for i := range selectStmt.From {
+		name := selectStmt.From[i].Name
+		if _, exists := c.db.tables[name]; !exists {
+			return fmt.Errorf("%w: %q", ErrTableNotFound, name)
+		}
+	}
+	return validateExprSubqueries(selectStmt.Where, c.validateSelectTables)
+}
+
+func validateExprSubqueries(
+	e *sqlast.Expr,
+	validate func(*sqlast.SelectStmt) error,
+) error {
+	if e == nil {
+		return nil
+	}
+	if e.Subquery != nil {
+		return validate(e.Subquery)
+	}
+	for _, kid := range e.Kids {
+		if err := validateExprSubqueries(kid, validate); err != nil {
+			return err
+		}
 	}
 	return nil
 }

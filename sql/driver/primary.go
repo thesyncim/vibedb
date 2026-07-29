@@ -38,9 +38,9 @@ func isPrimaryPredicate(where *sqlast.Expr, primaryKey string) bool {
 	}
 	switch where.Kind {
 	case sqlast.ExprCompare:
-		return where.Op == sqlast.OpEq
+		return where.Op == sqlast.OpEq && where.Subquery == nil
 	case sqlast.ExprIn:
-		return !where.Negated
+		return !where.Negated && where.Subquery == nil
 	default:
 		return false
 	}

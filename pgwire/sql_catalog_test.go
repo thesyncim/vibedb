@@ -98,6 +98,40 @@ func TestSQLCatalogSimpleAndExtendedLifecycle(t *testing.T) {
 	}
 }
 
+func TestSQLCatalogSubqueryRows(t *testing.T) {
+	c := connectSQLCatalog(t)
+	for _, statement := range []string{
+		`CREATE TABLE orders (id STRING PRIMARY KEY, customer STRING)`,
+		`CREATE TABLE customers (id STRING PRIMARY KEY, tier STRING)`,
+	} {
+		if got := commandTagOf(t, c.query(statement)); got != "CREATE TABLE" {
+			t.Fatalf("%s tag = %q", statement, got)
+		}
+	}
+	for _, insert := range []struct {
+		sql string
+		doc string
+	}{
+		{`INSERT INTO orders VALUES ($1)`, `{"id":"o1","customer":"c1"}`},
+		{`INSERT INTO orders VALUES ($1)`, `{"id":"o2","customer":"c2"}`},
+		{`INSERT INTO customers VALUES ($1)`, `{"id":"c1","tier":"pro"}`},
+		{`INSERT INTO customers VALUES ($1)`, `{"id":"c2","tier":"free"}`},
+	} {
+		if got := commandTagOf(t,
+			extendedSQL(c, insert.sql, [][]byte{[]byte(insert.doc)})); got != "INSERT 0 1" {
+			t.Fatalf("insert tag = %q", got)
+		}
+	}
+
+	rows := rowsOf(t, extendedSQL(c,
+		`SELECT id FROM orders WHERE customer IN (`+
+			`SELECT id FROM customers WHERE tier = $1)`,
+		[][]byte{[]byte("pro")}))
+	if len(rows) != 1 || string(rows[0][0]) != `"o1"` {
+		t.Fatalf("subquery rows = %q, want o1", rows)
+	}
+}
+
 func TestSQLCatalogInsertReturning(t *testing.T) {
 	c := connectSQLCatalog(t)
 	if got := commandTagOf(t, c.query(

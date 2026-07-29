@@ -999,7 +999,6 @@ func TestErrorClassification(t *testing.T) {
 		{`SELECT name FROM nosuch`, sqlstateUndefinedTable},
 		{`SELECT FROM users`, sqlstateSyntaxError},
 		{`SELECT name FROM users WHERE name LIKE 'a%'`, sqlstateSyntaxError},
-		{`SELECT name FROM users WHERE id IN (SELECT id FROM users)`, sqlstateSyntaxError},
 		{`INSERT INTO users VALUES (1)`, sqlstateFeatureNotSupported},
 		{`CREATE TABLE t (a int)`, sqlstateFeatureNotSupported},
 		{`BEGIN`, sqlstateFeatureNotSupported},

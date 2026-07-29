@@ -186,6 +186,10 @@ func driverQueryMemory(options query.ExecOptions) (int64, error) {
 
 func joinTableNames(statement *sqlast.SelectStmt) []string {
 	names := make([]string, 0, len(statement.From))
+	return appendSelectTableNames(names, statement)
+}
+
+func appendSelectTableNames(names []string, statement *sqlast.SelectStmt) []string {
 	for i := range statement.From {
 		name := statement.From[i].Name
 		duplicate := false
@@ -198,6 +202,20 @@ func joinTableNames(statement *sqlast.SelectStmt) []string {
 		if !duplicate {
 			names = append(names, name)
 		}
+	}
+	names = appendExprTableNames(names, statement.Where)
+	return names
+}
+
+func appendExprTableNames(names []string, e *sqlast.Expr) []string {
+	if e == nil {
+		return names
+	}
+	if e.Subquery != nil {
+		return appendSelectTableNames(names, e.Subquery)
+	}
+	for _, kid := range e.Kids {
+		names = appendExprTableNames(names, kid)
 	}
 	return names
 }

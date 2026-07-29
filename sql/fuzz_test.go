@@ -34,6 +34,8 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.uid WHERE o.total BETWEEN ? AND ?`,
 		`SELECT team, COUNT(*), SUM(s) FROM d GROUP BY team HAVING COUNT(*) > 1 ORDER BY team DESC LIMIT 5 OFFSET 2`,
 		`SELECT a FROM t WHERE m @> {"k": [1, 2, {"n": null}]}`,
+		`SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
+		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -165,6 +167,16 @@ func checkRowCount(t *testing.T, op *Operand) int {
 // checkExpr walks a predicate and returns the number of placeholders in it.
 func checkExpr(t *testing.T, s *SelectStmt, e *Expr, having bool) int {
 	t.Helper()
+	if e.Subquery != nil {
+		checkStatementInvariants(t, e.Subquery)
+		if e.Kind != ExprExists && e.Path == nil {
+			t.Fatalf("a subquery leaf of kind %d has no outer path", e.Kind)
+		}
+		if e.Path != nil {
+			checkPath(t, s, e.Path)
+		}
+		return e.Subquery.Params
+	}
 	switch e.Kind {
 	case ExprAnd, ExprOr:
 		if len(e.Kids) < 2 {

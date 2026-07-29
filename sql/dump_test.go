@@ -142,16 +142,31 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 	case ExprCompare:
 		fmt.Fprintf(b, "cmp %s ", e.Op)
 		dumpLeaf(b, e)
-		b.WriteByte(' ')
-		dumpOperand(b, e.Value)
+		if e.Subquery != nil {
+			b.WriteString(" (")
+			b.WriteString(dumpStmt(e.Subquery))
+			b.WriteByte(')')
+		} else {
+			b.WriteByte(' ')
+			dumpOperand(b, e.Value)
+		}
 	case ExprIn:
 		b.WriteString(negated(e, "in", "notin"))
 		b.WriteByte(' ')
 		dumpLeaf(b, e)
+		if e.Subquery != nil {
+			b.WriteString(" (")
+			b.WriteString(dumpStmt(e.Subquery))
+			b.WriteByte(')')
+		}
 		for _, value := range e.List {
 			b.WriteByte(' ')
 			dumpOperand(b, value)
 		}
+	case ExprExists:
+		b.WriteString("exists (")
+		b.WriteString(dumpStmt(e.Subquery))
+		b.WriteByte(')')
 	case ExprBetween:
 		b.WriteString(negated(e, "between", "notbetween"))
 		b.WriteByte(' ')
