@@ -1093,6 +1093,11 @@ type Collection struct {
 	// die-don't-retry: every later mutation, checkpoint, and Close is rejected
 	// until the collection is reopened and recovers through replay.
 	journalFailure atomic.Pointer[journalFailureBox]
+	// journalGroup is the buffered-journal lane's flat-combining sync sequencer.
+	// A caller appends its redo record under writer, releases writer, and blocks
+	// on this group's fence; one leader shares one journal sync across every
+	// caller whose record it covers. See store_file_journal_group.go.
+	journalGroup journalCommitGroup
 	// writeTransaction and the point-mutation scratch below are protected by
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
@@ -1114,8 +1119,14 @@ type Collection struct {
 	// snapshot-contended chain path and every forced or explicit checkpoint. The
 	// split is how a bench distinguishes the bounded-append lane from the
 	// full-publication lane at the store level.
-	journalAcks              atomic.Uint64
-	chainAcks                atomic.Uint64
+	journalAcks atomic.Uint64
+	chainAcks   atomic.Uint64
+	// journalSyncs counts shared journal syncs a group-commit leader issued;
+	// journalLargestGroup is the most records one such sync covered. JournalAcks
+	// divided by JournalSyncs is the average group size — the amortization the
+	// phase-1 group commit buys.
+	journalSyncs             atomic.Uint64
+	journalLargestGroup      atomic.Uint32
 	primaryLeafSplitRequired atomic.Uint64
 	primaryEmptyLeaves       atomic.Uint64
 	// Structural-transaction accounting for phase-8 split/merge/reclass. The
@@ -1401,6 +1412,13 @@ type Stats struct {
 	// is configured.
 	JournalAcks uint64
 	ChainAcks   uint64
+	// JournalSyncs counts the shared journal syncs the buffered-journal
+	// group-commit leader issued, and JournalLargestGroup the most records a
+	// single such sync covered. JournalAcks/JournalSyncs is the average
+	// group-commit fan-out: 1 for a lone writer, higher as concurrent callers
+	// share one fence. Both are zero unless a recovery journal is configured.
+	JournalSyncs        uint64
+	JournalLargestGroup uint32
 	// PrimaryLeafSplitRequired counts inserts rejected before publication
 	// because the selected wide leaf needs the deferred structural split.
 	PrimaryLeafSplitRequired uint64
@@ -2661,6 +2679,8 @@ func (c *Collection) Stats() Stats {
 		BufferedFirstTouchOverflows:     c.bufferedFirstTouchOverflows.Load(),
 		JournalAcks:                     c.journalAcks.Load(),
 		ChainAcks:                       c.chainAcks.Load(),
+		JournalSyncs:                    c.journalSyncs.Load(),
+		JournalLargestGroup:             c.journalLargestGroup.Load(),
 		PrimaryLeafSplitRequired:        c.primaryLeafSplitRequired.Load(),
 		PrimaryEmptyLeaves:              c.primaryEmptyLeaves.Load(),
 		PrimaryLeafSplits:               c.primaryLeafSplits.Load(),

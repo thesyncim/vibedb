@@ -251,6 +251,7 @@ func (c *Collection) openRecoveryJournalLocked(
 	c.journalID = journalID
 	c.journalPowerSafe = c.options.CheckpointStrength != CheckpointFilesystem
 	c.journal = journal
+	c.initJournalGroupLocked()
 	if recoveryJournalFaultHook != nil {
 		recoveryJournalFaultHook(journal)
 	}
@@ -347,51 +348,69 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 		// The durable generation never regressed; nothing to recycle past.
 		return nil
 	}
-	return c.journal.Recycle(baseGeneration)
+	if err := c.journal.Recycle(baseGeneration); err != nil {
+		return err
+	}
+	// The checkpoint folded every deposited record into the durable root before
+	// this recycle, so any group-commit waiter parked on an earlier ticket is now
+	// durable via the root and must complete without waiting for a sync of the
+	// records the recycle just discarded.
+	c.journalGroup.recycleAdvance()
+	return nil
 }
 
-// journalAckLocked appends one redo record for a frame-deferred mutation and
-// syncs the journal alone, turning a volatile buffered acknowledgement into a
-// durable one. A full journal forces a checkpoint — which recycles it — exactly
-// like dirty-cache pressure, after which the just-published mutation is already
-// durable in the checkpointed root, so no record is needed and the ack is
-// counted against the chain lane instead. The caller holds the writer and has
-// already published the mutation's state.
-func (c *Collection) journalAckLocked(
+// journalDepositLocked appends one redo record for a frame-deferred
+// (buffered-visible) mutation under the writer and returns the group-commit
+// ticket the caller waits on for the shared sync. It does NOT sync: the sync is
+// amortized across concurrent callers by journalGroupAwait after the writer is
+// released (phase 1 group commit, store_file_journal_group.go). Append order
+// under the writer equals publish order equals generation order, so the on-disk
+// record stream is byte-for-byte the per-caller path's — only the fsync is
+// shared.
+//
+// A full journal forces a checkpoint — which folds the just-published mutation,
+// and every earlier deposit, into a durable root and recycles the journal —
+// exactly like dirty-cache pressure, after which the mutation is durable without
+// its own record, so the ack is counted against the chain lane and a zero ticket
+// is returned (there is no sync to wait for). The caller holds the writer and
+// has already published the mutation's state. A returned ticket of zero means
+// "already durable, do not wait"; any device append error poisons
+// die-don't-retry and fails every waiter parked on the shared fence.
+func (c *Collection) journalDepositLocked(
 	kind uint16, generation uint64, key, value []byte,
-) error {
+) (uint64, error) {
 	if !c.journalEnabled() || c.journalReplaying {
-		return nil
+		return 0, nil
 	}
 	if !c.journal.Fits(len(key), len(value)) {
 		// No room for this record. Checkpoint folds every deferred mutation —
 		// including the one just published — into a durable root and recycles the
 		// journal. The mutation is durable afterwards without its own record.
 		if err := c.checkpointBufferedLocked(); err != nil {
-			return err
+			return 0, err
 		}
 		c.automaticCheckpoints.Add(1)
 		c.chainAcks.Add(1)
-		return nil
+		return 0, nil
 	}
 	if _, err := c.journal.Append(kind, generation, key, value); err != nil {
 		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
 			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
-				return cpErr
+				return 0, cpErr
 			}
 			c.automaticCheckpoints.Add(1)
 			c.chainAcks.Add(1)
-			return nil
+			return 0, nil
 		}
 		// A raw append error (a device write failure such as ENOSPC or EIO) is
-		// terminal for the journal lane: poison die-don't-retry.
-		return c.poisonJournalLocked(err)
-	}
-	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return c.poisonJournalLocked(err)
+		// terminal for the journal lane: poison die-don't-retry and fail every
+		// waiter of the shared fence, none of which can now be synced.
+		poisoned := c.poisonJournalLocked(err)
+		c.journalGroup.fail(poisoned)
+		return 0, poisoned
 	}
 	c.journalAcks.Add(1)
-	return nil
+	return c.journalGroup.depositBump(), nil
 }
 
 // journalBeforePublishLocked is the journal-backed synchronous lane's
@@ -457,35 +476,37 @@ func (c *Collection) journalBatchBeforePublishLocked(
 	return nil
 }
 
-// journalBatchAckLocked is the buffered-visible lane's batch acknowledgement: it
-// makes an already-published batch durable with one append plus one sync, the
-// group-commit analogue of journalAckLocked. Capacity is ensured before prepare,
-// but the full-journal fallback is kept for the same reason the single-record
-// path keeps it — a checkpoint folds the just-published batch into a durable root
-// and recycles, after which the batch is durable without its own record. The
-// caller holds the writer and has already published the batch's state.
-func (c *Collection) journalBatchAckLocked(
+// journalBatchDepositLocked is the buffered-visible lane's batch acknowledgement:
+// it appends the already-published batch's single redo record under the writer
+// and returns the group-commit ticket the caller waits on for the shared sync,
+// the group-commit analogue of journalDepositLocked. The whole batch is one
+// record and thus one ticket. Capacity is ensured before prepare, but the
+// full-journal fallback is kept for the same reason the single-record path keeps
+// it — a checkpoint folds the just-published batch into a durable root and
+// recycles, after which the batch is durable without its own record (zero ticket
+// returned). The caller holds the writer and has already published the batch's
+// state.
+func (c *Collection) journalBatchDepositLocked(
 	generation uint64, entries []storeio.RecoveryBatchEntry,
-) error {
+) (uint64, error) {
 	if !c.journalEnabled() || c.journalReplaying {
-		return nil
+		return 0, nil
 	}
 	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
 		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
 			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
-				return cpErr
+				return 0, cpErr
 			}
 			c.automaticCheckpoints.Add(1)
 			c.chainAcks.Add(1)
-			return nil
+			return 0, nil
 		}
-		return c.poisonJournalLocked(err)
-	}
-	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return c.poisonJournalLocked(err)
+		poisoned := c.poisonJournalLocked(err)
+		c.journalGroup.fail(poisoned)
+		return 0, poisoned
 	}
 	c.journalAcks.Add(1)
-	return nil
+	return c.journalGroup.depositBump(), nil
 }
 
 // ensurePrimaryBatchJournalRoom guarantees the whole batch record fits the

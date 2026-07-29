@@ -477,14 +477,23 @@ func (c *Collection) putPrimary(
 ) (created bool, err error) {
 	c.writer.Lock()
 	var generation uint64
+	var journalTarget uint64
 	defer func() {
-		wait := generation != 0 && c.synchronous()
-		if wait {
+		syncWait := generation != 0 && c.synchronous()
+		// The buffered-journal lane deposited its redo record under the writer and
+		// now shares one journal sync across concurrent callers: release the writer
+		// first, then block on the group fence (phase 1 group commit).
+		groupWait := journalTarget != 0
+		if syncWait || groupWait {
 			c.durabilityWait.Add(1)
 		}
 		c.writer.Unlock()
-		if wait {
+		if syncWait {
 			err = errors.Join(err, c.waitPublished(generation))
+		} else if groupWait {
+			err = errors.Join(err, c.journalGroupAwait(journalTarget))
+		}
+		if syncWait || groupWait {
 			c.durabilityWait.Done()
 		}
 	}()
@@ -588,11 +597,13 @@ func (c *Collection) putPrimary(
 		if handled {
 			leafLease.Release()
 			generation = state.root.Generation + 1
-			if err := c.journalAckLocked(
+			target, ackErr := c.journalDepositLocked(
 				storeio.RecoveryRecordKindPut, generation, keyBytes, src,
-			); err != nil {
-				return false, err
+			)
+			if ackErr != nil {
+				return false, ackErr
 			}
+			journalTarget = target
 			return false, nil
 		}
 	}
@@ -630,14 +641,16 @@ func (c *Collection) putPrimary(
 		// The journal-backed sync lane already appended and synced this record
 		// inside cowBufferedPrimaryMutation, before the frame was published, so
 		// the outer generation stays zero and this ack never takes the retired
-		// committer chain fence. Buffered-visible makes its volatile
-		// acknowledgement durable here instead.
+		// committer chain fence. Buffered-visible deposits its redo record here for
+		// the shared group sync after the writer is released.
 		if c.buffered() {
-			if err := c.journalAckLocked(
+			target, ackErr := c.journalDepositLocked(
 				storeio.RecoveryRecordKindPut, ackGeneration, keyBytes, src,
-			); err != nil {
-				return created, err
+			)
+			if ackErr != nil {
+				return created, ackErr
 			}
+			journalTarget = target
 		}
 		return created, nil
 	}
@@ -727,14 +740,20 @@ func (c *Collection) deletePrimary(
 ) (deleted bool, err error) {
 	c.writer.Lock()
 	var generation uint64
+	var journalTarget uint64
 	defer func() {
-		wait := generation != 0 && c.synchronous()
-		if wait {
+		syncWait := generation != 0 && c.synchronous()
+		groupWait := journalTarget != 0
+		if syncWait || groupWait {
 			c.durabilityWait.Add(1)
 		}
 		c.writer.Unlock()
-		if wait {
+		if syncWait {
 			err = errors.Join(err, c.waitPublished(generation))
+		} else if groupWait {
+			err = errors.Join(err, c.journalGroupAwait(journalTarget))
+		}
+		if syncWait || groupWait {
 			c.durabilityWait.Done()
 		}
 	}()
@@ -826,14 +845,16 @@ func (c *Collection) deletePrimary(
 		ackGeneration := state.root.Generation + 1
 		// The journal-backed sync lane journaled this delete before publish inside
 		// cowBufferedPrimaryMutation, so the outer generation stays zero and it never
-		// takes the retired chain fence. Buffered-visible makes its volatile
-		// acknowledgement durable here.
+		// takes the retired chain fence. Buffered-visible deposits its redo record
+		// here for the shared group sync after the writer is released.
 		if c.buffered() {
-			if err := c.journalAckLocked(
+			target, ackErr := c.journalDepositLocked(
 				storeio.RecoveryRecordKindDelete, ackGeneration, keyBytes, nil,
-			); err != nil {
-				return true, err
+			)
+			if ackErr != nil {
+				return true, ackErr
 			}
+			journalTarget = target
 		}
 		return true, nil
 	}

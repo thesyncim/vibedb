@@ -84,7 +84,21 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 		return ErrPrimaryBatchIndexedUnsupported
 	}
 	c.writer.Lock()
-	defer c.writer.Unlock()
+	var journalTarget uint64
+	defer func() {
+		// The buffered-journal lane deposited the batch's single redo record under
+		// the writer; release the writer, then share one journal sync across
+		// concurrent Update/Put callers on the group fence (phase 1 group commit).
+		groupWait := journalTarget != 0
+		if groupWait {
+			c.durabilityWait.Add(1)
+		}
+		c.writer.Unlock()
+		if groupWait {
+			err = errors.Join(err, c.journalGroupAwait(journalTarget))
+			c.durabilityWait.Done()
+		}
+	}()
 	if c.closed {
 		return ErrClosed
 	}
@@ -102,17 +116,19 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 	if len(batch.entries) == 0 {
 		return nil
 	}
-	_, applyErr := c.applyPrimaryBatch(batch)
+	_, target, applyErr := c.applyPrimaryBatch(batch)
+	journalTarget = target
 	return applyErr
 }
 
 // applyPrimaryBatch runs the prepare/durability/publish protocol above, retrying
 // after a leaf split or a capacity checkpoint (both advance the published state,
 // so the batch re-plans against it). It reports whether a generation was
-// published so a caller could wait on it; the deferred canonical lanes never
-// wait — durability is the journal sync or the deferred checkpoint, not a
-// committer root fence.
-func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, error) {
+// published and, for the buffered-journal lane, the group-commit ticket the
+// caller must wait on for the shared sync after releasing the writer (zero when
+// there is nothing to wait on). The sync lane fences before publish inside this
+// call and returns a zero ticket.
+func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) {
 	// Each split strictly grows its tablet and each capacity checkpoint drains the
 	// pending set, so both make monotonic progress; the budget bounds a pathological
 	// placement loop the way primaryStructuralRetryLimit does for a single Put.
@@ -121,29 +137,29 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, error) {
 	for attempt := 0; attempt < budget; attempt++ {
 		state := c.state.Load()
 		if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
-			return false, ErrClosed
+			return false, 0, ErrClosed
 		}
 		if state.root.Generation == 0 || state.root.Generation >= uint64(1)<<48 {
-			return false, storeio.ErrGenerationOrder
+			return false, 0, storeio.ErrGenerationOrder
 		}
 		if err := c.planPrimaryBatch(state, batch); err != nil {
-			return false, err
+			return false, 0, err
 		}
 		leafCount := len(c.batchPrimaryLeaves)
 		if leafCount == 0 {
 			// Every mutation resolved to a delete of an absent key: nothing changes,
 			// nothing is journaled, nothing is published.
-			return false, nil
+			return false, 0, nil
 		}
 		if leafCount > cap(c.primaryPendingParents) {
 			// More distinct leaves than one atomic generation can hold pending. This
 			// is the reservation ceiling; a batch that would exceed it is refused
 			// whole rather than split across generations.
-			return false, ErrBatchTooLarge
+			return false, 0, ErrBatchTooLarge
 		}
 		checkpointed, err := c.ensurePrimaryBatchCapacity(leafCount)
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 		if checkpointed {
 			// A checkpoint advanced FileEnd and rebound every leaf's physical
@@ -154,19 +170,19 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, error) {
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
 			if splitErr := c.splitPrimaryBatchLeaf(state, splitKey); splitErr != nil {
-				return false, errors.Join(buildErr, splitErr)
+				return false, 0, errors.Join(buildErr, splitErr)
 			}
 			continue
 		}
 		if buildErr != nil {
-			return false, buildErr
+			return false, 0, buildErr
 		}
 		if !c.primaryBatchHasLiveLeaf() {
-			return false, nil
+			return false, 0, nil
 		}
 		if err := c.admitPrimaryBatchLeaves(); err != nil {
 			c.unadmitPrimaryBatchLeaves()
-			return false, err
+			return false, 0, err
 		}
 		// Point of no return for the sync lane: every fallible prepare has
 		// succeeded and every leaf frame is admitted dirty but not yet
@@ -174,22 +190,24 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, error) {
 		// device failure poisons and publishes nothing.
 		if err := c.journalBatchBeforePublishLocked(generation, c.batchJournalEntries); err != nil {
 			c.unadmitPrimaryBatchLeaves()
-			return false, err
+			return false, 0, err
 		}
 		c.publishPrimaryBatch(state, generation)
 		if c.buffered() {
-			// Buffered-visible makes its already-published batch durable with the
-			// same one-record, one-sync group commit.
-			if err := c.journalBatchAckLocked(generation, c.batchJournalEntries); err != nil {
-				return true, err
+			// Buffered-visible deposits its already-published batch's redo record
+			// for the shared group sync after the writer is released.
+			target, ackErr := c.journalBatchDepositLocked(generation, c.batchJournalEntries)
+			if ackErr != nil {
+				return true, 0, ackErr
 			}
+			return true, target, nil
 		}
-		return true, nil
+		return true, 0, nil
 	}
 	if lastErr == nil {
 		lastErr = ErrPrimaryLeafSplitRequired
 	}
-	return false, lastErr
+	return false, 0, lastErr
 }
 
 // planPrimaryBatch validates and routes every WriteBatch entry, groups the
