@@ -73,6 +73,11 @@ func (c *Collection) poisonJournalLocked(cause error) error {
 	return c.journalFailure.Load().err
 }
 
+// ErrStoreDirectIOUnsupported reports that ReadDirectRequire or
+// WriteDirectRequire was configured on a platform or filesystem that cannot
+// honor direct Store page I/O.
+var ErrStoreDirectIOUnsupported = storeio.ErrDirectIOUnsupported
+
 // recoveryJournalFaultHook, when non-nil, is invoked with each journal this
 // collection creates or opens. The exhaustive store-level crash sweep sets it to
 // install a FaultJournal over the journal's raw writes; production leaves it nil.
