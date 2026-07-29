@@ -200,6 +200,9 @@ func fileStoreCollectionOptionFlags(options store.Options) uint32 {
 	if options.IndexOptions.HashKeys {
 		flags |= storeio.StateOptionHashKeys
 	}
+	if options.Schema != nil {
+		flags |= storeio.StateOptionSchema
+	}
 	return flags
 }
 
@@ -246,6 +249,11 @@ func normalizeOpenedFileStoreOptions(
 		)
 	}
 
+	if root.PageSize != 4096 {
+		// A store recording any base page other than 4096 predates the fixed-page
+		// primary graph; it cannot be opened by this build.
+		return normalizedFileStoreOptions{}, ErrUnsupportedPageSize
+	}
 	if supplied.PageSize != 0 && supplied.PageSize != int(root.PageSize) ||
 		supplied.MaxPageSize != 0 &&
 			supplied.MaxPageSize != int(root.MaxPageSize) ||
@@ -271,7 +279,8 @@ func normalizeOpenedFileStoreOptions(
 		(storeio.StateOptionShapeTapes |
 			storeio.StateOptionPostings |
 			storeio.StateOptionValueDict |
-			storeio.StateOptionHashKeys)
+			storeio.StateOptionHashKeys |
+			storeio.StateOptionSchema)
 	assertedFlags := fileStoreCollectionOptionFlags(supplied.Collection)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(

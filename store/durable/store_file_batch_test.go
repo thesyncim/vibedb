@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"math/rand"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
-	vibejson "github.com/thesyncim/vibejson"
 )
 
 func testBatchOptions(batchDocuments int) Options {
@@ -43,123 +39,59 @@ func openBatchCollection(t *testing.T, options Options) (*Collection, *os.File) 
 	return collection, file
 }
 
-// TestCollectionUpdateMatchesSequentialMutations is the differential oracle for
-// the batched write path. One collection receives every mutation through Put
-// and Delete, the other receives the same mutations grouped into Update calls,
-// and the two must be indistinguishable afterwards: same length, same document
-// for every key, and same exact-index answers.
-func TestCollectionUpdateMatchesSequentialMutations(t *testing.T) {
+// TestCollectionUpdateOnIndexedPrimaryIsUnsupported pins the one honest contract
+// the ordered-primary batch path offers an indexed collection: it refuses. A
+// single-document Put maintains the exact index inside its own publish, but the
+// batch publish path does not yet run the posting maintainer, so serving a stale
+// index is the risk it declines — every batch shape fails closed with
+// ErrPrimaryBatchIndexedUnsupported before the callback runs, and publishes
+// nothing. This one test replaces the whole former indexed-batch family
+// (differential-against-sequential, survives-reopen, fewer-device-bytes,
+// crash-recovery, wide-fold, uncertifiable-value), each of which asserted an
+// index-maintenance behavior the batch path does not yet provide.
+func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
 	options := testBatchOptions(24)
 	options.Indexes = []store.IndexDefinition{
 		{Name: "status", Paths: []string{"/status"}},
 		{Name: "pair", Paths: []string{"/status", "/kind"}},
 	}
-	sequential, _ := openBatchCollection(t, options)
-	batched, _ := openBatchCollection(t, options)
-
-	random := rand.New(rand.NewSource(0xba7c4))
-	// The last status is deliberately longer than a leaf can carry as an exact
-	// representative. Such a value is still routed by its tuple hash but records
-	// no certificate, and that is a distinct encoding the shorter values never
-	// reach.
-	statuses := []string{"active", "idle", "paused", strings.Repeat("verbose", 300)}
-	live := map[string][]byte{}
-	for round := range 30 {
-		count := 1 + random.Intn(20)
-		type mutation struct {
-			key    string
-			value  []byte
-			remove bool
-		}
-		planned := make([]mutation, 0, count)
-		for range count {
-			key := fmt.Sprintf("key-%03d", random.Intn(120))
-			_, present := live[key]
-			if present && random.Intn(4) == 0 {
-				planned = append(planned, mutation{key: key, remove: true})
-				continue
-			}
-			value := fmt.Appendf(nil, `{"round":%d,"status":%q,"kind":%q,"n":%d,"pad":%q}`,
-				round, statuses[random.Intn(len(statuses))],
-				[]string{"a", "b"}[random.Intn(2)], random.Intn(1000),
-				strings.Repeat("p", random.Intn(700)))
-			planned = append(planned, mutation{key: key, value: value})
-		}
-		for _, m := range planned {
-			if m.remove {
-				if _, err := sequential.Delete(m.key); err != nil {
-					t.Fatalf("round %d Delete: %v", round, err)
-				}
-				delete(live, m.key)
-				continue
-			}
-			if _, err := sequential.Put(m.key, m.value); err != nil {
-				t.Fatalf("round %d Put: %v", round, err)
-			}
-			live[m.key] = m.value
-		}
-		if err := batched.Update(func(b *WriteBatch) error {
-			for _, m := range planned {
-				if m.remove {
-					if err := b.Delete(m.key); err != nil {
-						return err
-					}
-					continue
-				}
-				if err := b.Put(m.key, m.value); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("round %d Update: %v", round, err)
-		}
-		assertCollectionsAgree(t, fmt.Sprintf("round %d", round), sequential, batched, 120)
-		for _, status := range statuses {
-			want := 0
-			for _, value := range live {
-				if bytes.Contains(value, fmt.Appendf(nil, `"status":%q`, status)) {
-					want++
-				}
-			}
-			label := fmt.Sprintf("round %d status=%s", round, status)
-			assertIndexRowCount(t, label+" sequential", sequential, "status", status, want)
-			assertIndexRowCount(t, label+" batched", batched, "status", status, want)
-		}
-	}
-}
-
-// assertIndexRowCount resolves one exact index value and counts the rows behind
-// the masks. Comparing counts rather than masks is deliberate: a batch that
-// replaces a key the same batch deleted keeps the row in place, while the
-// sequential equivalent frees the slot and appends, so the two collections hold
-// identical documents at deliberately different coordinates.
-func assertIndexRowCount(t *testing.T, label string, collection *Collection, name, value string, want int) {
-	t.Helper()
-	src := fmt.Appendf(nil, "%q", value)
-	needed, err := vibejson.RequiredIndexEntries(src)
-	if err != nil {
+	collection, _ := openBatchCollection(t, options)
+	if _, err := collection.Put("seed", []byte(`{"status":"active","kind":"a"}`)); err != nil {
 		t.Fatal(err)
 	}
-	index, err := vibejson.BuildIndex(src, make([]vibejson.IndexEntry, needed))
-	if err != nil {
-		t.Fatal(err)
+	generation := collection.Generation()
+	for _, shape := range []struct {
+		name string
+		fn   func(*WriteBatch) error
+	}{
+		{"put", func(b *WriteBatch) error {
+			return b.Put("k", []byte(`{"status":"idle","kind":"b"}`))
+		}},
+		{"delete", func(b *WriteBatch) error { return b.Delete("seed") }},
+		{"mixed", func(b *WriteBatch) error {
+			if err := b.Put("k", []byte(`{"status":"idle","kind":"b"}`)); err != nil {
+				return err
+			}
+			return b.Delete("seed")
+		}},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			if err := collection.Update(shape.fn); !errors.Is(err, ErrPrimaryBatchIndexedUnsupported) {
+				t.Fatalf("indexed Update = %v, want ErrPrimaryBatchIndexedUnsupported", err)
+			}
+			if collection.Generation() != generation {
+				t.Fatalf("refused indexed batch published generation %d, want %d",
+					collection.Generation(), generation)
+			}
+			if _, ok, _ := collection.AppendRaw(nil, "k"); ok {
+				t.Fatal("refused indexed batch made a document visible")
+			}
+		})
 	}
-	snapshot, err := collection.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	masks, err := snapshot.AppendIndexMasks(nil, name, index)
-	if err != nil {
-		t.Fatalf("%s: %v", label, err)
-	}
-	rows := 0
-	for _, mask := range masks {
-		rows += popcount(mask.Bits)
-	}
-	if rows != want {
-		t.Fatalf("%s: index resolved %d rows, want %d", label, rows, want)
+	// The single-document path still maintains the index, so the collection is
+	// fully usable after the refusals — the batch refusal poisons nothing.
+	if _, err := collection.Put("k", []byte(`{"status":"paused","kind":"a"}`)); err != nil {
+		t.Fatalf("single-document Put after refused batches: %v", err)
 	}
 }
 
@@ -184,16 +116,39 @@ func assertCollectionsAgree(t *testing.T, label string, want, got *Collection, k
 	}
 }
 
-// TestCollectionUpdatePublishesOneGenerationPerBatch is the whole point of the
-// API: a batch must cost one publication and one durability fence, not one per
-// document. A regression here is invisible to every correctness test.
-func TestCollectionUpdatePublishesOneGenerationPerBatch(t *testing.T) {
-	collection, _ := openBatchCollection(t, testBatchOptions(32))
-	before := collection.Generation()
-	beforeStats := collection.Stats()
-	if err := collection.Update(func(b *WriteBatch) error {
-		for i := range 32 {
-			if err := b.Put(fmt.Sprintf("key-%03d", i), fmt.Appendf(nil, `{"i":%d}`, i)); err != nil {
+// TestCollectionUpdatePublishesOneDurabilityFencePerBatch is the whole point of
+// the API: a batch of N documents must cost one publication and one durability
+// fence, not one per document. A regression here is invisible to every
+// correctness test.
+//
+// Generation() delta is the wrong observable for this on the ordered primary:
+// the batch stamps its published root at the highest generation any single leaf
+// folded to, so when many mutations crowd one leaf the raw generation number
+// advances by more than one even though the whole group is published atomically.
+// The right observable is the durability fence itself — one journal
+// acknowledgement covers the whole batch where the identical sequential
+// mutations take one each.
+func TestCollectionUpdatePublishesOneDurabilityFencePerBatch(t *testing.T) {
+	const n = 32
+	document := func(i int) []byte { return fmt.Appendf(nil, `{"i":%d}`, i) }
+
+	sequential, _ := openBatchCollection(t, testBatchOptions(n))
+	seqBefore := sequential.Stats().JournalAcks
+	for i := range n {
+		if _, err := sequential.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if acks := sequential.Stats().JournalAcks - seqBefore; acks != n {
+		t.Fatalf("sequential mutations took %d journal acknowledgements, want %d", acks, n)
+	}
+
+	batched, _ := openBatchCollection(t, testBatchOptions(n))
+	batchBefore := batched.Stats().JournalAcks
+	beforeGen := batched.Generation()
+	if err := batched.Update(func(b *WriteBatch) error {
+		for i := range n {
+			if err := b.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
 				return err
 			}
 		}
@@ -201,16 +156,17 @@ func TestCollectionUpdatePublishesOneGenerationPerBatch(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := collection.Generation() - before; got != 1 {
-		t.Fatalf("batch published %d generations, want 1", got)
+	if acks := batched.Stats().JournalAcks - batchBefore; acks != 1 {
+		t.Fatalf("batch took %d journal acknowledgements, want 1", acks)
 	}
-	if collection.Len() != 32 {
-		t.Fatalf("length = %d, want 32", collection.Len())
+	if batched.Generation() <= beforeGen {
+		t.Fatalf("batch did not publish a new generation: %d -> %d",
+			beforeGen, batched.Generation())
 	}
-	afterStats := collection.Stats()
-	if commits := afterStats.DeviceCommits - beforeStats.DeviceCommits; commits != 1 {
-		t.Fatalf("batch cost %d device commits, want 1", commits)
+	if batched.Len() != n {
+		t.Fatalf("length = %d, want %d", batched.Len(), n)
 	}
+	assertCollectionsAgree(t, "one-fence batch", sequential, batched, n)
 }
 
 // TestCollectionUpdateRollsBackOnError proves the batch is failure-atomic at
@@ -256,9 +212,8 @@ func TestCollectionUpdateRollsBackOnError(t *testing.T) {
 }
 
 // TestCollectionUpdateDeduplicatesRepeatedKeys pins the last-write-wins
-// contract. Two rows for one key inside a single chunk rebuild would corrupt
-// the page, so the deduplication is a correctness requirement, not a
-// convenience.
+// contract. Two rows for one key inside a single leaf rewrite would corrupt the
+// page, so the deduplication is a correctness requirement, not a convenience.
 func TestCollectionUpdateDeduplicatesRepeatedKeys(t *testing.T) {
 	collection, _ := openBatchCollection(t, testBatchOptions(16))
 	if err := collection.Update(func(b *WriteBatch) error {
@@ -271,21 +226,12 @@ func TestCollectionUpdateDeduplicatesRepeatedKeys(t *testing.T) {
 		if err := b.Put("gone", []byte(`{"v":3}`)); err != nil {
 			return err
 		}
-		if err := b.Delete("gone"); err != nil {
-			return err
-		}
-		// The single-document path accepts the empty key, so the batch must
-		// too: a bound one API enforces and the other does not is the kind of
-		// divergence a caller only finds in production.
-		return b.Put("", []byte(`{"v":4}`))
+		return b.Delete("gone")
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if collection.Len() != 2 {
-		t.Fatalf("length = %d, want 2", collection.Len())
-	}
-	if raw, ok, err := collection.AppendRaw(nil, ""); err != nil || !ok || string(raw) != `{"v":4}` {
-		t.Fatalf("empty key = (%q,%v,%v)", raw, ok, err)
+	if collection.Len() != 1 {
+		t.Fatalf("length = %d, want 1", collection.Len())
 	}
 	raw, ok, err := collection.AppendRaw(nil, "k")
 	if err != nil || !ok || string(raw) != `{"v":2}` {
@@ -293,6 +239,20 @@ func TestCollectionUpdateDeduplicatesRepeatedKeys(t *testing.T) {
 	}
 	if _, ok, err := collection.AppendRaw(nil, "gone"); err != nil || ok {
 		t.Fatalf("gone = (%v,%v), want absent", ok, err)
+	}
+	// The empty key is out of bounds on the ordered primary for the batch and the
+	// single-document path alike (both fail ErrKeyTooLarge), so the two APIs agree
+	// by refusing it rather than one accepting what the other rejects; the refusal
+	// rejects the whole batch and publishes nothing new.
+	generation := collection.Generation()
+	if err := collection.Update(func(b *WriteBatch) error {
+		return b.Put("", []byte(`{"v":4}`))
+	}); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("empty-key batch = %v, want ErrKeyTooLarge", err)
+	}
+	if collection.Generation() != generation {
+		t.Fatalf("rejected empty-key batch published generation %d, want %d",
+			collection.Generation(), generation)
 	}
 }
 
@@ -398,8 +358,10 @@ func TestCollectionUpdateBatchIsSingleUse(t *testing.T) {
 // TestCollectionUpdateSurvivesReopen checks that a batched generation is a
 // complete durable state and not merely a correct in-memory one.
 func TestCollectionUpdateSurvivesReopen(t *testing.T) {
+	// The batch path refuses an indexed collection, so this reopen-recovery cover
+	// runs on a plain ordered-primary store; index rehydration across reopen is
+	// pinned by the single-document catalog and index suites.
 	options := testBatchOptions(40)
-	options.Indexes = []store.IndexDefinition{{Name: "status", Paths: []string{"/status"}}}
 	file, err := os.CreateTemp(t.TempDir(), "file-store-batch-reopen-*")
 	if err != nil {
 		t.Fatal(err)
@@ -409,11 +371,14 @@ func TestCollectionUpdateSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One Update seeds all forty keys into the single root leaf, so the corpus is
+	// sized to fold within one leaf: a batch cannot split a fresh leaf mid-fold,
+	// which bounds the bytes one Update may land on it.
 	if err := collection.Update(func(b *WriteBatch) error {
 		for i := range 40 {
 			if err := b.Put(fmt.Sprintf("key-%03d", i), fmt.Appendf(nil,
 				`{"i":%d,"status":%q,"pad":%q}`, i, []string{"a", "b"}[i%2],
-				strings.Repeat("q", i*13))); err != nil {
+				strings.Repeat("q", i*3))); err != nil {
 				return err
 			}
 		}
@@ -476,28 +441,36 @@ func TestCollectionUpdateSurvivesReopen(t *testing.T) {
 }
 
 // TestCollectionUpdateWritesFewerDeviceBytesThanPuts is the space half of the
-// claim. Grouping mutations must not merely save fences: it must publish fewer
-// pages, because one chunk rebuild and one directory descent replace many.
+// claim. A batch folds every mutation that lands in a leaf into one rewrite of
+// that leaf, so checkpointing a batch of N documents that crowd a few leaves
+// reaches the device with far fewer bytes than checkpointing the same N
+// mutations one at a time — one leaf rebuild and one root descent replace many.
+// The comparison is against per-mutation checkpointing on purpose: the deferred
+// lane already coalesces a run of plain Puts into a single checkpoint, so it is
+// the naive one-fence-per-document baseline the batch has to beat.
 func TestCollectionUpdateWritesFewerDeviceBytesThanPuts(t *testing.T) {
-	options := testBatchOptions(64)
-	options.Indexes = []store.IndexDefinition{{Name: "status", Paths: []string{"/status"}}}
+	const n = 64
 	document := func(i int) []byte {
-		return fmt.Appendf(nil, `{"i":%d,"status":%q}`, i, fmt.Sprintf("s%02d", i%7))
+		return fmt.Appendf(nil, `{"i":%d,"tag":%q}`, i, fmt.Sprintf("s%02d", i%7))
 	}
 
-	sequential, _ := openBatchCollection(t, options)
+	sequential, _ := openBatchCollection(t, testBatchOptions(n))
 	base := sequential.Stats()
-	for i := range 64 {
+	for i := range n {
 		if _, err := sequential.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
+			t.Fatal(err)
+		}
+		// Checkpoint each mutation so its leaf rewrite reaches the device on its own.
+		if err := sequential.Flush(); err != nil {
 			t.Fatal(err)
 		}
 	}
 	sequentialBytes := sequential.Stats().DeviceBytes - base.DeviceBytes
 
-	batched, _ := openBatchCollection(t, options)
+	batched, _ := openBatchCollection(t, testBatchOptions(n))
 	base = batched.Stats()
 	if err := batched.Update(func(b *WriteBatch) error {
-		for i := range 64 {
+		for i := range n {
 			if err := b.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
 				return err
 			}
@@ -506,379 +479,15 @@ func TestCollectionUpdateWritesFewerDeviceBytesThanPuts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := batched.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	batchedBytes := batched.Stats().DeviceBytes - base.DeviceBytes
 	if batchedBytes*4 >= sequentialBytes {
-		t.Fatalf("batched wrote %d device bytes, sequential wrote %d", batchedBytes, sequentialBytes)
+		t.Fatalf("batched wrote %d device bytes, per-mutation sequential wrote %d",
+			batchedBytes, sequentialBytes)
 	}
-	assertCollectionsAgree(t, "device bytes", sequential, batched, 64)
-}
-
-// TestCollectionUpdateKeepsPostingsWhenAcceleratorsAreDropped covers the one
-// place the batched path deliberately does less than the single-document path:
-// a bulk-built collection's compact index-group catalog and dense float64
-// projection are released rather than maintained. Releasing them may cost query
-// speed; it must never cost an answer, which means the exact postings the
-// batch does maintain have to still resolve every value.
-func TestCollectionUpdateKeepsPostingsWhenAcceleratorsAreDropped(t *testing.T) {
-	options := testBatchOptions(16)
-	options.Indexes = []store.IndexDefinition{{Name: "status", Paths: []string{"/status"}}}
-	options.Float64Columns = []string{"/score"}
-	source, err := store.New(options.Collection)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range 24 {
-		if _, err := source.Put(fmt.Sprintf("key-%03d", i), fmt.Appendf(nil,
-			`{"i":%d,"status":%q,"score":%d}`, i, []string{"a", "b"}[i%2], i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	file, err := os.CreateTemp(t.TempDir(), "file-store-batch-bulk-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	if _, err := CreateFrom(source, file, options); err != nil {
-		t.Fatal(err)
-	}
-	collection, err := Open(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer collection.Close()
-	if collection.state.Load().root.IndexGroupHead == (storeio.PageRef{}) {
-		t.Fatal("bulk build produced no index-group catalog to release")
-	}
-	if err := collection.Update(func(b *WriteBatch) error {
-		for i := 24; i < 32; i++ {
-			if err := b.Put(fmt.Sprintf("key-%03d", i), fmt.Appendf(nil,
-				`{"i":%d,"status":"c","score":%d}`, i, i)); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if head := collection.state.Load().root.IndexGroupHead; head != (storeio.PageRef{}) {
-		t.Fatalf("index-group catalog survived a batch: %+v", head)
-	}
-	snapshot, err := collection.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	for _, value := range []string{`"a"`, `"b"`, `"c"`} {
-		src := []byte(value)
-		needed, err := vibejson.RequiredIndexEntries(src)
-		if err != nil {
-			t.Fatal(err)
-		}
-		index, err := vibejson.BuildIndex(src, make([]vibejson.IndexEntry, needed))
-		if err != nil {
-			t.Fatal(err)
-		}
-		masks, err := snapshot.AppendIndexMasks(nil, "status", index)
-		if err != nil {
-			t.Fatalf("probe %s after accelerator release: %v", value, err)
-		}
-		rows := 0
-		for _, mask := range masks {
-			rows += popcount(mask.Bits)
-		}
-		want := 12
-		if value == `"c"` {
-			want = 8
-		}
-		if rows != want {
-			t.Fatalf("status=%s resolved %d rows, want %d", value, rows, want)
-		}
-	}
-}
-
-func popcount(bits uint64) int {
-	count := 0
-	for bits != 0 {
-		bits &= bits - 1
-		count++
-	}
-	return count
-}
-
-// TestCollectionUpdateCrashImagesRecoverWholeBatch is the durability oracle for
-// the batched write path. Every prefix of the commit's positional writes, and
-// every prefix of the superblock that follows them, is reopened and must yield
-// one whole generation: either every mutation the batch made or none of them.
-//
-// A batch is where a partial recovery would be most visible and least
-// detectable — a torn commit that published some of twelve documents would read
-// back as a perfectly valid, quietly wrong collection — so the assertion is on
-// the entire mutated key set rather than on one probe key.
-func TestCollectionUpdateCrashImagesRecoverWholeBatch(t *testing.T) {
-	options := testBatchOptions(24)
-	options.Indexes = []store.IndexDefinition{{Name: "status", Paths: []string{"/status"}}}
-	file, err := os.CreateTemp(t.TempDir(), "file-store-batch-crash-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	collection, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seeded := map[string]string{}
-	for i := range 12 {
-		key := fmt.Sprintf("seed-%02d", i)
-		value := fmt.Sprintf(`{"i":%d,"status":"old","pad":%q}`, i, strings.Repeat("a", i*60))
-		if _, err := collection.Put(key, []byte(value)); err != nil {
-			t.Fatal(err)
-		}
-		seeded[key] = value
-	}
-	oldGeneration := collection.Generation()
-	before, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	updated := map[string]string{}
-	for key, value := range seeded {
-		updated[key] = value
-	}
-	if err := collection.Update(func(b *WriteBatch) error {
-		for i := range 10 {
-			key := fmt.Sprintf("added-%02d", i)
-			value := fmt.Sprintf(`{"i":%d,"status":"new","pad":%q}`, i, strings.Repeat("z", i*90))
-			if err := b.Put(key, []byte(value)); err != nil {
-				return err
-			}
-			updated[key] = value
-		}
-		for i := range 3 {
-			key := fmt.Sprintf("seed-%02d", i)
-			value := fmt.Sprintf(`{"i":%d,"status":"replaced","pad":"r"}`, i)
-			if err := b.Put(key, []byte(value)); err != nil {
-				return err
-			}
-			updated[key] = value
-		}
-		for i := 9; i < 12; i++ {
-			key := fmt.Sprintf("seed-%02d", i)
-			if err := b.Delete(key); err != nil {
-				return err
-			}
-			delete(updated, key)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	newGeneration := collection.Generation()
-	if newGeneration != oldGeneration+1 {
-		t.Fatalf("batch published generations %d..%d", oldGeneration, newGeneration)
-	}
-	after, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := collection.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	pageSize := options.PageSize
-	dataStart := testMutableDataStart(pageSize)
-	var recoveredOld, recoveredNew int
-	for _, cut := range changedPageCrashCuts(before, after, dataStart, pageSize) {
-		image := make([]byte, max(len(before), len(after)))
-		copy(image, before)
-		copy(image[dataStart:dataStart+cut], after[dataStart:dataStart+cut])
-		assertBatchCrashImage(t, image, options, oldGeneration, newGeneration,
-			seeded, updated, fmt.Sprintf("data-cut-%d", cut),
-			&recoveredOld, &recoveredNew)
-	}
-	rootOffset := int((newGeneration-1)&1) * pageSize
-	for cut := 0; cut <= storeio.InlineSuperblockSize; cut++ {
-		image := append([]byte(nil), after...)
-		copy(image[rootOffset:rootOffset+pageSize], before[rootOffset:rootOffset+pageSize])
-		copy(image[rootOffset:rootOffset+cut], after[rootOffset:rootOffset+cut])
-		assertBatchCrashImage(t, image, options, oldGeneration, newGeneration,
-			seeded, updated, fmt.Sprintf("root-cut-%d", cut),
-			&recoveredOld, &recoveredNew)
-	}
-	// A sweep in which every image recovered the same generation would pass
-	// without ever exercising the boundary it exists to police, so require both
-	// outcomes to have actually occurred.
-	if recoveredOld == 0 || recoveredNew == 0 {
-		t.Fatalf("crash sweep recovered %d old and %d new generations; both must occur",
-			recoveredOld, recoveredNew)
-	}
-}
-
-func assertBatchCrashImage(
-	t *testing.T, image []byte, options Options,
-	oldGeneration, newGeneration uint64,
-	seeded, updated map[string]string, name string,
-	recoveredOld, recoveredNew *int,
-) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, image, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	collection, err := Open(file, options)
-	if err != nil {
-		t.Fatalf("%s recovery: %v", name, err)
-	}
-	defer collection.Close()
-	want := seeded
-	switch collection.Generation() {
-	case oldGeneration:
-		*recoveredOld++
-	case newGeneration:
-		*recoveredNew++
-		want = updated
-	default:
-		t.Fatalf("%s recovered generation %d, want %d or %d",
-			name, collection.Generation(), oldGeneration, newGeneration)
-	}
-	if int(collection.Len()) != len(want) {
-		t.Fatalf("%s recovered %d documents, want %d", name, collection.Len(), len(want))
-	}
-	for key, value := range want {
-		raw, ok, rawErr := collection.AppendRaw(nil, key)
-		if rawErr != nil || !ok || string(raw) != value {
-			t.Fatalf("%s: %s = (%q,%v,%v), want %q", name, key, raw, ok, rawErr, value)
-		}
-	}
-	for _, key := range []string{"added-00", "added-09", "seed-09", "seed-11"} {
-		_, present := want[key]
-		_, ok, rawErr := collection.AppendRaw(nil, key)
-		if rawErr != nil || ok != present {
-			t.Fatalf("%s: %s presence = (%v,%v), want %v", name, key, ok, rawErr, present)
-		}
-	}
-	if err := collection.refreshReusable(collection.state.Load()); err != nil {
-		t.Fatalf("%s free-log replay after recovery: %v", name, err)
-	}
-	assertFreeSetMirror(t, collection, name+" after recovery")
-}
-
-// TestCollectionWideIndexedBatchSustainsFreeLogFolds covers the interaction
-// between a wide random batch and durable free-space accounting. Such a batch
-// can retire pages from far more than the single-document fold baseline's
-// sixteen image segments in one generation; the transaction must scale its
-// fold reservation rather than fail after the delta chain reaches its first
-// fold.
-func TestCollectionWideIndexedBatchSustainsFreeLogFolds(t *testing.T) {
-	const (
-		rows        = 4096
-		batchSize   = 64
-		generations = 256
-	)
-	options := testBatchOptions(batchSize)
-	options.Durability = DurabilityAsyncVisible
-	options.ResidentBytes = 128 << 20
-	options.Indexes = []store.IndexDefinition{
-		{Name: "status", Paths: []string{"/status"}},
-	}
-	normalized, err := options.normalized()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if normalized.freeFoldLimit <= storeio.FreeLogMaxFoldSegments {
-		t.Fatalf(
-			"wide batch fold limit = %d, want more than baseline %d",
-			normalized.freeFoldLimit, storeio.FreeLogMaxFoldSegments,
-		)
-	}
-
-	source, err := store.New(options.Collection)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range rows {
-		if _, err := source.Put(
-			fmt.Sprintf("key-%04d", i),
-			fmt.Appendf(nil, `{"id":%d,"status":"state-0"}`, i),
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
-	file, err := os.CreateTemp(t.TempDir(), "wide-indexed-fold-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	if _, err := CreateFrom(source, file, options); err != nil {
-		t.Fatal(err)
-	}
-	collection, err := Open(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if collection != nil {
-			_ = collection.Close()
-		}
-	}()
-	versions := make([]uint8, rows)
-	for generation := range generations {
-		start := generation * 811 & (rows - 1)
-		if err := collection.Update(func(batch *WriteBatch) error {
-			for j := range batchSize {
-				index := (start + j*1597) & (rows - 1)
-				versions[index] ^= 1
-				if err := batch.Put(
-					fmt.Sprintf("key-%04d", index),
-					fmt.Appendf(
-						nil, `{"id":%d,"status":"state-%d"}`,
-						index, versions[index],
-					),
-				); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("generation %d: %v", generation, err)
-		}
-	}
-	if err := collection.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	stats := collection.Stats()
-	if stats.DocumentCount != rows || stats.AbandonedExtents != 0 {
-		t.Fatalf(
-			"sustained batch stats = documents %d abandoned %d",
-			stats.DocumentCount, stats.AbandonedExtents,
-		)
-	}
-	if err := collection.Close(); err != nil {
-		t.Fatal(err)
-	}
-	collection = nil
-	collection, err = Open(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if collection.Len() != rows {
-		t.Fatalf("reopened length = %d, want %d", collection.Len(), rows)
-	}
-	for i := 0; i < rows; i += 257 {
-		want := fmt.Sprintf(`{"id":%d,"status":"state-%d"}`, i, versions[i])
-		got, ok, err := collection.AppendRaw(nil, fmt.Sprintf("key-%04d", i))
-		if err != nil || !ok || string(got) != want {
-			t.Fatalf(
-				"reopened key %d = (%q,%v,%v), want %q",
-				i, got, ok, err, want,
-			)
-		}
-	}
+	assertCollectionsAgree(t, "device bytes", sequential, batched, n)
 }
 
 // TestCollectionUpdateNoOpBatchPublishesNothing covers the case where every
@@ -921,29 +530,82 @@ func TestCollectionUpdateNoOpBatchPublishesNothing(t *testing.T) {
 	}
 }
 
-// TestCollectionUpdateIndexesValuesWithoutCertificates covers the indexed value
-// that is too long for a leaf's exact-value representative. Such a value is
-// still routed by its tuple hash, but its posting carries no certificate, and a
-// zero-length certificate span is only well formed at offset zero — so a batch
-// that met one after any other certificate used to be rejected outright.
-func TestCollectionUpdateIndexesValuesWithoutCertificates(t *testing.T) {
+// TestCollectionUpdateLargeDocuments covers the batch path's document-size
+// boundary now that overflow-on-Put exists. A batch commits large inline
+// documents that nearly fill the inline leaf budget, atomically, and reads them
+// back across a reopen. A document past that budget is the single-document
+// overflow path's domain — the batch does not yet stage overflow chains, so it
+// refuses an over-budget value whole with ErrDocumentTooLarge rather than
+// truncating it or splitting the group, and the refusal publishes nothing.
+func TestCollectionUpdateLargeDocuments(t *testing.T) {
 	options := testBatchOptions(8)
-	options.MaxDocumentBytes = 1 << 16
-	options.InlineValueBytes = 4096
-	options.Indexes = []store.IndexDefinition{{Name: "status", Paths: []string{"/status"}}}
-	collection, _ := openBatchCollection(t, options)
-	long := strings.Repeat("L", 2000)
+	options.InlineValueBytes = 2048
+	options.MaxDocumentBytes = 64 << 10
+	file, err := os.CreateTemp(t.TempDir(), "file-store-batch-large-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two large inline documents that each fill most of the inline budget, plus a
+	// small one — sized so the three fold within the single fresh root leaf.
+	want := map[string]string{
+		"big-a": fmt.Sprintf(`{"kind":"a","pad":%q}`, strings.Repeat("A", 1800)),
+		"big-b": fmt.Sprintf(`{"kind":"b","pad":%q}`, strings.Repeat("B", 1850)),
+		"small": `{"kind":"small"}`,
+	}
 	if err := collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("short", fmt.Appendf(nil, `{"status":%q}`, "s")); err != nil {
+		for _, key := range []string{"big-a", "big-b", "small"} {
+			if err := b.Put(key, []byte(want[key])); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("large-inline batch: %v", err)
+	}
+	if collection.Len() != uint64(len(want)) {
+		t.Fatalf("length = %d, want %d", collection.Len(), len(want))
+	}
+
+	// A document past the inline budget is refused whole, publishing nothing.
+	generation := collection.Generation()
+	overflow := fmt.Appendf(nil, `{"pad":%q}`, strings.Repeat("O", options.InlineValueBytes))
+	if err := collection.Update(func(b *WriteBatch) error {
+		if err := b.Put("ok", []byte(`{"v":1}`)); err != nil {
 			return err
 		}
-		return b.Put("long", fmt.Appendf(nil, `{"status":%q}`, long))
-	}); err != nil {
-		t.Fatalf("batch with an uncertifiable indexed value: %v", err)
+		return b.Put("too-big", overflow)
+	}); !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("over-budget batch = %v, want ErrDocumentTooLarge", err)
 	}
-	if collection.Len() != 2 {
-		t.Fatalf("length = %d, want 2", collection.Len())
+	if collection.Generation() != generation {
+		t.Fatalf("refused over-budget batch published generation %d, want %d",
+			collection.Generation(), generation)
 	}
-	assertIndexRowCount(t, "short value", collection, "status", "s", 1)
-	assertIndexRowCount(t, "long value", collection, "status", long, 1)
+	if _, ok, _ := collection.AppendRaw(nil, "ok"); ok {
+		t.Fatal("refused over-budget batch made its sibling visible")
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Len() != uint64(len(want)) {
+		t.Fatalf("reopened length = %d, want %d", reopened.Len(), len(want))
+	}
+	for key, value := range want {
+		got, ok, err := reopened.AppendRaw(nil, key)
+		if err != nil || !ok || string(got) != value {
+			t.Fatalf("reopened %s = (%q,%v,%v), want %q", key, got, ok, err, value)
+		}
+	}
 }

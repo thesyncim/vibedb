@@ -72,14 +72,14 @@ func TestMutableStoreLayoutReservedPrefixIsNeverAllocatable(t *testing.T) {
 		reservedOffset := layout.MaterializationJournalOffsets[0]
 		ref := PageRef{
 			Offset: reservedOffset, LogicalID: 2, Generation: 1,
-			Length: pageSize, Kind: PageChunkDirectory,
+			Length: pageSize, Kind: PageOverflow,
 		}
 		root := StateRoot{
 			StoreID: storeID, Generation: 1, PageSize: pageSize,
 			MaxPageSize: pageSize, NextLogicalID: 3, ChunkDocuments: 1,
 		}
 		if err := validateStatePageRef(
-			ref, PageChunkDirectory, true, root, fileEnd,
+			ref, PageOverflow, true, root, fileEnd,
 		); !errors.Is(err, ErrInvalidWrite) {
 			t.Fatalf(
 				"page size %d reserved PageRef error = %v, want %v",
@@ -95,7 +95,7 @@ func TestMutableStoreLayoutReservedPrefixIsNeverAllocatable(t *testing.T) {
 			)
 		}
 		targetRef := ref
-		targetRef.Kind = PageDocument
+		targetRef.Kind = PageOverflow
 		if err := validateMaterializationTargetRef(MaterializationJournalHeader{
 			StoreID: storeID, Sequence: 1, TargetGeneration: 2,
 			PageSize: pageSize, SectorSize: MaterializationJournalMinSectorSize,

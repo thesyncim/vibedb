@@ -9,6 +9,12 @@ import (
 
 var indexTermLeafBenchRows uint64
 
+// legacyIndexRecordBytes is the retired chunk index-directory's fixed 32-byte
+// leaf record. The packed term leaf replaced that layout; the "current32"
+// benchmark metrics keep it as the space baseline the packed encoding is
+// measured against.
+const legacyIndexRecordBytes = 32
+
 func BenchmarkIndexTermLeafBytes(b *testing.B) {
 	for _, cardinality := range []struct {
 		name            string
@@ -36,12 +42,12 @@ func BenchmarkIndexTermLeafBytes(b *testing.B) {
 					indexTermLeafBenchRows += uint64(len(encoded))
 				}
 				b.ReportMetric(float64(len(encoded))/float64(postings), "leaf-B/posting")
-				b.ReportMetric(float64(currentRecords*IndexDirectoryLeafRecordSize)/
+				b.ReportMetric(float64(currentRecords*legacyIndexRecordBytes)/
 					float64(postings), "current32-B/posting")
-				b.ReportMetric(float64(currentRecords*IndexDirectoryLeafRecordSize+
+				b.ReportMetric(float64(currentRecords*legacyIndexRecordBytes+
 					currentCertificateBytes)/float64(postings), "current+exact-B/posting")
 				b.ReportMetric(float64(len(encoded))/
-					float64(currentRecords*IndexDirectoryLeafRecordSize+
+					float64(currentRecords*legacyIndexRecordBytes+
 						currentCertificateBytes), "leaf/current")
 				b.ReportMetric(float64(len(encoded)), "leaf-bytes")
 				b.ReportMetric(float64(currentRecords), "current-records")
@@ -390,7 +396,7 @@ func BenchmarkIndexTermLeafOrderedIteration(b *testing.B) {
 				var rows uint64
 				for b.Loop() {
 					for position := 0; position < len(current); position +=
-						IndexDirectoryLeafRecordSize {
+						legacyIndexRecordBytes {
 						rows += binary.LittleEndian.Uint64(current[position+16 : position+24])
 					}
 				}
@@ -476,7 +482,7 @@ func indexTermLeafCurrentRecordCounts(
 // certificate bytes are reported separately in the byte benchmark.
 func makeIndexTermLeafCurrent32(fixture indexTermLeafFixture) []byte {
 	records, _ := indexTermLeafCurrentRecordCounts(fixture)
-	encoded := make([]byte, records*IndexDirectoryLeafRecordSize)
+	encoded := make([]byte, records*legacyIndexRecordBytes)
 	position := 0
 	for term := range fixture.terms {
 		for _, input := range fixture.terms[term].Postings {
@@ -490,7 +496,7 @@ func makeIndexTermLeafCurrent32(fixture indexTermLeafFixture) []byte {
 				binary.LittleEndian.PutUint32(record[4:8], input.Posting.TileID)
 				binary.LittleEndian.PutUint32(record[8:12], uint32(chunk))
 				binary.LittleEndian.PutUint64(record[16:24], mask)
-				position += IndexDirectoryLeafRecordSize
+				position += legacyIndexRecordBytes
 			}
 		}
 	}
@@ -498,11 +504,11 @@ func makeIndexTermLeafCurrent32(fixture indexTermLeafFixture) []byte {
 }
 
 func lookupIndexTermLeafCurrent32(encoded []byte, term uint32) (uint64, bool) {
-	count := len(encoded) / IndexDirectoryLeafRecordSize
+	count := len(encoded) / legacyIndexRecordBytes
 	low, high := 0, count
 	for low < high {
 		middle := int(uint(low+high) >> 1)
-		record := encoded[middle*IndexDirectoryLeafRecordSize:]
+		record := encoded[middle*legacyIndexRecordBytes:]
 		if binary.LittleEndian.Uint32(record[0:4]) < term {
 			low = middle + 1
 		} else {
@@ -510,12 +516,12 @@ func lookupIndexTermLeafCurrent32(encoded []byte, term uint32) (uint64, bool) {
 		}
 	}
 	if low == count ||
-		binary.LittleEndian.Uint32(encoded[low*IndexDirectoryLeafRecordSize:]) != term {
+		binary.LittleEndian.Uint32(encoded[low*legacyIndexRecordBytes:]) != term {
 		return 0, false
 	}
 	var rows uint64
 	for low < count {
-		record := encoded[low*IndexDirectoryLeafRecordSize:]
+		record := encoded[low*legacyIndexRecordBytes:]
 		if binary.LittleEndian.Uint32(record[0:4]) != term {
 			break
 		}

@@ -154,6 +154,64 @@ func BuildPrimaryGraphPlaced(
 	return ref, err
 }
 
+// EmptyPrimaryGraphPageCount is the exact number of transaction pages
+// BuildEmptyPrimaryGraph stages: one leaf, one tablet (anchor + locator +
+// route), one catalog leaf, and the catalog root. A creation transaction
+// reserves this plus its exact-index and state-root pages.
+const EmptyPrimaryGraphPageCount = 1 + 3 + 1 + 1
+
+// BuildEmptyPrimaryGraph stages a valid ordered primary graph that holds no
+// documents: one empty narrow leaf (tablet 0, local 0) spanning the entire key
+// range, its single-anchor tablet, and a one-child catalog root. It is the
+// creation-time counterpart of BuildPrimaryGraph — a freshly created collection
+// is a primary-layout store from its first byte, and its first Put routes to
+// this empty leaf and fills it exactly as a runtime insert fills a leaf a delete
+// emptied. Both halves are already exercised in production (a single-document
+// build produces one leaf/tablet/catalog; a delete of the last row produces an
+// empty leaf), so this only composes them. The returned reference is suitable
+// for StateRoot.PrimaryRoot.
+func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
+	if tx == nil || !tx.active || tx.options.PageSize != physicalPageQuantum ||
+		tx.options.StoreID == ([16]byte{}) || tx.options.Generation == 0 ||
+		tx.nextID < PrimaryFirstDynamicLogicalID {
+		return PageRef{}, fmt.Errorf("%w: empty primary graph transaction", ErrInvalidWrite)
+	}
+	bucket, ok := MakeTabletLocalIdentityBucket(0, 0)
+	logicalID, logicalOK := CommonPrimaryLeafLogicalID(BucketID(bucket))
+	if !ok || !logicalOK {
+		return PageRef{}, fmt.Errorf("%w: empty primary leaf identity", ErrInvalidWrite)
+	}
+	page, err := tx.Allocate(
+		PagePrimaryLeaf, CommonPrimaryLeafNarrowBytes, logicalID,
+	)
+	if err != nil {
+		return PageRef{}, err
+	}
+	if _, err := EncodeCommonPrimaryLeaf(
+		page.Bytes(), CommonPrimaryLeafNarrow,
+		CommonPrimaryLeafHeader{
+			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+			Bucket: BucketID(bucket), PageSize: CommonPrimaryLeafNarrowBytes,
+		},
+		tx.options.StoreID, nil,
+		CommonPrimaryLeafBounds{
+			FileEnd:           tx.fileEnd,
+			NextLogicalID:     tx.nextID,
+			AllocationQuantum: tx.options.PageSize,
+		},
+	); err != nil {
+		return PageRef{}, err
+	}
+	if err := page.Stage(); err != nil {
+		return PageRef{}, err
+	}
+	tablets, err := buildPrimaryTablets(tx, []primaryBuiltLeaf{{ref: page.Ref()}})
+	if err != nil {
+		return PageRef{}, err
+	}
+	return buildPrimaryCatalog(tx, tablets)
+}
+
 func BuildPrimaryGraphWithStats(
 	tx *WriteTransaction,
 	records []PrimaryGraphRecord,

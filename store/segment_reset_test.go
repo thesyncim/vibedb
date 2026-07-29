@@ -341,17 +341,4 @@ func TestSegmentResetRefusesPublishedSegments(t *testing.T) {
 		}
 	})
 
-	t.Run("opened image", func(t *testing.T) {
-		src := &Segment{ShapeTapes: true}
-		fillSegment(t, src, resetCorpus("image", 12, 4))
-		var buf bytes.Buffer
-		if _, err := src.WriteTo(&buf); err != nil {
-			t.Fatal(err)
-		}
-		opened, err := OpenSegment(buf.Bytes())
-		if err != nil {
-			t.Fatal(err)
-		}
-		mustPanic(t, "a segment opened from an image", func() { opened.Reset() })
-	})
 }

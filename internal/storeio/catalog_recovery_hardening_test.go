@@ -174,7 +174,7 @@ func newExactCatalogRecoveryFixture(
 		LogicalID:  catalogBounds.NextLogicalID,
 		Generation: 8,
 		Length:     pageSize,
-		Kind:       PageFloat64Catalog,
+		Kind: PageOverflow,
 	}
 	fileEnd := extraRef.Offset + uint64(pageSize)
 	if err := file.Truncate(int64(fileEnd)); err != nil {
@@ -345,34 +345,6 @@ func TestMutableRecoveryAuthenticatesCompleteCatalogRunAtEveryPageSize(
 				}
 			})
 
-			t.Run("typed-newest-falls-back-after-catalog-validation", func(t *testing.T) {
-				fixture := newExactCatalogRecoveryFixture(t, catalog, pageSize)
-				malformed := make([]byte, pageSize)
-				if _, err := InitPage(malformed, PageHeader{
-					StoreID: testStoreID, Generation: 8,
-					LogicalID: fixture.extraRef.LogicalID,
-					PageSize:  pageSize, Kind: PageFloat64Catalog,
-				}); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := SealPage(malformed); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := fixture.file.WriteAt(
-					malformed, int64(fixture.extraRef.Offset),
-				); err != nil {
-					t.Fatal(err)
-				}
-				fixture.roots(t, func(root *InlineSuperblock) {
-					root.State.Float64ScanHead = fixture.extraRef
-				})
-				result, recoverErr := fixture.recover()
-				if recoverErr != nil || result.Root.Generation != 7 ||
-					result.RootSlot != 0 ||
-					result.FallbackGeneration != 7 {
-					t.Fatalf("fallback recovery = (%+v, %v)", result, recoverErr)
-				}
-			})
 
 			t.Run("inline-free-overlap-is-unencodable", func(t *testing.T) {
 				fixture := newExactCatalogRecoveryFixture(t, catalog, pageSize)
@@ -591,7 +563,7 @@ func TestMaterializationCannotTargetCatalogRun(t *testing.T) {
 			name: "physical-overlap",
 			ref: PageRef{
 				Offset: layout.DataStart, LogicalID: 2,
-				Generation: 8, Length: pageSize, Kind: PageDocument,
+				Generation: 8, Length: pageSize, Kind: PageOverflow,
 			},
 		},
 		{
@@ -599,7 +571,7 @@ func TestMaterializationCannotTargetCatalogRun(t *testing.T) {
 			ref: PageRef{
 				Offset:    layout.DataStart + uint64(pageSize),
 				LogicalID: 10, Generation: 8,
-				Length: pageSize, Kind: PageDocument,
+				Length: pageSize, Kind: PageOverflow,
 			},
 		},
 	} {

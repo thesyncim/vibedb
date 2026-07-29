@@ -379,11 +379,6 @@ func validateInlineFreeRef(ref PageRef, kind PageKind, root *InlineSuperblock) e
 	}
 	refExtent := FreeExtent{Offset: ref.Offset, Length: uint64(ref.Length)}
 	stateRefs := [...]PageRef{
-		root.State.ChunkDirectory,
-		root.State.KeyDirectory,
-		root.State.IndexDirectory,
-		root.State.Float64ScanHead,
-		root.State.IndexGroupHead,
 		root.State.PrimaryRoot,
 		root.State.ExactIndexRoot,
 	}
@@ -447,11 +442,6 @@ func extentsOverlap(left, right FreeExtent) bool {
 
 func inlineExtentOverlapsRoot(extent FreeExtent, root *InlineSuperblock) bool {
 	refs := [...]PageRef{
-		root.State.ChunkDirectory,
-		root.State.KeyDirectory,
-		root.State.IndexDirectory,
-		root.State.Float64ScanHead,
-		root.State.IndexGroupHead,
 		root.State.PrimaryRoot,
 		root.State.ExactIndexRoot,
 		root.FreeDelta.externalPrev,

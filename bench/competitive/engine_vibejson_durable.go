@@ -1,7 +1,6 @@
 package competitive
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,7 +75,7 @@ func (v *vibeDurable) Tuning() string {
 	if v.cfg.Durability == DurabilityBufferedVisible {
 		mode = "Buffered-visible ordinarily keeps the persistence worker asleep until Checkpoint, uses bounded fresh-COW staging, groups the captured cut under one alternate root, and explicitly selects the ordinary two-phase filesystem-sync checkpoint used by this comparison; staging pressure can force an earlier checkpoint and comparative runs must verify the selected interval stays below that bound; "
 	}
-	layout := "the ordered primary graph (CreateFromPrimary bulk / the primary mutation path for Put and Delete) is what is measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; compact and float64-column rows stay on the chunk layout the primary graph does not yet carry; "
+	layout := "the ordered primary graph (CreateFromPrimary bulk / the primary mutation path for Put and Delete) is the only engine measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; verbatim and compact rows are both leaf classes on the graph; "
 	return format + "; " + mode + layout +
 		"ResidentBytes=64 MiB (the default, and the read-cache budget every other engine was matched to); " +
 		"PageSize=4 KiB default; buffered read and write modes (O_DIRECT is Linux-only); " +
@@ -87,7 +86,7 @@ func (v *vibeDurable) Tuning() string {
 		"25-35x faster Put and that figure does not currently reproduce — BenchmarkPointWriteDurableDefaults measures " +
 		"the pair and RESULTS.md reports what it is worth today, which is far less. " +
 		"CommitCoalesce=0, i.e. no acknowledged-latency-for-throughput trade. " +
-		"CreateFrom defaults to verbatim; compact is a separate explicit row because it materially trades read speed " +
+		"CreateFromPrimary defaults to verbatim; compact is a separate explicit row because it materially trades read speed " +
 		"for space. Put replay always emits verbatim pages. Never publish one representation as the engine's only footprint"
 }
 
@@ -146,7 +145,17 @@ func (v *vibeDurable) Load(docs []Doc) error {
 		return err
 	}
 	v.file = f
-	if v.cfg.PutLoop {
+	// A secondary index loads through the primary mutation path, which maintains
+	// the exact secondary index incrementally, one publish per Put -- the same
+	// path the indexed mutation workload exercises. Both this path and the bulk
+	// CreateFromPrimary cutover share one ceiling: a physical index's whole
+	// posting set serialises into a single term leaf (65,535 postings / 64 KiB),
+	// so a low-cardinality corpus spread across enough documents overruns it on
+	// either path and surfaces as ErrPrimaryCutoverUnsupported rather than a
+	// silent fallback. Until multi-leaf term indexes land (loadBulk's future-work
+	// note), the indexed configuration loads through Put and callers size the
+	// indexed corpus below that ceiling.
+	if v.cfg.PutLoop || v.cfg.Indexed {
 		return v.loadByPut(f, docs)
 	}
 	return v.loadBulk(f, docs)
@@ -176,37 +185,19 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 	if err != nil {
 		return err
 	}
-	// The ordered primary graph is the real engine (routed splits/merges, the
-	// resident router, journal-wired acknowledgements, and now on-graph exact
-	// secondary-index posting tiles). Build through it whenever the instance uses
-	// no capability the chunk layout still exclusively carries.
+	// The ordered primary graph is the only engine now (routed splits/merges, the
+	// resident router, journal-wired acknowledgements, and on-graph exact
+	// secondary-index posting tiles). Every corpus builds through it.
 	//
 	// The exact-index format holds one physical index's postings in a single term
 	// leaf (bounded to 65,535 postings / 64 KiB). A large low-cardinality corpus
 	// spreads one term across enough posting tiles to exceed that, which the bulk
 	// build reports as ErrPrimaryCutoverUnsupported. Multi-leaf term indexes are
-	// not landed, so an oversized index falls back to the chunk layout for this
-	// instance; smaller indexed corpora (and every unindexed corpus) measure the
-	// primary graph. The fallback keeps the comparison honest -- it never silently
-	// drops the index -- and is bounded to corpora past the single-leaf cap.
-	usedPrimary := false
-	if v.primaryCapable() {
-		_, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions())
-		switch {
-		case err == nil:
-			usedPrimary = true
-		case v.cfg.Indexed && errors.Is(err, durable.ErrPrimaryCutoverUnsupported):
-			if truncErr := truncateForRebuild(f); truncErr != nil {
-				return truncErr
-			}
-		default:
-			return err
-		}
-	}
-	if !usedPrimary {
-		if _, err := durable.CreateFrom(built, f, opts); err != nil {
-			return err
-		}
+	// future work; until they land the harness sizes its indexed configurations
+	// below the single-leaf posting ceiling, and an oversized index surfaces here
+	// as that hard error rather than a silent chunk-layout fallback.
+	if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
+		return err
 	}
 	db, err := durable.Open(f, opts)
 	if err != nil {
@@ -216,56 +207,13 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 	return nil
 }
 
-// truncateForRebuild resets f to empty so a fallback CreateFrom writes a clean
-// image over whatever a failed CreateFromPrimary left behind.
-func truncateForRebuild(f *os.File) error {
-	if err := f.Truncate(0); err != nil {
-		return err
-	}
-	_, err := f.Seek(0, 0)
-	return err
-}
-
 // loadByPut is the mutation-replay path, measured separately because the gap
-// between it and loadBulk is one of the more useful numbers in the report.
+// between it and loadBulk is one of the more useful numbers in the report. It
+// creates an empty ordered-primary collection and replays every document through
+// the primary mutation path — and, for ordinary-sync, its wired recovery
+// journal — exactly like the measured workload.
 func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 	opts := v.options()
-	if v.primaryCapable() {
-		if len(docs) == 0 {
-			return fmt.Errorf("vibejson-durable: put-loop load needs at least one document")
-		}
-		// The ordered primary graph has no empty-store constructor, so seed the
-		// graph with the first document through the bulk path, then replay the rest
-		// through Put. Those Puts route through the primary mutation path -- and, for
-		// ordinary-sync, its wired recovery journal -- exactly like the measured
-		// workload. Seeding one document of a large corpus is a negligible share of
-		// the replay it precedes.
-		builder, err := store.NewBuilder(store.Options{})
-		if err != nil {
-			return err
-		}
-		if err := builder.Append(docs[0].Key, docs[0].JSON); err != nil {
-			return err
-		}
-		built, err := builder.Build()
-		if err != nil {
-			return err
-		}
-		if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
-			return err
-		}
-		db, err := durable.Open(f, opts)
-		if err != nil {
-			return err
-		}
-		v.coll = db
-		for i := 1; i < len(docs); i++ {
-			if _, err := db.Put(docs[i].Key, docs[i].JSON); err != nil {
-				return err
-			}
-		}
-		return db.Flush()
-	}
 	db, err := durable.Create(f, opts)
 	if err != nil {
 		return err
@@ -277,20 +225,6 @@ func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 		}
 	}
 	return db.Flush()
-}
-
-// primaryCapable reports whether this instance can use the ordered primary
-// graph. Exact secondary indexes are maintained on the graph (posting tiles
-// updated in the same publish as each Put/Delete), so indexed rows measure the
-// primary graph too, and DocumentFormatCompact is now a leaf class on the graph
-// (CreateFromPrimary stages compact document-group leaves), so compact instances
-// measure the primary graph as well. This harness's Config exposes no float64
-// column or schema capability, the two features still carried only by the chunk
-// layout, so every instance it can construct is primary-capable. Point, scan,
-// filter, and mutation workloads, verbatim and compact alike, are measured
-// against the primary graph.
-func (v *vibeDurable) primaryCapable() bool {
-	return true
 }
 
 // primaryBulkOptions is the tuned options with BufferCount cleared. The single

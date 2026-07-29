@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +18,6 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -77,53 +75,15 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	}
 }
 
-func TestFileStoreBufferedPrewriteDoesNotPublishRoot(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "buffered-prewrite-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	options := testFileStoreOptions()
-	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
-	options.QueueSlots = 64
-	options.GroupLimit = 64
-	collection, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = collection.Close()
-		_ = file.Close()
-	}()
-
-	value := append([]byte(`{"payload":"`), bytes.Repeat([]byte("x"), 60<<10)...)
-	value = append(value, '"', '}')
-	for i := 0; i < 48 && collection.Stats().PrewrittenPageWrites == 0; i++ {
-		if _, err := collection.Put(fmt.Sprintf("prewrite-%02d", i), value); err != nil {
-			t.Fatal(err)
-		}
-	}
-	deadline := time.Now().Add(time.Second)
-	for collection.Stats().PrewrittenPageWrites == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	stats := collection.Stats()
-	if stats.PrewrittenPageWrites == 0 || stats.PrewrittenPageBytes == 0 {
-		t.Fatalf("half-full buffered staging produced no pre-write: %+v", stats)
-	}
-	if stats.DurableGeneration != 1 {
-		t.Fatalf("pre-write advanced durable generation to %d", stats.DurableGeneration)
-	}
-	image, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	recovered := openBufferedImage(t, image, options)
-	defer recovered.Close()
-	if got, found, err := recovered.AppendRaw(nil, "prewrite-00"); err != nil || found {
-		t.Fatalf("recovery selected unpublished pre-write = (%q,%v,%v)", got, found, err)
-	}
-}
+// TestFileStoreBufferedPrewriteDoesNotPublishRoot was retired with the chunk
+// store. It drove the committer write-behind (half-full staging pre-writes
+// dirty pages to the device ahead of the checkpoint), a path overflow-on-Put
+// makes unreachable in the buffered lane: a large value is stored out of line as
+// volatile, memory-only frames until a checkpoint, and the leaf that names its
+// chain stays small, so buffered staging never grows a half-full page vector to
+// pre-write. PrewrittenPageWrites is therefore always zero here and the
+// assertion can no longer fire. If volatile-frame spilling reintroduces
+// device-ahead staging in the buffered lane, this coverage returns with it.
 
 func TestFileStoreBufferedVisibleCloseCheckpoints(t *testing.T) {
 	path := t.TempDir() + "/buffered-close.db"
@@ -133,7 +93,6 @@ func TestFileStoreBufferedVisibleCloseCheckpoints(t *testing.T) {
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +131,6 @@ func TestFileStoreBufferedVisibleCheckpointPreservesOlderSnapshotFaults(t *testi
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	options.MaxDocumentBytes = 4 << 10
 	options.MaxRetiredExtents = 1 << 15
 	normalized, err := options.normalized()
@@ -240,7 +198,6 @@ func TestFileStoreBufferedVisibleFlushTakesWriterCut(t *testing.T) {
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +234,6 @@ func TestFileStoreBufferedVisibleCheckpointFailureIsSticky(t *testing.T) {
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -378,68 +334,90 @@ func TestFileStoreCheckpointStrengthIsExplicitAndConstrained(t *testing.T) {
 }
 
 func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *testing.T) {
-	path := t.TempDir() + "/buffered-pressure.db"
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// A buffered-visible checkpoint window records one pending parent per distinct
+	// routed leaf its mutations touch, capped at filePrimaryPendingParentLimit
+	// (64). Touching a 65th distinct leaf with no intervening Flush is the genuine
+	// staging-pressure trigger: it forces one checkpoint and accounts it as an
+	// automatic checkpoint. The earlier version of this test wrote 1,024 fresh
+	// keys into a virgin tree, which never spread across enough distinct leaves in
+	// one window to reach the cap, so AutomaticCheckpoints stayed at zero and the
+	// assertion was vacuous.
+	//
+	// This seeds a corpus wide enough to span well past 64 routed leaves through
+	// the bulk cutover -- which does not run the Put-path pending-parent logic, so
+	// the seed leaves the automatic counter at zero -- then updates one key from
+	// each of more than 64 distinct leaves inside a single window. No snapshot is
+	// held, so the superseded leaf frames drain and volatile-retirement pressure
+	// (a separate counter) never preempts the pending-parent trigger under test.
+	const corpusSize = 12_000
+	built, keys, _ := buildFilePrimaryCorpus(t, corpusSize)
 	options := Options{
-		Backend:    BackendPortable,
-		Durability: DurabilityBufferedVisible,
+		Backend:       BackendPortable,
+		ResidentBytes: 32 << 20,
+		Durability:    DurabilityBufferedVisible,
 	}
-	collection, err := Create(file, options)
+	file := createPrimaryPointFile(t, built, options, "buffered-pressure.db")
+	path := file.Name()
+	collection, err := Open(file, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	baseline := collection.Stats()
-
-	const (
-		writers   = 16
-		perWriter = 64
-	)
-	start := make(chan struct{})
-	errs := make(chan error, writers)
-	var wait sync.WaitGroup
-	wait.Add(writers)
-	for writer := range writers {
-		writer := writer
-		go func() {
-			defer wait.Done()
-			<-start
-			for item := range perWriter {
-				key := fmt.Sprintf("key-%02d-%03d", writer, item)
-				value := []byte(fmt.Sprintf(`{"writer":%d,"item":%d}`, writer, item))
-				if created, putErr := collection.Put(key, value); putErr != nil {
-					errs <- putErr
-					return
-				} else if !created {
-					errs <- fmt.Errorf("key %q unexpectedly replaced", key)
-					return
-				}
-			}
-		}()
+	if baseline.AutomaticCheckpoints != 0 {
+		t.Fatalf(
+			"bulk seed forced %d automatic checkpoints; the trigger must come from the update window",
+			baseline.AutomaticCheckpoints,
+		)
 	}
-	close(start)
-	wait.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
+
+	// One key per distinct routed leaf, enough to cross the 64-leaf cap. Selecting
+	// by route bucket guarantees the update window touches strictly more than
+	// filePrimaryPendingParentLimit distinct leaves.
+	const wantLeaves = filePrimaryPendingParentLimit + 16
+	state := collection.state.Load()
+	seen := make(map[storeio.BucketID]struct{}, wantLeaves)
+	targets := make([]string, 0, wantLeaves)
+	for _, key := range keys {
+		route, routeErr := collection.currentPrimaryResidentRoute(state, []byte(key))
+		if routeErr != nil {
+			t.Fatal(routeErr)
+		}
+		if _, ok := seen[route.Bucket]; ok {
+			continue
+		}
+		seen[route.Bucket] = struct{}{}
+		targets = append(targets, key)
+		if len(targets) == wantLeaves {
+			break
+		}
+	}
+	if len(targets) <= filePrimaryPendingParentLimit {
+		t.Fatalf(
+			"seed corpus spanned only %d distinct leaves, need more than %d",
+			len(targets), filePrimaryPendingParentLimit,
+		)
+	}
+
+	updated := make(map[string][]byte, len(targets))
+	for at, key := range targets {
+		value := fmt.Appendf(nil, `{"pressure":%d,"leaf":%d}`, at, at)
+		updated[key] = value
+		if _, putErr := collection.Put(key, value); putErr != nil {
+			t.Fatalf("update %q: %v", key, putErr)
+		}
 	}
 
 	stats := collection.Stats()
-	if stats.DeviceCommits <= baseline.DeviceCommits {
-		t.Fatalf(
-			"device commits = %d, baseline %d; staging pressure never checkpointed",
-			stats.DeviceCommits, baseline.DeviceCommits,
-		)
-	}
-	if stats.AutomaticMutationRequests == 0 {
-		t.Fatal("concurrent run did not exercise default mutation combining")
-	}
 	if stats.AutomaticCheckpoints <= baseline.AutomaticCheckpoints {
 		t.Fatalf(
-			"automatic checkpoints = %d, baseline %d; pressure checkpoint was not accounted",
-			stats.AutomaticCheckpoints, baseline.AutomaticCheckpoints,
+			"automatic checkpoints = %d, baseline %d; pending-parent pressure across %d leaves did not checkpoint",
+			stats.AutomaticCheckpoints, baseline.AutomaticCheckpoints, len(targets),
+		)
+	}
+	if stats.DeviceCommits <= baseline.DeviceCommits {
+		t.Fatalf(
+			"device commits = %d, baseline %d; the forced checkpoint never reached the device",
+			stats.DeviceCommits, baseline.DeviceCommits,
 		)
 	}
 	if stats.ResidentBytes > stats.CapacityBytes ||
@@ -457,9 +435,12 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 			stats.CommitCapacityBytes, baseline.CommitCapacityBytes,
 		)
 	}
-	if got, want := collection.Len(), uint64(writers*perWriter); got != want {
+	if got, want := collection.Len(), uint64(corpusSize); got != want {
 		t.Fatalf("Len = %d, want %d", got, want)
 	}
+
+	// An explicit Flush is a requested checkpoint, not a pressure one: it must not
+	// move the automatic counter.
 	automaticCheckpoints := stats.AutomaticCheckpoints
 	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
@@ -477,6 +458,9 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 		t.Fatal(err)
 	}
 
+	// The pressure-forced checkpoint plus the final Flush make every update
+	// durable: a reopen must see the whole corpus and every updated value byte for
+	// byte.
 	reopenedFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -487,8 +471,16 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got, want := reopened.Len(), uint64(writers*perWriter); got != want {
+	if got, want := reopened.Len(), uint64(corpusSize); got != want {
 		t.Fatalf("reopened Len = %d, want %d", got, want)
+	}
+	var scratch []byte
+	for key, value := range updated {
+		got, found, rawErr := reopened.AppendRaw(scratch[:0], key)
+		if rawErr != nil || !found || !bytes.Equal(got, value) {
+			t.Fatalf("reopened %q = (%q, %v, %v), want %q", key, got, found, rawErr, value)
+		}
+		scratch = got
 	}
 }
 
@@ -500,7 +492,6 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -511,21 +502,29 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 	if _, err := collection.Put("key", first); err != nil {
 		t.Fatal(err)
 	}
-	before := collection.Stats()
 	if _, err := collection.Put("key", second); err != nil {
 		t.Fatal(err)
-	}
-	after := collection.Stats()
-	if after.SupersededPageWrites <= before.SupersededPageWrites ||
-		after.SupersededPageBytes <= before.SupersededPageBytes {
-		t.Fatalf("hot replacement superseded no queued pages: before=%+v after=%+v", before, after)
 	}
 	if got, found, err := collection.AppendRaw(nil, "key"); err != nil ||
 		!found || !bytes.Equal(got, second) {
 		t.Fatalf("latest buffered value = (%q, %v, %v)", got, found, err)
 	}
+	// The primary graph does not cancel copy-on-write pages the way the committer's
+	// SupersededPageWrites counter once measured; a hot replacement drops the
+	// superseded version's volatile frames and the checkpoint retires the durable
+	// extents it made unreachable. So the observable that proves the supersession
+	// is the retirement table growing across the checkpoint, not a page-write
+	// counter that never moves on this layout.
+	beforeCheckpoint := collection.Stats()
 	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
+	}
+	afterCheckpoint := collection.Stats()
+	if afterCheckpoint.PendingRetiredExtents <= beforeCheckpoint.PendingRetiredExtents ||
+		afterCheckpoint.PendingRetiredBytes <= beforeCheckpoint.PendingRetiredBytes {
+		t.Fatalf("checkpoint retired no superseded extents: before=%d extents/%d bytes, after=%d extents/%d bytes",
+			beforeCheckpoint.PendingRetiredExtents, beforeCheckpoint.PendingRetiredBytes,
+			afterCheckpoint.PendingRetiredExtents, afterCheckpoint.PendingRetiredBytes)
 	}
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
@@ -558,7 +557,6 @@ func TestFileStoreBufferedVisibleSnapshotPinsRetiredQueuedPages(t *testing.T) {
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -578,27 +576,14 @@ func TestFileStoreBufferedVisibleSnapshotPinsRetiredQueuedPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snapshot.Close()
-	match, found, err := collection.resolveFileFingerprint(
-		snapshot.state, []byte("key"),
-	)
-	if err != nil || !found {
-		t.Fatalf("resolve snapshot document = (%v, %v)", found, err)
-	}
-	oldDocument := match.documentRef
-	match.Release()
-	oldRefs := []storeio.PageRef{
-		snapshot.state.keyRoot,
-		snapshot.state.chunkRoot,
-		snapshot.state.indexRoot,
-		oldDocument,
-	}
-	before := collection.Stats()
+	// The snapshot pins the ordered-primary graph the first Put published; the
+	// second Put copies it forward and retires that root. The pin is what this
+	// test proves: the historical read below must still resolve the first value
+	// from the retired root after it has been evicted, so the second Put cannot
+	// have reclaimed the pages the snapshot still needs.
+	oldRefs := []storeio.PageRef{snapshot.state.root.PrimaryRoot}
 	if _, err := collection.Put("key", second); err != nil {
 		t.Fatal(err)
-	}
-	after := collection.Stats()
-	if after.SupersededPageWrites != before.SupersededPageWrites {
-		t.Fatalf("active snapshot allowed page supersession: before=%+v after=%+v", before, after)
 	}
 	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
@@ -618,76 +603,6 @@ func TestFileStoreBufferedVisibleSnapshotPinsRetiredQueuedPages(t *testing.T) {
 	if got, found, err := collection.AppendRaw(nil, "key"); err != nil ||
 		!found || !bytes.Equal(got, second) {
 		t.Fatalf("current value = (%q, %v, %v)", got, found, err)
-	}
-}
-
-func TestFileStoreBufferedVisibleSnapshotGateLinearizesSupersession(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "buffered-gate-race-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	options := testFileStoreOptions()
-	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
-	collection, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = collection.Close()
-		_ = file.Close()
-	}()
-	if _, err := collection.Put("key", []byte(`{"version":0}`)); err != nil {
-		t.Fatal(err)
-	}
-
-	for version := 1; version <= 12; version++ {
-		oldGeneration := collection.Generation()
-		before := collection.Stats().SupersededPageWrites
-		start := make(chan struct{})
-		snapshotResult := make(chan *Snapshot, 1)
-		snapshotErrors := make(chan error, 1)
-		putErrors := make(chan error, 1)
-		go func() {
-			<-start
-			snapshot, snapshotErr := collection.Snapshot()
-			if snapshotErr != nil {
-				snapshotErrors <- snapshotErr
-				return
-			}
-			snapshotResult <- snapshot
-		}()
-		value := []byte(fmt.Sprintf(`{"version":%d}`, version))
-		go func() {
-			<-start
-			_, putErr := collection.Put("key", value)
-			putErrors <- putErr
-		}()
-		close(start)
-		var snapshot *Snapshot
-		select {
-		case err := <-snapshotErrors:
-			t.Fatal(err)
-		case snapshot = <-snapshotResult:
-		}
-		if err := <-putErrors; err != nil {
-			snapshot.Close()
-			t.Fatal(err)
-		}
-		after := collection.Stats().SupersededPageWrites
-		if snapshot.Generation() == oldGeneration && after != before {
-			snapshot.Close()
-			t.Fatalf(
-				"iteration %d: old generation %d lease raced with %d page cancellations",
-				version, oldGeneration, after-before,
-			)
-		}
-		got, found, err := snapshot.AppendRaw(nil, "key")
-		if err != nil || !found {
-			snapshot.Close()
-			t.Fatalf("iteration %d snapshot read = (%q, %v, %v)", version, got, found, err)
-		}
-		snapshot.Close()
 	}
 }
 
@@ -723,7 +638,6 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 			}
 			options := testFileStoreOptions()
 			options.Durability = DurabilityBufferedVisible
-			options.DisableMutationCombining = true
 			collection, err := Create(file, options)
 			if err != nil {
 				t.Fatal(err)
@@ -739,14 +653,9 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			before := collection.Stats().SupersededPageWrites
 			if err := test.mutate(collection); err != nil {
 				snapshot.Close()
 				t.Fatal(err)
-			}
-			if after := collection.Stats().SupersededPageWrites; after != before {
-				snapshot.Close()
-				t.Fatalf("active snapshot allowed %s supersession: %d -> %d", test.name, before, after)
 			}
 			if err := collection.Flush(); err != nil {
 				snapshot.Close()

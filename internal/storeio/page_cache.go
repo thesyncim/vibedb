@@ -1661,17 +1661,9 @@ func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	pageSize := uint64(c.options.PageSize)
 	length := uint64(ref.Length)
 	validRouting := ref.Aux == 0
-	if ref.Kind == PageDocumentGroup &&
-		uint16(ref.Flags)&DocumentGroupFlagFloat64Sidecar != 0 {
-		_, detached, err := DocumentGroupFloat64Sidecar(ref, uint32(c.options.PageSize))
-		validRouting = err == nil && detached
-	}
 	if length < pageSize || length > uint64(c.options.MaxPageSize) ||
 		!validPageExtentSize(ref.Kind, ref.Length) || length%pageSize != 0 ||
 		ref.Length != uint32(c.options.PageSize) &&
-			ref.Kind != PageDocument && ref.Kind != PageDocumentGroup &&
-			ref.Kind != PageFloat64Group && ref.Kind != PageFloat64Catalog &&
-			ref.Kind != PageFloat64Stripe && ref.Kind != PageIndexGroupCatalog &&
 			ref.Kind != PageOverflow && ref.Kind != PagePrimaryCatalog &&
 			ref.Kind != PageTabletDirectory && ref.Kind != PagePrimaryLocator &&
 			ref.Kind != PageTabletRoute && ref.Kind != PagePrimaryAnchor &&

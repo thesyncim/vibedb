@@ -862,6 +862,24 @@ func TestHeapSelectiveInnerJoinFilterChargesSurvivors(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The zone-summary pruning tier that once bounded a non-indexed inner
+	// filter is gone; an exact index is the surviving mechanism that lets the
+	// candidate planner narrow the inner universe to its survivors before the
+	// join build materializes a batch. Without it the build would have to
+	// admit the whole 512-row universe, which is the honest no-summaries cost.
+	info, err := inner.CreateIndex(store.IndexDefinition{
+		Name:  "keep",
+		Paths: []string{"/keep"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for info.State != store.IndexReady {
+		info, err = inner.BackfillIndex(info.Name, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	q := Select(Path("id")).Join(
 		JoinOn("inner", "join", "join").Where(Cmp("keep", Eq, true)),

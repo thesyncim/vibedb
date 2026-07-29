@@ -446,11 +446,6 @@ func selectRecoveryMaterializationJournal(
 func inlineRecoveryScratchNeed(root InlineSuperblock) int {
 	need := int(root.PageSize)
 	refs := [...]PageRef{
-		root.State.ChunkDirectory,
-		root.State.KeyDirectory,
-		root.State.IndexDirectory,
-		root.State.Float64ScanHead,
-		root.State.IndexGroupHead,
 		root.State.PageCatalogHead,
 		root.State.PrimaryRoot,
 		root.State.ExactIndexRoot,
@@ -613,11 +608,6 @@ func validateRecoveredInlineRefs(
 	catalog *CanonicalPageCatalog,
 ) (bool, *CanonicalPageCatalog, error) {
 	stateRefs := [...]PageRef{
-		root.State.ChunkDirectory,
-		root.State.KeyDirectory,
-		root.State.IndexDirectory,
-		root.State.Float64ScanHead,
-		root.State.IndexGroupHead,
 		root.State.PrimaryRoot,
 		root.State.ExactIndexRoot,
 	}
@@ -700,34 +690,6 @@ func validateRecoveredStateRef(
 
 	state := root.State
 	switch ref.Kind {
-	case PageChunkDirectory:
-		_, openErr = OpenChunkDirectoryPage(
-			page, root.FileEnd, state.NextLogicalID,
-		)
-	case PageKeyDirectory:
-		_, openErr = OpenKeyDirectoryPage(
-			page, root.FileEnd, state.NextLogicalID,
-			state.ChunkHighWater, uint8(state.ChunkDocuments),
-		)
-	case PageFingerprintDirectory:
-		_, openErr = OpenPageFingerprintDirectory(
-			page, root.FileEnd, state.NextLogicalID,
-			state.ChunkHighWater, state.ChunkDocuments,
-		)
-	case PageIndexDirectory:
-		_, openErr = OpenIndexDirectoryPage(
-			page, root.FileEnd, state.NextLogicalID, state.IndexCount,
-		)
-	case PageFloat64Catalog:
-		_, openErr = OpenFloat64Directory(
-			page, root.FileEnd, state.NextLogicalID, root.PageSize,
-		)
-	case PageIndexGroupCatalog:
-		_, openErr = OpenIndexGroupCatalog(
-			page, state.IndexCount, state.ChunkHighWater,
-			state.ChunkDocuments, root.FileEnd, state.NextLogicalID,
-			root.PageSize,
-		)
 	case PagePrimaryCatalog:
 		_, openErr = OpenGlobalTabletCatalogNode(
 			page, ref, GlobalTabletCatalogBounds{

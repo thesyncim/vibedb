@@ -445,6 +445,118 @@ func TestDurableDatabaseZeroAndClosed(t *testing.T) {
 //
 // The bound is what proves it: with N leases configured, a loop of more than N
 // captures that never released would fail on the first capture past the bound.
+// TestDurableDatabaseSnapshotMaterializesDeferredLanes is the database-level
+// variant of TestFileSnapshotPointScanAgreement. A DatabaseSnapshot captures
+// every member collection under one held set of writers and gates, and a
+// deferred-canonical lane's captured primary root can trail its live router — a
+// point read walks the captured root's live structures while an ordered scan
+// walks its sealed parents, so the two disagree until the pending parents are
+// folded in. The single-collection [Collection.Snapshot] materializes them under
+// one writer hold; the database capture has to do the same for every member
+// without opening a window between a member's materialize and its pin. If it
+// does not, a member's scan comes up short of its own point reads exactly as the
+// collection-level bug did — and that is what surfaced as a durable join
+// returning zero rows for a clear match, because a join reads its inner side
+// through the database cut's ordered scan.
+//
+// Both deferred lanes are covered, and the cut's stability is pinned the same
+// way the collection test pins it: mutating any member after the capture must
+// not move what the capture sees, because the lease holds the captured
+// generation against the reclaimer.
+func TestDurableDatabaseSnapshotMaterializesDeferredLanes(t *testing.T) {
+	syncJournal := testDatabaseOptions()
+	syncJournal.Durability = DurabilitySync
+	buffered := testDatabaseOptions()
+	buffered.Durability = DurabilityBufferedVisible
+	buffered.CheckpointStrength = CheckpointFilesystem
+
+	for _, mode := range []struct {
+		name string
+		opts Options
+	}{
+		{"sync-journal", syncJournal},
+		{"buffered", buffered},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			db, err := OpenDatabase(t.TempDir(), DatabaseOptions{Options: mode.opts})
+			if err != nil {
+				t.Fatalf("OpenDatabase: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+
+			names := []string{"a", "b"}
+			for _, name := range names {
+				coll, err := db.CreateCollection(name, mode.opts)
+				if err != nil {
+					t.Fatalf("CreateCollection(%s): %v", name, err)
+				}
+				// Seed then update the same key so the second Put stages a deferred
+				// parent on the sealed graph — the exact configuration whose captured
+				// root trails its router.
+				mustPut(t, coll, "k", `{"v":0}`)
+				mustPut(t, coll, "k", `{"v":1}`)
+			}
+
+			cut, err := db.Snapshot()
+			if err != nil {
+				t.Fatalf("Snapshot: %v", err)
+			}
+			defer func() { _ = cut.Close() }()
+
+			scanKey := func(snap *Snapshot) []byte {
+				t.Helper()
+				var scanned []byte
+				if _, err := snap.RangeRawBuffer(nil, func(key, value []byte) error {
+					if string(key) == "k" {
+						scanned = append([]byte(nil), value...)
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("RangeRawBuffer: %v", err)
+				}
+				return scanned
+			}
+
+			for _, name := range names {
+				snap, ok := cut.Collection(name)
+				if !ok {
+					t.Fatalf("collection %q absent from the cut", name)
+				}
+				point, ok, err := snap.AppendRaw(nil, "k")
+				if err != nil || !ok {
+					t.Fatalf("%s: snapshot point read: ok=%v err=%v", name, ok, err)
+				}
+				scanned := scanKey(snap)
+				if string(point) != string(scanned) {
+					t.Errorf("%s: SNAPSHOT SELF-DISAGREEMENT: point=%s scan=%s", name, point, scanned)
+				}
+				if string(point) != `{"v":1}` {
+					t.Errorf("%s: snapshot lost the acknowledged write: point=%s", name, point)
+				}
+			}
+
+			// Mutate every member after the cut; neither member of the cut may move.
+			for _, name := range names {
+				coll, _ := db.Collection(name)
+				mustPut(t, coll, "k", `{"v":2}`)
+			}
+			for _, name := range names {
+				snap, _ := cut.Collection(name)
+				point, ok, err := snap.AppendRaw(nil, "k")
+				if err != nil || !ok {
+					t.Fatalf("%s: old-cut point read after new put: ok=%v err=%v", name, ok, err)
+				}
+				if string(point) != `{"v":1}` {
+					t.Errorf("%s: CUT MOVED after a later mutation: point=%s (want {\"v\":1})", name, point)
+				}
+				if scanned := scanKey(snap); string(scanned) != `{"v":1}` {
+					t.Errorf("%s: CUT SCAN MOVED after a later mutation: scan=%s (want {\"v\":1})", name, scanned)
+				}
+			}
+		})
+	}
+}
+
 func TestDurableDatabaseSnapshotIntoReleasesThePreviousCapture(t *testing.T) {
 	options := testDatabaseOptions()
 	options.MaxSnapshotLeases = 4

@@ -44,6 +44,14 @@ func TestFileStoreFreeSetSurvivesCrashAtEveryWritePoint(t *testing.T) {
 	}
 	defer file.Close()
 	options := testFileStoreOptions()
+	// This sweep tears the store's own commit at every write point and requires
+	// recovery from the alternate superblock alone. The synchronous primary lane
+	// acknowledges through a synced journal and defers its store root to a
+	// checkpoint, so a torn store copy captures nothing and references a journal it
+	// was never paired with. The async lane is journal-free and its committer
+	// writes each generation's pages and root to the device, which is exactly the
+	// per-commit tearing this test models.
+	options.Durability = DurabilityAsyncVisible
 	options.ResidentBytes = 8 << 20
 	options.BufferCount = 1024
 	options.MaxRetiredExtents = 1024
@@ -57,6 +65,11 @@ func TestFileStoreFreeSetSurvivesCrashAtEveryWritePoint(t *testing.T) {
 	const keys = 20
 	for round := range 5 {
 		freeChurnRound(t, collection, keys, round)
+	}
+	// Drain the background committer so the first captured image below reflects
+	// the whole churn rather than a partially persisted tail.
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
 	}
 
 	// Tear several consecutive commits, not one. A fold and a plain chain append
@@ -112,6 +125,32 @@ func TestFileStoreFreeSetSurvivesCrashAtEveryWritePoint(t *testing.T) {
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// newestInlineSuperblockSlot recovers the inline superblock slot Open would
+// select from the store at path — the slot holding the newest durable root. The
+// committer alternates slots against its last physical commit, so this is the
+// only reliable way to name the slot a crash test must destroy to force the
+// fallback root.
+func newestInlineSuperblockSlot(t *testing.T, path string, pageSize int) int {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(f)
+	if err != nil {
+		t.Fatalf("bootstrap %s: %v", path, err)
+	}
+	recovery, err := storeio.RecoverMutableInlineStateRoot(
+		f, bootstrap.PageSize, bootstrap.MaterializationDamageGranule,
+		make([]byte, bootstrap.MaxPageSize),
+	)
+	if err != nil {
+		t.Fatalf("recover %s: %v", path, err)
+	}
+	return recovery.RootSlot
 }
 
 func sameSegmentRefs(a, b []storeio.FreeSegment) bool {
@@ -313,6 +352,11 @@ func TestFileStoreAlternateRootSurvivesFreeSpaceReuse(t *testing.T) {
 	}
 	defer file.Close()
 	options := testFileStoreOptions()
+	// Losing the newest superblock must fall back to the one before it, recovered
+	// from the store alone. The synchronous lane journals and defers its store
+	// root, so run this on the journal-free async lane whose committer writes each
+	// generation's root to the device (see TestFileStoreFreeSetSurvivesCrashAtEveryWritePoint).
+	options.Durability = DurabilityAsyncVisible
 	options.ResidentBytes = 8 << 20
 	options.BufferCount = 1024
 	options.MaxRetiredExtents = 1024
@@ -355,8 +399,11 @@ func TestFileStoreAlternateRootSurvivesFreeSpaceReuse(t *testing.T) {
 
 		// Destroy the superblock this generation published. Recovery must fall
 		// back to the one before it, which is the root every fenced extent in the
-		// free set is being held for.
-		newest := int((generation - 1) & 1)
+		// free set is being held for. The committer writes each root to the slot
+		// opposite its last physical commit rather than by generation parity, so the
+		// newest slot is the one recovery would select from the pristine image, not
+		// a value computed from the generation number.
+		newest := newestInlineSuperblockSlot(t, file.Name(), options.PageSize)
 		damaged := append([]byte(nil), image...)
 		for i := range storeio.InlineSuperblockSize {
 			damaged[newest*options.PageSize+i] = 0xEE

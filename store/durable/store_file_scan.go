@@ -1,10 +1,6 @@
 package durable
 
 import (
-	"fmt"
-	"math/bits"
-	"slices"
-
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
@@ -41,16 +37,7 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	if fn == nil {
 		return scratch, nil
 	}
-	state := s.state
-	if state.root.PrimaryRoot != (storeio.PageRef{}) {
-		return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
-	}
-	err := storeio.WalkChunkTreeRuns(s.collection.cache, state.chunkRoot, storeio.ChunkTreeBounds{
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(chunk, chunks uint32, ref storeio.PageRef) error {
-		return s.rangeFileDocumentRun(state, chunk, chunks, ref, ^uint64(0), &scratch, fn)
-	})
-	return scratch, err
+	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
 }
 
 // RangeRawReadAheadBuffer is the bounded cold-scan form of RangeRawBuffer.
@@ -71,54 +58,9 @@ func (s *Snapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, value []
 	if fn == nil {
 		return scratch, nil
 	}
-	if s.state.root.PrimaryRoot != (storeio.PageRef{}) {
-		return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
-	}
-	// Buffered files already receive kernel readahead, and feeding resident
-	// hits through the user-space queue costs more than a direct scan. Explicit
-	// read-ahead is for O_DIRECT, where each miss otherwise blocks the walker.
-	readBackend := s.collection.cache.ReadBackend()
-	if !s.collection.directRead ||
-		(readBackend != storeio.BackendIOUring && s.collection.options.ReadConcurrency == 1) {
-		return s.RangeRawBuffer(scratch, fn)
-	}
-	state := s.state
-	var pages [fileScanReadAheadLimit]fileScanPage
-	count := 0
-	bytes := uint64(0)
-	pageLimit, byteLimit := s.fileScanReadAheadWindow()
-	flush := func() error {
-		if count == 0 {
-			return nil
-		}
-		err := s.rangeFileReadAheadBatch(state, pages[:count], &scratch, fn)
-		count = 0
-		bytes = 0
-		return err
-	}
-	err := storeio.WalkChunkTreeRuns(s.collection.cache, state.chunkRoot, storeio.ChunkTreeBounds{
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(chunk, chunks uint32, ref storeio.PageRef) error {
-		reservation := s.collection.cache.ReservationBytes(ref.Length)
-		if reservation == 0 {
-			return storeio.ErrPageCacheReference
-		}
-		if count != 0 && (count == pageLimit || bytes+reservation > byteLimit) {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-		pages[count] = fileScanPage{
-			ref: ref, mask: ^uint64(0), chunk: chunk, chunks: chunks,
-		}
-		count++
-		bytes += reservation
-		return nil
-	})
-	if err == nil {
-		err = flush()
-	}
-	return scratch, err
+	// The ordered-primary scan reads inline values from the leaves it already
+	// walks in order, so it has no separate document-extent read-ahead lane.
+	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
 }
 
 // rangePrimaryGraph is the ordered-primary scan core. lower is inclusive,
@@ -159,15 +101,37 @@ func (s *Snapshot) rangePrimaryGraph(
 	if err != nil {
 		return err
 	}
-	defer cursor.Close()
-	overflow, err := cursor.VisitInline(fn)
-	if overflow != (storeio.PageRef{}) {
-		return fmt.Errorf(
-			"%w: overflow ordered-primary value",
-			ErrPrimaryCutoverUnsupported,
+	// Seed the cursor's splice buffer from the Snapshot's retained scratch and
+	// hand the grown buffer back when the scan ends, so a template/compact
+	// reconstruction reuses one allocation across every scan of this snapshot
+	// rather than growing a fresh buffer per scan.
+	cursor.AdoptSpliceScratch(s.scanSpliceScratch)
+	defer func() {
+		s.scanSpliceScratch = cursor.ReleaseSpliceScratch()
+		cursor.Close()
+	}()
+	// The fused drain stops at each out-of-line row and returns its key and chain
+	// head; the resolved value is reassembled into one reused buffer and delivered
+	// to fn exactly like an inline value, then the drain is re-entered. Passing fn
+	// straight through (no wrapper closure) keeps an inline scan allocation-free.
+	for {
+		key, ref, err := cursor.VisitInline(fn)
+		if err != nil {
+			return err
+		}
+		if ref == (storeio.PageRef{}) {
+			return nil
+		}
+		s.overflowScanValue, err = s.collection.appendPrimaryOverflowValue(
+			s.overflowScanValue[:0], ref, leafBounds,
 		)
+		if err != nil {
+			return err
+		}
+		if err := fn(key, s.overflowScanValue); err != nil {
+			return err
+		}
 	}
-	return err
 }
 
 // RangeMasksRaw visits only the live stable slots named by ordered masks.
@@ -191,39 +155,12 @@ func (s *Snapshot) RangeMasksRawBuffer(masks []store.Mask, scratch []byte, fn fu
 	if fn == nil {
 		return scratch, nil
 	}
-	state := s.state
-	if state.root.PrimaryRoot != (storeio.PageRef{}) {
-		return s.rangePrimaryMasks(
-			masks, scratch,
-			func(_ store.Location, key, value []byte) error {
-				return fn(key, value)
-			},
-		)
-	}
-	bounds := storeio.ChunkTreeBounds{
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}
-	var previous uint32
-	for i, mask := range masks {
-		if i != 0 && mask.Chunk <= previous {
-			return scratch, store.ErrMaskOrder
-		}
-		previous = mask.Chunk
-		if mask.Bits == 0 {
-			continue
-		}
-		ref, ok, err := storeio.LookupChunkTree(s.collection.cache, state.chunkRoot, mask.Chunk, bounds)
-		if err != nil {
-			return scratch, err
-		}
-		if !ok {
-			return scratch, store.ErrMaskChunk
-		}
-		if err := s.rangeFileDocumentPage(state, mask.Chunk, ref, mask.Bits, &scratch, fn); err != nil {
-			return scratch, err
-		}
-	}
-	return scratch, nil
+	return s.rangePrimaryMasks(
+		masks, scratch,
+		func(_ store.Location, key, value []byte) error {
+			return fn(key, value)
+		},
+	)
 }
 
 // RangeMasksRawRowsBuffer is the location-aware form of
@@ -246,38 +183,7 @@ func (s *Snapshot) RangeMasksRawRowsBuffer(
 	if fn == nil {
 		return scratch, nil
 	}
-	state := s.state
-	if state.root.PrimaryRoot != (storeio.PageRef{}) {
-		return s.rangePrimaryMasks(masks, scratch, fn)
-	}
-	bounds := storeio.ChunkTreeBounds{
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}
-	var previous uint32
-	for i, mask := range masks {
-		if i != 0 && mask.Chunk <= previous {
-			return scratch, store.ErrMaskOrder
-		}
-		previous = mask.Chunk
-		if mask.Bits == 0 {
-			continue
-		}
-		ref, ok, err := storeio.LookupChunkTree(
-			s.collection.cache, state.chunkRoot, mask.Chunk, bounds,
-		)
-		if err != nil {
-			return scratch, err
-		}
-		if !ok {
-			return scratch, store.ErrMaskChunk
-		}
-		if err := s.rangeFileDocumentRows(
-			state, mask.Chunk, ref, mask.Bits, &scratch, fn,
-		); err != nil {
-			return scratch, err
-		}
-	}
-	return scratch, nil
+	return s.rangePrimaryMasks(masks, scratch, fn)
 }
 
 // rangePrimaryMasks materializes selected rows from the ordered primary graph.
@@ -298,6 +204,11 @@ func (s *Snapshot) rangePrimaryMasks(
 	}
 	bounds := s.collection.primaryLeafBounds(state)
 	enforceLive := s.live != nil
+	// The Snapshot-owned buffer reassembles each selected out-of-line value, kept
+	// separate from the posting scratch that borrows the row's key and descriptor.
+	// Using the field rather than a captured local keeps the per-bucket callback
+	// free of a boxed-capture allocation (zero-GC scan hot path).
+	s.overflowScanValue = s.overflowScanValue[:0]
 	var previous uint32
 	for at := 0; at < len(masks); {
 		if at != 0 && masks[at].Chunk <= previous {
@@ -339,13 +250,25 @@ func (s *Snapshot) rangePrimaryMasks(
 				if selected[quadrant]&bit == 0 {
 					return nil
 				}
+				value := raw
 				if overflow {
-					return ErrPrimaryCutoverUnsupported
+					// The posting scratch already holds the borrowed key/descriptor for
+					// this row; the resolved value goes to the Snapshot buffer so it does
+					// not clobber the descriptor mid-callback.
+					resolved, rErr := s.collection.appendPrimaryOverflowValue(
+						s.overflowScanValue[:0],
+						storeio.DecodePrimaryOverflowRef(raw), bounds,
+					)
+					if rErr != nil {
+						return rErr
+					}
+					s.overflowScanValue = resolved
+					value = resolved
 				}
 				return fn(store.Location{
 					Chunk: uint32(route.Bucket)<<2 | uint32(quadrant),
 					Slot:  slot & 63,
-				}, key, raw)
+				}, key, value)
 			},
 		)
 		lease.Release()
@@ -354,203 +277,4 @@ func (s *Snapshot) rangePrimaryMasks(
 		}
 	}
 	return scratch, nil
-}
-
-func (s *Snapshot) rangeFileDocumentRows(
-	state *fileStoreState,
-	chunk uint32,
-	ref storeio.PageRef,
-	mask uint64,
-	overflow *[]byte,
-	fn func(row store.Location, key, value []byte) error,
-) error {
-	lease, err := s.collection.cache.Acquire(ref)
-	if err != nil {
-		return err
-	}
-	defer lease.Release()
-	view, err := admittedFileDocumentChunk(lease.Page(), ref, chunk)
-	if err != nil {
-		return err
-	}
-	selected := view.live() & mask
-	return s.rangeFileDocumentView(
-		state, &view, mask, overflow,
-		func(key, value []byte) error {
-			if selected == 0 {
-				return storeio.ErrDocumentPageCorrupt
-			}
-			slot := uint8(bits.TrailingZeros64(selected))
-			selected &= selected - 1
-			return fn(store.Location{Chunk: chunk, Slot: slot}, key, value)
-		},
-	)
-}
-
-func (s *Snapshot) fileScanReadAheadWindow() (int, uint64) {
-	options := s.collection.options
-	parallelLimit := options.ReadConcurrency * 4
-	if s.collection.cache.ReadBackend() == storeio.BackendIOUring {
-		parallelLimit = options.ReadQueueDepth
-	}
-	pageLimit := max(min(fileScanReadAheadLimit, options.PrefetchQueue, parallelLimit), 1)
-	byteLimit := max(uint64(options.ResidentBytes/2), uint64(options.MaxPageSize))
-	return pageLimit, byteLimit
-}
-
-func (s *Snapshot) rangeFileReadAheadBatch(
-	state *fileStoreState,
-	pages []fileScanPage,
-	overflow *[]byte,
-	fn func(key, value []byte) error,
-) error {
-	var refs [fileScanReadAheadLimit]storeio.PageRef
-	for i := range pages {
-		refs[i] = pages[i].ref
-	}
-	physical := refs[:len(pages)]
-	slices.SortFunc(physical, func(a, b storeio.PageRef) int {
-		switch {
-		case a.Offset < b.Offset:
-			return -1
-		case a.Offset > b.Offset:
-			return 1
-		default:
-			return 0
-		}
-	})
-	if _, err := s.collection.cache.Prefetch(physical); err != nil {
-		return err
-	}
-	for i := range pages {
-		page := pages[i]
-		if err := s.rangeFileDocumentRun(
-			state, page.chunk, page.chunks, page.ref, page.mask, overflow, fn,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Snapshot) rangeFileDocumentPage(
-	state *fileStoreState,
-	chunk uint32,
-	ref storeio.PageRef,
-	mask uint64,
-	overflow *[]byte,
-	fn func(key, value []byte) error,
-) error {
-	return s.rangeFileDocumentRun(state, chunk, 1, ref, mask, overflow, fn)
-}
-
-func (s *Snapshot) rangeFileDocumentRun(
-	state *fileStoreState,
-	first, chunks uint32,
-	ref storeio.PageRef,
-	mask uint64,
-	overflow *[]byte,
-	fn func(key, value []byte) error,
-) error {
-	if chunks == 0 || ref.Kind == storeio.PageDocument && chunks != 1 {
-		return storeio.ErrChunkDirectoryCorrupt
-	}
-	lease, err := s.collection.cache.Acquire(ref)
-	if err != nil {
-		return err
-	}
-	defer lease.Release()
-	for ordinal := range chunks {
-		view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+ordinal)
-		if viewErr != nil {
-			return viewErr
-		}
-		if err := s.rangeFileDocumentView(state, &view, mask, overflow, fn); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// rangeFileDocumentView delivers one chunk's selected rows in ascending
-// stable-slot order.
-//
-// view is a pointer, not a value: fileDocumentChunk is 416 bytes because it
-// unions an ordinary page view, a compact-group chunk view, and a detached
-// float64 view, and passing it by value copied all of it once per chunk and —
-// through the old fileDocumentChunk.lookup value receiver — once more per
-// document. That copy alone was over a fifth of scan time.
-//
-// The grouped and ungrouped representations get separate loops rather than a
-// per-row branch, because they share nothing in the row-extraction step: an
-// ordinary page hands back a borrowed contiguous JSON slice, while a compact
-// group must decode a token stream into the caller's overflow buffer.
-func (s *Snapshot) rangeFileDocumentView(
-	state *fileStoreState,
-	view *fileDocumentChunk,
-	mask uint64,
-	overflow *[]byte,
-	fn func(key, value []byte) error,
-) error {
-	chunk := view.chunk
-	if chunk >= state.root.ChunkHighWater {
-		return storeio.ErrDocumentPageCorrupt
-	}
-	if view.grouped {
-		return s.rangeFileGroupedView(view, mask, overflow, fn)
-	}
-	rows := view.page.Rows(mask)
-	for {
-		slot, key, json, overflowed, ok := rows.Next()
-		if !ok {
-			if rows.Err() {
-				return storeio.ErrDocumentPageCorrupt
-			}
-			return nil
-		}
-		value := json
-		if overflowed {
-			ref, length, valid := rows.OverflowDescriptor(json)
-			if !valid {
-				return storeio.ErrDocumentPageCorrupt
-			}
-			*overflow = (*overflow)[:0]
-			var err error
-			*overflow, err = s.collection.appendFileValue(*overflow, state, storeio.DocumentValue{
-				Overflow: ref, Length: length,
-			}, storeio.KeyLocation{Chunk: chunk, Slot: slot})
-			if err != nil {
-				return err
-			}
-			value = *overflow
-		}
-		if err := fn(key, value); err != nil {
-			return err
-		}
-	}
-}
-
-// rangeFileGroupedView is the compact-generation half of rangeFileDocumentView.
-// Every row is materialized into the shared overflow buffer because a grouped
-// row has no contiguous JSON spelling on the page at all.
-func (s *Snapshot) rangeFileGroupedView(
-	view *fileDocumentChunk,
-	mask uint64,
-	overflow *[]byte,
-	fn func(key, value []byte) error,
-) error {
-	rows := view.group.Rows(mask)
-	for {
-		_, key, value, ok := rows.Next((*overflow)[:0])
-		*overflow = value
-		if !ok {
-			if rows.Err() {
-				return storeio.ErrDocumentGroupCorrupt
-			}
-			return nil
-		}
-		if err := fn(key, value); err != nil {
-			return err
-		}
-	}
 }

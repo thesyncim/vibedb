@@ -180,7 +180,6 @@ func (b *Builder) Append(key string, src []byte) error {
 	// rebuilds a page, so this is the only place a bulk-built chunk is
 	// summarized, and it costs one linear pass over source bytes already in
 	// cache from Segment.Append.
-	b.current.zone.fold(src, int(b.current.Count))
 	// Grow before publishing the new key into the table. Rehashing sees only
 	// preceding rows, and every subsequent operation is bounded and infallible.
 	b.keyTable.reserve(b, b.count+1)

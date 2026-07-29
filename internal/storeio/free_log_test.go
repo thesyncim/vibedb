@@ -46,11 +46,11 @@ func TestFreeImagePageRoundTrip(t *testing.T) {
 	}
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeFreeImagePage(
-		page, header, extents, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		page, header, extents, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenFreeImagePage(encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+	view, err := OpenFreeImagePage(encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,11 +85,11 @@ func TestFreeDeltaPageRoundTrip(t *testing.T) {
 	}
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeFreeDeltaPage(
-		page, header, deltas, prev, indexHead, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		page, header, deltas, prev, indexHead, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenFreeDeltaPage(encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+	view, err := OpenFreeDeltaPage(encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,28 +115,28 @@ func TestFreeLogZeroLinksTerminateTheChain(t *testing.T) {
 	segment := make([]byte, testSuperblockPageSize)
 	segmentExtents := []FreeExtent{{Offset: 4 * pageSize, Length: pageSize, RetiredGeneration: 7}}
 	if _, err := EncodeFreeImagePage(segment, testFreeLogHeader(40), segmentExtents,
-		testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID); err != nil {
+		testFreeIndexFileEnd, testFreeIndexNextLogicalID); err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := EncodeFreeIndexPage(page, testFreeLogHeader(41), []FreeSegment{{
 		Ref: testFreeImageRef(40, 20, 11), FirstOffset: 4 * pageSize,
 		LargestFree: pageSize, Count: 1,
-	}}, PageRef{}, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+	}}, PageRef{}, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	index, err := OpenFreeIndexPage(encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+	index, err := OpenFreeIndexPage(encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil || index.Prev() != (PageRef{}) {
 		t.Fatalf("first index page = (%+v,%v)", index.Prev(), err)
 	}
 
 	encoded, err = EncodeFreeDeltaPage(page, testFreeLogHeader(50),
 		[]FreeDelta{{Op: FreeOpDelete, Extent: FreeExtent{Offset: 4 * pageSize}}},
-		PageRef{}, PageRef{}, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		PageRef{}, PageRef{}, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	delta, err := OpenFreeDeltaPage(encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+	delta, err := OpenFreeDeltaPage(encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil || delta.Prev() != (PageRef{}) || delta.IndexHead() != (PageRef{}) {
 		t.Fatalf("first delta = (%+v,%+v,%v)", delta.Prev(), delta.IndexHead(), err)
 	}
@@ -163,14 +163,14 @@ func TestFreeLogRecordCapacityIsExact(t *testing.T) {
 		}
 	}
 	if _, err := EncodeFreeImagePage(page, testFreeLogHeader(40), full,
-		fileEnd, testKeyDirectoryNextLogicalID); err != nil {
+		fileEnd, testFreeIndexNextLogicalID); err != nil {
 		t.Fatalf("exactly %d image extents rejected: %v", imageCap, err)
 	}
 	over := append(full, FreeExtent{
 		Offset: uint64(imageCap+4) * pageSize, Length: pageSize, RetiredGeneration: 7,
 	})
 	if _, err := EncodeFreeImagePage(page, testFreeLogHeader(40), over,
-		fileEnd, testKeyDirectoryNextLogicalID); err == nil {
+		fileEnd, testFreeIndexNextLogicalID); err == nil {
 		t.Fatalf("%d image extents accepted past a capacity of %d", len(over), imageCap)
 	}
 
@@ -183,14 +183,14 @@ func TestFreeLogRecordCapacityIsExact(t *testing.T) {
 		records[i] = FreeDelta{Op: FreeOpDelete, Extent: FreeExtent{Offset: uint64(i+4) * pageSize}}
 	}
 	if _, err := EncodeFreeDeltaPage(page, testFreeLogHeader(50), records, PageRef{}, PageRef{},
-		fileEnd, testKeyDirectoryNextLogicalID); err != nil {
+		fileEnd, testFreeIndexNextLogicalID); err != nil {
 		t.Fatalf("exactly %d delta records rejected: %v", deltaCap, err)
 	}
 	records = append(records, FreeDelta{
 		Op: FreeOpDelete, Extent: FreeExtent{Offset: uint64(deltaCap+4) * pageSize},
 	})
 	if _, err := EncodeFreeDeltaPage(page, testFreeLogHeader(50), records, PageRef{}, PageRef{},
-		fileEnd, testKeyDirectoryNextLogicalID); err == nil {
+		fileEnd, testFreeIndexNextLogicalID); err == nil {
 		t.Fatalf("%d delta records accepted past a capacity of %d", len(records), deltaCap)
 	}
 }
@@ -222,7 +222,7 @@ func TestFreeLogEncodeRejectsMalformedInput(t *testing.T) {
 	for _, c := range imageCases {
 		t.Run("image/"+c.name, func(t *testing.T) {
 			if _, err := EncodeFreeImagePage(page, testFreeLogHeader(40), c.extents,
-				testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID); err == nil {
+				testFreeIndexFileEnd, testFreeIndexNextLogicalID); err == nil {
 				t.Fatal("accepted")
 			}
 		})
@@ -253,7 +253,7 @@ func TestFreeLogEncodeRejectsMalformedInput(t *testing.T) {
 	for _, c := range deltaCases {
 		t.Run("delta/"+c.name, func(t *testing.T) {
 			if _, err := EncodeFreeDeltaPage(page, testFreeLogHeader(50), c.deltas, c.prev, c.indexHead,
-				testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID); err == nil {
+				testFreeIndexFileEnd, testFreeIndexNextLogicalID); err == nil {
 				t.Fatal("accepted")
 			}
 		})
@@ -272,7 +272,7 @@ func TestFreeLogOpenRejectsCorruption(t *testing.T) {
 			Offset: 4 * pageSize, Length: pageSize, RetiredGeneration: 7,
 		}}},
 		testFreeDeltaRef(49, 30, 10), testFreeIndexRef(40, 20, 9),
-		testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestFreeLogOpenRejectsCorruption(t *testing.T) {
 			copy(damaged, encoded)
 			c.apply(damaged)
 			if _, err := OpenFreeDeltaPage(
-				damaged, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID,
+				damaged, testFreeIndexFileEnd, testFreeIndexNextLogicalID,
 			); err == nil {
 				t.Fatal("corrupted delta page accepted")
 			}
@@ -315,12 +315,12 @@ func TestFreeLogRejectsSelfReferencingDelta(t *testing.T) {
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeFreeDeltaPage(page, header,
 		[]FreeDelta{{Op: FreeOpDelete, Extent: FreeExtent{Offset: 4 * pageSize}}},
-		self, PageRef{}, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		self, PageRef{}, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenFreeDeltaPage(
-		encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID,
+		encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID,
 	); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("self-referencing delta accepted: %v", err)
 	}
@@ -334,12 +334,12 @@ func TestFreeLogEnforcesPageKind(t *testing.T) {
 	page := make([]byte, testSuperblockPageSize)
 	image, err := EncodeFreeImagePage(page, testFreeLogHeader(40),
 		[]FreeExtent{{Offset: 4 * pageSize, Length: pageSize, RetiredGeneration: 7}},
-		testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenFreeDeltaPage(
-		image, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID,
+		image, testFreeIndexFileEnd, testFreeIndexNextLogicalID,
 	); err == nil {
 		t.Fatal("image page opened as a delta")
 	}
@@ -347,12 +347,12 @@ func TestFreeLogEnforcesPageKind(t *testing.T) {
 	other := make([]byte, testSuperblockPageSize)
 	delta, err := EncodeFreeDeltaPage(other, testFreeLogHeader(50),
 		[]FreeDelta{{Op: FreeOpDelete, Extent: FreeExtent{Offset: 4 * pageSize}}},
-		PageRef{}, PageRef{}, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		PageRef{}, PageRef{}, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenFreeImagePage(
-		delta, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID,
+		delta, testFreeIndexFileEnd, testFreeIndexNextLogicalID,
 	); err == nil {
 		t.Fatal("delta page opened as an image")
 	}

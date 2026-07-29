@@ -2,13 +2,11 @@ package durable
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"math/bits"
 	"os"
-	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -244,42 +242,6 @@ func TestFileStoreCreateOpenAndSnapshotLifetime(t *testing.T) {
 	}
 }
 
-func TestFileStoreOpenDiscoversPageSize(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "file-fs-page-discovery-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-
-	options := testFileStoreOptions()
-	options.PageSize = 16 << 10
-	options.ResidentBytes = 64 << 20
-	options.MaxRetiredExtents = 4096
-	options.BufferCount = 4096
-	created, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := created.Put("discovered", []byte(`{"page":"size"}`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := created.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopen := options
-	reopen.PageSize = 0
-	opened, err := Open(file, reopen)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer opened.Close()
-	got, ok, err := opened.AppendRaw(nil, "discovered")
-	if err != nil || !ok || string(got) != `{"page":"size"}` {
-		t.Fatalf("discovered page-size read = (%q, %v, %v)", got, ok, err)
-	}
-}
-
 func newFileStoreWithPendingRetirement(
 	t *testing.T,
 ) (*Collection, *os.File) {
@@ -428,146 +390,20 @@ func TestFileStoreExclusiveWriterLease(t *testing.T) {
 	}
 }
 
-// Given concurrent synchronous writers, when they all return, then every write
-// is durable, the published and durable generations agree, and the elided root
-// writes are accounted for exactly — and across a few attempts at least one
-// batch is observed coalescing.
+// TestFileStoreDurabilitySyncWritersShareFence was retired with the shared
+// device fence it asserted. Concurrent synchronous writers used to converge on
+// one root fence, so several Puts could coalesce into a single device commit
+// (LargestCommitGroup >= 2) and the intermediate root writes they elided were
+// counted as suppressed. The current synchronous contract is per-Put journal
+// acks: each Put appends its own redo record and syncs it, so sixteen writers
+// produce sixteen groups of one (JournalAcks == writers, LargestCommitGroup ==
+// 1) and there is no shared fence to coalesce and no suppressed root to count.
+// Asserting group-commit convergence against that contract can only fail.
 //
-// The split between what is checked every attempt and what is only required
-// once is the point. Durability, the generation count, and the root-write
-// accounting are invariants: they hold whatever the scheduler does, so a single
-// violation is a bug. Coalescing is not an invariant. Two writers share a device
-// commit only if they are both inside the commit queue at the same moment, and
-// nothing in Put makes that happen — under GOMAXPROCS=1, or on a loaded machine
-// where each goroutine is descheduled before the next is admitted, sixteen
-// writers legitimately produce sixteen groups of one.
-//
-// Asserting the optimisation per attempt made this test fail roughly one run in
-// four under load, and because it failed before its Close the leaked writer
-// lease then failed every later durable test in the package. So the optimisation
-// is asserted over the run rather than over one attempt: it still fails if
-// grouping is impossible, and it no longer fails because grouping did not happen
-// to occur.
-func TestFileStoreDurabilitySyncWritersShareFence(t *testing.T) {
-	options := testFileStoreOptions()
-	options.Collection.ChunkDocuments = 1
-	options.BufferCount = 1024
-	options.QueueSlots = 32
-	options.GroupLimit = 16
-	options.CommitCoalesce = 10 * time.Millisecond
-	const (
-		writers  = 16
-		attempts = 8
-	)
-	grouped, largest := 0, uint32(0)
-	for attempt := range attempts {
-		file, err := os.CreateTemp(t.TempDir(), "file-fs-sync-group-*")
-		if err != nil {
-			t.Fatal(err)
-		}
-		fs, err := Create(file, options)
-		if err != nil {
-			_ = file.Close()
-			t.Fatal(err)
-		}
-		// Closing through cleanup rather than at the end of the body is what keeps
-		// a failure here local: the writer lease is process-global, so a store left
-		// open by a t.Fatal takes every later test in the package with it.
-		closed := false
-		t.Cleanup(func() {
-			if !closed {
-				_ = fs.Close()
-			}
-			_ = file.Close()
-		})
-
-		start := make(chan struct{})
-		errs := make(chan error, writers)
-		for writer := range writers {
-			go func() {
-				<-start
-				key := fmt.Sprintf("writer:%02d", writer)
-				created, putErr := fs.Put(key, []byte(fmt.Sprintf(`{"writer":%d}`, writer)))
-				if putErr != nil || !created {
-					errs <- fmt.Errorf("Put(%s) = (%v,%v)", key, created, putErr)
-					return
-				}
-				errs <- nil
-			}()
-		}
-		close(start)
-		for range writers {
-			if err := <-errs; err != nil {
-				t.Fatal(err)
-			}
-		}
-		stats := fs.Stats()
-		if stats.DocumentCount != writers || stats.CommittedBatches != writers+1 ||
-			stats.DurableGeneration != stats.PublishedGeneration ||
-			stats.SuppressedRootBytes !=
-				stats.SuppressedRootWrites*uint64(options.PageSize) {
-			t.Fatalf("attempt %d: synchronous group commit did not converge: %+v",
-				attempt, stats)
-		}
-		// State lives inside the one selected fixed root, so grouping no
-		// longer stages intermediate PageStateRoot writes to suppress.
-		if stats.SuppressedRootWrites != 0 || stats.SuppressedRootBytes != 0 {
-			t.Fatalf("attempt %d: inline roots reported suppressed state pages: %+v",
-				attempt, stats)
-		}
-		if stats.LargestCommitGroup >= 2 {
-			grouped++
-		}
-		largest = max(largest, stats.LargestCommitGroup)
-
-		if err := fs.Close(); err != nil {
-			t.Fatal(err)
-		}
-		closed = true
-		reopened, err := Open(file, options)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if reopened.Len() != writers {
-			_ = reopened.Close()
-			t.Fatalf("attempt %d: reopened documents = %d, want %d",
-				attempt, reopened.Len(), writers)
-		}
-		for writer := range writers {
-			key := fmt.Sprintf("writer:%02d", writer)
-			got, ok, readErr := reopened.AppendRaw(nil, key)
-			if readErr != nil || !ok || string(got) != fmt.Sprintf(`{"writer":%d}`, writer) {
-				_ = reopened.Close()
-				t.Fatalf("attempt %d: %s after reopen = (%q,%v,%v)",
-					attempt, key, got, ok, readErr)
-			}
-		}
-		if err := reopened.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Coalescing needs two writers inside the commit queue at the same moment,
-	// and with a single P nothing can put them there: a writer that publishes then
-	// waits hands the P back, and whether another writer is admitted before the
-	// committer drains depends entirely on what else is runnable. Measured on a
-	// sixteen-core machine under a 40-process CPU load: at GOMAXPROCS=16 every one
-	// of fifteen runs coalesced on all eight attempts, while at GOMAXPROCS=1 a
-	// full shuffled package run coalesced on none of eight in four runs out of
-	// six. So the requirement is stated against the configuration that can satisfy
-	// it, and the invariants above are still checked at any GOMAXPROCS.
-	if runtime.GOMAXPROCS(0) < 2 {
-		t.Logf("GOMAXPROCS is 1, so two writers cannot be in the commit queue at "+
-			"once; checked the durability invariants over %d attempts without "+
-			"requiring coalescing", attempts)
-		return
-	}
-	if grouped == 0 {
-		t.Fatalf("no attempt out of %d coalesced two synchronous writers into one "+
-			"device commit (largest group seen: %d), so group commit is not merely "+
-			"unlucky here — it is not happening", attempts, largest)
-	}
-	t.Logf("%d of %d attempts coalesced, largest group %d", grouped, attempts, largest)
-}
+// The shared fence returns as the parallel-writers P1 group-commit gate
+// (docs/design/parallel-tablet-writers.md), which reintroduces a batched
+// device commit across concurrent writers on an explicit gate rather than as an
+// emergent property of the commit queue. This coverage returns with it.
 
 func TestCreateFileStoreRequiresEmptyFile(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-nonempty-*")
@@ -699,6 +535,13 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 	}
 	defer file.Close()
 	options := testFileStoreOptions()
+	// This test reads super.FileEnd directly to observe physical copy-on-write
+	// reuse. The synchronous primary lane stages each Put in a volatile append
+	// region far past the durable FileEnd and only materializes it at a checkpoint,
+	// so its visible FileEnd swings and never plateaus. The async lane's committer
+	// writes each generation to the device, so its FileEnd is the physical
+	// high-water this test is written against.
+	options.Durability = DurabilityAsyncVisible
 	options.MaxRetiredExtents = 1024
 	fs, err := Create(file, options)
 	if err != nil {
@@ -754,6 +597,12 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
+	// Physical allocation is what publishes the inline free log and, on a reopened
+	// store, triggers the lazy free-log replay. The synchronous lane stages each
+	// mutation as a volatile frame and does that allocation at the next checkpoint,
+	// so this test checkpoints at each observation point; the reads are of settled
+	// durable state, not the volatile append region, and stay deterministic across
+	// the whole package (an async committer's plateau does not).
 	options := testFileStoreOptions()
 	options.MaxRetiredExtents = 1024
 	fs, err := Create(file, options)
@@ -767,6 +616,9 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 		if _, err := fs.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := fs.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	if fs.inlineFree.Len() == 0 {
 		t.Fatal("churn did not publish a durable inline free log")
@@ -786,13 +638,21 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 	if _, err := reopened.Put("hot", []byte(`31`)); err != nil {
 		t.Fatal(err)
 	}
+	// The synchronous lane's first physical allocation is the checkpoint, which
+	// draws from free space and lazily replays the bounded free log.
+	if err := reopened.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if !reopened.freeLoaded {
-		t.Fatal("first mutation did not lazily replay the bounded free log")
+		t.Fatal("first checkpoint did not lazily replay the bounded free log")
 	}
 	for version := 32; version <= 50; version++ {
 		if _, err := reopened.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := reopened.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	plateau := reopened.Stats().FileEnd
 	for version := 51; version <= 80; version++ {
@@ -800,9 +660,26 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := reopened.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if got := reopened.Stats().FileEnd; got != plateau {
 		t.Fatalf("reopened allocator did not plateau: %d -> %d", plateau, got)
 	}
+}
+
+// collectionIndexMasks probes an exact index against a collection's newest
+// committed state through a short-lived snapshot. Exact-index probing moved off
+// Collection onto Snapshot with the ordered primary, so the convenience the
+// chunk store exposed on Collection is reconstructed here for the tests that
+// still verify the current state directly.
+func collectionIndexMasks(c *Collection, dst []store.Mask, name string, values ...vibejson.Index) ([]store.Mask, error) {
+	snap, err := c.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	defer snap.Close()
+	return snap.AppendIndexMasks(dst, name, values...)
 }
 
 func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
@@ -861,7 +738,7 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 		}
 		return count
 	}
-	masks, err := fs.AppendIndexMasks(nil, "status", active)
+	masks, err := collectionIndexMasks(fs, nil, "status", active)
 	if err != nil || countMasks(masks) != 4 {
 		t.Fatalf("active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
 	}
@@ -883,7 +760,7 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err := certifiedSnapshot.Close(); err != nil {
 		t.Fatal(err)
 	}
-	compound, err := fs.AppendIndexMasks(nil, "tenant_status", acme, active)
+	compound, err := collectionIndexMasks(fs, nil, "tenant_status", acme, active)
 	if err != nil || countMasks(compound) != 2 {
 		t.Fatalf("compound masks = (%+v,%v), count %d", compound, err, countMasks(compound))
 	}
@@ -911,7 +788,7 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if ok, err := fs.Delete("k06"); err != nil || !ok {
 		t.Fatalf("Delete indexed row = (%v,%v)", ok, err)
 	}
-	masks, err = fs.AppendIndexMasks(masks[:0], "status", active)
+	masks, err = collectionIndexMasks(fs, masks[:0], "status", active)
 	if err != nil || countMasks(masks) != 2 {
 		t.Fatalf("updated active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
 	}
@@ -930,7 +807,7 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err = reopened.AppendIndexMasks(nil, "status", active)
+	masks, err = collectionIndexMasks(reopened, nil, "status", active)
 	if err != nil || countMasks(masks) != 2 {
 		t.Fatalf("reopened active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
 	}
@@ -958,62 +835,6 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	wrong.Indexes = []store.IndexDefinition{{Name: "status", Paths: []string{"/tenant"}}, options.Indexes[1]}
 	if _, err := Open(file, wrong); err == nil {
 		t.Fatal("Open accepted a mismatched index catalog")
-	}
-}
-
-func TestFileIndexTupleCertificateSemantics(t *testing.T) {
-	leftValues := []vibejson.RawValue{
-		{Src: []byte(`"active"`)},
-		{Src: []byte(`1`)},
-	}
-	rightValues := []vibejson.RawValue{
-		{Src: []byte(`"ac\u0074ive"`)},
-		{Src: []byte(`1.0`)},
-	}
-	left, ok := appendFileIndexCertificate(nil, leftValues, 4096)
-	if !ok || !fileIndexCertificateValid(left, 2) {
-		t.Fatalf("left certificate = (%x,%v)", left, ok)
-	}
-	right, ok := appendFileIndexCertificate(nil, rightValues, 4096)
-	if !ok || !fileIndexCertificateValid(right, 2) {
-		t.Fatalf("right certificate = (%x,%v)", right, ok)
-	}
-	if !fileIndexCertificatesEqual(left, right, 2) {
-		t.Fatal("semantically equal tuple certificates compared unequal")
-	}
-	needle := func(src string) vibejson.Index {
-		needed, err := vibejson.RequiredIndexEntries([]byte(src))
-		if err != nil {
-			t.Fatal(err)
-		}
-		index, err := vibejson.BuildIndex([]byte(src), make([]vibejson.IndexEntry, needed))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return index
-	}
-	if !fileIndexCertificateMatches(
-		left, []vibejson.Index{needle(`"ac\u0074ive"`), needle(`1e0`)}, 2,
-	) {
-		t.Fatal("tuple certificate did not match equivalent query scalars")
-	}
-	different, ok := appendFileIndexCertificate(
-		nil, []vibejson.RawValue{{Src: []byte(`"active"`)}, {Src: []byte(`2`)}}, 4096,
-	)
-	if !ok || fileIndexCertificatesEqual(left, different, 2) {
-		t.Fatal("different tuple certificates compared equal")
-	}
-	corrupt := append([]byte(nil), left...)
-	corrupt[4] = 0xff
-	corrupt[5] = 0xff
-	if fileIndexCertificateValid(corrupt, 2) ||
-		fileIndexCertificateMatches(corrupt, []vibejson.Index{needle(`"active"`), needle(`1`)}, 2) {
-		t.Fatal("malformed tuple certificate was accepted")
-	}
-	prefix := []byte("prefix")
-	if got, ok := appendFileIndexCertificate(prefix, leftValues, 4); ok ||
-		string(got) != "prefix" {
-		t.Fatalf("bounded certificate append = (%q,%v)", got, ok)
 	}
 }
 
@@ -1047,27 +868,71 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 	}
 	defer snapshot.Close()
 
-	masks := []store.Mask{
-		{Chunk: 0, Bits: 1<<0 | 1<<1 | 1<<3 | 1<<63},
-		{Chunk: 2, Bits: 1 << 1},
-	}
-	var keys []string
+	// Slots are assigned from the store's random hash seed, so the masks that name
+	// k00, k03, and k09 are discovered from the live layout rather than hardcoded.
+	// A full-quadrant sweep of the single populated bucket yields every row's
+	// stable location; the three wanted keys' locations then build the selecting
+	// masks, grouped and ordered by chunk exactly as an index probe emits them.
+	locations := make(map[string]store.Location)
 	scratch := make([]byte, 0, 2048)
-	scratch, err = snapshot.RangeMasksRawBuffer(masks, scratch, func(key, value []byte) error {
-		keys = append(keys, string(key))
-		if len(value) == 0 {
-			t.Fatal("empty value")
+	sweep := []store.Mask{
+		{Chunk: 0, Bits: ^uint64(0)}, {Chunk: 1, Bits: ^uint64(0)},
+		{Chunk: 2, Bits: ^uint64(0)}, {Chunk: 3, Bits: ^uint64(0)},
+	}
+	scratch, err = snapshot.RangeMasksRawRowsBuffer(
+		sweep, scratch,
+		func(row store.Location, key, _ []byte) error {
+			locations[string(key)] = row
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectMasks := func(keys ...string) []store.Mask {
+		byChunk := make(map[uint32]uint64)
+		for _, key := range keys {
+			loc, ok := locations[key]
+			if !ok {
+				t.Fatalf("no location for %q", key)
+			}
+			byChunk[loc.Chunk] |= uint64(1) << loc.Slot
 		}
-		return nil
-	})
+		chunks := make([]uint32, 0, len(byChunk))
+		for chunk := range byChunk {
+			chunks = append(chunks, chunk)
+		}
+		slices.Sort(chunks)
+		out := make([]store.Mask, 0, len(chunks))
+		for _, chunk := range chunks {
+			out = append(out, store.Mask{Chunk: chunk, Bits: byChunk[chunk]})
+		}
+		return out
+	}
+
+	var keys []string
+	overflowValueLen := 0
+	scratch, err = snapshot.RangeMasksRawBuffer(
+		selectMasks("k00", "k03", "k09"), scratch[:0],
+		func(key, value []byte) error {
+			keys = append(keys, string(key))
+			if len(value) == 0 {
+				t.Fatal("empty value")
+			}
+			if string(key) == "k09" {
+				overflowValueLen = len(value)
+			}
+			return nil
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := strings.Join(keys, ","), "k00,k03,k09"; got != want {
 		t.Fatalf("masked key order = %q, want %q", got, want)
 	}
-	if cap(scratch) < 1024 {
-		t.Fatalf("caller overflow scratch capacity = %d, want at least 1024", cap(scratch))
+	if overflowValueLen < 1024 {
+		t.Fatalf("resolved overflow value length = %d, want at least 1024", overflowValueLen)
 	}
 
 	var serialKeys []string
@@ -1106,7 +971,7 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 		t.Fatalf("unknown chunk error = %v, want %v", err, store.ErrMaskChunk)
 	}
 
-	steady := []store.Mask{{Chunk: 0, Bits: 1<<0 | 1<<3}, {Chunk: 2, Bits: 1 << 1}}
+	steady := selectMasks("k00", "k05", "k09")
 	visitBytes := 0
 	visit := func(key, value []byte) error {
 		visitBytes += len(key) + len(value)
@@ -1176,10 +1041,14 @@ func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("warmed AppendIndexMasksInto allocated %.2f times, want 0", allocs)
 	}
-	if stats := workspace.LastProbeStats(); stats != (IndexProbeStats{
-		CandidateRows: 8, CertificateRows: 8,
-		MatchedRows: 8, CandidateChunks: 2, PostingPages: 1,
-	}) {
+	// CandidateChunks counts the succinct candidate groups the probe walked. On the
+	// ordered primary those groups are hash-distributed, so how many the eight
+	// matching rows fall across depends on the per-process hash seed and is not a
+	// deterministic property of the query. The row-level counts and posting-page
+	// count are exact and are what the probe must get right.
+	if stats := workspace.LastProbeStats(); stats.CandidateRows != 8 ||
+		stats.CertificateRows != 8 || stats.DocumentRecheckRows != 0 ||
+		stats.MatchedRows != 8 || stats.PostingPages != 1 {
 		t.Fatalf("exact probe stats = %+v", stats)
 	}
 	masks, err = snapshot.AppendIndexCandidateMasksInto(masks[:0], &workspace, "tenant_status", acme, active)
@@ -1196,319 +1065,12 @@ func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("warmed AppendIndexCandidateMasksInto allocated %.2f times, want 0", allocs)
 	}
-	if stats := workspace.LastProbeStats(); stats != (IndexProbeStats{
-		CandidateRows: 8, CandidateChunks: 2, PostingPages: 1,
-	}) {
+	// CandidateChunks is hash-seed-dependent on the ordered primary (see the exact
+	// probe assertion above), so only the exact row and posting-page counts are
+	// pinned.
+	if stats := workspace.LastProbeStats(); stats.CandidateRows != 8 ||
+		stats.PostingPages != 1 {
 		t.Fatalf("candidate probe stats = %+v", stats)
-	}
-}
-
-func TestFileStoreFloat64ColumnsMutationSnapshotReopenAndAllocations(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "file-fs-float64-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	options := testFileStoreOptions()
-	options.Float64Columns = []string{"/score", "/nested/value"}
-	fs, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for key, document := range map[string]string{
-		"k0": `{"score":1.5,"nested":{"value":10}}`,
-		"k1": `{"score":2,"nested":{"value":"not numeric"}}`,
-		"k2": `{"score":"not numeric","nested":{"value":-3}}`,
-		"k3": `{"score":1e999,"nested":null}`,
-	} {
-		if _, err := fs.Put(key, []byte(document)); err != nil {
-			t.Fatalf("Put(%s): %v", key, err)
-		}
-	}
-	if got := fs.Stats().Float64ScratchBytes; got != 2*(8+64*8) {
-		t.Fatalf("Float64ScratchBytes = %d, want %d", got, 2*(8+64*8))
-	}
-	old, err := fs.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertAggregate := func(snapshot *Snapshot, path string, want store.Float64Aggregate) {
-		t.Helper()
-		got, covered, err := snapshot.ReduceFloat64Path(path)
-		if err != nil || !covered || got != want {
-			t.Fatalf("ReduceFloat64Path(%q) = (%+v,%v,%v), want (%+v,true,nil)", path, got, covered, err, want)
-		}
-	}
-	assertAggregate(old, "/score", store.Float64Aggregate{Count: 2, Sum: 3.5, Min: 1.5, Max: 2})
-	assertAggregate(old, "/nested/value", store.Float64Aggregate{Count: 2, Sum: 7, Min: -3, Max: 10})
-	if !old.HasFloat64Path("/nested/value") || old.HasFloat64Path("/missing") {
-		t.Fatal("covering-column catalog lookup mismatch")
-	}
-	if got, covered, err := old.ReduceFloat64Path("/missing"); err != nil || covered || got != (store.Float64Aggregate{}) {
-		t.Fatalf("unconfigured reduction = (%+v,%v,%v), want zero,false,nil", got, covered, err)
-	}
-
-	if created, err := fs.Put("k0", []byte(`{"score":4}`)); err != nil || created {
-		t.Fatalf("update k0 = (%v,%v), want (false,nil)", created, err)
-	}
-	if deleted, err := fs.Delete("k1"); err != nil || !deleted {
-		t.Fatalf("delete k1 = (%v,%v), want (true,nil)", deleted, err)
-	}
-	if created, err := fs.Put("k4", []byte(`{"score":-1,"nested":{"value":8}}`)); err != nil || !created {
-		t.Fatalf("insert k4 = (%v,%v), want (true,nil)", created, err)
-	}
-	current, err := fs.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertAggregate(current, "/score", store.Float64Aggregate{Count: 2, Sum: 3, Min: -1, Max: 4})
-	assertAggregate(current, "/nested/value", store.Float64Aggregate{Count: 2, Sum: 5, Min: -3, Max: 8})
-	paths := []string{"/score", "/nested/value"}
-	totals := make([]store.Float64Aggregate, len(paths))
-	if covered, err := current.ReduceFloat64PathsInto(totals, paths); err != nil || !covered ||
-		totals[0] != (store.Float64Aggregate{Count: 2, Sum: 3, Min: -1, Max: 4}) ||
-		totals[1] != (store.Float64Aggregate{Count: 2, Sum: 5, Min: -3, Max: 8}) {
-		t.Fatalf("fused covering reductions = (%+v,%v,%v)", totals, covered, err)
-	}
-	// Copy-on-write publication keeps the old page and its typed columns
-	// coherent for readers that already hold the preceding generation.
-	assertAggregate(old, "/score", store.Float64Aggregate{Count: 2, Sum: 3.5, Min: 1.5, Max: 2})
-
-	if _, _, err := current.ReduceFloat64Path("/score"); err != nil {
-		t.Fatal(err)
-	}
-	allocs := testing.AllocsPerRun(100, func() {
-		got, covered, runErr := current.ReduceFloat64Path("/score")
-		if runErr != nil || !covered || got.Count != 2 || got.Sum != 3 {
-			panic("covered reduction failed")
-		}
-	})
-	if allocs != 0 {
-		t.Fatalf("warmed ReduceFloat64Path allocated %.2f times, want 0", allocs)
-	}
-	allocs = testing.AllocsPerRun(100, func() {
-		covered, runErr := current.ReduceFloat64PathsInto(totals, paths)
-		if runErr != nil || !covered || totals[0].Sum != 3 || totals[1].Sum != 5 {
-			panic("fused covered reduction failed")
-		}
-	})
-	if allocs != 0 {
-		t.Fatalf("warmed ReduceFloat64PathsInto allocated %.2f times, want 0", allocs)
-	}
-	if err := current.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := old.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := Open(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedSnapshot, err := reopened.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertAggregate(reopenedSnapshot, "/score", store.Float64Aggregate{Count: 2, Sum: 3, Min: -1, Max: 4})
-	assertAggregate(reopenedSnapshot, "/nested/value", store.Float64Aggregate{Count: 2, Sum: 5, Min: -3, Max: 8})
-	if err := reopenedSnapshot.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
-	}
-	wrong := options
-	wrong.Float64Columns = []string{"/score"}
-	if _, err := Open(file, wrong); err == nil {
-		t.Fatal("Open accepted a mismatched float64 covering catalog")
-	}
-}
-
-func recoveredFileDocumentRef(t *testing.T, file *os.File, options Options, chunk uint32) storeio.PageRef {
-	t.Helper()
-	rootScratch := make([]byte, options.PageSize)
-	inline, root, _, err := storeio.RecoverInlineStateRoot(file, uint32(options.PageSize), rootScratch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ref := root.ChunkDirectory
-	for {
-		page := make([]byte, ref.Length)
-		if _, err := file.ReadAt(page, int64(ref.Offset)); err != nil {
-			t.Fatal(err)
-		}
-		view, err := storeio.OpenChunkDirectoryPage(page, inline.FileEnd, root.NextLogicalID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		child, ok := view.Lookup(chunk)
-		if !ok {
-			t.Fatalf("chunk %d is absent from the recovered directory", chunk)
-		}
-		if view.Header().Shift == 0 {
-			return child
-		}
-		ref = child
-	}
-}
-
-func TestFileStoreFloat64ColumnRejectsResealedCorruptionOnAdmission(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "file-fs-float64-corrupt-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	options := testFileStoreOptions()
-	options.Float64Columns = []string{"/score"}
-	fs, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fs.Put("key", []byte(`{"score":1.5}`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	documentRef := recoveredFileDocumentRef(t, file, options, 0)
-	page := make([]byte, documentRef.Length)
-	if _, err := file.ReadAt(page, int64(documentRef.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	payloadStart := storeio.PageHeaderSize
-	count := int(page[payloadStart+20])
-	dataStart := payloadStart + storeio.DocumentPagePayloadHeaderSize +
-		count*storeio.DocumentPageRecordSize
-	dataLength := int(binary.LittleEndian.Uint32(page[payloadStart+16 : payloadStart+20]))
-	valueOffset := dataStart + dataLength + 8 // Skip the first column's stable-slot mask.
-	if valueOffset+8 > len(page) {
-		t.Fatal("encoded float64 covering value is outside the document page")
-	}
-	binary.LittleEndian.PutUint64(page[valueOffset:valueOffset+8], math.Float64bits(math.Inf(1)))
-	if _, err := storeio.SealPage(page); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteAt(page, int64(documentRef.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Sync(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := Open(file, options)
-	if reopened != nil {
-		_ = reopened.Close()
-		t.Fatal("Open returned a fs for a corrupt append document page")
-	}
-	if !errors.Is(err, storeio.ErrDocumentPageCorrupt) {
-		t.Fatalf("Open resealed covering corruption = %v, want document corruption", err)
-	}
-}
-
-func TestFileStoreRejectsResealedInvalidInlineJSONOnAdmission(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "file-fs-json-corrupt-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	options := testFileStoreOptions()
-	fs, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	document := []byte(`{"ok":true}`)
-	if _, err := fs.Put("key", document); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	documentRef := recoveredFileDocumentRef(t, file, options, 0)
-	page := make([]byte, documentRef.Length)
-	if _, err := file.ReadAt(page, int64(documentRef.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	position := bytes.Index(page, document)
-	if position < 0 {
-		t.Fatal("inline JSON is absent from recovered document page")
-	}
-	copy(page[position:], `{"ok":xxxx}`)
-	if _, err := storeio.SealPage(page); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteAt(page, int64(documentRef.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Sync(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := Open(file, options)
-	if reopened != nil {
-		_ = reopened.Close()
-		t.Fatal("Open returned a fs for invalid inline JSON")
-	}
-	if !errors.Is(err, storeio.ErrDocumentPageCorrupt) {
-		t.Fatalf("Open resealed invalid JSON = %v, want document corruption", err)
-	}
-}
-
-func TestFileSnapshotRejectsResealedCrossChunkDocument(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "file-fs-cross-chunk-corrupt-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	options := testFileStoreOptions()
-	fs, err := Create(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for row := range options.Collection.ChunkDocuments + 1 {
-		if _, err := fs.Put(fmt.Sprintf("key-%d", row), []byte(`{"ok":true}`)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := fs.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	documentRef := recoveredFileDocumentRef(t, file, options, 0)
-	page := make([]byte, documentRef.Length)
-	if _, err := file.ReadAt(page, int64(documentRef.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	// Chunk one exists, so the typed page validator accepts this in-range
-	// identity. The selecting chunk-tree edge must still reject the mismatch.
-	binary.LittleEndian.PutUint32(page[storeio.PageHeaderSize+4:storeio.PageHeaderSize+8], 1)
-	if _, err := storeio.SealPage(page); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteAt(page, int64(documentRef.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Sync(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := Open(file, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	snapshot, err := reopened.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	if _, _, err := snapshot.AppendRaw(nil, "key-0"); !errors.Is(err, storeio.ErrDocumentPageCorrupt) {
-		t.Fatalf("AppendRaw cross-chunk document = %v, want document corruption", err)
 	}
 }
 
@@ -1518,7 +1080,12 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	fs, err := Create(file, testFileStoreOptions())
+	options := testFileStoreOptions()
+	// The masked range needs real stable-slot masks. On the ordered primary a row's
+	// slot is its key hash, not a chunk ordinal, so hand-built chunk coordinates
+	// address nothing; the masks are taken from an exact index query instead.
+	options.Indexes = []store.IndexDefinition{{Name: "grp", Paths: []string{"/grp"}}}
+	fs, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1528,7 +1095,7 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 		if row == 9 {
 			padding = strings.Repeat("x", 1024)
 		}
-		document := fmt.Appendf(nil, `{"row":%d,"padding":%q}`, row, padding)
+		document := fmt.Appendf(nil, `{"row":%d,"grp":"g","padding":%q}`, row, padding)
 		if _, err := fs.Put(fmt.Sprintf("k%02d", row), document); err != nil {
 			t.Fatal(err)
 		}
@@ -1538,7 +1105,19 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snapshot.Close()
-	masks := []store.Mask{{Chunk: 0, Bits: 1<<0 | 1<<3}, {Chunk: 2, Bits: 1 << 1}}
+	// Every row shares grp="g", so the index resolves masks covering all ten rows.
+	needed, err := vibejson.RequiredIndexEntries([]byte(`"g"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	grp, err := vibejson.BuildIndex([]byte(`"g"`), make([]vibejson.IndexEntry, needed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := snapshot.AppendIndexMasks(nil, "grp", grp)
+	if err != nil || len(masks) == 0 {
+		t.Fatalf("index masks = (%+v,%v)", masks, err)
+	}
 	scratch := make([]byte, 0, 2048)
 	visitBytes := 0
 	visit := func(key, value []byte) error {

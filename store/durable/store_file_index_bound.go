@@ -6,7 +6,6 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
-	"github.com/thesyncim/vibejson"
 )
 
 // IndexProbeMemoryBound is the non-allocating geometry a query planner needs
@@ -57,45 +56,16 @@ func (s *Snapshot) IndexProbeMemoryBound() (IndexProbeMemoryBound, error) {
 		return bound, nil
 	}
 
-	chunks := uint64(state.root.LiveChunks)
-	bound.MaskCount = chunks
-	if chunks == 0 {
-		return bound, nil
-	}
-	// A catalog-free snapshot can still use chunk summaries, whose query-owned
-	// masks are covered by MaskCount. No exact-index probe can run, so charging
-	// directory/certificate workspace here would needlessly suppress that
-	// independent pruning tier.
-	if len(s.collection.options.Indexes) == 0 {
-		return bound, nil
-	}
-	entries := retainedIndexSliceBytes(
-		chunks, uint64(unsafe.Sizeof(storeio.IndexDirectoryEntry{})),
-	)
-	certificates := retainedIndexLogicalBytes(
-		indexBoundProduct(
-			chunks,
-			uint64(storeio.IndexDirectoryMaxCertificate(state.root.PageSize)),
-		),
-	)
-	postings := retainedIndexSliceBytes(
-		chunks, uint64(unsafe.Sizeof(fileIndexProbePosting{})),
-	)
-	bound.CandidateWorkspaceBytes =
-		indexBoundSum(indexBoundSum(entries, certificates), postings)
-
-	document := retainedIndexSliceBytes(
-		uint64(state.root.MaxDocumentBytes), 1,
-	)
-	bound.ExactSingleWorkspaceBytes =
-		indexBoundSum(bound.CandidateWorkspaceBytes, document)
-
-	tapeEntries := uint64(state.root.MaxDocumentBytes) + 2
-	tape := retainedIndexSliceBytes(
-		tapeEntries, uint64(unsafe.Sizeof(vibejson.IndexEntry{})),
-	)
-	bound.ExactCompoundWorkspaceBytes =
-		indexBoundSum(bound.ExactSingleWorkspaceBytes, tape)
+	// An ordered primary without a secondary exact index carries no posting
+	// live map, so no exact probe can run and the deleted chunk-summary tier
+	// leaves the directory/certificate/posting/document/tape workspaces at
+	// zero. The primary graph still exposes its live stable-slot tiles to the
+	// executor's full scan, and MaskCount must bound the query-owned masks that
+	// scan appends: one per live tile. The ordered graph does not maintain the
+	// retired LiveChunks counter, but every live tile holds at least one
+	// document, so DocumentCount is the conservative resident upper bound on the
+	// live-tile count without reading a page.
+	bound.MaskCount = state.root.DocumentCount
 	return bound, nil
 }
 

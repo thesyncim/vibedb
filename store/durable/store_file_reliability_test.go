@@ -139,6 +139,13 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 	}
 	defer file.Close()
 	options := testFileStoreOptions()
+	// The synchronous primary lane acknowledges through a synced recovery-journal
+	// record and folds its root at the next checkpoint, so a per-Put store image
+	// captures nothing and a torn copy references a journal it was never paired
+	// with. This sweep tears the store's own commit and must recover from the
+	// alternate superblock alone, so it runs on the journal-free async lane, whose
+	// committer writes each generation's data pages and root to the device.
+	options.Durability = DurabilityAsyncVisible
 	options.ResidentBytes = 8 << 20
 	options.BufferCount = 1024
 	options.MaxRetiredExtents = 1024
@@ -153,6 +160,11 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Drain the background committer so the store bytes captured below reflect
+	// every acknowledged generation.
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	oldGeneration := collection.Generation()
 	oldValue, ok, err := collection.AppendRaw(nil, "key-03")
 	if err != nil || !ok {
@@ -165,6 +177,9 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 	newValue := []byte(fmt.Sprintf(`{"id":3,"status":"new","padding":%q}`, strings.Repeat("z", 7000)))
 	if created, err := collection.Put("key-03", newValue); err != nil || created {
 		t.Fatalf("update = (%v,%v)", created, err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	newGeneration := collection.Generation()
 	after, err := os.ReadFile(file.Name())
@@ -304,7 +319,7 @@ func assertRecoveredIndexCounts(t *testing.T, collection *Collection, name strin
 		return index
 	}
 	count := func(value string) int {
-		masks, err := collection.AppendIndexMasks(nil, "status", needle([]byte(value)))
+		masks, err := collectionIndexMasks(collection, nil, "status", needle([]byte(value)))
 		if err != nil {
 			t.Fatalf("%s index probe %s: %v", name, value, err)
 		}

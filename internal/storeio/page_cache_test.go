@@ -174,57 +174,6 @@ func TestPageCacheFrameHintBypassesTableAndChecksExactIdentity(t *testing.T) {
 	}
 }
 
-func TestPageCacheFingerprintDirectoryIdentityIsNotLegacyKeyDirectory(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "store-page-cache-fingerprint-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	storeID := [16]byte{17, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6, 8, 10, 12, 14, 16}
-	page := make([]byte, pageCacheTestPageSize)
-	payload, err := InitPage(page, PageHeader{
-		StoreID: storeID, Generation: 2, LogicalID: 7,
-		PageSize: pageCacheTestPageSize, PayloadLength: 32,
-		Kind: PageFingerprintDirectory,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload[0] = 0x5a
-	if _, err := SealPage(page); err != nil {
-		t.Fatal(err)
-	}
-	ref := PageRef{
-		Offset: 4 * pageCacheTestPageSize, LogicalID: 7, Generation: 2,
-		Length: pageCacheTestPageSize, Kind: PageFingerprintDirectory,
-	}
-	if _, err := file.WriteAt(page, int64(ref.Offset)); err != nil {
-		t.Fatal(err)
-	}
-	cache, err := NewPageCache(file, PageCacheOptions{
-		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize,
-		StoreID: storeID, ReadConcurrency: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cache.Close()
-	lease, err := cache.Acquire(ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease.Header().Kind != PageFingerprintDirectory || lease.Payload()[0] != 0x5a {
-		t.Fatalf("fingerprint lease = header %+v payload %x", lease.Header(), lease.Payload())
-	}
-	lease.Release()
-
-	legacy := ref
-	legacy.Kind = PageKeyDirectory
-	if _, err := cache.Acquire(legacy); !errors.Is(err, ErrPageCacheReference) {
-		t.Fatalf("legacy-kind reference to fingerprint page = %v, want %v", err, ErrPageCacheReference)
-	}
-}
-
 func TestPageCachePrefetchOrderingAndHit(t *testing.T) {
 	file, storeID, refs := newPageCacheFixture(t, 3)
 	cache, err := NewPageCache(file, PageCacheOptions{
@@ -483,7 +432,7 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 			logicalID:  nextID,
 			generation: 1,
 			length:     uint32(reservedSpan * pageCacheTestPageSize),
-			kind:       PageDocument,
+			kind:       PageOverflow,
 		}
 		nextID++
 		frame := &cache.frames[index]
@@ -621,7 +570,7 @@ func TestPageCacheExactSpanEvictionSlidesWithinZone(t *testing.T) {
 		starts[i] = index
 		key := pageCacheKey{
 			offset: nextID * pageCacheTestPageSize, logicalID: nextID, generation: 1,
-			length: uint32(span * pageCacheTestPageSize), kind: PageDocument,
+			length: uint32(span * pageCacheTestPageSize), kind: PageOverflow,
 		}
 		nextID++
 		keys[i] = key
@@ -693,7 +642,7 @@ func TestPageCacheSegregatedZonesRecycleLargeChurnWithoutEviction(t *testing.T) 
 		t.Helper()
 		ref := PageRef{
 			Offset: nextOffset, LogicalID: nextID, Generation: 1,
-			Length: uint32(span * pageCacheTestPageSize), Kind: PageDocument,
+			Length: uint32(span * pageCacheTestPageSize), Kind: PageOverflow,
 		}
 		nextID++
 		nextOffset += uint64(ref.Length)
@@ -856,7 +805,7 @@ func TestPageCacheFiveFrameResidencyHasNoReservationSlackOrChurnEvictions(t *tes
 		t.Helper()
 		ref := PageRef{
 			Offset: nextOffset, LogicalID: nextID, Generation: 1,
-			Length: span * pageCacheTestPageSize, Kind: PageDocument,
+			Length: span * pageCacheTestPageSize, Kind: PageOverflow,
 		}
 		nextID++
 		nextOffset += uint64(ref.Length)
@@ -925,7 +874,7 @@ func TestPageCacheVariableDocumentExtent(t *testing.T) {
 	page := make([]byte, extentSize)
 	payload, err := InitPage(page, PageHeader{
 		StoreID: storeID, Generation: 3, LogicalID: 7,
-		PageSize: extentSize, PayloadLength: 17, Kind: PageDocument,
+		PageSize: extentSize, PayloadLength: 17, Kind: PageOverflow,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -936,7 +885,7 @@ func TestPageCacheVariableDocumentExtent(t *testing.T) {
 	}
 	ref := PageRef{
 		Offset: 4 * pageCacheTestPageSize, LogicalID: 7, Generation: 3,
-		Length: extentSize, Kind: PageDocument,
+		Length: extentSize, Kind: PageOverflow,
 	}
 	if _, err := file.WriteAt(page, int64(ref.Offset)); err != nil {
 		t.Fatal(err)
@@ -966,7 +915,7 @@ func TestPageCacheVariableDocumentExtent(t *testing.T) {
 	lease.Release()
 
 	metadata := ref
-	metadata.Kind = PageKeyDirectory
+	metadata.Kind = PageIndexPosting
 	if _, err := cache.Acquire(metadata); !errors.Is(err, ErrPageCacheReference) {
 		t.Fatalf("oversize metadata error = %v, want %v", err, ErrPageCacheReference)
 	}
@@ -1013,7 +962,7 @@ func TestPageCacheNonPowerOfTwoDocumentExtentDemandAndEviction(t *testing.T) {
 			zonePages := nextPowerOfTwo(test.logicalPages)
 			if _, initErr := InitPage(make([]byte, length), PageHeader{
 				StoreID: storeID, Generation: 1, LogicalID: 99,
-				PageSize: length, PayloadLength: 32, Kind: PageKeyDirectory,
+				PageSize: length, PayloadLength: 32, Kind: PageIndexPosting,
 			}); !errors.Is(initErr, ErrInvalidWrite) {
 				t.Fatalf("non-power metadata InitPage = %v, want %v", initErr, ErrInvalidWrite)
 			}
@@ -1023,7 +972,7 @@ func TestPageCacheNonPowerOfTwoDocumentExtentDemandAndEviction(t *testing.T) {
 				page := make([]byte, length)
 				payload, initErr := InitPage(page, PageHeader{
 					StoreID: storeID, Generation: 1, LogicalID: uint64(i + 2),
-					PageSize: length, PayloadLength: 32, Kind: PageDocument,
+					PageSize: length, PayloadLength: 32, Kind: PageOverflow,
 				})
 				if initErr != nil {
 					t.Fatal(initErr)
@@ -1037,7 +986,7 @@ func TestPageCacheNonPowerOfTwoDocumentExtentDemandAndEviction(t *testing.T) {
 				}
 				refs[i] = PageRef{
 					Offset: offset, LogicalID: uint64(i + 2), Generation: 1,
-					Length: length, Kind: PageDocument,
+					Length: length, Kind: PageOverflow,
 				}
 				offset += uint64(length)
 			}
@@ -1108,7 +1057,7 @@ func TestPageCacheNonPowerOfTwoDocumentExtentDemandAndEviction(t *testing.T) {
 			}
 
 			metadata := refs[2]
-			metadata.Kind = PageKeyDirectory
+			metadata.Kind = PageIndexPosting
 			if _, err := cache.Acquire(metadata); !errors.Is(err, ErrPageCacheReference) {
 				t.Fatalf("non-power metadata error = %v, want %v", err, ErrPageCacheReference)
 			}
@@ -1127,7 +1076,7 @@ func TestPageCacheNonPowerOfTwoDirtyReservationAccounting(t *testing.T) {
 	page := make([]byte, length)
 	payload, err := InitPage(page, PageHeader{
 		StoreID: storeID, Generation: 1, LogicalID: 2,
-		PageSize: length, PayloadLength: 32, Kind: PageDocument,
+		PageSize: length, PayloadLength: 32, Kind: PageOverflow,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1138,7 +1087,7 @@ func TestPageCacheNonPowerOfTwoDirtyReservationAccounting(t *testing.T) {
 	}
 	ref := PageRef{
 		Offset: 4 * pageCacheTestPageSize, LogicalID: 2, Generation: 1,
-		Length: length, Kind: PageDocument,
+		Length: length, Kind: PageOverflow,
 	}
 	cache, err := NewPageCache(file, PageCacheOptions{
 		PageSize: pageCacheTestPageSize, MaxPageSize: 4 * pageCacheTestPageSize,
@@ -1194,7 +1143,7 @@ func TestPageCacheMixedNonPowerReservationSymmetry(t *testing.T) {
 		page := make([]byte, length)
 		payload, initErr := InitPage(page, PageHeader{
 			StoreID: storeID, Generation: 1, LogicalID: uint64(i + 2),
-			PageSize: length, PayloadLength: 32, Kind: PageDocument,
+			PageSize: length, PayloadLength: 32, Kind: PageOverflow,
 		})
 		if initErr != nil {
 			t.Fatal(initErr)
@@ -1208,7 +1157,7 @@ func TestPageCacheMixedNonPowerReservationSymmetry(t *testing.T) {
 		}
 		refs[i] = PageRef{
 			Offset: offset, LogicalID: uint64(i + 2), Generation: 1,
-			Length: length, Kind: PageDocument,
+			Length: length, Kind: PageOverflow,
 		}
 		pages[i] = page
 		offset += uint64(length)
@@ -1327,10 +1276,10 @@ func TestPageCachePacksMetadataAndVariableExtentByQuantum(t *testing.T) {
 	offset := uint64(4 * pageCacheTestPageSize)
 	for pageID := range 5 {
 		length := uint32(pageCacheTestPageSize)
-		kind := PageChunkDirectory
+		kind := PageIndexPosting
 		if pageID == 4 {
 			length = 4 * pageCacheTestPageSize
-			kind = PageDocument
+			kind = PageOverflow
 		}
 		page := make([]byte, length)
 		payload, initErr := InitPage(page, PageHeader{
@@ -1898,7 +1847,7 @@ func TestPageCacheDoomedExtentReleasedOnLastUnpin(t *testing.T) {
 	storeID := [16]byte{29, 23, 19, 17, 13, 11, 7, 5, 3, 2, 1, 4, 6, 8, 10, 12}
 	ref := PageRef{
 		Offset: 4 * pageCacheTestPageSize, LogicalID: 2, Generation: 1,
-		Length: 3 * pageCacheTestPageSize, Kind: PageDocument,
+		Length: 3 * pageCacheTestPageSize, Kind: PageOverflow,
 	}
 	page := newPageCacheTestPage(t, storeID, ref, 0x5a)
 	if _, err := file.WriteAt(page, int64(ref.Offset)); err != nil {
@@ -2012,7 +1961,7 @@ func TestPageCacheDoomedDirtyAccountingClearedOnce(t *testing.T) {
 	storeID := [16]byte{31, 29, 23, 19, 17, 13, 11, 7, 5, 3, 2, 1, 4, 6, 8, 10}
 	ref := PageRef{
 		Offset: 4 * pageCacheTestPageSize, LogicalID: 2, Generation: 1,
-		Length: 3 * pageCacheTestPageSize, Kind: PageDocument,
+		Length: 3 * pageCacheTestPageSize, Kind: PageOverflow,
 	}
 	page := newPageCacheTestPage(t, storeID, ref, 0x7b)
 	cache, err := NewPageCache(file, PageCacheOptions{
@@ -2064,7 +2013,7 @@ func TestPageCacheConcurrentAcquireReleaseAndMarkUnreachable(t *testing.T) {
 	storeID := [16]byte{37, 31, 29, 23, 19, 17, 13, 11, 7, 5, 3, 2, 1, 4, 6, 8}
 	current := PageRef{
 		Offset: 4 * pageCacheTestPageSize, LogicalID: 2, Generation: 1,
-		Length: pageCacheTestPageSize, Kind: PageDocument,
+		Length: pageCacheTestPageSize, Kind: PageOverflow,
 	}
 	cache, err := NewPageCache(file, PageCacheOptions{
 		PageSize: pageCacheTestPageSize, MaxPageSize: pageCacheTestPageSize,
@@ -2210,7 +2159,7 @@ func newPageCacheFixture(t testing.TB, count int) (*os.File, [16]byte, []PageRef
 		page := make([]byte, pageCacheTestPageSize)
 		payload, initErr := InitPage(page, PageHeader{
 			StoreID: storeID, Generation: 1, LogicalID: logicalID,
-			PageSize: pageCacheTestPageSize, PayloadLength: 32, Kind: PageDocument,
+			PageSize: pageCacheTestPageSize, PayloadLength: 32, Kind: PageOverflow,
 		})
 		if initErr != nil {
 			t.Fatal(initErr)
@@ -2224,7 +2173,7 @@ func newPageCacheFixture(t testing.TB, count int) (*os.File, [16]byte, []PageRef
 		}
 		refs[i] = PageRef{
 			Offset: offset, LogicalID: logicalID, Generation: 1,
-			Length: pageCacheTestPageSize, Kind: PageDocument,
+			Length: pageCacheTestPageSize, Kind: PageOverflow,
 		}
 	}
 	return file, storeID, refs

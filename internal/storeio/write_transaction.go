@@ -388,7 +388,7 @@ func (t *WriteTransaction) AllocateNear(kind PageKind, length uint32, logicalID,
 
 func (t *WriteTransaction) allocate(kind PageKind, length uint32, logicalID, hint uint64) (TransactionPage, error) {
 	validLength := validPhysicalPageSize(length)
-	if kind == PageDocument || kind == PageOverflow {
+	if kind == PageOverflow {
 		validLength = validPageExtentSize(kind, length)
 	}
 	if t == nil || !t.active || t.batch == nil || !validPageKind(kind) ||
@@ -479,8 +479,7 @@ func (t *WriteTransaction) rollbackPhysicalAllocation(
 // their bounded copy-on-write geometry cannot silently expand.
 func variableTransactionExtent(kind PageKind) bool {
 	switch kind {
-	case PageDocument, PageOverflow, PageFloat64Stripe,
-		PageIndexGroupCatalog, PagePrimaryCatalog, PageTabletDirectory,
+	case PageOverflow, PagePrimaryCatalog, PageTabletDirectory,
 		PagePrimaryLocator, PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf,
 		PagePrimaryExactRoot, PagePrimaryExactLeaf:
 		return true

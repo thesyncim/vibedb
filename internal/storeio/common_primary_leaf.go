@@ -159,6 +159,17 @@ func (v CommonPrimaryLeafValue) IsOverflow() bool {
 	return len(v.Inline) == 0 && v.Overflow.LogicalID != 0
 }
 
+// DecodePrimaryOverflowRef decodes the borrowed 32-byte out-of-line value
+// descriptor a raw or posting-row scan yields for an overflow record into its
+// chain-head PageRef. It returns the zero PageRef for a wrong-length input; the
+// selecting snapshot bounds still gate the reference when the chain is opened.
+func DecodePrimaryOverflowRef(raw []byte) PageRef {
+	if len(raw) != PageRefSize {
+		return PageRef{}
+	}
+	return decodePageRef(raw)
+}
+
 // CommonPrimaryLeafRecord is one key/value together with its stable slot. It is
 // the build-and-mutate spelling: the slot is authoritative so an update or
 // delete lands on the same physical slot the key already occupies. Key and
@@ -1298,6 +1309,65 @@ func (v *CommonPrimaryLeafView) rankOverflow(rank int) bool {
 		(byte(1)<<uint(rank&7)) != 0
 }
 
+// HasOverflowRows reports whether any live row stores its value out of line. It
+// reads only the overflow bitmap, so the checkpoint fast path can skip the
+// per-row rewrite scan for the common all-inline leaf without opening a value.
+func (v *CommonPrimaryLeafView) HasOverflowRows() bool {
+	if v == nil || v.count == 0 {
+		return false
+	}
+	for _, b := range v.payload[v.layout.overflowStart:v.layout.lowStart] {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// RewriteOverflowRefs rewrites, in place, every out-of-line value descriptor in
+// payload whose head ref resolve maps to a different PageRef. payload must be the
+// payload region of a byte-for-byte copy of this view's raw-class leaf page: the
+// checkpoint materialize copies the volatile leaf verbatim into a durable page,
+// then calls this to swap each volatile chain head for the durable head it minted
+// in the checkpoint transaction. Row geometry is taken from the view (identical
+// to payload at call time); resolve receives the current head and returns the ref
+// to store, returning the same ref to leave a row untouched so a durable head
+// carried forward from a prior checkpoint costs only the resolve call. The caller
+// reseals the page. It allocates nothing.
+func (v *CommonPrimaryLeafView) RewriteOverflowRefs(
+	payload []byte,
+	resolve func(head PageRef) (PageRef, error),
+) error {
+	if v == nil {
+		return nil
+	}
+	if len(payload) != len(v.payload) {
+		return fmt.Errorf(
+			"%w: overflow rewrite payload width", ErrCommonPrimaryLeafCorrupt,
+		)
+	}
+	for rank := 0; rank < int(v.count); rank++ {
+		if !v.rankOverflow(rank) {
+			continue
+		}
+		_, valueStart, end, ok := v.keyBounds(rank)
+		if !ok || end-valueStart != PageRefSize {
+			return fmt.Errorf(
+				"%w: overflow descriptor", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		head := decodePageRef(payload[valueStart:end])
+		next, err := resolve(head)
+		if err != nil {
+			return err
+		}
+		if next != head {
+			encodePageRef(payload[valueStart:end], next)
+		}
+	}
+	return nil
+}
+
 // Header returns the leaf's stable identity; the zero value for a nil view.
 func (v *CommonPrimaryLeafView) Header() CommonPrimaryLeafHeader {
 	if v == nil {
@@ -1734,14 +1804,15 @@ func (it *CommonPrimaryLeafIterator) NextRawBorrowed() (
 // row counters in locals for the whole leaf, removing the per-row call
 // round trip and prologue the full-scan profile measured at over 1ns/doc.
 // fn receives only inline rows; the first overflow row stops the drain and is
-// returned as its borrowed raw descriptor with the iterator advanced past it.
-// A nil return with a nil error means the leaf is exhausted or a bound
-// terminated it, exactly as NextRawBorrowed's ok=false.
+// returned as its borrowed key and 32-byte descriptor with the iterator
+// advanced past it, so the caller resolves the out-of-line value and re-enters
+// to continue. A nil key and raw with a nil error means the leaf is exhausted
+// or a bound terminated it, exactly as NextRawBorrowed's ok=false.
 func (it *CommonPrimaryLeafIterator) VisitRawBorrowed(
 	fn func(key, raw []byte) error,
-) ([]byte, error) {
+) (overflowKey, overflowRaw []byte, err error) {
 	if it == nil || it.finished || fn == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	payload := it.payload
 	layout := &it.layout
@@ -1785,21 +1856,21 @@ func (it *CommonPrimaryLeafIterator) VisitRawBorrowed(
 			it.bitPos = uint16(bitPos)
 			it.offset = uint16(offset)
 			it.finished = rank >= count
-			return raw, nil
+			return key, raw, nil
 		}
 		if err := fn(key, raw); err != nil {
 			it.rank = uint16(rank)
 			it.bitPos = uint16(bitPos)
 			it.offset = uint16(offset)
 			it.finished = rank >= count
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	it.rank = uint16(rank)
 	it.bitPos = uint16(bitPos)
 	it.offset = uint16(offset)
 	it.finished = true
-	return nil, nil
+	return nil, nil, nil
 }
 
 func (v *CommonPrimaryLeafView) rankSlots() (

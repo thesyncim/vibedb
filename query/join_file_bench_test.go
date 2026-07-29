@@ -55,7 +55,7 @@ func joinBenchDurableDatabase(b testing.TB, dir string, outerRows, customers, ma
 			b.Fatal(err)
 		}
 		defer func() { _ = file.Close() }()
-		if _, err := durable.CreateFrom(source, file, options); err != nil {
+		if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
 			b.Fatal(err)
 		}
 	}

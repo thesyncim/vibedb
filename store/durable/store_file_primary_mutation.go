@@ -347,6 +347,7 @@ func (c *Collection) retirePrimaryVolatileRefLocked(
 
 func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 	resident storeio.ResidentPrimaryRoute,
+	valueLen int,
 ) error {
 	if cap(c.primaryPendingParents) == 0 {
 		c.primaryPendingParents = make(
@@ -368,11 +369,29 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 	}
 	c.clearPrimaryVolatileRetiredLocked()
 	if len(c.primaryVolatileRetired) == cap(c.primaryVolatileRetired) {
-		return fmt.Errorf(
-			"%w: buffered primary volatile-reference capacity %d",
-			storeio.ErrRetiredExtentCapacity,
-			cap(c.primaryVolatileRetired),
-		)
+		// A full volatile-reference table is the retirement-pressure situation the
+		// retirement table has: a held snapshot pins the frames a checkpoint would
+		// otherwise drop. Force one checkpoint and count it as a retirement-pressure
+		// checkpoint — the same response reserveFileRetirements' retry makes — then
+		// re-clear. A checkpoint that runs while no reader has arrived drains the
+		// table and lets the mutation proceed; a genuinely reader-pinned table stays
+		// full, and the error is routed through the shared diagnostic so it names the
+		// pinning snapshot and generation rather than surfacing a bare capacity
+		// number an operator cannot act on. materializePrimaryParentsLocked fails
+		// closed if it cannot fit the fold, so a failed checkpoint publishes nothing.
+		c.retirementPressureCheckpoints.Add(1)
+		if err := c.checkpointBufferedLocked(); err != nil &&
+			!errors.Is(err, storeio.ErrRetiredExtentCapacity) {
+			return err
+		}
+		c.clearPrimaryVolatileRetiredLocked()
+		if len(c.primaryVolatileRetired) == cap(c.primaryVolatileRetired) {
+			return c.absorbRetirementPressure(fmt.Errorf(
+				"%w: buffered primary volatile-reference capacity %d",
+				storeio.ErrRetiredExtentCapacity,
+				cap(c.primaryVolatileRetired),
+			))
+		}
 	}
 	if c.primaryPendingParentIndex(resident.Bucket) < 0 &&
 		len(c.primaryPendingParents) == cap(c.primaryPendingParents) {
@@ -384,15 +403,35 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 	// The journal-backed sync lane appends its record at the point of no return,
 	// after the leaf frame is admitted dirty, so it cannot force a checkpoint
 	// there. Fold and recycle a full journal now — before the frame is prepared —
-	// using the worst-case record size so any admitted mutation is guaranteed to
-	// fit. This is the sync lane's checkpoint cadence, the journal analogue of
-	// pending-parent pressure above.
+	// sized for the larger of this value and the worst-case inline record, so both
+	// an out-of-line value's full-length record and any later inline mutation are
+	// guaranteed to fit. This is the sync lane's checkpoint cadence, the journal
+	// analogue of pending-parent pressure above.
 	if c.syncJournalLane() &&
-		!c.journal.Fits(c.options.MaxKeyBytes, c.options.InlineValueBytes) {
+		!c.journal.Fits(
+			c.options.MaxKeyBytes, max(c.options.InlineValueBytes, valueLen),
+		) {
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return err
 		}
 		c.automaticCheckpoints.Add(1)
+	}
+	// A buffered overflow value holds its whole out-of-line chain as volatile dirty
+	// frames until checkpoint, so a run of large values would fill the cache with
+	// unflushable frames. Keep at least half the cache free for one of them: the
+	// checkpoint that folds the pending volatile chains into durable pages must
+	// stage the re-materialization, and that staging needs as much room as the
+	// resident volatile frames it supersedes. Both deferred-canonical lanes fold
+	// through checkpointBufferedLocked, so this covers buffered and sync-journal.
+	if valueLen > c.options.InlineValueBytes && len(c.primaryPendingParents) != 0 {
+		cacheCapacity := uint64(c.options.BufferCount) *
+			uint64(c.options.PageSize)
+		if c.cache.DirtyCapacityAvailable() < cacheCapacity*3/4 {
+			if err := c.checkpointBufferedLocked(); err != nil {
+				return err
+			}
+			c.automaticCheckpoints.Add(1)
+		}
 	}
 	return c.ensureDirtyCapacityFor(
 		0,
@@ -400,6 +439,36 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 			storeio.CommonPrimaryLeafWideBytes,
 		),
 	)
+}
+
+// validatePrimarySchema enforces the collection's declared schema before a Put
+// is admitted, so a schema-violating document never changes a generation or
+// grows the file. It reuses the exact primitive the heap builder validates with
+// — Schema.ValidateIndex over a per-document vibejson.Index built with the
+// collection's index options — so a document admitted here is one a rebuild
+// would also accept. A schemaless collection returns immediately; the caller has
+// already proven src is well-formed JSON with vibejson.Validate, so the index
+// build cannot fail on structural grounds. It runs under the writer lock, so the
+// reused IndexEntry arena is writer-private.
+func (c *Collection) validatePrimarySchema(src []byte) error {
+	schema := c.options.Collection.Schema
+	if schema == nil {
+		return nil
+	}
+	// The index needs at most one entry per source byte plus the two envelope
+	// entries; sizing the arena up front keeps a steady-state schema Put from
+	// growing it (mirrors the heap builder's segment scratch).
+	if cap(c.schemaIndexScratch) < len(src)+2 {
+		c.schemaIndexScratch = make([]vibejson.IndexEntry, 0, len(src)+2)
+	}
+	index, err := vibejson.BuildIndexOptions(
+		src, c.schemaIndexScratch[:0], c.options.Collection.IndexOptions,
+	)
+	if err != nil {
+		return err
+	}
+	c.schemaIndexScratch = index.Entries
+	return schema.ValidateIndex(index)
 }
 
 func (c *Collection) putPrimary(
@@ -431,11 +500,13 @@ func (c *Collection) putPrimary(
 		return false, ErrKeyTooLarge
 	}
 	if len(src) == 0 ||
-		len(src) > c.options.MaxDocumentBytes ||
-		len(src) > c.options.InlineValueBytes {
+		len(src) > c.options.MaxDocumentBytes {
 		return false, ErrDocumentTooLarge
 	}
 	if err := vibejson.Validate(src); err != nil {
+		return false, err
+	}
+	if err := c.validatePrimarySchema(src); err != nil {
 		return false, err
 	}
 	state := c.state.Load()
@@ -455,10 +526,16 @@ func (c *Collection) putPrimary(
 	// epoch table into its veto (anyActiveReaders), so an active point read
 	// defers the canonical lane exactly as an active lease does; the sync
 	// journal lane stays eligible regardless of readers.
+	// A value past the inline budget stays on the canonical frame lane: it mints
+	// its out-of-line overflow chain as volatile buffered-dirty frames, so unlike
+	// the transactional path it writes no device bytes at Put and the checkpoint
+	// folds the chain into the durable graph. The in-place patch below still steps
+	// aside for it (an overflow descriptor is never an equal-length byte swap).
+	newOverflow := !c.primaryOverflowValueIsInline(len(src))
 	canonicalPath := c.canonicalFramePathEligible()
 	if canonicalPath {
 		if err := c.ensureBufferedPrimaryMutationCapacity(
-			resident,
+			resident, len(src),
 		); err != nil {
 			return false, err
 		}
@@ -492,19 +569,13 @@ func (c *Collection) putPrimary(
 	slot, raw, overflow, found := leaf.LookupRawHashed(
 		resident.Hash, keyBytes,
 	)
-	if overflow {
-		leafLease.Release()
-		return false, fmt.Errorf(
-			"%w: ordered primary overflow mutation",
-			ErrPrimaryCutoverUnsupported,
-		)
-	}
 	created = !found
 	trackFirstTouch := false
 	// A de-templated leaf's bytes do not alias the resident page, so the
 	// buffered in-place patch cannot apply: the rewrite below replaces the
-	// template page with a raw leaf.
-	if found && !detemplated {
+	// template page with a raw leaf. An overflow value on either side (old or new)
+	// is never an equal-length in-place byte swap, so it skips this path.
+	if found && !detemplated && !overflow && !newOverflow {
 		handled, track, inplaceErr := c.tryBufferedPrimaryInplace(
 			state, src, raw, resident.Ref, &leafLease,
 		)
@@ -570,6 +641,25 @@ func (c *Collection) putPrimary(
 		return created, nil
 	}
 	leafLease.Release()
+	// The journal-backed sync lane appends this Put's full-value redo record inside
+	// cowPrimaryMutation, at a point of no return where it can no longer force a
+	// checkpoint. Fold and recycle a journal that cannot hold the record now, using
+	// the real value length rather than the inline bound, so an out-of-line value's
+	// large record is guaranteed to fit.
+	if c.syncJournalLane() && !c.journal.Fits(len(keyBytes), len(src)) {
+		if err := c.checkpointBufferedLocked(); err != nil {
+			return false, err
+		}
+		c.automaticCheckpoints.Add(1)
+		state = c.state.Load()
+		if state == nil {
+			return false, ErrClosed
+		}
+		resident, err = c.currentPrimaryResidentRoute(state, keyBytes)
+		if err != nil {
+			return false, err
+		}
+	}
 	if c.deferredCanonicalLane() && len(c.primaryPendingParents) != 0 {
 		if err := c.materializePrimaryParentsLocked(); err != nil {
 			return false, err
@@ -598,15 +688,9 @@ func (c *Collection) putPrimary(
 		return false, err
 	}
 	defer path.Release()
-	slot, _, overflow, resolvedFound := path.leaf.LookupRawHashed(
+	slot, _, _, resolvedFound := path.leaf.LookupRawHashed(
 		path.leafRoute.Hash, keyBytes,
 	)
-	if overflow {
-		return false, fmt.Errorf(
-			"%w: ordered primary overflow mutation",
-			ErrPrimaryCutoverUnsupported,
-		)
-	}
 	if resolvedFound != found {
 		return false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
@@ -627,7 +711,13 @@ func (c *Collection) putPrimary(
 	if filledEmpty && c.primaryRouter.Load().ClearEmpty(resident) {
 		c.removePrimaryEmptyLeaf()
 	}
-	generation = state.root.Generation + 1
+	// The journal-backed sync lane made this mutation durable with an append+sync
+	// inside cowPrimaryMutation, so it never takes the committer root fence; the
+	// outer generation stays zero. Async and buffered-with-reader publish through
+	// the committer and record their applied generation here.
+	if !c.syncJournalLane() {
+		generation = state.root.Generation + 1
+	}
 	return created, nil
 }
 
@@ -670,7 +760,7 @@ func (c *Collection) deletePrimary(
 	}
 	if c.canonicalFramePathEligible() {
 		if err := c.ensureBufferedPrimaryMutationCapacity(
-			resident,
+			resident, 0,
 		); err != nil {
 			return false, err
 		}
@@ -701,19 +791,16 @@ func (c *Collection) deletePrimary(
 			leafLease.Release()
 			return false, detemplateErr
 		}
-		slot, _, overflow, found := leaf.LookupRawHashed(
+		// A deleted out-of-line value's chain retires on the canonical lane too:
+		// cowBufferedPrimaryMutation drops it if still volatile or defers it to the
+		// checkpoint if the base already made it durable, so the delete never has to
+		// leave the deferred lane for the transactional path.
+		slot, _, _, found := leaf.LookupRawHashed(
 			resident.Hash, keyBytes,
 		)
 		if !found {
 			leafLease.Release()
 			return false, nil
-		}
-		if overflow {
-			leafLease.Release()
-			return false, fmt.Errorf(
-				"%w: ordered primary overflow mutation",
-				ErrPrimaryCutoverUnsupported,
-			)
 		}
 		_, becameEmpty, _, mutationErr :=
 			c.cowBufferedPrimaryMutation(
@@ -736,10 +823,10 @@ func (c *Collection) deletePrimary(
 			c.primaryEmptyLeaves.Add(1)
 		}
 		ackGeneration := state.root.Generation + 1
-		// The journal-backed sync lane journaled this delete before publish
-		// inside cowBufferedPrimaryMutation, so the outer generation stays zero
-		// and it never takes the retired chain fence. Buffered-visible makes its
-		// volatile acknowledgement durable here.
+		// The journal-backed sync lane journaled this delete before publish inside
+		// cowBufferedPrimaryMutation, so the outer generation stays zero and it never
+		// takes the retired chain fence. Buffered-visible makes its volatile
+		// acknowledgement durable here.
 		if c.buffered() {
 			if err := c.journalAckLocked(
 				storeio.RecoveryRecordKindDelete, ackGeneration, keyBytes, nil,
@@ -771,17 +858,11 @@ func (c *Collection) deletePrimary(
 		return false, err
 	}
 	defer path.Release()
-	slot, _, overflow, found := path.leaf.LookupRawHashed(
+	slot, _, _, found := path.leaf.LookupRawHashed(
 		path.leafRoute.Hash, keyBytes,
 	)
 	if !found {
 		return false, nil
-	}
-	if overflow {
-		return false, fmt.Errorf(
-			"%w: ordered primary overflow mutation",
-			ErrPrimaryCutoverUnsupported,
-		)
 	}
 	if err := c.ensureDirtyCapacityFor(
 		c.options.singleDocumentTransactionPages,
@@ -799,7 +880,12 @@ func (c *Collection) deletePrimary(
 	if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 		c.primaryEmptyLeaves.Add(1)
 	}
-	generation = state.root.Generation + 1
+	// The journal-backed sync lane made this delete durable inside
+	// cowPrimaryMutation; the outer generation stays zero and never takes the
+	// committer fence.
+	if !c.syncJournalLane() {
+		generation = state.root.Generation + 1
+	}
 	return true, nil
 }
 
@@ -866,8 +952,7 @@ func (c *Collection) replaceBufferedPrimaryInplace(
 	nextSuper.Generation = generation
 	nextState := &fileStoreState{
 		root: nextRoot, super: nextSuper,
-		keyRoot: state.keyRoot, chunkRoot: state.chunkRoot,
-		indexRoot: state.indexRoot, freeHead: state.freeHead,
+		freeHead: state.freeHead,
 	}
 	c.bufferedValueBefore = append(c.bufferedValueBefore[:0], old...)
 	before := c.bufferedValueBefore
@@ -949,10 +1034,61 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		pending = c.primaryPendingParents[pendingIndex]
 	}
 
+	// The new pages this mutation admits occupy the collection's volatile file
+	// region above the current FileEnd. The first pending parent reserves a gap
+	// wide enough for one worst-case checkpoint transaction below it, so a later
+	// materialize allocates its durable pages from the checkpoint base's FileEnd
+	// without colliding with any volatile page.
+	baseOffset := state.super.FileEnd
+	if len(c.primaryPendingParents) == 0 {
+		gap := uint64(c.options.maxTransactionPages) *
+			uint64(c.options.MaxPageSize)
+		if baseOffset > math.MaxUint64-gap {
+			return storeio.PageRef{}, false, false,
+				storeio.ErrInvalidWrite
+		}
+		baseOffset += gap
+	}
+
+	// An oversized value is stored out of line as a VOLATILE overflow chain minted
+	// just below the new leaf. The leaf then carries only the chain head, exactly
+	// as the transactional path does; the visible FileEnd/NextLogicalID advance to
+	// cover the chain so the head and every link validate, and the checkpoint
+	// re-mints the chain durable and patches the head in place. No device bytes are
+	// written at Put.
+	value := storeio.CommonPrimaryLeafValue{Inline: src}
+	var overflowBytes uint64
+	var overflowPages int
 	preparePath := filePrimaryMutationPath{leaf: *leaf}
+	if !deleting && !c.primaryOverflowValueIsInline(len(src)) {
+		head, ovBytes, ovPages, mintErr := c.mintBufferedPrimaryOverflowChain(
+			src, generation, baseOffset, state.root.NextLogicalID,
+		)
+		if mintErr != nil {
+			return storeio.PageRef{}, false, false, mintErr
+		}
+		value = storeio.CommonPrimaryLeafValue{Overflow: head}
+		overflowBytes, overflowPages = ovBytes, ovPages
+		// The leaf embeds the freshly minted head, so it must be encoded against
+		// ceilings that already cover the chain rather than the published state's.
+		// The chain ends at the leaf offset, so a FileEnd there and a NextLogicalID
+		// past the last extent validate the head and every forward link.
+		releaf, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+			leaf.PersistentBytes(), c.storeID, resident.Bucket,
+			storeio.CommonPrimaryLeafBounds{
+				FileEnd:           baseOffset + overflowBytes,
+				NextLogicalID:     state.root.NextLogicalID + uint64(overflowPages),
+				AllocationQuantum: state.root.PageSize,
+			},
+		)
+		if admitErr != nil {
+			return storeio.PageRef{}, false, false, admitErr
+		}
+		preparePath.leaf = releaf
+	}
+
 	leafImage, leafBytes, prepareErr := c.preparePrimaryLeafMutation(
-		&preparePath, generation, key, src,
-		deleting, found, slot,
+		&preparePath, generation, key, value, deleting, found, slot,
 	)
 	if prepareErr != nil {
 		return storeio.PageRef{}, false, false, prepareErr
@@ -960,22 +1096,45 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	becameEmpty = deleting && leaf.Len() == 1
 	filledEmpty = !deleting && !found && leaf.Len() == 0
 
-	offset := state.super.FileEnd
-	if len(c.primaryPendingParents) == 0 {
-		gap := uint64(c.options.maxTransactionPages) *
-			uint64(c.options.MaxPageSize)
-		if offset > math.MaxUint64-gap {
-			return storeio.PageRef{}, false, false,
-				storeio.ErrInvalidWrite
+	// A replaced or deleted out-of-line value's old chain retires. A chain still
+	// volatile (minted since the checkpoint base) drops with the superseded leaf as
+	// a memory-only frame set; a chain the checkpoint base already made durable is
+	// retired against that base at the next materialize.
+	oldOverflowVolatile := false
+	c.overflowRetireScratch = c.overflowRetireScratch[:0]
+	if found {
+		if _, oldValue, ok := leaf.LookupHashed(
+			resident.Hash, key,
+		); ok && oldValue.IsOverflow() {
+			extents, cErr := c.collectPrimaryOverflowExtents(
+				c.overflowRetireScratch[:0], oldValue.Overflow,
+				c.primaryLeafBounds(state),
+			)
+			if cErr != nil {
+				return storeio.PageRef{}, false, false, cErr
+			}
+			c.overflowRetireScratch = extents
+			base := c.primaryCheckpointBaseState()
+			oldOverflowVolatile = base != nil &&
+				oldValue.Overflow.Offset >= base.super.FileEnd
+			if !oldOverflowVolatile &&
+				len(c.primaryPendingOverflowRetire)+len(extents) >
+					cap(c.primaryPendingOverflowRetire) {
+				return storeio.PageRef{}, false, false, fmt.Errorf(
+					"%w: buffered primary overflow retirements",
+					storeio.ErrRetiredExtentCapacity,
+				)
+			}
 		}
-		offset += gap
 	}
-	if offset > math.MaxUint64-uint64(leafBytes) {
+
+	leafOffset := baseOffset + overflowBytes
+	if leafOffset > math.MaxUint64-uint64(leafBytes) {
 		return storeio.PageRef{}, false, false,
 			storeio.ErrInvalidWrite
 	}
 	nextLeaf = storeio.PageRef{
-		Offset: offset, LogicalID: resident.Ref.LogicalID,
+		Offset: leafOffset, LogicalID: resident.Ref.LogicalID,
 		Generation: generation, Length: uint32(leafBytes),
 		Kind: storeio.PagePrimaryLeaf,
 	}
@@ -993,6 +1152,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 
 	nextRoot := state.root
 	nextRoot.Generation = generation
+	nextRoot.NextLogicalID = state.root.NextLogicalID + uint64(overflowPages)
 	if deleting {
 		nextRoot.DocumentCount--
 	} else if !found {
@@ -1000,11 +1160,10 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	}
 	nextSuper := state.super
 	nextSuper.Generation = generation
-	nextSuper.FileEnd = offset + uint64(leafBytes)
+	nextSuper.FileEnd = leafOffset + uint64(leafBytes)
 	nextState := &fileStoreState{
 		root: nextRoot, super: nextSuper,
-		keyRoot: state.keyRoot, chunkRoot: state.chunkRoot,
-		indexRoot: state.indexRoot, freeHead: state.freeHead,
+		freeHead: state.freeHead,
 	}
 
 	// Re-derive the rewritten bucket's exact-index postings from the new leaf
@@ -1053,8 +1212,18 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	c.retirePrimaryVolatileRefLocked(previousVolatile)
+	if oldOverflowVolatile {
+		for _, ref := range c.overflowRetireScratch {
+			c.retirePrimaryVolatileRefLocked(ref)
+		}
+	}
 	c.endReaderFence()
 	c.snapshotGate.Unlock()
+	if !oldOverflowVolatile && len(c.overflowRetireScratch) != 0 {
+		c.primaryPendingOverflowRetire = append(
+			c.primaryPendingOverflowRetire, c.overflowRetireScratch...,
+		)
+	}
 	return nextLeaf, becameEmpty, filledEmpty, nil
 }
 
@@ -1076,25 +1245,10 @@ func (c *Collection) cowPrimaryMutation(
 		return storeio.PageRef{}, false, false,
 			storeio.ErrGenerationOrder
 	}
-	leafImage, leafBytes, prepareErr := c.preparePrimaryLeafMutation(
-		path, generation, key, src, deleting, found, slot,
-	)
-	if prepareErr != nil {
-		return storeio.PageRef{}, false, false, prepareErr
-	}
-	becameEmpty = deleting && path.leaf.Len() == 1
-	filledEmpty = !deleting && !found && path.leaf.Len() == 0
-	// Re-derive the rewritten bucket's exact-index postings before opening the
-	// transaction, so a build failure aborts without staging anything. The fresh
-	// resident snapshot is wrapped into durable pages inside this same
-	// transaction below and installed at publish, keeping the index and the graph
-	// in one atomic generation.
-	preparedExact, prepareExactErr := c.preparePrimaryExactLeaf(
-		leafImage, resident.Bucket, c.primaryLeafBounds(state),
-	)
-	if prepareExactErr != nil {
-		return storeio.PageRef{}, false, false, prepareExactErr
-	}
+	// The transaction opens before the leaf is encoded so an out-of-line overflow
+	// chain can be minted inside it and its head threaded into the leaf image:
+	// leaf and overflow extents then publish atomically in one generation, with no
+	// window in which the value is allocated but unreachable.
 	if err := c.refreshReusableFor(
 		state,
 		c.options.singleDocumentTransactionPages,
@@ -1132,6 +1286,66 @@ func (c *Collection) cowPrimaryMutation(
 	}()
 	c.retireScratch = c.retireScratch[:0]
 	c.retireRefScratch = c.retireRefScratch[:0]
+
+	// A value past the inline budget is stored out of line. The chain is minted in
+	// this transaction, so the leaf must be encoded against the transaction's
+	// advanced FileEnd/NextLogicalID for the freshly minted head reference to
+	// validate; the mutation leaf view is re-admitted against those bounds.
+	value := storeio.CommonPrimaryLeafValue{Inline: src}
+	leafBounds := c.primaryLeafBounds(state)
+	if !deleting && !c.primaryOverflowValueIsInline(len(src)) {
+		firstRef, ovErr := c.stagePrimaryOverflowChain(tx, src, generation)
+		if ovErr != nil {
+			return storeio.PageRef{}, false, false, ovErr
+		}
+		value = storeio.CommonPrimaryLeafValue{Overflow: firstRef}
+		leafBounds = c.primaryMutationLeafBounds(tx)
+		releaf, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+			path.leafLease.Page(), c.storeID, path.leafRoute.Bucket, leafBounds,
+		)
+		if admitErr != nil {
+			return storeio.PageRef{}, false, false, admitErr
+		}
+		path.leaf = releaf
+	}
+	// Retire the superseded value's overflow chain, if the replaced or deleted key
+	// held one, through the ordinary retirement accounting.
+	if found {
+		if _, oldValue, ok := path.leaf.LookupHashed(
+			path.leafRoute.Hash, key,
+		); ok && oldValue.IsOverflow() {
+			extents, cErr := c.collectPrimaryOverflowExtents(
+				c.overflowRetireScratch[:0], oldValue.Overflow,
+				c.primaryLeafBounds(state),
+			)
+			if cErr != nil {
+				return storeio.PageRef{}, false, false, cErr
+			}
+			c.overflowRetireScratch = extents
+			for _, ref := range extents {
+				if err := c.appendPrimaryRetirement(state, ref); err != nil {
+					return storeio.PageRef{}, false, false, err
+				}
+			}
+		}
+	}
+	leafImage, leafBytes, prepareErr := c.preparePrimaryLeafMutation(
+		path, generation, key, value, deleting, found, slot,
+	)
+	if prepareErr != nil {
+		return storeio.PageRef{}, false, false, prepareErr
+	}
+	becameEmpty = deleting && path.leaf.Len() == 1
+	filledEmpty = !deleting && !found && path.leaf.Len() == 0
+	// Re-derive the rewritten bucket's exact-index postings from the staged leaf
+	// image against the same bounds it was encoded under, so the index and the
+	// graph publish in one atomic generation.
+	preparedExact, prepareExactErr := c.preparePrimaryExactLeaf(
+		leafImage, resident.Bucket, leafBounds,
+	)
+	if prepareExactErr != nil {
+		return storeio.PageRef{}, false, false, prepareExactErr
+	}
 
 	// Draw the rewritten leaf toward its sorted-rank target so churn pulls leaves
 	// back into lexical order instead of scattering them to the file tail and
@@ -1341,6 +1555,17 @@ func (c *Collection) cowPrimaryMutation(
 			fmt.Errorf("vibejson: reserve retired extents: %w", err)
 	}
 	retirementReserved = true
+	// The journal-backed sync lane reaches this transactional path only for an
+	// out-of-line value (or the retirement of one), which mints page identities
+	// the canonical frame lane cannot. Append and sync its redo record at the
+	// point of no return — after every fallible prepare and before publish — so no
+	// reader observes the mutation before it is durable, exactly as the canonical
+	// lane does. It is a no-op for async and buffered-with-reader.
+	if err := c.journalBeforePublishLocked(
+		deleting, generation, key, src,
+	); err != nil {
+		return storeio.PageRef{}, false, false, err
+	}
 	if err := c.publishStagedPrimaryMutation(
 		tx, nextState, nextInline, freeLog,
 		resident, nextLeaf, preparedExact,
@@ -1349,6 +1574,21 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	abort = false
 	return nextLeaf, becameEmpty, filledEmpty, nil
+}
+
+// primaryCheckpointBaseState returns the state the next materialize will derive
+// its checkpoint from — the durable state, or a newer flush-less cut recorded in
+// primaryCheckpointBase — without the clearing side effect materialize applies.
+// A page whose offset is at or above this base's FileEnd is volatile (minted by a
+// buffered mutation since the base and never written to device); one below it is
+// durable. It is the discriminator for retiring a superseded overflow chain.
+func (c *Collection) primaryCheckpointBaseState() *fileStoreState {
+	base := c.durableState.Load()
+	if cp := c.primaryCheckpointBase; cp != nil &&
+		(base == nil || cp.root.Generation > base.root.Generation) {
+		base = cp
+	}
+	return base
 }
 
 func (c *Collection) materializePrimaryParentsLocked() (err error) {
@@ -1360,11 +1600,15 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		len(c.primaryVolatileRetired)+
 			len(c.primaryPendingParents) >
 			cap(c.primaryVolatileRetired) {
-		return fmt.Errorf(
+		// An active reader pins the volatile frames this materialize would retire, so
+		// the table cannot drain. Name the pinning snapshot and generation through
+		// the shared retirement diagnostic rather than surfacing a bare capacity
+		// number an operator cannot act on.
+		return c.absorbRetirementPressure(fmt.Errorf(
 			"%w: buffered primary volatile-reference capacity %d",
 			storeio.ErrRetiredExtentCapacity,
 			cap(c.primaryVolatileRetired),
-		)
+		))
 	}
 	// The base is the previous primary checkpoint, not necessarily the durable
 	// one. A flush-less materialize (Snapshot, snapshot-contended mutation) leaves
@@ -1435,6 +1679,8 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	}()
 	c.retireScratch = c.retireScratch[:0]
 	c.retireRefScratch = c.retireRefScratch[:0]
+	c.primaryCheckpointVolatileOverflow =
+		c.primaryCheckpointVolatileOverflow[:0]
 
 	layout, layoutErr := storeio.MutableStoreLayout(uint32(c.options.PageSize))
 	if layoutErr != nil {
@@ -1485,7 +1731,50 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		)
 		if initErr == nil {
 			copy(payload, lease.Payload())
-			_, initErr = storeio.SealPage(page.Bytes())
+			// A leaf carrying a volatile overflow head must have its chain minted
+			// durable in this checkpoint transaction and its head patched to the
+			// durable one in place before the leaf seals; a head the base already
+			// made durable is carried forward untouched. Reading the volatile chain
+			// resolves against the visible bounds it was minted under.
+			view := storeio.AdmittedCommonPrimaryLeaf(
+				lease.Page(), c.storeID, pending.leafRoute.Bucket,
+				c.primaryLeafBounds(visible),
+			)
+			if view.HasOverflowRows() {
+				initErr = view.RewriteOverflowRefs(
+					payload,
+					func(head storeio.PageRef) (storeio.PageRef, error) {
+						if head.Offset < base.super.FileEnd {
+							return head, nil
+						}
+						resolved, rErr := c.appendPrimaryOverflowValue(
+							c.overflowValueScratch[:0], head,
+							c.primaryLeafBounds(visible),
+						)
+						if rErr != nil {
+							return storeio.PageRef{}, rErr
+						}
+						c.overflowValueScratch = resolved
+						// The volatile chain is now superseded by the durable one
+						// minted below; record its extents so their memory-only frames
+						// drop once this checkpoint publishes.
+						extents, cErr := c.collectPrimaryOverflowExtents(
+							c.primaryCheckpointVolatileOverflow, head,
+							c.primaryLeafBounds(visible),
+						)
+						if cErr != nil {
+							return storeio.PageRef{}, cErr
+						}
+						c.primaryCheckpointVolatileOverflow = extents
+						return c.stagePrimaryOverflowChain(
+							tx, resolved, generation,
+						)
+					},
+				)
+			}
+			if initErr == nil {
+				_, initErr = storeio.SealPage(page.Bytes())
+			}
 		}
 		lease.Release()
 		if initErr != nil {
@@ -1498,6 +1787,16 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		if appendErr := c.appendPrimaryRetirement(
 			base, pending.leafRoute.Ref,
 		); appendErr != nil {
+			return appendErr
+		}
+	}
+
+	// Retire the durable overflow chains that buffered Puts and Deletes superseded
+	// since the base. Their pages predate this checkpoint, so they retire against
+	// the base generation through the same reclaim accounting as the graph pages
+	// above; the just-minted durable re-materializations above are unaffected.
+	for _, ref := range c.primaryPendingOverflowRetire {
+		if appendErr := c.appendPrimaryRetirement(base, ref); appendErr != nil {
 			return appendErr
 		}
 	}
@@ -1987,6 +2286,13 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 			c.primaryPendingParents[index].volatileRef,
 		)
 	}
+	// Drop the memory-only frames of every volatile overflow chain this checkpoint
+	// re-minted durable, deferring past an active reader exactly as the volatile
+	// leaves above do (a snapshot pinning the pre-checkpoint leaf still resolves the
+	// old chain until it releases).
+	for _, ref := range c.primaryCheckpointVolatileOverflow {
+		c.retirePrimaryVolatileRefLocked(ref)
+	}
 	c.endReaderFence()
 	c.snapshotGate.Unlock()
 	c.finalizeReusable()
@@ -1994,6 +2300,8 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	c.inlineFree = nextInline
 	clear(c.primaryPendingParents)
 	c.primaryPendingParents = c.primaryPendingParents[:0]
+	clear(c.primaryPendingOverflowRetire)
+	c.primaryPendingOverflowRetire = c.primaryPendingOverflowRetire[:0]
 	// Record the published cut so the next materialize derives its base from it
 	// rather than a durableState a flush has not yet advanced. A following
 	// checkpointBufferedLocked flush advances durableState past this generation,
@@ -2005,7 +2313,8 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 func (c *Collection) preparePrimaryLeafMutation(
 	path *filePrimaryMutationPath,
 	generation uint64,
-	key, src []byte,
+	key []byte,
+	value storeio.CommonPrimaryLeafValue,
 	deleting, found bool,
 	slot uint8,
 ) ([]byte, int, error) {
@@ -2020,25 +2329,22 @@ func (c *Collection) preparePrimaryLeafMutation(
 		page, err = path.leaf.DeleteTo(dst, generation, slot, key)
 	case found:
 		page, err = path.leaf.UpdateTo(
-			dst, generation, slot, key,
-			storeio.CommonPrimaryLeafValue{Inline: src},
+			dst, generation, slot, key, value,
 		)
 		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) {
 			page, err = storeio.PromoteCommonPrimaryLeafUpdateTo(
 				c.primaryLeafScratch, generation, &path.leaf,
-				slot, key,
-				storeio.CommonPrimaryLeafValue{Inline: src},
+				slot, key, value,
 			)
 		}
 	default:
 		page, _, err = path.leaf.InsertTo(
-			dst, generation, key,
-			storeio.CommonPrimaryLeafValue{Inline: src},
+			dst, generation, key, value,
 		)
 		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) {
 			page, _, err = storeio.PromoteCommonPrimaryLeafInsertTo(
 				c.primaryLeafScratch, generation, &path.leaf,
-				key, storeio.CommonPrimaryLeafValue{Inline: src},
+				key, value,
 			)
 		}
 	}
@@ -2074,6 +2380,20 @@ func (c *Collection) primaryLeafBounds(
 		FileEnd:           state.super.FileEnd,
 		NextLogicalID:     state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
+	}
+}
+
+// primaryMutationLeafBounds are the leaf-admission bounds for a leaf encoded
+// mid-transaction: a value's overflow chain minted in tx advances FileEnd and
+// NextLogicalID, so the leaf that embeds the fresh head reference must validate
+// against the transaction's advanced ceilings, not the published state's.
+func (c *Collection) primaryMutationLeafBounds(
+	tx *storeio.WriteTransaction,
+) storeio.CommonPrimaryLeafBounds {
+	return storeio.CommonPrimaryLeafBounds{
+		FileEnd:           tx.FileEnd(),
+		NextLogicalID:     tx.NextLogicalID(),
+		AllocationQuantum: uint32(c.options.PageSize),
 	}
 }
 
@@ -2136,8 +2456,7 @@ func (c *Collection) stagePrimaryState(
 	}
 	return &fileStoreState{
 		root: root, super: super,
-		keyRoot: old.keyRoot, chunkRoot: old.chunkRoot,
-		indexRoot: old.indexRoot, freeHead: freeHead,
+		freeHead: freeHead,
 	}, *inlineFree, nil
 }
 

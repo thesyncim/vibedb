@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"fmt"
 	"runtime"
 	"strings"
@@ -48,7 +47,7 @@ func TestStoreBuilderSelectsOwnedNarrowTapeWidths(t *testing.T) {
 					t.Fatalf("row %d tape kind = %d, want %d", row, ref.kind, tc.kind)
 				}
 			}
-			assertOwnedCollectionRoundTrip(t, collection, "k1", tc.doc, "/a")
+			assertOwnedCollection(t, collection, "k1", tc.doc, "/a")
 		})
 	}
 }
@@ -89,7 +88,7 @@ func TestStoreBuilderSelectsOwnedTemplateSpanWidths(t *testing.T) {
 					t.Fatalf("row %d ref = %+v, want kind %d template 0", row, ref, tc.kind)
 				}
 			}
-			assertOwnedCollectionRoundTrip(t, collection, "k1", tc.doc, "/a/x")
+			assertOwnedCollection(t, collection, "k1", tc.doc, "/a/x")
 		})
 	}
 }
@@ -131,7 +130,7 @@ func TestStoreBuilderTemplatesComposeWithValueDictionary(t *testing.T) {
 	if err != nil || allocs != 0 {
 		t.Fatalf("template dictionary pointer allocs/error = %.2f/%v", allocs, err)
 	}
-	assertOwnedCollectionRoundTrip(t, collection, "k7", doc, "/profile/label")
+	assertOwnedCollection(t, collection, "k7", doc, "/profile/label")
 }
 
 func TestStoreBuilderCompactRefsRecoverTrimmedRoot(t *testing.T) {
@@ -157,18 +156,6 @@ func TestStoreBuilderCompactRefsRecoverTrimmedRoot(t *testing.T) {
 			roots, err := snap37.AppendPointer(nil, vibejson.MustCompilePointer(""))
 			if err != nil || len(roots) != 2 || string(roots[1].Bytes()) != tc.root {
 				t.Fatalf("root column = (%q, %v), want %q", roots[1].Bytes(), err, tc.root)
-			}
-			var image bytes.Buffer
-			if _, err := collection.WriteTo(&image); err != nil {
-				t.Fatal(err)
-			}
-			reopened, err := Open(image.Bytes())
-			if err != nil {
-				t.Fatal(err)
-			}
-			index, ok = reopened.Get("k1")
-			if !ok || string(index.Root().Raw().Bytes()) != tc.root {
-				t.Fatalf("reopened root = (%q, %v), want %q", index.Root().Raw().Bytes(), ok, tc.root)
 			}
 		})
 	}
@@ -282,7 +269,7 @@ func buildOwnedLayoutCollection(t *testing.T, doc string, rows int) *Collection 
 	return collection
 }
 
-func assertOwnedCollectionRoundTrip(t *testing.T, collection *Collection, key, want, pointer string) {
+func assertOwnedCollection(t *testing.T, collection *Collection, key, want, pointer string) {
 	t.Helper()
 	index, ok := collection.Get(key)
 	if !ok || string(index.Root().Raw().Bytes()) != want {
@@ -291,16 +278,5 @@ func assertOwnedCollectionRoundTrip(t *testing.T, collection *Collection, key, w
 	node, ok, err := index.Pointer(pointer)
 	if err != nil || !ok || len(node.Raw().Bytes()) == 0 {
 		t.Fatalf("Pointer(%q) = (%q, %v, %v)", pointer, node.Raw().Bytes(), ok, err)
-	}
-	var image bytes.Buffer
-	if _, err := collection.WriteTo(&image); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(image.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if raw, ok := reopened.GetRaw(key); !ok || string(raw.Bytes()) != want {
-		t.Fatalf("reopened GetRaw(%q) = (%q, %v)", key, raw.Bytes(), ok)
 	}
 }

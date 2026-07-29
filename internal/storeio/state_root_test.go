@@ -17,7 +17,15 @@ func testStatePageRef(kind PageKind, page, logical, generation uint64) PageRef {
 	}
 }
 
+// testStateRoot returns a valid populated ordered-primary state root: an empty
+// chunk census (the chunk layout is gone), a published PrimaryRoot as the sole
+// document root, and the immutable admission bounds. fileEnd covers the primary
+// catalog extent exactly.
 func testStateRoot(generation uint64) (StateRoot, uint64) {
+	layout, err := MutableStoreLayout(testSuperblockPageSize)
+	if err != nil {
+		panic(err)
+	}
 	root := StateRoot{
 		StoreID:          testStoreID,
 		Generation:       generation,
@@ -25,24 +33,21 @@ func testStateRoot(generation uint64) (StateRoot, uint64) {
 		MaxPageSize:      64 << 10,
 		Options:          StateOptionShapeTapes | StateOptionHashKeys,
 		DocumentCount:    129,
-		NextLogicalID:    10,
-		ChunkHighWater:   4,
-		LiveChunks:       3,
+		NextLogicalID:    PrimaryFirstDynamicLogicalID,
 		ChunkDocuments:   64,
-		IndexCount:       2,
-		IndexMaxDepth:    1024,
-		IndexCatalogHash: 0x123456789abcdef0,
-		PageCatalogHead:  testStatePageRef(PageCatalogSegment, 7, 5, generation),
-		PageCatalogBytes: PageCatalogCanonicalHeaderSize,
-		FreeChunkHint:    2,
 		MaxKeyBytes:      256,
 		InlineValueBytes: 512,
 		MaxDocumentBytes: 4 << 20,
-		ChunkDirectory:   testStatePageRef(PageChunkDirectory, 4, 2, generation),
-		KeyDirectory:     testStatePageRef(PageKeyDirectory, 5, 3, generation),
-		IndexDirectory:   testStatePageRef(PageIndexDirectory, 6, 4, generation),
+		PrimaryRoot: PageRef{
+			Offset:     layout.DataStart,
+			LogicalID:  PrimaryCatalogRootLogicalID,
+			Generation: generation,
+			Length:     GlobalTabletCatalogRootBytes,
+			Kind:       PagePrimaryCatalog,
+		},
 	}
-	return root, 8 * uint64(testSuperblockPageSize)
+	fileEnd := layout.DataStart + uint64(GlobalTabletCatalogRootBytes)
+	return root, fileEnd
 }
 
 func TestStateRootPageRoundTrip(t *testing.T) {
@@ -66,31 +71,8 @@ func TestStateRootPageRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStateRootFingerprintDirectoryKindRoundTrip(t *testing.T) {
-	want, fileEnd := testStateRoot(11)
-	want.KeyDirectory.Kind = PageFingerprintDirectory
-	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
-	if err != nil || got != want {
-		t.Fatalf("fingerprint state root = (%+v,%v), want (%+v,nil)", got, err, want)
-	}
-}
-
 func TestStateRootPrimaryRootRoundTrip(t *testing.T) {
-	want, _ := testStateRoot(11)
-	want.NextLogicalID = PrimaryFirstDynamicLogicalID
-	want.PrimaryRoot = PageRef{
-		Offset:     16 * uint64(testSuperblockPageSize),
-		LogicalID:  PrimaryCatalogRootLogicalID,
-		Generation: want.Generation,
-		Length:     GlobalTabletCatalogRootBytes,
-		Kind:       PagePrimaryCatalog,
-	}
-	fileEnd := want.PrimaryRoot.Offset + uint64(want.PrimaryRoot.Length)
+	want, fileEnd := testStateRoot(11)
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeStateRootPage(page, want, fileEnd)
 	if err != nil {
@@ -127,11 +109,31 @@ func TestStateRootPrimaryRootRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStateRootFloat64ScanHeadRoundTrip(t *testing.T) {
+// TestStateRootExactIndexRootRoundTrip covers the ordered-primary exact-index
+// root, published as posting tiles beside the ordered graph, together with the
+// canonical catalog its index count requires.
+func TestStateRootExactIndexRootRoundTrip(t *testing.T) {
 	want, _ := testStateRoot(11)
-	want.Options |= StateOptionFloat64Columns
-	want.Float64ScanHead = testStatePageRef(PageFloat64Catalog, 8, 6, want.Generation)
-	fileEnd := 9 * uint64(testSuperblockPageSize)
+	layout, err := MutableStoreLayout(testSuperblockPageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterPrimary := layout.DataStart + uint64(GlobalTabletCatalogRootBytes)
+	want.IndexCount = 2
+	want.IndexMaxDepth = 1024
+	want.IndexCatalogHash = 0x123456789abcdef0
+	want.PageCatalogHead = PageRef{
+		Offset: afterPrimary, LogicalID: PrimaryCatalogRootLogicalID + 1,
+		Generation: want.Generation, Length: testSuperblockPageSize,
+		Kind: PageCatalogSegment,
+	}
+	want.PageCatalogBytes = PageCatalogCanonicalHeaderSize
+	want.ExactIndexRoot = PageRef{
+		Offset: afterPrimary + uint64(testSuperblockPageSize),
+		LogicalID: PrimaryCatalogRootLogicalID + 2, Generation: want.Generation,
+		Length: testSuperblockPageSize, Kind: PagePrimaryExactRoot,
+	}
+	fileEnd := afterPrimary + 2*uint64(testSuperblockPageSize)
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeStateRootPage(page, want, fileEnd)
 	if err != nil {
@@ -139,13 +141,17 @@ func TestStateRootFloat64ScanHeadRoundTrip(t *testing.T) {
 	}
 	got, err := DecodeStateRootPage(encoded, fileEnd)
 	if err != nil || got != want {
-		t.Fatalf("float64 state root = (%+v,%v), want (%+v,nil)", got, err, want)
+		t.Fatalf("exact-index state root = (%+v,%v), want (%+v,nil)", got, err, want)
 	}
 
+	// The exact-index root may not appear without a declared index count.
 	invalid := want
-	invalid.Options &^= StateOptionFloat64Columns
+	invalid.IndexCount = 0
+	invalid.PageCatalogHead = PageRef{}
+	invalid.PageCatalogBytes = 0
+	invalid.IndexCatalogHash = 0
 	if _, err := EncodeStateRootPage(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
-		t.Fatalf("scan head without columns = %v, want %v", err, ErrInvalidWrite)
+		t.Fatalf("exact root without index = %v, want %v", err, ErrInvalidWrite)
 	}
 }
 
@@ -237,31 +243,6 @@ func TestStateRootCanonicalMaterializationRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStateRootIndexGroupHeadRoundTrip(t *testing.T) {
-	want, _ := testStateRoot(11)
-	want.IndexGroupHead = testStatePageRef(
-		PageIndexGroupCatalog, 8, 6, want.Generation,
-	)
-	fileEnd := 9 * uint64(testSuperblockPageSize)
-	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
-	if err != nil || got != want {
-		t.Fatalf("index group state root = (%+v,%v), want (%+v,nil)", got, err, want)
-	}
-
-	invalid := want
-	invalid.IndexCount = 0
-	invalid.IndexCatalogHash = 0
-	invalid.IndexDirectory = PageRef{}
-	if _, err := EncodeStateRootPage(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
-		t.Fatalf("group head without index = %v, want %v", err, ErrInvalidWrite)
-	}
-}
-
 func TestStateRootValidation(t *testing.T) {
 	valid, fileEnd := testStateRoot(11)
 	for _, test := range []struct {
@@ -283,30 +264,18 @@ func TestStateRootValidation(t *testing.T) {
 		}},
 		{"chunk documents", func(root *StateRoot, _ *uint64) { root.ChunkDocuments = 65 }},
 		{"live high water", func(root *StateRoot, _ *uint64) { root.LiveChunks = root.ChunkHighWater + 1 }},
-		{"document minimum", func(root *StateRoot, _ *uint64) { root.DocumentCount = 2 }},
-		{"document maximum", func(root *StateRoot, _ *uint64) { root.DocumentCount = 193 }},
 		{"free chunk hint", func(root *StateRoot, _ *uint64) { root.FreeChunkHint = root.ChunkHighWater + 1 }},
-		{"next logical id", func(root *StateRoot, _ *uint64) { root.NextLogicalID = 4 }},
-		{"missing chunk root", func(root *StateRoot, _ *uint64) { root.ChunkDirectory = PageRef{} }},
-		{"wrong key kind", func(root *StateRoot, _ *uint64) { root.KeyDirectory.Kind = PageIndexDirectory }},
-		{"future generation", func(root *StateRoot, _ *uint64) { root.IndexDirectory.Generation++ }},
-		{"short ref", func(root *StateRoot, _ *uint64) { root.IndexDirectory.Length-- }},
-		{"unaligned ref", func(root *StateRoot, _ *uint64) { root.ChunkDirectory.Offset++ }},
-		{"outside file", func(root *StateRoot, _ *uint64) { root.ChunkDirectory.Offset = fileEnd }},
-		{"duplicate logical", func(root *StateRoot, _ *uint64) { root.KeyDirectory.LogicalID = root.ChunkDirectory.LogicalID }},
-		{"duplicate physical", func(root *StateRoot, _ *uint64) { root.KeyDirectory.Offset = root.ChunkDirectory.Offset }},
-		{"catalog without bytes", func(root *StateRoot, _ *uint64) { root.PageCatalogBytes = 0 }},
-		{"catalog without head", func(root *StateRoot, _ *uint64) { root.PageCatalogHead = PageRef{} }},
-		{"catalog without fast hash", func(root *StateRoot, _ *uint64) { root.IndexCatalogHash = 0 }},
-		{"catalog physical overlap", func(root *StateRoot, _ *uint64) {
-			root.PageCatalogHead.Offset = root.ChunkDirectory.Offset
+		{"next logical id", func(root *StateRoot, _ *uint64) { root.NextLogicalID = StateRootLogicalID }},
+		{"missing primary namespace", func(root *StateRoot, _ *uint64) {
+			root.NextLogicalID = PrimaryFirstDynamicLogicalID - 1
 		}},
-		{"catalog logical overlap", func(root *StateRoot, _ *uint64) {
-			root.PageCatalogHead.LogicalID = root.ChunkDirectory.LogicalID
-		}},
-		{"catalog run outside file", func(root *StateRoot, _ *uint64) {
-			capacity, _ := pageCatalogSegmentDataCapacity(root.PageSize)
-			root.PageCatalogBytes = uint32(capacity + 1)
+		{"wrong primary kind", func(root *StateRoot, _ *uint64) { root.PrimaryRoot.Kind = PageTabletRoute }},
+		{"future primary generation", func(root *StateRoot, _ *uint64) { root.PrimaryRoot.Generation++ }},
+		{"short primary ref", func(root *StateRoot, _ *uint64) { root.PrimaryRoot.Length-- }},
+		{"unaligned primary ref", func(root *StateRoot, _ *uint64) { root.PrimaryRoot.Offset++ }},
+		{"primary outside file", func(root *StateRoot, _ *uint64) { root.PrimaryRoot.Offset = fileEnd }},
+		{"exact root without index", func(root *StateRoot, _ *uint64) {
+			root.ExactIndexRoot = testStatePageRef(PagePrimaryExactRoot, 2, 3, root.Generation)
 		}},
 		{"unaligned file end", func(_ *StateRoot, end *uint64) { (*end)-- }},
 	} {
@@ -342,10 +311,14 @@ func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 	if _, err := EncodeStateRootPage(page, root, fileEnd); err != nil {
 		t.Fatal(err)
 	}
+	// The retired chunk/fingerprint slots and the trailing reserved region must
+	// decode as entirely blank; any set bit is semantic corruption a valid
+	// checksum cannot hide.
 	for _, offset := range []int{
-		PageHeaderSize + 152,
-		PageHeaderSize + 184,
-		PageHeaderSize + 56 + 30,
+		PageHeaderSize + stateRootChunkRefOffset,
+		PageHeaderSize + stateRootFloat64Offset,
+		PageHeaderSize + stateRootIndexGroupOffset,
+		PageHeaderSize + stateRootReservedOffset,
 	} {
 		corrupt := append([]byte(nil), page...)
 		corrupt[offset] = 1
@@ -355,8 +328,10 @@ func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 		}
 	}
 
+	// A resealed page whose version field no longer matches the format must fail
+	// before any field is trusted.
 	corrupt := append([]byte(nil), page...)
-	binary.LittleEndian.PutUint64(corrupt[PageHeaderSize+16:PageHeaderSize+24], 4)
+	binary.LittleEndian.PutUint32(corrupt[PageHeaderSize:PageHeaderSize+4], stateRootVersion+1)
 	resealTestPage(corrupt)
 	if _, err := DecodeStateRootPage(corrupt, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
 		t.Fatalf("semantic corruption = %v, want %v", err, ErrStateRootCorrupt)
@@ -428,91 +403,5 @@ func TestRecoverStateRootFallsBackOnSemanticMismatch(t *testing.T) {
 			"semantic fallback = (%+v,%+v,%d,fallback=%d,%v)",
 			gotSuper, gotState, slot, fallbackGeneration, err,
 		)
-	}
-}
-
-func TestRecoverStateRootValidatesTopLevelDirectories(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "state-root-directories")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	pageSize := uint64(testSuperblockPageSize)
-	fileEnd := 8 * pageSize
-	empty := StateRoot{
-		StoreID: testStoreID, Generation: 1, PageSize: testSuperblockPageSize,
-		MaxPageSize: 64 << 10, NextLogicalID: 2, ChunkDocuments: 64,
-	}
-	newer := StateRoot{
-		StoreID: testStoreID, Generation: 2, PageSize: testSuperblockPageSize,
-		MaxPageSize:   64 << 10,
-		DocumentCount: 1, NextLogicalID: 4, ChunkHighWater: 1, LiveChunks: 1, ChunkDocuments: 64,
-		ChunkDirectory: testStatePageRef(PageChunkDirectory, 6, 2, 2),
-		KeyDirectory:   testStatePageRef(PageFingerprintDirectory, 7, 3, 2),
-	}
-	state1 := make([]byte, testSuperblockPageSize)
-	state2 := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(state1, empty, fileEnd); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := EncodeStateRootPage(state2, newer, fileEnd); err != nil {
-		t.Fatal(err)
-	}
-	chunkRoot := make([]byte, testSuperblockPageSize)
-	keyRoot := make([]byte, testSuperblockPageSize)
-	for _, item := range []struct {
-		page []byte
-		ref  PageRef
-	}{
-		{chunkRoot, newer.ChunkDirectory},
-		{keyRoot, newer.KeyDirectory},
-	} {
-		if _, err := InitPage(item.page, PageHeader{
-			StoreID: testStoreID, Generation: item.ref.Generation, LogicalID: item.ref.LogicalID,
-			PageSize: testSuperblockPageSize, Kind: item.ref.Kind,
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := SealPage(item.page); err != nil {
-			t.Fatal(err)
-		}
-	}
-	root1 := testSuperblock(1, 4*pageSize, state1)
-	root1.FileEnd = fileEnd
-	root2 := testSuperblock(2, 5*pageSize, state2)
-	root2.FileEnd = fileEnd
-	first := encodeTestSuperblock(t, root1)
-	second := encodeTestSuperblock(t, root2)
-	if err := file.Truncate(int64(fileEnd)); err != nil {
-		t.Fatal(err)
-	}
-	writeAtTest(t, file, first[:], 0)
-	writeAtTest(t, file, second[:], int64(pageSize))
-	writeAtTest(t, file, state1, int64(root1.StateOffset))
-	writeAtTest(t, file, state2, int64(root2.StateOffset))
-	writeAtTest(t, file, chunkRoot, int64(newer.ChunkDirectory.Offset))
-	writeAtTest(t, file, keyRoot, int64(newer.KeyDirectory.Offset))
-	scratch := make([]byte, testSuperblockPageSize)
-
-	gotSuper, gotState, slot, err := RecoverStateRoot(file, testSuperblockPageSize, scratch)
-	if err != nil || gotSuper != root2 || gotState != newer || slot != 1 {
-		t.Fatalf("recover directories = (%+v,%+v,%d,%v)", gotSuper, gotState, slot, err)
-	}
-
-	wrongKeyKind := append([]byte(nil), keyRoot...)
-	wrongKeyKind[12] = byte(PageKeyDirectory)
-	resealTestPage(wrongKeyKind)
-	writeAtTest(t, file, wrongKeyKind, int64(newer.KeyDirectory.Offset))
-	gotSuper, gotState, slot, err = RecoverStateRoot(file, testSuperblockPageSize, scratch)
-	if err != nil || gotSuper != root1 || gotState != empty || slot != 0 {
-		t.Fatalf("key-kind fallback = (%+v,%+v,%d,%v)", gotSuper, gotState, slot, err)
-	}
-	writeAtTest(t, file, keyRoot, int64(newer.KeyDirectory.Offset))
-
-	chunkRoot[PageHeaderSize] ^= 1
-	writeAtTest(t, file, chunkRoot, int64(newer.ChunkDirectory.Offset))
-	gotSuper, gotState, slot, err = RecoverStateRoot(file, testSuperblockPageSize, scratch)
-	if err != nil || gotSuper != root1 || gotState != empty || slot != 0 {
-		t.Fatalf("directory fallback = (%+v,%+v,%d,%v)", gotSuper, gotState, slot, err)
 	}
 }

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"fmt"
 	"reflect"
 	"slices"
@@ -186,21 +185,6 @@ func TestStoreExactIndexPhysicalAliasDeduplication(t *testing.T) {
 	}
 	if stats := collection.Stats(); stats.Indexes != 3 || stats.PhysicalIndexes != 2 {
 		t.Fatalf("post-drop/create Stats = %+v", stats)
-	}
-
-	var image bytes.Buffer
-	if _, err := collection.WriteTo(&image); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(image.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reopened.indexes["alias"] != reopened.indexes["alias2"] {
-		t.Fatal("reopen duplicated identical physical indexes")
-	}
-	if reopened.indexes["alias"] == reopened.indexes["reverse"] {
-		t.Fatal("reopen merged order-distinct physical indexes")
 	}
 }
 

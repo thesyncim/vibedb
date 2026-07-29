@@ -181,18 +181,13 @@ type StateRoot struct {
 	MaxKeyBytes      uint32
 	InlineValueBytes uint32
 	MaxDocumentBytes uint32
-	ChunkDirectory   PageRef
-	KeyDirectory     PageRef
-	IndexDirectory   PageRef
-	// Float64ScanHead names the ordered value-stripe directory of a compact or
-	// incrementally maintained generation. It is only a scan accelerator;
-	// documented mutation fallbacks clear it and use the authoritative tree.
-	Float64ScanHead PageRef
-	// IndexGroupHead names bounded aggregate-only categorical cover pages.
-	// Exact postings remain authoritative.
-	IndexGroupHead PageRef
-	// PrimaryRoot selects the ordered tablet graph. Zero keeps the current
-	// fingerprint/chunk primary authoritative during the staged cutover.
+	// The chunk/fingerprint layout is gone. Its five root PageRef slots (chunk
+	// directory, pre-hybrid and fingerprint key directory, exact-index directory,
+	// float64 scan head, and index-group head) are held blank in the persisted
+	// payload so the fields after them keep their byte offsets; nothing writes or
+	// reads them any longer.
+	//
+	// PrimaryRoot selects the ordered tablet graph and is the sole document root.
 	PrimaryRoot PageRef
 	// ExactIndexRoot names the PagePrimaryExactRoot carrying the physical
 	// exact-term posting leaves associated with PrimaryRoot. It is absent for an
@@ -252,11 +247,7 @@ func encodeStateRootPayload(payload []byte, root StateRoot) {
 	binary.LittleEndian.PutUint32(payload[40:44], root.IndexMaxDepth)
 	binary.LittleEndian.PutUint64(payload[44:52], root.IndexCatalogHash)
 	binary.LittleEndian.PutUint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset], root.FreeChunkHint)
-	encodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset], root.ChunkDirectory)
-	encodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset], root.KeyDirectory)
-	encodePageRef(payload[stateRootIndexRefOffset:stateRootRefsEnd], root.IndexDirectory)
-	encodePageRef(payload[stateRootFloat64Offset:stateRootFloat64End], root.Float64ScanHead)
-	encodePageRef(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd], root.IndexGroupHead)
+	// The five removed chunk/fingerprint root slots stay zero (cleared above).
 	binary.LittleEndian.PutUint32(
 		payload[stateRootMaterializationOffset:stateRootMaterializationEnd],
 		root.MaterializationDamageGranule,
@@ -324,11 +315,10 @@ func decodeStateRootPayload(
 ) (StateRoot, error) {
 	if len(payload) != StateRootPayloadSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != stateRootVersion ||
-		!pageRefReservedZero(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]) ||
-		!pageRefReservedZero(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]) ||
-		!pageRefReservedZero(payload[stateRootIndexRefOffset:stateRootRefsEnd]) ||
-		!pageRefReservedZero(payload[stateRootFloat64Offset:stateRootFloat64End]) ||
-		!pageRefReservedZero(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd]) ||
+		// The five removed chunk/fingerprint root slots must be entirely blank.
+		!allZero(payload[stateRootChunkRefOffset:stateRootRefsEnd]) ||
+		!allZero(payload[stateRootFloat64Offset:stateRootFloat64End]) ||
+		!allZero(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd]) ||
 		!pageRefReservedZero(payload[stateRootPageCatalogOffset:stateRootPageCatalogEnd]) ||
 		!pageRefReservedZero(payload[stateRootPrimaryOffset:stateRootPrimaryEnd]) ||
 		!pageRefReservedZero(payload[stateRootExactIndexOffset:stateRootExactIndexEnd]) ||
@@ -336,8 +326,6 @@ func decodeStateRootPayload(
 		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
 	}
 	freeChunkHint := binary.LittleEndian.Uint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset])
-	float64ScanHead := decodePageRef(payload[stateRootFloat64Offset:stateRootFloat64End])
-	indexGroupHead := decodePageRef(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd])
 	root := StateRoot{
 		StoreID:          storeID,
 		Generation:       generation,
@@ -373,11 +361,6 @@ func decodeStateRootPayload(
 		MaxDocumentBytes: binary.LittleEndian.Uint32(
 			payload[stateRootInlineValueBytesEnd:stateRootMaxDocumentBytesEnd],
 		),
-		ChunkDirectory:  decodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]),
-		KeyDirectory:    decodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]),
-		IndexDirectory:  decodePageRef(payload[stateRootIndexRefOffset:stateRootRefsEnd]),
-		Float64ScanHead: float64ScanHead,
-		IndexGroupHead:  indexGroupHead,
 		PrimaryRoot: decodePageRef(
 			payload[stateRootPrimaryOffset:stateRootPrimaryEnd],
 		),
@@ -494,134 +477,16 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 		return fmt.Errorf("%w: document/chunk counts", ErrInvalidWrite)
 	}
 
-	keyKind := PageKeyDirectory
-	if root.KeyDirectory.Kind == PageFingerprintDirectory {
-		keyKind = PageFingerprintDirectory
-	}
-	refs := [3]struct {
-		ref      PageRef
-		kind     PageKind
-		required bool
-		allowed  bool
-	}{
-		{root.ChunkDirectory, PageChunkDirectory, root.LiveChunks != 0, root.LiveChunks != 0},
-		{
-			root.KeyDirectory, keyKind,
-			root.DocumentCount != 0 && !primarySelected,
-			root.DocumentCount != 0 && (!primarySelected || root.LiveChunks != 0),
-		},
-		{root.IndexDirectory, PageIndexDirectory, false, root.IndexCount != 0},
-	}
-	for i := range refs {
-		if err := validateStatePageRef(refs[i].ref, refs[i].kind, refs[i].required, root, fileEnd); err != nil {
-			return err
-		}
-		if !refs[i].allowed && refs[i].ref != (PageRef{}) {
-			return fmt.Errorf("%w: unneeded %d root", ErrInvalidWrite, refs[i].kind)
-		}
-		if refs[i].ref == (PageRef{}) {
-			continue
-		}
-		for j := range i {
-			if refs[j].ref != (PageRef{}) &&
-				(refs[j].ref.LogicalID == refs[i].ref.LogicalID || refs[j].ref.Offset == refs[i].ref.Offset) {
-				return fmt.Errorf("%w: duplicate root reference", ErrInvalidWrite)
-			}
-		}
-	}
 	if err := validateStatePrimaryRoot(root, fileEnd); err != nil {
 		return err
-	}
-	if root.PrimaryRoot != (PageRef{}) {
-		for i := range refs {
-			if refs[i].ref != (PageRef{}) &&
-				(refs[i].ref.LogicalID == root.PrimaryRoot.LogicalID ||
-					refs[i].ref.Offset == root.PrimaryRoot.Offset) {
-				return fmt.Errorf("%w: duplicate primary root", ErrInvalidWrite)
-			}
-		}
 	}
 	if err := validateStateExactIndexRoot(root, fileEnd); err != nil {
 		return err
 	}
-	if root.ExactIndexRoot != (PageRef{}) {
-		for i := range refs {
-			if refs[i].ref != (PageRef{}) &&
-				(refs[i].ref.LogicalID == root.ExactIndexRoot.LogicalID ||
-					refs[i].ref.Offset == root.ExactIndexRoot.Offset) {
-				return fmt.Errorf("%w: duplicate exact-index root", ErrInvalidWrite)
-			}
-		}
-		if root.PrimaryRoot.LogicalID == root.ExactIndexRoot.LogicalID ||
-			root.PrimaryRoot.Offset == root.ExactIndexRoot.Offset {
-			return fmt.Errorf("%w: duplicate primary/exact-index root", ErrInvalidWrite)
-		}
-	}
-	if root.Float64ScanHead != (PageRef{}) {
-		ref := root.Float64ScanHead
-		length := uint64(ref.Length)
-		if root.Options&StateOptionFloat64Columns == 0 ||
-			ref.Kind != PageFloat64Catalog || ref.Flags != 0 || ref.Aux != 0 ||
-			ref.Length != root.PageSize ||
-			ref.Generation == 0 || ref.Generation > root.Generation ||
-			ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
-			ref.Offset < layout.DataStart || ref.Offset%pageSize != 0 ||
-			length > fileEnd || ref.Offset > maxSuperblockFileOffset ||
-			ref.Offset > fileEnd-length {
-			return fmt.Errorf("%w: invalid float64 scan head", ErrInvalidWrite)
-		}
-		for i := range refs {
-			if refs[i].ref != (PageRef{}) &&
-				(refs[i].ref.LogicalID == ref.LogicalID || refs[i].ref.Offset == ref.Offset) {
-				return fmt.Errorf("%w: duplicate float64 scan head", ErrInvalidWrite)
-			}
-		}
-		if root.PrimaryRoot != (PageRef{}) &&
-			(root.PrimaryRoot.LogicalID == ref.LogicalID ||
-				root.PrimaryRoot.Offset == ref.Offset) {
-			return fmt.Errorf("%w: duplicate primary/float64 root", ErrInvalidWrite)
-		}
-		if root.ExactIndexRoot != (PageRef{}) &&
-			(root.ExactIndexRoot.LogicalID == ref.LogicalID ||
-				root.ExactIndexRoot.Offset == ref.Offset) {
-			return fmt.Errorf("%w: duplicate exact-index/float64 root", ErrInvalidWrite)
-		}
-	}
-	if root.IndexGroupHead != (PageRef{}) {
-		ref := root.IndexGroupHead
-		length := uint64(ref.Length)
-		if root.IndexCount == 0 || root.DocumentCount == 0 ||
-			ref.Kind != PageIndexGroupCatalog || ref.Flags != 0 || ref.Aux != 0 ||
-			!validPhysicalPageSize(ref.Length) || ref.Length < root.PageSize ||
-			ref.Length%root.PageSize != 0 ||
-			ref.Generation == 0 || ref.Generation > root.Generation ||
-			ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
-			ref.Offset < layout.DataStart || ref.Offset%pageSize != 0 ||
-			length > fileEnd || ref.Offset > maxSuperblockFileOffset ||
-			ref.Offset > fileEnd-length {
-			return fmt.Errorf("%w: invalid index group head", ErrInvalidWrite)
-		}
-		for i := range refs {
-			if refs[i].ref != (PageRef{}) &&
-				(refs[i].ref.LogicalID == ref.LogicalID || refs[i].ref.Offset == ref.Offset) {
-				return fmt.Errorf("%w: duplicate index group head", ErrInvalidWrite)
-			}
-		}
-		if root.Float64ScanHead != (PageRef{}) &&
-			(root.Float64ScanHead.LogicalID == ref.LogicalID ||
-				root.Float64ScanHead.Offset == ref.Offset) {
-			return fmt.Errorf("%w: duplicate aggregate head", ErrInvalidWrite)
-		}
-		if root.PrimaryRoot != (PageRef{}) &&
-			(root.PrimaryRoot.LogicalID == ref.LogicalID ||
-				root.PrimaryRoot.Offset == ref.Offset) {
-			return fmt.Errorf("%w: duplicate primary/aggregate root", ErrInvalidWrite)
-		}
-		if root.ExactIndexRoot != (PageRef{}) &&
-			(root.ExactIndexRoot.LogicalID == ref.LogicalID ||
-				root.ExactIndexRoot.Offset == ref.Offset) {
-			return fmt.Errorf("%w: duplicate exact-index/aggregate root", ErrInvalidWrite)
-		}
+	if root.ExactIndexRoot != (PageRef{}) &&
+		(root.PrimaryRoot.LogicalID == root.ExactIndexRoot.LogicalID ||
+			root.PrimaryRoot.Offset == root.ExactIndexRoot.Offset) {
+		return fmt.Errorf("%w: duplicate primary/exact-index root", ErrInvalidWrite)
 	}
 	if hasCatalog {
 		if err := validateStatePageCatalog(root, fileEnd); err != nil {
@@ -644,11 +509,6 @@ func validateStatePageCatalog(root StateRoot, fileEnd uint64) error {
 		return fmt.Errorf("%w: canonical catalog run", ErrInvalidWrite)
 	}
 	refs := [...]PageRef{
-		root.ChunkDirectory,
-		root.KeyDirectory,
-		root.IndexDirectory,
-		root.Float64ScanHead,
-		root.IndexGroupHead,
 		root.PrimaryRoot,
 		root.ExactIndexRoot,
 	}
@@ -699,12 +559,11 @@ func validateStatePrimaryRoot(root StateRoot, fileEnd uint64) error {
 
 // validateStateExactIndexRoot validates the PagePrimaryExactRoot published for
 // exact indexes carried as posting tiles on the ordered graph. The root is
-// required exactly when an ordered primary declares indexes but keeps no legacy
-// chunk-store IndexDirectory, and is forbidden otherwise.
+// required exactly when an ordered primary declares indexes, and is forbidden
+// otherwise.
 func validateStateExactIndexRoot(root StateRoot, fileEnd uint64) error {
 	ref := root.ExactIndexRoot
-	required := root.PrimaryRoot != (PageRef{}) && root.IndexCount != 0 &&
-		root.IndexDirectory == (PageRef{})
+	required := root.PrimaryRoot != (PageRef{}) && root.IndexCount != 0
 	if ref == (PageRef{}) {
 		if required {
 			return fmt.Errorf("%w: missing ordered-primary exact-index root", ErrInvalidWrite)

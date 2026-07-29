@@ -66,6 +66,14 @@ current mutable `store/durable` file and must not be used to infer that layout.
 
 ## Overview
 
+The base page (`PageSize`) is fixed at 4096 bytes: every tree, root, directory,
+and metadata page is exactly one base page, while a leaf or overflow extent
+grows from one base page up to `MaxPageSize` (default 64 KiB). Variable base
+page sizes are not supported — `Create` rejects any `PageSize` other than 4096
+with `ErrUnsupportedPageSize`, and `Open` of a store that recorded a different
+base page fails the same way. The base page is no longer discovered from the
+file.
+
 A mutable durable collection is a graph of checksummed physical pages rooted
 at one of two alternating full-`PageSize` inline root slots:
 
@@ -76,13 +84,21 @@ materialization journal 0 (fixed 4 KiB)
 materialization journal 1 (fixed 4 KiB)
 padding to the next PageSize boundary
 DataStart
-  -> ChunkDirectory (packed-radix tree) -> DocumentPage / DocumentGroup
-  -> FingerprintDirectory (B+tree)      -> candidate (chunk, slot) locations
-  -> IndexDirectory (B+tree)            -> inline slot masks + exact certificates
-  -> Float64ScanHead (Float64Catalog B-tree) -> Float64Stripe pages
-  -> IndexGroupHead (IndexGroupCatalog chain)
+  -> PrimaryRoot (GlobalTabletCatalog: catalog -> optional branch -> leaf
+       -> tablet root -> locator/anchor) -> ordered PagePrimaryLeaf pages
+       -> each leaf record is an inline value, or, for a value past
+          InlineValueBytes, a PageOverflow chain (one PageRef; each extent
+          sized to its piece up to MaxPageSize)
+  -> ExactIndexRoot (PagePrimaryExactRoot -> PagePrimaryExactLeaf posting tiles)
   -> external FreeImage/FreeIndex/FreeDelta spill pages when inline capacity fills
 ```
+
+A document value is stored inline in its ordered primary leaf when it fits
+`InlineValueBytes`; a value up to `MaxDocumentBytes` is written out of line as a
+forward-linked chain of `PageOverflow` extents, and the leaf record holds only
+the 32-byte chain-head `PageRef`. `Put` mints the chain in the same write
+transaction that publishes the referencing leaf, so the value and its leaf
+become durable in one generation; replaying a `Put` re-derives the chain.
 
 Ordinary mutations are copy-on-write: they allocate replacement extents,
 write and synchronize data pages, then publish and synchronize the alternate

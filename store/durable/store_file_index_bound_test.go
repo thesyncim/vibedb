@@ -22,7 +22,7 @@ func TestIndexProbeMemoryBoundCatalogOwnership(t *testing.T) {
 				"/a/long/catalog/path/whose/backing/stays/collection-owned",
 			},
 		}},
-		PageSize: 4096, MaxPageSize: 4096,
+		PageSize: 4096, MaxPageSize: 64 << 10,
 		MaxDocumentBytes: 1024,
 	}
 	collection, err := Create(file, options)
@@ -84,7 +84,7 @@ func TestIndexProbeMemoryBoundNoIndexLeavesProbeWorkspaceZero(t *testing.T) {
 	collection, err := Create(file, Options{
 		Collection:       store.Options{ChunkDocuments: 1},
 		PageSize:         4096,
-		MaxPageSize:      4096,
+		MaxPageSize:      64 << 10,
 		MaxDocumentBytes: 1024,
 	})
 	if err != nil {

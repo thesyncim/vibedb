@@ -436,13 +436,15 @@ func (c *PrimaryGraphCursor) Next() (PrimaryGraphRow, bool, error) {
 
 // VisitInline is the scan hot path for inline primary graphs. It keeps the
 // sequential rank decoder inside the leaf loop instead of paying a
-// row-at-a-time cursor call. If an overflow row is encountered, its reference
-// is returned without invoking fn for that row.
+// row-at-a-time cursor call. When an overflow row is encountered the drain stops
+// and returns that row's borrowed key and 32-byte descriptor without invoking fn
+// for it; the caller resolves the out-of-line value and re-enters to continue.
+// A nil key and zero PageRef mean the scan is complete.
 func (c *PrimaryGraphCursor) VisitInline(
 	fn func(key, value []byte) error,
-) (PageRef, error) {
+) ([]byte, PageRef, error) {
 	if c == nil || c.done || fn == nil {
-		return PageRef{}, nil
+		return nil, PageRef{}, nil
 	}
 	if len(c.upper) == 0 && len(c.prefix) == 0 {
 		return c.visitAllInline(fn)
@@ -456,40 +458,40 @@ func (c *PrimaryGraphCursor) VisitInline(
 			if len(c.upper) != 0 && bytes.Compare(key, c.upper) >= 0 ||
 				len(c.prefix) != 0 && !bytes.HasPrefix(key, c.prefix) {
 				c.Close()
-				return PageRef{}, nil
+				return nil, PageRef{}, nil
 			}
 			if overflow {
-				return decodePageRef(raw), nil
+				return key, decodePageRef(raw), nil
 			}
 			if err := fn(key, raw); err != nil {
-				return PageRef{}, err
+				return nil, PageRef{}, err
 			}
 		}
 		if err := c.advanceLeaf(); err != nil {
 			c.Close()
-			return PageRef{}, err
+			return nil, PageRef{}, err
 		}
 		if c.done {
-			return PageRef{}, nil
+			return nil, PageRef{}, nil
 		}
 	}
 }
 
 func (c *PrimaryGraphCursor) visitAllInline(
 	fn func(key, value []byte) error,
-) (PageRef, error) {
+) ([]byte, PageRef, error) {
 	for {
 		if c.leafClass != CommonPrimaryLeafTemplate &&
 			c.leafClass != CommonPrimaryLeafCompact {
 			// The raw classes drain each leaf in one fused call; the template
 			// and compact classes step row by row because each row is
 			// reconstructed through class-specific scratch, not borrowed.
-			raw, err := c.rows.VisitRawBorrowed(fn)
+			key, raw, err := c.rows.VisitRawBorrowed(fn)
 			if err != nil {
-				return PageRef{}, err
+				return nil, PageRef{}, err
 			}
 			if raw != nil {
-				return decodePageRef(raw), nil
+				return key, decodePageRef(raw), nil
 			}
 		} else {
 			for {
@@ -498,19 +500,19 @@ func (c *PrimaryGraphCursor) visitAllInline(
 					break
 				}
 				if overflow {
-					return decodePageRef(raw), nil
+					return key, decodePageRef(raw), nil
 				}
 				if err := fn(key, raw); err != nil {
-					return PageRef{}, err
+					return nil, PageRef{}, err
 				}
 			}
 		}
 		if err := c.advanceLeaf(); err != nil {
 			c.Close()
-			return PageRef{}, err
+			return nil, PageRef{}, err
 		}
 		if c.done {
-			return PageRef{}, nil
+			return nil, PageRef{}, nil
 		}
 	}
 }
@@ -652,4 +654,21 @@ func (c *PrimaryGraphCursor) Close() {
 	}
 	c.releaseTablet()
 	c.done = true
+}
+
+// AdoptSpliceScratch seeds the cursor's document-reconstruction buffer with a
+// caller-retained slice. A template or compact leaf splices each row into this
+// buffer, and a fresh cursor would grow it from nil on the first such row of the
+// scan; seeding it from a buffer the caller keeps across scans makes a warm
+// ordered scan splice into retained capacity instead. Call it after
+// InitPrimaryGraphCursor, which resets the cursor. ReleaseSpliceScratch returns
+// the possibly-grown buffer for the caller to retain for the next scan.
+func (c *PrimaryGraphCursor) AdoptSpliceScratch(buf []byte) {
+	c.spliceScratch = buf[:0]
+}
+
+// ReleaseSpliceScratch returns the cursor's document-reconstruction buffer so
+// the caller can retain its grown capacity across scans.
+func (c *PrimaryGraphCursor) ReleaseSpliceScratch() []byte {
+	return c.spliceScratch
 }

@@ -849,7 +849,7 @@ func (j *planJoin) buildSide(
 	scan.storeMaskUsed = 0
 	scan.text = scan.text[:0]
 
-	chunks, _, _ := inner.ZoneStats()
+	chunks := inner.Chunks()
 	if workBudget != nil {
 		if err := workBudget.admitJoinCandidates(
 			j.inner, inner.Len(), heapWorkSnapshot, false, chunks,
@@ -1007,7 +1007,7 @@ func (j *planJoin) collect(
 	scan.storeMaskUsed = 0
 	scan.text = scan.text[:0]
 
-	chunks, _, _ := inner.ZoneStats()
+	chunks := inner.Chunks()
 	if workBudget != nil {
 		if err := workBudget.admitJoinCandidates(
 			j.inner, inner.Len(), heapWorkSnapshot, false, chunks,

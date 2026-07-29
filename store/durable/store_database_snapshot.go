@@ -37,36 +37,76 @@ func sortCollectionSnapshotOrder(collections []*Collection) {
 	})
 }
 
-// lockSnapshotWriters holds every deferred-canonical writer in the same
-// process-global order used for publication gates, then seals pending parent
-// edits before a multi-collection cut is captured. Keeping the writer holds
-// until every gate read-lock is acquired closes the window in which a router
-// could advance beyond the rooted graph the snapshot will walk.
-func lockSnapshotWriters(
-	collections []*Collection,
-) ([]*Collection, error) {
-	locked := make([]*Collection, 0, len(collections))
-	for _, collection := range collections {
-		if !collection.deferredCanonicalLane() ||
-			collection.primaryRouter.Load() == nil {
-			continue
-		}
-		collection.writer.Lock()
-		locked = append(locked, collection)
-		if len(collection.primaryPendingParents) == 0 {
-			continue
-		}
-		if err := collection.materializePrimaryParentsLocked(); err != nil {
-			unlockSnapshotWriters(locked)
-			return nil, err
-		}
-	}
-	return locked, nil
+// snapshotCutHold is the writer-and-gate hold seized across a no-skew database
+// cut. It records how much of the cut [seizeSnapshotCut] acquired so [release]
+// can undo exactly that much in LIFO order, whether the cut completed or a
+// materialize aborted it midway.
+type snapshotCutHold struct {
+	order   []*Collection
+	gates   int
+	writers int
 }
 
-func unlockSnapshotWriters(collections []*Collection) {
-	for i := len(collections) - 1; i >= 0; i-- {
-		collections[i].writer.Unlock()
+// seizeSnapshotCut holds the cut over collections given in a total lock order.
+// It is the shared acquisition both database-cut entry points use:
+// [Database.SnapshotInto] over its process-global snapshotOrder, and
+// [SnapshotCollections] over the same handle order derived from caller-owned
+// collections. Using one order everywhere is what lets overlapping catalogs that
+// name the same handles differently avoid choosing opposite lock orders.
+//
+// It locks every writer first, then walks the collections a second time,
+// materializing each deferred primary lane under its writer and immediately
+// taking that collection's read publication gate. The materialize and the read
+// gate interleave per collection, and that interleave is the whole correctness
+// of the cut: materializePrimaryParentsLocked publishes under the collection's
+// snapshotGate WRITE side, so if every materialize ran before any read gate, a
+// capture that blocked materializing some member — contending an in-flight
+// committer-callback promotion that takes the gate WITHOUT the writer lock —
+// would wait there holding no gates, leaving every other member free to publish
+// behind its back and skew the cut. Taking member X's read gate before
+// materializing member X+1 means the capture already holds every earlier
+// member's gate the instant it can block. That is exactly what
+// TestDurableDatabaseSnapshotHoldsEveryGateAtOnce and
+// TestSnapshotCollectionsHoldsEveryPublicationGate assert.
+//
+// By return every writer and every read gate is held; the caller pins each
+// member with the whole cut seized, then calls release. Deadlock freedom: a
+// blocked acquisition here waits only on an in-flight gate writer (a
+// committer-callback promotion) that runs to completion without the writer lock
+// or any gate this hold owns, so ordered acquisition over the fixed member set
+// cannot cycle. On a materialize error the partial hold is released and the
+// error returned.
+func seizeSnapshotCut(order []*Collection) (snapshotCutHold, error) {
+	hold := snapshotCutHold{order: order}
+	for _, collection := range order {
+		collection.writer.Lock()
+		hold.writers++
+	}
+	for _, collection := range order {
+		if collection.deferredCanonicalLane() &&
+			collection.primaryRouter.Load() != nil &&
+			len(collection.primaryPendingParents) != 0 {
+			if err := collection.materializePrimaryParentsLocked(); err != nil {
+				hold.release()
+				return snapshotCutHold{}, err
+			}
+		}
+		collection.snapshotGate.RLock()
+		hold.gates++
+	}
+	return hold, nil
+}
+
+// release undoes the hold in LIFO order — read gates first, then writers — over
+// exactly the prefix that was acquired. Releasing the gates before the writers
+// keeps a reclaimer waiting on a gate from proceeding until no writer this cut
+// held could still be mid-publish.
+func (h snapshotCutHold) release() {
+	for i := h.gates - 1; i >= 0; i-- {
+		h.order[i].snapshotGate.RUnlock()
+	}
+	for i := h.writers - 1; i >= 0; i-- {
+		h.order[i].writer.Unlock()
 	}
 }
 
@@ -206,30 +246,15 @@ func SnapshotCollections(collections []NamedCollection) (DatabaseSnapshot, error
 	}
 	sortCollectionSnapshotOrder(gateOrder)
 
-	writerOrder, err := lockSnapshotWriters(gateOrder)
+	// Seize the whole cut over the process-global handle order, then pin the
+	// members with every writer and publication gate held at once. Rejecting one
+	// handle under two names above is what keeps this read-locking each gate at
+	// most once, never recursively across a waiting writer.
+	hold, err := seizeSnapshotCut(gateOrder)
 	if err != nil {
 		return DatabaseSnapshot{}, err
 	}
-	writersReleased := false
-	defer func() {
-		if !writersReleased {
-			unlockSnapshotWriters(writerOrder)
-		}
-	}()
-	// Every publication gate is held simultaneously. The process-global handle
-	// order makes overlapping catalogs deadlock-free, while rejecting one
-	// handle under two names avoids recursively read-locking an RWMutex across
-	// a waiting writer.
-	for _, collection := range gateOrder {
-		collection.snapshotGate.RLock()
-	}
-	unlockSnapshotWriters(writerOrder)
-	writersReleased = true
-	defer func() {
-		for i := len(gateOrder) - 1; i >= 0; i-- {
-			gateOrder[i].snapshotGate.RUnlock()
-		}
-	}()
+	defer hold.release()
 
 	result := DatabaseSnapshot{
 		entries: make([]databaseSnapshotEntry, 0, len(ordered)),
@@ -308,30 +333,22 @@ func (d *Database) SnapshotInto(dst *DatabaseSnapshot) error {
 		return nil
 	}
 
-	writerOrder, err := lockSnapshotWriters(d.snapshotOrder)
+	// Seize the cut over the process-global handle order (snapshotOrder, kept in
+	// lock step with the name-ordered d.order by reorder so this stays
+	// allocation-free). Every writer and publication gate is held on return, the
+	// same interleaved materialize-then-gate discipline SnapshotCollections uses;
+	// see seizeSnapshotCut for why the two must interleave to keep the cut from
+	// skewing. Handle order rather than name order is what lets a capture that
+	// overlaps a caller-owned SnapshotCollections avoid the opposite lock order.
+	hold, err := seizeSnapshotCut(d.snapshotOrder)
 	if err != nil {
 		return err
 	}
-	writersReleased := false
-	defer func() {
-		if !writersReleased {
-			unlockSnapshotWriters(writerOrder)
-		}
-	}()
-	// The catalog maintains a process-global handle order alongside its
-	// name-ordered view. Unlocking is deferred in reverse so an unexpected panic
-	// during the capture cannot leave the database wedged with gates held.
-	for _, collection := range d.snapshotOrder {
-		collection.snapshotGate.RLock()
-	}
-	unlockSnapshotWriters(writerOrder)
-	writersReleased = true
-	defer func() {
-		for i := len(d.snapshotOrder) - 1; i >= 0; i-- {
-			d.snapshotOrder[i].snapshotGate.RUnlock()
-		}
-	}()
+	defer hold.release()
 
+	// Phase 3 — pin every member's state and acquire its lease with every gate
+	// held at once, so the captured generations are a set that genuinely
+	// coexisted: no member could publish between the first pin and the last.
 	for _, entry := range d.order {
 		snapshot, err := entry.collection.snapshotGateHeld()
 		if err != nil {
@@ -365,17 +382,17 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	if stateErr != nil {
 		return nil, stateErr
 	}
+	// exact and live pin the primary index's frozen catalog and live-slot map for
+	// the captured generation, exactly as pinSnapshot does; a database snapshot
+	// that dropped them would answer an indexed mask probe against a nil catalog
+	// and silently degrade a covered query to a full scan.
+	exact := c.primaryExact
+	live := c.primaryLive
 	lease, err := c.leases.Acquire(state.root.Generation)
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{
-		collection: c,
-		state:      state,
-		exact:      c.primaryExact,
-		live:       c.primaryLive,
-		lease:      lease,
-	}, nil
+	return &Snapshot{collection: c, state: state, exact: exact, live: live, lease: lease}, nil
 }
 
 // Collection returns the captured view of name, reporting whether the

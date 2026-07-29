@@ -214,7 +214,7 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer legacyFile.Close()
-	if _, err := CreateFrom(built, legacyFile, options); err != nil {
+	if _, err := CreateFromPrimary(built, legacyFile, options); err != nil {
 		t.Fatal(err)
 	}
 	primaryFile := createPrimaryPointFile(
@@ -232,19 +232,11 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 	}
 	defer primary.Close()
 	primaryRoot := primary.state.Load().root
-	if primaryRoot.PrimaryRoot == (storeio.PageRef{}) ||
-		primaryRoot.ChunkDirectory != (storeio.PageRef{}) ||
-		primaryRoot.KeyDirectory != (storeio.PageRef{}) ||
-		primaryRoot.IndexDirectory != (storeio.PageRef{}) ||
-		primaryRoot.Float64ScanHead != (storeio.PageRef{}) ||
-		primaryRoot.IndexGroupHead != (storeio.PageRef{}) {
-		t.Fatalf(
-			"primary bulk roots = primary:%+v chunk:%+v key:%+v "+
-				"index:%+v float64:%+v groups:%+v",
-			primaryRoot.PrimaryRoot, primaryRoot.ChunkDirectory,
-			primaryRoot.KeyDirectory, primaryRoot.IndexDirectory,
-			primaryRoot.Float64ScanHead, primaryRoot.IndexGroupHead,
-		)
+	// The retired chunk/fingerprint/index/float64 roots no longer exist as
+	// StateRoot fields, so an ordered-primary store is defined by a published
+	// PrimaryRoot alone.
+	if primaryRoot.PrimaryRoot == (storeio.PageRef{}) {
+		t.Fatalf("primary bulk root missing: %+v", primaryRoot.PrimaryRoot)
 	}
 	if primary.Len() != count || primary.Stats().VacantChunkSlots != 0 {
 		t.Fatalf(

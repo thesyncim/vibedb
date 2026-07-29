@@ -224,10 +224,6 @@ type Chunk struct {
 	Ord        [MaxChunkDocuments]uint8
 	Live       uint64
 	Count      uint8
-	// zone is this chunk's block-pruning summary (store_zone.go). It is a
-	// fixed-size value, not a pointer, so publishing a rebuilt chunk copies it
-	// with the rest of the header and adds no allocation to the write path.
-	zone chunkZone
 }
 
 type storeIDSet struct {
@@ -585,24 +581,11 @@ func buildStoreChunk(
 	if chunk.Count == 0 {
 		return nil, nil
 	}
-	zoneMaintain(chunk, old, zoneFoldedSource(replaceSlot, src))
 	// The chunk is complete and about to be published immutable: no further
 	// document can be indexed into it, so its ingest-only working state is
 	// released before it acquires the lifetime of the generation holding it.
 	chunk.Docs.sealIngest()
 	return chunk, nil
-}
-
-// zoneFoldedSource returns the one document a rebuild parsed, or nil when
-// every surviving document came from the old chunk by reference and the
-// summary therefore needs no new value folded into it. A delete, a clone, and
-// an index backfill all take the nil path, so none of them costs the write
-// path a re-scan.
-func zoneFoldedSource(replaceSlot int, src []byte) []byte {
-	if replaceSlot < 0 {
-		return nil
-	}
-	return src
 }
 
 // buildStoreChunkSchema is the schema-on specialization of buildStoreChunk.
@@ -663,7 +646,6 @@ func buildStoreChunkSchema(
 	if chunk.Count == 0 {
 		return nil, nil
 	}
-	zoneMaintain(chunk, old, zoneFoldedSource(replaceSlot, src))
 	chunk.Docs.sealIngest()
 	return chunk, nil
 }
@@ -1011,6 +993,22 @@ type Snapshot struct {
 }
 
 // Len returns the number of keys visible in s.
+// Chunks reports the snapshot's live chunk count, the unit the query work
+// budget charges scan admission by. Count is a high-water figure that
+// includes recycled chunks, so the live set is counted by iteration exactly
+// as the retired zone-statistics accessor did.
+func (s Snapshot) Chunks() int {
+	if s.state == nil {
+		return 0
+	}
+	chunks := 0
+	s.state.Chunks.Each(func(_ uint32, _ *Chunk) bool {
+		chunks++
+		return true
+	})
+	return chunks
+}
+
 func (s Snapshot) Len() int {
 	if s.state == nil {
 		return 0

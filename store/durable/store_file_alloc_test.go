@@ -10,12 +10,9 @@ import (
 // TestFileStoreBufferedPutStoreAllocations pins the writer-side cost of a
 // same-size buffered COW replacement with no indexes. A root-only schema keeps
 // the canonical in-place optimization out of the measurement while validating
-// allocation-free, so the test covers key scratch, transaction admission, the
-// one-row zone edit, and state publication.
+// allocation-free, so the test covers key scratch, transaction admission, and
+// state publication.
 func TestFileStoreBufferedPutStoreAllocations(t *testing.T) {
-	previousZones := store.SetZonePruning(true)
-	defer store.SetZonePruning(previousZones)
-
 	file, err := os.CreateTemp(t.TempDir(), "buffered-put-alloc-*")
 	if err != nil {
 		t.Fatal(err)
@@ -23,7 +20,6 @@ func TestFileStoreBufferedPutStoreAllocations(t *testing.T) {
 	defer file.Close()
 	options := testFileStoreOptions()
 	options.Durability = DurabilityBufferedVisible
-	options.DisableMutationCombining = true
 	options.QueueSlots = 512
 	options.GroupLimit = 512
 	options.Collection.Schema, err = store.CompileSchema(store.SchemaDefinition{

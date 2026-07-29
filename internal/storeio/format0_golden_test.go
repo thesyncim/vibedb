@@ -133,52 +133,6 @@ func format0MutablePrefix(t *testing.T) []byte {
 	return prefix
 }
 
-func format0DocumentPage(t *testing.T) []byte {
-	t.Helper()
-	header := DocumentPageHeader{
-		StoreID:    format0StoreID,
-		Generation: 7,
-		LogicalID:  2,
-		PageSize:   format0PageSize,
-		ChunkID:    3,
-		Live:       uint64(1) << 5,
-	}
-	rows := []DocumentRecord{{
-		Slot: 5,
-		Key:  []byte("format0:key"),
-		JSON: []byte(`{"format":0,"live":true}`),
-	}}
-	encoded, err := EncodeDocumentPage(
-		make([]byte, format0PageSize), header, rows, 32,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
-}
-
-func format0FingerprintPage(t *testing.T) []byte {
-	t.Helper()
-	const hash = uint64(0x0123_4567_89ab_cdef)
-	header := PageKeyDirectoryHeader{
-		StoreID:    format0StoreID,
-		Generation: 7,
-		LogicalID:  3,
-		PageSize:   format0PageSize,
-		MinHash:    hash,
-		MaxHash:    hash,
-	}
-	entries := []PageKeyLocation{{Hash: hash, Chunk: 3, Slot: 5}}
-	encoded, err := EncodePageFingerprintLeaf(
-		make([]byte, format0PageSize), header, entries,
-		64*uint64(format0PageSize), 32, 4, 64,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
-}
-
 func format0PostingPage(t *testing.T) []byte {
 	t.Helper()
 	header := PostingPageHeader{
@@ -225,7 +179,7 @@ func format0MaterializationMaxPatches(t *testing.T) []byte {
 		LogicalID:  5,
 		Generation: 7,
 		Length:     pageSize,
-		Kind:       PageDocument,
+		Kind:       PageOverflow,
 	}
 	before := make([]byte, pageSize)
 	payload, err := InitPage(before, PageHeader{
@@ -294,7 +248,7 @@ func format0MaterializationMaxTargets(t *testing.T) []byte {
 		ref := PageRef{
 			Offset:    layout.DataStart + uint64(rank)*uint64(format0PageSize),
 			LogicalID: uint64(10 + rank), Generation: 7,
-			Length: format0PageSize, Kind: PageDocument,
+			Length: format0PageSize, Kind: PageOverflow,
 		}
 		before := make([]byte, format0PageSize)
 		payload, initErr := InitPage(before, PageHeader{
@@ -425,8 +379,6 @@ func TestFormat0PrintGolden(t *testing.T) {
 		"primary_state_root_page":     format0PrimaryStateRootPage,
 		"empty_inline_superblock":     func(t *testing.T) []byte { return format0InlineRoot(t, 7) },
 		"standalone_superblock":       format0StandaloneSuperblock,
-		"document_page":               format0DocumentPage,
-		"fingerprint_leaf":            format0FingerprintPage,
 		"posting_page":                format0PostingPage,
 		"materialization_max_patches": format0MaterializationMaxPatches,
 		"materialization_max_targets": format0MaterializationMaxTargets,
@@ -515,11 +467,6 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"MaterializationJournalMaxTargets":  {MaterializationJournalMaxTargets, 6},
 		"MaterializationJournalMaxPatches":  {MaterializationJournalMaxPatches, 7},
 		"MaterializationJournalMaxData":     {MaterializationJournalMaxData, 3584},
-		"DocumentPagePayloadHeaderSize":     {DocumentPagePayloadHeaderSize, 32},
-		"DocumentPageRecordSize":            {DocumentPageRecordSize, 8},
-		"PageKeyDirectoryPayloadHeaderSize": {PageKeyDirectoryPayloadHeaderSize, 64},
-		"PageKeyLeafEntrySize":              {PageKeyLeafEntrySize, 16},
-		"PageKeyBranchEntrySize":            {PageKeyBranchEntrySize, 40},
 		"PostingPagePayloadHeaderSize":      {PostingPagePayloadHeaderSize, 32},
 		"PostingSegmentHeaderSize":          {PostingSegmentHeaderSize, 48},
 	} {
@@ -535,36 +482,19 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 			MaterializationJournalMinSectorSize,
 		)
 	}
-	kinds := [...]PageKind{
-		PageStateRoot,
-		PageDocument,
-		PageOverflow,
-		PageChunkDirectory,
-		PageKeyDirectory,
-		PageIndexDirectory,
-		PageIndexPosting,
-		PageDocumentGroup,
-		PageFloat64Group,
-		PageFloat64Catalog,
-		PageFloat64Stripe,
-		PageIndexGroupCatalog,
-		PageFreeImage,
-		PageFreeDelta,
-		PageFreeIndex,
-		PageFingerprintDirectory,
-		PageCatalogSegment,
-		PagePrimaryCatalog,
-		PageTabletDirectory,
-		PagePrimaryLocator,
-		PageTabletRoute,
-		PagePrimaryAnchor,
-		PagePrimaryLeaf,
-		PagePrimaryExactRoot,
-		PagePrimaryExactLeaf,
-	}
-	for index, kind := range kinds {
-		if want := PageKind(index + 1); kind != want {
-			t.Fatalf("PageKind rank %d = %d, want %d", index, kind, want)
+	// The chunk/fingerprint kinds (2, 4-6, 8-12, 16) are retired but their
+	// numbers stay reserved so every surviving durable kind keeps the on-disk
+	// identifier it has always had. Pin each survivor to that fixed number.
+	for kind, want := range map[PageKind]int{
+		PageStateRoot: 1, PageOverflow: 3, PageIndexPosting: 7,
+		PageFreeImage: 13, PageFreeDelta: 14, PageFreeIndex: 15,
+		PageCatalogSegment: 17, PagePrimaryCatalog: 18, PageTabletDirectory: 19,
+		PagePrimaryLocator: 20, PageTabletRoute: 21, PagePrimaryAnchor: 22,
+		PagePrimaryLeaf: 23, PagePrimaryExactRoot: 24, PagePrimaryExactLeaf: 25,
+	} {
+		if int(kind) != want {
+			t.Fatalf("PageKind %d has value %d, want reserved-retired value %d",
+				kind, int(kind), want)
 		}
 	}
 
@@ -702,23 +632,6 @@ func TestFormat0GoldenRepresentativePageKinds(t *testing.T) {
 		page func(*testing.T) []byte
 		open func([]byte) error
 	}{
-		{
-			name: "document_page", kind: PageDocument, page: format0DocumentPage,
-			open: func(page []byte) error {
-				_, err := OpenDocumentPage(page, 4, 32)
-				return err
-			},
-		},
-		{
-			name: "fingerprint_leaf", kind: PageFingerprintDirectory,
-			page: format0FingerprintPage,
-			open: func(page []byte) error {
-				_, err := OpenPageFingerprintDirectory(
-					page, 64*uint64(format0PageSize), 32, 4, 64,
-				)
-				return err
-			},
-		},
 		{
 			name: "posting_page", kind: PageIndexPosting, page: format0PostingPage,
 			open: func(page []byte) error {

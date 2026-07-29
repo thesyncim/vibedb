@@ -219,6 +219,9 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 			if err := vibejson.Validate(value); err != nil {
 				return err
 			}
+			if err := c.validatePrimarySchema(value); err != nil {
+				return err
+			}
 		}
 		resident, err := c.currentPrimaryResidentRoute(state, key)
 		if err != nil {
@@ -453,7 +456,9 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		stampGen := baseGen + uint64(leaf.applied) + 1
 		preparePath := filePrimaryMutationPath{leaf: *curView}
 		image, imageBytes, prepErr := c.preparePrimaryLeafMutation(
-			&preparePath, stampGen, m.key, m.value, m.remove, found, slot,
+			&preparePath, stampGen, m.key,
+			storeio.CommonPrimaryLeafValue{Inline: m.value},
+			m.remove, found, slot,
 		)
 		if errors.Is(prepErr, ErrPrimaryLeafSplitRequired) {
 			return m.key, prepErr
@@ -547,8 +552,7 @@ func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint6
 	nextSuper.FileEnd = c.batchPrimaryFileEnd
 	nextState := &fileStoreState{
 		root: nextRoot, super: nextSuper,
-		keyRoot: state.keyRoot, chunkRoot: state.chunkRoot,
-		indexRoot: state.indexRoot, freeHead: state.freeHead,
+		freeHead: state.freeHead,
 	}
 
 	c.batchPrimaryPrevVolatile = c.batchPrimaryPrevVolatile[:0]

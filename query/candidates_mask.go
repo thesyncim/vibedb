@@ -36,13 +36,12 @@ import (
 // stable-slot masks, or a nil, unbounded result when the catalog can't
 // answer it. requireExact selects between candidate masks (may still need a
 // document recheck) and exact masks (already collision-verified).
-// A sourceCaps is the optional [store.IndexSource] capabilities a backend has:
-// chunk summaries for block-level pruning, and a materializable live-row
-// universe for complementing a NOT. Both are genuinely optional — the heap
-// Snapshot has both, durable has summaries but no cheap live universe — so the
-// planner has to know which it is dealing with.
+// A sourceCaps is the optional [store.IndexSource] capability a backend has: a
+// materializable live-row universe for complementing a NOT. It is genuinely
+// optional — the heap Snapshot has it, durable does not — so the planner has to
+// know which it is dealing with.
 //
-// Whatever a caller puts in these fields is converted to an interface, so a
+// Whatever a caller puts in this field is converted to an interface, so a
 // backend should state the narrowest concrete type that implements the
 // capability. One pointer converts in place; a wider struct is copied to the
 // heap to be boxed, which is the cost this type exists to remove.
@@ -51,14 +50,12 @@ import (
 // meant an `any(snapshot)` type assertion inside the generic dispatch, and a
 // type parameter wider than one word must be copied to the heap to be boxed:
 // the heap Snapshot is a single pointer and converts for free, while durable's
-// QuerySnapshot carries five and does not. So every durable execution paid a
-// 48-byte allocation to be told what its own call site already knew — that
-// durable has no chunk summaries — and a durable NOT paid a second one per
-// leaf. Which capabilities a backend has is a property of the backend, fixed at
-// compile time, so each concrete entry point states its own and the compiler
-// checks the claim.
+// QuerySnapshot carries five and does not, so every durable execution would pay
+// a 48-byte allocation to be told what its own call site already knew. Which
+// capabilities a backend has is a property of the backend, fixed at compile
+// time, so each concrete entry point states its own and the compiler checks the
+// claim.
 type sourceCaps struct {
-	zone store.ZoneSource
 	live store.LiveMaskSource
 }
 
@@ -103,9 +100,9 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			w.keepStoreMasks(out)
 			return out, true, requireExact, nil
 		}
-		// No exact index answers this leaf. Before this fell straight through
-		// to a full scan; now the chunk summaries get a chance to skip blocks.
-		return zoneCandidates(p, caps.zone, w, requireExact)
+		// No exact index answers this leaf, so the catalog cannot bound it: it
+		// falls through to a full scan.
+		return nil, false, false, nil
 	case predIn, predInBound:
 		// The index probes one exact value at a time (its variadic values are
 		// a compound key's columns, not alternatives), so a membership costs
@@ -132,11 +129,11 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			if len(lits) == 0 {
 				return nil, true, true, nil
 			}
-			return zoneCandidates(p, caps.zone, w, requireExact)
+			return nil, false, false, nil
 		}
 		index, ok := singleColumnIndex(p.indexPath(paths), indexes)
 		if !ok {
-			return zoneCandidates(p, caps.zone, w, requireExact)
+			return nil, false, false, nil
 		}
 		var acc []store.Mask
 		for i := range needles {
@@ -162,11 +159,10 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		}
 		return acc, true, requireExact, nil
 	case predExists, predIsNull:
-		// Neither has ever had an index probe: an exact index stores values,
-		// not the fact that a path is missing. The chunk summary tracks
-		// absence and explicit null as separate bits, so these are the two
-		// predicates it answers that nothing else in the planner can.
-		return zoneCandidates(p, caps.zone, w, requireExact)
+		// An exact index stores values, not the fact that a path is missing or
+		// explicitly null, so nothing in the catalog bounds these: they fall
+		// through to a full scan.
+		return nil, false, false, nil
 	case predContains:
 		if p.containPlan == nil {
 			return nil, false, false, nil
@@ -176,7 +172,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		return andCandidatesFor(p, snapshot, caps, paths, indexes, w, requireExact)
 	case predOr:
 		for _, kid := range p.kids {
-			if !kid.canBound(paths, indexes, w, caps.zone != nil && !requireExact) {
+			if !kid.canBound(paths, indexes, w) {
 				return nil, false, false, nil
 			}
 		}
@@ -356,15 +352,8 @@ func (p *compiledPredicate) membershipBounded(paths []compiledPath, indexes []st
 // filled by the time any planner pass runs; the catalog itself still comes from
 // indexes and no snapshot is touched.
 func (p *compiledPredicate) canBound(
-	paths []compiledPath, indexes []store.IndexInfo, w *Workspace, zoneOK bool,
+	paths []compiledPath, indexes []store.IndexInfo, w *Workspace,
 ) bool {
-	if zoneOK && p.zone.Op != store.ZoneOpNone {
-		// A chunk-summary probe bounds this leaf whatever the catalog holds.
-		// It may still turn out to prune nothing at execution, in which case
-		// the probe reports itself unbounded and the disjunction falls back —
-		// the same outcome as before, one metadata walk later.
-		return true
-	}
 	switch p.kind {
 	case predCmp:
 		if p.op != Eq {
@@ -375,13 +364,13 @@ func (p *compiledPredicate) canBound(
 	case predIn, predInBound:
 		return p.membershipBounded(paths, indexes, w)
 	case predContains:
-		return p.containPlan != nil && p.containPlan.canBound(paths, indexes, w, zoneOK)
+		return p.containPlan != nil && p.containPlan.canBound(paths, indexes, w)
 	case predAnd:
 		if _, _, ok := p.bestCompoundIndex(paths, indexes); ok {
 			return true
 		}
 		for _, kid := range p.kids {
-			if kid.canBound(paths, indexes, w, zoneOK) {
+			if kid.canBound(paths, indexes, w) {
 				return true
 			}
 		}
@@ -391,7 +380,7 @@ func (p *compiledPredicate) canBound(
 			return false
 		}
 		for _, kid := range p.kids {
-			if !kid.canBound(paths, indexes, w, zoneOK) {
+			if !kid.canBound(paths, indexes, w) {
 				return false
 			}
 		}
