@@ -128,10 +128,10 @@ type databaseEntry struct {
 type DatabaseOptions struct {
 	// Options is the per-collection configuration applied to every collection
 	// OpenDatabase discovers on disk. Collections created through
-	// CreateCollection take their own. It exists because a durable collection's
-	// options are frozen into its file — index catalog, chunk geometry, schema
-	// presence — and Open validates the file against them, so reopening a
-	// directory requires knowing what to validate against.
+	// CreateCollection take their own. Durable geometry and schema presence are
+	// frozen into each file and validated by Open. The index catalog is
+	// rehydrated from the file; a non-nil Options.Indexes additionally asserts
+	// its exact current value.
 	Options Options
 	// FileMode is the permission bits a newly created collection file gets.
 	// Zero means 0o600: a database is a private store by default.
@@ -148,12 +148,10 @@ type DatabaseOptions struct {
 // document or posting leaf is scanned. A directory holding K collections
 // costs K bounded recoveries and K open descriptors.
 //
-// Every collection in the directory must accept options.Options. A durable
-// collection validates its frozen index catalog, chunk geometry, and schema
-// presence against the options it is opened with, so a directory whose
-// collections were created under different options cannot be reopened as one
-// database — and failing loudly here is better than opening the subset that
-// happens to match.
+// Every collection in the directory must accept options.Options. Durable
+// collections validate frozen geometry and schema presence against those
+// options. Index catalogs may differ when Options.Indexes is nil; a non-nil
+// slice asserts the same catalog for every collection.
 func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("vibejson: durable database requires a directory")

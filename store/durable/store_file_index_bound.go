@@ -30,10 +30,10 @@ type IndexProbeMemoryBound struct {
 }
 
 // IndexProbeMemoryBound returns a conservative retained-capacity bound without
-// reading an index page or growing caller storage. It uses the frozen catalog
-// geometry, not observed selectivity: a tuple hash may legally occur in every
-// live chunk, and every copied directory entry may carry a distinct maximum
-// certificate.
+// reading an index page or growing caller storage. It uses this snapshot's
+// immutable catalog geometry, not observed selectivity: a tuple hash may
+// legally occur in every live chunk, and every copied directory entry may carry
+// a distinct maximum certificate.
 func (s *Snapshot) IndexProbeMemoryBound() (IndexProbeMemoryBound, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return IndexProbeMemoryBound{}, ErrClosed
@@ -41,7 +41,7 @@ func (s *Snapshot) IndexProbeMemoryBound() (IndexProbeMemoryBound, error) {
 	state := s.state
 	bound := IndexProbeMemoryBound{
 		CatalogBytes: retainedIndexSliceBytes(
-			uint64(len(s.collection.options.Indexes)),
+			uint64(len(s.indexDefinitions)),
 			uint64(unsafe.Sizeof(store.IndexInfo{})),
 		),
 	}

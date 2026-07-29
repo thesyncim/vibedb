@@ -429,8 +429,36 @@ func TestTypedRuntimeOwnershipErrorsAndArgumentBounds(t *testing.T) {
 	}
 	lateIndex := runtimePrepare(t, session,
 		`CREATE INDEX late_value ON docs(value)`)
-	if _, err := lateIndex.Exec(ctx, nil); !errors.Is(err, ErrIndexLayoutFrozen) {
+	if _, err := lateIndex.Exec(ctx, nil); err != nil {
 		t.Fatalf("CREATE INDEX after materialization = %v", err)
+	}
+	if _, err := insert.Exec(ctx, []any{
+		[]byte(`{"id":"later","value":"v"}`),
+	}); err != nil {
+		t.Fatalf("INSERT after online CREATE INDEX = %v", err)
+	}
+	lateLookup := runtimePrepare(t, session,
+		`SELECT id FROM docs WHERE value = ?`)
+	lateCursor, err := lateLookup.Query(ctx, []any{"v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateIDs := make(map[string]bool, 2)
+	for lateCursor.Next() {
+		id, ok := lateCursor.Cell(0).Text()
+		if !ok {
+			t.Fatalf("online indexed id = (%q, %v)", id, ok)
+		}
+		lateIDs[id] = true
+	}
+	if !lateIDs["kept"] || !lateIDs["later"] || len(lateIDs) != 2 {
+		t.Fatalf("online indexed ids = %v, want kept and later", lateIDs)
+	}
+	if err := lateCursor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lateLookup.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	lookup := runtimePrepare(t, session,
@@ -477,6 +505,26 @@ func TestTypedRuntimeOwnershipErrorsAndArgumentBounds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("last Session.Close retained catalog writer lock: %v", err)
 	}
+	reopenedSession, err := reopened.NewSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedLookup := runtimePrepare(t, reopenedSession,
+		`SELECT id FROM docs WHERE value = ?`)
+	reopenedCursor, err := reopenedLookup.Query(ctx, []any{"v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedRows := 0
+	for reopenedCursor.Next() {
+		reopenedRows++
+	}
+	if reopenedRows != 2 {
+		t.Fatalf("reopened online index rows = %d, want 2", reopenedRows)
+	}
+	_ = reopenedCursor.Close()
+	_ = reopenedLookup.Close()
+	_ = reopenedSession.Close()
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}

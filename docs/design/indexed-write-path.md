@@ -57,7 +57,8 @@ path, with three distinct mechanisms, all **(verified)**:
    corpus fails closed at bulk build ("ordered-primary exact term leaf
    exceeds MaxPageSize") and on the mutation-path split ("common primary
    leaf class is full", surfaced when a split cannot stage its postings).
-3. **No online add.** Durable indexes are frozen at Create:
+3. **No online add (baseline, closed by §8 / P2).** Durable indexes were
+   frozen at Create:
    `Options.Indexes` compiles into `options.indexes` /
    `indexCatalogHash`, `createInitialState` stamps
    `IndexCount`/`IndexCatalogHash` into the state root
@@ -371,60 +372,61 @@ full strength, and the 100k corpus builds instead of failing closed.
 
 ## 8. Design question 4 — online CreateIndex
 
-**Catalog.** The frozen-at-Create model inverts: the durable canonical
-catalog (rehydrated at Open, `store_file_catalog.go`) becomes the sole
-authority on index definitions; `Options.Indexes` is honored at Create and
-verified as an assertion at Open (mismatch fails, absence passes).
-`CreateIndex(def)` takes the exclusive writer side, appends the compiled
-definition to the canonical catalog bytes, recomputes `IndexCatalogHash`,
-bumps `IndexCount`, and publishes a **catalog checkpoint** (structural-
-transaction shape: fold, bounded transaction, publish). The per-index build
-state lives in the versioned exact root page: each entry gains
-`(state ∈ {Building, Ready}, backfillCursor)` alongside its catalog ref —
-crash-durable, replay-independent.
+**Implemented catalog authority.** The frozen-at-Create model is inverted:
+the durable canonical catalog (rehydrated at Open,
+`store_file_catalog.go`) is the authority on index definitions;
+`Options.Indexes` remains a Create input and optional Open assertion.
+`CreateIndex(def)` compiles a prospective canonical catalog and publishes
+its catalog identity, exact root, and ready posting leaf in one structural
+transaction.
 
-**Dual-write from declaration.** From the catalog checkpoint's generation,
-every mutation emits overlay records for the new index exactly as for Ready
-indexes (records are per-physical-index already). Absolute records make
-this race-free against the sweep: posting truth per (term, tile) is
-newest-record-wins, and generation order resolves sweep-vs-mutation.
+**Zero mutation-path tax.** The builder does not declare a Building index,
+install a mutation log, or add a build-state branch to Put/Update/Delete.
+Instead it scans one immutable primary leaf per bounded writer hold and
+retains `(leaf ref, live masks, term contribution)`. A changed leaf has a
+different immutable ref and only that contribution is rescanned. The
+forward cursor makes the initial pass O(leaves), and the final full ref
+vector is checked outside the writer against the resident router's
+generation. Publication reacquires the writer and rechecks router identity
+and generation; a concurrent mutation simply causes another bounded
+reconciliation pass.
 
-**Budgeted backfill.** `BackfillIndex(name, maxLeaves)` sweeps the primary
-graph in key order under the writer lock, `maxLeaves` buckets per call:
-for each unswept leaf, `deriveBucketExactContribution` for the new index
-only, emit its contribution as a rebase-group-shaped record set at the
-current generation, advance the cursor (the swept upper key bound — robust
-to concurrent splits because any later mutation dual-writes regardless of
-sweep coverage), and release the lock between steps so mutations and reads
-interleave. Overlay pressure from a large sweep escalates to a checkpoint
-fold mid-backfill — bounded memory by construction. When the cursor
-reaches the end, the next fold persists everything and flips the entry to
-Ready in the same publish.
+**Memory and disk shape.** Per-leaf term keys live in compact byte arenas.
+The final encoder k-way merges sorted leaf contributions directly into the
+canonical codec input rather than constructing a second whole-index map; one
+flat posting arena and the ordered-primary chunk-0 codec path avoid per-term
+payload allocations. Cutover installs a fresh empty-overlay epoch for the
+O(delta) mutation engine and advances the resident router in place, avoiding
+a second primary-graph walk.
+Publication persistently reuses every existing immutable index leaf,
+allocates only the new physical leaf and one new exact root, and treats a
+second name for an identical path vector as a catalog-only alias. There is
+no database rewrite or shadow file.
 
-**Reads during Building:** never blocked, never wrong — `AppendIndexes`
-reports `IndexBuilding` and probes against a Building index return no
-acceleration (the planner scans, the heap model's contract); point reads
-and scans are untouched. Mutation latency during backfill is bounded by the
-per-step budget **(projection: mutation p50 ≤ 2× baseline while a backfill
-runs at the default budget; P2 gate)**.
+**Reads during the build:** existing snapshots and indexes remain fully
+usable. The new name is absent until the ready index and catalog publish
+together; a snapshot taken before the cutover retains the old catalog,
+postings, and live masks, while a later snapshot sees all three new values.
 
-**Crash mid-backfill:** the durable cursor resumes the sweep; journal
-replay re-emits dual-writes; a Building entry is never probed, so a torn
-build is invisible. After Ready, a fold produces bytes identical to a
-Create-time index of the same graph (differential gate extension).
+**Crash during the build:** before publication there is no durable build
+state to recover. The publication is ordinary copy-on-write: recovery
+selects either the old root/catalog (no index) or the new root/catalog
+(complete Ready index). Fault injection covers every data write, barrier,
+root write, final sync, and torn-root boundary.
 
 **Alternative rejected — freeze-and-rebuild** (build a new store with the
 added index, swap files): O(store) unavailability-free but O(store) work
 and double space per index add, and it forecloses the SQL layer's
 `CREATE INDEX` on live multi-GB collections — the direction doc's whole
-point. The sweep reuses machinery this design already builds (rebase
-groups, budgeted escalation), so the marginal complexity is the cursor.
+point. The in-file builder scans primary leaves once and never copies document
+pages or existing on-disk index leaves; persistent growth is proportional to
+the new index rather than to the whole database.
 
-**Alternative rejected — backfill outside the writer lock** (snapshot-scan
-then reconcile): needs a reconciliation log of concurrent mutations —
-which is the overlay again, plus a proof that reconciliation converges;
-sweeping under short writer holds with dual-write-from-declaration gets
-convergence by generation order with no second mechanism.
+**Alternative rejected — long-lived snapshot backfill:** even a one-leaf
+snapshot can pin retired volatile references during a burst and make writes
+return capacity pressure. One bounded leaf visit under the writer prevents
+that failure mode; the expensive final vector validation runs lock-free and
+uses the generation recheck for stability.
 
 ## 9. Design question 5 — batches and the SQL driver
 
@@ -438,8 +440,9 @@ from the existing shape — nothing is linked or visible until the whole
 batch has staged and fenced; the journal batch record already replays
 whole-or-none (one CRC). `ErrPrimaryBatchIndexedUnsupported` is deleted;
 `SupportsUpdate` drops the `len(c.options.indexes) == 0` clause, which
-turns the SQL driver's update path on for indexed collections. Batches
-against a Building index dual-write like single mutations. This also
+turns the SQL driver's update path on for indexed collections. A future
+resumable Building-state variant would dual-write batch changes like
+single mutations. This also
 completes what parallel-tablet-writers §8.2 needs: deposits carry records
 (tablet-local by tile partition), and the publish leader links them —
 O(records) pointer work, no O(map) merge, so this design *removes* the
@@ -505,31 +508,42 @@ bounded by the hard-cap cut with a locality proof test.
 
 ### P2 — online CreateIndex
 
-**Lands:** durable catalog authority + catalog checkpoint + Building/Ready
-+ cursor in the exact root + dual-write from declaration + budgeted
-key-order backfill + Ready flip at fold. Public API: `CreateIndex`,
-`BackfillIndex`, `DropIndex` on the durable collection, mirroring the heap
-signatures.
+**Landed for the current exact-leaf format:** dynamic durable catalog
+authority, O(leaves) optimistic reconciliation, bounded writer holds,
+lock-free final validation, ready-only atomic cutover, immutable-leaf reuse,
+alias deduplication, SQL catalog repair, and `CreateIndex` /
+`CreateIndexContext` on the durable collection.
 
-**Gates:**
-- online add on a live 100k collection reaches Ready with reads never
-  blocked; concurrent point-read p50 unchanged; mutation p50 ≤ **2×**
-  baseline during backfill at the default budget.
-- post-Ready fold **byte-identical** to a Create-time index of the same
-  graph (differential gate).
-- crash at every backfill boundary (mid-sweep, post-sweep-pre-fold,
-  post-Ready-pre-checkpoint) resumes to an identical Ready index.
-- per-call budget honored: a `BackfillIndex(_, n)` call touches ≤ n leaves
-  (counter-verified).
+**Measured gates:**
+- 8k documents build at a five-sample median of **~1.10M docs/s** for both
+  20-value and 1,000-value corpora on Apple M4 Max, including atomic file
+  publication;
+- complete builds use about **606 allocations** (20 values) and **1,031
+  allocations** (1,000 values), or 0.076 and 0.129 allocations/document;
+- file growth is **5.12 B/document** and **9.22 B/document** respectively,
+  including the new exact root and canonical catalog page;
+- concurrent rewrites reconcile without a mutation hook or retired-capacity
+  failure;
+- online output is byte-identical to canonical map aggregation;
+- crash at every publication boundary (data writes, barrier, root write,
+  final sync, torn root) reopens as exactly old-or-new;
+- old snapshots retain the old catalog while new snapshots see the Ready
+  index.
 
-**Risk:** catalog authority inversion breaks Open expectations → covered
-by assertion-mode Open tests; sweep/mutation interleaving → generation-
-order argument plus a paired mutate/backfill stress with rebuild diff.
+**Remaining scale gate:** P1's spanned exact leaves must land before the
+100k corpus gate is meaningful; the current single-leaf 64 KiB format still
+fails closed rather than silently producing a partial index.
+
+**Risk:** sustained write churn can delay convergence, but cannot expose a
+partial index or stop writers; bounded leaf holds, cancellation, paired
+rewrite stress, canonical differential checks, and the final generation
+proof cover the interleaving.
 
 ### P3 — indexed batches and the SQL driver
 
 **Lands:** batch-scoped record staging, single-publish linking, refusal
-deleted, `SupportsUpdate` widened; batches legal against Building indexes.
+deleted, and `SupportsUpdate` widened. A future resumable build-state
+variant would make batches legal during that state as well.
 
 **Gates:**
 - 64-entry indexed batch amortized cost ≤ **2×** the unindexed batch

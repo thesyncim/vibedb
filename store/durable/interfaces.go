@@ -19,8 +19,13 @@ var _ store.IndexSource = (*Snapshot)(nil)
 // indexes; the single-document Put/Delete path maintains exact indexes, but the
 // batch publisher deliberately rejects them.
 func (c *Collection) SupportsUpdate() bool {
-	return c != nil && c.state.Load() != nil &&
-		len(c.options.indexes) == 0 && c.deferredCanonicalLane()
+	if c == nil || c.state.Load() == nil || !c.deferredCanonicalLane() {
+		return false
+	}
+	c.snapshotGate.RLock()
+	supported := c.primaryEpoch == nil
+	c.snapshotGate.RUnlock()
+	return supported
 }
 
 // QuerySnapshot adapts a Snapshot for repeated, zero-allocation index
@@ -44,7 +49,7 @@ type QuerySnapshot struct {
 
 var _ store.IndexSource = QuerySnapshot{}
 
-// AppendIndexes appends the frozen exact-index catalog visible to the
+// AppendIndexes appends the immutable exact-index catalog visible to the
 // wrapped snapshot.
 func (s QuerySnapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
 	return s.Snapshot.AppendIndexes(dst)

@@ -10,11 +10,11 @@
 // both expose, so query has one execution core over both backends. Optional
 // schema and exact-index definitions shape what a build materializes.
 //
-// The [Collection] keeps one construction-time mutation beyond reads: Put, which
-// the SQL driver uses to stage transient point-lookup rows before a durable
-// write. The former user-facing mutable surface — online delete and online
-// index declaration — is gone; a durable collection's indexes are frozen at
-// construction, and nothing in production mutated a heap collection in place.
+// The [Collection] keeps one construction-time mutation beyond reads: Put,
+// which the SQL driver uses to stage transient point-lookup rows before a
+// durable write. Durable collections own the production mutation surface,
+// including online exact-index creation; nothing in production mutates a heap
+// collection in place.
 //
 // # Measuring a collection's footprint
 //

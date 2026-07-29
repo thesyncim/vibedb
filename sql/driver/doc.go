@@ -52,9 +52,11 @@
 //
 // Declared JSON types, nullability, and required paths are enforced on every
 // write and recompiled when the catalog reopens. CREATE INDEX declares an exact
-// index over one to four paths and must precede the first INSERT. INSERT,
-// whole-document UPDATE, DELETE, and transactional batches maintain those
-// postings in the same publication as the primary change.
+// index over one to four paths. On a populated table it scans immutable primary
+// leaves under bounded writer holds and publishes the complete index and its
+// catalog entry atomically. INSERT, whole-document UPDATE, DELETE, and
+// transactional batches maintain ready-index postings in the same publication
+// as the primary change.
 //
 // # Documents and identity
 //

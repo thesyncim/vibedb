@@ -11,12 +11,12 @@ import (
 // masks are rechecked against the live posting map on read, so they are already
 // exact — candidate and exact probes coincide.
 
-// AppendIndexes appends the frozen exact-index catalog visible to the snapshot.
+// AppendIndexes appends the immutable exact-index catalog visible to the snapshot.
 func (s *Snapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
 	if s == nil || s.collection == nil || s.state == nil {
 		return dst
 	}
-	for _, definition := range s.collection.options.Indexes {
+	for _, definition := range s.indexDefinitions {
 		info := store.IndexInfo{
 			Name: definition.Name, Kind: store.IndexExact, State: store.IndexReady,
 			// The ordered-primary exact index covers every document, so it is fully
