@@ -15,13 +15,17 @@ describes a target; this file describes the APIs and formats implemented today.
 | --- | --- | --- |
 | `store.Segment` | Immutable self-contained batch of documents with its own tape, shape, and column machinery | Explicit segment image |
 | `store.Collection` | Mutable in-memory keyed collection with immutable snapshots | Explicit full checkpoint |
+| `store.Database` | In-memory catalog and consistent snapshot of independent collections | None beyond each collection |
 | `store.Builder` | Bulk construction of a `store.Collection` | None |
 | `durable.Collection` | Bounded-residency durable collection | Automatic incremental commits |
+| `durable.Database` | Directory catalog and process-consistent snapshot; one durable file per collection | Per-collection automatic commits |
 | `Collection.WriteTo` / `store.Open` | Portable immutable collection image | Explicit full checkpoint |
 
-A collection is one physical JSON namespace. `store.Database` is an in-memory
-catalog of independent `store.Collection` handles; it is not a durable
-multi-collection database.
+A collection is one physical JSON namespace. `store.Database` catalogs
+in-memory collections. `durable.Database` catalogs one collection file per
+name in a directory. Its multi-collection snapshot is a consistent in-process
+read cut; it does not make separate collection writes one crash-atomic or
+transactional operation.
 
 ## In-memory collections
 
@@ -322,14 +326,17 @@ direct-I/O choices after fallback.
 
 ### Durable indexes and numeric covers
 
-`durable.Options.Indexes` declares up to 64 exact scalar or compound indexes.
-Definitions are fixed at creation and verified when reopened. Each write
-maintains its postings transactionally.
+`durable.Options.Indexes` declares up to 4,096 logical exact scalar or compound
+index names over at most 64 distinct ordered path definitions. Logical aliases
+share one physical index. Definitions are fixed at creation and verified when
+reopened. Each write maintains their postings transactionally.
 
 `Float64Columns` declares up to 256 RFC 6901 paths. Numeric sidecars support
-predicate-free `SUM`, `AVG`, `MIN`, and `MAX` without reopening JSON when the
-query is fully covered. Missing, non-numeric, and non-finite values are absent
-from the cover.
+the store's explicit float64 reduction APIs without reopening JSON when the
+request is fully covered. Missing, non-numeric, and non-finite values are
+absent from the cover. The SQL/query executor deliberately does not use these
+summaries for `SUM`, `AVG`, `MIN`, or `MAX`: its contract is exact decimal
+reduction, which a binary64 cover cannot certify.
 
 ### Bulk creation
 
@@ -361,6 +368,37 @@ The caller-buffered operations are the steady-state allocation boundary:
 An undersized destination may grow. A new index/query high-water mark, custom
 method, or oversized value may allocate. Zero-allocation claims apply only to
 the documented warmed path, not every convenience call.
+
+For query execution, `ExecOptions.MemoryBytes` is a hard admission limit for
+heap/Segment row-proportional work and data-dependent planner, join, and JSON
+containment storage. On the durable backend it is a batch/merge target rather
+than a total RSS ceiling: fixed worker/ring minima and one document bounded by
+the collection's `MaxDocumentBytes` schema may exceed the target. Durable
+candidate planning, join membership, and containment tapes still fail before
+unbounded growth; `ResultBytes`, `AggregateBytes`, `JoinPairBytes`, and
+`SpillBytes` govern their separate resource classes.
+
+Long-running core-query executions can use an optional reusable
+`query.CancelFlag`:
+
+```go
+var stop query.CancelFlag
+exec.Options.Cancel = &stop
+
+// A control goroutine may call stop.Cancel() while RunInto is active.
+err := prepared.RunInto(&exec, source)
+if errors.Is(err, query.ErrCanceled) {
+	// No partial Result is exposed. Workers, snapshot bindings, and spill files
+	// have already been cleaned up, so exec can be reused.
+}
+stop.Reset() // only after every execution using stop has returned
+```
+
+Cancellation is cooperative. Scans, durable batches, joins, DML filters, and
+spill I/O poll at phase boundaries and inside long executor loops, then finish
+the internal drain and cleanup protocol before returning `query.ErrCanceled`. Leaving
+`ExecOptions.Cancel` nil keeps the default hot path allocation-free and avoids
+an atomic load; installing a dormant flag also remains allocation-free.
 
 The in-memory store copies `Put` input. `store.Open` may borrow its image.
 `durable.Collection` copies writes and uses explicit snapshot leases for reads.
@@ -395,6 +433,35 @@ for another.
 ## Current product boundaries
 
 The repository currently has no replication, backup manager, point-in-time
-restore, network protocol, distributed execution, cross-file transaction, or
-durable multi-collection catalog. Query joins are not implemented. Those
-features are not implied by the storage APIs above.
+restore, distributed execution, or cross-file transaction. The PostgreSQL
+protocol-v3 server can expose the typed SQL catalog through `FromSQLDatabase`;
+that path supports the documented DDL, DML, SELECT, prepared-statement, join,
+and transaction subset. A nested integration module exercises pinned pgx v5
+and lib/pq releases over loopback TCP in CI. That narrow evidence does not
+imply general PostgreSQL compatibility or catalog emulation. The legacy
+`FromDatabase` and `FromCollection` protocol sources remain deliberately
+read-only.
+
+The core does provide two multi-collection catalogs:
+
+- `store.Database` owns heap collections and takes a consistent heap snapshot.
+- `durable.Database` owns one durable file per collection and takes a
+  process-consistent leased read cut. `durable.SnapshotCollections` provides
+  the same read cut for a catalog that owns the collection handles itself.
+
+Neither catalog makes writes to separate collections atomic or crash-atomic.
+Their shared guarantee is a coherent read snapshot.
+
+The query engine runs existence and fan-out joins over heap database snapshots.
+Its direct durable path currently runs existence joins but does not materialize
+fan-out rows. The shared typed SQL runtime used by both `database/sql` and
+`pgwire` closes that product-level gap for its supported declared-field inner
+join: it captures the tables through `durable.SnapshotCollections`, admits the
+complete input against a fixed, conservative 64 MiB working-set bound, copies
+that coherent cut into the heap executor, and fails before execution if the
+bound would be exceeded. The SQL catalog persists table names, JSON schemas,
+primary-key paths, and exact-index definitions; it still commits one table at
+a time.
+
+Broader distributed and cross-file transactional features are not implied by
+these catalog and join APIs.

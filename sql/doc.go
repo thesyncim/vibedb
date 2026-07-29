@@ -22,9 +22,8 @@
 // told their SQL parsed. Refusing at parse time costs a longer keyword table
 // and buys every rejection an actionable message.
 //
-// Two clauses are accepted despite having no executor counterpart today, and
-// both are flagged on their fields: [SelectStmt.Having] and
-// [SelectStmt.Offset]. See "Accepted ahead of the engine" below.
+// HAVING, OFFSET, LIMIT, and placeholders need per-execution state and are
+// therefore executed by query.Statement rather than a bare compiled plan.
 //
 // # Grammar
 //
@@ -72,19 +71,15 @@
 //
 //	insert       = "INSERT" "INTO" name [ "(" insert-columns ")" ]
 //	               "VALUES" row { "," row } [ ";" ] EOF ;
-//	insert-columns = pseudo-columns | path { "," path } ;
-//	pseudo-columns = '"$key"' "," '"$doc"' ;
-//	row          = "(" document ")"
-//	             | "(" value { "," value } ")"
-//	             | "(" key "," document ")" ;
-//	key          = string | "?" ;
+//	insert-columns = path { "," path } ;
+//	row          = "(" document ")"              (* without columns *)
+//	             | "(" operand { "," operand } ")" ; (* with columns *)
 //	document     = "?" | string | json-object | json-array ;
 //
 //	update       = "UPDATE" name "SET" '"$doc"' "=" document
-//	               [ "WHERE" ( predicate | key-condition ) ] [ ";" ] EOF ;
+//	               [ "WHERE" predicate ] [ ";" ] EOF ;
 //	delete       = "DELETE" "FROM" name
-//	               [ "WHERE" ( predicate | key-condition ) ] [ ";" ] EOF ;
-//	key-condition = '"$key"' "=" key | '"$key"' "IN" "(" key { "," key } ")" ;
+//	               [ "WHERE" predicate ] [ ";" ] EOF ;
 //
 //	create-table = "CREATE" "TABLE" [ "IF" "NOT" "EXISTS" ] name
 //	               [ "(" table-item { "," table-item } ")" ] [ ";" ] EOF ;
@@ -121,14 +116,12 @@
 // The reason is not brevity. query already has exactly one path language — a
 // dotted name, or an RFC 6901 JSON Pointer when the string starts with '/' —
 // and its compilePath turns both into the same compiled pointer. Introducing
-// arrow operators would have put a second path language into one codebase, so
-// that a path written in SQL and the same path written in a query document
-// would be different syntax for the same thing, with two implementations to
-// keep in agreement. [PathExpr.AppendSpec] renders a parsed path into exactly
-// the spelling that existing compiler takes, and renders it deterministically,
-// so every clause naming the same path produces byte-identical output — which
-// is what lets query's path registry extract that path once no matter how many
-// clauses read it.
+// arrow operators would have put a second path language into one codebase.
+// [PathExpr.AppendSpec] renders a parsed path into exactly the spelling the
+// shared query compiler takes, and renders it deterministically, so every
+// clause naming the same path produces byte-identical output — which is what
+// lets query's path registry extract that path once no matter how many clauses
+// read it.
 //
 // The rendering keeps the two forms distinct on purpose. A single clean field
 // name stays a bare name, because that is the form compilePath marks as a
@@ -169,35 +162,27 @@
 // two things in two clauses. Quoting an identifier therefore does not change
 // its case; it only lets it hold a reserved word, a space, or punctuation.
 //
-// # Accepted ahead of the engine
+// # Binding and cursor clauses
 //
-// HAVING and OFFSET are in the grammar and have no executor counterpart today:
-// query's plan has no filter between reduction and ordering, and no row skip.
-// They are accepted rather than refused because both are fully resolvable here
-// and neither needs anything but a small step added to an existing one. HAVING
-// in particular is validated to the point where it cannot fail late: the parser
-// binds every HAVING leaf either to an aggregate the SELECT list already
-// computes — recording which output column, in [Expr.Column] — or to a GROUP BY
-// key, so a HAVING that survives parsing needs a filter-after-reduce and no
-// second aggregation pass.
-//
-// A lowering pass that cannot yet execute them must reject a non-nil Having or
-// Offset explicitly. Ignoring either returns wrong rows silently, which is the
-// one outcome worse than an error.
+// The compiled plan owns row selection, reduction, and ordering. A prepared
+// query.Statement adds the execution state SQL needs around that plan:
+// placeholders are rebound for every call, HAVING filters reduced rows, OFFSET
+// advances the cursor, and LIMIT is pushed down only where doing so cannot drop
+// a row HAVING would have kept. [query.PrepareStatement] is deliberately the
+// one SQL preparation entry point, so the restricted plan-only form cannot
+// become a second, subtly smaller SQL API.
 //
 // # Where this dialect and SQL disagree
 //
 // These are semantic differences, not gaps, and they are what a caller needs to
 // know before this is described as SQL compatibility.
 //
-// Null is two-valued here, not three. SQL's comparison against NULL yields
-// UNKNOWN, which is neither true nor false and which NOT does not flip; the
-// engine's evalCmp returns false for a null cell, and NOT of that is true. So
-// where x is null, SQL drops a row matching NOT (x = 1) and the engine keeps
-// it. The parser removes the one spelling whose reading would depend on which
-// semantics the reader had in mind — "x = NULL" and a NULL inside an IN list
-// are both refused, pointing at IS NULL — but it cannot remove the difference,
-// which lives in NOT over any comparison on a null-or-absent path.
+// SQL predicates use three-valued logic. The underlying predicate primitives
+// are boolean, so lowering carries the TRUE and FALSE forms of each expression
+// separately. NOT swaps those forms instead of blindly negating a primitive;
+// a null comparison therefore remains UNKNOWN and is dropped by WHERE, as SQL
+// requires. "x = NULL" is still refused in favor of IS NULL, and a bound NULL
+// inside IN participates in the ordinary UNKNOWN rules.
 //
 // Absent and null are one value. query treats a path that resolves to nothing
 // and a path holding an explicit null identically, and IS NULL is true for
@@ -230,24 +215,20 @@
 //
 // # A row is a document, and INSERT says so
 //
-// SQL's INSERT names columns and supplies a tuple. This store's unit is a whole
-// JSON document under a primary key, and there is no schema anywhere in the
-// engine that could say which fields a tuple's positions stand for. So an
-// INSERT carries exactly what the store takes — a key and a document:
+// This store's unit is a whole JSON document. The normal INSERT therefore
+// carries a complete document, or builds one flat object from a column list:
 //
-//	INSERT INTO users VALUES ('u-1', ?)
-//	INSERT INTO users ("$key", "$doc") VALUES ('u-1', {"name": "amy"})
+//	INSERT INTO users VALUES (?)
+//	INSERT INTO users (id, name) VALUES (?, ?)
 //
-// The two forms are one statement; the second names the positions. Any other
-// column list is refused, because accepting `INSERT INTO users (name, age)
-// VALUES (?, ?)` would mean synthesizing {"name":...,"age":...} and thereby
-// making the document's shape a property of the statement text — a different
-// shape for each statement, recorded nowhere the next reader could find it.
+// A flat column list names distinct top-level JSON fields and its VALUES must
+// be scalars. Nested construction is refused; a caller that already has a
+// nested value binds the complete document. Several VALUES rows are one
+// statement, not a client-side loop.
 //
-// The key is required and never generated. A store whose keys are opaque
-// caller-chosen strings has no sequence to draw from, and inventing a UUID or a
-// counter would make INSERT non-deterministic. For the same reason
-// driver.Result's LastInsertId returns an error rather than a number.
+// Identity always comes from the table's declared scalar JSON PRIMARY KEY.
+// There is no caller-supplied physical-key row form and no generated sequence,
+// so driver.Result's LastInsertId returns an error.
 //
 // INSERT onto a key that already exists is refused. Put happens to be an
 // upsert, and letting INSERT inherit that would make "this row is new" silently
@@ -284,34 +265,25 @@
 // path-set primitive, `SET path = value` becomes a lowering that calls it and
 // nothing in this grammar changes except the deletion of a rejection.
 //
-// # The primary key is not a field, and only two conditions can read it
+// # Primary-key predicates use ordinary declared fields
 //
-// A predicate compiler resolves a path against stored JSON, and a document's
-// key is not in the JSON. `WHERE "$key" = 'u-1'` lowered as an ordinary path
-// would compile without complaint and match the documents that happen to
-// contain a field literally named "$key" — almost never any of them, and
-// silently wrong when it is some of them.
+// UPDATE, DELETE, and SELECT all write predicates against JSON fields. The
+// database/sql driver recognizes equality and positive IN on the table's
+// declared primary-key path and answers them with point reads; the AST still
+// carries the ordinary predicate, so optimization does not introduce a second
+// query vocabulary or a separate execution meaning.
 //
-// So the two conditions the store can answer without a predicate at all are
-// recognized as key lookups and everything else is refused:
+// `"$key"` has no special SQL meaning. It addresses a JSON object field
+// literally named "$key", and may itself be declared as the primary key. The
+// shared programmatic query builder has a private sentinel with that spelling
+// for direct store joins, so SQL renders the quoted JSON field through its RFC
+// 6901 pointer spelling to keep the two namespaces disjoint.
 //
-//	DELETE FROM users WHERE "$key" = ?
-//	DELETE FROM users WHERE "$key" IN ('a', 'b')
-//
-// Those two never scan. Every other appearance of "$key" inside a condition —
-// under an OR, under a NOT, conjoined with another test, or with an inequality
-// — is refused with a position, because each would need a different execution
-// and a dialect that accepted three of the four would be harder to remember
-// than one that accepts the two that are free.
-//
-// A condition that does not mention the key is a full scan. The candidate
-// pruning a SELECT gets from persistent indexes belongs to the backend's own
-// execution entry point, and a mutation enumerates documents itself, so a
-// DELETE over an indexed path reads every document where the SELECT with the
-// same WHERE reads only the ones the index admits. That is a performance
-// difference, not a semantic one: the surviving documents are identical,
-// because the filter is the same compiled predicate reached through the same
-// call.
+// A mutation condition without a point shape currently scans. Candidate
+// pruning for secondary indexes belongs to SELECT's backend entry point today.
+// That is a performance difference, not a semantic one: the surviving
+// documents are identical because the filter is the same compiled predicate
+// reached through the same call.
 //
 // # Declared types are JSON's, not SQL's
 //
@@ -325,12 +297,12 @@
 // refuse to make. INTEGER survives because the store's own schema has it, as
 // the subset of NUMBER written without a fraction or an exponent.
 //
-// The common SQL spellings are accepted as aliases — TEXT, VARCHAR, CHAR, and
-// NVARCHAR are STRING; INT, BIGINT, SMALLINT, TINYINT, and SERIAL are INTEGER;
-// FLOAT, REAL, DOUBLE, DECIMAL, and NUMERIC are NUMBER; BOOLEAN is BOOL; JSON
-// and JSONB are ANY — because a user pasting a schema from elsewhere should get
-// a working table rather than a syntax error on a word with an obvious meaning
-// here.
+// Common SQL spellings whose relevant promise is only a JSON category are
+// accepted as aliases — TEXT, unparameterized VARCHAR, and CLOB are STRING;
+// INT, BIGINT, SMALLINT, and TINYINT are INTEGER; FLOAT, REAL, DOUBLE, DECIMAL,
+// and NUMERIC are NUMBER; BOOLEAN is BOOL; JSON is ANY. These aliases select a
+// JSON kind; they do not import another database's width, precision, or storage
+// representation.
 //
 // A parenthesised precision is refused rather than accepted and ignored.
 // VARCHAR(255) means something everywhere it is written, and a dialect that
@@ -340,29 +312,25 @@
 // because JSON has no date and no byte string, and giving them one would be
 // inventing a convention enforced nowhere.
 //
-// # What PRIMARY KEY does today, and what it will do
+// A spelling is also refused when it promises more than a JSON kind: SERIAL
+// means sequence-backed generation, MONEY means fixed-scale currency, JSONB
+// means normalized storage, bare CHAR/CHARACTER/NCHAR mean fixed-width padding,
+// and RECORD/STRUCT imply a declared composite shape. Accepting any of those as
+// a coarse type check would silently discard the behavior its author asked for.
+//
+// # PRIMARY KEY at the parser and driver boundaries
 //
 // The declaration is parsed and validated in full — a key path must be a
 // scalar, must not admit NULL, must not be named twice, and at most four paths
-// may compose one. It is then lowered to exactly what the engine can enforce
-// today, which is less than the declaration promises.
+// may compose one. Lowering compiles those paths into required schema fields
+// and also returns the primary-key metadata to the storage adapter.
 //
-// Enforced today: every path PRIMARY KEY names becomes a required,
-// scalar-typed field of the collection's declared schema, so a document that
-// omits it, or holds a container there, is rejected at write time by the
-// store's own validation.
-//
-// Not enforced today: derivation. The intended model is that a declared primary
-// key is one or more paths into the document and the store key is derived from
-// them — never passed separately, never stored twice, composites encoded by
-// internal/orderedkey. The engine has no such derivation, and adding it changes
-// the signature of every write primitive, so it is sequenced after the query
-// work whose oracles depend on the current one. Until then INSERT supplies its
-// key explicitly, nothing checks that the supplied key agrees with the values at
-// the declared paths, and uniqueness is the store's own uniqueness over the
-// supplied key rather than over the declared paths.
-//
-// Nothing in the lowering fakes the missing half.
+// The database/sql driver requires exactly one declared scalar path, extracts
+// that value from every inserted or replacement document, and derives the typed
+// storage key from it. Equivalent exact-decimal spellings have one numeric
+// identity, and INSERT checks uniqueness over that derived identity. Another
+// consumer of this AST may choose a different stable codec, but the declared
+// JSON key remains the source of identity.
 //
 // # What is refused, and why
 //
@@ -378,16 +346,16 @@
 // evaluates predicates over stored values, not computed expressions); ORDER BY
 // and GROUP BY over output positions or aggregates.
 //
-// The mutation and definition grammar refuses, each by name: a real INSERT
-// column list, an INSERT with one value or three, a generated or numeric key,
-// INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT / ON DUPLICATE KEY, RETURNING,
-// a path assignment in SET, assigning "$key", two assignments in one UPDATE,
-// UPDATE ... FROM, DELETE ... USING, LIMIT / ORDER BY / GROUP BY / HAVING on a
-// mutation, a table alias on a single-collection statement, "$key" anywhere in
-// a condition but the two key shapes above, DROP, ALTER, MERGE, REPLACE,
-// TRUNCATE, CREATE VIEW, CREATE UNIQUE INDEX, CREATE TABLE ... AS SELECT, a
-// partial index, an index method or key direction, DEFAULT, UNIQUE, CHECK, and
-// FOREIGN KEY.
+// The mutation and definition grammar refuses, each by name: a nested INSERT
+// column list, generated keys, INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT /
+// ON DUPLICATE KEY, RETURNING, a path assignment in SET, two assignments in one
+// UPDATE, UPDATE ... FROM, DELETE ... USING, LIMIT / ORDER BY / GROUP BY /
+// HAVING on a mutation, a table alias on a single-collection statement, DROP,
+// ALTER, MERGE, REPLACE, TRUNCATE, CREATE VIEW, CREATE UNIQUE INDEX, CREATE
+// TABLE ... AS SELECT, a partial index, an index method or key direction,
+// DEFAULT, UNIQUE, CHECK, and FOREIGN KEY. INSERT also refuses the old
+// key/document pair: VALUES without a field list contains exactly one complete
+// JSON document whose declared primary-key field determines identity.
 //
 // Which backend accepts which statement is a property of the engine rather than
 // of this grammar, and belongs to the layer that executes: see the sql/driver
@@ -406,7 +374,8 @@
 // # Performance
 //
 // A [Parser] holds chunked arenas that a warmed parse refills rather than
-// reallocates, the same shape as query's Compiler and for the same reason. The
+// reallocates, the same shape as query's prepared-statement compiler and for
+// the same reason. The
 // steady state is zero allocation: on an Apple M4 Max, a simple SELECT parses
 // in about 118 ns, a two-collection join in about 730 ns, and a grouped
 // aggregate with HAVING and ORDER BY in about 730 ns, each at 0 allocs/op and

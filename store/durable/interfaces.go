@@ -20,6 +20,25 @@ var (
 	_ store.ZoneSource = (*Snapshot)(nil)
 )
 
+// SupportsUpdate reports whether the collection's current immutable layout and
+// durability lane can publish [Collection.Update] batches. It describes a
+// structural capability, not a size guarantee: an individual batch may still
+// exceed its configured document or byte bounds.
+//
+// Chunk-layout collections support Update, including exact-index maintenance.
+// Ordered-primary collections support it only on a deferred-canonical lane and
+// only without exact indexes; their single-document Put/Delete path maintains
+// exact indexes, but their batch publisher deliberately rejects them.
+func (c *Collection) SupportsUpdate() bool {
+	if c == nil || c.state.Load() == nil {
+		return false
+	}
+	if !c.primaryGraphReadOnly() {
+		return true
+	}
+	return len(c.options.indexes) == 0 && c.deferredCanonicalLane()
+}
+
 // QuerySnapshot adapts a Snapshot for repeated, zero-allocation index
 // probing: it satisfies store.IndexSource like Snapshot itself, but
 // routes through the workspace-reusing AppendIndexMasksInto/

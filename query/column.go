@@ -41,19 +41,26 @@ func Count(path ...string) Column {
 	}
 }
 
-// Sum totals the numeric values at spec, skipping rows whose value is null or
-// not a number. The result is null when no row contributes.
+// Sum totals the numeric values at spec exactly, skipping rows whose value is
+// null or not a number. The result is null when no row contributes. Exact
+// coefficient storage is bounded by [ExecOptions.AggregateBytes]; exceeding
+// that whole-execution budget returns [AggregateBudgetError].
 func Sum(spec string) Column { return aggColumn(aggSum, "sum", spec) }
 
-// Avg averages the numeric values at spec, skipping null and non-numeric rows.
-// The result is null when no row contributes.
+// Avg averages the numeric values at spec after an exact SUM and count,
+// skipping null and non-numeric rows. A finite decimal with at most 34
+// significant digits is returned exactly; every other quotient is rounded to
+// 34 significant decimal digits, round-to-nearest with ties-to-even. It never
+// passes through float64. The result is null when no row contributes.
 func Avg(spec string) Column { return aggColumn(aggAvg, "avg", spec) }
 
-// Min returns the least numeric value at spec, skipping null and non-numeric
-// rows. The result is null when no row contributes.
+// Min returns the least numeric value at spec under exact JSON-decimal
+// ordering, preserving an exact source spelling and skipping null and
+// non-numeric rows. The result is null when no row contributes.
 func Min(spec string) Column { return aggColumn(aggMin, "min", spec) }
 
-// Max returns the greatest numeric value at spec, skipping null and
+// Max returns the greatest numeric value at spec under exact JSON-decimal
+// ordering, preserving an exact source spelling and skipping null and
 // non-numeric rows. The result is null when no row contributes.
 func Max(spec string) Column { return aggColumn(aggMax, "max", spec) }
 

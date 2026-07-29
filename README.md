@@ -32,33 +32,77 @@ bulk is a separate representation, not the mutable default.
 ## Quickstart
 
 ```go
-file, err := os.Create("example.vdb")
-if err != nil { log.Fatal(err) }
-defer file.Close()
-
-db, err := durable.Create(file, durable.Options{})
+db, err := sql.Open("vibedb", "example.vdb")
 if err != nil { log.Fatal(err) }
 defer db.Close()
 
-if _, err = db.Put("user:1",
-	[]byte(`{"name":"Ada","active":true}`)); err != nil {
+if _, err = db.Exec(`
+	CREATE TABLE users (
+		id STRING PRIMARY KEY,
+		name STRING NOT NULL,
+		active BOOL NOT NULL
+	)`); err != nil {
 	log.Fatal(err)
 }
-snapshot, err := db.Snapshot()
-if err != nil { log.Fatal(err) }
-defer snapshot.Close()
+if _, err = db.Exec(`INSERT INTO users VALUES (?)`,
+	`{"id":"user:1","name":"Ada","active":true}`); err != nil {
+	log.Fatal(err)
+}
 
-q := query.Select(query.Path("name")).
-	Where(query.Cmp("active", query.Eq, true))
-result, err := q.Run(query.FromFile(snapshot))
-if err != nil { log.Fatal(err) }
-fmt.Println(result.RowCount) // 1
+var name []byte
+if err = db.QueryRow(
+	`SELECT name FROM users WHERE id = ?`, "user:1",
+).Scan(&name); err != nil {
+	log.Fatal(err)
+}
+fmt.Println(string(name)) // Ada
 ```
 
-Imports are `os`, `log`, `fmt`,
-`github.com/thesyncim/vibedb/store/durable`, and
-`github.com/thesyncim/vibedb/query`. The caller owns the `*os.File`; keep it
-open until `Close` returns.
+Imports are `database/sql`, `log`, `fmt`, and a blank import of
+`github.com/thesyncim/vibedb/sql/driver`. SQL is the public textual query
+language; JSON is the stored row representation. See the
+[supported SQL surface](docs/design/sql-surface.md) for schemas, indexes,
+joins, transactions, exact-number behavior, and explicit subset limits.
+
+## PostgreSQL clients
+
+The `pgwire` package exposes the same typed SQL catalog and query engine over
+PostgreSQL protocol v3:
+
+```go
+catalog, err := vibedriver.Open("example.vdb")
+if err != nil { log.Fatal(err) }
+defer catalog.Close()
+
+srv, err := pgwire.NewServer(
+	pgwire.FromSQLDatabase(catalog),
+	pgwire.Options{Auth: pgwire.Trust()},
+)
+if err != nil { log.Fatal(err) }
+ln, err := net.Listen("tcp", "127.0.0.1:5433")
+if err != nil { log.Fatal(err) }
+go func() { log.Print(srv.Serve(ln)) }()
+```
+
+pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
+parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
+`SELECT`, inner joins, prepared statements, and explicit transactions.
+Whole-document parameters are described as PostgreSQL `json`; projected JSON
+values preserve their exact wire spelling.
+
+A read-only heap `*store.Database` or one `*durable.Collection` can still be
+served with `FromDatabase` or `FromCollection`. A
+[nested integration gate](integration/pgclient/pgclient_test.go) exercises
+pinned pgx v5 and lib/pq releases over loopback TCP in CI, including SCRAM,
+schema validation, indexes, writes, a join, rollback/read-your-writes, stable
+SQLSTATEs, and close/reopen persistence.
+
+This is a PostgreSQL client protocol and SQL-subset implementation, not a
+PostgreSQL catalog emulator. TLS, `pg_catalog`, ORM/BI schema discovery, psql
+backslash introspection, savepoints, and transactional DDL are explicitly
+unsupported. See the [pgwire contract](pgwire/doc.go) for the exact surface,
+authentication, result types, transaction boundaries, cancellation, and
+resource bounds.
 
 ## Durability at a glance
 

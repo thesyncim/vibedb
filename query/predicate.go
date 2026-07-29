@@ -6,10 +6,10 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
-	"github.com/thesyncim/vibedb/store"
 )
 
 // An Op is a scalar comparison operator for Cmp.
@@ -138,20 +138,31 @@ type literal struct {
 // *Number and *string are accepted alongside their value spellings because
 // converting a string-shaped value to an any copies its header onto the heap,
 // one allocation per literal on a path whose whole contract is to have none,
-// while a pointer-shaped value needs no box at all. The JSON front end hands
-// the arena's own pointer across; a caller writing Cmp by hand naturally uses
-// the value spellings.
-func (c *Compiler) makeLiteral(value any) (literal, error) {
+// while a pointer-shaped value needs no box at all. SQL lowering hands the
+// arena's own pointer across; a caller writing Cmp by hand naturally uses the
+// value spellings.
+func (c *compiler) makeLiteral(value any) (literal, error) {
 	switch v := value.(type) {
 	case bool:
 		return literal{kind: kindBool, bval: v}, nil
+	case *bool:
+		if v == nil {
+			return literal{}, fmt.Errorf("query: nil *bool literal")
+		}
+		return literal{kind: kindBool, bval: *v}, nil
 	case string:
 		return literal{kind: kindString, sval: v}, nil
 	case *string:
+		if v == nil {
+			return literal{}, fmt.Errorf("query: nil *string literal")
+		}
 		return literal{kind: kindString, sval: *v}, nil
 	case Number:
 		return c.numberLiteral(v)
 	case *Number:
+		if v == nil {
+			return literal{}, fmt.Errorf("query: nil *query.Number literal")
+		}
 		return c.numberLiteral(*v)
 	case int:
 		return c.intLiteral(int64(v)), nil
@@ -163,6 +174,11 @@ func (c *Compiler) makeLiteral(value any) (literal, error) {
 		return c.intLiteral(int64(v)), nil
 	case int64:
 		return c.intLiteral(v), nil
+	case *int64:
+		if v == nil {
+			return literal{}, fmt.Errorf("query: nil *int64 literal")
+		}
+		return c.intLiteral(*v), nil
 	case uint:
 		return c.uintLiteral(uint64(v)), nil
 	case uint8:
@@ -174,23 +190,38 @@ func (c *Compiler) makeLiteral(value any) (literal, error) {
 	case uint64:
 		return c.uintLiteral(v), nil
 	case float32:
-		return c.floatLiteral(float64(v)), nil
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return literal{}, fmt.Errorf("query: non-finite numeric literal %v", v)
+		}
+		return c.floatLiteral(f), nil
 	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return literal{}, fmt.Errorf("query: non-finite numeric literal %v", v)
+		}
 		return c.floatLiteral(v), nil
+	case *float64:
+		if v == nil {
+			return literal{}, fmt.Errorf("query: nil *float64 literal")
+		}
+		if math.IsNaN(*v) || math.IsInf(*v, 0) {
+			return literal{}, fmt.Errorf("query: non-finite numeric literal %v", *v)
+		}
+		return c.floatLiteral(*v), nil
 	default:
 		return literal{}, fmt.Errorf("query: unsupported literal type %T", value)
 	}
 }
 
-// numberLiteral types an exact decimal spelling from a JSON query document.
+// numberLiteral types an exact decimal spelling from SQL or a bound value.
 // The int64 fast path is taken when the spelling denotes one, so a membership
 // over ordinary integer keys compares by integer rather than by digits.
-func (c *Compiler) numberLiteral(v Number) (literal, error) {
-	if i, ok := int64Spelling(string(v)); ok {
-		return c.intLiteral(i), nil
-	}
+func (c *compiler) numberLiteral(v Number) (literal, error) {
 	if err := v.validate(); err != nil {
 		return literal{}, fmt.Errorf("query: literal: %w", err)
+	}
+	if i, ok := int64Spelling(string(v)); ok {
+		return c.intLiteral(i), nil
 	}
 	return literal{kind: kindNumber, num: c.bytes(byteview.Bytes(string(v)))}, nil
 }
@@ -201,13 +232,11 @@ func (c *Compiler) numberLiteral(v Number) (literal, error) {
 // It does not call strconv.ParseInt, whose failure path builds a
 // *strconv.NumError holding a copy of the input: two heap allocations spent on
 // every non-integer literal in every compile, to describe a rejection the
-// caller immediately discards for the exact-decimal path. It accepts a leading
-// '+' only because ParseInt did, and a Number spelled that way must keep
-// compiling to the same literal it always has.
+// caller immediately discards for the exact-decimal path.
 func int64Spelling(text string) (int64, bool) {
 	negative := false
-	if len(text) > 0 && (text[0] == '-' || text[0] == '+') {
-		negative = text[0] == '-'
+	if len(text) > 0 && text[0] == '-' {
+		negative = true
 		text = text[1:]
 	}
 	// Nineteen digits is the widest run that cannot overflow the uint64
@@ -238,13 +267,13 @@ func int64Spelling(text string) (int64, bool) {
 	return int64(magnitude), true
 }
 
-func (c *Compiler) intLiteral(i int64) literal {
+func (c *compiler) intLiteral(i int64) literal {
 	buf := strconv.AppendInt(c.tmp[:0], i, 10)
 	c.tmp = buf
 	return literal{kind: kindNumber, num: c.bytes(buf), isInt: true, ival: i}
 }
 
-func (c *Compiler) uintLiteral(u uint64) literal {
+func (c *compiler) uintLiteral(u uint64) literal {
 	if u <= math.MaxInt64 {
 		return c.intLiteral(int64(u))
 	}
@@ -253,7 +282,7 @@ func (c *Compiler) uintLiteral(u uint64) literal {
 	return literal{kind: kindNumber, num: c.bytes(buf)}
 }
 
-func (c *Compiler) floatLiteral(f float64) literal {
+func (c *compiler) floatLiteral(f float64) literal {
 	buf := strconv.AppendFloat(c.tmp[:0], f, 'g', -1, 64)
 	c.tmp = buf
 	return literal{kind: kindNumber, num: c.bytes(buf)}
@@ -304,7 +333,7 @@ const inLinearMax = 8
 // in reg so the executor extracts each needed column once. Every node, child
 // list, membership set, and needle tape comes from c's arenas, so a warmed
 // recompilation of the same shape allocates none of them.
-func (c *Compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error) {
+func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error) {
 	switch p.kind {
 	case predCmp:
 		col, err := c.addPath(reg, p.path)
@@ -474,7 +503,7 @@ type scalarContainmentLeaf struct {
 // the conjunction of those leaves under the core's last-duplicate rule.
 // Arrays and empty objects carry structural information that equality indexes
 // cannot prove, so the rewrite is deliberately all-or-nothing.
-func (c *Compiler) scalarObjectContainmentPlan(needle vibejson.Index, base string) (*compiledPredicate, error) {
+func (c *compiler) scalarObjectContainmentPlan(needle vibejson.Index, base string) (*compiledPredicate, error) {
 	c.leaves = c.leaves[:0]
 	if !c.appendScalarContainmentLeaves(needle.Root(), base) ||
 		len(c.leaves) == 0 || len(c.leaves) > maxIndexedContainmentLeaves {
@@ -520,7 +549,7 @@ type effectiveMember struct {
 	value vibejson.Node
 }
 
-func (c *Compiler) appendScalarContainmentLeaves(node vibejson.Node, base string) bool {
+func (c *compiler) appendScalarContainmentLeaves(node vibejson.Node, base string) bool {
 	count, ok := node.ObjectLen()
 	if !ok || count == 0 {
 		return false
@@ -585,7 +614,7 @@ func memberIndex(members []effectiveMember, name string) int {
 
 // pointerChild renders base + "/" + escaped(key) into the text arena, rather
 // than concatenating two heap strings per needle leaf.
-func (c *Compiler) pointerChild(base, key string) string {
+func (c *compiler) pointerChild(base, key string) string {
 	buf := append(c.tmp[:0], base...)
 	buf = append(buf, '/')
 	buf = appendEscapedPointerSegment(buf, key)
@@ -603,7 +632,7 @@ func (c *Compiler) pointerChild(base, key string) string {
 // collection indexes use scalarObjectContainmentPlan for wider nested scalar
 // objects. Compilation may allocate for an escaped key or the tiny scalar
 // tape; execution does not.
-func (c *Compiler) singleScalarObjectContainmentProbe(needle vibejson.Index) (string, vibejson.Index, bool, error) {
+func (c *compiler) singleScalarObjectContainmentProbe(needle vibejson.Index) (string, vibejson.Index, bool, error) {
 	root := needle.Root()
 	count, ok := root.ObjectLen()
 	if !ok || count != 1 {
@@ -629,7 +658,7 @@ func (c *Compiler) singleScalarObjectContainmentProbe(needle vibejson.Index) (st
 // that document is a scalar (as opposed to an array or object). It reuses the
 // core validator by building the needle's index once; the root kind then tells
 // the compiler whether the value postings can prune the leaf.
-func (c *Compiler) containsNeedleIndex(s string) (vibejson.Index, bool, error) {
+func (c *compiler) containsNeedleIndex(s string) (vibejson.Index, bool, error) {
 	// The index reads the needle text and never writes it, so it views the
 	// string in place instead of copying it. Copying would be a per-needle
 	// allocation to duplicate bytes the predicate already retains — and the
@@ -648,7 +677,7 @@ func (c *Compiler) containsNeedleIndex(s string) (vibejson.Index, bool, error) {
 
 // buildNeedleIndex indexes one needle onto c's tape arena. src must outlive
 // the plan, since the index borrows rather than copies it.
-func (c *Compiler) buildNeedleIndex(src []byte) (vibejson.Index, error) {
+func (c *compiler) buildNeedleIndex(src []byte) (vibejson.Index, error) {
 	entries, err := vibejson.RequiredIndexEntries(src)
 	if err != nil {
 		return vibejson.Index{}, err
@@ -829,8 +858,7 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 // memberships, one per column. A disjunction of equalities on one path is a
 // membership by definition — x = 1 OR x = 2 is exactly x IN (1, 2) — so this
 // is a normalization, not a heuristic, and it applies whatever front end
-// produced the tree: the builder's Or, SQL's OR, and a query document's $or
-// all reach it.
+// produced the tree: the builder's Or and SQL's OR both reach it.
 //
 // The win is on the other side of candidate generation. A disjunction tests
 // its operands one at a time, so a row costs one comparison per alternative
@@ -860,7 +888,7 @@ func mergeableEquality(p *compiledPredicate) bool {
 	return p.kind == predCmp && p.op == Eq && p.col >= 0 && p.boundPath == ""
 }
 
-func (c *Compiler) coalesceEqualityDisjuncts(kids []*compiledPredicate, reg *pathRegistry) []*compiledPredicate {
+func (c *compiler) coalesceEqualityDisjuncts(kids []*compiledPredicate, reg *pathRegistry) []*compiledPredicate {
 	// The tally is a linearly scanned slice rather than the two maps this
 	// used to build. A disjunction names one or two columns, so the maps were
 	// two allocations and a hash per operand spent to avoid a comparison per

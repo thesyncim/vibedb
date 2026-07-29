@@ -3,8 +3,8 @@ package query
 import (
 	"testing"
 
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // Given a bounded family of Segments built with the inverted postings enabled,

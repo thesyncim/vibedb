@@ -99,6 +99,14 @@ func CompileExactIndex(def IndexDefinition) (*ExactIndex, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: path %d: %v", ErrIndexDefinition, i, err)
 		}
+		for previous := range i {
+			if out.Specs[previous] == owned {
+				return nil, fmt.Errorf(
+					"%w: duplicate path %q at columns %d and %d",
+					ErrIndexDefinition, owned, previous, i,
+				)
+			}
+		}
 		out.Paths[i] = pointer
 		out.Specs[i] = owned
 	}

@@ -78,6 +78,12 @@ func (lx *lexer) next() token {
 		return token{kind: tokLBracket, pos: start}
 	case ']':
 		return token{kind: tokRBracket, pos: start}
+	case '{':
+		// A JSON document position consumes the complete object directly from
+		// source text. Give its opener a constant token so looking ahead does
+		// not format an "unexpected character" error that the JSON scanner
+		// would immediately discard.
+		return token{kind: tokLBrace, pos: start}
 	case '.':
 		return token{kind: tokDot, pos: start}
 	case '?':
@@ -281,9 +287,9 @@ func errfToken(pos int, format string, args ...any) token {
 // Admitting the high bytes is deliberate. An identifier here is a JSON object
 // key, and JSON keys are arbitrary UTF-8; requiring `"café"` to be quoted only
 // because of its accent would make the common case of non-English data uglier
-// than the SQL it replaces. Malformed UTF-8 is admitted too and simply becomes
-// a key that no document matches, which is a query result rather than a parser
-// failure — the same outcome as any other misspelled field.
+// than the SQL it replaces. Parser admission has already validated the whole
+// statement as UTF-8, so treating every byte of a multibyte rune as an
+// identifier byte cannot admit a malformed string into the AST.
 func isIdentStart(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
 }

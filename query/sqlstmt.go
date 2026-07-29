@@ -3,8 +3,8 @@ package query
 import (
 	"fmt"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The prepared-statement front end: a parsed [sqlast.SelectStmt] lowered onto
@@ -19,12 +19,12 @@ import (
 // OFFSET — applied somewhere, because the parser accepts both and silently
 // dropping either returns wrong rows.
 //
-// Rebuilding the plan per bind is the reason a Statement owns a [Compiler]
-// rather than borrowing one. A Compiler's arenas are refilled by a warmed
+// Rebuilding the plan per bind is the reason a Statement owns an internal
+// compiler rather than borrowing one. Its arenas are refilled by a warmed
 // compile instead of reallocated, so the steady state of "bind, execute, bind,
 // execute" allocates nothing; but a Query it produced is invalidated by its
-// next compile, so two statements sharing one Compiler would invalidate each
-// other's plan the moment both were prepared. One Compiler per Statement makes
+// next compile, so two statements sharing one compiler would invalidate each
+// other's plan the moment both were prepared. One compiler per Statement makes
 // the lifetime rule "a Statement's plan is valid until that Statement's next
 // bind", which is a rule a caller can actually hold to.
 
@@ -32,7 +32,7 @@ import (
 // it lowers to, and the output schema the plan does not carry.
 //
 // It is single-consumer and not safe for concurrent use, for the same reason
-// [Compiler] and [Exec] are: it holds the storage that makes a warmed
+// its internal compiler and [Exec] are: it holds the storage that makes a warmed
 // bind-and-execute allocation-free, and two goroutines binding one Statement
 // would interleave writes into a single plan. A pool of connections gives each
 // connection its own Statement.
@@ -71,9 +71,9 @@ type Statement struct {
 
 	// c and q are this statement's own compiler and the Query it compiles
 	// into. They are values rather than pointers so a Statement is one
-	// allocation; see the Compiler's own note on why it hands back pointers it
+	// allocation; see the compiler's own note on why it hands back pointers it
 	// merely holds rather than addresses of its own fields.
-	c Compiler
+	c compiler
 	q Query
 
 	// specBuf and specs memoize each path's rendered engine spec. A path's
@@ -158,6 +158,31 @@ func PrepareStatement(src string) (*Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	return PrepareParsedStatement(src, tree)
+}
+
+// PrepareParsedStatement lowers an already-parsed SELECT without parsing its
+// source a second time.
+//
+// src is retained only for diagnostics. tree must be a complete, validated
+// tree returned by the sql package and must not be mutated while the returned
+// Statement is live. The Statement retains tree but does not alter it. If tree
+// came from a reusable [sqlast.Parser], that Parser must not parse again or be
+// released until this Statement is released: parsing rewinds the arena that
+// owns tree. Several Statements may share a genuinely immutable tree, but each
+// Statement remains single-consumer because its compiler storage is mutable.
+//
+// This is the entry point for adapters that must inspect the AST before
+// lowering—for example, a database/sql driver enforcing catalog-specific
+// surface rules. Parse once, validate once, and pass that same immutable tree
+// here.
+func PrepareParsedStatement(
+	src string,
+	tree *sqlast.SelectStmt,
+) (*Statement, error) {
+	if tree == nil {
+		return nil, fmt.Errorf("query: PrepareParsedStatement was given a nil SELECT")
+	}
 	return prepareTree(src, tree)
 }
 
@@ -206,8 +231,8 @@ func (s *Statement) NumParams() int { return s.params }
 func (s *Statement) SQL() string { return s.text }
 
 // NumJoins returns the number of JOIN clauses. A statement with any of them
-// must execute against a [FromDatabase] source, whose database snapshot
-// resolves every collection at one instant; a caller holding a single
+// must execute against [FromDatabase] or [FromFileDatabase], whose database
+// snapshot resolves every collection at one instant; a caller holding a single
 // collection can refuse it before it takes a snapshot it would only discard.
 func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
 
@@ -233,7 +258,7 @@ func (s *Statement) Release() {
 	if s == nil {
 		return
 	}
-	s.c.Release()
+	s.c.release()
 	*s = Statement{}
 }
 
@@ -242,8 +267,10 @@ func (s *Statement) Release() {
 //
 // args must hold exactly [Statement.NumParams] values. Each may be nil, a
 // bool, any signed or unsigned integer, a float, a string, a []byte, or a
-// [Number]; a nil argument makes its leaf UNKNOWN, exactly as a SQL NULL
-// comparison would. Anything else is rejected by name.
+// [Number]. The pointer forms *bool, *int64, *float64, *string, and *Number are
+// also accepted so protocol adapters can bind stable scalar slots without
+// boxing allocations; a nil pointer or nil argument makes its leaf UNKNOWN,
+// exactly as a SQL NULL comparison would. Anything else is rejected by name.
 //
 // The returned [Cursor] walks e.Result, applying the HAVING filter and the
 // OFFSET and LIMIT the plan could not carry. It borrows e and stays valid until
@@ -266,6 +293,12 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 func (s *Statement) Run(src Source, args []any) (Result, Cursor, error) {
 	var e Exec
 	cursor, err := s.RunInto(&e, src, args)
+	// Match Query.Run's one-shot lifecycle: a durable execution parks a
+	// scanner and workers in Exec for reuse, but this transient Exec has no
+	// second call or Release through which to retire them. Stopping the pool
+	// does not affect Result or Cursor; durable cells own their bytes and the
+	// cursor only walks the completed Result.
+	e.file.stopPool()
 	return e.Result, cursor, err
 }
 
@@ -273,6 +306,9 @@ func (s *Statement) Run(src Source, args []any) (Result, Cursor, error) {
 // placeholders lowered once at prepare and is answered from the cached
 // outcome, which is what makes its execution byte-identical to the builder's.
 func (s *Statement) bind(args []any) error {
+	if s == nil || s.tree == nil {
+		return fmt.Errorf("query: cannot execute a nil or released Statement")
+	}
 	if len(args) != s.params {
 		return fmt.Errorf(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",

@@ -226,6 +226,42 @@ func (r *ResidentPrimaryRouter) walkTablet(
 				return fmt.Errorf("%w: resident anchor row",
 					ErrSegmentedTabletRouterCorrupt)
 			}
+			var fenceBytes uint64
+			if leafRank == 0 {
+				fenceBytes = uint64(len(tabletFloor))
+			} else {
+				var sizeOK bool
+				fenceBytes, sizeOK = checkedSizeAdd(
+					uint64(len(fence.a)),
+					uint64(len(fence.b)),
+					uint64(^uint32(0)),
+				)
+				if sizeOK {
+					fenceBytes, sizeOK = checkedSizeAdd(
+						fenceBytes,
+						uint64(len(fence.c)),
+						uint64(^uint32(0)),
+					)
+				}
+				if !sizeOK {
+					anchorLease.Release()
+					tabletLease.Release()
+					return fmt.Errorf("%w: resident fence arena",
+						ErrSegmentedTabletRouterCorrupt)
+				}
+			}
+			fenceLimit := uint64(^uint32(0))
+			if intLimit := uint64(maxIntValue); intLimit < fenceLimit {
+				fenceLimit = intLimit
+			}
+			if _, sizeOK := checkedSizeAdd(
+				uint64(len(r.fences)), fenceBytes, fenceLimit,
+			); !sizeOK {
+				anchorLease.Release()
+				tabletLease.Release()
+				return fmt.Errorf("%w: resident fence arena",
+					ErrSegmentedTabletRouterCorrupt)
+			}
 			start := len(r.fences)
 			if leafRank == 0 {
 				r.fences = append(r.fences, tabletFloor...)
@@ -233,13 +269,6 @@ func (r *ResidentPrimaryRouter) walkTablet(
 				r.fences = append(r.fences, fence.a...)
 				r.fences = append(r.fences, fence.b...)
 				r.fences = append(r.fences, fence.c...)
-			}
-			if len(r.fences) > int(^uint32(0)) ||
-				len(r.fences)-start > int(^uint32(0)) {
-				anchorLease.Release()
-				tabletLease.Release()
-				return fmt.Errorf("%w: resident fence arena",
-					ErrSegmentedTabletRouterCorrupt)
 			}
 			if r.Len() != 0 &&
 				bytes.Compare(r.fence(r.Len()-1), r.fences[start:]) >= 0 {
@@ -623,9 +652,26 @@ func (r *ResidentPrimaryRouter) ResidentBytes() int {
 	if r == nil {
 		return 0
 	}
-	return cap(r.fences) + cap(r.rows)*8 + cap(r.hints)*8 +
-		cap(r.searchKeys)*8 + cap(r.searchTops)*8 +
-		cap(r.empty)*4 + cap(r.mergeAbort)*4
+	limit := uint64(maxIntValue)
+	total := uint64(cap(r.fences))
+	terms := [6][2]uint64{
+		{uint64(cap(r.rows)), 8},
+		{uint64(cap(r.hints)), 8},
+		{uint64(cap(r.searchKeys)), 8},
+		{uint64(cap(r.searchTops)), 8},
+		{uint64(cap(r.empty)), 4},
+		{uint64(cap(r.mergeAbort)), 4},
+	}
+	for _, term := range terms {
+		bytes, ok := checkedSizeMul(term[0], term[1], limit)
+		if ok {
+			total, ok = checkedSizeAdd(total, bytes, limit)
+		}
+		if !ok {
+			return maxIntValue
+		}
+	}
+	return int(total)
 }
 
 // BuildDuration reports the wall time spent walking and packing the graph,

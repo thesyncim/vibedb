@@ -11,30 +11,63 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
-// ExecOptions controls bounded batch execution over a [durable.Snapshot], plus
-// the one bound a heap join execution takes. The zero value selects one worker
-// per GOMAXPROCS, the default batch and memory targets, and the default join
-// threshold, so a caller who does not care never has to fill it in. Heap
-// sources ignore everything but JoinMembershipMax, having neither worker
-// batches nor a spill frontier to bound.
+// ExecOptions controls execution resource bounds. The zero value selects one
+// worker per GOMAXPROCS, the default batch, memory, result, exact-aggregate,
+// spill, and join budgets, so a caller who does not care never has to fill it
+// in. MemoryBytes applies to every source: it is the durable batch/merge target
+// and the admission limit for heap/Segment row-proportional work, decoded text,
+// grouping, join memberships, and durable index planning. BatchRows,
+// BatchBytes, SpillDirectory, and SpillBytes are durable-only.
 //
-// MemoryBytes is a working-memory target, not a limit on the returned Result:
-// a caller asking for an unbounded projection necessarily owns output
-// proportional to the number and size of selected rows. One oversized JSON
-// document may also exceed the target by itself.
+// For durable sources MemoryBytes is deliberately a batch/merge target, not a
+// total resident-capacity ceiling: fixed worker/ring minima and one document
+// bounded by the collection's MaxDocumentBytes schema may exceed it. Optional
+// index planning, join membership, and containment tapes are data-dependent
+// additions and still use fail-closed admission. MemoryBytes is separate from
+// the returned Result; ResultRows and ResultBytes independently bound
+// materialized output for every source.
 type ExecOptions struct {
-	Workers        int
-	BatchRows      int
-	BatchBytes     int64
-	MemoryBytes    int64
+	Workers     int
+	BatchRows   int
+	BatchBytes  int64
+	MemoryBytes int64
+	// Cancel is an optional reusable cooperative cancellation signal. A nil
+	// flag is the default and adds no allocation or atomic operation to the
+	// execution path. When non-nil, cancellation returns [ErrCanceled] only
+	// after workers, reusable channels, spill files, and borrowed resources
+	// have been cleaned up. Clear a canceled flag with [CancelFlag.Reset] only
+	// after the execution has returned.
+	Cancel *CancelFlag
+	// ResultRows bounds rows materialized before HAVING/OFFSET cursor filtering.
+	// ResultBytes bounds logical ResultColumn/Cell storage plus every cell's
+	// retained variable-width representation, including bytes borrowed from a
+	// heap Segment and bytes copied out of durable snapshots. A string charges
+	// both its exact JSON spelling and decoded contents because Result retains
+	// both. Zero selects the conservative defaults [DefaultResultRows] and
+	// [DefaultResultBytes]; -1 explicitly disables that limit. Exceeding either
+	// returns *ResultBudgetError before the rejected result storage is grown.
+	ResultRows  int
+	ResultBytes int64
+	// AggregateBytes bounds the whole execution's retained exact-decimal
+	// coefficient, exponent, extremum, and result-digit storage across every
+	// group and worker partial. Zero selects a conservative 16 MiB default.
+	// Exceeding it returns *AggregateBudgetError before an unbounded decimal
+	// alignment or zero run can be allocated.
+	AggregateBytes int64
 	SpillDirectory string
+	// SpillBytes bounds live temporary run files for durable ORDER BY and GROUP
+	// BY execution. Zero selects 1 GiB; -1 explicitly disables the quota.
+	// Writers enforce it before a file grows past the remaining allowance,
+	// including the old and new runs that coexist during a merge.
+	SpillBytes int64
 
 	// JoinMembershipMax is how many inner join-key values a semi-join collects
 	// before it abandons the membership strategy and drives the join as a
@@ -48,6 +81,14 @@ type ExecOptions struct {
 	// differential proves the adaptive choice changes cost and never the answer.
 	// It never changes which rows a query returns.
 	JoinMembershipMax int
+
+	// JoinPairBytes bounds the retained pair-address, gathered-column, and
+	// decoded-text workspace of an inner join. Zero selects 64 MiB; -1
+	// explicitly disables the bound. A multiplicative fan-out that exceeds it
+	// returns *JoinPairBudgetError rather than allocating until OOM. This is
+	// separate from ResultBytes because COUNT(*) may have one result cell while
+	// still needing to inspect every joined pair.
+	JoinPairBytes int64
 
 	// JoinFilterScanRatio is how many inner rows a semi-join clause that has
 	// outgrown its membership will scan, per outer row, to build the prefilter
@@ -68,7 +109,7 @@ type ExecOptions struct {
 
 // fileWorkspace owns the reusable storage one durable execution needs beyond
 // the general [Workspace]: the persistent-index probe I/O workspace, the
-// residual bitmap, the typed cover reductions, the group frontier, and — since
+// residual bitmap, the group frontier, and — since
 // the batched executor stopped minting its scan storage per batch — the
 // per-worker scan workspaces, the in-flight batch ring, and the merge
 // frontier. It lives unexported inside [Exec] because it is neither
@@ -82,14 +123,10 @@ type ExecOptions struct {
 // inside each batch, which meant no amount of Exec reuse could ever warm the
 // scan — every BatchRows documents re-grew all of it from empty.
 type fileWorkspace struct {
-	index         durable.IndexWorkspace
-	overflow      []byte
-	reductions    []store.Float64Aggregate
-	coverPaths    []string
-	accs          []aggAcc
-	indexGroups   []durable.IndexScalarGroup
-	indexResidual []store.Mask
-	fileGroups    []fileGroup
+	index      durable.IndexWorkspace
+	overflow   []byte
+	accs       []aggAcc
+	fileGroups []fileGroup
 
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
@@ -159,11 +196,7 @@ func (w *fileWorkspace) release() {
 	w.stopPool()
 	w.index.Release()
 	w.overflow = nil
-	w.reductions = nil
-	w.coverPaths = nil
 	w.accs = nil
-	w.indexGroups = nil
-	w.indexResidual = nil
 	w.fileGroups = nil
 	w.workers = nil
 	w.segments = nil
@@ -177,6 +210,42 @@ func (w *fileWorkspace) release() {
 	w.rowRuns = nil
 	w.groupRuns = nil
 	w.spillFiles = nil
+}
+
+// abort severs every logical value a canceled durable execution retained while
+// preserving the top-level high-water buffers and parked worker pool for
+// reuse. Spill files are removed by spillManager's defer before this runs.
+func (w *fileWorkspace) abort() {
+	if w == nil {
+		return
+	}
+	resetAggs(w.accs)
+	clear(w.fileGroups)
+	w.fileGroups = w.fileGroups[:0]
+	for i := range w.workers {
+		w.workers[i].clearBorrowedViews()
+	}
+	for i := range w.slots {
+		resetAggs(w.slots[i].accs)
+		clear(w.slots[i].rows)
+		w.slots[i].rows = w.slots[i].rows[:0]
+		clear(w.slots[i].groups)
+		w.slots[i].groups = w.slots[i].groups[:0]
+		clear(w.slots[i].byKey)
+		w.slots[i].partial = filePartial{}
+		w.slots[i].ready = false
+	}
+	clear(w.rows)
+	w.rows = w.rows[:0]
+	clear(w.groupIndex)
+	clear(w.groupSet)
+	w.groupSet = w.groupSet[:0]
+	clear(w.mergedGroups)
+	w.mergedGroups = w.mergedGroups[:0]
+	clear(w.rowRuns)
+	w.rowRuns = w.rowRuns[:0]
+	clear(w.groupRuns)
+	w.groupRuns = w.groupRuns[:0]
 }
 
 // A fileSlot is the scratch one in-flight batch sequence owns: the scan
@@ -242,10 +311,9 @@ func clearTail[T any](s []T, n int) {
 // ExecStats describes the physical work performed by the last execution into
 // an [Exec]. The durable backend measures the scan and index fields; heap
 // sources reset them. The Join fields are the exception: they are written by
-// whichever backend bound the join clauses, which today is the heap database
-// source, because which strategy a join measured its way into is the one
-// execution decision this package makes that a caller cannot predict from the
-// plan.
+// either coherent database source, because which strategy a join measured its
+// way into is the one execution decision this package makes that a caller
+// cannot predict from the plan.
 // RowsTotal is the snapshot cardinality while
 // RowsScanned is the number of JSON documents admitted to execution after
 // persistent-index pushdown. IndexCertificateRows were decided from a
@@ -274,8 +342,6 @@ type ExecStats struct {
 	CandidateRows        uint64
 	CandidateChunks      int
 	CoveringColumns      int
-	IndexGroupedRows     uint64
-	IndexGroups          int
 
 	// JoinMemberships counts the join clauses whose inner side fit under the
 	// threshold and were pushed into the outer predicate as a membership;
@@ -311,6 +377,8 @@ type ExecStats struct {
 
 const (
 	defaultFileMemory = int64(64 << 20)
+	minimumFileMemory = int64(64 << 10)
+	defaultSpillBytes = int64(1 << 30)
 	defaultBatchRows  = 4096
 	maxSpillFanIn     = 32
 )
@@ -331,6 +399,7 @@ type normalizedFileOptions struct {
 	batchBytes  int64
 	memoryBytes int64
 	mergeBytes  int64
+	spillBytes  int64
 	spillDir    string
 }
 
@@ -346,7 +415,7 @@ func normalizeFileOptions(opts ExecOptions) (normalizedFileOptions, error) {
 	if memoryBytes == 0 {
 		memoryBytes = defaultFileMemory
 	}
-	if memoryBytes < 64<<10 {
+	if memoryBytes < minimumFileMemory {
 		return normalizedFileOptions{}, fmt.Errorf("query: MemoryBytes must be at least 64 KiB")
 	}
 	batchRows := opts.BatchRows
@@ -368,28 +437,40 @@ func normalizeFileOptions(opts ExecOptions) (normalizedFileOptions, error) {
 	if batchBytes < 1 {
 		return normalizedFileOptions{}, fmt.Errorf("query: BatchBytes must be positive")
 	}
+	spillBytes := opts.SpillBytes
+	switch {
+	case spillBytes < -1:
+		return normalizedFileOptions{}, fmt.Errorf(
+			"query: SpillBytes must be -1, zero, or positive",
+		)
+	case spillBytes == 0:
+		spillBytes = defaultSpillBytes
+	}
 	return normalizedFileOptions{
 		workers: workers, batchRows: batchRows, batchBytes: batchBytes,
 		memoryBytes: memoryBytes, mergeBytes: memoryBytes / 2,
-		spillDir: opts.SpillDirectory,
+		spillBytes: spillBytes, spillDir: opts.SpillDirectory,
 	}, nil
 }
 
-// runFileInto executes p over a page-backed snapshot in parallel batches,
-// under e.Options and into e's Result, Workspace, and durable planning
-// storage. Ordered projections and grouped reductions spill sorted runs once
-// their merge frontier reaches MemoryBytes; spill merges open at most 32 files
-// at a time. Repeated calls reuse the Result's column cells and packed
-// variable-width value arena, so once their observed high-water marks fit,
-// result materialization allocates nothing. Materialized cells own their bytes
-// and stay valid after the snapshot is closed, until e is reused or released.
-// The snapshot stays owned by the caller.
-// runFileInto executes p over a durable snapshot. catalog is the database cut
-// the driving snapshot came from, empty when the Source named a single file; a
-// join clause resolves its inner collection out of it.
+// runFileInto executes p over a page-backed snapshot in parallel batches under
+// e.Options and into e's Result, Workspace, and durable planning storage.
+// catalog is the database cut the driving snapshot came from, empty when the
+// Source named a single file; a join clause resolves its inner collection out
+// of it. Ordered projections and grouped reductions spill sorted runs once
+// their merge frontier reaches MemoryBytes after any admitted index-planning
+// capacity is debited; spill merges open at most 32 files at a time. Repeated
+// calls reuse the Result's column cells and packed variable-width value arena,
+// so once their observed high-water marks fit, result materialization allocates
+// nothing. Materialized cells own their bytes and stay valid after the snapshot
+// is closed, until e is reused or released. The snapshot stays owned by the
+// caller.
 func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.DatabaseSnapshot) error {
 	e.Result.fileData = e.Result.fileData[:0]
 	e.Stats = ExecStats{}
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
 	n, err := normalizeFileOptions(e.Options)
 	if err != nil {
 		return err
@@ -407,7 +488,14 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		// correctness workaround: they are unsafe here, not merely unprofitable.
 		return p.runFileJoinedBatched(e, snapshot, catalog, n, stats)
 	}
-	directIndex, handled, directErr := p.runDirectFileIndexedCount(snapshot, e)
+	// At most half of work memory is offered to an index plan. The admitted
+	// worst-case capacity is debited from the batched executor if the direct
+	// lane declines, while the other half guarantees a scan fallback remains
+	// available without turning an optional index into a resource error.
+	plannerMemory := n.memoryBytes / 2
+	directIndex, handled, directErr := p.runDirectFileIndexedCount(
+		snapshot, e, plannerMemory,
+	)
 	if handled {
 		stats.IndexBounded = directIndex.bounded
 		stats.IndexLookups = directIndex.lookups
@@ -417,24 +505,18 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		stats.CandidateRows = directIndex.rows
 		stats.CandidateChunks = directIndex.chunks
 		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
 		return directErr
 	}
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
 		e.Stats = stats
-		return directErr
-	}
-	groupStats, handled, directErr := p.runDirectFileIndexGroups(snapshot, e)
-	if handled {
-		stats.IndexLookups = groupStats.lookups
-		stats.IndexPostingPages = groupStats.postingPages
-		stats.IndexCertificateRows = groupStats.certificates
-		stats.IndexRecheckRows = groupStats.rechecks
-		stats.RowsScanned = groupStats.rechecks
-		stats.IndexGroupedRows = groupStats.certificates
-		stats.IndexGroups = groupStats.groups
-		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
 		return directErr
 	}
 	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, n, stats)
@@ -450,6 +532,9 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 func (p *plan) runFileOverlayInto(e *Exec, snapshot *durable.Snapshot, overlay FileOverlay) error {
 	e.Result.fileData = e.Result.fileData[:0]
 	e.Stats = ExecStats{}
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
 	n, err := normalizeFileOptions(e.Options)
 	if err != nil {
 		return err
@@ -487,10 +572,37 @@ func (p *plan) runFileSnapshotBatched(
 	// tails below stay one expression each; the caller stores it back into the
 	// Exec. Taking it from e keeps its retained cell and arena capacity.
 	result, stats = e.Result, base
-	candidateMasks, err := p.fileCandidateMasks(snapshot, &e.file.index, &e.Workspace)
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return result, stats, err
+	}
+	work := &e.Workspace.heapWorkBudget
+	if !work.active {
+		work.begin(n.memoryBytes)
+	}
+	candidateMasks, plannerBytes, err := p.fileCandidateMasksBounded(
+		snapshot, &e.file.index, &e.Workspace, work.remaining()/2,
+	)
 	if err != nil {
 		return result, stats, err
 	}
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return result, stats, err
+	}
+	if plannerBytes != 0 {
+		if err := work.admit(
+			"durable candidate-planner workspace",
+			plannerBytes,
+		); err != nil {
+			return result, stats, err
+		}
+	}
+	n.memoryBytes = work.remaining()
+	// A fileArena's controlled growth retains earlier generations while the
+	// merge frontier still references them. Its cumulative capacity is less
+	// than four times the logical bytes the frontier reports, so spilling at a
+	// quarter of the unreserved account leaves room for that real backing
+	// storage rather than treating logical row bytes as allocated capacity.
+	n.mergeBytes = max(int64(1), n.memoryBytes/4)
 	stats.IndexLookups = e.Workspace.storeIndexProbes
 	stats.IndexBounded = candidateMasks != nil
 	if stats.IndexBounded {
@@ -503,14 +615,21 @@ func (p *plan) runFileSnapshotBatched(
 			stats.CandidateChunks++
 		}
 	}
-	spills := newSpillManager(n.spillDir, e.file.spillFiles)
+	spills := newSpillManager(
+		n.spillDir, e.file.spillFiles, p.columns, len(p.groupCols),
+		&e.Workspace.aggregateBudget, n.spillBytes, e.Options.Cancel,
+	)
 	// The spill tallies are folded into the named result here, because the
 	// function returns from a dozen places and every one of them has to report
 	// what was written to disk — including the error paths, whose runs still
 	// have to be accounted for and removed.
 	defer func() {
 		stats.SpillRuns, stats.SpilledBytes = spills.runs, spills.size
-		e.file.spillFiles = spills.cleanup()
+		var cleanupErr error
+		e.file.spillFiles, cleanupErr = spills.cleanup()
+		if cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
 	}()
 
 	pool := e.file.poolFor(n.workers)
@@ -543,6 +662,9 @@ func (p *plan) runFileSnapshotBatched(
 	for i := range e.file.arenas {
 		e.file.arenas[i].reset()
 	}
+	for i := range e.file.compact {
+		e.file.compact[i].rewind()
+	}
 	// Each worker's evaluator is pointed at the one set of bindings the binder
 	// produced, on this goroutine, before any worker is woken. That is the same
 	// read-only/per-worker split bindScanWorkers performs for the heap filter
@@ -562,6 +684,10 @@ func (p *plan) runFileSnapshotBatched(
 		binds = e.Workspace.joins
 	}
 	for worker := range e.file.workers {
+		e.file.workers[worker].heapWorkParent = work
+		e.file.workers[worker].heapWorkTextReserved = 0
+		e.file.workers[worker].cancel = e.Options.Cancel
+		e.file.workers[worker].eval.setWork(work)
 		e.file.workers[worker].eval.bindTo(binds)
 	}
 	pool.start(fileJob{
@@ -569,12 +695,15 @@ func (p *plan) runFileSnapshotBatched(
 		overflow: &e.file.overflow, slots: slots,
 		spaces: e.file.workers, segments: e.file.segments,
 		arenas: e.file.arenas, opts: n, active: n.workers,
+		budget: &e.Workspace.aggregateBudget, cancel: e.Options.Cancel,
 	})
 	cancel := func() { pool.stopped.Store(true) }
 
 	var firstErr error
 	rows := e.file.rows[:0]
 	var rowBytes int64
+	var resultRows int
+	var resultPayloadBytes int64
 	rowRuns := e.file.rowRuns[:0]
 	var accs []aggAcc
 	// compactAt alternates the consumer's own row arena; see the unordered
@@ -593,18 +722,35 @@ func (p *plan) runFileSnapshotBatched(
 			if firstErr == nil {
 				firstErr = part.err
 			}
+			cancel()
 			return
 		}
 		if firstErr != nil {
 			return
 		}
+		if cancelErr := cancellationError(e.Options.Cancel); cancelErr != nil {
+			firstErr = cancelErr
+			cancel()
+			return
+		}
 		switch {
 		case p.grouped:
 			for i := range part.groups {
+				if cancelErr := cancellationCheckpoint(e.Options.Cancel, i); cancelErr != nil {
+					firstErr = cancelErr
+					cancel()
+					return
+				}
 				g := &part.groups[i]
 				if id, ok := byKey[g.key]; ok {
 					dst := &groups[id]
-					mergeAggs(dst.accs, g.accs)
+					if err := mergeAggs(
+						dst.accs, g.accs, p.columns, &e.Workspace.aggregateBudget,
+					); err != nil {
+						firstErr = err
+						cancel()
+						return
+					}
 					if g.first < dst.first {
 						dst.first = g.first
 					}
@@ -637,17 +783,59 @@ func (p *plan) runFileSnapshotBatched(
 				}
 			}
 		case p.singleRow:
+			if cancelErr := cancellationError(e.Options.Cancel); cancelErr != nil {
+				firstErr = cancelErr
+				cancel()
+				return
+			}
 			if accs == nil {
 				accs = resize(e.file.accs, len(p.columns))
-				clear(accs)
+				resetAggs(accs)
 				e.file.accs = accs
 			}
-			mergeAggs(accs, part.accs)
+			if err := mergeAggs(
+				accs, part.accs, p.columns, &e.Workspace.aggregateBudget,
+			); err != nil {
+				firstErr = err
+				cancel()
+				return
+			}
 		default:
+			if len(p.order) == 0 {
+				admit := len(part.rows)
+				if p.hasLimit {
+					admit = min(admit, max(p.limit-resultRows, 0))
+				}
+				for i := 0; i < admit; i++ {
+					if cancelErr := cancellationCheckpoint(e.Options.Cancel, i); cancelErr != nil {
+						firstErr = cancelErr
+						cancel()
+						return
+					}
+					payload, ok := fileResultPayloadBytes(part.rows[i])
+					if !ok || resultPayloadBytes > int64(^uint64(0)>>1)-payload {
+						firstErr = e.Result.resultByteBudgetError(
+							resultRows+1, int64(^uint64(0)>>1),
+						)
+						cancel()
+						return
+					}
+					resultPayloadBytes += payload
+				}
+				resultRows += admit
+				if _, err := e.Result.checkResultBudget(
+					len(p.columns), resultRows, resultPayloadBytes,
+				); err != nil {
+					firstErr = err
+					cancel()
+					return
+				}
+			}
 			rows = append(rows, part.rows...)
 			rowBytes += part.bytes
 			// An unordered LIMIT needs only the earliest source ordinals.
-			if len(p.order) == 0 && p.hasLimit && len(rows) > p.limit*2+1 {
+			if len(p.order) == 0 && p.hasLimit &&
+				len(rows) > unorderedTrimThreshold(p.limit) {
 				slices.SortFunc(rows, compareFileOrdinal)
 				rows = rows[:p.limit]
 				// The rows just dropped are the majority, and their bytes live
@@ -666,7 +854,18 @@ func (p *plan) runFileSnapshotBatched(
 				compactAt ^= 1
 				survivors.rewind()
 				for i := range rows {
-					rows[i] = repackRow(survivors, rows[i])
+					if cancelErr := cancellationCheckpoint(e.Options.Cancel, i); cancelErr != nil {
+						firstErr = cancelErr
+						cancel()
+						return
+					}
+					repacked, repackErr := repackRow(survivors, rows[i])
+					if repackErr != nil {
+						firstErr = repackErr
+						cancel()
+						return
+					}
+					rows[i] = repacked
 				}
 				pool.dropped.Store(nextSequence + 1)
 				rowBytes = estimateRows(rows)
@@ -755,8 +954,9 @@ func (p *plan) runFileSnapshotBatched(
 	stats.Batches = scan.batches
 	stats.PeakBatchRows = scan.peakRows
 	stats.PeakBatchBytes = scan.peakBytes
-	if scan.err != nil && !errors.Is(scan.err, errFileExecutionStopped) && firstErr == nil {
-		firstErr = scan.err
+	firstErr = fileExecutionError(firstErr, scan.err)
+	if firstErr == nil {
+		firstErr = cancellationError(e.Options.Cancel)
 	}
 	if firstErr != nil {
 		clear(rows)
@@ -781,30 +981,42 @@ func (p *plan) runFileSnapshotBatched(
 			if err != nil {
 				return result, stats, err
 			}
+			previousMerged := e.file.mergedGroups
 			var merged []fileGroup
-			merged, err = spills.readMergedGroups(e.file.mergedGroups[:0], groupRuns)
+			merged, err = spills.readMergedGroups(
+				p, &result, previousMerged[:0], groupRuns, n.memoryBytes,
+			)
+			clearTail(previousMerged, len(merged))
 			e.file.mergedGroups = merged
 			if err != nil {
+				clear(merged)
+				e.file.mergedGroups = merged[:0]
 				return result, stats, err
 			}
-			return p.fileGroupResultInto(result, merged), stats, nil
+			result, err = p.fileGroupResultInto(result, merged, &e.Workspace)
+			return result, stats, err
 		}
 		// Unspilled, the frontier is already the group set, so materialization
 		// sorts it where it stands rather than through a copy.
-		return p.fileGroupResultInto(result, groups), stats, nil
+		result, err = p.fileGroupResultInto(result, groups, &e.Workspace)
+		return result, stats, err
 	case p.singleRow:
 		if accs == nil {
 			accs = resize(e.file.accs, len(p.columns))
-			clear(accs)
+			resetAggs(accs)
 			e.file.accs = accs
 		}
 		resultRows := 1
 		if p.hasLimit && p.limit == 0 {
 			resultRows = 0
 		}
-		prepareResult(&result, p, resultRows)
+		if err := prepareResult(&result, p, resultRows); err != nil {
+			return result, stats, err
+		}
 		if resultRows != 0 {
-			p.fillAggregateCells(&result, 0, accs, nil, &e.Workspace)
+			if err := p.fillAggregateCells(&result, 0, accs, nil, &e.Workspace); err != nil {
+				return result, stats, err
+			}
 		}
 		return result, stats, nil
 	default:
@@ -823,9 +1035,12 @@ func (p *plan) runFileSnapshotBatched(
 			if err != nil {
 				return result, stats, err
 			}
-			rows, err = spills.readMergedRows(p, rowRuns, p.resultLimit(), rows[:0])
+			rows, err = spills.readMergedRows(
+				p, &result, rowRuns, p.resultLimit(), rows[:0],
+			)
 			if err != nil {
-				e.file.rows = rows
+				clear(rows)
+				e.file.rows = rows[:0]
 				return result, stats, err
 			}
 		} else if len(p.order) != 0 {
@@ -842,7 +1057,12 @@ func (p *plan) runFileSnapshotBatched(
 			clear(rows[limit:])
 			rows = rows[:limit]
 		}
-		result = p.fileRowResultInto(result, rows)
+		result, err = p.fileRowResultInto(result, rows, e.Options.Cancel)
+		if err != nil {
+			clear(rows)
+			e.file.rows = rows[:0]
+			return result, stats, err
+		}
 		// Every cell now owns its bytes inside the Result's arena, so the
 		// frontier's detached scalars have no reader left. Keeping the header
 		// array but clearing it retains the capacity that makes the next
@@ -852,6 +1072,22 @@ func (p *plan) runFileSnapshotBatched(
 		e.file.rows = rows[:0]
 		return result, stats, nil
 	}
+}
+
+// fileExecutionError combines the consumer/worker outcome with the scanner's
+// terminal error. A real storage or overlay failure wins over cancellation:
+// the scanner may have observed it first but still be delayed publishing
+// scanDone while a queued partial notices the flag. Stopped is only the
+// pipeline's internal response to an error already held by the consumer.
+func fileExecutionError(first, scan error) error {
+	if scan == nil || errors.Is(scan, errFileExecutionStopped) {
+		return first
+	}
+	if first == nil ||
+		errors.Is(first, ErrCanceled) && !errors.Is(scan, ErrCanceled) {
+		return scan
+	}
+	return first
 }
 
 type fileBatch struct {
@@ -876,15 +1112,9 @@ type fileBatch struct {
 // the write-back to flush alone dropped a fresh 64 KiB buffer on the floor once
 // per execution, forever. Storing at take time costs one slice-header write and
 // makes the trailing batch as warm as every other.
-func takeFileBatch(slots []fileSlot, seq, base uint64, opts normalizedFileOptions) fileBatch {
+func takeFileBatch(slots []fileSlot, seq, base uint64) fileBatch {
 	slot := &slots[seq%uint64(len(slots))]
 	b := slot.batch
-	if cap(b.data) == 0 {
-		b.data = make([]byte, 0, int(min(opts.batchBytes, 64<<10)))
-	}
-	if cap(b.ends) == 0 {
-		b.ends = make([]int, 0, min(opts.batchRows, defaultBatchRows))
-	}
 	b.seq, b.base, b.bytes = seq, base, 0
 	b.data, b.ends = b.data[:0], b.ends[:0]
 	slot.batch = b
@@ -936,8 +1166,19 @@ type fileGroup struct {
 // already detached. See Segment.Reset for the contract that makes the
 // distinction load-bearing: after the reset a retained Index would report the
 // next batch's bytes rather than fault.
-func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segment, slots []fileSlot, arena *fileArena) filePartial {
+func (p *plan) makeFilePartial(
+	batch fileBatch,
+	w *Workspace,
+	docs *store.Segment,
+	slots []fileSlot,
+	arena *fileArena,
+	budget *aggregateBudget,
+) filePartial {
 	part := filePartial{seq: batch.seq}
+	if err := w.checkCanceled(); err != nil {
+		part.err = err
+		return part
+	}
 	slot := &slots[batch.seq%uint64(len(slots))]
 	// The batch Segment carries no postings, and that is a decision, not an
 	// omission. Postings are an inverted index over a Segment's top-level keys
@@ -955,8 +1196,13 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 	// rows by construction, so this changes cost only.
 	docs.Reset()
 	start := 0
-	for _, end := range batch.ends {
-		if _, err := docs.Append(batch.data[start:end]); err != nil {
+	for row, end := range batch.ends {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			part.err = err
+			return part
+		}
+		document := batch.data[start:end]
+		if _, err := docs.Append(document); err != nil {
 			part.err = err
 			return part
 		}
@@ -970,7 +1216,19 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 		part.err = err
 		return part
 	}
-	selected := p.selectRows(ctx, nil, false, w)
+	if err := w.checkCanceled(); err != nil {
+		part.err = err
+		return part
+	}
+	selected, err := p.selectRows(ctx, nil, false, w)
+	if err != nil {
+		part.err = err
+		return part
+	}
+	if err := w.eval.firstError(); err != nil {
+		part.err = err
+		return part
+	}
 	switch {
 	case p.grouped:
 		if slot.byKey == nil {
@@ -980,7 +1238,11 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 		clear(byKey)
 		prev := slot.groups
 		groups := prev[:0]
-		for _, row := range selected {
+		for at, row := range selected {
+			if err := cancellationCheckpoint(w.cancel, at); err != nil {
+				part.err = err
+				return part
+			}
 			// The grown key buffer goes back into the Workspace. Building the
 			// key into w.groupKey[:0] and dropping the result meant every row
 			// re-grew the encoding from zero capacity — one to two allocations
@@ -993,16 +1255,33 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 				// One copy serves both the lookup key and the group's own
 				// key. Copying twice stored the same bytes twice for every
 				// distinct group in every batch.
-				key := arena.takeString(w.groupKey)
+				key, arenaErr := arena.takeString(w.groupKey)
+				if arenaErr != nil {
+					part.err = arenaErr
+					return part
+				}
 				byKey[key] = id
 				g := fileGroup{key: key, first: batch.base + uint64(row)}
-				g.scalars, g.bytes = ownScalars(arena, ctx, row, nil, nil, p.groupCols)
-				g.accs = arena.takeAccs(len(p.columns))
-				g.bytes += int64(len(g.key) + len(g.accs)*40 + 64)
+				g.scalars, g.bytes, arenaErr = ownScalars(
+					arena, ctx, row, nil, nil, p.groupCols,
+				)
+				if arenaErr != nil {
+					part.err = arenaErr
+					return part
+				}
+				g.accs, arenaErr = arena.takeAccs(len(p.columns))
+				if arenaErr != nil {
+					part.err = arenaErr
+					return part
+				}
+				g.bytes += int64(len(g.key)) + int64(len(g.accs))*aggAccStructBytes + 64
 				groups = append(groups, g)
 				part.bytes += g.bytes
 			}
-			p.accumulate(groups[id].accs, ctx, row)
+			if err := p.accumulate(groups[id].accs, ctx, row, budget); err != nil {
+				part.err = err
+				return part
+			}
 		}
 		// Entries past this batch's group count still hold the previous
 		// batch's key, detached scalars, and accumulators. Truncating alone
@@ -1013,22 +1292,56 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 		slot.groups, part.groups = groups, groups
 	case p.singleRow:
 		accs := resize(slot.accs, len(p.columns))
-		clear(accs)
-		for _, row := range selected {
-			p.accumulate(accs, ctx, row)
+		resetAggs(accs)
+		for at, row := range selected {
+			if err := cancellationCheckpoint(w.cancel, at); err != nil {
+				part.err = err
+				return part
+			}
+			if err := p.accumulate(accs, ctx, row, budget); err != nil {
+				part.err = err
+				return part
+			}
 		}
 		slot.accs, part.accs = accs, accs
-		part.bytes = int64(len(accs) * 40)
+		part.bytes = int64(len(accs)) * aggAccStructBytes
 	default:
 		if len(p.order) != 0 {
+			if err := w.checkCanceled(); err != nil {
+				part.err = err
+				return part
+			}
 			slices.SortStableFunc(selected, func(a, b int) int { return p.compareRows(ctx, a, b) })
+			if err := w.checkCanceled(); err != nil {
+				part.err = err
+				return part
+			}
 		}
 		if p.hasLimit && len(selected) > p.limit {
 			selected = selected[:p.limit]
 		}
+		// Reserve the whole batch's scalar-header slab before handing out the
+		// first row. Growing it a row at a time leaves every superseded array
+		// live through the rows already pointing into it; one exact batch
+		// reservation removes those transient generations and makes both the
+		// allocation and retained-memory cost proportional to the slab kept.
+		headsPerRow := len(p.columns) + len(p.order)
+		if headsPerRow != 0 &&
+			len(selected) > int(^uint(0)>>1)/headsPerRow {
+			part.err = fmt.Errorf("query: durable result scalar arena overflows int")
+			return part
+		}
+		if err := arena.reserveHeads(len(selected) * headsPerRow); err != nil {
+			part.err = err
+			return part
+		}
 		prev := slot.rows
 		rows := prev[:0]
-		for _, row := range selected {
+		for at, row := range selected {
+			if err := cancellationCheckpoint(w.cancel, at); err != nil {
+				part.err = err
+				return part
+			}
 			r := fileRow{ordinal: batch.base + uint64(row)}
 			// The projected and ordering scalars share one header span split in
 			// two, and every byte they detach is packed into one span of the
@@ -1037,7 +1350,14 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 			// role plus a clone per field used to cost — and, since the arena
 			// outlives the execution, no allocation at all once it is warm.
 			var used int64
-			r.values, used = ownScalars(arena, ctx, row, p.columns, p.order, nil)
+			var arenaErr error
+			r.values, used, arenaErr = ownScalars(
+				arena, ctx, row, p.columns, p.order, nil,
+			)
+			if arenaErr != nil {
+				part.err = arenaErr
+				return part
+			}
 			r.order = r.values[len(p.columns):len(r.values):len(r.values)]
 			r.values = r.values[:len(p.columns):len(p.columns)]
 			part.bytes += fileRowStructBytes + used
@@ -1048,6 +1368,10 @@ func (p *plan) makeFilePartial(batch fileBatch, w *Workspace, docs *store.Segmen
 		clearTail(prev, len(rows))
 		slot.rows, part.rows = rows, rows
 	}
+	for i := range part.groups {
+		detachAggregateExtremes(part.groups[i].accs, p.columns)
+	}
+	detachAggregateExtremes(part.accs, p.columns)
 	return part
 }
 
@@ -1172,39 +1496,73 @@ func (a *fileArena) rewind() {
 // reservation. The exact capping is what lets one reservation serve a whole row:
 // see ownScalarInto for why the storage a row is packed into must never move
 // while the row is being packed.
-func (a *fileArena) takeBytes(n int) []byte {
-	a.used += n
+func (a *fileArena) takeBytes(n int) ([]byte, error) {
+	if n < 0 || a.used > int(^uint(0)>>1)-n {
+		return nil, fmt.Errorf("query: durable result arena byte size overflows int")
+	}
+	nextUsed := a.used + n
+	nextCapacity := cap(a.bytes)
 	if cap(a.bytes)-len(a.bytes) < n {
-		a.bytes = make([]byte, 0, growCap(cap(a.bytes), a.used))
+		nextCapacity = growCap(cap(a.bytes), nextUsed)
+	}
+	a.used = nextUsed
+	if cap(a.bytes)-len(a.bytes) < n {
+		a.bytes = make([]byte, 0, nextCapacity)
 	}
 	at := len(a.bytes)
 	a.bytes = a.bytes[:at+n]
-	return a.bytes[at : at : at+n]
+	return a.bytes[at : at : at+n], nil
+}
+
+// reserveHeads ensures n more scalar headers fit without extending the active
+// span. It lets a batch reserve once before any returned row can pin the
+// current array; takeHeads remains the per-row partitioning operation.
+func (a *fileArena) reserveHeads(n int) error {
+	if n < 0 || len(a.heads) > int(^uint(0)>>1)-n {
+		return fmt.Errorf("query: durable result scalar arena overflows int")
+	}
+	required := len(a.heads) + n
+	nextCapacity := cap(a.heads)
+	if cap(a.heads)-len(a.heads) < n {
+		nextCapacity = growCap(cap(a.heads), required)
+	}
+	if cap(a.heads)-len(a.heads) < n {
+		a.heads = make([]scalar, 0, nextCapacity)
+	}
+	return nil
 }
 
 // takeHeads reserves n scalar headers. Their contents are whatever a previous
 // batch left; every caller fills each header it takes before anyone reads it.
-func (a *fileArena) takeHeads(n int) []scalar {
-	if cap(a.heads)-len(a.heads) < n {
-		a.heads = make([]scalar, 0, growCap(cap(a.heads), len(a.heads)+n))
+func (a *fileArena) takeHeads(n int) ([]scalar, error) {
+	if err := a.reserveHeads(n); err != nil {
+		return nil, err
 	}
 	at := len(a.heads)
 	a.heads = a.heads[:at+n]
-	return a.heads[at : at+n : at+n]
+	return a.heads[at : at+n : at+n], nil
 }
 
 // takeAccs reserves n zeroed accumulators. These are zeroed where the headers
 // are not, because an accumulator is folded into rather than assigned, so a
 // previous batch's tallies would be counted as this one's.
-func (a *fileArena) takeAccs(n int) []aggAcc {
+func (a *fileArena) takeAccs(n int) ([]aggAcc, error) {
+	if n < 0 || len(a.accs) > int(^uint(0)>>1)-n {
+		return nil, fmt.Errorf("query: durable result aggregate arena overflows int")
+	}
+	required := len(a.accs) + n
+	nextCapacity := cap(a.accs)
 	if cap(a.accs)-len(a.accs) < n {
-		a.accs = make([]aggAcc, 0, growCap(cap(a.accs), len(a.accs)+n))
+		nextCapacity = growCap(cap(a.accs), required)
+	}
+	if cap(a.accs)-len(a.accs) < n {
+		a.accs = make([]aggAcc, 0, nextCapacity)
 	}
 	at := len(a.accs)
 	a.accs = a.accs[:at+n]
 	out := a.accs[at : at+n : at+n]
-	clear(out)
-	return out
+	resetAggs(out)
+	return out, nil
 }
 
 // takeString copies src into the arena and returns it as a string. The result is
@@ -1212,9 +1570,12 @@ func (a *fileArena) takeAccs(n int) []aggAcc {
 // frontier, so it stays valid exactly as long as the generation does — which is
 // until the consumer has dropped the batch, and every map holding such a key is
 // cleared by the same drop.
-func (a *fileArena) takeString(src []byte) string {
-	dst := a.takeBytes(len(src))
-	return byteview.String(append(dst, src...))
+func (a *fileArena) takeString(src []byte) (string, error) {
+	dst, err := a.takeBytes(len(src))
+	if err != nil {
+		return "", err
+	}
+	return byteview.String(append(dst, src...)), nil
 }
 
 // ownScalars detaches one row's scalars — the value column of each entry in
@@ -1231,10 +1592,17 @@ func (a *fileArena) takeString(src []byte) string {
 // the reservation. Sizing exactly also means the span is never grown, which is
 // the invariant the returned views depend on: a later append that moved it would
 // silently repoint every scalar handed out for an earlier column of the row.
-func ownScalars(a *fileArena, ctx *execCtx, row int, cols []planColumn, order []planOrder, groupCols []int) ([]scalar, int64) {
+func ownScalars(
+	a *fileArena,
+	ctx *execCtx,
+	row int,
+	cols []planColumn,
+	order []planOrder,
+	groupCols []int,
+) ([]scalar, int64, error) {
 	n := len(cols) + len(order) + len(groupCols)
 	if n == 0 {
-		return nil, 0
+		return nil, 0, nil
 	}
 	need := 0
 	for i := range cols {
@@ -1249,8 +1617,15 @@ func ownScalars(a *fileArena, ctx *execCtx, row int, cols []planColumn, order []
 	// A zero-length reservation still has to be non-nil, so that a scalar whose
 	// raw bytes are empty but not nil keeps that shape — Cell.JSON distinguishes
 	// the two. Hence the floor of one byte.
-	arena := a.takeBytes(max(need, 1))
-	out := a.takeHeads(n)[:0]
+	arena, err := a.takeBytes(max(need, 1))
+	if err != nil {
+		return nil, 0, err
+	}
+	out, err := a.takeHeads(n)
+	if err != nil {
+		return nil, 0, err
+	}
+	out = out[:0]
 	for i := range cols {
 		var s scalar
 		arena, s = ownScalarInto(arena, ctx.values[cols[i].value][row])
@@ -1266,7 +1641,7 @@ func ownScalars(a *fileArena, ctx *execCtx, row int, cols []planColumn, order []
 		arena, s = ownScalarInto(arena, ctx.values[col][row])
 		out = append(out, s)
 	}
-	return out, int64(n)*scalarStructBytes + int64(need)
+	return out, int64(n)*scalarStructBytes + int64(need), nil
 }
 
 // repackRow re-detaches a surviving row into a, so that the storage a worker
@@ -1274,10 +1649,10 @@ func ownScalars(a *fileArena, ctx *execCtx, row int, cols []planColumn, order []
 // detached row rather than to a batch column, and it holds the same invariant:
 // the byte span is sized exactly first, so it is never grown while the views
 // into it are being handed out.
-func repackRow(a *fileArena, r fileRow) fileRow {
+func repackRow(a *fileArena, r fileRow) (fileRow, error) {
 	n := len(r.values) + len(r.order)
 	if n == 0 {
-		return r
+		return r, nil
 	}
 	need := 0
 	for _, s := range r.values {
@@ -1286,8 +1661,15 @@ func repackRow(a *fileArena, r fileRow) fileRow {
 	for _, s := range r.order {
 		need += scalarOwnBytes(s)
 	}
-	arena := a.takeBytes(max(need, 1))
-	out := a.takeHeads(n)[:0]
+	arena, err := a.takeBytes(max(need, 1))
+	if err != nil {
+		return fileRow{}, err
+	}
+	out, err := a.takeHeads(n)
+	if err != nil {
+		return fileRow{}, err
+	}
+	out = out[:0]
 	for _, s := range r.values {
 		var d scalar
 		arena, d = ownScalarInto(arena, s)
@@ -1303,7 +1685,7 @@ func repackRow(a *fileArena, r fileRow) fileRow {
 		values:  out[:values:values],
 		order:   out[values:len(out):len(out)],
 		ordinal: r.ordinal,
-	}
+	}, nil
 }
 
 // A classified scalar's fields overlap: classifyRawInto gives a number the same
@@ -1398,6 +1780,7 @@ func appendArena(arena, src []byte) ([]byte, []byte) {
 const (
 	scalarStructBytes  = 88
 	fileRowStructBytes = 56
+	aggAccStructBytes  = 32
 )
 
 // scalarBytes is the retained size of one detached scalar: the struct itself
@@ -1419,6 +1802,18 @@ func rowBytes(r fileRow) int64 {
 	return n
 }
 
+func fileResultPayloadBytes(r fileRow) (int64, bool) {
+	var bytes int64
+	for i := range r.values {
+		add := resultCellPayloadBytes(cellFromScalar(r.values[i]))
+		if add < 0 || bytes > int64(^uint64(0)>>1)-add {
+			return 0, false
+		}
+		bytes += add
+	}
+	return bytes, true
+}
+
 func estimateRows(rows []fileRow) int64 {
 	var n int64
 	for i := range rows {
@@ -1427,27 +1822,49 @@ func estimateRows(rows []fileRow) int64 {
 	return n
 }
 
-func mergeAggs(dst, src []aggAcc) {
+func mergeAggs(
+	dst, src []aggAcc,
+	columns []planColumn,
+	budget *aggregateBudget,
+) error {
 	for i := range dst {
 		d := &dst[i]
 		s := src[i]
 		d.count += s.count
-		if s.n == 0 {
+		if s.num == nil || s.num.n == 0 {
 			continue
 		}
-		if d.n == 0 {
-			d.min, d.max = s.min, s.max
-		} else {
-			if s.min < d.min {
-				d.min = s.min
+		dn, err := d.number(budget)
+		if err != nil {
+			return err
+		}
+		switch columns[i].agg {
+		case aggSum, aggAvg:
+			if err := dn.sum.addSum(&s.num.sum, &d.lease, budget); err != nil {
+				return err
 			}
-			if s.max > d.max {
-				d.max = s.max
+		case aggMin:
+			if dn.n == 0 || compareScalar(s.num.extreme, dn.extreme) < 0 {
+				if err := d.lease.reserve(
+					budget, aggregateAccBaseBytes+int64(len(s.num.extreme.num)),
+				); err != nil {
+					return err
+				}
+				copyAggregateExtreme(dn, s.num.extreme)
+			}
+		case aggMax:
+			if dn.n == 0 || compareScalar(s.num.extreme, dn.extreme) > 0 {
+				if err := d.lease.reserve(
+					budget, aggregateAccBaseBytes+int64(len(s.num.extreme.num)),
+				); err != nil {
+					return err
+				}
+				copyAggregateExtreme(dn, s.num.extreme)
 			}
 		}
-		d.n += s.n
-		d.sum += s.sum
+		dn.n += s.num.n
 	}
+	return nil
 }
 
 func (p *plan) compareFileRows(a, b fileRow) int {
@@ -1494,6 +1911,20 @@ func (p *plan) compareFileGroups(a, b fileGroup) int {
 	}
 }
 
+func (p *plan) compareResultGroups(a, b fileGroup) int {
+	if len(p.order) != 0 {
+		return p.compareFileGroups(a, b)
+	}
+	switch {
+	case a.first < b.first:
+		return -1
+	case a.first > b.first:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (p *plan) resultLimit() int {
 	if p.hasLimit {
 		return p.limit
@@ -1501,48 +1932,61 @@ func (p *plan) resultLimit() int {
 	return -1
 }
 
-func (p *plan) fileRowResultInto(result Result, rows []fileRow) Result {
-	prepareResult(&result, p, len(rows))
+func (p *plan) fileRowResultInto(result Result, rows []fileRow, cancel *CancelFlag) (Result, error) {
+	if err := cancellationError(cancel); err != nil {
+		return result, err
+	}
+	if err := prepareResult(&result, p, len(rows)); err != nil {
+		return result, err
+	}
 	for row := range rows {
+		if err := cancellationCheckpoint(cancel, row); err != nil {
+			return result, err
+		}
 		for col := range p.columns {
-			result.Columns[col].Cells[row] = result.ownFileCell(
-				cellFromScalar(rows[row].values[col]),
-			)
+			cell := cellFromScalar(rows[row].values[col])
+			if err := result.admitResultCell(cell); err != nil {
+				return result, err
+			}
+			cell = result.ownFileCell(cell)
+			result.Columns[col].Cells[row] = cell
 		}
 	}
-	return result
+	return result, nil
 }
 
-func (p *plan) fileGroupResultInto(result Result, groups []fileGroup) Result {
-	if len(p.order) != 0 {
-		slices.SortStableFunc(groups, p.compareFileGroups)
-	} else {
-		slices.SortStableFunc(groups, func(a, b fileGroup) int {
-			switch {
-			case a.first < b.first:
-				return -1
-			case a.first > b.first:
-				return 1
-			default:
-				return 0
-			}
-		})
+func (p *plan) fileGroupResultInto(
+	result Result,
+	groups []fileGroup,
+	w *Workspace,
+) (Result, error) {
+	if err := w.checkCanceled(); err != nil {
+		return result, err
+	}
+	slices.SortStableFunc(groups, p.compareResultGroups)
+	if err := w.checkCanceled(); err != nil {
+		return result, err
 	}
 	if p.hasLimit && len(groups) > p.limit {
 		groups = groups[:p.limit]
 	}
-	prepareResult(&result, p, len(groups))
-	var w Workspace
+	if err := prepareResult(&result, p, len(groups)); err != nil {
+		return result, err
+	}
 	for row := range groups {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			return result, err
+		}
 		g := group{scalars: groups[row].scalars, accs: groups[row].accs}
-		p.fillAggregateCells(&result, row, g.accs, &g, &w)
+		if err := p.fillAggregateCells(&result, row, g.accs, &g, w); err != nil {
+			return result, err
+		}
 		for column := range result.Columns {
-			result.Columns[column].Cells[row] = result.ownFileCell(
-				result.Columns[column].Cells[row],
-			)
+			result.Columns[column].Cells[row] =
+				result.ownFileCell(result.Columns[column].Cells[row])
 		}
 	}
-	return result
+	return result, nil
 }
 
 // The spill representation uses exported fields so encoding/gob can stream
@@ -1565,10 +2009,15 @@ type diskRow struct {
 
 type diskAgg struct {
 	Count int
-	N     int
-	Sum   float64
-	Min   float64
-	Max   float64
+	Num   *diskNumberAcc
+}
+
+type diskNumberAcc struct {
+	N        int
+	SumSet   bool
+	SumCoeff string
+	SumScale string
+	Extreme  diskScalar
 }
 
 type diskGroup struct {
@@ -1585,6 +2034,17 @@ func scalarToDisk(s scalar) diskScalar {
 
 func scalarFromDisk(s diskScalar) scalar {
 	return scalar{kind: scalarKind(s.Kind), bval: s.Bool, num: s.Num, isInt: s.IsInt, ival: s.Int, sval: s.Text, raw: s.Raw}
+}
+
+func validateDiskScalar(s diskScalar) error {
+	if scalarKind(s.Kind) > kindContainer {
+		return fmt.Errorf("%w: invalid scalar kind %d", ErrSpillCorrupt, s.Kind)
+	}
+	if scalarKind(s.Kind) == kindNumber &&
+		!validJSONNumber(byteview.String(s.Num)) {
+		return fmt.Errorf("%w: invalid JSON number", ErrSpillCorrupt)
+	}
+	return nil
 }
 
 func rowToDisk(r fileRow) diskRow {
@@ -1615,20 +2075,94 @@ func groupToDisk(g fileGroup) diskGroup {
 		d.Scalars[i] = scalarToDisk(g.scalars[i])
 	}
 	for i, a := range g.accs {
-		d.Aggs[i] = diskAgg{Count: a.count, N: a.n, Sum: a.sum, Min: a.min, Max: a.max}
+		d.Aggs[i] = aggregateToDisk(a)
 	}
 	return d
 }
 
-func groupFromDisk(d diskGroup) fileGroup {
+func groupFromDisk(d diskGroup, budget *aggregateBudget) (fileGroup, error) {
 	g := fileGroup{key: d.Key, scalars: make([]scalar, len(d.Scalars)), accs: make([]aggAcc, len(d.Aggs)), first: d.First, bytes: d.Bytes}
 	for i := range d.Scalars {
+		if err := validateDiskScalar(d.Scalars[i]); err != nil {
+			return fileGroup{}, err
+		}
 		g.scalars[i] = scalarFromDisk(d.Scalars[i])
 	}
 	for i, a := range d.Aggs {
-		g.accs[i] = aggAcc{count: a.Count, n: a.N, sum: a.Sum, min: a.Min, max: a.Max}
+		var err error
+		g.accs[i], err = aggregateFromDisk(a, budget)
+		if err != nil {
+			return fileGroup{}, err
+		}
 	}
-	return g
+	return g, nil
+}
+
+func aggregateToDisk(a aggAcc) diskAgg {
+	out := diskAgg{Count: a.count}
+	if a.num == nil {
+		return out
+	}
+	n := &diskNumberAcc{N: a.num.n, Extreme: scalarToDisk(a.num.extreme)}
+	if a.num.sum.set {
+		n.SumSet = true
+		if a.num.sum.big {
+			n.SumCoeff = a.num.sum.coeff.String()
+			n.SumScale = a.num.sum.scale.String()
+		} else {
+			n.SumCoeff = strconv.FormatInt(a.num.sum.smallCoeff, 10)
+			n.SumScale = strconv.FormatInt(a.num.sum.smallScale, 10)
+		}
+	}
+	out.Num = n
+	return out
+}
+
+func aggregateFromDisk(a diskAgg, budget *aggregateBudget) (aggAcc, error) {
+	if a.Count < 0 {
+		return aggAcc{}, fmt.Errorf(
+			"%w: negative aggregate count", ErrSpillCorrupt)
+	}
+	out := aggAcc{count: a.Count}
+	if a.Num == nil {
+		return out, nil
+	}
+	if a.Num.N < 0 {
+		return aggAcc{}, fmt.Errorf(
+			"%w: negative numeric aggregate count", ErrSpillCorrupt)
+	}
+	if err := validateDiskScalar(a.Num.Extreme); err != nil {
+		return aggAcc{}, err
+	}
+	payload := saturatedBytes(
+		int64(len(a.Num.SumCoeff)),
+		int64(len(a.Num.SumScale)),
+	)
+	payload = saturatedBytes(payload, int64(len(a.Num.Extreme.Num)))
+	payload = saturatedBytes(payload, 32)
+	need := saturatedBytes(
+		aggregateAccBaseBytes,
+		saturatedProduct(8, payload),
+	)
+	if err := out.lease.reserve(budget, need); err != nil {
+		return aggAcc{}, err
+	}
+	out.num = &numberAcc{n: a.Num.N, extreme: scalarFromDisk(a.Num.Extreme)}
+	if !a.Num.SumSet {
+		return out, nil
+	}
+	out.num.sum.set = true
+	if _, ok := out.num.sum.coeff.SetString(a.Num.SumCoeff, 10); !ok {
+		return aggAcc{}, fmt.Errorf(
+			"%w: invalid exact aggregate coefficient", ErrSpillCorrupt)
+	}
+	if _, ok := out.num.sum.scale.SetString(a.Num.SumScale, 10); !ok {
+		return aggAcc{}, fmt.Errorf(
+			"%w: invalid exact aggregate exponent", ErrSpillCorrupt)
+	}
+	out.num.sum.big = true
+	out.num.sum.normalizeBig()
+	return out, nil
 }
 
 type spillRun struct {
@@ -1637,8 +2171,17 @@ type spillRun struct {
 }
 
 type spillManager struct {
-	dir   string
-	files map[string]struct{}
+	dir          string
+	files        map[string]struct{}
+	columns      []planColumn
+	groupScalars int
+	budget       *aggregateBudget
+	limit        int64
+	live         int64
+	cancel       *CancelFlag
+	// removeFile is a test seam for hostile-filesystem cleanup failures. A nil
+	// hook is the production fast path and calls os.Remove directly.
+	removeFile func(string) error
 	// runs and size tally what this execution spilled, and are folded into
 	// ExecStats when it ends. The manager counts into itself rather than
 	// through a pointer to the caller's ExecStats because that pointer was the
@@ -1653,11 +2196,76 @@ type spillManager struct {
 // spills — the overwhelming majority — must not pay for a map it never writes
 // to, so the set is created on the first create and handed back by cleanup for
 // the next execution to reuse.
-func newSpillManager(dir string, files map[string]struct{}) *spillManager {
-	return &spillManager{dir: dir, files: files}
+func newSpillManager(
+	dir string,
+	files map[string]struct{},
+	columns []planColumn,
+	groupScalars int,
+	budget *aggregateBudget,
+	limit int64,
+	cancel *CancelFlag,
+) spillManager {
+	manager := spillManager{
+		dir: dir, files: files, columns: columns, groupScalars: groupScalars,
+		budget: budget, limit: limit, cancel: cancel,
+	}
+	for path := range files {
+		info, err := os.Stat(path)
+		switch {
+		case err == nil:
+			manager.live = saturatedBytes(manager.live, info.Size())
+		case errors.Is(err, os.ErrNotExist):
+			delete(files, path)
+		default:
+			// An unstatable leftover still consumes unknown storage. Charge
+			// the whole quota so another run cannot be admitted on the
+			// assumption that it disappeared.
+			if limit >= 0 {
+				manager.live = limit
+			}
+		}
+	}
+	return manager
+}
+
+type spillQuotaWriter struct {
+	dst       io.Writer
+	remaining int64
+	limit     int64
+	cancel    *CancelFlag
+}
+
+func (w *spillQuotaWriter) Write(src []byte) (int, error) {
+	if err := cancellationError(w.cancel); err != nil {
+		return 0, err
+	}
+	if w.limit >= 0 && int64(len(src)) > w.remaining {
+		return 0, &SpillBudgetError{
+			Bytes: saturatedBytes(w.limit, 1),
+			Limit: w.limit,
+		}
+	}
+	n, err := w.dst.Write(src)
+	if w.limit >= 0 {
+		w.remaining -= int64(n)
+	}
+	return n, err
+}
+
+func (s *spillManager) writer(file *os.File) io.Writer {
+	if s.limit < 0 && s.cancel == nil {
+		return file
+	}
+	return &spillQuotaWriter{
+		dst: file, remaining: max(s.limit-s.live, 0), limit: s.limit,
+		cancel: s.cancel,
+	}
 }
 
 func (s *spillManager) create(pattern string) (*os.File, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return nil, err
+	}
 	f, err := os.CreateTemp(s.dir, pattern)
 	if err == nil {
 		if s.files == nil {
@@ -1668,7 +2276,18 @@ func (s *spillManager) create(pattern string) (*os.File, error) {
 	return f, err
 }
 
+func (s *spillManager) unlink(path string) error {
+	if s.removeFile != nil {
+		return s.removeFile(path)
+	}
+	return os.Remove(path)
+}
+
 func (s *spillManager) finish(f *os.File) (spillRun, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		_ = f.Close()
+		return spillRun{}, err
+	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return spillRun{}, err
@@ -1680,36 +2299,77 @@ func (s *spillManager) finish(f *os.File) (spillRun, error) {
 	if err != nil {
 		return spillRun{}, err
 	}
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	run := spillRun{path: f.Name(), size: info.Size()}
+	if s.limit >= 0 && (run.size > s.limit-s.live) {
+		budgetErr := &SpillBudgetError{
+			Bytes: saturatedBytes(s.live, run.size),
+			Limit: s.limit,
+		}
+		if removeErr := s.unlink(run.path); removeErr != nil &&
+			!errors.Is(removeErr, os.ErrNotExist) {
+			// The rejected run still occupies disk. Keep it tracked and charge
+			// its actual size so cleanup and the next execution cannot pretend
+			// the quota was reclaimed.
+			s.live = saturatedBytes(s.live, run.size)
+			return spillRun{}, errors.Join(budgetErr, removeErr)
+		}
+		delete(s.files, run.path)
+		return spillRun{}, budgetErr
+	}
 	s.runs++
-	s.size += run.size
+	s.size = saturatedBytes(s.size, run.size)
+	s.live = saturatedBytes(s.live, run.size)
 	return run, nil
 }
 
-func (s *spillManager) remove(run spillRun) {
-	_ = os.Remove(run.path)
+func (s *spillManager) remove(run spillRun) error {
+	if err := s.unlink(run.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	delete(s.files, run.path)
+	s.live = max(s.live-run.size, 0)
+	return nil
 }
 
 // cleanup removes every run this execution left behind and returns the emptied
 // set so the next execution can reuse its buckets.
-func (s *spillManager) cleanup() map[string]struct{} {
+func (s *spillManager) cleanup() (map[string]struct{}, error) {
+	var cleanupErr error
 	for path := range s.files {
-		_ = os.Remove(path)
+		if err := s.unlink(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		delete(s.files, path)
 	}
-	clear(s.files)
-	return s.files
+	if cleanupErr == nil {
+		s.live = 0
+	}
+	return s.files, cleanupErr
 }
 
 func (s *spillManager) writeRows(p *plan, rows []fileRow) (spillRun, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	slices.SortStableFunc(rows, p.compareFileRows)
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	f, err := s.create("vibejson-query-rows-*")
 	if err != nil {
 		return spillRun{}, err
 	}
-	w := bufio.NewWriterSize(f, 64<<10)
+	w := bufio.NewWriterSize(s.writer(f), 64<<10)
 	enc := gob.NewEncoder(w)
 	for i := range rows {
+		if err := cancellationCheckpoint(s.cancel, i); err != nil {
+			_ = f.Close()
+			return spillRun{}, err
+		}
 		if err := enc.Encode(rowToDisk(rows[i])); err != nil {
 			_ = f.Close()
 			return spillRun{}, err
@@ -1729,14 +2389,24 @@ func (s *spillManager) writeRows(p *plan, rows []fileRow) (spillRun, error) {
 // abandoning the execution on a failure. Sorting a copy instead would cost one
 // allocation per spill for a frontier the caller is about to drop anyway.
 func (s *spillManager) writeGroups(groups []fileGroup) (spillRun, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	slices.SortFunc(groups, func(a, b fileGroup) int { return strings.Compare(a.key, b.key) })
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	f, err := s.create("vibejson-query-groups-*")
 	if err != nil {
 		return spillRun{}, err
 	}
-	w := bufio.NewWriterSize(f, 64<<10)
+	w := bufio.NewWriterSize(s.writer(f), 64<<10)
 	enc := gob.NewEncoder(w)
 	for i := range groups {
+		if err := cancellationCheckpoint(s.cancel, i); err != nil {
+			_ = f.Close()
+			return spillRun{}, err
+		}
 		if err := enc.Encode(groupToDisk(groups[i])); err != nil {
 			_ = f.Close()
 			return spillRun{}, err
@@ -1753,14 +2423,19 @@ type rowCursor struct {
 	file *os.File
 	dec  *gob.Decoder
 	row  fileRow
+	p    *plan
 }
 
-func openRowCursor(run spillRun) (*rowCursor, error) {
+func openRowCursor(p *plan, run spillRun) (*rowCursor, error) {
 	f, err := os.Open(run.path)
 	if err != nil {
 		return nil, err
 	}
-	c := &rowCursor{file: f, dec: gob.NewDecoder(bufio.NewReaderSize(f, 64<<10))}
+	c := &rowCursor{
+		file: f,
+		dec:  gob.NewDecoder(bufio.NewReaderSize(f, 64<<10)),
+		p:    p,
+	}
 	if err := c.next(); err != nil {
 		_ = f.Close()
 		return nil, err
@@ -1771,10 +2446,34 @@ func openRowCursor(run spillRun) (*rowCursor, error) {
 func (c *rowCursor) next() error {
 	var d diskRow
 	if err := c.dec.Decode(&d); err != nil {
-		return err
+		return spillDecodeError(err)
+	}
+	if len(d.Values) != len(c.p.columns) || len(d.Order) != len(c.p.order) {
+		return fmt.Errorf(
+			"%w: row shape is %d values/%d order keys, want %d/%d",
+			ErrSpillCorrupt, len(d.Values), len(d.Order),
+			len(c.p.columns), len(c.p.order),
+		)
+	}
+	for i := range d.Values {
+		if err := validateDiskScalar(d.Values[i]); err != nil {
+			return err
+		}
+	}
+	for i := range d.Order {
+		if err := validateDiskScalar(d.Order[i]); err != nil {
+			return err
+		}
 	}
 	c.row = rowFromDisk(d)
 	return nil
+}
+
+func spillDecodeError(err error) error {
+	if errors.Is(err, io.EOF) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrSpillCorrupt, err)
 }
 
 type rowHeap struct {
@@ -1796,7 +2495,7 @@ func (h *rowHeap) Pop() any {
 func openRowHeap(p *plan, runs []spillRun) (*rowHeap, error) {
 	h := &rowHeap{p: p}
 	for _, run := range runs {
-		c, err := openRowCursor(run)
+		c, err := openRowCursor(p, run)
 		if errors.Is(err, io.EOF) {
 			continue
 		}
@@ -1816,6 +2515,9 @@ func closeRowHeap(h *rowHeap) {
 }
 
 func (s *spillManager) mergeRowRuns(p *plan, runs []spillRun) (spillRun, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	h, err := openRowHeap(p, runs)
 	if err != nil {
 		return spillRun{}, err
@@ -1825,11 +2527,18 @@ func (s *spillManager) mergeRowRuns(p *plan, runs []spillRun) (spillRun, error) 
 	if err != nil {
 		return spillRun{}, err
 	}
-	w := bufio.NewWriterSize(f, 64<<10)
+	w := bufio.NewWriterSize(s.writer(f), 64<<10)
 	enc := gob.NewEncoder(w)
+	at := 0
 	for h.Len() != 0 {
+		if err := cancellationCheckpoint(s.cancel, at); err != nil {
+			_ = f.Close()
+			return spillRun{}, err
+		}
+		at++
 		c := heap.Pop(h).(*rowCursor)
 		if err := enc.Encode(rowToDisk(c.row)); err != nil {
+			_ = c.file.Close()
 			_ = f.Close()
 			return spillRun{}, err
 		}
@@ -1838,6 +2547,7 @@ func (s *spillManager) mergeRowRuns(p *plan, runs []spillRun) (spillRun, error) 
 		} else if errors.Is(err, io.EOF) {
 			_ = c.file.Close()
 		} else {
+			_ = c.file.Close()
 			_ = f.Close()
 			return spillRun{}, err
 		}
@@ -1851,15 +2561,23 @@ func (s *spillManager) mergeRowRuns(p *plan, runs []spillRun) (spillRun, error) 
 
 func (s *spillManager) reduceRowRuns(p *plan, runs []spillRun) ([]spillRun, error) {
 	for len(runs) > maxSpillFanIn {
+		if err := cancellationError(s.cancel); err != nil {
+			return nil, err
+		}
 		next := make([]spillRun, 0, (len(runs)+maxSpillFanIn-1)/maxSpillFanIn)
 		for start := 0; start < len(runs); start += maxSpillFanIn {
+			if err := cancellationCheckpoint(s.cancel, start/maxSpillFanIn); err != nil {
+				return nil, err
+			}
 			end := min(start+maxSpillFanIn, len(runs))
 			merged, err := s.mergeRowRuns(p, runs[start:end])
 			if err != nil {
 				return nil, err
 			}
 			for _, run := range runs[start:end] {
-				s.remove(run)
+				if err := s.remove(run); err != nil {
+					return nil, err
+				}
 			}
 			next = append(next, merged)
 		}
@@ -1868,20 +2586,48 @@ func (s *spillManager) reduceRowRuns(p *plan, runs []spillRun) ([]spillRun, erro
 	return runs, nil
 }
 
-func (s *spillManager) readMergedRows(p *plan, runs []spillRun, limit int, rows []fileRow) ([]fileRow, error) {
+func (s *spillManager) readMergedRows(
+	p *plan,
+	result *Result,
+	runs []spillRun,
+	limit int,
+	rows []fileRow,
+) ([]fileRow, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return rows, err
+	}
 	h, err := openRowHeap(p, runs)
 	if err != nil {
 		return rows, err
 	}
 	defer closeRowHeap(h)
+	var payloadBytes int64
 	for h.Len() != 0 && (limit < 0 || len(rows) < limit) {
+		if err := cancellationCheckpoint(s.cancel, len(rows)); err != nil {
+			return rows, err
+		}
 		c := heap.Pop(h).(*rowCursor)
+		payload, ok := fileResultPayloadBytes(c.row)
+		if !ok || payloadBytes > int64(^uint64(0)>>1)-payload {
+			_ = c.file.Close()
+			return rows, result.resultByteBudgetError(
+				len(rows)+1, int64(^uint64(0)>>1),
+			)
+		}
+		payloadBytes += payload
+		if _, err := result.checkResultBudget(
+			len(p.columns), len(rows)+1, payloadBytes,
+		); err != nil {
+			_ = c.file.Close()
+			return rows, err
+		}
 		rows = append(rows, c.row)
 		if err := c.next(); err == nil {
 			heap.Push(h, c)
 		} else if errors.Is(err, io.EOF) {
 			_ = c.file.Close()
 		} else {
+			_ = c.file.Close()
 			return rows, err
 		}
 	}
@@ -1889,17 +2635,27 @@ func (s *spillManager) readMergedRows(p *plan, runs []spillRun, limit int, rows 
 }
 
 type groupCursor struct {
-	file  *os.File
-	dec   *gob.Decoder
-	group fileGroup
+	file         *os.File
+	dec          *gob.Decoder
+	group        fileGroup
+	budget       *aggregateBudget
+	columns      int
+	groupScalars int
 }
 
-func openGroupCursor(run spillRun) (*groupCursor, error) {
+func openGroupCursor(
+	run spillRun,
+	budget *aggregateBudget,
+	columns, groupScalars int,
+) (*groupCursor, error) {
 	f, err := os.Open(run.path)
 	if err != nil {
 		return nil, err
 	}
-	c := &groupCursor{file: f, dec: gob.NewDecoder(bufio.NewReaderSize(f, 64<<10))}
+	c := &groupCursor{
+		file: f, dec: gob.NewDecoder(bufio.NewReaderSize(f, 64<<10)),
+		budget: budget, columns: columns, groupScalars: groupScalars,
+	}
 	if err := c.next(); err != nil {
 		_ = f.Close()
 		return nil, err
@@ -1910,10 +2666,18 @@ func openGroupCursor(run spillRun) (*groupCursor, error) {
 func (c *groupCursor) next() error {
 	var d diskGroup
 	if err := c.dec.Decode(&d); err != nil {
-		return err
+		return spillDecodeError(err)
 	}
-	c.group = groupFromDisk(d)
-	return nil
+	if len(d.Aggs) != c.columns || len(d.Scalars) != c.groupScalars {
+		return fmt.Errorf(
+			"%w: group shape is %d scalars/%d accumulators, want %d/%d",
+			ErrSpillCorrupt, len(d.Scalars), len(d.Aggs),
+			c.groupScalars, c.columns,
+		)
+	}
+	var err error
+	c.group, err = groupFromDisk(d, c.budget)
+	return err
 }
 
 type groupHeap struct{ items []*groupCursor }
@@ -1929,10 +2693,14 @@ func (h *groupHeap) Pop() any {
 	return x
 }
 
-func openGroupHeap(runs []spillRun) (*groupHeap, error) {
+func openGroupHeap(
+	runs []spillRun,
+	budget *aggregateBudget,
+	columns, groupScalars int,
+) (*groupHeap, error) {
 	h := &groupHeap{}
 	for _, run := range runs {
-		c, err := openGroupCursor(run)
+		c, err := openGroupCursor(run, budget, columns, groupScalars)
 		if errors.Is(err, io.EOF) {
 			continue
 		}
@@ -1952,25 +2720,39 @@ func closeGroupHeap(h *groupHeap) {
 }
 
 func (s *spillManager) mergeGroups(runs []spillRun, emit func(fileGroup) error) error {
-	h, err := openGroupHeap(runs)
+	if err := cancellationError(s.cancel); err != nil {
+		return err
+	}
+	h, err := openGroupHeap(
+		runs, s.budget, len(s.columns), s.groupScalars,
+	)
 	if err != nil {
 		return err
 	}
 	defer closeGroupHeap(h)
 	var current *fileGroup
+	at := 0
 	for h.Len() != 0 {
+		if err := cancellationCheckpoint(s.cancel, at); err != nil {
+			return err
+		}
+		at++
 		c := heap.Pop(h).(*groupCursor)
 		g := c.group
 		if current == nil || current.key != g.key {
 			if current != nil {
 				if err := emit(*current); err != nil {
+					_ = c.file.Close()
 					return err
 				}
 			}
 			copy := g
 			current = &copy
 		} else {
-			mergeAggs(current.accs, g.accs)
+			if err := mergeAggs(current.accs, g.accs, s.columns, s.budget); err != nil {
+				_ = c.file.Close()
+				return err
+			}
 			if g.first < current.first {
 				current.first = g.first
 			}
@@ -1980,6 +2762,7 @@ func (s *spillManager) mergeGroups(runs []spillRun, emit func(fileGroup) error) 
 		} else if errors.Is(err, io.EOF) {
 			_ = c.file.Close()
 		} else {
+			_ = c.file.Close()
 			return err
 		}
 	}
@@ -1990,11 +2773,14 @@ func (s *spillManager) mergeGroups(runs []spillRun, emit func(fileGroup) error) 
 }
 
 func (s *spillManager) mergeGroupRuns(runs []spillRun) (spillRun, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return spillRun{}, err
+	}
 	f, err := s.create("vibejson-query-groupmerge-*")
 	if err != nil {
 		return spillRun{}, err
 	}
-	w := bufio.NewWriterSize(f, 64<<10)
+	w := bufio.NewWriterSize(s.writer(f), 64<<10)
 	enc := gob.NewEncoder(w)
 	err = s.mergeGroups(runs, func(g fileGroup) error { return enc.Encode(groupToDisk(g)) })
 	if err == nil {
@@ -2009,15 +2795,23 @@ func (s *spillManager) mergeGroupRuns(runs []spillRun) (spillRun, error) {
 
 func (s *spillManager) reduceGroupRuns(runs []spillRun) ([]spillRun, error) {
 	for len(runs) > maxSpillFanIn {
+		if err := cancellationError(s.cancel); err != nil {
+			return nil, err
+		}
 		next := make([]spillRun, 0, (len(runs)+maxSpillFanIn-1)/maxSpillFanIn)
 		for start := 0; start < len(runs); start += maxSpillFanIn {
+			if err := cancellationCheckpoint(s.cancel, start/maxSpillFanIn); err != nil {
+				return nil, err
+			}
 			end := min(start+maxSpillFanIn, len(runs))
 			merged, err := s.mergeGroupRuns(runs[start:end])
 			if err != nil {
 				return nil, err
 			}
 			for _, run := range runs[start:end] {
-				s.remove(run)
+				if err := s.remove(run); err != nil {
+					return nil, err
+				}
 			}
 			next = append(next, merged)
 		}
@@ -2026,10 +2820,126 @@ func (s *spillManager) reduceGroupRuns(runs []spillRun) ([]spillRun, error) {
 	return runs, nil
 }
 
-func (s *spillManager) readMergedGroups(groups []fileGroup, runs []spillRun) ([]fileGroup, error) {
-	err := s.mergeGroups(runs, func(g fileGroup) error {
-		groups = append(groups, g)
+type resultGroupHeap struct {
+	p      *plan
+	groups []fileGroup
+}
+
+func (h resultGroupHeap) Len() int { return len(h.groups) }
+func (h resultGroupHeap) Less(i, j int) bool {
+	// The worst retained group is the root, so a better candidate can replace
+	// it in O(log LIMIT) while the merged key stream is read once.
+	return h.p.compareResultGroups(h.groups[i], h.groups[j]) > 0
+}
+func (h resultGroupHeap) Swap(i, j int) { h.groups[i], h.groups[j] = h.groups[j], h.groups[i] }
+func (h *resultGroupHeap) Push(value any) {
+	h.groups = append(h.groups, value.(fileGroup))
+}
+func (h *resultGroupHeap) Pop() any {
+	last := len(h.groups) - 1
+	value := h.groups[last]
+	h.groups[last] = fileGroup{}
+	h.groups = h.groups[:last]
+	return value
+}
+
+func retainedGroupBytes(group fileGroup) int64 {
+	return max(group.bytes, 64)
+}
+
+func saturatedBytes(a, b int64) int64 {
+	if a < 0 || b < 0 || a > int64(^uint64(0)>>1)-b {
+		return int64(^uint64(0) >> 1)
+	}
+	return a + b
+}
+
+func (s *spillManager) readMergedGroups(
+	p *plan,
+	result *Result,
+	groups []fileGroup,
+	runs []spillRun,
+	memoryBytes int64,
+) ([]fileGroup, error) {
+	if err := cancellationError(s.cancel); err != nil {
+		return groups, err
+	}
+	h := resultGroupHeap{p: p, groups: groups}
+	// Merged groups are the immediate representation of the final output, not
+	// an independent hash/sort workspace: fileGroupResultInto consumes them
+	// directly into Result. Let that frontier use the finite result allowance
+	// in addition to work memory. This preserves work_mem-style semantics for
+	// results larger than MemoryBytes while keeping hostile executions bounded.
+	// When ResultBytes is explicitly disabled, the frontier remains strictly
+	// capped by MemoryBytes.
+	frontierBytes := memoryBytes
+	if result.resultBytesLimit >= 0 {
+		frontierBytes = saturatedBytes(frontierBytes, result.resultBytesLimit)
+	}
+
+	keep := -1
+	if p.hasLimit {
+		keep = p.limit
+	}
+	hardRows := -1
+	if result.resultRowsLimit >= 0 &&
+		(!p.hasLimit || p.limit > result.resultRowsLimit) {
+		hardRows = result.resultRowsLimit
+		if keep < 0 || hardRows < keep {
+			keep = hardRows
+		}
+	}
+	if keep >= 0 {
+		heap.Init(&h)
+	}
+
+	total := 0
+	var retained int64
+	err := s.mergeGroups(runs, func(group fileGroup) error {
+		if cancelErr := cancellationCheckpoint(s.cancel, total); cancelErr != nil {
+			return cancelErr
+		}
+		total++
+		if hardRows >= 0 && total > hardRows {
+			return &ResultBudgetError{
+				Rows: total, RowLimit: result.resultRowsLimit,
+			}
+		}
+		if keep == 0 {
+			return nil
+		}
+
+		groupBytes := retainedGroupBytes(group)
+		switch {
+		case keep < 0 || len(h.groups) < keep:
+			next := saturatedBytes(retained, groupBytes)
+			if next > frontierBytes {
+				return &WorkBudgetError{
+					Resource: "merged group frontier",
+					Bytes:    next,
+					Limit:    frontierBytes,
+				}
+			}
+			retained = next
+			h.groups = append(h.groups, group)
+			if keep >= 0 {
+				heap.Fix(&h, len(h.groups)-1)
+			}
+		case p.compareResultGroups(group, h.groups[0]) < 0:
+			next := retained - retainedGroupBytes(h.groups[0])
+			next = saturatedBytes(next, groupBytes)
+			if next > frontierBytes {
+				return &WorkBudgetError{
+					Resource: "merged group frontier",
+					Bytes:    next,
+					Limit:    frontierBytes,
+				}
+			}
+			retained = next
+			h.groups[0] = group
+			heap.Fix(&h, 0)
+		}
 		return nil
 	})
-	return groups, err
+	return h.groups, err
 }

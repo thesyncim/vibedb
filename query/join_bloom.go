@@ -166,8 +166,15 @@ func joinBloomBlocks(keys int) int {
 		keys = 1
 	}
 	// Each block holds 256 bits, and the rounding up to a power of two below
-	// only ever adds capacity, so this cannot under-size the filter.
-	blocks := (keys*joinBloomBits + 255) / 256
+	// only ever adds capacity, so this cannot under-size the filter. Divide
+	// before rounding rather than multiplying keys by joinBloomBits: callers
+	// may hand this MaxInt, and filter sizing must saturate at its cap instead
+	// of wrapping to a one-block filter.
+	const keysPerBlock = 256 / joinBloomBits
+	blocks := keys / keysPerBlock
+	if keys%keysPerBlock != 0 {
+		blocks++
+	}
 	const maxBlocks = joinBloomMaxBytes / 32
 	if blocks > maxBlocks {
 		return maxBlocks

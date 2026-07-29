@@ -89,13 +89,9 @@ const (
 
 // Transaction status, the byte ReadyForQuery carries.
 //
-// This server sends only [statusIdle] today. 'T' would claim an open
-// transaction block and 'E' a failed one, and there is no transaction block
-// here to be in: BEGIN is refused rather than accepted as a no-op, so a client
-// can never reach a state where either byte would be the truth. The other two
-// are defined because the byte's meaning is part of the protocol contract and a
-// reader of this file should not have to go looking for what the server is
-// choosing not to say.
+// A writable SQL-catalog session reports all three directly from its typed
+// runtime. Read-only sources remain idle because they refuse transaction
+// control rather than accepting a no-op BEGIN.
 const (
 	statusIdle    = 'I' // not in a transaction block
 	statusInTx    = 'T' // in a transaction block
@@ -145,6 +141,45 @@ const (
 	// cap a client could name a million statements and hold their plans.
 	maxStatements = 1024
 	maxPortals    = 1024
+	// maxSimpleStatements bounds work and output amplification inside one
+	// simple Query message. The message byte limit alone still permits
+	// millions of tiny semicolon-separated statements.
+	maxSimpleStatements = 1024
+	// maxResultColumns mirrors the SQL front end's select-list bound. The
+	// compatibility SELECT shim runs before that front end, so it must carry
+	// the same limit itself or a small "SELECT 1,1,..." message can grow two
+	// unbounded result-metadata slices before parsing proper begins.
+	maxResultColumns = 1024
+
+	// maxPreparedInputBytes and maxPortalBytes bound retained input across a
+	// session, rather than merely bounding one message. A client may keep
+	// maxStatements statements and maxPortals portals alive at once; applying
+	// maxMessageBody to each object independently would therefore let one
+	// connection retain gigabytes even though no individual message was large.
+	// Prepared input includes statement/query names, copied parameter OIDs,
+	// numbered-parameter metadata, and a conservative AST/lowered-plan shape
+	// charge; counting SQL text alone leaves both OID-vector and many-wide-plan
+	// aggregate retention holes.
+	//
+	// The portal charge includes one copy of every wire parameter plus a
+	// conservative allowance for the argument slots produced by repeated $n
+	// placeholders. The exact accounting lives beside Bind in extended.go.
+	maxPreparedInputBytes = maxMessageBody
+	maxPreparedBindBytes  = maxMessageBody
+	maxPortalBytes        = maxMessageBody
+
+	// maxDataRowBytes and maxRowDescriptionBytes bound the two backend messages
+	// whose sizes are selected by result shape and data. Input messages are
+	// bounded, but a projection can repeat one large value or column name many
+	// times and amplify a small SELECT into a multi-gigabyte backend message.
+	// Keeping the same bound in both directions prevents that amplification
+	// before the protocol's signed Int32 lengths can overflow.
+	maxDataRowBytes        = maxMessageBody
+	maxRowDescriptionBytes = maxMessageBody
+	// Error fields are diagnostics, not an echo channel for a statement or a
+	// bound value. Keeping each one small prevents an error on a maximal input
+	// from permanently growing the session writer to that input's quoted size.
+	maxErrorFieldBytes = 4 << 10
 
 	// maxParameters bounds the parameter and format-code counts a Bind may
 	// declare. The wire field is a signed 16-bit integer, so 32767 is the

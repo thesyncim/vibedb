@@ -2,6 +2,7 @@ package sql
 
 import (
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -35,12 +36,20 @@ const maxParams = 1 << 16
 // entries in any one clause is already far past a statement anybody writes.
 const maxClauseItems = 1024
 
+// maxStatementBytes is the parser's total input bound. Structural limits cap
+// tree shape, but without a byte bound one identifier, quoted string, comment,
+// or containment literal could still force an unbounded copy and make context
+// cancellation wait on attacker-selected input. Sixteen MiB matches pgwire's
+// maximum frontend-message body and is well above ordinary prepared SQL.
+const maxStatementBytes = 16 << 20
+
 // A Parser parses SQL statements with reusable storage. Its zero value is ready
 // to use. It is single-consumer and not safe for concurrent use.
 //
 // A statement parsed into dst borrows the Parser's storage and is valid only
 // until that Parser's next Parse. This is the same borrowed-lifetime rule
-// query's Compiler, Result, and Workspace already carry, for the same reason:
+// query's prepared-statement compiler, Result, and Workspace already carry,
+// for the same reason:
 // the storage that makes the steady state allocation-free is the storage the
 // previous answer is still pointing at. A caller that keeps several statements
 // alive at once gives each its own Parser, or uses the package-level [Parse],
@@ -133,9 +142,12 @@ type pendingPath struct {
 // Parse parses one SELECT statement into dst, reusing p's storage. See
 // [Parser] for the lifetime dst inherits.
 func (p *Parser) Parse(dst *SelectStmt, src string) error {
+	*dst = SelectStmt{}
+	if err := validateStatementText(src); err != nil {
+		return err
+	}
 	p.reset(src)
 	p.out = dst
-	*dst = SelectStmt{}
 	if err := p.parseStatement(); err != nil {
 		// The half-parsed statement is thrown away rather than returned
 		// alongside the error, so a caller that ignores the error and lowers
@@ -145,6 +157,40 @@ func (p *Parser) Parse(dst *SelectStmt, src string) error {
 		return err
 	}
 	return nil
+}
+
+// validateStatementText is the one admission check shared by the SELECT-only
+// and all-statement parser entry points. UTF-8 validity belongs here rather
+// than in adapters: identifiers and string literals are copied into the AST,
+// and a public parser must never manufacture an invalid Go string merely
+// because its caller did not come through pgwire or database/sql.
+//
+// utf8.ValidString is allocation-free and has a fast ASCII path. The second
+// walk happens only for rejected input, to put the ParseError on the first
+// malformed byte.
+func validateStatementText(src string) error {
+	if len(src) > maxStatementBytes {
+		return newParseError(
+			src, maxStatementBytes,
+			"statement exceeds the 16 MiB SQL input limit",
+		)
+	}
+	if utf8.ValidString(src) {
+		return nil
+	}
+	return newParseError(src, firstInvalidUTF8(src),
+		"statement is not valid UTF-8")
+}
+
+func firstInvalidUTF8(src string) int {
+	for pos := 0; pos < len(src); {
+		_, size := utf8.DecodeRuneInString(src[pos:])
+		if size == 1 && src[pos] >= utf8.RuneSelf {
+			return pos
+		}
+		pos += size
+	}
+	return len(src)
 }
 
 // Parse parses one SELECT statement. The returned statement owns its storage
@@ -912,6 +958,14 @@ func (p *Parser) parsePath(allowStar bool) (*PathExpr, error) {
 	}
 	head := p.tok
 	p.advance()
+	if !head.esc && head.text == DocumentColumn {
+		return nil, p.errfAt(
+			head.pos,
+			"%q names the whole replacement document only as UPDATE's SET target; "+
+				"INSERT one complete document with VALUES (document), include its declared primary-key field, and use ordinary JSON field names everywhere else",
+			DocumentColumn,
+		)
+	}
 	return p.continuePath(head, allowStar)
 }
 

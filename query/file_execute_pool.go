@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -111,6 +112,8 @@ type fileJob struct {
 	segments []*store.Segment
 	arenas   []fileArenaSet
 	opts     normalizedFileOptions
+	budget   *aggregateBudget
+	cancel   *CancelFlag
 	// active is how many workers this execution woke. The pool's goroutines are
 	// a high-water mark, so the scanner must send exactly this many
 	// end-of-stream sentinels — one per worker actually woken, not one per
@@ -281,11 +284,20 @@ func (pool *filePool) work(at int) {
 		if len(batch.ends) == 0 {
 			return
 		}
+		if err := cancellationError(job.cancel); err != nil {
+			pool.stopped.Store(true)
+			pool.partials <- filePartial{seq: batch.seq, err: err}
+			continue
+		}
 		// This batch packs into a generation the consumer has finished with if
 		// there is one, and into a new one otherwise. The choice is made here,
 		// on the owning goroutine and between batches, because no other
 		// goroutine may touch a worker's storage.
-		part := p.makeFilePartial(batch, w, docs, slots, arenas.begin(batch.seq, pool.dropped.Load()))
+		part := p.makeFilePartial(
+			batch, w, docs, slots,
+			arenas.begin(batch.seq, pool.dropped.Load()),
+			job.budget,
+		)
 		if part.err != nil {
 			pool.stopped.Store(true)
 		}
@@ -329,7 +341,7 @@ func (pool *filePool) runScan(
 	overlayInsert func(value []byte) error,
 ) {
 	job := &pool.job
-	pool.scanState = fileScanState{batch: takeFileBatch(job.slots, 0, 0, job.opts)}
+	pool.scanState = fileScanState{batch: takeFileBatch(job.slots, 0, 0)}
 	var err error
 	switch {
 	case job.overlay != nil && job.masks != nil:
@@ -337,10 +349,16 @@ func (pool *filePool) runScan(
 			job.masks, (*job.overflow)[:0], overlayCandidate,
 		)
 		if err == nil {
+			err = cancellationError(job.cancel)
+		}
+		if err == nil {
 			err = job.overlay.RangePresent(overlayInsert)
 		}
 	case job.overlay != nil:
 		*job.overflow, err = job.snapshot.RangeRawReadAheadBuffer((*job.overflow)[:0], overlayRow)
+		if err == nil {
+			err = cancellationError(job.cancel)
+		}
 		if err == nil {
 			err = job.overlay.RangeInserts(overlayInsert)
 		}
@@ -348,6 +366,9 @@ func (pool *filePool) runScan(
 		*job.overflow, err = job.snapshot.RangeRawReadAheadBuffer((*job.overflow)[:0], row)
 	default:
 		*job.overflow, err = job.snapshot.RangeMasksRawBuffer(job.masks, (*job.overflow)[:0], row)
+	}
+	if err == nil {
+		err = cancellationError(job.cancel)
 	}
 	if err == nil {
 		err = pool.flush()
@@ -371,7 +392,11 @@ func (pool *filePool) runScan(
 func (pool *filePool) flush() error {
 	st := &pool.scanState
 	if len(st.batch.ends) == 0 {
-		return nil
+		return cancellationError(pool.job.cancel)
+	}
+	if err := cancellationError(pool.job.cancel); err != nil {
+		pool.stopped.Store(true)
+		return err
 	}
 	if pool.stopped.Load() {
 		return errFileExecutionStopped
@@ -391,17 +416,25 @@ func (pool *filePool) flush() error {
 	pool.credits <- struct{}{}
 	pool.jobs <- st.batch
 	st.out.batches++
-	st.batch = takeFileBatch(slots, st.batch.seq+1, st.out.rows, pool.job.opts)
+	st.batch = takeFileBatch(slots, st.batch.seq+1, st.out.rows)
 	return nil
 }
 
 // appendRow accumulates one document into the batch under construction and
 // publishes the batch when it reaches either bound.
 func (pool *filePool) appendRow(_, value []byte) error {
+	if err := cancellationError(pool.job.cancel); err != nil {
+		pool.stopped.Store(true)
+		return err
+	}
 	if pool.stopped.Load() {
 		return errFileExecutionStopped
 	}
 	st := &pool.scanState
+	slot := &pool.job.slots[st.batch.seq%uint64(len(pool.job.slots))]
+	if err := reserveFileBatchRow(&st.batch, slot, len(value)); err != nil {
+		return err
+	}
 	st.batch.data = append(st.batch.data, value...)
 	st.batch.ends = append(st.batch.ends, len(st.batch.data))
 	st.batch.bytes += int64(len(value))
@@ -419,9 +452,48 @@ func (pool *filePool) appendRow(_, value []byte) error {
 	return nil
 }
 
+func reserveFileBatchRow(
+	batch *fileBatch,
+	slot *fileSlot,
+	valueBytes int,
+) error {
+	maxInt := int(^uint(0) >> 1)
+	if valueBytes < 0 || len(batch.data) > maxInt-valueBytes ||
+		len(batch.ends) == maxInt {
+		return fmt.Errorf("query: durable raw batch size overflows int")
+	}
+	dataRequired := len(batch.data) + valueBytes
+	dataCapacity := cap(batch.data)
+	if dataRequired > dataCapacity {
+		dataCapacity = growCap(dataCapacity, dataRequired)
+	}
+	endRequired := len(batch.ends) + 1
+	endCapacity := cap(batch.ends)
+	if endRequired > endCapacity {
+		endCapacity = growCap(endCapacity, endRequired)
+	}
+	if dataRequired > cap(batch.data) {
+		next := make([]byte, len(batch.data), dataCapacity)
+		copy(next, batch.data)
+		batch.data = next
+		slot.batch.data = next
+	}
+	if endRequired > cap(batch.ends) {
+		next := make([]int, len(batch.ends), endCapacity)
+		copy(next, batch.ends)
+		batch.ends = next
+		slot.batch.ends = next
+	}
+	return nil
+}
+
 // appendOverlayRow merges one base row with the staged-write layer. It is a
 // distinct callback so the ordinary scanner has no per-row overlay branch.
 func (pool *filePool) appendOverlayRow(key, value []byte) error {
+	if err := cancellationError(pool.job.cancel); err != nil {
+		pool.stopped.Store(true)
+		return err
+	}
 	if replacement, present, shadowed := pool.job.overlay.Lookup(key); shadowed {
 		if !present {
 			return nil
@@ -435,6 +507,10 @@ func (pool *filePool) appendOverlayRow(key, value []byte) error {
 // replacement is evaluated once through RangePresent after the base candidate
 // pass, including replacements whose old value was not a candidate.
 func (pool *filePool) appendOverlayCandidate(key, value []byte) error {
+	if err := cancellationError(pool.job.cancel); err != nil {
+		pool.stopped.Store(true)
+		return err
+	}
 	if _, _, shadowed := pool.job.overlay.Lookup(key); shadowed {
 		return nil
 	}
@@ -442,5 +518,9 @@ func (pool *filePool) appendOverlayCandidate(key, value []byte) error {
 }
 
 func (pool *filePool) appendOverlayInsert(value []byte) error {
+	if err := cancellationError(pool.job.cancel); err != nil {
+		pool.stopped.Store(true)
+		return err
+	}
 	return pool.appendRow(nil, value)
 }

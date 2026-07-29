@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"unsafe"
 )
 
 // The recovery journal is a bounded redo log kept in a SEPARATE preallocated
@@ -78,6 +79,11 @@ const (
 	// granule. Record starts are aligned to the sector so a torn multi-sector
 	// append cannot rewrite an already-synced earlier record.
 	RecoveryJournalMinSectorSize = 512
+	// RecoveryJournalMaxCapacityBytes is the authoritative upper bound for the
+	// preallocated record region and the buffer read by recovery. Keeping it in
+	// the format package makes a checksummed hostile header unable to request an
+	// unbounded allocation and keeps durable's creation clamp from drifting.
+	RecoveryJournalMaxCapacityBytes = uint64(16) << 20
 
 	recoveryJournalMagic   = "RJRNL01\x00"
 	recoveryJournalVersion = DevelopmentFormatVersion
@@ -114,7 +120,9 @@ const (
 // RecoveryRecordPaddedSize returns the on-disk byte cost of one record whose key
 // and value have the given lengths, padded to the sector granule. A store sizes
 // its preallocated journal capacity from this so a chosen record budget maps to
-// an exact byte reservation.
+// an exact byte reservation. Inputs that cannot be represented by the wire
+// format or the current architecture saturate at the largest int, so callers
+// that use the result as an upper bound fail closed instead of under-reserving.
 func RecoveryRecordPaddedSize(sectorSize uint32, keyLen, valueLen int) int {
 	return recoveryRecordPadded(sectorSize, keyLen, valueLen)
 }
@@ -200,35 +208,152 @@ type RecoveryBatchEntry struct {
 // recoveryRecordPadded returns the sector-padded on-disk size of a record whose
 // key and value have the given lengths.
 func recoveryRecordPadded(sectorSize uint32, keyLen, valueLen int) int {
-	raw := RecoveryJournalRecordPrefixSize + keyLen + valueLen +
-		RecoveryJournalRecordTrailerSize
-	return recoveryPadRaw(sectorSize, raw)
+	padded, ok := checkedRecoveryRecordPadded(
+		sectorSize, keyLen, valueLen,
+	)
+	if !ok {
+		return maxIntValue
+	}
+	return padded
 }
 
 // recoveryPadRaw rounds a raw record byte count up to the sector granule.
 func recoveryPadRaw(sectorSize uint32, raw int) int {
-	sector := int(sectorSize)
-	return (raw + sector - 1) / sector * sector
+	if raw < 0 {
+		return maxIntValue
+	}
+	padded, ok := checkedRecoveryPadRaw(sectorSize, uint64(raw))
+	if !ok {
+		return maxIntValue
+	}
+	return padded
 }
 
-// recoveryBatchBodyLen sums the framed length of every entry in a batch record
-// (each entry's fixed header plus its key and value bytes).
-func recoveryBatchBodyLen(entries []RecoveryBatchEntry) int {
-	body := 0
-	for i := range entries {
-		body += RecoveryBatchEntryHeaderSize +
-			len(entries[i].Key) + len(entries[i].Value)
+func checkedRecoveryPadRaw(sectorSize uint32, raw uint64) (int, bool) {
+	if sectorSize == 0 {
+		return 0, false
 	}
-	return body
+	sector := uint64(sectorSize)
+	if remainder := raw % sector; remainder != 0 {
+		var ok bool
+		raw, ok = checkedSizeAdd(
+			raw, sector-remainder, uint64(maxIntValue),
+		)
+		if !ok {
+			return 0, false
+		}
+	}
+	return checkedSizeInt(raw, ^uint64(0))
+}
+
+func checkedRecoveryRecordPadded(
+	sectorSize uint32, keyLen, valueLen int,
+) (int, bool) {
+	if keyLen < 0 || valueLen < 0 {
+		return 0, false
+	}
+	wireLimit := uint64(^uint32(0))
+	keyBytes, valueBytes := uint64(keyLen), uint64(valueLen)
+	if keyBytes > wireLimit || valueBytes > wireLimit {
+		return 0, false
+	}
+	raw := uint64(
+		RecoveryJournalRecordPrefixSize +
+			RecoveryJournalRecordTrailerSize,
+	)
+	var ok bool
+	raw, ok = checkedSizeAdd(raw, keyBytes, uint64(maxIntValue))
+	if !ok {
+		return 0, false
+	}
+	raw, ok = checkedSizeAdd(raw, valueBytes, uint64(maxIntValue))
+	if !ok {
+		return 0, false
+	}
+	return checkedRecoveryPadRaw(sectorSize, raw)
+}
+
+func checkedRecoveryBatchBodyAdd(
+	body, keyLen, valueLen uint64,
+) (uint64, bool) {
+	wireLimit := uint64(^uint32(0))
+	if keyLen == 0 || keyLen > wireLimit || valueLen > wireLimit {
+		return 0, false
+	}
+	next, ok := checkedSizeAdd(
+		body, RecoveryBatchEntryHeaderSize, wireLimit,
+	)
+	if !ok {
+		return 0, false
+	}
+	next, ok = checkedSizeAdd(next, keyLen, wireLimit)
+	if !ok {
+		return 0, false
+	}
+	return checkedSizeAdd(next, valueLen, wireLimit)
+}
+
+// checkedRecoveryBatchBodyLen sums the framed length of every entry in a batch
+// record without allowing the uint32 body field or native int to wrap.
+func checkedRecoveryBatchBodyLen(
+	entries []RecoveryBatchEntry,
+) (uint64, bool) {
+	if len(entries) == 0 || uint64(len(entries)) > uint64(^uint32(0)) {
+		return 0, false
+	}
+	var body uint64
+	for i := range entries {
+		var ok bool
+		body, ok = checkedRecoveryBatchBodyAdd(
+			body,
+			uint64(len(entries[i].Key)),
+			uint64(len(entries[i].Value)),
+		)
+		if !ok {
+			return 0, false
+		}
+	}
+	return body, true
+}
+
+func checkedRecoveryBatchRecordPaddedSize(
+	sectorSize uint32, entries []RecoveryBatchEntry,
+) (int, bool) {
+	body, ok := checkedRecoveryBatchBodyLen(entries)
+	if !ok {
+		return 0, false
+	}
+	raw := uint64(
+		RecoveryJournalRecordPrefixSize +
+			RecoveryJournalRecordTrailerSize,
+	)
+	raw, ok = checkedSizeAdd(raw, body, uint64(maxIntValue))
+	if !ok {
+		return 0, false
+	}
+	return checkedRecoveryPadRaw(sectorSize, raw)
+}
+
+func recoveryBatchEntryArenaFits(entryCount uint64) bool {
+	_, ok := checkedSizeMul(
+		entryCount,
+		uint64(unsafe.Sizeof(RecoveryBatchEntry{})),
+		uint64(maxIntValue),
+	)
+	return ok
 }
 
 // RecoveryBatchRecordPaddedSize returns the on-disk byte cost of one batch
 // record carrying entries, padded to the sector granule. A store sizes a batch's
 // journal reservation from this so one Update maps to one bounded append.
+// Unrepresentable inputs saturate at the largest int, matching
+// RecoveryRecordPaddedSize's fail-closed sizing contract.
 func RecoveryBatchRecordPaddedSize(sectorSize uint32, entries []RecoveryBatchEntry) int {
-	raw := RecoveryJournalRecordPrefixSize + recoveryBatchBodyLen(entries) +
-		RecoveryJournalRecordTrailerSize
-	return recoveryPadRaw(sectorSize, raw)
+	padded, ok := checkedRecoveryBatchRecordPaddedSize(sectorSize, entries)
+	if !ok {
+		return maxIntValue
+	}
+	return padded
 }
 
 // validateRecoveryJournalHeader enforces the geometry invariants every header
@@ -237,6 +362,24 @@ func validateRecoveryJournalHeader(h RecoveryJournalHeader) error {
 	if h.StoreID == ([16]byte{}) || h.JournalID == ([16]byte{}) {
 		return fmt.Errorf("%w: zero identity", ErrRecoveryJournalCorrupt)
 	}
+	if err := validateRecoveryJournalGeometry(h); err != nil {
+		return err
+	}
+	if h.BaseGeneration == 0 {
+		return fmt.Errorf("%w: base generation", ErrRecoveryJournalCorrupt)
+	}
+	if h.Capacity == 0 ||
+		h.Capacity > RecoveryJournalMaxCapacityBytes ||
+		h.Capacity%uint64(h.SectorSize) != 0 {
+		return fmt.Errorf("%w: capacity", ErrRecoveryJournalCorrupt)
+	}
+	if h.RecycleCount == 0 {
+		return fmt.Errorf("%w: recycle count", ErrRecoveryJournalCorrupt)
+	}
+	return nil
+}
+
+func validateRecoveryJournalGeometry(h RecoveryJournalHeader) error {
 	if !validPhysicalPageSize(h.PageSize) {
 		return fmt.Errorf("%w: page size", ErrRecoveryJournalCorrupt)
 	}
@@ -244,15 +387,6 @@ func validateRecoveryJournalHeader(h RecoveryJournalHeader) error {
 		h.SectorSize&(h.SectorSize-1) != 0 ||
 		h.SectorSize > h.PageSize || h.PageSize%h.SectorSize != 0 {
 		return fmt.Errorf("%w: sector size", ErrRecoveryJournalCorrupt)
-	}
-	if h.BaseGeneration == 0 {
-		return fmt.Errorf("%w: base generation", ErrRecoveryJournalCorrupt)
-	}
-	if h.Capacity == 0 || h.Capacity%uint64(h.SectorSize) != 0 {
-		return fmt.Errorf("%w: capacity", ErrRecoveryJournalCorrupt)
-	}
-	if h.RecycleCount == 0 {
-		return fmt.Errorf("%w: recycle count", ErrRecoveryJournalCorrupt)
 	}
 	return nil
 }
@@ -333,11 +467,15 @@ func EncodeRecoveryRecord(
 	if rec.Kind != recoveryRecordKindPut && rec.Kind != recoveryRecordKindDelete {
 		return 0, fmt.Errorf("%w: record kind", ErrInvalidWrite)
 	}
-	if len(rec.Key) == 0 || len(rec.Key) > int(^uint32(0)) ||
-		len(rec.Value) > int(^uint32(0)) {
+	if len(rec.Key) == 0 {
 		return 0, fmt.Errorf("%w: record key or value length", ErrInvalidWrite)
 	}
-	padded := recoveryRecordPadded(sectorSize, len(rec.Key), len(rec.Value))
+	padded, ok := checkedRecoveryRecordPadded(
+		sectorSize, len(rec.Key), len(rec.Value),
+	)
+	if !ok {
+		return 0, fmt.Errorf("%w: record key or value length", ErrInvalidWrite)
+	}
 	if len(dst) < padded {
 		return 0, fmt.Errorf("%w: record buffer has %d bytes, need %d", ErrInvalidWrite, len(dst), padded)
 	}
@@ -370,15 +508,20 @@ func EncodeRecoveryBatchRecord(
 	if rec.Sequence == 0 || rec.Generation == 0 {
 		return 0, fmt.Errorf("%w: zero sequence or generation", ErrInvalidWrite)
 	}
-	if len(rec.Entries) == 0 || len(rec.Entries) > int(^uint32(0)) {
+	if len(rec.Entries) == 0 ||
+		uint64(len(rec.Entries)) > uint64(^uint32(0)) {
 		return 0, fmt.Errorf("%w: batch entry count", ErrInvalidWrite)
 	}
-	body := recoveryBatchBodyLen(rec.Entries)
-	if body > int(^uint32(0)) {
+	body, ok := checkedRecoveryBatchBodyLen(rec.Entries)
+	if !ok {
 		return 0, fmt.Errorf("%w: batch body length", ErrInvalidWrite)
 	}
-	padded := recoveryPadRaw(sectorSize,
-		RecoveryJournalRecordPrefixSize+body+RecoveryJournalRecordTrailerSize)
+	padded, ok := checkedRecoveryBatchRecordPaddedSize(
+		sectorSize, rec.Entries,
+	)
+	if !ok {
+		return 0, fmt.Errorf("%w: batch record length", ErrInvalidWrite)
+	}
 	if len(dst) < padded {
 		return 0, fmt.Errorf("%w: batch record buffer has %d bytes, need %d",
 			ErrInvalidWrite, len(dst), padded)
@@ -399,8 +542,9 @@ func EncodeRecoveryBatchRecord(
 			entry.Kind != recoveryRecordKindDelete {
 			return 0, fmt.Errorf("%w: batch entry kind", ErrInvalidWrite)
 		}
-		if len(entry.Key) == 0 || len(entry.Key) > int(^uint32(0)) ||
-			len(entry.Value) > int(^uint32(0)) {
+		if len(entry.Key) == 0 ||
+			uint64(len(entry.Key)) > uint64(^uint32(0)) ||
+			uint64(len(entry.Value)) > uint64(^uint32(0)) {
 			return 0, fmt.Errorf("%w: batch entry key or value length", ErrInvalidWrite)
 		}
 		binary.LittleEndian.PutUint16(buf[cursor:cursor+2], entry.Kind)
@@ -448,7 +592,9 @@ func DecodeRecoveryRecord(
 	if sequence != expectedSequence || generation == 0 || keyLen == 0 {
 		return RecoveryRecord{}, 0, fmt.Errorf("%w: sequence or framing", ErrRecoveryJournalRecord)
 	}
-	bodyEnd := uint64(RecoveryJournalRecordPrefixSize) + uint64(keyLen) + uint64(valueLen)
+	keyStart := uint64(RecoveryJournalRecordPrefixSize)
+	valueStart := keyStart + uint64(keyLen)
+	bodyEnd := valueStart + uint64(valueLen)
 	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
 		return RecoveryRecord{}, 0, fmt.Errorf("%w: length overruns region", ErrRecoveryJournalRecord)
 	}
@@ -458,13 +604,20 @@ func DecodeRecoveryRecord(
 		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
 		return RecoveryRecord{}, 0, fmt.Errorf("%w: checksum", ErrRecoveryJournalRecord)
 	}
-	padded := recoveryRecordPadded(sectorSize, int(keyLen), int(valueLen))
+	padded, ok := checkedRecoveryPadRaw(
+		sectorSize, bodyEnd+RecoveryJournalRecordTrailerSize,
+	)
+	if !ok {
+		return RecoveryRecord{}, 0, fmt.Errorf(
+			"%w: padded record length", ErrRecoveryJournalRecord,
+		)
+	}
 	rec := RecoveryRecord{
 		Sequence:   sequence,
 		Generation: generation,
 		Kind:       kind,
-		Key:        src[RecoveryJournalRecordPrefixSize : RecoveryJournalRecordPrefixSize+keyLen],
-		Value:      src[RecoveryJournalRecordPrefixSize+keyLen : bodyEnd],
+		Key:        src[keyStart:valueStart],
+		Value:      src[valueStart:bodyEnd],
 	}
 	return rec, padded, nil
 }
@@ -487,6 +640,23 @@ func decodeRecoveryBatchRecord(
 	bodyEnd := uint64(RecoveryJournalRecordPrefixSize) + uint64(bodyLen)
 	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
 		return RecoveryRecord{}, 0, fmt.Errorf("%w: length overruns region", ErrRecoveryJournalRecord)
+	}
+	// Every entry has a fixed header and a non-empty key. Prove the peer-chosen
+	// count fits both the framed body and native slice capacity before make;
+	// otherwise a tiny checksummed body could request a multi-gigabyte arena.
+	if uint64(entryCount) >
+		uint64(bodyLen)/(RecoveryBatchEntryHeaderSize+1) ||
+		uint64(entryCount) > uint64(maxIntValue) {
+		return RecoveryRecord{}, 0, fmt.Errorf(
+			"%w: batch entry count overruns body",
+			ErrRecoveryJournalRecord,
+		)
+	}
+	if !recoveryBatchEntryArenaFits(uint64(entryCount)) {
+		return RecoveryRecord{}, 0, fmt.Errorf(
+			"%w: batch entry arena overflows address space",
+			ErrRecoveryJournalRecord,
+		)
 	}
 	checksum := PageChecksum(src[:bodyEnd])
 	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
@@ -526,8 +696,14 @@ func decodeRecoveryBatchRecord(
 	if cursor != bodyEnd {
 		return RecoveryRecord{}, 0, fmt.Errorf("%w: batch body length mismatch", ErrRecoveryJournalRecord)
 	}
-	padded := recoveryPadRaw(sectorSize,
-		RecoveryJournalRecordPrefixSize+int(bodyLen)+RecoveryJournalRecordTrailerSize)
+	padded, ok := checkedRecoveryPadRaw(
+		sectorSize, bodyEnd+RecoveryJournalRecordTrailerSize,
+	)
+	if !ok {
+		return RecoveryRecord{}, 0, fmt.Errorf(
+			"%w: padded batch length", ErrRecoveryJournalRecord,
+		)
+	}
 	rec := RecoveryRecord{
 		Sequence:   sequence,
 		Generation: generation,
@@ -570,9 +746,23 @@ type RecoveryJournal struct {
 func CreateRecoveryJournal(
 	file *os.File, h RecoveryJournalHeader,
 ) (*RecoveryJournal, error) {
-	if h.Capacity%uint64(h.SectorSize) != 0 {
-		h.Capacity = (h.Capacity + uint64(h.SectorSize) - 1) /
-			uint64(h.SectorSize) * uint64(h.SectorSize)
+	if err := validateRecoveryJournalGeometry(h); err != nil {
+		return nil, err
+	}
+	if h.Capacity == 0 || h.Capacity > RecoveryJournalMaxCapacityBytes {
+		return nil, fmt.Errorf("%w: capacity", ErrRecoveryJournalCorrupt)
+	}
+	sector := uint64(h.SectorSize)
+	if remainder := h.Capacity % sector; remainder != 0 {
+		rounded, ok := checkedSizeAdd(
+			h.Capacity,
+			sector-remainder,
+			RecoveryJournalMaxCapacityBytes,
+		)
+		if !ok {
+			return nil, fmt.Errorf("%w: capacity", ErrRecoveryJournalCorrupt)
+		}
+		h.Capacity = rounded
 	}
 	h.RecycleCount = 1
 	if err := validateRecoveryJournalHeader(h); err != nil {
@@ -717,8 +907,14 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 		Key:        key,
 		Value:      value,
 	}
-	padded := recoveryRecordPadded(rj.header.SectorSize, len(key), len(value))
-	if rj.cursor+uint64(padded) > rj.header.Capacity {
+	padded, ok := checkedRecoveryRecordPadded(
+		rj.header.SectorSize, len(key), len(value),
+	)
+	if !ok {
+		return 0, fmt.Errorf("%w: record key or value length", ErrInvalidWrite)
+	}
+	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
+	if !ok || end > rj.header.Capacity {
 		return 0, ErrRecoveryJournalFull
 	}
 	if cap(rj.scratch) < padded {
@@ -740,15 +936,27 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 // Fits reports whether a record of the given key and value lengths would fit in
 // the remaining preallocated capacity without a recycle.
 func (rj *RecoveryJournal) Fits(keyLen, valueLen int) bool {
-	padded := recoveryRecordPadded(rj.header.SectorSize, keyLen, valueLen)
-	return rj.cursor+uint64(padded) <= rj.header.Capacity
+	padded, ok := checkedRecoveryRecordPadded(
+		rj.header.SectorSize, keyLen, valueLen,
+	)
+	if !ok {
+		return false
+	}
+	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
+	return ok && end <= rj.header.Capacity
 }
 
 // FitsBatch reports whether one batch record carrying entries would fit in the
 // remaining preallocated capacity without a recycle.
 func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
-	padded := RecoveryBatchRecordPaddedSize(rj.header.SectorSize, entries)
-	return rj.cursor+uint64(padded) <= rj.header.Capacity
+	padded, ok := checkedRecoveryBatchRecordPaddedSize(
+		rj.header.SectorSize, entries,
+	)
+	if !ok {
+		return false
+	}
+	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
+	return ok && end <= rj.header.Capacity
 }
 
 // AppendBatch writes one batch record carrying entries at the cursor and
@@ -760,8 +968,14 @@ func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
 func (rj *RecoveryJournal) AppendBatch(
 	generation uint64, entries []RecoveryBatchEntry,
 ) (uint64, error) {
-	padded := RecoveryBatchRecordPaddedSize(rj.header.SectorSize, entries)
-	if rj.cursor+uint64(padded) > rj.header.Capacity {
+	padded, ok := checkedRecoveryBatchRecordPaddedSize(
+		rj.header.SectorSize, entries,
+	)
+	if !ok {
+		return 0, fmt.Errorf("%w: batch record length", ErrInvalidWrite)
+	}
+	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
+	if !ok || end > rj.header.Capacity {
 		return 0, ErrRecoveryJournalFull
 	}
 	if cap(rj.scratch) < padded {

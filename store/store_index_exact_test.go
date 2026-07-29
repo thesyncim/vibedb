@@ -450,6 +450,7 @@ func TestStoreExactIndexDefinitionErrors(t *testing.T) {
 		{},
 		{Name: "x"},
 		{Name: "x", Paths: []string{"not-a-pointer"}},
+		{Name: "x", Paths: []string{"/a", "/a"}},
 		{Name: "x", Paths: []string{"/a", "/b", "/c", "/d", "/e"}},
 	} {
 		if _, err := collection.CreateIndex(def); err == nil {

@@ -19,23 +19,23 @@ func TestDMLGrammarShapes(t *testing.T) {
 	}{
 		{
 			name: "insert a bound document",
-			src:  `INSERT INTO users VALUES ('u1', ?)`,
-			want: `insert into users (s"u1", ?0) params=1`,
+			src:  `INSERT INTO users VALUES (?)`,
+			want: `insert into users (?0) params=1`,
 		},
 		{
-			name: "insert with the pseudo-column list",
-			src:  `INSERT INTO users ("$key", "$doc") VALUES ('u1', {"a":1})`,
-			want: `insert into users explicit (s"u1", j{"a":1}) params=0`,
+			name: "insert a flat document",
+			src:  `INSERT INTO users (id, name) VALUES ('u1', 'Ana')`,
+			want: `insert into users fields -1:id -1:name (s"u1", s"Ana") params=0`,
 		},
 		{
 			name: "insert a quoted JSON string",
-			src:  `INSERT INTO users VALUES (?, '{"a":1}')`,
-			want: `insert into users (?0, s"{\"a\":1}") params=1`,
+			src:  `INSERT INTO users VALUES ('{"id":"u1","a":1}')`,
+			want: `insert into users (s"{\"id\":\"u1\",\"a\":1}") params=0`,
 		},
 		{
 			name: "several rows in one statement",
-			src:  `INSERT INTO users VALUES ('a', {"x":1}), ('b', ?)`,
-			want: `insert into users (s"a", j{"x":1}) (s"b", ?0) params=1`,
+			src:  `INSERT INTO users VALUES ({"id":"a","x":1}), (?)`,
+			want: `insert into users (j{"id":"a","x":1}) (?0) params=1`,
 		},
 		{
 			name: "update every document",
@@ -48,9 +48,9 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `update users set ?0 where (cmp = 0:tier s"free") params=1`,
 		},
 		{
-			name: "update by primary key",
+			name: "update by a JSON field named dollar key",
 			src:  `UPDATE users SET "$doc" = ? WHERE "$key" = 'u1'`,
-			want: `update users set ?0 keys s"u1" params=1`,
+			want: `update users set ?0 where (cmp = 0:/$key s"u1") params=1`,
 		},
 		{
 			name: "delete everything",
@@ -63,14 +63,14 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `delete from users where (and (cmp > 0:age n30) (not (cmp = 0:name s"x"))) params=0`,
 		},
 		{
-			name: "delete by primary key",
+			name: "delete by a JSON field named dollar key",
 			src:  `DELETE FROM users WHERE "$key" = ?`,
-			want: `delete from users keys ?0 params=1`,
+			want: `delete from users where (cmp = 0:/$key ?0) params=1`,
 		},
 		{
-			name: "delete by primary-key membership",
+			name: "delete by dollar-key field membership",
 			src:  `DELETE FROM users WHERE "$key" IN ('a', 'b')`,
-			want: `delete from users keys s"a" s"b" params=0`,
+			want: `delete from users where (in 0:/$key s"a" s"b") params=0`,
 		},
 		{
 			name: "a nested path in a condition",
@@ -110,22 +110,22 @@ func TestDDLGrammarShapes(t *testing.T) {
 		{
 			name: "a column list with a column-level key",
 			src:  `CREATE TABLE users (id STRING PRIMARY KEY, name TEXT, age INTEGER NOT NULL)`,
-			want: `create table users 0:id:STRING:required:pk 0:name:STRING 0:age:INTEGER:required primary 0:id`,
+			want: `create table users 0:id:STRING:required:pk 0:name:NULL|STRING 0:age:INTEGER:required primary 0:id`,
 		},
 		{
 			name: "a table-level composite key",
 			src:  `CREATE TABLE events (tenant STRING, id STRING, PRIMARY KEY (tenant, id))`,
-			want: `create table events 0:tenant:STRING 0:id:STRING primary 0:tenant 0:id`,
+			want: `create table events 0:tenant:STRING:required 0:id:STRING:required primary 0:tenant 0:id`,
 		},
 		{
 			name: "a nested column",
 			src:  `CREATE TABLE users (profile.region STRING, flags ARRAY)`,
-			want: `create table users 0:profile.region:STRING 0:flags:ARRAY`,
+			want: `create table users 0:profile.region:NULL|STRING 0:flags:NULL|ARRAY`,
 		},
 		{
 			name: "SQL type aliases",
-			src:  `CREATE TABLE t (a VARCHAR, b BIGINT, c DOUBLE, d BOOLEAN, e JSONB)`,
-			want: `create table t 0:a:STRING 0:b:INTEGER 0:c:NUMBER 0:d:BOOL 0:e:ANY`,
+			src:  `CREATE TABLE t (a VARCHAR, b BIGINT, c DOUBLE, d BOOLEAN, e JSON)`,
+			want: `create table t 0:a:NULL|STRING 0:b:NULL|INTEGER 0:c:NULL|NUMBER 0:d:NULL|BOOL 0:e:ANY`,
 		},
 		{
 			name: "an unnamed index",
@@ -193,24 +193,22 @@ func runDMLRejections(t *testing.T, cases []dmlRejection) {
 // is what they get instead of a result.
 func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 	runDMLRejections(t, []dmlRejection{
-		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "exactly two values"},
-		{"a numeric key", `INSERT INTO t VALUES (1, ?)`, -1, "keys are opaque bytes"},
-		{"a NULL document", `INSERT INTO t VALUES ('k', NULL)`, -1, "not a document"},
+		{"the removed key/document row", `INSERT INTO t VALUES ('k', ?)`, -1, "one complete JSON document"},
+		{"the removed bound key/document row", `INSERT INTO t VALUES (?, ?)`, -1, "declared primary-key field"},
+		{"the removed pseudo-column pair", `INSERT INTO t ("$key", "$doc") VALUES ('k', ?)`, -1, "one complete document"},
+		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "one complete JSON document"},
+		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
 		{"INSERT ... SELECT", `INSERT INTO t SELECT a FROM u`, -1, "nowhere to send"},
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
-		{"ON CONFLICT", `INSERT INTO t VALUES ('k', ?) ON CONFLICT DO NOTHING`, -1, "ON CONFLICT"},
+		{"ON CONFLICT", `INSERT INTO t VALUES (?) ON CONFLICT DO NOTHING`, -1, "ON CONFLICT"},
 		{"RETURNING", `DELETE FROM t RETURNING a`, -1, "RETURNING"},
 
 		{"a top-level path assignment", `UPDATE t SET name = 'x'`, -1, "partial document update"},
 		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "no JSON path-set operation"},
-		{"assigning the key", `UPDATE t SET "$key" = 'x'`, -1, "identity"},
+		{"assigning a path", `UPDATE t SET "$key" = 'x'`, -1, "partial document update"},
 		{"two assignments", `UPDATE t SET "$doc" = ?, "$doc" = ?`, -1, "the whole document once"},
 		{"UPDATE ... FROM", `UPDATE t SET "$doc" = ? FROM u`, -1, "never from another collection"},
 
-		{"a key conjoined with a condition", `DELETE FROM t WHERE "$key" = 'a' AND b = 1`, -1, "primary key, not a field"},
-		{"a key under NOT", `DELETE FROM t WHERE NOT "$key" = 'a'`, -1, "primary key, not a field"},
-		{"a key inequality", `DELETE FROM t WHERE "$key" > 'a'`, -1, "primary key, not a field"},
-		{"a key NOT IN", `DELETE FROM t WHERE "$key" NOT IN ('a')`, -1, "primary key, not a field"},
 		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
 		{"DELETE ... LIMIT", `DELETE FROM t WHERE a = 1 LIMIT 5`, -1, "no LIMIT"},
 		{"DELETE ... ORDER BY", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "no ORDER BY"},
@@ -240,9 +238,6 @@ func TestDocumentDerivedInsertGrammar(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseStatement(%q) = %v", tc.src, err)
 			}
-			if !statement.Insert.DerivedKey {
-				t.Fatal("DerivedKey = false, want true")
-			}
 			if got := len(statement.Insert.Columns); got != tc.columns {
 				t.Fatalf("len(Columns) = %d, want %d", got, tc.columns)
 			}
@@ -266,6 +261,16 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"UUID", `CREATE TABLE t (a UUID)`, -1, "store it as STRING"},
 		{"BYTEA", `CREATE TABLE t (a BYTEA)`, -1, "no byte string"},
 		{"ENUM", `CREATE TABLE t (a ENUM)`, -1, "never checked"},
+		{"SERIAL", `CREATE TABLE t (a SERIAL)`, -1, "sequence-backed generated default"},
+		{"BIGSERIAL", `CREATE TABLE t (a BIGSERIAL)`, -1, "sequence-backed generated default"},
+		{"MONEY", `CREATE TABLE t (a MONEY)`, -1, "fixed fractional"},
+		{"bare CHAR", `CREATE TABLE t (a CHAR)`, -1, "fixed-width"},
+		{"bare CHARACTER", `CREATE TABLE t (a CHARACTER)`, -1, "fixed-width"},
+		{"bare NCHAR", `CREATE TABLE t (a NCHAR)`, -1, "fixed-width"},
+		{"NVARCHAR", `CREATE TABLE t (a NVARCHAR)`, -1, "omitted-length semantics"},
+		{"JSONB", `CREATE TABLE t (a JSONB)`, -1, "normalizes"},
+		{"RECORD", `CREATE TABLE t (a RECORD)`, -1, "declared field shape"},
+		{"STRUCT", `CREATE TABLE t (a STRUCT)`, -1, "declared field shape"},
 		{"an unknown type", `CREATE TABLE t (a WIDGET)`, -1, "unknown type"},
 		{"a column with no type", `CREATE TABLE t (a)`, -1, "expected a column type"},
 		{"an empty column list", `CREATE TABLE t ()`, -1, "may not be empty"},
@@ -273,6 +278,10 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"two primary keys", `CREATE TABLE t (a STRING PRIMARY KEY, b STRING PRIMARY KEY)`, -1, "declared twice"},
 		{"a container key", `CREATE TABLE t (a OBJECT PRIMARY KEY)`, -1, "no ordering to derive one from"},
 		{"a nullable key", `CREATE TABLE t (a NULL, PRIMARY KEY (a))`, -1, "must be present"},
+		{"an explicit nullable key", `CREATE TABLE t (a STRING NULL, PRIMARY KEY (a))`, -1, "explicit NULL"},
+		{"NULL then NOT NULL", `CREATE TABLE t (a STRING NULL NOT NULL)`, -1, "contradictory"},
+		{"NOT NULL then NULL", `CREATE TABLE t (a STRING NOT NULL NULL)`, -1, "contradictory"},
+		{"column primary key then NULL", `CREATE TABLE t (a STRING PRIMARY KEY NULL)`, -1, "contradictory"},
 		{"DEFAULT", `CREATE TABLE t (a STRING DEFAULT 'x')`, -1, "DEFAULT is not supported"},
 		{"UNIQUE", `CREATE TABLE t (a STRING UNIQUE)`, -1, "UNIQUE is not supported"},
 		{"CHECK", `CREATE TABLE t (a STRING, CHECK (a > 1))`, -1, "CHECK is not supported"},

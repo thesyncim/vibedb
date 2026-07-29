@@ -20,8 +20,11 @@ package sql
 // p's storage. See [Parser] for the lifetime dst and everything reachable from
 // it inherit.
 func (p *Parser) ParseStatement(dst *Statement, src string) error {
-	p.reset(src)
 	*dst = Statement{}
+	if err := validateStatementText(src); err != nil {
+		return err
+	}
+	p.reset(src)
 	if err := p.parseAnyStatement(dst); err != nil {
 		// As in Parse, the half-parsed statement is thrown away rather than
 		// returned beside the error: a caller that ignores the error and lowers
@@ -167,101 +170,36 @@ func (p *Parser) parseInsert() error {
 	return nil
 }
 
-// parseInsertColumns parses the optional ("$key", "$doc") column list.
-//
-// A real column list is refused rather than accepted and mapped onto document
-// fields. See [InsertStmt] for the reasoning; the short version is that a
-// schemaless store has no schema for the list to name, so accepting one would
-// make the document's shape a property of the statement text.
+// parseInsertColumns parses the flat document fields synthesized by VALUES.
+// A complete document uses no column list.
 func (p *Parser) parseInsertColumns() error {
 	p.advance() // '('
-	if !(p.tok.kind == tokQuotedIdent && !p.tok.esc &&
-		(p.tok.text == KeyColumn || p.tok.text == DocumentColumn)) {
-		paths := p.idxPaths[:0]
-		for {
-			path, err := p.parsePath(false)
-			if err != nil {
-				return err
-			}
-			if len(path.Segments) != 1 || path.Segments[0].IsIndex {
-				return p.errAt(path.Pos, "an INSERT column list builds a flat JSON object, so each column must be one top-level field")
-			}
-			for _, prior := range paths {
-				if sameSpec(prior, path) {
-					return p.errfAt(path.Pos, "INSERT column %q is named twice", path.Spec())
-				}
-			}
-			paths = append(paths, path)
-			if len(paths) > maxClauseItems {
-				return p.errfAt(path.Pos, "an INSERT may name at most %d columns", maxClauseItems)
-			}
-			if p.tok.kind != tokComma {
-				break
-			}
-			p.advance()
-		}
-		p.idxPaths = paths
-		p.ins.Columns = paths
-		p.ins.DerivedKey = true
-		return p.expect(tokRParen, "')'")
-	}
-	p.ins.Explicit = true
-	seen := [2]bool{}
-	order := [2]int{-1, -1}
-	for i := 0; ; i++ {
-		if i >= 2 {
-			return p.errfHere("an INSERT column list names exactly the two pseudo-columns %q and %q", KeyColumn, DocumentColumn)
-		}
-		which, err := p.parsePseudoColumn()
+	paths := p.idxPaths[:0]
+	for {
+		path, err := p.parsePath(false)
 		if err != nil {
 			return err
 		}
-		if seen[which] {
-			return p.errfHere("%q is named twice in the column list", pseudoColumnName(which))
+		if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+			return p.errAt(path.Pos, "an INSERT column list builds a flat JSON object, so each column must be one top-level field")
 		}
-		seen[which] = true
-		order[i] = which
+		for _, prior := range paths {
+			if sameSpec(prior, path) {
+				return p.errfAt(path.Pos, "INSERT column %q is named twice", path.Spec())
+			}
+		}
+		paths = append(paths, path)
+		if len(paths) > maxClauseItems {
+			return p.errfAt(path.Pos, "an INSERT may name at most %d columns", maxClauseItems)
+		}
 		if p.tok.kind != tokComma {
 			break
 		}
 		p.advance()
 	}
-	if !seen[0] || !seen[1] {
-		missing := KeyColumn
-		if !seen[1] {
-			missing = DocumentColumn
-		}
-		return p.errfHere("the column list omits %q: a document is written whole, so both the key and the document must be given", missing)
-	}
-	if order[0] != 0 {
-		return p.errfHere("the column list must name %q before %q: the VALUES positions follow the store's own order, key then document", KeyColumn, DocumentColumn)
-	}
+	p.idxPaths = paths
+	p.ins.Columns = paths
 	return p.expect(tokRParen, "')'")
-}
-
-// parsePseudoColumn reads one entry of an INSERT column list, answering 0 for
-// the key and 1 for the document.
-func (p *Parser) parsePseudoColumn() (int, error) {
-	if p.tok.kind == tokQuotedIdent && !p.tok.esc {
-		switch p.tok.text {
-		case KeyColumn:
-			p.advance()
-			return 0, nil
-		case DocumentColumn:
-			p.advance()
-			return 1, nil
-		}
-	}
-	return 0, p.errfHere(
-		"a column list names declared columns, and this store has none: its unit is a whole JSON document under a primary key. "+
-			"Write VALUES (key, document), or name the two pseudo-columns explicitly as (%q, %q)", KeyColumn, DocumentColumn)
-}
-
-func pseudoColumnName(which int) string {
-	if which == 0 {
-		return KeyColumn
-	}
-	return DocumentColumn
 }
 
 func (p *Parser) parseInsertRow() (InsertRow, error) {
@@ -271,7 +209,10 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 	}
 	p.advance()
 	if len(p.ins.Columns) != 0 {
-		values := make([]Operand, 0, len(p.ins.Columns))
+		// Values are retained by the parsed row, so they must come from the
+		// Parser's stable arena rather than a per-row heap allocation. The
+		// arena also keeps warmed ParseStatement allocation-free.
+		values := p.ops.allocDirty(len(p.ins.Columns))
 		for i := range p.ins.Columns {
 			if i != 0 {
 				if p.tok.kind != tokComma {
@@ -283,7 +224,7 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 			if err != nil {
 				return row, err
 			}
-			values = append(values, value)
+			values[i] = value
 		}
 		if p.tok.kind == tokComma {
 			return row, p.errfHere("the VALUES row has more values than its %d-column list", len(p.ins.Columns))
@@ -294,93 +235,25 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 		row.Values = values
 		return row, nil
 	}
-	// A single value is a complete JSON document whose key is derived from the
-	// table's declared PRIMARY KEY path.
-	if p.tok.kind == tokParam || p.tok.kind == tokString ||
-		p.tok.kind == tokLBracket ||
-		p.tok.kind == tokError && p.tok.pos < len(p.lx.src) && p.lx.src[p.tok.pos] == '{' {
-		first, err := p.parseDocumentOperand()
-		if err != nil {
-			return row, err
-		}
-		if p.tok.kind == tokRParen {
-			p.ins.DerivedKey = true
-			row.Values = []Operand{first}
-			p.advance()
-			return row, nil
-		}
-		// A leading placeholder or string followed by a comma is the legacy
-		// caller-supplied key/document form.
-		row.Key = first
-		if first.Kind != OperandParam && first.Kind != OperandString {
-			return row, p.errAt(first.Pos, "a caller-supplied primary key must be a string literal or '?'")
-		}
-		if p.tok.kind != tokComma {
-			return row, p.errHere("expected ',' between the primary key and document")
-		}
-		p.advance()
-		doc, err := p.parseDocumentOperand()
-		if err != nil {
-			return row, err
-		}
-		row.Doc = doc
-		if p.tok.kind == tokComma {
-			return row, p.errHere("a VALUES row holds exactly two values, the primary key and the document")
-		}
-		if err := p.expect(tokRParen, "')'"); err != nil {
-			return row, err
-		}
-		return row, nil
-	}
-	key, err := p.parseKeyOperand("a primary key")
+	// Without a column list, a VALUES row is exactly one complete JSON
+	// document. Its storage identity is derived later from the table's declared
+	// scalar JSON PRIMARY KEY.
+	document, err := p.parseDocumentOperand()
 	if err != nil {
 		return row, err
 	}
-	row.Key = key
-	if p.tok.kind != tokComma {
-		return row, p.errfHere(
-			"a VALUES row holds two values, the primary key and the document: this store writes whole documents under caller-chosen keys, "+
-				"and has no sequence to generate a key from. Write VALUES (%s, ?)", quoteForMessage(key))
-	}
-	p.advance()
-	doc, err := p.parseDocumentOperand()
-	if err != nil {
-		return row, err
-	}
-	row.Doc = doc
 	if p.tok.kind == tokComma {
-		return row, p.errHere("a VALUES row holds exactly two values, the primary key and the document")
+		return row, p.errHere(
+			"an INSERT row without a column list holds one complete JSON document; " +
+				"put the declared primary-key field inside that document, or use a flat declared-field list")
 	}
 	if err := p.expect(tokRParen, "')'"); err != nil {
 		return row, err
 	}
+	values := p.ops.allocDirty(1)
+	values[0] = document
+	row.Values = values
 	return row, nil
-}
-
-// quoteForMessage renders a key operand back for a diagnostic. It is only ever
-// reached on the error path, so the allocation formatting costs is free of the
-// steady state.
-func quoteForMessage(o Operand) string {
-	if o.Kind == OperandString {
-		return "'" + o.Text + "'"
-	}
-	return "?"
-}
-
-// parseKeyOperand reads a primary key: a string literal or a placeholder.
-//
-// A number is refused rather than converted. A key is an opaque byte string in
-// this store, so 1 and '1' would be the same key while comparing unequal in
-// every other context, and a caller who wrote the number would have no way to
-// tell which they had stored.
-func (p *Parser) parseKeyOperand(what string) (Operand, error) {
-	switch p.tok.kind {
-	case tokString, tokParam:
-		return p.parseOperand()
-	case tokNumber:
-		return Operand{}, p.errfHere("%s is a string: keys are opaque bytes here, so write '%s' rather than %s", what, p.tok.text, p.tok.text)
-	}
-	return Operand{}, p.errfHere("expected %s: a single-quoted string literal or '?'", what)
 }
 
 // parseDocumentOperand reads a whole JSON document.
@@ -401,7 +274,7 @@ func (p *Parser) parseDocumentOperand() (Operand, error) {
 	switch {
 	case p.tok.kind == tokParam, p.tok.kind == tokString:
 		return p.parseOperand()
-	case p.tok.kind == tokLBracket, p.tok.kind == tokError && pos < len(p.lx.src) && p.lx.src[pos] == '{':
+	case p.tok.kind == tokLBracket, p.tok.kind == tokLBrace:
 		text, start, end, err := p.scanJSONDocument(pos)
 		if err != nil {
 			return Operand{}, err
@@ -471,14 +344,10 @@ func (p *Parser) parseUpdate() error {
 	if p.atKeyword(kwFrom) {
 		return p.errHere("UPDATE ... FROM is not supported: the value written comes from the statement, never from another collection")
 	}
-	keys, err := p.parseDMLWhere("UPDATE")
-	if err != nil {
+	if err := p.parseDMLWhere("UPDATE"); err != nil {
 		return err
 	}
-	p.upd.Keys = keys
-	if keys == nil {
-		p.upd.Filter = p.out
-	}
+	p.upd.Filter = p.out
 	p.upd.Params = p.params
 	return nil
 }
@@ -499,11 +368,6 @@ func (p *Parser) parseAssignment() (Operand, error) {
 		}
 		p.advance()
 		return p.parseDocumentOperand()
-	}
-	if p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == KeyColumn {
-		return Operand{}, p.errfHere(
-			"%q cannot be assigned: a document's primary key is its identity, and moving a document to a new key is a delete and an insert, "+
-				"which this dialect makes you write as such", KeyColumn)
 	}
 	// Anything else that looks like a path is the partial update this engine
 	// has no primitive for. Naming the path back is what makes the message
@@ -540,13 +404,10 @@ func (p *Parser) parseDelete() error {
 		return p.errHere("DELETE ... USING is not supported: the rows to delete are chosen by a condition on the collection itself, never by a join")
 	}
 	whereAt := p.tok.pos
-	keys, err := p.parseDMLWhere("DELETE")
-	if err != nil {
+	if err := p.parseDMLWhere("DELETE"); err != nil {
 		return err
 	}
-	p.del.Keys = keys
 	switch {
-	case keys != nil:
 	case p.out.Where == nil:
 		// A DELETE with no WHERE is legal SQL and means every row. It is
 		// recorded as its own flag rather than as "a filter that happens to be
@@ -629,47 +490,35 @@ func (p *Parser) beginFilter(name string, pos int) {
 	p.out.From = p.from
 }
 
-// parseDMLWhere parses the optional WHERE of an UPDATE or a DELETE, finishes
-// the statement, and splits out a primary-key test.
-//
-// It returns a non-nil key list when the whole condition was a test on the
-// primary key, in which case p.out.Where is left nil because there is no scan
-// to filter: the keys are looked up directly.
-func (p *Parser) parseDMLWhere(clause string) ([]Operand, error) {
+// parseDMLWhere parses the optional WHERE of an UPDATE or a DELETE and
+// finishes the equivalent SELECT filter.
+func (p *Parser) parseDMLWhere(clause string) error {
 	if p.acceptKeyword(kwWhere) {
 		where, err := p.parseExpr(ctxWhere)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		p.out.Where = where
 	}
 	switch {
 	case p.atKeyword(kwGroup), p.atKeyword(kwHaving):
-		return nil, p.errfHere("%s has no GROUP BY or HAVING: it acts on documents, not on groups of them", clause)
+		return p.errfHere("%s has no GROUP BY or HAVING: it acts on documents, not on groups of them", clause)
 	case p.atKeyword(kwOrder):
-		return nil, p.errfHere("%s has no ORDER BY: which documents it touches is decided by the condition, and the order it touches them in is not observable", clause)
+		return p.errfHere("%s has no ORDER BY: which documents it touches is decided by the condition, and the order it touches them in is not observable", clause)
 	case p.atKeyword(kwLimit), p.atKeyword(kwOffset):
-		return nil, p.errfHere("%s has no LIMIT: a bounded delete would have to choose which matching documents to spare, and the engine has no ordering to choose by", clause)
+		return p.errfHere("%s has no LIMIT: a bounded delete would have to choose which matching documents to spare, and the engine has no ordering to choose by", clause)
 	}
 	if err := p.rejectTail(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := p.expectEnd(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := p.resolvePaths(); err != nil {
-		return nil, err
-	}
-	keys, err := p.splitKeyPredicate(p.out.Where)
-	if err != nil {
-		return nil, err
-	}
-	if keys != nil {
-		p.out.Where = nil
-		return keys, nil
+		return err
 	}
 	p.out.Params = p.params
-	return nil, p.validate()
+	return p.validate()
 }
 
 // rejectTail names the clauses a DML statement can be written with in other
@@ -682,69 +531,4 @@ func (p *Parser) rejectTail() error {
 		return p.errHere("ON CONFLICT / ON DUPLICATE KEY is not supported: an INSERT onto an existing key is refused, and a deliberate overwrite is written UPDATE ... SET \"$doc\" = ?")
 	}
 	return nil
-}
-
-// splitKeyPredicate recognizes the two conditions on the primary key that have
-// a direct execution, and refuses every other use of it.
-//
-// The primary key is not a document field. The predicate compiler resolves a
-// path against stored JSON, and the key is not in the JSON, so a compiled
-// predicate simply cannot read it: `WHERE "$key" = 'u-1'` lowered as an
-// ordinary path would compile fine and match the documents that happen to
-// contain a field literally named "$key", which is almost never any of them and
-// is silently wrong when it is some of them.
-//
-// So the two shapes the store can answer without a predicate at all — equality
-// and membership on the key alone — are recognized here and executed as
-// lookups, and every other appearance of the key inside a condition is
-// refused. The boundary is deliberately narrow. "$key" under an OR, a NOT, or
-// alongside another conjunct would each need a different execution, and a
-// dialect that accepted three of them and refused the fourth would be harder to
-// remember than one that accepts the two that are free.
-func (p *Parser) splitKeyPredicate(where *Expr) ([]Operand, error) {
-	if where == nil {
-		return nil, nil
-	}
-	uses := countKeyPaths(where)
-	if uses == 0 {
-		return nil, nil
-	}
-	if uses == 1 && isKeyPath(where.Path) && !where.Negated {
-		switch where.Kind {
-		case ExprCompare:
-			if where.Op == OpEq {
-				op := p.ops.alloc(1)
-				op[0] = where.Value
-				return op, nil
-			}
-		case ExprIn:
-			if len(where.List) != 0 {
-				return where.List, nil
-			}
-		}
-	}
-	return nil, p.errfAt(where.Pos,
-		"%q is the document's primary key, not a field inside it, so a predicate cannot read it: the two conditions that need no predicate are "+
-			"`WHERE %q = value` and `WHERE %q IN (value, ...)`, written on their own, and this is neither",
-		KeyColumn, KeyColumn, KeyColumn)
-}
-
-// countKeyPaths counts how many leaves of the tree name the primary key.
-func countKeyPaths(e *Expr) int {
-	n := 0
-	if isKeyPath(e.Path) {
-		n++
-	}
-	for _, kid := range e.Kids {
-		n += countKeyPaths(kid)
-	}
-	return n
-}
-
-// isKeyPath reports whether path is the bare primary-key pseudo-column. A
-// resolved path has already had any range-variable head removed, so the key is
-// exactly one segment spelling KeyColumn.
-func isKeyPath(path *PathExpr) bool {
-	return path != nil && len(path.Segments) == 1 &&
-		!path.Segments[0].IsIndex && path.Segments[0].Key == KeyColumn
 }

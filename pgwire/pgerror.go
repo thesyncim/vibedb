@@ -5,7 +5,11 @@ import (
 	"strconv"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // Errors, and the SQLSTATE codes clients branch on.
@@ -18,40 +22,50 @@ import (
 // appendix says they mean, and each is used in exactly one situation.
 //
 // The important one is the boundary between 42601 and 0A000. A statement this
-// dialect refuses is not the same kind of event as a statement it cannot parse,
-// and the difference a client cares about is retryability: 0A000 says "this
-// server will never run this", 42601 says "this text is wrong". The rule this
-// package applies is decided before parsing, from the statement's leading
-// keyword, and not from the parser's message. A statement whose first keyword
-// is not one this server implements at all — INSERT, UPDATE, CREATE, ALTER,
-// BEGIN, and the rest — is 0A000, named with the feature that is missing. A
-// SELECT that the parser then rejects, for any reason including a deliberate
-// refusal like a subquery or LIKE, is 42601 with the parser's own message and
-// its position. Classifying refusals by matching the parser's message text was
-// the alternative and was rejected: those messages are prose maintained in
-// another package by other people, and a SQLSTATE that changes when someone
-// improves a sentence is a SQLSTATE nobody can rely on.
+// dialect refuses is not the same kind of event as admitted SQL it cannot
+// parse, and the difference a client cares about is retryability: 0A000 says
+// "this server will never run this feature", while 42601 says "this admitted
+// statement text is wrong". SELECT, INSERT, UPDATE, DELETE, CREATE TABLE,
+// CREATE INDEX, and the bounded transaction grammar reach the real parser or
+// transaction decoder. Unsupported leading kinds such as ALTER, DROP, MERGE,
+// COPY, and SAVEPOINT are classified first and receive 0A000 with a specific
+// boundary. Parse errors from an admitted kind retain 42601 and a source
+// position. SQLSTATEs never depend on matching another package's prose.
 
 // SQLSTATE codes this server emits. The names are the PostgreSQL condition
 // names so a reader can find each one in the protocol appendix.
 const (
-	sqlstateSyntaxError            = "42601"
-	sqlstateUndefinedTable         = "42P01"
-	sqlstateUndefinedObject        = "42704"
-	sqlstateFeatureNotSupported    = "0A000"
-	sqlstateProtocolViolation      = "08P01"
-	sqlstateInvalidPassword        = "28P01"
-	sqlstateInvalidAuthorization   = "28000"
-	sqlstateInvalidStatementName   = "26000"
-	sqlstateInvalidCursorName      = "34000"
-	sqlstateDuplicateStatement     = "42P05"
-	sqlstateDuplicateCursor        = "42P03"
-	sqlstateInvalidParameterValue  = "22023"
-	sqlstateProgramLimitExceeded   = "54000"
-	sqlstateObjectNotInPrereqState = "55000"
-	sqlstateInternalError          = "XX000"
-	sqlstateTooManyConnections     = "53300"
-	sqlstateQueryCanceled          = "57014"
+	sqlstateSyntaxError                = "42601"
+	sqlstateUndefinedTable             = "42P01"
+	sqlstateDuplicateTable             = "42P07"
+	sqlstateDuplicateObject            = "42710"
+	sqlstateUndefinedObject            = "42704"
+	sqlstateDatatypeMismatch           = "42804"
+	sqlstateInvalidObjectDefinition    = "42P17"
+	sqlstateFeatureNotSupported        = "0A000"
+	sqlstateProtocolViolation          = "08P01"
+	sqlstateInvalidPassword            = "28P01"
+	sqlstateInvalidAuthorization       = "28000"
+	sqlstateInvalidStatementName       = "26000"
+	sqlstateInvalidCursorName          = "34000"
+	sqlstateDuplicateStatement         = "42P05"
+	sqlstateDuplicateCursor            = "42P03"
+	sqlstateCharacterNotInRepertoire   = "22021"
+	sqlstateNumericValueOutOfRange     = "22003"
+	sqlstateInvalidParameterValue      = "22023"
+	sqlstateProgramLimitExceeded       = "54000"
+	sqlstateObjectNotInPrereqState     = "55000"
+	sqlstateInternalError              = "XX000"
+	sqlstateTooManyConnections         = "53300"
+	sqlstateQueryCanceled              = "57014"
+	sqlstateUniqueViolation            = "23505"
+	sqlstateCheckViolation             = "23514"
+	sqlstateSerializationFailure       = "40001"
+	sqlstateStatementCompletionUnknown = "40003"
+	sqlstateNoActiveTransaction        = "25P01"
+	sqlstateFailedTransaction          = "25P02"
+	sqlstateActiveSQLTransaction       = "25001"
+	sqlstateReadOnlyTransaction        = "25006"
 )
 
 // A pgError is one ErrorResponse: a SQLSTATE, a message, and the optional
@@ -101,10 +115,10 @@ func (w *writer) errorResponse(e *pgError) {
 	w.byte('C')
 	w.str(e.code)
 	w.byte('M')
-	w.str(e.message)
+	w.str(truncateErrorField(e.message))
 	if e.hint != "" {
 		w.byte('H')
-		w.str(e.hint)
+		w.str(truncateErrorField(e.hint))
 	}
 	if e.position > 0 {
 		w.byte('P')
@@ -112,6 +126,21 @@ func (w *writer) errorResponse(e *pgError) {
 	}
 	w.byte(0)
 	w.end()
+}
+
+// truncateErrorField bounds diagnostic output while preserving valid UTF-8.
+// The caller's message may contain a quoted token derived from a maximal SQL
+// input; a client needs the reason and position, not megabytes of echoed text.
+func truncateErrorField(text string) string {
+	if len(text) <= maxErrorFieldBytes {
+		return text
+	}
+	const suffix = "..."
+	end := maxErrorFieldBytes - len(suffix)
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end] + suffix
 }
 
 // asPGError maps an error from the SQL front end or the executor onto a
@@ -129,6 +158,63 @@ func asPGError(err error) *pgError {
 	var already *pgError
 	if errors.As(err, &already) {
 		return already
+	}
+	if errors.Is(err, query.ErrResultBudget) ||
+		errors.Is(err, query.ErrAggregateBudget) ||
+		errors.Is(err, query.ErrJoinPairBudget) ||
+		errors.Is(err, query.ErrWorkBudget) ||
+		errors.Is(err, query.ErrSpillBudget) ||
+		errors.Is(err, sqldriver.ErrCatalogTooLarge) ||
+		errors.Is(err, sqldriver.ErrTooManyTables) ||
+		errors.Is(err, sqldriver.ErrArgumentsTooLarge) ||
+		errors.Is(err, sqldriver.ErrTransactionTooLarge) ||
+		errors.Is(err, sqldriver.ErrJoinMaterializationTooLarge) ||
+		errors.Is(err, store.ErrTooLarge) ||
+		errors.Is(err, store.ErrCheckpointTooLarge) ||
+		errors.Is(err, durable.ErrBatchTooLarge) ||
+		errors.Is(err, durable.ErrDocumentTooLarge) ||
+		errors.Is(err, durable.ErrKeyTooLarge) ||
+		errors.Is(err, durable.ErrStoreDocumentPageTooLarge) {
+		return newError(sqlstateProgramLimitExceeded, err.Error())
+	}
+	switch {
+	case errors.Is(err, query.ErrCanceled):
+		return queryCanceled()
+	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
+		return newError(sqlstateStatementCompletionUnknown, err.Error())
+	case errors.Is(err, sqldriver.ErrTableNotFound):
+		return newError(sqlstateUndefinedTable, err.Error())
+	case errors.Is(err, sqldriver.ErrTableExists):
+		return newError(sqlstateDuplicateTable, err.Error())
+	case errors.Is(err, sqldriver.ErrIndexExists):
+		return newError(sqlstateDuplicateObject, err.Error())
+	case errors.Is(err, sqldriver.ErrDuplicatePrimaryKey):
+		return newError(sqlstateUniqueViolation, err.Error())
+	case errors.Is(err, store.ErrSchemaViolation):
+		return newError(sqlstateCheckViolation, err.Error())
+	case errors.Is(err, store.ErrSchemaDefinition),
+		errors.Is(err, store.ErrIndexDefinition):
+		return newError(sqlstateInvalidObjectDefinition, err.Error())
+	case errors.Is(err, sqldriver.ErrTransactionConflict):
+		return newError(sqlstateSerializationFailure, err.Error())
+	case errors.Is(err, sqldriver.ErrTransactionFailed):
+		return newError(sqlstateFailedTransaction, err.Error())
+	case errors.Is(err, sqldriver.ErrNoTransaction):
+		return newError(sqlstateNoActiveTransaction, err.Error())
+	case errors.Is(err, sqldriver.ErrTransactionActive):
+		return newError(sqlstateActiveSQLTransaction, err.Error())
+	case errors.Is(err, sqldriver.ErrCursorOpen):
+		return newError(sqlstateObjectNotInPrereqState, err.Error())
+	case errors.Is(err, sqldriver.ErrIndexLayoutFrozen):
+		return newError(sqlstateObjectNotInPrereqState, err.Error())
+	case errors.Is(err, sqldriver.ErrReadOnlyTransaction):
+		return newError(sqlstateReadOnlyTransaction, err.Error())
+	case errors.Is(err, sqldriver.ErrDDLInTransaction):
+		return newError(sqlstateActiveSQLTransaction, err.Error())
+	case errors.Is(err, sqldriver.ErrUnsupportedIsolation),
+		errors.Is(err, sqldriver.ErrTransactionIndexedTable),
+		errors.Is(err, sqldriver.ErrTransactionUnsupportedLane):
+		return newError(sqlstateFeatureNotSupported, err.Error())
 	}
 	var parse *sqlast.ParseError
 	if errors.As(err, &parse) {

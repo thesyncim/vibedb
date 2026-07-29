@@ -1,9 +1,9 @@
 package query
 
 import (
-	"math"
+	"fmt"
+	"hash/maphash"
 
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -74,6 +74,12 @@ type joinBuild struct {
 	// text owns every byte values views, copied out of the joined side's
 	// extraction because that extraction's buffers are refilled batch to batch.
 	text []byte
+	// seed keys client-controlled join values before they reach the bucket
+	// directory. It is minted once per retained Workspace and survives reset,
+	// so a warmed join pays neither randomness nor allocation while collision
+	// construction remains impractical.
+	seed   maphash.Seed
+	seeded bool
 	// active reports whether this clause built a side at all. A clause that
 	// only filters never does, and reading a build that was never filled must
 	// fail closed rather than report no matches for a reason it cannot name.
@@ -95,9 +101,16 @@ func (b *joinBuild) reset() {
 
 // add records one surviving joined row. cell is the row's join value, already
 // copied into b's own storage by the caller.
-func (b *joinBuild) add(cell scalar, row store.Location) {
+func (b *joinBuild) add(cell scalar, row store.Location) error {
+	if len(b.values) >= int64ToInt(maxJoinBuildEntries) {
+		return fmt.Errorf(
+			"query: join build exceeds %d entries addressable by its int32 chains",
+			maxJoinBuildEntries,
+		)
+	}
 	b.values = append(b.values, cell)
 	b.rows = append(b.rows, row)
+	return nil
 }
 
 // index builds the bucket directory over the entries collected so far. It is a
@@ -110,8 +123,15 @@ func (b *joinBuild) add(cell scalar, row store.Location) {
 // structural: prepending in reverse leaves every chain holding its entries in
 // ascending entry order, which is ascending joined-row address order, which is
 // the order the expansion must emit them in.
-func (b *joinBuild) index() {
-	buckets := joinBuildBuckets(len(b.values))
+func (b *joinBuild) index() error {
+	if !b.seeded {
+		b.seed = maphash.MakeSeed()
+		b.seeded = true
+	}
+	buckets, err := joinBuildBuckets(len(b.values))
+	if err != nil {
+		return err
+	}
 	if cap(b.buckets) < buckets {
 		b.buckets = make([]int32, buckets)
 	} else {
@@ -123,23 +143,47 @@ func (b *joinBuild) index() {
 	b.mask = uint32(buckets - 1)
 	b.next = resize(b.next, len(b.values))
 	for i := len(b.values) - 1; i >= 0; i-- {
-		slot := uint32(hashJoinValue(b.values[i])) & b.mask
+		slot := uint32(hashJoinValue(b.seed, b.values[i])) & b.mask
 		b.next[i] = b.buckets[slot]
 		b.buckets[slot] = int32(i)
 	}
 	b.active = true
+	return nil
 }
 
 // joinBuildBuckets is the power-of-two directory size for n entries. Two
 // buckets per entry keeps the average chain at half a hop for distinct values,
 // which is what makes a probe's cost the exact-comparison of the matches it
 // finds rather than the hops it took to reach them.
-func joinBuildBuckets(n int) int {
+const maxJoinBuildEntries int64 = 1<<31 - 1
+
+func joinBuildBuckets(n int) (int, error) {
+	maxInt := int(^uint(0) >> 1)
+	if n < 0 || int64(n) > maxJoinBuildEntries || n > maxInt/2 {
+		return 0, fmt.Errorf(
+			"query: join build size %d is not representable by its int32 chains",
+			n,
+		)
+	}
 	buckets := 1
 	for buckets < n*2 {
+		if buckets > maxInt/2 {
+			return 0, fmt.Errorf(
+				"query: join build bucket directory overflows int for %d entries",
+				n,
+			)
+		}
 		buckets *= 2
 	}
-	return buckets
+	return buckets, nil
+}
+
+func int64ToInt(n int64) int {
+	maxInt := int64(^uint(0) >> 1)
+	if n > maxInt {
+		return int(maxInt)
+	}
+	return int(n)
 }
 
 // appendMatches appends the joined rows whose join value equals cell, in
@@ -149,20 +193,23 @@ func joinBuildBuckets(n int) int {
 // compareScalar every other equality in this engine uses, so a fan-out join
 // matches exactly the pairs a nested loop would and exactly the driving rows
 // the semi-join would keep.
-func (b *joinBuild) appendMatches(dst []store.Location, cell scalar) ([]store.Location, int) {
+func (b *joinBuild) appendMatches(dst []store.Location, cell scalar, limit int) ([]store.Location, int, bool) {
 	if !b.active || cell.kind == kindNull {
 		// A null or absent driving key joins to nothing, the rule every other
 		// comparison in this engine applies.
-		return dst, 0
+		return dst, 0, false
 	}
 	found := 0
-	for i := b.buckets[uint32(hashJoinValue(cell))&b.mask]; i != joinBuildEmpty; i = b.next[i] {
+	for i := b.buckets[uint32(hashJoinValue(b.seed, cell))&b.mask]; i != joinBuildEmpty; i = b.next[i] {
 		if compareScalar(b.values[i], cell) == 0 {
+			if limit >= 0 && len(dst) >= limit {
+				return dst, found, true
+			}
 			dst = append(dst, b.rows[i])
 			found++
 		}
 	}
-	return dst, found
+	return dst, found, false
 }
 
 // has reports whether cell has any partner. It is appendMatches without the
@@ -172,7 +219,7 @@ func (b *joinBuild) has(cell scalar) bool {
 	if !b.active || cell.kind == kindNull {
 		return false
 	}
-	for i := b.buckets[uint32(hashJoinValue(cell))&b.mask]; i != joinBuildEmpty; i = b.next[i] {
+	for i := b.buckets[uint32(hashJoinValue(b.seed, cell))&b.mask]; i != joinBuildEmpty; i = b.next[i] {
 		if compareScalar(b.values[i], cell) == 0 {
 			return true
 		}
@@ -183,14 +230,12 @@ func (b *joinBuild) has(cell scalar) bool {
 // hashJoinValue hashes a join value so that two values compareScalar reports
 // equal always hash equal.
 //
-// That is the whole contract, and it is why numbers hash through their float64
-// image rather than their spelling: 1 and 1.0 are one value under this engine's
-// exact-decimal comparison, and hashing the digits would put them in two
-// buckets and lose a match no exact comparison downstream would ever get to
-// recover. A magnitude beyond float64 falls into one shared bucket, which
-// costs comparisons and never correctness. Containers hash their source bytes,
-// which is exactly what compareScalar orders them by.
-func hashJoinValue(cell scalar) uint64 {
+// Numbers hash their canonical exact-decimal decomposition rather than either
+// their spelling or a float64 image. Thus 1, 1.0, and 10e-1 share a hash while
+// adjacent integers beyond 2^53 and arbitrarily wide exponents still spread
+// across buckets. Containers hash their source bytes, which is exactly what
+// compareScalar orders them by.
+func hashJoinValue(seed maphash.Seed, cell scalar) uint64 {
 	switch cell.kind {
 	case kindBool:
 		if cell.bval {
@@ -198,20 +243,61 @@ func hashJoinValue(cell scalar) uint64 {
 		}
 		return 0xbf58476d1ce4e5b9
 	case kindNumber:
-		f, ok := cell.float64OfNumber()
-		if !ok {
-			return 0x94d049bb133111eb
-		}
-		if f == 0 {
-			// JSON admits -0 and this engine equates it with 0, so the two must
-			// not land in different buckets.
-			f = 0
-		}
-		return mixJoinHash(math.Float64bits(f))
+		return hashExactJoinNumber(seed, cell.num)
 	case kindString:
-		return hashJoinKey(cell.sval)
+		return maphash.String(seed, cell.sval)
 	default:
-		return hashJoinKey(byteview.String(cell.raw))
+		return maphash.Bytes(seed, cell.raw)
+	}
+}
+
+// hashExactJoinNumber streams the same canonical fields appendNumberKey
+// encodes, but never materializes the key. maphash supplies a keyed bucket
+// hash, while writing each field directly keeps the path allocation-free even
+// for exponent spellings whose adjusted weight is wider than an int64.
+func hashExactJoinNumber(seed maphash.Seed, num []byte) uint64 {
+	d := parseDecimal(num)
+	var h maphash.Hash
+	h.SetSeed(seed)
+	if d.zero {
+		_ = h.WriteByte(0)
+		return h.Sum64()
+	}
+
+	_ = h.WriteByte(1)
+	if d.neg {
+		_ = h.WriteByte(1)
+	} else {
+		_ = h.WriteByte(0)
+	}
+
+	weight := &d.weight
+	var compact decimalWeight
+	if !weight.wide {
+		compact = wideWeightFromInt64(weight.compact)
+		weight = &compact
+	}
+	if weight.neg {
+		_ = h.WriteByte(1)
+	} else {
+		_ = h.WriteByte(0)
+	}
+	weightLen := weightMagnitudeLen(weight)
+	hashJoinUint(&h, uint64(weightLen))
+	for i := 0; i < weightLen; i++ {
+		_ = h.WriteByte(weightMagnitudeDigit(weight, i))
+	}
+
+	hashJoinUint(&h, uint64(len(d.intDigits)+len(d.fracDigits)))
+	_, _ = h.Write(d.intDigits)
+	_, _ = h.Write(d.fracDigits)
+	return h.Sum64()
+}
+
+func hashJoinUint(h *maphash.Hash, value uint64) {
+	for range 8 {
+		_ = h.WriteByte(byte(value))
+		value >>= 8
 	}
 }
 

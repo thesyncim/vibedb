@@ -1,8 +1,8 @@
 package query
 
 import (
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 // Declared index binding is deliberately late. A Query is immutable and may
@@ -443,6 +443,57 @@ func (p *compiledPredicate) canAnswerExactly(paths []compiledPath, indexes []sto
 		return true
 	default:
 		return false
+	}
+}
+
+// maxExactProbeColumns reports the widest exact-index probe selected by the
+// same catalog rules as canAnswerExactly/candidatesFor. The caller invokes it
+// only after canAnswerExactly succeeds. Width matters to durable admission:
+// a single-column collision recheck can seek one raw scalar, while a compound
+// recheck may need a complete document tape.
+func (p *compiledPredicate) maxExactProbeColumns(
+	paths []compiledPath,
+	indexes []store.IndexInfo,
+	w *Workspace,
+) int {
+	switch p.kind {
+	case predCmp:
+		return 1
+	case predIn, predInBound:
+		lits, _, bindable := p.membership(w)
+		if !bindable || len(lits) == 0 {
+			return 0
+		}
+		return 1
+	case predContains:
+		if p.containPlan == nil {
+			return 0
+		}
+		return p.containPlan.maxExactProbeColumns(paths, indexes, w)
+	case predAnd:
+		compound, _, _ := p.bestCompoundIndex(paths, indexes)
+		width := int(compound.ColumnCount)
+		for _, kid := range p.kids {
+			if kid.coveredEquality(paths, compound) {
+				continue
+			}
+			width = max(
+				width,
+				kid.maxExactProbeColumns(paths, indexes, w),
+			)
+		}
+		return width
+	case predOr:
+		width := 0
+		for _, kid := range p.kids {
+			width = max(
+				width,
+				kid.maxExactProbeColumns(paths, indexes, w),
+			)
+		}
+		return width
+	default:
+		return 0
 	}
 }
 

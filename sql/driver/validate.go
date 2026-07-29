@@ -1,97 +1,83 @@
 package driver
 
 import (
+	"context"
 	"fmt"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func (c *conn) validateSurface(statement *sqlast.Statement) error {
+	return c.validateSurfaceContext(backgroundContext, statement)
+}
+
+func (c *conn) validateSurfaceContext(
+	ctx context.Context,
+	statement *sqlast.Statement,
+) error {
 	switch statement.Kind {
 	case sqlast.KindCreateTable:
-		if len(statement.CreateTable.PrimaryKey) != 1 || len(statement.CreateTable.Columns) != 0 {
-			return fmt.Errorf("vibedb: CREATE TABLE supports exactly PRIMARY KEY (path), without SQL column declarations")
+		if len(statement.CreateTable.PrimaryKey) != 1 {
+			return fmt.Errorf("vibedb: CREATE TABLE requires exactly one PRIMARY KEY JSON path")
+		}
+		for i := range statement.CreateTable.Columns {
+			if pseudoDocumentPath(statement.CreateTable.Columns[i].Path) {
+				return reservedDocumentPathError(
+					statement.CreateTable.Columns[i].Path)
+			}
+		}
+		for i := range statement.CreateTable.PrimaryKey {
+			if pseudoDocumentPath(statement.CreateTable.PrimaryKey[i]) {
+				return reservedDocumentPathError(
+					statement.CreateTable.PrimaryKey[i])
+			}
 		}
 		return nil
-	case sqlast.KindCreateIndex:
-		if len(statement.CreateIndex.Paths) != 1 {
-			return fmt.Errorf("vibedb: CREATE INDEX supports one exact JSON path")
-		}
 	case sqlast.KindInsert:
-		if !statement.Insert.DerivedKey {
-			return fmt.Errorf("vibedb: INSERT derives the declared primary key; use VALUES (?) or a flat field list")
+		for i := range statement.Insert.Columns {
+			if pseudoDocumentPath(statement.Insert.Columns[i]) {
+				return reservedDocumentPathError(statement.Insert.Columns[i])
+			}
+		}
+	case sqlast.KindCreateIndex:
+		for i := range statement.CreateIndex.Paths {
+			if pseudoDocumentPath(statement.CreateIndex.Paths[i]) {
+				return reservedDocumentPathError(
+					statement.CreateIndex.Paths[i])
+			}
 		}
 	}
-	c.db.mu.RLock()
-	t, exists := c.db.tables[statement.Table()]
-	c.db.mu.RUnlock()
-	if !exists {
-		return fmt.Errorf("vibedb: table %q does not exist", statement.Table())
+	if err := rlockContext(ctx, &c.db.mu); err != nil {
+		return err
 	}
-	switch statement.Kind {
-	case sqlast.KindCreateIndex, sqlast.KindInsert:
+	defer c.db.mu.RUnlock()
+	if statement.Kind == sqlast.KindSelect {
+		for i := range statement.Select.From {
+			ref := &statement.Select.From[i]
+			name := ref.Name
+			if _, exists := c.db.tables[name]; !exists {
+				return fmt.Errorf("%w: %q", ErrTableNotFound, name)
+			}
+		}
 		return nil
-	case sqlast.KindSelect:
-		return validateSelectSurface(statement.Select, t.meta)
-	case sqlast.KindUpdate:
-		if statement.Update.Filter != nil {
-			return validatePredicateSurface(statement.Update.Filter.Where, t.meta)
-		}
-	case sqlast.KindDelete:
-		if statement.Delete.Filter != nil {
-			return validatePredicateSurface(statement.Delete.Filter.Where, t.meta)
-		}
+	}
+	if _, exists := c.db.tables[statement.Table()]; !exists {
+		return fmt.Errorf("%w: %q", ErrTableNotFound, statement.Table())
 	}
 	return nil
 }
 
-func validateSelectSurface(statement *sqlast.SelectStmt, meta *tableMeta) error {
-	if len(statement.From) != 1 {
-		return fmt.Errorf("vibedb: joins wait for a durable multi-collection SQL snapshot")
+func pseudoDocumentPath(path *sqlast.PathExpr) bool {
+	if path == nil || len(path.Segments) != 1 || path.Segments[0].IsIndex {
+		return false
 	}
-	if len(statement.GroupBy) != 0 || statement.Having != nil || statement.Offset != nil {
-		return fmt.Errorf("vibedb: GROUP BY, HAVING, and OFFSET are outside the compact driver surface")
-	}
-	for _, column := range statement.Columns {
-		if column.Agg != sqlast.AggNone && column.Agg != sqlast.AggCount {
-			return fmt.Errorf("vibedb: only projection and COUNT(*) are supported")
-		}
-		if column.Agg == sqlast.AggCount && column.Path != nil {
-			return fmt.Errorf("vibedb: only COUNT(*) is supported")
-		}
-	}
-	for _, order := range statement.OrderBy {
-		if string(order.Path.AppendPointer(nil)) != meta.PrimaryKey {
-			return fmt.Errorf("vibedb: ORDER BY is supported only on the declared primary key")
-		}
-	}
-	return validatePredicateSurface(statement.Where, meta)
+	return path.Segments[0].Key == sqlast.DocumentColumn
 }
 
-func validatePredicateSurface(where *sqlast.Expr, meta *tableMeta) error {
-	if where == nil {
-		return nil
-	}
-	path := ""
-	if where.Path != nil {
-		path = string(where.Path.AppendPointer(nil))
-	}
-	indexed := path == meta.PrimaryKey
-	for _, index := range meta.Indexes {
-		if len(index.Paths) == 1 && index.Paths[0] == path {
-			indexed = true
-			break
-		}
-	}
-	switch where.Kind {
-	case sqlast.ExprCompare:
-		if where.Op == sqlast.OpEq && indexed {
-			return nil
-		}
-	case sqlast.ExprIn:
-		if !where.Negated && path == meta.PrimaryKey {
-			return nil
-		}
-	}
-	return fmt.Errorf("vibedb: WHERE supports primary-key equality/IN or equality on one declared exact index")
+func reservedDocumentPathError(path *sqlast.PathExpr) error {
+	return fmt.Errorf(
+		"vibedb: JSON field %q is reserved by the SQL adapter; "+
+			"use an ordinary document field name",
+		path.Spec(),
+	)
 }

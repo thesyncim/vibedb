@@ -27,9 +27,10 @@ import (
 
 // A writer serializes backend messages onto one connection.
 type writer struct {
-	bw  *bufio.Writer
-	buf []byte
-	err error
+	bw          *bufio.Writer
+	buf         []byte
+	err         error
+	beforeWrite func()
 }
 
 func newWriter(w io.Writer, bufSize int) *writer {
@@ -54,6 +55,13 @@ func (w *writer) end() {
 func (w *writer) write(b []byte) {
 	if w.err != nil {
 		return
+	}
+	// A buffered write that fits cannot touch the socket, so avoid refreshing
+	// its deadline (and the SetWriteDeadline syscall) on the per-row hot path.
+	// bufio.Writer reaches its underlying writer exactly when this write does
+	// not fit in the currently available space.
+	if w.beforeWrite != nil && len(b) > w.bw.Available() {
+		w.beforeWrite()
 	}
 	_, w.err = w.bw.Write(b)
 }
@@ -81,6 +89,9 @@ func (w *writer) rawString(s string) { w.buf = append(w.buf, s...) }
 // error seen since the last flush.
 func (w *writer) flush() error {
 	if w.err == nil {
+		if w.beforeWrite != nil {
+			w.beforeWrite()
+		}
 		w.err = w.bw.Flush()
 	}
 	return w.err
@@ -160,14 +171,15 @@ func (w *writer) parseComplete()   { w.begin(msgParseComplete); w.end() }
 func (w *writer) bindComplete()    { w.begin(msgBindComplete); w.end() }
 func (w *writer) closeComplete()   { w.begin(msgCloseComplete); w.end() }
 func (w *writer) portalSuspended() { w.begin(msgPortalSuspended); w.end() }
-func (w *writer) parameterDesc(n int) {
+func (w *writer) parameterDesc(stmt *prepared) {
 	w.begin(msgParameterDesc)
-	w.int16(n)
-	for range n {
-		// Every placeholder in this dialect accepts the same value domain, so
-		// there is no per-parameter type to declare. Zero is the protocol's
-		// "unspecified", which is what a client that asked is entitled to.
-		w.int32(0)
+	w.int16(stmt.wireParams)
+	for i := range stmt.wireParams {
+		// Parse may provide fewer OIDs than the query ultimately proves to
+		// contain. Preserve every declared position. Whole-document parameters
+		// default to json so clients can select a lossless encoder; scalar
+		// parameters remain zero, the protocol's "unspecified" type.
+		w.int32(stmt.parameterOID(i))
 	}
 	w.end()
 }

@@ -1,6 +1,10 @@
 package query
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -45,14 +49,17 @@ import (
 // than hidden: a DELETE over an indexed path reads every document, where the
 // SELECT with the same WHERE reads the ones the index admits.
 //
-// The exception is a primary-key condition, which the parser splits out for
-// exactly this reason: `DELETE FROM t WHERE "$key" = ?` never scans at all.
+// A storage adapter may still recognize equality or membership on the table's
+// declared JSON primary-key path and use point reads before it calls Filter.
+// The SQL AST keeps that condition as an ordinary JSON predicate, so the
+// declared field remains the one identity vocabulary at every layer.
 
 // A DMLKind names what a [DMLStatement] does.
 type DMLKind uint8
 
 const (
-	// DMLInsert writes new documents under caller-supplied keys.
+	// DMLInsert writes new documents whose identity is derived from the table's
+	// declared JSON primary-key path.
 	DMLInsert DMLKind = iota
 	// DMLUpdate replaces whole documents.
 	DMLUpdate
@@ -92,8 +99,8 @@ type DMLStatement struct {
 	tree *sqlast.Statement
 
 	// filter is the SELECT this statement's row selection is, or nil when the
-	// statement needs no scan — an INSERT, a primary-key condition, a DELETE
-	// with no WHERE, or a DDL statement.
+	// statement needs no predicate evaluation — an INSERT, a DELETE with no
+	// WHERE, or a DDL statement.
 	filter *Statement
 	// all marks a DELETE written without a WHERE, which acts on every document.
 	// It is distinct from "filter is nil" so that no code path can arrive at
@@ -126,9 +133,31 @@ func PrepareDML(src string) (*DMLStatement, error) {
 	if err != nil {
 		return nil, err
 	}
+	return PrepareParsedDML(src, tree)
+}
+
+// PrepareParsedDML lowers an already-parsed non-SELECT statement without
+// parsing its source a second time.
+//
+// src is retained only for diagnostics. tree must be a complete, validated
+// tree returned by the sql package and must not be mutated while the returned
+// DMLStatement is live. The DMLStatement retains tree but does not alter it.
+// If tree came from a reusable [sqlast.Parser], that Parser must not parse
+// again or be released until this DMLStatement is released: parsing rewinds
+// the arena that owns tree.
+//
+// Catalog-owning adapters use this after inspecting the AST for storage policy
+// such as derived-key requirements and supported DDL.
+func PrepareParsedDML(
+	src string,
+	tree *sqlast.Statement,
+) (*DMLStatement, error) {
+	if tree == nil {
+		return nil, fmt.Errorf("query: PrepareParsedDML was given a nil statement")
+	}
 	if tree.Kind == sqlast.KindSelect {
 		return nil, fmt.Errorf(
-			"query: PrepareDML was given a SELECT, which returns rows; use PrepareStatement")
+			"query: PrepareParsedDML was given a SELECT, which returns rows; use PrepareParsedStatement")
 	}
 	d := &DMLStatement{text: src, tree: tree, params: tree.Params()}
 	switch tree.Kind {
@@ -148,12 +177,17 @@ func PrepareDML(src string) (*DMLStatement, error) {
 		d.kind = DDLCreateTable
 	case sqlast.KindCreateIndex:
 		d.kind = DDLCreateIndex
+	default:
+		return nil, fmt.Errorf(
+			"query: PrepareParsedDML was given unsupported statement kind %d",
+			tree.Kind,
+		)
 	}
 	return d, nil
 }
 
-// prepareFilter compiles the statement's row selection, unless the statement
-// acts on every document or on named keys.
+// prepareFilter compiles the statement's row selection unless the statement
+// acts on every document.
 func (d *DMLStatement) prepareFilter(src string, tree *sqlast.SelectStmt, all bool) error {
 	d.all = all
 	if tree == nil || all {
@@ -192,8 +226,11 @@ func (d *DMLStatement) Tree() *sqlast.Statement { return d.tree }
 
 // ScansEveryDocument reports whether executing this statement means visiting
 // every document of the collection: true for a filtered UPDATE or DELETE and
-// for one written without a WHERE, false for an INSERT, a primary-key
-// condition, and DDL.
+// for one written without a WHERE, false for INSERT and DDL.
+//
+// A storage adapter can answer equality or membership on the declared primary
+// key with point reads before opening this scan. That is an execution
+// optimization over the ordinary Filter tree, not a second AST lane.
 //
 // A caller uses it to decide whether to open a scan at all, and it is exported
 // rather than inferred because the inference — "filter is nil and kind is
@@ -211,36 +248,6 @@ func (d *DMLStatement) Release() {
 	d.filter.Release()
 	d.scan.Release()
 	*d = DMLStatement{}
-}
-
-// Argument converts one bound driver argument the way this dialect's literals
-// are converted, so a caller binding a key or a document reads them by the same
-// rules a WHERE does.
-//
-// It answers the string a key operand denotes. A nil argument is an error
-// rather than a null key: a document's identity cannot be absent, and SQL's
-// NULL has no key to be.
-func (d *DMLStatement) Key(o sqlast.Operand, args []any) (string, error) {
-	switch o.Kind {
-	case sqlast.OperandString:
-		return o.Text, nil
-	case sqlast.OperandParam:
-		if o.Ordinal >= len(args) {
-			return "", fmt.Errorf("query: placeholder %d was not bound", o.Ordinal+1)
-		}
-		switch v := args[o.Ordinal].(type) {
-		case string:
-			return v, nil
-		case []byte:
-			return string(v), nil
-		case nil:
-			return "", fmt.Errorf("query: a primary key was bound to NULL; a document's identity cannot be absent")
-		default:
-			return "", fmt.Errorf(
-				"query: a primary key was bound to %T; bind a string or a []byte, because keys are opaque bytes here", v)
-		}
-	}
-	return "", fmt.Errorf("query: a primary key must be a string literal or a placeholder")
 }
 
 // Document resolves a document operand to the JSON bytes to store.
@@ -357,15 +364,26 @@ func (d *DMLStatement) Filter(e *Exec, args []any, visit func(key, doc []byte) e
 	}
 	if !d.ScansEveryDocument() {
 		return nil, fmt.Errorf(
-			"query: %s acts on named keys and has no scan to filter", d.kind)
+			"query: %s has no document scan to filter", d.kind)
 	}
 	f := &d.scan
 	f.reset()
-	f.e, f.visit, f.plan, f.err = e, visit, nil, nil
+	// Drop the previous pass before any validation that can return without a
+	// Filter. In particular, a pre-canceled call must not leave the prepared
+	// statement retaining an Exec and callback the caller never received.
+	f.e, f.visit, f.plan, f.err = nil, nil, nil, nil
+	w := &e.Workspace
+	w.clearBorrowedViews()
+	w.cancel = e.Options.Cancel
+	if err := w.checkCanceled(); err != nil {
+		return nil, err
+	}
+	w.resetJoinBindings()
 	if d.filter == nil {
 		// A DELETE with no WHERE. There is no predicate to compile and no
 		// column to extract, so the batch machinery is bypassed entirely and
 		// every document is reported as it arrives.
+		f.e, f.visit = e, visit
 		return f, nil
 	}
 	if err := d.filter.bind(args); err != nil {
@@ -382,7 +400,21 @@ func (d *DMLStatement) Filter(e *Exec, args []any, visit func(key, doc []byte) e
 		// the filter phase.
 		return nil, fmt.Errorf("query: a mutation cannot join; its condition reads one collection")
 	}
-	f.plan = p
+	memoryBytes, err := normalizeHeapMemoryBytes(e.Options)
+	if err != nil {
+		return nil, err
+	}
+	w.heapWorkBudget.begin(memoryBytes)
+	// A mutation scans several bounded batches through one Workspace. Pointing
+	// the decoded-text high-water path at the same account makes repeated
+	// refills charge retained capacity, not total bytes scanned, while
+	// containment tapes share that one execution limit. The fixed batch itself
+	// follows the durable target semantics and remains bounded by scanBatch and
+	// scanBatchBytes rather than being treated as resident-capacity admission.
+	w.heapWorkParent = &w.heapWorkBudget
+	w.heapWorkTextReserved = 0
+	w.eval.setWork(&w.heapWorkBudget)
+	f.e, f.visit, f.plan = e, visit, p
 	return f, nil
 }
 
@@ -392,9 +424,17 @@ func (f *Filter) Add(key, doc []byte) error {
 	if f.err != nil {
 		return f.err
 	}
+	if err := f.e.Workspace.checkCanceled(); err != nil {
+		return f.fail(err)
+	}
 	if f.plan == nil {
-		f.err = f.visit(key, doc)
-		return f.err
+		if err := f.visit(key, doc); err != nil {
+			return f.fail(err)
+		}
+		if err := f.e.Workspace.checkCanceled(); err != nil {
+			return f.fail(err)
+		}
+		return nil
 	}
 	f.keyBuf = append(f.keyBuf, key...)
 	f.keyEnds = append(f.keyEnds, len(f.keyBuf))
@@ -410,6 +450,9 @@ func (f *Filter) Add(key, doc []byte) error {
 func (f *Filter) Done() error {
 	if f.err != nil {
 		return f.err
+	}
+	if err := f.e.Workspace.checkCanceled(); err != nil {
+		return f.fail(err)
 	}
 	if f.plan == nil {
 		return nil
@@ -451,6 +494,9 @@ func (f *Filter) flush() error {
 	f.docs.Reset()
 	start := 0
 	for row, end := range f.ends {
+		if err := cancellationCheckpoint(f.e.Workspace.cancel, row); err != nil {
+			return f.fail(err)
+		}
 		if _, err := f.docs.Append(f.buf[start:end]); err != nil {
 			// A stored document that no longer parses is a corrupt collection,
 			// not a user error, and naming the key is the only thing that makes
@@ -469,17 +515,37 @@ func (f *Filter) flush() error {
 	ctx := &w.ctx
 	ctx.s, ctx.rows = &f.docs, f.docs.Len()
 	if err := ctx.extract(f.plan, nil, w); err != nil {
-		f.err = err
-		return err
+		return f.fail(err)
 	}
-	selected := f.plan.selectRows(ctx, nil, false, w)
-	for _, row := range selected {
+	selected, err := f.plan.selectRows(ctx, nil, false, w)
+	if err != nil {
+		return f.fail(err)
+	}
+	if err := w.eval.firstError(); err != nil {
+		return f.fail(err)
+	}
+	for at, row := range selected {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			return f.fail(err)
+		}
 		if err := f.visit(f.row(row)); err != nil {
-			f.err = err
-			return err
+			return f.fail(err)
+		}
+		if err := w.checkCanceled(); err != nil {
+			return f.fail(err)
 		}
 	}
 	return nil
+}
+
+func (f *Filter) fail(err error) error {
+	f.err = err
+	if errors.Is(err, ErrCanceled) {
+		f.e.Workspace.clearBorrowedViews()
+		f.e.Workspace.resetJoinBindings()
+		f.e, f.visit = nil, nil
+	}
+	return err
 }
 
 func (f *Filter) reset() {
@@ -502,8 +568,9 @@ type TableDefinition struct {
 	// PrimaryKey holds the declared key paths, rendered in the engine's path
 	// language, or nil.
 	//
-	// It is reported rather than enforced. See [DMLStatement.LowerTable] for
-	// exactly what a declared primary key does today.
+	// The compiled Schema enforces that each path is a required scalar. Physical
+	// key derivation belongs to the storage adapter; see
+	// [DMLStatement.LowerTable].
 	PrimaryKey []string
 	// IfNotExists makes an existing collection a no-op rather than an error.
 	IfNotExists bool
@@ -520,15 +587,11 @@ type TableDefinition struct {
 // the store's own schema validation, and a document missing a key path is
 // rejected with the schema's error.
 //
-// The other half of the agreed model — that the store key is derived from those
-// paths, never supplied separately — is not implemented, here or in the engine.
-// It changes the signature of every write primitive and is deliberately
-// sequenced after the query work whose oracles depend on the current one. So
-// today an INSERT still carries its key explicitly, nothing checks that the key
-// agrees with the values at the declared paths, and uniqueness remains the
-// store's own uniqueness over the supplied key. PrimaryKey is carried out of
-// here so a caller can record and report it; it is not fed to anything that
-// enforces it.
+// This lowering does not choose a physical key codec. PrimaryKey is carried out
+// so the storage adapter can derive a stable physical key from the declared
+// scalar JSON value without teaching the query layer about collection handles
+// or catalogs. The base store itself remains intentionally unaware of SQL
+// declarations.
 func (d *DMLStatement) LowerTable() (TableDefinition, error) {
 	if d.kind != DDLCreateTable {
 		return TableDefinition{}, fmt.Errorf("query: %s is not a CREATE TABLE", d.kind)
@@ -631,10 +694,12 @@ type IndexDefinition struct {
 
 // LowerIndex compiles a CREATE INDEX into the store's index definition.
 //
-// An unnamed index is named after the paths it indexes, joined by '+', because
-// the store's catalog is keyed by name and an index with no name could never be
-// reported or dropped. The derived name is deterministic, so the same statement
-// run twice names the same index and IF NOT EXISTS means what it says.
+// An unnamed index receives a deterministic SHA-256 name derived from a
+// length-framed ordered vector of RFC 6901 paths. Framing prevents structural
+// aliases such as one field named "a+b" colliding with a compound index over
+// "a" and "b"; the fixed-size digest also prevents a legal long JSON path from
+// manufacturing an index name too large for the durable catalog. Repeating the
+// same statement therefore gives IF NOT EXISTS one stable target.
 func (d *DMLStatement) LowerIndex() (IndexDefinition, error) {
 	if d.kind != DDLCreateIndex {
 		return IndexDefinition{}, fmt.Errorf("query: %s is not a CREATE INDEX", d.kind)
@@ -651,16 +716,21 @@ func (d *DMLStatement) LowerIndex() (IndexDefinition, error) {
 	var buf []byte
 	paths := make([]string, 0, len(stmt.Paths))
 	name := stmt.Name
-	for i, path := range stmt.Paths {
+	for _, path := range stmt.Paths {
 		start := len(buf)
 		buf = path.AppendPointer(buf)
-		paths = append(paths, string(buf[start:]))
-		if !stmt.HasName {
-			if i > 0 {
-				name += "+"
-			}
-			name += path.Spec()
+		pointer := buf[start:]
+		paths = append(paths, string(pointer))
+	}
+	if !stmt.HasName {
+		hash := sha256.New()
+		var size [8]byte
+		for _, pointer := range paths {
+			binary.BigEndian.PutUint64(size[:], uint64(len(pointer)))
+			_, _ = hash.Write(size[:])
+			_, _ = hash.Write([]byte(pointer))
 		}
+		name = "idx_" + hex.EncodeToString(hash.Sum(nil))
 	}
 	out.Definition = store.IndexDefinition{Name: name, Paths: paths}
 	return out, nil

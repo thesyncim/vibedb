@@ -86,7 +86,7 @@ func BenchmarkMembership(b *testing.B) {
 func BenchmarkMembershipEval(b *testing.B) {
 	const rows = 1024
 
-	var c Compiler
+	var c compiler
 	for _, size := range []int{4, 16, 64, 256} {
 		values := membershipValues(size)
 

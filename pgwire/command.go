@@ -12,14 +12,14 @@ import (
 //
 // # Why classification happens before parsing
 //
-// [sql.Parse] accepts SELECT and refuses every other statement kind, with one
-// message and one error type for both "this is not SQL" and "this is SQL this
-// engine will never run". A client needs those distinguished, because the
-// SQLSTATE it branches on is the difference between a bug in its query and a
-// capability this server does not have. Deciding from the leading keyword,
-// here, is what makes 0A000 and 42601 mean different things; see pgerror.go for
-// why the alternative — classifying by matching the parser's prose — was
-// rejected.
+// The unified SQL front end parses the bounded SELECT/INSERT/UPDATE/DELETE/
+// CREATE TABLE/CREATE INDEX surface. Protocol-only session commands,
+// transaction aliases and modes, and unsupported SQL leading kinds still need
+// routing before that parse. A client needs syntax and missing capability
+// distinguished because the SQLSTATE it branches on is the difference between
+// a bug in its query and a feature this server does not have. Classification
+// here is what keeps 0A000 and 42601 stable; see pgerror.go for why matching
+// parser prose was rejected.
 //
 // # Why an unsupported SET is refused
 //
@@ -35,10 +35,11 @@ import (
 // dialect's FROM names a collection directly and there are no schemas at all,
 // so a client that set a search_path and had it accepted would believe its
 // unqualified names were being resolved through it. statement_timeout is the
-// second clearest: this server has no cancellation hook, so accepting a timeout
-// would be promising an interruption that will never arrive. Both would produce
-// a client that misreads its own results, which is exactly the outcome a silent
-// accept is worse than an error for.
+// second clearest: CancelRequest is supported, but the server has no
+// per-statement timer policy, so accepting a timeout would promise a deadline
+// it did not schedule. Both would produce a client that misreads its own
+// configuration, which is exactly the outcome a silent accept is worse than an
+// error for.
 
 // A statementKind is what the leading keyword says a statement is.
 type statementKind int
@@ -46,6 +47,12 @@ type statementKind int
 const (
 	// kindSelect is handed to the SQL front end.
 	kindSelect statementKind = iota
+	// kindCatalogSQL is INSERT, UPDATE, DELETE, or CREATE. The shared typed SQL
+	// runtime parses the precise bounded subset and supplies DDL/DML semantics.
+	kindCatalogSQL
+	kindBegin
+	kindCommit
+	kindRollback
 	// kindEmpty is a statement with no tokens: whitespace, comments, or a bare
 	// semicolon. The protocol has its own reply for it.
 	kindEmpty
@@ -66,33 +73,23 @@ const (
 // a reader of the message can act on, which is the whole reason the table
 // exists instead of a default branch saying "unsupported statement".
 var unsupportedStatements = map[string]string{
-	"INSERT":   "this server is read-only: the SQL surface is SELECT and this engine has no mutation path through SQL",
-	"UPDATE":   "this server is read-only: the SQL surface is SELECT and this engine has no mutation path through SQL",
-	"DELETE":   "this server is read-only: the SQL surface is SELECT and this engine has no mutation path through SQL",
-	"MERGE":    "this server is read-only: the SQL surface is SELECT and this engine has no mutation path through SQL",
-	"TRUNCATE": "this server is read-only: the SQL surface is SELECT and this engine has no mutation path through SQL",
+	"MERGE":    "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
+	"TRUNCATE": "TRUNCATE is not supported; use a bounded DELETE predicate",
 	"COPY":     "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
 
-	"CREATE":  "data definition is not supported: collections and their indexes are created by the application that owns the store, not over the wire",
-	"ALTER":   "data definition is not supported: collections and their indexes are created by the application that owns the store, not over the wire",
-	"DROP":    "data definition is not supported: collections and their indexes are created by the application that owns the store, not over the wire",
-	"GRANT":   "there is no privilege system: authentication decides whether a connection may read, and there is nothing finer to grant",
-	"REVOKE":  "there is no privilege system: authentication decides whether a connection may read, and there is nothing finer to grant",
-	"COMMENT": "there is no catalog to comment on",
+	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
+	"DROP":    "DROP is not in the bounded catalog subset; destructive catalog operations remain with the database owner",
+	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
+	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
+	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",
 	"VACUUM":  "storage maintenance is the owning application's, not a client's",
 	"ANALYZE": "storage maintenance is the owning application's, not a client's",
 	"REINDEX": "storage maintenance is the owning application's, not a client's",
 	"CLUSTER": "storage maintenance is the owning application's, not a client's",
 	"REFRESH": "there are no materialized views",
 
-	"BEGIN":     "transactions are not supported: every statement already reads one consistent snapshot, and there is no cross-statement transaction to open",
-	"START":     "transactions are not supported: every statement already reads one consistent snapshot, and there is no cross-statement transaction to open",
-	"COMMIT":    "transactions are not supported: every statement already reads one consistent snapshot, and there is no cross-statement transaction to open",
-	"ROLLBACK":  "transactions are not supported: every statement already reads one consistent snapshot, and there is no cross-statement transaction to open",
-	"END":       "transactions are not supported: every statement already reads one consistent snapshot, and there is no cross-statement transaction to open",
-	"ABORT":     "transactions are not supported: every statement already reads one consistent snapshot, and there is no cross-statement transaction to open",
-	"SAVEPOINT": "transactions are not supported, so there is nothing to set a savepoint in",
-	"RELEASE":   "transactions are not supported, so there is nothing to set a savepoint in",
+	"SAVEPOINT": "savepoints are not supported: the runtime owns one bounded transaction overlay",
+	"RELEASE":   "savepoints are not supported, so there is no savepoint to release",
 
 	"PREPARE":    "SQL-level PREPARE is not supported: use the extended query protocol's Parse message, which every client library exposes",
 	"EXECUTE":    "SQL-level EXECUTE is not supported: use the extended query protocol's Bind and Execute messages",
@@ -116,16 +113,28 @@ var unsupportedStatements = map[string]string{
 	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
 }
 
-// classify reports what kind of statement src is, from its leading keyword
-// alone. The second result is the refusal message for kindUnsupported.
+// classify reports what kind of statement src is, from its leading keyword.
+// The second result is a specific refusal or syntax-error message when one is
+// available.
 func classify(src string) (statementKind, string) {
 	s := scanner{src: src}
 	word := strings.ToUpper(s.word())
+	if s.malformed {
+		return kindUnknown, "unterminated block comment"
+	}
 	switch word {
 	case "":
 		return kindEmpty, ""
 	case "SELECT":
 		return kindSelect, ""
+	case "INSERT", "UPDATE", "DELETE", "CREATE":
+		return kindCatalogSQL, ""
+	case "BEGIN", "START":
+		return kindBegin, ""
+	case "COMMIT", "END":
+		return kindCommit, ""
+	case "ROLLBACK", "ABORT":
+		return kindRollback, ""
 	case "SET":
 		return kindSet, ""
 	case "RESET":
@@ -141,6 +150,76 @@ func classify(src string) (statementKind, string) {
 	return kindUnknown, ""
 }
 
+// parseTransactionCommand admits the deliberately small transaction grammar
+// implemented by the typed runtime. Isolation and access modes belong in a
+// future SQL AST rather than being accepted and ignored here.
+func parseTransactionCommand(src string, kind statementKind) (bool, error) {
+	s := scanner{src: src}
+	leading := strings.ToUpper(s.word())
+	switch kind {
+	case kindBegin:
+		if leading == "START" {
+			if !strings.EqualFold(s.word(), "TRANSACTION") {
+				return false, newError(sqlstateSyntaxError,
+					"START must be followed by TRANSACTION")
+			}
+		} else if next := strings.ToUpper(s.peekWord()); next == "WORK" || next == "TRANSACTION" {
+			s.word()
+		}
+		readOnly := false
+		seenAccess := false
+		seenIsolation := false
+		for {
+			switch next := strings.ToUpper(s.peekWord()); next {
+			case "":
+				if !s.atEnd() {
+					return false, newError(sqlstateSyntaxError,
+						"malformed BEGIN transaction mode")
+				}
+				return readOnly, nil
+			case "READ":
+				s.word()
+				access := strings.ToUpper(s.word())
+				if seenAccess || (access != "ONLY" && access != "WRITE") {
+					return false, newError(sqlstateSyntaxError,
+						"READ must be followed once by ONLY or WRITE")
+				}
+				seenAccess = true
+				readOnly = access == "ONLY"
+			case "ISOLATION":
+				s.word()
+				if seenIsolation || !strings.EqualFold(s.word(), "LEVEL") ||
+					!strings.EqualFold(s.word(), "REPEATABLE") ||
+					!strings.EqualFold(s.word(), "READ") {
+					return false, newError(sqlstateFeatureNotSupported,
+						"the SQL runtime supports only REPEATABLE READ snapshot isolation")
+				}
+				seenIsolation = true
+			default:
+				return false, newError(sqlstateFeatureNotSupported,
+					"unsupported transaction mode").
+					withHint("supported modes are READ ONLY, READ WRITE, and " +
+						"ISOLATION LEVEL REPEATABLE READ")
+			}
+		}
+	case kindCommit:
+		if next := strings.ToUpper(s.peekWord()); next == "WORK" || next == "TRANSACTION" {
+			s.word()
+		}
+	case kindRollback:
+		if next := strings.ToUpper(s.peekWord()); next == "WORK" || next == "TRANSACTION" {
+			s.word()
+		}
+	default:
+		return false, newError(sqlstateInternalError, "invalid transaction command kind")
+	}
+	if !s.atEnd() {
+		return false, newError(sqlstateFeatureNotSupported,
+			"transaction modes, savepoints, and chained transactions are not supported")
+	}
+	return false, nil
+}
+
 // A scanner walks SQL text past whitespace and comments. It is the smallest
 // thing that can answer "what is the first word" and "where does this statement
 // end" without a second SQL parser, and it deliberately understands only the
@@ -148,8 +227,9 @@ func classify(src string) (statementKind, string) {
 // single-quoted strings with ” escaping, and double-quoted identifiers with ""
 // escaping.
 type scanner struct {
-	src string
-	pos int
+	src       string
+	pos       int
+	malformed bool
 }
 
 // skip advances past whitespace and comments. Block comments do not nest here,
@@ -169,6 +249,7 @@ func (s *scanner) skip() {
 		case c == '/' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '*':
 			if i := strings.Index(s.src[s.pos+2:], "*/"); i < 0 {
 				s.pos = len(s.src)
+				s.malformed = true
 			} else {
 				s.pos += i + 4
 			}
@@ -211,23 +292,69 @@ func (s *scanner) symbol(c byte) bool {
 // semicolon remain.
 func (s *scanner) atEnd() bool {
 	s.skip()
+	if s.malformed {
+		return false
+	}
 	if s.pos < len(s.src) && s.src[s.pos] == ';' {
 		s.pos++
 		s.skip()
 	}
-	return s.pos >= len(s.src)
+	return !s.malformed && s.pos >= len(s.src)
 }
 
-// rest returns the remaining text with surrounding space and a trailing
-// semicolon removed. It is how a SET value is taken: PostgreSQL's SET accepts a
-// comma-separated list of bare words, numbers, and strings, and reproducing
-// that grammar to then throw the value away would be effort spent on a value
-// nothing reads.
-func (s *scanner) rest() string {
+// rest returns the remaining text with surrounding space, trailing comments,
+// and one statement terminator removed. The bool is false for an unterminated
+// quote/comment or for a second statement. It is how a SET value is taken:
+// PostgreSQL's SET accepts a comma-separated list of bare words, numbers, and
+// strings, and reproducing every parameter-specific grammar to then ignore
+// most values would add a second SQL parser here.
+func (s *scanner) rest() (string, bool) {
 	s.skip()
-	text := strings.TrimSpace(s.src[s.pos:])
+	if s.malformed {
+		return "", false
+	}
+	start := s.pos
+	semanticEnd := start
+	for s.pos < len(s.src) {
+		switch c := s.src[s.pos]; {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+			s.pos++
+		case c == '\'' || c == '"':
+			end, ok := skipQuotedChecked(s.src, s.pos, c)
+			if !ok {
+				s.pos = len(s.src)
+				return "", false
+			}
+			s.pos = end
+			semanticEnd = end
+		case c == '-' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '-':
+			if i := strings.IndexByte(s.src[s.pos:], '\n'); i < 0 {
+				s.pos = len(s.src)
+			} else {
+				s.pos += i + 1
+			}
+		case c == '/' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '*':
+			if i := strings.Index(s.src[s.pos+2:], "*/"); i < 0 {
+				s.pos = len(s.src)
+				s.malformed = true
+				return "", false
+			} else {
+				s.pos += i + 4
+			}
+		case c == ';':
+			s.pos++
+			s.skip()
+			if s.malformed || s.pos != len(s.src) {
+				return "", false
+			}
+		default:
+			s.pos++
+			semanticEnd = s.pos
+		}
+	}
+	text := strings.TrimSpace(s.src[start:semanticEnd])
 	s.pos = len(s.src)
-	return strings.TrimSpace(strings.TrimSuffix(text, ";"))
+	return text, true
 }
 
 // quoted reads a single-quoted string literal, returning its decoded value.
@@ -272,68 +399,89 @@ func isWordByte(c byte) bool {
 	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
-// splitStatements divides a simple-query message into its statements.
+// statementIterator walks a simple-query message one statement at a time.
 //
 // The simple query protocol allows several statements in one message, and a
 // naive split on ';' would cut a semicolon inside a string literal, a quoted
 // identifier, or a comment. That is not a hypothetical: a WHERE clause
 // comparing against a document value containing a semicolon is ordinary. The
-// splitter therefore tracks exactly the four constructs this dialect's lexer
+// iterator therefore tracks exactly the four constructs this dialect's lexer
 // tracks, and nothing else.
-func splitStatements(src string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(src); {
-		switch src[i] {
-		case '\'':
-			i = skipQuoted(src, i, '\'')
-		case '"':
-			i = skipQuoted(src, i, '"')
-		case '-':
-			if i+1 < len(src) && src[i+1] == '-' {
-				if n := strings.IndexByte(src[i:], '\n'); n < 0 {
-					i = len(src)
+//
+// It is an iterator rather than a []string builder for a security reason: a
+// legal 16 MiB message can contain millions of semicolons. Materializing one
+// string header per separator turned the input bound into hundreds of
+// megabytes of allocation before the first statement reached the parser.
+type statementIterator struct {
+	src       string
+	pos       int
+	done      bool
+	saw       bool
+	sentEmpty bool
+}
+
+func (s *statementIterator) next() (string, bool) {
+	for !s.done {
+		start := s.pos
+		i := start
+		for i < len(s.src) {
+			switch s.src[i] {
+			case '\'':
+				i = skipQuoted(s.src, i, '\'')
+			case '"':
+				i = skipQuoted(s.src, i, '"')
+			case '-':
+				if i+1 < len(s.src) && s.src[i+1] == '-' {
+					if n := strings.IndexByte(s.src[i:], '\n'); n < 0 {
+						i = len(s.src)
+					} else {
+						i += n + 1
+					}
 				} else {
-					i += n + 1
+					i++
 				}
-			} else {
+			case '/':
+				if i+1 < len(s.src) && s.src[i+1] == '*' {
+					if n := strings.Index(s.src[i+2:], "*/"); n < 0 {
+						i = len(s.src)
+					} else {
+						i += n + 4
+					}
+				} else {
+					i++
+				}
+			case ';':
+				text := s.src[start:i]
+				s.pos = i + 1
+				if strings.TrimSpace(text) != "" {
+					s.saw = true
+					return text, true
+				}
+				i = s.pos
+				start = i
+			default:
 				i++
 			}
-		case '/':
-			if i+1 < len(src) && src[i+1] == '*' {
-				if n := strings.Index(src[i+2:], "*/"); n < 0 {
-					i = len(src)
-				} else {
-					i += n + 4
-				}
-			} else {
-				i++
-			}
-		case ';':
-			out = append(out, src[start:i])
-			i++
-			start = i
-		default:
-			i++
+		}
+		s.done = true
+		s.pos = len(s.src)
+		text := s.src[start:]
+		if strings.TrimSpace(text) != "" {
+			s.saw = true
+			return text, true
 		}
 	}
-	out = append(out, src[start:])
 	// An empty statement between two semicolons is dropped rather than answered
 	// with an EmptyQueryResponse: PostgreSQL's grammar has no production for it,
 	// and a client counting one response per statement it wrote would be handed
 	// one more than it expected. A query string that is empty *in its entirety*
 	// is a different thing, and does get an EmptyQueryResponse, which is why the
-	// filter keeps one statement when everything was empty.
-	kept := out[:0]
-	for _, text := range out {
-		if strings.TrimSpace(text) != "" {
-			kept = append(kept, text)
-		}
+	// iterator yields one empty statement when everything was empty.
+	if !s.saw && !s.sentEmpty {
+		s.sentEmpty = true
+		return "", true
 	}
-	if len(kept) == 0 {
-		return []string{""}
-	}
-	return kept
+	return "", false
 }
 
 // skipQuoted advances past a quoted run starting at i, where the quote is
@@ -342,6 +490,11 @@ func splitStatements(src string) []string {
 // standard_conforming_strings is reported as on, so a backslash is an ordinary
 // byte.
 func skipQuoted(src string, i int, quote byte) int {
+	end, _ := skipQuotedChecked(src, i, quote)
+	return end
+}
+
+func skipQuotedChecked(src string, i int, quote byte) (int, bool) {
 	i++
 	for i < len(src) {
 		if src[i] != quote {
@@ -352,9 +505,9 @@ func skipQuoted(src string, i int, quote byte) int {
 			i += 2
 			continue
 		}
-		return i + 1
+		return i + 1, true
 	}
-	return len(src)
+	return len(src), false
 }
 
 // A parameter is one run-time setting this server recognizes.
@@ -419,12 +572,12 @@ var parameters = map[string]*parameter{
 // to set and this server refuses.
 var refusalHints = map[string]string{
 	"search_path":                         "this dialect has no schemas: a FROM clause names a collection directly, so a search path would silently not apply",
-	"statement_timeout":                   "this server has no query cancellation hook, so it cannot honour a timeout and will not pretend to",
-	"lock_timeout":                        "there is no lock manager, so nothing ever waits for a lock",
-	"idle_in_transaction_session_timeout": "there are no transactions",
-	"default_transaction_isolation":       "there are no transactions; every statement reads one consistent snapshot",
-	"default_transaction_read_only":       "every session is read-only already",
-	"transaction_isolation":               "there are no transactions; every statement reads one consistent snapshot",
+	"statement_timeout":                   "CancelRequest is supported, but this server has no SQL-configurable per-statement timer",
+	"lock_timeout":                        "there is no SQL lock manager; internal catalog ownership is not governed by PostgreSQL lock_timeout",
+	"idle_in_transaction_session_timeout": "there is no autonomous session timer for expiring an idle transaction",
+	"default_transaction_isolation":       "transactions use the runtime's fixed REPEATABLE READ snapshot isolation",
+	"default_transaction_read_only":       "choose READ ONLY or READ WRITE explicitly on BEGIN",
+	"transaction_isolation":               "transactions use the runtime's fixed REPEATABLE READ snapshot isolation",
 	"role":                                "there is no role system",
 	"session_authorization":               "there is no role system",
 }
@@ -506,10 +659,24 @@ func parseSet(src string) (setCommand, error) {
 	// name their parameter directly. Clients do send them.
 	if strings.EqualFold(name, "TIME") && strings.EqualFold(s.peekWord(), "ZONE") {
 		s.word()
-		return setCommand{name: "TimeZone", value: s.rest()}, nil
+		value, ok := s.rest()
+		if !ok || value == "" {
+			return setCommand{}, newError(sqlstateSyntaxError, "SET TIME ZONE requires a value")
+		}
+		if strings.EqualFold(value, "DEFAULT") {
+			return setCommand{name: "TimeZone", reset: true}, nil
+		}
+		return setCommand{name: "TimeZone", value: unquote(value)}, nil
 	}
 	if strings.EqualFold(name, "NAMES") {
-		return setCommand{name: "client_encoding", value: s.rest()}, nil
+		value, ok := s.rest()
+		if !ok || value == "" {
+			return setCommand{}, newError(sqlstateSyntaxError, "SET NAMES requires a value")
+		}
+		if strings.EqualFold(value, "DEFAULT") {
+			return setCommand{name: "client_encoding", reset: true}, nil
+		}
+		return setCommand{name: "client_encoding", value: unquote(value)}, nil
 	}
 	if !s.symbol('=') {
 		if !strings.EqualFold(s.peekWord(), "TO") {
@@ -518,8 +685,8 @@ func parseSet(src string) (setCommand, error) {
 		}
 		s.word()
 	}
-	value := s.rest()
-	if value == "" {
+	value, ok := s.rest()
+	if !ok || value == "" {
 		return setCommand{}, newError(sqlstateSyntaxError, "SET requires a value")
 	}
 	if strings.EqualFold(value, "DEFAULT") {
@@ -533,15 +700,23 @@ func parseReset(src string) (setCommand, error) {
 	s := scanner{src: src}
 	s.word() // RESET
 	name := s.word()
+	var cmd setCommand
 	switch {
 	case name == "":
 		return setCommand{}, newError(sqlstateSyntaxError, "RESET requires a parameter name or ALL")
 	case strings.EqualFold(name, "ALL"):
-		return setCommand{all: true, reset: true}, nil
+		cmd = setCommand{all: true, reset: true}
 	case strings.EqualFold(name, "TIME") && strings.EqualFold(s.peekWord(), "ZONE"):
-		return setCommand{name: "TimeZone", reset: true}, nil
+		s.word()
+		cmd = setCommand{name: "TimeZone", reset: true}
+	default:
+		cmd = setCommand{name: name, reset: true}
 	}
-	return setCommand{name: name, reset: true}, nil
+	if !s.atEnd() {
+		return setCommand{}, newError(sqlstateSyntaxError,
+			"RESET has unexpected tokens after the parameter name")
+	}
+	return cmd, nil
 }
 
 // parseShow decodes "SHOW name", "SHOW ALL", and "SHOW TIME ZONE".
@@ -549,13 +724,31 @@ func parseShow(src string) (string, error) {
 	s := scanner{src: src}
 	s.word() // SHOW
 	name := s.word()
+	var result string
 	switch {
 	case name == "":
 		return "", newError(sqlstateSyntaxError, "SHOW requires a parameter name or ALL")
 	case strings.EqualFold(name, "TIME") && strings.EqualFold(s.peekWord(), "ZONE"):
-		return "TimeZone", nil
+		s.word()
+		result = "TimeZone"
+	default:
+		result = name
 	}
-	return name, nil
+	if !s.atEnd() {
+		return "", newError(sqlstateSyntaxError,
+			"SHOW has unexpected tokens after the parameter name")
+	}
+	return result, nil
+}
+
+func parseDiscard(src string) error {
+	s := scanner{src: src}
+	s.word() // DISCARD
+	if !strings.EqualFold(s.word(), "ALL") || !s.atEnd() {
+		return newError(sqlstateSyntaxError,
+			"this server supports DISCARD ALL and no other DISCARD form")
+	}
+	return nil
 }
 
 // unquote strips one layer of single quotes from a SET value.
@@ -604,21 +797,31 @@ type shimColumn struct {
 // The second result reports whether the statement was one of those. A false
 // means "not mine", not "invalid": the caller hands it to the SQL front end,
 // which is the thing that knows how to reject it accurately.
-func (fn shimFunctions) parseFixedSelect(src string) (fixedResult, bool) {
+func (fn shimFunctions) parseFixedSelect(src string) (fixedResult, bool, error) {
 	s := scanner{src: src}
 	if !strings.EqualFold(s.word(), "SELECT") {
-		return fixedResult{}, false
+		return fixedResult{}, false, nil
 	}
 	var cols []column
 	var row []*string
 	for {
 		col, ok := fn.parseShimItem(&s)
 		if !ok {
-			return fixedResult{}, false
+			return fixedResult{}, false, nil
 		}
 		// An explicit output name wins, exactly as AS does in real SQL.
 		if alias, ok := parseAlias(&s); ok {
 			col.name = alias
+		}
+		if col.value != nil && col.typ.oid == oidInt8 {
+			if _, err := strconv.ParseInt(*col.value, 10, 64); err != nil {
+				return fixedResult{}, true, newError(sqlstateNumericValueOutOfRange,
+					"integer literal is outside the PostgreSQL int8 range")
+			}
+		}
+		if len(cols) >= maxResultColumns {
+			return fixedResult{}, true, newError(sqlstateProgramLimitExceeded, fmt.Sprintf(
+				"a SELECT list may hold at most %d columns", maxResultColumns))
 		}
 		cols = append(cols, column{name: col.name, typ: col.typ})
 		row = append(row, col.value)
@@ -627,13 +830,13 @@ func (fn shimFunctions) parseFixedSelect(src string) (fixedResult, bool) {
 		}
 	}
 	if !s.atEnd() {
-		return fixedResult{}, false
+		return fixedResult{}, false, nil
 	}
 	return fixedResult{
 		cols: cols,
 		rows: [][]*string{row},
 		tag:  "SELECT 1",
-	}, true
+	}, true, nil
 }
 
 // parseShimItem recognizes one select-list item.
@@ -664,7 +867,7 @@ func (fn shimFunctions) parseShimItem(s *scanner) (shimColumn, bool) {
 		if lower == "false" {
 			v = "f"
 		}
-		return shimColumn{name: "?column?", value: &v, typ: typeText}, true
+		return shimColumn{name: "?column?", value: &v, typ: typeBool}, true
 	case "current_user", "session_user", "user":
 		v := fn.user
 		return shimColumn{name: lower, value: &v, typ: typeText}, true

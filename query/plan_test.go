@@ -20,26 +20,34 @@ func TestPreparedQueryUnifiesBuilderAndSQL(t *testing.T) {
 	if err := builder.Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	sql, err := PrepareSQL(`SELECT bucket, COUNT(*), SUM(score) FROM docs WHERE live = true GROUP BY bucket ORDER BY bucket`)
+	statement, err := PrepareStatement(`SELECT bucket, COUNT(*), SUM(score) FROM docs WHERE live = true GROUP BY bucket ORDER BY bucket`)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer statement.Release()
 
 	gotBuilder, err := builder.Run(FromSegment(set))
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotSQL, err := sql.Run(FromSegment(set))
+	var sqlExec Exec
+	cursor, err := statement.RunInto(&sqlExec, FromSegment(set), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	for cursor.Next() {
+	}
+	gotSQL := sqlExec.Result
 	if got, want := dumpResult(gotBuilder), dumpResult(gotSQL); got != want {
 		t.Fatalf("prepared builder and SQL differ:\n%s\n%s", got, want)
 	}
+	if gotBuilder.Columns[1].Cells[0].raw != nil {
+		t.Fatal("COUNT unexpectedly retained a formatted numeric buffer")
+	}
+	if raw := gotBuilder.Columns[2].Cells[0].raw; string(raw) != "8" {
+		t.Fatalf("exact SUM raw encoding = %q, want 8", raw)
+	}
 	for col := 1; col < len(gotBuilder.Columns); col++ {
-		if gotBuilder.Columns[col].Cells[0].raw != nil {
-			t.Fatalf("aggregate column %d retained eagerly formatted JSON", col)
-		}
 		buf := make([]byte, 0, 32)
 		if got := gotBuilder.Columns[col].Cells[0].AppendJSON(buf); len(got) == 0 {
 			t.Fatalf("aggregate column %d appended no JSON", col)

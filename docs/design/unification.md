@@ -1,9 +1,9 @@
 # Engine unification: one in-memory durable store
 
 **Status:** in progress. The durable primary graph is now a mutable in-memory
-canonical-frame engine with a transactional batch and one SQL product; what
-remains is demoting the heap engine's mutable API, collapsing the query
-language, parallel writers, and freezing the format.
+canonical-frame engine with a transactional batch and one SQL language; what
+remains is demoting the heap engine's mutable API, parallel writers, and
+freezing the format.
 
 **Idea:** one `Collection` operates on canonical frames, with either a real
 device or a null device. Durability becomes a mode rather than a second
@@ -58,17 +58,23 @@ Executed:
    transactional on the primary graph (`a3ee052`), exact indexes are maintained
    in the same publish (`7e6f28e`), and the synchronous lane acknowledges
    through the journal (`70d39ea`).
-3. **One SQL product — done.** A `database/sql` driver runs over the ordered
-   primary graph (`886c5fe`) with transactions on the atomic batch; the second
-   SQL surface was deleted, leaving one product (`0611fb9`).
+3. **One SQL product — done.** One typed SQL runtime owns the durable catalog
+   and runs transactions on the mutable chunk layout's atomic batch
+   (`886c5fe`); both `database/sql` and `pgwire` consume it, and the second SQL
+   surface was deleted (`0611fb9`). Moving that catalog onto the surviving
+   primary graph belongs to the later engine-unification cutover rather than
+   being implied by the SQL surface.
+4. **Query-language collapse — done.** SQL is the only textual query language.
+   JSON remains the stored row/document representation, and the Go builder
+   remains a typed programmatic plan API rather than a second request grammar.
+   The JSON query-document parser and its compatibility syntax were deleted
+   before release.
 
 Remaining:
 
-4. **Heap mutable API demotion.** Collapse the heap `store.Collection` mutable
+5. **Heap mutable API demotion.** Collapse the heap `store.Collection` mutable
    surface into the one durable engine with a null device for the ephemeral
    mode; `Builder` feeds the bulk path directly. (Owned by later work.)
-5. **Query collapse.** Retire the JSON query language for the Go-native +
-   `database/sql` surface. (Owned elsewhere.)
 6. **Parallel tablet writers.** See
    [parallel-tablet-writers.md](parallel-tablet-writers.md).
 7. **Deletions and format freeze.** Delete the legacy fingerprint/chunk

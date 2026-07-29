@@ -210,11 +210,24 @@ func TemplateColumnarLeafRawBytes(rows []TemplateColumnarLeafRow) int {
 	if len(rows) > CommonPrimaryLeafNarrowLive {
 		class = CommonPrimaryLeafWide
 	}
-	n := CommonPrimaryLeafStructuralBytes(class, len(rows), 64<<10)
+	total := uint64(
+		CommonPrimaryLeafStructuralBytes(class, len(rows), 64<<10),
+	)
 	for _, row := range rows {
-		n += len(row.Key) + len(row.JSON)
+		var ok bool
+		total, ok = checkedSizeAdd(
+			total, uint64(len(row.Key)), uint64(maxIntValue),
+		)
+		if ok {
+			total, ok = checkedSizeAdd(
+				total, uint64(len(row.JSON)), uint64(maxIntValue),
+			)
+		}
+		if !ok {
+			return maxIntValue
+		}
 	}
-	return n
+	return int(total)
 }
 
 // TemplateColumnarLeafPlan is the size decision for a candidate leaf: the raw
@@ -270,6 +283,9 @@ func EncodeTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) ([]byte, error) 
 		if len(row.Key) == 0 || len(row.JSON) == 0 || rank != 0 && bytes.Compare(rows[rank-1].Key, row.Key) >= 0 {
 			return nil, fmt.Errorf("%w: key/value/order", ErrInvalidWrite)
 		}
+		if len(row.JSON) > math.MaxUint16 {
+			return nil, fmt.Errorf("%w: row too wide", ErrInvalidWrite)
+		}
 		bit := uint64(1) << uint(row.Slot&63)
 		if occupied[row.Slot>>6]&bit != 0 {
 			return nil, fmt.Errorf("%w: duplicate slot", ErrInvalidWrite)
@@ -322,6 +338,11 @@ func EncodeTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) ([]byte, error) 
 		// cardinality label. dictOrder is first-appearance order, so dictionary
 		// ids and byte layout are deterministic across identical inputs.
 		if count >= 2 && count*len(value) > len(value)+8+count {
+			if len(dict) == math.MaxUint16 {
+				return nil, fmt.Errorf(
+					"%w: dictionary cardinality", ErrInvalidWrite,
+				)
+			}
 			dictIDs[value] = uint32(len(dict))
 			dict = append(dict, templateColumnarLeafDictValue{value: []byte(value)})
 		}
@@ -329,7 +350,8 @@ func EncodeTemplateColumnarLeaf(rows []TemplateColumnarLeafRow) ([]byte, error) 
 	columns := make([]templateColumnarLeafBuildColumn, 0)
 	columnBase := make([]uint16, len(templates))
 	for ti := range templates {
-		if len(columns)+len(templates[ti].holes) > math.MaxUint16 {
+		if len(templates[ti].holes) >
+			math.MaxUint16-len(columns) {
 			return nil, fmt.Errorf("%w: columns", ErrInvalidWrite)
 		}
 		columnBase[ti] = uint16(len(columns))
@@ -381,36 +403,135 @@ func templateColumnarLeafShapeEqual(t templateColumnarLeafTemplate, x TemplateCo
 }
 
 func encodeTemplateColumnarLeafImage(rows []templateColumnarLeafBuildRow, templates []templateColumnarLeafTemplate, columnBase []uint16, columns []templateColumnarLeafBuildColumn, dict []templateColumnarLeafDictValue) ([]byte, error) {
-	metadataBytes := templateColumnarLeafHeader + templateColumnarLeafSlots + len(rows) +
-		len(rows)*templateColumnarLeafRowBytes + len(templates)*templateColumnarLeafTplBytes +
-		len(columns)*templateColumnarLeafColBytes + len(dict)*templateColumnarLeafDictBytes
+	if len(rows) == 0 || len(rows) >= templateColumnarLeafSlots ||
+		len(templates) == 0 || len(templates) > math.MaxUint16 ||
+		len(columns) > math.MaxUint16 {
+		return nil, fmt.Errorf("%w: image geometry", ErrInvalidWrite)
+	}
+	if len(dict) > math.MaxUint16 {
+		return nil, fmt.Errorf(
+			"%w: dictionary cardinality", ErrInvalidWrite,
+		)
+	}
+	for i := range rows {
+		if len(rows[i].row.JSON) > math.MaxUint16 {
+			return nil, fmt.Errorf("%w: row too wide", ErrInvalidWrite)
+		}
+	}
+	sizeLimit := uint64(math.MaxUint32)
+	if intLimit := uint64(maxIntValue); intLimit < sizeLimit {
+		sizeLimit = intLimit
+	}
+	metadataSize := uint64(templateColumnarLeafHeader + templateColumnarLeafSlots)
+	var ok bool
+	metadataSize, ok = checkedSizeAdd(
+		metadataSize, uint64(len(rows)), sizeLimit,
+	)
+	if !ok {
+		return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+	}
+	metadataTerms := [4][2]uint64{
+		{uint64(len(rows)), templateColumnarLeafRowBytes},
+		{uint64(len(templates)), templateColumnarLeafTplBytes},
+		{uint64(len(columns)), templateColumnarLeafColBytes},
+		{uint64(len(dict)), templateColumnarLeafDictBytes},
+	}
+	for _, term := range metadataTerms {
+		bytes, productOK := checkedSizeMul(term[0], term[1], sizeLimit)
+		if !productOK {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
+		metadataSize, ok = checkedSizeAdd(metadataSize, bytes, sizeLimit)
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
+	}
 	for _, r := range rows {
-		metadataBytes += len(r.row.Key)
+		metadataSize, ok = checkedSizeAdd(
+			metadataSize, uint64(len(r.row.Key)), sizeLimit,
+		)
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
 	}
 	for _, t := range templates {
-		metadataBytes += len(t.holes) * templateColumnarLeafHoleBytes
+		holeBytes, productOK := checkedSizeMul(
+			uint64(len(t.holes)), templateColumnarLeafHoleBytes, sizeLimit,
+		)
+		if !productOK {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
+		metadataSize, ok = checkedSizeAdd(
+			metadataSize, holeBytes, sizeLimit,
+		)
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
 	}
 	for _, c := range columns {
 		if len(c.min) > math.MaxUint16 || len(c.max) > math.MaxUint16 {
 			return nil, fmt.Errorf("%w: zone", ErrInvalidWrite)
 		}
-		metadataBytes += 32 + len(c.min) + len(c.max)
+		metadataSize, ok = checkedSizeAdd(metadataSize, 32, sizeLimit)
+		if ok {
+			metadataSize, ok = checkedSizeAdd(
+				metadataSize, uint64(len(c.min)), sizeLimit,
+			)
+		}
+		if ok {
+			metadataSize, ok = checkedSizeAdd(
+				metadataSize, uint64(len(c.max)), sizeLimit,
+			)
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
 	}
-	dictBytes := 0
+	var dictSize uint64
 	for _, t := range templates {
-		dictBytes += len(t.skeleton)
+		dictSize, ok = checkedSizeAdd(
+			dictSize, uint64(len(t.skeleton)), sizeLimit,
+		)
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
 	}
 	for _, d := range dict {
-		dictBytes += len(d.value)
+		dictSize, ok = checkedSizeAdd(
+			dictSize, uint64(len(d.value)), sizeLimit,
+		)
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
 	}
-	dataBytes := 0
+	var dataSize uint64
 	for _, r := range rows {
-		dataBytes += len(r.lengths) + len(r.values)
+		dataSize, ok = checkedSizeAdd(
+			dataSize, uint64(len(r.lengths)), sizeLimit,
+		)
+		if ok {
+			dataSize, ok = checkedSizeAdd(
+				dataSize, uint64(len(r.values)), sizeLimit,
+			)
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
+		}
 	}
-	total := metadataBytes + dictBytes + dataBytes + 16
-	if total > math.MaxUint32 {
+	totalSize, ok := checkedSizeAdd(metadataSize, dictSize, sizeLimit)
+	if ok {
+		totalSize, ok = checkedSizeAdd(totalSize, dataSize, sizeLimit)
+	}
+	if ok {
+		totalSize, ok = checkedSizeAdd(totalSize, 16, sizeLimit)
+	}
+	if !ok {
 		return nil, fmt.Errorf("%w: image too large", ErrInvalidWrite)
 	}
+	metadataBytes := int(metadataSize)
+	dictBytes := int(dictSize)
+	dataBytes := int(dataSize)
+	total := int(totalSize)
 	image := make([]byte, total)
 	copy(image[:8], templateColumnarLeafMagic[:])
 	binary.LittleEndian.PutUint16(image[8:10], templateColumnarLeafVersion)
@@ -444,9 +565,6 @@ func encodeTemplateColumnarLeafImage(rows []templateColumnarLeafBuildRow, templa
 		binary.LittleEndian.PutUint32(image[at:at+4], uint32(start))
 		binary.LittleEndian.PutUint32(image[at+4:at+8], uint32(cursor))
 		binary.LittleEndian.PutUint16(image[at+8:at+10], r.template)
-		if len(r.row.JSON) > math.MaxUint16 {
-			return nil, fmt.Errorf("%w: row too wide", ErrInvalidWrite)
-		}
 		binary.LittleEndian.PutUint16(image[at+10:at+12], uint16(len(r.row.JSON)))
 	}
 	tplDir := cursor

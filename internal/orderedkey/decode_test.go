@@ -135,22 +135,21 @@ func TestDecodeRejectsInvalidUTF8StringContent(t *testing.T) {
 	}
 }
 
-// Regression: at the extreme of the exponent range the encoder and decoder
-// disagreed. "0.9e-9223372036854775807" encoded fine but decoded to text naming
-// exponent MinInt64, which has no representable magnitude and so could not be
-// re-encoded; "0.09e-9223372036854775807" encoded fine but could not be decoded
-// at all. The canonical spelling now writes the adjusted exponent directly
-// rather than adjusted-1, and the encoder refuses the one exponent that has no
-// spelling, so the encodable and decodable sets coincide. Found by FuzzDecodeKey.
-func TestExtremeExponentRoundTripsOrIsRefused(t *testing.T) {
+// Regression: the original exponent codec stopped at int64 even though JSON
+// numbers have no such lexical bound. Every valid spelling now round-trips,
+// including adjusted exponent MinInt64 and magnitudes wider than uint64.
+func TestExtremeExponentRoundTrips(t *testing.T) {
 	for _, text := range []string{
 		"0.9e-9223372036854775807", "0.09e-9223372036854775807",
 		"9e9223372036854775806", "0.9e9223372036854775807",
 		"1e-9223372036854775807", "1e9223372036854775807",
+		"1e-9223372036854775808", "1e9223372036854775808",
+		"1e-18446744073709551616", "1e18446744073709551616",
+		"1e-999999999999999999999999", "1e999999999999999999999999",
 	} {
 		key, ok := AppendNumber(nil, []byte(text), Ascending)
 		if !ok {
-			continue // refused up front, which is a valid outcome
+			t.Fatalf("%s: valid JSON number was refused", text)
 		}
 		c, out, _, err := DecodeComponent(nil, key, 0)
 		if err != nil {
@@ -165,6 +164,56 @@ func TestExtremeExponentRoundTripsOrIsRefused(t *testing.T) {
 		again, ok := AppendNumber(nil, payload, Ascending)
 		if !ok || !bytes.Equal(again, key) {
 			t.Fatalf("%s: decoded %q did not re-encode (ok=%v)", text, payload, ok)
+		}
+	}
+}
+
+func TestHugeExponentZeroCanonicalizesBeforeExponentArithmetic(t *testing.T) {
+	want, ok := AppendNumber(nil, []byte("0"), Ascending)
+	if !ok {
+		t.Fatal("zero")
+	}
+	for _, text := range []string{
+		"0e9223372036854775808",
+		"-0e-18446744073709551616",
+		"0.000e999999999999999999999999999999999999999999",
+	} {
+		got, ok := AppendNumber(nil, []byte(text), Ascending)
+		if !ok || !bytes.Equal(got, want) {
+			t.Fatalf("%s: got %x ok=%v, want canonical zero %x", text, got, ok, want)
+		}
+	}
+}
+
+func TestDecodeRejectsMalformedWideExponent(t *testing.T) {
+	wide := func(header byte, length uint64, digits string) []byte {
+		key := []byte{tagNumber, tagNumberPositive, header}
+		var encodedLength [8]byte
+		for i := len(encodedLength) - 1; i >= 0; i-- {
+			encodedLength[i] = byte(length)
+			length >>= 8
+		}
+		key = append(key, encodedLength[:]...)
+		key = append(key, digits...)
+		key = append(key, 2, 0) // coefficient "1"
+		if header == expHeaderWideNegative {
+			invert(key[3 : 3+8+len(digits)])
+		}
+		return key
+	}
+	cases := [][]byte{
+		wide(expHeaderWidePositive, 0, ""),
+		wide(expHeaderWidePositive, 2, "01"),
+		wide(expHeaderWidePositive, 3, "1x3"),
+		wide(expHeaderWidePositive, 1, "9"), // compact-range alternative
+		wide(expHeaderWidePositive, 19, "9223372036854775807"),
+		wide(expHeaderWideNegative, 19, "9223372036854775807"),
+		wide(expHeaderWidePositive, 20, "999"), // declared payload is truncated
+		{tagNumber, tagNumberPositive, expHeaderWidePositive, 0, 0, 0},
+	}
+	for _, key := range cases {
+		if _, _, _, err := DecodeComponent(nil, key, 0); err == nil {
+			t.Fatalf("accepted malformed wide exponent %x", key)
 		}
 	}
 }
@@ -208,6 +257,8 @@ func FuzzDecodeKey(f *testing.F) {
 	key, _ = AppendNumber(key, []byte("-12.5e3"), Descending)
 	key, _ = AppendBool(key, true, Ascending)
 	f.Add(key)
+	wide, _ := AppendNumber(nil, []byte("-1e999999999999999999999999"), Descending)
+	f.Add(wide)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var buf []byte

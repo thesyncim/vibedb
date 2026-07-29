@@ -493,11 +493,9 @@ func TestExponentLengthBoundariesOrderAllPairs(t *testing.T) {
 		var kept []expValue
 		var keys [][]byte
 		for _, v := range all {
-			// Exponents near the int64 limit overflow the adjusted exponent and
-			// are refused by design; they simply do not take part.
 			key, ok := AppendNumber(nil, []byte(v.text), d)
 			if !ok {
-				continue
+				t.Fatalf("direction=%v refused valid number %s", d, v.text)
 			}
 			kept = append(kept, v)
 			keys = append(keys, key)
@@ -522,6 +520,64 @@ func TestExponentLengthBoundariesOrderAllPairs(t *testing.T) {
 	}
 }
 
+// The wide headers sit immediately outside both compact exponent ranges. This
+// all-pairs check crosses both escape boundaries, both exponent signs, the
+// number sign reversal, and descending component reversal. The list itself is
+// independently ordered by decimal semantics.
+func TestArbitraryWidthExponentOrderAllPairs(t *testing.T) {
+	positive := []string{
+		"1e-999999999999999999999999",
+		"9e-999999999999999999999999",
+		"1e-9223372036854775810",
+		"1e-9223372036854775809",
+		"1e-9223372036854775808",
+		"1e-9223372036854775807",
+		"1e-1",
+		"1",
+		"1e1",
+		"1e9223372036854775805",
+		"1e9223372036854775806",
+		"1e9223372036854775807",
+		"1e9223372036854775808",
+		"9e9223372036854775808",
+		"1e999999999999999999999999",
+		"9e999999999999999999999999",
+	}
+	ordered := make([]string, 0, len(positive)*2+1)
+	for i := len(positive) - 1; i >= 0; i-- {
+		ordered = append(ordered, "-"+positive[i])
+	}
+	ordered = append(ordered, "0")
+	ordered = append(ordered, positive...)
+
+	for _, direction := range []Direction{Ascending, Descending} {
+		keys := make([][]byte, len(ordered))
+		for i, text := range ordered {
+			var ok bool
+			keys[i], ok = AppendNumber(nil, []byte(text), direction)
+			if !ok {
+				t.Fatalf("direction=%v refused %s", direction, text)
+			}
+		}
+		flip := 1
+		if direction == Descending {
+			flip = -1
+		}
+		for i := range keys {
+			for j := range keys {
+				want := flip * sign(i-j)
+				got := sign(bytes.Compare(keys[i], keys[j]))
+				if got != want {
+					t.Fatalf(
+						"direction=%v %s vs %s: got %d want %d\n%x\n%x",
+						direction, ordered[i], ordered[j], got, want, keys[i], keys[j],
+					)
+				}
+			}
+		}
+	}
+}
+
 // Every exponent length must survive a round trip, including the negative-number
 // case where the exponent is complemented on top of the direction.
 func TestExponentLengthBoundariesRoundTrip(t *testing.T) {
@@ -529,7 +585,7 @@ func TestExponentLengthBoundariesRoundTrip(t *testing.T) {
 		for _, v := range expCorpus() {
 			key, ok := AppendNumber(nil, []byte(v.text), d)
 			if !ok {
-				continue
+				t.Fatalf("direction=%v refused valid number %s", d, v.text)
 			}
 			c, out, next, err := DecodeComponent(nil, key, 0)
 			if err != nil {

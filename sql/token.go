@@ -22,6 +22,7 @@ const (
 	tokRParen
 	tokLBracket
 	tokRBracket
+	tokLBrace // begins a raw JSON object in document/containment positions
 	tokDot
 	tokEq
 	tokNe

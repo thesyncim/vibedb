@@ -203,6 +203,32 @@ func TestTemplateColumnarLeafRejectsProgramBoundsAndLengthOverflow(t *testing.T)
 	}
 }
 
+func TestTemplateColumnarLeafRejectsUnrepresentableWidthsBeforeImageAllocation(t *testing.T) {
+	tooWide := []TemplateColumnarLeafRow{{
+		Slot: 0,
+		Key:  []byte("key"),
+		JSON: make([]byte, math.MaxUint16+1),
+	}}
+	if _, err := EncodeTemplateColumnarLeaf(tooWide); !errors.Is(
+		err, ErrInvalidWrite,
+	) {
+		t.Fatalf("over-wide row = %v, want ErrInvalidWrite", err)
+	}
+
+	rows := []templateColumnarLeafBuildRow{{
+		row: TemplateColumnarLeafRow{
+			Slot: 0, Key: []byte("key"), JSON: []byte(`{}`),
+		},
+	}}
+	templates := []templateColumnarLeafTemplate{{}}
+	dict := make([]templateColumnarLeafDictValue, math.MaxUint16+1)
+	if _, err := encodeTemplateColumnarLeafImage(
+		rows, templates, []uint16{0}, nil, dict,
+	); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("over-wide dictionary = %v, want ErrInvalidWrite", err)
+	}
+}
+
 func TestTemplateColumnarLeafPredicateSplicesSurvivorsOnly(t *testing.T) {
 	rows := templateColumnarLeafRows(t, 32, false)
 	image, err := EncodeTemplateColumnarLeaf(rows)

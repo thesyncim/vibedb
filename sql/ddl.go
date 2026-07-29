@@ -26,12 +26,18 @@ import "strings"
 //
 // # Aliases, and the one place an alias would have been a lie
 //
-// The common SQL spellings are accepted as aliases, because a user pasting a
-// schema from elsewhere should get a working table rather than a syntax error
-// on a word that has an obvious meaning here: TEXT, VARCHAR, CHAR, and NVARCHAR
-// are STRING; INT, BIGINT, SMALLINT, TINYINT, and SERIAL are INTEGER; FLOAT,
-// REAL, DOUBLE, DECIMAL, and NUMERIC are NUMBER; BOOLEAN is BOOL; JSON and
-// JSONB are ANY.
+// Common SQL spellings whose only relevant promise is a JSON value category
+// are accepted as aliases: TEXT, unparameterized VARCHAR, and CLOB are STRING;
+// INT, BIGINT, SMALLINT, and TINYINT are INTEGER; FLOAT, REAL, DOUBLE, DECIMAL,
+// and NUMERIC are NUMBER; BOOLEAN is BOOL; JSON is ANY. These aliases select a
+// JSON kind only; this dialect does not import another database's width,
+// precision, or storage representation.
+//
+// Spellings that promise behavior beyond a JSON kind are refused rather than
+// weakened silently. SERIAL would create a sequence-backed default; MONEY has
+// fixed-scale currency behavior; JSONB normalizes its input; bare
+// CHAR/CHARACTER/NCHAR are fixed-width; RECORD and STRUCT imply a declared
+// composite shape. None of those semantics exists here.
 //
 // A parenthesised precision is refused rather than accepted and ignored.
 // VARCHAR(255) means something everywhere it is written, and a dialect that
@@ -122,30 +128,22 @@ var typeNames = [...]struct {
 // documents want; a column list makes one whose stored documents are validated
 // against it on every write, by the schema the store already has.
 //
-// # What PRIMARY KEY does today
+// # PRIMARY KEY metadata and enforcement
 //
-// The declaration is parsed and validated in full, and it is lowered to exactly
-// what the engine can enforce today, which is less than the declaration
-// promises. Stating the gap precisely matters more than closing it here,
-// because closing it changes Put's signature and is deliberately sequenced
-// after the query work whose oracles depend on the current one.
+// The declaration is parsed and validated in full. Lowering makes every key
+// path a required scalar schema field and returns the paths as metadata to the
+// storage adapter.
 //
-// Enforced today: every path named by PRIMARY KEY becomes a required,
-// scalar-typed field of the collection's schema, so a document that omits it,
-// or holds a container there, is rejected at write time with the schema's own
-// error.
+// This AST does not prescribe one physical encoding. The database/sql driver
+// owns that policy at its catalog boundary: it requires one path, derives a
+// canonical typed key from the document's value, and rejects a duplicate
+// INSERT. Other consumers may support the compound declaration the parser
+// carries, but must derive identity from those declared JSON values and choose
+// a stable encoding.
 //
-// Not enforced today: derivation. The agreed model is that a declared primary
-// key is one or more paths into the document and the store key is derived from
-// them — never passed separately, never stored twice — with a composite
-// encoded by internal/orderedkey. The engine has no such derivation yet, so
-// INSERT still supplies the key explicitly, and nothing checks that the key a
-// caller supplies agrees with the values at the declared paths. Uniqueness is
-// therefore the store's own uniqueness over the supplied key, not over the
-// declared paths.
-//
-// Nothing here fakes the missing half. When the derivation lands, PrimaryKey
-// becomes the input to it and this comment loses its second paragraph.
+// This separation is deliberate: the parser reports the declaration and the
+// schema enforces its value domain; the adapter that maps a table onto storage
+// owns the physical-key codec.
 type CreateTableStmt struct {
 	// Table is the collection created.
 	Table string
@@ -187,6 +185,12 @@ type ColumnDef struct {
 	// PrimaryKey records that this column carried a column-level PRIMARY KEY.
 	PrimaryKey bool
 	Pos        int
+
+	// explicitNull distinguishes a nullable column (the SQL default) from one
+	// that explicitly wrote NULL. A table-level PRIMARY KEY makes an
+	// implicitly nullable column required, but must reject a contradictory
+	// explicit NULL constraint.
+	explicitNull bool
 }
 
 // A CreateIndexStmt is one parsed CREATE INDEX.

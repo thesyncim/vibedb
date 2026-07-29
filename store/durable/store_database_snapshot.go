@@ -1,9 +1,74 @@
 package durable
 
 import (
+	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
+
+var nextCollectionSnapshotOrder atomic.Uint64
+
+func (c *Collection) snapshotOrderID() uint64 {
+	if id := c.snapshotOrder.Load(); id != 0 {
+		return id
+	}
+	id := nextCollectionSnapshotOrder.Add(1)
+	if c.snapshotOrder.CompareAndSwap(0, id) {
+		return id
+	}
+	return c.snapshotOrder.Load()
+}
+
+func sortCollectionSnapshotOrder(collections []*Collection) {
+	for _, collection := range collections {
+		collection.snapshotOrderID()
+	}
+	slices.SortFunc(collections, func(a, b *Collection) int {
+		left, right := a.snapshotOrder.Load(), b.snapshotOrder.Load()
+		switch {
+		case left < right:
+			return -1
+		case left > right:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
+
+// lockSnapshotWriters holds every deferred-canonical writer in the same
+// process-global order used for publication gates, then seals pending parent
+// edits before a multi-collection cut is captured. Keeping the writer holds
+// until every gate read-lock is acquired closes the window in which a router
+// could advance beyond the rooted graph the snapshot will walk.
+func lockSnapshotWriters(
+	collections []*Collection,
+) ([]*Collection, error) {
+	locked := make([]*Collection, 0, len(collections))
+	for _, collection := range collections {
+		if !collection.deferredCanonicalLane() ||
+			collection.primaryRouter.Load() == nil {
+			continue
+		}
+		collection.writer.Lock()
+		locked = append(locked, collection)
+		if len(collection.primaryPendingParents) == 0 {
+			continue
+		}
+		if err := collection.materializePrimaryParentsLocked(); err != nil {
+			unlockSnapshotWriters(locked)
+			return nil, err
+		}
+	}
+	return locked, nil
+}
+
+func unlockSnapshotWriters(collections []*Collection) {
+	for i := len(collections) - 1; i >= 0; i-- {
+		collections[i].writer.Unlock()
+	}
+}
 
 // A DatabaseSnapshot is a logically immutable view of every collection in a
 // [Database] at one instant. Its zero value is an empty snapshot.
@@ -80,6 +145,113 @@ type databaseSnapshotEntry struct {
 	snapshot *Snapshot
 }
 
+// A NamedCollection binds an application-owned collection handle to the name
+// a [DatabaseSnapshot] uses to resolve it.
+//
+// It is the adapter for catalogs that own durable collections themselves
+// instead of using [Database]. Collection may be nil to represent a cataloged
+// collection that is still logically empty and has no backing file yet.
+type NamedCollection struct {
+	Name       string
+	Collection *Collection
+}
+
+// SnapshotCollections captures application-owned collections at one instant.
+//
+// It provides the same no-skew cut as [Database.Snapshot], but leaves catalog
+// ownership with the caller. The input slice is copied and sorted; callers may
+// reuse it as soon as this function returns. Names must be non-empty and
+// unique, and one collection handle may not be published under two names.
+// Gates are acquired by a process-global collection identity, not by these
+// caller-selected names, so overlapping captures cannot choose opposite lock
+// orders when two catalogs name the same handles differently.
+//
+// A nil Collection is retained as a cataloged empty collection. This supports
+// catalogs that defer allocating a durable file until the first write without
+// making an empty relation indistinguishable from an absent one.
+//
+// The returned snapshot owns one generation lease per non-empty collection
+// and must be closed.
+func SnapshotCollections(collections []NamedCollection) (DatabaseSnapshot, error) {
+	if len(collections) == 0 {
+		return DatabaseSnapshot{}, nil
+	}
+	ordered := slices.Clone(collections)
+	slices.SortFunc(ordered, func(a, b NamedCollection) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	seen := make(map[*Collection]string, len(ordered))
+	for i := range ordered {
+		entry := &ordered[i]
+		if entry.Name == "" {
+			return DatabaseSnapshot{}, ErrCollectionName
+		}
+		if i != 0 && ordered[i-1].Name == entry.Name {
+			return DatabaseSnapshot{}, ErrCollectionExists
+		}
+		if entry.Collection == nil {
+			continue
+		}
+		if previous, exists := seen[entry.Collection]; exists {
+			return DatabaseSnapshot{}, fmt.Errorf(
+				"vibejson: one durable collection cannot be cataloged as both %q and %q",
+				previous, entry.Name)
+		}
+		seen[entry.Collection] = entry.Name
+	}
+
+	gateOrder := make([]*Collection, 0, len(seen))
+	for collection := range seen {
+		gateOrder = append(gateOrder, collection)
+	}
+	sortCollectionSnapshotOrder(gateOrder)
+
+	writerOrder, err := lockSnapshotWriters(gateOrder)
+	if err != nil {
+		return DatabaseSnapshot{}, err
+	}
+	writersReleased := false
+	defer func() {
+		if !writersReleased {
+			unlockSnapshotWriters(writerOrder)
+		}
+	}()
+	// Every publication gate is held simultaneously. The process-global handle
+	// order makes overlapping catalogs deadlock-free, while rejecting one
+	// handle under two names avoids recursively read-locking an RWMutex across
+	// a waiting writer.
+	for _, collection := range gateOrder {
+		collection.snapshotGate.RLock()
+	}
+	unlockSnapshotWriters(writerOrder)
+	writersReleased = true
+	defer func() {
+		for i := len(gateOrder) - 1; i >= 0; i-- {
+			gateOrder[i].snapshotGate.RUnlock()
+		}
+	}()
+
+	result := DatabaseSnapshot{
+		entries: make([]databaseSnapshotEntry, 0, len(ordered)),
+	}
+	for i := range ordered {
+		entry := &ordered[i]
+		var snapshot *Snapshot
+		if entry.Collection != nil {
+			var err error
+			snapshot, err = entry.Collection.snapshotGateHeld()
+			if err != nil {
+				_ = result.Close()
+				return DatabaseSnapshot{}, err
+			}
+		}
+		result.entries = append(result.entries, databaseSnapshotEntry{
+			name: strings.Clone(entry.Name), snapshot: snapshot,
+		})
+	}
+	return result, nil
+}
+
 // Snapshot captures every cataloged collection at one instant, acquiring one
 // generation lease per collection. The caller must Close the result.
 //
@@ -136,16 +308,27 @@ func (d *Database) SnapshotInto(dst *DatabaseSnapshot) error {
 		return nil
 	}
 
-	// d.order is already sorted by name, so the acquisition order is fixed by
-	// the catalog rather than recomputed here. Unlocking is deferred in reverse
-	// so an unexpected panic during the capture cannot leave the database
-	// wedged with gates held.
-	for _, entry := range d.order {
-		entry.collection.snapshotGate.RLock()
+	writerOrder, err := lockSnapshotWriters(d.snapshotOrder)
+	if err != nil {
+		return err
 	}
+	writersReleased := false
 	defer func() {
-		for i := len(d.order) - 1; i >= 0; i-- {
-			d.order[i].collection.snapshotGate.RUnlock()
+		if !writersReleased {
+			unlockSnapshotWriters(writerOrder)
+		}
+	}()
+	// The catalog maintains a process-global handle order alongside its
+	// name-ordered view. Unlocking is deferred in reverse so an unexpected panic
+	// during the capture cannot leave the database wedged with gates held.
+	for _, collection := range d.snapshotOrder {
+		collection.snapshotGate.RLock()
+	}
+	unlockSnapshotWriters(writerOrder)
+	writersReleased = true
+	defer func() {
+		for i := len(d.snapshotOrder) - 1; i >= 0; i-- {
+			d.snapshotOrder[i].snapshotGate.RUnlock()
 		}
 	}()
 
@@ -186,7 +369,13 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{collection: c, state: state, lease: lease}, nil
+	return &Snapshot{
+		collection: c,
+		state:      state,
+		exact:      c.primaryExact,
+		live:       c.primaryLive,
+		lease:      lease,
+	}, nil
 }
 
 // Collection returns the captured view of name, reporting whether the

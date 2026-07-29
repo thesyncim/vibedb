@@ -4,10 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/thesyncim/vibedb/query"
 )
 
 // The listener, its configuration, and the registry a cancel request looks a
@@ -22,9 +24,10 @@ import (
 // engine's single-consumer contract hold without a lock on the hot path.
 //
 // Exactly three things are shared, and each is shared deliberately. The
-// [Source] is shared and is safe for concurrent readers by its own contract:
-// every execution takes its own snapshot. The [Options] are read-only after
-// construction. And the session registry is a map guarded by a mutex, touched
+// [Source] is shared; read-only shapes are safe for concurrent snapshots and a
+// SQL catalog opens one independently owned runtime session per connection.
+// The [Options] are read-only after construction. And the session registry is
+// a map guarded by a mutex, touched
 // once when a session starts, once when it ends, and once per cancel request —
 // never on a query path.
 //
@@ -44,15 +47,39 @@ import (
 const (
 	serverVersion    = "16.0"
 	serverVersionNum = "160000"
-	versionString    = "PostgreSQL " + serverVersion + " (vibejson pgwire)"
+	versionString    = "PostgreSQL " + serverVersion + " (vibedb pgwire)"
 )
 
-// Options configure a [Server]. The zero value is usable and authenticates
-// nobody; see [Options.Auth].
+// Safe defaults selected for zero-valued resource fields.
+const (
+	DefaultMaxConnections = 128
+	DefaultReadTimeout    = 10 * time.Second
+	DefaultWriteTimeout   = 30 * time.Second
+	DefaultIdleTimeout    = 5 * time.Minute
+	DefaultMaxResultRows  = query.DefaultResultRows
+	DefaultMaxResultBytes = query.DefaultResultBytes
+
+	// UnlimitedConnections and UnlimitedResults are explicit opt-outs from the
+	// corresponding finite defaults. A negative timeout explicitly disables
+	// that deadline.
+	UnlimitedConnections = -1
+	UnlimitedResults     = -1
+
+	// cancelRequestSlots are a bounded pre-startup admission cushion. They give
+	// an out-of-band CancelRequest an opportunity to reach a server whose
+	// ordinary session slots are full, but are not dedicated: the packet type is
+	// unknowable until it is read, so slow ordinary startups can occupy them.
+	// The finite default ReadTimeout plus the startup negotiation-attempt bound
+	// keeps each such occupation finite.
+	cancelRequestSlots = 8
+)
+
+// Options configure a [Server]. Authentication is intentionally the one field
+// with no default: callers must choose [Trust] or [SCRAM] explicitly.
 type Options struct {
-	// Auth is the authentication mechanism. A nil Auth is [Trust], which
-	// accepts every connection: correct for a loopback or unix-socket listener
-	// inside a trust boundary and wrong for anything reachable from elsewhere.
+	// Auth is the authentication mechanism. It is required. [Trust] accepts
+	// every connection and must be written explicitly, which prevents a
+	// forgotten production setting from silently disabling authentication.
 	Auth Authenticator
 
 	// Database, when non-empty, is the only database name a client may ask
@@ -61,19 +88,22 @@ type Options struct {
 	// already the whole set of collections this server can reach.
 	Database string
 
-	// MaxConnections bounds concurrent sessions. Zero means unlimited. A
-	// connection past the bound is refused with a FATAL 53300 before
-	// authentication, which is the earliest point at which refusing costs
-	// nothing.
+	// MaxConnections bounds authenticated and authenticating ordinary
+	// sessions. Zero selects DefaultMaxConnections; UnlimitedConnections is the
+	// explicit unbounded opt-out. The server additionally holds a fixed,
+	// bounded pre-startup cushion so a CancelRequest can contend when the
+	// ordinary limit is full; see the ReadTimeout caveat below.
 	MaxConnections int
 
 	// ReadTimeout bounds reading the startup packet and each authentication
 	// reply — the phase before the peer is known to be anything at all, and the
 	// one where a connection that opens, sends half a message, and stops would
-	// otherwise hold a goroutine forever. Zero means no deadline.
+	// otherwise hold a goroutine forever. Zero selects DefaultReadTimeout; a
+	// negative value explicitly disables the deadline.
 	ReadTimeout time.Duration
 
-	// WriteTimeout bounds how long a flush may block. Zero means no deadline.
+	// WriteTimeout bounds how long any underlying socket write may block. Zero
+	// selects DefaultWriteTimeout; a negative value explicitly disables it.
 	// It matters because a client that stops reading while a large result set
 	// is being written will otherwise block the session's goroutine
 	// indefinitely.
@@ -83,14 +113,22 @@ type Options struct {
 	// wait between statements plus the transfer of the message itself: it is
 	// applied before the header is read and covers the body too. A client
 	// sending a multi-megabyte statement over a slow link therefore needs an
-	// IdleTimeout longer than that transfer, which is why the default of zero —
-	// wait forever, what a pooled client expects — is the default.
+	// IdleTimeout longer than that transfer. Zero selects DefaultIdleTimeout; a
+	// negative value explicitly disables it.
 	IdleTimeout time.Duration
+
+	// MaxResultRows and MaxResultBytes bound one materialized SELECT result
+	// before pgwire begins encoding it. Zero selects the finite defaults above;
+	// UnlimitedResults is the explicit unbounded opt-out for either field.
+	MaxResultRows  int
+	MaxResultBytes int64
 
 	// OnError is called with every session-terminating error, including the
 	// ordinary ones (a client that closed its connection). It is the only
 	// logging hook, and it is a function rather than an interface so that a
-	// caller wiring it to log/slog does not have to implement anything.
+	// caller wiring it to log/slog does not have to implement anything. The
+	// session and connection are fully released before the hook runs, so the
+	// hook may synchronously call Close.
 	OnError func(err error)
 }
 
@@ -101,6 +139,7 @@ type Server struct {
 
 	mu        sync.Mutex
 	sessions  map[int32]*session
+	conns     map[net.Conn]struct{}
 	listeners map[net.Listener]struct{}
 	closed    bool
 	nextPID   int32
@@ -112,25 +151,83 @@ type Server struct {
 	wg sync.WaitGroup
 }
 
-// NewServer builds a server reading src.
-func NewServer(src Source, opts Options) *Server {
+// NewServer builds a server over src. It rejects an implicit authentication
+// policy and malformed resource settings before any listener is accepted.
+func NewServer(src Source, opts Options) (*Server, error) {
+	if src == nil {
+		return nil, errors.New(
+			"pgwire: a Source is required; use FromSQLDatabase, FromDatabase, or FromCollection")
+	}
+	if err := src.validate(); err != nil {
+		return nil, err
+	}
 	if opts.Auth == nil {
-		opts.Auth = Trust()
+		return nil, errors.New(
+			"pgwire: Options.Auth is required; choose Trust() or SCRAM(...) explicitly")
+	}
+	if err := opts.Auth.validate(); err != nil {
+		return nil, err
+	}
+	if opts.MaxConnections < UnlimitedConnections {
+		return nil, fmt.Errorf("pgwire: MaxConnections must be >= %d", UnlimitedConnections)
+	}
+	if opts.MaxConnections > int(^uint(0)>>1)-cancelRequestSlots {
+		return nil, errors.New("pgwire: MaxConnections is too large")
+	}
+	if opts.MaxResultRows < UnlimitedResults {
+		return nil, fmt.Errorf("pgwire: MaxResultRows must be >= %d", UnlimitedResults)
+	}
+	if opts.MaxResultBytes < UnlimitedResults {
+		return nil, fmt.Errorf("pgwire: MaxResultBytes must be >= %d", UnlimitedResults)
+	}
+	if opts.MaxConnections == 0 {
+		opts.MaxConnections = DefaultMaxConnections
+	}
+	if opts.ReadTimeout == 0 {
+		opts.ReadTimeout = DefaultReadTimeout
+	} else if opts.ReadTimeout < 0 {
+		opts.ReadTimeout = 0
+	}
+	if opts.WriteTimeout == 0 {
+		opts.WriteTimeout = DefaultWriteTimeout
+	} else if opts.WriteTimeout < 0 {
+		opts.WriteTimeout = 0
+	}
+	if opts.IdleTimeout == 0 {
+		opts.IdleTimeout = DefaultIdleTimeout
+	} else if opts.IdleTimeout < 0 {
+		opts.IdleTimeout = 0
+	}
+	if opts.MaxResultRows == 0 {
+		opts.MaxResultRows = DefaultMaxResultRows
+	}
+	if opts.MaxResultBytes == 0 {
+		opts.MaxResultBytes = DefaultMaxResultBytes
 	}
 	return &Server{
 		src:       src,
 		opts:      opts,
 		sessions:  map[int32]*session{},
+		conns:     map[net.Conn]struct{}{},
 		listeners: map[net.Listener]struct{}{},
-	}
+	}, nil
 }
 
-// ErrServerClosed is returned by [Server.Serve] after [Server.Close].
-var ErrServerClosed = errors.New("pgwire: server closed")
+var (
+	// ErrServerClosed is returned by [Server.Serve] after [Server.Close].
+	ErrServerClosed  = errors.New("pgwire: server closed")
+	errNilListener   = errors.New("pgwire: Serve requires a non-nil listener")
+	errNilConnection = errors.New(
+		"pgwire: ServeConn requires a non-nil connection",
+	)
+)
 
 // Serve accepts connections on l until l fails or the server is closed. It
 // takes ownership of l and closes it on return.
 func (s *Server) Serve(l net.Listener) error {
+	if l == nil {
+		return errNilListener
+	}
 	if !s.addListener(l) {
 		_ = l.Close()
 		return ErrServerClosed
@@ -144,11 +241,11 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return err
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.serveConn(conn)
-		}()
+		if !s.admitConnection(conn) {
+			_ = conn.Close()
+			continue
+		}
+		go s.serveAdmittedConnection(conn)
 	}
 }
 
@@ -160,29 +257,49 @@ func (s *Server) Serve(l net.Listener) error {
 // connections — over a unix socket with peer credentials checked, say — should
 // not have to give the listener away to use this package.
 func (s *Server) ServeConn(conn net.Conn) {
-	s.wg.Add(1)
-	defer s.wg.Done()
-	s.serveConn(conn)
+	if conn == nil {
+		if s.opts.OnError != nil {
+			s.opts.OnError(errNilConnection)
+		}
+		return
+	}
+	if !s.admitConnection(conn) {
+		_ = conn.Close()
+		return
+	}
+	s.serveAdmittedConnection(conn)
 }
 
-func (s *Server) serveConn(conn net.Conn) {
-	defer conn.Close()
-	sess := newSession(s, conn)
-	err := sess.serve()
+// serveAdmittedConnection runs an admitted connection and reports its terminal
+// error only after every resource and shutdown-accounting entry has been
+// released. The ordering is what makes OnError reentrant with Close: reporting
+// while this connection still contributed to wg would make Close wait for the
+// callback that was itself calling Close.
+func (s *Server) serveAdmittedConnection(conn net.Conn) {
+	err := s.serveConn(conn)
 	if err != nil && s.opts.OnError != nil {
 		s.opts.OnError(err)
 	}
 }
 
-// Close stops accepting, closes every open session's connection, and waits for
-// every session goroutine to return.
+func (s *Server) serveConn(conn net.Conn) error {
+	// Done was added by admitConnection. Declare it before the resource
+	// defers so LIFO ordering removes and closes the connection first.
+	defer s.wg.Done()
+	defer s.releaseConnection(conn)
+	defer conn.Close()
+	sess := newSession(s, conn)
+	return sess.serve()
+}
+
+// Close stops accepting, cancels every registered execution, closes every open
+// connection, and waits for every session goroutine to return.
 //
-// Closing the connections rather than politely asking sessions to stop is
-// deliberate: a session blocked in Read has no other way to be woken, and a
-// session blocked in the executor cannot be interrupted at all (see
-// [session.cancel]), so closing the socket is what makes its next write fail
-// and its loop exit. A client sees the connection drop, which is what a client
-// sees when a server shuts down.
+// Both signals are necessary. Cooperative cancellation reaches a session
+// currently inside heap/durable scan, join, filtered DML, or spill work;
+// closing its connection wakes a session blocked in Read or Write. The session
+// slice is copied under the registry lock and signaled after unlock, avoiding
+// any lock inversion with the unregister defers each exiting session runs.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -195,9 +312,13 @@ func (s *Server) Close() error {
 	for l := range s.listeners {
 		listeners = append(listeners, l)
 	}
-	conns := make([]net.Conn, 0, len(s.sessions))
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	sessions := make([]*session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		conns = append(conns, sess.conn)
+		sessions = append(sessions, sess)
 	}
 	s.mu.Unlock()
 
@@ -207,11 +328,43 @@ func (s *Server) Close() error {
 			err = closeErr
 		}
 	}
+	for _, sess := range sessions {
+		sess.shutdownCancel()
+	}
 	for _, c := range conns {
 		_ = c.Close()
 	}
 	s.wg.Wait()
 	return err
+}
+
+// admitConnection bounds sockets and goroutines before startup reads or SCRAM
+// work begin. The small cushion gives CancelRequest, which arrives on a new
+// connection by protocol design, a chance to reach a fully occupied server. It
+// cannot be a dedicated reserve because the packet type is unknown until after
+// admission and a startup read.
+func (s *Server) admitConnection(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	if s.opts.MaxConnections != UnlimitedConnections &&
+		len(s.conns) >= s.opts.MaxConnections+cancelRequestSlots {
+		return false
+	}
+	// Add while holding the same lock Close uses to cross into Wait. This
+	// prevents a ServeConn admitted concurrently with shutdown from calling
+	// WaitGroup.Add after Close has already begun waiting at a zero count.
+	s.wg.Add(1)
+	s.conns[conn] = struct{}{}
+	return true
+}
+
+func (s *Server) releaseConnection(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
 }
 
 func (s *Server) isClosed() bool {
@@ -313,13 +466,3 @@ func deadline(conn net.Conn, set func(time.Time) error, d time.Duration) {
 	}
 	_ = set(time.Now().Add(d))
 }
-
-// cancelFlag is a session's cancellation state. It is an atomic because the
-// only writer is another connection's goroutine.
-type cancelFlag struct{ flag atomic.Bool }
-
-func (c *cancelFlag) set() { c.flag.Store(true) }
-
-// take reports whether a cancel is pending and clears it, so one cancel request
-// stops one statement rather than every statement that follows it.
-func (c *cancelFlag) take() bool { return c.flag.Swap(false) }

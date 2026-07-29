@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // FuzzParseSQL is this package's highest-value test.
@@ -50,6 +51,9 @@ func FuzzParseSQL(f *testing.F) {
 		var p Parser
 		var stmt SelectStmt
 		err := p.Parse(&stmt, src)
+		if !utf8.ValidString(src) && err == nil {
+			t.Fatal("Parse accepted invalid UTF-8")
+		}
 		if err != nil {
 			var parseErr *ParseError
 			if !errors.As(err, &parseErr) {

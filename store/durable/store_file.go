@@ -384,6 +384,18 @@ type Options struct {
 	DisableMutationCombining bool
 }
 
+// ValidateOptions reports whether options can be normalized and represented by
+// the durable on-disk format, without opening or creating a collection.
+//
+// This is useful to catalogs that persist collection definitions before they
+// allocate a data file: validating first prevents acknowledging metadata that a
+// later Create would reject because of an index-count, string-size, schema, or
+// geometry bound.
+func ValidateOptions(options Options) error {
+	_, err := options.normalized()
+	return err
+}
+
 // batchMetadataBasePages is the worst-case non-overflow page reservation for
 // one batched publication before its free-log fold grows past the
 // single-document baseline. Each term names the structure it pays for:
@@ -1009,8 +1021,13 @@ type Collection struct {
 	writer         sync.Mutex
 	durabilityWait sync.WaitGroup
 	snapshotGate   sync.RWMutex
-	closed         bool
-	closeDone      bool
+	// snapshotOrder is a process-local, lazily assigned identity used to
+	// acquire several collections' snapshot gates in one global order. Names
+	// are catalog-local and cannot provide that order when the same handles are
+	// exposed through different catalogs.
+	snapshotOrder atomic.Uint64
+	closed        bool
+	closeDone     bool
 	// state is the writer's newest applied generation. Readers use
 	// visibleState so synchronous commits cannot leak before their fence.
 	state          atomic.Pointer[fileStoreState]

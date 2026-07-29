@@ -209,7 +209,7 @@ func (s scalar) float64OfNumber() (float64, bool) {
 	if s.isInt {
 		return float64(s.ival), true
 	}
-	f, err := strconv.ParseFloat(string(s.num), 64)
+	f, err := strconv.ParseFloat(byteview.String(s.num), 64)
 	if err != nil {
 		return 0, false
 	}

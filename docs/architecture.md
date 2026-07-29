@@ -124,6 +124,42 @@ and it never sorts hash order or subtracts tombstones. Query execution takes an
 explicit heap or durable snapshot and uses the same source for indexes, scans,
 and document rechecks.
 
+## SQL and JSON documents
+
+The relational boundary has one language: SQL. Embedded callers use
+`database/sql`; PostgreSQL clients use the protocol-v3 `pgwire` front door.
+Both adapters consume the same typed `sql/driver` catalog/session runtime for
+DDL, DML, SELECT, prepared statements, and transactions. JSON is the row
+representation, not a second request grammar. The `sql` package parses,
+`query` lowers onto the shared compiled evaluator, and `sql/driver` supplies
+catalog, storage, and transaction policy. This keeps SELECT and mutation
+predicates on one implementation instead of duplicating them in an adapter.
+The legacy `pgwire` constructors for a heap database or one durable collection
+remain deliberately read-only SELECT sources.
+
+Each SQL table is a durable collection plus catalog metadata for a declared
+JSON schema, one scalar document-derived primary-key path, and frozen exact
+index definitions. SQL-created tables currently use the mutable chunk layout
+so single writes and `Update` batches maintain compound exact postings in the
+same publication. Catalog replacement and first table-file creation include the
+platform namespace durability fence in addition to the durable file fence. The
+catalog and collection are reopened together, so schema validation and index
+maintenance do not disappear across process restarts.
+
+A multi-table SELECT captures all participating durable collections while
+holding their publication gates, then retains one generation lease per table.
+The captured generations therefore genuinely coexisted. A declared-field inner
+join that must emit matching pairs uses the heap executor after admitting the
+complete captured input against the current fixed, conservative 64 MiB
+working-set bound. The leases protect the cut while it is copied, then close;
+the heap copy owns the same cut through result production. An oversized fallback
+fails before execution. A join inside a transaction materializes the BEGIN cut
+plus the transaction overlay under the same bound.
+
+This coherent read cut does not create a cross-table commit. One SQL transaction
+may read several tables but writes exactly one, matching the largest atomic
+publication the storage layer actually has.
+
 ## Write path
 
 A mutation is planned against one state:
@@ -219,3 +255,6 @@ optimizations because they do not change what readers consult.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
   per-tablet concurrency.
 - [Unification](design/unification.md): one eventual mutable collection.
+- [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
+  contract over JSON documents, schemas, exact indexes, joins, and
+  transactions.

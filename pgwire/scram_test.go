@@ -3,6 +3,7 @@ package pgwire
 import (
 	"crypto/hmac"
 	"crypto/pbkdf2"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -185,6 +186,51 @@ func TestSCRAMAcceptsTheRightPassword(t *testing.T) {
 	}
 }
 
+func TestSCRAMAcceptsASpaceInAPassword(t *testing.T) {
+	const password = " correct horse "
+	srv := scramServer(t, "alice", password)
+	c := dial(t, srv)
+	sc := &scramClient{t: t, c: c, user: "alice", password: password, gs2: "n"}
+	m := sc.authenticate()
+	if m.tag != msgAuthentication {
+		t.Fatalf("a password containing ASCII spaces produced %q, want AuthenticationOk: %s",
+			string(rune(m.tag)), formatError(m.body))
+	}
+	if code := int32(binary.BigEndian.Uint32(m.body)); code != authOK {
+		t.Fatalf("expected AuthenticationOk (%d), got %d", authOK, code)
+	}
+}
+
+func TestNewServerRejectsSCRAMWithoutALookup(t *testing.T) {
+	if _, err := NewServer(
+		FromDatabase(testDatabase(t, "users", corpus)),
+		Options{Auth: SCRAM(nil)},
+	); err == nil {
+		t.Fatal("NewServer accepted SCRAM without a verifier lookup")
+	}
+}
+
+type failingEntropyReader struct{}
+
+func (failingEntropyReader) Read([]byte) (int, error) {
+	return 0, errors.New("entropy unavailable")
+}
+
+func TestNewServerReportsSCRAMEntropyFailureWithoutPanicking(t *testing.T) {
+	previous := cryptorand.Reader
+	cryptorand.Reader = failingEntropyReader{}
+	t.Cleanup(func() { cryptorand.Reader = previous })
+
+	auth := SCRAM(func(string) (Verifier, bool) { return Verifier{}, false })
+	_, err := NewServer(
+		FromDatabase(testDatabase(t, "users", corpus)),
+		Options{Auth: auth},
+	)
+	if err == nil || !strings.Contains(err.Error(), "entropy unavailable") {
+		t.Fatalf("NewServer after SCRAM entropy failure = %v", err)
+	}
+}
+
 func TestSCRAMRejectsTheWrongPassword(t *testing.T) {
 	srv := scramServer(t, "alice", "correct-horse")
 	c := dial(t, srv)
@@ -254,6 +300,124 @@ func TestSCRAMRefusesAClientThatRequiresChannelBinding(t *testing.T) {
 	}
 }
 
+func TestSCRAMRefusesAnAuthorizationIdentityItCannotEnforce(t *testing.T) {
+	_, err := parseClientFirst("n,a=administrator,n=,r=NONCE")
+	expectSCRAMErrorCode(t, err, sqlstateFeatureNotSupported)
+}
+
+func TestSCRAMClientFirstAttributesFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		code string
+	}{
+		{name: "missing username", msg: "n,,r=NONCE", code: sqlstateProtocolViolation},
+		{name: "reordered required attributes", msg: "n,,r=NONCE,n=",
+			code: sqlstateProtocolViolation},
+		{name: "duplicate username", msg: "n,,n=,r=NONCE,n=other",
+			code: sqlstateProtocolViolation},
+		{name: "duplicate nonce", msg: "n,,n=,r=NONCE,r=OTHER",
+			code: sqlstateProtocolViolation},
+		{name: "multi-letter attribute", msg: "n,,n=,r=NONCE,xx=value",
+			code: sqlstateProtocolViolation},
+		{name: "invalid username escape", msg: "n,,n=bad=escape,r=NONCE",
+			code: sqlstateProtocolViolation},
+		{name: "non-printable nonce", msg: "n,,n=,r=NON CE",
+			code: sqlstateProtocolViolation},
+		{name: "defined attribute in extension slot", msg: "n,,n=,r=NONCE,c=value",
+			code: sqlstateProtocolViolation},
+		{name: "empty optional extension", msg: "n,,n=,r=NONCE,z=",
+			code: sqlstateProtocolViolation},
+		{name: "nul in extension", msg: "n,,n=,r=NONCE,z=\x00",
+			code: sqlstateProtocolViolation},
+		{name: "trailing separator", msg: "n,,n=,r=NONCE,",
+			code: sqlstateProtocolViolation},
+		{name: "mandatory extension prefix", msg: "n,,m=required,n=,r=NONCE",
+			code: sqlstateFeatureNotSupported},
+		{name: "mandatory extension suffix", msg: "n,,n=,r=NONCE,m=required",
+			code: sqlstateFeatureNotSupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseClientFirst(tc.msg)
+			expectSCRAMErrorCode(t, err, tc.code)
+		})
+	}
+
+	first, err := parseClientFirst("n,,n=,r=NONCE,z=optional")
+	if err != nil {
+		t.Fatalf("an optional client-first extension was refused: %v", err)
+	}
+	if first.nonce != "NONCE" || first.bare != "n=,r=NONCE,z=optional" {
+		t.Fatalf("optional extension was not preserved in the authenticated message: %+v", first)
+	}
+}
+
+func TestSCRAMClientFinalAttributesFailClosed(t *testing.T) {
+	binding := base64.StdEncoding.EncodeToString([]byte("n,,"))
+	for _, tc := range []struct {
+		name string
+		msg  string
+		code string
+	}{
+		{name: "reordered required attributes",
+			msg: "r=NONCE,c=" + binding + ",p=AAAA", code: sqlstateProtocolViolation},
+		{name: "duplicate binding",
+			msg:  "c=" + binding + ",r=NONCE,c=" + binding + ",p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "duplicate nonce",
+			msg:  "c=" + binding + ",r=NONCE,r=OTHER,p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "proof before final proof",
+			msg:  "c=" + binding + ",r=NONCE,p=AAAA,p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "multi-letter attribute",
+			msg:  "c=" + binding + ",r=NONCE,xx=value,p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "non-printable nonce",
+			msg:  "c=" + binding + ",r=NON CE,p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "defined attribute in extension slot",
+			msg:  "c=" + binding + ",r=NONCE,s=value,p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "empty optional extension",
+			msg:  "c=" + binding + ",r=NONCE,z=,p=AAAA",
+			code: sqlstateProtocolViolation},
+		{name: "mandatory extension",
+			msg:  "c=" + binding + ",r=NONCE,m=required,p=AAAA",
+			code: sqlstateFeatureNotSupported},
+		{name: "empty proof",
+			msg: "c=" + binding + ",r=NONCE,p=", code: sqlstateProtocolViolation},
+		{name: "non-canonical proof base64",
+			msg: "c=" + binding + ",r=NONCE,p=AB==", code: sqlstateProtocolViolation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := parseClientFinal(tc.msg, "NONCE", "n,,")
+			expectSCRAMErrorCode(t, err, tc.code)
+		})
+	}
+
+	proof, withoutProof, err := parseClientFinal(
+		"c="+binding+",r=NONCE,z=optional,p=AAAA", "NONCE", "n,,")
+	if err != nil {
+		t.Fatalf("an optional client-final extension was refused: %v", err)
+	}
+	if len(proof) == 0 || withoutProof != "c="+binding+",r=NONCE,z=optional" {
+		t.Fatalf("optional extension was not preserved in the authenticated message: %q",
+			withoutProof)
+	}
+}
+
+func expectSCRAMErrorCode(t *testing.T, err error, code string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("SCRAM message succeeded, want SQLSTATE %s", code)
+	}
+	var pg *pgError
+	if !errors.As(err, &pg) || pg.code != code {
+		t.Fatalf("SCRAM failure = %v, want SQLSTATE %s", err, code)
+	}
+}
+
 // TestSCRAMDetectsATamperedChannelBindingHeader drives the downgrade case
 // directly: a client that sent "y" but echoes "n" in its final message must be
 // rejected, because that mismatch is the signature of an attacker having
@@ -281,14 +445,16 @@ func TestSCRAMRejectsAReplayedNonce(t *testing.T) {
 }
 
 func TestNewVerifierRefusesAPasswordItCannotNormalize(t *testing.T) {
-	for _, password := range []string{"", "café", "with space", "tab\there"} {
+	for _, password := range []string{"", "café", "tab\there", "line\nbreak"} {
 		if _, err := NewVerifier(password); err == nil {
 			t.Errorf("NewVerifier accepted %q, which needs SASLprep this package does not "+
 				"implement", password)
 		}
 	}
-	if _, err := NewVerifier("Printable-ASCII_1234!"); err != nil {
-		t.Errorf("NewVerifier refused an ordinary password: %v", err)
+	for _, password := range []string{"Printable-ASCII_1234!", "with space", " leading and trailing "} {
+		if _, err := NewVerifier(password); err != nil {
+			t.Errorf("NewVerifier refused safe ASCII password %q: %v", password, err)
+		}
 	}
 }
 

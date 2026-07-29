@@ -1,8 +1,8 @@
 package query
 
 import (
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 // Postings-accelerated candidate selection.
@@ -235,7 +235,7 @@ func unionSortedInto(out, a, b []int) []int {
 // them borrows them, so they live exactly as long as the plan does. The two
 // keyword needles are package constants instead: they never vary, so spending
 // arena bytes on a fresh copy of "true" per equality would be pure waste.
-func (c *Compiler) eqNeedle(lit scalar) ([]byte, bool) {
+func (c *compiler) eqNeedle(lit scalar) ([]byte, bool) {
 	switch lit.kind {
 	case kindBool:
 		if lit.bval {

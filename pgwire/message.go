@@ -53,9 +53,9 @@ type frontendMessage struct {
 	// maxRows is Execute's row limit; zero means "all rows".
 	maxRows int32
 
-	// paramOIDs are the parameter type hints of Parse. This server ignores
-	// their values (see extended.go) but decodes them because a message it did
-	// not fully decode is a message it cannot bound.
+	// paramOIDs are the parameter types declared by Parse. Bind uses them to
+	// select an unambiguous scalar decoder and ParameterDescription reports
+	// them back, with zero for positions the client left unspecified.
 	paramOIDs []int32
 	// paramFormats and resultFormats are Bind's format-code arrays, already
 	// validated to be text or binary.
@@ -81,8 +81,18 @@ type frontendMessage struct {
 // body for as long as the session lives, which is exactly what the reader's
 // retained-buffer cap exists to prevent.
 func (m *frontendMessage) reset() {
+	m.releaseBodyViews()
+}
+
+// releaseBodyViews drops every slice or string that aliases the current reader
+// body. dispatch calls it immediately after handling the message, so a rejected
+// 16 MiB message cannot remain pinned while an idle client sends nothing else.
+// The typed/count slices themselves are reusable session storage and remain.
+func (m *frontendMessage) releaseBodyViews() {
 	clear(m.params[:cap(m.params)])
 	m.params = m.params[:0]
+	m.name = ""
+	m.portal = ""
 	m.payload = nil
 	m.query = ""
 }
@@ -100,11 +110,11 @@ func decodeFrontend(m *frontendMessage, tag byte, body []byte) error {
 	f := fields{b: body}
 	switch tag {
 	case msgQuery:
-		m.query = f.cstring()
+		m.query = f.cstringView()
 
 	case msgParse:
-		m.name = f.name()
-		m.query = f.cstring()
+		m.name = f.nameView()
+		m.query = f.cstringView()
 		n := f.count(4)
 		m.paramOIDs = m.paramOIDs[:0]
 		for range n {
@@ -112,8 +122,8 @@ func decodeFrontend(m *frontendMessage, tag byte, body []byte) error {
 		}
 
 	case msgBind:
-		m.portal = f.name()
-		m.name = f.name()
+		m.portal = f.nameView()
+		m.name = f.nameView()
 		var err error
 		if m.paramFormats, err = decodeFormats(&f, m.paramFormats); err != nil {
 			return err
@@ -138,7 +148,7 @@ func decodeFrontend(m *frontendMessage, tag byte, body []byte) error {
 
 	case msgDescribe, msgClose:
 		m.target = f.uint8()
-		name := f.name()
+		name := f.nameView()
 		if m.target == targetPortal {
 			m.portal = name
 		} else {
@@ -149,7 +159,7 @@ func decodeFrontend(m *frontendMessage, tag byte, body []byte) error {
 		}
 
 	case msgExecute:
-		m.portal = f.name()
+		m.portal = f.nameView()
 		m.maxRows = f.int32()
 		if !f.bad() && m.maxRows < 0 {
 			return errBadRowLimit

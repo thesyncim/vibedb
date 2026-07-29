@@ -1,5 +1,34 @@
 package durable
 
+// NormalizeOptions applies every zero-value default and validates the result.
+// The returned Options are the exact logical bounds and modes a new collection
+// will freeze into its catalog. Callers that stage work before a Collection
+// exists use this to enforce the same limits before allocating from
+// peer-controlled input.
+func NormalizeOptions(options Options) (Options, error) {
+	normalized, err := options.normalized()
+	if err != nil {
+		return Options{}, err
+	}
+	return normalized.Options, nil
+}
+
+// MaxKeyBytes reports the maximum encoded primary-key size.
+func (c *Collection) MaxKeyBytes() int {
+	if c == nil {
+		return 0
+	}
+	return c.options.MaxKeyBytes
+}
+
+// MaxDocumentBytes reports the maximum JSON document size.
+func (c *Collection) MaxDocumentBytes() int {
+	if c == nil {
+		return 0
+	}
+	return c.options.MaxDocumentBytes
+}
+
 // MaxBatchDocuments reports how many distinct keys one [Collection.Update] may
 // mutate before the batch is refused with [ErrBatchTooLarge].
 //

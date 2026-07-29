@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // The in-memory execution battery. Every case reports ns/doc rather than

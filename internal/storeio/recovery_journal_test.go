@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -128,6 +129,61 @@ func TestRecoveryJournalHeaderRoundTrip(t *testing.T) {
 		if _, err := DecodeRecoveryJournalHeader(corrupt); err == nil {
 			t.Fatalf("%s corruption accepted", mut.name)
 		}
+	}
+}
+
+func TestRecoveryJournalRejectsHostileCapacityBeforeAllocation(t *testing.T) {
+	h := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
+	h.RecycleCount = 1
+	buf := make([]byte, RecoveryJournalHeaderSize)
+	if _, err := EncodeRecoveryJournalHeader(buf, h); err != nil {
+		t.Fatal(err)
+	}
+
+	oversized := RecoveryJournalMaxCapacityBytes +
+		uint64(RecoveryJournalMinSectorSize)
+	binary.LittleEndian.PutUint64(buf[72:80], oversized)
+	checksum := PageChecksum(buf[:RecoveryJournalHeaderSize-8])
+	binary.LittleEndian.PutUint32(
+		buf[RecoveryJournalHeaderSize-8:RecoveryJournalHeaderSize-4],
+		checksum,
+	)
+	binary.LittleEndian.PutUint32(
+		buf[RecoveryJournalHeaderSize-4:], ^checksum,
+	)
+	if _, err := DecodeRecoveryJournalHeader(buf); !errors.Is(
+		err, ErrRecoveryJournalCorrupt,
+	) {
+		t.Fatalf("oversized checksummed header = %v, want corrupt", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "invalid.rjournal")
+	file, err := os.OpenFile(
+		path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	for name, mutate := range map[string]func(*RecoveryJournalHeader){
+		"zero sector": func(h *RecoveryJournalHeader) {
+			h.SectorSize = 0
+		},
+		"oversized capacity": func(h *RecoveryJournalHeader) {
+			h.Capacity = oversized
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := testJournalHeader(
+				t, 8*RecoveryJournalMinSectorSize,
+			)
+			mutate(&candidate)
+			if _, err := CreateRecoveryJournal(
+				file, candidate,
+			); !errors.Is(err, ErrRecoveryJournalCorrupt) {
+				t.Fatalf("CreateRecoveryJournal = %v, want corrupt", err)
+			}
+		})
 	}
 }
 

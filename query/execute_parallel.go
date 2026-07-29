@@ -5,8 +5,8 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 // Parallel filter phase for the in-memory backends.
@@ -56,6 +56,8 @@ type scanWorker struct {
 	text     []byte
 	eval     evalScratch
 	selected []int
+	work     *heapWorkBudget
+	cancel   *CancelFlag
 	// lo and hi are this worker's half-open range of scan row ordinals;
 	// maskLo and maskHi are the live-mask window covering it, for a snapshot
 	// scan that has to expand its own addresses.
@@ -244,9 +246,16 @@ func (p *plan) start(w *Workspace, pool *scanPool, scan []scanWorker) ([]int, er
 // parked worker from holding its Workspace — and through it the collection and
 // the plan of an execution that finished long ago — alive.
 func (sw *scanWorker) release() {
+	for i := range sw.raws {
+		clear(sw.raws[i])
+		sw.raws[i] = sw.raws[i][:0]
+	}
 	sw.plan, sw.ctx = nil, nil
 	sw.snapshot = store.Snapshot{}
 	sw.rows, sw.addresses, sw.masks = nil, nil, nil
+	sw.work = nil
+	sw.cancel = nil
+	sw.eval.setWork(nil)
 }
 
 // filter runs this worker's share: gather its rows of every filter column into
@@ -306,6 +315,9 @@ func (p *plan) selectSegmentParallel(ctx *execCtx, w *Workspace, rows []int, wor
 // as this one's.
 func (w *Workspace) bindScanWorkers(scan []scanWorker) {
 	for i := range scan {
+		scan[i].work = w.activeHeapWorkBudget()
+		scan[i].cancel = w.cancel
+		scan[i].eval.setWork(scan[i].work)
 		scan[i].eval.bindTo(w.joins)
 	}
 	w.scanUsed = len(scan)
@@ -326,10 +338,18 @@ func (sw *scanWorker) filterSegment() {
 	p, ctx, rows := sw.plan, sw.ctx, sw.rows
 	sw.err = nil
 	sw.selected = sw.selected[:0]
+	if err := cancellationError(sw.cancel); err != nil {
+		sw.err = err
+		return
+	}
 	sw.raws = resize(sw.raws, len(p.valuePaths))
 	span := rows[sw.lo:sw.hi]
 	textNeed := 0
-	for _, c := range p.filterCols {
+	for at, c := range p.filterCols {
+		if err := cancellationCheckpoint(sw.cancel, at); err != nil {
+			sw.err = err
+			return
+		}
 		cp := p.valuePaths[c]
 		var raws []vibejson.RawValue
 		var err error
@@ -343,9 +363,16 @@ func (sw *scanWorker) filterSegment() {
 			return
 		}
 		sw.raws[c] = raws
-		textNeed += escapedTextBytes(raws)
+		escaped, err := escapedTextBytesCancelable(raws, sw.cancel)
+		if err != nil {
+			sw.err = err
+			return
+		}
+		textNeed += escaped
 	}
-	sw.classifyAndSelect(p, ctx, textNeed)
+	if err := sw.classifyAndSelect(p, ctx, textNeed); err != nil {
+		sw.err = err
+	}
 }
 
 // selectSnapshotParallel is selectSegmentParallel over a heap snapshot. The
@@ -360,7 +387,13 @@ func (p *plan) selectSnapshotParallel(ctx *execCtx, w *Workspace, snapshot store
 	scan := pool.split(ctx.rows, workers)
 	var masks []store.Mask
 	if !compact {
+		if err := w.checkCanceled(); err != nil {
+			return nil, false, err
+		}
 		w.liveMasks = snapshot.AppendLiveMasks(w.liveMasks[:0])
+		if err := w.checkCanceled(); err != nil {
+			return nil, false, err
+		}
 		masks = w.liveMasks
 		if !assignMaskSpans(scan, masks) {
 			// The live universe and the scan disagree about how many rows
@@ -403,6 +436,10 @@ func (sw *scanWorker) filterSnapshot() {
 	p, ctx, snapshot, masks := sw.plan, sw.ctx, sw.snapshot, sw.masks
 	sw.err = nil
 	sw.selected = sw.selected[:0]
+	if err := cancellationError(sw.cancel); err != nil {
+		sw.err = err
+		return
+	}
 	sw.raws = resize(sw.raws, len(p.valuePaths))
 	// A compacted scan already holds every candidate's address, so a worker
 	// takes its slice of them; an uncompacted one expands its own mask window
@@ -410,28 +447,47 @@ func (sw *scanWorker) filterSnapshot() {
 	// serial pass over the whole collection performed only to enable one.
 	var span []store.Location
 	if masks != nil {
-		sw.locs = expandMasks(sw.locs[:0], masks[sw.maskLo:sw.maskHi])
+		var err error
+		sw.locs, err = expandMasks(sw.locs[:0], masks[sw.maskLo:sw.maskHi], sw.cancel)
+		if err != nil {
+			sw.err = err
+			return
+		}
 		span = sw.locs
 	} else {
 		span = sw.addresses[sw.lo:sw.hi]
 	}
 	textNeed := 0
-	for _, c := range p.filterCols {
+	for at, c := range p.filterCols {
+		if err := cancellationCheckpoint(sw.cancel, at); err != nil {
+			sw.err = err
+			return
+		}
 		raws, err := snapshot.AppendPointerRows(sw.raws[c][:0], span, p.valuePaths[c].pointerForStore())
 		if err != nil {
 			sw.err = err
 			return
 		}
 		sw.raws[c] = raws
-		textNeed += escapedTextBytes(raws)
+		escaped, err := escapedTextBytesCancelable(raws, sw.cancel)
+		if err != nil {
+			sw.err = err
+			return
+		}
+		textNeed += escaped
 	}
-	sw.classifyAndSelect(p, ctx, textNeed)
+	if err := sw.classifyAndSelect(p, ctx, textNeed); err != nil {
+		sw.err = err
+	}
 }
 
 // expandMasks writes one address per live slot, in the stable chunk/slot order
 // that defines a snapshot scan's row numbering.
-func expandMasks(dst []store.Location, masks []store.Mask) []store.Location {
-	for _, mask := range masks {
+func expandMasks(dst []store.Location, masks []store.Mask, cancel *CancelFlag) ([]store.Location, error) {
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return dst, err
+		}
 		for word := mask.Bits; word != 0; word &= word - 1 {
 			dst = append(dst, store.Location{
 				Chunk: mask.Chunk,
@@ -439,31 +495,56 @@ func expandMasks(dst []store.Location, masks []store.Mask) []store.Location {
 			})
 		}
 	}
-	return dst
+	return dst, cancellationError(cancel)
 }
 
 // classifyAndSelect is the half of a worker's job that does not depend on where
 // the raw values came from: classify them into this worker's own text arena,
 // writing into this worker's range of the shared columns, then reduce that
 // range to the rows WHERE accepts.
-func (sw *scanWorker) classifyAndSelect(p *plan, ctx *execCtx, textNeed int) {
+func (sw *scanWorker) classifyAndSelect(p *plan, ctx *execCtx, textNeed int) error {
 	sw.text = sw.text[:0]
+	if sw.work != nil {
+		if err := sw.work.admitDecodedText(textNeed); err != nil {
+			return err
+		}
+	}
 	if cap(sw.text) < textNeed {
 		sw.text = make([]byte, 0, growCap(cap(sw.text), textNeed))
+	}
+	if sw.cancel == nil {
+		for _, c := range p.filterCols {
+			col := ctx.values[c]
+			for j, r := range sw.raws[c] {
+				col[sw.lo+j] = classifyRawInto(r, &sw.text)
+			}
+		}
+		if out, ok := p.where.selectSpan(sw.selected, ctx.values, sw.lo, sw.hi); ok {
+			sw.selected = out
+			return nil
+		}
+		for row := sw.lo; row < sw.hi; row++ {
+			if p.where.eval(ctx.values, row, &sw.eval) {
+				sw.selected = append(sw.selected, row)
+			}
+		}
+		return sw.eval.firstError()
 	}
 	for _, c := range p.filterCols {
 		col := ctx.values[c]
 		for j, r := range sw.raws[c] {
+			if err := cancellationCheckpoint(sw.cancel, j); err != nil {
+				return err
+			}
 			col[sw.lo+j] = classifyRawInto(r, &sw.text)
 		}
 	}
-	if out, ok := p.where.selectSpan(sw.selected, ctx.values, sw.lo, sw.hi); ok {
-		sw.selected = out
-		return
+	var err error
+	sw.selected, err = selectSpanCancelable(
+		p.where, sw.selected, ctx.values, sw.lo, sw.hi, &sw.eval, sw.cancel,
+	)
+	if err != nil {
+		return err
 	}
-	for row := sw.lo; row < sw.hi; row++ {
-		if p.where.eval(ctx.values, row, &sw.eval) {
-			sw.selected = append(sw.selected, row)
-		}
-	}
+	return sw.eval.firstError()
 }

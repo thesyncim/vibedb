@@ -1,26 +1,38 @@
-// Package pgwire serves vibejson's SQL surface over the PostgreSQL frontend
+// Package pgwire serves vibedb's SQL surface over the PostgreSQL frontend
 // and backend protocol, version 3.0, implemented from the specification.
 //
-//	db := store.NewDatabase()      // or a durable collection
-//	srv := pgwire.NewServer(pgwire.FromDatabase(db), pgwire.Options{})
+//	db, err := driver.Open("/data/app.vdb")
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	defer db.Close()
+//	srv, err := pgwire.NewServer(pgwire.FromSQLDatabase(db), pgwire.Options{
+//		Auth: pgwire.Trust(), // explicit; use SCRAM outside a trust boundary
+//	})
+//	if err != nil {
+//		log.Fatal(err)
+//	}
 //	ln, _ := net.Listen("tcp", "127.0.0.1:5433")
 //	go srv.Serve(ln)
 //
-// A client then connects with any PostgreSQL driver and issues SELECT
-// statements in the dialect [github.com/thesyncim/vibedb/sql] parses. It is a
-// second front door onto work that already exists: sql parses, query lowers to
-// a compiled plan, and the executor runs it. Nothing here re-implements any of
-// that, and the database/sql driver in
-// [github.com/thesyncim/vibedb/vibesql] is the same path with a different
-// door.
+// A pgx or lib/pq client then issues the bounded dialect
+// [github.com/thesyncim/vibedb/sql] parses. SQL parsing, catalog validation,
+// DDL/DML, transactions, query lowering, and execution live in one typed
+// runtime under both this adapter and database/sql. This package implements
+// protocol framing, parameter/result conversion, a bounded connect-sequence
+// compatibility shim, and PostgreSQL transaction/error state; it does not
+// duplicate the stored-row grammar or evaluator.
 //
 // # Who this is for, and who it is not for
 //
 // This server targets programmatic clients: a Go, Python, Node, or Rust driver
-// issuing SQL this engine supports. pgx v5 and lib/pq are driven against it and
-// work — see "Verified against real drivers" below. psycopg and node-postgres
-// are not tested here and are expected to work for the same reasons, which is
-// an expectation and not a measurement.
+// issuing SQL this engine supports. The in-repository suite drives the complete
+// protocol state machine over net.Pipe without depending on one client's
+// interpretation of it. A separate checked-in integration module also runs
+// unmodified pgx v5 and lib/pq clients over loopback TCP in CI. That is narrow,
+// reproducible evidence for those pinned client versions, not a general
+// PostgreSQL-compatibility guarantee. psycopg and node-postgres have not been
+// tested here.
 //
 // It does not target psql or BI tools, and that is a design decision rather
 // than an unfinished feature. Those tools do not primarily issue SQL you wrote;
@@ -48,7 +60,8 @@
 //   - Startup, including SSLRequest and GSSENCRequest (both refused in the
 //     clear), protocol version negotiation, and the parameter report.
 //   - Authentication: trust, or SCRAM-SHA-256. See "Authentication" below.
-//   - The simple query protocol, including several statements in one message.
+//   - The simple query protocol, including up to 1,024 statements in one
+//     message.
 //   - The extended query protocol: Parse, Bind, Describe, Execute, Close,
 //     Flush, Sync, with named and unnamed statements and portals, row limits
 //     and PortalSuspended, and the error state that discards messages until
@@ -65,17 +78,30 @@
 //     Bind; command.go explains why the rewrite lives here and not in the
 //     parser. Byte offsets are preserved by the rewrite, so an error's position
 //     still points into the statement the client sent.
+//   - With [FromSQLDatabase]: CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
+//     DELETE, SELECT, one declared-field inner JOIN, schema validation, exact
+//     indexes, whole-document parameters, and affected-row command tags.
+//   - Explicit BEGIN/COMMIT/ROLLBACK with ReadyForQuery I/T/E state,
+//     read-your-writes, rollback, failed-transaction behavior, read-only mode,
+//     and implicit atomic batches for non-DDL stored-row statements.
+//   - With [FromDatabase] or [FromCollection], the original read-only SELECT
+//     source remains available without opening a SQL catalog.
 //
 // # What does not work
 //
-//   - Transactions. BEGIN, COMMIT, and ROLLBACK are refused with 0A000 rather
-//     than accepted as no-ops, and ReadyForQuery therefore always reports 'I'.
-//     A no-op BEGIN would tell a client it had a transaction when it did not,
-//     which is worse than an error in both directions: a caller wrapping reads
-//     would believe in a consistency this cannot give across statements, and a
-//     caller wrapping writes would find there are no writes at all.
-//   - Writes of any kind. INSERT, UPDATE, DELETE, and every form of DDL are
-//     refused with 0A000. The store is written by the application that owns it.
+//   - DDL inside a transaction. CREATE TABLE and CREATE INDEX are atomic
+//     individually, but the catalog cannot yet publish through the transaction
+//     overlay. DDL must be the only non-empty statement in a simple Query and
+//     the only catalog execution between extended-protocol Sync points.
+//     Extended DDL publishes at Execute; if a client violates that boundary by
+//     executing a later command before Sync, the later command is refused but
+//     cannot retroactively roll back the completed DDL.
+//   - Savepoints, chained transactions, two-table writes, and isolation modes
+//     other than the runtime's REPEATABLE READ snapshot. Read-only and
+//     read-write transaction access modes are supported.
+//   - DDL/DML/transactions on [FromDatabase] and [FromCollection]. Those
+//     constructors intentionally expose read-only stores; use
+//     [FromSQLDatabase] for the writable catalog.
 //   - pg_catalog and information_schema. There are no catalog tables; see
 //     above. psql's backslash commands, JDBC's DatabaseMetaData, and ORM schema
 //     reflection all fail as a result.
@@ -83,7 +109,6 @@
 //     FETCH), SQL-level PREPARE/EXECUTE, and replication.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
-//   - Query cancellation of a running scan. See "Cancellation" below.
 //   - The SQL constructs the dialect itself refuses — subqueries, outer joins,
 //     LIKE, CASE, CAST, arithmetic, DISTINCT, set operations, window functions,
 //     and scalar functions. Each is refused by the parser with a message naming
@@ -120,33 +145,40 @@
 // Numbers keep their exact decimal spelling in both directions. A projected
 // number is sent as the document's own digits and nothing passes through
 // float64, so a 19-digit identifier survives; a bound parameter that spells a
-// JSON number is bound as an exact decimal literal. The one place float64 does
-// intrude is inside the engine, for a computed non-integer aggregate, and that
-// is noted where it happens.
+// JSON number is bound as an exact decimal literal. SUM, MIN, and MAX are exact
+// decimal reductions too. AVG emits an exact finite quotient when possible and
+// otherwise rounds once to 34 significant decimal digits, ties to even. A
+// bounded reduction that cannot retain its exact coefficient returns an error
+// instead of silently narrowing through float64.
 //
-// # Verified against real drivers
+// # Driver compatibility evidence
 //
-// pgx v5 and lib/pq are driven against this server outside the repository, so
-// neither reaches the root module's dependency set. Both connect (pgx over
-// SCRAM-SHA-256), prepare, bind, describe, execute, batch, and read rows.
-// All five of pgx's query execution modes work, including the simple-protocol
-// one. lib/pq reports the column types as JSON and INT8 through
-// database/sql's ColumnType, and its Begin fails with 0A000 as intended.
+// The package tests verify startup, SCRAM, simple and extended query flows,
+// pipelining and resynchronization, cancellation framing, every emitted type
+// and format, and client connect-sequence shims directly at the protocol
+// boundary. The nested integration/pgclient module is deliberately outside the
+// root dependency graph and imports pinned pgx v5 and lib/pq releases. CI runs
+// it once on ubuntu-latest against a real loopback listener. Its gate covers
+// SCRAM startup; CREATE TABLE and CREATE INDEX; whole-document and flat
+// writes; schema and duplicate-key SQLSTATEs; pgx named prepared statements;
+// a declared-field JOIN; lib/pq database/sql transactions; rollback,
+// read-your-writes, and commit; JSON string framing; exact transport of a
+// 19-digit number; graceful closes; and catalog reopen persistence.
 //
-// One measured result deserves repeating because it is the type mapping's real
-// cost. A 19-digit integer arrives on the wire as its exact digits, and pgx
-// scanning it into a string returns those digits; pgx scanning the same column
-// into an any returns 9.007199254740992e+15, because encoding/json decodes a
-// bare number into a float64. The wire is exact and the client's decoder is
-// not, and the fix on every client is to read the column as text or as a
-// deferred JSON value.
+// One result from that automated check is important to the type contract.
+// A 19-digit integer arrives on the wire as its exact digits. A JSON codec that
+// decodes a bare number into float64 can narrow it afterwards; the wire did
+// not. Read exact identifiers as raw JSON text or a deferred JSON value.
 //
 // # Bound parameters
 //
-// A placeholder in this dialect has no type — it compares against whatever the
-// path holds — so ParameterDescription reports every parameter as unspecified,
-// which is what makes most clients send parameters in text format with no
-// declared OID. Such a parameter is read as a JSON scalar: 21 binds as the
+// Scalar placeholders have no inferred type — they compare against whatever
+// the path holds — so ParameterDescription reports zero for an unspecified
+// scalar position. The typed runtime identifies whole-document INSERT/UPDATE
+// positions, and those default to json (OID 114), allowing pgx and similar
+// clients to choose an object/array-capable encoder without guessing. OIDs
+// explicitly declared in Parse are preserved in wire-parameter order. An
+// unspecified scalar text parameter is read as a JSON scalar: 21 binds as the
 // number 21, true as a boolean, null as SQL NULL, and anything else as a
 // string.
 //
@@ -154,15 +186,27 @@
 // binding the *string* "21" against a string-valued path matches nothing,
 // because the text on the wire is the same as the number's. Declare the
 // parameter's OID in Parse (pgx does this when it knows the Go type) or bind in
-// binary with a declared OID, and the ambiguity is gone. extended.go explains
-// why the opposite default — every untyped parameter is a string — is worse.
+// binary with a declared OID, and the ambiguity is gone. Declared json/jsonb
+// parameters in scalar positions use strict JSON scalar semantics, including
+// quoted-string unescaping; arrays and objects are refused there because
+// predicates bind scalar leaves. Whole-document positions accept one complete
+// JSON value and preserve its exact bytes. Reusing one $n in both roles is a
+// 42804 datatype mismatch. extended.go explains why the opposite scalar
+// default — every untyped parameter is a string — is worse.
+//
+// The SQL parser accepts at most 65,536 placeholders in an embedded statement.
+// The PostgreSQL protocol's Bind and ParameterDescription counts are signed
+// Int16 values, so this server's protocol surface necessarily has the lower
+// ceiling of 32,767 parameters per prepared statement. Parse rejects a wider
+// statement before publishing it.
 //
 // # Authentication
 //
-// The zero [Options] authenticates nobody. That is correct for a loopback or
-// unix-socket listener inside a trust boundary and wrong for anything else; it
-// is spelled [Trust] rather than implied so that a server which authenticates
-// nobody is a thing someone wrote down.
+// Authentication has no default: [NewServer] rejects a nil [Options.Auth].
+// [Trust] is correct for a loopback or unix-socket listener inside a trust
+// boundary and wrong for anything else; requiring it explicitly makes a server
+// which authenticates nobody a choice someone wrote down rather than an
+// omitted production setting.
 //
 // [SCRAM] implements SCRAM-SHA-256 (RFC 5802, RFC 7677) from the standard
 // library. md5 authentication is deliberately not implemented. SCRAM-SHA-256-
@@ -175,11 +219,16 @@
 // # Concurrency
 //
 // One connection is one session with its own prepared statements, portals, and
-// [query.Exec], served by one goroutine. Nothing on the query path is shared,
-// which is what makes the engine's single-consumer contract hold without a
-// lock. Many sessions run concurrently against one [Source]; every execution
-// takes its own snapshot, and a heap database or a durable collection is safe
-// for concurrent readers by its own contract.
+// query executor, served by one goroutine. A writable source opens one typed
+// SQL Session per authenticated connection; read-only sources retain one
+// [query.Exec] per connection. Nothing single-consumer is shared, so the query
+// hot path needs no session lock. Many sessions run concurrently against one
+// [Source], with independent snapshots and transaction overlays.
+//
+// Each session runs its executor with one worker. Session concurrency already
+// supplies parallelism; inheriting query's standalone GOMAXPROCS default in
+// every admitted connection would multiply retained durable worker pools and
+// their arenas by [Options.MaxConnections].
 //
 // One consequence is visible to a client. A session has one [query.Exec], so it
 // has one live result set: a portal suspended by an Execute row limit cannot be
@@ -188,27 +237,113 @@
 // executing without a row limit, avoids it entirely, which is what every client
 // library does by default.
 //
+// Writable-catalog portals are non-holdable: Sync closes them when it commits
+// or rolls back an implicit batch, and explicit COMMIT/ROLLBACK closes them as
+// well. Prepared statements survive those boundaries. A later Execute naming
+// a closed portal receives 34000, matching the protocol object's lifetime
+// rather than retaining a durable snapshot past its transaction.
+//
+// # Shared typed runtime
+//
+// [FromSQLDatabase] borrows a [github.com/thesyncim/vibedb/sql/driver.Database].
+// Each authenticated connection opens one single-consumer typed Session.
+// Prepare parses and lowers once, exposes scalar/document parameter roles and
+// typed output metadata, and owns the reusable compiled statement. SELECT
+// fills an embedded reusable cursor of query.Cell values; DDL/DML returns one
+// affected-row result; transaction state is the source of ReadyForQuery I/T/E.
+//
+// The database/sql adapter maps this runtime to driver.Value, while this
+// package maps the cells directly to PostgreSQL formats. Keeping the typed
+// boundary below both prevents a JSON string, exact decimal, and container
+// from collapsing into indistinguishable []byte values, avoids a second parse
+// for Describe, and leaves one catalog, validation, index, mutation, and
+// transaction implementation.
+//
 // # Cancellation
 //
-// The cancel-request subprotocol is implemented — a backend key is issued, and
-// a cancel arriving on its own connection is matched to a session and delivered
-// — but what it can stop is limited by the executor, which has no cancellation
-// hook. A cancel is honoured before a statement starts executing and between
-// the statements of a multi-statement simple query. A scan already running
-// finishes.
+// The cancel-request subprotocol is implemented end to end. A backend key is
+// issued, a cancel arriving on its own connection is matched to a session, and
+// the session arms the query executor's reusable atomic CancelFlag only while
+// a Query, Execute, or transaction-finalizing Sync is active. A request which
+// arrives while the backend is idle is ignored rather than retained to cancel
+// the next command. Heap and durable scans, parallel workers, joins, filtered
+// DML, and spill I/O check the flag at bounded units of work. Cancellation
+// drains reusable pipelines, releases snapshot leases, removes spill files,
+// exposes no partial materialized result, and reports 57014. During DataRow
+// delivery it stops at the next row boundary; rows already written cannot be
+// retracted, which is ordinary PostgreSQL error-stream behavior.
 //
-// This is stated here rather than left to be discovered because the failure it
-// produces is silent: a client that cancels a slow query and receives a
-// complete result set has been misled about what happened. If you need a hard
-// bound, close the connection; [Server.Close] does that for every session.
+// Socket admission keeps a small pre-startup cushion above MaxConnections so a
+// CancelRequest has an opportunity to contend when all ordinary session slots
+// are occupied. It is deliberately described as a cushion, not a guarantee:
+// the server cannot know whether a newly accepted socket carries CancelRequest
+// or an ordinary startup packet until it reads that packet, so slow ordinary
+// startups can occupy every cushion slot. The finite default ReadTimeout bounds
+// each partial read, and SSLRequest and GSSENCRequest are each accepted at most
+// once, so negotiation cannot reset that deadline forever. Explicitly disabling
+// ReadTimeout removes the partial-read bound and can make cancel admission
+// starvation indefinite under a hostile or stalled peer.
 //
-// # Security posture of the message reader
+// Cancellation is cooperative rather than an abandoned execution goroutine.
+// Its latency is the executor's bounded checkpoint interval plus any durable
+// operation already inside one indivisible publication step. Once durable
+// publication begins it runs to completion and returns its storage outcome;
+// SQL DDL may explicitly return
+// [github.com/thesyncim/vibedb/store/durable.ErrCommitOutcomeUnknown] after a
+// namespace publication whose durability fence failed. Returning early while
+// a write continued invisibly would be less correct than surfacing that
+// outcome. In every case the cancellation signal is consumed by the operation
+// it targeted and cannot poison the next statement.
+//
+// # Protocol resource bounds and hostile input
 //
 // reader.go parses bytes chosen by an unauthenticated peer, and it is written
-// on that assumption: every allocation is bounded by a constant before a
-// peer-supplied length is used for anything, every declared element count is
-// checked against the bytes actually present, and every field accessor
-// bounds-checks and latches a failure rather than panicking. FuzzFrontendMessage
-// drives arbitrary bytes through the decoder and asserts the only two possible
-// outcomes are a decoded message and an error.
+// on that assumption. A startup packet is at most 10,000 bytes and a later
+// frontend body at most 16 MiB; every declared element count is checked against
+// the bytes actually present, and every field accessor bounds-checks and
+// latches a failure rather than panicking. Text is checked against the UTF-8
+// encoding the server reports.
+//
+// Per-message bounds are not treated as per-session bounds. Prepared names,
+// SQL, copied parameter OIDs, numbered-parameter occurrence maps and rewritten
+// SQL; parser/AST/lowered-plan shape; portal arguments; and prepared compilers'
+// bound-literal high-water storage each have aggregate session budgets.
+// Prepared shape is admitted with a fixed arena allowance plus a conservative
+// source-length multiplier covering nodes, registries, output metadata,
+// escaped literals, and geometric slack. A repeated $1 is copied, decoded, and
+// escape-scanned once for the portal, while its conservative per-occurrence
+// compiler cost is admitted before Bind succeeds. The compiler charge uses the
+// exact JSON-escaped string length and includes arena, formatting-scratch,
+// predicate, and numeric-spelling slack.
+//
+// Simple-query statement iteration is allocation-free rather than materialized
+// into a slice, and the message is capped at 1,024 statements. Preparing and
+// executing each statement retains only that statement's bounded runtime
+// objects. The no-FROM compatibility SELECT carries the SQL parser's same
+// 1,024-column limit. DataRow and RowDescription bodies are each admitted
+// against a 16 MiB bound before the writer is touched, preventing repeated
+// values or names from amplifying a small query into an overflowing or
+// partially emitted backend message.
+//
+// Each SELECT result is materialized under [Options.MaxResultRows] and
+// [Options.MaxResultBytes] before any DataRow is encoded. Their zero values
+// select finite defaults of [DefaultMaxResultRows] and
+// [DefaultMaxResultBytes]; [UnlimitedResults] is the explicit opt-out.
+// Exhaustion is reported as SQLSTATE 54000 and never emits a partial DataRow.
+// Socket admission is likewise finite by default, and read, idle, and write
+// deadlines cover startup, message reads, and every underlying socket write.
+//
+// Executor intermediates have independent finite zero-value limits as well.
+// [query.ExecOptions.MemoryBytes] admits row-proportional heap columns,
+// selections, ordering/grouping state, decoded text, join memberships, and
+// durable index-planning, batch/merge, and inner-join work. An optional durable
+// index plan whose conservative workspace bound does not fit declines to the
+// exact full scan instead of failing the statement. Exact aggregates, fan-out
+// pairs, and durable spill files have their own bounded defaults. Crossing a
+// non-optional limit is reported as SQLSTATE 54000. These are memory and
+// storage-admission bounds, independent of the cooperative cancellation
+// checkpoints described above.
+//
+// FuzzFrontendMessage drives arbitrary bytes through the decoder and asserts
+// the only two possible outcomes are a decoded message and an error.
 package pgwire

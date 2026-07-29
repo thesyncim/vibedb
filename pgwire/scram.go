@@ -9,8 +9,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Authentication: trust, and SCRAM-SHA-256 implemented from RFC 5802 and RFC
@@ -72,6 +74,10 @@ const nonceLength = 18
 // protocol, not a policy hook: adding one means adding message exchanges, and
 // there is no way for code outside this package to do that.
 type Authenticator interface {
+	// validate rejects an authenticator that cannot run safely. The interface
+	// is closed, so requiring this method makes every future mechanism state
+	// its construction invariant before NewServer can admit it.
+	validate() error
 	// authenticate runs the mechanism's exchange for user. Returning nil means
 	// the connection may proceed; the caller writes AuthenticationOk.
 	authenticate(c authConn, user string) error
@@ -99,6 +105,7 @@ func Trust() Authenticator { return trustAuth{} }
 
 type trustAuth struct{}
 
+func (trustAuth) validate() error                     { return nil }
 func (trustAuth) authenticate(authConn, string) error { return nil }
 func (trustAuth) name() string                        { return "trust" }
 
@@ -116,6 +123,13 @@ type Verifier struct {
 	serverKey  []byte
 }
 
+func (v Verifier) valid() bool {
+	return len(v.salt) >= saltLength &&
+		v.iterations >= defaultIterations &&
+		len(v.storedKey) == sha256.Size &&
+		len(v.serverKey) == sha256.Size
+}
+
 // NewVerifier derives a verifier from a cleartext password with a fresh random
 // salt.
 //
@@ -129,7 +143,7 @@ func NewVerifier(password string) (Verifier, error) {
 		return Verifier{}, err
 	}
 	salt := make([]byte, saltLength)
-	if _, err := rand.Read(salt); err != nil {
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return Verifier{}, err
 	}
 	return deriveVerifier(password, salt, defaultIterations)
@@ -161,7 +175,7 @@ func checkSASLprepSafe(password string) error {
 		return errors.New("pgwire: a SCRAM password may not be empty")
 	}
 	for i := range len(password) {
-		if c := password[i]; c < 0x21 || c > 0x7e {
+		if c := password[i]; c < 0x20 || c > 0x7e {
 			return fmt.Errorf(
 				"pgwire: this server's SCRAM implementation accepts only printable ASCII "+
 					"passwords, because it does not implement SASLprep (RFC 4013) and will not "+
@@ -175,43 +189,75 @@ func checkSASLprepSafe(password string) error {
 // lookup. An unknown user is reported by returning false, and produces a
 // mechanically identical exchange that fails at the proof.
 func SCRAM(lookup func(user string) (Verifier, bool)) Authenticator {
+	a := &scramAuth{lookup: lookup}
+	if lookup == nil {
+		// Keep construction side-effect free for an invalid configuration.
+		// NewServer reports the actionable lookup error from validate.
+		return a
+	}
 	secret := make([]byte, 32)
 	// A failure here means the system entropy source is unavailable, which is
-	// not a condition this package can proceed through: the fallback would be a
-	// predictable mock verifier, which is exactly the user-enumeration oracle
-	// the mock exists to prevent.
-	if _, err := rand.Read(secret); err != nil {
-		panic("pgwire: cannot read random bytes for SCRAM: " + err.Error())
+	// not a condition this package can proceed through. Preserve it for
+	// NewServer to report rather than panicking in a configuration constructor;
+	// a predictable fallback would be exactly the user-enumeration oracle the
+	// mock exists to prevent.
+	if _, err := io.ReadFull(rand.Reader, secret); err != nil {
+		a.initErr = err
+		return a
 	}
-	return &scramAuth{lookup: lookup, mockSecret: secret}
+	a.mockSecret = secret
+	return a
 }
 
 type scramAuth struct {
 	lookup     func(string) (Verifier, bool)
 	mockSecret []byte
+	initErr    error
 }
 
 func (*scramAuth) name() string { return "scram-sha-256" }
+
+func (a *scramAuth) validate() error {
+	if a == nil || a.lookup == nil {
+		return errors.New("pgwire: SCRAM requires a non-nil verifier lookup")
+	}
+	if a.initErr != nil {
+		return fmt.Errorf("pgwire: cannot initialize SCRAM mock authentication: %w",
+			a.initErr)
+	}
+	if len(a.mockSecret) != 32 {
+		return errors.New("pgwire: SCRAM mock-authentication secret is not initialized")
+	}
+	return nil
+}
 
 // mockVerifier fabricates a stable verifier for an unknown user, so that the
 // exchange an attacker sees is indistinguishable from one for a real user with
 // the wrong password. It is stable per server and per username because a salt
 // that changed between attempts would itself be the tell.
-func (a *scramAuth) mockVerifier(user string) Verifier {
+func (a *scramAuth) mockVerifier(user string) (Verifier, error) {
 	salt := mac(a.mockSecret, "salt:"+user)[:saltLength]
-	v, err := deriveVerifier(string(mac(a.mockSecret, "password:"+user)), salt, defaultIterations)
-	if err != nil {
-		// deriveVerifier fails only if PBKDF2 rejects its parameters, which are
-		// constants here.
-		panic("pgwire: mock verifier derivation failed: " + err.Error())
-	}
-	return v
+	return deriveVerifier(
+		string(mac(a.mockSecret, "password:"+user)), salt, defaultIterations,
+	)
 }
 
 func (a *scramAuth) authenticate(c authConn, user string) error {
+	if err := a.validate(); err != nil {
+		return fatal(sqlstateInternalError, err.Error())
+	}
+	// Derive the per-user mock on every attempt, including a known user. An
+	// unknown-only PBKDF2 would make the delay before AuthenticationSASL a
+	// direct user-enumeration oracle: known users would use their precomputed
+	// verifier while unknown users paid 4096 rounds here.
+	mock, err := a.mockVerifier(user)
+	if err != nil {
+		return fatal(sqlstateInternalError,
+			"pgwire: cannot derive a SCRAM mock verifier: "+err.Error())
+	}
 	verifier, known := a.lookup(user)
-	if !known || verifier.iterations == 0 {
-		verifier = a.mockVerifier(user)
+	if !known || !verifier.valid() {
+		verifier = mock
 		known = false
 	}
 
@@ -284,7 +330,7 @@ func mac(key []byte, text string) []byte {
 
 func newNonce() (string, error) {
 	b := make([]byte, nonceLength)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
@@ -349,17 +395,59 @@ func parseClientFirst(msg string) (clientFirst, error) {
 	default:
 		return clientFirst{}, malformedSCRAM()
 	}
-	if authzid != "" && !strings.HasPrefix(authzid, "a=") {
-		return clientFirst{}, malformedSCRAM()
+	if authzid != "" {
+		if !strings.HasPrefix(authzid, "a=") || !validSCRAMName(authzid[2:], false) {
+			return clientFirst{}, malformedSCRAM()
+		}
+		// Authentication identities come from the startup packet. Silently
+		// accepting a distinct GS2 authorization identity would tell the client
+		// that an authorization decision happened when this server has no such
+		// policy layer.
+		return clientFirst{}, fatal(sqlstateFeatureNotSupported,
+			"SCRAM authorization identities are not supported")
 	}
 	first := clientFirst{gs2Header: flag + "," + authzid + ",", bare: bare}
-	for _, attr := range strings.Split(bare, ",") {
-		if strings.HasPrefix(attr, "r=") {
-			first.nonce = attr[2:]
-		}
+
+	attrs := scramAttributeScanner{text: bare}
+	name, username, err := attrs.next()
+	if err != nil {
+		return clientFirst{}, scramAttributeError(name, err)
 	}
-	if first.nonce == "" {
+	if name == 'm' {
+		return clientFirst{}, unsupportedSCRAMMandatoryExtension()
+	}
+	// PostgreSQL clients commonly leave n= empty because the protocol startup
+	// packet already carries the authentication identity. A non-empty spelling
+	// must nevertheless obey SCRAM's =2C/=3D name escaping.
+	if name != 'n' || !validSCRAMName(username, true) {
 		return clientFirst{}, malformedSCRAM()
+	}
+	name, nonce, err := attrs.next()
+	if err != nil {
+		return clientFirst{}, scramAttributeError(name, err)
+	}
+	if name == 'm' {
+		return clientFirst{}, unsupportedSCRAMMandatoryExtension()
+	}
+	if name != 'r' || !validSCRAMNonce(nonce) {
+		return clientFirst{}, malformedSCRAM()
+	}
+	first.nonce = nonce
+	for {
+		var value string
+		name, value, err = attrs.next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return clientFirst{}, scramAttributeError(name, err)
+		}
+		if name == 'm' {
+			return clientFirst{}, unsupportedSCRAMMandatoryExtension()
+		}
+		if isDefinedSCRAMAttribute(name) || value == "" {
+			return clientFirst{}, malformedSCRAM()
+		}
 	}
 	return first, nil
 }
@@ -374,39 +462,167 @@ func parseClientFirst(msg string) (clientFirst, error) {
 // offered channel binding, and comparing the two is how the mismatch surfaces.
 func parseClientFinal(msg, expectedNonce, gs2Header string) (proof []byte, withoutProof string, err error) {
 	cut := strings.LastIndex(msg, ",p=")
-	if cut < 0 {
+	if cut < 0 || cut+3 == len(msg) {
 		return nil, "", malformedSCRAM()
 	}
 	withoutProof = msg[:cut]
-	proof, decodeErr := base64.StdEncoding.DecodeString(msg[cut+3:])
-	if decodeErr != nil {
+
+	attrs := scramAttributeScanner{text: withoutProof}
+	name, binding, scanErr := attrs.next()
+	if scanErr != nil {
+		return nil, "", scramAttributeError(name, scanErr)
+	}
+	if name == 'm' {
+		return nil, "", unsupportedSCRAMMandatoryExtension()
+	}
+	if name != 'c' || binding == "" {
 		return nil, "", malformedSCRAM()
 	}
-	var sawBinding, sawNonce bool
-	for _, attr := range strings.Split(withoutProof, ",") {
-		switch {
-		case strings.HasPrefix(attr, "c="):
-			want := base64.StdEncoding.EncodeToString([]byte(gs2Header))
-			if attr[2:] != want {
-				return nil, "", fatal(sqlstateInvalidAuthorization,
-					"the SCRAM channel-binding header the client echoed does not match the one "+
-						"it sent, which is what a stripped-mechanism downgrade looks like")
+	wantBinding := base64.StdEncoding.EncodeToString([]byte(gs2Header))
+	if binding != wantBinding {
+		return nil, "", fatal(sqlstateInvalidAuthorization,
+			"the SCRAM channel-binding header the client echoed does not match the one "+
+				"it sent, which is what a stripped-mechanism downgrade looks like")
+	}
+
+	name, nonce, scanErr := attrs.next()
+	if scanErr != nil {
+		return nil, "", scramAttributeError(name, scanErr)
+	}
+	if name == 'm' {
+		return nil, "", unsupportedSCRAMMandatoryExtension()
+	}
+	if name != 'r' || !validSCRAMNonce(nonce) {
+		return nil, "", malformedSCRAM()
+	}
+	// Compared in constant time because it is a value derived from a secret
+	// exchange, and because there is no reason not to.
+	if subtle.ConstantTimeCompare([]byte(nonce), []byte(expectedNonce)) != 1 {
+		return nil, "", fatal(sqlstateInvalidAuthorization,
+			"the SCRAM nonce the client returned is not the one this server issued")
+	}
+
+	for {
+		var value string
+		name, value, scanErr = attrs.next()
+		if errors.Is(scanErr, io.EOF) {
+			break
+		}
+		if scanErr != nil {
+			return nil, "", scramAttributeError(name, scanErr)
+		}
+		switch name {
+		case 'm':
+			return nil, "", unsupportedSCRAMMandatoryExtension()
+		case 'p':
+			// LastIndex above locates the real final proof, so seeing another
+			// proof here means the client sent it outside its designated slot.
+			return nil, "", malformedSCRAM()
+		default:
+			// Every attribute defined by RFC 5802 has one designated position;
+			// only as-yet unassigned names are optional extensions.
+			if isDefinedSCRAMAttribute(name) || value == "" {
+				return nil, "", malformedSCRAM()
 			}
-			sawBinding = true
-		case strings.HasPrefix(attr, "r="):
-			// Compared in constant time because it is a value derived from a
-			// secret exchange, and because there is no reason not to.
-			if subtle.ConstantTimeCompare([]byte(attr[2:]), []byte(expectedNonce)) != 1 {
-				return nil, "", fatal(sqlstateInvalidAuthorization,
-					"the SCRAM nonce the client returned is not the one this server issued")
-			}
-			sawNonce = true
 		}
 	}
-	if !sawBinding || !sawNonce {
+
+	proof, decodeErr := base64.StdEncoding.Strict().DecodeString(msg[cut+3:])
+	if decodeErr != nil || len(proof) == 0 {
 		return nil, "", malformedSCRAM()
 	}
 	return proof, withoutProof, nil
+}
+
+// scramAttributeScanner walks an RFC 5802 attribute list without materializing
+// a []string. Attribute names are one ASCII letter, and a name may appear at
+// most once in a message. The caller enforces message-specific order: n,r for
+// client-first and c,r for client-final, with optional extensions afterwards.
+type scramAttributeScanner struct {
+	text string
+	pos  int
+	seen [256]bool
+}
+
+func (s *scramAttributeScanner) next() (name byte, value string, err error) {
+	if s.pos == len(s.text) {
+		return 0, "", io.EOF
+	}
+	start := s.pos
+	end := len(s.text)
+	if comma := strings.IndexByte(s.text[start:], ','); comma >= 0 {
+		end = start + comma
+		s.pos = end + 1
+		if s.pos == len(s.text) {
+			return 0, "", malformedSCRAM()
+		}
+	} else {
+		s.pos = len(s.text)
+	}
+	attr := s.text[start:end]
+	if len(attr) < 2 || attr[1] != '=' || !isSCRAMAttributeName(attr[0]) ||
+		!utf8.ValidString(attr) || strings.IndexByte(attr[2:], 0) >= 0 {
+		return 0, "", malformedSCRAM()
+	}
+	name = attr[0]
+	if s.seen[name] {
+		return name, "", malformedSCRAM()
+	}
+	s.seen[name] = true
+	return name, attr[2:], nil
+}
+
+func isSCRAMAttributeName(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+func isDefinedSCRAMAttribute(c byte) bool {
+	switch c {
+	case 'a', 'c', 'e', 'i', 'm', 'n', 'p', 'r', 's', 'v':
+		return true
+	}
+	return false
+}
+
+func validSCRAMNonce(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := range len(value) {
+		if value[i] < 0x21 || value[i] > 0x7e || value[i] == ',' {
+			return false
+		}
+	}
+	return true
+}
+
+func validSCRAMName(value string, emptyOK bool) bool {
+	if value == "" {
+		return emptyOK
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] != '=' {
+			continue
+		}
+		if i+2 >= len(value) ||
+			value[i+1:i+3] != "2C" && value[i+1:i+3] != "3D" {
+			return false
+		}
+		i += 2
+	}
+	return true
+}
+
+func scramAttributeError(name byte, err error) error {
+	if name == 'm' {
+		return unsupportedSCRAMMandatoryExtension()
+	}
+	return err
+}
+
+func unsupportedSCRAMMandatoryExtension() error {
+	return fatal(sqlstateFeatureNotSupported,
+		"SCRAM mandatory extensions are not supported")
 }
 
 func malformedSCRAM() error {
