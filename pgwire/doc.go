@@ -25,25 +25,25 @@
 //
 // # Who this is for, and who it is not for
 //
-// This server targets programmatic clients: a Go, Python, Node, or Rust driver
-// issuing SQL this engine supports. The in-repository suite drives the complete
-// protocol state machine over net.Pipe without depending on one client's
-// interpretation of it. A separate checked-in integration module also runs
-// unmodified pgx v5 and lib/pq clients over loopback TCP in CI. That is narrow,
-// reproducible evidence for those pinned client versions, not a general
+// This server targets programmatic clients—a Go, Python, Node, or Rust driver
+// issuing SQL this engine supports—and stock psql for direct SQL sessions. The
+// in-repository suite drives the complete protocol state machine over net.Pipe
+// without depending on one client's interpretation of it. A separate
+// checked-in integration module also runs unmodified pgx v5 and lib/pq clients
+// over loopback TCP and the official PostgreSQL 18.4 psql client in CI. That is
+// narrow, reproducible evidence for those pinned client versions, not a general
 // PostgreSQL-compatibility guarantee. psycopg and node-postgres have not been
 // tested here.
 //
-// It does not target psql or BI tools, and that is a design decision rather
-// than an unfinished feature. Those tools do not primarily issue SQL you wrote;
-// they issue SQL they generate against pg_catalog. A single psql "\d users"
+// Catalog-driven tooling remains deliberately out of scope. A psql "\d users"
 // expands to a query that joins pg_class to pg_namespace with a LEFT JOIN,
 // filters with a subquery, casts with ::regclass, calls scalar functions like
 // pg_table_is_visible and format_type, and tests membership with ANY over an
-// array — every one of which this dialect refuses on purpose, because the
+// array—every one of which this dialect refuses on purpose, because the
 // executor has no operator for any of them. The same is true of JDBC's
 // DatabaseMetaData, of every ORM's schema reflection, and of every BI tool's
-// table browser.
+// table browser. Direct SQL and client-side commands that do not issue
+// unsupported SQL, such as "\q", work; catalog-backed psql commands do not.
 //
 // The refusal is checked rather than asserted: TestCatalogQueriesAreRefused
 // feeds real psql, JDBC, and information_schema probes to the parser and logs
@@ -158,12 +158,14 @@
 // and format, and client connect-sequence shims directly at the protocol
 // boundary. The nested integration/pgclient module is deliberately outside the
 // root dependency graph and imports pinned pgx v5 and lib/pq releases. CI runs
-// it once on ubuntu-latest against a real loopback listener. Its gate covers
-// SCRAM startup; CREATE TABLE and CREATE INDEX; whole-document and flat
-// writes; schema and duplicate-key SQLSTATEs; pgx named prepared statements;
-// a declared-field JOIN; lib/pq database/sql transactions; rollback,
-// read-your-writes, and commit; JSON string framing; exact transport of a
-// 19-digit number; graceful closes; and catalog reopen persistence.
+// those clients and an official, digest-pinned PostgreSQL 18.4 psql client
+// against a real TCP listener. Its gates cover encryption refusal and cleartext
+// fallback; SCRAM startup; CREATE TABLE and CREATE INDEX; whole-document and
+// flat writes; schema and duplicate-key SQLSTATEs; recovery after a
+// simple-query error; pgx named prepared statements; a declared-field JOIN;
+// lib/pq database/sql transactions; rollback, read-your-writes, and commit;
+// JSON string framing; exact transport of a 19-digit number; graceful closes;
+// and catalog reopen persistence.
 //
 // One result from that automated check is important to the type contract.
 // A 19-digit integer arrives on the wire as its exact digits. A JSON codec that
