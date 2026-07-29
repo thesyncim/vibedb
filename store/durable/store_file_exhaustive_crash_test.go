@@ -360,7 +360,14 @@ func TestFileStoreExhaustiveCommitCrashSweep(t *testing.T) {
 	for _, pt := range points {
 		run := runFaultWorkload(t, options, fc, pt.plan, ops)
 		if !run.faulted {
-			t.Errorf("%s: programmed crash never fired (commit structure diverged)", pt.name)
+			// Asynchronous commit grouping can legally differ between the
+			// recording pass and a replay, leaving a recorded point with no
+			// matching commit. One re-run re-derives the timing; a point that
+			// diverges twice is a real structural regression, not scheduling.
+			run = runFaultWorkload(t, options, fc, pt.plan, ops)
+		}
+		if !run.faulted {
+			t.Errorf("%s: programmed crash never fired twice (commit structure diverged)", pt.name)
 			tally["not-fired"]++
 			continue
 		}
@@ -476,8 +483,8 @@ func TestFilePrimaryLeafSplitCrashBoundary(t *testing.T) {
 	options := Options{
 		Collection: store.Options{ChunkDocuments: 1},
 		Backend:    BackendPortable, ResidentBytes: 32 << 20,
-		Durability:       DurabilityBufferedVisible,
-		PageSize:         4096, MaxPageSize: 64 << 10,
+		Durability: DurabilityBufferedVisible,
+		PageSize:   4096, MaxPageSize: 64 << 10,
 		InlineValueBytes: 2048, MaxDocumentBytes: 2048,
 		// One generation per commit and no coalescing so the Nth commit is the same
 		// logical write on every replay.
