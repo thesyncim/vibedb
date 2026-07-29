@@ -86,7 +86,8 @@ go func() { log.Print(srv.Serve(ln)) }()
 
 pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
 parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
-`SELECT`, inner and left joins, prepared statements, and explicit transactions. Stock
+`SELECT`, uncorrelated predicate subqueries, inner and left joins, prepared
+statements, and explicit transactions. Stock
 `psql` can connect and issue the same supported direct SQL. Whole-document
 parameters are described as PostgreSQL `json`; projected JSON values preserve
 their exact wire spelling. `INSERT ... RETURNING` supports projected JSON paths

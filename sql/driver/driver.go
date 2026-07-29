@@ -340,7 +340,7 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	}
 	if tree.Kind.IsQuery() {
 		s.query, err = query.PrepareParsedStatement(src, tree.Select)
-		if err == nil && s.query.NumJoins() != 0 {
+		if err == nil && s.query.RequiresCatalog() {
 			s.joinNames = joinTableNames(tree.Select)
 		} else if err == nil {
 			if lockErr := rlockContext(ctx, &c.db.mu); lockErr != nil {

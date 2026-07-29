@@ -25,6 +25,9 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"filtered", benchFiltered},
 		{"join", benchJoin},
 		{"left join", benchLeftJoin},
+		{"subqueries", `SELECT id FROM orders WHERE customer IN (` +
+			`SELECT id FROM customers WHERE tier = ?) AND ` +
+			`EXISTS (SELECT 1 FROM regions WHERE active = TRUE)`},
 		{"grouped aggregate", benchGrouped},
 		{"containment and membership", benchRich},
 	}

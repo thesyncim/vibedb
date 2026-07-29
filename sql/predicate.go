@@ -147,7 +147,7 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	case p.tok.kind == tokLParen:
 		p.advance()
 		if p.atKeyword(kwSelect) {
-			return nil, p.errHere("subqueries are not supported: the engine executes one plan and has no nested execution")
+			return nil, p.errHere("a SELECT subquery cannot stand alone as a condition; use EXISTS (SELECT ...)")
 		}
 		inner, err := p.parseOr(ctx)
 		if err != nil {
@@ -158,7 +158,18 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		}
 		return inner, nil
 	case p.atKeyword(kwExists):
-		return nil, p.errHere("EXISTS is not supported: it takes a subquery, which the engine cannot execute; to test whether a field is present write `path IS NOT MISSING`")
+		pos := p.tok.pos
+		p.advance()
+		if err := p.expect(tokLParen, "'(' after EXISTS"); err != nil {
+			return nil, err
+		}
+		sub, err := p.parseSubquery(true)
+		if err != nil {
+			return nil, err
+		}
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprExists, Column: -1, Subquery: sub, Pos: pos}
+		return e, nil
 	case p.atKeyword(kwCase):
 		return nil, p.errHere("CASE expressions are not supported: the engine evaluates predicates, not computed values")
 	case p.atKeyword(kwCast):
@@ -228,6 +239,19 @@ func (p *Parser) parseLeafTail(agg AggKind, path *PathExpr, pos int) (*Expr, err
 		return nil, p.errHere("expected a comparison operator, IS, IN, BETWEEN, or @> after a path; a bare path is not a condition, so a boolean field is tested as `flag = TRUE`")
 	}
 	p.advance()
+	if p.tok.kind == tokLParen {
+		p.advance()
+		if p.atKeyword(kwSelect) {
+			sub, err := p.parseSubquery(false)
+			if err != nil {
+				return nil, err
+			}
+			e := p.exprs.one()
+			*e = Expr{Kind: ExprCompare, Op: op, Agg: agg, Column: -1, Path: path, Subquery: sub, Pos: pos}
+			return e, nil
+		}
+		return nil, p.errHere("a comparison parenthesis must contain a SELECT subquery")
+	}
 	value, err := p.parseOperand()
 	if err != nil {
 		return nil, err
@@ -262,7 +286,13 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 		return nil, err
 	}
 	if p.atKeyword(kwSelect) {
-		return nil, p.errHere("IN (SELECT ...) is not supported: the engine has no nested execution")
+		sub, err := p.parseSubquery(false)
+		if err != nil {
+			return nil, err
+		}
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprIn, Negated: negated, Agg: agg, Column: -1, Path: path, Subquery: sub, Pos: pos}
+		return e, nil
 	}
 	if p.tok.kind == tokRParen {
 		return nil, p.errHere("IN () has no alternatives; an empty membership matches nothing, so the statement is a mistake rather than a filter")
@@ -289,6 +319,125 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 	e := p.exprs.one()
 	*e = Expr{Kind: ExprIn, Negated: negated, Agg: agg, Column: -1, Path: path, List: list, Pos: pos}
 	return e, nil
+}
+
+// parseSubquery parses a SELECT beginning at the current token and consumes
+// the ')' belonging to its caller.
+//
+// A child Parser is intentional. A nested statement has its own FROM scope and
+// its tree must remain live beside the outer tree; sharing the outer clause
+// scratch would either overwrite the outer SELECT list or require copying the
+// whole tree. Child parsers retain and refill their arenas, so after a warm-up
+// the shape remains allocation-free.
+func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
+	start := p.tok.pos
+	if p.nesting >= maxSubqueryDepth {
+		return nil, p.errfAt(start,
+			"subqueries nest deeper than %d levels", maxSubqueryDepth)
+	}
+	depth := 0
+	end := -1
+	for {
+		switch p.tok.kind {
+		case tokEOF:
+			return nil, p.errHere("unterminated subquery: expected ')'")
+		case tokError:
+			return nil, p.errHere(p.tok.text)
+		case tokLParen:
+			depth++
+		case tokRParen:
+			if depth == 0 {
+				end = p.tok.pos
+			} else {
+				depth--
+			}
+		}
+		if end >= 0 {
+			break
+		}
+		p.advance()
+	}
+	if p.nested == nil {
+		p.nested = new(nestedParsers)
+	}
+	if p.nested.used == len(p.nested.parsers) {
+		p.nested.parsers = append(p.nested.parsers, new(Parser))
+	}
+	child := p.nested.parsers[p.nested.used]
+	p.nested.used++
+	sub := &child.sel
+	child.existsProjection = exists
+	child.nesting = p.nesting + 1
+	if err := child.Parse(sub, p.lx.src[start:end]); err != nil {
+		child.existsProjection = false
+		if pe, ok := err.(*ParseError); ok {
+			return nil, newParseError(p.lx.src, start+pe.Pos, pe.Msg)
+		}
+		return nil, err
+	}
+	child.existsProjection = false
+	if p.params+sub.Params > maxParams {
+		return nil, p.errfAt(start, "a statement may hold at most %d placeholders", maxParams)
+	}
+	sub.ParamBase = p.params
+	p.params += sub.Params
+	shiftSelectPositions(sub, start)
+	p.advance() // consume the caller's ')'
+	return sub, nil
+}
+
+func shiftSelectPositions(s *SelectStmt, delta int) {
+	for i := range s.Columns {
+		s.Columns[i].Pos += delta
+		shiftPathPosition(s.Columns[i].Path, delta)
+	}
+	for i := range s.From {
+		s.From[i].Pos += delta
+		if s.From[i].On != nil {
+			s.From[i].On.Pos += delta
+			shiftPathPosition(s.From[i].On.Left, delta)
+			shiftPathPosition(s.From[i].On.Right, delta)
+		}
+	}
+	shiftExprPositions(s.Where, delta)
+	for _, path := range s.GroupBy {
+		shiftPathPosition(path, delta)
+	}
+	shiftExprPositions(s.Having, delta)
+	for i := range s.OrderBy {
+		s.OrderBy[i].Pos += delta
+		shiftPathPosition(s.OrderBy[i].Path, delta)
+	}
+	if s.Limit != nil {
+		s.Limit.Pos += delta
+	}
+	if s.Offset != nil {
+		s.Offset.Pos += delta
+	}
+}
+
+func shiftPathPosition(path *PathExpr, delta int) {
+	if path != nil {
+		path.Pos += delta
+	}
+}
+
+func shiftExprPositions(e *Expr, delta int) {
+	if e == nil {
+		return
+	}
+	e.Pos += delta
+	shiftPathPosition(e.Path, delta)
+	e.Value.Pos += delta
+	for i := range e.List {
+		e.List[i].Pos += delta
+	}
+	for _, kid := range e.Kids {
+		shiftExprPositions(kid, delta)
+	}
+	if e.Subquery != nil {
+		shiftSelectPositions(e.Subquery, delta)
+	}
 }
 
 // parseBetweenTail parses BETWEEN lo AND hi. The AND belongs to BETWEEN, not to

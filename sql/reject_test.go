@@ -106,9 +106,7 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"LIKE", `SELECT a FROM t WHERE b LIKE 'x%'`, 24, "no pattern operator"},
 		{"ILIKE", `SELECT a FROM t WHERE b ILIKE 'x%'`, 24, "no pattern operator"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
-		{"EXISTS", `SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)`, 22, "IS NOT MISSING"},
-		{"a scalar subquery", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "subqueries are not supported"},
-		{"IN with a subquery", `SELECT a FROM t WHERE b IN (SELECT c FROM u)`, 28, "no nested execution"},
+		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"a subquery in FROM", `SELECT a FROM (SELECT b FROM u)`, 14, "subqueries are not supported"},
 		{"CASE", `SELECT a FROM t WHERE CASE WHEN b THEN 1 END = 1`, 22, "CASE"},
 		{"CAST", `SELECT a FROM t WHERE CAST(b AS text) = 1`, 22, "CAST"},
@@ -276,6 +274,17 @@ func TestRejectsExcessiveNesting(t *testing.T) {
 	}
 	if !strings.Contains(parseErr.Msg, "nests deeper") {
 		t.Fatalf("Parse(deeply nested) said %q, want it to mention the nesting bound", parseErr.Msg)
+	}
+}
+
+func TestRejectsExcessiveSubqueryNesting(t *testing.T) {
+	src := strings.Repeat(
+		`SELECT a FROM t WHERE EXISTS (`, maxSubqueryDepth+1,
+	) + `SELECT a FROM t` +
+		strings.Repeat(`)`, maxSubqueryDepth+1)
+	_, err := Parse(src)
+	if err == nil || !strings.Contains(err.Error(), "subqueries nest deeper") {
+		t.Fatalf("Parse(deep subqueries) = %v, want bounded-depth rejection", err)
 	}
 }
 

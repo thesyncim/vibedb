@@ -52,6 +52,22 @@ type Source struct {
 	name    string
 }
 
+func (s Source) subquerySource(outer, collection string) (Source, error) {
+	switch s.kind {
+	case sourceDatabase:
+		return FromDatabase(s.catalog, collection), nil
+	case sourceFileDatabase:
+		return FromFileDatabase(s.files, collection), nil
+	case sourceHeapSnapshot, sourceFileSnapshot, sourceSegment:
+		if collection == outer {
+			return s, nil
+		}
+	}
+	return Source{}, fmt.Errorf(
+		"query: subquery reads collection %q beside %q, so both must come from one database snapshot; use FromDatabase or FromFileDatabase",
+		collection, outer)
+}
+
 // FromSegment names an in-memory [store.Segment]. The Segment is not modified by
 // execution, and projected result cells borrow its bytes.
 func FromSegment(s *store.Segment) Source {

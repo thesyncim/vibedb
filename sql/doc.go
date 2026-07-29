@@ -55,12 +55,12 @@
 //	disjunction  = conjunction { "OR" conjunction } ;
 //	conjunction  = negation { "AND" negation } ;
 //	negation     = "NOT" negation | primary ;
-//	primary      = "(" predicate ")" | leaf ;
+//	primary      = "(" predicate ")" | "EXISTS" "(" select ")" | leaf ;
 //	leaf         = left "IS" [ "NOT" ] ( "NULL" | "MISSING" )
-//	             | left [ "NOT" ] "IN" "(" operand { "," operand } ")"
+//	             | left [ "NOT" ] "IN" "(" ( select | operand { "," operand } ) ")"
 //	             | left [ "NOT" ] "BETWEEN" operand "AND" operand
 //	             | left "@>" json-document
-//	             | left comparison operand ;
+//	             | left comparison ( operand | "(" select ")" ) ;
 //	left         = path | aggregate ;          (* aggregate only in HAVING *)
 //	comparison   = "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ;
 //	operand      = string | number | "TRUE" | "FALSE" | "?" ;
@@ -189,9 +189,8 @@
 // and a path holding an explicit null identically, and IS NULL is true for
 // both. SQL has no notion of an absent column at all. The distinction is
 // available as "IS [NOT] MISSING", which is this dialect's spelling of the
-// engine's existence test; it is spelled that way rather than as EXISTS(path)
-// because EXISTS takes a subquery in SQL, and that spelling is reserved for
-// refusing subqueries with an accurate message.
+// engine's field-existence test; it is spelled that way because EXISTS takes a
+// SELECT subquery in SQL and this dialect implements that standard meaning.
 //
 // Comparison is within type, with a cross-type total order. In SQL, comparing a
 // number column to a string is a type error or an implicit cast. Here, values
@@ -338,9 +337,9 @@
 // Each of these is refused with a message naming the missing capability:
 // SELECT DISTINCT and COUNT(DISTINCT ...) (no distinct operator); LIKE, ILIKE,
 // SIMILAR TO, and regular-expression operators (no pattern operator);
-// subqueries in any position, including EXISTS and IN (SELECT ...) (no nested
-// execution); right/full, cross, and natural joins and comma-separated FROM
-// items;
+// correlated subqueries and subqueries in FROM or the SELECT list (the nested
+// executor evaluates uncorrelated predicate subqueries once); right/full,
+// cross, and natural joins and comma-separated FROM items;
 // JOIN ... USING (schemaless documents have no declared columns to match by
 // name); set operations, common table expressions, window functions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine

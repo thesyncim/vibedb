@@ -207,6 +207,9 @@ func (p *Parser) validateHaving(grouped, hasAggregate bool) error {
 // Anything else would need a second aggregation pass, and rejecting it here is
 // the difference between an error with a position and a failure at lowering.
 func (p *Parser) bindHaving(e *Expr) error {
+	if e.Subquery != nil || e.Kind == ExprExists {
+		return p.errAt(e.Pos, "subqueries are not supported in HAVING; put the uncorrelated condition in WHERE")
+	}
 	switch e.Kind {
 	case ExprAnd, ExprOr, ExprNot:
 		for _, kid := range e.Kids {

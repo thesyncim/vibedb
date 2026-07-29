@@ -18,6 +18,11 @@ import (
 // predicate and far short of the goroutine stack limit.
 const maxExprDepth = 64
 
+// maxSubqueryDepth bounds recursive child Parser calls. Predicate parentheses
+// stay in one parser and use maxExprDepth; each nested SELECT owns a child
+// arena, so it needs a separate call-stack bound.
+const maxSubqueryDepth = 32
+
 // maxParams bounds the placeholders in one statement, so a pathological input
 // cannot make the parser mint ordinals until the arena exhausts memory. It is
 // well past any statement a driver would prepare.
@@ -119,6 +124,15 @@ type Parser struct {
 	opScratch  []Operand
 	pending    []pendingPath
 	tmp        []byte
+	// nested is allocated only when the statement contains a subquery, keeping
+	// ordinary Parser values at one pointer of added state rather than a slice.
+	nested *nestedParsers
+	// existsProjection allows SELECT 1 (and equivalent literals) only while
+	// parsing an EXISTS body. EXISTS never observes its output value, so
+	// lowering the literal to a whole-document projection avoids inventing a
+	// constant-expression executor for a value that is discarded.
+	existsProjection bool
+	nesting          int
 
 	params int
 	sized  bool
@@ -241,11 +255,19 @@ func (p *Parser) reset(src string) {
 	p.kidStack = p.kidStack[:0]
 	p.opScratch = p.opScratch[:0]
 	p.pending = p.pending[:0]
+	if p.nested != nil {
+		p.nested.used = 0
+	}
 
 	p.lx = lexer{src: src}
 	p.depth = 0
 	p.params = 0
 	p.advance()
+}
+
+type nestedParsers struct {
+	parsers []*Parser
+	used    int
 }
 
 // Release drops every chunk p retains, returning it to its zero state and
@@ -489,6 +511,18 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 
 func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	col := ResultColumn{Pos: p.tok.pos}
+	if p.existsProjection && (p.tok.kind == tokNumber ||
+		p.tok.kind == tokString ||
+		p.atKeyword(kwTrue) || p.atKeyword(kwFalse) || p.atKeyword(kwNull)) {
+		p.advance()
+		col.Path = p.newPath(col.Pos, nil, false, true)
+		alias, err := p.parseColumnAlias()
+		if err != nil {
+			return col, err
+		}
+		col.Alias = alias
+		return col, nil
+	}
 	switch agg, head, state := p.tryAggregate(); state {
 	case aggCall:
 		path, err := p.parseAggregateArgs(agg)

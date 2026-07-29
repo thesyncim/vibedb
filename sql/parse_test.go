@@ -70,6 +70,24 @@ func TestGrammarShapes(t *testing.T) {
 			want: `select path(0:a) from t where (and (in 0:tier s"pro" s"team") (notin 0:rank n1 n2))`,
 		},
 		{
+			name: "IN subquery",
+			src:  `SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
+			want: `select path(0:id) from orders where (in 0:customer (` +
+				`select path(0:id) from customers where (cmp = 0:tier ?0) params=1)) params=1`,
+		},
+		{
+			name: "EXISTS subquery with discarded literal",
+			src:  `SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
+			want: `select path(0:id) from orders where (exists (` +
+				`select path(0:) from customers where (cmp = 0:active true)))`,
+		},
+		{
+			name: "scalar subquery",
+			src:  `SELECT id FROM orders WHERE customer = (SELECT id FROM customers WHERE active = TRUE)`,
+			want: `select path(0:id) from orders where (cmp = 0:customer (` +
+				`select path(0:id) from customers where (cmp = 0:active true)))`,
+		},
+		{
 			name: "range",
 			src:  `SELECT a FROM t WHERE n BETWEEN 1 AND 9 AND m NOT BETWEEN ? AND ?`,
 			want: `select path(0:a) from t where (and (between 0:n n1 n9) (notbetween 0:m ?0 ?1)) params=2`,
