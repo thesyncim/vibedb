@@ -2,7 +2,6 @@ package orderedkey
 
 import (
 	"errors"
-	"math"
 	"strconv"
 	"unicode/utf8"
 )
@@ -12,12 +11,12 @@ import (
 // A composite key is the concatenation of independently encoded components.
 // Every component is self-delimiting in a single forward pass: null and bool
 // are one tag byte, a string ends at the unescaped 0x00,0x00 terminator, and a
-// number ends at its digit terminator after a fixed 8-byte exponent. Nothing is
-// back-loaded into a trailer, so finding component k costs a scan of components
-// 0..k-1 and never requires decoding them into values. This is the property
-// Leapfrog Triejoin needs: seek(x) and next() operate at one level by comparing
-// that level's byte span, and the span is discoverable without interpreting the
-// levels below it.
+// number ends at its digit terminator after a self-delimiting exponent. Nothing
+// is back-loaded into a trailer, so finding component k costs a scan of
+// components 0..k-1 and never requires decoding them into values. This is the
+// property Leapfrog Triejoin needs: seek(x) and next() operate at one level by
+// comparing that level's byte span, and the span is discoverable without
+// interpreting the levels below it.
 //
 // Direction is recoverable from the component itself rather than from a schema
 // the reader must carry. A descending component is the bitwise complement of
@@ -85,17 +84,21 @@ func maskAt(key []byte, off int) (tag, mask byte, err error) {
 // digitsEnd bound the encoded digit run, excluding the terminator. The exponent
 // is variable-length, so its extent is discovered by decoding its header rather
 // than by skipping a fixed width.
-func numberSpan(key []byte, i int, mask byte) (adjusted int64, digitsStart, digitsEnd, end int, err error) {
+func numberSpan(
+	key []byte,
+	i int,
+	mask byte,
+) (adjusted decodedExponent, digitsStart, digitsEnd, end int, err error) {
 	if i >= len(key) {
-		return 0, 0, 0, 0, ErrKeyTruncated
+		return decodedExponent{}, 0, 0, 0, ErrKeyTruncated
 	}
 	sign := key[i] ^ mask
 	i++
 	if sign == tagNumberZero {
-		return 0, i, i, i, nil
+		return decodedExponent{}, i, i, i, nil
 	}
 	if sign != tagNumberPositive && sign != tagNumberNegative {
-		return 0, 0, 0, 0, ErrMalformedKey
+		return decodedExponent{}, 0, 0, 0, ErrMalformedKey
 	}
 	negative := sign == tagNumberNegative
 	// A negative number carries a complemented exponent on top of whatever the
@@ -108,7 +111,7 @@ func numberSpan(key []byte, i int, mask byte) (adjusted int64, digitsStart, digi
 	}
 	adjusted, i, err = decodeExponent(key, i, expMask)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return decodedExponent{}, 0, 0, 0, err
 	}
 	digitsStart = i
 	for i < len(key) {
@@ -117,11 +120,11 @@ func numberSpan(key []byte, i int, mask byte) (adjusted int64, digitsStart, digi
 			return adjusted, digitsStart, i, i + 1, nil
 		}
 		if b < 1 || b > 10 {
-			return 0, 0, 0, 0, ErrMalformedKey
+			return decodedExponent{}, 0, 0, 0, ErrMalformedKey
 		}
 		i++
 	}
-	return 0, 0, 0, 0, ErrKeyTruncated
+	return decodedExponent{}, 0, 0, 0, ErrKeyTruncated
 }
 
 // DecodeComponent decodes the component at key[off:], appending its payload to
@@ -205,7 +208,7 @@ func decodeNumber(dst, key []byte, i int, mask byte) ([]byte, int, error) {
 	if sign == tagNumberZero {
 		return append(dst, '0'), i + 1, nil
 	}
-	adjusted, digitsStart, digitsEnd, end, err := numberSpan(key, i, mask)
+	exponent, digitsStart, digitsEnd, end, err := numberSpan(key, i, mask)
 	if err != nil {
 		return dst, 0, err
 	}
@@ -233,6 +236,24 @@ func decodeNumber(dst, key []byte, i int, mask byte) ([]byte, int, error) {
 	if negative {
 		dst = append(dst, '-')
 	}
+	if exponent.wide {
+		// 0.<digits> contributes no exponent adjustment when it is encoded,
+		// so this compact scientific spelling reproduces even an exponent far
+		// outside any machine integer without arithmetic or a temporary copy.
+		dst = append(dst, '0', '.')
+		for j := 0; j < n; j++ {
+			dst = append(dst, digit(j))
+		}
+		dst = append(dst, 'e')
+		if exponent.negative {
+			dst = append(dst, '-')
+		}
+		for j := exponent.digitsStart; j < exponent.digitsEnd; j++ {
+			dst = append(dst, key[j]^exponent.digitMask)
+		}
+		return dst, end, nil
+	}
+	adjusted := exponent.compact
 	switch {
 	case adjusted >= int64(n) && adjusted <= 21:
 		// Plain integer with trailing zeros: 0.125*10^5 is 12500.
@@ -264,17 +285,7 @@ func decodeNumber(dst, key []byte, i int, mask byte) ([]byte, int, error) {
 		// "0.<digits>e<adjusted>" rather than the more usual
 		// "<d0>.<rest>e<adjusted-1>" precisely so the exponent written out is
 		// adjusted itself: re-encoding "0.D" contributes a delta of zero, so no
-		// ±1 is needed and the text can never name an exponent one step beyond
-		// the range the encoder's exponent parser accepts. The obvious spelling
-		// underflows for adjusted == MinInt64+1, which AppendNumber can really
-		// produce from input like 0.9e-9223372036854775807.
-		//
-		// MinInt64 itself still has no representable magnitude, so it is
-		// rejected; AppendNumber refuses to build such a key for the same
-		// reason, which keeps the encodable and decodable sets identical.
-		if adjusted == math.MinInt64 {
-			return dst, 0, ErrMalformedKey
-		}
+		// ±1 is needed, including at the machine-integer boundaries.
 		dst = append(dst, '0', '.')
 		for j := 0; j < n; j++ {
 			dst = append(dst, digit(j))

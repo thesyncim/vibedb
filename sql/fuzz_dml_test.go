@@ -3,6 +3,7 @@ package sql
 import (
 	"errors"
 	"testing"
+	"unicode/utf8"
 )
 
 // FuzzParseStatement is [FuzzParseSQL] for the entry point that accepts every
@@ -19,17 +20,18 @@ import (
 //
 // The accepted-statement invariants are the ones a lowering pass relies on
 // without re-checking: that the tagged union's pointer agrees with its kind,
-// that a statement that acts on keys has no filter and one that filters has no
-// keys, and that the placeholder count matches the placeholders actually in the
-// tree. That last one is a real hazard rather than a formality: a driver
+// that an INSERT row agrees with its optional field list, and that the
+// placeholder count matches the placeholders actually in the tree. That last
+// one is a real hazard rather than a formality: a driver
 // validates its argument count against Params before it binds anything, so a
 // tree holding an ordinal past the end would index out of range at execution.
 func FuzzParseStatement(f *testing.F) {
 	seeds := []string{
 		``,
-		`INSERT INTO t VALUES ('k', ?)`,
+		`INSERT INTO t VALUES (?)`,
 		`INSERT INTO t ("$key", "$doc") VALUES ('k', {"a":1})`,
-		`INSERT INTO t VALUES ('a', {"x":1}), ('b', '{"y":2}')`,
+		`INSERT INTO t VALUES ({"id":"a"}), ('{"id":"b"}')`,
+		`INSERT INTO t (id, active) VALUES ('a', TRUE), ('b', FALSE)`,
 		`INSERT INTO t VALUES (`,
 		`UPDATE t SET "$doc" = ?`,
 		`UPDATE t SET "$doc" = ? WHERE a = 1 AND NOT b IS NULL`,
@@ -58,6 +60,9 @@ func FuzzParseStatement(f *testing.F) {
 		var p Parser
 		var stmt Statement
 		err := p.ParseStatement(&stmt, src)
+		if !utf8.ValidString(src) && err == nil {
+			t.Fatal("ParseStatement accepted invalid UTF-8")
+		}
 		if err != nil {
 			var parseErr *ParseError
 			if !errors.As(err, &parseErr) {
@@ -162,19 +167,21 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 	seen := 0
 	for i := range s.Rows {
 		row := &s.Rows[i]
-		switch row.Key.Kind {
-		case OperandString:
-		case OperandParam:
-			seen++
-		default:
-			t.Fatalf("row %d has a key of kind %d", i, row.Key.Kind)
+		wantValues := 1
+		if len(s.Columns) != 0 {
+			wantValues = len(s.Columns)
 		}
-		switch row.Doc.Kind {
-		case OperandString, OperandJSON:
-		case OperandParam:
-			seen++
-		default:
-			t.Fatalf("row %d has a document of kind %d", i, row.Doc.Kind)
+		if len(row.Values) != wantValues {
+			t.Fatalf("row %d has %d values, want %d", i, len(row.Values), wantValues)
+		}
+		for _, value := range row.Values {
+			switch value.Kind {
+			case OperandString, OperandNumber, OperandBool, OperandJSON:
+			case OperandParam:
+				seen++
+			default:
+				t.Fatalf("row %d has a value of kind %d", i, value.Kind)
+			}
 		}
 	}
 	if seen != s.Params {
@@ -192,7 +199,6 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 	default:
 		t.Fatalf("the assigned document has kind %d", s.Doc.Kind)
 	}
-	seen += checkKeyed(t, "UPDATE", s.Keys, s.Filter)
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)
 	}
@@ -203,7 +209,7 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 
 func checkDelete(t *testing.T, s *DeleteStmt) {
 	t.Helper()
-	seen := checkKeyed(t, "DELETE", s.Keys, s.Filter)
+	seen := 0
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)
 	}
@@ -213,33 +219,6 @@ func checkDelete(t *testing.T, s *DeleteStmt) {
 	if seen != s.Params {
 		t.Fatalf("DELETE reports %d placeholders and holds %d", s.Params, seen)
 	}
-}
-
-// checkKeyed asserts the exclusivity a keyed statement promises: a statement
-// acts on named keys or on a condition, never on both, because the two have
-// different executions and a consumer picks one by looking at a single field.
-func checkKeyed(t *testing.T, kind string, keys []Operand, filter *SelectStmt) int {
-	t.Helper()
-	if keys == nil {
-		return 0
-	}
-	if filter != nil {
-		t.Fatalf("a keyed %s also carries a filter", kind)
-	}
-	if len(keys) == 0 {
-		t.Fatalf("a keyed %s names no keys", kind)
-	}
-	seen := 0
-	for i, key := range keys {
-		switch key.Kind {
-		case OperandString, OperandNumber, OperandBool:
-		case OperandParam:
-			seen++
-		default:
-			t.Fatalf("key %d has kind %d", i, key.Kind)
-		}
-	}
-	return seen
 }
 
 // checkFilter asserts that a DML statement's synthetic SELECT is the shape the

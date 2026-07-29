@@ -1,12 +1,50 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/store"
 )
+
+func sharedFanOutDatabase(t testing.TB, outerRows, innerRows int) *store.Database {
+	t.Helper()
+	db := &store.Database{}
+	outer, err := db.CreateCollection("outer", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range outerRows {
+		if _, err := outer.Put(
+			fmt.Sprintf("o%d", i),
+			fmt.Appendf(nil, `{"id":%d,"join":"shared"}`, i),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inner, err := db.CreateCollection("inner", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range innerRows {
+		if _, err := inner.Put(
+			fmt.Sprintf("i%d", i),
+			fmt.Appendf(nil, `{"join":"shared","seat":%d,"label":"a\\u0062"}`, i),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db
+}
+
+func sharedFanOutBuildBytes(rows int) int64 {
+	return int64(rows) * joinBuildEntryBytes(scalar{
+		kind: kindString,
+		sval: "shared",
+	})
+}
 
 // Given a pair of small collections captured in one database snapshot and a
 // battery of semi-join shapes, when the compiled executor runs, then every
@@ -991,311 +1029,7 @@ func TestJoinRejectsAnUnknownInnerCollection(t *testing.T) {
 	}
 }
 
-// TestJoinDocumentFrontEndMatchesTheBuilder checks that the JSON spelling of a
-// join compiles to the same plan the builder produces, by requiring the two to
-// return the same rows over the same database — the same equivalence the rest
-// of this package's front ends are held to.
-func TestJoinDocumentFrontEndMatchesTheBuilder(t *testing.T) {
-	db := joinScaleDatabase(t, 60, 10, 4, true)
-	catalog := db.Snapshot()
-
-	cases := []struct {
-		name    string
-		builder *Query
-		doc     string
-		lit     M
-	}{
-		{
-			name: "primary key",
-			builder: Select(Path("id")).
-				Join(JoinOn("customers", "customer", JoinKey)).OrderBy("id", Asc),
-			doc: `{"select":["id"],
-			       "join":[{"from":"customers","on":{"customer":"$key"}}],
-			       "orderBy":["id"]}`,
-			lit: M{
-				"select":  A{"id"},
-				"join":    A{M{"from": "customers", "on": M{"customer": JoinKey}}},
-				"orderBy": A{"id"},
-			},
-		},
-		{
-			name: "primary key with an inner filter and an outer filter",
-			builder: Select(Path("id")).Where(Cmp("total", Lt, 30)).
-				Join(JoinOn("customers", "customer", JoinKey).Where(Cmp("tier", Eq, "pro"))).
-				OrderBy("id", Asc),
-			doc: `{"select":["id"],"where":{"total":{"$lt":30}},
-			       "join":[{"from":"customers","on":{"customer":"$key"},"where":{"tier":"pro"}}],
-			       "orderBy":["id"]}`,
-			lit: M{
-				"select":  A{"id"},
-				"where":   M{"total": M{"$lt": 30}},
-				"join":    A{M{"from": "customers", "on": M{"customer": JoinKey}, "where": M{"tier": "pro"}}},
-				"orderBy": A{"id"},
-			},
-		},
-		{
-			name: "an inner field path, written as a bare object rather than a list",
-			builder: Select(Count()).
-				Join(JoinOn("customers", "customer", "tier").Where(In("seat", 1, 2, 3))),
-			doc: `{"select":[{"$count":"*"}],
-			       "join":{"from":"customers","on":{"customer":"tier"},"where":{"seat":{"$in":[1,2,3]}}}}`,
-			lit: M{
-				"select": A{M{"$count": "*"}},
-				"join":   M{"from": "customers", "on": M{"customer": "tier"}, "where": M{"seat": M{"$in": A{1, 2, 3}}}},
-			},
-		},
-		{
-			name: "two clauses",
-			builder: Select(Path("id")).Join(
-				JoinOn("customers", "customer", JoinKey).Where(Cmp("tier", Eq, "pro")),
-				JoinOn("customers", "customer", JoinKey).Where(Cmp("seat", Lt, 2)),
-			).OrderBy("id", Asc),
-			doc: `{"select":["id"],"join":[
-			         {"from":"customers","on":{"customer":"$key"},"where":{"tier":"pro"}},
-			         {"from":"customers","on":{"customer":"$key"},"where":{"seat":{"$lt":2}}}],
-			       "orderBy":["id"]}`,
-			lit: M{
-				"select": A{"id"},
-				"join": A{
-					M{"from": "customers", "on": M{"customer": JoinKey}, "where": M{"tier": "pro"}},
-					M{"from": "customers", "on": M{"customer": JoinKey}, "where": M{"seat": M{"$lt": 2}}},
-				},
-				"orderBy": A{"id"},
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		want, err := tc.builder.Run(FromDatabase(catalog, "orders"))
-		if err != nil {
-			t.Fatalf("%s: builder: %v", tc.name, err)
-		}
-		if want.RowCount == 0 {
-			t.Fatalf("%s: the fixture must select some rows, or the comparison proves nothing", tc.name)
-		}
-		// Both document front ends, because they are two lowerings of one
-		// grammar: Parse reads member names and values in place out of a parsed
-		// document, New reads them out of Go maps and slices, and only running
-		// both proves the join clause is lowered by the grammar rather than by
-		// one backing.
-		parsed, err := Parse([]byte(tc.doc))
-		if err != nil {
-			t.Fatalf("%s: Parse: %v", tc.name, err)
-		}
-		literal, err := New(tc.lit)
-		if err != nil {
-			t.Fatalf("%s: New: %v", tc.name, err)
-		}
-		for form, q := range map[string]*Query{"Parse": parsed, "New": literal} {
-			got, err := q.Run(FromDatabase(catalog, "orders"))
-			if err != nil {
-				t.Fatalf("%s/%s: %v", tc.name, form, err)
-			}
-			if diff := diffResults(got, want); diff != "" {
-				t.Fatalf("%s/%s: document and builder disagree: %s", tc.name, form, diff)
-			}
-		}
-	}
-}
-
-// TestJoinCompilerSteadyAllocs extends the reusable front end's contract to the
-// join clause: a warmed Compiler recompiling a join document must refill the
-// inner plans and inner path registries it already holds rather than allocate a
-// new one per compile. A join is where that is easiest to get wrong, because
-// each clause needs a whole second plan and registry that no other clause does.
-func TestJoinCompilerSteadyAllocs(t *testing.T) {
-	src := []byte(`{"select":["id"],"where":{"total":{"$lt":30}},
-	                "join":[{"from":"customers","on":{"customer":"$key"},"where":{"tier":"pro"}},
-	                        {"from":"customers","on":{"customer":"name"},"where":{"seat":{"$in":[1,2,3]}}}],
-	                "orderBy":["id"]}`)
-	doc := M{
-		"select": A{"id"},
-		"where":  M{"total": M{"$lt": 30}},
-		"join": A{
-			M{"from": "customers", "on": M{"customer": JoinKey}, "where": M{"tier": "pro"}},
-			M{"from": "customers", "on": M{"customer": "name"}, "where": M{"seat": M{"$in": A{1, 2, 3}}}},
-		},
-		"orderBy": A{"id"},
-	}
-
-	t.Run("Parse", func(t *testing.T) {
-		var c Compiler
-		var q Query
-		for range 2 {
-			if err := c.Parse(&q, src); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if allocs := testing.AllocsPerRun(50, func() {
-			if err := c.Parse(&q, src); err != nil {
-				panic(err)
-			}
-		}); allocs != 0 {
-			t.Fatalf("warmed Compiler.Parse of a join allocated %.2f times, want 0", allocs)
-		}
-	})
-	t.Run("New", func(t *testing.T) {
-		var c Compiler
-		var q Query
-		for range 2 {
-			if err := c.New(&q, doc); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if allocs := testing.AllocsPerRun(50, func() {
-			if err := c.New(&q, doc); err != nil {
-				panic(err)
-			}
-		}); allocs != 0 {
-			t.Fatalf("warmed Compiler.New of a join allocated %.2f times, want 0", allocs)
-		}
-	})
-}
-
-// TestJoinCompilerReusedQueryStaysCorrect guards the other half of the reusable
-// compiler's contract: recompiling into the same Query must not leave the new
-// plan reading the previous compile's inner plan or the previous compile's
-// inner path registry. The documents below join against different inner paths
-// and different clause counts on purpose, so a stale inner plan would answer
-// with the previous query's join, and a registry that was never rewound would
-// leave the new plan extracting columns only the previous one wanted.
-func TestJoinCompilerReusedQueryStaysCorrect(t *testing.T) {
-	db := joinScaleDatabase(t, 60, 10, 4, false)
-	catalog := db.Snapshot()
-	docs := []struct {
-		src string
-		// innerPaths is the number of value columns each clause's inner side
-		// must extract: exactly the paths that clause names, and no path left
-		// over from whatever was compiled into this compiler before it.
-		innerPaths []int
-	}{
-		{`{"select":["id"],"join":[{"from":"customers","on":{"customer":"$key"},"where":{"tier":"pro"}}],"orderBy":["id"]}`,
-			[]int{1}},
-		{`{"select":["id"],"join":[{"from":"customers","on":{"customer":"name"},"where":{"seat":{"$gte":8}}}],"orderBy":["id"]}`,
-			[]int{2}},
-		{`{"select":["id"],"join":[{"from":"customers","on":{"customer":"$key"}}],"orderBy":["id"]}`,
-			[]int{0}},
-		// Two clauses with different inner shapes, which is the arrangement in
-		// which one shared inner plan would silently answer both with whichever
-		// was compiled last.
-		{`{"select":["id"],"join":[
-		     {"from":"customers","on":{"customer":"$key"},"where":{"tier":"pro"}},
-		     {"from":"customers","on":{"customer":"name"},"where":{"seat":{"$lt":3}}}],
-		   "orderBy":["id"]}`,
-			[]int{1, 2}},
-		{`{"select":["id"],"join":[
-		     {"from":"customers","on":{"customer":"name"},"where":{"seat":{"$lt":3}}},
-		     {"from":"customers","on":{"customer":"$key"},"where":{"tier":"pro"}}],
-		   "orderBy":["id"]}`,
-			[]int{2, 1}},
-	}
-	var c Compiler
-	var reused Query
-	// Two passes, so the second compile of each document is a warm one that has
-	// to rewind storage the previous document is still spelled into.
-	for pass := range 2 {
-		for i, tc := range docs {
-			if err := c.Parse(&reused, []byte(tc.src)); err != nil {
-				t.Fatalf("pass %d doc %d: %v", pass, i, err)
-			}
-			compiled, err := reused.compiled()
-			if err != nil {
-				t.Fatalf("pass %d doc %d: %v", pass, i, err)
-			}
-			if len(compiled.joins) != len(tc.innerPaths) {
-				t.Fatalf("pass %d doc %d: %d clauses, want %d",
-					pass, i, len(compiled.joins), len(tc.innerPaths))
-			}
-			for k, want := range tc.innerPaths {
-				if got := len(compiled.joins[k].inner.valuePaths); got != want {
-					t.Fatalf("pass %d doc %d clause %d: inner plan extracts %d value columns, want %d; "+
-						"a stale registry leaves the previous query's paths behind", pass, i, k, got, want)
-				}
-			}
-			got, err := reused.Run(FromDatabase(catalog, "orders"))
-			if err != nil {
-				t.Fatalf("pass %d doc %d: %v", pass, i, err)
-			}
-			owned, err := Parse([]byte(tc.src))
-			if err != nil {
-				t.Fatal(err)
-			}
-			want, err := owned.Run(FromDatabase(catalog, "orders"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if want.RowCount == 0 {
-				t.Fatalf("doc %d selects nothing; the comparison would prove nothing", i)
-			}
-			if diff := diffResults(got, want); diff != "" {
-				t.Fatalf("pass %d doc %d: reused compiler disagrees with a fresh one: %s", pass, i, diff)
-			}
-		}
-	}
-}
-
-// TestJoinDocumentErrors pins the rejections. Each message must name the clause
-// it is about, matching the rest of the front end, and the fan-out attempts must
-// be refused explicitly rather than ignored: a caller who asked for the inner
-// collection's columns and silently got a filter has been answered a question
-// they did not ask.
-func TestJoinDocumentErrors(t *testing.T) {
-	cases := []struct {
-		doc  string
-		want []string
-	}{
-		{`{"select":["id"],"join":3}`, []string{"join", "not a number"}},
-		{`{"select":["id"],"join":[]}`, []string{"join", "empty list"}},
-		{`{"select":["id"],"join":[3]}`, []string{"join[0]", "a join is an object"}},
-		{`{"select":["id"],"join":[{"on":{"a":"$key"}}]}`, []string{"join[0]", "from"}},
-		{`{"select":["id"],"join":[{"from":"c"}]}`, []string{"join[0]", "on"}},
-		{`{"select":["id"],"join":[{"from":3,"on":{"a":"$key"}}]}`, []string{"join[0]", "collection name"}},
-		{`{"select":["id"],"join":[{"from":"","on":{"a":"$key"}}]}`, []string{"join[0].from", "must name a collection"}},
-		{`{"select":["id"],"join":[{"from":"c","on":"a"}]}`, []string{"join[0]", "one-entry"}},
-		{`{"select":["id"],"join":[{"from":"c","on":{}}]}`, []string{"join[0]", "exactly one entry"}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key","b":"$key"}}]}`, []string{"join[0]", "exactly one entry"}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":3}}]}`, []string{"join[0].on.a", `a path or "$key"`}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$id"}}]}`, []string{"join[0].on.a", "unknown inner join target"}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"$or":"$key"}}]}`, []string{"join[0].on", "not the operator"}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key"},"limit":3}]}`, []string{"join[0]", "unknown join key"}},
-		// A select list inside a join is still refused, but it now points at the
-		// spelling that works rather than at a missing feature: the joined
-		// collection is named with "as" and projected from the query's own
-		// select list.
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key"},"select":["x"]}]}`,
-			[]string{"join[0]", "not a join key", `name the joined collection with "as"`}},
-		{`{"select":["id"],"join":[{"select":["x"],"from":"c","on":{"a":"$key"}}]}`,
-			[]string{"join[0]", "not a join key"}},
-		// And "as" is a join key now rather than a refusal, so a malformed one
-		// is reported as a malformed alias.
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key"},"as":3}]}`,
-			[]string{"join[0]", `"as" names the joined collection`}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key"},"as":""}]}`,
-			[]string{"join[0]", `"as" names the joined collection`}},
-		// The inner filter's own errors keep their breadcrumbs, which is the
-		// deepest position the grammar has and the reason locSteps is six.
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key"},"where":{"t":{"$in":[[1]]}}}]}`,
-			[]string{"join[0].where.t.$in[0]", "$in"}},
-		{`{"select":["id"],"join":[{"from":"c","on":{"a":"$key"},"where":{"t":{"$nope":1}}}]}`,
-			[]string{"join[0].where.t.$nope", "unknown operator"}},
-		// And the clause list itself is still closed.
-		{`{"select":["id"],"joins":[]}`, []string{"unknown query clause", "join"}},
-	}
-	for _, tc := range cases {
-		_, err := Parse([]byte(tc.doc))
-		if err == nil {
-			t.Fatalf("%s: compiled, want an error", tc.doc)
-		}
-		for _, want := range tc.want {
-			if !strings.Contains(err.Error(), want) {
-				t.Fatalf("%s:\n got %q\nwant it to mention %q", tc.doc, err, want)
-			}
-		}
-	}
-}
-
-// TestJoinBuilderErrors pins the compile-time rejections a builder can reach
-// that the document grammar cannot.
+// TestJoinBuilderErrors pins the builder's compile-time rejections.
 func TestJoinBuilderErrors(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1521,20 +1255,17 @@ func TestJoinInTheSQLSubset(t *testing.T) {
 	}
 }
 
-// TestJoinSQLKeepsTheSemiJoinWhereItIsProvable asserts the planner still takes
-// the cheaper operator for the shape it can prove equivalent: a primary-key
-// clause nothing outside the join reads matches at most one document, so one
-// row per pair and one row per driving row are the same rows. The SQL front end
-// declares an alias unconditionally, so this is the planner's decision and not
-// the front end's, and this test is what stops the front end from taking it
-// away by accident.
-func TestJoinSQLKeepsTheSemiJoinWhereItIsProvable(t *testing.T) {
+// TestJoinSQLNeverUsesTheProgrammaticPhysicalKeySentinel asserts that "$key"
+// in SQL is an ordinary quoted JSON field. The programmatic builder retains
+// JoinKey for direct store consumers, but the SQL surface derives identity from
+// declared JSON primary-key fields and has no physical-key pseudo-column.
+func TestJoinSQLNeverUsesTheProgrammaticPhysicalKeySentinel(t *testing.T) {
 	for _, tc := range []struct {
 		sql    string
 		fanOut bool
 	}{
-		{`SELECT t.id FROM t JOIN u ON u."$key" = t.a`, false},
-		{`SELECT t.id FROM t JOIN u ON u."$key" = t.a WHERE u.tier = 'pro'`, false},
+		{`SELECT t.id FROM t JOIN u ON u."$key" = t.a`, true},
+		{`SELECT t.id FROM t JOIN u ON u."$key" = t.a WHERE u.tier = 'pro'`, true},
 		{`SELECT t.id, u.b FROM t JOIN u ON u."$key" = t.a`, true},
 		{`SELECT t.id FROM t JOIN u ON u.b = t.a`, true},
 		{`SELECT t.id FROM t JOIN u ON u."$key" = t.a ORDER BY u.b`, true},
@@ -1913,7 +1644,10 @@ func TestJoinBloomFalsePositiveRate(t *testing.T) {
 // a block is a mask rather than a division, and it never exceeds the memory cap
 // however many keys are announced.
 func TestJoinBloomSizingIsBoundedAndSound(t *testing.T) {
-	for _, keys := range []int{0, 1, 2, 15, 16, 4095, 4096, 1 << 20, 1 << 28} {
+	for _, keys := range []int{
+		0, 1, 2, 15, 16, 4095, 4096, 1 << 20, 1 << 28,
+		int(^uint(0) >> 1),
+	} {
 		blocks := joinBloomBlocks(keys)
 		if blocks < 1 {
 			t.Fatalf("keys=%d: %d blocks", keys, blocks)
@@ -1929,6 +1663,20 @@ func TestJoinBloomSizingIsBoundedAndSound(t *testing.T) {
 		if int(filter.mask)+1 != len(filter.blocks) {
 			t.Fatalf("keys=%d: mask %d does not address %d blocks", keys, filter.mask, len(filter.blocks))
 		}
+	}
+}
+
+func TestJoinBloomCostArithmeticDoesNotOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if !joinBloomWorthwhile(maxInt, maxInt, 0, maxInt) {
+		t.Fatal("maximal exact cardinalities wrapped and declined a worthwhile filter")
+	}
+	max := uint64(maxInt)
+	if !joinProduct3GreaterThan2(max, max, max, max, max) {
+		t.Fatal("three-factor gain should exceed two-factor cost at MaxInt")
+	}
+	if joinProduct3GreaterThan2(1, max, max, max, max) {
+		t.Fatal("equal overflowing products compared as greater")
 	}
 }
 
@@ -2142,6 +1890,122 @@ func fanOutBattery() []*Query {
 			JoinOn("inner", "ref", "code").As("o"),
 			JoinOn("inner", "ref", JoinKey),
 		),
+	}
+}
+
+func TestFanOutPairWorkspaceIsBoundedBeforeMaterialization(t *testing.T) {
+	db := sharedFanOutDatabase(t, 16, 16)
+	q := Select(Count()).Join(JoinOn("inner", "join", "join").As("i"))
+	exec := Exec{Options: ExecOptions{
+		JoinPairBytes: sharedFanOutBuildBytes(16),
+		ResultRows:    -1,
+		ResultBytes:   -1,
+	}}
+	err := q.RunInto(&exec, FromDatabase(db.Snapshot(), "outer"))
+	var budgetErr *JoinPairBudgetError
+	if !errors.As(err, &budgetErr) || !errors.Is(err, ErrJoinPairBudget) {
+		t.Fatalf("error = %v, want JoinPairBudgetError", err)
+	}
+	if budgetErr.Pairs != 1 || len(exec.Workspace.pairInner) != 0 {
+		t.Fatalf(
+			"budget error/pair frontier = (%+v,%d), want first pair rejected",
+			budgetErr, len(exec.Workspace.pairInner),
+		)
+	}
+}
+
+func TestFanOutBudgetErrorClearsPriorResult(t *testing.T) {
+	db := sharedFanOutDatabase(t, 2, 2)
+	source := FromDatabase(db.Snapshot(), "outer")
+	q := Select(Count()).Join(JoinOn("inner", "join", "join").As("i"))
+	var exec Exec
+	if err := q.RunInto(&exec, source); err != nil {
+		t.Fatal(err)
+	}
+	if exec.Result.RowCount != 1 {
+		t.Fatalf("warm result has %d rows", exec.Result.RowCount)
+	}
+	exec.Options.JoinPairBytes = 1
+	if err := q.RunInto(&exec, source); !errors.Is(err, ErrJoinPairBudget) {
+		t.Fatalf("second execution error = %v, want pair budget", err)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("failed execution exposed prior %d-row result", exec.Result.RowCount)
+	}
+	for i := range exec.Result.Columns {
+		if len(exec.Result.Columns[i].Cells) != 0 {
+			t.Fatalf(
+				"failed execution retained %d visible cells in column %d",
+				len(exec.Result.Columns[i].Cells), i,
+			)
+		}
+	}
+}
+
+func TestFanOutEarlyLimitStopsAtPairBudgetWithoutSemanticError(t *testing.T) {
+	db := sharedFanOutDatabase(t, 4, 4)
+	q := Select(Path("id"), Path("i.seat")).
+		Join(JoinOn("inner", "join", "join").As("i")).
+		Limit(1)
+	p, err := q.compiled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	perPair := joinPairBytesPerRow(p, &p.joins[p.fanOutJoin])
+	exec := Exec{Options: ExecOptions{
+		JoinPairBytes: sharedFanOutBuildBytes(4) + perPair,
+		ResultRows:    -1,
+		ResultBytes:   -1,
+	}}
+	if err := q.RunInto(&exec, FromDatabase(db.Snapshot(), "outer")); err != nil {
+		t.Fatal(err)
+	}
+	if exec.Result.RowCount != 1 || len(exec.Workspace.pairInner) != 1 {
+		t.Fatalf(
+			"limited fan-out = %d result rows, %d pairs",
+			exec.Result.RowCount, len(exec.Workspace.pairInner),
+		)
+	}
+}
+
+func TestFanOutLimitZeroBuildsNoPairWorkspace(t *testing.T) {
+	db := sharedFanOutDatabase(t, 4, 32)
+	q := Select(Path("id"), Path("i.seat")).
+		Join(JoinOn("inner", "join", "join").As("i")).
+		Limit(0)
+	exec := Exec{Options: ExecOptions{
+		JoinPairBytes: 1,
+		ResultRows:    -1,
+		ResultBytes:   -1,
+	}}
+	if err := q.RunInto(&exec, FromDatabase(db.Snapshot(), "outer")); err != nil {
+		t.Fatal(err)
+	}
+	if exec.Result.RowCount != 0 || len(exec.Workspace.pairInner) != 0 {
+		t.Fatalf(
+			"LIMIT 0 fan-out = %d result rows, %d pairs",
+			exec.Result.RowCount, len(exec.Workspace.pairInner),
+		)
+	}
+}
+
+func TestFanOutDecodedTextSharesPairWorkspaceBudget(t *testing.T) {
+	db := sharedFanOutDatabase(t, 1, 1)
+	q := Select(Path("i.label")).
+		Join(JoinOn("inner", "join", "join").As("i"))
+	p, err := q.compiled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	perPair := joinPairBytesPerRow(p, &p.joins[p.fanOutJoin])
+	exec := Exec{Options: ExecOptions{
+		JoinPairBytes: sharedFanOutBuildBytes(1) + perPair,
+		ResultRows:    -1,
+		ResultBytes:   -1,
+	}}
+	err = q.RunInto(&exec, FromDatabase(db.Snapshot(), "outer"))
+	if !errors.Is(err, ErrJoinPairBudget) {
+		t.Fatalf("decoded fan-out text error = %v, want pair budget", err)
 	}
 }
 
@@ -2475,75 +2339,6 @@ func TestFanOutRejections(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestFanOutDocumentFrontEndMatchesTheBuilder checks the JSON spelling of an
-// inner join against the builder, the equivalence every front end in this
-// package is held to. "as" was a rejection before fan-out existed and is a join
-// key now, so this is also what pins that the grammar actually changed.
-func TestFanOutDocumentFrontEndMatchesTheBuilder(t *testing.T) {
-	db := joinSelectiveDatabaseFor(t, 60, 20, 20)
-	catalog := db.Snapshot()
-	cases := []struct {
-		name    string
-		builder *Query
-		doc     string
-		lit     M
-	}{
-		{
-			name: "the driver's shape",
-			builder: Select(Path("id"), Path("c.seat")).
-				Join(JoinOn("customers", "customer", JoinKey).As("c")).OrderBy("id", Asc),
-			doc: `{"select":["id","c.seat"],
-			       "join":[{"from":"customers","as":"c","on":{"customer":"$key"}}],
-			       "orderBy":["id"]}`,
-			lit: M{
-				"select":  A{"id", "c.seat"},
-				"join":    A{M{"from": "customers", "as": "c", "on": M{"customer": JoinKey}}},
-				"orderBy": A{"id"},
-			},
-		},
-		{
-			name: "aggregating a joined column with the clause's own filter",
-			builder: Select(Count(), Sum("c.seat")).
-				Join(JoinOn("customers", "customer", JoinKey).As("c").
-					Where(Cmp("tier", Eq, "pro"))),
-			doc: `{"select":[{"$count":"*"},{"$sum":"c.seat"}],
-			       "join":{"from":"customers","as":"c","on":{"customer":"$key"},
-			               "where":{"tier":"pro"}}}`,
-			lit: M{
-				"select": A{M{"$count": "*"}, M{"$sum": "c.seat"}},
-				"join": M{"from": "customers", "as": "c", "on": M{"customer": JoinKey},
-					"where": M{"tier": "pro"}},
-			},
-		},
-	}
-	for _, tc := range cases {
-		want, err := tc.builder.Run(FromDatabase(catalog, "orders"))
-		if err != nil {
-			t.Fatalf("%s: builder: %v", tc.name, err)
-		}
-		if want.RowCount == 0 {
-			t.Fatalf("%s: the fixture must select rows", tc.name)
-		}
-		parsed, err := Parse([]byte(tc.doc))
-		if err != nil {
-			t.Fatalf("%s: Parse: %v", tc.name, err)
-		}
-		literal, err := New(tc.lit)
-		if err != nil {
-			t.Fatalf("%s: New: %v", tc.name, err)
-		}
-		for form, q := range map[string]*Query{"Parse": parsed, "New": literal} {
-			got, err := q.Run(FromDatabase(catalog, "orders"))
-			if err != nil {
-				t.Fatalf("%s/%s: %v", tc.name, form, err)
-			}
-			if diff := diffResults(got, want); diff != "" {
-				t.Fatalf("%s/%s: document and builder disagree: %s", tc.name, form, diff)
-			}
-		}
 	}
 }
 

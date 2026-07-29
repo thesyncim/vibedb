@@ -27,8 +27,10 @@ import (
 // collection's writer mutex; here the exclusion needed is against publication
 // rather than against mutation in general, and publication is exactly what
 // snapshotGate's write side already fences. So the durable analogue takes every
-// collection's snapshotGate read side, in collection-name order, and acquires
-// one lease per collection while the whole set is held.
+// collection's snapshotGate read side, in a process-global handle order, and
+// acquires one lease per collection while the whole set is held. The handle
+// order remains stable even when separate catalogs give the same collections
+// different names.
 //
 // Read-locking rather than write-locking is not a weakening. A generation lease
 // is what makes a snapshot durable-valid — it pins the extents the reclaimer
@@ -104,12 +106,12 @@ type Database struct {
 	closed      bool
 	collections map[string]*databaseEntry
 
-	// order is the collection set in name order, rebuilt on every catalog
-	// mutation rather than sorted per snapshot. A snapshot's cost should be the
-	// locks it takes and the leases it acquires, not a sort of the catalog, and
-	// DDL is rare enough that paying there instead is free. It is also what
-	// lets SnapshotInto reach a fully allocation-free steady state.
-	order []*databaseEntry
+	// order is the collection set in name order. snapshotOrder contains the
+	// same handles in their process-global gate order. Both are rebuilt on
+	// catalog mutation so SnapshotInto remains allocation-free while results
+	// and catalog iteration stay name ordered.
+	order         []*databaseEntry
+	snapshotOrder []*Collection
 }
 
 // A databaseEntry is one cataloged collection plus the file the Database opened
@@ -365,6 +367,7 @@ func (d *Database) Close() error {
 	d.closed = true
 	entries := d.order
 	d.order = nil
+	d.snapshotOrder = nil
 	d.collections = nil
 	d.mu.Unlock()
 
@@ -385,15 +388,19 @@ func (e *databaseEntry) close() error {
 	return err
 }
 
-// reorder rebuilds the name-ordered view. The caller holds the write lock.
+// reorder rebuilds the name-ordered catalog view and global snapshot-gate
+// order. The caller holds the write lock.
 func (d *Database) reorder() {
 	d.order = d.order[:0]
+	d.snapshotOrder = d.snapshotOrder[:0]
 	for _, entry := range d.collections {
 		d.order = append(d.order, entry)
+		d.snapshotOrder = append(d.snapshotOrder, entry.collection)
 	}
 	slices.SortFunc(d.order, func(a, b *databaseEntry) int {
 		return strings.Compare(a.name, b.name)
 	})
+	sortCollectionSnapshotOrder(d.snapshotOrder)
 }
 
 // validCollectionName reports whether name may be a durable collection.

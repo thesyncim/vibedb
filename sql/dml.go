@@ -56,33 +56,18 @@ func (k Kind) String() string {
 // from a [Kind].
 func (k Kind) IsQuery() bool { return k == KindSelect }
 
-// KeyColumn is how a statement names a document's primary key.
-//
-// It is the same spelling a JOIN uses for the inner collection's key, and it is
-// spelled with a leading '$' for the same reason: '$' is not an identifier byte
-// in this lexer, so the name can only be written quoted, and a quoted name can
-// never collide with a JSON object key an author meant to reach. A document
-// with a field genuinely called "$key" is still addressable — as a path with a
-// pointer spelling — because this constant is recognized only in the three
-// positions the grammar gives it, never as a general path.
-const KeyColumn = "$key"
-
 // DocumentColumn is how a statement names the whole stored document.
 //
 // The store's unit is a document, not a tuple, so the only assignment target an
-// UPDATE can have and the only value an INSERT can carry is the document
-// itself. Giving it a name — rather than leaving it implicit in a positional
-// VALUES list — is what lets `INSERT INTO t ("$key", "$doc") VALUES (?, ?)`
-// document itself, and what lets the refusal of a real column list say exactly
-// which two names do exist.
+// UPDATE can have is the document itself. INSERT carries either one complete
+// document with VALUES (?) or synthesizes one flat object from a field list.
 const DocumentColumn = "$doc"
 
 // A Statement is one parsed statement of any kind.
 //
-// Exactly one of the four pointers is non-nil, selected by Kind. It is a tagged
-// struct rather than an interface because every consumer switches on the kind
-// anyway, and because the four bodies are already concrete types a caller wants
-// by name.
+// Exactly one body pointer is non-nil, selected by Kind. It is a tagged struct
+// rather than an interface because every consumer switches on the kind anyway,
+// and because the six bodies are already concrete types a caller wants by name.
 type Statement struct {
 	Kind        Kind
 	Select      *SelectStmt
@@ -136,33 +121,23 @@ func (s *Statement) Params() int {
 
 // An InsertStmt is one parsed INSERT.
 //
-// # Why a document and not a column list
+// # Documents, flat fields, and identity
 //
-// SQL's INSERT names columns and supplies a tuple. This store has no columns:
-// its unit is a whole JSON document addressed by a primary key, and there is no
-// schema anywhere in the engine that could say which fields a tuple's positions
-// stand for. A column list would therefore have to invent one, and the
-// invention would be per statement rather than per collection — two INSERTs
-// into one collection could declare different "schemas", and neither would be
-// recorded anywhere the next reader could find it.
+// Every INSERT derives identity from the table's declared scalar JSON PRIMARY
+// KEY. One form binds a complete JSON document; the other synthesizes a flat
+// object from distinct top-level fields and scalar values:
 //
-// So the grammar takes exactly what the store takes: a key and a document.
+//	INSERT INTO users VALUES (?)
+//	INSERT INTO users (id, name) VALUES (?, ?)
 //
-//	INSERT INTO users VALUES ('u-1', ?)
-//	INSERT INTO users ("$key", "$doc") VALUES ('u-1', ?)
+// Nested construction is deliberately not inferred from a path-shaped column
+// list. A caller with a nested value binds the complete document, preserving
+// its exact JSON representation and leaving structural editing outside the SQL
+// parser.
 //
-// The two forms are the same statement; the second names the two positions so a
-// reader who has not read this documentation can still tell which is which. Any
-// other column list is refused by name, because the alternative — accepting
-// `INSERT INTO users (name, age) VALUES (?, ?)` and synthesizing
-// {"name":...,"age":...} — would make the JSON document's shape a property of
-// the SQL text, and would give the same statement a different meaning in a
-// collection whose documents nest.
-//
-// The key is required rather than generated. A store whose keys are opaque
-// caller-chosen strings has no sequence to draw from, and inventing one (a
-// UUID, a counter) would make INSERT non-deterministic and LastInsertId a lie
-// in a different way.
+// There is no caller-supplied physical-key form and no generated sequence.
+// Keeping identity in the document makes CREATE TABLE's PRIMARY KEY declaration
+// the one source of truth for INSERT, point predicates, indexes, and reopen.
 type InsertStmt struct {
 	// Table is the collection written to.
 	Table string
@@ -172,34 +147,18 @@ type InsertStmt struct {
 	Rows []InsertRow
 	// Columns names the flat document fields synthesized by
 	// INSERT INTO t (a, b) VALUES (?, ?). It is nil when VALUES carries a
-	// whole JSON document or uses the legacy ("$key", "$doc") form.
+	// whole JSON document.
 	Columns []*PathExpr
-	// DerivedKey reports that the primary key is derived from the table's
-	// declared PRIMARY KEY path rather than supplied as "$key".
-	DerivedKey bool
-	// Explicit records that the statement wrote the ("$key", "$doc") column
-	// list, purely so a diagnostic can echo the statement back accurately.
-	Explicit bool
 	// Params is the number of '?' placeholders.
 	Params int
 	// Pos is the byte offset of the collection name.
 	Pos int
 }
 
-// An InsertRow is one VALUES tuple: the primary key and the document.
+// An InsertRow is one VALUES tuple.
 type InsertRow struct {
-	// Key is the primary key. It is a string literal or a placeholder; a number
-	// or a boolean is refused, because a key is an opaque byte string and
-	// accepting 1 as a key would make it ambiguous with '1'.
-	Key Operand
-	// Doc is the document. It is a placeholder bound to a []byte or a string, a
-	// string literal holding JSON text, or the '@>'-style JSON document literal
-	// the lexer already delimits structurally. Its syntax is validated by the
-	// same parser that will index it, at execution.
-	Doc Operand
 	// Values holds either the one whole-document operand of VALUES (?) or the
-	// flat field operands corresponding to InsertStmt.Columns. It is nil for
-	// the explicit key/document form.
+	// flat field operands corresponding to InsertStmt.Columns.
 	Values []Operand
 	Pos    int
 }
@@ -242,12 +201,8 @@ type UpdateStmt struct {
 	Table string
 	// Doc is the replacement document, the right-hand side of SET "$doc" = ....
 	Doc Operand
-	// Keys is non-nil when the WHERE was a primary-key test; see
-	// [DeleteStmt.Keys], which carries the same thing for the same reason.
-	Keys []Operand
 	// Filter is the equivalent SELECT whose surviving rows this statement
-	// updates: "SELECT count(*) FROM Table WHERE ...", with the same WHERE. It
-	// is nil when Keys is non-nil, because a key test needs no scan.
+	// updates: "SELECT count(*) FROM Table WHERE ...", with the same WHERE.
 	//
 	// Carrying a real SelectStmt rather than a bare *Expr is what makes the
 	// promise "UPDATE writes exactly the documents SELECT returns" structural: a
@@ -265,20 +220,8 @@ type UpdateStmt struct {
 type DeleteStmt struct {
 	// Table is the collection written to.
 	Table string
-	// Keys holds the primary keys named by a WHERE of the form
-	// `"$key" = operand` or `"$key" IN (operand, ...)`, and is nil for every
-	// other WHERE.
-	//
-	// The special case exists because the primary key is not a document field:
-	// the predicate compiler reads paths out of stored JSON, and a key is not
-	// in the JSON. So a key test has no compiled predicate to become, and the
-	// two shapes that need none — equality and membership over the key alone —
-	// are recognized here and executed as direct lookups. Every other use of
-	// "$key" inside a predicate is refused rather than silently read as a
-	// document field that almost certainly does not exist.
-	Keys []Operand
 	// Filter is the equivalent SELECT whose surviving rows this statement
-	// deletes, or nil when Keys is non-nil. See [UpdateStmt.Filter].
+	// deletes. See [UpdateStmt.Filter].
 	Filter *SelectStmt
 	// Params is the number of '?' placeholders.
 	Params int

@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -25,20 +26,17 @@ const (
 )
 
 // A Source is the collection a compiled query runs over. Construct one with
-// exactly one of [FromSegment], [FromSnapshot], [FromFile], and
-// [FromDatabase]; the zero Source names nothing and every execution rejects it.
+// exactly one of [FromSegment], [FromSnapshot], [FromFile],
+// [FromFileOverlay], [FromDatabase], or [FromFileDatabase]; the zero Source
+// names nothing and every execution rejects it.
 //
-// Source is a concrete discriminated struct rather than an interface for two
-// reasons. The three backends genuinely do not share a method set:
-// [store.IndexSource] already names everything the two snapshot backends have
-// in common and deliberately excludes the Segment, whose []int candidate
-// ordinals are a different shape in kind rather than a different way to reach
-// the same rows. And a Source crosses [Query.RunInto], whose whole contract is
-// that a warmed execution allocates nothing; a snapshot value carried in an
-// interface is one added field away from ceasing to be pointer-shaped, at
-// which point every call would pay a boxing allocation for a boundary that
-// buys no polymorphism. Copying four words onto the callee's frame has neither
-// problem.
+// Source is a concrete discriminated struct rather than an interface. A
+// Segment, a heap snapshot, a durable snapshot, an overlay, and a coherent
+// multi-collection snapshot expose materially different operations and
+// lifetimes; an interface would not remove their dispatch. Keeping the handle
+// concrete also preserves [Query.RunInto]'s warmed allocation-free boundary
+// without relying on whether a particular snapshot value can be boxed without
+// escaping.
 type Source struct {
 	kind sourceKind
 	// payload is a *store.Segment for sourceSegment and a *FileOverlaySource
@@ -149,7 +147,8 @@ func FromFileOverlay(s *durable.Snapshot, overlay *FileOverlaySource) Source {
 // what the catalog adds is the ability to resolve a join clause's inner
 // collection at that same instant.
 //
-// This is the only Source a query with a join accepts, and it is the reason
+// This is the heap Source a query with a join accepts. The durable counterpart
+// is [FromFileDatabase]. Requiring one of those catalog snapshots is the reason
 // snapshot skew across a join is not expressible rather than merely
 // discouraged. Two separately taken snapshots can disagree — one collection
 // observed before a commit and another after it — and a join resolving
@@ -185,9 +184,9 @@ func FromFileDatabase(catalog durable.DatabaseSnapshot, collection string) Sourc
 }
 
 // An Exec is the caller-owned storage one execution stream runs against: the
-// destination Result, the transient Workspace, the Options only the durable
-// backend reads, and the Stats only backends that measure physical work write.
-// The zero Exec is ready to use.
+// destination Result, the transient Workspace, the bounded execution Options,
+// and the Stats only backends that measure physical work write. The zero Exec
+// is ready to use.
 //
 // An Exec is single-consumer, exactly like the Result and Workspace it
 // contains. It holds the high-water buffers that make a warmed [Query.RunInto]
@@ -209,11 +208,16 @@ type Exec struct {
 	// planning. Retaining it across calls is what makes the steady state
 	// allocation-free.
 	Workspace Workspace
-	// Options tune bounded execution. Workers bounds the filter phase of every
-	// backend, including the two in-memory ones, and the two join bounds apply
-	// wherever a semi-join binds; the batch, memory, and spill fields are
-	// durable-only, a heap collection having neither worker batches nor a spill
-	// frontier to bound.
+	// Options tune bounded execution. Workers and MemoryBytes apply to every
+	// backend: durable execution uses MemoryBytes as its batch/merge frontier,
+	// while Segment and heap-snapshot execution admit their row-proportional
+	// columns, selections, ordering/grouping state, decoded text, and join
+	// memberships against it before growth. The durable frontier is a target,
+	// not a total resident-capacity quota over fixed worker/ring storage;
+	// data-dependent planner, join, and containment additions still fail
+	// admission explicitly. BatchRows, BatchBytes, SpillDirectory, and
+	// SpillBytes are durable-only; result, aggregate, and fan-out pair limits
+	// apply wherever their corresponding operation runs.
 	Options ExecOptions
 	// Stats reports the physical work the last execution performed. Only
 	// backends that measure a field write it, and every execution resets the
@@ -274,20 +278,79 @@ func (q *Query) Run(src Source) (Result, error) {
 // frontier, decoded text, and group count fit e's retained high-water marks
 // allocates no heap memory at all — stable ordering, grouping, containment
 // indexing, typed aggregates, and escaped-string decoding included. Use
-// [Cell.AppendJSON] with a retained destination to format computed aggregates
-// without allocating either.
+// [Cell.AppendJSON] with a retained destination to consume computed aggregates
+// without allocating either. Exact decimal aggregate state and encodings share
+// the whole-execution [ExecOptions.AggregateBytes] budget.
 //
 // RunInto overwrites e.Result and e.Stats and leaves e.Options alone. It
 // rejects the zero Source, which names no collection at all: a query that
 // forgets its source must fail rather than report an empty result.
-func (q *Query) RunInto(e *Exec, src Source) error {
+func (q *Query) RunInto(e *Exec, src Source) (err error) {
 	if e == nil {
 		return fmt.Errorf("query: RunInto requires a non-nil Exec")
 	}
+	// Invalidate the previous logical result immediately. If any later phase
+	// fails, abortResult clears its borrowed cell references while preserving
+	// capacity for reuse; callers can never mistake an earlier success for the
+	// result of this failed execution.
+	e.Result.RowCount = 0
+	e.Stats = ExecStats{}
+	defer func() {
+		if err != nil {
+			e.Result.abortResult()
+			if errors.Is(err, ErrCanceled) ||
+				e.Options.Cancel != nil && e.Options.Cancel.Canceled() {
+				// A canceled bind can leave earlier clauses fully bound. Drop
+				// every borrowed inner snapshot and worker evaluator binding
+				// now, rather than pinning them until this Exec happens to run
+				// again. Checking the flag as well as the returned error covers
+				// a durable I/O failure that correctly wins error precedence
+				// after cancellation was observed. Retained owned capacity
+				// remains warm.
+				e.Workspace.clearBorrowedViews()
+				e.Workspace.resetJoinBindings()
+				e.file.abort()
+			}
+		}
+	}()
+	e.Workspace.clearBorrowedViews()
+	for i := range e.file.workers {
+		e.file.workers[i].clearBorrowedViews()
+	}
+	e.Workspace.cancel = e.Options.Cancel
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
+	e.Workspace.resetJoinBindings()
 	p, err := q.compiled()
 	if err != nil {
 		return err
 	}
+	resultRows, resultBytes, limitErr := normalizeResultBudget(e.Options)
+	if limitErr != nil {
+		return limitErr
+	}
+	e.Result.beginResultBudget(resultRows, resultBytes)
+	if p.hasAggregate {
+		aggregateBytes, limitErr := normalizeAggregateBytes(e.Options)
+		if limitErr != nil {
+			return limitErr
+		}
+		e.Workspace.aggregateBudget.begin(aggregateBytes)
+		e.Workspace.aggregateOut = e.Workspace.aggregateOut[:0]
+	}
+	e.Workspace.heapWorkParent = nil
+	switch src.kind {
+	case sourceSegment, sourceHeapSnapshot, sourceDatabase:
+		memoryBytes, limitErr := normalizeHeapMemoryBytes(e.Options)
+		if limitErr != nil {
+			return limitErr
+		}
+		e.Workspace.heapWorkBudget.begin(memoryBytes)
+	default:
+		e.Workspace.heapWorkBudget.disable()
+	}
+	e.Workspace.eval.setWork(e.Workspace.activeHeapWorkBudget())
 	switch src.kind {
 	case sourceSegment:
 		docs := (*store.Segment)(src.payload)

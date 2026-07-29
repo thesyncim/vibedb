@@ -217,3 +217,38 @@ func FuzzStartupPacket(f *testing.F) {
 		}
 	})
 }
+
+// FuzzSCRAMClientMessages keeps the authentication grammar on the same hostile
+// input footing as the wire decoder. Both messages are peer-controlled text;
+// success must imply the structural invariants authenticate relies on, while
+// every other byte sequence must return an error rather than panic.
+func FuzzSCRAMClientMessages(f *testing.F) {
+	binding := "biws" // base64("n,,")
+	f.Add("n,,n=,r=NONCE",
+		"c="+binding+",r=NONCE,z=optional,p=AAAA")
+	f.Add("n,a=administrator,n=,r=NONCE",
+		"c="+binding+",r=NONCE,p=AAAA")
+	f.Add("n,,n=,r=NONCE,r=OTHER",
+		"c="+binding+",r=NONCE,p=AAAA,p=AAAA")
+	f.Add("n,,m=required,n=,r=NONCE",
+		"c="+binding+",r=NONCE,m=required,p=AAAA")
+
+	f.Fuzz(func(t *testing.T, firstMessage, finalMessage string) {
+		first, err := parseClientFirst(firstMessage)
+		if err == nil {
+			if first.nonce == "" || first.bare == "" || first.gs2Header == "" {
+				t.Fatalf("successful client-first parse has empty required state: %+v", first)
+			}
+			if !validSCRAMNonce(first.nonce) {
+				t.Fatalf("successful client-first parse has invalid nonce %q", first.nonce)
+			}
+		}
+
+		proof, withoutProof, err := parseClientFinal(
+			finalMessage, "NONCE", "n,,")
+		if err == nil && (len(proof) == 0 || withoutProof == "") {
+			t.Fatalf("successful client-final parse has empty proof/message: %d %q",
+				len(proof), withoutProof)
+		}
+	})
+}

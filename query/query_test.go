@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
-	"github.com/thesyncim/vibedb/store"
 )
 
 // Given a small Segment and a battery of query shapes, when the compiled

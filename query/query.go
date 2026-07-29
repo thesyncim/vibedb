@@ -1,22 +1,21 @@
 // Package query is a typed query engine over a
 // [store.Segment], heap [store.Snapshot], or a durable snapshot: the product
-// layer that turns indexing, projection,
-// containment, and grouping primitives into one compiled plan with a
-// programmatic builder and an optional SQL front end. Each document is one row
-// and columns are JSON paths. It answers SELECT of path projections and
-// aggregates
+// layer that turns indexing, projection, containment, and grouping primitives
+// into one compiled plan. The exported programmatic builder is the typed plan
+// API; SQL through [PrepareStatement] and [PrepareDML] is the sole textual
+// query language. Each document is one row and columns are JSON paths. It
+// answers SELECT of path projections and aggregates
 // (COUNT, SUM, AVG, MIN, MAX); WHERE with comparisons, containment (@>),
 // existence, and null tests combined by And/Or/Not; cross-collection
-// semi-joins; GROUP BY; ORDER BY; and
-// LIMIT. Subqueries, mutation, and full SQL are out of scope, as is any join
-// that returns the joined collection's columns — see [Join].
+// semi-joins and inner joins; GROUP BY; ORDER BY; and LIMIT. Subqueries and
+// mutation are outside this executor; the sql/driver package layers cataloged
+// DDL and whole-document DML over it.
 //
-// The builder, the JSON document front end, and the optional SQL parser are
-// front ends for one immutable compiled plan, cached inside the [Query] that
-// produced it. Compiling resolves paths to compiled pointers and numeric
-// slots, predicates to typed operators, and literals to typed constants. The
-// query text and the builder tree are then discarded; none of them is
-// interpreted during execution:
+// The builder and SQL parser are front ends for one immutable compiled plan,
+// cached inside the [Query] that produced it. Compiling resolves paths to
+// compiled pointers and numeric slots, predicates to typed operators, and
+// literals to typed constants. The SQL text and builder tree are then
+// discarded; neither is interpreted during execution:
 //
 //	q := query.Select(query.Path("name"), query.Sum("score")).
 //		Where(query.Cmp("active", query.Eq, true)).
@@ -25,42 +24,36 @@
 //		Limit(10)
 //	result, err := q.Run(query.FromSegment(&docs))
 //
-// A query is also expressible as a JSON document, so one can be stored,
-// logged, or received over a wire and compiled to the same plan. [New] takes
-// that document as Go literals and [Parse] takes it as JSON text. Sibling keys
-// conjoin, which is what makes the common all-of filter read as data rather
-// than as a tree of constructors:
+// SQL is the textual and wire-facing query language. JSON remains the stored
+// row representation, not a second query grammar:
 //
-//	q, err := query.New(query.M{
-//		"select":  query.A{"team", query.M{"total": query.M{"$sum": "score"}}},
-//		"where":   query.M{"active": true, "tier": query.M{"$in": query.A{"pro", "team"}}},
-//		"groupBy": "team",
-//		"orderBy": query.A{query.M{"total": "desc"}},
-//		"limit":   10,
-//	})
+//	stmt, err := query.PrepareStatement(`
+//		SELECT team, SUM(score) AS total
+//		FROM events
+//		WHERE active = TRUE AND tier IN ('pro', 'team')
+//		GROUP BY team
+//		ORDER BY total DESC
+//		LIMIT 10`)
 //
-// [New] and [Parse] own everything they return. A service compiling a query
-// document per request instead holds a [Compiler], whose arenas a warmed
-// compilation refills rather than reallocates, making a steady-state compile
-// free of heap allocation the same way a warmed [Query.RunInto] is. The Query
-// it produces borrows that compiler and is valid until its next compile, the
-// borrowed-lifetime rule [Result] and [Workspace] already carry.
+// A [Statement] owns an internal compiler whose arenas a warmed placeholder binding
+// refills rather than reallocates, making steady-state lowering allocation-free
+// in the same way a warmed [Query.RunInto] is.
 //
 // Execution has exactly two entry points. [Query.Run] answers a one-off, and
 // [Query.RunInto] runs into a caller-owned [Exec] that retains the destination
 // Result, the scratch Workspace, the durable backend's options, and its
 // reported stats. Both take a [Source], the discriminated handle naming the
-// collection: [FromSegment], [FromSnapshot], [FromFile], or [FromDatabase]. One
-// backend is therefore never a different call shape from another, and a hot
-// loop is one Exec reused:
+// collection: [FromSegment], [FromSnapshot], [FromFile], [FromFileOverlay],
+// [FromDatabase], or [FromFileDatabase]. One backend is therefore never a
+// different call shape from another, and a hot loop is one Exec reused:
 //
 //	var e query.Exec
 //	err = q.RunInto(&e, query.FromSnapshot(snapshot))
 //
-// A query with a [Join] clause reads a second collection, and takes
-// [FromDatabase] so both sides come from one [store.DatabaseSnapshot] — the
-// consistent cut that makes snapshot skew across a join inexpressible rather
-// than merely discouraged.
+// A query with a [Join] clause reads a second collection and takes
+// [FromDatabase] or [FromFileDatabase], so both sides come from one coherent
+// database snapshot — the consistent cut that makes snapshot skew across a
+// join inexpressible rather than merely discouraged.
 //
 // The clause is one of two operators, and which one is what it declares. Without
 // [Join.As] it is a semi-join: it filters the driving collection by the
@@ -76,19 +69,22 @@
 // then joined-ordinal order. See [Join], join.go, join_bloom.go, and
 // join_build.go.
 //
-// [PrepareSQL] produces an identically compiled Query directly from SQL, and
-// [Query.Prepare] forces compilation eagerly so a malformed query fails where
-// it was written. [PrepareStatement] is the fuller SQL entry point: it returns
-// a [Statement], which adds the three things a plan cannot carry — output names
-// from AS aliases, '?' placeholders bound per execution, and the HAVING and
-// OFFSET clauses the executor has no node for. A Statement owns its own
-// [Compiler], so re-binding a placeholder rebuilds the plan without allocating.
-// The vibesql package exposes it as a database/sql driver and lists in one
-// place every way this dialect and SQL disagree. Output has stable ordinal IDs through [Query.AppendSchema],
-// and [Cell] exposes typed values plus caller-buffered [Cell.AppendJSON]. A
-// transport encoder can therefore consume typed batches without header lookup
-// or intermediate string formatting. Field-name bytes remain only in immutable compiled-path
-// metadata because schemaless JSON has no external schema ID to replace them.
+// [Query.Prepare] forces a programmatically built plan to compile eagerly so a
+// malformed query fails where it was written. [PrepareStatement] is the SELECT
+// SQL entry point: it returns a [Statement], which adds the three things a plan
+// cannot carry — output names from AS aliases, '?' placeholders bound per
+// execution, and the HAVING and OFFSET clauses the executor has no node for.
+// [PrepareDML] lowers the same parser's non-SELECT statements for the typed SQL
+// runtime. A Statement owns its own compiler, so re-binding a placeholder
+// rebuilds the plan without allocating.
+// The [github.com/thesyncim/vibedb/sql/driver] package exposes the same parsed
+// and lowered statements through database/sql and documents in one place every
+// way the supported subset differs from general SQL. Output has stable ordinal
+// IDs through [Query.AppendSchema], and [Cell] exposes typed values plus
+// caller-buffered [Cell.AppendJSON]. A transport encoder can therefore consume
+// typed batches without header lookup or intermediate string formatting.
+// Field-name bytes remain only in immutable compiled-path metadata because
+// schemaless JSON has no external schema ID to replace them.
 //
 // The executor is column-oriented. Without an applicable posting bound it
 // extracts each needed path as a dense column and evaluates WHERE in one full
@@ -99,13 +95,17 @@
 // ordering, and limiting. A compiled query is immutable and safe to run
 // concurrently; Run owns its transient scan state, while concurrent RunInto
 // calls use one independent Exec per goroutine.
-// A [FromFile] execution first late-binds exact persistent indexes. A bounded
-// plan admits only its collision-rechecked stable-slot masks; an unbounded plan
-// scans every row. It then indexes bounded raw batches in parallel, restores
-// source order before partial reductions, and externally merges ordered
-// projections or groups when their transient frontier reaches the configured
-// memory target. The caller owns the final result, whose size is necessarily
-// outside that working-memory target.
+// A [FromFile] execution first late-binds exact persistent indexes. Catalog,
+// mask-buffer, certificate, posting, and exact-recheck workspace is
+// conservatively admitted before it can grow and debited from the configured
+// memory target. A plan whose worst-case index workspace does not fit simply
+// declines the optimization and scans every row; it is not a query error. The
+// executor then indexes bounded raw batches in parallel, restores source order
+// before partial reductions, and externally merges ordered projections or
+// groups when their transient frontier reaches the remaining memory target.
+// The caller owns the final result; it is outside that
+// working-memory target but independently bounded by [ExecOptions.ResultRows]
+// and [ExecOptions.ResultBytes].
 //
 // # Value semantics
 //
@@ -121,8 +121,12 @@
 //     number < string < container) for ORDER BY and GROUP BY, and inequality
 //     for =/!=; a null or absent value never satisfies a comparison.
 //   - SUM, AVG, MIN, and MAX skip null and non-numeric values and are null
-//     over an empty input. COUNT(path) counts present, non-null values;
-//     COUNT(*) counts rows.
+//     over an empty input. SUM, MIN, and MAX preserve exact decimal values.
+//     AVG emits an exact finite quotient when it fits the 34-significant-digit
+//     policy and otherwise rounds once, ties to even. Exact-decimal workspace
+//     is bounded by [ExecOptions.AggregateBytes]; exhaustion returns
+//     [ErrAggregateBudget] rather than substituting float64. COUNT(path)
+//     counts present, non-null values; COUNT(*) counts rows.
 //   - Duplicate object keys resolve to the last occurrence, matching the
 //     core's Node.Get.
 package query
@@ -163,7 +167,7 @@ type Query struct {
 	plan       *plan
 	compileErr error
 
-	// built is the outcome a [Compiler] installed directly. A Compiler has
+	// built is the outcome a [compiler] installed directly. A compiler has
 	// already compiled by the time it returns, so consulting this first is
 	// what lets it reuse one Query value across compiles: sync.Once is not
 	// resettable, and a second compile into a Query whose Once had already
@@ -172,7 +176,7 @@ type Query struct {
 }
 
 // A compileResult is a compiled plan or the failure that prevented one. It is
-// one heap object rather than two Query fields so a Compiler can publish both
+// one heap object rather than two Query fields so a compiler can publish both
 // halves with a single pointer store.
 type compileResult struct {
 	plan *plan
@@ -307,7 +311,7 @@ func (r *pathRegistry) reset() {
 
 // addPath returns spec's column index, compiling and registering it the first
 // time this query names it.
-func (c *Compiler) addPath(r *pathRegistry, spec string) (int, error) {
+func (c *compiler) addPath(r *pathRegistry, spec string) (int, error) {
 	for i := range r.paths {
 		if r.paths[i].spec == spec {
 			return i, nil
@@ -336,7 +340,7 @@ func (c *Compiler) addPath(r *pathRegistry, spec string) (int, error) {
 // which cannot know whether the driving collection has a field by that name.
 // It costs nothing in compatibility because an alias has to be declared to
 // exist, and no query written before joins could declare one.
-func (c *Compiler) resolveJoinAlias(spec string) (int, string) {
+func (c *compiler) resolveJoinAlias(spec string) (int, string) {
 	// A pointer spec is never qualified: it is rooted at a document, and which
 	// document it is rooted at is the question an alias answers.
 	if len(c.joinAliases) == 0 || spec == "" || spec[0] == '/' {
@@ -371,13 +375,13 @@ func (q *Query) compiled() (*plan, error) {
 	return q.plan, q.compileErr
 }
 
-// compile validates the builder state and lowers it to a plan, with storage
-// the returned plan owns outright. A query the builder or the SQL front end
-// produced has no Compiler behind it, so it gets a throwaway one whose arenas
+// compile validates the programmatic builder state and lowers it to a plan,
+// with storage the returned plan owns outright. A lazily compiled builder has
+// no reusable compiler behind it, so it gets a throwaway one whose arenas
 // nothing else can rewind — which is exactly what "the plan owns its storage"
 // means here.
 func (q *Query) compile() (*plan, error) {
-	var c Compiler
+	var c compiler
 	c.forOneShot()
 	return c.compilePlan(q)
 }
@@ -385,7 +389,7 @@ func (q *Query) compile() (*plan, error) {
 // compilePlan validates the builder state and lowers it to a plan in c's
 // storage. The reused slices are taken back whatever the outcome, so a failed
 // compile does not throw away the capacity the compiler had already grown.
-func (c *Compiler) compilePlan(q *Query) (*plan, error) {
+func (c *compiler) compilePlan(q *Query) (*plan, error) {
 	p := c.planStorage()
 	err := c.buildPlan(q, p)
 	c.headers = p.headers
@@ -401,7 +405,7 @@ func (c *Compiler) compilePlan(q *Query) (*plan, error) {
 	return p, nil
 }
 
-func (c *Compiler) buildPlan(q *Query, p *plan) error {
+func (c *compiler) buildPlan(q *Query, p *plan) error {
 	if len(q.columns) == 0 {
 		return fmt.Errorf("query: Select requires at least one column")
 	}
@@ -549,7 +553,7 @@ func (c *Compiler) buildPlan(q *Query, p *plan) error {
 // collectJoinAliases records each clause's declared alias for path resolution,
 // rejecting a duplicate: two clauses answering to one name would make every
 // qualified path silently read whichever was declared first.
-func (c *Compiler) collectJoinAliases(q *Query) error {
+func (c *compiler) collectJoinAliases(q *Query) error {
 	c.joinAliases = c.joinAliases[:0]
 	for i, j := range q.joins {
 		if j.alias == "" {
@@ -586,7 +590,7 @@ func (c *Compiler) collectJoinAliases(q *Query) error {
 // produce the same columns, and the semi-join machinery — which never
 // materializes a match — is strictly cheaper. That is a plan choice under a
 // proof, not a semantics choice.
-func (c *Compiler) planJoinColumns(p *plan) error {
+func (c *compiler) planJoinColumns(p *plan) error {
 	if len(p.joins) == 0 {
 		return nil
 	}
@@ -641,7 +645,7 @@ func (c *Compiler) planJoinColumns(p *plan) error {
 
 // compileOrder resolves the ORDER BY keys, enforcing the grouped-path rule and
 // skipping ordering for a single-row aggregate result.
-func (c *Compiler) compileOrder(q *Query, p *plan, values *pathRegistry) error {
+func (c *compiler) compileOrder(q *Query, p *plan, values *pathRegistry) error {
 	if p.singleRow {
 		return nil // one result row; nothing to order
 	}

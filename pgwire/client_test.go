@@ -42,6 +42,10 @@ type testClient struct {
 	t    *testing.T
 	conn net.Conn
 	br   *bufio.Reader
+	// readTimeout is normally short enough to turn a missing backend message
+	// into a prompt failure. A deliberately maximal parser-boundary test may
+	// raise it under the race detector without weakening every other test.
+	readTimeout time.Duration
 	// outbox is the client's send buffer; see newTestClient.
 	outbox chan writeRequest
 	// params are the ParameterStatus values the server reported.
@@ -69,11 +73,12 @@ type writeRequest struct {
 // pinning the server's behaviour to it would be pinning the wrong thing.
 func newTestClient(t *testing.T, conn net.Conn) *testClient {
 	c := &testClient{
-		t:      t,
-		conn:   conn,
-		br:     bufio.NewReader(conn),
-		outbox: make(chan writeRequest, 64),
-		params: map[string]string{},
+		t:           t,
+		conn:        conn,
+		br:          bufio.NewReader(conn),
+		readTimeout: 5 * time.Second,
+		outbox:      make(chan writeRequest, 64),
+		params:      map[string]string{},
 	}
 	go func() {
 		for req := range c.outbox {
@@ -191,7 +196,7 @@ func (c *testClient) sendStartup(params map[string]string) {
 // recv reads one backend message.
 func (c *testClient) recv() backendMessage {
 	c.t.Helper()
-	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 	var head [5]byte
 	if _, err := io.ReadFull(c.br, head[:]); err != nil {
 		c.t.Fatalf("read message header: %v", err)
@@ -336,6 +341,20 @@ func decodeRowDescription(t *testing.T, body []byte) []describedColumn {
 	return cols
 }
 
+func decodeParameterDescription(t *testing.T, body []byte) []int32 {
+	t.Helper()
+	f := fields{b: body}
+	n := f.int16()
+	oids := make([]int32, n)
+	for i := range oids {
+		oids[i] = f.int32()
+	}
+	if err := f.end(); err != nil {
+		t.Fatalf("malformed ParameterDescription: %v", err)
+	}
+	return oids
+}
+
 // errorFields decodes an ErrorResponse into its field map.
 func errorFields(body []byte) map[byte]string {
 	out := map[byte]string{}
@@ -455,7 +474,13 @@ func testDatabase(t testing.TB, name string, docs []string) *store.Database {
 // newTestServer builds a server over the corpus in a collection named "users".
 func newTestServer(t *testing.T, opts Options) *Server {
 	t.Helper()
-	srv := NewServer(FromDatabase(testDatabase(t, "users", corpus)), opts)
+	if opts.Auth == nil {
+		opts.Auth = Trust()
+	}
+	srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)), opts)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 	t.Cleanup(func() {
 		if err := srv.Close(); err != nil && !errors.Is(err, ErrServerClosed) {
 			t.Errorf("Server.Close: %v", err)

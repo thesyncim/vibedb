@@ -1,27 +1,49 @@
 package driver
 
 import (
-	"bytes"
+	"context"
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 type txMutation struct {
 	document []byte
-	before   []byte
+	remove   bool
+	existed  bool
+}
+
+// stagedTxMutation is one statement-local mutation. existed is resolved for
+// every new pending key before any entry is applied, so a failed snapshot read
+// cannot leave half of one SQL statement visible in the transaction overlay.
+type stagedTxMutation struct {
+	key      string
+	document []byte
 	remove   bool
 	existed  bool
 }
 
 type txTable struct {
-	snapshot *durable.Snapshot
-	pending  map[string]*txMutation
-	order    []string
+	snapshot         *durable.Snapshot
+	pending          map[string]*txMutation
+	order            []string
+	primaryKey       string
+	primary          vibejson.CompiledPointer
+	schema           *store.Schema
+	limits           durable.Options
+	conflicts        *txConflictClock
+	conflictRevision uint64
+	overlaySource    query.FileOverlaySource
+	emptyDocs        store.Segment
+	existenceScratch []byte
+	validationTape   []vibejson.IndexEntry
+	stagedBytes      int
 }
 
 // tx owns the generation-leased snapshots captured by BeginTx. Writes are
@@ -35,26 +57,50 @@ type tx struct {
 	done       bool
 }
 
-var _ sqldriver.Tx = (*tx)(nil)
+var (
+	_ sqldriver.Tx      = (*tx)(nil)
+	_ query.FileOverlay = (*txTable)(nil)
+)
 
-func (c *conn) beginTx(options sqldriver.TxOptions) (*tx, error) {
+func (c *conn) beginTx(
+	ctx context.Context,
+	options sqldriver.TxOptions,
+) (*tx, error) {
 	switch options.Isolation {
 	case 0, 5: // database/sql LevelDefault and LevelSnapshot.
 	default:
 		return nil, fmt.Errorf(
-			"vibedb: isolation level %d is unsupported; transactions provide snapshot isolation",
-			options.Isolation)
+			"%w %d; transactions provide snapshot isolation",
+			ErrUnsupportedIsolation, options.Isolation)
 	}
 	transaction := &tx{
 		conn: c, tables: make(map[string]*txTable), readOnly: options.ReadOnly,
 	}
-	c.db.mu.RLock()
-	defer c.db.mu.RUnlock()
+	if err := lockContext(ctx, &c.db.mu); err != nil {
+		return nil, err
+	}
+	defer c.db.mu.Unlock()
 	if c.db.closed {
 		return nil, sqldriver.ErrBadConn
 	}
 	for name, table := range c.db.tables {
-		state := &txTable{pending: make(map[string]*txMutation)}
+		if err := contextCheckpoint(ctx); err != nil {
+			transaction.releaseSnapshots()
+			return nil, err
+		}
+		limits, err := tableMutationLimits(table)
+		if err != nil {
+			transaction.releaseSnapshots()
+			return nil, err
+		}
+		state := &txTable{
+			pending:    make(map[string]*txMutation),
+			primaryKey: table.meta.PrimaryKey,
+			primary:    table.primary,
+			schema:     table.schema,
+			limits:     limits,
+		}
+		state.overlaySource = query.NewFileOverlaySource(state)
 		if table.collection != nil {
 			snapshot, err := table.collection.Snapshot()
 			if err != nil {
@@ -63,7 +109,22 @@ func (c *conn) beginTx(options sqldriver.TxOptions) (*tx, error) {
 			}
 			state.snapshot = snapshot
 		}
+		if !options.ReadOnly {
+			state.conflicts = &table.conflicts
+		}
 		transaction.tables[name] = state
+	}
+	// Snapshot() itself is synchronous. A cancellation that arrived while the
+	// final table was being captured must still be observed before the
+	// transaction and its leases become visible to the caller.
+	if err := contextCheckpoint(ctx); err != nil {
+		transaction.releaseSnapshots()
+		return nil, err
+	}
+	if !options.ReadOnly {
+		for _, state := range transaction.tables {
+			state.conflictRevision = state.conflicts.begin()
+		}
 	}
 	return transaction, nil
 }
@@ -72,49 +133,102 @@ func (t *tx) querySource(tableName string) (query.Source, error) {
 	if t.done {
 		return query.Source{}, errors.New("vibedb: transaction is finished")
 	}
-	view, err := t.view(tableName)
-	if err != nil {
-		return query.Source{}, err
-	}
-	return query.FromSnapshot(view), nil
-}
-
-// view materializes the BEGIN snapshot with the transaction's bounded overlay.
-// It intentionally makes one full pass so every SELECT and mutation sees exact
-// repeatable-read and read-your-writes semantics.
-func (t *tx) view(tableName string) (store.Snapshot, error) {
 	state, ok := t.tables[tableName]
 	if !ok {
-		return store.Snapshot{}, fmt.Errorf(
-			"vibedb: table %q was not present when the transaction began", tableName)
-	}
-	heap, err := store.New(store.Options{})
-	if err != nil {
-		return store.Snapshot{}, err
+		return query.Source{}, fmt.Errorf(
+			"%w: %q was not present when the transaction began",
+			ErrTableNotFound, tableName)
 	}
 	if state.snapshot != nil {
-		var rangeErr error
-		state.snapshot.RangeRaw(func(key, document []byte) error {
-			if _, shadowed := state.pending[string(key)]; shadowed {
-				return nil
-			}
-			_, rangeErr = heap.Put(string(key), document)
-			return rangeErr
-		})
-		if rangeErr != nil {
-			return store.Snapshot{}, rangeErr
+		if len(state.pending) == 0 {
+			return query.FromFile(state.snapshot), nil
 		}
+		return query.FromFileOverlay(state.snapshot, &state.overlaySource), nil
 	}
+
+	// A table without a durable file was empty at BEGIN. Its transaction view
+	// therefore consists only of the bounded pending set. Refill one retained
+	// Segment rather than allocate a heap Collection on every read.
+	state.emptyDocs.Reset()
 	for _, key := range state.order {
 		mutation := state.pending[key]
 		if mutation.remove {
 			continue
 		}
-		if _, err := heap.Put(key, mutation.document); err != nil {
-			return store.Snapshot{}, err
+		if _, err := state.emptyDocs.Append(mutation.document); err != nil {
+			return query.Source{}, err
 		}
 	}
-	return heap.Snapshot()
+	return query.FromSegment(&state.emptyDocs), nil
+}
+
+// Lookup, RangeInserts, RangePresent, and LenDelta implement query.FileOverlay
+// directly over the transaction's bounded pending map. Documents remain stable
+// for the execution: the connection refuses another statement while rows are
+// open.
+func (s *txTable) Lookup(key []byte) (value []byte, present, shadowed bool) {
+	mutation, ok := s.pending[string(key)]
+	if !ok {
+		return nil, false, false
+	}
+	if mutation.remove {
+		return nil, false, true
+	}
+	return mutation.document, true, true
+}
+
+func (s *txTable) RangeInserts(visit func(value []byte) error) error {
+	for _, key := range s.order {
+		mutation := s.pending[key]
+		if mutation.existed || mutation.remove {
+			continue
+		}
+		if err := visit(mutation.document); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *txTable) RangePresent(visit func(value []byte) error) error {
+	for _, key := range s.order {
+		mutation := s.pending[key]
+		if mutation.remove {
+			continue
+		}
+		if err := visit(mutation.document); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *txTable) LenDelta() int64 {
+	var delta int64
+	for _, key := range s.order {
+		mutation := s.pending[key]
+		switch {
+		case mutation.existed && mutation.remove:
+			delta--
+		case !mutation.existed && !mutation.remove:
+			delta++
+		}
+	}
+	return delta
+}
+
+// appendRaw appends the transaction-visible document for key into dst.
+func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
+	if mutation, ok := s.pending[key]; ok {
+		if mutation.remove {
+			return dst, false, nil
+		}
+		return append(dst, mutation.document...), true, nil
+	}
+	if s.snapshot == nil {
+		return dst, false, nil
+	}
+	return s.snapshot.AppendRaw(dst, key)
 }
 
 func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.Result, error) {
@@ -122,20 +236,30 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 		return nil, errors.New("vibedb: transaction is finished")
 	}
 	if t.readOnly {
-		return nil, errors.New("vibedb: mutation attempted in a read-only transaction")
+		return nil, ErrReadOnlyTransaction
 	}
 	switch statement.Kind() {
 	case query.DDLCreateTable, query.DDLCreateIndex:
-		return nil, errors.New("vibedb: schema definitions cannot run inside a transaction")
+		return nil, ErrDDLInTransaction
 	}
 	tableName := statement.Collection()
+	state, ok := t.tables[tableName]
+	if !ok {
+		return nil, fmt.Errorf(
+			"%w: %q was not present when the transaction began",
+			ErrTableNotFound, tableName)
+	}
 	t.conn.db.mu.RLock()
 	table, exists := t.conn.db.tables[tableName]
+	var collection *durable.Collection
+	if exists {
+		collection = table.collection
+	}
 	t.conn.db.mu.RUnlock()
 	if !exists {
-		return nil, fmt.Errorf("vibedb: table %q does not exist", tableName)
+		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, tableName)
 	}
-	if len(table.meta.Indexes) != 0 {
+	if collection != nil && !collection.SupportsUpdate() {
 		return nil, fmt.Errorf("%w: table %q: %w",
 			ErrTransactionIndexedTable, tableName, durable.ErrPrimaryBatchIndexedUnsupported)
 	}
@@ -144,43 +268,100 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 			"vibedb: a transaction writes exactly one table; it already writes %q and cannot also write %q",
 			t.writeTable, tableName)
 	}
-	state, ok := t.tables[tableName]
-	if !ok {
-		return nil, fmt.Errorf(
-			"vibedb: table %q was not present when the transaction began", tableName)
-	}
+	limits := state.limits
 
-	type stagedMutation struct {
-		key      string
-		document []byte
-		remove   bool
-	}
-	var staged []stagedMutation
+	var staged []stagedTxMutation
 	switch statement.Kind() {
 	case query.DMLInsert:
 		tree := statement.Tree().Insert
+		replaceable := 0
+		for _, key := range state.order {
+			if state.pending[key].remove {
+				replaceable++
+			}
+		}
+		remainingDocuments := limits.MaxBatchDocuments -
+			len(state.order) + replaceable
+		if len(tree.Rows) > remainingDocuments {
+			return nil, fmt.Errorf(
+				"%w: INSERT has %d rows but table %q has room for at most %d transaction keys: %w",
+				ErrTransactionTooLarge, len(tree.Rows), tableName,
+				remainingDocuments, durable.ErrBatchTooLarge,
+			)
+		}
+		seen := make(map[string]struct{}, len(tree.Rows))
+		scratch := t.conn.pointRaw[:0]
+		prospectiveBytes := state.stagedBytes
 		for i := range tree.Rows {
 			document, key, err := resolveInsertRow(
-				statement, tree, &tree.Rows[i], args, table.meta.PrimaryKey)
+				statement, tree, &tree.Rows[i], args,
+				state.primaryKey, state.primary, limits,
+			)
 			if err != nil {
 				return nil, err
 			}
-			staged = append(staged, stagedMutation{key: key, document: document})
+			if err := validateDocument(
+				state.schema, document, limits.MaxDocumentBytes,
+				&state.validationTape,
+			); err != nil {
+				return nil, err
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return nil, fmt.Errorf("%w: %q appears twice in one VALUES batch",
+					ErrDuplicatePrimaryKey, key)
+			}
+			seen[key] = struct{}{}
+			previous := state.pending[key]
+			if previous != nil {
+				prospectiveBytes -= len(key) + len(previous.document)
+			}
+			prospectiveBytes += len(key) + len(document)
+			if prospectiveBytes > limits.MaxBatchBytes {
+				t.conn.pointRaw = scratch
+				return nil, fmt.Errorf(
+					"%w: INSERT would stage %d key/document bytes for table %q, limit %d: %w",
+					ErrTransactionTooLarge, prospectiveBytes, tableName,
+					limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+				)
+			}
+			var found bool
+			scratch, found, err = state.appendRaw(scratch[:0], key)
+			if err != nil {
+				t.conn.pointRaw = scratch
+				return nil, err
+			}
+			if found {
+				t.conn.pointRaw = scratch
+				return nil, fmt.Errorf("%w: %q", ErrDuplicatePrimaryKey, key)
+			}
+			staged = append(staged, stagedTxMutation{key: key, document: document})
 		}
+		t.conn.pointRaw = scratch
 	case query.DMLUpdate:
-		document, err := statement.Document(statement.Tree().Update.Doc, args)
+		document, err := operandDocument(
+			statement, statement.Tree().Update.Doc, args)
 		if err != nil {
 			return nil, err
 		}
-		view, err := t.view(tableName)
+		if len(document) > limits.MaxDocumentBytes {
+			return nil, durable.ErrDocumentTooLarge
+		}
+		keys, err := t.conn.matchingKeysTransaction(
+			statement, args, state, len(document))
 		if err != nil {
 			return nil, err
 		}
-		keys, err := t.conn.matchingKeysSnapshot(statement, args, table, view)
-		if err != nil {
-			return nil, err
+		if len(keys) != 0 {
+			if err := validateDocument(
+				state.schema, document, limits.MaxDocumentBytes,
+				&state.validationTape,
+			); err != nil {
+				return nil, err
+			}
 		}
-		newKey, err := documentKey(document, table.meta.PrimaryKey)
+		newKey, err := documentKey(
+			document, state.primaryKey, state.primary, limits.MaxKeyBytes,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -188,28 +369,22 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 			if key != newKey {
 				return nil, errors.New("vibedb: UPDATE cannot change a document's primary key")
 			}
-			staged = append(staged, stagedMutation{key: key, document: document})
+			staged = append(staged, stagedTxMutation{key: key, document: document})
 		}
 	case query.DMLDelete:
-		view, err := t.view(tableName)
-		if err != nil {
-			return nil, err
-		}
-		keys, err := t.conn.matchingKeysSnapshot(statement, args, table, view)
+		keys, err := t.conn.matchingKeysTransaction(
+			statement, args, state, 0)
 		if err != nil {
 			return nil, err
 		}
 		for _, key := range keys {
-			staged = append(staged, stagedMutation{key: key, remove: true})
+			staged = append(staged, stagedTxMutation{key: key, remove: true})
 		}
 	default:
 		return nil, fmt.Errorf("vibedb: unsupported transaction statement %s", statement.Kind())
 	}
 
-	limit := store.MaxChunkDocuments
-	if table.collection != nil {
-		limit = table.collection.MaxBatchDocuments()
-	}
+	limit := limits.MaxBatchDocuments
 	distinct := len(state.order)
 	for _, mutation := range staged {
 		if _, present := state.pending[mutation.key]; !present {
@@ -221,10 +396,22 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 			"%w: statement would bring table %q to %d distinct keys, limit %d: %w",
 			ErrTransactionTooLarge, tableName, distinct, limit, durable.ErrBatchTooLarge)
 	}
+	stagedBytes := state.stagedBytes
 	for _, mutation := range staged {
-		if err := t.stage(state, mutation.key, mutation.document, mutation.remove); err != nil {
-			return nil, err
+		if previous := state.pending[mutation.key]; previous != nil {
+			stagedBytes -= len(mutation.key) + len(previous.document)
 		}
+		stagedBytes += len(mutation.key) + len(mutation.document)
+		if stagedBytes > limits.MaxBatchBytes {
+			return nil, fmt.Errorf(
+				"%w: statement would stage %d key/document bytes for table %q, limit %d: %w",
+				ErrTransactionTooLarge, stagedBytes, tableName,
+				limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+			)
+		}
+	}
+	if err := t.applyStagedMutations(state, staged); err != nil {
+		return nil, err
 	}
 	if len(staged) != 0 {
 		t.writeTable = tableName
@@ -232,19 +419,215 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 	return result{affected: int64(len(staged))}, nil
 }
 
-func (t *tx) stage(state *txTable, key string, document []byte, remove bool) error {
-	entry, exists := state.pending[key]
-	if !exists {
-		entry = &txMutation{}
-		if state.snapshot != nil {
-			before, found, err := state.snapshot.AppendRaw(nil, key)
-			if err != nil {
-				return err
-			}
-			entry.before, entry.existed = before, found
+// matchingKeysTransaction evaluates a DML predicate directly over the BEGIN
+// snapshot plus the bounded pending overlay. Primary-key predicates stay
+// point reads; every other predicate streams the merged view once. No heap
+// collection proportional to the base table is built.
+func (c *conn) matchingKeysTransaction(
+	statement *query.DMLStatement,
+	args []any,
+	state *txTable,
+	valueBytes int,
+) ([]string, error) {
+	budget := transactionMatchBudget{
+		table:      statement.Collection(),
+		state:      state,
+		valueBytes: valueBytes,
+		distinct:   len(state.order),
+		bytes:      state.stagedBytes,
+	}
+	var where *sqlast.Expr
+	switch statement.Tree().Kind {
+	case sqlast.KindUpdate:
+		if statement.Tree().Update.Filter != nil {
+			where = statement.Tree().Update.Filter.Where
 		}
+	case sqlast.KindDelete:
+		if statement.Tree().Delete.Filter != nil {
+			where = statement.Tree().Delete.Filter.Where
+		}
+	}
+	keys, point, err := primaryPredicateKeys(
+		where, state.primaryKey, args, c.pointKeys,
+		state.limits.MaxKeyBytes)
+	c.pointKeys = keys
+	if point || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		present := keys[:0]
+		scratch := c.pointRaw[:0]
+		for _, key := range keys {
+			var found bool
+			scratch, found, err = state.appendRaw(scratch[:0], key)
+			if err != nil {
+				c.pointRaw = scratch
+				return nil, err
+			}
+			if found {
+				if err := budget.admit(key); err != nil {
+					c.pointRaw = scratch
+					return nil, err
+				}
+				present = append(present, key)
+			}
+		}
+		clear(keys[len(present):])
+		c.pointRaw = scratch
+		c.pointKeys = present
+		return present, nil
+	}
+
+	clear(c.matchKeys)
+	keys = c.matchKeys[:0]
+	filter, err := statement.Filter(&c.exec, args, func(key, _ []byte) error {
+		owned := string(key)
+		if err := budget.admit(owned); err != nil {
+			return err
+		}
+		keys = append(keys, owned)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if state.snapshot != nil {
+		if err := state.snapshot.RangeRaw(func(key, document []byte) error {
+			if mutation, shadowed := state.pending[string(key)]; shadowed {
+				if mutation.remove {
+					return nil
+				}
+				return filter.Add(key, mutation.document)
+			}
+			return filter.Add(key, document)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for _, key := range state.order {
+		mutation := state.pending[key]
+		if mutation.existed || mutation.remove {
+			continue
+		}
+		if err := filter.Add([]byte(key), mutation.document); err != nil {
+			return nil, err
+		}
+	}
+	if err := filter.Done(); err != nil {
+		return nil, err
+	}
+	c.matchKeys = keys
+	return keys, nil
+}
+
+// transactionMatchBudget applies the transaction's distinct-key and byte
+// admission while a filtered mutation is still streaming its BEGIN snapshot.
+// Existing pending entries are replacements rather than additional keys, and
+// their prior value bytes stop counting exactly as they will in execMutation's
+// final admission pass.
+type transactionMatchBudget struct {
+	table      string
+	state      *txTable
+	valueBytes int
+	distinct   int
+	bytes      int
+}
+
+func (b *transactionMatchBudget) admit(key string) error {
+	limits := b.state.limits
+	nextDistinct := b.distinct
+	nextBytes := b.bytes
+	if previous, present := b.state.pending[key]; present {
+		nextBytes -= len(key) + len(previous.document)
+	} else {
+		nextDistinct++
+	}
+	if nextDistinct > limits.MaxBatchDocuments {
+		return fmt.Errorf(
+			"%w: statement would bring table %q above %d distinct transaction keys: %w",
+			ErrTransactionTooLarge, b.table, limits.MaxBatchDocuments,
+			durable.ErrBatchTooLarge,
+		)
+	}
+	if len(key) > limits.MaxBatchBytes-nextBytes ||
+		b.valueBytes > limits.MaxBatchBytes-nextBytes-len(key) {
+		return fmt.Errorf(
+			"%w: statement would exceed the %d-byte transaction batch limit for table %q: %w",
+			ErrTransactionTooLarge, limits.MaxBatchBytes, b.table,
+			durable.ErrBatchTooLarge,
+		)
+	}
+	b.distinct = nextDistinct
+	b.bytes = nextBytes + len(key) + b.valueBytes
+	return nil
+}
+
+func (t *tx) stage(state *txTable, key string, document []byte, remove bool) error {
+	existed := false
+	if entry, present := state.pending[key]; present {
+		existed = entry.existed
+	} else if state.snapshot != nil {
+		raw, found, err := state.snapshot.AppendRaw(
+			state.existenceScratch[:0], key,
+		)
+		state.existenceScratch = raw[:0]
+		if err != nil {
+			return err
+		}
+		existed = found
+	}
+	t.stageKnown(state, key, document, remove, existed)
+	return nil
+}
+
+// applyStagedMutations is the transaction statement's two-phase publication.
+// Resolve every potentially fallible snapshot lookup before changing pending;
+// once that pass succeeds, stageKnown only updates transaction-owned memory.
+func (t *tx) applyStagedMutations(
+	state *txTable,
+	staged []stagedTxMutation,
+) error {
+	for i := range staged {
+		mutation := &staged[i]
+		if entry, present := state.pending[mutation.key]; present {
+			mutation.existed = entry.existed
+			continue
+		}
+		if state.snapshot == nil {
+			continue
+		}
+		raw, found, err := state.snapshot.AppendRaw(
+			state.existenceScratch[:0], mutation.key,
+		)
+		state.existenceScratch = raw[:0]
+		if err != nil {
+			return err
+		}
+		mutation.existed = found
+	}
+	for i := range staged {
+		mutation := &staged[i]
+		t.stageKnown(
+			state, mutation.key, mutation.document,
+			mutation.remove, mutation.existed,
+		)
+	}
+	return nil
+}
+
+func (t *tx) stageKnown(
+	state *txTable,
+	key string,
+	document []byte,
+	remove, existed bool,
+) {
+	entry, present := state.pending[key]
+	if !present {
+		entry = &txMutation{existed: existed}
 		state.pending[key] = entry
 		state.order = append(state.order, key)
+	} else {
+		state.stagedBytes -= len(key) + len(entry.document)
 	}
 	entry.remove = remove
 	if remove {
@@ -252,7 +635,7 @@ func (t *tx) stage(state *txTable, key string, document []byte, remove bool) err
 	} else {
 		entry.document = append(entry.document[:0], document...)
 	}
-	return nil
+	state.stagedBytes += len(key) + len(entry.document)
 }
 
 func (t *tx) Commit() error {
@@ -268,44 +651,62 @@ func (t *tx) Commit() error {
 
 	t.conn.db.mu.Lock()
 	defer t.conn.db.mu.Unlock()
+	if err := t.conn.db.settleCatalogLocked(); err != nil {
+		return err
+	}
 	table := t.conn.db.tables[t.writeTable]
 	if table == nil {
 		return fmt.Errorf("vibedb: table %q no longer exists", t.writeTable)
 	}
-	if len(table.meta.Indexes) != 0 {
+	if table.collection != nil && !table.collection.SupportsUpdate() {
 		return fmt.Errorf("%w: table %q: %w",
 			ErrTransactionIndexedTable, t.writeTable, durable.ErrPrimaryBatchIndexedUnsupported)
 	}
-	if table.collection == nil {
-		var err error
-		table, err = t.conn.db.materializeLocked(t.writeTable, nil)
-		if err != nil {
-			return err
+	key, historyOverflow, conflict := state.conflicts.conflict(
+		state.conflictRevision, state.order,
+	)
+	if conflict {
+		if historyOverflow {
+			return fmt.Errorf(
+				"%w: table %q exceeded its bounded conflict history after BEGIN",
+				ErrTransactionConflict, t.writeTable,
+			)
 		}
+		return fmt.Errorf(
+			"%w: table %q key %q changed after BEGIN",
+			ErrTransactionConflict, t.writeTable, key,
+		)
+	}
+	if table.collection == nil {
+		seeds := make([]seedDocument, 0, len(state.order))
+		for _, key := range state.order {
+			entry := state.pending[key]
+			if !entry.remove {
+				seeds = append(seeds, seedDocument{
+					key: key, document: entry.document,
+				})
+			}
+		}
+		if len(seeds) == 0 {
+			return nil
+		}
+		_, err := t.conn.db.materializeLocked(t.writeTable, seeds)
+		if table.collection != nil {
+			table.conflicts.recordTransaction(state)
+		}
+		return transactionBatchError(err)
 	}
 	collection := table.collection
+	beforeGeneration := collection.Generation()
 	err := collection.Update(func(batch *durable.WriteBatch) error {
-		live, err := collection.Snapshot()
-		if err != nil {
-			return err
-		}
-		defer live.Close()
-		var scratch []byte
 		for _, key := range state.order {
 			entry := state.pending[key]
-			current, found, err := live.AppendRaw(scratch[:0], key)
-			if err != nil {
-				return err
+			// INSERT followed by DELETE in one transaction is a net no-op for
+			// a key absent at BEGIN. Do not make another transaction conflict
+			// with an event that was never published.
+			if !entry.existed && entry.remove {
+				continue
 			}
-			scratch = current
-			if found != entry.existed || (found && !bytes.Equal(current, entry.before)) {
-				return fmt.Errorf(
-					"%w: table %q key %q changed after BEGIN",
-					ErrTransactionConflict, t.writeTable, key)
-			}
-		}
-		for _, key := range state.order {
-			entry := state.pending[key]
 			if entry.remove {
 				if err := batch.Delete(key); err != nil {
 					return transactionBatchError(err)
@@ -316,6 +717,9 @@ func (t *tx) Commit() error {
 		}
 		return nil
 	})
+	if collectionMutationPublished(collection, beforeGeneration, err) {
+		table.conflicts.recordTransaction(state)
+	}
 	return transactionBatchError(err)
 }
 
@@ -344,8 +748,24 @@ func (t *tx) finish() {
 	t.done = true
 	t.releaseSnapshots()
 	if t.conn != nil {
-		t.conn.tx = nil
+		connection := t.conn
+		connection.db.mu.Lock()
+		for _, state := range t.tables {
+			if state.conflicts != nil {
+				state.conflicts.finish(state.conflictRevision)
+			}
+		}
+		connection.db.mu.Unlock()
+		if connection.tx == t {
+			connection.tx = nil
+		}
 	}
+	// A completed transaction is never executable again. Drop the connection
+	// and table graph so retaining the driver.Tx value cannot pin the database,
+	// staged documents, validation tapes, or overlay high-water storage.
+	t.conn = nil
+	t.tables = nil
+	t.writeTable = ""
 }
 
 func (t *tx) releaseSnapshots() {

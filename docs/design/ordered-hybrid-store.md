@@ -306,8 +306,8 @@ the frame forces the ordinary COW path.
 ### Multi-document batches (`Update`)
 
 `Update` publishes an arbitrary set of puts and deletes as one failure-atomic
-generation, the primary-graph transactional surface the Go-native/database/sql
-direction needs. It reuses the single-mutation canonical-frame primitives per
+generation, the primary-graph transactional surface the shared typed SQL
+runtime needs. It reuses the single-mutation canonical-frame primitives per
 document — the same `preparePrimaryLeafMutation` and dirty-frame admission —
 rather than a second mutation engine, so posting maintenance and leaf geometry
 compose into it unchanged. The commit runs in three strict phases:

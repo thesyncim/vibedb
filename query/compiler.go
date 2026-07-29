@@ -8,15 +8,7 @@ import (
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
-// The reusable compilation front end.
-//
-// Compiling a query document used to cost roughly seventy allocations spread
-// evenly over the whole lowering — the predicate nodes, the compiled paths,
-// the needle tapes, the literals' decimal spellings, the headers, and the path
-// registry's map. No single one dominated, so no point fix could reach the
-// zero-allocation steady state the rest of this package already offers through
-// RunInto and Workspace. A Compiler is the same answer applied to compilation:
-// caller-owned storage that a warmed compile refills instead of reallocating.
+// The reusable plan compiler behind prepared SQL statements.
 //
 // Every arena here is a chunkArena rather than an append-grown slice. A plan
 // is a graph of interior pointers — a *compiledPredicate points at a node, a
@@ -27,42 +19,17 @@ import (
 // allocated, so an issued pointer stays valid for as long as the compiler is
 // not rewound.
 
-// A Compiler compiles query documents with reusable storage. Its zero value is
-// ready to use. It is single-consumer and not safe for concurrent use.
+// A compiler owns the reusable storage a [Statement] refills when SQL
+// placeholders are rebound. Its zero value is ready to use. It is
+// single-consumer and not safe for concurrent use.
 //
-// Compiling into dst invalidates whatever dst held before, and a Query
-// compiled by a Compiler borrows that compiler's storage: it is valid only
-// until the next compile with the same Compiler (or until [Compiler.Release]).
-// This is the same borrowed-lifetime rule [Result] and [Workspace] already
-// carry, for the same reason — the storage that makes the steady state
-// allocation-free is the storage the previous answer is still pointing at. Two
-// Queries produced by one Compiler therefore cannot be used at the same time;
-// give each long-lived Query its own Compiler, or compile it with the
-// package-level [Parse] and [New], which own everything they return.
-//
-// A Query a Compiler produced is still safe to execute concurrently, exactly
-// like any other compiled Query: the plan it borrows is immutable for as long
-// as it is valid, and execution state lives in one [Exec] per goroutine. What
-// is not safe is compiling with the Compiler while one of its Queries runs.
-//
-// A first compile cannot be literally allocation-free — the Query owns its
-// paths, headers, literals, and needles, and the arenas have to come from
-// somewhere. The contract is zero steady-state allocation: after one warm-up
-// compile of comparable shape, every later compile refills the same chunks.
-type Compiler struct {
-	// entries is the structural index of the document being read. Nothing the
-	// plan retains points into it — every path, alias, literal, and needle is
-	// interned — so it is a plain reused slice rather than an arena.
-	entries []vibejson.IndexEntry
-
-	// scratch unescapes object keys and string values, needle renders
-	// containment needles, and tmp builds headers and derived pointer paths.
-	// They are separate buffers because each is live across a call that uses
-	// one of the others, and a single shared one would silently truncate the
-	// caller's view rather than fail.
-	scratch []byte
-	needle  []byte
-	tmp     []byte
+// A plan compiled in this storage remains valid until the next compile or
+// release. This is the same borrowed-lifetime rule [Result] and
+// [Workspace] carry: retaining high-water storage is what makes repeated
+// bind-and-execute allocation-free.
+type compiler struct {
+	// tmp builds headers, exact numeric spellings, and derived pointer paths.
+	tmp []byte
 
 	// Arenas whose storage a compiled plan retains.
 	text  chunkArena[byte]                // interned strings and literal digits
@@ -111,10 +78,6 @@ type Compiler struct {
 	leaves  []scalarContainmentLeaf
 	members []effectiveMember
 
-	// keys is the sorted-member stack the Go-literal front end walks objects
-	// through; see pushSortedKeys for why it is a stack.
-	keys []string
-
 	// counts is coalesceEqualityDisjuncts' per-column tally. It is a slice
 	// scanned linearly rather than a map: a disjunction names a couple of
 	// columns, and the map cost one allocation plus a hash per operand.
@@ -128,17 +91,14 @@ type Compiler struct {
 	//
 	// They are pointers rather than embedded values for an escape-analysis
 	// reason worth stating, because it is invisible and easy to undo:
-	// returning &c.plan from any method makes that method leak its receiver,
-	// which forces every Compiler — including the throwaway one behind the
-	// package-level Parse — onto the heap, a kilobyte of overhead per call on
-	// the front end that can least afford it. Handing back a pointer the
-	// Compiler merely holds leaks nothing.
+	// returning &c.plan from any method makes that method leak its receiver.
+	// Handing back a pointer the compiler merely holds leaks nothing.
 	plan   *plan
 	result *compileResult
 
-	// oneShot marks a compiler the package-level front ends own: it compiles
-	// exactly once and is then unreachable except through the plan it
-	// produced, so nothing can ever rewind it.
+	// oneShot marks the compiler a programmatic builder Query creates for its lazy
+	// first compile: it compiles exactly once and is then unreachable except
+	// through the plan it produced, so nothing can ever rewind it.
 	//
 	// It is a genuinely different allocation strategy, not a tuning knob. A
 	// reusable compiler wants chunks, because a chunk amortizes over every
@@ -158,13 +118,13 @@ type Compiler struct {
 	paths pathCache
 }
 
-// forOneShot puts c in the strategy the package-level front ends need: exact
+// forOneShot puts c in the strategy a programmatic builder Query needs: exact
 // allocation instead of chunking, no path memo, and a heap-allocated plan.
 //
 // The flag is pushed down into each arena rather than consulted through c on
 // every reservation, so the arenas stay self-contained and the branch is one
 // predictable load next to the storage it decides about.
-func (c *Compiler) forOneShot() {
+func (c *compiler) forOneShot() {
 	c.oneShot = true
 	c.text.direct = true
 	c.tape.direct = true
@@ -178,70 +138,15 @@ func (c *Compiler) forOneShot() {
 	c.tree.direct = true
 }
 
-// New compiles a query document written as Go literals into dst, reusing c's
-// storage. It is [New] with a caller-owned compiler; see [Compiler] for the
-// lifetime dst inherits.
-func (c *Compiler) New(dst *Query, doc M) error {
-	return c.compileDocument(dst, litValue(doc))
-}
-
-// Parse compiles a query document from JSON text into dst, reusing c's
-// storage. It is [Parse] with a caller-owned compiler; see [Compiler] for the
-// lifetime dst inherits.
-//
-// Parse borrows src only while it compiles. Everything dst retains — paths,
-// aliases, literals, and containment needles — is copied into c's arenas, so
-// src may be reused or modified as soon as Parse returns. What dst does not
-// survive is the next compile with c.
-func (c *Compiler) Parse(dst *Query, src []byte) error {
-	index, err := c.index(src)
-	if err != nil {
-		return c.fail(dst, err)
-	}
-	return c.compileDocument(dst, nodeValue(index.Root()))
-}
-
-// Release drops every chunk c retains, returning it to its zero state and
-// invalidating every Query compiled with it. Reusing a warm Compiler is the
-// point of having one — the retained high-water chunks are what make a
-// steady-state compile allocation-free — so Release is for after one unusually
-// large query whose arenas should not stay pinned for the rest of c's
-// lifetime.
-func (c *Compiler) Release() {
+// release drops every chunk c retains, returning it to its zero state and
+// invalidating its current plan. Reusing a warm compiler is the point of
+// having one, so release is for after one unusually large statement whose
+// arenas should not stay pinned.
+func (c *compiler) release() {
 	if c == nil {
 		return
 	}
-	*c = Compiler{}
-}
-
-// index builds the structural index of a query document into c's reused entry
-// storage.
-func (c *Compiler) index(src []byte) (vibejson.Index, error) {
-	need, err := vibejson.RequiredIndexEntries(src)
-	if err != nil {
-		return vibejson.Index{}, err
-	}
-	if cap(c.entries) < need {
-		c.entries = make([]vibejson.IndexEntry, need)
-	}
-	return vibejson.BuildIndex(src, c.entries[:need])
-}
-
-// compileDocument rewinds c, lowers a query document into dst, and compiles
-// the resulting plan, so a malformed query fails here rather than at the first
-// Run.
-func (c *Compiler) compileDocument(dst *Query, root qvalue) error {
-	c.rewind()
-	c.prepare(dst)
-	if err := c.buildQuery(dst, root); err != nil {
-		return c.fail(dst, err)
-	}
-	p, err := c.compilePlan(dst)
-	if err != nil {
-		return c.fail(dst, err)
-	}
-	dst.built = c.outcome(p, nil)
-	return nil
+	*c = compiler{}
 }
 
 // outcome publishes a compile result. A reusable compiler overwrites its own,
@@ -251,7 +156,7 @@ func (c *Compiler) compileDocument(dst *Query, root qvalue) error {
 // The halves are passed separately rather than as one compileResult: taking
 // the address of a by-value parameter in either branch would make it escape in
 // both, putting a heap allocation back on the reusable path that has none.
-func (c *Compiler) outcome(p *plan, err error) *compileResult {
+func (c *compiler) outcome(p *plan, err error) *compileResult {
 	if c.oneShot {
 		return &compileResult{plan: p, err: err}
 	}
@@ -264,7 +169,7 @@ func (c *Compiler) outcome(p *plan, err error) *compileResult {
 
 // planStorage returns the plan this compile writes into: the compiler's own
 // for a reusable compiler, a fresh one otherwise.
-func (c *Compiler) planStorage() *plan {
+func (c *compiler) planStorage() *plan {
 	if c.oneShot {
 		return new(plan)
 	}
@@ -278,7 +183,7 @@ func (c *Compiler) planStorage() *plan {
 // only returned so a caller that ignores the error and runs dst anyway sees
 // that same error instead of executing whichever half-lowered clauses survived
 // into dst before the failure.
-func (c *Compiler) fail(dst *Query, err error) error {
+func (c *compiler) fail(dst *Query, err error) error {
 	c.prepare(dst)
 	dst.built = c.outcome(nil, err)
 	return err
@@ -286,7 +191,7 @@ func (c *Compiler) fail(dst *Query, err error) error {
 
 // prepare resets dst onto c's retained builder storage, so lowering appends
 // into capacity the previous compile already grew.
-func (c *Compiler) prepare(dst *Query) {
+func (c *compiler) prepare(dst *Query) {
 	dst.built = nil
 	dst.columns = c.columns[:0]
 	dst.groupBy = c.groupBy[:0]
@@ -300,7 +205,7 @@ func (c *Compiler) prepare(dst *Query) {
 
 // keep takes back the builder storage dst grew, so the next compile starts
 // from this compile's high-water capacity.
-func (c *Compiler) keep(dst *Query) {
+func (c *compiler) keep(dst *Query) {
 	c.columns = dst.columns
 	c.groupBy = dst.groupBy
 	c.orderBy = dst.orderBy
@@ -310,7 +215,7 @@ func (c *Compiler) keep(dst *Query) {
 // rewind returns every arena and reused slice to empty while keeping the
 // storage behind it. Only the path memo survives, because it is the one thing
 // here that is not per-compile state.
-func (c *Compiler) rewind() {
+func (c *compiler) rewind() {
 	c.text.rewind()
 	c.tape.rewind()
 	c.nodes.rewind()
@@ -325,18 +230,16 @@ func (c *Compiler) rewind() {
 	c.numbers.reset()
 	c.leaves = c.leaves[:0]
 	c.members = c.members[:0]
-	c.keys = c.keys[:0]
 	c.counts = c.counts[:0]
 }
 
 // reserve grows s so that n more elements fit without reallocating, and
 // returns it with its length unchanged.
 //
-// It matters most on the one-shot path, where a slice starts empty and every
-// doubling is an allocation the compile never recovers: appending five columns
-// into a nil slice is four allocations, and reserving five up front is one. A
-// warm compiler is already past its high-water mark and reserve is a no-op
-// there, which is why the callers can reserve unconditionally.
+// It matters most on the Go builder's one-shot path, where a slice starts
+// empty and every doubling is an allocation the compile never recovers. A warm
+// prepared-statement compiler is already past its high-water mark and reserve
+// is a no-op there.
 func reserve[T any](s []T, n int) []T {
 	if n <= cap(s)-len(s) {
 		return s
@@ -350,7 +253,7 @@ func reserve[T any](s []T, n int) []T {
 // what lets the plan retain a name read out of a caller's src bytes or out of
 // the shared unescaping scratch: both are gone or overwritten by the time the
 // query runs.
-func (c *Compiler) intern(b []byte) string {
+func (c *compiler) intern(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
@@ -358,7 +261,7 @@ func (c *Compiler) intern(b []byte) string {
 }
 
 // internString is intern for a string source.
-func (c *Compiler) internString(s string) string {
+func (c *compiler) internString(s string) string {
 	if len(s) == 0 {
 		return ""
 	}
@@ -367,7 +270,7 @@ func (c *Compiler) internString(s string) string {
 
 // bytes copies b into the text arena and returns the arena's copy, the form a
 // literal's decimal spelling and a needle's source text are retained in.
-func (c *Compiler) bytes(b []byte) []byte {
+func (c *compiler) bytes(b []byte) []byte {
 	dst := c.text.allocDirty(len(b))
 	copy(dst, b)
 	return dst
@@ -386,14 +289,14 @@ const pathCacheMax = 256
 // A pathCache memoizes compilePath across compiles. compilePath is a pure
 // function of its spec and the compiledPath it returns is immutable, so the
 // token slice vibejson.CompilePointer allocates is the one piece of plan
-// storage that can be shared by every Query a Compiler produces.
+// storage that can be shared across a statement's successive bindings.
 type pathCache struct {
 	entries []cachedPath
 }
 
 // A cachedPath is one memoized compilation, including a failure: an invalid
-// pointer spec fails identically every time, and remembering that is what
-// keeps a repeatedly compiled bad query from re-running the parser.
+// pointer spec fails identically every time, and remembering that keeps a
+// repeatedly bound bad statement from re-running the pointer parser.
 type cachedPath struct {
 	spec string
 	path compiledPath
@@ -406,7 +309,7 @@ type cachedPath struct {
 // the lowering points into the text arena, and vibejson.CompilePointer's
 // pointer string and token texts would then alias that arena too — so the next
 // compile's rewind would rewrite the tokens of every previously compiled path.
-func (c *Compiler) compilePath(spec string) (compiledPath, error) {
+func (c *compiler) compilePath(spec string) (compiledPath, error) {
 	if c.oneShot {
 		// Nothing will rewind this compiler, so the arena spec outlives the
 		// plan and the compiled pointer may borrow it.
@@ -426,17 +329,17 @@ func (c *Compiler) compilePath(spec string) (compiledPath, error) {
 	return path, err
 }
 
-// --- arena-backed builder constructors ------------------------------------
+// --- arena-backed plan constructors ---------------------------------------
 
 // operands reserves an arena-backed operand list of exactly n predicates. The
 // callers all know their operand count up front, so the returned slice is
 // appended into and never outgrows its reservation.
-func (c *Compiler) operands(n int) []Predicate {
+func (c *compiler) operands(n int) []Predicate {
 	return c.tree.alloc(n)[:0]
 }
 
-// pair is the two-operand operand list the $in-with-null rewrite needs.
-func (c *Compiler) pair(a, b Predicate) []Predicate {
+// pair is the two-operand list SQL's IN-with-NULL rewrite needs.
+func (c *compiler) pair(a, b Predicate) []Predicate {
 	kids := c.tree.alloc(2)
 	kids[0], kids[1] = a, b
 	return kids
@@ -444,7 +347,7 @@ func (c *Compiler) pair(a, b Predicate) []Predicate {
 
 // not negates a predicate without the one-element slice literal [Not] builds,
 // which would be a heap allocation per negation on the arena path.
-func (c *Compiler) not(inner Predicate) Predicate {
+func (c *compiler) not(inner Predicate) Predicate {
 	kids := c.tree.alloc(1)
 	kids[0] = inner
 	return Predicate{kind: predNot, kids: kids}
@@ -452,18 +355,18 @@ func (c *Compiler) not(inner Predicate) Predicate {
 
 // aggColumn builds an aggregate column with an interned header, the arena
 // spelling of [Sum] and its siblings.
-func (c *Compiler) aggColumn(kind aggKind, name, spec string) Column {
+func (c *compiler) aggColumn(kind aggKind, name, spec string) Column {
 	return Column{agg: kind, spec: spec, header: c.aggHeader(name, spec)}
 }
 
 // countColumn builds COUNT(path) with an interned header.
-func (c *Compiler) countColumn(spec string) Column {
+func (c *compiler) countColumn(spec string) Column {
 	return Column{agg: aggCount, spec: spec, header: c.aggHeader("count", spec)}
 }
 
 // aggHeader renders "name(spec)" into the text arena rather than concatenating
 // two strings onto the heap.
-func (c *Compiler) aggHeader(name, spec string) string {
+func (c *compiler) aggHeader(name, spec string) string {
 	buf := append(c.tmp[:0], name...)
 	buf = append(buf, '(')
 	buf = append(buf, spec...)
@@ -477,16 +380,16 @@ func (c *Compiler) aggHeader(name, spec string) string {
 // arenaChunkBytes is the byte budget of an arena's first chunk. It is a byte
 // budget rather than an element count because these arenas hold everything
 // from single bytes to quarter-kilobyte predicate nodes: one element count for
-// all of them either over-provisions the wide types by tens of kilobytes — a
-// bill the one-shot package-level [Parse] pays in full and never reuses — or
-// splits the interned-text arena across a dozen chunks. Later chunks double,
+// all of them either over-provisions the wide types by tens of kilobytes on a
+// builder's one-shot compile, or splits the interned-text arena across a dozen
+// chunks. Later chunks double,
 // so the chunk count stays logarithmic in the query's size whichever type it
 // is, and alloc's linear scan over them stays trivial.
 //
 // The budget is deliberately small. A warm compiler reaches its high-water
 // chunk set within a compile or two whatever the budget is, so the only thing
-// a larger one buys is a bigger bill for the throwaway compiler behind the
-// one-shot [Parse] and [New], which never gets to reuse a byte of it.
+// a larger one buys is a bigger bill for the throwaway compiler behind a
+// builder Query, which never gets to reuse a byte of it.
 const arenaChunkBytes = 128
 
 // arenaMinElements floors the first chunk for the wide element types, whose
@@ -525,7 +428,7 @@ type chunkArena[T any] struct {
 	// exactly sized allocation. Chunking is a bet that a later compile will
 	// use the rest of the chunk, and a one-shot compiler is the case where
 	// that bet is known to lose — the leftover of every partly filled chunk is
-	// pure waste on the package-level Parse's bill. Both strategies satisfy
+	// pure waste on a one-shot builder compile's bill. Both strategies satisfy
 	// the same contract, an issued slice stays valid until rewind, which is
 	// why the callers above cannot tell them apart.
 	direct bool
@@ -593,7 +496,7 @@ func (a *chunkArena[T]) one() *T {
 
 // rewind returns every chunk to unused without freeing any of it. Every slice
 // and pointer previously handed out is invalid from here on; that invalidation
-// is the Compiler's documented contract.
+// is the compiler's documented contract.
 func (a *chunkArena[T]) rewind() {
 	a.at = 0
 	a.used = 0

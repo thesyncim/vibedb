@@ -82,12 +82,11 @@ import (
 // numeric in the first place.
 //
 // SUM, AVG, MIN, and MAX are json rather than numeric, so a client that wants
-// a decimal type gets a JSON number. There is a second, larger caveat that
-// belongs to the engine and not to this package: a computed aggregate that is
-// not an integer is held as a float64 inside [query.Cell] and formatted from
-// there, so AVG's exactness is bounded by float64 before this code ever sees
-// it. Projected numbers, which are the ones the exactness guarantee is about,
-// keep their document bytes and are unaffected.
+// a decimal type gets a JSON number. SUM, MIN, and MAX preserve exact decimal
+// values. AVG returns an exact finite quotient when one exists and otherwise
+// rounds once to 34 significant decimal digits, ties to even. The executor
+// bounds the retained exact-decimal workspace and fails rather than substituting
+// a float64 approximation when that budget is exhausted.
 //
 // # Absent, null, and NULL
 //
@@ -114,6 +113,7 @@ type columnType struct {
 var (
 	typeJSON = columnType{oid: oidJSON, size: -1}
 	typeInt8 = columnType{oid: oidInt8, size: 8}
+	typeBool = columnType{oid: oidBool, size: 1}
 	typeText = columnType{oid: oidText, size: -1}
 )
 
@@ -149,7 +149,10 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 // single most damaging inconsistency available in this protocol, because the
 // client decodes without complaint and gets nonsense, so the formats are passed
 // in from the same slice the row encoder reads.
-func (w *writer) rowDescription(cols []column, formats []int16) {
+func (w *writer) rowDescription(cols []column, formats []int16) error {
+	if err := checkRowDescription(cols); err != nil {
+		return err
+	}
 	w.begin(msgRowDescription)
 	w.int16(len(cols))
 	for i, c := range cols {
@@ -162,6 +165,116 @@ func (w *writer) rowDescription(cols []column, formats []int16) {
 		w.int16(int(formatFor(formats, i)))
 	}
 	w.end()
+	return nil
+}
+
+// checkRowDescription admits the complete message before the writer touches
+// its buffer. A column name is SQL input, and repeating a large one is an
+// output-amplification path unless the sum is bounded independently of the
+// frontend message that produced it.
+func checkRowDescription(cols []column) error {
+	if len(cols) > maxResultColumns {
+		return newError(sqlstateProgramLimitExceeded,
+			"a result has too many columns for the PostgreSQL protocol boundary")
+	}
+	size := 2 // Int16 field count.
+	for i := range cols {
+		// One terminating NUL plus the 18 fixed bytes following each name.
+		const fixed = 1 + 4 + 2 + 4 + 2 + 4 + 2
+		n := len(cols[i].name) + fixed
+		if n > maxRowDescriptionBytes-size {
+			return newError(sqlstateProgramLimitExceeded,
+				"a RowDescription exceeds the PostgreSQL message bound")
+		}
+		size += n
+	}
+	return nil
+}
+
+// checkDataRows walks a copy of an executed cursor and admits every DataRow
+// before the first one is written.
+//
+// Result materialization already happens atomically under the executor's row
+// and byte budgets. The protocol has one additional, independent constraint:
+// each backend message body is bounded by maxDataRowBytes. A small first row
+// followed by a row that repeats one large projection many times must not send
+// the first row and only then discover that the second cannot be represented.
+// Cursor is deliberately a value, so this pass advances only its copy and
+// retains no per-row storage.
+func checkDataRows(cursor query.Cursor, cols []column, formats []int16) error {
+	if len(cols) > maxResultColumns {
+		return newError(sqlstateProgramLimitExceeded,
+			"a result row has too many columns for the PostgreSQL protocol boundary")
+	}
+	framing := 2 + 4*len(cols)
+	if framing > maxDataRowBytes {
+		return newError(sqlstateProgramLimitExceeded,
+			"a result row has too many columns for the PostgreSQL message bound")
+	}
+	for cursor.Next() {
+		size := framing
+		for i := range cols {
+			cell := cursor.Cell(i)
+			if cell.IsNull() {
+				continue
+			}
+			n, err := cellWireSize(cell, cols[i].typ, formatFor(formats, i))
+			if err != nil {
+				return err
+			}
+			if n > maxDataRowBytes-size {
+				return newError(sqlstateProgramLimitExceeded,
+					"a result row exceeds the PostgreSQL message bound")
+			}
+			size += n
+		}
+	}
+	return nil
+}
+
+// cellWireSize is the allocation-free size twin of appendCell. Keep the two
+// switches exhaustive together: preflight must reject every value appendCell
+// would reject, and must return exactly the number of bytes appendCell writes.
+func cellWireSize(cell query.Cell, typ columnType, format int16) (int, error) {
+	switch typ.oid {
+	case oidInt8:
+		v, ok := cell.Int64()
+		if !ok {
+			return 0, newError(sqlstateInternalError,
+				"a column declared int8 produced a value that is not an integer")
+		}
+		if format == formatBinary {
+			return 8, nil
+		}
+		var scratch [32]byte
+		return len(strconv.AppendInt(scratch[:0], v, 10)), nil
+
+	case oidJSON:
+		if cell.IsExtension() {
+			return 0, newError(sqlstateInternalError,
+				"a result cell produced no JSON encoding")
+		}
+		if payload := cell.Payload(); payload != nil {
+			if len(payload) == 0 {
+				return 0, newError(sqlstateInternalError,
+					"a result cell produced no JSON encoding")
+			}
+			return len(payload), nil
+		}
+		// Only computed numeric cells have no source spelling. Every JSON
+		// number produced by the executor fits in this fixed scratch: int64 is
+		// at most 20 bytes and float64's shortest round-trip form at most 24.
+		var scratch [32]byte
+		encoded := cell.AppendJSON(scratch[:0])
+		if len(encoded) == 0 {
+			return 0, newError(sqlstateInternalError,
+				"a result cell produced no JSON encoding")
+		}
+		return len(encoded), nil
+
+	default:
+		return 0, newError(sqlstateInternalError, "unhandled result column type")
+	}
 }
 
 // appendCell appends one cell's wire encoding for the given declared type and
@@ -236,15 +349,41 @@ const nullSpan = int32(-1)
 func (e *rowEncoder) row(w *writer, cells []query.Cell, cols []column, formats []int16) error {
 	e.values = e.values[:0]
 	e.spans = e.spans[:0]
+	if len(cells) != len(cols) {
+		return newError(sqlstateInternalError,
+			"the executor returned a row whose width does not match its result schema")
+	}
+	if len(cells) > maxResultColumns {
+		return newError(sqlstateProgramLimitExceeded,
+			"a result row has too many columns for the PostgreSQL protocol boundary")
+	}
+	// The body begins with the column count and one length word per column.
+	// Account that fixed framing before any value is copied, then admit each
+	// payload against the remaining row budget. This is the output-side
+	// counterpart to maxMessageBody: projecting one large value repeatedly
+	// must not amplify a tiny SELECT into an unbounded backend allocation.
+	framing := 2 + 4*len(cells)
+	if framing > maxDataRowBytes {
+		return newError(sqlstateProgramLimitExceeded,
+			"a result row has too many columns for the PostgreSQL message bound")
+	}
 	for i := range cells {
 		if cells[i].IsNull() {
 			e.spans = append(e.spans, nullSpan)
 			continue
 		}
+		if payload := cells[i].Payload(); len(payload) > maxDataRowBytes-framing-len(e.values) {
+			return newError(sqlstateProgramLimitExceeded,
+				"a result row exceeds the PostgreSQL message bound")
+		}
 		var err error
 		e.values, err = appendCell(e.values, cells[i], cols[i].typ, formatFor(formats, i))
 		if err != nil {
 			return err
+		}
+		if len(e.values) > maxDataRowBytes-framing {
+			return newError(sqlstateProgramLimitExceeded,
+				"a result row exceeds the PostgreSQL message bound")
 		}
 		e.spans = append(e.spans, int32(len(e.values)))
 	}
@@ -269,12 +408,48 @@ func (e *rowEncoder) row(w *writer, cells []query.Cell, cols []column, formats [
 // version(), a literal SELECT — which have no cells and no schemaless types.
 //
 // A text column needs no conversion in either format, because text's binary
-// encoding is its bytes unchanged. An int8 column asked for in binary is
-// converted back from its digits, which is exact for every value that reached
-// this path (they are all produced here from an int64 in the first place) and
-// is the only place in this package where a value is re-parsed rather than
-// carried.
-func (w *writer) fixedRow(cols []column, values []*string, formats []int16) {
+// encoding is its bytes unchanged. int8 and bool use their PostgreSQL binary
+// encodings when requested. int8 is converted back from its digits, which is
+// exact for every value that reached this path (they are all produced here
+// from an int64 in the first place) and is the only place in this package where
+// a value is re-parsed rather than carried.
+func (w *writer) fixedRow(cols []column, values []*string, formats []int16) error {
+	if len(values) != len(cols) {
+		return newError(sqlstateInternalError,
+			"a fixed result row does not match its result schema")
+	}
+	if len(values) > maxResultColumns {
+		return newError(sqlstateProgramLimitExceeded,
+			"a fixed result row has too many columns for the PostgreSQL protocol boundary")
+	}
+	size := 2 + 4*len(values)
+	for i, v := range values {
+		if v == nil {
+			continue
+		}
+		n := len(*v)
+		if formatFor(formats, i) == formatBinary {
+			switch cols[i].typ.oid {
+			case oidInt8:
+				n = 8
+				if _, err := strconv.ParseInt(*v, 10, 64); err != nil {
+					return newError(sqlstateInternalError,
+						"a fixed column declared int8 does not contain an int64")
+				}
+			case oidBool:
+				n = 1
+				if *v != "t" && *v != "f" {
+					return newError(sqlstateInternalError,
+						"a fixed column declared bool does not contain t or f")
+				}
+			}
+		}
+		if n > maxDataRowBytes-size {
+			return newError(sqlstateProgramLimitExceeded,
+				"a fixed result row exceeds the PostgreSQL message bound")
+		}
+		size += n
+	}
 	w.begin(msgDataRow)
 	w.int16(len(values))
 	for i, v := range values {
@@ -282,11 +457,20 @@ func (w *writer) fixedRow(cols []column, values []*string, formats []int16) {
 			w.int32(-1)
 			continue
 		}
-		if cols[i].typ.oid == oidInt8 && formatFor(formats, i) == formatBinary {
-			n, err := strconv.ParseInt(*v, 10, 64)
-			if err == nil {
+		if formatFor(formats, i) == formatBinary {
+			switch cols[i].typ.oid {
+			case oidInt8:
+				n, _ := strconv.ParseInt(*v, 10, 64)
 				w.int32(8)
 				w.buf = appendUint64(w.buf, uint64(n))
+				continue
+			case oidBool:
+				w.int32(1)
+				if *v == "t" {
+					w.buf = append(w.buf, 1)
+				} else {
+					w.buf = append(w.buf, 0)
+				}
 				continue
 			}
 		}
@@ -294,4 +478,5 @@ func (w *writer) fixedRow(cols []column, values []*string, formats []int16) {
 		w.rawString(*v)
 	}
 	w.end()
+	return nil
 }

@@ -16,16 +16,26 @@ import (
 //
 // Cells that project a document value borrow the Segment's storage, exactly
 // like the RawValue they came from. RunInto may additionally place decoded
-// escaped text in its [Exec]'s Workspace. Computed aggregates remain typed and
-// borrow no formatted-number arena. Copy projected Cell.JSON and, when needed,
-// Cell.TextBytes before the Segment or the Exec is reused if a cell must
-// outlive that borrowing boundary. A [FromFile] execution instead copies
-// selected values into Result-owned backing, so its cells survive snapshot
-// close and page eviction.
+// escaped text and exact aggregate encodings in its [Exec]'s Workspace. Copy
+// Cell.JSON and, when needed, Cell.TextBytes before the Segment or Exec is
+// reused if a cell must outlive that borrowing boundary. A [FromFile]
+// execution instead copies selected and computed values into Result-owned
+// backing, so its cells survive snapshot close and page eviction.
 type Result struct {
 	Columns  []ResultColumn
 	RowCount int
 	fileData []byte
+
+	// resultRowsLimit and resultBytesLimit are installed from ExecOptions at
+	// the beginning of every execution. resultBytesUsed charges the logical
+	// column/cell storage plus every cell's retained representation, whether
+	// that representation is borrowed from a heap Segment or copied into
+	// fileData from a durable snapshot. Keeping the counters on Result makes
+	// every materialization lane pass through the same admission point without
+	// adding state to the hot inner loops.
+	resultRowsLimit  int
+	resultBytesLimit int64
+	resultBytesUsed  int64
 }
 
 // Release drops all storage retained by r. Reusing r through [Query.RunInto]
@@ -43,6 +53,9 @@ func (r *Result) Release() {
 	r.Columns = nil
 	r.RowCount = 0
 	r.fileData = nil
+	r.resultRowsLimit = 0
+	r.resultBytesLimit = 0
+	r.resultBytesUsed = 0
 }
 
 // A ResultColumn is one output column: its Header (the projection path or the
@@ -91,6 +104,7 @@ type cellFlag uint8
 const (
 	cellInteger cellFlag = 1 << iota
 	cellTrue
+	cellNumberRaw
 )
 
 var (
@@ -117,7 +131,10 @@ func cellFromScalar(s scalar) Cell {
 		if s.isInt {
 			return Cell{kind: KindNumber, flag: cellInteger, word: uint64(s.ival), raw: s.num}
 		}
-		f, _ := s.float64OfNumber()
+		f, ok := s.float64OfNumber()
+		if !ok {
+			return Cell{kind: KindNumber, flag: cellNumberRaw, raw: s.num}
+		}
 		return Cell{kind: KindNumber, word: math.Float64bits(f), raw: s.num}
 	case kindString:
 		return Cell{kind: KindString, text: s.sval, raw: s.raw}
@@ -156,7 +173,7 @@ func nullCell() Cell {
 func (c Cell) Kind() CellKind { return c.kind }
 
 // Type returns the versioned value type. It is the transport-oriented spelling
-// of [Cell.Kind]; Kind remains convenient for JSON-only callers.
+// of [Cell.Kind]; Kind remains convenient when inspecting JSON values.
 func (c Cell) Type() ValueType { return c.kind }
 
 // TypeVersion returns zero for built-in JSON values and the negotiated
@@ -201,6 +218,13 @@ func (c Cell) Float64() (float64, bool) {
 	}
 	if c.flag&cellInteger != 0 {
 		return float64(int64(c.word)), true
+	}
+	if c.flag&cellNumberRaw != 0 {
+		f, err := strconv.ParseFloat(byteview.String(c.raw), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
 	}
 	return math.Float64frombits(c.word), true
 }

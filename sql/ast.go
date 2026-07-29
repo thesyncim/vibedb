@@ -8,9 +8,9 @@ package sql
 // tagged node with an n-ary child list, exactly like query's compiledPredicate,
 // because the lowering that consumes this is a rename and a walk rather than a
 // translation. Where SQL has a construct the engine has no counterpart for, the
-// parser rejects it, so no node here exists to represent one — with the two
-// documented exceptions [SelectStmt.Having] and [SelectStmt.Offset], which are
-// called out on their fields.
+// parser rejects it, so no node here exists to represent one. Clauses such as
+// [SelectStmt.Having] and [SelectStmt.Offset] that run around the core scan plan
+// remain explicit nodes and are applied by the statement layer.
 //
 // A tree produced by a [Parser] is owned by that Parser and is valid only until
 // its next Parse; see the Parser documentation. It never points into the
@@ -35,14 +35,11 @@ type SelectStmt struct {
 
 	// Having is the post-aggregation filter, or nil.
 	//
-	// This is one of two clauses this package accepts that the executor has no
-	// counterpart for today: query's plan has no filter between reduction and
-	// ordering. It is accepted anyway because it is fully resolvable here —
-	// the parser binds every HAVING leaf to a column that is already in the
-	// SELECT list or to a GROUP BY key, so a HAVING that survives parsing
-	// needs a filter-after-reduce step and nothing else. A lowering pass that
-	// cannot yet supply one must reject a non-nil Having explicitly rather
-	// than ignore it, because silently dropping a filter returns wrong rows.
+	// The parser binds every HAVING leaf to a column already in the SELECT list
+	// or to a GROUP BY key. The query statement layer evaluates it after
+	// reduction and before ordering, offset, and limit. Any other lowerer that
+	// cannot supply that step must reject a non-nil Having explicitly; silently
+	// dropping a filter returns wrong rows.
 	Having *Expr
 
 	// OrderBy holds the sort keys, in priority order.
@@ -53,11 +50,9 @@ type SelectStmt struct {
 
 	// Offset is the number of leading rows to skip, or nil.
 	//
-	// This is the second clause with no executor counterpart: query's plan
-	// carries a limit and no offset. It is accepted because a driver-facing
-	// SQL dialect without OFFSET is a surprise, and because skipping n rows is
-	// a property of the same limiting step. The same rule as Having applies —
-	// lowering must reject a non-nil Offset rather than ignore it.
+	// The query statement layer applies it after ordering and before limit.
+	// The same rule as Having applies to any other lowerer: reject a non-nil
+	// Offset rather than ignore it.
 	Offset *Operand
 
 	// Params is the number of '?' placeholders in the statement. Placeholder

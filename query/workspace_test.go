@@ -7,8 +7,8 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/document"
 )
 
 func TestCellCompactTaggedLayout(t *testing.T) {

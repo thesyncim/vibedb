@@ -23,7 +23,7 @@ func BenchmarkFileMaterializationDurableUpdate(b *testing.B) {
 	zoned := make([][]byte, 512)
 	var previousZoneCode uint32
 	for index := range zoned {
-		number := fmt.Sprintf("%012d", 100_000_000_000+index*1_000_000_000)
+		number := fmt.Sprintf("%012d", int64(100_000_000_000)+int64(index)*1_000_000_000)
 		code, ok := store.ZoneCodeNumber([]byte(number))
 		if !ok || index != 0 && code <= previousZoneCode {
 			b.Fatalf("zone benchmark code %q = %d after %d",

@@ -293,7 +293,7 @@ var zoneAdversarialDocs = []string{
 func zoneFuzzPredicates(rng *rand.Rand) Predicate {
 	values := []any{
 		0, 1, 2, 100, -1,
-		9007199254740992, 9007199254740993,
+		Number("9007199254740992"), Number("9007199254740993"),
 		1e308, 1e-320,
 		"", "ab", "abc", "abcd", "abcde", "Abcd",
 		true, false,
@@ -478,7 +478,10 @@ func TestZonePruningExactDecimalBoundary(t *testing.T) {
 	docs = append(docs, []byte(`{"v":9007199254740993}`))
 	snapshot := zoneCollection(t, 64, docs)
 
-	result, _ := zoneRunBothWays(t, Select(Path("v")).Where(Cmp("v", Gt, 9007199254740992)), snapshot)
+	result, _ := zoneRunBothWays(t,
+		Select(Path("v")).Where(Cmp("v", Gt, Number("9007199254740992"))),
+		snapshot,
+	)
 	if result.RowCount != 1 {
 		t.Fatalf("rows: got %d want 1 (the value past float64 precision)", result.RowCount)
 	}

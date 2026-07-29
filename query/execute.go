@@ -3,13 +3,12 @@ package query
 import (
 	"bytes"
 	"fmt"
-	"math"
 	"math/bits"
 	"slices"
 
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
-	"github.com/thesyncim/vibedb/store"
 )
 
 // Workspace owns all transient query execution storage. It reaches execution
@@ -38,6 +37,11 @@ import (
 // to give that memory back, the same trade-off [Result.Release] offers.
 type Workspace struct {
 	ctx execCtx
+
+	// cancel is the caller-owned signal for the execution currently borrowing
+	// this Workspace. Nested join scans and parked workers receive the same
+	// pointer while active; no execution path owns or resets it.
+	cancel *CancelFlag
 
 	raws             [][]vibejson.RawValue
 	numRaws          []vibejson.RawValue
@@ -129,15 +133,102 @@ type Workspace struct {
 	// belong to exactly one of them.
 	joins []joinBinding
 
+	// joinPairBudget bounds the multiplicative workspace of the one supported
+	// fan-out join. It is configured before join binding and activated only
+	// when pair materialization begins, so ordinary filter-column extraction
+	// is not charged as pair storage.
+	joinPairBudget joinPairBudget
+
 	accs       []aggAcc
-	reductions []store.Float64Aggregate
-	reduced    []bool
 	interner   store.KeyInterner
 	groups     []group
 	groupKey   []byte
 	groupOrder []int
 	stringHash []uint32
 	stringSlot []uint32
+
+	// heapWorkBudget bounds the fixed row-proportional columns, selections,
+	// ordering/grouping state, decoded text, and distinct group keys retained
+	// by Segment and heap-snapshot execution. A durable database join also uses
+	// it for the joined side's membership, Bloom filter, and reusable batch;
+	// the driving durable scan keeps its own batch/spill accounting.
+	heapWorkBudget heapWorkBudget
+	// heapWorkParent is non-nil only on a join binding's nested scan Workspace.
+	// Its decoded-text growth belongs to the parent execution's one account,
+	// not to an independent per-clause limit.
+	heapWorkParent       *heapWorkBudget
+	heapWorkTextReserved int64
+
+	aggregateBudget aggregateBudget
+	aggregateOut    []byte
+	aggregateLease  aggregateLease
+}
+
+func (w *Workspace) activeHeapWorkBudget() *heapWorkBudget {
+	if w.heapWorkParent != nil {
+		return w.heapWorkParent
+	}
+	return &w.heapWorkBudget
+}
+
+func (w *Workspace) checkCanceled() error {
+	return cancellationError(w.cancel)
+}
+
+func (w *Workspace) admitDecodedText(bytes int) error {
+	if w.heapWorkParent == nil {
+		return w.heapWorkBudget.admitDecodedText(bytes)
+	}
+	return w.heapWorkParent.admitHighWater(
+		"heap join decoded-text workspace",
+		saturatedProduct(int64(bytes), 2),
+		&w.heapWorkTextReserved,
+	)
+}
+
+// clearBorrowedViews severs every document-backed view retained by a nested
+// join scan while preserving its capacities. It is intentionally narrower
+// than Release: decoded-text arenas, index tapes, masks, and ordinal buffers
+// own their storage and remain warm; RawValue and scalar columns do not.
+func (w *Workspace) clearBorrowedViews() {
+	resetAggs(w.accs)
+	for i := range w.raws {
+		clear(w.raws[i])
+		w.raws[i] = w.raws[i][:0]
+	}
+	clear(w.numRaws)
+	w.numRaws = w.numRaws[:0]
+	for i := range w.ctx.values {
+		clear(w.ctx.values[i])
+		w.ctx.values[i] = w.ctx.values[i][:0]
+	}
+	for i := range w.ctx.nums {
+		clear(w.ctx.nums[i].vals)
+		w.ctx.nums[i].vals = w.ctx.nums[i].vals[:0]
+	}
+	for i := range w.pairValues {
+		clear(w.pairValues[i])
+		w.pairValues[i] = w.pairValues[i][:0]
+	}
+	for i := range w.groups {
+		clear(w.groups[i].scalars)
+		w.groups[i].scalars = w.groups[i].scalars[:0]
+		resetAggs(w.groups[i].accs)
+	}
+	w.groups = w.groups[:0]
+	clear(w.storeIndexes)
+	w.storeIndexes = w.storeIndexes[:0]
+	w.ctx.s = nil
+	w.ctx.rows = 0
+	w.eval.bindTo(nil)
+	w.eval.setWork(nil)
+	if w.pool != nil {
+		for i := range w.pool.workers {
+			w.pool.workers[i].eval.bindTo(nil)
+			w.pool.workers[i].eval.setWork(nil)
+			w.pool.workers[i].release()
+		}
+	}
 }
 
 // Release drops all storage retained by w, returning it to its zero value.
@@ -183,8 +274,7 @@ type execCtx struct {
 }
 
 type numColumn struct {
-	vals  []float64
-	valid []bool
+	vals []scalar
 }
 
 // An evalScratch is everything a predicate mutates while evaluating a row, as
@@ -204,6 +294,12 @@ type numColumn struct {
 // probes, which is where every write during evaluation lands.
 type evalScratch struct {
 	entries []vibejson.IndexEntry
+	// work is the one whole-execution account shared by every evaluator.
+	// entriesReserved is this evaluator's current-execution high-water, so
+	// several parallel tapes are summed rather than each receiving the limit.
+	work            *heapWorkBudget
+	entriesReserved int64
+	err             error
 	// text is the decoded-string arena a nested evaluation classifies through.
 	// Only a join probe uses it; a top-level scan classifies into the phase
 	// arenas the extraction owns.
@@ -247,10 +343,25 @@ func (s *evalScratch) containsTape(src []byte) (vibejson.Index, error) {
 // ordinary documents and would stay that way for the evaluator's life, which
 // is the cost this shape is meant to avoid, not to move somewhere else.
 func (s *evalScratch) containsTapeFrom(src []byte, seed int) (vibejson.Index, error) {
-	need := seed
-	limit := len(src) + 2
+	need := max(seed, 1)
+	limit := len(src)
+	if limit > int(^uint(0)>>1)-2 {
+		limit = int(^uint(0) >> 1)
+	} else {
+		limit += 2
+	}
 	for {
 		if cap(s.entries) < need {
+			peak := saturatedBytes(int64(cap(s.entries)), int64(need))
+			if s.work != nil {
+				if err := s.work.admitContainmentTape(
+					peak,
+					&s.entriesReserved,
+				); err != nil {
+					s.parkError(err)
+					return vibejson.Index{}, err
+				}
+			}
 			s.entries = make([]vibejson.IndexEntry, need)
 		}
 		index, err := vibejson.BuildIndex(src, s.entries[:cap(s.entries)])
@@ -258,10 +369,68 @@ func (s *evalScratch) containsTapeFrom(src []byte, seed int) (vibejson.Index, er
 			// At or above limit the buffer cannot be the reason a build
 			// failed, so the error is reported rather than retried; that is
 			// what keeps a broken width invariant from spinning here forever.
+			if err == nil && s.work != nil {
+				if budgetErr := s.work.admitContainmentTape(
+					int64(len(index.Entries)),
+					&s.entriesReserved,
+				); budgetErr != nil {
+					s.parkError(budgetErr)
+					return vibejson.Index{}, budgetErr
+				}
+			}
+			if err != nil {
+				s.parkError(err)
+			}
 			return index, err
 		}
-		need = min(2*cap(s.entries), limit)
+		current := cap(s.entries)
+		if current >= limit-current {
+			need = limit
+		} else {
+			need = current * 2
+		}
 	}
+}
+
+func (s *evalScratch) setWork(work *heapWorkBudget) {
+	s.work = work
+	s.entriesReserved = 0
+	s.err = nil
+	for i := range s.probes {
+		s.probes[i].inner.setWork(work)
+	}
+}
+
+func (s *evalScratch) parkError(err error) {
+	if err != nil && s.err == nil {
+		s.err = err
+	}
+}
+
+func (s *evalScratch) firstError() error {
+	if s.err != nil {
+		return s.err
+	}
+	for i := range s.probes {
+		if s.probes[i].err != nil {
+			return s.probes[i].err
+		}
+		if s.probes[i].inner.err != nil {
+			return s.probes[i].inner.err
+		}
+	}
+	return nil
+}
+
+// errorOr preserves an error the evaluator already observed over a later
+// cooperative cancellation. In particular, a durable join probe can park an
+// I/O error in a bool-valued predicate; cancellation arriving after that read
+// must not relabel storage failure as an ordinary client abort.
+func (s *evalScratch) errorOr(fallback error) error {
+	if err := s.firstError(); err != nil {
+		return err
+	}
+	return fallback
 }
 
 // bindTo points s at the executing Workspace's join bindings and gives it one
@@ -269,6 +438,9 @@ func (s *evalScratch) containsTapeFrom(src []byte, seed int) (vibejson.Index, er
 // once on the calling goroutine, once per filter-phase worker — before any row
 // is evaluated.
 func (s *evalScratch) bindTo(binds []joinBinding) {
+	for i := range s.probes {
+		s.probes[i].reset()
+	}
 	s.binds = binds
 	if len(binds) == 0 {
 		s.probes = s.probes[:0]
@@ -276,7 +448,7 @@ func (s *evalScratch) bindTo(binds []joinBinding) {
 	}
 	s.probes = resize(s.probes, len(binds))
 	for i := range s.probes {
-		s.probes[i].reset()
+		s.probes[i].inner.setWork(s.work)
 	}
 }
 
@@ -326,6 +498,17 @@ func (w *Workspace) keepCandidates(rows []int) {
 // runInto executes p, overwriting dst while retaining its column and cell
 // capacity. Callers must not reuse dst or w concurrently.
 func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int) error {
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
+	if p.hasLimit && p.limit == 0 {
+		return prepareResult(dst, p, 0)
+	}
+	if err := w.activeHeapWorkBudget().admitPlanner(
+		p, s.Len(), heapWorkSegment, s.Postings, 0,
+	); err != nil {
+		return err
+	}
 	w.candidateUsed = 0
 	w.text = w.text[:0]
 	w.lateText = w.lateText[:0]
@@ -334,10 +517,22 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 	w.interner.Reset()
 
 	candidates := p.candidateRows(s, w)
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	compact := preferSparseRows(len(candidates), s.Len(), candidates != nil)
 	var sourceRows []int
 	if compact {
 		sourceRows = candidates
+	}
+	scanRows := s.Len()
+	if compact {
+		scanRows = len(candidates)
+	}
+	if err := w.activeHeapWorkBudget().admitRows(
+		p, scanRows, heapWorkSegment, workers,
+	); err != nil {
+		return err
 	}
 
 	ctx := &w.ctx
@@ -353,8 +548,11 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 		if err := ctx.extract(p, sourceRows, w); err != nil {
 			return err
 		}
-		p.emit(dst, ctx, p.selectRows(ctx, candidates, compact, w), w)
-		return nil
+		selected, err := p.selectRows(ctx, candidates, compact, w)
+		if err != nil {
+			return err
+		}
+		return p.emit(dst, ctx, selected, w)
 	}
 	selected, err := p.filterSegmentRows(ctx, w, candidates, sourceRows, compact, workers)
 	if err != nil {
@@ -364,19 +562,21 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 	if err != nil {
 		return err
 	}
-	p.emit(dst, ctx, selected, w)
-	return nil
+	return p.emit(dst, ctx, selected, w)
 }
 
 // emit reduces the selection to the result, whichever shape the plan has.
-func (p *plan) emit(dst *Result, ctx *execCtx, selected []int, w *Workspace) {
+func (p *plan) emit(dst *Result, ctx *execCtx, selected []int, w *Workspace) error {
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	switch {
 	case p.grouped:
-		p.runGroupedInto(dst, ctx, selected, w)
+		return p.runGroupedInto(dst, ctx, selected, w)
 	case p.singleRow:
-		p.runAggregateInto(dst, ctx, selected, w)
+		return p.runAggregateInto(dst, ctx, selected, w)
 	default:
-		p.runProjectionInto(dst, ctx, selected)
+		return p.runProjectionInto(dst, ctx, selected, w)
 	}
 }
 
@@ -397,7 +597,11 @@ func (p *plan) filterSegmentRows(ctx *execCtx, w *Workspace, candidates, sourceR
 	if err := ctx.extractValues(p, p.filterCols, sourceRows, compact, &w.text, w); err != nil {
 		return nil, err
 	}
-	return p.selectRows(ctx, candidates, compact, w), nil
+	selected, err := p.selectRows(ctx, candidates, compact, w)
+	if err != nil {
+		return nil, err
+	}
+	return selected, w.eval.firstError()
 }
 
 // runSnapshotInto executes p over one heap snapshot. catalog is the database
@@ -405,14 +609,45 @@ func (p *plan) filterSegmentRows(ctx *execCtx, w *Workspace, candidates, sourceR
 // named a single collection; it is what a join clause resolves its inner
 // collection out of, and a plan carrying one never reaches here without it.
 func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.DatabaseSnapshot) error {
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
+	e.Workspace.joinPairBudget.configure(-1)
+	if p.fanOutJoin >= 0 {
+		pairBytes, err := normalizeJoinPairBytes(e.Options)
+		if err != nil {
+			return err
+		}
+		e.Workspace.joinPairBudget.configure(pairBytes)
+	}
 	// Joins bind before anything else looks at the predicate: every later stage,
 	// from the direct-answer lanes through candidate masks to the filter phase's
 	// per-row recheck, reads a join leaf as an ordinary membership, and it is
 	// only an ordinary membership once its slot is filled. Binding here also
 	// means it happens on the calling goroutine, before any worker exists, which
 	// is what lets the bindings be shared read-only across the filter phase.
-	if err := p.bindJoins(&e.Workspace, snapshot, catalog,
-		e.Options.JoinMembershipMax, e.Options.JoinFilterScanRatio, &e.Stats); err != nil {
+	if p.hasLimit && p.limit == 0 {
+		for i := range p.joins {
+			if _, ok := catalog.Collection(p.joins[i].collection); !ok {
+				return fmt.Errorf(
+					"query: join: collection %q is not in the database snapshot",
+					p.joins[i].collection,
+				)
+			}
+		}
+		e.Stats = ExecStats{}
+		return prepareResult(&e.Result, p, 0)
+	}
+	if err := p.bindJoins(
+		&e.Workspace, snapshot, catalog,
+		e.Options.JoinMembershipMax, e.Options.JoinFilterScanRatio,
+		&e.Workspace.joinPairBudget,
+		e.Workspace.activeHeapWorkBudget(),
+		&e.Stats,
+	); err != nil {
+		return err
+	}
+	if err := e.Workspace.checkCanceled(); err != nil {
 		return err
 	}
 	err := p.runSnapshotRows(&e.Result, snapshot, catalog, &e.Workspace, e.Options.Workers)
@@ -421,6 +656,9 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 }
 
 func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog store.DatabaseSnapshot, w *Workspace, workers int) error {
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	w.candidateUsed = 0
 	w.storeMaskUsed = 0
 	w.zonePruned = 0
@@ -434,8 +672,12 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	// back as this one's.
 	w.pairInner = w.pairInner[:0]
 	w.interner.Reset()
-	if p.fanOutJoin < 0 && p.runDirectSnapshotAggregate(dst, snapshot, w) {
-		return nil
+	if p.fanOutJoin < 0 {
+		if handled, err := p.runDirectSnapshotAggregate(dst, snapshot, w); err != nil {
+			return err
+		} else if handled {
+			return nil
+		}
 	}
 	if p.fanOutJoin < 0 {
 		if handled, err := p.runDirectSnapshotStringCountGroups(dst, snapshot, w); err != nil {
@@ -443,6 +685,12 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 		} else if handled {
 			return nil
 		}
+	}
+	chunks, _, _ := snapshot.ZoneStats()
+	if err := w.activeHeapWorkBudget().admitPlanner(
+		p, snapshot.Len(), heapWorkSnapshot, false, chunks,
+	); err != nil {
+		return err
 	}
 	if p.fanOutJoin < 0 {
 		// The direct-answer lanes count and reduce the driving collection's
@@ -459,14 +707,32 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	if err != nil {
 		return err
 	}
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	candidateCount := 0
-	for _, mask := range masks {
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+			return err
+		}
 		candidateCount += bits.OnesCount64(mask.Bits)
 	}
 	compact := masks != nil && candidateCount <= snapshot.Len()/2
+	scanRows := snapshot.Len()
+	if compact {
+		scanRows = candidateCount
+	}
+	if err := w.activeHeapWorkBudget().admitRows(
+		p, scanRows, heapWorkSnapshot, workers,
+	); err != nil {
+		return err
+	}
 	w.storeRows = w.storeRows[:0]
 	if compact {
-		for _, mask := range masks {
+		for i, mask := range masks {
+			if err := cancellationCheckpoint(w.cancel, i); err != nil {
+				return err
+			}
 			for word := mask.Bits; word != 0; word &= word - 1 {
 				w.storeRows = append(w.storeRows, store.Location{
 					Chunk: mask.Chunk,
@@ -488,8 +754,11 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 		if err := ctx.extractSnapshotNums(p, snapshot, w.storeRows, compact, w); err != nil {
 			return err
 		}
-		p.emit(dst, ctx, p.selectRows(ctx, nil, compact, w), w)
-		return nil
+		selected, err := p.selectRows(ctx, nil, compact, w)
+		if err != nil {
+			return err
+		}
+		return p.emit(dst, ctx, selected, w)
 	}
 	selected, err := p.filterSnapshotRows(ctx, w, snapshot, compact, workers)
 	if err != nil {
@@ -503,8 +772,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	if err != nil {
 		return err
 	}
-	p.emit(dst, ctx, selected, w)
-	return nil
+	return p.emit(dst, ctx, selected, w)
 }
 
 // filterSnapshotRows is filterSegmentRows over a heap snapshot. The parallel
@@ -521,7 +789,11 @@ func (p *plan) filterSnapshotRows(ctx *execCtx, w *Workspace, snapshot store.Sna
 	if err := ctx.extractSnapshotValues(p, snapshot, p.filterCols, w.storeRows, compact, &w.text, w); err != nil {
 		return nil, err
 	}
-	return p.selectRows(ctx, nil, compact, w), nil
+	selected, err := p.selectRows(ctx, nil, compact, w)
+	if err != nil {
+		return nil, err
+	}
+	return selected, w.eval.firstError()
 }
 
 func preferSparseRows(candidates, total int, hasBound bool) bool {
@@ -618,8 +890,17 @@ func (ctx *execCtx) materialize(p *plan, selected, sourceRows []int, compact boo
 	rows := selected
 	if compact {
 		gathered := resize(w.lateRows, len(selected))
-		for i, row := range selected {
-			gathered[i] = sourceRows[row]
+		if w.cancel == nil {
+			for i, row := range selected {
+				gathered[i] = sourceRows[row]
+			}
+		} else {
+			for i, row := range selected {
+				if err := cancellationCheckpoint(w.cancel, i); err != nil {
+					return nil, err
+				}
+				gathered[i] = sourceRows[row]
+			}
 		}
 		w.lateRows = gathered
 		rows = gathered
@@ -630,7 +911,7 @@ func (ctx *execCtx) materialize(p *plan, selected, sourceRows []int, compact boo
 	if err := ctx.extractNums(p, rows, true, w); err != nil {
 		return nil, err
 	}
-	return ctx.compactOnto(p, selected), nil
+	return ctx.compactOnto(p, selected, w.cancel)
 }
 
 // materializeSnapshot is materialize over a heap snapshot, whose rows are
@@ -648,8 +929,17 @@ func (ctx *execCtx) materializeSnapshot(p *plan, snapshot store.Snapshot, select
 	selected = p.truncateEarly(selected)
 	rows := w.lateStoreRows[:0]
 	if compact {
-		for _, row := range selected {
-			rows = append(rows, w.storeRows[row])
+		if w.cancel == nil {
+			for _, row := range selected {
+				rows = append(rows, w.storeRows[row])
+			}
+		} else {
+			for i, row := range selected {
+				if err := cancellationCheckpoint(w.cancel, i); err != nil {
+					return nil, err
+				}
+				rows = append(rows, w.storeRows[row])
+			}
 		}
 	} else {
 		// An uncompacted scan numbered its rows by position in the snapshot's
@@ -657,7 +947,14 @@ func (ctx *execCtx) materializeSnapshot(p *plan, snapshot store.Snapshot, select
 		// produced them in and exactly the order the live masks enumerate. The
 		// masks are therefore the map from scan ordinal back to address.
 		w.liveMasks = snapshot.AppendLiveMasks(w.liveMasks[:0])
-		rows = appendMaskLocations(rows, w.liveMasks, selected)
+		if err := w.checkCanceled(); err != nil {
+			return nil, err
+		}
+		var err error
+		rows, err = appendMaskLocations(rows, w.liveMasks, selected, w.cancel)
+		if err != nil {
+			return nil, err
+		}
 	}
 	w.lateStoreRows = rows
 	if err := ctx.extractSnapshotValues(p, snapshot, p.lateCols, rows, true, &w.lateText, w); err != nil {
@@ -666,7 +963,7 @@ func (ctx *execCtx) materializeSnapshot(p *plan, snapshot store.Snapshot, select
 	if err := ctx.extractSnapshotNums(p, snapshot, rows, true, w); err != nil {
 		return nil, err
 	}
-	return ctx.compactOnto(p, selected), nil
+	return ctx.compactOnto(p, selected, w.cancel)
 }
 
 // compactOnto gathers the filter columns down onto the positions the late
@@ -674,19 +971,43 @@ func (ctx *execCtx) materializeSnapshot(p *plan, snapshot store.Snapshot, select
 // column set is dense over the survivors and every downstream consumer keeps
 // indexing by row. The gather is in place and safe because the selection is
 // ascending, so selected[i] is never below i.
-func (ctx *execCtx) compactOnto(p *plan, selected []int) []int {
+func (ctx *execCtx) compactOnto(
+	p *plan,
+	selected []int,
+	cancel *CancelFlag,
+) ([]int, error) {
+	if cancel == nil {
+		for _, c := range p.filterCols {
+			col := ctx.values[c]
+			for i, row := range selected {
+				col[i] = col[row]
+			}
+			ctx.values[c] = col[:len(selected)]
+		}
+		ctx.rows = len(selected)
+		for i := range selected {
+			selected[i] = i
+		}
+		return selected, nil
+	}
 	for _, c := range p.filterCols {
 		col := ctx.values[c]
 		for i, row := range selected {
+			if err := cancellationCheckpoint(cancel, i); err != nil {
+				return selected, err
+			}
 			col[i] = col[row]
 		}
 		ctx.values[c] = col[:len(selected)]
 	}
 	ctx.rows = len(selected)
 	for i := range selected {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return selected, err
+		}
 		selected[i] = i
 	}
-	return selected
+	return selected, cancellationError(cancel)
 }
 
 // appendMaskLocations resolves ascending scan ordinals to stable chunk/slot
@@ -694,12 +1015,42 @@ func (ctx *execCtx) compactOnto(p *plan, selected []int) []int {
 // mask's set bits forward alongside the ordinals it is asked for, so the whole
 // resolution costs one pass over the live universe rather than a popcount
 // search per row.
-func appendMaskLocations(dst []store.Location, masks []store.Mask, rows []int) []store.Location {
+func appendMaskLocations(
+	dst []store.Location,
+	masks []store.Mask,
+	rows []int,
+	cancel *CancelFlag,
+) ([]store.Location, error) {
 	base, next := 0, 0
-	for _, mask := range masks {
+	if cancel == nil {
+		for _, mask := range masks {
+			count := bits.OnesCount64(mask.Bits)
+			word, ordinal := mask.Bits, base
+			for next < len(rows) && rows[next] < base+count {
+				for ordinal < rows[next] {
+					word &= word - 1
+					ordinal++
+				}
+				dst = append(dst, store.Location{
+					Chunk: mask.Chunk,
+					Slot:  uint8(bits.TrailingZeros64(word)),
+				})
+				next++
+			}
+			base += count
+		}
+		return dst, nil
+	}
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return dst, err
+		}
 		count := bits.OnesCount64(mask.Bits)
 		word, ordinal := mask.Bits, base
 		for next < len(rows) && rows[next] < base+count {
+			if err := cancellationCheckpoint(cancel, next); err != nil {
+				return dst, err
+			}
 			for ordinal < rows[next] {
 				word &= word - 1
 				ordinal++
@@ -712,7 +1063,7 @@ func appendMaskLocations(dst []store.Location, masks []store.Mask, rows []int) [
 		}
 		base += count
 	}
-	return dst
+	return dst, cancellationError(cancel)
 }
 
 // extract materializes every value and numeric column for the rows in scope.
@@ -742,16 +1093,25 @@ func (ctx *execCtx) extractValues(p *plan, cols []int, rows []int, gather bool, 
 		return nil
 	}
 	textNeed := 0
-	for _, c := range cols {
+	for at, c := range cols {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			return err
+		}
 		raws, err := ctx.rawColumn(w.raws[c][:0], p.valuePaths[c], rows, gather)
 		if err != nil {
 			return err
 		}
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
 		w.raws[c] = raws
-		textNeed += escapedTextBytes(raws)
+		escaped, err := escapedTextBytesCancelable(raws, w.cancel)
+		if err != nil {
+			return err
+		}
+		textNeed += escaped
 	}
-	ctx.classifyColumns(cols, text, textNeed, w)
-	return nil
+	return ctx.classifyColumns(cols, text, textNeed, w)
 }
 
 func (ctx *execCtx) extractSnapshotValues(p *plan, snapshot store.Snapshot, cols []int, rows []store.Location, gather bool, text *[]byte, w *Workspace) error {
@@ -761,7 +1121,10 @@ func (ctx *execCtx) extractSnapshotValues(p *plan, snapshot store.Snapshot, cols
 		return nil
 	}
 	textNeed := 0
-	for _, c := range cols {
+	for at, c := range cols {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			return err
+		}
 		var raws []vibejson.RawValue
 		var err error
 		cp := p.valuePaths[c]
@@ -788,11 +1151,17 @@ func (ctx *execCtx) extractSnapshotValues(p *plan, snapshot store.Snapshot, cols
 		if err != nil {
 			return err
 		}
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
 		w.raws[c] = raws
-		textNeed += escapedTextBytes(raws)
+		escaped, err := escapedTextBytesCancelable(raws, w.cancel)
+		if err != nil {
+			return err
+		}
+		textNeed += escaped
 	}
-	ctx.classifyColumns(cols, text, textNeed, w)
-	return nil
+	return ctx.classifyColumns(cols, text, textNeed, w)
 }
 
 // escapedTextBytes is the exact decoded-text budget a column needs: only a
@@ -809,23 +1178,67 @@ func escapedTextBytes(raws []vibejson.RawValue) int {
 	return need
 }
 
-func (ctx *execCtx) classifyColumns(cols []int, text *[]byte, textNeed int, w *Workspace) {
+func escapedTextBytesCancelable(raws []vibejson.RawValue, cancel *CancelFlag) (int, error) {
+	if cancel == nil {
+		return escapedTextBytes(raws), nil
+	}
+	need := 0
+	for i, r := range raws {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return 0, err
+		}
+		b := r.Bytes()
+		if r.Kind() == document.String && bytes.IndexByte(b, '\\') >= 0 {
+			need += len(b)
+		}
+	}
+	if err := cancellationError(cancel); err != nil {
+		return 0, err
+	}
+	return need, nil
+}
+
+func (ctx *execCtx) classifyColumns(cols []int, text *[]byte, textNeed int, w *Workspace) error {
+	if err := w.joinPairBudget.admitText(textNeed); err != nil {
+		return err
+	}
+	if err := w.admitDecodedText(textNeed); err != nil {
+		return err
+	}
 	if cap(*text) < textNeed {
 		*text = make([]byte, 0, growCap(cap(*text), textNeed))
+	}
+	if w.cancel == nil {
+		for _, c := range cols {
+			raws := w.raws[c]
+			col := resize(ctx.values[c], len(raws))
+			for j, r := range raws {
+				col[j] = classifyRawInto(r, text)
+			}
+			ctx.values[c] = col
+		}
+		return nil
 	}
 	for _, c := range cols {
 		raws := w.raws[c]
 		col := resize(ctx.values[c], len(raws))
 		for j, r := range raws {
+			if err := cancellationCheckpoint(w.cancel, j); err != nil {
+				return err
+			}
 			col[j] = classifyRawInto(r, text)
 		}
 		ctx.values[c] = col
 	}
+	return w.checkCanceled()
 }
 
 func (ctx *execCtx) extractNums(p *plan, rows []int, gather bool, w *Workspace) error {
 	ctx.nums = resize(ctx.nums, len(p.numPaths))
 	for i, cp := range p.numPaths {
+		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+			return err
+		}
 		nc, err := ctx.numericColumn(ctx.nums[i], cp, rows, gather, w)
 		if err != nil {
 			return err
@@ -844,27 +1257,24 @@ func (ctx *execCtx) extractSnapshotNums(p *plan, snapshot store.Snapshot, rows [
 // through the same routine the driving side uses.
 func (ctx *execCtx) extractSnapshotNumCols(p *plan, snapshot store.Snapshot, cols []int, rows []store.Location, gather bool, w *Workspace) error {
 	ctx.nums = resize(ctx.nums, len(p.numPaths))
-	for _, i := range cols {
-		cp := p.numPaths[i]
-		if !gather && cp.single {
-			vals, valid := snapshot.AppendFieldFloat64(
-				ctx.nums[i].vals[:0], ctx.nums[i].valid[:0], cp.name, &ctx.cache,
-			)
-			ctx.nums[i] = numColumn{vals: vals, valid: valid}
-			continue
+	for at, i := range cols {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			return err
 		}
+		cp := p.numPaths[i]
 		var raws []vibejson.RawValue
 		var err error
 		switch {
-		case cp.single:
-			// Reached only when gather is set: the dense single-field case
-			// took the fused typed reducer above. The field primitive rather
-			// than the pointer walk, for the reason on AppendFieldRows — a
+		case cp.single && gather:
+			// The field primitive rather than the pointer walk, for the reason
+			// on AppendFieldRows — a
 			// document whose root is an array makes a named pointer token an
 			// error and a named member merely absent, and which of those a
 			// query sees must not depend on how many rows the planner decided
 			// to read.
 			raws = snapshot.AppendFieldRows(w.numRaws[:0], rows, cp.name, &ctx.cache)
+		case cp.single:
+			raws = snapshot.AppendField(w.numRaws[:0], cp.name, &ctx.cache)
 		case gather:
 			raws, err = snapshot.AppendPointerRows(w.numRaws[:0], rows, cp.pointerForStore())
 		default:
@@ -873,8 +1283,14 @@ func (ctx *execCtx) extractSnapshotNumCols(p *plan, snapshot store.Snapshot, col
 		if err != nil {
 			return err
 		}
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
 		w.numRaws = raws
-		ctx.nums[i] = numericRaws(ctx.nums[i], raws)
+		ctx.nums[i], err = numericRawsCancelable(ctx.nums[i], raws, w.cancel)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -898,32 +1314,97 @@ func (ctx *execCtx) rawColumn(dst []vibejson.RawValue, cp compiledPath, rows []i
 }
 
 func (ctx *execCtx) numericColumn(dst numColumn, cp compiledPath, rows []int, gather bool, w *Workspace) (numColumn, error) {
-	if !gather && cp.single {
-		vals, valid := ctx.cache.AppendFieldFloat64(dst.vals[:0], dst.valid[:0], ctx.s, cp.name)
-		return numColumn{vals: vals, valid: valid}, nil
-	}
 	raws, err := ctx.rawColumn(w.numRaws[:0], cp, rows, gather)
 	if err != nil {
 		return numColumn{}, err
 	}
+	if err := w.checkCanceled(); err != nil {
+		return numColumn{}, err
+	}
 	w.numRaws = raws
-	return numericRaws(dst, raws), nil
+	return numericRawsCancelable(dst, raws, w.cancel)
 }
 
 func numericRaws(dst numColumn, raws []vibejson.RawValue) numColumn {
 	vals := resize(dst.vals, len(raws))
-	valid := resize(dst.valid, len(raws))
-	clear(valid)
+	clear(vals)
 	for i, r := range raws {
-		if f, ok := r.Float64(); ok {
-			vals[i], valid[i] = f, true
+		if r.Kind() == document.Number {
+			raw := r.Bytes()
+			value := scalar{kind: kindNumber, num: raw, raw: raw}
+			if integer, ok := r.Int64(); ok {
+				value.isInt, value.ival = true, integer
+			}
+			vals[i] = value
 		}
 	}
-	return numColumn{vals: vals, valid: valid}
+	return numColumn{vals: vals}
 }
 
-func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool, w *Workspace) []int {
+func numericRawsCancelable(dst numColumn, raws []vibejson.RawValue, cancel *CancelFlag) (numColumn, error) {
+	if cancel == nil {
+		return numericRaws(dst, raws), nil
+	}
+	vals := resize(dst.vals, len(raws))
+	clear(vals)
+	for i, r := range raws {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return numColumn{vals: vals}, err
+		}
+		if r.Kind() == document.Number {
+			raw := r.Bytes()
+			value := scalar{kind: kindNumber, num: raw, raw: raw}
+			if integer, ok := r.Int64(); ok {
+				value.isInt, value.ival = true, integer
+			}
+			vals[i] = value
+		}
+	}
+	if err := cancellationError(cancel); err != nil {
+		return numColumn{vals: vals}, err
+	}
+	return numColumn{vals: vals}, nil
+}
+
+func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool, w *Workspace) ([]int, error) {
 	selected := w.selected[:0]
+	cancel := w.cancel
+	if cancel != nil {
+		switch {
+		case p.where == nil:
+			for row := 0; row < ctx.rows; row++ {
+				if err := cancellationCheckpoint(cancel, row); err != nil {
+					w.selected = selected
+					return nil, err
+				}
+				selected = append(selected, row)
+			}
+		case compact || candidates == nil:
+			var err error
+			selected, err = selectSpanCancelable(
+				p.where, selected, ctx.values, 0, ctx.rows, &w.eval, cancel,
+			)
+			if err != nil {
+				w.selected = selected
+				return nil, err
+			}
+		default:
+			for i, row := range candidates {
+				if err := cancellationCheckpoint(cancel, i); err != nil {
+					w.selected = selected
+					return nil, w.eval.errorOr(err)
+				}
+				if p.where.eval(ctx.values, row, &w.eval) {
+					selected = append(selected, row)
+				}
+			}
+		}
+		w.selected = selected
+		if err := cancellationError(cancel); err != nil {
+			return nil, w.eval.errorOr(err)
+		}
+		return selected, nil
+	}
 	switch {
 	case p.where == nil:
 		for row := 0; row < ctx.rows; row++ {
@@ -950,7 +1431,43 @@ func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool, w *Works
 		}
 	}
 	w.selected = selected
-	return selected
+	return selected, nil
+}
+
+// selectSpanCancelable keeps the dense predicate evaluator's hoisted dispatch
+// while inserting a checkpoint between fixed-size spans. Falling back to eval
+// is still span-bounded for predicate shapes selectSpan deliberately declines.
+// The nil cancellation path never calls this helper, so its single whole-span
+// dispatch remains exactly as before.
+func selectSpanCancelable(
+	p *compiledPredicate,
+	dst []int,
+	cols [][]scalar,
+	lo, hi int,
+	eval *evalScratch,
+	cancel *CancelFlag,
+) ([]int, error) {
+	const spanRows = cancellationCheckMask + 1
+	for lo < hi {
+		if err := cancellationError(cancel); err != nil {
+			return dst, eval.errorOr(err)
+		}
+		end := min(lo+spanRows, hi)
+		if out, ok := p.selectSpan(dst, cols, lo, end); ok {
+			dst = out
+		} else {
+			for row := lo; row < end; row++ {
+				if p.eval(cols, row, eval) {
+					dst = append(dst, row)
+				}
+			}
+		}
+		lo = end
+	}
+	if err := cancellationError(cancel); err != nil {
+		return dst, eval.errorOr(err)
+	}
+	return dst, nil
 }
 
 func (p *plan) candidateRows(s *store.Segment, w *Workspace) []int {
@@ -967,21 +1484,37 @@ func (p *plan) candidateRows(s *store.Segment, w *Workspace) []int {
 	return rows
 }
 
-func (p *plan) runProjectionInto(dst *Result, ctx *execCtx, selected []int) {
+func (p *plan) runProjectionInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) error {
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	if len(p.order) != 0 {
 		slices.SortStableFunc(selected, func(a, b int) int {
 			return p.compareRows(ctx, a, b)
 		})
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
 	}
 	if p.hasLimit && len(selected) > p.limit {
 		selected = selected[:p.limit]
 	}
-	prepareResult(dst, p, len(selected))
+	if err := prepareResult(dst, p, len(selected)); err != nil {
+		return err
+	}
 	for r, row := range selected {
+		if err := cancellationCheckpoint(w.cancel, r); err != nil {
+			return err
+		}
 		for c, col := range p.columns {
-			dst.Columns[c].Cells[r] = cellFromScalar(ctx.values[col.value][row])
+			cell := cellFromScalar(ctx.values[col.value][row])
+			if err := dst.admitResultCell(cell); err != nil {
+				return err
+			}
+			dst.Columns[c].Cells[r] = cell
 		}
 	}
+	return w.checkCanceled()
 }
 
 func (p *plan) compareRows(ctx *execCtx, a, b int) int {
@@ -997,39 +1530,65 @@ func (p *plan) compareRows(ctx *execCtx, a, b int) int {
 	return 0
 }
 
-func (p *plan) runAggregateInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) {
+func (p *plan) runAggregateInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) error {
 	w.accs = resize(w.accs, len(p.columns))
-	clear(w.accs)
-	for _, row := range selected {
-		p.accumulate(w.accs, ctx, row)
+	resetAggs(w.accs)
+	for i, row := range selected {
+		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+			return err
+		}
+		if err := p.accumulate(w.accs, ctx, row, &w.aggregateBudget); err != nil {
+			return err
+		}
 	}
 	rows := 1
 	if p.hasLimit && p.limit == 0 {
 		rows = 0
 	}
-	prepareResult(dst, p, rows)
-	if rows != 0 {
-		p.fillAggregateCells(dst, 0, w.accs, nil, w)
+	if err := prepareResult(dst, p, rows); err != nil {
+		return err
 	}
+	if rows != 0 {
+		return p.fillAggregateCells(dst, 0, w.accs, nil, w)
+	}
+	return nil
 }
 
-func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) {
+func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) error {
+	if err := w.activeHeapWorkBudget().admitGroups(p, len(selected)); err != nil {
+		return err
+	}
 	groupCount := 0
-	for _, row := range selected {
+	for at, row := range selected {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			return err
+		}
+		keyBytes := p.groupKeyBytes(ctx, row)
+		if err := w.activeHeapWorkBudget().admitGroupKeyScratch(keyBytes); err != nil {
+			return err
+		}
 		w.groupKey = p.groupKey(w.groupKey[:0], ctx, row)
-		id := int(w.interner.Intern(w.groupKey))
-		if id == groupCount {
+		id, exists := w.interner.Lookup(w.groupKey)
+		if !exists {
+			if err := w.activeHeapWorkBudget().admitGroupKey(len(w.groupKey)); err != nil {
+				return err
+			}
+			id = w.interner.Intern(w.groupKey)
+		}
+		if !exists {
 			w.groups = resize(w.groups, groupCount+1)
-			g := &w.groups[id]
+			g := &w.groups[int(id)]
 			g.scalars = resize(g.scalars, len(p.groupCols))
 			g.accs = resize(g.accs, len(p.columns))
-			clear(g.accs)
+			resetAggs(g.accs)
 			for i, gc := range p.groupCols {
 				g.scalars[i] = ctx.values[gc][row]
 			}
 			groupCount++
 		}
-		p.accumulate(w.groups[id].accs, ctx, row)
+		if err := p.accumulate(w.groups[int(id)].accs, ctx, row, &w.aggregateBudget); err != nil {
+			return err
+		}
 	}
 	// Groups beyond this run's count keep their scalars from the previous run,
 	// and those scalars carry raw bytes and strings borrowed from that run's
@@ -1041,7 +1600,7 @@ func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Work
 	// result cells it retains.
 	for i := groupCount; i < len(w.groups); i++ {
 		clear(w.groups[i].scalars)
-		clear(w.groups[i].accs)
+		resetAggs(w.groups[i].accs)
 	}
 	w.groups = w.groups[:groupCount]
 	w.groupOrder = resize(w.groupOrder[:0], groupCount)
@@ -1049,18 +1608,32 @@ func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Work
 		w.groupOrder[i] = i
 	}
 	if len(p.order) != 0 {
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
 		slices.SortStableFunc(w.groupOrder, func(a, b int) int {
 			return p.compareGroups(&w.groups[a], &w.groups[b])
 		})
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
 	}
 	if p.hasLimit && len(w.groupOrder) > p.limit {
 		w.groupOrder = w.groupOrder[:p.limit]
 	}
-	prepareResult(dst, p, len(w.groupOrder))
-	for row, id := range w.groupOrder {
-		g := &w.groups[id]
-		p.fillAggregateCells(dst, row, g.accs, g, w)
+	if err := prepareResult(dst, p, len(w.groupOrder)); err != nil {
+		return err
 	}
+	for row, id := range w.groupOrder {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			return err
+		}
+		g := &w.groups[id]
+		if err := p.fillAggregateCells(dst, row, g.accs, g, w); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *plan) compareGroups(a, b *group) int {
@@ -1083,20 +1656,20 @@ func (p *plan) groupKey(dst []byte, ctx *execCtx, row int) []byte {
 	return dst
 }
 
+func (p *plan) groupKeyBytes(ctx *execCtx, row int) int64 {
+	var bytes int64
+	for _, gc := range p.groupCols {
+		bytes = saturatedBytes(bytes, scalarGroupKeyBytes(ctx.values[gc][row]))
+	}
+	return bytes
+}
+
 type group struct {
 	scalars []scalar
 	accs    []aggAcc
 }
 
-type aggAcc struct {
-	count int
-	n     int
-	sum   float64
-	min   float64
-	max   float64
-}
-
-func (p *plan) accumulate(accs []aggAcc, ctx *execCtx, row int) {
+func (p *plan) accumulate(accs []aggAcc, ctx *execCtx, row int, budget *aggregateBudget) error {
 	for c, col := range p.columns {
 		switch col.agg {
 		case aggCount:
@@ -1105,73 +1678,72 @@ func (p *plan) accumulate(accs []aggAcc, ctx *execCtx, row int) {
 			}
 		case aggSum, aggAvg, aggMin, aggMax:
 			nc := ctx.nums[col.num]
-			if !nc.valid[row] {
+			value := nc.vals[row]
+			if value.kind != kindNumber {
 				continue
 			}
-			v := nc.vals[row]
-			a := &accs[c]
-			if a.n == 0 {
-				a.min, a.max = v, v
-			} else {
-				if v < a.min {
-					a.min = v
-				}
-				if v > a.max {
-					a.max = v
-				}
+			if err := accs[c].accumulateNumber(col.agg, value, budget); err != nil {
+				return err
 			}
-			a.sum += v
-			a.n++
 		}
 	}
+	return nil
 }
 
-func (p *plan) fillAggregateCells(dst *Result, row int, accs []aggAcc, g *group, w *Workspace) {
+func (p *plan) fillAggregateCells(dst *Result, row int, accs []aggAcc, g *group, w *Workspace) error {
 	for c, col := range p.columns {
+		if err := cancellationCheckpoint(w.cancel, c); err != nil {
+			return err
+		}
 		var cell Cell
+		var err error
 		switch col.agg {
 		case aggNone:
 			cell = cellFromScalar(g.scalars[col.slot])
 		case aggCount:
 			cell = w.countCell(accs[c].count)
 		case aggSum:
-			cell = w.numericOrNull(accs[c].n, accs[c].sum)
+			cell, err = w.exactSumCell(&accs[c])
 		case aggAvg:
-			if accs[c].n == 0 {
+			cell, err = w.exactAverageCell(&accs[c])
+		case aggMin:
+			if accs[c].num == nil || accs[c].num.n == 0 {
 				cell = nullCell()
 			} else {
-				cell = w.floatCell(accs[c].sum / float64(accs[c].n))
+				cell = cellFromScalar(accs[c].num.extreme)
 			}
-		case aggMin:
-			cell = w.numericOrNull(accs[c].n, accs[c].min)
 		case aggMax:
-			cell = w.numericOrNull(accs[c].n, accs[c].max)
+			if accs[c].num == nil || accs[c].num.n == 0 {
+				cell = nullCell()
+			} else {
+				cell = cellFromScalar(accs[c].num.extreme)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if err := dst.admitResultCell(cell); err != nil {
+			return err
 		}
 		dst.Columns[c].Cells[row] = cell
 	}
-}
-
-func (w *Workspace) floatCell(f float64) Cell {
-	return Cell{kind: KindNumber, word: math.Float64bits(f)}
+	return nil
 }
 
 func (w *Workspace) countCell(n int) Cell {
 	return Cell{kind: KindNumber, flag: cellInteger, word: uint64(n)}
 }
 
-func (w *Workspace) numericOrNull(n int, v float64) Cell {
-	if n == 0 {
-		return nullCell()
+func prepareResult(dst *Result, p *plan, rows int) error {
+	if err := dst.admitResultShape(len(p.columns), rows); err != nil {
+		return err
 	}
-	return w.floatCell(v)
-}
-
-func prepareResult(dst *Result, p *plan, rows int) {
 	if cap(dst.Columns) < len(p.columns) {
 		dst.Columns = make([]ResultColumn, len(p.columns))
 	} else {
 		for i := len(p.columns); i < len(dst.Columns); i++ {
 			clear(dst.Columns[i].Cells)
+			dst.Columns[i] = ResultColumn{}
 		}
 		dst.Columns = dst.Columns[:len(p.columns)]
 	}
@@ -1185,6 +1757,7 @@ func prepareResult(dst *Result, p *plan, rows int) {
 		dst.Columns[i].Cells = cells
 	}
 	dst.RowCount = rows
+	return nil
 }
 
 func resize[T any](s []T, n int) []T {
@@ -1232,15 +1805,40 @@ func growCap(old, need int) int {
 // producing them is work with no consumer. An ordered, grouped, or aggregated
 // plan passes no limit, because it has to see every pair before it knows which
 // ones survive.
-func (ctx *execCtx) expandPairs(p *plan, j *planJoin, b *joinBinding, selected []int, addresses []store.Location, limit int, w *Workspace) {
+func (ctx *execCtx) expandPairs(p *plan, j *planJoin, b *joinBinding, selected []int, addresses []store.Location, limit int, w *Workspace) error {
 	outerScan, outerRows, inner := w.pairOuterScan[:0], w.pairOuterRows[:0], w.pairInner[:0]
 	joinCol := j.outerPath
+	maxPairs := w.joinPairBudget.maxPairs()
+	if limit > 0 && (maxPairs < 0 || limit < maxPairs) {
+		maxPairs = limit
+	}
 	for i, row := range selected {
-		var found int
-		inner, found = b.build.appendMatches(inner, ctx.values[joinCol][row])
+		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+			w.pairOuterScan, w.pairOuterRows, w.pairInner =
+				outerScan, outerRows, inner
+			return err
+		}
+		var (
+			found    int
+			overflow bool
+		)
+		inner, found, overflow = b.build.appendMatches(
+			inner, ctx.values[joinCol][row], maxPairs,
+		)
 		for range found {
 			outerScan = append(outerScan, row)
 			outerRows = append(outerRows, addresses[i])
+		}
+		if overflow {
+			if limit > 0 && len(inner) >= limit {
+				outerScan, outerRows, inner =
+					outerScan[:limit], outerRows[:limit], inner[:limit]
+				break
+			}
+			w.pairOuterScan, w.pairOuterRows, w.pairInner =
+				outerScan, outerRows, inner
+			w.joinPairBudget.commitPairs(len(inner))
+			return w.joinPairBudget.pairError(len(inner) + 1)
 		}
 		if limit > 0 && len(inner) >= limit {
 			outerScan, outerRows, inner = outerScan[:limit], outerRows[:limit], inner[:limit]
@@ -1248,6 +1846,8 @@ func (ctx *execCtx) expandPairs(p *plan, j *planJoin, b *joinBinding, selected [
 		}
 	}
 	w.pairOuterScan, w.pairOuterRows, w.pairInner = outerScan, outerRows, inner
+	w.joinPairBudget.commitPairs(len(inner))
+	return nil
 }
 
 // pairLimit is the number of pairs the expansion may stop at, or zero when it
@@ -1263,20 +1863,41 @@ func (p *plan) pairLimit() int {
 
 // locateSelected resolves the selection's scan ordinals to stable addresses in
 // the driving collection, which is what a gather at pair granularity needs.
-func (ctx *execCtx) locateSelected(snapshot store.Snapshot, selected []int, compact bool, w *Workspace) []store.Location {
+func (ctx *execCtx) locateSelected(
+	snapshot store.Snapshot,
+	selected []int,
+	compact bool,
+	w *Workspace,
+) ([]store.Location, error) {
 	rows := w.lateStoreRows[:0]
 	if compact {
-		for _, row := range selected {
-			rows = append(rows, w.storeRows[row])
+		if w.cancel == nil {
+			for _, row := range selected {
+				rows = append(rows, w.storeRows[row])
+			}
+		} else {
+			for i, row := range selected {
+				if err := cancellationCheckpoint(w.cancel, i); err != nil {
+					return rows, err
+				}
+				rows = append(rows, w.storeRows[row])
+			}
 		}
 	} else {
 		// An uncompacted scan numbered its rows by position in the snapshot's
 		// live chunk/slot order, which is the order the live masks enumerate.
 		w.liveMasks = snapshot.AppendLiveMasks(w.liveMasks[:0])
-		rows = appendMaskLocations(rows, w.liveMasks, selected)
+		if err := w.checkCanceled(); err != nil {
+			return rows, err
+		}
+		var err error
+		rows, err = appendMaskLocations(rows, w.liveMasks, selected, w.cancel)
+		if err != nil {
+			return rows, err
+		}
 	}
 	w.lateStoreRows = rows
-	return rows
+	return rows, cancellationError(w.cancel)
 }
 
 // materializeFanOut is materializeSnapshot for a plan whose join produces pairs.
@@ -1291,8 +1912,22 @@ func (ctx *execCtx) locateSelected(snapshot store.Snapshot, selected []int, comp
 func (ctx *execCtx) materializeFanOut(p *plan, snapshot store.Snapshot, catalog store.DatabaseSnapshot, selected []int, compact bool, w *Workspace) ([]int, error) {
 	j := &p.joins[p.fanOutJoin]
 	b := &w.joins[j.slot]
-	addresses := ctx.locateSelected(snapshot, selected, compact, w)
-	ctx.expandPairs(p, j, b, selected, addresses, p.pairLimit(), w)
+	w.joinPairBudget.begin(p, j)
+	if p.hasLimit && p.limit == 0 {
+		w.pairOuterScan = w.pairOuterScan[:0]
+		w.pairOuterRows = w.pairOuterRows[:0]
+		w.pairInner = w.pairInner[:0]
+		ctx.rows = 0
+		w.selected = w.selected[:0]
+		return w.selected, nil
+	}
+	addresses, err := ctx.locateSelected(snapshot, selected, compact, w)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.expandPairs(p, j, b, selected, addresses, p.pairLimit(), w); err != nil {
+		return nil, err
+	}
 
 	if err := ctx.extractSnapshotValues(
 		p, snapshot, p.lateCols, w.pairOuterRows, true, &w.lateText, w,

@@ -10,11 +10,13 @@ import (
 )
 
 type rows struct {
+	conn     *conn
 	stmt     *stmt
 	cursor   query.Cursor
 	snapshot *durable.Snapshot
 	scratch  []byte
 	schema   []query.OutputColumn
+	schemaOK bool
 	closed   bool
 }
 
@@ -25,7 +27,12 @@ var (
 	_ sqldriver.RowsColumnTypeNullable         = (*rows)(nil)
 )
 
-func (r *rows) Columns() []string { return r.stmt.query.Columns() }
+func (r *rows) Columns() []string {
+	if r.stmt == nil || r.stmt.query == nil {
+		return nil
+	}
+	return r.stmt.query.Columns()
+}
 
 func (r *rows) Close() error {
 	if r.closed {
@@ -35,19 +42,27 @@ func (r *rows) Close() error {
 	var err error
 	if r.snapshot != nil {
 		err = r.snapshot.Close()
+		r.snapshot = nil
 	}
-	r.stmt.conn.open = false
-	if r.stmt.adhoc {
-		err = errorsJoin(err, r.stmt.Close())
+	if r.conn != nil {
+		r.conn.open = false
 	}
+	// The connection owns and reuses this rows value. A temporary database/sql
+	// statement is otherwise reachable from the idle connection forever,
+	// including its parsed SQL arena and compiler high-water storage. The
+	// cursor also points at that statement's result. Break both ownership
+	// edges at the lifecycle boundary; resetRows installs fresh ones.
+	r.cursor = query.Cursor{}
+	r.conn = nil
+	r.stmt = nil
+	// Output headers borrow the compiled statement's immutable plan storage.
+	// ColumnTypes may have populated this connection-owned cache, so merely
+	// dropping stmt would still retain the plan through these strings. Clear
+	// the elements before keeping the capacity for the next query.
+	clear(r.schema)
+	r.schema = r.schema[:0]
+	r.schemaOK = false
 	return err
-}
-
-func errorsJoin(a, b error) error {
-	if a != nil {
-		return a
-	}
-	return b
 }
 
 func (r *rows) Next(dest []sqldriver.Value) error {
@@ -93,10 +108,31 @@ func (r *rows) value(cell query.Cell) sqldriver.Value {
 }
 
 func (r *rows) columnSchema() []query.OutputColumn {
-	if r.schema == nil {
-		r.schema = r.stmt.query.AppendSchema(nil)
+	if r.stmt == nil || r.stmt.query == nil {
+		return nil
+	}
+	if !r.schemaOK {
+		r.schema = r.stmt.query.AppendSchema(r.schema[:0])
+		r.schemaOK = true
 	}
 	return r.schema
+}
+
+func (c *conn) resetRows(
+	statement *stmt,
+	cursor query.Cursor,
+	snapshot *durable.Snapshot,
+) *rows {
+	r := &c.rowset
+	r.conn = c
+	r.stmt = statement
+	r.cursor = cursor
+	r.snapshot = snapshot
+	r.scratch = r.scratch[:0]
+	r.schema = r.schema[:0]
+	r.schemaOK = false
+	r.closed = false
+	return r
 }
 
 func (r *rows) ColumnTypeScanType(index int) reflect.Type {

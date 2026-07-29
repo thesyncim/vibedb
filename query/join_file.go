@@ -3,12 +3,14 @@ package query
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
+	"unsafe"
 
-	vibejson "github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The durable join's inner side.
@@ -224,6 +226,191 @@ type fileJoinSide struct {
 	batchRows int
 }
 
+// fileJoinBatchBudget tracks the largest durable inner-side refill by storage
+// class. A scalar high-water mark would be insufficient: a batch of long
+// strings can maximize source arenas while a later punctuation-dense batch
+// maximizes index tapes, and both retained capacities coexist after Reset.
+type fileJoinBatchBudget struct {
+	documentBytes int64
+	entryUnits    int64
+	keyBytes      int64
+	rows          int64
+
+	rawReserved   int64
+	entryReserved int64
+	keyReserved   int64
+	rowReserved   int64
+	scanReserved  int64
+}
+
+func (b *fileJoinBatchBudget) resetBatch() {
+	b.documentBytes = 0
+	b.entryUnits = 0
+	b.keyBytes = 0
+	b.rows = 0
+}
+
+// admitRow bounds every arena grown before a durable join batch can be
+// released. The collector owns two geometrically grown source copies:
+// fileJoinSide.data plus its scratch Segment. RequiredIndexEntries is
+// allocation-free and gives the exact structural width before either copy
+// grows; charging four times that logical tape covers its chunk growth, spill
+// tape, and recycled generation without rejecting a long scalar string as
+// though every source byte were a token.
+func (b *fileJoinBatchBudget) admitRow(
+	work *heapWorkBudget,
+	p *plan,
+	key, value []byte,
+	needKeys bool,
+) error {
+	if work == nil {
+		return nil
+	}
+	entries, err := vibejson.RequiredIndexEntries(value)
+	if err != nil {
+		return err
+	}
+	documentBytes := saturatedBytes(b.documentBytes, int64(len(value)))
+	entryUnits := saturatedBytes(b.entryUnits, int64(entries))
+	rows := saturatedBytes(b.rows, 1)
+
+	// Every source arena can retain its old and new geometric generations
+	// across a growth. The Segment starts with an 8 KiB source chunk.
+	rawRequired := saturatedProduct(documentBytes, 4)
+	if rawRequired < 8<<10 {
+		rawRequired = 8 << 10
+	}
+	if err := work.admitHighWater(
+		"durable batch document workspace",
+		rawRequired,
+		&b.rawReserved,
+	); err != nil {
+		return err
+	}
+
+	entryRequired := saturatedProduct(
+		saturatedProduct(
+			entryUnits,
+			int64(unsafe.Sizeof(vibejson.IndexEntry{})),
+		),
+		4,
+	)
+	// store.Segment begins with 512 entries.
+	minimumEntries := int64(512) * int64(unsafe.Sizeof(vibejson.IndexEntry{}))
+	if entryRequired < minimumEntries {
+		entryRequired = minimumEntries
+	}
+	if err := work.admitHighWater(
+		"durable batch index workspace",
+		entryRequired,
+		&b.entryReserved,
+	); err != nil {
+		return err
+	}
+
+	perRow := int64(unsafe.Sizeof(int(0))) +
+		int64(unsafe.Sizeof(vibejson.Index{}))
+	if needKeys {
+		perRow += int64(unsafe.Sizeof(string("")))
+	}
+	rowRequired := saturatedProduct(
+		saturatedProduct(rows, perRow),
+		2,
+	)
+	if err := work.admitHighWater(
+		"durable batch row workspace",
+		rowRequired,
+		&b.rowReserved,
+	); err != nil {
+		return err
+	}
+	if err := work.admitHighWater(
+		"durable batch filter workspace",
+		durableBatchRowFixedBytes(p, int(rows)),
+		&b.scanReserved,
+	); err != nil {
+		return err
+	}
+
+	keyBytes := b.keyBytes
+	if needKeys {
+		keyBytes = saturatedBytes(keyBytes, int64(len(key)))
+		keyRequired := saturatedProduct(keyBytes, 2)
+		if err := work.admitHighWater(
+			"durable batch key workspace",
+			keyRequired,
+			&b.keyReserved,
+		); err != nil {
+			return err
+		}
+	}
+
+	b.documentBytes = documentBytes
+	b.entryUnits = entryUnits
+	b.keyBytes = keyBytes
+	b.rows = rows
+	return nil
+}
+
+// durableBatchRowFixedBytes is the retained columnar workspace of one
+// per-worker scratch Segment scan. It is intentionally narrower than
+// heapRowFixedBytes: durable batches materialize every path in one phase and
+// need only the selection ordinal, while the heap executor can simultaneously
+// retain candidates, identity, and late-gather ordinals plus a scanWorker.
+// Charging those absent heap lanes here made the minimum 64 KiB configuration
+// reject batches whose real storage fit.
+func durableBatchRowFixedBytes(p *plan, rows int) int64 {
+	if rows < 0 {
+		return math.MaxInt64
+	}
+	const capacityFactor = int64(2)
+	rawBytes := int64(unsafe.Sizeof(vibejson.RawValue{}))
+	scalarBytes := int64(unsafe.Sizeof(scalar{}))
+	intBytes := int64(unsafe.Sizeof(int(0)))
+	sliceBytes := int64(unsafe.Sizeof([]byte{}))
+
+	perRow := saturatedProduct(
+		int64(len(p.valuePaths)),
+		rawBytes+scalarBytes,
+	)
+	perRow = saturatedBytes(
+		perRow,
+		saturatedProduct(int64(len(p.numPaths)), scalarBytes),
+	)
+	if len(p.numPaths) != 0 {
+		perRow = saturatedBytes(perRow, rawBytes)
+	}
+	perRow = saturatedBytes(perRow, intBytes)
+	required := saturatedProduct(
+		saturatedProduct(int64(rows), perRow),
+		capacityFactor,
+	)
+
+	// resize grows these three outer arrays geometrically with a minimum of
+	// eight elements. The selected and numRaws slice headers are inline fields
+	// in Workspace; only their row backing stores are charged above.
+	outer := int64(0)
+	if len(p.valuePaths) != 0 {
+		outer = saturatedBytes(
+			outer,
+			saturatedProduct(
+				int64(2*max(8, len(p.valuePaths))),
+				sliceBytes,
+			),
+		)
+	}
+	if len(p.numPaths) != 0 {
+		outer = saturatedBytes(
+			outer,
+			saturatedProduct(
+				int64(max(8, len(p.numPaths))),
+				int64(unsafe.Sizeof(numColumn{})),
+			),
+		)
+	}
+	return saturatedBytes(required, outer)
+}
+
 // reset returns the side to an unbound state while keeping its storage.
 //
 // The keys are cleared rather than truncated, the same discipline
@@ -267,8 +454,12 @@ func (p *plan) bindFileJoins(
 	outer *durable.Snapshot,
 	catalog durable.DatabaseSnapshot,
 	limit, ratio int,
+	workBudget *heapWorkBudget,
 	stats *ExecStats,
 ) error {
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	if len(p.joins) == 0 {
 		w.eval.bindTo(nil)
 		w.scanUsed = 0
@@ -280,16 +471,30 @@ func (p *plan) bindFileJoins(
 	for len(w.joins) < len(p.joins) {
 		w.joins = append(w.joins, joinBinding{})
 	}
-	defer func() { w.eval.bindTo(w.joins) }()
+	defer func() { w.eval.bindTo(w.joins[:len(p.joins)]) }()
 	w.storeIndexes = outer.AppendIndexes(w.storeIndexes[:0])
 	for i := range p.joins {
+		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+			return err
+		}
 		j := &p.joins[i]
 		b := &w.joins[j.slot]
-		if err := j.bindFile(b, catalog, limit, int(outer.Len()), ratio, stats); err != nil {
+		if err := j.bindFile(
+			b, catalog, limit, int(outer.Len()), ratio, workBudget, w.cancel, stats,
+		); err != nil {
 			return err
 		}
 		if b.mode == joinBindSet {
-			b.buildNeedles(p.valuePaths[j.outerPath].indexPath(), w.storeIndexes)
+			if err := b.buildNeedles(
+				p.valuePaths[j.outerPath].indexPath(),
+				w.storeIndexes,
+				workBudget,
+			); err != nil {
+				if !errors.Is(err, ErrWorkBudget) {
+					return err
+				}
+				b.needles = b.needles[:0]
+			}
 		}
 	}
 	return nil
@@ -302,9 +507,15 @@ func (j *planJoin) bindFile(
 	b *joinBinding,
 	catalog durable.DatabaseSnapshot,
 	limit, outerRows, ratio int,
+	workBudget *heapWorkBudget,
+	cancel *CancelFlag,
 	stats *ExecStats,
 ) error {
 	b.reset()
+	b.scan.cancel = cancel
+	if err := b.scan.checkCanceled(); err != nil {
+		return err
+	}
 	inner, ok := catalog.Collection(j.collection)
 	if !ok {
 		return fmt.Errorf(
@@ -318,14 +529,27 @@ func (j *planJoin) bindFile(
 	}
 
 	stoppable := j.innerPath == joinPrimaryKey
-	overflowed, err := j.collectFile(b, inner, limit, outerRows, ratio, stoppable)
+	workMark := int64(0)
+	if workBudget != nil {
+		workMark = workBudget.checkpoint()
+	}
+	overflowed, err := j.collectFile(
+		b, inner, limit, outerRows, ratio, stoppable, workBudget,
+	)
 	if err != nil {
-		return err
+		if !stoppable || !errors.Is(err, ErrWorkBudget) {
+			return err
+		}
+		b.discardJoinAttempt()
+		workBudget.rollback(workMark)
+		overflowed = true
+		b.filtering = false
+		b.bloom.disable()
 	}
 	b.file.snapshot = inner
 	b.plan = j.inner
 	j.installStrategy(b, overflowed, stats)
-	return nil
+	return b.scan.checkCanceled()
 }
 
 // runFileJoinedBatched executes a joined plan over a durable driving snapshot.
@@ -344,11 +568,48 @@ func (p *plan) runFileJoinedBatched(
 	n normalizedFileOptions,
 	stats ExecStats,
 ) error {
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
+	// The durable driving scan has its own bounded batch/merge frontier. The
+	// joined side is bound before that scan exists, so arm the configured
+	// admission account for its data-dependent candidate plan, membership,
+	// Bloom filter, and containment tapes. Its schema- and row-bounded scratch
+	// batch uses the same value as an independent target, matching the durable
+	// MemoryBytes contract rather than pretending fixed batches are resident
+	// capacity in this account.
+	e.Workspace.heapWorkBudget.begin(n.memoryBytes)
 	if err := p.bindFileJoins(
 		&e.Workspace, snapshot, catalog,
-		e.Options.JoinMembershipMax, e.Options.JoinFilterScanRatio, &stats,
+		e.Options.JoinMembershipMax, e.Options.JoinFilterScanRatio,
+		&e.Workspace.heapWorkBudget, &stats,
 	); err != nil {
 		return err
+	}
+	// Inner data-dependent storage and the driving pipeline coexist. Spend only
+	// the unreserved remainder on driving batches and merge frontiers instead
+	// of giving the membership/planner and driving halves independent copies of
+	// MemoryBytes.
+	remaining := e.Workspace.heapWorkBudget.remaining()
+	if remaining < 1 {
+		return &WorkBudgetError{
+			Resource: "durable joined driving workspace",
+			Bytes:    n.memoryBytes + 1,
+			Limit:    n.memoryBytes,
+		}
+	}
+	n.memoryBytes = remaining
+	n.mergeBytes = max(int64(1), remaining/2)
+	batchShare := remaining / int64(n.workers) / 4
+	if batchShare < 1 {
+		return &WorkBudgetError{
+			Resource: "durable joined batch workspace",
+			Bytes:    int64(n.workers) * 4,
+			Limit:    remaining,
+		}
+	}
+	if n.batchBytes > batchShare {
+		n.batchBytes = batchShare
 	}
 	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, n, stats)
 	e.Result, e.Stats = result, stats
@@ -358,7 +619,7 @@ func (p *plan) runFileJoinedBatched(
 	if probeErr := p.collectFileJoinStats(e); probeErr != nil {
 		return probeErr
 	}
-	return nil
+	return e.Workspace.checkCanceled()
 }
 
 // collectFileJoinStats folds every durable worker's probe tallies into the
@@ -389,6 +650,9 @@ func (p *plan) collectFileJoinStats(e *Exec) error {
 			}
 		}
 	}
+	if first == nil {
+		first = e.Workspace.checkCanceled()
+	}
 	return first
 }
 
@@ -406,8 +670,15 @@ func (j *planJoin) collectFile(
 	inner *durable.Snapshot,
 	limit, outerRows, ratio int,
 	stoppable bool,
+	workBudget *heapWorkBudget,
 ) (bool, error) {
 	scan := &b.scan
+	if err := scan.checkCanceled(); err != nil {
+		return false, err
+	}
+	scan.heapWorkParent = workBudget
+	scan.heapWorkTextReserved = 0
+	scan.eval.setWork(workBudget)
 	scan.candidateUsed = 0
 	scan.storeMaskUsed = 0
 	scan.text = scan.text[:0]
@@ -419,9 +690,26 @@ func (j *planJoin) collectFile(
 	// narrow *durable.Snapshot capability statement for free — sourceCaps.zone
 	// is an interface field, and handing it the five-pointer QuerySnapshot
 	// instead of the bare snapshot would heap-box a copy once per bind.
-	masks, err := j.inner.fileCandidateMasks(inner, &f.index, scan)
+	remaining := int64(^uint64(0) >> 1)
+	if workBudget != nil {
+		remaining = workBudget.remaining()
+	}
+	masks, plannedBytes, err := j.inner.fileCandidateMasksBounded(
+		inner, &f.index, scan, remaining,
+	)
 	if err != nil {
 		return false, err
+	}
+	if err := scan.checkCanceled(); err != nil {
+		return false, err
+	}
+	if plannedBytes != 0 && workBudget != nil {
+		if err := workBudget.admit(
+			"durable candidate-planner workspace",
+			plannedBytes,
+		); err != nil {
+			return false, err
+		}
 	}
 
 	// The candidate count is exact in both branches, which is what the filter
@@ -431,7 +719,10 @@ func (j *planJoin) collectFile(
 	// here exactly as it does on the heap.
 	candidates := 0
 	if masks != nil {
-		for _, mask := range masks {
+		for i, mask := range masks {
+			if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+				return false, err
+			}
 			candidates += bits.OnesCount64(mask.Bits)
 		}
 	} else {
@@ -448,10 +739,25 @@ func (j *planJoin) collectFile(
 	f.keys = f.keys[:0]
 	f.keyText = f.keyText[:0]
 	f.batchRows = 0
+	var batchBudget fileJoinBatchBudget
+	var batchWork heapWorkBudget
+	var batchAccount *heapWorkBudget
+	if workBudget != nil {
+		batchWork.begin(workBudget.limit)
+		batchAccount = &batchWork
+	}
 
 	needKeys := j.innerPath == joinPrimaryKey
 	over := false
 	appendRow := func(key, value []byte) error {
+		if err := scan.checkCanceled(); err != nil {
+			return err
+		}
+		if err := batchBudget.admitRow(
+			batchAccount, j.inner, key, value, needKeys,
+		); err != nil {
+			return err
+		}
 		f.data = append(f.data, value...)
 		f.ends = append(f.ends, len(f.data))
 		if needKeys {
@@ -467,10 +773,11 @@ func (j *planJoin) collectFile(
 		if f.batchRows < joinBatchRows {
 			return nil
 		}
-		stop, drainErr := j.drainFile(b, limit, stoppable)
+		stop, drainErr := j.drainFile(b, limit, stoppable, workBudget)
 		if drainErr != nil {
 			return drainErr
 		}
+		batchBudget.resetBatch()
 		if stop {
 			over = true
 			return errJoinInnerStop
@@ -489,7 +796,7 @@ func (j *planJoin) collectFile(
 		}
 		return true, nil
 	}
-	stop, err := j.drainFile(b, limit, stoppable)
+	stop, err := j.drainFile(b, limit, stoppable, workBudget)
 	if err != nil {
 		return false, err
 	}
@@ -507,15 +814,26 @@ func (j *planJoin) collectFile(
 // binder's drain rather than merely analogous to it. The Segment is dense — one
 // row per scanned document, in scan order — so the selection it returns indexes
 // the batch directly and no location mapping is needed.
-func (j *planJoin) drainFile(b *joinBinding, limit int, stoppable bool) (bool, error) {
+func (j *planJoin) drainFile(
+	b *joinBinding,
+	limit int,
+	stoppable bool,
+	workBudget *heapWorkBudget,
+) (bool, error) {
 	f := &b.file
 	if f.batchRows == 0 {
-		return false, nil
+		return false, b.scan.checkCanceled()
 	}
 	scan := &b.scan
+	if err := scan.checkCanceled(); err != nil {
+		return false, err
+	}
 	f.docs.Reset()
 	start := 0
-	for _, end := range f.ends {
+	for row, end := range f.ends {
+		if err := cancellationCheckpoint(scan.cancel, row); err != nil {
+			return false, err
+		}
 		if _, err := f.docs.Append(f.data[start:end]); err != nil {
 			return false, err
 		}
@@ -527,10 +845,19 @@ func (j *planJoin) drainFile(b *joinBinding, limit int, stoppable bool) (bool, e
 	if err := ctx.extract(j.inner, nil, scan); err != nil {
 		return false, err
 	}
-	selected := j.inner.selectRows(ctx, nil, false, scan)
+	selected, err := j.inner.selectRows(ctx, nil, false, scan)
+	if err != nil {
+		return false, err
+	}
+	if err := scan.eval.firstError(); err != nil {
+		return false, err
+	}
 
 	stop := false
-	for _, row := range selected {
+	for at, row := range selected {
+		if err := cancellationCheckpoint(scan.cancel, at); err != nil {
+			return false, err
+		}
 		if b.overflowed {
 			// Past the threshold the set is not grown further, but the scan is
 			// still running because a filter is being built out of it, and a
@@ -540,9 +867,17 @@ func (j *planJoin) drainFile(b *joinBinding, limit int, stoppable bool) (bool, e
 			continue
 		}
 		if j.innerPath == joinPrimaryKey {
-			b.appendString(f.keys[row])
+			if err := b.appendString(f.keys[row], workBudget); err != nil {
+				return false, err
+			}
 		} else {
-			b.appendValue(ctx.values[j.innerPath][row])
+			value := ctx.values[j.innerPath][row]
+			if value.kind == kindNull {
+				continue
+			}
+			if err := b.appendValue(value, workBudget); err != nil {
+				return false, err
+			}
 		}
 		if !stoppable || len(b.lits) <= limit {
 			continue
@@ -551,9 +886,18 @@ func (j *planJoin) drainFile(b *joinBinding, limit int, stoppable bool) (bool, e
 			stop = true
 			break
 		}
+		if workBudget != nil {
+			if err := workBudget.resetJoinBloom(&b.bloom, b.candidates); err != nil {
+				return false, err
+			}
+		} else {
+			b.bloom.reset(b.candidates)
+		}
 		b.overflowed = true
-		b.bloom.reset(b.candidates)
 		for i := range b.lits {
+			if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+				return false, err
+			}
 			b.bloom.insert(hashJoinKey(b.lits[i].sval))
 		}
 	}
@@ -599,6 +943,12 @@ func (j *planJoin) drainFile(b *joinBinding, limit int, stoppable bool) (bool, e
 // whole execution if any is set. Rejecting the row in the meantime is safe
 // precisely because the result is thrown away.
 func (b *joinBinding) probeFile(cell scalar, pr *joinProbe) bool {
+	if err := cancellationError(b.scan.cancel); err != nil {
+		if pr.err == nil {
+			pr.err = err
+		}
+		return false
+	}
 	if cell.kind != kindString {
 		return false // collection keys are strings; nothing else can name one
 	}
@@ -614,6 +964,12 @@ func (b *joinBinding) probeFile(cell scalar, pr *joinProbe) bool {
 		}
 		return false
 	}
+	if cancelErr := cancellationError(b.scan.cancel); cancelErr != nil {
+		if pr.err == nil {
+			pr.err = cancelErr
+		}
+		return false
+	}
 	if !ok {
 		return false
 	}
@@ -624,6 +980,12 @@ func (b *joinBinding) probeFile(cell scalar, pr *joinProbe) bool {
 	pr.inner.text = pr.inner.text[:0]
 	document := vibejson.RawValue{Src: raw}
 	for i := range b.plan.valuePaths {
+		if cancelErr := cancellationCheckpoint(b.scan.cancel, i); cancelErr != nil {
+			if pr.err == nil {
+				pr.err = cancelErr
+			}
+			return false
+		}
 		value, found, pointerErr := document.PointerCompiled(b.plan.valuePaths[i].pointer)
 		if pointerErr != nil || !found {
 			value = vibejson.RawValue{}

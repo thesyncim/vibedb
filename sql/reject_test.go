@@ -240,6 +240,25 @@ func TestRejectsOversizedClauses(t *testing.T) {
 	if _, err := Parse(tooManyParams); err == nil || !strings.Contains(err.Error(), "placeholders") {
 		t.Fatalf("Parse(%d placeholders) = %v, want a rejection naming the bound", maxParams+1, err)
 	}
+	tooManyBytes := strings.Repeat(" ", maxStatementBytes+1)
+	for name, parse := range map[string]func(string) error{
+		"SELECT": func(src string) error {
+			_, err := Parse(src)
+			return err
+		},
+		"statement": func(src string) error {
+			_, err := ParseStatement(src)
+			return err
+		},
+	} {
+		err := parse(tooManyBytes)
+		var parseErr *ParseError
+		if !errors.As(err, &parseErr) ||
+			parseErr.Pos != maxStatementBytes ||
+			!strings.Contains(parseErr.Msg, "16 MiB") {
+			t.Fatalf("%s byte-bound error = %#v", name, err)
+		}
+	}
 }
 
 // TestRejectsExcessiveNesting checks the recursion bound. Without it the

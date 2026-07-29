@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The frontend message reader, and the field cursor every message body is
@@ -235,9 +237,9 @@ func (f *fields) int32() int32 {
 	return v
 }
 
-// cstring decodes a NUL-terminated string, copying it. The copy is required,
-// not defensive: the body it points into is reused by the next message, and
-// statement names and query text outlive the message that carried them.
+// cstring decodes a NUL-terminated string and copies it for callers such as
+// startup negotiation that retain fields past the next read. Ordinary frontend
+// dispatch uses cstringView and copies only at the specific ownership boundary.
 func (f *fields) cstring() string {
 	i := bytes.IndexByte(f.b, 0)
 	if i < 0 {
@@ -249,11 +251,35 @@ func (f *fields) cstring() string {
 	return s
 }
 
+// cstringView is cstring's message-lifetime form. Frontend dispatch handles a
+// decoded message before the reader can reuse its body, so transient names and
+// query text can borrow these bytes and avoid one allocation per message.
+// Handlers that retain a value must copy it at their ownership boundary.
+func (f *fields) cstringView() string {
+	i := bytes.IndexByte(f.b, 0)
+	if i < 0 {
+		f.fail(errUnterminated)
+		return ""
+	}
+	s := byteview.String(f.b[:i])
+	f.b = f.b[i+1:]
+	return s
+}
+
 // name decodes a cstring used as a prepared-statement or portal name, refusing
 // one past [maxIdentifier]. The bound exists because a session retains one name
 // per open object, so an unbounded name is an unbounded retention.
 func (f *fields) name() string {
 	s := f.cstring()
+	if len(s) > maxIdentifier {
+		f.fail(errNameTooLong)
+		return ""
+	}
+	return s
+}
+
+func (f *fields) nameView() string {
+	s := f.cstringView()
 	if len(s) > maxIdentifier {
 		f.fail(errNameTooLong)
 		return ""

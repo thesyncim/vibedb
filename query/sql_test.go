@@ -753,7 +753,7 @@ func TestSQLBindReuseIsStable(t *testing.T) {
 // It is the contract that makes the driver's per-row cost purely database/sql's
 // interface boxing. A statement without placeholders never re-lowers, so it is
 // the easy half; a statement with them rebuilds the plan on every bind, and the
-// only reason that is free is that the Statement owns a Compiler whose arenas a
+// only reason that is free is that the Statement owns a compiler whose arenas a
 // warmed compile refills rather than reallocates.
 func TestSQLStatementRebindZeroCost(t *testing.T) {
 	set := mustSegment(t,
@@ -787,7 +787,7 @@ func TestSQLStatementRebindZeroCost(t *testing.T) {
 			[]any{int64(0)}, true},
 		{"join grouped", `SELECT d.k, SUM(o.b) FROM d JOIN j o ON o.fk = d.k ` +
 			`GROUP BY d.k ORDER BY d.k`, nil, true},
-		{"semi join", `SELECT d.a FROM d JOIN j o ON o."$key" = d.k`, nil, true},
+		{"dollar-key field join", `SELECT d.a FROM d JOIN j o ON o."$key" = d.k`, nil, true},
 	} {
 		stmt, err := PrepareStatement(tc.src)
 		if err != nil {

@@ -120,13 +120,20 @@ func (p *PathExpr) AppendPointer(dst []byte) []byte {
 // anything else happens to it — so a dotted "a/b" would arrive at the pointer
 // compiler already broken.
 //
+// "$key" also forces the pointer spelling. The programmatic query builder uses
+// that bare string as its private physical-key join sentinel; SQL has no such
+// pseudo-column, so rendering the quoted JSON field as "/$key" keeps it an
+// ordinary field all the way through shared lowering.
+//
 // An empty key forces one for a subtler reason worth stating, since getting it
 // wrong is silent: a lone empty key would render as the empty spec, which does
 // not mean "the member named by the empty string" but "the whole document". The
 // pointer form "/" says the former unambiguously.
 func needsPointer(segs []Segment) bool {
 	for i := range segs {
-		if segs[i].IsIndex || segs[i].Key == "" || strings.ContainsAny(segs[i].Key, "./~") {
+		if segs[i].IsIndex || segs[i].Key == "" ||
+			segs[i].Key == "$key" ||
+			strings.ContainsAny(segs[i].Key, "./~") {
 			return true
 		}
 	}

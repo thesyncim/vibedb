@@ -24,71 +24,6 @@ func exampleSegment() *store.Segment {
 	return set
 }
 
-// A query written as a JSON document. Sibling keys of a filter conjoin, so an
-// all-of condition needs no explicit operator.
-func ExampleNew() {
-	q, err := query.New(query.M{
-		"select": query.A{
-			"team",
-			query.M{"total": query.M{"$sum": "score"}},
-			query.M{"n": query.M{"$count": nil}},
-		},
-		"where": query.M{
-			"active": true,
-			"tier":   query.M{"$in": query.A{"pro", "team"}},
-		},
-		"groupBy": "team",
-		"orderBy": query.A{query.M{"team": "asc"}},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	result, err := q.Run(query.FromSegment(exampleSegment()))
-	if err != nil {
-		log.Fatal(err)
-	}
-	teams, _ := result.Column("team")
-	totals, _ := result.Column("total")
-	counts, _ := result.Column("n")
-	for row := range result.RowCount {
-		fmt.Printf("%s total=%s n=%s\n", teams.Cells[row], totals.Cells[row], counts.Cells[row])
-	}
-	// Output:
-	// "data" total=9 n=1
-	// "infra" total=7 n=1
-}
-
-// The same query as JSON text. A query can therefore be stored in a config
-// file or received over a wire and compiled to the same plan; every number
-// keeps its original spelling, so an integer past float64's exact range
-// compiles to an exact literal.
-func ExampleParse() {
-	q, err := query.Parse([]byte(`{
-		"select":  ["team", {"best": {"$max": "score"}}],
-		"where":   {"score": {"$gte": 4}},
-		"groupBy": ["team"],
-		"orderBy": [{"team": "asc"}]
-	}`))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	result, err := q.Run(query.FromSegment(exampleSegment()))
-	if err != nil {
-		log.Fatal(err)
-	}
-	teams, _ := result.Column("team")
-	best, _ := result.Column("best")
-	for row := range result.RowCount {
-		fmt.Printf("%s best=%s\n", teams.Cells[row], best.Cells[row])
-	}
-	// Output:
-	// "data" best=9
-	// "infra" best=7
-	// "web" best=5
-}
-
 // A hot loop retains one Exec. Its Result and Workspace grow to the largest
 // execution they have served and are then reused, so a warmed run over an
 // unchanged shape allocates nothing. The Source is what names the collection,
@@ -199,29 +134,4 @@ func ExampleQuery_Join() {
 	// Output:
 	// order 1 total 30
 	// order 3 total 50
-}
-
-// The same join written as a query document, so it can be stored, logged, or
-// received over a wire.
-func ExampleParse_join() {
-	q, err := query.Parse([]byte(`{
-		"select": ["id"],
-		"where":  {"active": true},
-		"join":   [{"from": "customers", "on": {"customer_id": "$key"}, "where": {"region": "eu"}}],
-		"orderBy": ["id"]
-	}`))
-	if err != nil {
-		log.Fatal(err)
-	}
-	catalog := exampleDatabase().Snapshot()
-	result, err := q.Run(query.FromDatabase(catalog, "orders"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	for row := 0; row < result.RowCount; row++ {
-		fmt.Printf("%s\n", result.Columns[0].Cells[row].JSON())
-	}
-	// Output:
-	// 1
-	// 2
 }

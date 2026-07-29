@@ -1,11 +1,13 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/store"
@@ -398,6 +400,104 @@ func TestDurableFanOutJoinIsRefused(t *testing.T) {
 	}
 	if got := err.Error(); !contains(got, "does not yet materialize") {
 		t.Fatalf("error %q does not name the missing capability", got)
+	}
+}
+
+func TestDurableJoinBatchIsBoundedBeforeDocumentArenaGrowth(t *testing.T) {
+	db, err := durable.OpenDatabase(t.TempDir(), durable.DatabaseOptions{})
+	if err != nil {
+		t.Fatalf("OpenDatabase: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	outer, err := db.CreateCollection("outer", durableJoinOptions())
+	if err != nil {
+		t.Fatalf("CreateCollection(outer): %v", err)
+	}
+	if _, err := outer.Put(
+		"outer-0",
+		[]byte(`{"id":"outer-0","join":"x","ref":"inner-0"}`),
+	); err != nil {
+		t.Fatalf("Put(outer): %v", err)
+	}
+	inner, err := db.CreateCollection("inner", durableJoinOptions())
+	if err != nil {
+		t.Fatalf("CreateCollection(inner): %v", err)
+	}
+	// The raw document is small enough for the collection but structurally
+	// wider than a 64 KiB execution can index in its reusable join batch.
+	bomb := `{"join":"x","items":[` + strings.Repeat("0,", 2048) + `0]}`
+	if _, err := inner.Put("inner-0", []byte(bomb)); err != nil {
+		t.Fatalf("Put(inner): %v", err)
+	}
+	catalog, err := db.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = catalog.Close() })
+
+	q := Select(Path("id")).Join(JoinOn("inner", "join", "join"))
+	exec := Exec{Options: ExecOptions{
+		Workers:     1,
+		MemoryBytes: minimumHeapMemoryBytes,
+		ResultRows:  -1,
+		ResultBytes: -1,
+	}}
+	err = q.RunInto(&exec, FromFileDatabase(catalog, "outer"))
+	var budgetErr *WorkBudgetError
+	if !errors.As(err, &budgetErr) || !errors.Is(err, ErrWorkBudget) {
+		t.Fatalf("durable hostile join error = %v, want WorkBudgetError", err)
+	}
+	if len(exec.Workspace.joins) != 1 {
+		t.Fatalf("join bindings = %d, want 1", len(exec.Workspace.joins))
+	}
+	side := &exec.Workspace.joins[0].file
+	if side.batchRows != 0 || len(side.data) != 0 || side.docs.Len() != 0 {
+		t.Fatalf(
+			"rejected durable batch grew rows=%d data=%d docs=%d",
+			side.batchRows,
+			len(side.data),
+			side.docs.Len(),
+		)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("rejected durable join exposed %d result rows", exec.Result.RowCount)
+	}
+
+	primary := Select(Path("id")).Join(JoinOn("inner", "ref", JoinKey))
+	lookup := Exec{Options: ExecOptions{
+		Workers:             1,
+		MemoryBytes:         minimumHeapMemoryBytes,
+		JoinMembershipMax:   1 << 20,
+		JoinFilterScanRatio: -1,
+		ResultRows:          -1,
+		ResultBytes:         -1,
+	}}
+	if err := primary.RunInto(&lookup, FromFileDatabase(catalog, "outer")); err != nil {
+		t.Fatalf("durable primary-key fallback: %v", err)
+	}
+	if lookup.Result.RowCount != 1 || lookup.Stats.JoinLookups != 1 {
+		t.Fatalf(
+			"durable fallback rows=%d stats=%+v, want one lookup match",
+			lookup.Result.RowCount,
+			lookup.Stats,
+		)
+	}
+	binding := &lookup.Workspace.joins[0]
+	if cap(binding.lits) != 0 ||
+		cap(binding.file.data) != 0 ||
+		cap(binding.file.ends) != 0 ||
+		cap(binding.file.keys) != 0 ||
+		binding.file.docs.Len() != 0 ||
+		cap(binding.bloom.blocks) != 0 {
+		t.Fatalf(
+			"durable fallback retained abandoned capacities: lits=%d data=%d ends=%d keys=%d docs=%d bloom=%d",
+			cap(binding.lits),
+			cap(binding.file.data),
+			cap(binding.file.ends),
+			cap(binding.file.keys),
+			binding.file.docs.Len(),
+			cap(binding.bloom.blocks),
+		)
 	}
 }
 

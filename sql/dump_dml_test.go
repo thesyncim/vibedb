@@ -32,14 +32,21 @@ func dumpInsert(s *InsertStmt) string {
 	var b strings.Builder
 	b.WriteString("insert into ")
 	b.WriteString(s.Table)
-	if s.Explicit {
-		b.WriteString(" explicit")
+	if len(s.Columns) != 0 {
+		b.WriteString(" fields")
+		for _, column := range s.Columns {
+			b.WriteByte(' ')
+			dumpPath(&b, column)
+		}
 	}
 	for i := range s.Rows {
 		b.WriteString(" (")
-		dumpOperand(&b, s.Rows[i].Key)
-		b.WriteString(", ")
-		dumpOperand(&b, s.Rows[i].Doc)
+		for j, value := range s.Rows[i].Values {
+			if j != 0 {
+				b.WriteString(", ")
+			}
+			dumpOperand(&b, value)
+		}
 		b.WriteByte(')')
 	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
@@ -52,7 +59,7 @@ func dumpUpdate(s *UpdateStmt) string {
 	b.WriteString(s.Table)
 	b.WriteString(" set ")
 	dumpOperand(&b, s.Doc)
-	dumpTargets(&b, s.Keys, s.Filter, false)
+	dumpTargets(&b, s.Filter, false)
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }
@@ -61,21 +68,14 @@ func dumpDelete(s *DeleteStmt) string {
 	var b strings.Builder
 	b.WriteString("delete from ")
 	b.WriteString(s.Table)
-	dumpTargets(&b, s.Keys, s.Filter, s.All)
+	dumpTargets(&b, s.Filter, s.All)
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }
 
-// dumpTargets renders which documents a statement acts on, in whichever of the
-// three forms it has.
-func dumpTargets(b *strings.Builder, keys []Operand, filter *SelectStmt, all bool) {
+// dumpTargets renders which documents a statement acts on.
+func dumpTargets(b *strings.Builder, filter *SelectStmt, all bool) {
 	switch {
-	case keys != nil:
-		b.WriteString(" keys")
-		for _, key := range keys {
-			b.WriteByte(' ')
-			dumpOperand(b, key)
-		}
 	case all:
 		b.WriteString(" all")
 	case filter != nil && filter.Where != nil:

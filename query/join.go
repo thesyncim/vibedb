@@ -1,24 +1,25 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"math/bits"
 	"slices"
 
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
-	"github.com/thesyncim/vibedb/store"
 )
 
-// Cross-collection semi-joins.
+// Cross-collection equi-joins.
 //
-// A join here FILTERS the driving collection; it never widens a row. "Keep the
-// orders whose customer is a pro customer" is the whole of it, and a duplicate
-// inner match cannot duplicate an outer row because the question a join asks is
-// existential. Returning inner columns is a different operator — it changes the
-// result's cardinality and its schema, needs an outer/inner null discipline,
-// and needs a fan-out plan — so this package rejects a projection inside a join
-// clause rather than half-implementing one.
+// One clause has two deliberate execution shapes. If no selected, filtered,
+// grouped, or ordered path reads the joined alias, it is a semi-join: it asks
+// only whether a partner exists, so duplicate inner matches keep an outer row
+// once. If the query reads the alias, it is an inner join: every matching pair
+// becomes an output row and the fan-out build preserves source order. The
+// compiler chooses from actual path use, so the cheaper existential plan is an
+// optimization of the same clause rather than a second query operator.
 //
 // # Why the strategy is measured rather than estimated
 //
@@ -40,9 +41,9 @@ import (
 //     path carries a declared exact index — and it is the reason the values are
 //     collected at all.
 //   - Over the threshold the membership is abandoned unbuilt and the join runs
-//     as a lookup: scan the outer, probe the inner once per row. The inner
-//     collection is a keyed hash map, so a primary-key probe is O(1) with no
-//     build side and nothing materialized; the bounded collection work already
+//     as a lookup: scan the outer, probe the inner once per row. A primary-key
+//     probe uses the heap collection's key map or the durable collection's
+//     ordered primary without a build side; the bounded collection work already
 //     spent is the price of learning which side to drive, and it is bounded
 //     precisely because the threshold stops it.
 //
@@ -52,14 +53,16 @@ import (
 //
 // # Why a join must name a database snapshot
 //
-// Both sides are read from one [store.DatabaseSnapshot]. Resolving the inner
-// collection against a separately taken snapshot would let the outer side
-// reference a state it never saw — generation 7 of orders joined against
-// generation 12 of customers, two states that never coexisted — and no amount
-// of care at the call site would make that visible. It is therefore not
-// expressible: the inner collection is resolved by name out of the same
-// snapshot the driving side came from, and [FromSnapshot] (which names one
-// collection and has no catalog behind it) rejects a plan that has a join.
+// Both sides are read from one coherent database snapshot: a
+// [store.DatabaseSnapshot] through [FromDatabase], or its durable counterpart
+// through [FromFileDatabase]. Resolving the inner collection against a
+// separately taken snapshot would let the outer side reference a state it
+// never saw — generation 7 of orders joined against generation 12 of
+// customers, two states that never coexisted — and no amount of care at the
+// call site would make that visible. It is therefore not expressible: the
+// inner collection is resolved by name out of the same snapshot the driving
+// side came from, and single-collection sources such as [FromSnapshot] and
+// [FromFile] reject a plan that has a join.
 
 // JoinKey is the inner-path spelling that names the inner collection's primary
 // key rather than a field of its documents. It is the common foreign-key
@@ -72,13 +75,13 @@ const JoinKey = "$key"
 // negative so it can never be mistaken for a registered value column.
 const joinPrimaryKey = -1
 
-// A Join is one semi-join clause: keep an outer row when the inner collection
-// holds at least one document that satisfies the clause's filter and whose
+// A Join is one equi-join clause. It matches an outer row when the inner
+// collection holds a document that satisfies the clause's filter and whose
 // join key equals the outer row's value at the outer path.
 //
-// It is a filter and only a filter. A matching inner document contributes no
-// column to the result, and several matching inner documents keep the outer row
-// exactly once. The zero Join names no collection and is rejected at compile.
+// Without a read of its alias it is an existential filter; with one it expands
+// every matching pair as an inner join. The zero Join names no collection and
+// is rejected at compile.
 type Join struct {
 	collection string
 	alias      string
@@ -88,10 +91,12 @@ type Join struct {
 	hasWhere   bool
 }
 
-// JoinOn builds a semi-join against collection, matching each outer row's
+// JoinOn builds an equi-join against collection, matching each outer row's
 // value at outerPath against innerPath in the inner collection. innerPath is
 // either [JoinKey], naming the inner collection's primary key, or a path spec
-// in the same syntax as [Path].
+// in the same syntax as [Path]. Reading an alias declared with [Join.As]
+// requests pair-producing inner-join semantics; otherwise the clause is a
+// semi-join filter.
 //
 // A null or absent value on either side matches nothing, the rule [Cmp] and
 // [In] already apply: "unknown" is not a join key.
@@ -140,9 +145,9 @@ func (j Join) As(alias string) Join {
 // every clause finds a match, and they are evaluated after the query's own
 // WHERE so a cheap local filter is never paid for twice.
 //
-// A query with a join must be executed against a [FromDatabase] source, whose
-// database snapshot resolves the inner collections at the same instant the
-// driving side was captured.
+// A query with a join must be executed against [FromDatabase] or
+// [FromFileDatabase], whose database snapshot resolves the inner collections
+// at the same instant the driving side was captured.
 func (q *Query) Join(joins ...Join) *Query {
 	q.joins = append(q.joins, joins...)
 	return q
@@ -195,7 +200,7 @@ type planJoin struct {
 // a cost decision: a join leaf is the most expensive test in the tree — under a
 // lookup binding it is a hash probe and a document decode — so it belongs after
 // every local conjunct, where a cheap filter has already rejected the row.
-func (c *Compiler) compileJoins(q *Query, p *plan, values *pathRegistry) ([]*compiledPredicate, error) {
+func (c *compiler) compileJoins(q *Query, p *plan, values *pathRegistry) ([]*compiledPredicate, error) {
 	if len(q.joins) == 0 {
 		return nil, nil
 	}
@@ -222,7 +227,7 @@ func (c *Compiler) compileJoins(q *Query, p *plan, values *pathRegistry) ([]*com
 // filter of its own: no filter and one join is that join's leaf, and a filter
 // that was already a conjunction absorbs the leaves rather than nesting a
 // second And the evaluator would have to descend through per row.
-func (c *Compiler) conjoin(where *compiledPredicate, nodes []*compiledPredicate) *compiledPredicate {
+func (c *compiler) conjoin(where *compiledPredicate, nodes []*compiledPredicate) *compiledPredicate {
 	if where == nil {
 		if len(nodes) == 1 {
 			return nodes[0]
@@ -247,7 +252,7 @@ func (c *Compiler) conjoin(where *compiledPredicate, nodes []*compiledPredicate)
 	return cp
 }
 
-func (c *Compiler) compileJoin(j Join, index int, values *pathRegistry) (planJoin, error) {
+func (c *compiler) compileJoin(j Join, index int, values *pathRegistry) (planJoin, error) {
 	if j.collection == "" {
 		return planJoin{}, fmt.Errorf(
 			"query: join[%d]: a join names the collection to match against; set \"from\"", index)
@@ -324,7 +329,7 @@ func (c *Compiler) compileJoin(j Join, index int, values *pathRegistry) (planJoi
 // reusable compiler keeps one per position so a warmed recompile of the same
 // shape refills them instead of allocating; a one-shot compiler, which by
 // definition never recompiles, hands back a fresh one.
-func (c *Compiler) joinRegistry(index int) *pathRegistry {
+func (c *compiler) joinRegistry(index int) *pathRegistry {
 	if c.oneShot {
 		return new(pathRegistry)
 	}
@@ -339,7 +344,7 @@ func (c *Compiler) joinRegistry(index int) *pathRegistry {
 // reasoning as joinRegistry. The plans are held behind pointers rather than in
 // one slice of values so that growing the list cannot move a plan a previously
 // compiled Query still points at within a single compile.
-func (c *Compiler) joinPlan(index int) *plan {
+func (c *compiler) joinPlan(index int) *plan {
 	if c.oneShot {
 		return new(plan)
 	}
@@ -492,6 +497,10 @@ type joinBinding struct {
 	needleText []byte
 	starts     []int
 	entries    []vibejson.IndexEntry
+	// textReserved is the largest live-plus-growing text arena footprint this
+	// binding admitted in the current execution. It is per binding because all
+	// joined sides coexist; one global high-water mark would undercount them.
+	textReserved int64
 
 	// snapshot and plan are the probe mode's state: the inner collection at the
 	// joined instant, and the compiled filter a probe evaluates against one of
@@ -557,6 +566,7 @@ func (b *joinBinding) reset() {
 	b.lits = b.lits[:0]
 	b.needles = b.needles[:0]
 	b.text = b.text[:0]
+	b.textReserved = 0
 	b.needleText = b.needleText[:0]
 	clear(b.keys)
 	b.keys = b.keys[:0]
@@ -568,9 +578,31 @@ func (b *joinBinding) reset() {
 	b.overflowed = false
 	b.scanned = 0
 	b.outerRows = 0
+	b.scan.clearBorrowedViews()
+	b.scan.cancel = nil
+	b.scan.heapWorkParent = nil
+	b.scan.heapWorkTextReserved = 0
 	b.bloom.disable()
 	b.build.reset()
 	b.file.reset()
+}
+
+// resetJoinBindings clears every logical binding before a reused Exec starts
+// another query. The slice and all of its buffers remain as warm high-water
+// storage, but no prior heap or durable snapshot, borrowed scalar, or built
+// row stays reachable when the next plan has fewer joins, no joins, LIMIT 0,
+// or fails before binding.
+func (w *Workspace) resetJoinBindings() {
+	for i := range w.joins {
+		w.joins[i].reset()
+	}
+	w.eval.bindTo(nil)
+	if w.pool != nil {
+		for i := range w.pool.workers {
+			w.pool.workers[i].eval.bindTo(nil)
+		}
+	}
+	w.scanUsed = 0
 }
 
 // bindJoins resolves every join clause against catalog and fills w's bindings,
@@ -581,7 +613,18 @@ func (b *joinBinding) reset() {
 // outer is the driving collection's own view, consulted only for its declared
 // index catalog: whether the outer join path carries a ready exact index is
 // what decides if building needles for the collected set can pay for itself.
-func (p *plan) bindJoins(w *Workspace, outer store.Snapshot, catalog store.DatabaseSnapshot, limit, ratio int, stats *ExecStats) error {
+func (p *plan) bindJoins(
+	w *Workspace,
+	outer store.Snapshot,
+	catalog store.DatabaseSnapshot,
+	limit, ratio int,
+	pairBudget *joinPairBudget,
+	workBudget *heapWorkBudget,
+	stats *ExecStats,
+) error {
+	if err := w.checkCanceled(); err != nil {
+		return err
+	}
 	if len(p.joins) == 0 {
 		// A plan with no joins still clears the evaluator's bindings, so a
 		// Workspace reused across a joined and an unjoined query cannot leave
@@ -600,24 +643,55 @@ func (p *plan) bindJoins(w *Workspace, outer store.Snapshot, catalog store.Datab
 	// the filter phase's workers are pointed at the same ones when their share
 	// is assigned. Everything either of them writes lands in its own probe
 	// scratch, which is what makes one set of bindings safe to share.
-	defer func() { w.eval.bindTo(w.joins) }()
+	defer func() { w.eval.bindTo(w.joins[:len(p.joins)]) }()
 	w.storeIndexes = outer.AppendIndexes(w.storeIndexes[:0])
 	for i := range p.joins {
+		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+			return err
+		}
 		j := &p.joins[i]
 		b := &w.joins[j.slot]
-		if err := j.bind(b, catalog, limit, outer.Len(), ratio, stats); err != nil {
+		if err := j.bind(
+			b, catalog, limit, outer.Len(), ratio,
+			pairBudget, workBudget, w.cancel, stats,
+		); err != nil {
 			return err
 		}
 		if b.mode == joinBindSet {
-			b.buildNeedles(p.valuePaths[j.outerPath].indexPath(), w.storeIndexes)
+			if err := b.buildNeedles(
+				p.valuePaths[j.outerPath].indexPath(),
+				w.storeIndexes,
+				workBudget,
+			); err != nil {
+				if !errors.Is(err, ErrWorkBudget) {
+					return err
+				}
+				// Needles only push the finished membership into the outer
+				// exact index. The membership itself is authoritative, so a
+				// tight budget declines this optional acceleration rather than
+				// rejecting a query that can scan and recheck it.
+				b.needles = b.needles[:0]
+			}
 		}
 	}
 	return nil
 }
 
 // bind runs one join clause's inner side and installs the strategy it measured.
-func (j *planJoin) bind(b *joinBinding, catalog store.DatabaseSnapshot, limit, outerRows, ratio int, stats *ExecStats) error {
+func (j *planJoin) bind(
+	b *joinBinding,
+	catalog store.DatabaseSnapshot,
+	limit, outerRows, ratio int,
+	pairBudget *joinPairBudget,
+	workBudget *heapWorkBudget,
+	cancel *CancelFlag,
+	stats *ExecStats,
+) error {
 	b.reset()
+	b.scan.cancel = cancel
+	if err := b.scan.checkCanceled(); err != nil {
+		return err
+	}
 	inner, ok := catalog.Collection(j.collection)
 	if !ok {
 		return fmt.Errorf(
@@ -629,7 +703,7 @@ func (j *planJoin) bind(b *joinBinding, catalog store.DatabaseSnapshot, limit, o
 		// produced, so the joined side has to be materialized whatever its
 		// size. The whole adaptive apparatus above it is for the question this
 		// clause is not asking.
-		if err := j.buildSide(b, inner); err != nil {
+		if err := j.buildSide(b, inner, pairBudget, workBudget); err != nil {
 			return err
 		}
 		b.mode = joinBindBuild
@@ -647,14 +721,62 @@ func (j *planJoin) bind(b *joinBinding, catalog store.DatabaseSnapshot, limit, o
 	// collected in full rather than truncated. A join never returns partial
 	// results; the threshold picks between strategies where two exist.
 	stoppable := j.innerPath == joinPrimaryKey
-	overflowed, err := j.collect(b, inner, limit, outerRows, ratio, stoppable)
+	workMark := int64(0)
+	if workBudget != nil {
+		workMark = workBudget.checkpoint()
+	}
+	overflowed, err := j.collect(
+		b, inner, limit, outerRows, ratio, stoppable, workBudget,
+	)
 	if err != nil {
-		return err
+		if !stoppable || !errors.Is(err, ErrWorkBudget) {
+			return err
+		}
+		// A primary-key semi-join can always trade the build-side scan for an
+		// exact lookup per outer row. A memory admission failure therefore
+		// selects that lower-memory strategy rather than rejecting a query
+		// whose semantics do not require materializing the inner side.
+		b.discardJoinAttempt()
+		workBudget.rollback(workMark)
+		overflowed = true
+		b.filtering = false
+		b.bloom.disable()
 	}
 	b.snapshot = inner
 	b.plan = j.inner
 	j.installStrategy(b, overflowed, stats)
-	return nil
+	return b.scan.checkCanceled()
+}
+
+// discardJoinAttempt makes an adaptive primary-key build's storage unreachable
+// before its budget reservation is rolled back. This is an exhaustion path,
+// so correctness wins over warm reuse: retaining the abandoned capacities
+// would let the driving scan allocate the rolled-back bytes alongside them and
+// exceed the execution limit in real memory.
+func (b *joinBinding) discardJoinAttempt() {
+	b.lits = nil
+	b.needles = nil
+	b.text = nil
+	b.textReserved = 0
+	b.needleText = nil
+	b.starts = nil
+	b.entries = nil
+	b.rows = nil
+	b.keys = nil
+	b.masks = nil
+	b.scan.Release()
+	b.file.index.Release()
+	b.file.docs = store.Segment{}
+	b.file.data = nil
+	b.file.ends = nil
+	b.file.keys = nil
+	b.file.keyText = nil
+	b.file.overflow = nil
+	b.file.masks = nil
+	b.file.batchRows = 0
+	b.file.snapshot = nil
+	b.bloom.blocks = nil
+	b.bloom.disable()
 }
 
 // installStrategy turns a finished inner collection into the binding the outer
@@ -710,22 +832,64 @@ func (j *planJoin) installStrategy(b *joinBinding, overflowed bool, stats *ExecS
 // joinBatchRows at a time rather than as one column per path — but it never
 // stops early. A partial build is not a cheaper build, it is a wrong answer:
 // the rows it did not see are pairs the query will not return.
-func (j *planJoin) buildSide(b *joinBinding, inner store.Snapshot) error {
+func (j *planJoin) buildSide(
+	b *joinBinding,
+	inner store.Snapshot,
+	budget *joinPairBudget,
+	workBudget *heapWorkBudget,
+) error {
 	scan := &b.scan
+	if err := scan.checkCanceled(); err != nil {
+		return err
+	}
+	scan.heapWorkParent = workBudget
+	scan.heapWorkTextReserved = 0
+	scan.eval.setWork(workBudget)
 	scan.candidateUsed = 0
 	scan.storeMaskUsed = 0
 	scan.text = scan.text[:0]
 
+	chunks, _, _ := inner.ZoneStats()
+	if workBudget != nil {
+		if err := workBudget.admitJoinCandidates(
+			j.inner, inner.Len(), heapWorkSnapshot, false, chunks,
+		); err != nil {
+			return err
+		}
+	}
 	masks, err := j.inner.storeCandidateMasks(inner, scan)
 	if err != nil {
+		return err
+	}
+	if err := scan.checkCanceled(); err != nil {
 		return err
 	}
 	if masks == nil {
 		b.masks = inner.AppendLiveMasks(b.masks[:0])
 		masks = b.masks
 	}
+	candidates := 0
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+			return err
+		}
+		candidates += bits.OnesCount64(mask.Bits)
+	}
+	if workBudget != nil {
+		if err := workBudget.admitJoinBatch(
+			j.inner,
+			min(candidates, joinBatchRows),
+			heapWorkSnapshot,
+			j.innerPath == joinPrimaryKey,
+		); err != nil {
+			return err
+		}
+	}
 	b.rows = b.rows[:0]
-	for _, mask := range masks {
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+			return err
+		}
 		for word := mask.Bits; word != 0; word &= word - 1 {
 			b.rows = append(b.rows, store.Location{
 				Chunk: mask.Chunk,
@@ -734,16 +898,18 @@ func (j *planJoin) buildSide(b *joinBinding, inner store.Snapshot) error {
 			if len(b.rows) < joinBatchRows {
 				continue
 			}
-			if err := j.drainBuild(b, inner); err != nil {
+			if err := j.drainBuild(b, inner, budget); err != nil {
 				return err
 			}
 		}
 	}
-	if err := j.drainBuild(b, inner); err != nil {
+	if err := j.drainBuild(b, inner, budget); err != nil {
 		return err
 	}
-	b.build.index()
-	return nil
+	if err := b.build.index(); err != nil {
+		return err
+	}
+	return scan.checkCanceled()
 }
 
 // drainBuild filters one batch of joined rows and records each survivor's join
@@ -751,11 +917,18 @@ func (j *planJoin) buildSide(b *joinBinding, inner store.Snapshot) error {
 // batches themselves arrive in mask order, so the build's entries end up in the
 // joined collection's own scan order — which is what the chain construction in
 // joinBuild.index then preserves.
-func (j *planJoin) drainBuild(b *joinBinding, inner store.Snapshot) error {
+func (j *planJoin) drainBuild(
+	b *joinBinding,
+	inner store.Snapshot,
+	budget *joinPairBudget,
+) error {
 	if len(b.rows) == 0 {
 		return nil
 	}
 	scan := &b.scan
+	if err := scan.checkCanceled(); err != nil {
+		return err
+	}
 	ctx := &scan.ctx
 	ctx.s, ctx.rows = nil, len(b.rows)
 	if err := ctx.extractSnapshotValues(
@@ -763,17 +936,39 @@ func (j *planJoin) drainBuild(b *joinBinding, inner store.Snapshot) error {
 	); err != nil {
 		return err
 	}
-	selected := j.inner.selectRows(ctx, nil, true, scan)
+	selected, err := j.inner.selectRows(ctx, nil, true, scan)
+	if err != nil {
+		return err
+	}
+	if err := scan.eval.firstError(); err != nil {
+		return err
+	}
 	if j.innerPath == joinPrimaryKey {
 		b.keys = inner.AppendRowKeys(b.keys[:0], b.rows)
 	}
-	for _, row := range selected {
+	for at, row := range selected {
+		if err := cancellationCheckpoint(scan.cancel, at); err != nil {
+			return err
+		}
 		if j.innerPath == joinPrimaryKey {
+			cell := scalar{kind: kindString, sval: b.keys[row]}
+			if err := budget.admitBuild(joinBuildEntryBytes(cell)); err != nil {
+				return err
+			}
 			b.build.text, _ = copyJoinString(b.build.text, b.keys[row])
-			b.build.add(lastJoinString(b.build.text, len(b.keys[row])), b.rows[row])
+			if err := b.build.add(
+				lastJoinString(b.build.text, len(b.keys[row])),
+				b.rows[row],
+			); err != nil {
+				return err
+			}
 			continue
 		}
-		b.appendBuild(ctx.values[j.innerPath][row], b.rows[row])
+		if err := b.appendBuild(
+			ctx.values[j.innerPath][row], b.rows[row], budget,
+		); err != nil {
+			return err
+		}
 	}
 	b.rows = b.rows[:0]
 	// The next batch refills the decoded-string arena in place, so nothing may
@@ -794,14 +989,37 @@ func (j *planJoin) drainBuild(b *joinBinding, inner store.Snapshot) error {
 // is a summary of fixed size rather than a set that grows — so continuing costs
 // scan time but no more memory. joinBloomWorthwhile decides which, before the
 // first row is read, from cardinalities that are already known exactly.
-func (j *planJoin) collect(b *joinBinding, inner store.Snapshot, limit, outerRows, ratio int, stoppable bool) (bool, error) {
+func (j *planJoin) collect(
+	b *joinBinding,
+	inner store.Snapshot,
+	limit, outerRows, ratio int,
+	stoppable bool,
+	workBudget *heapWorkBudget,
+) (bool, error) {
 	scan := &b.scan
+	if err := scan.checkCanceled(); err != nil {
+		return false, err
+	}
+	scan.heapWorkParent = workBudget
+	scan.heapWorkTextReserved = 0
+	scan.eval.setWork(workBudget)
 	scan.candidateUsed = 0
 	scan.storeMaskUsed = 0
 	scan.text = scan.text[:0]
 
+	chunks, _, _ := inner.ZoneStats()
+	if workBudget != nil {
+		if err := workBudget.admitJoinCandidates(
+			j.inner, inner.Len(), heapWorkSnapshot, false, chunks,
+		); err != nil {
+			return false, err
+		}
+	}
 	masks, err := j.inner.storeCandidateMasks(inner, scan)
 	if err != nil {
+		return false, err
+	}
+	if err := scan.checkCanceled(); err != nil {
 		return false, err
 	}
 	if masks == nil {
@@ -817,16 +1035,32 @@ func (j *planJoin) collect(b *joinBinding, inner store.Snapshot, limit, outerRow
 	// popcount per chunk, and it is the input the filter decision needs — an
 	// exact cardinality rather than an estimate of one.
 	candidates := 0
-	for _, mask := range masks {
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+			return false, err
+		}
 		candidates += bits.OnesCount64(mask.Bits)
 	}
 	b.candidates = candidates
 	b.outerRows = outerRows
 	b.ratio = joinBloomEffectiveRatio(ratio)
 	b.filtering = stoppable && joinBloomWorthwhile(candidates, outerRows, limit, b.ratio)
+	if workBudget != nil {
+		if err := workBudget.admitJoinBatch(
+			j.inner,
+			min(candidates, joinBatchRows),
+			heapWorkSnapshot,
+			j.innerPath == joinPrimaryKey,
+		); err != nil {
+			return false, err
+		}
+	}
 
 	b.rows = b.rows[:0]
-	for _, mask := range masks {
+	for i, mask := range masks {
+		if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+			return false, err
+		}
 		for word := mask.Bits; word != 0; word &= word - 1 {
 			b.rows = append(b.rows, store.Location{
 				Chunk: mask.Chunk,
@@ -835,12 +1069,14 @@ func (j *planJoin) collect(b *joinBinding, inner store.Snapshot, limit, outerRow
 			if len(b.rows) < joinBatchRows {
 				continue
 			}
-			if over, err := j.drain(b, inner, limit, stoppable); over || err != nil {
+			if over, err := j.drain(
+				b, inner, limit, stoppable, workBudget,
+			); over || err != nil {
 				return over, err
 			}
 		}
 	}
-	over, err := j.drain(b, inner, limit, stoppable)
+	over, err := j.drain(b, inner, limit, stoppable, workBudget)
 	if err != nil {
 		return false, err
 	}
@@ -882,21 +1118,31 @@ func joinBloomWorthwhile(candidates, outerRows, limit, ratio int) bool {
 		// The set fits the membership; this scan will not overflow at all.
 		return false
 	}
-	if outerRows == 0 {
+	if outerRows <= 0 {
 		return false // nothing to prefilter
 	}
-	return candidates <= outerRows*ratio
+	high, low := bits.Mul64(uint64(outerRows), uint64(ratio))
+	return high != 0 || uint64(candidates) <= low
 }
 
 // drain filters one accumulated batch of inner rows and collects the join-key
 // value of each survivor, then empties the batch. It reports whether the
 // collected set passed limit, which only a join that can fall back to a lookup
 // ever asks about.
-func (j *planJoin) drain(b *joinBinding, inner store.Snapshot, limit int, stoppable bool) (bool, error) {
+func (j *planJoin) drain(
+	b *joinBinding,
+	inner store.Snapshot,
+	limit int,
+	stoppable bool,
+	workBudget *heapWorkBudget,
+) (bool, error) {
 	if len(b.rows) == 0 {
 		return false, nil
 	}
 	scan := &b.scan
+	if err := scan.checkCanceled(); err != nil {
+		return false, err
+	}
 	ctx := &scan.ctx
 	ctx.s, ctx.rows = nil, len(b.rows)
 	if err := ctx.extractSnapshotValues(
@@ -904,11 +1150,20 @@ func (j *planJoin) drain(b *joinBinding, inner store.Snapshot, limit int, stoppa
 	); err != nil {
 		return false, err
 	}
-	selected := j.inner.selectRows(ctx, nil, true, scan)
+	selected, err := j.inner.selectRows(ctx, nil, true, scan)
+	if err != nil {
+		return false, err
+	}
+	if err := scan.eval.firstError(); err != nil {
+		return false, err
+	}
 	if j.innerPath == joinPrimaryKey {
 		b.keys = inner.AppendRowKeys(b.keys[:0], b.rows)
 	}
-	for _, row := range selected {
+	for at, row := range selected {
+		if err := cancellationCheckpoint(scan.cancel, at); err != nil {
+			return false, err
+		}
 		if b.overflowed {
 			// Past the threshold the set is not grown any further, but the scan
 			// is still running because a filter is being built out of it, and a
@@ -919,9 +1174,17 @@ func (j *planJoin) drain(b *joinBinding, inner store.Snapshot, limit int, stoppa
 			continue
 		}
 		if j.innerPath == joinPrimaryKey {
-			b.appendString(b.keys[row])
+			if err := b.appendString(b.keys[row], workBudget); err != nil {
+				return false, err
+			}
 		} else {
-			b.appendValue(ctx.values[j.innerPath][row])
+			value := ctx.values[j.innerPath][row]
+			if value.kind == kindNull {
+				continue
+			}
+			if err := b.appendValue(value, workBudget); err != nil {
+				return false, err
+			}
 		}
 		if !stoppable || len(b.lits) <= limit {
 			continue
@@ -932,9 +1195,18 @@ func (j *planJoin) drain(b *joinBinding, inner store.Snapshot, limit int, stoppa
 		// The threshold is crossed and a filter is wanted. Seed it from the
 		// alternatives already collected before they are released, so the
 		// filter covers the whole inner side and not just its tail.
+		if workBudget != nil {
+			if err := workBudget.resetJoinBloom(&b.bloom, b.candidates); err != nil {
+				return false, err
+			}
+		} else {
+			b.bloom.reset(b.candidates)
+		}
 		b.overflowed = true
-		b.bloom.reset(b.candidates)
 		for i := range b.lits {
+			if err := cancellationCheckpoint(scan.cancel, i); err != nil {
+				return false, err
+			}
 			b.bloom.insert(hashJoinKey(b.lits[i].sval))
 		}
 	}
@@ -1002,22 +1274,60 @@ func (b *joinBinding) keepFiltering() bool {
 	if remaining <= 0 {
 		return true // nothing left to save; the filter is already paid for
 	}
-	// Written in int64 with every factor widened separately: on a 32-bit build
-	// a row count times an outer row count times a ratio is three factors that
-	// would overflow int long before any one of them is implausible.
+	// Compared as full-width products: on a 64-bit build a row count times an
+	// outer row count times a ratio needs up to 189 bits, long after every
+	// individual count remains a valid int.
 	rejected := int64(b.scanned) - int64(b.bloom.inserted)
-	gain := rejected * int64(b.outerRows) * int64(b.ratio)
-	cost := int64(b.candidates) * int64(b.scanned)
-	return gain > cost
+	return joinProduct3GreaterThan2(
+		uint64(rejected),
+		uint64(b.outerRows),
+		uint64(b.ratio),
+		uint64(b.candidates),
+		uint64(b.scanned),
+	)
+}
+
+// joinProduct3GreaterThan2 compares a*b*c > x*y without narrowing either
+// product. Join cardinalities are signed ints but non-negative at this point;
+// on 64-bit systems their three-factor product needs up to 189 bits, so a
+// three-limb multiply is both exact and cheaper than allocating a big.Int in a
+// check that runs once per inner batch.
+func joinProduct3GreaterThan2(a, b, c, x, y uint64) bool {
+	abHigh, abLow := bits.Mul64(a, b)
+	midFromLow, low := bits.Mul64(abLow, c)
+	high, midFromHigh := bits.Mul64(abHigh, c)
+	mid, carry := bits.Add64(midFromLow, midFromHigh, 0)
+	high, _ = bits.Add64(high, 0, carry)
+
+	rightHigh, rightLow := bits.Mul64(x, y)
+	if high != 0 {
+		return true
+	}
+	if mid != rightHigh {
+		return mid > rightHigh
+	}
+	return low > rightLow
 }
 
 // appendString collects one alternative spelled as a string: a collection key,
 // or a string-valued inner field. A collection key is a string, so an outer
 // join value of any other kind matches nothing — the same in-kind rule [Cmp]
 // and [In] apply, reached here without a special case.
-func (b *joinBinding) appendString(text string) {
+func (b *joinBinding) appendString(
+	text string,
+	workBudget *heapWorkBudget,
+) error {
+	if workBudget != nil {
+		if err := workBudget.admitJoinMember(); err != nil {
+			return err
+		}
+	}
+	if err := b.reserveText(len(text), workBudget); err != nil {
+		return err
+	}
 	b.text, _ = copyJoinString(b.text, text)
 	b.lits = append(b.lits, lastJoinString(b.text, len(text)))
+	return nil
 }
 
 // copyJoinString appends text to an arena and returns the arena plus the mark
@@ -1067,13 +1377,98 @@ func copyJoinValue(arena []byte, cell scalar) ([]byte, scalar) {
 // dropped: it matches no outer value, so admitting it would only add an
 // alternative nothing can equal, and dropping it keeps the collected count an
 // honest measure of how selective the join is.
-func (b *joinBinding) appendValue(cell scalar) {
+func (b *joinBinding) appendValue(
+	cell scalar,
+	workBudget *heapWorkBudget,
+) error {
 	if cell.kind == kindNull {
-		return
+		return nil
+	}
+	if workBudget != nil {
+		if err := workBudget.admitJoinMember(); err != nil {
+			return err
+		}
+	}
+	if err := b.reserveText(joinValuePayloadBytes(cell), workBudget); err != nil {
+		return err
 	}
 	arena, copied := copyJoinValue(b.text, cell)
 	b.text = arena
 	b.lits = append(b.lits, copied)
+	return nil
+}
+
+// reserveText makes an append safe for every scalar already viewing b.text.
+//
+// A plain append is not enough here: when it reallocates, every earlier scalar
+// keeps its old backing array alive. Repeating that over a large membership
+// retains every geometric generation, so charging only the final capacity is
+// unsound. This grows under our control, admits the exact old+new peak before
+// allocation, copies once, and rebases every existing view onto the new arena.
+// After it returns the old generation is unreachable.
+func (b *joinBinding) reserveText(
+	additional int,
+	workBudget *heapWorkBudget,
+) error {
+	if additional < 0 || len(b.text) > int(^uint(0)>>1)-additional {
+		return fmt.Errorf("query: join membership text exceeds the address space")
+	}
+	required := len(b.text) + additional
+	if required <= cap(b.text) {
+		if workBudget == nil {
+			return nil
+		}
+		return workBudget.admitJoinText(int64(required), &b.textReserved)
+	}
+
+	nextCapacity := required
+	if nextCapacity < 64 {
+		nextCapacity = 64
+	}
+	if current := cap(b.text); current <= int(^uint(0)>>1)/2 {
+		if doubled := current * 2; doubled > nextCapacity {
+			nextCapacity = doubled
+		}
+	}
+	peak := saturatedBytes(int64(cap(b.text)), int64(nextCapacity))
+	if workBudget != nil {
+		if err := workBudget.admitJoinText(peak, &b.textReserved); err != nil {
+			return err
+		}
+	}
+
+	next := make([]byte, len(b.text), nextCapacity)
+	copy(next, b.text)
+	cursor := 0
+	for i := range b.lits {
+		n := joinValuePayloadBytes(b.lits[i])
+		end := cursor + n
+		switch b.lits[i].kind {
+		case kindNumber:
+			b.lits[i].num = next[cursor:end:end]
+			b.lits[i].raw = b.lits[i].num
+		case kindString:
+			b.lits[i].sval = byteview.String(next[cursor:end:end])
+		case kindContainer:
+			b.lits[i].raw = next[cursor:end:end]
+		}
+		cursor = end
+	}
+	b.text = next
+	return nil
+}
+
+func joinValuePayloadBytes(cell scalar) int {
+	switch cell.kind {
+	case kindNumber:
+		return len(cell.num)
+	case kindString:
+		return len(cell.sval)
+	case kindContainer:
+		return len(cell.raw)
+	default:
+		return 0
+	}
 }
 
 // appendBuild records one surviving joined row on the fan-out build side: its
@@ -1081,13 +1476,20 @@ func (b *joinBinding) appendValue(cell scalar) {
 // expansion will read its columns from. A null or absent join value is dropped
 // for the same reason a semi-join drops it — it matches nothing — and dropping
 // it here also keeps it out of a chain no probe can ever reach.
-func (b *joinBinding) appendBuild(cell scalar, row store.Location) {
+func (b *joinBinding) appendBuild(
+	cell scalar,
+	row store.Location,
+	budget *joinPairBudget,
+) error {
 	if cell.kind == kindNull {
-		return
+		return nil
+	}
+	if err := budget.admitBuild(joinBuildEntryBytes(cell)); err != nil {
+		return err
 	}
 	arena, copied := copyJoinValue(b.build.text, cell)
 	b.build.text = arena
-	b.build.add(copied, row)
+	return b.build.add(copied, row)
 }
 
 // buildNeedles renders the collected set as exact-index needles, which is what
@@ -1096,13 +1498,52 @@ func (b *joinBinding) appendBuild(cell scalar, row store.Location) {
 // no ready single-column exact index, because a needle nothing will probe is
 // pure cost — one index build per alternative, paid on the binding path where
 // the membership strategy is trying to stay cheap.
-func (b *joinBinding) buildNeedles(path string, indexes []store.IndexInfo) {
+func (b *joinBinding) buildNeedles(
+	path string,
+	indexes []store.IndexInfo,
+	workBudget *heapWorkBudget,
+) error {
 	b.needles = b.needles[:0]
 	if len(b.lits) == 0 {
-		return
+		return nil
 	}
 	if _, ok := singleColumnIndex(path, indexes); !ok {
-		return
+		return nil
+	}
+	var payloadBytes int64
+	for i, lit := range b.lits {
+		if err := cancellationCheckpoint(b.scan.cancel, i); err != nil {
+			return err
+		}
+		var bytes int
+		switch lit.kind {
+		case kindBool:
+			if lit.bval {
+				bytes = len(trueNeedle)
+			} else {
+				bytes = len(falseNeedle)
+			}
+		case kindNumber:
+			bytes = len(lit.num)
+		case kindString:
+			bytes = jsonStringEncodedBytes(lit.sval)
+		default:
+			// A container alternative has no scalar needle, and one missing
+			// needle makes the whole set unindexable rather than partially
+			// bounded, which would be unsound. Detect it before growing any
+			// needle storage.
+			b.needleText = b.needleText[:0]
+			b.starts = b.starts[:0]
+			return nil
+		}
+		payloadBytes = saturatedBytes(payloadBytes, int64(bytes))
+	}
+	if workBudget != nil {
+		if err := workBudget.admitJoinNeedles(
+			len(b.lits), payloadBytes,
+		); err != nil {
+			return err
+		}
 	}
 	// Rendered in one pass and indexed in a second, so every needle is built
 	// over the final buffer. Growing between builds would in fact be safe —
@@ -1111,7 +1552,10 @@ func (b *joinBinding) buildNeedles(path string, indexes []store.IndexInfo) {
 	// two lines this costs.
 	b.needleText = b.needleText[:0]
 	starts := b.starts[:0]
-	for _, lit := range b.lits {
+	for i, lit := range b.lits {
+		if err := cancellationCheckpoint(b.scan.cancel, i); err != nil {
+			return err
+		}
 		starts = append(starts, len(b.needleText))
 		switch lit.kind {
 		case kindBool:
@@ -1124,26 +1568,39 @@ func (b *joinBinding) buildNeedles(path string, indexes []store.IndexInfo) {
 			b.needleText = append(b.needleText, lit.num...)
 		case kindString:
 			b.needleText = appendJSONString(b.needleText, lit.sval)
-		default:
-			// A container alternative has no scalar needle, and one missing
-			// needle makes the whole set unindexable rather than partially
-			// bounded, which would be unsound.
-			b.starts = starts
-			return
 		}
 	}
 	starts = append(starts, len(b.needleText))
 	b.starts = starts
 	b.entries = resize(b.entries, len(b.lits))
 	for i := range b.lits {
+		if err := cancellationCheckpoint(b.scan.cancel, i); err != nil {
+			return err
+		}
 		src := b.needleText[starts[i]:starts[i+1]:starts[i+1]]
 		index, err := vibejson.BuildIndex(src, b.entries[i:i+1:i+1])
 		if err != nil {
 			b.needles = b.needles[:0]
-			return
+			return nil
 		}
 		b.needles = append(b.needles, index)
 	}
+	return nil
+}
+
+func jsonStringEncodedBytes(text string) int {
+	bytes := 2 // opening and closing quotes
+	for i := 0; i < len(text); i++ {
+		switch c := text[i]; {
+		case c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t':
+			bytes += 2
+		case c < 0x20:
+			bytes += 6
+		default:
+			bytes++
+		}
+	}
+	return bytes
 }
 
 // A joinProbe is one evaluator's mutable state for one join clause: the one-row
@@ -1191,6 +1648,7 @@ func (pr *joinProbe) reset() {
 		clear(pr.cols[i])
 	}
 	pr.inner.entries = pr.inner.entries[:0]
+	pr.inner.setWork(nil)
 	pr.raw = pr.raw[:0]
 	pr.err = nil
 	pr.probes, pr.tested, pr.admitted = 0, 0, 0
@@ -1264,6 +1722,12 @@ func (b *joinBinding) matches(cell scalar, pr *joinProbe) bool {
 // shape most worth revisiting if this ever becomes the bottleneck; the common
 // single-field filter pays exactly one scan either way.
 func (b *joinBinding) probe(cell scalar, pr *joinProbe) bool {
+	if err := cancellationError(b.scan.cancel); err != nil {
+		if pr.err == nil {
+			pr.err = err
+		}
+		return false
+	}
 	if cell.kind != kindString {
 		return false // collection keys are strings; nothing else can name one
 	}
@@ -1278,6 +1742,12 @@ func (b *joinBinding) probe(cell scalar, pr *joinProbe) bool {
 	}
 	pr.probes++
 	raw, ok := b.snapshot.GetRaw(cell.sval)
+	if err := cancellationError(b.scan.cancel); err != nil {
+		if pr.err == nil {
+			pr.err = err
+		}
+		return false
+	}
 	if !ok {
 		return false
 	}
@@ -1287,6 +1757,12 @@ func (b *joinBinding) probe(cell scalar, pr *joinProbe) bool {
 	cols := pr.sized(len(b.plan.valuePaths))
 	pr.inner.text = pr.inner.text[:0]
 	for i := range b.plan.valuePaths {
+		if err := cancellationCheckpoint(b.scan.cancel, i); err != nil {
+			if pr.err == nil {
+				pr.err = err
+			}
+			return false
+		}
 		value, found, err := raw.PointerCompiled(b.plan.valuePaths[i].pointer)
 		if err != nil || !found {
 			value = vibejson.RawValue{}

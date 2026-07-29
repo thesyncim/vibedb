@@ -112,7 +112,7 @@ func TestRunFileSnapshotOptions(t *testing.T) {
 	}
 }
 
-func TestRunFileSnapshotPersistentFloat64CoveringAggregates(t *testing.T) {
+func TestRunFileSnapshotFloat64CoversDoNotAnswerExactAggregates(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "query-file-cover-*")
 	if err != nil {
 		t.Fatal(err)
@@ -169,13 +169,13 @@ func TestRunFileSnapshotPersistentFloat64CoveringAggregates(t *testing.T) {
 		Count(), Sum("score"), Avg("score"), Min("score"), Max("score"),
 		Sum("nested.value"), Max("nested.value"),
 	))
-	if stats.CoveringColumns != 2 || stats.RowsTotal != uint64(set.Len()) ||
-		stats.RowsScanned != 0 || stats.Batches != 0 || stats.BufferedBytes != 0 {
-		t.Fatalf("covering aggregate stats = %+v", stats)
+	if stats.CoveringColumns != 0 || stats.RowsTotal != uint64(set.Len()) ||
+		stats.RowsScanned != uint64(set.Len()) || stats.Batches == 0 {
+		t.Fatalf("exact aggregate incorrectly trusted float64 cover: %+v", stats)
 	}
 	_, stats = run(Select(Sum("score"), Max("score")))
-	if stats.CoveringColumns != 1 || stats.RowsScanned != 0 {
-		t.Fatalf("duplicate covering aggregate stats = %+v", stats)
+	if stats.CoveringColumns != 0 || stats.RowsScanned != uint64(set.Len()) {
+		t.Fatalf("duplicate exact aggregate incorrectly trusted float64 cover: %+v", stats)
 	}
 	result, stats := run(Select(Sum("score")).Limit(0))
 	if result.RowCount != 0 || stats.CoveringColumns != 0 || stats.RowsScanned != 0 {
@@ -203,7 +203,7 @@ func TestRunFileSnapshotPersistentFloat64CoveringAggregates(t *testing.T) {
 	}
 }
 
-func TestRunFileSnapshotIndexNativeScalarGroups(t *testing.T) {
+func TestRunFileSnapshotIndexedScalarGroupsUseBoundedScan(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "query-file-groups-*")
 	if err != nil {
 		t.Fatal(err)
@@ -258,21 +258,19 @@ func TestRunFileSnapshotIndexNativeScalarGroups(t *testing.T) {
 	if gotKey, wantKey := resultKey(got), resultKey(want); gotKey != wantKey {
 		t.Fatalf("index-native groups mismatch:\n got: %s\nwant: %s", gotKey, wantKey)
 	}
-	if stats.RowsTotal != 8 || stats.RowsScanned != 2 ||
-		stats.IndexLookups != 1 || stats.IndexPostingPages == 0 ||
-		stats.IndexCertificateRows != 6 || stats.IndexRecheckRows != 2 ||
-		stats.IndexGroupedRows != 6 || stats.IndexGroups != 5 ||
-		stats.Batches != 0 || stats.BufferedBytes != 0 {
-		t.Fatalf("index-native group stats = %+v", stats)
+	if stats.RowsTotal != 8 || stats.RowsScanned != 8 ||
+		stats.IndexLookups != 0 || stats.IndexPostingPages != 0 ||
+		stats.IndexCertificateRows != 0 || stats.IndexRecheckRows != 0 ||
+		stats.Batches == 0 || stats.BufferedBytes == 0 {
+		t.Fatalf("bounded grouped-scan stats = %+v", stats)
 	}
 
 	// Result strings and raw projections are execution-owned, not aliases of
-	// the reusable index certificate arena.
+	// the reusable scan workspace.
 	beforeReuse := resultKey(got)
-	// A second Exec inherits the first's durable planning storage, so the next
-	// execution overwrites the very certificate arena the first result was
-	// materialized from. Its Result is separate, so any surviving alias shows
-	// up as a changed first result rather than as a coincidence.
+	// A second Exec inherits the first's durable execution storage, so the next
+	// execution overwrites that workspace. Its Result is separate, so any
+	// surviving alias shows up as a changed first result.
 	reuse := Exec{Options: ExecOptions{Workers: 1, MemoryBytes: 64 << 10}}
 	reuse.file = e.file
 	if err := q.RunInto(&reuse, FromFile(snapshot)); err != nil {
@@ -283,7 +281,7 @@ func TestRunFileSnapshotIndexNativeScalarGroups(t *testing.T) {
 	}
 }
 
-func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
+func TestRunFileSnapshotIndexedCatalogScalarGroupsUseBoundedScan(t *testing.T) {
 	builder, err := store.NewBuilder(store.Options{
 		ChunkDocuments: 4, ShapeTapes: true,
 	})
@@ -353,12 +351,11 @@ func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
 	if gotKey, wantKey := resultKey(got), resultKey(want); gotKey != wantKey {
 		t.Fatalf("index catalog groups mismatch:\n got: %s\nwant: %s", gotKey, wantKey)
 	}
-	if stats.RowsTotal != 6 || stats.RowsScanned != 0 ||
-		stats.IndexLookups != 1 || stats.IndexPostingPages != 0 ||
-		stats.IndexCertificateRows != 6 || stats.IndexRecheckRows != 0 ||
-		stats.IndexGroupedRows != 6 || stats.IndexGroups != 3 ||
-		stats.Batches != 0 || stats.BufferedBytes != 0 {
-		t.Fatalf("index catalog group stats = %+v", stats)
+	if stats.RowsTotal != 6 || stats.RowsScanned != 6 ||
+		stats.IndexLookups != 0 || stats.IndexPostingPages != 0 ||
+		stats.IndexCertificateRows != 0 || stats.IndexRecheckRows != 0 ||
+		stats.Batches == 0 || stats.BufferedBytes == 0 {
+		t.Fatalf("bounded catalog grouped-scan stats = %+v", stats)
 	}
 	reusable := Exec{Options: ExecOptions{Workers: 4, MemoryBytes: 64 << 10}}
 	if err := q.RunInto(&reusable, FromFile(snapshot)); err != nil {
@@ -367,24 +364,24 @@ func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
 	allocs := testing.AllocsPerRun(100, func() {
 		if err := q.RunInto(&reusable, FromFile(snapshot)); err != nil ||
 			reusable.Result.RowCount != 3 {
-			panic("reusable index catalog groups")
+			panic("reusable catalog grouped scan")
 		}
 	})
 	if allocs != 0 {
 		t.Fatalf(
-			"reusable index catalog result allocations = %.2f, want zero",
+			"reusable catalog grouped-scan allocations = %.2f, want zero",
 			allocs,
 		)
 	}
 	if gotKey, wantKey := resultKey(reusable.Result), resultKey(want); gotKey != wantKey {
 		t.Fatalf(
-			"reusable index catalog groups mismatch:\n got: %s\nwant: %s",
+			"reusable catalog grouped-scan mismatch:\n got: %s\nwant: %s",
 			gotKey, wantKey,
 		)
 	}
-	if reusable.Stats.IndexPostingPages != 0 ||
-		reusable.Stats.IndexGroupedRows != 6 {
-		t.Fatalf("reusable index catalog stats = %+v", reusable.Stats)
+	if reusable.Stats.RowsScanned != 6 ||
+		reusable.Stats.IndexPostingPages != 0 {
+		t.Fatalf("reusable catalog grouped-scan stats = %+v", reusable.Stats)
 	}
 	reusable.Release()
 	if reusable.Result.RowCount != 0 || reusable.Result.Columns != nil ||
@@ -395,8 +392,9 @@ func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A non-first scalar mutation transactionally rewrites the bounded
-	// catalog, so the O(groups) query lane survives ordinary churn.
+	// A non-first scalar mutation transactionally rewrites the index catalog.
+	// Group execution remains exact when that indexed generation is read
+	// through the work-memory-bounded scan path.
 	mutated := []byte(`{"profile":{"kind":"b"}}`)
 	if created, err := fs.Put("k1", mutated); err != nil || created {
 		t.Fatalf("mutate covered group = (%v,%v)", created, err)
@@ -431,15 +429,15 @@ func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
 			gotKey, wantKey,
 		)
 	}
-	if stats.RowsTotal != 6 || stats.RowsScanned != 0 ||
-		stats.IndexLookups != 1 || stats.IndexPostingPages != 0 ||
-		stats.IndexCertificateRows != 6 || stats.IndexRecheckRows != 0 ||
-		stats.IndexGroupedRows != 6 || stats.IndexGroups != 4 {
-		t.Fatalf("incremental catalog group stats = %+v", stats)
+	if stats.RowsTotal != 6 || stats.RowsScanned != 6 ||
+		stats.IndexLookups != 0 || stats.IndexPostingPages != 0 ||
+		stats.IndexCertificateRows != 0 || stats.IndexRecheckRows != 0 ||
+		stats.Batches == 0 {
+		t.Fatalf("incremental catalog grouped-scan stats = %+v", stats)
 	}
 }
 
-func TestRunFileSnapshotSegmentedIndexCatalogScalarGroups(t *testing.T) {
+func TestRunFileSnapshotHighCardinalityIndexedGroupsSpillAtWorkMemory(t *testing.T) {
 	const documents = 256
 	builder, err := store.NewBuilder(store.Options{
 		ChunkDocuments: 8, ShapeTapes: true,
@@ -494,29 +492,24 @@ func TestRunFileSnapshotSegmentedIndexCatalogScalarGroups(t *testing.T) {
 	q := Select(Path("kind"), Count()).
 		GroupBy("kind").
 		OrderBy("kind", Asc)
-	e := Exec{Options: ExecOptions{Workers: 1, MemoryBytes: 64 << 10}}
+	const workMemory = int64(64 << 10)
+	e := Exec{Options: ExecOptions{Workers: 1, MemoryBytes: workMemory}}
 	if err := q.RunInto(&e, FromFile(snapshot)); err != nil {
 		t.Fatal(err)
 	}
-	if e.Result.RowCount != documents || e.Stats.RowsScanned != 0 ||
+	if e.Result.RowCount != documents ||
+		e.Stats.RowsScanned != documents ||
+		e.Stats.Batches == 0 ||
+		e.Stats.BufferedBytes > workMemory ||
+		e.Stats.SpillRuns == 0 ||
+		e.Stats.SpilledBytes == 0 ||
+		e.Stats.IndexLookups != 0 ||
 		e.Stats.IndexPostingPages != 0 ||
-		e.Stats.IndexGroupedRows != documents ||
-		e.Stats.IndexGroups != documents {
+		e.Stats.IndexCertificateRows != 0 ||
+		e.Stats.IndexRecheckRows != 0 {
 		t.Fatalf(
-			"segmented query = rows %d stats %+v",
+			"bounded high-cardinality query = rows %d stats %+v",
 			e.Result.RowCount, e.Stats,
-		)
-	}
-	allocs := testing.AllocsPerRun(100, func() {
-		if err := q.RunInto(&e, FromFile(snapshot)); err != nil ||
-			e.Result.RowCount != documents {
-			panic("segmented file query")
-		}
-	})
-	if allocs != 0 {
-		t.Fatalf(
-			"segmented query warm allocations = %.2f, want zero",
-			allocs,
 		)
 	}
 	first, ok := e.Result.Columns[0].Cells[0].Text()
@@ -526,6 +519,208 @@ func TestRunFileSnapshotSegmentedIndexCatalogScalarGroups(t *testing.T) {
 	last, ok := e.Result.Columns[0].Cells[documents-1].Text()
 	if !ok || last != "value-255" {
 		t.Fatalf("segmented last group = (%q,%v)", last, ok)
+	}
+}
+
+func TestRunFileSnapshotIndexPlanningRespectsWorkMemory(t *testing.T) {
+	const (
+		documents = 256
+		matches   = documents / 16
+	)
+	builder, err := store.NewBuilder(store.Options{
+		ChunkDocuments: 1, ShapeTapes: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		kind := "miss"
+		if row%16 == 0 {
+			kind = "hit"
+		}
+		if err := builder.Append(
+			fmt.Sprintf("k%03d", row),
+			fmt.Appendf(nil, `{"id":%d,"kind":%q}`, row, kind),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "query-file-index-bound-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := durable.Options{
+		Collection: store.Options{
+			ChunkDocuments: 1, ShapeTapes: true,
+		},
+		Indexes: []store.IndexDefinition{{
+			Name: "kind", Paths: []string{"/kind"},
+		}},
+		PageSize: 4096, MaxPageSize: 4096,
+		MaxKeyBytes: 32, InlineValueBytes: 128,
+		MaxDocumentBytes: 1024,
+	}
+	if _, err := durable.CreateFrom(source, file, options); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := durable.Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	snapshot, err := fs.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	projection := Select(Path("id")).Where(Cmp("kind", Eq, "hit"))
+	compiled, err := projection.compiled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := snapshot.IndexProbeMemoryBound()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateBytes := compiled.fileIndexPlanMemoryBytes(
+		bound, bound.CandidateWorkspaceBytes,
+	)
+	if candidateBytes <= minimumFileMemory/2 {
+		t.Fatalf(
+			"fixture candidate bound = %d, want above tight planner share",
+			candidateBytes,
+		)
+	}
+
+	// One byte below the derived bound declines before the catalog, mask
+	// buffers, or durable probe workspace grows. Equality admits the exact same
+	// plan and proves the comparison is not an off-by-one rejection.
+	var declined Workspace
+	var declinedIndex durable.IndexWorkspace
+	masks, planned, err := compiled.fileCandidateMasksBounded(
+		snapshot, &declinedIndex, &declined, candidateBytes-1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if masks != nil || planned != 0 ||
+		len(declined.storeIndexes) != 0 ||
+		len(declined.storeMasks) != 0 ||
+		declinedIndex.LastProbeStats() != (durable.IndexProbeStats{}) {
+		t.Fatalf(
+			"below-bound candidate plan grew workspace: masks=%d planned=%d "+
+				"indexes=%d buffers=%d probe=%+v",
+			len(masks), planned, len(declined.storeIndexes),
+			len(declined.storeMasks), declinedIndex.LastProbeStats(),
+		)
+	}
+	var admitted Workspace
+	var admittedIndex durable.IndexWorkspace
+	masks, planned, err = compiled.fileCandidateMasksBounded(
+		snapshot, &admittedIndex, &admitted, candidateBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planned != candidateBytes || len(masks) != matches ||
+		admitted.storeIndexProbes != 1 {
+		t.Fatalf(
+			"boundary candidate plan = masks %d planned %d probes %d",
+			len(masks), planned, admitted.storeIndexProbes,
+		)
+	}
+
+	exactBytes := compiled.fileIndexPlanMemoryBytes(
+		bound, bound.ExactSingleWorkspaceBytes,
+	)
+	var exactDeclined Workspace
+	var exactDeclinedIndex durable.IndexWorkspace
+	exactMasks, _, _, _, exact, err :=
+		compiled.fileExactCandidateMasksBounded(
+			snapshot, &exactDeclinedIndex, &exactDeclined, exactBytes-1,
+		)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exact || exactMasks != nil ||
+		len(exactDeclined.storeMasks) != 0 ||
+		exactDeclinedIndex.LastProbeStats() != (durable.IndexProbeStats{}) {
+		t.Fatalf(
+			"below-bound exact plan grew probe workspace: exact=%v masks=%d "+
+				"buffers=%d probe=%+v",
+			exact, len(exactMasks), len(exactDeclined.storeMasks),
+			exactDeclinedIndex.LastProbeStats(),
+		)
+	}
+	var exactAdmitted Workspace
+	var exactAdmittedIndex durable.IndexWorkspace
+	exactMasks, _, _, _, exact, err =
+		compiled.fileExactCandidateMasksBounded(
+			snapshot, &exactAdmittedIndex, &exactAdmitted, exactBytes,
+		)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exact || len(exactMasks) != matches ||
+		exactAdmitted.storeIndexProbes != 1 {
+		t.Fatalf(
+			"boundary exact plan = exact %v masks %d probes %d",
+			exact, len(exactMasks), exactAdmitted.storeIndexProbes,
+		)
+	}
+
+	// At the minimum public work-memory setting the conservative plan does not
+	// fit its half-budget. Both ordinary candidate pushdown and direct COUNT
+	// therefore decline to the same exact full scan, with honest zero index
+	// statistics and no mask/probe growth.
+	projectExec := Exec{Options: ExecOptions{
+		Workers: 1, MemoryBytes: minimumFileMemory,
+	}}
+	if err := projection.RunInto(&projectExec, FromFile(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if projectExec.Result.RowCount != matches ||
+		projectExec.Stats.RowsScanned != documents ||
+		projectExec.Stats.IndexBounded ||
+		projectExec.Stats.IndexLookups != 0 ||
+		projectExec.Stats.Batches == 0 ||
+		len(projectExec.Workspace.storeMasks) != 0 ||
+		projectExec.file.index.LastProbeStats() != (durable.IndexProbeStats{}) {
+		t.Fatalf(
+			"tight projection = rows %d stats %+v buffers %d probe %+v",
+			projectExec.Result.RowCount, projectExec.Stats,
+			len(projectExec.Workspace.storeMasks),
+			projectExec.file.index.LastProbeStats(),
+		)
+	}
+
+	countExec := Exec{Options: ExecOptions{
+		Workers: 1, MemoryBytes: minimumFileMemory,
+	}}
+	countQuery := Select(Count()).Where(Cmp("kind", Eq, "hit"))
+	if err := countQuery.RunInto(&countExec, FromFile(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if countExec.Result.RowCount != 1 ||
+		!countIs(countExec.Result.Columns[0].Cells[0], matches) ||
+		countExec.Stats.RowsScanned != documents ||
+		countExec.Stats.IndexBounded ||
+		countExec.Stats.IndexLookups != 0 ||
+		countExec.Stats.Batches == 0 ||
+		len(countExec.Workspace.storeMasks) != 0 ||
+		countExec.file.index.LastProbeStats() != (durable.IndexProbeStats{}) {
+		t.Fatalf(
+			"tight direct count fallback = result %s stats %+v buffers %d probe %+v",
+			resultKey(countExec.Result), countExec.Stats,
+			len(countExec.Workspace.storeMasks),
+			countExec.file.index.LastProbeStats(),
+		)
 	}
 }
 
@@ -542,7 +737,8 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 			{Name: "tenant", Paths: []string{"/tenant"}},
 			{Name: "country", Paths: []string{"/profile/geo/country"}},
 		},
-		Durability: durable.DurabilityAsyncVisible,
+		Durability:       durable.DurabilityAsyncVisible,
+		MaxDocumentBytes: 2048,
 	}
 	fs, err := durable.Create(file, options)
 	if err != nil {
@@ -597,7 +793,7 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 			t.Fatal(err)
 		}
 		e := Exec{Options: ExecOptions{
-			Workers: 3, BatchRows: 7, BatchBytes: 16 << 10, MemoryBytes: 64 << 10,
+			Workers: 3, BatchRows: 7, BatchBytes: 16 << 10, MemoryBytes: 1 << 20,
 		}}
 		if err := q.RunInto(&e, FromFile(snapshot)); err != nil {
 			t.Fatal(err)

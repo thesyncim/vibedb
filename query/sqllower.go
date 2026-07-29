@@ -52,11 +52,10 @@ import (
 
 // lower rebuilds and compiles the plan for one binding of args.
 //
-// It follows the JSON front end's shape exactly — rewind, prepare, build,
-// compile, publish — because that shape is what makes a warmed compile refill
-// the compiler's arenas instead of reallocating them. A statement re-lowered
-// per bind is therefore free of heap allocation in the steady state, the same
-// contract Compiler.New and Compiler.Parse carry.
+// It follows the reusable compiler lifecycle — rewind, prepare, build, compile,
+// publish — so a warmed compile refills the compiler's arenas instead of
+// reallocating them. A statement re-lowered per bind is therefore free of heap
+// allocation in the steady state.
 func (s *Statement) lower(args []any) error {
 	c := &s.c
 	c.rewind()
@@ -77,12 +76,14 @@ func (s *Statement) lower(args []any) error {
 	// that ignores the error and executes anyway sees this error rather than
 	// whichever half-built clauses survived into the builder state.
 	_ = c.fail(&s.q, err)
-	// A statement that cannot lower at all cannot lower for any binding
-	// either, so caching the failure is right even when placeholders are
-	// present: re-deriving it per execution would only re-derive the same
-	// message. A failure that depends on the argument — a bad type, a negative
-	// LIMIT — is raised before this point, by the leaf that read it.
-	s.cached = true
+	// A placeholder-free statement always has the same failure, so retaining
+	// it avoids pointlessly rebuilding the same invalid plan. A placeholder
+	// statement is different: prepare already lowered its shape successfully
+	// with neutral arguments, which means a later failure can depend on this
+	// binding (a bad type, an invalid Number, or a negative LIMIT/OFFSET).
+	// Keep that statement reusable so a rejected execution cannot poison the
+	// next valid bind.
+	s.cached = s.params == 0
 	s.lowerErr = err
 	return err
 }
@@ -210,11 +211,40 @@ func (s *Statement) count(o sqlast.Operand, args []any, clause string) (int, err
 			return 0, fmt.Errorf("query: %s was bound to %d, which is not a non-negative count", clause, v)
 		}
 		return int(v), nil
+	case *int64:
+		if v == nil {
+			return 0, fmt.Errorf("query: %s was bound to NULL; a row count cannot be NULL", clause)
+		}
+		if *v < 0 || int64(int(*v)) != *v {
+			return 0, fmt.Errorf("query: %s was bound to %d, which is not a non-negative count", clause, *v)
+		}
+		return int(*v), nil
 	case int:
 		if v < 0 {
 			return 0, fmt.Errorf("query: %s was bound to %d, which is not a non-negative count", clause, v)
 		}
 		return v, nil
+	case Number:
+		n, ok := int64Spelling(string(v))
+		if !ok || n < 0 || int64(int(n)) != n {
+			return 0, fmt.Errorf(
+				"query: %s was bound to %q, which is not a non-negative count",
+				clause, v,
+			)
+		}
+		return int(n), nil
+	case *Number:
+		if v == nil {
+			return 0, fmt.Errorf("query: %s was bound to NULL; a row count cannot be NULL", clause)
+		}
+		n, ok := int64Spelling(string(*v))
+		if !ok || n < 0 || int64(int(n)) != n {
+			return 0, fmt.Errorf(
+				"query: %s was bound to %q, which is not a non-negative count",
+				clause, *v,
+			)
+		}
+		return int(n), nil
 	default:
 		return 0, fmt.Errorf(
 			"query: %s was bound to %T; a row count must be a non-negative integer", clause, args[o.Ordinal])
@@ -731,7 +761,7 @@ func (s *Statement) inForm(e *sqlast.Expr, spec string, args []any) (leafForm, e
 }
 
 // operand resolves a literal or a bound placeholder to the typed value
-// [Compiler.makeLiteral] takes, reporting known=false for SQL NULL.
+// the internal literal compiler takes, reporting known=false for SQL NULL.
 //
 // Literal text is handed over by reference rather than copied: a parsed
 // statement owns its own text, and the Statement owns the parse tree, so the
@@ -770,6 +800,31 @@ func (s *Statement) argument(arg any) (any, bool, error) {
 	switch v := arg.(type) {
 	case nil:
 		return nil, false, nil
+	case *bool:
+		if v == nil {
+			return nil, false, nil
+		}
+		return arg, true, nil
+	case *int64:
+		if v == nil {
+			return nil, false, nil
+		}
+		return arg, true, nil
+	case *float64:
+		if v == nil {
+			return nil, false, nil
+		}
+		return arg, true, nil
+	case *string:
+		if v == nil {
+			return nil, false, nil
+		}
+		return arg, true, nil
+	case *Number:
+		if v == nil {
+			return nil, false, nil
+		}
+		return arg, true, nil
 	case bool, int, int8, int16, int32, int64,
 		uint, uint8, uint16, uint32, uint64, float32, float64:
 		return arg, true, nil
@@ -792,7 +847,8 @@ func (s *Statement) argument(arg any) (any, bool, error) {
 	default:
 		return nil, false, fmt.Errorf(
 			"query: cannot bind %T as a SQL literal; bind a bool, an integer, a float, "+
-				"a string, a []byte, a query.Number, or nil", arg)
+				"a string, a []byte, a query.Number, their pointer-shaped zero-copy "+
+				"forms, or nil", arg)
 	}
 }
 

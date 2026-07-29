@@ -6,15 +6,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // Given a PostgreSQL client speaking protocol 3.0 over a net.Pipe, when it
@@ -68,6 +74,95 @@ func TestStartupRefusesSSLInTheClear(t *testing.T) {
 	}
 	// The connection must remain usable in the clear afterwards.
 	c.startup(map[string]string{"user": "tester"})
+}
+
+func sendEncryptionRequest(c *testClient, code int32, extra []byte) {
+	packet := binary.BigEndian.AppendUint32(nil, uint32(8+len(extra)))
+	packet = binary.BigEndian.AppendUint32(packet, uint32(code))
+	packet = append(packet, extra...)
+	c.sendRaw(packet)
+}
+
+func expectEncryptionUnavailable(t *testing.T, c *testClient) {
+	t.Helper()
+	if err := c.conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("setting encryption-negotiation read deadline: %v", err)
+	}
+	reply := make([]byte, 1)
+	if _, err := io.ReadFull(c.br, reply); err != nil {
+		t.Fatalf("reading encryption-negotiation reply: %v", err)
+	}
+	if reply[0] != 'N' {
+		t.Fatalf("encryption negotiation replied %q, want 'N'", reply[0])
+	}
+}
+
+func expectStartupProtocolViolation(t *testing.T, c *testClient) {
+	t.Helper()
+	m := c.recv()
+	if m.tag != msgErrorResponse {
+		t.Fatalf("malformed startup produced %q, want ErrorResponse", string(rune(m.tag)))
+	}
+	if fields := errorFields(m.body); fields['C'] != sqlstateProtocolViolation ||
+		fields['S'] != "FATAL" {
+		t.Fatalf("malformed startup was not a fatal protocol violation: %s",
+			formatError(m.body))
+	}
+}
+
+func TestStartupEncryptionNegotiationIsStrictAndFinite(t *testing.T) {
+	t.Run("one fallback in either order", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			codes []int32
+		}{
+			{name: "SSL then GSS", codes: []int32{codeSSLRequest, codeGSSENCRequest}},
+			{name: "GSS then SSL", codes: []int32{codeGSSENCRequest, codeSSLRequest}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				c := dial(t, newTestServer(t, Options{}))
+				for _, code := range tc.codes {
+					sendEncryptionRequest(c, code, nil)
+					expectEncryptionUnavailable(t, c)
+				}
+				c.startup(map[string]string{"user": "tester"})
+			})
+		}
+	})
+
+	t.Run("a mechanism cannot reset the read deadline forever", func(t *testing.T) {
+		for _, code := range []int32{codeSSLRequest, codeGSSENCRequest} {
+			name := "SSL"
+			if code == codeGSSENCRequest {
+				name = "GSS"
+			}
+			t.Run(name, func(t *testing.T) {
+				c := dial(t, newTestServer(t, Options{ReadTimeout: -1}))
+				sendEncryptionRequest(c, code, nil)
+				expectEncryptionUnavailable(t, c)
+				sendEncryptionRequest(c, code, nil)
+				expectStartupProtocolViolation(t, c)
+			})
+		}
+	})
+
+	t.Run("encryption requests are exactly eight bytes", func(t *testing.T) {
+		for _, code := range []int32{codeSSLRequest, codeGSSENCRequest} {
+			c := dial(t, newTestServer(t, Options{}))
+			sendEncryptionRequest(c, code, []byte{0})
+			expectStartupProtocolViolation(t, c)
+		}
+	})
+}
+
+func TestStartupPacketRejectsBytesAfterItsTerminalNUL(t *testing.T) {
+	c := dial(t, newTestServer(t, Options{}))
+	body := binary.BigEndian.AppendUint32(nil, uint32(protocolVersion30))
+	body = append(body, "user\x00tester\x00\x00"...)
+	body = append(body, 0x7f)
+	packet := binary.BigEndian.AppendUint32(nil, uint32(len(body)+4))
+	c.sendRaw(append(packet, body...))
+	expectStartupProtocolViolation(t, c)
 }
 
 func TestStartupRefusesAnUnknownProtocolVersion(t *testing.T) {
@@ -192,6 +287,85 @@ func TestEmptyQueryGetsEmptyQueryResponse(t *testing.T) {
 	}
 }
 
+func TestUnterminatedBlockCommentIsNeverAnEmptyQuery(t *testing.T) {
+	c := connect(t)
+
+	msgs := c.query("/* unterminated")
+	expectError(t, msgs, sqlstateSyntaxError)
+	if has(msgs, msgEmptyQuery) {
+		t.Fatal("simple Query classified an unterminated block comment as empty SQL")
+	}
+
+	c.send(msgParse, parseMsg("bad-comment", "/* unterminated"))
+	c.send(msgSync, nil)
+	msgs = c.until(msgReadyForQuery)
+	expectError(t, msgs, sqlstateSyntaxError)
+	if has(msgs, msgParseComplete) {
+		t.Fatal("extended Parse accepted an unterminated block comment")
+	}
+}
+
+func TestSimpleQueryStatementIterationIsBounded(t *testing.T) {
+	t.Run("separator run allocates nothing", func(t *testing.T) {
+		src := strings.Repeat(";", 1<<20)
+		allocations := testing.AllocsPerRun(10, func() {
+			iter := statementIterator{src: src}
+			count := 0
+			for {
+				_, ok := iter.next()
+				if !ok {
+					break
+				}
+				count++
+			}
+			if count != 1 {
+				panic("all-empty query did not yield exactly one statement")
+			}
+		})
+		if allocations != 0 {
+			t.Fatalf("iterating one million separators allocated %.2f times, want zero",
+				allocations)
+		}
+	})
+
+	t.Run("statement count", func(t *testing.T) {
+		c := connect(t)
+		// Comments are non-empty input segments that classify as empty SQL.
+		// They keep the test's response small while exercising the same
+		// per-statement loop as ordinary SELECTs.
+		msgs := c.query(strings.Repeat("/**/;", maxSimpleStatements+1))
+		expectError(t, msgs, sqlstateProgramLimitExceeded)
+		if n := countTag(msgs, msgEmptyQuery); n != maxSimpleStatements {
+			t.Fatalf("executed %d statements before the bound, want %d",
+				n, maxSimpleStatements)
+		}
+		if n := countTag(msgs, msgReadyForQuery); n != 1 {
+			t.Fatalf("bounded simple query produced %d ReadyForQuery messages, want 1", n)
+		}
+	})
+}
+
+func TestLiteralSelectCompatibilityShimIsBounded(t *testing.T) {
+	c := connect(t)
+	// This path is answered by the no-FROM compatibility shim rather than the
+	// core SQL parser. It must carry the parser's structural limit itself.
+	sql := "SELECT " + strings.Repeat("1,", maxResultColumns) + "1"
+	msgs := c.query(sql)
+	expectError(t, msgs, sqlstateProgramLimitExceeded)
+	if has(msgs, msgRowDescription) || has(msgs, msgDataRow) {
+		t.Fatal("an over-wide compatibility SELECT emitted partial result metadata or data")
+	}
+}
+
+func TestLiteralSelectCompatibilityShimRejectsInt8Overflow(t *testing.T) {
+	c := connect(t)
+	msgs := c.query(`SELECT 9223372036854775808`)
+	expectError(t, msgs, sqlstateNumericValueOutOfRange)
+	if has(msgs, msgRowDescription) || has(msgs, msgDataRow) {
+		t.Fatal("an out-of-range fixed int8 emitted partial metadata or data")
+	}
+}
+
 // --- extended query --------------------------------------------------------
 
 func TestExtendedQueryRoundTrip(t *testing.T) {
@@ -217,6 +391,145 @@ func TestExtendedQueryRoundTrip(t *testing.T) {
 	if oid := f.int32(); oid != 0 {
 		t.Fatalf("ParameterDescription declares OID %d; a placeholder in this dialect has no "+
 			"type and must be reported as unspecified", oid)
+	}
+}
+
+func TestParameterDescriptionPreservesDeclaredWireOIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		oids []int32
+		want []int32
+	}{
+		{
+			name: "out of order and repeated",
+			oids: []int32{oidText, oidInt8},
+			want: []int32{oidText, oidInt8},
+		},
+		{
+			name: "unspecified tail",
+			oids: []int32{oidText},
+			want: []int32{oidText, 0},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := connect(t)
+			c.send(msgParse, parseMsg("typed",
+				`SELECT id FROM users WHERE age = $2 AND tier = $1 AND age >= $2`,
+				tc.oids...))
+			c.send(msgDescribe, describeMsg(targetStatement, "typed"))
+			c.send(msgSync, nil)
+			msgs := c.until(msgReadyForQuery)
+			if has(msgs, msgErrorResponse) {
+				t.Fatalf("typed Parse/Describe failed: %s",
+					formatError(find(t, msgs, msgErrorResponse).body))
+			}
+			got := decodeParameterDescription(t,
+				find(t, msgs, msgParameterDesc).body)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ParameterDescription OIDs = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeclaredJSONParametersUseJSONScalarSemantics(t *testing.T) {
+	docs := []string{
+		`{"id":1,"value":"21"}`,
+		`{"id":2,"value":"A\nB"}`,
+		`{"id":3,"value":21}`,
+		`{"id":4,"value":true}`,
+		`{"id":5,"value":null}`,
+	}
+	for _, tc := range []struct {
+		name     string
+		oid      int32
+		format   int16
+		raw      []byte
+		wantID   string
+		wantCode string
+	}{
+		{name: "quoted string", oid: oidJSON, raw: []byte(`"21"`), wantID: "1"},
+		{name: "escaped string", oid: oidJSON, raw: []byte(`"A\nB"`), wantID: "2"},
+		{name: "exact number", oid: oidJSON, raw: []byte(`21`), wantID: "3"},
+		{name: "boolean", oid: oidJSON, raw: []byte(`true`), wantID: "4"},
+		{name: "null", oid: oidJSON, raw: []byte(`null`)},
+		{name: "jsonb text", oid: oidJSONB, raw: []byte(` "21" `), wantID: "1"},
+		{
+			name:   "json binary",
+			oid:    oidJSON,
+			format: formatBinary,
+			raw:    []byte(`"21"`),
+			wantID: "1",
+		},
+		{
+			name:   "jsonb binary",
+			oid:    oidJSONB,
+			format: formatBinary,
+			raw:    append([]byte{1}, []byte(`"21"`)...),
+			wantID: "1",
+		},
+		{
+			name:     "jsonb binary version",
+			oid:      oidJSONB,
+			format:   formatBinary,
+			raw:      append([]byte{2}, []byte(`"21"`)...),
+			wantCode: sqlstateInvalidParameterValue,
+		},
+		{
+			name:     "malformed scalar",
+			oid:      oidJSON,
+			raw:      []byte(`"unterminated`),
+			wantCode: sqlstateInvalidParameterValue,
+		},
+		{
+			name:     "array refused",
+			oid:      oidJSON,
+			raw:      []byte(`[1,2]`),
+			wantCode: sqlstateFeatureNotSupported,
+		},
+		{
+			name:     "object refused",
+			oid:      oidJSONB,
+			raw:      []byte(`{"x":1}`),
+			wantCode: sqlstateFeatureNotSupported,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := NewServer(FromDatabase(testDatabase(t, "docs", docs)),
+				Options{Auth: Trust()})
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			t.Cleanup(func() { _ = srv.Close() })
+			c := dial(t, srv)
+			c.startup(map[string]string{"user": "tester"})
+			c.send(msgParse, parseMsg("", `SELECT id FROM docs WHERE value = $1`, tc.oid))
+			c.send(msgBind, bindMsg("", "", []int16{tc.format}, [][]byte{tc.raw}, nil))
+			c.send(msgExecute, executeMsg("", 0))
+			c.send(msgSync, nil)
+			msgs := c.until(msgReadyForQuery)
+			if tc.wantCode != "" {
+				expectError(t, msgs, tc.wantCode)
+				if has(msgs, msgDataRow) {
+					t.Fatal("a rejected JSON Bind emitted a row")
+				}
+				return
+			}
+			if has(msgs, msgErrorResponse) {
+				t.Fatalf("declared JSON scalar failed: %s",
+					formatError(find(t, msgs, msgErrorResponse).body))
+			}
+			rows := rowsOf(t, msgs)
+			if tc.wantID == "" {
+				if len(rows) != 0 {
+					t.Fatalf("JSON null matched %v, want no SQL equality match", rows)
+				}
+				return
+			}
+			if len(rows) != 1 || string(rows[0][0]) != tc.wantID {
+				t.Fatalf("declared JSON scalar returned %v, want id %s", rows, tc.wantID)
+			}
+		})
 	}
 }
 
@@ -266,6 +579,46 @@ func TestExtendedQueryPortalSuspension(t *testing.T) {
 	msgs = c.until(msgReadyForQuery)
 	if tag := commandTagOf(t, msgs); tag != "SELECT 0" {
 		t.Fatalf("re-executing an exhausted portal reported %q, want SELECT 0", tag)
+	}
+}
+
+func TestSimpleQueryDestroysUnnamedExtendedObjects(t *testing.T) {
+	c := connect(t)
+	// A named portal can be built from the unnamed statement, and the unnamed
+	// portal can independently be built from a named statement. A simple Query
+	// destroys both unnamed objects; destroying the statement also destroys
+	// every portal that depends on it.
+	c.send(msgParse, parseMsg("", `SELECT id FROM users`))
+	c.send(msgBind, bindMsg("fromUnnamed", "", nil, nil, nil))
+	c.send(msgParse, parseMsg("named", `SELECT id FROM users`))
+	c.send(msgBind, bindMsg("", "named", nil, nil, nil))
+	c.send(msgSync, nil)
+	if msgs := c.until(msgReadyForQuery); has(msgs, msgErrorResponse) {
+		t.Fatalf("setup failed: %s", formatError(find(t, msgs, msgErrorResponse).body))
+	}
+
+	if msgs := c.query(`SELECT 1`); has(msgs, msgErrorResponse) {
+		t.Fatalf("simple Query failed: %s", formatError(find(t, msgs, msgErrorResponse).body))
+	}
+
+	c.send(msgDescribe, describeMsg(targetStatement, ""))
+	c.send(msgSync, nil)
+	expectError(t, c.until(msgReadyForQuery), sqlstateInvalidStatementName)
+
+	c.send(msgDescribe, describeMsg(targetPortal, "fromUnnamed"))
+	c.send(msgSync, nil)
+	expectError(t, c.until(msgReadyForQuery), sqlstateInvalidCursorName)
+
+	c.send(msgDescribe, describeMsg(targetPortal, ""))
+	c.send(msgSync, nil)
+	expectError(t, c.until(msgReadyForQuery), sqlstateInvalidCursorName)
+
+	// The named statement did not depend on either unnamed object and remains.
+	c.send(msgDescribe, describeMsg(targetStatement, "named"))
+	c.send(msgSync, nil)
+	if msgs := c.until(msgReadyForQuery); has(msgs, msgErrorResponse) {
+		t.Fatalf("simple Query destroyed a named statement: %s",
+			formatError(find(t, msgs, msgErrorResponse).body))
 	}
 }
 
@@ -517,6 +870,8 @@ func TestUntypedTextParametersAreReadAsJSONScalars(t *testing.T) {
 		want  int
 	}{
 		{`SELECT id FROM users WHERE age = ?`, "30", 2},
+		{`SELECT id FROM users WHERE big = ?`, "9007199254740993", 1},
+		{`SELECT id FROM users WHERE ratio = ?`, "1e-1", 1},
 		{`SELECT id FROM users WHERE tier = ?`, "pro", 3},
 		{`SELECT id FROM users WHERE flag = ?`, "true", 1},
 	}
@@ -584,6 +939,53 @@ func TestBinaryParameterWithNoDeclaredTypeIsRefused(t *testing.T) {
 	c.send(msgBind, bindMsg("", "", []int16{formatBinary}, [][]byte{{0, 0, 0, 30}}, nil))
 	c.send(msgSync, nil)
 	expectError(t, c.until(msgReadyForQuery), sqlstateFeatureNotSupported)
+}
+
+func TestNonFiniteBinaryFloatParametersAreRefusedAtBind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		oid  int32
+		raw  []byte
+	}{
+		{name: "float4 NaN", oid: oidFloat4,
+			raw: binary.BigEndian.AppendUint32(nil, math.Float32bits(float32(math.NaN())))},
+		{name: "float8 positive infinity", oid: oidFloat8,
+			raw: binary.BigEndian.AppendUint64(nil, math.Float64bits(math.Inf(1)))},
+		{name: "float8 negative infinity", oid: oidFloat8,
+			raw: binary.BigEndian.AppendUint64(nil, math.Float64bits(math.Inf(-1)))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := connect(t)
+			c.send(msgParse, parseMsg("", `SELECT id FROM users WHERE ratio = ?`, tc.oid))
+			c.send(msgBind, bindMsg("", "", []int16{formatBinary}, [][]byte{tc.raw}, nil))
+			c.send(msgSync, nil)
+			expectError(t, c.until(msgReadyForQuery), sqlstateInvalidParameterValue)
+		})
+	}
+}
+
+func TestTextInputsMustMatchTheReportedUTF8Encoding(t *testing.T) {
+	t.Run("SQL", func(t *testing.T) {
+		c := connect(t)
+		expectError(t, c.query("SELECT "+string([]byte{0xff})+" FROM users"),
+			sqlstateCharacterNotInRepertoire)
+	})
+	t.Run("parameter", func(t *testing.T) {
+		c := connect(t)
+		c.send(msgParse, parseMsg("", `SELECT id FROM users WHERE name = ?`))
+		c.send(msgBind, bindMsg("", "", nil, [][]byte{{0xff}}, nil))
+		c.send(msgSync, nil)
+		expectError(t, c.until(msgReadyForQuery), sqlstateCharacterNotInRepertoire)
+	})
+	t.Run("startup", func(t *testing.T) {
+		c := dial(t, newTestServer(t, Options{}))
+		c.sendStartup(map[string]string{"user": string([]byte{0xff})})
+		m := c.recv()
+		if fs := errorFields(m.body); m.tag != msgErrorResponse ||
+			fs['C'] != sqlstateCharacterNotInRepertoire || fs['S'] != "FATAL" {
+			t.Fatalf("invalid startup UTF-8 was not refused: %s", formatError(m.body))
+		}
+	})
 }
 
 // --- error classification --------------------------------------------------
@@ -698,6 +1100,39 @@ func TestCatalogQueriesAreRefused(t *testing.T) {
 
 // --- session commands ------------------------------------------------------
 
+func TestSessionCommandShimsRejectMalformedOrTrailingSQL(t *testing.T) {
+	c := connect(t)
+	for _, sql := range []string{
+		`SHOW application_name trailing`,
+		`RESET application_name trailing`,
+		`DISCARD`,
+		`DISCARD PLANS`,
+		`DISCARD ALL trailing`,
+		`SET TIME ZONE`,
+		`SET NAMES`,
+		`SET application_name = 'x' /* unterminated`,
+	} {
+		expectErrorSoft(t, c.query(sql), sqlstateSyntaxError, sql)
+	}
+
+	// Simple Query legitimately splits this text into two statements. Extended
+	// Parse, however, must represent exactly one statement and must not let the
+	// permissive SET compatibility parser absorb a second command as its value.
+	c.send(msgParse, parseMsg("two-statements",
+		`SET application_name = 'changed'; SHOW application_name`))
+	c.send(msgSync, nil)
+	msgs := c.until(msgReadyForQuery)
+	expectError(t, msgs, sqlstateSyntaxError)
+	if has(msgs, msgParseComplete) {
+		t.Fatal("extended Parse accepted two statements through the SET shim")
+	}
+
+	rows := rowsOf(t, c.query(`SHOW application_name`))
+	if len(rows) != 1 || len(rows[0][0]) != 0 {
+		t.Fatalf("a rejected SET changed application_name to %v", rows)
+	}
+}
+
 func TestSetAcceptsWhatItCanAndRefusesTheRest(t *testing.T) {
 	c := connect(t)
 	for _, sql := range []string{
@@ -799,6 +1234,37 @@ func TestTheFixedSelectShimAnswersAHandshake(t *testing.T) {
 	}
 }
 
+func TestFixedBooleanUsesPostgreSQLBoolInTextAndBinary(t *testing.T) {
+	c := connect(t)
+
+	text := c.query(`SELECT TRUE`)
+	cols := decodeRowDescription(t, find(t, text, msgRowDescription).body)
+	if len(cols) != 1 || cols[0].oid != oidBool || cols[0].size != 1 {
+		t.Fatalf("SELECT TRUE described %+v, want one bool column", cols)
+	}
+	if rows := rowsOf(t, text); len(rows) != 1 ||
+		len(rows[0]) != 1 || string(rows[0][0]) != "t" {
+		t.Fatalf("SELECT TRUE text rows = %v, want t", rows)
+	}
+
+	c.send(msgParse, parseMsg("", `SELECT FALSE`))
+	c.send(msgBind, bindMsg("", "", nil, nil, []int16{formatBinary}))
+	c.send(msgDescribe, describeMsg(targetPortal, ""))
+	c.send(msgExecute, executeMsg("", 0))
+	c.send(msgSync, nil)
+	binaryMessages := c.until(msgReadyForQuery)
+	binaryCols := decodeRowDescription(
+		t, find(t, binaryMessages, msgRowDescription).body)
+	if len(binaryCols) != 1 || binaryCols[0].oid != oidBool ||
+		binaryCols[0].format != formatBinary {
+		t.Fatalf("SELECT FALSE binary described %+v, want binary bool", binaryCols)
+	}
+	if rows := rowsOf(t, binaryMessages); len(rows) != 1 ||
+		len(rows[0]) != 1 || !bytes.Equal(rows[0][0], []byte{0}) {
+		t.Fatalf("SELECT FALSE binary rows = %v, want one zero byte", rows)
+	}
+}
+
 func TestDiscardActuallyDiscards(t *testing.T) {
 	c := connect(t)
 	c.send(msgParse, parseMsg("kept", `SELECT id FROM users`))
@@ -815,6 +1281,19 @@ func TestDiscardActuallyDiscards(t *testing.T) {
 }
 
 // --- lifecycle and concurrency ---------------------------------------------
+
+func TestProtocolSessionUsesOneQueryWorker(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	srv := newTestServer(t, Options{})
+	session := newSession(srv, serverConn)
+	defer session.release()
+	if got := session.exec.Options.Workers; got != 1 {
+		t.Fatalf("session query workers = %d, want 1", got)
+	}
+}
 
 func TestTerminateEndsTheSessionCleanly(t *testing.T) {
 	c := connect(t)
@@ -856,6 +1335,454 @@ func TestAnOversizedMessageIsRefusedWithoutAllocating(t *testing.T) {
 	}
 }
 
+func TestSessionRetainedInputsHaveAggregateBounds(t *testing.T) {
+	t.Run("prepared SQL", func(t *testing.T) {
+		s := &session{
+			statements:     map[string]*prepared{},
+			portals:        map[string]*portal{},
+			statementBytes: maxPreparedInputBytes,
+			msg: frontendMessage{
+				name:  "next",
+				query: "SELECT 1",
+			},
+		}
+		err := s.handleParse()
+		var pg *pgError
+		if !errors.As(err, &pg) || pg.code != sqlstateProgramLimitExceeded {
+			t.Fatalf("prepared SQL beyond the session budget = %v", err)
+		}
+	})
+	t.Run("prepared parameter OIDs", func(t *testing.T) {
+		const oidCount = maxParameters
+		charge := preparedInputCharge("s", "", oidCount)
+		if want := 1 + 4*oidCount; charge != want {
+			t.Fatalf("prepared OID charge = %d, want %d", charge, want)
+		}
+		s := &session{
+			statements: map[string]*prepared{},
+			portals:    map[string]*portal{},
+			// Leave one byte less than this Parse requires.
+			statementBytes: maxPreparedInputBytes - charge + 1,
+			msg: frontendMessage{
+				name:      "s",
+				paramOIDs: make([]int32, oidCount),
+			},
+		}
+		err := s.handleParse()
+		var pg *pgError
+		if !errors.As(err, &pg) || pg.code != sqlstateProgramLimitExceeded {
+			t.Fatalf("prepared OIDs beyond the session budget = %v", err)
+		}
+	})
+	t.Run("portal arguments", func(t *testing.T) {
+		stmt := &prepared{name: "s", wireParams: 1}
+		s := &session{
+			statements:  map[string]*prepared{"s": stmt},
+			portals:     map[string]*portal{},
+			portalBytes: maxPortalBytes,
+			msg: frontendMessage{
+				name:   "s",
+				portal: "next",
+				params: [][]byte{[]byte("x")},
+			},
+		}
+		err := s.handleBind()
+		var pg *pgError
+		if !errors.As(err, &pg) || pg.code != sqlstateProgramLimitExceeded {
+			t.Fatalf("portal arguments beyond the session budget = %v", err)
+		}
+	})
+	t.Run("compiler high-water", func(t *testing.T) {
+		stmt := &prepared{name: "s", wireParams: 1}
+		s := &session{
+			statements:         map[string]*prepared{"s": stmt},
+			portals:            map[string]*portal{},
+			statementBindBytes: maxPreparedBindBytes,
+			msg: frontendMessage{
+				name:   "s",
+				portal: "next",
+				params: [][]byte{[]byte("x")},
+			},
+		}
+		err := s.handleBind()
+		var pg *pgError
+		if !errors.As(err, &pg) || pg.code != sqlstateProgramLimitExceeded {
+			t.Fatalf("compiler storage beyond the session budget = %v", err)
+		}
+		if len(s.portals) != 0 {
+			t.Fatal("a Bind rejected by compiler accounting published its portal")
+		}
+	})
+}
+
+func TestManyWidePreparedPlansHitAggregateBoundAndCloseReleasesIt(t *testing.T) {
+	c := connect(t)
+	projection := strings.TrimSuffix(strings.Repeat("id,", maxResultColumns), ",")
+	wide := "SELECT " + projection + " FROM users"
+	var admitted []string
+	for i := 0; i < maxStatements; i++ {
+		name := fmt.Sprintf("w%03d", i)
+		c.send(msgParse, parseMsg(name, wide))
+		c.send(msgSync, nil)
+		msgs := c.until(msgReadyForQuery)
+		if has(msgs, msgErrorResponse) {
+			expectError(t, msgs, sqlstateProgramLimitExceeded)
+			break
+		}
+		admitted = append(admitted, name)
+	}
+	if len(admitted) == 0 || len(admitted) >= maxStatements {
+		t.Fatalf("wide-plan aggregate bound admitted %d statements; want a finite prefix",
+			len(admitted))
+	}
+
+	// Releasing one plan returns exactly its admission charge, so an
+	// equivalently shaped and equally named replacement must fit immediately.
+	c.send(msgClose, closeMsg(targetStatement, admitted[0]))
+	c.send(msgSync, nil)
+	if msgs := c.until(msgReadyForQuery); has(msgs, msgErrorResponse) {
+		t.Fatalf("closing an admitted wide plan failed: %s",
+			formatError(find(t, msgs, msgErrorResponse).body))
+	}
+	c.send(msgParse, parseMsg("x000", wide))
+	c.send(msgSync, nil)
+	if msgs := c.until(msgReadyForQuery); has(msgs, msgErrorResponse) {
+		t.Fatalf("released wide-plan budget was not reusable: %s",
+			formatError(find(t, msgs, msgErrorResponse).body))
+	}
+}
+
+func TestDirectQuestionMarkParametersRespectTheWireInt16Bound(t *testing.T) {
+	c := connect(t)
+	// Parsing the protocol's maximal predicate is intentionally adversarial
+	// and takes several seconds under -race on slower builders. Keep the
+	// ordinary client's five-second missing-message detector everywhere else.
+	c.readTimeout = 20 * time.Second
+	sql := `SELECT id FROM users WHERE age = ?` +
+		strings.Repeat(` AND age = ?`, maxParameters)
+	c.send(msgParse, parseMsg("", sql))
+	// Pipeline Describe to prove an oversized count can never reach
+	// ParameterDescription's signed Int16 field.
+	c.send(msgDescribe, describeMsg(targetStatement, ""))
+	c.send(msgSync, nil)
+	msgs := c.until(msgReadyForQuery)
+	expectError(t, msgs, sqlstateProgramLimitExceeded)
+	if has(msgs, msgParseComplete) || has(msgs, msgParameterDesc) {
+		t.Fatal("an over-wide parameter vector was published or described")
+	}
+}
+
+func TestRepeatedNumberedParameterCopiesWireValueOnce(t *testing.T) {
+	const occurrences = 4096
+	order := make([]int, occurrences)
+	for i := range order {
+		order[i] = 1
+	}
+	raw := bytes.Repeat([]byte("9"), 4096)
+	m := &frontendMessage{params: [][]byte{raw}}
+	stmt := &prepared{paramOrder: order, wireParams: 1}
+	args, wireArgs, slots, store, decoded, err := bindArgs(
+		nil, nil, nil, nil, nil, m, stmt)
+	if err != nil {
+		t.Fatalf("bindArgs: %v", err)
+	}
+	if len(args) != occurrences || len(wireArgs) != 1 || len(slots) != 1 {
+		t.Fatalf("argument vectors have lengths %d/%d/%d, want %d/1/1",
+			len(args), len(wireArgs), len(slots), occurrences)
+	}
+	if len(store) != len(raw) {
+		t.Fatalf("repeated $1 retained %d bytes, want one %d-byte wire value",
+			len(store), len(raw))
+	}
+	if len(decoded) != 0 {
+		t.Fatalf("untyped repeated $1 retained %d decoded bytes, want none", len(decoded))
+	}
+	for i, arg := range args {
+		if arg != wireArgs[0] {
+			t.Fatalf("placeholder %d does not alias the one decoded wire value", i)
+		}
+	}
+	charges := fillLiteralCharges(nil, wireArgs)
+	if len(charges) != 1 {
+		t.Fatalf("literal charge cache has %d entries, want one per wire value", len(charges))
+	}
+
+	// The portal copy is one value, but lowering currently retains literal
+	// bytes per occurrence in the prepared statement's compiler. That separate
+	// high-water charge must still reject a shape whose execution would
+	// amplify past the session bound.
+	if got := boundLiteralCharge(charges, stmt); got <= maxPreparedBindBytes {
+		t.Fatalf("execution charge for repeated $1 = %d, want over %d",
+			got, maxPreparedBindBytes)
+	}
+}
+
+func TestCompilerLiteralChargeAccountsExactEscapingOnce(t *testing.T) {
+	const n = 1024
+	controls := strings.Repeat("\x01", n)
+	if got, want := encodedJSONStringLen(controls), 2+6*n; got != want {
+		t.Fatalf("encoded control-string length = %d, want %d", got, want)
+	}
+	if got, want := compilerLiteralCharge(controls), 1<<10+4*n+8*(2+6*n); got != want {
+		t.Fatalf("control-string compiler charge = %d, want %d", got, want)
+	}
+	number := query.Number(strings.Repeat("9", n))
+	if got, want := compilerLiteralCharge(number), 1<<10+12*n; got != want {
+		t.Fatalf("exact-number compiler charge = %d, want %d", got, want)
+	}
+
+	values := []any{controls}
+	charges := make([]int, 0, 1)
+	if allocs := testing.AllocsPerRun(100, func() {
+		charges = fillLiteralCharges(charges[:0], values)
+	}); allocs != 0 {
+		t.Fatalf("warm literal accounting allocated %.2f times, want zero", allocs)
+	}
+}
+
+func TestWarmUnnamedBindIsAllocationFreeForEveryParameterShape(t *testing.T) {
+	intWire := binary.BigEndian.AppendUint64(nil, uint64(42))
+	for _, tc := range []struct {
+		name   string
+		raw    []byte
+		oid    int32
+		format int16
+		role   sqldriver.ParamKind
+	}{
+		{name: "string", raw: []byte("ordinary text"), oid: oidText},
+		{name: "exact number", raw: []byte("1e-1"), oid: oidNumeric},
+		{name: "boolean", raw: []byte("true"), oid: oidBool},
+		{name: "binary integer", raw: intWire, oid: oidInt8, format: formatBinary},
+		{name: "declared JSON string", raw: []byte(`"A\nB"`), oid: oidJSON},
+		{
+			name:   "binary JSONB string",
+			raw:    append([]byte{1}, []byte(`"A\nB"`)...),
+			oid:    oidJSONB,
+			format: formatBinary,
+		},
+		{
+			name: "whole JSON document", raw: []byte(`{"id":"a","nested":[1,true]}`),
+			oid: oidJSON, role: sqldriver.ParamDocument,
+		},
+		{
+			name: "binary JSONB document",
+			raw:  append([]byte{1}, []byte(`{"id":"a","nested":[1,true]}`)...),
+			oid:  oidJSONB, format: formatBinary, role: sqldriver.ParamDocument,
+		},
+		{name: "null", raw: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt := &prepared{
+				wireParams: 1, paramOIDs: []int32{tc.oid},
+				paramKinds: []sqldriver.ParamKind{tc.role},
+			}
+			s := &session{
+				w:          newWriter(io.Discard, 1<<20),
+				statements: map[string]*prepared{"": stmt},
+				portals:    map[string]*portal{},
+				msg: frontendMessage{
+					params:       [][]byte{tc.raw},
+					paramFormats: []int16{tc.format},
+				},
+			}
+			if err := s.handleBind(); err != nil {
+				t.Fatalf("warm Bind: %v", err)
+			}
+			if allocs := testing.AllocsPerRun(100, func() {
+				if err := s.handleBind(); err != nil {
+					panic(err)
+				}
+			}); allocs != 0 {
+				t.Fatalf("warm unnamed Bind allocated %.2f times, want zero", allocs)
+			}
+		})
+	}
+}
+
+func TestOneResultRowCannotAmplifyPastTheMessageBound(t *testing.T) {
+	blob := strings.Repeat("x", 1<<20)
+	doc := `{"id":1,"blob":"` + blob + `"}`
+	srv, err := NewServer(FromDatabase(testDatabase(t, "docs", []string{doc})),
+		Options{Auth: Trust()})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+
+	columns := make([]string, 17)
+	for i := range columns {
+		columns[i] = "blob"
+	}
+	msgs := c.query("SELECT " + strings.Join(columns, ",") + " FROM docs")
+	expectError(t, msgs, sqlstateProgramLimitExceeded)
+	if has(msgs, msgDataRow) {
+		t.Fatal("an oversized result row was partially emitted")
+	}
+}
+
+func TestLaterOversizedResultRowIsRejectedBeforeAnyDataRow(t *testing.T) {
+	blob := strings.Repeat("x", 1<<20)
+	docs := []string{
+		`{"id":1,"blob":"small"}`,
+		`{"id":2,"blob":"` + blob + `"}`,
+	}
+	srv, err := NewServer(FromDatabase(testDatabase(t, "docs", docs)),
+		Options{Auth: Trust()})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+
+	columns := make([]string, 17)
+	for i := range columns {
+		columns[i] = "blob"
+	}
+	msgs := c.query("SELECT " + strings.Join(columns, ",") + " FROM docs")
+	expectError(t, msgs, sqlstateProgramLimitExceeded)
+	if has(msgs, msgDataRow) {
+		t.Fatal("a row preceding an oversized later DataRow was emitted")
+	}
+}
+
+func TestWarmDataRowPreflightIsAllocationFree(t *testing.T) {
+	src := FromDatabase(testDatabase(t, "docs", []string{
+		`{"blob":"small"}`,
+		`{"blob":"also small"}`,
+	}))
+	l, err := src.resolve("docs", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.release()
+	stmt, err := query.PrepareStatement(`SELECT blob FROM docs`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Release()
+	var exec query.Exec
+	cursor, err := stmt.RunInto(&exec, l.src, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := columnsFor(nil, stmt.Columns(), stmt.AppendSchema(nil))
+	if err := checkDataRows(cursor, cols, nil); err != nil {
+		t.Fatalf("warm DataRow preflight: %v", err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if err := checkDataRows(cursor, cols, nil); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("warm DataRow preflight allocated %.2f times, want zero", allocs)
+	}
+}
+
+func TestConfiguredResultBudgetsFailBeforeAnyDataRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts Options
+	}{
+		{
+			name: "rows",
+			opts: Options{
+				Auth:           Trust(),
+				MaxResultRows:  1,
+				MaxResultBytes: UnlimitedResults,
+			},
+		},
+		{
+			name: "bytes",
+			opts: Options{
+				Auth:           Trust(),
+				MaxResultRows:  UnlimitedResults,
+				MaxResultBytes: 1,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)), tc.opts)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			t.Cleanup(func() { _ = srv.Close() })
+			c := dial(t, srv)
+			c.startup(map[string]string{"user": "tester"})
+			msgs := c.query(`SELECT id FROM users`)
+			expectError(t, msgs, sqlstateProgramLimitExceeded)
+			if has(msgs, msgDataRow) {
+				t.Fatal("a result rejected by its execution budget emitted a partial DataRow")
+			}
+		})
+	}
+}
+
+func TestBackendResultMessagesAreAdmittedBeforeEncoding(t *testing.T) {
+	value := strings.Repeat("x", maxDataRowBytes/maxResultColumns+1)
+	cols := make([]column, maxResultColumns)
+	values := make([]*string, maxResultColumns)
+	for i := range cols {
+		cols[i] = column{name: value, typ: typeText}
+		values[i] = &value
+	}
+
+	t.Run("RowDescription", func(t *testing.T) {
+		var sink bytes.Buffer
+		w := newWriter(&sink, 1024)
+		err := w.rowDescription(cols, nil)
+		var pg *pgError
+		if !errors.As(err, &pg) || pg.code != sqlstateProgramLimitExceeded {
+			t.Fatalf("oversized RowDescription = %v", err)
+		}
+		if len(w.buf) != 0 {
+			t.Fatal("oversized RowDescription partially entered the writer")
+		}
+	})
+
+	t.Run("fixed DataRow", func(t *testing.T) {
+		var sink bytes.Buffer
+		w := newWriter(&sink, 1024)
+		err := w.fixedRow(cols, values, nil)
+		var pg *pgError
+		if !errors.As(err, &pg) || pg.code != sqlstateProgramLimitExceeded {
+			t.Fatalf("oversized fixed DataRow = %v", err)
+		}
+		if len(w.buf) != 0 {
+			t.Fatal("oversized fixed DataRow partially entered the writer")
+		}
+	})
+}
+
+func TestErrorResponseFieldsAreBoundedAndRemainUTF8(t *testing.T) {
+	var sink bytes.Buffer
+	w := newWriter(&sink, 1024)
+	oversized := strings.Repeat("界", maxErrorFieldBytes)
+	w.errorResponse(newError(sqlstateInvalidParameterValue, oversized).
+		withHint(oversized))
+	if len(w.buf) > 2*maxErrorFieldBytes+128 {
+		t.Fatalf("bounded ErrorResponse retained %d bytes", len(w.buf))
+	}
+	if err := w.flush(); err != nil {
+		t.Fatal(err)
+	}
+	wire := sink.Bytes()
+	if len(wire) < 5 || wire[0] != msgErrorResponse {
+		t.Fatalf("malformed ErrorResponse: %x", wire)
+	}
+	fields := errorFields(wire[5:])
+	for _, tag := range []byte{'M', 'H'} {
+		value := fields[tag]
+		if len(value) > maxErrorFieldBytes || !utf8.ValidString(value) ||
+			!strings.HasSuffix(value, "...") {
+			t.Errorf("field %c = %d bytes, valid=%v, suffix=%v",
+				tag, len(value), utf8.ValidString(value), strings.HasSuffix(value, "..."))
+		}
+	}
+}
+
 func TestManySessionsRunConcurrentlyAgainstOneStore(t *testing.T) {
 	srv := newTestServer(t, Options{})
 	const sessions = 8
@@ -882,8 +1809,232 @@ func TestManySessionsRunConcurrentlyAgainstOneStore(t *testing.T) {
 	wg.Wait()
 }
 
+type controlledListener struct {
+	entered    chan struct{}
+	acceptConn chan net.Conn
+	acceptErr  chan error
+	closed     chan struct{}
+	enterOnce  sync.Once
+	closeOnce  sync.Once
+}
+
+func newControlledListener() *controlledListener {
+	return &controlledListener{
+		entered:    make(chan struct{}),
+		acceptConn: make(chan net.Conn),
+		acceptErr:  make(chan error, 1),
+		closed:     make(chan struct{}),
+	}
+}
+
+func (l *controlledListener) Accept() (net.Conn, error) {
+	l.enterOnce.Do(func() { close(l.entered) })
+	select {
+	case conn := <-l.acceptConn:
+		return conn, nil
+	case err := <-l.acceptErr:
+		return nil, err
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *controlledListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (*controlledListener) Addr() net.Addr { return controlledListenerAddr{} }
+
+type controlledListenerAddr struct{}
+
+func (controlledListenerAddr) Network() string { return "pgwire-test" }
+func (controlledListenerAddr) String() string  { return "pgwire-test" }
+
+func awaitListenerAccept(t *testing.T, listener *controlledListener) {
+	t.Helper()
+	select {
+	case <-listener.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not enter Listener.Accept")
+	}
+}
+
+func awaitServeResult(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after its listener stopped")
+		return nil
+	}
+}
+
+func TestNilServeInputsNeverEnterListenerOrConnectionAccounting(t *testing.T) {
+	var reported error
+	srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+		Options{
+			Auth: Trust(),
+			OnError: func(err error) {
+				reported = err
+			},
+		})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	if err := srv.Serve(nil); !errors.Is(err, errNilListener) {
+		t.Fatalf("Serve(nil) = %v, want actionable nil-listener error", err)
+	}
+	srv.ServeConn(nil)
+	if !errors.Is(reported, errNilConnection) {
+		t.Fatalf("ServeConn(nil) reported %v, want nil-connection error", reported)
+	}
+
+	srv.mu.Lock()
+	listeners, conns := len(srv.listeners), len(srv.conns)
+	srv.mu.Unlock()
+	if listeners != 0 || conns != 0 {
+		t.Fatalf("nil endpoints entered accounting: %d listeners, %d connections",
+			listeners, conns)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close after nil endpoints: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked: a nil endpoint leaked WaitGroup accounting")
+	}
+}
+
+func TestServeOwnsTheListenerAcrossEveryExit(t *testing.T) {
+	newServer := func(t *testing.T) *Server {
+		t.Helper()
+		srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+			Options{Auth: Trust()})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		return srv
+	}
+
+	t.Run("server close", func(t *testing.T) {
+		srv := newServer(t)
+		listener := newControlledListener()
+		done := make(chan error, 1)
+		go func() { done <- srv.Serve(listener) }()
+		awaitListenerAccept(t, listener)
+
+		if err := srv.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := awaitServeResult(t, done); !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("Serve after Close = %v, want ErrServerClosed", err)
+		}
+		select {
+		case <-listener.closed:
+		default:
+			t.Fatal("Server.Close did not close the listener owned by Serve")
+		}
+		srv.mu.Lock()
+		n := len(srv.listeners)
+		srv.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("Serve retained %d listeners after returning", n)
+		}
+	})
+
+	t.Run("accept failure", func(t *testing.T) {
+		srv := newServer(t)
+		listener := newControlledListener()
+		done := make(chan error, 1)
+		go func() { done <- srv.Serve(listener) }()
+		awaitListenerAccept(t, listener)
+
+		acceptErr := errors.New("accept failed")
+		listener.acceptErr <- acceptErr
+		if err := awaitServeResult(t, done); !errors.Is(err, acceptErr) {
+			t.Fatalf("Serve after Accept failure = %v, want %v", err, acceptErr)
+		}
+		select {
+		case <-listener.closed:
+		default:
+			t.Fatal("Serve returned without closing its listener")
+		}
+		if err := srv.Close(); err != nil {
+			t.Fatalf("Close after Serve returned: %v", err)
+		}
+	})
+}
+
+func TestOnErrorMayCloseTheServerSynchronously(t *testing.T) {
+	for _, entry := range []string{"ServeConn", "Serve"} {
+		t.Run(entry, func(t *testing.T) {
+			callbackDone := make(chan error, 1)
+			var srv *Server
+			var err error
+			srv, err = NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+				Options{
+					Auth: Trust(),
+					OnError: func(error) {
+						callbackDone <- srv.Close()
+					},
+				})
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+
+			client, server := net.Pipe()
+			serveDone := make(chan error, 1)
+			switch entry {
+			case "ServeConn":
+				go func() {
+					srv.ServeConn(server)
+					serveDone <- nil
+				}()
+			case "Serve":
+				listener := newControlledListener()
+				go func() { serveDone <- srv.Serve(listener) }()
+				awaitListenerAccept(t, listener)
+				listener.acceptConn <- server
+			}
+
+			// EOF before a startup packet is an ordinary session-terminating
+			// error and invokes OnError.
+			if err := client.Close(); err != nil {
+				t.Fatalf("closing test client: %v", err)
+			}
+			select {
+			case err := <-callbackDone:
+				if err != nil {
+					t.Fatalf("Close from OnError: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("OnError calling Close deadlocked on its own connection")
+			}
+			select {
+			case err := <-serveDone:
+				if entry == "Serve" && !errors.Is(err, ErrServerClosed) {
+					t.Fatalf("Serve after callback Close = %v, want ErrServerClosed", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("%s did not return after callback Close", entry)
+			}
+		})
+	}
+}
+
 func TestServerCloseEndsEverySession(t *testing.T) {
-	srv := NewServer(FromDatabase(testDatabase(t, "users", corpus)), Options{})
+	srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+		Options{Auth: Trust()})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 	c := dial(t, srv)
 	c.startup(map[string]string{"user": "tester"})
 	if err := srv.Close(); err != nil {
@@ -893,6 +2044,71 @@ func TestServerCloseEndsEverySession(t *testing.T) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := c.br.ReadByte(); err == nil {
 		t.Fatal("the connection was still live after Close")
+	}
+}
+
+func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
+	src := FromDatabase(testDatabase(t, "users", corpus))
+	if _, err := NewServer(src, Options{}); err == nil {
+		t.Fatal("NewServer accepted an implicit authentication policy")
+	}
+	srv, err := NewServer(src, Options{Auth: Trust()})
+	if err != nil {
+		t.Fatalf("NewServer with explicit Trust: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	if srv.opts.MaxConnections != DefaultMaxConnections ||
+		srv.opts.ReadTimeout != DefaultReadTimeout ||
+		srv.opts.WriteTimeout != DefaultWriteTimeout ||
+		srv.opts.IdleTimeout != DefaultIdleTimeout ||
+		srv.opts.MaxResultRows != DefaultMaxResultRows ||
+		srv.opts.MaxResultBytes != DefaultMaxResultBytes {
+		t.Fatalf("zero resource fields did not select finite defaults: %+v", srv.opts)
+	}
+
+	unbounded, err := NewServer(src, Options{
+		Auth:           Trust(),
+		MaxConnections: UnlimitedConnections,
+		ReadTimeout:    -1,
+		WriteTimeout:   -1,
+		IdleTimeout:    -1,
+		MaxResultRows:  UnlimitedResults,
+		MaxResultBytes: UnlimitedResults,
+	})
+	if err != nil {
+		t.Fatalf("explicit opt-outs: %v", err)
+	}
+	t.Cleanup(func() { _ = unbounded.Close() })
+	if unbounded.opts.MaxConnections != UnlimitedConnections ||
+		unbounded.opts.ReadTimeout != 0 ||
+		unbounded.opts.WriteTimeout != 0 ||
+		unbounded.opts.IdleTimeout != 0 {
+		t.Fatalf("explicit unbounded settings were not preserved: %+v", unbounded.opts)
+	}
+}
+
+func TestNewServerRejectsNilSourcesBeforeServing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  Source
+	}{
+		{name: "nil interface"},
+		{name: "nil database", src: FromDatabase(nil)},
+		{name: "nil collection", src: FromCollection("docs", nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewServer(tc.src, Options{Auth: Trust()}); err == nil {
+				t.Fatal("NewServer accepted a source that would panic or fail every query")
+			}
+		})
+	}
+
+	// Keep resolve itself fail-closed as defense in depth. Source
+	// implementations are package-private today, but this prevents a future
+	// internal construction path from turning a bad source into a session
+	// goroutine panic.
+	if _, err := (&collectionSource{name: "docs"}).resolve("docs", false); err == nil {
+		t.Fatal("a nil durable collection resolved successfully")
 	}
 }
 
@@ -917,16 +2133,103 @@ func TestMaxConnectionsIsEnforced(t *testing.T) {
 	}
 }
 
+func TestSlowPartialStartupSocketsHaveAHardAggregateBound(t *testing.T) {
+	srv := newTestServer(t, Options{
+		MaxConnections: 1,
+		// Keep the intentionally partial ordinary startup packets open until
+		// this test closes them. This demonstrates that the pre-startup cushion
+		// is not dedicated to CancelRequest; production's zero value selects a
+		// finite read deadline, while this explicit opt-out permits indefinite
+		// occupation.
+		ReadTimeout: -1,
+	})
+	const admitted = 1 + cancelRequestSlots
+	clients := make([]net.Conn, 0, admitted)
+	for range admitted {
+		client, server := net.Pipe()
+		clients = append(clients, client)
+		go srv.ServeConn(server)
+	}
+	t.Cleanup(func() {
+		for _, conn := range clients {
+			_ = conn.Close()
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := len(srv.conns)
+		srv.mu.Unlock()
+		if n == admitted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d partial-startup sockets reached admission, want %d", n, admitted)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	overflowClient, overflowServer := net.Pipe()
+	defer overflowClient.Close()
+	done := make(chan struct{})
+	go func() {
+		srv.ServeConn(overflowServer)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a socket beyond the pre-startup aggregate bound retained a goroutine")
+	}
+}
+
 func TestCancelRequestStopsAPendingStatement(t *testing.T) {
-	srv := newTestServer(t, Options{})
+	gated := &blockingResolveSource{
+		inner:   FromDatabase(testDatabase(t, "users", corpus)),
+		entered: make(chan struct{}),
+		proceed: make(chan struct{}),
+	}
+	srv, err := NewServer(gated, Options{Auth: Trust(), MaxConnections: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
 	c := dial(t, srv)
 	c.startup(map[string]string{"user": "tester"})
 
-	// Deliver a cancel out of band, exactly as the protocol specifies: its own
-	// connection, no reply.
-	srv.cancelRequest(c.pid, c.secret)
+	c.send(msgQuery, append([]byte(`SELECT id FROM users`), 0))
+	c.drainWrites()
+	select {
+	case <-gated.entered:
+	case <-time.After(time.Second):
+		t.Fatal("query did not reach the blocking source")
+	}
 
-	msgs := c.query(`SELECT id FROM users; SELECT id FROM users`)
+	// Deliver a cancel out of band, exactly as the protocol specifies: its own
+	// connection, no reply. MaxConnections is already occupied; the bounded
+	// pre-startup cushion gives this socket an admission opportunity.
+	cancelClient, cancelServer := net.Pipe()
+	cancelDone := make(chan struct{})
+	go func() {
+		srv.ServeConn(cancelServer)
+		close(cancelDone)
+	}()
+	packet := binary.BigEndian.AppendUint32(nil, 16)
+	packet = binary.BigEndian.AppendUint32(packet, uint32(codeCancelRequest))
+	packet = binary.BigEndian.AppendUint32(packet, uint32(c.pid))
+	packet = binary.BigEndian.AppendUint32(packet, uint32(c.secret))
+	if _, err := cancelClient.Write(packet); err != nil {
+		t.Fatalf("writing CancelRequest: %v", err)
+	}
+	_ = cancelClient.Close()
+	select {
+	case <-cancelDone:
+	case <-time.After(time.Second):
+		t.Fatal("CancelRequest connection did not close")
+	}
+	close(gated.proceed)
+
+	msgs := c.until(msgReadyForQuery)
 	fs := expectError(t, msgs, sqlstateQueryCanceled)
 	if fs['S'] != "ERROR" {
 		t.Fatalf("a cancel produced severity %q, want ERROR so the session survives", fs['S'])
@@ -934,6 +2237,191 @@ func TestCancelRequestStopsAPendingStatement(t *testing.T) {
 	// One cancel stops one statement; the session keeps working.
 	if has(c.query(`SELECT 1`), msgErrorResponse) {
 		t.Fatal("the session did not recover after a cancel")
+	}
+}
+
+type blockingResolveSource struct {
+	inner   Source
+	entered chan struct{}
+	proceed chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingResolveSource) validate() error { return s.inner.validate() }
+
+func (s *blockingResolveSource) resolve(collection string, joins bool) (lease, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.proceed
+	return s.inner.resolve(collection, joins)
+}
+
+func TestCancelDuringMaterializationIsConsumedByTheCurrentQuery(t *testing.T) {
+	gated := &blockingResolveSource{
+		inner:   FromDatabase(testDatabase(t, "users", corpus)),
+		entered: make(chan struct{}),
+		proceed: make(chan struct{}),
+	}
+	srv, err := NewServer(gated, Options{Auth: Trust()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+
+	c.send(msgQuery, append([]byte(`SELECT id FROM users`), 0))
+	c.drainWrites()
+	select {
+	case <-gated.entered:
+	case <-time.After(time.Second):
+		t.Fatal("query did not reach the blocking source")
+	}
+	srv.cancelRequest(c.pid, c.secret)
+	close(gated.proceed)
+
+	msgs := c.until(msgReadyForQuery)
+	expectError(t, msgs, sqlstateQueryCanceled)
+	if has(msgs, msgDataRow) {
+		t.Fatal("a cancel delivered during materialization emitted a DataRow")
+	}
+	if has(c.query(`SELECT 1`), msgErrorResponse) {
+		t.Fatal("a materialization-time cancel poisoned the next statement")
+	}
+}
+
+func TestServerCloseCancelsAnExecutingSessionBeforeWaiting(t *testing.T) {
+	gated := &blockingResolveSource{
+		inner:   FromDatabase(testDatabase(t, "users", corpus)),
+		entered: make(chan struct{}),
+		proceed: make(chan struct{}),
+	}
+	srv, err := NewServer(gated, Options{Auth: Trust()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+
+	srv.mu.Lock()
+	sess := srv.sessions[c.pid]
+	srv.mu.Unlock()
+	if sess == nil {
+		t.Fatal("authenticated session is absent from the cancellation registry")
+	}
+
+	c.send(msgQuery, append([]byte(`SELECT id FROM users`), 0))
+	c.drainWrites()
+	select {
+	case <-gated.entered:
+	case <-time.After(time.Second):
+		t.Fatal("query did not reach the blocking source")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- srv.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for !sess.queryCancel.Canceled() {
+		if time.Now().After(deadline) {
+			close(gated.proceed)
+			t.Fatal("Server.Close did not signal the executing query before waiting")
+		}
+		runtime.Gosched()
+	}
+	close(gated.proceed)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Server.Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Server.Close did not return after its canceled execution unwound")
+	}
+}
+
+func TestCancelDuringDataRowStreamingStopsTheCurrentQuery(t *testing.T) {
+	blob := strings.Repeat("x", 32<<10)
+	docs := make([]string, 8)
+	for i := range docs {
+		docs[i] = fmt.Sprintf(`{"id":%d,"blob":"%s"}`, i, blob)
+	}
+	srv, err := NewServer(
+		FromDatabase(testDatabase(t, "docs", docs)),
+		Options{Auth: Trust()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+
+	c.send(msgQuery, append([]byte(`SELECT blob FROM docs`), 0))
+	if m := c.recv(); m.tag != msgRowDescription {
+		t.Fatalf("first result message = %q, want RowDescription", string(rune(m.tag)))
+	}
+	if m := c.recv(); m.tag != msgDataRow {
+		t.Fatalf("second result message = %q, want DataRow", string(rune(m.tag)))
+	}
+	// Each row is larger than the server's write buffer. The next row is now
+	// either about to be written or blocked in net.Pipe, so the cancel is
+	// deterministically observed at a following row boundary.
+	srv.cancelRequest(c.pid, c.secret)
+	msgs := c.until(msgReadyForQuery)
+	expectError(t, msgs, sqlstateQueryCanceled)
+	if rows := countTag(msgs, msgDataRow); rows >= len(docs)-1 {
+		t.Fatalf("streaming cancel delivered all %d remaining rows", rows)
+	}
+	if has(c.query(`SELECT 1`), msgErrorResponse) {
+		t.Fatal("a streaming cancel poisoned the next statement")
+	}
+}
+
+func TestLargeWriteRefreshesAnExpiredPreviousWriteDeadline(t *testing.T) {
+	blob := strings.Repeat("x", 32<<10)
+	doc := `{"blob":"` + blob + `"}`
+	srv, err := NewServer(FromDatabase(testDatabase(t, "docs", []string{doc})), Options{
+		Auth:         Trust(),
+		WriteTimeout: 250 * time.Millisecond,
+		IdleTimeout:  2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+
+	// Startup's final flush armed an absolute write deadline. Let it expire.
+	// The next DataRow is larger than bufio.Writer, so Write itself reaches the
+	// net.Pipe before session.flush runs and must refresh the deadline there.
+	time.Sleep(300 * time.Millisecond)
+	msgs := c.query(`SELECT blob FROM docs`)
+	if has(msgs, msgErrorResponse) || !has(msgs, msgDataRow) {
+		t.Fatalf("large result after idle did not complete: %s", tags(msgs))
+	}
+}
+
+func TestWriterRefreshesDeadlineOnlyBeforeUnderlyingWrites(t *testing.T) {
+	var sink bytes.Buffer
+	w := newWriter(&sink, 16)
+	refreshes := 0
+	w.beforeWrite = func() { refreshes++ }
+
+	w.write(make([]byte, 16))
+	if refreshes != 0 {
+		t.Fatalf("a fully buffered write refreshed the deadline %d times, want zero",
+			refreshes)
+	}
+	w.write([]byte{1})
+	if refreshes != 1 {
+		t.Fatalf("a write that forced a bufio flush refreshed %d times, want one",
+			refreshes)
+	}
+	if err := w.flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if refreshes != 2 {
+		t.Fatalf("the explicit flush left refresh count %d, want two", refreshes)
 	}
 }
 
@@ -1379,6 +2867,40 @@ func TestAnOversizedBodyIsNotPinnedByTheDecodedMessage(t *testing.T) {
 	for _, view := range m.params[:cap(m.params)] {
 		if view != nil {
 			t.Fatalf("a %d-byte view into a released body survived the next message", len(view))
+		}
+	}
+	if m.name != "" || m.portal != "" || m.query != "" {
+		t.Fatal("a borrowed string view into a released body survived the next message")
+	}
+}
+
+func TestWarmNamedBindDecodeIsAllocationFree(t *testing.T) {
+	body := bindMsg("portal", "statement", []int16{formatText},
+		[][]byte{[]byte("value")}, []int16{formatBinary})
+	var m frontendMessage
+	if err := decodeFrontend(&m, msgBind, body); err != nil {
+		t.Fatalf("warm decode: %v", err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if err := decodeFrontend(&m, msgBind, body); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("warm named Bind decode allocated %.2f times, want zero", allocs)
+	}
+}
+
+func TestEveryExecutionBudgetMapsToProgramLimitExceeded(t *testing.T) {
+	for _, err := range []error{
+		&query.ResultBudgetError{Rows: 2, RowLimit: 1},
+		&query.AggregateBudgetError{Requested: 2, Limit: 1},
+		&query.JoinPairBudgetError{Pairs: 2, Bytes: 2, Limit: 1},
+		&query.WorkBudgetError{Resource: "sort", Bytes: 2, Limit: 1},
+		&query.SpillBudgetError{Bytes: 2, Limit: 1},
+	} {
+		if got := asPGError(err); got.code != sqlstateProgramLimitExceeded {
+			t.Errorf("%T mapped to SQLSTATE %s, want %s",
+				err, got.code, sqlstateProgramLimitExceeded)
 		}
 	}
 }

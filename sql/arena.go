@@ -14,7 +14,7 @@ package sql
 // chunk is never resized once allocated, so growth only appends a chunk and
 // every pointer already issued stays valid until the arena is rewound.
 //
-// Unlike query's Compiler this has no one-shot "allocate each object exactly"
+// Unlike query's compiler this has no one-shot "allocate each object exactly"
 // mode. There, the one-shot path is a package-level front end whose plan
 // outlives the compiler, so the tail of every partly filled chunk is waste that
 // is never recovered. Here the one-shot [Parse] is a convenience wrapper whose

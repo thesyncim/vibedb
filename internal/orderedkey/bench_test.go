@@ -13,8 +13,10 @@ import (
 var (
 	benchInt     = []byte("1234567")
 	benchDecimal = []byte("-12345.678e-3")
+	benchWide    = []byte("0.1e999999999999999999999999")
 	benchShort   = []byte("abcdefgh")
 	benchLong    = bytes.Repeat([]byte("x"), 256)
+	benchJSON    = []byte(`"customer\u0000name"`)
 )
 
 func benchKey(tb testing.TB, build func(dst []byte) ([]byte, bool)) []byte {
@@ -50,6 +52,18 @@ func BenchmarkEncodeDecimal(b *testing.B) {
 	}
 }
 
+func BenchmarkEncodeWideExponent(b *testing.B) {
+	dst := make([]byte, 0, 64)
+	b.ReportAllocs()
+	for b.Loop() {
+		var ok bool
+		dst, ok = AppendNumber(dst[:0], benchWide, Ascending)
+		if !ok {
+			b.Fatal("encode")
+		}
+	}
+}
+
 func BenchmarkEncodeStringShort(b *testing.B) {
 	dst := make([]byte, 0, 64)
 	b.ReportAllocs()
@@ -70,6 +84,27 @@ func BenchmarkEncodeStringLong(b *testing.B) {
 		dst, ok = AppendString(dst[:0], benchLong, Ascending)
 		if !ok {
 			b.Fatal("encode")
+		}
+	}
+}
+
+func BenchmarkEncodeJSONStringEscaped(b *testing.B) {
+	dst := make([]byte, 0, 64)
+	b.ReportAllocs()
+	for b.Loop() {
+		var ok bool
+		dst, ok = AppendJSONString(dst[:0], benchJSON, Ascending)
+		if !ok {
+			b.Fatal("encode")
+		}
+	}
+}
+
+func BenchmarkSizeJSONStringEscaped(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, ok := JSONStringEncodedSize(benchJSON); !ok {
+			b.Fatal("size")
 		}
 	}
 }
@@ -126,6 +161,19 @@ func BenchmarkEncodeSeekTarget(b *testing.B) {
 
 func BenchmarkDecodeInteger(b *testing.B) {
 	key := benchKey(b, func(dst []byte) ([]byte, bool) { return AppendNumber(dst, benchInt, Ascending) })
+	buf := make([]byte, 0, 64)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, _, _, err := DecodeComponent(buf[:0], key, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeWideExponent(b *testing.B) {
+	key := benchKey(b, func(dst []byte) ([]byte, bool) {
+		return AppendNumber(dst, benchWide, Ascending)
+	})
 	buf := make([]byte, 0, 64)
 	b.ReportAllocs()
 	for b.Loop() {
@@ -194,11 +242,15 @@ func TestDecodeZeroAllocation(t *testing.T) {
 	if !ok {
 		t.Fatal("number")
 	}
+	key, ok = AppendNumber(key, benchWide, Ascending)
+	if !ok {
+		t.Fatal("wide number")
+	}
 	key, ok = AppendBool(key, true, Ascending)
 	if !ok {
 		t.Fatal("bool")
 	}
-	buf := make([]byte, 0, 128)
+	buf := make([]byte, 0, 256)
 	if allocations := testing.AllocsPerRun(1000, func() {
 		out, off := buf[:0], 0
 		for off < len(key) {

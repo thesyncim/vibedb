@@ -78,6 +78,80 @@ func TestWarmParseOfMixedShapesIsAllocationFree(t *testing.T) {
 	}
 }
 
+func TestWarmParseStatementIsAllocationFree(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"insert document", benchInsertDocument},
+		{"insert flat", benchInsertFlat},
+		{"update", benchUpdate},
+		{"delete", benchDelete},
+		{"create table", benchCreateTable},
+		{"create index", benchCreateIndex},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var p Parser
+			var stmt Statement
+			for i := 0; i < 2; i++ {
+				if err := p.ParseStatement(&stmt, tc.src); err != nil {
+					t.Fatalf("warm-up ParseStatement: %v", err)
+				}
+			}
+			allocs := testing.AllocsPerRun(200, func() {
+				if err := p.ParseStatement(&stmt, tc.src); err != nil {
+					t.Fatalf("ParseStatement: %v", err)
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf(
+					"warmed ParseStatement allocated %.1f times per run, want 0",
+					allocs,
+				)
+			}
+		})
+	}
+}
+
+// TestWarmParseStatementOfMixedShapesIsAllocationFree covers the adapter
+// workload: one Parser alternates SELECT, DML, and DDL rather than repeatedly
+// parsing only the shape that established its current high-water mark.
+func TestWarmParseStatementOfMixedShapesIsAllocationFree(t *testing.T) {
+	sources := []string{
+		benchSimple,
+		benchInsertDocument,
+		benchInsertFlat,
+		benchUpdate,
+		benchDelete,
+		benchCreateTable,
+		benchCreateIndex,
+	}
+	var p Parser
+	var stmt Statement
+	for i := 0; i < 3; i++ {
+		for _, src := range sources {
+			if err := p.ParseStatement(&stmt, src); err != nil {
+				t.Fatalf("warm-up ParseStatement of %q: %v", src, err)
+			}
+		}
+	}
+	next := 0
+	allocs := testing.AllocsPerRun(200, func() {
+		src := sources[next%len(sources)]
+		next++
+		if err := p.ParseStatement(&stmt, src); err != nil {
+			t.Fatalf("ParseStatement(%q): %v", src, err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf(
+			"warmed ParseStatement of mixed shapes allocated %.1f times per run, want 0",
+			allocs,
+		)
+	}
+}
+
 // TestParseRejectionAllocatesOnlyItsError checks that the rejection path does
 // not allocate parse state on its way out. A parser that allocated per
 // rejection would be a denial-of-service surface for a driver fed bad SQL in a

@@ -206,8 +206,6 @@ func BenchmarkJoinTwoQueryFilter(b *testing.B) {
 
 			innerQuery := Select(Path("name")).Where(Cmp("tier", Eq, "pro"))
 			var innerExec, outerExec Exec
-			var compiler Compiler
-			var outerQuery Query
 			keys := make([]any, 0, shape.customers)
 
 			run := func() int {
@@ -219,12 +217,7 @@ func BenchmarkJoinTwoQueryFilter(b *testing.B) {
 					text, _ := innerExec.Result.Columns[0].Cells[r].Text()
 					keys = append(keys, text)
 				}
-				if err := compiler.New(&outerQuery, M{
-					"select": A{M{"$count": "*"}},
-					"where":  M{"customer": M{"$in": A(keys)}},
-				}); err != nil {
-					b.Fatal(err)
-				}
+				outerQuery := Select(Count()).Where(In("customer", keys...))
 				if err := outerQuery.RunInto(&outerExec, FromSnapshot(orders)); err != nil {
 					b.Fatal(err)
 				}

@@ -195,25 +195,57 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	if err != nil {
 		return column, err
 	}
-	column.Type = kind
+	// SQL columns are nullable unless constrained otherwise. Carry null in the
+	// type set itself so the AST and the lowered store schema say the same
+	// thing: absence is allowed by Required=false, while an explicit JSON null
+	// is allowed by TypeNull.
+	column.Type = kind | TypeNull
+	var nullability uint8
 	for {
 		switch {
 		case p.atKeyword(kwNot):
+			if nullability != 0 {
+				return column, p.errHere("NULL and NOT NULL are contradictory column constraints")
+			}
 			p.advance()
 			if err := p.expectKeyword(kwNull, "NULL after NOT"); err != nil {
 				return column, err
 			}
+			nullability = 2
 			column.Required = true
+			column.Type &^= TypeNull
+			if column.Type == 0 {
+				return column, p.errAt(column.Pos, "a column whose type is NULL cannot also be NOT NULL")
+			}
 		case p.atKeyword(kwNull):
+			if nullability != 0 {
+				return column, p.errHere("NULL and NOT NULL are contradictory column constraints")
+			}
+			if column.PrimaryKey {
+				return column, p.errHere("PRIMARY KEY and NULL are contradictory column constraints")
+			}
 			p.advance()
+			nullability = 1
 			column.Required = false
+			column.Type |= TypeNull
+			column.explicitNull = true
 		case p.atKeyword(kwPrimary):
 			p.advance()
 			if err := p.expectKeyword(kwKey, "KEY after PRIMARY"); err != nil {
 				return column, err
 			}
+			if column.PrimaryKey {
+				return column, p.errHere("PRIMARY KEY is declared twice")
+			}
+			if column.explicitNull {
+				return column, p.errHere("PRIMARY KEY and NULL are contradictory column constraints")
+			}
 			column.PrimaryKey = true
 			column.Required = true
+			column.Type &^= TypeNull
+			if column.Type == 0 {
+				return column, p.errAt(column.Pos, "a PRIMARY KEY cannot have the type NULL")
+			}
 		case p.atKeyword(kwDefault):
 			return column, p.errHere("DEFAULT is not supported: a default would have to be written into every document that omitted the field, and this store validates documents rather than completing them")
 		case p.atKeyword(kwUnique):
@@ -262,17 +294,17 @@ func jsonTypeOf(name []byte) (JSONType, bool) {
 		return TypeNull, true
 	case "BOOL", "BOOLEAN":
 		return TypeBool, true
-	case "NUMBER", "FLOAT", "REAL", "DOUBLE", "DECIMAL", "NUMERIC", "MONEY":
+	case "NUMBER", "FLOAT", "REAL", "DOUBLE", "DECIMAL", "NUMERIC":
 		return TypeNumber, true
-	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT", "SERIAL", "BIGSERIAL":
+	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT":
 		return TypeInteger, true
-	case "STRING", "TEXT", "VARCHAR", "CHAR", "NCHAR", "NVARCHAR", "CLOB", "CHARACTER":
+	case "STRING", "TEXT", "VARCHAR", "CLOB":
 		return TypeString, true
 	case "ARRAY":
 		return TypeArray, true
-	case "OBJECT", "RECORD", "STRUCT":
+	case "OBJECT":
 		return TypeObject, true
-	case "ANY", "JSON", "JSONB":
+	case "ANY", "JSON":
 		return TypeAny, true
 	}
 	return 0, false
@@ -292,6 +324,18 @@ func refusedTypeReason(name []byte) (string, bool) {
 		return "JSON has no byte string; store it as STRING with an encoding your application chooses", true
 	case "ENUM":
 		return "the schema constrains types rather than value sets, so an enumeration would be accepted and never checked", true
+	case "SERIAL", "SMALLSERIAL", "BIGSERIAL", "SERIAL2", "SERIAL4", "SERIAL8":
+		return "SERIAL creates a sequence-backed generated default, but this engine has neither sequences nor generated values; use INTEGER and supply the value explicitly", true
+	case "MONEY":
+		return "MONEY has fixed fractional and locale-dependent currency semantics this engine cannot enforce; use NUMBER for an exact JSON decimal", true
+	case "CHAR", "CHARACTER", "NCHAR":
+		return "a bare fixed-width character type implies length and padding semantics this engine cannot enforce; use STRING or VARCHAR", true
+	case "NVARCHAR":
+		return "its omitted-length semantics vary by SQL dialect and are not part of this PostgreSQL-oriented subset; use STRING or VARCHAR", true
+	case "JSONB":
+		return "JSONB normalizes object order, duplicate keys, whitespace, and number spellings, while this engine preserves JSON text; use JSON or ANY", true
+	case "RECORD", "STRUCT":
+		return "a composite type promises a declared field shape, while OBJECT constrains only the JSON kind; use OBJECT", true
 	case "GEOMETRY", "GEOGRAPHY", "POINT", "INET", "CIDR", "MACADDR", "XML":
 		return "this engine stores JSON and has no such value", true
 	}
@@ -324,14 +368,24 @@ func (p *Parser) validateTable() error {
 			if !sameSpec(column.Path, key) {
 				continue
 			}
+			if column.explicitNull {
+				return p.errfAt(column.Pos,
+					"PRIMARY KEY names %q, which has an explicit NULL constraint: a key must be present in every document", key.Spec())
+			}
+			// PRIMARY KEY implies NOT NULL even when it is table-level. The
+			// parser initially includes TypeNull because SQL columns are
+			// nullable by default; remove that implicit bit before validating
+			// the key's scalar domain.
+			column.Required = true
+			column.Type &^= TypeNull
+			if column.Type == 0 {
+				return p.errfAt(column.Pos,
+					"PRIMARY KEY names %q, whose NULL type has no non-null key value: a key must be present in every document", key.Spec())
+			}
 			if column.Type&(TypeArray|TypeObject) != 0 {
 				return p.errfAt(column.Pos,
 					"PRIMARY KEY names %q, which is declared %s: a key is derived from a scalar value, and a container has no ordering to derive one from",
 					key.Spec(), column.Type)
-			}
-			if column.Type&TypeNull != 0 {
-				return p.errfAt(column.Pos,
-					"PRIMARY KEY names %q, which is declared to admit NULL: a key must be present in every document", key.Spec())
 			}
 		}
 	}

@@ -36,7 +36,7 @@ const recoveryJournalCheckpointRecords = 2048
 // large-value store cannot reserve an unbounded file or an unbounded replay.
 const (
 	recoveryJournalMinCapacityBytes = uint64(512) << 10
-	recoveryJournalMaxCapacityBytes = uint64(16) << 20
+	recoveryJournalMaxCapacityBytes = storeio.RecoveryJournalMaxCapacityBytes
 )
 
 // ErrRecoveryJournalRequiresPrimary reports that Options.RecoveryJournal was
