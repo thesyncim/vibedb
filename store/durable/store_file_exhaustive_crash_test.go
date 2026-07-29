@@ -360,14 +360,7 @@ func TestFileStoreExhaustiveCommitCrashSweep(t *testing.T) {
 	for _, pt := range points {
 		run := runFaultWorkload(t, options, fc, pt.plan, ops)
 		if !run.faulted {
-			// Asynchronous commit grouping can legally differ between the
-			// recording pass and a replay, leaving a recorded point with no
-			// matching commit. One re-run re-derives the timing; a point that
-			// diverges twice is a real structural regression, not scheduling.
-			run = runFaultWorkload(t, options, fc, pt.plan, ops)
-		}
-		if !run.faulted {
-			t.Errorf("%s: programmed crash never fired twice (commit structure diverged)", pt.name)
+			t.Errorf("%s: programmed crash never fired (commit structure diverged)", pt.name)
 			tally["not-fired"]++
 			continue
 		}

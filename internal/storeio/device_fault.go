@@ -162,9 +162,13 @@ func (d *FaultDevice) bindFrameArena(arena []byte, frameSize int) error {
 	return d.real.bindFrameArena(arena, frameSize)
 }
 
-// Prewrite forwards the opportunistic manual-checkpoint pre-write unchanged; it
-// names no root, so it is not a crash boundary. It satisfies prewriteDevice.
-func (d *FaultDevice) Prewrite(pages []Write) error { return d.real.Prewrite(pages) }
+// Prewrite deliberately rejects opportunistic writes. FaultDevice enumerates
+// every crashable data write inside Commit; allowing a pre-write to succeed
+// would let scheduler timing remove pages from a replay's Commit and make a
+// crash point recorded by the probe unreachable. Committer treats a failed
+// opportunistic pre-write as a hint to disable that optimization and submits
+// the complete page set through Commit instead.
+func (d *FaultDevice) Prewrite([]Write) error { return ErrUnsupported }
 
 // Commit reproduces the portable device's commit sequence write by write,
 // inducing the programmed crash between the appropriate steps.
