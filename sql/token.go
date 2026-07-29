@@ -349,16 +349,15 @@ func keywordOf(s string) keyword {
 // this dialect's own addition, and reserving a word SQL does not would surprise
 // an author who has never seen it.
 //
-// The words recognized only in order to be refused — CONFLICT, DEFAULT,
-// RETURNING, and the three statement kinds MERGE, REPLACE, and TRUNCATE — are
-// not reserved either, and the rule above says why. Reserving a word costs
-// every document that has a field of that name, and these buy nothing in
-// return: each is matched positionally, where a clause keyword is the only
-// thing that could appear, so leaving them nameable cannot make any statement
-// ambiguous. INTO and SET are the opposite case and are reserved: they are
-// clause keywords of the grammar itself, in the position a path could also
-// start, which is exactly where an unreserved word turns a missing comma into a
-// misparse two tokens later.
+// CONFLICT, DEFAULT, RETURNING, and the three refused statement kinds MERGE,
+// REPLACE, and TRUNCATE are not reserved either, and the rule above says why.
+// Reserving a word costs every document that has a field of that name, and
+// these buy nothing in return: each is matched positionally, where a clause
+// keyword is the only thing that could appear, so leaving them nameable cannot
+// make any statement ambiguous. INTO and SET are the opposite case and are
+// reserved: they are clause keywords of the grammar itself, in the position a
+// path could also start, which is exactly where an unreserved word turns a
+// missing comma into a misparse two tokens later.
 func reserved(kw keyword) bool {
 	switch kw {
 	case kwNone,

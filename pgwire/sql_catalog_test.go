@@ -98,6 +98,66 @@ func TestSQLCatalogSimpleAndExtendedLifecycle(t *testing.T) {
 	}
 }
 
+func TestSQLCatalogInsertReturning(t *testing.T) {
+	c := connectSQLCatalog(t)
+	if got := commandTagOf(t, c.query(
+		`CREATE TABLE users (id STRING PRIMARY KEY, name STRING NOT NULL)`,
+	)); got != "CREATE TABLE" {
+		t.Fatalf("CREATE TABLE tag = %q", got)
+	}
+
+	returned := extendedSQL(c,
+		`INSERT INTO users VALUES ($1), ($2) RETURNING id, name AS display_name`,
+		[][]byte{
+			[]byte(`{"id":"a","name":"Ada"}`),
+			[]byte(`{"id":"b","name":"Grace"}`),
+		},
+	)
+	rows := rowsOf(t, returned)
+	if len(rows) != 2 ||
+		string(rows[0][0]) != `"a"` || string(rows[0][1]) != `"Ada"` ||
+		string(rows[1][0]) != `"b"` || string(rows[1][1]) != `"Grace"` {
+		t.Fatalf("INSERT RETURNING rows = %q", rows)
+	}
+	if got := commandTagOf(t, returned); got != "INSERT 0 2" {
+		t.Fatalf("INSERT RETURNING tag = %q, want INSERT 0 2", got)
+	}
+	description := decodeRowDescription(
+		t, find(t, returned, msgRowDescription).body,
+	)
+	if len(description) != 2 ||
+		description[0].name != "id" ||
+		description[1].name != "display_name" {
+		t.Fatalf("INSERT RETURNING columns = %v", description)
+	}
+
+	whole := c.query(
+		`INSERT INTO users VALUES ({"id":"c","name":"Lin"}) RETURNING *`,
+	)
+	rows = rowsOf(t, whole)
+	if len(rows) != 1 ||
+		string(rows[0][0]) != `{"id":"c","name":"Lin"}` {
+		t.Fatalf("simple INSERT RETURNING * rows = %q", rows)
+	}
+	if got := commandTagOf(t, whole); got != "INSERT 0 1" {
+		t.Fatalf("simple INSERT RETURNING tag = %q", got)
+	}
+
+	duplicate := extendedSQL(c,
+		`INSERT INTO users VALUES ($1), ($2) RETURNING id`,
+		[][]byte{
+			[]byte(`{"id":"fresh","name":"Fresh"}`),
+			[]byte(`{"id":"a","name":"Duplicate"}`),
+		},
+	)
+	expectError(t, duplicate, sqlstateUniqueViolation)
+	if rows := rowsOf(t, c.query(
+		`SELECT id FROM users WHERE id = 'fresh'`,
+	)); len(rows) != 0 {
+		t.Fatalf("failed INSERT RETURNING published a row: %q", rows)
+	}
+}
+
 func TestSQLCatalogTransactionsAndFailedState(t *testing.T) {
 	c := connectSQLCatalog(t)
 	c.query(`CREATE TABLE docs (id STRING PRIMARY KEY, name STRING NOT NULL)`)

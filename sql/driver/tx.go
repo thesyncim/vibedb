@@ -232,6 +232,27 @@ func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
 }
 
 func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.Result, error) {
+	return t.execMutationCore(statement, args, nil, nil)
+}
+
+func (t *tx) execMutationReturning(
+	statement *query.DMLStatement,
+	args []any,
+	returning *query.Statement,
+) (query.Cursor, error) {
+	var cursor query.Cursor
+	_, err := t.execMutationCore(
+		statement, args, returning, &cursor,
+	)
+	return cursor, err
+}
+
+func (t *tx) execMutationCore(
+	statement *query.DMLStatement,
+	args []any,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
 	if t.done {
 		return nil, errors.New("vibedb: transaction is finished")
 	}
@@ -409,9 +430,30 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 			)
 		}
 	}
-	if err := t.applyStagedMutations(state, staged); err != nil {
+	if err := t.resolveStagedMutations(state, staged); err != nil {
 		return nil, err
 	}
+	if returning != nil {
+		if statement.Kind() != query.DMLInsert || returned == nil {
+			return nil, errors.New(
+				"vibedb: internal returning execution requires INSERT RETURNING",
+			)
+		}
+		t.conn.pointDocs.Reset()
+		for i := range staged {
+			if _, err := t.conn.pointDocs.Append(staged[i].document); err != nil {
+				return nil, err
+			}
+		}
+		cursor, err := returning.RunInto(
+			&t.conn.exec, query.FromSegment(&t.conn.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
+	}
+	t.applyResolvedMutations(state, staged)
 	if len(staged) != 0 {
 		t.writeTable = tableName
 	}
@@ -586,6 +628,17 @@ func (t *tx) applyStagedMutations(
 	state *txTable,
 	staged []stagedTxMutation,
 ) error {
+	if err := t.resolveStagedMutations(state, staged); err != nil {
+		return err
+	}
+	t.applyResolvedMutations(state, staged)
+	return nil
+}
+
+func (t *tx) resolveStagedMutations(
+	state *txTable,
+	staged []stagedTxMutation,
+) error {
 	for i := range staged {
 		mutation := &staged[i]
 		if entry, present := state.pending[mutation.key]; present {
@@ -604,6 +657,13 @@ func (t *tx) applyStagedMutations(
 		}
 		mutation.existed = found
 	}
+	return nil
+}
+
+func (t *tx) applyResolvedMutations(
+	state *txTable,
+	staged []stagedTxMutation,
+) {
 	for i := range staged {
 		mutation := &staged[i]
 		t.stageKnown(
@@ -611,7 +671,6 @@ func (t *tx) applyStagedMutations(
 			mutation.remove, mutation.existed,
 		)
 	}
-	return nil
 }
 
 func (t *tx) stageKnown(

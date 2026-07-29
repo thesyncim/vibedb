@@ -89,7 +89,8 @@ parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
 `SELECT`, inner joins, prepared statements, and explicit transactions. Stock
 `psql` can connect and issue the same supported direct SQL. Whole-document
 parameters are described as PostgreSQL `json`; projected JSON values preserve
-their exact wire spelling.
+their exact wire spelling. `INSERT ... RETURNING` supports projected JSON paths
+and `*`, including multi-row inserts in VALUES order.
 
 For example, the server above accepts a direct psql session with the documented
 cleartext fallback:

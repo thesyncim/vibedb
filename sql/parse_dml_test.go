@@ -38,6 +38,16 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `insert into users (j{"id":"a","x":1}) (?0) params=1`,
 		},
 		{
+			name: "insert returning projected fields",
+			src:  `INSERT INTO users VALUES (?) RETURNING id, profile.name AS name`,
+			want: `insert into users (?0) returning path(0:id), path(0:profile.name) as name params=1`,
+		},
+		{
+			name: "insert returning whole document",
+			src:  `INSERT INTO users (id, name) VALUES ('u1', 'Ana') RETURNING *`,
+			want: `insert into users fields -1:id -1:name (s"u1", s"Ana") returning path(0:) params=0`,
+		},
+		{
 			name: "update every document",
 			src:  `UPDATE users SET "$doc" = ?`,
 			want: `update users set ?0 <no target> params=1`,
@@ -202,6 +212,7 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
 		{"ON CONFLICT", `INSERT INTO t VALUES (?) ON CONFLICT DO NOTHING`, -1, "ON CONFLICT"},
 		{"RETURNING", `DELETE FROM t RETURNING a`, -1, "RETURNING"},
+		{"aggregate RETURNING", `INSERT INTO t VALUES (?) RETURNING COUNT(*)`, -1, "aggregate"},
 
 		{"a top-level path assignment", `UPDATE t SET name = 'x'`, -1, "partial document update"},
 		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "no JSON path-set operation"},

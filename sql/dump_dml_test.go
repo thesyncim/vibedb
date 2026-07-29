@@ -49,6 +49,15 @@ func dumpInsert(s *InsertStmt) string {
 		}
 		b.WriteByte(')')
 	}
+	if s.Returning != nil {
+		b.WriteString(" returning ")
+		for i := range s.Returning.Columns {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			dumpColumn(&b, &s.Returning.Columns[i])
+		}
+	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }

@@ -160,6 +160,13 @@ func (p *Parser) parseInsert() error {
 	}
 	p.rows = rows
 	p.ins.Rows = rows
+	if p.acceptKeyword(kwReturning) {
+		if err := p.parseInsertReturning(name, pos); err != nil {
+			return err
+		}
+		p.ins.Params = p.params
+		return nil
+	}
 	if err := p.rejectTail(); err != nil {
 		return err
 	}
@@ -167,6 +174,51 @@ func (p *Parser) parseInsert() error {
 		return err
 	}
 	p.ins.Params = p.params
+	return nil
+}
+
+// parseInsertReturning parses the projection over the documents already
+// materialized by INSERT. Keeping it inside a SelectStmt makes RETURNING a
+// reuse of the query engine's projection lane rather than a second JSON path
+// evaluator in the write adapter.
+func (p *Parser) parseInsertReturning(name string, pos int) error {
+	p.out = &p.sel
+	*p.out = SelectStmt{}
+	// INSERT's optional field list is parsed as paths but is not part of a
+	// range-variable expression. Do not let RETURNING's resolver bind those
+	// retained field names to its synthetic FROM entry.
+	p.pending = p.pending[:0]
+	p.from = append(p.from[:0], TableRef{
+		Name: name, Alias: name, Join: JoinNone, Pos: pos,
+	})
+	p.out.From = p.from
+	if err := p.parseResultColumns(); err != nil {
+		return err
+	}
+	for i := range p.out.Columns {
+		if p.out.Columns[i].Agg != AggNone {
+			return p.errAt(
+				p.out.Columns[i].Pos,
+				"RETURNING projects each inserted document; aggregate functions are not allowed",
+			)
+		}
+	}
+	if err := p.rejectTail(); err != nil {
+		return err
+	}
+	if err := p.expectEnd(); err != nil {
+		return err
+	}
+	if err := p.resolvePaths(); err != nil {
+		return err
+	}
+	// RETURNING's projection grammar contains no value expressions, so the
+	// INSERT's VALUES placeholders belong only to the mutation plan.
+	p.out.Params = 0
+	if err := p.validate(); err != nil {
+		return err
+	}
+	p.ins.Returning = p.out
 	return nil
 }
 
@@ -525,7 +577,7 @@ func (p *Parser) parseDMLWhere(clause string) error {
 // dialects and this one has no execution for.
 func (p *Parser) rejectTail() error {
 	if p.atKeyword(kwReturning) {
-		return p.errHere("RETURNING is not supported: a mutation reports how many documents it touched and returns no rows; read them with SELECT first if you need them")
+		return p.errHere("RETURNING is supported only on INSERT; UPDATE and DELETE report how many documents they touched and return no rows")
 	}
 	if p.atKeyword(kwOn) {
 		return p.errHere("ON CONFLICT / ON DUPLICATE KEY is not supported: an INSERT onto an existing key is refused, and a deliberate overwrite is written UPDATE ... SET \"$doc\" = ?")
