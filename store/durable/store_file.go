@@ -2536,22 +2536,42 @@ func (s *Snapshot) PrefetchKeys(keys [][]byte) (int, error) {
 	return queued, flush()
 }
 
+// liveReadSupersededRetries bounds how many times a live point read restarts
+// after a concurrent publication advanced the resident router past its pinned
+// state mid-read. Each restart re-pins the newest visible state, so a retry
+// fails again only if another publication lands inside the next entry's
+// nanosecond-scale pin-to-route window; the bound exists so an adversarial
+// publish cadence still cannot livelock a reader — the terminal gate-held
+// resolve in appendRawLeased always completes.
+const liveReadSupersededRetries = 4
+
 // AppendRaw is the current-snapshot convenience form. It protects the read
 // with one epoch slot — no lock, no per-call generation lease — and falls back
 // to the gated lease path only when the epoch table declines the entry (full
 // table, an active writer fence, Close, or a persistence failure that needs
 // the slow path's exact error).
+//
+// A read whose pinned state is superseded mid-read (the resident router moved
+// ahead of it) restarts against the newer publication instead of resolving:
+// the live state's rooted graph is the last checkpoint's cut, so falling back
+// to it would un-see acknowledged mutations that are visible only through the
+// router (see resolvePrimaryGraphLive).
 func (c *Collection) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	if c == nil {
 		return dst, false, ErrClosed
 	}
-	state, epoch, ok := c.enterReadEpoch()
-	if !ok {
-		return c.appendRawLeased(dst, key)
+	for range liveReadSupersededRetries {
+		state, epoch, ok := c.enterReadEpoch()
+		if !ok {
+			break
+		}
+		out, found, superseded, err := c.resolvePrimaryGraphLive(dst, state, key)
+		epoch.Exit()
+		if !superseded {
+			return out, found, err
+		}
 	}
-	out, found, err := c.appendRawAtState(dst, key, state)
-	epoch.Exit()
-	return out, found, err
+	return c.appendRawLeased(dst, key)
 }
 
 // appendRawLeased is the pre-epoch read entry, retained as the slow path every
@@ -2559,6 +2579,33 @@ func (c *Collection) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 // readers here exactly because this path blocks on the snapshot gate until the
 // writer's decision window closes.
 func (c *Collection) appendRawLeased(dst []byte, key []byte) ([]byte, bool, error) {
+	for range liveReadSupersededRetries {
+		c.snapshotGate.RLock()
+		state, stateErr := c.readerFileState()
+		if stateErr != nil {
+			c.snapshotGate.RUnlock()
+			return dst, false, stateErr
+		}
+		lease, err := c.leases.Acquire(state.root.Generation)
+		c.snapshotGate.RUnlock()
+		if err != nil {
+			return dst, false, err
+		}
+		out, ok, superseded, err := c.resolvePrimaryGraphLive(dst, state, key)
+		lease.Release()
+		if !superseded {
+			return out, ok, err
+		}
+	}
+	// Terminal, guaranteed-progress resolve: hold the snapshot gate's read side
+	// across the read. Every live publication pairs its router advance with its
+	// state publish inside one gate write hold, so a state pinned under the
+	// gate can never trail the router — the routed read is current, or the
+	// router is behind a structural publish and that state's materialized
+	// rooted graph serves exactly. This path is effectively unreachable (it
+	// needs liveReadSupersededRetries consecutive publications to land inside
+	// consecutive nanosecond windows); it exists so reader progress is a
+	// guarantee rather than a probability.
 	c.snapshotGate.RLock()
 	state, stateErr := c.readerFileState()
 	if stateErr != nil {
@@ -2566,11 +2613,12 @@ func (c *Collection) appendRawLeased(dst []byte, key []byte) ([]byte, bool, erro
 		return dst, false, stateErr
 	}
 	lease, err := c.leases.Acquire(state.root.Generation)
-	c.snapshotGate.RUnlock()
 	if err != nil {
+		c.snapshotGate.RUnlock()
 		return dst, false, err
 	}
-	out, ok, err := c.appendRawAtState(dst, key, state)
+	out, ok, _, err := c.resolvePrimaryGraphLive(dst, state, key)
+	c.snapshotGate.RUnlock()
 	lease.Release()
 	return out, ok, err
 }

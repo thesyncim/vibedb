@@ -37,7 +37,9 @@ func (c *Collection) resolvePrimaryGraph(
 	// The resident router is mutable collection-local acceleration for the
 	// newest published generation. A snapshot whose rooted graph predates a
 	// handle rewrite must retain its old physical route, so it uses the rooted
-	// page-walk oracle instead.
+	// page-walk oracle instead. That substitution is sound here because every
+	// state a Snapshot pins was materialized under the writer first: its rooted
+	// graph carries every mutation its generation acknowledges.
 	// Load the router pointer once: a structural split/merge/reclass swaps the
 	// whole instance, so re-reading the field mid-read could observe two
 	// generations. One consistent instance plus the generation guard keeps a
@@ -47,9 +49,33 @@ func (c *Collection) resolvePrimaryGraph(
 		router.Generation() != state.root.Generation {
 		return c.resolvePrimaryGraphPageWalk(dst, state, key)
 	}
+	dst, found, superseded, err := c.resolvePrimaryGraphRouted(
+		dst, state, keyBytes, router,
+	)
+	if superseded {
+		// The serialized writer advanced the router after the generation check
+		// but while this reader was selecting its handle. The snapshot's cut is
+		// materialized, so the rooted oracle serves it exactly.
+		return c.resolvePrimaryGraphPageWalk(dst, state, key)
+	}
+	return dst, found, err
+}
+
+// resolvePrimaryGraphRouted reads one key through a resident router whose
+// generation matched state's at entry. superseded=true reports that the router
+// advanced past the state before a leaf handle was selected, with nothing
+// resolved; the caller chooses the recovery — the rooted page walk for a
+// materialized snapshot cut, a retry against the newer publication for a live
+// read.
+func (c *Collection) resolvePrimaryGraphRouted(
+	dst []byte,
+	state *fileStoreState,
+	keyBytes []byte,
+	router *storeio.ResidentPrimaryRouter,
+) (out []byte, found bool, superseded bool, err error) {
 	route, ok := router.Route(keyBytes)
 	if !ok {
-		return dst, false, fmt.Errorf(
+		return dst, false, false, fmt.Errorf(
 			"%w: resident primary route",
 			storeio.ErrSegmentedTabletRouterCorrupt,
 		)
@@ -57,13 +83,13 @@ func (c *Collection) resolvePrimaryGraph(
 	// Close the race in which the serialized writer advances the router after
 	// the generation check but while this reader is selecting its handle.
 	if router.Generation() != state.root.Generation {
-		return c.resolvePrimaryGraphPageWalk(dst, state, key)
+		return dst, false, true, nil
 	}
 	leafLease, err := router.AcquireLeaf(c.cache, route)
 	if err != nil {
-		return dst, false, err
+		return dst, false, false, err
 	}
-	dst, found, err := c.appendPrimaryLeafValue(
+	dst, found, err = c.appendPrimaryLeafValue(
 		dst, leafLease.Page(), state.root.StoreID, route.Bucket,
 		route.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
@@ -73,7 +99,52 @@ func (c *Collection) resolvePrimaryGraph(
 		},
 	)
 	leafLease.Release()
-	return dst, found, err
+	return dst, found, false, err
+}
+
+// resolvePrimaryGraphLive is the point-read resolver for the LIVE visible
+// state (AppendRaw's epoch and lease paths). It differs from the snapshot
+// resolver in exactly one decision: what a router-generation mismatch means.
+//
+// A live state is never materialized: between checkpoints its acknowledged
+// mutations exist only as volatile leaf frames reachable through the resident
+// router, while state.root.PrimaryRoot still names the last checkpoint's
+// sealed graph. The rooted page walk therefore serves the CHECKPOINT BASE, not
+// the state's own acknowledged content — a key put since the fold reads as
+// missing and an updated key reads its pre-fold value. So when the router has
+// moved AHEAD of the pinned state (a concurrent publication landed between the
+// reader's state pin and its router read), the walk is not a legal fallback;
+// the read must instead retry against the newer publication (superseded=true).
+//
+// The opposite mismatch — the router BEHIND the pinned state — is the
+// structural swap window: a split/merge/reclass publishes its state under the
+// snapshot gate and rebuilds the router outside it. A structural publication
+// is a checkpoint (its pending parents were folded first), so that state's
+// rooted graph is complete and the page walk is exactly right; retrying there
+// would spin for the whole router rebuild for no benefit.
+func (c *Collection) resolvePrimaryGraphLive(
+	dst []byte,
+	state *fileStoreState,
+	key []byte,
+) (out []byte, found bool, superseded bool, err error) {
+	if c == nil || state == nil ||
+		state.root.PrimaryRoot == (storeio.PageRef{}) {
+		return dst, false, false, nil
+	}
+	if len(key) == 0 ||
+		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
+		return dst, false, false, nil
+	}
+	router := c.primaryRouter.Load()
+	if router == nil ||
+		router.Generation() < state.root.Generation {
+		out, found, err = c.resolvePrimaryGraphPageWalk(dst, state, key)
+		return out, found, false, err
+	}
+	if router.Generation() != state.root.Generation {
+		return dst, false, true, nil
+	}
+	return c.resolvePrimaryGraphRouted(dst, state, key, router)
 }
 
 // appendPrimaryLeafValue reads one exact value from an admitted primary leaf,
