@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"syscall"
 )
 
 const (
@@ -207,7 +208,19 @@ func OpenDevice(file *os.File, options DeviceOptions) (Device, error) {
 }
 
 func ringFallbackError(err error) bool {
-	return errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported)
+	// BackendAuto is a preference, not a resource requirement. Linux may
+	// support io_uring while refusing another ring because the process or
+	// runner exhausted ring memory, descriptors, or a transient kernel
+	// admission limit. Portable positional I/O needs no ring and can still
+	// serve the already-open file, so these setup failures are valid fallback
+	// signals. BackendIOUring remains fail-closed because OpenDevice checks the
+	// explicit backend before consulting this predicate.
+	return errors.Is(err, ErrUnavailable) ||
+		errors.Is(err, ErrUnsupported) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE)
 }
 
 func validateCommit(bufferCount, bufferSize int, seen []uint64, pages []Write, root Write) error {

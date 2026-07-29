@@ -6,8 +6,26 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 )
+
+func TestAutoRingResourceFailuresFallBack(t *testing.T) {
+	for _, err := range []error{
+		syscall.ENOMEM,
+		syscall.EAGAIN,
+		syscall.EMFILE,
+		syscall.ENFILE,
+	} {
+		wrapped := fmt.Errorf("io_uring setup: %w", err)
+		if !ringFallbackError(wrapped) {
+			t.Errorf("ringFallbackError(%v) = false, want true", err)
+		}
+	}
+	if ringFallbackError(syscall.EIO) {
+		t.Fatal("ringFallbackError(EIO) = true, want fatal I/O error")
+	}
+}
 
 func TestPortableCheckpointSyncSelection(t *testing.T) {
 	tests := []struct {
