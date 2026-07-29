@@ -125,15 +125,17 @@ func findTemplateLeafKeys(
 }
 
 // rebuildPrimaryExactLeavesFromGraph re-derives every physical index's
-// canonical term leaf from the current graph alone — router, leaves, stable
-// slots — through the same VisitPrimaryLeafPostingRows + term
-// canonicalization + encodeIndexTermLeaf pipeline a bulk build uses. It is
-// the from-scratch oracle the fold's byte-identity anchor (invariant 4) is
-// asserted against: fold output must equal it exactly, independent of the
-// mutation history that produced the graph.
+// spanned canonical term-leaf set from the current graph alone — router,
+// leaves, stable slots — through the same VisitPrimaryLeafPostingRows + term
+// canonicalization + content-defined cutter + AppendIndexTermLeaf pipeline a
+// bulk build uses. It is the from-scratch oracle the fold's byte-identity
+// anchor (invariant 4) is asserted against: the fold's leaf set — including
+// every cut boundary — must equal it exactly, independent of the mutation
+// history that produced the graph. Per index it returns the ordered encoded
+// leaves.
 func rebuildPrimaryExactLeavesFromGraph(
 	t testing.TB, coll *Collection,
-) [][]byte {
+) [][][]byte {
 	t.Helper()
 	state := coll.state.Load()
 	router := coll.primaryRouter.Load()
@@ -194,19 +196,26 @@ func rebuildPrimaryExactLeavesFromGraph(
 			t.Fatal(err)
 		}
 	}
-	out := make([][]byte, len(byIndex))
+	table := newPrimaryLiveTable(live)
+	out := make([][][]byte, len(byIndex))
 	for i := range byIndex {
-		encoded, err := coll.encodeIndexTermLeaf(byIndex[i], live)
+		leaves, err := coll.encodePrimaryExactLeaves(
+			byIndex[i], live, table.lookup,
+		)
 		if err != nil {
 			t.Fatal(err)
+		}
+		encoded := make([][]byte, len(leaves))
+		for l := range leaves {
+			encoded[l] = leaves[l].encoded
 		}
 		out[i] = encoded
 	}
 	return out
 }
 
-// assertFoldMatchesRebuild byte-compares the resident fold base against the
-// from-scratch graph rebuild.
+// assertFoldMatchesRebuild byte-compares the resident fold base — every
+// spanned leaf, in catalog order — against the from-scratch graph rebuild.
 func assertFoldMatchesRebuild(t *testing.T, coll *Collection, when string) {
 	t.Helper()
 	rebuilt := rebuildPrimaryExactLeavesFromGraph(t, coll)
@@ -216,13 +225,16 @@ func assertFoldMatchesRebuild(t *testing.T, coll *Collection, when string) {
 			when, len(resident), len(rebuilt))
 	}
 	for i := range resident {
-		var encoded []byte
-		if resident[i].present {
-			encoded = resident[i].encoded
+		if len(resident[i].leaves) != len(rebuilt[i]) {
+			t.Fatalf("%s: index %d spans %d leaves, graph rebuild %d",
+				when, i, len(resident[i].leaves), len(rebuilt[i]))
 		}
-		if !slices.Equal(encoded, rebuilt[i]) {
-			t.Fatalf("%s: index %d fold output diverges from graph rebuild: %d vs %d bytes",
-				when, i, len(encoded), len(rebuilt[i]))
+		for l := range resident[i].leaves {
+			if !slices.Equal(resident[i].leaves[l].encoded, rebuilt[i][l]) {
+				t.Fatalf("%s: index %d leaf %d diverges from graph rebuild: %d vs %d bytes",
+					when, i, l, len(resident[i].leaves[l].encoded),
+					len(rebuilt[i][l]))
+			}
 		}
 	}
 }

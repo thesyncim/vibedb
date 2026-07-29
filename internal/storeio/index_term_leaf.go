@@ -268,12 +268,12 @@ type indexTermLeafDerivedPosting struct {
 	// to be dictionary candidates; payloadHash keys the builder's
 	// use-counting table so no per-posting identity string is materialized
 	// (the string form was ~220 KB of garbage per 10k-posting build).
-	payload           []byte
-	direct            [2]TermPostingMask
-	directCount       uint8
+	payload            []byte
+	direct             [2]TermPostingMask
+	directCount        uint8
 	dictionaryEligible bool
-	payloadHash       uint64
-	dictionary        uint16
+	payloadHash        uint64
+	dictionary         uint16
 }
 
 type indexTermLeafDerivedTerm struct {
@@ -821,6 +821,22 @@ func OpenIndexTermLeaf(
 		return IndexTermLeafView{}, err
 	}
 	return view, nil
+}
+
+// WithLive returns a copy of an already admitted view bound to a different
+// liveness lookup. It re-validates nothing: the caller asserts that every
+// posting in the leaf is still contained by the new lookup's masks at its
+// generation. The spanned checkpoint fold carries untouched leaves across
+// index epochs with exactly this call — an untouched leaf's terms received no
+// records in the fold window, so no bit its postings reference was cleared
+// (a delete or value move always records the affected term, dirtying its
+// leaf), and the probe's per-mask liveness recheck still fails closed if the
+// assertion is ever violated.
+func (v IndexTermLeafView) WithLive(
+	live IndexTermLeafLiveLookup,
+) IndexTermLeafView {
+	v.live = live
+	return v
 }
 
 func (v IndexTermLeafView) Len() int           { return int(v.termCount) }

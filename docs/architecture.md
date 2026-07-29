@@ -8,9 +8,11 @@ APIs, see [store.md](store.md); for bytes on disk, see [format.md](format.md).
 ## The central rule: one reader-visible representation
 
 Every published generation is complete. A point read, ordered scan, exact-index
-probe, and query all begin from one immutable root and follow one canonical
-graph. No reader reconciles a base with a memtable, WAL, tombstone set, delta
-chain, or version list.
+probe, and query all begin from one immutable root. Primary reads and scans
+follow one canonical graph. An exact probe resolves one captured index epoch:
+its immutable spanned-leaf fold base plus the bounded generation-stamped
+posting and liveness records visible at the reader's generation. No reader
+consults a WAL, tombstone set, unbounded merge structure, or version list.
 
 That rule expands into a family of invariants:
 
@@ -28,7 +30,8 @@ That rule expands into a family of invariants:
    generation is complete.
 
 The primary graph realizes this with a `StateRoot` selecting an ordered-tablet
-catalog, its leaves, and an exact-index root.
+catalog, its leaves, and an exact-index root whose per-index catalogs route to
+ordered bounded term leaves.
 
 ## The ordered-tablet graph
 
@@ -36,12 +39,16 @@ The graph is:
 
 ```text
 StateRoot
-  └─ TabletCatalog                 global lexical fences
-       └─ TabletRoot               tablet-local identity and anchor routing
-            └─ AnchorPage          stable leaf rows and current PageRefs
-                 └─ OrderedHashLeaf
-                      ├─ exact keys and JSON values in lexical-rank order
-                      └─ stable slots used by exact-term postings
+  ├─ TabletCatalog                 global lexical fences
+  │    └─ TabletRoot               tablet-local identity and anchor routing
+  │         └─ AnchorPage          stable leaf rows and current PageRefs
+  │              └─ OrderedHashLeaf
+  │                   ├─ exact keys and JSON values in lexical-rank order
+  │                   └─ stable slots used by exact-term postings
+  └─ PrimaryExactRoot              one record per physical exact index
+       └─ ExactCatalog             level 0, or level 1 over level-0 pages
+            └─ PrimaryExactLeaf    ordered term slices and giant-term stripes
+                 └─ exact term → posting tiles
 ```
 
 `StateRoot` selects the whole generation. `TabletCatalog` maps global lexical
@@ -59,8 +66,12 @@ BucketID = (18-bit TabletID << 12) | 12-bit LocalLeafID
 
 Exact-term postings name stable `(BucketID, slot)` locations, and the exact
 secondary index that maps a JSON term to those postings is maintained in the
-same publish as the document mutation that changes it — never rebuilt. A
-complete key comparison still decides every primary hit. See the
+same publish as the document mutation that changes it. Ordinary mutations emit
+absolute per-term and per-tile records; a slot-reassigning structural rewrite
+emits a bounded rebase. At a fold, affected content-defined runs or giant-term
+stripes are re-encoded through the deterministic cutter, while untouched term
+leaves carry their durable page references forward. A complete key comparison
+still decides every primary hit. See the
 [ordered-hybrid store specification](design/ordered-hybrid-store.md) for the
 measured primitives, scale bounds, and structural gates.
 
@@ -159,12 +170,14 @@ A mutation is planned against one state:
 
 1. Validate and copy the key and complete JSON value.
 2. Resolve the existing row and affected exact-index tuples.
-3. Construct complete after-images for every touched leaf/page and metadata
-   path.
+3. Construct complete after-images for every touched primary leaf/page and
+   metadata path, plus absolute exact-index term/tile records or a bounded
+   structural rebase when stable slots move.
 4. Recheck ownership and the source generation.
 5. COW any snapshot-visible or durable-reachable bytes; patch an exclusively
    owned frame in place when every eligibility check passes.
-6. Update the exact index for the rewritten bucket in the same publish.
+6. Link the exact-index records or rebase for the rewritten bucket in the same
+   publish.
 7. Publish one new root after the selected acknowledgement boundary. On the
    journal-backed synchronous lane the redo record is appended and synced
    before that publish, so visibility follows durability.
@@ -183,12 +196,15 @@ Deferred-canonical mutations normally perform no root device write per mutation.
 Buffered-visible does no device write at all on ordinary admission; the
 journal-backed synchronous lane makes each acknowledgement durable with one
 journal append plus sync and still defers its root. `Flush` captures the current
-visible generation and materializes only its reachable dirty/new frames:
+visible generation, materializes its reachable dirty/new primary frames and
+newly encoded dirty exact leaves, carries clean exact leaves by `PageRef`, and
+rebuilds the exact catalogs and exact root:
 
 ```text
 seal visible root
-  → walk dirty children and parents bottom-up
-  → write complete COW page set
+  → walk dirty primary children and parents bottom-up
+  → fold dirty exact runs/stripes; retain clean leaf refs
+  → write complete COW page set plus fresh exact catalogs/root
   → data ordering barrier
   → write alternate inline root
   → final persistence barrier
@@ -224,10 +240,11 @@ Those structures can make acknowledgement cheap by deferring canonical
 materialization. They also make reads reconcile representations and create
 flush, compaction, and space-amplification debt.
 
-vibedb chooses the opposite trade: bounded writer work produces one canonical
-generation before publication. Deletes reclaim their logical representation
-immediately, scans walk one ordered view, and snapshots pin roots rather than
-versions inside a shared read path. The cost is real: isolated random writes
+vibedb chooses the opposite trade: bounded writer work produces one
+semantically complete generation before publication. Deletes reclaim their
+logical representation immediately, scans walk one ordered view, and snapshots
+pin roots rather than versions inside a shared read path. The cost is real:
+isolated random writes
 can rewrite page paths, and it shows in the synchronous lane, where a
 per-mutation durable acknowledgement currently trails SQLite. Writer batching,
 owned-frame in-place updates, and the recovery-only journal are admissible

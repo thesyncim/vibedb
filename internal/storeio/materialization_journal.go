@@ -663,7 +663,7 @@ func validateMaterializationTargetRef(
 	if ref.LogicalID <= StateRootLogicalID || ref.Generation == 0 ||
 		ref.Generation >= header.TargetGeneration ||
 		ref.Kind == PageStateRoot || ref.Kind == PageCatalogSegment ||
-		ref.Kind >= PagePrimaryCatalog && ref.Kind <= PagePrimaryExactLeaf ||
+		ref.Kind >= PagePrimaryCatalog && ref.Kind <= PagePrimaryExactCatalog ||
 		!validPageKind(ref.Kind) || !validPageFlags(ref.Kind, ref.Flags) ||
 		ref.Aux != 0 || ref.Length < header.PageSize ||
 		ref.Length%header.PageSize != 0 || !validPageExtentSize(ref.Kind, ref.Length) ||

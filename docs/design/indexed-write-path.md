@@ -1,10 +1,12 @@
 # Indexed write path: O(delta) posting maintenance, spanned term leaves, online index add
 
-**Status:** executable design, validated against the tree at head (post
-`c6df176`). Every claim below is either **(verified)** against named code or
-**(projection)** with the measurement that will decide it. The design covers
-the ordered primary graph's exact secondary indexes only; the heap store's
-index machinery (`store/store_index.go`) is source material, not a target.
+**Status:** P0 (the generation-stamped posting overlay), P1 (spanned term
+leaves), and P2 (online durable index creation) are implemented. P3 (indexed
+batches and SQL-driver widening) remains. Historical measurements below are
+retained as the baseline that motivated the work; unrun promotion gates remain
+gates, not claimed results. The design covers the ordered primary graph's
+exact secondary indexes only; the heap store's index machinery
+(`store/store_index.go`) is source material, not a target.
 
 **Idea:** stop paying for the whole index on every mutation. Keep the
 canonical encoded term leaves as an immutable **fold base** that is rebuilt
@@ -16,20 +18,22 @@ per-generation view without copying anything per mutation. Term leaves then
 stop being one monolith per index: a deterministic content-defined split
 spans an index (and a single term) across many bounded leaves, which removes
 the 64 KiB fail-closed cap and makes the checkpoint fold O(dirty leaves).
-Online index add and indexed batches fall out of the same overlay: a backfill
-sweep and a batch entry both just emit records.
+P2's online index builder scans immutable primary leaves with optimistic
+reconciliation and publishes only a complete Ready index. P3's indexed
+batches will reuse the overlay's per-entry record shape.
 
 ---
 
-## 1. The measured problem (2026-07-29, at head)
+## 1. The measured pre-P0/P1 problem (2026-07-29 baseline)
 
 | metric | unindexed | indexed (1 exact index) | SQLite |
 |---|---|---|---|
 | churn, 10k corpus | 281,000 ops/s | **567 ops/s** | 38,921 ops/s |
 | update p50 | 4.6 µs | **4,954 µs** | 10.5 → 19 µs |
 
-A 69× loss to SQLite, and a ~1000× regression against our own unindexed
-path, with three distinct mechanisms, all **(verified)**:
+Before P0/P1 this was a 69× loss to SQLite and a ~1000× regression against
+our own unindexed path, with three distinct mechanisms verified against the
+pre-P0 tree:
 
 1. **O(index-size) mutation cost.** `preparePrimaryExactLeaf`
    (`store/durable/store_file_primary_exact_mutation.go:268`) runs on every
@@ -44,7 +48,7 @@ path, with three distinct mechanisms, all **(verified)**:
    plus O(one physical index's postings) to re-encode each affected term
    leaf." At the 10k benchmark shape that is ~10,000 tile-postings decoded,
    re-encoded, and re-validated per Put.
-2. **The 64 KiB whole-index cap.** `PrimaryExactRoot` maps each physical
+2. **The former 64 KiB whole-index cap.** Exact-root version 0 mapped each physical
    index to exactly ONE `PagePrimaryExactLeaf`
    (`internal/storeio/primary_exact_index.go:96-125`), whose payload is one
    `IndexTermLeaf` bounded by `IndexTermLeafMaxBytes = 65535`
@@ -57,18 +61,17 @@ path, with three distinct mechanisms, all **(verified)**:
    corpus fails closed at bulk build ("ordered-primary exact term leaf
    exceeds MaxPageSize") and on the mutation-path split ("common primary
    leaf class is full", surfaced when a split cannot stage its postings).
-3. **No online add (baseline, closed by §8 / P2).** Durable indexes were
-   frozen at Create:
+3. **The former lack of online add.** Before P2, durable indexes were frozen
+   at Create:
    `Options.Indexes` compiles into `options.indexes` /
    `indexCatalogHash`, `createInitialState` stamps
    `IndexCount`/`IndexCatalogHash` into the state root
    (`store_file.go:2105`), and Open fails on any disagreement
-   (`store_file_catalog.go:328-340`). The heap store has the pattern to
-   port: `CreateIndex` → `IndexBuilding` → budgeted `BackfillIndex` →
-   `IndexReady`, reads uninterrupted, later writes dual-maintaining before
-   publication (`store/store_index.go:124,177,359`).
+   (`store_file_catalog.go:328-340`). P2 replaced that model with durable
+   catalog authority and ready-only atomic `CreateIndex` publication over a
+   live collection (§8).
 
-## 2. What is already true (verified inventory)
+## 2. Implemented inventory and remaining exclusions
 
 1. **A mutation's index effect is confined to one bucket's four tiles.**
    `TileID = BucketID<<2 | quadrant`, 64 stable slots per quadrant, chunk 0
@@ -93,27 +96,26 @@ path, with three distinct mechanisms, all **(verified)**:
    (`stagePrimaryExactPagesLocked` from the checkpoint materialize,
    `store_file_primary_mutation.go:2281`) and at structural transactions
    (`store_file_primary_structural.go:667`).
-4. **Snapshots pin the pair by pointer.** `pinSnapshot` captures
-   `(c.primaryExact, c.primaryLive)` under `snapshotGate.RLock`
-   (`store_file.go:2341-2349`); probes are Snapshot-scoped
-   (`appendPrimaryExactMasks`, `store_file_primary_exact.go:157`) and hold
-   generation leases; epoch slots protect the direct point-read fast path
-   (`store_file_epoch.go:16`). The reclaim floor is
+4. **Snapshots pin one exact-index epoch by pointer.** The epoch contains
+   the immutable spanned fold base, flat live table, and generation-stamped
+   overlay. Probes are Snapshot-scoped and hold generation leases; epoch
+   slots protect the direct point-read fast path. The reclaim floor is
    `min(leases, epochs, oldestRecoveryGeneration)` — the same floor this
    design reuses for overlay reclamation.
-5. **The equivalence anchor:** an incrementally maintained term leaf is
-   byte-identical to a fresh `CreateFromPrimary` of the same final graph
-   (header comment `:28-32`, pinned by
+5. **The equivalence anchor:** incrementally folded spanned term leaves are
+   byte-identical to a fresh `CreateFromPrimary` of the same final graph,
+   including across cut boundaries (pinned by
    `TestFilePrimaryIndexedMutationMatchesRebuild`,
    `TestFilePrimaryIndexedCommitCrashBoundary`,
    `TestCreateFromPrimaryExactIndexDifferential`). This design keeps that
-   anchor and extends it to spanned leaves and online-added indexes.
+   anchor across packed leaves, giant-term stripe pieces, and online-added
+   indexes.
 6. **Batches refuse indexes.** `Update` fails with
    `ErrPrimaryBatchIndexedUnsupported`
    (`store_file_primary_batch.go:83`), and `SupportsUpdate` advertises the
    exclusion (`interfaces.go:21`), which is what keeps the SQL driver off
    indexed collections.
-7. **The numbers to hold:** probe
+7. **Historical numbers to hold until the new gates are measured:** probe
    `BenchmarkPrimaryExactLookupIteration/lookup` = 1.22 µs, 0 allocs/op;
    space = 5.751 exact-B/posting (both measured on the 10k/100-term shape,
    `store_file_primary_exact_test.go:463`). Buffered checkpoint p50 is
@@ -127,8 +129,8 @@ collection, swapped as a whole under `snapshotGate` only at fold points
 (checkpoints, structural transactions, index catalog changes):
 
 - **Fold base** (immutable between folds): per physical index, the encoded
-  term leaves (the existing `IndexTermLeaf` codec, unchanged) plus — after
-  P1 — a small sorted **leaf router** array mapping canonical-term ranges to
+  term leaves (the existing `IndexTermLeaf` codec, unchanged) plus a small
+  sorted **leaf router** array mapping canonical-term ranges to
   leaves; and one flat open-addressed **live table** `tileID → uint64`
   replacing the `map[uint32]*[64]uint64` (the primary graph uses chunk 0
   only — **(verified)** — so one word per tile suffices resident;
@@ -188,13 +190,14 @@ decided by the P0 gate)**.
 **Fold.** At every point that advances `ExactIndexRoot`
 (checkpoint, structural, canonical-lane per-mutation transaction), the
 writer resolves base+overlay through the read rule at the fold generation,
-re-encodes term leaves via the existing `encodeIndexTermLeaf` path, stages
-pages in the same transaction (`stagePrimaryExactPagesLocked`, shape
-unchanged), publishes a fresh index epoch with an empty overlay, and
+re-encodes dirty term-leaf segments through the shared deterministic cutter,
+carries untouched leaf pages by reference, stages changed pages and catalogs
+in the same transaction (`stagePrimaryExactPagesLocked`), publishes a fresh
+index epoch with an empty overlay, and
 retires the consumed records/tables to a generation-keyed pending list
-freed once the reclaim floor passes the fold generation. In P0 the fold
-re-encodes the whole (single) leaf — O(index), paid once per checkpoint
-instead of once per mutation; P1 makes it O(dirty leaves).
+freed once the reclaim floor passes the fold generation. P0 moved the cost
+out of each mutation; P1 bounds the fold to dirty leaves and giant-term
+stripes.
 
 **Zero-GC.** Records and interned term bytes come from a per-collection
 arena with freelists; the overlay hash tables are sized for the churn
@@ -255,8 +258,9 @@ against a 1.22 µs bound. Term-keying the log is exactly the chosen design.
 
 ## 5. Design question 3 — the live map
 
-`primaryLive` is rebuilt wholesale per mutation today (full map copy plus
-one allocation per tile, **(verified)** `:281-299`). Chosen replacement,
+Before P0, `primaryLive` was rebuilt wholesale per mutation (full map copy
+plus one allocation per tile, verified against the baseline tree). The
+implemented replacement is
 uniform with §3: the **flat fold-immutable live table** (open-addressed
 `tileID → uint64`, rebuilt O(tiles) at fold — 2k tiles ≈ 16 KB at the 10k
 shape, trivial against a 330 µs checkpoint) plus **per-tile overlay
@@ -272,13 +276,13 @@ against stale postings, `store_file_primary_exact.go:190-195`).
 
 ### 6.1 Sharding rule (deterministic, content-defined, order-preserving)
 
-A physical index's sorted term sequence is cut into leaves by two pure
-functions of content — never of history:
+A physical index's sorted term sequence is cut into leaves by three pure
+rules over content — never mutation history:
 
-1. **Term-boundary cuts:** term T starts a new leaf iff
-   `IndexTermRouteHash(storeID, T) mod 2^16 < p·2^16`, with `p` tuned for a
-   ~4 KiB expected leaf **(projection: p and the target size are fixed by a
-   P1 space/latency sweep; start at mean 48 terms/leaf)**. Content-defined
+1. **Term-boundary cuts:** term T starts a new leaf iff the low 16 bits of
+   `IndexTermRouteHash(storeID, T)` are below
+   `IndexTermLeafCutThreshold = 1365`. That is approximately 1/48 and
+   targets a mean 48 terms per run. Content-defined
    cuts make sharding local: adding or removing a term reshapes only its
    own run, never the whole file — the classic content-defined-chunking
    argument.
@@ -295,7 +299,7 @@ functions of content — never of history:
    own content and propagates only to the next rule-1 cut — still
    history-free, still local.
 
-This **replaces the fail-closed `primaryExactExtent` check**: the builder
+This replaced the fail-closed single-leaf `primaryExactExtent` limit: the builder
 can always cut, so "exceeds MaxPageSize" becomes unreachable by
 construction and is demoted to a corruption-class assertion.
 
@@ -454,17 +458,17 @@ Every phase is independently landable and keeps every earlier gate green.
 "10k/100k corpus" = the measured shapes from §1; churn/update rows are the
 mixed-workload harness lanes measured 2026-07-29.
 
-### P0 — kill the O(N) re-encode (the 69×)
+### P0 — implemented: kill the O(N) re-encode (the 69×)
 
-**Lands:** overlay records + index-epoch capture + flat live table +
+**Implemented:** overlay records + index-epoch capture + flat live table +
 O(touched-terms) mutation path + rebase groups + checkpoint/structural fold
 from overlay. **No durable format change** (single leaf per index kept;
 canonical lane unchanged). `preparePrimaryExactLeaf`'s
 reconstruct/encode/re-admit per mutation is deleted.
 
-**Gates:**
-- indexed churn, 10k corpus ≥ **100,000 ops/s** (today 567; SQLite 38.9k);
-  indexed update p50 ≤ **15 µs** (today 4,954 µs).
+**Promotion gates (results must be recorded before claiming pass):**
+- indexed churn, 10k corpus ≥ **100,000 ops/s** (baseline 567; SQLite 38.9k);
+  indexed update p50 ≤ **15 µs** (baseline 4,954 µs).
 - `BenchmarkPrimaryExactLookupIteration/lookup` ≤ **1.22 µs, 0 allocs/op**
   (post-fold path); new mid-window probe benchmark (probe with a warm
   overlay of 64 mutations) ≤ **1.5 µs, 0 allocs/op**.
@@ -481,16 +485,16 @@ caught by the identity tests, which compare against a from-scratch rebuild
 byte-for-byte; overlay memory under a pinned Snapshot → bounded by the
 existing floor discipline, stress-tested.
 
-### P1 — spanned term leaves (the cap)
+### P1 — implemented: spanned term leaves (the cap)
 
-**Lands:** content-defined term cuts + tile stripes + hard-cap cuts;
+**Implemented:** content-defined term cuts + tile stripes + hard-cap cuts;
 versioned exact root with per-index leaf catalogs (tree ≤ 2 levels); leaf
 router in the index epoch; fold and canonical lane re-encode dirty leaves
 only; bulk build shares the cutter; fail-closed check demoted to assertion.
 
-**Gates:**
-- **100k low-cardinality corpus builds, probes, and churns** (today: fails
-  closed at build).
+**Promotion gates (results must be recorded before claiming pass):**
+- **100k low-cardinality corpus builds, probes, and churns** (the pre-P1
+  baseline failed closed at build).
 - probe at 100k ≤ **2 µs, 0 allocs/op**; 10k probe still ≤ 1.22 µs.
 - indexed churn ≥ **100k ops/s at both 10k and 100k** corpora (index cost
   is corpus-size-independent by construction).
@@ -502,11 +506,12 @@ only; bulk build shares the cutter; fail-closed check demoted to assertion.
 - determinism: `-count=2`; differential test extended to spanned leaves;
   bulk-vs-mutation identity holds across cut boundaries.
 
-**Risk:** cut-parameter tuning (leaf too small → space; too big → fold
-latency) — decided by the sweep; adversarial term-size distributions —
-bounded by the hard-cap cut with a locality proof test.
+**Residual measurement risk:** the fixed cut parameter may trade space
+against fold latency; the benchmark sweep decides whether it stays.
+Adversarial term-size distributions are bounded by the hard-cap cut and
+locality tests.
 
-### P2 — online CreateIndex
+### P2 — implemented: online CreateIndex
 
 **Landed for the current exact-leaf format:** dynamic durable catalog
 authority, O(leaves) optimistic reconciliation, bounded writer holds,
@@ -530,9 +535,9 @@ alias deduplication, SQL catalog repair, and `CreateIndex` /
 - old snapshots retain the old catalog while new snapshots see the Ready
   index.
 
-**Remaining scale gate:** P1's spanned exact leaves must land before the
-100k corpus gate is meaningful; the current single-leaf 64 KiB format still
-fails closed rather than silently producing a partial index.
+**Remaining measurement gate:** rerun the online-add scale lanes against P1's
+spanned exact leaves, including the 100k corpus. The implementation is current;
+no 100k P2 result is claimed here.
 
 **Risk:** sustained write churn can delay convergence, but cannot expose a
 partial index or stop writers; bounded leaf holds, cancellation, paired
@@ -580,9 +585,11 @@ variant would make batches legal during that state as well.
 - **Mid-window probes pay for churn.** A term hammered between checkpoints
   grows its chain; the probe walks it. Bounded by the overlay-pressure
   escalation, and the mid-window gate pins the worst case we accept.
-- **P0 checkpoints are O(index).** Accepted, bounded (≤ 5 ms at 10k), and
-  repaired by P1. A collection near the current 64 KiB cap should land P1
-  before relying on indexed churn at scale.
+- **Giant-term probes stream every matching piece.** Routing is one binary
+  search, but a low-cardinality term spanning many stripe pieces necessarily
+  visits them all and returns all of their postings.
+- **The exact catalog is bounded to two levels.** This covers the intended
+  scale and fails closed if that explicit format bound is exceeded.
 - **Rebase groups are O(leaf)** on slot-reassigning rewrites — inherent:
   the slot mapping changed for every row. Rare by construction (class
   transitions), and no worse than today's every-mutation cost.
@@ -629,9 +636,10 @@ variant would make batches legal during that state as well.
 9. **Cap-free by construction.** Every emitted term leaf fits
    `min(IndexTermLeafMaxBytes, MaxPageSize)` via the cut rules; no posting
    state can make a build or mutation fail closed on size.
-10. **Reads never block on index maintenance.** Backfill, fold, and
-    catalog changes never suspend point reads, scans, or probes; a
-    Building index is reported as Building and simply does not accelerate.
+10. **Reads never block on index maintenance.** Online build, fold, and
+    catalog changes never suspend point reads, scans, or probes. The online
+    name remains absent until the complete Ready index and catalog publish
+    atomically.
 11. **Concurrency headroom.** Posting contributions remain tablet-local
     (tile partition by TabletID) and install remains a serialized
     pointer/link section — the stage→fence→publish decomposition of the
@@ -643,16 +651,16 @@ No backward compatibility is owed (pre-release; the standing
 no-migration rule applies). On-disk changes, by phase:
 
 - **P0:** none. Resident-only change; existing stores open unchanged.
-- **P1:** `PagePrimaryExactRoot` version 0 → 1: entries become per-index
+- **P1 (current):** `PagePrimaryExactRoot` version 0 → 1: entries become per-index
   term-leaf catalogs `(firstTerm prefix, firstTileID, PageRef)` (single
   extent, spilling to a two-level tree), replacing the one-leaf-per-index
   table. `PagePrimaryExactLeaf` payloads are unchanged
   (`AppendIndexTermLeaf` output); `TermPosting` and `IndexTermLeaf` codecs
   are unchanged. Stores created before P1 are recreated, not migrated.
-- **P2:** exact root entries gain `(state, backfillCursor)`; the canonical
-  catalog becomes the index-definition authority (Open treats
-  `Options.Indexes` as an assertion); `IndexCount`/`IndexCatalogHash`
-  semantics move from "frozen at Create" to "current catalog checkpoint".
-  Recreate, no migration.
+- **P2 (current):** the canonical catalog becomes the index-definition
+  authority; `Options.Indexes` remains a Create input and optional Open
+  assertion. A ready-only online cutover advances `IndexCount`,
+  `IndexCatalogHash`, the catalog, and the v1 exact root atomically. There is
+  no durable Building state or backfill cursor. Recreate, no migration.
 - **P3:** no format change (journal batch records already carry what
   replay needs).

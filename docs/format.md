@@ -66,13 +66,15 @@ current mutable `store/durable` file and must not be used to infer that layout.
 
 ## Overview
 
-The base page (`PageSize`) is fixed at 4096 bytes: every tree, root, directory,
-and metadata page is exactly one base page, while a leaf or overflow extent
-grows from one base page up to `MaxPageSize` (default 64 KiB). Variable base
-page sizes are not supported — `Create` rejects any `PageSize` other than 4096
-with `ErrUnsupportedPageSize`, and `Open` of a store that recorded a different
-base page fails the same way. The base page is no longer discovered from the
-file.
+The base page (`PageSize`) is fixed at 4096 bytes. Most roots and metadata pages
+are one base page. The global primary catalog has its fixed production extent,
+and exact-catalog pages, leaves, and overflow extents may grow from one base
+page up to `MaxPageSize` (default 64 KiB); exact-catalog and exact-leaf extents
+are powers of two, while primary document and overflow extents use their
+kind-specific sizing rules. Variable base page sizes are not supported —
+`Create` rejects any `PageSize` other than 4096 with `ErrUnsupportedPageSize`,
+and `Open` of a store that recorded a different base page fails the same way.
+The base page is no longer discovered from the file.
 
 A mutable durable collection is a graph of checksummed physical pages rooted
 at one of two alternating full-`PageSize` inline root slots:
@@ -89,7 +91,13 @@ DataStart
        -> each leaf record is an inline value, or, for a value past
           InlineValueBytes, a PageOverflow chain (one PageRef; each extent
           sized to its piece up to MaxPageSize)
-  -> ExactIndexRoot (PagePrimaryExactRoot -> PagePrimaryExactLeaf posting tiles)
+  -> ExactIndexRoot
+       -> PagePrimaryExactRoot
+            -> zero for an empty physical index, otherwise
+               PagePrimaryExactCatalog
+                 -> level-0 ordered term-leaf entries, or
+                 -> level-1 child refs to level-0 catalog pages
+                      -> PagePrimaryExactLeaf posting tiles
   -> external FreeImage/FreeIndex/FreeDelta spill pages when inline capacity fills
 ```
 
@@ -262,6 +270,7 @@ const (
 	PagePrimaryLeaf                   // 23
 	PagePrimaryExactRoot              // 24
 	PagePrimaryExactLeaf              // 25
+	PagePrimaryExactCatalog           // 26
 )
 ```
 
@@ -295,8 +304,9 @@ its query-time packed index in this format.
 | 21 | `PageTabletRoute` | tablet segmented route block over its primary leaves |
 | 22 | `PagePrimaryAnchor` | tablet lexical anchor map: immutable interval fences routing to stable `BucketID`s |
 | 23 | `PagePrimaryLeaf` | ordered primary leaf holding the key/value records |
-| 24 | `PagePrimaryExactRoot` | physical exact-index id to term-leaf reference catalog built beside `PrimaryRoot` (`StateRoot.ExactIndexRoot`); aliases share physical leaf entries |
-| 25 | `PagePrimaryExactLeaf` | common-page envelope around one canonical adaptive `IndexTermLeaf` byte stream (exact posting tiles for one physical index) |
+| 24 | `PagePrimaryExactRoot` | physical exact-index id to `(LeafCount, Catalog PageRef)` root built beside `PrimaryRoot` (`StateRoot.ExactIndexRoot`); aliases share one physical-index record |
+| 25 | `PagePrimaryExactLeaf` | common-page envelope around one canonical adaptive `IndexTermLeaf` byte stream: one bounded ordered term slice or one giant-term stripe piece |
+| 26 | `PagePrimaryExactCatalog` | one level-0 ordered term-leaf catalog page, or one level-1 page naming level-0 children for a physical exact index |
 
 ### PageRef — 32 bytes
 
@@ -356,16 +366,18 @@ accepted.
 | 284:288 | MaxDocumentBytes | u32 | immutable complete-document bound |
 | 288:320 | PrimaryRoot | `PageRef` | the 64 KiB `PagePrimaryCatalog` root at `PrimaryCatalogRootLogicalID`; the sole document root — a zero `PrimaryRoot` fails `Open` |
 | 320:336 | JournalID | 16 bytes | UUID of the paired recovery journal file; zero means no journal is referenced |
-| 336:368 | ExactIndexRoot | `PageRef` | `PagePrimaryExactRoot` for exact indexes built beside `PrimaryRoot`; aliases share physical leaf entries. Zero when the collection declares no indexes |
+| 336:368 | ExactIndexRoot | `PageRef` | `PagePrimaryExactRoot` for exact indexes built beside `PrimaryRoot`; aliases share one physical-index record. Zero when the collection declares no indexes |
 | 368:512 | reserved | — | zero |
 
 The retired `PageRef` slots are held blank so the fields after them keep
 their byte offsets; nothing writes or reads them any longer. `PrimaryRoot` has
 the fixed production catalog identity, kind, and 64 KiB length and requires the
-reserved primary logical-ID bands below `NextLogicalID`. `ExactIndexRoot` is one `PageSize`
-catalog whose ordered records each contain either zero (an empty physical index)
-or a `PagePrimaryExactLeaf` reference; leaf extents are powers of two up to
-`MaxPageSize`, and each leaf payload is exactly `AppendIndexTermLeaf` output.
+reserved primary logical-ID bands below `NextLogicalID`. `ExactIndexRoot` is
+one `PageSize` version-1 root whose ordered records contain one physical
+index's leaf count and catalog reference. An empty physical index has a zero
+count and zero catalog; a populated one names a `PagePrimaryExactCatalog`.
+Exact-catalog and exact-leaf extents are powers of two up to `MaxPageSize`, and
+each exact-leaf payload is exactly `AppendIndexTermLeaf` output.
 Every populated top-level ref has `Generation <= root.Generation`; all roots are
 pairwise distinct in both `LogicalID` and `Offset`.
 
@@ -438,6 +450,102 @@ stored in the StateRoot. That granule is a power of two in `[512, 3584]` and
 must divide `PageSize`; zero and the option bit must either both be absent or
 both be present.
 Any bit outside this known set fails closed on decode.
+
+## Ordered-primary exact index
+
+`internal/storeio/primary_exact_index.go`, `index_term_leaf.go`, and
+`index_term_cutter.go`; kinds `PagePrimaryExactRoot`,
+`PagePrimaryExactCatalog`, and `PagePrimaryExactLeaf`. A physical exact index
+is an ordered set of bounded term leaves rather than one whole-index leaf.
+`StateRoot.ExactIndexRoot` names the one-base-page root. Its payload version is
+`1`; version-0 exact roots from the superseded one-leaf layout are rejected and
+stores containing them are recreated rather than migrated.
+
+**Exact root.** The fixed payload header is 16 bytes:
+
+| Offset | Field | Notes |
+| --- | --- | --- |
+| 0:4 | version | u32, `1` |
+| 4:8 | count | u32, exactly `StateRoot.IndexCount`, at most 64 |
+| 8:16 | reserved | zero |
+
+The header is followed by `count` fixed 40-byte records in physical-index-id
+order:
+
+| Record offset | Field | Notes |
+| --- | --- | --- |
+| 0:4 | LeafCount | u32, number of term leaves in this physical index |
+| 4:8 | reserved | zero |
+| 8:40 | Catalog | `PageRef`, kind `PagePrimaryExactCatalog`, or zero |
+
+`LeafCount == 0` if and only if `Catalog` is zero. Logical aliases resolve to
+the same physical index id and do not duplicate root records or term leaves.
+
+**Exact catalog.** A catalog page is a power-of-two extent no larger than
+`MaxPageSize`. Its common 16-byte payload header is:
+
+| Offset | Field | Notes |
+| --- | --- | --- |
+| 0:4 | version | u32, `1` |
+| 4 | level | u8, `0` leaf catalog or `1` child-reference page |
+| 5:8 | reserved | zero |
+| 8:12 | count | u32, non-zero |
+| 12:16 | reserved | zero |
+
+A level-0 catalog contains `count` variable-length records:
+
+| Record offset | Field | Notes |
+| --- | --- | --- |
+| 0:32 | Leaf | `PageRef`, kind `PagePrimaryExactLeaf` |
+| 32:36 | FirstTile | u32, first posting tile of the leaf's first term |
+| 36 | Flags | u8, only `Piece = 1` and `RunCut = 2` |
+| 37 | PrefixLength | u8, `<= 40` |
+| 38:... | Prefix | first term's canonical bytes, truncated to 40 bytes |
+
+`Piece` marks a single-term piece emitted for a giant term.
+`RunCut` records that the leaf's first term satisfies the content-defined
+term-boundary predicate. A level-1 catalog contains at least two consecutive
+32-byte `PagePrimaryExactCatalog` child refs after its header; every child must
+be level 0, so catalog depth is at most two. A physical index that fits one
+catalog extent uses one level-0 page directly.
+
+**Term leaves and deterministic cuts.** `PagePrimaryExactLeaf` wraps exactly
+one canonical `AppendIndexTermLeaf` byte stream; the nested `IndexTermLeaf` and
+`TermPosting` codecs are unchanged by spanning. Its physical extent is the
+smallest power of two that holds the common envelope and payload. The cutter's
+payload budget is:
+
+```text
+min(IndexTermLeafMaxBytes, MaxPageSize - PageHeaderSize - PageTrailerSize)
+```
+
+The cutter is deterministic for the final posting content:
+
+1. A term starts a content-defined run when the low 16 bits of its StoreID-keyed
+   route hash are below `1365`, targeting one run per 48 terms.
+2. A term too large for an otherwise empty leaf is divided at absolute
+   2048-tile stripe boundaries. Empty stripes emit nothing.
+3. A run or stripe that still exceeds the byte budget is cut at the last term
+   or posting that fits.
+
+Sizing uses a deterministic upper bound on encoded bytes, so it may cut earlier
+than an exact trial encode but never emits an oversized leaf. Identical final
+postings therefore produce identical leaf boundaries in bulk build,
+checkpoint fold, and journal replay. One term may occupy consecutive piece
+leaves ordered by increasing first tile; an entire physical index no longer
+has to fit one `MaxPageSize` extent.
+
+**Admission.** Root selection validates the exact-root envelope and its
+per-index catalog refs. Full `Open` then derives posting liveness from the
+selected primary graph, walks each catalog (depth at most two), requires the
+flattened entry count to equal `LeafCount`, and admits every `IndexTermLeaf`
+against those live masks. It recomputes each entry's prefix, first tile,
+`Piece`, and `RunCut` fields from leaf content; requires a piece leaf to contain
+one term; and requires strict full `(first canonical term, first tile)` order
+across catalog pages. Catalog-local decoding also validates record lengths,
+reserved bytes, allowed flags, reference bounds, and non-decreasing stored
+prefix order. A stale posting, grafted leaf, reordered catalog, or mismatched
+router certificate therefore makes `Open` fail closed.
 
 ## ChunkDirectory (retired)
 
@@ -1100,7 +1208,13 @@ A crash before root publication leaves the preceding root authoritative. A
 torn new root fails its complement/CRC/schema checks. A fully selected root
 can name only data pages that crossed the earlier barrier. Recovery validates
 both inline-root candidates newest-first and every top-level reference before
-returning a generation.
+returning a generation. This selection phase admits the top-level
+`PagePrimaryCatalog` and `PagePrimaryExactRoot` codecs; it does not recursively
+prove every descendant. After selection, `store/durable.Open` validates the
+primary routing graph and performs the full exact-index admission described
+above. A failure in that deeper admission fails `Open` closed; the current
+implementation does not restart inline-root selection with the older candidate
+because of a descendant-only error.
 
 One serialized producer and one private device-owner goroutine form the
 asynchronous `Committer` pipeline. Ordinary adjacent generations may be group
@@ -1159,6 +1273,21 @@ strictly below both the reader floor and the oldest generation a crash
 recovery might still need to select — i.e. an extent is reusable only once
 no live reader and no still-selectable inline-root generation can reach it.
 
+### Offline verification
+
+`store/durable.Verify` selects the root with the same first-phase rule, then
+walks the reachable graph. For ordered-primary exact indexes it traverses
+`PagePrimaryExactRoot` to every level-1/level-0 catalog page and referenced
+term-leaf envelope, checks their common-page identities and local catalog
+shape, records their extents for alias and free-overlap detection, and rejects
+a catalog tree deeper than two levels.
+
+That offline walk is intentionally not the same as online semantic admission.
+It does not currently compare each root `LeafCount` with the number of
+traversed leaves, recompute catalog prefixes/tiles/flags from term content, or
+prove posting bits against live masks derived from the primary graph. Full
+`Open` performs those exact-index semantic checks.
+
 ## Golden-format tests
 
 `internal/storeio/format0_golden_test.go` regenerates checked-in, byte-exact
@@ -1178,8 +1307,8 @@ The remaining format-0 completion gates are:
 2. a maximum-inline-free root and corruption coverage for every remaining
    inline field class;
 3. byte-exact pages for Overflow, ChunkDirectory, the legacy KeyDirectory,
-   IndexDirectory, DocumentGroup, all float64 and index-group kinds, and all
-   free-log kinds;
+   IndexDirectory, DocumentGroup, the ordered-primary exact root/catalog/leaf
+   kinds, all float64 and index-group kinds, and all free-log kinds;
 4. the superseded external-root magic and a complete `store/durable` file with
    a populated legacy `PageKeyDirectory` primary root;
 5. crash-matrix fixtures captured after each ordinary phase, both patch-only

@@ -159,15 +159,22 @@ func TestFilePrimaryIndexedMutationMatchesRebuild(t *testing.T) {
 			len(mutatedExact), len(againExact))
 	}
 	for i := range mutatedExact {
-		if mutatedExact[i].present != againExact[i].present {
+		if mutatedExact[i].present() != againExact[i].present() {
 			t.Fatalf("index %d presence differs", i)
 		}
-		if !slices.Equal(
-			mutatedExact[i].encoded, againExact[i].encoded,
-		) {
-			t.Fatalf("index %d term-leaf bytes not deterministic: %d vs %d bytes",
-				i, len(mutatedExact[i].encoded),
-				len(againExact[i].encoded))
+		if len(mutatedExact[i].leaves) != len(againExact[i].leaves) {
+			t.Fatalf("index %d spans %d vs %d leaves",
+				i, len(mutatedExact[i].leaves), len(againExact[i].leaves))
+		}
+		for l := range mutatedExact[i].leaves {
+			if !slices.Equal(
+				mutatedExact[i].leaves[l].encoded,
+				againExact[i].leaves[l].encoded,
+			) {
+				t.Fatalf("index %d leaf %d bytes not deterministic: %d vs %d bytes",
+					i, l, len(mutatedExact[i].leaves[l].encoded),
+					len(againExact[i].leaves[l].encoded))
+			}
 		}
 	}
 }

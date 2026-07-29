@@ -65,12 +65,13 @@ inventory the rest of the design builds on; read it as "what is already true."
    structural generation (verified, `store_file_primary_structural.go`).
 5. **The exact index publishes with the mutation.** Posting tiles are
    per-leaf (`TileID = BucketID<<2 | quadrant`), so tablet-disjoint writers
-   touch disjoint tiles; but the *resident* snapshot install
-   (`installPrimaryExactResidentLocked`) swaps two collection-wide fields
-   (`primaryLive`, `primaryExact`) under `snapshotGate`, and `prepare` copies
-   the whole live map minus the mutated bucket (verified,
-   `store_file_primary_exact_mutation.go`). The batch path refuses indexed
-   collections today (`ErrPrimaryBatchIndexedUnsupported`).
+   touch disjoint tiles. P0 replaced the collection-wide live-map copy and
+   whole-index re-encode with one `primaryEpoch`: immutable spanned fold-base
+   leaves, a flat live table, and generation-stamped term/tile records.
+   Ordinary indexed mutations therefore prepare O(touched terms/tiles), while
+   publication still links their records with the document state under the
+   collection-wide gate. The batch path still refuses indexed collections
+   (`ErrPrimaryBatchIndexedUnsupported`); P3 removes that exclusion.
 
 Two further verified facts shape everything below:
 
@@ -302,7 +303,8 @@ pre-release):
 
 Exactly one thread at a time executes the publish section, which is today's
 code verbatim: `snapshotGate.Lock()` → `beginReaderFence()` → router
-`UpdateLeaf` row stores → `installPrimaryExactResidentLocked` →
+`UpdateLeaf` row stores → `installPrimaryExactResidentLocked` links the
+prepared exact-index records →
 `pageValidator.update` → `publishFileState` → volatile retirements →
 `endReaderFence()` → `snapshotGate.Unlock()`. Writers that finish staging
 try-acquire the publish lock; the holder drains a bounded publish queue and
@@ -416,28 +418,25 @@ runs the split, downgrades, retries — same shape as capacity escalation.
 
 Tiles partition by tablet (`TileID = BucketID<<2|q`, BucketID carries
 TabletID), so per-tablet *contributions* are disjoint by construction. What
-does not partition is the install: `preparePrimaryExactLeaf` snapshots the
-whole live map minus one bucket, and two concurrent preparers would each miss
-the other's tiles — a lost-update race — and the per-physical-index term leaf
-(`encodeIndexTermLeaf` re-encodes the term set) is one shared object.
-Decision, in two steps:
+does not partition is the publication of the collection epoch and document
+state. P0/P1 removed the former whole-live-map snapshot and single shared term
+leaf: preparers now produce immutable, tablet-local term/tile records, and
+checkpoint folds re-encode only dirty spanned segments. The remaining decision
+is therefore about grouped record linking and fold cadence, in two steps:
 
 - **Phase 2 (unindexed parallelism):** indexed collections keep the exclusive
   gate for mutations — the honest analogue of the batch path's existing typed
   refusal. No stale postings are possible because nothing indexed runs
   concurrently.
 - **Phase 4 (indexed parallelism):** deposits carry only the bucket's
-  derived contribution (`bucketLive`, `byIndex` — the cheap tablet-local
-  half, verified `deriveBucketExactContribution`); the publish LEADER merges
-  contributions into the current snapshot and performs the single
-  `installPrimaryExactResidentLocked` swap per group, rebasing on the live
-  snapshot so no contribution is lost. The live map becomes per-tablet
-  sub-maps keyed by TabletID (tile→tablet is derivable) so the leader's merge
-  is per-tablet pointer swaps, not a full-map copy. The term-leaf re-encode —
-  the only remaining O(global) per-group cost — is measured first; if it
-  binds, term leaves shard per tablet with a k-way read-side merge, but that
-  is a read-path change and needs its own gate **(projection: decided by a
-  phase-4 microbench of `encodeIndexTermLeaf` at 8-writer mutation rates)**.
+  prepared term/tile records. The publish leader links all records for the
+  group under the same reader fence and publishes one state generation, so no
+  contribution is lost. No full live-map copy or global term-leaf re-encode
+  occurs in the publish section. Overlay pressure escalates to a checkpoint;
+  that fold merges the linked records into the dirty spanned segments and
+  carries untouched leaves by reference. The remaining projection is the
+  publish-group record budget and fold cadence, decided by the phase-4
+  8-writer record-link/fold microbench.
 
 Structural posting repair (`structuralRepairPostingsHook`,
 `prepareStructuralExactLocked`) runs under the exclusive gate and is
@@ -619,9 +618,12 @@ are measured in phase 0, since RESULTS.md rows are single-client.
    better than today's one per mutation, but the zero-GC audit must confirm
    the deposit rings and shard frames stay allocation-free at steady state.
    *Decider:* `AllocsPerRun` gates extended to 8-writer loops.
-3. **Term-leaf re-encode cost under load** (§8.2). Decides phase 4's shape
-   (leader-merged single leaf vs per-tablet leaves with read-side merge).
-   *Decider:* microbench of `encodeIndexTermLeaf` at 8-writer mutation rates.
+3. **Overlay merge and dirty-leaf fold cost under load** (§8.2). P0/P1 remove
+   the old leader-merged single-leaf choice: deposits are tablet-local posting
+   records and the fold re-encodes only dirty spanned segments or giant-term
+   stripes. Phase 4 still must decide the leader's merge budget and checkpoint
+   cadence. *Decider:* an 8-writer microbench of record linking plus dirty-leaf
+   folding at the expected publish-group sizes.
 4. **Does concurrent `fdatasync` scale on the target devices at all?** Not
    load-bearing for the chosen design; bounds how much the rejected
    per-tablet-journal alternative ever had to offer. *Decider:* optional

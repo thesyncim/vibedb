@@ -51,10 +51,16 @@ Normal COW publication is:
 4. Cross the selected final persistence barrier.
 5. Mark the generation durable and release eligible frames/extents.
 
-The two inline root slots alternate. Recovery validates both and selects the
-newest root whose complete reachable graph is valid, with fallback to the
-previous generation. The root write is the commit point; a data page that is
-not named by a valid root is not visible after recovery.
+The two inline root slots alternate. Recovery validates both newest-first,
+including each candidate's inline state, free-log heads, canonical catalog, and
+top-level primary and exact-root codecs, with fallback to the preceding
+candidate when that selection-phase validation fails. After selection,
+`store/durable.Open` validates the primary routing graph and fully admits the
+exact catalogs and term leaves against live masks derived from that graph. A
+descendant-only failure in this deeper admission fails `Open` closed; it does
+not currently restart selection with the older inline root. The root write is
+the commit point; a data page not named by the selected root is not visible
+after recovery.
 
 Qualified canonical materialization adds a durable undo capsule before changing
 an existing extent. Its exact protocol and recovery cases are in

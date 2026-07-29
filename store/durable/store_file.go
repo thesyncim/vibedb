@@ -527,6 +527,16 @@ const (
 	// bound so an untrusted configuration cannot force unbounded compilation,
 	// hashing, and lookup-map growth.
 	fileStoreMaxLogicalIndexes = 4096
+
+	// fileStoreExactStagePagesMin/Max bound the per-transaction staging
+	// allowance for dirty spanned exact-index term leaves (see the
+	// exactIndexPages derivation in normalized()). The allowance scales with
+	// ResidentBytes — a quarter of residency at one MaxPageSize per leaf —
+	// because the worst-case dirty transaction must remain resident; 256
+	// leaves ≈ a full re-cut of a ~1M-posting index, far past what a bounded
+	// overlay window can dirty.
+	fileStoreExactStagePagesMin = 16
+	fileStoreExactStagePagesMax = 256
 )
 
 func (o Options) normalized() (normalizedFileStoreOptions, error) {
@@ -813,27 +823,44 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	docSingleDocumentBytes :=
 		uint64(largePages)*uint64(o.MaxPageSize) +
 			uint64(singleDocumentMetadataPages)*uint64(o.PageSize)
-	// Incremental exact-index maintenance stages, in the same transaction as the
-	// document mutation, the term leaves that mutation can touch plus the
-	// reference-root page. A leaf owns four posting tiles, so a mutation's whole
-	// posting effect is one term leaf per physical index (an in-place value change
-	// removes the old posting and inserts the new one in that same leaf), and a
-	// single document can carry a value for every index -- so the worst case is
-	// one term leaf for each of the fileStoreMaxPhysicalIndexes-bounded physical
-	// indexes plus one PagePrimaryExactRoot. Each term leaf may reach
-	// IndexTermLeafMaxBytes and so rounds up to a full MaxPageSize extent; the
-	// root is exactly PageSize. This is the term-leaf reservation the design's
-	// bounded exact-tile rebuild names, derived rather than fudged. It is zero for
-	// an unindexed collection, so the unindexed mutation reserves exactly what it
-	// did before.
-	exactIndexLeafPages := len(compiled)
-	exactIndexRootPages := 0
+	// Exact-index maintenance stages, in the same transaction as the document
+	// mutation or checkpoint, the dirty term leaves the fold re-encoded plus
+	// each physical index's ordered catalog pages and one
+	// PagePrimaryExactRoot. Since the spanned-leaf format the dirty set is
+	// variable — a window's touched terms name it — so the reservation is a
+	// static allowance (fileStoreExactStagePages) covering every leaf a
+	// bounded overlay window or a full re-cut of a multi-hundred-thousand-row
+	// index can dirty, plus one catalog page per index and the root. A fold
+	// whose dirty set ever exceeds the allowance fails its transaction closed
+	// with ErrTooManyPages rather than corrupting; quiet windows stage only
+	// the root and catalogs regardless of index size. Zero for an unindexed
+	// collection, so the unindexed mutation reserves exactly what it did
+	// before.
+	exactIndexPages := 0
+	exactIndexBytes := uint64(0)
 	if len(compiled) != 0 {
-		exactIndexRootPages = 1
+		allowance := int(o.ResidentBytes / int64(4*o.MaxPageSize))
+		allowance = min(
+			max(allowance, fileStoreExactStagePagesMin),
+			fileStoreExactStagePagesMax,
+		)
+		// Online index creation inherits the already allocated commit-buffer
+		// pool. Admit it with the largest dirty-leaf window that fits that
+		// fixed pool (never below the supported minimum) instead of requiring
+		// the unindexed collection to have pre-sized for the maximum 256-leaf
+		// window. A fold exceeding the admitted window still fails closed at
+		// transaction staging; the common bounded window scales to the arena
+		// actually owned by this collection.
+		if o.BufferCount != 0 {
+			available := o.BufferCount - docMaxTransactionPages -
+				len(compiled) - 2 // catalogs, exact root, alternate root
+			if available >= fileStoreExactStagePagesMin {
+				allowance = min(allowance, available)
+			}
+		}
+		exactIndexPages = allowance + len(compiled) + 1
+		exactIndexBytes = uint64(exactIndexPages) * uint64(o.MaxPageSize)
 	}
-	exactIndexPages := exactIndexLeafPages + exactIndexRootPages
-	exactIndexBytes := uint64(exactIndexLeafPages)*uint64(o.MaxPageSize) +
-		uint64(exactIndexRootPages)*uint64(o.PageSize)
 	maxTransactionPages := docMaxTransactionPages + exactIndexPages
 	singleDocumentTransactionPages := docSingleDocumentPages + exactIndexPages
 	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
@@ -1030,6 +1057,13 @@ type Collection struct {
 	foldPostingScratch []storeio.IndexTermLeafPosting
 	foldKeyArena       []byte
 	foldKeyOffsets     []int
+	// foldPlanScratch/foldRunScratch/foldDirtyRunScratch are the dirty-leaf
+	// fold's classification scratch: one plan per touched (index, term), the
+	// rule-1 run decomposition of the current leaf set, and the dirty-run
+	// marks. Transient within one per-index fold pass.
+	foldPlanScratch     []primaryExactFoldPlan
+	foldRunScratch      []int
+	foldDirtyRunScratch []bool
 	// structuralExactReencoded and structuralExactRemoved accumulate, within one
 	// bounded structural transaction, the exact-index contribution of every leaf
 	// the transaction re-encodes plus the buckets it removes outright, so the

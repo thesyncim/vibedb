@@ -468,14 +468,20 @@ which order it promises.
 
 Exact indexes are published beside the ordered primary graph, so a store that
 declares indexes no longer needs the legacy chunk layout to carry the "indexed"
-leg. Two self-describing page kinds carry them:
+leg. Three self-describing page kinds carry them:
 
 - `PagePrimaryExactLeaf` wraps exactly one canonical `IndexTermLeaf` byte stream
-  (the adaptive posting codec above) in the common page envelope. One leaf holds
-  the complete posting set for one physical index.
-- `PagePrimaryExactRoot` is a `PageSize` reference catalog: an ordered record per
-  physical index id, each either zero (an empty physical index) or a strictly
-  ascending `PagePrimaryExactLeaf` reference. `StateRoot.ExactIndexRoot` names it.
+  (the adaptive posting codec above) in the common page envelope. A physical
+  index spans an ordered set of these bounded leaves; a giant term may itself
+  span consecutive stripe-piece leaves.
+- `PagePrimaryExactCatalog` describes that ordered set. A level-0 page carries
+  leaf references with first-term routing prefixes, first tile IDs, and
+  content-derived cut flags; a level-1 page names level-0 children when one
+  extent cannot hold the catalog.
+- `PagePrimaryExactRoot` is a `PageSize` catalog with one ordered record per
+  physical index id. Each record contains the leaf count and either a zero
+  catalog reference (an empty physical index) or a
+  `PagePrimaryExactCatalog` reference. `StateRoot.ExactIndexRoot` names it.
   It is required exactly when the ordered primary declares indexes and keeps no
   legacy `IndexDirectory`, and is forbidden otherwise (`validateStateExactIndexRoot`).
 
@@ -484,10 +490,19 @@ stages the graph. The bottom-up builder returns a posting-stable placement
 (`BucketID`, slot) for every input row through `BuildPrimaryGraphPlaced`; the
 exact build groups rows by canonical term, keys each posting by
 `TileID = (BucketID << 2) | (slot >> 6)` with bit `slot & 63`, and encodes one
-term leaf per non-empty index plus the root. The whole file image is a
-deterministic function of the input and the canonical index catalog, so rebuilds
-are byte-identical (`TestCreateFromPrimaryExactIndexDeterministic`), and the
-catalog identity is folded into the reproducible `StoreID`.
+or more leaves per non-empty index through the shared deterministic cutter.
+Content-defined term-run cuts, fixed 2,048-tile giant-term stripes, and hard-cap
+sub-cuts guarantee every leaf fits; the builder stages the ordered catalog and
+root beside them. The whole file image is a deterministic function of the input
+and canonical index catalog, so rebuilds are byte-identical
+(`TestCreateFromPrimaryExactIndexDeterministic`), and the catalog identity is
+folded into the reproducible `StoreID`.
+
+**Online add.** `CreateIndex` / `CreateIndexContext` scan immutable primary
+leaves with bounded writer holds, reconcile any concurrently replaced leaves,
+encode the result through the same spanned cutter, and atomically publish the
+complete Ready index with the updated durable catalog. Existing readers keep
+their old catalog epoch; the new name is never visible with partial postings.
 
 **Slot model across leaf classes.** The posting-stable slot must mean the same
 thing at build and at read. For the succinct narrow/wide leaves it is the leaf's
@@ -498,51 +513,52 @@ placement and the read path route through, so a row is always read under the
 posting it was written under, regardless of class. Template ranks are bounded by
 256, so they fit the four-quadrant tile model unchanged.
 
-**Read.** A resident `IndexTermLeafView` per physical index answers exact
-lookups; `AppendIndexMasksInto` canonicalizes the needle and returns one
-`(tile, mask)` per live posting. Every posting bit is rechecked against a
-live-slot map derived from the current graph, so a stale or grafted posting fails
-closed. `RangeMasksRaw` materializes selected rows by resolving each tile's
-bucket through the resident router and visiting the leaf's live rows in lexical
-order.
+**Read.** Each physical index holds a sorted resident leaf slice that is also
+its router. `AppendIndexMasksInto` canonicalizes the needle, binary-searches the
+first candidate leaf, and returns one `(tile, mask)` per live posting; while
+following leaves continue the same giant term it streams those pieces in order.
+The admitted views and caller workspace keep this zero-allocation. Every posting
+bit is rechecked against the epoch's flat live-slot table, so a stale or grafted
+posting fails closed. `RangeMasksRaw` materializes selected rows by resolving
+each tile's bucket through the resident primary router and visiting the leaf's
+live rows in lexical order.
 
-**Mutation (incremental maintenance).** An indexed ordered-primary collection is
-mutable: a `Put`/`Delete` updates the affected term leaves in the same publish as
-the document, so the index is never stale in any lane (buffered, buffered+journal,
-sync-journal). A leaf owns exactly four posting tiles (`bucket<<2 | q`), so a
-mutation's whole posting effect is confined to those tiles; the maintainer
-re-derives them from the rewritten leaf image (`VisitPrimaryLeafPostingRows`,
-`deriveBucketExactContribution`) and splices them into a fresh resident term-leaf
-snapshot, dropping the bucket's old tiles and adding the new ones. Because the
-resident encoded bytes are reconstructed from the same canonical
-term→tile→mask map a bulk build produces, an incrementally maintained leaf is
-byte-identical to a fresh build of the same final graph — the correctness anchor.
-The resident snapshot is captured by each reader at `Snapshot` and swapped whole
-under `snapshotGate`, so a concurrent reader keeps a consistent (term leaves, live
-map) pair. Durable posting pages (`stagePrimaryExactPagesLocked`) are staged in
-the same write transaction as the graph on the real-transaction path and folded
-at each checkpoint on the buffered path; the single-document reservation grows by
-one term leaf per physical index plus one root (the
-`fileStoreMaxPhysicalIndexes`-bounded worst case a single document can touch).
+**Mutation (incremental maintenance).** An indexed ordered-primary collection
+is mutable: a `Put`/`Delete` publishes the document change and its
+generation-stamped posting records together, so the index is never stale in any
+lane (buffered, buffered+journal, sync-journal). A leaf owns exactly four posting
+tiles (`bucket<<2 | q`), so an ordinary mutation emits records only for the
+touched terms and tiles; an unchanged indexed value emits none. Slot-reassigning
+rewrites use a bounded whole-bucket rebase group. Each Snapshot captures one
+immutable exact-index epoch containing the spanned fold base, flat live table,
+and overlay, so concurrent readers retain an exact generation view.
+
+Durable posting pages (`stagePrimaryExactPagesLocked`) are staged in the same
+write transaction as the graph on the real-transaction path and folded at each
+checkpoint on deferred paths. The fold applies the overlay through the same
+content-defined cutter as bulk build, re-encodes dirty leaf segments and giant
+term stripes, and carries untouched leaf pages by reference. The resulting
+spanned leaf set is byte-identical to a fresh build of the same final graph —
+the correctness anchor.
 `structuralRepairPostingsHook` is live: a split/merge/reclass captures each
 re-encoded leaf's contribution and records removed buckets, and the per-tablet
 posting rebuild is staged inside the one bounded structural transaction so moved
 rows keep correct postings.
 
-**Term-leaf capacity.** One physical index's postings live in a single term leaf,
-bounded to 65,535 postings / 64 KiB. A large low-cardinality corpus can exceed
-that at build time (`ErrPrimaryCutoverUnsupported`); multi-leaf term indexes are
-the pending extension. Until then, an oversized index falls back to the chunk
-layout in the competitive harness rather than dropping postings.
+**Term-leaf capacity.** The former one-leaf-per-index 65,535-byte/64 KiB cap is
+gone. A physical index and a single giant term can span as many bounded leaves
+as their postings require. Every emitted leaf fits
+`min(IndexTermLeafMaxBytes, MaxPageSize)` by construction; an oversized posting
+set no longer triggers a cutover fallback.
 
 **Crash safety and verify.** Exact-index pages are staged and published through
 the same committer as the graph in one atomic generation, so they add no new
 commit-window shape — a crash at any write point of the commit window recovers an
 index consistent with the recovered graph (proven by the indexed commit-crash
 sweep and the sync-journal replay-after-crash test). `cmd/vibedb-verify` walks
-`ExactIndexRoot` → every
-`PagePrimaryExactLeaf`, admitting the reference catalog (bounds, ordering,
-distinctness) and each leaf envelope, and records their extents for the
+`ExactIndexRoot` → each level-0 or level-1 `PagePrimaryExactCatalog` → every
+`PagePrimaryExactLeaf`, admitting catalog bounds, ordering, depth, prefixes,
+flags, references, and each leaf envelope, and records all extents for the
 reachable-overlap check; recovery re-admits the exact root through
 `validateRecoveredStateRef`.
 

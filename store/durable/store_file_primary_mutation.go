@@ -1420,7 +1420,7 @@ func (c *Collection) cowPrimaryMutation(
 			}
 		}
 	}
-	leafImage, leafBytes, _, prepareErr := c.preparePrimaryLeafMutation(
+	leafImage, leafBytes, newSlot, prepareErr := c.preparePrimaryLeafMutation(
 		path, generation, key, value, deleting, found, slot,
 	)
 	if prepareErr != nil {
@@ -1428,13 +1428,16 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	becameEmpty = deleting && path.leaf.Len() == 1
 	filledEmpty = !deleting && !found && path.leaf.Len() == 0
-	// Fold-first lane (§7): re-derive the rewritten bucket from the staged
-	// leaf image against the same bounds it was encoded under, resolve the
-	// rest through the read rule, and prepare the fresh epoch this
-	// transaction stages durably, so the index and the graph publish in one
-	// atomic generation.
+	// Fold-first lane (§7): run the §3 delta write rule for the common
+	// slot-stable shapes and fold only the dirty leaves; a slot-reassigning
+	// rewrite re-derives the whole bucket from the staged leaf image against
+	// the same bounds it was encoded under. Either way the fresh epoch is
+	// prepared here and staged durably by this same transaction, so the
+	// index and the graph publish in one atomic generation.
 	preparedExact, prepareExactErr := c.preparePrimaryExactLeaf(
-		leafImage, resident.Bucket, leafBounds, generation,
+		state, &path.leaf, leafImage, resident, key, src,
+		deleting, found, path.detemplated, slot, newSlot,
+		generation, leafBounds,
 	)
 	if prepareExactErr != nil {
 		return storeio.PageRef{}, false, false, prepareExactErr
@@ -2301,29 +2304,43 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	// Fold the overlay into durable exact pages in the same checkpoint
 	// transaction that seals the graph (§7). Per-mutation buffered edits only
 	// append overlay records; this is where they resolve onto the base
-	// through the read rule at the fold generation, re-encode via the same
-	// builder a bulk build uses (byte-identical output — the identity
-	// anchor), and become durable, with the state root's ExactIndexRoot
-	// advancing to match, so a crash after this checkpoint recovers a
-	// consistent index without replay. A quiet window — no overlay records,
-	// the same-value replacement shape the mixed harness's update lane is
-	// made of — skips the O(index) re-encode entirely and re-wraps the
-	// current base bytes, which is what keeps the amortized indexed
-	// checkpoint within the unindexed arm's class.
+	// through the read rule at the fold generation and re-encode ONLY the
+	// dirty leaves — the runs and stripes the window's touched terms name —
+	// via the same cutter+builder a bulk build uses (byte-identical output —
+	// the identity anchor), becoming durable with the state root's
+	// ExactIndexRoot advancing to match, so a crash after this checkpoint
+	// recovers a consistent index without replay. Untouched leaves keep
+	// their durable pages by reference and a quiet window — no overlay
+	// records, the same-value replacement shape the mixed harness's update
+	// lane is made of — rewrites only the small root and catalog pages,
+	// which is what keeps the amortized indexed checkpoint within the
+	// unindexed arm's class.
 	var exactRoot storeio.PageRef
 	var exactPrepared primaryExactPrepared
+	var quietExact []primaryExactResident
+	defer func() {
+		if abort && exactPrepared.epoch != nil {
+			c.unwindPrimaryExactPrepared(&exactPrepared)
+		}
+	}()
 	exactActive := c.primaryExactActive()
 	if exactActive {
 		c.recyclePrimaryExactEpochsLocked()
 		staged := c.primaryEpoch.exact
 		if !c.primaryEpoch.overlayEmpty() {
-			exactPrepared, err = c.prepareStreamedPrimaryExactFold(
-				generation, generation,
+			exactPrepared, err = c.prepareDirtyPrimaryExactFold(
+				generation, generation, nil,
 			)
 			if err != nil {
 				return err
 			}
 			staged = exactPrepared.epoch.exact
+		} else {
+			// Staging assigns fresh root/catalog identities. Keep those writes
+			// off the installed epoch until the transaction publishes: a later
+			// free-log or state-root failure must leave retry metadata intact.
+			quietExact = clonePrimaryExactResidentsForStaging(staged)
+			staged = quietExact
 		}
 		exactRoot, err = c.stagePrimaryExactPagesLocked(
 			tx, base, generation, staged,
@@ -2387,8 +2404,14 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	}
 	// The fold's fresh epoch (empty overlay) publishes in the same gate +
 	// fence section as the checkpointed state, retiring the consumed epoch
-	// onto the generation-keyed pending list. A no-op for a quiet window,
-	// which keeps its epoch and overlay untouched.
+	// onto the generation-keyed pending list. A quiet window keeps its epoch
+	// and overlay but adopts the newly published catalog/root identities now
+	// that no fallible transaction step remains.
+	if quietExact != nil {
+		installPrimaryExactDurableMetadata(
+			c.primaryEpoch.exact, quietExact,
+		)
+	}
 	c.installPrimaryExactResidentLocked(exactPrepared)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)

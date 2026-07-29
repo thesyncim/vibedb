@@ -301,10 +301,16 @@ direct-I/O choices after fallback.
 
 ### Durable indexes
 
-`durable.Options.Indexes` declares up to 4,096 logical exact scalar or compound
-index names over at most 64 distinct ordered path definitions. Logical aliases
-share one physical index. Definitions are fixed at creation and verified when
-reopened. Each write maintains their postings transactionally.
+`durable.Options.Indexes` declares the initial exact scalar or compound index
+names. A durable collection supports up to 4,096 logical names over at most 64
+distinct ordered path definitions; logical aliases share one physical index.
+`CreateIndex` / `CreateIndexContext` can build another definition over a live
+collection and atomically publish its ready postings with the updated durable
+catalog. The catalog is authoritative on reopen, while supplied option
+definitions act as an assertion. Each write maintains the published postings
+transactionally. One physical index spans deterministic, bounded term leaves
+behind an ordered catalog; a giant term may span consecutive fixed-tile stripe
+pieces, so posting volume is not capped by one 64 KiB leaf.
 
 ### Bulk creation
 

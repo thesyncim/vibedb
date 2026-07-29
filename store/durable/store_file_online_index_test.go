@@ -259,10 +259,10 @@ func TestOnlineCreateIndexReusesImmutableLeavesAndAliases(t *testing.T) {
 		oldLease.Release()
 		t.Fatal(err)
 	}
-	oldLeaf, ok := oldRoot.Leaf(collection.options.indexNameIDs["by_z"])
+	oldEntry, ok := oldRoot.Entry(collection.options.indexNameIDs["by_z"])
 	oldLease.Release()
-	if !ok || oldLeaf == (storeio.PageRef{}) {
-		t.Fatalf("old by_z leaf = %+v ok=%v", oldLeaf, ok)
+	if !ok || oldEntry.Catalog == (storeio.PageRef{}) {
+		t.Fatalf("old by_z catalog = %+v ok=%v", oldEntry.Catalog, ok)
 	}
 
 	if _, err := collection.CreateIndex(store.IndexDefinition{
@@ -283,10 +283,10 @@ func TestOnlineCreateIndexReusesImmutableLeavesAndAliases(t *testing.T) {
 		newLease.Release()
 		t.Fatal(err)
 	}
-	reused, ok := newRoot.Leaf(collection.options.indexNameIDs["by_z"])
+	reused, ok := newRoot.Entry(collection.options.indexNameIDs["by_z"])
 	newLease.Release()
-	if !ok || reused != oldLeaf {
-		t.Fatalf("by_z leaf rewritten: got %+v want %+v", reused, oldLeaf)
+	if !ok || reused != oldEntry {
+		t.Fatalf("by_z catalog rewritten: got %+v want %+v", reused, oldEntry)
 	}
 
 	rootBeforeAlias := newState.root.ExactIndexRoot
@@ -659,7 +659,11 @@ func TestOnlineCreateIndexMatchesCanonicalAggregation(t *testing.T) {
 			}
 		}
 	}
-	want, err := online.encodeIndexTermLeaf(terms, live)
+	ordered, err := buildPrimaryExactTerms(online.storeID, terms, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := storeio.AppendIndexTermLeaf(nil, online.storeID, ordered)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,8 +685,34 @@ func TestOnlineCreateIndexMatchesCanonicalAggregation(t *testing.T) {
 	if _, err := online.CreateIndex(definition); err != nil {
 		t.Fatal(err)
 	}
+	var wantLeaves [][]byte
+	err = storeio.CutIndexTermLeaves(
+		ordered,
+		storeio.IndexTermLeafCutBudget(uint32(online.options.MaxPageSize)),
+		func(leafTerms []storeio.IndexTermLeafTerm, _ bool) error {
+			encoded, encodeErr := storeio.AppendIndexTermLeaf(
+				nil, online.storeID, leafTerms,
+			)
+			if encodeErr == nil {
+				wantLeaves = append(wantLeaves, encoded)
+			}
+			return encodeErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if online.primaryEpoch == nil || len(online.primaryEpoch.exact) != 1 ||
-		!slices.Equal(online.primaryEpoch.exact[0].encoded, want) {
+		len(online.primaryEpoch.exact[0].leaves) != len(wantLeaves) {
 		t.Fatal("published online index differs from canonical aggregation")
+	}
+	for leafAt := range wantLeaves {
+		if !slices.Equal(
+			online.primaryEpoch.exact[0].leaves[leafAt].encoded,
+			wantLeaves[leafAt],
+		) {
+			t.Fatalf("published online leaf %d differs from canonical aggregation",
+				leafAt)
+		}
 	}
 }

@@ -514,9 +514,9 @@ func BenchmarkPrimaryExactLookupIteration(b *testing.B) {
 	}
 	byteCount, postings := 0, 0
 	for _, resident := range collection.primaryEpoch.exact {
-		if resident.present {
-			byteCount += len(resident.encoded)
-			postings += resident.view.PostingLen()
+		for l := range resident.leaves {
+			byteCount += len(resident.leaves[l].encoded)
+			postings += resident.leaves[l].view.PostingLen()
 		}
 	}
 	bytesPerPosting := float64(byteCount) / float64(postings)

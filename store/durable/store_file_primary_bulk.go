@@ -152,11 +152,20 @@ func CreateFromPrimary(
 	}
 	pageCount := primaryPageCount
 	if len(normalized.indexes) != 0 {
-		// One bounded term leaf per physical index plus its canonical root.
-		// Empty physical indexes consume only their zero root entry, so this is
-		// a safe upper bound for the single transaction that stages the graph
-		// and every exact-index page together.
-		pageCount += len(normalized.indexes) + 1
+		// The spanned exact indexes stage one page per cutter-emitted term
+		// leaf plus each index's catalog and the shared root; the bound is
+		// computed by planning the leaves and running the real cutter over
+		// simulated posting tiles, so the single transaction that stages the
+		// graph and every exact-index page together reserves a count that can
+		// never under-provision (see primaryExactIndexPageBound).
+		exactPageBound, boundErr := primaryExactIndexPageBound(
+			storeID, records, normalized.indexes,
+			uint32(normalized.MaxPageSize), leafPolicy,
+		)
+		if boundErr != nil {
+			return 0, boundErr
+		}
+		pageCount += exactPageBound
 	}
 	bufferCount := pageCount + 1
 	if requestedBuffers != 0 {

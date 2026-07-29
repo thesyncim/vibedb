@@ -481,7 +481,7 @@ func variableTransactionExtent(kind PageKind) bool {
 	switch kind {
 	case PageOverflow, PagePrimaryCatalog, PageTabletDirectory,
 		PagePrimaryLocator, PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf,
-		PagePrimaryExactRoot, PagePrimaryExactLeaf:
+		PagePrimaryExactRoot, PagePrimaryExactLeaf, PagePrimaryExactCatalog:
 		return true
 	default:
 		return false

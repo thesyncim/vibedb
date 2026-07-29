@@ -199,26 +199,149 @@ func (w *verifyWalker) walkExactIndexes() {
 	}
 	w.count("primary-exact-root")
 	for indexID := 0; indexID < view.Len(); indexID++ {
-		ref, ok := view.Leaf(uint32(indexID))
+		entry, ok := view.Entry(uint32(indexID))
 		if !ok {
 			w.fail("primary-exact-root", rootRef.Offset, rootRef.LogicalID,
-				"leaf catalog entry %d", indexID)
+				"root catalog entry %d", indexID)
 			return
 		}
-		if ref == (storeio.PageRef{}) {
+		if entry.LeafCount == 0 {
 			continue
 		}
-		w.record(ref, "primary-exact-leaf")
-		leaf, ok := w.openAndCheckIdentity(ref, "primary-exact-leaf")
+		state := verifyExactCatalogState{}
+		w.walkExactCatalogPage(entry.Catalog, bounds, true, &state)
+		if state.leaves != entry.LeafCount {
+			w.fail("primary-exact-root", rootRef.Offset, rootRef.LogicalID,
+				"index %d catalog leaves=%d want=%d",
+				indexID, state.leaves, entry.LeafCount)
+		}
+	}
+}
+
+type verifyExactCatalogState struct {
+	previousKey  []byte
+	previousTile uint32
+	leaves       uint32
+}
+
+// walkExactCatalogPage proves one PagePrimaryExactCatalog page and, for a
+// level-1 page, its level-0 children; every referenced term leaf opens with a
+// matching identity and is recorded for the overlap check.
+func (w *verifyWalker) walkExactCatalogPage(
+	ref storeio.PageRef, bounds storeio.PrimaryExactIndexBounds,
+	allowIndex bool, state *verifyExactCatalogState,
+) {
+	w.record(ref, "primary-exact-catalog")
+	page, ok := w.openAndCheckIdentity(ref, "primary-exact-catalog")
+	if !ok {
+		return
+	}
+	view, err := storeio.OpenPrimaryExactCatalogPage(page, ref, bounds)
+	if err != nil {
+		w.fail("primary-exact-catalog", ref.Offset, ref.LogicalID,
+			"admit: %v", err)
+		return
+	}
+	w.count("primary-exact-catalog")
+	if view.Level() == 1 {
+		if !allowIndex {
+			w.fail("primary-exact-catalog", ref.Offset, ref.LogicalID,
+				"catalog tree exceeds depth 2")
+			return
+		}
+		for i := 0; i < view.Len(); i++ {
+			child, ok := view.Child(uint32(i))
+			if !ok {
+				w.fail("primary-exact-catalog", ref.Offset, ref.LogicalID,
+					"catalog child %d", i)
+				return
+			}
+			w.walkExactCatalogPage(child, bounds, false, state)
+		}
+		return
+	}
+	if err := view.ForEachEntry(func(entry storeio.PrimaryExactCatalogEntry) error {
+		w.record(entry.Leaf, "primary-exact-leaf")
+		leaf, ok := w.openAndCheckIdentity(entry.Leaf, "primary-exact-leaf")
 		if !ok {
-			continue
+			return nil
 		}
-		if _, err := storeio.OpenPrimaryExactLeafPage(leaf, ref, bounds); err != nil {
-			w.fail("primary-exact-leaf", ref.Offset, ref.LogicalID,
-				"admit: %v", err)
-			continue
+		payload, err := storeio.OpenPrimaryExactLeafPage(
+			leaf, entry.Leaf, bounds,
+		)
+		if err != nil {
+			w.fail("primary-exact-leaf", entry.Leaf.Offset,
+				entry.Leaf.LogicalID, "admit: %v", err)
+			return nil
 		}
+		var allLive [storeio.TermPostingTileChunks]uint64
+		for i := range allLive {
+			allLive[i] = ^uint64(0)
+		}
+		view, err := storeio.OpenIndexTermLeaf(
+			payload, w.storeID,
+			func(uint32) *[storeio.TermPostingTileChunks]uint64 {
+				return &allLive
+			},
+		)
+		if err != nil {
+			w.fail("primary-exact-leaf", entry.Leaf.Offset,
+				entry.Leaf.LogicalID, "term codec: %v", err)
+			return nil
+		}
+		it := view.Ordered()
+		key, match, ok := it.Next()
+		if !ok {
+			w.fail("primary-exact-leaf", entry.Leaf.Offset,
+				entry.Leaf.LogicalID, "empty term leaf")
+			return nil
+		}
+		maskIt := match.MaskIterator()
+		firstTile, _, ok := maskIt.Next()
+		if !ok {
+			w.fail("primary-exact-leaf", entry.Leaf.Offset,
+				entry.Leaf.LogicalID, "first term has no postings")
+			return nil
+		}
+		prefix := key
+		if len(prefix) > storeio.PrimaryExactCatalogPrefixBytes {
+			prefix = prefix[:storeio.PrimaryExactCatalogPrefixBytes]
+		}
+		flags := uint8(0)
+		if entry.Flags&storeio.PrimaryExactCatalogPiece != 0 {
+			flags |= storeio.PrimaryExactCatalogPiece
+			if view.Len() != 1 {
+				w.fail("primary-exact-leaf", entry.Leaf.Offset,
+					entry.Leaf.LogicalID, "piece leaf has %d terms", view.Len())
+			}
+		}
+		if storeio.IndexTermLeafRunCut(
+			storeio.IndexTermRouteHash(w.storeID, key),
+		) {
+			flags |= storeio.PrimaryExactCatalogRunCut
+		}
+		if !bytes.Equal(entry.Prefix, prefix) ||
+			entry.FirstTile != firstTile || entry.Flags != flags {
+			w.fail("primary-exact-leaf", entry.Leaf.Offset,
+				entry.Leaf.LogicalID, "catalog metadata mismatch")
+			return nil
+		}
+		if state.leaves != 0 {
+			cmp := bytes.Compare(state.previousKey, key)
+			if cmp > 0 || cmp == 0 && state.previousTile >= firstTile {
+				w.fail("primary-exact-leaf", entry.Leaf.Offset,
+					entry.Leaf.LogicalID, "catalog term order")
+				return nil
+			}
+		}
+		state.previousKey = append(state.previousKey[:0], key...)
+		state.previousTile = firstTile
+		state.leaves++
 		w.count("primary-exact-leaf")
+		return nil
+	}); err != nil {
+		w.fail("primary-exact-catalog", ref.Offset, ref.LogicalID,
+			"entries: %v", err)
 	}
 }
 

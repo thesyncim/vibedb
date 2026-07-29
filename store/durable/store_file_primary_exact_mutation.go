@@ -2,9 +2,6 @@ package durable
 
 import (
 	"bytes"
-	"fmt"
-	"math/bits"
-	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
@@ -138,65 +135,6 @@ func (c *Collection) deriveBucketExactContribution(
 		return nil, nil, err
 	}
 	return bucketLive, byIndex, nil
-}
-
-// encodeIndexTermLeaf encodes one physical index's canonical term map into an
-// IndexTermLeaf byte stream, mirroring buildPrimaryExactIndexes exactly so the
-// output is byte-identical to a bulk build of the same postings. It returns nil
-// bytes for an empty physical index. It is the fold's identity anchor: every
-// resident and durable term leaf in this file passes through it.
-func (c *Collection) encodeIndexTermLeaf(
-	terms map[string]map[uint32]uint64,
-	live map[uint32]*[storeio.TermPostingTileChunks]uint64,
-) ([]byte, error) {
-	if len(terms) == 0 {
-		return nil, nil
-	}
-	keys := make([]string, 0, len(terms))
-	for key := range terms {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	leafTerms := make([]storeio.IndexTermLeafTerm, len(keys))
-	for termAt, key := range keys {
-		record, ok := storeio.OpenIndexTermKeyRecord(c.storeID, []byte(key))
-		if !ok {
-			return nil, fmt.Errorf(
-				"%w: canonical exact term", storeio.ErrInvalidWrite,
-			)
-		}
-		tileMap := terms[key]
-		tiles := make([]uint32, 0, len(tileMap))
-		for tileID := range tileMap {
-			tiles = append(tiles, tileID)
-		}
-		slices.Sort(tiles)
-		postings := make([]storeio.IndexTermLeafPosting, len(tiles))
-		for postingAt, tileID := range tiles {
-			maskBits := tileMap[tileID]
-			liveMask := live[tileID]
-			if liveMask == nil {
-				return nil, storeio.ErrPrimaryExactIndexCorrupt
-			}
-			// A chunk-0-only posting always encodes through the leaf's
-			// direct representations, which never consume the adaptive
-			// codec's record — the synthetic (tile, rows) record plus the
-			// mask is the builder's complete input and skips codec
-			// selection (see prepareStreamedPrimaryExactFold's emit).
-			postings[postingAt] = storeio.IndexTermLeafPosting{
-				Posting: storeio.TermPosting{
-					TileID: tileID,
-					Rows:   uint16(bits.OnesCount64(maskBits)),
-				},
-				Live:       liveMask,
-				Chunk0Bits: maskBits, Chunk0Only: true,
-			}
-		}
-		leafTerms[termAt] = storeio.IndexTermLeafTerm{
-			Key: record, Postings: postings,
-		}
-	}
-	return storeio.AppendIndexTermLeaf(nil, c.storeID, leafTerms)
 }
 
 // primaryExactTermLink is one prepared chain-head publication: head's
@@ -390,11 +328,11 @@ func (c *Collection) emitPrimaryExactTileRecord(
 // resolvePrimaryExactTermTileBits is the writer's probe-shaped read of the
 // current absolute bits for (index, term, tile): newest overlay record for
 // the tile if any (a record older than the tile's newest rebase is void),
-// else the fold base unless a rebase voided it. The base branch seeks the
-// term's ascending mask iterator and exits at the first tile past the
-// target, so its cost is O(the term's postings before the touched tile) —
-// the honest price of the unchanged monolithic leaf codec in P0, paid only
-// on value-changed updates, inserts, and deletes of indexed terms.
+// else the fold base unless a rebase voided it. The spanned base routes by
+// one router binary search on (term, tile) — for a striped giant term that
+// lands directly on the stripe piece owning the tile — then seeks that
+// leaf's ascending mask iterator, so its cost is O(one leaf's postings
+// before the touched tile), corpus-size-independent by construction.
 func (c *Collection) resolvePrimaryExactTermTileBits(
 	epoch *primaryExactEpoch,
 	indexID uint32,
@@ -421,21 +359,25 @@ func (c *Collection) resolvePrimaryExactTermTileBits(
 		// record at or above it means "no bits" and the base is void.
 		return 0, nil
 	}
-	resident := &epoch.exact[indexID]
-	if !resident.present {
+	leaves := epoch.exact[indexID].leaves
+	if len(leaves) == 0 {
 		return 0, nil
 	}
-	match, found := resident.view.LookupRecord(keyRecord)
+	at := primaryExactLeafAt(leaves, keyRecord.Canonical, tileID)
+	if at < 0 {
+		return 0, nil
+	}
+	match, found := leaves[at].view.LookupRecord(keyRecord)
 	if !found {
 		return 0, nil
 	}
 	iterator := match.MaskIterator()
 	for {
-		at, mask, more := iterator.Next()
-		if !more || at > tileID {
+		tile, mask, more := iterator.Next()
+		if !more || tile > tileID {
 			return 0, nil
 		}
-		if at == tileID {
+		if tile == tileID {
 			if mask.Chunk != 0 {
 				return 0, storeio.ErrPrimaryExactIndexCorrupt
 			}
@@ -572,7 +514,7 @@ func (c *Collection) preparePrimaryExactBufferedMutation(
 		&primaryExactBucketOverride{
 			bucket: bucket, live: bucketLive, byIndex: byIndex,
 		},
-		nil,
+		nil, nil,
 	)
 }
 
@@ -707,35 +649,80 @@ func (c *Collection) preparePrimaryExactDelta(
 }
 
 // preparePrimaryExactLeaf is the fold-first lane used by the canonical
-// per-mutation-transaction path (§7): it re-derives bucket's contribution
-// from the rewritten leaf image, resolves everything else through the read
-// rule at the current head, and prepares a complete fresh epoch whose
-// encoded leaves the same transaction stages durably. P0 keeps this lane's
-// whole-leaf re-encode cost — that lane already pays a device sync per
-// mutation. The overlay it resolves is empty in practice: every
-// record-emitting buffered mutation registers a pending parent, and the
-// transactional path materializes pending parents (a fold) before entering.
+// per-mutation-transaction path (§7): it prepares a complete fresh epoch
+// whose encoded leaves the same transaction stages durably. Since P1 the
+// common shapes (slot-stable update, insert, delete) run the same §3 delta
+// write rule the buffered lane uses and then fold ONLY the dirty leaves —
+// the mutation's own ≤ 2 touched terms per index name everything that can
+// differ — so the canonical lane is no longer O(index) per mutation; that
+// lane already pays a device sync, and a 1–3 small leaf encodes are noise
+// beside it. Slot-reassigning rewrites (de-template, defensive slot-move
+// detection) fall back to the full bucket re-derivation fold, exactly the
+// rebase semantics of the buffered lane. The overlay it resolves is empty in
+// practice: every record-emitting buffered mutation registers a pending
+// parent, and the transactional path materializes pending parents (a fold)
+// before entering.
 func (c *Collection) preparePrimaryExactLeaf(
-	leafPage []byte, bucket storeio.BucketID,
-	bounds storeio.CommonPrimaryLeafBounds,
+	state *fileStoreState,
+	leaf *storeio.CommonPrimaryLeafView,
+	leafImage []byte,
+	resident storeio.ResidentPrimaryRoute,
+	key, src []byte,
+	deleting, found, detemplated bool,
+	oldSlot, newSlot uint8,
 	generation uint64,
+	bounds storeio.CommonPrimaryLeafBounds,
 ) (primaryExactPrepared, error) {
 	if !c.primaryExactActive() {
 		return primaryExactPrepared{}, nil
 	}
+	epoch := c.primaryEpoch
+	rebase := detemplated || (found && !deleting && newSlot != oldSlot)
+	if !rebase {
+		records := primaryExactPrepared{
+			active:         true,
+			gen:            generation,
+			termLinks:      c.exactTermLinkScratch[:0],
+			tileLinks:      c.exactTileLinkScratch[:0],
+			termRecordMark: epoch.termRecordN,
+			tileRecordMark: epoch.tileRecordN,
+		}
+		ok, err := c.preparePrimaryExactDelta(
+			state, epoch, &records, leaf, resident,
+			key, src, deleting, found, oldSlot, newSlot, generation,
+		)
+		if err != nil {
+			c.unwindPrimaryExactPrepared(&records)
+			return primaryExactPrepared{}, err
+		}
+		if ok {
+			prepared, foldErr := c.prepareDirtyPrimaryExactFold(
+				generation, generation, &records,
+			)
+			c.unwindPrimaryExactPrepared(&records)
+			if foldErr != nil {
+				return primaryExactPrepared{}, foldErr
+			}
+			return prepared, nil
+		}
+		// Overlay pressure: the record arena cannot hold even this delta;
+		// the bucket-derivation fold below needs no records at all.
+		c.unwindPrimaryExactPrepared(&records)
+	}
 	bucketLive, byIndex, err := c.deriveBucketExactContribution(
-		leafPage, bucket, bounds,
+		leafImage, resident.Bucket, bounds,
 	)
 	if err != nil {
 		return primaryExactPrepared{}, err
 	}
+	bucket := resident.Bucket
 	return c.prepareFoldedPrimaryExact(
 		^uint64(0), generation,
 		func(b storeio.BucketID) bool { return b == bucket },
 		&primaryExactBucketOverride{
 			bucket: bucket, live: bucketLive, byIndex: byIndex,
 		},
-		nil,
+		nil, nil,
 	)
 }
 
@@ -814,23 +801,26 @@ func (c *Collection) prepareStructuralExactLocked(
 		func(b storeio.BucketID) bool { return affected[b] },
 		nil,
 		c.structuralExactReencoded,
+		nil,
 	)
 }
 
-// stagePrimaryExactPagesLocked writes exact indexes as fresh durable pages
-// inside tx and returns the new PagePrimaryExactRoot ref. Every present physical
-// index is written in ascending canonical index order; leaf references need
-// only be unique because persistent catalog updates may reuse older leaves in a
-// different allocation order. The superseded leaves and root named by
-// state.root.ExactIndexRoot are retired through c.retireScratch, and an empty
-// physical index keeps a zero leaf ref. It stages nothing and returns a zero ref
-// for a collection without exact indexes.
+// stagePrimaryExactPagesLocked persists the exact indexes inside tx and
+// returns the new PagePrimaryExactRoot ref: it writes a durable page for
+// every staged leaf that does not already have one (carried leaves keep the
+// page their ref names — the O(dirty leaves) half of §7's fold), rebuilds
+// each index's ordered catalog and the v1 root (both small), and retires
+// exactly the superseded pages: the old root, the old catalog pages, and
+// the old pages of leaves the fold replaced or dropped. It stages nothing
+// and returns a zero ref for a collection without exact indexes.
 //
 // exact is the resident term-leaf set to persist: a freshly folded epoch's
 // base for a per-mutation transaction, structural transaction, or dirty
-// checkpoint, or the current epoch's base for a quiet checkpoint. Its
-// encoded bytes are already canonical, so this only wraps them in page
-// envelopes; it does not rebuild postings from the graph.
+// checkpoint, or the current epoch's base for a quiet checkpoint (whose
+// leaves all carry refs, so only root+catalog pages are written). Encoded
+// bytes are already canonical; this only wraps them in page envelopes.
+// Fresh page refs are recorded on the staged leaves, so the epoch installed
+// at publish carries the durable identity of every leaf.
 func (c *Collection) stagePrimaryExactPagesLocked(
 	tx *storeio.WriteTransaction,
 	state *fileStoreState,
@@ -842,65 +832,90 @@ func (c *Collection) stagePrimaryExactPagesLocked(
 	}
 	pageSize := uint32(c.options.PageSize)
 	maxPageSize := uint32(c.options.MaxPageSize)
+
+	// Retire superseded pages against the currently installed epoch (the
+	// fold's input). Carried leaves preserve their relative order, so one
+	// forward scan of the staged refs decides which old pages survive.
 	if state.root.ExactIndexRoot != (storeio.PageRef{}) {
-		lease, err := c.cache.Acquire(state.root.ExactIndexRoot)
-		if err != nil {
-			return storeio.PageRef{}, err
-		}
-		root, openErr := storeio.OpenPrimaryExactRootPage(
-			lease.Page(), state.root.ExactIndexRoot, c.primaryExactBounds(state),
-		)
-		if openErr == nil {
-			for indexID := 0; indexID < root.Len(); indexID++ {
-				ref, ok := root.Leaf(uint32(indexID))
-				if !ok {
-					openErr = storeio.ErrPrimaryExactIndexCorrupt
-					break
+		old := c.primaryEpoch.exact
+		for indexID := range old {
+			var staged []primaryExactLeaf
+			if indexID < len(exact) {
+				staged = exact[indexID].leaves
+			}
+			// At this point fresh leaves still carry zero refs (their pages
+			// are staged below), so a staged leaf with a ref IS a carried
+			// leaf, and carried leaves preserve the old relative order: the
+			// carried refs form an in-order subsequence of the old refs.
+			si := 0
+			for at := range old[indexID].leaves {
+				ref := old[indexID].leaves[at].ref
+				if ref == (storeio.PageRef{}) {
+					continue
 				}
-				if ref != (storeio.PageRef{}) {
-					if appendErr := c.appendPrimaryRetirement(
-						state, ref,
-					); appendErr != nil {
-						openErr = appendErr
-						break
-					}
+				for si < len(staged) && staged[si].ref == (storeio.PageRef{}) {
+					si++
+				}
+				if si < len(staged) && staged[si].ref == ref {
+					si++
+					continue // carried: the page survives
+				}
+				if err := c.appendPrimaryRetirement(state, ref); err != nil {
+					return storeio.PageRef{}, err
+				}
+			}
+			for _, ref := range old[indexID].catalog {
+				if err := c.appendPrimaryRetirement(state, ref); err != nil {
+					return storeio.PageRef{}, err
 				}
 			}
 		}
-		lease.Release()
-		if openErr != nil {
-			return storeio.PageRef{}, openErr
-		}
-	}
-	leafRefs := make([]storeio.PageRef, len(exact))
-	for indexID := range exact {
-		if !exact[indexID].present {
-			continue
-		}
-		encoded := exact[indexID].encoded
-		extent, ok := primaryExactExtent(
-			len(encoded)+storeio.PageHeaderSize+storeio.PageTrailerSize,
-			pageSize, maxPageSize,
-		)
-		if !ok {
-			return storeio.PageRef{}, fmt.Errorf(
-				"%w: ordered-primary exact term leaf exceeds MaxPageSize",
-				ErrPrimaryCutoverUnsupported,
-			)
-		}
-		page, err := tx.Allocate(storeio.PagePrimaryExactLeaf, extent, 0)
-		if err != nil {
-			return storeio.PageRef{}, err
-		}
-		if _, err := storeio.EncodePrimaryExactLeafPage(
-			page.Bytes(), c.storeID, generation, page.Ref().LogicalID, encoded,
+		if err := c.appendPrimaryRetirement(
+			state, state.root.ExactIndexRoot,
 		); err != nil {
 			return storeio.PageRef{}, err
 		}
-		if err := page.Stage(); err != nil {
+	}
+
+	rootEntries := make([]storeio.PrimaryExactRootEntry, len(exact))
+	stagedScratch := make([]primaryExactStagedLeaf, 0, 16)
+	for indexID := range exact {
+		resident := &exact[indexID]
+		if !resident.present() {
+			resident.catalog = resident.catalog[:0]
+			continue
+		}
+		staged := stagedScratch[:0]
+		for at := range resident.leaves {
+			leaf := &resident.leaves[at]
+			if leaf.ref == (storeio.PageRef{}) {
+				ref, err := stagePrimaryExactLeafPage(
+					tx, leaf.encoded, pageSize, maxPageSize,
+				)
+				if err != nil {
+					return storeio.PageRef{}, err
+				}
+				leaf.ref = ref
+			}
+			staged = append(staged, primaryExactStagedLeaf{
+				ref:       leaf.ref,
+				firstKey:  leaf.firstKey,
+				firstTile: leaf.firstTile,
+				piece:     leaf.piece,
+				runCut:    leaf.runCut,
+			})
+		}
+		stagedScratch = staged[:0]
+		catalogRef, pages, err := stagePrimaryExactCatalog(
+			tx, pageSize, maxPageSize, staged, resident.catalog[:0],
+		)
+		if err != nil {
 			return storeio.PageRef{}, err
 		}
-		leafRefs[indexID] = page.Ref()
+		resident.catalog = pages
+		rootEntries[indexID] = storeio.PrimaryExactRootEntry{
+			Catalog: catalogRef, LeafCount: uint32(len(staged)),
+		}
 	}
 	rootPage, err := tx.Allocate(storeio.PagePrimaryExactRoot, pageSize, 0)
 	if err != nil {
@@ -908,19 +923,55 @@ func (c *Collection) stagePrimaryExactPagesLocked(
 	}
 	if _, err := storeio.EncodePrimaryExactRootPage(
 		rootPage.Bytes(), c.storeID, generation, rootPage.Ref().LogicalID,
-		leafRefs,
+		rootEntries,
 	); err != nil {
 		return storeio.PageRef{}, err
 	}
 	if err := rootPage.Stage(); err != nil {
 		return storeio.PageRef{}, err
 	}
-	if state.root.ExactIndexRoot != (storeio.PageRef{}) {
-		if err := c.appendPrimaryRetirement(
-			state, state.root.ExactIndexRoot,
-		); err != nil {
-			return storeio.PageRef{}, err
-		}
-	}
 	return rootPage.Ref(), nil
+}
+
+// clonePrimaryExactResidentsForStaging makes a metadata-private copy of an
+// installed epoch's fold base. Encoded bytes, admitted views, and first keys
+// remain immutable and may be shared; leaf refs and catalog slices must not be
+// shared because staging replaces them before publication can still fail.
+func clonePrimaryExactResidentsForStaging(
+	src []primaryExactResident,
+) []primaryExactResident {
+	out := make([]primaryExactResident, len(src))
+	for indexID := range src {
+		out[indexID].leaves = append(
+			out[indexID].leaves, src[indexID].leaves...,
+		)
+		out[indexID].catalog = append(
+			out[indexID].catalog, src[indexID].catalog...,
+		)
+	}
+	return out
+}
+
+// installPrimaryExactDurableMetadata copies page identities from a successfully
+// published staging copy into the installed epoch. Readers use only the
+// immutable encoded/view routing fields, so this writer-gated update changes no
+// query-visible state.
+func installPrimaryExactDurableMetadata(
+	dst, src []primaryExactResident,
+) {
+	if len(dst) != len(src) {
+		return
+	}
+	for indexID := range src {
+		if len(dst[indexID].leaves) != len(src[indexID].leaves) {
+			return
+		}
+		for leafAt := range src[indexID].leaves {
+			dst[indexID].leaves[leafAt].ref =
+				src[indexID].leaves[leafAt].ref
+		}
+		dst[indexID].catalog = append(
+			dst[indexID].catalog[:0], src[indexID].catalog...,
+		)
+	}
 }

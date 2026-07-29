@@ -348,6 +348,72 @@ func PrimaryGraphPageCount(
 		catalogLeaves + catalogBranches + 1, nil
 }
 
+// PrimaryGraphLeafSpan describes one planned primary leaf without staging it:
+// the input record range it will hold, the bucket it will own, and whether
+// its class assigns posting slots by lexical ordinal (template and compact
+// classes) or by hash directory (narrow and wide). Bulk reservation uses it
+// to bound the spanned exact-index page set before the build transaction
+// opens: ordinal spans yield each row's exact posting tile; hash-directory
+// spans bound a term's tiles by min(rows, 4) quadrants of the bucket, which
+// over-counts but never under-counts postings per stripe.
+type PrimaryGraphLeafSpan struct {
+	Bucket  BucketID
+	First   int
+	Last    int
+	Ordinal bool
+}
+
+// PrimaryGraphLeafSpans plans the leaves BuildPrimaryGraph will stage for
+// records — identical planning, no staging.
+func PrimaryGraphLeafSpans(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	policy ...PrimaryLeafClassPolicy,
+) ([]PrimaryGraphLeafSpan, error) {
+	if storeID == ([16]byte{}) || len(records) == 0 || len(policy) > 1 {
+		return nil, fmt.Errorf("%w: primary graph span input", ErrInvalidWrite)
+	}
+	selected := PrimaryLeafAdaptive
+	if len(policy) == 1 {
+		selected = policy[0]
+	}
+	if selected > PrimaryLeafUnified {
+		return nil, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
+	}
+	layout, err := MutableStoreLayout(physicalPageQuantum)
+	if err != nil {
+		return nil, err
+	}
+	measurement := &WriteTransaction{
+		options: WriteTransactionOptions{
+			StoreID: storeID, Generation: 1,
+			PageSize: physicalPageQuantum,
+		},
+		fileEnd: layout.DataStart,
+		nextID:  PrimaryFirstDynamicLogicalID,
+	}
+	plans, err := planPrimaryLeaves(measurement, records, selected)
+	if err != nil {
+		return nil, err
+	}
+	spans := make([]PrimaryGraphLeafSpan, len(plans))
+	for rank := range plans {
+		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
+		localID := uint32(rank % TabletLocalIdentityLocalCount)
+		bucket, ok := MakeTabletLocalIdentityBucket(tabletID, localID)
+		if !ok {
+			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
+		}
+		spans[rank] = PrimaryGraphLeafSpan{
+			Bucket: BucketID(bucket),
+			First:  plans[rank].first, Last: plans[rank].last,
+			Ordinal: plans[rank].class == CommonPrimaryLeafTemplate ||
+				plans[rank].class == CommonPrimaryLeafCompact,
+		}
+	}
+	return spans, nil
+}
+
 func planPrimaryLeaves(
 	tx *WriteTransaction,
 	records []PrimaryGraphRecord,

@@ -132,22 +132,20 @@ func primaryExactBenchOptions(indexed bool) Options {
 // primaryExactBenchStore bulk-builds the corpus into a durable collection via
 // CreateFromPrimary — the same cutover the harness's loadBulk uses — and opens
 // it with the tuned mutation options. Any build failure is fatal rather than a
-// skip: the exact-index format bounds one physical index's whole posting set to
-// a single term leaf (65,535 postings / 64 KiB), a ceiling a large corpus can
-// overrun, and a benchmark that silently dropped its indexed arm at that
-// ceiling would recreate the exact blind spot this file exists to close.
+// skip: a benchmark that silently dropped an indexed arm would recreate the
+// exact blind spot this file exists to close.
 //
-// The corpus sizes below were verified against that ceiling today. At three
-// values 10,000 documents build; per-term overhead, not posting count, is what
-// pushed this corpus over, so it is the thousand-value arm that hits the cap
-// first: at 1000 values the measured ceiling is 9,070 documents, 9,071 fails
-// with "vibejson: ordered primary cutover feature is unsupported:
-// ordered-primary exact term leaf exceeds MaxPageSize", and from 9,085 up the
-// same overflow surfaces as "vibejson: ordered primary cutover feature is
-// unsupported: ordered-primary exact index 0: vibejson: invalid Store page
-// write: exact-term leaf size". The high-cardinality arms therefore stop at
-// 9,000 documents; if a future corpus change trips the ceiling again, shrink
-// the corpus and record the new boundary here rather than skipping.
+// History of the corpus ceilings this comment used to record: exact root v0
+// bounded one physical index's whole posting set to a single term leaf
+// (65,535 postings / 64 KiB), which failed closed at 100,000 low-cardinality
+// documents and capped the thousand-value arm at a measured 9,070 documents
+// (9,071 failed with "ordered-primary exact term leaf exceeds MaxPageSize").
+// The spanned-leaf v1 format removed that cap by construction — the
+// deterministic content-defined cutter always cuts (term-boundary runs,
+// giant-term stripe pieces, hard-cap sub-cuts), so both cardinalities now
+// build, probe, and churn at 100,000 documents and the arms below cover that
+// scale. The 9,000-document high-cardinality arm is retained unchanged so
+// pre-P1 numbers stay directly comparable.
 func primaryExactBenchStore(
 	b *testing.B, docs []primaryExactBenchDoc, indexed bool,
 ) *Collection {
@@ -217,12 +215,17 @@ func BenchmarkPrimaryExactMutation(b *testing.B) {
 		values    int
 		documents []int
 	}{
-		{name: "low", values: 3, documents: []int{1_000, 10_000}},
-		// The large high-cardinality arm stops at 9,000 documents because
-		// 10,000 documents at 1000 values overrun the single-term-leaf build
-		// ceiling; primaryExactBenchStore's comment records the measured
-		// boundary and the exact error text.
-		{name: "high", values: 1000, documents: []int{1_000, 9_000}},
+		// 100,000 documents at three values was the corpus the v0 format
+		// failed closed on ("ordered-primary exact term leaf exceeds
+		// MaxPageSize"); it now builds through the spanned cutter and its
+		// indexed churn is corpus-size-independent by construction — the
+		// arm exists to keep that claim measured.
+		{name: "low", values: 3, documents: []int{1_000, 10_000, 100_000}},
+		// The 9,000-document arm was the v0 single-leaf ceiling for a
+		// thousand values (see primaryExactBenchStore); it is kept for
+		// comparability and the 100,000-document arm proves the cap is gone
+		// on the per-term-overhead side too.
+		{name: "high", values: 1000, documents: []int{1_000, 9_000, 100_000}},
 	}
 	for _, cardinality := range cardinalities {
 		for _, documents := range cardinality.documents {
@@ -310,13 +313,14 @@ var primaryExactProbeBenchRows int
 // probe-plus-iteration on a bulk-built 100-value corpus and is deliberately
 // left untouched. The one probe axis it does not cover is term-leaf shape at
 // the cardinality extremes this file's mutation arms introduce: at three
-// values a single term's posting list is a third of the 10k corpus — the
-// largest single-term decode a probe can meet on this corpus size — while at a
-// thousand values a term carries about nine postings. The pair brackets
-// per-probe cost the same way the mutation arms bracket per-mutation cost, so
-// a fix that restructures the term leaf shows its read-side consequences here.
-// The high arm uses the same 9,000-document ceiling the mutation arms do; see
-// primaryExactBenchStore for the measured boundary.
+// values a single term's posting list is a third of the corpus — at 100,000
+// documents a giant term spanning dozens of stripe-piece leaves, the largest
+// streaming probe the spanned format can meet — while at a thousand values a
+// term carries roughly documents/1000 postings routed by one binary search.
+// The P1 probe gate is the 100,000-document high-cardinality arm (≤ 2 µs,
+// 0 allocs); the low arms measure giant-term streaming throughput, which
+// scales with the postings returned, not with a bound. Each arm also reports
+// exact-B/posting so the 100k space baseline stays a pinned number.
 func BenchmarkPrimaryExactProbe(b *testing.B) {
 	cardinalities := []struct {
 		name      string
@@ -324,7 +328,9 @@ func BenchmarkPrimaryExactProbe(b *testing.B) {
 		documents int
 	}{
 		{name: "low", values: 3, documents: 10_000},
+		{name: "low", values: 3, documents: 100_000},
 		{name: "high", values: 1000, documents: 9_000},
+		{name: "high", values: 1000, documents: 100_000},
 	}
 	for _, cardinality := range cardinalities {
 		name := fmt.Sprintf(
@@ -335,6 +341,16 @@ func BenchmarkPrimaryExactProbe(b *testing.B) {
 				b, cardinality.documents, cardinality.values,
 			)
 			collection := primaryExactBenchStore(b, docs, true)
+			byteCount, postings := 0, 0
+			for _, resident := range collection.primaryEpoch.exact {
+				for l := range resident.leaves {
+					byteCount += len(resident.leaves[l].encoded)
+					postings += resident.leaves[l].view.PostingLen()
+				}
+			}
+			b.ReportMetric(
+				float64(byteCount)/float64(postings), "exact-B/posting",
+			)
 			snapshot, err := collection.Snapshot()
 			if err != nil {
 				b.Fatalf("snapshot: %v", err)

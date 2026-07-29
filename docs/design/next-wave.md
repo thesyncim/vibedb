@@ -5,8 +5,11 @@ the labels are sacred. Since this document was first written, routed splits and
 merges, the recovery journal, epoch-protected reads, and the compact leaf have
 landed, and the template-columnar class was measured and rejected as a default.
 The remaining open queue is parallel tablet writers, deferred COW-leaf reseal,
-overflow dedup, the fault-device sweep, verify/salvage, and the publishable
-suite refresh.
+overflow dedup, indexed batches and SQL-driver widening (indexed-write-path
+P3), the fault-device sweep, verify/salvage, and the publishable suite refresh.
+The indexed posting overlay (P0), spanned term leaves (P1), and online durable
+index creation (P2) are implemented; their outstanding benchmark gates remain
+measurements to record, not claimed wins.
 
 ## Speed
 
@@ -72,12 +75,14 @@ many-collection database catalogs.
 
 ## Sequencing
 
-Routed splits and merges, the journal, and epoch reads have landed. Parallel
-tablet writers are next among engine work, since the journal's group commit
-multiplies with them. The reseal-deferral item slots after the publishable
-suite refresh so its gate measures against a published baseline. The
-fault-device sweep and verify/salvage tooling are parallel-safe and may start
-any time; the overflow dedup and corner lanes ride the harness cadence. The
+Routed splits and merges, the journal, epoch reads, the indexed posting
+overlay, spanned term leaves, and online durable index creation have landed.
+Parallel tablet writers are next among engine work, since the journal's group
+commit multiplies with them. Indexed batches and SQL-driver widening remain as
+P3 of the indexed write path. The reseal-deferral item slots after the
+publishable suite refresh so its gate measures against a published baseline.
+The fault-device sweep and verify/salvage tooling are parallel-safe and may
+start any time; overflow dedup and corner lanes ride the harness cadence. The
 [distributed-sharding plan](distributed-sharding.md) has its own gated
 sequence after the shard-local storage contract is stable; it does not turn
 local `TabletID` partitions into network ownership units.

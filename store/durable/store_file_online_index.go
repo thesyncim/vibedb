@@ -477,33 +477,29 @@ func (b *onlineIndexBuild) prepareResident(
 	if fresh == nil {
 		return primaryExactPrepared{}, storeio.ErrInvalidWrite
 	}
+	live := make(map[uint32]*[storeio.TermPostingTileChunks]uint64)
 	if currentEpoch != nil && currentEpoch.live != nil {
-		fresh.ensureLiveTable(currentEpoch.live.count)
 		for at := range currentEpoch.live.slots {
 			slot := &currentEpoch.live.slots[at]
 			if slot.mask != nil {
-				fresh.live.insert(slot.tileID, slot.mask)
+				live[slot.tileID] = slot.mask
 			}
 		}
 		for bucketID, bucket := range b.buckets {
 			for quadrant, bits := range bucket.live {
 				tileID := uint32(bucketID)<<2 | uint32(quadrant)
-				if fresh.live.word(tileID) != bits {
+				mask := live[tileID]
+				var got uint64
+				if mask != nil {
+					got = mask[0]
+				}
+				if got != bits {
 					return primaryExactPrepared{},
 						storeio.ErrPrimaryExactIndexCorrupt
 				}
 			}
 		}
 	} else {
-		liveCount := 0
-		for _, bucket := range b.buckets {
-			for _, bits := range bucket.live {
-				if bits != 0 {
-					liveCount++
-				}
-			}
-		}
-		fresh.ensureLiveTable(liveCount)
 		for bucketID, bucket := range b.buckets {
 			for quadrant, bits := range bucket.live {
 				if bits == 0 {
@@ -512,11 +508,12 @@ func (b *onlineIndexBuild) prepareResident(
 				tileID := uint32(bucketID)<<2 | uint32(quadrant)
 				mask := new([storeio.TermPostingTileChunks]uint64)
 				mask[0] = bits
-				fresh.live.insert(tileID, mask)
+				live[tileID] = mask
 			}
 		}
 	}
-	encoded, err := c.encodeOnlineIndexBuckets(
+	fresh.live = newPrimaryLiveTable(live)
+	terms, err := c.buildOnlineIndexTerms(
 		b.buckets, fresh.live.lookup,
 	)
 	if err != nil {
@@ -524,41 +521,48 @@ func (b *onlineIndexBuild) prepareResident(
 	}
 	fresh.baseGen = 0
 	for candidateID, candidateIndex := range candidate.indexes {
-		var bytes []byte
 		if uint32(candidateID) == targetID {
-			bytes = encoded
-		} else if oldID := exactIndexID(
-			currentIndexes, candidateIndex,
-		); oldID >= 0 && currentEpoch != nil &&
-			oldID < len(currentEpoch.exact) &&
-			currentEpoch.exact[oldID].present {
-			bytes = currentEpoch.exact[oldID].encoded
-		}
-		if len(bytes) == 0 {
+			leaves, cutErr := c.foldEmitCutLeaves(
+				fresh, terms,
+				storeio.IndexTermLeafCutBudget(uint32(c.options.MaxPageSize)),
+				fresh.exact[candidateID].leaves[:0], false,
+			)
+			if cutErr != nil {
+				return primaryExactPrepared{}, cutErr
+			}
+			fresh.exact[candidateID].leaves = leaves
 			continue
 		}
-		residentBytes := append(fresh.encodeBuf(candidateID), bytes...)
-		view, err := storeio.OpenIndexTermLeaf(
-			residentBytes, c.storeID, fresh.live.lookup,
+		oldID := exactIndexID(
+			currentIndexes, candidateIndex,
 		)
-		if err != nil {
-			return primaryExactPrepared{}, err
+		if oldID < 0 || currentEpoch == nil ||
+			oldID >= len(currentEpoch.exact) {
+			continue
 		}
-		fresh.exact[candidateID] = primaryExactResident{
-			encoded: residentBytes, view: view, present: true,
+		old := &currentEpoch.exact[oldID]
+		resident := &fresh.exact[candidateID]
+		resident.leaves = resident.leaves[:0]
+		for leafAt := range old.leaves {
+			carried := old.leaves[leafAt]
+			carried.view = carried.view.WithLive(fresh.live.lookup)
+			resident.leaves = append(resident.leaves, carried)
 		}
+		resident.catalog = append(
+			resident.catalog[:0], old.catalog...,
+		)
 	}
 	return primaryExactPrepared{active: true, epoch: fresh}, nil
 }
 
-// encodeOnlineIndexBuckets merges sorted per-bucket contributions directly
+// buildOnlineIndexTerms merges sorted per-bucket contributions directly
 // into the canonical codec input. It deliberately avoids constructing a second
 // complete term->tile map: temporary space is the sorted string headers, the
-// merge heap (one entry per leaf), and the final codec input.
-func (c *Collection) encodeOnlineIndexBuckets(
+// merge heap (one entry per leaf), and the final cutter input.
+func (c *Collection) buildOnlineIndexTerms(
 	buckets map[storeio.BucketID]onlineIndexBucket,
 	liveLookup storeio.IndexTermLeafLiveLookup,
-) ([]byte, error) {
+) ([]storeio.IndexTermLeafTerm, error) {
 	heap := onlineIndexTermHeap{
 		sources: make([]onlineIndexTermSource, 0, len(buckets)),
 		order:   make([]int, 0, len(buckets)),
@@ -662,6 +666,20 @@ func (c *Collection) encodeOnlineIndexBuckets(
 			Key:      record,
 			Postings: allPostings[postingStart:len(allPostings):len(allPostings)],
 		})
+	}
+	return terms, nil
+}
+
+// encodeOnlineIndexBuckets preserves the single-leaf oracle used by focused
+// merge tests. Production online index creation sends the same ordered terms
+// through the shared deterministic cutter.
+func (c *Collection) encodeOnlineIndexBuckets(
+	buckets map[storeio.BucketID]onlineIndexBucket,
+	liveLookup storeio.IndexTermLeafLiveLookup,
+) ([]byte, error) {
+	terms, err := c.buildOnlineIndexTerms(buckets, liveLookup)
+	if err != nil {
+		return nil, err
 	}
 	return storeio.AppendIndexTermLeaf(nil, c.storeID, terms)
 }
@@ -890,10 +908,11 @@ catalogAddsName:
 }
 
 // stageOnlineExactRootLocked performs a persistent-root update: every existing
-// immutable exact leaf remains referenced, only the newly built physical index
-// receives a leaf, and aliases reuse the complete old root. This makes index
-// creation write amplification proportional to the new index, independent of
-// how many indexes the collection already has.
+// immutable exact leaf set and catalog remains referenced, only the newly built
+// physical index receives cutter-produced leaves and a catalog, and aliases
+// reuse the complete old root. This makes index creation write amplification
+// proportional to the new index, independent of how many indexes the
+// collection already has.
 func (c *Collection) stageOnlineExactRootLocked(
 	tx *storeio.WriteTransaction,
 	state *fileStoreState,
@@ -927,37 +946,47 @@ func (c *Collection) stageOnlineExactRootLocked(
 		}
 	}
 
-	leafRefs := make([]storeio.PageRef, len(candidate.indexes))
+	rootEntries := make(
+		[]storeio.PrimaryExactRootEntry, len(candidate.indexes),
+	)
 	for candidateID, index := range candidate.indexes {
 		if uint32(candidateID) == targetID {
-			if !prepared.epoch.exact[candidateID].present {
+			resident := &prepared.epoch.exact[candidateID]
+			if !resident.present() {
+				resident.catalog = resident.catalog[:0]
 				continue
 			}
-			encoded := prepared.epoch.exact[candidateID].encoded
-			extent, ok := primaryExactExtent(
-				len(encoded)+storeio.PageHeaderSize+storeio.PageTrailerSize,
-				uint32(c.options.PageSize), uint32(c.options.MaxPageSize),
+			staged := make(
+				[]primaryExactStagedLeaf, 0, len(resident.leaves),
 			)
-			if !ok {
-				return storeio.PageRef{}, fmt.Errorf(
-					"%w: ordered-primary exact term leaf exceeds MaxPageSize",
-					ErrPrimaryCutoverUnsupported,
+			for leafAt := range resident.leaves {
+				leaf := &resident.leaves[leafAt]
+				ref, err := stagePrimaryExactLeafPage(
+					tx, leaf.encoded, uint32(c.options.PageSize),
+					uint32(c.options.MaxPageSize),
 				)
+				if err != nil {
+					return storeio.PageRef{}, err
+				}
+				leaf.ref = ref
+				staged = append(staged, primaryExactStagedLeaf{
+					ref: ref, firstKey: leaf.firstKey,
+					firstTile: leaf.firstTile, piece: leaf.piece,
+					runCut: leaf.runCut,
+				})
 			}
-			page, err := tx.Allocate(storeio.PagePrimaryExactLeaf, extent, 0)
+			catalogRef, pages, err := stagePrimaryExactCatalog(
+				tx, uint32(c.options.PageSize),
+				uint32(c.options.MaxPageSize), staged,
+				resident.catalog[:0],
+			)
 			if err != nil {
 				return storeio.PageRef{}, err
 			}
-			if _, err := storeio.EncodePrimaryExactLeafPage(
-				page.Bytes(), c.storeID, generation,
-				page.Ref().LogicalID, encoded,
-			); err != nil {
-				return storeio.PageRef{}, err
+			resident.catalog = pages
+			rootEntries[candidateID] = storeio.PrimaryExactRootEntry{
+				Catalog: catalogRef, LeafCount: uint32(len(staged)),
 			}
-			if err := page.Stage(); err != nil {
-				return storeio.PageRef{}, err
-			}
-			leafRefs[candidateID] = page.Ref()
 			continue
 		}
 
@@ -965,11 +994,11 @@ func (c *Collection) stageOnlineExactRootLocked(
 		if oldID < 0 || oldID >= oldRoot.Len() {
 			return storeio.PageRef{}, storeio.ErrPrimaryExactIndexCorrupt
 		}
-		ref, ok := oldRoot.Leaf(uint32(oldID))
+		entry, ok := oldRoot.Entry(uint32(oldID))
 		if !ok {
 			return storeio.PageRef{}, storeio.ErrPrimaryExactIndexCorrupt
 		}
-		leafRefs[candidateID] = ref
+		rootEntries[candidateID] = entry
 	}
 
 	rootPage, err := tx.Allocate(
@@ -980,7 +1009,7 @@ func (c *Collection) stageOnlineExactRootLocked(
 	}
 	if _, err := storeio.EncodePrimaryExactRootPage(
 		rootPage.Bytes(), c.storeID, generation,
-		rootPage.Ref().LogicalID, leafRefs,
+		rootPage.Ref().LogicalID, rootEntries,
 	); err != nil {
 		return storeio.PageRef{}, err
 	}

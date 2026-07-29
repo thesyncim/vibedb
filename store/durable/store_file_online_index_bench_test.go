@@ -98,9 +98,10 @@ func BenchmarkOnlineCreateIndex(b *testing.B) {
 						_ = file.Close()
 						b.Fatal(buildErr)
 					}
-					indexBytes = int64(
-						len(collection.primaryEpoch.exact[0].encoded),
-					)
+					indexBytes = 0
+					for _, leaf := range collection.primaryEpoch.exact[0].leaves {
+						indexBytes += int64(len(leaf.encoded))
+					}
 					if err := collection.Close(); err != nil {
 						_ = file.Close()
 						b.Fatal(err)
