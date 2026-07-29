@@ -43,6 +43,13 @@ const (
 	// document too large to co-locate) falls back to an adaptive raw leaf, since
 	// readers dispatch per leaf on the class byte.
 	PrimaryLeafCompact
+	// PrimaryLeafUnified stages every leaf as the class-5 unified canonical
+	// template-row codec through the single packing planner of the unified-leaf
+	// design §3.6: one memoized fit search over the {4..64 KiB} extents, ≤ 256
+	// rows, wide-class cuckoo placement, no raw fallback — a single-row unified
+	// leaf is legal (one trivial row), so the planner has exactly one output
+	// shape.
+	PrimaryLeafUnified
 )
 
 const (
@@ -98,11 +105,11 @@ func ShortestPrimaryFence(dst, leftMax, rightMin []byte) ([]byte, error) {
 
 // PrimaryGraphBuildStats reports how many leaves the bulk builder staged in
 // each leaf class. LeavesByClass is indexed by CommonPrimaryLeafClass value
-// (1 narrow, 2 wide, 3 template-columnar, 4 compact); index 0 is unused. It
-// exists so a caller can assert the adopted class mix deterministically without
-// re-reading the durable graph.
+// (1 narrow, 2 wide, 3 template-columnar, 4 compact, 5 unified); index 0 is
+// unused. It exists so a caller can assert the adopted class mix
+// deterministically without re-reading the durable graph.
 type PrimaryGraphBuildStats struct {
-	LeavesByClass [5]int
+	LeavesByClass [6]int
 }
 
 // BuildPrimaryGraph deterministically stages one complete ordered primary
@@ -229,7 +236,7 @@ func buildPrimaryGraphPlaced(
 	if len(policy) == 1 {
 		selected = policy[0]
 	}
-	if selected > PrimaryLeafCompact {
+	if selected > PrimaryLeafUnified {
 		return PageRef{}, stats, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
 	}
 	for at := range records {
@@ -281,7 +288,7 @@ func PrimaryGraphPageCount(
 	if len(policy) == 1 {
 		selected = policy[0]
 	}
-	if selected > PrimaryLeafCompact {
+	if selected > PrimaryLeafUnified {
 		return 0, fmt.Errorf("%w: primary leaf policy", ErrInvalidWrite)
 	}
 	for at := range records {
@@ -348,6 +355,9 @@ func planPrimaryLeaves(
 ) ([]primaryLeafPlan, error) {
 	if policy == PrimaryLeafCompact {
 		return planCompactPrimaryLeaves(tx, records)
+	}
+	if policy == PrimaryLeafUnified {
+		return planUnifiedPrimaryLeaves(tx, records)
 	}
 	plans := make([]primaryLeafPlan, 0,
 		(len(records)+CommonPrimaryLeafNarrowLive-1)/CommonPrimaryLeafNarrowLive)
@@ -614,6 +624,42 @@ func planCompactLeaf(
 	return bestCount, bestExtent, nil
 }
 
+// planUnifiedPrimaryLeaves packs records into class-5 unified leaves through
+// the single packing planner (unified-leaf design §3.6). Unlike the compact
+// planner it has no raw-leaf fallback: a run that shares no shape degrades to
+// trivial rows inside the same codec, and a single-row unified leaf is legal,
+// so the planner has exactly one output shape.
+func planUnifiedPrimaryLeaves(
+	tx *WriteTransaction,
+	records []PrimaryGraphRecord,
+) ([]primaryLeafPlan, error) {
+	var plans []primaryLeafPlan
+	builder := NewUnifiedPrimaryLeafBuilder()
+	window := make([]CommonPrimaryLeafRecord, 0, CommonPrimaryLeafWideSlots)
+	for first := 0; first < len(records); {
+		hi := min(CommonPrimaryLeafWideSlots, len(records)-first)
+		window = window[:0]
+		for at := range hi {
+			window = append(window, CommonPrimaryLeafRecord{
+				Key:   records[first+at].Key,
+				Value: CommonPrimaryLeafValue{Inline: records[first+at].Value},
+			})
+		}
+		count, extent, err := planUnifiedLeaf(builder, tx.options.StoreID, window)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, primaryLeafPlan{
+			first: first, last: first + count,
+			class:   CommonPrimaryLeafUnified,
+			records: append([]CommonPrimaryLeafRecord(nil), window[:count]...),
+			extent:  extent,
+		})
+		first += count
+	}
+	return plans, nil
+}
+
 // planTemplateLeafCount returns the largest number of records from first that a
 // template-columnar leaf should hold: the most that fit one 4 KiB template page,
 // capped at the raw wide-leaf capacity (so the leaf can be de-templated back for
@@ -769,6 +815,7 @@ func buildPrimaryLeaves(
 		AllocationQuantum: tx.options.PageSize,
 	}
 	var compactBuilder *CompactPrimaryLeafBuilder
+	var unifiedBuilder *UnifiedPrimaryLeafBuilder
 	for rank := range plans {
 		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
 		localID := uint32(rank % TabletLocalIdentityLocalCount)
@@ -781,7 +828,7 @@ func buildPrimaryLeaves(
 		switch plans[rank].class {
 		case CommonPrimaryLeafWide:
 			pageSize = CommonPrimaryLeafWideBytes
-		case CommonPrimaryLeafCompact:
+		case CommonPrimaryLeafCompact, CommonPrimaryLeafUnified:
 			pageSize = uint32(plans[rank].extent)
 		}
 		page, err := tx.Allocate(PagePrimaryLeaf, pageSize, logicalID)
@@ -806,6 +853,16 @@ func buildPrimaryLeaves(
 			}
 			if _, err := EncodeCommonPrimaryCompactLeaf(
 				page.Bytes(), leafHeader, plans[rank].records, bounds, compactBuilder,
+			); err != nil {
+				return nil, err
+			}
+		case CommonPrimaryLeafUnified:
+			if unifiedBuilder == nil {
+				unifiedBuilder = NewUnifiedPrimaryLeafBuilder()
+			}
+			if _, err := EncodeCommonPrimaryUnifiedLeaf(
+				page.Bytes(), leafHeader, tx.options.StoreID,
+				plans[rank].records, bounds, unifiedBuilder,
 			); err != nil {
 				return nil, err
 			}
@@ -857,6 +914,26 @@ func recordPrimaryPlacements(
 		for at := plan.first; at < plan.last; at++ {
 			placements[at] = PrimaryGraphPlacement{
 				Bucket: bucket, Slot: uint8(at - plan.first),
+			}
+		}
+		return nil
+	}
+	if plan.class == CommonPrimaryLeafUnified {
+		// A unified leaf's posting-stable slot is the envelope's stable cuckoo
+		// hash slot — the one slot discipline of the unified-leaf design §3.1 —
+		// so placements resolve from the encoded slot tables exactly as a later
+		// posting enumeration recovers them.
+		view, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
+		if !ok {
+			return fmt.Errorf("%w: unified placement view", ErrInvalidWrite)
+		}
+		slots, slotsOK := view.env.rankSlots()
+		if !slotsOK {
+			return fmt.Errorf("%w: unified placement slots", ErrInvalidWrite)
+		}
+		for at := plan.first; at < plan.last; at++ {
+			placements[at] = PrimaryGraphPlacement{
+				Bucket: bucket, Slot: slots[at-plan.first],
 			}
 		}
 		return nil

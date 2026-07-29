@@ -235,6 +235,17 @@ type Options struct {
 	// produce the verbatim one (a compact leaf de-compacts on its first
 	// mutation).
 	DocumentFormat DocumentFormat
+	// UnifiedLeaves routes a bulk build (CreateFromPrimary) to the class-5
+	// unified canonical template-row codec (docs/design/unified-leaf-format.md
+	// §3.1): documents are stored — and therefore returned by every read — in
+	// their vibejson canonical form (§3.2: object members sorted by decoded
+	// key, no interstitial whitespace, escapes normalized, number spellings
+	// preserved), with per-leaf shape templates, a bounded value dictionary,
+	// and typed token streams replacing the raw value bytes. It is mutually
+	// exclusive with DocumentFormatCompact. In this phase mutations to a
+	// unified leaf route through the existing structural rewrite path, which
+	// re-encodes the touched leaf's rows into raw leaves (the §11 U1 row).
+	UnifiedLeaves bool
 
 	// PageSize is the base page of the ordered primary graph. It must be 4096:
 	// every tree, root, directory, and metadata page is exactly one base page.
@@ -592,6 +603,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		)
 	}
 	if o.DocumentFormat > DocumentFormatCompact ||
+		o.UnifiedLeaves && o.DocumentFormat != DocumentFormatVerbatim ||
 		o.Backend > BackendIOUring || o.ReadMode > ReadDirectRequire ||
 		o.WriteMode > WriteDirectRequire ||
 		o.Durability > DurabilityBufferedVisible ||

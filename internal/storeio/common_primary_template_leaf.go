@@ -292,6 +292,26 @@ func AdmittedPrimaryLeafForMutation(
 			return CommonPrimaryLeafView{}, false, err
 		}
 		generation = cv.Header().Generation
+	case CommonPrimaryLeafUnified:
+		// U1-phase behavior of the unified-leaf design (§11 phase table):
+		// mutations to a class-5 leaf route through this existing structural
+		// rewrite — every row renders to its canonical bytes and the rows
+		// re-encode into a raw envelope the mutation path already handles. The
+		// unified planner caps a leaf's rows at what a 64 KiB raw wide envelope
+		// can carry, so the escalation loop below always terminates with a fit.
+		uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, seed, bucket, bounds)
+		if !ok {
+			return CommonPrimaryLeafView{}, false, fmt.Errorf(
+				"%w: unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		detemplateEvents.Add(1)
+		var err error
+		records, _, err = uv.RenderRecords(nil, nil)
+		if err != nil {
+			return CommonPrimaryLeafView{}, false, err
+		}
+		generation = uv.Header().Generation
 	default:
 		return AdmittedCommonPrimaryLeaf(page, seed, bucket, bounds), false, nil
 	}
@@ -309,6 +329,13 @@ func AdmittedPrimaryLeafForMutation(
 		{CommonPrimaryLeafWide, 32 << 10},
 		{CommonPrimaryLeafWide, 64 << 10},
 	} {
+		// A unified leaf can pack more rows (≤ 256) than the narrow class can
+		// hold at all (217 slots); placement reports that impossibility as an
+		// invalid-write, not as NeedsWide, so skip undersized classes here
+		// rather than aborting the whole escalation.
+		if len(records) > attempt.class.slots() {
+			continue
+		}
 		if placeErr := PlaceCommonPrimaryLeafRecords(
 			attempt.class, seed, records,
 		); placeErr != nil {
