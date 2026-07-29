@@ -614,9 +614,13 @@ func (p *Parser) parseFrom() error {
 // parseJoin parses one JOIN clause, reporting true when the next token does not
 // open one.
 func (p *Parser) parseJoin() (bool, error) {
+	join := JoinInner
 	switch {
-	case p.atKeyword(kwLeft), p.atKeyword(kwRight), p.atKeyword(kwFull), p.atKeyword(kwOuter):
-		return false, p.errHere("outer joins are not supported: the engine joins by matching a key on both sides, which has no row to emit for a non-match")
+	case p.acceptKeyword(kwLeft):
+		join = JoinLeft
+		p.acceptKeyword(kwOuter)
+	case p.atKeyword(kwRight), p.atKeyword(kwFull), p.atKeyword(kwOuter):
+		return false, p.errHere("RIGHT and FULL outer joins are not supported; write a LEFT JOIN with the preserved collection first")
 	case p.atKeyword(kwCross):
 		return false, p.errHere("CROSS JOIN is not supported: the engine has no unrestricted product")
 	case p.atKeyword(kwNatural):
@@ -625,11 +629,16 @@ func (p *Parser) parseJoin() (bool, error) {
 	if p.tok.kind == tokComma {
 		return false, p.errHere("comma-separated FROM items are not supported; write an explicit JOIN ... ON")
 	}
-	p.acceptKeyword(kwInner)
+	if join == JoinInner {
+		p.acceptKeyword(kwInner)
+	}
 	if !p.acceptKeyword(kwJoin) {
+		if join == JoinLeft {
+			return false, p.errHere("expected JOIN after LEFT")
+		}
 		return true, nil
 	}
-	ref, err := p.parseTableRef(JoinInner)
+	ref, err := p.parseTableRef(join)
 	if err != nil {
 		return false, err
 	}

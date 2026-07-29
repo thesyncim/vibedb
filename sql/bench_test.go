@@ -11,6 +11,8 @@ const (
 	benchFiltered = `SELECT name, score FROM docs WHERE active = TRUE AND score >= 10 AND tier <> 'free'`
 	benchJoin     = `SELECT u.name, o.total FROM users AS u JOIN orders AS o ON u.id = o.user_id ` +
 		`WHERE o.total > ? AND u.address.city = 'Lisbon'`
+	benchLeftJoin = `SELECT u.name, o.total FROM users AS u LEFT JOIN orders AS o ON u.id = o.user_id ` +
+		`WHERE u.address.city = 'Lisbon'`
 	benchGrouped = `SELECT team, COUNT(*), SUM(score) AS total FROM docs WHERE tier IN ('pro', 'team') ` +
 		`GROUP BY team HAVING SUM(score) > 100 ORDER BY team DESC LIMIT 10`
 	benchRich = `SELECT u.profile.name FROM users u WHERE u.meta @> {"tier": "pro"} ` +

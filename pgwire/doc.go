@@ -128,7 +128,7 @@
 //     FETCH), SQL-level PREPARE/EXECUTE, and replication.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
-//   - The SQL constructs the dialect itself refuses — subqueries, outer joins,
+//   - The SQL constructs the dialect itself refuses — subqueries, right/full outer joins,
 //     LIKE, CASE, CAST, arithmetic, DISTINCT, set operations, window functions,
 //     and scalar functions. Each is refused by the parser with a message naming
 //     the missing capability and a position;

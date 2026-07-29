@@ -360,6 +360,11 @@ func TestRangeVariableResolution(t *testing.T) {
 			want: `select path(0:name) from users/u orders/o join(0:id=1:user_id)`,
 		},
 		{
+			name: "a left outer join records its preserving operator",
+			src:  `SELECT u.name, o.total FROM users u LEFT OUTER JOIN orders o ON o.user_id = u.id`,
+			want: `select path(0:name) path(1:total) from users/u orders/o left-join(0:id=1:user_id)`,
+		},
+		{
 			name: "two joins chain against earlier sources",
 			src: `SELECT a.x FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k ` +
 				`WHERE c.z = 1`,

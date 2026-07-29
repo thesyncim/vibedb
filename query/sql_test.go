@@ -954,6 +954,38 @@ func TestSQLJoinThreeValuedLogicMatchesKleene(t *testing.T) {
 		checked, len(sqlJoinDriving), len(sqlJoinJoined))
 }
 
+func TestSQLLeftJoinNullExtendsUnmatchedRows(t *testing.T) {
+	db, driving, joined := sqlJoinDatabase(t)
+	for _, predicate := range []string{"", "d.a >= 2", "d.k IS NULL"} {
+		src := `SELECT d.a, o.b FROM d LEFT JOIN j o ON o.fk = d.k`
+		if predicate != "" {
+			src += ` WHERE ` + predicate
+		}
+		stmt, err := PrepareStatement(src)
+		if err != nil {
+			t.Fatalf("PrepareStatement(%q): %v", src, err)
+		}
+		tree, err := sqlast.Parse(src)
+		if err != nil {
+			t.Fatalf("reference parse(%q): %v", src, err)
+		}
+		got := runStatement(t, stmt, FromDatabase(db.Snapshot(), "d"))
+		want := joinKleeneReference(tree, driving, joined, nil)
+		if got != want {
+			t.Fatalf("WHERE %s:\n got %s\nwant %s", predicate, got, want)
+		}
+	}
+}
+
+func TestSQLLeftJoinRejectsNullableSideWhere(t *testing.T) {
+	_, err := PrepareStatement(
+		`SELECT d.a, o.b FROM d LEFT JOIN j o ON o.fk = d.k WHERE o.b IS NULL`,
+	)
+	if err == nil || !strings.Contains(err.Error(), "nullable side of a LEFT JOIN") {
+		t.Fatalf("PrepareStatement nullable-side WHERE = %v", err)
+	}
+}
+
 // joinKleeneReference renders the rows the statement must produce, by nested
 // loop over the two decoded collections with the predicate applied to each pair
 // under Kleene's tables.
@@ -974,14 +1006,13 @@ func joinKleeneReference(tree *sqlast.SelectStmt, driving, joined []any, args []
 	// the order a nested loop produces without sorting anything.
 	for _, outer := range driving {
 		key := refClassify(refResolve("k", outer))
-		if key.kind == kindNull {
-			continue // a null or absent join key matches nothing
-		}
+		matched := false
 		for _, inner := range joined {
 			partner := refClassify(refResolve("fk", inner))
-			if partner.kind == kindNull || refCompare(key, partner) != 0 {
+			if key.kind == kindNull || partner.kind == kindNull || refCompare(key, partner) != 0 {
 				continue
 			}
+			matched = true
 			pair := [2]any{outer, inner}
 			if tree.Where != nil && joinRefTri(tree.Where, pair, args) != triTrue {
 				continue
@@ -994,6 +1025,20 @@ func joinKleeneReference(tree *sqlast.SelectStmt, driving, joined []any, args []
 			}
 			b.WriteByte('\n')
 		}
+		if matched || tree.From[1].Join != sqlast.JoinLeft {
+			continue
+		}
+		pair := [2]any{outer, nil}
+		if tree.Where != nil && joinRefTri(tree.Where, pair, args) != triTrue {
+			continue
+		}
+		for i := range tree.Columns {
+			path := tree.Columns[i].Path
+			cell := refCellFromScalar(
+				refClassify(refResolve(path.Spec(), pair[path.Source])))
+			fmt.Fprintf(&b, "%d:%s|", cell.kind, refCellJSON(cell))
+		}
+		b.WriteByte('\n')
 	}
 	return b.String()
 }

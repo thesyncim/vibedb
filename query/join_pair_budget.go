@@ -168,6 +168,9 @@ func joinPairBytesPerRow(p *plan, join *planJoin) int64 {
 	// values, and the one reused numeric RawValue gather. Decoded escaped text
 	// is charged at its exact size by admitText before that arena grows.
 	bytes := int64(unsafe.Sizeof(int(0))) * 2
+	if join.left && (len(join.innerCols) != 0 || len(join.innerNums) != 0) {
+		bytes += int64(unsafe.Sizeof(int(0)))
+	}
 	bytes += int64(unsafe.Sizeof(store.Location{})) * 2
 	bytes += int64(len(p.valuePaths)+len(p.numPaths)) * int64(unsafe.Sizeof(scalar{}))
 	rawColumns := len(p.lateCols) + len(join.innerCols)

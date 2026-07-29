@@ -534,7 +534,14 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 		if p.valuePaths[i].join != joinPathOuter {
 			continue
 		}
-		if p.where.readsColumn(i) {
+		joinKey := false
+		for j := range p.joins {
+			if p.joins[j].outerPath == i {
+				joinKey = true
+				break
+			}
+		}
+		if p.where.readsColumn(i) || joinKey {
 			p.filterCols = append(p.filterCols, i)
 		} else {
 			p.lateCols = append(p.lateCols, i)
@@ -624,7 +631,7 @@ func (c *compiler) planJoinColumns(p *plan) error {
 			}
 		}
 		reads := len(j.innerCols) != 0 || len(j.innerNums) != 0
-		j.fanOut = j.aliased && (reads || j.innerPath != joinPrimaryKey)
+		j.fanOut = j.left || (j.aliased && (reads || j.innerPath != joinPrimaryKey))
 	}
 	fanOut := -1
 	for i := range p.joins {

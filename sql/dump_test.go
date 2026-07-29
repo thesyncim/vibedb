@@ -95,7 +95,11 @@ func dumpTable(b *strings.Builder, t *TableRef) {
 		fmt.Fprintf(b, "/%s", t.Alias)
 	}
 	if t.On != nil {
-		b.WriteString(" join(")
+		if t.Join == JoinLeft {
+			b.WriteString(" left-join(")
+		} else {
+			b.WriteString(" join(")
+		}
 		dumpPath(b, t.On.Left)
 		b.WriteByte('=')
 		dumpPath(b, t.On.Right)

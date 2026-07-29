@@ -105,7 +105,9 @@ type Workspace struct {
 	pairOuterScan []int
 	pairOuterRows []store.Location
 	pairInner     []store.Location
+	pairInnerPair []int
 	pairValues    [][]scalar
+	pairNums      [][]scalar
 
 	// pool holds the parked filter-phase workers, and identity is the row
 	// permutation a segment worker addresses its share of an uncompacted scan
@@ -202,6 +204,10 @@ func (w *Workspace) clearBorrowedViews() {
 	for i := range w.pairValues {
 		clear(w.pairValues[i])
 		w.pairValues[i] = w.pairValues[i][:0]
+	}
+	for i := range w.pairNums {
+		clear(w.pairNums[i])
+		w.pairNums[i] = w.pairNums[i][:0]
 	}
 	for i := range w.groups {
 		clear(w.groups[i].scalars)
@@ -456,7 +462,7 @@ func (w *Workspace) collectJoinStats(p *plan, stats *ExecStats) {
 		return
 	}
 	if p.fanOutJoin >= 0 {
-		stats.JoinPairs = uint64(len(w.pairInner))
+		stats.JoinPairs = uint64(len(w.pairOuterScan))
 	}
 	for i := range p.joins {
 		slot := p.joins[i].slot
@@ -663,6 +669,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	// on the way — cannot leave the previous execution's pair count to be read
 	// back as this one's.
 	w.pairInner = w.pairInner[:0]
+	w.pairInnerPair = w.pairInnerPair[:0]
 	w.interner.Reset()
 	if p.fanOutJoin < 0 {
 		if handled, err := p.runDirectSnapshotAggregate(dst, snapshot, w); err != nil {
@@ -739,7 +746,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	if compact {
 		ctx.rows = len(w.storeRows)
 	}
-	if p.where == nil {
+	if p.where == nil && p.fanOutJoin < 0 {
 		if err := ctx.extractSnapshotValues(p, snapshot, p.lateCols, w.storeRows, compact, &w.lateText, w); err != nil {
 			return err
 		}
@@ -747,6 +754,24 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 			return err
 		}
 		selected, err := p.selectRows(ctx, nil, compact, w)
+		if err != nil {
+			return err
+		}
+		return p.emit(dst, ctx, selected, w)
+	}
+	if p.where == nil {
+		if err := ctx.extractSnapshotValues(
+			p, snapshot, p.filterCols, w.storeRows, compact, &w.text, w,
+		); err != nil {
+			return err
+		}
+		selected, err := p.selectRows(ctx, nil, compact, w)
+		if err != nil {
+			return err
+		}
+		selected, err = ctx.materializeFanOut(
+			p, snapshot, catalog, selected, compact, w,
+		)
 		if err != nil {
 			return err
 		}
@@ -1798,47 +1823,80 @@ func growCap(old, need int) int {
 // plan passes no limit, because it has to see every pair before it knows which
 // ones survive.
 func (ctx *execCtx) expandPairs(p *plan, j *planJoin, b *joinBinding, selected []int, addresses []store.Location, limit int, w *Workspace) error {
-	outerScan, outerRows, inner := w.pairOuterScan[:0], w.pairOuterRows[:0], w.pairInner[:0]
+	outerScan, outerRows := w.pairOuterScan[:0], w.pairOuterRows[:0]
+	inner, innerPair := w.pairInner[:0], w.pairInnerPair[:0]
 	joinCol := j.outerPath
+	mapInner := j.left && (len(j.innerCols) != 0 || len(j.innerNums) != 0)
 	maxPairs := w.joinPairBudget.maxPairs()
 	if limit > 0 && (maxPairs < 0 || limit < maxPairs) {
 		maxPairs = limit
 	}
 	for i, row := range selected {
 		if err := cancellationCheckpoint(w.cancel, i); err != nil {
-			w.pairOuterScan, w.pairOuterRows, w.pairInner =
-				outerScan, outerRows, inner
+			w.pairOuterScan, w.pairOuterRows = outerScan, outerRows
+			w.pairInner, w.pairInnerPair = inner, innerPair
 			return err
+		}
+		remaining := -1
+		if maxPairs >= 0 {
+			remaining = maxPairs - len(outerScan)
+			if remaining <= 0 {
+				if limit > 0 && len(outerScan) >= limit {
+					break
+				}
+				w.pairOuterScan, w.pairOuterRows = outerScan, outerRows
+				w.pairInner, w.pairInnerPair = inner, innerPair
+				w.joinPairBudget.commitPairs(len(outerScan))
+				return w.joinPairBudget.pairError(len(outerScan) + 1)
+			}
 		}
 		var (
 			found    int
 			overflow bool
 		)
+		innerLimit := -1
+		if remaining >= 0 {
+			innerLimit = len(inner) + remaining
+		}
 		inner, found, overflow = b.build.appendMatches(
-			inner, ctx.values[joinCol][row], maxPairs,
+			inner, ctx.values[joinCol][row], innerLimit,
 		)
-		for range found {
+		pairAt := len(outerScan)
+		if mapInner {
+			for range found {
+				outerScan = append(outerScan, row)
+				outerRows = append(outerRows, addresses[i])
+				innerPair = append(innerPair, pairAt)
+				pairAt++
+			}
+		} else {
+			for range found {
+				outerScan = append(outerScan, row)
+				outerRows = append(outerRows, addresses[i])
+			}
+		}
+		if found == 0 && j.left {
 			outerScan = append(outerScan, row)
 			outerRows = append(outerRows, addresses[i])
 		}
 		if overflow {
-			if limit > 0 && len(inner) >= limit {
-				outerScan, outerRows, inner =
-					outerScan[:limit], outerRows[:limit], inner[:limit]
+			if limit > 0 && len(outerScan) >= limit {
+				outerScan, outerRows = outerScan[:limit], outerRows[:limit]
 				break
 			}
-			w.pairOuterScan, w.pairOuterRows, w.pairInner =
-				outerScan, outerRows, inner
-			w.joinPairBudget.commitPairs(len(inner))
-			return w.joinPairBudget.pairError(len(inner) + 1)
+			w.pairOuterScan, w.pairOuterRows = outerScan, outerRows
+			w.pairInner, w.pairInnerPair = inner, innerPair
+			w.joinPairBudget.commitPairs(len(outerScan))
+			return w.joinPairBudget.pairError(len(outerScan) + 1)
 		}
-		if limit > 0 && len(inner) >= limit {
-			outerScan, outerRows, inner = outerScan[:limit], outerRows[:limit], inner[:limit]
+		if limit > 0 && len(outerScan) >= limit {
+			outerScan, outerRows = outerScan[:limit], outerRows[:limit]
 			break
 		}
 	}
-	w.pairOuterScan, w.pairOuterRows, w.pairInner = outerScan, outerRows, inner
-	w.joinPairBudget.commitPairs(len(inner))
+	w.pairOuterScan, w.pairOuterRows = outerScan, outerRows
+	w.pairInner, w.pairInnerPair = inner, innerPair
+	w.joinPairBudget.commitPairs(len(outerScan))
 	return nil
 }
 
@@ -1909,6 +1967,7 @@ func (ctx *execCtx) materializeFanOut(p *plan, snapshot store.Snapshot, catalog 
 		w.pairOuterScan = w.pairOuterScan[:0]
 		w.pairOuterRows = w.pairOuterRows[:0]
 		w.pairInner = w.pairInner[:0]
+		w.pairInnerPair = w.pairInnerPair[:0]
 		ctx.rows = 0
 		w.selected = w.selected[:0]
 		return w.selected, nil
@@ -1946,7 +2005,37 @@ func (ctx *execCtx) materializeFanOut(p *plan, snapshot store.Snapshot, catalog 
 	); err != nil {
 		return nil, err
 	}
+	if j.left {
+		ctx.nullExtendJoined(p, j, w)
+	}
 	return ctx.spreadOnto(p, w.pairOuterScan, w), nil
+}
+
+// nullExtendJoined scatters the matched joined columns onto the full LEFT JOIN
+// pair space. Positions without a build-side row remain the zero scalar, which
+// is the executor's NULL representation.
+func (ctx *execCtx) nullExtendJoined(p *plan, j *planJoin, w *Workspace) {
+	pairs := len(w.pairOuterScan)
+	w.pairValues = resize(w.pairValues, len(ctx.values))
+	for _, col := range j.innerCols {
+		src := ctx.values[col]
+		dst := resize(w.pairValues[col], pairs)
+		clear(dst)
+		for match, pair := range w.pairInnerPair {
+			dst[pair] = src[match]
+		}
+		ctx.values[col], w.pairValues[col] = dst, src
+	}
+	w.pairNums = resize(w.pairNums, len(ctx.nums))
+	for _, col := range j.innerNums {
+		src := ctx.nums[col].vals
+		dst := resize(w.pairNums[col], pairs)
+		clear(dst)
+		for match, pair := range w.pairInnerPair {
+			dst[pair] = src[match]
+		}
+		ctx.nums[col].vals, w.pairNums[col] = dst, src
+	}
 }
 
 // spreadOnto rewrites the driving collection's filter columns so that they are

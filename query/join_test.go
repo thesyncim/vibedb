@@ -1221,13 +1221,14 @@ func TestJoinLookupTransientMemoryDoesNotScaleWithOuterRows(t *testing.T) {
 // Every JOIN lowers with its alias declared, so the operator is SQL's inner
 // join and the joined collection's columns are readable. What remains refused
 // is what the engine has no plan for: a chained join, a second fanning clause,
-// and an outer join, which the parser refuses by name before lowering sees it.
+// while LEFT JOIN uses the same one-expansion bound.
 func TestJoinInTheSQLSubset(t *testing.T) {
 	for _, src := range []string{
 		`SELECT t.id, u.b FROM t JOIN u ON u.b = t.a`,
 		`SELECT t.id, u.b FROM t JOIN u ON u."$key" = t.a`,
 		`SELECT t.id FROM t JOIN u ON u.b = t.a WHERE u.tier = 'pro'`,
 		`SELECT t.id, SUM(u.n) FROM t JOIN u ON u.b = t.a GROUP BY t.id`,
+		`SELECT t.id, u.b FROM t LEFT JOIN u ON u.b = t.a`,
 	} {
 		if _, err := PrepareStatement(src); err != nil {
 			t.Fatalf("%q must lower to an inner join: %v", src, err)
@@ -1241,7 +1242,6 @@ func TestJoinInTheSQLSubset(t *testing.T) {
 			"chained join"},
 		{`SELECT t.id, u.b, v.c FROM t JOIN u ON u.b = t.a JOIN v ON v.c = t.a`,
 			"only once"},
-		{`SELECT t.id FROM t LEFT JOIN u ON u.b = t.a`, "join"},
 		{`SELECT t.id, u.b FROM t JOIN u ON u.b = t.a WHERE t.x = 1 OR u.y = 2`,
 			"two collections"},
 	} {
@@ -2457,6 +2457,8 @@ func TestFanOutRunIntoSteadyAllocs(t *testing.T) {
 		queries := map[string]*Query{
 			"projection": Select(Path("id"), Path("o.seat")).
 				Join(JoinOn("orders", "id", "user_id").As("o")),
+			"left projection": Select(Path("id"), Path("o.seat")).
+				Join(LeftJoinOn("orders", "id", "user_id").As("o")),
 			"joined only": Select(Path("o.seat")).
 				Join(JoinOn("orders", "id", "user_id").As("o")),
 			"driving filter beside the join": Select(Path("id"), Path("o.seat")).

@@ -226,9 +226,10 @@ remain correct full scans; an index is an optimization, not a requirement for a
 WHERE clause. Sorting, grouping, aggregation, HAVING, OFFSET, and final
 projection remain query-engine operations.
 
-## Inner joins
+## Inner and left joins
 
-The SQL join is a natural declared-field inner equi-join:
+The SQL join is a declared-field equi-join. Both `INNER JOIN` and
+`LEFT [OUTER] JOIN` are supported:
 
 ```sql
 SELECT u.id, o.total
@@ -237,6 +238,11 @@ INNER JOIN orders AS o ON u.id = o.user_id
 WHERE o.state = ?
 ORDER BY o.total DESC
 ```
+
+A left join preserves each row from its driving `FROM` table. When no joined
+document matches, every projected field from the joined alias is SQL `NULL`.
+Fan-out remains exact: a driving row with three matches produces three rows,
+while one with no match produces exactly one null-extended row.
 
 The driver captures every participating durable collection in one coherent
 snapshot. All publication gates are held while the generation leases are
@@ -270,10 +276,15 @@ The current relational plan has two explicit join limits:
 - that JOIN must relate the joined table directly to the driving `FROM` table;
   chained joins are rejected.
 
-Only `INNER JOIN ... ON left_path = right_path` is supported. SQL exposes no
+Only inner and left `JOIN ... ON left_path = right_path` are supported. SQL exposes no
 physical storage-key pseudo-column; `"$key"` is an ordinary quoted JSON field.
 Join the tables' declared JSON primary-key fields when relational identity is
 the intended relationship.
+
+The current executor has no post-join predicate phase. A `WHERE` condition over
+the nullable side of a left join is therefore rejected rather than pushed into
+the build side, which would silently change its meaning. Conditions over the
+preserved table remain supported.
 
 Joins inside a transaction use the same bounded heap path over the snapshots
 captured by BEGIN plus that transaction's staged overlay. They preserve
@@ -464,7 +475,7 @@ operation:
 - subqueries, common table expressions, set operations, window functions,
   `DISTINCT`, computed scalar expressions, pattern matching, and user-defined
   functions;
-- outer, cross, natural, `USING`, chained, and multiple fan-out joins;
+- right/full outer, cross, natural, `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, mutation joins,
   mutation `ORDER BY`/`LIMIT`, and `UPDATE`/`DELETE RETURNING`;
 - generated keys, `INSERT ... SELECT`, defaults, upsert/on-conflict forms, and

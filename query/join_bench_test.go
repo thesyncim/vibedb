@@ -548,6 +548,47 @@ func BenchmarkFanOutJoin(b *testing.B) {
 	}
 }
 
+// BenchmarkLeftJoinFanOut measures the exact incremental operator cost against
+// the established inner-join path, both when every driving row matches and
+// when half of them require null extension.
+func BenchmarkLeftJoinFanOut(b *testing.B) {
+	for _, shape := range []struct {
+		name   string
+		orders int
+		users  int
+	}{
+		{name: "all-matched", orders: 20_000, users: 10_000},
+		{name: "half-unmatched", orders: 5_000, users: 10_000},
+	} {
+		db := joinFanOutDatabase(b, shape.orders, shape.users)
+		catalog := db.Snapshot()
+		for _, operator := range []struct {
+			name string
+			join Join
+		}{
+			{name: "inner", join: JoinOn("orders", "id", "user_id").As("o")},
+			{name: "left", join: LeftJoinOn("orders", "id", "user_id").As("o")},
+		} {
+			b.Run(shape.name+"/"+operator.name, func(b *testing.B) {
+				q := Select(Path("id"), Path("o.seat")).Join(operator.join)
+				var e Exec
+				if err := q.RunInto(&e, FromDatabase(catalog, "users")); err != nil {
+					b.Fatal(err)
+				}
+				rows := e.Result.RowCount
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					if err := q.RunInto(&e, FromDatabase(catalog, "users")); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*rows), "ns/output-row")
+			})
+		}
+	}
+}
+
 // BenchmarkFanOutAgainstSemiJoin is the regression guard the planner rule
 // exists for: the same clause and the same collections answered as a filter and
 // as an inner join, at a fan-out ratio of one so both return the same number of

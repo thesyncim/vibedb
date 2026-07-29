@@ -24,6 +24,7 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"simple", benchSimple},
 		{"filtered", benchFiltered},
 		{"join", benchJoin},
+		{"left join", benchLeftJoin},
 		{"grouped aggregate", benchGrouped},
 		{"containment and membership", benchRich},
 	}
@@ -55,7 +56,9 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 // cache does. A per-shape arena that only worked when the same statement
 // repeated would pass the test above and fail here.
 func TestWarmParseOfMixedShapesIsAllocationFree(t *testing.T) {
-	sources := []string{benchSimple, benchFiltered, benchJoin, benchGrouped, benchRich}
+	sources := []string{
+		benchSimple, benchFiltered, benchJoin, benchLeftJoin, benchGrouped, benchRich,
+	}
 	var p Parser
 	var stmt SelectStmt
 	for i := 0; i < 3; i++ {
