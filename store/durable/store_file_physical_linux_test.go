@@ -159,7 +159,7 @@ func TestFileStorePhysicalHundredXMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := reopened.AppendIndexMasks(nil, "nested_group", needle)
+	masks, err := collectionIndexMasks(reopened, nil, "nested_group", needle)
 	if err != nil {
 		t.Fatal(err)
 	}

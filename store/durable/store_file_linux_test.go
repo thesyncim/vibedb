@@ -22,7 +22,7 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 	options := testFileStoreOptions()
 	options.ReadMode = ReadDirectRequire
 	collection, err := Create(file, options)
-	if errors.Is(err, ErrStoreDirectIOUnsupported) {
+	if errors.Is(err, storeio.ErrDirectIOUnsupported) {
 		t.Skipf("test filesystem has no O_DIRECT support: %v", err)
 	}
 	if err != nil {
@@ -31,10 +31,10 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 	if !collection.Stats().DirectReads {
 		t.Fatal("required direct reads were not reported active")
 	}
-	// Large enough that a read-ahead scan has consecutive pages to coalesce and
-	// prefetch. A smaller corpus stopped exercising either once the chunk
-	// directory became only as tall as its chunk count requires, leaving too
-	// few pages for the read-ahead to get ahead of.
+	// Large enough that the ordered-primary scan crosses several pages. That
+	// scan is deliberately serial even through RangeRawReadAheadBuffer: inline
+	// values arrive with the leaves the cursor already reads, so there is no
+	// separate document-extent prefetch lane.
 	const documents = 512
 	for row := range documents {
 		key := fmt.Sprintf("linux:direct:%04d", row)
@@ -72,7 +72,7 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 		t.Fatalf("required direct read-ahead rows = %d, want %d", rows, documents)
 	}
 	if stats := reopened.Stats(); !stats.DirectReads || stats.PageReads == 0 ||
-		stats.PrefetchQueued == 0 || stats.PrefetchHits+stats.CoalescedReads == 0 {
+		stats.PrefetchQueued != 0 {
 		t.Fatalf("required direct stats = %+v", stats)
 	}
 }
@@ -86,7 +86,7 @@ func TestFileStoreRequiredDirectWrites(t *testing.T) {
 	options := testFileStoreOptions()
 	options.WriteMode = WriteDirectRequire
 	collection, err := Create(file, options)
-	if errors.Is(err, ErrStoreDirectIOUnsupported) {
+	if errors.Is(err, storeio.ErrDirectIOUnsupported) {
 		t.Skipf("test filesystem has no O_DIRECT support: %v", err)
 	}
 	if err != nil {
@@ -134,7 +134,7 @@ func TestFileStoreRequiredDirectReadWrite(t *testing.T) {
 	options.ReadMode = ReadDirectRequire
 	options.WriteMode = WriteDirectRequire
 	collection, err := Create(file, options)
-	if errors.Is(err, ErrStoreDirectIOUnsupported) {
+	if errors.Is(err, storeio.ErrDirectIOUnsupported) {
 		t.Skipf("test filesystem has no O_DIRECT support: %v", err)
 	}
 	if err != nil {
@@ -187,7 +187,7 @@ func TestFileStoreDirectReadWriteUnderCachePressure(t *testing.T) {
 	}
 	options.ResidentBytes = int64(2 * normalized.maxTransactionBytes)
 	collection, err := Create(file, options)
-	if errors.Is(err, ErrStoreDirectIOUnsupported) {
+	if errors.Is(err, storeio.ErrDirectIOUnsupported) {
 		t.Skipf("test filesystem has no O_DIRECT support: %v", err)
 	}
 	if err != nil {
@@ -326,7 +326,7 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 	options.MaxPageSize = options.PageSize
 	options.MaxDocumentBytes = options.PageSize
 	collection, err := Create(file, options)
-	if errors.Is(err, ErrStoreDirectIOUnsupported) ||
+	if errors.Is(err, storeio.ErrDirectIOUnsupported) ||
 		errors.Is(err, storeio.ErrUnavailable) ||
 		errors.Is(err, storeio.ErrUnsupported) {
 		t.Skipf("test host cannot provide direct io_uring I/O: %v", err)
@@ -350,7 +350,7 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopened, err := Open(file, options)
-	if errors.Is(err, ErrStoreDirectIOUnsupported) ||
+	if errors.Is(err, storeio.ErrDirectIOUnsupported) ||
 		errors.Is(err, storeio.ErrUnavailable) ||
 		errors.Is(err, storeio.ErrUnsupported) {
 		t.Skipf("test host cannot reopen direct io_uring I/O: %v", err)
