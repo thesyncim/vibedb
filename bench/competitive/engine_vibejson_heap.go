@@ -2,6 +2,7 @@ package competitive
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/query"
@@ -158,7 +159,7 @@ func (v *vibeHeap) Scan() (int, error) {
 		n++
 		return true
 	})
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, nil
 }
 
@@ -173,7 +174,7 @@ func (v *vibeHeap) ScanAllBytes() (int, error) {
 		n++
 		return true
 	})
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, nil
 }
 
@@ -192,9 +193,17 @@ func (v *vibeHeap) Visit(fn func(key string, value []byte) error) error {
 	return ferr
 }
 
-// scanSink defeats dead-store elimination on the scan workloads without
-// costing an atomic or a heap write per document.
-var scanSink byte
+// scanSink defeats dead-store elimination on the scan workloads. Each scan folds
+// its whole per-call XOR accumulator into it exactly once (not once per
+// document), so the atomic is off the per-value path. It must be atomic because
+// a scan workload under -clients=N folds into it from several goroutines at
+// once; its value is never asserted, so a plain read-modify-write would be only
+// a benign accumulator race, but a benign race still trips the detector and the
+// concurrent lanes must run clean.
+var scanSink atomic.Uint64
+
+// foldScanSink folds one scan's accumulator into scanSink race-free.
+func foldScanSink(sink byte) { scanSink.Add(uint64(sink)) }
 
 func (v *vibeHeap) FilterCount(value string) (int, error) {
 	if v.cfg.Indexed {
@@ -242,3 +251,12 @@ func (v *vibeHeap) Close() error {
 	v.snapshotCurrent = false
 	return nil
 }
+
+// Session returns the engine itself. vibejson-heap is the volatile, non-durable
+// label engine and shares a cached snapshot plus a query executor across calls,
+// so it is only safe under a single client; concurrent mutation of the in-memory
+// collection is a store-level property this harness does not assert. No required
+// concurrent lane runs it (the concurrency diagnostics are durable, SQLite, and
+// Badger), and at clients=1 the shared self-session is exactly the engine's own
+// behaviour, preserving single-client parity.
+func (v *vibeHeap) Session(int) EngineSession { return v }

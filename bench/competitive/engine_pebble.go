@@ -149,7 +149,7 @@ func (p *pebbleEngine) Scan() (int, error) {
 		}
 		n++
 	}
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, it.Error()
 }
 
@@ -169,7 +169,7 @@ func (p *pebbleEngine) ScanAllBytes() (int, error) {
 		sink ^= touchAll(v)
 		n++
 	}
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, it.Error()
 }
 
@@ -245,3 +245,9 @@ func (p *pebbleEngine) Close() error {
 	p.cache.Unref()
 	return err
 }
+
+// Session returns the engine itself: *pebble.DB is documented safe for
+// concurrent Get/Set/Delete/NewIter, and this adapter keeps no per-caller
+// scratch (Get closes its value handle inline, the write path holds no cached
+// read handle), so N clients share one handle with nothing to race on.
+func (p *pebbleEngine) Session(int) EngineSession { return p }

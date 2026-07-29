@@ -315,7 +315,7 @@ func (v *vibeDurable) Scan() (int, error) {
 		return nil
 	})
 	v.scratch = scratch
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, err
 }
 
@@ -332,7 +332,7 @@ func (v *vibeDurable) ScanAllBytes() (int, error) {
 		return nil
 	})
 	v.scratch = scratch
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, err
 }
 
@@ -426,4 +426,93 @@ func (v *vibeDurable) Close() error {
 		v.file = nil
 	}
 	return nil
+}
+
+// vibeDurableSession is one client's private view onto the shared durable
+// collection. The collection handle (v.coll) is shared — its public mutation
+// path is serialized under one writer mutex and its readers are lock-free behind
+// the reader-epoch fence, so concurrent Put/Delete/AppendRaw/Snapshot on it are
+// safe by the store's own design. What is NOT safe to share, and is the whole
+// reason this type exists, is the adapter's per-caller scratch: the cached read
+// snapshot (opened lazily, dropped on every write to avoid pinning retired
+// extents) and the decode buffer reused across scans. Both move here so N
+// clients never race on v.snap or v.scratch.
+type vibeDurableSession struct {
+	coll    durableCollection
+	snap    *durable.Snapshot
+	scratch []byte
+}
+
+// snapshot mirrors vibeDurable.snapshot on the session's own slot; see the
+// commentary there for why the write path must not hold one open.
+func (s *vibeDurableSession) snapshot() (*durable.Snapshot, error) {
+	if s.snap != nil {
+		return s.snap, nil
+	}
+	snap, err := s.coll.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	s.snap = snap
+	return snap, nil
+}
+
+func (s *vibeDurableSession) releaseReads() {
+	if s.snap != nil {
+		_ = s.snap.Close()
+		s.snap = nil
+	}
+}
+
+func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
+	out, ok, err := s.coll.AppendRaw(dst, key)
+	if err != nil {
+		return dst, err
+	}
+	if !ok {
+		return dst, fmt.Errorf("missing key %q", key)
+	}
+	return out, nil
+}
+
+func (s *vibeDurableSession) Put(key string, doc []byte) error {
+	s.releaseReads()
+	_, err := s.coll.Put(key, doc)
+	return err
+}
+
+func (s *vibeDurableSession) Upsert(key string, doc []byte) error { return s.Put(key, doc) }
+
+func (s *vibeDurableSession) Delete(key string) error {
+	s.releaseReads()
+	deleted, err := s.coll.Delete(key)
+	if err == nil && !deleted {
+		return fmt.Errorf("missing key %q", key)
+	}
+	return err
+}
+
+func (s *vibeDurableSession) ScanAllBytes() (int, error) {
+	snap, err := s.snapshot()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	var sink byte
+	scratch, err := snap.RangeRawBuffer(s.scratch, func(key, value []byte) error {
+		sink ^= touchAll(value)
+		n++
+		return nil
+	})
+	s.scratch = scratch
+	foldScanSink(sink)
+	return n, err
+}
+
+// Session vends a per-client session over the shared collection. Every session
+// carries its own snapshot slot and scan buffer; the collection itself is
+// shared, which is the point — the concurrent lane measures the store's own
+// writer mutex and reader-epoch fence under N callers.
+func (v *vibeDurable) Session(int) EngineSession {
+	return &vibeDurableSession{coll: v.coll}
 }

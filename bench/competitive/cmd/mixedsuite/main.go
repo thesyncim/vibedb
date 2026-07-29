@@ -49,6 +49,7 @@ type config struct {
 	checkpointMutations int
 	indexed             bool
 	cardinality         string
+	clients             int
 }
 
 type rawRow struct {
@@ -226,6 +227,7 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		checkpoint   = fs.Int("checkpoint-mutations", 64, "checkpoint cadence in acknowledged mutations")
 		indexed      = fs.Bool("indexed", false, "maintain the country secondary index")
 		cardinality  = fs.String("cardinality", "low", "low or high corpus cardinality")
+		clients      = fs.Int("clients", 1, "concurrent worker goroutines per child (passed to cmd/mixed)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -249,10 +251,10 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		return config{}, err
 	}
 	if *repetitions < 1 || *timeout <= 0 || *corpus < 2 ||
-		*operations < 1 || *warmup < 0 || *checkpoint < 0 {
+		*operations < 1 || *warmup < 0 || *checkpoint < 0 || *clients < 1 {
 		return config{}, errors.New(
 			"-repetitions>=1, -timeout>0, -corpus>=2, -operations>=1, " +
-				"-warmup>=0, and -checkpoint-mutations>=0 are required",
+				"-warmup>=0, -checkpoint-mutations>=0, and -clients>=1 are required",
 		)
 	}
 	if *repetitions < 9 && !*diagnostic {
@@ -274,7 +276,7 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		workload: *workload, corpus: *corpus, operations: *operations,
 		warmup: *warmup, durability: *durability,
 		checkpointMutations: *checkpoint, indexed: *indexed,
-		cardinality: *cardinality,
+		cardinality: *cardinality, clients: *clients,
 	}, nil
 }
 
@@ -331,6 +333,7 @@ func executeMixed(cfg config, engine string) ([]string, []rawRow, error) {
 		"-checkpoint-mutations=" + strconv.Itoa(cfg.checkpointMutations),
 		"-indexed=" + strconv.FormatBool(cfg.indexed),
 		"-cardinality=" + cfg.cardinality,
+		"-clients=" + strconv.Itoa(cfg.clients),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
@@ -412,6 +415,7 @@ func validateMixedRows(cfg config, requested string, header []string, rows []raw
 		"warmup":     strconv.Itoa(cfg.warmup),
 		"checkpoint": strconv.Itoa(cfg.checkpointMutations),
 		"indexed":    strconv.FormatBool(cfg.indexed),
+		"clients":    strconv.Itoa(cfg.clients),
 	}
 	for name := range expected {
 		if _, ok := index[name]; !ok {
@@ -459,6 +463,7 @@ func writeSummaries(w io.Writer, header []string, records []runRecord) error {
 		"engine": true, "durability": true, "workload": true,
 		"card": true, "docs": true, "measured": true, "warmup": true,
 		"checkpoint": true, "indexed": true, "operation": true,
+		"clients": true,
 	}
 	var metrics []string
 	for _, name := range header {
@@ -632,6 +637,7 @@ func collectMetadata(cfg config, args []string, started time.Time) map[string]st
 		"checkpoint-mutations": strconv.Itoa(cfg.checkpointMutations),
 		"indexed":              strconv.FormatBool(cfg.indexed),
 		"cardinality":          cfg.cardinality,
+		"clients":              strconv.Itoa(cfg.clients),
 	}
 	addBuildMetadata(metadata, "mixed", cfg.mixedBin)
 	if suiteBin, err := os.Executable(); err == nil {

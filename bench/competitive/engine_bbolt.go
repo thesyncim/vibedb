@@ -10,6 +10,21 @@ import (
 var boltBucket = []byte("docs")
 
 type bboltEngine struct {
+	cfg Config
+	db  *bolt.DB
+	// self is the engine's own single-client session; the Engine-interface
+	// point methods delegate to it so the cached-read-transaction logic has one
+	// implementation, shared with the sessions Session vends.
+	self *bboltSession
+}
+
+// bboltSession is one client's view onto the shared *bolt.DB. bbolt is MVCC:
+// many read-only transactions and one read-write transaction run concurrently,
+// and db.Update serializes writers internally, so the handle is safe to share.
+// What is not safe to share is the cached read transaction and bucket handle the
+// point-read path holds — a *bolt.Tx is single-goroutine, and a write drops it
+// out from under a concurrent Get — so each session owns its own.
+type bboltSession struct {
 	cfg    Config
 	db     *bolt.DB
 	read   *bolt.Tx
@@ -49,7 +64,9 @@ func newBbolt(cfg Config) (Engine, error) {
 		db.Close()
 		return nil, err
 	}
-	return &bboltEngine{cfg: cfg, db: db}, nil
+	e := &bboltEngine{cfg: cfg, db: db}
+	e.self = &bboltSession{cfg: cfg, db: db}
+	return e, nil
 }
 
 func (b *bboltEngine) Name() string { return "bbolt" }
@@ -101,31 +118,33 @@ func (b *bboltEngine) Load(docs []Doc) error {
 // and it is the same hazard store/durable's snapshot lease has. Neither
 // engine's read path is charged for opening one per operation here, and neither
 // engine's write path holds one.
-func (b *bboltEngine) readBucket() (*bolt.Bucket, error) {
-	if b.bucket != nil {
-		return b.bucket, nil
+func (s *bboltSession) readBucket() (*bolt.Bucket, error) {
+	if s.bucket != nil {
+		return s.bucket, nil
 	}
-	tx, err := b.db.Begin(false)
+	tx, err := s.db.Begin(false)
 	if err != nil {
 		return nil, err
 	}
-	b.read = tx
-	b.bucket = tx.Bucket(boltBucket)
-	return b.bucket, nil
+	s.read = tx
+	s.bucket = tx.Bucket(boltBucket)
+	return s.bucket, nil
 }
 
-func (b *bboltEngine) dropReadTx() {
-	if b.read != nil {
-		_ = b.read.Rollback()
-		b.read = nil
-		b.bucket = nil
+func (s *bboltSession) dropReadTx() {
+	if s.read != nil {
+		_ = s.read.Rollback()
+		s.read = nil
+		s.bucket = nil
 	}
 }
 
-func (b *bboltEngine) Get(dst []byte, key string) ([]byte, error) {
-	if b.cfg.Untuned {
+func (s *bboltSession) releaseReads() { s.dropReadTx() }
+
+func (s *bboltSession) Get(dst []byte, key string) ([]byte, error) {
+	if s.cfg.Untuned {
 		// bbolt's own idiom: a read transaction per read.
-		err := b.db.View(func(tx *bolt.Tx) error {
+		err := s.db.View(func(tx *bolt.Tx) error {
 			v := tx.Bucket(boltBucket).Get([]byte(key))
 			if v == nil {
 				return fmt.Errorf("missing key %q", key)
@@ -135,7 +154,7 @@ func (b *bboltEngine) Get(dst []byte, key string) ([]byte, error) {
 		})
 		return dst, err
 	}
-	bkt, err := b.readBucket()
+	bkt, err := s.readBucket()
 	if err != nil {
 		return dst, err
 	}
@@ -146,9 +165,9 @@ func (b *bboltEngine) Get(dst []byte, key string) ([]byte, error) {
 	return append(dst, v...), nil
 }
 
-func (b *bboltEngine) Put(key string, doc []byte) error {
-	b.dropReadTx()
-	return b.db.Update(func(tx *bolt.Tx) error {
+func (s *bboltSession) Put(key string, doc []byte) error {
+	s.dropReadTx()
+	return s.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(boltBucket)
 		rawKey := []byte(key)
 		if bucket.Get(rawKey) == nil {
@@ -158,16 +177,16 @@ func (b *bboltEngine) Put(key string, doc []byte) error {
 	})
 }
 
-func (b *bboltEngine) Upsert(key string, doc []byte) error {
-	b.dropReadTx()
-	return b.db.Update(func(tx *bolt.Tx) error {
+func (s *bboltSession) Upsert(key string, doc []byte) error {
+	s.dropReadTx()
+	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(boltBucket).Put([]byte(key), doc)
 	})
 }
 
-func (b *bboltEngine) Delete(key string) error {
-	b.dropReadTx()
-	return b.db.Update(func(tx *bolt.Tx) error {
+func (s *bboltSession) Delete(key string) error {
+	s.dropReadTx()
+	return s.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(boltBucket)
 		rawKey := []byte(key)
 		if bucket.Get(rawKey) == nil {
@@ -175,6 +194,33 @@ func (b *bboltEngine) Delete(key string) error {
 		}
 		return bucket.Delete(rawKey)
 	})
+}
+
+func (s *bboltSession) ScanAllBytes() (int, error) {
+	n := 0
+	var sink byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(boltBucket).ForEach(func(k, v []byte) error {
+			sink ^= touchAll(v)
+			n++
+			return nil
+		})
+	})
+	foldScanSink(sink)
+	return n, err
+}
+
+func (b *bboltEngine) Get(dst []byte, key string) ([]byte, error) { return b.self.Get(dst, key) }
+func (b *bboltEngine) Put(key string, doc []byte) error          { return b.self.Put(key, doc) }
+func (b *bboltEngine) Upsert(key string, doc []byte) error       { return b.self.Upsert(key, doc) }
+func (b *bboltEngine) Delete(key string) error                   { return b.self.Delete(key) }
+func (b *bboltEngine) ScanAllBytes() (int, error)                { return b.self.ScanAllBytes() }
+
+// Session vends a fresh per-client session sharing the *bolt.DB. Each carries
+// its own read transaction and bucket handle; bbolt's MVCC lets those readers
+// run alongside the single writer db.Update serializes internally.
+func (b *bboltEngine) Session(int) EngineSession {
+	return &bboltSession{cfg: b.cfg, db: b.db}
 }
 
 func (b *bboltEngine) Scan() (int, error) {
@@ -189,21 +235,7 @@ func (b *bboltEngine) Scan() (int, error) {
 			return nil
 		})
 	})
-	scanSink ^= sink
-	return n, err
-}
-
-func (b *bboltEngine) ScanAllBytes() (int, error) {
-	n := 0
-	var sink byte
-	err := b.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(boltBucket).ForEach(func(k, v []byte) error {
-			sink ^= touchAll(v)
-			n++
-			return nil
-		})
-	})
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, err
 }
 
@@ -251,6 +283,6 @@ func (b *bboltEngine) MaintenanceFloorDescription() string {
 }
 
 func (b *bboltEngine) Close() error {
-	b.dropReadTx()
+	b.self.dropReadTx()
 	return b.db.Close()
 }

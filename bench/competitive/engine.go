@@ -196,6 +196,47 @@ func BenchmarkDurabilityModes(engine string) []DurabilityMode {
 	}
 }
 
+// EngineSession is one client's private handle onto a shared engine. It carries
+// exactly the per-operation surface the concurrent mixed harness drives from N
+// worker goroutines at once. The point of the split is goroutine safety without
+// giving up the shared storage handle: the underlying store/*sql.DB/*bolt.DB is
+// shared across every session (that is what makes the measurement a concurrency
+// measurement), but any mutable scratch an adapter would otherwise keep on the
+// engine — a cached read snapshot, a reused decode buffer, a held read
+// transaction — moves onto the session so no two clients race on it.
+//
+// Engine.Session vends these. An adapter whose operation surface is already safe
+// for concurrent callers returns the engine itself (it satisfies this interface,
+// being a superset); an adapter with per-caller scratch returns a fresh session
+// that shares the handle but owns its own scratch.
+type EngineSession interface {
+	// Get, Put, Upsert, Delete, and ScanAllBytes have the same contracts as the
+	// identically named Engine methods; see there.
+	Get(dst []byte, key string) ([]byte, error)
+	Put(key string, doc []byte) error
+	Upsert(key string, doc []byte) error
+	Delete(key string) error
+	ScanAllBytes() (int, error)
+}
+
+// sessionReleaser is implemented by the sessions that hold releasable read state
+// (a cached durable snapshot, or a held bbolt/Badger read transaction). The
+// harness calls releaseReads on every session once the timed loop ends so no
+// reader lease outlives the run and blocks the final checkpoint or Close. A
+// self-returning session (a concurrency-safe engine) does not implement it, so
+// the harness's type assertion simply skips it.
+type sessionReleaser interface{ releaseReads() }
+
+// ReleaseSession releases any read state a session opened (a cached snapshot or
+// held read transaction) without closing the shared engine, so no reader lease
+// outlives the timed loop and stalls the final checkpoint or Close. A session
+// that is the engine itself holds no such state and is left untouched.
+func ReleaseSession(s EngineSession) {
+	if r, ok := s.(sessionReleaser); ok {
+		r.releaseReads()
+	}
+}
+
 // Engine is the uniform surface every competitor is driven through. Each
 // method is the cheapest correct spelling that engine offers for the
 // operation; where an engine has no cheap spelling, that is the finding.
@@ -258,6 +299,19 @@ type Engine interface {
 	DiskBytes() (int64, error)
 	// Close releases the engine.
 	Close() error
+
+	// Session returns a per-client handle for concurrent operation. client is a
+	// zero-based worker index in [0, N). Every session returned by one Engine
+	// shares that engine's storage handle, so N sessions driven from N
+	// goroutines exercise the store under real concurrent load; what a session
+	// does NOT share is per-caller scratch (a cached read snapshot, a reused
+	// buffer, a held read transaction), which is why an adapter that keeps such
+	// state must vend a fresh session rather than return itself. An adapter that
+	// keeps no per-caller scratch — its operation surface is already
+	// goroutine-safe — returns the engine, which satisfies EngineSession. The
+	// single-client harness path calls Session(0) too, so the returned handle
+	// must reproduce the engine's own per-operation behaviour exactly.
+	Session(client int) EngineSession
 }
 
 // MaintenanceFloorer is the optional representation-maintenance hook used by

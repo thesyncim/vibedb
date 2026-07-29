@@ -255,7 +255,7 @@ func (s *sqliteEngine) Scan() (int, error) {
 			}
 			n++
 		}
-		scanSink ^= sink
+		foldScanSink(sink)
 		return n, rows.Err()
 	}
 	var doc sql.RawBytes
@@ -268,7 +268,7 @@ func (s *sqliteEngine) Scan() (int, error) {
 		}
 		n++
 	}
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, rows.Err()
 }
 
@@ -288,7 +288,7 @@ func (s *sqliteEngine) ScanAllBytes() (int, error) {
 		sink ^= touchAll(doc)
 		n++
 	}
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, rows.Err()
 }
 
@@ -377,3 +377,12 @@ func (s *sqliteEngine) Close() error {
 	}
 	return s.db.Close()
 }
+
+// Session returns the engine itself: *sql.DB and every *sql.Stmt prepared on it
+// are documented safe for concurrent use, and this adapter keeps no per-caller
+// scratch. Because MaxOpenConns is 1 (deliberate: one connection keeps the
+// per-connection pragmas and prepared-statement cache deterministic), N clients
+// serialize at the connection pool rather than run truly in parallel — an honest
+// property of this single-connection configuration, not a harness artifact, and
+// the reason SQLite's multi-client rows do not scale.
+func (s *sqliteEngine) Session(int) EngineSession { return s }

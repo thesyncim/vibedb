@@ -69,14 +69,14 @@ func TestSummarizeReportsMedianMADQuartilesAndRange(t *testing.T) {
 }
 
 func TestParseMixedOutputRequiresMachineReadableShape(t *testing.T) {
-	const valid = `engine durability workload card docs measured warmup checkpoint forced-cp indexed operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
-vibejson buffered-visible ycsb-a low 10 20 2 64 0 false read 10 1 2 3 1000 1 1 2 3 4
+	const valid = `engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
+vibejson buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
 `
 	header, rows, err := parseMixedOutput([]byte(valid))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(header) != 21 || len(rows) != 1 {
+	if len(header) != 22 || len(rows) != 1 {
 		t.Fatalf("header=%d rows=%d", len(header), len(rows))
 	}
 	if _, _, err := parseMixedOutput([]byte("engine workload\nvibe ycsb-a\n")); err == nil {
@@ -86,8 +86,8 @@ vibejson buffered-visible ycsb-a low 10 20 2 64 0 false read 10 1 2 3 1000 1 1 2
 
 func TestValidateMixedRowsChecksRequestedConfiguration(t *testing.T) {
 	header, rows, err := parseMixedOutput([]byte(
-		`engine durability workload card docs measured warmup checkpoint forced-cp indexed operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
-vibejson-durable/bulk-verbatim buffered-visible ycsb-a low 10 20 2 64 0 false read 10 1 2 3 1000 1 1 2 3 4
+		`engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
+vibejson-durable/bulk-verbatim buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
 `,
 	))
 	if err != nil {
@@ -96,7 +96,7 @@ vibejson-durable/bulk-verbatim buffered-visible ycsb-a low 10 20 2 64 0 false re
 	cfg := config{
 		durability: "buffered-visible", workload: "ycsb-a",
 		cardinality: "low", corpus: 10, operations: 20, warmup: 2,
-		checkpointMutations: 64,
+		checkpointMutations: 64, clients: 1,
 	}
 	if err := validateMixedRows(cfg, "vibejson-durable", header, rows); err != nil {
 		t.Fatal(err)
@@ -170,8 +170,8 @@ for arg in "$@"; do
 	esac
 done
 printf '%s\n' "$engine" >> "$MIXEDSUITE_TEST_LOG"
-printf '%s\n' 'engine durability workload card docs measured warmup checkpoint forced-cp indexed operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB'
-printf '%s\n' "$engine buffered-visible ycsb-a low 10 20 2 64 0 false read 10 1 2 3 1000 1 1 2 3 4"
+printf '%s\n' 'engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB'
+printf '%s\n' "$engine buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4"
 `
 	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
 		t.Fatal(err)

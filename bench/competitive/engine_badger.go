@@ -8,12 +8,27 @@ import (
 )
 
 type badgerEngine struct {
+	cfg Config
+	db  *badger.DB
+	// self is the engine's own single-client session. The Engine-interface
+	// point methods delegate to it so there is exactly one implementation of
+	// the cached-read-transaction logic, shared with the sessions Session vends.
+	self *badgerSession
+}
+
+// badgerSession is one client's view onto the shared *badger.DB. The database
+// handle is documented safe for concurrent transactions; what is not safe to
+// share is the cached read transaction the point-read path holds, because a
+// *badger.Txn is a single-reader object and Put/Delete discard it out from under
+// a concurrent Get. Each session therefore owns its own read transaction.
+type badgerSession struct {
 	cfg  Config
 	db   *badger.DB
 	read *badger.Txn
 }
 
-// scanOptions is the iterator configuration every full-corpus walk here uses.
+// badgerScanOptions is the iterator configuration every full-corpus walk here
+// uses.
 //
 // PrefetchValues defaults to true, and leaving it on costs Badger a large
 // factor on this corpus. Badger's prefetcher hands each item to a worker pool
@@ -22,9 +37,9 @@ type badgerEngine struct {
 // and already inline in the LSM tables. Leaving it on the default published
 // Badger as the slowest engine in the scan row when it is not.
 // BenchmarkTuning/badger measures the pair; do not quote the effect from here.
-func (b *badgerEngine) scanOptions() badger.IteratorOptions {
+func badgerScanOptions(cfg Config) badger.IteratorOptions {
 	opt := badger.DefaultIteratorOptions
-	opt.PrefetchValues = b.cfg.Untuned
+	opt.PrefetchValues = cfg.Untuned
 	if opt.PrefetchValues {
 		opt.PrefetchSize = 256
 	}
@@ -66,7 +81,9 @@ func newBadger(cfg Config) (Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &badgerEngine{cfg: cfg, db: db}, nil
+	e := &badgerEngine{cfg: cfg, db: db}
+	e.self = &badgerSession{cfg: cfg, db: db}
+	return e, nil
 }
 
 func (b *badgerEngine) Name() string { return "badger" }
@@ -123,24 +140,26 @@ func (b *badgerEngine) Load(docs []Doc) error {
 // transaction pins a read timestamp, so a Get issued through one opened before
 // a Put would return the pre-Put value. The read-only workloads never write, so
 // they never observe a stale snapshot; the write workloads never hold one.
-func (b *badgerEngine) readTxn() *badger.Txn {
-	if b.read == nil {
-		b.read = b.db.NewTransaction(false)
+func (s *badgerSession) readTxn() *badger.Txn {
+	if s.read == nil {
+		s.read = s.db.NewTransaction(false)
 	}
-	return b.read
+	return s.read
 }
 
-func (b *badgerEngine) dropReadTxn() {
-	if b.read != nil {
-		b.read.Discard()
-		b.read = nil
+func (s *badgerSession) dropReadTxn() {
+	if s.read != nil {
+		s.read.Discard()
+		s.read = nil
 	}
 }
 
-func (b *badgerEngine) Get(dst []byte, key string) ([]byte, error) {
-	if b.cfg.Untuned {
+func (s *badgerSession) releaseReads() { s.dropReadTxn() }
+
+func (s *badgerSession) Get(dst []byte, key string) ([]byte, error) {
+	if s.cfg.Untuned {
 		// Badger's own idiom: a transaction per read.
-		err := b.db.View(func(txn *badger.Txn) error {
+		err := s.db.View(func(txn *badger.Txn) error {
 			item, err := txn.Get([]byte(key))
 			if err != nil {
 				return err
@@ -150,16 +169,16 @@ func (b *badgerEngine) Get(dst []byte, key string) ([]byte, error) {
 		})
 		return dst, err
 	}
-	item, err := b.readTxn().Get([]byte(key))
+	item, err := s.readTxn().Get([]byte(key))
 	if err != nil {
 		return dst, err
 	}
 	return item.ValueCopy(dst)
 }
 
-func (b *badgerEngine) Put(key string, doc []byte) error {
-	b.dropReadTxn()
-	return b.db.Update(func(txn *badger.Txn) error {
+func (s *badgerSession) Put(key string, doc []byte) error {
+	s.dropReadTxn()
+	return s.db.Update(func(txn *badger.Txn) error {
 		rawKey := []byte(key)
 		if _, err := txn.Get(rawKey); err != nil {
 			return err
@@ -168,16 +187,16 @@ func (b *badgerEngine) Put(key string, doc []byte) error {
 	})
 }
 
-func (b *badgerEngine) Upsert(key string, doc []byte) error {
-	b.dropReadTxn()
-	return b.db.Update(func(txn *badger.Txn) error {
+func (s *badgerSession) Upsert(key string, doc []byte) error {
+	s.dropReadTxn()
+	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte(key), doc)
 	})
 }
 
-func (b *badgerEngine) Delete(key string) error {
-	b.dropReadTxn()
-	return b.db.Update(func(txn *badger.Txn) error {
+func (s *badgerSession) Delete(key string) error {
+	s.dropReadTxn()
+	return s.db.Update(func(txn *badger.Txn) error {
 		rawKey := []byte(key)
 		if _, err := txn.Get(rawKey); err != nil {
 			return err
@@ -186,11 +205,11 @@ func (b *badgerEngine) Delete(key string) error {
 	})
 }
 
-func (b *badgerEngine) Scan() (int, error) {
+func (s *badgerSession) Scan() (int, error) {
 	n := 0
 	var sink byte
-	err := b.db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(b.scanOptions())
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badgerScanOptions(s.cfg))
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			if err := it.Item().Value(func(v []byte) error {
@@ -205,15 +224,15 @@ func (b *badgerEngine) Scan() (int, error) {
 		}
 		return nil
 	})
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, err
 }
 
-func (b *badgerEngine) ScanAllBytes() (int, error) {
+func (s *badgerSession) ScanAllBytes() (int, error) {
 	n := 0
 	var sink byte
-	err := b.db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(b.scanOptions())
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badgerScanOptions(s.cfg))
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			if err := it.Item().Value(func(v []byte) error {
@@ -226,13 +245,27 @@ func (b *badgerEngine) ScanAllBytes() (int, error) {
 		}
 		return nil
 	})
-	scanSink ^= sink
+	foldScanSink(sink)
 	return n, err
+}
+
+func (b *badgerEngine) Get(dst []byte, key string) ([]byte, error) { return b.self.Get(dst, key) }
+func (b *badgerEngine) Put(key string, doc []byte) error          { return b.self.Put(key, doc) }
+func (b *badgerEngine) Upsert(key string, doc []byte) error       { return b.self.Upsert(key, doc) }
+func (b *badgerEngine) Delete(key string) error                   { return b.self.Delete(key) }
+func (b *badgerEngine) Scan() (int, error)                        { return b.self.Scan() }
+func (b *badgerEngine) ScanAllBytes() (int, error)                { return b.self.ScanAllBytes() }
+
+// Session vends a fresh per-client session sharing the *badger.DB. Each carries
+// its own read transaction, so N clients never race on one *badger.Txn while the
+// database handle serializes their writes internally.
+func (b *badgerEngine) Session(int) EngineSession {
+	return &badgerSession{cfg: b.cfg, db: b.db}
 }
 
 func (b *badgerEngine) Visit(fn func(key string, value []byte) error) error {
 	return b.db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(b.scanOptions())
+		it := txn.NewIterator(badgerScanOptions(b.cfg))
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
@@ -249,7 +282,7 @@ func (b *badgerEngine) FilterCount(value string) (int, error) {
 	needle := jsonScalarNeedle(value)
 	n := 0
 	err := b.db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(b.scanOptions())
+		it := txn.NewIterator(badgerScanOptions(b.cfg))
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			if err := it.Item().Value(func(v []byte) error {
@@ -282,7 +315,7 @@ func (b *badgerEngine) DiskBytes() (int64, error) {
 func (b *badgerEngine) Checkpoint() error { return b.db.Sync() }
 
 func (b *badgerEngine) MaintenanceFloor() error {
-	b.dropReadTxn()
+	b.self.dropReadTxn()
 	if err := b.db.Flatten(2); err != nil {
 		return err
 	}
@@ -302,6 +335,6 @@ func (b *badgerEngine) MaintenanceFloorDescription() string {
 }
 
 func (b *badgerEngine) Close() error {
-	b.dropReadTxn()
+	b.self.dropReadTxn()
 	return b.db.Close()
 }
