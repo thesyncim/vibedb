@@ -187,17 +187,19 @@ type State struct {
 	Generation uint64
 	Count      int
 	ChunkCount uint32
-	// mappedDocChunks counts current Chunks that still borrow mappedDocs. A
-	// rebuilt chunk becomes ordinary owned Go state; the last detach drops the
-	// state-level owner while retained snapshots keep their own chunk owners.
-	mappedDocChunks uint32
-	seed            maphash.Seed
-	StateOptions    StateOptions
-	keys            *storeKeyNode
+	seed       maphash.Seed
+	StateOptions StateOptions
+	keys         *storeKeyNode
 	// baseKeys is the compact immutable directory created by Builder or
 	// Open. keys is then only the path-copied overlay for later insertions
 	// and moved keys.
-	baseKeys   *storeMappedKeys
+	baseKeys *storeMappedKeys
+	// mappedDocs pins the off-heap source block for the lifetime of every
+	// state, exactly like baseKeys. It must never be dropped early: a chunk
+	// rebuild carries surviving rows by reference out of the mapped block
+	// (appendStoreDoc copies nothing), and those borrowed pointers are
+	// invisible to the garbage collector, so this edge is the only thing
+	// standing between a rebuilt chunk and the block's finalizer munmap.
 	mappedDocs *storeMappedDocs
 	Chunks     storeChunkVector
 	Indexes    []IndexInfo
@@ -776,7 +778,6 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 		}
 		next := *state
 		next.Generation++
-		next.detachMappedDocuments(old)
 		next.Chunks = state.Chunks.set(loc.Chunk, chunk)
 		c.noteChunkPostingsLocked(loc.Chunk, old, chunk)
 		catalogChanged, secondaryChanged := c.noteIndexesForChunkLocked(loc.Chunk, old, chunk, uint64(1)<<loc.Slot)
@@ -817,7 +818,6 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 	next := *state
 	next.Generation++
 	next.Count++
-	next.detachMappedDocuments(old)
 	loc = Location{Chunk: chunkID, Slot: uint8(slot)}
 	next.keys = storeKeyInsert(state.keys, hash, key, loc)
 	if chunkID == state.Chunks.Count {
@@ -843,26 +843,6 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 	}
 	c.state.Store(&next)
 	return true, nil
-}
-
-func (s *State) detachMappedDocuments(chunk *Chunk) {
-	if s.mappedDocs == nil || chunk == nil || chunk.Docs.mappedDocs != s.mappedDocs {
-		return
-	}
-	s.detachMappedDocumentChunks(1)
-}
-
-func (s *State) detachMappedDocumentChunks(count uint32) {
-	if count == 0 {
-		return
-	}
-	if count > s.mappedDocChunks {
-		panic("vibejson: mapped collection document count invariant")
-	}
-	s.mappedDocChunks -= count
-	if s.mappedDocChunks == 0 {
-		s.mappedDocs = nil
-	}
 }
 
 func (c *Collection) allocateSlotLocked(state *State) (uint32, int, *Chunk) {

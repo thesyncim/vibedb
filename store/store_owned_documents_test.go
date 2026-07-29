@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibejson"
 )
@@ -161,13 +162,24 @@ func TestStoreBuilderCompactRefsRecoverTrimmedRoot(t *testing.T) {
 	}
 }
 
-func TestStoreReclaimsOwnedDocumentBaseAfterAllChunksDetach(t *testing.T) {
+// TestStorePutRetainsMappedDocumentOwner is the regression test for a
+// use-after-free. A chunk rebuild carries surviving rows by reference out of
+// the mapped source block (appendStoreDoc copies nothing), and those borrowed
+// pointers are invisible to the garbage collector. An earlier design detached
+// the state-level owner once every chunk had been rebuilt; the finalizer then
+// unmapped bytes the rebuilt chunks still aliased, and reading a carried row
+// after GC faulted. The owner must therefore survive every rebuild, exactly
+// like baseKeys does on the key side.
+func TestStorePutRetainsMappedDocumentOwner(t *testing.T) {
 	builder, err := NewBuilder(Options{ChunkDocuments: 2, ShapeTapes: true})
 	if err != nil {
 		t.Fatal(err)
 	}
+	docs := make(map[string]string, 4)
 	for row := range 4 {
-		if err := builder.Append(fmt.Sprintf("k%d", row), []byte(fmt.Sprintf(`{"n":%d}`, row))); err != nil {
+		key := fmt.Sprintf("k%d", row)
+		docs[key] = fmt.Sprintf(`{"n":%d,"pad":"%032d"}`, row, row)
+		if err := builder.Append(key, []byte(docs[key])); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -176,31 +188,32 @@ func TestStoreReclaimsOwnedDocumentBaseAfterAllChunksDetach(t *testing.T) {
 		t.Fatal(err)
 	}
 	retained, _ := collection.Snapshot()
-	if state := collection.state.Load(); state.mappedDocChunks != 2 || state.mappedDocs == nil {
-		t.Fatalf("initial mapped document state = %d/%p", state.mappedDocChunks, state.mappedDocs)
-	}
-	if _, err := collection.Put("k0", []byte(`{"n":10}`)); err != nil {
+	// One Put per chunk rebuilds every chunk; k1 and k3 are carried by
+	// reference out of the mapped block into the rebuilt chunks.
+	if _, err := collection.Put("k0", []byte(`{"n":10,"pad":"replacement-payload-0"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if state := collection.state.Load(); state.mappedDocChunks != 1 || state.mappedDocs == nil {
-		t.Fatalf("first detach state = %d/%p", state.mappedDocChunks, state.mappedDocs)
-	}
-	if _, err := collection.Put("k2", []byte(`{"n":12}`)); err != nil {
+	if _, err := collection.Put("k2", []byte(`{"n":12,"pad":"replacement-payload-2"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if state := collection.state.Load(); state.mappedDocChunks != 0 || state.mappedDocs != nil {
-		t.Fatalf("last detach retained current owner = %d/%p", state.mappedDocChunks, state.mappedDocs)
+	if state := collection.state.Load(); state.mappedDocs == nil {
+		t.Fatal("rebuilding every chunk dropped the mapped document owner")
 	}
-	if collection.Stats().ExternalDocumentBytes != 0 {
-		t.Fatal("current generation still reports detached document storage")
-	}
-	for range 3 {
+	// Give the collector every chance to run the owner's finalizer if the
+	// owner edge were broken; the reads below would then fault or return
+	// garbage rather than the original bytes.
+	for range 6 {
 		runtime.GC()
-		if raw, ok := retained.GetRaw("k0"); !ok || string(raw.Bytes()) != `{"n":0}` {
-			t.Fatalf("retained k0 after GC = (%q, %v)", raw.Bytes(), ok)
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, key := range []string{"k1", "k3"} {
+		if raw, ok := collection.GetRaw(key); !ok || string(raw.Bytes()) != docs[key] {
+			t.Fatalf("carried row %s after GC = (%q, %v), want %q", key, raw.Bytes(), ok, docs[key])
 		}
-		if raw, ok := retained.GetRaw("k2"); !ok || string(raw.Bytes()) != `{"n":2}` {
-			t.Fatalf("retained k2 after GC = (%q, %v)", raw.Bytes(), ok)
+	}
+	for _, key := range []string{"k0", "k2"} {
+		if raw, ok := retained.GetRaw(key); !ok || string(raw.Bytes()) != docs[key] {
+			t.Fatalf("retained %s after GC = (%q, %v), want %q", key, raw.Bytes(), ok, docs[key])
 		}
 	}
 }

@@ -189,7 +189,6 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 	}
 	nextChunks := state.Chunks
 	examined := 0
-	detachedMapped := uint32(0)
 	changed := false
 	bulkRoot := b.root
 	var pending map[uint64][]storeIndexChunkMask
@@ -221,9 +220,6 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 				return storeLogicalIndexInfo(name, b), err
 			}
 			nextChunks = nextChunks.set(id, rebuilt)
-			if state.mappedDocs != nil && chunk.Docs.mappedDocs == state.mappedDocs {
-				detachedMapped++
-			}
 			c.noteChunkPostingsLocked(id, chunk, rebuilt)
 		}
 		if b.exact != nil {
@@ -256,7 +252,6 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 	if changed {
 		next := *state
 		next.Generation++
-		next.detachMappedDocumentChunks(detachedMapped)
 		next.Chunks = nextChunks
 		next.Indexes = c.indexInfosLocked()
 		next.secondary = c.indexSnapshotsLocked()
@@ -318,7 +313,6 @@ func (c *Collection) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
 		limit = int(state.Chunks.Count)
 	}
 	nextChunks := state.Chunks
-	detachedMapped := uint32(0)
 	for len(c.postingChunks.ids) != 0 && rebuilt < limit {
 		id := c.postingChunks.ids[len(c.postingChunks.ids)-1]
 		chunk := state.Chunks.Get(id)
@@ -331,9 +325,6 @@ func (c *Collection) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
 			panic("vibejson: rebuilding validated collection chunk: " + err.Error())
 		}
 		nextChunks = nextChunks.set(id, plain)
-		if state.mappedDocs != nil && chunk.Docs.mappedDocs == state.mappedDocs {
-			detachedMapped++
-		}
 		c.noteChunkPostingsLocked(id, chunk, plain)
 		rebuilt++
 	}
@@ -341,7 +332,6 @@ func (c *Collection) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
 	if rebuilt != 0 {
 		next := *state
 		next.Generation++
-		next.detachMappedDocumentChunks(detachedMapped)
 		next.Chunks = nextChunks
 		c.state.Store(&next)
 	}

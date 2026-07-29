@@ -193,7 +193,6 @@ func (b *Builder) compactDocuments(state *State) error {
 		return errors.New("vibejson: Builder compact document invariant")
 	}
 	state.mappedDocs = owned
-	state.mappedDocChunks = state.ChunkCount
 	owned.templates = templates
 	owned.shapes = b.shapes
 	return nil
