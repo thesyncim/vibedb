@@ -299,7 +299,7 @@ func primaryLTRPointLane(
 			primaryLTRPrefetch(t, collection, keys[first:last])
 		}
 		for at := first; at < last; at++ {
-			out, ok, readErr := snapshot.AppendRaw(buffer[:0], keys[at])
+			out, ok, readErr := snapshot.AppendRaw(buffer[:0], []byte(keys[at]))
 			if readErr != nil || !ok || len(out) != primaryLTRDocumentBytes {
 				t.Fatalf(
 					"point read %d = %d bytes, ok=%v err=%v",
@@ -367,15 +367,18 @@ func primaryLTRWarmLane(
 	buffer := make([]byte, 0, primaryLTRDocumentBytes)
 	for at := range keys {
 		keys[at] = primaryLTRKey(order[at])
-		out, ok, readErr := snapshot.AppendRaw(buffer[:0], keys[at])
+		out, ok, readErr := snapshot.AppendRaw(buffer[:0], []byte(keys[at]))
 		if readErr != nil || !ok {
 			t.Fatalf("warmup read %d: ok=%v err=%v", at, ok, readErr)
 		}
 		buffer = out
 	}
 	want := primaryLTRDocument(nil, order[0])
+	// Convert the probe key once, outside the measured closure (borrowed []byte
+	// key; a per-call conversion would break the 0-alloc pin).
+	probe := []byte(keys[0])
 	allocs := testing.AllocsPerRun(1000, func() {
-		out, ok, readErr := snapshot.AppendRaw(buffer[:0], keys[0])
+		out, ok, readErr := snapshot.AppendRaw(buffer[:0], probe)
 		if readErr != nil || !ok {
 			panic("warm allocation probe failed")
 		}
@@ -391,7 +394,7 @@ func primaryLTRWarmLane(
 	started := time.Now()
 	for at := 0; at < config.warmReads; at++ {
 		out, ok, readErr := snapshot.AppendRaw(
-			buffer[:0], keys[at%len(keys)],
+			buffer[:0], []byte(keys[at%len(keys)]),
 		)
 		if readErr != nil || !ok {
 			t.Fatalf("warm read %d: ok=%v err=%v", at, ok, readErr)

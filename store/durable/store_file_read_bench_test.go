@@ -95,11 +95,13 @@ func BenchmarkFileStorePointRead(b *testing.B) {
 	defer done()
 	order := benchReadProbeOrder(benchReadCorpusSize)
 
-	// Keys are precomputed so the benchmark measures the store rather than
-	// fmt.Sprintf, whose allocation would otherwise dominate the alloc column.
-	keys := make([]string, len(order))
+	// Keys are precomputed as []byte, outside the timed loop, so the benchmark
+	// measures the store rather than fmt.Sprintf or a per-call string->[]byte
+	// conversion — either allocation would otherwise dominate the alloc column
+	// and break the zero-alloc read pin.
+	keys := make([][]byte, len(order))
 	for i := range keys {
-		keys[i] = benchReadKey(order[i])
+		keys[i] = []byte(benchReadKey(order[i]))
 	}
 
 	b.Run("collection", func(b *testing.B) {
@@ -187,7 +189,9 @@ func openBenchScanCollection(tb testing.TB, count int) (*Collection, func()) {
 		end := min(start+64, count)
 		if err := collection.Update(func(batch *WriteBatch) error {
 			for i := start; i < end; i++ {
-				if err := batch.Put(benchReadKey(i), benchReadDocument(i)); err != nil {
+				// Corpus build (untimed setup): a per-key []byte conversion here
+				// is not measured.
+				if err := batch.Put([]byte(benchReadKey(i)), benchReadDocument(i)); err != nil {
 					return err
 				}
 			}

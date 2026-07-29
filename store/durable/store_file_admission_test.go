@@ -41,7 +41,7 @@ func TestCollectionRetirementBackpressureRecovers(t *testing.T) {
 	defer collection.Close()
 	const keys = 32
 	for i := range keys {
-		if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchDocument(i)); err != nil {
+		if _, err := collection.Put([]byte(fmt.Sprintf("key-%09d", i)), benchDocument(i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -53,7 +53,7 @@ func TestCollectionRetirementBackpressureRecovers(t *testing.T) {
 	var failure error
 	accepted := 0
 	for i := range 5000 {
-		if _, err := collection.Put(fmt.Sprintf("key-%09d", i%keys), benchDocument(i)); err != nil {
+		if _, err := collection.Put([]byte(fmt.Sprintf("key-%09d", i%keys)), benchDocument(i)); err != nil {
 			failure = err
 			break
 		}
@@ -90,13 +90,13 @@ func TestCollectionRetirementBackpressureRecovers(t *testing.T) {
 	}
 	// Recovery must need nothing but the release: no reopen, no compaction.
 	for i := range keys {
-		if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchDocument(i)); err != nil {
+		if _, err := collection.Put([]byte(fmt.Sprintf("key-%09d", i)), benchDocument(i)); err != nil {
 			t.Fatalf("write %d still fails after releasing the snapshot: %v; stats=%+v",
 				i, err, collection.Stats())
 		}
 	}
 	for i := range keys {
-		got, ok, err := collection.AppendRaw(nil, fmt.Sprintf("key-%09d", i))
+		got, ok, err := collection.AppendRaw(nil, []byte(fmt.Sprintf("key-%09d", i)))
 		if err != nil || !ok {
 			t.Fatalf("read %d after recovery: ok=%v err=%v", i, ok, err)
 		}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 func (c *Collection) primaryGraphReadOnly() bool {
@@ -24,13 +23,13 @@ func (c *Collection) primaryGraphReadOnly() bool {
 func (c *Collection) resolvePrimaryGraph(
 	dst []byte,
 	state *fileStoreState,
-	key string,
+	key []byte,
 ) ([]byte, bool, error) {
 	if c == nil || state == nil ||
 		state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return dst, false, nil
 	}
-	keyBytes := byteview.Bytes(key)
+	keyBytes := key
 	if len(keyBytes) == 0 ||
 		len(keyBytes) > storeio.CommonPrimaryLeafMaxKeyBytes {
 		return dst, false, nil
@@ -134,13 +133,13 @@ func (c *Collection) appendPrimaryLeafValue(
 func (c *Collection) resolvePrimaryGraphPageWalk(
 	dst []byte,
 	state *fileStoreState,
-	key string,
+	key []byte,
 ) ([]byte, bool, error) {
 	if c == nil || state == nil ||
 		state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return dst, false, nil
 	}
-	keyBytes := byteview.Bytes(key)
+	keyBytes := key
 	if len(keyBytes) == 0 ||
 		len(keyBytes) > storeio.CommonPrimaryLeafMaxKeyBytes {
 		return dst, false, nil

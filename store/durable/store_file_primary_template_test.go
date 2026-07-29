@@ -40,18 +40,18 @@ func TestFilePrimaryTemplateLeafEndToEnd(t *testing.T) {
 	buf := make([]byte, 0, 128)
 	pw := make([]byte, 0, 128)
 	for at, key := range keys {
-		v, ok, err := primary.AppendRaw(buf[:0], key)
+		v, ok, err := primary.AppendRaw(buf[:0], []byte(key))
 		if err != nil || !ok || !bytes.Equal(v, values[at]) {
 			t.Fatalf("point %d = %q ok=%v err=%v want %q", at, v, ok, err, values[at])
 		}
-		pwv, pwok, pwerr := primary.resolvePrimaryGraphPageWalk(pw[:0], primary.state.Load(), key)
+		pwv, pwok, pwerr := primary.resolvePrimaryGraphPageWalk(pw[:0], primary.state.Load(), []byte(key))
 		if pwerr != nil || !pwok || !bytes.Equal(pwv, values[at]) {
 			t.Fatalf("pagewalk %d mismatch", at)
 		}
 		buf, pw = v, pwv
 	}
 	// absent
-	if v, ok, err := primary.AppendRaw(buf[:0], "primary-key-absentzzz"); err != nil || ok || len(v) != 0 {
+	if v, ok, err := primary.AppendRaw(buf[:0], []byte("primary-key-absentzzz")); err != nil || ok || len(v) != 0 {
 		t.Fatalf("absent = %q %v %v", v, ok, err)
 	}
 	// scan differential
@@ -84,20 +84,20 @@ func TestFilePrimaryTemplateLeafEndToEnd(t *testing.T) {
 			report.OK(), report.Primary, report.Documents, count, report.Findings)
 	}
 	// mutations that hit the first (template) leaf
-	if created, err := primary.Put("new", []byte(`{"v":1}`)); err != nil || !created {
+	if created, err := primary.Put([]byte("new"), []byte(`{"v":1}`)); err != nil || !created {
 		t.Fatalf("Put new = %v %v", created, err)
 	}
-	if v, ok, err := primary.AppendRaw(buf[:0], "new"); err != nil || !ok || string(v) != `{"v":1}` {
+	if v, ok, err := primary.AppendRaw(buf[:0], []byte("new")); err != nil || !ok || string(v) != `{"v":1}` {
 		t.Fatalf("read new = %q %v %v", v, ok, err)
 	}
-	if deleted, err := primary.Delete(keys[0]); err != nil || !deleted {
+	if deleted, err := primary.Delete([]byte(keys[0])); err != nil || !deleted {
 		t.Fatalf("Delete keys[0] = %v %v", deleted, err)
 	}
-	if _, ok, err := primary.AppendRaw(buf[:0], keys[0]); err != nil || ok {
+	if _, ok, err := primary.AppendRaw(buf[:0], []byte(keys[0])); err != nil || ok {
 		t.Fatalf("read deleted = %v %v", ok, err)
 	}
 	// remaining still readable after de-template
-	if v, ok, err := primary.AppendRaw(buf[:0], keys[1]); err != nil || !ok || !bytes.Equal(v, values[1]) {
+	if v, ok, err := primary.AppendRaw(buf[:0], []byte(keys[1])); err != nil || !ok || !bytes.Equal(v, values[1]) {
 		t.Fatalf("read keys[1] after mutation = %q %v %v", v, ok, err)
 	}
 }
@@ -141,7 +141,7 @@ func TestFilePrimaryTemplateLeafSalvageRoundTrip(t *testing.T) {
 	defer collection.Close()
 	buf := make([]byte, 0, 128)
 	for at, key := range keys {
-		v, ok, err := collection.AppendRaw(buf[:0], key)
+		v, ok, err := collection.AppendRaw(buf[:0], []byte(key))
 		if err != nil || !ok || !bytes.Equal(v, values[at]) {
 			t.Fatalf("salvaged read %d = %q ok=%v err=%v", at, v, ok, err)
 		}

@@ -88,7 +88,7 @@ func TestPhase0Diag(t *testing.T) {
 		var scr []byte
 		for i := range docs {
 			scr = AppendSameSizeUpdatedJSON(scr[:0], docs, i)
-			if _, err := coll.Put(docs[i].Key, scr); err != nil {
+			if _, err := coll.Put([]byte(docs[i].Key), scr); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -118,7 +118,7 @@ func TestPhase0Diag(t *testing.T) {
 		key := docs[idx].Key
 		switch choice {
 		case 0: // read
-			out, _, err := coll.AppendRaw(readScratch[:0], key)
+			out, _, err := coll.AppendRaw(readScratch[:0], []byte(key))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -130,16 +130,16 @@ func TestPhase0Diag(t *testing.T) {
 			} else {
 				replacement = AppendSameSizeUpdatedJSON(replacement[:0], docs, idx)
 			}
-			if _, err := coll.Put(key, replacement); err != nil {
+			if _, err := coll.Put([]byte(key), replacement); err != nil {
 				t.Fatal(err)
 			}
 			updated[idx] = !updated[idx]
 			return 1, 1
 		case 3: // churn: delete + restore
-			if _, err := coll.Delete(key); err != nil {
+			if _, err := coll.Delete([]byte(key)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := coll.Put(key, docs[idx].JSON); err != nil {
+			if _, err := coll.Put([]byte(key), docs[idx].JSON); err != nil {
 				t.Fatal(err)
 			}
 			updated[idx] = false

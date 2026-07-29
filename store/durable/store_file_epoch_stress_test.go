@@ -23,7 +23,9 @@ func TestFilePrimaryReadEpochAllocatesZero(t *testing.T) {
 	}
 	defer collection.Close()
 	buffer := make([]byte, 0, 512)
-	target := keys[len(keys)/2]
+	// Convert the probe key once, outside the measured closure (the store
+	// borrows a []byte key; a per-call conversion would break the 0-alloc pin).
+	target := []byte(keys[len(keys)/2])
 	if _, ok, err := collection.AppendRaw(buffer[:0], target); err != nil || !ok {
 		t.Fatalf("warm AppendRaw = %v,%v", ok, err)
 	}
@@ -54,7 +56,7 @@ func TestFilePrimaryReadEpochStress(t *testing.T) {
 	built, keys, _ := buildFilePrimaryCorpus(t, seed)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 64 << 20,
-		Durability:               DurabilityBufferedVisible,
+		Durability: DurabilityBufferedVisible,
 	}
 	file := createPrimaryPointFile(t, built, options, "epoch-stress.vibe")
 	collection, err := Open(file, options)
@@ -83,7 +85,7 @@ func TestFilePrimaryReadEpochStress(t *testing.T) {
 			buffer := make([]byte, 0, 512)
 			for at := offset; !stop.Load(); at += readers + 1 {
 				key := keys[at%seed]
-				out, ok, err := collection.AppendRaw(buffer[:0], key)
+				out, ok, err := collection.AppendRaw(buffer[:0], []byte(key))
 				if err != nil {
 					fail("AppendRaw(%q): %v", key, err)
 					return
@@ -155,26 +157,26 @@ func TestFilePrimaryReadEpochStress(t *testing.T) {
 				`{"id":%d,"group":%d,"name":"primary row %d"}`,
 				round%seed, round%997, round%seed,
 			)
-			if _, err := collection.Put(key, same); err != nil {
+			if _, err := collection.Put([]byte(key), same); err != nil {
 				return fmt.Errorf("in-place put %q: %w", key, err)
 			}
 			grown := fmt.Appendf(nil,
 				`{"id":%d,"round":%d,"pad":"%032d"}`,
 				round%seed, round, round,
 			)
-			if _, err := collection.Put(key, grown); err != nil {
+			if _, err := collection.Put([]byte(key), grown); err != nil {
 				return fmt.Errorf("cow put %q: %w", key, err)
 			}
 			if round%7 == 0 {
-				if _, err := collection.Delete(key); err != nil {
+				if _, err := collection.Delete([]byte(key)); err != nil {
 					return fmt.Errorf("delete %q: %w", key, err)
 				}
-				if _, err := collection.Put(key, same); err != nil {
+				if _, err := collection.Put([]byte(key), same); err != nil {
 					return fmt.Errorf("reinsert %q: %w", key, err)
 				}
 			}
 			fresh := fmt.Sprintf("primary-key-%09d", seed+round)
-			if _, err := collection.Put(fresh, grown); err != nil {
+			if _, err := collection.Put([]byte(fresh), grown); err != nil {
 				return fmt.Errorf("insert %q: %w", fresh, err)
 			}
 			if round%97 == 0 {

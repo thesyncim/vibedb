@@ -224,7 +224,7 @@ func runRecoveryJournalAppendCrashMatrix(t *testing.T, options Options, value fu
 
 			landed := 0
 			for i := 0; i < n; i++ {
-				_, putErr := coll.Put(journalCrashKey(i), value(i))
+				_, putErr := coll.Put([]byte(journalCrashKey(i)), value(i))
 				if fj.Faulted() {
 					if putErr == nil {
 						landed = i + 1
@@ -296,20 +296,20 @@ func TestRecoveryJournalSyncFailurePoisons(t *testing.T) {
 	fj := get()
 	// Two acknowledgements land, the third append is ENOSPC'd.
 	fj.Program(storeio.JournalFaultPlan{Phase: storeio.JournalFaultENOSPCAppend, AppendIndex: 2})
-	if _, err := coll.Put(journalCrashKey(0), journalValue(0)); err != nil {
+	if _, err := coll.Put([]byte(journalCrashKey(0)), journalValue(0)); err != nil {
 		t.Fatalf("put 0: %v", err)
 	}
-	if _, err := coll.Put(journalCrashKey(1), journalValue(1)); err != nil {
+	if _, err := coll.Put([]byte(journalCrashKey(1)), journalValue(1)); err != nil {
 		t.Fatalf("put 1: %v", err)
 	}
-	if _, err := coll.Put(journalCrashKey(2), journalValue(2)); err == nil {
+	if _, err := coll.Put([]byte(journalCrashKey(2)), journalValue(2)); err == nil {
 		t.Fatal("put 2 succeeded despite an ENOSPC'd journal append")
 	}
 	if coll.PersistenceError() == nil {
 		t.Fatal("collection not poisoned after journal append failure")
 	}
 	// Die-don't-retry: a later mutation is rejected with the sticky error.
-	if _, err := coll.Put(journalCrashKey(3), journalValue(3)); err == nil {
+	if _, err := coll.Put([]byte(journalCrashKey(3)), journalValue(3)); err == nil {
 		t.Fatal("mutation accepted after journal poison")
 	}
 	image := captureJournalImage(t, path)
@@ -366,25 +366,25 @@ func TestSyncPrimaryJournalAppendFailureNeverVisible(t *testing.T) {
 	// Two acknowledgements land; the third record append is ENOSPC'd — before its
 	// mutation is applied or published.
 	fj.Program(storeio.JournalFaultPlan{Phase: storeio.JournalFaultENOSPCAppend, AppendIndex: 2})
-	if _, err := coll.Put(journalCrashKey(0), journalValue(0)); err != nil {
+	if _, err := coll.Put([]byte(journalCrashKey(0)), journalValue(0)); err != nil {
 		t.Fatalf("put 0: %v", err)
 	}
-	if _, err := coll.Put(journalCrashKey(1), journalValue(1)); err != nil {
+	if _, err := coll.Put([]byte(journalCrashKey(1)), journalValue(1)); err != nil {
 		t.Fatalf("put 1: %v", err)
 	}
-	if _, err := coll.Put(journalCrashKey(2), journalValue(2)); err == nil {
+	if _, err := coll.Put([]byte(journalCrashKey(2)), journalValue(2)); err == nil {
 		t.Fatal("put 2 succeeded despite an ENOSPC'd journal append")
 	}
 	// The stronger sync invariant: the rejected mutation was never published, so
 	// it is not visible on the live reader (buffered-visible would have exposed it
 	// before its ack failed).
-	if got, found, _ := coll.AppendRaw(nil, journalCrashKey(2)); found {
+	if got, found, _ := coll.AppendRaw(nil, []byte(journalCrashKey(2))); found {
 		t.Fatalf("rejected sync mutation is visible in memory: got %q", got)
 	}
 	if coll.PersistenceError() == nil {
 		t.Fatal("collection not poisoned after journal append failure")
 	}
-	if _, err := coll.Put(journalCrashKey(3), journalValue(3)); err == nil {
+	if _, err := coll.Put([]byte(journalCrashKey(3)), journalValue(3)); err == nil {
 		t.Fatal("mutation accepted after journal poison")
 	}
 	image := captureJournalImage(t, path)
@@ -448,7 +448,7 @@ func TestRecoveryJournalRecycleCrashMatrix(t *testing.T) {
 			t.Fatalf("%s: open: %v", label, err)
 		}
 		for i := 0; i < putsBeforeFlush; i++ {
-			if _, err := coll.Put(journalCrashKey(i), journalValue(i)); err != nil {
+			if _, err := coll.Put([]byte(journalCrashKey(i)), journalValue(i)); err != nil {
 				t.Fatalf("%s: put %d: %v", label, i, err)
 			}
 		}

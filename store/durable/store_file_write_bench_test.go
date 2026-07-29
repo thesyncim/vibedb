@@ -102,10 +102,14 @@ func BenchmarkFileStorePutCommitBuffers(b *testing.B) {
 			collection, done := openBenchCollection(b, options)
 			defer done()
 			base := collection.Stats()
+			// Unique keys formatted into a reused []byte so the timed loop pays
+			// no per-op key allocation (the store borrows the key).
+			var keyBuf []byte
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
-				if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchDocument(i)); err != nil {
+				keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", i)
+				if _, err := collection.Put(keyBuf, benchDocument(i)); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -134,15 +138,17 @@ func BenchmarkFileStorePutDeviceBytes(b *testing.B) {
 			collection, done := openBenchCollection(b, options)
 			defer done()
 			for i := range existing {
-				if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchDocument(i)); err != nil {
+				if _, err := collection.Put([]byte(fmt.Sprintf("key-%09d", i)), benchDocument(i)); err != nil {
 					b.Fatal(err)
 				}
 			}
 			base := collection.Stats()
+			var keyBuf []byte
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
-				if _, err := collection.Put(fmt.Sprintf("key-%09d", existing+i), benchDocument(existing+i)); err != nil {
+				keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", existing+i)
+				if _, err := collection.Put(keyBuf, benchDocument(existing+i)); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -194,14 +200,16 @@ func BenchmarkFileStorePutChunkGeometry(b *testing.B) {
 			collection, done := openBenchCollection(b, options)
 			defer done()
 			for i := range 2_000 {
-				if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchDocument(i)); err != nil {
+				if _, err := collection.Put([]byte(fmt.Sprintf("key-%09d", i)), benchDocument(i)); err != nil {
 					b.Fatal(err)
 				}
 			}
 			base := collection.Stats()
+			var keyBuf []byte
 			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
-				if _, err := collection.Put(fmt.Sprintf("key-%09d", 2_000+i), benchDocument(i)); err != nil {
+				keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", 2_000+i)
+				if _, err := collection.Put(keyBuf, benchDocument(i)); err != nil {
 					b.Fatal(err)
 				}
 			}

@@ -20,12 +20,16 @@ func runCollectionWriters(b *testing.B, collection *Collection, writers int) {
 	limit := int64(b.N)
 	for range writers {
 		group.Go(func() {
+			// Per-goroutine reused key scratch: unique keys, no per-op key
+			// allocation in the timed loop (Put borrows the key).
+			var keyBuf []byte
 			for {
 				i := next.Add(1) - 1
 				if i >= limit {
 					return
 				}
-				if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchDocument(int(i))); err != nil {
+				keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", i)
+				if _, err := collection.Put(keyBuf, benchDocument(int(i))); err != nil {
 					b.Error(err)
 					return
 				}
@@ -84,4 +88,3 @@ func BenchmarkFileStoreCommitGrouping(b *testing.B) {
 		}
 	}
 }
-

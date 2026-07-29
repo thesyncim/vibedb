@@ -228,7 +228,7 @@ func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
 	if s.snapshot == nil {
 		return dst, false, nil
 	}
-	return s.snapshot.AppendRaw(dst, key)
+	return s.snapshot.AppendRaw(dst, []byte(key))
 }
 
 func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.Result, error) {
@@ -567,7 +567,7 @@ func (t *tx) stage(state *txTable, key string, document []byte, remove bool) err
 		existed = entry.existed
 	} else if state.snapshot != nil {
 		raw, found, err := state.snapshot.AppendRaw(
-			state.existenceScratch[:0], key,
+			state.existenceScratch[:0], []byte(key),
 		)
 		state.existenceScratch = raw[:0]
 		if err != nil {
@@ -596,7 +596,7 @@ func (t *tx) applyStagedMutations(
 			continue
 		}
 		raw, found, err := state.snapshot.AppendRaw(
-			state.existenceScratch[:0], mutation.key,
+			state.existenceScratch[:0], []byte(mutation.key),
 		)
 		state.existenceScratch = raw[:0]
 		if err != nil {
@@ -723,10 +723,10 @@ func (t *tx) Commit() error {
 				continue
 			}
 			if entry.remove {
-				if err := batch.Delete(key); err != nil {
+				if err := batch.Delete([]byte(key)); err != nil {
 					return transactionBatchError(err)
 				}
-			} else if err := batch.Put(key, entry.document); err != nil {
+			} else if err := batch.Put([]byte(key), entry.document); err != nil {
 				return transactionBatchError(err)
 			}
 		}
@@ -772,9 +772,9 @@ func (t *tx) commitSingleMutationLocked(
 	beforeGeneration := collection.Generation()
 	var err error
 	if entry.remove {
-		_, err = collection.Delete(only)
+		_, err = collection.Delete([]byte(only))
 	} else {
-		_, err = collection.Put(only, entry.document)
+		_, err = collection.Put([]byte(only), entry.document)
 	}
 	if collectionMutationPublished(collection, beforeGeneration, err) {
 		table.conflicts.recordTransaction(state)
@@ -796,7 +796,7 @@ func (t *tx) validateWriteSet(collection *durable.Collection, state *txTable) er
 	var scratch []byte
 	for _, key := range state.order {
 		entry := state.pending[key]
-		current, found, err := live.AppendRaw(scratch[:0], key)
+		current, found, err := live.AppendRaw(scratch[:0], []byte(key))
 		if err != nil {
 			return err
 		}

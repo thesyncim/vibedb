@@ -32,7 +32,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	value := []byte(`{"value":"buffered"}`)
-	if created, err := collection.Put("key", value); err != nil || !created {
+	if created, err := collection.Put([]byte("key"), value); err != nil || !created {
 		t.Fatalf("Put = (%v, %v), want created", created, err)
 	}
 	if got, want := collection.Generation(), uint64(2); got != want {
@@ -41,7 +41,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	if got, want := collection.DurableGeneration(), uint64(1); got != want {
 		t.Fatalf("durable generation = %d, want %d", got, want)
 	}
-	got, found, err := collection.AppendRaw(nil, "key")
+	got, found, err := collection.AppendRaw(nil, []byte("key"))
 	if err != nil || !found || !bytes.Equal(got, value) {
 		t.Fatalf("visible read = (%q, %v, %v), want %q", got, found, err, value)
 	}
@@ -54,7 +54,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	}
 
 	beforeCrash := openBufferedImage(t, before, options)
-	if got, found, err := beforeCrash.AppendRaw(nil, "key"); err != nil || found {
+	if got, found, err := beforeCrash.AppendRaw(nil, []byte("key")); err != nil || found {
 		t.Fatalf("recovery before checkpoint = (%q, %v, %v), want absent", got, found, err)
 	}
 
@@ -69,7 +69,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	afterCrash := openBufferedImage(t, after, options)
-	got, found, err = afterCrash.AppendRaw(nil, "key")
+	got, found, err = afterCrash.AppendRaw(nil, []byte("key"))
 	if err != nil || !found || !bytes.Equal(got, value) {
 		t.Fatalf("recovery after checkpoint = (%q, %v, %v), want %q", got, found, err, value)
 	}
@@ -98,7 +98,7 @@ func TestFileStoreBufferedVisibleCloseCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	value := []byte(`{"value":"close"}`)
-	if _, err := collection.Put("key", value); err != nil {
+	if _, err := collection.Put([]byte("key"), value); err != nil {
 		t.Fatal(err)
 	}
 	if err := collection.Close(); err != nil {
@@ -118,7 +118,7 @@ func TestFileStoreBufferedVisibleCloseCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	got, found, err := reopened.AppendRaw(nil, "key")
+	got, found, err := reopened.AppendRaw(nil, []byte("key"))
 	if err != nil || !found || !bytes.Equal(got, value) {
 		t.Fatalf("read after Close checkpoint = (%q, %v, %v), want %q", got, found, err, value)
 	}
@@ -151,7 +151,7 @@ func TestFileStoreBufferedVisibleCheckpointPreservesOlderSnapshotFaults(t *testi
 
 	oldValue := []byte(`{"version":"old"}`)
 	newValue := []byte(`{"version":"new"}`)
-	if created, putErr := collection.Put("target", oldValue); putErr != nil || !created {
+	if created, putErr := collection.Put([]byte("target"), oldValue); putErr != nil || !created {
 		t.Fatalf("initial Put = (%v, %v), want created", created, putErr)
 	}
 	snapshot, err := collection.Snapshot()
@@ -159,7 +159,7 @@ func TestFileStoreBufferedVisibleCheckpointPreservesOlderSnapshotFaults(t *testi
 		t.Fatal(err)
 	}
 	defer snapshot.Close()
-	if created, putErr := collection.Put("target", newValue); putErr != nil || created {
+	if created, putErr := collection.Put([]byte("target"), newValue); putErr != nil || created {
 		t.Fatalf("replacement Put = (%v, %v), want replaced", created, putErr)
 	}
 	if err := collection.Flush(); err != nil {
@@ -170,7 +170,7 @@ func TestFileStoreBufferedVisibleCheckpointPreservesOlderSnapshotFaults(t *testi
 	for item := 0; item < 2048 && collection.Stats().Evictions == evictions; item++ {
 		key := fmt.Sprintf("pressure-%04d", item)
 		if created, putErr := collection.Put(
-			key, []byte(`{"payload":"cache-pressure"}`),
+			[]byte(key), []byte(`{"payload":"cache-pressure"}`),
 		); putErr != nil || !created {
 			t.Fatalf("pressure Put %d = (%v, %v)", item, created, putErr)
 		}
@@ -178,14 +178,14 @@ func TestFileStoreBufferedVisibleCheckpointPreservesOlderSnapshotFaults(t *testi
 	if got := collection.Stats().Evictions; got <= evictions {
 		t.Fatalf("cache pressure caused no eviction: before=%d after=%d", evictions, got)
 	}
-	got, found, err := snapshot.AppendRaw(nil, "target")
+	got, found, err := snapshot.AppendRaw(nil, []byte("target"))
 	if err != nil || !found || !bytes.Equal(got, oldValue) {
 		t.Fatalf(
 			"older snapshot fault after checkpoint/eviction = (%q, %v, %v), want %q",
 			got, found, err, oldValue,
 		)
 	}
-	got, found, err = collection.AppendRaw(nil, "target")
+	got, found, err = collection.AppendRaw(nil, []byte("target"))
 	if err != nil || !found || !bytes.Equal(got, newValue) {
 		t.Fatalf("latest read = (%q, %v, %v), want %q", got, found, err, newValue)
 	}
@@ -239,7 +239,7 @@ func TestFileStoreBufferedVisibleCheckpointFailureIsSticky(t *testing.T) {
 		t.Fatal(err)
 	}
 	value := []byte(`{"value":"visible"}`)
-	if _, err := collection.Put("key", value); err != nil {
+	if _, err := collection.Put([]byte("key"), value); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,11 +253,11 @@ func TestFileStoreBufferedVisibleCheckpointFailureIsSticky(t *testing.T) {
 	if persistErr := collection.PersistenceError(); !errors.Is(checkpointErr, persistErr) {
 		t.Fatalf("PersistenceError = %v, checkpoint error = %v", persistErr, checkpointErr)
 	}
-	got, found, err := collection.AppendRaw(nil, "key")
+	got, found, err := collection.AppendRaw(nil, []byte("key"))
 	if err != nil || !found || !bytes.Equal(got, value) {
 		t.Fatalf("read after failed checkpoint = (%q, %v, %v), want %q", got, found, err, value)
 	}
-	if _, err := collection.Put("later", []byte(`{"value":2}`)); !errors.Is(err, checkpointErr) {
+	if _, err := collection.Put([]byte("later"), []byte(`{"value":2}`)); !errors.Is(err, checkpointErr) {
 		t.Fatalf("Put after failed checkpoint = %v, want sticky %v", err, checkpointErr)
 	}
 	if err := collection.Flush(); !errors.Is(err, checkpointErr) {
@@ -402,7 +402,7 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 	for at, key := range targets {
 		value := fmt.Appendf(nil, `{"pressure":%d,"leaf":%d}`, at, at)
 		updated[key] = value
-		if _, putErr := collection.Put(key, value); putErr != nil {
+		if _, putErr := collection.Put([]byte(key), value); putErr != nil {
 			t.Fatalf("update %q: %v", key, putErr)
 		}
 	}
@@ -476,7 +476,7 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 	}
 	var scratch []byte
 	for key, value := range updated {
-		got, found, rawErr := reopened.AppendRaw(scratch[:0], key)
+		got, found, rawErr := reopened.AppendRaw(scratch[:0], []byte(key))
 		if rawErr != nil || !found || !bytes.Equal(got, value) {
 			t.Fatalf("reopened %q = (%q, %v, %v), want %q", key, got, found, rawErr, value)
 		}
@@ -499,13 +499,13 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 
 	first := []byte(`{"value":"first","pad":"aaaaaaaaaaaaaaaa"}`)
 	second := []byte(`{"value":"second","pad":"bbbbbbbbbbbbbbbb"}`)
-	if _, err := collection.Put("key", first); err != nil {
+	if _, err := collection.Put([]byte("key"), first); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := collection.Put("key", second); err != nil {
+	if _, err := collection.Put([]byte("key"), second); err != nil {
 		t.Fatal(err)
 	}
-	if got, found, err := collection.AppendRaw(nil, "key"); err != nil ||
+	if got, found, err := collection.AppendRaw(nil, []byte("key")); err != nil ||
 		!found || !bytes.Equal(got, second) {
 		t.Fatalf("latest buffered value = (%q, %v, %v)", got, found, err)
 	}
@@ -543,7 +543,7 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got, found, err := reopened.AppendRaw(nil, "key"); err != nil ||
+	if got, found, err := reopened.AppendRaw(nil, []byte("key")); err != nil ||
 		!found || !bytes.Equal(got, second) {
 		t.Fatalf("reopened latest value = (%q, %v, %v)", got, found, err)
 	}
@@ -568,7 +568,7 @@ func TestFileStoreBufferedVisibleSnapshotPinsRetiredQueuedPages(t *testing.T) {
 
 	first := []byte(`{"value":"snapshot"}`)
 	second := []byte(`{"value":"current"}`)
-	if _, err := collection.Put("key", first); err != nil {
+	if _, err := collection.Put([]byte("key"), first); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := collection.Snapshot()
@@ -582,7 +582,7 @@ func TestFileStoreBufferedVisibleSnapshotPinsRetiredQueuedPages(t *testing.T) {
 	// from the retired root after it has been evicted, so the second Put cannot
 	// have reclaimed the pages the snapshot still needs.
 	oldRefs := []storeio.PageRef{snapshot.state.root.PrimaryRoot}
-	if _, err := collection.Put("key", second); err != nil {
+	if _, err := collection.Put([]byte("key"), second); err != nil {
 		t.Fatal(err)
 	}
 	if err := collection.Flush(); err != nil {
@@ -596,11 +596,11 @@ func TestFileStoreBufferedVisibleSnapshotPinsRetiredQueuedPages(t *testing.T) {
 			collection.cache.Invalidate(ref)
 		}
 	}
-	if got, found, err := snapshot.AppendRaw(nil, "key"); err != nil ||
+	if got, found, err := snapshot.AppendRaw(nil, []byte("key")); err != nil ||
 		!found || !bytes.Equal(got, first) {
 		t.Fatalf("evicted historical snapshot = (%q, %v, %v)", got, found, err)
 	}
-	if got, found, err := collection.AppendRaw(nil, "key"); err != nil ||
+	if got, found, err := collection.AppendRaw(nil, []byte("key")); err != nil ||
 		!found || !bytes.Equal(got, second) {
 		t.Fatalf("current value = (%q, %v, %v)", got, found, err)
 	}
@@ -614,7 +614,7 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 		{
 			name: "delete",
 			mutate: func(collection *Collection) error {
-				deleted, err := collection.Delete("key")
+				deleted, err := collection.Delete([]byte("key"))
 				if err == nil && !deleted {
 					return errors.New("delete reported missing key")
 				}
@@ -625,7 +625,7 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 			name: "batch",
 			mutate: func(collection *Collection) error {
 				return collection.Update(func(batch *WriteBatch) error {
-					return batch.Put("key", []byte(`{"value":"batch"}`))
+					return batch.Put([]byte("key"), []byte(`{"value":"batch"}`))
 				})
 			},
 		},
@@ -646,7 +646,7 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 				_ = collection.Close()
 				_ = file.Close()
 			}()
-			if _, err := collection.Put("key", []byte(`{"value":"old"}`)); err != nil {
+			if _, err := collection.Put([]byte("key"), []byte(`{"value":"old"}`)); err != nil {
 				t.Fatal(err)
 			}
 			snapshot, err := collection.Snapshot()
@@ -661,7 +661,7 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 				snapshot.Close()
 				t.Fatal(err)
 			}
-			if got, found, err := snapshot.AppendRaw(nil, "key"); err != nil ||
+			if got, found, err := snapshot.AppendRaw(nil, []byte("key")); err != nil ||
 				!found || !bytes.Contains(got, []byte(`"old"`)) {
 				snapshot.Close()
 				t.Fatalf("%s historical read = (%q, %v, %v)", test.name, got, found, err)

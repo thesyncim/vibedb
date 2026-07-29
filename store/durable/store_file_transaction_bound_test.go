@@ -28,13 +28,13 @@ func TestSingleDocumentTransactionFitsExactReservation(t *testing.T) {
 			{Name: "indexed", Paths: []string{"/indexed"}},
 		},
 		PageSize: 4096, MaxPageSize: 64 << 10,
-		ResidentBytes:            64 << 20,
-		MaxKeyBytes:              128,
-		InlineValueBytes:         512,
-		MaxDocumentBytes:         64 << 10,
-		MaxBatchDocuments:        64,
-		Backend:                  BackendPortable,
-		Durability:               DurabilityBufferedVisible,
+		ResidentBytes:     64 << 20,
+		MaxKeyBytes:       128,
+		InlineValueBytes:  512,
+		MaxDocumentBytes:  64 << 10,
+		MaxBatchDocuments: 64,
+		Backend:           BackendPortable,
+		Durability:        DurabilityBufferedVisible,
 	}
 	normalized, err := options.normalized()
 	if err != nil {
@@ -90,7 +90,7 @@ func TestSingleDocumentTransactionFitsExactReservation(t *testing.T) {
 	) + suffix)
 	key := strings.Repeat("k", collection.options.MaxKeyBytes)
 	checkpoints := collection.automaticCheckpoints.Load()
-	created, err := collection.Put(key, document)
+	created, err := collection.Put([]byte(key), document)
 	if err != nil || !created {
 		t.Fatalf("maximum indexed Put = (%v,%v), want (true,nil)", created, err)
 	}

@@ -215,20 +215,20 @@ func TestPrimaryExactIndexMutable(t *testing.T) {
 	}
 
 	// In-place value change: move k0000 from c00 to c19.
-	if _, err := collection.Put("k0000", []byte(`{"country":"c19","row":0}`)); err != nil {
+	if _, err := collection.Put([]byte("k0000"), []byte(`{"country":"c19","row":0}`)); err != nil {
 		t.Fatalf("indexed value change Put: %v", err)
 	}
 	delete(oracle["c00"], "k0000")
 	oracle["c19"]["k0000"] = true
 
 	// Delete k0001 (was c01).
-	if _, err := collection.Delete("k0001"); err != nil {
+	if _, err := collection.Delete([]byte("k0001")); err != nil {
 		t.Fatalf("indexed Delete: %v", err)
 	}
 	delete(oracle["c01"], "k0001")
 
 	// Insert a fresh key with a fresh scalar the corpus never used.
-	if _, err := collection.Put("k9999", []byte(`{"country":"czz","row":9999}`)); err != nil {
+	if _, err := collection.Put([]byte("k9999"), []byte(`{"country":"czz","row":9999}`)); err != nil {
 		t.Fatalf("indexed insert Put: %v", err)
 	}
 	oracle["czz"] = map[string]bool{"k9999": true}

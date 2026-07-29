@@ -91,13 +91,13 @@ func FuzzDurableRecovery(f *testing.F) {
 				if (round+i)%3 == 0 {
 					padding = 900
 				}
-				if _, err := collection.Put(commitCrashKey(i),
+				if _, err := collection.Put([]byte(commitCrashKey(i)),
 					commitCrashDocument(round, i, padding)); err != nil {
 					return err
 				}
 			}
 			for i := round; i < 12; i += 3 {
-				if _, err := collection.Delete(commitCrashKey(i)); err != nil {
+				if _, err := collection.Delete([]byte(commitCrashKey(i))); err != nil {
 					return err
 				}
 			}
@@ -202,7 +202,7 @@ func assertFuzzRecoveredStoreIsSelfConsistent(t *testing.T, collection *Collecti
 func assertFuzzKeyDirectoryAgrees(t *testing.T, snapshot *Snapshot, scanned map[string]string) {
 	t.Helper()
 	for key, want := range scanned {
-		got, ok, err := snapshot.AppendRaw(nil, key)
+		got, ok, err := snapshot.AppendRaw(nil, []byte(key))
 		if err != nil {
 			continue
 		}

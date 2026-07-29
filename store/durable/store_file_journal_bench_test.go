@@ -61,11 +61,12 @@ func BenchmarkRecoveryJournalStorePut(b *testing.B) {
 			// patch that appends exactly one record. The first two touches
 			// establish the frame and its first-touch tracking.
 			const key = "bench-key"
+			keyB := []byte(key)
 			value := func(i int) []byte {
 				return []byte(fmt.Sprintf(`{"n":"%016d"}`, i))
 			}
 			for i := 0; i < 3; i++ {
-				if _, err := coll.Put(key, value(i)); err != nil {
+				if _, err := coll.Put(keyB, value(i)); err != nil {
 					b.Fatalf("warmup put: %v", err)
 				}
 			}
@@ -73,7 +74,7 @@ func BenchmarkRecoveryJournalStorePut(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := coll.Put(key, value(i)); err != nil {
+				if _, err := coll.Put(keyB, value(i)); err != nil {
 					b.Fatalf("put: %v", err)
 				}
 			}

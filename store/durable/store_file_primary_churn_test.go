@@ -420,7 +420,7 @@ func primaryChurnReplace(
 	id := part.present[rng.IntN(len(part.present))]
 	*revision++
 	*valueScratch = primaryChurnValue(*valueScratch, *revision)
-	created, err := collection.Put(primaryChurnKey(id), *valueScratch)
+	created, err := collection.Put([]byte(primaryChurnKey(id)), *valueScratch)
 	if errors.Is(err, ErrPrimaryLeafSplitRequired) {
 		// A same-size replace never grows a leaf, so this is not expected; count
 		// it and leave the oracle untouched to stay robust if it ever fires.
@@ -453,7 +453,7 @@ func primaryChurnMove(
 	from := part.present[rng.IntN(len(part.present))]
 	to := part.absent[rng.IntN(len(part.absent))]
 
-	deleted, err := collection.Delete(primaryChurnKey(from))
+	deleted, err := collection.Delete([]byte(primaryChurnKey(from)))
 	if err != nil || !deleted {
 		tb.Fatalf("move delete id %d = %v, err %v", from, deleted, err)
 	}
@@ -462,7 +462,7 @@ func primaryChurnMove(
 
 	*revision++
 	*valueScratch = primaryChurnValue(*valueScratch, *revision)
-	created, err := collection.Put(primaryChurnKey(to), *valueScratch)
+	created, err := collection.Put([]byte(primaryChurnKey(to)), *valueScratch)
 	if errors.Is(err, ErrPrimaryLeafSplitRequired) {
 		// Fullness bit: the target leaf is at its 256-slot cap and no split
 		// exists to relieve it. Restore the deleted key (its slot is free) so the
@@ -470,7 +470,7 @@ func primaryChurnMove(
 		*fallbacks++
 		*revision++
 		restore := primaryChurnValue(nil, *revision)
-		createdBack, restoreErr := collection.Put(primaryChurnKey(from), restore)
+		createdBack, restoreErr := collection.Put([]byte(primaryChurnKey(from)), restore)
 		if restoreErr != nil || !createdBack {
 			tb.Fatalf("move restore id %d = %v, err %v", from, createdBack, restoreErr)
 		}
@@ -505,7 +505,7 @@ func primaryChurnGrow(
 	to := part.absent[rng.IntN(len(part.absent))]
 	*revision++
 	*valueScratch = primaryChurnValue(*valueScratch, *revision)
-	created, err := collection.Put(primaryChurnKey(to), *valueScratch)
+	created, err := collection.Put([]byte(primaryChurnKey(to)), *valueScratch)
 	if err != nil || !created {
 		tb.Fatalf("grow insert id %d = created %v, err %v", to, created, err)
 	}
@@ -525,7 +525,7 @@ func primaryChurnDeleteID(
 	id int,
 ) {
 	tb.Helper()
-	deleted, err := collection.Delete(primaryChurnKey(id))
+	deleted, err := collection.Delete([]byte(primaryChurnKey(id)))
 	if err != nil || !deleted {
 		tb.Fatalf("sweep delete id %d = %v, err %v", id, deleted, err)
 	}
@@ -548,7 +548,7 @@ func primaryChurnOracleCheck(
 	for range probe {
 		id := rng.IntN(universe)
 		want, wantOK := oracle[id]
-		got, ok, err := collection.AppendRaw(buffer[:0], primaryChurnKey(id))
+		got, ok, err := collection.AppendRaw(buffer[:0], []byte(primaryChurnKey(id)))
 		if err != nil || ok != wantOK || !bytes.Equal(got, want) {
 			tb.Fatalf(
 				"oracle drift id %d: got %q,%v,%v want %q,%v",

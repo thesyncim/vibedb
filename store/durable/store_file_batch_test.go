@@ -56,7 +56,7 @@ func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
 		{Name: "pair", Paths: []string{"/status", "/kind"}},
 	}
 	collection, _ := openBatchCollection(t, options)
-	if _, err := collection.Put("seed", []byte(`{"status":"active","kind":"a"}`)); err != nil {
+	if _, err := collection.Put([]byte("seed"), []byte(`{"status":"active","kind":"a"}`)); err != nil {
 		t.Fatal(err)
 	}
 	generation := collection.Generation()
@@ -65,14 +65,14 @@ func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
 		fn   func(*WriteBatch) error
 	}{
 		{"put", func(b *WriteBatch) error {
-			return b.Put("k", []byte(`{"status":"idle","kind":"b"}`))
+			return b.Put([]byte("k"), []byte(`{"status":"idle","kind":"b"}`))
 		}},
-		{"delete", func(b *WriteBatch) error { return b.Delete("seed") }},
+		{"delete", func(b *WriteBatch) error { return b.Delete([]byte("seed")) }},
 		{"mixed", func(b *WriteBatch) error {
-			if err := b.Put("k", []byte(`{"status":"idle","kind":"b"}`)); err != nil {
+			if err := b.Put([]byte("k"), []byte(`{"status":"idle","kind":"b"}`)); err != nil {
 				return err
 			}
-			return b.Delete("seed")
+			return b.Delete([]byte("seed"))
 		}},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
@@ -83,14 +83,14 @@ func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
 				t.Fatalf("refused indexed batch published generation %d, want %d",
 					collection.Generation(), generation)
 			}
-			if _, ok, _ := collection.AppendRaw(nil, "k"); ok {
+			if _, ok, _ := collection.AppendRaw(nil, []byte("k")); ok {
 				t.Fatal("refused indexed batch made a document visible")
 			}
 		})
 	}
 	// The single-document path still maintains the index, so the collection is
 	// fully usable after the refusals — the batch refusal poisons nothing.
-	if _, err := collection.Put("k", []byte(`{"status":"paused","kind":"a"}`)); err != nil {
+	if _, err := collection.Put([]byte("k"), []byte(`{"status":"paused","kind":"a"}`)); err != nil {
 		t.Fatalf("single-document Put after refused batches: %v", err)
 	}
 }
@@ -102,11 +102,11 @@ func assertCollectionsAgree(t *testing.T, label string, want, got *Collection, k
 	}
 	for i := range keys {
 		key := fmt.Sprintf("key-%03d", i)
-		wantRaw, wantOK, err := want.AppendRaw(nil, key)
+		wantRaw, wantOK, err := want.AppendRaw(nil, []byte(key))
 		if err != nil {
 			t.Fatalf("%s: sequential AppendRaw(%s): %v", label, key, err)
 		}
-		gotRaw, gotOK, err := got.AppendRaw(nil, key)
+		gotRaw, gotOK, err := got.AppendRaw(nil, []byte(key))
 		if err != nil {
 			t.Fatalf("%s: batched AppendRaw(%s): %v", label, key, err)
 		}
@@ -135,7 +135,7 @@ func TestCollectionUpdatePublishesOneDurabilityFencePerBatch(t *testing.T) {
 	sequential, _ := openBatchCollection(t, testBatchOptions(n))
 	seqBefore := sequential.Stats().JournalAcks
 	for i := range n {
-		if _, err := sequential.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
+		if _, err := sequential.Put([]byte(fmt.Sprintf("key-%03d", i)), document(i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -148,7 +148,7 @@ func TestCollectionUpdatePublishesOneDurabilityFencePerBatch(t *testing.T) {
 	beforeGen := batched.Generation()
 	if err := batched.Update(func(b *WriteBatch) error {
 		for i := range n {
-			if err := b.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
+			if err := b.Put([]byte(fmt.Sprintf("key-%03d", i)), document(i)); err != nil {
 				return err
 			}
 		}
@@ -174,13 +174,13 @@ func TestCollectionUpdatePublishesOneDurabilityFencePerBatch(t *testing.T) {
 // must both leave the published generation untouched.
 func TestCollectionUpdateRollsBackOnError(t *testing.T) {
 	collection, _ := openBatchCollection(t, testBatchOptions(16))
-	if _, err := collection.Put("seed", []byte(`{"seed":true}`)); err != nil {
+	if _, err := collection.Put([]byte("seed"), []byte(`{"seed":true}`)); err != nil {
 		t.Fatal(err)
 	}
 	generation := collection.Generation()
 	sentinel := errors.New("closure failed")
 	if err := collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("added", []byte(`{"a":1}`)); err != nil {
+		if err := b.Put([]byte("added"), []byte(`{"a":1}`)); err != nil {
 			return err
 		}
 		return sentinel
@@ -188,10 +188,10 @@ func TestCollectionUpdateRollsBackOnError(t *testing.T) {
 		t.Fatalf("closure error = %v, want %v", err, sentinel)
 	}
 	if err := collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("added", []byte(`{"a":1}`)); err != nil {
+		if err := b.Put([]byte("added"), []byte(`{"a":1}`)); err != nil {
 			return err
 		}
-		return b.Put("broken", []byte(`{"a":`))
+		return b.Put([]byte("broken"), []byte(`{"a":`))
 	}); err == nil {
 		t.Fatal("malformed document accepted")
 	}
@@ -201,12 +201,12 @@ func TestCollectionUpdateRollsBackOnError(t *testing.T) {
 	if collection.Len() != 1 {
 		t.Fatalf("length = %d, want 1", collection.Len())
 	}
-	if _, ok, err := collection.AppendRaw(nil, "added"); err != nil || ok {
+	if _, ok, err := collection.AppendRaw(nil, []byte("added")); err != nil || ok {
 		t.Fatalf("aborted batch published a row: (%v,%v)", ok, err)
 	}
 	// The collection must still be writable: an aborted transaction that leaked
 	// its reservation or its retirement claim would fail the next commit.
-	if _, err := collection.Put("after", []byte(`{"a":2}`)); err != nil {
+	if _, err := collection.Put([]byte("after"), []byte(`{"a":2}`)); err != nil {
 		t.Fatalf("write after aborted batch: %v", err)
 	}
 }
@@ -217,27 +217,27 @@ func TestCollectionUpdateRollsBackOnError(t *testing.T) {
 func TestCollectionUpdateDeduplicatesRepeatedKeys(t *testing.T) {
 	collection, _ := openBatchCollection(t, testBatchOptions(16))
 	if err := collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("k", []byte(`{"v":1}`)); err != nil {
+		if err := b.Put([]byte("k"), []byte(`{"v":1}`)); err != nil {
 			return err
 		}
-		if err := b.Put("k", []byte(`{"v":2}`)); err != nil {
+		if err := b.Put([]byte("k"), []byte(`{"v":2}`)); err != nil {
 			return err
 		}
-		if err := b.Put("gone", []byte(`{"v":3}`)); err != nil {
+		if err := b.Put([]byte("gone"), []byte(`{"v":3}`)); err != nil {
 			return err
 		}
-		return b.Delete("gone")
+		return b.Delete([]byte("gone"))
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if collection.Len() != 1 {
 		t.Fatalf("length = %d, want 1", collection.Len())
 	}
-	raw, ok, err := collection.AppendRaw(nil, "k")
+	raw, ok, err := collection.AppendRaw(nil, []byte("k"))
 	if err != nil || !ok || string(raw) != `{"v":2}` {
 		t.Fatalf("k = (%q,%v,%v), want the second document", raw, ok, err)
 	}
-	if _, ok, err := collection.AppendRaw(nil, "gone"); err != nil || ok {
+	if _, ok, err := collection.AppendRaw(nil, []byte("gone")); err != nil || ok {
 		t.Fatalf("gone = (%v,%v), want absent", ok, err)
 	}
 	// The empty key is out of bounds on the ordered primary for the batch and the
@@ -246,7 +246,7 @@ func TestCollectionUpdateDeduplicatesRepeatedKeys(t *testing.T) {
 	// rejects the whole batch and publishes nothing new.
 	generation := collection.Generation()
 	if err := collection.Update(func(b *WriteBatch) error {
-		return b.Put("", []byte(`{"v":4}`))
+		return b.Put([]byte(""), []byte(`{"v":4}`))
 	}); !errors.Is(err, ErrKeyTooLarge) {
 		t.Fatalf("empty-key batch = %v, want ErrKeyTooLarge", err)
 	}
@@ -264,7 +264,7 @@ func TestCollectionUpdateRejectsOversizedBatch(t *testing.T) {
 	generation := collection.Generation()
 	err := collection.Update(func(b *WriteBatch) error {
 		for i := range 5 {
-			if err := b.Put(fmt.Sprintf("key-%d", i), fmt.Appendf(nil, `{"i":%d}`, i)); err != nil {
+			if err := b.Put([]byte(fmt.Sprintf("key-%d", i)), fmt.Appendf(nil, `{"i":%d}`, i)); err != nil {
 				return err
 			}
 		}
@@ -292,37 +292,37 @@ func TestCollectionUpdateBoundsRepeatedKeyArenaAndTotalBytes(t *testing.T) {
 	large[0], large[len(large)-1] = '{', '}'
 	var arenaCapacity int
 	if err := collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("same", large); err != nil {
+		if err := b.Put([]byte("same"), large); err != nil {
 			return err
 		}
 		for i := range 10_000 {
 			if i&1 == 0 {
-				if err := b.Delete("same"); err != nil {
+				if err := b.Delete([]byte("same")); err != nil {
 					return err
 				}
-			} else if err := b.Put("same", []byte(`{"final":false}`)); err != nil {
+			} else if err := b.Put([]byte("same"), []byte(`{"final":false}`)); err != nil {
 				return err
 			}
 			arenaCapacity = max(arenaCapacity, cap(b.values))
 		}
-		return b.Put("same", []byte(`{"final":true}`))
+		return b.Put([]byte("same"), []byte(`{"final":true}`))
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if arenaCapacity > 2048 {
 		t.Fatalf("repeated-key value arena capacity = %d, want bounded near largest value", arenaCapacity)
 	}
-	got, ok, err := collection.AppendRaw(nil, "same")
+	got, ok, err := collection.AppendRaw(nil, []byte("same"))
 	if err != nil || !ok || string(got) != `{"final":true}` {
 		t.Fatalf("final repeated value = (%q,%v,%v)", got, ok, err)
 	}
 
 	generation := collection.Generation()
 	err = collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("first", large); err != nil {
+		if err := b.Put([]byte("first"), large); err != nil {
 			return err
 		}
-		return b.Put("second", large)
+		return b.Put([]byte("second"), large)
 	})
 	if !errors.Is(err, ErrBatchTooLarge) {
 		t.Fatalf("aggregate byte overflow = %v, want ErrBatchTooLarge", err)
@@ -340,14 +340,14 @@ func TestCollectionUpdateBatchIsSingleUse(t *testing.T) {
 	var retained *WriteBatch
 	if err := collection.Update(func(b *WriteBatch) error {
 		retained = b
-		return b.Put("k", []byte(`{"v":1}`))
+		return b.Put([]byte("k"), []byte(`{"v":1}`))
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := retained.Put("late", []byte(`{"v":2}`)); !errors.Is(err, ErrBatchClosed) {
+	if err := retained.Put([]byte("late"), []byte(`{"v":2}`)); !errors.Is(err, ErrBatchClosed) {
 		t.Fatalf("retained batch Put = %v, want ErrBatchClosed", err)
 	}
-	if err := retained.Delete("k"); !errors.Is(err, ErrBatchClosed) {
+	if err := retained.Delete([]byte("k")); !errors.Is(err, ErrBatchClosed) {
 		t.Fatalf("retained batch Delete = %v, want ErrBatchClosed", err)
 	}
 	if collection.Len() != 1 {
@@ -376,7 +376,7 @@ func TestCollectionUpdateSurvivesReopen(t *testing.T) {
 	// which bounds the bytes one Update may land on it.
 	if err := collection.Update(func(b *WriteBatch) error {
 		for i := range 40 {
-			if err := b.Put(fmt.Sprintf("key-%03d", i), fmt.Appendf(nil,
+			if err := b.Put([]byte(fmt.Sprintf("key-%03d", i)), fmt.Appendf(nil,
 				`{"i":%d,"status":%q,"pad":%q}`, i, []string{"a", "b"}[i%2],
 				strings.Repeat("q", i*3))); err != nil {
 				return err
@@ -388,7 +388,7 @@ func TestCollectionUpdateSurvivesReopen(t *testing.T) {
 	}
 	if err := collection.Update(func(b *WriteBatch) error {
 		for i := 0; i < 40; i += 3 {
-			if err := b.Delete(fmt.Sprintf("key-%03d", i)); err != nil {
+			if err := b.Delete([]byte(fmt.Sprintf("key-%03d", i))); err != nil {
 				return err
 			}
 		}
@@ -402,7 +402,7 @@ func TestCollectionUpdateSurvivesReopen(t *testing.T) {
 			continue
 		}
 		key := fmt.Sprintf("key-%03d", i)
-		raw, ok, rawErr := collection.AppendRaw(nil, key)
+		raw, ok, rawErr := collection.AppendRaw(nil, []byte(key))
 		if rawErr != nil || !ok {
 			t.Fatalf("%s = (%v,%v)", key, ok, rawErr)
 		}
@@ -421,14 +421,14 @@ func TestCollectionUpdateSurvivesReopen(t *testing.T) {
 		t.Fatalf("reopened length = %d, want %d", reopened.Len(), len(want))
 	}
 	for key, value := range want {
-		raw, ok, rawErr := reopened.AppendRaw(nil, key)
+		raw, ok, rawErr := reopened.AppendRaw(nil, []byte(key))
 		if rawErr != nil || !ok || string(raw) != value {
 			t.Fatalf("reopened %s = (%q,%v,%v), want %q", key, raw, ok, rawErr, value)
 		}
 	}
 	for i := 0; i < 40; i += 3 {
 		key := fmt.Sprintf("key-%03d", i)
-		if _, ok, rawErr := reopened.AppendRaw(nil, key); rawErr != nil || ok {
+		if _, ok, rawErr := reopened.AppendRaw(nil, []byte(key)); rawErr != nil || ok {
 			t.Fatalf("reopened deleted %s = (%v,%v)", key, ok, rawErr)
 		}
 	}
@@ -457,7 +457,7 @@ func TestCollectionUpdateWritesFewerDeviceBytesThanPuts(t *testing.T) {
 	sequential, _ := openBatchCollection(t, testBatchOptions(n))
 	base := sequential.Stats()
 	for i := range n {
-		if _, err := sequential.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
+		if _, err := sequential.Put([]byte(fmt.Sprintf("key-%03d", i)), document(i)); err != nil {
 			t.Fatal(err)
 		}
 		// Checkpoint each mutation so its leaf rewrite reaches the device on its own.
@@ -471,7 +471,7 @@ func TestCollectionUpdateWritesFewerDeviceBytesThanPuts(t *testing.T) {
 	base = batched.Stats()
 	if err := batched.Update(func(b *WriteBatch) error {
 		for i := range n {
-			if err := b.Put(fmt.Sprintf("key-%03d", i), document(i)); err != nil {
+			if err := b.Put([]byte(fmt.Sprintf("key-%03d", i)), document(i)); err != nil {
 				return err
 			}
 		}
@@ -501,14 +501,14 @@ func TestCollectionUpdateNoOpBatchPublishesNothing(t *testing.T) {
 		t.Fatal("this test only means something with synchronous durability")
 	}
 	collection, _ := openBatchCollection(t, options)
-	if _, err := collection.Put("present", []byte(`{"v":1}`)); err != nil {
+	if _, err := collection.Put([]byte("present"), []byte(`{"v":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	generation := collection.Generation()
 	stats := collection.Stats()
 	if err := collection.Update(func(b *WriteBatch) error {
 		for i := range 4 {
-			if err := b.Delete(fmt.Sprintf("absent-%d", i)); err != nil {
+			if err := b.Delete([]byte(fmt.Sprintf("absent-%d", i))); err != nil {
 				return err
 			}
 		}
@@ -525,7 +525,7 @@ func TestCollectionUpdateNoOpBatchPublishesNothing(t *testing.T) {
 	if got := collection.Stats().DeviceCommits; got != stats.DeviceCommits {
 		t.Fatalf("device commits = %d, want %d", got, stats.DeviceCommits)
 	}
-	if _, err := collection.Put("after", []byte(`{"v":2}`)); err != nil {
+	if _, err := collection.Put([]byte("after"), []byte(`{"v":2}`)); err != nil {
 		t.Fatalf("write after no-op batch: %v", err)
 	}
 }
@@ -560,7 +560,7 @@ func TestCollectionUpdateLargeDocuments(t *testing.T) {
 	}
 	if err := collection.Update(func(b *WriteBatch) error {
 		for _, key := range []string{"big-a", "big-b", "small"} {
-			if err := b.Put(key, []byte(want[key])); err != nil {
+			if err := b.Put([]byte(key), []byte(want[key])); err != nil {
 				return err
 			}
 		}
@@ -576,10 +576,10 @@ func TestCollectionUpdateLargeDocuments(t *testing.T) {
 	generation := collection.Generation()
 	overflow := fmt.Appendf(nil, `{"pad":%q}`, strings.Repeat("O", options.InlineValueBytes))
 	if err := collection.Update(func(b *WriteBatch) error {
-		if err := b.Put("ok", []byte(`{"v":1}`)); err != nil {
+		if err := b.Put([]byte("ok"), []byte(`{"v":1}`)); err != nil {
 			return err
 		}
-		return b.Put("too-big", overflow)
+		return b.Put([]byte("too-big"), overflow)
 	}); !errors.Is(err, ErrDocumentTooLarge) {
 		t.Fatalf("over-budget batch = %v, want ErrDocumentTooLarge", err)
 	}
@@ -587,7 +587,7 @@ func TestCollectionUpdateLargeDocuments(t *testing.T) {
 		t.Fatalf("refused over-budget batch published generation %d, want %d",
 			collection.Generation(), generation)
 	}
-	if _, ok, _ := collection.AppendRaw(nil, "ok"); ok {
+	if _, ok, _ := collection.AppendRaw(nil, []byte("ok")); ok {
 		t.Fatal("refused over-budget batch made its sibling visible")
 	}
 	if err := collection.Close(); err != nil {
@@ -603,7 +603,7 @@ func TestCollectionUpdateLargeDocuments(t *testing.T) {
 		t.Fatalf("reopened length = %d, want %d", reopened.Len(), len(want))
 	}
 	for key, value := range want {
-		got, ok, err := reopened.AppendRaw(nil, key)
+		got, ok, err := reopened.AppendRaw(nil, []byte(key))
 		if err != nil || !ok || string(got) != value {
 			t.Fatalf("reopened %s = (%q,%v,%v), want %q", key, got, ok, err, value)
 		}

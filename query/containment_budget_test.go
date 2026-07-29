@@ -144,7 +144,7 @@ func TestDurablePunctuationDenseContainmentIsBounded(t *testing.T) {
 	defer collection.Close()
 
 	document := []byte(`{"id":1,"hay":` + denseContainmentArray(5_000) + `}`)
-	if _, err := collection.Put("row", document); err != nil {
+	if _, err := collection.Put([]byte("row"), document); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := collection.Snapshot()

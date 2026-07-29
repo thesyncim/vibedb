@@ -92,7 +92,7 @@ func TestFileStoreFreeSetSurvivesCrashAtEveryWritePoint(t *testing.T) {
 		key := fmt.Sprintf("key-%02d", attempt%keys)
 		doc := []byte(fmt.Sprintf(`{"crash":%d,"padding":%q}`,
 			attempt, strings.Repeat("q", 200+attempt*300)))
-		if _, err := collection.Put(key, doc); err != nil {
+		if _, err := collection.Put([]byte(key), doc); err != nil {
 			t.Fatal(err)
 		}
 		if err := collection.Flush(); err != nil {
@@ -254,7 +254,7 @@ func assertCrashImageFreeSetIsDead(
 	expected := make(map[string]string, 32)
 	for i := range 32 {
 		key := fmt.Sprintf("key-%02d", i)
-		value, ok, getErr := collection.AppendRaw(nil, key)
+		value, ok, getErr := collection.AppendRaw(nil, []byte(key))
 		if getErr != nil {
 			t.Fatalf("%s read %s: %v", name, key, getErr)
 		}
@@ -299,7 +299,7 @@ func assertCrashImageFreeSetIsDead(
 			"held a page the selected root needed", name, generation, got)
 	}
 	for key, want := range expected {
-		got, ok, getErr := after.AppendRaw(nil, key)
+		got, ok, getErr := after.AppendRaw(nil, []byte(key))
 		if getErr != nil || !ok || string(got) != want {
 			t.Fatalf("%s %s after destroying its free space = (%q,%v,%v), want %q",
 				name, key, got, ok, getErr, want)
@@ -312,16 +312,16 @@ func assertCrashImageFreeSetIsDead(
 	// Writing is the other half. A recovered store whose free set overlaps a live
 	// page reads correctly right up until the moment it allocates from it, so the
 	// read sweep alone would pass on exactly the image that corrupts.
-	if _, err := after.Put("crash-probe", []byte(`{"probe":true}`)); err != nil {
+	if _, err := after.Put([]byte("crash-probe"), []byte(`{"probe":true}`)); err != nil {
 		t.Fatalf("%s write after recovery: %v", name, err)
 	}
 	assertFreeSetMirror(t, after, name+" after writing")
-	if got, ok, getErr := after.AppendRaw(nil, "crash-probe"); getErr != nil || !ok ||
+	if got, ok, getErr := after.AppendRaw(nil, []byte("crash-probe")); getErr != nil || !ok ||
 		string(got) != `{"probe":true}` {
 		t.Fatalf("%s probe read back = (%q,%v,%v)", name, got, ok, getErr)
 	}
 	for key, want := range expected {
-		got, ok, getErr := after.AppendRaw(nil, key)
+		got, ok, getErr := after.AppendRaw(nil, []byte(key))
 		if getErr != nil || !ok || string(got) != want {
 			t.Fatalf("%s %s after writing into recovered free space = (%q,%v,%v), want %q",
 				name, key, got, ok, getErr, want)
@@ -374,7 +374,7 @@ func TestFileStoreAlternateRootSurvivesFreeSpaceReuse(t *testing.T) {
 		key := fmt.Sprintf("key-%02d", attempt%keys)
 		doc := []byte(fmt.Sprintf(`{"alt":%d,"padding":%q}`,
 			attempt, strings.Repeat("w", 300+attempt*250)))
-		if _, err := collection.Put(key, doc); err != nil {
+		if _, err := collection.Put([]byte(key), doc); err != nil {
 			t.Fatal(err)
 		}
 		if err := collection.Flush(); err != nil {
@@ -384,7 +384,7 @@ func TestFileStoreAlternateRootSurvivesFreeSpaceReuse(t *testing.T) {
 		expected := make(map[string]string, keys)
 		for i := range keys {
 			name := fmt.Sprintf("key-%02d", i)
-			value, ok, getErr := collection.AppendRaw(nil, name)
+			value, ok, getErr := collection.AppendRaw(nil, []byte(name))
 			if getErr != nil {
 				t.Fatal(getErr)
 			}
@@ -432,7 +432,7 @@ func TestFileStoreAlternateRootSurvivesFreeSpaceReuse(t *testing.T) {
 		// key must be present and exactly right: an absent or wrong one means its
 		// page was handed out while this root still pointed at it.
 		for name, want := range expected {
-			got, ok, getErr := fallback.AppendRaw(nil, name)
+			got, ok, getErr := fallback.AppendRaw(nil, []byte(name))
 			if getErr != nil {
 				t.Fatalf("attempt %d: reading %s from the alternate root: %v", attempt, name, getErr)
 			}
@@ -450,7 +450,7 @@ func TestFileStoreAlternateRootSurvivesFreeSpaceReuse(t *testing.T) {
 		if err := fallback.refreshReusable(fallback.state.Load()); err != nil {
 			t.Fatalf("attempt %d: alternate root free-log replay: %v", attempt, err)
 		}
-		if _, err := fallback.Put("alt-probe", []byte(`{"probe":1}`)); err != nil {
+		if _, err := fallback.Put([]byte("alt-probe"), []byte(`{"probe":1}`)); err != nil {
 			t.Fatalf("attempt %d: alternate root cannot write: %v", attempt, err)
 		}
 		assertFreeSetMirror(t, fallback, fmt.Sprintf("alternate root %d", attempt))

@@ -46,7 +46,7 @@ func TestFileStoreSchemaMutationAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	document := []byte(`{"id":1,"profile":{"name":"Ada"}}`)
-	if _, err := fs.Put("key", document); err != nil {
+	if _, err := fs.Put([]byte("key"), document); err != nil {
 		t.Fatal(err)
 	}
 	generation := fs.Generation()
@@ -55,7 +55,7 @@ func TestFileStoreSchemaMutationAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fs.Put(
-		"key", []byte(`{"id":1,"profile":{}}`),
+		[]byte("key"), []byte(`{"id":1,"profile":{}}`),
 	); !errors.Is(err, store.ErrSchemaViolation) {
 		t.Fatalf("collection invalid replacement = %v", err)
 	}
@@ -76,7 +76,7 @@ func TestFileStoreSchemaMutationAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, err := reopened.AppendRaw(nil, "key"); err != nil ||
+	if got, ok, err := reopened.AppendRaw(nil, []byte("key")); err != nil ||
 		!ok || !bytes.Equal(got, document) {
 		t.Fatalf("reopened document = (%q,%v,%v)", got, ok, err)
 	}

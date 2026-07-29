@@ -29,7 +29,7 @@ func TestFileStoreGroupedCommitCoversPublishedFileEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := range documents {
-			if _, err := collection.Put(fmt.Sprintf("key-%04d", i), []byte(fmt.Sprintf(`{"id":%d}`, i))); err != nil {
+			if _, err := collection.Put([]byte(fmt.Sprintf("key-%04d", i)), []byte(fmt.Sprintf(`{"id":%d}`, i))); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -53,7 +53,7 @@ func TestFileStoreGroupedCommitCoversPublishedFileEnd(t *testing.T) {
 			t.Fatalf("documents=%d: reopen: %v", documents, err)
 		}
 		for i := range documents {
-			got, ok, readErr := reopened.AppendRaw(nil, fmt.Sprintf("key-%04d", i))
+			got, ok, readErr := reopened.AppendRaw(nil, []byte(fmt.Sprintf("key-%04d", i)))
 			want := fmt.Sprintf(`{"id":%d}`, i)
 			if readErr != nil || !ok || string(got) != want {
 				t.Fatalf("reopened key %d = (%q,%v,%v)", i, got, ok, readErr)

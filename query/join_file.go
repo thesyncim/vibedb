@@ -954,7 +954,7 @@ func (b *joinBinding) probeFile(cell scalar, pr *joinProbe) bool {
 		return false
 	}
 	pr.probes++
-	raw, ok, err := b.file.snapshot.AppendRaw(pr.raw[:0], cell.sval)
+	raw, ok, err := b.file.snapshot.AppendRaw(pr.raw[:0], []byte(cell.sval))
 	pr.raw = raw
 	if err != nil {
 		if pr.err == nil {

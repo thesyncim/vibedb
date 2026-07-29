@@ -146,7 +146,7 @@ func TestFilePrimaryRepackRoundTrip(t *testing.T) {
 	buffer := make([]byte, 0, 64)
 	for id := 0; id < universe; id++ {
 		want, wantOK := oracle[id]
-		got, ok, err := repacked.AppendRaw(buffer[:0], primaryChurnKey(id))
+		got, ok, err := repacked.AppendRaw(buffer[:0], []byte(primaryChurnKey(id)))
 		if err != nil || ok != wantOK || !bytes.Equal(got, want) {
 			t.Fatalf(
 				"contents drift id %d: got %q,%v,%v want %q,%v",

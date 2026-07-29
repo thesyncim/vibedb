@@ -250,12 +250,12 @@ func freeChurnRound(t *testing.T, fs *Collection, keys, round int) {
 		padding := strings.Repeat("x", 120+(round*37+key*53)%300)
 		doc := fmt.Sprintf(`{"round":%d,"key":%d,"status":%q,"padding":%q}`,
 			round, key, [3]string{"active", "idle", "paused"}[(round+key)%3], padding)
-		if _, err := fs.Put(fmt.Sprintf("key-%02d", key), []byte(doc)); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("key-%02d", key)), []byte(doc)); err != nil {
 			t.Fatalf("round %d put %d: %v", round, key, err)
 		}
 	}
 	for key := round % 3; key < keys; key += 3 {
-		if _, err := fs.Delete(fmt.Sprintf("key-%02d", key)); err != nil {
+		if _, err := fs.Delete([]byte(fmt.Sprintf("key-%02d", key))); err != nil {
 			t.Fatalf("round %d delete %d: %v", round, key, err)
 		}
 	}
@@ -391,7 +391,7 @@ func TestFileStoreFreeSpaceHoldsNothingReachable(t *testing.T) {
 	expected := make(map[string]string, keys)
 	for key := range keys {
 		name := fmt.Sprintf("key-%02d", key)
-		value, ok, getErr := fs.AppendRaw(nil, name)
+		value, ok, getErr := fs.AppendRaw(nil, []byte(name))
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
@@ -434,7 +434,7 @@ func TestFileStoreFreeSpaceHoldsNothingReachable(t *testing.T) {
 	}
 	defer reopened.Close()
 	for name, want := range expected {
-		got, ok, getErr := reopened.AppendRaw(nil, name)
+		got, ok, getErr := reopened.AppendRaw(nil, []byte(name))
 		if getErr != nil || !ok || string(got) != want {
 			t.Fatalf("%s after overwriting free space = (%q,%v,%v)", name, got, ok, getErr)
 		}
@@ -532,13 +532,13 @@ func TestFileStoreLazyFreeSegmentPromotionCyclesBoundedArena(t *testing.T) {
 	// checkpoints leave both superblock slots at generation two or later, so the
 	// generation-one extents this promotion test plants fall below the floor and
 	// are reusable.
-	if _, err := fs.Put("a", []byte(`{"v":1}`)); err != nil {
+	if _, err := fs.Put([]byte("a"), []byte(`{"v":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := fs.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.Put("b", []byte(`{"v":2}`)); err != nil {
+	if _, err := fs.Put([]byte("b"), []byte(`{"v":2}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := fs.Flush(); err != nil {
@@ -757,7 +757,7 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 				value := []byte(fmt.Sprintf(
 					`{"id":%d,"padding":%q}`, i, strings.Repeat("x", 300),
 				))
-				if err := batch.Put(fmt.Sprintf("spill-%03d", i), value); err != nil {
+				if err := batch.Put([]byte(fmt.Sprintf("spill-%03d", i)), value); err != nil {
 					return err
 				}
 			}
@@ -769,7 +769,7 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 	for base := 0; base < documents; base += options.MaxBatchDocuments {
 		if err := fs.Update(func(batch *WriteBatch) error {
 			for i := base; i < base+options.MaxBatchDocuments; i++ {
-				if err := batch.Delete(fmt.Sprintf("spill-%03d", i)); err != nil {
+				if err := batch.Delete([]byte(fmt.Sprintf("spill-%03d", i))); err != nil {
 					return err
 				}
 			}
@@ -1131,7 +1131,7 @@ func TestFileStoreSurvivesManyRestartsWithoutGrowingTheFile(t *testing.T) {
 		if openErr != nil {
 			t.Fatalf("cycle %d open: %v", cycle, openErr)
 		}
-		if _, err := session.Put("key-00", []byte(`{"cycle":1}`)); err != nil {
+		if _, err := session.Put([]byte("key-00"), []byte(`{"cycle":1}`)); err != nil {
 			t.Fatalf("cycle %d put: %v", cycle, err)
 		}
 		assertFreeSetMirror(t, session, fmt.Sprintf("cycle %d", cycle))
@@ -1175,7 +1175,7 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	const keys = 16
 	body := strings.Repeat("x", 300)
 	put := func(round, i int) error {
-		_, err := fs.Put(fmt.Sprintf("k%02d", i), fmt.Appendf(nil,
+		_, err := fs.Put([]byte(fmt.Sprintf("k%02d", i)), fmt.Appendf(nil,
 			`{"round":%d,"v":%q}`, round, body))
 		return err
 	}
@@ -1242,7 +1242,7 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	}
 	for i := range keys {
 		key := fmt.Sprintf("k%02d", i)
-		got, ok, getErr := fs.AppendRaw(nil, key)
+		got, ok, getErr := fs.AppendRaw(nil, []byte(key))
 		if getErr != nil || !ok || !bytes.Contains(got, []byte(`"round":5015`)) {
 			t.Fatalf("AppendRaw(%s) after recovery = (%s,%v,%v)", key, got, ok, getErr)
 		}

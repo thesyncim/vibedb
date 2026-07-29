@@ -109,12 +109,12 @@ func TestFilePrimaryBatchMatchesSequential(t *testing.T) {
 			defer seqFile.Close()
 			for _, op := range ops {
 				if op.remove {
-					if _, err := sequential.Delete(op.key); err != nil {
+					if _, err := sequential.Delete([]byte(op.key)); err != nil {
 						t.Fatalf("sequential delete %s: %v", op.key, err)
 					}
 					continue
 				}
-				if _, err := sequential.Put(op.key, op.value); err != nil {
+				if _, err := sequential.Put([]byte(op.key), op.value); err != nil {
 					t.Fatalf("sequential put %s: %v", op.key, err)
 				}
 			}
@@ -132,12 +132,12 @@ func TestFilePrimaryBatchMatchesSequential(t *testing.T) {
 				if err := batched.Update(func(b *WriteBatch) error {
 					for _, op := range run {
 						if op.remove {
-							if err := b.Delete(op.key); err != nil {
+							if err := b.Delete([]byte(op.key)); err != nil {
 								return err
 							}
 							continue
 						}
-						if err := b.Put(op.key, op.value); err != nil {
+						if err := b.Put([]byte(op.key), op.value); err != nil {
 							return err
 						}
 					}
@@ -173,7 +173,7 @@ func TestFilePrimaryBatchAtomicOnPrepareFailure(t *testing.T) {
 			defer coll.Close()
 			defer file.Close()
 			for i := 0; i < 8; i++ {
-				if _, err := coll.Put(fmt.Sprintf("base%02d", i), journalValue(i)); err != nil {
+				if _, err := coll.Put([]byte(fmt.Sprintf("base%02d", i)), journalValue(i)); err != nil {
 					t.Fatalf("seed put: %v", err)
 				}
 			}
@@ -181,7 +181,7 @@ func TestFilePrimaryBatchAtomicOnPrepareFailure(t *testing.T) {
 
 			boom := errors.New("caller aborted the batch")
 			if err := coll.Update(func(b *WriteBatch) error {
-				if err := b.Put("late", []byte(`{"ok":1}`)); err != nil {
+				if err := b.Put([]byte("late"), []byte(`{"ok":1}`)); err != nil {
 					return err
 				}
 				return boom
@@ -195,10 +195,10 @@ func TestFilePrimaryBatchAtomicOnPrepareFailure(t *testing.T) {
 			// A malformed document is a prepare-time rejection: the whole batch,
 			// including the well-formed sibling, must publish nothing.
 			if err := coll.Update(func(b *WriteBatch) error {
-				if err := b.Put("good", []byte(`{"ok":2}`)); err != nil {
+				if err := b.Put([]byte("good"), []byte(`{"ok":2}`)); err != nil {
 					return err
 				}
-				return b.Put("bad", []byte(`{"broken":`))
+				return b.Put([]byte("bad"), []byte(`{"broken":`))
 			}); err == nil {
 				t.Fatal("batch with a malformed document succeeded, want an error")
 			}
@@ -206,7 +206,7 @@ func TestFilePrimaryBatchAtomicOnPrepareFailure(t *testing.T) {
 			if !mapsEqual(after, before) {
 				t.Fatal("a rejected malformed batch changed collection state")
 			}
-			if _, ok, _ := coll.AppendRaw(nil, "good"); ok {
+			if _, ok, _ := coll.AppendRaw(nil, []byte("good")); ok {
 				t.Fatal("the well-formed sibling of a rejected batch became visible")
 			}
 			if coll.PersistenceError() != nil {
@@ -249,12 +249,12 @@ func TestFilePrimaryBatchDeterministic(t *testing.T) {
 		if err := coll.Update(func(b *WriteBatch) error {
 			for _, op := range ops {
 				if op.remove {
-					if err := b.Delete(op.key); err != nil {
+					if err := b.Delete([]byte(op.key)); err != nil {
 						return err
 					}
 					continue
 				}
-				if err := b.Put(op.key, op.value); err != nil {
+				if err := b.Put([]byte(op.key), op.value); err != nil {
 					return err
 				}
 			}
@@ -296,7 +296,7 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 			defer coll.Close()
 			defer file.Close()
 			for i := 0; i < 24; i++ {
-				if _, err := coll.Put(fmt.Sprintf("base%02d", i), journalValue(i)); err != nil {
+				if _, err := coll.Put([]byte(fmt.Sprintf("base%02d", i)), journalValue(i)); err != nil {
 					t.Fatalf("seed put: %v", err)
 				}
 			}
@@ -308,13 +308,13 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 			}
 
 			if err := coll.Update(func(b *WriteBatch) error {
-				if err := b.Put("fresh", []byte(`{"new":1}`)); err != nil {
+				if err := b.Put([]byte("fresh"), []byte(`{"new":1}`)); err != nil {
 					return err
 				}
-				if err := b.Put("base00", []byte(`{"overwritten":1}`)); err != nil {
+				if err := b.Put([]byte("base00"), []byte(`{"overwritten":1}`)); err != nil {
 					return err
 				}
-				return b.Delete("base01")
+				return b.Delete([]byte("base01"))
 			}); err != nil {
 				t.Fatalf("batch under snapshot: %v", err)
 			}
@@ -332,13 +332,13 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 			}
 
 			// The live collection observes the whole batch.
-			if v, ok, _ := coll.AppendRaw(nil, "fresh"); !ok || string(v) != `{"new":1}` {
+			if v, ok, _ := coll.AppendRaw(nil, []byte("fresh")); !ok || string(v) != `{"new":1}` {
 				t.Fatalf("live fresh = %q,%v, want the batch put", v, ok)
 			}
-			if v, ok, _ := coll.AppendRaw(nil, "base00"); !ok || string(v) != `{"overwritten":1}` {
+			if v, ok, _ := coll.AppendRaw(nil, []byte("base00")); !ok || string(v) != `{"overwritten":1}` {
 				t.Fatalf("live base00 = %q,%v, want the batch overwrite", v, ok)
 			}
-			if _, ok, _ := coll.AppendRaw(nil, "base01"); ok {
+			if _, ok, _ := coll.AppendRaw(nil, []byte("base01")); ok {
 				t.Fatal("live base01 still present after batch delete")
 			}
 			if err := snap.Close(); err != nil {
@@ -347,11 +347,11 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 
 			// After the lease closes, a second batch commits and reads back.
 			if err := coll.Update(func(b *WriteBatch) error {
-				return b.Put("after", []byte(`{"post":1}`))
+				return b.Put([]byte("after"), []byte(`{"post":1}`))
 			}); err != nil {
 				t.Fatalf("post-snapshot batch: %v", err)
 			}
-			if v, ok, _ := coll.AppendRaw(nil, "after"); !ok || string(v) != `{"post":1}` {
+			if v, ok, _ := coll.AppendRaw(nil, []byte("after")); !ok || string(v) != `{"post":1}` {
 				t.Fatalf("live after = %q,%v, want the second batch put", v, ok)
 			}
 			if coll.PersistenceError() != nil {
@@ -385,10 +385,10 @@ func batchContentOracle(n int) []map[string]string {
 
 func applyCrashBatch(coll *Collection, i int) error {
 	return coll.Update(func(b *WriteBatch) error {
-		if err := b.Put(batchCrashKey(i, 0), journalValue(2*i)); err != nil {
+		if err := b.Put([]byte(batchCrashKey(i, 0)), journalValue(2*i)); err != nil {
 			return err
 		}
-		return b.Put(batchCrashKey(i, 1), journalValue(2*i+1))
+		return b.Put([]byte(batchCrashKey(i, 1)), journalValue(2*i+1))
 	})
 }
 
@@ -567,7 +567,7 @@ func runPrimaryBatchCheckpointFaultPass(
 	for i := 0; i < ops; i++ {
 		opErr := coll.Update(func(b *WriteBatch) error {
 			for j := 0; j < 8; j++ {
-				if err := b.Put(fmt.Sprintf("bc%02d-%02d", i, j), journalValue(i*8+j)); err != nil {
+				if err := b.Put([]byte(fmt.Sprintf("bc%02d-%02d", i, j)), journalValue(i*8+j)); err != nil {
 					return err
 				}
 			}

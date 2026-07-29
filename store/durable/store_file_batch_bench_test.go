@@ -30,19 +30,19 @@ func benchBatchDocument(i int) []byte {
 }
 
 type mutationBenchCorpus struct {
-	keys      []string
+	keys      [][]byte
 	documents [2][][]byte
 }
 
 func newMutationBenchCorpus(rows int) mutationBenchCorpus {
 	corpus := mutationBenchCorpus{
-		keys: make([]string, rows),
+		keys: make([][]byte, rows),
 		documents: [2][][]byte{
 			make([][]byte, rows), make([][]byte, rows),
 		},
 	}
 	for i := range rows {
-		corpus.keys[i] = fmt.Sprintf("key-%09d", i)
+		corpus.keys[i] = []byte(fmt.Sprintf("key-%09d", i))
 		for version := range 2 {
 			corpus.documents[version][i] = fmt.Appendf(
 				nil,
@@ -63,7 +63,9 @@ func openMutationBenchCollection(
 		b.Fatal(err)
 	}
 	for i, key := range corpus.keys {
-		if _, err := source.Put(key, corpus.documents[0][i]); err != nil {
+		// source is the heap store (string-keyed); convert at this untimed
+		// setup boundary.
+		if _, err := source.Put(string(key), corpus.documents[0][i]); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -124,13 +126,17 @@ func BenchmarkFileStoreBatchWrite(b *testing.B) {
 			defer done()
 			base := collection.Stats()
 			written := 0
+			// Reused key scratch: unique keys, no per-op key allocation in the
+			// timed loop (batch.Put copies the key into its arena).
+			var keyBuf []byte
 			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
 				start := i * size
 				if err := collection.Update(func(batch *WriteBatch) error {
 					for j := range size {
+						keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", start+j)
 						if err := batch.Put(
-							fmt.Sprintf("key-%09d", start+j), benchBatchDocument(start+j),
+							keyBuf, benchBatchDocument(start+j),
 						); err != nil {
 							return err
 						}
@@ -150,9 +156,11 @@ func BenchmarkFileStoreBatchWrite(b *testing.B) {
 		defer done()
 		base := collection.Stats()
 		written := 0
+		var keyBuf []byte
 		b.ResetTimer()
 		for i := 0; b.Loop(); i++ {
-			if _, err := collection.Put(fmt.Sprintf("key-%09d", i), benchBatchDocument(i)); err != nil {
+			keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", i)
+			if _, err := collection.Put(keyBuf, benchBatchDocument(i)); err != nil {
 				b.Fatal(err)
 			}
 			written++
@@ -179,12 +187,14 @@ func BenchmarkFileStoreBatchWriteIndexed(b *testing.B) {
 			defer done()
 			base := collection.Stats()
 			written := 0
+			var keyBuf []byte
 			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
 				start := i * size
 				if err := collection.Update(func(batch *WriteBatch) error {
 					for j := range size {
-						if err := batch.Put(fmt.Sprintf("key-%09d", start+j), document(start+j)); err != nil {
+						keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", start+j)
+						if err := batch.Put(keyBuf, document(start+j)); err != nil {
 							return err
 						}
 					}
@@ -205,9 +215,11 @@ func BenchmarkFileStoreBatchWriteIndexed(b *testing.B) {
 		defer done()
 		base := collection.Stats()
 		written := 0
+		var keyBuf []byte
 		b.ResetTimer()
 		for i := 0; b.Loop(); i++ {
-			if _, err := collection.Put(fmt.Sprintf("key-%09d", i), document(i)); err != nil {
+			keyBuf = fmt.Appendf(keyBuf[:0], "key-%09d", i)
+			if _, err := collection.Put(keyBuf, document(i)); err != nil {
 				b.Fatal(err)
 			}
 			written++

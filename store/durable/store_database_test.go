@@ -39,7 +39,7 @@ func newTestDatabase(t testing.TB, names ...string) *Database {
 
 func mustPut(t testing.TB, c *Collection, key, doc string) {
 	t.Helper()
-	if _, err := c.Put(key, []byte(doc)); err != nil {
+	if _, err := c.Put([]byte(key), []byte(doc)); err != nil {
 		t.Fatalf("Put(%s): %v", key, err)
 	}
 }
@@ -70,7 +70,7 @@ func TestDurableDatabaseSnapshotCapturesEveryCollection(t *testing.T) {
 	if !ok {
 		t.Fatal("orders absent from the snapshot")
 	}
-	raw, found, err := view.AppendRaw(nil, "o1")
+	raw, found, err := view.AppendRaw(nil, []byte("o1"))
 	if err != nil || !found || string(raw) != `{"customer":"c1"}` {
 		t.Fatalf("AppendRaw(o1)=%q,%v,%v", raw, found, err)
 	}
@@ -99,14 +99,14 @@ func TestDurableDatabaseSnapshotIsIndependentOfLaterMutation(t *testing.T) {
 	}
 
 	view, _ := snapshot.Collection("orders")
-	raw, _, err := view.AppendRaw(nil, "o1")
+	raw, _, err := view.AppendRaw(nil, []byte("o1"))
 	if err != nil {
 		t.Fatalf("AppendRaw: %v", err)
 	}
 	if string(raw) != `{"n":1}` {
 		t.Fatalf("AppendRaw(o1)=%q want the captured value", raw)
 	}
-	if _, found, _ := view.AppendRaw(nil, "o2"); found {
+	if _, found, _ := view.AppendRaw(nil, []byte("o2")); found {
 		t.Fatal("a key written after the snapshot is visible in it")
 	}
 	if _, ok := snapshot.Collection("later"); ok {
@@ -164,7 +164,7 @@ func TestDurableDatabaseSnapshotIsASingleInstant(t *testing.T) {
 			for i := range writes {
 				c := handles[(w+i)%collections]
 				started.Add(1)
-				if _, err := c.Put(fmt.Sprintf("w%d-%d", w, i), fmt.Appendf(nil, `{"w":%d,"i":%d}`, w, i)); err != nil {
+				if _, err := c.Put([]byte(fmt.Sprintf("w%d-%d", w, i)), fmt.Appendf(nil, `{"w":%d,"i":%d}`, w, i)); err != nil {
 					t.Errorf("Put: %v", err)
 					return
 				}
@@ -348,7 +348,7 @@ func TestDurableDatabaseReopensItsDirectory(t *testing.T) {
 	}
 	defer func() { _ = snapshot.Close() }()
 	view, _ := snapshot.Collection("orders")
-	raw, found, err := view.AppendRaw(nil, "orders-1")
+	raw, found, err := view.AppendRaw(nil, []byte("orders-1"))
 	if err != nil || !found || string(raw) != `{"in":"orders"}` {
 		t.Fatalf("AppendRaw=%q,%v,%v", raw, found, err)
 	}
@@ -522,7 +522,7 @@ func TestDurableDatabaseSnapshotMaterializesDeferredLanes(t *testing.T) {
 				if !ok {
 					t.Fatalf("collection %q absent from the cut", name)
 				}
-				point, ok, err := snap.AppendRaw(nil, "k")
+				point, ok, err := snap.AppendRaw(nil, []byte("k"))
 				if err != nil || !ok {
 					t.Fatalf("%s: snapshot point read: ok=%v err=%v", name, ok, err)
 				}
@@ -542,7 +542,7 @@ func TestDurableDatabaseSnapshotMaterializesDeferredLanes(t *testing.T) {
 			}
 			for _, name := range names {
 				snap, _ := cut.Collection(name)
-				point, ok, err := snap.AppendRaw(nil, "k")
+				point, ok, err := snap.AppendRaw(nil, []byte("k"))
 				if err != nil || !ok {
 					t.Fatalf("%s: old-cut point read after new put: ok=%v err=%v", name, ok, err)
 				}

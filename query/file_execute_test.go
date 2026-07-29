@@ -38,7 +38,7 @@ func TestRunFileSnapshotParallelSpillDifferential(t *testing.T) {
 		if _, err := set.Append(doc); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fs.Put(fmt.Sprintf("key-%04d", i), doc); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("key-%04d", i)), doc); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -150,7 +150,7 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 		if _, err := set.Append(doc); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fs.Put(fmt.Sprintf("key-%04d", i), doc); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("key-%04d", i)), doc); err != nil {
 			t.Fatal(err)
 		}
 	}

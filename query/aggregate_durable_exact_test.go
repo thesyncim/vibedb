@@ -34,7 +34,7 @@ func TestExactAggregatesSurviveDurableParallelSpill(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := collection.Put(
-				fmt.Sprintf("k-%03d-%d", group, row), document,
+				[]byte(fmt.Sprintf("k-%03d-%d", group, row)), document,
 			); err != nil {
 				t.Fatal(err)
 			}

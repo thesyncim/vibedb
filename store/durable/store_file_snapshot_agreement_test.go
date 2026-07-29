@@ -51,7 +51,7 @@ func TestFileSnapshotPointScanAgreement(t *testing.T) {
 			}
 			defer coll.Close()
 
-			if _, err := coll.Put("k", []byte(`{"v":1}`)); err != nil {
+			if _, err := coll.Put([]byte("k"), []byte(`{"v":1}`)); err != nil {
 				t.Fatal(err)
 			}
 			snap, err := coll.Snapshot()
@@ -60,7 +60,7 @@ func TestFileSnapshotPointScanAgreement(t *testing.T) {
 			}
 			defer snap.Close()
 
-			point, ok, err := snap.AppendRaw(nil, "k")
+			point, ok, err := snap.AppendRaw(nil, []byte("k"))
 			if err != nil || !ok {
 				t.Fatalf("snapshot point read: ok=%v err=%v", ok, err)
 			}
@@ -80,10 +80,10 @@ func TestFileSnapshotPointScanAgreement(t *testing.T) {
 				t.Errorf("snapshot point read lost the acknowledged write: %s", point)
 			}
 
-			if _, err := coll.Put("k", []byte(`{"v":2}`)); err != nil {
+			if _, err := coll.Put([]byte("k"), []byte(`{"v":2}`)); err != nil {
 				t.Fatal(err)
 			}
-			pointAfter, ok, err := snap.AppendRaw(nil, "k")
+			pointAfter, ok, err := snap.AppendRaw(nil, []byte("k"))
 			if err != nil || !ok {
 				t.Fatalf("old-snapshot point read after new put: ok=%v err=%v", ok, err)
 			}

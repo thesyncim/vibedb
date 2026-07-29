@@ -472,7 +472,7 @@ func (c *Collection) validatePrimarySchema(src []byte) error {
 }
 
 func (c *Collection) putPrimary(
-	key string,
+	key []byte,
 	src []byte,
 ) (created bool, err error) {
 	c.writer.Lock()
@@ -513,8 +513,9 @@ func (c *Collection) putPrimary(
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return false, ErrClosed
 	}
-	c.pointKeyScratch = append(c.pointKeyScratch[:0], key...)
-	keyBytes := c.pointKeyScratch
+	// key is borrowed for this call; everything that persists it (leaf frame,
+	// recovery-journal record) copies it, so route/stage directly with no scratch.
+	keyBytes := key
 	resident, err := c.currentPrimaryResidentRoute(state, keyBytes)
 	if err != nil {
 		return false, err
@@ -722,7 +723,7 @@ func (c *Collection) putPrimary(
 }
 
 func (c *Collection) deletePrimary(
-	key string,
+	key []byte,
 ) (deleted bool, err error) {
 	c.writer.Lock()
 	var generation uint64
@@ -752,8 +753,8 @@ func (c *Collection) deletePrimary(
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return false, nil
 	}
-	c.pointKeyScratch = append(c.pointKeyScratch[:0], key...)
-	keyBytes := c.pointKeyScratch
+	// key is borrowed for this call; stages that persist it copy it.
+	keyBytes := key
 	resident, err := c.currentPrimaryResidentRoute(state, keyBytes)
 	if err != nil {
 		return false, err

@@ -44,13 +44,13 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 			doc := []byte(fmt.Sprintf(`{"step":%d,"status":%q,"value":%d,"padding":%q}`,
 				step, status, rng.Int63(), strings.Repeat("x", rng.Intn(900))))
 			heapCreated, heapErr := heapCollection.Put(key, doc)
-			fileCreated, fileErr := collection.Put(key, doc)
+			fileCreated, fileErr := collection.Put([]byte(key), doc)
 			if heapErr != nil || fileErr != nil || heapCreated != fileCreated {
 				t.Fatalf("step %d Put = heap(%v,%v) file(%v,%v)", step, heapCreated, heapErr, fileCreated, fileErr)
 			}
 		case 2:
 			heapDeleted, _ := heapCollection.Delete(key)
-			fileDeleted, fileErr := collection.Delete(key)
+			fileDeleted, fileErr := collection.Delete([]byte(key))
 			if fileErr != nil || heapDeleted != fileDeleted {
 				t.Fatalf("step %d Delete = heap %v file(%v,%v)", step, heapDeleted, fileDeleted, fileErr)
 			}
@@ -76,7 +76,7 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 				key := fmt.Sprintf("key-%02d", i)
 				doc := []byte(fmt.Sprintf(`{"snapshot-churn":%d,"status":"new"}`, i))
 				_, _ = heapCollection.Put(key, doc)
-				if _, err := collection.Put(key, doc); err != nil {
+				if _, err := collection.Put([]byte(key), doc); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -125,7 +125,7 @@ func assertFileSnapshotMatchesHeap(t *testing.T, fileSnapshot *Snapshot, heapSna
 	for i := range keys {
 		key := fmt.Sprintf("key-%02d", i)
 		heapRaw, heapOK := heapSnapshot.GetRaw(key)
-		fileRaw, fileOK, err := fileSnapshot.AppendRaw(nil, key)
+		fileRaw, fileOK, err := fileSnapshot.AppendRaw(nil, []byte(key))
 		if err != nil || heapOK != fileOK || (heapOK && string(heapRaw.Bytes()) != string(fileRaw)) {
 			t.Fatalf("GetRaw(%s) = heap(%q,%v) file(%q,%v,%v)", key, heapRaw.Bytes(), heapOK, fileRaw, fileOK, err)
 		}
@@ -156,7 +156,7 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 	}
 	for i := range 12 {
 		doc := []byte(fmt.Sprintf(`{"id":%d,"status":"old","padding":%q}`, i, strings.Repeat("a", i*80)))
-		if _, err := collection.Put(fmt.Sprintf("key-%02d", i), doc); err != nil {
+		if _, err := collection.Put([]byte(fmt.Sprintf("key-%02d", i)), doc); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -166,7 +166,7 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldGeneration := collection.Generation()
-	oldValue, ok, err := collection.AppendRaw(nil, "key-03")
+	oldValue, ok, err := collection.AppendRaw(nil, []byte("key-03"))
 	if err != nil || !ok {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	newValue := []byte(fmt.Sprintf(`{"id":3,"status":"new","padding":%q}`, strings.Repeat("z", 7000)))
-	if created, err := collection.Put("key-03", newValue); err != nil || created {
+	if created, err := collection.Put([]byte("key-03"), newValue); err != nil || created {
 		t.Fatalf("update = (%v,%v)", created, err)
 	}
 	if err := collection.Flush(); err != nil {
@@ -270,7 +270,7 @@ func assertCrashImage(t *testing.T, image []byte, options Options, oldGeneration
 		_ = file.Close()
 		t.Fatalf("%s recovery: %v", name, err)
 	}
-	got, ok, getErr := collection.AppendRaw(nil, "key-03")
+	got, ok, getErr := collection.AppendRaw(nil, []byte("key-03"))
 	if getErr != nil || !ok {
 		t.Fatalf("%s GetRaw = (%q,%v,%v)", name, got, ok, getErr)
 	}
@@ -349,7 +349,7 @@ func TestFileSnapshotInlineReadSteadyAllocations(t *testing.T) {
 	}
 	defer collection.Close()
 	value := []byte(`{"id":1,"status":"active"}`)
-	if _, err := collection.Put("key", value); err != nil {
+	if _, err := collection.Put([]byte("key"), value); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := collection.Snapshot()
@@ -358,11 +358,15 @@ func TestFileSnapshotInlineReadSteadyAllocations(t *testing.T) {
 	}
 	defer snapshot.Close()
 	dst := make([]byte, 0, len(value))
-	if _, ok, err := snapshot.AppendRaw(dst[:0], "key"); err != nil || !ok {
+	// Convert the key once, outside the measured closures: the store borrows a
+	// []byte key, so a per-call []byte("key") would be counted as a read-path
+	// allocation the store never makes.
+	krd := []byte("key")
+	if _, ok, err := snapshot.AppendRaw(dst[:0], krd); err != nil || !ok {
 		t.Fatalf("warm read = (%v,%v)", ok, err)
 	}
 	allocs := testing.AllocsPerRun(100, func() {
-		got, ok, err := snapshot.AppendRaw(dst[:0], "key")
+		got, ok, err := snapshot.AppendRaw(dst[:0], krd)
 		if err != nil || !ok || len(got) != len(value) {
 			panic("file snapshot read failed")
 		}
@@ -370,11 +374,11 @@ func TestFileSnapshotInlineReadSteadyAllocations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("inline cache-hit AppendRaw allocated %.2f times, want 0", allocs)
 	}
-	if _, ok, err := collection.AppendRaw(dst[:0], "key"); err != nil || !ok {
+	if _, ok, err := collection.AppendRaw(dst[:0], krd); err != nil || !ok {
 		t.Fatalf("warm collection read = (%v,%v)", ok, err)
 	}
 	allocs = testing.AllocsPerRun(100, func() {
-		got, ok, err := collection.AppendRaw(dst[:0], "key")
+		got, ok, err := collection.AppendRaw(dst[:0], krd)
 		if err != nil || !ok || len(got) != len(value) {
 			panic("file collection read failed")
 		}
@@ -399,7 +403,7 @@ func TestFileStoreAsyncPublicationFlushesDurably(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range 40 {
-		if _, err := collection.Put(fmt.Sprintf("key-%02d", i), []byte(fmt.Sprintf(`{"id":%d}`, i))); err != nil {
+		if _, err := collection.Put([]byte(fmt.Sprintf("key-%02d", i)), []byte(fmt.Sprintf(`{"id":%d}`, i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -425,7 +429,7 @@ func TestFileStoreAsyncPublicationFlushesDurably(t *testing.T) {
 	}
 	defer reopened.Close()
 	for i := range 40 {
-		got, ok, err := reopened.AppendRaw(nil, fmt.Sprintf("key-%02d", i))
+		got, ok, err := reopened.AppendRaw(nil, []byte(fmt.Sprintf("key-%02d", i)))
 		if err != nil || !ok || string(got) != fmt.Sprintf(`{"id":%d}`, i) {
 			t.Fatalf("reopened key %d = (%q,%v,%v)", i, got, ok, err)
 		}

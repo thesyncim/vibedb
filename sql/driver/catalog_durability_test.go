@@ -196,7 +196,7 @@ func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snapshot.Close()
-	raw, found, err := snapshot.AppendRaw(nil, key)
+	raw, found, err := snapshot.AppendRaw(nil, []byte(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if raw, found, err = snapshot.AppendRaw(raw[:0], secondKey); err != nil {
+	if raw, found, err = snapshot.AppendRaw(raw[:0], []byte(secondKey)); err != nil {
 		t.Fatal(err)
 	}
 	if !found || string(raw) != `{"id":"b","kind":"y"}` {
@@ -276,7 +276,7 @@ func TestReopenFencesTableNamespaceBeforeMaterializationUpgrade(t *testing.T) {
 	if !reopened.catalog.Tables["docs"].Materialized {
 		t.Fatal("reopen did not persist the recovered materialization identity")
 	}
-	raw, found, err := reopened.tables["docs"].collection.AppendRaw(nil, key)
+	raw, found, err := reopened.tables["docs"].collection.AppendRaw(nil, []byte(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestReopenRefusesToAdoptTableBeforeRecoveryFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.close()
-	raw, found, err := reopened.tables["docs"].collection.AppendRaw(nil, key)
+	raw, found, err := reopened.tables["docs"].collection.AppendRaw(nil, []byte(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestCatalogSymlinkUsesCanonicalLockAndTableDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snapshot.Close()
-	if _, found, err := snapshot.AppendRaw(nil, key); err != nil || !found {
+	if _, found, err := snapshot.AppendRaw(nil, []byte(key)); err != nil || !found {
 		t.Fatalf("read through catalog symlink = (found %t, err %v)", found, err)
 	}
 }

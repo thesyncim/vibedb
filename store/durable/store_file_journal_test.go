@@ -136,7 +136,7 @@ func TestRecoveryJournalRoundTrip(t *testing.T) {
 	}
 	const n = 200
 	for i := 0; i < n; i++ {
-		if _, err := coll.Put(fmt.Sprintf("key-%04d", i), journalValue(i)); err != nil {
+		if _, err := coll.Put([]byte(fmt.Sprintf("key-%04d", i)), journalValue(i)); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
@@ -210,14 +210,14 @@ func TestSyncPrimaryJournalRoundTrip(t *testing.T) {
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("key-%04d", i)
 		val := journalValue(i)
-		if _, err := coll.Put(key, val); err != nil {
+		if _, err := coll.Put([]byte(key), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 		want[key] = string(val)
 		// Visibility follows durability: the value is readable on the live reader
 		// immediately after the acknowledging Put returns (a snapshot pins the
 		// durable checkpoint root and would not yet see the un-checkpointed ack).
-		if got, found, err := coll.AppendRaw(nil, key); err != nil ||
+		if got, found, err := coll.AppendRaw(nil, []byte(key)); err != nil ||
 			!found || string(got) != string(val) {
 			t.Fatalf("key %s not visible after sync ack: got %q found=%v err=%v want %q",
 				key, got, found, err, val)
@@ -289,7 +289,7 @@ func TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow(t *testing.T) {
 	for i := 0; i < baseline; i++ {
 		key := fmt.Sprintf("key-%04d", i)
 		val := journalValue(i)
-		if _, err := coll.Put(key, val); err != nil {
+		if _, err := coll.Put([]byte(key), val); err != nil {
 			t.Fatalf("baseline put %d: %v", i, err)
 		}
 		want[key] = string(val)
@@ -312,7 +312,7 @@ func TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow(t *testing.T) {
 	}
 	defer func() { recoveryJournalPostSyncHook = nil }()
 
-	if _, err := coll.Put(crashKey, crashVal); err != nil {
+	if _, err := coll.Put([]byte(crashKey), crashVal); err != nil {
 		t.Fatalf("crash-window put: %v", err)
 	}
 	if !captured {
@@ -321,7 +321,7 @@ func TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow(t *testing.T) {
 	want[crashKey] = string(crashVal)
 	// The live writer published normally after the seam; the value is visible on
 	// the live reader.
-	if got, found, err := coll.AppendRaw(nil, crashKey); err != nil ||
+	if got, found, err := coll.AppendRaw(nil, []byte(crashKey)); err != nil ||
 		!found || string(got) != string(crashVal) {
 		t.Fatalf("crash key not visible on live store after publish: got %q found=%v err=%v",
 			got, found, err)
@@ -396,7 +396,7 @@ func TestSyncPrimaryJournaledOverflowReplayIsDeterministic(t *testing.T) {
 	for i := 0; i < baseline; i++ {
 		key := fmt.Sprintf("key-%04d", i)
 		val := journalOverflowValue(i)
-		if _, err := coll.Put(key, val); err != nil {
+		if _, err := coll.Put([]byte(key), val); err != nil {
 			t.Fatalf("baseline overflow put %d: %v", i, err)
 		}
 		want[key] = string(val)
@@ -419,14 +419,14 @@ func TestSyncPrimaryJournaledOverflowReplayIsDeterministic(t *testing.T) {
 	}
 	defer func() { recoveryJournalPostSyncHook = nil }()
 
-	if _, err := coll.Put(crashKey, crashVal); err != nil {
+	if _, err := coll.Put([]byte(crashKey), crashVal); err != nil {
 		t.Fatalf("crash-window overflow put: %v", err)
 	}
 	if !captured {
 		t.Fatal("post-sync seam never fired: the sync lane did not journal before publishing")
 	}
 	want[crashKey] = string(crashVal)
-	if got, found, err := coll.AppendRaw(nil, crashKey); err != nil ||
+	if got, found, err := coll.AppendRaw(nil, []byte(crashKey)); err != nil ||
 		!found || string(got) != string(crashVal) {
 		t.Fatalf("overflow crash key not visible on live store after publish: found=%v err=%v", found, err)
 	}
@@ -505,7 +505,7 @@ func TestRecoveryJournalReplayReconstructsAcks(t *testing.T) {
 			for i := 0; i < n; i++ {
 				key := fmt.Sprintf("key-%04d", i)
 				val := journalValue(i)
-				if _, err := coll.Put(key, val); err != nil {
+				if _, err := coll.Put([]byte(key), val); err != nil {
 					t.Fatalf("put %d: %v", i, err)
 				}
 				want[key] = string(val)
@@ -599,7 +599,7 @@ func TestRecoveryJournalFullForcesCheckpoint(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		k := fmt.Sprintf("key-%d", r%keys)
 		v := fmt.Sprintf(`{"r":"%08d","pad":"%s"}`, r, pad)
-		if _, err := coll.Put(k, []byte(v)); err != nil {
+		if _, err := coll.Put([]byte(k), []byte(v)); err != nil {
 			t.Fatalf("put round %d: %v", r, err)
 		}
 		want[k] = v
@@ -668,7 +668,7 @@ func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
 		t.Fatalf("Open primary journaled store: %v", err)
 	}
 	defer primary.Close()
-	if _, err := primary.Put("key-0001", journalValue(1)); err != nil {
+	if _, err := primary.Put([]byte("key-0001"), journalValue(1)); err != nil {
 		t.Fatalf("primary put: %v", err)
 	}
 	if acks := primary.Stats().JournalAcks; acks == 0 {

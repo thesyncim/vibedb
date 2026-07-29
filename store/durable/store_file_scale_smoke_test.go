@@ -49,7 +49,7 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 		key = fmt.Appendf(key[:0], "row:%08d", row)
 		document = appendFileStoreScaleDocument(document[:0], row, false)
 		sourceBytes += uint64(len(key) + len(document))
-		if created, putErr := collection.Put(string(key), document); putErr != nil || !created {
+		if created, putErr := collection.Put([]byte(string(key)), document); putErr != nil || !created {
 			t.Fatalf("Put(%d) = (%v,%v)", row, created, putErr)
 		}
 	}
@@ -114,7 +114,7 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	for _, row := range []int{records - 1, 0, records / 2, 17, records - 101, 1} {
 		key = fmt.Appendf(key[:0], "row:%08d", row)
 		want := appendFileStoreScaleDocument(document[:0], row, false)
-		got, ok, readErr := reopened.AppendRaw(readBuffer[:0], string(key))
+		got, ok, readErr := reopened.AppendRaw(readBuffer[:0], []byte(string(key)))
 		if readErr != nil || !ok || !bytes.Equal(got, want) {
 			t.Fatalf("pressure read %d = (%q,%v,%v)", row, got, ok, readErr)
 		}
@@ -122,19 +122,19 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	updatedRow := records / 2
 	updatedKey := fmt.Sprintf("row:%08d", updatedRow)
 	updated := appendFileStoreScaleDocument(document[:0], updatedRow, true)
-	if created, err := reopened.Put(updatedKey, updated); err != nil || created {
+	if created, err := reopened.Put([]byte(updatedKey), updated); err != nil || created {
 		t.Fatalf("pressure update = (%v,%v)", created, err)
 	}
-	if deleted, err := reopened.Delete("row:00000017"); err != nil || !deleted {
+	if deleted, err := reopened.Delete([]byte("row:00000017")); err != nil || !deleted {
 		t.Fatalf("pressure delete = (%v,%v)", deleted, err)
 	}
 	if err := reopened.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, err := reopened.AppendRaw(readBuffer[:0], updatedKey); err != nil || !ok || !bytes.Equal(got, updated) {
+	if got, ok, err := reopened.AppendRaw(readBuffer[:0], []byte(updatedKey)); err != nil || !ok || !bytes.Equal(got, updated) {
 		t.Fatalf("updated pressure read = (%q,%v,%v)", got, ok, err)
 	}
-	if _, ok, err := reopened.AppendRaw(readBuffer[:0], "row:00000017"); err != nil || ok {
+	if _, ok, err := reopened.AppendRaw(readBuffer[:0], []byte("row:00000017")); err != nil || ok {
 		t.Fatalf("deleted pressure read = (%v,%v)", ok, err)
 	}
 	stats := reopened.Stats()
@@ -151,10 +151,10 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer final.Close()
-	if got, ok, err := final.AppendRaw(readBuffer[:0], updatedKey); err != nil || !ok || !bytes.Equal(got, updated) {
+	if got, ok, err := final.AppendRaw(readBuffer[:0], []byte(updatedKey)); err != nil || !ok || !bytes.Equal(got, updated) {
 		t.Fatalf("reopened update = (%q,%v,%v)", got, ok, err)
 	}
-	if _, ok, err := final.AppendRaw(readBuffer[:0], "row:00000017"); err != nil || ok {
+	if _, ok, err := final.AppendRaw(readBuffer[:0], []byte("row:00000017")); err != nil || ok {
 		t.Fatalf("reopened delete = (%v,%v)", ok, err)
 	}
 	var memory runtime.MemStats

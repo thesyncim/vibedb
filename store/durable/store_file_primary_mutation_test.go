@@ -42,19 +42,19 @@ func TestFilePrimaryPutDeleteSnapshotCOW(t *testing.T) {
 
 			updated := []byte(`{"id":500,"updated":true}`)
 			if created, err := collection.Put(
-				keys[500], updated,
+				[]byte(keys[500]), updated,
 			); err != nil || created {
 				t.Fatalf("update = %v,%v", created, err)
 			}
 			insertedKey := "primary-key-000000500-extra"
 			inserted := []byte(`{"inserted":true}`)
 			if created, err := collection.Put(
-				insertedKey, inserted,
+				[]byte(insertedKey), inserted,
 			); err != nil || !created {
 				t.Fatalf("insert = %v,%v", created, err)
 			}
 			if deleted, err := collection.Delete(
-				keys[250],
+				[]byte(keys[250]),
 			); err != nil || !deleted {
 				t.Fatalf("delete = %v,%v", deleted, err)
 			}
@@ -66,15 +66,15 @@ func TestFilePrimaryPutDeleteSnapshotCOW(t *testing.T) {
 			assertPrimaryRaw(t, collection, keys[250], nil, false)
 
 			buffer := make([]byte, 0, 128)
-			got, ok, err := snapshot.AppendRaw(buffer[:0], keys[500])
+			got, ok, err := snapshot.AppendRaw(buffer[:0], []byte(keys[500]))
 			if err != nil || !ok || !bytes.Equal(got, values[500]) {
 				t.Fatalf("snapshot update = %q,%v,%v", got, ok, err)
 			}
-			got, ok, err = snapshot.AppendRaw(buffer[:0], insertedKey)
+			got, ok, err = snapshot.AppendRaw(buffer[:0], []byte(insertedKey))
 			if err != nil || ok || len(got) != 0 {
 				t.Fatalf("snapshot insert = %q,%v,%v", got, ok, err)
 			}
-			got, ok, err = snapshot.AppendRaw(buffer[:0], keys[250])
+			got, ok, err = snapshot.AppendRaw(buffer[:0], []byte(keys[250]))
 			if err != nil || !ok || !bytes.Equal(got, values[250]) {
 				t.Fatalf("snapshot delete = %q,%v,%v", got, ok, err)
 			}
@@ -121,7 +121,7 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 		len(third) != len(fourth) {
 		t.Fatal("same-size fixture drift")
 	}
-	if created, err := collection.Put(keys[500], first); err != nil || created {
+	if created, err := collection.Put([]byte(keys[500]), first); err != nil || created {
 		t.Fatalf("first update = %v,%v", created, err)
 	}
 	afterFirst := collection.Stats()
@@ -131,7 +131,7 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 			afterFirst.BufferedInplaceUpdates,
 		)
 	}
-	if created, err := collection.Put(keys[500], second); err != nil || created {
+	if created, err := collection.Put([]byte(keys[500]), second); err != nil || created {
 		t.Fatalf("second update = %v,%v", created, err)
 	}
 	afterSecond := collection.Stats()
@@ -141,7 +141,7 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 			afterSecond.BufferedInplaceUpdates,
 		)
 	}
-	if created, err := collection.Put(keys[500], third); err != nil || created {
+	if created, err := collection.Put([]byte(keys[500]), third); err != nil || created {
 		t.Fatalf("third update = %v,%v", created, err)
 	}
 	afterThird := collection.Stats()
@@ -155,7 +155,7 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 	state := collection.state.Load()
 	buffer := make([]byte, 0, 128)
 	got, ok, err := collection.resolvePrimaryGraphPageWalk(
-		buffer[:0], state, keys[500],
+		buffer[:0], state, []byte(keys[500]),
 	)
 	if err != nil || !ok || !bytes.Equal(got, values[500]) {
 		t.Fatalf(
@@ -168,11 +168,11 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snapshot.Close()
-	if created, err := collection.Put(keys[500], fourth); err != nil || created {
+	if created, err := collection.Put([]byte(keys[500]), fourth); err != nil || created {
 		t.Fatalf("snapshot-forced COW = %v,%v", created, err)
 	}
 	assertPrimaryRaw(t, collection, keys[500], fourth, true)
-	got, ok, err = snapshot.AppendRaw(buffer[:0], keys[500])
+	got, ok, err = snapshot.AppendRaw(buffer[:0], []byte(keys[500]))
 	if err != nil || !ok || !bytes.Equal(got, third) {
 		t.Fatalf("snapshot after forced COW = %q,%v,%v", got, ok, err)
 	}
@@ -203,7 +203,7 @@ func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 	sealedRetired := collection.Stats().PendingRetiredExtents
 	updated := []byte(`{"id":500,"crash":"buffered"}`)
 	if created, err := collection.Put(
-		keys[500], updated,
+		[]byte(keys[500]), updated,
 	); err != nil || created {
 		t.Fatalf("buffered update = %v,%v", created, err)
 	}
@@ -367,7 +367,7 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 	}
 	for index, update := range updates {
 		if created, putErr := collection.Put(
-			update.key, update.value,
+			[]byte(update.key), update.value,
 		); putErr != nil || created {
 			t.Fatalf(
 				"Put %d = %v,%v", index, created, putErr,
@@ -390,7 +390,7 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 		)
 	}
 	pageWalk, ok, err := collection.resolvePrimaryGraphPageWalk(
-		nil, collection.state.Load(), firstKey,
+		nil, collection.state.Load(), []byte(firstKey),
 	)
 	if err != nil || !ok ||
 		!bytes.Equal(pageWalk, values[firstIndex]) {
@@ -419,7 +419,7 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 		)
 	}
 	pageWalk, ok, err = collection.resolvePrimaryGraphPageWalk(
-		pageWalk[:0], collection.state.Load(), firstKey,
+		pageWalk[:0], collection.state.Load(), []byte(firstKey),
 	)
 	if err != nil || !ok ||
 		!bytes.Equal(pageWalk, updates[len(updates)-1].value) {
@@ -429,7 +429,7 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 		)
 	}
 	pageWalk, ok, err = collection.resolvePrimaryGraphPageWalk(
-		pageWalk[:0], collection.state.Load(), secondKey,
+		pageWalk[:0], collection.state.Load(), []byte(secondKey),
 	)
 	if err != nil || !ok ||
 		!bytes.Equal(pageWalk, updates[1].value) {
@@ -484,12 +484,12 @@ func TestFilePrimaryBufferedPendingCapacityForcesCheckpoint(t *testing.T) {
 	}
 	firstValue := []byte(`{"capacity":"first"}`)
 	secondValue := []byte(`{"capacity":"second"}`)
-	if _, err := collection.Put(first, firstValue); err != nil {
+	if _, err := collection.Put([]byte(first), firstValue); err != nil {
 		t.Fatal(err)
 	}
 	firstGeneration := collection.Generation()
 	before := collection.Stats()
-	if _, err := collection.Put(second, secondValue); err != nil {
+	if _, err := collection.Put([]byte(second), secondValue); err != nil {
 		t.Fatal(err)
 	}
 	after := collection.Stats()
@@ -551,7 +551,7 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 	for at := range inserts {
 		key := fmt.Sprintf("key-%04d", at)
 		value := []byte(fmt.Sprintf(`{"v":%d}`, at))
-		created, putErr := collection.Put(key, value)
+		created, putErr := collection.Put([]byte(key), value)
 		if errors.Is(putErr, ErrPrimaryLeafSplitRequired) {
 			t.Fatalf("routed put %q surfaced a leaf-split signal", key)
 		}
@@ -587,7 +587,7 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 
 	buf := make([]byte, 0, 32)
 	for key, want := range oracle {
-		got, ok, readErr := collection.AppendRaw(buf[:0], key)
+		got, ok, readErr := collection.AppendRaw(buf[:0], []byte(key))
 		if readErr != nil || !ok || !bytes.Equal(got, want) {
 			t.Fatalf(
 				"routed split readback %q = %q,%v,%v want %q",
@@ -597,7 +597,7 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 		buf = got
 	}
 	if got, ok, readErr := collection.AppendRaw(
-		buf[:0], "seed",
+		buf[:0], []byte("seed"),
 	); readErr != nil || !ok || !bytes.Equal(got, []byte(`{"v":0}`)) {
 		t.Fatalf("seed readback across splits = %q,%v,%v", got, ok, readErr)
 	}
@@ -626,7 +626,7 @@ func TestFilePrimaryEmptyLeafAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer collection.Close()
-	if deleted, err := collection.Delete("seed"); err != nil || !deleted {
+	if deleted, err := collection.Delete([]byte("seed")); err != nil || !deleted {
 		t.Fatalf("delete = %v,%v", deleted, err)
 	}
 	if collection.Stats().PrimaryEmptyLeaves != 1 {
@@ -635,7 +635,7 @@ func TestFilePrimaryEmptyLeafAccounting(t *testing.T) {
 			collection.Stats().PrimaryEmptyLeaves,
 		)
 	}
-	if created, err := collection.Put("seed", value); err != nil || !created {
+	if created, err := collection.Put([]byte("seed"), value); err != nil || !created {
 		t.Fatalf("refill = %v,%v", created, err)
 	}
 	if collection.Stats().PrimaryEmptyLeaves != 0 {
@@ -689,7 +689,7 @@ func TestFilePrimaryConcurrentRouterPublication(t *testing.T) {
 			if at&1 != 0 {
 				value = second
 			}
-			if _, putErr := collection.Put(key, value); putErr != nil {
+			if _, putErr := collection.Put([]byte(key), value); putErr != nil {
 				writerErr = putErr
 				return
 			}
@@ -699,7 +699,7 @@ func TestFilePrimaryConcurrentRouterPublication(t *testing.T) {
 	snapshotBuffer := make([]byte, 0, 128)
 	for !done.Load() {
 		current, ok, readErr := collection.AppendRaw(
-			currentBuffer[:0], key,
+			currentBuffer[:0], []byte(key),
 		)
 		if readErr != nil || !ok ||
 			!bytes.Equal(current, values[500]) &&
@@ -708,7 +708,7 @@ func TestFilePrimaryConcurrentRouterPublication(t *testing.T) {
 			t.Fatalf("current read = %q,%v,%v", current, ok, readErr)
 		}
 		pinned, pinnedOK, pinnedErr := snapshot.AppendRaw(
-			snapshotBuffer[:0], key,
+			snapshotBuffer[:0], []byte(key),
 		)
 		if pinnedErr != nil || !pinnedOK ||
 			!bytes.Equal(pinned, values[500]) {
@@ -792,7 +792,7 @@ func runPrimaryMutationDifferential(
 		random ^= random << 8
 		key := keys[int(random%uint64(len(keys)))]
 		if random>>63 == 0 {
-			deleted, deleteErr := collection.Delete(key)
+			deleted, deleteErr := collection.Delete([]byte(key))
 			_, existed := oracle[key]
 			if deleteErr != nil || deleted != existed {
 				t.Fatalf(
@@ -806,7 +806,7 @@ func runPrimaryMutationDifferential(
 				`{"v":"%06d","p":"b"}`, operation%1_000_000,
 			))
 			_, existed := oracle[key]
-			created, putErr := collection.Put(key, value)
+			created, putErr := collection.Put([]byte(key), value)
 			if putErr != nil || created == existed {
 				t.Fatalf(
 					"put %d %q = %v,%v, existed=%v",
@@ -816,7 +816,7 @@ func runPrimaryMutationDifferential(
 			oracle[key] = append(oracle[key][:0], value...)
 		}
 		want, wantOK := oracle[key]
-		got, ok, readErr := collection.AppendRaw(buffer[:0], key)
+		got, ok, readErr := collection.AppendRaw(buffer[:0], []byte(key))
 		if readErr != nil || ok != wantOK || !bytes.Equal(got, want) {
 			t.Fatalf(
 				"read %d %q = %q,%v,%v; want %q,%v,nil",
@@ -842,7 +842,7 @@ func runPrimaryMutationDifferential(
 			state := collection.state.Load()
 			pageWalk, pageWalkOK, pageWalkErr :=
 				collection.resolvePrimaryGraphPageWalk(
-					oracleBuffer[:0], state, key,
+					oracleBuffer[:0], state, []byte(key),
 				)
 			if pageWalkErr != nil || pageWalkOK != wantOK ||
 				!bytes.Equal(pageWalk, want) {
@@ -876,7 +876,7 @@ func assertPrimaryRaw(
 ) {
 	t.Helper()
 	got, ok, err := collection.AppendRaw(
-		make([]byte, 0, max(len(want), 1)), key,
+		make([]byte, 0, max(len(want), 1)), []byte(key),
 	)
 	if err != nil || ok != wantOK || !bytes.Equal(got, want) {
 		t.Fatalf(
@@ -960,12 +960,12 @@ func TestFilePrimaryRoutedSplitDifferential(t *testing.T) {
 	for at, id := range order {
 		key := fmt.Sprintf("rk-%08d", id)
 		value := []byte(fmt.Sprintf(`{"id":%d,"n":%d}`, id, at))
-		created, putErr := collection.Put(key, value)
+		created, putErr := collection.Put([]byte(key), value)
 		if putErr != nil || !created {
 			t.Fatalf("insert %d %q = created %v, err %v", at, key, created, putErr)
 		}
 		oracle[key] = value
-		got, ok, readErr := collection.AppendRaw(buffer[:0], key)
+		got, ok, readErr := collection.AppendRaw(buffer[:0], []byte(key))
 		if readErr != nil || !ok || !bytes.Equal(got, value) {
 			t.Fatalf("post-insert read %q = %q,%v,%v want %q", key, got, ok, readErr, value)
 		}
@@ -988,7 +988,7 @@ func TestFilePrimaryRoutedSplitDifferential(t *testing.T) {
 
 	// Point differential: every oracle key resolves byte-exact.
 	for key, want := range oracle {
-		got, ok, readErr := collection.AppendRaw(buffer[:0], key)
+		got, ok, readErr := collection.AppendRaw(buffer[:0], []byte(key))
 		if readErr != nil || !ok || !bytes.Equal(got, want) {
 			t.Fatalf("point differential %q = %q,%v,%v want %q", key, got, ok, readErr, want)
 		}

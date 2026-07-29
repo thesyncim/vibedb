@@ -267,7 +267,7 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
 	applied := 0
-	apply := func(kind uint16, key string, value []byte) error {
+	apply := func(kind uint16, key, value []byte) error {
 		switch kind {
 		case storeio.RecoveryRecordKindPut:
 			_, putErr := c.Put(key, value)
@@ -293,13 +293,15 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 			// validated) or not at all, so this loop never sees a partial batch.
 			for i := range rec.Entries {
 				entry := rec.Entries[i]
-				if err := apply(entry.Kind, string(entry.Key), entry.Value); err != nil {
+				// The mutation path borrows the key; replay hands the record's
+				// []byte straight back with no string round-trip.
+				if err := apply(entry.Kind, entry.Key, entry.Value); err != nil {
 					return err
 				}
 			}
 			return nil
 		}
-		return apply(rec.Kind, string(rec.Key), rec.Value)
+		return apply(rec.Kind, rec.Key, rec.Value)
 	})
 	if err != nil {
 		return err

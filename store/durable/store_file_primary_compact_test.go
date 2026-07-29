@@ -207,11 +207,11 @@ func TestCompactPrimaryByteExactness(t *testing.T) {
 
 			// Point reads: every doc, both files, against the original bytes.
 			for i := range keys {
-				gotV, okV, err := verbatimSnap.AppendRaw(nil, keys[i])
+				gotV, okV, err := verbatimSnap.AppendRaw(nil, []byte(keys[i]))
 				if err != nil || !okV {
 					t.Fatalf("verbatim AppendRaw(%q) = (%v,%v)", keys[i], okV, err)
 				}
-				gotC, okC, err := compactSnap.AppendRaw(nil, keys[i])
+				gotC, okC, err := compactSnap.AppendRaw(nil, []byte(keys[i]))
 				if err != nil || !okC {
 					t.Fatalf("compact AppendRaw(%q) = (%v,%v)", keys[i], okC, err)
 				}
@@ -306,22 +306,22 @@ func TestCompactPrimaryMutation(t *testing.T) {
 		switch round % 4 {
 		case 0, 1: // update in place
 			val := fmt.Appendf(nil, `{"rev":%d,"key":"%s","note":"mutated"}`, round, key)
-			if _, err := compact.Put(key, val); err != nil {
+			if _, err := compact.Put([]byte(key), val); err != nil {
 				t.Fatalf("put %q: %v", key, err)
 			}
 			want[key] = val
 		case 2: // delete then reinsert original
-			if _, err := compact.Delete(key); err != nil {
+			if _, err := compact.Delete([]byte(key)); err != nil {
 				t.Fatalf("delete %q: %v", key, err)
 			}
-			if _, err := compact.Put(key, docs[i]); err != nil {
+			if _, err := compact.Put([]byte(key), docs[i]); err != nil {
 				t.Fatalf("reinsert %q: %v", key, err)
 			}
 			want[key] = docs[i]
 		case 3: // insert a fresh key
 			nk := fmt.Sprintf("new:%08d", round)
 			val := fmt.Appendf(nil, `{"fresh":%d}`, round)
-			if _, err := compact.Put(nk, val); err != nil {
+			if _, err := compact.Put([]byte(nk), val); err != nil {
 				t.Fatalf("insert %q: %v", nk, err)
 			}
 			keys = append(keys, nk)
@@ -337,7 +337,7 @@ func TestCompactPrimaryMutation(t *testing.T) {
 	}
 	defer snap.Close()
 	for k, v := range want {
-		got, ok, err := snap.AppendRaw(nil, k)
+		got, ok, err := snap.AppendRaw(nil, []byte(k))
 		if err != nil || !ok {
 			t.Fatalf("post-mutation AppendRaw(%q) = (%v,%v)", k, ok, err)
 		}

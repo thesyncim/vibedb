@@ -37,7 +37,7 @@ func openBenchPrimaryPutCollection(
 	}
 	options := Options{
 		ResidentBytes: 64 << 20, Backend: BackendPortable,
-		Durability:               DurabilityBufferedVisible,
+		Durability: DurabilityBufferedVisible,
 	}
 	if primary {
 		_, err = CreateFromPrimary(built, file, options)
@@ -81,6 +81,14 @@ func BenchmarkFilePrimaryPut(b *testing.B) {
 				defer done()
 				short := []byte(`{"value":"short"}`)
 				long := []byte(`{"value":"a deliberately longer value"}`)
+				// Keys are precomputed as []byte outside the timed loop: the
+				// store speaks []byte, so the loop must not pay a per-op
+				// fmt.Sprintf or string->[]byte conversion. That conversion was
+				// one of the two allocs/op this bench used to report.
+				keys := make([][]byte, corpus)
+				for j := range keys {
+					keys[j] = []byte(benchReadKey(j))
+				}
 				base := collection.Stats()
 				at := 0
 				b.ReportAllocs()
@@ -91,7 +99,7 @@ func BenchmarkFilePrimaryPut(b *testing.B) {
 						value = long
 					}
 					if _, err := collection.Put(
-						benchReadKey(at%corpus), value,
+						keys[at%corpus], value,
 					); err != nil {
 						b.Fatal(err)
 					}
@@ -112,7 +120,7 @@ func BenchmarkFilePrimaryPut(b *testing.B) {
 				defer done()
 				first := []byte(`{"value":"hot-a"}`)
 				second := []byte(`{"value":"hot-b"}`)
-				key := benchReadKey(corpus / 2)
+				key := []byte(benchReadKey(corpus / 2))
 				// Size-changing COW, same-size lazy first touch, then one
 				// canonical update leave the timed loop on its hot lane.
 				for _, value := range [][]byte{first, second, first} {
@@ -186,9 +194,11 @@ func BenchmarkFilePrimaryPointReadTemplate(b *testing.B) {
 		classCounts[storeio.CommonPrimaryLeafTemplate])
 
 	order := benchReadProbeOrder(count)
-	probes := make([]string, len(order))
+	// Precompute probe keys as []byte outside the timed loop to hold the
+	// zero-alloc read pin (the store's AppendRaw takes []byte).
+	probes := make([][]byte, len(order))
 	for at := range probes {
-		probes[at] = keys[order[at]]
+		probes[at] = []byte(keys[order[at]])
 	}
 	buffer := make([]byte, 0, 512)
 	for _, key := range probes {
@@ -290,9 +300,11 @@ func BenchmarkFilePrimaryPointRead(b *testing.B) {
 	)
 	defer done()
 	order := benchReadProbeOrder(benchReadCorpusSize)
-	keys := make([]string, len(order))
+	// Precompute probe keys as []byte outside the timed loop to hold the
+	// zero-alloc read pin (the store's AppendRaw takes []byte).
+	keys := make([][]byte, len(order))
 	for at := range keys {
-		keys[at] = benchReadKey(order[at])
+		keys[at] = []byte(benchReadKey(order[at]))
 	}
 	warm := make([]byte, 0, 512)
 	for _, key := range keys {

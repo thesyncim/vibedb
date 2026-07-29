@@ -100,14 +100,14 @@ func TestFilePrimaryIndexedMutationMatchesRebuild(t *testing.T) {
 			key := fmt.Sprintf("k%04d", row)
 			nc := fmt.Sprintf("c%02d", (row*13)%59)
 			doc := []byte(fmt.Sprintf(`{"country":"%s","row":%d}`, nc, row))
-			if _, err := coll.Put(key, doc); err != nil {
+			if _, err := coll.Put([]byte(key), doc); err != nil {
 				t.Fatalf("value-change put %s: %v", key, err)
 			}
 			docs[key] = doc
 		}
 		for row := 1; row < base; row += 11 {
 			key := fmt.Sprintf("k%04d", row)
-			if _, err := coll.Delete(key); err != nil {
+			if _, err := coll.Delete([]byte(key)); err != nil {
 				t.Fatalf("delete %s: %v", key, err)
 			}
 			delete(docs, key)
@@ -115,7 +115,7 @@ func TestFilePrimaryIndexedMutationMatchesRebuild(t *testing.T) {
 		for row := base; row < base+80; row++ {
 			key := fmt.Sprintf("n%04d", row)
 			doc := []byte(fmt.Sprintf(`{"country":"c%02d","row":%d}`, row%58, row))
-			if _, err := coll.Put(key, doc); err != nil {
+			if _, err := coll.Put([]byte(key), doc); err != nil {
 				t.Fatalf("insert put %s: %v", key, err)
 			}
 			docs[key] = doc
@@ -222,7 +222,7 @@ func TestFilePrimaryIndexedChurnSplit(t *testing.T) {
 		key := fmt.Sprintf("m%05d", i)
 		country := fmt.Sprintf("c%02d", i%30)
 		doc := []byte(fmt.Sprintf(`{"country":"%s","row":%d}`, country, i))
-		if _, err := coll.Put(key, doc); err != nil {
+		if _, err := coll.Put([]byte(key), doc); err != nil {
 			t.Fatalf("split-driving put %s: %v", key, err)
 		}
 		oracle[key] = country
@@ -238,7 +238,7 @@ func TestFilePrimaryIndexedChurnSplit(t *testing.T) {
 	// Delete band to drive merges/empties.
 	for i := 0; i < 900; i += 2 {
 		key := fmt.Sprintf("m%05d", i)
-		if _, err := coll.Delete(key); err != nil {
+		if _, err := coll.Delete([]byte(key)); err != nil {
 			t.Fatalf("merge-driving delete %s: %v", key, err)
 		}
 		delete(oracle, key)
@@ -300,7 +300,7 @@ func TestSyncPrimaryIndexedJournalReplayAfterCrashWindow(t *testing.T) {
 		key := fmt.Sprintf("key-%04d", i)
 		country := fmt.Sprintf("c%02d", i%5)
 		val := []byte(fmt.Sprintf(`{"country":"%s","i":%d}`, country, i))
-		if _, err := coll.Put(key, val); err != nil {
+		if _, err := coll.Put([]byte(key), val); err != nil {
 			t.Fatalf("baseline put %d: %v", i, err)
 		}
 		oracle[key] = country
@@ -320,7 +320,7 @@ func TestSyncPrimaryIndexedJournalReplayAfterCrashWindow(t *testing.T) {
 	}
 	defer func() { recoveryJournalPostSyncHook = nil }()
 
-	if _, err := coll.Put(crashKey, crashVal); err != nil {
+	if _, err := coll.Put([]byte(crashKey), crashVal); err != nil {
 		t.Fatalf("crash-window put: %v", err)
 	}
 	if !captured {
@@ -440,7 +440,7 @@ func runIndexedPrimaryFaultPass(
 	boundaries = []int{dev.Commits()}
 	contents = []map[string]string{snapshotCollectionContent(t, coll)}
 	for i := 0; i < ops; i++ {
-		_, opErr := coll.Put(indexedCrashKey(i), indexedCrashValue(i))
+		_, opErr := coll.Put([]byte(indexedCrashKey(i)), indexedCrashValue(i))
 		if opErr == nil {
 			opErr = coll.Flush()
 		}
@@ -547,10 +547,10 @@ func TestFilePrimaryIndexedCommitCrashBoundary(t *testing.T) {
 	options := Options{
 		Collection: store.Options{ChunkDocuments: 1},
 		Backend:    BackendPortable, ResidentBytes: 32 << 20,
-		Durability:       DurabilityBufferedVisible,
-		PageSize:         4096, MaxPageSize: 64 << 10,
+		Durability: DurabilityBufferedVisible,
+		PageSize:   4096, MaxPageSize: 64 << 10,
 		InlineValueBytes: 2048, MaxDocumentBytes: 2048,
-		GroupLimit:       1, CommitCoalesce: 0,
+		GroupLimit: 1, CommitCoalesce: 0,
 		Indexes: []store.IndexDefinition{
 			{Name: "country", Paths: []string{"/country"}},
 		},

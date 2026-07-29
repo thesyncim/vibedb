@@ -302,7 +302,7 @@ func (c *conn) rejectExistingSeeds(
 	for _, seed := range seeds {
 		var found bool
 		var err error
-		scratch, found, err = collection.AppendRaw(scratch[:0], seed.key)
+		scratch, found, err = collection.AppendRaw(scratch[:0], []byte(seed.key))
 		if err != nil {
 			c.pointRaw = scratch
 			return err
@@ -321,7 +321,7 @@ func putSeedsAtomic(collection *durable.Collection, seeds []seedDocument) error 
 	case 0:
 		return nil
 	case 1:
-		_, err := collection.Put(seeds[0].key, seeds[0].document)
+		_, err := collection.Put([]byte(seeds[0].key), seeds[0].document)
 		return err
 	}
 	if !collection.SupportsUpdate() {
@@ -331,7 +331,7 @@ func putSeedsAtomic(collection *durable.Collection, seeds []seedDocument) error 
 	}
 	return collection.Update(func(batch *durable.WriteBatch) error {
 		for _, seed := range seeds {
-			if err := batch.Put(seed.key, seed.document); err != nil {
+			if err := batch.Put([]byte(seed.key), seed.document); err != nil {
 				return err
 			}
 		}
@@ -685,7 +685,7 @@ func (c *conn) updateLocked(
 	switch len(keys) {
 	case 0:
 	case 1:
-		_, mutationErr = t.collection.Put(keys[0], document)
+		_, mutationErr = t.collection.Put([]byte(keys[0]), document)
 	default:
 		if !t.collection.SupportsUpdate() {
 			return nil, fmt.Errorf(
@@ -694,7 +694,7 @@ func (c *conn) updateLocked(
 		}
 		mutationErr = t.collection.Update(func(batch *durable.WriteBatch) error {
 			for _, key := range keys {
-				if err := batch.Put(key, document); err != nil {
+				if err := batch.Put([]byte(key), document); err != nil {
 					return err
 				}
 			}
@@ -739,7 +739,7 @@ func (c *conn) deleteLocked(
 	case 0:
 	case 1:
 		var deleted bool
-		deleted, mutationErr = t.collection.Delete(keys[0])
+		deleted, mutationErr = t.collection.Delete([]byte(keys[0]))
 		if !deleted {
 			affected = 0
 		}
@@ -751,7 +751,7 @@ func (c *conn) deleteLocked(
 		}
 		mutationErr = t.collection.Update(func(batch *durable.WriteBatch) error {
 			for _, key := range keys {
-				if err := batch.Delete(key); err != nil {
+				if err := batch.Delete([]byte(key)); err != nil {
 					return err
 				}
 			}
@@ -810,7 +810,7 @@ func (c *conn) matchingKeysLocked(
 		scratch := c.pointRaw[:0]
 		for _, key := range keys {
 			var found bool
-			scratch, found, err = t.collection.AppendRaw(scratch[:0], key)
+			scratch, found, err = t.collection.AppendRaw(scratch[:0], []byte(key))
 			if err != nil {
 				c.pointRaw = scratch
 				return nil, err

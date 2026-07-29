@@ -80,7 +80,7 @@ func TestFileOverlayMergesWritesOverIndexedSnapshot(t *testing.T) {
 		`{"id":3,"active":false}`,
 	}
 	for i, document := range documents {
-		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(document)); err != nil {
+		if _, err := collection.Put([]byte(fmt.Sprintf("k%d", i)), []byte(document)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -141,7 +141,7 @@ func TestFileOverlayRejectsInvalidSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer collection.Close()
-	if _, err := collection.Put("k000000", []byte(`{"id":1}`)); err != nil {
+	if _, err := collection.Put([]byte("k000000"), []byte(`{"id":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := collection.Snapshot()

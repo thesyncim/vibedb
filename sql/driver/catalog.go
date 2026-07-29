@@ -759,11 +759,11 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		switch {
 		case len(documents) == 0:
 		case len(documents) == 1:
-			_, err = collection.Put(documents[0].key, documents[0].document)
+			_, err = collection.Put([]byte(documents[0].key), documents[0].document)
 		case collection.SupportsUpdate():
 			err = collection.Update(func(batch *durable.WriteBatch) error {
 				for _, document := range documents {
-					if putErr := batch.Put(document.key, document.document); putErr != nil {
+					if putErr := batch.Put([]byte(document.key), document.document); putErr != nil {
 						return putErr
 					}
 				}
@@ -776,7 +776,7 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 			// through a sequence of Puts is atomic at the file boundary — the only
 			// place a first INSERT of several rows can land on an indexed table.
 			for _, document := range documents {
-				if _, putErr := collection.Put(document.key, document.document); putErr != nil {
+				if _, putErr := collection.Put([]byte(document.key), document.document); putErr != nil {
 					err = putErr
 					break
 				}

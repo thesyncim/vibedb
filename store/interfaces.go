@@ -49,11 +49,17 @@ type Reader interface {
 
 var _ Reader = Snapshot{}
 
-// Mutable is the mutable, keyed, generation-producing shape both *Collection and
-// package store/durable's collection type satisfy: S is the concrete Snapshot
-// type each side produces (Snapshot for *Collection, *durable.Snapshot for
-// durable's collection), so Mutable[S] costs nothing beyond what each side already
-// does — no boxing, no adapter allocation.
+// Mutable is the mutable, keyed, generation-producing shape of the durable base
+// store: S is the concrete Snapshot type it produces (*durable.Snapshot), so
+// Mutable[S] costs nothing beyond what the store already does — no boxing, no
+// adapter allocation.
+//
+// The base store speaks []byte: key is borrowed for the call and not retained
+// after it returns; the store copies it wherever it stages the key. The heap
+// *Collection keeps a string-keyed ergonomic surface (it is a construction-time
+// and convenience layer that owns its own conversions) and deliberately does
+// not implement this interface — nothing dispatches on Mutable generically, so
+// the two backends need not share one key type.
 //
 // Deliberately excluded: index-lifecycle mutation (AddIndex, CreateIndex,
 // DropIndex, BackfillIndex, ReclaimIndexes). durable's indexes are frozen at
@@ -61,14 +67,12 @@ var _ Reader = Snapshot{}
 // duplication, and belongs on the separate IndexManager interface that only
 // *Collection implements.
 type Mutable[S any] interface {
-	Put(key string, src []byte) (bool, error)
-	Delete(key string) (bool, error)
+	Put(key []byte, src []byte) (bool, error)
+	Delete(key []byte) (bool, error)
 	Snapshot() (S, error)
 	Len() uint64
 	Generation() uint64
 }
-
-var _ Mutable[Snapshot] = (*Collection)(nil)
 
 // IndexManager is the heap-only index-lifecycle extension described on
 // Mutable. Generic code that needs online index mutation type-asserts for it

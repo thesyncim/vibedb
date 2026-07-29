@@ -127,9 +127,9 @@ func runFaultWorkload(t *testing.T, options Options, fc *faultController, plan s
 	for _, op := range ops {
 		var opErr error
 		if op.value == "" {
-			_, opErr = coll.Delete(op.key)
+			_, opErr = coll.Delete([]byte(op.key))
 		} else {
-			_, opErr = coll.Put(op.key, []byte(op.value))
+			_, opErr = coll.Put([]byte(op.key), []byte(op.value))
 		}
 		if opErr == nil {
 			opErr = coll.Flush()
@@ -428,7 +428,7 @@ func runPrimarySplitFaultPass(
 	contents = []map[string]string{snapshotCollectionContent(t, coll)}
 	splits = []uint64{coll.Stats().PrimaryLeafSplits}
 	for i := 0; i < ops; i++ {
-		_, opErr := coll.Put(primarySplitCrashKey(i), primarySplitCrashValue(i))
+		_, opErr := coll.Put([]byte(primarySplitCrashKey(i)), primarySplitCrashValue(i))
 		if opErr == nil {
 			opErr = coll.Flush()
 		}

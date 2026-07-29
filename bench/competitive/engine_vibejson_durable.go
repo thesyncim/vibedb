@@ -14,9 +14,9 @@ import (
 // harness uses. As with heapCollection, it is spelled as a local interface so
 // the in-flight rename of the concrete type cannot break the benchmark.
 type durableCollection interface {
-	Put(key string, src []byte) (bool, error)
-	Delete(key string) (bool, error)
-	AppendRaw(dst []byte, key string) ([]byte, bool, error)
+	Put(key []byte, src []byte) (bool, error)
+	Delete(key []byte) (bool, error)
+	AppendRaw(dst []byte, key []byte) ([]byte, bool, error)
 	Snapshot() (*durable.Snapshot, error)
 	Len() uint64
 	Stats() durable.Stats
@@ -220,7 +220,7 @@ func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 	}
 	v.coll = db
 	for i := range docs {
-		if _, err := db.Put(docs[i].Key, docs[i].JSON); err != nil {
+		if _, err := db.Put([]byte(docs[i].Key), docs[i].JSON); err != nil {
 			return err
 		}
 	}
@@ -272,7 +272,7 @@ func (v *vibeDurable) releaseSnapshot() {
 }
 
 func (v *vibeDurable) Get(dst []byte, key string) ([]byte, error) {
-	out, ok, err := v.coll.AppendRaw(dst, key)
+	out, ok, err := v.coll.AppendRaw(dst, []byte(key))
 	if err != nil {
 		return dst, err
 	}
@@ -285,7 +285,7 @@ func (v *vibeDurable) Get(dst []byte, key string) ([]byte, error) {
 func (v *vibeDurable) Put(key string, doc []byte) error {
 	// See snapshot: a write path must not hold a snapshot lease open.
 	v.releaseSnapshot()
-	_, err := v.coll.Put(key, doc)
+	_, err := v.coll.Put([]byte(key), doc)
 	return err
 }
 
@@ -293,7 +293,7 @@ func (v *vibeDurable) Upsert(key string, doc []byte) error { return v.Put(key, d
 
 func (v *vibeDurable) Delete(key string) error {
 	v.releaseSnapshot()
-	deleted, err := v.coll.Delete(key)
+	deleted, err := v.coll.Delete([]byte(key))
 	if err == nil && !deleted {
 		return fmt.Errorf("missing key %q", key)
 	}
@@ -465,7 +465,7 @@ func (s *vibeDurableSession) releaseReads() {
 }
 
 func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
-	out, ok, err := s.coll.AppendRaw(dst, key)
+	out, ok, err := s.coll.AppendRaw(dst, []byte(key))
 	if err != nil {
 		return dst, err
 	}
@@ -477,7 +477,7 @@ func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
 
 func (s *vibeDurableSession) Put(key string, doc []byte) error {
 	s.releaseReads()
-	_, err := s.coll.Put(key, doc)
+	_, err := s.coll.Put([]byte(key), doc)
 	return err
 }
 
@@ -485,7 +485,7 @@ func (s *vibeDurableSession) Upsert(key string, doc []byte) error { return s.Put
 
 func (s *vibeDurableSession) Delete(key string) error {
 	s.releaseReads()
-	deleted, err := s.coll.Delete(key)
+	deleted, err := s.coll.Delete([]byte(key))
 	if err == nil && !deleted {
 		return fmt.Errorf("missing key %q", key)
 	}

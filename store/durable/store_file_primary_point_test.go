@@ -295,19 +295,19 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 	primarySnapshotBuffer := make([]byte, 0, 128)
 	for at, key := range keys {
 		legacyValue, legacyOK, legacyErr := legacy.AppendRaw(
-			legacyBuffer[:0], key,
+			legacyBuffer[:0], []byte(key),
 		)
 		primaryValue, primaryOK, primaryErr := primary.AppendRaw(
-			primaryBuffer[:0], key,
+			primaryBuffer[:0], []byte(key),
 		)
 		pageWalkValue, pageWalkOK, pageWalkErr :=
 			primary.resolvePrimaryGraphPageWalk(
-				pageWalkBuffer[:0], primary.state.Load(), key,
+				pageWalkBuffer[:0], primary.state.Load(), []byte(key),
 			)
 		legacySnapshotValue, legacySnapshotOK, legacySnapshotErr :=
-			legacySnapshot.AppendRaw(legacySnapshotBuffer[:0], key)
+			legacySnapshot.AppendRaw(legacySnapshotBuffer[:0], []byte(key))
 		primarySnapshotValue, primarySnapshotOK, primarySnapshotErr :=
-			primarySnapshot.AppendRaw(primarySnapshotBuffer[:0], key)
+			primarySnapshot.AppendRaw(primarySnapshotBuffer[:0], []byte(key))
 		if legacyErr != nil || primaryErr != nil || pageWalkErr != nil ||
 			legacySnapshotErr != nil || primarySnapshotErr != nil ||
 			!legacyOK || !primaryOK || !pageWalkOK ||
@@ -338,19 +338,19 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 
 	for sample := range 10_000 {
 		key := fmt.Sprintf("absent-primary-key-%09d", sample*7919)
-		if value, ok, err := legacy.AppendRaw(legacyBuffer[:0], key); err != nil || ok || len(value) != 0 {
+		if value, ok, err := legacy.AppendRaw(legacyBuffer[:0], []byte(key)); err != nil || ok || len(value) != 0 {
 			t.Fatalf("legacy absent %d = %q,%v,%v", sample, value, ok, err)
 		}
-		if value, ok, err := primary.AppendRaw(primaryBuffer[:0], key); err != nil || ok || len(value) != 0 {
+		if value, ok, err := primary.AppendRaw(primaryBuffer[:0], []byte(key)); err != nil || ok || len(value) != 0 {
 			t.Fatalf("primary absent %d = %q,%v,%v", sample, value, ok, err)
 		}
 		if value, ok, err := primary.resolvePrimaryGraphPageWalk(
-			pageWalkBuffer[:0], primary.state.Load(), key,
+			pageWalkBuffer[:0], primary.state.Load(), []byte(key),
 		); err != nil || ok || len(value) != 0 {
 			t.Fatalf("page-walk absent %d = %q,%v,%v", sample, value, ok, err)
 		}
 		if value, ok, err := legacySnapshot.AppendRaw(
-			legacySnapshotBuffer[:0], key,
+			legacySnapshotBuffer[:0], []byte(key),
 		); err != nil || ok || len(value) != 0 {
 			t.Fatalf(
 				"legacy snapshot absent %d = %q,%v,%v",
@@ -358,7 +358,7 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 			)
 		}
 		if value, ok, err := primarySnapshot.AppendRaw(
-			primarySnapshotBuffer[:0], key,
+			primarySnapshotBuffer[:0], []byte(key),
 		); err != nil || ok || len(value) != 0 {
 			t.Fatalf(
 				"primary snapshot absent %d = %q,%v,%v",
@@ -367,27 +367,27 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 		}
 	}
 
-	if created, err := primary.Put("new", []byte(`{"v":1}`)); err != nil || !created {
+	if created, err := primary.Put([]byte("new"), []byte(`{"v":1}`)); err != nil || !created {
 		t.Fatalf("primary Put = %v,%v, want true,nil", created, err)
 	}
-	if deleted, err := primary.Delete(keys[0]); err != nil || !deleted {
+	if deleted, err := primary.Delete([]byte(keys[0])); err != nil || !deleted {
 		t.Fatalf("primary Delete = %v,%v, want true,nil", deleted, err)
 	}
 	// A multi-document Update is now first-class on the ordered primary graph: it
 	// publishes every mutation under one generation, all-or-nothing.
 	if err := primary.Update(func(batch *WriteBatch) error {
-		if err := batch.Put("batched", []byte(`{"v":2}`)); err != nil {
+		if err := batch.Put([]byte("batched"), []byte(`{"v":2}`)); err != nil {
 			return err
 		}
-		return batch.Delete(keys[1])
+		return batch.Delete([]byte(keys[1]))
 	}); err != nil {
 		t.Fatalf("primary Update = %v, want nil", err)
 	}
-	if value, ok, err := primary.AppendRaw(nil, "batched"); err != nil || !ok ||
+	if value, ok, err := primary.AppendRaw(nil, []byte("batched")); err != nil || !ok ||
 		string(value) != `{"v":2}` {
 		t.Fatalf("primary batched Put = %q,%v,%v, want {\"v\":2},true,nil", value, ok, err)
 	}
-	if value, ok, err := primary.AppendRaw(nil, keys[1]); err != nil || ok || len(value) != 0 {
+	if value, ok, err := primary.AppendRaw(nil, []byte(keys[1])); err != nil || ok || len(value) != 0 {
 		t.Fatalf("primary batched Delete keys[1] = %q,%v,%v, want absent", value, ok, err)
 	}
 }
@@ -728,14 +728,17 @@ func TestFilePrimaryResolverAllocatesZero(t *testing.T) {
 	defer collection.Close()
 	state := collection.state.Load()
 	buffer := make([]byte, 0, 128)
-	target := keys[len(keys)/2]
+	// Convert probe keys once, outside the measured closures: resolvePrimaryGraph
+	// borrows a []byte key, so a per-call []byte(...) would break the 0-alloc pin.
+	target := []byte(keys[len(keys)/2])
+	absent := []byte("primary-key-absent")
 	if _, ok, err := collection.resolvePrimaryGraph(
 		buffer[:0], state, target,
 	); err != nil || !ok {
 		t.Fatalf("warm primary hit = %v,%v", ok, err)
 	}
 	if _, ok, err := collection.resolvePrimaryGraph(
-		buffer[:0], state, "primary-key-absent",
+		buffer[:0], state, absent,
 	); err != nil || ok {
 		t.Fatalf("warm primary miss = %v,%v", ok, err)
 	}
@@ -758,7 +761,7 @@ func TestFilePrimaryResolverAllocatesZero(t *testing.T) {
 	}
 	missAllocs := testing.AllocsPerRun(1_000, func() {
 		out, found, runErr = collection.resolvePrimaryGraph(
-			buffer[:0], state, "primary-key-absent",
+			buffer[:0], state, absent,
 		)
 	})
 	if runErr != nil || found || len(out) != 0 {
@@ -942,7 +945,7 @@ func TestFilePrimaryPointReadCorruptionFailsClosed(t *testing.T) {
 				return
 			}
 			defer corrupt.Close()
-			value, found, readErr := corrupt.AppendRaw(nil, target)
+			value, found, readErr := corrupt.AppendRaw(nil, []byte(target))
 			if readErr == nil || found || len(value) != 0 {
 				t.Fatalf(
 					"corrupt read = %q,%v,%v; want typed failure",

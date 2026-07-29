@@ -139,7 +139,7 @@ func TestSnapshotCollectionsSealsDeferredPrimaryBeforeCapture(t *testing.T) {
 	}
 	defer collection.Close()
 
-	if _, err := collection.Put("k", []byte(`{"v":1}`)); err != nil {
+	if _, err := collection.Put([]byte("k"), []byte(`{"v":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	if len(collection.primaryPendingParents) == 0 {
@@ -159,7 +159,7 @@ func TestSnapshotCollectionsSealsDeferredPrimaryBeforeCapture(t *testing.T) {
 	if !ok || snapshot == nil || snapshot.Len() != 1 {
 		t.Fatalf("captured collection = (%p, %t), want one-row snapshot", snapshot, ok)
 	}
-	point, found, err := snapshot.AppendRaw(nil, "k")
+	point, found, err := snapshot.AppendRaw(nil, []byte("k"))
 	if err != nil || !found {
 		t.Fatalf("point read = (%q, %t, %v)", point, found, err)
 	}
@@ -175,10 +175,10 @@ func TestSnapshotCollectionsSealsDeferredPrimaryBeforeCapture(t *testing.T) {
 	if string(point) != `{"v":1}` || string(scanned) != string(point) {
 		t.Fatalf("captured point/scan = (%s, %s), want v1 agreement", point, scanned)
 	}
-	if _, err := collection.Put("k", []byte(`{"v":2}`)); err != nil {
+	if _, err := collection.Put([]byte("k"), []byte(`{"v":2}`)); err != nil {
 		t.Fatal(err)
 	}
-	point, found, err = snapshot.AppendRaw(point[:0], "k")
+	point, found, err = snapshot.AppendRaw(point[:0], []byte("k"))
 	if err != nil || !found || string(point) != `{"v":1}` {
 		t.Fatalf("old captured point after v2 = (%s, %t, %v)", point, found, err)
 	}

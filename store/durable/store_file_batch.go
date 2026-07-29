@@ -73,7 +73,11 @@ func (b *WriteBatch) Len() int {
 
 // Put records key with src. It reports ErrKeyTooLarge, ErrDocumentTooLarge, or
 // ErrBatchTooLarge immediately; malformed JSON is reported by Update.
-func (b *WriteBatch) Put(key string, src []byte) error {
+//
+// key is borrowed for the duration of the call and not retained after it
+// returns: the batch copies it into its own arena. The caller may reuse or
+// mutate the backing array as soon as Put returns.
+func (b *WriteBatch) Put(key []byte, src []byte) error {
 	if b == nil || !b.active {
 		return ErrBatchClosed
 	}
@@ -87,8 +91,9 @@ func (b *WriteBatch) Put(key string, src []byte) error {
 }
 
 // Delete records the removal of key. Removing a key the collection does not
-// hold is not an error and publishes nothing for it.
-func (b *WriteBatch) Delete(key string) error {
+// hold is not an error and publishes nothing for it. key is borrowed for the
+// call only; the batch copies it into its own arena.
+func (b *WriteBatch) Delete(key []byte) error {
 	if b == nil || !b.active {
 		return ErrBatchClosed
 	}
@@ -98,8 +103,10 @@ func (b *WriteBatch) Delete(key string) error {
 	return b.record(key, nil, true)
 }
 
-func (b *WriteBatch) record(key string, src []byte, remove bool) error {
-	if at, exists := b.position[key]; exists {
+func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
+	// m[string(b)] is the compiler's non-allocating map-read pattern: the string
+	// conversion is used only as the index expression and never escapes.
+	if at, exists := b.position[string(key)]; exists {
 		old := b.entries[at]
 		nextBytes := len(b.keys) + len(b.values) - old.valueLength
 		if len(src) > b.collection.options.MaxBatchBytes-nextBytes {

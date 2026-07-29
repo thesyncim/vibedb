@@ -1312,7 +1312,7 @@ func assertRawDocument(
 	database.mu.RLock()
 	collection := database.tables["docs"].collection
 	database.mu.RUnlock()
-	got, found, err := collection.AppendRaw(nil, key)
+	got, found, err := collection.AppendRaw(nil, []byte(key))
 	if err != nil {
 		t.Fatal(err)
 	}

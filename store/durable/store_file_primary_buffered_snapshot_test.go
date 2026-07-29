@@ -86,7 +86,7 @@ func TestFilePrimaryBufferedSnapshotCheckpointRetire(t *testing.T) {
 	put := func(id int) {
 		revision++
 		value := primaryBufferedFixedValue(id, revision)
-		if _, err := collection.Put(keys[id], value); err != nil {
+		if _, err := collection.Put([]byte(keys[id]), value); err != nil {
 			t.Fatalf("put %s: %v", keys[id], err)
 		}
 		oracle[keys[id]] = value
@@ -95,7 +95,7 @@ func TestFilePrimaryBufferedSnapshotCheckpointRetire(t *testing.T) {
 		t.Helper()
 		var scratch []byte
 		for key, want := range oracle {
-			got, found, err := collection.AppendRaw(scratch[:0], key)
+			got, found, err := collection.AppendRaw(scratch[:0], []byte(key))
 			scratch = got
 			if err != nil || !found || !bytes.Equal(got, want) {
 				t.Fatalf("%s: read %s = (%q, found=%v, err=%v), want %q",
@@ -154,7 +154,7 @@ func TestFilePrimaryBufferedSnapshotCheckpointRetire(t *testing.T) {
 	reopened := openBufferedImage(t, image, options)
 	var scratch []byte
 	for key, want := range oracle {
-		got, found, err := reopened.AppendRaw(scratch[:0], key)
+		got, found, err := reopened.AppendRaw(scratch[:0], []byte(key))
 		scratch = got
 		if err != nil || !found || !bytes.Equal(got, want) {
 			t.Fatalf("reopen read %s = (%q, found=%v, err=%v), want %q",
@@ -223,7 +223,7 @@ func runPrimarySnapshotCheckpointFaultPass(
 		for k := 0; k < count/stride; k++ {
 			revision++
 			id := (base + k*stride) % count
-			if _, err := coll.Put(keys[id], primaryBufferedFixedValue(id, revision)); err != nil {
+			if _, err := coll.Put([]byte(keys[id]), primaryBufferedFixedValue(id, revision)); err != nil {
 				return err
 			}
 		}

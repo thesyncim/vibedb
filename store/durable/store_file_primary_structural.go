@@ -1332,7 +1332,7 @@ func (c *Collection) reclassPrimaryLeaf(
 // structural transaction and retries. A lexical-median split makes room, so the
 // retry succeeds; the small bound guards against a pathological placement loop.
 func (c *Collection) putPrimaryWithSplit(
-	key string, src []byte,
+	key []byte, src []byte,
 ) (created bool, err error) {
 	for attempt := 0; ; attempt++ {
 		created, err = c.putPrimary(key, src)
@@ -1351,7 +1351,7 @@ func (c *Collection) putPrimaryWithSplit(
 // splitPrimaryLeafForKey runs one split structural transaction for the leaf
 // routed by key under the single-writer lock, waiting for durability when
 // synchronous.
-func (c *Collection) splitPrimaryLeafForKey(key string) (err error) {
+func (c *Collection) splitPrimaryLeafForKey(key []byte) (err error) {
 	c.writer.Lock()
 	var generation uint64
 	defer func() {
@@ -1381,8 +1381,9 @@ func (c *Collection) splitPrimaryLeafForKey(key string) (err error) {
 		return ErrClosed
 	}
 	before := state.root.Generation
-	c.pointKeyScratch = append(c.pointKeyScratch[:0], key...)
-	if err := c.structuralSplitPrimaryLeaf(c.pointKeyScratch); err != nil {
+	// key is borrowed for the call; structuralSplitPrimaryLeaf copies it where
+	// it persists, so pass it directly with no scratch round-trip.
+	if err := c.structuralSplitPrimaryLeaf(key); err != nil {
 		return err
 	}
 	if after := c.state.Load(); after != nil && after.root.Generation > before {
@@ -1396,7 +1397,7 @@ func (c *Collection) splitPrimaryLeafForKey(key string) (err error) {
 // slot-class reclaim. That hygiene is best-effort: any failure aborts its own
 // transaction and leaves the published post-delete state intact.
 func (c *Collection) deletePrimaryWithMerge(
-	key string,
+	key []byte,
 ) (deleted bool, err error) {
 	deleted, err = c.deletePrimary(key)
 	if err != nil || !deleted {
@@ -1409,7 +1410,7 @@ func (c *Collection) deletePrimaryWithMerge(
 // mergeReclassPrimaryLeafForKey runs one merge/reclass structural evaluation for
 // the leaf routed by key under the single-writer lock, waiting for durability
 // when synchronous.
-func (c *Collection) mergeReclassPrimaryLeafForKey(key string) (err error) {
+func (c *Collection) mergeReclassPrimaryLeafForKey(key []byte) (err error) {
 	c.writer.Lock()
 	var generation uint64
 	defer func() {
@@ -1439,8 +1440,9 @@ func (c *Collection) mergeReclassPrimaryLeafForKey(key string) (err error) {
 		return ErrClosed
 	}
 	before := state.root.Generation
-	c.pointKeyScratch = append(c.pointKeyScratch[:0], key...)
-	if err := c.structuralMergeReclassPrimaryLeaf(c.pointKeyScratch); err != nil {
+	// key is borrowed for the call; structuralMergeReclassPrimaryLeaf copies it
+	// where it persists, so pass it directly.
+	if err := c.structuralMergeReclassPrimaryLeaf(key); err != nil {
 		return err
 	}
 	if after := c.state.Load(); after != nil && after.root.Generation > before {

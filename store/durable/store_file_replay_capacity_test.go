@@ -43,7 +43,7 @@ func TestFileStorePointReplayDoesNotExhaustRetirementCapacity(t *testing.T) {
 				`"note":"steady state, no anomalies observed in the last reporting window"}`,
 			i, i, i%1000,
 		)
-		if created, putErr := collection.Put(key, value); putErr != nil || !created {
+		if created, putErr := collection.Put([]byte(key), value); putErr != nil || !created {
 			stats := collection.Stats()
 			retired := collection.reclaimer.Stats()
 			t.Fatalf(

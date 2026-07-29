@@ -2245,7 +2245,12 @@ func (c *Collection) cacheStoreID() [16]byte {
 
 // Put inserts or replaces one document. Every collection is an ordered primary
 // graph, so the mutation is always resolved through the routed COW path.
-func (c *Collection) Put(key string, src []byte) (created bool, err error) {
+//
+// key is borrowed for the duration of the call and not retained after it
+// returns: the store copies it wherever it stages the key (leaf frame,
+// recovery-journal record). Callers may reuse or mutate the backing array as
+// soon as Put returns.
+func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
@@ -2253,7 +2258,9 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 }
 
 // Delete removes one document by key through the routed ordered-primary path.
-func (c *Collection) Delete(key string) (deleted bool, err error) {
+// key is borrowed for the call only; the store copies it where it stages a
+// tombstone (recovery-journal record).
+func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
@@ -2438,8 +2445,8 @@ func (s *Snapshot) Generation() uint64 {
 }
 
 // AppendRaw appends key's exact JSON spelling into dst. It never returns a
-// borrowed page slice.
-func (s *Snapshot) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
+// borrowed page slice. key is borrowed for the call only; it is not retained.
+func (s *Snapshot) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return dst, false, ErrClosed
 	}
@@ -2447,7 +2454,7 @@ func (s *Snapshot) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 }
 
 func (c *Collection) appendRawAtState(
-	dst []byte, key string, state *fileStoreState,
+	dst []byte, key []byte, state *fileStoreState,
 ) ([]byte, bool, error) {
 	return c.resolvePrimaryGraph(dst, state, key)
 }
@@ -2456,7 +2463,7 @@ func (c *Collection) appendRawAtState(
 // document extents to the bounded asynchronous read queue in physical order.
 // It returns the number submitted; missing keys are ignored and queue pressure
 // is visible through Stats.PrefetchDropped.
-func (s *Snapshot) PrefetchKeys(keys []string) (int, error) {
+func (s *Snapshot) PrefetchKeys(keys [][]byte) (int, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return 0, ErrClosed
 	}
@@ -2496,7 +2503,7 @@ func (s *Snapshot) PrefetchKeys(keys []string) (int, error) {
 		return 0, nil
 	}
 	for _, key := range keys {
-		route, ok := router.Route([]byte(key))
+		route, ok := router.Route(key)
 		if !ok || route.Ref == (storeio.PageRef{}) {
 			continue
 		}
@@ -2516,7 +2523,7 @@ func (s *Snapshot) PrefetchKeys(keys []string) (int, error) {
 // to the gated lease path only when the epoch table declines the entry (full
 // table, an active writer fence, Close, or a persistence failure that needs
 // the slow path's exact error).
-func (c *Collection) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
+func (c *Collection) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	if c == nil {
 		return dst, false, ErrClosed
 	}
@@ -2533,7 +2540,7 @@ func (c *Collection) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 // declined or diverted epoch entry falls back to. A writer fence points new
 // readers here exactly because this path blocks on the snapshot gate until the
 // writer's decision window closes.
-func (c *Collection) appendRawLeased(dst []byte, key string) ([]byte, bool, error) {
+func (c *Collection) appendRawLeased(dst []byte, key []byte) ([]byte, bool, error) {
 	c.snapshotGate.RLock()
 	state, stateErr := c.readerFileState()
 	if stateErr != nil {
@@ -2552,7 +2559,7 @@ func (c *Collection) appendRawLeased(dst []byte, key string) ([]byte, bool, erro
 
 // PrefetchKeys submits current-snapshot document reads to the bounded
 // asynchronous prefetch queue.
-func (c *Collection) PrefetchKeys(keys []string) (int, error) {
+func (c *Collection) PrefetchKeys(keys [][]byte) (int, error) {
 	snapshot, err := c.Snapshot()
 	if err != nil {
 		return 0, err
@@ -2673,13 +2680,13 @@ func (c *Collection) Stats() Stats {
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch) + len(c.primaryRootScratch),
 		),
-		Backend:                       Backend(commit.Backend),
-		Durability:                    c.options.Durability,
-		CheckpointStrength:            c.options.CheckpointStrength,
-		ReadBackend:                   Backend(cache.ReadBackend),
-		DirectReads:                   c.directRead,
-		DirectWrites:                  c.directWrite,
-		SnapshotCapacity:              leases.Capacity, ActiveSnapshots: leases.Active,
+		Backend:            Backend(commit.Backend),
+		Durability:         c.options.Durability,
+		CheckpointStrength: c.options.CheckpointStrength,
+		ReadBackend:        Backend(cache.ReadBackend),
+		DirectReads:        c.directRead,
+		DirectWrites:       c.directWrite,
+		SnapshotCapacity:   leases.Capacity, ActiveSnapshots: leases.Active,
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
 		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(c.reusable)),

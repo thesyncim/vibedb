@@ -308,7 +308,7 @@ func (c *conn) pointCollectionSource(
 			found bool
 			err   error
 		)
-		document, found, err = collection.AppendRaw(document[:0], key)
+		document, found, err = collection.AppendRaw(document[:0], []byte(key))
 		if err != nil {
 			c.pointRaw = document
 			return query.Source{}, err

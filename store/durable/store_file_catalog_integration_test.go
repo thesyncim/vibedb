@@ -95,7 +95,7 @@ func TestFileStoreExactCatalogZeroOptionReopenAndRootPreservation(
 		t.Fatalf("initial exact catalog root = %+v", initial)
 	}
 	if _, err := collection.Put(
-		"key", []byte(`{"id":7,"score":1.5}`),
+		[]byte("key"), []byte(`{"id":7,"score":1.5}`),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -147,13 +147,13 @@ func TestFileStoreExactCatalogZeroOptionReopenAndRootPreservation(
 		reopened.options.indexNameIDs["id_alias"] != 0 {
 		t.Fatalf("zero-option reopen did not rehydrate catalog: %+v", reopened.options.Options)
 	}
-	raw, ok, err := reopened.AppendRaw(nil, "key")
+	raw, ok, err := reopened.AppendRaw(nil, []byte("key"))
 	if err != nil || !ok || string(raw) !=
 		`{"id":7,"score":1.5}` {
 		t.Fatalf("zero-option reopened read = (%q,%v,%v)", raw, ok, err)
 	}
 	if _, err := reopened.Put(
-		"invalid", []byte(`{"id":"wrong"}`),
+		[]byte("invalid"), []byte(`{"id":"wrong"}`),
 	); !errors.Is(err, store.ErrSchemaViolation) {
 		t.Fatalf("rehydrated schema accepted invalid write: %v", err)
 	}
@@ -272,7 +272,6 @@ func TestFileStoreMultiPageExactCatalogZeroOptionReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
 
 func TestFileStoreMaterializationRequiresCurrentDeviceAssertion(
 	t *testing.T,

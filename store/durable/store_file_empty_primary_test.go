@@ -46,7 +46,7 @@ func TestCreateBuildsEmptyPrimaryStore(t *testing.T) {
 			if fs.Len() != 0 {
 				t.Fatalf("empty store Len = %d, want 0", fs.Len())
 			}
-			if got, ok, err := fs.AppendRaw(nil, "missing"); err != nil || ok || got != nil {
+			if got, ok, err := fs.AppendRaw(nil, []byte("missing")); err != nil || ok || got != nil {
 				t.Fatalf("AppendRaw on empty store = (%q,%v,%v)", got, ok, err)
 			}
 
@@ -54,7 +54,7 @@ func TestCreateBuildsEmptyPrimaryStore(t *testing.T) {
 			for i := 0; i < n; i++ {
 				key := fmt.Sprintf("k%03d", i)
 				doc := fmt.Sprintf(`{"id":%d,"name":%q}`, i, key)
-				created, err := fs.Put(key, []byte(doc))
+				created, err := fs.Put([]byte(key), []byte(doc))
 				if err != nil {
 					t.Fatalf("Put %s: %v", key, err)
 				}
@@ -89,7 +89,7 @@ func TestCreateBuildsEmptyPrimaryStore(t *testing.T) {
 			for i := 0; i < n; i++ {
 				key := fmt.Sprintf("k%03d", i)
 				want := fmt.Sprintf(`{"id":%d,"name":%q}`, i, key)
-				got, ok, err := fs.AppendRaw(nil, key)
+				got, ok, err := fs.AppendRaw(nil, []byte(key))
 				if err != nil || !ok {
 					t.Fatalf("AppendRaw %s after reopen = (ok=%v,%v)", key, ok, err)
 				}
@@ -101,7 +101,7 @@ func TestCreateBuildsEmptyPrimaryStore(t *testing.T) {
 			// Delete every document; the leaf empties but the graph stays valid.
 			for i := 0; i < n; i++ {
 				key := fmt.Sprintf("k%03d", i)
-				deleted, err := fs.Delete(key)
+				deleted, err := fs.Delete([]byte(key))
 				if err != nil {
 					t.Fatalf("Delete %s: %v", key, err)
 				}
@@ -113,10 +113,10 @@ func TestCreateBuildsEmptyPrimaryStore(t *testing.T) {
 				t.Fatalf("Len after deleting all = %d, want 0", fs.Len())
 			}
 			// A fresh Put after emptying must still route and fill.
-			if _, err := fs.Put("reborn", []byte(`{"v":1}`)); err != nil {
+			if _, err := fs.Put([]byte("reborn"), []byte(`{"v":1}`)); err != nil {
 				t.Fatalf("Put after empty: %v", err)
 			}
-			if got, ok, err := fs.AppendRaw(nil, "reborn"); err != nil || !ok || string(got) != `{"v":1}` {
+			if got, ok, err := fs.AppendRaw(nil, []byte("reborn")); err != nil || !ok || string(got) != `{"v":1}` {
 				t.Fatalf("AppendRaw reborn = (%q,%v,%v)", got, ok, err)
 			}
 			if err := fs.Close(); err != nil {
@@ -154,7 +154,7 @@ func TestCreateBuildsEmptyIndexedPrimaryStore(t *testing.T) {
 			status = "active"
 		}
 		doc := fmt.Sprintf(`{"id":%d,"status":%q}`, i, status)
-		if _, err := fs.Put(fmt.Sprintf("k%02d", i), []byte(doc)); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("k%02d", i)), []byte(doc)); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}

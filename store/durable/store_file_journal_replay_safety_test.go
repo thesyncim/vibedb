@@ -60,7 +60,7 @@ func replaySafetyCrashImage(
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("seed-%06d", (i*stride)%seedDocs)
 		val := journalValue(i)
-		if _, err := coll.Put(key, val); err != nil {
+		if _, err := coll.Put([]byte(key), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 		want[key] = string(val)

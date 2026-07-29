@@ -110,7 +110,7 @@ func TestCollectionUpdateWritesItsRetirementsInTheSameCommit(t *testing.T) {
 	for round := range 8 {
 		if err := collection.Update(func(b *WriteBatch) error {
 			for i := range 6 {
-				if err := b.Put(fmt.Sprintf("key-%d-%d", round, i),
+				if err := b.Put([]byte(fmt.Sprintf("key-%d-%d", round, i)),
 					commitCrashDocument(round, i, 100+i*300)); err != nil {
 					return err
 				}
@@ -173,14 +173,14 @@ func TestCollectionUpdateSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 				// keep the whole seed batch within a single leaf's fold budget. The
 				// retirement/growth invariant this test asserts is size-independent.
 				for key := range keys {
-					if err := b.Put(fmt.Sprintf("key-%02d", key),
+					if err := b.Put([]byte(fmt.Sprintf("key-%02d", key)),
 						commitCrashDocument(session*rounds+round, key,
 							40+(round*37+key*53)%110)); err != nil {
 						return err
 					}
 				}
 				for key := round % 3; key < keys; key += 3 {
-					if err := b.Delete(fmt.Sprintf("key-%02d", key)); err != nil {
+					if err := b.Delete([]byte(fmt.Sprintf("key-%02d", key))); err != nil {
 						return err
 					}
 				}

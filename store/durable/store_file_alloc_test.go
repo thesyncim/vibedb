@@ -34,7 +34,10 @@ func TestFileStoreBufferedPutStoreAllocations(t *testing.T) {
 	}
 	defer collection.Close()
 
-	const key = "allocation-key"
+	// key is converted once, outside the measured closure: the store speaks
+	// []byte, so the caller owns the conversion and a per-call []byte(key) would
+	// be counted as an allocation the store never makes.
+	key := []byte("allocation-key")
 	value := []byte(`{"value":"same-size-buffered-replacement"}`)
 	if _, err := collection.Put(key, value); err != nil {
 		t.Fatal(err)

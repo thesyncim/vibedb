@@ -131,7 +131,7 @@ func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.Put("direct:key", []byte(`{"mode":"observable"}`)); err != nil {
+	if _, err := fs.Put([]byte("direct:key"), []byte(`{"mode":"observable"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := fs.Close(); err != nil {
@@ -141,7 +141,7 @@ func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := reopened.AppendRaw(make([]byte, 0, 64), "direct:key")
+	got, ok, err := reopened.AppendRaw(make([]byte, 0, 64), []byte("direct:key"))
 	if err != nil || !ok || string(got) != `{"mode":"observable"}` {
 		t.Fatalf("direct-mode read = (%q,%v,%v)", got, ok, err)
 	}
@@ -209,7 +209,7 @@ func TestFileStoreCreateOpenAndSnapshotLifetime(t *testing.T) {
 	if fs.Len() != 0 || fs.Generation() != 1 || fs.DurableGeneration() != 1 {
 		t.Fatalf("created state = len %d generation %d durable %d", fs.Len(), fs.Generation(), fs.DurableGeneration())
 	}
-	if got, ok, err := fs.AppendRaw(nil, "missing"); err != nil || ok || got != nil {
+	if got, ok, err := fs.AppendRaw(nil, []byte("missing")); err != nil || ok || got != nil {
 		t.Fatalf("AppendRaw missing = (%q,%v,%v)", got, ok, err)
 	}
 	snapshot, err := fs.Snapshot()
@@ -255,7 +255,7 @@ func newFileStoreWithPendingRetirement(
 		_ = file.Close()
 		t.Fatal(err)
 	}
-	if created, err := fs.Put("held", []byte(`{"value":1}`)); err != nil || !created {
+	if created, err := fs.Put([]byte("held"), []byte(`{"value":1}`)); err != nil || !created {
 		_ = fs.Close()
 		_ = file.Close()
 		t.Fatalf("initial Put = (%v,%v)", created, err)
@@ -266,7 +266,7 @@ func newFileStoreWithPendingRetirement(
 		_ = file.Close()
 		t.Fatal(err)
 	}
-	if created, err := fs.Put("held", []byte(`{"value":2}`)); err != nil || created {
+	if created, err := fs.Put([]byte("held"), []byte(`{"value":2}`)); err != nil || created {
 		_ = snapshot.Close()
 		_ = fs.Close()
 		_ = file.Close()
@@ -434,7 +434,7 @@ func TestFileStoreMutationsOverflowSnapshotAndReopen(t *testing.T) {
 	for i := range 10 {
 		key := fmt.Sprintf("key-%02d", i)
 		value := fmt.Sprintf(`{"key":%q,"value":%d}`, key, i)
-		created, putErr := fs.Put(key, []byte(value))
+		created, putErr := fs.Put([]byte(key), []byte(value))
 		if putErr != nil || !created {
 			t.Fatalf("Put(%q) = (%v,%v)", key, created, putErr)
 		}
@@ -450,26 +450,26 @@ func TestFileStoreMutationsOverflowSnapshotAndReopen(t *testing.T) {
 	}
 	old := want["key-01"]
 	large := `{"payload":"` + strings.Repeat("large-value-", 400) + `"}`
-	created, err := fs.Put("key-01", []byte(large))
+	created, err := fs.Put([]byte("key-01"), []byte(large))
 	if err != nil || created {
 		t.Fatalf("update = (%v,%v), want existing", created, err)
 	}
 	want["key-01"] = large
-	if got, ok, err := snapshot.AppendRaw(nil, "key-01"); err != nil || !ok || string(got) != old {
+	if got, ok, err := snapshot.AppendRaw(nil, []byte("key-01")); err != nil || !ok || string(got) != old {
 		t.Fatalf("old snapshot = (%q,%v,%v), want %q", got, ok, err, old)
 	}
-	if got, ok, err := fs.AppendRaw(nil, "key-01"); err != nil || !ok || string(got) != large {
+	if got, ok, err := fs.AppendRaw(nil, []byte("key-01")); err != nil || !ok || string(got) != large {
 		t.Fatalf("current overflow = (%d bytes,%v,%v), want %d bytes", len(got), ok, err, len(large))
 	}
-	deleted, err := fs.Delete("key-02")
+	deleted, err := fs.Delete([]byte("key-02"))
 	if err != nil || !deleted {
 		t.Fatalf("Delete existing = (%v,%v)", deleted, err)
 	}
 	delete(want, "key-02")
-	if deleted, err := fs.Delete("key-02"); err != nil || deleted {
+	if deleted, err := fs.Delete([]byte("key-02")); err != nil || deleted {
 		t.Fatalf("Delete missing = (%v,%v)", deleted, err)
 	}
-	if got, ok, err := snapshot.AppendRaw(nil, "key-02"); err != nil || !ok || string(got) == "" {
+	if got, ok, err := snapshot.AppendRaw(nil, []byte("key-02")); err != nil || !ok || string(got) == "" {
 		t.Fatalf("snapshot deleted key = (%q,%v,%v)", got, ok, err)
 	}
 	if err := snapshot.Close(); err != nil {
@@ -487,7 +487,7 @@ func TestFileStoreMutationsOverflowSnapshotAndReopen(t *testing.T) {
 	if reopened.Len() != uint64(len(want)) {
 		t.Fatalf("reopened Len = %d, want %d", reopened.Len(), len(want))
 	}
-	queued, err := reopened.PrefetchKeys([]string{"key-09", "key-00", "missing", "key-05", "key-01"})
+	queued, err := reopened.PrefetchKeys([][]byte{[]byte("key-09"), []byte("key-00"), []byte("missing"), []byte("key-05"), []byte("key-01")})
 	if err != nil || queued == 0 {
 		t.Fatalf("PrefetchKeys = (%d,%v)", queued, err)
 	}
@@ -495,12 +495,12 @@ func TestFileStoreMutationsOverflowSnapshotAndReopen(t *testing.T) {
 		t.Fatalf("Stats after prefetch = %+v", stats)
 	}
 	for key, value := range want {
-		got, ok, getErr := reopened.AppendRaw(nil, key)
+		got, ok, getErr := reopened.AppendRaw(nil, []byte(key))
 		if getErr != nil || !ok || string(got) != value {
 			t.Fatalf("reopened %q = (%q,%v,%v), want %q", key, got, ok, getErr, value)
 		}
 	}
-	if got, ok, err := reopened.AppendRaw(nil, "key-02"); err != nil || ok || got != nil {
+	if got, ok, err := reopened.AppendRaw(nil, []byte("key-02")); err != nil || ok || got != nil {
 		t.Fatalf("reopened deleted key = (%q,%v,%v)", got, ok, err)
 	}
 }
@@ -517,13 +517,13 @@ func TestFileStoreRejectsInvalidMutationWithoutPublishing(t *testing.T) {
 	}
 	defer fs.Close()
 	generation := fs.Generation()
-	if _, err := fs.Put("bad", []byte(`{"unterminated":`)); err == nil {
+	if _, err := fs.Put([]byte("bad"), []byte(`{"unterminated":`)); err == nil {
 		t.Fatal("Put invalid JSON succeeded")
 	}
 	if fs.Generation() != generation || fs.Len() != 0 {
 		t.Fatalf("invalid Put published generation %d len %d", fs.Generation(), fs.Len())
 	}
-	if _, err := fs.Put(strings.Repeat("k", fs.options.MaxKeyBytes+1), []byte(`null`)); !errors.Is(err, ErrKeyTooLarge) {
+	if _, err := fs.Put([]byte(strings.Repeat("k", fs.options.MaxKeyBytes+1)), []byte(`null`)); !errors.Is(err, ErrKeyTooLarge) {
 		t.Fatalf("oversize key = %v, want %v", err, ErrKeyTooLarge)
 	}
 }
@@ -548,7 +548,7 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
-	if _, err := fs.Put("hot", []byte(`{"version":0}`)); err != nil {
+	if _, err := fs.Put([]byte("hot"), []byte(`{"version":0}`)); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := fs.Snapshot()
@@ -557,7 +557,7 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 	}
 	beforePinned := fs.state.Load().super.FileEnd
 	for version := 1; version <= 20; version++ {
-		if _, err := fs.Put("hot", []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
+		if _, err := fs.Put([]byte("hot"), []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -565,7 +565,7 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 	if afterPinned <= beforePinned {
 		t.Fatalf("active snapshot did not fence reuse: fileEnd %d -> %d", beforePinned, afterPinned)
 	}
-	if got, ok, err := snapshot.AppendRaw(nil, "hot"); err != nil || !ok || string(got) != `{"version":0}` {
+	if got, ok, err := snapshot.AppendRaw(nil, []byte("hot")); err != nil || !ok || string(got) != `{"version":0}` {
 		t.Fatalf("pinned value after churn = (%q,%v,%v)", got, ok, err)
 	}
 	if err := snapshot.Close(); err != nil {
@@ -573,20 +573,20 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 	}
 
 	for version := 21; version <= 40; version++ {
-		if _, err := fs.Put("hot", []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
+		if _, err := fs.Put([]byte("hot"), []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	plateau := fs.state.Load().super.FileEnd
 	for version := 41; version <= 80; version++ {
-		if _, err := fs.Put("hot", []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
+		if _, err := fs.Put([]byte("hot"), []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if got := fs.state.Load().super.FileEnd; got != plateau {
 		t.Fatalf("copy-on-write file did not plateau: %d -> %d", plateau, got)
 	}
-	if got, ok, err := fs.AppendRaw(nil, "hot"); err != nil || !ok || string(got) != `{"version":80}` {
+	if got, ok, err := fs.AppendRaw(nil, []byte("hot")); err != nil || !ok || string(got) != `{"version":80}` {
 		t.Fatalf("latest value = (%q,%v,%v)", got, ok, err)
 	}
 }
@@ -609,11 +609,11 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.Put("hot", []byte(`0`)); err != nil {
+	if _, err := fs.Put([]byte("hot"), []byte(`0`)); err != nil {
 		t.Fatal(err)
 	}
 	for version := 1; version <= 30; version++ {
-		if _, err := fs.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
+		if _, err := fs.Put([]byte("hot"), []byte(fmt.Sprintf(`%d`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -635,7 +635,7 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 	if reopened.freeLoaded {
 		t.Fatal("Open eagerly replayed the free log")
 	}
-	if _, err := reopened.Put("hot", []byte(`31`)); err != nil {
+	if _, err := reopened.Put([]byte("hot"), []byte(`31`)); err != nil {
 		t.Fatal(err)
 	}
 	// The synchronous lane's first physical allocation is the checkpoint, which
@@ -647,7 +647,7 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 		t.Fatal("first checkpoint did not lazily replay the bounded free log")
 	}
 	for version := 32; version <= 50; version++ {
-		if _, err := reopened.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
+		if _, err := reopened.Put([]byte("hot"), []byte(fmt.Sprintf(`%d`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -656,7 +656,7 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 	}
 	plateau := reopened.Stats().FileEnd
 	for version := 51; version <= 80; version++ {
-		if _, err := reopened.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
+		if _, err := reopened.Put([]byte("hot"), []byte(fmt.Sprintf(`%d`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -713,7 +713,7 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 		if i == 9 {
 			doc = fmt.Sprintf(`{"id":%d,"tenant":%q,"status":"ac\u0074ive","padding":%q}`, i, tenant, strings.Repeat("x", 900))
 		}
-		if _, err := fs.Put(fmt.Sprintf("k%02d", i), []byte(doc)); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("k%02d", i)), []byte(doc)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -782,10 +782,10 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err != nil || countMasks(bufferedMasks) != 2 {
 		t.Fatalf("buffered compound candidates = (%+v,%v)", bufferedMasks, err)
 	}
-	if _, err := fs.Put("k00", []byte(`{"id":0,"tenant":"acme","status":"idle"}`)); err != nil {
+	if _, err := fs.Put([]byte("k00"), []byte(`{"id":0,"tenant":"acme","status":"idle"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := fs.Delete("k06"); err != nil || !ok {
+	if ok, err := fs.Delete([]byte("k06")); err != nil || !ok {
 		t.Fatalf("Delete indexed row = (%v,%v)", ok, err)
 	}
 	masks, err = collectionIndexMasks(fs, masks[:0], "status", active)
@@ -855,11 +855,11 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 			padding = strings.Repeat("x", 1024)
 		}
 		doc := []byte(fmt.Sprintf(`{"id":%d,"padding":%q}`, i, padding))
-		if _, err := fs.Put(fmt.Sprintf("k%02d", i), doc); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("k%02d", i)), doc); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if deleted, err := fs.Delete("k01"); err != nil || !deleted {
+	if deleted, err := fs.Delete([]byte("k01")); err != nil || !deleted {
 		t.Fatalf("Delete(k01) = (%v,%v)", deleted, err)
 	}
 	snapshot, err := fs.Snapshot()
@@ -1004,7 +1004,7 @@ func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	defer fs.Close()
 	for row := range 8 {
 		document := fmt.Appendf(nil, `{"tenant":"acme","status":"active","row":%d}`, row)
-		if _, err := fs.Put(fmt.Sprintf("k%d", row), document); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("k%d", row)), document); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1096,7 +1096,7 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 			padding = strings.Repeat("x", 1024)
 		}
 		document := fmt.Appendf(nil, `{"row":%d,"grp":"g","padding":%q}`, row, padding)
-		if _, err := fs.Put(fmt.Sprintf("k%02d", row), document); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("k%02d", row)), document); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1190,7 +1190,7 @@ func TestFileStoreOverflowExtentsMatchTheirPiece(t *testing.T) {
 			len(value), options.InlineValueBytes)
 	}
 	for i := range documents {
-		if _, err := fs.Put(fmt.Sprintf("k%02d", i), value); err != nil {
+		if _, err := fs.Put([]byte(fmt.Sprintf("k%02d", i)), value); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -1213,7 +1213,7 @@ func TestFileStoreOverflowExtentsMatchTheirPiece(t *testing.T) {
 	// Every document must still read back exactly, so the smaller extent is a
 	// space change and not a truncation.
 	for i := range documents {
-		got, ok, err := fs.AppendRaw(nil, fmt.Sprintf("k%02d", i))
+		got, ok, err := fs.AppendRaw(nil, []byte(fmt.Sprintf("k%02d", i)))
 		if err != nil || !ok {
 			t.Fatalf("AppendRaw(k%02d) = (%v,%v)", i, ok, err)
 		}
@@ -1258,7 +1258,7 @@ func TestFileStoreRecoversAfterRetirementPressureClears(t *testing.T) {
 
 	body := strings.Repeat("x", 512)
 	put := func(round, i int) error {
-		_, err := fs.Put(fmt.Sprintf("k%02d", i), fmt.Appendf(nil,
+		_, err := fs.Put([]byte(fmt.Sprintf("k%02d", i)), fmt.Appendf(nil,
 			`{"round":%d,"v":%q}`, round, body))
 		return err
 	}
@@ -1315,7 +1315,7 @@ func TestFileStoreRecoversAfterRetirementPressureClears(t *testing.T) {
 	// hand out space that was still live.
 	for i := range keys {
 		key := fmt.Sprintf("k%02d", i)
-		got, ok, err := fs.AppendRaw(nil, key)
+		got, ok, err := fs.AppendRaw(nil, []byte(key))
 		if err != nil || !ok {
 			t.Fatalf("AppendRaw(%s) = (%v,%v)", key, ok, err)
 		}

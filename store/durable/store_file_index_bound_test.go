@@ -91,7 +91,7 @@ func TestIndexProbeMemoryBoundNoIndexLeavesProbeWorkspaceZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer collection.Close()
-	if _, err := collection.Put("k", []byte(`{"value":1}`)); err != nil {
+	if _, err := collection.Put([]byte("k"), []byte(`{"value":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := collection.Snapshot()

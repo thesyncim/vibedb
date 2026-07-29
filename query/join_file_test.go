@@ -70,7 +70,7 @@ func buildDurableJoinDatabase(t testing.TB, outerDocs []string, innerRows []int,
 		t.Fatalf("CreateCollection(outer): %v", err)
 	}
 	for i, doc := range outerDocs {
-		if _, err := outer.Put(fmt.Sprintf("o%d", i), []byte(doc)); err != nil {
+		if _, err := outer.Put([]byte(fmt.Sprintf("o%d", i)), []byte(doc)); err != nil {
 			t.Fatalf("Put(o%d, %s): %v", i, doc, err)
 		}
 	}
@@ -79,7 +79,7 @@ func buildDurableJoinDatabase(t testing.TB, outerDocs []string, innerRows []int,
 		t.Fatalf("CreateCollection(inner): %v", err)
 	}
 	for _, r := range innerRows {
-		if _, err := inner.Put(innerJoinPool[r].key, []byte(innerJoinPool[r].doc)); err != nil {
+		if _, err := inner.Put([]byte(innerJoinPool[r].key), []byte(innerJoinPool[r].doc)); err != nil {
 			t.Fatalf("Put(%s): %v", innerJoinPool[r].key, err)
 		}
 	}
@@ -254,7 +254,7 @@ func TestDurableJoinInnerScanSpansManyBatchesUnderEviction(t *testing.T) {
 	for i := range outerRows {
 		key := fmt.Sprintf("o%04d", i)
 		doc := fmt.Sprintf(`{"id":%d,"ref":"k%04d"}`, i, i%innerRows)
-		if _, err := outer.Put(key, []byte(doc)); err != nil {
+		if _, err := outer.Put([]byte(key), []byte(doc)); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		if _, err := heapOuter.Put(key, []byte(doc)); err != nil {
@@ -280,7 +280,7 @@ func TestDurableJoinInnerScanSpansManyBatchesUnderEviction(t *testing.T) {
 			tier = "pro"
 		}
 		doc := fmt.Sprintf(`{"tier":%q,"seat":%d,"pad":%q}`, tier, i, innerJoinPadding)
-		if _, err := inner.Put(key, []byte(doc)); err != nil {
+		if _, err := inner.Put([]byte(key), []byte(doc)); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		if _, err := heapInner.Put(key, []byte(doc)); err != nil {
@@ -358,7 +358,7 @@ func TestDurableJoinNamesAnAbsentCollection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCollection: %v", err)
 	}
-	if _, err := outer.Put("o1", []byte(`{"id":1,"ref":"k1"}`)); err != nil {
+	if _, err := outer.Put([]byte("o1"), []byte(`{"id":1,"ref":"k1"}`)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	catalog, err := db.Snapshot()
@@ -414,7 +414,7 @@ func TestDurableJoinBatchIsBoundedBeforeDocumentArenaGrowth(t *testing.T) {
 		t.Fatalf("CreateCollection(outer): %v", err)
 	}
 	if _, err := outer.Put(
-		"outer-0",
+		[]byte("outer-0"),
 		[]byte(`{"id":"outer-0","join":"x","ref":"inner-0"}`),
 	); err != nil {
 		t.Fatalf("Put(outer): %v", err)
@@ -426,7 +426,7 @@ func TestDurableJoinBatchIsBoundedBeforeDocumentArenaGrowth(t *testing.T) {
 	// The raw document is small enough for the collection but structurally
 	// wider than a 64 KiB execution can index in its reusable join batch.
 	bomb := `{"join":"x","items":[` + strings.Repeat("0,", 2048) + `0]}`
-	if _, err := inner.Put("inner-0", []byte(bomb)); err != nil {
+	if _, err := inner.Put([]byte("inner-0"), []byte(bomb)); err != nil {
 		t.Fatalf("Put(inner): %v", err)
 	}
 	catalog, err := db.Snapshot()

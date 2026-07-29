@@ -83,7 +83,7 @@ func TestFilePrimarySyncLeafSplitSignal(t *testing.T) {
 	for i := 0; i < inserts; i++ {
 		key := fmt.Sprintf("key-%06d", i)
 		value := journalValue(i)
-		created, putErr := coll.Put(key, value)
+		created, putErr := coll.Put([]byte(key), value)
 		if errors.Is(putErr, ErrPrimaryLeafSplitRequired) {
 			t.Fatalf("sync put %q surfaced a leaf-split signal", key)
 		}
@@ -117,7 +117,7 @@ func TestFilePrimarySyncLeafSplitSignal(t *testing.T) {
 	// synced acknowledgement).
 	buf := make([]byte, 0, 32)
 	for key, want := range oracle {
-		got, ok, readErr := coll.AppendRaw(buf[:0], key)
+		got, ok, readErr := coll.AppendRaw(buf[:0], []byte(key))
 		if readErr != nil || !ok || string(got) != want {
 			t.Fatalf("live readback %q = %q,%v,%v want %q", key, got, ok, readErr, want)
 		}
@@ -168,12 +168,12 @@ func TestFilePrimarySyncRoutedSplitDifferential(t *testing.T) {
 	for at, id := range order {
 		key := fmt.Sprintf("rk-%08d", id)
 		value := []byte(fmt.Sprintf(`{"id":%d,"n":%d}`, id, at))
-		created, putErr := coll.Put(key, value)
+		created, putErr := coll.Put([]byte(key), value)
 		if putErr != nil || !created {
 			t.Fatalf("insert %d %q = created %v, err %v", at, key, created, putErr)
 		}
 		oracle[key] = string(value)
-		got, ok, readErr := coll.AppendRaw(buffer[:0], key)
+		got, ok, readErr := coll.AppendRaw(buffer[:0], []byte(key))
 		if readErr != nil || !ok || !bytes.Equal(got, value) {
 			t.Fatalf("post-insert read %q = %q,%v,%v want %q", key, got, ok, readErr, value)
 		}
@@ -188,7 +188,7 @@ func TestFilePrimarySyncRoutedSplitDifferential(t *testing.T) {
 
 	// Point differential: every oracle key resolves byte-exact.
 	for key, want := range oracle {
-		got, ok, readErr := coll.AppendRaw(buffer[:0], key)
+		got, ok, readErr := coll.AppendRaw(buffer[:0], []byte(key))
 		if readErr != nil || !ok || string(got) != want {
 			t.Fatalf("point differential %q = %q,%v,%v want %q", key, got, ok, readErr, want)
 		}
@@ -250,7 +250,7 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 	for i := 0; i < grow; i++ {
 		key := fmt.Sprintf("key-%06d", i)
 		value := journalValue(i)
-		if _, err := coll.Put(key, value); err != nil {
+		if _, err := coll.Put([]byte(key), value); err != nil {
 			t.Fatalf("grow put %q: %v", key, err)
 		}
 		oracle[key] = string(value)
@@ -269,7 +269,7 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 	buf := make([]byte, 0, 32)
 	for i := 0; i < shrink; i++ {
 		key := keys[i]
-		deleted, err := coll.Delete(key)
+		deleted, err := coll.Delete([]byte(key))
 		if err != nil {
 			t.Fatalf("delete %q: %v", key, err)
 		}
@@ -279,7 +279,7 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 		delete(oracle, key)
 		// The delete is visible immediately, and a surviving key remains readable
 		// (proves the merge/reclass rewrite preserved neighbours).
-		if _, ok, err := coll.AppendRaw(buf[:0], key); err != nil || ok {
+		if _, ok, err := coll.AppendRaw(buf[:0], []byte(key)); err != nil || ok {
 			t.Fatalf("deleted key %q still visible: ok=%v err=%v", key, ok, err)
 		}
 	}
@@ -301,7 +301,7 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 
 	// Live differential over every surviving key.
 	for key, want := range oracle {
-		got, ok, readErr := coll.AppendRaw(buf[:0], key)
+		got, ok, readErr := coll.AppendRaw(buf[:0], []byte(key))
 		if readErr != nil || !ok || string(got) != want {
 			t.Fatalf("post-merge readback %q = %q,%v,%v want %q", key, got, ok, readErr, want)
 		}
@@ -341,7 +341,7 @@ func TestFilePrimarySyncBatchSplit(t *testing.T) {
 	for i := 0; i < total; i++ {
 		key := fmt.Sprintf("bk-%06d", i)
 		value := journalValue(i)
-		if _, err := sequential.Put(key, value); err != nil {
+		if _, err := sequential.Put([]byte(key), value); err != nil {
 			t.Fatalf("sequential put %q: %v", key, err)
 		}
 		oracle[key] = string(value)
@@ -363,7 +363,7 @@ func TestFilePrimarySyncBatchSplit(t *testing.T) {
 		}
 		if err := batched.Update(func(b *WriteBatch) error {
 			for i := start; i < end; i++ {
-				if err := b.Put(fmt.Sprintf("bk-%06d", i), journalValue(i)); err != nil {
+				if err := b.Put([]byte(fmt.Sprintf("bk-%06d", i)), journalValue(i)); err != nil {
 					return err
 				}
 			}
@@ -419,7 +419,7 @@ func TestFilePrimarySyncSplitCrashReplay(t *testing.T) {
 	for i := 0; i < inserts; i++ {
 		key := fmt.Sprintf("key-%06d", i)
 		value := journalValue(i)
-		if _, err := coll.Put(key, value); err != nil {
+		if _, err := coll.Put([]byte(key), value); err != nil {
 			t.Fatalf("put %q: %v", key, err)
 		}
 		oracle[key] = string(value)

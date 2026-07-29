@@ -122,7 +122,7 @@ func TestFileStoreStickyFailureRejectsNoOpMutations(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = collection.Put("trigger", []byte(`{"value":1}`))
+	_, _ = collection.Put([]byte("trigger"), []byte(`{"value":1}`))
 	deadline := time.Now().Add(5 * time.Second)
 	for collection.PersistenceError() == nil && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Microsecond)
@@ -131,7 +131,7 @@ func TestFileStoreStickyFailureRejectsNoOpMutations(t *testing.T) {
 	if persistErr == nil {
 		t.Fatal("closed commit descriptor did not poison persistence")
 	}
-	if deleted, err := collection.Delete("missing"); deleted ||
+	if deleted, err := collection.Delete([]byte("missing")); deleted ||
 		!errors.Is(err, persistErr) {
 		t.Fatalf(
 			"missing Delete after failure = (%v, %v), want sticky %v",
@@ -175,7 +175,7 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 	const key = "stable"
 	before := []byte(`{"value":"durable"}`)
 	after := []byte(`{"value":"rejected"}`)
-	if _, err := collection.Put(key, before); err != nil {
+	if _, err := collection.Put([]byte(key), before); err != nil {
 		t.Fatal(err)
 	}
 	// A sync Put acknowledges through the journal and folds its root at the next
@@ -199,7 +199,7 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 	fj.Program(storeio.JournalFaultPlan{
 		Phase: storeio.JournalFaultENOSPCAppend, AppendIndex: fj.Appends(),
 	})
-	if created, err := collection.Put(key, after); created || err == nil {
+	if created, err := collection.Put([]byte(key), after); created || err == nil {
 		t.Fatalf("rejected replacement = (%v, %v), want false and failure", created, err)
 	}
 	if !fj.Faulted() {
@@ -209,7 +209,7 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 	if persistErr == nil {
 		t.Fatal("synchronous device failure did not become sticky")
 	}
-	got, found, readErr := collection.AppendRaw(nil, key)
+	got, found, readErr := collection.AppendRaw(nil, []byte(key))
 	if readErr != nil || !found || string(got) != string(before) {
 		t.Fatalf(
 			"reader after rejected commit = (%q, %v, %v), want durable %q",
@@ -226,7 +226,7 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 	}
 	// The journal poison is die-don't-retry: every later mutation is refused with
 	// the sticky error rather than retried against an uncertain journal.
-	if _, err := collection.Put(key, after); !errors.Is(err, persistErr) {
+	if _, err := collection.Put([]byte(key), after); !errors.Is(err, persistErr) {
 		t.Fatalf("mutation after sync failure = %v, want sticky %v", err, persistErr)
 	}
 	// Close, by contrast, succeeds. The failed append never published, so the
@@ -246,7 +246,7 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 		t.Fatalf("reopen after sync failure: %v", err)
 	}
 	defer reopened.Close()
-	if got, found, err := reopened.AppendRaw(nil, key); err != nil || !found ||
+	if got, found, err := reopened.AppendRaw(nil, []byte(key)); err != nil || !found ||
 		string(got) != string(before) {
 		t.Fatalf("reopened value = (%q, %v, %v), want durable baseline %q", got, found, err, before)
 	}
