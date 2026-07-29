@@ -66,10 +66,6 @@ func TestStoreExactCompoundIndexLifecycle(t *testing.T) {
 	if _, err := collection.Put("a", []byte(`{"tenant":"acme","status":"idle","n":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	del22, _ := collection.Delete("b")
-	if !del22 {
-		t.Fatal("Delete(b) missed")
-	}
 	if _, err := collection.Put("d", []byte(`{"tenant":"acme","status":"active","n":3}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +79,7 @@ func TestStoreExactCompoundIndexLifecycle(t *testing.T) {
 	idle := testScalarIndex(t, `"idle"`)
 	snap27, _ := collection.Snapshot()
 	got, err = snap27.AppendIndexKeys(nil, "tenant_status", active[0], idle)
-	if err != nil || !slices.Equal(got, []string{"a"}) {
+	if err != nil || !slices.Equal(got, []string{"a", "b"}) {
 		t.Fatalf("current idle lookup = (%v,%v)", got, err)
 	}
 	got, err = before.AppendIndexKeys(nil, "tenant_status", active...)
@@ -149,9 +145,6 @@ func TestStoreExactIndexPhysicalAliasDeduplication(t *testing.T) {
 	if _, err := collection.Put("a", []byte(`{"tenant":"acme","status":"idle"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := collection.Delete("b"); err != nil || !deleted {
-		t.Fatalf("Delete(b) = (%v,%v)", deleted, err)
-	}
 	if _, err := collection.Put("d", []byte(`{"tenant":"acme","status":"active"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -193,14 +186,21 @@ func TestStoreBuilderExactIndexPhysicalAliasDeduplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Builder no longer exposes public index declaration, but Build still
+	// deduplicates exact indexes staged on it — identical ordered paths share one
+	// physical build. Stage them directly to cover that bulk dedup.
+	builder.exact = map[string]*ExactIndex{}
 	for _, def := range []IndexDefinition{
 		{Name: "a", Paths: []string{"/value"}},
 		{Name: "b", Paths: []string{"/value"}},
 		{Name: "other", Paths: []string{"/other"}},
 	} {
-		if err := builder.CreateIndex(def); err != nil {
+		exact, err := CompileExactIndex(def)
+		if err != nil {
 			t.Fatal(err)
 		}
+		exact.seed = builder.seed
+		builder.exact[def.Name] = exact
 	}
 	if err := builder.Append("one", []byte(`{"value":1,"other":2}`)); err != nil {
 		t.Fatal(err)
@@ -300,13 +300,9 @@ func TestStoreExactIndexMutationDifferential(t *testing.T) {
 			for step := range 240 {
 				i := (step*37 + 13) % 131
 				key := fmt.Sprintf("k%03d", i)
-				if step%9 == 0 {
-					collection.Delete(key)
-				} else {
-					doc := fmt.Sprintf(`{"tenant":"t%d","profile":{"bucket":%d},"seq":%d}`, (i+step)%7, (i*3+step)%11, step)
-					if _, err := collection.Put(key, []byte(doc)); err != nil {
-						t.Fatal(err)
-					}
+				doc := fmt.Sprintf(`{"tenant":"t%d","profile":{"bucket":%d},"seq":%d}`, (i+step)%7, (i*3+step)%11, step)
+				if _, err := collection.Put(key, []byte(doc)); err != nil {
+					t.Fatal(err)
 				}
 				if step%17 == 0 {
 					snap25, _ := collection.Snapshot()

@@ -24,7 +24,3 @@ func storeKeyLookup(root *storeKeyNode, hash uint64, key string) (Location, bool
 func storeKeyInsert(root *storeKeyNode, hash uint64, key string, loc Location) *storeKeyNode {
 	return storekey.Insert(root, hash, key, loc)
 }
-
-func storeKeyDelete(root *storeKeyNode, hash uint64, key string) *storeKeyNode {
-	return storekey.Delete(root, hash, key)
-}

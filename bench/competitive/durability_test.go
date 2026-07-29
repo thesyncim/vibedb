@@ -34,7 +34,6 @@ func TestDurabilityDefaultResolvesToConcreteMode(t *testing.T) {
 		engine string
 		want   DurabilityMode
 	}{
-		{engine: "vibejson-heap", want: DurabilityVolatile},
 		{engine: "vibejson-durable", want: DurabilityBufferedVisible},
 		{engine: "bbolt", want: DurabilityBufferedVisible},
 		{engine: "badger", want: DurabilityBufferedVisible},
@@ -65,7 +64,6 @@ func TestUnsupportedDurabilityModesFailClosed(t *testing.T) {
 		{engine: "bbolt", mode: DurabilityPowerSafe},
 		{engine: "badger", mode: DurabilityPowerSafe},
 		{engine: "sqlite", mode: DurabilityAsyncStableInFlight},
-		{engine: "vibejson-heap", mode: DurabilityBufferedVisible},
 	}
 	for _, test := range tests {
 		if _, err := ResolveDurabilityMode(test.engine, test.mode); err == nil {

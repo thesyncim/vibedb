@@ -185,9 +185,8 @@ func TestStoreReclaimsOwnedDocumentBaseAfterAllChunksDetach(t *testing.T) {
 	if state := collection.state.Load(); state.mappedDocChunks != 1 || state.mappedDocs == nil {
 		t.Fatalf("first detach state = %d/%p", state.mappedDocChunks, state.mappedDocs)
 	}
-	del36, _ := collection.Delete("k2")
-	if !del36 {
-		t.Fatal("Delete(k2) missed")
+	if _, err := collection.Put("k2", []byte(`{"n":12}`)); err != nil {
+		t.Fatal(err)
 	}
 	if state := collection.state.Load(); state.mappedDocChunks != 0 || state.mappedDocs != nil {
 		t.Fatalf("last detach retained current owner = %d/%p", state.mappedDocChunks, state.mappedDocs)
@@ -203,51 +202,6 @@ func TestStoreReclaimsOwnedDocumentBaseAfterAllChunksDetach(t *testing.T) {
 		if raw, ok := retained.GetRaw("k2"); !ok || string(raw.Bytes()) != `{"n":2}` {
 			t.Fatalf("retained k2 after GC = (%q, %v)", raw.Bytes(), ok)
 		}
-	}
-}
-
-func TestStoreMaintenanceDetachesOwnedDocumentBase(t *testing.T) {
-	t.Run("posting backfill", func(t *testing.T) {
-		collection := buildOwnedDetachFixture(t)
-		retained, _ := collection.Snapshot()
-		info, err := collection.AddIndex("postings", IndexPostings)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info, err = collection.BackfillIndex(info.Name, 0); err != nil || info.State != IndexReady {
-			t.Fatalf("BackfillIndex = (%+v, %v)", info, err)
-		}
-		assertOwnedDocumentBaseDetached(t, collection, retained)
-	})
-}
-
-func buildOwnedDetachFixture(t *testing.T) *Collection {
-	t.Helper()
-	builder, err := NewBuilder(Options{ChunkDocuments: 2, ShapeTapes: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for row := range 4 {
-		if err := builder.Append(fmt.Sprintf("k%d", row), []byte(fmt.Sprintf(`{"n":%d}`, row))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	collection, err := builder.Build()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return collection
-}
-
-func assertOwnedDocumentBaseDetached(t *testing.T, collection *Collection, retained Snapshot) {
-	t.Helper()
-	state := collection.state.Load()
-	if state.mappedDocChunks != 0 || state.mappedDocs != nil || collection.Stats().ExternalDocumentBytes != 0 {
-		t.Fatalf("current owner = %d/%p, external=%d", state.mappedDocChunks, state.mappedDocs, collection.Stats().ExternalDocumentBytes)
-	}
-	runtime.GC()
-	if raw, ok := retained.GetRaw("k0"); !ok || string(raw.Bytes()) != `{"n":0}` {
-		t.Fatalf("retained k0 after GC = (%q, %v)", raw.Bytes(), ok)
 	}
 }
 

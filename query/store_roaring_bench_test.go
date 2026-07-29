@@ -18,11 +18,6 @@ func benchmarkIndexedCollection(b *testing.B, rows int) store.Snapshot {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := builder.CreateIndex(store.IndexDefinition{
-		Name: "bucket", Paths: []string{"/bucket"},
-	}); err != nil {
-		b.Fatal(err)
-	}
 	for i := 0; i < rows; i++ {
 		doc := fmt.Appendf(nil, `{"id":%d,"bucket":%d,"payload":"value-%08d"}`, i, i%100, i)
 		if err := builder.Append(fmt.Sprintf("key:%08d", i), doc); err != nil {
@@ -32,6 +27,18 @@ func benchmarkIndexedCollection(b *testing.B, rows int) store.Snapshot {
 	db, err := builder.Build()
 	if err != nil {
 		b.Fatal(err)
+	}
+	if _, err := db.CreateIndex(store.IndexDefinition{Name: "bucket", Paths: []string{"/bucket"}}); err != nil {
+		b.Fatal(err)
+	}
+	for {
+		info, err := db.BackfillIndex("bucket", 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if info.State == store.IndexReady {
+			break
+		}
 	}
 	snapshot, _ := db.Snapshot()
 	return snapshot

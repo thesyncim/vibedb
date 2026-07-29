@@ -211,13 +211,12 @@ func TestLateMaterializationMatchesReference(t *testing.T) {
 	}
 }
 
-// TestLateMaterializationSnapshotSparseSlots is the snapshot half, over a
-// collection whose live slots are deliberately sparse. A snapshot scan numbers
-// its rows by position in live chunk/slot order, and the late gather has to
-// translate those numbers back into addresses through the live masks; a
-// collection with holes in it is what tells a correct translation from one that
-// only works when slot equals ordinal.
-func TestLateMaterializationSnapshotSparseSlots(t *testing.T) {
+// TestLateMaterializationSnapshot is the snapshot half of the late-materialization
+// differential, over a heap store.Snapshot. A snapshot scan numbers its rows by
+// position in live chunk/slot order, and the late gather translates those numbers
+// back into addresses through the live masks; the run compares the gathered
+// values and their order against a Segment oracle and the decoded reference.
+func TestLateMaterializationSnapshot(t *testing.T) {
 	collection, err := store.New(store.Options{ChunkDocuments: 8, ShapeTapes: true})
 	if err != nil {
 		t.Fatal(err)
@@ -226,14 +225,6 @@ func TestLateMaterializationSnapshotSparseSlots(t *testing.T) {
 	for i, doc := range docs {
 		if _, err := collection.Put(fmt.Sprintf("k%03d", i), doc); err != nil {
 			t.Fatal(err)
-		}
-	}
-	// Delete an irregular pattern so no chunk keeps a dense prefix of slots.
-	for i := range docs {
-		if i%3 == 1 || i%7 == 2 {
-			if _, err := collection.Delete(fmt.Sprintf("k%03d", i)); err != nil {
-				t.Fatal(err)
-			}
 		}
 	}
 	snapshot, err := collection.Snapshot()

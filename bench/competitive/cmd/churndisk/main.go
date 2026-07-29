@@ -72,9 +72,6 @@ func run(args []string, out io.Writer) error {
 		cfg.replacePercent < 0 || cfg.replacePercent > 100 {
 		return fmt.Errorf("-engine, -corpus>=1, -mutations>=1, -sample-mutations>=1, -checkpoint-mutations>=0, and -replace-percent in [0,100] are required")
 	}
-	if cfg.engineName == "vibejson-heap" {
-		return fmt.Errorf("vibejson-heap has no live-disk lane")
-	}
 	factory, ok := competitive.FactoryNamed(cfg.engineName)
 	if !ok {
 		return fmt.Errorf("unknown engine %q", cfg.engineName)

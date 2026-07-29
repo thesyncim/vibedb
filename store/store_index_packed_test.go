@@ -84,9 +84,6 @@ func TestStorePackedIndexDeltaShadowsWholeChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.CreateIndex(IndexDefinition{Name: "v", Paths: []string{"/v"}}); err != nil {
-		t.Fatal(err)
-	}
 	for i := range 8 {
 		if err := builder.Append(string(rune('a'+i)), []byte(`{"v":1}`)); err != nil {
 			t.Fatal(err)
@@ -96,10 +93,25 @@ func TestStorePackedIndexDeltaShadowsWholeChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A fully backfilled exact index folds its heap root into one packed base, the
+	// same packed-only shape a bulk build once published, so a Put must still
+	// shadow it with a bounded per-chunk delta rather than rewriting the base.
+	if _, err := collection.CreateIndex(IndexDefinition{Name: "v", Paths: []string{"/v"}}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		info, err := collection.BackfillIndex("v", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State == IndexReady {
+			break
+		}
+	}
 	before, _ := collection.Snapshot()
 	baseIndex, ok := before.exactIndex("v")
 	if !ok || baseIndex.base == nil || baseIndex.root != nil || baseIndex.dirty.root != nil {
-		t.Fatalf("builder did not publish packed-only base: %+v", baseIndex)
+		t.Fatalf("backfill did not publish packed-only base: %+v", baseIndex)
 	}
 	if _, err := collection.Put("b", []byte(`{"v":2}`)); err != nil {
 		t.Fatal(err)

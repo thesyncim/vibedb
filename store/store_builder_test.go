@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibejson"
@@ -21,16 +20,6 @@ func TestStoreBuilderEquivalentAndMutable(t *testing.T) {
 		t.Run(fmt.Sprintf("chunk=%d/shape=%v/postings=%v", options.ChunkDocuments, options.ShapeTapes, options.Postings), func(t *testing.T) {
 			builder, err := NewBuilder(options)
 			if err != nil {
-				t.Fatal(err)
-			}
-			if err := builder.CreateIndex(IndexDefinition{
-				Name: "country", Paths: []string{"/profile/geo/country"},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if err := builder.CreateIndex(IndexDefinition{
-				Name: "country_active", Paths: []string{"/profile/geo/country", "/active"},
-			}); err != nil {
 				t.Fatal(err)
 			}
 			want := make(map[string]string)
@@ -57,46 +46,18 @@ func TestStoreBuilderEquivalentAndMutable(t *testing.T) {
 			snap4, _ := collection.Snapshot()
 			checkCollectionSnapshot(t, snap4, want)
 
-			snap3, _ := collection.Snapshot()
-			indexes := snap3.AppendIndexes(nil)
-			if len(indexes) != 2 || indexes[0].Name != "country" || indexes[1].Name != "country_active" ||
-				indexes[0].State != IndexReady || indexes[0].CoveredChunks != indexes[0].TotalChunks ||
-				indexes[1].State != IndexReady || indexes[1].CoveredChunks != indexes[1].TotalChunks {
-				t.Fatalf("bulk index = %+v", indexes)
-			}
-			snap2, _ := collection.Snapshot()
-			keys, err := snap2.AppendIndexRawKeys(nil, "country", []byte(`"c3"`))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(keys) == 0 {
-				t.Fatal("nested index found no c3 documents")
-			}
-			snap1, _ := collection.Snapshot()
-			compound, err := snap1.AppendIndexRawKeys(nil, "country_active", []byte(`"c3"`), []byte(`false`))
-			if err != nil || len(compound) == 0 {
-				t.Fatalf("bulk compound index = (%v,%v)", compound, err)
-			}
-
+			// A built collection is still Put-mutable — the SQL driver stages
+			// transient point-lookup rows into one — and a snapshot retained across
+			// that Put keeps its original bytes.
 			before, _ := collection.Snapshot()
 			if _, err := collection.Put("key-003", []byte(`{"id":3,"profile":{"geo":{"country":"new"}}}`)); err != nil {
 				t.Fatal(err)
 			}
-			del12, _ := collection.Delete("key-004")
-			if !del12 {
-				t.Fatal("built collection mutation failed")
-			}
 			if raw, ok := before.GetRaw("key-003"); !ok || string(raw.Bytes()) != want["key-003"] {
 				t.Fatal("post-build mutation changed retained snapshot")
 			}
-			oldKeys, err := before.AppendIndexRawKeys(nil, "country", []byte(`"c3"`))
-			if err != nil || !containsString(oldKeys, "key-003") {
-				t.Fatalf("retained bulk index lost old row: (%v,%v)", oldKeys, err)
-			}
-			snap11, _ := collection.Snapshot()
-			newKeys, err := snap11.AppendIndexRawKeys(nil, "country", []byte(`"new"`))
-			if err != nil || len(newKeys) != 1 || newKeys[0] != "key-003" {
-				t.Fatalf("bulk index did not dual-maintain update: (%v,%v)", newKeys, err)
+			if raw, ok := collection.GetRaw("key-003"); !ok || string(raw.Bytes()) != `{"id":3,"profile":{"geo":{"country":"new"}}}` {
+				t.Fatalf("post-build Put not visible: (%q,%v)", raw.Bytes(), ok)
 			}
 		})
 	}
@@ -110,9 +71,6 @@ func buildNestedTemplateCollection(t *testing.T) *Collection {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.CreateIndex(IndexDefinition{Name: "country", Paths: []string{"/profile/geo/country"}}); err != nil {
-		t.Fatal(err)
-	}
 	for i := range storeBuilderTemplateRows {
 		doc := fmt.Sprintf(`{"id":%d,"profile":{"geo":{"country":"c%d"}},"active":%t}`, i, i%4, i&1 == 0)
 		if err := builder.Append(fmt.Sprintf("k%02d", i), []byte(doc)); err != nil {
@@ -122,6 +80,20 @@ func buildNestedTemplateCollection(t *testing.T) *Collection {
 	collection, err := builder.Build()
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The exact index over the interned nested templates is declared online on
+	// the built collection; Builder no longer declares indexes itself.
+	if _, err := collection.CreateIndex(IndexDefinition{Name: "country", Paths: []string{"/profile/geo/country"}}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		info, err := collection.BackfillIndex("country", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State == IndexReady {
+			break
+		}
 	}
 	return collection
 }
@@ -210,10 +182,6 @@ func TestStoreBuilderNestedStructuralTemplateAllocs(t *testing.T) {
 	}
 }
 
-func containsString(values []string, want string) bool {
-	return slices.Contains(values, want)
-}
-
 func TestStoreBuilderCompactsKeyDirectory(t *testing.T) {
 	builder, err := NewBuilder(Options{ChunkDocuments: 2})
 	if err != nil {
@@ -259,18 +227,14 @@ func TestStoreBuilderCompactsKeyDirectory(t *testing.T) {
 	}
 
 	before, _ := collection.Snapshot()
-	del18, _ := collection.Delete("alpha")
-	if !del18 {
-		t.Fatal("Delete(alpha) missed compact base")
-	}
 	if created, err := collection.Put("later", []byte(`3`)); err != nil || !created {
-		t.Fatalf("Put(later) = (%v,%v)", created, err)
+		t.Fatalf("Put(later) into compact base = (%v,%v)", created, err)
 	}
 	if raw, ok := before.GetRaw("alpha"); !ok || string(raw.Bytes()) != `1` {
 		t.Fatalf("retained compact snapshot = (%q,%v)", raw.Bytes(), ok)
 	}
-	if _, ok := collection.GetRaw("alpha"); ok {
-		t.Fatal("deleted compact-base key remained visible")
+	if raw, ok := collection.GetRaw("later"); !ok || string(raw.Bytes()) != `3` {
+		t.Fatalf("Put(later) into compact base not visible: (%q,%v)", raw.Bytes(), ok)
 	}
 }
 
@@ -430,15 +394,6 @@ func TestStoreBuilderErrorsAndEmptyStore(t *testing.T) {
 	if builder.Len() != 1 {
 		t.Fatalf("duplicate changed Len to %d", builder.Len())
 	}
-	if err := builder.CreateIndex(IndexDefinition{Name: "", Paths: []string{"/valid"}}); err == nil {
-		t.Fatal("invalid builder index accepted")
-	}
-	if err := builder.CreateIndex(IndexDefinition{Name: "valid", Paths: []string{"/valid"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := builder.CreateIndex(IndexDefinition{Name: "valid", Paths: []string{"/other"}}); !errors.Is(err, ErrIndexExists) {
-		t.Fatalf("duplicate builder index error = %v", err)
-	}
 	collection, err := builder.Build()
 	if err != nil {
 		t.Fatal(err)
@@ -449,16 +404,8 @@ func TestStoreBuilderErrorsAndEmptyStore(t *testing.T) {
 	if _, err := builder.Build(); !errors.Is(err, ErrBuilderClosed) {
 		t.Fatalf("second Build error = %v", err)
 	}
-	if err := builder.CreateIndex(IndexDefinition{Name: "later", Paths: []string{"/valid"}}); !errors.Is(err, ErrBuilderClosed) {
-		t.Fatalf("CreateIndex after Build error = %v", err)
-	}
 	if raw, ok := collection.GetRaw("bad"); !ok || string(raw.Bytes()) != `{"valid":true}` {
 		t.Fatalf("built value = (%q,%v)", raw.Bytes(), ok)
-	}
-	snap17, _ := collection.Snapshot()
-	keys, err := snap17.AppendIndexRawKeys(nil, "valid", []byte(`true`))
-	if err != nil || len(keys) != 1 || keys[0] != "bad" {
-		t.Fatalf("built exact index = (%v,%v)", keys, err)
 	}
 
 	emptyBuilder, err := NewBuilder(Options{ChunkDocuments: 2})

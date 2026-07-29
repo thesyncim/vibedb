@@ -114,11 +114,16 @@ func newStoreBuilderFailureFixture(t *testing.T) *Builder {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.CreateIndex(IndexDefinition{
-		Name: "value", Paths: []string{"/value"},
-	}); err != nil {
+	// Builder no longer exposes a public index declaration, but Build still
+	// constructs any exact indexes staged on the builder and transfers their
+	// owned blocks together with the documents. Stage one directly to exercise
+	// that bulk-index ownership path and its release on a failed Build.
+	exact, err := CompileExactIndex(IndexDefinition{Name: "value", Paths: []string{"/value"}})
+	if err != nil {
 		t.Fatal(err)
 	}
+	exact.seed = builder.seed
+	builder.exact = map[string]*ExactIndex{"value": exact}
 	for _, row := range []struct {
 		key string
 		doc string

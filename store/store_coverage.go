@@ -67,15 +67,3 @@ func (c *storeCoverage) unmark(id uint32) bool {
 	}
 	return true
 }
-
-func (c storeCoverage) clone() storeCoverage {
-	if len(c.pages) == 0 {
-		return storeCoverage{}
-	}
-	out := storeCoverage{pages: make(map[uint32]*storeCoveragePage, len(c.pages))}
-	for id, page := range c.pages {
-		copyPage := *page
-		out.pages[id] = &copyPage
-	}
-	return out
-}

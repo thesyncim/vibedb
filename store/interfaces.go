@@ -61,8 +61,8 @@ var _ Reader = Snapshot{}
 // not implement this interface — nothing dispatches on Mutable generically, so
 // the two backends need not share one key type.
 //
-// Deliberately excluded: index-lifecycle mutation (AddIndex, CreateIndex,
-// DropIndex, BackfillIndex, ReclaimIndexes). durable's indexes are frozen at
+// Deliberately excluded: index-lifecycle mutation (CreateIndex, DropIndex,
+// BackfillIndex, ReclaimIndexes). durable's indexes are frozen at
 // construction; that is a real capability difference, not incidental
 // duplication, and belongs on the separate IndexManager interface that only
 // *Collection implements.
@@ -79,7 +79,6 @@ type Mutable[S any] interface {
 // (`im, ok := any(t).(IndexManager)`) rather than requiring every Mutable to
 // carry it.
 type IndexManager interface {
-	AddIndex(name string, kind IndexKind) (IndexInfo, error)
 	CreateIndex(def IndexDefinition) (IndexInfo, error)
 	DropIndex(name string) error
 	BackfillIndex(name string, maxChunks int) (IndexInfo, error)

@@ -8,8 +8,21 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 )
+
+// scanSink defeats dead-store elimination on the scan workloads. Each scan folds
+// its whole per-call XOR accumulator into it exactly once (not once per
+// document), so the atomic is off the per-value path. It must be atomic because
+// a scan workload under -clients=N folds into it from several goroutines at
+// once; its value is never asserted, so a plain read-modify-write would be only
+// a benign accumulator race, but a benign race still trips the detector and the
+// concurrent lanes must run clean.
+var scanSink atomic.Uint64
+
+// foldScanSink folds one scan's accumulator into scanSink race-free.
+func foldScanSink(sink byte) { scanSink.Add(uint64(sink)) }
 
 // ErrNoIndex is returned by IndexedCount for an engine that has no secondary
 // index over a JSON field. The plain key/value stores all return it: the
@@ -133,17 +146,10 @@ func ParseDurabilityMode(value string) (DurabilityMode, error) {
 // modes are not silently weakened or strengthened into a misleading row.
 func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityMode, error) {
 	if requested == DurabilityDefault {
-		switch engine {
-		case "vibejson-heap":
-			requested = DurabilityVolatile
-		default:
-			requested = DurabilityBufferedVisible
-		}
+		requested = DurabilityBufferedVisible
 	}
 	supported := false
 	switch engine {
-	case "vibejson-heap":
-		supported = requested == DurabilityVolatile
 	case "vibejson-durable":
 		supported = requested == DurabilityBufferedVisible ||
 			requested == DurabilityAsyncStableInFlight ||
@@ -173,8 +179,6 @@ func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityM
 // position.
 func BenchmarkDurabilityModes(engine string) []DurabilityMode {
 	switch engine {
-	case "vibejson-heap":
-		return []DurabilityMode{DurabilityVolatile}
 	case "vibejson-durable":
 		return []DurabilityMode{
 			DurabilityBufferedVisible,
@@ -352,7 +356,6 @@ type Factory struct {
 // Factories is the registry, in report order.
 func Factories() []Factory {
 	return []Factory{
-		{Name: "vibejson-heap", New: newVibeHeap},
 		{Name: "vibejson-durable", New: newVibeDurable},
 		{Name: "bbolt", New: newBbolt},
 		{Name: "badger", New: newBadger},
@@ -372,7 +375,7 @@ func Factories() []Factory {
 // engine's actual IndexedCount behaviour agree, so the two cannot drift.
 func IndexCapable(name string) bool {
 	switch name {
-	case "vibejson-heap", "vibejson-durable", "sqlite":
+	case "vibejson-durable", "sqlite":
 		return true
 	default:
 		return false

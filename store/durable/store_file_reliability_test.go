@@ -29,10 +29,11 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	heapCollection, err := store.New(options.Collection)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The oracle is a plain in-memory model. The heap store is now a build-time
+	// source model with no online delete, so it can no longer mirror this
+	// interleaved Put/Delete workload in place; a map does it exactly, and the
+	// durable store is diffed against it byte for byte after every commit.
+	model := make(map[string][]byte)
 	rng := rand.New(rand.NewSource(0x5eed))
 	mirrored := 0
 
@@ -43,16 +44,18 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 			status := []string{"active", "idle", "paused"}[rng.Intn(3)]
 			doc := []byte(fmt.Sprintf(`{"step":%d,"status":%q,"value":%d,"padding":%q}`,
 				step, status, rng.Int63(), strings.Repeat("x", rng.Intn(900))))
-			heapCreated, heapErr := heapCollection.Put(key, doc)
+			_, existed := model[key]
 			fileCreated, fileErr := collection.Put([]byte(key), doc)
-			if heapErr != nil || fileErr != nil || heapCreated != fileCreated {
-				t.Fatalf("step %d Put = heap(%v,%v) file(%v,%v)", step, heapCreated, heapErr, fileCreated, fileErr)
+			if fileErr != nil || fileCreated == existed {
+				t.Fatalf("step %d Put created=%v (model existed=%v), err=%v", step, fileCreated, existed, fileErr)
 			}
+			model[key] = doc
 		case 2:
-			heapDeleted, _ := heapCollection.Delete(key)
+			_, existed := model[key]
+			delete(model, key)
 			fileDeleted, fileErr := collection.Delete([]byte(key))
-			if fileErr != nil || heapDeleted != fileDeleted {
-				t.Fatalf("step %d Delete = heap %v file(%v,%v)", step, heapDeleted, fileDeleted, fileErr)
+			if fileErr != nil || fileDeleted != existed {
+				t.Fatalf("step %d Delete = file(%v,%v), model existed %v", step, fileDeleted, fileErr, existed)
 			}
 		}
 
@@ -64,23 +67,26 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 			mirrored++
 		}
 		if step%13 == 0 {
-			assertFileCollectionMatchesHeap(t, collection, heapCollection, 32)
+			assertFileCollectionMatchesModel(t, collection, model, 32)
 		}
 		if step == 79 {
-			heapSnapshot, _ := heapCollection.Snapshot()
 			fileSnapshot, snapshotErr := collection.Snapshot()
 			if snapshotErr != nil {
 				t.Fatal(snapshotErr)
 			}
+			snapshotModel := make(map[string][]byte, len(model))
+			for k, v := range model {
+				snapshotModel[k] = v
+			}
 			for i := range 16 {
 				key := fmt.Sprintf("key-%02d", i)
 				doc := []byte(fmt.Sprintf(`{"snapshot-churn":%d,"status":"new"}`, i))
-				_, _ = heapCollection.Put(key, doc)
+				model[key] = doc
 				if _, err := collection.Put([]byte(key), doc); err != nil {
 					t.Fatal(err)
 				}
 			}
-			assertFileSnapshotMatchesHeap(t, fileSnapshot, heapSnapshot, 32)
+			assertFileSnapshotMatchesModel(t, fileSnapshot, snapshotModel, 32)
 			if err := fileSnapshot.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -91,10 +97,10 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertFileCollectionMatchesHeap(t, collection, heapCollection, 32)
+			assertFileCollectionMatchesModel(t, collection, model, 32)
 		}
 	}
-	assertFileCollectionMatchesHeap(t, collection, heapCollection, 32)
+	assertFileCollectionMatchesModel(t, collection, model, 32)
 	// The mirror check compares nothing when the durable free set is empty, so
 	// the workload has to be shown to have produced one. A silently vacuous
 	// assertion is worse than none: it reports the invariant as held.
@@ -106,28 +112,27 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 	}
 }
 
-func assertFileCollectionMatchesHeap(t *testing.T, collection *Collection, heapCollection *store.Collection, keys int) {
+func assertFileCollectionMatchesModel(t *testing.T, collection *Collection, model map[string][]byte, keys int) {
 	t.Helper()
 	fileSnapshot, err := collection.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fileSnapshot.Close()
-	heapSnapshot, _ := heapCollection.Snapshot()
-	assertFileSnapshotMatchesHeap(t, fileSnapshot, heapSnapshot, keys)
-	if fileSnapshot.Len() != uint64(heapSnapshot.Len()) {
-		t.Fatalf("snapshot lengths = file %d heap %d", fileSnapshot.Len(), heapSnapshot.Len())
+	assertFileSnapshotMatchesModel(t, fileSnapshot, model, keys)
+	if fileSnapshot.Len() != uint64(len(model)) {
+		t.Fatalf("snapshot length = file %d model %d", fileSnapshot.Len(), len(model))
 	}
 }
 
-func assertFileSnapshotMatchesHeap(t *testing.T, fileSnapshot *Snapshot, heapSnapshot store.Snapshot, keys int) {
+func assertFileSnapshotMatchesModel(t *testing.T, fileSnapshot *Snapshot, model map[string][]byte, keys int) {
 	t.Helper()
 	for i := range keys {
 		key := fmt.Sprintf("key-%02d", i)
-		heapRaw, heapOK := heapSnapshot.GetRaw(key)
+		want, modelOK := model[key]
 		fileRaw, fileOK, err := fileSnapshot.AppendRaw(nil, []byte(key))
-		if err != nil || heapOK != fileOK || (heapOK && string(heapRaw.Bytes()) != string(fileRaw)) {
-			t.Fatalf("GetRaw(%s) = heap(%q,%v) file(%q,%v,%v)", key, heapRaw.Bytes(), heapOK, fileRaw, fileOK, err)
+		if err != nil || modelOK != fileOK || (modelOK && string(want) != string(fileRaw)) {
+			t.Fatalf("GetRaw(%s) = model(%q,%v) file(%q,%v,%v)", key, want, modelOK, fileRaw, fileOK, err)
 		}
 	}
 }

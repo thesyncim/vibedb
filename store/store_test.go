@@ -77,13 +77,6 @@ func TestStoreCompiledKeyAcrossSnapshotsAndStores(t *testing.T) {
 	if _, err := collection.Put("a", []byte(`{"v":"new"}`)); err != nil {
 		t.Fatal(err)
 	}
-	del47, _ := collection.Delete("a")
-	if !del47 {
-		t.Fatal("delete a")
-	}
-	if _, err := collection.Put("filler", []byte(`{"v":"reuses-slot"}`)); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := collection.Put("a", []byte(`{"v":"moved"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -146,13 +139,9 @@ func TestStoreCompiledKeyMutationDifferential(t *testing.T) {
 	rng := rand.New(rand.NewSource(23))
 	for step := 1; step <= 4000; step++ {
 		i := rng.Intn(keyCount)
-		if rng.Intn(4) == 0 {
-			collection.Delete(keys[i])
-		} else {
-			doc := fmt.Sprintf(`{"step":%d,"key":%d}`, step, i)
-			if _, err := collection.Put(keys[i], []byte(doc)); err != nil {
-				t.Fatal(err)
-			}
+		doc := fmt.Sprintf(`{"step":%d,"key":%d}`, step, i)
+		if _, err := collection.Put(keys[i], []byte(doc)); err != nil {
+			t.Fatal(err)
 		}
 		if step%37 == 0 {
 			j := rng.Intn(keyCount)
@@ -173,7 +162,7 @@ func TestStoreCompiledKeyMutationDifferential(t *testing.T) {
 	}
 }
 
-func TestStoreCoverageSparsePagesAndClone(t *testing.T) {
+func TestStoreCoverageSparsePages(t *testing.T) {
 	ids := []uint32{1, (1 << storeCoveragePageShift) - 1, 1 << 31, ^uint32(0)}
 	var coverage storeCoverage
 	for _, id := range ids {
@@ -184,10 +173,9 @@ func TestStoreCoverageSparsePagesAndClone(t *testing.T) {
 	if len(coverage.pages) != 3 {
 		t.Fatalf("sparse coverage pages = %d, want 3", len(coverage.pages))
 	}
-	clone := coverage.clone()
 	for _, id := range ids {
-		if !coverage.has(id) || !clone.has(id) {
-			t.Fatalf("coverage or clone lost %d", id)
+		if !coverage.has(id) {
+			t.Fatalf("coverage lost %d", id)
 		}
 	}
 	for _, id := range ids {
@@ -197,11 +185,6 @@ func TestStoreCoverageSparsePagesAndClone(t *testing.T) {
 	}
 	if coverage.pages != nil {
 		t.Fatalf("empty coverage retained %d pages", len(coverage.pages))
-	}
-	for _, id := range ids {
-		if !clone.has(id) {
-			t.Fatalf("mutating original changed clone at %d", id)
-		}
 	}
 }
 
@@ -219,28 +202,19 @@ func TestStoreMutationSnapshotDifferential(t *testing.T) {
 			var held []Snapshot
 			for step := range 4000 {
 				key := fmt.Sprintf("key-%03d", rng.Intn(300))
-				switch rng.Intn(5) {
-				case 0:
+				if step%251 == 0 {
 					before, _ := collection.Snapshot()
-					got, _ := collection.Delete(key)
-					if got != (want[key] != "") {
-						t.Fatalf("step %d Delete(%q) = %v, existed %v", step, key, got, want[key] != "")
-					}
-					delete(want, key)
-					if step%251 == 0 {
-						held = append(held, before)
-					}
-				default:
-					doc := fmt.Sprintf(`{"id":%d,"key":%q,"g":%d,"value":"v-%03d"}`, step, key, step%11, rng.Intn(80))
-					created, err := collection.Put(key, []byte(doc))
-					if err != nil {
-						t.Fatal(err)
-					}
-					if created != (want[key] == "") {
-						t.Fatalf("step %d Put(%q) created=%v, existed=%v", step, key, created, want[key] != "")
-					}
-					want[key] = doc
+					held = append(held, before)
 				}
+				doc := fmt.Sprintf(`{"id":%d,"key":%q,"g":%d,"value":"v-%03d"}`, step, key, step%11, rng.Intn(80))
+				created, err := collection.Put(key, []byte(doc))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if created != (want[key] == "") {
+					t.Fatalf("step %d Put(%q) created=%v, existed=%v", step, key, created, want[key] != "")
+				}
+				want[key] = doc
 				if step%97 == 0 {
 					snap51, _ := collection.Snapshot()
 					checkCollectionSnapshot(t, snap51, want)
@@ -336,31 +310,6 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 		t.Fatalf("new snapshot aliases caller input: %q, %v", raw.Bytes(), ok)
 	}
 
-	del49, _ := collection.Delete("k4")
-	if !del49 {
-		t.Fatal("Delete(k4) missed")
-	}
-	deleted, _ := collection.Snapshot()
-	for i := range 8 {
-		if i == 4 {
-			continue
-		}
-		current := lookupSource(fmt.Sprintf("k%d", i))
-		state := after.state
-		loc, _ := storeKeyLookup(state.keys, maphash.String(state.seed, fmt.Sprintf("k%d", i)), fmt.Sprintf("k%d", i))
-		chunk := state.Chunks.Get(loc.Chunk)
-		prior := chunk.Docs.RawAt(int(chunk.Ord[loc.Slot]))
-		if &current[0] != &prior[0] {
-			t.Fatalf("delete copied surviving source %d", i)
-		}
-	}
-	if _, ok := deleted.GetRaw("k4"); ok {
-		t.Fatal("deleted snapshot retained k4")
-	}
-	if _, ok := after.GetRaw("k4"); !ok {
-		t.Fatal("older snapshot lost k4")
-	}
-
 	// Replace the complete live A layout with B. The final cache must contain
 	// only B: sharing live immutable records cannot turn into shape history.
 	churn := &Collection{Options: Options{ChunkDocuments: 3, ShapeTapes: true}}
@@ -407,7 +356,7 @@ func checkCollectionSnapshot(t testing.TB, snapshot Snapshot, want map[string]st
 	}
 }
 
-func TestStoreInvalidPutRollbackAndChunkReuse(t *testing.T) {
+func TestStoreInvalidPutRollback(t *testing.T) {
 	collection := &Collection{Options: Options{ChunkDocuments: 4, ShapeTapes: true, Postings: true}}
 	if _, err := collection.Put("bad", []byte(`{"x":`)); err == nil {
 		t.Fatal("invalid Put succeeded")
@@ -420,32 +369,19 @@ func TestStoreInvalidPutRollbackAndChunkReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	snap48, _ := collection.Snapshot()
-	high := snap48.state.Chunks.Count
+	// A rolled-back Put leaves the collection able to keep inserting, and a
+	// snapshot taken now keeps its exact 100-row view while the writer churns on.
 	old, _ := collection.Snapshot()
-	for i := range 100 {
-		del55, _ := collection.Delete(fmt.Sprintf("k%d", i))
-		if !del55 {
-			t.Fatal("delete miss")
-		}
-	}
-	if stats := collection.Stats(); stats.Chunks != 0 || stats.ChunkHighWater != high {
-		t.Fatalf("post-delete stats = %+v, want zero live chunks and high-water %d", stats, high)
-	}
 	for i := range 100 {
 		if _, err := collection.Put(fmt.Sprintf("r%d", i), []byte(fmt.Sprintf(`{"n":%d}`, -i))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	snap54, _ := collection.Snapshot()
-	if got := snap54.state.Chunks.Count; got != high {
-		t.Fatalf("delete/insert churn grew chunk address space from %d to %d", high, got)
-	}
-	if stats := collection.Stats(); stats.Chunks != high || stats.ReusableChunks != 0 {
-		t.Fatalf("post-reuse stats = %+v, want %d full chunks", stats, high)
-	}
 	if old.Len() != 100 {
 		t.Fatalf("old snapshot Len = %d, want 100", old.Len())
+	}
+	if collection.Len() != 200 {
+		t.Fatalf("Len after churn = %d, want 200", collection.Len())
 	}
 }
 
@@ -525,24 +461,17 @@ func TestStoreConcurrentSnapshots(t *testing.T) {
 	}
 	for i := range 1000 {
 		key := fmt.Sprintf("k%d", i%64)
-		if i%7 == 0 {
-			collection.Delete(key)
-		} else if _, err := collection.Put(key, []byte(fmt.Sprintf(`{"n":%d,"s":"same"}`, i))); err != nil {
+		if _, err := collection.Put(key, []byte(fmt.Sprintf(`{"n":%d,"s":"same"}`, i))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	wg.Wait()
 }
 
-func TestStoreOnlinePostingsIndex(t *testing.T) {
-	collection := &Collection{Options: Options{ChunkDocuments: 4, ShapeTapes: true}}
+func TestStoreBornWithPostingsProbes(t *testing.T) {
+	collection := &Collection{Options: Options{ChunkDocuments: 4, ShapeTapes: true, Postings: true}}
 	for i := range 14 {
 		_, _ = collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"g":%d,"v":%d}`, i%3, i)))
-	}
-	old, _ := collection.Snapshot()
-	info, err := collection.AddIndex("search", IndexPostings)
-	if err != nil || info.State != IndexBuilding {
-		t.Fatalf("AddIndex = (%+v,%v)", info, err)
 	}
 	needle := refIndex(t, `1`)
 	wantContains := []string{"k1", "k4", "k7", "k10", "k13"}
@@ -550,107 +479,48 @@ func TestStoreOnlinePostingsIndex(t *testing.T) {
 	if got, err := collection.AppendWhereContainsKeys(prefix, "g", []byte(`{"bad":`)); err == nil || !slices.Equal(got, prefix) {
 		t.Fatalf("invalid contains = (%v,%v), want unchanged prefix and error", got, err)
 	}
-	snap59, _ := collection.Snapshot()
-	if got := snap59.AppendWhereContainsIndexKeys(nil, "g", needle); !slices.Equal(got, wantContains) {
-		t.Fatalf("building-index contains = %v, want %v", got, wantContains)
-	}
-	// A write into an uncovered chunk dual-maintains and covers it.
-	if _, err := collection.Put("k0", []byte(`{"g":9,"v":0}`)); err != nil {
-		t.Fatal(err)
-	}
-	previous := uint32(0)
-	for info.State != IndexReady {
-		info, err = collection.BackfillIndex("search", 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.CoveredChunks < previous || info.CoveredChunks > info.TotalChunks {
-			t.Fatalf("invalid progress %+v", info)
-		}
-		previous = info.CoveredChunks
-	}
-	current, _ := collection.Snapshot()
-	current.state.Chunks.Each(func(_ uint32, chunk *Chunk) bool {
+	snap, _ := collection.Snapshot()
+	// A collection born with postings carries the physical index on every chunk,
+	// so the containment probe is served from postings rather than an exact scan.
+	snap.state.Chunks.Each(func(_ uint32, chunk *Chunk) bool {
 		if !chunk.Docs.Postings {
-			t.Fatal("ready index left an uncovered chunk")
+			t.Fatal("born-with-postings collection left an uncovered chunk")
 		}
 		return true
 	})
-	if got := current.AppendIndexes(nil); len(got) != 1 || got[0].State != IndexReady {
-		t.Fatalf("Snapshot indexes = %+v", got)
-	}
-	if stats := collection.Stats(); stats.Indexes != 1 || stats.IndexedChunks != int(stats.Chunks) {
-		t.Fatalf("ready index stats = %+v", stats)
-	}
-	keys := make([]string, 0, current.Len())
-	keys = current.AppendWhereExistsKeys(keys, "v")
-	if len(keys) != current.Len() {
-		t.Fatalf("exists keys = %d, want %d", len(keys), current.Len())
-	}
-	contains := make([]string, 0, current.Len())
-	contains = current.AppendWhereContainsIndexKeys(contains, "g", needle)
+	contains := make([]string, 0, snap.Len())
+	contains = snap.AppendWhereContainsIndexKeys(contains, "g", needle)
 	if !slices.Equal(contains, wantContains) {
-		t.Fatalf("ready-index contains = %v, want %v", contains, wantContains)
+		t.Fatalf("postings contains = %v, want %v", contains, wantContains)
 	}
-	if err := collection.DropIndex("search"); err != nil {
-		t.Fatal(err)
-	}
-	if got := current.AppendIndexes(nil); len(got) != 1 || got[0].Name != "search" {
-		t.Fatalf("old snapshot lost index metadata: %+v", got)
-	}
-	snap65, _ := collection.Snapshot()
-	if got := snap65.AppendIndexes(nil); len(got) != 0 {
-		t.Fatalf("dropped index remains logical: %+v", got)
-	}
-	if !collection.Stats().IndexReclaiming {
-		t.Fatal("last index drop did not expose reclamation state")
-	}
-	for done := false; !done; {
-		_, done = collection.ReclaimIndexes(1)
-	}
-	snap64, _ := collection.Snapshot()
-	snap64.state.Chunks.Each(func(_ uint32, chunk *Chunk) bool {
-		if chunk.Docs.Postings {
-			t.Fatal("reclamation left postings")
-		}
-		return true
-	})
-	snap63, _ := collection.Snapshot()
-	if got := snap63.AppendWhereContainsIndexKeys(nil, "g", needle); !slices.Equal(got, wantContains) {
-		t.Fatalf("post-reclaim scan contains = %v, want %v", got, wantContains)
-	}
-	// Pre-DDL snapshots retain their original physical representation and data.
-	if old.Len() != 14 {
-		t.Fatalf("old snapshot Len = %d", old.Len())
+	keys := make([]string, 0, snap.Len())
+	keys = snap.AppendWhereExistsKeys(keys, "v")
+	if len(keys) != snap.Len() {
+		t.Fatalf("exists keys = %d, want %d", len(keys), snap.Len())
 	}
 }
 
 func TestStoreIndexedSnapshotProbeSteadyAllocs(t *testing.T) {
-	collection := &Collection{Options: Options{ChunkDocuments: 4, ShapeTapes: true}}
-	for i := range 32 {
-		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"g":%d,"v":%d}`, i%3, i))); err != nil {
-			t.Fatal(err)
+	seed := func(options Options) Snapshot {
+		collection := &Collection{Options: options}
+		for i := range 32 {
+			if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"g":%d,"v":%d}`, i%3, i))); err != nil {
+				t.Fatal(err)
+			}
 		}
+		snap, _ := collection.Snapshot()
+		return snap
 	}
 	needle := refIndex(t, `1`)
-	scan, _ := collection.Snapshot()
-	info, err := collection.AddIndex("search", IndexPostings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for info.State != IndexReady {
-		info, err = collection.BackfillIndex("search", 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	indexed, _ := collection.Snapshot()
+	// The exact-scan fallback and the postings-served path must both probe with
+	// zero steady-state allocation. The scan snapshot carries no postings; the
+	// indexed snapshot is born with them on every chunk.
 	for _, test := range []struct {
 		name     string
 		snapshot Snapshot
 	}{
-		{"scan", scan},
-		{"indexed", indexed},
+		{"scan", seed(Options{ChunkDocuments: 4, ShapeTapes: true})},
+		{"indexed", seed(Options{ChunkDocuments: 4, ShapeTapes: true, Postings: true})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			exists := make([]string, 0, test.snapshot.Len())
@@ -671,109 +541,6 @@ func TestStoreIndexedSnapshotProbeSteadyAllocs(t *testing.T) {
 				t.Fatalf("AppendWhereContainsIndexKeys allocated %.2f times, want 0", allocs)
 			}
 		})
-	}
-}
-
-func TestStoreSharedIndexAndReclaimRestart(t *testing.T) {
-	collection := &Collection{Options: Options{ChunkDocuments: 2}}
-	for i := range 12 {
-		_, _ = collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"v":%d}`, i)))
-	}
-	a, err := collection.AddIndex("a", IndexPostings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err = collection.BackfillIndex("a", 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := collection.AddIndex("b", IndexPostings)
-	if err != nil || a.CoveredChunks != b.CoveredChunks {
-		t.Fatalf("shared coverage a=%+v b=%+v err=%v", a, b, err)
-	}
-	for b.State != IndexReady {
-		b, err = collection.BackfillIndex("b", 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	snap67, _ := collection.Snapshot()
-	infos := snap67.AppendIndexes(nil)
-	if len(infos) != 2 || infos[0].State != IndexReady || infos[1].State != IndexReady {
-		t.Fatalf("shared indexes not ready: %+v", infos)
-	}
-	if err := collection.DropIndex("a"); err != nil {
-		t.Fatal(err)
-	}
-	if collection.Stats().IndexReclaiming {
-		t.Fatal("reclamation started with one logical consumer")
-	}
-	if err := collection.DropIndex("b"); err != nil {
-		t.Fatal(err)
-	}
-	if rebuilt, done := collection.ReclaimIndexes(1); rebuilt != 1 || done {
-		t.Fatalf("first reclaim = (%d,%v), want (1,false)", rebuilt, done)
-	}
-	c, err := collection.AddIndex("c", IndexPostings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if collection.Stats().IndexReclaiming {
-		t.Fatal("new index did not cancel reclamation")
-	}
-	for c.State != IndexReady {
-		c, err = collection.BackfillIndex("c", 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if stats := collection.Stats(); stats.IndexedChunks != int(stats.Chunks) {
-		t.Fatalf("restart coverage stats = %+v", stats)
-	}
-}
-
-func TestStoreIndexBackfillBudgetIncludesCoveredCandidates(t *testing.T) {
-	collection := &Collection{Options: Options{ChunkDocuments: 1}}
-	for i := range 100 {
-		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"v":%d}`, i))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	info, err := collection.AddIndex("search", IndexPostings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Concurrent writes cover the first 99 chunks before backfill visits them.
-	// A budget of one must still examine only one start-snapshot candidate per
-	// call instead of scanning through all 99 to find the remaining rebuild.
-	for i := range 99 {
-		if _, err := collection.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"v":%d}`, i+1000))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	build := collection.indexes["search"]
-	for wantCursor := uint64(1); wantCursor <= 99; wantCursor++ {
-		generation := collection.Generation()
-		info, err = collection.BackfillIndex("search", 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if build.cursor != wantCursor {
-			t.Fatalf("call %d cursor=%d, want %d", wantCursor, build.cursor, wantCursor)
-		}
-		if collection.Generation() != generation {
-			t.Fatalf("covered-only call %d published a redundant generation", wantCursor)
-		}
-		if info.State != IndexBuilding {
-			t.Fatalf("call %d state=%v, want Building", wantCursor, info.State)
-		}
-	}
-	info, err = collection.BackfillIndex("search", 1)
-	if err != nil || info.State != IndexReady {
-		t.Fatalf("final BackfillIndex = (%+v,%v)", info, err)
-	}
-	if !build.all || build.coverage.pages != nil || build.scan.root != nil || build.scan.Count != 0 || build.cursor != 0 {
-		t.Fatalf("ready build retained progress state: all=%v coverage-pages=%d scan=%d cursor=%d", build.all, len(build.coverage.pages), build.scan.Count, build.cursor)
 	}
 }
 
@@ -809,152 +576,11 @@ func TestStoreOwnershipOptionsAndEmptyKey(t *testing.T) {
 	if _, err := invalid.Put("k", []byte(`null`)); err == nil {
 		t.Fatal("Put accepted invalid Options")
 	}
-	if _, err := invalid.AddIndex("i", IndexPostings); err == nil {
-		t.Fatal("AddIndex accepted invalid Options")
+	if _, err := invalid.CreateIndex(IndexDefinition{Name: "i", Paths: []string{"/v"}}); err == nil {
+		t.Fatal("CreateIndex accepted invalid Options")
 	}
 	if invalid.Len() != 0 || invalid.Generation() != 0 {
 		t.Fatalf("invalid options published state: Len=%d Generation=%d", invalid.Len(), invalid.Generation())
-	}
-}
-
-func TestStoreMixedLifecycleDifferential(t *testing.T) {
-	type modelEntry struct {
-		doc string
-		tag string
-	}
-	type heldSnapshot struct {
-		snapshot Snapshot
-		want     map[string]string
-	}
-
-	collection := &Collection{Options: Options{
-		ChunkDocuments: 5,
-		ShapeTapes:     true,
-		ValueDict:      true,
-	}}
-	want := make(map[string]modelEntry)
-	rng := rand.New(rand.NewSource(91))
-	needleEven := refIndex(t, `"even"`)
-	var held []heldSnapshot
-	activeIndex := ""
-	var info IndexInfo
-
-	check := func(step int) {
-		t.Helper()
-		snapshot, _ := collection.Snapshot()
-		if snapshot.Len() != len(want) {
-			t.Fatalf("step %d Len=%d, want %d", step, snapshot.Len(), len(want))
-		}
-		wantExists := make([]string, 0, len(want))
-		wantEven := make([]string, 0, len(want))
-		for key, entry := range want {
-			wantExists = append(wantExists, key)
-			if entry.tag == "even" {
-				wantEven = append(wantEven, key)
-			}
-			raw, ok := snapshot.GetRaw(key)
-			if !ok || string(raw.Bytes()) != entry.doc {
-				t.Fatalf("step %d GetRaw(%q)=(%s,%v), want %s", step, key, raw.Bytes(), ok, entry.doc)
-			}
-		}
-		gotExists := snapshot.AppendWhereExistsKeys(make([]string, 0, len(want)), "v")
-		gotEven := snapshot.AppendWhereContainsIndexKeys(make([]string, 0, len(want)), "tag", needleEven)
-		slices.Sort(gotExists)
-		slices.Sort(gotEven)
-		slices.Sort(wantExists)
-		slices.Sort(wantEven)
-		if !slices.Equal(gotExists, wantExists) || !slices.Equal(gotEven, wantEven) {
-			t.Fatalf("step %d probes exists=%v/%v even=%v/%v", step, gotExists, wantExists, gotEven, wantEven)
-		}
-		stats := collection.Stats()
-		if stats.Keys != len(want) {
-			t.Fatalf("step %d stats=%+v, want keys=%d", step, stats, len(want))
-		}
-	}
-
-	for step := range 5000 {
-		switch step {
-		case 100:
-			var err error
-			activeIndex = "first"
-			info, err = collection.AddIndex(activeIndex, IndexPostings)
-			if err != nil {
-				t.Fatal(err)
-			}
-		case 1800:
-			if err := collection.DropIndex(activeIndex); err != nil {
-				t.Fatal(err)
-			}
-			activeIndex = ""
-		case 1810:
-			// Re-add while physical reclamation is in flight. Coverage must
-			// restart conservatively and remain exact on mixed chunks.
-			var err error
-			activeIndex = "second"
-			info, err = collection.AddIndex(activeIndex, IndexPostings)
-			if err != nil {
-				t.Fatal(err)
-			}
-		case 3600:
-			if err := collection.DropIndex(activeIndex); err != nil {
-				t.Fatal(err)
-			}
-			activeIndex = ""
-		}
-
-		key := fmt.Sprintf("k%03d", rng.Intn(240))
-		switch rng.Intn(5) {
-		case 0:
-			deleted, _ := collection.Delete(key)
-			_, existed := want[key]
-			if deleted != existed {
-				t.Fatalf("step %d Delete(%q)=%v, want %v", step, key, deleted, existed)
-			}
-			delete(want, key)
-		default:
-			tag := "odd"
-			if step%2 == 0 {
-				tag = "even"
-			}
-			doc := fmt.Sprintf(`{"v":%d,"tag":%q}`, step, tag)
-			_, existed := want[key]
-			created, err := collection.Put(key, []byte(doc))
-			if err != nil || created == existed {
-				t.Fatalf("step %d Put(%q)=(%v,%v), existed=%v", step, key, created, err, existed)
-			}
-			entry := want[key]
-			entry.doc = doc
-			entry.tag = tag
-			want[key] = entry
-		}
-
-		if activeIndex != "" && info.State != IndexReady {
-			var err error
-			info, err = collection.BackfillIndex(activeIndex, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-		} else if activeIndex == "" {
-			collection.ReclaimIndexes(1)
-		}
-		if step%173 == 0 {
-			check(step)
-		}
-		if step%997 == 0 {
-			copyModel := make(map[string]string, len(want))
-			for modelKey, entry := range want {
-				copyModel[modelKey] = entry.doc
-			}
-			snap66, _ := collection.Snapshot()
-			held = append(held, heldSnapshot{snapshot: snap66, want: copyModel})
-		}
-	}
-	check(5000)
-	for i, old := range held {
-		checkCollectionSnapshot(t, old.snapshot, old.want)
-		if old.snapshot.Generation() > collection.Generation() {
-			t.Fatalf("held snapshot %d generation moved forward", i)
-		}
 	}
 }
 
@@ -1053,20 +679,13 @@ func TestStoreChunkRetainsNoIngestScratch(t *testing.T) {
 			}
 			checkSealed(t, collection, want)
 
-			// A replacement is the one rebuild that parses a document, and a
-			// delete is the one that parses none; both must publish a sealed
-			// chunk, and the surviving rows carried in by reference must keep
-			// the exact tapes they were given.
+			// A replacement is a rebuild that parses the one new document; the
+			// surviving rows it carries in by reference must keep the exact tapes
+			// they were given, and the published chunk must still be sealed.
 			if created, err := collection.Put("k3", []byte(doc(300))); err != nil || created {
 				t.Fatalf("Put update = (%v,%v), want (false,nil)", created, err)
 			}
 			want["k3"] = doc(300)
-			checkSealed(t, collection, want)
-
-			if deleted, _ := collection.Delete("k7"); !deleted {
-				t.Fatal("Delete(k7) missed")
-			}
-			delete(want, "k7")
 			checkSealed(t, collection, want)
 		})
 	}

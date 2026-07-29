@@ -181,9 +181,9 @@ func loadedEngine(
 // BenchmarkBulkLoad measures loading the whole corpus into an empty engine
 // through that engine's bulk path: one bbolt write transaction, one Badger
 // WriteBatch, one Pebble batch, one SQLite transaction over a prepared
-// INSERT, store.Builder for vibejson's heap mode, and durable.CreateFrom for
-// store/durable — which, unlike the others, has to materialise the whole heap
-// collection first, and pays for that inside the measurement.
+// INSERT, and durable.CreateFrom for store/durable — which has to materialise
+// the whole heap collection through store.Builder first, and pays for that
+// inside the measurement.
 //
 // It runs with and without a secondary index over the filter field. The
 // unindexed row alone was the whole bulk-load report for a while, which means

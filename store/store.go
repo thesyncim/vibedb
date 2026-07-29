@@ -1,8 +1,20 @@
-// Package store is the canonical keyed JSON store API.
+// Package store is the in-memory source model that durable JSON collections are
+// built from, together with the read-side snapshot machinery the query engine
+// reads through. It is not a user-facing mutable database.
 //
-// It contains the in-memory engine, immutable snapshots, optional schema and
-// exact-index definitions and bulk construction. Durable page-file
-// storage lives in package store/durable.
+// A [Builder] bulk-loads a corpus into an immutable keyed graph — source bytes,
+// structural tapes, key directory, and exact-index pages — that package
+// store/durable freezes onto a page file with CreateFromPrimary. A [Snapshot] is
+// the lock-free read view (GetRaw, Range, and the index and candidate mask
+// probes a plan is built against) that this package and the durable snapshot
+// both expose, so query has one execution core over both backends. Optional
+// schema and exact-index definitions shape what a build materializes.
+//
+// The [Collection] keeps one construction-time mutation beyond reads: Put, which
+// the SQL driver uses to stage transient point-lookup rows before a durable
+// write. The former user-facing mutable surface — online delete and online
+// index declaration — is gone; a durable collection's indexes are frozen at
+// construction, and nothing in production mutated a heap collection in place.
 //
 // # Measuring a collection's footprint
 //

@@ -6,7 +6,6 @@ import (
 	"hash/maphash"
 	"math"
 	"math/bits"
-	"strings"
 
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -31,9 +30,8 @@ var (
 // A builder belongs to one goroutine. Append errors leave all previously
 // appended rows intact and do not consume a key or slot. Build may be called
 // once; the returned collection has ordinary snapshot, mutation, and index
-// semantics. CreateIndex can include ready nested or compound indexes in the
-// same publication. Builder is intentionally not an update API: online
-// changes belong to Collection.Put.
+// semantics. Builder is intentionally not an update API: online changes belong
+// to Collection.Put.
 //
 // Use it for any load of more than a chunk's worth of rows. Put rebuilds its
 // whole chunk per write — that is what makes a published chunk immutable and a
@@ -101,35 +99,6 @@ func (b *Builder) Len() int {
 		return 0
 	}
 	return b.count
-}
-
-// CreateIndex declares a single-column or compound exact index to build inside
-// the unpublished transaction. Paths have the same nested RFC 6901 semantics
-// as [Collection.CreateIndex]. Build returns the index Ready: it extracts and sorts
-// page-local tuples, constructs immutable stable-slot postings in bulk, and
-// publishes the documents, key directory, and index roots together.
-//
-// A declaration may be added before or after Append calls. Invalid or duplicate
-// declarations leave the builder and all appended rows unchanged.
-func (b *Builder) CreateIndex(def IndexDefinition) error {
-	if b == nil || b.closed {
-		return ErrBuilderClosed
-	}
-	exact, err := CompileExactIndex(def)
-	if err != nil {
-		return err
-	}
-	if b.exact != nil {
-		if _, exists := b.exact[def.Name]; exists {
-			return ErrIndexExists
-		}
-	} else {
-		b.exact = make(map[string]*ExactIndex)
-	}
-	name := strings.Clone(def.Name)
-	exact.seed = b.seed
-	b.exact[name] = exact
-	return nil
 }
 
 // Append validates and copies one unique keyed document. The caller may reuse

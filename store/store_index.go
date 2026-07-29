@@ -55,12 +55,10 @@ type IndexInfo struct {
 }
 
 var (
-	// ErrIndexExists reports an AddIndex or CreateIndex name collision.
+	// ErrIndexExists reports a CreateIndex name collision.
 	ErrIndexExists = errors.New("vibejson: collection index already exists")
 	// ErrIndexNotFound reports an unknown index name.
 	ErrIndexNotFound = errors.New("vibejson: collection index not found")
-	// ErrIndexKind reports an IndexKind this build does not implement.
-	ErrIndexKind = errors.New("vibejson: unsupported collection index kind")
 )
 
 type storeIndexBuild struct {
@@ -118,61 +116,6 @@ func (c *Collection) nextExactIndexVisitLocked() uint32 {
 	}
 	c.indexVisit = 1
 	return c.indexVisit
-}
-
-// AddIndex atomically publishes an online index definition. Existing chunks
-// are backfilled by BackfillIndex; all writes from this call onward build the
-// index before their new snapshot is visible. Query consumers can inspect the
-// published coverage and use exact scan fallback until Ready.
-func (c *Collection) AddIndex(name string, kind IndexKind) (IndexInfo, error) {
-	if kind != IndexPostings {
-		return IndexInfo{}, ErrIndexKind
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	state, err := c.initLocked()
-	if err != nil {
-		return IndexInfo{}, err
-	}
-	if c.indexes == nil {
-		c.indexes = make(map[string]*storeIndexBuild)
-	}
-	if _, exists := c.indexes[name]; exists {
-		return IndexInfo{}, ErrIndexExists
-	}
-	name = strings.Clone(name)
-	c.reclaim = nil // a new consumer cancels removal of the same physical layer
-	b := &storeIndexBuild{info: IndexInfo{
-		Name:        name,
-		Kind:        kind,
-		State:       IndexBuilding,
-		TotalChunks: state.ChunkCount,
-	}, scan: state.Chunks}
-	// Logical postings indexes share one physical layer. Copying an existing
-	// build's coverage is O(coverage words), not a document pass; a collection born
-	// with Postings already covers the complete vector. If reclamation was in
-	// flight, start conservatively uncovered and let bounded backfill discover
-	// the still-indexed chunks without trusting stale logical metadata.
-	for _, existing := range c.indexes {
-		if existing.info.Kind == kind {
-			b.coverage = existing.coverage.clone()
-			b.info.CoveredChunks = existing.info.CoveredChunks
-			b.info.State = existing.info.State
-			b.all = existing.all
-			break
-		}
-	}
-	if state.StateOptions.Postings {
-		b.info.CoveredChunks = b.info.TotalChunks
-	}
-	b.updateState()
-	c.indexes[name] = b
-	next := *state
-	next.Generation++
-	next.Indexes = c.indexInfosLocked()
-	next.secondary = c.indexSnapshotsLocked()
-	c.state.Store(&next)
-	return b.info, nil
 }
 
 // CreateIndex atomically publishes a path-specific exact scalar index. A

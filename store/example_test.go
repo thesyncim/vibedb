@@ -23,31 +23,25 @@ func ExampleCollection() {
 
 func ExampleBuilder() {
 	builder, _ := store.NewBuilder(store.Options{ShapeTapes: true})
-	_ = builder.CreateIndex(store.IndexDefinition{
-		Name: "country", Paths: []string{"/profile/country"},
-	})
 	_ = builder.Append("user:1", []byte(`{"profile":{"country":"PT"}}`))
 	_ = builder.Append("user:2", []byte(`{"profile":{"country":"US"}}`))
 	s, _ := builder.Build()
 
 	snapshot, _ := s.Snapshot()
-	keys, _ := snapshot.AppendIndexRawKeys(nil, "country", []byte(`"PT"`))
-	fmt.Println(s.Generation(), keys)
+	raw, _ := snapshot.GetRaw("user:1")
+	fmt.Println(s.Generation(), string(raw.Bytes()))
 
 	// Output:
-	// 1 [user:1]
+	// 1 {"profile":{"country":"PT"}}
 }
 
-func ExampleCollection_AddIndex() {
-	s, _ := store.New(store.Options{ChunkDocuments: 2, ShapeTapes: true})
+func ExampleCollection_AppendWhereContainsIndexKeys() {
+	// A collection born with postings serves the containment probe from its
+	// physical index on every chunk.
+	s, _ := store.New(store.Options{ChunkDocuments: 2, ShapeTapes: true, Postings: true})
 	_, _ = s.Put("a", []byte(`{"team":"compiler"}`))
 	_, _ = s.Put("b", []byte(`{"team":"runtime"}`))
 	_, _ = s.Put("c", []byte(`{"team":"compiler"}`))
-
-	info, _ := s.AddIndex("team-search", store.IndexPostings)
-	for info.State != store.IndexReady {
-		info, _ = s.BackfillIndex("team-search", 1)
-	}
 
 	src := []byte(`"compiler"`)
 	need, _ := vibejson.RequiredIndexEntries(src)

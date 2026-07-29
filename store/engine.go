@@ -17,7 +17,7 @@ import (
 // zero value selects 64-document chunks with the ordinary Segment layout.
 // ShapeTapes, Postings, ValueDict, and IndexOptions have the same semantics as
 // their Segment counterparts. Options are frozen by the first operation that
-// initializes the collection (currently Put or AddIndex).
+// initializes the collection (currently Put or CreateIndex).
 type Options struct {
 	// ChunkDocuments bounds documents rebuilt by one ordinary mutation. Zero
 	// selects 64; valid explicit values are 1 through 64.
@@ -116,17 +116,17 @@ func (o Options) Normalized() (Options, error) {
 	return o, nil
 }
 
-// A Collection is a keyed, mutable set of JSON documents with immutable
-// snapshots and a lock-free raw read path. Writes are serialized, rebuild at
-// most one bounded document chunk, path-copy only bounded-radix metadata, and
-// publish one new state through an atomic pointer. A replacement parses only
-// its new document; unchanged source and structural-tape storage is immutable
-// and shared into the new chunk. Deletes rebuild dense row metadata without the
-// document: no tombstone enters a read path and no later compaction is required
-// to restore scan speed.
+// A Collection is a keyed set of JSON documents with immutable snapshots and a
+// lock-free raw read path. It is the in-memory source model the query engine
+// reads and durable collections are built from; its only surviving mutation is
+// Put, which the SQL driver uses to stage transient point-lookup rows. Writes
+// are serialized, rebuild at most one bounded document chunk, path-copy only
+// bounded-radix metadata, and publish one new state through an atomic pointer. A
+// replacement parses only its new document; unchanged source and structural-tape
+// storage is immutable and shared into the new chunk.
 //
-// The zero Collection is ready to use: set Options before the first Put,
-// AddIndex, or CreateIndex, or use [New]. Invalid chunk bounds in a directly
+// The zero Collection is ready to use: set Options before the first Put or
+// CreateIndex, or use [New]. Invalid chunk bounds in a directly
 // constructed Collection are reported by the first operation that initializes
 // it, so only [New] reports configuration errors up front. A Collection is safe
 // for concurrent use. Snapshot readers take no writer lock; GetRaw and Range
@@ -843,57 +843,6 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 	}
 	c.state.Store(&next)
 	return true, nil
-}
-
-// Delete atomically removes key and reports whether it existed. The affected
-// chunk is rebuilt without the document, so scans see a dense Segment and the
-// delete creates neither a tombstone nor future compaction work. Snapshots
-// obtained before Delete remain valid and continue to see their old version.
-// The error return always reports nil; it exists so collection satisfies the same
-// [Mutable] shape as durable.Collection, whose Delete can fail on I/O.
-func (c *Collection) Delete(key string) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.deleteLocked(key), nil
-}
-
-func (c *Collection) deleteLocked(key string) bool {
-	state := c.state.Load()
-	if state == nil {
-		return false
-	}
-	hash := maphash.String(state.seed, key)
-	old, loc, found := storeStateKeyLookupChunk(state, hash, key)
-	if !found {
-		return false
-	}
-	chunk, err := rebuildStoreChunk(
-		state.StateOptions, c.postingsRequiredLocked(), old,
-		int(loc.Slot), "", nil, false,
-	)
-	if err != nil {
-		panic("vibejson: rebuilding validated collection chunk: " + err.Error())
-	}
-	next := *state
-	next.Generation++
-	next.Count--
-	next.detachMappedDocuments(old)
-	next.keys = storeKeyDelete(state.keys, hash, key)
-	next.Chunks = state.Chunks.set(loc.Chunk, chunk)
-	if chunk == nil {
-		next.ChunkCount--
-	}
-	c.noteChunkPostingsLocked(loc.Chunk, old, chunk)
-	c.addFreeLocked(loc.Chunk)
-	catalogChanged, secondaryChanged := c.noteIndexesForChunkLocked(loc.Chunk, old, chunk, uint64(1)<<loc.Slot)
-	if catalogChanged {
-		next.Indexes = c.indexInfosLocked()
-	}
-	if secondaryChanged {
-		next.secondary = c.indexSnapshotsLocked()
-	}
-	c.state.Store(&next)
-	return true
 }
 
 func (s *State) detachMappedDocuments(chunk *Chunk) {
