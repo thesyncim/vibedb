@@ -46,6 +46,9 @@ func (s *stmt) preflightExec(got int) error {
 	if s.mutation == nil {
 		return errors.New("vibedb: SELECT returns rows; use Query")
 	}
+	if s.query != nil {
+		return fmt.Errorf("vibedb: %s RETURNING returns rows; use Query", s.tree.Kind)
+	}
 	return s.checkArgumentCount(got)
 }
 
@@ -116,6 +119,23 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return nil, err
 	}
 	var err error
+	if s.mutation != nil {
+		var cursor query.Cursor
+		if s.conn.tx != nil {
+			cursor, err = s.conn.tx.execMutationReturning(
+				s.mutation, args, s.query,
+			)
+		} else {
+			cursor, err = s.conn.insertReturningContext(
+				ctx, s.mutation, args, s.query,
+			)
+		}
+		if err != nil {
+			return nil, err
+		}
+		s.conn.open = true
+		return s.conn.resetRows(s, cursor, nil), nil
+	}
 	if s.conn.tx != nil {
 		if s.query.NumJoins() != 0 {
 			source, err := s.conn.materializeTransactionJoinSource(

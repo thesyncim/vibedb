@@ -68,7 +68,7 @@ func (c *conn) execMutationContext(
 	}
 	switch statement.Kind() {
 	case query.DMLInsert:
-		return c.insertLocked(ctx, statement, args, t)
+		return c.insertLocked(ctx, statement, args, t, nil, nil)
 	case query.DMLUpdate:
 		return c.updateLocked(ctx, statement, args, t)
 	case query.DMLDelete:
@@ -210,6 +210,8 @@ func (c *conn) insertLocked(
 	statement *query.DMLStatement,
 	args []any,
 	t *table,
+	returning *query.Statement,
+	returned *query.Cursor,
 ) (sqldriver.Result, error) {
 	tree := statement.Tree().Insert
 	limits, err := tableMutationLimits(t)
@@ -260,6 +262,24 @@ func (c *conn) insertLocked(
 		}
 		seeds = append(seeds, seedDocument{key: key, document: document})
 	}
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		c.pointDocs.Reset()
+		for i := range seeds {
+			if _, err := c.pointDocs.Append(seeds[i].document); err != nil {
+				return nil, err
+			}
+		}
+		cursor, err := returning.RunInto(
+			&c.exec, query.FromSegment(&c.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
+	}
 	if t.collection == nil {
 		if err := contextCheckpoint(ctx); err != nil {
 			return nil, err
@@ -292,6 +312,50 @@ func (c *conn) insertLocked(
 		return nil, err
 	}
 	return result{affected: int64(len(seeds))}, nil
+}
+
+// insertReturningContext executes an INSERT and materializes its RETURNING
+// projection from the already-resolved documents before publication. A
+// projection or result-budget failure therefore leaves storage untouched, and
+// the successful path performs no storage reread.
+func (c *conn) insertReturningContext(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+	returning *query.Statement,
+) (query.Cursor, error) {
+	var cursor query.Cursor
+	d := c.db
+	if err := lockContext(ctx, &d.mu); err != nil {
+		return cursor, err
+	}
+	defer d.mu.Unlock()
+	if d.closed {
+		return cursor, sqldriver.ErrBadConn
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return cursor, err
+	}
+	if err := d.settleCatalogLocked(); err != nil {
+		return cursor, err
+	}
+	if statement.Kind() != query.DMLInsert || returning == nil {
+		return cursor, errors.New(
+			"vibedb: internal returning execution requires INSERT RETURNING",
+		)
+	}
+	t, ok := d.tables[statement.Collection()]
+	if !ok {
+		return cursor, fmt.Errorf(
+			"%w: %q", ErrTableNotFound, statement.Collection(),
+		)
+	}
+	if _, err := c.insertLocked(
+		ctx, statement, args, t, returning, &cursor,
+	); err != nil {
+		return query.Cursor{}, err
+	}
+	return cursor, nil
 }
 
 func (c *conn) rejectExistingSeeds(

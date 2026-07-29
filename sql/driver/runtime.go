@@ -353,6 +353,12 @@ func (p *Prepared) Kind() sqlast.Kind {
 	return p.statement.tree.Kind
 }
 
+// ReturnsRows reports whether this statement must be executed through Query.
+// It is true for SELECT and for a mutation with a RETURNING projection.
+func (p *Prepared) ReturnsRows() bool {
+	return p != nil && p.statement != nil && p.statement.query != nil
+}
+
 // NumParams reports the statement's placeholder count.
 func (p *Prepared) NumParams() int {
 	if p == nil || p.statement == nil {
@@ -417,7 +423,7 @@ func (p *Prepared) QueryInto(
 	if err := p.usable(); err != nil {
 		return p.fail(err)
 	}
-	if !p.Kind().IsQuery() {
+	if !p.ReturnsRows() {
 		return p.fail(fmt.Errorf(
 			"vibedb: %s returns no rows; use Exec", p.Kind()))
 	}
@@ -452,8 +458,9 @@ func (p *Prepared) Exec(ctx context.Context, values []any) (Result, error) {
 	if err := p.usable(); err != nil {
 		return Result{}, p.fail(err)
 	}
-	if p.Kind().IsQuery() {
-		return Result{}, p.fail(errors.New("vibedb: SELECT returns rows; use Query"))
+	if p.ReturnsRows() {
+		return Result{}, p.fail(fmt.Errorf(
+			"vibedb: %s returns rows; use Query", p.Kind()))
 	}
 	if err := p.session.ready(ctx); err != nil {
 		return Result{}, p.fail(err)

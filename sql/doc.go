@@ -348,14 +348,17 @@
 //
 // The mutation and definition grammar refuses, each by name: a nested INSERT
 // column list, generated keys, INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT /
-// ON DUPLICATE KEY, RETURNING, a path assignment in SET, two assignments in one
-// UPDATE, UPDATE ... FROM, DELETE ... USING, LIMIT / ORDER BY / GROUP BY /
-// HAVING on a mutation, a table alias on a single-collection statement, DROP,
-// ALTER, MERGE, REPLACE, TRUNCATE, CREATE VIEW, CREATE UNIQUE INDEX, CREATE
-// TABLE ... AS SELECT, a partial index, an index method or key direction,
-// DEFAULT, UNIQUE, CHECK, and FOREIGN KEY. INSERT also refuses the old
-// key/document pair: VALUES without a field list contains exactly one complete
-// JSON document whose declared primary-key field determines identity.
+// ON DUPLICATE KEY, UPDATE/DELETE RETURNING, a path assignment in SET, two
+// assignments in one UPDATE, UPDATE ... FROM, DELETE ... USING, LIMIT / ORDER
+// BY / GROUP BY / HAVING on a mutation, a table alias on a single-collection
+// statement, DROP, ALTER, MERGE, REPLACE, TRUNCATE, CREATE VIEW, CREATE UNIQUE
+// INDEX, CREATE TABLE ... AS SELECT, a partial index, an index method or key
+// direction, DEFAULT, UNIQUE, CHECK, and FOREIGN KEY. INSERT also refuses the
+// old key/document pair: VALUES without a field list contains exactly one
+// complete JSON document whose declared primary-key field determines identity.
+// INSERT RETURNING accepts the ordinary projection list (including * and
+// aliases, but not aggregates) and evaluates it over the staged documents in
+// VALUES order before publication.
 //
 // Which backend accepts which statement is a property of the engine rather than
 // of this grammar, and belongs to the layer that executes: see the sql/driver

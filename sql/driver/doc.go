@@ -65,6 +65,11 @@
 // type-separated; numerically equal spellings such as 1, 1.0, and 1e0 identify
 // one row.
 //
+// INSERT ... RETURNING path, ... and RETURNING * execute through Query. The
+// projection is evaluated from the final staged JSON documents in VALUES order
+// before publication, without a storage reread. A projection or result-budget
+// failure therefore publishes nothing.
+//
 // INSERT rejects an existing or repeated derived key with
 // ErrDuplicatePrimaryKey and never replaces it. UPDATE is the explicit
 // replacement operation, accepts only SET "$doc" = ..., and cannot change the

@@ -465,7 +465,7 @@ operation:
   functions;
 - outer, cross, natural, `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, mutation joins,
-  mutation `ORDER BY`/`LIMIT`, and `RETURNING`;
+  mutation `ORDER BY`/`LIMIT`, and `UPDATE`/`DELETE RETURNING`;
 - generated keys, `INSERT ... SELECT`, defaults, upsert/on-conflict forms, and
   nested flat-INSERT construction;
 - `ALTER`, `DROP`, `TRUNCATE`, views, unique/check/foreign-key/default/generated
@@ -477,3 +477,8 @@ operation:
 
 These are explicit errors rather than parser successes followed by
 approximations.
+
+`INSERT ... RETURNING path, ...` and `RETURNING *` are supported. They reuse
+the SELECT projection engine over the final staged documents, preserve
+multi-row VALUES order, and complete projection admission before the atomic
+write is published.

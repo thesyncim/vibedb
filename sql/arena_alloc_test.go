@@ -85,6 +85,7 @@ func TestWarmParseStatementIsAllocationFree(t *testing.T) {
 	}{
 		{"insert document", benchInsertDocument},
 		{"insert flat", benchInsertFlat},
+		{"insert returning", `INSERT INTO docs VALUES (?) RETURNING id, *`},
 		{"update", benchUpdate},
 		{"delete", benchDelete},
 		{"create table", benchCreateTable},
@@ -122,6 +123,7 @@ func TestWarmParseStatementOfMixedShapesIsAllocationFree(t *testing.T) {
 		benchSimple,
 		benchInsertDocument,
 		benchInsertFlat,
+		`INSERT INTO docs VALUES (?) RETURNING id, *`,
 		benchUpdate,
 		benchDelete,
 		benchCreateTable,

@@ -29,6 +29,7 @@ func FuzzParseStatement(f *testing.F) {
 	seeds := []string{
 		``,
 		`INSERT INTO t VALUES (?)`,
+		`INSERT INTO t VALUES (?) RETURNING id, *`,
 		`INSERT INTO t ("$key", "$doc") VALUES ('k', {"a":1})`,
 		`INSERT INTO t VALUES ({"id":"a"}), ('{"id":"b"}')`,
 		`INSERT INTO t (id, active) VALUES ('a', TRUE), ('b', FALSE)`,
@@ -186,6 +187,15 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 	}
 	if seen != s.Params {
 		t.Fatalf("INSERT reports %d placeholders and holds %d", s.Params, seen)
+	}
+	if s.Returning != nil {
+		checkStatementInvariants(t, s.Returning)
+		for i := range s.Returning.Columns {
+			if s.Returning.Columns[i].Agg != AggNone {
+				t.Fatalf("RETURNING column %d is aggregate kind %d",
+					i, s.Returning.Columns[i].Agg)
+			}
+		}
 	}
 }
 

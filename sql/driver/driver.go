@@ -356,6 +356,12 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 		}
 	} else {
 		s.mutation, err = query.PrepareParsedDML(src, tree)
+		if err == nil && tree.Kind == sqlast.KindInsert &&
+			tree.Insert.Returning != nil {
+			s.query, err = query.PrepareParsedStatement(
+				src, tree.Insert.Returning,
+			)
+		}
 	}
 	if err != nil {
 		return nil, err

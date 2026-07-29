@@ -1131,7 +1131,7 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 			p.release()
 			return nil, err
 		}
-		if runtime.Kind().IsQuery() {
+		if runtime.ReturnsRows() {
 			p.cols = columnsFor(nil, runtime.Columns(), runtime.AppendSchema(nil))
 		}
 		return p, nil
@@ -1296,7 +1296,7 @@ func (s *session) execute(p *portal, limit int32) error {
 	case stmt.kind == kindBegin || stmt.kind == kindCommit || stmt.kind == kindRollback:
 		return s.executeTransaction(stmt)
 
-	case stmt.runtime != nil && stmt.runtime.Kind().IsQuery():
+	case stmt.runtime != nil && stmt.runtime.ReturnsRows():
 		return s.executeRuntimeQuery(p, limit)
 
 	case stmt.runtime != nil:
@@ -1399,8 +1399,13 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 }
 
 func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
+	kind := p.stmt.runtime.Kind()
 	if p.exhausted {
-		s.w.commandComplete(commandTag(0))
+		if kind == sqlast.KindSelect {
+			s.w.commandComplete(commandTag(0))
+		} else {
+			s.w.commandComplete(runtimeCommandTag(kind, 0))
+		}
 		return nil
 	}
 	if p.invalidated {
@@ -1436,6 +1441,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 			return err
 		}
 		sent++
+		p.row++
 		if s.takeCancel() {
 			cancelPortal(p)
 			return queryCanceled()
@@ -1455,7 +1461,11 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	p.runtimeOpen = false
-	s.w.commandComplete(commandTag(sent))
+	if kind == sqlast.KindSelect {
+		s.w.commandComplete(commandTag(p.row))
+	} else {
+		s.w.commandComplete(runtimeCommandTag(kind, int64(p.row)))
+	}
 	return nil
 }
 

@@ -51,9 +51,9 @@ func (k Kind) String() string {
 	return "SELECT"
 }
 
-// IsQuery reports whether the statement returns rows. It is the routing
-// predicate a database/sql driver needs and the only thing most callers want
-// from a [Kind].
+// IsQuery reports whether this is the SELECT statement kind. A complete
+// [Statement] can also return rows when an INSERT carries RETURNING; use
+// [Statement.ReturnsRows] when the parsed statement is available.
 func (k Kind) IsQuery() bool { return k == KindSelect }
 
 // DocumentColumn is how a statement names the whole stored document.
@@ -76,6 +76,13 @@ type Statement struct {
 	Delete      *DeleteStmt
 	CreateTable *CreateTableStmt
 	CreateIndex *CreateIndexStmt
+}
+
+// ReturnsRows reports whether this parsed statement must execute through a
+// query path.
+func (s *Statement) ReturnsRows() bool {
+	return s != nil && (s.Kind == KindSelect ||
+		s.Kind == KindInsert && s.Insert != nil && s.Insert.Returning != nil)
 }
 
 // Table answers the collection the statement reads or writes.
@@ -149,6 +156,13 @@ type InsertStmt struct {
 	// INSERT INTO t (a, b) VALUES (?, ?). It is nil when VALUES carries a
 	// whole JSON document.
 	Columns []*PathExpr
+	// Returning is the projection evaluated over the documents this INSERT
+	// publishes, in VALUES order. It is nil when the statement returns no rows.
+	//
+	// This is a real SelectStmt so RETURNING uses the same path resolution,
+	// projection semantics, output names, and lowering as SELECT. Its From has
+	// exactly one entry: Table.
+	Returning *SelectStmt
 	// Params is the number of '?' placeholders.
 	Params int
 	// Pos is the byte offset of the collection name.
