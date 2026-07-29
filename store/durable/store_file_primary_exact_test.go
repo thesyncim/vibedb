@@ -54,7 +54,7 @@ func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer primaryFile.Close()
-	if _, err := CreateFrom(source, legacyFile, options); err != nil {
+	if _, err := CreateFromPrimary(source, legacyFile, options); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := CreateFromPrimary(source, primaryFile, options); err != nil {
@@ -73,11 +73,9 @@ func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
 	root := primary.state.Load().root
 	if root.PrimaryRoot == (storeio.PageRef{}) ||
 		root.ExactIndexRoot == (storeio.PageRef{}) ||
-		root.IndexDirectory != (storeio.PageRef{}) ||
 		root.IndexCount != 2 {
-		t.Fatalf("primary exact roots/count = %+v %+v %+v/%d",
-			root.PrimaryRoot, root.ExactIndexRoot, root.IndexDirectory,
-			root.IndexCount)
+		t.Fatalf("primary exact roots/count = %+v %+v/%d",
+			root.PrimaryRoot, root.ExactIndexRoot, root.IndexCount)
 	}
 
 	country := primaryExactTestNeedle(t, `"c042"`)
@@ -352,7 +350,7 @@ func TestPrimaryExactIndexTemplateLeaves(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer primaryFile.Close()
-	if _, err := CreateFrom(source, legacyFile, options); err != nil {
+	if _, err := CreateFromPrimary(source, legacyFile, options); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := CreateFromPrimary(source, primaryFile, options); err != nil {

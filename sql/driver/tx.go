@@ -250,19 +250,18 @@ func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.
 			ErrTableNotFound, tableName)
 	}
 	t.conn.db.mu.RLock()
-	table, exists := t.conn.db.tables[tableName]
-	var collection *durable.Collection
-	if exists {
-		collection = table.collection
-	}
+	_, exists := t.conn.db.tables[tableName]
 	t.conn.db.mu.RUnlock()
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, tableName)
 	}
-	if collection != nil && !collection.SupportsUpdate() {
-		return nil, fmt.Errorf("%w: table %q: %w",
-			ErrTransactionIndexedTable, tableName, durable.ErrPrimaryBatchIndexedUnsupported)
-	}
+	// An indexed ordered-primary collection cannot batch, but its single-document
+	// Put/Delete path maintains its exact indexes, so whether this transaction is
+	// admissible depends on how many mutations it ultimately stages — which is not
+	// known until commit. Staging proceeds here; commit applies a lone mutation
+	// through Put/Delete and refuses a genuine multi-key batch with the typed
+	// error. This is what lets an autocommit statement, including a pgwire
+	// implicit single-statement transaction, write an indexed table.
 	if t.writeTable != "" && t.writeTable != tableName {
 		return nil, fmt.Errorf(
 			"vibedb: a transaction writes exactly one table; it already writes %q and cannot also write %q",
@@ -658,10 +657,6 @@ func (t *tx) Commit() error {
 	if table == nil {
 		return fmt.Errorf("vibedb: table %q no longer exists", t.writeTable)
 	}
-	if table.collection != nil && !table.collection.SupportsUpdate() {
-		return fmt.Errorf("%w: table %q: %w",
-			ErrTransactionIndexedTable, t.writeTable, durable.ErrPrimaryBatchIndexedUnsupported)
-	}
 	key, historyOverflow, conflict := state.conflicts.conflict(
 		state.conflictRevision, state.order,
 	)
@@ -697,6 +692,26 @@ func (t *tx) Commit() error {
 		return transactionBatchError(err)
 	}
 	collection := table.collection
+	// Validate the write set against the currently committed state BEFORE
+	// staging the batch: Collection.Update holds the writer mutex across fn and
+	// Snapshot re-acquires it on the deferred-canonical lane, so a conflict
+	// check inside fn self-deadlocks. The whole commit runs under db.mu, which
+	// serializes every driver-mediated mutation, so a snapshot taken here
+	// observes all prior commits and nothing can interleave between check and
+	// apply.
+	if err := t.validateWriteSet(collection, state); err != nil {
+		return err
+	}
+	if !collection.SupportsUpdate() {
+		// An indexed ordered-primary collection refuses batch publication, but its
+		// single-document Put/Delete path still maintains the exact indexes (see
+		// durable.Collection.SupportsUpdate). A transaction that nets out to a
+		// single mutation — which is what an autocommit statement, including every
+		// pgwire implicit single-statement transaction, resolves to — therefore
+		// applies through that path. Only a genuine multi-key batch is refused
+		// with the typed error.
+		return t.commitSingleMutationLocked(table, collection, state)
+	}
 	beforeGeneration := collection.Generation()
 	err := collection.Update(func(batch *durable.WriteBatch) error {
 		for _, key := range state.order {
@@ -721,6 +736,78 @@ func (t *tx) Commit() error {
 		table.conflicts.recordTransaction(state)
 	}
 	return transactionBatchError(err)
+}
+
+// commitSingleMutationLocked publishes a transaction whose staged mutations net
+// out to at most one key against a collection that cannot batch — an indexed
+// ordered-primary collection. It applies that one mutation through the
+// single-document Put/Delete path, which maintains the collection's exact
+// indexes; a transaction that stages two or more effective mutations genuinely
+// needs the batch publisher and is refused with the typed error. An INSERT that
+// a later DELETE cancels for a key absent at BEGIN nets to nothing, so it counts
+// toward neither the effective total nor a publication.
+func (t *tx) commitSingleMutationLocked(
+	table *table,
+	collection *durable.Collection,
+	state *txTable,
+) error {
+	only := ""
+	effective := 0
+	for _, key := range state.order {
+		entry := state.pending[key]
+		if !entry.existed && entry.remove {
+			continue
+		}
+		effective++
+		only = key
+	}
+	if effective == 0 {
+		return nil
+	}
+	if effective > 1 {
+		return fmt.Errorf("%w: table %q: %w",
+			ErrTransactionIndexedTable, t.writeTable, durable.ErrPrimaryBatchIndexedUnsupported)
+	}
+	entry := state.pending[only]
+	beforeGeneration := collection.Generation()
+	var err error
+	if entry.remove {
+		_, err = collection.Delete(only)
+	} else {
+		_, err = collection.Put(only, entry.document)
+	}
+	if collectionMutationPublished(collection, beforeGeneration, err) {
+		table.conflicts.recordTransaction(state)
+	}
+	return transactionBatchError(err)
+}
+
+// validateWriteSet enforces optimistic-concurrency: every key the transaction
+// touched must still hold the value it held at BEGIN, otherwise a concurrent
+// commit changed it and this transaction must abort. It reads a fresh snapshot
+// of the currently committed state; the caller runs under db.mu, so that state
+// is stable for the duration of the check and the subsequent apply.
+func (t *tx) validateWriteSet(collection *durable.Collection, state *txTable) error {
+	live, err := collection.Snapshot()
+	if err != nil {
+		return err
+	}
+	defer live.Close()
+	var scratch []byte
+	for _, key := range state.order {
+		entry := state.pending[key]
+		current, found, err := live.AppendRaw(scratch[:0], key)
+		if err != nil {
+			return err
+		}
+		scratch = current
+		if found != entry.existed {
+			return fmt.Errorf(
+				"%w: table %q key %q changed after BEGIN",
+				ErrTransactionConflict, t.writeTable, key)
+		}
+	}
+	return nil
 }
 
 func transactionBatchError(err error) error {

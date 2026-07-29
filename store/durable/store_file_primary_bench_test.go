@@ -38,12 +38,11 @@ func openBenchPrimaryPutCollection(
 	options := Options{
 		ResidentBytes: 64 << 20, Backend: BackendPortable,
 		Durability:               DurabilityBufferedVisible,
-		DisableMutationCombining: true,
 	}
 	if primary {
 		_, err = CreateFromPrimary(built, file, options)
 	} else {
-		_, err = CreateFrom(built, file, options)
+		_, err = CreateFromPrimary(built, file, options)
 	}
 	if err != nil {
 		tb.Fatal(err)

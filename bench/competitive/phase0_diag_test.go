@@ -64,14 +64,11 @@ func TestPhase0Diag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if os.Getenv("PHASE0_CHUNK") != "" {
-		if _, err := durable.CreateFrom(built, f, opts); err != nil {
-			t.Fatal(err)
-		}
-	} else {
-		if _, err := durable.CreateFromPrimary(built, f, opts); err != nil {
-			t.Fatal(err)
-		}
+	// The chunk builder (durable.CreateFrom) and its PHASE0_CHUNK diagnostic path
+	// were removed with the chunk store; every durable store is now an ordered
+	// primary graph built by CreateFromPrimary.
+	if _, err := durable.CreateFromPrimary(built, f, opts); err != nil {
+		t.Fatal(err)
 	}
 	coll, err := durable.Open(f, opts)
 	if err != nil {

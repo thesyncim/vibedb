@@ -38,7 +38,6 @@ func testFileCatalogOptions(t testing.TB) Options {
 		{Name: "id", Paths: []string{"/id"}},
 		{Name: "id_alias", Paths: []string{"/id"}},
 	}
-	options.Float64Columns = []string{"/score"}
 	return options
 }
 
@@ -48,13 +47,25 @@ func recoverFileCatalogRoot(
 	pageSize uint32,
 ) (storeio.InlineSuperblock, storeio.StateRoot) {
 	t.Helper()
-	inline, root, _, err := storeio.RecoverInlineStateRoot(
-		file, pageSize, make([]byte, pageSize),
+	// Recover exactly the way Open does: the deferred-canonical lanes settle the
+	// authoritative root through the materialization capsules (and, for un-
+	// checkpointed generations, the recovery journal), so a bare RecoverInlineState-
+	// Root that only trusts the fixed superblock and its direct refs sees no valid
+	// root. RecoverMutableInlineStateRoot resolves the capsules against each root
+	// candidate the same way Open's Open-time recovery does; its scratch must hold
+	// the largest top-level reference, i.e. one MaxPageSize extent.
+	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := storeio.RecoverMutableInlineStateRoot(
+		file, bootstrap.PageSize, bootstrap.MaterializationDamageGranule,
+		make([]byte, bootstrap.MaxPageSize),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return inline, root
+	return recovery.Root, recovery.State
 }
 
 func TestFileStoreExactCatalogZeroOptionReopenAndRootPreservation(
@@ -131,10 +142,6 @@ func TestFileStoreExactCatalogZeroOptionReopenAndRootPreservation(
 			options.Collection.Schema.Definition(),
 		) ||
 		!reflect.DeepEqual(reopened.options.Indexes, options.Indexes) ||
-		!reflect.DeepEqual(
-			reopened.options.Float64Columns,
-			options.Float64Columns,
-		) ||
 		len(reopened.options.indexes) != 1 ||
 		reopened.options.indexNameIDs["id"] != 0 ||
 		reopened.options.indexNameIDs["id_alias"] != 0 {
@@ -266,61 +273,6 @@ func TestFileStoreMultiPageExactCatalogZeroOptionReopen(t *testing.T) {
 	}
 }
 
-func TestFileStoreBulkExactCatalogZeroOptionReopen(t *testing.T) {
-	options := testFileCatalogOptions(t)
-	source, err := store.New(options.Collection)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := source.Put(
-		"bulk", []byte(`{"id":9,"score":2.5}`),
-	); err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.CreateTemp(t.TempDir(), "file-catalog-bulk-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	if _, err := CreateFrom(source, file, options); err != nil {
-		t.Fatal(err)
-	}
-	inline, root := recoverFileCatalogRoot(
-		t, file, uint32(options.PageSize),
-	)
-	layout, err := storeio.MutableStoreLayout(uint32(options.PageSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if root.PageCatalogHead.Offset != layout.DataStart ||
-		root.PageCatalogHead.Generation != 1 ||
-		root.PageCatalogBytes == 0 ||
-		root.MaxPageSize != uint32(options.MaxPageSize) ||
-		root.MaxKeyBytes != uint32(options.MaxKeyBytes) ||
-		root.InlineValueBytes != uint32(options.InlineValueBytes) ||
-		root.MaxDocumentBytes != uint32(options.MaxDocumentBytes) ||
-		root.ChunkDirectory.Offset <= root.PageCatalogHead.Offset ||
-		inline.FileEnd <= root.ChunkDirectory.Offset {
-		t.Fatalf("bulk exact catalog/root geometry = %+v", root)
-	}
-	reopened, err := Open(file, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, ok, err := reopened.AppendRaw(nil, "bulk")
-	if err != nil || !ok || string(raw) !=
-		`{"id":9,"score":2.5}` {
-		t.Fatalf("bulk zero-option reopened read = (%q,%v,%v)", raw, ok, err)
-	}
-	if len(reopened.options.indexes) != 1 ||
-		len(reopened.options.float64Columns) != 1 ||
-		reopened.options.Collection.Schema == nil {
-		t.Fatalf("bulk zero-option catalog = %+v", reopened.options.Options)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
 
 func TestFileStoreMaterializationRequiresCurrentDeviceAssertion(
 	t *testing.T,
@@ -331,6 +283,12 @@ func TestFileStoreMaterializationRequiresCurrentDeviceAssertion(
 	}
 	defer file.Close()
 	options := testFileStoreOptions()
+	// Canonical materialization requires a committer that owns the checkpoint. The
+	// buffered-visible and sync-primary lanes drive it manually (ManualCheckpoint),
+	// which the committer refuses to combine with a materialization granule, so the
+	// device-assertion round trip is exercised on the async lane, whose committer
+	// materializes each generation itself.
+	options.Durability = DurabilityAsyncVisible
 	options.MaterializationDamageGranule =
 		storeio.MaterializationJournalMinSectorSize
 	collection, err := Create(file, options)
@@ -346,6 +304,7 @@ func TestFileStoreMaterializationRequiresCurrentDeviceAssertion(
 		)
 	}
 	reopened, err := Open(file, Options{
+		Durability:                   DurabilityAsyncVisible,
 		MaterializationDamageGranule: options.MaterializationDamageGranule,
 	})
 	if err != nil {

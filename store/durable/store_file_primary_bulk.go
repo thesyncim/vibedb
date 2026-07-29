@@ -88,7 +88,7 @@ func CreateFromPrimary(
 			chunk := snapshot.Chunks.Get(row.sourceChunk)
 			if chunk == nil ||
 				chunk.Live&(uint64(1)<<row.sourceSlot) == 0 {
-				return storeio.ErrDocumentPageCorrupt
+				return fmt.Errorf("vibejson: bulk source row references a missing document")
 			}
 			key := chunk.Key(int(row.sourceSlot))
 			value := chunk.Docs.RawAt(int(chunk.Ord[row.sourceSlot]))
@@ -281,7 +281,8 @@ func CreateFromPrimary(
 			file.Name(),
 			recoveryJournalHeaderFor(
 				storeID, journalID, uint32(normalized.PageSize),
-				normalized.MaxKeyBytes, normalized.InlineValueBytes, 1,
+				normalized.MaxKeyBytes, normalized.InlineValueBytes,
+				normalized.MaxDocumentBytes, 1,
 			),
 		); err != nil {
 			_ = tx.Abort()

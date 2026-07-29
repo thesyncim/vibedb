@@ -64,7 +64,7 @@ func (c *Collection) resolvePrimaryGraph(
 	if err != nil {
 		return dst, false, err
 	}
-	dst, found, err := appendPrimaryLeafValue(
+	dst, found, err := c.appendPrimaryLeafValue(
 		dst, leafLease.Page(), state.root.StoreID, route.Bucket,
 		route.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
@@ -77,11 +77,12 @@ func (c *Collection) resolvePrimaryGraph(
 	return dst, found, err
 }
 
-// appendPrimaryLeafValue reads one exact inline value from an admitted primary
-// leaf, dispatching on the leaf class recorded in the page. Template leaves
-// splice the exact JSON into dst; raw leaves append the borrowed inline bytes.
-// It allocates nothing when dst has capacity for the value.
-func appendPrimaryLeafValue(
+// appendPrimaryLeafValue reads one exact value from an admitted primary leaf,
+// dispatching on the leaf class recorded in the page. Template leaves splice the
+// exact JSON into dst; raw leaves append the borrowed inline bytes, or resolve
+// and append the out-of-line value when the record is an overflow reference. It
+// allocates nothing for inline hits when dst has capacity for the value.
+func (c *Collection) appendPrimaryLeafValue(
 	dst []byte,
 	page []byte,
 	storeID [16]byte,
@@ -113,17 +114,18 @@ func appendPrimaryLeafValue(
 		return out, found, nil
 	}
 	leaf := storeio.AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
-	_, raw, overflow, found := leaf.LookupRawHashed(hash, keyBytes)
+	_, value, found := leaf.LookupHashed(hash, keyBytes)
 	if !found {
 		return dst, false, nil
 	}
-	if overflow {
-		return dst, false, fmt.Errorf(
-			"%w: overflow ordered-primary value",
-			ErrPrimaryCutoverUnsupported,
-		)
+	if value.IsOverflow() {
+		out, err := c.appendPrimaryOverflowValue(dst, value.Overflow, bounds)
+		if err != nil {
+			return dst, false, err
+		}
+		return out, true, nil
 	}
-	return append(dst, raw...), true, nil
+	return append(dst, value.Inline...), true, nil
 }
 
 // resolvePrimaryGraphPageWalk is the rooted resolver retained both as a
@@ -252,7 +254,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	if err != nil {
 		return dst, false, err
 	}
-	dst, found, err := appendPrimaryLeafValue(
+	dst, found, err := c.appendPrimaryLeafValue(
 		dst, leafLease.Page(), state.root.StoreID, leafRoute.Bucket,
 		leafRoute.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
@@ -444,6 +446,66 @@ func withOpenedPrimaryCatalogNode(
 		return fmt.Errorf("vibejson: open ordered primary catalog: %w", err)
 	}
 	return visit(&node)
+}
+
+// setupResidentPrimaryLocked builds the collection-local acceleration a
+// primary-layout store needs once its root is known: the mutation scratch sized
+// for the largest leaf, the resident router rebuilt from the catalog, the
+// deferred-lane pending-parent scratch, and the resident exact indexes. It is
+// shared by Open (recovering a persisted primary root) and the fresh-create
+// path (publishing an empty primary root), so both reach an identically wired
+// collection. The writer must be held and the collection not yet reachable.
+func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
+	// A compact leaf packs far more rows than a wide leaf holds raw, so its first
+	// mutation de-compacts it into a leaf as large as the 64 KiB maximum leaf
+	// extent before the structural path re-fits and splits it back into wide
+	// leaves. The mutation scratch must therefore cover the largest leaf, not just
+	// the wide class.
+	c.primaryLeafScratch = make([]byte, storeio.CommonPrimaryLeafMaxExtentBytes)
+	c.primaryRootScratch = make([]byte, storeio.SegmentedTabletRouterRootBytes)
+	builtRouter, err := storeio.BuildResidentPrimaryRouter(
+		c.cache, state.root.PrimaryRoot,
+		storeio.GlobalTabletCatalogBounds{
+			StoreID: state.root.StoreID, SelectedRootGeneration: state.root.Generation,
+			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("vibejson: build resident primary router: %w", err)
+	}
+	c.primaryRouter.Store(builtRouter)
+	// Both buffered-visible and the journal-backed synchronous lane apply through
+	// the deferred canonical-frame path, so both need the pending parent and
+	// volatile-retire scratch. Async-visible on a primary graph uses the committer
+	// path and does not.
+	if c.buffered() || c.synchronous() {
+		pendingCapacity := min(
+			c.options.MaxRetiredExtents, filePrimaryPendingParentLimit,
+		)
+		c.primaryPendingParents = make(
+			[]filePrimaryPendingParent, 0, pendingCapacity,
+		)
+		c.primaryVolatileRetired = make([]storeio.PageRef, 0, pendingCapacity)
+		// The deferred-canonical lane mints out-of-line values as volatile chains and
+		// resolves them at read, checkpoint, and exact-index maintenance. Size the
+		// chain scratch for one worst-case document so a steady-state overflow Put
+		// never grows it, and the durable-retirement queue for one worst-case
+		// checkpoint's superseded chains.
+		maxOverflowPages := c.primaryOverflowPageCount(c.options.MaxDocumentBytes)
+		c.overflowRefScratch = make([]storeio.PageRef, 0, maxOverflowPages)
+		c.overflowOffsetScratch = make([]int, 0, maxOverflowPages)
+		c.overflowValueScratch = make([]byte, 0, c.options.MaxDocumentBytes)
+		c.overflowPageScratch = make([]byte, c.options.MaxPageSize)
+		c.primaryPendingOverflowRetire = make(
+			[]storeio.PageRef, 0, c.options.MaxRetiredExtents,
+		)
+	}
+	if err := c.openPrimaryExactIndexes(state); err != nil {
+		return fmt.Errorf(
+			"vibejson: open ordered-primary exact indexes: %w", err,
+		)
+	}
+	return nil
 }
 
 // ResetPrimaryTemplateDiag zeroes the process-global template-columnar mutation

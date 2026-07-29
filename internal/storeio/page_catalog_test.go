@@ -798,11 +798,15 @@ func clonePageCatalogTestChain(
 }
 
 func TestPageCatalogKindIsAppendedAndDistinct(t *testing.T) {
-	if PageCatalogSegment != PageFingerprintDirectory+1 ||
-		PageCatalogSegment == PageIndexGroupCatalog {
+	// The retired chunk kinds (including 16, the former PageFingerprintDirectory)
+	// keep their on-disk numbers reserved, so PageCatalogSegment retains the
+	// identifier 17 it has always had: one past the last retired slot, and
+	// distinct from the free-set and primary kinds bracketing it.
+	if PageCatalogSegment != 17 || PageCatalogSegment == PageFreeIndex ||
+		PageCatalogSegment == PagePrimaryCatalog {
 		t.Fatalf(
-			"catalog kind = %d, fingerprint = %d, aggregate = %d",
-			PageCatalogSegment, PageFingerprintDirectory, PageIndexGroupCatalog,
+			"catalog kind = %d, want 17 distinct from free-index %d and primary %d",
+			PageCatalogSegment, PageFreeIndex, PagePrimaryCatalog,
 		)
 	}
 }

@@ -81,14 +81,22 @@ func (c *Collection) deriveBucketExactContribution(
 		leafPage, c.storeID, bucket, bounds, scratch,
 		func(slot uint8, _, raw []byte, overflow bool) error {
 			if overflow {
-				// An overflow value is not the document itself, so its indexed
-				// components cannot be canonicalized in place. The mutation path
-				// already refuses overflow mutations; refuse a bucket carrying one
-				// rather than index a descriptor as if it were the document.
-				return fmt.Errorf(
-					"%w: ordered primary overflow posting maintenance",
-					ErrPrimaryCutoverUnsupported,
+				// The row stores its value out of line, so raw is the chain head
+				// descriptor, not the document. Resolve the value through the shared
+				// overflow reader and index the reassembled document exactly as an
+				// inline row: term derivation is a pure function of the value bytes,
+				// so an out-of-line value contributes the identical postings a fitting
+				// one would. The chain is cache-resident here (volatile on the buffered
+				// lane, durable after checkpoint), so resolution reads no device.
+				resolved, resolveErr := c.appendPrimaryOverflowValue(
+					c.overflowValueScratch[:0],
+					storeio.DecodePrimaryOverflowRef(raw), bounds,
 				)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				c.overflowValueScratch = resolved
+				raw = resolved
 			}
 			tileID := uint32(bucket)<<2 | uint32(slot>>6)
 			bit := uint64(1) << uint(slot&63)

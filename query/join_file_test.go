@@ -522,7 +522,7 @@ func durableJoinCorpus(tb testing.TB, outerRows, innerRows int) *durable.Databas
 			tb.Fatal(err)
 		}
 		defer func() { _ = file.Close() }()
-		if _, err := durable.CreateFrom(source, file, options); err != nil {
+		if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
 			tb.Fatal(err)
 		}
 	}

@@ -52,16 +52,9 @@ type Workspace struct {
 	storeMasks       [][]store.Mask
 	storeMaskUsed    int
 	storeIndexProbes int
-	// zonePruned counts the chunks the block-pruning tier skipped during the
-	// last execution. Nothing on an execution path reads it; it is the
-	// measurement hook the pruning benchmarks and the non-vacuity assertions in
-	// the differential tests report from, kept on the per-execution Workspace
-	// rather than in a package variable so it needs no synchronization and
-	// cannot race a concurrent query.
-	zonePruned     int
-	storeRows      []store.Location
-	storeIndexes   []store.IndexInfo
-	emptyStoreMask [1]store.Mask
+	storeRows        []store.Location
+	storeIndexes     []store.IndexInfo
+	emptyStoreMask   [1]store.Mask
 	// needleScratch backs every AppendIndexMasks/AppendIndexCandidateMasks
 	// call the generic candidate planner (candidates_mask.go) makes: passing
 	// an already-existing, reused slice instead of building one from scalars
@@ -661,7 +654,6 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	}
 	w.candidateUsed = 0
 	w.storeMaskUsed = 0
-	w.zonePruned = 0
 	w.text = w.text[:0]
 	w.lateText = w.lateText[:0]
 	w.groupKey = w.groupKey[:0]
@@ -686,7 +678,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 			return nil
 		}
 	}
-	chunks, _, _ := snapshot.ZoneStats()
+	chunks := snapshot.Chunks()
 	if err := w.activeHeapWorkBudget().admitPlanner(
 		p, snapshot.Len(), heapWorkSnapshot, false, chunks,
 	); err != nil {

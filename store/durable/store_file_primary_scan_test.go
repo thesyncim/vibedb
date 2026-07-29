@@ -27,7 +27,7 @@ func openPrimaryScanPair(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = legacyFile.Close() })
-	if _, err := CreateFrom(built, legacyFile, options); err != nil {
+	if _, err := CreateFromPrimary(built, legacyFile, options); err != nil {
 		t.Fatal(err)
 	}
 	primaryFile := createPrimaryPointFile(
@@ -62,7 +62,7 @@ func openRedundantPrimaryScanPair(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = legacyFile.Close() })
-	if _, err := CreateFrom(built, legacyFile, options); err != nil {
+	if _, err := CreateFromPrimary(built, legacyFile, options); err != nil {
 		t.Fatal(err)
 	}
 	primaryFile := createPrimaryPointFile(

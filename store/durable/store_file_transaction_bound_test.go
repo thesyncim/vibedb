@@ -35,7 +35,6 @@ func TestSingleDocumentTransactionFitsExactReservation(t *testing.T) {
 		MaxBatchDocuments:        64,
 		Backend:                  BackendPortable,
 		Durability:               DurabilityBufferedVisible,
-		DisableMutationCombining: true,
 	}
 	normalized, err := options.normalized()
 	if err != nil {

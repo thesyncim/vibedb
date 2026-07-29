@@ -135,11 +135,17 @@ func journalCrashKey(i int) string { return fmt.Sprintf("key-%04d", i) }
 // collection, whose volatile pending mutations a mid-workload Snapshot is not
 // obligated to materialize.
 func journalContentOracle(n int) []map[string]string {
+	return journalContentOracleWith(n, journalValue)
+}
+
+// journalContentOracleWith is journalContentOracle over a caller-chosen value
+// function, so the same oracle serves both the inline and the overflow workloads.
+func journalContentOracleWith(n int, value func(int) []byte) []map[string]string {
 	contents := make([]map[string]string, 0, n+1)
 	for i := 0; i <= n; i++ {
 		m := map[string]string{"seed": `{"v":0}`}
 		for j := 0; j < i; j++ {
-			m[journalCrashKey(j)] = string(journalValue(j))
+			m[journalCrashKey(j)] = string(value(j))
 		}
 		contents = append(contents, m)
 	}
@@ -152,9 +158,28 @@ func journalContentOracle(n int) []map[string]string {
 // point of the tail: recovery must recover to the content just before or just
 // after that acknowledgement, and never a torn third value.
 func TestRecoveryJournalAppendCrashMatrix(t *testing.T) {
-	options := journalTestOptions(CheckpointPowerSafe)
+	for _, cfg := range []struct {
+		name    string
+		options Options
+		value   func(int) []byte
+	}{
+		{"inline", journalTestOptions(CheckpointPowerSafe), journalValue},
+		// The overflow variant acknowledges every value out of line: each Put mints
+		// a volatile overflow chain the redo record carries by reference, so a torn,
+		// dropped, or ENOSPC'd append here must fail closed or recover the whole
+		// referenced value — never a half-written chain and never a reference to a
+		// chain the crash left incomplete.
+		{"overflow", journalOverflowOptions(CheckpointPowerSafe), journalOverflowValue},
+	} {
+		t.Run(cfg.name, func(t *testing.T) {
+			runRecoveryJournalAppendCrashMatrix(t, cfg.options, cfg.value)
+		})
+	}
+}
+
+func runRecoveryJournalAppendCrashMatrix(t *testing.T, options Options, value func(int) []byte) {
 	const n = 8
-	contents := journalContentOracle(n)
+	contents := journalContentOracleWith(n, value)
 
 	phases := []struct {
 		name  string
@@ -199,7 +224,7 @@ func TestRecoveryJournalAppendCrashMatrix(t *testing.T) {
 
 			landed := 0
 			for i := 0; i < n; i++ {
-				_, putErr := coll.Put(journalCrashKey(i), journalValue(i))
+				_, putErr := coll.Put(journalCrashKey(i), value(i))
 				if fj.Faulted() {
 					if putErr == nil {
 						landed = i + 1

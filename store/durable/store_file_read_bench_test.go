@@ -56,7 +56,7 @@ func openBenchReadCollection(tb testing.TB, count int, format DocumentFormat) (*
 		tb.Fatal(err)
 	}
 	options := Options{ResidentBytes: 64 << 20, Backend: BackendPortable, DocumentFormat: format}
-	if _, err := CreateFrom(built, file, options); err != nil {
+	if _, err := CreateFromPrimary(built, file, options); err != nil {
 		tb.Fatal(err)
 	}
 	collection, err := Open(file, options)

@@ -754,16 +754,13 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	}
 	tmpPath := file.Name()
 	options := durableOptions(t)
-	// SQL tables always use the mutable chunk layout. Choosing a different
-	// layout from the shape of the first INSERT made transaction support and
-	// statement atomicity depend on which statement happened to arrive first.
 	collection, err := durable.Create(file, options)
 	if err == nil {
-		switch len(documents) {
-		case 0:
-		case 1:
+		switch {
+		case len(documents) == 0:
+		case len(documents) == 1:
 			_, err = collection.Put(documents[0].key, documents[0].document)
-		default:
+		case collection.SupportsUpdate():
 			err = collection.Update(func(batch *durable.WriteBatch) error {
 				for _, document := range documents {
 					if putErr := batch.Put(document.key, document.document); putErr != nil {
@@ -772,6 +769,18 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 				}
 				return nil
 			})
+		default:
+			// An indexed ordered-primary collection cannot batch, but its single-
+			// document Put maintains the exact indexes, and this create discards
+			// the whole file on any error below, so seeding a fresh indexed table
+			// through a sequence of Puts is atomic at the file boundary — the only
+			// place a first INSERT of several rows can land on an indexed table.
+			for _, document := range documents {
+				if _, putErr := collection.Put(document.key, document.document); putErr != nil {
+					err = putErr
+					break
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -820,6 +829,19 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	d.tableDirFencePending = true
 	t.meta.Materialized = true
 	d.catalogWritePending = true
+	// A synchronous (the driver's default) or journal-opted collection writes a
+	// recovery-journal sibling beside the store file, and reopen resolves it by
+	// the store file's final path, so it must move with the rename above.
+	// Ordering is not crash-critical: the table becomes durably known only when
+	// the catalog write below records it, and a crash before that leaves both
+	// files as harmless orphans no reopen consults. The live handle is retained
+	// on failure exactly as the directory-sync failure below does.
+	if err := publishJournalSibling(tmpPath, path); err != nil {
+		return t, fmt.Errorf(
+			"%w: publish first SQL table journal: %w",
+			durable.ErrCommitOutcomeUnknown, err,
+		)
+	}
 	if err := d.directorySync(d.dataDir); err != nil {
 		// The durable file and its live namespace entry now exist. Retain the
 		// matching live table state: removing it would turn a failed fence into
@@ -835,6 +857,23 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		return t, err
 	}
 	return t, nil
+}
+
+// publishJournalSibling relocates a store file's recovery-journal sibling when
+// the store file is published from fromStore to toStore. An async collection
+// writes no journal, so an absent source is a no-op rather than an error; a
+// present one is moved with the same platform-atomic rename the store file uses,
+// because a journaled root cannot reopen without its journal at the store file's
+// path.
+func publishJournalSibling(fromStore, toStore string) error {
+	from := durable.RecoveryJournalPath(fromStore)
+	if _, err := os.Stat(from); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return publishNewPath(from, durable.RecoveryJournalPath(toStore))
 }
 
 // close is the retryable close used by direct database owners. A pending

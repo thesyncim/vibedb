@@ -498,7 +498,7 @@ func tabletAnchorHandleTest(
 				LogicalID:  uint64(bucket) + 1,
 				Generation: uint64(100 + ordinal),
 				Length:     uint32(4096 << (ordinal % 5)),
-				Kind:       PageDocument,
+				Kind:       PagePrimaryLeaf,
 			},
 			Zone: zone,
 		}
@@ -522,7 +522,7 @@ func tabletAnchorHandleTest(
 		make([]byte, 1<<20),
 		anchorView,
 		localBits,
-		PageDocument,
+		PagePrimaryLeaf,
 		leaves,
 	)
 	if err != nil {

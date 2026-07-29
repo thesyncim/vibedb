@@ -53,16 +53,21 @@ func TestTransactionSelectReadsStagedInsertAndUpdate(t *testing.T) {
 	}
 }
 
-func TestTransactionOverlayCorrectsIndexedBaseCandidates(t *testing.T) {
+// A transaction cannot mutate an indexed primary collection (the engine gate
+// ErrPrimaryBatchIndexedUnsupported, surfaced as ErrTransactionIndexedTable —
+// see TestTransactionOnIndexedTableIsRejected). The overlay-correctness
+// contract this test exercises — a WHERE-filtered read inside a transaction
+// reflecting the transaction's own pending updates, deletes, and inserts over
+// the base rows — does not depend on the filter being index-answered, so it is
+// expressed on the unindexed primary, where the filter is answered by a scan of
+// the overlaid candidates.
+func TestTransactionOverlayCorrectsFilteredBaseCandidates(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`
 		CREATE TABLE docs (
 			id STRING PRIMARY KEY,
 			active BOOL NOT NULL
 		)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE INDEX active_idx ON docs (active)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(
@@ -117,7 +122,7 @@ func TestTransactionOverlayCorrectsIndexedBaseCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fmt.Sprint(got) != "[a d]" {
-		t.Fatalf("indexed overlay rows = %v, want [a d]", got)
+		t.Fatalf("filtered overlay rows = %v, want [a d]", got)
 	}
 }
 
@@ -783,7 +788,14 @@ func TestDriverValueRoundTrips(t *testing.T) {
 	}
 }
 
-func TestTransactionMaintainsChunkLayoutExactIndex(t *testing.T) {
+// The engine is primary-only: an exact index lives on the ordered graph, whose
+// single-document Put/Delete path maintains it but whose batch publisher refuses
+// it with ErrPrimaryBatchIndexedUnsupported. A transaction that stages a single
+// mutation therefore commits through Put/Delete, but one that stages a genuine
+// multi-key batch is refused at commit with the typed ErrTransactionIndexedTable.
+// (This replaces a retired test that asserted a transactional insert maintained
+// a secondary index through the deleted chunk layout.)
+func TestTransactionOnIndexedTableIsRejected(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
 		t.Fatal(err)
@@ -794,22 +806,41 @@ func TestTransactionMaintainsChunkLayoutExactIndex(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"seed","kind":"x"}`); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := db.Begin()
+
+	// A lone transactional mutation applies through the exact-index-maintaining
+	// Put path, exactly as an autocommit statement does.
+	single, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = tx.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"later","kind":"x"}`); err != nil {
+	if _, err := single.Exec(
+		`INSERT INTO docs VALUES (?)`, `{"id":"one","kind":"x"}`,
+	); err != nil {
+		t.Fatalf("staging one indexed mutation = %v, want success", err)
+	}
+	if err := single.Commit(); err != nil {
+		t.Fatalf("committing one indexed mutation = %v, want success", err)
+	}
+
+	// Two staged mutations need the batch publisher, which the indexed collection
+	// refuses; the driver surfaces the typed error at commit.
+	multi, err := db.Begin()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	defer multi.Rollback()
+	if _, err := multi.Exec(
+		`INSERT INTO docs VALUES (?)`, `{"id":"two","kind":"x"}`,
+	); err != nil {
+		t.Fatalf("staging first of two indexed mutations = %v", err)
 	}
-	var count int64
-	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE kind = ?`, "x").Scan(&count); err != nil {
-		t.Fatal(err)
+	if _, err := multi.Exec(
+		`INSERT INTO docs VALUES (?)`, `{"id":"three","kind":"x"}`,
+	); err != nil {
+		t.Fatalf("staging second of two indexed mutations = %v", err)
 	}
-	if count != 2 {
-		t.Fatalf("indexed transactional COUNT(*) = %d, want 2", count)
+	if err := multi.Commit(); !errors.Is(err, ErrTransactionIndexedTable) {
+		t.Fatalf("indexed multi-key transactional commit = %v, want ErrTransactionIndexedTable", err)
 	}
 }
 
@@ -855,7 +886,12 @@ func TestTransactionInsertRejectsExistingPrimaryKeyAtExec(t *testing.T) {
 }
 
 func TestTransactionDeleteRetainsOneBoundedExistenceScratch(t *testing.T) {
-	payload := strings.Repeat("x", 1<<20)
+	// A transactional batch on the ordered primary stores each document inline
+	// and does not overflow (overflow is the single-Put path), so a staged
+	// document is bounded by the inline value size, not by MaxDocumentBytes.
+	// Two documents that comfortably fit that bound still make the assertion
+	// sharp: the DELETE existence scratch retains one document, never both.
+	payload := strings.Repeat("x", 400)
 	firstDocument := []byte(`{"id":"a","payload":"` + payload + `"}`)
 	secondDocument := []byte(`{"id":"b","payload":"` + payload + `"}`)
 	_, transaction, keys := beginRawDocsTransaction(

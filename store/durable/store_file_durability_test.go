@@ -115,7 +115,6 @@ func TestFileStoreStickyFailureRejectsNoOpMutations(t *testing.T) {
 	}
 	options := testFileStoreOptions()
 	options.Durability = DurabilityAsyncVisible
-	options.DisableMutationCombining = true
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -154,17 +153,36 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer file.Close()
 	options := testFileStoreOptions()
 	options.Durability = DurabilitySync
-	options.DisableMutationCombining = true
+	// The sync primary lane's durability fence is a synced recovery-journal record
+	// appended before the mutation is applied and published. That append is the
+	// device write a failure must be injected into: the chunk-era trick of closing
+	// the store descriptor no longer touches a sync Put, which writes only the
+	// sibling journal. Arm the journal write seam so the rejected commit's append
+	// fails with ENOSPC.
+	get, restore := installJournalFaultSeam(t)
+	defer restore()
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
+	}
+	fj := get()
+	if fj == nil {
+		t.Fatal("sync primary store minted no journal to fault")
 	}
 	const key = "stable"
 	before := []byte(`{"value":"durable"}`)
 	after := []byte(`{"value":"rejected"}`)
 	if _, err := collection.Put(key, before); err != nil {
+		t.Fatal(err)
+	}
+	// A sync Put acknowledges through the journal and folds its root at the next
+	// checkpoint, so the published generation leads the checkpointed
+	// DurableGeneration until then. Checkpoint here so the baseline has both
+	// aligned; the assertion that a rejected commit advances neither is the point.
+	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	generation := collection.Generation()
@@ -176,14 +194,16 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 		)
 	}
 
-	// Buffered portable commits own this descriptor. Closing it injects a real
-	// device write failure after the next generation has been fully built but
-	// before it can cross the durability fence.
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// Fail the next journal append — the replacement Put's durability record —
+	// before it can cross the fence and be applied or published.
+	fj.Program(storeio.JournalFaultPlan{
+		Phase: storeio.JournalFaultENOSPCAppend, AppendIndex: fj.Appends(),
+	})
 	if created, err := collection.Put(key, after); created || err == nil {
 		t.Fatalf("rejected replacement = (%v, %v), want false and failure", created, err)
+	}
+	if !fj.Faulted() {
+		t.Fatal("programmed journal append fault never fired")
 	}
 	persistErr := collection.PersistenceError()
 	if persistErr == nil {
@@ -204,7 +224,30 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 			generation, durableGeneration,
 		)
 	}
-	if err := collection.Close(); !errors.Is(err, persistErr) {
-		t.Fatalf("Close after sync failure = %v, want %v", err, persistErr)
+	// The journal poison is die-don't-retry: every later mutation is refused with
+	// the sticky error rather than retried against an uncertain journal.
+	if _, err := collection.Put(key, after); !errors.Is(err, persistErr) {
+		t.Fatalf("mutation after sync failure = %v, want sticky %v", err, persistErr)
+	}
+	// Close, by contrast, succeeds. The failed append never published, so the
+	// last-admitted immutable view the poison preserved is the durable baseline;
+	// Close checkpoints exactly that and recycles the journal. A reopen must find
+	// the baseline and none of the rejected mutation.
+	if err := collection.Close(); err != nil {
+		t.Fatalf("Close after sync failure = %v, want clean checkpoint of the baseline", err)
+	}
+	reopenedFile, err := os.OpenFile(file.Name(), os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedFile.Close()
+	reopened, err := Open(reopenedFile, options)
+	if err != nil {
+		t.Fatalf("reopen after sync failure: %v", err)
+	}
+	defer reopened.Close()
+	if got, found, err := reopened.AppendRaw(nil, key); err != nil || !found ||
+		string(got) != string(before) {
+		t.Fatalf("reopened value = (%q, %v, %v), want durable baseline %q", got, found, err, before)
 	}
 }

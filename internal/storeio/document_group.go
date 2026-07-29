@@ -18,9 +18,10 @@ const (
 	DocumentGroupChunkSize         = 16
 	DocumentGroupRecordSize        = 16
 
-	documentGroupVersion    = DevelopmentFormatVersion
-	documentGroupKnownFlags = DocumentGroupFlagFloat64Sidecar |
-		documentGroupFloat64OrderMask | documentGroupFloat64LogicalHighMask
+	documentGroupVersion = DevelopmentFormatVersion
+	// The compact document-group payload the ordered-primary leaf embeds carries
+	// no header flags; the chunk float64 sidecar that once defined them is gone.
+	documentGroupKnownFlags    = 0
 	documentGroupShortLiteral  = byte(0x80)
 	documentGroupLongLiteral   = byte(0xff)
 	documentGroupMaxDictionary = int(documentGroupShortLiteral)
@@ -50,13 +51,11 @@ type DocumentGroupRecord struct {
 }
 
 // DocumentGroupChunk is one ordinary stable-slot chunk inside a larger
-// immutable physical extent. Columns uses the same chunk-local, column-major
-// representation as DocumentPage.
+// immutable physical extent.
 type DocumentGroupChunk struct {
 	ChunkID uint32
 	Live    uint64
 	Rows    []DocumentGroupRecord
-	Columns DocumentFloat64Columns
 }
 
 // DocumentGroupHeader identifies one immutable compact-generation group.
@@ -104,66 +103,6 @@ type documentGroupLayout struct {
 	columnBytes           int
 	decodedBytes          uint64
 	payloadBytes          int
-}
-
-// DocumentGroupSize returns the exact physical bytes required for chunks in a
-// page of the requested allocation quantum. It returns ok=false when grouping
-// is invalid or cannot beat representational bounds. The result is rounded to
-// a power-of-two physical extent; callers may compare it with independent
-// document pages before choosing the grouped representation.
-func DocumentGroupSize(chunks []DocumentGroupChunk, allocationQuantum uint32, workspace *DocumentGroupWorkspace) (size uint32, ok bool) {
-	layout, err := planDocumentGroup(chunks, workspace)
-	if err != nil || !validPhysicalPageSize(allocationQuantum) {
-		return 0, false
-	}
-	required := uint64(PageHeaderSize + layout.payloadBytes + PageTrailerSize)
-	size64 := uint64(allocationQuantum)
-	for size64 < required {
-		size64 <<= 1
-		if size64 > math.MaxUint32 {
-			return 0, false
-		}
-	}
-	if !validPhysicalPageSize(uint32(size64)) {
-		return 0, false
-	}
-	return uint32(size64), true
-}
-
-// EncodeDocumentGroup writes consecutive stable-slot chunks into one exact,
-// independently checksummed extent. Repeated structural bytes are stored once
-// per page template; repeated complete leaf spellings use a bounded dictionary.
-// Literal leaves remain byte-for-byte exact. Keys and any co-located typed
-// columns stay directly addressable. A compact bulk generation may instead
-// set DocumentGroupFlagFloat64Sidecar and store columns in the adjacent
-// column-major extent derived from the group PageRef.
-func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []DocumentGroupChunk, nextLogicalID uint64, workspace *DocumentGroupWorkspace) ([]byte, error) {
-	layout, err := planDocumentGroup(chunks, workspace)
-	if err != nil {
-		return nil, err
-	}
-	if workspace == nil {
-		return nil, fmt.Errorf("%w: nil document-group workspace", ErrInvalidWrite)
-	}
-	if err := validateDocumentGroupHeader(header, layout, chunks, nextLogicalID); err != nil {
-		return nil, err
-	}
-	payload, err := InitPage(dst, PageHeader{
-		StoreID: header.StoreID, Generation: header.Generation, LogicalID: header.LogicalID,
-		PageSize: header.PageSize, PayloadLength: uint32(layout.payloadBytes), Kind: PageDocumentGroup,
-		Flags: uint8(header.Flags),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := writeDocumentGroupPayload(payload, header, chunks, workspace, layout); err != nil {
-		return nil, err
-	}
-	page := dst[:int(header.PageSize)]
-	if _, err := sealInitializedPage(page); err != nil {
-		return nil, err
-	}
-	return page, nil
 }
 
 // writeDocumentGroupPayload writes the exact grouped payload — directory,
@@ -290,20 +229,8 @@ func writeDocumentGroupPayload(payload []byte, header DocumentGroupHeader, chunk
 	if cursor != columnStart {
 		return fmt.Errorf("%w: dictionary section length drift", ErrInvalidWrite)
 	}
-	for _, chunk := range chunks {
-		for column, mask := range chunk.Columns.Masks {
-			binary.LittleEndian.PutUint64(payload[cursor:cursor+8], mask)
-			cursor += 8
-			base := column * 64
-			for slots := mask; slots != 0; slots &= slots - 1 {
-				slot := bits.TrailingZeros64(slots)
-				binary.LittleEndian.PutUint64(payload[cursor:cursor+8], math.Float64bits(chunk.Columns.Values[base+slot]))
-				cursor += 8
-			}
-		}
-	}
 	if cursor != len(payload) {
-		return fmt.Errorf("%w: column section length drift", ErrInvalidWrite)
+		return fmt.Errorf("%w: payload section length drift", ErrInvalidWrite)
 	}
 	return nil
 }
@@ -328,14 +255,11 @@ func planDocumentGroup(chunks []DocumentGroupChunk, workspace *DocumentGroupWork
 	workspace.dictionary = workspace.dictionary[:0]
 
 	firstChunk := chunks[0].ChunkID
-	columnCount := len(chunks[0].Columns.Masks)
+	columnCount := 0
 	recordIndex := 0
 	for chunkOrdinal, chunk := range chunks {
 		if chunk.ChunkID != firstChunk+uint32(chunkOrdinal) || chunk.Live == 0 ||
-			len(chunk.Rows) != bits.OnesCount64(chunk.Live) ||
-			len(chunk.Columns.Masks) != columnCount ||
-			columnCount == 0 && len(chunk.Columns.Values) != 0 ||
-			columnCount != 0 && len(chunk.Columns.Values) != columnCount*64 {
+			len(chunk.Rows) != bits.OnesCount64(chunk.Live) {
 			return layout, fmt.Errorf("%w: document-group chunk shape", ErrInvalidWrite)
 		}
 		live := chunk.Live
@@ -381,19 +305,6 @@ func planDocumentGroup(chunks []DocumentGroupChunk, workspace *DocumentGroupWork
 			}
 			recordIndex++
 			live &= live - 1
-		}
-		for column, mask := range chunk.Columns.Masks {
-			if mask&^chunk.Live != 0 {
-				return layout, fmt.Errorf("%w: document-group column mask", ErrInvalidWrite)
-			}
-			layout.columnBytes += 8 + bits.OnesCount64(mask)*8
-			base := column * 64
-			for slots := mask; slots != 0; slots &= slots - 1 {
-				value := chunk.Columns.Values[base+bits.TrailingZeros64(slots)]
-				if math.IsNaN(value) || math.IsInf(value, 0) {
-					return layout, fmt.Errorf("%w: document-group non-finite column", ErrInvalidWrite)
-				}
-			}
 		}
 	}
 	if recordIndex == 0 || recordIndex > math.MaxUint16 || columnCount > math.MaxUint16 {
@@ -456,7 +367,6 @@ func validateDocumentGroupHeader(header DocumentGroupHeader, layout documentGrou
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
 		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
 		!validPhysicalPageSize(header.PageSize) || header.Flags&^documentGroupKnownFlags != 0 ||
-		header.Flags&DocumentGroupFlagFloat64Sidecar != 0 && layout.columns != 0 ||
 		header.FirstChunk != chunks[0].ChunkID ||
 		int(header.ChunkCount) != layout.chunks || int(header.RowCount) != layout.rows ||
 		int(header.ColumnCount) != layout.columns ||
@@ -623,8 +533,12 @@ func AdmittedDocumentGroup(src []byte) DocumentGroupView {
 	}
 }
 
+// openDocumentGroupPayload validates a document-group payload and builds a view
+// over it. It is the payload-decoder half shared by the ordered-primary compact
+// leaf's embedded open path; the deleted chunk page container was its only other
+// caller, so it no longer checks a page kind (an embedded payload has none).
 func openDocumentGroupPayload(pageHeader PageHeader, payload []byte, chunkHighWater uint32, nextLogicalID uint64) (DocumentGroupView, error) {
-	if pageHeader.Kind != PageDocumentGroup || len(payload) < DocumentGroupPayloadHeaderSize ||
+	if len(payload) < DocumentGroupPayloadHeaderSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != documentGroupVersion ||
 		binary.LittleEndian.Uint16(payload[56:58]) != DocumentGroupRecordSize ||
 		binary.LittleEndian.Uint16(payload[58:60]) != DocumentGroupChunkSize ||
@@ -640,8 +554,6 @@ func openDocumentGroupPayload(pageHeader PageHeader, payload []byte, chunkHighWa
 	if chunkCount < 2 || rowCount == 0 || templateCount == 0 ||
 		dictionaryCount > documentGroupMaxDictionary || flags&^documentGroupKnownFlags != 0 ||
 		uint16(pageHeader.Flags) != flags ||
-		flags&DocumentGroupFlagFloat64Sidecar != 0 &&
-			binary.LittleEndian.Uint16(payload[44:46]) != 0 ||
 		pageHeader.LogicalID <= StateRootLogicalID || pageHeader.LogicalID >= nextLogicalID ||
 		uint64(firstChunk)+uint64(chunkCount) > uint64(chunkHighWater) {
 		return DocumentGroupView{}, fmt.Errorf("%w: identity or counts", ErrDocumentGroupCorrupt)
@@ -936,11 +848,6 @@ func (v DocumentGroupChunkView) Live() uint64 { return v.live }
 // Len returns the live row count.
 func (v DocumentGroupChunkView) Len() int { return v.count }
 
-// Float64ColumnCount returns the number of group-local typed covers.
-func (v DocumentGroupChunkView) Float64ColumnCount() int {
-	return int(v.group.header.ColumnCount)
-}
-
 // DocumentGroupRecordView is a borrowed key plus exact decoded-length
 // descriptor. AppendJSON materializes its JSON into caller storage.
 type DocumentGroupRecordView struct {
@@ -1223,27 +1130,6 @@ func (v DocumentGroupChunkView) LookupString(slot uint8, key string) (DocumentGr
 	return record, ok && string(record.Key) == key
 }
 
-// Float64Column returns one borrowed typed covering column for this logical
-// chunk. It shares DocumentPage's iterator representation.
-func (v DocumentGroupChunkView) Float64Column(column int) (DocumentFloat64ColumnView, bool) {
-	if column < 0 || column >= int(v.group.header.ColumnCount) {
-		return DocumentFloat64ColumnView{}, false
-	}
-	cursor := v.columnStart
-	for current := 0; current < int(v.group.header.ColumnCount); current++ {
-		mask := binary.LittleEndian.Uint64(v.group.payload[cursor : cursor+8])
-		cursor += 8
-		valueBytes := bits.OnesCount64(mask) * 8
-		if current == column {
-			return DocumentFloat64ColumnView{
-				mask: mask, values: v.group.payload[cursor : cursor+valueBytes : cursor+valueBytes],
-			}, true
-		}
-		cursor += valueBytes
-	}
-	return DocumentFloat64ColumnView{}, false
-}
-
 // --- Ordered-primary compact-leaf embedding support ---
 //
 // A compact primary leaf embeds a document-group payload (produced by
@@ -1299,9 +1185,9 @@ func openDocumentGroupEmbeddedPayload(payload []byte, storeID [16]byte, generati
 	firstChunk := binary.LittleEndian.Uint32(payload[4:8])
 	header := PageHeader{
 		StoreID: storeID, Generation: generation, LogicalID: logicalID,
-		PageSize: uint32(len(payload)) + PageHeaderSize + PageTrailerSize,
-		Kind:     PageDocumentGroup, PayloadLength: uint32(len(payload)),
-		Flags: uint8(binary.LittleEndian.Uint16(payload[46:48])),
+		PageSize:      uint32(len(payload)) + PageHeaderSize + PageTrailerSize,
+		PayloadLength: uint32(len(payload)),
+		Flags:         uint8(binary.LittleEndian.Uint16(payload[46:48])),
 	}
 	highWater := uint64(firstChunk) + chunkCount
 	if highWater > uint64(^uint32(0)) {

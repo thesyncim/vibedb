@@ -745,7 +745,7 @@ func TestSegmentedTabletRouterRejectsCorruption(t *testing.T) {
 		{
 			name: "root-leaf-kind",
 			edit: func(root, _, _ []byte) {
-				root[16] = byte(PageDocument)
+				root[16] = byte(PageOverflow)
 			},
 			sealRoot: true, sealPage: -1,
 		},
@@ -1006,9 +1006,9 @@ func TestSegmentedTabletRouterRejectsInvalidWrites(t *testing.T) {
 		refs[0].Kind = PagePrimaryAnchor
 	})
 	t.Run("wrong-leaf-kind", func(t *testing.T) {
-		header.LeafKind = PageDocument
+		header.LeafKind = PageOverflow
 		for rank := range leaves {
-			leaves[rank].Ref.Kind = PageDocument
+			leaves[rank].Ref.Kind = PageOverflow
 		}
 		if err := encode(); err == nil {
 			t.Fatal("non-primary leaf kind accepted")

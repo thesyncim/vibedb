@@ -72,7 +72,7 @@ func openMutationBenchCollection(
 	if err != nil {
 		b.Fatal(err)
 	}
-	if _, err := CreateFrom(source, file, options); err != nil {
+	if _, err := CreateFromPrimary(source, file, options); err != nil {
 		_ = file.Close()
 		b.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func BenchmarkFileStoreCreateFromFloor(b *testing.B) {
 		if openErr != nil {
 			b.Fatal(openErr)
 		}
-		size, buildErr := CreateFrom(source, file, options)
+		size, buildErr := CreateFromPrimary(source, file, options)
 		if buildErr != nil {
 			b.Fatal(buildErr)
 		}

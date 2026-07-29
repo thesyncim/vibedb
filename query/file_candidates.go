@@ -20,26 +20,14 @@ func (p *plan) fileCandidateMasks(snapshot *durable.Snapshot, index *durable.Ind
 	if err := w.checkCanceled(); err != nil {
 		return nil, err
 	}
-	// Durable has one of the two optional capabilities. Its chunks carry
-	// per-chunk summaries in the chunk-directory leaves
-	// (store/durable/store_file_zone.go), so the block-pruning tier is offered.
-	// A live-row universe is not: materializing it would mean reading every
-	// document page, which is real I/O rather than the metadata read a NOT
-	// needs it to be, so durable still declines NOT.
-	//
-	// The summary capability is stated as the bare *durable.Snapshot rather
-	// than the QuerySnapshot below it, and that is load-bearing rather than
-	// tidy. sourceCaps.zone is an interface field, so whatever goes in it is
-	// converted; a single pointer converts in place, while the five-pointer
-	// QuerySnapshot has to be copied to the heap to be boxed — the same
-	// 48-byte allocation per execution that removing the `any(snapshot)`
-	// assertion from the generic planner was meant to eliminate. Probing a
-	// summary needs neither the I/O workspace nor the stats accumulators
-	// QuerySnapshot exists to carry, so nothing is lost by handing over the
-	// narrower type. See sourceCaps.
+	// Durable offers neither optional capability: the ordered primary graph
+	// carries no block-pruning summaries, and a live-row universe would mean
+	// reading every document page — real I/O rather than the metadata read a
+	// NOT needs it to be — so durable declines NOT. Candidate generation runs
+	// from the declared index catalog alone.
 	masks, _, err := snapshotCandidateMasks(
 		p, durable.QuerySnapshot{Snapshot: snapshot, Workspace: index},
-		sourceCaps{zone: snapshot}, w, false)
+		sourceCaps{}, w, false)
 	if err == nil {
 		err = w.checkCanceled()
 	}
@@ -147,9 +135,8 @@ func (p *plan) fileExactCandidateMasksLoaded(
 		Snapshot: snapshot, Workspace: index,
 		Rechecks: &rechecks, Certificates: &certificates, PostingPages: &postingPages,
 	}
-	// requireExact rules the chunk-summary tier out anyway (a zone mask is a
-	// superset, and this lane consumes masks as final answers), and durable has
-	// no live-mask source either, so no capabilities are offered here at all.
+	// This lane consumes masks as final answers, and durable has no live-mask
+	// source, so no capabilities are offered here at all.
 	masks, bounded, exact, err := candidatesFor(p.where, qs, sourceCaps{}, p.valuePaths, w.storeIndexes, w, true)
 	if err != nil {
 		return nil, rechecks, certificates, postingPages, true, err

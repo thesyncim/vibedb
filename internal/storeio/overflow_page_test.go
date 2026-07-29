@@ -107,7 +107,7 @@ func TestOverflowPageRejectsInvalidAndCorrupt(t *testing.T) {
 		func(h *OverflowPageHeader, _ *[]byte) { h.Total = 4 },
 		func(h *OverflowPageHeader, _ *[]byte) { h.Offset = 8 },
 		func(h *OverflowPageHeader, _ *[]byte) { h.Next.LogicalID = h.LogicalID },
-		func(h *OverflowPageHeader, _ *[]byte) { h.Next.Kind = PageDocument },
+		func(h *OverflowPageHeader, _ *[]byte) { h.Next.Kind = PagePrimaryLeaf },
 		func(_ *OverflowPageHeader, data *[]byte) { *data = nil },
 	} {
 		header := valid

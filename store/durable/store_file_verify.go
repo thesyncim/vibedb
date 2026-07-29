@@ -291,25 +291,8 @@ func (w *verifyWalker) openAndCheckIdentity(
 // publishes and the immutable page-catalog run. The primary root's subtree is
 // walked separately by walkPrimary.
 func (w *verifyWalker) walkStateRefs() {
-	refs := []struct {
-		ref  storeio.PageRef
-		kind string
-	}{
-		{w.root.ChunkDirectory, "chunk-directory"},
-		{w.root.KeyDirectory, "key-directory"},
-		{w.root.IndexDirectory, "index-directory"},
-		{w.root.Float64ScanHead, "float64-scan"},
-		{w.root.IndexGroupHead, "index-group"},
-	}
-	for _, r := range refs {
-		if r.ref == (storeio.PageRef{}) {
-			continue
-		}
-		w.record(r.ref, r.kind)
-		if _, ok := w.openAndCheckIdentity(r.ref, r.kind); ok {
-			w.count(r.kind)
-		}
-	}
+	// The chunk/fingerprint root slots are gone; the ordered-primary graph and
+	// its exact-index root are walked by walkPrimary and walkExactIndexes.
 	w.walkPageCatalog()
 }
 

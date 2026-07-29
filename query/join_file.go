@@ -686,10 +686,8 @@ func (j *planJoin) collectFile(
 
 	// The inner side plans its candidates through the same durable entry point
 	// the driving side uses, rather than calling the generic planner directly.
-	// That is what gives the inner scan the chunk-summary pruning tier and the
-	// narrow *durable.Snapshot capability statement for free — sourceCaps.zone
-	// is an interface field, and handing it the five-pointer QuerySnapshot
-	// instead of the bare snapshot would heap-box a copy once per bind.
+	// The inner scan resolves candidates from the declared index catalog,
+	// bounded by the join's remaining work budget.
 	remaining := int64(^uint64(0) >> 1)
 	if workBudget != nil {
 		remaining = workBudget.remaining()

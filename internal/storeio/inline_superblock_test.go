@@ -424,24 +424,6 @@ func TestInlineFreeDeltaValidatesAnchorsAndLiveExtents(t *testing.T) {
 	}
 
 	root = testInlineFreeSuperblock(7, 16)
-	root.State.IndexGroupHead = PageRef{
-		Offset: 4 * pageSize, LogicalID: 4, Generation: 6,
-		Length: 2 * testSuperblockPageSize, Kind: PageIndexGroupCatalog,
-	}
-	root.FreeDelta = NewInlineFreeDelta(PageRef{
-		Offset: 5 * pageSize, LogicalID: 8, Generation: 6,
-		Length: testSuperblockPageSize, Kind: PageFreeDelta,
-	}, PageRef{})
-	if _, err := EncodeInlineSuperblock(encoded[:], root); !errors.Is(err, ErrInvalidWrite) {
-		t.Fatalf("anchor overlapping second state page = %v, want %v", err, ErrInvalidWrite)
-	}
-	root.FreeDelta.externalPrev.Offset = 7 * pageSize
-	root.FreeDelta.externalPrev.LogicalID = root.State.IndexGroupHead.LogicalID
-	if _, err := EncodeInlineSuperblock(encoded[:], root); !errors.Is(err, ErrInvalidWrite) {
-		t.Fatalf("anchor logical collision = %v, want %v", err, ErrInvalidWrite)
-	}
-
-	root = testInlineFreeSuperblock(7, 16)
 	catalogCapacity, ok := pageCatalogSegmentDataCapacity(root.PageSize)
 	if !ok {
 		t.Fatal("catalog segment geometry")
@@ -700,61 +682,6 @@ func TestRecoverInlineFreeDeltaValidatesIndexOnlyAnchor(t *testing.T) {
 	got, _, slot, err = RecoverInlineStateRoot(file, testSuperblockPageSize, scratch)
 	if err != nil || got != root1 || slot != 0 {
 		t.Fatalf("corrupt index-only fallback = (%+v,%d,%v)", got, slot, err)
-	}
-}
-
-func TestRecoverInlineStateRootFallsBackOnReferencedPageCorruption(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "inline-superblock-semantic-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-
-	root1 := testInlineSuperblock(1)
-	root2 := testInlineSuperblock(2)
-	root2.FileEnd = 6 * uint64(testSuperblockPageSize)
-	root2.State.NextLogicalID = 4
-	root2.State.DocumentCount = 1
-	root2.State.ChunkHighWater = 1
-	root2.State.LiveChunks = 1
-	root2.State.ChunkDirectory = PageRef{
-		Offset: 4 * uint64(testSuperblockPageSize), LogicalID: 2,
-		Generation: 2, Length: testSuperblockPageSize, Kind: PageChunkDirectory,
-	}
-	root2.State.KeyDirectory = PageRef{
-		Offset: 5 * uint64(testSuperblockPageSize), LogicalID: 3,
-		Generation: 2, Length: testSuperblockPageSize, Kind: PageKeyDirectory,
-	}
-	first := encodeTestInlineSuperblock(t, root1)
-	second := encodeTestInlineSuperblock(t, root2)
-	writeInlineRootPage(t, file, 0, first[:])
-	writeInlineRootPage(t, file, 1, second[:])
-	for _, ref := range []PageRef{root2.State.ChunkDirectory, root2.State.KeyDirectory} {
-		page := make([]byte, testSuperblockPageSize)
-		payload, err := InitPage(page, PageHeader{
-			StoreID: testStoreID, Generation: ref.Generation, LogicalID: ref.LogicalID,
-			PageSize: ref.Length, PayloadLength: 0, Kind: ref.Kind,
-		})
-		if err != nil || len(payload) != 0 {
-			t.Fatalf("InitPage = (%d,%v)", len(payload), err)
-		}
-		if _, err := sealInitializedPage(page); err != nil {
-			t.Fatal(err)
-		}
-		writeAtTest(t, file, page, int64(ref.Offset))
-	}
-
-	scratch := make([]byte, testSuperblockPageSize)
-	got, _, slot, err := RecoverInlineStateRoot(file, testSuperblockPageSize, scratch)
-	if err != nil || got != root2 || slot != 1 {
-		t.Fatalf("recover newest = (%+v,%d,%v)", got, slot, err)
-	}
-
-	one := []byte{0}
-	writeAtTest(t, file, one, int64(root2.State.KeyDirectory.Offset))
-	got, _, slot, err = RecoverInlineStateRoot(file, testSuperblockPageSize, scratch)
-	if err != nil || got != root1 || slot != 0 {
-		t.Fatalf("semantic fallback = (%+v,%d,%v)", got, slot, err)
 	}
 }
 

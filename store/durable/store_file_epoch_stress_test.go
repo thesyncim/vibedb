@@ -55,7 +55,6 @@ func TestFilePrimaryReadEpochStress(t *testing.T) {
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 64 << 20,
 		Durability:               DurabilityBufferedVisible,
-		DisableMutationCombining: true,
 	}
 	file := createPrimaryPointFile(t, built, options, "epoch-stress.vibe")
 	collection, err := Open(file, options)

@@ -47,7 +47,7 @@ func durableScanCorpus(tb testing.TB, n int) *durable.Snapshot {
 		}
 	}
 	options := durable.Options{Collection: store.Options{ChunkDocuments: 64}}
-	if _, err := durable.CreateFrom(source, file, options); err != nil {
+	if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
 		tb.Fatal(err)
 	}
 	fs, err := durable.Open(file, options)

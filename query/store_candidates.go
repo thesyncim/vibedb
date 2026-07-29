@@ -16,10 +16,10 @@ func (p *plan) storeCandidateMasks(snapshot store.Snapshot, w *Workspace) ([]sto
 }
 
 func (p *plan) storeCandidateMasksMode(snapshot store.Snapshot, w *Workspace, requireExact bool) ([]store.Mask, bool, error) {
-	// A heap Snapshot carries chunk summaries and can materialize its live-row
-	// universe, so it is its own zone and live-mask source. Both are stated
-	// here, where the type is concrete and the compiler checks them, rather than
-	// discovered by assertion inside the generic planner; see sourceCaps.
+	// A heap Snapshot can materialize its live-row universe, so it is its own
+	// live-mask source. The capability is stated here, where the type is concrete
+	// and the compiler checks it, rather than discovered by assertion inside the
+	// generic planner; see sourceCaps.
 	return snapshotCandidateMasks(
-		p, snapshot, sourceCaps{zone: snapshot, live: snapshot}, w, requireExact)
+		p, snapshot, sourceCaps{live: snapshot}, w, requireExact)
 }

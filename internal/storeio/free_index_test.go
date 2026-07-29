@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+const (
+	testFreeIndexNextLogicalID = uint64(100)
+	testFreeIndexFileEnd       = uint64(32 * testSuperblockPageSize)
+)
+
 func testFreeSegment(logicalID, page, first, largest uint64, count uint32) FreeSegment {
 	return FreeSegment{
 		Ref:         testFreeImageRef(logicalID, page, 9),
@@ -26,11 +31,11 @@ func TestFreeIndexPageRoundTrip(t *testing.T) {
 	prev := testFreeIndexRef(59, 19, 8)
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeFreeIndexPage(
-		page, header, segments, prev, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		page, header, segments, prev, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenFreeIndexPage(encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+	view, err := OpenFreeIndexPage(encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +130,7 @@ func TestFreeIndexEncodeRejectsMalformedSegments(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := EncodeFreeIndexPage(page, testFreeLogHeader(60), c.segments, c.prev,
-				testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID); err == nil {
+				testFreeIndexFileEnd, testFreeIndexNextLogicalID); err == nil {
 				t.Fatal("accepted")
 			}
 		})
@@ -144,12 +149,12 @@ func TestFreeIndexRejectsSelfReferencingPage(t *testing.T) {
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := EncodeFreeIndexPage(page, header,
 		[]FreeSegment{testFreeSegment(40, 20, 4, 2, 3)}, self,
-		testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID)
+		testFreeIndexFileEnd, testFreeIndexNextLogicalID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenFreeIndexPage(
-		encoded, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID,
+		encoded, testFreeIndexFileEnd, testFreeIndexNextLogicalID,
 	); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("self-referencing index page accepted: %v", err)
 	}

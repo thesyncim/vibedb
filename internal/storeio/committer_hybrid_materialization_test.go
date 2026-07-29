@@ -50,7 +50,7 @@ func TestCommitterHybridMaterializationMergesFullPagesAndPatches(t *testing.T) {
 	payload, err := InitPage(full, PageHeader{
 		StoreID: testStoreID, Generation: 2, LogicalID: 8,
 		PageSize: uint32(pageSize), PayloadLength: 32,
-		Kind: PageChunkDirectory,
+		Kind: PageOverflow,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestCommitterHybridMaterializationMergesFullPagesAndPatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := batch.stageMaterializationPage(
-		0, int64(fullOffset), pageSize, PageChunkDirectory,
+		0, int64(fullOffset), pageSize, PageOverflow,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestCommitterHybridMaterializationRejectsUnjournaledOldPage(t *testing.T) {
 		// A full write born before the publication generation is an
 		// unjournaled canonical overwrite and must be rejected.
 		Generation: 1, LogicalID: 8,
-		PageSize: uint32(pageSize), Kind: PageChunkDirectory,
+		PageSize: uint32(pageSize), Kind: PageOverflow,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestCommitterHybridMaterializationRejectsUnjournaledOldPage(t *testing.T) {
 	}
 	if err := batch.stageMaterializationPage(
 		0, int64(fixture.ref.Offset-uint64(pageSize)), pageSize,
-		PageChunkDirectory,
+		PageOverflow,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestHybridWriteTransactionPublishesCOWAndCanonicalPatchTogether(t *testing.
 	if err := tx.SealMaterializationJournal(); err != nil {
 		t.Fatal(err)
 	}
-	page, err := tx.Allocate(PageChunkDirectory, uint32(pageSize), 0)
+	page, err := tx.Allocate(PageOverflow, uint32(pageSize), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestHybridWriteTransactionPublishesCOWAndCanonicalPatchTogether(t *testing.
 		StoreID: testStoreID, Generation: 2,
 		LogicalID: page.Ref().LogicalID,
 		PageSize:  uint32(pageSize), PayloadLength: 16,
-		Kind: PageChunkDirectory,
+		Kind: PageOverflow,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -376,14 +376,14 @@ func TestHybridWriteTransactionFailedPublishCannotConsumeCapacity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := tx.Allocate(PageChunkDirectory, pageSize, 0)
+	page, err := tx.Allocate(PageOverflow, pageSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := InitPage(page.Bytes(), PageHeader{
 		StoreID: testStoreID, Generation: 2,
 		LogicalID: page.Ref().LogicalID, PageSize: pageSize,
-		Kind: PageChunkDirectory,
+		Kind: PageOverflow,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestHybridWriteTransactionFailedPublishCannotConsumeCapacity(t *testing.T) 
 	wantReusable := slices.Clone(reusable)
 	wantEdits := slices.Clone(tx.ReuseEdits())
 	if _, err := tx.Allocate(
-		PageChunkDirectory, pageSize, 0,
+		PageOverflow, pageSize, 0,
 	); !errors.Is(err, ErrTooManyPages) {
 		t.Fatalf("Allocate after failed publication = %v, want %v", err, ErrTooManyPages)
 	}

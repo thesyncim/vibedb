@@ -28,8 +28,8 @@ func newMaterializationJournalFixture(tb testing.TB, sequence uint64) materializ
 		after:  make([][]byte, 2),
 	}
 	refs := [2]PageRef{
-		{Offset: 4 * 4096, LogicalID: 7, Generation: 11, Length: 4096, Kind: PageDocument},
-		{Offset: 5 * 4096, LogicalID: 8, Generation: 12, Length: 4096, Kind: PageDocument},
+		{Offset: 4 * 4096, LogicalID: 7, Generation: 11, Length: 4096, Kind: PageOverflow},
+		{Offset: 5 * 4096, LogicalID: 8, Generation: 12, Length: 4096, Kind: PageOverflow},
 	}
 	for rank, ref := range refs {
 		before := makeMaterializationTestPage(tb, storeID, ref, byte(0x30+rank))

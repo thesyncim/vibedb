@@ -173,8 +173,7 @@ func asPGError(err error) *pgError {
 		errors.Is(err, store.ErrCheckpointTooLarge) ||
 		errors.Is(err, durable.ErrBatchTooLarge) ||
 		errors.Is(err, durable.ErrDocumentTooLarge) ||
-		errors.Is(err, durable.ErrKeyTooLarge) ||
-		errors.Is(err, durable.ErrStoreDocumentPageTooLarge) {
+		errors.Is(err, durable.ErrKeyTooLarge) {
 		return newError(sqlstateProgramLimitExceeded, err.Error())
 	}
 	switch {

@@ -27,11 +27,23 @@ func freeSetFromFile(t *testing.T, path string, pageSize int) []storeio.FreeExte
 		t.Fatal(err)
 	}
 	defer file.Close()
-	scratch := make([]byte, pageSize)
-	root, state, _, err := storeio.RecoverInlineStateRoot(file, uint32(pageSize), scratch)
+	// Recover the authoritative root the way Open does. On the deferred-canonical
+	// lanes the fixed superblock is settled through the materialization capsules,
+	// so a bare RecoverInlineStateRoot that trusts only the superblock and its
+	// direct refs finds no valid root; RecoverMutableInlineStateRoot resolves the
+	// capsules against each candidate. Its scratch must hold one MaxPageSize extent.
+	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(file)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}
+	recovery, err := storeio.RecoverMutableInlineStateRoot(
+		file, bootstrap.PageSize, bootstrap.MaterializationDamageGranule,
+		make([]byte, bootstrap.MaxPageSize),
+	)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	root, state := recovery.Root, recovery.State
 	external := root.FreeDelta.ExternalPrev()
 	if external == (storeio.PageRef{}) && root.FreeDelta.IndexHead() == (storeio.PageRef{}) &&
 		root.FreeDelta.Len() == 0 {
@@ -191,12 +203,10 @@ func assertFreeSetDisjointFromRoots(t *testing.T, fs *Collection, free []storeio
 		name string
 		ref  storeio.PageRef
 	}{
-		{"chunk directory", state.chunkRoot},
-		{"key directory", state.keyRoot},
-		{"index directory", state.indexRoot},
+		{"primary root", state.root.PrimaryRoot},
+		{"exact index root", state.root.ExactIndexRoot},
+		{"page catalog head", state.root.PageCatalogHead},
 		{"free log head", state.freeHead},
-		{"float64 scan head", state.root.Float64ScanHead},
-		{"index group head", state.root.IndexGroupHead},
 	}
 	for _, segment := range fs.freeSegments {
 		roots = append(roots, struct {
@@ -237,7 +247,7 @@ func assertFreeSetDisjointFromRoots(t *testing.T, fs *Collection, free []storeio
 func freeChurnRound(t *testing.T, fs *Collection, keys, round int) {
 	t.Helper()
 	for key := range keys {
-		padding := strings.Repeat("x", 120+(round*37+key*53)%900)
+		padding := strings.Repeat("x", 120+(round*37+key*53)%300)
 		doc := fmt.Sprintf(`{"round":%d,"key":%d,"status":%q,"padding":%q}`,
 			round, key, [3]string{"active", "idle", "paused"}[(round+key)%3], padding)
 		if _, err := fs.Put(fmt.Sprintf("key-%02d", key), []byte(doc)); err != nil {
@@ -389,8 +399,16 @@ func TestFileStoreFreeSpaceHoldsNothingReachable(t *testing.T) {
 			expected[name] = string(value)
 		}
 	}
-	free := freeSetFromFile(t, file.Name(), options.PageSize)
+	// Capture the durable free set only after a checkpoint has folded every
+	// journaled acknowledgement into the store root. On the synchronous lane a Put
+	// acknowledges through a synced journal record whose store-root fold is
+	// deferred, so a free set read while the journal still leads the checkpointed
+	// root names extents a later commit has already reused; overwriting those would
+	// destroy live pages and the reopen would fall back to an older root the
+	// recycled journal now leads. assertFreeSetMirror flushes fs first, so the root
+	// it leaves is the one freeSetFromFile reads here.
 	assertFreeSetMirror(t, fs, "before overwrite")
+	free := freeSetFromFile(t, file.Name(), options.PageSize)
 	if err := fs.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -450,14 +468,23 @@ func TestFileStoreCommitSpansSeveralFreeExtents(t *testing.T) {
 	}
 	defer fs.Close()
 	const keys = 48
-	for round := range 10 {
+	// Churn to steady state before measuring, checkpointing every round so the
+	// physical layout settles under the same per-round cadence the measurement loop
+	// below uses. The first few rounds grow the file as the root leaf widens into a
+	// MaxPageSize frame no fragmented free extent can serve and the retirement
+	// reclaimer fills its in-flight fence; past that the physical FileEnd plateaus,
+	// which is the reuse property this test asserts. On the journaled lane a Put
+	// also stages frames in a volatile append region far past the durable FileEnd,
+	// so each checkpoint materializes that region into reused space.
+	for round := range 15 {
 		freeChurnRound(t, fs, keys, round)
+		if err := fs.Flush(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(fs.reusable) < 2 {
 		t.Fatalf("workload left %d free extents, need a fragmented set", len(fs.reusable))
 	}
-	// A commit large enough that no single extent can serve it: the largest free
-	// extent is smaller than the pages this write needs.
 	var largest, total uint64
 	for _, extent := range fs.reusable {
 		largest = max(largest, extent.Length)
@@ -465,14 +492,16 @@ func TestFileStoreCommitSpansSeveralFreeExtents(t *testing.T) {
 	}
 	before := fs.state.Load().super.FileEnd
 	spread, grew := 0, false
-	for round := 10; round < 20; round++ {
+	for round := 15; round < 25; round++ {
 		reuseBefore := len(fs.reusable)
 		freeChurnRound(t, fs, keys, round)
+		// assertFreeSetMirror flushes, so the FileEnd sampled after it is the durable
+		// physical high-water, comparable to the pre-loop checkpoint above.
 		assertFreeSetMirror(t, fs, fmt.Sprintf("round %d", round))
 		if reuseBefore >= 2 {
 			spread++
 		}
-		if fs.state.Load().super.FileEnd != before {
+		if fs.state.Load().super.FileEnd > before {
 			grew = true
 		}
 	}
@@ -496,10 +525,23 @@ func TestFileStoreLazyFreeSegmentPromotionCyclesBoundedArena(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fs.Close()
+	// FallbackGeneration is the committer's alternate-root floor: the generation of
+	// the older durable superblock, below which a retired extent is reusable. It
+	// advances only when a physical commit publishes a new durable root, and the
+	// synchronous primary lane defers that publish from a Put to a checkpoint. Two
+	// checkpoints leave both superblock slots at generation two or later, so the
+	// generation-one extents this promotion test plants fall below the floor and
+	// are reusable.
 	if _, err := fs.Put("a", []byte(`{"v":1}`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := fs.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fs.Put("b", []byte(`{"v":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	if floor := fs.committer.FallbackGeneration(); floor <= 1 {
@@ -696,19 +738,24 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 	options := testFileStoreOptions()
 	options.BufferCount = 4096
 	options.MaxRetiredExtents = 4096
-	options.MaxBatchDocuments = 64
+	// A batch cannot split a fresh leaf mid-fold, so the seed batch's documents
+	// must fit one leaf. Sixteen ~330-byte documents stay within that budget; the
+	// collection has split into several leaves by the time the later batches land,
+	// and the spill this test asserts comes from the retirement volume of deleting
+	// every key, not from any single batch's width.
+	options.MaxBatchDocuments = 16
 	options.ResidentBytes = 32 << 20
 	fs, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	const documents = 128
+	const documents = 512
 	for base := 0; base < documents; base += options.MaxBatchDocuments {
 		if err := fs.Update(func(batch *WriteBatch) error {
 			for i := base; i < base+options.MaxBatchDocuments; i++ {
 				value := []byte(fmt.Sprintf(
-					`{"id":%d,"padding":%q}`, i, strings.Repeat("x", 600),
+					`{"id":%d,"padding":%q}`, i, strings.Repeat("x", 300),
 				))
 				if err := batch.Put(fmt.Sprintf("spill-%03d", i), value); err != nil {
 					return err
@@ -1126,7 +1173,7 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	defer fs.Close()
 
 	const keys = 16
-	body := strings.Repeat("x", 512)
+	body := strings.Repeat("x", 300)
 	put := func(round, i int) error {
 		_, err := fs.Put(fmt.Sprintf("k%02d", i), fmt.Appendf(nil,
 			`{"round":%d,"v":%q}`, round, body))

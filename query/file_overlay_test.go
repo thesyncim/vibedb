@@ -129,7 +129,26 @@ func TestFileOverlayRejectsInvalidSources(t *testing.T) {
 	if err := q.RunInto(&e, FromFileOverlay(nil, &empty)); err == nil {
 		t.Fatal("nil snapshot accepted")
 	}
-	snapshot := zoneFileCollection(t, 4, [][]byte{[]byte(`{"id":1}`)})
+	file, err := os.CreateTemp(t.TempDir(), "query-file-overlay-reject-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	collection, err := durable.Create(file, durable.Options{
+		Collection: store.Options{ChunkDocuments: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+	if _, err := collection.Put("k000000", []byte(`{"id":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
 	if err := q.RunInto(&e, FromFileOverlay(snapshot, nil)); err == nil {
 		t.Fatal("nil overlay accepted")
 	}

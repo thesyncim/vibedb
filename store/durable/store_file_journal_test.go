@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -40,6 +41,34 @@ func syncPrimaryJournalTestOptions() Options {
 	o.Durability = DurabilitySync
 	o.RecoveryJournal = false
 	return o
+}
+
+// journalOverflowOptions is journalTestOptions with MaxDocumentBytes raised above
+// InlineValueBytes, so a value between the two stores an out-of-line overflow
+// chain rather than fitting inline. The journal and its replay must then carry
+// the acknowledgement by reference to that chain, which is the seam the inline
+// helper never exercises.
+func journalOverflowOptions(strength CheckpointStrength) Options {
+	o := journalTestOptions(strength)
+	o.InlineValueBytes = 256
+	o.MaxDocumentBytes = 8 << 10
+	return o
+}
+
+// syncPrimaryOverflowJournalTestOptions is the DurabilitySync counterpart of
+// journalOverflowOptions, matching syncPrimaryJournalTestOptions' lane choices.
+func syncPrimaryOverflowJournalTestOptions() Options {
+	o := journalOverflowOptions(CheckpointPowerSafe)
+	o.Durability = DurabilitySync
+	o.RecoveryJournal = false
+	return o
+}
+
+// journalOverflowValue is journalValue past InlineValueBytes=256, so every write
+// spills out of line. The pad is distinct per index so a value replayed from its
+// overflow chain is checked byte for byte rather than merely for presence.
+func journalOverflowValue(i int) []byte {
+	return []byte(fmt.Sprintf(`{"i":%d,"pad":%q}`, i, strings.Repeat("p", 1024)))
 }
 
 // seedPrimaryCollection builds a one-document ordered primary graph so a plain
@@ -330,6 +359,111 @@ func TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow(t *testing.T) {
 	verify("second-open-idempotent")
 }
 
+// TestSyncPrimaryJournaledOverflowReplayIsDeterministic is the overflow
+// counterpart of TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow. The
+// crash value is stored out of line, so the redo record captured at the
+// sync-but-unpublished instant names an overflow chain rather than carrying an
+// inline value. Replay must reconstruct the referenced value exactly, and a
+// second reopen — now checkpointed, the chain folded into the durable root —
+// must recover the identical content: an overflow chain rebuilt on replay is
+// deterministic, not a fresh allocation whose bytes could drift.
+func TestSyncPrimaryJournaledOverflowReplayIsDeterministic(t *testing.T) {
+	options := syncPrimaryOverflowJournalTestOptions()
+	built := seedPrimaryCollection(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.vibe")
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFromPrimary(built, file, options); err != nil {
+		t.Fatalf("CreateFromPrimary: %v", err)
+	}
+	_ = file.Close()
+
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	want := map[string]string{"seed": `{"v":0}`}
+	const baseline = 6
+	for i := 0; i < baseline; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := journalOverflowValue(i)
+		if _, err := coll.Put(key, val); err != nil {
+			t.Fatalf("baseline overflow put %d: %v", i, err)
+		}
+		want[key] = string(val)
+	}
+
+	// Snapshot the store and journal exactly once, at the sync-but-unpublished
+	// instant of the next out-of-line Put: its record and overflow chain are
+	// durable on disk while the store root still predates them.
+	crashStore := filepath.Join(dir, "crash.vibe")
+	crashKey := "crash-key"
+	crashVal := journalOverflowValue(999)
+	var captured bool
+	recoveryJournalPostSyncHook = func() {
+		if captured {
+			return
+		}
+		captured = true
+		copyFileForCrash(t, path, crashStore)
+		copyFileForCrash(t, path+".rjournal", crashStore+".rjournal")
+	}
+	defer func() { recoveryJournalPostSyncHook = nil }()
+
+	if _, err := coll.Put(crashKey, crashVal); err != nil {
+		t.Fatalf("crash-window overflow put: %v", err)
+	}
+	if !captured {
+		t.Fatal("post-sync seam never fired: the sync lane did not journal before publishing")
+	}
+	want[crashKey] = string(crashVal)
+	if got, found, err := coll.AppendRaw(nil, crashKey); err != nil ||
+		!found || string(got) != string(crashVal) {
+		t.Fatalf("overflow crash key not visible on live store after publish: found=%v err=%v", found, err)
+	}
+	if err := coll.Close(); err != nil {
+		t.Fatalf("close live: %v", err)
+	}
+	_ = file.Close()
+
+	// Reopen the crash image mid-Put. Both opens must reconstruct every baseline
+	// overflow value AND the crash record whose in-memory publish never ran, and
+	// the two must be byte-for-byte identical.
+	verify := func(label string) {
+		cf, err := os.OpenFile(crashStore, os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := Open(cf, options)
+		if err != nil {
+			t.Fatalf("%s: reopen crash image: %v", label, err)
+		}
+		got := snapshotCollectionContent(t, rc)
+		if got[crashKey] != string(crashVal) {
+			t.Fatalf("%s: synced-but-unpublished overflow record was not replayed: got %q want overflow value",
+				label, got[crashKey])
+		}
+		if !mapsEqual(got, want) {
+			t.Fatalf("%s: recovered %d keys, want %d", label, len(got), len(want))
+		}
+		if err := rc.Close(); err != nil {
+			t.Fatalf("%s: close: %v", label, err)
+		}
+		_ = cf.Close()
+	}
+	verify("first-open-replay")
+	verify("second-open-idempotent")
+}
+
 // TestRecoveryJournalReplayReconstructsAcks copies the store and journal at a
 // point where acknowledgements have been journaled but no checkpoint has folded
 // them into the root, then reopens the copy. Replay must reconstruct every
@@ -499,58 +633,18 @@ func TestRecoveryJournalFullForcesCheckpoint(t *testing.T) {
 	}
 }
 
-// TestRecoveryJournalRequiresPrimaryLayout proves the journal fails closed on a
-// chunk-layout store, where no mutation would ever append to it. Create rejects
-// the request outright; opening an existing chunk store with the option set is
-// rejected the same way; and the primary path (CreateFromPrimary) both succeeds
-// and actually acknowledges through the journal.
+// TestRecoveryJournalRequiresPrimaryLayout proves the primary journal lane is
+// live: a CreateFromPrimary store opened with Options.RecoveryJournal actually
+// acknowledges a Put through the journal. The former chunk-image cases (Create
+// and Open of a chunk-layout store failing closed with
+// ErrRecoveryJournalRequiresPrimary) were deleted with the chunk layout, which
+// can no longer be constructed. The production guard that fails an Open closed
+// when a root names a journal but carries no primary graph (store_file.go,
+// root.PrimaryRoot == zero && journal named) remains and is exercised by the
+// recovery/fuzz sweeps.
 func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
 	options := journalTestOptions(CheckpointFilesystem)
 	dir := t.TempDir()
-
-	// Create on a fresh (chunk-layout) store must fail closed: the chunk mutation
-	// path never calls journalAckLocked, so a minted journal would be a lie. A
-	// failed Create may leave a partially-initialised file, so this store uses its
-	// own path.
-	rejectPath := filepath.Join(dir, "reject.vibe")
-	rf, err := os.OpenFile(rejectPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Create(rf, options); !errors.Is(err, ErrRecoveryJournalRequiresPrimary) {
-		t.Fatalf("Create chunk store with RecoveryJournal: got %v, want ErrRecoveryJournalRequiresPrimary", err)
-	}
-	_ = rf.Close()
-
-	// Build a real chunk store WITHOUT a journal, then reopen it with the option
-	// set: Open must also fail closed rather than pretend it can journal.
-	chunkPath := filepath.Join(dir, "chunk.vibe")
-	cf, err := os.OpenFile(chunkPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	noJournal := options
-	noJournal.RecoveryJournal = false
-	coll, err := Create(cf, noJournal)
-	if err != nil {
-		t.Fatalf("Create chunk store without journal: %v", err)
-	}
-	if _, err := coll.Put("k", []byte(`{"v":1}`)); err != nil {
-		t.Fatalf("chunk put: %v", err)
-	}
-	if err := coll.Close(); err != nil {
-		t.Fatalf("close chunk: %v", err)
-	}
-	_ = cf.Close()
-
-	cf, err = os.OpenFile(chunkPath, os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cf.Close()
-	if _, err := Open(cf, options); !errors.Is(err, ErrRecoveryJournalRequiresPrimary) {
-		t.Fatalf("Open chunk store with RecoveryJournal: got %v, want ErrRecoveryJournalRequiresPrimary", err)
-	}
 
 	// The primary path succeeds and journals: a Put must record at least one
 	// journal acknowledgement.
@@ -583,54 +677,11 @@ func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
 	}
 }
 
-// TestChunkSyncMintsNoJournal completes the journal biconditional on the
-// synchronous side: a journal exists iff the store is primary-layout AND either
-// buffered-visible opted in or the lane is synchronous. A chunk-layout
-// DurabilitySync store has no journal mutation lane, so it mints no sibling
-// journal, acknowledges through the committer chain fence, and reopens cleanly.
-func TestChunkSyncMintsNoJournal(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "chunk-sync.vibe")
-	options := Options{
-		Backend: BackendPortable, ResidentBytes: 32 << 20,
-		Durability: DurabilitySync,
-	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	coll, err := Create(file, options)
-	if err != nil {
-		t.Fatalf("Create chunk sync store: %v", err)
-	}
-	if _, err := coll.Put("k", []byte(`{"v":1}`)); err != nil {
-		t.Fatalf("chunk sync put: %v", err)
-	}
-	if got := coll.Stats().JournalAcks; got != 0 {
-		t.Fatalf("chunk sync took a journal acknowledgement: journal=%d", got)
-	}
-	if err := coll.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	_ = file.Close()
-	if _, err := os.Stat(path + ".rjournal"); !os.IsNotExist(err) {
-		t.Fatalf("chunk sync store minted a sibling journal (stat err=%v)", err)
-	}
-	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	reopened, err := Open(file, options)
-	if err != nil {
-		t.Fatalf("reopen chunk sync store: %v", err)
-	}
-	defer reopened.Close()
-	if got, found, err := reopened.AppendRaw(nil, "k"); err != nil ||
-		!found || string(got) != `{"v":1}` {
-		t.Fatalf("chunk sync value lost: got %q found=%v err=%v", got, found, err)
-	}
-}
+// The former TestChunkSyncMintsNoJournal was deleted with the chunk layout: it
+// asserted that a DurabilitySync chunk-layout store minted no sibling journal.
+// Every store is now an ordered primary graph, and the synchronous lane journals
+// by design (the sync-journal lane), so the biconditional it guarded no longer
+// exists.
 
 // TestRecoveryJournalMissingFailsClosed proves a root that references a journal
 // whose file is absent fails closed rather than silently dropping acknowledged

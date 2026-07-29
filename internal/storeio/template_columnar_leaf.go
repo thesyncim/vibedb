@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"unsafe"
 
 	"github.com/thesyncim/vibejson"
@@ -1025,7 +1026,16 @@ func (v TemplateColumnarLeafView) appendRawDirect(dst []byte, rank int, ti uint1
 	dp := int(binary.LittleEndian.Uint32(v.rowDir[at+20:]))
 	total := int(binary.LittleEndian.Uint16(v.rowDir[at+10:]))
 	start := len(dst)
-	dst = append(dst, make([]byte, total)...)
+	// Reserve the reconstructed document's width in place. append(dst,
+	// make([]byte, total)...) allocated a throwaway slice on every splice — one
+	// alloc per scanned row, which a warm ordered scan repeats for the whole
+	// collection; growing dst's own capacity and clearing the reserved region
+	// reuses the caller's retained scratch instead. The clear is retained rather
+	// than dropped: the copy loop below is expected to overwrite every byte, but a
+	// span clamped by a malformed template must fail closed to zeros, not expose
+	// stale bytes left in the reused capacity by a previous row.
+	dst = slices.Grow(dst, total)[:start+total]
+	clear(dst[start:])
 	out, sk := start, ss
 	for i := range n {
 		token := uint64(v.image[lp])

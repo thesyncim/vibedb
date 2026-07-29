@@ -162,7 +162,7 @@ func newCommitterMaterializationFixture(
 	}
 	ref := PageRef{
 		Offset: 8 * uint64(pageSize), LogicalID: 7, Generation: 1,
-		Length: pageSize, Kind: PageDocument,
+		Length: pageSize, Kind: PageOverflow,
 	}
 	before := make([]byte, pageSize)
 	payload, err := InitPage(before, PageHeader{

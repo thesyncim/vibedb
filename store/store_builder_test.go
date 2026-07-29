@@ -164,10 +164,6 @@ func TestStoreBuilderInternsNestedStructuralTemplates(t *testing.T) {
 	if err != nil || !ok || string(node.Raw().Bytes()) != `"c3"` {
 		t.Fatalf("widened template pointer = (%q,%v,%v)", node.Raw().Bytes(), ok, err)
 	}
-	var image bytes.Buffer
-	if _, err := collection.WriteTo(&image); err != nil {
-		t.Fatal(err)
-	}
 	before, _ := collection.Snapshot()
 	if _, err := collection.Put("k07", []byte(`{"id":7,"profile":{"geo":{"country":"new"}},"active":false}`)); err != nil {
 		t.Fatal(err)
@@ -178,14 +174,6 @@ func TestStoreBuilderInternsNestedStructuralTemplates(t *testing.T) {
 	snap8, _ := collection.Snapshot()
 	if keys, err = snap8.AppendIndexRawKeys(keys[:0], "country", []byte(`"new"`)); err != nil || len(keys) != 1 || keys[0] != "k07" {
 		t.Fatalf("mutated template index = (%v,%v)", keys, err)
-	}
-
-	reopened, err := Open(image.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if raw, ok := reopened.GetRaw("k07"); !ok || !bytes.Contains(raw.Bytes(), []byte(`"c3"`)) {
-		t.Fatalf("reopened template = (%q,%v)", raw.Bytes(), ok)
 	}
 }
 

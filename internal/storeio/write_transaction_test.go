@@ -36,37 +36,38 @@ func TestWriteTransactionPublishesRecoverableStateAndDirtyPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	document, err := tx.Allocate(PageDocument, testSuperblockPageSize, 0)
+	dirty, err := tx.Allocate(PageIndexPosting, testSuperblockPageSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	documentHeader := DocumentPageHeader{
-		StoreID: testStoreID, Generation: 1, LogicalID: document.Ref().LogicalID,
-		PageSize: testSuperblockPageSize, ChunkID: 0, Live: 1,
-	}
-	if _, err := EncodeDocumentPage(document.Bytes(), documentHeader, []DocumentRecord{{Slot: 0, Key: []byte("k"), JSON: []byte("1")}}, tx.NextLogicalID()); err != nil {
+	dirtyPayload, err := InitPage(dirty.Bytes(), PageHeader{
+		StoreID: testStoreID, Generation: 1, LogicalID: dirty.Ref().LogicalID,
+		PageSize: testSuperblockPageSize, PayloadLength: 1, Kind: PageIndexPosting,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := document.Stage(); err != nil {
+	dirtyPayload[0] = 0x5a
+	if _, err := SealPage(dirty.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirty.Stage(); err != nil {
 		t.Fatal(err)
 	}
 	write := tx.batch.pages[0]
 	staged, err := tx.batch.PageBuffer(0)
 	if err != nil || !write.frameNative() ||
-		len(staged) < int(document.Ref().Length) ||
-		&staged[0] != &document.Bytes()[0] {
-		t.Fatal("document was not staged in its page-cache frame")
+		len(staged) < int(dirty.Ref().Length) ||
+		&staged[0] != &dirty.Bytes()[0] {
+		t.Fatal("dirty page was not staged in its page-cache frame")
 	}
-	lease, err := cache.Acquire(document.Ref())
+	lease, err := cache.Acquire(dirty.Ref())
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenDocumentPage(lease.Page(), 1, tx.NextLogicalID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if json, ok := view.LookupString(0, "k"); !ok || string(json) != "1" {
-		t.Fatalf("dirty document lookup = (%q,%v)", json, ok)
+	_, payload, err := OpenPage(lease.Page())
+	if err != nil || len(payload) != 1 || payload[0] != 0x5a {
+		t.Fatalf("dirty page readback = (%x,%v)", payload, err)
 	}
 	lease.Release()
 
@@ -118,17 +119,17 @@ func TestWriteTransactionValidationAndAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Allocate(PageKeyDirectory, 2*testSuperblockPageSize, 0); !errors.Is(err, ErrInvalidWrite) {
+	if _, err := tx.Allocate(PageCatalogSegment, 2*testSuperblockPageSize, 0); !errors.Is(err, ErrInvalidWrite) {
 		t.Fatalf("variable metadata = %v, want %v", err, ErrInvalidWrite)
 	}
-	if page, err := tx.Allocate(PageFingerprintDirectory, testSuperblockPageSize, 0); err != nil ||
-		page.Ref().Kind != PageFingerprintDirectory {
-		t.Fatalf("fingerprint metadata allocation = (%+v,%v)", page.Ref(), err)
+	if page, err := tx.Allocate(PageIndexPosting, testSuperblockPageSize, 0); err != nil ||
+		page.Ref().Kind != PageIndexPosting {
+		t.Fatalf("posting metadata allocation = (%+v,%v)", page.Ref(), err)
 	}
 	if err := tx.Abort(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Allocate(PageDocument, testSuperblockPageSize, 0); !errors.Is(err, ErrTooManyPages) {
+	if _, err := tx.Allocate(PageOverflow, testSuperblockPageSize, 0); !errors.Is(err, ErrTooManyPages) {
 		t.Fatalf("Allocate after abort = %v, want %v", err, ErrTooManyPages)
 	}
 }
@@ -173,14 +174,14 @@ func TestWriteTransactionForeignStagingRunsFullVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Abort()
-	page, err := tx.Allocate(PageChunkDirectory, uint32(pageSize), 0)
+	page, err := tx.Allocate(PageIndexPosting, uint32(pageSize), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	foreign := make([]byte, pageSize)
 	payload, err := InitPage(foreign, PageHeader{
 		StoreID: testStoreID, Generation: 1, LogicalID: page.Ref().LogicalID,
-		PageSize: uint32(pageSize), PayloadLength: 1, Kind: PageChunkDirectory,
+		PageSize: uint32(pageSize), PayloadLength: 1, Kind: PageIndexPosting,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +201,7 @@ func TestWriteTransactionForeignStagingRunsFullVerification(t *testing.T) {
 
 	payload, err = InitPage(page.Bytes(), PageHeader{
 		StoreID: testStoreID, Generation: 1, LogicalID: page.Ref().LogicalID,
-		PageSize: uint32(pageSize), PayloadLength: 1, Kind: PageChunkDirectory,
+		PageSize: uint32(pageSize), PayloadLength: 1, Kind: PageIndexPosting,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +215,7 @@ func TestWriteTransactionForeignStagingRunsFullVerification(t *testing.T) {
 	}
 }
 
-func TestWriteTransactionAllowsPackedAcceleratorExtents(t *testing.T) {
+func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "write-transaction-packed-*")
 	if err != nil {
 		t.Fatal(err)
@@ -242,9 +243,8 @@ func TestWriteTransactionAllowsPackedAcceleratorExtents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kind := range []PageKind{
-		PageFloat64Stripe, PageIndexGroupCatalog,
-		PagePrimaryCatalog, PageTabletDirectory, PagePrimaryLocator,
-		PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf,
+		PageOverflow, PagePrimaryCatalog, PageTabletDirectory, PagePrimaryLocator,
+		PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf, PagePrimaryExactLeaf,
 	} {
 		if _, err := tx.Allocate(
 			kind, 2*testSuperblockPageSize, 0,
@@ -253,9 +253,9 @@ func TestWriteTransactionAllowsPackedAcceleratorExtents(t *testing.T) {
 		}
 	}
 	if _, err := tx.Allocate(
-		PageFloat64Catalog, 2*testSuperblockPageSize, 0,
+		PageCatalogSegment, 2*testSuperblockPageSize, 0,
 	); err == nil {
-		t.Fatal("variable-size float64 directory node accepted")
+		t.Fatal("variable-size single-page metadata node accepted")
 	}
 	if _, err := tx.Allocate(
 		PagePrimaryLeaf, 3*testSuperblockPageSize, 0,
@@ -296,7 +296,7 @@ func TestWriteTransactionAllowsExactPrimaryValueExtents(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantOffset := tx.FileEnd()
-	for _, kind := range []PageKind{PageDocument, PageOverflow} {
+	for _, kind := range []PageKind{PageOverflow} {
 		for _, pages := range []uint32{3, 5, 7} {
 			length := pages * testSuperblockPageSize
 			page, allocateErr := tx.Allocate(kind, length, 0)
@@ -312,8 +312,8 @@ func TestWriteTransactionAllowsExactPrimaryValueExtents(t *testing.T) {
 		}
 	}
 	for _, kind := range []PageKind{
-		PageKeyDirectory, PageFingerprintDirectory, PageDocumentGroup, PageFloat64Group,
-		PageFloat64Catalog, PageFloat64Stripe, PageIndexGroupCatalog,
+		PageIndexPosting, PageCatalogSegment, PagePrimaryLeaf,
+		PageFreeImage, PageFreeDelta, PageFreeIndex,
 	} {
 		if _, err := tx.Allocate(
 			kind, 3*testSuperblockPageSize, 0,
@@ -346,7 +346,7 @@ func TestWriteTransactionReusesAndRollsBackSafeExtents(t *testing.T) {
 	}
 
 	tx := begin()
-	page, err := tx.Allocate(PageDocument, testSuperblockPageSize, 0)
+	page, err := tx.Allocate(PageOverflow, testSuperblockPageSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestWriteTransactionAllocatesAcrossSeveralFreeExtents(t *testing.T) {
 	defer tx.Abort()
 	seen := make(map[uint64]bool, 6)
 	for i := range 6 {
-		page, allocErr := tx.Allocate(PageDocument, testSuperblockPageSize, 0)
+		page, allocErr := tx.Allocate(PageOverflow, testSuperblockPageSize, 0)
 		if allocErr != nil {
 			t.Fatalf("allocate %d: %v", i, allocErr)
 		}
@@ -497,14 +497,14 @@ func TestWriteTransactionIndexedPromotionRemapsAbortJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := tx.Allocate(PageKeyDirectory, testSuperblockPageSize, 0)
+	first, err := tx.Allocate(PageIndexPosting, testSuperblockPageSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := first.Ref().Offset, 8*pageSize; got != want {
 		t.Fatalf("first indexed allocation offset = %d, want %d", got, want)
 	}
-	second, err := tx.Allocate(PageDocument, 2*testSuperblockPageSize, 0)
+	second, err := tx.Allocate(PagePrimaryLeaf, 2*testSuperblockPageSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

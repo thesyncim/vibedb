@@ -9,13 +9,20 @@ import (
 )
 
 func TestFileStorePageValidatorFailsClosedForEveryPageKind(t *testing.T) {
-	validator := newFileStorePageValidator(testAdmissionPageSize, 4, 64)
+	validator := newFileStorePageValidator(testAdmissionPageSize, 4)
 	validator.fileEnd.Store(64 * testAdmissionPageSize)
 	validator.nextLogicalID.Store(100)
-	validator.chunkHighWater.Store(20)
 	storeID := [16]byte{1, 2, 3}
 
-	for kind := storeio.PageStateRoot; kind <= storeio.PageFingerprintDirectory; kind++ {
+	// The retired chunk kinds (2, 4-6, 8-12, 16) no longer have a typed
+	// validator, so they are not swept here; only the durable kinds that
+	// survived the chunk deletion are. Each must still fail closed on a
+	// checksum-valid but semantically empty page, and only PageStateRoot may
+	// reach the unsupported-kind reference default.
+	for _, kind := range []storeio.PageKind{
+		storeio.PageStateRoot, storeio.PageOverflow,
+		storeio.PageFreeImage, storeio.PageFreeDelta, storeio.PageFreeIndex,
+	} {
 		t.Run(pageAdmissionKindName(kind), func(t *testing.T) {
 			logicalID := uint64(50)
 			if kind == storeio.PageStateRoot {
@@ -55,47 +62,21 @@ func TestFileStorePageValidatorCoversMetadataAndOverflowKinds(t *testing.T) {
 		nextLogicalID = uint64(100)
 	)
 	storeID := [16]byte{1, 2, 3}
-	validator := newFileStorePageValidator(pageSize, 4, 64)
+	validator := newFileStorePageValidator(pageSize, 4)
 	validator.fileEnd.Store(fileEnd)
 	validator.nextLogicalID.Store(nextLogicalID)
-	validator.chunkHighWater.Store(20)
 
+	// The ordered-primary graph pins the overflow codec's vestigial chunk/slot
+	// addressing to the same fixed sentinels the producer and validator use, so the
+	// encoded page must too (a primary state root leaves ChunkHighWater zero).
 	overflow, err := storeio.EncodeOverflowPage(
 		make([]byte, pageSize),
 		storeio.OverflowPageHeader{
 			StoreID: storeID, Generation: 3, LogicalID: 30, PageSize: pageSize,
-			Chunk: 3, Slot: 2, Total: 2,
+			Chunk: 0, Slot: 0, Total: 2,
 		},
-		[]byte(`{}`), fileEnd, nextLogicalID, pageSize, 20, 64,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	indexDirectory, err := storeio.EncodeIndexDirectoryLeaf(
-		make([]byte, pageSize),
-		storeio.IndexDirectoryHeader{
-			StoreID: storeID, Generation: 3, LogicalID: 31, PageSize: pageSize,
-		},
-		[]storeio.IndexDirectoryEntry{{
-			Key:  storeio.IndexDirectoryKey{IndexID: 1, TupleHash: 7, Chunk: 3},
-			Bits: 1 << 2,
-		}},
-		nil, nextLogicalID, 4,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	posting, err := storeio.EncodePostingPage(
-		make([]byte, pageSize),
-		storeio.PostingPageHeader{
-			StoreID: storeID, Generation: 3, LogicalID: 32, PageSize: pageSize,
-			IndexID: 1,
-		},
-		[]storeio.PostingSegment{{
-			StreamID: 1, TupleHash: 7,
-			Entries: []storeio.PostingEntry{{Chunk: 3, Bits: 1 << 2}},
-		}},
-		nextLogicalID, 4,
+		[]byte(`{}`), fileEnd, nextLogicalID, pageSize,
+		primaryOverflowChunkHighWater, primaryOverflowChunkDocuments,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -152,22 +133,6 @@ func TestFileStorePageValidatorCoversMetadataAndOverflowKinds(t *testing.T) {
 				binary.LittleEndian.PutUint32(page[storeio.PageHeaderSize+12:], 3)
 			},
 			want: storeio.ErrOverflowPageCorrupt,
-		},
-		{
-			name: "index directory", kind: storeio.PageIndexDirectory,
-			logical: 31, page: indexDirectory,
-			corrupt: func(page []byte) {
-				binary.LittleEndian.PutUint16(page[storeio.PageHeaderSize+6:], 600)
-			},
-			want: storeio.ErrIndexDirectoryCorrupt,
-		},
-		{
-			name: "index posting", kind: storeio.PageIndexPosting,
-			logical: 32, page: posting,
-			corrupt: func(page []byte) {
-				binary.LittleEndian.PutUint16(page[storeio.PageHeaderSize+8:], 600)
-			},
-			want: storeio.ErrPostingPageCorrupt,
 		},
 		{
 			name: "free image", kind: storeio.PageFreeImage, logical: 33, page: freeImage,
@@ -227,7 +192,7 @@ func TestFileStorePageValidatorExplicitlyRejectsStateRootAdmission(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	validator := newFileStorePageValidator(pageSize, 4, 64)
+	validator := newFileStorePageValidator(pageSize, 4)
 	validator.fileEnd.Store(fileEnd)
 	validator.nextLogicalID.Store(root.NextLogicalID)
 	ref := storeio.PageRef{

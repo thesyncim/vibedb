@@ -34,7 +34,7 @@ func poolReuseCorpus(t *testing.T, documents int) (*durable.Snapshot, *store.Seg
 			t.Fatal(err)
 		}
 	}
-	if _, err := durable.CreateFrom(source, file, options); err != nil {
+	if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
 		t.Fatal(err)
 	}
 	fs, err := durable.Open(file, options)

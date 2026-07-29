@@ -51,34 +51,30 @@ const (
 	// PageStateRoot is the published generation root; it names every current
 	// durable structure and is the page recovery selects an image from.
 	PageStateRoot PageKind = iota + 1
-	// PageDocument is one verbatim JSON document extent: a chunk's contiguous
-	// bytes handed to a scan callback without decoding.
-	PageDocument
+	// Kind 2 (was PageDocument, the verbatim chunk document extent) is removed
+	// with the chunk layout. Its slot is held blank so every surviving durable
+	// kind keeps the on-disk identifier it already had.
+	_
 	// PageOverflow is a continuation extent for a document or value too large
 	// for one home page; the home page holds a PageRef into this chain.
 	PageOverflow
-	// PageChunkDirectory is a chunk-radix directory node mapping chunk IDs to
-	// their document pages.
-	PageChunkDirectory
-	// PageKeyDirectory is the pre-hybrid primary-key directory (branch or leaf).
-	// It remains a distinct discriminator so a reader never mistakes it for the
-	// fingerprint directory or a primary-graph node.
-	PageKeyDirectory
-	// PageIndexDirectory is one exact secondary-index directory node.
-	PageIndexDirectory
-	// PageIndexPosting is a packed posting-list page for a secondary index.
+	// Kinds 4–6, 8–12 are removed with the chunk/fingerprint layout: the
+	// chunk-radix directory, the pre-hybrid key directory, the exact-index
+	// directory, the compact document-group container, the three float64 columnar
+	// page kinds, and the index-group catalog. Their slots are held blank so every
+	// surviving durable kind keeps its existing on-disk identifier.
+	_ // 4  (was PageChunkDirectory)
+	_ // 5  (was PageKeyDirectory)
+	_ // 6  (was PageIndexDirectory)
+	// PageIndexPosting is a packed posting-list page. It survives the chunk
+	// deletion because the in-memory heap store encodes its query-time packed
+	// index in this format (see store/store_index_packed.go and posting_page.go).
 	PageIndexPosting
-	// PageDocumentGroup is a compact-format group page: one shape template and
-	// value dictionary plus per-row token streams packing several chunks.
-	PageDocumentGroup
-	// PageFloat64Group is one columnar float64 group page.
-	PageFloat64Group
-	// PageFloat64Catalog names the float64 groups and stripes of a column.
-	PageFloat64Catalog
-	// PageFloat64Stripe is one float64 column stripe.
-	PageFloat64Stripe
-	// PageIndexGroupCatalog names the durable index groups.
-	PageIndexGroupCatalog
+	_ // 8  (was PageDocumentGroup)
+	_ // 9  (was PageFloat64Group)
+	_ // 10 (was PageFloat64Catalog)
+	_ // 11 (was PageFloat64Stripe)
+	_ // 12 (was PageIndexGroupCatalog)
 	// PageFreeImage and PageFreeDelta carry the free set as a base image plus a
 	// chain of per-commit diffs. They replaced a B+tree of PageFreeDirectory
 	// nodes, whose identifier is deliberately gone rather than reserved: the
@@ -93,15 +89,10 @@ const (
 	// segments a commit touched instead of the whole image; see free_index.go
 	// for why the image stopped being a linked list.
 	PageFreeIndex
-	// PageFingerprintDirectory is the hash-routed primary-key directory. It is
-	// intentionally distinct from the legacy PageKeyDirectory kind, which has
-	// carried more than one primary-directory schema during development. The
-	// durable kind is the format discriminator: readers must never guess a
-	// decoder from payload bytes.
-	//
-	// Keep this value after the existing kinds. Adding it here preserves every
-	// durable identifier already assigned above.
-	PageFingerprintDirectory
+	// Kind 16 (was PageFingerprintDirectory, the hash-routed chunk primary-key
+	// directory) is removed with the chunk layout. Its slot is held blank so the
+	// kinds after it keep their existing on-disk identifiers.
+	_
 	// PageCatalogSegment carries the self-describing, canonical Store catalog.
 	// It is deliberately distinct from every query accelerator: reopening a
 	// file must select this decoder from the durable kind, never by guessing
@@ -278,7 +269,7 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 		return true
 	}
 	switch kind {
-	case PageDocument, PageOverflow:
+	case PageOverflow:
 		return size >= physicalPageQuantum && size%physicalPageQuantum == 0
 	default:
 		return false
@@ -290,10 +281,9 @@ func validPageKind(kind PageKind) bool {
 }
 
 func validPageFlags(kind PageKind, flags uint8) bool {
-	if kind == PageDocumentGroup {
-		encoded := uint16(flags)
-		return encoded&^documentGroupKnownFlags == 0 &&
-			(encoded&DocumentGroupFlagFloat64Sidecar != 0 || encoded == 0)
-	}
+	_ = kind
+	// No surviving page kind carries header flags: the compact document-group
+	// payload the ordered-primary leaf embeds lives behind its class byte inside
+	// a flag-less PagePrimaryLeaf, and the chunk float64 sidecar flag is gone.
 	return flags == 0
 }

@@ -58,7 +58,7 @@ func BenchmarkWriteTransactionAdmission(b *testing.B) {
 				b.Fatal(err)
 			}
 			if _, err := tx.Allocate(
-				PageChunkDirectory, uint32(pageSize), 0,
+				PageOverflow, uint32(pageSize), 0,
 			); err != nil {
 				b.Fatal(err)
 			}
@@ -70,7 +70,7 @@ func BenchmarkWriteTransactionAdmission(b *testing.B) {
 	template := make([]byte, pageSize)
 	if _, err := InitPage(template, PageHeader{
 		StoreID: testStoreID, Generation: 2, LogicalID: 8,
-		PageSize: uint32(pageSize), Kind: PageChunkDirectory,
+		PageSize: uint32(pageSize), Kind: PageOverflow,
 	}); err != nil {
 		b.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func BenchmarkWriteTransactionAdmission(b *testing.B) {
 				b.Fatal(err)
 			}
 			page, err := tx.Allocate(
-				PageChunkDirectory, uint32(pageSize), 0,
+				PageOverflow, uint32(pageSize), 0,
 			)
 			if err != nil {
 				b.Fatal(err)

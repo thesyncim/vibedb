@@ -334,11 +334,7 @@ func recoverRoots(
 }
 
 func stateRootReferencesOffset(root StateRoot, offset uint64) bool {
-	if root.ChunkDirectory.Offset == offset || root.KeyDirectory.Offset == offset ||
-		root.IndexDirectory.Offset == offset ||
-		root.Float64ScanHead.Offset == offset ||
-		root.IndexGroupHead.Offset == offset ||
-		root.PrimaryRoot.Offset == offset ||
+	if root.PrimaryRoot.Offset == offset ||
 		root.ExactIndexRoot.Offset == offset {
 		return true
 	}
@@ -354,9 +350,6 @@ func readStateRootRefs(
 	scratch []byte,
 ) (bool, error) {
 	refs := [...]PageRef{
-		root.ChunkDirectory,
-		root.KeyDirectory,
-		root.IndexDirectory,
 		root.PrimaryRoot,
 		root.ExactIndexRoot,
 	}

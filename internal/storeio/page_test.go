@@ -26,7 +26,7 @@ func resealTestPage(page []byte) {
 
 func TestPageCodecRoundTripAndEveryByteCorruption(t *testing.T) {
 	page := make([]byte, testSuperblockPageSize)
-	wantHeader := testPageHeader(PageDocument, 19, 7)
+	wantHeader := testPageHeader(PageOverflow, 19, 7)
 	payload, err := InitPage(page, wantHeader)
 	if err != nil {
 		t.Fatal(err)
@@ -54,26 +54,6 @@ func TestPageCodecRoundTripAndEveryByteCorruption(t *testing.T) {
 		if _, _, err := OpenPage(page[:cut]); !errors.Is(err, ErrPageCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrPageCorrupt)
 		}
-	}
-}
-
-func TestPageFingerprintDirectoryKindIsDistinctAndRoundTrips(t *testing.T) {
-	if PageFingerprintDirectory == PageKeyDirectory {
-		t.Fatal("fingerprint and full-key directories share a durable kind")
-	}
-	page := make([]byte, testSuperblockPageSize)
-	want := testPageHeader(PageFingerprintDirectory, 23, 9)
-	payload, err := InitPage(page, want)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload[0] = 0xa5
-	if _, err := SealPage(page); err != nil {
-		t.Fatal(err)
-	}
-	got, opened, err := OpenPage(page)
-	if err != nil || got != want || len(opened) != int(want.PayloadLength) || opened[0] != 0xa5 {
-		t.Fatalf("OpenPage fingerprint = (%+v,%x,%v), want (%+v,a5...,nil)", got, opened, err, want)
 	}
 }
 
@@ -122,7 +102,7 @@ func TestPageCodecRejectsResealedNonCanonicalBytes(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			page := make([]byte, testSuperblockPageSize)
-			if _, err := InitPage(page, testPageHeader(PageDocument, 2, 1)); err != nil {
+			if _, err := InitPage(page, testPageHeader(PageOverflow, 2, 1)); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := SealPage(page); err != nil {
@@ -138,7 +118,7 @@ func TestPageCodecRejectsResealedNonCanonicalBytes(t *testing.T) {
 }
 
 func TestPageCodecValidationAndUnsealedPadding(t *testing.T) {
-	valid := testPageHeader(PageDocument, 2, 1)
+	valid := testPageHeader(PageOverflow, 2, 1)
 	for _, test := range []struct {
 		name   string
 		mutate func(*PageHeader)

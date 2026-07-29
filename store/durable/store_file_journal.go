@@ -102,21 +102,46 @@ func (c *Collection) journalConfigured() bool {
 		c.options.Durability == DurabilityBufferedVisible
 }
 
+// recoveryJournalSuffix names a store file's paired recovery journal, which
+// lives beside the store file and is resolved by path on reopen. It is exported
+// through RecoveryJournalPath so a caller that publishes a store file by renaming
+// it (a SQL table's atomic temp-to-final publish, say) can relocate the journal
+// with it; leaving the journal behind makes a journaled root unopenable.
+const recoveryJournalSuffix = ".rjournal"
+
+// RecoveryJournalPath returns the recovery-journal sibling path for a store file
+// at storePath. A journaled collection (any synchronous collection, and a
+// buffered-visible one that opted into RecoveryJournal) writes its journal here,
+// and Open resolves it here, so any external move of the store file must move
+// this alongside it.
+func RecoveryJournalPath(storePath string) string {
+	return storePath + recoveryJournalSuffix
+}
+
 // journalSiblingPath returns the store file's paired journal path.
 func (c *Collection) journalSiblingPath() (string, error) {
 	name := c.file.Name()
 	if name == "" {
 		return "", fmt.Errorf("vibejson: recovery journal requires a named store file")
 	}
-	return name + ".rjournal", nil
+	return RecoveryJournalPath(name), nil
 }
 
 // recoveryJournalCapacityBytesFor derives the preallocated record-region size
 // from the store's admission bounds and the checkpoint-record cadence, clamped
 // and sector-aligned. It is a free function so both Create and CreateFromPrimary
 // size an identical journal.
+//
+// The cadence-derived size uses the inline worst case (MaxKeyBytes +
+// InlineValueBytes) so a small-value store keeps thousands of acknowledgements
+// between checkpoints. An out-of-line value's redo record instead carries the
+// whole document (up to MaxDocumentBytes) so replay can re-run the Put and
+// re-derive its overflow chain. That single record can exceed the inline cadence
+// budget entirely, so the capacity is widened — never shrunk — to hold at least
+// one worst-case overflow record plus a checkpoint's slack. It is not sized as
+// 2048 overflow records: one must fit, the journal recycles at the next.
 func recoveryJournalCapacityBytesFor(
-	sectorSize uint32, maxKeyBytes, inlineValueBytes int,
+	sectorSize uint32, maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
 ) uint64 {
 	recordUpper := storeio.RecoveryRecordPaddedSize(
 		sectorSize, maxKeyBytes, inlineValueBytes,
@@ -128,6 +153,18 @@ func recoveryJournalCapacityBytesFor(
 	if capacity > recoveryJournalMaxCapacityBytes {
 		capacity = recoveryJournalMaxCapacityBytes
 	}
+	if maxDocumentBytes > inlineValueBytes {
+		worstOverflow := uint64(storeio.RecoveryRecordPaddedSize(
+			sectorSize, maxKeyBytes, maxDocumentBytes,
+		))
+		// One worst-case overflow record plus one inline cadence window of slack, so
+		// a checkpoint that folds pending mutations still has room to append the
+		// record that forced it.
+		need := worstOverflow + uint64(recordUpper)
+		if capacity < need {
+			capacity = need
+		}
+	}
 	sector := uint64(sectorSize)
 	return (capacity + sector - 1) / sector * sector
 }
@@ -137,7 +174,7 @@ func recoveryJournalCapacityBytesFor(
 func recoveryJournalHeaderFor(
 	storeID, journalID [16]byte,
 	pageSize uint32,
-	maxKeyBytes, inlineValueBytes int,
+	maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
 	baseGeneration uint64,
 ) storeio.RecoveryJournalHeader {
 	sectorSize := uint32(storeio.RecoveryJournalMinSectorSize)
@@ -149,7 +186,7 @@ func recoveryJournalHeaderFor(
 		BaseGeneration: baseGeneration,
 		BaseSequence:   0,
 		Capacity: recoveryJournalCapacityBytesFor(
-			sectorSize, maxKeyBytes, inlineValueBytes,
+			sectorSize, maxKeyBytes, inlineValueBytes, maxDocumentBytes,
 		),
 	}
 }
