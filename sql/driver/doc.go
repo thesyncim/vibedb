@@ -91,7 +91,9 @@
 // otherwise rounds once, ties to even. Exact reduction workspace is bounded
 // and returns query.ErrAggregateBudget rather than falling back to float64.
 //
-// An INNER JOIN compares declared JSON fields. The driver captures all
+// INNER JOIN and LEFT JOIN compare declared JSON fields. A left join preserves
+// each driving row and returns NULL for joined fields when no partner exists.
+// The driver captures all
 // participating durable collections in one coherent leased snapshot. A join
 // that emits matching pairs is admitted against the current fixed,
 // conservative 64 MiB working-set bound and materialized into the heap fan-out
@@ -101,6 +103,11 @@
 // declared-field fan-out JOIN directly against the FROM table. SQL exposes no
 // physical-key pseudo-column: "$key" is an ordinary quoted JSON field, and a
 // relationship based on identity names the declared primary-key field.
+//
+// WHERE predicates over the nullable joined side are rejected until the shared
+// engine has a post-join predicate phase; pushing them into the joined scan
+// would change LEFT JOIN semantics. Predicates over the preserved side remain
+// supported.
 //
 // # Transactions
 //

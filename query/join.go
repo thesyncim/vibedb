@@ -89,6 +89,7 @@ type Join struct {
 	innerPath  string
 	where      Predicate
 	hasWhere   bool
+	left       bool
 }
 
 // JoinOn builds an equi-join against collection, matching each outer row's
@@ -106,6 +107,18 @@ type Join struct {
 //			Where(query.Cmp("tier", query.Eq, "pro")))
 func JoinOn(collection, outerPath, innerPath string) Join {
 	return Join{collection: collection, outerPath: outerPath, innerPath: innerPath}
+}
+
+// LeftJoinOn builds a left outer equi-join. Every driving row contributes at
+// least one result row; when no joined document matches, columns read through
+// the joined alias are NULL.
+func LeftJoinOn(collection, outerPath, innerPath string) Join {
+	return Join{
+		collection: collection,
+		outerPath:  outerPath,
+		innerPath:  innerPath,
+		left:       true,
+	}
 }
 
 // Where narrows the inner collection to the documents satisfying p. Without it
@@ -183,6 +196,9 @@ type planJoin struct {
 	// chooses between its own measured strategies. See planJoinColumns for the
 	// one case where an aliased clause can still take the cheaper shape.
 	fanOut bool
+	// left preserves a driving row whose build-side probe finds no partner and
+	// null-extends every column read from the joined collection.
+	left bool
 	// innerCols are the value-column indexes this clause's collection fills,
 	// in the shared column space. They are extracted after the pairs exist,
 	// addressed by the joined row of each pair.
@@ -212,11 +228,13 @@ func (c *compiler) compileJoins(q *Query, p *plan, values *pathRegistry) ([]*com
 			return nil, err
 		}
 		p.joins = append(p.joins, compiled)
-		node := c.nodes.one()
-		*node = compiledPredicate{
-			kind: predInBound, col: compiled.outerPath, op: Eq, slot: compiled.slot,
+		if !compiled.left {
+			node := c.nodes.one()
+			*node = compiledPredicate{
+				kind: predInBound, col: compiled.outerPath, op: Eq, slot: compiled.slot,
+			}
+			nodes = append(nodes, node)
 		}
-		nodes = append(nodes, node)
 	}
 	c.planJoins = p.joins
 	return nodes, nil
@@ -316,6 +334,7 @@ func (c *compiler) compileJoin(j Join, index int, values *pathRegistry) (planJoi
 	return planJoin{
 		collection: j.collection,
 		aliased:    j.alias != "",
+		left:       j.left,
 		inner:      ip,
 		outerPath:  outer,
 		innerPath:  innerPath,

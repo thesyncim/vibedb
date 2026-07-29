@@ -292,8 +292,11 @@ func (s *Statement) buildJoins(args []any) error {
 		// is the reverse of the order "ON o.user_id = u.id" writes them in; the
 		// parser has already normalized the condition so Left is always the
 		// side already in scope and Right the side this clause adds.
-		s.q.joins = append(s.q.joins,
-			JoinOn(ref.Name, s.spec(cond.Left), s.localSpec(cond.Right)).As(ref.Alias))
+		join := JoinOn(ref.Name, s.spec(cond.Left), s.localSpec(cond.Right))
+		if ref.Join == sqlast.JoinLeft {
+			join = LeftJoinOn(ref.Name, s.spec(cond.Left), s.localSpec(cond.Right))
+		}
+		s.q.joins = append(s.q.joins, join.As(ref.Alias))
 	}
 	if err := s.checkSingleFanOut(); err != nil {
 		return err
@@ -468,6 +471,13 @@ func (s *Statement) buildWhere(args []any) error {
 		if source <= 0 {
 			s.stack = append(s.stack, pred)
 			continue
+		}
+		if s.tree.From[source].Join == sqlast.JoinLeft {
+			return fmt.Errorf(
+				"query: WHERE reads %q, the nullable side of a LEFT JOIN; "+
+					"post-join predicates are not supported yet, so put the condition "+
+					"on the preserved collection or omit it",
+				s.tree.From[source].Alias)
 		}
 		if err := s.narrowJoin(source, pred); err != nil {
 			return err

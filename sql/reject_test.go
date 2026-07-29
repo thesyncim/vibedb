@@ -138,7 +138,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 
 func TestRejectsUnsupportedJoins(t *testing.T) {
 	runRejections(t, []rejection{
-		{"LEFT JOIN", `SELECT t.a FROM t LEFT JOIN u ON t.k = u.k`, 18, "outer joins"},
 		{"RIGHT JOIN", `SELECT t.a FROM t RIGHT JOIN u ON t.k = u.k`, 18, "outer joins"},
 		{"FULL JOIN", `SELECT t.a FROM t FULL JOIN u ON t.k = u.k`, 18, "outer joins"},
 		{"CROSS JOIN", `SELECT t.a FROM t CROSS JOIN u`, 18, "unrestricted product"},
