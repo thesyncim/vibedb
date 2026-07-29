@@ -985,14 +985,36 @@ type Collection struct {
 	// transaction and mutated in place by ordinary COW UpdateLeaf. Lock-free
 	// point reads load it once; an atomic pointer keeps that swap race-free.
 	primaryRouter atomic.Pointer[storeio.ResidentPrimaryRouter]
-	// primaryExact holds the resident exact-term leaves published on the ordered
-	// graph, one per physical index; primaryLive is the live posting-slot map the
-	// read-side posting recheck validates against. Both are non-nil only for an
-	// indexed ordered-primary collection and are rebuilt wholesale after a
-	// mutation changes the graph (see rebuildPrimaryExactIndexes). They are
-	// protected by the same writer/snapshotGate discipline as primaryRouter.
-	primaryExact []primaryExactResident
-	primaryLive  map[uint32]*[storeio.TermPostingTileChunks]uint64
+	// primaryEpoch is the resident exact-index epoch: the immutable fold base
+	// (encoded term leaves plus flat live table) under the generation-stamped
+	// overlay (docs/design/indexed-write-path.md §3). Non-nil only for an
+	// indexed ordered-primary collection. The pointer is swapped whole under
+	// the writer/snapshotGate discipline at fold points; between folds the
+	// exclusive writer appends overlay records inside the publish fence.
+	// Retired epochs wait on the generation-keyed pending list until the
+	// reclaim floor passes them, then recycle through the pool so steady-state
+	// fold cycles reuse overlay storage instead of allocating it.
+	primaryEpoch        *primaryExactEpoch
+	primaryEpochRetired []retiredPrimaryExactEpoch
+	primaryEpochPool    []*primaryExactEpoch
+	// exactTermLinkScratch/exactTileLinkScratch are writer-owned staging for
+	// one mutation's prepared overlay chain heads (fallible prepare,
+	// infallible link at publish).
+	exactTermLinkScratch []primaryExactTermLink
+	exactTileLinkScratch []primaryExactTileLink
+	// fold* slices are the streamed checkpoint fold's writer-owned scratch:
+	// the resolved changed-tile set, per-index entry ordering, per-term
+	// overlay tiles, the flat term/posting builder inputs, and the base-key
+	// arena with its rebind offsets. All transient within one fold call
+	// (AppendIndexTermLeaf copies everything), so reuse is safe and keeps
+	// the steady-state fold free of resolve-side allocation.
+	foldChangedTiles   []primaryExactProbeTile
+	foldEntryScratch   []*primaryExactTermEntry
+	foldTileScratch    []primaryExactProbeTile
+	foldTermScratch    []storeio.IndexTermLeafTerm
+	foldPostingScratch []storeio.IndexTermLeafPosting
+	foldKeyArena       []byte
+	foldKeyOffsets     []int
 	// structuralExactReencoded and structuralExactRemoved accumulate, within one
 	// bounded structural transaction, the exact-index contribution of every leaf
 	// the transaction re-encodes plus the buckets it removes outright, so the
@@ -2223,13 +2245,13 @@ func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 type Snapshot struct {
 	collection *Collection
 	state      *fileStoreState
-	// exact and live are the immutable resident exact-index posting snapshot
-	// captured at Snapshot creation under snapshotGate. An incremental mutation
-	// installs a fresh pair by swapping the collection fields, so capturing them
-	// once here pins a consistent (term leaves, live map) view for this reader's
-	// whole lifetime even as the writer maintains the index.
-	exact []primaryExactResident
-	live  map[uint32]*[storeio.TermPostingTileChunks]uint64
+	// epoch is the index epoch captured at Snapshot creation under
+	// snapshotGate: one pointer pins the fold base and the overlay chains for
+	// this reader's whole lifetime, and the snapshot's generation filters the
+	// records — records linked later carry strictly newer generations, so
+	// this view resolves exactly its generation's postings even as the writer
+	// keeps appending (§3's per-generation view).
+	epoch *primaryExactEpoch
 	lease storeio.GenerationLease
 	once  sync.Once
 	// overflowScanValue reassembles each out-of-line value a range or mask scan
@@ -2261,6 +2283,24 @@ type Snapshot struct {
 // capacity.
 type IndexWorkspace struct {
 	lastProbe IndexProbeStats
+	// overlayTiles and baseTiles are the mid-window probe's merge scratch:
+	// the needle term's overlay contributions (newest record ≤ G per tile)
+	// and its decoded base postings, merged as two sorted arrays. Retained
+	// here so a warmed merged probe is allocation-free; the overlay side is
+	// one term's churn in a fold window and the base side is one term's
+	// postings, so the high-water marks stay small.
+	overlayTiles []primaryExactProbeTile
+	baseTiles    []primaryExactProbeTile
+	// needle is the canonicalized probe term's scratch, retained so a warmed
+	// probe neither heap-allocates nor re-zeroes a maximum-size stack array.
+	needle []byte
+}
+
+// primaryExactProbeTile is one resolved overlay contribution for a probe:
+// the tile and its absolute record bits at the snapshot's generation.
+type primaryExactProbeTile struct {
+	tileID uint32
+	bits   uint64
 }
 
 // IndexProbeStats reports the physical work of the most recent exact or
@@ -2295,6 +2335,9 @@ func (w *IndexWorkspace) Release() {
 		return
 	}
 	w.lastProbe = IndexProbeStats{}
+	w.overlayTiles = nil
+	w.baseTiles = nil
+	w.needle = nil
 }
 
 // Snapshot acquires an explicit generation lease.
@@ -2338,15 +2381,14 @@ func (c *Collection) pinSnapshot() (*Snapshot, error) {
 		c.snapshotGate.RUnlock()
 		return nil, stateErr
 	}
-	exact := c.primaryExact
-	live := c.primaryLive
+	epoch := c.primaryEpoch
 	lease, err := c.leases.Acquire(state.root.Generation)
 	c.snapshotGate.RUnlock()
 	if err != nil {
 		return nil, err
 	}
 	return &Snapshot{
-		collection: c, state: state, exact: exact, live: live, lease: lease,
+		collection: c, state: state, epoch: epoch, lease: lease,
 	}, nil
 }
 
@@ -2365,8 +2407,7 @@ func (s *Snapshot) Close() error {
 		s.lease.Release()
 		s.collection = nil
 		s.state = nil
-		s.exact = nil
-		s.live = nil
+		s.epoch = nil
 	})
 	return nil
 }

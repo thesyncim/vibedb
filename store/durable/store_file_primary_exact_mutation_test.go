@@ -140,23 +140,34 @@ func TestFilePrimaryIndexedMutationMatchesRebuild(t *testing.T) {
 	}
 
 	// Determinism: the same sequence on the same base yields byte-identical
-	// resident term leaves (same StoreID, deterministic maintenance).
+	// folded term leaves (same StoreID, deterministic maintenance). The
+	// resident base only changes at fold points now, so both runs are folded
+	// first — the comparison then covers the overlay resolve + re-encode,
+	// not just the untouched build-time bytes.
 	dir2 := t.TempDir()
 	again, _ := run(dir2)
-	if len(mutated.primaryExact) != len(again.primaryExact) {
-		t.Fatalf("index count differs: %d vs %d",
-			len(mutated.primaryExact), len(again.primaryExact))
+	if err := mutated.Flush(); err != nil {
+		t.Fatal(err)
 	}
-	for i := range mutated.primaryExact {
-		if mutated.primaryExact[i].present != again.primaryExact[i].present {
+	if err := again.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	mutatedExact := mutated.primaryEpoch.exact
+	againExact := again.primaryEpoch.exact
+	if len(mutatedExact) != len(againExact) {
+		t.Fatalf("index count differs: %d vs %d",
+			len(mutatedExact), len(againExact))
+	}
+	for i := range mutatedExact {
+		if mutatedExact[i].present != againExact[i].present {
 			t.Fatalf("index %d presence differs", i)
 		}
 		if !slices.Equal(
-			mutated.primaryExact[i].encoded, again.primaryExact[i].encoded,
+			mutatedExact[i].encoded, againExact[i].encoded,
 		) {
 			t.Fatalf("index %d term-leaf bytes not deterministic: %d vs %d bytes",
-				i, len(mutated.primaryExact[i].encoded),
-				len(again.primaryExact[i].encoded))
+				i, len(mutatedExact[i].encoded),
+				len(againExact[i].encoded))
 		}
 	}
 }

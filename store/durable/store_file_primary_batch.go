@@ -472,7 +472,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		// rewrite; the running image already carries the previous fold's generation.
 		stampGen := baseGen + uint64(leaf.applied) + 1
 		preparePath := filePrimaryMutationPath{leaf: *curView}
-		image, imageBytes, prepErr := c.preparePrimaryLeafMutation(
+		image, imageBytes, _, prepErr := c.preparePrimaryLeafMutation(
 			&preparePath, stampGen, m.key,
 			storeio.CommonPrimaryLeafValue{Inline: m.value},
 			m.remove, found, slot,

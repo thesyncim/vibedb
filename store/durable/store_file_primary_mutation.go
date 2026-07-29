@@ -418,6 +418,28 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 		}
 		c.automaticCheckpoints.Add(1)
 	}
+	// Exact-index overlay pressure, same discipline as pending-parent
+	// pressure above: when the window's record/entry arenas cannot absorb one
+	// more ordinary mutation (≤ 2 term records per index plus one tile
+	// record), fold now — the checkpoint empties the overlay — rather than
+	// resizing structures concurrent probes are reading. These dimensions
+	// are document-independent, so the check is exact; the document-dependent
+	// ones (interned term bytes, a rebase group's fan-out) are handled by the
+	// prepare-time fold escalation instead.
+	if epoch := c.primaryEpoch; epoch != nil {
+		need := 2*len(c.options.indexes) + 2
+		if len(epoch.termRecords)-epoch.termRecordN < need ||
+			len(epoch.tileRecords)-epoch.tileRecordN < 8 ||
+			min(len(epoch.termEntries), len(epoch.termTable)/4)-
+				epoch.termEntryN < need ||
+			min(len(epoch.tileEntries), len(epoch.tileTable)/4)-
+				epoch.tileEntryN < 8 {
+			if err := c.checkpointBufferedLocked(); err != nil {
+				return err
+			}
+			c.automaticCheckpoints.Add(1)
+		}
+	}
 	// The journal-backed sync lane appends its record at the point of no return,
 	// after the leaf frame is admitted dirty, so it cannot force a checkpoint
 	// there. Fold and recycle a full journal now — before the frame is prepared —
@@ -628,7 +650,7 @@ func (c *Collection) putPrimary(
 	if canonicalPath {
 		nextLeaf, becameEmpty, filledEmpty, mutationErr :=
 			c.cowBufferedPrimaryMutation(
-				state, keyBytes, src, false, found, slot,
+				state, keyBytes, src, false, found, detemplated, slot,
 				resident, &leaf,
 			)
 		leafLease.Release()
@@ -817,7 +839,7 @@ func (c *Collection) deletePrimary(
 		if acquireErr != nil {
 			return false, acquireErr
 		}
-		leaf, _, detemplateErr := storeio.AdmittedPrimaryLeafForMutation(
+		leaf, detemplated, detemplateErr := storeio.AdmittedPrimaryLeafForMutation(
 			leafLease.Page(), c.storeID, resident.Bucket,
 			storeio.CommonPrimaryLeafBounds{
 				FileEnd:           state.super.FileEnd,
@@ -842,7 +864,7 @@ func (c *Collection) deletePrimary(
 		}
 		_, becameEmpty, _, mutationErr :=
 			c.cowBufferedPrimaryMutation(
-				state, keyBytes, nil, true, true, slot,
+				state, keyBytes, nil, true, true, detemplated, slot,
 				resident, &leaf,
 			)
 		leafLease.Release()
@@ -1031,7 +1053,7 @@ func (c *Collection) replaceBufferedPrimaryInplace(
 func (c *Collection) cowBufferedPrimaryMutation(
 	state *fileStoreState,
 	key, src []byte,
-	deleting, found bool,
+	deleting, found, detemplated bool,
 	slot uint8,
 	resident storeio.ResidentPrimaryRoute,
 	leaf *storeio.CommonPrimaryLeafView,
@@ -1135,7 +1157,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		preparePath.leaf = releaf
 	}
 
-	leafImage, leafBytes, prepareErr := c.preparePrimaryLeafMutation(
+	leafImage, leafBytes, newSlot, prepareErr := c.preparePrimaryLeafMutation(
 		&preparePath, generation, key, value, deleting, found, slot,
 	)
 	if prepareErr != nil {
@@ -1224,16 +1246,18 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		freeHead: state.freeHead,
 	}
 
-	// Re-derive the rewritten bucket's exact-index postings from the new leaf
-	// image as a fallible prepare step: a fresh resident term-leaf snapshot is
-	// built here so the point-of-no-return install below cannot fail and leave a
-	// journaled mutation with a stale index. The durable posting pages are not
-	// written now — a buffered leaf frame is volatile until checkpoint, and the
-	// checkpoint materialize wraps this snapshot into durable pages then. On
-	// recovery the journaled Put/Delete replays through this same path, so the
-	// index is rebuilt identically.
-	preparedExact, err := c.preparePrimaryExactLeaf(
-		leafImage, resident.Bucket, c.primaryLeafBounds(nextState),
+	// Prepare this mutation's exact-index overlay records (§3's write rule)
+	// as a fallible step: the point-of-no-return install below only links
+	// prepared chain heads, so it cannot fail and leave a journaled mutation
+	// with a stale index. The durable posting pages are not written now — a
+	// buffered leaf frame is volatile until checkpoint, and the checkpoint
+	// fold resolves the overlay into durable pages then. On recovery the
+	// journaled Put/Delete replays through this same path, so the records
+	// regenerate and the fold rebuilds the index identically.
+	preparedExact, err := c.preparePrimaryExactBufferedMutation(
+		state, leaf, leafImage, resident, key, src,
+		deleting, found, detemplated, slot, newSlot,
+		generation, c.primaryLeafBounds(nextState),
 	)
 	if err != nil {
 		c.unadmitPrimaryMutationFrames()
@@ -1250,7 +1274,9 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		deleting, generation, key, src,
 	); err != nil {
 		// The fence failed with nothing published, so the admitted frames are
-		// still unreferenced and must not survive as unowned dirty capacity.
+		// still unreferenced and must not survive as unowned dirty capacity,
+		// and the prepared overlay records return to their bump allocator.
+		c.unwindPrimaryExactPrepared(&preparedExact)
 		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false, err
 	}
@@ -1394,7 +1420,7 @@ func (c *Collection) cowPrimaryMutation(
 			}
 		}
 	}
-	leafImage, leafBytes, prepareErr := c.preparePrimaryLeafMutation(
+	leafImage, leafBytes, _, prepareErr := c.preparePrimaryLeafMutation(
 		path, generation, key, value, deleting, found, slot,
 	)
 	if prepareErr != nil {
@@ -1402,11 +1428,13 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	becameEmpty = deleting && path.leaf.Len() == 1
 	filledEmpty = !deleting && !found && path.leaf.Len() == 0
-	// Re-derive the rewritten bucket's exact-index postings from the staged leaf
-	// image against the same bounds it was encoded under, so the index and the
-	// graph publish in one atomic generation.
+	// Fold-first lane (§7): re-derive the rewritten bucket from the staged
+	// leaf image against the same bounds it was encoded under, resolve the
+	// rest through the read rule, and prepare the fresh epoch this
+	// transaction stages durably, so the index and the graph publish in one
+	// atomic generation.
 	preparedExact, prepareExactErr := c.preparePrimaryExactLeaf(
-		leafImage, resident.Bucket, leafBounds,
+		leafImage, resident.Bucket, leafBounds, generation,
 	)
 	if prepareExactErr != nil {
 		return storeio.PageRef{}, false, false, prepareExactErr
@@ -1583,7 +1611,7 @@ func (c *Collection) cowPrimaryMutation(
 	var exactRoot storeio.PageRef
 	if preparedExact.active {
 		exactRoot, err = c.stagePrimaryExactPagesLocked(
-			tx, state, generation, preparedExact.exact,
+			tx, state, generation, preparedExact.epoch.exact,
 		)
 		if err != nil {
 			return storeio.PageRef{}, false, false, err
@@ -2270,18 +2298,38 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 		return err
 	}
 
-	// Fold the maintained resident postings into durable exact pages in the same
-	// checkpoint transaction that seals the graph. Per-mutation buffered edits
-	// only touch the in-memory posting snapshot; this is where they become
-	// durable and where the state root's ExactIndexRoot advances to match, so a
-	// crash after this checkpoint recovers a consistent index without replay.
+	// Fold the overlay into durable exact pages in the same checkpoint
+	// transaction that seals the graph (§7). Per-mutation buffered edits only
+	// append overlay records; this is where they resolve onto the base
+	// through the read rule at the fold generation, re-encode via the same
+	// builder a bulk build uses (byte-identical output — the identity
+	// anchor), and become durable, with the state root's ExactIndexRoot
+	// advancing to match, so a crash after this checkpoint recovers a
+	// consistent index without replay. A quiet window — no overlay records,
+	// the same-value replacement shape the mixed harness's update lane is
+	// made of — skips the O(index) re-encode entirely and re-wraps the
+	// current base bytes, which is what keeps the amortized indexed
+	// checkpoint within the unindexed arm's class.
 	var exactRoot storeio.PageRef
+	var exactPrepared primaryExactPrepared
 	exactActive := c.primaryExactActive()
 	if exactActive {
+		c.recyclePrimaryExactEpochsLocked()
+		staged := c.primaryEpoch.exact
+		if !c.primaryEpoch.overlayEmpty() {
+			exactPrepared, err = c.prepareStreamedPrimaryExactFold(
+				generation, generation,
+			)
+			if err != nil {
+				return err
+			}
+			staged = exactPrepared.epoch.exact
+		}
 		exactRoot, err = c.stagePrimaryExactPagesLocked(
-			tx, base, generation, c.primaryExact,
+			tx, base, generation, staged,
 		)
 		if err != nil {
+			c.unwindPrimaryExactPrepared(&exactPrepared)
 			return err
 		}
 	}
@@ -2337,6 +2385,11 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 			generation,
 		)
 	}
+	// The fold's fresh epoch (empty overlay) publishes in the same gate +
+	// fence section as the checkpointed state, retiring the consumed epoch
+	// onto the generation-keyed pending list. A no-op for a quiet window,
+	// which keeps its epoch and overlay untouched.
+	c.installPrimaryExactResidentLocked(exactPrepared)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	if retiring {
@@ -2375,6 +2428,11 @@ func (c *Collection) materializePrimaryParentsLocked() (err error) {
 	return nil
 }
 
+// preparePrimaryLeafMutation encodes the copy-on-write leaf image and
+// reports the mutated row's stable slot: the caller's slot for update and
+// delete (UpdateTo/DeleteTo/Promote preserve published slots), the freshly
+// drawn one for an insert — the slot the exact-index write rule stamps into
+// its posting records.
 func (c *Collection) preparePrimaryLeafMutation(
 	path *filePrimaryMutationPath,
 	generation uint64,
@@ -2382,13 +2440,14 @@ func (c *Collection) preparePrimaryLeafMutation(
 	value storeio.CommonPrimaryLeafValue,
 	deleting, found bool,
 	slot uint8,
-) ([]byte, int, error) {
+) ([]byte, int, uint8, error) {
 	size := len(path.leaf.PersistentBytes())
 	dst := c.primaryLeafScratch[:size]
 	var (
 		page []byte
 		err  error
 	)
+	newSlot := slot
 	switch {
 	case deleting:
 		page, err = path.leaf.DeleteTo(dst, generation, slot, key)
@@ -2403,11 +2462,11 @@ func (c *Collection) preparePrimaryLeafMutation(
 			)
 		}
 	default:
-		page, _, err = path.leaf.InsertTo(
+		page, newSlot, err = path.leaf.InsertTo(
 			dst, generation, key, value,
 		)
 		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) {
-			page, _, err = storeio.PromoteCommonPrimaryLeafInsertTo(
+			page, newSlot, err = storeio.PromoteCommonPrimaryLeafInsertTo(
 				c.primaryLeafScratch, generation, &path.leaf,
 				key, value,
 			)
@@ -2415,15 +2474,15 @@ func (c *Collection) preparePrimaryLeafMutation(
 	}
 	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
 		c.primaryLeafSplitRequired.Add(1)
-		return nil, 0, errors.Join(
+		return nil, 0, 0, errors.Join(
 			ErrPrimaryLeafSplitRequired,
 			storeio.ErrCommonPrimaryLeafFull,
 		)
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return page, len(page), nil
+	return page, len(page), newSlot, nil
 }
 
 func (c *Collection) primaryMutationBounds(

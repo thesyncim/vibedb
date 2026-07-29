@@ -50,9 +50,10 @@ func (s *Snapshot) IndexProbeMemoryBound() (IndexProbeMemoryBound, error) {
 	// caller's masks. They do not populate IndexWorkspace's directory,
 	// certificate, posting-decision, document, or tape buffers.
 	if state.root.ExactIndexRoot != (storeio.PageRef{}) {
-		// Each iterator result is one live posting tile, and s.live contains
-		// exactly those occupied tiles for this frozen generation.
-		bound.MaskCount = uint64(len(s.live))
+		// Each iterator result is one live posting tile. The epoch bound is
+		// the fold base's occupied tiles plus every tile the overlay window
+		// could have added — conservative, which is this function's contract.
+		bound.MaskCount = s.epoch.liveTileBound()
 		return bound, nil
 	}
 

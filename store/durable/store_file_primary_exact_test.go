@@ -124,9 +124,12 @@ func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
 	}
 	corruptTile := uint32(0)
 	corruptBit := uint64(0)
-	for tileID, live := range primary.primaryLive {
-		if dead := ^live[0]; dead != 0 {
-			corruptTile = tileID
+	for _, slot := range primary.primaryEpoch.live.slots {
+		if slot.mask == nil {
+			continue
+		}
+		if dead := ^slot.mask[0]; dead != 0 {
+			corruptTile = slot.tileID
 			corruptBit = dead & -dead
 			break
 		}
@@ -510,7 +513,7 @@ func BenchmarkPrimaryExactLookupIteration(b *testing.B) {
 		b.Fatal(err)
 	}
 	byteCount, postings := 0, 0
-	for _, resident := range collection.primaryExact {
+	for _, resident := range collection.primaryEpoch.exact {
 		if resident.present {
 			byteCount += len(resident.encoded)
 			postings += resident.view.PostingLen()

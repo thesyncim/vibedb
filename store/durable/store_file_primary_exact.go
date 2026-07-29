@@ -28,7 +28,7 @@ type primaryExactResident struct {
 // primaryExactActive reports whether this collection carries ordered-primary
 // exact indexes, i.e. postings live on the graph rather than the chunk store.
 func (c *Collection) primaryExactActive() bool {
-	return len(c.primaryExact) != 0 || c.primaryLive != nil
+	return c.primaryEpoch != nil
 }
 
 // derivePrimaryLive rebuilds the posting live-slot map from the current resident
@@ -78,9 +78,10 @@ func (c *Collection) derivePrimaryLive(
 	return live, nil
 }
 
-// openPrimaryExactIndexes materializes the resident exact indexes from the
-// published ExactIndexRoot and derives the live-slot map they are validated
-// against. It is called once by Open for an indexed ordered-primary collection.
+// openPrimaryExactIndexes materializes the resident index epoch from the
+// published ExactIndexRoot: the fold base (encoded term leaves plus the flat
+// live table derived from the graph) under an empty overlay. It is called
+// once by Open for an indexed ordered-primary collection.
 func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	if state.root.ExactIndexRoot == (storeio.PageRef{}) {
 		return nil
@@ -95,14 +96,6 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	if err != nil {
 		return err
 	}
-	c.primaryLive = live
-	// Close over this specific live map, not c.primaryLive: an incremental
-	// mutation installs a fresh (term leaves, live map) pair by swapping the
-	// collection fields, and a snapshot that captured this view must keep reading
-	// the live map this view was admitted against.
-	liveLookup := func(tileID uint32) *[storeio.TermPostingTileChunks]uint64 {
-		return live[tileID]
-	}
 	rootLease, err := c.cache.Acquire(state.root.ExactIndexRoot)
 	if err != nil {
 		return err
@@ -114,7 +107,14 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	if err != nil {
 		return err
 	}
-	resident := make([]primaryExactResident, root.Len())
+	epoch := newPrimaryExactEpoch(root.Len())
+	epoch.live = newPrimaryLiveTable(live)
+	epoch.baseGen = state.root.Generation
+	// Views close over this epoch's flat table, not the collection field: a
+	// fold installs a fresh epoch by swapping the pointer, and a snapshot
+	// that captured this one must keep reading the table its views were
+	// admitted against.
+	liveLookup := epoch.live.lookup
 	for indexID := 0; indexID < root.Len(); indexID++ {
 		ref, ok := root.Leaf(uint32(indexID))
 		if !ok {
@@ -131,29 +131,39 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 			lease.Page(), ref, bounds,
 		)
 		if openErr == nil {
-			resident[indexID].encoded = append([]byte(nil), payload...)
+			epoch.exact[indexID].encoded = append([]byte(nil), payload...)
 		}
 		lease.Release()
 		if openErr != nil {
 			return openErr
 		}
 		view, viewErr := storeio.OpenIndexTermLeaf(
-			resident[indexID].encoded, state.root.StoreID, liveLookup,
+			epoch.exact[indexID].encoded, state.root.StoreID, liveLookup,
 		)
 		if viewErr != nil {
 			return viewErr
 		}
-		resident[indexID].view = view
-		resident[indexID].present = true
+		epoch.exact[indexID].view = view
+		epoch.exact[indexID].present = true
 	}
-	c.primaryExact = resident
+	c.primaryEpoch = epoch
+	// Retire/pool lists are bounded by fold cadence against the reclaim
+	// floor; pre-sizing them keeps the publish-gate append allocation-free.
+	c.primaryEpochRetired = make([]retiredPrimaryExactEpoch, 0, 8)
+	c.primaryEpochPool = make([]*primaryExactEpoch, 0, 8)
 	return nil
 }
 
 // appendPrimaryExactMasks is the exact-match read path for an ordered-primary
-// index: it canonicalizes the needle term, looks it up in the resident term
-// leaf, and appends one (tile, mask) per live posting. Every posting bit is
-// rechecked against the live map so a stale or grafted posting fails closed.
+// index: it canonicalizes the needle term and resolves it through the pinned
+// index epoch's read rule (docs/design/indexed-write-path.md §3) at the
+// snapshot's generation G — the newest overlay term record ≤ G per tile,
+// else the fold base unless a rebase ≤ G voided it — and appends one
+// (tile, mask) per live posting in ascending tile order. Every posting bit
+// is rechecked against the resolved liveness so a stale or grafted posting
+// fails closed. Post-fold (both overlay counters zero, the state every
+// Collection.Snapshot sees because pinning materializes pending parents)
+// this is byte-for-byte the pre-overlay probe with the flat-table recheck.
 func (s *Snapshot) appendPrimaryExactMasks(
 	dst []store.Mask, workspace *IndexWorkspace,
 	name string, values []vibejson.Index,
@@ -164,44 +174,227 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	}
 	exact := s.collection.options.indexes[indexID]
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
-	var canonical [storeio.IndexTermMaxKeyBytes]byte
+	// The needle canonicalization scratch comes from the workspace: a stack
+	// array of IndexTermMaxKeyBytes would be re-zeroed on every probe (a
+	// measured ~2% of the mid-window gate), and the workspace already exists
+	// to retain exactly this kind of high-water storage.
+	needle := []byte(nil)
+	if workspace != nil {
+		needle = workspace.needle[:0]
+	}
 	key, err := appendPrimaryExactNeedleTerm(
-		canonical[:0], components[:], exact, values,
+		needle, components[:], exact, values,
 	)
+	if workspace != nil && cap(key) > cap(workspace.needle) {
+		workspace.needle = key
+	}
 	if err != nil {
 		return dst, err
 	}
 	if workspace != nil {
 		workspace.lastProbe = IndexProbeStats{}
 	}
-	if int(indexID) >= len(s.exact) ||
-		!s.exact[indexID].present {
+	epoch := s.epoch
+	if epoch == nil || int(indexID) >= len(epoch.exact) {
 		return dst, nil
 	}
-	match, found := s.exact[indexID].view.Lookup(key)
-	if !found {
-		return dst, nil
+	atGen := s.state.root.Generation
+	keyRecord := storeio.IndexTermKeyRecord{
+		RouteHash: storeio.IndexTermRouteHash(s.collection.storeID, key),
+		Canonical: key,
 	}
-	iterator := match.MaskIterator()
-	for {
-		tileID, mask, next := iterator.Next()
-		if !next {
-			break
+	var entry *primaryExactTermEntry
+	if epoch.termRecordCount.Load() != 0 {
+		entry = epoch.lookupTermEntry(
+			primaryExactTermChainHash(keyRecord.RouteHash, uint32(indexID)),
+			uint32(indexID), key,
+		)
+	}
+	overlayTiles := epoch.tileRecordCount.Load() != 0
+	resident := &epoch.exact[indexID]
+
+	if entry == nil && !overlayTiles {
+		// Post-fold fast path: no record can affect this probe, so the base
+		// is the whole answer and the only overlay cost was the two counter
+		// loads and one empty table probe above.
+		if !resident.present {
+			return dst, nil
 		}
-		if mask.Chunk != 0 || mask.Bits == 0 ||
-			s.live[tileID] == nil ||
-			mask.Bits&^s.live[tileID][0] != 0 {
+		match, found := resident.view.LookupRecord(keyRecord)
+		if !found {
+			return dst, nil
+		}
+		iterator := match.MaskIterator()
+		for {
+			tileID, mask, next := iterator.Next()
+			if !next {
+				break
+			}
+			if mask.Chunk != 0 || mask.Bits == 0 ||
+				mask.Bits&^epoch.live.word(tileID) != 0 {
+				return dst, storeio.ErrPrimaryExactIndexCorrupt
+			}
+			dst = append(dst, store.Mask{Chunk: tileID, Bits: mask.Bits})
+			if workspace != nil {
+				rows := uint64(bits.OnesCount64(mask.Bits))
+				workspace.lastProbe.CandidateRows += rows
+				workspace.lastProbe.CertificateRows += rows
+				workspace.lastProbe.MatchedRows += rows
+				workspace.lastProbe.CandidateChunks++
+				workspace.lastProbe.PostingPages = 1
+			}
+		}
+		return dst, nil
+	}
+
+	// Mid-window merged path. Overlay contributions collect into workspace
+	// scratch as one sorted-insert-dedup pass: the chain is newest-first, so
+	// the first record ≤ G per tile wins and a later hit on an already
+	// collected tile is simply skipped; records older than the tile's newest
+	// rebase ≤ G contribute "no bits". The sorted set then merges with the
+	// base's ascending mask iterator so the output tile order matches the
+	// post-fold path exactly.
+	var overlay []primaryExactProbeTile
+	if workspace != nil {
+		overlay = workspace.overlayTiles[:0]
+	}
+	if entry != nil {
+		for record := entry.head.Load(); record != nil; record = record.next {
+			if record.gen > atGen {
+				continue
+			}
+			lo, hi := 0, len(overlay)
+			for lo < hi {
+				mid := int(uint(lo+hi) >> 1)
+				if overlay[mid].tileID < record.tileID {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			if lo < len(overlay) && overlay[lo].tileID == record.tileID {
+				continue // a newer record for this tile is already collected
+			}
+			recordBits := record.bits
+			if overlayTiles &&
+				record.gen < epoch.rebaseFloor(record.tileID, atGen) {
+				recordBits = 0 // pre-rebase record: superseded slot assignment
+			}
+			overlay = append(overlay, primaryExactProbeTile{})
+			copy(overlay[lo+1:], overlay[lo:])
+			overlay[lo] = primaryExactProbeTile{
+				tileID: record.tileID, bits: recordBits,
+			}
+		}
+	}
+	// Decode the base postings into the second workspace scratch, applying
+	// the rebase-void rule, so the emission below is one fused two-array
+	// merge with a single inlined emission site and register-local stats —
+	// the shape that keeps the 64-mutation worst case inside the mid-window
+	// gate.
+	var base []primaryExactProbeTile
+	if workspace != nil {
+		base = workspace.baseTiles[:0]
+	}
+	if resident.present {
+		if match, found := resident.view.LookupRecord(keyRecord); found {
+			iterator := match.MaskIterator()
+			for {
+				tileID, mask, next := iterator.Next()
+				if !next {
+					break
+				}
+				if mask.Chunk != 0 || mask.Bits == 0 {
+					return dst, storeio.ErrPrimaryExactIndexCorrupt
+				}
+				if overlayTiles && epoch.rebaseFloor(tileID, atGen) != 0 {
+					// Rebased bucket: base postings void; the rebase group's
+					// absolute records are the only truth for its tiles.
+					continue
+				}
+				base = append(base, primaryExactProbeTile{
+					tileID: tileID, bits: mask.Bits,
+				})
+			}
+		}
+	}
+	// Sentinel-terminated two-array merge: both sides end on an impossible
+	// tile id, so the hot loop carries no bounds checks, and the flat-table
+	// liveness probe is inlined (hoisted slot array + mask) — together these
+	// are what hold the 64-mutation worst case inside the 1.5 µs gate. The
+	// scratch write-back happens after the sentinels so their grown capacity
+	// is what the workspace retains.
+	overlay = append(overlay, primaryExactProbeTile{tileID: ^uint32(0)})
+	base = append(base, primaryExactProbeTile{tileID: ^uint32(0)})
+	if workspace != nil {
+		workspace.overlayTiles = overlay
+		workspace.baseTiles = base
+	}
+	liveSlots := epoch.live.slots
+	liveMask := uint32(len(liveSlots) - 1)
+	var candidateRows uint64
+	var candidateChunks int
+	at, bt := 0, 0
+	for {
+		tileID := overlay[at].tileID
+		var maskBits uint64
+		if tileID <= base[bt].tileID {
+			if tileID == ^uint32(0) {
+				break
+			}
+			// An overlay record ≤ G owns its tile absolutely; a base posting
+			// for the same tile is superseded whether the record adds,
+			// moves, or clears bits.
+			maskBits = overlay[at].bits
+			if base[bt].tileID == tileID {
+				bt++
+			}
+			at++
+			if maskBits == 0 {
+				continue
+			}
+		} else {
+			tileID, maskBits = base[bt].tileID, base[bt].bits
+			bt++
+		}
+		var live uint64
+		h := tileID
+		h ^= h >> 16
+		h *= 0x45d9f3b
+		h ^= h >> 16
+		for slot := h & liveMask; ; slot = (slot + 1) & liveMask {
+			entry := &liveSlots[slot]
+			if entry.mask == nil {
+				break
+			}
+			if entry.tileID == tileID {
+				live = entry.mask[0]
+				break
+			}
+		}
+		if overlayTiles {
+			if entry := epoch.lookupTileEntry(tileID); entry != nil {
+				for record := entry.head.Load(); record != nil; record = record.next {
+					if record.gen <= atGen {
+						live = record.live
+						break
+					}
+				}
+			}
+		}
+		if maskBits&^live != 0 {
 			return dst, storeio.ErrPrimaryExactIndexCorrupt
 		}
-		dst = append(dst, store.Mask{Chunk: tileID, Bits: mask.Bits})
-		if workspace != nil {
-			rows := uint64(bits.OnesCount64(mask.Bits))
-			workspace.lastProbe.CandidateRows += rows
-			workspace.lastProbe.CertificateRows += rows
-			workspace.lastProbe.MatchedRows += rows
-			workspace.lastProbe.CandidateChunks++
-			workspace.lastProbe.PostingPages = 1
-		}
+		dst = append(dst, store.Mask{Chunk: tileID, Bits: maskBits})
+		candidateRows += uint64(bits.OnesCount64(maskBits))
+		candidateChunks++
+	}
+	if workspace != nil && candidateChunks != 0 {
+		workspace.lastProbe.CandidateRows += candidateRows
+		workspace.lastProbe.CertificateRows += candidateRows
+		workspace.lastProbe.MatchedRows += candidateRows
+		workspace.lastProbe.CandidateChunks += candidateChunks
+		workspace.lastProbe.PostingPages = 1
 	}
 	return dst, nil
 }
@@ -271,7 +464,6 @@ func buildPrimaryExactIndexes(
 		}
 		slices.Sort(keys)
 		terms := make([]storeio.IndexTermLeafTerm, len(keys))
-		var componentScratch [storeio.TermPostingMaxPayloadBytes]byte
 		for termAt, key := range keys {
 			keyBytes := []byte(key)
 			record, ok := storeio.OpenIndexTermKeyRecord(tx.StoreID(), keyBytes)
@@ -287,23 +479,19 @@ func buildPrimaryExactIndexes(
 			slices.Sort(tiles)
 			postings := make([]storeio.IndexTermLeafPosting, len(tiles))
 			for postingAt, tileID := range tiles {
-				var posting [storeio.TermPostingTileChunks]uint64
-				posting[0] = byIndex[indexID][key][tileID]
+				maskBits := byIndex[indexID][key][tileID]
 				liveMask := live[tileID]
-				built, componentBytes, buildErr := storeio.BuildTermPosting(
-					componentScratch[:], tileID, &posting, liveMask,
-				)
-				if buildErr != nil {
-					return storeio.PageRef{}, buildErr
-				}
-				var component []byte
-				if componentBytes != 0 {
-					component = append(
-						[]byte(nil), componentScratch[:componentBytes]...,
-					)
-				}
+				// Chunk-0-only postings encode through the leaf's direct
+				// representations; the synthetic (tile, rows) record plus
+				// the mask is the builder's complete input (see
+				// encodeIndexTermLeaf).
 				postings[postingAt] = storeio.IndexTermLeafPosting{
-					Posting: built, Component: component, Live: liveMask,
+					Posting: storeio.TermPosting{
+						TileID: tileID,
+						Rows:   uint16(bits.OnesCount64(maskBits)),
+					},
+					Live:       liveMask,
+					Chunk0Bits: maskBits, Chunk0Only: true,
 				}
 			}
 			terms[termAt] = storeio.IndexTermLeafTerm{

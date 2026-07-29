@@ -382,17 +382,16 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	if stateErr != nil {
 		return nil, stateErr
 	}
-	// exact and live pin the primary index's frozen catalog and live-slot map for
-	// the captured generation, exactly as pinSnapshot does; a database snapshot
-	// that dropped them would answer an indexed mask probe against a nil catalog
-	// and silently degrade a covered query to a full scan.
-	exact := c.primaryExact
-	live := c.primaryLive
+	// The epoch pointer pins the primary index's fold base and overlay for
+	// the captured generation, exactly as pinSnapshot does; a database
+	// snapshot that dropped it would answer an indexed mask probe against a
+	// nil catalog and silently degrade a covered query to a full scan.
+	epoch := c.primaryEpoch
 	lease, err := c.leases.Acquire(state.root.Generation)
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{collection: c, state: state, exact: exact, live: live, lease: lease}, nil
+	return &Snapshot{collection: c, state: state, epoch: epoch, lease: lease}, nil
 }
 
 // Collection returns the captured view of name, reporting whether the

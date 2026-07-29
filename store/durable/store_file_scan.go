@@ -178,7 +178,13 @@ func (s *Snapshot) rangePrimaryMasks(
 		return scratch, store.ErrMaskChunk
 	}
 	bounds := s.collection.primaryLeafBounds(state)
-	enforceLive := s.live != nil
+	// Liveness enforcement resolves through the pinned epoch's read rule at
+	// this snapshot's generation: newest tile record ≤ G, else the flat
+	// table — the same fence the probe's posting recheck uses.
+	epoch := s.epoch
+	enforceLive := epoch != nil
+	atGen := state.root.Generation
+	overlayTiles := enforceLive && epoch.tileRecordCount.Load() != 0
 	// The Snapshot-owned buffer reassembles each selected out-of-line value, kept
 	// separate from the posting scratch that borrows the row's key and descriptor.
 	// Using the field rather than a captured local keeps the per-bucket callback
@@ -201,9 +207,10 @@ func (s *Snapshot) rangePrimaryMasks(
 			}
 			previous = mask.Chunk
 			quadrant := mask.Chunk & 3
-			live := s.live[mask.Chunk]
 			if mask.Bits != 0 && enforceLive &&
-				(live == nil || mask.Bits&^live[0] != 0) {
+				mask.Bits&^epoch.resolveLiveWord(
+					mask.Chunk, atGen, overlayTiles,
+				) != 0 {
 				return scratch, store.ErrMaskChunk
 			}
 			selected[quadrant] = mask.Bits

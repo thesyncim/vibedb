@@ -210,8 +210,18 @@ func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	powerSafe := powerSafeEngine.(*vibeDurable).options()
-	if powerSafe.Durability != durable.DurabilitySync {
-		t.Fatalf("power-safe store durability = %d, want sync", powerSafe.Durability)
+	// The power-safe row rides the journal group commit: buffered-visible
+	// with a per-mutation redo record synced at the platform's strongest
+	// power-loss boundary, not the strict DurabilitySync lane (whose
+	// acknowledgements cannot group). See the DurabilityPowerSafe mapping.
+	if powerSafe.Durability != durable.DurabilityBufferedVisible {
+		t.Fatalf(
+			"power-safe store durability = %d, want buffered-visible",
+			powerSafe.Durability,
+		)
+	}
+	if !powerSafe.RecoveryJournal {
+		t.Fatal("power-safe row must acknowledge through the recovery journal")
 	}
 	if powerSafe.CheckpointStrength != durable.CheckpointPowerSafe {
 		t.Fatalf(

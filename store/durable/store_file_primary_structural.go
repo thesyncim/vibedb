@@ -658,14 +658,14 @@ func (c *Collection) commitPrimaryStructural(
 	// re-encoded (captured in encodeStructuralLeaf) and the buckets it removed,
 	// and stage them as durable pages in this same transaction so the postings
 	// and the rearranged tablet publish in one atomic generation.
-	preparedExact, prepareExactErr := c.prepareStructuralExactLocked()
+	preparedExact, prepareExactErr := c.prepareStructuralExactLocked(generation)
 	if prepareExactErr != nil {
 		return prepareExactErr
 	}
 	var exactRoot storeio.PageRef
 	if preparedExact.active {
 		exactRoot, err = c.stagePrimaryExactPagesLocked(
-			tx, state, generation, preparedExact.exact,
+			tx, state, generation, preparedExact.epoch.exact,
 		)
 		if err != nil {
 			return err

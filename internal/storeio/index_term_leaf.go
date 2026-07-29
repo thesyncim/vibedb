@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math/bits"
+	"sync"
 	"unsafe"
 )
 
@@ -82,6 +83,19 @@ type IndexTermLeafPosting struct {
 	Posting   TermPosting
 	Component []byte
 	Live      *[TermPostingTileChunks]uint64
+	// Chunk0Bits/Chunk0Only let a builder that just derived Posting from a
+	// single chunk-0 mask — the ordered primary graph's whole posting
+	// universe (slots are uint8: tile = bucket<<2 | slot>>6, bit = slot&63)
+	// — hand that mask straight back, skipping the per-posting payload
+	// re-decode and codec re-selection OpenTermPosting would repeat on bytes
+	// BuildTermPosting produced in the same call chain. Measured on the
+	// checkpoint fold at the 10k shape, that duplicated selection was about
+	// half the whole encode's CPU. Foreign postings (device reads, other
+	// chunks) leave Chunk0Only false and keep the full admission; a
+	// mismatched caller mask is still caught by the built leaf's own
+	// admission, which re-validates every posting against liveness.
+	Chunk0Bits uint64
+	Chunk0Only bool
 }
 
 // IndexTermLeafTerm groups all non-empty tile postings for one exact canonical
@@ -245,15 +259,21 @@ type IndexTermLeafOneMaskBlockIterator struct {
 }
 
 type indexTermLeafDerivedPosting struct {
-	tileID        uint32
-	rows          uint16
-	kind          byte
-	codec         TermPostingCodec
-	payload       []byte
-	direct        [2]TermPostingMask
-	directCount   uint8
-	dictionaryKey string
-	dictionary    uint16
+	tileID uint32
+	rows   uint16
+	kind   byte
+	codec  TermPostingCodec
+	// payload borrows the input posting's inline array or component for the
+	// duration of one build. dictionaryEligible marks payloads long enough
+	// to be dictionary candidates; payloadHash keys the builder's
+	// use-counting table so no per-posting identity string is materialized
+	// (the string form was ~220 KB of garbage per 10k-posting build).
+	payload           []byte
+	direct            [2]TermPostingMask
+	directCount       uint8
+	dictionaryEligible bool
+	payloadHash       uint64
+	dictionary        uint16
 }
 
 type indexTermLeafDerivedTerm struct {
@@ -299,10 +319,26 @@ func AppendIndexTermLeaf(
 		return original, fmt.Errorf("%w: exact-term leaf term count", ErrInvalidWrite)
 	}
 
-	derived := make([]indexTermLeafDerivedTerm, len(terms))
+	// The builder runs once per bulk build AND once per exact-index
+	// checkpoint fold, so its working set comes from a pooled scratch and
+	// the derived postings live in one flat slab: the per-call map, string,
+	// and per-term slice churn was ~630 KB of garbage per 10k-posting build,
+	// enough to make GC the dominant cost of a dirty indexed checkpoint.
 	totalPostings := 0
+	for i := range terms {
+		if totalPostings > int(^uint16(0))-len(terms[i].Postings) {
+			return original, fmt.Errorf("%w: exact-term leaf posting count", ErrInvalidWrite)
+		}
+		totalPostings += len(terms[i].Postings)
+	}
+	scratch := indexTermLeafBuilderPool.Get().(*indexTermLeafBuilderScratch)
+	defer scratch.release()
+	derived := scratch.derivedTerms(len(terms))
+	postingSlab := scratch.derivedPostings(totalPostings)
+	scratch.resetUses(totalPostings)
+
 	keyBytes := 0
-	payloadUses := make(map[string]int)
+	slabAt := 0
 	for i := range terms {
 		term := &terms[i]
 		key := term.Key.Canonical
@@ -312,11 +348,6 @@ func AppendIndexTermLeaf(
 			len(term.Postings) == 0 {
 			return original, fmt.Errorf("%w: exact-term leaf key or order", ErrInvalidWrite)
 		}
-		if totalPostings > int(^uint16(0))-len(term.Postings) {
-			return original, fmt.Errorf("%w: exact-term leaf posting count", ErrInvalidWrite)
-		}
-		totalPostings += len(term.Postings)
-
 		shared := 0
 		if i%IndexTermLeafRestartInterval != 0 {
 			restart := i - i%IndexTermLeafRestartInterval
@@ -326,7 +357,7 @@ func AppendIndexTermLeaf(
 		}
 		derived[i] = indexTermLeafDerivedTerm{
 			key: key, shared: uint16(shared),
-			postings:    make([]indexTermLeafDerivedPosting, len(term.Postings)),
+			postings:    postingSlab[slabAt : slabAt+len(term.Postings) : slabAt+len(term.Postings)],
 			directBlock: indexTermLeafNoDirectBlock,
 		}
 		keyBytes += len(key) - shared
@@ -339,29 +370,48 @@ func AppendIndexTermLeaf(
 				input.Posting.Rows == 0 {
 				return original, fmt.Errorf("%w: exact-term leaf posting order", ErrInvalidWrite)
 			}
-			view, err := OpenTermPosting(input.Posting, input.Component, input.Live)
-			if err != nil {
-				return original, fmt.Errorf("%w: exact-term leaf posting: %v", ErrInvalidWrite, err)
-			}
-			var masks [TermPostingTileChunks]uint64
-			if !view.MasksInto(&masks) {
-				return original, fmt.Errorf("%w: exact-term leaf posting masks", ErrInvalidWrite)
-			}
-			posting := deriveIndexTermLeafPosting(input.Posting, input.Component, &masks)
-			derived[i].postings[j] = posting
-			if posting.dictionaryKey != "" {
-				payloadUses[posting.dictionaryKey]++
+			if input.Chunk0Only {
+				// The caller derived this record from a single chunk-0 mask
+				// in this same call chain (the primary graph's whole posting
+				// universe); re-decoding, re-selecting the codec, and
+				// scanning all 64 chunks here would repeat work whose
+				// outcome is fixed — a single-chunk posting always lands on
+				// a direct representation. The row-count cross-check plus
+				// the built leaf's admission keep a mismatched mask
+				// fail-closed. The specialized derive also skips the
+				// per-posting 512-byte mask-array zeroing, which was a
+				// measured slice of the checkpoint fold at the 10k shape.
+				if input.Posting.Rows != uint16(bits.OnesCount64(input.Chunk0Bits)) {
+					return original, fmt.Errorf("%w: exact-term leaf posting masks", ErrInvalidWrite)
+				}
+				derived[i].postings[j] = deriveChunk0IndexTermLeafPosting(
+					input.Posting.TileID, input.Posting.Rows, input.Chunk0Bits,
+				)
+			} else {
+				var masks [TermPostingTileChunks]uint64
+				view, err := OpenTermPosting(input.Posting, input.Component, input.Live)
+				if err != nil {
+					return original, fmt.Errorf("%w: exact-term leaf posting: %v", ErrInvalidWrite, err)
+				}
+				if !view.MasksInto(&masks) {
+					return original, fmt.Errorf("%w: exact-term leaf posting masks", ErrInvalidWrite)
+				}
+				posting := deriveIndexTermLeafPosting(input.Posting, input.Component, &masks)
+				derived[i].postings[j] = posting
+				if posting.dictionaryEligible {
+					scratch.countUse(&derived[i].postings[j], int32(slabAt+j))
+				}
 			}
 			previousTile = input.Posting.TileID
 		}
+		slabAt += len(term.Postings)
 		derived[i].directBlock = selectIndexTermLeafDirectBlock(
 			derived[i].postings,
 		)
 	}
 	globalDirect := selectIndexTermLeafGlobalDirect(derived)
 
-	dictionaries := make([]indexTermLeafDictionary, 0)
-	dictionaryIndex := make(map[string]uint16)
+	dictionaries := scratch.dictionaries[:0]
 	postingBytes := 0
 	for i := range derived {
 		if globalDirect != indexTermLeafNoDirectBlock {
@@ -381,19 +431,20 @@ func AppendIndexTermLeaf(
 		var previousTile uint32
 		for j := range derived[i].postings {
 			posting := &derived[i].postings[j]
-			if posting.dictionaryKey != "" &&
-				(payloadUses[posting.dictionaryKey]-1)*len(posting.payload) >
+			if posting.dictionaryEligible {
+				use := scratch.lookupUse(posting)
+				if int(use.uses-1)*len(posting.payload) >
 					indexTermLeafDictionaryBytes {
-				index, ok := dictionaryIndex[posting.dictionaryKey]
-				if !ok {
-					index = uint16(len(dictionaries))
-					dictionaryIndex[posting.dictionaryKey] = index
-					dictionaries = append(dictionaries, indexTermLeafDictionary{
-						codec: posting.codec, rows: posting.rows, payload: posting.payload,
-					})
+					if !use.assigned {
+						use.assigned = true
+						use.dictionary = uint16(len(dictionaries))
+						dictionaries = append(dictionaries, indexTermLeafDictionary{
+							codec: posting.codec, rows: posting.rows, payload: posting.payload,
+						})
+					}
+					posting.kind = indexTermLeafAdaptiveDictionary
+					posting.dictionary = use.dictionary
 				}
-				posting.kind = indexTermLeafAdaptiveDictionary
-				posting.dictionary = index
 			}
 			delta := uint64(posting.tileID)
 			if j != 0 {
@@ -403,6 +454,7 @@ func AppendIndexTermLeaf(
 			previousTile = posting.tileID
 		}
 	}
+	scratch.dictionaries = dictionaries
 
 	dictionaryPayloadBytes := 0
 	for i := range dictionaries {
@@ -426,7 +478,18 @@ func AppendIndexTermLeaf(
 		return original, fmt.Errorf("%w: exact-term leaf size", ErrInvalidWrite)
 	}
 
-	encoded := make([]byte, totalBytes)
+	// Carve the output straight out of dst (zeroed: alignment padding and
+	// the equality table's untouched tails are admitted as all-zero), so a
+	// caller reusing its buffer pays no intermediate 64 KiB copy per build.
+	dstLen := len(dst)
+	if cap(dst)-dstLen < totalBytes {
+		grown := make([]byte, dstLen, dstLen+totalBytes)
+		copy(grown, dst)
+		dst = grown
+	}
+	dst = dst[:dstLen+totalBytes]
+	encoded := dst[dstLen:]
+	clear(encoded)
 	copy(encoded[0:4], indexTermLeafMagic[:])
 	encoded[4] = indexTermLeafVersion
 	encoded[5] = IndexTermLeafRestartInterval
@@ -517,7 +580,123 @@ func AppendIndexTermLeaf(
 		dictionaryPosition += len(dictionary.payload)
 	}
 	binary.LittleEndian.PutUint32(encoded[28:32], indexTermLeafChecksum(encoded))
-	return append(dst, encoded...), nil
+	return dst, nil
+}
+
+// indexTermLeafBuilderScratch is AppendIndexTermLeaf's pooled working set:
+// the derived term/posting slabs, the dictionary accumulator, and the
+// open-addressed payload-identity table that replaced the per-posting string
+// keyed maps. release clears every borrowed reference (payload and key
+// slices point into caller storage) before returning to the pool.
+type indexTermLeafBuilderScratch struct {
+	derived      []indexTermLeafDerivedTerm
+	postings     []indexTermLeafDerivedPosting
+	dictionaries []indexTermLeafDictionary
+	uses         []indexTermLeafPayloadUse
+	useTable     []int32
+}
+
+type indexTermLeafPayloadUse struct {
+	hash       uint64
+	first      int32
+	uses       int32
+	dictionary uint16
+	assigned   bool
+}
+
+var indexTermLeafBuilderPool = sync.Pool{
+	New: func() any { return &indexTermLeafBuilderScratch{} },
+}
+
+func (s *indexTermLeafBuilderScratch) derivedTerms(
+	n int,
+) []indexTermLeafDerivedTerm {
+	if cap(s.derived) < n {
+		s.derived = make([]indexTermLeafDerivedTerm, n)
+	}
+	s.derived = s.derived[:n]
+	return s.derived
+}
+
+func (s *indexTermLeafBuilderScratch) derivedPostings(
+	n int,
+) []indexTermLeafDerivedPosting {
+	if cap(s.postings) < n {
+		s.postings = make([]indexTermLeafDerivedPosting, n)
+	}
+	s.postings = s.postings[:n]
+	return s.postings
+}
+
+func (s *indexTermLeafBuilderScratch) resetUses(totalPostings int) {
+	size := 8
+	for size < 2*totalPostings {
+		size <<= 1
+	}
+	if cap(s.useTable) < size {
+		s.useTable = make([]int32, size)
+	}
+	s.useTable = s.useTable[:size]
+	for i := range s.useTable {
+		s.useTable[i] = -1
+	}
+	s.uses = s.uses[:0]
+}
+
+// countUse records one dictionary-eligible payload occurrence, resolving
+// hash collisions by full identity comparison against the representative
+// posting already in the slab.
+func (s *indexTermLeafBuilderScratch) countUse(
+	posting *indexTermLeafDerivedPosting, slabIndex int32,
+) {
+	mask := uint64(len(s.useTable) - 1)
+	for at := posting.payloadHash & mask; ; at = (at + 1) & mask {
+		index := s.useTable[at]
+		if index < 0 {
+			s.useTable[at] = int32(len(s.uses))
+			s.uses = append(s.uses, indexTermLeafPayloadUse{
+				hash: posting.payloadHash, first: slabIndex, uses: 1,
+			})
+			return
+		}
+		use := &s.uses[index]
+		if use.hash == posting.payloadHash &&
+			indexTermLeafPayloadIdentityEqual(
+				&s.postings[use.first], posting,
+			) {
+			use.uses++
+			return
+		}
+	}
+}
+
+func (s *indexTermLeafBuilderScratch) lookupUse(
+	posting *indexTermLeafDerivedPosting,
+) *indexTermLeafPayloadUse {
+	mask := uint64(len(s.useTable) - 1)
+	for at := posting.payloadHash & mask; ; at = (at + 1) & mask {
+		index := s.useTable[at]
+		if index < 0 {
+			// Unreachable by construction: every eligible posting was
+			// counted in the first pass.
+			return &indexTermLeafPayloadUse{}
+		}
+		use := &s.uses[index]
+		if use.hash == posting.payloadHash &&
+			indexTermLeafPayloadIdentityEqual(
+				&s.postings[use.first], posting,
+			) {
+			return use
+		}
+	}
+}
+
+func (s *indexTermLeafBuilderScratch) release() {
+	clear(s.derived[:cap(s.derived)])
+	clear(s.postings[:cap(s.postings)])
+	clear(s.dictionaries[:cap(s.dictionaries)])
+	s.dictionaries = s.dictionaries[:0]
+	indexTermLeafBuilderPool.Put(s)
 }
 
 // OpenIndexTermLeaf validates checksum, exact section layout, restart-front
@@ -1544,13 +1723,59 @@ func deriveIndexTermLeafPosting(
 		derived.payload = component
 	}
 	if len(derived.payload) > TermPostingInlineBytes {
-		var identity [3 + TermPostingMaxPayloadBytes]byte
-		identity[0] = byte(posting.Codec)
-		binary.LittleEndian.PutUint16(identity[1:3], posting.Rows)
-		copy(identity[3:], derived.payload)
-		derived.dictionaryKey = string(identity[:3+len(derived.payload)])
+		derived.dictionaryEligible = true
+		derived.payloadHash = indexTermLeafPayloadHash(
+			posting.Codec, posting.Rows, derived.payload,
+		)
 	}
 	return derived
+}
+
+// deriveChunk0IndexTermLeafPosting is deriveIndexTermLeafPosting specialized
+// for a posting whose only populated chunk is chunk 0: exactly the direct
+// branches of the general derivation (one non-zero chunk can never reach the
+// adaptive fallthrough), with no 64-chunk scan and no mask-array
+// materialization.
+func deriveChunk0IndexTermLeafPosting(
+	tileID uint32, rows uint16, chunk0 uint64,
+) indexTermLeafDerivedPosting {
+	derived := indexTermLeafDerivedPosting{
+		tileID: tileID, rows: rows,
+		kind: indexTermLeafAdaptiveInline,
+	}
+	if chunk0 != 0 {
+		derived.direct[0] = TermPostingMask{Chunk: 0, Bits: chunk0}
+		derived.directCount = 1
+	}
+	if rows == 1 {
+		derived.kind = indexTermLeafDirect1
+		return derived
+	}
+	derived.kind = indexTermLeafDirectN
+	return derived
+}
+
+// indexTermLeafPayloadHash fingerprints one dictionary-candidate payload
+// identity (codec, rows, payload bytes) for the builder's use-counting
+// table. Collisions are resolved by full byte comparison, never trusted.
+func indexTermLeafPayloadHash(
+	codec TermPostingCodec, rows uint16, payload []byte,
+) uint64 {
+	const offset, prime = 0xcbf29ce484222325, 0x100000001b3
+	h := uint64(offset)
+	h = (h ^ uint64(codec)) * prime
+	h = (h ^ uint64(rows)) * prime
+	for _, b := range payload {
+		h = (h ^ uint64(b)) * prime
+	}
+	return h
+}
+
+func indexTermLeafPayloadIdentityEqual(
+	a, b *indexTermLeafDerivedPosting,
+) bool {
+	return a.codec == b.codec && a.rows == b.rows &&
+		bytes.Equal(a.payload, b.payload)
 }
 
 func indexTermLeafPostingBytes(
