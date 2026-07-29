@@ -269,6 +269,41 @@ func VisitPrimaryLeafPostingRows(
 			}
 		}
 		return scratch, nil
+	case CommonPrimaryLeafUnified:
+		// The unified class keeps the envelope's stable hash slots (the one
+		// slot discipline of the unified-leaf design §3.1), so posting slots
+		// resolve from the encoded slot tables rather than the lexical rank;
+		// row bodies render into the reused scratch exactly as templates do.
+		uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
+		if !ok {
+			return scratch, primaryExactCorrupt("unified leaf")
+		}
+		slots, slotsOK := uv.env.rankSlots()
+		if !slotsOK {
+			return scratch, primaryExactCorrupt("unified slots")
+		}
+		it := uv.env.AllRows()
+		for rank := 0; ; rank++ {
+			key, raw, overflow, ok := it.NextRawBorrowed()
+			if !ok {
+				break
+			}
+			if overflow {
+				if err := fn(slots[rank], key, raw, true); err != nil {
+					return scratch, err
+				}
+				continue
+			}
+			var rendered bool
+			scratch, rendered = uv.AppendRowBody(scratch[:0], raw)
+			if !rendered {
+				return scratch, primaryExactCorrupt("unified row body")
+			}
+			if err := fn(slots[rank], key, scratch, false); err != nil {
+				return scratch, err
+			}
+		}
+		return scratch, nil
 	}
 	view := AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
 	it := view.AllRows()

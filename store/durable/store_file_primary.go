@@ -182,6 +182,40 @@ func (c *Collection) appendPrimaryLeafValue(
 		}
 		out, found := cv.AppendRawByKey(dst, keyBytes)
 		return out, found, nil
+	case storeio.CommonPrimaryLeafUnified:
+		uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+			page, storeID, bucket, bounds,
+		)
+		if !ok {
+			return dst, false, fmt.Errorf(
+				"%w: unified primary leaf",
+				storeio.ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		body, overflow, found := uv.LookupBodyHashed(hash, keyBytes)
+		if !found {
+			return dst, false, nil
+		}
+		if overflow {
+			// The overflow chain carries the document's canonical bytes, so
+			// the read is the existing chain reassembly at verbatim parity
+			// (unified-leaf design §6).
+			out, err := c.appendPrimaryOverflowValue(
+				dst, storeio.DecodePrimaryOverflowRef(body), bounds,
+			)
+			if err != nil {
+				return dst, false, err
+			}
+			return out, true, nil
+		}
+		out, rendered := uv.AppendRowBody(dst, body)
+		if !rendered {
+			return dst, false, fmt.Errorf(
+				"%w: unified row body",
+				storeio.ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		return out, true, nil
 	}
 	leaf := storeio.AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
 	_, value, found := leaf.LookupHashed(hash, keyBytes)

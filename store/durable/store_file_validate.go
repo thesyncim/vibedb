@@ -160,6 +160,12 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 				leafBounds,
 			)
 			return err
+		case storeio.CommonPrimaryLeafUnified:
+			_, err = storeio.OpenCommonPrimaryUnifiedLeaf(
+				page, header.StoreID, bucket, ref, v.generation.Load(),
+				leafBounds,
+			)
+			return err
 		}
 		_, err = storeio.OpenCommonPrimaryLeaf(
 			page, header.StoreID, bucket, ref, v.generation.Load(), leafBounds,

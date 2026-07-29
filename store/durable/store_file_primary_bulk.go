@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -117,14 +120,32 @@ func CreateFromPrimary(
 	}
 
 	// DocumentFormatCompact stages every leaf as the compact document-group
-	// class; verbatim uses the adaptive succinct/template classes. The policy is
-	// threaded identically into the page-count reservation and the build so the
-	// single staging transaction reserves exactly the leaves the build produces.
+	// class; verbatim uses the adaptive succinct/template classes; UnifiedLeaves
+	// routes to the class-5 unified planner and codec. The policy is threaded
+	// identically into the page-count reservation and the build so the single
+	// staging transaction reserves exactly the leaves the build produces.
 	leafPolicy := storeio.PrimaryLeafAdaptive
+	formatTag := options.DocumentFormat
 	if options.DocumentFormat == DocumentFormatCompact {
 		leafPolicy = storeio.PrimaryLeafCompact
 	}
-	storeID := primaryBulkStoreID(records, normalized, options.DocumentFormat)
+	if options.UnifiedLeaves {
+		leafPolicy = storeio.PrimaryLeafUnified
+		// The unified representation stores canonical bytes, so the build's
+		// deterministic identity must not collide with a verbatim or compact
+		// build over the same records: hash a distinct format tag beyond the
+		// two public DocumentFormat values.
+		formatTag = DocumentFormat(2)
+		// Canonicalize every document once, up front, so the leaf encoder, the
+		// exact-index term derivation, and every later read all observe exactly
+		// one spelling (unified-leaf design §3.2/§7.5: canonicalization happens
+		// at admission, before anything else consumes the bytes). The snapshot
+		// backing the borrowed values stays pinned through the KeepAlive below.
+		if err := canonicalizePrimaryBulkRecords(records); err != nil {
+			return 0, err
+		}
+	}
+	storeID := primaryBulkStoreID(records, normalized, formatTag)
 	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records, leafPolicy)
 	if err != nil {
 		return 0, err
@@ -301,6 +322,59 @@ func CreateFromPrimary(
 		return 0, err
 	}
 	return fileEnd, nil
+}
+
+// canonicalizePrimaryBulkRecords rewrites every record value to its vibejson
+// canonical form (unified-leaf design §3.2). Already-canonical values — the
+// steady state for engine-generated input (§8) — are left borrowed from the
+// bulk snapshot; rewritten spellings live in one arena sized up front. The
+// arena never reallocates because canonicalization can only shrink or keep a
+// document's length under the pinned encoder: whitespace is dropped and every
+// escape normalization collapses (raw control bytes are illegal JSON, so a
+// control character's source spelling is never shorter than its canonical
+// one), which the capacity check below still enforces defensively.
+func canonicalizePrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error {
+	total := 0
+	for at := range records {
+		total += len(records[at].Value)
+	}
+	arena := make([]byte, 0, total)
+	var ws storeio.CanonicalWorkspace
+	entryStore := make([]vibejson.IndexEntry, 0, 128)
+	for at := range records {
+		var index vibejson.Index
+		for {
+			var err error
+			index, err = vibejson.BuildIndex(
+				records[at].Value, entryStore[:cap(entryStore)],
+			)
+			if err == nil {
+				entryStore = index.Entries
+				break
+			}
+			if !errors.Is(err, document.ErrIndexFull) {
+				return err
+			}
+			grown := max(cap(entryStore)*2, 128)
+			entryStore = make([]vibejson.IndexEntry, 0, grown)
+		}
+		if storeio.IndexIsCanonical(index, &ws) {
+			continue
+		}
+		off := len(arena)
+		out, err := storeio.AppendCanonicalIndexed(arena, index, &ws)
+		if err != nil {
+			return err
+		}
+		if cap(out) != cap(arena) && off != 0 {
+			return fmt.Errorf(
+				"vibejson: canonical bulk arena grew past its sized capacity",
+			)
+		}
+		arena = out
+		records[at].Value = arena[off:len(arena):len(arena)]
+	}
+	return nil
 }
 
 // sortPrimaryBulkRecords establishes the exact ordering contract shared by

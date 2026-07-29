@@ -50,6 +50,7 @@ type PrimaryGraphCursor struct {
 	leafClass     CommonPrimaryLeafClass
 	tcLeaf        CommonPrimaryTemplateLeafView
 	compactLeaf   CommonPrimaryCompactLeafView
+	unifiedLeaf   CommonPrimaryUnifiedLeafView
 	tcRank        int
 	spliceScratch []byte
 
@@ -303,6 +304,27 @@ func (c *PrimaryGraphCursor) openLeaf(
 		}
 		return nil
 	}
+	if c.leafClass == CommonPrimaryLeafUnified {
+		// The unified class reuses the succinct envelope's iterator directly:
+		// keys and raw row bodies (or overflow descriptors) stream through the
+		// same boundary machinery as the raw classes, and only the body render
+		// differs at consumption time in nextRawBorrowed.
+		uv, ok := AdmittedCommonPrimaryUnifiedLeaf(
+			lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
+		)
+		if !ok {
+			return fmt.Errorf(
+				"%w: unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+			)
+		}
+		c.unifiedLeaf = uv
+		if lowerBound {
+			c.rows = uv.env.Range(c.lower, nil)
+		} else {
+			c.rows = uv.env.AllRows()
+		}
+		return nil
+	}
 	leaf := AdmittedCommonPrimaryLeaf(
 		lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
 	)
@@ -342,6 +364,23 @@ func (c *PrimaryGraphCursor) nextRawBorrowed() (
 		}
 		c.spliceScratch = c.compactLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
 		c.tcRank++
+		return k, c.spliceScratch, false, true
+	case CommonPrimaryLeafUnified:
+		k, body, isOverflow, rowOK := c.rows.NextRawBorrowed()
+		if !rowOK {
+			return nil, nil, false, false
+		}
+		if isOverflow {
+			return k, body, true, true
+		}
+		out, rendered := c.unifiedLeaf.AppendRowBody(c.spliceScratch[:0], body)
+		if !rendered {
+			// The leaf passed admission, so a render failure here means the
+			// resident frame changed under us; fail the scan closed rather
+			// than yield partial bytes.
+			return nil, nil, false, false
+		}
+		c.spliceScratch = out
 		return k, c.spliceScratch, false, true
 	default:
 		return c.rows.NextRawBorrowed()
@@ -396,7 +435,8 @@ func (c *PrimaryGraphCursor) visitAllInline(
 ) ([]byte, PageRef, error) {
 	for {
 		if c.leafClass != CommonPrimaryLeafTemplate &&
-			c.leafClass != CommonPrimaryLeafCompact {
+			c.leafClass != CommonPrimaryLeafCompact &&
+			c.leafClass != CommonPrimaryLeafUnified {
 			// The raw classes drain each leaf in one fused call; the template
 			// and compact classes step row by row because each row is
 			// reconstructed through class-specific scratch, not borrowed.
@@ -547,6 +587,7 @@ func (c *PrimaryGraphCursor) releaseAnchor() {
 	c.leafClass = 0
 	c.tcLeaf = CommonPrimaryTemplateLeafView{}
 	c.compactLeaf = CommonPrimaryCompactLeafView{}
+	c.unifiedLeaf = CommonPrimaryUnifiedLeafView{}
 	c.tcRank = 0
 	c.anchorLease.Release()
 	c.anchor = GlobalTabletCatalogAnchorView{}

@@ -595,6 +595,28 @@ func (w *verifyWalker) walkLeaf(route storeio.SegmentedTabletRouterRoute) {
 		}
 		return
 	}
+	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafUnified {
+		uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
+			page, w.storeID, route.Bucket, route.Ref,
+			w.root.Generation, w.leafBounds,
+		)
+		if err != nil {
+			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+				"open unified: %v", err)
+			return
+		}
+		w.count("primary-leaf")
+		for rank := 0; rank < uv.Len(); rank++ {
+			key, ok := uv.RowAt(rank)
+			if !ok {
+				w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+					"unified row %d", rank)
+				break
+			}
+			w.checkLeafOrder(route, key)
+		}
+		return
+	}
 	// OpenCommonPrimaryLeaf additionally proves the succinct/hash structures and
 	// every overflow PageRef.
 	leaf, err := storeio.OpenCommonPrimaryLeaf(
@@ -830,6 +852,12 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 					salvageSelectingGeneration, leafBounds,
 				)
 				return err == nil
+			case storeio.CommonPrimaryLeafUnified:
+				_, err := storeio.OpenCommonPrimaryUnifiedLeaf(
+					buf[:extent], bootstrap.StoreID, bucket, expected,
+					salvageSelectingGeneration, leafBounds,
+				)
+				return err == nil
 			}
 			_, err := storeio.OpenCommonPrimaryLeaf(
 				buf[:extent], bootstrap.StoreID, bucket, expected,
@@ -912,6 +940,43 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 				records = append(records, salvagedRecord{
 					key:   append([]byte(nil), key...),
 					value: cv.AppendRawRank(nil, rank, ti),
+				})
+			}
+			continue
+		}
+		if storeio.PrimaryLeafClass(buf) == storeio.CommonPrimaryLeafUnified {
+			uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
+				buf, bootstrap.StoreID, bucket, expected,
+				salvageSelectingGeneration, leafBounds,
+			)
+			if err != nil {
+				return report, fmt.Errorf(
+					"vibejson: salvage re-open unified leaf: %w", err,
+				)
+			}
+			report.BucketsKept++
+			for rank := 0; rank < uv.Len(); rank++ {
+				key, body, overflow, ok := uv.RowRawAt(rank)
+				if !ok {
+					return report, fmt.Errorf(
+						"vibejson: salvage unified row %d", rank,
+					)
+				}
+				if overflow {
+					// Salvage skips out-of-line values for every class; the
+					// raw branch below records the same skip for its rows.
+					report.OverflowSkipped++
+					continue
+				}
+				value, rendered := uv.AppendRowBody(nil, body)
+				if !rendered {
+					return report, fmt.Errorf(
+						"vibejson: salvage unified row body %d", rank,
+					)
+				}
+				records = append(records, salvagedRecord{
+					key:   append([]byte(nil), key...),
+					value: value,
 				})
 			}
 			continue
