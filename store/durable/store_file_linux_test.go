@@ -71,8 +71,10 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 	if rows != documents {
 		t.Fatalf("required direct read-ahead rows = %d, want %d", rows, documents)
 	}
-	if stats := reopened.Stats(); !stats.DirectReads || stats.PageReads == 0 ||
-		stats.PrefetchQueued == 0 || stats.PrefetchHits+stats.CoalescedReads == 0 {
+	// The ordered primary graph's scans acquire leaves through the cursor
+	// directly and never feed the prefetch pipeline, so only the direct-read
+	// mode and the fact that device reads happened are load-bearing here.
+	if stats := reopened.Stats(); !stats.DirectReads || stats.PageReads == 0 {
 		t.Fatalf("required direct stats = %+v", stats)
 	}
 }
@@ -321,9 +323,10 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 	options.ReadMode = ReadDirectRequire
 	options.WriteMode = WriteDirectRequire
 	// The test stores tiny inline documents. Keep fixed-buffer registration
-	// equally small so a shared CI host's memlock pressure does not decide
-	// whether the reopen path can be exercised.
-	options.MaxPageSize = options.PageSize
+	// small so a shared CI host's memlock pressure does not decide whether
+	// the reopen path can be exercised; the ordered primary graph's floor is
+	// the 64 KiB catalog root extent.
+	options.MaxPageSize = 64 << 10
 	options.MaxDocumentBytes = options.PageSize
 	collection, err := Create(file, options)
 	if errors.Is(err, ErrStoreDirectIOUnsupported) ||
