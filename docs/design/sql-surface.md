@@ -149,11 +149,12 @@ CREATE INDEX by_tenant_state ON jobs (tenant, state)
 Compound paths are order-sensitive. A named index uses its declared name; an
 unnamed index receives a deterministic name derived from its paths.
 
-Indexes must be declared after `CREATE TABLE` and before the first INSERT.
-Their definitions are frozen into the collection's initial durable layout.
-Once created, however, their postings are mutable: INSERT, whole-document
-UPDATE, DELETE, and a transactional `WriteBatch` maintain exact indexes in the
-same publication as the primary document change.
+Indexes may be declared before or after INSERT. On a populated table, the
+builder reconciles immutable primary leaves in bounded writer steps, writes only
+the new physical index, and atomically publishes the index root and canonical
+catalog. Ordinary mutations carry no build log or build-state branch. Once
+ready, INSERT, whole-document UPDATE, DELETE, and a transactional `WriteBatch`
+maintain exact indexes in the same publication as the primary document change.
 
 The query planner chooses eligible indexes automatically. An exact index is a
 candidate-pruning structure, not an alternate source of truth; stored documents
@@ -470,8 +471,8 @@ operation:
   nested flat-INSERT construction;
 - `ALTER`, `DROP`, `TRUNCATE`, views, unique/check/foreign-key/default/generated
   constraints, and SQL types without a JSON equivalent;
-- indexes created after the first INSERT, unique/partial/range/full-text
-  indexes, expression indexes, and selectable index methods;
+- unique/partial/range/full-text indexes, expression indexes, and selectable
+  index methods;
 - composite primary keys in the typed SQL runtime and atomic transactions
   spanning more than one table.
 

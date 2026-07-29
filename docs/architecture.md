@@ -129,10 +129,11 @@ The legacy `pgwire` constructors for a heap database or one durable collection
 remain deliberately read-only SELECT sources.
 
 Each SQL table is a durable collection plus catalog metadata for a declared
-JSON schema, one scalar document-derived primary-key path, and frozen exact
-index definitions. SQL-created tables use the ordered primary graph; single
-writes maintain compound exact postings in the same publication, and the
-driver batches through `Update` only where the collection supports it.
+JSON schema, one scalar document-derived primary-key path, and exact index
+definitions. Indexes can be added online and become visible with their durable
+catalog entry in one publication. SQL-created tables use the ordered primary
+graph; single writes maintain compound exact postings in the same publication,
+and the driver batches through `Update` only where the collection supports it.
 Catalog replacement and first table-file creation include the
 platform namespace durability fence in addition to the durable file fence. The
 catalog and collection are reopened together, so schema validation and index
@@ -246,6 +247,9 @@ optimizations because they do not change what readers consult.
   now backs the synchronous lane.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
   per-tablet concurrency.
+- [Distributed sharding](design/distributed-sharding.md): future routed
+  ownership, replication, failover, and online resharding across independent
+  durable roots.
 - [Unification](design/unification.md): one eventual mutable collection.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and

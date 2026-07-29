@@ -168,11 +168,11 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	dst []store.Mask, workspace *IndexWorkspace,
 	name string, values []vibejson.Index,
 ) ([]store.Mask, error) {
-	indexID, ok := s.collection.options.indexNameIDs[name]
+	indexID, ok := s.indexNameIDs[name]
 	if !ok {
 		return dst, store.ErrIndexNotFound
 	}
-	exact := s.collection.options.indexes[indexID]
+	exact := s.indexes[indexID]
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
 	// The needle canonicalization scratch comes from the workspace: a stack
 	// array of IndexTermMaxKeyBytes would be re-zeroed on every probe (a

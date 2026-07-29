@@ -105,9 +105,6 @@ func TestDiscoverMutableInlineBootstrapRejectsImmutableConflicts(t *testing.T) {
 		{"index depth", func(root *InlineSuperblock) {
 			root.State.IndexMaxDepth = 17
 		}},
-		{"catalog digest", func(root *InlineSuperblock) {
-			root.State.PageCatalogDigest[0] ^= 1
-		}},
 	}
 	for _, test := range mutations {
 		t.Run(test.name, func(t *testing.T) {
@@ -148,6 +145,34 @@ func TestDiscoverMutableInlineBootstrapRejectsImmutableConflicts(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestDiscoverMutableInlineBootstrapSelectsNewerCatalog(t *testing.T) {
+	file := openDiscoveryFixture(t)
+	first := discoveryInlineRoot(t, 4096, 3, [16]byte{3})
+	second := discoveryInlineRoot(t, 4096, 4, [16]byte{3})
+	second.State.IndexCount = 1
+	second.State.IndexCatalogHash = 7
+	second.State.NextLogicalID = 3
+	second.State.PageCatalogHead = PageRef{
+		Offset: second.FileEnd, LogicalID: 2, Generation: second.Generation,
+		Length: second.PageSize, Kind: PageCatalogSegment,
+	}
+	second.State.PageCatalogDigest = [PageCatalogDigestSize]byte{0x71}
+	second.State.PageCatalogBytes = PageCatalogCanonicalHeaderSize
+	second.FileEnd += uint64(second.PageSize)
+	writeDiscoveryRoot(t, file, first, 0)
+	writeDiscoveryRoot(t, file, second, 4096)
+
+	got, err := DiscoverMutableInlineBootstrap(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PageCatalogHead != second.State.PageCatalogHead ||
+		got.PageCatalogDigest != second.State.PageCatalogDigest ||
+		got.PageCatalogBytes != second.State.PageCatalogBytes {
+		t.Fatalf("bootstrap selected stale catalog: %+v", got)
 	}
 }
 

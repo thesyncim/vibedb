@@ -40,6 +40,9 @@ func (c *conn) execMutationContext(
 	args []any,
 ) (sqldriver.Result, error) {
 	d := c.db
+	if statement.Kind() == query.DDLCreateIndex {
+		return d.createIndexContext(ctx, statement)
+	}
 	if err := lockContext(ctx, &d.mu); err != nil {
 		return nil, err
 	}
@@ -59,8 +62,6 @@ func (c *conn) execMutationContext(
 	switch statement.Kind() {
 	case query.DDLCreateTable:
 		return d.createTableLockedContext(ctx, statement)
-	case query.DDLCreateIndex:
-		return d.createIndexLockedContext(ctx, statement)
 	}
 	t, ok := d.tables[statement.Collection()]
 	if !ok {
@@ -148,6 +149,111 @@ func (d *database) createIndexLocked(statement *query.DMLStatement) (sqldriver.R
 	return d.createIndexLockedContext(backgroundContext, statement)
 }
 
+// createIndexContext keeps the catalog mutex only around validation and the
+// final metadata publication. A materialized table delegates the expensive
+// scan to durable.Collection.CreateIndexContext, whose optimistic leaf
+// reconciliation leaves concurrent SQL reads and writes running.
+func (d *database) createIndexContext(
+	ctx context.Context,
+	statement *query.DMLStatement,
+) (sqldriver.Result, error) {
+	if err := lockContext(ctx, &d.mu); err != nil {
+		return nil, err
+	}
+	if d.closed {
+		d.mu.Unlock()
+		return nil, sqldriver.ErrBadConn
+	}
+	if err := d.settleCatalogLocked(); err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
+	definition, err := statement.LowerIndex()
+	if err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
+	if _, err := store.CompileExactIndex(definition.Definition); err != nil {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("vibedb: CREATE INDEX: %w", err)
+	}
+	t, exists := d.tables[definition.Table]
+	if !exists {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, definition.Table)
+	}
+	for _, index := range t.meta.Indexes {
+		if index.Name == definition.Definition.Name {
+			d.mu.Unlock()
+			if definition.IfNotExists {
+				return result{}, nil
+			}
+			return nil, fmt.Errorf("%w: %q", ErrIndexExists, index.Name)
+		}
+	}
+	if t.collection == nil {
+		defer d.mu.Unlock()
+		return d.createIndexLockedContext(ctx, statement)
+	}
+	collection := t.collection
+	if err := contextCheckpoint(ctx); err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
+	d.mu.Unlock()
+
+	_, err = collection.CreateIndexContext(ctx, definition.Definition)
+	if errors.Is(err, store.ErrIndexExists) && definition.IfNotExists {
+		err = nil
+	}
+	if errors.Is(err, store.ErrIndexExists) {
+		return nil, fmt.Errorf(
+			"%w: %q", ErrIndexExists, definition.Definition.Name,
+		)
+	}
+	if errors.Is(err, durable.ErrIndexBuildInProgress) {
+		return nil, fmt.Errorf(
+			"%w: table %q", ErrIndexBuildInProgress, definition.Table,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := lockContext(ctx, &d.mu); err != nil {
+		// The durable catalog is already authoritative. A canceled SQL metadata
+		// mirror is repaired on reopen or by the next catalog settlement.
+		d.mu.Lock()
+		_, _ = syncTableIndexMeta(t)
+		d.catalogWritePending = true
+		d.mu.Unlock()
+		return nil, fmt.Errorf(
+			"%w: durable index committed before SQL catalog cancellation: %v",
+			durable.ErrCommitOutcomeUnknown, err,
+		)
+	}
+	defer d.mu.Unlock()
+	if _, syncErr := syncTableIndexMeta(t); syncErr != nil {
+		d.catalogWritePending = true
+		return nil, fmt.Errorf(
+			"%w: durable index committed before SQL catalog refresh: %v",
+			durable.ErrCommitOutcomeUnknown, syncErr,
+		)
+	}
+	published, persistErr := d.persistCatalogLocked()
+	if persistErr != nil {
+		d.catalogWritePending = !published
+		if published {
+			return nil, persistErr
+		}
+		return nil, fmt.Errorf(
+			"%w: durable index committed before SQL catalog publication: %v",
+			durable.ErrCommitOutcomeUnknown, persistErr,
+		)
+	}
+	return result{}, nil
+}
+
 func (d *database) createIndexLockedContext(
 	ctx context.Context,
 	statement *query.DMLStatement,
@@ -172,10 +278,8 @@ func (d *database) createIndexLockedContext(
 		}
 	}
 	if t.collection != nil {
-		return nil, fmt.Errorf(
-			"%w: CREATE INDEX must be declared before the first INSERT; "+
-				"durable exact indexes are frozen at collection creation",
-			ErrIndexLayoutFrozen,
+		return nil, errors.New(
+			"vibedb: materialized CREATE INDEX reached the catalog-only path",
 		)
 	}
 	proposed := append([]indexMeta(nil), t.meta.Indexes...)

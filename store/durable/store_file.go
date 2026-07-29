@@ -220,12 +220,14 @@ const (
 // power-safe configuration; every field below documents what it overrides.
 type Options struct {
 	Collection store.Options
-	// Indexes are frozen exact scalar definitions maintained from the first
-	// durable generation. Canonical ordered path vectors assign stable on-disk
-	// physical IDs independently of caller order. Differently named definitions
-	// with identical ordered paths are logical aliases of one physical index:
-	// they share posting maintenance and durable bytes while remaining
-	// independently discoverable and queryable.
+	// Indexes are exact scalar definitions maintained from their atomic durable
+	// publication onward. CreateIndex can add definitions to a live collection
+	// when its fixed transaction/resident arenas admit the resulting write path.
+	// Canonical ordered path vectors assign stable on-disk physical IDs
+	// independently of caller order. Differently named definitions with
+	// identical ordered paths are logical aliases of one physical index: they
+	// share posting maintenance and durable bytes while remaining independently
+	// discoverable and queryable.
 	Indexes []store.IndexDefinition
 	// DocumentFormat selects how a bulk build (CreateFromPrimary) stores
 	// document bytes. It has no effect on Open, Put, or Update: a collection
@@ -961,9 +963,10 @@ type Collection struct {
 	options      normalizedFileStoreOptions
 	storeID      [16]byte
 
-	writer         sync.Mutex
-	durabilityWait sync.WaitGroup
-	snapshotGate   sync.RWMutex
+	writer           sync.Mutex
+	onlineIndexBuild atomic.Bool
+	durabilityWait   sync.WaitGroup
+	snapshotGate     sync.RWMutex
 	// snapshotOrder is a process-local, lazily assigned identity used to
 	// acquire several collections' snapshot gates in one global order. Names
 	// are catalog-local and cannot provide that order when the same handles are
@@ -2245,6 +2248,13 @@ func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 type Snapshot struct {
 	collection *Collection
 	state      *fileStoreState
+	// indexes and indexNameIDs pin the immutable logical/physical catalog
+	// published with epoch. Online CREATE INDEX replaces both under
+	// snapshotGate, so an older snapshot keeps resolving names against the
+	// same physical catalog generation as its postings.
+	indexes          []*store.ExactIndex
+	indexNameIDs     map[string]uint32
+	indexDefinitions []store.IndexDefinition
 	// epoch is the index epoch captured at Snapshot creation under
 	// snapshotGate: one pointer pins the fold base and the overlay chains for
 	// this reader's whole lifetime, and the snapshot's generation filters the
@@ -2382,13 +2392,19 @@ func (c *Collection) pinSnapshot() (*Snapshot, error) {
 		return nil, stateErr
 	}
 	epoch := c.primaryEpoch
+	indexes := c.options.indexes
+	indexNameIDs := c.options.indexNameIDs
+	indexDefinitions := c.options.Indexes
 	lease, err := c.leases.Acquire(state.root.Generation)
 	c.snapshotGate.RUnlock()
 	if err != nil {
 		return nil, err
 	}
 	return &Snapshot{
-		collection: c, state: state, epoch: epoch, lease: lease,
+		collection: c, state: state,
+		indexes: indexes, indexNameIDs: indexNameIDs,
+		indexDefinitions: indexDefinitions,
+		epoch:            epoch, lease: lease,
 	}, nil
 }
 

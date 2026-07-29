@@ -124,9 +124,9 @@ func EncodePrimaryExactRootPage(
 	return page, nil
 }
 
-// PrimaryExactRootView is a validated exact-index reference catalog. Leaf refs
-// are strictly ascending in both LogicalID and Offset; a zero ref names an
-// empty physical index.
+// PrimaryExactRootView is a validated exact-index reference catalog. Non-zero
+// leaf refs are unique; their order is the canonical physical index ID, not
+// allocation order. A zero ref names an empty physical index.
 type PrimaryExactRootView struct {
 	payload []byte
 	count   uint32
@@ -153,7 +153,6 @@ func OpenPrimaryExactRootPage(
 		return PrimaryExactRootView{}, primaryExactCorrupt("root envelope")
 	}
 	view := PrimaryExactRootView{payload: payload, count: bounds.IndexCount}
-	var previous PageRef
 	for i := uint32(0); i < bounds.IndexCount; i++ {
 		ref, ok := view.Leaf(i)
 		if !ok {
@@ -164,12 +163,20 @@ func OpenPrimaryExactRootPage(
 		}
 		if !validPrimaryExactRef(ref, PagePrimaryExactLeaf, bounds) ||
 			ref.LogicalID == expected.LogicalID ||
-			ref.Offset == expected.Offset ||
-			previous != (PageRef{}) && (ref.LogicalID <= previous.LogicalID ||
-				ref.Offset == previous.Offset) {
+			ref.Offset == expected.Offset {
 			return PrimaryExactRootView{}, primaryExactCorrupt("leaf catalog")
 		}
-		previous = ref
+		for previousID := uint32(0); previousID < i; previousID++ {
+			previous, ok := view.Leaf(previousID)
+			if !ok {
+				return PrimaryExactRootView{}, primaryExactCorrupt("leaf catalog")
+			}
+			if previous != (PageRef{}) &&
+				(previous.LogicalID == ref.LogicalID ||
+					previous.Offset == ref.Offset) {
+				return PrimaryExactRootView{}, primaryExactCorrupt("leaf catalog")
+			}
+		}
 	}
 	return view, nil
 }

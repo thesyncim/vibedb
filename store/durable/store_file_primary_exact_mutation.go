@@ -819,8 +819,9 @@ func (c *Collection) prepareStructuralExactLocked(
 
 // stagePrimaryExactPagesLocked writes exact indexes as fresh durable pages
 // inside tx and returns the new PagePrimaryExactRoot ref. Every present physical
-// index is written in ascending index order (the reference catalog requires
-// strictly ascending leaf logical ids), the superseded leaves and root named by
+// index is written in ascending canonical index order; leaf references need
+// only be unique because persistent catalog updates may reuse older leaves in a
+// different allocation order. The superseded leaves and root named by
 // state.root.ExactIndexRoot are retired through c.retireScratch, and an empty
 // physical index keeps a zero leaf ref. It stages nothing and returns a zero ref
 // for a collection without exact indexes.

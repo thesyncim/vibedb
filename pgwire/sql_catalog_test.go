@@ -88,8 +88,14 @@ func TestSQLCatalogSimpleAndExtendedLifecycle(t *testing.T) {
 		string(rows[0][1]) != "8" {
 		t.Fatalf("updated row = %q", rows)
 	}
-	expectError(t, c.query(`CREATE INDEX too_late ON docs(n)`),
-		sqlstateObjectNotInPrereqState)
+	if got := commandTagOf(t,
+		c.query(`CREATE INDEX by_n_online ON docs(n)`)); got != "CREATE INDEX" {
+		t.Fatalf("online CREATE INDEX tag = %q", got)
+	}
+	rows = rowsOf(t, c.query(`SELECT id FROM docs WHERE n = 8`))
+	if len(rows) != 1 || string(rows[0][0]) != `"a"` {
+		t.Fatalf("online indexed rows = %q", rows)
+	}
 }
 
 func TestSQLCatalogInsertReturning(t *testing.T) {
