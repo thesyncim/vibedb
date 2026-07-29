@@ -27,8 +27,6 @@ type Stats struct {
 	PhysicalIndexes int
 	// IndexedChunks counts chunks that physically retain postings.
 	IndexedChunks int
-	// IndexReclaiming reports detached physical postings still being removed.
-	IndexReclaiming bool
 	// ExternalKeyBytes is pointer-free mapped key-directory metadata outside
 	// Go HeapAlloc on supported Unix platforms. It remains process RSS.
 	ExternalKeyBytes uint64
@@ -62,10 +60,9 @@ func (c *Collection) Stats() Stats {
 		Chunks:          state.ChunkCount,
 		ChunkHighWater:  state.Chunks.Count,
 		ChunkDocuments:  state.StateOptions.ChunkDocuments,
-		ReusableChunks:  len(c.free.ids),
-		Indexes:         len(c.indexes),
-		IndexedChunks:   len(c.postingChunks.ids),
-		IndexReclaiming: c.reclaim != nil,
+		ReusableChunks: len(c.free.ids),
+		Indexes:        len(c.indexes),
+		IndexedChunks:  len(c.postingChunks.ids),
 	}
 	stats.ExternalKeyBytes = state.baseKeys.externalBytes()
 	stats.ExternalDocumentBytes = state.mappedDocs.externalBytes()

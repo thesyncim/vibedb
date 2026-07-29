@@ -75,8 +75,6 @@ type storeIndexBuild struct {
 	refs     uint32
 }
 
-type storeIndexReclaim struct{}
-
 func storeExactIndexEqual(a, b *ExactIndex) bool {
 	if a == nil || b == nil || a.N != b.N {
 		return false
@@ -261,9 +259,12 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 }
 
 // DropIndex removes the logical definition from the next snapshot immediately.
-// If it was the last postings consumer, future writes omit postings and
-// ReclaimIndexes can rebuild old chunks in bounded batches. Old Snapshots keep
-// their indexed chunks until ordinary garbage collection releases them.
+// Old Snapshots keep their indexed chunks until ordinary garbage collection
+// releases them. No postings reclamation follows: chunk-level postings exist
+// only when Options.Postings requested them at build time (CreateIndex mints
+// IndexExact definitions exclusively, so no logical index can be a postings
+// consumer), and born-with postings are a standing option, not garbage a drop
+// detaches.
 func (c *Collection) DropIndex(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -280,65 +281,12 @@ func (c *Collection) DropIndex(name string) error {
 	if state == nil {
 		return nil
 	}
-	if !c.options.Postings && !c.hasPostingsIndexLocked() {
-		if len(c.postingChunks.ids) != 0 {
-			c.reclaim = &storeIndexReclaim{}
-		}
-	}
 	next := *state
 	next.Generation++
 	next.Indexes = c.indexInfosLocked()
 	next.secondary = c.indexSnapshotsLocked()
 	c.state.Store(&next)
 	return nil
-}
-
-// ReclaimIndexes removes physically detached postings from at most maxChunks
-// chunks, atomically publishing the batch. It returns the number rebuilt and
-// whether reclamation is complete. maxChunks <= 0 processes all remaining
-// chunks. No live read is blocked and old snapshots retain their old chunks.
-func (c *Collection) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.reclaim == nil || c.options.Postings || c.hasPostingsIndexLocked() {
-		return 0, true
-	}
-	state := c.state.Load()
-	if state == nil || len(c.postingChunks.ids) == 0 {
-		c.reclaim = nil
-		return 0, true
-	}
-	limit := maxChunks
-	if limit <= 0 {
-		limit = int(state.Chunks.Count)
-	}
-	nextChunks := state.Chunks
-	for len(c.postingChunks.ids) != 0 && rebuilt < limit {
-		id := c.postingChunks.ids[len(c.postingChunks.ids)-1]
-		chunk := state.Chunks.Get(id)
-		if chunk == nil || !chunk.Docs.Postings {
-			c.postingChunks.remove(id)
-			continue
-		}
-		plain, err := cloneStoreChunk(state.StateOptions, false, chunk)
-		if err != nil {
-			panic("vibejson: rebuilding validated collection chunk: " + err.Error())
-		}
-		nextChunks = nextChunks.set(id, plain)
-		c.noteChunkPostingsLocked(id, chunk, plain)
-		rebuilt++
-	}
-	done = len(c.postingChunks.ids) == 0
-	if rebuilt != 0 {
-		next := *state
-		next.Generation++
-		next.Chunks = nextChunks
-		c.state.Store(&next)
-	}
-	if done {
-		c.reclaim = nil
-	}
-	return rebuilt, done
 }
 
 func (b *storeIndexBuild) has(id uint32) bool {

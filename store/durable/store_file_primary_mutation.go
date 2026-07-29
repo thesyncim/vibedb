@@ -345,6 +345,24 @@ func (c *Collection) retirePrimaryVolatileRefLocked(
 	)
 }
 
+// unadmitPrimaryMutationFrames discards every buffered-dirty frame the current
+// single-document mutation admitted before its point of no return. Nothing has
+// published a reference to them yet — the router still routes the old leaf and
+// the pending-parent entry was not installed — so no current or future snapshot
+// can acquire the refs and the fence-free MarkUnreachable contract holds,
+// exactly as it does for unadmitPrimaryBatchLeaves. Without this, an error
+// between the first admission and the publish (a retryable
+// ErrRetiredExtentCapacity under snapshot pressure, a journal device failure)
+// would strand up to a whole overflow chain of frames in the cache's dirty
+// accounting with no owner, and each retry would strand another.
+func (c *Collection) unadmitPrimaryMutationFrames() {
+	if len(c.primaryMutationAdmitted) == 0 {
+		return
+	}
+	c.cache.MarkUnreachable(c.primaryMutationAdmitted)
+	c.primaryMutationAdmitted = c.primaryMutationAdmitted[:0]
+}
+
 func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 	resident storeio.ResidentPrimaryRoute,
 	valueLen int,
@@ -1071,6 +1089,11 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		baseOffset += gap
 	}
 
+	// Every frame admitted from here to the publish is tracked so any error
+	// return before the point of no return hands it back to the cache; the
+	// tracking slice must therefore start empty for this mutation.
+	c.primaryMutationAdmitted = c.primaryMutationAdmitted[:0]
+
 	// An oversized value is stored out of line as a VOLATILE overflow chain minted
 	// just below the new leaf. The leaf then carries only the chain head, exactly
 	// as the transactional path does; the visible FileEnd/NextLogicalID advance to
@@ -1086,6 +1109,9 @@ func (c *Collection) cowBufferedPrimaryMutation(
 			src, generation, baseOffset, state.root.NextLogicalID,
 		)
 		if mintErr != nil {
+			// A mid-chain mint failure has already admitted the earlier extents;
+			// hand them back so the failed attempt leaves no dirty-capacity residue.
+			c.unadmitPrimaryMutationFrames()
 			return storeio.PageRef{}, false, false, mintErr
 		}
 		value = storeio.CommonPrimaryLeafValue{Overflow: head}
@@ -1103,6 +1129,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 			},
 		)
 		if admitErr != nil {
+			c.unadmitPrimaryMutationFrames()
 			return storeio.PageRef{}, false, false, admitErr
 		}
 		preparePath.leaf = releaf
@@ -1112,6 +1139,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		&preparePath, generation, key, value, deleting, found, slot,
 	)
 	if prepareErr != nil {
+		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false, prepareErr
 	}
 	becameEmpty = deleting && leaf.Len() == 1
@@ -1132,6 +1160,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 				c.primaryLeafBounds(state),
 			)
 			if cErr != nil {
+				c.unadmitPrimaryMutationFrames()
 				return storeio.PageRef{}, false, false, cErr
 			}
 			c.overflowRetireScratch = extents
@@ -1141,6 +1170,10 @@ func (c *Collection) cowBufferedPrimaryMutation(
 			if !oldOverflowVolatile &&
 				len(c.primaryPendingOverflowRetire)+len(extents) >
 					cap(c.primaryPendingOverflowRetire) {
+				// This is a retryable pressure error — the caller checkpoints and
+				// retries — so the minted chain must be handed back or every retry
+				// would strand another chain's worth of dirty frames.
+				c.unadmitPrimaryMutationFrames()
 				return storeio.PageRef{}, false, false, fmt.Errorf(
 					"%w: buffered primary overflow retirements",
 					storeio.ErrRetiredExtentCapacity,
@@ -1151,6 +1184,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 
 	leafOffset := baseOffset + overflowBytes
 	if leafOffset > math.MaxUint64-uint64(leafBytes) {
+		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false,
 			storeio.ErrInvalidWrite
 	}
@@ -1162,14 +1196,17 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	if !c.primaryRouter.Load().CanUpdateLeaf(
 		resident, nextLeaf, generation,
 	) {
+		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false,
 			storeio.ErrSegmentedTabletRouterCorrupt
 	}
 	if err := c.cache.AdmitBufferedDirty(
 		nextLeaf, leafImage, math.MaxUint64,
 	); err != nil {
+		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false, err
 	}
+	c.primaryMutationAdmitted = append(c.primaryMutationAdmitted, nextLeaf)
 
 	nextRoot := state.root
 	nextRoot.Generation = generation
@@ -1199,6 +1236,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		leafImage, resident.Bucket, c.primaryLeafBounds(nextState),
 	)
 	if err != nil {
+		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false, err
 	}
 
@@ -1211,8 +1249,14 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	if err := c.journalBeforePublishLocked(
 		deleting, generation, key, src,
 	); err != nil {
+		// The fence failed with nothing published, so the admitted frames are
+		// still unreferenced and must not survive as unowned dirty capacity.
+		c.unadmitPrimaryMutationFrames()
 		return storeio.PageRef{}, false, false, err
 	}
+	// Point of no return passed: the frames are about to be published, so the
+	// tracking slice is retired without unadmitting.
+	c.primaryMutationAdmitted = c.primaryMutationAdmitted[:0]
 
 	previousVolatile := pending.volatileRef
 	pending.volatileRef = nextLeaf

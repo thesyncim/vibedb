@@ -169,16 +169,18 @@ This is a Roaring-inspired execution strategy, not the Roaring serialization or
 container format. Array, bitmap, and run-container adaptation is not currently
 implemented.
 
-`DropIndex` removes the logical index immediately. `ReclaimIndexes` bounds
-physical wildcard-posting reclamation after the last user is gone.
+`DropIndex` removes the logical index immediately. Chunk-level postings exist
+only when `Options.Postings` requested them at build time, so no reclamation
+follows a drop.
 
 ### Bulk construction
 
-`store.Builder` accepts unique keys, validates and copies documents directly
-into final chunks, and builds declared indexes before publishing one collection.
-`Append` is single-goroutine. `Build` transfers completed state and closes the
-builder. Once final key compaction succeeds, Build is terminal; a later failure
-releases every unpublished external block and the builder cannot be retried.
+`store.Builder` accepts unique keys and validates and copies documents directly
+into final chunks before publishing one collection; indexes are declared on the
+built collection through `CreateIndex` plus `BackfillIndex`. `Append` is
+single-goroutine. `Build` transfers completed state and closes the builder.
+Once final key compaction succeeds, Build is terminal; a later failure releases
+every unpublished external block and the builder cannot be retried.
 
 Use the builder for an initial corpus and `Collection.Put` for individual
 mutations.

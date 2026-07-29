@@ -290,7 +290,16 @@ func TestRecoveryJournalGroupWindowCrashMatrix(t *testing.T) {
 					return
 				}
 				if openErr != nil {
-					// Failing closed is a legal outcome for a torn tail.
+					if ph.errs {
+						// The ENOSPC fault fails the append cleanly without writing a
+						// byte, so the on-disk record stream is a valid contiguous
+						// prefix and reopen must succeed. Skipping the acked-subset
+						// check below on a failed Open would make this phase's only
+						// meaningful assertion vacuous.
+						t.Fatalf("%s: reopen failed on a clean-prefix image (%d acked): %v",
+							label, len(acked), openErr)
+					}
+					// Failing closed is a legal outcome for a torn or dropped tail.
 					t.Logf("%s: fail-closed: %v", label, openErr)
 					return
 				}

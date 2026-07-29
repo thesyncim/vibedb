@@ -762,7 +762,7 @@ func CreateRecoveryJournal(
 	}
 	rj := newRecoveryJournalManager(file, h)
 	rj.headerSlot = 0
-	if err := rj.writeHeader(0); err != nil {
+	if err := rj.writeHeader(0, rj.header); err != nil {
 		return nil, err
 	}
 	if err := rj.journalDataSync(file); err != nil {
@@ -840,9 +840,11 @@ func (rj *RecoveryJournal) Pair(
 }
 
 // writeHeader encodes and positionally writes one header slot. It is called
-// only on create and recycle, never per record.
-func (rj *RecoveryJournal) writeHeader(slot uint32) error {
-	if _, err := EncodeRecoveryJournalHeader(rj.scratch, rj.header); err != nil {
+// only on create and recycle, never per record. The header is passed by value
+// rather than read from rj.header so Recycle can write a staged candidate and
+// commit it to memory only after the device accepted it.
+func (rj *RecoveryJournal) writeHeader(slot uint32, header RecoveryJournalHeader) error {
+	if _, err := EncodeRecoveryJournalHeader(rj.scratch, header); err != nil {
 		return err
 	}
 	off := int64(slot) * RecoveryJournalHeaderSize
@@ -1015,16 +1017,23 @@ func (rj *RecoveryJournal) Recycle(baseGeneration uint64) error {
 	if baseGeneration < rj.header.BaseGeneration {
 		return fmt.Errorf("%w: recycle base generation regressed", ErrGenerationOrder)
 	}
-	rj.header.BaseGeneration = baseGeneration
-	rj.header.BaseSequence = rj.nextSequence - 1
-	rj.header.RecycleCount++
+	// Stage the advanced header and commit it to memory only after the write and
+	// its sync both succeed. A failed recycle then leaves the manager describing
+	// exactly what is on the device — the old base still guards the < check
+	// above, the cursor still appends after the live records — instead of a
+	// half-applied header whose in-memory base has moved past the durable one.
+	next := rj.header
+	next.BaseGeneration = baseGeneration
+	next.BaseSequence = rj.nextSequence - 1
+	next.RecycleCount++
 	slot := rj.headerSlot ^ 1
-	if err := rj.writeHeader(slot); err != nil {
+	if err := rj.writeHeader(slot, next); err != nil {
 		return err
 	}
 	if err := rj.journalDataSync(rj.file); err != nil {
 		return err
 	}
+	rj.header = next
 	rj.headerSlot = slot
 	rj.cursor = 0
 	return nil

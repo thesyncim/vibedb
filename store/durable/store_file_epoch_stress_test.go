@@ -41,6 +41,32 @@ func TestFilePrimaryReadEpochAllocatesZero(t *testing.T) {
 	}
 }
 
+// epochStressDocID extracts the leading "id" field every epoch-stress document
+// embeds. The corpus seeds keys[i] with id i and every shape the stress writer
+// publishes for keys[i] (same-size, grown, reinsert) also embeds id i, so a hit
+// whose id disagrees with the probed key is a routing fault even though the
+// document itself is valid JSON. The prefix scan is deliberately allocation-free
+// so the reader loop's pressure profile is unchanged.
+func epochStressDocID(doc []byte) (int, bool) {
+	const prefix = `{"id":`
+	if len(doc) <= len(prefix) || string(doc[:len(prefix)]) != prefix {
+		return 0, false
+	}
+	id := 0
+	at := len(prefix)
+	for ; at < len(doc); at++ {
+		digit := doc[at]
+		if digit < '0' || digit > '9' {
+			break
+		}
+		id = id*10 + int(digit-'0')
+	}
+	if at == len(prefix) {
+		return 0, false
+	}
+	return id, true
+}
+
 // TestFilePrimaryReadEpochStress is the epoch-read concurrency gate: reader
 // goroutines hammer the lock-free point-read entry and snapshot scans while
 // the single writer mutates, splits, checkpoints, and recycles volatile pages.
@@ -84,18 +110,27 @@ func TestFilePrimaryReadEpochStress(t *testing.T) {
 			defer group.Done()
 			buffer := make([]byte, 0, 512)
 			for at := offset; !stop.Load(); at += readers + 1 {
-				key := keys[at%seed]
+				want := at % seed
+				key := keys[want]
 				out, ok, err := collection.AppendRaw(buffer[:0], []byte(key))
 				if err != nil {
 					fail("AppendRaw(%q): %v", key, err)
 					return
 				}
 				// The writer deletes and re-inserts seeded keys, so a miss is
-				// legal; a hit must be a complete committed document.
+				// legal; a hit must be a complete committed document FOR THIS KEY.
+				// Well-formedness alone would let a routing bug hand back another
+				// key's equally well-formed document, so the id every workload
+				// shape embeds — always the key's seed ordinal — is the oracle.
 				if ok {
 					if validateErr := vibejson.Validate(out); validateErr != nil {
 						fail("AppendRaw(%q) returned torn value %q: %v",
 							key, out, validateErr)
+						return
+					}
+					if id, idOK := epochStressDocID(out); !idOK || id != want {
+						fail("AppendRaw(%q) returned another key's value %q (id=%d ok=%t want=%d)",
+							key, out, id, idOK, want)
 						return
 					}
 				}

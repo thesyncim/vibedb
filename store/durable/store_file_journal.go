@@ -42,11 +42,16 @@ const (
 // journalFailureBox carries the sticky journal poison behind an atomic pointer.
 type journalFailureBox struct{ err error }
 
-// poisonJournalLocked records a terminal journal failure and rolls the reader
-// view to the committer's poison rules, then returns the sticky error. It is
-// idempotent: the first failure wins so later callers report the original cause.
-// The caller holds the writer.
-func (c *Collection) poisonJournalLocked(cause error) error {
+// poisonJournal records a terminal journal failure and rolls the reader view
+// to the committer's poison rules, then returns the sticky error. It is
+// idempotent: the first failure wins so later callers report the original
+// cause. It requires no collection lock: the failure box is a first-wins
+// CompareAndSwap, and poisonPersistence serializes against every publication
+// under snapshotGate and visibilityMu on its own. That is what lets the
+// group-commit leader poison from journalGroupAwait after releasing the writer
+// (its sync deliberately runs outside c.writer), while the deposit and
+// before-publish paths call it with the writer held.
+func (c *Collection) poisonJournal(cause error) error {
 	if cause == nil {
 		return nil
 	}
@@ -343,7 +348,16 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 		return nil
 	}
 	if err := c.journal.Recycle(baseGeneration); err != nil {
-		return err
+		// A failed recycle is a device write or sync failure on the journal
+		// header (Recycle never reports full), and it is terminal the same way a
+		// failed record append is: the caller's mutation may already be
+		// published, so returning a plain error would let every later Put
+		// re-publish and re-fail forever with PersistenceError still nil.
+		// Poison die-don't-retry and fail the shared group fence so no deposited
+		// waiter is acknowledged out of a journal whose head can no longer move.
+		poisoned := c.poisonJournal(err)
+		c.journalGroup.fail(poisoned)
+		return poisoned
 	}
 	// The checkpoint folded every deposited record into the durable root before
 	// this recycle, so any group-commit waiter parked on an earlier ticket is now
@@ -399,7 +413,7 @@ func (c *Collection) journalDepositLocked(
 		// A raw append error (a device write failure such as ENOSPC or EIO) is
 		// terminal for the journal lane: poison die-don't-retry and fail every
 		// waiter of the shared fence, none of which can now be synced.
-		poisoned := c.poisonJournalLocked(err)
+		poisoned := c.poisonJournal(err)
 		c.journalGroup.fail(poisoned)
 		return 0, poisoned
 	}
@@ -430,10 +444,10 @@ func (c *Collection) journalBeforePublishLocked(
 		value = nil
 	}
 	if _, err := c.journal.Append(kind, generation, key, value); err != nil {
-		return c.poisonJournalLocked(err)
+		return c.poisonJournal(err)
 	}
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return c.poisonJournalLocked(err)
+		return c.poisonJournal(err)
 	}
 	if recoveryJournalPostSyncHook != nil {
 		recoveryJournalPostSyncHook()
@@ -458,10 +472,10 @@ func (c *Collection) journalBatchBeforePublishLocked(
 		return nil
 	}
 	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
-		return c.poisonJournalLocked(err)
+		return c.poisonJournal(err)
 	}
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return c.poisonJournalLocked(err)
+		return c.poisonJournal(err)
 	}
 	if recoveryJournalPostSyncHook != nil {
 		recoveryJournalPostSyncHook()
@@ -495,7 +509,7 @@ func (c *Collection) journalBatchDepositLocked(
 			c.chainAcks.Add(1)
 			return 0, nil
 		}
-		poisoned := c.poisonJournalLocked(err)
+		poisoned := c.poisonJournal(err)
 		c.journalGroup.fail(poisoned)
 		return 0, poisoned
 	}

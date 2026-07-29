@@ -181,39 +181,47 @@ func TestStoreExactIndexPhysicalAliasDeduplication(t *testing.T) {
 	}
 }
 
-func TestStoreBuilderExactIndexPhysicalAliasDeduplication(t *testing.T) {
+// TestStoreBuilderCollectionIndexesThroughCreateIndex pins the one index door a
+// bulk-built collection has: CreateIndex plus BackfillIndex after Build. The
+// builder itself stages no indexes — its former staging field was deleted with
+// the public declaration API — so this is also the regression guard that a
+// bulk-built collection's chunks backfill and dedup exactly like Put-built ones.
+func TestStoreBuilderCollectionIndexesThroughCreateIndex(t *testing.T) {
 	builder, err := NewBuilder(Options{ChunkDocuments: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Builder no longer exposes public index declaration, but Build still
-	// deduplicates exact indexes staged on it — identical ordered paths share one
-	// physical build. Stage them directly to cover that bulk dedup.
-	builder.exact = map[string]*ExactIndex{}
-	for _, def := range []IndexDefinition{
-		{Name: "a", Paths: []string{"/value"}},
-		{Name: "b", Paths: []string{"/value"}},
-		{Name: "other", Paths: []string{"/other"}},
-	} {
-		exact, err := CompileExactIndex(def)
-		if err != nil {
-			t.Fatal(err)
-		}
-		exact.seed = builder.seed
-		builder.exact[def.Name] = exact
-	}
 	if err := builder.Append("one", []byte(`{"value":1,"other":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Append("two", []byte(`{"value":1,"other":3}`)); err != nil {
 		t.Fatal(err)
 	}
 	collection, err := builder.Build()
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, def := range []IndexDefinition{
+		{Name: "a", Paths: []string{"/value"}},
+		{Name: "b", Paths: []string{"/value"}},
+		{Name: "other", Paths: []string{"/other"}},
+	} {
+		if _, err := collection.CreateIndex(def); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := collection.BackfillIndex(def.Name, 0); err != nil || info.State != IndexReady {
+			t.Fatalf("BackfillIndex(%s) = (%+v,%v)", def.Name, info, err)
+		}
+	}
 	if collection.indexes["a"] != collection.indexes["b"] {
-		t.Fatal("Builder duplicated identical physical indexes")
+		t.Fatal("CreateIndex duplicated identical physical indexes")
 	}
 	if collection.indexes["a"] == collection.indexes["other"] {
-		t.Fatal("Builder merged different physical indexes")
+		t.Fatal("CreateIndex merged different physical indexes")
+	}
+	if got, err := collection.IndexRawKeys("b", []byte(`1`)); err != nil ||
+		len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Fatalf("bulk-built backfilled lookup = (%v,%v)", got, err)
 	}
 	infos, _ := collection.Snapshot()
 	published := infos.AppendIndexes(nil)

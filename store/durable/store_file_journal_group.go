@@ -82,7 +82,7 @@ type journalCommitGroup struct {
 	syncing bool
 	// failed is the sticky group poison: a leader whose sync fails records the
 	// error here and every current and future waiter returns it (die-don't-retry),
-	// mirroring poisonJournalLocked for the shared fence. syncing is held true
+	// mirroring poisonJournal for the shared fence. syncing is held true
 	// across the poison so no second waiter can ever become leader and retry a
 	// terminally failed sync.
 	failed error
@@ -181,7 +181,7 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 		if err != nil {
 			// syncing stays true across the poison so no other waiter becomes a
 			// second leader and retries a terminally failed sync.
-			poisoned := c.poisonJournalLocked(err)
+			poisoned := c.poisonJournal(err)
 			g.mu.Lock()
 			if g.failed == nil {
 				g.failed = poisoned

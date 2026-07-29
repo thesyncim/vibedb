@@ -58,7 +58,6 @@ type Builder struct {
 	count    int
 	keyBytes int
 	closed   bool
-	exact    map[string]*ExactIndex
 	shapes   []*ShapeRecord
 	shapeSet map[*ShapeRecord]struct{}
 	// sourceHint is the exact JSON bytes in the preceding full chunk. It lets
@@ -345,8 +344,7 @@ func compactStoreBuilderShapes(docs *Segment) {
 // subsequent call returns ErrBuilderClosed.
 func (b *Builder) Build() (*Collection, error) {
 	return b.build(storeBuilderBuildSteps{
-		buildExactIndexes: (*Builder).buildExactIndexes,
-		compactDocuments:  (*Builder).compactDocuments,
+		compactDocuments: (*Builder).compactDocuments,
 	})
 }
 
@@ -354,8 +352,7 @@ func (b *Builder) Build() (*Collection, error) {
 // builder. Tests can stop after a specific ownership transfer without a
 // process-wide hook that could race an unrelated Build.
 type storeBuilderBuildSteps struct {
-	buildExactIndexes func(*Builder, *Collection, *State) error
-	compactDocuments  func(*Builder, *State) error
+	compactDocuments func(*Builder, *State) error
 }
 
 func (b *Builder) build(steps storeBuilderBuildSteps) (*Collection, error) {
@@ -379,7 +376,7 @@ func (b *Builder) build(steps storeBuilderBuildSteps) (*Collection, error) {
 		baseKeys:     baseKeys,
 		Chunks:       b.chunks,
 	}
-	if b.count != 0 || len(b.exact) != 0 {
+	if b.count != 0 {
 		state.Generation = 1
 	}
 	collection := &Collection{Options: b.options, options: b.options}
@@ -394,19 +391,14 @@ func (b *Builder) build(steps storeBuilderBuildSteps) (*Collection, error) {
 			collection.postingChunks.add(id)
 		}
 	}
-	if err := steps.buildExactIndexes(b, collection, state); err != nil {
-		releaseStoreBuilderBuild(state, collection)
-		return nil, err
-	}
 	if err := steps.compactDocuments(b, state); err != nil {
-		releaseStoreBuilderBuild(state, collection)
+		releaseStoreBuilderBuild(state)
 		return nil, err
 	}
 	collection.state.Store(state)
 	b.keyTable = storeBuilderKeyTable{}
 	b.chunks = storeChunkVector{}
 	b.current = nil
-	b.exact = nil
 	b.shapes = nil
 	b.shapeSet = nil
 	b.sourceHint = 0
@@ -418,15 +410,7 @@ func (b *Builder) build(steps storeBuilderBuildSteps) (*Collection, error) {
 // after key compaction but before the new collection is published. A failed Build
 // is terminal once compactBaseKeys has rewritten the chunks, so no subsequent
 // builder operation can observe these released unpublished representations.
-func releaseStoreBuilderBuild(state *State, collection *Collection) {
-	if collection != nil {
-		for _, index := range collection.indexes {
-			if index != nil && index.base != nil {
-				index.base.release()
-				index.base = nil
-			}
-		}
-	}
+func releaseStoreBuilderBuild(state *State) {
 	if state == nil {
 		return
 	}
@@ -490,61 +474,6 @@ func (b *Builder) compactBaseKeys() (*storeMappedKeys, error) {
 		return true
 	})
 	return base, nil
-}
-
-// buildExactIndexes constructs complete roots while collection and state are
-// still unreachable by readers. storeIndexCollectChunk coalesces equal tuples inside
-// each page; radix traversal supplies ascending chunk ids, so every posting's
-// masks are already in the order required by the packed-page builder.
-func (b *Builder) buildExactIndexes(collection *Collection, state *State) error {
-	if len(b.exact) == 0 {
-		return nil
-	}
-	if collection.indexes == nil {
-		collection.indexes = make(map[string]*storeIndexBuild, len(b.exact))
-	}
-	for name, exact := range b.exact {
-		if shared := collection.equivalentExactIndexLocked(exact); shared != nil {
-			shared.refs++
-			collection.exactAliases++
-			collection.indexes[name] = shared
-			continue
-		}
-		pending := make(map[uint64][]storeIndexChunkMask)
-		state.Chunks.Each(func(id uint32, chunk *Chunk) bool {
-			var storage [MaxChunkDocuments]storeIndexHashMask
-			for _, entry := range storeIndexCollectChunk(storage[:0], exact, chunk) {
-				pending[entry.hash] = append(pending[entry.hash], storeIndexChunkMask{
-					chunk: id,
-					mask:  entry.mask,
-				})
-			}
-			return true
-		})
-		info := IndexInfo{
-			Name:          name,
-			Kind:          IndexExact,
-			State:         IndexReady,
-			CoveredChunks: state.ChunkCount,
-			TotalChunks:   state.ChunkCount,
-			ColumnCount:   exact.N,
-		}
-		copy(info.Columns[:], exact.Specs[:exact.N])
-		base, err := newStorePackedIndex(pending)
-		if err != nil {
-			return fmt.Errorf("vibejson: build packed exact index %q: %w", name, err)
-		}
-		collection.indexes[name] = &storeIndexBuild{
-			info:  info,
-			exact: exact,
-			base:  base,
-			all:   true,
-			refs:  1,
-		}
-	}
-	state.Indexes = collection.indexInfosLocked()
-	state.secondary = collection.indexSnapshotsLocked()
-	return nil
 }
 
 const (

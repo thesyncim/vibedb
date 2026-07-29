@@ -217,6 +217,11 @@ func (c *Collection) mintBufferedPrimaryOverflowChain(
 		); err != nil {
 			return storeio.PageRef{}, 0, 0, err
 		}
+		// Record the admission immediately so a failure on a LATER extent (or any
+		// fallible caller step after the whole chain is minted) can hand every
+		// already-admitted frame back through unadmitPrimaryMutationFrames;
+		// nothing references these frames until the caller publishes.
+		c.primaryMutationAdmitted = append(c.primaryMutationAdmitted, ref)
 	}
 	return c.overflowRefScratch[0], totalBytes, pages, nil
 }

@@ -154,7 +154,6 @@ type Collection struct {
 	indexes      map[string]*storeIndexBuild
 	indexVisit   uint32
 	exactAliases uint32
-	reclaim      *storeIndexReclaim
 }
 
 // WithBulkSnapshot runs fn with c's current State (materializing an

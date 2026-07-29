@@ -1141,6 +1141,17 @@ type Collection struct {
 	overflowRefScratch   []storeio.PageRef
 	overflowPageScratch  []byte
 	overflowValueScratch []byte
+	// primaryMutationAdmitted tracks every buffered-dirty frame one
+	// single-document deferred-canonical mutation admits before its point of no
+	// return: the minted overflow-chain extents, then the rewritten leaf. A
+	// fallible step after the first admission (collecting the superseded chain,
+	// the retired-extent capacity check, the exact-index prepare, the sync-lane
+	// journal fence) must hand these frames back to the cache on error, or a
+	// retryable failure would leak up to a whole MaxDocumentBytes chain of
+	// unreachable dirty frames per attempt until Close. Writer-lock owned and
+	// reused per mutation, so the steady-state cost is zero allocations — the
+	// single-document mirror of batchPrimaryAdmitted.
+	primaryMutationAdmitted []storeio.PageRef
 	// primaryPendingOverflowRetire holds the durable overflow-extent chains a
 	// buffered Put or Delete superseded since the last checkpoint. Their pages are
 	// on device (a prior checkpoint minted them), so unlike a superseded volatile

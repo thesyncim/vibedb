@@ -439,6 +439,58 @@ func TestRecoveryJournalIdentityPairing(t *testing.T) {
 	rj.header.BaseGeneration = good.BaseGeneration
 }
 
+// TestRecoveryJournalRecycleFailureLeavesManagerUnchanged pins the recycle
+// commit discipline: the in-memory header, slot, and cursor advance only after
+// the header write AND its sync both succeed, so a failed recycle leaves the
+// manager describing exactly the on-disk state — same base guarding the
+// regression check, same cursor appending after the live records — and a later
+// clean recycle of the same generation completes normally.
+func TestRecoveryJournalRecycleFailureLeavesManagerUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		plan JournalFaultPlan
+	}{
+		{"header-write", JournalFaultPlan{Phase: JournalFaultENOSPCRecycle}},
+		// SyncIndex 2 skips the two appendPut barriers below and faults the
+		// recycle's own sync, the write's fallible second half.
+		{"header-sync", JournalFaultPlan{Phase: JournalFaultSyncError, SyncIndex: 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rj, _ := createTestJournal(t, 64*RecoveryJournalMinSectorSize)
+			defer rj.Close()
+			fj := NewFaultJournal(rj)
+			appendPut(t, rj, 2, "k", "v")
+			appendPut(t, rj, 3, "k", "v")
+			beforeCursor := rj.Cursor()
+			beforeCount := rj.Header().RecycleCount
+
+			fj.Program(tc.plan)
+			if err := rj.Recycle(3); err == nil {
+				t.Fatal("faulted recycle returned nil error")
+			}
+			if !fj.Faulted() {
+				t.Fatal("programmed recycle fault did not fire")
+			}
+			if rj.BaseGeneration() != 1 || rj.Cursor() != beforeCursor ||
+				rj.Header().RecycleCount != beforeCount || rj.headerSlot != 0 {
+				t.Fatalf("failed recycle half-applied the header: base=%d cursor=%d count=%d slot=%d",
+					rj.BaseGeneration(), rj.Cursor(), rj.Header().RecycleCount, rj.headerSlot)
+			}
+
+			// With the device healthy again the same recycle must complete whole.
+			fj.Program(JournalFaultPlan{})
+			if err := rj.Recycle(3); err != nil {
+				t.Fatalf("clean recycle after failure: %v", err)
+			}
+			if rj.BaseGeneration() != 3 || rj.Cursor() != 0 ||
+				rj.Header().RecycleCount != beforeCount+1 || rj.headerSlot != 1 {
+				t.Fatalf("clean recycle did not commit: base=%d cursor=%d count=%d slot=%d",
+					rj.BaseGeneration(), rj.Cursor(), rj.Header().RecycleCount, rj.headerSlot)
+			}
+		})
+	}
+}
+
 func TestRecoveryJournalENOSPCAppend(t *testing.T) {
 	rj, _ := createTestJournal(t, 64*RecoveryJournalMinSectorSize)
 	defer rj.Close()

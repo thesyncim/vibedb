@@ -43,6 +43,13 @@ const (
 	// JournalFaultENOSPCRecycle returns ENOSPC in place of the recycle header
 	// write.
 	JournalFaultENOSPCRecycle
+	// JournalFaultSyncError returns EIO in place of the journal sync barrier at
+	// SyncIndex, once; later syncs run normally. One-shot is deliberate: the
+	// store's die-don't-retry posture means a poisoned lane must never issue a
+	// second sync, so a test that fails the leader's sync once and asserts every
+	// waiter got the poison would instead observe a spurious success if any
+	// second leader illegally retried.
+	JournalFaultSyncError
 )
 
 // JournalFaultPlan programs a FaultJournal to induce exactly one crash.
@@ -51,13 +58,18 @@ type JournalFaultPlan struct {
 	// AppendIndex selects which append since Program is faulted, for the append
 	// phases. Appends before it complete normally.
 	AppendIndex int
+	// SyncIndex selects which sync barrier since the wrapper was created is
+	// faulted, for JournalFaultSyncError. Syncs before it complete normally.
+	SyncIndex int
 }
 
-// FaultJournal wraps a RecoveryJournal's raw file writes and can stop an append
-// or a recycle at an exact point, leaving on disk exactly the bytes a crash
-// there would have left. It records every append and recycle it observes. It is
-// not safe for concurrent use; the collection's single writer owns it, exactly
-// as it owns the RecoveryJournal it stands in for.
+// FaultJournal wraps a RecoveryJournal's raw file writes and sync barriers and
+// can stop an append, a recycle, or a sync at an exact point, leaving on disk
+// exactly the bytes a crash or device failure there would have left. It records
+// every append, recycle, and sync it observes. The write path is owned by the
+// collection's single writer exactly as the RecoveryJournal it stands in for;
+// the sync path additionally serves the group-commit leader, which syncs
+// outside the writer, so the counters live under the wrapper's own mutex.
 type FaultJournal struct {
 	file *os.File
 
@@ -65,18 +77,29 @@ type FaultJournal struct {
 	plan        JournalFaultPlan
 	appends     int
 	recycles    int
+	syncs       int
 	faulted     bool
 	tornWrites  int
 	appendBytes int64
 }
 
-// NewFaultJournal wraps the file backing rj and installs its write seam so
-// every subsequent append and recycle passes through the fault plan. Sync
-// barriers are left intact: a fault models lost or torn bytes, and the caller's
-// own sync failure handling covers a failed barrier.
+// NewFaultJournal wraps the file backing rj and installs its write and sync
+// seams so every subsequent append, recycle, and sync barrier passes through
+// the fault plan. Under JournalFaultNone (and every write-phase plan) the sync
+// wrappers are pure pass-throughs, so pre-existing write-fault sweeps observe
+// the platform barriers unchanged; JournalFaultSyncError is what lets a test
+// fail the group-commit leader's fence, which no write fault can reach.
 func NewFaultJournal(rj *RecoveryJournal) *FaultJournal {
 	fj := &FaultJournal{file: rj.file}
 	rj.writeAt = fj.writeAt
+	realSync := rj.journalSync
+	realDataSync := rj.journalDataSync
+	rj.journalSync = func(file *os.File) error {
+		return fj.sync(file, realSync)
+	}
+	rj.journalDataSync = func(file *os.File) error {
+		return fj.sync(file, realDataSync)
+	}
 	return fj
 }
 
@@ -104,6 +127,30 @@ func (fj *FaultJournal) Appends() int {
 	fj.mu.Lock()
 	defer fj.mu.Unlock()
 	return fj.appends
+}
+
+// Syncs reports how many sync barriers were observed since the wrapper was
+// created, so a plan can target the next barrier with SyncIndex regardless of
+// how many the open/replay path already issued.
+func (fj *FaultJournal) Syncs() int {
+	fj.mu.Lock()
+	defer fj.mu.Unlock()
+	return fj.syncs
+}
+
+// sync counts one barrier and either fails it per the plan or forwards it to
+// the real platform barrier captured at wrap time.
+func (fj *FaultJournal) sync(file *os.File, real func(*os.File) error) error {
+	fj.mu.Lock()
+	plan := fj.plan
+	index := fj.syncs
+	fj.syncs++
+	fj.mu.Unlock()
+	if plan.Phase == JournalFaultSyncError && index == plan.SyncIndex {
+		_, err := fj.fault(0, syscall.EIO)
+		return err
+	}
+	return real(file)
 }
 
 func (fj *FaultJournal) writeAt(p []byte, off int64) (int, error) {
