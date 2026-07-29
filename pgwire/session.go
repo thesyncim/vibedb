@@ -1098,6 +1098,16 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	if s.sql != nil {
 		runtime, err := s.sql.Prepare(context.Background(), lowered)
 		if err != nil {
+			// The catalog shim engages only here, behind the front end's own
+			// refusal: a statement the runtime accepted never reaches it, so
+			// the successful path's behavior and allocation profile are
+			// untouched, and a refused statement pays one recognition attempt
+			// on an already-failed cold path. An unrecognized statement keeps
+			// the runtime's original error unchanged. See catalog_shim.go.
+			if fixed, ok := s.catalogShim(text); ok {
+				p.fixed, p.cols, p.tag = fixed, fixed.cols, fixed.tag
+				return p, nil
+			}
 			return nil, asPGErrorIn(err, text)
 		}
 		p.runtime = runtime

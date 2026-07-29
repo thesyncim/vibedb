@@ -35,25 +35,37 @@
 // PostgreSQL-compatibility guarantee. psycopg and node-postgres have not been
 // tested here.
 //
-// Catalog-driven tooling remains deliberately out of scope. A psql "\d users"
-// expands to a query that joins pg_class to pg_namespace with a LEFT JOIN,
-// filters with a subquery, casts with ::regclass, calls scalar functions like
-// pg_table_is_visible and format_type, and tests membership with ANY over an
-// array—every one of which this dialect refuses on purpose, because the
-// executor has no operator for any of them. The same is true of JDBC's
-// DatabaseMetaData, of every ORM's schema reflection, and of every BI tool's
-// table browser. Direct SQL and client-side commands that do not issue
-// unsupported SQL, such as "\q", work; catalog-backed psql commands do not.
+// A general catalog SQL engine remains deliberately out of scope. A psql
+// "\d users" expands to a query that joins pg_class to pg_namespace with a
+// LEFT JOIN, filters with a subquery, casts with ::regclass, calls scalar
+// functions like pg_table_is_visible and format_type, and tests membership
+// with ANY over an array—every one of which this dialect refuses on purpose,
+// because the executor has no operator for any of them. The same is true of
+// JDBC's DatabaseMetaData, of every ORM's schema reflection, and of every BI
+// tool's table browser, and those still fail here.
 //
-// The refusal is checked rather than asserted: TestCatalogQueriesAreRefused
-// feeds real psql, JDBC, and information_schema probes to the parser and logs
-// where each stops. In practice the parser rejects them earlier than the list
-// above suggests — at "pg_catalog.pg_class", because a schema-qualified
-// relation name is indistinguishable from this dialect's dotted path syntax and
-// is refused rather than guessed at. Supporting these queries would mean
+// psql's own basic meta-commands are the one bounded exception. Stock psql
+// builds its catalog queries from fixed templates, so the exact texts it
+// emits for \l, \dn, \dt, \di, \d, and \d <name> are knowable in advance, and
+// with [FromSQLDatabase] this server recognizes those texts and answers each
+// whole query from the SQL catalog without evaluating any of the SQL inside
+// it; \df, \du, and \dv are recognized and honestly empty. The recognition
+// runs only after the SQL front end has already refused the statement, so a
+// query the dialect accepts never pays for it and an unrecognized query keeps
+// the front end's original error unchanged — catalog_shim.go carries the full
+// argument and the allocation measurement. Client-side commands that issue no
+// SQL, such as "\q", work as before.
+//
+// The parser-level refusal is checked rather than asserted:
+// TestCatalogQueriesAreRefused feeds real psql, JDBC, and information_schema
+// probes to the parser and logs where each stops. In practice the parser
+// rejects them at "pg_catalog.pg_class", because a schema-qualified relation
+// name is indistinguishable from this dialect's dotted path syntax and is
+// refused rather than guessed at. Supporting arbitrary catalog SQL would mean
 // building a subquery-capable, outer-join-capable SQL engine with a schema
-// namespace, to answer questions about a catalog that does not exist. That is a
-// much larger project than this one and a different one.
+// namespace, to answer questions about a catalog that does not exist. That is
+// a much larger project than this one and a different one; the recognition
+// table answers the questions without building the engine.
 //
 // # What works
 //
@@ -81,6 +93,10 @@
 //   - With [FromSQLDatabase]: CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
 //     DELETE, SELECT, one declared-field inner JOIN, schema validation, exact
 //     indexes, whole-document parameters, and affected-row command tags.
+//   - With [FromSQLDatabase]: stock psql's basic introspection meta-commands
+//     — \l, \dn, \dt, \di, \d, and \d <name> — answered from the SQL catalog
+//     by the post-parse-failure recognition shim in catalog_shim.go; \df,
+//     \du, and \dv are recognized and honestly empty.
 //   - Explicit BEGIN/COMMIT/ROLLBACK with ReadyForQuery I/T/E state,
 //     read-your-writes, rollback, failed-transaction behavior, read-only mode,
 //     and implicit atomic batches for non-DDL stored-row statements.
@@ -102,9 +118,12 @@
 //   - DDL/DML/transactions on [FromDatabase] and [FromCollection]. Those
 //     constructors intentionally expose read-only stores; use
 //     [FromSQLDatabase] for the writable catalog.
-//   - pg_catalog and information_schema. There are no catalog tables; see
-//     above. psql's backslash commands, JDBC's DatabaseMetaData, and ORM schema
-//     reflection all fail as a result.
+//   - pg_catalog and information_schema as queryable tables. There are no
+//     catalog tables; see above. psql's basic meta-commands (\l, \dn, \dt,
+//     \di, \d, \d name) are answered by the recognition shim against a
+//     writable SQL catalog; every other catalog consumer — JDBC's
+//     DatabaseMetaData, ORM schema reflection, ad-hoc pg_catalog SQL — still
+//     fails with the parser's refusal.
 //   - COPY, the function-call subprotocol, LISTEN/NOTIFY, cursors (DECLARE and
 //     FETCH), SQL-level PREPARE/EXECUTE, and replication.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a

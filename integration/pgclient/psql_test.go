@@ -120,6 +120,9 @@ SELECT psql_users.name, psql_users.big, psql_orders.total
 FROM psql_users
 JOIN psql_orders ON psql_users.id = psql_orders.user_id
 WHERE psql_users.tier = 'pro';
+\pset tuples_only off
+\dt
+\d psql_users
 \echo __VIBEDB_PSQL_SETUP_OK__
 \q
 `,
@@ -132,6 +135,20 @@ WHERE psql_users.tier = 'pro';
 		"UTF8",
 		"1",
 		`"Ada"|9007199254740993123|12.50`,
+		// \dt answered by the catalog recognition shim: both tables, in the
+		// single "public" namespace, owned by the connected user. tuples_only
+		// is switched off first because it would suppress the \d footer that
+		// carries the index list.
+		"List of tables",
+		"public|psql_orders|table|"+testUser,
+		"public|psql_users|table|"+testUser,
+		// \d psql_users: the pg_attribute rows in the catalog's canonical
+		// order, then the primary-key and secondary exact indexes rendered
+		// from the shim's index definitions.
+		"id|string||not null|",
+		"tier|string|||",
+		`"psql_users_pkey" PRIMARY KEY, exact (id)`,
+		`"psql_users_by_tier" exact (tier)`,
 		"__VIBEDB_PSQL_SETUP_OK__",
 	)
 
@@ -144,6 +161,7 @@ WHERE psql_users.tier = 'pro';
 		script: `
 SELECT * FROM psql_table_that_does_not_exist;
 SELECT 'VIBEDB_SERVER_RESYNC_OK';
+\d psql_missing
 \echo __VIBEDB_PSQL_RESYNC_OK__
 \q
 `,
@@ -154,6 +172,10 @@ SELECT 'VIBEDB_SERVER_RESYNC_OK';
 	assertOutputContains(t, resyncOutput,
 		"42P01",
 		"VIBEDB_SERVER_RESYNC_OK",
+		// \d of a missing table resolves to zero rows on the server, and psql
+		// prints its own diagnostic — a psql-side error, which is why it runs
+		// in this ON_ERROR_STOP=off session.
+		`Did not find any relation named "psql_missing".`,
 		"__VIBEDB_PSQL_RESYNC_OK__",
 	)
 
