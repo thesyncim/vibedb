@@ -95,6 +95,22 @@ func (c *Collection) publishFileState(state *fileStoreState) {
 		c.visibilityMu.Unlock()
 		return
 	}
+	c.recordPendingFileStateLocked(
+		state, c.committer.DurableGeneration(),
+	)
+	c.visibilityMu.Unlock()
+}
+
+// recordPendingFileStateLocked installs state in the fixed visibility ring
+// before considering a durability promotion. That order is load-bearing when
+// a grouped commit skips logical generations: a durable watermark may already
+// cover the state being published, and the promotion scan must be able to
+// select the just-recorded pointer in the same critical section.
+//
+// The caller holds visibilityMu.
+func (c *Collection) recordPendingFileStateLocked(
+	state *fileStoreState, durableGeneration uint64,
+) {
 	slot := state.root.Generation & uint64(len(c.pendingVisible)-1)
 	c.pendingVisible[slot] = filePendingState{
 		generation: state.root.Generation,
@@ -107,8 +123,28 @@ func (c *Collection) publishFileState(state *fileStoreState) {
 	if !c.chainFenceSync() {
 		c.visibleState.Store(state)
 	}
-	c.promoteDurableStateLocked(c.committer.DurableGeneration())
-	c.visibilityMu.Unlock()
+	c.promoteDurableStateIfAdvancedLocked(durableGeneration)
+}
+
+// promoteDurableStateIfAdvancedLocked avoids an O(len(pendingVisible)) scan
+// while the physical durable watermark is unchanged. In buffered-visible and
+// journal-backed synchronous operation that is almost every mutation between
+// physical checkpoints (the competitive shape configures 1,024 visibility
+// slots). No pending publication can become newly eligible without the
+// watermark advancing, so retaining the ring verbatim is equivalent.
+//
+// The caller holds visibilityMu. The result is true when the scan ran; it is
+// exposed for the focused invariant tests and is otherwise intentionally
+// ignored.
+func (c *Collection) promoteDurableStateIfAdvancedLocked(
+	generation uint64,
+) bool {
+	current := c.durableState.Load()
+	if current != nil && generation <= current.root.Generation {
+		return false
+	}
+	c.promoteDurableStateLocked(generation)
+	return true
 }
 
 // promoteDurableState is called by the persistence worker after the final

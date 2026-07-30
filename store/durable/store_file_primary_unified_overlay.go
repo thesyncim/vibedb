@@ -838,12 +838,18 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 			if overflow {
 				return false, false, false, nil
 			}
-			old := uv.AppendAdmittedRowBody(c.primaryUnifiedCanonical[:0], body)
-			oldLen = len(old)
-			c.overflowValueScratch = append(
-				c.overflowValueScratch[:0], old...,
-			)
-			oldRaw = c.overflowValueScratch
+			if c.primaryEpoch == nil {
+				oldLen = uv.AdmittedRowBodyLen(body)
+			} else {
+				old := uv.AppendAdmittedRowBody(
+					c.primaryUnifiedCanonical[:0], body,
+				)
+				oldLen = len(old)
+				c.overflowValueScratch = append(
+					c.overflowValueScratch[:0], old...,
+				)
+				oldRaw = c.overflowValueScratch
+			}
 		}
 	default:
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
@@ -992,12 +998,18 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 			// Overflow retirement remains on the structural lane.
 			return false, false, false, nil
 		}
-		old := uv.AppendAdmittedRowBody(c.primaryUnifiedCanonical[:0], body)
-		oldLen = len(old)
-		c.overflowValueScratch = append(
-			c.overflowValueScratch[:0], old...,
-		)
-		oldRaw = c.overflowValueScratch
+		if c.primaryEpoch == nil {
+			oldLen = uv.AdmittedRowBodyLen(body)
+		} else {
+			old := uv.AppendAdmittedRowBody(
+				c.primaryUnifiedCanonical[:0], body,
+			)
+			oldLen = len(old)
+			c.overflowValueScratch = append(
+				c.overflowValueScratch[:0], old...,
+			)
+			oldRaw = c.overflowValueScratch
+		}
 	default:
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}

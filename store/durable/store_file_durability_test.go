@@ -74,6 +74,147 @@ func TestFileStoreDurablePromotionSelectsNewestGroupedGeneration(t *testing.T) {
 	}
 }
 
+func TestFileStoreDurablePromotionGuardSkipsUnchangedWatermark(t *testing.T) {
+	collection := &Collection{
+		options: normalizedFileStoreOptions{
+			Options: Options{Durability: DurabilityBufferedVisible},
+		},
+		pendingVisible: make([]filePendingState, 1_024),
+	}
+	initial := durabilityTestState(10)
+	collection.initializeFileState(initial)
+	next := durabilityTestState(11)
+
+	collection.recordPendingFileStateLocked(next, 10)
+	if got := collection.visibleState.Load(); got != next {
+		t.Fatalf("visible state = %p, want published %p", got, next)
+	}
+	if got := collection.durableState.Load(); got != initial {
+		t.Fatalf("durable state = %p, want unchanged %p", got, initial)
+	}
+	slot := next.root.Generation & uint64(len(collection.pendingVisible)-1)
+	pending := collection.pendingVisible[slot]
+	if pending.generation != 11 || pending.state != next {
+		t.Fatalf(
+			"pending slot = generation %d state %p, want 11/%p",
+			pending.generation, pending.state, next,
+		)
+	}
+	if scanned := collection.promoteDurableStateIfAdvancedLocked(10); scanned {
+		t.Fatal("unchanged durable watermark scanned the visibility ring")
+	}
+	if pending = collection.pendingVisible[slot]; pending.state != next {
+		t.Fatal("guard changed pending publication at unchanged watermark")
+	}
+}
+
+func TestFileStorePublishRecordsPendingBeforePromotion(t *testing.T) {
+	collection := &Collection{
+		options: normalizedFileStoreOptions{
+			// With no journal, synchronous visibility is gated by the physical
+			// committer watermark. The state can become visible only if the
+			// promotion sees the pending entry recorded by this same call.
+			Options: Options{Durability: DurabilitySync},
+		},
+		pendingVisible: make([]filePendingState, 4),
+	}
+	initial := durabilityTestState(1)
+	collection.initializeFileState(initial)
+	second := durabilityTestState(2)
+
+	// The supplied physical watermark already covers generation 2. Recording
+	// second before the guarded scan is what lets this single call promote it.
+	collection.recordPendingFileStateLocked(second, 2)
+	if got := collection.durableState.Load(); got != second {
+		t.Fatalf("durable state = %p, want just-published %p", got, second)
+	}
+	if got := collection.visibleState.Load(); got != second {
+		t.Fatalf("visible state = %p, want just-published %p", got, second)
+	}
+	slot := second.root.Generation & uint64(len(collection.pendingVisible)-1)
+	if pending := collection.pendingVisible[slot]; pending.state != nil {
+		t.Fatalf(
+			"promoted pending slot retained generation %d state %p",
+			pending.generation, pending.state,
+		)
+	}
+}
+
+func TestFileStoreDurablePromotionGuardHandlesGroupedGap(t *testing.T) {
+	collection := &Collection{
+		options: normalizedFileStoreOptions{
+			Options: Options{Durability: DurabilityBufferedVisible},
+		},
+		pendingVisible: make([]filePendingState, 8),
+	}
+	initial := durabilityTestState(1)
+	collection.initializeFileState(initial)
+	second := durabilityTestState(2)
+	third := durabilityTestState(3)
+	fourth := durabilityTestState(4)
+
+	collection.recordPendingFileStateLocked(second, 1)
+	collection.recordPendingFileStateLocked(third, 1)
+	collection.recordPendingFileStateLocked(fourth, 1)
+	if got := collection.durableState.Load(); got != initial {
+		t.Fatalf("pre-fence durable state = %p, want %p", got, initial)
+	}
+	if scanned := collection.promoteDurableStateIfAdvancedLocked(3); !scanned {
+		t.Fatal("advanced grouped watermark skipped promotion scan")
+	}
+	if got := collection.durableState.Load(); got != third {
+		t.Fatalf("grouped durable state = %p, want generation-3 %p", got, third)
+	}
+	for _, generation := range []uint64{2, 3} {
+		slot := generation & uint64(len(collection.pendingVisible)-1)
+		if pending := collection.pendingVisible[slot]; pending.state != nil {
+			t.Fatalf("eligible generation %d remained pending", generation)
+		}
+	}
+	fourthSlot := fourth.root.Generation &
+		uint64(len(collection.pendingVisible)-1)
+	if pending := collection.pendingVisible[fourthSlot]; pending.state != fourth {
+		t.Fatalf("future generation 4 was cleared by generation-3 fence")
+	}
+	if scanned := collection.promoteDurableStateIfAdvancedLocked(4); !scanned {
+		t.Fatal("second advanced watermark skipped promotion scan")
+	}
+	if got := collection.durableState.Load(); got != fourth {
+		t.Fatalf("final durable state = %p, want generation-4 %p", got, fourth)
+	}
+}
+
+func BenchmarkFileStoreDurablePromotionGuard(b *testing.B) {
+	newCollection := func() *Collection {
+		collection := &Collection{
+			pendingVisible: make([]filePendingState, 1_024),
+		}
+		collection.initializeFileState(durabilityTestState(1))
+		collection.pendingVisible[2] = filePendingState{
+			generation: 2, state: durabilityTestState(2),
+		}
+		return collection
+	}
+	b.Run("unchanged-guard", func(b *testing.B) {
+		collection := newCollection()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if collection.promoteDurableStateIfAdvancedLocked(1) {
+				b.Fatal("unchanged watermark scanned")
+			}
+		}
+	})
+	b.Run("full-scan-control", func(b *testing.B) {
+		collection := newCollection()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			collection.promoteDurableStateLocked(1)
+		}
+	})
+}
+
 func TestFileStoreAsyncFailureRollsBackOrRejectsCanonicalView(t *testing.T) {
 	initial := durabilityTestState(1)
 	volatile := durabilityTestState(2)
