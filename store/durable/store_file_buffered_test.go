@@ -466,8 +466,13 @@ func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T)
 			automaticCheckpoints, got,
 		)
 	}
-	if got := collection.Stats().DeviceCommits; got <= stats.DeviceCommits {
-		t.Fatalf("explicit Flush left device commits at %d", got)
+	afterFlush := collection.Stats()
+	if afterFlush.JournalDeltaCheckpoints <= stats.JournalDeltaCheckpoints &&
+		afterFlush.DeviceCommits <= stats.DeviceCommits {
+		t.Fatalf(
+			"explicit Flush advanced neither journal nor device: before=%+v after=%+v",
+			stats, afterFlush,
+		)
 	}
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
@@ -568,6 +573,130 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 	if got, found, err := reopened.AppendRaw(nil, []byte("key")); err != nil ||
 		!found || !bytes.Equal(got, canonicalSecond) {
 		t.Fatalf("reopened latest value = (%q, %v, %v)", got, found, err)
+	}
+}
+
+func TestFileStoreBufferedVisibleNeverDurableReusePlateausAndReopens(t *testing.T) {
+	path := t.TempDir() + "/buffered-never-durable-reuse.db"
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := testFileStoreOptions()
+	options.Durability = DurabilityBufferedVisible
+	options.ResidentBytes = 64 << 20
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte("hot")
+	var last []byte
+	var plateau uint64
+	const warmup = 16
+	const cycles = 64
+	for cycle := range cycles {
+		value := fmt.Appendf(
+			nil,
+			`{"cycle":%d,"pad":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+			cycle,
+		)
+		last, err = vibejson.AppendCanonicalize(last[:0], value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := collection.Put(key, value); err != nil {
+			t.Fatalf("cycle %d Put: %v", cycle, err)
+		}
+		// Snapshot materializes the current overlay without authorizing a
+		// physical checkpoint. Closing it before the next mutation gives the
+		// following publication the exact no-reader supersession proof.
+		snapshot, err := collection.Snapshot()
+		if err != nil {
+			t.Fatalf("cycle %d Snapshot: %v", cycle, err)
+		}
+		got, found, readErr := snapshot.AppendRaw(nil, key)
+		if readErr != nil || !found || !bytes.Equal(got, last) {
+			_ = snapshot.Close()
+			t.Fatalf(
+				"cycle %d snapshot = (%q, %v, %v), want %q",
+				cycle, got, found, readErr, last,
+			)
+		}
+		if err := snapshot.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if cycle == warmup-1 {
+			plateau = collection.state.Load().super.FileEnd
+		}
+	}
+	after := collection.state.Load().super.FileEnd
+	// One retained tail witness plus bounded free-log reshaping may extend the
+	// warmup high-water by a few pages. It must not grow once per materialized
+	// generation, which was the pre-integration failure mode.
+	maxGrowth := uint64(8 * options.PageSize)
+	if after > plateau+maxGrowth {
+		t.Fatalf(
+			"never-durable COW reuse did not plateau: warmup=%d after=%d growth=%d limit=%d",
+			plateau, after, after-plateau, maxGrowth,
+		)
+	}
+	if stats := collection.committer.Stats(); stats.SupersededPageWrites == 0 {
+		t.Fatalf("materialized churn superseded no queued page writes: %+v", stats)
+	}
+	if err := flushPhysicalForTest(collection); err != nil {
+		t.Fatal(err)
+	}
+	crash := openBufferedImage(
+		t, captureJournalImage(t, path), options,
+	)
+	if got, found, err := crash.AppendRaw(nil, key); err != nil ||
+		!found || !bytes.Equal(got, last) {
+		t.Fatalf(
+			"crash image latest value = (%q, %v, %v), want %q",
+			got, found, err, last,
+		)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedFile.Close()
+	reopened, err := Open(reopenedFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, found, err := reopened.AppendRaw(nil, key); err != nil ||
+		!found || !bytes.Equal(got, last) {
+		t.Fatalf(
+			"reopened latest value = (%q, %v, %v), want %q",
+			got, found, err, last,
+		)
+	}
+	// Allocate and durably publish once more after replay. If the prior
+	// generation failed to persist the reuse delete, this allocation can hand
+	// out a live extent and the checkpoint/re-read catches the overlap.
+	final := []byte(`{"cycle":"reopened"}`)
+	if _, err := reopened.Put(key, final); err != nil {
+		t.Fatal(err)
+	}
+	if err := flushPhysicalForTest(reopened); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := reopened.AppendRaw(nil, key); err != nil ||
+		!found || !bytes.Equal(got, final) {
+		t.Fatalf(
+			"post-reopen update = (%q, %v, %v), want %q",
+			got, found, err, final,
+		)
 	}
 }
 

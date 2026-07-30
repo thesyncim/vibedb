@@ -441,6 +441,140 @@ func TestExtentReclaimerBatchIsAtomicAndCancelable(t *testing.T) {
 	}
 }
 
+func TestExtentReclaimerExtractRetiredExact(t *testing.T) {
+	const count = retiredIntervalIndexThreshold + 8
+	leases, _ := NewGenerationLeases(
+		GenerationLeaseOptions{MaxLeases: 1},
+	)
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: count},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents := make([]FreeExtent, count)
+	var totalBytes uint64
+	for i := range extents {
+		extents[i] = FreeExtent{
+			Offset: uint64(i+1) * 4096, Length: 4096,
+			RetiredGeneration: uint64(10 + i/16),
+		}
+		totalBytes += extents[i].Length
+	}
+	if err := reclaimer.RetireBatch(extents); err != nil {
+		t.Fatal(err)
+	}
+	// Include a malformed record, an absent exact shape, and a duplicate.
+	// Only the two exact pending extents may move.
+	candidates := []FreeExtent{
+		{},
+		{Offset: extents[17].Offset, Length: 2048, RetiredGeneration: extents[17].RetiredGeneration},
+		extents[17],
+		extents[count-3],
+		extents[17],
+	}
+	dst := make([]FreeExtent, 1, 4)
+	dst[0] = FreeExtent{Offset: 1, Length: 1, RetiredGeneration: 1}
+	dst = reclaimer.ExtractRetiredExact(dst, candidates)
+	if got, want := dst[1:], []FreeExtent{extents[17], extents[count-3]}; !slices.Equal(got, want) {
+		t.Fatalf("extracted = %+v, want %+v", got, want)
+	}
+	stats := reclaimer.Stats()
+	if stats.Pending != count-2 ||
+		stats.PendingBytes != totalBytes-2*4096 {
+		t.Fatalf("Stats after exact extraction = %+v", stats)
+	}
+	pending := reclaimer.AppendPending(nil)
+	for _, extracted := range dst[1:] {
+		if slices.Contains(pending, extracted) {
+			t.Fatalf("extracted extent remains pending: %+v", extracted)
+		}
+	}
+	// The interval index must remain exact after arbitrary middle removals.
+	if err := reclaimer.RetireBatch(dst[1:]); err != nil {
+		t.Fatalf("re-retire extracted extents: %v", err)
+	}
+	if stats := reclaimer.Stats(); stats.Pending != count ||
+		stats.PendingBytes != totalBytes {
+		t.Fatalf("Stats after re-retire = %+v", stats)
+	}
+}
+
+func TestExtentReclaimerExtractRetiredExactIsBoundedAndAllocationFree(t *testing.T) {
+	leases, _ := NewGenerationLeases(
+		GenerationLeaseOptions{MaxLeases: 1},
+	)
+	reclaimer, _ := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: 2},
+	)
+	first := FreeExtent{
+		Offset: 4096, Length: 4096, RetiredGeneration: 1,
+	}
+	second := FreeExtent{
+		Offset: 8192, Length: 4096, RetiredGeneration: 1,
+	}
+	dst := make([]FreeExtent, 0, 1)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if err := reclaimer.RetireBatch([]FreeExtent{first, second}); err != nil {
+			panic(err)
+		}
+		dst = reclaimer.ExtractRetiredExact(
+			dst[:0], []FreeExtent{first, second},
+		)
+		if len(dst) != 1 || dst[0] != first {
+			panic("bounded exact extraction")
+		}
+		if err := reclaimer.CancelRetiredGeneration(1); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("exact extraction allocations = %g, want 0", allocs)
+	}
+}
+
+func TestExtentReclaimerExtractRetiredExactLargePendingIsAllocationFree(t *testing.T) {
+	const (
+		pendingCount = 1 << 16
+		extractCount = 256
+	)
+	leases, _ := NewGenerationLeases(
+		GenerationLeaseOptions{MaxLeases: 1},
+	)
+	reclaimer, err := NewExtentReclaimer(
+		leases,
+		ExtentReclaimerOptions{MaxRetiredExtents: pendingCount},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents := make([]FreeExtent, pendingCount)
+	for i := range extents {
+		extents[i] = FreeExtent{
+			Offset: uint64(i+1) * 4096, Length: 4096,
+			RetiredGeneration: uint64(1 + i/64),
+		}
+	}
+	if err := reclaimer.RetireBatch(extents); err != nil {
+		t.Fatal(err)
+	}
+	candidates := extents[len(extents)-extractCount:]
+	dst := make([]FreeExtent, 0, extractCount)
+	if allocs := testing.AllocsPerRun(10, func() {
+		dst = reclaimer.ExtractRetiredExact(dst[:0], candidates)
+		if len(dst) != extractCount {
+			panic("large exact extraction")
+		}
+		if err := reclaimer.RetireBatch(dst); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("large exact extraction allocations = %g, want 0", allocs)
+	}
+	if stats := reclaimer.Stats(); stats.Pending != pendingCount {
+		t.Fatalf("large pending Stats = %+v", stats)
+	}
+}
+
 func TestGenerationLeaseAndReclaimerSteadyAllocation(t *testing.T) {
 	leases, _ := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
 	reclaimer, _ := NewExtentReclaimer(leases, ExtentReclaimerOptions{MaxRetiredExtents: 1})

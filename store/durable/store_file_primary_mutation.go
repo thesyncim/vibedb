@@ -2707,14 +2707,23 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	c.snapshotGate.Lock()
 	c.beginReaderFence()
 	retiring := !c.anyActiveReaders()
+	absorbedStart := len(c.retirementAbsorbed)
 	if retiring {
-		err = tx.PublishInlineRetiring(
-			nextState.root, nextInline, c.retireRefScratch,
+		absorbed := c.retirementAbsorbed
+		var extracted []storeio.FreeExtent
+		extracted, err = tx.PublishInlineRetiring(
+			nextState.root, nextInline,
+			c.retireRefScratch, c.retireScratch,
+			c.neverDurableRetirementOutput(),
 		)
+		c.retirementAbsorbed = absorbed[:len(extracted)]
 	} else {
 		err = tx.PublishInline(nextState.root, nextInline)
 	}
 	if err != nil {
+		clear(c.retirementAbsorbed[absorbedStart:])
+		c.retirementAbsorbed =
+			c.retirementAbsorbed[:absorbedStart]
 		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
@@ -2747,6 +2756,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		clear(c.primaryVolatileRetired)
 		c.primaryVolatileRetired =
 			c.primaryVolatileRetired[:0]
+		c.extractNeverDurableRetirements(absorbedStart)
 	}
 	for index := range c.primaryPendingParents {
 		c.retirePrimaryVolatileRefLocked(
@@ -2914,6 +2924,46 @@ func (c *Collection) appendPrimaryRetirement(
 	return nil
 }
 
+// extractNeverDurableRetirements completes the one-publication-late handoff.
+// PublishInlineRetiring appended only records whose exact older pending writes
+// it transitioned to superseded under the committer checkpoint mutex. The
+// caller has since made those refs unreachable in PageCache while the
+// snapshot gate and direct-reader fence still exclude every old reader.
+//
+// The extents move into retirementAbsorbed rather than directly into the
+// allocator. refreshReusableFor merges that bounded batch before the next
+// transaction, so ordinary ReuseEdits record the mandatory free-log delete or
+// shortened-set if the next generation consumes one.
+func (c *Collection) extractNeverDurableRetirements(start int) {
+	if c == nil || c.reclaimer == nil ||
+		start < 0 || start > len(c.retirementAbsorbed) {
+		return
+	}
+	c.retirementAbsorbed = c.reclaimer.ExtractRetiredExact(
+		c.retirementAbsorbed[:start],
+		c.retirementAbsorbed[start:],
+	)
+}
+
+// neverDurableRetirementOutput caps the optimization by both its fixed scratch
+// and the allocator's remaining authoritative free-set room. Candidates beyond
+// that bound stay in the reclaimer and take the ordinary fallback-generation
+// path; extracting them would make the next merge fail after publication.
+func (c *Collection) neverDurableRetirementOutput() []storeio.FreeExtent {
+	if c == nil {
+		return nil
+	}
+	used := len(c.retirementAbsorbed)
+	room := min(
+		cap(c.retirementAbsorbed)-used,
+		c.freeSetLimit-c.liveReusable()-used,
+	)
+	if room < 0 {
+		room = 0
+	}
+	return c.retirementAbsorbed[: used : used+room]
+}
+
 func (c *Collection) removePrimaryEmptyLeaf() {
 	for {
 		current := c.primaryEmptyLeaves.Load()
@@ -2968,11 +3018,19 @@ func (c *Collection) publishStagedPrimaryMutation(
 	nextLeaf storeio.PageRef,
 	preparedExact primaryExactPrepared,
 ) error {
+	absorbedStart := len(c.retirementAbsorbed)
 	publish := func(retiring bool) error {
 		if retiring {
-			return tx.PublishInlineRetiring(
-				nextState.root, nextInline, c.retireRefScratch,
+			absorbed := c.retirementAbsorbed
+			var err error
+			var extracted []storeio.FreeExtent
+			extracted, err = tx.PublishInlineRetiring(
+				nextState.root, nextInline,
+				c.retireRefScratch, c.retireScratch,
+				c.neverDurableRetirementOutput(),
 			)
+			c.retirementAbsorbed = absorbed[:len(extracted)]
+			return err
 		}
 		return tx.PublishInline(nextState.root, nextInline)
 	}
@@ -2998,6 +3056,9 @@ func (c *Collection) publishStagedPrimaryMutation(
 	c.beginReaderFence()
 	retiring := !c.anyActiveReaders()
 	if err := publish(retiring); err != nil {
+		clear(c.retirementAbsorbed[absorbedStart:])
+		c.retirementAbsorbed =
+			c.retirementAbsorbed[:absorbedStart]
 		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
@@ -3010,6 +3071,7 @@ func (c *Collection) publishStagedPrimaryMutation(
 	c.publishFileState(nextState)
 	if retiring {
 		c.cache.MarkUnreachable(c.retireRefScratch)
+		c.extractNeverDurableRetirements(absorbedStart)
 	}
 	c.endReaderFence()
 	c.snapshotGate.Unlock()

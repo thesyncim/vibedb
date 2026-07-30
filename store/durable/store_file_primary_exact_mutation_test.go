@@ -146,10 +146,10 @@ func TestFilePrimaryIndexedMutationMatchesRebuild(t *testing.T) {
 	// not just the untouched build-time bytes.
 	dir2 := t.TempDir()
 	again, _ := run(dir2)
-	if err := mutated.Flush(); err != nil {
+	if err := flushPhysicalForTest(mutated); err != nil {
 		t.Fatal(err)
 	}
-	if err := again.Flush(); err != nil {
+	if err := flushPhysicalForTest(again); err != nil {
 		t.Fatal(err)
 	}
 	mutatedExact := mutated.primaryEpoch.exact
@@ -427,7 +427,7 @@ func indexedCrashCountry(doc string) (string, bool) {
 func runIndexedPrimaryFaultPass(
 	t *testing.T, built *store.Collection, options Options,
 	fc *faultController, plan storeio.FaultPlan, ops int,
-) (boundaries []int, contents []map[string]string, image []byte, faulted bool) {
+) (boundaries []int, contents []map[string]string, image journalCrashImage, faulted bool) {
 	t.Helper()
 	prev := storeCommitterFactory
 	storeCommitterFactory = fc.factory()
@@ -460,7 +460,7 @@ func runIndexedPrimaryFaultPass(
 	for i := 0; i < ops; i++ {
 		_, opErr := coll.Put([]byte(indexedCrashKey(i)), indexedCrashValue(i))
 		if opErr == nil {
-			opErr = coll.Flush()
+			opErr = flushPhysicalForTest(coll)
 		}
 		if dev.Faulted() {
 			break
@@ -474,7 +474,7 @@ func runIndexedPrimaryFaultPass(
 		contents = append(contents, snapshotCollectionContent(t, coll))
 	}
 	faulted = dev.Faulted()
-	image, _ = os.ReadFile(path)
+	image = captureJournalImage(t, path)
 	_ = coll.Close()
 	_ = file.Close()
 	return boundaries, contents, image, faulted
@@ -488,10 +488,15 @@ func runIndexedPrimaryFaultPass(
 // (the term-leaf admission rechecks postings against the derived live map) or
 // return a mismatched answer here; a mid-write torn image is allowed to fail
 // Open, but must not corrupt.
-func assertIndexedCrashImage(t *testing.T, options Options, image []byte, label string) {
+func assertIndexedCrashImage(
+	t *testing.T, options Options, image journalCrashImage, label string,
+) {
 	t.Helper()
 	imagePath := filepath.Join(t.TempDir(), "indexed-verify.vibe")
-	if err := os.WriteFile(imagePath, image, 0o600); err != nil {
+	if err := os.WriteFile(imagePath, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(imagePath+".rjournal", image.journal, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.OpenFile(imagePath, os.O_RDWR, 0o600)

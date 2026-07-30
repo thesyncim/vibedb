@@ -151,7 +151,8 @@ type Write struct {
 	// pendingFlags belongs to the manual-checkpoint committer. Device never
 	// receives superseded writes. The flags also distinguish a compact
 	// cache-frame source and record opportunistic pre-write completion.
-	pendingFlags uint8
+	pendingFlags      uint8
+	retiredGeneration uint64
 }
 
 func (w Write) frameNative() bool {

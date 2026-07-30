@@ -37,7 +37,8 @@ func (b *Batch) SetInlineSuperblock(root InlineSuperblock) error {
 // and requires that the transaction did not allocate a PageStateRoot extent.
 // All ordinary data pages must already be staged.
 func (t *WriteTransaction) PublishInline(state StateRoot, free InlineFreeDelta) error {
-	return t.publishInline(state, free, nil)
+	_, err := t.publishInline(state, free, nil, nil, nil)
+	return err
 }
 
 // PublishInlineRetiring is PublishInline with a conservative buffered-
@@ -49,37 +50,49 @@ func (t *WriteTransaction) PublishInline(state StateRoot, free InlineFreeDelta) 
 //
 // The caller must exclude snapshot acquisition from before this call through
 // publication of the corresponding reader-visible state and must prove that no
-// snapshot of the preceding state is active. The slice is borrowed only for
-// this call. Automatic committers ignore it.
+// snapshot of the preceding state is active. retired and retirements are
+// borrowed only for this call and need not be index-parallel: exact
+// offset/length matching binds the physical PageRef proof to its authoritative
+// retired-generation record. superseded is caller-owned bounded output; the
+// returned slice appends only records whose pending writes this call actually
+// made impossible to checkpoint. Automatic committers leave it unchanged.
 func (t *WriteTransaction) PublishInlineRetiring(
 	state StateRoot,
 	free InlineFreeDelta,
 	retired []PageRef,
-) error {
-	return t.publishInline(state, free, retired)
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) ([]FreeExtent, error) {
+	return t.publishInline(
+		state, free, retired, retirements, superseded,
+	)
 }
 
 func (t *WriteTransaction) publishInline(
 	state StateRoot,
 	free InlineFreeDelta,
 	retired []PageRef,
-) error {
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) ([]FreeExtent, error) {
 	if t == nil || !t.active || state.StoreID != t.options.StoreID ||
 		state.Generation != t.options.Generation || state.PageSize != t.options.PageSize ||
 		state.NextLogicalID != t.nextID {
-		return ErrBatchState
+		return superseded, ErrBatchState
 	}
 	for i := 0; i < t.allocated; i++ {
 		write := *t.writeAt(i)
 		if write.Length == 0 {
-			return fmt.Errorf("%w: unstaged transaction page", ErrInvalidWrite)
+			return superseded,
+				fmt.Errorf("%w: unstaged transaction page", ErrInvalidWrite)
 		}
 		if write.kind == PageStateRoot {
-			return fmt.Errorf("%w: inline publication allocated a state page", ErrInvalidWrite)
+			return superseded,
+				fmt.Errorf("%w: inline publication allocated a state page", ErrInvalidWrite)
 		}
 	}
 	if err := t.resizePages(t.allocated); err != nil {
-		return err
+		return superseded, err
 	}
 	if !t.batch.materialized {
 		slices.SortFunc(t.fullWrites(), func(a, b Write) int {
@@ -98,14 +111,17 @@ func (t *WriteTransaction) publishInline(
 		FreeDelta: free,
 	}
 	if err := t.batch.SetInlineSuperblock(root); err != nil {
-		return err
+		return superseded, err
 	}
-	if err := t.committer.publish(
-		t.batch, t.options.Generation, retired,
-	); err != nil {
-		return err
+	var err error
+	superseded, err = t.committer.publishRetiring(
+		t.batch, t.options.Generation,
+		retired, retirements, superseded,
+	)
+	if err != nil {
+		return superseded, err
 	}
 	t.active = false
 	t.batch = nil
-	return nil
+	return superseded, nil
 }

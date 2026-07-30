@@ -3,6 +3,7 @@ package storeio
 import (
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 )
@@ -191,7 +192,10 @@ func TestCommitterManualCheckpointSupersedesExactRetiredPages(t *testing.T) {
 	publishTestGeneration(t, committer, 1,
 		[]testPage{{offset: int64(pageSize), data: []byte("old")}},
 		0, []byte("root-1"))
-	publishTestGenerationRetiring(t, committer, 2,
+	retirement := FreeExtent{
+		Offset: uint64(pageSize), Length: 3, RetiredGeneration: 1,
+	}
+	superseded := publishTestGenerationRetiringCollect(t, committer, 2,
 		[]testPage{{offset: int64(2 * pageSize), data: []byte("new")}},
 		0, []byte("root-2"), []PageRef{
 			// Overlap and same-offset/different-length are not proofs.
@@ -200,7 +204,13 @@ func TestCommitterManualCheckpointSupersedesExactRetiredPages(t *testing.T) {
 			// A duplicate exact proof must recycle the buffer only once.
 			{Offset: uint64(pageSize), Length: 3, Generation: 1},
 			{Offset: uint64(pageSize), Length: 3, Generation: 1},
-		})
+		}, []FreeExtent{retirement}, make([]FreeExtent, 0, 2))
+	if !slices.Equal(superseded, []FreeExtent{retirement}) {
+		t.Fatalf(
+			"superseded retirement proof = %+v, want %+v",
+			superseded, retirement,
+		)
+	}
 	stats := committer.Stats()
 	if stats.SupersededPageWrites != 1 ||
 		stats.SupersededPageBytes != 3 {
@@ -243,11 +253,18 @@ func TestCommitterManualCheckpointRetainsAndLaterReleasesTailWitness(t *testing.
 		publishTestGeneration(t, committer, 1,
 			[]testPage{{offset: int64(3 * pageSize), data: []byte("tail")}},
 			0, []byte("root-1"))
-		publishTestGenerationRetiring(t, committer, 2,
+		tailRetirement := FreeExtent{
+			Offset: uint64(3 * pageSize), Length: 4,
+			RetiredGeneration: 1,
+		}
+		superseded := publishTestGenerationRetiringCollect(t, committer, 2,
 			[]testPage{{offset: int64(2 * pageSize), data: []byte("low")}},
 			0, []byte("root-2"), []PageRef{{
 				Offset: uint64(3 * pageSize), Length: 4, Generation: 1,
-			}})
+			}}, []FreeExtent{tailRetirement}, make([]FreeExtent, 0, 1))
+		if len(superseded) != 0 {
+			t.Fatalf("tail witness reported reusable: %+v", superseded)
+		}
 		if stats := committer.Stats(); stats.TailWitnessWrites != 0 {
 			t.Fatalf("provisional witness counted before submission: %+v", stats)
 		}
@@ -287,17 +304,31 @@ func TestCommitterManualCheckpointRetainsAndLaterReleasesTailWitness(t *testing.
 		publishTestGeneration(t, committer, 1,
 			[]testPage{{offset: int64(3 * pageSize), data: []byte("tail")}},
 			0, []byte("root-1"))
-		publishTestGenerationRetiring(t, committer, 2,
+		tailRetirement := FreeExtent{
+			Offset: uint64(3 * pageSize), Length: 4,
+			RetiredGeneration: 1,
+		}
+		firstProof := publishTestGenerationRetiringCollect(t, committer, 2,
 			[]testPage{{offset: int64(2 * pageSize), data: []byte("low")}},
 			0, []byte("root-2"), []PageRef{{
 				Offset: uint64(3 * pageSize), Length: 4, Generation: 1,
-			}})
+			}}, []FreeExtent{tailRetirement}, make([]FreeExtent, 0, 1))
+		if len(firstProof) != 0 {
+			t.Fatalf("active tail witness reported reusable: %+v", firstProof)
+		}
 		// The non-nil empty proof says this publication also observed no active
 		// snapshot. Its farther page makes generation one's retained tail
 		// witness unnecessary.
-		publishTestGenerationRetiring(t, committer, 3,
+		releasedProof := publishTestGenerationRetiringCollect(t, committer, 3,
 			[]testPage{{offset: int64(4 * pageSize), data: []byte("high")}},
-			0, []byte("root-3"), []PageRef{})
+			0, []byte("root-3"), []PageRef{}, nil,
+			make([]FreeExtent, 0, 1))
+		if !slices.Equal(releasedProof, []FreeExtent{tailRetirement}) {
+			t.Fatalf(
+				"released tail proof = %+v, want %+v",
+				releasedProof, tailRetirement,
+			)
+		}
 		if err := committer.Flush(); err != nil {
 			t.Fatal(err)
 		}
@@ -345,11 +376,17 @@ func TestCommitterManualPageSupersessionDoesNotCrossCheckpointCut(t *testing.T) 
 	// has not dequeued it yet. Generation two is outside that cut and cannot
 	// remove a page root-one may publish.
 	committer.checkpointThrough.Store(1)
-	publishTestGenerationRetiring(t, committer, 2,
+	protectedRetirement := FreeExtent{
+		Offset: uint64(pageSize), Length: 3, RetiredGeneration: 1,
+	}
+	superseded := publishTestGenerationRetiringCollect(t, committer, 2,
 		[]testPage{{offset: int64(2 * pageSize), data: []byte("new")}},
 		0, []byte("root-2"), []PageRef{{
 			Offset: uint64(pageSize), Length: 3, Generation: 1,
-		}})
+		}}, []FreeExtent{protectedRetirement}, make([]FreeExtent, 0, 1))
+	if len(superseded) != 0 {
+		t.Fatalf("checkpoint-cut retirement reported reusable: %+v", superseded)
+	}
 	if got := committer.Stats().SupersededPageWrites; got != 0 {
 		t.Fatalf("checkpoint cut superseded page: count=%d", got)
 	}
@@ -607,6 +644,23 @@ func publishTestGenerationRetiring(
 	root []byte,
 	retired []PageRef,
 ) {
+	_ = publishTestGenerationRetiringCollect(
+		t, committer, generation, pages, rootOffset, root,
+		retired, nil, nil,
+	)
+}
+
+func publishTestGenerationRetiringCollect(
+	t *testing.T,
+	committer *Committer,
+	generation uint64,
+	pages []testPage,
+	rootOffset int64,
+	root []byte,
+	retired []PageRef,
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) []FreeExtent {
 	t.Helper()
 	batch, err := committer.Begin(len(pages))
 	if err != nil {
@@ -630,7 +684,11 @@ func publishTestGenerationRetiring(
 	if err := batch.SetRoot(rootOffset, len(root)); err != nil {
 		t.Fatal(err)
 	}
-	if err := committer.publish(batch, generation, retired); err != nil {
+	superseded, err = committer.publishRetiring(
+		batch, generation, retired, retirements, superseded,
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
+	return superseded
 }

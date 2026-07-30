@@ -155,8 +155,8 @@ func assertFreeSetMirror(t *testing.T, fs *Collection, context string) int {
 		// about the file and there is nothing to compare it against.
 		return -1
 	}
-	if err := fs.Flush(); err != nil {
-		t.Fatalf("%s: flush: %v", context, err)
+	if err := flushPhysicalForTest(fs); err != nil {
+		t.Fatalf("%s: physical flush: %v", context, err)
 	}
 	durable := freeSetFromFile(t, fs.file.Name(), fs.options.PageSize)
 	// The durable set is the whole free set, reusable and fenced alike: a
@@ -167,6 +167,11 @@ func assertFreeSetMirror(t *testing.T, fs *Collection, context string) int {
 	// instead of the comparison being loosened.
 	memory := append(append([]storeio.FreeExtent(nil), fs.reusable...),
 		fs.reclaimer.AppendPending(nil)...)
+	// Exact never-durable retirements have already been removed from the
+	// reclaimer, but intentionally wait in this bounded handoff until the next
+	// allocator refresh merges them into reusable. They remain part of the
+	// authoritative in-memory free set throughout that interval.
+	memory = append(memory, fs.retirementAbsorbed...)
 	slices.SortFunc(memory, func(a, b storeio.FreeExtent) int {
 		switch {
 		case a.Offset < b.Offset:
@@ -1294,6 +1299,29 @@ func TestFileStoreRetirementOverflowNeverAbandonsSpace(t *testing.T) {
 	}
 	if got := reclaimer.Stats().Pending; got != 1 {
 		t.Fatalf("pending retirements = %d, want original extent only", got)
+	}
+}
+
+func TestNeverDurableRetirementOutputRespectsFreeSetRoom(t *testing.T) {
+	c := &Collection{
+		freeSetLimit: 3,
+		reusable: []storeio.FreeExtent{
+			{Offset: 4096, Length: 4096, RetiredGeneration: 1},
+			{Offset: 8192, Length: 4096, RetiredGeneration: 1},
+			// A whole-consumed transaction entry disappears in
+			// finalizeReusable and must not consume next-generation room.
+			{Offset: 12288, RetiredGeneration: 1},
+		},
+		retirementAbsorbed: make([]storeio.FreeExtent, 1, 4),
+	}
+	if got := cap(c.neverDurableRetirementOutput()) -
+		len(c.neverDurableRetirementOutput()); got != 0 {
+		t.Fatalf("output room with two live + one absorbed = %d, want 0", got)
+	}
+	c.reusable[1].Length = 0
+	output := c.neverDurableRetirementOutput()
+	if got := cap(output) - len(output); got != 1 {
+		t.Fatalf("output room after one whole consumption = %d, want 1", got)
 	}
 }
 

@@ -41,12 +41,54 @@ func journalDeltaCanonical(t testing.TB, raw []byte) string {
 	return string(got)
 }
 
+func TestBufferedJournalDeltaOverlayFoldTransactionGeometry(t *testing.T) {
+	options := journalDeltaTestOptions()
+	options.ResidentBytes = 64 << 20
+	options.MaxBatchDocuments = 1
+	options.MaxDocumentBytes = 1 << 10
+	options.BufferCount = 1024
+	options.QueueSlots = 1024
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatalf("competitive geometry: %v", err)
+	}
+
+	const parentLevels = 4
+	metadataPages := parentLevels*primaryUnifiedOverlayBuckets + 2 +
+		normalized.freeFoldLimit + storeio.FreeLogMaxIndexPages +
+		storeio.FreeLogMaxDeltaPages
+	corePages := primaryUnifiedOverlayBuckets + metadataPages
+	// One exact-index catalog/root plus at least the admitted dirty-leaf
+	// allowance must coexist with the complete primary/free-log fold.
+	minExactPages := fileStoreExactStagePagesMin +
+		len(normalized.indexes) + 1
+	if got, want := normalized.maxTransactionPages,
+		corePages+minExactPages; got < want {
+		t.Fatalf("max transaction pages = %d, want at least overlay %d + exact %d = %d",
+			got, corePages, minExactPages, want)
+	}
+	coreBytes :=
+		uint64(primaryUnifiedOverlayBuckets)*
+			uint64(normalized.MaxPageSize) +
+			uint64(metadataPages)*uint64(normalized.PageSize)
+	minBytes := coreBytes +
+		uint64(minExactPages)*uint64(normalized.MaxPageSize)
+	if got := normalized.maxTransactionBytes; got < minBytes {
+		t.Fatalf("max transaction bytes = %d, want at least %d", got, minBytes)
+	}
+	if normalized.BufferCount != 1024 ||
+		normalized.BufferCount <= normalized.maxTransactionPages {
+		t.Fatalf("competitive BufferCount=%d cannot hold %d-page overlay fold",
+			normalized.BufferCount, normalized.maxTransactionPages)
+	}
+}
+
 func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 	ordinaryOptions := journalDeltaTestOptions()
 	ordinary := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, ordinaryOptions,
 	)
-	const wantDeltaCapacity = uint64(512) << 10
+	const wantDeltaCapacity = uint64(1) << 20
 	if got := ordinary.journal.Header().Capacity; got != wantDeltaCapacity {
 		t.Fatalf("ordinary delta journal capacity = %d, want %d",
 			got, wantDeltaCapacity)
@@ -561,6 +603,184 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 		t, options, closedImage, cloneStringMap(want), cloneIntMap(groups),
 		finalGeneration, "device-silent-fold/close",
 	)
+}
+
+// TestBufferedJournalDeltaScheduledPhysicalDrain bounds the resource lag behind
+// journal durability. Two device-silent folds occupy half this test's tiny
+// committer arena; the next explicit Flush must drain the current cut
+// physically instead of leaving a later mutation to force an automatic
+// checkpoint. Production's larger arena uses the same half-full rule, while
+// dirty-byte pressure can request an earlier drain for wider/indexed folds.
+func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
+	const (
+		documents       = 320
+		checkpointEvery = 64
+		mutations       = primaryUnifiedOverlayRecords*2 + checkpointEvery
+	)
+	options := journalDeltaTestOptions()
+	options.QueueSlots = 4
+	coll := buildTemplateHeavyOverlayCollection(
+		t, t.TempDir(), documents, options,
+	)
+	path := coll.file.Name()
+	physicalBase := coll.committer.DurableGeneration()
+	baseline := coll.Stats()
+
+	want := primaryStoreContent(t, coll)
+	groups := make(map[string]int, documents)
+	for at := range documents {
+		groups[templateHeavyOverlayKey(at)] = at % 37
+	}
+	keyString := templateHeavyOverlayKey(20)
+	key := []byte(keyString)
+
+	for mutation := 1; mutation <= mutations; mutation++ {
+		group := 40 + mutation&1
+		raw := journalDeltaGroupDoc(20, group)
+		if created, err := coll.Put(key, raw); err != nil || created {
+			t.Fatalf("Put %d = %v,%v", mutation, created, err)
+		}
+		want[keyString] = journalDeltaCanonical(t, raw)
+		groups[keyString] = group
+		if mutation%checkpointEvery != 0 {
+			continue
+		}
+		if err := coll.Flush(); err != nil {
+			t.Fatalf("Flush %d: %v", mutation/checkpointEvery, err)
+		}
+	}
+
+	target := coll.Generation()
+	stats := coll.Stats()
+	if stats.AutomaticCheckpoints != baseline.AutomaticCheckpoints {
+		t.Fatalf("scheduled drain counted as automatic: %d -> %d",
+			baseline.AutomaticCheckpoints, stats.AutomaticCheckpoints)
+	}
+	if stats.JournalDeltaFullFallbacks !=
+		baseline.JournalDeltaFullFallbacks {
+		t.Fatalf("scheduled drain counted as delta fallback: %d -> %d",
+			baseline.JournalDeltaFullFallbacks,
+			stats.JournalDeltaFullFallbacks)
+	}
+	if got := coll.committer.DurableGeneration(); got != target ||
+		got == physicalBase {
+		t.Fatalf("physical durable = %d, want current %d above base %d",
+			got, target, physicalBase)
+	}
+	if got := coll.committer.Stats().QueuedGenerations; got != 0 {
+		t.Fatalf("queued generations after scheduled drain = %d, want 0", got)
+	}
+	if coll.DurableGeneration() != target ||
+		coll.journalDeltaGeneration.Load() != target ||
+		coll.journalDeltaAppendedGeneration.Load() != target {
+		t.Fatalf(
+			"generation visible/durable/appended = %d/%d/%d, want %d",
+			coll.DurableGeneration(), coll.journalDeltaGeneration.Load(),
+			coll.journalDeltaAppendedGeneration.Load(), target,
+		)
+	}
+	if got, wantCheckpoints := stats.JournalDeltaCheckpoints-
+		baseline.JournalDeltaCheckpoints,
+		uint64(mutations/checkpointEvery-1); got != wantCheckpoints {
+		t.Fatalf("journal delta checkpoints = %d, want %d",
+			got, wantCheckpoints)
+	}
+
+	crashImage := captureJournalImage(t, path)
+	assertJournalDeltaImage(
+		t, options, crashImage, cloneStringMap(want), cloneIntMap(groups),
+		target, "scheduled-physical-drain",
+	)
+	if err := coll.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush proves journal
+// bytes are bounded independently of committer and dirty-frame pressure. One
+// hot key fills records much faster than it fills the physical overlay queue;
+// the explicit Flush preflight must rotate before the remaining journal region
+// can no longer hold both its suffix and one future full overlay carry.
+func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T) {
+	const (
+		documents       = 320
+		checkpointEvery = 64
+		checkpoints     = 240
+		mutations       = checkpointEvery * checkpoints
+	)
+	options := journalDeltaTestOptions()
+	options.QueueSlots = 1024
+	coll := buildTemplateHeavyOverlayCollection(
+		t, t.TempDir(), documents, options,
+	)
+	path := coll.file.Name()
+	baseline := coll.Stats()
+	baseRecycle := coll.journal.Header().RecycleCount
+
+	want := primaryStoreContent(t, coll)
+	groups := make(map[string]int, documents)
+	for at := range documents {
+		groups[templateHeavyOverlayKey(at)] = at % 37
+	}
+	keyString := templateHeavyOverlayKey(20)
+	key := []byte(keyString)
+	for mutation := 1; mutation <= mutations; mutation++ {
+		group := 40 + mutation&1
+		raw := journalDeltaGroupDoc(20, group)
+		if created, err := coll.Put(key, raw); err != nil || created {
+			t.Fatalf("Put %d = %v,%v", mutation, created, err)
+		}
+		if mutation == mutations {
+			want[keyString] = journalDeltaCanonical(t, raw)
+			groups[keyString] = group
+		}
+		if mutation%checkpointEvery == 0 {
+			if err := coll.Flush(); err != nil {
+				t.Fatalf("Flush %d: %v", mutation/checkpointEvery, err)
+			}
+		}
+	}
+
+	stats := coll.Stats()
+	recycles := coll.journal.Header().RecycleCount - baseRecycle
+	if recycles < 2 {
+		t.Fatalf("journal headroom rotations = %d, want multiple", recycles)
+	}
+	if stats.AutomaticCheckpoints != baseline.AutomaticCheckpoints {
+		t.Fatalf("journal headroom forced automatic checkpoints: %d -> %d",
+			baseline.AutomaticCheckpoints, stats.AutomaticCheckpoints)
+	}
+	if stats.JournalDeltaFullFallbacks !=
+		baseline.JournalDeltaFullFallbacks {
+		t.Fatalf("journal headroom used full fallback: %d -> %d",
+			baseline.JournalDeltaFullFallbacks,
+			stats.JournalDeltaFullFallbacks)
+	}
+	if got, wantCheckpoints := stats.JournalDeltaCheckpoints-
+		baseline.JournalDeltaCheckpoints+recycles,
+		uint64(checkpoints); got != wantCheckpoints {
+		t.Fatalf("delta checkpoints + rotations = %d, want %d",
+			got, wantCheckpoints)
+	}
+	target := coll.Generation()
+	if coll.DurableGeneration() != target {
+		t.Fatalf("durable generation = %d, want %d",
+			coll.DurableGeneration(), target)
+	}
+	assertJournalDeltaImage(
+		t, options, captureJournalImage(t, path),
+		cloneStringMap(want), cloneIntMap(groups), target,
+		"same-key-headroom-rotation",
+	)
+	if err := coll.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.file.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay uses a checkpoint

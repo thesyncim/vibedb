@@ -943,14 +943,23 @@ catalogAddsName:
 	c.snapshotGate.Lock()
 	c.beginReaderFence()
 	retiring := !c.anyActiveReaders()
+	absorbedStart := len(c.retirementAbsorbed)
 	if retiring {
-		err = tx.PublishInlineRetiring(
-			nextState.root, nextInline, c.retireRefScratch,
+		absorbed := c.retirementAbsorbed
+		var extracted []storeio.FreeExtent
+		extracted, err = tx.PublishInlineRetiring(
+			nextState.root, nextInline,
+			c.retireRefScratch, c.retireScratch,
+			c.neverDurableRetirementOutput(),
 		)
+		c.retirementAbsorbed = absorbed[:len(extracted)]
 	} else {
 		err = tx.PublishInline(nextState.root, nextInline)
 	}
 	if err != nil {
+		clear(c.retirementAbsorbed[absorbedStart:])
+		c.retirementAbsorbed =
+			c.retirementAbsorbed[:absorbedStart]
 		c.endReaderFence()
 		c.snapshotGate.Unlock()
 		return err
@@ -985,6 +994,7 @@ catalogAddsName:
 	c.publishFileState(nextState)
 	if retiring {
 		c.cache.MarkUnreachable(c.retireRefScratch)
+		c.extractNeverDurableRetirements(absorbedStart)
 	}
 	c.endReaderFence()
 	c.snapshotGate.Unlock()

@@ -344,6 +344,49 @@ func RecoveryBatchRecordPaddedSize(sectorSize uint32, entries []RecoveryBatchEnt
 	return padded
 }
 
+// RecoveryBatchRecordPaddedSizeForPayload returns the exact padded record size
+// for a batch with entryCount framed entries and totalPayloadBytes key+value
+// bytes. It is the allocation-free upper-bound form of
+// RecoveryBatchRecordPaddedSize: a bounded producer can reserve a future batch
+// from its entry and byte arenas without constructing dummy slice headers.
+// Invalid or unrepresentable inputs saturate at the largest int.
+func RecoveryBatchRecordPaddedSizeForPayload(
+	sectorSize uint32, entryCount, totalPayloadBytes int,
+) int {
+	if entryCount <= 0 || totalPayloadBytes < 0 {
+		return maxIntValue
+	}
+	count := uint64(entryCount)
+	payload := uint64(totalPayloadBytes)
+	wireLimit := uint64(^uint32(0))
+	if count > wireLimit {
+		return maxIntValue
+	}
+	body, ok := checkedSizeMul(
+		count, RecoveryBatchEntryHeaderSize, wireLimit,
+	)
+	if !ok {
+		return maxIntValue
+	}
+	body, ok = checkedSizeAdd(body, payload, wireLimit)
+	if !ok {
+		return maxIntValue
+	}
+	raw := uint64(
+		RecoveryJournalRecordPrefixSize +
+			RecoveryJournalRecordTrailerSize,
+	)
+	raw, ok = checkedSizeAdd(raw, body, uint64(maxIntValue))
+	if !ok {
+		return maxIntValue
+	}
+	padded, ok := checkedRecoveryPadRaw(sectorSize, raw)
+	if !ok {
+		return maxIntValue
+	}
+	return padded
+}
+
 // validateRecoveryJournalHeader enforces the geometry invariants every header
 // must satisfy regardless of provenance.
 func validateRecoveryJournalHeader(h RecoveryJournalHeader) error {

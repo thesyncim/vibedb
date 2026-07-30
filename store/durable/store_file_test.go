@@ -21,7 +21,7 @@ import (
 func testFileStoreOptions() Options {
 	return Options{
 		Collection: store.Options{ChunkDocuments: 4},
-		PageSize:   4096, MaxPageSize: 64 << 10, ResidentBytes: 4 << 20,
+		PageSize:   4096, MaxPageSize: 64 << 10, ResidentBytes: 8 << 20,
 		MaxDocumentBytes: 64 << 10, MaxKeyBytes: 128, InlineValueBytes: 512,
 		ReadConcurrency: 2, PrefetchQueue: 8, BufferCount: 1024,
 		QueueSlots: 4, GroupLimit: 2, Backend: BackendPortable,

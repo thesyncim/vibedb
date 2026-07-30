@@ -780,6 +780,38 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	singleDocumentTransactionPages := docSingleDocumentPages + exactIndexPages
 	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
 	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
+	// The class-5 overlay is bounded independently of MaxBatchDocuments: point
+	// mutations may touch as many as 64 routed buckets before pressure folds the
+	// window. That fold stages one maximum-size leaf per bucket, up to four
+	// distinct rooted parent pages per bucket, the catalog root plus StateRoot,
+	// and the configured free-log fold reserve. The exact-index allowance is
+	// shared with the ordinary batch geometry but must coexist with this wider
+	// primary cut.
+	//
+	// Previously MaxBatchDocuments=1 sized the committer for only the point
+	// transaction (about 141 descriptors in the competitive configuration).
+	// Mature churn could then reach syncFreeLogFor after staging the primary
+	// graph and run out of descriptors while writing its reusable extents. This
+	// explicit overlay geometry makes the pressure fold a first-class bounded
+	// transaction instead of relying on spare buffers.
+	const primaryOverlayParentLevels = 4
+	primaryOverlayMetadataPages :=
+		primaryOverlayParentLevels*primaryUnifiedOverlayBuckets + 2 +
+			freeFoldLimit + storeio.FreeLogMaxIndexPages +
+			storeio.FreeLogMaxDeltaPages
+	primaryOverlayTransactionPages :=
+		primaryUnifiedOverlayBuckets + primaryOverlayMetadataPages +
+			exactIndexPages
+	primaryOverlayTransactionBytes :=
+		uint64(primaryUnifiedOverlayBuckets)*uint64(o.MaxPageSize) +
+			uint64(primaryOverlayMetadataPages)*uint64(o.PageSize) +
+			exactIndexBytes
+	maxTransactionPages = max(
+		maxTransactionPages, primaryOverlayTransactionPages,
+	)
+	maxTransactionBytes = max(
+		maxTransactionBytes, primaryOverlayTransactionBytes,
+	)
 	if o.MaxRetiredExtents < maxTransactionPages {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibejson: collection MaxRetiredExtents must retain one worst-case transaction")
 	}

@@ -416,7 +416,7 @@ func runOnlineIndexFaultPass(
 	options Options,
 	controller *faultController,
 	plan storeio.FaultPlan,
-) (image []byte, records []storeio.FaultCommitRecord, faulted bool) {
+) (image journalCrashImage, records []storeio.FaultCommitRecord, faulted bool) {
 	t.Helper()
 	previousFactory := storeCommitterFactory
 	storeCommitterFactory = controller.factory()
@@ -449,6 +449,9 @@ func runOnlineIndexFaultPass(
 	_, buildErr := collection.CreateIndex(store.IndexDefinition{
 		Name: "by_group", Paths: []string{"/group"},
 	})
+	if buildErr == nil && !device.Faulted() {
+		buildErr = flushPhysicalForTest(collection)
+	}
 	if !device.Faulted() && buildErr != nil {
 		_ = collection.Close()
 		_ = file.Close()
@@ -456,10 +459,7 @@ func runOnlineIndexFaultPass(
 	}
 	records = device.Records()
 	faulted = device.Faulted()
-	image, err = os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	image = captureJournalImage(t, path)
 	_ = collection.Close()
 	_ = file.Close()
 	return image, records, faulted
@@ -468,12 +468,15 @@ func runOnlineIndexFaultPass(
 func assertOnlineIndexCrashImage(
 	t *testing.T,
 	options Options,
-	image []byte,
+	image journalCrashImage,
 	label string,
 ) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "online-index-recover.vibe")
-	if err := os.WriteFile(path, image, 0o600); err != nil {
+	if err := os.WriteFile(path, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".rjournal", image.journal, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.OpenFile(path, os.O_RDWR, 0)

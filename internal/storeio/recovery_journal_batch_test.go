@@ -135,6 +135,16 @@ func TestRecoveryBatchRecordPaddedSizeAndFits(t *testing.T) {
 	if padded%RecoveryJournalMinSectorSize != 0 || padded == 0 {
 		t.Fatalf("padded size %d is not a positive sector multiple", padded)
 	}
+	payloadBytes := 0
+	for i := range entries {
+		payloadBytes += len(entries[i].Key) + len(entries[i].Value)
+	}
+	if got := RecoveryBatchRecordPaddedSizeForPayload(
+		RecoveryJournalMinSectorSize, len(entries), payloadBytes,
+	); got != padded {
+		t.Fatalf("payload-only padded size = %d, want exact entry size %d",
+			got, padded)
+	}
 	rj, _ := createTestJournal(t, 8<<10)
 	if !rj.FitsBatch(entries) {
 		t.Fatal("FitsBatch = false on an empty journal, want true")

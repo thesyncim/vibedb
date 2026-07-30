@@ -19,14 +19,19 @@ const (
 // The highest pending write is retained even when unreachable. The newest root
 // carries a monotonic FileEnd, and without an explicit truncate operation that
 // write may be the only operation extending the file to the advertised length.
+// Its exact retirement generation stays on the descriptor so a later farther
+// write can release and report that witness without asking the Store to repeat
+// an already-published retirement proof.
 func (c *Committer) coalesceManualPagesLocked(
 	batch *Batch,
 	generation uint64,
 	retired []PageRef,
-) {
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) []FreeExtent {
 	if c == nil || !c.options.ManualCheckpoint || batch == nil ||
 		batch.materialized || retired == nil {
-		return
+		return superseded
 	}
 	checkpointThrough := c.checkpointThrough.Load()
 	highest := uint64(0)
@@ -77,6 +82,15 @@ func (c *Committer) coalesceManualPagesLocked(
 			}
 			write.pendingFlags &^= pendingWriteTailWitness
 			write.pendingFlags |= pendingWriteSuperseded
+			if write.retiredGeneration != 0 &&
+				write.retiredGeneration < generation &&
+				len(superseded) < cap(superseded) {
+				superseded = append(superseded, FreeExtent{
+					Offset: uint64(write.Offset), Length: uint64(write.Length),
+					RetiredGeneration: write.retiredGeneration,
+				})
+			}
+			write.retiredGeneration = 0
 			c.releaseSupersededPage(write, previous.generation)
 			c.supersededPageWrites.Add(1)
 			c.supersededPageBytes.Add(uint64(write.Length))
@@ -109,12 +123,42 @@ func (c *Committer) coalesceManualPagesLocked(
 				end := uint64(write.Offset) + uint64(write.Length)
 				if end == highest {
 					write.pendingFlags |= pendingWriteTailWitness
+					for _, extent := range retirements {
+						if extent.Offset == ref.Offset &&
+							extent.Length == uint64(ref.Length) &&
+							extent.RetiredGeneration != 0 &&
+							extent.RetiredGeneration < generation {
+							write.retiredGeneration =
+								extent.RetiredGeneration
+							break
+						}
+					}
 					break
 				}
 				write.pendingFlags |= pendingWriteSuperseded
 				c.releaseSupersededPage(write, previous.generation)
 				c.supersededPageWrites.Add(1)
 				c.supersededPageBytes.Add(uint64(write.Length))
+				// Only the exact transition above proves that this physical
+				// write can never become reachable from a durable root. Copy
+				// its authoritative retirement record when the caller supplied
+				// an exact physical match and bounded output room. Failure to
+				// report is conservative: normal generation/fallback
+				// reclamation still owns the extent.
+				if len(superseded) < cap(superseded) {
+					for _, extent := range retirements {
+						if extent.Offset == ref.Offset &&
+							extent.Length == uint64(ref.Length) &&
+							extent.RetiredGeneration != 0 &&
+							extent.RetiredGeneration < generation {
+							superseded = append(
+								superseded, extent,
+							)
+							break
+						}
+					}
+				}
+				write.retiredGeneration = 0
 				break
 			}
 			if matched {
@@ -122,6 +166,7 @@ func (c *Committer) coalesceManualPagesLocked(
 			}
 		}
 	}
+	return superseded
 }
 
 func (c *Committer) releaseSupersededPage(

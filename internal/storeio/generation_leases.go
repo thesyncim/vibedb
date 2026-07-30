@@ -497,7 +497,9 @@ func (r *ExtentReclaimer) RetireBatch(extents []FreeExtent) error {
 		slices.SortStableFunc(added, compareReclamationGeneration)
 	}
 	if start != 0 &&
-		r.pending[start-1].RetiredGeneration > r.pending[start].RetiredGeneration {
+		compareReclamationGeneration(
+			r.pending[start-1], r.pending[start],
+		) > 0 {
 		// A bounded reclamation batch may be returned after a fold-budget trim.
 		// That rare path can insert an older generation behind still-fenced
 		// generations. Restore ordering here; ordinary serialized retirements
@@ -557,6 +559,82 @@ func (r *ExtentReclaimer) CancelRetiredGeneration(generation uint64) error {
 		r.resetPendingLocked()
 	}
 	return nil
+}
+
+// ExtractRetiredExact transfers exact pending retirements into dst without
+// applying the ordinary reader/recovery generation floor. It is the narrow
+// handoff for a stronger external proof: the manual committer has omitted the
+// matching copy-on-write page from every possible checkpoint after a
+// reader-fenced publication made it unreachable.
+//
+// Candidates that are malformed, duplicated, absent, or do not fit dst are
+// ignored. Interval-index inconsistency fails closed and transfers nothing.
+// This method allocates nothing and preserves pending generation order.
+func (r *ExtentReclaimer) ExtractRetiredExact(
+	dst []FreeExtent,
+	candidates []FreeExtent,
+) []FreeExtent {
+	if r == nil || len(candidates) == 0 || len(dst) == cap(dst) {
+		return dst
+	}
+	base := len(dst)
+	r.mu.Lock()
+	pending := r.activePendingLocked()
+	for _, candidate := range candidates {
+		if len(dst) == cap(dst) {
+			break
+		}
+		if candidate.Offset == 0 || candidate.Length == 0 ||
+			candidate.RetiredGeneration == 0 ||
+			candidate.Offset > ^uint64(0)-candidate.Length {
+			continue
+		}
+		duplicate := false
+		for _, chosen := range dst[base:] {
+			if chosen == candidate {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		at, found := slices.BinarySearchFunc(
+			pending, candidate, compareReclamationGeneration,
+		)
+		if found && pending[at] == candidate {
+			dst = append(dst, candidate)
+		}
+	}
+	extracted := dst[base:]
+	if len(extracted) == 0 {
+		r.mu.Unlock()
+		return dst
+	}
+	slices.SortFunc(extracted, compareReclamationGeneration)
+	if r.indexed && !r.removeRetiredIntervalsLocked(extracted) {
+		r.mu.Unlock()
+		clear(dst[base:])
+		return dst[:base]
+	}
+	kept := pending[:0]
+	extractedAt := 0
+	for _, extent := range pending {
+		if extractedAt < len(extracted) &&
+			extent == extracted[extractedAt] {
+			r.pendingBytes -= extent.Length
+			extractedAt++
+			continue
+		}
+		kept = append(kept, extent)
+	}
+	clear(pending[len(kept):])
+	r.pending = r.pending[:r.pendingHead+len(kept)]
+	if len(kept) == 0 {
+		r.resetPendingLocked()
+	}
+	r.mu.Unlock()
+	return dst
 }
 
 // AppendReusable appends and removes extents whose retired generation is
@@ -641,10 +719,10 @@ func (r *ExtentReclaimer) AppendReusable(
 }
 
 // AppendPending copies the extents still waiting on a reader or the alternate
-// recovery root in nondecreasing retirement-generation order. There is no
-// physical-offset ordering contract within one generation: consumers that
-// merge physical ranges must sort the result by offset first. The durable free
-// log carries them alongside the
+// recovery root in nondecreasing retirement-generation and physical-offset
+// order. Consumers that merge the result with a set ordered only by physical
+// offset must still sort it by offset first. The durable free log carries them
+// alongside the
 // reusable set — they are free space, merely fenced — so a fold needs them to
 // write a complete image, and dropping them from that image is what used to
 // lose them at every restart.
@@ -754,7 +832,7 @@ func compareReclamationGeneration(a, b FreeExtent) int {
 
 func reclamationGenerationOrdered(extents []FreeExtent) bool {
 	for i := 1; i < len(extents); i++ {
-		if extents[i-1].RetiredGeneration > extents[i].RetiredGeneration {
+		if compareReclamationGeneration(extents[i-1], extents[i]) > 0 {
 			return false
 		}
 	}

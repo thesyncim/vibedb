@@ -30,6 +30,11 @@ const recoveryJournalCheckpointRecords = 2048
 // large-value store cannot reserve an unbounded file or an unbounded replay.
 const (
 	recoveryJournalMinCapacityBytes = uint64(512) << 10
+	// The ordinary delta lane reserves one additional half MiB so a full
+	// future-carry headroom check rotates below 5% of CP64 boundaries. This
+	// keeps physical drains out of checkpoint p95 while adding only 512 KiB to
+	// the paired store footprint.
+	recoveryJournalDeltaMinCapacityBytes = uint64(1) << 20
 	recoveryJournalMaxCapacityBytes = storeio.RecoveryJournalMaxCapacityBytes
 )
 
@@ -186,7 +191,7 @@ func recoveryJournalCapacityBytesFor(
 				storeio.RecoveryBatchEntryHeaderSize) +
 			storeio.RecoveryJournalRecordPrefixSize +
 			storeio.RecoveryJournalRecordTrailerSize
-		capacity = max(capacity, recoveryJournalMinCapacityBytes)
+		capacity = max(capacity, recoveryJournalDeltaMinCapacityBytes)
 		capacity = min(capacity, recoveryJournalMaxCapacityBytes)
 		sector := uint64(sectorSize)
 		return (capacity + sector - 1) / sector * sector
@@ -721,6 +726,92 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 	return true, nil
 }
 
+// bufferedJournalDeltaPhysicalDrainNeeded reports whether another journal-only
+// checkpoint would leave too little bounded physical staging for the next
+// overlay fold. Journal durability may run arbitrarily far ahead of the rooted
+// durability floor, but the resources held by those device-silent roots may
+// not: committer descriptors, dirty cache frames, the free-log lineage they
+// fence, and the bounded redo region are all finite.
+//
+// Half the descriptor arena, capped at 32 staged roots, is a deterministic
+// upper bound independent of page shape. The dirty-byte guard retains two
+// worst-case materializations: one for the requested drain itself and one for
+// the next overlay fold. At the normal 64-mutation Flush cadence this makes the
+// physical drain rare enough to stay outside p95 while ensuring pressure is
+// paid at an explicit Flush rather than by an otherwise-unrequested mutation
+// checkpoint.
+func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
+	pending []storeio.RecoveryBatchEntry,
+) bool {
+	if !c.bufferedJournalDeltaLane() {
+		return false
+	}
+	queueLimit := min(
+		32, max(1, fileVisibilitySlots(c.options.QueueSlots)/2),
+	)
+	if c.committer.Stats().QueuedGenerations >= uint64(queueLimit) {
+		return true
+	}
+	reserve := c.options.maxTransactionBytes
+	if reserve <= ^uint64(0)/2 {
+		reserve *= 2
+	} else {
+		reserve = ^uint64(0)
+	}
+	if c.cache.DirtyCapacityAvailable() < reserve {
+		return true
+	}
+
+	// Keep enough redo capacity for both this explicit Flush suffix and one
+	// complete future overlay carry. Without the future reserve, repeated CP64
+	// same-key windows fill the 512 KiB journal long before the physical queue or
+	// dirty-frame guards fire; the next non-aligned pressure fold would then have
+	// to checkpoint from a mutation and be counted as automatic. The overlay's
+	// record and byte arenas are the exact admissibility bounds, so this is a
+	// conservative byte calculation without constructing dummy entries.
+	header := c.journal.Header()
+	currentBytes := 0
+	if len(pending) != 0 {
+		currentBytes = storeio.RecoveryBatchRecordPaddedSize(
+			header.SectorSize, pending,
+		)
+	}
+	futureBytes := storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		header.SectorSize, primaryUnifiedOverlayRecords,
+		len(c.primaryUnifiedOverlay.arena),
+	)
+	cursor := c.journal.Cursor()
+	if cursor > header.Capacity {
+		return true
+	}
+	remaining := header.Capacity - cursor
+	current := uint64(currentBytes)
+	future := uint64(futureBytes)
+	return current > remaining || future > remaining-current
+}
+
+// drainBufferedJournalDeltaPhysicalLocked advances the physical durability and
+// reclamation floor through the current explicit Flush cut. Ordinarily one
+// checkpoint both materializes the pending overlay and drains the committer.
+// If prior staged cuts have already consumed the materialization reserve, drain
+// those first, then retry the still-intact overlay. Recycling is generation
+// guarded, so the first drain cannot discard journal records newer than its
+// rooted cut.
+func (c *Collection) drainBufferedJournalDeltaPhysicalLocked(
+	target uint64,
+) error {
+	if c.cache.DirtyCapacityAvailable() < c.options.maxTransactionBytes ||
+		c.committer.NeedsFrameCheckpointFor(c.options.maxTransactionPages) {
+		if err := c.flushBufferedPublishedLocked(); err != nil {
+			return err
+		}
+		if c.committer.DurableGeneration() >= target {
+			return nil
+		}
+	}
+	return c.checkpointBufferedLocked()
+}
+
 // checkpointBufferedJournalDeltaLocked makes the current ordinary
 // buffered-visible cut durable with one journal Sync. Any suffix not already
 // carried by non-aligned overlay pressure is appended first; a carried suffix
@@ -752,11 +843,17 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		if appendedAfter != durableAfter {
 			return true, storeio.ErrGenerationOrder
 		}
+		if c.bufferedJournalDeltaPhysicalDrainNeeded(nil) {
+			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
+		}
 		return true, nil
 	}
 	if target < durableAfter || target < appendedAfter ||
 		appendedAfter < durableAfter {
 		return true, storeio.ErrGenerationOrder
+	}
+	if c.bufferedJournalDeltaPhysicalDrainNeeded(nil) {
+		return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
 	}
 	// The cheap cut may coexist with resident exact-index deltas: recovery
 	// deterministically rebuilds them by replaying the same primary mutations.
@@ -773,6 +870,19 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		return false, nil
 	}
 	if target > appendedAfter {
+		entries, covered, entryErr :=
+			c.primaryUnifiedOverlay.checkpointEntries(
+				c.journalDeltaEntries[:0], appendedAfter, target,
+			)
+		if entryErr != nil {
+			return true, entryErr
+		}
+		if !covered || len(entries) == 0 {
+			return false, nil
+		}
+		if c.bufferedJournalDeltaPhysicalDrainNeeded(entries) {
+			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
+		}
 		complete, appendErr :=
 			c.appendBufferedJournalDeltaLocked(appendedAfter, target)
 		if appendErr != nil {

@@ -755,38 +755,55 @@ func (c *Committer) publish(
 	generation uint64,
 	retired []PageRef,
 ) error {
+	_, err := c.publishRetiring(
+		batch, generation, retired, nil, nil,
+	)
+	return err
+}
+
+// publishRetiring is publish with a bounded, caller-owned result for exact
+// retirements whose older pending writes this publication transitions to
+// pendingWriteSuperseded. The result is produced under manualMu, in the same
+// critical section that excludes checkpoint capture and worker dequeue.
+func (c *Committer) publishRetiring(
+	batch *Batch,
+	generation uint64,
+	retired []PageRef,
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) ([]FreeExtent, error) {
 	if failure := c.currentFailure(); failure != nil {
-		return failure
+		return superseded, failure
 	}
 	if !c.enterPublish() {
 		if failure := c.currentFailure(); failure != nil {
-			return failure
+			return superseded, failure
 		}
-		return ErrClosed
+		return superseded, ErrClosed
 	}
 	defer c.publishers.Add(^uint32(0))
 	if failure := c.currentFailure(); failure != nil {
-		return failure
+		return superseded, failure
 	}
 	if generation == 0 || generation <= c.published.Load() {
-		return ErrGenerationOrder
+		return superseded, ErrGenerationOrder
 	}
 	if batch.rootGeneration != 0 && batch.rootGeneration != generation {
-		return ErrGenerationOrder
+		return superseded, ErrGenerationOrder
 	}
 	if batch.materialized {
 		sequence, err := c.validateMaterializedBatch(batch, generation)
 		if err != nil {
-			return err
+			return superseded, err
 		}
 		batch.journalSequence = sequence
 	} else if err := validateCommit(
 		c.bufferCount, c.bufferSize, c.producerSeen, batch.pages, batch.root,
 	); err != nil {
-		return err
+		return superseded, err
 	}
 	if c.closing.Load() {
-		return ErrClosed
+		return superseded, ErrClosed
 	}
 	if c.options.ManualCheckpoint {
 		c.manualMu.Lock()
@@ -795,9 +812,9 @@ func (c *Committer) publish(
 	tail := c.tail.Load()
 	if tail-c.head.Load() >= uint64(len(c.pending)) {
 		if c.options.ManualCheckpoint {
-			return ErrCheckpointRequired
+			return superseded, ErrCheckpointRequired
 		}
-		return ErrQueueFull
+		return superseded, ErrQueueFull
 	}
 	if batch.materialized {
 		batch.journalSlot = c.materializationNextSlot.Load()
@@ -807,7 +824,9 @@ func (c *Committer) publish(
 	}
 	batch.generation = generation
 	if c.options.ManualCheckpoint {
-		c.coalesceManualPagesLocked(batch, generation, retired)
+		superseded = c.coalesceManualPagesLocked(
+			batch, generation, retired, retirements, superseded,
+		)
 		c.coalesceManualBatchLocked(batch, generation)
 	}
 	batch.state.Store(batchPublished)
@@ -826,7 +845,7 @@ func (c *Committer) publish(
 		default:
 		}
 	}
-	return nil
+	return superseded, nil
 }
 
 // requestCurrentCheckpoint captures and authorizes one exact publication cut.
