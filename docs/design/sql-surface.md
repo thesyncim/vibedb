@@ -286,6 +286,34 @@ the nullable side of a left join is therefore rejected rather than pushed into
 the build side, which would silently change its meaning. Conditions over the
 preserved table remain supported.
 
+## Predicate subqueries
+
+Uncorrelated subqueries are supported in predicates:
+
+```sql
+SELECT id
+FROM orders
+WHERE customer_id IN (
+  SELECT id FROM customers WHERE tier = ?
+)
+```
+
+The accepted forms are `IN (SELECT ...)`, `NOT IN (SELECT ...)`,
+`EXISTS (SELECT ...)`, and a scalar comparison such as
+`customer_id = (SELECT id FROM aliases WHERE active = TRUE)`. The nested
+statement runs once per outer execution against the same coherent catalog
+snapshot. Its scalar output is retained in reusable typed slots and the outer
+predicate lowers to the existing sorted membership or comparison plan; there
+is no per-row nested execution and warmed execution allocates nothing.
+
+`IN` preserves SQL three-valued logic when the nested result contains `NULL`.
+An empty scalar result is `NULL`; a scalar result with more than one row is an
+error. Every nested result remains subject to the query result row and byte
+budgets.
+
+Correlated subqueries are rejected rather than re-evaluated once per row, and
+subqueries in `FROM`, the projection list, and `HAVING` remain unsupported.
+
 Joins inside a transaction use the same bounded heap path over the snapshots
 captured by BEGIN plus that transaction's staged overlay. They preserve
 repeatable reads and read-your-writes.
@@ -472,9 +500,9 @@ preparation, up to the durable publication point.
 The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
-- subqueries, common table expressions, set operations, window functions,
-  `DISTINCT`, computed scalar expressions, pattern matching, and user-defined
-  functions;
+- correlated subqueries and subqueries outside predicates, common table
+  expressions, set operations, window functions, `DISTINCT`, computed scalar
+  expressions, pattern matching, and user-defined functions;
 - right/full outer, cross, natural, `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, mutation joins,
   mutation `ORDER BY`/`LIMIT`, and `UPDATE`/`DELETE RETURNING`;

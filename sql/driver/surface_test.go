@@ -84,9 +84,62 @@ func TestSQLDriverSharedSelectSurface(t *testing.T) {
 	}
 }
 
-func assertSurfaceIDs(t *testing.T, db *stdsql.DB, statement string, want []string) {
+func TestSQLDriverSubqueriesUseOneCatalogSnapshot(t *testing.T) {
+	db := openTestDB(t)
+	for _, statement := range []string{
+		`CREATE TABLE orders (PRIMARY KEY (id))`,
+		`CREATE TABLE customers (PRIMARY KEY (id))`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(
+		`INSERT INTO orders VALUES (?), (?), (?)`,
+		`{"id":"o1","customer":"c1"}`,
+		`{"id":"o2","customer":"c2"}`,
+		`{"id":"o3","customer":"c3"}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO customers VALUES (?), (?), (?)`,
+		`{"id":"c1","tier":"pro","score":7}`,
+		`{"id":"c2","tier":"free","score":9}`,
+		`{"id":"c3","tier":"pro","score":null}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	assertSurfaceIDs(t, db,
+		`SELECT id FROM orders WHERE customer IN (`+
+			`SELECT id FROM customers WHERE tier = ?) ORDER BY id`,
+		[]string{"o1", "o3"}, "pro")
+	assertSurfaceIDs(t, db,
+		`SELECT id FROM orders WHERE EXISTS (`+
+			`SELECT 1 FROM customers WHERE score = 7) ORDER BY id`,
+		[]string{"o1", "o2", "o3"})
+	assertSurfaceIDs(t, db,
+		`SELECT id FROM orders WHERE customer = (`+
+			`SELECT id FROM customers WHERE score = 9)`,
+		[]string{"o2"})
+
+	if _, err := db.Prepare(
+		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM missing)`,
+	); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("nested missing table error = %v, want ErrTableNotFound", err)
+	}
+}
+
+func assertSurfaceIDs(
+	t *testing.T,
+	db *stdsql.DB,
+	statement string,
+	want []string,
+	args ...any,
+) {
 	t.Helper()
-	rows, err := db.Query(statement)
+	rows, err := db.Query(statement, args...)
 	if err != nil {
 		t.Fatal(err)
 	}

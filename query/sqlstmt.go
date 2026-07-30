@@ -37,12 +37,10 @@ import (
 // would interleave writes into a single plan. A pool of connections gives each
 // connection its own Statement.
 //
-// A Statement with no '?' placeholder compiles exactly once, at
-// [PrepareStatement], and every later execution reuses that plan without
-// touching the parser or the compiler again. A Statement with placeholders
-// re-lowers on each bind; after one warm-up that re-lowering is free of heap
-// allocation, but it is not free of work, and the difference is measurable.
-// See the package benchmarks.
+// A Statement with neither a '?' placeholder nor a subquery compiles exactly
+// once, at [PrepareStatement], and every later execution reuses that plan.
+// Placeholders and subqueries re-lower on each execution because their values
+// may change; after one warm-up that work is free of heap allocation.
 type Statement struct {
 	// text is the statement source, retained only so an error raised during a
 	// later bind can quote what the author wrote.
@@ -116,12 +114,15 @@ type Statement struct {
 	// result before the filter had a chance to reject anything.
 	driverLimit bool
 
+	// subqueryLimit is an internal semantic cap: EXISTS needs at most one row,
+	// and a scalar subquery needs at most two to distinguish its valid
+	// cardinalities from an error. It is zero for every top-level statement.
+	subqueryLimit uint8
+
 	// cached marks that q holds a plan every execution may reuse, and lowerErr
-	// the failure that prevented one. Only a statement with no placeholder can
-	// cache: its literals are fixed, so the plan lowered at prepare is the plan
-	// every execution wants, and its steady state is the builder's exactly —
-	// no parse, no lowering, no compile, the same plan handed to the same
-	// executor.
+	// the failure that prevented one. Only a statement with neither
+	// placeholders nor subqueries can cache: its literals are fixed, so the
+	// plan lowered at prepare is the plan every execution wants.
 	cached   bool
 	lowerErr error
 
@@ -129,6 +130,43 @@ type Statement struct {
 	// prepare-time validation pass has somewhere to put its placeholder
 	// stand-ins without allocating.
 	args []any
+
+	// nested is allocated only for a statement that actually contains a
+	// subquery. Keeping one pointer here instead of three slice words makes
+	// ordinary prepared statements pay the smallest representable space cost.
+	nested *nestedStatements
+}
+
+type nestedStatements struct {
+	subqueries []statementSubquery
+}
+
+type subqueryUse uint8
+
+const (
+	subqueryIn subqueryUse = iota
+	subqueryExists
+	subqueryScalarUse
+)
+
+type statementSubquery struct {
+	tree    *sqlast.SelectStmt
+	stmt    *Statement
+	exec    Exec
+	use     subqueryUse
+	preview bool
+	values  []any
+	slots   []subqueryScalar
+	hasNull bool
+	exists  bool
+}
+
+type subqueryScalar struct {
+	b   bool
+	i   int64
+	s   string
+	n   Number
+	buf []byte
 }
 
 // A pathSpec memoizes one parsed path's rendered engine spelling in one of the
@@ -194,7 +232,21 @@ func PrepareParsedStatement(
 // into the same Statement PrepareStatement would have produced from the
 // equivalent SELECT text. See sqldml.go.
 func prepareTree(src string, tree *sqlast.SelectStmt) (*Statement, error) {
-	s := &Statement{text: src, tree: tree, params: tree.Params}
+	return prepareTreeWithLimit(src, tree, 0)
+}
+
+func prepareTreeWithLimit(
+	src string,
+	tree *sqlast.SelectStmt,
+	subqueryLimit uint8,
+) (*Statement, error) {
+	s := &Statement{
+		text: src, tree: tree, params: tree.Params,
+		subqueryLimit: subqueryLimit,
+	}
+	if err := s.prepareSubqueries(); err != nil {
+		return nil, err
+	}
 	if err := s.describe(); err != nil {
 		return nil, err
 	}
@@ -236,6 +288,14 @@ func (s *Statement) SQL() string { return s.text }
 // collection can refuse it before it takes a snapshot it would only discard.
 func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
 
+// RequiresCatalog reports whether execution may read a collection other than
+// the driving one. JOIN and nested SELECT both require one coherent database
+// snapshot; adapters use this to avoid constructing a single-collection Source
+// that execution would have to reject.
+func (s *Statement) RequiresCatalog() bool {
+	return len(s.tree.From) > 1 || s.nested != nil
+}
+
 // AppendSchema appends the statement's output schema to dst, one entry per
 // SELECT column. It is [Query.AppendSchema] narrowed to the columns the caller
 // can see: a HAVING clause may have added a hidden column, and a result schema
@@ -259,6 +319,12 @@ func (s *Statement) Release() {
 		return
 	}
 	s.c.release()
+	if s.nested != nil {
+		for i := range s.nested.subqueries {
+			s.nested.subqueries[i].stmt.Release()
+			s.nested.subqueries[i].exec.Release()
+		}
+	}
 	*s = Statement{}
 }
 
@@ -279,6 +345,14 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	if e == nil {
 		return Cursor{}, fmt.Errorf("query: RunInto requires a non-nil Exec")
 	}
+	if len(args) != s.params {
+		return Cursor{}, fmt.Errorf(
+			"query: statement has %d placeholder(s) and %d argument(s) were bound",
+			s.params, len(args))
+	}
+	if err := s.runSubqueries(e, src, args); err != nil {
+		return Cursor{}, err
+	}
 	if err := s.bind(args); err != nil {
 		return Cursor{}, err
 	}
@@ -286,6 +360,142 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 		return Cursor{}, err
 	}
 	return s.cursor(&e.Result), nil
+}
+
+func (s *Statement) prepareSubqueries() error {
+	if err := s.collectSubqueries(s.tree.Where); err != nil {
+		return err
+	}
+	return s.collectSubqueries(s.tree.Having)
+}
+
+func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
+	if e == nil {
+		return nil
+	}
+	if e.Subquery != nil {
+		use := subqueryScalarUse
+		switch e.Kind {
+		case sqlast.ExprIn:
+			use = subqueryIn
+		case sqlast.ExprExists:
+			use = subqueryExists
+		}
+		if use != subqueryExists && len(e.Subquery.Columns) != 1 {
+			return fmt.Errorf("query: a scalar or IN subquery must return exactly one column")
+		}
+		limit := uint8(2)
+		if use == subqueryExists {
+			limit = 1
+		}
+		if use == subqueryIn {
+			limit = 0
+		}
+		stmt, err := prepareTreeWithLimit(s.text, e.Subquery, limit)
+		if err != nil {
+			return err
+		}
+		if s.nested == nil {
+			s.nested = new(nestedStatements)
+		}
+		s.nested.subqueries = append(s.nested.subqueries, statementSubquery{
+			tree: e.Subquery, stmt: stmt, use: use, preview: true, exists: true,
+		})
+		return nil
+	}
+	for _, kid := range e.Kids {
+		if err := s.collectSubqueries(kid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
+	if s.nested == nil {
+		return nil
+	}
+	for i := range s.nested.subqueries {
+		sub := &s.nested.subqueries[i]
+		n := sub.stmt.NumParams()
+		base := sub.tree.ParamBase
+		if base < 0 || base+n > len(args) {
+			return fmt.Errorf("query: invalid nested placeholder range")
+		}
+		nestedSource, err := src.subquerySource(s.Collection(), sub.stmt.Collection())
+		if err != nil {
+			return err
+		}
+		sub.exec.Options = parent.Options
+		cursor, err := sub.stmt.RunInto(&sub.exec, nestedSource, args[base:base+n])
+		if err != nil {
+			return err
+		}
+		sub.preview = false
+		sub.exists = false
+		sub.hasNull = false
+		clear(sub.values)
+		sub.values = sub.values[:0]
+		sub.slots = reserve(sub.slots[:0], sub.exec.Result.RowCount)
+		sub.values = reserve(sub.values, sub.exec.Result.RowCount)
+		for cursor.Next() {
+			sub.exists = true
+			if sub.use == subqueryExists {
+				continue
+			}
+			if sub.use == subqueryScalarUse && len(sub.slots) == 1 {
+				return fmt.Errorf("query: scalar subquery returned more than one row")
+			}
+			sub.slots = append(sub.slots, subqueryScalar{})
+			slot := &sub.slots[len(sub.slots)-1]
+			value, known, err := scalarFromCell(slot, cursor.Cell(0))
+			if err != nil {
+				return err
+			}
+			if !known {
+				sub.hasNull = true
+				continue
+			}
+			sub.values = append(sub.values, value)
+		}
+	}
+	return nil
+}
+
+func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
+	switch cell.Kind() {
+	case KindNull:
+		return nil, false, nil
+	case KindBool:
+		slot.b, _ = cell.Bool()
+		return &slot.b, true, nil
+	case KindNumber:
+		if v, ok := cell.Int64(); ok {
+			slot.i = v
+			return &slot.i, true, nil
+		}
+		slot.buf = cell.AppendJSON(slot.buf[:0])
+		slot.n = Number(byteview.String(slot.buf))
+		return &slot.n, true, nil
+	case KindString:
+		slot.s, _ = cell.Text()
+		return &slot.s, true, nil
+	default:
+		return nil, false, fmt.Errorf(
+			"query: a subquery predicate requires scalar values, got %v", cell.Kind())
+	}
+}
+
+func (s *Statement) subquery(tree *sqlast.SelectStmt) *statementSubquery {
+	if s.nested == nil {
+		return nil
+	}
+	for i := range s.nested.subqueries {
+		if s.nested.subqueries[i].tree == tree {
+			return &s.nested.subqueries[i]
+		}
+	}
+	return nil
 }
 
 // Run binds args and executes s over src with transient storage this call
@@ -302,9 +512,8 @@ func (s *Statement) Run(src Source, args []any) (Result, Cursor, error) {
 	return e.Result, cursor, err
 }
 
-// bind re-lowers the plan for args when it has to. A statement with no
-// placeholders lowered once at prepare and is answered from the cached
-// outcome, which is what makes its execution byte-identical to the builder's.
+// bind re-lowers the plan when parameters or nested results can change it. A
+// statement with neither lowered once at prepare and uses the cached outcome.
 func (s *Statement) bind(args []any) error {
 	if s == nil || s.tree == nil {
 		return fmt.Errorf("query: cannot execute a nil or released Statement")

@@ -137,7 +137,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
 	if s.conn.tx != nil {
-		if s.query.NumJoins() != 0 {
+		if s.query.RequiresCatalog() {
 			source, err := s.conn.materializeTransactionJoinSource(
 				ctx, s.conn.tx, s.tree.Select, s.joinNames)
 			if err != nil {
@@ -189,7 +189,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
 		return nil, err
 	}
-	if s.query.NumJoins() != 0 {
+	if s.query.RequiresCatalog() {
 		clear(s.conn.joinCatalog)
 		collections := s.conn.joinCatalog[:0]
 		for _, name := range s.joinNames {

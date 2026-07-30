@@ -59,6 +59,10 @@ type SelectStmt struct {
 	// ordinals run from 0 to Params-1 in source order, which is the order a
 	// database/sql driver binds arguments in.
 	Params int
+
+	// ParamBase is the first outer-statement placeholder occupied by this
+	// statement when it is a subquery. It is zero for a top-level statement.
+	ParamBase int
 }
 
 // A JoinKind names a join's flavour.
@@ -226,6 +230,8 @@ const (
 	ExprOr
 	// ExprNot is the negation of Kids[0].
 	ExprNot
+	// ExprExists is EXISTS (SELECT ...). Subquery holds the nested statement.
+	ExprExists
 )
 
 // A CmpOp is a comparison operator. The constants are in the same order as
@@ -297,7 +303,13 @@ type Expr struct {
 	// one node with three children — the shape query's And and Or take, and
 	// the shape its OR-to-IN coalescing looks for.
 	Kids []*Expr
-	Pos  int
+	// Subquery is the nested SELECT used by ExprExists, by ExprIn instead of
+	// List, or by ExprCompare instead of Value. It is nil for every ordinary
+	// leaf. Nested statements have their own source scope; correlated
+	// references are deliberately rejected until the executor has a
+	// parameterized nested-loop plan rather than being guessed at here.
+	Subquery *SelectStmt
+	Pos      int
 }
 
 // An OperandKind tags a right-hand-side value.

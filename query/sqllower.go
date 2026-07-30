@@ -67,7 +67,7 @@ func (s *Statement) lower(args []any) error {
 		p, err = c.compilePlan(&s.q)
 		if err == nil {
 			s.q.built = c.outcome(p, nil)
-			s.cached = s.params == 0
+			s.cached = s.params == 0 && s.nested == nil
 			s.lowerErr = nil
 			return nil
 		}
@@ -83,7 +83,7 @@ func (s *Statement) lower(args []any) error {
 	// binding (a bad type, an invalid Number, or a negative LIMIT/OFFSET).
 	// Keep that statement reusable so a rejected execution cannot poison the
 	// next valid bind.
-	s.cached = s.params == 0
+	s.cached = s.params == 0 && s.nested == nil
 	s.lowerErr = err
 	return err
 }
@@ -181,6 +181,10 @@ func (s *Statement) buildLimit(args []any) error {
 			return err
 		}
 		s.limit, s.hasLimit = n, true
+	}
+	if s.subqueryLimit > 0 &&
+		(!s.hasLimit || s.limit > int(s.subqueryLimit)) {
+		s.limit, s.hasLimit = int(s.subqueryLimit), true
 	}
 	if s.hasLimit && !s.driverLimit {
 		bound := s.offset + s.limit
@@ -694,9 +698,24 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	spec := s.spec(e.Path)
 	switch e.Kind {
 	case sqlast.ExprCompare:
+		if e.Subquery != nil {
+			return s.subqueryCompareForm(e)
+		}
 		return s.compareForm(e.Path, e.Op, e.Value, args)
 	case sqlast.ExprIn:
+		if e.Subquery != nil {
+			return s.subqueryInForm(e, spec)
+		}
 		return s.inForm(e, spec, args)
+	case sqlast.ExprExists:
+		sub := s.subquery(e.Subquery)
+		if sub == nil {
+			return leafForm{}, fmt.Errorf("query: missing prepared EXISTS subquery")
+		}
+		if sub.preview || sub.exists {
+			return leafForm{pred: alwaysTruePred(), total: true}, nil
+		}
+		return leafForm{pred: neverTrue(), total: true}, nil
 	case sqlast.ExprIsNull:
 		// IS NULL is two-valued in both dialects, and it is where this engine
 		// and SQL disagree about what null means rather than about logic: an
@@ -716,6 +735,45 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	default:
 		return leafForm{}, fmt.Errorf("query: unsupported predicate in SQL lowering")
 	}
+}
+
+func (s *Statement) subqueryCompareForm(e *sqlast.Expr) (leafForm, error) {
+	sub := s.subquery(e.Subquery)
+	if sub == nil {
+		return leafForm{}, fmt.Errorf("query: missing prepared scalar subquery")
+	}
+	if sub.preview {
+		return leafForm{
+			pred:  Cmp(s.spec(e.Path), Op(e.Op), int64(0)),
+			guard: s.c.not(IsNull(s.spec(e.Path))),
+		}, nil
+	}
+	if !sub.exists || sub.hasNull || len(sub.values) == 0 {
+		return leafForm{noTrue: true, noFalse: true}, nil
+	}
+	spec := s.spec(e.Path)
+	return leafForm{
+		pred:  Cmp(spec, Op(e.Op), sub.values[0]),
+		guard: s.c.not(IsNull(spec)),
+	}, nil
+}
+
+func (s *Statement) subqueryInForm(e *sqlast.Expr, spec string) (leafForm, error) {
+	sub := s.subquery(e.Subquery)
+	if sub == nil {
+		return leafForm{}, fmt.Errorf("query: missing prepared IN subquery")
+	}
+	if sub.preview {
+		return leafForm{
+			pred:  In(spec, int64(0)),
+			guard: s.c.not(IsNull(spec)),
+		}, nil
+	}
+	return leafForm{
+		pred:    In(spec, sub.values...),
+		guard:   s.c.not(IsNull(spec)),
+		noFalse: sub.hasNull,
+	}, nil
 }
 
 // compareForm builds the form of one comparison leaf.
