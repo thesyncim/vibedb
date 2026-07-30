@@ -41,7 +41,7 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 			for _, required := range []string{
 				"engine", "mutation-index", "phase", "apparent-bytes",
 				"allocated-bytes", "forced-cp", "publishable", "storage-profile",
-				"compression", "compression-provenance",
+				"compression", "compression-provenance", "maintenance-floor",
 			} {
 				if _, ok := index[required]; !ok {
 					t.Fatalf("header omits %q: %q", required, lines[0])
@@ -49,6 +49,7 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 			}
 			last := -1
 			phases := map[string]bool{}
+			var preFloor, postFloor int64
 			for lineNo, line := range lines[1:] {
 				fields := strings.Split(line, "\t")
 				if len(fields) != len(header) {
@@ -62,7 +63,20 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 					t.Fatalf("mutation index decreased from %d to %d", last, got)
 				}
 				last = got
-				phases[fields[index["phase"]]] = true
+				phase := fields[index["phase"]]
+				phases[phase] = true
+				apparent, err := strconv.ParseInt(
+					fields[index["apparent-bytes"]], 10, 64,
+				)
+				if err != nil {
+					t.Fatalf("line %d apparent bytes: %v", lineNo+2, err)
+				}
+				switch phase {
+				case "pre-floor":
+					preFloor = apparent
+				case "post-floor":
+					postFloor = apparent
+				}
 				if fields[index["publishable"]] != "false" {
 					t.Fatalf("diagnostic line %d marked publishable: %q", lineNo+2, line)
 				}
@@ -78,6 +92,20 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 			}
 			if !phases["pre-floor"] || !phases["post-floor"] {
 				t.Fatalf("final floor rows missing; phases=%v", phases)
+			}
+			if engine == "vibejson-durable" {
+				if postFloor > preFloor {
+					t.Fatalf(
+						"offline repack increased apparent bytes: pre=%d post=%d",
+						preFloor, postFloor,
+					)
+				}
+				if !strings.Contains(
+					strings.Join(lines[1:], "\n"),
+					"offline out-of-place durable.Repack",
+				) {
+					t.Fatal("vibejson floor rows omit offline Repack disclosure")
+				}
 			}
 			if last != 2000 {
 				t.Fatalf("final mutation index = %d, want 2000", last)

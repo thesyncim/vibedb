@@ -406,10 +406,69 @@ func (v *vibeDurable) Checkpoint() error {
 	return v.coll.Flush()
 }
 
-func (v *vibeDurable) MaintenanceFloor() error { return v.Checkpoint() }
+func (v *vibeDurable) MaintenanceFloor() error {
+	if v.coll == nil || v.file == nil {
+		return nil
+	}
+	// Repack is deliberately offline: close the live collection so its newest
+	// journal-visible generation is folded into a quiescent source before the
+	// snapshot scan. The benchmark keeps both the pre-floor COW high-water and
+	// the post-floor row, so this stronger rewrite is never hidden inside timed
+	// mutation throughput.
+	if err := v.Close(); err != nil {
+		return err
+	}
+	sourcePath := v.path
+	source, err := os.OpenFile(sourcePath, os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	outputPath := sourcePath + ".repack"
+	output, err := os.OpenFile(
+		outputPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		_ = source.Close()
+		return err
+	}
+	cleanupOutput := true
+	defer func() {
+		_ = source.Close()
+		_ = output.Close()
+		if cleanupOutput {
+			_ = os.Remove(outputPath)
+			_ = os.Remove(durable.RecoveryJournalPath(outputPath))
+		}
+	}()
+	if _, err := durable.Repack(
+		source, output, v.primaryBulkOptions(),
+	); err != nil {
+		return err
+	}
+	if err := source.Close(); err != nil {
+		return err
+	}
+	if err := output.Close(); err != nil {
+		return err
+	}
+	// This harness consumes the compact output in place of the source; it does
+	// not claim a crash-atomic production cutover protocol. Repack itself is a
+	// vacuum-into primitive, leaving deployment to publish the completed pair
+	// with its own manifest/rename protocol.
+	if err := os.Remove(sourcePath); err != nil {
+		return err
+	}
+	sourceJournal := durable.RecoveryJournalPath(sourcePath)
+	if err := os.Remove(sourceJournal); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	v.path = outputPath
+	cleanupOutput = false
+	return nil
+}
 
 func (v *vibeDurable) MaintenanceFloorDescription() string {
-	return "Flush (the ordinary mutation representation is unchanged)"
+	return "offline out-of-place durable.Repack (vacuum-into), then remove the benchmark source pair; cutover protocol excluded"
 }
 
 // AutomaticCheckpoints reports persistence boundaries forced by bounded
