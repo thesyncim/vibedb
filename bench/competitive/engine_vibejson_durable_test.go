@@ -95,10 +95,10 @@ func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
 	}
 }
 
-// TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary proves the buffered
-// lane is also on the primary graph: MergeReclassEvaluations increments only in
-// the primary delete path (deletePrimaryWithMerge), so a non-zero count after
-// deletes is proof the chunk layout is not being measured.
+// TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary pins the unified
+// primary delete fast path. Dense class-5 leaves publish overlay tombstones
+// without paying a second writer lock and merge/reclass evaluation; structural
+// hygiene runs only after a delete makes a routed leaf empty.
 func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 	factory, ok := FactoryNamed("vibejson-durable")
 	if !ok {
@@ -114,8 +114,11 @@ func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 			t.Fatalf("delete %d: %v", i, err)
 		}
 	}
-	if got := v.coll.Stats().MergeReclassEvaluations - base; got == 0 {
-		t.Fatal("buffered-visible deletes did not run the primary merge/reclass evaluation (chunk layout still measured?)")
+	if got := v.coll.Stats().MergeReclassEvaluations - base; got != 0 {
+		t.Fatalf(
+			"buffered-visible dense primary deletes ran %d merge/reclass evaluations, want 0",
+			got,
+		)
 	}
 }
 

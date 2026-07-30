@@ -39,7 +39,7 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				index[name] = i
 			}
 			for _, required := range []string{
-				"engine", "mutation-index", "phase", "apparent-bytes",
+				"git-commit", "vcs-modified", "engine", "mutation-index", "phase", "apparent-bytes",
 				"allocated-bytes", "forced-cp", "publishable", "storage-profile",
 				"compression", "compression-provenance", "maintenance-floor",
 			} {

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -220,6 +221,14 @@ func run(args []string, out io.Writer) error {
 	if err := takeSample("pre-floor"); err != nil {
 		return err
 	}
+	// Verify every final key and value outside the timed mutation interval. The
+	// maintenance row remains comparable with the pre-maintenance row by
+	// excluding the oracle's wall time from its cumulative elapsed value.
+	verifyStart := time.Now()
+	if err := verifyChurnCorpus(engine, cfg.engineName, docs, updated); err != nil {
+		return err
+	}
+	start = start.Add(time.Since(verifyStart))
 	if err := floor.MaintenanceFloor(); err != nil {
 		return err
 	}
@@ -238,16 +247,81 @@ func run(args []string, out io.Writer) error {
 	publishable := publicationShape(cfg) &&
 		forced == 0 && !cfg.allowDiagnostic
 	printHeader(out)
-	commit := gitCommit()
+	commit, modified := vcsProvenance()
 	for _, s := range samples {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%t\t%s\t%s\t%d\t%d\t%d\t%.6f\t%s\t%s\t%s\n",
-			commit, cfg.engineName, cardinality, cfg.corpusSize,
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%t\t%s\t%s\t%d\t%d\t%d\t%.6f\t%s\t%s\t%s\n",
+			commit, modified, cfg.engineName, cardinality, cfg.corpusSize,
 			cfg.mutationBudget, cfg.replacePercent, cfg.sampleMutations,
 			engine.DurabilityMode(), cfg.checkpointMutations,
 			competitive.DefaultCacheBytes, cfg.seed,
 			forced, publishable, floor.MaintenanceFloorDescription(), s.phase,
 			s.mutationIndex, s.apparentBytes, s.allocatedBytes, s.elapsed.Seconds(),
 			profile.Profile, profile.Compression, profile.Provenance,
+		)
+	}
+	return nil
+}
+
+func verifyChurnCorpus(
+	engine competitive.Engine,
+	engineName string,
+	docs []competitive.Doc,
+	updated []bool,
+) error {
+	if len(updated) != len(docs) {
+		return fmt.Errorf(
+			"churn oracle state length %d does not match corpus length %d",
+			len(updated), len(docs),
+		)
+	}
+	keyIndexes := make(map[string]int, len(docs))
+	for i := range docs {
+		keyIndexes[docs[i].Key] = i
+	}
+	seen := make([]bool, len(docs))
+	seenCount := 0
+	var submitted, expected []byte
+	if err := engine.Visit(func(key string, value []byte) error {
+		i, ok := keyIndexes[key]
+		if !ok {
+			return fmt.Errorf("churn oracle found unexpected key %q", key)
+		}
+		if seen[i] {
+			return fmt.Errorf("churn oracle found duplicate key %q", key)
+		}
+		seen[i] = true
+		seenCount++
+		submitted = submitted[:0]
+		if updated[i] {
+			submitted = competitive.AppendSameSizeUpdatedJSON(submitted, docs, i)
+		} else {
+			submitted = append(submitted, docs[i].JSON...)
+		}
+		var err error
+		expected, err = competitive.AppendExpectedStoredJSON(
+			expected[:0], engineName, submitted,
+		)
+		if err != nil {
+			return fmt.Errorf("churn oracle canonicalize %q: %w", key, err)
+		}
+		if !bytes.Equal(value, expected) {
+			return fmt.Errorf(
+				"churn oracle value mismatch for %q: got %d bytes, want %d",
+				key, len(value), len(expected),
+			)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if seenCount != len(docs) {
+		for i := range docs {
+			if !seen[i] {
+				return fmt.Errorf("churn oracle is missing key %q", docs[i].Key)
+			}
+		}
+		return fmt.Errorf(
+			"churn oracle visited %d keys, want %d", seenCount, len(docs),
 		)
 	}
 	return nil
@@ -264,7 +338,7 @@ func publicationShape(cfg config) bool {
 
 func printHeader(w io.Writer) {
 	fmt.Fprintln(w, strings.Join([]string{
-		"git-commit", "engine", "cardinality", "corpus", "mutation-budget",
+		"git-commit", "vcs-modified", "engine", "cardinality", "corpus", "mutation-budget",
 		"replace-percent", "sample-mutations", "durability",
 		"checkpoint-mutations", "cache-bytes", "seed", "forced-cp", "publishable",
 		"maintenance-floor", "phase", "mutation-index", "apparent-bytes",
@@ -298,17 +372,33 @@ func (s *checkpointSchedule) Add(mutations int) bool {
 func (s *checkpointSchedule) Mark()        { s.pending = 0 }
 func (s *checkpointSchedule) Pending() int { return s.pending }
 
-func gitCommit() string {
+func vcsProvenance() (revision, modified string) {
+	revision, modified = "unknown", "unknown"
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" && setting.Value != "" {
-				return setting.Value
+			switch setting.Key {
+			case "vcs.revision":
+				if setting.Value != "" {
+					revision = setting.Value
+				}
+			case "vcs.modified":
+				if setting.Value != "" {
+					modified = setting.Value
+				}
 			}
 		}
 	}
-	out, err := exec.Command("git", "rev-parse", "HEAD").Output()
-	if err != nil {
-		return "unknown"
+	if revision == "unknown" {
+		if out, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
+			revision = strings.TrimSpace(string(out))
+		}
 	}
-	return strings.TrimSpace(string(out))
+	if modified == "unknown" {
+		if out, err := exec.Command(
+			"git", "status", "--porcelain", "--untracked-files=no",
+		).Output(); err == nil {
+			modified = fmt.Sprintf("%t", strings.TrimSpace(string(out)) != "")
+		}
+	}
+	return revision, modified
 }

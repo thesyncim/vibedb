@@ -33,7 +33,10 @@ func durableJoinOptions(indexes ...store.IndexDefinition) durable.Options {
 		Indexes:          indexes,
 		PageSize:         4096,
 		MaxPageSize:      64 << 10,
-		ResidentBytes:    4 << 20,
+		// Retain the unified class-5 overlay and the bounded exact-index staging
+		// window. Individual eviction tests tighten this while remaining above
+		// the admitted worst-case point transaction.
+		ResidentBytes:    8 << 20,
 		MaxDocumentBytes: 64 << 10,
 		MaxKeyBytes:      128,
 		InlineValueBytes: 512,
@@ -223,16 +226,16 @@ func TestDurableJoinInnerScanSpansManyBatchesUnderEviction(t *testing.T) {
 	)
 	options := durableJoinOptions()
 	// Tight enough that the corpus cannot stay resident, so a frame borrowed by
-	// an early batch is genuinely recycled before the scan ends. Three MiB also
-	// retains the point writer's complete worst-case free-image fold: the
-	// collection must be able to publish any admitted point mutation even
-	// though this read test deliberately keeps its cache far below the corpus.
-	options.ResidentBytes = 3 << 20
+	// an early batch is genuinely recycled before the scan ends. Six MiB also
+	// retains the unified point writer's complete worst-case class-5 overlay:
+	// the collection must be able to publish any admitted point mutation even
+	// though this read test deliberately keeps its cache below the corpus.
+	options.ResidentBytes = 6 << 20
 	// Four documents per chunk with a two-kilobyte document makes a chunk page
-	// about eight kilobytes, so two consecutive 1024-row batches span roughly
-	// four megabytes of pages against a three-megabyte resident budget. That
-	// ratio is the point: the frames an early page was read into are handed to a
-	// later read before the scan finishes, so a borrowed key is reading another
+	// about eight kilobytes, so the complete inner scan spans roughly eight
+	// megabytes of pages against a six-megabyte resident budget. That ratio is
+	// the point: the frames an early page was read into are handed to a later
+	// read before the scan finishes, so a borrowed key is reading another
 	// document's bytes.
 	options.Collection = store.Options{ChunkDocuments: 4}
 

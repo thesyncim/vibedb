@@ -13,6 +13,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"runtime/debug"
+	"strings"
 
 	competitive "github.com/thesyncim/vibedb/bench/competitive"
 )
@@ -32,8 +35,8 @@ func main() {
 		"disk comparison profile: intrinsic (optional compression off) or production (recommended built-in compression)",
 	)
 	card := flag.String("cardinality", "low", "corpus variant: low (the shipped, ~92% redundant one) or high. "+
-		"The two are shape- and length-identical and differ only in value entropy, so the difference between a "+
-		"disk column measured on each is exactly the part of an engine's compactness that came from the corpus.")
+		"The two are shape- and length-identical and differ only in value entropy, isolating each format's "+
+		"sensitivity to entropy at fixed shape and length.")
 	header := flag.Bool("header", false, "print a column header first")
 	corpusStats := flag.Bool("corpus-stats", false, "print the corpus's size and gzip -9 size, then exit")
 	files := flag.Bool("files", false, "additionally list every file the engine left behind, with its apparent "+
@@ -145,8 +148,8 @@ func main() {
 }
 
 func printHeader(w io.Writer) {
-	fmt.Fprintf(w, "%-24s %-24s %8s %8s %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
-		"engine", "durability", "corpus", "indexed", "disk", "diskalloc",
+	fmt.Fprintf(w, "%-40s %-12s %-24s %-24s %8s %8s %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
+		"git-commit", "vcs-modified", "engine", "durability", "corpus", "indexed", "disk", "diskalloc",
 		"heapalloc", "heapsys", "resident", "maxrss", "storage-profile",
 		"compression", "compression-provenance")
 }
@@ -159,12 +162,44 @@ func report(
 	fp competitive.Footprint,
 	profile competitive.StorageProfileResolution,
 ) {
-	fmt.Fprintf(w, "%-24s %-24s %8s %8v %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
-		name, durability, card, indexed,
+	commit, modified := vcsProvenance()
+	fmt.Fprintf(w, "%-40s %-12s %-24s %-24s %8s %8v %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
+		commit, modified, name, durability, card, indexed,
 		mib(fp.DiskBytes), mib(fp.DiskAllocatedBytes),
 		mib(int64(fp.HeapAlloc)), mib(int64(fp.HeapSys)),
 		mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()),
 		profile.Profile, profile.Compression, profile.Provenance)
+}
+
+func vcsProvenance() (revision, modified string) {
+	revision, modified = "unknown", "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if setting.Value != "" {
+					revision = setting.Value
+				}
+			case "vcs.modified":
+				if setting.Value != "" {
+					modified = setting.Value
+				}
+			}
+		}
+	}
+	if revision == "unknown" {
+		if out, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
+			revision = strings.TrimSpace(string(out))
+		}
+	}
+	if modified == "unknown" {
+		if out, err := exec.Command(
+			"git", "status", "--porcelain", "--untracked-files=no",
+		).Output(); err == nil {
+			modified = fmt.Sprintf("%t", strings.TrimSpace(string(out)) != "")
+		}
+	}
+	return revision, modified
 }
 
 func mib(n int64) string { return fmt.Sprintf("%.1f", float64(n)/(1<<20)) }

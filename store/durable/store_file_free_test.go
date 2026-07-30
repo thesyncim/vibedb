@@ -1309,9 +1309,11 @@ func TestNeverDurableRetirementOutputRespectsFreeSetRoom(t *testing.T) {
 			{Offset: 4096, Length: 4096, RetiredGeneration: 1},
 			{Offset: 8192, Length: 4096, RetiredGeneration: 1},
 			// A whole-consumed transaction entry disappears in
-			// finalizeReusable and must not consume next-generation room.
+			// finalizeReusable. Until then the hot-path bound deliberately
+			// counts it, avoiding an O(n) live-entry scan per mutation.
 			{Offset: 12288, RetiredGeneration: 1},
 		},
+		freeExtentMaxima:   make([]uint64, storeio.FreeExtentIndexCapacity(3)),
 		retirementAbsorbed: make([]storeio.FreeExtent, 1, 4),
 	}
 	if got := cap(c.neverDurableRetirementOutput()) -
@@ -1320,8 +1322,13 @@ func TestNeverDurableRetirementOutputRespectsFreeSetRoom(t *testing.T) {
 	}
 	c.reusable[1].Length = 0
 	output := c.neverDurableRetirementOutput()
+	if got := cap(output) - len(output); got != 0 {
+		t.Fatalf("conservative output room before finalize = %d, want 0", got)
+	}
+	c.finalizeReusable()
+	output = c.neverDurableRetirementOutput()
 	if got := cap(output) - len(output); got != 1 {
-		t.Fatalf("output room after one whole consumption = %d, want 1", got)
+		t.Fatalf("output room after finalize = %d, want 1", got)
 	}
 }
 

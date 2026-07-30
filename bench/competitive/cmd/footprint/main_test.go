@@ -34,6 +34,11 @@ func TestReportIncludesStorageProfileProvenance(t *testing.T) {
 	for i, name := range header {
 		index[name] = i
 	}
+	for _, required := range []string{"git-commit", "vcs-modified"} {
+		if _, ok := index[required]; !ok {
+			t.Fatalf("header omits %q: %q", required, lines[0])
+		}
+	}
 	if row[index["storage-profile"]] != "production" {
 		t.Fatalf("storage profile = %q", row[index["storage-profile"]])
 	}
