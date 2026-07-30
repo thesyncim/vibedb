@@ -1,19 +1,21 @@
 # Parallel tablet writers
 
-**Status:** executable design, validated against the tree at the
-routed-splits/journal/epoch/batch state (post `c6df176`). Every claim below is
+**Status:** executable design for the remaining parallel-staging work,
+re-audited against the unified class-5 tree at `3fbcd8a`. Every claim below is
 either **(verified)** against named code or **(projection)** with the
 measurement that will decide it. The design assumes ONE layout — the ordered
-primary graph with a single mutation path — because the legacy chunk layout's
-source is deleted in a sibling worktree that merges before this work starts.
+primary graph with a single mutation path; the legacy chunk layout is already
+deleted.
 
 **Idea:** keep every mutation's tablet-local work parallel across tablets,
 fence durability as a group through the one shared recovery journal, and
 publish visibility as a group through the one serialized pointer-swap section
 that already exists. The write path becomes a three-stage pipeline — *stage in
-parallel, fence as a group, publish as a group* — and the pipeline lands
-first on today's single writer (where it already wins the ordinary-sync lane)
-before any sharding exists.
+parallel, fence as a group, publish as a group*. Fence grouping for the
+buffered-journal lane is already landed on today's single writer; parallel
+staging and grouped publication remain. Current ordinary-sync performance is
+unmeasured; the published `d714d63` lane is a historical loss, not an existing
+win.
 
 This design is intra-process concurrency inside one physical collection.
 Distributed ownership and replication use
@@ -34,14 +36,13 @@ inventory the rest of the design builds on; read it as "what is already true."
    (`journalBeforePublishLocked`, called from `cowBufferedPrimaryMutation`
    between the last fallible prepare step and the router/state publish —
    verified, `store_file_primary_mutation.go`). Buffered-visible +
-   `Options.RecoveryJournal` journals AFTER publish (`journalAckLocked`).
-   The batch record — one record, one CRC, one sync for N entries
-   (`RecoveryRecordKindBatch`, `AppendBatch`, verified
-   `internal/storeio/recovery_journal.go`) — is explicitly documented as the
-   group-commit primitive whose "future group of INDEPENDENT acknowledgements
-   sharing one sync is the same record with unrelated entries"
-   ([recovery-journal.md](recovery-journal.md#batch-records--the-group-commit-primitive)).
-   This design is that future.
+   `Options.RecoveryJournal` journals AFTER publish (`journalDepositLocked`).
+   Phase 1 grouping is landed: each independent mutation appends its own record
+   under `c.writer`, releases the writer, and waits on a flat-combined sync that
+   covers every record appended before the leader's captured ticket
+   (`journalDepositLocked`, `journalGroupAwait`). A logical `Update` still uses
+   one batch record, one CRC, and one sync for atomicity
+   (`RecoveryRecordKindBatch`, `AppendBatch`).
 2. **Readers are lock-free behind a writer-side fence.** Point reads claim an
    epoch slot and re-validate (`enterReadEpoch`, 4 ns entry); the writer
    raises the divert word inside `snapshotGate` and scans slots
@@ -75,10 +76,11 @@ inventory the rest of the design builds on; read it as "what is already true."
 
 Two further verified facts shape everything below:
 
-- **The entire mutation path is serialized under one `sync.Mutex`**
-  (`c.writer`), and the ordinary-sync acknowledgement is paid inside that
-  lock, so concurrent callers divide the sync budget instead of sharing it
-  (verified, `putPrimary` / `journalAckLocked`).
+- **Mutation staging, publication, and journal append are serialized under one
+  `sync.Mutex`** (`c.writer`). The buffered-journal sync wait is already outside
+  that lock and shared by concurrent callers; parallel tablet work must attack
+  the remaining serialized staging/publication, not re-land phase 1
+  (`putPrimary`, `journalDepositLocked`, `journalGroupAwait`).
 - **The resident router is a single-writer seqlock.** `UpdateLeaf` brackets
   its row stores with `version.Add(1)` pairs; two concurrent updaters would
   interleave to an even version mid-write and let a reader admit a torn row
@@ -92,19 +94,18 @@ From [RESULTS.md](../../bench/competitive/RESULTS.md) (M4 Max, medians of 10):
 
 | lane | vibedb today | best competitor | gap mechanism |
 |---|---|---|---|
-| buffered ycsb-a | 182,590 | Badger 264,284 | Badger amortizes across its internal pipeline; our writer is one lock |
-| buffered churn | 244,114 | Badger 328,884 | same |
-| ordinary-sync ycsb-a | 10,138 | Badger 58,358 (SQLite 28,790) | each caller pays its acknowledgement and checkpoint stalls under serialized publication |
-| power-safe ycsb-a | **394** | SQLite 382 | the single-fence path now wins narrowly; group amortization is still absent |
+| buffered ycsb-a | 278,553 | Badger 313,682 | 11.2% below the leader; our writer is one lock |
+| buffered churn | **445,005** | Badger 401,636 | current single-client path leads by 10.8% |
+| ordinary-sync ycsb-a (`d714d63`) | 10,138 | Badger 58,358 (SQLite 28,790) | historical lane; each caller pays its acknowledgement under serialized publication |
+| power-safe ycsb-a (`d714d63`) | **394** | SQLite 382 | historical lane; group amortization is still absent |
 
-Cost decomposition that the pipeline exploits (all measured): buffered apply
-is 4.8–4.9 µs per update (in-workload p50), ordinary-sync updates are
-27.7–39.9 µs, power-safe updates are 4.03–4.12 ms, and buffered checkpoint p50
-is 360–415 µs. The shape is unambiguous: **the sync is far costlier than the
-apply**, so
+Current buffered apply is 0.916–0.958 µs per update (in-workload p50) and
+buffered checkpoint p50 is 28.2–34.3 µs. The historical ordinary-sync updates
+are 27.7–39.9 µs and power-safe updates are 4.03–4.12 ms. The shape remains
+unambiguous: **the sync is far costlier than the apply**, so
 sharing one sync across N callers is worth far more than parallelizing the
 apply — and it needs no sharding at all. Sharding then attacks the second
-ceiling (serialized apply at ~4.9 µs ≈ 204 k/s).
+ceiling after the current sub-microsecond apply path.
 
 ## 3. Architecture: stage → fence → publish
 
@@ -128,9 +129,9 @@ separates for one writer:
    serializing it is not the bottleneck **(projection: publish-section
    occupancy < 15 % at 8 writers; measured by a phase-2 counter gate)**.
 
-The phases land the stages in reverse risk order: phase 1 groups the fence
-under the existing single writer (largest win, no concurrency); phase 2
-parallelizes staging.
+The phases land the stages in reverse risk order: phase 1 fence grouping is
+landed under the existing single writer; phase 1b extends grouping to
+fence-before-publish, and phase 2 parallelizes staging.
 
 ## 4. Sharding model
 
@@ -140,10 +141,10 @@ A mutation routes to its tablet and acquires that tablet's **write token** — a
 fixed array of futex-cheap mutexes indexed by `TabletID & mask`, allocated
 once at open (no allocation, zero-GC directive holds). The caller's goroutine
 executes the stage itself. There is **no dispatcher and no per-tablet writer
-goroutine**: a goroutine hop costs hundreds of nanoseconds against a 412 ns
-hot ack, and per-key ordering already falls out of
-single-token-per-tablet (two writers to the same key contend on the same
-token; distinct tablets never contend).
+goroutine**: a goroutine hop costs hundreds of nanoseconds, material against
+the current 0.916–0.958 µs buffered update p50, and per-key ordering already
+falls out of single-token-per-tablet (two writers to the same key contend on
+the same token; distinct tablets never contend).
 
 Token index aliasing (two tablets hashing to one token) is correctness-neutral
 — it only serializes more than necessary — so the table can stay small
@@ -211,42 +212,47 @@ rejected.** The arguments, from the measured numbers:
 - **The power-safe fence is device-global.** `F_FULLFSYNC` drains the whole
   device cache (4.05 ms measured); N journals issuing N concurrent full
   fences still serialize on the same drain. Parallel journal files buy
-  literally nothing in the lane where the fence is 860× the apply.
+  literally nothing in the lane where the fence is roughly 4,200–4,400× the
+  current buffered update p50.
 - **Ordinary-sync parallelism is unproven and unnecessary.** Concurrent
   `fdatasync` on distinct files shares one device queue; whether it scales at
   all on APFS/M4 is unmeasured **(projection — a phase-0 microbench can bound
   it, but the chosen design does not depend on the answer)**. The shared
-  journal's group commit is projected to amortize the measured 28-40 µs
-  acknowledgement to roughly 4-5 µs/op at eight waiting writers, near the
-  apply cost — the sync stops being the
-  bottleneck, so multiplying sync streams optimizes a solved problem.
+  journal's group commit is projected to amortize a 28–40 µs fence contribution
+  to roughly 3.5–5 µs per acknowledgement at eight waiting writers. Phase 0
+  must measure the current ordinary-sync decomposition before treating that
+  projection as a bottleneck result.
 - **One stream keeps recovery exactly as it is** (§9): one `Replay` cursor,
   one base generation, one recycle discipline tied to the one durable root.
   Per-tablet journals would need per-tablet recycle floors against a single
   durable root — the folding discipline (recycle only after the durable fold,
   verified `checkpointBufferedLocked` ordering) becomes k-way.
 
-This is the Badger model (writers stage records, one syncer fences batches)
-— and Badger's 58.4k ordinary-sync ycsb-a on this exact harness is the
-existence proof that group commit alone, without any storage-engine
-parallelism, wins this lane.
+Badger's historical 58.4k ordinary-sync YCSB-A row is a target, not proof of a
+mechanism: that published run is single-client and does not isolate either
+cross-caller group commit or storage-engine parallelism.
 
 ### 5.2 The sequencer and its windows
 
 The **journal sequencer** is a small state machine in front of the existing
 `RecoveryJournal` (which stays single-threaded behind it):
 
-- Writers deposit `(kind, key, value)` intents into a bounded lock-protected
-  ring and wait on a sequence.
-- A **leader** (the depositing writer that finds no sync in flight — flat
-  combining, no dedicated goroutine) drains the ring: one `AppendBatch` with
-  the group generation, one `Sync(journalPowerSafe)`, then wakes every waiter
-  whose record the sync covered.
+- Each writer appends its own redo record under `c.writer`, increments the
+  sequencer's monotonic deposited ticket, releases `c.writer`, and waits for
+  that ticket. There is no intent ring and independent mutations are not
+  reframed into `AppendBatch`.
+- The first waiter that finds no sync in flight becomes the **leader**. After
+  any configured pre-capture linger, it captures the highest deposited ticket,
+  issues one `Sync(journalPowerSafe)` outside `c.writer`, advances `synced` to
+  the captured ticket, and wakes every covered waiter. This is flat combining:
+  no dedicated goroutine and no handoff on the uncontended path.
 - **Windows are natural, not timed.** While a sync is in flight, arrivals
-  queue; the next leader takes everything queued. The device's own sync
-  latency is the window: roughly 28-40 µs at ordinary-sync class and 4 ms at
-  power-safe — the slower the fence, the bigger the group, which is exactly
-  the right self-tuning. This mirrors the committer's own measured lesson:
+  append their own records and wait; the next leader covers them. The device's
+  latency is the window. Historical whole-mutation latency is roughly 28–40 µs
+  at ordinary-sync class and 4 ms at power-safe; phase 0 must isolate the
+  current fence component. The slower the fence, the bigger the group, which
+  is exactly the right self-tuning. This mirrors the committer's own measured
+  lesson:
   "how many generations are queued when the worker picks one up" decides
   group size, not any configured limit (verified comment on
   `Options.GroupLimit`).
@@ -254,27 +260,19 @@ The **journal sequencer** is a small state machine in front of the existing
   escalates to a checkpoint exactly as `ensurePrimaryBatchJournalRoom` does
   today, and the depositors re-enter after the recycle.
 - **Failure: poison the group, die-don't-retry.** An append or sync error
-  poisons via `poisonJournalLocked` (unchanged sticky semantics); every
-  waiter in the group and every later depositor gets the persistence error.
+  poisons the journal and group with the same sticky error; every waiter in the
+  group and every later depositor gets the persistence error.
   No waiter can be acknowledged out of a failed group.
 
-### 5.3 What `CommitCoalesce` becomes
+### 5.3 What `CommitCoalesce` is now
 
-`CommitCoalesce` configured the *committer's* fence-sharing window — a knob
-for the retired chain-fence sync path. On the primary graph nothing on the
-mutation path waits on the committer fence (verified: sync-lane outer
-generation stays zero, `waitPublished` is never armed on the canonical path),
-so the knob is vestigial there. Disposition (formats and APIs are breakable
-pre-release):
-
-- The committer keeps `CoalesceDelay` internally for the checkpoint flush it
-  still owns; the public `Options.CommitCoalesce` is **repurposed as the
-  optional upper bound on a journal group window**: zero (default) =
-  natural windows only; a positive value lets a leader linger up to that long
-  after its sync completes if the ring is non-empty, trading acknowledged
-  latency for group size. Expected useful only at power-safe, where the fence
-  is so expensive that a bounded linger is nearly free
-  **(projection: decided by the phase-1b power-safe lane sweep at 0/0.5/1 ms)**.
+`Options.CommitCoalesce` already bounds both the committer's checkpoint
+coalescing delay and the buffered-journal leader's optional grouping linger.
+Zero, the default, adds no intentional wait. A positive value makes the leader
+sleep **before** it captures `deposited` and starts the sync, trading
+acknowledgement latency for a larger covering prefix. It has no effect on the
+journal-before-publish `DurabilitySync` path; phase 1b must decide its own
+power-safe grouping policy.
 
 ### 5.4 Lane orderings under grouping (unchanged invariants)
 
@@ -286,7 +284,7 @@ pre-release):
   outside. A checkpoint racing between deposit and sync makes the record
   redundant, not lost: the recycle epoch bumps, and waiters whose generation
   ≤ the new durable root complete immediately (their durability came from the
-  root; verified analogue: `journalAckLocked`'s full-journal fallback counts
+  root; `journalDepositLocked`'s full-journal fallback counts
   the ack against the chain lane today).
 - **DurabilitySync:** stage everything fallible, deposit, **wait for the
   group sync, then publish**. Visibility strictly follows durability for
@@ -311,9 +309,8 @@ try-acquire the publish lock; the holder drains a bounded publish queue and
 installs everyone's deposits as one group under ONE generation (the max birth
 ticket, §4.2), building one `fileStoreState` per group instead of one per
 mutation (an allocation-rate improvement over today). An uncontended writer
-publishes its own deposit inline with no handoff, so the single-writer hot
-path (412 ns in-place acks) keeps its exact instruction sequence
-**(gate: single-writer regression ≤ 3 %)**.
+publishes its own deposit inline with no handoff; the gate is a single-writer
+regression of at most 3%.
 
 Deposits are plain data: router row updates `(rank, ref, generation)`, doc
 count delta, FileEnd high-water, volatile refs to retire, exact-index
@@ -366,10 +363,11 @@ ensure-then-reroute discipline `ensureBufferedPrimaryMutationCapacity`
 implements today, lifted to the gate.
 
 **Why a single root publisher and not a root-publication pipeline:** the
-durable root advance costs one checkpoint (330–355 µs buffered) per 64+
-mutations and is off every steady-state path; pipelining it buys back a cost
-that is already amortized to ~5 µs/op, while a pipeline would need per-shard
-durable cuts and a k-way `primaryCheckpointBase`. Rejected (§12).
+current whole-checkpoint p50 is 28.2–34.3 µs at a CP64 acknowledged-mutation
+threshold, about 0.44–0.54 µs per scheduled mutation at the median. Pipelining
+that already-amortized cost would require per-shard durable cuts and a k-way
+`primaryCheckpointBase`; checkpoint p99 remains a separate latency gate.
+Rejected (§12).
 
 ## 7. Reader composition
 
@@ -496,37 +494,38 @@ guarantee intact (single-writer numbers, zero read-path deltas, crash sweeps).
 Gates compare same-harness, same-client-count rows — competitor 8-client rows
 are measured in phase 0, since RESULTS.md rows are single-client.
 
-- **Phase 0 — concurrent harness lanes.** `mixedsuite`/`mixed` grow a
-  `-clients=N` axis (1 and 8 first; 64 later); all five engines measured on
-  both; repetition/isolation discipline unchanged. *Gates:* 10-rep medians
-  with the existing cross-run drift bound; vibedb single-client rows within
-  5 % of RESULTS.md (harness overhead audit).
-- **Phase 1 — group-committed acknowledgements, existing single writer.**
-  The journal sequencer (§5.2) behind `journalAckLocked`: append intent
-  deposited under `c.writer`, sync shared by a leader outside it. No
-  sharding, no batch-record requirement yet (individual records sharing one
-  sync is sufficient and smallest). This attacks the ordinary-sync loss
-  directly: apply stays ~4.7 µs serialized, sync amortizes 32.5/N µs.
-  *Gates:* ordinary-sync ycsb-a ≥ **55 k ops/s at 8 clients** (stretch:
-  ≥ 60 k, past Badger's single-client 59.7 k; the hard comparison is
-  Badger's own 8-client row); single-client ordinary-sync ≥ 17 k (≤ 5 %
-  regression); crash matrix extended with §9's windows 1/3/4, zero
-  acknowledged loss.
+- **Phase 0 — concurrent harness lanes.** Use the existing recorded
+  `-clients=N` axis to run and publish 1- and 8-client rows first, then 64;
+  all five engines use the same repetition/isolation discipline. *Gates:*
+  10-rep medians with the existing cross-run drift bound; vibedb single-client
+  rows within 5% of RESULTS.md (harness overhead audit).
+- **Phase 1 — landed: group-committed acknowledgements, existing single
+  writer.** Each published mutation appends its own record under `c.writer`;
+  the covering sync is flat-combined outside it (§5.2). No tablet sharding or
+  independent-entry batch framing was required. Multi-caller durability,
+  poison, recycle, and race tests are in
+  `store_file_journal_group_test.go`. *Remaining publication gate:* current
+  one- and eight-client ordinary-sync rows for vibedb, Badger, and SQLite,
+  with vibedb single-client within 5% of the phase-0 baseline and the
+  eight-client row compared against the same-client competitor rows.
 - **Phase 1b — sync-lane group fence (the combiner front door).**
   DurabilitySync callers deposit whole mutation intents; a combiner drains:
   stage k, one batch record, one `Sync(powerSafe)`, publish k, wake k.
   Uses the batch-record framing and generalizes
   `journalBatchBeforePublishLocked` to independent entries. *Gates:*
-  power-safe ycsb-a ≥ **1.5 k ops/s at 8 clients** (≥ 4× single-client 378;
-  ceiling ~2 k at the 4.05 ms fence) and ≥ SQLite's 8-client row;
+  power-safe ycsb-a ≥ **1.5 k ops/s at 8 clients** (about 4× the historical
+  single-client 394; ceiling ~2 k at the 4.05 ms fence) and ≥ SQLite's
+  8-client row;
   visibility-follows-durability test: no reader observes any group member
   before the group record is durable; single-client power-safe not regressed.
 - **Phase 2 — parallel staging (tablet tokens + grouped publish).**
   `writerGate` + tokens + shard frames (§4.2), publish leader (§6.1),
   checkpoint escalation (§6.3). Unindexed collections only; indexed and
-  `Update` take the exclusive gate. *Gates:* buffered ycsb-a ≥ **300 k at 8
-  clients**; churn ≥ **316 k at 8 clients** (take Badger's crown); ycsb-b
-  ≥ 1.2 M at 8 clients; single-writer buffered within 3 % (ycsb-a ≥ 190 k);
+  `Update` take the exclusive gate. *Gates:* single-client buffered stays
+  within 3% of current results (YCSB-A ≥270,196, churn ≥431,655,
+  YCSB-B ≥1,646,446); each eight-client row improves on its phase-0
+  eight-client baseline and is compared with the competitor's measured
+  eight-client row;
   epoch stress test extended to N writers, race-detector clean; in-workload
   point-read p50 unchanged (0.33–0.38 µs); publish-section occupancy < 15 %
   at 8 writers (validates the serialized-publish bet).
@@ -549,11 +548,12 @@ are measured in phase 0, since RESULTS.md rows are single-client.
 - **Per-tablet journals with merge-by-generation recovery.** Rejected for
   cross-tablet batch atomicity (the one-CRC argument does not survive file
   splitting), device-global power-safe fences (parallel `F_FULLFSYNC` buys
-  nothing), k-way recycle floors against one durable root, and because group
-  commit on one stream already pushes the sync below the apply cost (§5.1).
+  nothing), k-way recycle floors against one durable root, and because one
+  stream can group acknowledgements without adding recovery streams (§5.1).
 - **Per-tablet writer goroutines behind a router dispatcher.** A mandatory
-  goroutine hop on a 412 ns hot path, bounded queues that either allocate or
-  add ring management, and no correctness benefit over caller-held tokens.
+  goroutine hop is material against the current sub-microsecond buffered
+  update p50, bounded queues either allocate or add ring management, and
+  neither adds a correctness benefit over caller-held tokens.
   Combining is only needed where sharing is (fence, publish) — so it lives
   there, flat-combining style, not in front of the tablet work.
 - **PALM-style epoch publisher rewriting shared pages per epoch** (the
@@ -569,9 +569,9 @@ are measured in phase 0, since RESULTS.md rows are single-client.
   read-amplification consequences, against the standing zero-read-path-delta
   gate.
 - **Root-publication pipeline / sharded checkpoints.** Adds k-way
-  `primaryCheckpointBase` and per-shard durable cuts to save ~5 µs/op of
-  already-amortized checkpoint cost (§6.3). Revisit only if checkpoint pauses
-  fail a latency gate at 64 clients.
+  `primaryCheckpointBase` and per-shard durable cuts to attack only
+  ~0.44–0.54 µs per scheduled mutation at current median CP64 cost (§6.3).
+  Revisit only if checkpoint pauses fail a latency gate at 64 clients.
 - **Sharded structural transactions.** Structurals are rare, checkpoint-priced
   and correctness-critical (double-retire history); stop-the-world is the
   simplest argument that stays true. Deferred until p99 evidence, not
@@ -592,8 +592,9 @@ are measured in phase 0, since RESULTS.md rows are single-client.
 
 - **Same-tablet writers serialize.** Per-key linearizability comes from the
   tablet token, so a workload hammering one tablet degrades to single-writer
-  throughput plus group-committed acks — which is the correct floor, and
-  phase 1 means that floor already beats today's number.
+  throughput plus the already-landed group-committed acknowledgements. That is
+  the correct floor; current one- and eight-client ordinary-sync publication
+  still decides its competitive position.
 - **The sync lane's token-hold spans the fence.** At power-safe, a tablet is
   write-blocked for ~4 ms per group containing it. Unavoidable under
   visibility-follows-durability; the design's answer is that cross-tablet

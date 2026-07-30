@@ -1,92 +1,103 @@
 # Performance
 
-The current competitive snapshot was measured on 2026-07-30 from clean commit
-`d714d63e1c48fc7c8e3021cf27675712d08a04fa`.
+The current buffered-visible snapshot was measured on 2026-07-31 host-local
+time from clean engine commit
+`0a593f513663b66e631853d1352edf1a74b7a8a6`. Disk and footprint were
+regenerated from clean benchmark-verification commit
+`3fbcd8a8c79f076adce682a121131b1fbc11fe54`.
 
-The complete source tables, competitor versions, commits, corpus definitions,
-and commands live in
+The summary tables, competitor versions, commits, corpus definitions, and
+command templates live in
 [bench/competitive/RESULTS.md](../bench/competitive/RESULTS.md). This page is
 the short reading guide.
 
 ## Published snapshot
 
 Throughput is total operations per second, median of ten isolated repetitions
-on an Apple M4 Max. Every workload uses 10,000 documents and checkpoints after
-64 acknowledged mutations.
+on an Apple M4 Max. Every workload uses 10,000 documents and a CP64
+acknowledged-mutation threshold.
 
-Each result cell is **vibedb / SQLite**:
+Current buffered-visible medians:
 
-| Workload | Buffered-visible | Ordinary-sync | Power-safe |
+| Workload | vibedb | Badger | SQLite |
 | --- | ---: | ---: | ---: |
-| YCSB-A | 182,590 / 94,134 | 10,138 / 28,790 | 394 / 382 |
-| YCSB-B | 1,105,691 / 275,950 | 177,810 / 181,062 | 4,175 / 3,728 |
-| YCSB-F | 171,480 / 83,182 | 9,860 / 34,737 | 436 / 392 |
-| Churn | 244,114 / 118,515 | 18,016 / 51,866 | 607 / 518 |
-| Scan mix | 248,194 / 107,244 | 18,380 / 62,592 | 829 / 765 |
+| YCSB-A | 278,553 | **313,682** | 114,072 |
+| YCSB-B | **1,697,367** | 1,092,690 | 326,279 |
+| YCSB-F | 269,938 | **289,320** | 100,899 |
+| Churn | **445,005** | 401,636 | 147,831 |
+| Scan mix | 276,420 | **309,899** | 131,560 |
 
-The columns are separate durability lanes:
+vibedb is 2.1-5.2x SQLite, leads YCSB-B by 55% and churn by 10.8%,
+and trails Badger by 6.7-11.2% on the other three aggregate mixes. Point
+read p50 is 0.333-0.334 µs, update p50 is 0.916-0.958 µs, and
+delete+restore p50 is 1.25 µs. Checkpoint p50 is 28.2-34.3 µs with zero
+forced checkpoints; workload median p99 ranges from 38 µs to 1.03 ms.
 
-- **Buffered-visible:** mutations are visible immediately and become durable at
-  the scheduled checkpoint. vibedb is 1.9-4.0x SQLite.
-- **Ordinary-sync:** every successful mutation crosses an ordinary filesystem
-  boundary. vibedb is near SQLite on read-heavy YCSB-B and trails on the other
-  mixes; Badger leads this lane.
-- **Power-safe:** every successful mutation crosses the strongest Darwin
-  device-cache boundary. Only vibedb and SQLite make that promise in this
-  harness; vibedb leads SQLite by 3-17%.
+Ordinary-sync and power-safe are separate guarantee classes. Their previous
+clean `d714d63` tables remain in
+[RESULTS.md](../bench/competitive/RESULTS.md), explicitly marked historical,
+until complete current suites are rerun. They are not combined with the table
+above.
 
-Do not compare values across lanes as if durability were unchanged. The current
-single-fence synchronous path is included in this snapshot.
-
-## Current unified-format development gates
+## Current unified-format space
 
 The strict class-5 churn harness keeps 100,000 documents live through 200,000
-uniform random mutations, checkpoints every 64 acknowledged mutations, samples
-every 5,000 mutations, verifies the final corpus, and requires zero
-pressure-forced checkpoints. These rows are current development measurements;
-they are not mixed into the older clean cross-engine publication above.
+acknowledged state changes. Eighty percent of random choices are one-change
+replacements and the rest are indivisible two-change delete+reinsert pairs.
+Checkpoint and sample cadences are thresholds, so a pair may cross one by a
+single change. The harness verifies every final key and byte outside the timed
+mutation interval and requires zero pressure-forced checkpoints.
 
 Disk cells are **apparent / allocated MiB**.
 
-| Measurement | Result |
-| --- | ---: |
-| Sustained churn, low cardinality | 11.12 / 11.52, flat through the final maintenance floor |
-| Sustained churn, high cardinality | 24.59 / 25.52, flat through the final maintenance floor |
-| Unified primary bulk, low / high cardinality | 6.50 / — · 16.27 / — |
+| Measurement | Low cardinality | High cardinality |
+| --- | ---: | ---: |
+| vibedb paired bulk | **7.50 / 8.02** | **17.27 / 18.02** |
+| sustained churn, steady plateau | **15.48 / 16.02** | 37.00 / 37.02 |
+| after offline repack | **7.50 / 8.02** | **17.27 / 18.02** |
+| SQLite after VACUUM | 26.23 / 26.23 | 26.23 / 26.23 |
+| Snappy Pebble after compaction (median of 3) | 58.57 / 55.25 | 78.32 / 75.12 |
 
-The shape-matched low- and high-cardinality corpora are both 23.73 MiB raw.
-The unified primary graph measures 68.16 and 170.56 bytes/document,
-respectively, and is the only production leaf representation. Allocated-file
-cells await the next complete competitive publication.
-The replay-through-`Put` diagnostic still reaches the primary macro-tablet
-split limit at 100,000 newly inserted keys; it is not presented as a footprint
-result.
+The high-cardinality steady Vibe high-water is larger than SQLite before
+maintenance, but it is flat rather than growing. It is reusable online
+capacity; offline out-of-place repack lowers both apparent and allocated bytes
+and produces the smallest maintenance floor in both cardinalities. The
+benchmark's source-pair removal is not a production crash-atomic cutover.
+
+The shape-matched corpora are both 23.73 MiB raw. Their gzip-9 sizes are
+1.84 MiB and 8.04 MiB. The full vibedb pair includes its 1 MiB-capacity
+recovery journal plus a 1 KiB dual header; the core class-5 graph is 68.16 and
+170.56 bytes/document before that pairing overhead.
+
+Why compactness is strong: each leaf stores repeated canonical JSON skeletons
+once, dictionaries repeated value spellings, and represents each templated
+row as typed tokens for the skeleton's holes. Keys and row boundaries remain
+in the succinct ordered envelope. A shape templates only when doing so saves
+bytes; otherwise it remains a trivial row. This is one adaptive representation,
+not a compact/verbatim store-mode choice and not a generic gzip claim.
+
+Optional compression is reported separately. With pinned Snappy defaults,
+Pebble's bulk image is 34.0/41.0 MiB low/high and its post-compaction churn
+median is 58.57/78.32 MiB apparent; vibedb remains 7.50/17.27 MiB without
+adding a block codec.
+
+## Current CPU and scan gates
 
 The leaf-codec CPU regression is closed by a plan-stability certificate that
 patches an admitted class-5 page only when the result is byte-identical to a
 full planner fold. Its leaf microbenchmark is 2.12–2.13 µs with zero
 allocations, versus 240–242 µs for render/replan/encode (about 113× faster).
-The bounded journal-delta checkpoint removes the common physical leaf/root
-copy: on three isolated CP64 churn runs, checkpoint p50 is 76.8 µs at low
-cardinality and 65.5 µs at high cardinality, with zero pressure-forced
-persistence checkpoints. Median throughput is 42,667 and 40,710 ops/s.
-The remaining tail is explicit rather than hidden: p95 is 7.56 and 7.93 ms
-when a non-aligned overlay fold requires the physical fallback. Eliminating
-that fallback tail is the next checkpoint gate.
+The common checkpoint appends one bounded journal batch and ordinary sync over
+the unchanged physical root. Journal recycle now preserves the requested
+checkpoint strength: ordinary filesystem mode no longer pays an accidental
+Darwin `F_FULLFSYNC`, while power-safe mode still does.
 
-The churn footprint includes the paired preallocated checkpoint journal, while
-the bulk row above is the core store-file image. The low/high corpora remain
-23.73 MiB raw.
-
-## Unified scan development gates
-
-These are local codec/runtime microbenchmarks, not cross-engine published
-results. On the Apple M4 Max used for the 2026-07-30 unification work:
+Local scan microbenchmarks on the Apple M4 Max:
 
 | Gate | Result |
 | --- | ---: |
 | Ordered class-5 scan, 100k three-scalar documents | 24.58 ns/document, 0 allocs |
-| Competitive ~250 B scan, low / high cardinality | 98.60 / 101.1 ns/document, 0 allocs |
+| Competitive ~250 B scan, low / high cardinality | 88.07 / 89.48 ns/document, 0 allocs |
 | Masked scan, 1 / 4 / 16 selected rows per leaf | 163 ns / 443–448 ns / 1.47 µs |
 | Masked scan, dense 153-row leaf | 10.88–11.10 µs, within 2% of sequential |
 
@@ -100,8 +111,11 @@ class-5 renderer and retains its splice buffer across passes.
 A replacement table must:
 
 1. name the exact commit, machine, OS, Go and competitor versions;
-2. run each engine in an isolated process and publish repeated-sample medians;
-3. verify every key and scanned byte before measurement;
+2. run timing/throughput engines in isolated processes and publish
+   repeated-sample medians; label disk/footprint sample counts and any medians
+   explicitly;
+3. validate corpus equivalence and final state outside timed intervals, and
+   make timed scans consume every returned byte;
 4. match mutation semantics, durability boundaries, checkpoint cadence, and
    client count;
 5. include requested checkpoint and maintenance stalls in elapsed time;
@@ -132,6 +146,6 @@ go build -o /tmp/vibedb-mixedsuite ./cmd/mixedsuite
   -checkpoint-mutations=64 -repetitions=10 -output=mixed.tsv
 ```
 
-Use the complete lane matrix in
+Use the complete command matrix in
 [RESULTS.md](../bench/competitive/RESULTS.md#reproduction) for a publishable
 refresh.
