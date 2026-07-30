@@ -35,7 +35,7 @@ const (
 	// keeps physical drains out of checkpoint p95 while adding only 512 KiB to
 	// the paired store footprint.
 	recoveryJournalDeltaMinCapacityBytes = uint64(1) << 20
-	recoveryJournalMaxCapacityBytes = storeio.RecoveryJournalMaxCapacityBytes
+	recoveryJournalMaxCapacityBytes      = storeio.RecoveryJournalMaxCapacityBytes
 )
 
 // journalFailureBox carries the sticky journal poison behind an atomic pointer.
@@ -657,31 +657,52 @@ func (c *Collection) bufferedJournalDeltaStateEligible(
 // watermark; the durable watermark remains unchanged until an explicit Flush
 // fences the journal. complete=false is a conservative physical-fallback
 // signal, including a gap, structural staging, or bounded journal capacity.
-func (c *Collection) appendBufferedJournalDeltaLocked(
+func (c *Collection) prepareBufferedJournalDeltaLocked(
 	after, target uint64,
-) (complete bool, err error) {
+) (
+	entries []storeio.RecoveryBatchEntry,
+	plan storeio.RecoveryBatchPlan,
+	complete bool,
+	err error,
+) {
 	if target == after {
-		return true, nil
+		return nil, storeio.RecoveryBatchPlan{}, true, nil
 	}
 	if target < after ||
 		after < c.journalDeltaGeneration.Load() {
-		return false, storeio.ErrGenerationOrder
+		return nil, storeio.RecoveryBatchPlan{}, false,
+			storeio.ErrGenerationOrder
 	}
 	if !c.bufferedJournalDeltaStateEligible(after) {
-		return false, nil
+		return nil, storeio.RecoveryBatchPlan{}, false, nil
 	}
 	entries, covered, entryErr :=
 		c.primaryUnifiedOverlay.checkpointEntries(
 			c.journalDeltaEntries[:0], after, target,
 		)
 	if entryErr != nil {
-		return false, entryErr
+		return nil, storeio.RecoveryBatchPlan{}, false, entryErr
 	}
-	if !covered || len(entries) == 0 ||
-		!c.journal.FitsBatch(entries) {
-		return false, nil
+	if !covered || len(entries) == 0 {
+		return nil, storeio.RecoveryBatchPlan{}, false, nil
 	}
-	if _, appendErr := c.journal.AppendBatch(target, entries); appendErr != nil {
+	plan, planErr := c.journal.PrepareBatch(entries)
+	if planErr != nil {
+		return nil, storeio.RecoveryBatchPlan{}, false, planErr
+	}
+	if !c.journal.PreparedBatchFits(plan) {
+		return nil, storeio.RecoveryBatchPlan{}, false, nil
+	}
+	return entries, plan, true, nil
+}
+
+func (c *Collection) appendPreparedBufferedJournalDeltaLocked(
+	target uint64, entries []storeio.RecoveryBatchEntry,
+	plan storeio.RecoveryBatchPlan,
+) (complete bool, err error) {
+	if _, appendErr := c.journal.AppendPreparedBatch(
+		target, entries, plan,
+	); appendErr != nil {
 		if errors.Is(appendErr, storeio.ErrRecoveryJournalFull) {
 			return false, nil
 		}
@@ -689,10 +710,21 @@ func (c *Collection) appendBufferedJournalDeltaLocked(
 	}
 	c.journalDeltaAppendedGeneration.Store(target)
 	c.journalDeltaRecords.Add(uint64(len(entries)))
-	c.journalDeltaBytes.Add(uint64(storeio.RecoveryBatchRecordPaddedSize(
-		c.journal.Header().SectorSize, entries,
-	)))
+	c.journalDeltaBytes.Add(uint64(plan.PaddedSize()))
 	return true, nil
+}
+
+func (c *Collection) appendBufferedJournalDeltaLocked(
+	after, target uint64,
+) (complete bool, err error) {
+	entries, plan, complete, prepareErr :=
+		c.prepareBufferedJournalDeltaLocked(after, target)
+	if prepareErr != nil || !complete || target == after {
+		return complete, prepareErr
+	}
+	return c.appendPreparedBufferedJournalDeltaLocked(
+		target, entries, plan,
+	)
 }
 
 // carryBufferedJournalDeltaBeforeFoldLocked preserves a complete non-aligned
@@ -741,7 +773,7 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 // paid at an explicit Flush rather than by an otherwise-unrequested mutation
 // checkpoint.
 func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
-	pending []storeio.RecoveryBatchEntry,
+	pendingBytes int,
 ) bool {
 	if !c.bufferedJournalDeltaLane() {
 		return false
@@ -770,12 +802,6 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 	// record and byte arenas are the exact admissibility bounds, so this is a
 	// conservative byte calculation without constructing dummy entries.
 	header := c.journal.Header()
-	currentBytes := 0
-	if len(pending) != 0 {
-		currentBytes = storeio.RecoveryBatchRecordPaddedSize(
-			header.SectorSize, pending,
-		)
-	}
 	futureBytes := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		header.SectorSize, primaryUnifiedOverlayRecords,
 		len(c.primaryUnifiedOverlay.arena),
@@ -785,7 +811,7 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 		return true
 	}
 	remaining := header.Capacity - cursor
-	current := uint64(currentBytes)
+	current := uint64(pendingBytes)
 	future := uint64(futureBytes)
 	return current > remaining || future > remaining-current
 }
@@ -843,7 +869,7 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		if appendedAfter != durableAfter {
 			return true, storeio.ErrGenerationOrder
 		}
-		if c.bufferedJournalDeltaPhysicalDrainNeeded(nil) {
+		if c.bufferedJournalDeltaPhysicalDrainNeeded(0) {
 			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
 		}
 		return true, nil
@@ -852,7 +878,7 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		appendedAfter < durableAfter {
 		return true, storeio.ErrGenerationOrder
 	}
-	if c.bufferedJournalDeltaPhysicalDrainNeeded(nil) {
+	if c.bufferedJournalDeltaPhysicalDrainNeeded(0) {
 		return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
 	}
 	// The cheap cut may coexist with resident exact-index deltas: recovery
@@ -870,21 +896,20 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		return false, nil
 	}
 	if target > appendedAfter {
-		entries, covered, entryErr :=
-			c.primaryUnifiedOverlay.checkpointEntries(
-				c.journalDeltaEntries[:0], appendedAfter, target,
-			)
-		if entryErr != nil {
-			return true, entryErr
+		entries, plan, complete, prepareErr :=
+			c.prepareBufferedJournalDeltaLocked(appendedAfter, target)
+		if prepareErr != nil {
+			return true, prepareErr
 		}
-		if !covered || len(entries) == 0 {
+		if !complete {
 			return false, nil
 		}
-		if c.bufferedJournalDeltaPhysicalDrainNeeded(entries) {
+		if c.bufferedJournalDeltaPhysicalDrainNeeded(plan.PaddedSize()) {
 			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
 		}
-		complete, appendErr :=
-			c.appendBufferedJournalDeltaLocked(appendedAfter, target)
+		complete, appendErr := c.appendPreparedBufferedJournalDeltaLocked(
+			target, entries, plan,
+		)
 		if appendErr != nil {
 			return true, appendErr
 		}

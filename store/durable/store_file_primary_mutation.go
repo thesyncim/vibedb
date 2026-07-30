@@ -2946,9 +2946,13 @@ func (c *Collection) extractNeverDurableRetirements(start int) {
 }
 
 // neverDurableRetirementOutput caps the optimization by both its fixed scratch
-// and the allocator's remaining authoritative free-set room. Candidates beyond
-// that bound stay in the reclaimer and take the ordinary fallback-generation
-// path; extracting them would make the next merge fail after publication.
+// and the allocator's remaining authoritative free-set room. The transaction
+// may already have consumed whole reusable entries whose zero lengths are not
+// removed until finalizeReusable; counting those entries as still live is a
+// conservative O(1) bound. It can delay a candidate by one publication, while
+// scanning the entire free set here would tax every mutation merely to recover
+// room that finalize creates immediately afterward. Candidates beyond the
+// bound stay in the reclaimer and take the ordinary fallback-generation path.
 func (c *Collection) neverDurableRetirementOutput() []storeio.FreeExtent {
 	if c == nil {
 		return nil
@@ -2956,7 +2960,7 @@ func (c *Collection) neverDurableRetirementOutput() []storeio.FreeExtent {
 	used := len(c.retirementAbsorbed)
 	room := min(
 		cap(c.retirementAbsorbed)-used,
-		c.freeSetLimit-c.liveReusable()-used,
+		c.freeSetLimit-len(c.reusable)-used,
 	)
 	if room < 0 {
 		room = 0

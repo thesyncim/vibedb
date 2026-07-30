@@ -311,15 +311,71 @@ func checkedRecoveryBatchRecordPaddedSize(
 	if !ok {
 		return 0, false
 	}
+	return checkedRecoveryBatchRecordPaddedSizeForBody(sectorSize, body)
+}
+
+func checkedRecoveryBatchRecordPaddedSizeForBody(
+	sectorSize uint32, body uint64,
+) (int, bool) {
 	raw := uint64(
 		RecoveryJournalRecordPrefixSize +
 			RecoveryJournalRecordTrailerSize,
 	)
-	raw, ok = checkedSizeAdd(raw, body, uint64(maxIntValue))
+	raw, ok := checkedSizeAdd(raw, body, uint64(maxIntValue))
 	if !ok {
 		return 0, false
 	}
 	return checkedRecoveryPadRaw(sectorSize, raw)
+}
+
+// RecoveryBatchPlan is an opaque, allocation-free sizing result for one batch
+// record. Preparing once lets a caller use the same validated layout for its
+// capacity decision, append, and byte accounting instead of rescanning every
+// entry at each step. Its fields are deliberately private: only this package
+// can mint a layout accepted by AppendPreparedBatch.
+type RecoveryBatchPlan struct {
+	sectorSize uint32
+	entryCount int
+	bodyLen    uint64
+	padded     int
+}
+
+// PaddedSize returns the exact sector-padded bytes the prepared batch consumes.
+func (p RecoveryBatchPlan) PaddedSize() int { return p.padded }
+
+func prepareRecoveryBatch(
+	sectorSize uint32, entries []RecoveryBatchEntry,
+) (RecoveryBatchPlan, bool) {
+	body, ok := checkedRecoveryBatchBodyLen(entries)
+	if !ok {
+		return RecoveryBatchPlan{}, false
+	}
+	padded, ok := checkedRecoveryBatchRecordPaddedSizeForBody(
+		sectorSize, body,
+	)
+	if !ok {
+		return RecoveryBatchPlan{}, false
+	}
+	return RecoveryBatchPlan{
+		sectorSize: sectorSize,
+		entryCount: len(entries),
+		bodyLen:    body,
+		padded:     padded,
+	}, true
+}
+
+func (p RecoveryBatchPlan) validFor(
+	sectorSize uint32, entryCount int,
+) bool {
+	if p.sectorSize != sectorSize || p.entryCount != entryCount ||
+		p.entryCount <= 0 || p.bodyLen > uint64(^uint32(0)) ||
+		p.padded <= 0 {
+		return false
+	}
+	padded, ok := checkedRecoveryBatchRecordPaddedSizeForBody(
+		p.sectorSize, p.bodyLen,
+	)
+	return ok && padded == p.padded
 }
 
 func recoveryBatchEntryArenaFits(entryCount uint64) bool {
@@ -536,28 +592,28 @@ func EncodeRecoveryRecord(
 func EncodeRecoveryBatchRecord(
 	dst []byte, sectorSize uint32, rec RecoveryRecord,
 ) (int, error) {
-	if rec.Sequence == 0 || rec.Generation == 0 {
-		return 0, fmt.Errorf("%w: zero sequence or generation", ErrInvalidWrite)
-	}
-	if len(rec.Entries) == 0 ||
-		uint64(len(rec.Entries)) > uint64(^uint32(0)) {
-		return 0, fmt.Errorf("%w: batch entry count", ErrInvalidWrite)
-	}
-	body, ok := checkedRecoveryBatchBodyLen(rec.Entries)
-	if !ok {
-		return 0, fmt.Errorf("%w: batch body length", ErrInvalidWrite)
-	}
-	padded, ok := checkedRecoveryBatchRecordPaddedSize(
-		sectorSize, rec.Entries,
-	)
+	plan, ok := prepareRecoveryBatch(sectorSize, rec.Entries)
 	if !ok {
 		return 0, fmt.Errorf("%w: batch record length", ErrInvalidWrite)
 	}
-	if len(dst) < padded {
-		return 0, fmt.Errorf("%w: batch record buffer has %d bytes, need %d",
-			ErrInvalidWrite, len(dst), padded)
+	return encodeRecoveryBatchRecordPrepared(dst, sectorSize, rec, plan)
+}
+
+func encodeRecoveryBatchRecordPrepared(
+	dst []byte, sectorSize uint32, rec RecoveryRecord,
+	plan RecoveryBatchPlan,
+) (int, error) {
+	if rec.Sequence == 0 || rec.Generation == 0 {
+		return 0, fmt.Errorf("%w: zero sequence or generation", ErrInvalidWrite)
 	}
-	buf := dst[:padded]
+	if !plan.validFor(sectorSize, len(rec.Entries)) {
+		return 0, fmt.Errorf("%w: batch plan", ErrInvalidWrite)
+	}
+	if len(dst) < plan.padded {
+		return 0, fmt.Errorf("%w: batch record buffer has %d bytes, need %d",
+			ErrInvalidWrite, len(dst), plan.padded)
+	}
+	buf := dst[:plan.padded]
 	clear(buf)
 	binary.LittleEndian.PutUint32(buf[0:4], recoveryRecordMagic)
 	binary.LittleEndian.PutUint16(buf[4:6], recoveryRecordKindBatch)
@@ -565,8 +621,9 @@ func EncodeRecoveryBatchRecord(
 	binary.LittleEndian.PutUint64(buf[8:16], rec.Sequence)
 	binary.LittleEndian.PutUint64(buf[16:24], rec.Generation)
 	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(rec.Entries)))
-	binary.LittleEndian.PutUint32(buf[28:32], uint32(body))
-	cursor := RecoveryJournalRecordPrefixSize
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(plan.bodyLen))
+	cursor := uint64(RecoveryJournalRecordPrefixSize)
+	bodyEnd := cursor + plan.bodyLen
 	for i := range rec.Entries {
 		entry := rec.Entries[i]
 		if entry.Kind != recoveryRecordKindPut &&
@@ -578,18 +635,26 @@ func EncodeRecoveryBatchRecord(
 			uint64(len(entry.Value)) > uint64(^uint32(0)) {
 			return 0, fmt.Errorf("%w: batch entry key or value length", ErrInvalidWrite)
 		}
+		entryEnd := cursor + RecoveryBatchEntryHeaderSize +
+			uint64(len(entry.Key)) + uint64(len(entry.Value))
+		if entryEnd > bodyEnd {
+			return 0, fmt.Errorf("%w: batch plan no longer matches entries", ErrInvalidWrite)
+		}
 		binary.LittleEndian.PutUint16(buf[cursor:cursor+2], entry.Kind)
 		// buf[cursor+2:cursor+4] reserved zero.
 		binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], uint32(len(entry.Key)))
 		binary.LittleEndian.PutUint32(buf[cursor+8:cursor+12], uint32(len(entry.Value)))
 		cursor += RecoveryBatchEntryHeaderSize
-		cursor += copy(buf[cursor:], entry.Key)
-		cursor += copy(buf[cursor:], entry.Value)
+		cursor += uint64(copy(buf[cursor:], entry.Key))
+		cursor += uint64(copy(buf[cursor:], entry.Value))
+	}
+	if cursor != bodyEnd {
+		return 0, fmt.Errorf("%w: batch plan no longer matches entries", ErrInvalidWrite)
 	}
 	checksum := PageChecksum(buf[:cursor])
 	binary.LittleEndian.PutUint32(buf[cursor:cursor+4], checksum)
 	binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], ^checksum)
-	return padded, nil
+	return plan.padded, nil
 }
 
 // DecodeRecoveryRecord validates one record at the start of src against the
@@ -982,13 +1047,39 @@ func (rj *RecoveryJournal) Fits(keyLen, valueLen int) bool {
 // FitsBatch reports whether one batch record carrying entries would fit in the
 // remaining preallocated capacity without a recycle.
 func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
-	padded, ok := checkedRecoveryBatchRecordPaddedSize(
-		rj.header.SectorSize, entries,
-	)
-	if !ok {
+	plan, err := rj.PrepareBatch(entries)
+	if err != nil {
 		return false
 	}
-	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
+	return rj.PreparedBatchFits(plan)
+}
+
+// PrepareBatch validates and sizes one batch without allocating. The returned
+// opaque plan can be reused for the capacity decision, append, and accounting.
+// AppendPreparedBatch still validates every entry while encoding: a body-size
+// change fails closed before any write, while same-size content changes remain
+// safe because framing and CRC are recomputed from the final bytes.
+func (rj *RecoveryJournal) PrepareBatch(
+	entries []RecoveryBatchEntry,
+) (RecoveryBatchPlan, error) {
+	plan, ok := prepareRecoveryBatch(rj.header.SectorSize, entries)
+	if !ok {
+		return RecoveryBatchPlan{}, fmt.Errorf(
+			"%w: batch record length", ErrInvalidWrite,
+		)
+	}
+	return plan, nil
+}
+
+// PreparedBatchFits reports whether a prepared batch fits at the current
+// cursor. A plan minted for another journal geometry fails closed.
+func (rj *RecoveryJournal) PreparedBatchFits(plan RecoveryBatchPlan) bool {
+	if !plan.validFor(rj.header.SectorSize, plan.entryCount) {
+		return false
+	}
+	end, ok := checkedSizeAdd(
+		rj.cursor, uint64(plan.padded), ^uint64(0),
+	)
 	return ok && end <= rj.header.Capacity
 }
 
@@ -1001,18 +1092,31 @@ func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
 func (rj *RecoveryJournal) AppendBatch(
 	generation uint64, entries []RecoveryBatchEntry,
 ) (uint64, error) {
-	padded, ok := checkedRecoveryBatchRecordPaddedSize(
-		rj.header.SectorSize, entries,
-	)
-	if !ok {
-		return 0, fmt.Errorf("%w: batch record length", ErrInvalidWrite)
+	plan, err := rj.PrepareBatch(entries)
+	if err != nil {
+		return 0, err
 	}
-	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
+	return rj.AppendPreparedBatch(generation, entries, plan)
+}
+
+// AppendPreparedBatch appends a batch using a layout returned by PrepareBatch.
+// It preserves AppendBatch's all-or-nothing framing and cursor semantics while
+// eliminating repeated entry-length scans in callers that must preflight fit.
+func (rj *RecoveryJournal) AppendPreparedBatch(
+	generation uint64, entries []RecoveryBatchEntry,
+	plan RecoveryBatchPlan,
+) (uint64, error) {
+	if !plan.validFor(rj.header.SectorSize, len(entries)) {
+		return 0, fmt.Errorf("%w: batch plan", ErrInvalidWrite)
+	}
+	end, ok := checkedSizeAdd(
+		rj.cursor, uint64(plan.padded), ^uint64(0),
+	)
 	if !ok || end > rj.header.Capacity {
 		return 0, ErrRecoveryJournalFull
 	}
-	if cap(rj.scratch) < padded {
-		rj.scratch = make([]byte, padded)
+	if cap(rj.scratch) < plan.padded {
+		rj.scratch = make([]byte, plan.padded)
 	}
 	rec := RecoveryRecord{
 		Sequence:   rj.nextSequence,
@@ -1020,14 +1124,16 @@ func (rj *RecoveryJournal) AppendBatch(
 		Kind:       recoveryRecordKindBatch,
 		Entries:    entries,
 	}
-	if _, err := EncodeRecoveryBatchRecord(rj.scratch[:padded], rj.header.SectorSize, rec); err != nil {
+	if _, err := encodeRecoveryBatchRecordPrepared(
+		rj.scratch[:plan.padded], rj.header.SectorSize, rec, plan,
+	); err != nil {
 		return 0, err
 	}
 	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
-	if _, err := rj.writeAt(rj.scratch[:padded], offset); err != nil {
+	if _, err := rj.writeAt(rj.scratch[:plan.padded], offset); err != nil {
 		return 0, err
 	}
-	rj.cursor += uint64(padded)
+	rj.cursor = end
 	sequence := rj.nextSequence
 	rj.nextSequence++
 	return sequence, nil

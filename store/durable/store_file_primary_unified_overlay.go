@@ -15,7 +15,12 @@ const (
 	primaryUnifiedOverlayRecords = 256
 	primaryUnifiedOverlayBuckets = filePrimaryPendingParentLimit
 	primaryUnifiedOverlayTable   = 512
-	primaryUnifiedOverlayMax     = 1 << 20
+	// The bucket directory stays at <=50% load at the overlay's hard
+	// distinct-bucket limit. Open addressing therefore gives the mutation and
+	// scan lanes a bounded, allocation-free bucket lookup without the previous
+	// record-window rescans (including the quadratic distinct-bucket census).
+	primaryUnifiedOverlayBucketTable = 128
+	primaryUnifiedOverlayMax         = 1 << 20
 
 	primaryUnifiedOverlayPut    = 1
 	primaryUnifiedOverlayDelete = 2
@@ -37,22 +42,44 @@ type primaryUnifiedOverlayRecord struct {
 	generation uint64
 	hash       uint64
 	previous   uint32
-	bucket     uint32
-	keyOffset  uint32
-	valueOff   uint32
-	valueLen   uint32
-	rawDelta   int32
-	keyLen     uint16
-	countDelta int8
-	kind       uint8
-	slot       uint8
-	_          uint8
+	// bucketPrevious links only records for this bucket. The global previous
+	// chain remains the point-lookup hash chain; this second chain makes
+	// per-bucket deltas, fold replay, scans, and version checks independent of
+	// unrelated mutations in the same overlay window.
+	bucketPrevious uint32
+	bucket         uint32
+	keyOffset      uint32
+	valueOff       uint32
+	valueLen       uint32
+	rawDelta       int32
+	keyLen         uint16
+	countDelta     int8
+	kind           uint8
+	slot           uint8
+	_              uint8
+}
+
+// primaryUnifiedOverlayBucket is one open-addressed directory entry. head is
+// the publication word: head==0 means the slot is empty, and publish writes
+// bucket plus the aggregates before storing head. The serialized writer owns
+// updates, while atomics keep lock-free scans and online-index reconciliation
+// race-free.
+type primaryUnifiedOverlayBucket struct {
+	bucket      atomic.Uint32
+	head        atomic.Uint32
+	rawBytes    atomic.Int64
+	rows        atomic.Int32
+	insertSlots [4]atomic.Uint64
 }
 
 type primaryUnifiedOverlay struct {
 	records []primaryUnifiedOverlayRecord
 	heads   []atomic.Uint32
 	arena   []byte
+	buckets [primaryUnifiedOverlayBucketTable]primaryUnifiedOverlayBucket
+	// bucketCount belongs to the writer, but an atomic keeps the directory's
+	// reset/publication protocol explicit alongside count and used.
+	bucketCount atomic.Uint32
 
 	// count and used publish initialized record/arena prefixes for stats and
 	// fold-side traversal. The serialized writer owns reservations; readers
@@ -66,9 +93,11 @@ type primaryUnifiedOverlay struct {
 }
 
 type primaryUnifiedOverlayPrepared struct {
-	index     uint32
-	usedAfter uint32
-	headSlot  uint32
+	index      uint32
+	usedAfter  uint32
+	headSlot   uint32
+	bucketSlot uint32
+	newBucket  bool
 }
 
 func newPrimaryUnifiedOverlay(bytes int) *primaryUnifiedOverlay {
@@ -112,22 +141,64 @@ func (o *primaryUnifiedOverlay) hasPending() bool {
 	return count != 0 && o.records[count-1].generation > o.folded.Load()
 }
 
+func primaryUnifiedOverlayBucketHash(bucket storeio.BucketID) uint32 {
+	// Bucket identities carry tablet bits above the local-id field, so masking
+	// their low bits directly would collide corresponding leaves from every
+	// tablet. This integer finalizer folds all 32 bits before the power-of-two
+	// table mask.
+	value := uint32(bucket)
+	value ^= value >> 16
+	value *= 0x7feb352d
+	value ^= value >> 15
+	value *= 0x846ca68b
+	value ^= value >> 16
+	return value
+}
+
+// bucketSlot returns the matching directory slot, or the first empty slot.
+// Entries are never deleted individually: markFolded clears the whole table,
+// so encountering an empty slot proves the bucket is absent.
+func (o *primaryUnifiedOverlay) bucketSlot(
+	bucket storeio.BucketID,
+) (slot uint32, found bool) {
+	if o == nil {
+		return 0, false
+	}
+	mask := uint32(primaryUnifiedOverlayBucketTable - 1)
+	slot = primaryUnifiedOverlayBucketHash(bucket) & mask
+	for range primaryUnifiedOverlayBucketTable {
+		entry := &o.buckets[slot]
+		if entry.head.Load() == 0 {
+			return slot, false
+		}
+		if entry.bucket.Load() == uint32(bucket) {
+			return slot, true
+		}
+		slot = (slot + 1) & mask
+	}
+	return 0, false
+}
+
+func (o *primaryUnifiedOverlay) pendingBucketHead(
+	bucket storeio.BucketID, folded uint64,
+) uint32 {
+	slot, found := o.bucketSlot(bucket)
+	if !found {
+		return 0
+	}
+	head := o.buckets[slot].head.Load()
+	if head == 0 || int(head) > len(o.records) ||
+		o.records[head-1].generation <= folded {
+		return 0
+	}
+	return head
+}
+
 func (o *primaryUnifiedOverlay) pendingBucket(bucket storeio.BucketID) bool {
 	if o == nil {
 		return false
 	}
-	folded := o.folded.Load()
-	count := int(o.count.Load())
-	for i := count - 1; i >= 0; i-- {
-		record := &o.records[i]
-		if record.generation <= folded {
-			break
-		}
-		if record.bucket == uint32(bucket) {
-			return true
-		}
-	}
-	return false
+	return o.pendingBucketHead(bucket, o.folded.Load()) != 0
 }
 
 // bucketVersion is the generation of the newest visible row-overlay record
@@ -141,16 +212,16 @@ func (o *primaryUnifiedOverlay) bucketVersion(
 		return 0
 	}
 	folded := o.folded.Load()
-	count := min(int(o.count.Load()), len(o.records))
-	for i := count - 1; i >= 0; i-- {
-		record := &o.records[i]
+	head := o.pendingBucketHead(bucket, folded)
+	for head != 0 {
+		record := &o.records[head-1]
 		if record.generation <= folded {
 			break
 		}
-		if record.generation <= generation &&
-			record.bucket == uint32(bucket) {
+		if record.generation <= generation {
 			return record.generation
 		}
+		head = record.bucketPrevious
 	}
 	return 0
 }
@@ -162,18 +233,17 @@ func (o *primaryUnifiedOverlay) pendingBucketDeltas(
 		return 0, 0
 	}
 	folded := o.folded.Load()
-	count := int(o.count.Load())
-	for i := count - 1; i >= 0; i-- {
-		record := &o.records[i]
-		if record.generation <= folded {
-			break
-		}
-		if record.bucket == uint32(bucket) {
-			rawBytes += int(record.rawDelta)
-			rows += int(record.countDelta)
-		}
+	slot, found := o.bucketSlot(bucket)
+	if !found {
+		return 0, 0
 	}
-	return rawBytes, rows
+	entry := &o.buckets[slot]
+	head := entry.head.Load()
+	if head == 0 || int(head) > len(o.records) ||
+		o.records[head-1].generation <= folded {
+		return 0, 0
+	}
+	return int(entry.rawBytes.Load()), int(entry.rows.Load())
 }
 
 // pendingInsertSlots returns every slot claimed by an overlay-native insert
@@ -187,15 +257,18 @@ func (o *primaryUnifiedOverlay) pendingInsertSlots(
 		return occupied
 	}
 	folded := o.folded.Load()
-	count := int(o.count.Load())
-	for i := count - 1; i >= 0; i-- {
-		record := &o.records[i]
-		if record.generation <= folded {
-			break
-		}
-		if record.bucket == uint32(bucket) && record.countDelta > 0 {
-			occupied[record.slot>>6] |= uint64(1) << uint(record.slot&63)
-		}
+	slot, found := o.bucketSlot(bucket)
+	if !found {
+		return occupied
+	}
+	entry := &o.buckets[slot]
+	head := entry.head.Load()
+	if head == 0 || int(head) > len(o.records) ||
+		o.records[head-1].generation <= folded {
+		return occupied
+	}
+	for i := range occupied {
+		occupied[i] = entry.insertSlots[i].Load()
 	}
 	return occupied
 }
@@ -281,32 +354,13 @@ func (o *primaryUnifiedOverlay) prepare(
 			"%w: unified row overlay pressure", storeio.ErrPageCachePinned,
 		)
 	}
-	if !o.pendingBucket(bucket) {
-		var distinct int
-		folded := o.folded.Load()
-		for i := int(index) - 1; i >= 0; i-- {
-			record := &o.records[i]
-			if record.generation <= folded {
-				break
-			}
-			first := true
-			for j := i + 1; j < int(index); j++ {
-				if o.records[j].generation > folded &&
-					o.records[j].bucket == record.bucket {
-					first = false
-					break
-				}
-			}
-			if first {
-				distinct++
-			}
-		}
-		if distinct >= primaryUnifiedOverlayBuckets {
-			return primaryUnifiedOverlayPrepared{}, fmt.Errorf(
-				"%w: unified row overlay bucket pressure",
-				storeio.ErrPageCachePinned,
-			)
-		}
+	bucketSlot, bucketFound := o.bucketSlot(bucket)
+	if !bucketFound &&
+		o.bucketCount.Load() >= primaryUnifiedOverlayBuckets {
+		return primaryUnifiedOverlayPrepared{}, fmt.Errorf(
+			"%w: unified row overlay bucket pressure",
+			storeio.ErrPageCachePinned,
+		)
 	}
 	keyOff := used
 	valueOff := keyOff + uint32(len(key))
@@ -314,25 +368,49 @@ func (o *primaryUnifiedOverlay) prepare(
 	copy(o.arena[valueOff:valueOff+uint32(len(value))], value)
 	slot := uint32(hash & (primaryUnifiedOverlayTable - 1))
 	o.records[index] = primaryUnifiedOverlayRecord{
-		generation: generation,
-		hash:       hash,
-		previous:   o.heads[slot].Load(),
-		bucket:     uint32(bucket),
-		keyOffset:  keyOff,
-		valueOff:   valueOff,
-		valueLen:   uint32(len(value)),
-		rawDelta:   int32(rawDelta),
-		keyLen:     uint16(len(key)),
-		countDelta: int8(countDelta),
-		kind:       kind,
-		slot:       stableSlot,
+		generation:     generation,
+		hash:           hash,
+		previous:       o.heads[slot].Load(),
+		bucketPrevious: o.buckets[bucketSlot].head.Load(),
+		bucket:         uint32(bucket),
+		keyOffset:      keyOff,
+		valueOff:       valueOff,
+		valueLen:       uint32(len(value)),
+		rawDelta:       int32(rawDelta),
+		keyLen:         uint16(len(key)),
+		countDelta:     int8(countDelta),
+		kind:           kind,
+		slot:           stableSlot,
 	}
 	return primaryUnifiedOverlayPrepared{
-		index: index, usedAfter: valueOff + uint32(len(value)), headSlot: slot,
+		index: index, usedAfter: valueOff + uint32(len(value)),
+		headSlot: slot, bucketSlot: bucketSlot, newBucket: !bucketFound,
 	}, nil
 }
 
 func (o *primaryUnifiedOverlay) publish(prepared primaryUnifiedOverlayPrepared) {
+	record := &o.records[prepared.index]
+	bucket := &o.buckets[prepared.bucketSlot]
+	if prepared.newBucket {
+		bucket.bucket.Store(record.bucket)
+		bucket.rawBytes.Store(0)
+		bucket.rows.Store(0)
+		for i := range bucket.insertSlots {
+			bucket.insertSlots[i].Store(0)
+		}
+		o.bucketCount.Add(1)
+	}
+	bucket.rawBytes.Add(int64(record.rawDelta))
+	bucket.rows.Add(int32(record.countDelta))
+	if record.countDelta > 0 {
+		bucket.insertSlots[record.slot>>6].Or(
+			uint64(1) << uint(record.slot&63),
+		)
+	}
+	// Publish the bucket chain before the global count/hash words. A reader
+	// that reaches it before the collection state advances filters the future
+	// generation; after state publication every directory aggregate is ready.
+	bucket.head.Store(prepared.index + 1)
 	o.used.Store(prepared.usedAfter)
 	o.count.Store(prepared.index + 1)
 	o.heads[prepared.headSlot].Store(prepared.index + 1)
@@ -348,22 +426,14 @@ func (o *primaryUnifiedOverlay) pendingBuckets(
 		return 0, nil
 	}
 	folded := o.folded.Load()
-	count := int(o.count.Load())
 	n := 0
-	for i := 0; i < count; i++ {
-		record := &o.records[i]
-		if record.generation <= folded {
+	for i := range o.buckets {
+		head := o.buckets[i].head.Load()
+		if head == 0 || int(head) > len(o.records) {
 			continue
 		}
-		bucket := storeio.BucketID(record.bucket)
-		seen := false
-		for j := 0; j < n; j++ {
-			if buckets[j] == bucket {
-				seen = true
-				break
-			}
-		}
-		if seen {
+		record := &o.records[head-1]
+		if record.generation <= folded {
 			continue
 		}
 		if n == len(buckets) {
@@ -376,7 +446,7 @@ func (o *primaryUnifiedOverlay) pendingBuckets(
 		if end > uint32(len(o.arena)) {
 			return 0, storeio.ErrCommonPrimaryLeafCorrupt
 		}
-		buckets[n] = bucket
+		buckets[n] = storeio.BucketID(record.bucket)
 		keys[n] = o.arena[record.keyOffset:end:end]
 		n++
 	}
@@ -392,12 +462,26 @@ func (o *primaryUnifiedOverlay) applyBucket(
 	generation uint64,
 ) ([]storeio.CommonPrimaryLeafRecord, error) {
 	folded := o.folded.Load()
-	count := int(o.count.Load())
-	for i := 0; i < count; i++ {
-		record := &o.records[i]
-		if record.generation <= folded ||
-			record.generation > generation ||
-			record.bucket != uint32(bucket) {
+	var indexes [primaryUnifiedOverlayRecords]uint16
+	n := 0
+	head := o.pendingBucketHead(bucket, folded)
+	for head != 0 {
+		record := &o.records[head-1]
+		if record.generation <= folded {
+			break
+		}
+		if record.generation <= generation {
+			indexes[n] = uint16(head - 1)
+			n++
+		}
+		head = record.bucketPrevious
+	}
+	for at := n - 1; at >= 0; at-- {
+		record := &o.records[indexes[at]]
+		if record.bucket != uint32(bucket) {
+			return records, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		if record.generation > generation {
 			continue
 		}
 		keyEnd := record.keyOffset + uint32(record.keyLen)
@@ -464,13 +548,16 @@ func (o *primaryUnifiedOverlay) latestBucketRecords(
 		return 0
 	}
 	folded := o.folded.Load()
-	count := min(int(o.count.Load()), len(o.records))
 	n := 0
-	for i := count - 1; i >= 0; i-- {
-		record := &o.records[i]
-		if record.generation <= folded ||
-			record.generation > generation ||
-			record.bucket != uint32(bucket) {
+	head := o.pendingBucketHead(bucket, folded)
+	for head != 0 {
+		index := head - 1
+		record := &o.records[index]
+		if record.generation <= folded {
+			break
+		}
+		head = record.bucketPrevious
+		if record.generation > generation {
 			continue
 		}
 		keyEnd := record.keyOffset + uint32(record.keyLen)
@@ -491,7 +578,7 @@ func (o *primaryUnifiedOverlay) latestBucketRecords(
 		if duplicate {
 			continue
 		}
-		dst[n] = uint16(i)
+		dst[n] = uint16(index)
 		n++
 	}
 	for i := 1; i < n; i++ {
@@ -584,6 +671,20 @@ func (o *primaryUnifiedOverlay) markFolded(generation uint64, recycle bool) {
 		return
 	}
 	o.folded.Store(generation)
+	// The directory describes only records newer than folded. Clear it even
+	// when an old epoch reader pins the global record/hash chains; those chains
+	// retain the old reader's history while a later window starts from an empty
+	// per-bucket directory.
+	for i := range o.buckets {
+		bucket := &o.buckets[i]
+		bucket.head.Store(0)
+		bucket.rawBytes.Store(0)
+		bucket.rows.Store(0)
+		for slot := range bucket.insertSlots {
+			bucket.insertSlots[slot].Store(0)
+		}
+	}
+	o.bucketCount.Store(0)
 	if !recycle {
 		return
 	}

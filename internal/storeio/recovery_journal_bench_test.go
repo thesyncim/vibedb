@@ -70,3 +70,61 @@ func BenchmarkRecoveryJournalAppendSync(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkRecoveryJournalAppendBatchCheckpoint measures the CPU portion of an
+// ordinary buffered checkpoint: prove one batch fits, append it, and account
+// its exact padded bytes. The write seam intentionally accepts the encoded
+// bytes in memory so this isolates framing/checksum work from filesystem sync.
+func BenchmarkRecoveryJournalAppendBatchCheckpoint(b *testing.B) {
+	entries := make([]RecoveryBatchEntry, 64)
+	for i := range entries {
+		entries[i] = RecoveryBatchEntry{
+			Kind:  RecoveryRecordKindPut,
+			Key:   []byte("benchmark-key"),
+			Value: []byte(`{"value":"journal-checkpoint-payload"}`),
+		}
+	}
+	path := filepath.Join(b.TempDir(), "batch.rjournal")
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	defer file.Close()
+	rj, err := CreateRecoveryJournal(file, RecoveryJournalHeader{
+		StoreID:        [16]byte{1},
+		JournalID:      [16]byte{2},
+		PageSize:       4096,
+		SectorSize:     RecoveryJournalMinSectorSize,
+		BaseGeneration: 1,
+		Capacity:       RecoveryJournalMaxCapacityBytes,
+	})
+	if err != nil {
+		b.Fatalf("create: %v", err)
+	}
+	rj.writeAt = func(p []byte, _ int64) (int, error) {
+		return len(p), nil
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(RecoveryBatchRecordPaddedSize(
+		rj.header.SectorSize, entries,
+	)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rj.cursor = 0
+		plan, err := rj.PrepareBatch(entries)
+		if err != nil {
+			b.Fatalf("prepare batch: %v", err)
+		}
+		if !rj.PreparedBatchFits(plan) {
+			b.Fatal("batch does not fit")
+		}
+		if _, err := rj.AppendPreparedBatch(
+			uint64(i+2), entries, plan,
+		); err != nil {
+			b.Fatalf("append batch: %v", err)
+		}
+		if got := plan.PaddedSize(); got <= 0 {
+			b.Fatalf("padded size = %d", got)
+		}
+	}
+}

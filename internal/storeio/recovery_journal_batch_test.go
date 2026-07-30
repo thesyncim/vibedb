@@ -149,9 +149,20 @@ func TestRecoveryBatchRecordPaddedSizeAndFits(t *testing.T) {
 	if !rj.FitsBatch(entries) {
 		t.Fatal("FitsBatch = false on an empty journal, want true")
 	}
+	plan, err := rj.PrepareBatch(entries)
+	if err != nil {
+		t.Fatalf("PrepareBatch: %v", err)
+	}
+	if plan.PaddedSize() != padded {
+		t.Fatalf("prepared padded size = %d, want %d",
+			plan.PaddedSize(), padded)
+	}
+	if !rj.PreparedBatchFits(plan) {
+		t.Fatal("PreparedBatchFits = false on an empty journal, want true")
+	}
 	before := rj.Cursor()
-	if _, err := rj.AppendBatch(2, entries); err != nil {
-		t.Fatalf("append batch: %v", err)
+	if _, err := rj.AppendPreparedBatch(2, entries, plan); err != nil {
+		t.Fatalf("append prepared batch: %v", err)
 	}
 	if got := rj.Cursor() - before; got != uint64(padded) {
 		t.Fatalf("append consumed %d bytes, want reported padded %d", got, padded)
@@ -169,5 +180,43 @@ func TestRecoveryBatchRecordPaddedSizeAndFits(t *testing.T) {
 	}
 	if _, err := small.AppendBatch(2, big); !errors.Is(err, ErrRecoveryJournalFull) {
 		t.Fatalf("AppendBatch over capacity = %v, want ErrRecoveryJournalFull", err)
+	}
+}
+
+// TestRecoveryBatchPreparedPlanFailsClosedAfterLengthChange proves an opaque
+// layout cannot turn a caller mutation between preflight and append into a
+// truncated or malformed write. The encoder revalidates the planned body while
+// copying and leaves both cursor and sequence unchanged on a mismatch.
+func TestRecoveryBatchPreparedPlanFailsClosedAfterLengthChange(t *testing.T) {
+	rj, _ := createTestJournal(t, 8<<10)
+	entries := []RecoveryBatchEntry{{
+		Kind:  recoveryRecordKindPut,
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	}}
+	plan, err := rj.PrepareBatch(entries)
+	if err != nil {
+		t.Fatalf("PrepareBatch: %v", err)
+	}
+	cursor := rj.cursor
+	sequence := rj.nextSequence
+	writes := 0
+	rj.writeAt = func(p []byte, _ int64) (int, error) {
+		writes++
+		return len(p), nil
+	}
+	entries[0].Value = append(entries[0].Value, '!')
+	if _, err := rj.AppendPreparedBatch(
+		2, entries, plan,
+	); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("AppendPreparedBatch after length change = %v, want invalid write",
+			err)
+	}
+	if writes != 0 {
+		t.Fatalf("write calls = %d, want 0", writes)
+	}
+	if rj.cursor != cursor || rj.nextSequence != sequence {
+		t.Fatalf("journal advanced after rejected plan: cursor %d->%d sequence %d->%d",
+			cursor, rj.cursor, sequence, rj.nextSequence)
 	}
 }
