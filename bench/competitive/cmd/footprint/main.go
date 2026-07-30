@@ -22,8 +22,6 @@ func main() {
 	corpus := flag.Int("corpus", competitive.CorpusSize, "documents in the shared corpus")
 	indexed := flag.Bool("indexed", false, "declare a secondary index over the filter field")
 	putloop := flag.Bool("putloop", false, "store/durable only: build by replaying Put instead of the bulk path")
-	compact := flag.Bool("compact", false, "store/durable only: explicitly select compact bulk documents; "+
-		"the default bulk and Put paths are verbatim")
 	durabilityName := flag.String(
 		"durability", "default",
 		"default, volatile, buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe",
@@ -81,10 +79,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "footprint: -engine is required")
 		os.Exit(2)
 	}
-	if *compact && (*engine != "vibejson-durable" || *putloop) {
-		fmt.Fprintln(os.Stderr, "footprint: -compact requires vibejson-durable bulk mode")
-		os.Exit(2)
-	}
 	factory, ok := competitive.FactoryNamed(*engine)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "footprint: unknown engine %q\n", *engine)
@@ -102,7 +96,6 @@ func main() {
 		Indexed:    *indexed,
 		CacheBytes: competitive.DefaultCacheBytes,
 		PutLoop:    *putloop,
-		Compact:    *compact,
 	})
 	check(err)
 
@@ -120,11 +113,7 @@ func main() {
 	if *putloop {
 		name += "/put"
 	} else if factory.Name == "vibejson-durable" {
-		if *compact {
-			name += "/bulk-compact"
-		} else {
-			name += "/bulk-verbatim"
-		}
+		name += "/bulk-unified"
 	}
 	report(name, e.DurabilityMode().String(), cardinality, *indexed, fp)
 

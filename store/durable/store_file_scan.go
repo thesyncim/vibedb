@@ -1,6 +1,8 @@
 package durable
 
 import (
+	"bytes"
+
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
@@ -77,7 +79,7 @@ func (s *Snapshot) rangePrimaryGraph(
 		return err
 	}
 	// Seed the cursor's splice buffer from the Snapshot's retained scratch and
-	// hand the grown buffer back when the scan ends, so a template/compact
+	// hand the grown buffer back when the scan ends, so class-5 row
 	// reconstruction reuses one allocation across every scan of this snapshot
 	// rather than growing a fresh buffer per scan.
 	cursor.AdoptSpliceScratch(s.scanSpliceScratch)
@@ -116,7 +118,19 @@ func (s *Snapshot) rangePrimaryGraph(
 // grouping, or stable tie semantics. Inline key/value slices borrow one cache
 // lease for the callback. One overflow buffer is reused for the complete call.
 func (s *Snapshot) RangeMasksRaw(masks []store.Mask, fn func(key, value []byte) error) error {
-	_, err := s.RangeMasksRawBuffer(masks, nil, fn)
+	if s == nil || s.collection == nil || s.state == nil {
+		return ErrClosed
+	}
+	if fn == nil {
+		return nil
+	}
+	scratch, err := s.rangePrimaryMasks(
+		masks, s.scanSpliceScratch,
+		func(_ store.Location, key, value []byte) error {
+			return fn(key, value)
+		},
+	)
+	s.scanSpliceScratch = scratch
 	return err
 }
 
@@ -224,38 +238,162 @@ func (s *Snapshot) rangePrimaryMasks(
 		if err != nil {
 			return scratch, err
 		}
-		scratch, err = storeio.VisitPrimaryLeafPostingRows(
-			lease.Page(), state.root.StoreID, route.Bucket, bounds, scratch,
-			func(slot uint8, key, raw []byte, overflow bool) error {
-				quadrant := slot >> 6
-				bit := uint64(1) << uint(slot&63)
-				if selected[quadrant]&bit == 0 {
-					return nil
-				}
-				value := raw
-				if overflow {
-					// The posting scratch already holds the borrowed key/descriptor for
-					// this row; the resolved value goes to the Snapshot buffer so it does
-					// not clobber the descriptor mid-callback.
-					resolved, rErr := s.collection.appendPrimaryOverflowValue(
-						s.overflowScanValue[:0],
-						storeio.DecodePrimaryOverflowRef(raw), bounds,
-					)
-					if rErr != nil {
-						return rErr
+		if s.collection.primaryUnifiedOverlay.pendingBucket(route.Bucket) {
+			scratch, err = s.rangePrimaryOverlayMaskedLeaf(
+				lease.Page(), route.Bucket, bounds, selected,
+				scratch, fn,
+			)
+		} else {
+			scratch, err = storeio.VisitPrimaryLeafSelectedPostingRows(
+				lease.Page(), state.root.StoreID, route.Bucket, bounds,
+				selected, scratch,
+				func(slot uint8, key, raw []byte, overflow bool) error {
+					quadrant := slot >> 6
+					value := raw
+					if overflow {
+						// The posting scratch already holds the borrowed
+						// key/descriptor; keep the resolved value separate.
+						resolved, rErr :=
+							s.collection.appendPrimaryOverflowValue(
+								s.overflowScanValue[:0],
+								storeio.DecodePrimaryOverflowRef(raw), bounds,
+							)
+						if rErr != nil {
+							return rErr
+						}
+						s.overflowScanValue = resolved
+						value = resolved
 					}
-					s.overflowScanValue = resolved
-					value = resolved
-				}
-				return fn(store.Location{
-					Chunk: uint32(route.Bucket)<<2 | uint32(quadrant),
-					Slot:  slot & 63,
-				}, key, value)
-			},
-		)
+					return fn(store.Location{
+						Chunk: uint32(route.Bucket)<<2 | uint32(quadrant),
+						Slot:  slot & 63,
+					}, key, value)
+				},
+			)
+		}
 		lease.Release()
 		if err != nil {
 			return scratch, err
+		}
+	}
+	return scratch, nil
+}
+
+// rangePrimaryOverlayMaskedLeaf merges a bucket's newest visible row-overlay
+// records with its immutable class-5 base in lexical order. This is the masked
+// counterpart of point reads' overlay-first rule: inserted rows are visible,
+// replacements expose their new value, and tombstones suppress the base row.
+func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
+	page []byte,
+	bucket storeio.BucketID,
+	bounds storeio.CommonPrimaryLeafBounds,
+	selected [4]uint64,
+	scratch []byte,
+	fn func(row store.Location, key, value []byte) error,
+) ([]byte, error) {
+	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		page, s.state.root.StoreID, bucket, bounds,
+	)
+	if !ok {
+		return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	slots, ok := unified.PostingSlots()
+	if !ok {
+		return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	overlay := s.collection.primaryUnifiedOverlay
+	var indexes [primaryUnifiedOverlayRecords]uint16
+	overlayCount := overlay.latestBucketRecords(
+		&indexes, bucket, s.state.root.Generation,
+	)
+	emit := func(
+		slot uint8, key, raw []byte, overflow, encoded bool,
+	) error {
+		quadrant := slot >> 6
+		if selected[quadrant]&(uint64(1)<<uint(slot&63)) == 0 {
+			return nil
+		}
+		value := raw
+		if overflow {
+			resolved, err := s.collection.appendPrimaryOverflowValue(
+				s.overflowScanValue[:0],
+				storeio.DecodePrimaryOverflowRef(raw), bounds,
+			)
+			if err != nil {
+				return err
+			}
+			s.overflowScanValue = resolved
+			value = resolved
+		} else if encoded {
+			scratch = unified.AppendAdmittedRowBody(scratch[:0], raw)
+			value = scratch
+		}
+		return fn(store.Location{
+			Chunk: uint32(bucket)<<2 | uint32(quadrant),
+			Slot:  slot & 63,
+		}, key, value)
+	}
+
+	baseRank, overlayAt := 0, 0
+	for baseRank < unified.Len() || overlayAt < overlayCount {
+		var baseKey, baseBody []byte
+		var baseOverflow bool
+		if baseRank < unified.Len() {
+			var rowOK bool
+			baseKey, baseBody, baseOverflow, rowOK =
+				unified.RowRawAt(baseRank)
+			if !rowOK {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+		}
+		var record *primaryUnifiedOverlayRecord
+		var overlayKey []byte
+		if overlayAt < overlayCount {
+			record = &overlay.records[indexes[overlayAt]]
+			keyEnd := record.keyOffset + uint32(record.keyLen)
+			if keyEnd > uint32(len(overlay.arena)) {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			overlayKey =
+				overlay.arena[record.keyOffset:keyEnd:keyEnd]
+		}
+		order := 0
+		switch {
+		case baseRank >= unified.Len():
+			order = 1
+		case overlayAt >= overlayCount:
+			order = -1
+		default:
+			order = bytes.Compare(baseKey, overlayKey)
+		}
+		if order < 0 {
+			if err := emit(
+				slots[baseRank], baseKey, baseBody, baseOverflow, true,
+			); err != nil {
+				return scratch, err
+			}
+			baseRank++
+			continue
+		}
+		if record.kind == primaryUnifiedOverlayPut {
+			valueEnd := record.valueOff + record.valueLen
+			if record.valueLen == 0 ||
+				valueEnd > uint32(len(overlay.arena)) {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if err := emit(
+				record.slot, overlayKey,
+				overlay.arena[record.valueOff:valueEnd:valueEnd],
+				false, false,
+			); err != nil {
+				return scratch, err
+			}
+		} else if record.kind != primaryUnifiedOverlayDelete {
+			return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		overlayAt++
+		if order == 0 {
+			baseRank++
 		}
 	}
 	return scratch, nil

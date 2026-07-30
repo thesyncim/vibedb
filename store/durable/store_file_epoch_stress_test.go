@@ -41,19 +41,38 @@ func TestFilePrimaryReadEpochAllocatesZero(t *testing.T) {
 	}
 }
 
-// epochStressDocID extracts the leading "id" field every epoch-stress document
-// embeds. The corpus seeds keys[i] with id i and every shape the stress writer
-// publishes for keys[i] (same-size, grown, reinsert) also embeds id i, so a hit
-// whose id disagrees with the probed key is a routing fault even though the
-// document itself is valid JSON. The prefix scan is deliberately allocation-free
-// so the reader loop's pressure profile is unchanged.
+// epochStressDocID extracts the top-level "id" field every epoch-stress
+// document embeds. Canonical class-5 rows sort object fields, so id is not
+// necessarily first (the seed corpus also carries "group"). The corpus seeds
+// keys[i] with id i and every shape the stress writer publishes for keys[i]
+// (same-size, grown, reinsert) also embeds id i, so a hit whose id disagrees
+// with the probed key is a routing fault even though the document itself is
+// valid JSON. The byte scan is deliberately allocation-free so the reader
+// loop's pressure profile is unchanged.
 func epochStressDocID(doc []byte) (int, bool) {
-	const prefix = `{"id":`
-	if len(doc) <= len(prefix) || string(doc[:len(prefix)]) != prefix {
+	const field = `"id":`
+	at := -1
+	for i := 1; i+len(field) < len(doc); i++ {
+		if doc[i-1] != '{' && doc[i-1] != ',' {
+			continue
+		}
+		matched := true
+		for j := range len(field) {
+			if doc[i+j] != field[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			at = i + len(field)
+			break
+		}
+	}
+	if at < 0 {
 		return 0, false
 	}
 	id := 0
-	at := len(prefix)
+	start := at
 	for ; at < len(doc); at++ {
 		digit := doc[at]
 		if digit < '0' || digit > '9' {
@@ -61,7 +80,7 @@ func epochStressDocID(doc []byte) (int, bool) {
 		}
 		id = id*10 + int(digit-'0')
 	}
-	if at == len(prefix) {
+	if at == start {
 		return 0, false
 	}
 	return id, true

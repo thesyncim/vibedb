@@ -85,7 +85,8 @@ func seizeSnapshotCut(order []*Collection) (snapshotCutHold, error) {
 	for _, collection := range order {
 		if collection.deferredCanonicalLane() &&
 			collection.primaryRouter.Load() != nil &&
-			len(collection.primaryPendingParents) != 0 {
+			(len(collection.primaryPendingParents) != 0 ||
+				collection.primaryUnifiedOverlay.hasPending()) {
 			if err := collection.materializePrimaryParentsLocked(); err != nil {
 				hold.release()
 				return snapshotCutHold{}, err

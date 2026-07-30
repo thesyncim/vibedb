@@ -153,66 +153,6 @@ const (
 	CheckpointFilesystem
 )
 
-// Options fixes every collection-owned resident and in-flight memory
-// bound. The zero value selects 4 KiB metadata pages, 64 KiB
-// document/overflow extents, a 64 MiB read cache, and 4 MiB maximum documents.
-// DocumentFormat selects the physical representation CreateFromPrimary gives
-// document bytes. It is a space-against-scan-speed decision, the two options
-// are far apart on both axes, and which one a workload wants is not obvious, so
-// it is stated explicitly rather than chosen silently.
-//
-// Measured on 100,000 documents averaging 299 bytes, Apple M4 Max, medians of
-// -count=6, both files bulk-built from the same source collection:
-//
-//	                          verbatim   compact
-//	file size                 52.7 MiB   27.1 MiB
-//	... as a multiple of raw JSON  1.85x     0.95x
-//	full scan, warm, ns/doc         6.2      81.3
-//	point read, warm, ns            904      1234
-//	full scan, cold, ns/doc         287       450
-//	cold scan device reads         1586       805
-//
-// So compact costs roughly thirteen times the resident scan and a third more
-// per point read, and returns just under half the bytes on disk.
-//
-// The cold row is the one that is easy to get backwards. Compact reads half as
-// much from the device, and it is still slower cold, because on this hardware
-// the token decoding costs more than the I/O it saves. That balance is a
-// property of the storage, not of the format: on a slow or contended device,
-// or with a resident budget far below the corpus, halving the bytes read can
-// invert it. Measure it on the device you will deploy on rather than assuming
-// either direction. Note also that this cold measurement empties the buffer
-// pool but not the operating system's page cache.
-//
-// One more caution about the space number, because two different comparisons
-// are in circulation and they flatter differently. The 1.95x above is compact
-// against this package's own verbatim output, and a similar ratio holds against
-// a Put-built file. Against other embedded engines the result is much less
-// impressive: on a shape-matched high-cardinality corpus the compact file grew
-// 77% (15.9 -> 28.2 MiB) while bbolt, badger, and SQLite moved under 3%, which
-// leaves compact level with them rather than ahead. Both statements are true
-// and they answer different questions; quote the one that matches the question
-// being asked.
-//
-// Verbatim is the default because a caller who reaches for CreateFromPrimary is
-// usually after "write every page exactly once", and should not silently
-// receive an order-of-magnitude resident-scan regression they did not ask for.
-type DocumentFormat uint8
-
-const (
-	// DocumentFormatVerbatim stores each document's exact JSON contiguously in
-	// ordinary primary leaves, which a scan hands to its callback as a borrowed
-	// slice with no decoding at all.
-	DocumentFormatVerbatim DocumentFormat = iota
-	// DocumentFormatCompact stores documents as a grouped image that keeps one
-	// shape template and one value dictionary per container and reduces each row
-	// to a token stream: each primary leaf embeds the grouped payload as the
-	// compact leaf class. Reading a row means reassembling it from roughly two
-	// dozen fragments, which is where the scan cost is; see DocumentFormat for
-	// the numbers.
-	DocumentFormatCompact
-)
-
 // Options fixes the durable collection's schema, exact indexes, memory bounds,
 // engine selection, and durability contract at construction. It embeds the
 // in-memory store.Options for shared collection settings and adds the on-disk
@@ -229,24 +169,6 @@ type Options struct {
 	// share posting maintenance and durable bytes while remaining independently
 	// discoverable and queryable.
 	Indexes []store.IndexDefinition
-	// DocumentFormat selects how a bulk build (CreateFromPrimary) stores
-	// document bytes. It has no effect on Open, Put, or Update: a collection
-	// reads both representations unconditionally, and ordinary writes always
-	// produce the verbatim one (a compact leaf de-compacts on its first
-	// mutation).
-	DocumentFormat DocumentFormat
-	// UnifiedLeaves routes a bulk build (CreateFromPrimary) to the class-5
-	// unified canonical template-row codec (docs/design/unified-leaf-format.md
-	// §3.1): documents are stored — and therefore returned by every read — in
-	// their vibejson canonical form (§3.2: object members sorted by decoded
-	// key, no interstitial whitespace, escapes normalized, number spellings
-	// preserved), with per-leaf shape templates, a bounded value dictionary,
-	// and typed token streams replacing the raw value bytes. It is mutually
-	// exclusive with DocumentFormatCompact. In this phase mutations to a
-	// unified leaf route through the existing structural rewrite path, which
-	// re-encodes the touched leaf's rows into raw leaves (the §11 U1 row).
-	UnifiedLeaves bool
-
 	// PageSize is the base page of the ordered primary graph. It must be 4096:
 	// every tree, root, directory, and metadata page is exactly one base page.
 	// Zero defaults to 4096; any other value is rejected on Create with
@@ -317,15 +239,18 @@ type Options struct {
 	// option is explicit and restricted to buffered-visible copy-on-write
 	// checkpoints; it can never weaken DurabilitySync or AsyncVisible.
 	CheckpointStrength CheckpointStrength
-	// RecoveryJournal is the opt-in that gives a DurabilityBufferedVisible
-	// collection every frame-deferred acknowledgement a bounded redo record
-	// synced to a sibling journal file, turning buffered-visible's volatile
-	// acknowledgement into a durable one at one bounded append plus one sync — no
-	// page copy-on-write and no root fence. Readers are untouched: visibility
-	// still comes from the canonical frames, and the journal is write-only until
-	// crash recovery replays it through the ordinary mutation path. The journal's
-	// sync strength follows CheckpointStrength (power-safe issues the
+	// RecoveryJournal upgrades DurabilityBufferedVisible from volatile mutation
+	// acknowledgements to a bounded redo append and sync for every mutation.
+	// Readers are untouched: visibility still comes from canonical resident
+	// state, and crash recovery replays redo through the ordinary mutation path.
+	// The sync strength follows CheckpointStrength (power-safe issues the
 	// F_FULLFSYNC-class barrier, filesystem the ordinary fdatasync-class one).
+	//
+	// When false, a buffered-visible store still owns a smaller sibling journal.
+	// Mutations remain volatile, but Flush can append and sync one ordered batch
+	// for a complete bounded class-5 overlay instead of copying its physical
+	// leaves. Exceptional mutations, pressure, and Close take a physical
+	// checkpoint and recycle the journal.
 	//
 	// It has no effect on DurabilityAsyncVisible, and none on DurabilitySync: a
 	// primary-layout synchronous store is journal-backed UNCONDITIONALLY (the
@@ -507,6 +432,7 @@ type normalizedFileStoreOptions struct {
 	indexes                        []*store.ExactIndex
 	indexNameIDs                   map[string]uint32
 	indexCatalogHash               uint64
+	primaryUnifiedOverlayBytes     int
 }
 
 const (
@@ -603,9 +529,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			"vibejson: collection MaxBatchBytes must hold one maximum document and every batch key",
 		)
 	}
-	if o.DocumentFormat > DocumentFormatCompact ||
-		o.UnifiedLeaves && o.DocumentFormat != DocumentFormatVerbatim ||
-		o.Backend > BackendIOUring || o.ReadMode > ReadDirectRequire ||
+	if o.Backend > BackendIOUring || o.ReadMode > ReadDirectRequire ||
 		o.WriteMode > WriteDirectRequire ||
 		o.Durability > DurabilityBufferedVisible ||
 		o.CheckpointStrength > CheckpointFilesystem ||
@@ -868,6 +792,10 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	if o.ResidentBytes < 0 || uint64(o.ResidentBytes) < maxTransactionBytes {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibejson: collection ResidentBytes cannot retain one worst-case dirty transaction")
 	}
+	primaryUnifiedOverlayBytes := primaryUnifiedOverlayBudget(
+		uint64(o.ResidentBytes), maxTransactionBytes,
+		o.PageSize, o.MaxPageSize, o.MaxKeyBytes, o.InlineValueBytes,
+	)
 	return normalizedFileStoreOptions{
 		Options:                        o,
 		maxTransactionPages:            maxTransactionPages,
@@ -878,7 +806,8 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		freeFoldLimit:                  freeFoldLimit,
 		pageCatalog:                    pageCatalog,
 		indexes:                        compiled, indexNameIDs: indexNameIDs,
-		indexCatalogHash: catalogHash,
+		indexCatalogHash:           catalogHash,
+		primaryUnifiedOverlayBytes: primaryUnifiedOverlayBytes,
 	}, nil
 }
 
@@ -1014,6 +943,15 @@ type Collection struct {
 
 	committer *storeio.Committer
 	cache     *storeio.PageCache
+	// primaryUnifiedOverlay is the bounded, generation-stamped mutable row
+	// window for class-5 replacement updates. Its byte arena is carved out of
+	// Options.ResidentBytes; PageCache owns the remainder.
+	primaryUnifiedOverlay *primaryUnifiedOverlay
+	// primaryUnifiedSeen is writer-owned lazy route metadata. Until the first
+	// class-5 leaf is observed, ordinary stores preserve their established
+	// capacity-before-acquire mutation order; afterwards class-5 routes may try
+	// the allocation-free overlay before reserving structural COW capacity.
+	primaryUnifiedSeen bool
 	// primaryRouter is swapped wholesale by a structural split/merge/reclass
 	// transaction and mutated in place by ordinary COW UpdateLeaf. Lock-free
 	// point reads load it once; an atomic pointer keeps that swap race-free.
@@ -1076,13 +1014,14 @@ type Collection struct {
 	readEpochs    *storeio.ReadEpochs
 	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
-	// journal is the bounded redo log paired with this store. It is non-nil only
-	// for a DurabilityBufferedVisible collection opened or created with
-	// Options.RecoveryJournal. It is owned by the serialized writer exactly like
-	// the committer, appended and synced under c.writer, and recycled inside the
-	// checkpoint's root publication. journalID mirrors the header identity written
-	// into the state root so recovery cannot pair a stray file; journalPowerSafe
-	// selects the acknowledgement barrier strength from CheckpointStrength.
+	// journal is the bounded redo log paired with every primary
+	// DurabilityBufferedVisible and DurabilitySync store. It is owned by the
+	// serialized writer exactly like the committer and appended and synced under
+	// c.writer. Options.RecoveryJournal selects per-mutation durable
+	// acknowledgement for buffered-visible; without it, Flush may append one
+	// complete class-5 delta batch. Full checkpoints fold and recycle the log.
+	// journalID mirrors the root identity so recovery cannot pair a stray file;
+	// journalPowerSafe selects the barrier strength from CheckpointStrength.
 	journal          *storeio.RecoveryJournal
 	journalID        [16]byte
 	journalPowerSafe bool
@@ -1101,11 +1040,22 @@ type Collection struct {
 	// on this group's fence; one leader shares one journal sync across every
 	// caller whose record it covers. See store_file_journal_group.go.
 	journalGroup journalCommitGroup
+	// journalDeltaGeneration is the newest ordinary buffered-visible generation
+	// made crash-safe by a checkpoint batch in the recovery journal. It is a
+	// logical durability watermark: allocator/recycle decisions continue to use
+	// the committer's physical root generation, while DurableGeneration reports
+	// the maximum of the two. It advances only after the journal sync succeeds.
+	journalDeltaGeneration atomic.Uint64
+	// journalDeltaEntries is fixed writer-owned framing scratch for one cheap
+	// checkpoint. The class-5 overlay itself is capped at this record count, so
+	// every eligible interval fits without allocation.
+	journalDeltaEntries [primaryUnifiedOverlayRecords]storeio.RecoveryBatchEntry
 	// writeTransaction and the point-mutation scratch below are protected by
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
 
 	automaticCheckpoints          atomic.Uint64
+	primaryOverlayFolds           atomic.Uint64
 	retirementPressureCheckpoints atomic.Uint64
 	materializationAttempts       atomic.Uint64
 	materializationUpdates        atomic.Uint64
@@ -1128,10 +1078,14 @@ type Collection struct {
 	// journalLargestGroup is the most records one such sync covered. JournalAcks
 	// divided by JournalSyncs is the average group size — the amortization the
 	// phase-1 group commit buys.
-	journalSyncs             atomic.Uint64
-	journalLargestGroup      atomic.Uint32
-	primaryLeafSplitRequired atomic.Uint64
-	primaryEmptyLeaves       atomic.Uint64
+	journalSyncs              atomic.Uint64
+	journalLargestGroup       atomic.Uint32
+	journalDeltaCheckpoints   atomic.Uint64
+	journalDeltaRecords       atomic.Uint64
+	journalDeltaBytes         atomic.Uint64
+	journalDeltaFullFallbacks atomic.Uint64
+	primaryLeafSplitRequired  atomic.Uint64
+	primaryEmptyLeaves        atomic.Uint64
 	// Structural-transaction accounting for phase-8 split/merge/reclass. The
 	// *MaxNS fields are the observed high-water bounded-transaction latency so a
 	// harness can gate p-max without a full histogram allocation.
@@ -1168,22 +1122,32 @@ type Collection struct {
 	// cleanup. retireScratch remains the authoritative durable/reclaimer list
 	// and may coalesce adjacent refs; this list never affects correctness when
 	// its fixed capacity is exhausted.
-	retireRefScratch       []storeio.PageRef
-	reusable               []storeio.FreeExtent
-	reuseJournal           []storeio.ReuseEdit
-	reusableBlock          *storemem.Block
-	freeExtentIndex        storeio.FreeExtentIndex
-	freeExtentMaxima       []uint64
-	freeScratchBlock       *storemem.Block
-	materializationBlock   *storemem.Block
-	materializationBefore  []byte
-	materializationAfter   []byte
-	bufferedFirstTouches   []storeio.PageRef
-	bufferedValueBefore    []byte
-	primaryLeafScratch     []byte
-	primaryRootScratch     []byte
-	primaryPendingParents  []filePrimaryPendingParent
-	primaryVolatileRetired []storeio.PageRef
+	retireRefScratch      []storeio.PageRef
+	reusable              []storeio.FreeExtent
+	reuseJournal          []storeio.ReuseEdit
+	reusableBlock         *storemem.Block
+	freeExtentIndex       storeio.FreeExtentIndex
+	freeExtentMaxima      []uint64
+	freeScratchBlock      *storemem.Block
+	materializationBlock  *storemem.Block
+	materializationBefore []byte
+	materializationAfter  []byte
+	bufferedFirstTouches  []storeio.PageRef
+	bufferedValueBefore   []byte
+	primaryLeafScratch    []byte
+	// primaryLeafMutationScratch is the second writer-owned leaf buffer plus
+	// row/render workspace used when the current U1 bridge opens a compressed
+	// leaf for mutation. It must be distinct from primaryLeafScratch because
+	// the decoded view remains the source while that buffer receives the
+	// mutated image.
+	primaryLeafMutationScratch *storeio.PrimaryLeafMutationScratch
+	primaryUnifiedBuilder      *storeio.UnifiedPrimaryLeafBuilder
+	primaryUnifiedIndexScratch []vibejson.IndexEntry
+	primaryUnifiedCanonical    []byte
+	primaryUnifiedCanonicalWS  storeio.CanonicalWorkspace
+	primaryRootScratch         []byte
+	primaryPendingParents      []filePrimaryPendingParent
+	primaryVolatileRetired     []storeio.PageRef
 	// overflowChainScratch and overflowOffsetScratch stage one out-of-line value's
 	// overflow-extent chain during a mutation transaction: the reserved transaction
 	// pages and each piece's start offset in the value. They are writer-private and
@@ -1386,9 +1350,15 @@ type Stats struct {
 	// barrier or root publication while the checkpoint worker was idle.
 	PrewrittenPageWrites uint64
 	PrewrittenPageBytes  uint64
-	// AutomaticCheckpoints counts successful Flush calls forced internally by
-	// bounded dirty-cache or buffered-visible staging pressure.
+	// AutomaticCheckpoints counts unrequested persistence boundaries forced by
+	// bounded staging pressure. Device-silent row-overlay materializations are
+	// accounted separately by PrimaryOverlayFolds.
 	AutomaticCheckpoints uint64
+	// PrimaryOverlayFolds counts device-silent materializations of the bounded
+	// class-5 row overlay. These publish a physical root in memory but perform no
+	// device checkpoint; a later journal delta, explicit Flush, or Close supplies
+	// the crash-safety boundary.
+	PrimaryOverlayFolds uint64
 	// RetirementPressureCheckpoints counts retirement-capacity events that
 	// forced an otherwise-unrequested checkpoint before retry.
 	RetirementPressureCheckpoints uint64
@@ -1433,6 +1403,15 @@ type Stats struct {
 	// share one fence. Both are zero unless a recovery journal is configured.
 	JournalSyncs        uint64
 	JournalLargestGroup uint32
+	// JournalDelta* accounts for ordinary buffered-visible Flush calls made
+	// durable by one recovery-journal batch instead of a physical root fold.
+	// Records is the number of logical overlay mutations carried, Bytes their
+	// sector-padded journal traffic, and FullFallbacks counts attempted cheap
+	// checkpoints that deliberately fell back to the full COW/root path.
+	JournalDeltaCheckpoints   uint64
+	JournalDeltaRecords       uint64
+	JournalDeltaBytes         uint64
+	JournalDeltaFullFallbacks uint64
 	// PrimaryLeafSplitRequired counts inserts rejected before publication
 	// because the selected wide leaf needs the deferred structural split.
 	PrimaryLeafSplitRequired uint64
@@ -1449,10 +1428,7 @@ type Stats struct {
 	// MergeReclassEvaluations counts post-delete merge/reclass evaluations (the
 	// second writer-lock acquisition each routed delete pays);
 	// MergeReclassWarranted counts the subset that proceeded to a structural
-	// transaction. PrimaryTemplateDetemplateEvents counts template-leaf
-	// de-template splices for mutation; PrimaryTemplateReplanEvents counts full
-	// template dictionary re-dedup encodes. These are process-global storeio
-	// counters, reset by ResetTemplateColumnarDiag.
+	// transaction.
 	MergeReclassEvaluations uint64
 	MergeReclassWarranted   uint64
 	// MergeReclassCommits, MergeReclassAborts, and MergeReclassSkips decompose the
@@ -1460,11 +1436,9 @@ type Stats struct {
 	// were warranted but found nothing viable (a checkpoint-free abort recorded
 	// for hysteresis); skips were elided read-only because the leaf already
 	// aborted at this live count. Only commits pay a flush.
-	MergeReclassCommits             uint64
-	MergeReclassAborts              uint64
-	MergeReclassSkips               uint64
-	PrimaryTemplateDetemplateEvents uint64
-	PrimaryTemplateReplanEvents     uint64
+	MergeReclassCommits uint64
+	MergeReclassAborts  uint64
+	MergeReclassSkips   uint64
 	// PrimaryMacroSplitRequired counts structural transactions that could not
 	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
 	// and a macro-tablet split (the next phase) is required.
@@ -1775,7 +1749,9 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 	)
 	cache, err := storeio.NewPageCache(readFile, storeio.PageCacheOptions{
 		PageSize: options.PageSize, MaxPageSize: options.MaxPageSize,
-		ResidentBytes: options.ResidentBytes, StoreID: storeID,
+		ResidentBytes: options.ResidentBytes -
+			int64(options.primaryUnifiedOverlayBytes),
+		StoreID:       storeID,
 		PrefetchQueue: options.PrefetchQueue, ReadConcurrency: options.ReadConcurrency,
 		ReadQueueDepth: options.ReadQueueDepth,
 		Backend:        storeio.Backend(options.Backend),
@@ -1987,6 +1963,9 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 	}
 	collection := &Collection{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
+		primaryUnifiedOverlay: newPrimaryUnifiedOverlay(
+			options.primaryUnifiedOverlayBytes,
+		),
 		readFile: ownedRead, writeFile: ownedWrite,
 		directRead: directRead, directWrite: directWrite,
 		leases: leases, readEpochs: readEpochs, reclaimer: reclaimer,
@@ -2185,8 +2164,9 @@ func (c *Collection) createInitialState() error {
 	// Mint the paired journal before the root that names it is published, so a
 	// crash after the root is durable finds the journal file present. The
 	// synchronous lane is journal-backed on the primary graph unconditionally --
-	// it is how sync acknowledges -- while buffered-visible carries a journal only
-	// on the RecoveryJournal opt-in. Async-visible never carries one. This is the
+	// it is how sync acknowledges -- and every buffered-visible store carries one
+	// for either checkpoint deltas or per-mutation acknowledgement.
+	// Async-visible never carries one. This is the
 	// creation-time counterpart of CreateFromPrimary's journal mint.
 	journalRequired := c.options.Durability == DurabilitySync ||
 		c.journalConfigured()
@@ -2202,6 +2182,12 @@ func (c *Collection) createInitialState() error {
 				c.cacheStoreID(), journalID, uint32(c.options.PageSize),
 				c.options.MaxKeyBytes, c.options.InlineValueBytes,
 				c.options.MaxDocumentBytes, 1,
+				func() int {
+					if c.buffered() && !c.options.RecoveryJournal {
+						return c.options.primaryUnifiedOverlayBytes
+					}
+					return 0
+				}(),
 			),
 		); err != nil {
 			_ = tx.Abort()
@@ -2404,7 +2390,8 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 	// make it durable; Flush/Close keep that boundary.
 	if c.deferredCanonicalLane() && c.primaryRouter.Load() != nil {
 		c.writer.Lock()
-		if len(c.primaryPendingParents) != 0 {
+		if len(c.primaryPendingParents) != 0 ||
+			c.primaryUnifiedOverlay.hasPending() {
 			if err := c.materializePrimaryParentsLocked(); err != nil {
 				c.writer.Unlock()
 				return nil, err
@@ -2682,7 +2669,10 @@ func (c *Collection) DurableGeneration() uint64 {
 	if c == nil || c.committer == nil {
 		return 0
 	}
-	return c.committer.DurableGeneration()
+	return max(
+		c.committer.DurableGeneration(),
+		c.journalDeltaGeneration.Load(),
+	)
 }
 
 // Stats reports configured residency, page I/O, prefetch, durability queue,
@@ -2705,65 +2695,76 @@ func (c *Collection) Stats() Stats {
 	}
 	leases := c.leases.Stats(current)
 	retired := c.reclaimer.Stats()
+	overlayCapacity, overlayResident, overlayDirty :=
+		c.primaryUnifiedOverlay.stats()
 	stats := Stats{
-		CapacityBytes: cache.CapacityBytes, ResidentBytes: cache.ResidentBytes,
-		ReservedBytes:       cache.ReservedBytes,
+		CapacityBytes:       cache.CapacityBytes + overlayCapacity,
+		ResidentBytes:       cache.ResidentBytes + overlayResident,
+		ReservedBytes:       cache.ReservedBytes + overlayCapacity,
 		CommitCapacityBytes: c.committer.StagingCapacityBytes(),
-		PinnedPages:         cache.PinnedPages, DirtyBytes: cache.DirtyBytes,
-		PageReads: cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
+		PinnedPages:         cache.PinnedPages,
+		DirtyBytes:          cache.DirtyBytes + overlayDirty,
+		PageReads:           cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
 		CacheMisses: cache.Misses, CoalescedReads: cache.Coalesced, ReadErrors: cache.ReadErrors,
 		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,
 		PrefetchQueued: cache.PrefetchQueued, PrefetchDropped: cache.PrefetchDropped,
 		PrefetchQueueDepth: cache.QueueDepth, ReadQueueDepth: cache.ReadQueueDepth,
 		AsyncReadBatches: cache.AsyncReadBatches, LargestReadBatch: cache.LargestReadBatch,
-		PublishedGeneration: commit.PublishedGeneration, DurableGeneration: commit.DurableGeneration,
+		PublishedGeneration: max(commit.PublishedGeneration, current),
+		DurableGeneration: max(
+			commit.DurableGeneration,
+			c.journalDeltaGeneration.Load(),
+		),
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
-		SuppressedRootWrites:            commit.SuppressedRootWrites,
-		SuppressedRootBytes:             commit.SuppressedRootBytes,
-		SupersededRootWrites:            commit.SupersededRootWrites,
-		SupersededRootBytes:             commit.SupersededRootBytes,
-		TailWitnessWrites:               commit.TailWitnessWrites,
-		TailWitnessBytes:                commit.TailWitnessBytes,
-		PrewrittenPageWrites:            commit.PrewrittenPageWrites,
-		PrewrittenPageBytes:             commit.PrewrittenPageBytes,
-		AutomaticCheckpoints:            c.automaticCheckpoints.Load(),
-		RetirementPressureCheckpoints:   c.retirementPressureCheckpoints.Load(),
-		DeviceBytes:                     commit.DeviceBytes,
-		MaterializedBatches:             commit.MaterializedBatches,
-		MaterializationJournalBytes:     commit.MaterializationJournalBytes,
-		MaterializationTargetBytes:      commit.MaterializationTargetBytes,
-		MaterializationFullWriteBytes:   commit.MaterializationFullWriteBytes,
-		MaterializationBarriers:         commit.MaterializationBarriers,
-		MaterializationAttempts:         c.materializationAttempts.Load(),
-		MaterializationUpdates:          c.materializationUpdates.Load(),
-		MaterializationFallbacks:        c.materializationFallbacks.Load(),
-		MaterializationSnapshotSkips:    c.materializationSnapshotSkips.Load(),
-		MaterializationBusySkips:        c.materializationBusySkips.Load(),
-		BufferedInplaceAttempts:         c.bufferedInplaceAttempts.Load(),
-		BufferedInplaceUpdates:          c.bufferedInplaceUpdates.Load(),
-		BufferedInplaceFallbacks:        c.bufferedInplaceFallbacks.Load(),
-		BufferedFirstTouchOverflows:     c.bufferedFirstTouchOverflows.Load(),
-		JournalAcks:                     c.journalAcks.Load(),
-		ChainAcks:                       c.chainAcks.Load(),
-		JournalSyncs:                    c.journalSyncs.Load(),
-		JournalLargestGroup:             c.journalLargestGroup.Load(),
-		PrimaryLeafSplitRequired:        c.primaryLeafSplitRequired.Load(),
-		PrimaryEmptyLeaves:              c.primaryEmptyLeaves.Load(),
-		PrimaryLeafSplits:               c.primaryLeafSplits.Load(),
-		PrimaryLeafMerges:               c.primaryLeafMerges.Load(),
-		PrimaryLeafReclass:              c.primaryLeafReclass.Load(),
-		MergeReclassEvaluations:         c.mergeReclassEvaluations.Load(),
-		MergeReclassWarranted:           c.mergeReclassWarrantedHits.Load(),
-		MergeReclassCommits:             c.mergeReclassCommits.Load(),
-		MergeReclassAborts:              c.mergeReclassAborts.Load(),
-		MergeReclassSkips:               c.mergeReclassSkips.Load(),
-		PrimaryTemplateDetemplateEvents: storeio.TemplateColumnarDetemplateEvents(),
-		PrimaryTemplateReplanEvents:     storeio.TemplateColumnarReplanEvents(),
-		PrimaryMacroSplitRequired:       c.primaryMacroSplitRequired.Load(),
-		PrimarySplitMaxNS:               c.primarySplitMaxNS.Load(),
-		PrimaryMergeMaxNS:               c.primaryMergeMaxNS.Load(),
-		PrimaryReclassMaxNS:             c.primaryReclassMaxNS.Load(),
+		SuppressedRootWrites:          commit.SuppressedRootWrites,
+		SuppressedRootBytes:           commit.SuppressedRootBytes,
+		SupersededRootWrites:          commit.SupersededRootWrites,
+		SupersededRootBytes:           commit.SupersededRootBytes,
+		TailWitnessWrites:             commit.TailWitnessWrites,
+		TailWitnessBytes:              commit.TailWitnessBytes,
+		PrewrittenPageWrites:          commit.PrewrittenPageWrites,
+		PrewrittenPageBytes:           commit.PrewrittenPageBytes,
+		AutomaticCheckpoints:          c.automaticCheckpoints.Load(),
+		PrimaryOverlayFolds:           c.primaryOverlayFolds.Load(),
+		RetirementPressureCheckpoints: c.retirementPressureCheckpoints.Load(),
+		DeviceBytes:                   commit.DeviceBytes,
+		MaterializedBatches:           commit.MaterializedBatches,
+		MaterializationJournalBytes:   commit.MaterializationJournalBytes,
+		MaterializationTargetBytes:    commit.MaterializationTargetBytes,
+		MaterializationFullWriteBytes: commit.MaterializationFullWriteBytes,
+		MaterializationBarriers:       commit.MaterializationBarriers,
+		MaterializationAttempts:       c.materializationAttempts.Load(),
+		MaterializationUpdates:        c.materializationUpdates.Load(),
+		MaterializationFallbacks:      c.materializationFallbacks.Load(),
+		MaterializationSnapshotSkips:  c.materializationSnapshotSkips.Load(),
+		MaterializationBusySkips:      c.materializationBusySkips.Load(),
+		BufferedInplaceAttempts:       c.bufferedInplaceAttempts.Load(),
+		BufferedInplaceUpdates:        c.bufferedInplaceUpdates.Load(),
+		BufferedInplaceFallbacks:      c.bufferedInplaceFallbacks.Load(),
+		BufferedFirstTouchOverflows:   c.bufferedFirstTouchOverflows.Load(),
+		JournalAcks:                   c.journalAcks.Load(),
+		ChainAcks:                     c.chainAcks.Load(),
+		JournalSyncs:                  c.journalSyncs.Load(),
+		JournalLargestGroup:           c.journalLargestGroup.Load(),
+		JournalDeltaCheckpoints:       c.journalDeltaCheckpoints.Load(),
+		JournalDeltaRecords:           c.journalDeltaRecords.Load(),
+		JournalDeltaBytes:             c.journalDeltaBytes.Load(),
+		JournalDeltaFullFallbacks:     c.journalDeltaFullFallbacks.Load(),
+		PrimaryLeafSplitRequired:      c.primaryLeafSplitRequired.Load(),
+		PrimaryEmptyLeaves:            c.primaryEmptyLeaves.Load(),
+		PrimaryLeafSplits:             c.primaryLeafSplits.Load(),
+		PrimaryLeafMerges:             c.primaryLeafMerges.Load(),
+		PrimaryLeafReclass:            c.primaryLeafReclass.Load(),
+		MergeReclassEvaluations:       c.mergeReclassEvaluations.Load(),
+		MergeReclassWarranted:         c.mergeReclassWarrantedHits.Load(),
+		MergeReclassCommits:           c.mergeReclassCommits.Load(),
+		MergeReclassAborts:            c.mergeReclassAborts.Load(),
+		MergeReclassSkips:             c.mergeReclassSkips.Load(),
+		PrimaryMacroSplitRequired:     c.primaryMacroSplitRequired.Load(),
+		PrimarySplitMaxNS:             c.primarySplitMaxNS.Load(),
+		PrimaryMergeMaxNS:             c.primaryMergeMaxNS.Load(),
+		PrimaryReclassMaxNS:           c.primaryReclassMaxNS.Load(),
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch) + len(c.primaryRootScratch),
 		),
@@ -2963,17 +2964,33 @@ func (c *Collection) waitPublished(generation uint64) error {
 }
 
 // Flush waits until the current reader-visible generation is crash-safe.
+// Ordinary buffered-visible stores may satisfy this with a recovery-journal
+// batch over the unchanged durable root; pressure, exceptional mutations,
+// snapshots, and Close still fold a complete physical root.
 func (c *Collection) Flush() error {
 	if c == nil || c.committer == nil {
 		return ErrClosed
 	}
-	// The deferred canonical-frame lanes — buffered-visible and the
-	// journal-backed synchronous lane — hold acknowledged mutations in staged
-	// frames plus (on the sync lane) durable journal records, so Flush folds them
-	// into a checkpointed root and recycles the journal. The chunk sync and
-	// async-visible lanes already fence per generation, so Flush waits on the
-	// current one.
-	if c.buffered() || c.syncJournalLane() {
+	if c.buffered() {
+		c.writer.Lock()
+		defer c.writer.Unlock()
+		if c.closed {
+			return ErrClosed
+		}
+		deltaLane := c.bufferedJournalDeltaLane()
+		handled, err := c.checkpointBufferedJournalDeltaLocked()
+		if err != nil || handled {
+			return err
+		}
+		if deltaLane {
+			c.journalDeltaFullFallbacks.Add(1)
+		}
+		return c.checkpointBufferedLocked()
+	}
+	// The journal-backed synchronous lane already has durable redo records but
+	// Flush folds and recycles them. Async-visible and the chain-fence sync lane
+	// already publish through the committer and only need to wait.
+	if c.syncJournalLane() {
 		c.writer.Lock()
 		defer c.writer.Unlock()
 		if c.closed {
@@ -3014,12 +3031,22 @@ func (c *Collection) Close() error {
 	if c.closeDone {
 		return nil
 	}
+	var result error
+	poisoned := false
 	// Fold the final deferred window into a durable root and recycle the journal
 	// so a reopen replays nothing, for both buffered-visible and the
 	// journal-backed synchronous lane.
 	if c.buffered() || c.syncJournalLane() {
 		if err := c.checkpointBufferedLocked(); err != nil {
-			return err
+			// A sticky persistence failure cannot be repaired on this live
+			// handle, but it must not prevent Close from releasing the writer
+			// lock and owned I/O resources. Recovery on reopen is the repair
+			// path. Non-persistence checkpoint errors remain retryable.
+			if c.PersistenceError() == nil {
+				return err
+			}
+			result = errors.Join(result, err)
+			poisoned = true
 		}
 	}
 	// The epoch table closes before the lease table for the same reason the
@@ -3027,16 +3054,24 @@ func (c *Collection) Close() error {
 	// fail Close (and divert every later read) rather than race the arena
 	// release below.
 	if err := c.readEpochs.Close(); err != nil {
-		return err
+		return errors.Join(result, err)
 	}
 	if err := c.leases.Close(); err != nil {
-		return err
+		return errors.Join(result, err)
 	}
 	if err := c.closeResourcesLocked(); err != nil {
-		return err
+		result = errors.Join(result, err)
+		if !poisoned {
+			return result
+		}
+	}
+	// A failed writer unlock is the one cleanup error that must remain
+	// retryable: until it succeeds, reopening the file for mutation is not safe.
+	if c.writerLocked {
+		return result
 	}
 	c.closeDone = true
-	return nil
+	return result
 }
 
 func (c *Collection) closeResources() error {

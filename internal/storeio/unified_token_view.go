@@ -119,7 +119,7 @@ func (v *CommonPrimaryUnifiedLeafView) RowToken(body []byte, hole int) (UnifiedR
 			}
 			cursor += length
 		case tag == unifiedTokenLongLiteral:
-			length, n, ok := readDocumentGroupUvarint(body[cursor:])
+			length, n, ok := readUnifiedTokenUvarint(body[cursor:])
 			if !ok || length == 0 || uint64(length) > uint64(len(body)-cursor-n) {
 				return UnifiedRowToken{}, false
 			}

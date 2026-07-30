@@ -189,7 +189,7 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				source := compactPrimarySource(t, keys, docs)
+				source := unifiedPrimarySource(t, keys, docs)
 				fileEnd, err := CreateFromPrimary(source, f, options)
 				if err != nil {
 					t.Fatalf("CreateFromPrimary(%s): %v", file, err)
@@ -201,15 +201,9 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 			}
 			unifiedEnd := build("unified.vibe", Options{
 				ResidentBytes: 256 << 20, Backend: BackendPortable,
-				UnifiedLeaves: true, Durability: DurabilityAsyncVisible,
-			})
-			compactEnd := build("compact.vibe", Options{
-				ResidentBytes: 256 << 20, Backend: BackendPortable,
-				DocumentFormat: DocumentFormatCompact,
-				Durability:     DurabilityAsyncVisible,
+				Durability: DurabilityAsyncVisible,
 			})
 			unifiedPerDoc := float64(unifiedEnd) / n
-			compactPerDoc := float64(compactEnd) / n
 
 			reopened, err := os.OpenFile(filepath.Join(dir, "unified.vibe"), os.O_RDWR, 0o600)
 			if err != nil {
@@ -229,8 +223,8 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 			if census.rows != n {
 				t.Fatalf("census rows %d want %d", census.rows, n)
 			}
-			t.Logf("[%s] raw=%.1f B/doc unified=%.2f B/doc compact=%.2f B/doc (gate ≤ %.1f)",
-				name, float64(rawBytes)/n, unifiedPerDoc, compactPerDoc, gates[name])
+			t.Logf("[%s] raw=%.1f B/doc unified=%.2f B/doc (gate ≤ %.1f)",
+				name, float64(rawBytes)/n, unifiedPerDoc, gates[name])
 			t.Logf("[%s] census: leaves=%d rows=%d shapes/leaf=%.2f dict/leaf=%.1f trivial=%d (%.4f%%) leavesByExtent=%v rowsByExtent=%v",
 				name, census.leaves, census.rows,
 				float64(census.templates)/float64(census.leaves),
@@ -241,10 +235,6 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 			if unifiedPerDoc > gates[name] {
 				t.Fatalf("[%s] unified space %.2f B/doc exceeds the gate %.1f",
 					name, unifiedPerDoc, gates[name])
-			}
-			if unifiedPerDoc > compactPerDoc {
-				t.Fatalf("[%s] unified space %.2f B/doc exceeds compact %.2f on the same corpus",
-					name, unifiedPerDoc, compactPerDoc)
 			}
 		})
 	}

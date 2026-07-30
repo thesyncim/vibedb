@@ -154,12 +154,9 @@ func BenchmarkFilePrimaryPut(b *testing.B) {
 	}
 }
 
-// BenchmarkFilePrimaryPointReadTemplate mirrors BenchmarkFilePrimaryPointRead
-// but over a template-friendly corpus, so the leaves under the probe are the
-// template-columnar class and each hit pays the splice. It reports the ns/op so
-// the splice's cost against the raw point read is visible; it also asserts that
-// the corpus actually selected the template class.
-func BenchmarkFilePrimaryPointReadTemplate(b *testing.B) {
+// BenchmarkFilePrimaryPointReadUnifiedShape measures class-5 point reads over
+// a shape-redundant corpus, including row-body reconstruction.
+func BenchmarkFilePrimaryPointReadUnifiedShape(b *testing.B) {
 	if testing.Short() {
 		b.Skip("100k-document corpus is too slow for -short")
 	}
@@ -167,7 +164,7 @@ func BenchmarkFilePrimaryPointReadTemplate(b *testing.B) {
 	built, keys, _ := buildRedundantPrimaryCorpus(b, count)
 	options := Options{ResidentBytes: 64 << 20, Backend: BackendPortable}
 	file, err := os.OpenFile(
-		filepath.Join(b.TempDir(), "primary-template-read.vibe"),
+		filepath.Join(b.TempDir(), "primary-unified-read.vibe"),
 		os.O_RDWR|os.O_CREATE, 0o600,
 	)
 	if err != nil {
@@ -185,13 +182,10 @@ func BenchmarkFilePrimaryPointReadTemplate(b *testing.B) {
 	classCounts := filePrimaryLeafClassCounts(
 		b, file, collection.state.Load().root,
 	)
-	if classCounts[storeio.CommonPrimaryLeafTemplate] == 0 {
-		b.Fatalf("no template leaves selected; split = %v", classCounts)
+	if classCounts[storeio.CommonPrimaryLeafUnified] == 0 {
+		b.Fatalf("no unified leaves selected; split = %v", classCounts)
 	}
-	b.Logf("leaf class split narrow=%d wide=%d template=%d",
-		classCounts[storeio.CommonPrimaryLeafNarrow],
-		classCounts[storeio.CommonPrimaryLeafWide],
-		classCounts[storeio.CommonPrimaryLeafTemplate])
+	b.Logf("unified leaves=%d", classCounts[storeio.CommonPrimaryLeafUnified])
 
 	order := benchReadProbeOrder(count)
 	// Precompute probe keys as []byte outside the timed loop to hold the

@@ -51,12 +51,6 @@ type Config struct {
 	// PutLoop asks an engine that has both a bulk path and a mutation-replay
 	// path to use the latter. Only store/durable distinguishes them.
 	PutLoop bool
-	// Compact asks store/durable's bulk builder for its compact immutable
-	// document representation. The safe default is false: ordinary Put-built
-	// files and the default CreateFromPrimary path are verbatim. Compact and
-	// PutLoop are mutually exclusive because ordinary mutations do not emit
-	// compact pages.
-	Compact bool
 	// Untuned reverts the call-shape tuning this harness applies, so a row can
 	// show what the engine's own defaults cost and no tuning claim has to be
 	// taken on trust. BenchmarkTuning reports every tuned/untuned pair.

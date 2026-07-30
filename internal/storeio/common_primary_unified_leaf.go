@@ -28,6 +28,7 @@ import (
 //	  u16 dictionaryCount          (≤ 128: dict ids occupy token tags 0..127)
 //	  u32 templateSectionBytes     (directory + entries)
 //	  u32 dictionarySectionBytes   (directory + value spellings)
+//	  u32 trivialContentBytes      (exact no-compression fold envelope)
 //	template section: cumulative u32 ends (relative to the entry data start),
 //	  then per template the document_group entry layout (§3.3, reused):
 //	  u16 holeCount | u16 zero | u32 staticBytes |
@@ -54,7 +55,7 @@ const (
 	// commonPrimaryUnifiedHeaderBytes frames the two unified sections. The
 	// counts are duplicated from the section directories so an open can bound
 	// every section arithmetic check before touching section bytes.
-	commonPrimaryUnifiedHeaderBytes = 12
+	commonPrimaryUnifiedHeaderBytes = 16
 
 	// Token tags (§3.4). Dict ids and short-literal ranges are disjoint,
 	// following the document-group scheme, extended with the typed tags whose
@@ -78,7 +79,6 @@ const (
 	// unifiedMaxTemplates caps template ids at the values a row's leading byte
 	// can name without colliding with the trivial tag.
 	unifiedMaxTemplates = 255
-
 	// unifiedNarrowExtentMaxRows caps rows in a 4 KiB extent. The envelope's
 	// one-byte select checkpoints (commonPrimaryLeafLayoutFor keys the width on
 	// extent == 4 KiB) encode a bitmap position of (offset>>8) + boundaryIndex;
@@ -139,7 +139,7 @@ type UnifiedPrimaryLeafBuilder struct {
 	indexStore   []vibejson.IndexEntry
 	ws           CanonicalWorkspace
 	heap         []byte
-	spans        []DocumentGroupSpan
+	spans        []UnifiedTokenSpan
 	rows         []unifiedPrimaryLeafRow
 	shapes       []unifiedPrimaryLeafShape
 	records      []CommonPrimaryLeafRecord
@@ -147,8 +147,10 @@ type UnifiedPrimaryLeafBuilder struct {
 	shapeRows    []int32
 	shapeSavings []int64
 	counts       map[string]int
-	dictionary   []documentGroupDictionaryCandidate
+	dictionary   []unifiedDictionaryCandidate
 	dictionaryID map[string]uint8
+	patchValues  []unifiedPrimaryPatchValueDelta
+	patchInteger [24]byte
 }
 
 // NewUnifiedPrimaryLeafBuilder returns a builder with modest starting scratch.
@@ -193,13 +195,13 @@ func (b *UnifiedPrimaryLeafBuilder) buildIndex(src []byte) (vibejson.Index, erro
 // design reuses (§3.3): a non-key tape leaf with Next == 1, which places
 // holes at scalar leaves of arbitrary depth and makes empty containers holes
 // too — nesting never disqualifies (§6).
-func appendHoleSpans(dst []DocumentGroupSpan, index vibejson.Index) []DocumentGroupSpan {
+func appendHoleSpans(dst []UnifiedTokenSpan, index vibejson.Index) []UnifiedTokenSpan {
 	for i := range index.Entries {
 		e := &index.Entries[i]
 		if e.Flags()&vibejson.TapeFlagKey != 0 || e.Next != 1 {
 			continue
 		}
-		dst = append(dst, DocumentGroupSpan{Start: e.Start, End: e.End})
+		dst = append(dst, UnifiedTokenSpan{Start: e.Start, End: e.End})
 	}
 	return dst
 }
@@ -235,12 +237,28 @@ func unifiedTypedTokenCost(v []byte) int {
 	if len(v) <= unifiedTokenShortMax {
 		return 1 + len(v)
 	}
-	return 1 + documentGroupUvarintLen(uint32(len(v))) + len(v)
+	return 1 + unifiedTokenUvarintLen(uint32(len(v))) + len(v)
+}
+
+// unifiedDictionaryEligible is the single policy gate shared by the full
+// planner and the checkpoint patch certificate. Canonical integers are already
+// represented by a typed zigzag varint, so dictionarying them buys marginal
+// bytes at the cost of making every integer replacement depend on a leaf-wide
+// frequency census. Keeping integers out of the dictionary makes an
+// equal-token-cost integer replacement locally plan-stable. The one-byte typed
+// spellings are excluded for the simpler reason that a dictionary reference
+// cannot improve on them.
+func unifiedDictionaryEligible(v []byte) bool {
+	if unifiedTypedTokenCost(v) == 1 {
+		return false
+	}
+	_, integer := CanonicalIntValue(v)
+	return !integer
 }
 
 // shapeEqual reports whether rows a and b share one skeleton: identical hole
 // counts and identical static bytes between (and around) the holes. This is
-// documentGroupStaticEqual restated over the builder's span storage.
+// static template equality restated over the builder's span storage.
 func (b *UnifiedPrimaryLeafBuilder) shapeEqual(a, bi int) bool {
 	ra, rb := &b.rows[a], &b.rows[bi]
 	if ra.spanEnd-ra.spanStart != rb.spanEnd-rb.spanStart {
@@ -367,7 +385,7 @@ func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) e
 // least what the predicate charged, and the choice is a pure function of the
 // prefix's rows. This deviation is flagged in the stage report.
 func (b *UnifiedPrimaryLeafBuilder) planPrefix(count int) (*unifiedPrefixPlan, error) {
-	if count < 1 || count > len(b.rows) {
+	if count < 0 || count > len(b.rows) {
 		return nil, fmt.Errorf("%w: unified prefix count", ErrInvalidWrite)
 	}
 	plan := &b.plan
@@ -426,12 +444,6 @@ func (b *UnifiedPrimaryLeafBuilder) planPrefix(count int) (*unifiedPrefixPlan, e
 	} else {
 		clear(b.counts)
 	}
-	if b.dictionaryID == nil {
-		b.dictionaryID = make(map[string]uint8, unifiedTokenDictLimit)
-	} else {
-		clear(b.dictionaryID)
-	}
-	b.dictionary = b.dictionary[:0]
 	for i := 0; i < count; i++ {
 		row := &b.rows[i]
 		if row.shape < 0 || plan.templated[row.shape] < 0 {
@@ -439,34 +451,17 @@ func (b *UnifiedPrimaryLeafBuilder) planPrefix(count int) (*unifiedPrefixPlan, e
 		}
 		canonical := b.canonicalOf(i)
 		for _, span := range b.spans[row.spanStart:row.spanEnd] {
+			value := canonical[span.Start:span.End]
+			if !unifiedDictionaryEligible(value) {
+				continue
+			}
 			// The builder heap and the borrowed records are stable for the
 			// whole plan cycle, so a read-only string view avoids copying
 			// every scalar merely to count candidates.
-			b.counts[byteview.String(canonical[span.Start:span.End])]++
+			b.counts[byteview.String(value)]++
 		}
 	}
-	for value, n := range b.counts {
-		cost := unifiedTypedTokenCost(byteview.Bytes(value))
-		saving := n*cost - (n + 4 + len(value))
-		if saving > 0 {
-			b.dictionary = append(b.dictionary, documentGroupDictionaryCandidate{
-				value: value, count: n, saving: saving,
-			})
-		}
-	}
-	slices.SortFunc(b.dictionary, func(x, y documentGroupDictionaryCandidate) int {
-		if x.saving != y.saving {
-			return y.saving - x.saving
-		}
-		return strings.Compare(x.value, y.value)
-	})
-	if len(b.dictionary) > unifiedTokenDictLimit {
-		b.dictionary = b.dictionary[:unifiedTokenDictLimit]
-	}
-	for id, candidate := range b.dictionary {
-		b.dictionaryID[candidate.value] = uint8(id)
-		plan.dictionaryBytes += 4 + len(candidate.value)
-	}
+	plan.dictionaryBytes = b.selectUnifiedDictionary()
 
 	for i := 0; i < count; i++ {
 		record := &b.records[i]
@@ -480,6 +475,43 @@ func (b *UnifiedPrimaryLeafBuilder) planPrefix(count int) (*unifiedPrefixPlan, e
 	plan.contentBytes = commonPrimaryUnifiedHeaderBytes +
 		plan.templateBytes + plan.dictionaryBytes + plan.heapBytes
 	return plan, nil
+}
+
+// selectUnifiedDictionary derives the deterministic dictionary from b.counts
+// and returns its encoded section bytes. The checkpoint patch certificate uses
+// this exact routine after applying its changed-value deltas, preventing the
+// fast path and full planner from developing subtly different ranking rules.
+func (b *UnifiedPrimaryLeafBuilder) selectUnifiedDictionary() int {
+	if b.dictionaryID == nil {
+		b.dictionaryID = make(map[string]uint8, unifiedTokenDictLimit)
+	} else {
+		clear(b.dictionaryID)
+	}
+	b.dictionary = b.dictionary[:0]
+	for value, n := range b.counts {
+		cost := unifiedTypedTokenCost(byteview.Bytes(value))
+		saving := n*cost - (n + 4 + len(value))
+		if saving > 0 {
+			b.dictionary = append(b.dictionary, unifiedDictionaryCandidate{
+				value: value, count: n, saving: saving,
+			})
+		}
+	}
+	slices.SortFunc(b.dictionary, func(x, y unifiedDictionaryCandidate) int {
+		if x.saving != y.saving {
+			return y.saving - x.saving
+		}
+		return strings.Compare(x.value, y.value)
+	})
+	if len(b.dictionary) > unifiedTokenDictLimit {
+		b.dictionary = b.dictionary[:unifiedTokenDictLimit]
+	}
+	dictionaryBytes := 0
+	for id, candidate := range b.dictionary {
+		b.dictionaryID[candidate.value] = uint8(id)
+		dictionaryBytes += 4 + len(candidate.value)
+	}
+	return dictionaryBytes
 }
 
 // rowBodyBytes is the encoded row-body cost of row i under plan, counting
@@ -548,7 +580,7 @@ func (b *UnifiedPrimaryLeafBuilder) appendRowBody(dst []byte, i int, plan *unifi
 		} else {
 			dst = append(dst, unifiedTokenLongLiteral)
 			var lengthBytes [5]byte
-			n := putDocumentGroupUvarint(lengthBytes[:], uint32(len(value)))
+			n := putUnifiedTokenUvarint(lengthBytes[:], uint32(len(value)))
 			dst = append(dst, lengthBytes[:n]...)
 		}
 		dst = append(dst, value...)
@@ -565,14 +597,11 @@ func (b *UnifiedPrimaryLeafBuilder) appendRowBody(dst []byte, i int, plan *unifi
 // than that envelope can carry. The cap dies with that path in U2.
 func (b *UnifiedPrimaryLeafBuilder) rawRenderCapacity(extentBytes int) int {
 	capacity := extentBytes - PageHeaderSize - PageTrailerSize
-	recordBytes := 0
+	contentBytes := commonPrimaryUnifiedHeaderBytes
 	count := 0
 	for count < CommonPrimaryLeafWideSlots && count < len(b.rows) {
-		valueBytes := int(b.rows[count].length)
-		if b.rows[count].shape < 0 {
-			valueBytes = CommonPrimaryLeafOverflowBytes
-		}
-		grown := recordBytes + len(b.records[count].Key) + valueBytes
+		grown := contentBytes + len(b.records[count].Key) +
+			b.trivialValueBytes(count)
 		if len(b.records[count].Key) >= commonPrimaryLeafEscapeLength {
 			grown++
 		}
@@ -582,10 +611,61 @@ func (b *UnifiedPrimaryLeafBuilder) rawRenderCapacity(extentBytes int) int {
 		if layout.heapStart+grown > capacity {
 			break
 		}
-		recordBytes = grown
+		contentBytes = grown
 		count++
 	}
 	return count
+}
+
+func (b *UnifiedPrimaryLeafBuilder) trivialValueBytes(row int) int {
+	if b.rows[row].shape < 0 {
+		return CommonPrimaryLeafOverflowBytes
+	}
+	return 1 + int(b.rows[row].length)
+}
+
+func (b *UnifiedPrimaryLeafBuilder) trivialContentBytes(count int) int {
+	total := commonPrimaryUnifiedHeaderBytes
+	for row := 0; row < count; row++ {
+		total += len(b.records[row].Key) + b.trivialValueBytes(row)
+		if len(b.records[row].Key) >= commonPrimaryLeafEscapeLength {
+			total++
+		}
+	}
+	return total
+}
+
+// CommonPrimaryUnifiedTrivialFits reports whether count rows with the supplied
+// exact no-compression content byte total fit the maximum class-5 extent. The
+// total includes the unified header, encoded keys, row tags/values, and
+// overflow descriptors, but not the succinct envelope tables.
+func CommonPrimaryUnifiedTrivialFits(count, contentBytes int) bool {
+	if count < 0 || count > CommonPrimaryLeafWideSlots ||
+		contentBytes < commonPrimaryUnifiedHeaderBytes {
+		return false
+	}
+	capacity := CommonPrimaryLeafMaxExtentBytes -
+		PageHeaderSize - PageTrailerSize
+	layout := commonPrimaryLeafLayoutFor(
+		CommonPrimaryLeafWide, count, CommonPrimaryLeafMaxExtentBytes,
+	)
+	return layout.heapStart != 0 &&
+		layout.heapStart+contentBytes <= capacity
+}
+
+// CommonPrimaryUnifiedInsertedTrivialBytes reports the exact increase to a
+// class-5 leaf's no-compression content total for one new inline row. It
+// includes the encoded key, the trivial row tag, and value bytes.
+func CommonPrimaryUnifiedInsertedTrivialBytes(key []byte, valueBytes int) int {
+	if len(key) == 0 || len(key) > CommonPrimaryLeafMaxKeyBytes ||
+		valueBytes <= 0 {
+		return 0
+	}
+	total := len(key) + 1 + valueBytes
+	if len(key) >= commonPrimaryLeafEscapeLength {
+		total++
+	}
+	return total
 }
 
 // unifiedLeafExtents are the physical extents the §3.6 packing search tries,
@@ -721,6 +801,20 @@ func EncodeCommonPrimaryUnifiedLeaf(
 	bounds CommonPrimaryLeafBounds,
 	b *UnifiedPrimaryLeafBuilder,
 ) ([]byte, error) {
+	return encodeCommonPrimaryUnifiedLeaf(
+		dst, header, seed, records, bounds, b, true,
+	)
+}
+
+func encodeCommonPrimaryUnifiedLeaf(
+	dst []byte,
+	header CommonPrimaryLeafHeader,
+	seed [16]byte,
+	records []CommonPrimaryLeafRecord,
+	bounds CommonPrimaryLeafBounds,
+	b *UnifiedPrimaryLeafBuilder,
+	place bool,
+) ([]byte, error) {
 	extent := int(header.PageSize)
 	logicalID, logicalOK := CommonPrimaryLeafLogicalID(header.Bucket)
 	if b == nil || !validPhysicalPageSize(header.PageSize) ||
@@ -728,7 +822,7 @@ func EncodeCommonPrimaryUnifiedLeaf(
 		extent > CommonPrimaryLeafMaxExtentBytes ||
 		len(dst) < extent || header.StoreID == ([16]byte{}) ||
 		header.Generation == 0 || header.Generation >= uint64(1)<<48 ||
-		seed == ([16]byte{}) || len(records) == 0 ||
+		seed == ([16]byte{}) ||
 		len(records) > CommonPrimaryLeafWideSlots ||
 		!logicalOK || !commonPrimaryLeafValidateBounds(bounds) {
 		return nil, fmt.Errorf("%w: unified leaf identity/class/bounds", ErrInvalidWrite)
@@ -753,10 +847,12 @@ func EncodeCommonPrimaryUnifiedLeaf(
 	if err != nil {
 		return nil, err
 	}
-	if err := PlaceCommonPrimaryLeafRecords(
-		CommonPrimaryLeafWide, seed, records,
-	); err != nil {
-		return nil, err
+	if place {
+		if err := PlaceCommonPrimaryLeafRecords(
+			CommonPrimaryLeafWide, seed, records,
+		); err != nil {
+			return nil, err
+		}
 	}
 	layout := commonPrimaryLeafLayoutFor(
 		CommonPrimaryLeafWide, len(records), extent,
@@ -779,8 +875,12 @@ func EncodeCommonPrimaryUnifiedLeaf(
 	if err != nil {
 		return nil, err
 	}
-	payload[0] = byte(len(records) - 1)
-	payload[2] = byte(CommonPrimaryLeafUnified)
+	if len(records) == 0 {
+		payload[2] = byte(CommonPrimaryLeafUnified) | 0x80
+	} else {
+		payload[0] = byte(len(records) - 1)
+		payload[2] = byte(CommonPrimaryLeafUnified)
+	}
 
 	// Envelope tables: identical machinery and byte meaning to the wide raw
 	// class (§3.1 — the slot, lookup, and boundary machinery is reused byte
@@ -832,6 +932,9 @@ func EncodeCommonPrimaryUnifiedLeaf(
 	binary.LittleEndian.PutUint16(payload[unifiedStart+2:], uint16(len(b.dictionary)))
 	binary.LittleEndian.PutUint32(payload[unifiedStart+4:], uint32(plan.templateBytes))
 	binary.LittleEndian.PutUint32(payload[unifiedStart+8:], uint32(plan.dictionaryBytes))
+	binary.LittleEndian.PutUint32(
+		payload[unifiedStart+12:], uint32(b.trivialContentBytes(len(records))),
+	)
 	templateDir := unifiedStart + commonPrimaryUnifiedHeaderBytes
 	templateData := templateDir + 4*len(plan.templateShapes)
 	cursor := templateData
@@ -914,6 +1017,62 @@ func EncodeCommonPrimaryUnifiedLeaf(
 	return page, nil
 }
 
+// EncodeBestCommonPrimaryUnifiedLeaf encodes the complete row set through the
+// class-5 planner, choosing its smallest winning extent. Unlike the bulk
+// planner it does not accept a prefix: every supplied row must fit one leaf.
+// Checkpoint folds use this entry so bulk and mutation history share one
+// deterministic encoder.
+func EncodeBestCommonPrimaryUnifiedLeaf(
+	dst []byte,
+	header CommonPrimaryLeafHeader,
+	seed [16]byte,
+	records []CommonPrimaryLeafRecord,
+	bounds CommonPrimaryLeafBounds,
+	builder *UnifiedPrimaryLeafBuilder,
+) ([]byte, error) {
+	if builder == nil {
+		return nil, fmt.Errorf("%w: unified fold input", ErrInvalidWrite)
+	}
+	if err := builder.extract(records); err != nil {
+		return nil, err
+	}
+	if len(records) > builder.rawRenderCapacity(
+		CommonPrimaryLeafMaxExtentBytes,
+	) {
+		return nil, ErrCommonPrimaryLeafFull
+	}
+	plan, err := builder.planPrefix(len(records))
+	if err != nil {
+		return nil, err
+	}
+	extent := 0
+	for _, candidate := range unifiedLeafExtents {
+		if candidate == CommonPrimaryLeafNarrowBytes &&
+			len(records) > unifiedNarrowExtentMaxRows {
+			continue
+		}
+		capacity := candidate - PageHeaderSize - PageTrailerSize
+		layout := commonPrimaryLeafLayoutFor(
+			CommonPrimaryLeafWide, len(records), candidate,
+		)
+		if layout.heapStart != 0 &&
+			layout.heapStart+plan.contentBytes <= capacity {
+			extent = candidate
+			break
+		}
+	}
+	if extent == 0 {
+		return nil, ErrCommonPrimaryLeafFull
+	}
+	if extent > len(dst) {
+		return nil, fmt.Errorf("%w: unified fold destination", ErrInvalidWrite)
+	}
+	header.PageSize = uint32(extent)
+	return encodeCommonPrimaryUnifiedLeaf(
+		dst[:extent], header, seed, records, bounds, builder, false,
+	)
+}
+
 // CommonPrimaryUnifiedLeafView is the borrowed, allocation-free read view over
 // one class-5 leaf. env is the succinct envelope view constructed at the wide
 // slot geometry with its heap start advanced past the unified sections, so
@@ -929,6 +1088,7 @@ type CommonPrimaryUnifiedLeafView struct {
 	dictionaryDir   int
 	dictionaryData  int
 	heapStart       int
+	trivialBytes    int
 }
 
 // unifiedSectionOffsets derives the section offsets from an already
@@ -945,8 +1105,10 @@ func unifiedSectionOffsets(
 	dictionaryCount := int(binary.LittleEndian.Uint16(payload[unifiedStart+2:]))
 	templateBytes := int(binary.LittleEndian.Uint32(payload[unifiedStart+4:]))
 	dictionaryBytes := int(binary.LittleEndian.Uint32(payload[unifiedStart+8:]))
+	trivialBytes := int(binary.LittleEndian.Uint32(payload[unifiedStart+12:]))
 	if templateCount > unifiedMaxTemplates ||
 		dictionaryCount > unifiedTokenDictLimit ||
+		trivialBytes < commonPrimaryUnifiedHeaderBytes ||
 		templateBytes < 4*templateCount || dictionaryBytes < 4*dictionaryCount ||
 		templateBytes > len(payload) || dictionaryBytes > len(payload) {
 		return v, false
@@ -958,6 +1120,7 @@ func unifiedSectionOffsets(
 	v.dictionaryDir = v.templateDir + templateBytes
 	v.dictionaryData = v.dictionaryDir + 4*dictionaryCount
 	v.heapStart = v.dictionaryDir + dictionaryBytes
+	v.trivialBytes = trivialBytes
 	if v.heapStart > len(payload) {
 		return v, false
 	}
@@ -994,7 +1157,7 @@ func OpenCommonPrimaryUnifiedLeaf(
 	}
 	logicalID, _ := CommonPrimaryLeafLogicalID(bucket)
 	if len(payload) < commonPrimaryLeafPayloadHeader ||
-		payload[2] != byte(CommonPrimaryLeafUnified) ||
+		payload[2]&0x7f != byte(CommonPrimaryLeafUnified) ||
 		len(src) < int(pageHeader.PageSize) ||
 		pageHeader.LogicalID != logicalID ||
 		pageHeader.LogicalID != expected.LogicalID ||
@@ -1005,10 +1168,14 @@ func OpenCommonPrimaryUnifiedLeaf(
 			"%w: common identity or unified header", ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	// A unified leaf always holds at least one row: the empty creation leaf
-	// stays a narrow raw leaf, and the planner never emits an empty plan, so
-	// the class-5 empty spelling (0x80 flag) is rejected outright.
-	count := int(payload[0]) + 1
+	count := 0
+	if payload[2]&0x80 == 0 {
+		count = int(payload[0]) + 1
+	} else if payload[0] != 0 {
+		return CommonPrimaryUnifiedLeafView{}, fmt.Errorf(
+			"%w: unified empty count encoding", ErrCommonPrimaryLeafCorrupt,
+		)
+	}
 	stashCount := int(payload[1])
 	layout := commonPrimaryLeafLayoutFor(
 		CommonPrimaryLeafWide, count, int(pageHeader.PageSize),
@@ -1070,10 +1237,13 @@ func AdmittedCommonPrimaryUnifiedLeaf(
 		return CommonPrimaryUnifiedLeafView{}, false
 	}
 	payload := src[PageHeaderSize:payloadEnd:payloadEnd]
-	if payload[2] != byte(CommonPrimaryLeafUnified) {
+	if payload[2]&0x7f != byte(CommonPrimaryLeafUnified) {
 		return CommonPrimaryUnifiedLeafView{}, false
 	}
-	count := int(payload[0]) + 1
+	count := 0
+	if payload[2]&0x80 == 0 {
+		count = int(payload[0]) + 1
+	}
 	layout := commonPrimaryLeafLayoutFor(
 		CommonPrimaryLeafWide, count, int(pageHeader.PageSize),
 	)
@@ -1151,6 +1321,40 @@ func (v *CommonPrimaryUnifiedLeafView) dictionaryEntry(id int) ([]byte, bool) {
 	return payload[at+int(previous) : at+int(end) : at+int(end)], true
 }
 
+// admittedTemplateEntry is the PageCache-admitted counterpart of
+// templateEntry. OpenCommonPrimaryUnifiedLeaf already proved the directory,
+// entry header, hole table, and static byte bounds before the frame became
+// reader-visible, so a lease over that immutable frame does not need to repeat
+// those branches for every row it renders.
+func (v *CommonPrimaryUnifiedLeafView) admittedTemplateEntry(id int) unifiedTemplateView {
+	payload := v.env.payload
+	previous := uint32(0)
+	if id != 0 {
+		previous = binary.LittleEndian.Uint32(payload[v.templateDir+(id-1)*4:])
+	}
+	end := binary.LittleEndian.Uint32(payload[v.templateDir+id*4:])
+	entry := payload[v.templateData+int(previous) : v.templateData+int(end)]
+	holes := int(binary.LittleEndian.Uint16(entry[0:2]))
+	endsBytes := (holes + 1) * 4
+	return unifiedTemplateView{
+		holes: holes, ends: entry[8 : 8+endsBytes], static: entry[8+endsBytes:],
+	}
+}
+
+// admittedDictionaryEntry is the PageCache-admitted counterpart of
+// dictionaryEntry. The id and cumulative directory were validated together
+// with every row token at frame admission.
+func (v *CommonPrimaryUnifiedLeafView) admittedDictionaryEntry(id int) []byte {
+	payload := v.env.payload
+	previous := uint32(0)
+	if id != 0 {
+		previous = binary.LittleEndian.Uint32(payload[v.dictionaryDir+(id-1)*4:])
+	}
+	end := binary.LittleEndian.Uint32(payload[v.dictionaryDir+id*4:])
+	at := v.dictionaryData
+	return payload[at+int(previous) : at+int(end) : at+int(end)]
+}
+
 // validateSections proves every unified section independently: the template
 // directory and each entry's segment table, the dictionary directory, and —
 // per row — the body classification and a complete bounds-checked token walk
@@ -1203,12 +1407,18 @@ func (v *CommonPrimaryUnifiedLeafView) validateSections() error {
 	if v.dictionaryData+int(previous) != v.heapStart {
 		return corrupt("dictionary section length")
 	}
+	trivialBytes := commonPrimaryUnifiedHeaderBytes
 	for rank := 0; rank < v.env.Len(); rank++ {
-		_, valueStart, end, ok := v.env.keyBounds(rank)
+		key, valueStart, end, ok := v.env.keyBounds(rank)
 		if !ok {
 			return corrupt("row bounds")
 		}
+		trivialBytes += len(key)
+		if len(key) >= commonPrimaryLeafEscapeLength {
+			trivialBytes++
+		}
 		if v.env.rankOverflow(rank) {
+			trivialBytes += CommonPrimaryLeafOverflowBytes
 			continue // the envelope validator already proved the PageRef
 		}
 		body := v.env.payload[valueStart:end]
@@ -1219,61 +1429,83 @@ func (v *CommonPrimaryUnifiedLeafView) validateSections() error {
 			if len(body) < 2 {
 				return corrupt("trivial row body")
 			}
+			trivialBytes += len(body)
 			continue
 		}
 		entry, ok := v.templateEntry(int(body[0]))
 		if !ok {
 			return corrupt("row template id")
 		}
-		if !v.tokenStreamValid(body[1:], entry.holes) {
+		renderBytes, valid := v.tokenStreamRenderBytes(
+			body[1:], entry.holes,
+		)
+		if !valid {
 			return corrupt("row token stream")
 		}
+		trivialBytes += 1 + len(entry.static) + renderBytes
+	}
+	if trivialBytes != v.trivialBytes ||
+		!CommonPrimaryUnifiedTrivialFits(v.env.Len(), trivialBytes) {
+		return corrupt("trivial content length")
 	}
 	return nil
 }
 
-// tokenStreamValid walks holes tokens over body and reports whether the walk
-// is in bounds, every tag is assigned, every dictionary reference resolves,
-// every zigzag varint decodes, and the stream ends exactly at the body end.
-func (v *CommonPrimaryUnifiedLeafView) tokenStreamValid(body []byte, holes int) bool {
+// tokenStreamRenderBytes walks the hole tokens over body and reports their
+// exact canonical render length while proving bounds and exact termination.
+func (v *CommonPrimaryUnifiedLeafView) tokenStreamRenderBytes(
+	body []byte, holes int,
+) (int, bool) {
 	cursor := 0
+	renderBytes := 0
 	for range holes {
 		if cursor >= len(body) {
-			return false
+			return 0, false
 		}
 		tag := body[cursor]
 		cursor++
 		switch {
 		case tag < unifiedTokenDictLimit:
 			if int(tag) >= v.dictionaryCount {
-				return false
+				return 0, false
 			}
+			entry, ok := v.dictionaryEntry(int(tag))
+			if !ok {
+				return 0, false
+			}
+			renderBytes += len(entry)
 		case tag >= unifiedTokenShortBase && tag < unifiedTokenShortBase+unifiedTokenShortMax:
 			length := int(tag-unifiedTokenShortBase) + 1
 			if length > len(body)-cursor {
-				return false
+				return 0, false
 			}
 			cursor += length
+			renderBytes += length
 		case tag == unifiedTokenLongLiteral:
-			length, n, ok := readDocumentGroupUvarint(body[cursor:])
+			length, n, ok := readUnifiedTokenUvarint(body[cursor:])
 			if !ok || length == 0 || uint64(length) > uint64(len(body)-cursor-n) {
-				return false
+				return 0, false
 			}
 			cursor += n + int(length)
-		case tag == unifiedTokenTrue, tag == unifiedTokenFalse, tag == unifiedTokenNull:
-			// tag-only
+			renderBytes += int(length)
+		case tag == unifiedTokenTrue, tag == unifiedTokenNull:
+			renderBytes += 4
+		case tag == unifiedTokenFalse:
+			renderBytes += 5
 		case tag == unifiedTokenInt:
-			_, n := DecodeZigzagVarint(body[cursor:])
+			value, n := DecodeZigzagVarint(body[cursor:])
 			if n == 0 {
-				return false
+				return 0, false
 			}
 			cursor += n
+			var integer [24]byte
+			renderBytes += len(AppendCanonicalInt(integer[:0], value))
 		default:
 			// 0xFD/0xFE unassigned; 0xFF never appears inside a token stream.
-			return false
+			return 0, false
 		}
 	}
-	return cursor == len(body)
+	return renderBytes, cursor == len(body)
 }
 
 // Len returns the number of live rows.
@@ -1290,6 +1522,15 @@ func (v *CommonPrimaryUnifiedLeafView) Header() CommonPrimaryLeafHeader {
 		return CommonPrimaryLeafHeader{}
 	}
 	return v.env.Header()
+}
+
+// TrivialContentBytes returns the exact content bytes needed if every inline
+// row in this leaf lost all compression and used the trivial row spelling.
+func (v *CommonPrimaryUnifiedLeafView) TrivialContentBytes() int {
+	if v == nil {
+		return 0
+	}
+	return v.trivialBytes
 }
 
 // TemplateCount reports the leaf's template table size (census deliverable).
@@ -1344,10 +1585,22 @@ func (v *CommonPrimaryUnifiedLeafView) RowRawAt(rank int) (key, body []byte, ove
 		return nil, nil, false, false
 	}
 	key, valueStart, end, ok := v.env.keyBounds(rank)
-	if !ok {
+	if !ok || valueStart < 0 || end < valueStart || end > len(v.env.payload) {
 		return nil, nil, false, false
 	}
 	return key, v.env.payload[valueStart:end:end], v.env.rankOverflow(rank), true
+}
+
+// PostingSlots returns the stable posting slot for every lexical row rank.
+// Callers that walk a whole leaf compute the directory inversion once and
+// index the returned fixed array by rank.
+func (v *CommonPrimaryUnifiedLeafView) PostingSlots() (
+	[CommonPrimaryLeafWideSlots]uint8, bool,
+) {
+	if v == nil {
+		return [CommonPrimaryLeafWideSlots]uint8{}, false
+	}
+	return v.env.rankSlots()
 }
 
 // AppendRowBody splices the canonical document a templated or trivial row
@@ -1399,7 +1652,7 @@ func (v *CommonPrimaryUnifiedLeafView) AppendRowBody(dst, body []byte) ([]byte, 
 			dst = append(dst, body[cursor:cursor+length]...)
 			cursor += length
 		case tag == unifiedTokenLongLiteral:
-			length, n, okLength := readDocumentGroupUvarint(body[cursor:])
+			length, n, okLength := readUnifiedTokenUvarint(body[cursor:])
 			if !okLength || uint64(length) > uint64(len(body)-cursor-n) {
 				return dst[:start], false
 			}
@@ -1431,6 +1684,183 @@ func (v *CommonPrimaryUnifiedLeafView) AppendRowBody(dst, body []byte) ([]byte, 
 	return append(dst, entry.static[segPrevious:]...), true
 }
 
+// AppendAdmittedRowBody is the zero-allocation render path for a row body
+// borrowed from this view's admitted envelope. PageCache admission has already
+// performed AppendRowBody's complete structural walk: template ids, segment
+// ends, dictionary ids, literal lengths, varints, and exact token-stream
+// termination. A page lease keeps those immutable bytes stable for the call.
+//
+// Keeping the checked AppendRowBody entry is important for arbitrary-byte
+// tests, verification, and defensive callers. Store read cursors use this
+// admitted entry so whole-document reads do not repay the corruption proof for
+// every row.
+func (v *CommonPrimaryUnifiedLeafView) AppendAdmittedRowBody(dst, body []byte) []byte {
+	if body[0] == unifiedRowTrivial {
+		return append(dst, body[1:]...)
+	}
+	entry := v.admittedTemplateEntry(int(body[0]))
+	cursor := 1
+	segPrevious := 0
+	for hole := 0; hole < entry.holes; hole++ {
+		segEnd := int(binary.LittleEndian.Uint32(entry.ends[hole*4:]))
+		dst = append(dst, entry.static[segPrevious:segEnd]...)
+		segPrevious = segEnd
+		tag := body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			dst = append(dst, v.admittedDictionaryEntry(int(tag))...)
+		case tag >= unifiedTokenShortBase && tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+	}
+	return append(dst, entry.static[segPrevious:]...)
+}
+
+// unifiedPrimaryRowRenderer is the sequential-scan resolver for one admitted
+// unified leaf. Reset resolves the dictionary directory once per leaf, while
+// Append retains the most recently used template. Lexically adjacent rows
+// overwhelmingly share a template, so the scan loop avoids re-decoding both
+// directories for every row and every token without allocating a side table.
+type unifiedPrimaryRowRenderer struct {
+	view             CommonPrimaryUnifiedLeafView
+	template         unifiedTemplateView
+	dictionaryData   []byte
+	dictionaryBounds [unifiedTokenDictLimit]uint64
+	templateID       uint8
+	templateSet      bool
+	threeHoles       bool
+	threeStatic      [4][]byte
+}
+
+func (r *unifiedPrimaryRowRenderer) Reset(
+	view CommonPrimaryUnifiedLeafView,
+) {
+	r.view = view
+	r.templateSet = false
+	r.dictionaryData =
+		view.env.payload[view.dictionaryData:view.heapStart:view.heapStart]
+	var previous uint32
+	for id := 0; id < view.dictionaryCount; id++ {
+		end := binary.LittleEndian.Uint32(
+			view.env.payload[view.dictionaryDir+id*4:],
+		)
+		r.dictionaryBounds[id] =
+			uint64(previous) | uint64(end)<<32
+		previous = end
+	}
+}
+
+// Append reconstructs one admitted inline row using Reset's leaf-local
+// resolver state. Page admission has already proved every body and directory
+// bound, so this is intentionally branch-light and fail-free.
+func (r *unifiedPrimaryRowRenderer) Append(dst, body []byte) []byte {
+	if body[0] == unifiedRowTrivial {
+		return append(dst, body[1:]...)
+	}
+	templateID := body[0]
+	if !r.templateSet || r.templateID != templateID {
+		r.template = r.view.admittedTemplateEntry(int(templateID))
+		r.templateID = templateID
+		r.templateSet = true
+		r.threeHoles = r.template.holes == 3
+		if r.threeHoles {
+			end0 := int(binary.LittleEndian.Uint32(r.template.ends))
+			end1 := int(binary.LittleEndian.Uint32(r.template.ends[4:]))
+			end2 := int(binary.LittleEndian.Uint32(r.template.ends[8:]))
+			static := r.template.static
+			r.threeStatic = [4][]byte{
+				static[:end0:end0],
+				static[end0:end1:end1],
+				static[end1:end2:end2],
+				static[end2:],
+			}
+		}
+	}
+	// Three scalar holes are the dominant document shape in ordered scans.
+	// Its overwhelmingly common token signature is two canonical integers
+	// followed by a short string. Recognize the admitted signature before
+	// touching dst, then render it without the generic per-hole loop and
+	// switch. Other signatures retain the complete generic path below.
+	if r.threeHoles && body[1] == unifiedTokenInt {
+		value0, n0 := DecodeZigzagVarint(body[2:])
+		token1 := 2 + n0
+		if body[token1] == unifiedTokenInt {
+			value1, n1 := DecodeZigzagVarint(body[token1+1:])
+			token2 := token1 + 1 + n1
+			tag2 := body[token2]
+			if tag2 >= unifiedTokenShortBase &&
+				tag2 < unifiedTokenShortBase+unifiedTokenShortMax {
+				length2 := int(tag2-unifiedTokenShortBase) + 1
+				literal2 := token2 + 1
+				if literal2+length2 == len(body) {
+					dst = append(dst, r.threeStatic[0]...)
+					dst = AppendCanonicalInt(dst, value0)
+					dst = append(dst, r.threeStatic[1]...)
+					dst = AppendCanonicalInt(dst, value1)
+					dst = append(dst, r.threeStatic[2]...)
+					dst = append(dst, body[literal2:]...)
+					return append(dst, r.threeStatic[3]...)
+				}
+			}
+		}
+	}
+	entry := r.template
+	cursor := 1
+	segPrevious := 0
+	for hole := 0; hole < entry.holes; hole++ {
+		segEnd := int(binary.LittleEndian.Uint32(entry.ends[hole*4:]))
+		dst = append(dst, entry.static[segPrevious:segEnd]...)
+		segPrevious = segEnd
+		tag := body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			bounds := r.dictionaryBounds[tag]
+			start, end := uint32(bounds), uint32(bounds>>32)
+			dst = append(dst, r.dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+	}
+	return append(dst, entry.static[segPrevious:]...)
+}
+
 // AppendRawRank splices the canonical document at lexical rank onto dst. It
 // reports false for overflow rows (whose canonical bytes live in the chain)
 // and on structural corruption.
@@ -1442,17 +1872,65 @@ func (v *CommonPrimaryUnifiedLeafView) AppendRawRank(dst []byte, rank int) ([]by
 	return v.AppendRowBody(dst, body)
 }
 
-// LookupBodyHashed is the point-read hot path: the envelope's stable-slot
-// lookup resolves key to its raw row body (or overflow descriptor) with the
-// caller-supplied key hash, borrowing the admitted page.
+// LookupBodySlotHashed resolves key to its stable slot and raw row body (or
+// overflow descriptor) with the caller-supplied key hash. The body borrows the
+// admitted page.
+func (v *CommonPrimaryUnifiedLeafView) LookupBodySlotHashed(
+	hash uint64, key []byte,
+) (slot uint8, body []byte, overflow, ok bool) {
+	if v == nil {
+		return 0, nil, false, false
+	}
+	return v.env.LookupRawHashed(hash, key)
+}
+
+// LookupBodyHashed is the point-read hot path when the stable slot is not
+// needed.
 func (v *CommonPrimaryUnifiedLeafView) LookupBodyHashed(
 	hash uint64, key []byte,
 ) (body []byte, overflow, ok bool) {
-	if v == nil {
-		return nil, false, false
-	}
-	_, body, overflow, ok = v.env.LookupRawHashed(hash, key)
+	_, body, overflow, ok = v.LookupBodySlotHashed(hash, key)
 	return body, overflow, ok
+}
+
+// ChooseInsertSlotHashed returns the stable slot a new row may claim while
+// preserving every slot already present in the durable envelope and every bit
+// set in additional. additional represents overlay-native inserts that are not
+// in the durable envelope yet.
+func (v *CommonPrimaryUnifiedLeafView) ChooseInsertSlotHashed(
+	hash uint64, additional [4]uint64,
+) (uint8, bool) {
+	if v == nil || v.env.class != CommonPrimaryLeafWide {
+		return 0, false
+	}
+	occupied := func(slot uint8) bool {
+		return additional[slot>>6]&(uint64(1)<<uint(slot&63)) != 0
+	}
+	first, second := commonPrimaryLeafGroups(hash)
+	groups := [2]uint8{first, second}
+	homes := [2]uint8{
+		uint8(hash>>16) & (commonPrimaryLeafGroupSize - 1),
+		uint8(hash>>20) & (commonPrimaryLeafGroupSize - 1),
+	}
+	for groupIndex := range 2 {
+		base := groups[groupIndex] * commonPrimaryLeafGroupSize
+		for ordinal := range uint8(commonPrimaryLeafGroupSize) {
+			slot := base + (homes[groupIndex]+ordinal)&
+				(commonPrimaryLeafGroupSize-1)
+			if v.env.payload[v.env.layout.controlStart+int(slot)] == 0 &&
+				!occupied(slot) {
+				return slot, true
+			}
+		}
+	}
+	mask := v.env.stashMask()
+	for stash := 0; stash < v.env.class.stashSlots(); stash++ {
+		slot := uint8(CommonPrimaryLeafNormalSlots + stash)
+		if mask&(uint64(1)<<uint(stash)) == 0 && !occupied(slot) {
+			return slot, true
+		}
+	}
+	return 0, false
 }
 
 // FirstRankFrom returns the first lexical rank whose key is >= lower (0 for
@@ -1478,6 +1956,10 @@ func (v *CommonPrimaryUnifiedLeafView) RenderRecords(
 	records = records[:0]
 	heap = heap[:0]
 	n := v.env.Len()
+	slots, slotsOK := v.env.rankSlots()
+	if !slotsOK {
+		return records, heap, ErrCommonPrimaryLeafCorrupt
+	}
 	spans := make([][2]int, n)
 	overflowRefs := make([]PageRef, n)
 	for rank := 0; rank < n; rank++ {
@@ -1509,7 +1991,74 @@ func (v *CommonPrimaryUnifiedLeafView) RenderRecords(
 		} else {
 			value.Inline = heap[spans[rank][0]:spans[rank][1]:spans[rank][1]]
 		}
-		records = append(records, CommonPrimaryLeafRecord{Key: key, Value: value})
+		records = append(records, CommonPrimaryLeafRecord{
+			Slot: slots[rank], Key: key, Value: value,
+		})
 	}
 	return records, heap, nil
+}
+
+// renderRecordsInto is RenderRecords over the writer's fixed mutation
+// workspace. It is deliberately separate from the public slice-returning
+// helper: the scratch owns span/reference arrays as well as the output slices,
+// removing every temporary allocation from a warmed cold-leaf conversion.
+func (v *CommonPrimaryUnifiedLeafView) renderRecordsInto(
+	s *PrimaryLeafMutationScratch,
+) error {
+	if v == nil || !s.reset(v.env.Len()) {
+		return ErrCommonPrimaryLeafCorrupt
+	}
+	n := v.env.Len()
+	slots, slotsOK := v.env.rankSlots()
+	if !slotsOK {
+		return ErrCommonPrimaryLeafCorrupt
+	}
+	spans := s.spans[:n]
+	overflowRefs := s.overflowRefs[:n]
+	for rank := 0; rank < n; rank++ {
+		_, body, overflow, ok := v.RowRawAt(rank)
+		if !ok {
+			return ErrCommonPrimaryLeafCorrupt
+		}
+		if overflow {
+			overflowRefs[rank] = decodePageRef(body)
+			spans[rank] = [2]int{-1, -1}
+			continue
+		}
+		start := len(s.heap)
+		out, rendered := v.AppendAdmittedRowBody(s.heap, body), true
+		if !rendered || len(out) > cap(s.heap) {
+			return ErrCommonPrimaryLeafCorrupt
+		}
+		s.heap = out
+		spans[rank] = [2]int{start, len(s.heap)}
+	}
+	for rank := 0; rank < n; rank++ {
+		key, ok := v.RowAt(rank)
+		if !ok {
+			return ErrCommonPrimaryLeafCorrupt
+		}
+		value := CommonPrimaryLeafValue{}
+		if spans[rank][0] < 0 {
+			value.Overflow = overflowRefs[rank]
+		} else {
+			value.Inline = s.heap[spans[rank][0]:spans[rank][1]:spans[rank][1]]
+		}
+		s.records = append(s.records, CommonPrimaryLeafRecord{
+			Slot: slots[rank], Key: key, Value: value,
+		})
+	}
+	return nil
+}
+
+// RenderRecordsWithScratch reconstructs the leaf's canonical row set into one
+// retained mutation workspace. The returned records borrow both the admitted
+// page (keys) and scratch (values) until the next scratch use.
+func (v *CommonPrimaryUnifiedLeafView) RenderRecordsWithScratch(
+	scratch *PrimaryLeafMutationScratch,
+) ([]CommonPrimaryLeafRecord, error) {
+	if err := v.renderRecordsInto(scratch); err != nil {
+		return nil, err
+	}
+	return scratch.records, nil
 }

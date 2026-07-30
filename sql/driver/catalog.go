@@ -381,8 +381,7 @@ func canonicalCatalogPath(path string) (string, error) {
 
 func durableOptions(t *table) durable.Options {
 	options := durable.Options{
-		Collection:     store.Options{Schema: t.schema},
-		DocumentFormat: durable.DocumentFormatVerbatim,
+		Collection: store.Options{Schema: t.schema},
 	}
 	for _, index := range t.meta.Indexes {
 		options.Indexes = append(options.Indexes, store.IndexDefinition{

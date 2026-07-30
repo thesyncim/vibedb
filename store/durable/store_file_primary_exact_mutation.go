@@ -29,8 +29,8 @@ import (
 //     — using the pre-image the leaf lookup already has in hand.
 //   - insert / delete: one term record per index carrying a term, plus one
 //     tile record for the touched quadrant's live mask.
-//   - slot-reassigning leaf rewrite (de-template of a template or compact
-//     leaf — PlaceCommonPrimaryLeafRecords reassigns every slot): fall back
+//   - slot-reassigning class-5 workspace rewrite
+//     (PlaceCommonPrimaryLeafRecords reassigns every slot): fall back
 //     to deriveBucketExactContribution (O(leaf rows), exactly the old cost,
 //     once per leaf-class transition) and emit a rebase group — 4 rebased
 //     tile records plus absolute term records for every term present in the
@@ -432,20 +432,13 @@ func (c *Collection) preparePrimaryExactRebase(
 	return true, nil
 }
 
-// preparePrimaryExactBufferedMutation is §3's write rule for the buffered
-// canonical-frame lane: it prepares the overlay records for one mutation
-// without touching the fold base. Zero heap allocations on the steady-state
-// shapes (unchanged-value update, value change, insert, delete); the rebase
-// and pressure escapes may allocate, bounded to leaf-class transitions and
-// window exhaustion.
+// preparePrimaryExactBufferedMutation rebases the exact contribution after the
+// exceptional structural lane has placed an owned raw workspace back into
+// class 5. Steady-state class-5 overlay mutations use
+// preparePrimaryExactUnifiedMutation instead.
 func (c *Collection) preparePrimaryExactBufferedMutation(
-	state *fileStoreState,
-	leaf *storeio.CommonPrimaryLeafView,
 	leafImage []byte,
 	resident storeio.ResidentPrimaryRoute,
-	key, src []byte,
-	deleting, found, detemplated bool,
-	oldSlot, newSlot uint8,
 	generation uint64,
 	newBounds storeio.CommonPrimaryLeafBounds,
 ) (primaryExactPrepared, error) {
@@ -461,35 +454,17 @@ func (c *Collection) preparePrimaryExactBufferedMutation(
 		termRecordMark: epoch.termRecordN,
 		tileRecordMark: epoch.tileRecordN,
 	}
-	// A de-templated (template or compact) leaf was re-placed wholesale:
-	// PlaceCommonPrimaryLeafRecords assigned every row a fresh slot, so no
-	// pre-image slot maps to the new image. An update whose prepared slot
-	// moved is the same condition caught defensively — the identity tests
-	// compare against a from-scratch rebuild byte-for-byte, so a missed
-	// reassignment class fails loudly there, and this branch fails safe by
-	// re-deriving the whole bucket.
-	rebase := detemplated || (found && !deleting && newSlot != oldSlot)
-	pressure := false
-	if rebase {
-		ok, err := c.preparePrimaryExactRebase(
-			epoch, &prepared, leafImage, resident.Bucket, generation, newBounds,
-		)
-		if err != nil {
-			c.unwindPrimaryExactPrepared(&prepared)
-			return primaryExactPrepared{}, err
-		}
-		pressure = !ok
-	} else {
-		ok, err := c.preparePrimaryExactDelta(
-			state, epoch, &prepared, leaf, resident,
-			key, src, deleting, found, oldSlot, newSlot, generation,
-		)
-		if err != nil {
-			c.unwindPrimaryExactPrepared(&prepared)
-			return primaryExactPrepared{}, err
-		}
-		pressure = !ok
+	// The class-5 leaf was rendered into an owned raw workspace and placed
+	// wholesale, so no pre-image slot can be assumed to map to the new image.
+	// Re-derive the bucket instead of attempting a slot delta.
+	ok, err := c.preparePrimaryExactRebase(
+		epoch, &prepared, leafImage, resident.Bucket, generation, newBounds,
+	)
+	if err != nil {
+		c.unwindPrimaryExactPrepared(&prepared)
+		return primaryExactPrepared{}, err
 	}
+	pressure := !ok
 	if !pressure {
 		return prepared, nil
 	}
@@ -518,46 +493,19 @@ func (c *Collection) preparePrimaryExactBufferedMutation(
 	)
 }
 
-// preparePrimaryExactDelta emits the slot-stable record set: zero records
-// for an unchanged indexed value, ≤ 2 term records per index for a changed
-// one, term + tile records for insert and delete. ok=false is overlay
-// pressure.
-func (c *Collection) preparePrimaryExactDelta(
-	state *fileStoreState,
+// preparePrimaryExactDeltaRaw is the representation-independent exact-index
+// write rule. oldRaw is the logical pre-image already resolved by the primary
+// mutation lane; class-5 can therefore share the same slot-stable posting
+// overlay without de-templating or synthesizing a raw leaf view.
+func (c *Collection) preparePrimaryExactDeltaRaw(
 	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
-	leaf *storeio.CommonPrimaryLeafView,
 	resident storeio.ResidentPrimaryRoute,
-	key, src []byte,
+	oldRaw, src []byte,
 	deleting, found bool,
 	oldSlot, newSlot uint8,
 	generation uint64,
 ) (ok bool, err error) {
 	indexes := c.options.indexes
-	// The pre-image: the mutation's own leaf lookup already proved presence;
-	// re-reading it here borrows the resident page for the duration of the
-	// prepare only. An out-of-line pre-image resolves through the shared
-	// overflow reader against the published bounds it was minted under.
-	var oldRaw []byte
-	if found {
-		_, raw, overflow, present := leaf.LookupRawHashed(resident.Hash, key)
-		if !present {
-			return false, storeio.ErrCommonPrimaryLeafCorrupt
-		}
-		if overflow {
-			resolved, resolveErr := c.appendPrimaryOverflowValue(
-				c.overflowValueScratch[:0],
-				storeio.DecodePrimaryOverflowRef(raw),
-				c.primaryLeafBounds(state),
-			)
-			if resolveErr != nil {
-				return false, resolveErr
-			}
-			c.overflowValueScratch = resolved
-			raw = resolved
-		}
-		oldRaw = raw
-	}
-
 	var oldComponents [store.MaxIndexColumns]storeio.IndexTermComponent
 	var newComponents [store.MaxIndexColumns]storeio.IndexTermComponent
 	var oldCanonical [storeio.IndexTermMaxKeyBytes]byte
@@ -648,66 +596,56 @@ func (c *Collection) preparePrimaryExactDelta(
 	return true, nil
 }
 
-// preparePrimaryExactLeaf is the fold-first lane used by the canonical
-// per-mutation-transaction path (§7): it prepares a complete fresh epoch
-// whose encoded leaves the same transaction stages durably. Since P1 the
-// common shapes (slot-stable update, insert, delete) run the same §3 delta
-// write rule the buffered lane uses and then fold ONLY the dirty leaves —
-// the mutation's own ≤ 2 touched terms per index name everything that can
-// differ — so the canonical lane is no longer O(index) per mutation; that
-// lane already pays a device sync, and a 1–3 small leaf encodes are noise
-// beside it. Slot-reassigning rewrites (de-template, defensive slot-move
-// detection) fall back to the full bucket re-derivation fold, exactly the
-// rebase semantics of the buffered lane. The overlay it resolves is empty in
-// practice: every record-emitting buffered mutation registers a pending
-// parent, and the transactional path materializes pending parents (a fold)
-// before entering.
+// preparePrimaryExactUnifiedMutation stages the exact-index half of one
+// class-5 overlay mutation. Both overlays install inside the same snapshot
+// fence. pressure leaves neither half published and asks the caller to fold the
+// current window before retrying.
+func (c *Collection) preparePrimaryExactUnifiedMutation(
+	resident storeio.ResidentPrimaryRoute,
+	oldRaw, src []byte,
+	deleting, found bool,
+	oldSlot, newSlot uint8,
+	generation uint64,
+) (prepared primaryExactPrepared, pressure bool, err error) {
+	epoch := c.primaryEpoch
+	if epoch == nil {
+		return primaryExactPrepared{}, false, nil
+	}
+	prepared = primaryExactPrepared{
+		active:         true,
+		gen:            generation,
+		termLinks:      c.exactTermLinkScratch[:0],
+		tileLinks:      c.exactTileLinkScratch[:0],
+		termRecordMark: epoch.termRecordN,
+		tileRecordMark: epoch.tileRecordN,
+	}
+	ok, err := c.preparePrimaryExactDeltaRaw(
+		epoch, &prepared, resident, oldRaw, src,
+		deleting, found, oldSlot, newSlot, generation,
+	)
+	if err != nil {
+		c.unwindPrimaryExactPrepared(&prepared)
+		return primaryExactPrepared{}, false, err
+	}
+	if !ok {
+		c.unwindPrimaryExactPrepared(&prepared)
+		return primaryExactPrepared{}, true, nil
+	}
+	return prepared, false, nil
+}
+
+// preparePrimaryExactLeaf is the fold-first exceptional structural lane. Its
+// owned workspace placement may reassign every stable slot, so it derives the
+// complete bucket contribution and publishes a fresh folded epoch atomically
+// with the rewritten class-5 leaf.
 func (c *Collection) preparePrimaryExactLeaf(
-	state *fileStoreState,
-	leaf *storeio.CommonPrimaryLeafView,
 	leafImage []byte,
 	resident storeio.ResidentPrimaryRoute,
-	key, src []byte,
-	deleting, found, detemplated bool,
-	oldSlot, newSlot uint8,
 	generation uint64,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) (primaryExactPrepared, error) {
 	if !c.primaryExactActive() {
 		return primaryExactPrepared{}, nil
-	}
-	epoch := c.primaryEpoch
-	rebase := detemplated || (found && !deleting && newSlot != oldSlot)
-	if !rebase {
-		records := primaryExactPrepared{
-			active:         true,
-			gen:            generation,
-			termLinks:      c.exactTermLinkScratch[:0],
-			tileLinks:      c.exactTileLinkScratch[:0],
-			termRecordMark: epoch.termRecordN,
-			tileRecordMark: epoch.tileRecordN,
-		}
-		ok, err := c.preparePrimaryExactDelta(
-			state, epoch, &records, leaf, resident,
-			key, src, deleting, found, oldSlot, newSlot, generation,
-		)
-		if err != nil {
-			c.unwindPrimaryExactPrepared(&records)
-			return primaryExactPrepared{}, err
-		}
-		if ok {
-			prepared, foldErr := c.prepareDirtyPrimaryExactFold(
-				generation, generation, &records,
-			)
-			c.unwindPrimaryExactPrepared(&records)
-			if foldErr != nil {
-				return primaryExactPrepared{}, foldErr
-			}
-			return prepared, nil
-		}
-		// Overlay pressure: the record arena cannot hold even this delta;
-		// the bucket-derivation fold below needs no records at all.
-		c.unwindPrimaryExactPrepared(&records)
 	}
 	bucketLive, byIndex, err := c.deriveBucketExactContribution(
 		leafImage, resident.Bucket, bounds,

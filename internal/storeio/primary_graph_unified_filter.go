@@ -11,9 +11,9 @@ import (
 // dictionary once, then evaluate rows from tokens without rendering — a tag
 // walk to the hole plus a one-byte dict-id compare, a zigzag varint decode,
 // or a short memcmp. Rows an engaged leaf cannot evaluate from tokens —
-// trivial rows, container-target rows, overflow rows, and rows of
-// non-unified leaves — individually take the render-then-filter path at the
-// fallback rate; the lane is per-row, never all-or-nothing.
+// trivial rows, container-target rows, and overflow rows — individually take
+// the render-then-filter path at the fallback rate; the lane is per-row, never
+// all-or-nothing.
 
 // UnifiedEqFilter is the reusable state of one equality predicate over the
 // token lane. The predicate semantics are canonical-spelling equality: the
@@ -175,7 +175,7 @@ func (f *UnifiedEqFilter) matchBody(body []byte) (matched, needsRender, ok bool)
 			}
 			cursor += length
 		case tag == unifiedTokenLongLiteral:
-			length, n, lengthOK := readDocumentGroupUvarint(body[cursor:])
+			length, n, lengthOK := readUnifiedTokenUvarint(body[cursor:])
 			if !lengthOK || length == 0 || uint64(length) > uint64(len(body)-cursor-n) {
 				return false, false, false
 			}
@@ -223,10 +223,9 @@ type UnifiedFilterProgress struct {
 
 // FilterCountEq drives the filter over the cursor's remaining rows. Unified
 // leaves evaluate from tokens; every row the token lane cannot decide renders
-// into the cursor's splice scratch and evaluates there; rows of non-unified
-// leaves render through the ordinary class dispatch and evaluate the same
-// way. Overflow rows stop the drain and return their borrowed key and chain
-// descriptor — exactly the VisitInline overflow contract — so the caller can
+// into the cursor's splice scratch and evaluates there. Overflow rows stop the
+// drain and return their borrowed key and chain descriptor — exactly the
+// VisitInline overflow contract — so the caller can
 // resolve the chain, evaluate the document itself, and re-enter; the cursor
 // and per-leaf filter state resume where they left off. A nil key with a zero
 // PageRef means the scan is complete.
@@ -237,72 +236,47 @@ func (c *PrimaryGraphCursor) FilterCountEq(
 		return nil, PageRef{}, nil
 	}
 	for {
-		if c.leafClass == CommonPrimaryLeafUnified {
-			if !f.prepared {
-				f.prepareLeaf(&c.unifiedLeaf)
+		if !f.prepared {
+			f.prepareLeaf(&c.unifiedLeaf)
+		}
+		for {
+			key, body, isOverflow, ok := c.rows.NextRawBorrowed()
+			if !ok {
+				break
 			}
-			for {
-				key, body, isOverflow, ok := c.rows.NextRawBorrowed()
-				if !ok {
-					break
-				}
-				progress.Scanned++
-				if isOverflow {
-					// Overflow documents are never templated (§6): the caller
-					// reassembles the chain and evaluates the rendered bytes.
-					progress.Fallback++
-					return key, decodePageRef(body), nil
-				}
-				matched, needsRender, bodyOK := f.matchBody(body)
-				if !bodyOK {
-					return nil, PageRef{}, fmt.Errorf(
-						"%w: unified filter row", ErrCommonPrimaryLeafCorrupt,
-					)
-				}
-				if needsRender {
-					progress.Fallback++
-					doc := body[1:]
-					if body[0] != unifiedRowTrivial {
-						out, rendered := c.unifiedLeaf.AppendRowBody(c.spliceScratch[:0], body)
-						if !rendered {
-							return nil, PageRef{}, fmt.Errorf(
-								"%w: unified filter render", ErrCommonPrimaryLeafCorrupt,
-							)
-						}
-						c.spliceScratch = out
-						doc = c.spliceScratch
-					}
-					matched, err := f.EvalRendered(doc)
-					if err != nil {
-						return nil, PageRef{}, err
-					}
-					if matched {
-						progress.Matched++
-					}
-					continue
-				}
-				if matched {
-					progress.Matched++
-				}
-			}
-		} else {
-			for {
-				key, raw, isOverflow, ok := c.nextRawBorrowed()
-				if !ok {
-					break
-				}
-				progress.Scanned++
+			progress.Scanned++
+			if isOverflow {
+				// Overflow documents are never templated (§6): the caller
+				// reassembles the chain and evaluates the rendered bytes.
 				progress.Fallback++
-				if isOverflow {
-					return key, decodePageRef(raw), nil
+				return key, decodePageRef(body), nil
+			}
+			matched, needsRender, bodyOK := f.matchBody(body)
+			if !bodyOK {
+				return nil, PageRef{}, fmt.Errorf(
+					"%w: unified filter row", ErrCommonPrimaryLeafCorrupt,
+				)
+			}
+			if needsRender {
+				progress.Fallback++
+				doc := body[1:]
+				if body[0] != unifiedRowTrivial {
+					c.spliceScratch = c.unifiedLeaf.AppendAdmittedRowBody(
+						c.spliceScratch[:0], body,
+					)
+					doc = c.spliceScratch
 				}
-				matched, err := f.EvalRendered(raw)
+				matched, err := f.EvalRendered(doc)
 				if err != nil {
 					return nil, PageRef{}, err
 				}
 				if matched {
 					progress.Matched++
 				}
+				continue
+			}
+			if matched {
+				progress.Matched++
 			}
 		}
 		f.prepared = false

@@ -321,17 +321,16 @@ pieces, so posting volume is not capped by one 64 KiB leaf.
 
 `durable.CreateFromPrimary` converts a completed in-memory store directly into
 one durable generation. It preserves keys and declared exact indexes without
-replaying individual `Put` calls.
+replaying individual `Put` calls. There is no document-format option: empty
+creation, bulk creation, point mutations, batch mutations, structural
+split/merge, and checkpoint fold all emit the same canonical unified leaf
+grammar.
 
-**The bulk path and a `Put` loop do not produce the same file when
-`DocumentFormat` selects compact.** Only the bulk writer emits compact leaves —
-the per-leaf template table and value dictionary that deduplicate structural
-repetition and repeated exact values. A collection built by replaying `Put`
-never reaches that representation, and on a corpus with repeated field values
-it is several times larger on disk than the same documents written in bulk.
-How much larger depends entirely on how repetitive the values are, so neither
-figure is "the" durable footprint; a measured comparison must state the corpus
-and report a high-cardinality control beside the redundant case.
+Each leaf chooses its physical extent from 4–64 KiB and chooses templated,
+dictionary-backed, typed-token, or canonical-trivial row spellings inside that
+one grammar. These are per-row encodings, not store modes. Bulk build and
+checkpoint fold share the same deterministic planner, so a mutation does not
+decompress or permanently fall back to another leaf representation.
 
 ## Allocation and ownership
 

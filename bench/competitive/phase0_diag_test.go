@@ -17,8 +17,8 @@ import (
 // TestPhase0Diag attributes the buffered churn/update per-mutation CPU on the
 // exact harness shapes: bulk-load the low-cardinality 10k corpus, then replay
 // the mixed churn trace (Zipfian keys, checkpoint every 64 mutations) under a
-// CPU profile while reading the template de-template / merge-eval counters. It
-// is a diagnostic, run explicitly with -run TestPhase0Diag, never in CI.
+// CPU profile while reading the structural and overlay counters. It is a
+// diagnostic, run explicitly with -run TestPhase0Diag, never in CI.
 func TestPhase0Diag(t *testing.T) {
 	if os.Getenv("PHASE0") == "" {
 		t.Skip("set PHASE0=1 to run the phase-0 diagnostic")
@@ -77,29 +77,6 @@ func TestPhase0Diag(t *testing.T) {
 	defer coll.Close()
 	if err := coll.Flush(); err != nil {
 		t.Fatal(err)
-	}
-
-	// Census: touch every key once. Each still-templated leaf de-templates
-	// exactly once, so the de-template delta is the count of TC leaves that
-	// bulk build actually adopted for this corpus.
-	if os.Getenv("PHASE0_CENSUS") != "" {
-		durable.ResetPrimaryTemplateDiag()
-		cs0 := coll.Stats()
-		var scr []byte
-		for i := range docs {
-			scr = AppendSameSizeUpdatedJSON(scr[:0], docs, i)
-			if _, err := coll.Put([]byte(docs[i].Key), scr); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := coll.Flush(); err != nil {
-			t.Fatal(err)
-		}
-		cs1 := coll.Stats()
-		fmt.Printf("[census] touch-all-keys detemplate=%d replan=%d (=> TC leaves adopted)\n",
-			cs1.PrimaryTemplateDetemplateEvents-cs0.PrimaryTemplateDetemplateEvents,
-			cs1.PrimaryTemplateReplanEvents-cs0.PrimaryTemplateReplanEvents)
-		return
 	}
 
 	// Zipf trace, identical to cmd/mixed.
@@ -165,10 +142,10 @@ func TestPhase0Diag(t *testing.T) {
 	}
 
 	before := coll.Stats()
-	fmt.Printf("\n[after warmup] cumulative detemplate=%d replan=%d mergeEval=%d splits=%d merges=%d reclass=%d inplaceUpd=%d len=%d\n",
-		before.PrimaryTemplateDetemplateEvents, before.PrimaryTemplateReplanEvents,
-		before.MergeReclassEvaluations, before.PrimaryLeafSplits, before.PrimaryLeafMerges,
-		before.PrimaryLeafReclass, before.BufferedInplaceUpdates, coll.Len())
+	fmt.Printf("\n[after warmup] mergeEval=%d splits=%d merges=%d reclass=%d inplaceUpd=%d len=%d\n",
+		before.MergeReclassEvaluations, before.PrimaryLeafSplits,
+		before.PrimaryLeafMerges, before.PrimaryLeafReclass,
+		before.BufferedInplaceUpdates, coll.Len())
 	var updateLat, churnLat []int64
 
 	profPath := filepath.Join(os.Getenv("PHASE0_OUT"), "phase0-churn-cpu.prof")
@@ -233,8 +210,6 @@ func TestPhase0Diag(t *testing.T) {
 	fmt.Printf("update  count=%d  p50=%.2fus  p99=%.2fus\n", len(updateLat), p50(updateLat), p99(updateLat))
 	fmt.Printf("churn   count=%d  p50=%.2fus  p99=%.2fus\n", len(churnLat), p50(churnLat), p99(churnLat))
 	fmt.Printf("--- counter deltas over the measured loop ---\n")
-	fmt.Printf("template detemplate events   = %d\n", d(before.PrimaryTemplateDetemplateEvents, after.PrimaryTemplateDetemplateEvents))
-	fmt.Printf("template replan (encode)     = %d\n", d(before.PrimaryTemplateReplanEvents, after.PrimaryTemplateReplanEvents))
 	fmt.Printf("merge/reclass evaluations    = %d\n", d(before.MergeReclassEvaluations, after.MergeReclassEvaluations))
 	fmt.Printf("merge/reclass warranted      = %d\n", d(before.MergeReclassWarranted, after.MergeReclassWarranted))
 	fmt.Printf("merge/reclass commits        = %d\n", d(before.MergeReclassCommits, after.MergeReclassCommits))

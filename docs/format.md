@@ -37,12 +37,10 @@ This is **development format 0**. The repository has not released a persistent
 format, deliberately provides no backward-compatibility or migration promise,
 and may reject files written by any superseded development layout. A schema
 change edits format 0 in place; it does not add a compatibility branch. The
-common page envelope is currently version `4` specifically to make pages from
+common page envelope is currently version `5` specifically to make pages from
 superseded development layouts fail closed; each in-place development
 renumbering bumps it so a valid checksum is never the only thing selecting a
 decoder.
-The current StateRoot and `PageKind` set contain no TTL/expiration counter,
-directory, or page kind.
 The few payload-local tag `1` forms documented below are branches that the
 current codecs explicitly emit or accept; they are current schema
 discriminants, not a repository-level compatibility guarantee.
@@ -216,10 +214,10 @@ the conservative reclamation fence when it remains independently readable.
 | Offset | Field | Type | Notes |
 | --- | --- | --- | --- |
 | 0:8 | magic | `"SJPAGE01"` | fixed |
-| 8:10 | version | u16 | `4` (`pageVersion`); rejects every superseded development layout |
+| 8:10 | version | u16 | `5` (`pageVersion`); rejects every superseded development layout |
 | 10:12 | headerLength | u16 | `PageHeaderSize` = `64`, self-describing |
 | 12 | Kind | u8 | `PageKind`, see table below |
-| 13 | Flags | u8 | kind-specific; `0` for every kind except `PageDocumentGroup` |
+| 13 | Flags | u8 | `0` for every current kind |
 | 14:16 | reserved | — | must be zero |
 | 16:20 | PageSize | u32 | physical extent size; power of two except `PageDocument`/`PageOverflow`, which may use any 4 KiB multiple |
 | 20:24 | PayloadLength | u32 | payload bytes, excludes header/padding/trailer |
@@ -381,50 +379,45 @@ each exact-leaf payload is exactly `AppendIndexTermLeaf` output.
 Every populated top-level ref has `Generation <= root.Generation`; all roots are
 pairwise distinct in both `LogicalID` and `Offset`.
 
-Ordered-primary leaves are all `PagePrimaryLeaf` pages; their payload byte
-`[2]` low seven bits are the leaf-class discriminator, read only after the
-common-page checksum has validated the payload. Class `1` is the 4 KiB narrow
-succinct envelope, `2` the 8 KiB wide envelope, and `3` the template-columnar
-class, whose payload from byte `3` on is a template-columnar image (a
-content-addressed template skeleton per shape, packed field slots, a per-leaf
-value dictionary, per-field zone vectors, and region checksums). The bulk
-builder stages the template class per leaf when it lowers the page cost per
-document by at least a quarter versus the raw envelope; readers dispatch on the
-class byte with no payload probing, and a mutation de-templates a template leaf
-back into a raw envelope on first write.
+Ordered-primary leaves are `PagePrimaryLeaf` pages using one canonical unified
+grammar. Payload byte `[2]` has low seven bits `5`; its high bit marks the
+empty spelling. Payload byte `[0]` is `liveRows-1` for a non-empty leaf and
+zero for an empty leaf, and byte `[1]` is the live stash count. Every leaf has
+the 256-slot succinct ordered envelope: 192 normal cuckoo slots, 64 stash
+slots, lexical-rank tables, 7-bit key lengths, an overflow bitmap, succinct
+cumulative record boundaries, and select checkpoints. The physical extent is
+the planner-selected power of two from 4–64 KiB.
 
-Class `4` is the compact document-group class, the ordered-primary form of
-`DocumentFormatCompact`. Its payload from byte `3` on is a `PageDocumentGroup`
-payload (see below) embedded verbatim — one shared shape-template table and
-value dictionary per leaf, each row reduced to a dictionary/literal token
-stream — so the leaf is self-describing behind its class byte and needs no
-separate format flag on the collection. The embedded payload's rows are keyed
-by lexical rank rather than a chunk/slot directory; a compact leaf's
-posting-stable slot is that lexical rank (as for the template class). The
-enclosing common-page CRC covers the embedded bytes, so the group payload
-carries no second checksum. `CreateFromPrimary` stages class-4 leaves only when
-`DocumentFormat` is `Compact`; each leaf packs as many rows as minimise its
-byte-per-row within the 64 KiB maximum extent and the 256-row posting-slot
-ceiling, capped so its rows still fit a 64 KiB raw wide leaf. A run that cannot
-be grouped (a lone trailing row, or a document too large to co-locate) falls
-back to one adaptive raw leaf, which reads dispatch to on the class byte just
-like the compact ones.
+Immediately after the envelope metadata is the 16-byte unified header:
 
-Reads reconstruct each compact row's exact original JSON by splicing the
-shared template's static segments with the row's decoded values; a point read
-decodes into a caller-owned scratch (the verbatim path's zero-allocation
-borrow does not apply, because a compact value is assembled from fragments
-rather than stored contiguously), and an ordered scan reconstructs per row into
-one reused scratch. A `Put`/`Update`/`Delete` on a compact collection does
-**not** patch the compact image in place: like the template class it
-de-compacts the whole leaf into a raw envelope on first write, then the ordinary
-structural path re-fits and splits it into wide leaves (so ordinary writes
-always leave verbatim leaves behind). The de-compacted leaf can be as large as
-the 64 KiB maximum before that re-fit, which is why the mutation leaf scratch
-covers the maximum leaf extent rather than only the wide class. The exact-index
-maintainer enumerates compact rows through the same `VisitPrimaryLeafPostingRows`
-enumerator every class uses, decoding each row's field bytes before extraction,
-so a compact leaf's postings match what a lookup selects it by.
+| Offset | Field | Notes |
+| --- | --- | --- |
+| 0:2 | TemplateCount | u16, at most 255 |
+| 2:4 | DictionaryCount | u16, at most 128 |
+| 4:8 | TemplateSectionBytes | u32, directory plus entries |
+| 8:12 | DictionarySectionBytes | u32, directory plus spellings |
+| 12:16 | TrivialContentBytes | u32, exact bytes required if every row used its canonical-trivial spelling |
+
+The template section starts with cumulative u32 entry ends. Each entry is
+`HoleCount` (u16), zero (u16), `StaticBytes` (u32), `HoleCount+1`
+cumulative u32 static-segment ends, then the canonical static bytes. The
+dictionary section likewise starts with cumulative u32 ends followed by the
+raw canonical scalar spellings.
+
+The record heap is in lexical key order. Each record is `[key][row body]`;
+the envelope supplies the boundaries and key length. A row body begins with
+either a template id and its token stream or `0xff` followed by the complete
+canonical JSON spelling. Overflow rows are selected by the envelope bitmap and
+carry a 32-byte `PageRef` instead of an inline row body. Token tags `0x00–0x7f`
+are dictionary ids, `0x80–0xf7` are 1–120-byte literals, `0xf8` is a
+uvarint-length literal, `0xf9/0xfa/0xfb` are true/false/null, and `0xfc`
+is a zigzag-varint canonical integer. `0xfd/0xfe` are invalid.
+
+The posting-stable slot is always the envelope's cuckoo slot. Bulk build and
+checkpoint fold use the same deterministic planner; point mutations publish
+generation-stamped row/tombstone overlays and folds re-census the final live
+rows into this same grammar. Templated and trivial rows are encodings within
+the grammar, not alternate leaf classes or collection modes.
 
 ### Options bits
 
@@ -747,9 +740,9 @@ key/value data at offset `dataStart + dataLength`: `float64ColumnCount`
 columns, each a `(mask u64, dense values)` pair — one `1`-bit per row that
 has a finite value in that column (`mask &^ Live == 0`), followed by that
 many densely packed 8-byte IEEE754 values in ascending-slot order (NaN and
-±Inf are rejected). This is the *raw inline* float64 encoding shared with
-`DocumentGroup`'s own column section; it differs from the separately
-checksummed `Float64Group`/`Float64Stripe` typed extents described below.
+±Inf are rejected). This is the *raw inline* float64 encoding; it differs
+from the separately checksummed `Float64Group`/`Float64Stripe` typed extents
+described below.
 
 ## OverflowPage
 
@@ -781,99 +774,11 @@ at offset 64. Every non-final piece's `Next` must have a strictly greater
 `LogicalID` than the current piece — the chain's logical ids increase
 monotonically.
 
-## DocumentGroup
-
-`internal/storeio/document_group.go`, kind `PageDocumentGroup`. An
-immutable, independently checksummed extent packing **2 or more consecutive
-logical chunks** (bulk/compact generations) with structural and value
-deduplication: a bounded page-local dictionary (up to 128 entries) for
-repeated complete leaf spellings, and a page-local template table that
-stores each record's non-varying JSON bytes once and encodes each row as a
-list of tokens standing in for its variable leaf values (dictionary
-reference, short literal, or long literal). This is *not* general
-compression — every literal byte is stored byte-for-byte; only structural
-repetition and repeated exact values are deduplicated.
-
-Fixed 64-byte header (`DocumentGroupPayloadHeaderSize`):
-
-| Offset | Field | Notes |
-| --- | --- | --- |
-| 0:4 | version | u32, development format `0` |
-| 4:8 | FirstChunk | u32 |
-| 8:10 | ChunkCount | u16, `>= 2` |
-| 10:12 | RowCount | u16 |
-| 12:14 | TemplateCount | u16 |
-| 14:16 | DictionaryCount | u16, `<= 128` |
-| 16:20 | chunk-section bytes | u32, `= ChunkCount * 16` |
-| 20:24 | row-section bytes | u32, `= RowCount * 16` |
-| 24:28 | key-bytes length | u32 |
-| 28:32 | body-bytes length | u32 |
-| 32:36 | template-section bytes | u32 |
-| 36:40 | dictionary-section bytes | u32 |
-| 40:44 | column-section bytes | u32 |
-| 44:46 | ColumnCount | u16 (0 when the group instead uses a Float64Group sidecar) |
-| 46:48 | Flags | u16, only `DocumentGroupFlagFloat64Sidecar` (`1<<0`) plus its order/logical-delta bit fields, see below |
-| 48:56 | decodedBytes | u64, sum of every row's exact decoded JSON length (integrity cross-check) |
-| 56:58 | recordSize | u16, `= DocumentGroupRecordSize = 16` |
-| 58:60 | chunkSize | u16, `= DocumentGroupChunkSize = 16` |
-| 60:64 | reserved | must be zero |
-
-Sections follow the header back-to-back in this fixed order: **chunk
-directory**, **row directory**, **key bytes**, **body tokens**, **template
-table**, **dictionary table**, **column data** — each section's length comes
-from the header fields above, so offsets are computed once at open time.
-
-**Chunk descriptor — 16 bytes** (`DocumentGroupChunkSize`), one per logical
-chunk, `ChunkID` strictly `FirstChunk + ordinal`: `ChunkID` (u32, 0:4),
-`Live` (u64, 4:12), `firstRow` (u16, 12:14, this chunk's first row's index
-into the row directory), `count` (u8, 14, `== popcount(Live)`), reserved(15).
-
-**Row descriptor — 16 bytes** (`DocumentGroupRecordSize`), one per row in
-chunk then stable-slot order: cumulative key-end offset (u32, 0:4),
-cumulative body-end offset (u32, 4:8), exact decoded `JSONLength` (u32,
-8:12), `TemplateID` (u16, 12:14), `Slot` (u8, 14), reserved(15). A row's key
-spans `[keyEnd(row-1), keyEnd(row))` of the key-bytes section and its body
-token stream spans `[bodyEnd(row-1), bodyEnd(row))` of the body section.
-
-**Body tokens.** Each row's variable leaf values are a sequence of one-byte
-tags (one per template "hole"): a byte `< DictionaryCount` is a dictionary
-reference; a byte in `[0x80, 0xfe]` (`documentGroupShortLiteral` =
-`0x80`..`documentGroupLongLiteral-1`) is a short literal, length
-`token-0x80+1` (1–127 bytes), literal bytes follow immediately; byte `0xff`
-(`documentGroupLongLiteral`) is a long literal, followed by a uvarint length
-and then that many literal bytes. Because `DictionaryCount <= 128 == 0x80`,
-the dictionary-id and short-literal ranges never overlap.
-
-**Template table.** A `TemplateCount`-entry directory of cumulative u32 end
-offsets (4 bytes each) into the following template-data region. Each
-template entry: `values` count (u16, 0:2, number of leaf "holes"), reserved
-(2:4), `staticBytes` length (u32, 4:8), then `values+1` cumulative u32 "ends"
-into the static-bytes tail that follows — reconstructing a row interleaves
-static bytes `[ends[i], ends[i+1])`... with the row's per-hole tokens
-(`AppendJSON` does exactly this walk).
-
-**Dictionary table.** A `DictionaryCount`-entry directory of cumulative u32
-end offsets (4 bytes each) into the following raw dictionary-value bytes.
-
-**Column section.** Only used when `ColumnCount != 0` (i.e. no float64
-sidecar). Per chunk, per column, in that nesting order: `mask` u64 then
-dense 8-byte IEEE754 values for each set bit — the same encoding as
-DocumentPage's inline float64 section.
-
-**Float64 sidecar routing.** When a bulk/compact generation instead sets
-`DocumentGroupFlagFloat64Sidecar` in `Flags`/`PageRef.Flags`, `ColumnCount`
-is `0` and the typed columns live in a separately checksummed
-`PageFloat64Group` extent, addressed by a bounded delta encoded directly in
-the referencing `PageRef`'s `Flags` (u8) and `Aux` (u16) — no second tree
-walk is needed to find it. See "Float64Group sidecar addressing" below for
-the exact bit layout.
-
 ## Float64Group
 
 `internal/storeio/float64_group.go`, kind `PageFloat64Group`. A detached,
 independently checksummed, column-major typed extent covering the same
-consecutive chunk range as one or more adjacent `DocumentGroup` (or, for
-non-grouped compact generations, `DocumentPage`) extents. Column-major
+consecutive chunk range as one or more `DocumentPage` extents. Column-major
 layout means a one-column reduction touches only that column's bytes.
 
 Fixed 48-byte header (`Float64GroupPayloadHeaderSize`): version (0:4,
@@ -899,35 +804,6 @@ that round-trips every finite value in the column exactly):
 | 1 | `Float64GroupUint8` | 1 |
 | 2 | `Float64GroupUint16` | 2 |
 | 3 | `Float64GroupUint32` | 4 |
-
-### Float64Group sidecar addressing
-
-A `PageDocumentGroup`'s `PageRef` (as stored in a `ChunkDirectory` leaf or a
-`DocumentGroupFloat64Sidecar`/`AttachDocumentGroupFloat64Sidecar` call site)
-encodes the sidecar's location as a small forward delta rather than a second
-pointer, so no additional tree is walked:
-
-```text
-PageRef.Flags (u8):
-  bit 0       DocumentGroupFlagFloat64Sidecar (1 = sidecar present)
-  bits 1-4    order: log2(sidecar pages), sidecar length = allocationQuantum << order
-  bits 5-7    high 3 bits of (logicalDelta - 1)
-
-PageRef.Aux (u16):
-  bits 0-10   offsetPages: sidecar.Offset = group.Offset + offsetPages * allocationQuantum
-  bits 11-15  low 5 bits of (logicalDelta - 1)
-
-sidecar.LogicalID = group.LogicalID + logicalDelta   (logicalDelta = 1..256)
-sidecar.Generation = group.Generation
-sidecar.Kind = PageFloat64Group
-```
-
-`offsetPages` is 11 bits (max `2047`), so `DocumentGroupFloat64MaxForwardBytes
-= 2047 * allocationQuantum` bounds how far forward of the document group its
-sidecar may be allocated; `logicalDelta` is 8 bits split 3-high/5-low and
-ranges `1..256`. This lets many adjacent document groups share one typed
-extent purely through arithmetic on their own `PageRef`, with no directory
-lookup.
 
 ## Float64Catalog (stripe directory)
 
@@ -1297,8 +1173,7 @@ images, including every implicit zero byte. The initial
 empty standalone and inline roots, the provisional standalone superblock,
 representative document/fingerprint/posting pages, both maximum materialization
 journal geometries, fixed constants and kind numbers, checksums/complements,
-reserved-zero ranges, resealed semantic corruption, and checksum-valid
-rejection of the removed TTL numbering.
+reserved-zero ranges, and resealed semantic corruption.
 
 The remaining format-0 completion gates are:
 
@@ -1307,8 +1182,8 @@ The remaining format-0 completion gates are:
 2. a maximum-inline-free root and corruption coverage for every remaining
    inline field class;
 3. byte-exact pages for Overflow, ChunkDirectory, the legacy KeyDirectory,
-   IndexDirectory, DocumentGroup, the ordered-primary exact root/catalog/leaf
-   kinds, all float64 and index-group kinds, and all free-log kinds;
+   IndexDirectory, the ordered-primary exact root/catalog/leaf kinds, all
+   float64 and index-group kinds, and all free-log kinds;
 4. the superseded external-root magic and a complete `store/durable` file with
    a populated legacy `PageKeyDirectory` primary root;
 5. crash-matrix fixtures captured after each ordinary phase, both patch-only

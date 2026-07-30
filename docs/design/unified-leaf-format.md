@@ -117,13 +117,12 @@ caller the original bytes, only *a* valid, deterministic spelling.
    (`internal/storeio/document_group.go:116-366`) — bounded 128-entry value
    dictionary, content-addressed static skeletons, token grammar
    (dict-ref / short literal / long literal), pinned byte-for-byte by
-   `TestCompactPrimaryDeterminism`
-   (`store/durable/store_file_primary_compact_test.go:253`). The unified
-   codec reuses these derivation rules, not the container.
+   The deleted compact prototype's determinism tests pinned this behavior.
+   The unified codec reuses those derivation rules, not that container.
 5. **The template-columnar lab measured the splice.** 102.7 ns compiled
    `AppendRaw` splice for the ~250 B/12-field competitive shape, 20.4 ns
    zero-alloc field access, region reseal 2.5× cheaper than whole-leaf
-   (docs/design/template-columnar-leaves.md). Those are the load-bearing
+   (the removed pre-release template-columnar experiment). Those are the load-bearing
    constants in §10's arithmetic. The class-3 *class* failed adoption for
    reasons this design removes: byte-exact templates fragmented shapes, the
    row cap was tied to de-templatability, and mutation cost scaled with

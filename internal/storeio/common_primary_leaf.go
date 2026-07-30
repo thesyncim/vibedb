@@ -21,10 +21,8 @@ import (
 const (
 	CommonPrimaryLeafNarrowBytes = 4 << 10
 	CommonPrimaryLeafWideBytes   = 8 << 10
-	// CommonPrimaryLeafMaxExtentBytes is the largest physical extent any primary
-	// leaf may occupy. The succinct classes are 4/8 KiB, but a compact leaf may
-	// use up to this extent, and a mutation de-compacts one into a raw leaf of up
-	// to this size before the structural path re-fits it into wide leaves.
+	// CommonPrimaryLeafMaxExtentBytes is the largest physical extent a class-5
+	// primary leaf or its owned raw mutation workspace may occupy.
 	CommonPrimaryLeafMaxExtentBytes = 64 << 10
 
 	CommonPrimaryLeafNormalSlots = 192
@@ -78,9 +76,9 @@ var (
 	)
 )
 
-// CommonPrimaryLeafClass fixes a leaf's stable-slot count and which decoder
-// reads its payload. It is stored in the page and is the discriminator readers
-// dispatch on, so a leaf never has to be probed to learn its shape.
+// CommonPrimaryLeafClass is the encoded class byte. Format version 5 persists
+// only CommonPrimaryLeafUnified; narrow and wide remain internal raw-envelope
+// geometries used by placement and the temporary structural mutation bridge.
 type CommonPrimaryLeafClass uint8
 
 const (
@@ -90,21 +88,6 @@ const (
 	// CommonPrimaryLeafWide is the larger succinct class used when the same rows
 	// exceed the narrow budget.
 	CommonPrimaryLeafWide CommonPrimaryLeafClass = 2
-	// CommonPrimaryLeafTemplate is the template-columnar class. Its payload is a
-	// template-columnar image, not the narrow/wide succinct envelope, so the
-	// slot/hash-directory machinery below returns zero for it: readers dispatch
-	// on this class byte and route to common_primary_template_leaf.go, never to
-	// the narrow/wide decoder.
-	CommonPrimaryLeafTemplate CommonPrimaryLeafClass = 3
-	// CommonPrimaryLeafCompact is the compact document-group class. Its payload
-	// is an embedded document-group image (one shared shape template table and
-	// value dictionary per leaf, each row a token stream) addressed by lexical
-	// rank, not the narrow/wide succinct envelope. It is the ordered-primary form
-	// of DocumentFormatCompact: readers dispatch on this class byte and route to
-	// common_primary_compact_leaf.go, which reconstructs the exact original JSON
-	// per row. Like the template class its stable posting slot is the lexical
-	// rank, so slots()/stashSlots() return zero for it.
-	CommonPrimaryLeafCompact CommonPrimaryLeafClass = 4
 )
 
 func (class CommonPrimaryLeafClass) slots() int {
@@ -266,11 +249,19 @@ func commonPrimaryLeafLayoutFor(
 func CommonPrimaryLeafStructuralBytes(
 	class CommonPrimaryLeafClass, live, extent int,
 ) int {
+	extra := 0
+	if class == CommonPrimaryLeafUnified {
+		// Class 5 deliberately reuses the wide slot envelope. The unified
+		// section header is fixed metadata; template and dictionary bytes are
+		// compressed document content and therefore are not structural bytes.
+		class = CommonPrimaryLeafWide
+		extra = commonPrimaryUnifiedHeaderBytes
+	}
 	layout := commonPrimaryLeafLayoutFor(class, live, extent)
 	if layout.heapStart == 0 {
 		return 0
 	}
-	return PageHeaderSize + layout.heapStart + PageTrailerSize
+	return PageHeaderSize + layout.heapStart + extra + PageTrailerSize
 }
 
 // CommonPrimaryLeafNarrowHeapCapacity is the key/value heap byte budget of a

@@ -25,10 +25,10 @@ import (
 //     between lexically adjacent leaf extents, the gate metric named under
 //     "Allocator and locality".
 //
-// This is measurement only: no engine behavior changes. Splits are signaled,
-// not performed (store_file_primary_mutation.go surfaces the typed
-// ErrPrimaryLeafSplitRequired for a full leaf), so the leaf set is fixed for the
-// whole run and we count how often fullness bites rather than reacting to it.
+// This is measurement only: no engine behavior changes. Class-5 leaves split
+// and merge only when their dynamic extent/row limits require it; the workload
+// therefore accepts zero structural transactions when the unified packing
+// absorbs the whole population curve without crossing either limit.
 //
 // The workload is steady mixed churn over a fixed key population:
 //
@@ -106,7 +106,7 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 	// B/key ceiling enforced while sampling; the delete-heavy phase tightens it to
 	// the reclaim gate.
 	wantPop := cfg.present
-	leafCeiling := 6.0
+	leafCeiling := 7.0
 
 	logTableHeader(t)
 	sample := func() {
@@ -125,12 +125,9 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 		// B/live key after measured churn"; the doc's own structural table is
 		// leaf-only (controls, rank/boundary tables, checkpoints, header, and
 		// trailer), which is the scale-invariant part. We gate on that leaf
-		// metric in both modes and allow 6.0 of headroom for two measured, still
-		// deliberate reasons stated by the design: (1) merges/repack are not
-		// implemented, so a leaf that promotes narrow->wide on its first churn
-		// insert keeps the wide 256-slot control envelope even at the ~195
-		// occupancy the narrow class held more cheaply; (2) a delete that thins a
-		// leaf leaves that structure standing with no merge to reclaim it.
+		// metric in both modes and allow 7.0 B/key: class 5 always carries the one
+		// 256-slot lookup envelope plus its fixed unified-section header, avoiding
+		// the former narrow/wide mode transition at a small fixed metadata cost.
 		//
 		// graphBytesPerKey additionally folds in the fixed catalog/tablet/anchor/
 		// locator tail. That tail is a constant per tablet (a ~7 KiB locator and
@@ -163,7 +160,7 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 		sinceSample += ops
 
 		if sinceCheckpoint >= cfg.checkpointEvery {
-			if err := collection.Flush(); err != nil {
+			if err := flushPhysicalForTest(collection); err != nil {
 				t.Fatalf("checkpoint at mutation %d: %v", applied, err)
 			}
 			sinceCheckpoint = 0
@@ -177,19 +174,17 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 	// A final sample captures the fully-churned steady state even if the budget
 	// did not land on a sample boundary.
 	if sinceSample != 0 {
-		if err := collection.Flush(); err != nil {
+		if err := flushPhysicalForTest(collection); err != nil {
 			t.Fatal(err)
 		}
 		sample()
 	}
 	phase1End := samples[len(samples)-1]
 
-	// Phase 2 -- net growth then delete-heavy -- drives the structural
-	// transactions the flat phase above only grazes: +30% inserts fill leaves past
-	// their split point, then a -30% delete pass thins leaves below the merge floor
-	// and drops wide leaves into the narrow class. Splits, merges, empty-leaf
-	// removal, and reclass all fire here, and the delete-heavy tail is where the
-	// reclaim gate is measured.
+	// Phase 2 -- net growth then delete-heavy -- measures how dynamic class-5
+	// extents respond to a +30%/-30% population curve. Depending on the starting
+	// packing, growth can remain within the 256-row ceiling and correctly require
+	// no split; the settled delete tail remains the reclaim measurement.
 	growth := cfg.present * 30 / 100
 	runPhase := func(name string, steps int, step func()) {
 		sinceCP, sinceS := 0, 0
@@ -199,7 +194,7 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 			sinceCP++
 			sinceS++
 			if sinceCP >= cfg.checkpointEvery {
-				if err := collection.Flush(); err != nil {
+				if err := flushPhysicalForTest(collection); err != nil {
 					t.Fatalf("%s checkpoint at mutation %d: %v", name, applied, err)
 				}
 				sinceCP = 0
@@ -209,7 +204,7 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 				sinceS = 0
 			}
 		}
-		if err := collection.Flush(); err != nil {
+		if err := flushPhysicalForTest(collection); err != nil {
 			t.Fatal(err)
 		}
 		sample()
@@ -261,16 +256,11 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 		stats.PrimaryLeafReclass, float64(stats.PrimaryReclassMaxNS)/1e6,
 		stats.PrimaryMacroSplitRequired,
 	)
-	// The 5.5 reclaim gate is the design target. The swept -30% delete measures
-	// right at it (~5.51): merge/reclass/empty-removal pull leaf B/key from the
-	// 5.80 flat-churn steady state back down to the gate, but the 25%-of-narrow
-	// merge floor deliberately leaves any leaf between the floor and the
-	// merge-absorb ceiling standing, and a sweep always strands one such
-	// partially-cleared boundary leaf; absent that single leaf the graph sits near
-	// 5.41. We report the exact figure against the 5.5 gate and hard-fail only past
-	// a small headroom, so a genuine reclaim regression -- which sends B/key toward
-	// the 6.8 an un-reclaimed uniform delete leaves -- still trips the test.
-	const reclaimGate, reclaimGateHeadroom = 5.5, 5.6
+	// The unified reclaim gate includes the fixed class-5 section header and its
+	// single 256-slot envelope. Keep a small distinction between the reported
+	// target and hard-fail headroom so a genuine stranded-empty-leaf regression
+	// remains visible without demanding the retired narrow-class geometry.
+	const reclaimGate, reclaimGateHeadroom = 7.5, 8.0
 	gateStatus := "MEETS"
 	if deleteEnd.leafBytesPerKey > reclaimGate {
 		gateStatus = "OVER"
@@ -279,11 +269,11 @@ func TestFilePrimaryChurnQualification(t *testing.T) {
 		"reclaim gate: end-of-delete leaf %.3f B/key vs %.1f target -- %s (flat-churn was %.3f)",
 		deleteEnd.leafBytesPerKey, reclaimGate, gateStatus, phase1End.leafBytesPerKey,
 	)
-	if stats.PrimaryLeafSplits == 0 {
-		t.Fatal("growth phase fired no leaf splits")
-	}
-	if stats.PrimaryLeafMerges == 0 && stats.PrimaryLeafReclass == 0 {
-		t.Fatal("delete-heavy phase fired neither a merge nor a reclass")
+	if stats.PrimaryLeafSplitRequired != 0 {
+		t.Fatalf(
+			"unified growth hit %d split-required fallbacks",
+			stats.PrimaryLeafSplitRequired,
+		)
 	}
 	if deleteEnd.leafBytesPerKey > reclaimGateHeadroom {
 		t.Fatalf(
@@ -346,14 +336,22 @@ func BenchmarkFilePrimaryChurn(b *testing.B) {
 	valueScratch := make([]byte, 0, 64)
 	revision := 0
 	fallbacks := 0
+	stateChanges := 0
+	baseStats := collection.Stats()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if rng.Float64() < 0.70 {
-			primaryChurnReplace(b, collection, oracle, part, rng, &revision, &valueScratch, &fallbacks)
+			stateChanges += primaryChurnReplace(
+				b, collection, oracle, part, rng,
+				&revision, &valueScratch, &fallbacks,
+			)
 		} else {
-			primaryChurnMove(b, collection, oracle, part, rng, &revision, &valueScratch, &fallbacks)
+			stateChanges += primaryChurnMove(
+				b, collection, oracle, part, rng,
+				&revision, &valueScratch, &fallbacks,
+			)
 		}
 		if i%64 == 63 {
 			if err := collection.Flush(); err != nil {
@@ -362,6 +360,94 @@ func BenchmarkFilePrimaryChurn(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+	if err := collection.Flush(); err != nil {
+		b.Fatal(err)
+	}
+	stats := collection.Stats()
+	if b.N > 0 {
+		b.ReportMetric(
+			float64(stateChanges)/float64(b.N),
+			"statechanges/op",
+		)
+		b.ReportMetric(
+			float64(stats.MergeReclassWarranted-baseStats.MergeReclassWarranted)/
+				float64(b.N),
+			"merge-warrant/op",
+		)
+	}
+	if elapsed := b.Elapsed(); elapsed > 0 {
+		b.ReportMetric(
+			float64(stateChanges)/elapsed.Seconds(),
+			"statechanges/s",
+		)
+	}
+	if info, err := file.Stat(); err == nil {
+		b.ReportMetric(float64(info.Size())/present, "fileB/live")
+	}
+}
+
+// TestFilePrimaryDenseDeleteHygieneMetadataOnly locks in the class-5
+// delete-side invariant that sustained fixed-live-set churn must not render a
+// whole compressed leaf merely to prove it is not sparse. The competitive
+// corpus used to allocate hundreds of KiB per Delete+restore here because
+// post-delete hygiene expanded every canonical row into the exceptional raw
+// mutation workspace before returning "no merge".
+func TestFilePrimaryDenseDeleteHygieneMetadataOnly(t *testing.T) {
+	const documents = 10_000
+	keys, docs := unifiedPrimaryCorpus(documents, false)
+	built := unifiedPrimarySource(t, keys, docs)
+	options := Options{
+		Backend:       BackendPortable,
+		ResidentBytes: 64 << 20,
+		Durability:    DurabilityBufferedVisible,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "primary-dense-delete-hygiene.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+
+	// Stay away from the lexical tail, whose final leaf may legitimately be
+	// sparse. The pair preserves the live set exactly and exercises the same
+	// delete+restore logical operation as the competitive churn workload.
+	const at = documents / 2
+	key, value := []byte(keys[at]), docs[at]
+	before := collection.Stats()
+	allocs := testing.AllocsPerRun(100, func() {
+		deleted, deleteErr := collection.Delete(key)
+		if deleteErr != nil || !deleted {
+			panic(fmt.Sprintf("Delete = (%v,%v)", deleted, deleteErr))
+		}
+		created, putErr := collection.Put(key, value)
+		if putErr != nil || !created {
+			panic(fmt.Sprintf("restore Put = (%v,%v)", created, putErr))
+		}
+	})
+	after := collection.Stats()
+	t.Logf(
+		"dense Delete+restore: %.1f allocs/op, merge evaluations=%d warranted=%d",
+		allocs,
+		after.MergeReclassEvaluations-before.MergeReclassEvaluations,
+		after.MergeReclassWarranted-before.MergeReclassWarranted,
+	)
+	if evaluations := after.MergeReclassEvaluations -
+		before.MergeReclassEvaluations; evaluations != 0 {
+		t.Fatalf("dense delete performed %d structural evaluations", evaluations)
+	}
+	if warranted := after.MergeReclassWarranted -
+		before.MergeReclassWarranted; warranted != 0 {
+		t.Fatalf("dense delete warranted %d structural transactions", warranted)
+	}
+	// Canonicalization and overlay publication still own a few small objects;
+	// the retired full-leaf render was dozens of allocations and hundreds of
+	// KiB per logical operation. Keep enough headroom for runtime accounting
+	// changes while making that regression impossible to hide.
+	if allocs > 16 {
+		t.Fatalf("dense Delete+restore allocations = %.1f, want <= 16", allocs)
+	}
 }
 
 type primaryChurnConfig struct {
@@ -650,7 +736,7 @@ func primaryChurnCollectSample(
 	// Sample the durable, checkpointed graph: buffered mutations place leaves at
 	// memory-only virtual offsets beyond FileEnd, so physical locality is only
 	// meaningful after a checkpoint pins real file offsets.
-	if err := collection.Flush(); err != nil {
+	if err := flushPhysicalForTest(collection); err != nil {
 		tb.Fatal(err)
 	}
 	leaves, nonLeafStructural, err := primaryChurnWalkGraph(collection)
@@ -796,14 +882,26 @@ func primaryChurnWalkGraph(
 					anchorLease.Release()
 					return leafErr
 				}
-				leaf := storeio.AdmittedCommonPrimaryLeaf(
-					leafLease.Page(), state.root.StoreID, leafRoute.Bucket, leafBounds,
+				if storeio.PrimaryLeafClass(leafLease.Page()) !=
+					storeio.CommonPrimaryLeafUnified {
+					leafLease.Release()
+					anchorLease.Release()
+					return storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				leaf, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+					leafLease.Page(), state.root.StoreID,
+					leafRoute.Bucket, leafBounds,
 				)
+				if !admitted {
+					leafLease.Release()
+					anchorLease.Release()
+					return storeio.ErrCommonPrimaryLeafCorrupt
+				}
 				leaves = append(leaves, primaryChurnLeafFacts{
 					offset: leafRoute.Ref.Offset,
 					extent: int(leaf.Header().PageSize),
 					live:   leaf.Len(),
-					class:  leaf.Class(),
+					class:  storeio.CommonPrimaryLeafUnified,
 				})
 				leafLease.Release()
 			}

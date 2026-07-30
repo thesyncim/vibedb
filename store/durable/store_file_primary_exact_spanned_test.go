@@ -132,7 +132,7 @@ func TestFilePrimaryIndexedSpannedFoldIdentity(t *testing.T) {
 		groups[key] = nextGroup
 	}
 	forceSpannedTestBudget(coll)
-	if err := coll.Flush(); err != nil {
+	if err := flushPhysicalForTest(coll); err != nil {
 		t.Fatal(err)
 	}
 
@@ -232,11 +232,21 @@ func TestFilePrimaryIndexedSpannedFoldIdentity(t *testing.T) {
 	}
 	slices.Sort(wantMid)
 	if !slices.Equal(midWindow, wantMid) {
-		t.Fatalf("mid-window kind=k1: got %d keys want %d",
-			len(midWindow), len(wantMid))
+		missing := make([]string, 0)
+		gotSet := make(map[string]bool, len(midWindow))
+		for _, key := range midWindow {
+			gotSet[key] = true
+		}
+		for _, key := range wantMid {
+			if !gotSet[key] {
+				missing = append(missing, key)
+			}
+		}
+		t.Fatalf("mid-window kind=k1: got %d keys want %d; missing=%v",
+			len(midWindow), len(wantMid), missing)
 	}
 
-	if err := coll.Flush(); err != nil {
+	if err := flushPhysicalForTest(coll); err != nil {
 		t.Fatal(err)
 	}
 	if !coll.primaryEpoch.overlayEmpty() {
@@ -250,7 +260,7 @@ func TestFilePrimaryIndexedSpannedFoldIdentity(t *testing.T) {
 	beforeKind := spannedLeafRefs(&coll.primaryEpoch.exact[kindID])
 	beforeGroup := spannedLeafRefs(&coll.primaryEpoch.exact[groupID])
 	put(spannedTestKey(42), 42, (kinds[spannedTestKey(42)]+1)%3, 41)
-	if err := coll.Flush(); err != nil {
+	if err := flushPhysicalForTest(coll); err != nil {
 		t.Fatal(err)
 	}
 	assertFoldMatchesRebuild(t, coll, "post-localized-fold")
@@ -331,7 +341,7 @@ func TestFilePrimaryIndexedSpannedStripePatch(t *testing.T) {
 		}
 	}
 	forceSpannedTestBudget(coll)
-	if err := coll.Flush(); err != nil {
+	if err := flushPhysicalForTest(coll); err != nil {
 		t.Fatal(err)
 	}
 	resident := &coll.primaryEpoch.exact[0]
@@ -355,7 +365,7 @@ func TestFilePrimaryIndexedSpannedStripePatch(t *testing.T) {
 	if _, err := coll.Put(key, doc); err != nil {
 		t.Fatal(err)
 	}
-	if err := coll.Flush(); err != nil {
+	if err := flushPhysicalForTest(coll); err != nil {
 		t.Fatal(err)
 	}
 	assertFoldMatchesRebuild(t, coll, "post-stripe-patch")

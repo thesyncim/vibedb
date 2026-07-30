@@ -254,11 +254,10 @@ func (c *Collection) extractLeafRecords(
 	return c.structuralRows
 }
 
-// fitStructuralLeaf places and encodes rows into c.primaryLeafScratch, choosing
-// the narrow class when the rows fit and falling back to wide otherwise, and
-// returns the chosen extent. Preferring narrow is the slot-class reclaim: a
-// split half or merged survivor that fits narrow is rewritten narrow in the
-// same structural transaction.
+// fitStructuralLeaf places and encodes rows into the sole class-5 grammar and
+// returns the planner-selected extent. Splits and merges may assign fresh
+// stable slots because their exact-index contribution is rebuilt in the same
+// structural publication.
 func (c *Collection) fitStructuralLeaf(
 	tx *storeio.WriteTransaction,
 	generation uint64,
@@ -270,49 +269,34 @@ func (c *Collection) fitStructuralLeaf(
 		NextLogicalID:     tx.NextLogicalID(),
 		AllocationQuantum: uint32(c.options.PageSize),
 	}
-	try := func(class storeio.CommonPrimaryLeafClass, extent int) (bool, error) {
-		if err := storeio.PlaceCommonPrimaryLeafRecords(
-			class, c.storeID, rows,
-		); err != nil {
-			if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
-				errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-				return false, nil
-			}
-			return false, err
-		}
-		if _, err := storeio.EncodeCommonPrimaryLeaf(
-			c.primaryLeafScratch[:extent], class,
-			storeio.CommonPrimaryLeafHeader{
-				StoreID: c.storeID, Generation: generation,
-				Bucket: bucket, PageSize: uint32(extent),
-			},
-			c.storeID, rows, bounds,
-		); err != nil {
-			if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
-				errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
-	if ok, err := try(
-		storeio.CommonPrimaryLeafNarrow, storeio.CommonPrimaryLeafNarrowBytes,
+	if err := storeio.PlaceCommonPrimaryLeafRecords(
+		storeio.CommonPrimaryLeafWide, c.storeID, rows,
 	); err != nil {
+		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
+			errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+			return 0, errors.Join(
+				ErrPrimaryLeafSplitRequired,
+				storeio.ErrCommonPrimaryLeafFull,
+			)
+		}
 		return 0, err
-	} else if ok {
-		return storeio.CommonPrimaryLeafNarrowBytes, nil
 	}
-	if ok, err := try(
-		storeio.CommonPrimaryLeafWide, storeio.CommonPrimaryLeafWideBytes,
-	); err != nil {
-		return 0, err
-	} else if ok {
-		return storeio.CommonPrimaryLeafWideBytes, nil
-	}
-	return 0, errors.Join(
-		ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
+	image, err := storeio.EncodeBestCommonPrimaryUnifiedLeaf(
+		c.primaryLeafScratch,
+		storeio.CommonPrimaryLeafHeader{
+			StoreID: c.storeID, Generation: generation, Bucket: bucket,
+		},
+		c.storeID, rows, bounds, c.primaryUnifiedBuilder,
 	)
+	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+		return 0, errors.Join(
+			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
+		)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(image), nil
 }
 
 // encodeStructuralLeaf fits rows for bucket, allocates one leaf page of the
@@ -952,8 +936,42 @@ func (c *Collection) evaluateMergeReclass(
 	if err != nil {
 		return primaryMergeEval{}, err
 	}
-	leaf, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
-		lease.Page(), c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	page := lease.Page()
+	bounds := c.primaryLeafBounds(state)
+
+	// Class 5 has no legacy narrow/wide mode to reclass on every tombstone.
+	// Nonempty merge economy belongs at the fold/repack boundary, where the
+	// planner sees the exact encoded size once for the whole dirty leaf. The
+	// per-delete hygiene path therefore handles only an actually empty leaf.
+	// Include the pending overlay row delta because buffered-visible deletes
+	// deliberately leave the sealed image unchanged until checkpoint.
+	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafUnified {
+		unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+			page, c.storeID, route.Bucket, bounds,
+		)
+		if !ok {
+			lease.Release()
+			return primaryMergeEval{}, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		_, rowDelta := c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
+		liveCount := unified.Len() + rowDelta
+		if liveCount < 0 {
+			lease.Release()
+			return primaryMergeEval{}, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		eval := primaryMergeEval{
+			route: route, liveCount: liveCount,
+		}
+		if liveCount == 0 {
+			eval.kind = primaryMergeEmpty
+		}
+		lease.Release()
+		return eval, nil
+	}
+
+	leaf, admitErr := storeio.AdmittedPrimaryLeafForMutationWithScratch(
+		page, c.storeID, route.Bucket, bounds,
+		c.primaryLeafMutationScratch,
 	)
 	if admitErr != nil {
 		lease.Release()
@@ -1001,8 +1019,9 @@ func (c *Collection) mergeNeighborViable(eval primaryMergeEval) bool {
 		if err != nil {
 			continue
 		}
-		leaf, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+		leaf, admitErr := storeio.AdmittedPrimaryLeafForMutationWithScratch(
 			lease.Page(), c.storeID, neighbor.Bucket, bounds,
+			c.primaryLeafMutationScratch,
 		)
 		if admitErr != nil {
 			lease.Release()
@@ -1033,7 +1052,10 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 	c.mergeReclassEvaluations.Add(1)
 	eval, err := c.evaluateMergeReclass(keyBytes)
 	if err != nil || eval.kind == primaryMergeNone {
-		return err
+		if err != nil {
+			return fmt.Errorf("evaluate primary merge: %w", err)
+		}
+		return nil
 	}
 
 	router := c.primaryRouter.Load()
@@ -1063,7 +1085,7 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 
 	c.mergeReclassWarrantedHits.Add(1)
 	if err := c.flushPendingForStructural(); err != nil {
-		return err
+		return fmt.Errorf("flush before primary merge: %w", err)
 	}
 	state := c.state.Load()
 	if state == nil {
@@ -1077,12 +1099,12 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 	if err := c.acquirePrimaryMutationPath(
 		&path, state, keyBytes, route,
 	); err != nil {
-		return err
+		return fmt.Errorf("acquire primary merge path: %w", err)
 	}
 	defer path.Release()
 	current, err := c.enumerateTabletLeaves(&path.tablet)
 	if err != nil {
-		return err
+		return fmt.Errorf("enumerate primary merge tablet: %w", err)
 	}
 	sourceIndex := structuralIndexOfBucket(current, route.Bucket)
 	if sourceIndex < 0 {
@@ -1098,7 +1120,7 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 		if err := c.commitRemoveEmptyLeaf(
 			state, &path, current, sourceIndex,
 		); err != nil {
-			return err
+			return fmt.Errorf("remove empty primary leaf: %w", err)
 		}
 		c.removePrimaryEmptyLeaf()
 		c.mergeReclassCommits.Add(1)
@@ -1111,7 +1133,7 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 			state, &path, current, sourceIndex,
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("merge primary leaf: %w", err)
 		}
 		if merged {
 			c.mergeReclassCommits.Add(1)
@@ -1124,7 +1146,7 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 		if err := c.reclassPrimaryLeaf(
 			state, &path, current, sourceIndex,
 		); err != nil {
-			return err
+			return fmt.Errorf("reclass primary leaf: %w", err)
 		}
 		c.mergeReclassCommits.Add(1)
 		return nil
@@ -1203,7 +1225,7 @@ func (c *Collection) tryStructuralMerge(
 		if err != nil {
 			return false, err
 		}
-		neighbor, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+		neighbor, admitErr := storeio.AdmittedPrimaryLeafForMutation(
 			lease.Page(), c.storeID, current[neighborIdx].bucket,
 			storeio.CommonPrimaryLeafBounds{
 				FileEnd:           state.super.FileEnd,
@@ -1402,6 +1424,13 @@ func (c *Collection) deletePrimaryWithMerge(
 	deleted, err = c.deletePrimary(key)
 	if err != nil || !deleted {
 		return deleted, err
+	}
+	// Class-5 Delete marks the resident route before returning when its pending
+	// row count reaches zero. Healthy fixed-live-set churn therefore avoids a
+	// second writer-lock acquisition, route lookup, and leaf admission entirely;
+	// only eager empty-leaf removal pays post-delete structural hygiene.
+	if c.primaryEmptyLeaves.Load() == 0 {
+		return true, nil
 	}
 	_ = c.mergeReclassPrimaryLeafForKey(key)
 	return deleted, nil

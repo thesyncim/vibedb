@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 )
 
 const (
@@ -507,107 +508,150 @@ func primaryExactCorrupt(what string) error {
 	return fmt.Errorf("%w: %s", ErrPrimaryExactIndexCorrupt, what)
 }
 
-// VisitPrimaryLeafPostingRows enumerates the live rows of one admitted primary
-// leaf, of any class, in lexical key order, with the posting-stable slot each
-// row occupies. For the succinct narrow/wide classes the slot is the leaf's
-// stable hash-directory slot; for the template-columnar class it is the lexical
-// rank, which is exactly the Slot the template builder assigned each row.
-//
-// A template leaf's slot space differs from the narrow/wide hash space, but
-// build placement and read enumeration both route through this one function, so
-// the posting a row is written under is the posting a lookup selects it by,
-// regardless of class. That is the invariant the read-side liveness recheck
-// depends on. raw borrows the leaf page for the succinct classes and the
-// returned scratch, spliced fresh for each row, for the template class.
+// VisitPrimaryLeafPostingRows enumerates one unified leaf's live rows in
+// lexical key order with the stable hash-directory slot each row occupies.
+// Inline rows render into scratch; overflow descriptors borrow the page.
 func VisitPrimaryLeafPostingRows(
 	page []byte, storeID [16]byte, bucket BucketID,
 	bounds CommonPrimaryLeafBounds, scratch []byte,
 	fn func(slot uint8, key, raw []byte, overflow bool) error,
 ) ([]byte, error) {
-	switch PrimaryLeafClass(page) {
-	case CommonPrimaryLeafTemplate:
-		tv, ok := AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
+	if PrimaryLeafClass(page) != CommonPrimaryLeafUnified {
+		return scratch, primaryExactCorrupt("non-unified leaf")
+	}
+	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
+	if !ok {
+		return scratch, primaryExactCorrupt("unified leaf")
+	}
+	slots, slotsOK := uv.env.rankSlots()
+	if !slotsOK {
+		return scratch, primaryExactCorrupt("unified slots")
+	}
+	it := uv.env.AllRows()
+	var renderer unifiedPrimaryRowRenderer
+	renderer.Reset(uv)
+	for rank := 0; ; rank++ {
+		key, raw, overflow, ok := it.NextRawBorrowed()
 		if !ok {
-			return scratch, primaryExactCorrupt("template leaf")
+			break
 		}
-		for rank := 0; rank < tv.Len(); rank++ {
-			key, ti, ok := tv.RowAt(rank)
-			if !ok {
-				return scratch, primaryExactCorrupt("template row")
-			}
-			scratch = tv.AppendRawRank(scratch[:0], rank, ti)
-			if err := fn(uint8(rank), key, scratch, false); err != nil {
+		if overflow {
+			if err := fn(slots[rank], key, raw, true); err != nil {
 				return scratch, err
 			}
+			continue
 		}
+		scratch = renderer.Append(scratch[:0], raw)
+		if err := fn(slots[rank], key, scratch, false); err != nil {
+			return scratch, err
+		}
+	}
+	return scratch, nil
+}
+
+// VisitPrimaryLeafSelectedPostingRows materializes only the stable slots named
+// by selected. It first maps occupied hash slots to lexical ranks, then visits
+// those ranks in order. Sparse exact-index scans therefore do O(matches) row
+// decoding and rendering instead of reconstructing every document in each
+// touched bucket. Dead and absent bits are ignored.
+func VisitPrimaryLeafSelectedPostingRows(
+	page []byte, storeID [16]byte, bucket BucketID,
+	bounds CommonPrimaryLeafBounds, selected [4]uint64, scratch []byte,
+	fn func(slot uint8, key, raw []byte, overflow bool) error,
+) ([]byte, error) {
+	if PrimaryLeafClass(page) != CommonPrimaryLeafUnified {
+		return scratch, primaryExactCorrupt("non-unified leaf")
+	}
+	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
+	if !ok {
+		return scratch, primaryExactCorrupt("unified leaf")
+	}
+	requested := 0
+	for _, word := range selected {
+		requested += bits.OnesCount64(word)
+	}
+	if requested == 0 {
 		return scratch, nil
-	case CommonPrimaryLeafCompact:
-		cv, ok := AdmittedCommonPrimaryCompactLeaf(page, bucket, bounds)
-		if !ok {
-			return scratch, primaryExactCorrupt("compact leaf")
-		}
-		for rank := 0; rank < cv.Len(); rank++ {
-			key, ti, ok := cv.RowAt(rank)
-			if !ok {
-				return scratch, primaryExactCorrupt("compact row")
-			}
-			scratch = cv.AppendRawRank(scratch[:0], rank, ti)
-			if err := fn(uint8(rank), key, scratch, false); err != nil {
-				return scratch, err
-			}
-		}
-		return scratch, nil
-	case CommonPrimaryLeafUnified:
-		// The unified class keeps the envelope's stable hash slots (the one
-		// slot discipline of the unified-leaf design §3.1), so posting slots
-		// resolve from the encoded slot tables rather than the lexical rank;
-		// row bodies render into the reused scratch exactly as templates do.
-		uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
-		if !ok {
-			return scratch, primaryExactCorrupt("unified leaf")
-		}
+	}
+	// Above three-quarters density, a sequential leaf walk is cheaper than
+	// slot-to-rank inversion plus random row-directory probes. This branch also
+	// handles masks containing many dead bits efficiently; only occupied slots
+	// are delivered.
+	if requested*4 >= uv.Len()*3 {
 		slots, slotsOK := uv.env.rankSlots()
 		if !slotsOK {
 			return scratch, primaryExactCorrupt("unified slots")
 		}
 		it := uv.env.AllRows()
+		var renderer unifiedPrimaryRowRenderer
+		rendererReady := false
 		for rank := 0; ; rank++ {
-			key, raw, overflow, ok := it.NextRawBorrowed()
-			if !ok {
+			key, raw, overflow, rowOK := it.NextRawBorrowed()
+			if !rowOK {
 				break
 			}
-			if overflow {
-				if err := fn(slots[rank], key, raw, true); err != nil {
-					return scratch, err
-				}
+			slot := slots[rank]
+			if selected[slot>>6]&(uint64(1)<<uint(slot&63)) == 0 {
 				continue
 			}
-			var rendered bool
-			scratch, rendered = uv.AppendRowBody(scratch[:0], raw)
-			if !rendered {
-				return scratch, primaryExactCorrupt("unified row body")
+			if !overflow {
+				if !rendererReady {
+					renderer.Reset(uv)
+					rendererReady = true
+				}
+				scratch = renderer.Append(scratch[:0], raw)
+				raw = scratch
 			}
-			if err := fn(slots[rank], key, scratch, false); err != nil {
+			if err := fn(slot, key, raw, overflow); err != nil {
 				return scratch, err
 			}
 		}
 		return scratch, nil
 	}
-	view := AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
-	it := view.AllRows()
-	for {
-		key, raw, overflow, ok := it.NextRawBorrowed()
-		if !ok {
-			break
+	var (
+		selectedRanks [4]uint64
+		slotsByRank   [CommonPrimaryLeafWideSlots]uint8
+		anySelected   bool
+	)
+	for quadrant, word := range selected {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			word &= word - 1
+			slot := uint8(quadrant*64 + bit)
+			rank, occupied := uv.env.slotRank(slot)
+			if !occupied {
+				continue
+			}
+			anySelected = true
+			selectedRanks[rank>>6] |= uint64(1) << uint(rank&63)
+			slotsByRank[rank] = slot
 		}
-		slot, _, _, found := view.LookupRawHashed(
-			KeyHashBytes(storeID, key), key,
-		)
-		if !found {
-			return scratch, primaryExactCorrupt("row slot")
-		}
-		if err := fn(slot, key, raw, overflow); err != nil {
-			return scratch, err
+	}
+	if !anySelected {
+		return scratch, nil
+	}
+	var renderer unifiedPrimaryRowRenderer
+	rendererReady := false
+	for rankWord, word := range selectedRanks {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			word &= word - 1
+			rank := rankWord*64 + bit
+			key, raw, overflow, rowOK := uv.RowRawAt(rank)
+			if !rowOK {
+				return scratch, primaryExactCorrupt("unified selected row")
+			}
+			if !overflow {
+				if !rendererReady {
+					renderer.Reset(uv)
+					rendererReady = true
+				}
+				scratch = renderer.Append(scratch[:0], raw)
+				raw = scratch
+			}
+			if err := fn(slotsByRank[rank], key, raw, overflow); err != nil {
+				return scratch, err
+			}
 		}
 	}
 	return scratch, nil

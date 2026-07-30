@@ -15,6 +15,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 var primaryLTRScale = flag.String(
@@ -182,10 +183,12 @@ func primaryLTRBuild(
 ) int {
 	t.Helper()
 	// One deterministic document is deliberately too large for a narrow leaf.
-	// The graph therefore owns at least one 8 KiB leaf per row, making the
-	// target a lower bound without a build-calibrate-build cycle.
-	records := int((config.targetBytes + primaryLTRLeafBytes - 1) /
-		primaryLTRLeafBytes)
+	// Each row therefore contributes at least its canonical document bytes even
+	// though the unified wide leaf no longer pads every row to a full 8 KiB
+	// page. Size the corpus from that tighter lower bound so format space
+	// improvements cannot accidentally turn this into an in-cache test.
+	records := int((config.targetBytes + primaryLTRDocumentBytes - 1) /
+		primaryLTRDocumentBytes)
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -342,6 +345,7 @@ func primaryLTRPrefetch(
 			return 0
 		}
 	})
+	ordered = slices.Compact(ordered)
 	if _, err := collection.cache.Prefetch(ordered); err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +377,12 @@ func primaryLTRWarmLane(
 		}
 		buffer = out
 	}
-	want := primaryLTRDocument(nil, order[0])
+	want, err := vibejson.AppendCanonicalize(
+		nil, primaryLTRDocument(nil, order[0]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Convert the probe key once, outside the measured closure (borrowed []byte
 	// key; a per-call conversion would break the 0-alloc pin).
 	probe := []byte(keys[0])

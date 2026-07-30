@@ -8,19 +8,13 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// The recovery journal wiring makes a DurabilityBufferedVisible acknowledgement
-// durable at the price of one bounded append plus one sync, instead of leaving
-// it volatile until the next checkpoint. A frame-deferred mutation is applied to
-// the canonical frames exactly as buffered-visible already does, then its redo
-// record — key, value, generation — is appended to a sibling journal file and
-// that file alone is synced. Readers never consult the journal: visibility comes
-// from the canonical frames, unchanged. A checkpoint folds the records into the
-// ordinary root publication and recycles the journal head in the same fence.
-//
-// Only buffered-visible carries a journal. Its deferred-root, immediate-visibility
-// read path is exactly what a redo lane needs, and adding write-side durability
-// does not perturb a single reader decision — the standing "no read-path change"
-// gate holds by construction.
+// The recovery journal serves two buffered-visible contracts without changing
+// reads. With Options.RecoveryJournal, each mutation appends and syncs its redo
+// before acknowledgement. Without that option, acknowledgements stay volatile
+// and an explicit Flush appends one ordered batch covering the bounded class-5
+// overlay, then syncs it. Both forms recover through the ordinary mutation path;
+// a physical checkpoint eventually folds the records into the root and recycles
+// the journal. DurabilitySync uses the per-mutation form unconditionally.
 
 // recoveryJournalCheckpointRecords bounds how many worst-case records the
 // preallocated journal holds before a further append reports full and forces a
@@ -87,6 +81,16 @@ var recoveryJournalFaultHook func(*storeio.RecoveryJournal)
 // a crash there replays the record on reopen. Production leaves it nil.
 var recoveryJournalPostSyncHook func()
 
+// recoveryJournalDeltaPreSyncHook and recoveryJournalDeltaPostSyncHook bracket
+// the ordinary buffered-visible checkpoint fence for crash tests. The pre hook
+// runs after the complete batch append and before Sync; the post hook runs
+// after Sync succeeds but before the logical durable watermark advances.
+// Production leaves both nil.
+var (
+	recoveryJournalDeltaPreSyncHook  func(target uint64)
+	recoveryJournalDeltaPostSyncHook func(target uint64)
+)
+
 // journalEnabled reports whether this collection acknowledges through a recovery
 // journal. The synchronous lane is journal-backed unconditionally — Create and
 // CreateFromPrimary mint the journal with the store — and buffered-visible
@@ -98,12 +102,31 @@ func (c *Collection) journalEnabled() bool {
 	return c != nil && c.journal != nil
 }
 
-// journalConfigured reports whether the collection's options request a journal.
-// It is decided from options alone so Create and Open can size and mint the
-// journal before c.journal is set.
+// journalConfigured reports whether a newly created collection needs the
+// recovery-journal sibling. Every buffered-visible store carries one: the
+// RecoveryJournal option selects per-mutation durable acknowledgements, while
+// ordinary buffered-visible uses the same file only when Flush publishes a
+// bounded delta checkpoint. It is decided from options alone so Create can mint
+// the sibling before c.journal is set.
 func (c *Collection) journalConfigured() bool {
-	return c.options.RecoveryJournal &&
-		c.options.Durability == DurabilityBufferedVisible
+	return c.options.Durability == DurabilityBufferedVisible
+}
+
+// bufferedJournalAckLane is the opt-in buffered mode that appends and syncs a
+// redo record for every acknowledged mutation. Merely having a paired journal
+// no longer selects this path: ordinary buffered-visible also has a journal,
+// but keeps mutation acknowledgements volatile and writes it only from Flush.
+func (c *Collection) bufferedJournalAckLane() bool {
+	return c.buffered() && c.options.RecoveryJournal &&
+		c.journalEnabled()
+}
+
+// bufferedJournalDeltaLane is the ordinary buffered-visible checkpoint lane.
+// It never runs during recovery replay: Open must physically fold and recycle
+// the records it is currently consuming.
+func (c *Collection) bufferedJournalDeltaLane() bool {
+	return c.buffered() && !c.options.RecoveryJournal &&
+		c.journalEnabled() && !c.journalReplaying
 }
 
 // recoveryJournalSuffix names a store file's paired recovery journal, which
@@ -114,10 +137,9 @@ func (c *Collection) journalConfigured() bool {
 const recoveryJournalSuffix = ".rjournal"
 
 // RecoveryJournalPath returns the recovery-journal sibling path for a store file
-// at storePath. A journaled collection (any synchronous collection, and a
-// buffered-visible one that opted into RecoveryJournal) writes its journal here,
-// and Open resolves it here, so any external move of the store file must move
-// this alongside it.
+// at storePath. Every buffered-visible or synchronous primary store writes its
+// journal here, and Open resolves it here, so an external move of the store file
+// must move this sibling with it.
 func RecoveryJournalPath(storePath string) string {
 	return storePath + recoveryJournalSuffix
 }
@@ -146,7 +168,26 @@ func (c *Collection) journalSiblingPath() (string, error) {
 // 2048 overflow records: one must fit, the journal recycles at the next.
 func recoveryJournalCapacityBytesFor(
 	sectorSize uint32, maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
+	deltaOverlayBytes int,
 ) uint64 {
+	if deltaOverlayBytes > 0 {
+		// Ordinary buffered-visible never deposits an overflow value or more
+		// records than the resident overlay can hold. The complete checkpoint
+		// batch is therefore bounded by the overlay's key+value arena plus one
+		// small entry header per record. Do not charge this lane the 2,048
+		// worst-case per-mutation acknowledgements reserved by the opt-in sync
+		// lane: that hidden preallocation would erase much of class-5's disk
+		// saving even though the bytes are unreachable.
+		capacity := uint64(deltaOverlayBytes) +
+			uint64(primaryUnifiedOverlayRecords*
+				storeio.RecoveryBatchEntryHeaderSize) +
+			storeio.RecoveryJournalRecordPrefixSize +
+			storeio.RecoveryJournalRecordTrailerSize
+		capacity = max(capacity, recoveryJournalMinCapacityBytes)
+		capacity = min(capacity, recoveryJournalMaxCapacityBytes)
+		sector := uint64(sectorSize)
+		return (capacity + sector - 1) / sector * sector
+	}
 	recordUpper := storeio.RecoveryRecordPaddedSize(
 		sectorSize, maxKeyBytes, inlineValueBytes,
 	)
@@ -179,7 +220,7 @@ func recoveryJournalHeaderFor(
 	storeID, journalID [16]byte,
 	pageSize uint32,
 	maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
-	baseGeneration uint64,
+	baseGeneration uint64, deltaOverlayBytes int,
 ) storeio.RecoveryJournalHeader {
 	sectorSize := uint32(storeio.RecoveryJournalMinSectorSize)
 	return storeio.RecoveryJournalHeader{
@@ -191,13 +232,16 @@ func recoveryJournalHeaderFor(
 		BaseSequence:   0,
 		Capacity: recoveryJournalCapacityBytesFor(
 			sectorSize, maxKeyBytes, inlineValueBytes, maxDocumentBytes,
+			deltaOverlayBytes,
 		),
 	}
 }
 
 // createSiblingRecoveryJournal preallocates and syncs a fresh journal file
-// beside storePath, then closes it. A one-shot builder (CreateFromPrimary) uses
-// this to mint the journal a later Open will pair, replay, and own.
+// beside storePath, closes it, then durably links its directory entry before a
+// root may publish the journal identity. A one-shot builder
+// (CreateFromPrimary) uses this to mint the journal a later Open will pair,
+// replay, and own.
 func createSiblingRecoveryJournal(
 	storePath string, header storeio.RecoveryJournalHeader,
 ) error {
@@ -215,7 +259,15 @@ func createSiblingRecoveryJournal(
 		_ = os.Remove(path)
 		return fmt.Errorf("vibejson: create recovery journal: %w", err)
 	}
-	return journal.Close()
+	if err := journal.Close(); err != nil {
+		return fmt.Errorf("vibejson: close recovery journal: %w", err)
+	}
+	if err := syncRecoveryJournalParent(path); err != nil {
+		return fmt.Errorf(
+			"vibejson: persist recovery journal directory entry: %w", err,
+		)
+	}
+	return nil
 }
 
 // openRecoveryJournalLocked opens and pairs the sibling journal named by a
@@ -250,6 +302,7 @@ func (c *Collection) openRecoveryJournalLocked(
 	c.journalID = journalID
 	c.journalPowerSafe = c.options.CheckpointStrength != CheckpointFilesystem
 	c.journal = journal
+	c.journalDeltaGeneration.Store(rootGeneration)
 	c.initJournalGroupLocked()
 	if recoveryJournalFaultHook != nil {
 		recoveryJournalFaultHook(journal)
@@ -359,6 +412,7 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 		c.journalGroup.fail(poisoned)
 		return poisoned
 	}
+	c.journalDeltaGeneration.Store(baseGeneration)
 	// The checkpoint folded every deposited record into the durable root before
 	// this recycle, so any group-commit waiter parked on an earlier ticket is now
 	// durable via the root and must complete without waiting for a sync of the
@@ -387,7 +441,7 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 func (c *Collection) journalDepositLocked(
 	kind uint16, generation uint64, key, value []byte,
 ) (uint64, error) {
-	if !c.journalEnabled() || c.journalReplaying {
+	if !c.bufferedJournalAckLane() || c.journalReplaying {
 		return 0, nil
 	}
 	if !c.journal.Fits(len(key), len(value)) {
@@ -497,7 +551,7 @@ func (c *Collection) journalBatchBeforePublishLocked(
 func (c *Collection) journalBatchDepositLocked(
 	generation uint64, entries []storeio.RecoveryBatchEntry,
 ) (uint64, error) {
-	if !c.journalEnabled() || c.journalReplaying {
+	if !c.bufferedJournalAckLane() || c.journalReplaying {
 		return 0, nil
 	}
 	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
@@ -526,7 +580,8 @@ func (c *Collection) journalBatchDepositLocked(
 func (c *Collection) ensurePrimaryBatchJournalRoom(
 	entries []storeio.RecoveryBatchEntry,
 ) error {
-	if !c.journalEnabled() || c.journalReplaying {
+	if c.journalReplaying ||
+		!c.bufferedJournalAckLane() && !c.syncJournalLane() {
 		return nil
 	}
 	if c.journal.FitsBatch(entries) {
@@ -537,6 +592,104 @@ func (c *Collection) ensurePrimaryBatchJournalRoom(
 	}
 	c.automaticCheckpoints.Add(1)
 	return nil
+}
+
+// checkpointBufferedJournalDeltaLocked makes the current ordinary
+// buffered-visible cut durable with one bounded recovery-journal batch and one
+// sync. It returns handled=false when any visible generation is not represented
+// by one consecutive class-5 overlay record, when physical COW state is staged,
+// or when the journal has no room; the caller then performs the existing full
+// leaf/root checkpoint and recycles the journal.
+//
+// The batch retains every raw record rather than coalescing repeated keys.
+// Recovery applies one entry per logical generation, so the reopened public
+// generation lands exactly on target as well as reconstructing the same rows
+// and exact-index postings.
+func (c *Collection) checkpointBufferedJournalDeltaLocked() (
+	handled bool, err error,
+) {
+	if !c.bufferedJournalDeltaLane() {
+		return false, nil
+	}
+	if failure := c.PersistenceError(); failure != nil {
+		return true, failure
+	}
+	state := c.state.Load()
+	if state == nil {
+		return true, ErrClosed
+	}
+	target := state.root.Generation
+	after := c.journalDeltaGeneration.Load()
+	if target == after {
+		return true, nil
+	}
+	if target < after {
+		return true, storeio.ErrGenerationOrder
+	}
+	// The cheap cut may coexist with resident exact-index deltas: recovery
+	// deterministically rebuilds them by replaying the same primary mutations.
+	//
+	// A device-silent row-overlay fold is also safe once the journal watermark
+	// already covers its complete generation. The committer's newer root is only
+	// staged in memory; after a crash the old durable root plus the retained
+	// journal reconstructs the same cut. primaryCheckpointBase identifies that
+	// staged root exactly. Do not admit an arbitrary physical gap here: a
+	// structural/COW publication newer than the watermark is not represented by
+	// checkpointEntries and must take the ordinary full checkpoint.
+	published := c.committer.PublishedGeneration()
+	physicalDurable := c.committer.DurableGeneration()
+	stagedFoldCovered := false
+	if published > physicalDurable && published <= after {
+		if base := c.primaryCheckpointBase; base != nil {
+			stagedFoldCovered = base.root.Generation == published
+		}
+	}
+	if published != physicalDurable && !stagedFoldCovered ||
+		len(c.primaryPendingParents) != 0 ||
+		len(c.primaryVolatileRetired) != 0 ||
+		len(c.bufferedFirstTouches) != 0 ||
+		len(c.primaryMutationAdmitted) != 0 ||
+		len(c.batchPrimaryAdmitted) != 0 {
+		return false, nil
+	}
+	entries, complete, entryErr :=
+		c.primaryUnifiedOverlay.checkpointEntries(
+			c.journalDeltaEntries[:0], after, target,
+		)
+	if entryErr != nil {
+		return true, entryErr
+	}
+	if !complete || len(entries) == 0 ||
+		!c.journal.FitsBatch(entries) {
+		return false, nil
+	}
+	if _, appendErr := c.journal.AppendBatch(target, entries); appendErr != nil {
+		if errors.Is(appendErr, storeio.ErrRecoveryJournalFull) {
+			return false, nil
+		}
+		return true, c.poisonJournal(appendErr)
+	}
+	if recoveryJournalDeltaPreSyncHook != nil {
+		recoveryJournalDeltaPreSyncHook(target)
+	}
+	if syncErr := c.journal.Sync(c.journalPowerSafe); syncErr != nil {
+		return true, c.poisonJournal(syncErr)
+	}
+	if recoveryJournalDeltaPostSyncHook != nil {
+		recoveryJournalDeltaPostSyncHook(target)
+	}
+
+	// The watermark is the point of no return: only a completed journal fence
+	// may make this generation observable as crash-safe. The physical committer
+	// generation deliberately remains at the old root for allocator/recycle
+	// decisions until pressure or Close performs a full fold.
+	c.journalDeltaGeneration.Store(target)
+	c.journalDeltaCheckpoints.Add(1)
+	c.journalDeltaRecords.Add(uint64(len(entries)))
+	c.journalDeltaBytes.Add(uint64(storeio.RecoveryBatchRecordPaddedSize(
+		c.journal.Header().SectorSize, entries,
+	)))
+	return true, nil
 }
 
 // closeRecoveryJournalLocked closes the journal file. The final checkpoint on

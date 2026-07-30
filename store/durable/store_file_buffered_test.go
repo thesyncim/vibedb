@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
@@ -27,10 +28,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 		_ = file.Close()
 	}()
 
-	before, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := captureJournalImage(t, file.Name())
 	value := []byte(`{"value":"buffered"}`)
 	if created, err := collection.Put([]byte("key"), value); err != nil || !created {
 		t.Fatalf("Put = (%v, %v), want created", created, err)
@@ -49,7 +47,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(during, before) {
+	if !bytes.Equal(during, before.store) {
 		t.Fatal("acknowledged buffered Put changed the file before a checkpoint")
 	}
 
@@ -64,10 +62,7 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	if got, want := collection.DurableGeneration(), collection.Generation(); got != want {
 		t.Fatalf("checkpoint generations = durable %d, visible %d", got, want)
 	}
-	after, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	after := captureJournalImage(t, file.Name())
 	afterCrash := openBufferedImage(t, after, options)
 	got, found, err = afterCrash.AppendRaw(nil, []byte("key"))
 	if err != nil || !found || !bytes.Equal(got, value) {
@@ -246,7 +241,7 @@ func TestFileStoreBufferedVisibleCheckpointFailureIsSticky(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	checkpointErr := collection.Flush()
+	checkpointErr := flushPhysicalForTest(collection)
 	if checkpointErr == nil {
 		t.Fatal("checkpoint on a closed device succeeded")
 	}
@@ -333,22 +328,17 @@ func TestFileStoreCheckpointStrengthIsExplicitAndConstrained(t *testing.T) {
 	}
 }
 
-func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *testing.T) {
-	// A buffered-visible checkpoint window records one pending parent per distinct
-	// routed leaf its mutations touch, capped at filePrimaryPendingParentLimit
-	// (64). Touching a 65th distinct leaf with no intervening Flush is the genuine
-	// staging-pressure trigger: it forces one checkpoint and accounts it as an
-	// automatic checkpoint. The earlier version of this test wrote 1,024 fresh
-	// keys into a virgin tree, which never spread across enough distinct leaves in
-	// one window to reach the cap, so AutomaticCheckpoints stayed at zero and the
-	// assertion was vacuous.
+func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T) {
+	// A buffered-visible class-5 overlay tracks at most 64 distinct dirty leaves
+	// per fold. Touching a 65th distinct leaf with no intervening Flush is the
+	// genuine staging-pressure trigger: it folds the first window into a rooted
+	// publication and accounts it as a device-silent overlay fold.
 	//
 	// This seeds a corpus wide enough to span well past 64 routed leaves through
-	// the bulk cutover -- which does not run the Put-path pending-parent logic, so
-	// the seed leaves the automatic counter at zero -- then updates one key from
+	// the bulk cutover -- which does not run the row-overlay logic, so the seed
+	// leaves both pressure counters at zero -- then updates one key from
 	// each of more than 64 distinct leaves inside a single window. No snapshot is
-	// held, so the superseded leaf frames drain and volatile-retirement pressure
-	// (a separate counter) never preempts the pending-parent trigger under test.
+	// held, so the completed fold can recycle its row arena immediately.
 	const corpusSize = 12_000
 	built, keys, _ := buildFilePrimaryCorpus(t, corpusSize)
 	options := Options{
@@ -367,6 +357,12 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 		t.Fatalf(
 			"bulk seed forced %d automatic checkpoints; the trigger must come from the update window",
 			baseline.AutomaticCheckpoints,
+		)
+	}
+	if baseline.PrimaryOverlayFolds != 0 {
+		t.Fatalf(
+			"bulk seed performed %d overlay folds; the trigger must come from the update window",
+			baseline.PrimaryOverlayFolds,
 		)
 	}
 
@@ -401,22 +397,41 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 	updated := make(map[string][]byte, len(targets))
 	for at, key := range targets {
 		value := fmt.Appendf(nil, `{"pressure":%d,"leaf":%d}`, at, at)
-		updated[key] = value
+		canonical, canonicalErr := vibejson.AppendCanonicalize(nil, value)
+		if canonicalErr != nil {
+			t.Fatal(canonicalErr)
+		}
+		updated[key] = canonical
 		if _, putErr := collection.Put([]byte(key), value); putErr != nil {
 			t.Fatalf("update %q: %v", key, putErr)
 		}
 	}
 
 	stats := collection.Stats()
-	if stats.AutomaticCheckpoints <= baseline.AutomaticCheckpoints {
+	if stats.PrimaryOverlayFolds <= baseline.PrimaryOverlayFolds {
 		t.Fatalf(
-			"automatic checkpoints = %d, baseline %d; pending-parent pressure across %d leaves did not checkpoint",
-			stats.AutomaticCheckpoints, baseline.AutomaticCheckpoints, len(targets),
+			"primary overlay folds = %d, baseline %d; class-5 overlay pressure across %d leaves did not fold",
+			stats.PrimaryOverlayFolds, baseline.PrimaryOverlayFolds, len(targets),
 		)
 	}
-	if stats.DeviceCommits <= baseline.DeviceCommits {
+	if stats.AutomaticCheckpoints != baseline.AutomaticCheckpoints {
 		t.Fatalf(
-			"device commits = %d, baseline %d; the forced checkpoint never reached the device",
+			"automatic checkpoints = %d, baseline %d; device-silent row fold was mislabeled as forced persistence",
+			stats.AutomaticCheckpoints, baseline.AutomaticCheckpoints,
+		)
+	}
+	if stats.PublishedGeneration <= baseline.PublishedGeneration {
+		t.Fatalf(
+			"published generation = %d, baseline %d; the forced fold never rooted its rows",
+			stats.PublishedGeneration, baseline.PublishedGeneration,
+		)
+	}
+	// Buffered-visible pressure folds remain device-silent. Durability belongs
+	// to the explicit Flush below (or to a later bounded committer-pressure
+	// checkpoint), preserving the mode's group-commit contract.
+	if stats.DeviceCommits != baseline.DeviceCommits {
+		t.Fatalf(
+			"device commits = %d, baseline %d; a row-overlay fold performed an eager device checkpoint",
 			stats.DeviceCommits, baseline.DeviceCommits,
 		)
 	}
@@ -450,6 +465,9 @@ func TestFileStoreBufferedVisibleAutomaticallyCheckpointsStagingPressure(t *test
 			"explicit Flush changed automatic checkpoints from %d to %d",
 			automaticCheckpoints, got,
 		)
+	}
+	if got := collection.Stats().DeviceCommits; got <= stats.DeviceCommits {
+		t.Fatalf("explicit Flush left device commits at %d", got)
 	}
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
@@ -499,6 +517,10 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 
 	first := []byte(`{"value":"first","pad":"aaaaaaaaaaaaaaaa"}`)
 	second := []byte(`{"value":"second","pad":"bbbbbbbbbbbbbbbb"}`)
+	canonicalSecond, err := vibejson.AppendCanonicalize(nil, second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := collection.Put([]byte("key"), first); err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +528,7 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 		t.Fatal(err)
 	}
 	if got, found, err := collection.AppendRaw(nil, []byte("key")); err != nil ||
-		!found || !bytes.Equal(got, second) {
+		!found || !bytes.Equal(got, canonicalSecond) {
 		t.Fatalf("latest buffered value = (%q, %v, %v)", got, found, err)
 	}
 	// The primary graph does not cancel copy-on-write pages the way the committer's
@@ -516,7 +538,7 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 	// is the retirement table growing across the checkpoint, not a page-write
 	// counter that never moves on this layout.
 	beforeCheckpoint := collection.Stats()
-	if err := collection.Flush(); err != nil {
+	if err := flushPhysicalForTest(collection); err != nil {
 		t.Fatal(err)
 	}
 	afterCheckpoint := collection.Stats()
@@ -544,7 +566,7 @@ func TestFileStoreBufferedVisibleSupersedesExactRetiredPagesAndReopens(t *testin
 	}
 	defer reopened.Close()
 	if got, found, err := reopened.AppendRaw(nil, []byte("key")); err != nil ||
-		!found || !bytes.Equal(got, second) {
+		!found || !bytes.Equal(got, canonicalSecond) {
 		t.Fatalf("reopened latest value = (%q, %v, %v)", got, found, err)
 	}
 }
@@ -671,10 +693,15 @@ func TestFileStoreBufferedVisibleSupersessionCoversDeleteAndBatch(t *testing.T) 
 	}
 }
 
-func openBufferedImage(t *testing.T, image []byte, options Options) *Collection {
+func openBufferedImage(
+	t *testing.T, image journalCrashImage, options Options,
+) *Collection {
 	t.Helper()
 	path := t.TempDir() + "/crash-image.db"
-	if err := os.WriteFile(path, image, 0o600); err != nil {
+	if err := os.WriteFile(path, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".rjournal", image.journal, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.OpenFile(path, os.O_RDWR, 0o600)

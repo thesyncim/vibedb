@@ -38,13 +38,10 @@ func unifiedOverflowDoc(i int) []byte {
 }
 
 // TestUnifiedStoreEquivalence is the U1b end-to-end functional gate at store
-// level: a UnifiedLeaves store must agree with a plain map oracle of
+// level: the canonical class-5 store must agree with a plain map oracle of
 // canonical spellings on point reads (present and absent keys), full ordered
 // scans, the token filter lane, and the field probe — over both competitive
-// cardinalities with overflow, trivial, and rewrite rows mixed in. (The
-// bench/competitive harness has no seam to select UnifiedLeaves without
-// harness edits, so per the stage instructions the equivalence coverage runs
-// here at store level.)
+// cardinalities with overflow, trivial, and rewrite rows mixed in.
 func TestUnifiedStoreEquivalence(t *testing.T) {
 	const n = 20_000
 	for _, high := range []bool{false, true} {

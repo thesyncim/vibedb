@@ -16,12 +16,13 @@ const (
 	PageTrailerSize = 8
 
 	pageMagic = "SJPAGE01"
-	// pageVersion is 4 because the hybrid primary received dedicated durable
-	// page kinds. Earlier experiments deliberately reused unrelated kinds,
-	// which made a valid checksum insufficient to select the only legal decoder.
+	// pageVersion is 5 because ordered-primary leaves now have one canonical
+	// class-5 grammar. Version 4 admitted the superseded raw, template-columnar,
+	// and compact leaf classes, so accepting it would silently preserve a
+	// compatibility branch the unreleased format does not owe.
 	// The store has never been released; there is deliberately no migration
 	// path.
-	pageVersion = uint16(4)
+	pageVersion = uint16(5)
 )
 
 // ErrPageCorrupt reports a malformed, truncated, or checksum-invalid common

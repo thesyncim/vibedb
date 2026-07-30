@@ -23,10 +23,10 @@ import (
 // resulting collection supports point reads, snapshots, and serialized
 // Put/Delete through the ordered-primary COW path.
 //
-// Exact indexes are built as posting tiles beside the ordered primary, and
-// Options.DocumentFormat selects verbatim or compact leaves. Schemas and
-// overflow values are not implemented by this entry; create an empty collection
-// with Create and load it through Put when they are required.
+// Exact indexes are built as posting tiles beside the ordered primary. Every
+// document is canonicalized once and every leaf uses the unified class-5
+// grammar. Schemas and overflow values are not implemented by this entry;
+// create an empty collection with Create and load it through Put when required.
 func CreateFromPrimary(
 	collection *store.Collection,
 	file *os.File,
@@ -47,12 +47,6 @@ func CreateFromPrimary(
 	if options.Collection.Schema != nil {
 		return 0, fmt.Errorf(
 			"%w: schemas are not available in CreateFromPrimary",
-			ErrPrimaryCutoverUnsupported,
-		)
-	}
-	if options.DocumentFormat > DocumentFormatCompact {
-		return 0, fmt.Errorf(
-			"%w: unknown document format",
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
@@ -119,34 +113,13 @@ func CreateFromPrimary(
 		)
 	}
 
-	// DocumentFormatCompact stages every leaf as the compact document-group
-	// class; verbatim uses the adaptive succinct/template classes; UnifiedLeaves
-	// routes to the class-5 unified planner and codec. The policy is threaded
-	// identically into the page-count reservation and the build so the single
-	// staging transaction reserves exactly the leaves the build produces.
-	leafPolicy := storeio.PrimaryLeafAdaptive
-	formatTag := options.DocumentFormat
-	if options.DocumentFormat == DocumentFormatCompact {
-		leafPolicy = storeio.PrimaryLeafCompact
+	// Canonicalize every document once, up front, so the leaf encoder, exact
+	// index term derivation, and every later read observe exactly one spelling.
+	if err := canonicalizePrimaryBulkRecords(records); err != nil {
+		return 0, err
 	}
-	if options.UnifiedLeaves {
-		leafPolicy = storeio.PrimaryLeafUnified
-		// The unified representation stores canonical bytes, so the build's
-		// deterministic identity must not collide with a verbatim or compact
-		// build over the same records: hash a distinct format tag beyond the
-		// two public DocumentFormat values.
-		formatTag = DocumentFormat(2)
-		// Canonicalize every document once, up front, so the leaf encoder, the
-		// exact-index term derivation, and every later read all observe exactly
-		// one spelling (unified-leaf design §3.2/§7.5: canonicalization happens
-		// at admission, before anything else consumes the bytes). The snapshot
-		// backing the borrowed values stays pinned through the KeepAlive below.
-		if err := canonicalizePrimaryBulkRecords(records); err != nil {
-			return 0, err
-		}
-	}
-	storeID := primaryBulkStoreID(records, normalized, formatTag)
-	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records, leafPolicy)
+	storeID := primaryBulkStoreID(records, normalized)
+	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records)
 	if err != nil {
 		return 0, err
 	}
@@ -160,7 +133,7 @@ func CreateFromPrimary(
 		// never under-provision (see primaryExactIndexPageBound).
 		exactPageBound, boundErr := primaryExactIndexPageBound(
 			storeID, records, normalized.indexes,
-			uint32(normalized.MaxPageSize), leafPolicy,
+			uint32(normalized.MaxPageSize),
 		)
 		if boundErr != nil {
 			return 0, boundErr
@@ -244,7 +217,7 @@ func CreateFromPrimary(
 		return 0, err
 	}
 	placements := make([]storeio.PrimaryGraphPlacement, len(records))
-	primaryRoot, err := storeio.BuildPrimaryGraphPlaced(tx, records, placements, leafPolicy)
+	primaryRoot, err := storeio.BuildPrimaryGraphPlaced(tx, records, placements)
 	if err != nil {
 		_ = tx.Abort()
 		_ = committer.Close()
@@ -288,11 +261,11 @@ func CreateFromPrimary(
 	// Mint the paired journal before the root that names it is published, so a
 	// crash after the root is durable finds the journal file present.
 	// DurabilitySync is journal-backed on the primary graph unconditionally — it
-	// is how sync acknowledges — while buffered-visible carries a journal only on
-	// the RecoveryJournal opt-in. Async-visible never carries one.
+	// is how sync acknowledges — and every buffered-visible store carries a
+	// journal for checkpoint deltas or per-mutation acknowledgement.
+	// Async-visible never carries one.
 	if normalized.Durability == DurabilitySync ||
-		normalized.RecoveryJournal &&
-			normalized.Durability == DurabilityBufferedVisible {
+		normalized.Durability == DurabilityBufferedVisible {
 		var journalID [16]byte
 		if _, err := rand.Read(journalID[:]); err != nil {
 			_ = tx.Abort()
@@ -306,6 +279,13 @@ func CreateFromPrimary(
 				storeID, journalID, uint32(normalized.PageSize),
 				normalized.MaxKeyBytes, normalized.InlineValueBytes,
 				normalized.MaxDocumentBytes, 1,
+				func() int {
+					if normalized.Durability == DurabilityBufferedVisible &&
+						!normalized.RecoveryJournal {
+						return normalized.primaryUnifiedOverlayBytes
+					}
+					return 0
+				}(),
 			),
 		); err != nil {
 			_ = tx.Abort()
@@ -409,14 +389,9 @@ func sortPrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error {
 func primaryBulkStoreID(
 	records []storeio.PrimaryGraphRecord,
 	options normalizedFileStoreOptions,
-	format DocumentFormat,
 ) [16]byte {
 	hash := sha256.New()
-	_, _ = hash.Write([]byte("vibejson primary bulk v1\x00"))
-	// The document format changes the physical leaf image byte for byte, so a
-	// compact build must not share an identity with a verbatim one over the same
-	// records and policy.
-	_, _ = hash.Write([]byte{byte(format)})
+	_, _ = hash.Write([]byte("vibejson unified primary bulk v1\x00"))
 	var fixed [8]byte
 	writeUint64 := func(value uint64) {
 		binary.LittleEndian.PutUint64(fixed[:], value)

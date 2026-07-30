@@ -15,7 +15,7 @@ type primaryGraphTestImage struct {
 	nodes   map[PageRef]*GlobalTabletCatalogNodeView
 	tablets map[PageRef]*GlobalTabletCatalogTabletRootView
 	anchors map[PageRef]*GlobalTabletCatalogAnchorView
-	leaves  map[PageRef]*CommonPrimaryLeafView
+	leaves  map[PageRef]*CommonPrimaryUnifiedLeafView
 }
 
 func buildPrimaryGraphTestImage(
@@ -87,7 +87,7 @@ func buildPrimaryGraphTestImage(
 		nodes:   make(map[PageRef]*GlobalTabletCatalogNodeView),
 		tablets: make(map[PageRef]*GlobalTabletCatalogTabletRootView),
 		anchors: make(map[PageRef]*GlobalTabletCatalogAnchorView),
-		leaves:  make(map[PageRef]*CommonPrimaryLeafView),
+		leaves:  make(map[PageRef]*CommonPrimaryUnifiedLeafView),
 	}, records
 }
 
@@ -161,12 +161,12 @@ func (image *primaryGraphTestImage) anchor(
 
 func (image *primaryGraphTestImage) leaf(
 	t testing.TB, route SegmentedTabletRouterRoute,
-) *CommonPrimaryLeafView {
+) *CommonPrimaryUnifiedLeafView {
 	t.Helper()
 	if view := image.leaves[route.Ref]; view != nil {
 		return view
 	}
-	view, err := OpenCommonPrimaryLeaf(
+	view, err := OpenCommonPrimaryUnifiedLeaf(
 		image.page(t, route.Ref), image.root.StoreID,
 		route.Bucket, route.Ref, image.root.Generation,
 		CommonPrimaryLeafBounds{
@@ -216,8 +216,12 @@ func (image *primaryGraphTestImage) lookup(
 		t.Fatal("anchor leaf route")
 	}
 	leaf := image.leaf(t, leafRoute)
-	_, value, found := leaf.LookupHashed(leafRoute.Hash, key)
-	return value.Inline, found
+	body, overflow, found := leaf.LookupBodyHashed(leafRoute.Hash, key)
+	if !found || overflow {
+		return nil, false
+	}
+	value, ok := leaf.AppendRowBody(nil, body)
+	return value, ok
 }
 
 func (image *primaryGraphTestImage) tabletRefs(
@@ -326,7 +330,7 @@ func TestBuildPrimaryGraphRoundTrip(t *testing.T) {
 						if !ok {
 							t.Fatal("leaf iteration route")
 						}
-						leaf, err := OpenCommonPrimaryLeaf(
+						leaf, err := OpenCommonPrimaryUnifiedLeaf(
 							image.page(t, route.Ref), image.root.StoreID,
 							route.Bucket, route.Ref, image.root.Generation,
 							leafBounds,
@@ -334,16 +338,16 @@ func TestBuildPrimaryGraphRoundTrip(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						iterator := leaf.AllRows()
-						for {
-							row, ok := iterator.Next()
-							if !ok {
-								break
+						for rank := 0; rank < leaf.Len(); rank++ {
+							key, body, overflow, ok := leaf.RowRawAt(rank)
+							value, rendered := leaf.AppendRowBody(nil, body)
+							if !ok || overflow || !rendered {
+								t.Fatal("unified leaf iteration")
 							}
 							if at >= len(records) ||
-								!bytes.Equal(row.Key, records[at].Key) ||
-								!bytes.Equal(row.Value.Inline, records[at].Value) {
-								t.Fatalf("iteration row %d = %q/%q", at, row.Key, row.Value.Inline)
+								!bytes.Equal(key, records[at].Key) ||
+								!bytes.Equal(value, records[at].Value) {
+								t.Fatalf("iteration row %d = %q/%q", at, key, value)
 							}
 							at++
 						}

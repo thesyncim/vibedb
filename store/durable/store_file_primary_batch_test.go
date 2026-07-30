@@ -219,25 +219,50 @@ func TestFilePrimaryBatchAtomicOnPrepareFailure(t *testing.T) {
 
 // TestFilePrimaryBatchDeterministic proves batch apply is byte-deterministic: two
 // stores that start from identical bytes and receive the identical batch commit
-// to identical bytes. The journal stamps a random identity into the root, so this
-// runs on the buffered lane without one, exactly as the other build-determinism
-// tests do.
+// to identical bytes. Each newly created buffered store has an independent
+// random journal identity, so the fixture creates one base and clones the paired
+// store+journal image before applying either batch.
 func TestFilePrimaryBatchDeterministic(t *testing.T) {
 	options := journalTestOptions(CheckpointPowerSafe)
 	options.RecoveryJournal = false
 
+	baseDir := t.TempDir()
+	basePath := filepath.Join(baseDir, "determinism-base.vibe")
+	baseFile, err := os.OpenFile(
+		basePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFromPrimary(
+		seedPrimaryCollection(t), baseFile, options,
+	); err != nil {
+		t.Fatalf("CreateFromPrimary: %v", err)
+	}
+	if err := baseFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	baseStore, err := os.ReadFile(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseJournal, err := os.ReadFile(RecoveryJournalPath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	build := func(label string) []byte {
 		dir := t.TempDir()
 		path := filepath.Join(dir, label+".vibe")
-		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
+		if err := os.WriteFile(path, baseStore, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := CreateFromPrimary(seedPrimaryCollection(t), file, options); err != nil {
-			t.Fatalf("CreateFromPrimary: %v", err)
+		if err := os.WriteFile(
+			RecoveryJournalPath(path), baseJournal, 0o600,
+		); err != nil {
+			t.Fatal(err)
 		}
-		_ = file.Close()
-		file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+		file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatal(err)
 		}

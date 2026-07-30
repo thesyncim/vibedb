@@ -13,6 +13,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 func TestFilePrimaryPutDeleteSnapshotCOW(t *testing.T) {
@@ -99,7 +100,7 @@ func TestFilePrimaryPutDeleteSnapshotCOW(t *testing.T) {
 	}
 }
 
-func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
+func TestFilePrimaryBufferedUnifiedOverlay(t *testing.T) {
 	built, keys, values := buildFilePrimaryCorpus(t, 1_000)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
@@ -113,10 +114,10 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer collection.Close()
-	first := []byte(`{"id":500,"hot":"first"}`)
-	second := []byte(`{"id":500,"hot":"other"}`)
-	third := []byte(`{"id":500,"hot":"third"}`)
-	fourth := []byte(`{"id":500,"hot":"final"}`)
+	first := []byte(`{"hot":"first","id":500}`)
+	second := []byte(`{"hot":"other","id":500}`)
+	third := []byte(`{"hot":"third","id":500}`)
+	fourth := []byte(`{"hot":"final","id":500}`)
 	if len(first) != len(second) || len(second) != len(third) ||
 		len(third) != len(fourth) {
 		t.Fatal("same-size fixture drift")
@@ -124,32 +125,14 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 	if created, err := collection.Put([]byte(keys[500]), first); err != nil || created {
 		t.Fatalf("first update = %v,%v", created, err)
 	}
-	afterFirst := collection.Stats()
-	if afterFirst.BufferedInplaceUpdates != 0 {
-		t.Fatalf(
-			"first-touch in-place updates = %d, want 0",
-			afterFirst.BufferedInplaceUpdates,
-		)
-	}
 	if created, err := collection.Put([]byte(keys[500]), second); err != nil || created {
 		t.Fatalf("second update = %v,%v", created, err)
-	}
-	afterSecond := collection.Stats()
-	if afterSecond.BufferedInplaceUpdates != 0 {
-		t.Fatalf(
-			"same-size first-touch in-place updates = %d, want 0",
-			afterSecond.BufferedInplaceUpdates,
-		)
 	}
 	if created, err := collection.Put([]byte(keys[500]), third); err != nil || created {
 		t.Fatalf("third update = %v,%v", created, err)
 	}
-	afterThird := collection.Stats()
-	if afterThird.BufferedInplaceUpdates != 1 {
-		t.Fatalf(
-			"same-size second-touch in-place updates = %d, want 1",
-			afterThird.BufferedInplaceUpdates,
-		)
+	if collection.Stats().BufferedInplaceUpdates != 0 {
+		t.Fatal("class-5 overlay unexpectedly used the retired in-place lane")
 	}
 	assertPrimaryRaw(t, collection, keys[500], third, true)
 	state := collection.state.Load()
@@ -176,9 +159,6 @@ func TestFilePrimaryBufferedCanonicalFrame(t *testing.T) {
 	if err != nil || !ok || !bytes.Equal(got, third) {
 		t.Fatalf("snapshot after forced COW = %q,%v,%v", got, ok, err)
 	}
-	if collection.Stats().BufferedInplaceFallbacks == 0 {
-		t.Fatal("snapshot-forced COW did not count an in-place fallback")
-	}
 }
 
 func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
@@ -201,7 +181,7 @@ func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	sealedRetired := collection.Stats().PendingRetiredExtents
-	updated := []byte(`{"id":500,"crash":"buffered"}`)
+	updated := []byte(`{"crash":"buffered","id":500}`)
 	if created, err := collection.Put(
 		[]byte(keys[500]), updated,
 	); err != nil || created {
@@ -214,8 +194,11 @@ func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 			got, sealedRoot,
 		)
 	}
-	if got := len(collection.primaryPendingParents); got != 1 {
-		t.Fatalf("pending parents = %d, want 1", got)
+	if got := len(collection.primaryPendingParents); got != 0 {
+		t.Fatalf("overlay update staged %d parent rewrites, want 0", got)
+	}
+	if !collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("buffered update left no pending unified row overlay")
 	}
 	if got := collection.Stats().PendingRetiredExtents; got != sealedRetired {
 		t.Fatalf(
@@ -247,11 +230,14 @@ func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := collection.Flush(); err != nil {
+	if err := flushPhysicalForTest(collection); err != nil {
 		t.Fatal(err)
 	}
 	if len(collection.primaryPendingParents) != 0 {
 		t.Fatal("checkpoint retained pending primary parents")
+	}
+	if collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("checkpoint retained pending unified row overlay")
 	}
 	after := clonePrimaryCrashFile(t, file, "after-checkpoint.vibe")
 	afterCollection, err := Open(after, options)
@@ -267,7 +253,7 @@ func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 	}
 }
 
-func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
+func TestFilePrimaryBufferedOverlayFoldRewritesParentChainOnce(t *testing.T) {
 	built, keys, values := buildFilePrimaryCorpus(t, 1_000)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
@@ -345,24 +331,24 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 	sealedRoot := state.root.PrimaryRoot
 	before := collection.Stats()
 	updates := []struct {
-		key     string
-		value   []byte
-		pending int
+		key          string
+		value        []byte
+		dirtyBuckets int
 	}{
 		{
-			key:     firstKey,
-			value:   []byte(`{"value":"first deferred value"}`),
-			pending: 1,
+			key:          firstKey,
+			value:        []byte(`{"value":"first deferred value"}`),
+			dirtyBuckets: 1,
 		},
 		{
-			key:     secondKey,
-			value:   []byte(`{"value":"second deferred leaf"}`),
-			pending: 2,
+			key:          secondKey,
+			value:        []byte(`{"value":"second deferred leaf"}`),
+			dirtyBuckets: 2,
 		},
 		{
-			key:     firstKey,
-			value:   []byte(`{"value":"final"}`),
-			pending: 2,
+			key:          firstKey,
+			value:        []byte(`{"value":"final"}`),
+			dirtyBuckets: 2,
 		},
 	}
 	for index, update := range updates {
@@ -379,10 +365,21 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 				index, got, sealedRoot,
 			)
 		}
-		if got := len(collection.primaryPendingParents); got != update.pending {
+		if got := len(collection.primaryPendingParents); got != 0 {
 			t.Fatalf(
-				"Put %d pending parents = %d, want %d",
-				index, got, update.pending,
+				"Put %d entered structural pending-parent lane: %d",
+				index, got,
+			)
+		}
+		var dirty [primaryUnifiedOverlayBuckets]storeio.BucketID
+		var representatives [primaryUnifiedOverlayBuckets][]byte
+		gotDirty, dirtyErr := collection.primaryUnifiedOverlay.pendingBuckets(
+			&dirty, &representatives,
+		)
+		if dirtyErr != nil || gotDirty != update.dirtyBuckets {
+			t.Fatalf(
+				"Put %d dirty class-5 buckets = %d,%v, want %d,nil",
+				index, gotDirty, dirtyErr, update.dirtyBuckets,
 			)
 		}
 		assertPrimaryRaw(
@@ -399,8 +396,12 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 			pageWalk, ok, err, values[firstIndex],
 		)
 	}
-	if err := collection.Flush(); err != nil {
+	if err := flushPhysicalForTest(collection); err != nil {
 		t.Fatal(err)
+	}
+	if collection.primaryUnifiedOverlay.hasPending() ||
+		len(collection.primaryPendingParents) != 0 {
+		t.Fatal("checkpoint retained class-5 overlay or structural parents")
 	}
 	after := collection.Stats()
 	if got := after.PendingRetiredExtents -
@@ -440,7 +441,7 @@ func TestFilePrimaryBufferedParentChainOncePerCheckpoint(t *testing.T) {
 	}
 }
 
-func TestFilePrimaryBufferedPendingCapacityForcesCheckpoint(t *testing.T) {
+func TestFilePrimaryBufferedOverlayCapacityForcesFold(t *testing.T) {
 	built, keys, _ := buildFilePrimaryCorpus(t, 1_000)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
@@ -454,9 +455,11 @@ func TestFilePrimaryBufferedPendingCapacityForcesCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer collection.Close()
-	collection.primaryPendingParents = make(
-		[]filePrimaryPendingParent, 0, 1,
-	)
+	// Make record pressure deterministic without changing the production
+	// overlay budget. One record fills the window; the next Put must fold it,
+	// recycle the reader-free arena, and retry in a new window.
+	collection.primaryUnifiedOverlay.records =
+		collection.primaryUnifiedOverlay.records[:1]
 
 	state := collection.state.Load()
 	first := keys[0]
@@ -493,27 +496,118 @@ func TestFilePrimaryBufferedPendingCapacityForcesCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	after := collection.Stats()
-	if after.AutomaticCheckpoints != before.AutomaticCheckpoints+1 {
+	if after.PrimaryOverlayFolds != before.PrimaryOverlayFolds+1 {
 		t.Fatalf(
-			"automatic checkpoints = %d, want %d",
-			after.AutomaticCheckpoints,
-			before.AutomaticCheckpoints+1,
+			"primary overlay folds = %d, want %d",
+			after.PrimaryOverlayFolds,
+			before.PrimaryOverlayFolds+1,
 		)
 	}
-	if after.DurableGeneration != firstGeneration {
+	if after.AutomaticCheckpoints != before.AutomaticCheckpoints {
+		t.Fatalf("device-silent fold changed automatic checkpoints %d -> %d",
+			before.AutomaticCheckpoints, after.AutomaticCheckpoints)
+	}
+	if got := collection.committer.PublishedGeneration(); got != firstGeneration {
 		t.Fatalf(
-			"capacity durable generation = %d, want first cut %d",
-			after.DurableGeneration, firstGeneration,
+			"capacity published generation = %d, want first folded cut %d",
+			got, firstGeneration,
 		)
 	}
-	if len(collection.primaryPendingParents) != 1 {
+	if after.DurableGeneration != before.DurableGeneration {
 		t.Fatalf(
-			"new checkpoint window pending parents = %d, want 1",
-			len(collection.primaryPendingParents),
+			"device generation advanced from %d to %d during device-silent fold",
+			before.DurableGeneration, after.DurableGeneration,
 		)
+	}
+	if len(collection.primaryPendingParents) != 0 {
+		t.Fatalf("new overlay window entered structural lane: %d parents",
+			len(collection.primaryPendingParents))
+	}
+	if !collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("second Put did not occupy the recycled overlay window")
 	}
 	assertPrimaryRaw(t, collection, first, firstValue, true)
 	assertPrimaryRaw(t, collection, second, secondValue, true)
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if collection.DurableGeneration() != collection.Generation() {
+		t.Fatalf("Flush left durable generation %d behind visible %d",
+			collection.DurableGeneration(), collection.Generation())
+	}
+}
+
+func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
+	open := func(t *testing.T) (*Collection, []string) {
+		t.Helper()
+		built, keys, _ := buildFilePrimaryCorpus(t, 1_000)
+		options := Options{
+			Backend: BackendPortable, ResidentBytes: 32 << 20,
+			Durability: DurabilityBufferedVisible,
+		}
+		file := createPrimaryPointFile(
+			t, built, options, "primary-overlay-fold-stats.vibe",
+		)
+		collection, err := Open(file, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = collection.Close() })
+		return collection, keys
+	}
+	assertFold := func(
+		t *testing.T, collection *Collection, before Stats,
+	) {
+		t.Helper()
+		after := collection.Stats()
+		if after.PrimaryOverlayFolds != before.PrimaryOverlayFolds+1 {
+			t.Fatalf("primary overlay folds = %d, want %d",
+				after.PrimaryOverlayFolds, before.PrimaryOverlayFolds+1)
+		}
+		if after.AutomaticCheckpoints != before.AutomaticCheckpoints {
+			t.Fatalf("automatic checkpoints changed %d -> %d",
+				before.AutomaticCheckpoints, after.AutomaticCheckpoints)
+		}
+		if after.DeviceCommits != before.DeviceCommits {
+			t.Fatalf("device commits changed %d -> %d",
+				before.DeviceCommits, after.DeviceCommits)
+		}
+	}
+
+	t.Run("delete-pressure", func(t *testing.T) {
+		collection, keys := open(t)
+		collection.primaryUnifiedOverlay.records =
+			collection.primaryUnifiedOverlay.records[:1]
+		if _, err := collection.Put(
+			[]byte(keys[0]), []byte(`{"fold":"before-delete"}`),
+		); err != nil {
+			t.Fatal(err)
+		}
+		before := collection.Stats()
+		if deleted, err := collection.Delete([]byte(keys[1])); err != nil ||
+			!deleted {
+			t.Fatalf("Delete = %v,%v", deleted, err)
+		}
+		assertFold(t, collection, before)
+	})
+
+	t.Run("batch-pre-fold", func(t *testing.T) {
+		collection, keys := open(t)
+		if _, err := collection.Put(
+			[]byte(keys[0]), []byte(`{"fold":"before-batch"}`),
+		); err != nil {
+			t.Fatal(err)
+		}
+		before := collection.Stats()
+		if err := collection.Update(func(batch *WriteBatch) error {
+			return batch.Put(
+				[]byte(keys[1]), []byte(`{"fold":"inside-batch"}`),
+			)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		assertFold(t, collection, before)
+	})
 }
 
 func TestFilePrimaryLeafSplitSignal(t *testing.T) {
@@ -753,6 +847,14 @@ func runPrimaryMutationDifferential(
 	count, operations int,
 ) {
 	t.Helper()
+	canonical := func(src []byte) []byte {
+		t.Helper()
+		out, canonicalErr := vibejson.AppendCanonicalize(nil, src)
+		if canonicalErr != nil {
+			t.Fatal(canonicalErr)
+		}
+		return out
+	}
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -763,7 +865,7 @@ func runPrimaryMutationDifferential(
 		key := fmt.Sprintf("trace-key-%06d", at)
 		value := []byte(fmt.Sprintf(`{"v":"%06d","p":"a"}`, at))
 		keys[at] = key
-		oracle[key] = append([]byte(nil), value...)
+		oracle[key] = canonical(value)
 		if err := builder.Append(key, value); err != nil {
 			t.Fatal(err)
 		}
@@ -813,7 +915,7 @@ func runPrimaryMutationDifferential(
 					operation, key, created, putErr, existed,
 				)
 			}
-			oracle[key] = append(oracle[key][:0], value...)
+			oracle[key] = append(oracle[key][:0], canonical(value)...)
 		}
 		want, wantOK := oracle[key]
 		got, ok, readErr := collection.AppendRaw(buffer[:0], []byte(key))
@@ -833,7 +935,7 @@ func runPrimaryMutationDifferential(
 		deferred := collection.deferredCanonicalLane()
 		if !deferred || operation%64 == 63 {
 			if deferred {
-				if flushErr := collection.Flush(); flushErr != nil {
+				if flushErr := flushPhysicalForTest(collection); flushErr != nil {
 					t.Fatalf(
 						"checkpoint %d: %v", operation, flushErr,
 					)
@@ -899,6 +1001,13 @@ func clonePrimaryCrashFile(
 	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, image, 0o600); err != nil {
 		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(RecoveryJournalPath(source.Name()))
+	if err != nil {
+		t.Fatalf("read recovery journal: %v", err)
+	}
+	if err := os.WriteFile(RecoveryJournalPath(path), journal, 0o600); err != nil {
+		t.Fatalf("write recovery journal clone: %v", err)
 	}
 	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {

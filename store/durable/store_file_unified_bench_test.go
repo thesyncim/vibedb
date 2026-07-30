@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 // The U1 read-gate benchmark battery (unified-leaf design §10, §11 U1 row).
@@ -72,13 +74,11 @@ func unifiedBenchStoreWith(
 	return collection
 }
 
-func unifiedBenchOptions(unified bool) Options {
-	options := Options{
+func unifiedBenchOptions() Options {
+	return Options{
 		ResidentBytes: 256 << 20, Backend: BackendPortable,
 		Durability: DurabilityAsyncVisible,
 	}
-	options.UnifiedLeaves = unified
-	return options
 }
 
 // benchCorpus returns the 100k low-cardinality competitive corpus (the GetRaw
@@ -150,9 +150,9 @@ func measureBatchP50(b *testing.B, ops int, op func(i int)) {
 	reportBatchP50(b, samples)
 }
 
-func benchmarkPointGetRaw(b *testing.B, unified bool) {
+func benchmarkPointGetRaw(b *testing.B) {
 	keys, docs, _ := benchCorpus(b)
-	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions(unified))
+	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
 	if err != nil {
 		b.Fatal(err)
@@ -186,19 +186,79 @@ func benchmarkPointGetRaw(b *testing.B, unified bool) {
 
 // BenchmarkUnifiedGetRaw is the §10.1 gate: point-read p50 ≤ 0.50 µs
 // (kill-switch ceiling 0.70 µs), 0 allocs.
-func BenchmarkUnifiedGetRaw(b *testing.B) { benchmarkPointGetRaw(b, true) }
+func BenchmarkUnifiedGetRaw(b *testing.B) { benchmarkPointGetRaw(b) }
 
-// BenchmarkVerbatimGetRaw is the same pipeline over today's verbatim classes:
-// the baseline the gate is stated against.
-func BenchmarkVerbatimGetRaw(b *testing.B) { benchmarkPointGetRaw(b, false) }
+// BenchmarkUnifiedPrimaryReplace is the U2 mutation gate. It drives uniform
+// equal-size replacements across the competitive corpus on the same
+// buffered-visible acknowledgement contract as the 4.6 us pre-unification
+// baseline.
+// Median latency measures O(document) overlay publication; p99 exposes the
+// bounded checkpoint that folds a full dirty-bucket window.
+func BenchmarkUnifiedPrimaryReplace(b *testing.B) {
+	const documents = 10_000
+	keys, docs := unifiedPrimaryCorpus(documents, false)
+	options := Options{
+		ResidentBytes: 64 << 20, Backend: BackendPortable,
+		Durability: DurabilityBufferedVisible,
+	}
+	collection := unifiedBenchStoreWith(b, keys, docs, options, options)
+	if collection.primaryUnifiedOverlay == nil {
+		b.Fatal("unified row overlay was not budgeted")
+	}
+	canonical := make([][]byte, documents)
+	replacement := make([][]byte, documents)
+	keyBytes := make([][]byte, documents)
+	for i := range documents {
+		var err error
+		canonical[i], err = vibejson.AppendCanonicalize(nil, docs[i])
+		if err != nil {
+			b.Fatal(err)
+		}
+		replacement[i] = append([]byte(nil), canonical[i]...)
+		if bytes.Contains(replacement[i], []byte(`"active":true`)) {
+			replacement[i] = bytes.Replace(
+				replacement[i], []byte(`"active":true`),
+				[]byte(`"active":null`), 1,
+			)
+		} else {
+			replacement[i] = bytes.Replace(
+				replacement[i], []byte(`"active":false`),
+				[]byte(`"active":10e+0`), 1,
+			)
+		}
+		if len(replacement[i]) != len(canonical[i]) ||
+			bytes.Equal(replacement[i], canonical[i]) {
+			b.Fatalf("replacement %d does not preserve canonical size", i)
+		}
+		keyBytes[i] = []byte(keys[i])
+	}
+	latency := make([]int64, b.N)
+	at := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		doc := replacement[at%documents]
+		if at/documents&1 != 0 {
+			doc = canonical[at%documents]
+		}
+		start := time.Now()
+		if _, err := collection.Put(keyBytes[at%documents], doc); err != nil {
+			b.Fatal(err)
+		}
+		latency[i] = time.Since(start).Nanoseconds()
+		at++
+	}
+	b.StopTimer()
+	reportP50(b, latency)
+}
 
-func benchmarkOverflowGetRaw(b *testing.B, unified bool) {
+func benchmarkOverflowGetRaw(b *testing.B) {
 	// Overflow chains cannot enter through the bulk path (inline-only
 	// constraint), so build small and rewrite every document through Put; the
 	// reads then all take the chain-reassembly path in both representations.
 	n := 4000
 	keys, docs := unifiedCompetitiveCorpus(n, false)
-	options := unifiedBenchOptions(unified)
+	options := unifiedBenchOptions()
 	// The overflow rewrite loop below runs through the buffered mutation lane
 	// (the harness's profile), which owns the overflow chain scratch; the
 	// bulk-only async lane is not built for thousands of chain mints.
@@ -243,17 +303,14 @@ func benchmarkOverflowGetRaw(b *testing.B, unified bool) {
 	reportP50(b, lat)
 }
 
-// BenchmarkUnifiedGetRawOverflow vs BenchmarkVerbatimGetRawOverflow is the
-// §10.1 overflow-parity gate: chain reassembly is the same machinery in both
-// representations.
-func BenchmarkUnifiedGetRawOverflow(b *testing.B)  { benchmarkOverflowGetRaw(b, true) }
-func BenchmarkVerbatimGetRawOverflow(b *testing.B) { benchmarkOverflowGetRaw(b, false) }
+// BenchmarkUnifiedGetRawOverflow is the §10.1 chain-reassembly gate.
+func BenchmarkUnifiedGetRawOverflow(b *testing.B) { benchmarkOverflowGetRaw(b) }
 
 // BenchmarkUnifiedFieldProbe is the §10.2 gate: point field probe p50
 // ≤ 0.30 µs end-to-end (pipeline floor + hole read), 0 allocs.
 func BenchmarkUnifiedFieldProbe(b *testing.B) {
 	keys, docs, _ := benchCorpus(b)
-	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions(true))
+	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
 	if err != nil {
 		b.Fatal(err)
@@ -301,7 +358,7 @@ func BenchmarkUnifiedFieldProbe(b *testing.B) {
 // copy, measured through the same resolver for a like-for-like parse cost.
 func BenchmarkUnifiedCopyThenParseProbe(b *testing.B) {
 	keys, docs, _ := benchCorpus(b)
-	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions(true))
+	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
 	if err != nil {
 		b.Fatal(err)
@@ -336,9 +393,13 @@ func BenchmarkUnifiedCopyThenParseProbe(b *testing.B) {
 	reportP50(b, lat)
 }
 
-func benchmarkScanAll(b *testing.B, unified bool) {
-	keys, docs, n := benchCorpus(b)
-	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions(unified))
+func benchmarkScanAll(b *testing.B, highCardinality bool) {
+	n := 100_000
+	if testing.Short() {
+		n = 10_000
+	}
+	keys, docs := unifiedCompetitiveCorpus(n, highCardinality)
+	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
 	if err != nil {
 		b.Fatal(err)
@@ -346,15 +407,24 @@ func benchmarkScanAll(b *testing.B, unified bool) {
 	defer snapshot.Close()
 	var sink byte
 	rows := 0
+	visit := func(key, value []byte) error {
+		sink ^= value[0] ^ value[len(value)-1]
+		rows++
+		return nil
+	}
+	// Prime the snapshot-owned splice scratch. Cold growth is bounded setup;
+	// repeated scans are the steady-state lane and must allocate nothing.
+	if _, err := snapshot.RangeRawBuffer(nil, visit); err != nil {
+		b.Fatal(err)
+	}
+	if rows != n {
+		b.Fatalf("warm scan visited %d want %d", rows, n)
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rows = 0
-		if _, err := snapshot.RangeRawBuffer(nil, func(key, value []byte) error {
-			sink ^= value[0] ^ value[len(value)-1]
-			rows++
-			return nil
-		}); err != nil {
+		if _, err := snapshot.RangeRawBuffer(nil, visit); err != nil {
 			b.Fatal(err)
 		}
 		if rows != n {
@@ -368,49 +438,21 @@ func benchmarkScanAll(b *testing.B, unified bool) {
 
 var benchScanSink byte
 
-// BenchmarkUnifiedScanAll vs BenchmarkVerbatimScanAll is the "scan all-docs
-// within today's harness scan lane" gate, as ns/doc through the same
-// RangeRaw surface the harness lane drives.
-func BenchmarkUnifiedScanAll(b *testing.B)  { benchmarkScanAll(b, true) }
-func BenchmarkVerbatimScanAll(b *testing.B) { benchmarkScanAll(b, false) }
-
-// BenchmarkCompactScanAll is the other splicing class's scan cost on the same
-// corpus: the representation whose space unified must beat while scanning no
-// slower.
-func BenchmarkCompactScanAll(b *testing.B) {
-	keys, docs, n := benchCorpus(b)
-	options := unifiedBenchOptions(false)
-	options.DocumentFormat = DocumentFormatCompact
-	collection := unifiedBenchStore(b, keys, docs, options)
-	snapshot, err := collection.Snapshot()
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer snapshot.Close()
-	var sink byte
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		rows := 0
-		if _, err := snapshot.RangeRawBuffer(nil, func(key, value []byte) error {
-			sink ^= value[0] ^ value[len(value)-1]
-			rows++
-			return nil
-		}); err != nil {
-			b.Fatal(err)
-		}
-		if rows != n {
-			b.Fatalf("scanned %d want %d", rows, n)
-		}
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/doc")
-	benchScanSink = sink
+// The two scan gates exercise the sole durable format at both dictionary
+// extremes. Low cardinality stresses templated/dictionary reconstruction;
+// high cardinality prevents a fast shared-value path from hiding row-render
+// regressions.
+func BenchmarkUnifiedScanAllLowCardinality(b *testing.B) {
+	benchmarkScanAll(b, false)
 }
 
-func benchmarkFilterEq(b *testing.B, unified bool, path, needle string) {
+func BenchmarkUnifiedScanAllHighCardinality(b *testing.B) {
+	benchmarkScanAll(b, true)
+}
+
+func benchmarkFilterEq(b *testing.B, path, needle string) {
 	keys, docs, n := benchCorpus(b)
-	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions(unified))
+	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
 	if err != nil {
 		b.Fatal(err)
@@ -445,19 +487,12 @@ func benchmarkFilterEq(b *testing.B, unified bool, path, needle string) {
 // BenchmarkUnifiedFilterEq is the §10.3 gate lane: the harness filter shape
 // (country == "PT") over the token lane, gate ≤ 40 ns/doc, target ≤ 20.
 func BenchmarkUnifiedFilterEq(b *testing.B) {
-	benchmarkFilterEq(b, true, "/country", `"PT"`)
+	benchmarkFilterEq(b, "/country", `"PT"`)
 }
 
 // BenchmarkUnifiedFilterEqFallback drives the recorded fallback lane: a
 // container-valued path resolves on no template as a token compare, so every
 // row renders and evaluates (§10.3's render-then-filter number).
 func BenchmarkUnifiedFilterEqFallback(b *testing.B) {
-	benchmarkFilterEq(b, true, "/profile", `{"joined":"2020-01-02","region":"eu-west-1","tier":"pro"}`)
-}
-
-// BenchmarkVerbatimFilterEq runs the same predicate over verbatim leaves
-// through the same API: every row takes the render-then-eval path, which
-// bounds what the non-unified lane of the filter costs.
-func BenchmarkVerbatimFilterEq(b *testing.B) {
-	benchmarkFilterEq(b, false, "/country", `"PT"`)
+	benchmarkFilterEq(b, "/profile", `{"joined":"2020-01-02","region":"eu-west-1","tier":"pro"}`)
 }

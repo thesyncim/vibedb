@@ -193,6 +193,10 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 			generation, durableGeneration,
 		)
 	}
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Fail the next journal append — the replacement Put's durability record —
 	// before it can cross the fence and be applied or published.
@@ -229,13 +233,26 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 	if _, err := collection.Put([]byte(key), after); !errors.Is(err, persistErr) {
 		t.Fatalf("mutation after sync failure = %v, want sticky %v", err, persistErr)
 	}
-	// Close, by contrast, succeeds. The failed append never published, so the
-	// last-admitted immutable view the poison preserved is the durable baseline;
-	// Close checkpoints exactly that and recycles the journal. A reopen must find
-	// the baseline and none of the rejected mutation.
-	if err := collection.Close(); err != nil {
-		t.Fatalf("Close after sync failure = %v, want clean checkpoint of the baseline", err)
+	// An active snapshot keeps resource teardown retryable even on the poisoned
+	// path. Once it releases, Close reports the sticky failure but still releases
+	// every owned resource and the writer lock.
+	if err := collection.Close(); !errors.Is(err, persistErr) ||
+		!errors.Is(err, storeio.ErrLeasesActive) {
+		t.Fatalf("Close with snapshot after sync failure = %v, want %v and %v",
+			err, persistErr, storeio.ErrLeasesActive)
 	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); !errors.Is(err, persistErr) {
+		t.Fatalf("Close after snapshot release = %v, want sticky %v",
+			err, persistErr)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatalf("idempotent Close = %v", err)
+	}
+	// Recovery on reopen, rather than a retry on the poisoned handle, must find
+	// the durable baseline and none of the rejected mutation.
 	reopenedFile, err := os.OpenFile(file.Name(), os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)

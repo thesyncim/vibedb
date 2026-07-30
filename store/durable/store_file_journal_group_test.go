@@ -53,8 +53,8 @@ func TestRecoveryJournalGroupCommitSharesSync(t *testing.T) {
 	const putsPer = 4
 
 	for _, tc := range []struct {
-		name    string
-		linger  time.Duration
+		name            string
+		linger          time.Duration
 		requireGrouping bool
 	}{
 		{"linger", 25 * time.Millisecond, true},
@@ -76,7 +76,11 @@ func TestRecoveryJournalGroupCommitSharesSync(t *testing.T) {
 					<-start
 					for p := 0; p < putsPer; p++ {
 						key := fmt.Sprintf("w%02d-k%02d", w, p)
-						val := fmt.Sprintf(`{"w":%d,"p":%d}`, w, p)
+						// Class 5 exposes canonical JSON bytes. Keep this
+						// journal test's oracle canonical so it measures
+						// acknowledgement durability rather than source
+						// object-field order.
+						val := fmt.Sprintf(`{"p":%d,"w":%d}`, p, w)
 						if _, err := coll.Put([]byte(key), []byte(val)); err != nil {
 							t.Errorf("put %s: %v", key, err)
 							return
@@ -371,7 +375,7 @@ func TestRecoveryJournalGroupConcurrentRaceSmoke(t *testing.T) {
 						// Distinct keys per writer, plus periodic collisions on a shared
 						// key so same-key serialization through the writer is exercised.
 						key := fmt.Sprintf("w%02d-k%03d", w, p)
-						if _, err := coll.Put([]byte(key), []byte(fmt.Sprintf(`{"w":%d,"p":%d}`, w, p))); err != nil {
+						if _, err := coll.Put([]byte(key), []byte(fmt.Sprintf(`{"p":%d,"w":%d}`, p, w))); err != nil {
 							t.Errorf("put %s: %v", key, err)
 							return
 						}
@@ -393,7 +397,7 @@ func TestRecoveryJournalGroupConcurrentRaceSmoke(t *testing.T) {
 				for p := 0; p < putsPer; p++ {
 					key := fmt.Sprintf("w%02d-k%03d", w, p)
 					got, ok, err := coll.AppendRaw(nil, []byte(key))
-					want := fmt.Sprintf(`{"w":%d,"p":%d}`, w, p)
+					want := fmt.Sprintf(`{"p":%d,"w":%d}`, p, w)
 					if err != nil || !ok || string(got) != want {
 						t.Fatalf("live key %s = (%q,%v,%v), want %q", key, got, ok, err, want)
 					}
@@ -419,7 +423,7 @@ func TestRecoveryJournalGroupConcurrentRaceSmoke(t *testing.T) {
 				for p := 0; p < putsPer; p++ {
 					key := fmt.Sprintf("w%02d-k%03d", w, p)
 					got, ok, err := rc.AppendRaw(nil, []byte(key))
-					want := fmt.Sprintf(`{"w":%d,"p":%d}`, w, p)
+					want := fmt.Sprintf(`{"p":%d,"w":%d}`, p, w)
 					if err != nil || !ok || string(got) != want {
 						t.Fatalf("reopened key %s = (%q,%v,%v), want %q", key, got, ok, err, want)
 					}

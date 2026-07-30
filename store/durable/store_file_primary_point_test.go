@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 func buildFilePrimaryCorpus(
@@ -24,12 +25,16 @@ func buildFilePrimaryCorpus(
 	values := make([][]byte, count)
 	for at := range count {
 		keys[at] = fmt.Sprintf("primary-key-%09d", at)
-		values[at] = fmt.Appendf(
+		input := fmt.Appendf(
 			nil,
 			`{"id":%d,"group":%d,"name":"primary row %d"}`,
 			at, at%997, at,
 		)
-		if err := builder.Append(keys[at], values[at]); err != nil {
+		if err := builder.Append(keys[at], input); err != nil {
+			t.Fatal(err)
+		}
+		values[at], err = vibejson.AppendCanonicalize(nil, input)
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -42,9 +47,8 @@ func buildFilePrimaryCorpus(
 
 // redundantPrimaryDocument is a low-cardinality shape whose structure and
 // constant fields ("kind","active","tier","region") are shared across
-// documents, so the bulk builder selects the template-columnar leaf class for
-// it. It stays under 128 bytes so warmed point-read buffers remain allocation
-// free.
+// documents, so class 5 can reuse one template and dictionary. It stays under
+// 128 bytes so warmed point-read buffers remain allocation free.
 func redundantPrimaryDocument(at int) []byte {
 	return fmt.Appendf(nil,
 		`{"id":%d,"kind":"document","group":%d,"active":%t,`+
@@ -52,9 +56,9 @@ func redundantPrimaryDocument(at int) []byte {
 		at, at%997, at%3 == 0, at)
 }
 
-// buildRedundantPrimaryCorpus mirrors buildFilePrimaryCorpus but with the
-// template-friendly shape, so the differential tests exercise the
-// template-columnar leaf class end to end.
+// buildRedundantPrimaryCorpus mirrors buildFilePrimaryCorpus but with a
+// template-friendly shape, so the differential tests exercise compressed
+// class-5 rows end to end.
 func buildRedundantPrimaryCorpus(
 	t testing.TB, count int,
 ) (*store.Collection, []string, [][]byte) {
@@ -67,8 +71,12 @@ func buildRedundantPrimaryCorpus(
 	values := make([][]byte, count)
 	for at := range count {
 		keys[at] = fmt.Sprintf("primary-key-%09d", at)
-		values[at] = redundantPrimaryDocument(at)
-		if err := builder.Append(keys[at], values[at]); err != nil {
+		input := redundantPrimaryDocument(at)
+		if err := builder.Append(keys[at], input); err != nil {
+			t.Fatal(err)
+		}
+		values[at], err = vibejson.AppendCanonicalize(nil, input)
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -81,12 +89,13 @@ func buildRedundantPrimaryCorpus(
 
 // filePrimaryLeafClassCounts walks every ordered-graph leaf and tallies the
 // durable leaf class recorded in each page. It is the ground-truth build-stats
-// counter: index by CommonPrimaryLeafClass value (1 narrow, 2 wide, 3 template).
+// counter, indexed by CommonPrimaryLeafClass value; durable files must contain
+// only class 5.
 func filePrimaryLeafClassCounts(
 	t testing.TB, file *os.File, root storeio.StateRoot,
-) [4]int {
+) [6]int {
 	t.Helper()
-	var counts [4]int
+	var counts [6]int
 	info, err := file.Stat()
 	if err != nil {
 		t.Fatal(err)
@@ -265,14 +274,12 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 		primaryInfo.Size()-regions.total(),
 	)
 	t.Logf(
-		"100k leaf class split: narrow=%d wide=%d template=%d",
-		classCounts[storeio.CommonPrimaryLeafNarrow],
-		classCounts[storeio.CommonPrimaryLeafWide],
-		classCounts[storeio.CommonPrimaryLeafTemplate],
+		"100k unified leaves=%d",
+		classCounts[storeio.CommonPrimaryLeafUnified],
 	)
-	if classCounts[storeio.CommonPrimaryLeafTemplate] == 0 {
+	if classCounts[storeio.CommonPrimaryLeafUnified] == 0 {
 		t.Fatalf(
-			"expected template-columnar leaves to be selected; class split = %v",
+			"expected unified leaves; class split = %v",
 			classCounts,
 		)
 	}
@@ -550,27 +557,27 @@ func TestCreateFromPrimaryLexicalCodecIteration1K(t *testing.T) {
 	var previous []byte
 	seen := 0
 	visitLeaf := func(route storeio.SegmentedTabletRouterRoute) {
-		leaf, openErr := storeio.OpenCommonPrimaryLeaf(
+		leaf, openErr := storeio.OpenCommonPrimaryUnifiedLeaf(
 			readPrimaryOpenTestPage(t, file, route.Ref),
 			root.StoreID, route.Bucket, route.Ref, root.Generation, leafBounds,
 		)
 		if openErr != nil {
 			t.Fatal(openErr)
 		}
-		iterator := leaf.AllRows()
-		for {
-			row, ok := iterator.Next()
-			if !ok {
-				break
+		for rank := 0; rank < leaf.Len(); rank++ {
+			key, body, overflow, ok := leaf.RowRawAt(rank)
+			value, rendered := leaf.AppendRowBody(nil, body)
+			if !ok || overflow || !rendered {
+				t.Fatal("unified codec row")
 			}
-			if seen != 0 && bytes.Compare(previous, row.Key) >= 0 {
-				t.Fatalf("codec order %q then %q", previous, row.Key)
+			if seen != 0 && bytes.Compare(previous, key) >= 0 {
+				t.Fatalf("codec order %q then %q", previous, key)
 			}
-			want, exists := expectedValues[string(row.Key)]
-			if !exists || !bytes.Equal(row.Value.Inline, want) {
-				t.Fatalf("codec row %q = %q", row.Key, row.Value.Inline)
+			want, exists := expectedValues[string(key)]
+			if !exists || !bytes.Equal(value, want) {
+				t.Fatalf("codec row %q = %q", key, value)
 			}
-			previous = append(previous[:0], row.Key...)
+			previous = append(previous[:0], key...)
 			seen++
 		}
 	}
@@ -964,12 +971,7 @@ func TestCreateFromPrimaryRejectsUnsupportedOptions(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		options Options
-	}{
-		{
-			name:    "unknown document format",
-			options: Options{DocumentFormat: DocumentFormatCompact + 1},
-		},
-	} {
+	}{} {
 		t.Run(test.name, func(t *testing.T) {
 			file, err := os.CreateTemp(t.TempDir(), "unsupported-*")
 			if err != nil {

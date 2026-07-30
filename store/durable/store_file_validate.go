@@ -145,29 +145,13 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 			FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(),
 			AllocationQuantum: v.pageSize,
 		}
-		// The class byte selects the decoder without probing. An unknown class
-		// falls through to the raw decoder, which rejects it as corrupt.
-		switch storeio.PrimaryLeafClass(page) {
-		case storeio.CommonPrimaryLeafTemplate:
-			_, err = storeio.OpenCommonPrimaryTemplateLeaf(
-				page, header.StoreID, bucket, ref, v.generation.Load(),
-				leafBounds,
+		if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+			return fmt.Errorf(
+				"%w: non-unified primary leaf",
+				storeio.ErrCommonPrimaryLeafCorrupt,
 			)
-			return err
-		case storeio.CommonPrimaryLeafCompact:
-			_, err = storeio.OpenCommonPrimaryCompactLeaf(
-				page, header.StoreID, bucket, ref, v.generation.Load(),
-				leafBounds,
-			)
-			return err
-		case storeio.CommonPrimaryLeafUnified:
-			_, err = storeio.OpenCommonPrimaryUnifiedLeaf(
-				page, header.StoreID, bucket, ref, v.generation.Load(),
-				leafBounds,
-			)
-			return err
 		}
-		_, err = storeio.OpenCommonPrimaryLeaf(
+		_, err = storeio.OpenCommonPrimaryUnifiedLeaf(
 			page, header.StoreID, bucket, ref, v.generation.Load(), leafBounds,
 		)
 		return err

@@ -38,23 +38,62 @@ The columns are separate durability lanes:
 Do not compare values across lanes as if durability were unchanged. The current
 single-fence synchronous path is included in this snapshot.
 
-## Space snapshot
+## Current unified-format development gates
 
-The same published run recorded:
+The strict class-5 churn harness keeps 100,000 documents live through 200,000
+uniform random mutations, checkpoints every 64 acknowledged mutations, samples
+every 5,000 mutations, verifies the final corpus, and requires zero
+pressure-forced checkpoints. These rows are current development measurements;
+they are not mixed into the older clean cross-engine publication above.
 
 Disk cells are **apparent / allocated MiB**.
 
 | Measurement | Result |
 | --- | ---: |
-| Sustained churn, 100k live documents | 35.1 / 35.4, flat |
-| Verbatim primary bulk, low / high cardinality | 28.1 / 29.0 · 28.1 / 28.1 |
-| Compact primary bulk, low / high cardinality | 7.8 / 8.0 · 17.6 / 18.0 |
+| Sustained churn, low cardinality | 11.12 / 11.52, flat through the final maintenance floor |
+| Sustained churn, high cardinality | 24.59 / 25.52, flat through the final maintenance floor |
+| Unified primary bulk, low / high cardinality | 6.50 / — · 16.27 / — |
 
 The shape-matched low- and high-cardinality corpora are both 23.73 MiB raw.
-The compact primary graph is the smallest measured representation in both.
+The unified primary graph measures 68.16 and 170.56 bytes/document,
+respectively, and is the only production leaf representation. Allocated-file
+cells await the next complete competitive publication.
 The replay-through-`Put` diagnostic still reaches the primary macro-tablet
 split limit at 100,000 newly inserted keys; it is not presented as a footprint
 result.
+
+The leaf-codec CPU regression is closed by a plan-stability certificate that
+patches an admitted class-5 page only when the result is byte-identical to a
+full planner fold. Its leaf microbenchmark is 2.12–2.13 µs with zero
+allocations, versus 240–242 µs for render/replan/encode (about 113× faster).
+The bounded journal-delta checkpoint removes the common physical leaf/root
+copy: on three isolated CP64 churn runs, checkpoint p50 is 76.8 µs at low
+cardinality and 65.5 µs at high cardinality, with zero pressure-forced
+persistence checkpoints. Median throughput is 42,667 and 40,710 ops/s.
+The remaining tail is explicit rather than hidden: p95 is 7.56 and 7.93 ms
+when a non-aligned overlay fold requires the physical fallback. Eliminating
+that fallback tail is the next checkpoint gate.
+
+The churn footprint includes the paired preallocated checkpoint journal, while
+the bulk row above is the core store-file image. The low/high corpora remain
+23.73 MiB raw.
+
+## Unified scan development gates
+
+These are local codec/runtime microbenchmarks, not cross-engine published
+results. On the Apple M4 Max used for the 2026-07-30 unification work:
+
+| Gate | Result |
+| --- | ---: |
+| Ordered class-5 scan, 100k three-scalar documents | 24.58 ns/document, 0 allocs |
+| Competitive ~250 B scan, low / high cardinality | 98.60 / 101.1 ns/document, 0 allocs |
+| Masked scan, 1 / 4 / 16 selected rows per leaf | 163 ns / 443–448 ns / 1.47 µs |
+| Masked scan, dense 153-row leaf | 10.88–11.10 µs, within 2% of sequential |
+
+The masked visitor decodes and renders only selected stable slots below the
+measured 75% density crossover; dense masks switch to the sequential leaf
+drain. The full scan fuses succinct-boundary decoding with the admitted
+class-5 renderer and retains its splice buffer across passes.
 
 ## Publishing rules
 

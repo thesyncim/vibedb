@@ -107,6 +107,12 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 	if !c.deferredCanonicalLane() {
 		return ErrPrimaryBatchUnsupportedLane
 	}
+	if c.primaryUnifiedOverlay.hasPending() {
+		if err := c.materializePrimaryParentsLocked(); err != nil {
+			return err
+		}
+		c.primaryOverlayFolds.Add(1)
+	}
 	batch := c.fileWriteBatch()
 	defer c.releaseFileWriteBatch(batch)
 	if err := fn(batch); err != nil {
@@ -441,7 +447,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	var accView storeio.CommonPrimaryLeafView
 	curView := &path.leaf
 	if !havePath {
-		view, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+		view, admitErr := storeio.AdmittedPrimaryLeafForMutation(
 			lease.Page(), c.storeID, leaf.resident.Bucket, bounds,
 		)
 		if admitErr != nil {
@@ -475,7 +481,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		image, imageBytes, _, prepErr := c.preparePrimaryLeafMutation(
 			&preparePath, stampGen, m.key,
 			storeio.CommonPrimaryLeafValue{Inline: m.value},
-			m.remove, found, slot,
+			m.remove, found, slot, bounds,
 		)
 		if errors.Is(prepErr, ErrPrimaryLeafSplitRequired) {
 			return m.key, prepErr
@@ -484,7 +490,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 			return nil, prepErr
 		}
 		c.batchPrimaryLeafImage = append(c.batchPrimaryLeafImage[:0], image[:imageBytes]...)
-		view, _, admitErr := storeio.AdmittedPrimaryLeafForMutation(
+		view, admitErr := storeio.AdmittedPrimaryLeafForMutation(
 			c.batchPrimaryLeafImage, c.storeID, leaf.resident.Bucket, bounds,
 		)
 		if admitErr != nil {

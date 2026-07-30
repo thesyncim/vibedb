@@ -309,13 +309,9 @@ func TestCreateFromPrimaryExactIndexDeterministic(t *testing.T) {
 	}
 }
 
-// TestPrimaryExactIndexTemplateLeaves exercises the template-columnar leaf class
-// on the exact-index path. The redundant corpus template-compresses, so its
-// leaves are PagePrimaryLeaf template images with no hash directory; the posting
-// slot is the lexical rank at both build and read. The test proves at least one
-// template leaf exists and that the exact index answers identically to the
-// legacy chunk store on that corpus.
-func TestPrimaryExactIndexTemplateLeaves(t *testing.T) {
+// TestPrimaryExactIndexUnifiedLeafFormat proves the sole class-5 leaf format uses
+// stable posting slots and answers identically on a shape-redundant corpus.
+func TestPrimaryExactIndexUnifiedLeafFormat(t *testing.T) {
 	const documents = 4000
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
@@ -370,10 +366,9 @@ func TestPrimaryExactIndexTemplateLeaves(t *testing.T) {
 	}
 	defer primary.Close()
 
-	// Prove the corpus actually placed template leaves, so this test genuinely
-	// covers the template slot model rather than the succinct one.
+	// Prove every leaf is the sole durable class.
 	router := primary.primaryRouter.Load()
-	templates := 0
+	unified := 0
 	for rank := 0; rank < router.Len(); rank++ {
 		route, ok := router.RouteAtRank(rank)
 		if !ok {
@@ -384,13 +379,16 @@ func TestPrimaryExactIndexTemplateLeaves(t *testing.T) {
 			t.Fatal(err)
 		}
 		if storeio.PrimaryLeafClass(lease.Page()) ==
-			storeio.CommonPrimaryLeafTemplate {
-			templates++
+			storeio.CommonPrimaryLeafUnified {
+			unified++
+		} else {
+			lease.Release()
+			t.Fatal("non-unified primary leaf")
 		}
 		lease.Release()
 	}
-	if templates == 0 {
-		t.Fatal("redundant corpus produced no template leaves; test would not cover the template posting path")
+	if unified == 0 {
+		t.Fatal("redundant corpus produced no unified leaves")
 	}
 
 	for _, probe := range []struct {
@@ -406,7 +404,7 @@ func TestPrimaryExactIndexTemplateLeaves(t *testing.T) {
 		want := primaryExactTestKeys(t, legacy, probe.name, needle)
 		got := primaryExactTestKeys(t, primary, probe.name, needle)
 		if !slices.Equal(got, want) {
-			t.Fatalf("%s=%s template primary keys differ: got %d want %d",
+			t.Fatalf("%s=%s unified primary keys differ: got %d want %d",
 				probe.name, probe.raw, len(got), len(want))
 		}
 	}

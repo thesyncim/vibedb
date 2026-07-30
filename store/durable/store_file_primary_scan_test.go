@@ -81,14 +81,12 @@ func openRedundantPrimaryScanPair(
 	primaryRoot := primary.state.Load().root
 	classCounts := filePrimaryLeafClassCounts(t, primaryFile, primaryRoot)
 	t.Logf(
-		"scan leaf class split: narrow=%d wide=%d template=%d",
-		classCounts[storeio.CommonPrimaryLeafNarrow],
-		classCounts[storeio.CommonPrimaryLeafWide],
-		classCounts[storeio.CommonPrimaryLeafTemplate],
+		"scan unified leaves=%d",
+		classCounts[storeio.CommonPrimaryLeafUnified],
 	)
-	if classCounts[storeio.CommonPrimaryLeafTemplate] == 0 {
+	if classCounts[storeio.CommonPrimaryLeafUnified] == 0 {
 		t.Fatalf(
-			"expected template-columnar leaves to be selected; class split = %v",
+			"expected unified leaves; class split = %v",
 			classCounts,
 		)
 	}

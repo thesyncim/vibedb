@@ -27,6 +27,7 @@ type config struct {
 	checkpointMutations int
 	cardinalityName     string
 	seed                int64
+	allowDiagnostic     bool
 }
 
 type sample struct {
@@ -56,6 +57,10 @@ func run(args []string, out io.Writer) error {
 	fs.IntVar(&cfg.checkpointMutations, "checkpoint-mutations", 64, "checkpoint cadence in acknowledged mutations; zero means final only")
 	fs.StringVar(&cfg.cardinalityName, "cardinality", "low", "low or high corpus cardinality")
 	fs.Int64Var(&cfg.seed, "seed", defaultSeed, "deterministic churn seed")
+	fs.BoolVar(
+		&cfg.allowDiagnostic, "allow-diagnostic", false,
+		"allow a nonstandard or forced-checkpoint run and mark every row non-publishable",
+	)
 	list := fs.Bool("list", false, "list eligible engines")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -71,6 +76,14 @@ func run(args []string, out io.Writer) error {
 		cfg.sampleMutations < 1 || cfg.checkpointMutations < 0 ||
 		cfg.replacePercent < 0 || cfg.replacePercent > 100 {
 		return fmt.Errorf("-engine, -corpus>=1, -mutations>=1, -sample-mutations>=1, -checkpoint-mutations>=0, and -replace-percent in [0,100] are required")
+	}
+	if !publicationShape(cfg) && !cfg.allowDiagnostic {
+		return fmt.Errorf(
+			"nonstandard churn shape is diagnostic; use -allow-diagnostic "+
+				"(publishable requires corpus=%d mutations=200000 replace-percent=80 "+
+				"sample-mutations=5000 checkpoint-mutations=64 seed=%d)",
+			competitive.CorpusSize, defaultSeed,
+		)
 	}
 	factory, ok := competitive.FactoryNamed(cfg.engineName)
 	if !ok {
@@ -201,7 +214,15 @@ func run(args []string, out io.Writer) error {
 	}
 
 	forced := automaticCheckpointCount(engine) - forcedStart
-	publishable := cfg.engineName != "vibejson-durable" || forced == 0
+	if forced != 0 && !cfg.allowDiagnostic {
+		return fmt.Errorf(
+			"%s forced %d checkpoint(s); rerun with -allow-diagnostic "+
+				"to retain explicitly non-publishable output",
+			cfg.engineName, forced,
+		)
+	}
+	publishable := publicationShape(cfg) &&
+		forced == 0 && !cfg.allowDiagnostic
 	printHeader(out)
 	commit := gitCommit()
 	for _, s := range samples {
@@ -215,6 +236,15 @@ func run(args []string, out io.Writer) error {
 		)
 	}
 	return nil
+}
+
+func publicationShape(cfg config) bool {
+	return cfg.corpusSize == competitive.CorpusSize &&
+		cfg.mutationBudget == 200_000 &&
+		cfg.replacePercent == 80 &&
+		cfg.sampleMutations == 5_000 &&
+		cfg.checkpointMutations == 64 &&
+		cfg.seed == defaultSeed
 }
 
 func printHeader(w io.Writer) {

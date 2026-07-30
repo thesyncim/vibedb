@@ -12,11 +12,9 @@ import (
 )
 
 // Overlay-specific coverage for the O(delta) indexed write path
-// (docs/design/indexed-write-path.md §3, §7): the rebase group a
-// slot-reassigning de-template emits, the mid-window read rule over a
-// populated overlay, crash-replay across a rebase-before-fold window, the
-// zero-allocation contract of the per-mutation record path, and the
-// mid-window probe cost gate.
+// (docs/design/indexed-write-path.md §3, §7): the mid-window read rule over a
+// populated overlay, crash replay before a fold, the zero-allocation contract
+// of the per-mutation record path, and the mid-window probe cost gate.
 
 // primaryExactOverlayTestOptions builds a buffered-visible indexed
 // configuration over the given index paths.
@@ -30,10 +28,8 @@ func primaryExactOverlayTestOptions(paths ...string) Options {
 	}
 }
 
-// templateHeavyOverlayDoc is the redundant document shape that reliably
-// template-compresses at bulk build (same shape the template-leaf test
-// uses), with the indexed scalar drawn from a small group space so terms
-// carry several postings.
+// templateHeavyOverlayDoc is a shape-redundant document with the indexed scalar
+// drawn from a small group space so terms carry several postings.
 func templateHeavyOverlayDoc(at int) []byte {
 	return fmt.Appendf(nil,
 		`{"id":%d,"kind":"document","group":%d,"active":%t,`+
@@ -46,8 +42,7 @@ func templateHeavyOverlayKey(at int) string {
 }
 
 // buildTemplateHeavyOverlayCollection bulk-builds the redundant corpus and
-// proves it actually produced at least one template leaf, so the de-template
-// rebase path is genuinely exercised.
+// proves every leaf uses the sole class-5 grammar.
 func buildTemplateHeavyOverlayCollection(
 	t *testing.T, dir string, documents int, options Options,
 ) *Collection {
@@ -58,7 +53,7 @@ func buildTemplateHeavyOverlayCollection(
 	}
 	coll := buildIndexedPrimaryFile(t, dir, "overlay-rebase-*", docs, options)
 	router := coll.primaryRouter.Load()
-	templates := 0
+	unified := 0
 	for rank := 0; rank < router.Len(); rank++ {
 		route, ok := router.RouteAtRank(rank)
 		if !ok {
@@ -69,20 +64,21 @@ func buildTemplateHeavyOverlayCollection(
 			t.Fatal(err)
 		}
 		if storeio.PrimaryLeafClass(lease.Page()) ==
-			storeio.CommonPrimaryLeafTemplate {
-			templates++
+			storeio.CommonPrimaryLeafUnified {
+			unified++
+		} else {
+			lease.Release()
+			t.Fatal("non-unified primary leaf")
 		}
 		lease.Release()
 	}
-	if templates == 0 {
-		t.Fatal("redundant corpus produced no template leaves; the rebase path would go uncovered")
+	if unified == 0 {
+		t.Fatal("redundant corpus produced no unified leaves")
 	}
 	return coll
 }
 
-// findTemplateLeafKeys returns the bucket and lexical keys of one currently
-// template-classed leaf, so a mutation against any of them forces the
-// de-template + slot reassignment the rebase group exists for.
+// findTemplateLeafKeys returns the bucket and lexical keys of one unified leaf.
 func findTemplateLeafKeys(
 	t *testing.T, coll *Collection,
 ) (storeio.BucketID, []string) {
@@ -100,7 +96,7 @@ func findTemplateLeafKeys(
 			t.Fatal(err)
 		}
 		if storeio.PrimaryLeafClass(lease.Page()) !=
-			storeio.CommonPrimaryLeafTemplate {
+			storeio.CommonPrimaryLeafUnified {
 			lease.Release()
 			continue
 		}
@@ -120,7 +116,7 @@ func findTemplateLeafKeys(
 			return route.Bucket, keys
 		}
 	}
-	t.Fatal("no template leaf found")
+	t.Fatal("no unified leaf found")
 	return 0, nil
 }
 
@@ -279,13 +275,10 @@ func oracleGroupKeys(oracle map[string]int, group int) []string {
 	return keys
 }
 
-// TestFilePrimaryIndexedRebaseGroupFoldIdentity drives a de-template
-// (slot-reassigning) mutation mid-window — surrounded by ordinary overlay
-// records before and after it, including post-rebase records on the rebased
-// bucket's own tiles — and proves the §3 read rule answers correctly against
-// an oracle before any fold, then that the fold output is byte-identical to
-// a from-scratch rebuild of the final graph, live and after reopen.
-func TestFilePrimaryIndexedRebaseGroupFoldIdentity(t *testing.T) {
+// TestFilePrimaryIndexedOverlayFoldIdentity drives multiple indexed class-5
+// mutations in one window and proves the read rule against an oracle before
+// folding, then proves the fold output is byte-identical to a rebuild.
+func TestFilePrimaryIndexedOverlayFoldIdentity(t *testing.T) {
 	const documents = 4000
 	options := primaryExactOverlayTestOptions("/group")
 	coll := buildTemplateHeavyOverlayCollection(
@@ -306,25 +299,14 @@ func TestFilePrimaryIndexedRebaseGroupFoldIdentity(t *testing.T) {
 		oracle[key] = group
 	}
 
-	// Ordinary pre-rebase records first (they may themselves de-template
-	// their own leaves), then pick a leaf that is STILL template-classed so
-	// the next Put provably takes the rebase path.
+	// Populate the window, then select multiple rows from one unified bucket.
 	put(templateHeavyOverlayKey(0), 100)
 	put(templateHeavyOverlayKey(1), 101)
 	templateBucket, templateKeys := findTemplateLeafKeys(t, coll)
 
-	// The rebase: a value-changed Put on a template leaf de-templates it,
-	// reassigning every slot — the write rule must emit the 4-tile rebase
-	// group plus absolute term records for every term in the bucket.
 	put(templateKeys[0], 102)
-	if coll.primaryEpoch.rebaseFloor(
-		uint32(templateBucket)<<2, ^uint64(0),
-	) == 0 {
-		t.Fatal("de-templating Put emitted no rebase group")
-	}
-	// Post-rebase records over the rebased bucket's tiles: a newer term
-	// record must supersede the rebase group's absolute record, and a delete
-	// must overlay the rebased tile's liveness.
+	_ = templateBucket
+	// Newer term and liveness records on the same bucket must win.
 	put(templateKeys[1], 103)
 	if _, err := coll.Delete([]byte(templateKeys[2])); err != nil {
 		t.Fatal(err)
@@ -346,7 +328,7 @@ func TestFilePrimaryIndexedRebaseGroupFoldIdentity(t *testing.T) {
 
 	// Fold and pin the identity anchor: resident fold output must equal the
 	// from-scratch rebuild of the final graph, byte for byte.
-	if err := coll.Flush(); err != nil {
+	if err := flushPhysicalForTest(coll); err != nil {
 		t.Fatal(err)
 	}
 	if !coll.primaryEpoch.overlayEmpty() {
@@ -365,12 +347,12 @@ func TestFilePrimaryIndexedRebaseGroupFoldIdentity(t *testing.T) {
 	}
 }
 
-// TestSyncPrimaryIndexedRebaseCrashReplay crashes the journal-backed sync
-// lane in the window between a de-template rebase mutation and its fold,
-// replays the journal on the crash image, and proves the recovered fold is
+// TestSyncPrimaryIndexedOverlayCrashReplay crashes the journal-backed sync
+// lane in the window between an indexed overlay mutation and its fold, replays
+// the journal on the crash image, and proves the recovered fold is
 // byte-identical to a from-scratch rebuild of the recovered graph — the
 // crash-between-rebase-and-fold case §7 names.
-func TestSyncPrimaryIndexedRebaseCrashReplay(t *testing.T) {
+func TestSyncPrimaryIndexedOverlayCrashReplay(t *testing.T) {
 	const documents = 4000
 	options := syncPrimaryJournalTestOptions()
 	options.Indexes = []store.IndexDefinition{
@@ -422,10 +404,9 @@ func TestSyncPrimaryIndexedRebaseCrashReplay(t *testing.T) {
 		oracle[templateHeavyOverlayKey(at)] = at % 37
 	}
 
-	// A pre-rebase journaled mutation first, then pick a leaf that is still
-	// template-classed, and arm the crash capture on the de-templating Put's
-	// own journal sync: the captured image holds the rebase acknowledgement
-	// in the journal with no fold behind it.
+	// A first journaled mutation populates the window. Arm crash capture on the
+	// next Put's own journal sync so the image holds its acknowledgement with no
+	// fold behind it.
 	movedDoc := func(group int) []byte {
 		return fmt.Appendf(nil,
 			`{"id":0,"kind":"document","group":%d,"active":false,`+
@@ -462,8 +443,7 @@ func TestSyncPrimaryIndexedRebaseCrashReplay(t *testing.T) {
 	}
 	_ = file.Close()
 
-	// Reopen the crash image: replay drives the same mutation path, so the
-	// rebase group regenerates from the journaled Put and the replay's
+	// Reopen the crash image: replay drives the same mutation path and its
 	// closing checkpoint folds it. The recovered fold must byte-match a
 	// from-scratch rebuild of the recovered graph and answer the oracle.
 	cf, err := os.OpenFile(crashStore, os.O_RDWR, 0o600)
@@ -490,7 +470,7 @@ func TestSyncPrimaryIndexedRebaseCrashReplay(t *testing.T) {
 
 // TestFilePrimaryIndexedMutationAllocations is the zero-GC gate for the
 // per-mutation write rule in isolation from checkpoint folds: after the
-// one-time de-template transient, an indexed buffered Put — value unchanged
+// one-time workspace conversion transient, an indexed buffered Put — value unchanged
 // or changed — allocates exactly what the unindexed base lane allocates
 // (the overlay records come from the epoch's bump arenas, entries and
 // interned bytes from pre-sized slabs).
@@ -532,8 +512,7 @@ func TestFilePrimaryIndexedMutationAllocations(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer coll.Close()
-		// Touch every key once so any template/compact leaf pays its one
-		// de-template rebase before measurement, then fold to an empty window.
+		// Warm every key once, then fold to an empty window.
 		for row := range 2000 {
 			raw := fmt.Appendf(nil, `{"country":"c%03d","row":%d}`, row%100, row+10000)
 			if _, err := coll.Put(fmt.Appendf(nil, "k%05d", row), raw); err != nil {
@@ -625,8 +604,7 @@ func BenchmarkPrimaryExactProbeMidWindow(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer collection.Close()
-	// Warm the whole corpus so template/compact leaves de-template outside
-	// the window under test, then fold to a clean base.
+	// Warm the whole corpus, then fold to a clean base.
 	for row := range documents {
 		raw := fmt.Appendf(nil, `{"country":"c%03d","row":%d}`, row%100, row+100000)
 		if _, err := collection.Put(fmt.Appendf(nil, "k%05d", row), raw); err != nil {

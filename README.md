@@ -9,18 +9,23 @@ memtables, tombstones, or version chains.
 The project is pre-v1. Public APIs and the on-disk format may change without a
 migration path.
 
-## Published benchmark snapshot
+## Performance snapshot
 
-The latest checked-in competitive run measured clean commit `d714d63` on
-2026-07-30.
+The mixed-workload rows come from clean commit `d714d63` on 2026-07-30. The
+unified class-5 rows are current development gates and remain separate until
+the next full isolated competitive publication.
 
-| Lane or measurement | Published result | Context |
+| Lane or measurement | Result | Context |
 | --- | ---: | --- |
 | Buffered-visible mixed workloads | 171k–1.11M ops/s | 1.9–4.0× SQLite |
 | Ordinary-sync mixed workloads | 9.9k–178k ops/s | near SQLite on YCSB-B; trails elsewhere |
 | Power-safe mixed workloads | 394–4,175 ops/s | 3–17% ahead of SQLite |
-| Sustained churn, 100k live documents | 35.1 / 35.4 MiB | apparent / allocated; flat |
-| Compact primary bulk, low/high cardinality | 7.8 / 17.6 MiB | apparent size |
+| Sustained churn, 100k live documents, low/high cardinality | 11.12 / 11.52 · 24.59 / 25.52 MiB | apparent / allocated including paired checkpoint journal; flat at steady state |
+| Unified primary bulk, low/high cardinality | 6.50 / 16.27 MiB | apparent size |
+| Unified ordered scan, 100k documents | 24.58 ns/document | 0 allocations |
+| Unified competitive scan, low/high cardinality | 98.60 / 101.1 ns/document | ~250 B documents; 0 allocations |
+| Native checkpoint leaf patch / full replan | 2.12 / 241 µs | ~113× faster; 0 allocations on native path |
+| Journal-delta CP64, low/high cardinality | 76.8 / 65.5 µs p50 | zero forced persistence checkpoints; 7.56 / 7.93 ms p95 tail remains |
 
 See the [short performance guide](docs/performance.md) for interpretation and
 the [competitive results](bench/competitive/RESULTS.md) for complete tables,

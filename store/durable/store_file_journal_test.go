@@ -598,7 +598,9 @@ func TestRecoveryJournalFullForcesCheckpoint(t *testing.T) {
 	want := map[string]string{"seed": `{"v":0}`}
 	for r := 0; r < rounds; r++ {
 		k := fmt.Sprintf("key-%d", r%keys)
-		v := fmt.Sprintf(`{"r":"%08d","pad":"%s"}`, r, pad)
+		// The unified class-5 read contract is canonical JSON, so retain the
+		// canonical spelling in the byte-for-byte recovery oracle.
+		v := fmt.Sprintf(`{"pad":"%s","r":"%08d"}`, pad, r)
 		if _, err := coll.Put([]byte(k), []byte(v)); err != nil {
 			t.Fatalf("put round %d: %v", r, err)
 		}

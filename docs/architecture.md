@@ -258,8 +258,6 @@ optimizations because they do not change what readers consult.
   buffered checkpoints.
 - [Canonical materialization](design/canonical-materialization.md): in-place
   frame updates and the gated async capsule path with recovery undo.
-- [Template-columnar leaves](design/template-columnar-leaves.md): the leaf
-  codec that adopts 0% under the honest gates, and the compact leaf that won.
 - [Recovery journal](design/recovery-journal.md): the recovery-only redo that
   now backs the synchronous lane.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): future
@@ -267,7 +265,8 @@ optimizations because they do not change what readers consult.
 - [Distributed sharding](design/distributed-sharding.md): future routed
   ownership, replication, failover, and online resharding across independent
   durable roots.
-- [Unification](design/unification.md): one eventual mutable collection.
+- [Unification](design/unification.md): the unified mutable collection and
+  its remaining performance gates.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and
   transactions.

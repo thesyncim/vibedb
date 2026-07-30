@@ -147,10 +147,7 @@ func TestFilePrimaryBufferedSnapshotCheckpointRetire(t *testing.T) {
 	verify("after flush")
 
 	// The flushed image must recover the full content on reopen.
-	image, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatalf("read flushed image: %v", err)
-	}
+	image := captureJournalImage(t, file.Name())
 	reopened := openBufferedImage(t, image, options)
 	var scratch []byte
 	for key, want := range oracle {
@@ -185,7 +182,7 @@ func runPrimarySnapshotCheckpointFaultPass(
 	boundaries []int,
 	contents []map[string]string,
 	records []storeio.FaultCommitRecord,
-	image []byte,
+	image journalCrashImage,
 	faulted bool,
 ) {
 	t.Helper()
@@ -273,7 +270,7 @@ func runPrimarySnapshotCheckpointFaultPass(
 	}
 	faulted = dev.Faulted()
 	records = dev.Records()
-	image, _ = os.ReadFile(path)
+	image = captureJournalImage(t, path)
 	_ = coll.Close()
 	_ = file.Close()
 	return boundaries, contents, records, image, faulted
@@ -358,12 +355,14 @@ func TestFilePrimaryBufferedSnapshotCheckpointCrashBoundary(t *testing.T) {
 			label := fmt.Sprintf("commit=%d phase=%d data=%d",
 				plan.Commit, plan.Phase, plan.DataIndex)
 			legal := expectedStates(commit, plan.Phase, boundaries, contents)
-			outcome := verifyCrashImage(t, options, image, legal, label)
+			outcome := verifyJournalCrashImage(
+				t, options, image, legal, label,
+			)
 			tally[outcome]++
 			exercised++
 
 			imagePath := filepath.Join(t.TempDir(), "verify.vibe")
-			if err := os.WriteFile(imagePath, image, 0o600); err != nil {
+			if err := os.WriteFile(imagePath, image.store, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			vf, vErr := os.OpenFile(imagePath, os.O_RDWR, 0o600)

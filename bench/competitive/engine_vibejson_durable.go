@@ -35,9 +35,6 @@ type vibeDurable struct {
 }
 
 func newVibeDurable(cfg Config) (Engine, error) {
-	if cfg.Compact && cfg.PutLoop {
-		return nil, fmt.Errorf("vibejson-durable: compact format requires the bulk path")
-	}
 	mode, err := ResolveDurabilityMode("vibejson-durable", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -67,16 +64,12 @@ func (v *vibeDurable) Tuning() string {
 	if v.cfg.Untuned {
 		return "defaults only, for comparison against the tuned row"
 	}
-	format := "DocumentFormatVerbatim"
-	if v.cfg.Compact {
-		format = "DocumentFormatCompact"
-	}
 	mode := ""
 	if v.cfg.Durability == DurabilityBufferedVisible {
 		mode = "Buffered-visible ordinarily keeps the persistence worker asleep until Checkpoint, uses bounded fresh-COW staging, groups the captured cut under one alternate root, and explicitly selects the ordinary two-phase filesystem-sync checkpoint used by this comparison; staging pressure can force an earlier checkpoint and comparative runs must verify the selected interval stays below that bound; "
 	}
-	layout := "the ordered primary graph (CreateFromPrimary bulk / the primary mutation path for Put and Delete) is the only engine measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; verbatim and compact rows are both leaf classes on the graph; "
-	return format + "; " + mode + layout +
+	layout := "the ordered primary graph (unified class-5 bulk / the primary mutation path for Put and Delete) is the only engine measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; "
+	return mode + layout +
 		"ResidentBytes=64 MiB (the default, and the read-cache budget every other engine was matched to); " +
 		"PageSize=4 KiB default; buffered read and write modes (O_DIRECT is Linux-only); " +
 		"MaxBatchDocuments=1 and MaxDocumentBytes=1 KiB because this harness exposes only point mutations over a corpus whose largest document is below that bound; the restriction cuts worst-case staging reservation without changing any measured value; " +
@@ -86,8 +79,7 @@ func (v *vibeDurable) Tuning() string {
 		"25-35x faster Put and that figure does not currently reproduce — BenchmarkPointWriteDurableDefaults measures " +
 		"the pair and RESULTS.md reports what it is worth today, which is far less. " +
 		"CommitCoalesce=0, i.e. no acknowledged-latency-for-throughput trade. " +
-		"CreateFromPrimary defaults to verbatim; compact is a separate explicit row because it materially trades read speed " +
-		"for space. Put replay always emits verbatim pages. Never publish one representation as the engine's only footprint"
+		"CreateFromPrimary emits the sole canonical class-5 representation"
 }
 
 func (v *vibeDurable) options() durable.Options {
@@ -127,9 +119,6 @@ func (v *vibeDurable) options() durable.Options {
 		opts.RecoveryJournal = true
 	case DurabilityAsyncStableInFlight:
 		opts.Durability = durable.DurabilityAsyncVisible
-	}
-	if v.cfg.Compact {
-		opts.DocumentFormat = durable.DocumentFormatCompact
 	}
 	if !v.cfg.Untuned {
 		// This adapter cannot express Collection.Update, so reserving for the

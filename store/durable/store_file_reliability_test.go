@@ -49,7 +49,7 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 			if fileErr != nil || fileCreated == existed {
 				t.Fatalf("step %d Put created=%v (model existed=%v), err=%v", step, fileCreated, existed, fileErr)
 			}
-			model[key] = doc
+			model[key] = canonicalDurableTestDocument(t, doc)
 		case 2:
 			_, existed := model[key]
 			delete(model, key)
@@ -81,7 +81,7 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 			for i := range 16 {
 				key := fmt.Sprintf("key-%02d", i)
 				doc := []byte(fmt.Sprintf(`{"snapshot-churn":%d,"status":"new"}`, i))
-				model[key] = doc
+				model[key] = canonicalDurableTestDocument(t, doc)
 				if _, err := collection.Put([]byte(key), doc); err != nil {
 					t.Fatal(err)
 				}
@@ -110,6 +110,15 @@ func TestFileStoreRandomizedHeapDifferentialAndReopen(t *testing.T) {
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func canonicalDurableTestDocument(t testing.TB, document []byte) []byte {
+	t.Helper()
+	canonical, err := vibejson.AppendCanonicalize(nil, document)
+	if err != nil {
+		t.Fatalf("canonicalize model document: %v", err)
+	}
+	return canonical
 }
 
 func assertFileCollectionMatchesModel(t *testing.T, collection *Collection, model map[string][]byte, keys int) {
@@ -179,8 +188,9 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	newValue := []byte(fmt.Sprintf(`{"id":3,"status":"new","padding":%q}`, strings.Repeat("z", 7000)))
-	if created, err := collection.Put([]byte("key-03"), newValue); err != nil || created {
+	newInput := []byte(fmt.Sprintf(`{"id":3,"status":"new","padding":%q}`, strings.Repeat("z", 7000)))
+	newValue := canonicalDurableTestDocument(t, newInput)
+	if created, err := collection.Put([]byte("key-03"), newInput); err != nil || created {
 		t.Fatalf("update = (%v,%v)", created, err)
 	}
 	if err := collection.Flush(); err != nil {

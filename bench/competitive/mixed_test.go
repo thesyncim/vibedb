@@ -350,8 +350,13 @@ func TestMixedMutationEquivalence(t *testing.T) {
 			}
 
 			want := make(map[string][]byte, len(fixture))
+			var expectedScratch []byte
 			for i := range fixture {
-				want[fixture[i].Key] = fixture[i].JSON
+				expectedScratch, err = AppendExpectedStoredJSON(expectedScratch[:0], factory.Name, fixture[i].JSON)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want[fixture[i].Key] = append([]byte(nil), expectedScratch...)
 			}
 
 			updateAt := 17
@@ -359,10 +364,14 @@ func TestMixedMutationEquivalence(t *testing.T) {
 			if err := e.Put(fixture[updateAt].Key, updated); err != nil {
 				t.Fatal(err)
 			}
-			want[fixture[updateAt].Key] = updated
+			expectedScratch, err = AppendExpectedStoredJSON(expectedScratch[:0], factory.Name, updated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want[fixture[updateAt].Key] = append(want[fixture[updateAt].Key][:0], expectedScratch...)
 			got, err := e.Get(nil, fixture[updateAt].Key)
-			if err != nil || !bytes.Equal(got, updated) {
-				t.Fatalf("updated Get = %q, %v; want %q", got, err, updated)
+			if err != nil || !bytes.Equal(got, want[fixture[updateAt].Key]) {
+				t.Fatalf("updated Get = %q, %v; want %q", got, err, want[fixture[updateAt].Key])
 			}
 
 			deleteAt := 23
@@ -394,7 +403,11 @@ func TestMixedMutationEquivalence(t *testing.T) {
 			if err := e.Upsert(fixture[deleteAt].Key, fixture[deleteAt].JSON); err != nil {
 				t.Fatal(err)
 			}
-			want[fixture[deleteAt].Key] = fixture[deleteAt].JSON
+			expectedScratch, err = AppendExpectedStoredJSON(expectedScratch[:0], factory.Name, fixture[deleteAt].JSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want[fixture[deleteAt].Key] = append([]byte(nil), expectedScratch...)
 
 			seen := make(map[string]bool, len(want))
 			if err := e.Visit(func(key string, value []byte) error {

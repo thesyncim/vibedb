@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strconv"
+
+	"github.com/thesyncim/vibejson"
 )
 
 // Doc is one corpus record: a key and its JSON body.
@@ -22,12 +24,23 @@ type Doc struct {
 	JSON []byte
 }
 
+// AppendExpectedStoredJSON appends the representation an engine promises to
+// return for src. The durable class-5 format is canonical by construction;
+// byte-preserving competitors return the submitted spelling. Correctness
+// oracles use this outside timed regions so canonicalization is never charged
+// to, or hidden inside, a benchmarked read.
+func AppendExpectedStoredJSON(dst []byte, engineName string, src []byte) ([]byte, error) {
+	if engineName == "vibejson-durable" {
+		return vibejson.AppendCanonicalize(dst, src)
+	}
+	return append(dst, src...), nil
+}
+
 // Cardinality selects which corpus variant is generated. It exists because the
-// shipped corpus is highly redundant. store/durable can exploit that only when
-// the harness explicitly selects its compact bulk representation; the default
-// verbatim representation cannot. Reporting only the redundant corpus could
-// therefore mistake corpus redundancy for engine compression. Both variants
-// and both vibejson representations are measured and published.
+// shipped corpus is highly redundant and store/durable's unified grammar can
+// exploit that redundancy automatically. Reporting only the redundant corpus
+// could therefore mistake corpus entropy for format efficiency. Both variants
+// are measured and published through the same durable representation.
 type Cardinality int
 
 const (

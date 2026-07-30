@@ -1,9 +1,11 @@
 # Engine unification: one in-memory durable store
 
-**Status:** in progress. The durable primary graph is now a mutable in-memory
-canonical-frame engine with a transactional batch and one SQL language; what
-remains is demoting the heap engine's mutable API, parallel writers, and
-freezing the format.
+**Status:** storage-mode and primary-leaf collapse complete; public API cutover
+in progress. The durable primary graph is now a mutable in-memory
+canonical-frame engine with one canonical leaf grammar, a transactional batch,
+and one SQL language. What remains is moving the query/build substrate behind
+that engine's public API, adding its null-device ephemeral mode, parallel
+writers, and freezing the remaining root metadata.
 
 **Idea:** one `Collection` operates on canonical frames, with either a real
 device or a null device. Durability becomes a mode rather than a second
@@ -69,18 +71,24 @@ Executed:
    remains a typed programmatic plan API rather than a second request grammar.
    The JSON query-document parser and its compatibility syntax were deleted
    before release.
+5. **Primary-leaf collapse — done.** Empty creation, bulk build, point and
+   batch mutations, structural split/merge, and checkpoint fold all produce
+   the unified canonical class-5 grammar. The public `DocumentFormat` and
+   experimental `UnifiedLeaves` switches are gone; templated and trivial rows
+   are choices inside one leaf codec rather than store modes.
 
 Remaining:
 
-5. **Heap mutable API demotion.** Collapse the heap `store.Collection` mutable
+6. **Heap mutable API demotion.** Collapse the heap `store.Collection` mutable
    surface into the one durable engine with a null device for the ephemeral
    mode; `Builder` feeds the bulk path directly. (Owned by later work.)
-6. **Parallel tablet writers.** See
+7. **Parallel tablet writers.** See
    [parallel-tablet-writers.md](parallel-tablet-writers.md).
-7. **Deletions and format freeze.** Delete the legacy fingerprint/chunk
-   primary and every codepath that exists only to keep two engines behaving
-   alike; freeze the surviving format. Golden tests and docs/format.md follow
-   the surviving format only.
+8. **Root-metadata deletion and format freeze.** The legacy
+   fingerprint/chunk primary codecs and standalone `DocumentGroup` leaf codec
+   are deleted. Remove their remaining retired `StateRoot`, `PageKind`,
+   overflow-header, options, and stats fields, then freeze the surviving
+   format. Golden tests and docs/format.md follow the surviving format only.
 
 Each stage lands only behind the measured gates; a stage that regresses a
 published read/scan/space number does not merge.

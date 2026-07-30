@@ -86,6 +86,17 @@ workloads; vibedb's measured mutation median is 4.03-4.12 ms.
 uniformly random keys, checkpoint every 64, then each engine's own
 maintenance floor. Cells are **apparent / allocated MiB**.
 
+The current unified class-5 development gate, measured separately from the
+clean publication below, is:
+
+| corpus | steady state | checkpoint policy |
+|---|---:|---|
+| low cardinality | **11.12 / 11.52**, flat through maintenance floor | CP64 journal-delta; zero forced persistence checkpoints |
+| high cardinality | **24.59 / 25.52**, flat through maintenance floor | CP64 journal-delta; zero forced persistence checkpoints |
+
+The following table is the pre-unification clean cross-engine publication and
+is retained for provenance until the next complete isolated suite:
+
 | engine | steady state | after maintenance floor | maintenance required |
 |---|---|---|---|
 | vibedb | **35.1 / 35.4**, flat | 35.1 / 35.4 | flush; representation unchanged |
@@ -95,6 +106,19 @@ maintenance floor. Cells are **apparent / allocated MiB**.
 | Badger | 314.8 / 72.6 | 314.8 / 72.6 | flatten + value-log GC |
 
 ## Bulk footprint (100k docs, both corpus cardinalities)
+
+The current class-5 development measurement is:
+
+| engine | low card | high card |
+|---|---:|---:|
+| vibedb unified primary graph | **6.50 / —** | **16.27 / —** |
+
+Those cells are apparent MiB; allocated size awaits the next complete isolated
+publication. Class 5 uses 68.16 and 170.56 bytes/document respectively.
+
+The table below records the pre-unification published run and is retained as
+historical evidence. The next full competitive publication replaces the old
+vibedb rows rather than comparing them as selectable modes.
 
 The low-cardinality corpus is ~92% redundant; the high-cardinality variant
 is shape- and length-identical with near-unique values, so the difference
@@ -121,6 +145,36 @@ The auxiliary replay-through-`Put` footprint did not produce a row: inserting
 100,000 new keys from an empty store reached the current primary macro-tablet
 split limit in both cardinalities. Bulk load and the fixed-live-set churn run
 completed; this limitation is recorded rather than conflated with either path.
+
+## Unified scan development gates
+
+These class-5 microbenchmarks were measured on the Apple M4 Max during the
+2026-07-30 unification work. They are kept separate from the isolated
+cross-engine workload tables above.
+
+| gate | result |
+|---|---:|
+| ordered scan, 100k three-scalar documents | **24.58 ns/document**, 0 allocs |
+| competitive ~250 B scan, low / high cardinality | **98.60 / 101.1 ns/document**, 0 allocs |
+| masked scan, 1 / 4 / 16 selected rows per leaf | **163 ns / 443–448 ns / 1.47 µs** |
+| dense 153-row mask | **10.88–11.10 µs**, within 2% of sequential |
+
+Sparse masks decode and render only selected stable slots; masks at or above
+the measured 75% density crossover use the sequential class-5 drain.
+
+The native plan-stable checkpoint patch is **2.12–2.13 µs**, zero allocations,
+versus **240–242 µs** for a complete render/replan/encode. The final-tree
+journal-delta CP64 runs (three isolated repetitions per cardinality) measure:
+
+| corpus | ops/s median | checkpoint p50 | checkpoint p95 | forced persistence |
+|---|---:|---:|---:|---:|
+| low | **42,667** | **76.8 µs** | 7.56 ms | 0 |
+| high | **40,710** | **65.5 µs** | 7.93 ms | 0 |
+
+The common checkpoint is now one bounded journal batch and one ordinary sync
+over the unchanged physical root. The p95 tail is the remaining non-aligned
+overlay-fold fallback; it is recorded as an open optimization rather than
+blurred into the much lower median.
 
 ## Reproduction
 
@@ -150,5 +204,5 @@ go build -o /tmp/vibedb-footprint ./cmd/footprint
 /tmp/vibedb-churndisk -engine=<engine> -cardinality=low
 /tmp/vibedb-footprint -engine=<engine> -cardinality=<low|high>
 /tmp/vibedb-footprint -engine=vibejson-durable \
-  -compact -cardinality=<low|high>
+  -putloop -cardinality=<low|high>
 ```

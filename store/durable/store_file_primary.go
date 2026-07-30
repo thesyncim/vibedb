@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibejson"
 )
 
 func (c *Collection) primaryGraphReadOnly() bool {
@@ -85,6 +86,13 @@ func (c *Collection) resolvePrimaryGraphRouted(
 	if router.Generation() != state.root.Generation {
 		return dst, false, true, nil
 	}
+	if value, disposition, _ := c.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, keyBytes, state.root.Generation,
+	); disposition == primaryUnifiedOverlayValue {
+		return append(dst, value...), true, false, nil
+	} else if disposition == primaryUnifiedOverlayDeleted {
+		return dst, false, false, nil
+	}
 	leafLease, err := router.AcquireLeaf(c.cache, route)
 	if err != nil {
 		return dst, false, false, err
@@ -147,11 +155,9 @@ func (c *Collection) resolvePrimaryGraphLive(
 	return c.resolvePrimaryGraphRouted(dst, state, key, router)
 }
 
-// appendPrimaryLeafValue reads one exact value from an admitted primary leaf,
-// dispatching on the leaf class recorded in the page. Template leaves splice the
-// exact JSON into dst; raw leaves append the borrowed inline bytes, or resolve
-// and append the out-of-line value when the record is an overflow reference. It
-// allocates nothing for inline hits when dst has capacity for the value.
+// appendPrimaryLeafValue reads one exact value from the sole admitted class-5
+// leaf grammar. Inline rows splice their canonical spelling into dst; overflow
+// rows resolve the existing chain.
 func (c *Collection) appendPrimaryLeafValue(
 	dst []byte,
 	page []byte,
@@ -161,75 +167,35 @@ func (c *Collection) appendPrimaryLeafValue(
 	keyBytes []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) ([]byte, bool, error) {
-	switch storeio.PrimaryLeafClass(page) {
-	case storeio.CommonPrimaryLeafTemplate:
-		tv, ok := storeio.AdmittedCommonPrimaryTemplateLeaf(page, bucket, bounds)
-		if !ok {
-			return dst, false, fmt.Errorf(
-				"%w: template primary leaf",
-				storeio.ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		out, found := tv.AppendRawByKey(dst, keyBytes)
-		return out, found, nil
-	case storeio.CommonPrimaryLeafCompact:
-		cv, ok := storeio.AdmittedCommonPrimaryCompactLeaf(page, bucket, bounds)
-		if !ok {
-			return dst, false, fmt.Errorf(
-				"%w: compact primary leaf",
-				storeio.ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		out, found := cv.AppendRawByKey(dst, keyBytes)
-		return out, found, nil
-	case storeio.CommonPrimaryLeafUnified:
-		uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-			page, storeID, bucket, bounds,
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		return dst, false, fmt.Errorf(
+			"%w: non-unified primary leaf",
+			storeio.ErrCommonPrimaryLeafCorrupt,
 		)
-		if !ok {
-			return dst, false, fmt.Errorf(
-				"%w: unified primary leaf",
-				storeio.ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		body, overflow, found := uv.LookupBodyHashed(hash, keyBytes)
-		if !found {
-			return dst, false, nil
-		}
-		if overflow {
-			// The overflow chain carries the document's canonical bytes, so
-			// the read is the existing chain reassembly at verbatim parity
-			// (unified-leaf design §6).
-			out, err := c.appendPrimaryOverflowValue(
-				dst, storeio.DecodePrimaryOverflowRef(body), bounds,
-			)
-			if err != nil {
-				return dst, false, err
-			}
-			return out, true, nil
-		}
-		out, rendered := uv.AppendRowBody(dst, body)
-		if !rendered {
-			return dst, false, fmt.Errorf(
-				"%w: unified row body",
-				storeio.ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		return out, true, nil
 	}
-	leaf := storeio.AdmittedCommonPrimaryLeaf(page, storeID, bucket, bounds)
-	_, value, found := leaf.LookupHashed(hash, keyBytes)
+	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		page, storeID, bucket, bounds,
+	)
+	if !ok {
+		return dst, false, fmt.Errorf(
+			"%w: unified primary leaf",
+			storeio.ErrCommonPrimaryLeafCorrupt,
+		)
+	}
+	body, overflow, found := uv.LookupBodyHashed(hash, keyBytes)
 	if !found {
 		return dst, false, nil
 	}
-	if value.IsOverflow() {
-		out, err := c.appendPrimaryOverflowValue(dst, value.Overflow, bounds)
+	if overflow {
+		out, err := c.appendPrimaryOverflowValue(
+			dst, storeio.DecodePrimaryOverflowRef(body), bounds,
+		)
 		if err != nil {
 			return dst, false, err
 		}
 		return out, true, nil
 	}
-	return append(dst, value.Inline...), true, nil
+	return uv.AppendAdmittedRowBody(dst, body), true, nil
 }
 
 // resolvePrimaryGraphPageWalk is the rooted resolver retained both as a
@@ -560,12 +526,25 @@ func withOpenedPrimaryCatalogNode(
 // path (publishing an empty primary root), so both reach an identically wired
 // collection. The writer must be held and the collection not yet reachable.
 func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
-	// A compact leaf packs far more rows than a wide leaf holds raw, so its first
-	// mutation de-compacts it into a leaf as large as the 64 KiB maximum leaf
-	// extent before the structural path re-fits and splits it back into wide
-	// leaves. The mutation scratch must therefore cover the largest leaf, not just
-	// the wide class.
+	// Structural mutation renders class 5 into an owned raw workspace before
+	// re-encoding class 5. Large inline rows can require the full 64 KiB
+	// transient extent, so the retained scratch covers that ceiling.
 	c.primaryLeafScratch = make([]byte, storeio.CommonPrimaryLeafMaxExtentBytes)
+	c.primaryLeafMutationScratch = storeio.NewPrimaryLeafMutationScratch(
+		storeio.CommonPrimaryLeafMaxExtentBytes,
+	)
+	c.primaryUnifiedBuilder = storeio.NewUnifiedPrimaryLeafBuilder()
+	if overlay := c.primaryUnifiedOverlay; overlay != nil {
+		indexEntries := min(c.options.InlineValueBytes+2, 8192)
+		indexEntries = max(indexEntries, 64)
+		c.primaryUnifiedIndexScratch = make(
+			[]vibejson.IndexEntry, 0, indexEntries,
+		)
+		canonicalBytes := min(
+			len(overlay.arena), max(4096, 2*c.options.InlineValueBytes),
+		)
+		c.primaryUnifiedCanonical = make([]byte, 0, canonicalBytes)
+	}
 	c.primaryRootScratch = make([]byte, storeio.SegmentedTabletRouterRootBytes)
 	builtRouter, err := storeio.BuildResidentPrimaryRouter(
 		c.cache, state.root.PrimaryRoot,
@@ -611,9 +590,3 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 	}
 	return nil
 }
-
-// ResetPrimaryTemplateDiag zeroes the process-global template-columnar mutation
-// diagnostics (de-template and re-plan event counters). It is a thin re-export
-// of the storeio counter reset so out-of-tree diagnostics can attribute runtime
-// cost without importing the internal package.
-func ResetPrimaryTemplateDiag() { storeio.ResetTemplateColumnarDiag() }

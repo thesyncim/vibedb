@@ -42,17 +42,11 @@ type PrimaryGraphCursor struct {
 	leafLease   PageLease
 	rows        CommonPrimaryLeafIterator
 
-	// Template-columnar and compact leaves reconstruct documents by splice, so
-	// the cursor dispatches on the leaf class and, for those classes, walks ranks
-	// and reconstructs each surviving row into spliceScratch. The scratch is
-	// reused across rows and leaves within one scan. tcRank is the shared rank
-	// cursor for both reconstructed classes.
-	leafClass     CommonPrimaryLeafClass
-	tcLeaf        CommonPrimaryTemplateLeafView
-	compactLeaf   CommonPrimaryCompactLeafView
-	unifiedLeaf   CommonPrimaryUnifiedLeafView
-	tcRank        int
-	spliceScratch []byte
+	// Unified rows reconstruct documents into spliceScratch. The scratch is
+	// reused across rows and leaves within one scan.
+	unifiedLeaf     CommonPrimaryUnifiedLeafView
+	unifiedRenderer unifiedPrimaryRowRenderer
+	spliceScratch   []byte
 
 	done bool
 }
@@ -267,124 +261,46 @@ func (c *PrimaryGraphCursor) openLeaf(
 		return err
 	}
 	c.leafLease = lease
-	c.leafClass = PrimaryLeafClass(lease.Page())
-	if c.leafClass == CommonPrimaryLeafTemplate {
-		tv, ok := AdmittedCommonPrimaryTemplateLeaf(
-			lease.Page(), route.Bucket, c.leafBounds,
+	if PrimaryLeafClass(lease.Page()) != CommonPrimaryLeafUnified {
+		return fmt.Errorf(
+			"%w: non-unified primary leaf", ErrCommonPrimaryLeafCorrupt,
 		)
-		if !ok {
-			return fmt.Errorf(
-				"%w: template primary leaf", ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		c.tcLeaf = tv
-		c.rows = CommonPrimaryLeafIterator{}
-		if lowerBound {
-			c.tcRank = tv.FirstRankFrom(c.lower)
-		} else {
-			c.tcRank = 0
-		}
-		return nil
 	}
-	if c.leafClass == CommonPrimaryLeafCompact {
-		cv, ok := AdmittedCommonPrimaryCompactLeaf(
-			lease.Page(), route.Bucket, c.leafBounds,
-		)
-		if !ok {
-			return fmt.Errorf(
-				"%w: compact primary leaf", ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		c.compactLeaf = cv
-		c.rows = CommonPrimaryLeafIterator{}
-		if lowerBound {
-			c.tcRank = cv.FirstRankFrom(c.lower)
-		} else {
-			c.tcRank = 0
-		}
-		return nil
-	}
-	if c.leafClass == CommonPrimaryLeafUnified {
-		// The unified class reuses the succinct envelope's iterator directly:
-		// keys and raw row bodies (or overflow descriptors) stream through the
-		// same boundary machinery as the raw classes, and only the body render
-		// differs at consumption time in nextRawBorrowed.
-		uv, ok := AdmittedCommonPrimaryUnifiedLeaf(
-			lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
-		)
-		if !ok {
-			return fmt.Errorf(
-				"%w: unified primary leaf", ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		c.unifiedLeaf = uv
-		if lowerBound {
-			c.rows = uv.env.Range(c.lower, nil)
-		} else {
-			c.rows = uv.env.AllRows()
-		}
-		return nil
-	}
-	leaf := AdmittedCommonPrimaryLeaf(
+	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(
 		lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
 	)
+	if !ok {
+		return fmt.Errorf(
+			"%w: unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+		)
+	}
+	c.unifiedLeaf = uv
+	c.unifiedRenderer.Reset(uv)
 	if lowerBound {
-		c.rows = leaf.Range(c.lower, nil)
+		c.rows = uv.env.Range(c.lower, nil)
 	} else {
-		c.rows = leaf.AllRows()
+		c.rows = uv.env.AllRows()
 	}
 	return nil
 }
 
-// nextRawBorrowed yields the next row of the current leaf, dispatching on the
-// leaf class. Template rows are spliced into the reused scratch; the returned
-// value borrows that scratch and is valid only until the next call.
+// nextRawBorrowed yields the next unified row. Inline bodies are rendered into
+// reused scratch; the returned value borrows that scratch and is valid only
+// until the next call.
 func (c *PrimaryGraphCursor) nextRawBorrowed() (
 	key, raw []byte, overflow, ok bool,
 ) {
-	switch c.leafClass {
-	case CommonPrimaryLeafTemplate:
-		if c.tcRank >= c.tcLeaf.Len() {
-			return nil, nil, false, false
-		}
-		k, ti, rowOK := c.tcLeaf.RowAt(c.tcRank)
-		if !rowOK {
-			return nil, nil, false, false
-		}
-		c.spliceScratch = c.tcLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
-		c.tcRank++
-		return k, c.spliceScratch, false, true
-	case CommonPrimaryLeafCompact:
-		if c.tcRank >= c.compactLeaf.Len() {
-			return nil, nil, false, false
-		}
-		k, ti, rowOK := c.compactLeaf.RowAt(c.tcRank)
-		if !rowOK {
-			return nil, nil, false, false
-		}
-		c.spliceScratch = c.compactLeaf.AppendRawRank(c.spliceScratch[:0], c.tcRank, ti)
-		c.tcRank++
-		return k, c.spliceScratch, false, true
-	case CommonPrimaryLeafUnified:
-		k, body, isOverflow, rowOK := c.rows.NextRawBorrowed()
-		if !rowOK {
-			return nil, nil, false, false
-		}
-		if isOverflow {
-			return k, body, true, true
-		}
-		out, rendered := c.unifiedLeaf.AppendRowBody(c.spliceScratch[:0], body)
-		if !rendered {
-			// The leaf passed admission, so a render failure here means the
-			// resident frame changed under us; fail the scan closed rather
-			// than yield partial bytes.
-			return nil, nil, false, false
-		}
-		c.spliceScratch = out
-		return k, c.spliceScratch, false, true
-	default:
-		return c.rows.NextRawBorrowed()
+	k, body, isOverflow, rowOK := c.rows.NextRawBorrowed()
+	if !rowOK {
+		return nil, nil, false, false
 	}
+	if isOverflow {
+		return k, body, true, true
+	}
+	c.spliceScratch = c.unifiedLeaf.AppendAdmittedRowBody(
+		c.spliceScratch[:0], body,
+	)
+	return k, c.spliceScratch, false, true
 }
 
 // VisitInline is the scan hot path for inline primary graphs. It keeps the
@@ -434,32 +350,12 @@ func (c *PrimaryGraphCursor) visitAllInline(
 	fn func(key, value []byte) error,
 ) ([]byte, PageRef, error) {
 	for {
-		if c.leafClass != CommonPrimaryLeafTemplate &&
-			c.leafClass != CommonPrimaryLeafCompact &&
-			c.leafClass != CommonPrimaryLeafUnified {
-			// The raw classes drain each leaf in one fused call; the template
-			// and compact classes step row by row because each row is
-			// reconstructed through class-specific scratch, not borrowed.
-			key, raw, err := c.rows.VisitRawBorrowed(fn)
-			if err != nil {
-				return nil, PageRef{}, err
-			}
-			if raw != nil {
-				return key, decodePageRef(raw), nil
-			}
-		} else {
-			for {
-				key, raw, overflow, ok := c.nextRawBorrowed()
-				if !ok {
-					break
-				}
-				if overflow {
-					return key, decodePageRef(raw), nil
-				}
-				if err := fn(key, raw); err != nil {
-					return nil, PageRef{}, err
-				}
-			}
+		key, raw, err := c.visitCurrentLeafAllInline(fn)
+		if err != nil {
+			return nil, PageRef{}, err
+		}
+		if key != nil {
+			return key, decodePageRef(raw), nil
 		}
 		if err := c.advanceLeaf(); err != nil {
 			c.Close()
@@ -469,6 +365,73 @@ func (c *PrimaryGraphCursor) visitAllInline(
 			return nil, PageRef{}, nil
 		}
 	}
+}
+
+// visitCurrentLeafAllInline fuses the succinct boundary decoder, key decoder,
+// admitted row renderer, and callback dispatch into one leaf-local loop. The
+// iterator state is written back only when the leaf drains, an overflow row is
+// returned, or the callback stops the scan.
+func (c *PrimaryGraphCursor) visitCurrentLeafAllInline(
+	fn func(key, value []byte) error,
+) (overflowKey, overflowRaw []byte, err error) {
+	it := &c.rows
+	if it.finished {
+		return nil, nil, nil
+	}
+	payload := it.payload
+	layout := &it.layout
+	count := int(it.count)
+	rank := int(it.rank)
+	bitPos := int(it.bitPos)
+	offset := int(it.offset)
+	for rank < count {
+		nextPosition, ok := commonPrimaryLeafNextHighBitAt(
+			payload, layout.highStart, layout.highBytes, bitPos+1,
+		)
+		if !ok {
+			break
+		}
+		nextRank := rank + 1
+		end := uint16(
+			(nextPosition-nextRank)<<commonPrimaryLeafLowerBits,
+		) | uint16(payload[layout.lowStart+nextRank])
+		keyLength := commonPrimaryLeafKeyCode(payload, layout, rank)
+		start := offset
+		if keyLength == commonPrimaryLeafEscapeLength {
+			keyLength = int(payload[start]) + 1
+			start++
+		}
+		key := payload[start : start+keyLength : start+keyLength]
+		valueStart := start + keyLength
+		raw := payload[valueStart:int(end):int(end)]
+		overflow := payload[layout.overflowStart+rank/8]&
+			(byte(1)<<uint(rank&7)) != 0
+		rank = nextRank
+		bitPos = nextPosition
+		offset = int(end)
+		if overflow {
+			it.rank = uint16(rank)
+			it.bitPos = uint16(bitPos)
+			it.offset = uint16(offset)
+			it.finished = rank >= count
+			return key, raw, nil
+		}
+		c.spliceScratch = c.unifiedRenderer.Append(
+			c.spliceScratch[:0], raw,
+		)
+		if err := fn(key, c.spliceScratch); err != nil {
+			it.rank = uint16(rank)
+			it.bitPos = uint16(bitPos)
+			it.offset = uint16(offset)
+			it.finished = rank >= count
+			return nil, nil, err
+		}
+	}
+	it.rank = uint16(rank)
+	it.bitPos = uint16(bitPos)
+	it.offset = uint16(offset)
+	it.finished = true
+	return nil, nil, nil
 }
 
 func (c *PrimaryGraphCursor) advanceLeaf() error {
@@ -584,11 +547,7 @@ func (c *PrimaryGraphCursor) nextTablet() (PageRef, bool, error) {
 func (c *PrimaryGraphCursor) releaseAnchor() {
 	c.leafLease.Release()
 	c.rows = CommonPrimaryLeafIterator{}
-	c.leafClass = 0
-	c.tcLeaf = CommonPrimaryTemplateLeafView{}
-	c.compactLeaf = CommonPrimaryCompactLeafView{}
 	c.unifiedLeaf = CommonPrimaryUnifiedLeafView{}
-	c.tcRank = 0
 	c.anchorLease.Release()
 	c.anchor = GlobalTabletCatalogAnchorView{}
 	c.rowRank = 0
@@ -612,10 +571,10 @@ func (c *PrimaryGraphCursor) Close() {
 }
 
 // AdoptSpliceScratch seeds the cursor's document-reconstruction buffer with a
-// caller-retained slice. A template or compact leaf splices each row into this
-// buffer, and a fresh cursor would grow it from nil on the first such row of the
-// scan; seeding it from a buffer the caller keeps across scans makes a warm
-// ordered scan splice into retained capacity instead. Call it after
+// caller-retained slice. A unified leaf reconstructs each row into this buffer,
+// and a fresh cursor would grow it from nil on the first such row of the scan;
+// seeding it from a buffer the caller keeps across scans makes a warm ordered
+// scan render into retained capacity instead. Call it after
 // InitPrimaryGraphCursor, which resets the cursor. ReleaseSpliceScratch returns
 // the possibly-grown buffer for the caller to retain for the next scan.
 func (c *PrimaryGraphCursor) AdoptSpliceScratch(buf []byte) {

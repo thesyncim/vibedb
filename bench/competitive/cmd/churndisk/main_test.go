@@ -17,6 +17,7 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				"-mutations=2000",
 				"-sample-mutations=500",
 				"-checkpoint-mutations=64",
+				"-allow-diagnostic",
 			}, &out)
 			if err != nil {
 				t.Fatal(err)
@@ -54,6 +55,9 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				}
 				last = got
 				phases[fields[index["phase"]]] = true
+				if fields[index["publishable"]] != "false" {
+					t.Fatalf("diagnostic line %d marked publishable: %q", lineNo+2, line)
+				}
 			}
 			if !phases["pre-floor"] || !phases["post-floor"] {
 				t.Fatalf("final floor rows missing; phases=%v", phases)
@@ -62,5 +66,23 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				t.Fatalf("final mutation index = %d, want 2000", last)
 			}
 		})
+	}
+}
+
+func TestPublicationShape(t *testing.T) {
+	cfg := config{
+		corpusSize:          100_000,
+		mutationBudget:      200_000,
+		replacePercent:      80,
+		sampleMutations:     5_000,
+		checkpointMutations: 64,
+		seed:                defaultSeed,
+	}
+	if !publicationShape(cfg) {
+		t.Fatal("default publication shape rejected")
+	}
+	cfg.corpusSize--
+	if publicationShape(cfg) {
+		t.Fatal("custom corpus accepted as a publication shape")
 	}
 }

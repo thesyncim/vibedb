@@ -92,7 +92,7 @@ type primaryExactTermRecord struct {
 
 // primaryExactTileRecord is one absolute liveness overwrite: tile tileID's
 // live slot mask is live as of gen. rebased marks a slot-reassigning rewrite
-// of the owning bucket (de-template, reclass): it voids the fold base's
+// of the owning bucket (workspace or structural rewrite): it voids the fold base's
 // postings for this tile and invalidates older term records (§3 read rule).
 type primaryExactTileRecord struct {
 	next    *primaryExactTileRecord

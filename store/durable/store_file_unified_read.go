@@ -251,13 +251,7 @@ func (s *Snapshot) AppendField(
 	}
 	if hole < 0 {
 		// Container target: render this one row and walk it.
-		out, rendered := uv.AppendRowBody(p.doc[:0], body)
-		if !rendered {
-			return dst, false, fmt.Errorf(
-				"%w: unified row render", storeio.ErrCommonPrimaryLeafCorrupt,
-			)
-		}
-		p.doc = out
+		p.doc = uv.AppendAdmittedRowBody(p.doc[:0], body)
 		return p.appendPathOf(dst, p.doc)
 	}
 	tok, ok := uv.RowToken(body, int(hole))

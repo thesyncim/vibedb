@@ -438,37 +438,37 @@ func resealFormat0Journal(image []byte) {
 
 func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 	for name, gotWant := range map[string][2]int{
-		"PageHeaderSize":                    {PageHeaderSize, 64},
-		"PageTrailerSize":                   {PageTrailerSize, 8},
-		"StateRootPayloadSize":              {StateRootPayloadSize, 512},
-		"stateRootMaxPageSizeOffset":        {stateRootMaxPageSizeOffset, 220},
-		"stateRootPageCatalogOffset":        {stateRootPageCatalogOffset, 224},
-		"stateRootPageCatalogEnd":           {stateRootPageCatalogEnd, 256},
-		"stateRootPageCatalogDigestEnd":     {stateRootPageCatalogDigestEnd, 272},
-		"stateRootPageCatalogBytesEnd":      {stateRootPageCatalogBytesEnd, 276},
-		"stateRootMaxKeyBytesEnd":           {stateRootMaxKeyBytesEnd, 280},
-		"stateRootInlineValueBytesEnd":      {stateRootInlineValueBytesEnd, 284},
-		"stateRootMaxDocumentBytesEnd":      {stateRootMaxDocumentBytesEnd, 288},
-		"stateRootPrimaryOffset":            {stateRootPrimaryOffset, 288},
-		"stateRootPrimaryEnd":               {stateRootPrimaryEnd, 320},
-		"stateRootJournalIDOffset":          {stateRootJournalIDOffset, 320},
-		"stateRootJournalIDEnd":             {stateRootJournalIDEnd, 336},
-		"stateRootExactIndexOffset":         {stateRootExactIndexOffset, 336},
-		"stateRootExactIndexEnd":            {stateRootExactIndexEnd, 368},
-		"stateRootReservedOffset":           {stateRootReservedOffset, 368},
-		"PageRefSize":                       {PageRefSize, 32},
-		"InlineSuperblockSize":              {InlineSuperblockSize, 4096},
-		"InlineFreeDeltaCapacity":           {InlineFreeDeltaCapacity, 106},
-		"SuperblockSize":                    {SuperblockSize, 128},
-		"MaterializationJournalSize":        {MaterializationJournalSize, 4096},
-		"MaterializationJournalHeaderSize":  {MaterializationJournalHeaderSize, 112},
-		"MaterializationTargetRecordSize":   {MaterializationTargetRecordSize, 56},
-		"MaterializationPatchRecordSize":    {MaterializationPatchRecordSize, 16},
-		"MaterializationJournalMaxTargets":  {MaterializationJournalMaxTargets, 6},
-		"MaterializationJournalMaxPatches":  {MaterializationJournalMaxPatches, 7},
-		"MaterializationJournalMaxData":     {MaterializationJournalMaxData, 3584},
-		"PostingPagePayloadHeaderSize":      {PostingPagePayloadHeaderSize, 32},
-		"PostingSegmentHeaderSize":          {PostingSegmentHeaderSize, 48},
+		"PageHeaderSize":                   {PageHeaderSize, 64},
+		"PageTrailerSize":                  {PageTrailerSize, 8},
+		"StateRootPayloadSize":             {StateRootPayloadSize, 512},
+		"stateRootMaxPageSizeOffset":       {stateRootMaxPageSizeOffset, 220},
+		"stateRootPageCatalogOffset":       {stateRootPageCatalogOffset, 224},
+		"stateRootPageCatalogEnd":          {stateRootPageCatalogEnd, 256},
+		"stateRootPageCatalogDigestEnd":    {stateRootPageCatalogDigestEnd, 272},
+		"stateRootPageCatalogBytesEnd":     {stateRootPageCatalogBytesEnd, 276},
+		"stateRootMaxKeyBytesEnd":          {stateRootMaxKeyBytesEnd, 280},
+		"stateRootInlineValueBytesEnd":     {stateRootInlineValueBytesEnd, 284},
+		"stateRootMaxDocumentBytesEnd":     {stateRootMaxDocumentBytesEnd, 288},
+		"stateRootPrimaryOffset":           {stateRootPrimaryOffset, 288},
+		"stateRootPrimaryEnd":              {stateRootPrimaryEnd, 320},
+		"stateRootJournalIDOffset":         {stateRootJournalIDOffset, 320},
+		"stateRootJournalIDEnd":            {stateRootJournalIDEnd, 336},
+		"stateRootExactIndexOffset":        {stateRootExactIndexOffset, 336},
+		"stateRootExactIndexEnd":           {stateRootExactIndexEnd, 368},
+		"stateRootReservedOffset":          {stateRootReservedOffset, 368},
+		"PageRefSize":                      {PageRefSize, 32},
+		"InlineSuperblockSize":             {InlineSuperblockSize, 4096},
+		"InlineFreeDeltaCapacity":          {InlineFreeDeltaCapacity, 106},
+		"SuperblockSize":                   {SuperblockSize, 128},
+		"MaterializationJournalSize":       {MaterializationJournalSize, 4096},
+		"MaterializationJournalHeaderSize": {MaterializationJournalHeaderSize, 112},
+		"MaterializationTargetRecordSize":  {MaterializationTargetRecordSize, 56},
+		"MaterializationPatchRecordSize":   {MaterializationPatchRecordSize, 16},
+		"MaterializationJournalMaxTargets": {MaterializationJournalMaxTargets, 6},
+		"MaterializationJournalMaxPatches": {MaterializationJournalMaxPatches, 7},
+		"MaterializationJournalMaxData":    {MaterializationJournalMaxData, 3584},
+		"PostingPagePayloadHeaderSize":     {PostingPagePayloadHeaderSize, 32},
+		"PostingSegmentHeaderSize":         {PostingSegmentHeaderSize, 48},
 	} {
 		if gotWant[0] != gotWant[1] {
 			t.Errorf("%s = %d, want format-0 value %d", name, gotWant[0], gotWant[1])
@@ -727,7 +727,7 @@ func TestFormat0GoldensRejectCorruptionAndPriorPageVersion(t *testing.T) {
 		t.Fatalf("resealed StateRoot reserve = %v", err)
 	}
 
-	for _, prior := range []uint16{2, 3} {
+	for _, prior := range []uint16{2, 3, 4} {
 		state = append([]byte(nil), readFormat0Golden(t, "empty_state_root_page")...)
 		binary.LittleEndian.PutUint16(state[8:10], prior)
 		resealFormat0Page(state)
@@ -820,24 +820,5 @@ func TestFormat0GoldensRejectCorruptionAndPriorPageVersion(t *testing.T) {
 		err, ErrMaterializationJournalCorrupt,
 	) {
 		t.Fatalf("journal checksum bit = %v", err)
-	}
-
-	// In the immediately superseded layout common-page version 2, durable kind
-	// 7 meant PageTTLDirectory. In format 0's current version 3 it means
-	// PageIndexPosting. A checksum-valid legacy envelope must therefore fail
-	// before its kind can be dispatched to the posting decoder.
-	removedTTL := append([]byte(nil), readFormat0Golden(t, "posting_page")...)
-	binary.LittleEndian.PutUint16(removedTTL[8:10], 2)
-	resealFormat0Page(removedTTL)
-	if PageKind(removedTTL[12]) != PageIndexPosting {
-		t.Fatalf("removed-TTL test kind = %d, want current posting kind", removedTTL[12])
-	}
-	if _, _, err := OpenPage(removedTTL); !errors.Is(err, ErrPageCorrupt) {
-		t.Fatalf("version-2 removed-TTL numbering = %v", err)
-	}
-	if _, err := OpenPostingPage(removedTTL, 32, 2); !errors.Is(
-		err, ErrPostingPageCorrupt,
-	) {
-		t.Fatalf("posting decoder accepted removed-TTL numbering: %v", err)
 	}
 }

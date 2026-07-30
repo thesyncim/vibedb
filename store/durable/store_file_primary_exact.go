@@ -956,12 +956,11 @@ func primaryExactIndexPageBound(
 	records []storeio.PrimaryGraphRecord,
 	indexes []*store.ExactIndex,
 	maxPageSize uint32,
-	policy storeio.PrimaryLeafClassPolicy,
 ) (int, error) {
 	if len(indexes) == 0 {
 		return 0, nil
 	}
-	spans, err := storeio.PrimaryGraphLeafSpans(storeID, records, policy)
+	spans, err := storeio.PrimaryGraphLeafSpans(storeID, records)
 	if err != nil {
 		return 0, err
 	}

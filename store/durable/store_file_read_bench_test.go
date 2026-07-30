@@ -5,8 +5,10 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -35,7 +37,7 @@ func benchReadKey(i int) string { return fmt.Sprintf("user-%09d", i) }
 // resident budget is deliberately larger than the file: this benchmark exists
 // to measure the warm, no-I/O read path, and any miss would measure the device
 // instead.
-func openBenchReadCollection(tb testing.TB, count int, format DocumentFormat) (*Collection, func()) {
+func openBenchReadCollection(tb testing.TB, count int) (*Collection, func()) {
 	tb.Helper()
 	path := filepath.Join(tb.TempDir(), "read.vibe")
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
@@ -55,7 +57,7 @@ func openBenchReadCollection(tb testing.TB, count int, format DocumentFormat) (*
 	if err != nil {
 		tb.Fatal(err)
 	}
-	options := Options{ResidentBytes: 64 << 20, Backend: BackendPortable, DocumentFormat: format}
+	options := Options{ResidentBytes: 64 << 20, Backend: BackendPortable}
 	if _, err := CreateFromPrimary(built, file, options); err != nil {
 		tb.Fatal(err)
 	}
@@ -91,7 +93,7 @@ func BenchmarkFileStorePointRead(b *testing.B) {
 	if testing.Short() {
 		b.Skip("100k-document corpus is too slow for -short")
 	}
-	collection, done := openBenchReadCollection(b, benchReadCorpusSize, DocumentFormatVerbatim)
+	collection, done := openBenchReadCollection(b, benchReadCorpusSize)
 	defer done()
 	order := benchReadProbeOrder(benchReadCorpusSize)
 
@@ -162,68 +164,6 @@ func reportReadResidency(b *testing.B, stats, base Stats) {
 	b.ReportMetric(float64(stats.PageReads-base.PageReads)/float64(b.N), "reads/op")
 }
 
-// openBenchScanCollection builds the same corpus through repeated writes rather
-// than CreateFrom, so the store under measurement holds verbatim contiguous
-// PageDocument extents instead of the compact PageDocumentGroup form.
-//
-// Both representations have to be measured separately because they do
-// completely different work per row: an ordinary page hands back a borrowed
-// slice of the page, while a group decodes a per-row token stream against a
-// shape template and a value dictionary. Reporting only one of them would hide
-// whichever is being paid for.
-func openBenchScanCollection(tb testing.TB, count int) (*Collection, func()) {
-	tb.Helper()
-	path := filepath.Join(tb.TempDir(), "scan.vibe")
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	options := Options{ResidentBytes: 256 << 20, Backend: BackendPortable}
-	collection, err := Create(file, options)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	// Batched so building the corpus costs one published generation per batch
-	// instead of per document; the resulting page layout is the same either way.
-	for start := 0; start < count; start += 64 {
-		end := min(start+64, count)
-		if err := collection.Update(func(batch *WriteBatch) error {
-			for i := start; i < end; i++ {
-				// Corpus build (untimed setup): a per-key []byte conversion here
-				// is not measured.
-				if err := batch.Put([]byte(benchReadKey(i)), benchReadDocument(i)); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			tb.Fatal(err)
-		}
-	}
-	if err := collection.Close(); err != nil {
-		tb.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		tb.Fatal(err)
-	}
-	// Reopen so the measured cache is a reader's cold-started one rather than
-	// the writer's, which is still holding the frames it just admitted dirty.
-	reopened, err := os.OpenFile(path, os.O_RDWR, 0o600)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	reader, err := Open(reopened, options)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return reader, func() {
-		if closeErr := reader.Close(); closeErr != nil {
-			tb.Fatal(closeErr)
-		}
-		_ = reopened.Close()
-	}
-}
-
 // reportScanPerDocument converts one whole-store pass into per-document cost
 // and, beside it, page acquisitions per document. The second number is the one
 // that says whether a scan amortizes its buffer pool over a chunk: at the
@@ -275,24 +215,15 @@ func benchmarkFileStoreScan(b *testing.B, collection *Collection) {
 	reportScanPerDocument(b, collection, base, benchReadCorpusSize)
 }
 
-// BenchmarkFileStoreScan is the warm full-scan path for both document
-// representations Options.DocumentFormat selects between. The gap between the
-// arms is the number that decides whether the compact format is worth its
-// space saving for a given workload, so they are reported side by side.
+// BenchmarkFileStoreScan is the warm full-scan path for the unified bulk
+// representation.
 func BenchmarkFileStoreScan(b *testing.B) {
 	if testing.Short() {
 		b.Skip("100k-document corpus is too slow for -short")
 	}
-	b.Run("verbatim", func(b *testing.B) {
-		collection, done := openBenchScanCollection(b, benchReadCorpusSize)
-		defer done()
-		benchmarkFileStoreScan(b, collection)
-	})
-	b.Run("compact", func(b *testing.B) {
-		collection, done := openBenchReadCollection(b, benchReadCorpusSize, DocumentFormatCompact)
-		defer done()
-		benchmarkFileStoreScan(b, collection)
-	})
+	collection, done := openBenchReadCollection(b, benchReadCorpusSize)
+	defer done()
+	benchmarkFileStoreScan(b, collection)
 }
 
 // BenchmarkFileStoreScanMasked is the selective shape query execution produces
@@ -303,17 +234,67 @@ func BenchmarkFileStoreScanMasked(b *testing.B) {
 	if testing.Short() {
 		b.Skip("100k-document corpus is too slow for -short")
 	}
-	collection, done := openBenchScanCollection(b, benchReadCorpusSize)
+	collection, done := openBenchReadCollection(b, benchReadCorpusSize)
 	defer done()
 	snapshot, err := collection.Snapshot()
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer snapshot.Close()
-	chunks := int(collection.Stats().LiveChunks)
-	masks := make([]store.Mask, 0, chunks)
-	for chunk := range chunks {
-		masks = append(masks, store.Mask{Chunk: uint32(chunk), Bits: 1 << 3})
+	// Ordered-primary stores intentionally retire the legacy LiveChunks
+	// counter, and a fixed slot bit is not guaranteed to name a row in the
+	// stable hash directory. Derive one real occupied slot per live tile from
+	// the admitted unified leaves so setup does not benchmark an empty scan.
+	router := collection.primaryRouter.Load()
+	if router == nil {
+		b.Fatal("ordered-primary router is unavailable")
+	}
+	byChunk := make(map[uint32]uint64, router.Len()*2)
+	bounds := collection.primaryLeafBounds(snapshot.state)
+	for rank := 0; rank < router.Len(); rank++ {
+		route, ok := router.RouteAtRank(rank)
+		if !ok {
+			b.Fatalf("primary route %d is unavailable", rank)
+		}
+		lease, acquireErr := router.AcquireLeaf(collection.cache, route)
+		if acquireErr != nil {
+			b.Fatal(acquireErr)
+		}
+		view, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+			lease.Page(), snapshot.state.root.StoreID, route.Bucket, bounds,
+		)
+		if !admitted {
+			lease.Release()
+			b.Fatalf("primary bucket %d is not unified", route.Bucket)
+		}
+		slots, slotsOK := view.PostingSlots()
+		if !slotsOK {
+			lease.Release()
+			b.Fatalf("primary bucket %d has invalid posting slots", route.Bucket)
+		}
+		for row := 0; row < view.Len(); row++ {
+			slot := slots[row]
+			chunk := uint32(route.Bucket)<<2 | uint32(slot>>6)
+			if _, exists := byChunk[chunk]; !exists {
+				byChunk[chunk] = uint64(1) << uint(slot&63)
+			}
+		}
+		lease.Release()
+	}
+	chunks := make([]uint32, 0, len(byChunk))
+	for chunk := range byChunk {
+		chunks = append(chunks, chunk)
+	}
+	slices.Sort(chunks)
+	masks := make([]store.Mask, 0, len(chunks))
+	for _, chunk := range chunks {
+		masks = append(masks, store.Mask{
+			Chunk: chunk,
+			Bits:  byChunk[chunk],
+		})
+	}
+	if len(masks) == 0 {
+		b.Fatal("masked benchmark found no live posting tiles")
 	}
 	var scratch []byte
 	seen := 0

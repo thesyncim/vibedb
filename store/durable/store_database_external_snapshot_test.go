@@ -142,8 +142,11 @@ func TestSnapshotCollectionsSealsDeferredPrimaryBeforeCapture(t *testing.T) {
 	if _, err := collection.Put([]byte("k"), []byte(`{"v":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if len(collection.primaryPendingParents) == 0 {
-		t.Fatal("test did not establish a deferred primary parent")
+	if !collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("test did not establish a deferred class-5 row")
+	}
+	if len(collection.primaryPendingParents) != 0 {
+		t.Fatal("class-5 row update unexpectedly entered the structural parent lane")
 	}
 	catalog, err := SnapshotCollections([]NamedCollection{{
 		Name: "docs", Collection: collection,
@@ -153,7 +156,10 @@ func TestSnapshotCollectionsSealsDeferredPrimaryBeforeCapture(t *testing.T) {
 	}
 	defer catalog.Close()
 	if len(collection.primaryPendingParents) != 0 {
-		t.Fatal("external snapshot left deferred primary parents unsealed")
+		t.Fatal("external snapshot left structural primary parents unsealed")
+	}
+	if collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("external snapshot left the class-5 row overlay unfolded")
 	}
 	snapshot, ok := catalog.Collection("docs")
 	if !ok || snapshot == nil || snapshot.Len() != 1 {

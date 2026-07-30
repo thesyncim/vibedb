@@ -110,8 +110,8 @@ func TestFileBufferedJournalConcurrentPointReadVisibility(t *testing.T) {
 				switch op % 3 {
 				case 0, 1: // update in place / COW
 					doc := fmt.Appendf(nil,
-						`{"id":%d,"group":%d,"name":"primary row %d"}`,
-						at, (at+op)%997, at,
+						`{"group":%d,"id":%d,"name":"primary row %d"}`,
+						(at+op)%997, at, at,
 					)
 					if _, putErr := collection.Put([]byte(keys[at]), doc); putErr != nil {
 						errs[worker] = fmt.Errorf("put %q: %w", keys[at], putErr)

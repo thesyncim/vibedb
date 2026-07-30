@@ -2,6 +2,7 @@ package durable
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"testing"
 
@@ -53,7 +54,7 @@ func buildPrimaryOpenTestFile(
 	for at := range records {
 		records[at] = storeio.PrimaryGraphRecord{
 			Key:   []byte{byte(at >> 8), byte(at), 1},
-			Value: []byte{byte(at), 1},
+			Value: fmt.Appendf(nil, `{"v":%d}`, at),
 		}
 	}
 	primaryRoot, err := storeio.BuildPrimaryGraph(tx, records)

@@ -38,7 +38,7 @@ selectivity. A cross-engine number is not publishable unless both pass.
 | Workload | What it measures |
 | --- | --- |
 | `BenchmarkBulkLoad` | whole-corpus batch construction, with and without a secondary index |
-| `BenchmarkBulkLoadVariants` | durable verbatim bulk, compact bulk, mutation replay, and untuned replay at three sizes |
+| `BenchmarkBulkLoadVariants` | durable unified bulk, mutation replay, and untuned replay at three sizes |
 | `BenchmarkPointRead` | one document by key |
 | `BenchmarkPointWrite` | replacement with a growing value |
 | `BenchmarkPointWriteSameSize` | replacement without length or indexed-value change |
@@ -52,7 +52,8 @@ selectivity. A cross-engine number is not publishable unless both pass.
 | `BenchmarkParse` | JSON extraction without storage |
 
 The in-memory engine is an upper-bound diagnostic, not a durable competitor.
-Verbatim bulk, compact bulk, and `Put` replay are distinct artifacts.
+Unified bulk and `Put` replay are distinct construction artifacts over the
+same durable format.
 
 ## Core runs
 
@@ -127,9 +128,9 @@ length while preserving shape and filter selectivity:
 go test -run '^$' -bench=. -cardinality=high .
 ```
 
-Neither corpus is declared realistic. Together they expose how much a
-dictionary-based representation depends on redundancy. Disk results always
-show both, and explicitly compact output remains separate from verbatim output.
+Neither corpus is declared realistic. Together they expose how much the
+unified grammar's per-leaf dictionary benefits from redundancy. Disk results
+always show both; there is no separate compact/verbatim store-mode axis.
 
 ## Footprint
 
@@ -144,8 +145,6 @@ for cardinality in low high; do
   done
   /tmp/vibedb-footprint -engine=vibejson-durable \
     -putloop -cardinality="$cardinality"
-  /tmp/vibedb-footprint -engine=vibejson-durable \
-    -compact -cardinality="$cardinality"
 done
 ```
 
@@ -173,4 +172,5 @@ Before editing [RESULTS.md](RESULTS.md), apply every rule in
 [docs/performance.md](../../docs/performance.md): matched semantics and
 durability, repeated isolated samples, explicit machine/commit/lane
 provenance, both scan meanings, both disk meanings, cardinality controls,
-separate durable representations, and all tuning disclosed.
+one durable representation at both cardinalities, separate bulk/replay
+construction results, and all tuning disclosed.

@@ -338,9 +338,14 @@ func TestFileStoreFreeSetSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 	}
 	splitSize := fileSizeOf(t, split.Name())
 
-	// One page per restart of slack, for the reopened store's first commit
-	// landing before its own reclamation has anything to offer it.
-	allowance := abandoned + uint64(sessions*options.PageSize)
+	// One root page per restart plus one largest class-5 extent overall is the
+	// bounded geometry slack: each reopened store's first root may land before
+	// reclamation has anything to offer it, and the multi-session packing
+	// boundary may retain one alternate wide leaf that a continuous session
+	// reuses internally. Anything beyond that must be explained by extents still
+	// fenced at Close.
+	allowance := abandoned +
+		uint64(sessions*options.PageSize+options.MaxPageSize)
 	t.Logf("one session = %d bytes, %d sessions = %d bytes, excess %d, allowance %d "+
 		"(%d bytes of extents were still fenced across the eight Closes)",
 		singleSize, sessions, splitSize, splitSize-singleSize, allowance, abandoned)
@@ -739,23 +744,28 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 	options.BufferCount = 4096
 	options.MaxRetiredExtents = 4096
 	// A batch cannot split a fresh leaf mid-fold, so the seed batch's documents
-	// must fit one leaf. Sixteen ~330-byte documents stay within that budget; the
-	// collection has split into several leaves by the time the later batches land,
+	// must fit one leaf. Sixteen ~1.2 KiB documents stay within that budget; the
+	// collection has split into many leaves by the time the later batches land,
 	// and the spill this test asserts comes from the retirement volume of deleting
 	// every key, not from any single batch's width.
 	options.MaxBatchDocuments = 16
+	options.InlineValueBytes = 2048
 	options.ResidentBytes = 32 << 20
 	fs, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	const documents = 512
+	// Class 5's denser leaves and exact retirement coalescing keep the former
+	// 512 small-row workload below the 106-record inline root. A wider corpus
+	// still runs quickly but creates enough independently retired extents to
+	// prove the external spill/replay path remains live.
+	const documents = 2048
 	for base := 0; base < documents; base += options.MaxBatchDocuments {
 		if err := fs.Update(func(batch *WriteBatch) error {
 			for i := base; i < base+options.MaxBatchDocuments; i++ {
 				value := []byte(fmt.Sprintf(
-					`{"id":%d,"padding":%q}`, i, strings.Repeat("x", 300),
+					`{"id":%d,"padding":%q}`, i, strings.Repeat("x", 1200),
 				))
 				if err := batch.Put([]byte(fmt.Sprintf("spill-%03d", i)), value); err != nil {
 					return err

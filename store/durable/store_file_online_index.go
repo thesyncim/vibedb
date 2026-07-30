@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,11 +20,12 @@ var ErrIndexBuildInProgress = errors.New(
 )
 
 type onlineIndexBucket struct {
-	ref       storeio.PageRef
-	live      [4]uint64
-	terms     map[string]uint16
-	termMasks [][4]uint64
-	keyArena  []byte
+	ref            storeio.PageRef
+	overlayVersion uint64
+	live           [4]uint64
+	terms          map[string]uint16
+	termMasks      [][4]uint64
+	keyArena       []byte
 }
 
 type onlineIndexTermSource struct {
@@ -360,7 +362,12 @@ func (b *onlineIndexBuild) reconcileOneLocked(
 		}
 		b.nextRank++
 		checked++
-		if previous, exists := b.buckets[route.Bucket]; exists && previous.ref == route.Ref {
+		overlayVersion := c.primaryUnifiedOverlay.bucketVersion(
+			route.Bucket, state.root.Generation,
+		)
+		if previous, exists := b.buckets[route.Bucket]; exists &&
+			previous.ref == route.Ref &&
+			previous.overlayVersion == overlayVersion {
 			continue
 		}
 		bucket, err := b.scanBucket(c, state, router, route)
@@ -399,7 +406,11 @@ func (b *onlineIndexBuild) scanBucket(
 	route storeio.ResidentPrimaryRoute,
 ) (onlineIndexBucket, error) {
 	bucket := onlineIndexBucket{
-		ref: route.Ref, terms: make(map[string]uint16, 32),
+		ref: route.Ref,
+		overlayVersion: c.primaryUnifiedOverlay.bucketVersion(
+			route.Bucket, state.root.Generation,
+		),
+		terms:     make(map[string]uint16, 32),
 		termMasks: make([][4]uint64, 0, 32),
 		keyArena:  make([]byte, 0, 1024),
 	}
@@ -415,54 +426,134 @@ func (b *onlineIndexBuild) scanBucket(
 		scratch    []byte
 	)
 	bounds := c.primaryLeafBounds(state)
-	scratch, err = storeio.VisitPrimaryLeafPostingRows(
-		lease.Page(), state.root.StoreID, route.Bucket, bounds, scratch,
-		func(slot uint8, _, raw []byte, outOfLine bool) error {
-			if outOfLine {
-				var resolveErr error
-				overflow, resolveErr = c.appendPrimaryOverflowValue(
-					overflow[:0],
-					storeio.DecodePrimaryOverflowRef(raw), bounds,
-				)
-				if resolveErr != nil {
-					return resolveErr
-				}
-				raw = overflow
-			}
-			quadrant := slot >> 6
-			bit := uint64(1) << uint(slot&63)
-			bucket.live[quadrant] |= bit
-			key, present, termErr := appendPrimaryExactDocumentTerm(
-				canonical[:0], components[:], b.exact, raw,
+	visit := func(slot uint8, raw []byte, outOfLine bool) error {
+		if outOfLine {
+			var resolveErr error
+			overflow, resolveErr = c.appendPrimaryOverflowValue(
+				overflow[:0],
+				storeio.DecodePrimaryOverflowRef(raw), bounds,
 			)
-			if termErr != nil || !present {
-				return termErr
+			if resolveErr != nil {
+				return resolveErr
 			}
-			identity := byteview.String(key)
-			termID, exists := bucket.terms[identity]
-			if !exists {
-				if len(bucket.termMasks) == int(^uint16(0)) {
-					return storeio.ErrInvalidWrite
-				}
-				termID = uint16(len(bucket.termMasks))
-				start := len(bucket.keyArena)
-				bucket.keyArena = append(bucket.keyArena, key...)
-				stored := byteview.String(
-					bucket.keyArena[start:len(bucket.keyArena):len(bucket.keyArena)],
-				)
-				bucket.terms[stored] = termID
-				bucket.termMasks = append(
-					bucket.termMasks, [4]uint64{},
-				)
+			raw = overflow
+		}
+		quadrant := slot >> 6
+		bit := uint64(1) << uint(slot&63)
+		bucket.live[quadrant] |= bit
+		key, present, termErr := appendPrimaryExactDocumentTerm(
+			canonical[:0], components[:], b.exact, raw,
+		)
+		if termErr != nil || !present {
+			return termErr
+		}
+		identity := byteview.String(key)
+		termID, exists := bucket.terms[identity]
+		if !exists {
+			if len(bucket.termMasks) == int(^uint16(0)) {
+				return storeio.ErrInvalidWrite
 			}
-			bucket.termMasks[termID][quadrant] |= bit
-			return nil
-		},
-	)
-	_ = scratch
-	if err != nil {
-		return onlineIndexBucket{}, err
+			termID = uint16(len(bucket.termMasks))
+			start := len(bucket.keyArena)
+			bucket.keyArena = append(bucket.keyArena, key...)
+			stored := byteview.String(
+				bucket.keyArena[start:len(bucket.keyArena):len(bucket.keyArena)],
+			)
+			bucket.terms[stored] = termID
+			bucket.termMasks = append(
+				bucket.termMasks, [4]uint64{},
+			)
+		}
+		bucket.termMasks[termID][quadrant] |= bit
+		return nil
 	}
+	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		lease.Page(), state.root.StoreID, route.Bucket, bounds,
+	)
+	if !ok {
+		return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
+	}
+	slots, ok := unified.PostingSlots()
+	if !ok {
+		return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
+	}
+	overlay := c.primaryUnifiedOverlay
+	var overlayIndexes [primaryUnifiedOverlayRecords]uint16
+	overlayCount := overlay.latestBucketRecords(
+		&overlayIndexes, route.Bucket, state.root.Generation,
+	)
+	baseRank, overlayAt := 0, 0
+	for baseRank < unified.Len() || overlayAt < overlayCount {
+		var baseKey, baseBody []byte
+		var baseOverflow bool
+		if baseRank < unified.Len() {
+			var rowOK bool
+			baseKey, baseBody, baseOverflow, rowOK =
+				unified.RowRawAt(baseRank)
+			if !rowOK {
+				return onlineIndexBucket{},
+					storeio.ErrPrimaryExactIndexCorrupt
+			}
+		}
+		var record *primaryUnifiedOverlayRecord
+		var overlayKey []byte
+		if overlayAt < overlayCount {
+			record = &overlay.records[overlayIndexes[overlayAt]]
+			keyEnd := record.keyOffset + uint32(record.keyLen)
+			if keyEnd > uint32(len(overlay.arena)) {
+				return onlineIndexBucket{},
+					storeio.ErrPrimaryExactIndexCorrupt
+			}
+			overlayKey = overlay.arena[record.keyOffset:keyEnd:keyEnd]
+		}
+		order := 0
+		switch {
+		case baseRank >= unified.Len():
+			order = 1
+		case overlayAt >= overlayCount:
+			order = -1
+		default:
+			order = bytes.Compare(baseKey, overlayKey)
+		}
+		if order < 0 {
+			if baseOverflow {
+				err = visit(slots[baseRank], baseBody, true)
+			} else {
+				scratch = unified.AppendAdmittedRowBody(
+					scratch[:0], baseBody,
+				)
+				err = visit(slots[baseRank], scratch, false)
+			}
+			if err != nil {
+				return onlineIndexBucket{}, err
+			}
+			baseRank++
+			continue
+		}
+		if record.kind == primaryUnifiedOverlayPut {
+			valueEnd := record.valueOff + record.valueLen
+			if record.valueLen == 0 ||
+				valueEnd > uint32(len(overlay.arena)) {
+				return onlineIndexBucket{},
+					storeio.ErrPrimaryExactIndexCorrupt
+			}
+			err = visit(
+				record.slot,
+				overlay.arena[record.valueOff:valueEnd:valueEnd],
+				false,
+			)
+			if err != nil {
+				return onlineIndexBucket{}, err
+			}
+		} else if record.kind != primaryUnifiedOverlayDelete {
+			return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
+		}
+		overlayAt++
+		if order == 0 {
+			baseRank++
+		}
+	}
+	_ = scratch
 	return bucket, nil
 }
 
@@ -685,7 +776,7 @@ func (c *Collection) encodeOnlineIndexBuckets(
 }
 
 func (b *onlineIndexBuild) matches(
-	router *storeio.ResidentPrimaryRouter,
+	c *Collection, router *storeio.ResidentPrimaryRouter,
 ) bool {
 	if router == nil || router.Len() != len(b.buckets) {
 		return false
@@ -696,7 +787,10 @@ func (b *onlineIndexBuild) matches(
 			return false
 		}
 		bucket, exists := b.buckets[route.Bucket]
-		if !exists || bucket.ref != route.Ref {
+		if !exists || bucket.ref != route.Ref ||
+			bucket.overlayVersion != c.primaryUnifiedOverlay.bucketVersion(
+				route.Bucket, router.Generation(),
+			) {
 			return false
 		}
 	}
@@ -716,7 +810,7 @@ func (b *onlineIndexBuild) matchesStable(
 		return 0, false
 	}
 	before := router.Generation()
-	if !b.matches(router) {
+	if !b.matches(c, router) {
 		return 0, false
 	}
 	after := router.Generation()

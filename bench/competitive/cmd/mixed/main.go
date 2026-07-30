@@ -161,7 +161,6 @@ func main() {
 	)
 	indexed := flag.Bool("indexed", false, "maintain the country secondary index")
 	putloop := flag.Bool("putloop", false, "store/durable only: load by replaying Put")
-	compact := flag.Bool("compact", false, "store/durable only: explicitly use compact bulk documents")
 	card := flag.String("cardinality", "low", "low or high corpus cardinality")
 	list := flag.Bool("list", false, "list engines and workloads")
 	header := flag.Bool("header", false, "print the table header first")
@@ -189,9 +188,6 @@ func main() {
 	if *clients > *operations {
 		fail("mixed: -clients=%d exceeds -operations=%d (each client needs at least one measured op)", *clients, *operations)
 	}
-	if *compact && (*engineName != "vibejson-durable" || *putloop) {
-		fail("mixed: -compact requires vibejson-durable bulk mode")
-	}
 	factory, ok := competitive.FactoryNamed(*engineName)
 	if !ok {
 		fail("mixed: unknown engine %q", *engineName)
@@ -218,7 +214,6 @@ func main() {
 		Indexed:    *indexed,
 		CacheBytes: competitive.DefaultCacheBytes,
 		PutLoop:    *putloop,
-		Compact:    *compact,
 	})
 	check(err)
 	defer engine.Close()
@@ -367,7 +362,7 @@ func main() {
 	checkpointLatencies := measuredCoord.latencies
 
 	seen := make([]bool, len(docs))
-	var expected []byte
+	var expected, submitted []byte
 	check(engine.Visit(func(key string, value []byte) error {
 		const prefix = "doc:"
 		if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
@@ -382,9 +377,13 @@ func main() {
 		}
 		seen[ord] = true
 		if updated[ord] {
-			expected = competitive.AppendSameSizeUpdatedJSON(expected[:0], docs, ord)
+			submitted = competitive.AppendSameSizeUpdatedJSON(submitted[:0], docs, ord)
 		} else {
-			expected = append(expected[:0], docs[ord].JSON...)
+			submitted = append(submitted[:0], docs[ord].JSON...)
+		}
+		expected, err = competitive.AppendExpectedStoredJSON(expected[:0], *engineName, submitted)
+		if err != nil {
+			return fmt.Errorf("final value canonicalization for %q: %w", key, err)
 		}
 		if !bytes.Equal(value, expected) {
 			return fmt.Errorf("final value mismatch for %q", key)
@@ -445,10 +444,8 @@ func main() {
 	if factory.Name == "vibejson-durable" {
 		if *putloop {
 			reportName += "/put"
-		} else if *compact {
-			reportName += "/bulk-compact"
 		} else {
-			reportName += "/bulk-verbatim"
+			reportName += "/bulk-unified"
 		}
 	}
 	if *header {

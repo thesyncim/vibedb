@@ -87,7 +87,7 @@ vibejson buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1
 func TestValidateMixedRowsChecksRequestedConfiguration(t *testing.T) {
 	header, rows, err := parseMixedOutput([]byte(
 		`engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
-vibejson-durable/bulk-verbatim buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
+vibejson-durable/bulk-unified buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
 `,
 	))
 	if err != nil {

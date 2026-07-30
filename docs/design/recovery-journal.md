@@ -1,11 +1,12 @@
 # Recovery-only redo journal
 
 **Status:** implemented on the ordered primary graph. `DurabilitySync`
-acknowledges through the journal, and buffered-visible gains the same
-per-mutation durable acknowledgement with `Options.RecoveryJournal`. Readers
-still consult canonical frames only. What remains projected is the *win*: a
-competitive refresh that measures the single-fence sync lane against SQLite,
-cross-writer group commit, and a Linux FUA record write.
+acknowledges through the journal. Every buffered-visible store also owns one:
+ordinary `Flush` uses a single batch sync for eligible class-5 update/delete
+intervals, while `Options.RecoveryJournal` selects per-mutation durable
+acknowledgement. Readers still consult canonical frames only. What remains
+projected is a competitive refresh of the per-mutation single-fence lane
+against SQLite, cross-writer group commit, and a Linux FUA record write.
 
 **Idea:** sync a bounded redo record in a separate file for acknowledgement,
 while readers continue to use canonical frames only. A checkpoint later folds
@@ -52,12 +53,19 @@ empty state.
     publish; the journal sync sits at that point of no return, after
     journal capacity for the record is already reserved so the append cannot
     meet a full journal.
-  - Buffered-visible applies and publishes first, then appends and syncs the
-    record (`journalAckLocked`, after `publishFileState`). Its acknowledgement
-    contract already permits a volatile window, so the cheaper
-    apply-then-journal order is correct there, and a full journal folds into a
-    checkpoint instead of poisoning.
+  - Buffered-visible with `Options.RecoveryJournal` applies and publishes
+    first, then appends and syncs the record (`journalAckLocked`, after
+    `publishFileState`). Its acknowledgement contract already permits a
+    volatile window, so the cheaper apply-then-journal order is correct there,
+    and a full journal folds into a checkpoint instead of poisoning.
   Acknowledgement returns after that single bounded append plus sync.
+- Ordinary buffered-visible does no journal I/O on mutation admission. On
+  `Flush`, a complete consecutive interval of class-5 replacement records is
+  framed as one batch and synced once over the unchanged physical root.
+  Repeated keys are intentionally not coalesced because recovery advances one
+  exact logical generation per entry. Structural edits, batches, overflow
+  values, incomplete intervals, and bounded pressure fall back to the full
+  physical checkpoint. `Close` always folds and recycles.
 - Readers never consult the journal. Visibility comes from the canonical
   frames, exactly as before; the journal is write-only until recovery.
 - Checkpoints materialize dirty frames, publish the alternate root, then
@@ -83,8 +91,9 @@ empty state.
   sync path waits on `committer.Wait`, and the sync-mode outer generation stays
   zero so the fence guard is skipped. The journal is therefore minted
   UNCONDITIONALLY for primary `DurabilitySync` — it is how sync acknowledges,
-  not an option (`syncJournalLane`) — while `Options.RecoveryJournal` is the
-  opt-in only for buffered-visible. A chunk-layout `DurabilitySync` store has no
+  not an option (`syncJournalLane`) — while `Options.RecoveryJournal` selects
+  the per-mutation acknowledgement policy for buffered-visible. A chunk-layout
+  `DurabilitySync` store has no
   journal mutation lane and keeps the chain fence (`chainFenceSync`) until the
   chunk store is deleted; requesting a journal on a layout that cannot feed it
   fails closed (`ErrRecoveryJournalRequiresPrimary`).

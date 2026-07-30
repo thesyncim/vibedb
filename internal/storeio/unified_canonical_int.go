@@ -20,6 +20,18 @@ import "strconv"
 // proof one-directional.
 const CanonicalIntMaxDigits = 18
 
+const canonicalDecimalPairs = "" +
+	"00010203040506070809" +
+	"10111213141516171819" +
+	"20212223242526272829" +
+	"30313233343536373839" +
+	"40414243444546474849" +
+	"50515253545556575859" +
+	"60616263646566676869" +
+	"70717273747576777879" +
+	"80818283848586878889" +
+	"90919293949596979899"
+
 // CanonicalIntValue is the admission predicate: it reports whether spelling
 // is a canonical int token (§3.4) and, when it is, the int64 value whose
 // AppendCanonicalInt spelling is byte-identical to the input.
@@ -60,7 +72,54 @@ func CanonicalIntValue(spelling []byte) (int64, bool) {
 // byte-identical to the admitted spelling — the §3.4 identity the
 // differential test pins.
 func AppendCanonicalInt(dst []byte, v int64) []byte {
+	if v >= 0 && v < 1_000_000 {
+		return appendCanonicalUint6(dst, uint64(v))
+	}
+	if v < 0 && v > -1_000_000 {
+		dst = append(dst, '-')
+		return appendCanonicalUint6(dst, uint64(-v))
+	}
 	return strconv.AppendInt(dst, v, 10)
+}
+
+// appendCanonicalUint6 is the scan-dominant integer renderer. IDs, counters,
+// ordinals, and small measurements account for nearly all integer tokens; a
+// fixed digit-pair table avoids strconv's general base-10 setup on that lane.
+// Larger magnitudes retain strconv's heavily tuned generic path above.
+func appendCanonicalUint6(dst []byte, v uint64) []byte {
+	pair := func(value uint64) (byte, byte) {
+		at := value * 2
+		return canonicalDecimalPairs[at], canonicalDecimalPairs[at+1]
+	}
+	switch {
+	case v < 10:
+		return append(dst, byte(v)+'0')
+	case v < 100:
+		a, b := pair(v)
+		return append(dst, a, b)
+	case v < 1_000:
+		rest := v % 100
+		a, b := pair(rest)
+		return append(dst, byte(v/100)+'0', a, b)
+	case v < 10_000:
+		leading, rest := v/100, v%100
+		a, b := pair(leading)
+		c, d := pair(rest)
+		return append(dst, a, b, c, d)
+	case v < 100_000:
+		leading, rest := v/10_000, v%10_000
+		middle, trailing := rest/100, rest%100
+		a, b := pair(middle)
+		c, d := pair(trailing)
+		return append(dst, byte(leading)+'0', a, b, c, d)
+	default:
+		leading, rest := v/10_000, v%10_000
+		middle, trailing := rest/100, rest%100
+		a, b := pair(leading)
+		c, d := pair(middle)
+		e, f := pair(trailing)
+		return append(dst, a, b, c, d, e, f)
+	}
 }
 
 // AppendZigzagVarint appends the token payload encoding of §3.4: zigzag

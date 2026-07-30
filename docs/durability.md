@@ -12,7 +12,7 @@ honor successful writes and synchronization calls.
 
 | Contract | Go option | Acknowledgement and visibility | Stable-storage work | Loss window |
 | --- | --- | --- | --- | --- |
-| buffered-visible | `DurabilityBufferedVisible` | success after bounded canonical COW staging; immediately reader-visible | none on ordinary admission, unless `RecoveryJournal` is set (one redo append plus sync per mutation) | process or machine failure may lose every acknowledged generation after the last successful `Flush`, or after the last synced journal record when `RecoveryJournal` is set |
+| buffered-visible | `DurabilityBufferedVisible` | success after bounded canonical staging; immediately reader-visible | none on ordinary admission, unless `RecoveryJournal` is set (one redo append plus sync per mutation) | process or machine failure may lose every acknowledged generation after the last successful `Flush`, or after the last synced per-mutation record when `RecoveryJournal` is set |
 | async-stable-in-flight | `DurabilityAsyncVisible` | success after the bounded committer accepts the generation; immediately reader-visible | the background worker continuously writes ordered COW generations and roots | failure may lose acknowledged generations newer than `DurableGeneration`; `Flush` closes the window |
 | synchronous, power-safe | `DurabilitySync` (zero value) | success waits for one journal append plus its power-safe sync, then applies and publishes — visibility strictly follows durability | strongest supported platform sequence: one journaled record barrier per mutation | after success, recovery selects the acknowledged generation; before success, outcome may require reopen |
 
@@ -21,15 +21,17 @@ survival, not read ordering. Bounded staging or retirement pressure may force a
 buffered checkpoint before the requested cadence; `Stats.AutomaticCheckpoints`
 and `Stats.RetirementPressureCheckpoints` expose those events.
 
-`DurableGeneration` reports the newest generation whose final root boundary
-completed. `Flush` waits for or checkpoints the current reader-visible cut.
+`DurableGeneration` reports the newest generation protected by either a final
+root boundary or a completed buffered checkpoint-delta journal sync. `Flush`
+waits for or checkpoints the current reader-visible cut.
 `Close` rejects new work, drains or checkpoints accepted work, and releases
 resources; it does not close the caller's file.
 
 ## Checkpoint strengths
 
-`CheckpointStrength` applies only to buffered-visible `Flush` and `Close`. It
-does not weaken `DurabilitySync` or `DurabilityAsyncVisible`.
+`CheckpointStrength` applies only to buffered-visible `Flush` and `Close`,
+including the journal sync used by a bounded delta checkpoint. It does not
+weaken `DurabilitySync` or `DurabilityAsyncVisible`.
 
 | Strength | Go option | Contract |
 | --- | --- | --- |
@@ -88,6 +90,13 @@ the code does not retry dirty pages that the kernel may already have discarded.
 
 - Before `Flush`: the durable file names the previous checkpoint. All later
   acknowledged mutations may disappear after process or machine failure.
+- An ordinary class-5 update/delete cut can complete `Flush` by appending the
+  entire consecutive generation interval as one recovery-journal batch and
+  syncing it once. Before that sync recovery ignores the tail; after it,
+  recovery replays the exact cut over the previous physical root.
+- A structural mutation, incomplete delta interval, journal or overlay
+  pressure, snapshot materialization, or `Close` takes the full physical path
+  below and recycles the journal after the new root is durable.
 - During data writes or the first barrier: recovery selects the previous root.
 - After data persistence but before the alternate root is durable: the new
   pages are unreachable; recovery selects the previous root.
@@ -144,18 +153,17 @@ mutation against the poisoned live handle.
 ## Recovery journal
 
 On the ordered primary graph the [recovery-only redo journal][journal] backs
-`DurabilitySync`: it is minted unconditionally for a primary-layout synchronous
-store and is how that lane acknowledges — one bounded append plus one sync,
-before the mutation is applied and published — not an option. Buffered-visible
-opts in with `Options.RecoveryJournal` for the same per-mutation durable
-acknowledgement. Readers never consult it; the journal is write-only until
-recovery replays the records after the newest valid root's generation. The
-store root records the journal's identity, and recovery pairs the two files by
-identity, page geometry, and a base-generation epoch, failing closed on a
-missing or mismatched journal. A synchronous store whose root names no journal
-(created async-visible, reopened sync) acknowledges through the chain fence
-instead. See [the design][journal] for the record format, batch group-commit,
-and the projected competitive effects, which are not yet reflected in the
-published tables.
+`DurabilitySync`: it is minted unconditionally and is how that lane
+acknowledges — one bounded append plus one sync before publication — not an
+option. Every buffered-visible primary store also owns the paired journal.
+Without `Options.RecoveryJournal`, mutation acknowledgement stays volatile and
+`Flush` uses one bounded batch to protect an eligible update/delete interval.
+With the option, every mutation receives the synchronous-style durable record.
+Readers never consult the journal; recovery alone replays records after the
+newest valid root. The root records journal identity, and recovery pairs the
+files by identity, page geometry, and base-generation epoch, failing closed on
+a missing or mismatched sibling. A synchronous store whose root names no
+journal (created async-visible, reopened sync) acknowledges through the chain
+fence instead. See [the design][journal] for record and group-commit details.
 
 [journal]: design/recovery-journal.md

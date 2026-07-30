@@ -105,6 +105,13 @@ func TestRecoveryJournalOverflowMutationErrorLeavesNoDirtyResidue(t *testing.T) 
 	if _, err := coll.Put([]byte("warm"), journalValue(0)); err != nil {
 		t.Fatalf("warm put: %v", err)
 	}
+	// Settle the warm overlay before taking the dirty baseline. An out-of-line
+	// mutation cannot itself use the inline row overlay, so it first folds any
+	// pending class-5 rows; those reachable checkpoint frames are not residue
+	// from the later failed mutation.
+	if err := coll.Flush(); err != nil {
+		t.Fatalf("warm flush: %v", err)
+	}
 	dirtyBefore := coll.cache.Stats().DirtyBytes
 
 	fj.Program(storeio.JournalFaultPlan{

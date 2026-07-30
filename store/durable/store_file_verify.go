@@ -669,95 +669,29 @@ func (w *verifyWalker) walkLeaf(route storeio.SegmentedTabletRouterRoute) {
 			"read: %v", err)
 		return
 	}
-	// The class byte selects the decoder. Both openers prove common framing, the
-	// selecting PageRef, lexical order inside the leaf, and that BucketID matches
-	// the leaf logical identity the anchor routed to — the leaf half of "BucketIDs
-	// match locators, leaf keys within fences". checkLeafOrder then applies the
-	// cross-leaf order proof over the decoded keys, which is codec-agnostic.
-	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafTemplate {
-		tv, err := storeio.OpenCommonPrimaryTemplateLeaf(
-			page, w.storeID, route.Bucket, route.Ref,
-			w.root.Generation, w.leafBounds,
-		)
-		if err != nil {
-			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-				"open template: %v", err)
-			return
-		}
-		w.count("primary-leaf")
-		for rank := 0; rank < tv.Len(); rank++ {
-			key, _, ok := tv.RowAt(rank)
-			if !ok {
-				w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-					"template row %d", rank)
-				break
-			}
-			w.checkLeafOrder(route, key)
-		}
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+			"non-unified leaf class %d", storeio.PrimaryLeafClass(page))
 		return
 	}
-	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafCompact {
-		cv, err := storeio.OpenCommonPrimaryCompactLeaf(
-			page, w.storeID, route.Bucket, route.Ref,
-			w.root.Generation, w.leafBounds,
-		)
-		if err != nil {
-			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-				"open compact: %v", err)
-			return
-		}
-		w.count("primary-leaf")
-		for rank := 0; rank < cv.Len(); rank++ {
-			key, _, ok := cv.RowAt(rank)
-			if !ok {
-				w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-					"compact row %d", rank)
-				break
-			}
-			w.checkLeafOrder(route, key)
-		}
-		return
-	}
-	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafUnified {
-		uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
-			page, w.storeID, route.Bucket, route.Ref,
-			w.root.Generation, w.leafBounds,
-		)
-		if err != nil {
-			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-				"open unified: %v", err)
-			return
-		}
-		w.count("primary-leaf")
-		for rank := 0; rank < uv.Len(); rank++ {
-			key, ok := uv.RowAt(rank)
-			if !ok {
-				w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-					"unified row %d", rank)
-				break
-			}
-			w.checkLeafOrder(route, key)
-		}
-		return
-	}
-	// OpenCommonPrimaryLeaf additionally proves the succinct/hash structures and
-	// every overflow PageRef.
-	leaf, err := storeio.OpenCommonPrimaryLeaf(
-		page, w.storeID, route.Bucket, route.Ref, w.root.Generation, w.leafBounds,
+	uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
+		page, w.storeID, route.Bucket, route.Ref,
+		w.root.Generation, w.leafBounds,
 	)
 	if err != nil {
 		w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-			"open: %v", err)
+			"open unified: %v", err)
 		return
 	}
 	w.count("primary-leaf")
-	it := leaf.AllRows()
-	for {
-		row, ok := it.Next()
+	for rank := 0; rank < uv.Len(); rank++ {
+		key, ok := uv.RowAt(rank)
 		if !ok {
-			break
+			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
+				"unified row %d", rank)
+			return
 		}
-		w.checkLeafOrder(route, row.Key)
+		w.checkLeafOrder(route, key)
 	}
 }
 
@@ -961,33 +895,12 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Generation: header.Generation, Length: header.PageSize,
 			Kind: storeio.PagePrimaryLeaf,
 		}
-		leafValid := func() bool {
-			switch storeio.PrimaryLeafClass(buf[:extent]) {
-			case storeio.CommonPrimaryLeafTemplate:
-				_, err := storeio.OpenCommonPrimaryTemplateLeaf(
-					buf[:extent], bootstrap.StoreID, bucket, expected,
-					salvageSelectingGeneration, leafBounds,
-				)
-				return err == nil
-			case storeio.CommonPrimaryLeafCompact:
-				_, err := storeio.OpenCommonPrimaryCompactLeaf(
-					buf[:extent], bootstrap.StoreID, bucket, expected,
-					salvageSelectingGeneration, leafBounds,
-				)
-				return err == nil
-			case storeio.CommonPrimaryLeafUnified:
-				_, err := storeio.OpenCommonPrimaryUnifiedLeaf(
-					buf[:extent], bootstrap.StoreID, bucket, expected,
-					salvageSelectingGeneration, leafBounds,
-				)
-				return err == nil
-			}
-			_, err := storeio.OpenCommonPrimaryLeaf(
-				buf[:extent], bootstrap.StoreID, bucket, expected,
-				salvageSelectingGeneration, leafBounds,
-			)
-			return err == nil
-		}()
+		_, leafErr := storeio.OpenCommonPrimaryUnifiedLeaf(
+			buf[:extent], bootstrap.StoreID, bucket, expected,
+			salvageSelectingGeneration, leafBounds,
+		)
+		leafValid := storeio.PrimaryLeafClass(buf[:extent]) ==
+			storeio.CommonPrimaryLeafUnified && leafErr == nil
 		if !leafValid {
 			// Checksum-valid page in the leaf identity band but not a valid leaf.
 			offset += extent
@@ -1017,117 +930,35 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Generation: hit.generation, Length: uint32(hit.length),
 			Kind: storeio.PagePrimaryLeaf,
 		}
-		if storeio.PrimaryLeafClass(buf) == storeio.CommonPrimaryLeafTemplate {
-			tv, err := storeio.OpenCommonPrimaryTemplateLeaf(
-				buf, bootstrap.StoreID, bucket, expected,
-				salvageSelectingGeneration, leafBounds,
-			)
-			if err != nil {
-				return report, fmt.Errorf(
-					"vibejson: salvage re-open template leaf: %w", err,
-				)
-			}
-			report.BucketsKept++
-			for rank := 0; rank < tv.Len(); rank++ {
-				key, ti, ok := tv.RowAt(rank)
-				if !ok {
-					return report, fmt.Errorf(
-						"vibejson: salvage template row %d", rank,
-					)
-				}
-				records = append(records, salvagedRecord{
-					key:   append([]byte(nil), key...),
-					value: tv.AppendRawRank(nil, rank, ti),
-				})
-			}
-			continue
-		}
-		if storeio.PrimaryLeafClass(buf) == storeio.CommonPrimaryLeafCompact {
-			cv, err := storeio.OpenCommonPrimaryCompactLeaf(
-				buf, bootstrap.StoreID, bucket, expected,
-				salvageSelectingGeneration, leafBounds,
-			)
-			if err != nil {
-				return report, fmt.Errorf(
-					"vibejson: salvage re-open compact leaf: %w", err,
-				)
-			}
-			report.BucketsKept++
-			for rank := 0; rank < cv.Len(); rank++ {
-				key, ti, ok := cv.RowAt(rank)
-				if !ok {
-					return report, fmt.Errorf(
-						"vibejson: salvage compact row %d", rank,
-					)
-				}
-				records = append(records, salvagedRecord{
-					key:   append([]byte(nil), key...),
-					value: cv.AppendRawRank(nil, rank, ti),
-				})
-			}
-			continue
-		}
-		if storeio.PrimaryLeafClass(buf) == storeio.CommonPrimaryLeafUnified {
-			uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
-				buf, bootstrap.StoreID, bucket, expected,
-				salvageSelectingGeneration, leafBounds,
-			)
-			if err != nil {
-				return report, fmt.Errorf(
-					"vibejson: salvage re-open unified leaf: %w", err,
-				)
-			}
-			report.BucketsKept++
-			for rank := 0; rank < uv.Len(); rank++ {
-				key, body, overflow, ok := uv.RowRawAt(rank)
-				if !ok {
-					return report, fmt.Errorf(
-						"vibejson: salvage unified row %d", rank,
-					)
-				}
-				if overflow {
-					// Salvage skips out-of-line values for every class; the
-					// raw branch below records the same skip for its rows.
-					report.OverflowSkipped++
-					continue
-				}
-				value, rendered := uv.AppendRowBody(nil, body)
-				if !rendered {
-					return report, fmt.Errorf(
-						"vibejson: salvage unified row body %d", rank,
-					)
-				}
-				records = append(records, salvagedRecord{
-					key:   append([]byte(nil), key...),
-					value: value,
-				})
-			}
-			continue
-		}
-		leaf, err := storeio.OpenCommonPrimaryLeaf(
+		uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
 			buf, bootstrap.StoreID, bucket, expected,
 			salvageSelectingGeneration, leafBounds,
 		)
 		if err != nil {
-			// The scan already proved this exact extent opens; a failure here is an
-			// I/O change under a concurrent writer, which the quiescent-file contract
-			// forbids.
-			return report, fmt.Errorf("vibejson: salvage re-open leaf: %w", err)
+			return report, fmt.Errorf(
+				"vibejson: salvage re-open unified leaf: %w", err,
+			)
 		}
 		report.BucketsKept++
-		it := leaf.AllRows()
-		for {
-			row, ok := it.Next()
+		for rank := 0; rank < uv.Len(); rank++ {
+			key, body, overflow, ok := uv.RowRawAt(rank)
 			if !ok {
-				break
+				return report, fmt.Errorf(
+					"vibejson: salvage unified row %d", rank,
+				)
 			}
-			if row.Value.IsOverflow() || len(row.Value.Inline) == 0 {
+			if overflow {
 				report.OverflowSkipped++
 				continue
 			}
+			value, rendered := uv.AppendRowBody(nil, body)
+			if !rendered {
+				return report, fmt.Errorf(
+					"vibejson: salvage unified row body %d", rank,
+				)
+			}
 			records = append(records, salvagedRecord{
-				key:   append([]byte(nil), row.Key...),
-				value: append([]byte(nil), row.Value.Inline...),
+				key: append([]byte(nil), key...), value: value,
 			})
 		}
 	}

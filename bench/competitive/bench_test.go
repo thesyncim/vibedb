@@ -236,9 +236,8 @@ func BenchmarkBulkLoad(b *testing.B) {
 	}
 }
 
-// BenchmarkBulkLoadVariants isolates three choices that are easy to conflate
-// with store/durable: verbatim versus compact bulk output, mutation replay,
-// and leaving BufferCount at its default.
+// BenchmarkBulkLoadVariants compares the sole unified bulk output with
+// mutation replay and with leaving BufferCount at its default.
 //
 // Every variant is measured at more than one corpus size, because the previous
 // version of this benchmark ran a 5,000-document build and then invited
@@ -263,8 +262,7 @@ func BenchmarkBulkLoadVariants(b *testing.B) {
 		cfg     Config
 		maxSize int // 0 means every size
 	}{
-		{name: "bulk-verbatim-tuned", cfg: Config{}},
-		{name: "bulk-compact-tuned", cfg: Config{Compact: true}},
+		{name: "bulk-unified-tuned", cfg: Config{}},
 		{name: "putloop-tuned", cfg: Config{PutLoop: true}},
 		{name: "putloop-defaults", cfg: Config{PutLoop: true, Untuned: true}, maxSize: 1000},
 	}
@@ -336,88 +334,6 @@ func BenchmarkPointRead(b *testing.B) {
 					i = 0
 				}
 			}
-		})
-	}
-}
-
-// BenchmarkVibeDurableReadFormat keeps the space-saving compact bulk format
-// honest by pairing it with the same point and all-byte scan loops as the
-// default verbatim format. Compact is not a competitor engine and must not be
-// mixed into the cross-engine table as though it were the mutable default.
-// This row exists specifically to prevent a smaller bulk artifact from being
-// promoted without paying its measured read cost.
-func BenchmarkVibeDurableReadFormat(b *testing.B) {
-	for _, format := range []struct {
-		name    string
-		compact bool
-	}{
-		{name: "verbatim"},
-		{name: "compact", compact: true},
-	} {
-		b.Run(format.name, func(b *testing.B) {
-			closeForeignFixtures("")
-			engine, err := newVibeDurable(Config{
-				Dir:        b.TempDir(),
-				CacheBytes: DefaultCacheBytes,
-				Compact:    format.compact,
-			})
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { _ = engine.Close() })
-			if err := engine.Load(docs); err != nil {
-				b.Fatal(err)
-			}
-
-			b.Run("point", func(b *testing.B) {
-				buf := make([]byte, 0, 512)
-				index := 0
-				b.ReportAllocs()
-				b.ResetTimer()
-				for b.Loop() {
-					out, getErr := engine.Get(
-						buf[:0], docs[probeIdx[index]].Key,
-					)
-					if getErr != nil {
-						b.Fatal(getErr)
-					}
-					if len(out) == 0 {
-						b.Fatal("empty document")
-					}
-					buf = out
-					index++
-					if index == len(probeIdx) {
-						index = 0
-					}
-				}
-			})
-
-			b.Run("scan-all-bytes", func(b *testing.B) {
-				totalBytes, _, _, _ := CorpusStats(docs)
-				b.ReportAllocs()
-				b.SetBytes(int64(totalBytes))
-				b.ResetTimer()
-				var count int
-				for b.Loop() {
-					var scanErr error
-					count, scanErr = engine.ScanAllBytes()
-					if scanErr != nil {
-						b.Fatal(scanErr)
-					}
-				}
-				b.StopTimer()
-				if count != len(docs) {
-					b.Fatalf(
-						"scanned %d documents, want %d",
-						count, len(docs),
-					)
-				}
-				b.ReportMetric(
-					float64(b.Elapsed().Nanoseconds())/
-						float64(b.N*len(docs)),
-					"ns/doc",
-				)
-			})
 		})
 	}
 }
@@ -749,9 +665,10 @@ func BenchmarkParse(b *testing.B) {
 }
 
 // TestFullEquivalence is the test that licenses every performance number in
-// this harness. Every engine must return the exact stored bytes for every one
-// of the corpus's keys, and must visit every key exactly once with those same
-// bytes during a scan.
+// this harness. Every engine must return its documented stored representation
+// for every one of the corpus's keys, and must visit every key exactly once
+// with those same bytes during a scan. Byte-preserving engines return the
+// submitted spelling; vibejson-durable returns the sole class-5 canonical form.
 //
 // It replaced a check that verified one document — docs[42] — and validated
 // Scan by its count alone. An engine that returned correct bytes for docs[42]
@@ -774,31 +691,38 @@ func TestFullEquivalence(t *testing.T) {
 		cardinality, len(docs), minBytes, maxBytes, float64(total)/(1<<20),
 		float64(gz)/(1<<20), 100*float64(gz)/float64(total), want, FilterField, FilterValue)
 
-	byKey := make(map[string][]byte, len(docs))
-	for i := range docs {
-		byKey[docs[i].Key] = docs[i].JSON
-	}
-
 	for _, factory := range Factories() {
 		t.Run(factory.Name, func(t *testing.T) {
 			e := loadedEngine(
 				t, factory.Name, DurabilityDefault, false, "read",
 			)
 
-			// 1. Every key, by Get, byte-identical. Not one key: all of them.
+			byKey := make(map[string][]byte, len(docs))
+			var expected []byte
+			for i := range docs {
+				expected, err = AppendExpectedStoredJSON(expected[:0], factory.Name, docs[i].JSON)
+				if err != nil {
+					t.Fatalf("canonicalize %q: %v", docs[i].Key, err)
+				}
+				byKey[docs[i].Key] = append([]byte(nil), expected...)
+			}
+
+			// 1. Every key, by Get, representation-identical. Not one key: all
+			// of them.
 			var buf []byte
 			for i := range docs {
 				buf, err = e.Get(buf[:0], docs[i].Key)
 				if err != nil {
 					t.Fatalf("Get(%q): %v", docs[i].Key, err)
 				}
-				if string(buf) != string(docs[i].JSON) {
+				wantJSON := byKey[docs[i].Key]
+				if string(buf) != string(wantJSON) {
 					t.Fatalf("Get(%q) mismatch:\n got %s\nwant %s",
-						docs[i].Key, buf, docs[i].JSON)
+						docs[i].Key, buf, wantJSON)
 				}
 			}
 
-			// 2. A scan visits every key exactly once, with exact bytes.
+			// 2. A scan visits every key exactly once, with the expected bytes.
 			seen := make([]bool, len(docs))
 			n := 0
 			err := e.Visit(func(key string, value []byte) error {
@@ -891,7 +815,7 @@ func TestFullEquivalence(t *testing.T) {
 	}
 }
 
-// TestFullEquivalenceIndexedDurable extends TestFullEquivalence's byte-exact
+// TestFullEquivalenceIndexedDurable extends TestFullEquivalence's canonical
 // oracle to the one arm TestFullEquivalence cannot cover at the default corpus:
 // the indexed vibejson-durable engine.
 //
@@ -900,8 +824,8 @@ func TestFullEquivalence(t *testing.T) {
 // binds both the bulk cutover (AppendIndexTermLeaf) and the Put mutation path
 // (the incremental exact-tile rebuild), so a low-cardinality corpus spread
 // across enough documents overruns it. This test sizes the indexed durable arm
-// below the ceiling and applies the identical oracle: every key byte-identical
-// by Get, every key visited exactly once with exact bytes, Scan and
+// below the ceiling and applies the identical oracle: every key canonical by
+// Get, every key visited exactly once with canonical bytes, Scan and
 // ScanAllBytes counts, and IndexedCount against the corpus oracle. Multi-leaf
 // term indexes are the future work that lifts the cap and folds this arm back
 // into TestFullEquivalence at the shared corpus.
@@ -915,8 +839,14 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	corpus := CorpusOf(size, cardinality)
 
 	byKey := make(map[string][]byte, len(corpus))
+	var expected []byte
+	var err error
 	for i := range corpus {
-		byKey[corpus[i].Key] = corpus[i].JSON
+		expected, err = AppendExpectedStoredJSON(expected[:0], "vibejson-durable", corpus[i].JSON)
+		if err != nil {
+			t.Fatalf("canonicalize %q: %v", corpus[i].Key, err)
+		}
+		byKey[corpus[i].Key] = append([]byte(nil), expected...)
 	}
 	_, _, _, want := CorpusStats(corpus)
 
@@ -935,21 +865,21 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	}, corpus)
 	defer cleanup()
 
-	// 1. Every key, by Get, byte-identical.
+	// 1. Every key, by Get, canonical-byte-identical.
 	var buf []byte
-	var err error
 	for i := range corpus {
 		buf, err = e.Get(buf[:0], corpus[i].Key)
 		if err != nil {
 			t.Fatalf("Get(%q): %v", corpus[i].Key, err)
 		}
-		if string(buf) != string(corpus[i].JSON) {
+		wantJSON := byKey[corpus[i].Key]
+		if string(buf) != string(wantJSON) {
 			t.Fatalf("Get(%q) mismatch:\n got %s\nwant %s",
-				corpus[i].Key, buf, corpus[i].JSON)
+				corpus[i].Key, buf, wantJSON)
 		}
 	}
 
-	// 2. A scan visits every key exactly once, with exact bytes.
+	// 2. A scan visits every key exactly once, with canonical bytes.
 	seen := make([]bool, len(corpus))
 	n := 0
 	err = e.Visit(func(key string, value []byte) error {

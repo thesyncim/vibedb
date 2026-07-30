@@ -1129,6 +1129,19 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("warmed RangeMasksRawBuffer allocated %.2f times, want 0", allocs)
 	}
+	if err := snapshot.RangeMasksRaw(masks, visit); err != nil {
+		t.Fatal(err)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		visitBytes = 0
+		if runErr := snapshot.RangeMasksRaw(masks, visit); runErr != nil ||
+			visitBytes == 0 {
+			panic("masked convenience range failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed RangeMasksRaw allocated %.2f times, want 0", allocs)
+	}
 	allocs = testing.AllocsPerRun(100, func() {
 		visitBytes = 0
 		var runErr error
