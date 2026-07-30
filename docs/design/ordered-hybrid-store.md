@@ -1,28 +1,29 @@
 # Ordered hybrid store
 
-**Status:** promotion specification; candidate primitives are measured, the
-complete primary is not the default.
+**Status:** implemented design record. The ordered primary graph is the durable
+default. Primitive measurements and promotion thresholds below are historical
+evidence or refresh gates, not current-head benchmark claims.
 
 **Idea:** route lexically to a tablet and leaf, use bounded hashes inside that
 leaf, and keep exact key/value bytes in lexical order. Readers retain one
 canonical representation; mutations publish complete generations.
 
-**Decision rule:** every number below is measured, projected, or a gate. No
-isolated primitive becomes the default until the complete store passes
-[the promotion gates](#promotion-gates).
+**Reading rule:** every number below is measured, projected, or a gate. Keep
+those labels when comparing later work; isolated primitive results do not
+replace complete-store measurements.
 
 **Measured evidence:** in the [cited M4 Max runs](#ordered-hash-leaf), the
 isolated ordered leaf measures 30.0–31.1 ns hits, 49.3–50.9 ns misses, and
 5.14–5.17 ns/document lexical iteration; the combined resident route measures
 185.8 ns with hashing included. These omit publication, snapshot COW,
-secondary maintenance, and I/O. The complete store is therefore still judged
-by the end-to-end gates, not these primitive results.
+secondary maintenance, and I/O. They explain the design choice but do not
+describe current end-to-end performance.
 
-The target is not an LSM. Readers consult one immutable published generation,
-with no memtable, delta, tombstone, version-chain, or merge cursor. Mutations
-construct the next canonical pages directly and publish one root. Snapshots pin
-old immutable roots; qualified in-place materialization is an optimization, and
-copy-on-write is always the safe fallback.
+The implementation is not an LSM. Readers consult one immutable published
+generation, with no memtable, delta, tombstone, version-chain, or merge cursor.
+Mutations construct the next canonical pages directly and publish one root.
+Snapshots pin old immutable roots; qualified in-place materialization is an
+optimization, and copy-on-write is always the safe fallback.
 
 ## Why the primary cannot be globally hash-partitioned
 
@@ -634,7 +635,7 @@ release gates even when the original bug is closed:
 | overlapping mutable engines and representations | open: vNext must become the only public mutable path; compact bulk cannot silently change performance class | API inventory plus deletion of obsolete paths after migration tests |
 | compact bulk creates a read cliff | rejected as the default; paired point and all-byte benchmarks are mandatory | no promoted codec may regress point, random, lower-bound, or ordered scan gates |
 | one collection is too large a 100 TB ownership unit | in progress locally; network ownership is specified separately in [distributed sharding](distributed-sharding.md) | split/merge, snapshot ownership, bounded resident metadata, and 100-billion-row simulations |
-| backup, verify, salvage, and physical space return are missing | open | live-snapshot export, offline verify/salvage, and `vacuum-into` workflows |
+| backup and physical space workflows are incomplete | partial: offline verify, inline-row catalog-loss salvage, and `repack` are shipped; overflow salvage and live-snapshot export remain | overflow-aware salvage, live-snapshot export, and workflow tests |
 | cross-shard durability and snapshots are unspecified | future contract in [distributed sharding](distributed-sharding.md), intentionally after the local vNext format | shard-term/sequence fencing, retained root history, safe-time reads, and GC watermark model |
 
 Closing a row does not remove its tests. A rewrite that reintroduces one of
@@ -643,8 +644,9 @@ smaller.
 
 ## Promotion gates
 
-The next format replaces the current primary only when the complete durable
-store, not an isolated leaf, passes all gates on equivalent corpora:
+These historical promotion gates remain useful as refresh criteria for the
+complete durable store. They are not claims that current `main` achieves the
+numbers:
 
 | Metric | Gate |
 | --- | ---: |

@@ -6,7 +6,8 @@ merges, the recovery journal, epoch-protected reads, and the compact leaf have
 landed, and the template-columnar class was measured and rejected as a default.
 The remaining open queue is parallel tablet writers, deferred COW-leaf reseal,
 overflow dedup, indexed batches and SQL-driver widening (indexed-write-path
-P3), the fault-device sweep, verify/salvage, and the publishable suite refresh.
+P3), the fault-device sweep, overflow-aware salvage, and the publishable suite
+refresh.
 The indexed posting overlay (P0), spanned term leaves (P1), and online durable
 index creation (P2) are implemented; their outstanding benchmark gates remain
 measurements to record, not claimed wins.
@@ -56,13 +57,12 @@ prior-or-committed root. This subsumes sampled crash tests with a
 systematic sweep; the enumeration is bounded because the portable
 device's sequence per commit is short and explicit.
 
-**Verify and salvage, with catalog-loss recovery as a stated property.**
-Leaves are self-describing — BucketID plus complete keys — so the entire
-routing graph is reconstructable from leaf extents alone. The offline
-verify tool walks checksums, graph reachability, free-set consistency,
-and posting agreement; the salvage tool rebuilds catalog, tablets,
-anchors, and locators from surviving leaves. Read-only opens at the last
-durable root provide consistent online backup without pausing writers.
+**Verify and catalog-loss salvage — landed, with one explicit limit.**
+`vibedb-verify verify` walks checksums, graph reachability, exact-index
+catalogs, and free-set overlap. `salvage` reconstructs a fresh graph from
+self-describing surviving primary leaves when catalogs are lost. Inline rows
+are recovered; out-of-line overflow values are counted and skipped, so
+overflow-aware salvage remains future work rather than an implied guarantee.
 
 ## All-cases workload lanes
 
@@ -81,7 +81,7 @@ Parallel tablet writers are next among engine work, since the journal's group
 commit multiplies with them. Indexed batches and SQL-driver widening remain as
 P3 of the indexed write path. The reseal-deferral item slots after the
 publishable suite refresh so its gate measures against a published baseline.
-The fault-device sweep and verify/salvage tooling are parallel-safe and may
+The fault-device sweep and overflow-aware salvage are parallel-safe and may
 start any time; overflow dedup and corner lanes ride the harness cadence. The
 [distributed-sharding plan](distributed-sharding.md) has its own gated
 sequence after the shard-local storage contract is stable; it does not turn

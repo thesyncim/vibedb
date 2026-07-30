@@ -9,25 +9,23 @@ memtables, tombstones, or version chains.
 The project is pre-v1. Public APIs and the on-disk format may change without a
 migration path.
 
-## Measured baseline
+## Published benchmark snapshot
 
-These are medians from the checked-in Apple M4 Max baseline: Go 1.26.0,
-darwin/arm64, 100,000 documents, three isolated process runs. They describe
-the current default durable store unless a row says otherwise.
+The latest checked-in competitive run is a dated 2026-07-28 baseline, not a
+claim about current `main`. Several storage and index paths changed after its
+measured commits.
 
-| Measurement | Result |
-| --- | ---: |
-| Random point read | 1,162 ns, 0 B / 0 alloc |
-| Ordered iteration | 7.546 ns/document, 0 B / 0 alloc |
-| Ordered all-bytes scan | 79.64 ns/document, 0 B / 0 alloc |
-| Exact indexed filter, 945 matches | 36.108 µs |
-| Verbatim bulk file, 23.73 MiB raw JSON | 32.2 MiB allocated |
-| Explicit compact bulk, low / high cardinality | 13.9 / 26.1 MiB allocated |
-| Power-safe mixed workloads vs comparable SQLite | 6.3–14.7% lower throughput |
+| Lane or measurement | Published result | Context |
+| --- | ---: | --- |
+| Buffered-visible mixed workloads | 180k–1.01M ops/s | 1.9–3.6× SQLite |
+| Ordinary-sync mixed workloads | 17.9k–176k ops/s | trailed SQLite and Badger |
+| Power-safe mixed workloads | 370–3,663 ops/s | roughly 6–13% behind SQLite |
+| Sustained churn, 100k live documents | 36.0 MiB allocated | flat; no maintenance |
+| Verbatim primary bulk, 100k documents | 28.1 MiB allocated | published corpus |
 
-The full tables, commits, corpus definitions, caveats, and reproduction
-commands are in [competitive results](bench/competitive/RESULTS.md). Compact
-bulk is a separate representation, not the mutable default.
+See the [short performance guide](docs/performance.md) for interpretation and
+the [competitive results](bench/competitive/RESULTS.md) for complete tables,
+commits, corpus definitions, caveats, and reproduction commands.
 
 ## Quickstart
 
@@ -140,7 +138,8 @@ mode.
 - [On-disk format](docs/format.md): current byte-level format authority.
 - [Performance](docs/performance.md): measured tables and benchmark honesty
   rules.
-- [Design documents](docs/design/): promotion specifications and future work.
+- [Design documents](docs/design/): implementation records, rejected options,
+  promotion evidence, and future work.
 - [Contributing](CONTRIBUTING.md): tests, benchmarks, and documentation rules.
 
 The repository was extracted from

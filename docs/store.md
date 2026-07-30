@@ -4,10 +4,12 @@ This document describes the canonical `store` and `store/durable` APIs in the
 current tree. Public Go documentation remains authoritative for individual
 methods and option fields.
 
-The proposed sole next-generation primary, its invariants, 100-billion-key
-bounds, space accounting, weaknesses, and promotion gates are specified in
-[design/ordered-hybrid-store.md](design/ordered-hybrid-store.md). That document
-describes a target; this file describes the APIs and formats implemented today.
+The ordered primary graph's design record, scale bounds, and promotion evidence
+are in
+[design/ordered-hybrid-store.md](design/ordered-hybrid-store.md). This file
+describes the implemented APIs; [architecture.md](architecture.md) describes
+the current runtime shape and [format.md](format.md) is authoritative for
+durable bytes.
 
 ## Storage surfaces
 
@@ -236,20 +238,23 @@ remain bounded by the transaction limits derived from the options.
 
 ### Durability
 
-`Put`, `Delete`, and `Update` publish a copy-on-write
-generation. Applications do not rewrite a checkpoint after each operation.
+`Put`, `Delete`, and `Update` publish one complete generation. Applications do
+not rewrite a checkpoint after each operation.
 
-The zero-value `DurabilitySync` mode makes mutation success and reader
-visibility wait for both the data barrier and the alternate-root barrier.
-`DurabilityAsyncVisible` is the explicit asynchronous opt-in: a mutation
-becomes reader-visible when the bounded committer accepts it. Use:
+The zero-value `DurabilitySync` mode appends and power-safely syncs one bounded
+recovery-journal record before applying and publishing the mutation; the root
+is folded at a later checkpoint. `DurabilityAsyncVisible` is the explicit
+asynchronous opt-in: a mutation becomes reader-visible when the bounded
+committer accepts it. `DurabilityBufferedVisible` publishes after bounded
+memory admission and relies on `Flush` or `Close` for crash persistence. Use:
 
 - `DurableGeneration` to observe the last fenced generation;
 - `Flush` to wait until the current visible generation is durable;
 - `Close` to stop new work, drain commits, and release owned resources.
 
-`CommitCoalesce` bounds an optional group-commit window. It also affects the
-latency of synchronous callers.
+`CommitCoalesce` bounds optional grouping for the background committer and the
+opt-in buffered-journal lane. It does not delay the journal-before-publish
+`DurabilitySync` path.
 
 Recovery validates both superblocks and their roots and can fall back to the
 previous complete generation. Corruption encountered when a lower page is

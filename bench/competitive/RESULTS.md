@@ -1,5 +1,10 @@
 # Competitive results
 
+> **Published snapshot, not current-head results.** These tables were measured
+> on 2026-07-28 at the commits named below. Later work changed the primary
+> graph, synchronous journal, compact leaves, and exact-index path. The numbers
+> remain the latest complete cross-engine run until the suite is refreshed.
+
 Every number in this file comes from `cmd/mixedsuite`, `cmd/churndisk`, and
 `cmd/footprint` runs on a quiet machine, with the exact commands in
 [Reproduction](#reproduction). Mixed-workload numbers are medians of 10
@@ -69,7 +74,7 @@ delete+restore 9.7 µs, checkpoint 330-355 µs, full 10k-doc ordered scan
 | churn | 17,860 | 311 | 635 | 49,881 | 82,157 |
 | scan-mix | 21,176 | 439 | 913 | 62,369 | 94,931 |
 
-**vibedb currently loses this lane to SQLite and Badger.** The journal
+**The measured vibedb build loses this lane to SQLite and Badger.** The journal
 acknowledgement costs 32.5 µs per mutation (append + ordinary sync of the
 dedicated journal file); SQLite's fsync-class WAL commit is cheaper per
 operation on this platform, and Badger group-commits its value log. bbolt
@@ -78,9 +83,9 @@ behind everyone. An earlier draft of this table showed vibedb winning the
 lane; those rows were measured with the journal silently disengaged (the
 legacy chunk layout has no journal append path), were withdrawn, and the
 engine now fails closed if a journal is requested on a layout that cannot
-feed it. The active work here is collapsing the sync lanes onto
-single-fence journal acknowledgements and, on Linux, group-committed FUA
-journal writes.
+feed it. Single-fence journal acknowledgement landed after this measurement;
+its current competitive standing is deliberately unclaimed until the complete
+lane is rerun.
 
 ## Mixed workloads, power-safe (total ops/s, median of 10)
 
@@ -93,11 +98,11 @@ journal writes.
 | scan-mix | 757 | 828 |
 
 Both engines sit on the ~4-5 ms F_FULLFSYNC device floor per fenced
-mutation; vibedb trails by 8-13% because its sync lane pays two full fences
-per commit (update p50 5.01 ms) against SQLite's one (4.09 ms). The
-journal's single-fence power-safe acknowledgement measures 4.05 ms at store
-level; wiring it as the sync lane is in progress and is expected to flip
-this table's sign.
+mutation; the measured vibedb build trails by roughly 6-13% because its sync
+lane paid two full fences per commit (update p50 5.01 ms) against SQLite's one
+(4.09 ms). The journal's single-fence power-safe acknowledgement landed after
+this table; an isolated store-level result does not replace the competitive
+lane.
 
 ## Disk under sustained churn (200k mutations, fixed 100k-doc live set)
 
@@ -132,11 +137,12 @@ from the corpus rather than the format.
 | Pebble | 50.6 | 50.6 |
 | Badger | 257.0 | 257.0 |
 
-vibedb compact is the smallest at BOTH cardinalities — smaller than the raw
-corpus itself at low cardinality. Verbatim stores the exact JSON bytes,
-byte-for-byte recoverable, at SQLite parity. Compact currently rides the
-legacy chunk layout; its port to the primary graph is scheduled with the
-chunk layout's deletion. The two representations are never conflated.
+In this snapshot vibedb compact is the smallest at both cardinalities —
+smaller than the raw corpus itself at low cardinality. Verbatim stores the
+exact JSON bytes, byte-for-byte recoverable, at SQLite parity. The compact row
+measured the since-deleted chunk layout; primary-graph compact and unified
+leaves require a new cross-engine footprint run. The representations are never
+conflated.
 
 ## Reproduction
 

@@ -293,21 +293,12 @@ type Options struct {
 	// neither the achieved group size nor throughput on any writer shape tested.
 	// Reach for CommitCoalesce instead.
 	GroupLimit int
-	// CommitCoalesce bounds how long the background durability worker waits
-	// after taking one generation for adjacent ones to join it. Zero, the
-	// default, commits each generation as soon as it is picked up.
-	//
-	// The window is only entered when another generation is already queued or a
-	// producer is mid-transaction, so a lone synchronous writer — whose next Put
-	// cannot start until this one is durable — never pays it. When grouping is
-	// possible the cost is real and bounded: a DurabilitySync caller's
-	// acknowledgement is delayed by up to this duration so that its fence can be
-	// shared. On an Apple M4 Max, where one file.Sync costs several
-	// milliseconds, a 1 ms window took roughly three generations per fence
-	// instead of one and a half, cutting per-operation cost by about a third
-	// with eight concurrent writers. It is left at zero by default because that
-	// trade belongs to the caller: it buys throughput with acknowledged-commit
-	// latency, and only a caller knows which it is short of.
+	// CommitCoalesce bounds optional durability grouping. The background
+	// committer uses it to wait for adjacent accepted generations; the opt-in
+	// buffered-journal lane uses it to let concurrent published records share
+	// one sync. Zero, the default, adds no intentional wait. It has no effect on
+	// the journal-before-publish DurabilitySync path, whose record must be
+	// fenced before the mutation becomes visible.
 	CommitCoalesce time.Duration
 	// Backend selects both engines; Stats reports the actual read and write
 	// choices independently after Auto fallback.
