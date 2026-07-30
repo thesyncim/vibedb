@@ -768,15 +768,19 @@ func (c *Collection) canonicalPrimaryMutationValue(src []byte) ([]byte, error) {
 }
 
 // canonicalPrimaryUnifiedOverlayValue applies the overlay's bounded inline
-// admission after canonicalization. Tape-dense or overflow values decline to
-// the structural lane, which calls canonicalPrimaryMutationValue again and
-// therefore preserves the same class-5 byte contract.
+// admission. canonicalReady is the schemaless Put fast path's proof that src
+// already came from canonicalPrimaryMutationValue; schema collections retain
+// the old late-canonicalization path. Tape-dense or overflow values decline to
+// the structural lane without repeating a parse for canonical-ready input.
 func (c *Collection) canonicalPrimaryUnifiedOverlayValue(
-	src []byte,
+	src []byte, canonicalReady bool,
 ) ([]byte, bool, error) {
 	if c == nil || c.primaryUnifiedOverlay == nil ||
 		len(src) > c.options.InlineValueBytes {
 		return nil, false, nil
+	}
+	if canonicalReady {
+		return src, true, nil
 	}
 	canonical, err := c.canonicalPrimaryMutationValue(src)
 	if err != nil {
@@ -800,6 +804,7 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	route storeio.ResidentPrimaryRoute,
 	page []byte,
 	key, src []byte,
+	canonicalReady bool,
 ) (handled, created, pressure bool, err error) {
 	overlay := c.primaryUnifiedOverlay
 	if overlay == nil ||
@@ -841,13 +846,10 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 			if c.primaryEpoch == nil {
 				oldLen = uv.AdmittedRowBodyLen(body)
 			} else {
-				old := uv.AppendAdmittedRowBody(
-					c.primaryUnifiedCanonical[:0], body,
+				c.overflowValueScratch = uv.AppendAdmittedRowBody(
+					c.overflowValueScratch[:0], body,
 				)
-				oldLen = len(old)
-				c.overflowValueScratch = append(
-					c.overflowValueScratch[:0], old...,
-				)
+				oldLen = len(c.overflowValueScratch)
 				oldRaw = c.overflowValueScratch
 			}
 		}
@@ -857,7 +859,8 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	// The leaf header carries its exact no-compression envelope. Accumulating
 	// each pending mutation's exact delta lets growing values and inserts stay
 	// on the O(document) lane whenever an all-trivial fold remains bounded.
-	canonical, eligible, err := c.canonicalPrimaryUnifiedOverlayValue(src)
+	canonical, eligible, err :=
+		c.canonicalPrimaryUnifiedOverlayValue(src, canonicalReady)
 	if err != nil || !eligible {
 		return false, false, false, err
 	}

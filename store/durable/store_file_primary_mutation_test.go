@@ -161,6 +161,109 @@ func TestFilePrimaryBufferedUnifiedOverlay(t *testing.T) {
 	}
 }
 
+func TestFilePrimarySchemalessPutCanonicalContract(t *testing.T) {
+	built, keys, _ := buildFilePrimaryCorpus(t, 1_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityBufferedVisible,
+		Indexes: []store.IndexDefinition{
+			{Name: "id", Paths: []string{"/id"}},
+		},
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "primary-schemaless-canonical.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+
+	key := []byte(keys[500])
+	beforeGeneration := collection.Generation()
+	beforeLen := collection.Len()
+	beforeCount := collection.primaryUnifiedOverlay.count.Load()
+	beforeUsed := collection.primaryUnifiedOverlay.used.Load()
+	for _, invalid := range [][]byte{
+		[]byte(`{"unterminated":`),
+		[]byte(`{"valid":true} trailing`),
+	} {
+		if _, putErr := collection.Put(key, invalid); putErr == nil {
+			t.Fatalf("invalid Put %q succeeded", invalid)
+		}
+		if got := collection.Generation(); got != beforeGeneration {
+			t.Fatalf(
+				"invalid Put advanced generation %d -> %d",
+				beforeGeneration, got,
+			)
+		}
+		if got := collection.Len(); got != beforeLen {
+			t.Fatalf("invalid Put changed Len %d -> %d", beforeLen, got)
+		}
+		if got := collection.primaryUnifiedOverlay.count.Load(); got != beforeCount {
+			t.Fatalf("invalid Put changed overlay count %d -> %d", beforeCount, got)
+		}
+		if got := collection.primaryUnifiedOverlay.used.Load(); got != beforeUsed {
+			t.Fatalf("invalid Put changed overlay bytes %d -> %d", beforeUsed, got)
+		}
+	}
+
+	input := []byte(
+		" \n { \"z\" : 1.0, \"a\" : [ true, null ], \"m\" : \"x\" } \t",
+	)
+	want, err := vibejson.AppendCanonicalize(nil, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created, putErr := collection.Put(key, input); putErr != nil || created {
+		t.Fatalf("canonicalizing Put = %v,%v", created, putErr)
+	}
+	if got := collection.Generation(); got != beforeGeneration+1 {
+		t.Fatalf(
+			"valid Put generation = %d, want %d",
+			got, beforeGeneration+1,
+		)
+	}
+	got, found, err := collection.AppendRaw(nil, key)
+	if err != nil || !found || !bytes.Equal(got, want) {
+		t.Fatalf("live canonical read = %q,%v,%v, want %q", got, found, err, want)
+	}
+	state := collection.state.Load()
+	route, err := collection.currentPrimaryResidentRoute(state, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlayValue, disposition, _ := collection.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, state.root.Generation,
+	)
+	if disposition != primaryUnifiedOverlayValue ||
+		!bytes.Equal(overlayValue, want) {
+		t.Fatalf(
+			"overlay canonical value = %q,%v, want %q",
+			overlayValue, disposition, want,
+		)
+	}
+
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, found, err = reopened.AppendRaw(nil, key)
+	if err != nil || !found || !bytes.Equal(got, want) {
+		t.Fatalf(
+			"reopened canonical read = %q,%v,%v, want %q",
+			got, found, err, want,
+		)
+	}
+}
+
 func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 	built, keys, values := buildFilePrimaryCorpus(t, 1_000)
 	options := Options{

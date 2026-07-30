@@ -575,11 +575,26 @@ func (c *Collection) putPrimary(
 		len(src) > c.options.MaxDocumentBytes {
 		return false, ErrDocumentTooLarge
 	}
-	if err := vibejson.Validate(src); err != nil {
-		return false, err
-	}
-	if err := c.validatePrimarySchema(src); err != nil {
-		return false, err
+	// A schemaless primary Put needs the structural index for canonical class-5
+	// bytes anyway. Build it once here: BuildIndex validates the document, and
+	// the canonical result then flows unchanged through overlay/COW, exact-index
+	// maintenance, and recovery-journal admission. Schema collections retain
+	// their existing Validate + option-aware BuildIndexOptions path; sharing that
+	// index requires proving the schema's depth/hash options compatible with the
+	// canonical builder and is deliberately outside this fast-path change.
+	canonicalReady := c.options.Collection.Schema == nil
+	if canonicalReady {
+		src, err = c.canonicalPrimaryMutationValue(src)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		if err := vibejson.Validate(src); err != nil {
+			return false, err
+		}
+		if err := c.validatePrimarySchema(src); err != nil {
+			return false, err
+		}
 	}
 retryAfterUnifiedFold:
 	state := c.state.Load()
@@ -632,6 +647,7 @@ retryAfterUnifiedFold:
 		handled, overlayCreated, pressure, overlayErr :=
 			c.tryPrimaryUnifiedOverlayPut(
 				state, resident, leafLease.Page(), keyBytes, src,
+				canonicalReady,
 			)
 		if overlayErr != nil {
 			leafLease.Release()
@@ -686,10 +702,13 @@ retryAfterUnifiedFold:
 	// path (overflow, structural pressure, async mode, or a reader-forced
 	// fallback) must do the same before exact-index deltas, journal records, and
 	// leaf/overflow images observe them.
-	src, err = c.canonicalPrimaryMutationValue(src)
-	if err != nil {
-		leafLease.Release()
-		return false, err
+	if !canonicalReady {
+		src, err = c.canonicalPrimaryMutationValue(src)
+		if err != nil {
+			leafLease.Release()
+			return false, err
+		}
+		canonicalReady = true
 	}
 	leaf, err := storeio.AdmittedPrimaryLeafForMutationWithScratch(
 		leafLease.Page(), c.storeID, resident.Bucket,
