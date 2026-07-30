@@ -405,13 +405,85 @@ func TestSyncPrimaryJournalAppendFailureNeverVisible(t *testing.T) {
 	}
 }
 
+func TestRecoveryJournalRecycleUsesCheckpointStrength(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		strength CheckpointStrength
+		wantFile int
+		wantData int
+	}{
+		{
+			name: "filesystem", strength: CheckpointFilesystem,
+			wantFile: 1,
+		},
+		{
+			name: "power-safe", strength: CheckpointPowerSafe,
+			wantData: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := journalTestOptions(tc.strength)
+			get, restore := installJournalFaultSeam(t)
+			defer restore()
+
+			path := filepath.Join(t.TempDir(), "store.vibe")
+			file, err := os.OpenFile(
+				path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := CreateFromPrimary(
+				seedPrimaryCollection(t), file, options,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			coll, err := Open(file, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer coll.Close()
+
+			fj := get()
+			if fj == nil {
+				t.Fatal("journal fault seam was not installed")
+			}
+			if _, err := coll.Put(
+				[]byte(journalCrashKey(0)), journalValue(0),
+			); err != nil {
+				t.Fatal(err)
+			}
+			fileBefore := fj.FilesystemSyncs()
+			dataBefore := fj.DataSyncs()
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			gotFile := fj.FilesystemSyncs() - fileBefore
+			gotData := fj.DataSyncs() - dataBefore
+			if gotFile != tc.wantFile || gotData != tc.wantData {
+				t.Fatalf(
+					"recycle filesystem/data syncs = %d/%d, want %d/%d",
+					gotFile, gotData, tc.wantFile, tc.wantData,
+				)
+			}
+		})
+	}
+}
+
 // TestRecoveryJournalRecycleCrashMatrix crashes the checkpoint's journal recycle
 // header write. The store root was already fenced durable before the recycle, so
 // a torn or ENOSPC'd recycle must leave a reopen that recovers to the fully
 // checkpointed state through the surviving previous header — never a lost
 // acknowledgement, never a panic.
 func TestRecoveryJournalRecycleCrashMatrix(t *testing.T) {
-	options := journalTestOptions(CheckpointPowerSafe)
 	const putsBeforeFlush = 5
 	contents := journalContentOracle(putsBeforeFlush)
 	checkpointed := contents[putsBeforeFlush]
@@ -424,51 +496,72 @@ func TestRecoveryJournalRecycleCrashMatrix(t *testing.T) {
 		{"enospc-recycle", storeio.JournalFaultENOSPCRecycle},
 	}
 
-	tally := map[string]int{}
-	for _, ph := range phases {
-		label := ph.name
-		get, restore := installJournalFaultSeam(t)
+	for _, strength := range []struct {
+		name  string
+		value CheckpointStrength
+	}{
+		{name: "filesystem", value: CheckpointFilesystem},
+		{name: "power-safe", value: CheckpointPowerSafe},
+	} {
+		t.Run(strength.name, func(t *testing.T) {
+			options := journalTestOptions(strength.value)
+			tally := map[string]int{}
+			for _, ph := range phases {
+				label := ph.name
+				get, restore := installJournalFaultSeam(t)
 
-		dir := t.TempDir()
-		path := filepath.Join(dir, "store.vibe")
-		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := CreateFromPrimary(seedPrimaryCollection(t), file, options); err != nil {
-			t.Fatalf("%s: CreateFromPrimary: %v", label, err)
-		}
-		_ = file.Close()
-		file, err = os.OpenFile(path, os.O_RDWR, 0o600)
-		if err != nil {
-			t.Fatal(err)
-		}
-		coll, err := Open(file, options)
-		if err != nil {
-			t.Fatalf("%s: open: %v", label, err)
-		}
-		for i := 0; i < putsBeforeFlush; i++ {
-			if _, err := coll.Put([]byte(journalCrashKey(i)), journalValue(i)); err != nil {
-				t.Fatalf("%s: put %d: %v", label, i, err)
+				dir := t.TempDir()
+				path := filepath.Join(dir, "store.vibe")
+				file, err := os.OpenFile(
+					path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := CreateFromPrimary(
+					seedPrimaryCollection(t), file, options,
+				); err != nil {
+					t.Fatalf("%s: CreateFromPrimary: %v", label, err)
+				}
+				_ = file.Close()
+				file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				coll, err := Open(file, options)
+				if err != nil {
+					t.Fatalf("%s: open: %v", label, err)
+				}
+				for i := 0; i < putsBeforeFlush; i++ {
+					if _, err := coll.Put(
+						[]byte(journalCrashKey(i)), journalValue(i),
+					); err != nil {
+						t.Fatalf("%s: put %d: %v", label, i, err)
+					}
+				}
+				fj := get()
+				fj.Program(storeio.JournalFaultPlan{Phase: ph.phase})
+				// Flush checkpoints (root durable) then recycles the journal, where
+				// the fault fires at the selected checkpoint strength.
+				flushErr := coll.Flush()
+				if !fj.Faulted() {
+					t.Fatalf(
+						"%s: recycle fault never fired (flushErr=%v)",
+						label, flushErr,
+					)
+				}
+				image := captureJournalImage(t, path)
+				_ = coll.Close()
+				_ = file.Close()
+				restore()
+
+				outcome := verifyJournalCrashImage(
+					t, options, image,
+					[]map[string]string{checkpointed}, label,
+				)
+				tally[outcome]++
 			}
-		}
-		fj := get()
-		fj.Program(storeio.JournalFaultPlan{Phase: ph.phase})
-		// Flush checkpoints (root durable) then recycles the journal, where the
-		// fault fires.
-		flushErr := coll.Flush()
-		if !fj.Faulted() {
-			t.Fatalf("%s: recycle fault never fired (flushErr=%v)", label, flushErr)
-		}
-		image := captureJournalImage(t, path)
-		_ = coll.Close()
-		_ = file.Close()
-		restore()
-
-		outcome := verifyJournalCrashImage(
-			t, options, image, []map[string]string{checkpointed}, label,
-		)
-		tally[outcome]++
+			t.Logf("journal recycle crash matrix: outcomes %v", tally)
+		})
 	}
-	t.Logf("journal recycle crash matrix: outcomes %v", tally)
 }

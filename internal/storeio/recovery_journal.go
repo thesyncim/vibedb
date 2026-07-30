@@ -1152,9 +1152,10 @@ func (rj *RecoveryJournal) Sync(powerSafe bool) error {
 
 // Recycle advances the journal head past a checkpointed generation. It rewrites
 // the header with the new base generation and the current durable sequence,
-// syncs, and resets the append cursor to the region start. Stale record bytes
-// left in the preallocated region are never zeroed: the new BaseSequence anchor
-// makes them fail monotonic-sequence validation, so a later recovery treats the
+// syncs at the same strength as the checkpoint that made baseGeneration safe,
+// and resets the append cursor to the region start. Stale record bytes left in
+// the preallocated region are never zeroed: the new BaseSequence anchor makes
+// them fail monotonic-sequence validation, so a later recovery treats the
 // recycled region as empty until fresh appends overwrite it.
 //
 // The header rewrite plus its sync is the journal half of the checkpoint's root
@@ -1162,7 +1163,10 @@ func (rj *RecoveryJournal) Sync(powerSafe bool) error {
 // the old header, whose records recovery re-applies idempotently through the
 // ordinary mutation path onto the newer root — the replay filter skips any
 // record whose generation the root already covers.
-func (rj *RecoveryJournal) Recycle(baseGeneration uint64) error {
+func (rj *RecoveryJournal) Recycle(
+	baseGeneration uint64,
+	powerSafe bool,
+) error {
 	if baseGeneration < rj.header.BaseGeneration {
 		return fmt.Errorf("%w: recycle base generation regressed", ErrGenerationOrder)
 	}
@@ -1179,7 +1183,11 @@ func (rj *RecoveryJournal) Recycle(baseGeneration uint64) error {
 	if err := rj.writeHeader(slot, next); err != nil {
 		return err
 	}
-	if err := rj.journalDataSync(rj.file); err != nil {
+	sync := rj.journalSync
+	if powerSafe {
+		sync = rj.journalDataSync
+	}
+	if err := sync(rj.file); err != nil {
 		return err
 	}
 	rj.header = next

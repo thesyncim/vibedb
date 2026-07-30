@@ -78,6 +78,8 @@ type FaultJournal struct {
 	appends     int
 	recycles    int
 	syncs       int
+	fileSyncs   int
+	dataSyncs   int
 	faulted     bool
 	tornWrites  int
 	appendBytes int64
@@ -95,10 +97,10 @@ func NewFaultJournal(rj *RecoveryJournal) *FaultJournal {
 	realSync := rj.journalSync
 	realDataSync := rj.journalDataSync
 	rj.journalSync = func(file *os.File) error {
-		return fj.sync(file, realSync)
+		return fj.sync(file, realSync, false)
 	}
 	rj.journalDataSync = func(file *os.File) error {
-		return fj.sync(file, realDataSync)
+		return fj.sync(file, realDataSync, true)
 	}
 	return fj
 }
@@ -138,13 +140,36 @@ func (fj *FaultJournal) Syncs() int {
 	return fj.syncs
 }
 
+// FilesystemSyncs reports ordinary filesystem-strength journal barriers.
+func (fj *FaultJournal) FilesystemSyncs() int {
+	fj.mu.Lock()
+	defer fj.mu.Unlock()
+	return fj.fileSyncs
+}
+
+// DataSyncs reports power-safe journal barriers.
+func (fj *FaultJournal) DataSyncs() int {
+	fj.mu.Lock()
+	defer fj.mu.Unlock()
+	return fj.dataSyncs
+}
+
 // sync counts one barrier and either fails it per the plan or forwards it to
 // the real platform barrier captured at wrap time.
-func (fj *FaultJournal) sync(file *os.File, real func(*os.File) error) error {
+func (fj *FaultJournal) sync(
+	file *os.File,
+	real func(*os.File) error,
+	powerSafe bool,
+) error {
 	fj.mu.Lock()
 	plan := fj.plan
 	index := fj.syncs
 	fj.syncs++
+	if powerSafe {
+		fj.dataSyncs++
+	} else {
+		fj.fileSyncs++
+	}
 	fj.mu.Unlock()
 	if plan.Phase == JournalFaultSyncError && index == plan.SyncIndex {
 		_, err := fj.fault(0, syscall.EIO)

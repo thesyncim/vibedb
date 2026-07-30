@@ -347,7 +347,7 @@ func TestRecoveryJournalFullForcesRecycle(t *testing.T) {
 	}
 	// Recycle past the checkpointed generation and resume appending.
 	checkpointGen := gen - 1
-	if err := rj.Recycle(checkpointGen); err != nil {
+	if err := rj.Recycle(checkpointGen, true); err != nil {
 		t.Fatalf("recycle: %v", err)
 	}
 	if rj.Cursor() != 0 {
@@ -379,7 +379,7 @@ func TestRecoveryJournalRecycleCrashFallsBack(t *testing.T) {
 	// (base generation 1) survives, and recovery re-applies its records onto the
 	// newer root idempotently.
 	fj.Program(JournalFaultPlan{Phase: JournalFaultTornRecycle})
-	if err := rj.Recycle(3); err == nil {
+	if err := rj.Recycle(3, true); err == nil {
 		t.Fatal("torn recycle returned nil error")
 	}
 	if !fj.Faulted() {
@@ -439,6 +439,50 @@ func TestRecoveryJournalIdentityPairing(t *testing.T) {
 	rj.header.BaseGeneration = good.BaseGeneration
 }
 
+func TestRecoveryJournalRecycleSelectsSyncStrength(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		powerSafe bool
+		wantSync  int
+		wantData  int
+	}{
+		{name: "filesystem", wantSync: 1},
+		{name: "power-safe", powerSafe: true, wantData: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rj, _ := createTestJournal(
+				t, 8*RecoveryJournalMinSectorSize,
+			)
+			defer rj.Close()
+
+			syncs, dataSyncs := 0, 0
+			rj.journalSync = func(*os.File) error {
+				syncs++
+				return nil
+			}
+			rj.journalDataSync = func(*os.File) error {
+				dataSyncs++
+				return nil
+			}
+			if err := rj.Recycle(2, tc.powerSafe); err != nil {
+				t.Fatalf("Recycle: %v", err)
+			}
+			if syncs != tc.wantSync || dataSyncs != tc.wantData {
+				t.Fatalf(
+					"sync calls filesystem/data = %d/%d, want %d/%d",
+					syncs, dataSyncs, tc.wantSync, tc.wantData,
+				)
+			}
+			if rj.BaseGeneration() != 2 || rj.Cursor() != 0 {
+				t.Fatalf(
+					"recycled base/cursor = %d/%d, want 2/0",
+					rj.BaseGeneration(), rj.Cursor(),
+				)
+			}
+		})
+	}
+}
+
 // TestRecoveryJournalRecycleFailureLeavesManagerUnchanged pins the recycle
 // commit discipline: the in-memory header, slot, and cursor advance only after
 // the header write AND its sync both succeed, so a failed recycle leaves the
@@ -465,7 +509,7 @@ func TestRecoveryJournalRecycleFailureLeavesManagerUnchanged(t *testing.T) {
 			beforeCount := rj.Header().RecycleCount
 
 			fj.Program(tc.plan)
-			if err := rj.Recycle(3); err == nil {
+			if err := rj.Recycle(3, true); err == nil {
 				t.Fatal("faulted recycle returned nil error")
 			}
 			if !fj.Faulted() {
@@ -479,7 +523,7 @@ func TestRecoveryJournalRecycleFailureLeavesManagerUnchanged(t *testing.T) {
 
 			// With the device healthy again the same recycle must complete whole.
 			fj.Program(JournalFaultPlan{})
-			if err := rj.Recycle(3); err != nil {
+			if err := rj.Recycle(3, true); err != nil {
 				t.Fatalf("clean recycle after failure: %v", err)
 			}
 			if rj.BaseGeneration() != 3 || rj.Cursor() != 0 ||

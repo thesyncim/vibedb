@@ -423,7 +423,9 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 		// The durable generation never regressed; nothing to recycle past.
 		return nil
 	}
-	if err := c.journal.Recycle(baseGeneration); err != nil {
+	if err := c.journal.Recycle(
+		baseGeneration, c.journalPowerSafe,
+	); err != nil {
 		// A failed recycle is a device write or sync failure on the journal
 		// header (Recycle never reports full), and it is terminal the same way a
 		// failed record append is: the caller's mutation may already be
