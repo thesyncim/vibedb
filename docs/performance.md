@@ -106,8 +106,11 @@ A replacement table must:
    client count;
 5. include requested checkpoint and maintenance stalls in elapsed time;
 6. report both apparent and allocated disk bytes, with low- and
-   high-cardinality corpora side by side; and
-7. keep measured database results separate from microbenchmarks and
+   high-cardinality corpora side by side;
+7. name the storage profile and effective compression configuration for every
+   disk row, and never rank intrinsic/uncompressed rows together with
+   production-compressed rows; and
+8. keep measured database results separate from microbenchmarks and
    projections.
 
 The detailed rationale is in the

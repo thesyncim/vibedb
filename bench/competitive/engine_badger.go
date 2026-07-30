@@ -52,26 +52,32 @@ func newBadger(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.Durability = mode
+	profile, err := ResolveStorageProfile("badger", cfg.StorageProfile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageProfile = profile.Profile
+	compression, blockCacheBytes, indexCacheBytes := badgerStorageOptions(profile, cfg.CacheBytes)
 	opt := badger.DefaultOptions(cfg.Dir).
 		// Badger logs to stderr at INFO by default, which would pollute
 		// benchmark output and cost real time during a 100k-document load.
 		WithLogger(nil).
-		// Default is Snappy. None of bbolt, pebble-as-configured, SQLite, or
-		// either vibejson mode compresses, so leaving Badger compressed would
-		// make the bytes-on-disk column incomparable and charge Badger CPU
-		// nobody else pays.
-		WithCompression(options.None).
+		// The intrinsic profile forces None for the apples-to-apples format
+		// lane. The production profile restores Badger's pinned recommended
+		// default, Snappy. Only SST blocks are compressed; the value log and
+		// other files still count in full.
+		WithCompression(compression).
 		// The default value-log file size is 1 GiB, which Badger mmaps. With
 		// ~250-byte values that reserves three orders of magnitude more
 		// address space than the data needs and distorts RSS badly. 64 MiB
 		// still amortises rotation across the whole corpus.
 		WithValueLogFileSize(64 << 20).
 		// Give Badger the same 64 MiB read-cache budget as everyone else.
-		// With compression and encryption off, Badger's own guidance is to
-		// leave the block cache at zero and let it read from the mmapped
-		// tables directly, so the whole budget goes to the index cache.
-		WithBlockCacheSize(0).
-		WithIndexCacheSize(cfg.CacheBytes).
+		// Badger's own guidance is a zero block cache when compression is off,
+		// and a block cache when it is on. Keep the total fixed while moving
+		// the budget between index and block caches with the profile.
+		WithBlockCacheSize(blockCacheBytes).
+		WithIndexCacheSize(indexCacheBytes).
 		// The harness never runs concurrent conflicting transactions, so
 		// conflict detection is pure overhead here.
 		WithDetectConflicts(false).
@@ -84,6 +90,16 @@ func newBadger(cfg Config) (Engine, error) {
 	e := &badgerEngine{cfg: cfg, db: db}
 	e.self = &badgerSession{cfg: cfg, db: db}
 	return e, nil
+}
+
+func badgerStorageOptions(
+	profile StorageProfileResolution,
+	cacheBytes int64,
+) (options.CompressionType, int64, int64) {
+	if profile.compression == storageCompressionSnappy {
+		return options.Snappy, cacheBytes, 0
+	}
+	return options.None, 0, cacheBytes
 }
 
 func (b *badgerEngine) Name() string { return "badger" }
@@ -107,9 +123,12 @@ func (b *badgerEngine) Durability() string {
 }
 
 func (b *badgerEngine) Tuning() string {
-	return "Logger=nil; Compression=None (to match the uncompressed competitors and make bytes-on-disk comparable); " +
+	storage := "Compression=None for the intrinsic uncompressed comparison; BlockCacheSize=0 with IndexCacheSize=64 MiB, Badger's recommendation when compression is off; "
+	if b.cfg.StorageProfile == StorageProfileProduction {
+		storage = "Compression=Snappy for SST blocks, Badger v4.9.5's recommended default; BlockCacheSize=64 MiB with IndexCacheSize=0, keeping the common cache budget while following Badger's requirement/recommendation to cache compressed blocks; "
+	}
+	return "Logger=nil; " + storage +
 		"ValueLogFileSize=64 MiB instead of the 1 GiB default, which would otherwise mmap a gigabyte for a 25 MiB corpus; " +
-		"BlockCacheSize=0 with IndexCacheSize=64 MiB, which is Badger's own recommendation when compression is off; " +
 		"DetectConflicts=false (no concurrent transactions here); NumVersionsToKeep=1; " +
 		"IteratorOptions.PrefetchValues=false on every full-corpus walk, against Badger's default of true, because the " +
 		"prefetch worker pool only pays for large value-log-resident values and these are ~250 bytes inline in the LSM " +
@@ -250,11 +269,11 @@ func (s *badgerSession) ScanAllBytes() (int, error) {
 }
 
 func (b *badgerEngine) Get(dst []byte, key string) ([]byte, error) { return b.self.Get(dst, key) }
-func (b *badgerEngine) Put(key string, doc []byte) error          { return b.self.Put(key, doc) }
-func (b *badgerEngine) Upsert(key string, doc []byte) error       { return b.self.Upsert(key, doc) }
-func (b *badgerEngine) Delete(key string) error                   { return b.self.Delete(key) }
-func (b *badgerEngine) Scan() (int, error)                        { return b.self.Scan() }
-func (b *badgerEngine) ScanAllBytes() (int, error)                { return b.self.ScanAllBytes() }
+func (b *badgerEngine) Put(key string, doc []byte) error           { return b.self.Put(key, doc) }
+func (b *badgerEngine) Upsert(key string, doc []byte) error        { return b.self.Upsert(key, doc) }
+func (b *badgerEngine) Delete(key string) error                    { return b.self.Delete(key) }
+func (b *badgerEngine) Scan() (int, error)                         { return b.self.Scan() }
+func (b *badgerEngine) ScanAllBytes() (int, error)                 { return b.self.ScanAllBytes() }
 
 // Session vends a fresh per-client session sharing the *badger.DB. Each carries
 // its own read transaction, so N clients never race on one *badger.Txn while the

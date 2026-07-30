@@ -26,6 +26,7 @@ type config struct {
 	sampleMutations     int
 	checkpointMutations int
 	cardinalityName     string
+	storageProfileName  string
 	seed                int64
 	allowDiagnostic     bool
 }
@@ -56,6 +57,10 @@ func run(args []string, out io.Writer) error {
 	fs.IntVar(&cfg.sampleMutations, "sample-mutations", 5_000, "sample disk bytes after this many additional mutations")
 	fs.IntVar(&cfg.checkpointMutations, "checkpoint-mutations", 64, "checkpoint cadence in acknowledged mutations; zero means final only")
 	fs.StringVar(&cfg.cardinalityName, "cardinality", "low", "low or high corpus cardinality")
+	fs.StringVar(
+		&cfg.storageProfileName, "storage-profile", "intrinsic",
+		"disk comparison profile: intrinsic (optional compression off) or production (recommended built-in compression)",
+	)
 	fs.Int64Var(&cfg.seed, "seed", defaultSeed, "deterministic churn seed")
 	fs.BoolVar(
 		&cfg.allowDiagnostic, "allow-diagnostic", false,
@@ -93,6 +98,14 @@ func run(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	storageProfile, err := competitive.ParseStorageProfile(cfg.storageProfileName)
+	if err != nil {
+		return err
+	}
+	profile, err := competitive.ResolveStorageProfile(cfg.engineName, storageProfile)
+	if err != nil {
+		return err
+	}
 	durability, err := competitive.ResolveDurabilityMode(
 		cfg.engineName, competitive.DurabilityBufferedVisible,
 	)
@@ -107,9 +120,10 @@ func run(args []string, out io.Writer) error {
 	}
 	defer os.RemoveAll(dir)
 	engine, err := factory.New(competitive.Config{
-		Dir:        dir,
-		Durability: durability,
-		CacheBytes: competitive.DefaultCacheBytes,
+		Dir:            dir,
+		Durability:     durability,
+		CacheBytes:     competitive.DefaultCacheBytes,
+		StorageProfile: storageProfile,
 	})
 	if err != nil {
 		return err
@@ -226,13 +240,14 @@ func run(args []string, out io.Writer) error {
 	printHeader(out)
 	commit := gitCommit()
 	for _, s := range samples {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%t\t%s\t%s\t%d\t%d\t%d\t%.6f\n",
+		fmt.Fprintf(out, "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%t\t%s\t%s\t%d\t%d\t%d\t%.6f\t%s\t%s\t%s\n",
 			commit, cfg.engineName, cardinality, cfg.corpusSize,
 			cfg.mutationBudget, cfg.replacePercent, cfg.sampleMutations,
 			engine.DurabilityMode(), cfg.checkpointMutations,
 			competitive.DefaultCacheBytes, cfg.seed,
 			forced, publishable, floor.MaintenanceFloorDescription(), s.phase,
 			s.mutationIndex, s.apparentBytes, s.allocatedBytes, s.elapsed.Seconds(),
+			profile.Profile, profile.Compression, profile.Provenance,
 		)
 	}
 	return nil
@@ -253,7 +268,8 @@ func printHeader(w io.Writer) {
 		"replace-percent", "sample-mutations", "durability",
 		"checkpoint-mutations", "cache-bytes", "seed", "forced-cp", "publishable",
 		"maintenance-floor", "phase", "mutation-index", "apparent-bytes",
-		"allocated-bytes", "elapsed-seconds",
+		"allocated-bytes", "elapsed-seconds", "storage-profile", "compression",
+		"compression-provenance",
 	}, "\t"))
 }
 

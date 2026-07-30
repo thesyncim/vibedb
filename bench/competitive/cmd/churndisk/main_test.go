@@ -11,14 +11,21 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 	for _, engine := range []string{"vibejson-durable", "bbolt"} {
 		t.Run(engine, func(t *testing.T) {
 			var out bytes.Buffer
-			err := run([]string{
+			args := []string{
 				"-engine=" + engine,
 				"-corpus=1000",
 				"-mutations=2000",
 				"-sample-mutations=500",
 				"-checkpoint-mutations=64",
 				"-allow-diagnostic",
-			}, &out)
+			}
+			wantProfile := "intrinsic"
+			wantCompression := "unsupported/no-op"
+			if engine == "bbolt" {
+				args = append(args, "-storage-profile=production")
+				wantProfile = "production"
+			}
+			err := run(args, &out)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -33,7 +40,8 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 			}
 			for _, required := range []string{
 				"engine", "mutation-index", "phase", "apparent-bytes",
-				"allocated-bytes", "forced-cp", "publishable",
+				"allocated-bytes", "forced-cp", "publishable", "storage-profile",
+				"compression", "compression-provenance",
 			} {
 				if _, ok := index[required]; !ok {
 					t.Fatalf("header omits %q: %q", required, lines[0])
@@ -57,6 +65,15 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				phases[fields[index["phase"]]] = true
 				if fields[index["publishable"]] != "false" {
 					t.Fatalf("diagnostic line %d marked publishable: %q", lineNo+2, line)
+				}
+				if fields[index["storage-profile"]] != wantProfile {
+					t.Fatalf("line %d storage profile = %q, want %q", lineNo+2, fields[index["storage-profile"]], wantProfile)
+				}
+				if fields[index["compression"]] != wantCompression {
+					t.Fatalf("line %d compression = %q, want %q", lineNo+2, fields[index["compression"]], wantCompression)
+				}
+				if !strings.Contains(fields[index["compression-provenance"]], "profile-no-op") {
+					t.Fatalf("line %d omits no-op provenance: %q", lineNo+2, line)
 				}
 			}
 			if !phases["pre-floor"] || !phases["post-floor"] {

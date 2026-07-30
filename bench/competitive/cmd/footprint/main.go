@@ -11,6 +11,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	competitive "github.com/thesyncim/vibedb/bench/competitive"
@@ -25,6 +26,10 @@ func main() {
 	durabilityName := flag.String(
 		"durability", "default",
 		"default, volatile, buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe",
+	)
+	storageProfileName := flag.String(
+		"storage-profile", "intrinsic",
+		"disk comparison profile: intrinsic (optional compression off) or production (recommended built-in compression)",
 	)
 	card := flag.String("cardinality", "low", "corpus variant: low (the shipped, ~92% redundant one) or high. "+
 		"The two are shape- and length-identical and differ only in value entropy, so the difference between a "+
@@ -46,6 +51,8 @@ func main() {
 	check(err)
 	durability, err := competitive.ParseDurabilityMode(*durabilityName)
 	check(err)
+	storageProfile, err := competitive.ParseStorageProfile(*storageProfileName)
+	check(err)
 
 	if *corpusStats {
 		// The number that has to sit beside every disk column: how much of this
@@ -61,9 +68,7 @@ func main() {
 	}
 
 	if *header {
-		fmt.Printf("%-24s %-24s %8s %8s %12s %12s %12s %12s %12s %12s\n",
-			"engine", "durability", "corpus", "indexed", "disk", "diskalloc",
-			"heapalloc", "heapsys", "resident", "maxrss")
+		printHeader(os.Stdout)
 	}
 	if *engine == "baseline" {
 		// The harness's own cost with no engine at all: the corpus is built and
@@ -72,7 +77,11 @@ func main() {
 		_ = competitive.CorpusOf(*corpus, cardinality)
 		fp, err := competitive.Measure(nil, "")
 		check(err)
-		report("baseline", "-", cardinality, false, fp)
+		report(os.Stdout, "baseline", "-", cardinality, false, fp, competitive.StorageProfileResolution{
+			Profile:     storageProfile,
+			Compression: "n/a",
+			Provenance:  "harness-baseline:no-engine",
+		})
 		return
 	}
 	if *engine == "" {
@@ -84,6 +93,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "footprint: unknown engine %q\n", *engine)
 		os.Exit(2)
 	}
+	profile, err := competitive.ResolveStorageProfile(factory.Name, storageProfile)
+	check(err)
 
 	docs := competitive.CorpusOf(*corpus, cardinality)
 	dir, err := os.MkdirTemp("", "vibebench-footprint-")
@@ -91,11 +102,12 @@ func main() {
 	defer os.RemoveAll(dir)
 
 	e, err := factory.New(competitive.Config{
-		Dir:        dir,
-		Durability: durability,
-		Indexed:    *indexed,
-		CacheBytes: competitive.DefaultCacheBytes,
-		PutLoop:    *putloop,
+		Dir:            dir,
+		Durability:     durability,
+		Indexed:        *indexed,
+		CacheBytes:     competitive.DefaultCacheBytes,
+		PutLoop:        *putloop,
+		StorageProfile: storageProfile,
 	})
 	check(err)
 
@@ -115,7 +127,7 @@ func main() {
 	} else if factory.Name == "vibejson-durable" {
 		name += "/bulk-unified"
 	}
-	report(name, e.DurabilityMode().String(), cardinality, *indexed, fp)
+	report(os.Stdout, name, e.DurabilityMode().String(), cardinality, *indexed, fp, profile)
 
 	if *files {
 		entries, err := competitive.DirFileSizes(dir)
@@ -132,17 +144,27 @@ func main() {
 	check(e.Close())
 }
 
+func printHeader(w io.Writer) {
+	fmt.Fprintf(w, "%-24s %-24s %8s %8s %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
+		"engine", "durability", "corpus", "indexed", "disk", "diskalloc",
+		"heapalloc", "heapsys", "resident", "maxrss", "storage-profile",
+		"compression", "compression-provenance")
+}
+
 func report(
+	w io.Writer,
 	name, durability string,
 	card competitive.Cardinality,
 	indexed bool,
 	fp competitive.Footprint,
+	profile competitive.StorageProfileResolution,
 ) {
-	fmt.Printf("%-24s %-24s %8s %8v %12s %12s %12s %12s %12s %12s\n",
+	fmt.Fprintf(w, "%-24s %-24s %8s %8v %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
 		name, durability, card, indexed,
 		mib(fp.DiskBytes), mib(fp.DiskAllocatedBytes),
 		mib(int64(fp.HeapAlloc)), mib(int64(fp.HeapSys)),
-		mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()))
+		mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()),
+		profile.Profile, profile.Compression, profile.Provenance)
 }
 
 func mib(n int64) string { return fmt.Sprintf("%.1f", float64(n)/(1<<20)) }

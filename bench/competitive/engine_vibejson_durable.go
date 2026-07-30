@@ -40,6 +40,11 @@ func newVibeDurable(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.Durability = mode
+	profile, err := ResolveStorageProfile("vibejson-durable", cfg.StorageProfile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageProfile = profile.Profile
 	return &vibeDurable{cfg: cfg}, nil
 }
 

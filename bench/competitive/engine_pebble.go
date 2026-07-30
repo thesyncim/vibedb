@@ -19,16 +19,21 @@ func newPebble(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.Durability = mode
+	profile, err := ResolveStorageProfile("pebble", cfg.StorageProfile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageProfile = profile.Profile
 	// Pebble's default block cache is 8 MiB. Every other engine here was given
 	// 64 MiB, so leaving Pebble on the default would make it lose a cache
 	// fight it was never entered into.
 	cache := pebble.NewCache(cfg.CacheBytes)
 	opts := &pebble.Options{
 		Cache: cache,
-		// Snappy by default. Turned off so bytes-on-disk is comparable with
-		// the uncompressed engines and Pebble is not charged compression CPU
-		// nobody else pays.
-		Levels: []pebble.LevelOptions{{Compression: pebble.NoCompression}},
+		// The intrinsic profile forces uncompressed SST blocks. The production
+		// profile explicitly restores Pebble v1.1.5's default, Snappy. A
+		// single LevelOptions entry is inherited by every higher level.
+		Levels: []pebble.LevelOptions{{Compression: pebbleStorageCompression(profile)}},
 		// 64 MiB memtables let the whole ~25 MiB corpus land in one or two
 		// flushes rather than a dozen, which is what a bulk load would be
 		// configured for in practice.
@@ -50,6 +55,13 @@ func newPebble(cfg Config) (Engine, error) {
 	return &pebbleEngine{cfg: cfg, db: db, cache: cache, wopts: wopts}, nil
 }
 
+func pebbleStorageCompression(profile StorageProfileResolution) pebble.Compression {
+	if profile.compression == storageCompressionSnappy {
+		return pebble.SnappyCompression
+	}
+	return pebble.NoCompression
+}
+
 func (p *pebbleEngine) Name() string { return "pebble" }
 
 func (p *pebbleEngine) DurabilityMode() DurabilityMode { return p.cfg.Durability }
@@ -62,8 +74,12 @@ func (p *pebbleEngine) Durability() string {
 }
 
 func (p *pebbleEngine) Tuning() string {
+	storage := "Compression=None on all SST levels for the intrinsic uncompressed comparison; "
+	if p.cfg.StorageProfile == StorageProfileProduction {
+		storage = "Compression=Snappy on all SST levels, Pebble v1.1.5's default; WAL and metadata bytes remain uncompressed and included; "
+	}
 	return "Cache=64 MiB instead of the 8 MiB default, matching every other engine's read-cache budget; " +
-		"Compression=None on all levels so bytes-on-disk is comparable; " +
+		storage +
 		"MemTableSize=64 MiB so the bulk load is not chopped into a dozen flushes; " +
 		"MaxConcurrentCompactions=2. " +
 		"Checkpoint uses LogData(nil, pebble.Sync), Pebble's own documented WAL sequence fence, rather than " +

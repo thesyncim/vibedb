@@ -48,6 +48,17 @@ type Config struct {
 	// engine wins or loses purely on how much of the corpus it was allowed to
 	// keep resident. It is set to vibejson durable's default ResidentBytes.
 	CacheBytes int64
+	// StorageProfile selects which optional, engine-provided storage
+	// compression the footprint-only harnesses permit. The zero value is the
+	// historical intrinsic lane: optional competitor compression is forced
+	// off so the formats are compared without an extra codec. Production
+	// enables the pinned dependency's recommended built-in block compression
+	// where one exists. Engines without such a switch accept both profiles as
+	// an explicitly labelled no-op.
+	//
+	// This is deliberately independent of Untuned: the storage profile defines
+	// the question a disk-space run asks, while Untuned varies call shape.
+	StorageProfile StorageProfile
 	// PutLoop asks an engine that has both a bulk path and a mutation-replay
 	// path to use the latter. Only store/durable distinguishes them.
 	PutLoop bool
@@ -57,15 +68,164 @@ type Config struct {
 	//
 	// It reverts only the choices that are this harness's to make — how an
 	// operation is spelled against the engine's API. It does not revert the
-	// choices that exist to make the engines comparable at all (compression
-	// off and a common 64 MiB read-cache budget): flipping
-	// those would not produce a fair "defaults" row, it would produce a
-	// different benchmark.
+	// choices that exist to make the engines comparable at all (the selected
+	// storage profile and a common 64 MiB read-cache budget): flipping those
+	// would not produce a fair "defaults" row, it would produce a different
+	// benchmark.
 	Untuned bool
 }
 
 // DefaultCacheBytes matches store/durable Options.ResidentBytes' default.
 const DefaultCacheBytes = 64 << 20
+
+// StorageProfile selects the optional compression policy for footprint and
+// sustained-churn disk measurements. It is benchmark configuration, not a
+// store format or production API.
+type StorageProfile uint8
+
+const (
+	// StorageProfileIntrinsic preserves the original comparison: Badger and
+	// Pebble are forced to store uncompressed SST blocks, matching engines
+	// that expose no optional compression switch.
+	StorageProfileIntrinsic StorageProfile = iota
+	// StorageProfileProduction permits each pinned dependency's recommended
+	// built-in storage compression. Badger v4.9.5 and Pebble v1.1.5 both use
+	// Snappy by default. It does not retrofit compression into engines that do
+	// not offer it.
+	StorageProfileProduction
+)
+
+func (p StorageProfile) String() string {
+	switch p {
+	case StorageProfileIntrinsic:
+		return "intrinsic"
+	case StorageProfileProduction:
+		return "production"
+	default:
+		return fmt.Sprintf("storage-profile(%d)", p)
+	}
+}
+
+// ParseStorageProfile parses the stable command-line spelling used by the disk
+// footprint tools.
+func ParseStorageProfile(value string) (StorageProfile, error) {
+	switch value {
+	case "intrinsic":
+		return StorageProfileIntrinsic, nil
+	case "production":
+		return StorageProfileProduction, nil
+	default:
+		return StorageProfileIntrinsic, fmt.Errorf(
+			"unknown storage profile %q (want intrinsic or production)", value,
+		)
+	}
+}
+
+type storageCompression uint8
+
+const (
+	storageCompressionUnsupported storageCompression = iota
+	storageCompressionNone
+	storageCompressionSnappy
+)
+
+// StorageProfileResolution is the effective optional-compression setting for
+// one engine. Compression and Provenance are stable, whitespace-free output
+// fields so a result file remains self-describing after dependencies move on.
+type StorageProfileResolution struct {
+	Profile     StorageProfile
+	Compression string
+	Provenance  string
+	compression storageCompression
+}
+
+// ResolveStorageProfile validates a profile for an engine and describes the
+// exact effective setting. Engines with no optional storage-compression knob
+// intentionally resolve to unsupported/no-op instead of rejecting the
+// production profile: they still belong in that comparison, but must not be
+// mislabelled as compressed.
+func ResolveStorageProfile(engine string, profile StorageProfile) (StorageProfileResolution, error) {
+	if profile != StorageProfileIntrinsic && profile != StorageProfileProduction {
+		return StorageProfileResolution{}, fmt.Errorf(
+			"unknown storage profile %s", profile,
+		)
+	}
+	switch engine {
+	case "badger":
+		version := dependencyVersion("github.com/dgraph-io/badger/v4")
+		if profile == StorageProfileProduction {
+			return StorageProfileResolution{
+				Profile:     profile,
+				Compression: "snappy-sst-blocks",
+				Provenance: fmt.Sprintf(
+					"github.com/dgraph-io/badger/v4@%s:WithCompression(options.Snappy);block-cache=CacheBytes;index-cache=0",
+					version,
+				),
+				compression: storageCompressionSnappy,
+			}, nil
+		}
+		return StorageProfileResolution{
+			Profile:     profile,
+			Compression: "none",
+			Provenance: fmt.Sprintf(
+				"github.com/dgraph-io/badger/v4@%s:WithCompression(options.None);block-cache=0;index-cache=CacheBytes",
+				version,
+			),
+			compression: storageCompressionNone,
+		}, nil
+	case "pebble":
+		version := dependencyVersion("github.com/cockroachdb/pebble")
+		if profile == StorageProfileProduction {
+			return StorageProfileResolution{
+				Profile:     profile,
+				Compression: "snappy-sst-blocks",
+				Provenance: fmt.Sprintf(
+					"github.com/cockroachdb/pebble@%s:Levels[*].Compression=pebble.SnappyCompression",
+					version,
+				),
+				compression: storageCompressionSnappy,
+			}, nil
+		}
+		return StorageProfileResolution{
+			Profile:     profile,
+			Compression: "none",
+			Provenance: fmt.Sprintf(
+				"github.com/cockroachdb/pebble@%s:Levels[*].Compression=pebble.NoCompression",
+				version,
+			),
+			compression: storageCompressionNone,
+		}, nil
+	case "vibejson-durable", "bbolt", "sqlite":
+		return StorageProfileResolution{
+			Profile:     profile,
+			Compression: "unsupported/no-op",
+			Provenance:  "benchmark-adapter:no-optional-compression-switch;profile-no-op",
+			compression: storageCompressionUnsupported,
+		}, nil
+	default:
+		return StorageProfileResolution{}, fmt.Errorf("unknown engine %q", engine)
+	}
+}
+
+func dependencyVersion(path string) string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path != path {
+			continue
+		}
+		if dep.Replace != nil {
+			dep = dep.Replace
+		}
+		if dep.Version != "" {
+			return dep.Version
+		}
+		return "unknown"
+	}
+	return "unknown"
+}
 
 // DurabilityMode is the benchmark contract at a successful mutation return.
 // It deliberately separates visibility, ordinary OS sync, and power-safe

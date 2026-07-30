@@ -37,6 +37,11 @@ func newBbolt(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.Durability = mode
+	profile, err := ResolveStorageProfile("bbolt", cfg.StorageProfile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageProfile = profile.Profile
 	path := filepath.Join(cfg.Dir, "bolt.db")
 	opts := &bolt.Options{
 		// bbolt's default is to fsync the freelist alongside every commit.
@@ -211,10 +216,10 @@ func (s *bboltSession) ScanAllBytes() (int, error) {
 }
 
 func (b *bboltEngine) Get(dst []byte, key string) ([]byte, error) { return b.self.Get(dst, key) }
-func (b *bboltEngine) Put(key string, doc []byte) error          { return b.self.Put(key, doc) }
-func (b *bboltEngine) Upsert(key string, doc []byte) error       { return b.self.Upsert(key, doc) }
-func (b *bboltEngine) Delete(key string) error                   { return b.self.Delete(key) }
-func (b *bboltEngine) ScanAllBytes() (int, error)                { return b.self.ScanAllBytes() }
+func (b *bboltEngine) Put(key string, doc []byte) error           { return b.self.Put(key, doc) }
+func (b *bboltEngine) Upsert(key string, doc []byte) error        { return b.self.Upsert(key, doc) }
+func (b *bboltEngine) Delete(key string) error                    { return b.self.Delete(key) }
+func (b *bboltEngine) ScanAllBytes() (int, error)                 { return b.self.ScanAllBytes() }
 
 // Session vends a fresh per-client session sharing the *bolt.DB. Each carries
 // its own read transaction and bucket handle; bbolt's MVCC lets those readers

@@ -132,6 +132,46 @@ Neither corpus is declared realistic. Together they expose how much the
 unified grammar's per-leaf dictionary benefits from redundancy. Disk results
 always show both; there is no separate compact/verbatim store-mode axis.
 
+## Storage profiles
+
+Footprint and sustained-churn disk runs have two explicit storage profiles:
+
+| `-storage-profile` | Badger | Pebble | vibejson durable, bbolt, SQLite |
+| --- | --- | --- | --- |
+| `intrinsic` (default) | SST compression forced off | SST compression forced off | no optional compression switch; labelled `unsupported/no-op` |
+| `production` | Snappy SST blocks | Snappy SST blocks | no optional compression switch; labelled `unsupported/no-op` |
+
+`intrinsic` is the historical apples-to-apples lane: it compares each
+engine's intrinsic representation without adding an optional block codec.
+`production` asks the separate operational question, “how much disk does the
+pinned engine use with its recommended built-in compression enabled?” Badger
+v4.9.5 and Pebble v1.1.5 both default to Snappy, so the harness selects that
+algorithm explicitly rather than inheriting a dependency default silently.
+
+Every footprint row and churn TSV sample prints `storage-profile`,
+`compression`, and `compression-provenance`. The last field names the exact
+dependency version and API setting. For Badger, enabling compression moves the
+same `CacheBytes` budget from its index cache to its block cache, following
+Badger's compressed-block cache guidance without granting it more memory.
+
+The scope matters: Badger and Pebble compress SST blocks, not every byte in
+their directories. Value logs, WALs, manifests, preallocation, and sparse-file
+effects remain in both apparent and allocated totals. Do not mix storage rows
+from the two profiles in one ranking, and do not attribute the production
+profile's space saving to an intrinsic format. The throughput suites remain on
+the default intrinsic profile; a production-space result does not claim that
+compression CPU was included in those latency rows.
+
+Badger can keep the 100k bulk corpus in its mutable table because the harness
+retains Badger's 64 MiB memtable. `Sync` is a durability fence, not an SST
+flush, and Badger exposes no ordinary public flush operation. Consequently a
+pre-close bulk-footprint row may contain few or no compressible SST bytes even
+though Snappy is configured; `-files` makes that physical state visible. The
+churn samples and post-`Flatten` maintenance-floor row exercise rotated SSTs.
+The harness does not shrink the production profile's memtable merely to make
+compression look better, because that would change memory and LSM geometry in
+the supposed space-only comparison.
+
 ## Footprint
 
 Memory is process-global, so the tool loads one engine per process:
@@ -139,12 +179,15 @@ Memory is process-global, so the tool loads one engine per process:
 ```sh
 go build -o /tmp/vibedb-footprint ./cmd/footprint
 /tmp/vibedb-footprint -engine=baseline -header
-for cardinality in low high; do
-  for engine in $(/tmp/vibedb-footprint -list); do
-    /tmp/vibedb-footprint -engine="$engine" -cardinality="$cardinality"
+for profile in intrinsic production; do
+  for cardinality in low high; do
+    for engine in $(/tmp/vibedb-footprint -list); do
+      /tmp/vibedb-footprint -engine="$engine" \
+        -cardinality="$cardinality" -storage-profile="$profile"
+    done
+    /tmp/vibedb-footprint -engine=vibejson-durable \
+      -putloop -cardinality="$cardinality" -storage-profile="$profile"
   done
-  /tmp/vibedb-footprint -engine=vibejson-durable \
-    -putloop -cardinality="$cardinality"
 done
 ```
 
@@ -160,7 +203,10 @@ floor afterward.
 
 ```sh
 go build -o /tmp/vibedb-churndisk ./cmd/churndisk
-/tmp/vibedb-churndisk -engine=vibejson-durable -cardinality=low
+/tmp/vibedb-churndisk -engine=badger -cardinality=low \
+  -storage-profile=intrinsic
+/tmp/vibedb-churndisk -engine=badger -cardinality=low \
+  -storage-profile=production
 ```
 
 Use `-allow-diagnostic` only for investigation; its short or forced-checkpoint

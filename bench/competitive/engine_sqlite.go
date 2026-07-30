@@ -28,6 +28,11 @@ func newSQLite(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.Durability = mode
+	profile, err := ResolveStorageProfile("sqlite", cfg.StorageProfile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageProfile = profile.Profile
 	path := filepath.Join(cfg.Dir, "sqlite.db")
 	// _pragma parameters are applied to every pooled connection, which
 	// matters because database/sql may open more than one.
