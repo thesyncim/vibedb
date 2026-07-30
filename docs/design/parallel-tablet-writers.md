@@ -76,10 +76,9 @@ inventory the rest of the design builds on; read it as "what is already true."
 Two further verified facts shape everything below:
 
 - **The entire mutation path is serialized under one `sync.Mutex`**
-  (`c.writer`), and on the ordinary-sync lane the 32.5 µs journal fdatasync is
-  paid INSIDE that lock, so concurrent callers divide the fsync budget instead
-  of sharing it (verified, `putPrimary` / `journalAckLocked`). This — not the
-  journal itself — is the whole ordinary-sync loss.
+  (`c.writer`), and the ordinary-sync acknowledgement is paid inside that
+  lock, so concurrent callers divide the sync budget instead of sharing it
+  (verified, `putPrimary` / `journalAckLocked`).
 - **The resident router is a single-writer seqlock.** `UpdateLeaf` brackets
   its row stores with `version.Add(1)` pairs; two concurrent updaters would
   interleave to an even version mid-write and let a reader admit a torn row
@@ -93,19 +92,19 @@ From [RESULTS.md](../../bench/competitive/RESULTS.md) (M4 Max, medians of 10):
 
 | lane | vibedb today | best competitor | gap mechanism |
 |---|---|---|---|
-| buffered ycsb-a | 195,351 | Badger 241,812 | Badger amortizes across its own internal parallelism; our writer is one lock |
-| buffered churn | 265,137 | Badger 316,547 | same |
-| ordinary-sync ycsb-a | 17,949 | Badger 59,728 (SQLite 27,871) | each caller pays a private 32.5 µs journal sync under the writer lock; Badger group-commits its value log |
-| power-safe ycsb-a | 378 | SQLite 431 | two full fences per commit vs one; the single-fence journal ack (4.05 ms) is wired but the group amortization is not |
+| buffered ycsb-a | 182,590 | Badger 264,284 | Badger amortizes across its internal pipeline; our writer is one lock |
+| buffered churn | 244,114 | Badger 328,884 | same |
+| ordinary-sync ycsb-a | 10,138 | Badger 58,358 (SQLite 28,790) | each caller pays its acknowledgement and checkpoint stalls under serialized publication |
+| power-safe ycsb-a | **394** | SQLite 382 | the single-fence path now wins narrowly; group amortization is still absent |
 
 Cost decomposition that the pipeline exploits (all measured): buffered apply
-is ~4.7 µs per update (in-workload p50), hot in-place acks are ~412 ns,
-ordinary journal sync is 32.5 µs, power-safe fence is 4.05 ms
-(`F_FULLFSYNC` floor 4–5 ms), buffered checkpoint p50 330–355 µs, epoch read
-entry 4 ns. The shape is unambiguous: **the sync is 7–860× the apply**, so
+is 4.8–4.9 µs per update (in-workload p50), ordinary-sync updates are
+27.7–39.9 µs, power-safe updates are 4.03–4.12 ms, and buffered checkpoint p50
+is 360–415 µs. The shape is unambiguous: **the sync is far costlier than the
+apply**, so
 sharing one sync across N callers is worth far more than parallelizing the
 apply — and it needs no sharding at all. Sharding then attacks the second
-ceiling (serialized apply at ~4.7 µs ≈ 213 k/s).
+ceiling (serialized apply at ~4.9 µs ≈ 204 k/s).
 
 ## 3. Architecture: stage → fence → publish
 
@@ -217,8 +216,9 @@ rejected.** The arguments, from the measured numbers:
   `fdatasync` on distinct files shares one device queue; whether it scales at
   all on APFS/M4 is unmeasured **(projection — a phase-0 microbench can bound
   it, but the chosen design does not depend on the answer)**. The shared
-  journal's group commit already amortizes the 32.5 µs sync to ~4 µs/op at 8
-  waiting writers, below the apply cost — the sync stops being the
+  journal's group commit is projected to amortize the measured 28-40 µs
+  acknowledgement to roughly 4-5 µs/op at eight waiting writers, near the
+  apply cost — the sync stops being the
   bottleneck, so multiplying sync streams optimizes a solved problem.
 - **One stream keeps recovery exactly as it is** (§9): one `Replay` cursor,
   one base generation, one recycle discipline tied to the one durable root.
@@ -227,7 +227,7 @@ rejected.** The arguments, from the measured numbers:
   verified `checkpointBufferedLocked` ordering) becomes k-way.
 
 This is the Badger model (writers stage records, one syncer fences batches)
-— and Badger's 59.7k ordinary-sync ycsb-a on this exact harness is the
+— and Badger's 58.4k ordinary-sync ycsb-a on this exact harness is the
 existence proof that group commit alone, without any storage-engine
 parallelism, wins this lane.
 
@@ -244,7 +244,7 @@ The **journal sequencer** is a small state machine in front of the existing
   whose record the sync covered.
 - **Windows are natural, not timed.** While a sync is in flight, arrivals
   queue; the next leader takes everything queued. The device's own sync
-  latency IS the window: 32.5 µs windows at fdatasync class, 4 ms windows at
+  latency is the window: roughly 28-40 µs at ordinary-sync class and 4 ms at
   power-safe — the slower the fence, the bigger the group, which is exactly
   the right self-tuning. This mirrors the committer's own measured lesson:
   "how many generations are queued when the worker picks one up" decides

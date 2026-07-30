@@ -175,24 +175,21 @@ The mechanism has landed; these are the still-open measurements and extensions.
 
 - Synchronous single-writer acknowledgement changed from page COW plus two
   ordered syncs to one bounded append plus one sync. The single-fence
-  power-safe journal acknowledgement measures 4.05 ms at store level against
-  the device's `F_FULLFSYNC` floor; the last published competitive tables
-  ([RESULTS.md](../../bench/competitive/RESULTS.md)) predate wiring it as the
-  sync lane and still show the two-fence deficit, so proving the overtake
-  against SQLite's comparable power-safe lane is pending the next competitive
-  refresh. The ordinary-sync lane currently measures 32.5 µs per journal
-  acknowledgement and loses to SQLite and Badger; the active work is collapsing
-  the sync lanes onto single-fence acknowledgements and, on Linux,
-  group-committed FUA journal writes.
+  power-safe journal acknowledgement measures about 4.05 ms against the
+  device's `F_FULLFSYNC` floor. The 2026-07-30 competitive refresh
+  ([RESULTS.md](../../bench/competitive/RESULTS.md)) confirms that path leads
+  SQLite by 3-17% across the five power-safe workloads. Ordinary-sync update
+  medians are 27.7-39.9 µs, but the complete lane still loses to SQLite and
+  Badger outside read-heavy YCSB-B; the open work is group-committed
+  acknowledgement and, on Linux, FUA journal writes.
 - Group commit composes: concurrent synchronous writers sharing one journal
   sync through the commit-grouping machinery is the parallel-writer phase's
   first payoff, since the sync floor then amortizes across writers instead of
   dividing the fsync budget.
 - A `pwritev2(RWF_DSYNC)` lane is worth a Linux lab: a FUA-class record write
   may deliver durability without the separate `fdatasync` syscall.
-- Gates before the sync lane is declared competitive: power-safe mixed lanes
-  vs SQLite on the same harness; the crash matrix covering torn tails,
-  reordered records, journal wrap, and checkpoint-concurrent crashes;
+- Remaining gates: the crash matrix covering torn tails, reordered records,
+  journal wrap, and checkpoint-concurrent crashes;
   recovery-time bounds at a full journal; zero read-path deltas (the standing
   benchmark set).
 

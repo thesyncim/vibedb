@@ -1,10 +1,7 @@
 # Performance
 
-The latest checked-in competitive snapshot was measured on 2026-07-28. It is a
-reproducible baseline, not a claim about current `main`: the primary graph,
-single-fence synchronous journal, compact primary leaves, exact-index overlay,
-spanned postings, and online index creation changed after the measured commits.
-Refresh the suite before attributing these numbers to the current engine.
+The current competitive snapshot was measured on 2026-07-30 from clean commit
+`d714d63e1c48fc7c8e3021cf27675712d08a04fa`.
 
 The complete source tables, competitor versions, commits, corpus definitions,
 and commands live in
@@ -21,39 +18,43 @@ Each result cell is **vibedb / SQLite**:
 
 | Workload | Buffered-visible | Ordinary-sync | Power-safe |
 | --- | ---: | ---: | ---: |
-| YCSB-A | 195,351 / 104,263 | 17,949 / 27,871 | 378 / 431 |
-| YCSB-B | 1,010,312 / 280,248 | 176,264 / 202,783 | 3,663 / 3,904 |
-| YCSB-F | 179,986 / 86,000 | 18,519 / 32,560 | 370 / 402 |
-| Churn | 265,137 / 127,557 | 17,860 / 49,881 | 533 / 589 |
-| Scan mix | 265,362 / 112,967 | 21,176 / 62,369 | 757 / 828 |
+| YCSB-A | 182,590 / 94,134 | 10,138 / 28,790 | 394 / 382 |
+| YCSB-B | 1,105,691 / 275,950 | 177,810 / 181,062 | 4,175 / 3,728 |
+| YCSB-F | 171,480 / 83,182 | 9,860 / 34,737 | 436 / 392 |
+| Churn | 244,114 / 118,515 | 18,016 / 51,866 | 607 / 518 |
+| Scan mix | 248,194 / 107,244 | 18,380 / 62,592 | 829 / 765 |
 
 The columns are separate durability lanes:
 
 - **Buffered-visible:** mutations are visible immediately and become durable at
-  the scheduled checkpoint. In this snapshot vibedb was 1.9–3.6× SQLite.
+  the scheduled checkpoint. vibedb is 1.9-4.0x SQLite.
 - **Ordinary-sync:** every successful mutation crosses an ordinary filesystem
-  boundary. The measured vibedb build trailed SQLite and Badger.
+  boundary. vibedb is near SQLite on read-heavy YCSB-B and trails on the other
+  mixes; Badger leads this lane.
 - **Power-safe:** every successful mutation crosses the strongest Darwin
   device-cache boundary. Only vibedb and SQLite make that promise in this
-  harness; the measured vibedb build trailed SQLite by roughly 6–13%.
+  harness; vibedb leads SQLite by 3-17%.
 
 Do not compare values across lanes as if durability were unchanged. The current
-single-fence synchronous journal landed after this snapshot and has not yet
-received a publishable competitive refresh.
+single-fence synchronous path is included in this snapshot.
 
 ## Space snapshot
 
 The same published run recorded:
 
+Disk cells are **apparent / allocated MiB**.
+
 | Measurement | Result |
 | --- | ---: |
-| Sustained churn, 100k live documents | 36.0 MiB allocated, flat; no maintenance |
-| Verbatim primary bulk, 100k documents | 28.1 MiB allocated |
-| Historical compact chunk bulk, low / high cardinality | 13.9 / 26.1 MiB allocated |
+| Sustained churn, 100k live documents | 35.1 / 35.4, flat |
+| Verbatim primary bulk, low / high cardinality | 28.1 / 29.0 · 28.1 / 28.1 |
+| Compact primary bulk, low / high cardinality | 7.8 / 8.0 · 17.6 / 18.0 |
 
-The compact row is retained only as a format-history result: it measured the
-deleted chunk layout. Primary-graph compact and unified leaves need a new
-cross-engine footprint run before replacing it.
+The shape-matched low- and high-cardinality corpora are both 23.73 MiB raw.
+The compact primary graph is the smallest measured representation in both.
+The replay-through-`Put` diagnostic still reaches the primary macro-tablet
+split limit at 100,000 newly inserted keys; it is not presented as a footprint
+result.
 
 ## Publishing rules
 

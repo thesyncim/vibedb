@@ -106,11 +106,11 @@ stable BucketID, so the router, catalog, COW, snapshots, and the exact-index
 maintainer route to it exactly as to any other leaf; only the payload codec
 differs.
 
-As a measured diagnostic (not yet a published competitive table), a 100k-doc
-compact primary graph occupies roughly **7.8 MiB low-cardinality / 17.6 MiB
-high-cardinality** — below the legacy chunk-layout compact footprint at both
-cardinalities. It is bulk-only, explicitly selected evidence, and the reader
-never has to know which format wrote the file.
+The 2026-07-30 published competitive footprint confirms that a 100k-document
+compact primary graph occupies **7.8 MiB low-cardinality / 17.6 MiB
+high-cardinality** apparent space — below the legacy chunk-layout compact
+footprint at both cardinalities. It is bulk-only, explicitly selected
+evidence, and the reader never has to know which format wrote the file.
 
 ## The surviving hypothesis
 
