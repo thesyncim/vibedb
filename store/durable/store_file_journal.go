@@ -82,22 +82,25 @@ var recoveryJournalFaultHook func(*storeio.RecoveryJournal)
 var recoveryJournalPostSyncHook func()
 
 // recoveryJournalDeltaPreSyncHook and recoveryJournalDeltaPostSyncHook bracket
-// the ordinary buffered-visible checkpoint fence for crash tests. The pre hook
-// runs after the complete batch append and before Sync; the post hook runs
-// after Sync succeeds but before the logical durable watermark advances.
-// Production leaves both nil.
+// the ordinary buffered-visible checkpoint fence for crash tests.
+// recoveryJournalDeltaCarryHook runs after a pressure suffix has been appended
+// without syncing and before its device-silent fold. The pre-sync hook runs
+// after every suffix needed by the target has been appended and before Sync;
+// the post-sync hook runs after Sync succeeds but before the logical durable
+// watermark advances. Production leaves all three nil.
 var (
+	recoveryJournalDeltaCarryHook    func(target uint64)
 	recoveryJournalDeltaPreSyncHook  func(target uint64)
 	recoveryJournalDeltaPostSyncHook func(target uint64)
 )
 
-// journalEnabled reports whether this collection acknowledges through a recovery
-// journal. The synchronous lane is journal-backed unconditionally — Create and
-// CreateFromPrimary mint the journal with the store — and buffered-visible
-// carries one on the Options.RecoveryJournal opt-in; in both cases this is true
-// once the journal file is open. A synchronous store whose root names no
-// journal (created async-visible, reopened sync) has none and stays on the
-// committer fence (chainFenceSync).
+// journalEnabled reports whether this collection has an open recovery journal.
+// Every newly created buffered-visible store carries one: RecoveryJournal
+// selects per-mutation durable acknowledgement, while the ordinary lane uses
+// it only at Flush boundaries. The synchronous lane is also journal-backed
+// unconditionally. A synchronous store whose root names no journal (created
+// async-visible, reopened sync) has none and stays on the committer fence
+// (chainFenceSync).
 func (c *Collection) journalEnabled() bool {
 	return c != nil && c.journal != nil
 }
@@ -303,6 +306,7 @@ func (c *Collection) openRecoveryJournalLocked(
 	c.journalPowerSafe = c.options.CheckpointStrength != CheckpointFilesystem
 	c.journal = journal
 	c.journalDeltaGeneration.Store(rootGeneration)
+	c.journalDeltaAppendedGeneration.Store(rootGeneration)
 	c.initJournalGroupLocked()
 	if recoveryJournalFaultHook != nil {
 		recoveryJournalFaultHook(journal)
@@ -396,6 +400,20 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 	if !c.journalEnabled() || baseGeneration == 0 {
 		return nil
 	}
+	// A device-silent fold may have appended a newer ordinary-buffered suffix
+	// without syncing it yet. Committer staging pressure is allowed to flush an
+	// older rooted cut, but that older physical generation cannot recycle the
+	// journal: doing so would discard the carried suffix and regress both
+	// logical watermarks. Retain the journal until a physical root covers every
+	// appended generation. An explicit Flush may sync that suffix, but the
+	// records still cannot be discarded until a physical root covers them.
+	if c.bufferedJournalDeltaLane() &&
+		baseGeneration < max(
+			c.journalDeltaGeneration.Load(),
+			c.journalDeltaAppendedGeneration.Load(),
+		) {
+		return nil
+	}
 	if baseGeneration < c.journal.BaseGeneration() {
 		// The durable generation never regressed; nothing to recycle past.
 		return nil
@@ -413,6 +431,7 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 		return poisoned
 	}
 	c.journalDeltaGeneration.Store(baseGeneration)
+	c.journalDeltaAppendedGeneration.Store(baseGeneration)
 	// The checkpoint folded every deposited record into the durable root before
 	// this recycle, so any group-commit waiter parked on an earlier ticket is now
 	// durable via the root and must complete without waiting for a sync of the
@@ -594,12 +613,120 @@ func (c *Collection) ensurePrimaryBatchJournalRoom(
 	return nil
 }
 
+// bufferedJournalDeltaStagingCovered reports whether the committer either has
+// no device-silent root or its newest staged root is exactly the heap fold named
+// by primaryCheckpointBase and is already represented by complete journal
+// appends through coveredGeneration. An arbitrary structural/COW publication
+// must never borrow the overlay delta lane.
+func (c *Collection) bufferedJournalDeltaStagingCovered(
+	coveredGeneration uint64,
+) bool {
+	published := c.committer.PublishedGeneration()
+	physicalDurable := c.committer.DurableGeneration()
+	if published == physicalDurable {
+		return true
+	}
+	if published > coveredGeneration {
+		return false
+	}
+	base := c.primaryCheckpointBase
+	return base != nil && base.root.Generation == published
+}
+
+// bufferedJournalDeltaStateEligible rejects every non-overlay source of a
+// visible generation. Exact-index resident deltas are deliberately allowed:
+// replaying the same ordered primary mutations rebuilds identical postings.
+func (c *Collection) bufferedJournalDeltaStateEligible(
+	coveredGeneration uint64,
+) bool {
+	return c.bufferedJournalDeltaStagingCovered(coveredGeneration) &&
+		len(c.primaryPendingParents) == 0 &&
+		len(c.primaryVolatileRetired) == 0 &&
+		len(c.bufferedFirstTouches) == 0 &&
+		len(c.primaryMutationAdmitted) == 0 &&
+		len(c.batchPrimaryAdmitted) == 0
+}
+
+// appendBufferedJournalDeltaLocked appends exactly one complete consecutive
+// overlay interval without syncing it. Success advances only the appended
+// watermark; the durable watermark remains unchanged until an explicit Flush
+// fences the journal. complete=false is a conservative physical-fallback
+// signal, including a gap, structural staging, or bounded journal capacity.
+func (c *Collection) appendBufferedJournalDeltaLocked(
+	after, target uint64,
+) (complete bool, err error) {
+	if target == after {
+		return true, nil
+	}
+	if target < after ||
+		after < c.journalDeltaGeneration.Load() {
+		return false, storeio.ErrGenerationOrder
+	}
+	if !c.bufferedJournalDeltaStateEligible(after) {
+		return false, nil
+	}
+	entries, covered, entryErr :=
+		c.primaryUnifiedOverlay.checkpointEntries(
+			c.journalDeltaEntries[:0], after, target,
+		)
+	if entryErr != nil {
+		return false, entryErr
+	}
+	if !covered || len(entries) == 0 ||
+		!c.journal.FitsBatch(entries) {
+		return false, nil
+	}
+	if _, appendErr := c.journal.AppendBatch(target, entries); appendErr != nil {
+		if errors.Is(appendErr, storeio.ErrRecoveryJournalFull) {
+			return false, nil
+		}
+		return false, c.poisonJournal(appendErr)
+	}
+	c.journalDeltaAppendedGeneration.Store(target)
+	c.journalDeltaRecords.Add(uint64(len(entries)))
+	c.journalDeltaBytes.Add(uint64(storeio.RecoveryBatchRecordPaddedSize(
+		c.journal.Header().SectorSize, entries,
+	)))
+	return true, nil
+}
+
+// carryBufferedJournalDeltaBeforeFoldLocked preserves a complete non-aligned
+// overlay suffix before pressure materializes and recycles the overlay. It never
+// syncs. A later explicit Flush fences this append plus any later suffix with
+// one Sync. Gaps, structural state, and journal capacity return handled=false
+// so the pressure caller takes the ordinary physical checkpoint instead.
+func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
+	handled bool, err error,
+) {
+	if !c.bufferedJournalDeltaLane() {
+		return false, nil
+	}
+	if failure := c.PersistenceError(); failure != nil {
+		return true, failure
+	}
+	state := c.state.Load()
+	if state == nil {
+		return true, ErrClosed
+	}
+	target := state.root.Generation
+	after := c.journalDeltaAppendedGeneration.Load()
+	complete, appendErr :=
+		c.appendBufferedJournalDeltaLocked(after, target)
+	if appendErr != nil || !complete {
+		return complete, appendErr
+	}
+	if recoveryJournalDeltaCarryHook != nil && target > after {
+		recoveryJournalDeltaCarryHook(target)
+	}
+	return true, nil
+}
+
 // checkpointBufferedJournalDeltaLocked makes the current ordinary
-// buffered-visible cut durable with one bounded recovery-journal batch and one
-// sync. It returns handled=false when any visible generation is not represented
-// by one consecutive class-5 overlay record, when physical COW state is staged,
-// or when the journal has no room; the caller then performs the existing full
-// leaf/root checkpoint and recycles the journal.
+// buffered-visible cut durable with one journal Sync. Any suffix not already
+// carried by non-aligned overlay pressure is appended first; a carried suffix
+// needs no second append. It returns handled=false for any partial coverage,
+// structural state, or journal-capacity failure, so the caller performs the
+// existing full leaf/root checkpoint and recycles the journal.
 //
 // The batch retains every raw record rather than coalescing repeated keys.
 // Recovery applies one entry per logical generation, so the reopened public
@@ -619,55 +746,41 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		return true, ErrClosed
 	}
 	target := state.root.Generation
-	after := c.journalDeltaGeneration.Load()
-	if target == after {
+	durableAfter := c.journalDeltaGeneration.Load()
+	appendedAfter := c.journalDeltaAppendedGeneration.Load()
+	if target == durableAfter {
+		if appendedAfter != durableAfter {
+			return true, storeio.ErrGenerationOrder
+		}
 		return true, nil
 	}
-	if target < after {
+	if target < durableAfter || target < appendedAfter ||
+		appendedAfter < durableAfter {
 		return true, storeio.ErrGenerationOrder
 	}
 	// The cheap cut may coexist with resident exact-index deltas: recovery
 	// deterministically rebuilds them by replaying the same primary mutations.
 	//
-	// A device-silent row-overlay fold is also safe once the journal watermark
-	// already covers its complete generation. The committer's newer root is only
-	// staged in memory; after a crash the old durable root plus the retained
+	// A device-silent row-overlay fold is also safe once the appended journal
+	// watermark covers its complete generation. The committer's newer root is
+	// only staged in memory; after a crash the old durable root plus the retained
 	// journal reconstructs the same cut. primaryCheckpointBase identifies that
 	// staged root exactly. Do not admit an arbitrary physical gap here: a
-	// structural/COW publication newer than the watermark is not represented by
-	// checkpointEntries and must take the ordinary full checkpoint.
-	published := c.committer.PublishedGeneration()
-	physicalDurable := c.committer.DurableGeneration()
-	stagedFoldCovered := false
-	if published > physicalDurable && published <= after {
-		if base := c.primaryCheckpointBase; base != nil {
-			stagedFoldCovered = base.root.Generation == published
+	// structural/COW publication newer than the appended watermark is not
+	// represented by checkpointEntries and must take the ordinary full
+	// checkpoint.
+	if !c.bufferedJournalDeltaStateEligible(appendedAfter) {
+		return false, nil
+	}
+	if target > appendedAfter {
+		complete, appendErr :=
+			c.appendBufferedJournalDeltaLocked(appendedAfter, target)
+		if appendErr != nil {
+			return true, appendErr
 		}
-	}
-	if published != physicalDurable && !stagedFoldCovered ||
-		len(c.primaryPendingParents) != 0 ||
-		len(c.primaryVolatileRetired) != 0 ||
-		len(c.bufferedFirstTouches) != 0 ||
-		len(c.primaryMutationAdmitted) != 0 ||
-		len(c.batchPrimaryAdmitted) != 0 {
-		return false, nil
-	}
-	entries, complete, entryErr :=
-		c.primaryUnifiedOverlay.checkpointEntries(
-			c.journalDeltaEntries[:0], after, target,
-		)
-	if entryErr != nil {
-		return true, entryErr
-	}
-	if !complete || len(entries) == 0 ||
-		!c.journal.FitsBatch(entries) {
-		return false, nil
-	}
-	if _, appendErr := c.journal.AppendBatch(target, entries); appendErr != nil {
-		if errors.Is(appendErr, storeio.ErrRecoveryJournalFull) {
+		if !complete {
 			return false, nil
 		}
-		return true, c.poisonJournal(appendErr)
 	}
 	if recoveryJournalDeltaPreSyncHook != nil {
 		recoveryJournalDeltaPreSyncHook(target)
@@ -685,10 +798,6 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	// decisions until pressure or Close performs a full fold.
 	c.journalDeltaGeneration.Store(target)
 	c.journalDeltaCheckpoints.Add(1)
-	c.journalDeltaRecords.Add(uint64(len(entries)))
-	c.journalDeltaBytes.Add(uint64(storeio.RecoveryBatchRecordPaddedSize(
-		c.journal.Header().SectorSize, entries,
-	)))
 	return true, nil
 }
 

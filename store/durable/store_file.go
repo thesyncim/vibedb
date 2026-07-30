@@ -1046,6 +1046,12 @@ type Collection struct {
 	// the committer's physical root generation, while DurableGeneration reports
 	// the maximum of the two. It advances only after the journal sync succeeds.
 	journalDeltaGeneration atomic.Uint64
+	// journalDeltaAppendedGeneration is the newest complete ordinary-buffered
+	// overlay suffix appended to the journal. It may be newer than
+	// journalDeltaGeneration when non-aligned overlay pressure carries a suffix
+	// before a device-silent fold. A later explicit Flush syncs every append
+	// through this watermark with one fence, then advances the durable watermark.
+	journalDeltaAppendedGeneration atomic.Uint64
 	// journalDeltaEntries is fixed writer-owned framing scratch for one cheap
 	// checkpoint. The class-5 overlay itself is capped at this record count, so
 	// every eligible interval fits without allocation.
@@ -1403,11 +1409,11 @@ type Stats struct {
 	// share one fence. Both are zero unless a recovery journal is configured.
 	JournalSyncs        uint64
 	JournalLargestGroup uint32
-	// JournalDelta* accounts for ordinary buffered-visible Flush calls made
-	// durable by one recovery-journal batch instead of a physical root fold.
-	// Records is the number of logical overlay mutations carried, Bytes their
-	// sector-padded journal traffic, and FullFallbacks counts attempted cheap
-	// checkpoints that deliberately fell back to the full COW/root path.
+	// JournalDelta* accounts for ordinary buffered-visible journal checkpoints.
+	// Checkpoints counts explicit Flush fences. Records is the number of logical
+	// overlay mutations appended (including an unsynced pressure carry), Bytes
+	// their sector-padded journal traffic, and FullFallbacks counts attempted
+	// delta paths that deliberately fell back to the full COW/root path.
 	JournalDeltaCheckpoints   uint64
 	JournalDeltaRecords       uint64
 	JournalDeltaBytes         uint64

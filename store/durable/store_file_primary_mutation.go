@@ -655,18 +655,16 @@ retryAfterUnifiedFold:
 		}
 		if pressure || c.primaryUnifiedOverlay.hasPending() {
 			leafLease.Release()
-			if err := c.materializePrimaryParentsLocked(); err != nil {
+			if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 				return false, err
 			}
-			c.primaryOverlayFolds.Add(1)
 			goto retryAfterUnifiedFold
 		}
 	} else if c.primaryUnifiedOverlay.hasPending() {
 		leafLease.Release()
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 			return false, err
 		}
-		c.primaryOverlayFolds.Add(1)
 		goto retryAfterUnifiedFold
 	}
 	// Overlay publication owns no page-cache dirty frame, pending-parent slot,
@@ -905,19 +903,17 @@ retryAfterUnifiedDeleteFold:
 			return overlayDeleted, nil
 		}
 		if pressure || c.primaryUnifiedOverlay.hasPending() {
-			if err := c.materializePrimaryParentsLocked(); err != nil {
+			if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 				return false, fmt.Errorf(
 					"materialize before unified delete: %w", err,
 				)
 			}
-			c.primaryOverlayFolds.Add(1)
 			goto retryAfterUnifiedDeleteFold
 		}
 	} else if c.primaryUnifiedOverlay.hasPending() {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 			return false, err
 		}
-		c.primaryOverlayFolds.Add(1)
 		goto retryAfterUnifiedDeleteFold
 	}
 	if canonicalPath {
@@ -1810,6 +1806,40 @@ func (c *Collection) materializePrimaryParentsLocked() error {
 	}
 	c.automaticCheckpoints.Add(1)
 	return c.materializePrimaryParentsOnceLocked()
+}
+
+// materializePrimaryOverlayPressureLocked drains a full/non-admissible class-5
+// overlay without accidentally discarding a volatile generation interval. The
+// ordinary buffered delta lane first carries a complete suffix into the journal
+// without syncing; only then may a device-silent fold recycle the overlay. If
+// the suffix is incomplete or the bounded journal is full, use the physical
+// checkpoint path instead. Other durability lanes retain their existing
+// device-silent materialization behavior.
+func (c *Collection) materializePrimaryOverlayPressureLocked() error {
+	if !c.bufferedJournalDeltaLane() {
+		if err := c.materializePrimaryParentsLocked(); err != nil {
+			return err
+		}
+		c.primaryOverlayFolds.Add(1)
+		return nil
+	}
+	handled, err := c.carryBufferedJournalDeltaBeforeFoldLocked()
+	if err != nil {
+		return err
+	}
+	if handled {
+		if err := c.materializePrimaryParentsLocked(); err != nil {
+			return err
+		}
+		c.primaryOverlayFolds.Add(1)
+		return nil
+	}
+	c.journalDeltaFullFallbacks.Add(1)
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return err
+	}
+	c.automaticCheckpoints.Add(1)
+	return nil
 }
 
 func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
