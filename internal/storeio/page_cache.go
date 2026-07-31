@@ -1904,12 +1904,15 @@ func (c *PageCache) beginPrefetch(ref PageRef) (pageCacheRingLoad, bool) {
 }
 
 func (c *PageCache) completeRingPrefetch(ring *Ring, loads []pageCacheRingLoad) error {
-	for range loads {
-		completion, ok, err := ring.Pop()
-		if err != nil {
-			return err
-		}
-		if !ok || completion.UserData >= uint64(len(loads)) {
+	completions, err := ring.PopBatch(uint32(len(loads)))
+	if err != nil {
+		return err
+	}
+	if len(completions) != len(loads) {
+		return ErrOverflow
+	}
+	for _, completion := range completions {
+		if completion.UserData >= uint64(len(loads)) {
 			return ErrOverflow
 		}
 		index := int(completion.UserData)
