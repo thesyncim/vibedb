@@ -64,6 +64,8 @@ func workloadNamed(name string) (workload, bool) {
 		return workload{name: name, reads: 500, updates: 500}, true
 	case "ycsb-f":
 		return workload{name: name, reads: 500, readModifies: 500}, true
+	case "write":
+		return workload{name: name, updates: 1000}, true
 	case "churn":
 		return workload{name: name, reads: 700, updates: 250, churns: 50}, true
 	case "scan":
@@ -146,7 +148,7 @@ func buildKeyTrace(base, span, length int, keySeed, probeSeed int64) []int {
 
 func main() {
 	engineName := flag.String("engine", "", "engine name (see -list)")
-	workloadName := flag.String("workload", "churn", "ycsb-b, ycsb-a, ycsb-f, churn, or scan")
+	workloadName := flag.String("workload", "churn", "ycsb-b, ycsb-a, ycsb-f, write, churn, or scan")
 	corpusSize := flag.Int("corpus", competitive.CorpusSize, "documents in the shared corpus")
 	operations := flag.Int("operations", 100_000, "measured user operations")
 	warmup := flag.Int("warmup", 10_000, "unmeasured warmup operations")
@@ -167,7 +169,7 @@ func main() {
 	flag.Parse()
 
 	if *list {
-		fmt.Println("workloads: ycsb-b ycsb-a ycsb-f churn scan")
+		fmt.Println("workloads: ycsb-b ycsb-a ycsb-f write churn scan")
 		fmt.Print("engines:")
 		for _, factory := range competitive.Factories() {
 			fmt.Print(" ", factory.Name)
