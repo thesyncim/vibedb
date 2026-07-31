@@ -255,9 +255,12 @@ group until the first configured bound:
 - `MaxBatchDocuments`;
 - optional coalescing target.
 
-The combiner does not wait merely to make a lone operation look batched. It
-extends a group when another request is already queued or a producer is known
-to be in flight. An explicit latency window remains a caller policy, just like
+The production synchronous lane uses a bounded 50µs arrival window: this is
+small beside a power-safe device barrier and lets a concurrent wave join one
+group, while a lone request still produces a one-entry batch. The combiner is
+not a general parallel writer: indexed, overflow, and unsupported-lane
+requests fall back to the existing exact single-document path. An explicit
+latency window remains a caller policy for future wider lanes, just like
 `CommitCoalesce`.
 
 This is **apply combining**, which happens before a generation is built.

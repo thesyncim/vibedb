@@ -500,24 +500,23 @@ are measured in phase 0, since RESULTS.md rows are single-client.
   10-rep medians with the existing cross-run drift bound; vibedb single-client
   rows within 5% of RESULTS.md (harness overhead audit).
 - **Phase 1 — landed: group-committed acknowledgements, existing single
-  writer.** Each published mutation appends its own record under `c.writer`;
-  the covering sync is flat-combined outside it (§5.2). No tablet sharding or
-  independent-entry batch framing was required. Multi-caller durability,
-  poison, recycle, and race tests are in
-  `store_file_journal_group_test.go`. *Remaining publication gate:* current
-  one- and eight-client ordinary-sync rows for vibedb, Badger, and SQLite,
-  with vibedb single-client within 5% of the phase-0 baseline and the
-  eight-client row compared against the same-client competitor rows.
-- **Phase 1b — sync-lane group fence (the combiner front door).**
-  DurabilitySync callers deposit whole mutation intents; a combiner drains:
-  stage k, one batch record, one `Sync(powerSafe)`, publish k, wake k.
-  Uses the batch-record framing and generalizes
-  `journalBatchBeforePublishLocked` to independent entries. *Gates:*
-  power-safe ycsb-a ≥ **1.5 k ops/s at 8 clients** (about 4× the historical
-  single-client 394; ceiling ~2 k at the 4.05 ms fence) and ≥ SQLite's
-  8-client row;
-  visibility-follows-durability test: no reader observes any group member
-  before the group record is durable; single-client power-safe not regressed.
+  writer.** Buffered-journal deposits still use the flat-combined fence
+  outside `c.writer` (§5.2). The synchronous lane now also has a bounded
+  apply combiner for unindexed inline primary mutations: a short arrival window
+  drains requests into the existing atomic `Update` publisher, which appends
+  one batch record, issues one `Sync(powerSafe)`, and publishes one root. No
+  tablet sharding or independent staging is implied. Multi-caller durability,
+  poison, recycle, and race tests remain in
+  `store_file_journal_group_test.go` and
+  `store_file_mutation_combiner_test.go`.
+- **Phase 1b — remaining sync-lane work.** The landed combiner deliberately
+  falls back to the ordinary exact-index, overflow, and single-request paths.
+  Extending it to independently stage arbitrary mutation intents, preserve
+  indexed maintenance, and publish without the current writer hold remains a
+  separate phase. *Gates:* power-safe ycsb-a ≥ **1.5 k ops/s at 8 clients**
+  (about 4× the historical single-client 394; ceiling ~2 k at the 4.05 ms
+  fence) and ≥ SQLite's 8-client row; visibility-follows-durability test; and
+  no single-client power-safe regression.
 - **Phase 2 — parallel staging (tablet tokens + grouped publish).**
   `writerGate` + tokens + shard frames (§4.2), publish leader (§6.1),
   checkpoint escalation (§6.3). Unindexed collections only; indexed and
