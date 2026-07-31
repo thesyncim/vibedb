@@ -266,18 +266,6 @@ func (f *fields) cstringView() string {
 	return s
 }
 
-// name decodes a cstring used as a prepared-statement or portal name, refusing
-// one past [maxIdentifier]. The bound exists because a session retains one name
-// per open object, so an unbounded name is an unbounded retention.
-func (f *fields) name() string {
-	s := f.cstring()
-	if len(s) > maxIdentifier {
-		f.fail(errNameTooLong)
-		return ""
-	}
-	return s
-}
-
 func (f *fields) nameView() string {
 	s := f.cstringView()
 	if len(s) > maxIdentifier {

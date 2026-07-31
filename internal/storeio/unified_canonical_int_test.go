@@ -8,11 +8,11 @@ import (
 	"testing"
 )
 
-// checkCanonicalIntRoundTrip pins the §3.4 differential contract for one
+// checkCanonicalIntRoundTrip pins the canonical-integer contract for one
 // spelling: admitted implies byte-identical regeneration through the zigzag
-// varint payload; rejected implies the spelling stays a stored literal (in
-// U0 terms: the predicate refuses it, so the token encoder will copy it
-// verbatim and round-trip is the identity by construction).
+// varint payload; rejected implies the spelling stays a stored literal: the
+// predicate refuses it, so the token encoder copies it verbatim and the
+// round-trip is the identity by construction.
 func checkCanonicalIntRoundTrip(t *testing.T, spelling []byte, wantAdmit bool) {
 	t.Helper()
 	v, ok := CanonicalIntValue(spelling)
@@ -63,7 +63,7 @@ func TestTokenCanonicalIntHandcrafted(t *testing.T) {
 	}
 }
 
-// TestTokenCanonicalIntGenerative sweeps the admission predicate as §3.4
+// TestTokenCanonicalIntGenerative sweeps the admission predicate
 // requires: random in-range values must admit and regenerate identically;
 // systematic near-miss mutations of each admitted spelling must reject.
 func TestTokenCanonicalIntGenerative(t *testing.T) {

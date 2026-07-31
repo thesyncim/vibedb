@@ -60,16 +60,11 @@ type scalar struct {
 	raw  []byte // original JSON bytes, for projection passthrough and containers
 }
 
-// classifyRaw classifies one extracted cell. An invalid RawValue (the absence
-// convention of AppendField / AppendPointer) and an explicit JSON null both
-// classify as kindNull, so absent and null paths are indistinguishable to
-// every downstream operation, as documented.
-func classifyRaw(r vibejson.RawValue) scalar {
-	var scratch []byte
-	return classifyRawInto(r, &scratch)
-}
-
-// classifyRawInto is classifyRaw with caller-owned decoded-string storage.
+// classifyRawInto classifies one extracted cell with caller-owned decoded-string
+// storage. An invalid RawValue (the absence convention of AppendField /
+// AppendPointer) and an explicit JSON null both classify as kindNull, so absent
+// and null paths are indistinguishable to every downstream operation, as
+// documented.
 // The caller must reserve enough capacity before the first call if previously
 // returned escaped-string views must survive later calls.
 func classifyRawInto(r vibejson.RawValue, scratch *[]byte) scalar {

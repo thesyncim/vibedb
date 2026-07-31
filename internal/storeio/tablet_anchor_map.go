@@ -24,8 +24,8 @@ const (
 	TabletAnchorMapMaxFences        = 65535
 
 	tabletAnchorMapAcceleratorBytes = TabletAnchorMapAcceleratorSlots * 2
-	tabletAnchorMapMagic            = "AMLAB001"
-	tabletAnchorMapVersion          = uint32(1)
+	tabletAnchorMapMagic            = "AMLAB000"
+	tabletAnchorMapVersion          = DevelopmentFormatVersion
 )
 
 var (
@@ -130,8 +130,8 @@ const (
 	TabletAnchorHandleHandleSize  = 17
 	TabletAnchorHandleTrailerSize = 8
 
-	tabletAnchorHandleMagic   = "AHLAB001"
-	tabletAnchorHandleVersion = uint32(1)
+	tabletAnchorHandleMagic   = "AHLAB000"
+	tabletAnchorHandleVersion = DevelopmentFormatVersion
 	tabletAnchorHandleMissing = uint16(0xffff)
 	tabletAnchorHandleMaxPage = uint64(1) << 48
 )
@@ -951,7 +951,7 @@ func tabletAnchorHandleValidateRef(
 		ref.Generation == 0 ||
 		ref.Generation >= tabletAnchorHandleMaxPage ||
 		ref.LogicalID != uint64(bucket)+1 ||
-		ref.Kind != leafKind || ref.Flags != 0 || ref.Aux != 0 ||
+		ref.Kind != leafKind ||
 		tabletAnchorHandleExtentClass(ref.Length) < 0 {
 		return fmt.Errorf("%w: non-canonical compact leaf ref", ErrInvalidWrite)
 	}

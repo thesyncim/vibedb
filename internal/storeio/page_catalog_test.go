@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"testing"
 )
 
@@ -17,7 +16,6 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 			{Name: "tenant_status_alias", Paths: []string{"/tenant", "/status"}},
 			{Name: "tenant_status", Paths: []string{"/tenant", "/status"}},
 		},
-		Float64Paths: []string{"/score", "/metrics/latency"},
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
 			Fields: []PageCatalogSchemaField{
@@ -44,9 +42,6 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 	}) {
 		t.Fatalf("alias order = %q", names)
 	}
-	if !slices.Equal(got.Float64Paths, []string{"/metrics/latency", "/score"}) {
-		t.Fatalf("float64 paths = %q", got.Float64Paths)
-	}
 	if got.Schema.Fields[0].Path != "/score" ||
 		got.Schema.Fields[0].Types != PageCatalogSchemaNumber ||
 		got.Schema.Fields[1].Path != "/tenant" {
@@ -59,7 +54,6 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 			{Name: "z_by_score", Paths: []string{"/score"}},
 			{Name: "tenant_status_alias", Paths: []string{"/tenant", "/status"}},
 		},
-		Float64Paths: []string{"/metrics/latency", "/score"},
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
 			Fields: []PageCatalogSchemaField{
@@ -99,7 +93,7 @@ func TestPageCatalogNilEmptyAndExplicitSchemaCanonicality(t *testing.T) {
 		t.Fatal(err)
 	}
 	emptyCatalog, err := BuildCanonicalPageCatalog(PageCatalogDefinition{
-		Indexes: []PageCatalogIndex{}, Float64Paths: []string{},
+		Indexes: []PageCatalogIndex{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -151,13 +145,12 @@ func TestPageCatalogFrontCodingAndExactCanonicalGolden(t *testing.T) {
 			{Name: "by_region", Paths: []string{"/profile/region"}},
 			{Name: "by_role", Paths: []string{"/profile/role"}},
 		},
-		Float64Paths: []string{"/profile/risk"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	image := catalog.AppendCanonical(nil)
-	stringBytes := int(binary.LittleEndian.Uint32(image[40:44]))
+	stringBytes := int(binary.LittleEndian.Uint32(image[36:40]))
 	stringCount := int(binary.LittleEndian.Uint32(image[20:24]))
 	cursor := PageCatalogCanonicalHeaderSize
 	previous := ""
@@ -170,10 +163,10 @@ func TestPageCatalogFrontCodingAndExactCanonicalGolden(t *testing.T) {
 		previous = value
 		cursor += 4 + suffix
 	}
-	if cursor != PageCatalogCanonicalHeaderSize+stringBytes || saved < 15 {
+	if cursor != PageCatalogCanonicalHeaderSize+stringBytes || saved < 14 {
 		t.Fatalf("front coding cursor/saved = %d/%d", cursor, saved)
 	}
-	const wantHex = "534a434154433030000000004000000087000000050000000200000002000000010000000000000035000000080000000000000000000000000000000000000000000f002f70726f66696c652f726567696f6e0a00030069736b0a0003006f6c650000090062795f726567696f6e040003006f6c65010000000100020003000000040001000100"
+	const wantHex = "534a43415443303000000000400000007e000000040000000200000002000000000000002e00000008000000000000000000000000000000000000000000000000000f002f70726f66696c652f726567696f6e0a0003006f6c650000090062795f726567696f6e040003006f6c6501000000010001000200000003000100"
 	if fmt.Sprintf("%x", image) != wantHex {
 		t.Fatalf("canonical bytes changed:\n%x", image)
 	}
@@ -190,19 +183,14 @@ func TestPageCatalogRejectsInvalidDefinitions(t *testing.T) {
 			Name: fmt.Sprintf("i%03d", i), Paths: []string{fmt.Sprintf("/p%03d", i)},
 		}
 	}
-	oversize := "/" + strings.Repeat("x", PageCatalogMaxStringBytes)
 	tooManyLogical := make(
 		[]PageCatalogIndex, PageCatalogMaxLogicalIndexes+1,
-	)
-	tooManyFloat64 := make(
-		[]string, PageCatalogMaxFloat64Paths+1,
 	)
 	tooManySchema := make(
 		[]PageCatalogSchemaField, PageCatalogMaxSchemaFields+1,
 	)
 	tests := []PageCatalogDefinition{
 		{Indexes: tooManyLogical},
-		{Float64Paths: tooManyFloat64},
 		{Schema: &PageCatalogSchema{Fields: tooManySchema}},
 		{Indexes: []PageCatalogIndex{{Name: "", Paths: []string{"/a"}}}},
 		{Indexes: []PageCatalogIndex{{Name: "a"}}},
@@ -214,8 +202,6 @@ func TestPageCatalogRejectsInvalidDefinitions(t *testing.T) {
 			{Name: "a", Paths: []string{"/b"}},
 		}},
 		{Indexes: tooManyPhysical},
-		{Float64Paths: []string{"/a", "/a"}},
-		{Float64Paths: []string{oversize}},
 		{Schema: &PageCatalogSchema{Root: 1 << 15}},
 		{Schema: &PageCatalogSchema{Fields: []PageCatalogSchemaField{{
 			Path: "", Types: PageCatalogSchemaString,
@@ -247,7 +233,6 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 			{Name: "a_alias", Paths: []string{"/tenant", "/status"}},
 			{Name: "score", Paths: []string{"/score"}},
 		},
-		Float64Paths: []string{"/score"},
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
 			Fields: []PageCatalogSchemaField{{
@@ -263,9 +248,6 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 	maximum := PageCatalogDefinition{
 		Indexes: make(
 			[]PageCatalogIndex, PageCatalogMaxLogicalIndexes,
-		),
-		Float64Paths: make(
-			[]string, PageCatalogMaxFloat64Paths,
 		),
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
@@ -295,9 +277,6 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 			),
 		}
 	}
-	for i := range maximum.Float64Paths {
-		maximum.Float64Paths[i] = fmt.Sprintf("/float/%03d", i)
-	}
 	for i := range maximum.Schema.Fields {
 		maximum.Schema.Fields[i] = PageCatalogSchemaField{
 			Path:     fmt.Sprintf("/schema/%04d", i),
@@ -326,10 +305,6 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 		t.Fatalf("maximum aliases = %d", got)
 	}
 	if got := binary.LittleEndian.Uint32(image[32:36]); got !=
-		PageCatalogMaxFloat64Paths {
-		t.Fatalf("maximum float paths = %d", got)
-	}
-	if got := binary.LittleEndian.Uint32(image[36:40]); got !=
 		PageCatalogMaxSchemaFields {
 		t.Fatalf("maximum schema fields = %d", got)
 	}
@@ -337,13 +312,14 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 	maxSegments := (PageCatalogMaxCanonicalBytes +
 		PageCatalogSegmentDataCapacity - 1) /
 		PageCatalogSegmentDataCapacity
+	encodedSegments := pageCatalogSegmentCountFor(
+		PageCatalogMaxCanonicalBytes, PageCatalogSegmentPageSize,
+	)
 	if maxSegments > int(^uint16(0)) ||
-		pageCatalogSegmentCount(PageCatalogMaxCanonicalBytes) !=
-			uint16(maxSegments) {
+		encodedSegments != uint16(maxSegments) {
 		t.Fatalf(
 			"maximum segments = %d encoded %d",
-			maxSegments,
-			pageCatalogSegmentCount(PageCatalogMaxCanonicalBytes),
+			maxSegments, encodedSegments,
 		)
 	}
 	if PageCatalogMaxUniqueStrings > int(^uint16(0))+1 ||
@@ -382,17 +358,16 @@ func assertPageCatalogCompactAccounting(
 	wantTotal := PageCatalogCanonicalHeaderSize +
 		stringBytes + physicalBytes +
 		len(definition.Indexes)*4 +
-		len(definition.Float64Paths)*2 +
 		fieldCount*6
 	if catalog.CanonicalSize() != wantTotal ||
 		int(binary.LittleEndian.Uint32(catalog.canonical[16:20])) != wantTotal ||
-		int(binary.LittleEndian.Uint32(catalog.canonical[40:44])) != stringBytes ||
-		int(binary.LittleEndian.Uint32(catalog.canonical[44:48])) != physicalBytes {
+		int(binary.LittleEndian.Uint32(catalog.canonical[36:40])) != stringBytes ||
+		int(binary.LittleEndian.Uint32(catalog.canonical[40:44])) != physicalBytes {
 		t.Fatalf(
 			"accounting size/string/physical = %d/%d/%d, want %d/%d/%d",
 			catalog.CanonicalSize(),
+			binary.LittleEndian.Uint32(catalog.canonical[36:40]),
 			binary.LittleEndian.Uint32(catalog.canonical[40:44]),
-			binary.LittleEndian.Uint32(catalog.canonical[44:48]),
 			wantTotal, stringBytes, physicalBytes,
 		)
 	}
@@ -404,7 +379,6 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 			{Name: "a", Paths: []string{"/aa"}},
 			{Name: "b", Paths: []string{"/ab"}},
 		},
-		Float64Paths: []string{"/f"},
 		Schema: &PageCatalogSchema{
 			Fields: []PageCatalogSchemaField{{
 				Path: "/s", Types: PageCatalogSchemaString,
@@ -415,15 +389,15 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	image := catalog.AppendCanonical(nil)
-	stringBytes := int(binary.LittleEndian.Uint32(image[40:44]))
-	physicalBytes := int(binary.LittleEndian.Uint32(image[44:48]))
+	stringBytes := int(binary.LittleEndian.Uint32(image[36:40]))
+	physicalBytes := int(binary.LittleEndian.Uint32(image[40:44]))
 	aliasStart := PageCatalogCanonicalHeaderSize + stringBytes + physicalBytes
 	for _, test := range []struct {
 		name   string
 		mutate func([]byte)
 	}{
 		{"magic", func(src []byte) { src[0] ^= 1 }},
-		{"reserved", func(src []byte) { src[50] = 1 }},
+		{"reserved", func(src []byte) { src[46] = 1 }},
 		{"total", func(src []byte) { binary.LittleEndian.PutUint32(src[16:20], 1) }},
 		{"front prefix", func(src []byte) {
 			binary.LittleEndian.PutUint16(
@@ -459,8 +433,7 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 		{20, PageCatalogMaxUniqueStrings + 1},
 		{24, PageCatalogMaxPhysicalIndexes + 1},
 		{28, PageCatalogMaxLogicalIndexes + 1},
-		{32, PageCatalogMaxFloat64Paths + 1},
-		{36, PageCatalogMaxSchemaFields + 1},
+		{32, PageCatalogMaxSchemaFields + 1},
 	} {
 		corrupt := slices.Clone(image)
 		binary.LittleEndian.PutUint32(
@@ -637,9 +610,12 @@ func TestPageCatalogSegmentWriteAndReferenceBounds(t *testing.T) {
 	layout, _ := MutableStoreLayout(PageCatalogSegmentPageSize)
 	bounds := PageCatalogBounds{
 		StoreID: testStoreID, Generation: 7,
-		DataStart:     layout.DataStart,
-		FileEnd:       layout.DataStart + uint64(PageCatalogSegmentPageSize),
-		NextLogicalID: 10,
+		PageSize:       PageCatalogSegmentPageSize,
+		DataStart:      layout.DataStart,
+		FileEnd:        layout.DataStart + uint64(PageCatalogSegmentPageSize),
+		NextLogicalID:  10,
+		TotalBytes:     uint32(catalog.CanonicalSize()),
+		ExpectedDigest: catalog.Digest(),
 	}
 	valid := PageCatalogSegmentHeader{
 		StoreID: testStoreID, Generation: 7, LogicalID: 2,
@@ -648,7 +624,7 @@ func TestPageCatalogSegmentWriteAndReferenceBounds(t *testing.T) {
 		func(header *PageCatalogSegmentHeader) { header.StoreID = [16]byte{} },
 		func(header *PageCatalogSegmentHeader) { header.Generation = 0 },
 		func(header *PageCatalogSegmentHeader) { header.Generation = 8 },
-		func(header *PageCatalogSegmentHeader) { header.LogicalID = 1 },
+		func(header *PageCatalogSegmentHeader) { header.LogicalID = 0 },
 		func(header *PageCatalogSegmentHeader) { header.LogicalID = 10 },
 		func(header *PageCatalogSegmentHeader) { header.Ordinal = 1 },
 		func(header *PageCatalogSegmentHeader) {
@@ -759,9 +735,11 @@ func encodePageCatalogTestChainAtPageSize(
 	}
 	bounds := PageCatalogBounds{
 		StoreID: storeID, Generation: generation, PageSize: pageSize,
-		DataStart:     layout.DataStart,
-		FileEnd:       layout.DataStart + uint64(count)*uint64(pageSize),
-		NextLogicalID: uint64(10 + count),
+		DataStart:      layout.DataStart,
+		FileEnd:        layout.DataStart + uint64(count)*uint64(pageSize),
+		NextLogicalID:  uint64(10 + count),
+		TotalBytes:     uint32(catalog.CanonicalSize()),
+		ExpectedDigest: catalog.Digest(),
 	}
 	pages := make([]PageCatalogChainPage, count)
 	for i := range pages {
@@ -797,15 +775,13 @@ func clonePageCatalogTestChain(
 	return out
 }
 
-func TestPageCatalogKindIsAppendedAndDistinct(t *testing.T) {
-	// The retired chunk kinds (including 16, the former PageFingerprintDirectory)
-	// keep their on-disk numbers reserved, so PageCatalogSegment retains the
-	// identifier 17 it has always had: one past the last retired slot, and
-	// distinct from the free-set and primary kinds bracketing it.
-	if PageCatalogSegment != 17 || PageCatalogSegment == PageFreeIndex ||
+func TestPageCatalogKindIsDenseAndDistinct(t *testing.T) {
+	if PageCatalogSegment != PageFreeIndex+1 ||
+		PagePrimaryCatalog != PageCatalogSegment+1 ||
+		PageCatalogSegment == PageFreeIndex ||
 		PageCatalogSegment == PagePrimaryCatalog {
 		t.Fatalf(
-			"catalog kind = %d, want 17 distinct from free-index %d and primary %d",
+			"catalog kind = %d, want dense between free-index %d and primary %d",
 			PageCatalogSegment, PageFreeIndex, PagePrimaryCatalog,
 		)
 	}
@@ -813,7 +789,7 @@ func TestPageCatalogKindIsAppendedAndDistinct(t *testing.T) {
 
 func TestPageCatalogCanonicalImageDoesNotExposeMutableBytes(t *testing.T) {
 	catalog, err := BuildCanonicalPageCatalog(PageCatalogDefinition{
-		Float64Paths: []string{"/x"},
+		Indexes: []PageCatalogIndex{{Name: "x", Paths: []string{"/x"}}},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -27,11 +27,6 @@ var (
 	// ErrPageCacheReference reports a malformed or physically unordered page
 	// reference before any file I/O is attempted.
 	ErrPageCacheReference = errors.New("vibejson: invalid Store page cache reference")
-	// Compatibility names used by the immutable StorePageReader surface.
-	ErrPageCacheFull = ErrPageCachePinned
-	// ErrPageReference is the StorePageReader-surface alias for
-	// ErrPageCacheReference.
-	ErrPageReference = ErrPageCacheReference
 	// ErrPageLeaseClosed reports a read or release against a page lease that has
 	// already been closed.
 	ErrPageLeaseClosed = errors.New("vibejson: Store page lease already closed")
@@ -136,8 +131,6 @@ type pageCacheKey struct {
 	generation uint64
 	length     uint32
 	kind       PageKind
-	flags      uint8
-	aux        uint16
 }
 
 const (
@@ -218,7 +211,6 @@ type PageCacheStats struct {
 	Coalesced       uint64
 	ReadErrors      uint64
 	Prefetches      uint64
-	CopyOuts        uint64
 	PinnedPages     uint64
 	DirtyBytes      uint64
 	PageReads       uint64
@@ -291,7 +283,6 @@ type PageCache struct {
 	cacheMisses      uint64
 	coalesced        uint64
 	readErrors       uint64
-	copyOuts         uint64
 	prefetchHits     atomic.Uint64
 	evictions        uint64
 	prefetchQueued   uint64
@@ -390,7 +381,6 @@ func (l *PageLease) Header() PageHeader {
 	return PageHeader{
 		StoreID: l.cache.options.StoreID, Generation: l.key.generation, LogicalID: l.key.logicalID,
 		PageSize: l.key.length, PayloadLength: l.payloadLength, Kind: l.key.kind,
-		Flags: l.key.flags,
 	}
 }
 
@@ -412,9 +402,6 @@ func (l *PageLease) Page() []byte {
 	}
 	return l.page
 }
-
-// Bytes is the StorePageReader compatibility spelling of Page.
-func (l *PageLease) Bytes() []byte { return l.Page() }
 
 // Release unpins the frame. It is idempotent for one PageLease value.
 func (l *PageLease) Release() {
@@ -478,9 +465,6 @@ func (c *PageCache) acquireFrameHinted(
 	return lease, nil
 }
 
-// Pin is the StorePageReader compatibility spelling of Acquire.
-func (c *PageCache) Pin(ref PageRef) (PageLease, error) { return c.Acquire(ref) }
-
 // ReservationBytes returns the cache-arena bytes a whole logical extent owns.
 // It returns zero when length is not a non-zero, allocation-quantum-aligned
 // extent within MaxPageSize. The calculation takes no lock and performs no
@@ -497,34 +481,6 @@ func (c *PageCache) ReservationBytes(length uint32) uint64 {
 		return 0
 	}
 	return uint64(pageCacheReservedSpan(int(logical/quantum))) * quantum
-}
-
-// ValidatesOnAdmission reports whether a typed payload check runs once, before
-// a page becomes visible, so that resident lookups may reconstruct a view
-// instead of revalidating it. It is the guard on every Admitted* reconstruction
-// reached from a cached page: without it a descent must keep paying the
-// checksum and whole-node walk on every level of every read, which is correct
-// but was measured at roughly three quarters of a warm point read.
-//
-// Dirty pages are covered even though AdmitDirty does not call Validate: they
-// were produced by this process's encoders, which validate everything they
-// write, and they are checksum-verified on the way in.
-func (c *PageCache) ValidatesOnAdmission() bool {
-	return c != nil && c.options.Validate != nil
-}
-
-// AppendPage copies one validated page into dst and releases its frame.
-func (c *PageCache) AppendPage(dst []byte, ref PageRef) ([]byte, error) {
-	lease, err := c.Acquire(ref)
-	if err != nil {
-		return dst, err
-	}
-	dst = append(dst, lease.Page()...)
-	lease.Release()
-	c.mu.Lock()
-	c.copyOuts++
-	c.mu.Unlock()
-	return dst, nil
 }
 
 // Invalidate removes one clean, unpinned admitted reference. Loading, dirty,
@@ -628,8 +584,7 @@ func (c *PageCache) sealDirtyFrame(
 		header.StoreID != c.options.StoreID ||
 		header.PageSize != ref.Length ||
 		header.LogicalID != ref.LogicalID ||
-		header.Generation != ref.Generation ||
-		header.Kind != ref.Kind || header.Flags != ref.Flags {
+		header.Generation != ref.Generation || header.Kind != ref.Kind {
 		return fmt.Errorf(
 			"%w: dirty page identity does not match reservation",
 			ErrPageCacheReference,
@@ -680,9 +635,7 @@ func (c *PageCache) releaseFrameWrite(write Write, generation uint64) {
 		frame.key.generation == generation {
 		frame.flags &^= pageCacheFrameWritePinned
 		available = true
-		if frame.pins == 0 &&
-			(frame.flags&pageCacheFrameDoomed != 0 ||
-				frame.key.kind == PageStateRoot && frame.dirty == 0) {
+		if frame.pins == 0 && frame.flags&pageCacheFrameDoomed != 0 {
 			c.resetExtentLocked(index)
 			reset = true
 		}
@@ -773,7 +726,7 @@ func (c *PageCache) admitDirtyValidated(
 ) error {
 	if header.StoreID != c.options.StoreID || header.PageSize != ref.Length ||
 		header.LogicalID != ref.LogicalID || header.Generation != ref.Generation ||
-		header.Kind != ref.Kind || header.Flags != ref.Flags {
+		header.Kind != ref.Kind {
 		return fmt.Errorf("%w: dirty page identity does not match reference", ErrPageCacheReference)
 	}
 
@@ -851,18 +804,10 @@ func (c *PageCache) MarkDurable(generation uint64) {
 			continue
 		}
 		if dirty.generation <= generation {
-			if frame.key.kind == PageStateRoot && frame.pins == 0 &&
-				frame.flags&pageCacheFrameWritePinned == 0 {
-				// State roots are checkpoint data but readers retain their
-				// decoded state and never fault these pages through PageCache.
-				// Return their staging-only frame immediately at the fence.
-				c.resetExtentLocked(int(dirty.frame))
-			} else {
-				c.dirtyBytes -= uint64(frame.key.length)
-				c.dirtyReservedBytes -=
-					uint64(frame.reservationSpan) * uint64(c.options.PageSize)
-				frame.dirty = 0
-			}
+			c.dirtyBytes -= uint64(frame.key.length)
+			c.dirtyReservedBytes -=
+				uint64(frame.reservationSpan) * uint64(c.options.PageSize)
+			frame.dirty = 0
 		} else {
 			kept = append(kept, dirty)
 		}
@@ -1160,7 +1105,7 @@ func (c *PageCache) validateLoadedPage(page []byte, ref PageRef) (PageHeader, er
 	header, _, err := OpenPage(page)
 	if err == nil && (header.StoreID != c.options.StoreID || header.PageSize != ref.Length ||
 		header.LogicalID != ref.LogicalID || header.Generation != ref.Generation ||
-		header.Kind != ref.Kind || header.Flags != ref.Flags) {
+		header.Kind != ref.Kind) {
 		err = fmt.Errorf("%w: physical page identity does not match reference", ErrPageCacheReference)
 	}
 	if err == nil && c.options.Validate != nil {
@@ -1518,8 +1463,7 @@ func (c *PageCache) tryPinFrameReady(
 	if c.closing.Load() || frame.state != pageCacheReady ||
 		frame.key.offset != key.offset || frame.key.generation != key.generation ||
 		frame.key.logicalID != key.logicalID || frame.key.length != key.length ||
-		frame.key.kind != key.kind || frame.key.flags != key.flags ||
-		frame.key.aux != key.aux || frame.pins == ^uint32(0) {
+		frame.key.kind != key.kind || frame.pins == ^uint32(0) {
 		frame.lock.Unlock()
 		return false
 	}
@@ -1631,7 +1575,7 @@ func cacheKeyHash(key pageCacheKey) uint64 {
 	// a large cache can retain a clean old page after its offset is safely reused,
 	// and offset-only hashing would turn that history into one long probe chain.
 	x := key.offset>>12 ^ key.generation*0x9e3779b97f4a7c15 ^
-		uint64(key.kind)<<48 ^ uint64(key.flags)<<56 ^ uint64(key.aux)<<32
+		uint64(key.kind)<<48
 	x ^= x >> 30
 	x *= 0xbf58476d1ce4e5b9
 	return x ^ x>>27
@@ -1639,26 +1583,23 @@ func cacheKeyHash(key pageCacheKey) uint64 {
 
 func pageCacheKeyStamp(key pageCacheKey) uint32 {
 	x := key.offset ^ key.logicalID ^ key.generation
-	x ^= uint64(key.length)<<32 | uint64(key.kind)<<24 |
-		uint64(key.flags)<<16 | uint64(key.aux)
+	x ^= uint64(key.length)<<32 | uint64(key.kind)<<24
 	return uint32(x ^ x>>32)
 }
 
 func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	pageSize := uint64(c.options.PageSize)
 	length := uint64(ref.Length)
-	validRouting := ref.Aux == 0
 	if length < pageSize || length > uint64(c.options.MaxPageSize) ||
 		!validPageExtentSize(ref.Kind, ref.Length) || length%pageSize != 0 ||
 		ref.Length != uint32(c.options.PageSize) &&
 			ref.Kind != PageOverflow && ref.Kind != PagePrimaryCatalog &&
-			ref.Kind != PageTabletDirectory && ref.Kind != PagePrimaryLocator &&
+			ref.Kind != PagePrimaryLocator &&
 			ref.Kind != PageTabletRoute && ref.Kind != PagePrimaryAnchor &&
 			ref.Kind != PagePrimaryLeaf && ref.Kind != PagePrimaryExactLeaf &&
 			ref.Kind != PagePrimaryExactCatalog ||
-		!validPageFlags(ref.Kind, ref.Flags) || !validRouting || !validPageKind(ref.Kind) ||
-		(ref.Kind == PageStateRoot && ref.LogicalID != StateRootLogicalID) ||
-		(ref.Kind != PageStateRoot && ref.LogicalID <= StateRootLogicalID) ||
+		!validPageKind(ref.Kind) ||
+		ref.LogicalID == 0 ||
 		ref.Generation == 0 ||
 		ref.Offset < c.dataStart || ref.Offset%pageSize != 0 ||
 		ref.Offset > uint64(^uint64(0)>>1)-length {
@@ -1666,7 +1607,7 @@ func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	}
 	return pageCacheKey{
 		offset: ref.Offset, logicalID: ref.LogicalID, generation: ref.Generation,
-		length: ref.Length, kind: ref.Kind, flags: ref.Flags, aux: ref.Aux,
+		length: ref.Length, kind: ref.Kind,
 	}, nil
 }
 
@@ -1999,7 +1940,6 @@ func (c *PageCache) Stats() PageCacheStats {
 		Coalesced:        c.coalesced,
 		ReadErrors:       c.readErrors,
 		Prefetches:       c.prefetchQueued,
-		CopyOuts:         c.copyOuts,
 		PrefetchHits:     c.prefetchHits.Load(),
 		Evictions:        c.evictions,
 		PrefetchQueued:   c.prefetchQueued,

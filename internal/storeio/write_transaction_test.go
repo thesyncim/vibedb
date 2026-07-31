@@ -71,25 +71,14 @@ func TestWriteTransactionPublishesRecoverableStateAndDirtyPage(t *testing.T) {
 	}
 	lease.Release()
 
-	statePage, err := tx.Allocate(PageStateRoot, testSuperblockPageSize, StateRootLogicalID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantState := StateRoot{
 		StoreID: testStoreID, Generation: 1, PageSize: testSuperblockPageSize,
-		MaxPageSize: 64 << 10, NextLogicalID: tx.NextLogicalID(), ChunkDocuments: 64,
+		MaxPageSize: 64 << 10, NextLogicalID: tx.NextLogicalID(),
 	}
-	if _, err := EncodeStateRootPage(statePage.Bytes(), wantState, tx.FileEnd()); err != nil {
+	if err := tx.PublishInline(wantState, InlineFreeDelta{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := statePage.Stage(); err != nil {
-		t.Fatal(err)
-	}
-	stateChecksum := PageChecksum(statePage.Bytes())
-	if err := tx.Publish(statePage.Ref(), stateChecksum, 0, 0, 0); err != nil {
-		t.Fatal(err)
-	}
-	if stats := cache.Stats(); stats.DirtyBytes != 2*uint64(testSuperblockPageSize) {
+	if stats := cache.Stats(); stats.DirtyBytes != uint64(testSuperblockPageSize) {
 		t.Fatalf("dirty cache before wait = %+v", stats)
 	}
 	if err := committer.Wait(1); err != nil {
@@ -100,7 +89,7 @@ func TestWriteTransactionPublishesRecoverableStateAndDirtyPage(t *testing.T) {
 		t.Fatalf("dirty cache after wait = %+v", stats)
 	}
 	scratch := make([]byte, testSuperblockPageSize)
-	root, gotState, slot, err := RecoverStateRoot(file, testSuperblockPageSize, scratch)
+	root, gotState, slot, err := RecoverInlineStateRoot(file, testSuperblockPageSize, scratch)
 	if err != nil || slot != 0 || gotState != wantState || root.Generation != 1 || root.FileEnd != tx.FileEnd() {
 		t.Fatalf("RecoverStateRoot = (%+v,%+v,%d,%v)", root, gotState, slot, err)
 	}
@@ -243,7 +232,7 @@ func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kind := range []PageKind{
-		PageOverflow, PagePrimaryCatalog, PageTabletDirectory, PagePrimaryLocator,
+		PageOverflow, PagePrimaryCatalog, PagePrimaryLocator,
 		PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf, PagePrimaryExactLeaf,
 	} {
 		if _, err := tx.Allocate(
@@ -361,21 +350,30 @@ func TestWriteTransactionReusesAndRollsBackSafeExtents(t *testing.T) {
 	}
 
 	tx = begin()
-	state, err := tx.Allocate(PageStateRoot, testSuperblockPageSize, StateRootLogicalID)
+	state, err := tx.Allocate(PageIndexPosting, testSuperblockPageSize, 0)
 	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := InitPage(state.Bytes(), PageHeader{
+		StoreID: testStoreID, Generation: 3,
+		LogicalID: state.Ref().LogicalID, PageSize: testSuperblockPageSize,
+		PayloadLength: 1, Kind: PageIndexPosting,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload[0] = 1
+	if _, err := SealPage(state.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	root := StateRoot{
 		StoreID: testStoreID, Generation: 3, PageSize: testSuperblockPageSize,
-		MaxPageSize: 64 << 10, NextLogicalID: tx.NextLogicalID(), ChunkDocuments: 64,
-	}
-	if _, err := EncodeStateRootPage(state.Bytes(), root, tx.FileEnd()); err != nil {
-		t.Fatal(err)
+		MaxPageSize: 64 << 10, NextLogicalID: tx.NextLogicalID(),
 	}
 	if err := state.Stage(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Publish(state.Ref(), PageChecksum(state.Bytes()), 0, 0, 0); err != nil {
+	if err := tx.PublishInline(root, InlineFreeDelta{}); err != nil {
 		t.Fatal(err)
 	}
 	if reusable[0].Offset != 4*pageSize || reusable[0].Length != pageSize {

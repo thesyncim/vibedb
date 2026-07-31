@@ -227,8 +227,8 @@ func BenchmarkFileStoreScan(b *testing.B) {
 }
 
 // BenchmarkFileStoreScanMasked is the selective shape query execution produces
-// once an index has already reduced the candidate set: one row per chunk. Its
-// per-row cost is dominated by the chunk-directory descent each mask needs, not
+// once an index has already reduced the candidate set: one row per tile. Its
+// per-row cost is dominated by the primary-route descent each mask needs, not
 // by row extraction, which is why it is reported separately from a full scan.
 func BenchmarkFileStoreScanMasked(b *testing.B) {
 	if testing.Short() {
@@ -241,9 +241,8 @@ func BenchmarkFileStoreScanMasked(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer snapshot.Close()
-	// Ordered-primary stores intentionally retire the legacy LiveChunks
-	// counter, and a fixed slot bit is not guaranteed to name a row in the
-	// stable hash directory. Derive one real occupied slot per live tile from
+	// A fixed slot bit is not guaranteed to name a row in the stable hash
+	// directory. Derive one real occupied slot per live tile from
 	// the admitted unified leaves so setup does not benchmark an empty scan.
 	router := collection.primaryRouter.Load()
 	if router == nil {

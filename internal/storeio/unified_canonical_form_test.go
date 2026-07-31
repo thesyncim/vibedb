@@ -28,7 +28,7 @@ func buildTestIndex(t testing.TB, src []byte) vibejson.Index {
 	}
 }
 
-// checkCanonicalAgainstLibrary pins the three §8 differential properties for
+// checkCanonicalAgainstLibrary pins three differential properties for
 // one document: the tape render equals AppendCanonicalize, the render is
 // idempotent, and IndexIsCanonical is exactly the already-canonical
 // predicate (true iff the source equals its own canonicalization).
@@ -51,7 +51,7 @@ func checkCanonicalAgainstLibrary(t *testing.T, ws *CanonicalWorkspace, src []by
 	}
 	// Idempotence: rendering the canonical bytes reproduces them and the
 	// fast check accepts them, so journal replay of canonical bytes is a
-	// fixed point (§3.2, §7.5).
+	// fixed point.
 	canonIndex := buildTestIndex(t, want)
 	again, err := AppendCanonicalIndexed(nil, canonIndex, ws)
 	if err != nil {
@@ -80,13 +80,13 @@ func TestCanonicalRenderHandcrafted(t *testing.T) {
 		"null", "true", "false", "0", "-0", "1e9", "1E+9", "-0.5",
 		"\"x\"", "\"\"", "123456789012345678901234567890",
 		// Empty containers, including whitespace-carrying spellings that
-		// must collapse to the pinned scalar-leaf forms (design §3.2).
+		// must collapse to the pinned scalar-leaf forms.
 		"{}", "[]", "{ }", "[ ]", "{\"a\":{ },\"b\":[  ]}",
 		// Member sorting by decoded byte order, nesting, arrays in order.
 		"{\"b\":1,\"a\":2}", "{\"a\":2,\"b\":1}",
 		"{\"b\":{\"d\":1,\"c\":2},\"a\":[3,2,1]}",
 		"[{\"z\":1,\"y\":2},{\"y\":1,\"z\":2}]",
-		// Duplicate keys retained in original relative order (§3.2): the
+		// Duplicate keys retained in original relative order: the
 		// first two are different documents at rest.
 		"{\"a\":1,\"a\":2}", "{\"a\":2,\"a\":1}",
 		"{\"b\":0,\"a\":1,\"a\":2,\"a\":3}",
@@ -100,7 +100,7 @@ func TestCanonicalRenderHandcrafted(t *testing.T) {
 		"\"\\u0022\"", "\"\\u005C\"", "\"\\u0000\"", "\"\\u001f\"",
 		"\"\\u001F\"",
 		// Surrogate pairs decode to raw characters; unpaired surrogates are
-		// rejected at admission (§3.2) and cannot occur.
+		// rejected at admission and cannot occur.
 		"\"\\uD83D\\uDE00\"", "\"\U0001F600\"", "{\"\U0001F600\":1}",
 		// Raw U+2028/U+2029 stay raw in the pinned library revision, and
 		// their escaped spellings normalize to the raw characters (see
@@ -258,9 +258,8 @@ func TestCanonicalRenderEmptyTapeFailsClosed(t *testing.T) {
 	}
 }
 
-// TestCanonicalRenderZeroAllocs pins the U0 gate's allocation half: once the
-// workspace has warmed, neither the render nor the check allocates
-// (zero-GC directive; design §11 U0 row).
+// TestCanonicalRenderZeroAllocs pins the allocation contract: once the
+// workspace has warmed, neither the render nor the check allocates.
 func TestCanonicalRenderZeroAllocs(t *testing.T) {
 	ws := &CanonicalWorkspace{}
 	src := []byte(competitiveShapeJSON)

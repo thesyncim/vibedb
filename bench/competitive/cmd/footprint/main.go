@@ -27,8 +27,8 @@ func main() {
 	indexed := flag.Bool("indexed", false, "declare a secondary index over the filter field")
 	putloop := flag.Bool("putloop", false, "store/durable only: build by replaying Put instead of the bulk path")
 	durabilityName := flag.String(
-		"durability", "default",
-		"default, volatile, buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe",
+		"durability", "buffered-visible",
+		"buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe",
 	)
 	storageProfileName := flag.String(
 		"storage-profile", "intrinsic",

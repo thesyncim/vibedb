@@ -33,12 +33,6 @@ read p50 is 0.333-0.334 µs, update p50 is 0.916-0.958 µs, and
 delete+restore p50 is 1.25 µs. Checkpoint p50 is 28.2-34.3 µs with zero
 forced checkpoints; workload median p99 ranges from 38 µs to 1.03 ms.
 
-Ordinary-sync and power-safe are separate guarantee classes. Their previous
-clean `d714d63` tables remain in
-[RESULTS.md](../bench/competitive/RESULTS.md), explicitly marked historical,
-until complete current suites are rerun. They are not combined with the table
-above.
-
 ## Current unified-format space
 
 The strict class-5 churn harness keeps 100,000 documents live through 200,000

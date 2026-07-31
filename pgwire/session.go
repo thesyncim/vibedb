@@ -22,11 +22,8 @@ import (
 //
 // A session is created, negotiates, runs a message loop until the client sends
 // Terminate or the connection fails, and then releases everything it owns. The
-// release is unconditional and runs on every exit path, because two of the
-// things it releases are not memory: a durable snapshot pins a storage
-// generation against reuse, and a [query.Statement] holds compiler arenas. A
-// session that returned without releasing them would leak a storage generation
-// per connection, which is invisible until a file stops shrinking.
+// release is unconditional and runs on every exit path so prepared runtimes,
+// cursors, and the underlying SQL session cannot outlive the connection.
 //
 // A client that vanishes mid-message produces a read error from io.ReadFull —
 // io.ErrUnexpectedEOF for a partial message, io.EOF for a clean disconnect —
@@ -51,11 +48,8 @@ type session struct {
 	// parameter spelling, never by whatever case the client used.
 	params map[string]string
 
-	// exec is the read-only-source execution storage. A writable source uses
-	// the typed SQL session below, which owns an equivalent executor.
-	exec query.Exec
-	// sql is non-nil only for a FromSQLDatabase source. It is the shared typed
-	// SQL runtime used by both database/sql and this protocol adapter.
+	// sql is the shared typed SQL runtime used by both database/sql and this
+	// protocol adapter.
 	sql         *sqldriver.Session
 	queryCancel query.CancelFlag
 	// cancelMu makes the active-command boundary atomic with delivery of an
@@ -95,12 +89,6 @@ type session struct {
 	statementBindBytes int
 	portalBytes        int
 
-	// generation counts executions into exec. A portal's cursor reads
-	// exec.Result directly, which the next execution overwrites, so a portal
-	// records the generation it was executed in and is refused if it is asked
-	// to continue after another statement has run. See portal.
-	generation uint64
-
 	// msg is the decoded frontend message, reused so a session that serves a
 	// million messages allocates one set of parameter slices.
 	msg frontendMessage
@@ -121,9 +109,8 @@ type session struct {
 // A prepared is one prepared statement.
 //
 // It is a small discriminated union rather than an interface: a shared-runtime
-// SQL statement, a legacy read-only query statement, a fixed compatibility
-// result, a session parameter command, or transaction control. All variants
-// have explicit ownership in release.
+// SQL statement, a fixed protocol result, a session parameter command, or
+// transaction control. All variants have explicit ownership in release.
 type prepared struct {
 	name string
 	sql  string
@@ -138,8 +125,6 @@ type prepared struct {
 	// this charge remains until the statement closes.
 	bindBytes int
 
-	// stmt is the lowered plan used by legacy read-only sources.
-	stmt *query.Statement
 	// runtime is the shared typed SQL runtime statement for a writable catalog.
 	runtime *sqldriver.Prepared
 	// paramKinds consolidates the scalar/document role of every wire parameter,
@@ -169,10 +154,6 @@ type prepared struct {
 }
 
 func (p *prepared) release() {
-	if p.stmt != nil {
-		p.stmt.Release()
-		p.stmt = nil
-	}
 	if p.runtime != nil {
 		_ = p.runtime.Close()
 		p.runtime = nil
@@ -220,15 +201,12 @@ type portal struct {
 	retainedBytes int
 
 	// started marks a portal that has begun executing; row is the next fixed
-	// row to send; cursor and lease belong to an engine execution.
+	// row to send.
 	started     bool
 	exhausted   bool
 	row         int
-	cursor      query.Cursor
 	runtime     sqldriver.Cursor
 	runtimeOpen bool
-	lease       lease
-	generation  uint64
 	invalidated bool
 }
 
@@ -245,12 +223,10 @@ type boundValueSlot struct {
 }
 
 func (p *portal) release() {
-	p.lease.release()
 	if p.runtimeOpen {
 		_ = p.runtime.Close()
 		p.runtimeOpen = false
 	}
-	p.cursor = query.Cursor{}
 	p.started = false
 }
 
@@ -265,15 +241,8 @@ func (p *portal) resetForBind(name string, stmt *prepared) {
 	p.retainedBytes = 0
 	p.exhausted = false
 	p.row = 0
-	p.generation = 0
 	p.invalidated = false
 }
-
-// sessionQueryWorkers keeps one protocol connection to one executor worker.
-// PostgreSQL obtains concurrency from independent sessions; allowing every
-// admitted session to inherit query's zero-value GOMAXPROCS policy would
-// multiply retained durable worker pools by MaxConnections.
-const sessionQueryWorkers = 1
 
 func newSession(s *Server, conn net.Conn) *session {
 	session := &session{
@@ -285,10 +254,6 @@ func newSession(s *Server, conn net.Conn) *session {
 		statements: map[string]*prepared{},
 		portals:    map[string]*portal{},
 	}
-	session.exec.Options.Workers = sessionQueryWorkers
-	session.exec.Options.ResultRows = s.opts.MaxResultRows
-	session.exec.Options.ResultBytes = s.opts.MaxResultBytes
-	session.exec.Options.Cancel = &session.queryCancel
 	// bufio.Writer may flush from inside Write when one DataRow is larger than
 	// its buffer. Arming only session.flush is therefore too late: the socket
 	// write has already happened. Refresh immediately before every operation
@@ -387,7 +352,6 @@ func (s *session) release() {
 	s.statements = nil
 	s.statementBytes = 0
 	s.statementBindBytes = 0
-	s.exec.Release()
 	if s.sql != nil {
 		_ = s.sql.Close()
 		s.sql = nil
@@ -537,19 +501,25 @@ func (s *session) negotiate(body []byte) error {
 	if err := s.server.opts.Auth.authenticate(s, s.user); err != nil {
 		return err
 	}
-	if source, ok := s.server.src.(sqlSessionSource); ok {
-		runtime, err := source.openSession(context.Background())
-		if err != nil {
-			return fatal(sqlstateInternalError,
-				"could not open this connection's SQL session: "+err.Error())
-		}
-		if err := runtime.SetCancelFlag(&s.queryCancel); err != nil {
-			_ = runtime.Close()
-			return fatal(sqlstateInternalError,
-				"could not configure this connection's SQL session: "+err.Error())
-		}
-		s.sql = runtime
+	runtime, err := s.server.db.NewSession(context.Background())
+	if err != nil {
+		return fatal(sqlstateInternalError,
+			"could not open this connection's SQL session: "+err.Error())
 	}
+	if err := runtime.SetCancelFlag(&s.queryCancel); err != nil {
+		_ = runtime.Close()
+		return fatal(sqlstateInternalError,
+			"could not configure this connection's SQL session: "+err.Error())
+	}
+	if err := runtime.SetResultLimits(
+		s.server.opts.MaxResultRows,
+		int64(s.server.opts.MaxResultBytes),
+	); err != nil {
+		_ = runtime.Close()
+		return fatal(sqlstateInternalError,
+			"could not configure this connection's result limits: "+err.Error())
+	}
+	s.sql = runtime
 	s.w.authenticationOK()
 
 	s.reportParameters()
@@ -836,9 +806,6 @@ func (s *session) simpleQuery(sql string) error {
 }
 
 func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
-	if s.sql == nil {
-		return false, nil
-	}
 	iter := statementIterator{src: src}
 	count := 0
 	var first statementKind
@@ -963,13 +930,6 @@ func (s *session) runSimple(text string) error {
 	}
 	p := &portal{stmt: stmt}
 	defer p.release()
-	if stmt.stmt != nil {
-		if stmt.stmt.NumParams() != 0 {
-			return newError(sqlstateSyntaxError,
-				"a statement with placeholders cannot be run through the simple query "+
-					"protocol; use Parse and Bind, which every client library exposes")
-		}
-	}
 	if stmt.runtime != nil && stmt.runtime.NumParams() != 0 {
 		return newError(sqlstateSyntaxError,
 			"a statement with placeholders cannot be run through the simple query "+
@@ -997,18 +957,8 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		return p, nil
 
 	case kindCatalogSQL:
-		if s.sql == nil {
-			return nil, newError(sqlstateFeatureNotSupported,
-				"this server source is read-only; DDL and DML require a SQL catalog").
-				withHint("construct the server with FromSQLDatabase")
-		}
 
 	case kindBegin, kindCommit, kindRollback:
-		if s.sql == nil {
-			return nil, newError(sqlstateFeatureNotSupported,
-				"transactions require a writable SQL catalog").
-				withHint("construct the server with FromSQLDatabase")
-		}
 		readOnly, err := parseTransactionCommand(text, kind)
 		if err != nil {
 			return nil, err
@@ -1095,74 +1045,44 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.sql != nil {
-		runtime, err := s.sql.Prepare(context.Background(), lowered)
-		if err != nil {
-			// The catalog shim engages only here, behind the front end's own
-			// refusal: a statement the runtime accepted never reaches it, so
-			// the successful path's behavior and allocation profile are
-			// untouched, and a refused statement pays one recognition attempt
-			// on an already-failed cold path. An unrecognized statement keeps
-			// the runtime's original error unchanged. See catalog_shim.go.
-			if fixed, ok := s.catalogShim(text); ok {
-				p.fixed, p.cols, p.tag = fixed, fixed.cols, fixed.tag
-				return p, nil
-			}
-			return nil, asPGErrorIn(err, text)
-		}
-		p.runtime = runtime
-		p.paramOrder = order
-		p.wireParams = runtime.NumParams()
-		if order != nil {
-			p.wireParams = highest
-		}
-		if order != nil && len(order) != runtime.NumParams() {
-			p.release()
-			return nil, newError(sqlstateInternalError,
-				"the numbered-parameter rewrite and the SQL runtime disagree about the placeholder count")
-		}
-		if p.wireParams > maxParameters {
-			p.release()
-			return nil, newError(sqlstateProgramLimitExceeded, fmt.Sprintf(
-				"a PostgreSQL prepared statement may hold at most %d parameters",
-				maxParameters))
-		}
-		if err := configureRuntimeParamKinds(p); err != nil {
-			p.release()
-			return nil, err
-		}
-		if runtime.ReturnsRows() {
-			p.cols = columnsFor(nil, runtime.Columns(), runtime.AppendSchema(nil))
-		}
-		return p, nil
-	}
-	if kind != kindSelect {
-		return nil, newError(sqlstateInternalError,
-			"a writable SQL statement reached a read-only query source")
-	}
-	stmt, err := query.PrepareStatement(lowered)
+	runtime, err := s.sql.Prepare(context.Background(), lowered)
 	if err != nil {
+		// The catalog shim engages only here, behind the front end's own
+		// refusal: a statement the runtime accepted never reaches it, so
+		// the successful path's behavior and allocation profile are
+		// untouched, and a refused statement pays one recognition attempt
+		// on an already-failed cold path. An unrecognized statement keeps
+		// the runtime's original error unchanged. See catalog_shim.go.
+		if fixed, ok := s.catalogShim(text); ok {
+			p.fixed, p.cols, p.tag = fixed, fixed.cols, fixed.tag
+			return p, nil
+		}
 		return nil, asPGErrorIn(err, text)
 	}
-	if order != nil && len(order) != stmt.NumParams() {
-		stmt.Release()
-		return nil, newError(sqlstateInternalError,
-			"the numbered-parameter rewrite and the parser disagree about the placeholder count")
-	}
-	p.stmt = stmt
+	p.runtime = runtime
 	p.paramOrder = order
-	p.wireParams = stmt.NumParams()
+	p.wireParams = runtime.NumParams()
 	if order != nil {
 		p.wireParams = highest
 	}
+	if order != nil && len(order) != runtime.NumParams() {
+		p.release()
+		return nil, newError(sqlstateInternalError,
+			"the numbered-parameter rewrite and the SQL runtime disagree about the placeholder count")
+	}
 	if p.wireParams > maxParameters {
-		stmt.Release()
-		p.stmt = nil
+		p.release()
 		return nil, newError(sqlstateProgramLimitExceeded, fmt.Sprintf(
 			"a PostgreSQL prepared statement may hold at most %d parameters",
 			maxParameters))
 	}
-	p.cols = columnsFor(nil, stmt.Columns(), stmt.AppendSchema(nil))
+	if err := configureRuntimeParamKinds(p); err != nil {
+		p.release()
+		return nil, err
+	}
+	if runtime.ReturnsRows() {
+		p.cols = columnsFor(nil, runtime.Columns(), runtime.AppendSchema(nil))
+	}
 	return p, nil
 }
 
@@ -1301,9 +1221,6 @@ func (s *session) execute(p *portal, limit int32) error {
 
 	case stmt.runtime != nil:
 		return s.executeRuntimeExec(p)
-
-	case stmt.stmt != nil:
-		return s.executeQuery(p, limit)
 	}
 
 	_ = s.takeCancel()
@@ -1471,7 +1388,6 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 
 func (s *session) startRuntime(p *portal) error {
 	s.invalidateRuntimePortals(p)
-	s.generation++
 	if err := p.stmt.runtime.QueryInto(context.Background(), p.args, &p.runtime); err != nil {
 		return err
 	}
@@ -1482,7 +1398,6 @@ func (s *session) startRuntime(p *portal) error {
 		return err
 	}
 	p.started = true
-	p.generation = s.generation
 	return nil
 }
 
@@ -1607,85 +1522,6 @@ func (s *session) executeFixed(p *portal, limit int32) error {
 	return nil
 }
 
-// executeQuery runs or resumes an engine query.
-func (s *session) executeQuery(p *portal, limit int32) error {
-	if p.exhausted {
-		// Re-executing a drained portal produces no rows, and the tag says so.
-		// PostgreSQL reports the rows of the Execute that is completing rather
-		// than the portal's running total, and a client that adds the tags of a
-		// suspended portal's runs together has to be able to trust that.
-		s.w.commandComplete(commandTag(0))
-		return nil
-	}
-	if !p.started {
-		if s.takeCancel() {
-			return queryCanceled()
-		}
-		if err := s.start(p); err != nil {
-			_ = s.takeCancel()
-			if errors.Is(err, query.ErrCanceled) {
-				return queryCanceled()
-			}
-			return asPGErrorIn(err, p.stmt.sql)
-		}
-		// RunInto materializes synchronously, so a cancel delivered while it
-		// was scanning could not be observed until now. Consume it as belonging
-		// to this Execute, discard the materialized result and release its
-		// snapshot before any DataRow reaches the client.
-		if s.takeCancel() {
-			cancelPortal(p)
-			return queryCanceled()
-		}
-	} else if p.generation != s.generation {
-		// The portal is provably unusable from here, so its snapshot is dropped
-		// now rather than at Close. A durable snapshot pins a storage generation
-		// against reuse, and a client that abandons a refused portal without
-		// closing it would otherwise block extent reclamation for the rest of
-		// the connection.
-		p.release()
-		p.exhausted = true
-		return newError(sqlstateObjectNotInPrereqState,
-			"this suspended portal can no longer be resumed because another statement has "+
-				"executed on the same connection").
-			withHint("this server holds one result set per connection; read a portal to " +
-				"completion before executing anything else on the same connection, or run " +
-				"the statement without a row limit")
-	}
-
-	sent := 0
-	for p.cursor.Next() {
-		// A cancel during delivery cannot retract rows already written, but the
-		// protocol explicitly permits DataRows followed by ErrorResponse. Stop
-		// at the next row boundary and, crucially, do not let this cancel poison
-		// the connection's next statement.
-		if s.takeCancel() {
-			cancelPortal(p)
-			return queryCanceled()
-		}
-		cells := s.rowCells(&p.cursor, len(p.stmt.cols))
-		if err := s.rows.row(s.w, cells, p.stmt.cols, p.formats); err != nil {
-			return err
-		}
-		sent++
-		if s.takeCancel() {
-			cancelPortal(p)
-			return queryCanceled()
-		}
-		if limit > 0 && int32(sent) >= limit {
-			s.w.portalSuspended()
-			return nil
-		}
-	}
-	if s.takeCancel() {
-		cancelPortal(p)
-		return queryCanceled()
-	}
-	p.exhausted = true
-	p.lease.release()
-	s.w.commandComplete(commandTag(sent))
-	return nil
-}
-
 func queryCanceled() *pgError {
 	return newError(sqlstateQueryCanceled, "canceling statement due to a cancel request")
 }
@@ -1693,43 +1529,4 @@ func queryCanceled() *pgError {
 func cancelPortal(p *portal) {
 	p.release()
 	p.exhausted = true
-}
-
-// start binds and executes a portal's statement.
-func (s *session) start(p *portal) error {
-	stmt := p.stmt.stmt
-	l, err := s.server.src.resolve(stmt.Collection(), stmt.NumJoins() != 0)
-	if err != nil {
-		return err
-	}
-	// Every previously executed portal's cursor is invalidated by this
-	// execution; bumping the generation before running is what makes the
-	// invalidation observable rather than silent.
-	s.generation++
-	cursor, err := stmt.RunInto(&s.exec, l.src, p.args)
-	if err != nil {
-		l.release()
-		return err
-	}
-	if err := checkDataRows(cursor, p.stmt.cols, p.formats); err != nil {
-		l.release()
-		return err
-	}
-	p.cursor = cursor
-	p.lease = l
-	p.started = true
-	p.generation = s.generation
-	return nil
-}
-
-// rowCells collects the current row's cells into the session's scratch.
-func (s *session) rowCells(c *query.Cursor, n int) []query.Cell {
-	if cap(s.cells) < n {
-		s.cells = make([]query.Cell, n)
-	}
-	s.cells = s.cells[:n]
-	for i := range n {
-		s.cells[i] = c.Cell(i)
-	}
-	return s.cells
 }

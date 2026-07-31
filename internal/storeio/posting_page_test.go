@@ -178,13 +178,12 @@ func TestPostingPageRejectsInvalidWrites(t *testing.T) {
 		{"store id", func(h *PostingPageHeader, _ *[]PostingSegment, _ *uint64, _ *uint32) { h.StoreID = [16]byte{} }},
 		{"generation", func(h *PostingPageHeader, _ *[]PostingSegment, _ *uint64, _ *uint32) { h.Generation = 0 }},
 		{"logical id", func(h *PostingPageHeader, _ *[]PostingSegment, _ *uint64, _ *uint32) {
-			h.LogicalID = StateRootLogicalID
+			h.LogicalID = 0
 		}},
 		{"future logical id", func(h *PostingPageHeader, _ *[]PostingSegment, next *uint64, _ *uint32) { h.LogicalID = *next }},
 		{"page size", func(h *PostingPageHeader, _ *[]PostingSegment, _ *uint64, _ *uint32) { h.PageSize = 5000 }},
 		{"index id", func(h *PostingPageHeader, _ *[]PostingSegment, _ *uint64, high *uint32) { h.IndexID = *high }},
 		{"index high water", func(_ *PostingPageHeader, _ *[]PostingSegment, _ *uint64, high *uint32) { *high = 0 }},
-		{"page flags", func(h *PostingPageHeader, _ *[]PostingSegment, _ *uint64, _ *uint32) { h.Flags = 1 }},
 		{"empty", func(_ *PostingPageHeader, segments *[]PostingSegment, _ *uint64, _ *uint32) { *segments = nil }},
 		{"stream zero", func(_ *PostingPageHeader, segments *[]PostingSegment, _ *uint64, _ *uint32) {
 			(*segments)[0].StreamID = 0
@@ -245,7 +244,7 @@ func TestPostingPageRejectsResealedSemanticCorruption(t *testing.T) {
 		name   string
 		mutate func([]byte)
 	}{
-		{"version", func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:PageHeaderSize+4], 3) }},
+		{"version", func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:PageHeaderSize+4], 1) }},
 		{"index", func(p []byte) {
 			binary.LittleEndian.PutUint32(p[PageHeaderSize+4:PageHeaderSize+8], testPostingIndexHighWater)
 		}},

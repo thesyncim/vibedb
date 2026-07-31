@@ -78,7 +78,7 @@ type DeviceOptions struct {
 	CheckpointSync CheckpointSync
 	// BufferCount is the number of reusable page staging buffers for a Device
 	// opened directly. NewCommitter accepts and normalizes the same value for
-	// compatibility and descriptor bounds, but caps its private Device arena:
+	// descriptor bounds, but caps its private Device arena:
 	// WriteTransaction data pages are cache-frame-native.
 	BufferCount int
 	// BufferSize is the equal byte size of every staging buffer. It must be a

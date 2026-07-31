@@ -13,11 +13,9 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-// The U1 read-gate benchmark battery (unified-leaf design §10, §11 U1 row).
-// Every benchmark builds its store from the exact competitive corpus the
-// design's baselines were measured on (100k ~249 B documents) and reports
-// the gate quantity explicitly: p50 ns for point pipelines (the gates are
-// p50 gates), ns/doc for scan-shaped lanes.
+// The unified-read benchmark battery builds every store from the same
+// competitive corpus (100k ~249 B documents) and reports p50 nanoseconds for
+// point pipelines and nanoseconds per document for scan-shaped lanes.
 
 func unifiedBenchSource(b *testing.B, keys []string, docs [][]byte) *store.Collection {
 	b.Helper()
@@ -184,11 +182,11 @@ func benchmarkPointGetRaw(b *testing.B) {
 	reportP50(b, lat)
 }
 
-// BenchmarkUnifiedGetRaw is the §10.1 gate: point-read p50 ≤ 0.50 µs
+// BenchmarkUnifiedGetRaw targets point-read p50 ≤ 0.50 µs
 // (kill-switch ceiling 0.70 µs), 0 allocs.
 func BenchmarkUnifiedGetRaw(b *testing.B) { benchmarkPointGetRaw(b) }
 
-// BenchmarkUnifiedPrimaryReplace is the U2 mutation gate. It drives uniform
+// BenchmarkUnifiedPrimaryReplace drives uniform
 // equal-size replacements across the competitive corpus on the same
 // buffered-visible acknowledgement contract as the 4.6 us pre-unification
 // baseline.
@@ -303,10 +301,10 @@ func benchmarkOverflowGetRaw(b *testing.B) {
 	reportP50(b, lat)
 }
 
-// BenchmarkUnifiedGetRawOverflow is the §10.1 chain-reassembly gate.
+// BenchmarkUnifiedGetRawOverflow measures overflow-chain reassembly.
 func BenchmarkUnifiedGetRawOverflow(b *testing.B) { benchmarkOverflowGetRaw(b) }
 
-// BenchmarkUnifiedFieldProbe is the §10.2 gate: point field probe p50
+// BenchmarkUnifiedFieldProbe targets point field-probe p50
 // ≤ 0.30 µs end-to-end (pipeline floor + hole read), 0 allocs.
 func BenchmarkUnifiedFieldProbe(b *testing.B) {
 	keys, docs, _ := benchCorpus(b)
@@ -321,7 +319,7 @@ func BenchmarkUnifiedFieldProbe(b *testing.B) {
 		b.Fatal(err)
 	}
 	// Warm the per-(leaf, template) resolution cache: population is a
-	// boundary cost amortized over the snapshot's lifetime (§10.2).
+	// boundary cost amortized over the snapshot's lifetime.
 	dst := make([]byte, 0, 256)
 	for i := range keys {
 		if _, _, err := snapshot.AppendField(dst[:0], probe, []byte(keys[i])); err != nil {
@@ -353,8 +351,8 @@ func BenchmarkUnifiedFieldProbe(b *testing.B) {
 	reportP50(b, lat)
 }
 
-// BenchmarkUnifiedCopyThenParseProbe is the pattern the probe replaces
-// (§10.2's baseline): whole-document AppendRaw plus a path walk over the
+// BenchmarkUnifiedCopyThenParseProbe is the pattern the probe replaces:
+// whole-document AppendRaw plus a path walk over the
 // copy, measured through the same resolver for a like-for-like parse cost.
 func BenchmarkUnifiedCopyThenParseProbe(b *testing.B) {
 	keys, docs, _ := benchCorpus(b)
@@ -484,7 +482,7 @@ func benchmarkFilterEq(b *testing.B, path, needle string) {
 	b.ReportMetric(float64(result.Fallback), "fallback-rows")
 }
 
-// BenchmarkUnifiedFilterEq is the §10.3 gate lane: the harness filter shape
+// BenchmarkUnifiedFilterEq measures the harness filter shape
 // (country == "PT") over the token lane, gate ≤ 40 ns/doc, target ≤ 20.
 func BenchmarkUnifiedFilterEq(b *testing.B) {
 	benchmarkFilterEq(b, "/country", `"PT"`)
@@ -492,7 +490,7 @@ func BenchmarkUnifiedFilterEq(b *testing.B) {
 
 // BenchmarkUnifiedFilterEqFallback drives the recorded fallback lane: a
 // container-valued path resolves on no template as a token compare, so every
-// row renders and evaluates (§10.3's render-then-filter number).
+// row renders and evaluates.
 func BenchmarkUnifiedFilterEqFallback(b *testing.B) {
 	benchmarkFilterEq(b, "/profile", `{"joined":"2020-01-02","region":"eu-west-1","tier":"pro"}`)
 }

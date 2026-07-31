@@ -12,7 +12,7 @@ func testInlineState(generation uint64) StateRoot {
 	return StateRoot{
 		StoreID: testStoreID, Generation: generation,
 		PageSize: testSuperblockPageSize, NextLogicalID: 2,
-		MaxPageSize: 64 << 10, ChunkDocuments: 64,
+		MaxPageSize: 64 << 10,
 	}
 }
 
@@ -57,7 +57,7 @@ func writeInlineRootPage(t *testing.T, file *os.File, slot int, encoded []byte) 
 	writeAtTest(t, file, page, int64(slot)*int64(testSuperblockPageSize))
 }
 
-func TestInlineSuperblockCodecRejectsCorruptionAndExternalFormat(t *testing.T) {
+func TestInlineSuperblockCodecRejectsCorruption(t *testing.T) {
 	root := testInlineSuperblock(7)
 	encoded := encodeTestInlineSuperblock(t, root)
 	decoded, err := DecodeInlineSuperblock(encoded[:])
@@ -99,41 +99,23 @@ func TestInlineSuperblockCodecRejectsCorruptionAndExternalFormat(t *testing.T) {
 		})
 	}
 
-	statePage := make([]byte, testSuperblockPageSize)
-	state := testInlineState(7)
-	dataStart := testMutableStoreDataStart(testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(statePage, state, dataStart+uint64(testSuperblockPageSize)); err != nil {
-		t.Fatal(err)
-	}
-	external := encodeTestSuperblock(t, testSuperblock(
-		7, dataStart, statePage,
-	))
-	if _, err := DecodeInlineSuperblock(external[:]); !errors.Is(err, ErrSuperblockCorrupt) {
-		t.Fatalf("inline decoder accepted external format: %v", err)
-	}
-	if _, err := DecodeSuperblock(encoded[:]); !errors.Is(err, ErrSuperblockCorrupt) {
-		t.Fatalf("external decoder accepted inline format: %v", err)
-	}
 }
 
 func TestInlineSuperblockSharesCanonicalStatePayload(t *testing.T) {
 	state := testInlineState(3)
 	fileEnd := testMutableStoreDataStart(testSuperblockPageSize)
-	statePage := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(statePage, state, fileEnd); err != nil {
+	if err := validateStateRoot(state, fileEnd); err != nil {
 		t.Fatal(err)
 	}
-	_, pagePayload, err := OpenPage(statePage)
-	if err != nil {
-		t.Fatal(err)
-	}
+	payload := make([]byte, StateRootPayloadSize)
+	encodeStateRootPayload(payload, state)
 	inline := encodeTestInlineSuperblock(t, InlineSuperblock{
 		StoreID: testStoreID, Generation: state.Generation,
 		FileEnd: fileEnd, PageSize: state.PageSize, State: state,
 	})
 	inlinePayload := inline[inlineSuperblockStateOffset:inlineSuperblockStateEnd]
-	if !bytes.Equal(inlinePayload, pagePayload) {
-		t.Fatal("inline and standalone StateRoot payloads differ")
+	if !bytes.Equal(inlinePayload, payload) {
+		t.Fatal("inline StateRoot payload differs from canonical encoding")
 	}
 	decoded, err := decodeStateRootPayload(
 		inlinePayload, state.StoreID, state.Generation, state.PageSize, fileEnd,
@@ -685,104 +667,6 @@ func TestRecoverInlineFreeDeltaValidatesIndexOnlyAnchor(t *testing.T) {
 	}
 }
 
-func TestPublishInlineEliminatesDedicatedStatePage(t *testing.T) {
-	externalCommitter, externalFile, pageSize := newPortableCommitter(t, 4, 1)
-	defer externalCommitter.Close()
-	dataStart := testMutableStoreDataStart(uint32(pageSize))
-	if err := externalFile.Truncate(int64(dataStart)); err != nil {
-		t.Fatal(err)
-	}
-	externalTx, err := BeginWriteTransaction(
-		externalCommitter, nil, 1, WriteTransactionOptions{
-			StoreID: testStoreID, Generation: 1, PageSize: uint32(pageSize),
-			FileEnd: dataStart, NextLogicalID: 2,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	statePage, err := externalTx.Allocate(PageStateRoot, uint32(pageSize), StateRootLogicalID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalState := StateRoot{
-		StoreID: testStoreID, Generation: 1, PageSize: uint32(pageSize),
-		MaxPageSize: uint32(pageSize), NextLogicalID: 2, ChunkDocuments: 64,
-	}
-	if _, err := EncodeStateRootPage(statePage.Bytes(), externalState, externalTx.FileEnd()); err != nil {
-		t.Fatal(err)
-	}
-	if err := statePage.Stage(); err != nil {
-		t.Fatal(err)
-	}
-	if err := externalTx.Publish(
-		statePage.Ref(), PageChecksum(statePage.Bytes()), 0, 0, 0,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := externalCommitter.Wait(1); err != nil {
-		t.Fatal(err)
-	}
-	externalInfo, err := externalFile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	inlineCommitter, inlineFile, inlinePageSize := newPortableCommitter(t, 2, 0)
-	defer inlineCommitter.Close()
-	inlineDataStart := testMutableStoreDataStart(uint32(inlinePageSize))
-	if err := inlineFile.Truncate(int64(inlineDataStart)); err != nil {
-		t.Fatal(err)
-	}
-	inlineTx, err := BeginWriteTransaction(
-		inlineCommitter, nil, 0, WriteTransactionOptions{
-			StoreID: testStoreID, Generation: 1, PageSize: uint32(inlinePageSize),
-			FileEnd: inlineDataStart, NextLogicalID: 2,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inlineState := StateRoot{
-		StoreID: testStoreID, Generation: 1, PageSize: uint32(inlinePageSize),
-		MaxPageSize: uint32(inlinePageSize), NextLogicalID: 2, ChunkDocuments: 64,
-	}
-	if err := inlineTx.PublishInline(inlineState, InlineFreeDelta{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := inlineCommitter.Wait(1); err != nil {
-		t.Fatal(err)
-	}
-	inlineInfo, err := inlineFile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	externalBytes := externalCommitter.Stats().DeviceBytes
-	inlineBytes := inlineCommitter.Stats().DeviceBytes
-	if externalBytes != uint64(2*pageSize) || inlineBytes != uint64(inlinePageSize) ||
-		externalBytes-inlineBytes != uint64(inlinePageSize) {
-		t.Fatalf(
-			"device bytes external=%d inline=%d page=%d",
-			externalBytes, inlineBytes, inlinePageSize,
-		)
-	}
-	if externalTx.FileEnd()-inlineTx.FileEnd() != uint64(inlinePageSize) ||
-		externalInfo.Size()-inlineInfo.Size() != int64(inlinePageSize) {
-		t.Fatalf(
-			"file bytes external=(logical=%d physical=%d) inline=(logical=%d physical=%d)",
-			externalTx.FileEnd(), externalInfo.Size(), inlineTx.FileEnd(), inlineInfo.Size(),
-		)
-	}
-	scratch := make([]byte, inlinePageSize)
-	_, recovered, _, err := RecoverInlineStateRoot(
-		inlineFile, uint32(inlinePageSize), scratch,
-	)
-	if err != nil || recovered != inlineState {
-		t.Fatalf("RecoverInlineStateRoot = (%+v,%v)", recovered, err)
-	}
-}
-
 func TestPublishInlineClearsPhysicalTailAboveCodecSize(t *testing.T) {
 	const pageSize = uint32(8192)
 	file, err := os.CreateTemp(t.TempDir(), "inline-large-root-*")
@@ -811,7 +695,7 @@ func TestPublishInlineClearsPhysicalTailAboveCodecSize(t *testing.T) {
 	}
 	state := StateRoot{
 		StoreID: testStoreID, Generation: 1, PageSize: pageSize,
-		MaxPageSize: pageSize, NextLogicalID: 2, ChunkDocuments: 64,
+		MaxPageSize: pageSize, NextLogicalID: 2,
 	}
 	if err := tx.PublishInline(state, InlineFreeDelta{}); err != nil {
 		t.Fatal(err)
@@ -819,7 +703,7 @@ func TestPublishInlineClearsPhysicalTailAboveCodecSize(t *testing.T) {
 	if err := committer.Wait(1); err != nil {
 		t.Fatal(err)
 	}
-	offset, err := SuperblockOffset(1, pageSize)
+	offset, err := superblockOffset(1, pageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -835,140 +719,13 @@ func TestPublishInlineClearsPhysicalTailAboveCodecSize(t *testing.T) {
 	}
 }
 
-func TestPublishInlineEliminatesRoutineStateAndFreeDeltaPages(t *testing.T) {
-	externalCommitter, externalFile, pageSize := newPortableCommitter(t, 5, 2)
-	defer externalCommitter.Close()
-	dataStart := testMutableStoreDataStart(uint32(pageSize))
-	if err := externalFile.Truncate(int64(dataStart)); err != nil {
-		t.Fatal(err)
-	}
-	externalTx, err := BeginWriteTransaction(
-		externalCommitter, nil, 2, WriteTransactionOptions{
-			StoreID: testStoreID, Generation: 1, PageSize: uint32(pageSize),
-			FileEnd: dataStart, NextLogicalID: 2,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	freePage, err := externalTx.Allocate(PageFreeDelta, uint32(pageSize), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	statePage, err := externalTx.Allocate(
-		PageStateRoot, uint32(pageSize), StateRootLogicalID,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	externalDelta := FreeDelta{
-		Op:     FreeOpDelete,
-		Extent: FreeExtent{Offset: dataStart},
-	}
-	if _, err := EncodeFreeDeltaPage(
-		freePage.Bytes(),
-		FreeLogHeader{
-			StoreID: testStoreID, Generation: 1, LogicalID: freePage.Ref().LogicalID,
-			PageSize: uint32(pageSize),
-		},
-		[]FreeDelta{externalDelta}, PageRef{}, PageRef{},
-		externalTx.FileEnd(), externalTx.NextLogicalID(),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := freePage.Stage(); err != nil {
-		t.Fatal(err)
-	}
-	externalState := StateRoot{
-		StoreID: testStoreID, Generation: 1, PageSize: uint32(pageSize),
-		MaxPageSize:   uint32(pageSize),
-		NextLogicalID: externalTx.NextLogicalID(), ChunkDocuments: 64,
-	}
-	if _, err := EncodeStateRootPage(
-		statePage.Bytes(), externalState, externalTx.FileEnd(),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := statePage.Stage(); err != nil {
-		t.Fatal(err)
-	}
-	if err := externalTx.Publish(
-		statePage.Ref(), PageChecksum(statePage.Bytes()),
-		freePage.Ref().Offset, freePage.Ref().Length, PageChecksum(freePage.Bytes()),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := externalCommitter.Wait(1); err != nil {
-		t.Fatal(err)
-	}
-	externalInfo, err := externalFile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	inlineCommitter, inlineFile, inlinePageSize := newPortableCommitter(t, 2, 0)
-	defer inlineCommitter.Close()
-	inlineDataStart := testMutableStoreDataStart(uint32(inlinePageSize))
-	if err := inlineFile.Truncate(int64(inlineDataStart)); err != nil {
-		t.Fatal(err)
-	}
-	inlineTx, err := BeginWriteTransaction(
-		inlineCommitter, nil, 0, WriteTransactionOptions{
-			StoreID: testStoreID, Generation: 1, PageSize: uint32(inlinePageSize),
-			FileEnd: inlineDataStart, NextLogicalID: 2,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inlineState := StateRoot{
-		StoreID: testStoreID, Generation: 1, PageSize: uint32(inlinePageSize),
-		MaxPageSize: uint32(inlinePageSize), NextLogicalID: 2, ChunkDocuments: 64,
-	}
-	var inlineDelta InlineFreeDelta
-	if err := inlineDelta.Append([]FreeDelta{{
-		Op:     FreeOpDelete,
-		Extent: FreeExtent{Offset: inlineDataStart},
-	}}, uint32(inlinePageSize), inlineTx.FileEnd()); err != nil {
-		t.Fatal(err)
-	}
-	if err := inlineTx.PublishInline(inlineState, inlineDelta); err != nil {
-		t.Fatal(err)
-	}
-	if err := inlineCommitter.Wait(1); err != nil {
-		t.Fatal(err)
-	}
-	inlineInfo, err := inlineFile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	externalBytes := externalCommitter.Stats().DeviceBytes
-	inlineBytes := inlineCommitter.Stats().DeviceBytes
-	if externalBytes != uint64(3*pageSize) ||
-		inlineBytes != uint64(inlinePageSize) ||
-		externalBytes-inlineBytes != uint64(2*inlinePageSize) {
-		t.Fatalf(
-			"metadata device bytes external=%d inline=%d page=%d",
-			externalBytes, inlineBytes, inlinePageSize,
-		)
-	}
-	if externalTx.FileEnd()-inlineTx.FileEnd() != uint64(2*inlinePageSize) ||
-		externalInfo.Size()-inlineInfo.Size() != int64(2*inlinePageSize) {
-		t.Fatalf(
-			"metadata file bytes external=(logical=%d physical=%d) inline=(logical=%d physical=%d)",
-			externalTx.FileEnd(), externalInfo.Size(), inlineTx.FileEnd(), inlineInfo.Size(),
-		)
-	}
-}
-
 func TestInlineSuperblockCommitSteadyStateDoesNotAllocate(t *testing.T) {
 	committer, _, pageSize := newPortableCommitter(t, 2, 0)
 	defer committer.Close()
 	var generation uint64
 	state := StateRoot{
 		StoreID: testStoreID, PageSize: uint32(pageSize),
-		MaxPageSize: uint32(pageSize), NextLogicalID: 2, ChunkDocuments: 64,
+		MaxPageSize: uint32(pageSize), NextLogicalID: 2,
 	}
 	if allocs := testing.AllocsPerRun(20, func() {
 		generation++

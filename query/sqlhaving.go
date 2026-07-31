@@ -246,11 +246,11 @@ func andTri(a, b tri) tri {
 // HAVING compares through the same total order the executor does.
 func (h *havingProgram) cellScalar(c Cell) scalar {
 	switch c.kind {
-	case KindNull:
+	case TypeNull:
 		return scalar{kind: kindNull}
-	case KindBool:
+	case TypeBool:
 		return scalar{kind: kindBool, bval: c.flag&cellTrue != 0}
-	case KindNumber:
+	case TypeNumber:
 		s := scalar{kind: kindNumber, num: c.raw, raw: c.raw}
 		if c.flag&cellInteger != 0 {
 			s.isInt, s.ival = true, int64(c.word)
@@ -267,7 +267,7 @@ func (h *havingProgram) cellScalar(c Cell) scalar {
 			s.raw = s.num
 		}
 		return s
-	case KindString:
+	case TypeString:
 		return scalar{kind: kindString, sval: c.text, raw: c.raw}
 	default:
 		return scalar{kind: kindContainer, raw: c.raw}

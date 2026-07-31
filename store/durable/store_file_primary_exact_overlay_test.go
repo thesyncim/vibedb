@@ -11,9 +11,8 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// Overlay-specific coverage for the O(delta) indexed write path
-// (docs/design/indexed-write-path.md §3, §7): the mid-window read rule over a
-// populated overlay, crash replay before a fold, the zero-allocation contract
+// Overlay-specific coverage for the O(delta) indexed write path: the
+// mid-window read rule over a populated overlay, crash replay before a fold, the zero-allocation contract
 // of the per-mutation record path, and the mid-window probe cost gate.
 
 // primaryExactOverlayTestOptions builds a buffered-visible indexed
@@ -351,7 +350,7 @@ func TestFilePrimaryIndexedOverlayFoldIdentity(t *testing.T) {
 // lane in the window between an indexed overlay mutation and its fold, replays
 // the journal on the crash image, and proves the recovered fold is
 // byte-identical to a from-scratch rebuild of the recovered graph — the
-// crash-between-rebase-and-fold case §7 names.
+// crash-between-rebase-and-fold case.
 func TestSyncPrimaryIndexedOverlayCrashReplay(t *testing.T) {
 	const documents = 4000
 	options := syncPrimaryJournalTestOptions()
@@ -562,7 +561,7 @@ func TestFilePrimaryIndexedMutationAllocations(t *testing.T) {
 	}
 }
 
-// BenchmarkPrimaryExactProbeMidWindow is the P0 mid-window probe gate: a
+// BenchmarkPrimaryExactProbeMidWindow measures a
 // probe against a snapshot whose overlay carries 64 pending record-emitting
 // mutations, every one of them touching the probed term, so the chain walk,
 // newest-wins de-duplication, sort, and base merge are all on the measured

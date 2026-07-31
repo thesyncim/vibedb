@@ -40,14 +40,6 @@ func (b *Batch) MaterializationSequence() (uint64, error) {
 	return b.committer.materializationNextSequence.Load(), nil
 }
 
-// BeginMaterialized acquires one isolated canonical-materialization batch.
-// patchWriteCount is the exact number of journal patch spans, not the number
-// of complete target pages. It is the patch-only spelling retained for callers
-// that do not also publish immutable copy-on-write pages.
-func (c *Committer) BeginMaterialized(patchWriteCount int) (*Batch, error) {
-	return c.beginHybridMaterialized(0, patchWriteCount)
-}
-
 // beginHybridMaterialized acquires one isolated generation containing both
 // immutable copy-on-write pages and journal-covered canonical patches. The
 // durable order is journal, one offset-sorted combined data phase, then root.
@@ -470,8 +462,7 @@ func (c *Committer) validateMaterializedBatch(batch *Batch, generation uint64) (
 			pageHeader.Generation != generation ||
 			pageHeader.PageSize != write.Length ||
 			pageHeader.Kind != write.kind ||
-			pageHeader.Kind == PageStateRoot ||
-			pageHeader.LogicalID <= StateRootLogicalID ||
+			pageHeader.LogicalID == 0 ||
 			pageHeader.LogicalID >= root.State.NextLogicalID {
 			return 0, fmt.Errorf(
 				"%w: materialization full-page identity",

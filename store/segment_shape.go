@@ -404,10 +404,10 @@ func (s *Segment) synthShapeTape(i int, r ShapeTapeRef) []vibejson.IndexEntry {
 }
 
 // shapeTapeHintSlots sizes the inline ordinal cache below. Four slots cover
-// the round-robin interleavings real batch loaders emit (the phase-0
+// the round-robin interleavings real batch loaders emit: the competitive
 // corpora cycle up to four shapes document by document, which a two-slot
-// cache thrashes end to end), while the miss fallback — one table probe —
-// keeps wider mixes merely cheap rather than cached.
+// cache thrashes end to end. The miss path is one table probe, so wider mixes
+// stay cheap even when they are not cached.
 const shapeTapeHintSlots = 4
 
 // A shapeTapeHint memoizes one query's ordinal in the most recently seen

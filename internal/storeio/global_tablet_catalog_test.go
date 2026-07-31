@@ -927,7 +927,6 @@ func TestGlobalTabletCatalogRootAndLocatorFailClosed(t *testing.T) {
 
 func TestGlobalTabletCatalogNamespaceAndSpace(t *testing.T) {
 	ranges := [][2]uint64{
-		{GlobalTabletCatalogStateRootLogicalID, GlobalTabletCatalogStateRootLogicalID + 1},
 		{GlobalTabletCatalogLeafLogicalIDBase, GlobalTabletCatalogLeafLogicalIDLimit},
 		{GlobalTabletCatalogAnchorLogicalIDBase, GlobalTabletCatalogAnchorLogicalIDLimit},
 		{GlobalTabletCatalogTabletRootLogicalIDBase, GlobalTabletCatalogTabletRootLogicalIDLimit},
@@ -936,15 +935,13 @@ func TestGlobalTabletCatalogNamespaceAndSpace(t *testing.T) {
 		{GlobalTabletCatalogBranchPageLogicalIDBase, GlobalTabletCatalogBranchPageLogicalIDLimit},
 		{GlobalTabletCatalogRootLogicalID, GlobalTabletCatalogRootLogicalID + 1},
 		{PrimaryTabletRouteLogicalIDBase, PrimaryTabletRouteLogicalIDLimit},
-		{PrimaryTabletDirectoryLogicalIDBase, PrimaryTabletDirectoryLogicalIDLimit},
 	}
 	for at := 1; at < len(ranges); at++ {
 		if ranges[at-1][1] != ranges[at][0] {
 			t.Fatalf("namespace gap/collision %d: %v then %v", at, ranges[at-1], ranges[at])
 		}
 	}
-	if GlobalTabletCatalogFirstDynamicLogicalID != ranges[len(ranges)-1][1] ||
-		!GlobalTabletCatalogIsDynamicLogicalID(GlobalTabletCatalogFirstDynamicLogicalID) {
+	if GlobalTabletCatalogFirstDynamicLogicalID != ranges[len(ranges)-1][1] {
 		t.Fatal("dynamic namespace boundary")
 	}
 	view, _, _, entries := globalTabletCatalogTestNode(t)

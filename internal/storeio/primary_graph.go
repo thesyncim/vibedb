@@ -12,9 +12,6 @@ type PrimaryGraphRecord struct {
 	Value []byte
 }
 
-// PrimaryRecord is the concise spelling used by store/durable bulk callers.
-type PrimaryRecord = PrimaryGraphRecord
-
 // PrimaryGraphPlacement is the posting-stable location assigned to one input
 // record by the bottom-up builder: the leaf's stable BucketID and the row's
 // stable slot within it (see VisitPrimaryLeafPostingRows for the per-class slot
@@ -64,13 +61,6 @@ func ShortestPrimaryFence(dst, leftMax, rightMin []byte) ([]byte, error) {
 	return dst[:length], nil
 }
 
-// PrimaryGraphBuildStats reports how many unified leaves the bulk builder
-// staged. LeavesByClass retains the class-byte index so diagnostics can compare
-// the count directly with an admitted page.
-type PrimaryGraphBuildStats struct {
-	LeavesByClass [6]int
-}
-
 // BuildPrimaryGraph deterministically stages one complete ordered primary
 // graph in tx. Records must be strictly bytewise lexical and contain inline
 // non-empty values. Every leaf uses the unified canonical grammar.
@@ -82,11 +72,9 @@ func BuildPrimaryGraph(
 	tx *WriteTransaction,
 	records []PrimaryGraphRecord,
 ) (PageRef, error) {
-	ref, _, err := BuildPrimaryGraphWithStats(tx, records)
-	return ref, err
+	return buildPrimaryGraphPlaced(tx, records, nil)
 }
 
-// BuildPrimaryGraphWithStats is BuildPrimaryGraph plus its leaf count.
 // BuildPrimaryGraphPlaced is BuildPrimaryGraph with caller-owned placement
 // output: placements must have exactly one element per input record, and each
 // receives the posting-stable location the builder assigned that row. It is the
@@ -99,14 +87,13 @@ func BuildPrimaryGraphPlaced(
 	if len(placements) != len(records) {
 		return PageRef{}, fmt.Errorf("%w: primary placement output", ErrInvalidWrite)
 	}
-	ref, _, err := buildPrimaryGraphPlaced(tx, records, placements)
-	return ref, err
+	return buildPrimaryGraphPlaced(tx, records, placements)
 }
 
 // EmptyPrimaryGraphPageCount is the exact number of transaction pages
 // BuildEmptyPrimaryGraph stages: one leaf, one tablet (anchor + locator +
 // route), one catalog leaf, and the catalog root. A creation transaction
-// reserves this plus its exact-index and state-root pages.
+// reserves this plus its exact-index root when configured.
 const EmptyPrimaryGraphPageCount = 1 + 3 + 1 + 1
 
 // BuildEmptyPrimaryGraph stages a valid ordered primary graph that holds no
@@ -162,57 +149,43 @@ func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
 	return buildPrimaryCatalog(tx, tablets)
 }
 
-func BuildPrimaryGraphWithStats(
-	tx *WriteTransaction,
-	records []PrimaryGraphRecord,
-) (PageRef, PrimaryGraphBuildStats, error) {
-	return buildPrimaryGraphPlaced(tx, records, nil)
-}
-
 func buildPrimaryGraphPlaced(
 	tx *WriteTransaction,
 	records []PrimaryGraphRecord,
 	placements []PrimaryGraphPlacement,
-) (PageRef, PrimaryGraphBuildStats, error) {
-	var stats PrimaryGraphBuildStats
+) (PageRef, error) {
 	if tx == nil || !tx.active || tx.options.PageSize != physicalPageQuantum ||
 		tx.options.StoreID == ([16]byte{}) ||
 		tx.options.Generation == 0 ||
 		tx.nextID < PrimaryFirstDynamicLogicalID ||
 		len(records) == 0 {
-		return PageRef{}, stats, fmt.Errorf("%w: primary graph transaction or input", ErrInvalidWrite)
+		return PageRef{}, fmt.Errorf("%w: primary graph transaction or input", ErrInvalidWrite)
 	}
 	for at := range records {
 		if len(records[at].Key) == 0 ||
 			len(records[at].Key) > CommonPrimaryLeafMaxKeyBytes ||
 			len(records[at].Value) == 0 ||
 			at != 0 && bytes.Compare(records[at-1].Key, records[at].Key) >= 0 {
-			return PageRef{}, stats, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
+			return PageRef{}, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
 		}
 	}
 
 	plans, err := planUnifiedPrimaryLeaves(tx, records)
 	if err != nil {
-		return PageRef{}, stats, err
+		return PageRef{}, err
 	}
 	if len(plans) > TabletLocalIdentityTabletCount*TabletLocalIdentityLocalCount {
-		return PageRef{}, stats, fmt.Errorf("%w: primary leaf namespace exhausted", ErrInvalidWrite)
-	}
-	for at := range plans {
-		if class := plans[at].class; int(class) < len(stats.LeavesByClass) {
-			stats.LeavesByClass[class]++
-		}
+		return PageRef{}, fmt.Errorf("%w: primary leaf namespace exhausted", ErrInvalidWrite)
 	}
 	built, err := buildPrimaryLeaves(tx, records, plans, placements)
 	if err != nil {
-		return PageRef{}, stats, err
+		return PageRef{}, err
 	}
 	tablets, err := buildPrimaryTablets(tx, built)
 	if err != nil {
-		return PageRef{}, stats, err
+		return PageRef{}, err
 	}
-	root, err := buildPrimaryCatalog(tx, tablets)
-	return root, stats, err
+	return buildPrimaryCatalog(tx, tablets)
 }
 
 // PrimaryGraphPageCount returns the exact number of transaction pages
@@ -337,7 +310,7 @@ func PrimaryGraphLeafSpans(
 }
 
 // planUnifiedPrimaryLeaves packs records into class-5 unified leaves through
-// the single packing planner (unified-leaf design §3.6). Unlike the compact
+// the single packing planner. Unlike the compact
 // planner it has no raw-leaf fallback: a run that shares no shape degrades to
 // trivial rows inside the same codec, and a single-row unified leaf is legal,
 // so the planner has exactly one output shape.

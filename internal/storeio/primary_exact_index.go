@@ -9,12 +9,7 @@ import (
 )
 
 const (
-	// primaryExactVersion 1: the root maps each physical index to an ordered
-	// term-leaf *catalog* (leaf count + catalog page reference) instead of a
-	// single leaf reference, ending the one-leaf-per-index 64 KiB cap. Leaf
-	// payloads (AppendIndexTermLeaf output) and TermPosting are unchanged.
-	// Version-0 stores are recreated, not migrated (pre-release rule).
-	primaryExactVersion         = uint32(1)
+	primaryExactVersion         = DevelopmentFormatVersion
 	primaryExactRootHeaderBytes = 16
 	primaryExactRootEntryBytes  = 8 + PageRefSize
 	// fileFormatMaxExactIndexes bounds the physical exact-index count so one
@@ -57,7 +52,7 @@ type PrimaryExactIndexBounds struct {
 
 func (b PrimaryExactIndexBounds) valid() bool {
 	return b.StoreID != ([16]byte{}) && b.Generation != 0 &&
-		b.FileEnd != 0 && b.NextLogicalID > StateRootLogicalID &&
+		b.FileEnd != 0 && b.NextLogicalID != 0 &&
 		b.AllocationQuantum >= physicalPageQuantum &&
 		b.MaxPageSize >= b.AllocationQuantum && b.IndexCount != 0
 }
@@ -82,7 +77,7 @@ func EncodePrimaryExactLeafPage(
 		return nil, err
 	}
 	copy(payload, encoded)
-	page := dst[:len(dst)]
+	page := dst
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
 	}
@@ -103,7 +98,7 @@ func OpenPrimaryExactLeafPage(
 		header.Generation != expected.Generation ||
 		header.LogicalID != expected.LogicalID ||
 		header.PageSize != expected.Length ||
-		header.Kind != PagePrimaryExactLeaf || header.Flags != 0 ||
+		header.Kind != PagePrimaryExactLeaf ||
 		len(payload) < indexTermLeafHeaderBytes ||
 		len(payload) > IndexTermLeafMaxBytes {
 		return nil, primaryExactCorrupt("leaf envelope")
@@ -111,7 +106,7 @@ func OpenPrimaryExactLeafPage(
 	return payload[:len(payload):len(payload)], nil
 }
 
-// PrimaryExactRootEntry is one physical index's row in the v1 exact root:
+// PrimaryExactRootEntry is one physical index's row in the exact root:
 // how many term leaves the index spans and the reference of its ordered
 // catalog. LeafCount == 0 names an empty physical index (zero Catalog).
 type PrimaryExactRootEntry struct {
@@ -153,14 +148,14 @@ func EncodePrimaryExactRootPage(
 		binary.LittleEndian.PutUint32(payload[at:at+4], entry.LeafCount)
 		encodePageRef(payload[at+8:at+8+PageRefSize], entry.Catalog)
 	}
-	page := dst[:len(dst)]
+	page := dst
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
 	}
 	return page, nil
 }
 
-// PrimaryExactRootView is a validated v1 exact root: per physical index, the
+// PrimaryExactRootView is a validated exact root: per physical index, the
 // leaf count and catalog reference. Non-zero catalog refs are unique; their
 // order is the canonical physical index ID, not allocation order.
 type PrimaryExactRootView struct {
@@ -180,7 +175,7 @@ func OpenPrimaryExactRootPage(
 		header.Generation != expected.Generation ||
 		header.LogicalID != expected.LogicalID ||
 		header.PageSize != expected.Length ||
-		header.Kind != PagePrimaryExactRoot || header.Flags != 0 ||
+		header.Kind != PagePrimaryExactRoot ||
 		len(payload) != primaryExactRootHeaderBytes+
 			int(bounds.IndexCount)*primaryExactRootEntryBytes ||
 		binary.LittleEndian.Uint32(payload[0:4]) != primaryExactVersion ||
@@ -298,7 +293,7 @@ func EncodePrimaryExactCatalogLeafPage(
 		copy(payload[at+6:], entry.Prefix)
 		at += 6 + len(entry.Prefix)
 	}
-	page := dst[:len(dst)]
+	page := dst
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
 	}
@@ -336,7 +331,7 @@ func EncodePrimaryExactCatalogIndexPage(
 			payload[primaryExactCatalogHeaderBytes+i*PageRefSize:], child,
 		)
 	}
-	page := dst[:len(dst)]
+	page := dst
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
 	}
@@ -362,7 +357,7 @@ func OpenPrimaryExactCatalogPage(
 		header.Generation != expected.Generation ||
 		header.LogicalID != expected.LogicalID ||
 		header.PageSize != expected.Length ||
-		header.Kind != PagePrimaryExactCatalog || header.Flags != 0 ||
+		header.Kind != PagePrimaryExactCatalog ||
 		len(payload) < primaryExactCatalogHeaderBytes ||
 		binary.LittleEndian.Uint32(payload[0:4]) != primaryExactVersion ||
 		payload[4] > 1 || !allZero(payload[5:8]) ||
@@ -487,13 +482,13 @@ func (v PrimaryExactCatalogView) ForEachEntry(
 func validPrimaryExactRef(
 	ref PageRef, kind PageKind, bounds PrimaryExactIndexBounds,
 ) bool {
-	if !bounds.valid() || ref.Kind != kind || ref.Flags != 0 || ref.Aux != 0 ||
+	if !bounds.valid() || ref.Kind != kind ||
 		!validPhysicalPageSize(ref.Length) ||
 		ref.Length < bounds.AllocationQuantum ||
 		ref.Length > bounds.MaxPageSize ||
 		ref.Length%bounds.AllocationQuantum != 0 ||
 		ref.Generation == 0 || ref.Generation > bounds.Generation ||
-		ref.LogicalID <= StateRootLogicalID ||
+		ref.LogicalID == 0 ||
 		ref.LogicalID >= bounds.NextLogicalID {
 		return false
 	}

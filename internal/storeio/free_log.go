@@ -52,8 +52,7 @@ const (
 	// never straddles a cache line boundary mid-field.
 	FreeDeltaRecordSize = 32
 
-	freeLogVersion    = DevelopmentFormatVersion
-	freeLogKnownFlags = uint8(0)
+	freeLogVersion = DevelopmentFormatVersion
 
 	freeDeltaPrevOffset      = 16
 	freeDeltaIndexHeadOffset = freeDeltaPrevOffset + PageRefSize
@@ -90,7 +89,6 @@ type FreeLogHeader struct {
 	Generation uint64
 	LogicalID  uint64
 	PageSize   uint32
-	Flags      uint8
 }
 
 // FreeImageView is one checksum-verified borrowed image segment.
@@ -328,7 +326,6 @@ func (v FreeDeltaView) DeltaAt(rank int) (FreeDelta, bool) {
 
 func encodeFreeLogPayloadHeader(payload []byte, header FreeLogHeader, count int) {
 	binary.LittleEndian.PutUint32(payload[0:4], freeLogVersion)
-	payload[4] = header.Flags
 	binary.LittleEndian.PutUint16(payload[6:8], uint16(count))
 }
 
@@ -341,13 +338,12 @@ func openFreeLogPage(
 	}
 	if pageHeader.Kind != kind || len(payload) < payloadHeaderSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != freeLogVersion ||
-		payload[5] != 0 || !allZero(payload[8:16]) {
+		!allZero(payload[4:6]) || !allZero(payload[8:16]) {
 		return FreeLogHeader{}, nil, 0, fmt.Errorf("%w: header, version, or reserved bytes", ErrFreeLogCorrupt)
 	}
 	header := FreeLogHeader{
 		StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
 		LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
-		Flags: payload[4],
 	}
 	count := int(binary.LittleEndian.Uint16(payload[6:8]))
 	if err := validateFreeLogHeader(header, count, recordSize, payloadHeaderSize, nextLogicalID); err != nil ||
@@ -362,9 +358,8 @@ func validateFreeLogHeader(
 ) error {
 	capacity := (int(header.PageSize) - PageHeaderSize - PageTrailerSize - payloadHeaderSize) / recordSize
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
-		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
+		header.LogicalID == 0 || header.LogicalID >= nextLogicalID ||
 		!validPhysicalPageSize(header.PageSize) ||
-		header.Flags&^freeLogKnownFlags != 0 ||
 		count < 0 || count > capacity {
 		return fmt.Errorf("%w: free log page identity or capacity", ErrInvalidWrite)
 	}
@@ -382,10 +377,10 @@ func validFreeLogPageRef(
 		return false
 	}
 	pageSize := uint64(header.PageSize)
-	return ref.Kind == kind && ref.Flags == 0 && ref.Aux == 0 &&
+	return ref.Kind == kind &&
 		ref.Length == header.PageSize &&
 		ref.Generation != 0 && ref.Generation <= header.Generation &&
-		ref.LogicalID > StateRootLogicalID && ref.LogicalID < nextLogicalID &&
+		ref.LogicalID != 0 && ref.LogicalID < nextLogicalID &&
 		ref.Offset >= layout.DataStart && ref.Offset%pageSize == 0 &&
 		ref.Offset <= maxSuperblockFileOffset &&
 		pageSize <= fileEnd && ref.Offset <= fileEnd-pageSize

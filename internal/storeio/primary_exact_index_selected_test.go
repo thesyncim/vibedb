@@ -86,7 +86,7 @@ func TestVisitPrimaryLeafSelectedPostingRowsMatchesFilteredFullVisit(t *testing.
 			var want, got [][]byte
 			fullScratch := make([]byte, 0, 4096)
 			var err error
-			fullScratch, err = VisitPrimaryLeafPostingRows(
+			_, err = VisitPrimaryLeafPostingRows(
 				page, unifiedTestStoreID(), 0, unifiedTestBounds(),
 				fullScratch,
 				func(slot uint8, key, raw []byte, _ bool) error {
@@ -100,7 +100,7 @@ func TestVisitPrimaryLeafSelectedPostingRowsMatchesFilteredFullVisit(t *testing.
 				t.Fatal(err)
 			}
 			selectedScratch := make([]byte, 0, 4096)
-			selectedScratch, err = VisitPrimaryLeafSelectedPostingRows(
+			_, err = VisitPrimaryLeafSelectedPostingRows(
 				page, unifiedTestStoreID(), 0, unifiedTestBounds(),
 				selected, selectedScratch,
 				func(_ uint8, key, raw []byte, _ bool) error {

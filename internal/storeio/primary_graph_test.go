@@ -68,8 +68,8 @@ func buildPrimaryGraphTestImage(
 	root := StateRoot{
 		StoreID: format0StoreID, Generation: 1, PageSize: format0PageSize,
 		MaxPageSize:   GlobalTabletCatalogRootBytes,
-		NextLogicalID: tx.NextLogicalID(), ChunkDocuments: 64,
-		PrimaryRoot: primaryRoot,
+		NextLogicalID: tx.NextLogicalID(),
+		PrimaryRoot:   primaryRoot,
 	}
 	if err := tx.PublishInline(root, InlineFreeDelta{}); err != nil {
 		t.Fatal(err)

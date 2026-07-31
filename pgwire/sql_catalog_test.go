@@ -671,7 +671,7 @@ func connectSQLCatalogWithServer(t *testing.T) (*testClient, *Server) {
 			t.Errorf("close SQL catalog: %v", err)
 		}
 	})
-	server, err := NewServer(FromSQLDatabase(database), Options{Auth: Trust()})
+	server, err := NewServer(database, Options{Auth: Trust()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

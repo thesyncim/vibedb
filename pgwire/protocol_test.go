@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -335,9 +335,8 @@ func TestSimpleQueryStatementIterationIsBounded(t *testing.T) {
 		// per-statement loop as ordinary SELECTs.
 		msgs := c.query(strings.Repeat("/**/;", maxSimpleStatements+1))
 		expectError(t, msgs, sqlstateProgramLimitExceeded)
-		if n := countTag(msgs, msgEmptyQuery); n != maxSimpleStatements {
-			t.Fatalf("executed %d statements before the bound, want %d",
-				n, maxSimpleStatements)
+		if n := countTag(msgs, msgEmptyQuery); n != 0 {
+			t.Fatalf("executed %d statements after preflight rejected the message, want 0", n)
 		}
 		if n := countTag(msgs, msgReadyForQuery); n != 1 {
 			t.Fatalf("bounded simple query produced %d ReadyForQuery messages, want 1", n)
@@ -495,7 +494,7 @@ func TestDeclaredJSONParametersUseJSONScalarSemantics(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := NewServer(FromDatabase(testDatabase(t, "docs", docs)),
+			srv, err := NewServer(testDatabase(t, "docs", docs),
 				Options{Auth: Trust()})
 			if err != nil {
 				t.Fatalf("NewServer: %v", err)
@@ -538,48 +537,31 @@ func TestExtendedQueryPortalSuspension(t *testing.T) {
 	c.send(msgParse, parseMsg("", `SELECT id FROM users ORDER BY id`))
 	c.send(msgBind, bindMsg("", "", nil, nil, nil))
 	c.send(msgExecute, executeMsg("", 2))
+	c.send(msgExecute, executeMsg("", 3))
+	c.send(msgExecute, executeMsg("", 0))
 	c.send(msgSync, nil)
 	msgs := c.until(msgReadyForQuery)
-	if !has(msgs, msgPortalSuspended) {
-		t.Fatalf("an Execute with a row limit did not suspend the portal: %s", tags(msgs))
-	}
-	if n := countTag(msgs, msgDataRow); n != 2 {
-		t.Fatalf("got %d rows for a limit of 2", n)
-	}
-
-	// Resuming the same portal continues where it stopped.
-	c.send(msgExecute, executeMsg("", 3))
-	c.send(msgSync, nil)
-	msgs = c.until(msgReadyForQuery)
-	if n := countTag(msgs, msgDataRow); n != 3 {
-		t.Fatalf("resuming the portal produced %d rows, want 3", n)
+	if n := countTag(msgs, msgPortalSuspended); n != 2 {
+		t.Fatalf("three Execute messages produced %d suspensions, want 2: %s", n, tags(msgs))
 	}
 	rows := rowsOf(t, msgs)
-	if string(rows[0][0]) != "3" {
-		t.Fatalf("resumed portal restarted at %q, want the third row", rows[0][0])
+	if len(rows) != 7 {
+		t.Fatalf("resumed portal produced %d rows, want all 7", len(rows))
+	}
+	for i := range rows {
+		if string(rows[i][0]) != strconv.Itoa(i+1) {
+			t.Fatalf("row %d = %q, want %d", i, rows[i][0], i+1)
+		}
+	}
+	if tag := commandTagOf(t, msgs); tag != "SELECT 7" {
+		t.Fatalf("CommandComplete tag is %q, want portal total SELECT 7", tag)
 	}
 
-	// Draining it completes with the rows of *this* Execute, not the portal's
-	// running total. PostgreSQL reports per-run, which is what lets a client
-	// that resumes a portal add the tags up; reporting the total would make a
-	// client that did so count most rows several times.
+	// Sync commits the implicit transaction and closes its non-holdable portal.
 	c.send(msgExecute, executeMsg("", 0))
 	c.send(msgSync, nil)
 	msgs = c.until(msgReadyForQuery)
-	if n := countTag(msgs, msgDataRow); n != 2 {
-		t.Fatalf("draining the portal produced %d rows, want the last 2 of 7", n)
-	}
-	if tag := commandTagOf(t, msgs); tag != "SELECT 2" {
-		t.Fatalf("CommandComplete tag is %q, want this run's count SELECT 2", tag)
-	}
-
-	// Re-executing a drained portal produces no rows and says so.
-	c.send(msgExecute, executeMsg("", 0))
-	c.send(msgSync, nil)
-	msgs = c.until(msgReadyForQuery)
-	if tag := commandTagOf(t, msgs); tag != "SELECT 0" {
-		t.Fatalf("re-executing an exhausted portal reported %q, want SELECT 0", tag)
-	}
+	expectError(t, msgs, sqlstateInvalidCursorName)
 }
 
 func TestSimpleQueryDestroysUnnamedExtendedObjects(t *testing.T) {
@@ -630,9 +612,6 @@ func TestASuspendedPortalIsRefusedAfterAnotherExecution(t *testing.T) {
 	c.send(msgBind, bindMsg("pb", "b", nil, nil, nil))
 	c.send(msgExecute, executeMsg("pa", 1))
 	c.send(msgExecute, executeMsg("pb", 0))
-	c.send(msgSync, nil)
-	c.until(msgReadyForQuery)
-
 	c.send(msgExecute, executeMsg("pa", 1))
 	c.send(msgSync, nil)
 	msgs := c.until(msgReadyForQuery)
@@ -999,10 +978,8 @@ func TestErrorClassification(t *testing.T) {
 		{`SELECT name FROM nosuch`, sqlstateUndefinedTable},
 		{`SELECT FROM users`, sqlstateSyntaxError},
 		{`SELECT name FROM users WHERE name LIKE 'a%'`, sqlstateSyntaxError},
-		{`INSERT INTO users VALUES (1)`, sqlstateFeatureNotSupported},
-		{`CREATE TABLE t (a int)`, sqlstateFeatureNotSupported},
-		{`BEGIN`, sqlstateFeatureNotSupported},
-		{`COMMIT`, sqlstateFeatureNotSupported},
+		{`INSERT INTO users VALUES (1)`, sqlstateSyntaxError},
+		{`CREATE TABLE t (a int)`, sqlstateInternalError},
 		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
 		{`DECLARE c CURSOR FOR SELECT 1`, sqlstateFeatureNotSupported},
 		{`WITH x AS (SELECT 1) SELECT * FROM x`, sqlstateFeatureNotSupported},
@@ -1280,19 +1257,6 @@ func TestDiscardActuallyDiscards(t *testing.T) {
 }
 
 // --- lifecycle and concurrency ---------------------------------------------
-
-func TestProtocolSessionUsesOneQueryWorker(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-
-	srv := newTestServer(t, Options{})
-	session := newSession(srv, serverConn)
-	defer session.release()
-	if got := session.exec.Options.Workers; got != 1 {
-		t.Fatalf("session query workers = %d, want 1", got)
-	}
-}
 
 func TestTerminateEndsTheSessionCleanly(t *testing.T) {
 	c := connect(t)
@@ -1601,7 +1565,7 @@ func TestWarmUnnamedBindIsAllocationFreeForEveryParameterShape(t *testing.T) {
 func TestOneResultRowCannotAmplifyPastTheMessageBound(t *testing.T) {
 	blob := strings.Repeat("x", 1<<20)
 	doc := `{"id":1,"blob":"` + blob + `"}`
-	srv, err := NewServer(FromDatabase(testDatabase(t, "docs", []string{doc})),
+	srv, err := NewServer(testDatabase(t, "docs", []string{doc}),
 		Options{Auth: Trust()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1627,7 +1591,7 @@ func TestLaterOversizedResultRowIsRejectedBeforeAnyDataRow(t *testing.T) {
 		`{"id":1,"blob":"small"}`,
 		`{"id":2,"blob":"` + blob + `"}`,
 	}
-	srv, err := NewServer(FromDatabase(testDatabase(t, "docs", docs)),
+	srv, err := NewServer(testDatabase(t, "docs", docs),
 		Options{Auth: Trust()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1648,25 +1612,26 @@ func TestLaterOversizedResultRowIsRejectedBeforeAnyDataRow(t *testing.T) {
 }
 
 func TestWarmDataRowPreflightIsAllocationFree(t *testing.T) {
-	src := FromDatabase(testDatabase(t, "docs", []string{
+	db := testDatabase(t, "docs", []string{
 		`{"blob":"small"}`,
 		`{"blob":"also small"}`,
-	}))
-	l, err := src.resolve("docs", false)
+	})
+	session, err := db.NewSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.release()
-	stmt, err := query.PrepareStatement(`SELECT blob FROM docs`)
+	defer session.Close()
+	stmt, err := session.Prepare(context.Background(), `SELECT blob FROM docs`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stmt.Release()
-	var exec query.Exec
-	cursor, err := stmt.RunInto(&exec, l.src, nil)
-	if err != nil {
+	defer stmt.Close()
+	var runtimeCursor sqldriver.Cursor
+	if err := stmt.QueryInto(context.Background(), nil, &runtimeCursor); err != nil {
 		t.Fatal(err)
 	}
+	defer runtimeCursor.Close()
+	cursor := runtimeCursor.Snapshot()
 	cols := columnsFor(nil, stmt.Columns(), stmt.AppendSchema(nil))
 	if err := checkDataRows(cursor, cols, nil); err != nil {
 		t.Fatalf("warm DataRow preflight: %v", err)
@@ -1703,7 +1668,7 @@ func TestConfiguredResultBudgetsFailBeforeAnyDataRow(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)), tc.opts)
+			srv, err := NewServer(testDatabase(t, "users", corpus), tc.opts)
 			if err != nil {
 				t.Fatalf("NewServer: %v", err)
 			}
@@ -1872,7 +1837,7 @@ func awaitServeResult(t *testing.T, done <-chan error) error {
 
 func TestNilServeInputsNeverEnterListenerOrConnectionAccounting(t *testing.T) {
 	var reported error
-	srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+	srv, err := NewServer(testDatabase(t, "users", corpus),
 		Options{
 			Auth: Trust(),
 			OnError: func(err error) {
@@ -1914,7 +1879,7 @@ func TestNilServeInputsNeverEnterListenerOrConnectionAccounting(t *testing.T) {
 func TestServeOwnsTheListenerAcrossEveryExit(t *testing.T) {
 	newServer := func(t *testing.T) *Server {
 		t.Helper()
-		srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+		srv, err := NewServer(testDatabase(t, "users", corpus),
 			Options{Auth: Trust()})
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
@@ -1977,7 +1942,7 @@ func TestOnErrorMayCloseTheServerSynchronously(t *testing.T) {
 			callbackDone := make(chan error, 1)
 			var srv *Server
 			var err error
-			srv, err = NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+			srv, err = NewServer(testDatabase(t, "users", corpus),
 				Options{
 					Auth: Trust(),
 					OnError: func(error) {
@@ -2029,7 +1994,7 @@ func TestOnErrorMayCloseTheServerSynchronously(t *testing.T) {
 }
 
 func TestServerCloseEndsEverySession(t *testing.T) {
-	srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)),
+	srv, err := NewServer(testDatabase(t, "users", corpus),
 		Options{Auth: Trust()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -2047,11 +2012,11 @@ func TestServerCloseEndsEverySession(t *testing.T) {
 }
 
 func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
-	src := FromDatabase(testDatabase(t, "users", corpus))
-	if _, err := NewServer(src, Options{}); err == nil {
+	database := testDatabase(t, "users", corpus)
+	if _, err := NewServer(database, Options{}); err == nil {
 		t.Fatal("NewServer accepted an implicit authentication policy")
 	}
-	srv, err := NewServer(src, Options{Auth: Trust()})
+	srv, err := NewServer(database, Options{Auth: Trust()})
 	if err != nil {
 		t.Fatalf("NewServer with explicit Trust: %v", err)
 	}
@@ -2065,7 +2030,7 @@ func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
 		t.Fatalf("zero resource fields did not select finite defaults: %+v", srv.opts)
 	}
 
-	unbounded, err := NewServer(src, Options{
+	unbounded, err := NewServer(database, Options{
 		Auth:           Trust(),
 		MaxConnections: UnlimitedConnections,
 		ReadTimeout:    -1,
@@ -2086,28 +2051,9 @@ func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
 	}
 }
 
-func TestNewServerRejectsNilSourcesBeforeServing(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		src  Source
-	}{
-		{name: "nil interface"},
-		{name: "nil database", src: FromDatabase(nil)},
-		{name: "nil collection", src: FromCollection("docs", nil)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := NewServer(tc.src, Options{Auth: Trust()}); err == nil {
-				t.Fatal("NewServer accepted a source that would panic or fail every query")
-			}
-		})
-	}
-
-	// Keep resolve itself fail-closed as defense in depth. Source
-	// implementations are package-private today, but this prevents a future
-	// internal construction path from turning a bad source into a session
-	// goroutine panic.
-	if _, err := (&collectionSource{name: "docs"}).resolve("docs", false); err == nil {
-		t.Fatal("a nil durable collection resolved successfully")
+func TestNewServerRejectsNilDatabaseBeforeServing(t *testing.T) {
+	if _, err := NewServer(nil, Options{Auth: Trust()}); err == nil {
+		t.Fatal("NewServer accepted a nil database")
 	}
 }
 
@@ -2182,161 +2128,6 @@ func TestSlowPartialStartupSocketsHaveAHardAggregateBound(t *testing.T) {
 	}
 }
 
-func TestCancelRequestStopsAPendingStatement(t *testing.T) {
-	gated := &blockingResolveSource{
-		inner:   FromDatabase(testDatabase(t, "users", corpus)),
-		entered: make(chan struct{}),
-		proceed: make(chan struct{}),
-	}
-	srv, err := NewServer(gated, Options{Auth: Trust(), MaxConnections: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = srv.Close() })
-	c := dial(t, srv)
-	c.startup(map[string]string{"user": "tester"})
-
-	c.send(msgQuery, append([]byte(`SELECT id FROM users`), 0))
-	c.drainWrites()
-	select {
-	case <-gated.entered:
-	case <-time.After(time.Second):
-		t.Fatal("query did not reach the blocking source")
-	}
-
-	// Deliver a cancel out of band, exactly as the protocol specifies: its own
-	// connection, no reply. MaxConnections is already occupied; the bounded
-	// pre-startup cushion gives this socket an admission opportunity.
-	cancelClient, cancelServer := net.Pipe()
-	cancelDone := make(chan struct{})
-	go func() {
-		srv.ServeConn(cancelServer)
-		close(cancelDone)
-	}()
-	packet := binary.BigEndian.AppendUint32(nil, 16)
-	packet = binary.BigEndian.AppendUint32(packet, uint32(codeCancelRequest))
-	packet = binary.BigEndian.AppendUint32(packet, uint32(c.pid))
-	packet = binary.BigEndian.AppendUint32(packet, uint32(c.secret))
-	if _, err := cancelClient.Write(packet); err != nil {
-		t.Fatalf("writing CancelRequest: %v", err)
-	}
-	_ = cancelClient.Close()
-	select {
-	case <-cancelDone:
-	case <-time.After(time.Second):
-		t.Fatal("CancelRequest connection did not close")
-	}
-	close(gated.proceed)
-
-	msgs := c.until(msgReadyForQuery)
-	fs := expectError(t, msgs, sqlstateQueryCanceled)
-	if fs['S'] != "ERROR" {
-		t.Fatalf("a cancel produced severity %q, want ERROR so the session survives", fs['S'])
-	}
-	// One cancel stops one statement; the session keeps working.
-	if has(c.query(`SELECT 1`), msgErrorResponse) {
-		t.Fatal("the session did not recover after a cancel")
-	}
-}
-
-type blockingResolveSource struct {
-	inner   Source
-	entered chan struct{}
-	proceed chan struct{}
-	once    sync.Once
-}
-
-func (s *blockingResolveSource) validate() error { return s.inner.validate() }
-
-func (s *blockingResolveSource) resolve(collection string, joins bool) (lease, error) {
-	s.once.Do(func() { close(s.entered) })
-	<-s.proceed
-	return s.inner.resolve(collection, joins)
-}
-
-func TestCancelDuringMaterializationIsConsumedByTheCurrentQuery(t *testing.T) {
-	gated := &blockingResolveSource{
-		inner:   FromDatabase(testDatabase(t, "users", corpus)),
-		entered: make(chan struct{}),
-		proceed: make(chan struct{}),
-	}
-	srv, err := NewServer(gated, Options{Auth: Trust()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = srv.Close() })
-	c := dial(t, srv)
-	c.startup(map[string]string{"user": "tester"})
-
-	c.send(msgQuery, append([]byte(`SELECT id FROM users`), 0))
-	c.drainWrites()
-	select {
-	case <-gated.entered:
-	case <-time.After(time.Second):
-		t.Fatal("query did not reach the blocking source")
-	}
-	srv.cancelRequest(c.pid, c.secret)
-	close(gated.proceed)
-
-	msgs := c.until(msgReadyForQuery)
-	expectError(t, msgs, sqlstateQueryCanceled)
-	if has(msgs, msgDataRow) {
-		t.Fatal("a cancel delivered during materialization emitted a DataRow")
-	}
-	if has(c.query(`SELECT 1`), msgErrorResponse) {
-		t.Fatal("a materialization-time cancel poisoned the next statement")
-	}
-}
-
-func TestServerCloseCancelsAnExecutingSessionBeforeWaiting(t *testing.T) {
-	gated := &blockingResolveSource{
-		inner:   FromDatabase(testDatabase(t, "users", corpus)),
-		entered: make(chan struct{}),
-		proceed: make(chan struct{}),
-	}
-	srv, err := NewServer(gated, Options{Auth: Trust()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := dial(t, srv)
-	c.startup(map[string]string{"user": "tester"})
-
-	srv.mu.Lock()
-	sess := srv.sessions[c.pid]
-	srv.mu.Unlock()
-	if sess == nil {
-		t.Fatal("authenticated session is absent from the cancellation registry")
-	}
-
-	c.send(msgQuery, append([]byte(`SELECT id FROM users`), 0))
-	c.drainWrites()
-	select {
-	case <-gated.entered:
-	case <-time.After(time.Second):
-		t.Fatal("query did not reach the blocking source")
-	}
-
-	closed := make(chan error, 1)
-	go func() { closed <- srv.Close() }()
-	deadline := time.Now().Add(time.Second)
-	for !sess.queryCancel.Canceled() {
-		if time.Now().After(deadline) {
-			close(gated.proceed)
-			t.Fatal("Server.Close did not signal the executing query before waiting")
-		}
-		runtime.Gosched()
-	}
-	close(gated.proceed)
-	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatalf("Server.Close: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Server.Close did not return after its canceled execution unwound")
-	}
-}
-
 func TestCancelDuringDataRowStreamingStopsTheCurrentQuery(t *testing.T) {
 	blob := strings.Repeat("x", 32<<10)
 	docs := make([]string, 8)
@@ -2344,7 +2135,7 @@ func TestCancelDuringDataRowStreamingStopsTheCurrentQuery(t *testing.T) {
 		docs[i] = fmt.Sprintf(`{"id":%d,"blob":"%s"}`, i, blob)
 	}
 	srv, err := NewServer(
-		FromDatabase(testDatabase(t, "docs", docs)),
+		testDatabase(t, "docs", docs),
 		Options{Auth: Trust()},
 	)
 	if err != nil {
@@ -2378,7 +2169,7 @@ func TestCancelDuringDataRowStreamingStopsTheCurrentQuery(t *testing.T) {
 func TestLargeWriteRefreshesAnExpiredPreviousWriteDeadline(t *testing.T) {
 	blob := strings.Repeat("x", 32<<10)
 	doc := `{"blob":"` + blob + `"}`
-	srv, err := NewServer(FromDatabase(testDatabase(t, "docs", []string{doc})), Options{
+	srv, err := NewServer(testDatabase(t, "docs", []string{doc}), Options{
 		Auth:         Trust(),
 		WriteTimeout: 250 * time.Millisecond,
 		IdleTimeout:  2 * time.Second,

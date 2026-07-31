@@ -2427,7 +2427,7 @@ func TestFanOutAbsentJoinedPathIsNull(t *testing.T) {
 		t.Fatalf("%d rows, want one per matching pair:\n%s", e.Result.RowCount, dumpResult(e.Result))
 	}
 	for r := 0; r < e.Result.RowCount; r++ {
-		if kind := e.Result.Columns[0].Cells[r].Kind(); kind != KindNull {
+		if kind := e.Result.Columns[0].Cells[r].Kind(); kind != TypeNull {
 			t.Fatalf("row %d is %v, want null for both the absent and the explicit spelling",
 				r, kind)
 		}

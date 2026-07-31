@@ -81,8 +81,6 @@ type Authenticator interface {
 	// authenticate runs the mechanism's exchange for user. Returning nil means
 	// the connection may proceed; the caller writes AuthenticationOk.
 	authenticate(c authConn, user string) error
-	// name is what appears in a log line and in an error message.
-	name() string
 }
 
 // An authConn is the part of a session a mechanism is allowed to touch: write
@@ -107,7 +105,6 @@ type trustAuth struct{}
 
 func (trustAuth) validate() error                     { return nil }
 func (trustAuth) authenticate(authConn, string) error { return nil }
-func (trustAuth) name() string                        { return "trust" }
 
 // A Verifier is one user's stored SCRAM-SHA-256 credentials: a salt, an
 // iteration count, and the two derived keys.
@@ -214,8 +211,6 @@ type scramAuth struct {
 	mockSecret []byte
 	initErr    error
 }
-
-func (*scramAuth) name() string { return "scram-sha-256" }
 
 func (a *scramAuth) validate() error {
 	if a == nil || a.lookup == nil {

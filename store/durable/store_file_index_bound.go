@@ -58,12 +58,10 @@ func (s *Snapshot) IndexProbeMemoryBound() (IndexProbeMemoryBound, error) {
 	}
 
 	// An ordered primary without a secondary exact index carries no posting
-	// live map, so no exact probe can run and the deleted chunk-summary tier
-	// leaves the directory/certificate/posting/document/tape workspaces at
-	// zero. The primary graph still exposes its live stable-slot tiles to the
+	// live map, so no exact probe can run and the reusable exact-index workspaces
+	// remain empty. The primary graph still exposes its live stable-slot tiles to the
 	// executor's full scan, and MaskCount must bound the query-owned masks that
 	// scan appends: one per live tile. The ordered graph does not maintain the
-	// retired LiveChunks counter, but every live tile holds at least one
 	// document, so DocumentCount is the conservative resident upper bound on the
 	// live-tile count without reading a page.
 	bound.MaskCount = state.root.DocumentCount

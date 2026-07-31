@@ -152,8 +152,8 @@ func main() {
 	warmup := flag.Int("warmup", 10_000, "unmeasured warmup operations")
 	clients := flag.Int("clients", 1, "concurrent worker goroutines sharing one engine handle")
 	durabilityName := flag.String(
-		"durability", "default",
-		"default, volatile, buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe",
+		"durability", "buffered-visible",
+		"buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe",
 	)
 	checkpointMutations := flag.Int(
 		"checkpoint-mutations", 0,

@@ -206,7 +206,7 @@ func discoveryInlineRoot(
 	}
 	state := StateRoot{
 		StoreID: storeID, Generation: generation, PageSize: pageSize,
-		MaxPageSize: 64 << 10, NextLogicalID: 2, ChunkDocuments: 64,
+		MaxPageSize: 64 << 10, NextLogicalID: 2,
 	}
 	return InlineSuperblock{
 		StoreID: storeID, Generation: generation, FileEnd: layout.DataStart,

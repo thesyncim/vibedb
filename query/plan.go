@@ -33,8 +33,7 @@ const (
 )
 
 // OutputColumn is cold result-schema metadata. Ordinal is the stable column ID
-// used by the typed result batch; Header is a compatibility/display spelling,
-// not an execution key.
+// used by the typed result batch; Header is its display spelling.
 type OutputColumn struct {
 	Header    string
 	Ordinal   uint32
@@ -43,21 +42,7 @@ type OutputColumn struct {
 	// current aggregate family. Future aggregate or schema-aware output types
 	// extend ValueType without changing column ordinals or instruction opcodes.
 	Type ValueType
-	// Flags control column framing. Unknown required types fail preparation;
-	// an explicitly optional length-delimited column may be skipped by a
-	// negotiated older reader.
-	Flags OutputFlags
 }
-
-// OutputFlags describe schema-level compatibility behavior independently from
-// a value type's physical properties.
-type OutputFlags uint16
-
-const (
-	// OutputOptional permits a reader that does not recognize Type to skip the
-	// complete length-delimited column.
-	OutputOptional OutputFlags = 1 << iota
-)
 
 // AppendSchema appends q's output schema to dst, compiling q if execution has
 // not already done so, and allocating nothing when dst has enough capacity.

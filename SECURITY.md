@@ -11,7 +11,7 @@ window is implied before then.
 ## Private reports
 
 Use [GitHub private vulnerability
-reporting](https://github.com/thesyncim/vibejson/security/advisories/new). Do not
+reporting](https://github.com/thesyncim/vibedb/security/advisories/new). Do not
 publish exploit details, private inputs, or a reproducer in an issue.
 
 If private reporting is unavailable, open a public issue that asks only for a
@@ -24,9 +24,10 @@ Include:
 - the smallest available reproducer;
 - expected confidentiality, integrity, availability, or durability impact.
 
-Relevant reports include parser acceptance errors, out-of-bounds access,
-stale/hidden pointers, lifetime violations, data corruption, recovery accepting
-an invalid generation, denial of service, and unsafe custom-method dispatch.
+Relevant reports include authentication or authorization bypass, SQL or
+protocol validation errors, out-of-bounds access, stale or hidden pointers,
+lifetime violations, data corruption, recovery accepting an invalid
+generation, unbounded resource use, and denial of service.
 
 Reports remain private while they are reproduced and a fix is validated through
 the relevant portable, SIMD, race, checkptr, differential, persistence, and

@@ -1,228 +1,77 @@
 # Canonical materialization
 
-**Status:** narrow, capability-gated implementation. The durable
-before-image capsule path described here qualifies same-length, projection-safe
-*asynchronous* updates; the broader mutation set remains gated. Separately, the
-buffered-visible and journal-backed synchronous lanes now patch an exclusively
-owned canonical leaf frame in place with no capsule — the frame is volatile
-until the next checkpoint materializes it — which is the primary graph's
-everyday in-place realization; this document covers the async capsule variant.
+**Status:** implemented behind strict eligibility checks. Readers always see
+one canonical page graph; materialization changes writer and recovery work only.
 
-**Idea:** overwrite a canonical page only after proving exclusive ownership,
-and protect recovery with a durable before-image capsule. Every failed
-eligibility check falls back to copy-on-write.
+## Current paths
 
-The implementation does not graduate by local latency alone. The crash,
-snapshot, read-path, scan, and index requirements in
-[Required gates](#required-gates) are the decision.
+Buffered-visible and journal-backed synchronous mutations may patch an
+exclusively owned canonical leaf frame when the replacement has the same size
+and does not require a structural change. The frame is volatile until the next
+checkpoint, so this path needs no materialization capsule. A failed eligibility
+check uses copy-on-write.
 
-## Decision
+An asynchronous store configured with a non-zero
+`MaterializationDamageGranule` may persist a same-length, projection-safe
+inline update through the before-image capsule. A zone change may include the
+document page and its route-summary page in the same capsule. Inserts, deletes,
+overflow transitions, structural changes, and unqualified devices use
+copy-on-write.
 
-Small updates and deletes may overwrite their canonical pages only when the
-writer can prove exclusive ownership. Every other mutation uses the existing
-copy-on-write path unchanged.
-
-Current implementation status is deliberately narrower than that destination:
-an explicitly asynchronous file with a caller-qualified damage granule may
-materialize a same-length, projection-safe inline update. A zone change is
-included by materializing the document page and its chunk-directory leaf in
-one capsule. Deletes, inserts, grouped pages, overflow transitions, and
-synchronous acknowledgement still use copy-on-write. The current sparse-write
-implementation also requires buffered writes: direct-I/O alignment varies by
-device and is rejected until it can be admitted rather than guessed.
-
-The fast path is not a read overlay:
-
-```text
-writer batch -> complete page after-images -> durable undo capsule
-             -> canonical sector writes -> alternate inline root
-
-reader       -> canonical route -> canonical page
-```
-
-Readers never inspect the capsule, a tombstone, a memtable, a delta chain, or a
-version list. Publication is allowed only after all query-visible structures
-are fully materialized.
+Neither path adds a read overlay, tombstone table, memtable, delta chain, or
+version list. Point reads, scans, filters, and indexes continue to follow the
+published canonical graph.
 
 ## Eligibility
 
-The writer constructs complete after-images first, then holds the snapshot
-publication gate while checking all of the following:
+The writer constructs complete after-images before publication, then verifies:
 
-1. The current state pointer is the state used to construct the mutation.
-2. The committer is healthy and orders this isolated materialization after
-   every earlier accepted generation.
-3. The undo capsule has room for every dirty sector.
-4. Every target still resolves to the exact `PageRef` selected by the current
-   root.
-5. Every target is a uniquely owned canonical extent, not a grouped or shared
-   representation.
-6. Every active reader — a snapshot's generation lease or a direct point read's
-   epoch slot, both consulted together — is strictly older than the target
-   page's generation.
-7. Every target cache frame is ready, clean, and unpinned.
-8. The encoded extent and its `PageRef` identity remain unchanged.
-9. No split, merge, relocation, separator, fence, selector, or overflow
-   transition is required.
-10. Exact indexes, certificates, ordered stripes, and group accelerators remain
-    complete for the after-image; a changed zone summary is included as a
-    second canonical target.
+1. the selected state is still current;
+2. every target resolves to the exact `PageRef` selected by that state;
+3. no active reader can observe a target that would be overwritten;
+4. each target cache frame is ready, clean, exclusively owned, and unpinned;
+5. the extent, page identity, and encoded length remain unchanged;
+6. no split, merge, relocation, fence, slot reassignment, or overflow
+   transition is required;
+7. exact-index postings and route summaries remain complete for the after-image;
+8. the bounded queue or capsule has capacity for the complete operation.
 
-Failure of any check is a normal fallback, not an error. The mutation continues
-through copy-on-write. Materialized batches are hard queue boundaries and are
-never group-committed with adjacent generations. The single writer constructs
-them in generation order, and the persistence worker finishes every earlier
-batch before writing their capsule or target sectors.
+Failure of any check is a normal copy-on-write decision. A mutation never waits
+for ownership and never weakens its configured acknowledgement contract.
 
-A canonical frame becomes eligible again when the background durability
-callback clears its dirty generation. An immediate second update that arrives
-before that fence deliberately falls back to copy-on-write; it never waits or
-adds a reader overlay. Once the callback completes, another same-page update
-can materialize without an explicit `Flush`.
+## Before-image protocol
 
-## Stable page identity
+The persistent path uses two fixed, allocator-excluded 4 KiB capsule slots. A
+capsule binds the store identity, sequence, target generation, qualified sector
+size, exact target references, complete aligned before-sectors, and checksum.
 
-A canonical materialization does not change the page header generation,
-logical ID, extent, or kind. Changing any of those fields would invalidate
-every parent `PageRef` and turn the optimization into a tree rewrite.
+Publication is ordered:
 
-The page cache swaps the full validated after-image only when the matching
-frame is clean and unpinned. It then marks that frame dirty through the target
-publication generation. This is a writer-only operation; the ordinary cache
-hit and scan paths are unchanged.
+1. write and synchronize the alternate capsule slot;
+2. write all changed canonical sectors and ordinary copy-on-write pages;
+3. synchronize data;
+4. write and synchronize the alternate inline root.
 
-The snapshot gate covers the final ownership recheck, cache swaps, queue
-acceptance, and state publication. Page construction and JSON/index work stay
-outside the gate.
+The inline-root generation is the commit marker. On open, a selected root older
+than the capsule target causes every recorded before-sector to be restored and
+synchronized. A root at or beyond the target ignores the capsule targets. A
+torn prospective capsule is ignored in favor of the preceding valid slot.
 
-## Undo protocol
+The capsule remains intact because the alternate inline root may still require
+its before-images.
 
-Two fixed, allocator-excluded 4 KiB capsule slots alternate. A capsule contains:
+## Invariants and qualification
 
-- store identity;
-- monotonic capsule sequence;
-- target root generation;
-- sector size;
-- exact target `PageRef` records;
-- complete aligned before-sectors;
-- canonical offsets and checksums;
-- a checksum over the complete fixed slot.
+- snapshots observe the complete old or new generation, never a mixture;
+- page-cache replacement occurs under the snapshot gate and reader fence;
+- every ordinary read remains independent of the capsule;
+- crash tests cover each capsule, data, synchronization, and root boundary;
+- stale-state, pinned-reader, dirty-frame, capacity, and structural cases prove
+  copy-on-write selection;
+- exact-index and route-summary answers match a full rebuild;
+- warmed read allocation and page-acquisition gates remain unchanged;
+- matched-durability benchmarks report latency and device bytes separately for
+  copy-on-write and materialized updates.
 
-The portable commit protocol is:
-
-1. Encode the new capsule into the older slot.
-2. Write and durably synchronize the complete capsule.
-3. Write every changed canonical sector and any ordinary COW pages.
-4. Durably synchronize the data.
-5. Write and synchronize the alternate inline root.
-
-The root generation is the commit marker. Recovery selects the newest
-structurally valid root before deciding whether to touch target pages:
-
-```text
-root generation < capsule target generation:
-    restore every recorded before-sector
-    synchronize
-
-root generation >= capsule target generation:
-    do not read or replay capsule targets
-```
-
-The first case preserves the older alternate root after a torn data or root
-write. The second case preserves the committed canonical after-images. A
-prospective capsule that tears before its first durability barrier is ignored;
-the preceding valid slot remains available.
-
-The capsule is retained. Clearing it immediately would destroy the rollback
-state needed by the alternate recovery root.
-
-## Mutation touch sets
-
-### Projection-neutral update
-
-When the key, route, indexed tuples, zones, and representation class are
-unchanged, only the document block and publication metadata are targets.
-Unchanged exact-index tuples are eliminated before physical planning.
-
-### Indexed update
-
-The document block and only the posting/accelerator pages whose semantic value
-changed are targets. If a posting edit changes a fence, splits a page, or
-invalidates a certificate, the mutation uses COW.
-
-### Delete
-
-A non-structural delete:
-
-- clears the document live slot and ordered permutation entry;
-- immediately exposes the slot/record span for reuse;
-- clears the exact compact route word;
-- clears affected posting bits and updates stable accelerator metadata;
-- publishes the new count and free hint.
-
-It leaves no persistent tombstone and creates no later compaction obligation.
-A boundary delete that changes a route/index fence uses COW.
-
-### Insert
-
-Initial integration leaves inserts entirely on the current COW and batch paths.
-Canonical inserts are considered only after update/delete correctness and
-competitive gates pass.
-
-## Fragmentation policy
-
-The planned hot document format uses a fixed slot directory with explicit
-`start/keyEnd/rowEnd` offsets. An update chooses a fitting free interval and
-redirects one slot in the fully materialized after-image. A delete returns its
-interval immediately.
-
-The writer reconstructs and coalesces free intervals in bounded scratch.
-Page-local compaction runs only when no interval fits despite sufficient total
-free bytes. Cold blocks are packed contiguously; mutating one materializes it
-as one hot block before publication. Readers never merge a hot overlay with a
-cold base.
-
-The implemented same-length update already compares complete after-images and
-records only changed qualified damage sectors. Page-local gap reuse, delete
-reclamation, and hot-page compaction remain gated on integrating the sparse
-document format. The checksum sector is included whenever its bytes change.
-
-## Required gates
-
-The path remains an explicit capability-gated option and cannot become the
-default until all of these pass:
-
-- exhaustive crash cuts before/after each capsule, data, and root write;
-- active-snapshot old/new visibility and forced COW fallback;
-- cache pin, stale-state, journal-capacity, and structural fallback tests;
-- point-hit/miss allocations and page acquisitions unchanged;
-- random point-read latency unchanged within noise;
-- ordered scan iteration and full-byte throughput unchanged or faster;
-- exact-index collision and certificate answers unchanged;
-- one physical materialization per target page in a combined batch;
-- matched-durability update/delete device-byte and latency measurements;
-- insert, bulk-load, and snapshot benchmarks unchanged within noise.
-
-On ordinary storage, one isolated synchronous mutation still pays ordered
-durability barriers. The design wins steady-state update/delete work by
-coalescing same-page mutations, writing bounded dirty sectors, retaining one
-canonical representation, and eliminating compaction. Device atomic-write
-support may later remove the undo phase for explicitly qualified sectors; it is
-an optimization, not a correctness dependency.
-
-## Research lineage
-
-The design borrows writer-side batching and page ownership ideas without
-adopting query-time overlays:
-
-- [Bf-Tree](https://www.vldb.org/pvldb/vol17/p3442-hao.pdf) buffers updates in
-  mini-pages, but point misses and scans consult/merge that state.
-- [Bw-tree](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/bw-tree-icde2013-final.pdf)
-  prepends page deltas, which readers traverse.
-- [FASTER](https://www.microsoft.com/en-us/research/uploads/prod/2018/03/faster-sigmod18.pdf)
-  combines in-place hot records with a hybrid log.
-- [PALM](https://www.vldb.org/pvldb/vol4/p795-sewall.pdf) demonstrates
-  dependency-aware, page-owned batch execution.
-- [Closing the B-tree versus LSM-tree write-amplification gap](https://www.usenix.org/system/files/fast22-qiao.pdf)
-  demonstrates that shadowing, localized logging, and compression can move a
-  B-tree close to LSM write amplification without adopting an LSM read path.
+Materialization is an optimization. Correctness never depends on a mutation
+qualifying for it.

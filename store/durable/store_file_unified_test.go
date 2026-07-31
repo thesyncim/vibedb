@@ -67,8 +67,7 @@ func canonicalDocs(t *testing.T, docs [][]byte) [][]byte {
 
 // TestUnifiedPrimaryCanonicalReads pins the whole unified read surface: a
 // bulk-built unified store returns exactly the canonical spelling of every
-// document (unified-leaf design §3.2 — canonicalization changes returned
-// bytes by ruling) on point reads and ordered scans, and the build stages
+// document on point reads and ordered scans, and the build stages
 // only class-5 leaves.
 func TestUnifiedPrimaryCanonicalReads(t *testing.T) {
 	for _, high := range []bool{false, true} {
@@ -135,8 +134,7 @@ func TestUnifiedPrimaryCanonicalReads(t *testing.T) {
 }
 
 // TestUnifiedPrimaryDeterminism pins that the unified bulk build is
-// byte-for-byte reproducible from the same source (INVARIANT 2, the U1
-// -count=2 gate at file strength).
+// byte-for-byte reproducible from the same source.
 func TestUnifiedPrimaryDeterminism(t *testing.T) {
 	dir := t.TempDir()
 	keys, docs := unifiedPrimaryCorpus(1500, false)
@@ -234,7 +232,7 @@ func TestUnifiedPrimaryMutation(t *testing.T) {
 	}
 }
 
-// TestUnifiedPrimaryOverlayReplaceFold pins U2's first mutable lane: one
+// TestUnifiedPrimaryOverlayReplaceFold pins the row-overlay mutation lane: one
 // equal-size replacement publishes without de-templating the leaf or creating
 // a pending raw parent, remains snapshot-isolated by generation, and folds
 // through the class-5 bulk encoder when a scan-capable snapshot is requested.
@@ -680,7 +678,7 @@ func TestUnifiedPrimaryOverlayFoldWithPinnedReader(t *testing.T) {
 
 // TestUnifiedPrimaryWithIndexes pins that exact indexes built beside a
 // unified graph stay consistent with the leaves' stable hash slots — the
-// §3.1 one-slot-discipline invariant (posting slot == read slot), exercised
+// one-slot-discipline invariant (posting slot == read slot), exercised
 // through the indexed scan path.
 func TestUnifiedPrimaryWithIndexes(t *testing.T) {
 	dir := t.TempDir()

@@ -11,15 +11,11 @@ import (
 type IndexKind uint8
 
 const (
-	// IndexPostings builds the Segment existence/scalar-containment posting
-	// layer in every collection chunk. It accelerates query equality, existence, and
-	// scalar containment while exact predicate rechecks preserve semantics.
-	IndexPostings IndexKind = iota + 1
 	// IndexExact is a declared single-column or compound scalar index.
 	// Create it with [Collection.CreateIndex]. Its physical directory maps one
 	// order-sensitive typed fingerprint to persistent stable-slot bitmaps;
 	// hashes only prune and every returned row is verified exactly.
-	IndexExact
+	IndexExact IndexKind = iota + 1
 )
 
 // IndexState is an online index's publication state.
@@ -43,7 +39,6 @@ type IndexInfo struct {
 	// Kind identifies the shared physical index family.
 	Kind IndexKind
 	// Columns contains the indexed RFC 6901 paths in compound-key order.
-	// ColumnCount is zero for the legacy wildcard posting family.
 	Columns     [MaxIndexColumns]string
 	ColumnCount uint8
 	// State is Building until CoveredChunks equals TotalChunks.
@@ -108,9 +103,7 @@ func (c *Collection) nextExactIndexVisitLocked() uint32 {
 		return c.indexVisit
 	}
 	for _, b := range c.indexes {
-		if b.exact != nil {
-			b.visit = 0
-		}
+		b.visit = 0
 	}
 	c.indexVisit = 1
 	return c.indexVisit
@@ -185,7 +178,6 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 	if b.info.State == IndexReady || state == nil {
 		return storeLogicalIndexInfo(name, b), nil
 	}
-	nextChunks := state.Chunks
 	examined := 0
 	changed := false
 	bulkRoot := b.root
@@ -204,27 +196,14 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 		if chunk == nil {
 			continue
 		}
-		if b.exact != nil {
-			var storage [MaxChunkDocuments]storeIndexHashMask
-			for _, entry := range storeIndexCollectChunk(storage[:0], b.exact, chunk) {
-				if pending == nil {
-					pending = make(map[uint64][]storeIndexChunkMask)
-				}
-				pending[entry.hash] = append(pending[entry.hash], storeIndexChunkMask{chunk: id, mask: entry.mask})
+		var storage [MaxChunkDocuments]storeIndexHashMask
+		for _, entry := range storeIndexCollectChunk(storage[:0], b.exact, chunk) {
+			if pending == nil {
+				pending = make(map[uint64][]storeIndexChunkMask)
 			}
-		} else if !chunk.Docs.Postings {
-			rebuilt, err := cloneStoreChunk(state.StateOptions, true, chunk)
-			if err != nil {
-				return storeLogicalIndexInfo(name, b), err
-			}
-			nextChunks = nextChunks.set(id, rebuilt)
-			c.noteChunkPostingsLocked(id, chunk, rebuilt)
+			pending[entry.hash] = append(pending[entry.hash], storeIndexChunkMask{chunk: id, mask: entry.mask})
 		}
-		if b.exact != nil {
-			b.mark(id)
-		} else {
-			c.markIndexesCoveredLocked(id)
-		}
+		b.mark(id)
 		changed = true
 	}
 	if len(pending) != 0 {
@@ -234,7 +213,7 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 			b.root = storeIndexApplyBulk(bulkRoot, pending)
 		}
 	}
-	if b.exact != nil && b.base == nil && b.info.CoveredChunks == b.info.TotalChunks {
+	if b.base == nil && b.info.CoveredChunks == b.info.TotalChunks {
 		base, err := newStorePackedIndex(storeIndexPending(b.root))
 		if err != nil {
 			// Keep the complete heap root and Building state retryable. A later
@@ -250,7 +229,6 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 	if changed {
 		next := *state
 		next.Generation++
-		next.Chunks = nextChunks
 		next.Indexes = c.indexInfosLocked()
 		next.secondary = c.indexSnapshotsLocked()
 		c.state.Store(&next)
@@ -273,7 +251,7 @@ func (c *Collection) DropIndex(name string) error {
 	}
 	b := c.indexes[name]
 	delete(c.indexes, name)
-	if b.exact != nil && b.refs > 1 {
+	if b.refs > 1 {
 		b.refs--
 		c.exactAliases--
 	}
@@ -319,7 +297,7 @@ func (b *storeIndexBuild) unmark(id uint32) {
 // updateState collapses complete coverage to an implicit all-live-chunks
 // representation. Readiness is monotonic because every later write builds the
 // active physical family before publication. Discarding both the bitmap and
-// AddIndex snapshot prevents a completed logical index from pinning historical
+// CreateIndex snapshot prevents a completed logical index from pinning historical
 // chunks or retaining one bit per chunk indefinitely.
 func (b *storeIndexBuild) updateState() {
 	if b.info.CoveredChunks == b.info.TotalChunks {
@@ -331,24 +309,6 @@ func (b *storeIndexBuild) updateState() {
 		return
 	}
 	b.info.State = IndexBuilding
-}
-
-func (c *Collection) hasPostingsIndexLocked() bool {
-	for _, b := range c.indexes {
-		if b.info.Kind == IndexPostings {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Collection) markIndexesCoveredLocked(id uint32) {
-	for _, b := range c.indexes {
-		if b.info.Kind == IndexPostings {
-			b.mark(id)
-			b.updateState()
-		}
-	}
 }
 
 // noteIndexesForChunkLocked updates logical coverage for a collection write. A
@@ -363,7 +323,7 @@ func (c *Collection) noteIndexesForChunkLocked(id uint32, old, next *Chunk, chan
 		visit = c.nextExactIndexVisitLocked()
 	}
 	for _, b := range c.indexes {
-		if visit != 0 && b.exact != nil {
+		if visit != 0 {
 			if b.visit == visit {
 				continue
 			}
@@ -371,7 +331,7 @@ func (c *Collection) noteIndexesForChunkLocked(id uint32, old, next *Chunk, chan
 		}
 		oldInfo, oldRoot, oldDirty := b.info, b.root, b.dirty.root
 		covered := b.has(id)
-		if b.exact != nil && b.base != nil && b.dirty.get(id) == 0 {
+		if b.base != nil && b.dirty.get(id) == 0 {
 			// Shadow the whole chunk before changing one slot. Base postings for
 			// every tuple in a dirty chunk are skipped by readers, so seed the
 			// delta with the complete old image exactly once.
@@ -383,28 +343,24 @@ func (c *Collection) noteIndexesForChunkLocked(id uint32, old, next *Chunk, chan
 		switch {
 		case !oldLive && nextLive:
 			b.info.TotalChunks++
-			if b.exact != nil {
-				b.root = storeIndexSetChunk(b.root, b.exact, id, next, true)
-			}
+			b.root = storeIndexSetChunk(b.root, b.exact, id, next, true)
 			b.mark(id)
 		case oldLive && !nextLive:
-			if b.exact != nil && covered {
+			if covered {
 				b.root = storeIndexSetChunk(b.root, b.exact, id, old, false)
 			}
 			b.info.TotalChunks--
 			b.unmark(id)
 		case nextLive:
-			if b.exact != nil {
-				if covered {
-					for slots := changed; slots != 0; slots &= slots - 1 {
-						slot := bits.TrailingZeros64(slots)
-						b.root = storeIndexUpdateSlot(b.root, b.exact, id, old, next, slot)
-					}
-				} else {
-					// A mutation of an uncovered chunk indexes its complete next
-					// image, so the chunk can join coverage immediately.
-					b.root = storeIndexSetChunk(b.root, b.exact, id, next, true)
+			if covered {
+				for slots := changed; slots != 0; slots &= slots - 1 {
+					slot := bits.TrailingZeros64(slots)
+					b.root = storeIndexUpdateSlot(b.root, b.exact, id, old, next, slot)
 				}
+			} else {
+				// A mutation of an uncovered chunk indexes its complete next
+				// image, so the chunk can join coverage immediately.
+				b.root = storeIndexSetChunk(b.root, b.exact, id, next, true)
 			}
 			b.mark(id)
 		}
@@ -412,7 +368,7 @@ func (c *Collection) noteIndexesForChunkLocked(id uint32, old, next *Chunk, chan
 		if b.info != oldInfo {
 			catalogChanged = true
 		}
-		if b.exact != nil && (b.root != oldRoot || b.dirty.root != oldDirty || b.info != oldInfo) {
+		if b.root != oldRoot || b.dirty.root != oldDirty || b.info != oldInfo {
 			secondaryChanged = true
 		}
 	}
@@ -425,13 +381,11 @@ func (c *Collection) indexSnapshotsLocked() []storeIndexSnapshot {
 	}
 	out := make([]storeIndexSnapshot, 0, len(c.indexes))
 	for name, b := range c.indexes {
-		if b.exact != nil {
-			out = append(out, storeIndexSnapshot{
-				name:  name,
-				state: b.info.State,
-				exact: b.exact, root: b.root, base: b.base, dirty: b.dirty,
-			})
-		}
+		out = append(out, storeIndexSnapshot{
+			name:  name,
+			state: b.info.State,
+			exact: b.exact, root: b.root, base: b.base, dirty: b.dirty,
+		})
 	}
 	slices.SortFunc(out, func(a, b storeIndexSnapshot) int {
 		if a.name < b.name {

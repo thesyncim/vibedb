@@ -500,7 +500,7 @@ func TestFileStoreCommitSpansSeveralFreeExtents(t *testing.T) {
 		largest = max(largest, extent.Length)
 		total += extent.Length
 	}
-	before := fs.state.Load().super.FileEnd
+	before := fs.state.Load().fileEnd
 	spread, grew := 0, false
 	for round := 15; round < 25; round++ {
 		reuseBefore := len(fs.reusable)
@@ -511,15 +511,15 @@ func TestFileStoreCommitSpansSeveralFreeExtents(t *testing.T) {
 		if reuseBefore >= 2 {
 			spread++
 		}
-		if fs.state.Load().super.FileEnd > before {
+		if fs.state.Load().fileEnd > before {
 			grew = true
 		}
 	}
 	t.Logf("largest free extent %d, total free %d, FileEnd %d -> %d over %d fragmented rounds",
-		largest, total, before, fs.state.Load().super.FileEnd, spread)
+		largest, total, before, fs.state.Load().fileEnd, spread)
 	if grew {
 		t.Fatalf("FileEnd advanced from %d to %d while %d bytes were free across %d extents",
-			before, fs.state.Load().super.FileEnd, total, len(fs.reusable))
+			before, fs.state.Load().fileEnd, total, len(fs.reusable))
 	}
 }
 
@@ -568,10 +568,10 @@ func TestFileStoreLazyFreeSegmentPromotionCyclesBoundedArena(t *testing.T) {
 		{Offset: 66 * pageSize, Length: pageSize, RetiredGeneration: 1},
 	}
 	current := *fs.state.Load()
-	current.super.FileEnd = max(current.super.FileEnd, 128*pageSize)
+	current.fileEnd = max(current.fileEnd, 128*pageSize)
 	logical := current.root.NextLogicalID
 	current.root.NextLogicalID += 2
-	if err := file.Truncate(int64(current.super.FileEnd)); err != nil {
+	if err := file.Truncate(int64(current.fileEnd)); err != nil {
 		t.Fatal(err)
 	}
 	writeSegment := func(
@@ -585,7 +585,7 @@ func TestFileStoreLazyFreeSegmentPromotionCyclesBoundedArena(t *testing.T) {
 				StoreID: fs.storeID, Generation: current.root.Generation,
 				LogicalID: logicalID, PageSize: uint32(options.PageSize),
 			},
-			extents, current.super.FileEnd, current.root.NextLogicalID,
+			extents, current.fileEnd, current.root.NextLogicalID,
 		); encodeErr != nil {
 			t.Fatal(encodeErr)
 		}

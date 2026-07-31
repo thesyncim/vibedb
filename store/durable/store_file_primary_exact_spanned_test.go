@@ -9,9 +9,9 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// Spanned term-leaf coverage (docs/design/indexed-write-path.md §6): fold
-// identity ACROSS CUT BOUNDARIES on a corpus large enough that the exact
-// root v1 catalog genuinely spans — giant terms as stripe pieces and a
+// Spanned term-leaf coverage: fold identity across cut boundaries on a corpus
+// large enough that the exact
+// root catalog genuinely spans — giant terms as stripe pieces and a
 // multi-run packed index — plus the dirty-leaf fold's page-reuse contract
 // (untouched leaves keep their durable pages; only dirty ones re-stage) and
 // the stripe-patch locality of a still-giant term.
@@ -98,8 +98,8 @@ func TestPrimaryExactQuietStagingMetadataIsPrivate(t *testing.T) {
 	}
 }
 
-// TestFilePrimaryIndexedSpannedFoldIdentity is the P1 identity gate: a
-// corpus whose low-cardinality index fails closed under the v0 single-leaf
+// TestFilePrimaryIndexedSpannedFoldIdentity proves fold identity for a
+// corpus whose low-cardinality index cannot fit one leaf and therefore
 // format builds spanned, answers probes mid-window and post-fold against an
 // oracle, and every fold — including dirty-leaf folds that carry most leaves
 // by reference — produces the byte-identical spanned leaf set a from-scratch
@@ -288,7 +288,7 @@ func TestFilePrimaryIndexedSpannedFoldIdentity(t *testing.T) {
 		t.Fatalf("group fold carried %d of %d leaf pages", keptGroup, totalGroup)
 	}
 
-	// Reopen: the v1 root and spanned catalogs rehydrate to the identical
+	// Reopen: the root and spanned catalogs rehydrate to the identical
 	// resident leaf set and keep answering.
 	file := coll.file
 	if err := coll.Close(); err != nil {

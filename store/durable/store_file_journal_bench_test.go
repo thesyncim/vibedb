@@ -92,7 +92,7 @@ func BenchmarkRecoveryJournalStorePut(b *testing.B) {
 }
 
 // BenchmarkRecoveryJournalStorePutConcurrent measures the buffered-journal ack
-// path under 1 vs N concurrent goroutines, isolating the phase-1 group-commit
+// path under 1 vs N concurrent goroutines, isolating journal group-commit
 // amortization: each goroutine appends its own redo record under the writer, but
 // concurrent callers share one journal sync. Per-op time should fall well below
 // the single-goroutine sync floor as the group fans out. It reports the achieved

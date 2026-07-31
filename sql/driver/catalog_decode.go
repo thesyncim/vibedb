@@ -20,14 +20,18 @@ import (
 
 func (c *catalogFile) UnmarshalJSON(data []byte) error {
 	var decoded catalogFile
+	var versionPresent bool
+	var tablesPresent bool
 	err := decodeCatalogObject(data, "root", func(
 		name string,
 		decoder *json.Decoder,
 	) error {
 		switch name {
 		case "version":
+			versionPresent = true
 			return decoder.Decode(&decoded.Version)
 		case "tables":
+			tablesPresent = true
 			var tables catalogTableMap
 			if err := decoder.Decode(&tables); err != nil {
 				return err
@@ -40,6 +44,12 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 	})
 	if err != nil {
 		return err
+	}
+	if !versionPresent {
+		return fmt.Errorf("vibedb: SQL catalog root is missing member %q", "version")
+	}
+	if !tablesPresent {
+		return fmt.Errorf("vibedb: SQL catalog root is missing member %q", "tables")
 	}
 	*c = decoded
 	return nil

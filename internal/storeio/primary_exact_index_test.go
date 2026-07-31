@@ -45,7 +45,7 @@ func TestPrimaryExactRootRejectsGraft(t *testing.T) {
 }
 
 // TestPrimaryExactRootByteIdenticalRebuild pins the deterministic byte image
-// of the v1 exact root: the same per-index catalog entries encode to the same
+// of the exact root: the same per-index catalog entries encode to the same
 // bytes on every build, so a rebuilt ordered-primary index is byte-identical.
 func TestPrimaryExactRootByteIdenticalRebuild(t *testing.T) {
 	const pageSize = uint32(4096)

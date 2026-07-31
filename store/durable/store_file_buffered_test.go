@@ -70,16 +70,6 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	}
 }
 
-// TestFileStoreBufferedPrewriteDoesNotPublishRoot was retired with the chunk
-// store. It drove the committer write-behind (half-full staging pre-writes
-// dirty pages to the device ahead of the checkpoint), a path overflow-on-Put
-// makes unreachable in the buffered lane: a large value is stored out of line as
-// volatile, memory-only frames until a checkpoint, and the leaf that names its
-// chain stays small, so buffered staging never grows a half-full page vector to
-// pre-write. PrewrittenPageWrites is therefore always zero here and the
-// assertion can no longer fire. If volatile-frame spilling reintroduces
-// device-ahead staging in the buffered lane, this coverage returns with it.
-
 func TestFileStoreBufferedVisibleCloseCheckpoints(t *testing.T) {
 	path := t.TempDir() + "/buffered-close.db"
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -627,10 +617,10 @@ func TestFileStoreBufferedVisibleNeverDurableReusePlateausAndReopens(t *testing.
 			t.Fatal(err)
 		}
 		if cycle == warmup-1 {
-			plateau = collection.state.Load().super.FileEnd
+			plateau = collection.state.Load().fileEnd
 		}
 	}
-	after := collection.state.Load().super.FileEnd
+	after := collection.state.Load().fileEnd
 	// One retained tail witness plus bounded free-log reshaping may extend the
 	// warmup high-water by a few pages. It must not grow once per materialized
 	// generation, which was the pre-integration failure mode.

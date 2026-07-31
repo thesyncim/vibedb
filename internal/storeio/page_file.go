@@ -28,10 +28,10 @@ const (
 // owns and must close a returned descriptor only when it differs from file.
 func OpenPageCacheFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
 	if file == nil {
-		return nil, false, fmt.Errorf("%w: nil file", ErrPageReference)
+		return nil, false, fmt.Errorf("%w: nil file", ErrPageCacheReference)
 	}
 	if mode > DirectRequire {
-		return nil, false, fmt.Errorf("%w: direct mode %d", ErrPageReference, mode)
+		return nil, false, fmt.Errorf("%w: direct mode %d", ErrPageCacheReference, mode)
 	}
 	return openPageCacheFile(file, mode)
 }

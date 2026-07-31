@@ -488,19 +488,6 @@ func (s *decimalSum) mulPow10(value *big.Int, n int) {
 	value.Mul(value, &s.pow)
 }
 
-func (s *decimalSum) normalizeSmall() {
-	if s.smallCoeff == 0 {
-		s.smallScale = 0
-		s.digits = 1
-		return
-	}
-	for s.smallCoeff%10 == 0 {
-		s.smallCoeff /= 10
-		s.smallScale++
-	}
-	s.digits = intDigits64(s.smallCoeff)
-}
-
 func intDigits64(v int64) int {
 	u := absInt64(v)
 	return uintDigits(u)
@@ -786,7 +773,7 @@ func (w *Workspace) exactDecimalCell(sum *decimalSum) (Cell, error) {
 		w.aggregateOut = sum.appendJSON(w.aggregateOut)
 	}
 	raw := w.aggregateOut[start:len(w.aggregateOut):len(w.aggregateOut)]
-	cell := Cell{kind: KindNumber, flag: cellNumberRaw, raw: raw}
+	cell := Cell{kind: TypeNumber, flag: cellNumberRaw, raw: raw}
 	if value, ok := sum.int64Value(); ok {
 		cell.flag |= cellInteger
 		cell.word = uint64(value)

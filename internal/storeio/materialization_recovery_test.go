@@ -145,8 +145,8 @@ func (f *mutableRecoveryFixture) root(generation uint64) InlineSuperblock {
 	}
 	state := StateRoot{
 		StoreID: f.storeID, Generation: generation, PageSize: f.pageSize,
-		MaxPageSize:   f.pageSize,
-		NextLogicalID: uint64(len(f.refs) + 2), ChunkDocuments: 64,
+		MaxPageSize:                  f.pageSize,
+		NextLogicalID:                uint64(len(f.refs) + 2),
 		Options:                      StateOptionCanonicalMaterialization,
 		MaterializationDamageGranule: MaterializationJournalMinSectorSize,
 	}
@@ -564,4 +564,3 @@ func TestMutableRecoveryRejectsShortScratchBeforeMutation(t *testing.T) {
 		t.Fatal("short scratch mutated recovery state")
 	}
 }
-

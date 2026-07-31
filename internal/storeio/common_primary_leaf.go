@@ -76,9 +76,9 @@ var (
 	)
 )
 
-// CommonPrimaryLeafClass is the encoded class byte. Format version 5 persists
+// CommonPrimaryLeafClass is the encoded class byte. The durable format persists
 // only CommonPrimaryLeafUnified; narrow and wide remain internal raw-envelope
-// geometries used by placement and the temporary structural mutation bridge.
+// geometries used by placement and structural mutation.
 type CommonPrimaryLeafClass uint8
 
 const (
@@ -262,23 +262,6 @@ func CommonPrimaryLeafStructuralBytes(
 		return 0
 	}
 	return PageHeaderSize + layout.heapStart + extra + PageTrailerSize
-}
-
-// CommonPrimaryLeafNarrowHeapCapacity is the key/value heap byte budget of a
-// full narrow-class leaf, computed at its densest live count so the value is a
-// conservative floor. Merge/reclass evaluation compares a wide leaf's live heap
-// against it to reject a reclass whose rows cannot fit the narrow class -- a
-// re-encode that would fall back to wide and cost a full checkpoint for no
-// space gain (the low-cardinality corpus's byte-full ~28-doc wide leaves).
-func CommonPrimaryLeafNarrowHeapCapacity() int {
-	structural := CommonPrimaryLeafStructuralBytes(
-		CommonPrimaryLeafNarrow, CommonPrimaryLeafNarrowLive,
-		CommonPrimaryLeafNarrowBytes,
-	)
-	if structural == 0 {
-		return 0
-	}
-	return CommonPrimaryLeafNarrowBytes - structural
 }
 
 // CommonPrimaryLeafStructuralBytesPerKey reports the leaf's fixed structural
@@ -515,8 +498,7 @@ func commonPrimaryLeafValidateOverflow(
 		ref.LogicalID >= CommonPrimaryLeafFirstDynamicLogicalID &&
 		ref.LogicalID < bounds.NextLogicalID && ref.LogicalID != leafLogicalID &&
 		ref.Generation != 0 && ref.Generation < uint64(1)<<48 &&
-		ref.Generation <= leafGeneration &&
-		ref.Kind == PageOverflow && ref.Flags == 0 && ref.Aux == 0 &&
+		ref.Generation <= leafGeneration && ref.Kind == PageOverflow &&
 		validPageExtentSize(PageOverflow, ref.Length) &&
 		ref.Length >= bounds.AllocationQuantum &&
 		ref.Length%bounds.AllocationQuantum == 0
@@ -544,8 +526,7 @@ func commonPrimaryLeafValidateExpectedRef(
 		ref.LogicalID == logicalID &&
 		ref.Generation != 0 && ref.Generation < uint64(1)<<48 &&
 		ref.Generation <= selectingGeneration &&
-		ref.Kind == commonPrimaryLeafPageKind &&
-		ref.Flags == 0 && ref.Aux == 0
+		ref.Kind == commonPrimaryLeafPageKind
 }
 
 // EncodeCommonPrimaryLeaf writes one immutable leaf image into dst from records
@@ -849,8 +830,7 @@ func OpenCommonPrimaryLeaf(
 		pageHeader.LogicalID != expected.LogicalID ||
 		pageHeader.Generation != expected.Generation ||
 		pageHeader.PageSize != expected.Length ||
-		pageHeader.Kind != expected.Kind ||
-		pageHeader.Flags != 0 {
+		pageHeader.Kind != expected.Kind {
 		return CommonPrimaryLeafView{}, fmt.Errorf(
 			"%w: common identity or payload header",
 			ErrCommonPrimaryLeafCorrupt,
@@ -1367,49 +1347,12 @@ func (v *CommonPrimaryLeafView) Header() CommonPrimaryLeafHeader {
 	return v.header
 }
 
-// Class returns the leaf's stable-slot class, or zero for a nil view.
-func (v *CommonPrimaryLeafView) Class() CommonPrimaryLeafClass {
-	if v == nil {
-		return 0
-	}
-	return v.class
-}
-
 // Len returns the number of live records in the leaf.
 func (v *CommonPrimaryLeafView) Len() int {
 	if v == nil {
 		return 0
 	}
 	return int(v.count)
-}
-
-// HeapOccupancy reports the key/value heap bytes the live records currently
-// occupy and the heap byte capacity of the leaf's physical extent. Merge
-// evaluation uses the ratio to separate a genuinely sparse leaf (few small rows,
-// far below capacity) from a byte-full one (few large rows that already pack the
-// heap): the merge floor is then relative to what this leaf can actually hold
-// rather than an absolute slot count. Record boundaries are absolute payload
-// offsets whose first equals heapStart, so the last live record's end minus
-// heapStart is exactly the occupied heap span. A template leaf (heapStart == 0)
-// reports a zero capacity; callers treat that as "not a sparse merge candidate".
-func (v *CommonPrimaryLeafView) HeapOccupancy() (used, capacity int) {
-	if v == nil || v.layout.heapStart == 0 ||
-		len(v.payload) <= v.layout.heapStart {
-		return 0, 0
-	}
-	capacity = len(v.payload) - v.layout.heapStart
-	if v.count == 0 {
-		return 0, capacity
-	}
-	_, end, ok := v.recordBounds(int(v.count) - 1)
-	if !ok || end < v.layout.heapStart {
-		return 0, capacity
-	}
-	used = end - v.layout.heapStart
-	if used > capacity {
-		used = capacity
-	}
-	return used, capacity
 }
 
 // PersistentBytes returns the borrowed on-disk image. It aliases the admitted
@@ -1764,80 +1707,6 @@ func (it *CommonPrimaryLeafIterator) NextRawBorrowed() (
 		it.finished = true
 	}
 	return key, raw, overflow, true
-}
-
-// VisitRawBorrowed drains the iterator through fn in one call. It performs
-// exactly NextRawBorrowed's decode per row but keeps the payload, layout, and
-// row counters in locals for the whole leaf, removing the per-row call
-// round trip and prologue the full-scan profile measured at over 1ns/doc.
-// fn receives only inline rows; the first overflow row stops the drain and is
-// returned as its borrowed key and 32-byte descriptor with the iterator
-// advanced past it, so the caller resolves the out-of-line value and re-enters
-// to continue. A nil key and raw with a nil error means the leaf is exhausted
-// or a bound terminated it, exactly as NextRawBorrowed's ok=false.
-func (it *CommonPrimaryLeafIterator) VisitRawBorrowed(
-	fn func(key, raw []byte) error,
-) (overflowKey, overflowRaw []byte, err error) {
-	if it == nil || it.finished || fn == nil {
-		return nil, nil, nil
-	}
-	payload := it.payload
-	layout := &it.layout
-	count := int(it.count)
-	rank := int(it.rank)
-	bitPos := int(it.bitPos)
-	offset := int(it.offset)
-	bounded := len(it.upper) != 0 || len(it.prefix) != 0
-	for rank < count {
-		nextPosition, ok := commonPrimaryLeafNextHighBitAt(
-			payload, layout.highStart, layout.highBytes, bitPos+1,
-		)
-		if !ok {
-			break
-		}
-		nextRank := rank + 1
-		end := uint16(
-			(nextPosition-nextRank)<<commonPrimaryLeafLowerBits,
-		) | uint16(payload[layout.lowStart+nextRank])
-		keyLength := commonPrimaryLeafKeyCode(payload, layout, rank)
-		start := offset
-		if keyLength == commonPrimaryLeafEscapeLength {
-			keyLength = int(payload[start]) + 1
-			start++
-		}
-		key := payload[start : start+keyLength : start+keyLength]
-		if bounded &&
-			(len(it.upper) != 0 && bytes.Compare(key, it.upper) >= 0 ||
-				len(it.prefix) != 0 && !bytes.HasPrefix(key, it.prefix)) {
-			break
-		}
-		valueStart := start + keyLength
-		overflow := payload[layout.overflowStart+rank/8]&
-			(byte(1)<<uint(rank&7)) != 0
-		raw := payload[valueStart:int(end):int(end)]
-		rank = nextRank
-		bitPos = nextPosition
-		offset = int(end)
-		if overflow {
-			it.rank = uint16(rank)
-			it.bitPos = uint16(bitPos)
-			it.offset = uint16(offset)
-			it.finished = rank >= count
-			return key, raw, nil
-		}
-		if err := fn(key, raw); err != nil {
-			it.rank = uint16(rank)
-			it.bitPos = uint16(bitPos)
-			it.offset = uint16(offset)
-			it.finished = rank >= count
-			return nil, nil, err
-		}
-	}
-	it.rank = uint16(rank)
-	it.bitPos = uint16(bitPos)
-	it.offset = uint16(offset)
-	it.finished = true
-	return nil, nil, nil
 }
 
 func (v *CommonPrimaryLeafView) rankSlots() (
@@ -2516,139 +2385,4 @@ func (v *CommonPrimaryLeafView) rebuildMutationStash(
 		}
 	}
 	return nil
-}
-
-// PromoteCommonPrimaryLeafUpdateTo combines a narrow-to-wide promotion with
-// one value replacement in a single destination generation. Existing stable
-// slots are preserved.
-func PromoteCommonPrimaryLeafUpdateTo(
-	dst []byte,
-	generation uint64,
-	narrow *CommonPrimaryLeafView,
-	slot uint8,
-	key []byte,
-	value CommonPrimaryLeafValue,
-) ([]byte, error) {
-	if narrow == nil || narrow.class != CommonPrimaryLeafNarrow ||
-		generation <= narrow.header.Generation ||
-		generation >= uint64(1)<<48 ||
-		len(dst) < CommonPrimaryLeafWideBytes ||
-		commonPrimaryLeafValueBytes(value) == 0 ||
-		commonPrimaryLeafOverlaps(
-			dst[:CommonPrimaryLeafWideBytes], narrow.page,
-		) {
-		return nil, fmt.Errorf(
-			"%w: primary leaf promoted update", ErrInvalidWrite,
-		)
-	}
-	rank, ok := narrow.slotRank(slot)
-	if !ok {
-		return nil, ErrCommonPrimaryLeafNotFound
-	}
-	if _, ok := narrow.LookupSlot(slot, key); !ok {
-		return nil, ErrCommonPrimaryLeafNotFound
-	}
-	var records [CommonPrimaryLeafWideSlots]CommonPrimaryLeafRecord
-	count, ok := narrow.copyRecords(records[:], -1)
-	if !ok {
-		return nil, ErrCommonPrimaryLeafCorrupt
-	}
-	records[rank].Value = value
-	return EncodeCommonPrimaryLeaf(
-		dst, CommonPrimaryLeafWide,
-		CommonPrimaryLeafHeader{
-			StoreID: narrow.header.StoreID, Generation: generation,
-			Bucket:   narrow.header.Bucket,
-			PageSize: CommonPrimaryLeafWideBytes,
-		},
-		narrow.seed, records[:count], narrow.bounds,
-	)
-}
-
-// PromoteCommonPrimaryLeafInsertTo combines a narrow-to-wide promotion with
-// one insertion. Published rows retain their stable slots; only the new row is
-// assigned an empty normal candidate or expanded wide stash slot.
-func PromoteCommonPrimaryLeafInsertTo(
-	dst []byte,
-	generation uint64,
-	narrow *CommonPrimaryLeafView,
-	key []byte,
-	value CommonPrimaryLeafValue,
-) ([]byte, uint8, error) {
-	if narrow == nil || narrow.class != CommonPrimaryLeafNarrow ||
-		generation <= narrow.header.Generation ||
-		generation >= uint64(1)<<48 ||
-		len(key) == 0 || len(key) > CommonPrimaryLeafMaxKeyBytes ||
-		len(dst) < CommonPrimaryLeafWideBytes ||
-		commonPrimaryLeafValueBytes(value) == 0 ||
-		commonPrimaryLeafOverlaps(
-			dst[:CommonPrimaryLeafWideBytes], narrow.page,
-		) {
-		return nil, 0, fmt.Errorf(
-			"%w: primary leaf promoted insert", ErrInvalidWrite,
-		)
-	}
-	hash := commonPrimaryLeafHash(narrow.seed, key)
-	if _, _, _, ok := narrow.LookupRawHashed(hash, key); ok {
-		return nil, 0, fmt.Errorf(
-			"%w: duplicate primary leaf key", ErrInvalidWrite,
-		)
-	}
-	slot, ok := narrow.emptyPromotedWideSlot(hash)
-	if !ok {
-		return nil, 0, ErrCommonPrimaryLeafFull
-	}
-	var records [CommonPrimaryLeafWideSlots]CommonPrimaryLeafRecord
-	count, ok := narrow.copyRecords(records[:], -1)
-	if !ok {
-		return nil, 0, ErrCommonPrimaryLeafCorrupt
-	}
-	insertRank := narrow.LowerBound(key)
-	copy(
-		records[insertRank+1:count+1],
-		records[insertRank:count],
-	)
-	records[insertRank] = CommonPrimaryLeafRecord{
-		Slot: slot, Key: key, Value: value,
-	}
-	page, err := EncodeCommonPrimaryLeaf(
-		dst, CommonPrimaryLeafWide,
-		CommonPrimaryLeafHeader{
-			StoreID: narrow.header.StoreID, Generation: generation,
-			Bucket:   narrow.header.Bucket,
-			PageSize: CommonPrimaryLeafWideBytes,
-		},
-		narrow.seed, records[:count+1], narrow.bounds,
-	)
-	return page, slot, err
-}
-
-func (v *CommonPrimaryLeafView) emptyPromotedWideSlot(
-	hash uint64,
-) (uint8, bool) {
-	first, second := commonPrimaryLeafGroups(hash)
-	groups := [2]uint8{first, second}
-	homes := [2]uint8{
-		uint8(hash>>16) & (commonPrimaryLeafGroupSize - 1),
-		uint8(hash>>20) & (commonPrimaryLeafGroupSize - 1),
-	}
-	for groupIndex := range 2 {
-		base := groups[groupIndex] * commonPrimaryLeafGroupSize
-		for ordinal := range uint8(commonPrimaryLeafGroupSize) {
-			slot := base + (homes[groupIndex]+ordinal)&
-				(commonPrimaryLeafGroupSize-1)
-			if v.payload[v.layout.controlStart+int(slot)] == 0 {
-				return slot, true
-			}
-		}
-	}
-	for slot := CommonPrimaryLeafNormalSlots; slot < CommonPrimaryLeafWideSlots; slot++ {
-		if slot >= v.class.slots() {
-			return uint8(slot), true
-		}
-		if _, live := v.slotRank(uint8(slot)); !live {
-			return uint8(slot), true
-		}
-	}
-	return 0, false
 }

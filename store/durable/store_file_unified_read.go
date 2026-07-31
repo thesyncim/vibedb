@@ -6,12 +6,10 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// Bench-level unified read lanes (unified-leaf design §5, §10.2, §10.3):
-// the token filter and the field probe. Both consume class-5 rows through
+// The token filter and field probe consume class-5 rows through
 // the token view without rendering non-target holes; both degrade per row —
 // never per store — to the render path for trivial rows, container targets,
-// overflow chains, and non-unified leaves. SQL wiring is U4; these APIs are
-// the U1 gate surface and the seam that wiring will consume.
+// overflow chains, and non-unified leaves.
 
 // EqFilter is a reusable canonical-spelling equality predicate for
 // Snapshot.FilterEqCount. It is single-consumer; reuse across scans and
@@ -31,7 +29,7 @@ func NewEqFilter(path string, needleJSON []byte) (*EqFilter, error) {
 }
 
 // FilterEqResult reports one filtered scan: rows matched, rows that took the
-// render-then-filter fallback lane (reported, not hidden — §10.3), and rows
+// render-then-filter fallback lane (reported, not hidden), and rows
 // scanned in total.
 type FilterEqResult struct {
 	Matched  int
@@ -41,7 +39,7 @@ type FilterEqResult struct {
 
 // FilterEqCount scans every live document and counts those whose value at
 // the filter's path equals the filter's needle by canonical spelling.
-// Unified leaves evaluate rows from tokens (the §10.3 lane); every row the
+// Unified leaves evaluate rows from tokens; every row the
 // token lane cannot decide — and every row of a non-unified leaf — renders
 // into reused scratch and evaluates there. Overflow documents reassemble
 // through the snapshot's reused chain buffer. A warmed filter scan allocates
@@ -57,11 +55,11 @@ func (s *Snapshot) FilterEqCount(f *EqFilter) (FilterEqResult, error) {
 	catalogBounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
 		SelectedRootGeneration: state.root.Generation,
-		FileEnd:                state.super.FileEnd,
+		FileEnd:                state.fileEnd,
 		NextLogicalID:          state.root.NextLogicalID,
 	}
 	leafBounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           state.super.FileEnd,
+		FileEnd:           state.fileEnd,
 		NextLogicalID:     state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 	}
@@ -91,7 +89,7 @@ func (s *Snapshot) FilterEqCount(f *EqFilter) (FilterEqResult, error) {
 				Scanned:  progress.Scanned,
 			}, nil
 		}
-		// Overflow chains carry canonical bytes (§6): reassemble into the
+		// Overflow chains carry canonical bytes: reassemble into the
 		// snapshot's reused buffer and evaluate through the render path.
 		s.overflowScanValue, err = s.collection.appendPrimaryOverflowValue(
 			s.overflowScanValue[:0], ref, leafBounds,
@@ -120,9 +118,8 @@ type fieldProbeKey struct {
 }
 
 // FieldProbe reads one field's canonical spelling from documents by key
-// without copying or parsing the rest of the document (§10.2: what the token
-// view deletes is everything after the slot lookup — the whole-document copy
-// and the parse/walk over it). A probe is single-consumer, bound to one
+// without copying or parsing the rest of the document. A probe is
+// single-consumer, bound to one
 // collection, and reusable across snapshots; per-(leaf, template) hole
 // resolutions are cached, so a warmed probe allocates nothing.
 type FieldProbe struct {
@@ -199,7 +196,7 @@ func (s *Snapshot) AppendField(
 		return s.appendFieldFallback(dst, p, key)
 	}
 	bounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           state.super.FileEnd,
+		FileEnd:           state.fileEnd,
 		NextLogicalID:     state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 	}

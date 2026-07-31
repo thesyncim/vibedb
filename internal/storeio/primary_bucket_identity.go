@@ -1,6 +1,12 @@
 package storeio
 
 const (
+	TabletLocalIdentityTabletBits  = 18
+	TabletLocalIdentityLocalBits   = 12
+	TabletLocalIdentityLocalCount  = 1 << TabletLocalIdentityLocalBits
+	TabletLocalIdentityTabletCount = 1 << TabletLocalIdentityTabletBits
+	TabletLocalIdentityBucketCount = 1 << (TabletLocalIdentityTabletBits + TabletLocalIdentityLocalBits)
+
 	// PrimaryBucketIDLimit is the first value outside the durable 30-bit
 	// primary-leaf identity namespace. The upper bits identify a tablet and
 	// the lower bits identify a stable leaf inside that tablet.
@@ -11,16 +17,12 @@ const (
 	// independently reconstructible without storing another uint64 in every
 	// routing row. Dynamically allocated overflow, index, free, and catalog
 	// pages start only after the complete fixed namespace.
-	PrimaryLeafLogicalIDBase  = uint64(StateRootLogicalID + 1)
+	PrimaryLeafLogicalIDBase  = uint64(1)
 	PrimaryLeafLogicalIDLimit = PrimaryLeafLogicalIDBase + uint64(PrimaryBucketIDLimit)
 
 	PrimaryAnchorLogicalIDBase  = PrimaryLeafLogicalIDLimit
 	PrimaryAnchorLogicalIDLimit = PrimaryAnchorLogicalIDBase + 1<<18*16
 
-	// Tablet roots are retained only for the tracked catalog codec while the
-	// fused route block replaces that wrapper in the production graph. Keeping
-	// the temporary band explicit prevents its pages from colliding with the
-	// selected locator and route identities during the cutover.
 	PrimaryTabletRootLogicalIDBase  = PrimaryAnchorLogicalIDLimit
 	PrimaryTabletRootLogicalIDLimit = PrimaryTabletRootLogicalIDBase + 1<<18
 
@@ -38,10 +40,7 @@ const (
 	PrimaryTabletRouteLogicalIDBase  = PrimaryCatalogRootLogicalID + 1
 	PrimaryTabletRouteLogicalIDLimit = PrimaryTabletRouteLogicalIDBase + 1<<20
 
-	PrimaryTabletDirectoryLogicalIDBase  = PrimaryTabletRouteLogicalIDLimit
-	PrimaryTabletDirectoryLogicalIDLimit = PrimaryTabletDirectoryLogicalIDBase + 1<<20
-
-	PrimaryFirstDynamicLogicalID = PrimaryTabletDirectoryLogicalIDLimit
+	PrimaryFirstDynamicLogicalID = PrimaryTabletRouteLogicalIDLimit
 )
 
 // BucketID is the stable 30-bit identity carried by secondary posting tiles.
@@ -51,3 +50,25 @@ type BucketID uint32
 // BucketZone is the compact leaf summary carried by a primary router handle.
 // Its interpretation belongs to the ordered-leaf layer.
 type BucketZone [4]byte
+
+// MakeTabletLocalIdentityBucket combines an 18-bit tablet and 12-bit local
+// identity. The largest valid pair produces the largest 30-bit BucketID.
+func MakeTabletLocalIdentityBucket(
+	tabletID uint32, localID uint32,
+) (uint32, bool) {
+	if tabletID >= TabletLocalIdentityTabletCount ||
+		localID >= TabletLocalIdentityLocalCount {
+		return 0, false
+	}
+	return tabletID<<TabletLocalIdentityLocalBits | localID, true
+}
+
+func SplitTabletLocalIdentityBucket(
+	bucketID uint32,
+) (tabletID uint32, localID uint16, ok bool) {
+	if bucketID >= TabletLocalIdentityBucketCount {
+		return 0, 0, false
+	}
+	return bucketID >> TabletLocalIdentityLocalBits,
+		uint16(bucketID & (TabletLocalIdentityLocalCount - 1)), true
+}

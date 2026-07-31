@@ -263,11 +263,6 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 				"(use -allow-diagnostic for a shorter diagnostic)",
 		)
 	}
-	if *durability == "default" {
-		return config{}, errors.New(
-			"-durability must select an explicit common lane, not default",
-		)
-	}
 	return config{
 		mixedBin: resolvedBin, engines: engines,
 		repetitions: *repetitions, conditioning: *conditioning,
@@ -609,7 +604,7 @@ func outputWriter(path string, stdout io.Writer) (io.Writer, func() error, error
 
 func collectMetadata(cfg config, args []string, started time.Time) map[string]string {
 	metadata := map[string]string{
-		"format-version":       "1",
+		"format-version":       "0",
 		"started-utc":          started.UTC().Format(time.RFC3339Nano),
 		"argv-json":            marshalJSON(args),
 		"mixed-binary":         cfg.mixedBin,

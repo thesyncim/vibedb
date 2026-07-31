@@ -464,12 +464,12 @@ func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
 
 func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
 	switch cell.Kind() {
-	case KindNull:
+	case TypeNull:
 		return nil, false, nil
-	case KindBool:
+	case TypeBool:
 		slot.b, _ = cell.Bool()
 		return &slot.b, true, nil
-	case KindNumber:
+	case TypeNumber:
 		if v, ok := cell.Int64(); ok {
 			slot.i = v
 			return &slot.i, true, nil
@@ -477,7 +477,7 @@ func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
 		slot.buf = cell.AppendJSON(slot.buf[:0])
 		slot.n = Number(byteview.String(slot.buf))
 		return &slot.n, true, nil
-	case KindString:
+	case TypeString:
 		slot.s, _ = cell.Text()
 		return &slot.s, true, nil
 	default:

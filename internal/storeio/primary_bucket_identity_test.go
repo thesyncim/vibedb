@@ -7,7 +7,6 @@ func TestPrimaryLogicalIDNamespaceIsContiguousAndCollisionFree(t *testing.T) {
 		name       string
 		first, end uint64
 	}{
-		{"state root", StateRootLogicalID, StateRootLogicalID + 1},
 		{"primary leaves", PrimaryLeafLogicalIDBase, PrimaryLeafLogicalIDLimit},
 		{"primary anchors", PrimaryAnchorLogicalIDBase, PrimaryAnchorLogicalIDLimit},
 		{"tablet roots", PrimaryTabletRootLogicalIDBase, PrimaryTabletRootLogicalIDLimit},
@@ -16,7 +15,6 @@ func TestPrimaryLogicalIDNamespaceIsContiguousAndCollisionFree(t *testing.T) {
 		{"catalog branches", PrimaryCatalogBranchLogicalIDBase, PrimaryCatalogBranchLogicalIDLimit},
 		{"catalog root", PrimaryCatalogRootLogicalID, PrimaryCatalogRootLogicalID + 1},
 		{"tablet routes", PrimaryTabletRouteLogicalIDBase, PrimaryTabletRouteLogicalIDLimit},
-		{"tablet directory", PrimaryTabletDirectoryLogicalIDBase, PrimaryTabletDirectoryLogicalIDLimit},
 	}
 	for rank, current := range ranges {
 		if current.first >= current.end {

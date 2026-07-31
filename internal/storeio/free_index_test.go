@@ -174,7 +174,7 @@ func TestReplayFreeLogRejectsIndexOrderAcrossPages(t *testing.T) {
 	first := w.index([]FreeSegment{segmentOf(w.image(high), high)}, PageRef{})
 	head := w.index([]FreeSegment{segmentOf(w.image(low), low)}, first)
 	delta := w.delta([]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(600, 1, 2)}}, PageRef{}, head)
-	if _, _, err := ReplayFreeLog(w.cache, delta, w.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
+	if _, _, err := replayExternalFreeLog(w.cache, delta, w.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("inverted index join = %v, want %v", err, ErrFreeLogCorrupt)
 	}
 }
@@ -192,7 +192,7 @@ func TestReplayFreeLogRejectsSegmentDisagreeingWithIndex(t *testing.T) {
 	segment.Count = 1
 	head := w.index([]FreeSegment{segment}, PageRef{})
 	delta := w.delta([]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(600, 1, 2)}}, PageRef{}, head)
-	if _, _, err := ReplayFreeLog(w.cache, delta, w.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
+	if _, _, err := replayExternalFreeLog(w.cache, delta, w.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("count disagreement = %v, want %v", err, ErrFreeLogCorrupt)
 	}
 
@@ -205,7 +205,7 @@ func TestReplayFreeLogRejectsSegmentDisagreeingWithIndex(t *testing.T) {
 	movedHead := other.index([]FreeSegment{moved}, PageRef{})
 	movedDelta := other.delta(
 		[]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(600, 1, 2)}}, PageRef{}, movedHead)
-	if _, _, err := ReplayFreeLog(other.cache, movedDelta, other.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
+	if _, _, err := replayExternalFreeLog(other.cache, movedDelta, other.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("first-offset disagreement = %v, want %v", err, ErrFreeLogCorrupt)
 	}
 }

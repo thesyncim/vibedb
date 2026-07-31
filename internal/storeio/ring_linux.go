@@ -572,8 +572,8 @@ func (r *Ring) registerFrameArena(arena []byte) error {
 }
 
 // Buffer returns one registered staging region. The owner may use it until a
-// successful PrepareReadFixed or PrepareWriteFixed; it must not retain or touch
-// the slice again until the corresponding completion is consumed by Pop.
+// successful PrepareWriteFixed; it must not retain or touch the slice again
+// until the corresponding completion is consumed by Pop.
 func (r *Ring) Buffer(index int) ([]byte, error) {
 	if r.closed {
 		return nil, ErrClosed
@@ -693,12 +693,6 @@ func (r *Ring) prepareWriteFrame(
 	}, userData, -1)
 	runtime.KeepAlive(data)
 	return err
-}
-
-// PrepareReadFixed appends one positional read using a registered file and
-// buffer. linked makes failure cancel the immediately following request.
-func (r *Ring) PrepareReadFixed(file, buffer, length int, offset int64, userData uint64, linked bool) error {
-	return r.prepareFixed(ioUringOpReadFixed, file, buffer, length, offset, userData, linked)
 }
 
 // prepareReadArena appends one positional read directly into the stable arena

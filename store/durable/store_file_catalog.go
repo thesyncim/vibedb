@@ -35,13 +35,12 @@ func planFilePageCatalog(
 	if catalog == nil || storeID == ([16]byte{}) || generation == 0 ||
 		pageSize == 0 ||
 		dataStart%uint64(pageSize) != 0 ||
-		nextLogicalID <= storeio.StateRootLogicalID {
+		nextLogicalID == 0 {
 		return filePageCatalogPlan{}, storeio.ErrInvalidWrite
 	}
 	size := catalog.CanonicalSize()
 	definition := catalog.Definition()
 	semanticEmpty := len(definition.Indexes) == 0 &&
-		len(definition.Float64Paths) == 0 &&
 		definition.Schema == nil
 	if size == 0 {
 		if !semanticEmpty {
@@ -119,7 +118,7 @@ func (p filePageCatalogPlan) write(
 		StoreID: p.storeID, Generation: p.head.Generation,
 		PageSize: p.head.Length, DataStart: p.head.Offset,
 		FileEnd: fileEnd, NextLogicalID: nextLogicalID,
-		TotalBytes: p.bytes, RequireDigest: true,
+		TotalBytes:     p.bytes,
 		ExpectedDigest: p.digest,
 	}
 	for ordinal := uint16(0); ordinal < p.segments; ordinal++ {
@@ -157,26 +156,13 @@ func (p filePageCatalogPlan) ref(ordinal uint16) storeio.PageRef {
 	}
 }
 
-// fileStoreCollectionOptionFlags returns the frozen, pointer-free collection
-// representation flags carried through every root generation.
+// fileStoreCollectionOptionFlags returns durable collection semantics carried
+// through every root generation.
 func fileStoreCollectionOptionFlags(options store.Options) uint32 {
-	var flags uint32
-	if options.ShapeTapes {
-		flags |= storeio.StateOptionShapeTapes
-	}
-	if options.Postings {
-		flags |= storeio.StateOptionPostings
-	}
-	if options.ValueDict {
-		flags |= storeio.StateOptionValueDict
-	}
-	if options.IndexOptions.HashKeys {
-		flags |= storeio.StateOptionHashKeys
-	}
 	if options.Schema != nil {
-		flags |= storeio.StateOptionSchema
+		return storeio.StateOptionSchema
 	}
-	return flags
+	return 0
 }
 
 // normalizeOpenedFileStoreOptions reconstructs every frozen collection option
@@ -195,15 +181,13 @@ func normalizeOpenedFileStoreOptions(
 	}
 	definition := catalog.Definition()
 	hasIndexes := len(definition.Indexes) != 0
-	hasFloat64 := len(definition.Float64Paths) != 0
 	hasSchema := definition.Schema != nil
 	catalogAsserted := supplied.Indexes != nil ||
 		supplied.Collection.Schema != nil
 	if root.IndexCount != uint32(catalog.PhysicalIndexCount()) ||
-		(root.Options&storeio.StateOptionFloat64Columns != 0) != hasFloat64 ||
 		(root.Options&storeio.StateOptionSchema != 0) != hasSchema ||
 		(root.PageCatalogBytes != 0) !=
-			(hasIndexes || hasFloat64 || hasSchema) {
+			(hasIndexes || hasSchema) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"%w: catalog definition disagrees with state root",
 			storeio.ErrPageCatalogCorrupt,
@@ -222,8 +206,6 @@ func normalizeOpenedFileStoreOptions(
 	}
 
 	if root.PageSize != 4096 {
-		// A store recording any base page other than 4096 predates the fixed-page
-		// primary graph; it cannot be opened by this build.
 		return normalizedFileStoreOptions{}, ErrUnsupportedPageSize
 	}
 	if supplied.PageSize != 0 && supplied.PageSize != int(root.PageSize) ||
@@ -237,9 +219,6 @@ func normalizeOpenedFileStoreOptions(
 			supplied.InlineValueBytes != int(root.InlineValueBytes) ||
 		supplied.MaxDocumentBytes != 0 &&
 			supplied.MaxDocumentBytes != int(root.MaxDocumentBytes) ||
-		supplied.Collection.ChunkDocuments != 0 &&
-			supplied.Collection.ChunkDocuments !=
-				int(root.ChunkDocuments) ||
 		supplied.Collection.IndexOptions.MaxDepth > 0 &&
 			supplied.Collection.IndexOptions.MaxDepth !=
 				int(root.IndexMaxDepth) {
@@ -247,12 +226,7 @@ func normalizeOpenedFileStoreOptions(
 			"vibejson: collection persisted option mismatch",
 		)
 	}
-	persistedFlags := root.Options &
-		(storeio.StateOptionShapeTapes |
-			storeio.StateOptionPostings |
-			storeio.StateOptionValueDict |
-			storeio.StateOptionHashKeys |
-			storeio.StateOptionSchema)
+	persistedFlags := root.Options & storeio.StateOptionSchema
 	assertedFlags := fileStoreCollectionOptionFlags(supplied.Collection)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -266,17 +240,7 @@ func normalizeOpenedFileStoreOptions(
 	options.MaxKeyBytes = int(root.MaxKeyBytes)
 	options.InlineValueBytes = int(root.InlineValueBytes)
 	options.MaxDocumentBytes = int(root.MaxDocumentBytes)
-	options.Collection.ChunkDocuments = int(root.ChunkDocuments)
 	options.Collection.IndexOptions.MaxDepth = int(root.IndexMaxDepth)
-	options.Collection.ShapeTapes =
-		persistedFlags&storeio.StateOptionShapeTapes != 0
-	options.Collection.Postings =
-		persistedFlags&storeio.StateOptionPostings != 0
-	options.Collection.ValueDict =
-		persistedFlags&storeio.StateOptionValueDict != 0
-	options.Collection.IndexOptions.HashKeys =
-		persistedFlags&storeio.StateOptionHashKeys != 0
-
 	if options.Indexes == nil {
 		options.Indexes = make(
 			[]store.IndexDefinition, len(definition.Indexes),
@@ -327,8 +291,6 @@ func normalizeOpenedFileStoreOptions(
 	}
 	if root.IndexCount != uint32(len(normalized.indexes)) ||
 		root.IndexCatalogHash != normalized.indexCatalogHash ||
-		root.ChunkDocuments !=
-			uint32(normalized.Collection.ChunkDocuments) ||
 		root.IndexMaxDepth !=
 			uint32(max(normalized.Collection.IndexOptions.MaxDepth, 0)) ||
 		persistedFlags !=

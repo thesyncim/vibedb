@@ -26,13 +26,8 @@ func testFileCatalogOptions(t testing.TB) Options {
 	options := testFileStoreOptions()
 	options.Collection = store.Options{
 		ChunkDocuments: 8,
-		IndexOptions: document.IndexOptions{
-			MaxDepth: 17, HashKeys: true,
-		},
-		ShapeTapes: true,
-		Postings:   true,
-		ValueDict:  true,
-		Schema:     schema,
+		IndexOptions:   document.IndexOptions{MaxDepth: 17},
+		Schema:         schema,
 	}
 	options.Indexes = []store.IndexDefinition{
 		{Name: "id", Paths: []string{"/id"}},
@@ -126,16 +121,11 @@ func TestFileStoreExactCatalogZeroOptionReopenAndRootPreservation(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopened.options.Collection.ChunkDocuments !=
-		options.Collection.ChunkDocuments ||
-		reopened.options.MaxKeyBytes != options.MaxKeyBytes ||
+	if reopened.options.MaxKeyBytes != options.MaxKeyBytes ||
 		reopened.options.InlineValueBytes != options.InlineValueBytes ||
 		reopened.options.MaxDocumentBytes != options.MaxDocumentBytes ||
-		reopened.options.Collection.IndexOptions !=
-			options.Collection.IndexOptions ||
-		!reopened.options.Collection.ShapeTapes ||
-		!reopened.options.Collection.Postings ||
-		!reopened.options.Collection.ValueDict ||
+		reopened.options.Collection.IndexOptions.MaxDepth !=
+			options.Collection.IndexOptions.MaxDepth ||
 		reopened.options.Collection.Schema == nil ||
 		!reflect.DeepEqual(
 			reopened.options.Collection.Schema.Definition(),
@@ -313,44 +303,35 @@ func TestFileStoreMaterializationRequiresCurrentDeviceAssertion(
 	}
 }
 
-// TestOpenRejectsPersistedFloat64ColumnCatalog pins the format-level guard for
-// the retired float64 covering-column state option. No current configuration
-// can create such a store, so a file whose root claims the option bit and whose
-// canonical catalog carries float64 paths must fail Open's option rehydration:
-// the catalog rebuilt from the rehydrated options can never equal the persisted
-// canonical bytes.
-func TestOpenRejectsPersistedFloat64ColumnCatalog(t *testing.T) {
-	catalog, err := storeio.BuildCanonicalPageCatalog(
-		storeio.PageCatalogDefinition{Float64Paths: []string{"/score"}},
-	)
+func TestCreateFromPrimaryPreservesMaterializationAssertion(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "primary-materialize-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defaults, err := Options{}.normalized()
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.Durability = DurabilityAsyncVisible
+	options.MaterializationDamageGranule =
+		storeio.MaterializationJournalMinSectorSize
+	if _, err := CreateFromPrimary(
+		seedPrimaryCollection(t), file, options,
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, root := recoverFileCatalogRoot(t, file, uint32(options.PageSize))
+	if root.Options&storeio.StateOptionCanonicalMaterialization == 0 ||
+		root.MaterializationDamageGranule !=
+			uint32(options.MaterializationDamageGranule) {
+		t.Fatalf("bulk root materialization assertion = %+v", root)
+	}
+	reopened, err := Open(file, Options{
+		Durability:                   DurabilityAsyncVisible,
+		MaterializationDamageGranule: options.MaterializationDamageGranule,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := storeio.StateRoot{
-		StoreID:          [16]byte{1},
-		Generation:       1,
-		PageSize:         uint32(defaults.PageSize),
-		MaxPageSize:      uint32(defaults.MaxPageSize),
-		Options:          storeio.StateOptionFloat64Columns,
-		ChunkDocuments:   uint32(defaults.Collection.ChunkDocuments),
-		IndexMaxDepth:    uint32(max(defaults.Collection.IndexOptions.MaxDepth, 0)),
-		MaxKeyBytes:      uint32(defaults.MaxKeyBytes),
-		InlineValueBytes: uint32(defaults.InlineValueBytes),
-		MaxDocumentBytes: uint32(defaults.MaxDocumentBytes),
-		PageCatalogBytes: uint32(catalog.CanonicalSize()),
-	}
-	if _, err := normalizeOpenedFileStoreOptions(
-		Options{}, root, catalog,
-	); err == nil {
-		t.Fatal("Open rehydration accepted a persisted float64 column catalog")
-	} else if !errors.Is(err, storeio.ErrPageCatalogCorrupt) {
-		t.Fatalf(
-			"rehydration error = %v, want %v",
-			err, storeio.ErrPageCatalogCorrupt,
-		)
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

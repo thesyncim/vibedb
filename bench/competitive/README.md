@@ -141,8 +141,8 @@ Footprint and sustained-churn disk runs have two explicit storage profiles:
 | `intrinsic` (default) | SST compression forced off | SST compression forced off | no optional compression switch; labelled `unsupported/no-op` |
 | `production` | Snappy SST blocks | Snappy SST blocks | no optional compression switch; labelled `unsupported/no-op` |
 
-`intrinsic` is the historical apples-to-apples lane: it compares each
-engine's intrinsic representation without adding an optional block codec.
+`intrinsic` compares each engine's intrinsic representation without adding an
+optional block codec.
 `production` asks the separate operational question, “how much disk does the
 pinned engine use with its recommended built-in compression enabled?” Badger
 v4.9.5 and Pebble v1.1.5 both default to Snappy, so the harness selects that

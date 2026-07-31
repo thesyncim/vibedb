@@ -17,9 +17,8 @@ import (
 // 0 only; each tile is one 64-slot bucket quadrant) while building one term.
 type primaryExactTermPostings map[uint32]uint64
 
-// primaryExactLeaf is one resident spanned term leaf
-// (docs/design/indexed-write-path.md §6): a bounded slice of one physical
-// index's ordered term sequence produced by the deterministic content-defined
+// primaryExactLeaf is one resident spanned term leaf: a bounded slice of one
+// physical index's ordered term sequence produced by the deterministic content-defined
 // cutter. encoded is the canonical IndexTermLeaf byte stream; it is GC-owned
 // and shared by reference across index epochs when a fold carries the leaf
 // forward untouched, which is what makes the checkpoint fold O(dirty leaves).
@@ -93,7 +92,7 @@ func primaryExactRunHead(leaves []primaryExactLeaf, at int) bool {
 }
 
 // primaryExactActive reports whether this collection carries ordered-primary
-// exact indexes, i.e. postings live on the graph rather than the chunk store.
+// exact indexes.
 func (c *Collection) primaryExactActive() bool {
 	return c.primaryEpoch != nil
 }
@@ -232,7 +231,7 @@ func (c *Collection) newPrimaryExactResidentLeaf(
 }
 
 // openPrimaryExactIndexes materializes the resident index epoch from the
-// published v1 ExactIndexRoot: per physical index, the ordered term-leaf
+// published ExactIndexRoot: per physical index, the ordered term-leaf
 // catalog and its admitted leaves (the fold base) plus the flat live table
 // derived from the graph, under an empty overlay. It is called once by Open
 // for an indexed ordered-primary collection.
@@ -242,7 +241,7 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	}
 	bounds := storeio.PrimaryExactIndexBounds{
 		StoreID: state.root.StoreID, Generation: state.root.Generation,
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 		MaxPageSize:       state.root.MaxPageSize, IndexCount: state.root.IndexCount,
 	}
@@ -419,11 +418,11 @@ func appendPrimaryExactCatalogEntries(
 
 // appendPrimaryExactMasks is the exact-match read path for an ordered-primary
 // index: it canonicalizes the needle term and resolves it through the pinned
-// index epoch's read rule (docs/design/indexed-write-path.md §3) at the
-// snapshot's generation G — the newest overlay term record ≤ G per tile,
+// index epoch's read rule at the snapshot's generation G — the newest overlay
+// term record ≤ G per tile,
 // else the fold base unless a rebase ≤ G voided it — and appends one
 // (tile, mask) per live posting in ascending tile order. The base is spanned
-// (§6.3): the probe binary-searches the resident leaf router once, opens the
+// across bounded leaves: the probe binary-searches the resident leaf router once, opens the
 // admitted view it lands on, and streams; while the following leaves continue
 // the same term (stripe pieces of a giant term) it advances and repeats —
 // sequential leaf views, no per-leaf search, zero allocations. Every posting
@@ -1075,7 +1074,7 @@ func primaryExactIndexPageBound(
 // buildPrimaryExactIndexes derives every physical index's posting tiles from
 // the placements the primary build assigned each row, cuts each index's term
 // sequence into spanned leaves through the shared content-defined cutter,
-// stages the leaves and their ordered catalogs, and returns the v1 exact
+// stages the leaves and their ordered catalogs, and returns the exact-index
 // root. Bulk build, checkpoint fold, and journal replay share the cutter, so
 // identical final graphs produce byte-identical leaf sets regardless of path.
 func buildPrimaryExactIndexes(

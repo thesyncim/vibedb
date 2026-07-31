@@ -2,9 +2,9 @@
 
 vibedb changes must preserve storage correctness, snapshot isolation,
 durability, bounded memory, and format validation before improving a benchmark.
-The repository targets Go 1.26 and has no compatibility promise before v1, but
-every format or API break must still leave the current tree internally
-consistent.
+The repository targets Go 1.26 and is unreleased. Format changes edit version
+0 in place, and every format or API break must leave the current tree
+internally consistent.
 
 ## Start focused
 
@@ -77,9 +77,8 @@ new measured phase.
 
 [docs/format.md](docs/format.md) is the readable specification; codecs are
 authoritative. Change them together. Preserve or regenerate byte-exact fixtures
-under `internal/storeio/testdata/format0`, and make old or malformed
-development layouts fail closed. Do not add a compatibility branch unless the
-project explicitly adopts a released format.
+under `internal/storeio/testdata/format0`, and make obsolete or malformed
+development layouts fail closed. Do not add compatibility branches.
 
 Update [docs/architecture.md](docs/architecture.md) when a representation or
 root graph changes, and [docs/durability.md](docs/durability.md) when an
@@ -123,8 +122,9 @@ path. Add it in this order:
 7. Promote one representation and remove obsolete paths. Do not leave a
    permanent reader-visible fallback or overlay to rescue a failed gate.
 
-Rejected ideas and failed gates remain in the design record with their reason;
-they prevent the same unmeasured proposal from recurring.
+After a decision, rewrite the design record to describe only the current path
+and remaining work. Delete rejected experiment code, dead plans, and stale
+benchmark claims.
 
 ## Ownership and unsafe code
 

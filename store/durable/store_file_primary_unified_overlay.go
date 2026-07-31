@@ -934,10 +934,9 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	if !found {
 		nextRoot.DocumentCount++
 	}
-	nextSuper := state.super
-	nextSuper.Generation = generation
 	nextState := &fileStoreState{
-		root: nextRoot, super: nextSuper, freeHead: state.freeHead,
+		root: nextRoot, fileEnd: state.fileEnd,
+		freeHead: state.freeHead,
 	}
 
 	c.snapshotGate.Lock()
@@ -1062,10 +1061,9 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 	nextRoot := state.root
 	nextRoot.Generation = generation
 	nextRoot.DocumentCount--
-	nextSuper := state.super
-	nextSuper.Generation = generation
 	nextState := &fileStoreState{
-		root: nextRoot, super: nextSuper, freeHead: state.freeHead,
+		root: nextRoot, fileEnd: state.fileEnd,
+		freeHead: state.freeHead,
 	}
 
 	c.snapshotGate.Lock()

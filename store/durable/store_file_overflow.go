@@ -10,21 +10,8 @@ import (
 // Overflow-on-Put stores a document value that exceeds the inline leaf budget
 // (InlineValueBytes) out of line, as a forward-linked chain of PageOverflow
 // extents. The leaf record then holds only the 32-byte PageRef of the chain
-// head, so a leaf carrying large values stays small and splits/merges/reclass
-// through the ordinary succinct machinery unchanged.
-//
-// The overflow page codec predates the ordered-primary graph and still carries
-// vestigial chunk/slot addressing from the deleted chunk store. The primary
-// graph reaches a value only by following the single PageRef chain, so those
-// fields have no meaning here: both the producer and every reader pin them to a
-// fixed in-range sentinel, satisfying the codec's chunk bounds without a live
-// chunk directory. state.root.ChunkHighWater is zero for a primary store, so
-// the collection page validator's overflow branch uses these same sentinels
-// rather than the (zero) state-root value.
-const (
-	primaryOverflowChunkHighWater = uint32(1)
-	primaryOverflowChunkDocuments = uint8(1)
-)
+// head, so a leaf carrying large values stays small through the ordinary
+// structural machinery.
 
 // ErrOverflowChainCorrupt reports that a resolved overflow chain does not agree
 // with its own length or link metadata. The individual page codec already
@@ -113,12 +100,11 @@ func (c *Collection) stagePrimaryOverflowChain(
 		header := storeio.OverflowPageHeader{
 			StoreID: c.storeID, Generation: generation,
 			LogicalID: page.Ref().LogicalID, PageSize: page.Ref().Length,
-			Chunk: 0, Slot: 0,
 			Total: total, Offset: uint64(start), Next: next,
 		}
 		if _, err := storeio.EncodeOverflowPage(
 			page.Bytes(), header, value[start:end], fileEnd, nextLogicalID,
-			quantum, primaryOverflowChunkHighWater, primaryOverflowChunkDocuments,
+			quantum,
 		); err != nil {
 			return storeio.PageRef{}, err
 		}
@@ -202,13 +188,12 @@ func (c *Collection) mintBufferedPrimaryOverflowChain(
 		header := storeio.OverflowPageHeader{
 			StoreID: c.storeID, Generation: generation,
 			LogicalID: ref.LogicalID, PageSize: ref.Length,
-			Chunk: 0, Slot: 0,
 			Total: total, Offset: uint64(start), Next: next,
 		}
 		buf := c.overflowPageScratch[:ref.Length]
 		if _, err := storeio.EncodeOverflowPage(
 			buf, header, value[start:end], fileEnd, nextLogicalID,
-			quantum, primaryOverflowChunkHighWater, primaryOverflowChunkDocuments,
+			quantum,
 		); err != nil {
 			return storeio.PageRef{}, 0, 0, err
 		}
@@ -247,8 +232,7 @@ func (c *Collection) appendPrimaryOverflowValue(
 		}
 		view, err := storeio.OpenOverflowPage(
 			lease.Page(), bounds.FileEnd, bounds.NextLogicalID,
-			bounds.AllocationQuantum, primaryOverflowChunkHighWater,
-			primaryOverflowChunkDocuments,
+			bounds.AllocationQuantum,
 		)
 		if err != nil {
 			lease.Release()
@@ -292,8 +276,7 @@ func (c *Collection) collectPrimaryOverflowExtents(
 		}
 		view, err := storeio.OpenOverflowPage(
 			lease.Page(), bounds.FileEnd, bounds.NextLogicalID,
-			bounds.AllocationQuantum, primaryOverflowChunkHighWater,
-			primaryOverflowChunkDocuments,
+			bounds.AllocationQuantum,
 		)
 		if err != nil {
 			lease.Release()

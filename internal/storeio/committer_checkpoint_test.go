@@ -635,21 +635,6 @@ func TestCommitterManualCheckpointCaptureLinearizesWithSupersession(t *testing.T
 	}
 }
 
-func publishTestGenerationRetiring(
-	t *testing.T,
-	committer *Committer,
-	generation uint64,
-	pages []testPage,
-	rootOffset int64,
-	root []byte,
-	retired []PageRef,
-) {
-	_ = publishTestGenerationRetiringCollect(
-		t, committer, generation, pages, rootOffset, root,
-		retired, nil, nil,
-	)
-}
-
 func publishTestGenerationRetiringCollect(
 	t *testing.T,
 	committer *Committer,

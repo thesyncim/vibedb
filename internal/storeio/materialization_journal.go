@@ -67,10 +67,10 @@ const (
 	MaterializationJournalMaxPatches    = 7
 	MaterializationJournalMaxData       = 3584
 
-	materializationJournalMagic   = "SJMTRL01"
+	materializationJournalMagic   = "SJMTRL00"
 	materializationJournalVersion = DevelopmentFormatVersion
 	materializationJournalFlags   = uint32(0)
-	materializationJournalCommit  = uint64(0x313054494d4d4f43) // "COMMIT01", little-endian.
+	materializationJournalCommit  = uint64(0x303054494d4d4f43) // "COMMIT00", little-endian.
 
 	materializationTargetOffset = MaterializationJournalHeaderSize
 	materializationTrailerSize  = 8
@@ -660,12 +660,11 @@ func validateMaterializationTargetRef(
 	if err != nil {
 		return err
 	}
-	if ref.LogicalID <= StateRootLogicalID || ref.Generation == 0 ||
+	if ref.LogicalID == 0 || ref.Generation == 0 ||
 		ref.Generation >= header.TargetGeneration ||
-		ref.Kind == PageStateRoot || ref.Kind == PageCatalogSegment ||
+		ref.Kind == PageCatalogSegment ||
 		ref.Kind >= PagePrimaryCatalog && ref.Kind <= PagePrimaryExactCatalog ||
-		!validPageKind(ref.Kind) || !validPageFlags(ref.Kind, ref.Flags) ||
-		ref.Aux != 0 || ref.Length < header.PageSize ||
+		!validPageKind(ref.Kind) || ref.Length < header.PageSize ||
 		ref.Length%header.PageSize != 0 || !validPageExtentSize(ref.Kind, ref.Length) ||
 		ref.Offset < layout.DataStart ||
 		ref.Offset%uint64(header.PageSize) != 0 ||
@@ -720,6 +719,9 @@ func (v MaterializationJournalView) validateRecords() error {
 	for rank := 0; rank < int(v.targetCount); rank++ {
 		record := v.src[materializationTargetOffset+rank*MaterializationTargetRecordSize:]
 		target := decodeMaterializationTarget(record, v.header.StoreID)
+		if !pageRefReservedZero(record[0:PageRefSize]) {
+			return fmt.Errorf("%w: target reference reserved bytes", ErrMaterializationJournalCorrupt)
+		}
 		if err := validateMaterializationTargetRef(v.header, target.Ref); err != nil ||
 			rank != 0 && target.Ref.Offset < previousEnd {
 			return fmt.Errorf("%w: target record", ErrMaterializationJournalCorrupt)
@@ -802,8 +804,7 @@ func materializationPageHeaderMatchesRef(header PageHeader, ref PageRef) bool {
 	return header.LogicalID == ref.LogicalID &&
 		header.Generation == ref.Generation &&
 		header.PageSize == ref.Length &&
-		header.Kind == ref.Kind &&
-		header.Flags == ref.Flags
+		header.Kind == ref.Kind
 }
 
 func (v MaterializationJournalView) validateRolledBackPage(ref PageRef, page []byte) error {
@@ -855,7 +856,7 @@ func materializationContextChecksumFromInput(
 	return crc32.Update(checksum, pageChecksumTable, page[cursor:]), nil
 }
 
-const materializationAfterPatchDigestDomain = "MATAP002"
+const materializationAfterPatchDigestDomain = "MATAP000"
 
 func materializationAfterPatchDigestFromInput(
 	page []byte,

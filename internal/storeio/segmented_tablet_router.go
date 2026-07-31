@@ -30,12 +30,11 @@ const (
 	SegmentedTabletRouterRowsPerPage     = 256
 	SegmentedTabletRouterHandleBytes     = 18
 
-	// Logical IDs form one explicit, disjoint durable namespace. StateRoot owns
-	// 1. Every possible 30-bit leaf identity follows, then every possible
+	// Logical IDs form one explicit, disjoint durable namespace. Every possible
+	// 30-bit leaf identity comes first, followed by every possible
 	// (18-bit tablet, 4-bit stable anchor-page) identity. The remaining hybrid
 	// primary bands follow; dynamically allocated overflow, indexes, and
 	// configuration pages start only after that complete shared namespace.
-	SegmentedTabletRouterStateRootLogicalID    = StateRootLogicalID
 	SegmentedTabletRouterLeafLogicalIDBase     = PrimaryLeafLogicalIDBase
 	SegmentedTabletRouterLeafLogicalIDLimit    = PrimaryLeafLogicalIDLimit
 	SegmentedTabletRouterAnchorLogicalIDBase   = PrimaryAnchorLogicalIDBase
@@ -65,13 +64,10 @@ const (
 		PageHeaderSize - PageTrailerSize
 	segmentedTabletRouterAnchorKeyCapacity = segmentedTabletRouterAnchorTrailerAt - segmentedTabletRouterAnchorKeysAt
 
-	segmentedTabletRouterRestart = 16
-	segmentedTabletRouterEmpty   = uint16(0xffff)
-	// Version 3 binds the private tablet root to StoreID and requires common
-	// PagePrimaryAnchor children. Version 2 used the private STRPAGE1 anchor
-	// envelope and must fail closed; no decoder fallback exists.
-	segmentedTabletRouterVersion   = uint32(3)
-	segmentedTabletRouterRootMagic = "STRROOT1"
+	segmentedTabletRouterRestart   = 16
+	segmentedTabletRouterEmpty     = uint16(0xffff)
+	segmentedTabletRouterVersion   = DevelopmentFormatVersion
+	segmentedTabletRouterRootMagic = "STRROOT0"
 )
 
 var (
@@ -568,7 +564,6 @@ func segmentedTabletRouterOpenAnchor(
 		header.PageSize != SegmentedTabletRouterAnchorPageBytes ||
 		header.PayloadLength != segmentedTabletRouterAnchorPayloadBytes ||
 		header.Kind != PagePrimaryAnchor ||
-		header.Flags != 0 ||
 		len(payload) != segmentedTabletRouterAnchorPayloadBytes {
 		return view, segmentedTabletRouterCorrupt(
 			"anchor header, identity, or checksum",
@@ -1292,23 +1287,6 @@ func (v *SegmentedTabletRouterView) SplitAnchorPage(
 	}, nil
 }
 
-// RoutingBytesPerDocument reports the exact fixed routing footprint at a
-// specified leaf count and average leaf occupancy.
-func SegmentedTabletRouterRoutingBytesPerDocument(
-	leafCount, rowsPerLeaf int,
-) float64 {
-	if leafCount <= 0 || leafCount > TabletLocalIdentityLocalCount ||
-		rowsPerLeaf <= 0 {
-		return 0
-	}
-	pages := (leafCount + SegmentedTabletRouterRowsPerPage - 1) /
-		SegmentedTabletRouterRowsPerPage
-	bytes := SegmentedTabletRouterRootBytes +
-		SegmentedTabletRouterLocatorBytes +
-		pages*SegmentedTabletRouterAnchorPageBytes
-	return float64(bytes) / float64(leafCount*rowsPerLeaf)
-}
-
 // SegmentedTabletRouterLeafLogicalID derives the collision-free durable
 // logical ID for one posting-stable 30-bit BucketID.
 func SegmentedTabletRouterLeafLogicalID(
@@ -1700,8 +1678,8 @@ func segmentedTabletRouterValidateLeafRef(
 		return fmt.Errorf("%w: exact leaf length", ErrInvalidWrite)
 	case ref.LogicalID != logicalID:
 		return fmt.Errorf("%w: exact leaf logical ID", ErrInvalidWrite)
-	case ref.Kind != PagePrimaryLeaf || ref.Flags != 0 || ref.Aux != 0:
-		return fmt.Errorf("%w: exact leaf kind or flags", ErrInvalidWrite)
+	case ref.Kind != PagePrimaryLeaf:
+		return fmt.Errorf("%w: exact leaf kind", ErrInvalidWrite)
 	}
 	return nil
 }
@@ -1738,8 +1716,7 @@ func segmentedTabletRouterValidateAnchorRefIdentity(
 		ref.Offset>>12 >= uint64(1)<<48 ||
 		ref.Generation == 0 || ref.Generation >= uint64(1)<<48 ||
 		ref.Generation > selectingGeneration ||
-		ref.LogicalID != logicalID ||
-		ref.Kind != PagePrimaryAnchor || ref.Flags != 0 || ref.Aux != 0 ||
+		ref.LogicalID != logicalID || ref.Kind != PagePrimaryAnchor ||
 		ref.Length != SegmentedTabletRouterAnchorPageBytes {
 		return fmt.Errorf("%w: non-canonical anchor ref", ErrInvalidWrite)
 	}

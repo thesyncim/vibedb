@@ -16,7 +16,7 @@ func unifiedCompetitiveShapeRecords(n int) []CommonPrimaryLeafRecord {
 	tiers := []string{"free", "pro", "team"}
 	notes := []string{
 		"steady state, no anomalies observed in the last reporting window",
-		"migrated from the legacy pipeline during the maintenance window",
+		"processed by the current pipeline during the maintenance window",
 	}
 	tags := []string{"alpha", "beta", "gamma", "delta"}
 	records := make([]CommonPrimaryLeafRecord, n)
@@ -248,8 +248,7 @@ func TestUnifiedEqFilterLeafDifferential(t *testing.T) {
 
 // TestUnifiedTokenViewZeroAlloc pins the steady-state hot calls at zero
 // allocations: the hole read, the token compare, the warmed per-template
-// resolution, and the warmed render-path evaluation (zero-GC directive;
-// design §1.1).
+// resolution, and the warmed render-path evaluation.
 func TestUnifiedTokenViewZeroAlloc(t *testing.T) {
 	records := unifiedCompetitiveShapeRecords(200)
 	page, _ := encodeUnifiedTestLeaf(t, records)
@@ -394,7 +393,7 @@ func TestUnifiedTokenViewAdversarial(t *testing.T) {
 }
 
 // BenchmarkUnifiedHoleRead measures the scan-side hole read: tag walk to the
-// country hole plus token decode (U1 gate: ≤ 25 ns, 0 allocs).
+// country hole plus token decode (target: ≤ 25 ns, 0 allocs).
 func BenchmarkUnifiedHoleRead(b *testing.B) {
 	records := unifiedCompetitiveShapeRecords(200)
 	page, count := encodeUnifiedTestBench(b, records)
@@ -437,7 +436,7 @@ func BenchmarkUnifiedHoleRead(b *testing.B) {
 var holeReadSink int
 
 // BenchmarkUnifiedLeafFilterToken measures the per-document token filter
-// compare over one competitive-shape leaf: the §10.3 lane's core arithmetic
+// compare over one competitive-shape leaf: the token lane's core arithmetic
 // (tag walk + dict-id compare), reported as ns/doc.
 func BenchmarkUnifiedLeafFilterToken(b *testing.B) {
 	records := unifiedCompetitiveShapeRecords(200)

@@ -4,75 +4,41 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-func openPrimaryScanPair(
+func openPrimaryScan(
 	t testing.TB, count int,
-) (*Collection, *Collection, []string, [][]byte) {
+) (*Collection, []string, [][]byte) {
 	t.Helper()
 	built, keys, values := buildFilePrimaryCorpus(t, count)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 128 << 20,
 	}
-	legacyFile, err := os.OpenFile(
-		filepath.Join(t.TempDir(), "legacy-scan.vibe"),
-		os.O_RDWR|os.O_CREATE, 0o600,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = legacyFile.Close() })
-	if _, err := CreateFromPrimary(built, legacyFile, options); err != nil {
-		t.Fatal(err)
-	}
 	primaryFile := createPrimaryPointFile(
 		t, built, options, "primary-scan.vibe",
 	)
-	legacy, err := Open(legacyFile, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = legacy.Close() })
 	primary, err := Open(primaryFile, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = primary.Close() })
-	return legacy, primary, keys, values
+	return primary, keys, values
 }
 
-func openRedundantPrimaryScanPair(
+func openRedundantPrimaryScan(
 	t testing.TB, count int,
-) (*Collection, *Collection, []string, [][]byte) {
+) (*Collection, []string, [][]byte) {
 	t.Helper()
 	built, keys, values := buildRedundantPrimaryCorpus(t, count)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 128 << 20,
 	}
-	legacyFile, err := os.OpenFile(
-		filepath.Join(t.TempDir(), "legacy-scan.vibe"),
-		os.O_RDWR|os.O_CREATE, 0o600,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = legacyFile.Close() })
-	if _, err := CreateFromPrimary(built, legacyFile, options); err != nil {
-		t.Fatal(err)
-	}
 	primaryFile := createPrimaryPointFile(
 		t, built, options, "primary-scan.vibe",
 	)
-	legacy, err := Open(legacyFile, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = legacy.Close() })
 	primary, err := Open(primaryFile, options)
 	if err != nil {
 		t.Fatal(err)
@@ -90,17 +56,12 @@ func openRedundantPrimaryScanPair(
 			classCounts,
 		)
 	}
-	return legacy, primary, keys, values
+	return primary, keys, values
 }
 
-func TestFilePrimaryOrderedScanDifferential100K(t *testing.T) {
+func TestFilePrimaryOrderedScan100K(t *testing.T) {
 	const count = 100_000
-	legacy, primary, keys, values := openRedundantPrimaryScanPair(t, count)
-	legacySnapshot, err := legacy.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacySnapshot.Close()
+	primary, keys, values := openRedundantPrimaryScan(t, count)
 	primarySnapshot, err := primary.Snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +89,6 @@ func TestFilePrimaryOrderedScanDifferential100K(t *testing.T) {
 			t.Fatalf("%s rows = %d, want %d", label, at, count)
 		}
 	}
-	verifyFull("legacy", legacySnapshot)
 	verifyFull("primary", primarySnapshot)
 
 	random := rand.New(rand.NewSource(2203))
@@ -206,7 +166,7 @@ func TestFilePrimaryOrderedScanDifferential100K(t *testing.T) {
 }
 
 func TestFilePrimaryOrderedScanAllocatesZero(t *testing.T) {
-	_, primary, _, _ := openPrimaryScanPair(t, 2_000)
+	primary, _, _ := openPrimaryScan(t, 2_000)
 	snapshot, err := primary.Snapshot()
 	if err != nil {
 		t.Fatal(err)

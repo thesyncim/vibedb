@@ -125,7 +125,7 @@ var (
 	tagPool = []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"}
 	notes   = []string{
 		"steady state, no anomalies observed in the last reporting window",
-		"migrated from the legacy pipeline during the maintenance window",
+		"processed by the current pipeline during the maintenance window",
 		"flagged for review after a threshold breach on the ingest path",
 		"nominal; retention policy applied and checkpoint acknowledged",
 	}

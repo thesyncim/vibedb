@@ -6,9 +6,9 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-// The U0 gate row (design §11): canonical render of the 250 B
-// competitive-corpus shape in ≤ 250 ns with 0 allocs, plus the
-// already-canonical check and the int predicate reported alongside.
+// These benchmarks measure canonical rendering of the 250 B competitive
+// corpus shape, the already-canonical check, and the integer predicate. The
+// render target is ≤ 250 ns with 0 allocations.
 
 // BenchmarkCanonicalRenderCompetitiveShape renders the non-canonical source
 // spelling (unsorted keys, as the corpus generates them), so the member sort
@@ -33,7 +33,7 @@ func BenchmarkCanonicalRenderCompetitiveShape(b *testing.B) {
 
 // BenchmarkCanonicalRenderAlreadyCanonical renders canonical input: the
 // sortedness scan short-circuits the sort and every string takes the
-// verbatim fast path — the §8 steady state.
+// verbatim fast path used by already-canonical input.
 func BenchmarkCanonicalRenderAlreadyCanonical(b *testing.B) {
 	ws := &CanonicalWorkspace{}
 	canonical, err := vibejson.AppendCanonicalize(nil, []byte(competitiveShapeJSON))
@@ -53,7 +53,7 @@ func BenchmarkCanonicalRenderAlreadyCanonical(b *testing.B) {
 	}
 }
 
-// BenchmarkCanonicalCheckCanonical prices the §8 already-canonical fast
+// BenchmarkCanonicalCheckCanonical prices the already-canonical fast
 // check on input that passes it — the cost every steady-state admission
 // pays.
 func BenchmarkCanonicalCheckCanonical(b *testing.B) {
@@ -89,7 +89,7 @@ func BenchmarkCanonicalCheckNonCanonical(b *testing.B) {
 	}
 }
 
-// BenchmarkTokenCanonicalIntPredicate prices the §3.4 admission predicate
+// BenchmarkTokenCanonicalIntPredicate prices the canonical-integer admission predicate
 // plus payload encode over the corpus-typical spellings (ids, scores) and
 // the rejecting spellings the corpus carries (floats stay literals).
 func BenchmarkTokenCanonicalIntPredicate(b *testing.B) {

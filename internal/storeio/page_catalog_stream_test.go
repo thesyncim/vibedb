@@ -37,8 +37,7 @@ func TestOpenPageCatalogChainAtAllocationQuanta(t *testing.T) {
 			{Name: "tenant_alias", Paths: []string{"/tenant"}},
 			{Name: "by_tenant_status", Paths: []string{"/tenant", "/status"}},
 		},
-		Float64Paths: []string{"/score", "/metrics/latency"},
-		Schema:       &PageCatalogSchema{Root: PageCatalogSchemaObject},
+		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
 	for i := range 2_000 {
 		definition.Schema.Fields = append(
@@ -69,9 +68,6 @@ func TestOpenPageCatalogChainAtAllocationQuanta(t *testing.T) {
 				)
 			}
 			reader := pageCatalogTestExtent(pages, bounds)
-			bounds.TotalBytes = uint32(catalog.CanonicalSize())
-			bounds.ExpectedDigest = catalog.Digest()
-			bounds.RequireDigest = true
 			scratch := make([]byte, pageSize)
 			opened, openErr := OpenPageCatalogChainAt(
 				reader, pages[0].Ref, bounds, scratch,
@@ -100,9 +96,6 @@ func TestOpenPageCatalogChainAtRejectsNonContiguousAndGraftedChains(
 	pages, bounds := encodePageCatalogTestChain(
 		t, catalog, testStoreID, 23,
 	)
-	bounds.TotalBytes = uint32(catalog.CanonicalSize())
-	bounds.ExpectedDigest = catalog.Digest()
-	bounds.RequireDigest = true
 	head := pages[0].Ref
 
 	open := func(
@@ -253,7 +246,7 @@ func TestOpenPageCatalogChainAtRejectsNonContiguousAndGraftedChains(
 	})
 }
 
-func TestPageCatalogDigestRequirementDistinguishesAllZeroDigest(t *testing.T) {
+func TestPageCatalogAlwaysRequiresExactDigest(t *testing.T) {
 	catalog, err := BuildCanonicalPageCatalog(PageCatalogDefinition{
 		Schema: &PageCatalogSchema{},
 	})
@@ -266,14 +259,8 @@ func TestPageCatalogDigestRequirementDistinguishesAllZeroDigest(t *testing.T) {
 	bounds.ExpectedDigest = [PageCatalogDigestSize]byte{}
 	if _, err := OpenPageCatalogSegment(
 		pages[0].Page, bounds,
-	); err != nil {
-		t.Fatalf("legacy optional zero digest = %v", err)
-	}
-	bounds.RequireDigest = true
-	if _, err := OpenPageCatalogSegment(
-		pages[0].Page, bounds,
 	); !errors.Is(err, ErrPageCatalogCorrupt) {
-		t.Fatalf("mandatory all-zero digest = %v", err)
+		t.Fatalf("all-zero expected digest = %v", err)
 	}
 	bounds.TotalBytes = uint32(catalog.CanonicalSize())
 	reader := pageCatalogTestExtent(pages, bounds)
@@ -282,13 +269,6 @@ func TestPageCatalogDigestRequirementDistinguishesAllZeroDigest(t *testing.T) {
 		make([]byte, bounds.PageSize),
 	); !errors.Is(err, ErrPageCatalogCorrupt) {
 		t.Fatalf("streaming all-zero expected digest = %v", err)
-	}
-	bounds.RequireDigest = false
-	if _, err := OpenPageCatalogChainAt(
-		reader, pages[0].Ref, bounds,
-		make([]byte, bounds.PageSize),
-	); !errors.Is(err, ErrInvalidWrite) {
-		t.Fatalf("optional streaming digest = %v", err)
 	}
 }
 

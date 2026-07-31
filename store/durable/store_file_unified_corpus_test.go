@@ -20,7 +20,7 @@ func unifiedPrimaryCorpus(n int, highCardinality bool) ([]string, [][]byte) {
 	tiers := []string{"free", "pro", "team", "enterprise"}
 	notes := []string{
 		"steady state, no anomalies observed",
-		"migrated from the legacy pipeline",
+		"processed by the ingestion pipeline",
 		"flagged for review after a breach",
 	}
 	uniq := func(sample string) string {

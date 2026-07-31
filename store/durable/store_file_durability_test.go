@@ -12,9 +12,6 @@ import (
 func durabilityTestState(generation uint64) *fileStoreState {
 	return &fileStoreState{
 		root: storeio.StateRoot{Generation: generation},
-		super: storeio.Superblock{
-			Generation: generation,
-		},
 	}
 }
 

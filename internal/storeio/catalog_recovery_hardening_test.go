@@ -174,7 +174,7 @@ func newExactCatalogRecoveryFixture(
 		LogicalID:  catalogBounds.NextLogicalID,
 		Generation: 8,
 		Length:     pageSize,
-		Kind: PageOverflow,
+		Kind:       PageOverflow,
 	}
 	fileEnd := extraRef.Offset + uint64(pageSize)
 	if err := file.Truncate(int64(fileEnd)); err != nil {
@@ -191,8 +191,7 @@ func newExactCatalogRecoveryFixture(
 		PageSize:          pageSize,
 		MaxPageSize:       pageSize,
 		NextLogicalID:     extraRef.LogicalID + 1,
-		ChunkDocuments:    64,
-		Options:           StateOptionFloat64Columns | StateOptionSchema,
+		Options:           StateOptionSchema,
 		IndexCatalogHash:  1,
 		PageCatalogHead:   pages[0].Ref,
 		PageCatalogDigest: catalog.Digest(),
@@ -259,8 +258,7 @@ func TestMutableRecoveryAuthenticatesCompleteCatalogRunAtEveryPageSize(
 	t *testing.T,
 ) {
 	definition := PageCatalogDefinition{
-		Float64Paths: []string{"/score"},
-		Schema:       &PageCatalogSchema{Root: PageCatalogSchemaObject},
+		Schema: &PageCatalogSchema{Root: PageCatalogSchemaObject},
 	}
 	for i := range 2_400 {
 		definition.Schema.Fields = append(
@@ -344,7 +342,6 @@ func TestMutableRecoveryAuthenticatesCompleteCatalogRunAtEveryPageSize(
 					t.Fatalf("zero digest recovery = %v", recoverErr)
 				}
 			})
-
 
 			t.Run("inline-free-overlap-is-unencodable", func(t *testing.T) {
 				fixture := newExactCatalogRecoveryFixture(t, catalog, pageSize)
@@ -545,8 +542,8 @@ func TestMaterializationCannotTargetCatalogRun(t *testing.T) {
 		State: StateRoot{
 			StoreID: testStoreID, Generation: 8,
 			PageSize: pageSize, MaxPageSize: pageSize,
-			NextLogicalID: 20, ChunkDocuments: 64,
-			Options: StateOptionSchema, IndexCatalogHash: 1,
+			NextLogicalID: 20,
+			Options:       StateOptionSchema, IndexCatalogHash: 1,
 			PageCatalogHead: PageRef{
 				Offset: layout.DataStart, LogicalID: 10,
 				Generation: 1, Length: pageSize,

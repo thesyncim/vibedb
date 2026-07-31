@@ -19,9 +19,8 @@ const (
 	// aligned physical page.
 	InlineSuperblockSize = 4096
 
-	inlineSuperblockMagic        = "SJINL001"
+	inlineSuperblockMagic        = "SJINL000"
 	inlineSuperblockVersion      = DevelopmentFormatVersion
-	inlineSuperblockKnownFlags   = uint32(0)
 	inlineSuperblockStateOffset  = 96
 	inlineSuperblockStateEnd     = inlineSuperblockStateOffset + StateRootPayloadSize
 	inlineSuperblockChecksumFrom = InlineSuperblockSize - 8
@@ -171,18 +170,14 @@ func (d *InlineFreeDelta) rank(offset uint64) (int, bool) {
 }
 
 // InlineSuperblock is the failure-atomic root of one Store generation. State
-// and the cumulative free-set diff are encoded in the same fixed root page
-// rather than separately allocated immutable pages. FileEnd consequently
+// and the cumulative free-set diff are encoded in the same fixed root page.
+// FileEnd consequently
 // describes data and external spill/image extents only.
-//
-// This is a strict development-format codec. It neither recognizes nor emits
-// the external-state Superblock format.
 type InlineSuperblock struct {
 	StoreID    [16]byte
 	Generation uint64
 	FileEnd    uint64
 	PageSize   uint32
-	Flags      uint32
 	State      StateRoot
 	FreeDelta  InlineFreeDelta
 }
@@ -201,7 +196,6 @@ func EncodeInlineSuperblock(dst []byte, root InlineSuperblock) ([]byte, error) {
 	copy(dst[0:8], inlineSuperblockMagic)
 	binary.LittleEndian.PutUint32(dst[8:12], inlineSuperblockVersion)
 	binary.LittleEndian.PutUint32(dst[12:16], InlineSuperblockSize)
-	binary.LittleEndian.PutUint32(dst[16:20], root.Flags)
 	binary.LittleEndian.PutUint32(dst[20:24], root.PageSize)
 	binary.LittleEndian.PutUint64(dst[24:32], root.Generation)
 	binary.LittleEndian.PutUint64(dst[32:40], ^root.Generation)
@@ -215,8 +209,8 @@ func EncodeInlineSuperblock(dst []byte, root InlineSuperblock) ([]byte, error) {
 	return dst, nil
 }
 
-// DecodeInlineSuperblock verifies and decodes one inline root record. Unknown
-// flags, non-zero reserved bytes, impossible references, and checksum
+// DecodeInlineSuperblock verifies and decodes one inline root record. Non-zero
+// reserved bytes, impossible references, and checksum
 // mismatches fail closed before any embedded offset is trusted.
 func DecodeInlineSuperblock(src []byte) (InlineSuperblock, error) {
 	if len(src) < InlineSuperblockSize {
@@ -235,13 +229,13 @@ func DecodeInlineSuperblock(src []byte) (InlineSuperblock, error) {
 		PageChecksum(src[:inlineSuperblockChecksumFrom]) != checksum {
 		return InlineSuperblock{}, fmt.Errorf("%w: inline checksum", ErrSuperblockCorrupt)
 	}
-	if !allZero(src[48:72]) || !allZero(src[88:inlineSuperblockStateOffset]) {
+	if !allZero(src[16:20]) || !allZero(src[48:72]) ||
+		!allZero(src[88:inlineSuperblockStateOffset]) {
 		return InlineSuperblock{}, fmt.Errorf("%w: inline reserved bytes", ErrSuperblockCorrupt)
 	}
 	root := InlineSuperblock{
 		Generation: binary.LittleEndian.Uint64(src[24:32]),
 		FileEnd:    binary.LittleEndian.Uint64(src[40:48]),
-		Flags:      binary.LittleEndian.Uint32(src[16:20]),
 		PageSize:   binary.LittleEndian.Uint32(src[20:24]),
 	}
 	copy(root.StoreID[:], src[72:88])
@@ -368,9 +362,9 @@ func validateInlineFreeRef(ref PageRef, kind PageKind, root *InlineSuperblock) e
 	if err != nil {
 		return err
 	}
-	if ref.Kind != kind || ref.Flags != 0 || ref.Aux != 0 ||
+	if ref.Kind != kind ||
 		ref.Length != root.PageSize || ref.Generation == 0 ||
-		ref.Generation > root.Generation || ref.LogicalID <= StateRootLogicalID ||
+		ref.Generation > root.Generation || ref.LogicalID == 0 ||
 		ref.LogicalID >= root.State.NextLogicalID ||
 		ref.Offset < layout.DataStart ||
 		ref.Offset%pageSize != 0 || ref.Offset > maxSuperblockFileOffset ||
@@ -464,9 +458,8 @@ func inlineExtentOverlapsRoot(extent FreeExtent, root *InlineSuperblock) bool {
 }
 
 func validateInlineSuperblock(root InlineSuperblock) error {
-	if root.Generation == 0 || root.Flags&^inlineSuperblockKnownFlags != 0 ||
-		!validPhysicalPageSize(root.PageSize) {
-		return fmt.Errorf("%w: invalid inline generation, flags, or page size", ErrInvalidWrite)
+	if root.Generation == 0 || !validPhysicalPageSize(root.PageSize) {
+		return fmt.Errorf("%w: invalid inline generation or page size", ErrInvalidWrite)
 	}
 	if root.StoreID == ([16]byte{}) {
 		return fmt.Errorf("%w: zero inline Store id", ErrInvalidWrite)
@@ -500,7 +493,6 @@ type inlineSuperblockCandidate struct {
 }
 
 // SelectInlineSuperblock returns the newest structurally valid inline root.
-// It does not recognize the external-state superblock format.
 func SelectInlineSuperblock(first, second []byte) (InlineSuperblock, int, error) {
 	candidates, _, err := orderedInlineSuperblocks(first, second)
 	if err != nil {
@@ -689,7 +681,6 @@ func sameImmutableInlineConfiguration(
 		left.State.InlineValueBytes == right.State.InlineValueBytes &&
 		left.State.MaxDocumentBytes == right.State.MaxDocumentBytes &&
 		left.State.Options == right.State.Options &&
-		left.State.ChunkDocuments == right.State.ChunkDocuments &&
 		left.State.IndexMaxDepth == right.State.IndexMaxDepth &&
 		left.State.MaterializationDamageGranule ==
 			right.State.MaterializationDamageGranule

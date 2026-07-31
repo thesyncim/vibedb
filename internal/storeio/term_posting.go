@@ -33,7 +33,7 @@ const (
 	// termPostingComponentDomain binds content identities to this component
 	// type and format version. A future incompatible payload cannot alias a
 	// component admitted by this decoder even when its trailing bytes match.
-	termPostingComponentDomain = "VJTP\x01"
+	termPostingComponentDomain = "VJTP\x00"
 )
 
 // TermPostingCodec is the canonical physical encoding of one term in one
@@ -292,19 +292,6 @@ func (it *TermPostingIterator) Next() (TermPostingMask, bool) {
 	default:
 		return TermPostingMask{}, false
 	}
-}
-
-// ReachableBytes returns the packed bytes attributable to this tile posting,
-// including its leaf owner/manifest entry and external component. Empty terms
-// are removed from the dictionary and therefore own zero reachable bytes.
-func (p TermPosting) ReachableBytes() int {
-	if p.Codec == TermPostingEmpty && p.Rows == 0 {
-		return 0
-	}
-	if p.Placement == TermPostingInline {
-		return TermPostingInlineHeaderBytes + int(p.EncodedBytes)
-	}
-	return TermPostingManifestEntryBytes + int(p.EncodedBytes)
 }
 
 func (it *TermPostingIterator) payload() []byte {

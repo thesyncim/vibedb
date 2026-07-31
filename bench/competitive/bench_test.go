@@ -13,13 +13,8 @@ import (
 )
 
 var (
-	corpusSize   = flag.Int("corpus", CorpusSize, "documents in the shared corpus")
-	corpusCard   = flag.String("cardinality", "low", "corpus variant: low (the shipped, ~92% redundant one) or high")
-	keepCoreside = flag.Bool("coresident", false,
-		"keep every engine's fixture loaded at once, the old behaviour. Off by default, because the bias it "+
-			"introduces has opposite signs for the two sides of the comparison: releasing foreign fixtures speeds "+
-			"up both vibejson engines, whose working sets the GC has to scan, and slows down all four competitors, "+
-			"whose working sets live in mmaps and off-heap arenas it never touches. Keep it on to measure that")
+	corpusSize = flag.Int("corpus", CorpusSize, "documents in the shared corpus")
+	corpusCard = flag.String("cardinality", "low", "corpus variant: low (the shipped, ~92% redundant one) or high")
 )
 
 var (
@@ -73,24 +68,10 @@ func closeFixtures() {
 // closeForeignFixtures releases every loaded engine that is not the one about
 // to be measured.
 //
-// This is measurement correctness, not tidiness. Fixtures used to accumulate in
-// Factories() order and were never released, so by the time the last engine in
-// a row ran, five other engines' working sets were resident, the Go heap was
-// several hundred megabytes larger, and the GC had more to scan. The effect was
-// not uniform and therefore did not cancel: vibejson-heap's point read moved by
-// tens of percent between an isolated run and a full one, while bbolt — whose
-// working set is an mmap the Go heap never scans — barely moved. The smallest
-// number in the table was the most run-mode-sensitive one, which is the worst
-// possible place for a bias to sit. `-coresident` restores the old behaviour so
-// the effect stays measurable; RESULTS.md reports the current pair.
-//
-// This makes a full `-bench=.` run close to the isolated figure. It does not
-// make it identical: allocator state and page-cache history still carry over.
-// Published figures come from one process per engine — see the README.
+// Keeping foreign engines resident biases GC-visible and mmap-backed working
+// sets differently. A full -bench=. run releases them to stay close to the
+// isolated process-per-engine publication protocol in README.md.
 func closeForeignFixtures(name string) {
-	if *keepCoreside {
-		return
-	}
 	released := false
 	for k, f := range fixtures {
 		if k.name == name {
@@ -181,15 +162,13 @@ func loadedEngine(
 // BenchmarkBulkLoad measures loading the whole corpus into an empty engine
 // through that engine's bulk path: one bbolt write transaction, one Badger
 // WriteBatch, one Pebble batch, one SQLite transaction over a prepared
-// INSERT, and durable.CreateFrom for store/durable — which has to materialise
-// the whole heap collection through store.Builder first, and pays for that
+// INSERT, and durable.CreateFromPrimary for store/durable. The durable lane
+// materializes the source through store.Builder first and charges that work
 // inside the measurement.
 //
 // It runs with and without a secondary index over the filter field. The
-// unindexed row alone was the whole bulk-load report for a while, which means
-// the cost of building the index that BenchmarkIndexedFilter then measures the
-// benefit of was charged to nobody. An engine's indexed-filter win has to be
-// read against its own indexed-load cost, not against its unindexed one.
+// indexed-filter result must be read against its own indexed-load cost, not
+// against the engine's unindexed load.
 //
 // One b.N iteration is one full corpus load, so ns/op is the total wall time.
 func BenchmarkBulkLoad(b *testing.B) {
@@ -239,14 +218,10 @@ func BenchmarkBulkLoad(b *testing.B) {
 // BenchmarkBulkLoadVariants compares the sole unified bulk output with
 // mutation replay and with leaving BufferCount at its default.
 //
-// Every variant is measured at more than one corpus size, because the previous
-// version of this benchmark ran a 5,000-document build and then invited
-// comparison with BenchmarkBulkLoad's 100,000-document row on the strength of a
-// comment asserting that ns/doc was stable at 5,000. That was asserted, never
-// measured, and it is exactly the kind of assertion a bulk builder with
-// per-build fixed costs (a shape template, a value dictionary, a key
-// directory) is most likely to violate. The sizes are now a measured column:
-// read them against each other before comparing any of them with anything else.
+// Every variant is measured at more than one corpus size so per-build fixed
+// costs (shape templates, value dictionaries, and key directories) cannot be
+// mistaken for stable per-document scaling. Read sizes against each other
+// before comparing any variant with another benchmark.
 //
 // putloop-defaults runs only at the smallest size on purpose. At the default
 // BufferCount a single Put costs milliseconds, so a full-corpus replay is
@@ -314,7 +289,7 @@ func BenchmarkPointRead(b *testing.B) {
 	for _, factory := range Factories() {
 		b.Run(factory.Name, func(b *testing.B) {
 			e := loadedEngine(
-				b, factory.Name, DurabilityDefault, false, "read",
+				b, factory.Name, DurabilityBufferedVisible, false, "read",
 			)
 			buf := make([]byte, 0, 512)
 			i := 0
@@ -340,15 +315,9 @@ func BenchmarkPointRead(b *testing.B) {
 
 // BenchmarkPointWrite replaces one existing document. This is the workload
 // where durability dominates, so it runs in each engine's explicitly named
-// historical benchmark configurations. Equal slice positions are not claims
-// of equivalent guarantees.
-//
-// Each repetition builds its own store and throws it away. The shared fixture
-// this used to use accumulated every earlier repetition's writes, and the drift
-// was large and monotonic: SQLite's sync=true row measured 4.10, then 5.41,
-// then 6.72 ms across three repetitions of one `-count=3` run, +64% end to end.
-// The median across repetitions hid it, and it penalised the engines that got
-// through the most writes per repetition — i.e. the fastest ones — hardest.
+// durability configurations. Equal slice positions are not claims of
+// equivalent guarantees. Each repetition builds its own store so writes from
+// one repetition cannot affect another.
 func BenchmarkPointWrite(b *testing.B) {
 	for _, factory := range Factories() {
 		for _, durability := range BenchmarkDurabilityModes(factory.Name) {
@@ -421,7 +390,7 @@ func BenchmarkScan(b *testing.B) {
 	for _, factory := range Factories() {
 		b.Run(factory.Name, func(b *testing.B) {
 			e := loadedEngine(
-				b, factory.Name, DurabilityDefault, false, "read",
+				b, factory.Name, DurabilityBufferedVisible, false, "read",
 			)
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -453,7 +422,7 @@ func BenchmarkScanAllBytes(b *testing.B) {
 	for _, factory := range Factories() {
 		b.Run(factory.Name, func(b *testing.B) {
 			e := loadedEngine(
-				b, factory.Name, DurabilityDefault, false, "read",
+				b, factory.Name, DurabilityBufferedVisible, false, "read",
 			)
 			b.ReportAllocs()
 			b.SetBytes(int64(totalBytes))
@@ -484,7 +453,7 @@ func BenchmarkFilter(b *testing.B) {
 	for _, factory := range Factories() {
 		b.Run(factory.Name, func(b *testing.B) {
 			e := loadedEngine(
-				b, factory.Name, DurabilityDefault, false, "read",
+				b, factory.Name, DurabilityBufferedVisible, false, "read",
 			)
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -518,7 +487,7 @@ func BenchmarkIndexedFilter(b *testing.B) {
 				b.Skipf("%s: %v", factory.Name, ErrNoIndex)
 			}
 			e := loadedEngine(
-				b, factory.Name, DurabilityDefault, true, "indexed",
+				b, factory.Name, DurabilityBufferedVisible, true, "indexed",
 			)
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -694,7 +663,7 @@ func TestFullEquivalence(t *testing.T) {
 	for _, factory := range Factories() {
 		t.Run(factory.Name, func(t *testing.T) {
 			e := loadedEngine(
-				t, factory.Name, DurabilityDefault, false, "read",
+				t, factory.Name, DurabilityBufferedVisible, false, "read",
 			)
 
 			byKey := make(map[string][]byte, len(docs))
@@ -793,7 +762,7 @@ func TestFullEquivalence(t *testing.T) {
 			}
 
 			idx := loadedEngine(
-				t, factory.Name, DurabilityDefault, true, "indexed",
+				t, factory.Name, DurabilityBufferedVisible, true, "indexed",
 			)
 			ic, err := idx.IndexedCount(FilterValue)
 			switch {
@@ -860,7 +829,7 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	// Built directly rather than through loadedEngine, whose shared fixtures load
 	// the package-global 100k docs this arm cannot index.
 	e, _, cleanup := newLoadedCorpus(t, factory, Config{
-		Durability: DurabilityDefault,
+		Durability: DurabilityBufferedVisible,
 		Indexed:    true,
 	}, corpus)
 	defer cleanup()

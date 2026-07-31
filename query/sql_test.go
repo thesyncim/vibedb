@@ -363,16 +363,16 @@ func kleeneReference(tree *sqlast.SelectStmt, docs []any, args []any) string {
 // refCellJSON renders a reference cell the way Cell.JSON renders the engine's.
 func refCellJSON(c refCell) string {
 	switch c.kind {
-	case KindNull:
+	case TypeNull:
 		return "null"
-	case KindBool:
+	case TypeBool:
 		if c.b {
 			return "true"
 		}
 		return "false"
-	case KindNumber:
+	case TypeNumber:
 		return c.num
-	case KindString:
+	case TypeString:
 		raw, _ := json.Marshal(c.s)
 		return string(raw)
 	default:
@@ -1156,7 +1156,7 @@ func TestSQLJoinAliasDoesNotShadowADrivingField(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := runStatement(t, stmt, FromDatabase(db.Snapshot(), "d"))
-	want := "|/o/b|o.b\n64:\"driving\"|64:\"joined\"|\n"
+	want := "|/o/b|o.b\n4:\"driving\"|4:\"joined\"|\n"
 	if got != want {
 		t.Fatalf("got %q, want %q; a qualified driving path must not read the joined side", got, want)
 	}

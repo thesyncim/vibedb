@@ -208,54 +208,27 @@ func createPrimaryPointFile(
 	return file
 }
 
-func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
+func TestFilePrimaryPointRead100K(t *testing.T) {
 	const count = 100_000
 	built, keys, values := buildRedundantPrimaryCorpus(t, count)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 128 << 20,
 	}
-	legacyFile, err := os.OpenFile(
-		filepath.Join(t.TempDir(), "legacy.vibe"),
-		os.O_RDWR|os.O_CREATE,
-		0o600,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacyFile.Close()
-	if _, err := CreateFromPrimary(built, legacyFile, options); err != nil {
-		t.Fatal(err)
-	}
 	primaryFile := createPrimaryPointFile(
 		t, built, options, "primary.vibe",
 	)
 
-	legacy, err := Open(legacyFile, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacy.Close()
 	primary, err := Open(primaryFile, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer primary.Close()
 	primaryRoot := primary.state.Load().root
-	// The retired chunk/fingerprint/index/float64 roots no longer exist as
-	// StateRoot fields, so an ordered-primary store is defined by a published
-	// PrimaryRoot alone.
 	if primaryRoot.PrimaryRoot == (storeio.PageRef{}) {
 		t.Fatalf("primary bulk root missing: %+v", primaryRoot.PrimaryRoot)
 	}
-	if primary.Len() != count || primary.Stats().VacantChunkSlots != 0 {
-		t.Fatalf(
-			"primary count/stats = %d/%d, want %d/0",
-			primary.Len(), primary.Stats().VacantChunkSlots, count,
-		)
-	}
-	legacyInfo, err := legacyFile.Stat()
-	if err != nil {
-		t.Fatal(err)
+	if primary.Len() != count {
+		t.Fatalf("primary count = %d, want %d", primary.Len(), count)
 	}
 	primaryInfo, err := primaryFile.Stat()
 	if err != nil {
@@ -266,9 +239,9 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 	)
 	classCounts := filePrimaryLeafClassCounts(t, primaryFile, primaryRoot)
 	t.Logf(
-		"100k disk bytes: primary=%d legacy=%d leaves=%d anchors=%d "+
+		"100k disk bytes: total=%d leaves=%d anchors=%d "+
 			"tablet_roots=%d locators=%d catalog=%d metadata=%d",
-		primaryInfo.Size(), legacyInfo.Size(),
+		primaryInfo.Size(),
 		regions.leaves, regions.anchors, regions.tabletRoots,
 		regions.locators, regions.catalog,
 		primaryInfo.Size()-regions.total(),
@@ -284,26 +257,16 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 		)
 	}
 
-	legacySnapshot, err := legacy.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacySnapshot.Close()
 	primarySnapshot, err := primary.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer primarySnapshot.Close()
 
-	legacyBuffer := make([]byte, 0, 128)
 	primaryBuffer := make([]byte, 0, 128)
 	pageWalkBuffer := make([]byte, 0, 128)
-	legacySnapshotBuffer := make([]byte, 0, 128)
 	primarySnapshotBuffer := make([]byte, 0, 128)
 	for at, key := range keys {
-		legacyValue, legacyOK, legacyErr := legacy.AppendRaw(
-			legacyBuffer[:0], []byte(key),
-		)
 		primaryValue, primaryOK, primaryErr := primary.AppendRaw(
 			primaryBuffer[:0], []byte(key),
 		)
@@ -311,43 +274,31 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 			primary.resolvePrimaryGraphPageWalk(
 				pageWalkBuffer[:0], primary.state.Load(), []byte(key),
 			)
-		legacySnapshotValue, legacySnapshotOK, legacySnapshotErr :=
-			legacySnapshot.AppendRaw(legacySnapshotBuffer[:0], []byte(key))
 		primarySnapshotValue, primarySnapshotOK, primarySnapshotErr :=
 			primarySnapshot.AppendRaw(primarySnapshotBuffer[:0], []byte(key))
-		if legacyErr != nil || primaryErr != nil || pageWalkErr != nil ||
-			legacySnapshotErr != nil || primarySnapshotErr != nil ||
-			!legacyOK || !primaryOK || !pageWalkOK ||
-			!legacySnapshotOK || !primarySnapshotOK ||
-			!bytes.Equal(legacyValue, values[at]) ||
-			!bytes.Equal(primaryValue, legacyValue) ||
+		if primaryErr != nil || pageWalkErr != nil ||
+			primarySnapshotErr != nil ||
+			!primaryOK || !pageWalkOK || !primarySnapshotOK ||
+			!bytes.Equal(primaryValue, values[at]) ||
 			!bytes.Equal(pageWalkValue, primaryValue) ||
-			!bytes.Equal(legacySnapshotValue, legacyValue) ||
-			!bytes.Equal(primarySnapshotValue, legacyValue) {
+			!bytes.Equal(primarySnapshotValue, primaryValue) {
 			t.Fatalf(
-				"point read %d = legacy(%q,%v,%v) primary(%q,%v,%v) "+
-					"page-walk(%q,%v,%v) "+
-					"legacy snapshot(%q,%v,%v) primary snapshot(%q,%v,%v)",
+				"point read %d = primary(%q,%v,%v) page-walk(%q,%v,%v) "+
+					"snapshot(%q,%v,%v), want %q",
 				at,
-				legacyValue, legacyOK, legacyErr,
 				primaryValue, primaryOK, primaryErr,
 				pageWalkValue, pageWalkOK, pageWalkErr,
-				legacySnapshotValue, legacySnapshotOK, legacySnapshotErr,
 				primarySnapshotValue, primarySnapshotOK, primarySnapshotErr,
+				values[at],
 			)
 		}
-		legacyBuffer = legacyValue
 		primaryBuffer = primaryValue
 		pageWalkBuffer = pageWalkValue
-		legacySnapshotBuffer = legacySnapshotValue
 		primarySnapshotBuffer = primarySnapshotValue
 	}
 
 	for sample := range 10_000 {
 		key := fmt.Sprintf("absent-primary-key-%09d", sample*7919)
-		if value, ok, err := legacy.AppendRaw(legacyBuffer[:0], []byte(key)); err != nil || ok || len(value) != 0 {
-			t.Fatalf("legacy absent %d = %q,%v,%v", sample, value, ok, err)
-		}
 		if value, ok, err := primary.AppendRaw(primaryBuffer[:0], []byte(key)); err != nil || ok || len(value) != 0 {
 			t.Fatalf("primary absent %d = %q,%v,%v", sample, value, ok, err)
 		}
@@ -355,14 +306,6 @@ func TestFilePrimaryPointReadDifferential100K(t *testing.T) {
 			pageWalkBuffer[:0], primary.state.Load(), []byte(key),
 		); err != nil || ok || len(value) != 0 {
 			t.Fatalf("page-walk absent %d = %q,%v,%v", sample, value, ok, err)
-		}
-		if value, ok, err := legacySnapshot.AppendRaw(
-			legacySnapshotBuffer[:0], []byte(key),
-		); err != nil || ok || len(value) != 0 {
-			t.Fatalf(
-				"legacy snapshot absent %d = %q,%v,%v",
-				sample, value, ok, err,
-			)
 		}
 		if value, ok, err := primarySnapshot.AppendRaw(
 			primarySnapshotBuffer[:0], []byte(key),
@@ -408,8 +351,7 @@ func (r filePrimaryRegions) total() int64 {
 }
 
 // filePrimaryRegionAccounting follows the same promoted catalog/router/leaf
-// codecs as point reads. It doubles as an ordered graph inventory without
-// depending on the legacy chunk scan cursor.
+// codecs as point reads. It doubles as an ordered graph inventory.
 func filePrimaryRegionAccounting(
 	t testing.TB, file *os.File, root storeio.StateRoot,
 ) filePrimaryRegions {

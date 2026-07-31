@@ -1,7 +1,6 @@
 package query
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 
@@ -60,7 +59,7 @@ func (r *Result) Release() {
 
 // A ResultColumn is one output column: its Header (the projection path or the
 // aggregate spelling, e.g. "sum(price)") and its Cells, one per row. Header is
-// display/compatibility metadata; its stable execution and transport ID is the
+// display metadata; its stable execution and transport ID is the
 // column's ordinal, available before execution through [Query.AppendSchema].
 type ResultColumn struct {
 	Header string
@@ -91,12 +90,8 @@ type Cell struct {
 	raw  []byte
 	text string
 	word uint64
-	kind CellKind
+	kind ValueType
 	flag cellFlag
-	// version is zero for core JSON types and participates in the identity of
-	// an extension type. It occupies existing alignment padding, so making the
-	// output model extensible does not enlarge Cell on 64-bit targets.
-	version uint16
 }
 
 type cellFlag uint8
@@ -118,7 +113,7 @@ var (
 func cellFromScalar(s scalar) Cell {
 	switch s.kind {
 	case kindNull:
-		return Cell{kind: KindNull, raw: nullBytes}
+		return Cell{kind: TypeNull, raw: nullBytes}
 	case kindBool:
 		raw := falseBytes
 		flag := cellFlag(0)
@@ -126,20 +121,20 @@ func cellFromScalar(s scalar) Cell {
 			raw = trueBytes
 			flag = cellTrue
 		}
-		return Cell{kind: KindBool, flag: flag, raw: raw}
+		return Cell{kind: TypeBool, flag: flag, raw: raw}
 	case kindNumber:
 		if s.isInt {
-			return Cell{kind: KindNumber, flag: cellInteger, word: uint64(s.ival), raw: s.num}
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(s.ival), raw: s.num}
 		}
 		f, ok := s.float64OfNumber()
 		if !ok {
-			return Cell{kind: KindNumber, flag: cellNumberRaw, raw: s.num}
+			return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: s.num}
 		}
-		return Cell{kind: KindNumber, word: math.Float64bits(f), raw: s.num}
+		return Cell{kind: TypeNumber, word: math.Float64bits(f), raw: s.num}
 	case kindString:
-		return Cell{kind: KindString, text: s.sval, raw: s.raw}
+		return Cell{kind: TypeString, text: s.sval, raw: s.raw}
 	default:
-		return Cell{kind: KindJSON, raw: s.raw}
+		return Cell{kind: TypeJSON, raw: s.raw}
 	}
 }
 
@@ -166,45 +161,27 @@ func (r *Result) ownFileCell(cell Cell) Cell {
 // nullCell builds a null result, the value of an aggregate over no rows and of
 // an absent projection.
 func nullCell() Cell {
-	return Cell{kind: KindNull, raw: nullBytes}
+	return Cell{kind: TypeNull, raw: nullBytes}
 }
 
 // Kind returns the cell's JSON kind.
-func (c Cell) Kind() CellKind { return c.kind }
+func (c Cell) Kind() ValueType { return c.kind }
 
-// Type returns the versioned value type. It is the transport-oriented spelling
+// Type returns the value type. It is the transport-oriented spelling
 // of [Cell.Kind]; Kind remains convenient when inspecting JSON values.
 func (c Cell) Type() ValueType { return c.kind }
 
-// TypeVersion returns zero for built-in JSON values and the negotiated
-// semantic version for an extension value.
-func (c Cell) TypeVersion() uint16 { return c.version }
-
-// IsExtension reports whether the cell carries a negotiated opaque type.
-func (c Cell) IsExtension() bool { return c.kind.IsExtension() }
-
-// ExtensionCell creates a borrowed opaque extension value. The payload is not
-// copied and must remain immutable for the cell's lifetime. Length-delimited
-// result framing lets readers skip an optional unknown extension; required
-// unknown types must be rejected during schema negotiation.
-func ExtensionCell(valueType ValueType, version uint16, payload []byte) (Cell, error) {
-	if valueType < ValueTypeExtensionStart {
-		return Cell{}, fmt.Errorf("query: extension value type %#x is reserved", valueType)
-	}
-	return Cell{kind: valueType, version: version, raw: payload}, nil
-}
-
 // Payload returns the borrowed representation bytes. For a projected core
-// value these are exact JSON bytes; for an extension they are the opaque
-// length-delimited payload negotiated for Type and TypeVersion.
+// value these are its exact JSON bytes. A computed numeric value may have no
+// source payload; use [Cell.AppendJSON] to encode it.
 func (c Cell) Payload() []byte { return c.raw }
 
 // IsNull reports whether the cell is null or absent.
-func (c Cell) IsNull() bool { return c.kind == KindNull }
+func (c Cell) IsNull() bool { return c.kind == TypeNull }
 
 // Bool returns the cell's boolean value, and false for a non-boolean cell.
 func (c Cell) Bool() (bool, bool) {
-	if c.kind != KindBool {
+	if c.kind != TypeBool {
 		return false, false
 	}
 	return c.flag&cellTrue != 0, true
@@ -213,7 +190,7 @@ func (c Cell) Bool() (bool, bool) {
 // Float64 returns the cell's numeric value as a float64, and false for a
 // non-numeric cell.
 func (c Cell) Float64() (float64, bool) {
-	if c.kind != KindNumber {
+	if c.kind != TypeNumber {
 		return 0, false
 	}
 	if c.flag&cellInteger != 0 {
@@ -232,7 +209,7 @@ func (c Cell) Float64() (float64, bool) {
 // Int64 returns the cell's numeric value as an int64 when it is an integer
 // within range, and false otherwise.
 func (c Cell) Int64() (int64, bool) {
-	if c.kind == KindNumber && c.flag&cellInteger != 0 {
+	if c.kind == TypeNumber && c.flag&cellInteger != 0 {
 		return int64(c.word), true
 	}
 	return 0, false
@@ -241,7 +218,7 @@ func (c Cell) Int64() (int64, bool) {
 // Text returns the cell's decoded string content, and false for a non-string
 // cell.
 func (c Cell) Text() (string, bool) {
-	if c.kind != KindString {
+	if c.kind != TypeString {
 		return "", false
 	}
 	return c.text, true
@@ -251,7 +228,7 @@ func (c Cell) Text() (string, bool) {
 // read-only borrowed view with the same lifetime as the Cell and must not be
 // modified. For a non-string it returns nil and false.
 func (c Cell) TextBytes() ([]byte, bool) {
-	if c.kind != KindString {
+	if c.kind != TypeString {
 		return nil, false
 	}
 	return byteview.Bytes(c.text), true
@@ -263,9 +240,6 @@ func (c Cell) TextBytes() ([]byte, bool) {
 // [Cell.AppendJSON] with retained storage when computed values must not
 // allocate.
 func (c Cell) JSON() []byte {
-	if c.IsExtension() {
-		return nil
-	}
 	if c.raw != nil {
 		return c.raw
 	}
@@ -276,13 +250,10 @@ func (c Cell) JSON() []byte {
 // caller-buffered transport form of [Cell.JSON] and allocates only if dst does
 // not have enough capacity.
 func (c Cell) AppendJSON(dst []byte) []byte {
-	if c.IsExtension() {
-		return dst
-	}
 	if c.raw != nil {
 		return append(dst, c.raw...)
 	}
-	if c.kind != KindNumber {
+	if c.kind != TypeNumber {
 		return dst
 	}
 	if c.flag&cellInteger != 0 {
@@ -291,11 +262,7 @@ func (c Cell) AppendJSON(dst []byte) []byte {
 	return strconv.AppendFloat(dst, math.Float64frombits(c.word), 'g', -1, 64)
 }
 
-// String returns compact JSON for a core value and a diagnostic descriptor for
-// an opaque extension. It is a debugging API, not a transport path.
+// String returns the cell's compact JSON representation.
 func (c Cell) String() string {
-	if c.IsExtension() {
-		return fmt.Sprintf("<value-type %#x v%d: %d bytes>", c.kind, c.version, len(c.raw))
-	}
 	return string(c.AppendJSON(nil))
 }

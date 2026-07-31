@@ -673,12 +673,6 @@ func TestRecoveryJournalRequiresPrimaryLayout(t *testing.T) {
 	}
 }
 
-// The former TestChunkSyncMintsNoJournal was deleted with the chunk layout: it
-// asserted that a DurabilitySync chunk-layout store minted no sibling journal.
-// Every store is now an ordered primary graph, and the synchronous lane journals
-// by design (the sync-journal lane), so the biconditional it guarded no longer
-// exists.
-
 // TestRecoveryJournalMissingFailsClosed proves a root that references a journal
 // whose file is absent fails closed rather than silently dropping acknowledged
 // mutations.

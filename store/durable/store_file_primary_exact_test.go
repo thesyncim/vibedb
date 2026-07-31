@@ -13,11 +13,10 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// TestCreateFromPrimaryExactIndexDifferential builds the same indexed corpus on
-// the legacy chunk store and the ordered primary graph and proves the exact
-// index answers identically, the posting recheck fails closed on a dead slot,
-// and the lookup is allocation-free.
-func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
+// TestCreateFromPrimaryExactIndex proves the bulk-built exact index returns the
+// expected rows, the posting recheck fails closed on a dead slot, and lookup is
+// allocation-free.
+func TestCreateFromPrimaryExactIndex(t *testing.T) {
 	const documents = 10_000
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
@@ -44,27 +43,14 @@ func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
 			{Name: "country_active", Paths: []string{"/country", "/active"}},
 		},
 	}
-	legacyFile, err := os.CreateTemp(t.TempDir(), "legacy-exact-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacyFile.Close()
 	primaryFile, err := os.CreateTemp(t.TempDir(), "primary-exact-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer primaryFile.Close()
-	if _, err := CreateFromPrimary(source, legacyFile, options); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := CreateFromPrimary(source, primaryFile, options); err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := Open(legacyFile, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacy.Close()
 	primary, err := Open(primaryFile, options)
 	if err != nil {
 		t.Fatal(err)
@@ -88,10 +74,13 @@ func TestCreateFromPrimaryExactIndexDifferential(t *testing.T) {
 		{name: "country_alias", values: []vibejson.Index{country}},
 		{name: "country_active", values: []vibejson.Index{country, active}},
 	} {
-		want := primaryExactTestKeys(t, legacy, probe.name, probe.values...)
 		got := primaryExactTestKeys(t, primary, probe.name, probe.values...)
+		want := make([]string, 0, documents/100)
+		for row := 42; row < documents; row += 100 {
+			want = append(want, fmt.Sprintf("k%05d", row))
+		}
 		if !slices.Equal(got, want) {
-			t.Fatalf("%s primary keys differ: got %d want %d",
+			t.Fatalf("%s keys differ: got %d want %d",
 				probe.name, len(got), len(want))
 		}
 	}
@@ -339,27 +328,14 @@ func TestPrimaryExactIndexUnifiedLeafFormat(t *testing.T) {
 			{Name: "group", Paths: []string{"/group"}},
 		},
 	}
-	legacyFile, err := os.CreateTemp(t.TempDir(), "legacy-tmpl-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacyFile.Close()
 	primaryFile, err := os.CreateTemp(t.TempDir(), "primary-tmpl-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer primaryFile.Close()
-	if _, err := CreateFromPrimary(source, legacyFile, options); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := CreateFromPrimary(source, primaryFile, options); err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := Open(legacyFile, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacy.Close()
 	primary, err := Open(primaryFile, options)
 	if err != nil {
 		t.Fatal(err)
@@ -392,19 +368,25 @@ func TestPrimaryExactIndexUnifiedLeafFormat(t *testing.T) {
 	}
 
 	for _, probe := range []struct {
-		name string
-		raw  string
+		name  string
+		raw   string
+		match func(int) bool
 	}{
-		{name: "active", raw: `true`},
-		{name: "active", raw: `false`},
-		{name: "group", raw: `42`},
-		{name: "group", raw: `500`},
+		{name: "active", raw: `true`, match: func(row int) bool { return row%3 == 0 }},
+		{name: "active", raw: `false`, match: func(row int) bool { return row%3 != 0 }},
+		{name: "group", raw: `42`, match: func(row int) bool { return row%997 == 42 }},
+		{name: "group", raw: `500`, match: func(row int) bool { return row%997 == 500 }},
 	} {
 		needle := primaryExactTestNeedle(t, probe.raw)
-		want := primaryExactTestKeys(t, legacy, probe.name, needle)
 		got := primaryExactTestKeys(t, primary, probe.name, needle)
+		want := make([]string, 0, len(got))
+		for row := range documents {
+			if probe.match(row) {
+				want = append(want, fmt.Sprintf("primary-key-%09d", row))
+			}
+		}
 		if !slices.Equal(got, want) {
-			t.Fatalf("%s=%s unified primary keys differ: got %d want %d",
+			t.Fatalf("%s=%s unified keys differ: got %d want %d",
 				probe.name, probe.raw, len(got), len(want))
 		}
 	}

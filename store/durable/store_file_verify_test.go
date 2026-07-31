@@ -99,9 +99,6 @@ func TestVerifyCleanPrimaryStoreVerifiesClean(t *testing.T) {
 		t.Fatalf("clean store reported %d findings: %+v",
 			len(report.Findings), report.Findings)
 	}
-	if !report.Primary {
-		t.Fatal("clean primary store not reported as primary")
-	}
 	if report.Documents != len(keys) {
 		t.Fatalf("verify counted %d documents, want %d",
 			report.Documents, len(keys))

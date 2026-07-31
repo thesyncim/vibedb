@@ -15,8 +15,8 @@ import (
 )
 
 // The unified primary leaf (class 5) stores every document as canonical
-// template rows inside the proven succinct ordered envelope (unified-leaf
-// design §3.1). The envelope machinery — stable cuckoo hash slots, control
+// template rows inside the succinct ordered envelope. The envelope machinery
+// — stable cuckoo hash slots, control
 // bytes, lexical rank permutation, 7-bit key lengths, overflow bitmap, and
 // succinct record boundaries — is reused byte for byte at the wide-class
 // geometry (192 normal + 64 stash slots); only the record heap's *value*
@@ -30,26 +30,26 @@ import (
 //	  u32 dictionarySectionBytes   (directory + value spellings)
 //	  u32 trivialContentBytes      (exact no-compression fold envelope)
 //	template section: cumulative u32 ends (relative to the entry data start),
-//	  then per template the document_group entry layout (§3.3, reused):
+//	  then per template the document_group entry layout:
 //	  u16 holeCount | u16 zero | u32 staticBytes |
 //	  (holeCount+1)×u32 cumulative static-segment ends | static bytes
 //	dictionary section: cumulative u32 ends + raw canonical value spellings
 //	record heap (physically lexical, succinct boundaries as today):
 //	  per record: [key bytes][row body]
 //	  row body = templateID u8 | token stream         (templated row)
-//	           | 0xFF          | canonical JSON bytes (trivial row, §3.5)
+//	           | 0xFF          | canonical JSON bytes (trivial row)
 //	           | 32-byte PageRef                      (overflow bitmap set)
 //
-// The stored logical value of every row is its vibejson canonical form
-// (§3.2): the encoder canonicalizes each input document (already-canonical
-// input is detected in the same walk and aliased, the §8 steady state), and
+// The stored logical value of every row is its vibejson canonical form: the
+// encoder canonicalizes each input document (already-canonical input is
+// detected in the same walk and aliased), and
 // every render reproduces exactly those canonical bytes.
 const (
 	// CommonPrimaryLeafUnified is the class-5 unified canonical template-row
 	// leaf. Like classes 3/4 its payload is not the raw narrow/wide value heap,
 	// so CommonPrimaryLeafClass.slots() reports zero for it and readers must
 	// dispatch on the class byte; unlike classes 3/4 its posting-stable slot is
-	// the envelope's stable cuckoo hash slot (§3.1: one slot discipline).
+	// the envelope's stable cuckoo hash slot (one-slot discipline).
 	CommonPrimaryLeafUnified CommonPrimaryLeafClass = 5
 
 	// commonPrimaryUnifiedHeaderBytes frames the two unified sections. The
@@ -57,23 +57,23 @@ const (
 	// every section arithmetic check before touching section bytes.
 	commonPrimaryUnifiedHeaderBytes = 16
 
-	// Token tags (§3.4). Dict ids and short-literal ranges are disjoint,
+	// Token tags. Dictionary ids and short-literal ranges are disjoint,
 	// following the document-group scheme, extended with the typed tags whose
 	// losslessness the design proves from the JSON grammar.
 	unifiedTokenDictLimit   = 128  // dict ids occupy tags 0x00..0x7F
 	unifiedTokenShortBase   = 0x80 // short literal lengths 1..120 → 0x80..0xF7
 	unifiedTokenShortMax    = 120
 	unifiedTokenLongLiteral = 0xF8 // uvarint length + spelling bytes
-	unifiedTokenTrue        = 0xF9 // regeneration is identity by grammar (§3.4)
+	unifiedTokenTrue        = 0xF9 // regeneration is identity by grammar
 	unifiedTokenFalse       = 0xFA
 	unifiedTokenNull        = 0xFB
-	unifiedTokenInt         = 0xFC // canonical-int admission (§3.4), zigzag varint
+	unifiedTokenInt         = 0xFC // canonical-integer admission, zigzag varint
 	// Tags 0xFD/0xFE are unassigned and fail closed; 0xFF is never a token tag
 	// because it is the row-level trivial escape, which keeps the row tag space
 	// unambiguous when a decoder resynchronizes at a row boundary.
 
-	// unifiedRowTrivial marks a row stored as its whole canonical spelling
-	// (§3.5): the escape hatch inside the one grammar, not a class.
+	// unifiedRowTrivial marks a row stored as its whole canonical spelling:
+	// the escape hatch inside the one grammar, not a class.
 	unifiedRowTrivial = 0xFF
 
 	// unifiedMaxTemplates caps template ids at the values a row's leading byte
@@ -92,7 +92,7 @@ const (
 // window: where the canonical spelling lives (aliased from the input when the
 // input is already canonical, otherwise in the builder heap), the row's hole
 // spans within that spelling, its shape, and the typed token-stream cost
-// without dictionary participation (the §3.5 predicate operand).
+// without dictionary participation (the trivial-row predicate operand).
 type unifiedPrimaryLeafRow struct {
 	heapOff      int32 // -1: canonical bytes alias the input record
 	length       int32
@@ -109,7 +109,7 @@ type unifiedPrimaryLeafShape struct {
 	firstRow    int
 	holes       int
 	staticBytes int
-	// entryBytes is the §3.5 template-entry cost 8 + (holes+1)·4 + staticBytes,
+	// entryBytes is the template-entry cost 8 + (holes+1)·4 + staticBytes,
 	// exactly the document_group entry layout this class reuses.
 	entryBytes int
 }
@@ -117,7 +117,7 @@ type unifiedPrimaryLeafShape struct {
 // unifiedPrefixPlan is the deterministic derivation for one row prefix: which
 // shapes template, in which id order, with which dictionary, and how many
 // bytes each section and the heap take. It is a pure function of the prefix's
-// rows (§7.4 fold purity), which is what makes bulk build and the later fold
+// rows, which is what makes bulk build and the later fold
 // share one encoder.
 type unifiedPrefixPlan struct {
 	count           int
@@ -191,10 +191,9 @@ func (b *UnifiedPrimaryLeafBuilder) buildIndex(src []byte) (vibejson.Index, erro
 }
 
 // appendHoleSpans extracts the ordered scalar-leaf spans of one canonical
-// document from its tape. The criterion is the document-group model the
-// design reuses (§3.3): a non-key tape leaf with Next == 1, which places
-// holes at scalar leaves of arbitrary depth and makes empty containers holes
-// too — nesting never disqualifies (§6).
+// document from its tape. A hole is a non-key tape leaf with Next == 1, which
+// places holes at scalar leaves of arbitrary depth and makes empty containers
+// holes too — nesting never disqualifies.
 func appendHoleSpans(dst []UnifiedTokenSpan, index vibejson.Index) []UnifiedTokenSpan {
 	for i := range index.Entries {
 		e := &index.Entries[i]
@@ -218,7 +217,7 @@ func zigzagVarintLen(v int64) int {
 }
 
 // unifiedTypedTokenCost is the token byte cost of one hole spelling without
-// dictionary participation: the typed tags of §3.4 where identity is provable
+// dictionary participation: typed tags where identity is provable
 // from the grammar, a verbatim literal everywhere else.
 func unifiedTypedTokenCost(v []byte) int {
 	switch len(v) {
@@ -285,7 +284,7 @@ func (b *UnifiedPrimaryLeafBuilder) shapeEqual(a, bi int) bool {
 
 // extract canonicalizes every record of one window and derives its holes and
 // shape. Records are borrowed until the next extract call. Already-canonical
-// input skips the render (the §8 steady state: stored-and-rendered bytes are
+// input skips the render (stored and rendered bytes are
 // canonical by construction); everything else renders once into the builder
 // heap, whose offsets — not slices — the rows keep, so heap growth during
 // later rows cannot invalidate earlier references.
@@ -305,7 +304,7 @@ func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) e
 		}
 		if record.Value.IsOverflow() {
 			// Overflow rows carry a chain reference, never canonical bytes; the
-			// chain itself holds the canonical spelling (§6) and the row takes
+			// chain itself holds the canonical spelling and the row takes
 			// no part in the template census.
 			b.rows = append(b.rows, unifiedPrimaryLeafRow{heapOff: -1, shape: -1})
 			continue
@@ -362,7 +361,7 @@ func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) e
 			holes := int(row.spanEnd - row.spanStart)
 			b.shapes = append(b.shapes, unifiedPrimaryLeafShape{
 				firstRow: at, holes: holes, staticBytes: staticBytes,
-				// The §3.5 template-entry cost, verified against the reused
+				// The template-entry cost, verified against the reused
 				// document_group entry layout: 8 header bytes, one u32 per
 				// segment end (holes+1), and the static bytes.
 				entryBytes: 8 + (holes+1)*4 + staticBytes,
@@ -375,12 +374,11 @@ func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) e
 }
 
 // planPrefix derives the deterministic template/dictionary/token plan for the
-// first count extracted rows. Order of derivation follows §7.4: template
-// census first, then dictionary selection, then token sizing. The §3.5
-// amortization predicate is evaluated with dictionary-free typed token costs:
-// the design's tokenStreamLen cannot include dictionary references without a
-// circular dependency (which shapes template decides which rows feed the
-// dictionary, per the §7.4 order), so the predicate uses the conservative
+// first count extracted rows: template census first, then dictionary
+// selection, then token sizing. The amortization predicate is evaluated with
+// dictionary-free typed token costs. tokenStreamLen cannot include dictionary
+// references without a circular dependency (which shapes template decides
+// which rows feed the dictionary), so the predicate uses the conservative
 // dictionary-free cost — a shape that templates under it always saves at
 // least what the predicate charged, and the choice is a pure function of the
 // prefix's rows. This deviation is flagged in the stage report.
@@ -410,11 +408,11 @@ func (b *UnifiedPrimaryLeafBuilder) planPrefix(count int) (*unifiedPrefixPlan, e
 			continue
 		}
 		b.shapeRows[row.shape]++
-		// Per §3.5: each templated row saves canonicalLen − tokenStreamLen − 1,
+		// Each templated row saves canonicalLen − tokenStreamLen − 1,
 		// the −1 charging the row its templateID byte.
 		b.shapeSavings[row.shape] += int64(row.length) - int64(row.tokensNoDict) - 1
 	}
-	// Shapes are admitted in first-use lexical-rank order (§3.3), which is the
+	// Shapes are admitted in first-use lexical-rank order, which is the
 	// order b.shapes already holds. The template-id budget (≤ 255, the row tag
 	// space minus the trivial escape) is enforced in the same order so the
 	// choice stays a pure function of the row set; in practice the predicate
@@ -424,7 +422,7 @@ func (b *UnifiedPrimaryLeafBuilder) planPrefix(count int) (*unifiedPrefixPlan, e
 		if b.shapeRows[s] == 0 || len(plan.templateShapes) >= unifiedMaxTemplates {
 			continue
 		}
-		// Ties template (§3.5): equality is admission, fixed so that two
+		// Ties template: equality is admission, fixed so that two
 		// implementations cannot disagree.
 		if int64(b.shapes[s].entryBytes)+4 <= b.shapeSavings[s] {
 			plan.templated[s] = int32(len(plan.templateShapes))
@@ -589,12 +587,9 @@ func (b *UnifiedPrimaryLeafBuilder) appendRowBody(dst []byte, i int, plan *unifi
 }
 
 // rawRenderCapacity returns the largest row prefix whose canonical renders
-// fit one raw wide envelope of extentBytes. This cap is a U1-phase-only
-// deviation from §3.6 (which deletes the de-templatability cap outright): in
-// this phase mutations to a class-5 leaf still route through the existing
-// structural rewrite, which renders every row into a raw wide envelope of at
-// most 64 KiB before re-fitting, so a unified leaf must never hold more rows
-// than that envelope can carry. The cap dies with that path in U2.
+// fit one raw wide envelope of extentBytes. Structural mutations can render a
+// class-5 leaf into a raw wide envelope of at most 64 KiB before re-fitting,
+// so a unified leaf must never hold more rows than that envelope can carry.
 func (b *UnifiedPrimaryLeafBuilder) rawRenderCapacity(extentBytes int) int {
 	capacity := extentBytes - PageHeaderSize - PageTrailerSize
 	contentBytes := commonPrimaryUnifiedHeaderBytes
@@ -668,14 +663,14 @@ func CommonPrimaryUnifiedInsertedTrivialBytes(key []byte, valueBytes int) int {
 	return total
 }
 
-// unifiedLeafExtents are the physical extents the §3.6 packing search tries,
+// unifiedLeafExtents are the physical extents the packing search tries,
 // smallest first so an equal bytes-per-row tie keeps the smaller extent.
 var unifiedLeafExtents = [...]int{
 	CommonPrimaryLeafNarrowBytes, CommonPrimaryLeafWideBytes,
 	16 << 10, 32 << 10, 64 << 10,
 }
 
-// planUnifiedLeaf runs the single packing planner of §3.6 over the front of
+// planUnifiedLeaf runs the single packing planner over the front of
 // window: for each extent in {4..64 KiB}, binary-search the largest lexical
 // row prefix that encodes within the extent, places within the 256-slot wide
 // class, and holds ≤ 256 rows; choose the extent minimizing bytes per row.
@@ -711,7 +706,7 @@ func planUnifiedLeaf(
 		return false, err
 	}
 	// A cuckoo placement valid for n rows restricts to a valid placement for
-	// n−1 (§3.6), so the largest placeable prefix binary-searches.
+	// n−1, so the largest placeable prefix binary-searches.
 	maxPlace := 0
 	for lo, high := 1, hi; lo <= high; {
 		mid := (lo + high) / 2
@@ -883,7 +878,7 @@ func encodeCommonPrimaryUnifiedLeaf(
 	}
 
 	// Envelope tables: identical machinery and byte meaning to the wide raw
-	// class (§3.1 — the slot, lookup, and boundary machinery is reused byte
+	// class; the slot, lookup, and boundary machinery is reused byte
 	// for byte; only the record heap's value content changes meaning).
 	stashCount := 0
 	var occupied [4]uint64
@@ -1132,7 +1127,7 @@ func unifiedSectionOffsets(
 // lexical order, boundaries, checkpoints, overflow refs), and every unified
 // section — template directory and entries, dictionary directory, and each
 // row body's complete token walk. Every section is independently fail-closed:
-// a violation anywhere rejects the leaf (the U1 corruption gate).
+// a violation anywhere rejects the leaf.
 func OpenCommonPrimaryUnifiedLeaf(
 	src []byte,
 	seed [16]byte,
@@ -1163,7 +1158,7 @@ func OpenCommonPrimaryUnifiedLeaf(
 		pageHeader.LogicalID != expected.LogicalID ||
 		pageHeader.Generation != expected.Generation ||
 		pageHeader.PageSize != expected.Length ||
-		pageHeader.Kind != expected.Kind || pageHeader.Flags != 0 {
+		pageHeader.Kind != expected.Kind {
 		return CommonPrimaryUnifiedLeafView{}, fmt.Errorf(
 			"%w: common identity or unified header", ErrCommonPrimaryLeafCorrupt,
 		)
@@ -1202,7 +1197,7 @@ func OpenCommonPrimaryUnifiedLeaf(
 			Bucket: bucket, PageSize: pageHeader.PageSize,
 		},
 		// The envelope machinery keys its slot arithmetic on the class field;
-		// the unified class shares the wide slot geometry exactly (§3.1).
+		// the unified class shares the wide slot geometry exactly.
 		class: CommonPrimaryLeafWide, seed: seed,
 		page:    src[:int(pageHeader.PageSize):int(pageHeader.PageSize)],
 		payload: payload, count: uint16(count), stashCount: uint8(stashCount),
@@ -1358,7 +1353,7 @@ func (v *CommonPrimaryUnifiedLeafView) admittedDictionaryEntry(id int) []byte {
 // validateSections proves every unified section independently: the template
 // directory and each entry's segment table, the dictionary directory, and —
 // per row — the body classification and a complete bounds-checked token walk
-// that must consume the body exactly. Fail-closed everywhere (U1 gate).
+// that must consume the body exactly. Every violation fails closed.
 func (v *CommonPrimaryUnifiedLeafView) validateSections() error {
 	corrupt := func(what string) error {
 		return fmt.Errorf("%w: unified %s", ErrCommonPrimaryLeafCorrupt, what)
@@ -1550,7 +1545,7 @@ func (v *CommonPrimaryUnifiedLeafView) DictionaryCount() int {
 }
 
 // TrivialRowCount scans the row directory and reports how many live rows are
-// stored in trivial form (§3.5) — the census deliverable's trivial fraction.
+// stored in trivial form — the census's trivial fraction.
 func (v *CommonPrimaryUnifiedLeafView) TrivialRowCount() int {
 	if v == nil {
 		return 0
@@ -1605,7 +1600,7 @@ func (v *CommonPrimaryUnifiedLeafView) PostingSlots() (
 
 // AppendRowBody splices the canonical document a templated or trivial row
 // body encodes onto dst: trivial rows are one memcpy, templated rows
-// interleave the template's static segments with the token renders (§5). It
+// interleave the template's static segments with the token renders. It
 // fails closed (dst unchanged, false) on any structural violation rather than
 // emitting partial bytes, and never reads outside the admitted payload.
 func (v *CommonPrimaryUnifiedLeafView) AppendRowBody(dst, body []byte) ([]byte, bool) {
@@ -1671,8 +1666,8 @@ func (v *CommonPrimaryUnifiedLeafView) AppendRowBody(dst, body []byte) ([]byte, 
 				return dst[:start], false
 			}
 			cursor += n
-			// Regeneration is byte-identical for every admitted spelling (§3.4
-			// losslessness, pinned by the U0 differential tests).
+			// Regeneration is byte-identical for every admitted spelling, as
+			// pinned by the canonical-integer differential tests.
 			dst = AppendCanonicalInt(dst, value)
 		default:
 			return dst[:start], false
@@ -1943,7 +1938,7 @@ func (v *CommonPrimaryUnifiedLeafView) FirstRankFrom(lower []byte) int {
 }
 
 // RenderRecords reconstructs every row as a raw CommonPrimaryLeafRecord for
-// the U1 mutation path (the existing structural rewrite). Canonical renders
+// the structural mutation rewrite. Canonical renders
 // are written contiguously into heap (grown as needed and returned); record
 // values borrow that heap, record keys borrow the admitted page, and overflow
 // rows keep their chain reference untouched.

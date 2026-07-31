@@ -78,8 +78,7 @@ func BenchmarkSegmentedTabletRouterOrdinaryCOW(b *testing.B) {
 	leafRef.Offset += 8
 	leafRef.Generation = 10_001
 	leafRef.Length = 317
-	var zone BucketZone
-	zone = BucketZone{9, 8, 7, 6}
+	zone := BucketZone{9, 8, 7, 6}
 	pageID := uint8(target / SegmentedTabletRouterRowsPerPage)
 	anchorRef := refs[pageID]
 	anchorRef.Offset += 1 << 20

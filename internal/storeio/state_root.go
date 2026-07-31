@@ -7,45 +7,15 @@ import (
 )
 
 const (
-	// StateRootLogicalID is fixed so a recovered superblock cannot silently
-	// reinterpret an arbitrary page as the root of a Store generation.
-	StateRootLogicalID = uint64(1)
-	// StateRootPayloadSize is deliberately larger than the fields in use. Every
-	// current value ends at stateRootReservedOffset, and the remainder is
-	// reserved, written zero, and validated zero on decode. A later development
-	// field advances that boundary without moving an existing offset or changing
-	// the payload length.
-	//
-	// It has been exactly full once already — six page references ending on the
-	// byte the payload ended on — which turned the tail check into a comparison
-	// against an empty slice and would have forced a layout change on the next
-	// field added. The reserve exists so that does not recur; do not shrink the
-	// payload back to the last field.
-	//
-	// The room is free: a state root occupies a whole page, which is at least
-	// 4096 bytes, so the payload length is a schema bound rather than a
-	// physical one.
+	// StateRootPayloadSize leaves a zero-filled suffix for development fields
+	// within each inline root.
 	StateRootPayloadSize = 512
 	// PageRefSize is the fixed encoded width of one pointer-free physical page
 	// reference.
 	PageRefSize = 32
 
-	// stateRootVersion is 0 for as long as the format is under development.
-	// Nothing is released, so there is no older file to read and no ladder to
-	// climb: a layout change edits this schema in place rather than adding a
-	// version, and every file written before it simply stops opening. The first
-	// release takes version 1 and starts the ladder for real.
-	stateRootVersion               = uint32(0)
-	stateRootFreeHintOffset        = 52
-	stateRootChunkRefOffset        = 56
-	stateRootKeyRefOffset          = stateRootChunkRefOffset + PageRefSize
-	stateRootIndexRefOffset        = stateRootKeyRefOffset + PageRefSize
-	stateRootRefsEnd               = stateRootIndexRefOffset + PageRefSize
-	stateRootFloat64Offset         = stateRootRefsEnd
-	stateRootFloat64End            = stateRootFloat64Offset + PageRefSize
-	stateRootIndexGroupOffset      = stateRootFloat64End
-	stateRootIndexGroupEnd         = stateRootIndexGroupOffset + PageRefSize
-	stateRootMaterializationOffset = stateRootIndexGroupEnd
+	stateRootVersion               = DevelopmentFormatVersion
+	stateRootMaterializationOffset = 40
 	stateRootMaterializationEnd    = stateRootMaterializationOffset + 4
 	stateRootMaxPageSizeOffset     = stateRootMaterializationEnd
 	stateRootMaxPageSizeEnd        = stateRootMaxPageSizeOffset + 4
@@ -58,21 +28,14 @@ const (
 	stateRootMaxDocumentBytesEnd   = stateRootInlineValueBytesEnd + 4
 	stateRootPrimaryOffset         = stateRootMaxDocumentBytesEnd
 	stateRootPrimaryEnd            = stateRootPrimaryOffset + PageRefSize
-	// stateRootJournalIDOffset names the paired recovery journal. It occupies 16
-	// bytes of the previously zero-filled reserve, so a store that never uses a
-	// journal encodes exactly the bytes it did before (an all-zero JournalID),
-	// and existing golden roots decode unchanged. This is the smaller of the two
-	// pairing formats: the reserve exists for exactly this, no field offset
-	// moves, and the payload length is unchanged. The journal file's own header
-	// carries {StoreID, JournalID}; recovery cross-checks both before replaying.
+	// stateRootJournalIDOffset names the paired recovery journal. The journal
+	// file's own header carries {StoreID, JournalID}; recovery cross-checks both
+	// before replaying.
 	stateRootJournalIDOffset = stateRootPrimaryEnd
 	stateRootJournalIDEnd    = stateRootJournalIDOffset + 16
 	// stateRootExactIndexOffset names the PagePrimaryExactRoot published beside
 	// PrimaryRoot for exact indexes carried as posting tiles on the ordered
-	// graph. It occupies 32 bytes of the previously zero-filled reserve, so a
-	// store without ordered-primary exact indexes encodes exactly the bytes it
-	// did before (an all-zero ExactIndexRoot). No existing offset moves and the
-	// payload length is unchanged.
+	// graph.
 	stateRootExactIndexOffset = stateRootJournalIDEnd
 	stateRootExactIndexEnd    = stateRootExactIndexOffset + PageRefSize
 	// stateRootReservedOffset begins the zero-filled suffix described on
@@ -83,17 +46,10 @@ const (
 // State-root option bits are durable equivalents of Store construction
 // options. Unknown bits fail closed.
 const (
-	StateOptionShapeTapes uint32 = 1 << iota
-	StateOptionPostings
-	StateOptionValueDict
-	StateOptionHashKeys
-	// StateOptionFloat64Columns means every live document page carries the
-	// complete configured float64 covering-column catalog.
-	StateOptionFloat64Columns
 	// StateOptionSchema means the durable catalog hash also binds an
 	// application-supplied document schema. The schema definition remains
 	// caller configuration; reopening with a different definition fails.
-	StateOptionSchema
+	StateOptionSchema uint32 = 1 << iota
 	// StateOptionCanonicalMaterialization means the file may contain
 	// recovery-journaled canonical page replacements. The exact qualified
 	// power-loss damage granule is carried by StateRoot so Open can recover
@@ -101,12 +57,7 @@ const (
 	StateOptionCanonicalMaterialization
 )
 
-const stateRootKnownOptions = StateOptionShapeTapes |
-	StateOptionPostings |
-	StateOptionValueDict |
-	StateOptionHashKeys |
-	StateOptionFloat64Columns |
-	StateOptionSchema |
+const stateRootKnownOptions = StateOptionSchema |
 	StateOptionCanonicalMaterialization
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
@@ -123,40 +74,24 @@ type PageRef struct {
 	Generation uint64
 	Length     uint32
 	Kind       PageKind
-	Flags      uint8
-	// Aux is routing metadata for schemas that explicitly define it. It is
-	// zero for every ordinary reference. Document-group leaves use it only
-	// with DocumentGroupFlagFloat64Sidecar to encode bounded physical and
-	// logical deltas to a shared typed extent.
-	Aux uint16
 }
 
-// StateRoot is the compact, pointer-free graph root named by a Superblock.
-// Its current directory references separate document placement, key lookup,
-// and secondary indexes so a mutation copies only affected paths. PrimaryRoot
-// independently selects the ordered replacement graph during its staged
-// cutover. The persistent free-page tree remains a separate Superblock root.
+// StateRoot is the compact, pointer-free graph root embedded in an InlineSuperblock.
+// PrimaryRoot selects the ordered document graph, ExactIndexRoot selects its
+// secondary indexes, and free-page state is carried by the inline root.
 type StateRoot struct {
-	StoreID        [16]byte
-	Generation     uint64
-	PageSize       uint32
-	Options        uint32
-	DocumentCount  uint64
-	NextLogicalID  uint64
-	ChunkHighWater uint32
-	LiveChunks     uint32
-	ChunkDocuments uint32
-	IndexCount     uint32
-	IndexMaxDepth  uint32
+	StoreID       [16]byte
+	Generation    uint64
+	PageSize      uint32
+	Options       uint32
+	DocumentCount uint64
+	NextLogicalID uint64
+	IndexCount    uint32
+	IndexMaxDepth uint32
 	// IndexCatalogHash is a compact non-authoritative rejection key for the
 	// exact PageCatalog identity. Open must reconstruct and compare the
 	// canonical catalog bytes; this value is never a fallback authority.
 	IndexCatalogHash uint64
-	// FreeChunkHint is a conservative lower bound for the first chunk that
-	// may contain a free stable slot. ChunkHighWater means no known hole.
-	// Insertion advances it while delete can lower it in O(1), avoiding a
-	// heap-side free-slot object or pointer for every key.
-	FreeChunkHint uint32
 	// MaterializationDamageGranule is the largest complete sector a power
 	// failure may damage during one qualified canonical overwrite. Zero means
 	// the file never uses in-place materialization.
@@ -181,19 +116,11 @@ type StateRoot struct {
 	MaxKeyBytes      uint32
 	InlineValueBytes uint32
 	MaxDocumentBytes uint32
-	// The chunk/fingerprint layout is gone. Its five root PageRef slots (chunk
-	// directory, pre-hybrid and fingerprint key directory, exact-index directory,
-	// float64 scan head, and index-group head) are held blank in the persisted
-	// payload so the fields after them keep their byte offsets; nothing writes or
-	// reads them any longer.
-	//
 	// PrimaryRoot selects the ordered tablet graph and is the sole document root.
 	PrimaryRoot PageRef
 	// ExactIndexRoot names the PagePrimaryExactRoot carrying the physical
 	// exact-term posting leaves associated with PrimaryRoot. It is absent for an
-	// ordered primary without indexes, and never coexists with IndexDirectory:
-	// exact indexes live either on the chunk store (IndexDirectory) or on the
-	// ordered graph (ExactIndexRoot), not both.
+	// ordered primary without indexes.
 	ExactIndexRoot PageRef
 	// JournalID is the UUID of the recovery journal file paired with this store.
 	// Zero means no journal is referenced: the store never acknowledged a
@@ -204,50 +131,18 @@ type StateRoot struct {
 	JournalID [16]byte
 }
 
-// EncodeStateRootPage writes and seals one complete common-format page into
-// caller storage. fileEnd is copied from the prospective Superblock and bounds
-// every physical reference before publication. No allocation is performed.
-func EncodeStateRootPage(dst []byte, root StateRoot, fileEnd uint64) ([]byte, error) {
-	if err := validateStateRoot(root, fileEnd); err != nil {
-		return nil, err
-	}
-	header := PageHeader{
-		StoreID:       root.StoreID,
-		Generation:    root.Generation,
-		LogicalID:     StateRootLogicalID,
-		PageSize:      root.PageSize,
-		PayloadLength: StateRootPayloadSize,
-		Kind:          PageStateRoot,
-	}
-	payload, err := InitPage(dst, header)
-	if err != nil {
-		return nil, err
-	}
-	encodeStateRootPayload(payload, root)
-	page := dst[:int(root.PageSize)]
-	if _, err := sealInitializedPage(page); err != nil {
-		return nil, err
-	}
-	return page, nil
-}
-
 // encodeStateRootPayload writes the identity-free StateRoot body shared by the
-// standalone page envelope and the inline superblock envelope. The caller
-// validates root against its enclosing FileEnd before calling it.
+// inline root envelope. The caller validates root against its enclosing FileEnd
+// before calling it.
 func encodeStateRootPayload(payload []byte, root StateRoot) {
 	clear(payload)
 	binary.LittleEndian.PutUint32(payload[0:4], stateRootVersion)
 	binary.LittleEndian.PutUint32(payload[4:8], root.Options)
 	binary.LittleEndian.PutUint64(payload[8:16], root.DocumentCount)
 	binary.LittleEndian.PutUint64(payload[16:24], root.NextLogicalID)
-	binary.LittleEndian.PutUint32(payload[24:28], root.ChunkHighWater)
-	binary.LittleEndian.PutUint32(payload[28:32], root.LiveChunks)
-	binary.LittleEndian.PutUint32(payload[32:36], root.ChunkDocuments)
-	binary.LittleEndian.PutUint32(payload[36:40], root.IndexCount)
-	binary.LittleEndian.PutUint32(payload[40:44], root.IndexMaxDepth)
-	binary.LittleEndian.PutUint64(payload[44:52], root.IndexCatalogHash)
-	binary.LittleEndian.PutUint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset], root.FreeChunkHint)
-	// The five removed chunk/fingerprint root slots stay zero (cleared above).
+	binary.LittleEndian.PutUint32(payload[24:28], root.IndexCount)
+	binary.LittleEndian.PutUint32(payload[28:32], root.IndexMaxDepth)
+	binary.LittleEndian.PutUint64(payload[32:40], root.IndexCatalogHash)
 	binary.LittleEndian.PutUint32(
 		payload[stateRootMaterializationOffset:stateRootMaterializationEnd],
 		root.MaterializationDamageGranule,
@@ -291,41 +186,20 @@ func encodeStateRootPayload(payload []byte, root StateRoot) {
 	)
 }
 
-// DecodeStateRootPage verifies a complete common page and its state-root
-// schema. fileEnd is the high-water mark from the selecting Superblock. The
-// result contains values only and retains no reference to src.
-func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
-	header, payload, err := OpenPage(src)
-	if err != nil {
-		return StateRoot{}, fmt.Errorf("%w: %w", ErrStateRootCorrupt, err)
-	}
-	if header.Kind != PageStateRoot || header.LogicalID != StateRootLogicalID {
-		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
-	}
-	return decodeStateRootPayload(
-		payload, header.StoreID, header.Generation, header.PageSize, fileEnd,
-	)
-}
-
 // decodeStateRootPayload decodes the identity-free StateRoot body shared by
-// standalone and inline roots. Identity comes from the checksummed enclosing
+// inline roots. Identity comes from the checksummed enclosing
 // envelope and is validated with every state field before return.
 func decodeStateRootPayload(
 	payload []byte, storeID [16]byte, generation uint64, pageSize uint32, fileEnd uint64,
 ) (StateRoot, error) {
 	if len(payload) != StateRootPayloadSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != stateRootVersion ||
-		// The five removed chunk/fingerprint root slots must be entirely blank.
-		!allZero(payload[stateRootChunkRefOffset:stateRootRefsEnd]) ||
-		!allZero(payload[stateRootFloat64Offset:stateRootFloat64End]) ||
-		!allZero(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd]) ||
 		!pageRefReservedZero(payload[stateRootPageCatalogOffset:stateRootPageCatalogEnd]) ||
 		!pageRefReservedZero(payload[stateRootPrimaryOffset:stateRootPrimaryEnd]) ||
 		!pageRefReservedZero(payload[stateRootExactIndexOffset:stateRootExactIndexEnd]) ||
 		!allZero(payload[stateRootReservedOffset:]) {
 		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
 	}
-	freeChunkHint := binary.LittleEndian.Uint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset])
 	root := StateRoot{
 		StoreID:          storeID,
 		Generation:       generation,
@@ -333,13 +207,9 @@ func decodeStateRootPayload(
 		Options:          binary.LittleEndian.Uint32(payload[4:8]),
 		DocumentCount:    binary.LittleEndian.Uint64(payload[8:16]),
 		NextLogicalID:    binary.LittleEndian.Uint64(payload[16:24]),
-		ChunkHighWater:   binary.LittleEndian.Uint32(payload[24:28]),
-		LiveChunks:       binary.LittleEndian.Uint32(payload[28:32]),
-		ChunkDocuments:   binary.LittleEndian.Uint32(payload[32:36]),
-		IndexCount:       binary.LittleEndian.Uint32(payload[36:40]),
-		IndexMaxDepth:    binary.LittleEndian.Uint32(payload[40:44]),
-		IndexCatalogHash: binary.LittleEndian.Uint64(payload[44:52]),
-		FreeChunkHint:    freeChunkHint,
+		IndexCount:       binary.LittleEndian.Uint32(payload[24:28]),
+		IndexMaxDepth:    binary.LittleEndian.Uint32(payload[28:32]),
+		IndexCatalogHash: binary.LittleEndian.Uint64(payload[32:40]),
 		MaterializationDamageGranule: binary.LittleEndian.Uint32(
 			payload[stateRootMaterializationOffset:stateRootMaterializationEnd],
 		),
@@ -385,8 +255,7 @@ func encodePageRef(dst []byte, ref PageRef) {
 	binary.LittleEndian.PutUint64(dst[16:24], ref.Generation)
 	binary.LittleEndian.PutUint32(dst[24:28], ref.Length)
 	dst[28] = byte(ref.Kind)
-	dst[29] = ref.Flags
-	binary.LittleEndian.PutUint16(dst[30:32], ref.Aux)
+	clear(dst[29:32])
 }
 
 func decodePageRef(src []byte) PageRef {
@@ -396,13 +265,11 @@ func decodePageRef(src []byte) PageRef {
 		Generation: binary.LittleEndian.Uint64(src[16:24]),
 		Length:     binary.LittleEndian.Uint32(src[24:28]),
 		Kind:       PageKind(src[28]),
-		Flags:      src[29],
-		Aux:        binary.LittleEndian.Uint16(src[30:32]),
 	}
 }
 
 func pageRefReservedZero(src []byte) bool {
-	return binary.LittleEndian.Uint16(src[30:PageRefSize]) == 0
+	return allZero(src[29:PageRefSize])
 }
 
 func validateStateRoot(root StateRoot, fileEnd uint64) error {
@@ -429,8 +296,7 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	if fileEnd < layout.DataStart || fileEnd > maxSuperblockFileOffset || fileEnd%pageSize != 0 {
 		return fmt.Errorf("%w: state file high-water mark", ErrInvalidWrite)
 	}
-	hasCatalog := root.IndexCount != 0 ||
-		root.Options&(StateOptionFloat64Columns|StateOptionSchema) != 0
+	hasCatalog := root.IndexCount != 0 || root.Options&StateOptionSchema != 0
 	hasExactCatalog := root.PageCatalogBytes != 0
 	if !validPhysicalPageSize(root.MaxPageSize) ||
 		root.MaxPageSize < root.PageSize ||
@@ -461,20 +327,11 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 		root.PageCatalogBytes > PageCatalogMaxCanonicalBytes {
 		return fmt.Errorf("%w: canonical catalog identity", ErrInvalidWrite)
 	}
-	if root.ChunkDocuments == 0 || root.ChunkDocuments > 64 ||
-		root.LiveChunks > root.ChunkHighWater ||
-		root.FreeChunkHint > root.ChunkHighWater ||
-		root.NextLogicalID <= StateRootLogicalID {
+	if root.NextLogicalID == 0 {
 		return fmt.Errorf("%w: state counts", ErrInvalidWrite)
 	}
-	primarySelected := root.PrimaryRoot != (PageRef{})
-	if root.LiveChunks == 0 {
-		if root.DocumentCount != 0 && !primarySelected {
-			return fmt.Errorf("%w: documents without chunks", ErrInvalidWrite)
-		}
-	} else if root.DocumentCount < uint64(root.LiveChunks) ||
-		root.DocumentCount > uint64(root.LiveChunks)*uint64(root.ChunkDocuments) {
-		return fmt.Errorf("%w: document/chunk counts", ErrInvalidWrite)
+	if root.DocumentCount != 0 && root.PrimaryRoot == (PageRef{}) {
+		return fmt.Errorf("%w: documents without primary root", ErrInvalidWrite)
 	}
 
 	if err := validateStatePrimaryRoot(root, fileEnd); err != nil {
@@ -542,7 +399,7 @@ func validateStatePrimaryRoot(root StateRoot, fileEnd uint64) error {
 		return err
 	}
 	length := uint64(ref.Length)
-	if ref.Kind != PagePrimaryCatalog || ref.Flags != 0 || ref.Aux != 0 ||
+	if ref.Kind != PagePrimaryCatalog ||
 		ref.Length != GlobalTabletCatalogRootBytes ||
 		root.MaxPageSize < ref.Length ||
 		ref.Generation == 0 || ref.Generation > root.Generation ||
@@ -633,9 +490,9 @@ func validateStatePageRef(ref PageRef, kind PageKind, required bool, root StateR
 	if err != nil {
 		return err
 	}
-	if ref.Kind != kind || ref.Flags != 0 || ref.Aux != 0 || ref.Length != root.PageSize ||
+	if ref.Kind != kind || ref.Length != root.PageSize ||
 		ref.Generation == 0 || ref.Generation > root.Generation ||
-		ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
+		ref.LogicalID == 0 || ref.LogicalID >= root.NextLogicalID ||
 		ref.Offset < layout.DataStart || ref.Offset%pageSize != 0 ||
 		ref.Offset > maxSuperblockFileOffset || ref.Offset > fileEnd-pageSize {
 		return fmt.Errorf("%w: invalid %d root reference", ErrInvalidWrite, kind)

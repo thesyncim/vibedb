@@ -152,7 +152,5 @@ func canonicalPageHeaderMatchesRef(header PageHeader, ref PageRef, storeID [16]b
 	return header.StoreID == storeID &&
 		header.PageSize == ref.Length &&
 		header.LogicalID == ref.LogicalID &&
-		header.Generation == ref.Generation &&
-		header.Kind == ref.Kind &&
-		header.Flags == ref.Flags
+		header.Generation == ref.Generation && header.Kind == ref.Kind
 }

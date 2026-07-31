@@ -45,7 +45,6 @@ type VerifyReport struct {
 	RootSlot    int
 	Generation  uint64
 	FileEnd     uint64
-	Primary     bool
 	Documents   int
 	FreeExtents int
 	// PageCounts records how many pages of each kind the walk validated.
@@ -96,7 +95,6 @@ func Verify(file *os.File) (VerifyReport, error) {
 	report.RootSlot = slot
 	report.Generation = root.Generation
 	report.FileEnd = inline.FileEnd
-	report.Primary = root.PrimaryRoot != (storeio.PageRef{})
 
 	w := &verifyWalker{
 		file:        file,
@@ -120,18 +118,14 @@ func Verify(file *os.File) (VerifyReport, error) {
 	}
 
 	w.walkStateRefs()
-	if report.Primary {
+	if root.PrimaryRoot == (storeio.PageRef{}) {
+		w.fail("root", 0, 0, "collection has no ordered-primary root")
+	} else {
 		w.walkPrimary()
 	}
 	if root.ExactIndexRoot != (storeio.PageRef{}) {
 		w.walkExactIndexes()
 	}
-	// Legacy chunk/fingerprint primaries (PrimaryRoot zero) have their recovery
-	// root, every top-level directory/catalog root, and free set proven above and
-	// below; their interior document-page graph is validated by the online Open
-	// path and is not deep-walked here. This is the going-forward store's inverse:
-	// the ordered primary graph gets the exhaustive interior walk because it is
-	// the format the salvage property depends on.
 	w.checkReachableOverlap()
 	w.walkFreeSet(&inline.FreeDelta)
 	return report, nil
@@ -414,8 +408,8 @@ func (w *verifyWalker) openAndCheckIdentity(
 // publishes and the immutable page-catalog run. The primary root's subtree is
 // walked separately by walkPrimary.
 func (w *verifyWalker) walkStateRefs() {
-	// The chunk/fingerprint root slots are gone; the ordered-primary graph and
-	// its exact-index root are walked by walkPrimary and walkExactIndexes.
+	// The ordered-primary graph and its exact-index root are walked by
+	// walkPrimary and walkExactIndexes.
 	w.walkPageCatalog()
 }
 

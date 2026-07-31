@@ -17,7 +17,7 @@ const (
 	// residual document recheck instead of forcing an unbounded index key.
 	IndexTermMaxKeyBytes = 4096
 
-	indexTermKeyVersion    = byte(1)
+	indexTermKeyVersion    = byte(DevelopmentFormatVersion)
 	indexTermKeyTerminator = byte(0)
 )
 

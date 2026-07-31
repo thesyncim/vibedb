@@ -38,7 +38,7 @@ func checkedFileFreeScratchCounts(
 		foldExtents,
 		maxRetired,
 		maxTransaction,
-		fileStorePointFingerprintRetirePages,
+		fileStorePointPrimaryRetirePages,
 		1,
 		storeio.FreeLogMaxChainPages,
 		storeio.FreeLogMaxIndexPages,

@@ -154,6 +154,28 @@ func (s *Session) SetCancelFlag(flag *query.CancelFlag) error {
 	return nil
 }
 
+// SetResultLimits configures the maximum materialized rows and bytes for one
+// query result. Zero selects the query package default and -1 disables the
+// corresponding limit. Configure a session before preparing or executing
+// statements.
+func (s *Session) SetResultLimits(rows int, bytes int64) error {
+	if err := s.live(); err != nil {
+		return err
+	}
+	if rows < -1 || bytes < -1 {
+		return errors.New("vibedb: result limits must be -1, zero, or positive")
+	}
+	if s.current != nil {
+		return ErrCursorOpen
+	}
+	if s.state != SessionIdle {
+		return ErrTransactionActive
+	}
+	s.conn.exec.Options.ResultRows = rows
+	s.conn.exec.Options.ResultBytes = bytes
+	return nil
+}
+
 // Prepare parses and lowers one statement exactly once.
 //
 // An error while a transaction is active moves the session to

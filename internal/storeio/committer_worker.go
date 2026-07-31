@@ -166,42 +166,6 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 			}
 			c.commitScratch = out
 		}
-		// Every grouped generation contains a checksummed PageStateRoot, but
-		// the single alternate superblock committed below can name only the
-		// newest one. Earlier state pages are never consulted by live
-		// snapshots (which retain decoded roots), so suppressing them is safe.
-		// Other same-logical-id pages are deliberately retained: an
-		// intermediate snapshot may still need their physical generations.
-		//
-		// The one intermediate root that must still be written is the one
-		// holding the group's highest extent. The superblock publishes a
-		// FileEnd covering every extent this group allocated, and recovery
-		// rejects a store whose file is shorter than its own FileEnd as
-		// truncated. Dropping the only write that reaches that high leaves a
-		// file that is exactly one page short of the root it just published,
-		// which is unopenable rather than merely stale.
-		latestState := -1
-		highest := uint64(0)
-		for index := range c.commitScratch {
-			write := c.commitScratch[index]
-			if write.kind == PageStateRoot {
-				latestState = index
-			}
-			highest = max(highest, uint64(write.Offset)+uint64(write.Length))
-		}
-		if latestState >= 0 {
-			out := c.commitScratch[:0]
-			for index, write := range c.commitScratch {
-				extends := uint64(write.Offset)+uint64(write.Length) == highest
-				if write.kind == PageStateRoot && index != latestState && !extends {
-					c.suppressedRootWrites.Add(1)
-					c.suppressedRootBytes.Add(uint64(write.Length))
-					continue
-				}
-				out = append(out, write)
-			}
-			c.commitScratch = out
-		}
 		slices.SortFunc(c.commitScratch, func(a, b Write) int {
 			if a.Offset < b.Offset {
 				return -1
@@ -213,7 +177,8 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 		})
 		// Always preserve the last durable superblock as the recovery fallback.
 		// Grouping may publish generation N+2 directly over durable N, so the
-		// generation-derived slot prepared by SetSuperblock is not authoritative.
+		// The generation-derived slot prepared by SetInlineSuperblock is not
+		// authoritative.
 		// Toggle only after Device.Commit completes both durability barriers.
 		rootSlot := c.nextRootSlot.Load()
 		if latest.rootGeneration != 0 {

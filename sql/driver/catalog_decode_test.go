@@ -22,24 +22,34 @@ func TestCatalogDecoderRejectsUnknownAndDuplicateMembers(t *testing.T) {
 		want string
 	}{
 		{
+			name: "missing version zero",
+			raw:  `{"tables":{}}`,
+			want: `missing member "version"`,
+		},
+		{
+			name: "missing tables",
+			raw:  `{"version":0}`,
+			want: `missing member "tables"`,
+		},
+		{
 			name: "unknown root",
-			raw:  `{"version":2,"tables":{},"future":true}`,
+			raw:  `{"version":0,"tables":{},"future":true}`,
 			want: `unknown member "future"`,
 		},
 		{
 			name: "duplicate root",
-			raw:  `{"version":2,"version":2,"tables":{}}`,
+			raw:  `{"version":0,"version":0,"tables":{}}`,
 			want: `duplicate member "version"`,
 		},
 		{
 			name: "duplicate table name",
-			raw: `{"version":2,"tables":{"docs":` + validTable +
+			raw: `{"version":0,"tables":{"docs":` + validTable +
 				`,"docs":` + validTable + `}}`,
 			want: `duplicate member "docs"`,
 		},
 		{
 			name: "unknown table metadata",
-			raw: `{"version":2,"tables":{"docs":{
+			raw: `{"version":0,"tables":{"docs":{
 				"primary_key":"/id",
 				"future":true,
 				"schema":{"root":64,"fields":[
@@ -50,7 +60,7 @@ func TestCatalogDecoderRejectsUnknownAndDuplicateMembers(t *testing.T) {
 		},
 		{
 			name: "duplicate primary key",
-			raw: `{"version":2,"tables":{"docs":{
+			raw: `{"version":0,"tables":{"docs":{
 				"primary_key":"/id",
 				"primary_key":"/other",
 				"schema":{"root":64,"fields":[
@@ -61,7 +71,7 @@ func TestCatalogDecoderRejectsUnknownAndDuplicateMembers(t *testing.T) {
 		},
 		{
 			name: "unknown schema field metadata",
-			raw: `{"version":2,"tables":{"docs":{
+			raw: `{"version":0,"tables":{"docs":{
 				"primary_key":"/id",
 				"schema":{"root":64,"fields":[
 					{"path":"/id","types":16,"required":true,"future":0}
@@ -71,7 +81,7 @@ func TestCatalogDecoderRejectsUnknownAndDuplicateMembers(t *testing.T) {
 		},
 		{
 			name: "duplicate index metadata",
-			raw: `{"version":2,"tables":{"docs":{
+			raw: `{"version":0,"tables":{"docs":{
 				"primary_key":"/id",
 				"schema":{"root":64,"fields":[
 					{"path":"/id","types":16,"required":true}
@@ -120,7 +130,7 @@ func TestCatalogDecoderAcceptsCanonicalEncoding(t *testing.T) {
 
 func TestCatalogOpenRejectsInvalidUTF8BeforeJSONNormalization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.vdb")
-	raw := []byte(`{"version":2,"tables":{"bad`)
+	raw := []byte(`{"version":0,"tables":{"bad`)
 	raw = append(raw, 0xff)
 	raw = append(raw, []byte(`":{
 		"primary_key":"/id",

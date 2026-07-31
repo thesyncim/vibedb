@@ -204,8 +204,7 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateActiveSQLTransaction, err.Error())
 	case errors.Is(err, sqldriver.ErrCursorOpen):
 		return newError(sqlstateObjectNotInPrereqState, err.Error())
-	case errors.Is(err, sqldriver.ErrIndexLayoutFrozen),
-		errors.Is(err, sqldriver.ErrIndexBuildInProgress):
+	case errors.Is(err, sqldriver.ErrIndexBuildInProgress):
 		return newError(sqlstateObjectNotInPrereqState, err.Error())
 	case errors.Is(err, sqldriver.ErrReadOnlyTransaction):
 		return newError(sqlstateReadOnlyTransaction, err.Error())

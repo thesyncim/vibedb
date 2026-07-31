@@ -131,9 +131,6 @@ func TestFilePrimaryBufferedUnifiedOverlay(t *testing.T) {
 	if created, err := collection.Put([]byte(keys[500]), third); err != nil || created {
 		t.Fatalf("third update = %v,%v", created, err)
 	}
-	if collection.Stats().BufferedInplaceUpdates != 0 {
-		t.Fatal("class-5 overlay unexpectedly used the retired in-place lane")
-	}
 	assertPrimaryRaw(t, collection, keys[500], third, true)
 	state := collection.state.Load()
 	buffer := make([]byte, 0, 128)
@@ -1030,11 +1027,9 @@ func runPrimaryMutationDifferential(
 		}
 		// A deferred canonical-frame lane — buffered-visible or the journal-backed
 		// synchronous lane — keeps mutations in volatile frames until a checkpoint,
-		// so the persistent-graph page-walk only reflects them after a Flush. The
-		// old per-mutation-durable-root sync contract is retired, so sync now
-		// follows the same cadence as buffered here. A non-deferred lane (async
-		// visible) publishes a full generation per mutation, so its persistent
-		// graph reflects every mutation immediately.
+		// so the persistent-graph page-walk only reflects them after a Flush. A
+		// non-deferred lane publishes a full generation per mutation, so its
+		// persistent graph reflects every mutation immediately.
 		deferred := collection.deferredCanonicalLane()
 		if !deferred || operation%64 == 63 {
 			if deferred {

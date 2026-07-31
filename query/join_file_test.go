@@ -29,10 +29,10 @@ import (
 // covered by store/durable's own reliability and crash tests.
 func durableJoinOptions(indexes ...store.IndexDefinition) durable.Options {
 	return durable.Options{
-		Collection:       store.Options{ChunkDocuments: 2},
-		Indexes:          indexes,
-		PageSize:         4096,
-		MaxPageSize:      64 << 10,
+		Collection:  store.Options{ChunkDocuments: 2},
+		Indexes:     indexes,
+		PageSize:    4096,
+		MaxPageSize: 64 << 10,
 		// Retain the unified class-5 overlay and the bounded exact-index staging
 		// window. Individual eviction tests tighten this while remaining above
 		// the admitted worst-case point transaction.

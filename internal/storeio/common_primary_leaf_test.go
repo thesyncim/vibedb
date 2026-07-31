@@ -393,54 +393,6 @@ func TestCommonPrimaryLeafMutations(t *testing.T) {
 	}
 }
 
-func TestCommonPrimaryLeafPromotedUpdatePreservesSlots(t *testing.T) {
-	records := commonPrimaryLeafTestRecords(
-		t, CommonPrimaryLeafNarrow, 100, 8,
-	)
-	_, view, ref, bounds := commonPrimaryLeafOpenTest(
-		t, CommonPrimaryLeafNarrow, CommonPrimaryLeafNarrowBytes, records,
-	)
-	target := records[40]
-	large := CommonPrimaryLeafValue{
-		Inline: bytes.Repeat([]byte{'x'}, 3_000),
-	}
-	if _, err := view.UpdateTo(
-		make([]byte, CommonPrimaryLeafNarrowBytes),
-		ref.Generation+1, target.Slot, target.Key, large,
-	); !errors.Is(err, ErrCommonPrimaryLeafNeedsWide) {
-		t.Fatalf("narrow update = %v, want %v", err, ErrCommonPrimaryLeafNeedsWide)
-	}
-	promoted, err := PromoteCommonPrimaryLeafUpdateTo(
-		make([]byte, CommonPrimaryLeafWideBytes),
-		ref.Generation+1, &view, target.Slot, target.Key, large,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	promotedRef := ref
-	promotedRef.Generation++
-	promotedRef.Length = CommonPrimaryLeafWideBytes
-	promotedView, err := OpenCommonPrimaryLeaf(
-		promoted, commonPrimaryLeafTestSeed, view.header.Bucket,
-		promotedRef, promotedRef.Generation, bounds,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if value, ok := promotedView.LookupSlot(
-		target.Slot, target.Key,
-	); !ok || !bytes.Equal(value.Inline, large.Inline) {
-		t.Fatal("promoted update not visible in stable slot")
-	}
-	for _, record := range records {
-		if _, ok := promotedView.LookupSlot(
-			record.Slot, record.Key,
-		); !ok {
-			t.Fatalf("promotion moved stable slot %d", record.Slot)
-		}
-	}
-}
-
 func TestCommonPrimaryLeafMutationCanonical(t *testing.T) {
 	for _, test := range []struct {
 		name     string

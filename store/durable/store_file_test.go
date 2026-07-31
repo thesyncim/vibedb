@@ -380,21 +380,6 @@ func TestFileStoreExclusiveWriterLease(t *testing.T) {
 	}
 }
 
-// TestFileStoreDurabilitySyncWritersShareFence was retired with the shared
-// device fence it asserted. Concurrent synchronous writers used to converge on
-// one root fence, so several Puts could coalesce into a single device commit
-// (LargestCommitGroup >= 2) and the intermediate root writes they elided were
-// counted as suppressed. The current synchronous contract is per-Put journal
-// acks: each Put appends its own redo record and syncs it, so sixteen writers
-// produce sixteen groups of one (JournalAcks == writers, LargestCommitGroup ==
-// 1) and there is no shared fence to coalesce and no suppressed root to count.
-// Asserting group-commit convergence against that contract can only fail.
-//
-// The shared fence returns as the parallel-writers P1 group-commit gate
-// (docs/design/parallel-tablet-writers.md), which reintroduces a batched
-// device commit across concurrent writers on an explicit gate rather than as an
-// emergent property of the commit queue. This coverage returns with it.
-
 func TestCreateFileStoreRequiresEmptyFile(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-nonempty-*")
 	if err != nil {
@@ -545,13 +530,13 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforePinned := fs.state.Load().super.FileEnd
+	beforePinned := fs.state.Load().fileEnd
 	for version := 1; version <= 20; version++ {
 		if _, err := fs.Put([]byte("hot"), []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	afterPinned := fs.state.Load().super.FileEnd
+	afterPinned := fs.state.Load().fileEnd
 	if afterPinned <= beforePinned {
 		t.Fatalf("active snapshot did not fence reuse: fileEnd %d -> %d", beforePinned, afterPinned)
 	}
@@ -567,13 +552,13 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	plateau := fs.state.Load().super.FileEnd
+	plateau := fs.state.Load().fileEnd
 	for version := 41; version <= 80; version++ {
 		if _, err := fs.Put([]byte("hot"), []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := fs.state.Load().super.FileEnd; got != plateau {
+	if got := fs.state.Load().fileEnd; got != plateau {
 		t.Fatalf("copy-on-write file did not plateau: %d -> %d", plateau, got)
 	}
 	if got, ok, err := fs.AppendRaw(nil, []byte("hot")); err != nil || !ok || string(got) != `{"version":80}` {

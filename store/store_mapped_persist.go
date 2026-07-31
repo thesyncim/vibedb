@@ -9,9 +9,7 @@ import (
 
 // This file holds the few zero-copy helpers the memory-mapped document reader
 // (store_mapped_docs.go, store_owned_documents.go, store_document_template.go)
-// shares. The legacy Segment image serializer that once defined them was
-// removed with the chunk layout; these helpers outlive it because the mapped
-// reader still projects posting entries and aligns record sections.
+// shares. They project posting entries and align record sections.
 
 // A document record's storage class, recorded in its header: a classic tape, a
 // 16-byte shape-taped value array, or an 8-byte narrow value array. The mapped

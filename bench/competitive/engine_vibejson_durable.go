@@ -80,9 +80,7 @@ func (v *vibeDurable) Tuning() string {
 		"MaxBatchDocuments=1 and MaxDocumentBytes=1 KiB because this harness exposes only point mutations over a corpus whose largest document is below that bound; the restriction cuts worst-case staging reservation without changing any measured value; " +
 		"BufferCount=1024, QueueSlots=1024, GroupLimit=64 (buffered-visible normalizes the physical checkpoint group to QueueSlots). The default BufferCount is sized for the collection's " +
 		"worst-case transaction geometry; the explicit pool keeps this workload's staging capacity stable. " +
-		"This tuning was originally justified by a " +
-		"25-35x faster Put and that figure does not currently reproduce — BenchmarkPointWriteDurableDefaults measures " +
-		"the pair and RESULTS.md reports what it is worth today, which is far less. " +
+		"BenchmarkPointWriteDurableDefaults measures the tuned/default pair directly. " +
 		"CommitCoalesce=0, i.e. no acknowledged-latency-for-throughput trade. " +
 		"CreateFromPrimary emits the sole canonical class-5 representation"
 }
@@ -253,15 +251,12 @@ func (v *vibeDurable) primaryBulkOptions() durable.Options {
 // snapshot lazily opens, and then caches, the read snapshot the scan and
 // filter workloads run against.
 //
-// It is lazy, and Put drops it, for a reason worth recording: an open durable
+// It is lazy, and Put drops it, because an open durable
 // snapshot holds a lease that pins retired extents, and a store written to
 // while a snapshot stays open exhausts Options.MaxRetiredExtents and fails
 // with "retired extent capacity exhausted". Holding one open across a
-// long-running write loop — which an earlier version of this harness did —
-// takes roughly thirteen thousand replacements to hit at the default bound.
-// That is a genuine operational hazard for a reader that keeps a snapshot for
-// the lifetime of a request handler, but it is not what the point-write
-// benchmark is supposed to be measuring, so the write path holds no snapshot.
+// long-running write loop can exhaust the configured bound. The point-write
+// benchmark therefore holds no snapshot across a write.
 func (v *vibeDurable) snapshot() (*durable.Snapshot, error) {
 	if v.snap != nil {
 		return v.snap, nil

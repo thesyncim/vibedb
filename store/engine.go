@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/storekey"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -183,12 +184,12 @@ func (c *Collection) WithBulkSnapshot(fn func(state *State) error) error {
 // fields describe that generation; the unexported fields track how much of it
 // is borrowed from a mapped source versus owned Go heap.
 type State struct {
-	Generation uint64
-	Count      int
-	ChunkCount uint32
+	Generation   uint64
+	Count        int
+	ChunkCount   uint32
 	seed         maphash.Seed
 	StateOptions StateOptions
-	keys         *storeKeyNode
+	keys         *storekey.Node
 	// baseKeys is the compact immutable directory created by Builder. keys is
 	// then only the path-copied overlay for later insertions and moved keys.
 	baseKeys *storeMappedKeys
@@ -689,19 +690,6 @@ func rebuildStoreChunkSchema(
 	)
 }
 
-func cloneStoreChunk(
-	options StateOptions,
-	postings bool,
-	old *Chunk,
-) (*Chunk, error) {
-	if old == nil {
-		return nil, nil
-	}
-	return buildStoreChunk(
-		options, postings, old, old.Live, -1, "", nil,
-	)
-}
-
 // Key returns the document key stored at the given physical slot. The result
 // is borrowed: it aliases the chunk's owned key slice or the underlying mapped
 // source and stays valid only while this chunk generation is reachable.
@@ -757,12 +745,12 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 		if schema := c.options.Schema; schema != nil {
 			chunk, err = rebuildStoreChunkSchema(
 				state.StateOptions, schema,
-				c.postingsRequiredLocked(), old, int(loc.Slot),
+				c.options.Postings, old, int(loc.Slot),
 				storedKey, src,
 			)
 		} else {
 			chunk, err = rebuildStoreChunk(
-				state.StateOptions, c.postingsRequiredLocked(), old,
+				state.StateOptions, c.options.Postings, old,
 				int(loc.Slot), storedKey, src, true,
 			)
 		}
@@ -791,12 +779,12 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 	var chunk *Chunk
 	if schema := c.options.Schema; schema != nil {
 		chunk, err = rebuildStoreChunkSchema(
-			state.StateOptions, schema, c.postingsRequiredLocked(),
+			state.StateOptions, schema, c.options.Postings,
 			old, slot, key, src,
 		)
 	} else {
 		chunk, err = rebuildStoreChunk(
-			state.StateOptions, c.postingsRequiredLocked(), old,
+			state.StateOptions, c.options.Postings, old,
 			slot, key, src, true,
 		)
 	}
@@ -812,7 +800,7 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 	next.Generation++
 	next.Count++
 	loc = Location{Chunk: chunkID, Slot: uint8(slot)}
-	next.keys = storeKeyInsert(state.keys, hash, key, loc)
+	next.keys = storekey.Insert(state.keys, hash, key, loc)
 	if chunkID == state.Chunks.Count {
 		next.Chunks, _ = state.Chunks.append(chunk)
 	} else {
@@ -914,11 +902,9 @@ type Snapshot struct {
 	state *State
 }
 
-// Len returns the number of keys visible in s.
 // Chunks reports the snapshot's live chunk count, the unit the query work
-// budget charges scan admission by. Count is a high-water figure that
-// includes recycled chunks, so the live set is counted by iteration exactly
-// as the retired zone-statistics accessor did.
+// budget charges scan admission by. The vector's Count is a high-water figure
+// that includes recycled chunks, so this method counts the live set directly.
 func (s Snapshot) Chunks() int {
 	if s.state == nil {
 		return 0
@@ -931,6 +917,7 @@ func (s Snapshot) Chunks() int {
 	return chunks
 }
 
+// Len returns the number of keys visible in s.
 func (s Snapshot) Len() int {
 	if s.state == nil {
 		return 0
@@ -1028,14 +1015,4 @@ func (c *Collection) GetRaw(key string) (vibejson.RawValue, bool) {
 func (c *Collection) Get(key string) (vibejson.Index, bool) {
 	snap, _ := c.Snapshot()
 	return snap.Get(key)
-}
-
-// postingsRequiredLocked includes online index builds in addition to the
-// representation selected at construction. store_index.go supplies the
-// dynamic half; this default keeps the core independent when no DDL exists.
-func (c *Collection) postingsRequiredLocked() bool {
-	if c.options.Postings {
-		return true
-	}
-	return c.hasPostingsIndexLocked()
 }

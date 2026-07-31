@@ -111,7 +111,7 @@ func TestFileOverlayMergesWritesOverIndexedSnapshot(t *testing.T) {
 	if err := q.RunInto(&e, FromFileOverlay(snapshot, &source)); err != nil {
 		t.Fatal(err)
 	}
-	if got := resultKey(e.Result); got != "|id\n48:0|\n48:4|\n" {
+	if got := resultKey(e.Result); got != "|id\n3:0|\n3:4|\n" {
 		t.Fatalf("merged result = %q, want 0 and 4", got)
 	}
 	if !e.Stats.IndexBounded || e.Stats.IndexLookups == 0 {

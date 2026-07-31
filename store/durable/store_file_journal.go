@@ -649,7 +649,6 @@ func (c *Collection) bufferedJournalDeltaStateEligible(
 	return c.bufferedJournalDeltaStagingCovered(coveredGeneration) &&
 		len(c.primaryPendingParents) == 0 &&
 		len(c.primaryVolatileRetired) == 0 &&
-		len(c.bufferedFirstTouches) == 0 &&
 		len(c.primaryMutationAdmitted) == 0 &&
 		len(c.batchPrimaryAdmitted) == 0
 }

@@ -97,7 +97,7 @@ func TestCommitterPersistenceFailurePhasesPoisonWriterAndReportOutcome(t *testin
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if err := committer.InitializeGeneration(1); err != nil {
+			if err := committer.InitializeRecovery(1, 0, 1); err != nil {
 				t.Fatal(err)
 			}
 
@@ -172,7 +172,7 @@ func TestCommitterWaitAcknowledgesOnlyAfterDurableCallback(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := committer.InitializeGeneration(1); err != nil {
+	if err := committer.InitializeRecovery(1, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	publishTestGeneration(
@@ -251,7 +251,7 @@ func TestCommitterWaitSettlesFailureCallbackWithoutBlockingAdmission(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := committer.InitializeGeneration(1); err != nil {
+	if err := committer.InitializeRecovery(1, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	publishTestGeneration(

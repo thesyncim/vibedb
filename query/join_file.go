@@ -427,19 +427,6 @@ func (f *fileJoinSide) reset() {
 	f.batchRows = 0
 }
 
-// release drops every buffer the side retains.
-func (f *fileJoinSide) release() {
-	f.reset()
-	f.index.Release()
-	f.docs.Reset()
-	f.data = nil
-	f.ends = nil
-	f.keys = nil
-	f.keyText = nil
-	f.overflow = nil
-	f.masks = nil
-}
-
 // bindFileJoins is bindJoins for a durable driving side: it resolves every
 // clause against a durable catalog and fills w's bindings, so the driving
 // scan's predInBound leaves are either a membership it can search or a probe it

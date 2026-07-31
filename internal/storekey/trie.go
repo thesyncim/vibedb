@@ -16,7 +16,6 @@ package storekey
 const (
 	trieBits        = 5
 	keyBucketShift  = 10 // The third fixed level consumes bits 10..14.
-	FixedBits       = 15
 	keyLeafBucket   = 2
 	keyBranchFactor = 1 << trieBits
 )
