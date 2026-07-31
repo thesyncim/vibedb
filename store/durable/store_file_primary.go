@@ -526,6 +526,10 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 	)
 	c.primaryUnifiedBuilder = storeio.NewUnifiedPrimaryLeafBuilder()
 	if overlay := c.primaryUnifiedOverlay; overlay != nil {
+		c.primaryUnifiedReplacementScratch = make(
+			[]storeio.CommonPrimaryUnifiedReplacement,
+			0, primaryUnifiedOverlayRecords,
+		)
 		indexEntries := min(c.options.InlineValueBytes+2, 8192)
 		indexEntries = max(indexEntries, 64)
 		c.primaryUnifiedIndexScratch = make(

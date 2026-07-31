@@ -24,6 +24,16 @@ func journalDeltaTestOptions() Options {
 	return o
 }
 
+// The journal-delta corpus toggles one exact-indexed scalar. Every replacement
+// can consume two exact term records (remove old, add new), so its device-silent
+// fold cadence is bounded by both the primary record overlay and the exact term
+// record overlay. Keep pressure tests tied to those production constants rather
+// than assuming the primary overlay is always the first arena exhausted.
+const journalDeltaTestPressureMutations = min(
+	primaryUnifiedOverlayRecords,
+	primaryExactOverlayTermRecordCap/2,
+)
+
 func journalDeltaGroupDoc(at, group int) []byte {
 	return fmt.Appendf(nil,
 		`{"id":%d,"kind":"document","group":%d,"active":%t,`+
@@ -88,7 +98,15 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 	ordinary := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, ordinaryOptions,
 	)
-	const wantDeltaCapacity = uint64(1) << 20
+	ordinaryHeader := ordinary.journal.Header()
+	completeOverlayBatch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		ordinaryHeader.SectorSize, primaryUnifiedOverlayRecords,
+		len(ordinary.primaryUnifiedOverlay.arena),
+	))
+	wantDeltaCapacity := min(
+		max(2*completeOverlayBatch, recoveryJournalDeltaMinCapacityBytes),
+		recoveryJournalMaxCapacityBytes,
+	)
 	if got := ordinary.journal.Header().Capacity; got != wantDeltaCapacity {
 		t.Fatalf("ordinary delta journal capacity = %d, want %d",
 			got, wantDeltaCapacity)
@@ -99,9 +117,9 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 	ack := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, ackOptions,
 	)
-	if got := ack.journal.Header().Capacity; got <= wantDeltaCapacity {
+	if got := ack.journal.Header().Capacity; got <= completeOverlayBatch {
 		t.Fatalf("per-mutation ack journal capacity = %d, want > %d",
-			got, wantDeltaCapacity)
+			got, completeOverlayBatch)
 	}
 }
 
@@ -479,7 +497,7 @@ func TestBufferedJournalDeltaCrashReplayAndClose(t *testing.T) {
 // staged root. Neither fold is a forced persistence boundary.
 func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 	const checkpointEvery = 64
-	const mutations = primaryUnifiedOverlayRecords*2 + checkpointEvery*2
+	const mutations = journalDeltaTestPressureMutations*2 + checkpointEvery*2
 
 	options := journalDeltaTestOptions()
 	coll := buildTemplateHeavyOverlayCollection(
@@ -615,7 +633,7 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 	const (
 		documents       = 320
 		checkpointEvery = 64
-		mutations       = primaryUnifiedOverlayRecords*2 + checkpointEvery
+		mutations       = journalDeltaTestPressureMutations*2 + checkpointEvery
 	)
 	options := journalDeltaTestOptions()
 	options.QueueSlots = 4
@@ -784,18 +802,23 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 }
 
 // TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay uses a checkpoint
-// cadence that does not divide the 256-record overlay. The first pressure fold
-// therefore carries generations 201..256 without syncing; the next scheduled
-// Flush appends 257..300 and fences both batches once. A crash may lose the
-// unsynced carry and recover generation 200, or retain its complete bytes and
-// recover generation 256. After Flush it must recover exactly generation 300.
-// Repeating through a second pressure fold proves the appended watermark keeps
-// each interval consecutive across recycled overlay arenas.
+// cadence that does not divide the effective indexed-overlay mutation window.
+// The first pressure fold therefore carries the suffix after the preceding
+// scheduled Flush without syncing; the next scheduled Flush appends the rest
+// and fences both batches once. A crash may lose that unsynced carry and recover
+// the preceding scheduled cut, or retain its complete bytes and recover the
+// pressure cut. Repeating through a second pressure fold proves the appended
+// watermark keeps each interval consecutive across recycled overlay arenas.
 func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 	const (
-		documents       = 320
-		checkpointEvery = 100
-		mutations       = 600
+		documents             = 320
+		checkpointEvery       = 100
+		pressure              = journalDeltaTestPressureMutations
+		durableBeforeMutation = pressure / checkpointEvery * checkpointEvery
+		durableAfterMutation  = (pressure + checkpointEvery - 1) /
+			checkpointEvery * checkpointEvery
+		mutations = (2*pressure + checkpointEvery - 1) /
+			checkpointEvery * checkpointEvery
 	)
 	options := journalDeltaTestOptions()
 	getFault, restoreFault := installJournalFaultSeam(t)
@@ -827,11 +850,11 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 		generation uint64
 	}
 	var (
-		durable200 crashCut
-		carried256 crashCut
-		durable300 crashCut
-		carryCuts  []uint64
-		lastSyncs  = fault.Syncs()
+		durableBefore crashCut
+		carriedFirst  crashCut
+		durableAfter  crashCut
+		carryCuts     []uint64
+		lastSyncs     = fault.Syncs()
 	)
 	previousCarryHook := recoveryJournalDeltaCarryHook
 	defer func() { recoveryJournalDeltaCarryHook = previousCarryHook }()
@@ -841,8 +864,8 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 				target, lastSyncs, got)
 		}
 		carryCuts = append(carryCuts, target)
-		if target == baseGeneration+256 {
-			carried256 = crashCut{
+		if target == baseGeneration+pressure {
+			carriedFirst = crashCut{
 				image:      captureJournalImage(t, path),
 				want:       cloneStringMap(want),
 				groups:     cloneIntMap(groups),
@@ -890,16 +913,16 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 			generation: target,
 		}
 		switch mutation {
-		case 200:
-			durable200 = cut
-		case 300:
-			durable300 = cut
+		case durableBeforeMutation:
+			durableBefore = cut
+		case durableAfterMutation:
+			durableAfter = cut
 		}
 	}
 
 	if got, expected := carryCuts, []uint64{
-		baseGeneration + 256,
-		baseGeneration + 512,
+		baseGeneration + pressure,
+		baseGeneration + 2*pressure,
 	}; !slices.Equal(got, expected) {
 		t.Fatalf("carry generations = %v, want %v", got, expected)
 	}
@@ -928,20 +951,20 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 
 	// Losing the unsynced append is legal buffered-visible behavior.
 	assertJournalDeltaImage(
-		t, options, durable200.image, durable200.want, durable200.groups,
-		durable200.generation, "non-aligned/lost-carry",
+		t, options, durableBefore.image, durableBefore.want, durableBefore.groups,
+		durableBefore.generation, "non-aligned/lost-carry",
 	)
 	// If the complete unsynced append reached storage, its framed batch is a
 	// valid recoverable prefix even though no explicit durability was promised.
 	assertJournalDeltaImage(
-		t, options, carried256.image, carried256.want, carried256.groups,
-		carried256.generation, "non-aligned/retained-carry",
+		t, options, carriedFirst.image, carriedFirst.want, carriedFirst.groups,
+		carriedFirst.generation, "non-aligned/retained-carry",
 	)
 	// The following explicit Flush must make both the carried batch and its
 	// remaining suffix durable through the exact target generation and index.
 	assertJournalDeltaImage(
-		t, options, durable300.image, durable300.want, durable300.groups,
-		durable300.generation, "non-aligned/post-flush",
+		t, options, durableAfter.image, durableAfter.want, durableAfter.groups,
+		durableAfter.generation, "non-aligned/post-flush",
 	)
 
 	if err := coll.Close(); err != nil {
@@ -981,7 +1004,7 @@ func TestBufferedJournalDeltaTornUnsyncedCarryTruncates(t *testing.T) {
 	keyString := templateHeavyOverlayKey(20)
 	key := []byte(keyString)
 
-	for mutation := 1; mutation <= primaryUnifiedOverlayRecords; mutation++ {
+	for mutation := 1; mutation <= journalDeltaTestPressureMutations; mutation++ {
 		group := 40 + mutation&1
 		raw := journalDeltaGroupDoc(20, group)
 		if created, err := coll.Put(key, raw); err != nil || created {
@@ -1006,8 +1029,9 @@ func TestBufferedJournalDeltaTornUnsyncedCarryTruncates(t *testing.T) {
 	}
 	baselineWant := cloneStringMap(want)
 	baselineGroups := cloneIntMap(groups)
-	// The oracle above includes mutations 101..256, which were not explicitly
-	// flushed. Reconstruct the exact generation-100 value for the recovery cut.
+	// The oracle above includes mutations after checkpointEvery through the
+	// pressure boundary, which were not explicitly flushed. Reconstruct the
+	// exact last-scheduled-Flush value for the recovery cut.
 	baselineRaw := journalDeltaGroupDoc(20, 40+checkpointEvery&1)
 	baselineWant[keyString] = journalDeltaCanonical(t, baselineRaw)
 	baselineGroups[keyString] = 40 + checkpointEvery&1
@@ -1039,17 +1063,17 @@ func TestBufferedJournalDeltaTornUnsyncedCarryTruncates(t *testing.T) {
 
 // TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush exercises the
 // recovery branch materializePrimaryParentsLocked uses when committer staging
-// is exhausted. A generation-256 heap root is staged, the journal is explicitly
-// durable through generation 320, generations 321..337 are carried unsynced,
-// and the older generation-256 root is then flushed. That physical flush must
-// not recycle the newer journal or regress either watermark. Recovery without
-// the carry still reaches 320; after the current overlay is materialized,
-// explicit Flush fences the carry without appending it twice and recovery
-// reaches the exact indexed generation-337 cut.
+// is exhausted. One effective pressure window is staged, the journal is made
+// explicitly durable through another 64 generations, and 17 more generations
+// are carried unsynced before the older staged root is flushed. That physical
+// flush must not recycle the newer journal or regress either watermark.
+// Recovery without the carry still reaches the explicitly durable cut; after
+// the current overlay is materialized, Flush fences the carry without appending
+// it twice and recovery reaches the exact indexed target.
 func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 	const (
 		documents = 320
-		mutations = primaryUnifiedOverlayRecords + 64 + 17
+		mutations = journalDeltaTestPressureMutations + 64 + 17
 	)
 	options := journalDeltaTestOptions()
 	getFault, restoreFault := installJournalFaultSeam(t)
@@ -1071,9 +1095,9 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 	keyString := templateHeavyOverlayKey(20)
 	key := []byte(keyString)
 	var (
-		durableWant320    map[string]string
-		durableGroups320  map[string]int
-		durableJournal320 []byte
+		durableWantCut    map[string]string
+		durableGroupsCut  map[string]int
+		durableJournalCut []byte
 	)
 
 	for mutation := 1; mutation <= mutations; mutation++ {
@@ -1084,16 +1108,16 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 		}
 		want[keyString] = journalDeltaCanonical(t, raw)
 		groups[keyString] = group
-		if mutation <= primaryUnifiedOverlayRecords+64 &&
+		if mutation <= journalDeltaTestPressureMutations+64 &&
 			mutation%64 == 0 {
 			if err := coll.Flush(); err != nil {
 				t.Fatalf("aligned Flush %d: %v", mutation/64, err)
 			}
-			if mutation == primaryUnifiedOverlayRecords+64 {
-				durableWant320 = cloneStringMap(want)
-				durableGroups320 = cloneIntMap(groups)
+			if mutation == journalDeltaTestPressureMutations+64 {
+				durableWantCut = cloneStringMap(want)
+				durableGroupsCut = cloneIntMap(groups)
 				var readErr error
-				durableJournal320, readErr =
+				durableJournalCut, readErr =
 					os.ReadFile(path + ".rjournal")
 				if readErr != nil {
 					t.Fatal(readErr)
@@ -1109,9 +1133,9 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 		t.Fatalf("staged/journal/current generation = %d/%d/%d, want deltas 64/17",
 			stagedGeneration, journalDurable, target)
 	}
-	if durableWant320 == nil || durableGroups320 == nil ||
-		durableJournal320 == nil {
-		t.Fatal("generation-320 durable crash cut was not captured")
+	if durableWantCut == nil || durableGroupsCut == nil ||
+		durableJournalCut == nil {
+		t.Fatal("explicitly durable crash cut was not captured")
 	}
 
 	beforeAppends, beforeSyncs := fault.Appends(), fault.Syncs()
@@ -1149,7 +1173,7 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 			got, journalBase)
 	}
 	lostCarryImage := journalDeltaImageBeforeSync(
-		t, path, durableJournal320,
+		t, path, durableJournalCut,
 	)
 	if err := coll.materializePrimaryParentsLocked(); err != nil {
 		coll.writer.Unlock()
@@ -1169,7 +1193,7 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 			got, journalDurable)
 	}
 	assertJournalDeltaImage(
-		t, options, lostCarryImage, durableWant320, durableGroups320,
+		t, options, lostCarryImage, durableWantCut, durableGroupsCut,
 		journalDurable, "staged-exhaustion/lost-carry",
 	)
 
@@ -1296,7 +1320,7 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 		baseGroups[templateHeavyOverlayKey(at)] = at % 37
 	}
 	key := []byte(templateHeavyOverlayKey(20))
-	for mutation := 1; mutation <= primaryUnifiedOverlayRecords; mutation++ {
+	for mutation := 1; mutation <= journalDeltaTestPressureMutations; mutation++ {
 		if _, err := coll.Put(
 			key, journalDeltaGroupDoc(20, 40+mutation&1),
 		); err != nil {
@@ -1356,9 +1380,9 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 
 // TestBufferedJournalDeltaSyncFailureIsSticky proves the logical durable
 // watermark advances only after the journal barrier. Pressure first carries a
-// complete 256-generation window without syncing; Flush then appends its
-// one-record suffix before the failed barrier. The appended watermark may reach
-// the target, but the durable watermark does not, and every later
+// complete effective indexed-overlay window without syncing; Flush then appends
+// its one-record suffix before the failed barrier. The appended watermark may
+// reach the target, but the durable watermark does not, and every later
 // write/checkpoint/Close returns the same poison.
 func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	options := journalDeltaTestOptions()
@@ -1370,7 +1394,7 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 		t.Fatal("journal fault seam was not installed")
 	}
 	key := []byte(templateHeavyOverlayKey(20))
-	for mutation := 1; mutation <= primaryUnifiedOverlayRecords+1; mutation++ {
+	for mutation := 1; mutation <= journalDeltaTestPressureMutations+1; mutation++ {
 		if _, err := coll.Put(
 			key, journalDeltaGroupDoc(20, 40+mutation&1),
 		); err != nil {
@@ -1452,7 +1476,7 @@ func TestBufferedJournalDeltaCloseFoldsUnsyncedCarry(t *testing.T) {
 	keyString := templateHeavyOverlayKey(20)
 	key := []byte(keyString)
 	beforeSyncs := fault.Syncs()
-	for mutation := 1; mutation <= primaryUnifiedOverlayRecords+1; mutation++ {
+	for mutation := 1; mutation <= journalDeltaTestPressureMutations+1; mutation++ {
 		group := 40 + mutation&1
 		raw := journalDeltaGroupDoc(20, group)
 		if _, err := coll.Put(key, raw); err != nil {
@@ -1462,9 +1486,9 @@ func TestBufferedJournalDeltaCloseFoldsUnsyncedCarry(t *testing.T) {
 		groups[keyString] = group
 	}
 	target := coll.Generation()
-	if target != baseGeneration+primaryUnifiedOverlayRecords+1 {
+	if target != baseGeneration+journalDeltaTestPressureMutations+1 {
 		t.Fatalf("target generation = %d, want %d",
-			target, baseGeneration+primaryUnifiedOverlayRecords+1)
+			target, baseGeneration+journalDeltaTestPressureMutations+1)
 	}
 	if got := coll.journalDeltaAppendedGeneration.Load(); got != target-1 {
 		t.Fatalf("pressure appended generation = %d, want %d", got, target-1)
@@ -1612,10 +1636,13 @@ func TestBufferedJournalDeltaIneligibleMutationsPhysicallyFold(t *testing.T) {
 }
 
 // TestBufferedJournalDeltaOverlayPressureCarriesUnsynced fills one complete
-// class-5 overlay window and publishes one more mutation. Pressure must append
-// the complete old window without syncing, device-silently fold it, and retain
-// the final mutation in the new overlay. Flush appends that one-record suffix
-// and fences both batches with exactly one Sync.
+// effective indexed-overlay window and publishes one more mutation. Pressure
+// must append the complete old window without syncing, device-silently fold it,
+// and retain the final mutation in the new overlay. Flush appends that one-record
+// suffix and fences both batches with exactly one Sync. If one worst-case batch
+// consumes the complete bounded journal, Flush must instead take the stronger
+// physical drain: after a carried prefix there is mathematically no room to
+// retain the required complete future-window reserve.
 func TestBufferedJournalDeltaOverlayPressureCarriesUnsynced(t *testing.T) {
 	options := journalDeltaTestOptions()
 	getFault, restoreFault := installJournalFaultSeam(t)
@@ -1631,7 +1658,7 @@ func TestBufferedJournalDeltaOverlayPressureCarriesUnsynced(t *testing.T) {
 	second := journalDeltaGroupDoc(20, 41)
 	before := coll.committer.DurableGeneration()
 	beforeSyncs := fault.Syncs()
-	for i := range primaryUnifiedOverlayRecords + 1 {
+	for i := range journalDeltaTestPressureMutations + 1 {
 		value := first
 		if i&1 != 0 {
 			value = second
@@ -1660,6 +1687,13 @@ func TestBufferedJournalDeltaOverlayPressureCarriesUnsynced(t *testing.T) {
 		t.Fatalf("pressure issued %d journal sync(s), want 0",
 			got-beforeSyncs)
 	}
+	header := coll.journal.Header()
+	futureBytes := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		header.SectorSize, primaryUnifiedOverlayRecords,
+		len(coll.primaryUnifiedOverlay.arena),
+	))
+	remaining := header.Capacity - coll.journal.Cursor()
+	physicalDrainRequired := futureBytes > remaining
 	firstCanonical := []byte(journalDeltaCanonical(t, first))
 	if got, found, err := coll.AppendRaw(nil, key); err != nil || !found ||
 		!bytes.Equal(got, firstCanonical) {
@@ -1669,8 +1703,12 @@ func TestBufferedJournalDeltaOverlayPressureCarriesUnsynced(t *testing.T) {
 	if err := coll.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if got := coll.committer.DurableGeneration(); got != before {
-		t.Fatalf("pressure Flush physical durable = %d, want %d", got, before)
+	wantPhysical := before
+	if physicalDrainRequired {
+		wantPhysical = target
+	}
+	if got := coll.committer.DurableGeneration(); got != wantPhysical {
+		t.Fatalf("pressure Flush physical durable = %d, want %d", got, wantPhysical)
 	}
 	if coll.DurableGeneration() != target ||
 		coll.journalDeltaAppendedGeneration.Load() != target {

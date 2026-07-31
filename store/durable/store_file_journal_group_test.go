@@ -42,6 +42,48 @@ func openJournalGroupCollection(t *testing.T, options Options) (*Collection, str
 	return coll, path
 }
 
+// TestRecoveryJournalReaderForcedTransactionalAck covers the buffered-journal
+// acknowledgement when an active reader diverts Put from the canonical-frame
+// lane into the transactional COW path. A successful return must still have one
+// durable acknowledgement and must recover the mutation from an immediate
+// crash image without relying on Flush or Close.
+func TestRecoveryJournalReaderForcedTransactionalAck(t *testing.T) {
+	options := journalTestOptions(CheckpointFilesystem)
+	coll, path := openJournalGroupCollection(t, options)
+
+	snapshot, err := coll.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	defer snapshot.Close()
+
+	before := coll.Stats()
+	key := []byte("reader-fallback")
+	value := []byte(`{"v":1}`)
+	if _, err := coll.Put(key, value); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	after := coll.Stats()
+	acks := after.JournalAcks - before.JournalAcks +
+		after.ChainAcks - before.ChainAcks
+	if acks != 1 {
+		t.Fatalf("durable acknowledgements=%d, want 1", acks)
+	}
+
+	image := captureJournalImage(t, path)
+	result := verifyJournalCrashImage(
+		t, options, image,
+		[]map[string]string{{
+			"seed":            `{"v":0}`,
+			"reader-fallback": `{"v":1}`,
+		}},
+		"reader-forced transactional acknowledgement",
+	)
+	if result != "recovered" {
+		t.Fatalf("crash-image result=%s, want recovered", result)
+	}
+}
+
 // TestRecoveryJournalGroupCommitSharesSync proves the phase-1 amortization: when
 // concurrent buffered-journal callers deposit under the writer and share one
 // journal sync, one fence covers many records instead of one each — and every

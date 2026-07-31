@@ -278,21 +278,19 @@ func freeChurnRound(t *testing.T, fs *Collection, keys, round int) {
 // single hot key retires few enough extents per commit that one edit keeps up,
 // and the loss never appears.
 //
-// The bound is calibrated from the store's own accounting rather than chosen,
-// because a ratio is not a test here: the defect also inflates the
-// single-session file, so before this change eight sessions were 2.26x one
-// session at 4.54 MiB, and after it they are 2.52x one session at 1.02 MiB. The
-// honest question is not how the two files compare to each other but what a
-// restart is allowed to cost, and the only thing a restart may still cost is
-// ExtentReclaimer's pending set: extents retired too recently for the alternate
-// superblock to have let go, which live in memory and are not written down by
-// this change. Everything else — every extent the free set had already accepted
-// — must survive, and the difference between the two is what this asserts.
+// The bound is calibrated from physical recovery geometry rather than a ratio.
+// The wider row overlay makes Close one complete primary cut: for this asserted
+// one-leaf workload, one maximum leaf plus four bucket-local parent levels and
+// the global catalog root. The alternate-root recovery window may retain two
+// such cuts. It may not grow once those two generations settle, and already
+// accepted free extents must still survive every restart.
 func TestFileStoreFreeSetSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 	const (
-		keys     = 48
-		rounds   = 8
-		sessions = 8
+		keys                       = 48
+		rounds                     = 8
+		sessions                   = 8
+		recoveryGenerations        = 2
+		primaryParentsAndRootPages = 5
 	)
 	options := testFileStoreOptions()
 	options.ResidentBytes = 8 << 20
@@ -310,6 +308,14 @@ func TestFileStoreFreeSetSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 	}
 	for round := range rounds {
 		freeChurnRound(t, oneSession, keys, round)
+	}
+	router := oneSession.primaryRouter.Load()
+	if router == nil {
+		t.Fatal("restart-growth fixture has no primary router")
+	}
+	if router.Len() != 1 {
+		t.Fatalf("restart-growth fixture routed across %d leaves, want exactly one",
+			router.Len())
 	}
 	if err := oneSession.Close(); err != nil {
 		t.Fatal(err)
@@ -329,6 +335,7 @@ func TestFileStoreFreeSetSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	abandoned := uint64(0)
+	settledSplitSize := int64(0)
 	for round := range sessions {
 		session, openErr := Open(split, options)
 		if openErr != nil {
@@ -340,17 +347,24 @@ func TestFileStoreFreeSetSurvivesRestartsWithoutGrowingTheFile(t *testing.T) {
 		if err := session.Close(); err != nil {
 			t.Fatalf("session %d close: %v", round, err)
 		}
+		size := fileSizeOf(t, split.Name())
+		if round == recoveryGenerations {
+			settledSplitSize = size
+		} else if round > recoveryGenerations && size != settledSplitSize {
+			t.Fatalf("session %d grew the settled split file from %d to %d bytes",
+				round, settledSplitSize, size)
+		}
 	}
 	splitSize := fileSizeOf(t, split.Name())
 
-	// One root page per restart plus one largest class-5 extent overall is the
-	// bounded geometry slack: each reopened store's first root may land before
-	// reclamation has anything to offer it, and the multi-session packing
-	// boundary may retain one alternate wide leaf that a continuous session
-	// reuses internally. Anything beyond that must be explained by extents still
-	// fenced at Close.
-	allowance := abandoned +
-		uint64(sessions*options.PageSize+options.MaxPageSize)
+	// Each recovery generation can retain one maximum leaf plus the four
+	// per-bucket parents and the global catalog root. The allowance is independent
+	// of session count; the explicit plateau assertion above rejects a store that
+	// merely remains below a generous final-size ceiling while leaking per open.
+	recoveryBytes := uint64(recoveryGenerations) *
+		(uint64(options.MaxPageSize) +
+			primaryParentsAndRootPages*uint64(options.PageSize))
+	allowance := abandoned + recoveryBytes
 	t.Logf("one session = %d bytes, %d sessions = %d bytes, excess %d, allowance %d "+
 		"(%d bytes of extents were still fenced across the eight Closes)",
 		singleSize, sessions, splitSize, splitSize-singleSize, allowance, abandoned)

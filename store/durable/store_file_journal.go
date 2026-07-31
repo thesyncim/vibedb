@@ -30,10 +30,10 @@ const recoveryJournalCheckpointRecords = 2048
 // large-value store cannot reserve an unbounded file or an unbounded replay.
 const (
 	recoveryJournalMinCapacityBytes = uint64(512) << 10
-	// The ordinary delta lane reserves one additional half MiB so a full
-	// future-carry headroom check rotates below 5% of CP64 boundaries. This
-	// keeps physical drains out of checkpoint p95 while adding only 512 KiB to
-	// the paired store footprint.
+	// The ordinary delta lane keeps a one-MiB floor for small overlays. Larger
+	// overlays derive a two-complete-window reservation below, so the cheap
+	// Flush lane and its required future pressure carry remain compatible as
+	// the record window changes.
 	recoveryJournalDeltaMinCapacityBytes = uint64(1) << 20
 	recoveryJournalMaxCapacityBytes      = storeio.RecoveryJournalMaxCapacityBytes
 )
@@ -173,7 +173,8 @@ func (c *Collection) journalSiblingPath() (string, error) {
 // re-derive its overflow chain. That single record can exceed the inline cadence
 // budget entirely, so the capacity is widened — never shrunk — to hold at least
 // one worst-case overflow record plus a checkpoint's slack. It is not sized as
-// 2048 overflow records: one must fit, the journal recycles at the next.
+// recoveryJournalCheckpointRecords overflow records: one must fit, the
+// journal recycles at the next.
 func recoveryJournalCapacityBytesFor(
 	sectorSize uint32, maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
 	deltaOverlayBytes int,
@@ -181,20 +182,25 @@ func recoveryJournalCapacityBytesFor(
 	if deltaOverlayBytes > 0 {
 		// Ordinary buffered-visible never deposits an overflow value or more
 		// records than the resident overlay can hold. The complete checkpoint
-		// batch is therefore bounded by the overlay's key+value arena plus one
-		// small entry header per record. Do not charge this lane the 2,048
-		// worst-case per-mutation acknowledgements reserved by the opt-in sync
-		// lane: that hidden preallocation would erase much of class-5's disk
-		// saving even though the bytes are unreachable.
-		capacity := uint64(deltaOverlayBytes) +
-			uint64(primaryUnifiedOverlayRecords*
-				storeio.RecoveryBatchEntryHeaderSize) +
-			storeio.RecoveryJournalRecordPrefixSize +
-			storeio.RecoveryJournalRecordTrailerSize
+		// batch is therefore bounded exactly by the overlay's key+value arena and
+		// record count. Reserve two such batches: one for the journal-only cuts
+		// already retained since the physical base, and one for the complete
+		// future carry that pressure must append before folding the resident
+		// overlay. bufferedJournalDeltaPhysicalDrainNeeded enforces the same
+		// two-window invariant; sizing only one window makes its future-reserve
+		// check reject even the first cheap Flush.
+		batch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
+			sectorSize, primaryUnifiedOverlayRecords, deltaOverlayBytes,
+		))
+		capacity := batch
+		if batch <= recoveryJournalMaxCapacityBytes/2 {
+			capacity = batch * 2
+		} else {
+			capacity = recoveryJournalMaxCapacityBytes
+		}
 		capacity = max(capacity, recoveryJournalDeltaMinCapacityBytes)
 		capacity = min(capacity, recoveryJournalMaxCapacityBytes)
-		sector := uint64(sectorSize)
-		return (capacity + sector - 1) / sector * sector
+		return capacity
 	}
 	recordUpper := storeio.RecoveryRecordPaddedSize(
 		sectorSize, maxKeyBytes, inlineValueBytes,
@@ -797,7 +803,7 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 
 	// Keep enough redo capacity for both this explicit Flush suffix and one
 	// complete future overlay carry. Without the future reserve, repeated CP64
-	// same-key windows fill the 512 KiB journal long before the physical queue or
+	// same-key windows fill the bounded journal long before the physical queue or
 	// dirty-frame guards fire; the next non-aligned pressure fold would then have
 	// to checkpoint from a mutation and be counted as automatic. The overlay's
 	// record and byte arenas are the exact admissibility bounds, so this is a

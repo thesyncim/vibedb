@@ -458,14 +458,8 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 	// an out-of-line value's full-length record and any later inline mutation are
 	// guaranteed to fit. This is the sync lane's checkpoint cadence, the journal
 	// analogue of pending-parent pressure above.
-	if c.syncJournalLane() &&
-		!c.journal.Fits(
-			c.options.MaxKeyBytes, max(c.options.InlineValueBytes, valueLen),
-		) {
-		if err := c.checkpointBufferedLocked(); err != nil {
-			return err
-		}
-		c.automaticCheckpoints.Add(1)
+	if _, err := c.ensureSyncJournalMutationRoomLocked(valueLen); err != nil {
+		return err
 	}
 	// A buffered overflow value holds its whole out-of-line chain as volatile dirty
 	// frames until checkpoint, so a run of large values would fill the cache with
@@ -490,6 +484,29 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 			storeio.CommonPrimaryLeafWideBytes,
 		),
 	)
+}
+
+// ensureSyncJournalMutationRoomLocked preserves journalBeforePublishLocked's
+// point-of-no-return contract for every canonical-frame shape, including the
+// unified overlay. A widened overlay can hold more logical replacements than
+// the journal can hold sector-padded records, so overlay pressure alone is not
+// a sufficient checkpoint cadence. Recycle before prepare/publish while a
+// capacity failure is still ordinary bounded backpressure rather than a
+// terminal append failure. The bool reports that routing state must be rebound
+// after the checkpoint.
+func (c *Collection) ensureSyncJournalMutationRoomLocked(
+	valueLen int,
+) (checkpointed bool, err error) {
+	if !c.syncJournalLane() || c.journal.Fits(
+		c.options.MaxKeyBytes, max(c.options.InlineValueBytes, valueLen),
+	) {
+		return false, nil
+	}
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return false, err
+	}
+	c.automaticCheckpoints.Add(1)
+	return true, nil
 }
 
 // validatePrimarySchema enforces the collection's declared schema before a Put
@@ -609,6 +626,14 @@ retryAfterUnifiedFold:
 	// the transactional path it writes no device bytes at Put and the checkpoint
 	// folds the chain into the durable graph.
 	canonicalPath := c.canonicalFramePathEligible()
+	journalCheckpointed := false
+	if canonicalPath {
+		journalCheckpointed, err =
+			c.ensureSyncJournalMutationRoomLocked(len(src))
+		if err != nil {
+			return false, err
+		}
+	}
 	if canonicalPath && !c.primaryUnifiedSeen &&
 		!canonicalCapacityEnsured {
 		if err := c.ensureBufferedPrimaryMutationCapacity(
@@ -617,6 +642,9 @@ retryAfterUnifiedFold:
 			return false, err
 		}
 		canonicalCapacityEnsured = true
+		journalCheckpointed = true
+	}
+	if journalCheckpointed {
 		state = c.state.Load()
 		if state == nil {
 			return false, ErrClosed
@@ -828,6 +856,21 @@ retryAfterUnifiedFold:
 	if filledEmpty && c.primaryRouter.Load().ClearEmpty(resident) {
 		c.removePrimaryEmptyLeaf()
 	}
+	// A buffered-visible recovery-journal mutation can reach the transactional
+	// path while a reader keeps the canonical-frame path fenced off. The
+	// transaction has published the new generation, but buffered-visible does
+	// not wait on the committer's root fence, so deposit the same post-publish
+	// redo record used by the canonical path before acknowledging the caller.
+	if c.buffered() {
+		target, ackErr := c.journalDepositLocked(
+			storeio.RecoveryRecordKindPut,
+			state.root.Generation+1, keyBytes, src,
+		)
+		if ackErr != nil {
+			return created, ackErr
+		}
+		journalTarget = target
+	}
 	// The journal-backed sync lane made this mutation durable with an append+sync
 	// inside cowPrimaryMutation, so it never takes the committer root fence; the
 	// outer generation stays zero. Async and buffered-with-reader publish through
@@ -883,6 +926,22 @@ retryAfterUnifiedDeleteFold:
 		return false, err
 	}
 	canonicalPath := c.canonicalFramePathEligible()
+	if canonicalPath {
+		checkpointed, roomErr := c.ensureSyncJournalMutationRoomLocked(0)
+		if roomErr != nil {
+			return false, roomErr
+		}
+		if checkpointed {
+			state = c.state.Load()
+			if state == nil {
+				return false, ErrClosed
+			}
+			resident, err = c.currentPrimaryResidentRoute(state, keyBytes)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
 	if canonicalPath {
 		leafLease, acquireErr :=
 			c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
@@ -1052,6 +1111,19 @@ retryAfterUnifiedDeleteFold:
 	}
 	if becameEmpty && c.primaryRouter.Load().MarkEmpty(resident) {
 		c.primaryEmptyLeaves.Add(1)
+	}
+	// Match the buffered Put fallback above: a reader-forced transactional delete
+	// still needs a post-publish redo record because buffered-visible never waits
+	// for the committer's durable-root fence.
+	if c.buffered() {
+		target, ackErr := c.journalDepositLocked(
+			storeio.RecoveryRecordKindDelete,
+			state.root.Generation+1, keyBytes, nil,
+		)
+		if ackErr != nil {
+			return true, ackErr
+		}
+		journalTarget = target
 	}
 	// The journal-backed sync lane made this delete durable inside
 	// cowPrimaryMutation; the outer generation stays zero and never takes the
@@ -1904,10 +1976,9 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			if c.primaryUnifiedOverlay.pendingBucket(
 				pending.leafRoute.Bucket,
 			) && pending.volatileRef.Offset < base.fileEnd {
-				var replacementStorage [primaryUnifiedOverlayRecords]storeio.CommonPrimaryUnifiedReplacement
 				replacements, allPuts, patchErr :=
 					c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
-						replacementStorage[:0],
+						c.primaryUnifiedReplacementScratch[:0],
 						pending.leafRoute.Bucket, generation,
 					)
 				if patchErr != nil {

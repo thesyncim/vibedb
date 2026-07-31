@@ -12,9 +12,13 @@ import (
 )
 
 const (
-	primaryUnifiedOverlayRecords = 256
+	// The record/hash window is deliberately wider than the distinct-bucket
+	// directory: replacement-heavy workloads can accumulate many generations
+	// across the same bounded set of dirty leaves before paying one fold. The
+	// hash table remains at 50% load at the record ceiling.
+	primaryUnifiedOverlayRecords = 4096
 	primaryUnifiedOverlayBuckets = filePrimaryPendingParentLimit
-	primaryUnifiedOverlayTable   = 512
+	primaryUnifiedOverlayTable   = 8192
 	// The bucket directory stays at <=50% load at the overlay's hard
 	// distinct-bucket limit. Open addressing therefore gives the mutation and
 	// scan lanes a bounded, allocation-free bucket lookup without the previous

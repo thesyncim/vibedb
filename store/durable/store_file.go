@@ -953,7 +953,31 @@ type Collection struct {
 	options      normalizedFileStoreOptions
 	storeID      [16]byte
 
-	writer sync.Mutex
+	// writer is the collection-wide mutation gate. Ordinary mutation,
+	// checkpoint, structural, and lifecycle paths retain its exclusive side;
+	// the narrow buffered existing-row overlay lane takes the shared side so its
+	// fallible staging can overlap across independent leaf buckets. Converting
+	// the existing gate, rather than adding a second checkpoint lock, makes every
+	// established writer.Lock site automatically fence the concurrent lane.
+	writer sync.RWMutex
+	// primaryOverlayPublish retains the unified overlay's single-producer
+	// contract while allowing validation, canonicalization, routing, and leaf
+	// inspection to run in parallel. Contended staged requests are flat-combined
+	// into consecutive generations under one reader fence; structural writers
+	// remain excluded by writer.
+	primaryOverlayPublish primaryConcurrentPublisher
+	// primaryConcurrentPressure elects one overflowed publisher request to take
+	// the exclusive fold/fallback path. The remaining pressure cohort retries the
+	// concurrent lane after that fold instead of stampeding writer.Lock.
+	primaryConcurrentPressure sync.Mutex
+	// primaryConcurrentStripes serialize the shared size/accounting state of one
+	// routed leaf. The full BucketID is mixed before selecting a stripe, so leaves
+	// inside one tablet do not collapse onto one writer token.
+	primaryConcurrentStripes *[primaryConcurrentStripeCount]primaryConcurrentStripe
+	// primaryConcurrentContexts is a fixed-count pool of writer-private JSON
+	// tape/canonicalization workspaces. It is nil for collections that cannot use
+	// the concurrent overlay lane.
+	primaryConcurrentContexts *primaryConcurrentContextPool
 	// mutationCombiner is a short, bounded arrival lane for synchronous
 	// unindexed primary mutations. It shares one journal barrier across a
 	// contended group and hands the group to the existing atomic Update path.
@@ -983,6 +1007,10 @@ type Collection struct {
 	// window for class-5 replacement updates. Its byte arena is carved out of
 	// Options.ResidentBytes; PageCache owns the remainder.
 	primaryUnifiedOverlay *primaryUnifiedOverlay
+	// primaryUnifiedReplacementScratch is the exclusive writer's bounded fold
+	// workspace. Keeping it on the collection avoids promoting a 4,096-entry
+	// stack array to the heap each time overlay pressure materializes a leaf.
+	primaryUnifiedReplacementScratch []storeio.CommonPrimaryUnifiedReplacement
 	// primaryUnifiedSeen is writer-owned lazy route metadata. Until the first
 	// class-5 leaf is observed, ordinary stores preserve their established
 	// capacity-before-acquire mutation order; afterwards class-5 routes may try
@@ -1096,14 +1124,18 @@ type Collection struct {
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
 
-	automaticCheckpoints          atomic.Uint64
-	primaryOverlayFolds           atomic.Uint64
-	retirementPressureCheckpoints atomic.Uint64
-	materializationAttempts       atomic.Uint64
-	materializationUpdates        atomic.Uint64
-	materializationFallbacks      atomic.Uint64
-	materializationSnapshotSkips  atomic.Uint64
-	materializationBusySkips      atomic.Uint64
+	automaticCheckpoints                 atomic.Uint64
+	primaryOverlayFolds                  atomic.Uint64
+	concurrentPrimaryReplaces            atomic.Uint64
+	concurrentPrimaryFallbacks           atomic.Uint64
+	concurrentPrimaryPublishGroups       atomic.Uint64
+	concurrentPrimaryLargestPublishGroup atomic.Uint64
+	retirementPressureCheckpoints        atomic.Uint64
+	materializationAttempts              atomic.Uint64
+	materializationUpdates               atomic.Uint64
+	materializationFallbacks             atomic.Uint64
+	materializationSnapshotSkips         atomic.Uint64
+	materializationBusySkips             atomic.Uint64
 	// journalAcks counts frame-deferred mutations made durable by a single journal
 	// append plus one sync, the redo lane's fast acknowledgement. chainAcks counts
 	// mutations whose durability instead came from a committer root fence — the
@@ -1369,6 +1401,23 @@ type Stats struct {
 	// device checkpoint; a later journal delta, explicit Flush, or Close supplies
 	// the crash-safety boundary.
 	PrimaryOverlayFolds uint64
+	// ConcurrentPrimaryReplaces counts existing inline rows published through
+	// the shared-writer, bucket-striped buffered lane. It advances only after the
+	// complete overlay/router/state publication, so qualification can detect a
+	// benchmark that silently fell back to the exclusive mutation path.
+	ConcurrentPrimaryReplaces uint64
+	// ConcurrentPrimaryFallbacks counts successful members of a concurrent
+	// pressure cohort that were elected to take the exclusive fold/retry path.
+	// Together with ConcurrentPrimaryReplaces it accounts for every successful
+	// operation admitted by the concurrent replacement entry lane.
+	ConcurrentPrimaryFallbacks uint64
+	// ConcurrentPrimaryPublishGroups counts non-empty replacement groups made
+	// visible by the concurrent publisher. Dividing ConcurrentPrimaryReplaces
+	// by this value yields its lifetime mean successful group size.
+	ConcurrentPrimaryPublishGroups uint64
+	// ConcurrentPrimaryLargestPublishGroup is the largest successful prefix
+	// made visible by one concurrent publisher group.
+	ConcurrentPrimaryLargestPublishGroup uint64
 	// RetirementPressureCheckpoints counts retirement-capacity events that
 	// forced an otherwise-unrequested checkpoint before retry.
 	RetirementPressureCheckpoints uint64
@@ -1432,8 +1481,13 @@ type Stats struct {
 	PrimarySplitMaxNS        uint64
 	PrimaryEmptyReclaimMaxNS uint64
 	// PrimaryMutationScratchBytes is the fixed leaf-promotion and raw
-	// segmented-root writer scratch, allocated only for PrimaryRoot stores.
+	// segmented-root writer scratch plus the bounded unified-fold replacement
+	// vector, allocated only for PrimaryRoot stores.
 	PrimaryMutationScratchBytes uint64
+	// ConcurrentPrimaryScratchBytes is the retained stripe directory, publisher
+	// handoff, and fixed writer-private canonicalization context pool for the
+	// eligible concurrent replacement lane. It is zero for ineligible stores.
+	ConcurrentPrimaryScratchBytes uint64
 	// Backend reports the durable write engine.
 	Backend Backend
 	// Durability reports acknowledgement and reader-visibility semantics.
@@ -1922,6 +1976,13 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		}
 		return nil, err
 	}
+	concurrentContexts := newPrimaryConcurrentContextPool(options)
+	var concurrentStripes *[primaryConcurrentStripeCount]primaryConcurrentStripe
+	if concurrentContexts != nil {
+		concurrentStripes = new(
+			[primaryConcurrentStripeCount]primaryConcurrentStripe,
+		)
+	}
 	collection := &Collection{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
 		primaryUnifiedOverlay: newPrimaryUnifiedOverlay(
@@ -1988,6 +2049,8 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		mutationCombiner: newPrimaryMutationCombiner(
 			options.QueueSlots, options.MaxBatchDocuments, options.MaxBatchBytes,
 		),
+		primaryConcurrentContexts: concurrentContexts,
+		primaryConcurrentStripes:  concurrentStripes,
 	}
 	if options.MaterializationDamageGranule != 0 {
 		imageArenaBytes := options.MaxPageSize + options.PageSize
@@ -2201,6 +2264,35 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
+	handled, concurrentErr := c.tryConcurrentPrimaryReplace(key, src)
+	if handled {
+		return false, nil
+	}
+	if errors.Is(concurrentErr, errConcurrentPrimaryPressure) {
+		// Exactly one member of a pressure cohort takes the exclusive fold/retry.
+		// Later members first retry the fast lane after that fold, so a full
+		// overlay cannot turn one combined group into N queued writer.Lock calls.
+		c.primaryConcurrentPressure.Lock()
+		handled, concurrentErr = c.tryConcurrentPrimaryReplace(key, src)
+		if handled {
+			c.primaryConcurrentPressure.Unlock()
+			return false, nil
+		}
+		if concurrentErr != nil &&
+			!errors.Is(concurrentErr, errConcurrentPrimaryPressure) {
+			c.primaryConcurrentPressure.Unlock()
+			return false, concurrentErr
+		}
+		created, err = c.putPrimaryWithSplit(key, src)
+		if err == nil {
+			c.concurrentPrimaryFallbacks.Add(1)
+		}
+		c.primaryConcurrentPressure.Unlock()
+		return created, err
+	}
+	if concurrentErr != nil {
+		return false, concurrentErr
+	}
 	if len(src) > 0 && c.shouldQueuePrimaryMutation(key, src) {
 		created, _, err = c.submitPrimaryMutation(
 			primaryMutationPut, key, src,
@@ -2357,6 +2449,9 @@ func (c *Collection) Snapshot() (*Snapshot, error) {
 	// a scan came up one row short of Len. This stages the cut but does not
 	// make it durable; Flush/Close keep that boundary.
 	if c.deferredCanonicalLane() && c.primaryRouter.Load() != nil {
+		if concurrentPrimaryExclusiveWaitHook != nil {
+			concurrentPrimaryExclusiveWaitHook("snapshot")
+		}
 		c.writer.Lock()
 		if len(c.primaryPendingParents) != 0 ||
 			c.primaryUnifiedOverlay.hasPending() {
@@ -2665,6 +2760,11 @@ func (c *Collection) Stats() Stats {
 	retired := c.reclaimer.Stats()
 	overlayCapacity, overlayResident, overlayDirty :=
 		c.primaryUnifiedOverlay.stats()
+	concurrentPrimaryScratch := c.primaryConcurrentContexts.capacityBytes()
+	if c.primaryConcurrentStripes != nil {
+		concurrentPrimaryScratch += uint64(unsafe.Sizeof(*c.primaryConcurrentStripes))
+		concurrentPrimaryScratch += uint64(unsafe.Sizeof(c.primaryOverlayPublish))
+	}
 	stats := Stats{
 		CapacityBytes:       cache.CapacityBytes + overlayCapacity,
 		ResidentBytes:       cache.ResidentBytes + overlayResident,
@@ -2685,51 +2785,57 @@ func (c *Collection) Stats() Stats {
 		),
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
-		SupersededRootWrites:          commit.SupersededRootWrites,
-		SupersededRootBytes:           commit.SupersededRootBytes,
-		TailWitnessWrites:             commit.TailWitnessWrites,
-		TailWitnessBytes:              commit.TailWitnessBytes,
-		PrewrittenPageWrites:          commit.PrewrittenPageWrites,
-		PrewrittenPageBytes:           commit.PrewrittenPageBytes,
-		AutomaticCheckpoints:          c.automaticCheckpoints.Load(),
-		PrimaryOverlayFolds:           c.primaryOverlayFolds.Load(),
-		RetirementPressureCheckpoints: c.retirementPressureCheckpoints.Load(),
-		DeviceBytes:                   commit.DeviceBytes,
-		MaterializedBatches:           commit.MaterializedBatches,
-		MaterializationJournalBytes:   commit.MaterializationJournalBytes,
-		MaterializationTargetBytes:    commit.MaterializationTargetBytes,
-		MaterializationFullWriteBytes: commit.MaterializationFullWriteBytes,
-		MaterializationBarriers:       commit.MaterializationBarriers,
-		MaterializationAttempts:       c.materializationAttempts.Load(),
-		MaterializationUpdates:        c.materializationUpdates.Load(),
-		MaterializationFallbacks:      c.materializationFallbacks.Load(),
-		MaterializationSnapshotSkips:  c.materializationSnapshotSkips.Load(),
-		MaterializationBusySkips:      c.materializationBusySkips.Load(),
-		JournalAcks:                   c.journalAcks.Load(),
-		ChainAcks:                     c.chainAcks.Load(),
-		JournalSyncs:                  c.journalSyncs.Load(),
-		JournalLargestGroup:           c.journalLargestGroup.Load(),
-		JournalDeltaCheckpoints:       c.journalDeltaCheckpoints.Load(),
-		JournalDeltaRecords:           c.journalDeltaRecords.Load(),
-		JournalDeltaBytes:             c.journalDeltaBytes.Load(),
-		JournalDeltaFullFallbacks:     c.journalDeltaFullFallbacks.Load(),
-		PrimaryLeafSplitRequired:      c.primaryLeafSplitRequired.Load(),
-		PrimaryEmptyLeaves:            c.primaryEmptyLeaves.Load(),
-		PrimaryLeafSplits:             c.primaryLeafSplits.Load(),
-		PrimaryEmptyReclaims:          c.primaryEmptyReclaims.Load(),
-		PrimaryMacroSplitRequired:     c.primaryMacroSplitRequired.Load(),
-		PrimarySplitMaxNS:             c.primarySplitMaxNS.Load(),
-		PrimaryEmptyReclaimMaxNS:      c.primaryEmptyReclaimMaxNS.Load(),
+		SupersededRootWrites:                 commit.SupersededRootWrites,
+		SupersededRootBytes:                  commit.SupersededRootBytes,
+		TailWitnessWrites:                    commit.TailWitnessWrites,
+		TailWitnessBytes:                     commit.TailWitnessBytes,
+		PrewrittenPageWrites:                 commit.PrewrittenPageWrites,
+		PrewrittenPageBytes:                  commit.PrewrittenPageBytes,
+		AutomaticCheckpoints:                 c.automaticCheckpoints.Load(),
+		PrimaryOverlayFolds:                  c.primaryOverlayFolds.Load(),
+		ConcurrentPrimaryReplaces:            c.concurrentPrimaryReplaces.Load(),
+		ConcurrentPrimaryFallbacks:           c.concurrentPrimaryFallbacks.Load(),
+		ConcurrentPrimaryPublishGroups:       c.concurrentPrimaryPublishGroups.Load(),
+		ConcurrentPrimaryLargestPublishGroup: c.concurrentPrimaryLargestPublishGroup.Load(),
+		RetirementPressureCheckpoints:        c.retirementPressureCheckpoints.Load(),
+		DeviceBytes:                          commit.DeviceBytes,
+		MaterializedBatches:                  commit.MaterializedBatches,
+		MaterializationJournalBytes:          commit.MaterializationJournalBytes,
+		MaterializationTargetBytes:           commit.MaterializationTargetBytes,
+		MaterializationFullWriteBytes:        commit.MaterializationFullWriteBytes,
+		MaterializationBarriers:              commit.MaterializationBarriers,
+		MaterializationAttempts:              c.materializationAttempts.Load(),
+		MaterializationUpdates:               c.materializationUpdates.Load(),
+		MaterializationFallbacks:             c.materializationFallbacks.Load(),
+		MaterializationSnapshotSkips:         c.materializationSnapshotSkips.Load(),
+		MaterializationBusySkips:             c.materializationBusySkips.Load(),
+		JournalAcks:                          c.journalAcks.Load(),
+		ChainAcks:                            c.chainAcks.Load(),
+		JournalSyncs:                         c.journalSyncs.Load(),
+		JournalLargestGroup:                  c.journalLargestGroup.Load(),
+		JournalDeltaCheckpoints:              c.journalDeltaCheckpoints.Load(),
+		JournalDeltaRecords:                  c.journalDeltaRecords.Load(),
+		JournalDeltaBytes:                    c.journalDeltaBytes.Load(),
+		JournalDeltaFullFallbacks:            c.journalDeltaFullFallbacks.Load(),
+		PrimaryLeafSplitRequired:             c.primaryLeafSplitRequired.Load(),
+		PrimaryEmptyLeaves:                   c.primaryEmptyLeaves.Load(),
+		PrimaryLeafSplits:                    c.primaryLeafSplits.Load(),
+		PrimaryEmptyReclaims:                 c.primaryEmptyReclaims.Load(),
+		PrimaryMacroSplitRequired:            c.primaryMacroSplitRequired.Load(),
+		PrimarySplitMaxNS:                    c.primarySplitMaxNS.Load(),
+		PrimaryEmptyReclaimMaxNS:             c.primaryEmptyReclaimMaxNS.Load(),
 		PrimaryMutationScratchBytes: uint64(
-			len(c.primaryLeafScratch) + len(c.primaryRootScratch),
-		),
-		Backend:            Backend(commit.Backend),
-		Durability:         c.options.Durability,
-		CheckpointStrength: c.options.CheckpointStrength,
-		ReadBackend:        Backend(cache.ReadBackend),
-		DirectReads:        c.directRead,
-		DirectWrites:       c.directWrite,
-		SnapshotCapacity:   leases.Capacity, ActiveSnapshots: leases.Active,
+			len(c.primaryLeafScratch)+len(c.primaryRootScratch),
+		) + uint64(cap(c.primaryUnifiedReplacementScratch))*
+			uint64(unsafe.Sizeof(storeio.CommonPrimaryUnifiedReplacement{})),
+		ConcurrentPrimaryScratchBytes: concurrentPrimaryScratch,
+		Backend:                       Backend(commit.Backend),
+		Durability:                    c.options.Durability,
+		CheckpointStrength:            c.options.CheckpointStrength,
+		ReadBackend:                   Backend(cache.ReadBackend),
+		DirectReads:                   c.directRead,
+		DirectWrites:                  c.directWrite,
+		SnapshotCapacity:              leases.Capacity, ActiveSnapshots: leases.Active,
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
 		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(c.reusable)),
@@ -2921,6 +3027,9 @@ func (c *Collection) Flush() error {
 		return ErrClosed
 	}
 	if c.buffered() {
+		if concurrentPrimaryExclusiveWaitHook != nil {
+			concurrentPrimaryExclusiveWaitHook("flush")
+		}
 		c.writer.Lock()
 		defer c.writer.Unlock()
 		if c.closed {
