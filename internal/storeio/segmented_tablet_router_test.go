@@ -229,7 +229,6 @@ func TestSegmentedTabletRouterUsesExactCommonAnchorEnvelope(t *testing.T) {
 		pageHeader.PageSize != SegmentedTabletRouterAnchorPageBytes ||
 		pageHeader.PayloadLength != segmentedTabletRouterAnchorPayloadBytes ||
 		pageHeader.Kind != PagePrimaryAnchor ||
-		pageHeader.Flags != 0 ||
 		len(payload) != segmentedTabletRouterAnchorPayloadBytes {
 		t.Fatalf("common anchor header = %+v, payload=%d", pageHeader, len(payload))
 	}
@@ -246,8 +245,7 @@ func TestSegmentedTabletRouterUsesExactCommonAnchorEnvelope(t *testing.T) {
 }
 
 func TestSegmentedTabletRouterLogicalIDNamespace(t *testing.T) {
-	if SegmentedTabletRouterStateRootLogicalID != 1 ||
-		SegmentedTabletRouterLeafLogicalIDBase != 2 ||
+	if SegmentedTabletRouterLeafLogicalIDBase != 1 ||
 		SegmentedTabletRouterLeafLogicalIDLimit !=
 			SegmentedTabletRouterAnchorLogicalIDBase ||
 		SegmentedTabletRouterAnchorLogicalIDLimit !=
@@ -257,8 +255,7 @@ func TestSegmentedTabletRouterLogicalIDNamespace(t *testing.T) {
 		SegmentedTabletRouterAnchorLogicalIDLimit >=
 			SegmentedTabletRouterFirstDynamicLogicalID {
 		t.Fatalf(
-			"namespace boundaries state=%d leaf=[%d,%d) anchor=[%d,%d) dynamic=%d",
-			SegmentedTabletRouterStateRootLogicalID,
+			"namespace boundaries leaf=[%d,%d) anchor=[%d,%d) dynamic=%d",
 			SegmentedTabletRouterLeafLogicalIDBase,
 			SegmentedTabletRouterLeafLogicalIDLimit,
 			SegmentedTabletRouterAnchorLogicalIDBase,
@@ -303,7 +300,6 @@ func TestSegmentedTabletRouterLogicalIDNamespace(t *testing.T) {
 		t.Fatal("out-of-range anchor page accepted")
 	}
 	ids := []uint64{
-		SegmentedTabletRouterStateRootLogicalID,
 		leafZero, leafMax, anchorZero, anchorMax,
 		SegmentedTabletRouterFirstDynamicLogicalID,
 	}
@@ -336,11 +332,9 @@ func TestSegmentedTabletRouterRejectsCollidingLogicalIDs(t *testing.T) {
 		)
 		return err
 	}
-	bucket := segmentedTabletRouterTestBucket(leaves[0].Ref)
 	for name, logicalID := range map[string]uint64{
-		"state-root-as-leaf":     SegmentedTabletRouterStateRootLogicalID,
-		"legacy-bucket-plus-one": uint64(bucket) + 1,
-		"anchor-range-as-leaf":   SegmentedTabletRouterAnchorLogicalIDBase,
+		"zero-as-leaf":         0,
+		"anchor-range-as-leaf": SegmentedTabletRouterAnchorLogicalIDBase,
 	} {
 		t.Run(name, func(t *testing.T) {
 			leaves[0].Ref.LogicalID = logicalID
@@ -351,8 +345,8 @@ func TestSegmentedTabletRouterRejectsCollidingLogicalIDs(t *testing.T) {
 		})
 	}
 	for name, logicalID := range map[string]uint64{
-		"state-root-as-anchor": SegmentedTabletRouterStateRootLogicalID,
-		"legacy-tablet-page": uint64(header.TabletID)*
+		"zero-as-anchor": 0,
+		"tablet-derived-anchor": uint64(header.TabletID)*
 			SegmentedTabletRouterMaxPages + 1,
 		"leaf-range-as-anchor": SegmentedTabletRouterLeafLogicalIDBase,
 	} {
@@ -722,9 +716,9 @@ func TestSegmentedTabletRouterRejectsCorruption(t *testing.T) {
 			sealPage: -1,
 		},
 		{
-			name: "legacy-root-version",
+			name: "nonzero-root-version",
 			edit: func(root, _, _ []byte) {
-				binary.LittleEndian.PutUint32(root[8:12], 2)
+				binary.LittleEndian.PutUint32(root[8:12], 1)
 			},
 			sealRoot: true, sealPage: -1,
 		},
@@ -787,16 +781,16 @@ func TestSegmentedTabletRouterRejectsCorruption(t *testing.T) {
 			sealPage: -1,
 		},
 		{
-			name: "legacy-common-anchor-version",
+			name: "nonzero-common-anchor-version",
 			edit: func(_, _, pages []byte) {
-				binary.LittleEndian.PutUint16(pages[8:10], pageVersion-1)
+				binary.LittleEndian.PutUint16(pages[8:10], 1)
 			},
 			sealPage: 0,
 		},
 		{
-			name: "legacy-private-anchor-envelope",
+			name: "anchor-magic",
 			edit: func(_, _, pages []byte) {
-				copy(pages[:8], "STRPAGE1")
+				pages[0] ^= 1
 			},
 			sealPage: 0,
 		},

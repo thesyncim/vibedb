@@ -11,8 +11,8 @@ const testOverflowNextLogicalID = uint64(100)
 func testOverflowHeader(logicalID, offset, total uint64, next PageRef) OverflowPageHeader {
 	return OverflowPageHeader{
 		StoreID: testStoreID, Generation: 11, LogicalID: logicalID,
-		PageSize: testSuperblockPageSize, Chunk: 7, Slot: 5,
-		Total: total, Offset: offset, Next: next,
+		PageSize: testSuperblockPageSize,
+		Total:    total, Offset: offset, Next: next,
 	}
 }
 
@@ -38,11 +38,11 @@ func TestOverflowPageChainRoundTrip(t *testing.T) {
 		}
 		header := testOverflowHeader(refs[i].LogicalID, offset, 12, next)
 		page := make([]byte, testSuperblockPageSize)
-		encoded, err := EncodeOverflowPage(page, header, piece, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64)
+		encoded, err := EncodeOverflowPage(page, header, piece, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize)
 		if err != nil {
 			t.Fatal(err)
 		}
-		view, err := OpenOverflowPage(encoded, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64)
+		view, err := OpenOverflowPage(encoded, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,13 +67,13 @@ func TestOverflowPageExactQuantumExtents(t *testing.T) {
 		page := make([]byte, header.PageSize)
 		if _, err := EncodeOverflowPage(
 			page, header, data, fileEnd, testOverflowNextLogicalID,
-			testSuperblockPageSize, 8, 64,
+			testSuperblockPageSize,
 		); err != nil {
 			t.Fatalf("%d-page EncodeOverflowPage: %v", pages, err)
 		}
 		view, err := OpenOverflowPage(
 			page, fileEnd, testOverflowNextLogicalID,
-			testSuperblockPageSize, 8, 64,
+			testSuperblockPageSize,
 		)
 		if err != nil || view.Header() != header ||
 			len(view.Data()) != len(data) {
@@ -89,7 +89,7 @@ func TestOverflowPageExactQuantumExtents(t *testing.T) {
 	page := make([]byte, header.PageSize)
 	if _, err := EncodeOverflowPage(
 		page, header, []byte("1234"), uint64(32*testSuperblockPageSize),
-		testOverflowNextLogicalID, testSuperblockPageSize, 8, 64,
+		testOverflowNextLogicalID, testSuperblockPageSize,
 	); err != nil {
 		t.Fatalf("exact-extent continuation: %v", err)
 	}
@@ -101,9 +101,7 @@ func TestOverflowPageRejectsInvalidAndCorrupt(t *testing.T) {
 	valid := testOverflowHeader(10, 0, 8, validNext)
 	for _, mutate := range []func(*OverflowPageHeader, *[]byte){
 		func(h *OverflowPageHeader, _ *[]byte) { h.StoreID = [16]byte{} },
-		func(h *OverflowPageHeader, _ *[]byte) { h.LogicalID = StateRootLogicalID },
-		func(h *OverflowPageHeader, _ *[]byte) { h.Chunk = 8 },
-		func(h *OverflowPageHeader, _ *[]byte) { h.Slot = 64 },
+		func(h *OverflowPageHeader, _ *[]byte) { h.LogicalID = 0 },
 		func(h *OverflowPageHeader, _ *[]byte) { h.Total = 4 },
 		func(h *OverflowPageHeader, _ *[]byte) { h.Offset = 8 },
 		func(h *OverflowPageHeader, _ *[]byte) { h.Next.LogicalID = h.LogicalID },
@@ -114,26 +112,26 @@ func TestOverflowPageRejectsInvalidAndCorrupt(t *testing.T) {
 		data := []byte("1234")
 		mutate(&header, &data)
 		page := make([]byte, testSuperblockPageSize)
-		if _, err := EncodeOverflowPage(page, header, data, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64); !errors.Is(err, ErrInvalidWrite) {
+		if _, err := EncodeOverflowPage(page, header, data, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize); !errors.Is(err, ErrInvalidWrite) {
 			t.Fatalf("EncodeOverflowPage = %v, want %v", err, ErrInvalidWrite)
 		}
 	}
 
 	page := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeOverflowPage(page, valid, []byte("1234"), fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64); err != nil {
+	if _, err := EncodeOverflowPage(page, valid, []byte("1234"), fileEnd, testOverflowNextLogicalID, testSuperblockPageSize); err != nil {
 		t.Fatal(err)
 	}
 	for _, mutate := range []func([]byte){
 		func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:], 2) },
-		func(p []byte) { p[PageHeaderSize+7] = 1 },
-		func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize+12:], 3) },
-		func(p []byte) { binary.LittleEndian.PutUint64(p[PageHeaderSize+24:], 8) },
-		func(p []byte) { p[PageHeaderSize+32+29] = 1 },
+		func(p []byte) { p[PageHeaderSize+4] = 1 },
+		func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize+56:], 3) },
+		func(p []byte) { binary.LittleEndian.PutUint64(p[PageHeaderSize+48:], 8) },
+		func(p []byte) { p[PageHeaderSize+8+29] = 1 },
 	} {
 		corrupt := append([]byte(nil), page...)
 		mutate(corrupt)
 		resealTestPage(corrupt)
-		if _, err := OpenOverflowPage(corrupt, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64); !errors.Is(err, ErrOverflowPageCorrupt) {
+		if _, err := OpenOverflowPage(corrupt, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize); !errors.Is(err, ErrOverflowPageCorrupt) {
 			t.Fatalf("OpenOverflowPage = %v, want %v", err, ErrOverflowPageCorrupt)
 		}
 	}
@@ -145,10 +143,10 @@ func TestOverflowPageSteadyAllocation(t *testing.T) {
 	data := []byte("1234")
 	page := make([]byte, testSuperblockPageSize)
 	if allocs := testing.AllocsPerRun(1000, func() {
-		if _, err := EncodeOverflowPage(page, header, data, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64); err != nil {
+		if _, err := EncodeOverflowPage(page, header, data, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize); err != nil {
 			panic(err)
 		}
-		view, err := OpenOverflowPage(page, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize, 8, 64)
+		view, err := OpenOverflowPage(page, fileEnd, testOverflowNextLogicalID, testSuperblockPageSize)
 		if err != nil {
 			panic(err)
 		}

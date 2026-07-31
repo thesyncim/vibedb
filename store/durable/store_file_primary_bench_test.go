@@ -11,7 +11,6 @@ import (
 
 func openBenchPrimaryPutCollection(
 	tb testing.TB,
-	primary bool,
 	count int,
 ) (*Collection, func()) {
 	tb.Helper()
@@ -39,11 +38,7 @@ func openBenchPrimaryPutCollection(
 		ResidentBytes: 64 << 20, Backend: BackendPortable,
 		Durability: DurabilityBufferedVisible,
 	}
-	if primary {
-		_, err = CreateFromPrimary(built, file, options)
-	} else {
-		_, err = CreateFromPrimary(built, file, options)
-	}
+	_, err = CreateFromPrimary(built, file, options)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -59,99 +54,84 @@ func openBenchPrimaryPutCollection(
 	}
 }
 
-// BenchmarkFilePrimaryPut compares the ordered-primary leaf path with the
-// legacy 20 KiB chunk path under the same buffered-visible acknowledgement
-// contract. Uniform alternates value sizes so every operation is an honest
-// COW; hot-repeat alternates equal-sized values after the lazy first touch so
-// it measures canonical-frame acknowledgement.
+// BenchmarkFilePrimaryPut measures the ordered-primary leaf path under the
+// buffered-visible acknowledgement contract. Uniform alternates value sizes
+// so every operation is an honest COW; hot-repeat alternates equal-sized values
+// after the lazy first touch so it measures canonical-frame acknowledgement.
 func BenchmarkFilePrimaryPut(b *testing.B) {
 	const corpus = 10_000
-	for _, implementation := range []struct {
-		name    string
-		primary bool
-	}{
-		{name: "primary", primary: true},
-		{name: "legacy-chunk", primary: false},
-	} {
-		b.Run(implementation.name, func(b *testing.B) {
-			b.Run("uniform-cow", func(b *testing.B) {
-				collection, done := openBenchPrimaryPutCollection(
-					b, implementation.primary, corpus,
-				)
-				defer done()
-				short := []byte(`{"value":"short"}`)
-				long := []byte(`{"value":"a deliberately longer value"}`)
-				// Keys are precomputed as []byte outside the timed loop: the
-				// store speaks []byte, so the loop must not pay a per-op
-				// fmt.Sprintf or string->[]byte conversion. That conversion was
-				// one of the two allocs/op this bench used to report.
-				keys := make([][]byte, corpus)
-				for j := range keys {
-					keys[j] = []byte(benchReadKey(j))
-				}
-				base := collection.Stats()
-				at := 0
-				b.ReportAllocs()
-				b.ResetTimer()
-				for b.Loop() {
-					value := short
-					if at/corpus&1 != 0 {
-						value = long
-					}
-					if _, err := collection.Put(
-						keys[at%corpus], value,
-					); err != nil {
-						b.Fatal(err)
-					}
-					at++
-				}
-				b.StopTimer()
-				if err := collection.Flush(); err != nil {
-					b.Fatal(err)
-				}
-				reportPrimaryPutMetrics(
-					b, collection.Stats(), base,
-				)
-			})
-			b.Run("hot-repeat-same-size", func(b *testing.B) {
-				collection, done := openBenchPrimaryPutCollection(
-					b, implementation.primary, corpus,
-				)
-				defer done()
-				first := []byte(`{"value":"hot-a"}`)
-				second := []byte(`{"value":"hot-b"}`)
-				key := []byte(benchReadKey(corpus / 2))
-				// Size-changing COW, same-size lazy first touch, then one
-				// canonical update leave the timed loop on its hot lane.
-				for _, value := range [][]byte{first, second, first} {
-					if _, err := collection.Put(key, value); err != nil {
-						b.Fatal(err)
-					}
-				}
-				base := collection.Stats()
-				at := 0
-				b.ReportAllocs()
-				b.ResetTimer()
-				for b.Loop() {
-					value := first
-					if at&1 != 0 {
-						value = second
-					}
-					if _, err := collection.Put(key, value); err != nil {
-						b.Fatal(err)
-					}
-					at++
-				}
-				b.StopTimer()
-				if err := collection.Flush(); err != nil {
-					b.Fatal(err)
-				}
-				reportPrimaryPutMetrics(
-					b, collection.Stats(), base,
-				)
-			})
-		})
-	}
+	b.Run("uniform-cow", func(b *testing.B) {
+		collection, done := openBenchPrimaryPutCollection(b, corpus)
+		defer done()
+		short := []byte(`{"value":"short"}`)
+		long := []byte(`{"value":"a deliberately longer value"}`)
+		// Keys are precomputed as []byte outside the timed loop: the
+		// store speaks []byte, so the loop must not pay a per-op
+		// fmt.Sprintf or string->[]byte conversion. That conversion was
+		// one of the two allocs/op this bench used to report.
+		keys := make([][]byte, corpus)
+		for j := range keys {
+			keys[j] = []byte(benchReadKey(j))
+		}
+		base := collection.Stats()
+		at := 0
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			value := short
+			if at/corpus&1 != 0 {
+				value = long
+			}
+			if _, err := collection.Put(
+				keys[at%corpus], value,
+			); err != nil {
+				b.Fatal(err)
+			}
+			at++
+		}
+		b.StopTimer()
+		if err := collection.Flush(); err != nil {
+			b.Fatal(err)
+		}
+		reportPrimaryPutMetrics(
+			b, collection.Stats(), base,
+		)
+	})
+	b.Run("hot-repeat-same-size", func(b *testing.B) {
+		collection, done := openBenchPrimaryPutCollection(b, corpus)
+		defer done()
+		first := []byte(`{"value":"hot-a"}`)
+		second := []byte(`{"value":"hot-b"}`)
+		key := []byte(benchReadKey(corpus / 2))
+		// Size-changing COW, same-size lazy first touch, then one
+		// canonical update leave the timed loop on its hot lane.
+		for _, value := range [][]byte{first, second, first} {
+			if _, err := collection.Put(key, value); err != nil {
+				b.Fatal(err)
+			}
+		}
+		base := collection.Stats()
+		at := 0
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			value := first
+			if at&1 != 0 {
+				value = second
+			}
+			if _, err := collection.Put(key, value); err != nil {
+				b.Fatal(err)
+			}
+			at++
+		}
+		b.StopTimer()
+		if err := collection.Flush(); err != nil {
+			b.Fatal(err)
+		}
+		reportPrimaryPutMetrics(
+			b, collection.Stats(), base,
+		)
+	})
 }
 
 // BenchmarkFilePrimaryPointReadUnifiedShape measures class-5 point reads over
@@ -227,13 +207,6 @@ func reportPrimaryPutMetrics(
 		float64(after.DeviceBytes-before.DeviceBytes)/float64(b.N),
 		"device-B/op",
 	)
-	b.ReportMetric(
-		float64(
-			after.BufferedInplaceUpdates-
-				before.BufferedInplaceUpdates,
-		)/float64(b.N),
-		"inplace/op",
-	)
 }
 
 func openBenchPrimaryReadCollection(
@@ -281,10 +254,7 @@ func openBenchPrimaryReadCollection(
 // BenchmarkFilePrimaryPointRead mirrors BenchmarkFileStorePointRead over the
 // same 100k documents and fixed random permutation. It reports the collection
 // convenience form and the caller-pinned Snapshot separately, with allocation
-// and residency metrics kept visible. On an Apple M4 Max (darwin/arm64), the
-// phase-I correctness-first seqlock run measured 425 ns/op for Collection and
-// 423 ns/op for Snapshot, both at 0 B/op and 0 allocs/op. These honest
-// end-to-end results still do not meet the 300 ns promotion gate.
+// and residency metrics kept visible.
 func BenchmarkFilePrimaryPointRead(b *testing.B) {
 	if testing.Short() {
 		b.Skip("100k-document corpus is too slow for -short")

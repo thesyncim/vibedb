@@ -65,8 +65,8 @@ func buildPrimaryOpenTestFile(
 	root := storeio.StateRoot{
 		StoreID: primaryOpenTestStoreID, Generation: 1, PageSize: pageSize,
 		MaxPageSize:   storeio.GlobalTabletCatalogRootBytes,
-		NextLogicalID: tx.NextLogicalID(), ChunkDocuments: 64,
-		MaxKeyBytes: 256, InlineValueBytes: 512, MaxDocumentBytes: 4 << 20,
+		NextLogicalID: tx.NextLogicalID(),
+		MaxKeyBytes:   256, InlineValueBytes: 512, MaxDocumentBytes: 4 << 20,
 		PrimaryRoot: primaryRoot,
 	}
 	if err := tx.PublishInline(root, storeio.InlineFreeDelta{}); err != nil {

@@ -39,9 +39,10 @@ func TestSharedPrefixAndFullHashCollision(t *testing.T) {
 }
 
 func TestTailPromotionAndDeleteDemotion(t *testing.T) {
+	const tailShift = keyBucketShift + trieBits
 	var root *Node
 	for i := 0; i < keyLeafBucket+1; i++ {
-		hash := uint64(i) << FixedBits
+		hash := uint64(i) << tailShift
 		root = Insert(root, hash, fmt.Sprintf("k%d", i), Location{Chunk: uint32(i), Slot: uint8(i)})
 	}
 	boundary := root.slots[0].child.slots[0].child.slots[0]
@@ -53,17 +54,17 @@ func TestTailPromotionAndDeleteDemotion(t *testing.T) {
 	}
 	old := root
 	last := keyLeafBucket
-	root = Delete(root, uint64(last)<<FixedBits, fmt.Sprintf("k%d", last))
+	root = Delete(root, uint64(last)<<tailShift, fmt.Sprintf("k%d", last))
 	if root.slots[0].child != nil || leafCount(root.slots[0].leaf) != keyLeafBucket {
 		t.Fatalf("tail did not flatten and collapse: %+v", root.slots[0])
 	}
 	for i := 0; i < keyLeafBucket; i++ {
-		loc, ok := Lookup(root, uint64(i)<<FixedBits, fmt.Sprintf("k%d", i))
+		loc, ok := Lookup(root, uint64(i)<<tailShift, fmt.Sprintf("k%d", i))
 		if !ok || loc.Chunk != uint32(i) {
 			t.Fatalf("lookup k%d after demotion = (%+v,%v)", i, loc, ok)
 		}
 	}
-	if _, ok := Lookup(old, uint64(last)<<FixedBits, fmt.Sprintf("k%d", last)); !ok {
+	if _, ok := Lookup(old, uint64(last)<<tailShift, fmt.Sprintf("k%d", last)); !ok {
 		t.Fatal("delete changed retained promoted root")
 	}
 }

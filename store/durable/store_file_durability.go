@@ -259,9 +259,9 @@ func (c *Collection) readerFileState() (*fileStoreState, error) {
 		// A journal-backed collection (buffered-visible, or the synchronous lane
 		// whose records are synced before visibility) never holds a visible
 		// generation the journal has not already made durable, so it retains its
-		// last admitted view. The fail-closed-if-visible-leads-durable guard
-		// survives only for the chunk sync lane's committer chain fence and for
-		// async canonical materialization, and dies with the chunk store.
+		// last admitted view. An unjournaled asynchronous collection still fails
+		// closed when its visible state leads the durable state or canonical
+		// materialization made recovery mandatory.
 		if !c.buffered() && !c.journalEnabled() &&
 			(c.options.MaterializationDamageGranule != 0 ||
 				state != c.durableState.Load()) {

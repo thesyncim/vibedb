@@ -66,7 +66,7 @@ after recovery.
 
 Qualified canonical materialization adds a durable undo capsule before changing
 an existing extent. Its exact protocol and recovery cases are in
-[the format](format.md#materialization-journal) and
+[the format](format.md#catalog-free-space-and-journals) and
 [the design](design/canonical-materialization.md).
 
 ## Platform synchronization

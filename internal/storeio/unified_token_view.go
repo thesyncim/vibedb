@@ -9,12 +9,10 @@ import (
 	"github.com/thesyncim/vibejson/document"
 )
 
-// Token-level row view over class-5 unified leaves (unified-leaf design §5).
-//
 // The scan/filter lanes and the future SQL column probe consume rows without
 // rendering them: a row is (templateID, token stream), a template resolves a
 // field path to a hole ordinal once per (leaf, template), and a hole read is
-// a walk of at most a dozen one-byte tags plus lengths (§10.2). This is the
+// a walk of at most a dozen one-byte tags plus lengths. This is the
 // same one read path exposing structure it already has — not a cache and not
 // a second representation; every returned slice borrows the admitted page
 // under the same lease/epoch rules as every other borrowed span (INVARIANT 8).
@@ -25,12 +23,12 @@ type UnifiedRowTokenKind uint8
 const (
 	// UnifiedRowTokenLiteral is a canonical spelling carried by the token:
 	// either an inline short/long literal or a dictionary reference (whose
-	// entry stores the exact canonical spelling, §3.4 losslessness).
+	// entry stores the exact canonical spelling).
 	UnifiedRowTokenLiteral UnifiedRowTokenKind = iota
 	UnifiedRowTokenTrue
 	UnifiedRowTokenFalse
 	UnifiedRowTokenNull
-	// UnifiedRowTokenInt is a §3.4 canonical-int token; regeneration through
+	// UnifiedRowTokenInt is a canonical-integer token; regeneration through
 	// AppendCanonicalInt is byte-identical for every admitted spelling.
 	UnifiedRowTokenInt
 )
@@ -48,7 +46,7 @@ type UnifiedRowToken struct {
 
 // AppendUnifiedRowToken appends the canonical spelling a token encodes.
 // Literal spellings copy; true/false/null are the grammar's unique spellings;
-// int tokens regenerate their unique minimal decimal spelling (§3.4).
+// integer tokens regenerate their unique minimal decimal spelling.
 func AppendUnifiedRowToken(dst []byte, tok UnifiedRowToken) []byte {
 	switch tok.Kind {
 	case UnifiedRowTokenTrue:
@@ -159,9 +157,8 @@ func (v *CommonPrimaryUnifiedLeafView) RowToken(body []byte, hole int) (UnifiedR
 	}
 }
 
-// Hole resolution results below the valid ordinals (design §10.2: resolution
-// is per (template, path), cached by the caller and amortized over the
-// leaf's rows).
+// Hole resolution results below the valid ordinals. Resolution is per
+// (template, path), cached by the caller, and amortized over the leaf's rows.
 const (
 	// UnifiedHoleAbsent: the path names no value in this template's shape.
 	// Every row of the template shares the shape, so the field is absent from
@@ -169,7 +166,7 @@ const (
 	UnifiedHoleAbsent = -1
 	// UnifiedHoleContainer: the path resolves to a non-empty object or array,
 	// which spans multiple holes and skeleton segments. Consumers take the
-	// render path for these rows (§10.3's per-row fallback lane).
+	// render path for these rows.
 	UnifiedHoleContainer = -2
 )
 
@@ -277,7 +274,7 @@ func (r *UnifiedHoleResolver) buildIndex(src []byte) (vibejson.Index, error) {
 // carries the field, UnifiedHoleContainer means the path names structure that
 // spans holes (render-path rows). The resolution reconstructs the template's
 // skeleton with "null" in every hole — legal by construction, because every
-// scalar leaf of the canonical document is a hole (§3.3) — and walks its tape
+// scalar leaf of the canonical document is a hole — and walks its tape
 // in document order, so hole ordinals match the encoder's span order exactly.
 func (r *UnifiedHoleResolver) Resolve(v *CommonPrimaryUnifiedLeafView, templateID int) int {
 	entry, ok := v.templateEntry(templateID)
@@ -312,7 +309,7 @@ func (r *UnifiedHoleResolver) Resolve(v *CommonPrimaryUnifiedLeafView, templateI
 
 // resolveWalk walks the filled skeleton's tape in document order, counting
 // holes (every entry with Next == 1 is a hole: the filler nulls stand exactly
-// where the encoder extracted spans, §3.3). onPath means the path to this
+// where the encoder extracted spans). onPath means the path to this
 // value equals segments[:seg]. It returns the hole count after the subtree,
 // plus the decided result once the target's fate is known.
 func (r *UnifiedHoleResolver) resolveWalk(
@@ -364,7 +361,7 @@ func (r *UnifiedHoleResolver) resolveWalk(
 			ke := &entries[key]
 			childOnPath := false
 			if onPath && !matched && r.keyEquals(src, ke, r.segment(seg)) {
-				// Duplicate keys retained at rest (§3.2): the first member in
+				// Duplicate keys are retained at rest: the first member in
 				// canonical order wins, deterministically.
 				childOnPath = true
 				matched = true

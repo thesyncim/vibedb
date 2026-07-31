@@ -793,8 +793,6 @@ func TestDriverValueRoundTrips(t *testing.T) {
 // it with ErrPrimaryBatchIndexedUnsupported. A transaction that stages a single
 // mutation therefore commits through Put/Delete, but one that stages a genuine
 // multi-key batch is refused at commit with the typed ErrTransactionIndexedTable.
-// (This replaces a retired test that asserted a transactional insert maintained
-// a secondary index through the deleted chunk layout.)
 func TestTransactionOnIndexedTableIsRejected(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {

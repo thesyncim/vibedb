@@ -78,12 +78,12 @@ func (r *rows) Next(dest []sqldriver.Value) error {
 
 func (r *rows) value(cell query.Cell) sqldriver.Value {
 	switch cell.Kind() {
-	case query.KindNull:
+	case query.TypeNull:
 		return nil
-	case query.KindBool:
+	case query.TypeBool:
 		value, _ := cell.Bool()
 		return value
-	case query.KindNumber:
+	case query.TypeNumber:
 		if value, ok := cell.Int64(); ok {
 			return value
 		}
@@ -93,7 +93,7 @@ func (r *rows) value(cell query.Cell) sqldriver.Value {
 		start := len(r.scratch)
 		r.scratch = cell.AppendJSON(r.scratch)
 		return r.scratch[start:]
-	case query.KindString:
+	case query.TypeString:
 		value, _ := cell.TextBytes()
 		if len(value) == 0 {
 			return []byte{}

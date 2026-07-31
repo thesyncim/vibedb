@@ -371,7 +371,7 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 
 func (c *conn) ExecContext(ctx context.Context, src string, args []sqldriver.NamedValue) (sqldriver.Result, error) {
 	// Transaction staging has no context-aware executor. Returning ErrSkip
-	// makes database/sql use the statement's legacy Exec path instead of
+	// makes database/sql use the statement's required Exec fallback instead of
 	// claiming cancellation support that the transaction cannot provide.
 	if c.tx != nil {
 		return nil, sqldriver.ErrSkip
@@ -381,7 +381,7 @@ func (c *conn) ExecContext(ctx context.Context, src string, args []sqldriver.Nam
 	// cannot bridge an arbitrary ctx.Done channel into that flag during a scan
 	// without a watcher goroutine or an allocation on its zero-allocation hot
 	// path. Advertise only the bounded CREATE/INSERT context surface and let
-	// database/sql use legacy statement execution for scans. KindOf is an
+	// database/sql use statement execution without a context for scans. KindOf is an
 	// allocation-free one-token router; classifying here avoids parsing and
 	// lowering a scan mutation only to return ErrSkip and make database/sql
 	// parse it a second time.
@@ -492,7 +492,7 @@ func (c *conn) values(args []sqldriver.NamedValue) ([]any, error) {
 	return c.args, nil
 }
 
-func (c *conn) legacyValues(args []sqldriver.Value) []any {
+func (c *conn) positionalValues(args []sqldriver.Value) []any {
 	if cap(c.args) < len(args) {
 		c.args = make([]any, len(args))
 	} else if len(c.args) > len(args) {

@@ -22,11 +22,11 @@ func TestStateRootJournalIDRoundTrip(t *testing.T) {
 	root := format0EmptyState(9, format0PageSize)
 	root.JournalID = journalID
 	page := make([]byte, format0PageSize)
-	encoded, err := EncodeStateRootPage(page, root, layout.DataStart)
+	encoded, err := encodeTestStateRootPayload(page, root, layout.DataStart)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	decoded, err := DecodeStateRootPage(encoded, layout.DataStart)
+	decoded, err := decodeTestStateRootPayload(encoded, root, layout.DataStart)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -35,10 +35,7 @@ func TestStateRootJournalIDRoundTrip(t *testing.T) {
 	}
 
 	// The field occupies exactly the first 16 bytes of the former reserve.
-	_, payload, err := OpenPage(encoded)
-	if err != nil {
-		t.Fatalf("open page: %v", err)
-	}
+	payload := encoded
 	if !bytes.Equal(payload[stateRootJournalIDOffset:stateRootJournalIDEnd], journalID[:]) {
 		t.Fatalf("JournalID not at expected offset [%d:%d]", stateRootJournalIDOffset, stateRootJournalIDEnd)
 	}
@@ -50,14 +47,11 @@ func TestStateRootJournalIDRoundTrip(t *testing.T) {
 	// are byte-identical.
 	zeroRoot := format0EmptyState(9, format0PageSize)
 	zeroPage := make([]byte, format0PageSize)
-	zeroEncoded, err := EncodeStateRootPage(zeroPage, zeroRoot, layout.DataStart)
+	zeroEncoded, err := encodeTestStateRootPayload(zeroPage, zeroRoot, layout.DataStart)
 	if err != nil {
 		t.Fatalf("encode zero: %v", err)
 	}
-	_, zeroPayload, err := OpenPage(zeroEncoded)
-	if err != nil {
-		t.Fatalf("open zero page: %v", err)
-	}
+	zeroPayload := zeroEncoded
 	if !allZero(zeroPayload[stateRootJournalIDOffset:]) {
 		t.Fatal("unused JournalID region must be zero")
 	}

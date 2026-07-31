@@ -11,7 +11,7 @@ import (
 const contextLockPoll = 100 * time.Microsecond
 
 // backgroundContext keeps the non-cancellable context interface boxed once.
-// Passing context.Background() from a large legacy driver method otherwise
+// Passing context.Background() from a database/sql fallback method otherwise
 // makes the interface box escape on every call, even when the branch using it
 // (for example JOIN materialization) is not taken.
 var backgroundContext = context.Background()

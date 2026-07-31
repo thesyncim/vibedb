@@ -62,7 +62,7 @@ func TestFreeLogScalesPastTheLinkedImageCap(t *testing.T) {
 		// Eager: read every segment, which is what an open cost before residency
 		// became a budget.
 		started := time.Now()
-		replayed, pages, err := ReplayFreeLog(w.cache, head, w.bounds(), nil, extents+16, segments)
+		replayed, pages, err := replayExternalFreeLog(w.cache, head, w.bounds(), nil, extents+16, segments)
 		eager := time.Since(started)
 		if err != nil {
 			t.Fatalf("%d extents: replay: %v", extents, err)
@@ -79,7 +79,7 @@ func TestFreeLogScalesPastTheLinkedImageCap(t *testing.T) {
 		// records, so nothing is mandatory and the budget alone decides.
 		const budget = 8
 		started = time.Now()
-		partial, lazyPages, err := ReplayFreeLog(w.cache, head, w.bounds(), nil, extents+16, budget)
+		partial, lazyPages, err := replayExternalFreeLog(w.cache, head, w.bounds(), nil, extents+16, budget)
 		lazy := time.Since(started)
 		if err != nil {
 			t.Fatalf("%d extents: lazy replay: %v", extents, err)

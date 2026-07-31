@@ -367,10 +367,7 @@ func serveCatalogAt(
 	if configure != nil {
 		configure(&options)
 	}
-	server, err := pgwire.NewServer(
-		pgwire.FromSQLDatabase(database),
-		options,
-	)
+	server, err := pgwire.NewServer(database, options)
 	if err != nil {
 		t.Fatalf("create pgwire server: %v", err)
 	}

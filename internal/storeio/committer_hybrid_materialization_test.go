@@ -73,7 +73,6 @@ func TestCommitterHybridMaterializationMergesFullPagesAndPatches(t *testing.T) {
 		State: StateRoot{
 			StoreID: testStoreID, Generation: 2,
 			PageSize: uint32(pageSize), MaxPageSize: uint32(pageSize), NextLogicalID: 9,
-			ChunkDocuments: 64,
 		},
 	}
 	if err := batch.SetInlineSuperblock(root); err != nil {
@@ -180,7 +179,6 @@ func TestCommitterHybridMaterializationRejectsUnjournaledOldPage(t *testing.T) {
 		State: StateRoot{
 			StoreID: testStoreID, Generation: 2,
 			PageSize: uint32(pageSize), MaxPageSize: uint32(pageSize), NextLogicalID: 9,
-			ChunkDocuments: 64,
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -266,8 +264,7 @@ func TestHybridWriteTransactionPublishesCOWAndCanonicalPatchTogether(t *testing.
 	state := StateRoot{
 		StoreID: testStoreID, Generation: 2,
 		PageSize: uint32(pageSize), MaxPageSize: uint32(pageSize),
-		NextLogicalID:  tx.NextLogicalID(),
-		ChunkDocuments: 64,
+		NextLogicalID: tx.NextLogicalID(),
 	}
 	if err := tx.PublishInline(state, InlineFreeDelta{}); err != nil {
 		t.Fatal(err)
@@ -289,58 +286,6 @@ func TestHybridWriteTransactionPublishesCOWAndCanonicalPatchTogether(t *testing.
 	}
 	if !foundFull {
 		t.Fatal("hybrid transaction did not publish its immutable page")
-	}
-	if err := committer.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestHybridWriteTransactionRejectsInlineStatePage(t *testing.T) {
-	pageSize := max(os.Getpagesize(), InlineSuperblockSize)
-	device := newMaterializationRecordingDevice(10, pageSize)
-	committer := newMaterializationTestCommitter(t, device, CommitterOptions{
-		QueueSlots: 4, MaxPagesPerBatch: 3, GroupLimit: 2,
-	})
-	tx, err := BeginHybridWriteTransaction(
-		committer, nil, 1, 1,
-		WriteTransactionOptions{
-			StoreID: testStoreID, Generation: 2,
-			PageSize:      uint32(pageSize),
-			FileEnd:       testMutableStoreDataStart(uint32(pageSize)),
-			NextLogicalID: 2,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Abort() }()
-	statePage, err := tx.Allocate(
-		PageStateRoot, uint32(pageSize), StateRootLogicalID,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := StateRoot{
-		StoreID: testStoreID, Generation: 2,
-		PageSize: uint32(pageSize), MaxPageSize: uint32(pageSize),
-		NextLogicalID:  tx.NextLogicalID(),
-		ChunkDocuments: 64,
-	}
-	if _, err := EncodeStateRootPage(
-		statePage.Bytes(), state, tx.FileEnd(),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := statePage.Stage(); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.PublishInline(
-		state, InlineFreeDelta{},
-	); !errors.Is(err, ErrInvalidWrite) {
-		t.Fatalf("PublishInline(state page) = %v, want %v", err, ErrInvalidWrite)
-	}
-	if len(device.snapshot()) != 0 {
-		t.Fatal("inline state page reached the device")
 	}
 	if err := committer.Close(); err != nil {
 		t.Fatal(err)
@@ -398,8 +343,8 @@ func TestHybridWriteTransactionFailedPublishCannotConsumeCapacity(t *testing.T) 
 		MaxPageSize:   pageSize,
 		NextLogicalID: tx.NextLogicalID(),
 		// The transaction passes its cheap identity checks, shrinks its
-		// reserved buffers, then the root codec rejects this count.
-		ChunkDocuments: 65,
+		// reserved buffers, then the root codec rejects this option bit.
+		Options: 1 << 31,
 	}
 	if err := tx.PublishInline(
 		invalidState, InlineFreeDelta{},

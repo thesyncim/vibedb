@@ -43,7 +43,7 @@ func unifiedTestCorpus(n int) ([]CommonPrimaryLeafRecord, [][]byte) {
 		switch {
 		case i%17 == 0:
 			// Structurally unique nested shape: unique member names force a
-			// singleton skeleton, which the §3.5 predicate makes trivial.
+			// singleton skeleton, which the amortization predicate makes trivial.
 			doc = fmt.Appendf(nil,
 				`{"unique-%d":{"deep":[%d,{"x-%d":null}]},"f":%d.5,"e":1e%d}`,
 				i, i, i, i, 1+i%7)
@@ -587,7 +587,7 @@ func BenchmarkUnifiedLeafPlanStableCheckpointFold(b *testing.B) {
 	})
 }
 
-// TestUnifiedLeafSingleRow pins the §3.6 rule that a single-row unified leaf
+// TestUnifiedLeafSingleRow pins that a single-row unified leaf
 // is legal (one trivial or templated row): the planner has one output shape
 // and no raw fallback.
 func TestUnifiedLeafSingleRow(t *testing.T) {
@@ -658,7 +658,7 @@ func mutateSealedUnified(t *testing.T, page []byte, mutate func(payload []byte))
 // TestUnifiedLeafCorruptionFailsClosed proves every unified section is
 // independently fail-closed: targeted structural violations in the header,
 // template directory and entries, dictionary directory, and row bodies must
-// each reject the leaf at open (the U1 corruption gate).
+// each reject the leaf at open.
 func TestUnifiedLeafCorruptionFailsClosed(t *testing.T) {
 	records, _ := unifiedTestCorpus(180)
 	page, _ := encodeUnifiedTestLeaf(t, records)
@@ -792,7 +792,7 @@ func TestUnifiedLeafZeroAllocRead(t *testing.T) {
 	}
 }
 
-// TestUnifiedPlannerDeterministicCoverage runs the §3.6 planner over a larger
+// TestUnifiedPlannerDeterministicCoverage runs the planner over a larger
 // ordered corpus and pins: plans are contiguous and exhaustive, every plan
 // re-encodes into its chosen extent, and two runs agree exactly.
 func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
@@ -915,11 +915,11 @@ func BenchmarkUnifiedAppendRawByKey(b *testing.B) {
 	b.SetBytes(int64(docBytes))
 }
 
-// BenchmarkUnifiedAdmitForMutation isolates the U1-to-U2 bridge paid on the
-// first mutation of a class-5 leaf: canonical row reconstruction followed by
-// one raw mutable envelope. It remains useful while the row overlay is being
-// landed because it makes temporary heap/page allocation visible rather than
-// hiding the cold-leaf cliff inside an end-to-end workload.
+// BenchmarkUnifiedAdmitForMutation isolates the structural mutation bridge
+// paid when a class-5 leaf cannot use the row overlay: canonical row
+// reconstruction followed by one raw mutable envelope. This exposes the
+// temporary heap and page allocation instead of hiding the cold-leaf cost
+// inside an end-to-end workload.
 func BenchmarkUnifiedAdmitForMutation(b *testing.B) {
 	records := unifiedCompetitiveShapeRecords(200)
 	page, _ := encodeUnifiedTestBench(b, records)

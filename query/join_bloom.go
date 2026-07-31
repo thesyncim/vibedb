@@ -33,36 +33,13 @@ import (
 // exactly that population, and that is the population a selective join is made
 // of.
 //
-// # What it costs, and what that forced
+// # Cost control
 //
-// It is not free and it is not always right. Building it means scanning the
-// whole inner side, which is exactly the work the lookup strategy exists to
-// avoid. So the filter is a third strategy with its own cost profile rather
-// than an improvement to the second one.
-//
-// The first version of this gated the scan on cardinalities alone
-// (joinBloomScanRatio) and was measured to be 1.56x SLOWER than no filter when
-// the inner predicate kept everything: the scan was paid in full and the filter
-// then admitted every row. Bounding that loss by halving the ratio did not work
-// either — it declined filters measured to be 1.55x wins. What fixed it was
-// measuring instead of bounding: joinBinding.keepFiltering re-reads the inner
-// predicate's observed selectivity after every batch and abandons a scan that
-// can no longer pay, which costs one batch rather than a whole collection.
-// A second measurement, after the executor grew its late-materialization
-// phase, then overturned how that check charges for the scan; keepFiltering
-// records what changed and why.
-//
-// With both gates, BenchmarkJoinBloomPrefilter over a 20,000-row driving
-// collection and 40,000 inner rows (ns per outer row, Apple M4 Max, Go 1.26):
-//
-//	inner filter keeps   policy   filter off   filter kept
-//	                1%    155.7        282.0           yes
-//	               10%    194.7        293.5           yes
-//	               50%    283.9        280.6       no, abandoned
-//	              100%    285.1        280.5       no, abandoned
-//
-// so the filter is worth 1.5x to 1.8x where it applies and costs nothing
-// measurable where it does not.
+// Building the filter scans the inner side, so it is a third strategy with its
+// own cost profile. joinBinding.keepFiltering observes the inner predicate's
+// selectivity after each batch and abandons construction when the remaining
+// scan cannot repay its cost. A retained filter therefore targets selective
+// joins; an abandoned filter falls back to exact probes after bounded work.
 
 // joinBloomBlock is one 32-byte block: eight 32-bit words, each carrying
 // exactly one of the filter's eight bits per key. Confining a key's whole

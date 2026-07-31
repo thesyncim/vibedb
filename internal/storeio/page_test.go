@@ -60,7 +60,6 @@ func TestPageCodecRoundTripAndEveryByteCorruption(t *testing.T) {
 func TestHybridPrimaryPageKindsAreDistinctAndRoundTrip(t *testing.T) {
 	kinds := [...]PageKind{
 		PagePrimaryCatalog,
-		PageTabletDirectory,
 		PagePrimaryLocator,
 		PageTabletRoute,
 		PagePrimaryAnchor,
@@ -97,7 +96,7 @@ func TestPageCodecRejectsResealedNonCanonicalBytes(t *testing.T) {
 		name   string
 		mutate func([]byte)
 	}{
-		{"header reserved", func(page []byte) { page[14] = 1 }},
+		{"header reserved", func(page []byte) { page[13] = 1 }},
 		{"header tail", func(page []byte) { page[56] = 1 }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -127,7 +126,6 @@ func TestPageCodecValidationAndUnsealedPadding(t *testing.T) {
 		{"generation", func(h *PageHeader) { h.Generation = 0 }},
 		{"logical id", func(h *PageHeader) { h.LogicalID = 0 }},
 		{"kind", func(h *PageHeader) { h.Kind = 0 }},
-		{"flags", func(h *PageHeader) { h.Flags = 1 }},
 		{"page size", func(h *PageHeader) { h.PageSize = 5000 }},
 		{"payload", func(h *PageHeader) { h.PayloadLength = h.PageSize }},
 	} {

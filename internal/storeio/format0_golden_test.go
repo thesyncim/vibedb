@@ -27,53 +27,11 @@ func format0EmptyState(generation uint64, pageSize uint32) StateRoot {
 		Generation:       generation,
 		PageSize:         pageSize,
 		MaxPageSize:      64 << 10,
-		NextLogicalID:    StateRootLogicalID + 1,
-		ChunkDocuments:   64,
+		NextLogicalID:    1,
 		MaxKeyBytes:      256,
 		InlineValueBytes: 512,
 		MaxDocumentBytes: 4 << 20,
 	}
-}
-
-func format0StateRootPage(t *testing.T) []byte {
-	t.Helper()
-	layout, err := MutableStoreLayout(format0PageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	page := make([]byte, format0PageSize)
-	encoded, err := EncodeStateRootPage(
-		page, format0EmptyState(7, format0PageSize), layout.DataStart,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
-}
-
-func format0PrimaryStateRootPage(t *testing.T) []byte {
-	t.Helper()
-	layout, err := MutableStoreLayout(format0PageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := format0EmptyState(7, format0PageSize)
-	root.NextLogicalID = PrimaryFirstDynamicLogicalID
-	root.PrimaryRoot = PageRef{
-		Offset:     layout.DataStart,
-		LogicalID:  PrimaryCatalogRootLogicalID,
-		Generation: root.Generation,
-		Length:     GlobalTabletCatalogRootBytes,
-		Kind:       PagePrimaryCatalog,
-	}
-	page := make([]byte, format0PageSize)
-	encoded, err := EncodeStateRootPage(
-		page, root, layout.DataStart+uint64(root.PrimaryRoot.Length),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
 }
 
 func format0InlineRoot(t *testing.T, generation uint64) []byte {
@@ -91,30 +49,6 @@ func format0InlineRoot(t *testing.T, generation uint64) []byte {
 	}
 	dst := make([]byte, InlineSuperblockSize)
 	encoded, err := EncodeInlineSuperblock(dst, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
-}
-
-func format0StandaloneSuperblock(t *testing.T) []byte {
-	t.Helper()
-	state := format0StateRootPage(t)
-	layout, err := MutableStoreLayout(format0PageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := Superblock{
-		StoreID:       format0StoreID,
-		Generation:    7,
-		StateOffset:   layout.DataStart,
-		StateLength:   uint32(len(state)),
-		StateChecksum: PageChecksum(state),
-		FileEnd:       layout.DataStart + uint64(format0PageSize),
-		PageSize:      format0PageSize,
-	}
-	dst := make([]byte, SuperblockSize)
-	encoded, err := EncodeSuperblock(dst, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,10 +309,7 @@ func TestFormat0PrintGolden(t *testing.T) {
 	name := os.Getenv("STOREIO_FORMAT0_GOLDEN")
 	builders := map[string]func(*testing.T) []byte{
 		"mutable_prefix_4k":           format0MutablePrefix,
-		"empty_state_root_page":       format0StateRootPage,
-		"primary_state_root_page":     format0PrimaryStateRootPage,
 		"empty_inline_superblock":     func(t *testing.T) []byte { return format0InlineRoot(t, 7) },
-		"standalone_superblock":       format0StandaloneSuperblock,
 		"posting_page":                format0PostingPage,
 		"materialization_max_patches": format0MaterializationMaxPatches,
 		"materialization_max_targets": format0MaterializationMaxTargets,
@@ -409,13 +340,6 @@ func assertFormat0Checksum(t *testing.T, image []byte, trailer int) {
 	}
 }
 
-func resealFormat0Page(image []byte) {
-	trailer := len(image) - PageTrailerSize
-	checksum := PageChecksum(image[:trailer])
-	binary.LittleEndian.PutUint32(image[trailer:trailer+4], checksum)
-	binary.LittleEndian.PutUint32(image[trailer+4:], ^checksum)
-}
-
 func resealFormat0Inline(image []byte) {
 	checksum := PageChecksum(image[:inlineSuperblockChecksumFrom])
 	binary.LittleEndian.PutUint32(
@@ -441,25 +365,24 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"PageHeaderSize":                   {PageHeaderSize, 64},
 		"PageTrailerSize":                  {PageTrailerSize, 8},
 		"StateRootPayloadSize":             {StateRootPayloadSize, 512},
-		"stateRootMaxPageSizeOffset":       {stateRootMaxPageSizeOffset, 220},
-		"stateRootPageCatalogOffset":       {stateRootPageCatalogOffset, 224},
-		"stateRootPageCatalogEnd":          {stateRootPageCatalogEnd, 256},
-		"stateRootPageCatalogDigestEnd":    {stateRootPageCatalogDigestEnd, 272},
-		"stateRootPageCatalogBytesEnd":     {stateRootPageCatalogBytesEnd, 276},
-		"stateRootMaxKeyBytesEnd":          {stateRootMaxKeyBytesEnd, 280},
-		"stateRootInlineValueBytesEnd":     {stateRootInlineValueBytesEnd, 284},
-		"stateRootMaxDocumentBytesEnd":     {stateRootMaxDocumentBytesEnd, 288},
-		"stateRootPrimaryOffset":           {stateRootPrimaryOffset, 288},
-		"stateRootPrimaryEnd":              {stateRootPrimaryEnd, 320},
-		"stateRootJournalIDOffset":         {stateRootJournalIDOffset, 320},
-		"stateRootJournalIDEnd":            {stateRootJournalIDEnd, 336},
-		"stateRootExactIndexOffset":        {stateRootExactIndexOffset, 336},
-		"stateRootExactIndexEnd":           {stateRootExactIndexEnd, 368},
-		"stateRootReservedOffset":          {stateRootReservedOffset, 368},
+		"stateRootMaxPageSizeOffset":       {stateRootMaxPageSizeOffset, 44},
+		"stateRootPageCatalogOffset":       {stateRootPageCatalogOffset, 48},
+		"stateRootPageCatalogEnd":          {stateRootPageCatalogEnd, 80},
+		"stateRootPageCatalogDigestEnd":    {stateRootPageCatalogDigestEnd, 96},
+		"stateRootPageCatalogBytesEnd":     {stateRootPageCatalogBytesEnd, 100},
+		"stateRootMaxKeyBytesEnd":          {stateRootMaxKeyBytesEnd, 104},
+		"stateRootInlineValueBytesEnd":     {stateRootInlineValueBytesEnd, 108},
+		"stateRootMaxDocumentBytesEnd":     {stateRootMaxDocumentBytesEnd, 112},
+		"stateRootPrimaryOffset":           {stateRootPrimaryOffset, 112},
+		"stateRootPrimaryEnd":              {stateRootPrimaryEnd, 144},
+		"stateRootJournalIDOffset":         {stateRootJournalIDOffset, 144},
+		"stateRootJournalIDEnd":            {stateRootJournalIDEnd, 160},
+		"stateRootExactIndexOffset":        {stateRootExactIndexOffset, 160},
+		"stateRootExactIndexEnd":           {stateRootExactIndexEnd, 192},
+		"stateRootReservedOffset":          {stateRootReservedOffset, 192},
 		"PageRefSize":                      {PageRefSize, 32},
 		"InlineSuperblockSize":             {InlineSuperblockSize, 4096},
 		"InlineFreeDeltaCapacity":          {InlineFreeDeltaCapacity, 106},
-		"SuperblockSize":                   {SuperblockSize, 128},
 		"MaterializationJournalSize":       {MaterializationJournalSize, 4096},
 		"MaterializationJournalHeaderSize": {MaterializationJournalHeaderSize, 112},
 		"MaterializationTargetRecordSize":  {MaterializationTargetRecordSize, 56},
@@ -474,26 +397,24 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 			t.Errorf("%s = %d, want format-0 value %d", name, gotWant[0], gotWant[1])
 		}
 	}
-	if DevelopmentFormatVersion != 0 || StateRootLogicalID != 1 ||
+	if DevelopmentFormatVersion != 0 || PrimaryLeafLogicalIDBase != 1 ||
 		MaterializationJournalMinSectorSize != 512 {
 		t.Fatalf(
-			"format identity = version %d state logical %d sector %d",
-			DevelopmentFormatVersion, StateRootLogicalID,
+			"format identity = version %d primary base %d sector %d",
+			DevelopmentFormatVersion, PrimaryLeafLogicalIDBase,
 			MaterializationJournalMinSectorSize,
 		)
 	}
-	// The chunk/fingerprint kinds (2, 4-6, 8-12, 16) are retired but their
-	// numbers stay reserved so every surviving durable kind keeps the on-disk
-	// identifier it has always had. Pin each survivor to that fixed number.
 	for kind, want := range map[PageKind]int{
-		PageStateRoot: 1, PageOverflow: 3, PageIndexPosting: 7,
-		PageFreeImage: 13, PageFreeDelta: 14, PageFreeIndex: 15,
-		PageCatalogSegment: 17, PagePrimaryCatalog: 18, PageTabletDirectory: 19,
-		PagePrimaryLocator: 20, PageTabletRoute: 21, PagePrimaryAnchor: 22,
-		PagePrimaryLeaf: 23, PagePrimaryExactRoot: 24, PagePrimaryExactLeaf: 25,
+		PageOverflow: 1, PageIndexPosting: 2,
+		PageFreeImage: 3, PageFreeDelta: 4, PageFreeIndex: 5,
+		PageCatalogSegment: 6, PagePrimaryCatalog: 7, PagePrimaryLocator: 8,
+		PageTabletRoute: 9, PagePrimaryAnchor: 10, PagePrimaryLeaf: 11,
+		PagePrimaryExactRoot: 12, PagePrimaryExactLeaf: 13,
+		PagePrimaryExactCatalog: 14,
 	} {
 		if int(kind) != want {
-			t.Fatalf("PageKind %d has value %d, want reserved-retired value %d",
+			t.Fatalf("PageKind %d has value %d, want %d",
 				kind, int(kind), want)
 		}
 	}
@@ -547,53 +468,11 @@ func TestFormat0GoldenMutablePrefix(t *testing.T) {
 }
 
 func TestFormat0GoldenEmptyStateAndRoots(t *testing.T) {
-	statePage := format0StateRootPage(t)
-	compareFormat0Golden(t, "empty_state_root_page", statePage)
-	layout, _ := MutableStoreLayout(format0PageSize)
-	state, err := DecodeStateRootPage(statePage, layout.DataStart)
-	if err != nil || state != format0EmptyState(7, format0PageSize) {
-		t.Fatalf("state root = (%+v,%v)", state, err)
-	}
-	if string(statePage[0:8]) != pageMagic ||
-		binary.LittleEndian.Uint16(statePage[8:10]) != pageVersion ||
-		binary.LittleEndian.Uint16(statePage[10:12]) != PageHeaderSize ||
-		PageKind(statePage[12]) != PageStateRoot {
-		t.Fatal("standalone StateRoot common-page offsets changed")
-	}
-	assertFormat0Zero(t, statePage, 14, 16)
-	assertFormat0Zero(t, statePage, 56, 64)
-	assertFormat0Zero(
-		t, statePage,
-		PageHeaderSize+stateRootReservedOffset,
-		PageHeaderSize+StateRootPayloadSize,
-	)
-	assertFormat0Zero(
-		t, statePage,
-		PageHeaderSize+StateRootPayloadSize,
-		len(statePage)-PageTrailerSize,
-	)
-	assertFormat0Checksum(t, statePage, len(statePage)-PageTrailerSize)
-
-	primaryStatePage := format0PrimaryStateRootPage(t)
-	compareFormat0Golden(t, "primary_state_root_page", primaryStatePage)
-	primaryFileEnd := layout.DataStart + uint64(GlobalTabletCatalogRootBytes)
-	primaryState, err := DecodeStateRootPage(primaryStatePage, primaryFileEnd)
-	if err != nil || primaryState.PrimaryRoot == (PageRef{}) {
-		t.Fatalf("primary state root = (%+v,%v)", primaryState, err)
-	}
-	assertFormat0Zero(
-		t, primaryStatePage,
-		PageHeaderSize+stateRootPrimaryEnd,
-		PageHeaderSize+StateRootPayloadSize,
-	)
-	assertFormat0Checksum(
-		t, primaryStatePage, len(primaryStatePage)-PageTrailerSize,
-	)
-
 	inline := format0InlineRoot(t, 7)
 	compareFormat0Golden(t, "empty_inline_superblock", inline)
+	want := format0EmptyState(7, format0PageSize)
 	decoded, err := DecodeInlineSuperblock(inline)
-	if err != nil || decoded.State != state {
+	if err != nil || decoded.State != want {
 		t.Fatalf("inline root = (%+v,%v)", decoded, err)
 	}
 	if string(inline[0:8]) != inlineSuperblockMagic ||
@@ -614,15 +493,6 @@ func TestFormat0GoldenEmptyStateAndRoots(t *testing.T) {
 	assertFormat0Zero(t, inline, inlineFreeDeltaRecordsOffset, inlineSuperblockChecksumFrom)
 	assertFormat0Checksum(t, inline, inlineSuperblockChecksumFrom)
 
-	superblock := format0StandaloneSuperblock(t)
-	compareFormat0Golden(t, "standalone_superblock", superblock)
-	if _, err := DecodeSuperblock(superblock); err != nil {
-		t.Fatal(err)
-	}
-	assertFormat0Zero(t, superblock, 60, 64)
-	assertFormat0Zero(t, superblock, 92, 96)
-	assertFormat0Zero(t, superblock, 112, 120)
-	assertFormat0Checksum(t, superblock, 120)
 }
 
 func TestFormat0GoldenRepresentativePageKinds(t *testing.T) {
@@ -715,29 +585,7 @@ func TestFormat0GoldenMaterializationJournals(t *testing.T) {
 	assertFormat0Checksum(t, maxTargets, materializationTrailerAt)
 }
 
-func TestFormat0GoldensRejectCorruptionAndPriorPageVersion(t *testing.T) {
-	state := append([]byte(nil), readFormat0Golden(t, "empty_state_root_page")...)
-	state[PageHeaderSize+stateRootReservedOffset] ^= 1
-	if _, err := SealPage(state); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeStateRootPage(
-		state, testMutableStoreDataStart(format0PageSize),
-	); !errors.Is(err, ErrStateRootCorrupt) {
-		t.Fatalf("resealed StateRoot reserve = %v", err)
-	}
-
-	for _, prior := range []uint16{2, 3, 4} {
-		state = append([]byte(nil), readFormat0Golden(t, "empty_state_root_page")...)
-		binary.LittleEndian.PutUint16(state[8:10], prior)
-		resealFormat0Page(state)
-		if _, err := DecodeStateRootPage(
-			state, testMutableStoreDataStart(format0PageSize),
-		); !errors.Is(err, ErrStateRootCorrupt) {
-			t.Fatalf("resealed common-page version %d = %v", prior, err)
-		}
-	}
-
+func TestFormat0GoldensRejectCorruptionAndNonzeroVersions(t *testing.T) {
 	inline := append([]byte(nil), readFormat0Golden(t, "empty_inline_superblock")...)
 	inline[48] ^= 1
 	resealFormat0Inline(inline)

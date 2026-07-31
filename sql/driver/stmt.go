@@ -90,7 +90,7 @@ func (s *stmt) Query(values []sqldriver.Value) (sqldriver.Rows, error) {
 	if err := checkSQLValues(values); err != nil {
 		return nil, err
 	}
-	args := s.conn.legacyValues(values)
+	args := s.conn.positionalValues(values)
 	return s.queryRows(backgroundContext, args)
 }
 
@@ -419,7 +419,7 @@ func (s *stmt) Exec(values []sqldriver.Value) (sqldriver.Result, error) {
 	if err := checkSQLValues(values); err != nil {
 		return nil, err
 	}
-	return s.exec(backgroundContext, s.conn.legacyValues(values))
+	return s.exec(backgroundContext, s.conn.positionalValues(values))
 }
 
 func (s *stmt) execContext(ctx context.Context, arguments []sqldriver.NamedValue) (sqldriver.Result, error) {

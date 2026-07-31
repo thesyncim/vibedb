@@ -151,7 +151,7 @@ func (c *Collection) acquirePrimaryPath(
 	}()
 	bounds := storeio.GlobalTabletCatalogBounds{
 		StoreID: c.storeID, SelectedRootGeneration: state.root.Generation,
-		FileEnd:       state.super.FileEnd,
+		FileEnd:       state.fileEnd,
 		NextLogicalID: state.root.NextLogicalID,
 	}
 	path.rootLease, err = c.cache.Acquire(state.root.PrimaryRoot)
@@ -241,7 +241,7 @@ func (c *Collection) acquirePrimaryPath(
 	path.leaf, err = storeio.AdmittedPrimaryLeafForMutation(
 		path.leafLease.Page(), c.storeID, path.leafRoute.Bucket,
 		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
+			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
@@ -272,17 +272,6 @@ func (c *Collection) primaryPendingParentIndex(
 ) int {
 	for index := range c.primaryPendingParents {
 		if c.primaryPendingParents[index].leafRoute.Bucket == bucket {
-			return index
-		}
-	}
-	return -1
-}
-
-func (c *Collection) primaryPendingParentRefIndex(
-	ref storeio.PageRef,
-) int {
-	for index := range c.primaryPendingParents {
-		if c.primaryPendingParents[index].volatileRef == ref {
 			return index
 		}
 	}
@@ -713,7 +702,7 @@ retryAfterUnifiedFold:
 	leaf, err := storeio.AdmittedPrimaryLeafForMutationWithScratch(
 		leafLease.Page(), c.storeID, resident.Bucket,
 		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
+			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
@@ -959,7 +948,7 @@ retryAfterUnifiedDeleteFold:
 		leaf, workspaceErr := storeio.AdmittedPrimaryLeafForMutationWithScratch(
 			leafLease.Page(), c.storeID, resident.Bucket,
 			storeio.CommonPrimaryLeafBounds{
-				FileEnd:           state.super.FileEnd,
+				FileEnd:           state.fileEnd,
 				NextLogicalID:     state.root.NextLogicalID,
 				AllocationQuantum: state.root.PageSize,
 			},
@@ -1073,105 +1062,6 @@ retryAfterUnifiedDeleteFold:
 	return true, nil
 }
 
-func (c *Collection) tryBufferedPrimaryInplace(
-	state *fileStoreState,
-	src, before []byte,
-	ref storeio.PageRef,
-	leafLease *storeio.PageLease,
-) (handled bool, trackFirstTouch bool, err error) {
-	if c == nil || state == nil || leafLease == nil || !c.buffered() {
-		return false, false, nil
-	}
-	c.bufferedInplaceAttempts.Add(1)
-	fallback := func() (bool, bool, error) {
-		c.bufferedInplaceFallbacks.Add(1)
-		return false, false, nil
-	}
-	if len(c.options.indexes) != 0 ||
-		c.options.Collection.Schema != nil ||
-		len(before) == 0 || len(before) != len(src) {
-		return fallback()
-	}
-	valueOffset, ok := leafLease.OffsetOf(before)
-	if !ok {
-		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
-	}
-	if !c.bufferedFirstTouchContains(ref) {
-		if !c.bufferedFirstTouchCapacityAvailable() {
-			c.bufferedFirstTouchOverflows.Add(1)
-			return fallback()
-		}
-		return false, true, nil
-	}
-	handled, err = c.replaceBufferedPrimaryInplace(
-		state, src, before, valueOffset, ref, leafLease,
-	)
-	if handled || err != nil {
-		return handled, false, err
-	}
-	c.takeBufferedFirstTouch(ref)
-	return false, true, nil
-}
-
-func (c *Collection) replaceBufferedPrimaryInplace(
-	state *fileStoreState,
-	src, old []byte,
-	valueOffset uint32,
-	ref storeio.PageRef,
-	leafLease *storeio.PageLease,
-) (handled bool, err error) {
-	generation := state.root.Generation + 1
-	if generation == 0 {
-		return false, storeio.ErrGenerationOrder
-	}
-	if c.primaryPendingParentRefIndex(ref) < 0 {
-		// Only a leaf already represented in the pending-parent set can be
-		// advanced without queuing a root token.
-		return false, nil
-	}
-	nextRoot := state.root
-	nextRoot.Generation = generation
-	nextSuper := state.super
-	nextSuper.Generation = generation
-	nextState := &fileStoreState{
-		root: nextRoot, super: nextSuper,
-		freeHead: state.freeHead,
-	}
-	c.bufferedValueBefore = append(c.bufferedValueBefore[:0], old...)
-	before := c.bufferedValueBefore
-
-	c.snapshotGate.Lock()
-	c.beginReaderFence()
-	if c.anyActiveReaders() {
-		c.endReaderFence()
-		c.snapshotGate.Unlock()
-		c.bufferedInplaceFallbacks.Add(1)
-		return false, nil
-	}
-	_, replaceErr := c.cache.ReplaceLeasedCanonicalDirty(
-		leafLease,
-		ref, ref,
-		valueOffset, before, src, math.MaxUint64,
-	)
-	if replaceErr != nil {
-		c.endReaderFence()
-		c.snapshotGate.Unlock()
-		if errors.Is(replaceErr, storeio.ErrCanonicalPageBusy) ||
-			errors.Is(replaceErr, storeio.ErrCanonicalPageChanged) {
-			c.bufferedInplaceFallbacks.Add(1)
-			return false, nil
-		}
-		return false, replaceErr
-	}
-	c.primaryRouter.Load().AdvanceGeneration(generation)
-	c.pageValidator.update(nextState)
-	c.publishFileState(nextState)
-	c.endReaderFence()
-	c.snapshotGate.Unlock()
-	c.bufferedInplaceUpdates.Add(1)
-	return true, nil
-}
-
 func (c *Collection) cowBufferedPrimaryMutation(
 	state *fileStoreState,
 	key, src []byte,
@@ -1222,7 +1112,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	// wide enough for one worst-case checkpoint transaction below it, so a later
 	// materialize allocates its durable pages from the checkpoint base's FileEnd
 	// without colliding with any volatile page.
-	baseOffset := state.super.FileEnd
+	baseOffset := state.fileEnd
 	if len(c.primaryPendingParents) == 0 {
 		gap := uint64(c.options.maxTransactionPages) *
 			uint64(c.options.MaxPageSize)
@@ -1310,7 +1200,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 			c.overflowRetireScratch = extents
 			base := c.primaryCheckpointBaseState()
 			oldOverflowVolatile = base != nil &&
-				oldValue.Overflow.Offset >= base.super.FileEnd
+				oldValue.Overflow.Offset >= base.fileEnd
 			if !oldOverflowVolatile &&
 				len(c.primaryPendingOverflowRetire)+len(extents) >
 					cap(c.primaryPendingOverflowRetire) {
@@ -1360,15 +1250,12 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	} else if !found {
 		nextRoot.DocumentCount++
 	}
-	nextSuper := state.super
-	nextSuper.Generation = generation
-	nextSuper.FileEnd = leafOffset + uint64(leafBytes)
 	nextState := &fileStoreState{
-		root: nextRoot, super: nextSuper,
+		root: nextRoot, fileEnd: leafOffset + uint64(leafBytes),
 		freeHead: state.freeHead,
 	}
 
-	// Prepare this mutation's exact-index overlay records (§3's write rule)
+	// Prepare this mutation's exact-index overlay records
 	// as a fallible step: the point-of-no-return install below only links
 	// prepared chain heads, so it cannot fail and leave a journaled mutation
 	// with a stale index. The durable posting pages are not written now — a
@@ -1473,7 +1360,7 @@ func (c *Collection) cowPrimaryMutation(
 		storeio.WriteTransactionOptions{
 			StoreID: c.storeID, Generation: generation,
 			PageSize:         uint32(c.options.PageSize),
-			FileEnd:          state.super.FileEnd,
+			FileEnd:          state.fileEnd,
 			NextLogicalID:    state.root.NextLogicalID,
 			Reusable:         c.reusable,
 			ReuseJournal:     c.reuseJournal,
@@ -1549,7 +1436,7 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	becameEmpty = deleting && path.leaf.Len() == 1
 	filledEmpty = !deleting && !found && path.leaf.Len() == 0
-	// Fold-first lane (§7): run the §3 delta write rule for the common
+	// Fold-first lane: apply delta writes for the common
 	// slot-stable shapes and fold only the dirty leaves; a slot-reassigning
 	// rewrite re-derives the whole bucket from the staged leaf image against
 	// the same bounds it was encoded under. Either way the fresh epoch is
@@ -1749,7 +1636,7 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, state, generation, rootPage.Ref(),
-		freeLog.head, freeLog.checksum, freeLog.inline,
+		freeLog.head, freeLog.inline,
 		func() uint64 {
 			if deleting {
 				return state.root.DocumentCount - 1
@@ -1939,7 +1826,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		storeio.WriteTransactionOptions{
 			StoreID: c.storeID, Generation: generation,
 			PageSize:         uint32(c.options.PageSize),
-			FileEnd:          base.super.FileEnd,
+			FileEnd:          base.fileEnd,
 			NextLogicalID:    base.root.NextLogicalID,
 			Reusable:         c.reusable,
 			ReuseJournal:     c.reuseJournal,
@@ -2016,7 +1903,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			}
 			if c.primaryUnifiedOverlay.pendingBucket(
 				pending.leafRoute.Bucket,
-			) && pending.volatileRef.Offset < base.super.FileEnd {
+			) && pending.volatileRef.Offset < base.fileEnd {
 				var replacementStorage [primaryUnifiedOverlayRecords]storeio.CommonPrimaryUnifiedReplacement
 				replacements, allPuts, patchErr :=
 					c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
@@ -2088,7 +1975,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 				for rank := range records {
 					head := records[rank].Value.Overflow
 					if head == (storeio.PageRef{}) ||
-						head.Offset < base.super.FileEnd {
+						head.Offset < base.fileEnd {
 						continue
 					}
 					var resolved []byte
@@ -2184,7 +2071,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			if view.HasOverflowRows() {
 				initErr = view.RewriteOverflowRefs(
 					payload, func(head storeio.PageRef) (storeio.PageRef, error) {
-						if head.Offset < base.super.FileEnd {
+						if head.Offset < base.fileEnd {
 							return head, nil
 						}
 						resolved, rErr := c.appendPrimaryOverflowValue(
@@ -2266,7 +2153,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			storeio.GlobalTabletCatalogBounds{
 				StoreID:                c.storeID,
 				SelectedRootGeneration: base.root.Generation,
-				FileEnd:                base.super.FileEnd,
+				FileEnd:                base.fileEnd,
 				NextLogicalID:          base.root.NextLogicalID,
 			},
 		)
@@ -2346,7 +2233,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			storeio.GlobalTabletCatalogBounds{
 				StoreID:                c.storeID,
 				SelectedRootGeneration: base.root.Generation,
-				FileEnd:                base.super.FileEnd,
+				FileEnd:                base.fileEnd,
 				NextLogicalID:          base.root.NextLogicalID,
 			},
 		)
@@ -2448,7 +2335,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			storeio.GlobalTabletCatalogBounds{
 				StoreID:                c.storeID,
 				SelectedRootGeneration: base.root.Generation,
-				FileEnd:                base.super.FileEnd,
+				FileEnd:                base.fileEnd,
 				NextLogicalID:          base.root.NextLogicalID,
 			},
 		)
@@ -2524,7 +2411,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			storeio.GlobalTabletCatalogBounds{
 				StoreID:                c.storeID,
 				SelectedRootGeneration: base.root.Generation,
-				FileEnd:                base.super.FileEnd,
+				FileEnd:                base.fileEnd,
 				NextLogicalID:          base.root.NextLogicalID,
 			},
 		)
@@ -2592,7 +2479,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		storeio.GlobalTabletCatalogBounds{
 			StoreID:                c.storeID,
 			SelectedRootGeneration: base.root.Generation,
-			FileEnd:                base.super.FileEnd,
+			FileEnd:                base.fileEnd,
 			NextLogicalID:          base.root.NextLogicalID,
 		},
 	)
@@ -2646,7 +2533,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	}
 
 	// Fold the overlay into durable exact pages in the same checkpoint
-	// transaction that seals the graph (§7). Per-mutation buffered edits only
+	// transaction that seals the graph. Per-mutation buffered edits only
 	// append overlay records; this is where they resolve onto the base
 	// through the read rule at the fold generation and re-encode ONLY the
 	// dirty leaves — the runs and stripes the window's touched terms name —
@@ -2706,7 +2593,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, base, generation, rootPage.Ref(),
-		freeLog.head, freeLog.checksum, freeLog.inline,
+		freeLog.head, freeLog.inline,
 		visible.root.DocumentCount,
 	)
 	if err != nil {
@@ -2898,14 +2785,12 @@ func (c *Collection) primaryMutationBounds(
 	}
 }
 
-// primaryLeafBounds are the leaf-admission bounds for the published state, used
-// by read-only leaf peeks (merge/reclass evaluation) that admit a leaf image
-// without a write transaction.
+// primaryLeafBounds are the leaf-admission bounds for the published state.
 func (c *Collection) primaryLeafBounds(
 	state *fileStoreState,
 ) storeio.CommonPrimaryLeafBounds {
 	return storeio.CommonPrimaryLeafBounds{
-		FileEnd:           state.super.FileEnd,
+		FileEnd:           state.fileEnd,
 		NextLogicalID:     state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 	}
@@ -3002,7 +2887,6 @@ func (c *Collection) stagePrimaryState(
 	old *fileStoreState,
 	generation uint64,
 	primaryRoot, freeHead storeio.PageRef,
-	freeChecksum uint32,
 	inlineFree *storeio.InlineFreeDelta,
 	documentCount uint64,
 ) (*fileStoreState, storeio.InlineFreeDelta, error) {
@@ -3015,19 +2899,8 @@ func (c *Collection) stagePrimaryState(
 	root.DocumentCount = documentCount
 	root.NextLogicalID = tx.NextLogicalID()
 	root.PrimaryRoot = primaryRoot
-	super := old.super
-	super.Generation = generation
-	super.FileEnd = tx.FileEnd()
-	super.FreeOffset = 0
-	super.FreeLength = 0
-	super.FreeChecksum = 0
-	if freeHead != (storeio.PageRef{}) {
-		super.FreeOffset = freeHead.Offset
-		super.FreeLength = freeHead.Length
-		super.FreeChecksum = freeChecksum
-	}
 	return &fileStoreState{
-		root: root, super: super,
+		root: root, fileEnd: tx.FileEnd(),
 		freeHead: freeHead,
 	}, *inlineFree, nil
 }

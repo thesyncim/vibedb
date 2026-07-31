@@ -45,10 +45,7 @@ func openBatchCollection(t *testing.T, options Options) (*Collection, *os.File) 
 // batch publish path does not yet run the posting maintainer, so serving a stale
 // index is the risk it declines — every batch shape fails closed with
 // ErrPrimaryBatchIndexedUnsupported before the callback runs, and publishes
-// nothing. This one test replaces the whole former indexed-batch family
-// (differential-against-sequential, survives-reopen, fewer-device-bytes,
-// crash-recovery, wide-fold, uncertifiable-value), each of which asserted an
-// index-maintenance behavior the batch path does not yet provide.
+// nothing.
 func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
 	options := testBatchOptions(24)
 	options.Indexes = []store.IndexDefinition{

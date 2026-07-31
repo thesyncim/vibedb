@@ -15,15 +15,13 @@ Latin-square engine ordering and one discarded conditioning pass per engine.
 Footprint and non-Pebble churn cells are one isolated invocation per
 engine/cardinality/profile, not timing medians. Pebble churn cells are medians
 of three clean runs because compaction scheduling moves its post-maintenance
-image by a few MiB. Historical tables remain in Git history; they are never
-mixed with current numbers.
+image by a few MiB.
 
 - Machine: Apple M4 Max (16 cores, 64 GB), macOS 26.3.1 / Darwin 25.3.0,
   APFS. Go 1.26.0.
 - Competitors: bbolt 1.5.0, Badger 4.9.5, Pebble 1.1.5, modernc SQLite 1.54.0.
-- Within each current mixed table, all engine rows use the same clean commit,
-  binaries, corpus, and run protocol. Historical and disk tables name their
-  own provenance.
+- Within each mixed table, all engine rows use the same clean commit, binaries,
+  corpus, and run protocol. Disk tables name their own provenance.
 - Corpus: 10,000 documents (mixed workloads) / 100,000 (churn-disk,
   footprint), ~250 B JSON each; low cardinality unless stated.
 - Mixed workload: 2,000 warmup operations, 20,000 measured operations,
@@ -61,50 +59,13 @@ unsupported lane fails closed.
 
 vibedb is 2.1-5.2x SQLite. It leads the table on YCSB-B by 55% and churn
 by 10.8%; it trails Badger by 11.2%, 6.7%, and 10.8% on YCSB-A, YCSB-F,
-and scan-mix, respectively. Relative to the previous clean vibedb publication,
-the five medians are 1.11–1.82× as high (11.4–82.3% higher); that is descriptive
-commit-to-commit progress, not a causal A/B because the filesystem state and
-competitor rows also moved.
+and scan-mix, respectively.
 
 The vibedb median point read is 0.333-0.334 µs, update is 0.916-0.958 µs,
 delete+restore is 1.25 µs, and a full 10k-document ordered scan inside the
 scan mix is 2.15 ms. Checkpoint p50 is 28.2-34.3 µs. Median checkpoint p99
 ranges from 38 µs on read-heavy YCSB-B to 1.03 ms in scan-mix; every run has
 zero pressure-forced checkpoints.
-
-## Historical ordinary-sync snapshot (clean `d714d63`, median of 10)
-
-This lane has not been rerun on `0a593f5`; it is retained for durability
-provenance and must not be mixed into the current buffered-visible ranking.
-
-| workload | vibedb | bbolt | Pebble | SQLite | Badger |
-|---|---|---|---|---|---|
-| ycsb-a | 10,138 | 210 | 440 | 28,790 | **58,358** |
-| ycsb-b | 177,810 | 2,336 | 4,678 | 181,062 | **410,408** |
-| ycsb-f | 9,860 | 214 | 427 | 34,737 | **59,638** |
-| churn | 18,016 | 298 | 654 | 51,866 | **81,976** |
-| scan-mix | 18,380 | 402 | 863 | 62,592 | **99,676** |
-
-Badger leads this lane. Vibedb is close to SQLite on read-heavy ycsb-b, but
-trails it by 2.8-3.5x on the other mixes. bbolt and Pebble remain much slower
-when every mutation pays their synchronous commit path.
-
-## Historical power-safe snapshot (clean `d714d63`, median of 10)
-
-This lane likewise predates the current buffered-visible and unified-format
-publication.
-
-| workload | vibedb | SQLite |
-|---|---|---|
-| ycsb-a | **394** | 382 |
-| ycsb-b | **4,175** | 3,728 |
-| ycsb-f | **436** | 392 |
-| churn | **607** | 518 |
-| scan-mix | **829** | 765 |
-
-Both engines sit on the ~4 ms F_FULLFSYNC device floor per fenced mutation.
-The `d714d63` single-fence vibedb path leads SQLite by 3-17% across all five
-workloads; vibedb's measured mutation median is 4.03-4.12 ms.
 
 ## Disk under sustained churn (200k mutations, fixed 100k-doc live set)
 
@@ -234,8 +195,7 @@ go build -o /tmp/vibedb-mixedsuite ./cmd/mixedsuite
   -durability=buffered-visible \
   -checkpoint-mutations=64 -repetitions=10 -output=<file>
 
-# Historical ordinary-sync and power-safe commands remain available, but must
-# be rerun as complete isolated suites before those tables are advanced.
+# Power-safe publication lane template:
 /tmp/vibedb-mixedsuite -mixed-bin=/tmp/vibedb-mixed \
   -engines=vibejson-durable,sqlite \
   -workload=<ycsb-a|ycsb-b|ycsb-f|churn|scan> \

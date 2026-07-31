@@ -6,9 +6,8 @@ import (
 )
 
 // SetInlineSuperblock encodes a checksummed StateRoot and cumulative free delta
-// directly into the alternate fixed-root page. It has the same slot and
-// full-page write discipline as SetSuperblock, but requires no separately
-// allocated state or routine free-delta page.
+// directly into the alternate fixed-root page, with no separately allocated
+// state or routine free-delta page.
 func (b *Batch) SetInlineSuperblock(root InlineSuperblock) error {
 	if b == nil || b.state.Load() != batchOwned {
 		return ErrBatchState
@@ -22,7 +21,7 @@ func (b *Batch) SetInlineSuperblock(root InlineSuperblock) error {
 	if _, err := EncodeInlineSuperblock(page, root); err != nil {
 		return err
 	}
-	offset, err := SuperblockOffset(root.Generation, root.PageSize)
+	offset, err := superblockOffset(root.Generation, root.PageSize)
 	if err != nil {
 		return err
 	}
@@ -32,10 +31,9 @@ func (b *Batch) SetInlineSuperblock(root InlineSuperblock) error {
 	return nil
 }
 
-// PublishInline selects state through an inline alternate superblock. Unlike
-// Publish, it accepts the decoded StateRoot and cumulative inline free delta
-// and requires that the transaction did not allocate a PageStateRoot extent.
-// All ordinary data pages must already be staged.
+// PublishInline selects state through an inline alternate superblock. It
+// accepts the decoded StateRoot and cumulative inline free delta. All ordinary
+// data pages must already be staged.
 func (t *WriteTransaction) PublishInline(state StateRoot, free InlineFreeDelta) error {
 	_, err := t.publishInline(state, free, nil, nil, nil)
 	return err
@@ -85,10 +83,6 @@ func (t *WriteTransaction) publishInline(
 		if write.Length == 0 {
 			return superseded,
 				fmt.Errorf("%w: unstaged transaction page", ErrInvalidWrite)
-		}
-		if write.kind == PageStateRoot {
-			return superseded,
-				fmt.Errorf("%w: inline publication allocated a state page", ErrInvalidWrite)
 		}
 	}
 	if err := t.resizePages(t.allocated); err != nil {

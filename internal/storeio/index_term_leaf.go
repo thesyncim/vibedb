@@ -31,7 +31,7 @@ const (
 	indexTermLeafDescriptorBytes = 12
 	indexTermLeafDictionaryBytes = 8
 
-	indexTermLeafVersion = byte(2)
+	indexTermLeafVersion = byte(DevelopmentFormatVersion)
 
 	indexTermLeafDirect1 = byte(iota)
 	indexTermLeafDirectN
@@ -232,30 +232,6 @@ type IndexTermLeafDirectBlockIterator struct {
 	row       uint16
 	mask      uint64
 	second    bool
-}
-
-// IndexTermLeafSingletonBlockIterator is an allocation-free cursor over a
-// singleton posting block, yielding each posting's (tile, row) directly from the
-// borrowed payload without materializing a list.
-type IndexTermLeafSingletonBlockIterator struct {
-	payload   []byte
-	tile      uint32
-	remaining uint16
-	row       uint16
-	constant  bool
-}
-
-// IndexTermLeafOneMaskBlockIterator is an allocation-free cursor over a one-mask
-// posting block, yielding each posting as a (tile, chunk, mask) triple from the
-// borrowed payload.
-type IndexTermLeafOneMaskBlockIterator struct {
-	payload   []byte
-	tile      uint32
-	remaining uint16
-	chunk     uint8
-	columnar  bool
-	mask      uint64
-	constant  bool
 }
 
 type indexTermLeafDerivedPosting struct {
@@ -892,30 +868,6 @@ func (v IndexTermLeafView) LookupDirectBlock(
 	return v.directBlockAt(index)
 }
 
-// LookupGlobalDirect is the narrow fast path for a uniformly direct leaf.
-func (v IndexTermLeafView) LookupGlobalDirect(
-	key IndexTermKeyRecord,
-) (IndexTermLeafDirectBlockView, bool) {
-	if v.flags == 0 {
-		return IndexTermLeafDirectBlockView{}, false
-	}
-	index, ok := v.lookupRecordIndex(key)
-	if !ok {
-		return IndexTermLeafDirectBlockView{}, false
-	}
-	position := int(v.globalPayloadAt) + index*int(v.globalStride)
-	end := position + int(v.globalStride)
-	return IndexTermLeafDirectBlockView{
-		payload: v.encoded[position:end:end],
-		base:    v.globalBase + uint32(index),
-		count:   1,
-		kind:    indexTermLeafGlobalDirectKind(v.flags),
-		chunk:   v.globalChunk,
-		row:     v.globalRow,
-		mask:    v.globalMask,
-	}, true
-}
-
 // LookupGlobalMask is the fused exact point path for a uniform one-posting
 // singleton or one-mask leaf.
 func (v *IndexTermLeafView) LookupGlobalMask(
@@ -1211,91 +1163,6 @@ func (b IndexTermLeafDirectBlockView) Iterator() IndexTermLeafDirectBlockIterato
 		payload: b.payload, tile: b.base, remaining: b.count, kind: b.kind,
 		chunk: b.chunk, row: b.row, mask: b.mask,
 	}
-}
-
-func (b IndexTermLeafDirectBlockView) SingletonIterator() (
-	IndexTermLeafSingletonBlockIterator,
-	bool,
-) {
-	if b.kind != indexTermLeafDirect1Contiguous &&
-		b.kind != indexTermLeafDirect1SameRow {
-		return IndexTermLeafSingletonBlockIterator{}, false
-	}
-	return IndexTermLeafSingletonBlockIterator{
-		payload: b.payload, tile: b.base, remaining: b.count,
-		row: b.row, constant: b.kind == indexTermLeafDirect1SameRow,
-	}, true
-}
-
-func (b IndexTermLeafDirectBlockView) OneMaskIterator() (
-	IndexTermLeafOneMaskBlockIterator,
-	bool,
-) {
-	if b.kind != indexTermLeafDirectN1Contiguous &&
-		b.kind != indexTermLeafDirectN1SameChunk &&
-		b.kind != indexTermLeafDirectN1SameMask {
-		return IndexTermLeafOneMaskBlockIterator{}, false
-	}
-	return IndexTermLeafOneMaskBlockIterator{
-		payload: b.payload, tile: b.base, remaining: b.count,
-		chunk: b.chunk, columnar: b.kind == indexTermLeafDirectN1SameChunk,
-		mask: b.mask, constant: b.kind == indexTermLeafDirectN1SameMask,
-	}, true
-}
-
-func (it *IndexTermLeafSingletonBlockIterator) Next() (
-	tileID uint32,
-	mask TermPostingMask,
-	ok bool,
-) {
-	if it == nil || it.remaining == 0 {
-		return 0, TermPostingMask{}, false
-	}
-	row := int(it.row)
-	if !it.constant {
-		row = int(binary.LittleEndian.Uint16(it.payload[:2]))
-		it.payload = it.payload[2:]
-	}
-	tile := it.tile
-	it.tile++
-	it.remaining--
-	return tile, TermPostingMask{
-		Chunk: uint8(row >> 6), Bits: uint64(1) << uint(row&63),
-	}, true
-}
-
-func (it *IndexTermLeafOneMaskBlockIterator) Next() (
-	tileID uint32,
-	mask TermPostingMask,
-	ok bool,
-) {
-	if it == nil || it.remaining == 0 {
-		return 0, TermPostingMask{}, false
-	}
-	if it.constant {
-		tile := it.tile
-		it.tile++
-		it.remaining--
-		return tile, TermPostingMask{
-			Chunk: it.chunk, Bits: it.mask,
-		}, true
-	}
-	if it.columnar {
-		tile := it.tile
-		mask := binary.LittleEndian.Uint64(it.payload[:8])
-		it.payload = it.payload[8:]
-		it.tile++
-		it.remaining--
-		return tile, TermPostingMask{Chunk: it.chunk, Bits: mask}, true
-	}
-	record := it.payload[:9]
-	it.payload = it.payload[9:]
-	tile := it.tile
-	it.tile++
-	it.remaining--
-	return tile, TermPostingMask{
-		Chunk: record[0], Bits: binary.LittleEndian.Uint64(record[1:9]),
-	}, true
 }
 
 func (it *IndexTermLeafDirectBlockIterator) Next() (

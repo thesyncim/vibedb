@@ -12,9 +12,9 @@ import (
 )
 
 // unifiedCompetitiveCorpus reproduces bench/competitive/corpus.go byte for
-// byte (same PCG seeds, same draw order, same substitution scheme) so the U1
-// space gate measures exactly the corpus the design's §9 arithmetic and the
-// compact baselines (81.8 / 184.5 B/doc) were measured on. The generator is
+// byte (same PCG seeds, same draw order, same substitution scheme) so the
+// space test measures exactly the corpus used for the compact baselines
+// (81.8 / 184.5 B/doc). The generator is
 // copied rather than imported because bench/competitive is a separate module
 // by design (its competitor dependencies must not leak into the root module).
 func unifiedCompetitiveCorpus(n int, high bool) ([]string, [][]byte) {
@@ -31,7 +31,7 @@ func unifiedCompetitiveCorpus(n int, high bool) ([]string, [][]byte) {
 	tagPool := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"}
 	notes := []string{
 		"steady state, no anomalies observed in the last reporting window",
-		"migrated from the legacy pipeline during the maintenance window",
+		"processed during the scheduled maintenance window",
 		"flagged for review after a threshold breach on the ingest path",
 		"nominal; retention policy applied and checkpoint acknowledged",
 	}
@@ -102,7 +102,7 @@ func unifiedCompetitiveCorpus(n int, high bool) ([]string, [][]byte) {
 }
 
 // unifiedLeafCensus walks every primary leaf through the resident router and
-// aggregates the §11 census deliverable: leaves and rows per extent, shapes
+// aggregates leaves and rows per extent, shapes
 // per leaf, dictionary entries per leaf, and the trivial-row fraction.
 type unifiedLeafCensus struct {
 	leaves         int
@@ -139,7 +139,7 @@ func collectUnifiedLeafCensus(t *testing.T, c *Collection) unifiedLeafCensus {
 		}
 		state := c.state.Load()
 		bounds := storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
+			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: uint32(4096),
 		}
@@ -163,12 +163,12 @@ func collectUnifiedLeafCensus(t *testing.T, c *Collection) unifiedLeafCensus {
 	return census
 }
 
-// TestUnifiedSpaceCompetitiveCorpus is the U1 space gate and census
+// TestUnifiedSpaceCompetitiveCorpus is the unified space and census test:
 // deliverable: both competitive corpora (100k ~249 B documents, low and high
 // cardinality) built through the unified path must land at or below the
-// compact baselines of 81.8 / 184.5 B/doc (§1.1, §9; projection 70–75 /
-// 164–171), and the template census (shapes per leaf, trivial fraction) is
-// reported for U2/U3. Skipped under -short: it builds 200k documents.
+// compact baselines of 81.8 / 184.5 B/doc, and the template census reports
+// shapes per leaf and the trivial-row fraction. Skipped under -short: it
+// builds 200k documents.
 func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 	if testing.Short() {
 		t.Skip("space gate builds two 100k-document stores")

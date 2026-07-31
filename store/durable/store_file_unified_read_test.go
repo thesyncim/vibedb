@@ -37,7 +37,7 @@ func unifiedOverflowDoc(i int) []byte {
 		i, long, i, long[:200])
 }
 
-// TestUnifiedStoreEquivalence is the U1b end-to-end functional gate at store
+// TestUnifiedStoreEquivalence is an end-to-end functional test at store
 // level: the canonical class-5 store must agree with a plain map oracle of
 // canonical spellings on point reads (present and absent keys), full ordered
 // scans, the token filter lane, and the field probe — over both competitive
@@ -58,8 +58,8 @@ func TestUnifiedStoreEquivalence(t *testing.T) {
 				oracle[keys[i]] = want[i]
 			}
 			collection := createUnifiedPrimary(t, filepath.Join(dir, "u.vibe"), keys, docs)
-			// Inject overflow documents through the mutation path (this phase's
-			// only overflow entry): the touched class-5 leaves route through the
+			// Inject overflow documents through the mutation path: the touched
+			// class-5 leaves route through the
 			// structural rewrite and the big documents ride overflow chains. The
 			// Put spelling is written canonically so the map oracle stays one
 			// canonical spelling per key.
@@ -197,7 +197,7 @@ func TestUnifiedStoreEquivalence(t *testing.T) {
 	}
 }
 
-// TestUnifiedReadZeroAlloc pins the U1 zero-allocation gate on the durable
+// TestUnifiedReadZeroAlloc pins the zero-allocation contract on the durable
 // read surface: warmed point reads, ordered scans, field probes, and token
 // filter scans allocate nothing per operation.
 func TestUnifiedReadZeroAlloc(t *testing.T) {
@@ -228,7 +228,7 @@ func TestUnifiedReadZeroAlloc(t *testing.T) {
 	}
 	// Warm the per-(leaf, template) resolution cache over every leaf first so
 	// the pin measures the steady state, not cache population (which is a
-	// boundary cost by design, §10.2).
+	// boundary cost by design).
 	for i := range keys {
 		if _, _, err := snapshot.AppendField(dst[:0], probe, []byte(keys[i])); err != nil {
 			t.Fatal(err)
@@ -272,7 +272,7 @@ func TestUnifiedReadZeroAlloc(t *testing.T) {
 	}
 }
 
-// TestUnifiedProbeCanonicalIntSpellings pins the §3.4 losslessness clause on
+// TestUnifiedProbeCanonicalIntSpellings pins canonical-integer losslessness on
 // the probe surface: integer spellings inside and outside the canonical-int
 // admission class round-trip byte-identically through the token view.
 func TestUnifiedProbeCanonicalIntSpellings(t *testing.T) {

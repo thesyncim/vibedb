@@ -250,10 +250,6 @@ func cellWireSize(cell query.Cell, typ columnType, format int16) (int, error) {
 		return len(strconv.AppendInt(scratch[:0], v, 10)), nil
 
 	case oidJSON:
-		if cell.IsExtension() {
-			return 0, newError(sqlstateInternalError,
-				"a result cell produced no JSON encoding")
-		}
 		if payload := cell.Payload(); payload != nil {
 			if len(payload) == 0 {
 				return 0, newError(sqlstateInternalError,

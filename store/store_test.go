@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/storekey"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -252,7 +253,7 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 
 	lookupSource := func(key string) []byte {
 		state := collection.state.Load()
-		loc, ok := storeKeyLookup(state.keys, maphash.String(state.seed, key), key)
+		loc, ok := storekey.Lookup(state.keys, maphash.String(state.seed, key), key)
 		if !ok {
 			t.Fatalf("missing key %q", key)
 		}

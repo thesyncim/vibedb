@@ -254,10 +254,7 @@ func TestFilePrimaryReadEpochStress(t *testing.T) {
 		)
 	}
 	t.Logf(
-		"reads=%d scans=%d writes=%d inplace=%d/%d fallbacks=%d",
+		"reads=%d scans=%d writes=%d",
 		readsDone.Load(), scansDone.Load(), writesDone.Load(),
-		collection.bufferedInplaceUpdates.Load(),
-		collection.bufferedInplaceAttempts.Load(),
-		collection.bufferedInplaceFallbacks.Load(),
 	)
 }

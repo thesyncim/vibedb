@@ -19,20 +19,18 @@ func TestCommitterSteadyAllocation(t *testing.T) {
 		}
 		clear(page)
 		copy(page, "page")
-		stateOffset := testMutableStoreDataStart(uint32(pageSize)) +
+		pageOffset := testMutableStoreDataStart(uint32(pageSize)) +
 			uint64(pageSize)*(generation-1)
-		if err := batch.SetPage(0, int64(stateOffset), pageSize); err != nil {
+		if err := batch.SetPage(0, int64(pageOffset), pageSize); err != nil {
 			panic(err)
 		}
-		if err := batch.SetSuperblock(Superblock{
-			StoreID:       storeID,
-			Generation:    generation,
-			StateOffset:   stateOffset,
-			StateLength:   uint32(pageSize),
-			StateChecksum: PageChecksum(page),
-			FileEnd:       stateOffset + uint64(pageSize),
-			PageSize:      uint32(pageSize),
-		}); err != nil {
+		root := testInlineSuperblock(generation)
+		root.StoreID = storeID
+		root.State.StoreID = storeID
+		root.PageSize = uint32(pageSize)
+		root.State.PageSize = uint32(pageSize)
+		root.FileEnd = pageOffset + uint64(pageSize)
+		if err := batch.SetInlineSuperblock(root); err != nil {
 			panic(err)
 		}
 		if err := batch.Publish(generation); err != nil {

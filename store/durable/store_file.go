@@ -328,14 +328,13 @@ func ValidateOptions(options Options) error {
 // one batched publication before its free-log fold grows past the
 // single-document baseline. Each term names the structure it pays for:
 //
-//   - one rebuilt document page per chunk the batch touches, plus one for a
-//     chunk it creates;
-//   - one batched chunk-directory descent over every touched chunk;
-//   - one batched fingerprint-directory descent over every mutated key;
-//   - one batched index-directory descent per configured index, over at most
-//     two routing edits per document, because a replaced value leaves one
-//     posting and joins another;
-//   - the free log's fold ceiling and the publication root.
+//   - one rewritten primary leaf per document;
+//   - the bounded structural primary path for every mutated key;
+//   - rewritten term leaves and catalog paths for each configured exact index;
+//   - the free log's fold ceiling.
+//
+// The alternate publication root has its own Batch buffer and is not part of
+// this transaction-page reservation.
 //
 // It is deliberately a reservation and not an invariant. A pathological tree
 // shape can exceed it, in which case the transaction's allocator refuses and
@@ -351,7 +350,7 @@ func batchMetadataBasePages(o Options, indexes int) int {
 	// batch computes its exact reservation at apply time; this is the conservative
 	// commit-buffer cap.
 	pages := documents
-	pages += fileStoreFingerprintBatchReservePages(documents)
+	pages += fileStorePrimaryBatchReservePages(documents)
 	if indexes != 0 {
 		pages += indexes * (documents + 2)
 	}
@@ -359,7 +358,7 @@ func batchMetadataBasePages(o Options, indexes int) int {
 	return pages
 }
 
-// fileStoreFingerprintBatchReservePages sizes the ordinary atomic-batch
+// fileStorePrimaryBatchReservePages sizes the ordinary atomic-batch
 // staging arena without charging every edit for all sixteen theoretical tree
 // levels. One edit can contribute a rewritten leaf, a branch, and a split
 // output; the fixed point-mutation allowance covers root promotion and the
@@ -373,11 +372,11 @@ func batchMetadataBasePages(o Options, indexes int) int {
 // atomic batch. Reserving the format-wide bound for the default 64-document
 // batch would otherwise consume thousands of staging buffers for a mutation
 // that normally publishes only a handful of pages.
-func fileStoreFingerprintBatchReservePages(edits int) int {
+func fileStorePrimaryBatchReservePages(edits int) int {
 	if edits <= 0 {
 		return 0
 	}
-	const fixed = fileStorePointFingerprintStagePages
+	const fixed = fileStorePointPrimaryStagePages
 	if edits > (math.MaxInt-fixed)/3 {
 		return math.MaxInt
 	}
@@ -402,22 +401,22 @@ func batchMetadataPages(o Options, indexes int) int {
 }
 
 const (
-	// A point fingerprint mutation has a sixteen-page maximum path. Root
+	// A point primary mutation has a sixteen-page maximum path. Root
 	// promotion can stage two more pages, while delete compaction may retire
 	// the selected page plus one sibling at every level: 2*16-1 = 31.
 	// Keeping the staged and retired geometries separate avoids charging the
 	// commit-buffer arena for immutable pages that only enter the reclaimer.
-	fileStorePointFingerprintStagePages  = 18
-	fileStorePointFingerprintRetirePages = 31
+	fileStorePointPrimaryStagePages  = 18
+	fileStorePointPrimaryRetirePages = 31
 
 	// fileStoreMetadataReservePages is the fixed share of a transaction's page
-	// reservation that is not proportional to the batch: the fingerprint
-	// tree's 18-page point ceiling, state root, chunk/index paths, and the
+	// reservation that is not proportional to the batch: the primary tree's
+	// 18-page point ceiling, exact-index paths, and the
 	// single-document free log's worst commit. A wider batch adds fold pages in
 	// batchMetadataPages because it can dirty more free-image segments
 	// atomically. Both geometries spend this baseline, which is why it is named
 	// once rather than repeated as a literal in each.
-	fileStoreMetadataReservePages = 56
+	fileStoreMetadataReservePages = 55
 )
 
 type normalizedFileStoreOptions struct {
@@ -783,7 +782,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// The class-5 overlay is bounded independently of MaxBatchDocuments: point
 	// mutations may touch as many as 64 routed buckets before pressure folds the
 	// window. That fold stages one maximum-size leaf per bucket, up to four
-	// distinct rooted parent pages per bucket, the catalog root plus StateRoot,
+	// distinct rooted parent pages per bucket, the catalog root,
 	// and the configured free-log fold reserve. The exact-index allowance is
 	// shared with the ordinary batch geometry but must coexist with this wider
 	// primary cut.
@@ -796,7 +795,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// transaction instead of relying on spare buffers.
 	const primaryOverlayParentLevels = 4
 	primaryOverlayMetadataPages :=
-		primaryOverlayParentLevels*primaryUnifiedOverlayBuckets + 2 +
+		primaryOverlayParentLevels*primaryUnifiedOverlayBuckets + 1 +
 			freeFoldLimit + storeio.FreeLogMaxIndexPages +
 			storeio.FreeLogMaxDeltaPages
 	primaryOverlayTransactionPages :=
@@ -934,11 +933,11 @@ func fileIndexHashBytes(hash uint64, src []byte) uint64 {
 }
 
 type fileStoreState struct {
-	root  storeio.StateRoot
-	super storeio.Superblock
+	root    storeio.StateRoot
+	fileEnd uint64
 	// freeHead is the newest delta page of the free log, or the zero reference
-	// when the durable free set is empty. It is reached through the superblock
-	// rather than the state root, so the whole free set is replaceable without
+	// when the durable free set is empty. The inline root's cumulative free
+	// delta reaches it directly, so the whole free set is replaceable without
 	// rewriting a directory.
 	freeHead storeio.PageRef
 }
@@ -989,14 +988,14 @@ type Collection struct {
 	// capacity-before-acquire mutation order; afterwards class-5 routes may try
 	// the allocation-free overlay before reserving structural COW capacity.
 	primaryUnifiedSeen bool
-	// primaryRouter is swapped wholesale by a structural split/merge/reclass
+	// primaryRouter is swapped wholesale by a structural split or empty reclaim
 	// transaction and mutated in place by ordinary COW UpdateLeaf. Lock-free
 	// point reads load it once; an atomic pointer keeps that swap race-free.
 	primaryRouter atomic.Pointer[storeio.ResidentPrimaryRouter]
 	// primaryEpoch is the resident exact-index epoch: the immutable fold base
 	// (encoded term leaves plus flat live table) under the generation-stamped
-	// overlay (docs/design/indexed-write-path.md §3). Non-nil only for an
-	// indexed ordered-primary collection. The pointer is swapped whole under
+	// overlay. Non-nil only for an indexed ordered-primary collection. The
+	// pointer is swapped whole under
 	// the writer/snapshotGate discipline at fold points; between folds the
 	// exclusive writer appends overlay records inside the publish fence.
 	// Retired epochs wait on the generation-keyed pending list until the
@@ -1105,10 +1104,6 @@ type Collection struct {
 	materializationFallbacks      atomic.Uint64
 	materializationSnapshotSkips  atomic.Uint64
 	materializationBusySkips      atomic.Uint64
-	bufferedInplaceAttempts       atomic.Uint64
-	bufferedInplaceUpdates        atomic.Uint64
-	bufferedInplaceFallbacks      atomic.Uint64
-	bufferedFirstTouchOverflows   atomic.Uint64
 	// journalAcks counts frame-deferred mutations made durable by a single journal
 	// append plus one sync, the redo lane's fast acknowledgement. chainAcks counts
 	// mutations whose durability instead came from a committer root fence — the
@@ -1119,8 +1114,8 @@ type Collection struct {
 	chainAcks   atomic.Uint64
 	// journalSyncs counts shared journal syncs a group-commit leader issued;
 	// journalLargestGroup is the most records one such sync covered. JournalAcks
-	// divided by JournalSyncs is the average group size — the amortization the
-	// phase-1 group commit buys.
+	// divided by JournalSyncs is the average group size provided by journal
+	// group commit.
 	journalSyncs              atomic.Uint64
 	journalLargestGroup       atomic.Uint32
 	journalDeltaCheckpoints   atomic.Uint64
@@ -1129,36 +1124,14 @@ type Collection struct {
 	journalDeltaFullFallbacks atomic.Uint64
 	primaryLeafSplitRequired  atomic.Uint64
 	primaryEmptyLeaves        atomic.Uint64
-	// Structural-transaction accounting for phase-8 split/merge/reclass. The
+	// Structural-transaction accounting for split and empty-leaf reclaim. The
 	// *MaxNS fields are the observed high-water bounded-transaction latency so a
 	// harness can gate p-max without a full histogram allocation.
 	primaryLeafSplits         atomic.Uint64
-	primaryLeafMerges         atomic.Uint64
-	primaryLeafReclass        atomic.Uint64
+	primaryEmptyReclaims      atomic.Uint64
 	primaryMacroSplitRequired atomic.Uint64
-	// mergeReclassEvaluations counts every post-delete merge/reclass evaluation
-	// (the second writer-lock acquisition after a routed delete). The rest
-	// decompose its outcome, and the whole point of the capacity-relative floor is
-	// that evaluations vastly exceeds the flush count on a byte-full corpus:
-	//   - mergeReclassWarrantedHits: passed every read-only gate and PAID A FLUSH.
-	//     This is the only counter that implies a checkpoint. It equals commits
-	//     plus the rare post-flush abort (a count-viable neighbour that turned out
-	//     to be on a different anchor page).
-	//   - mergeReclassCommits: published a structural transaction.
-	//   - mergeReclassAborts: identified a candidate but committed nothing --
-	//     mostly the read-only no-viable-neighbour abort (checkpoint-free), plus
-	//     the rare post-flush abort. Recorded as a hysteresis stamp.
-	//   - mergeReclassSkips: below-floor evaluations elided read-only because the
-	//     leaf already aborted at this exact live count (checkpoint-free).
-	// evaluations - warranted is the read-only fraction; only warranted flushes.
-	mergeReclassEvaluations   atomic.Uint64
-	mergeReclassWarrantedHits atomic.Uint64
-	mergeReclassCommits       atomic.Uint64
-	mergeReclassAborts        atomic.Uint64
-	mergeReclassSkips         atomic.Uint64
 	primarySplitMaxNS         atomic.Uint64
-	primaryMergeMaxNS         atomic.Uint64
-	primaryReclassMaxNS       atomic.Uint64
+	primaryEmptyReclaimMaxNS  atomic.Uint64
 
 	retireScratch []storeio.FreeExtent
 	// retireRefScratch mirrors exact PageRefs opportunistically for cache
@@ -1175,11 +1148,9 @@ type Collection struct {
 	materializationBlock  *storemem.Block
 	materializationBefore []byte
 	materializationAfter  []byte
-	bufferedFirstTouches  []storeio.PageRef
-	bufferedValueBefore   []byte
 	primaryLeafScratch    []byte
 	// primaryLeafMutationScratch is the second writer-owned leaf buffer plus
-	// row/render workspace used when the current U1 bridge opens a compressed
+	// row/render workspace used when the structural mutation bridge opens a compressed
 	// leaf for mutation. It must be distinct from primaryLeafScratch because
 	// the decoded view remains the source while that buffer receives the
 	// mutated image.
@@ -1252,7 +1223,7 @@ type Collection struct {
 	// flush advances the durable floor. Writer-lock owned; a flush advancing
 	// durableState past it clears it lazily in the next materialize.
 	primaryCheckpointBase *fileStoreState
-	// structuralRows is reused row scratch for a leaf split/merge re-encode. Its
+	// structuralRows is reused row scratch for leaf re-encoding. Its
 	// records borrow the source leaf page and are valid only while that page is
 	// leased inside the structural transaction.
 	structuralRows  []storeio.CommonPrimaryLeafRecord
@@ -1376,10 +1347,6 @@ type Stats struct {
 	DeviceCommits       uint64
 	CommittedBatches    uint64
 	LargestCommitGroup  uint32
-	// SuppressedRootWrites/Bytes count intermediate state pages omitted when
-	// several generations share one newest durable superblock.
-	SuppressedRootWrites uint64
-	SuppressedRootBytes  uint64
 	// SupersededRootWrites/Bytes count buffered alternate-superblock staging
 	// buffers returned before checkpoint because only a newer root can be
 	// selected.
@@ -1422,15 +1389,6 @@ type Stats struct {
 	MaterializationSnapshotSkips  uint64
 	MaterializationBusySkips      uint64
 	MaterializationScratchBytes   uint64
-	// BufferedInplace* accounts for the narrow same-size current-chunk
-	// canonical-frame lane. Fallbacks remain ordinary COW publications.
-	BufferedInplaceAttempts  uint64
-	BufferedInplaceUpdates   uint64
-	BufferedInplaceFallbacks uint64
-	// BufferedFirstTouchOverflows counts eligible ordinary COW publications
-	// that could not be remembered because the bounded per-checkpoint set was
-	// full. Those frames remain on the ordinary COW path.
-	BufferedFirstTouchOverflows uint64
 	// JournalAcks counts frame-deferred mutations acknowledged through a single
 	// recovery-journal append plus one sync, with the root publication deferred to
 	// the next checkpoint. ChainAcks counts mutations whose durability instead
@@ -1459,39 +1417,20 @@ type Stats struct {
 	// because the selected wide leaf needs the deferred structural split.
 	PrimaryLeafSplitRequired uint64
 	// PrimaryEmptyLeaves counts routed leaves currently empty (made empty and
-	// not yet refilled or reclaimed by a merge). A merge that retires an empty
-	// leaf decrements it. The counter is rebuilt from zero on Open.
+	// not yet refilled or reclaimed). The counter is rebuilt from zero on Open.
 	PrimaryEmptyLeaves uint64
-	// PrimaryLeafSplits, PrimaryLeafMerges, and PrimaryLeafReclass count the
-	// phase-8 bounded structural transactions performed this session. Reclass
-	// counts wide->narrow slot-class rewrites folded into a split or merge.
-	PrimaryLeafSplits  uint64
-	PrimaryLeafMerges  uint64
-	PrimaryLeafReclass uint64
-	// MergeReclassEvaluations counts post-delete merge/reclass evaluations (the
-	// second writer-lock acquisition each routed delete pays);
-	// MergeReclassWarranted counts the subset that proceeded to a structural
-	// transaction.
-	MergeReclassEvaluations uint64
-	MergeReclassWarranted   uint64
-	// MergeReclassCommits, MergeReclassAborts, and MergeReclassSkips decompose the
-	// merge-floor engagement. Commits published a structural transaction; aborts
-	// were warranted but found nothing viable (a checkpoint-free abort recorded
-	// for hysteresis); skips were elided read-only because the leaf already
-	// aborted at this live count. Only commits pay a flush.
-	MergeReclassCommits uint64
-	MergeReclassAborts  uint64
-	MergeReclassSkips   uint64
+	// PrimaryLeafSplits and PrimaryEmptyReclaims count the bounded structural
+	// transactions performed this session.
+	PrimaryLeafSplits    uint64
+	PrimaryEmptyReclaims uint64
 	// PrimaryMacroSplitRequired counts structural transactions that could not
 	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
 	// and a macro-tablet split (the next phase) is required.
 	PrimaryMacroSplitRequired uint64
-	// PrimarySplitMaxNS, PrimaryMergeMaxNS, and PrimaryReclassMaxNS report the
-	// high-water bounded-transaction latency in nanoseconds for each structural
-	// kind, so a harness can bound p-max without a resident histogram.
-	PrimarySplitMaxNS   uint64
-	PrimaryMergeMaxNS   uint64
-	PrimaryReclassMaxNS uint64
+	// PrimarySplitMaxNS and PrimaryEmptyReclaimMaxNS report the high-water
+	// bounded-transaction latency in nanoseconds for each structural kind.
+	PrimarySplitMaxNS        uint64
+	PrimaryEmptyReclaimMaxNS uint64
 	// PrimaryMutationScratchBytes is the fixed leaf-promotion and raw
 	// segmented-root writer scratch, allocated only for PrimaryRoot stores.
 	PrimaryMutationScratchBytes uint64
@@ -1551,17 +1490,7 @@ type Stats struct {
 	ReusableExtents       uint64
 	ReusableBytes         uint64
 	DocumentCount         uint64
-	// ChunkSlots is the stable-slot capacity in live chunks. VacantChunkSlots
-	// is the immediately reusable logical space inside those chunks; it excludes
-	// absent chunks below ChunkHighWater, which an insert can also reclaim.
-	ChunkSlots       uint64
-	VacantChunkSlots uint64
-	LiveChunks       uint32
-	// ChunkHighWater is the logical placement high-water. The difference from
-	// LiveChunks exposes completely empty historical chunks without walking the
-	// chunk directory or touching document pages.
-	ChunkHighWater uint32
-	FileEnd        uint64
+	FileEnd               uint64
 }
 
 // Create initializes an empty durable collection in file and fences its
@@ -1658,11 +1587,10 @@ func Open(file *os.File, options Options) (*Collection, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Every store is ordered-primary. A recovered root without a primary graph
-	// is a legacy chunk image this build no longer opens.
+	// The ordered-primary root is mandatory in the sole current format.
 	if root.PrimaryRoot == (storeio.PageRef{}) {
 		return nil, fmt.Errorf(
-			"vibejson: unsupported legacy chunk-layout collection (no ordered-primary root)",
+			"vibejson: collection has no ordered-primary root",
 		)
 	}
 	if root.PageSize != uint32(normalized.PageSize) ||
@@ -1689,25 +1617,15 @@ func Open(file *os.File, options Options) (*Collection, error) {
 			return nil, err
 		}
 	}
-	// Keep the old internal carrier for FileEnd and statistics while the public
-	// format uses the state-bearing inline root exclusively.
-	super := storeio.Superblock{
-		StoreID: inline.StoreID, Generation: inline.Generation,
-		FileEnd: inline.FileEnd, PageSize: inline.PageSize,
-	}
 	freeHead := inline.FreeDelta.ExternalPrev()
-	if freeHead != (storeio.PageRef{}) {
-		super.FreeOffset = freeHead.Offset
-		super.FreeLength = freeHead.Length
-	}
 	state := &fileStoreState{
-		root: root, super: super,
+		root: root, fileEnd: inline.FileEnd,
 		freeHead: freeHead,
 	}
 	collection.inlineFree = inline.FreeDelta
 	collection.pageValidator.update(state)
 	if err := validateOpenedPrimaryGraph(
-		collection.cache, root, super.FileEnd,
+		collection.cache, root, state.fileEnd,
 	); err != nil {
 		_ = collection.closeResources()
 		return nil, err
@@ -2015,11 +1933,11 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		// A fold retires the whole superseded chain on top of the commit's own
 		// retirements, so the scratch reserves both.
 		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+
-			fileStorePointFingerprintRetirePages+1+
+			fileStorePointPrimaryRetirePages+1+
 			storeio.FreeLogMaxChainPages+storeio.FreeLogMaxIndexPages+
 			options.freeFoldLimit),
 		retireRefScratch: make([]storeio.PageRef, 0, options.maxTransactionPages+
-			fileStorePointFingerprintRetirePages+1+
+			fileStorePointPrimaryRetirePages+1+
 			storeio.FreeLogMaxChainPages+storeio.FreeLogMaxIndexPages+
 			options.freeFoldLimit),
 		reusable:         reusableArena[:0],
@@ -2070,11 +1988,6 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		mutationCombiner: newPrimaryMutationCombiner(
 			options.QueueSlots, options.MaxBatchDocuments, options.MaxBatchBytes,
 		),
-	}
-	if options.Durability == DurabilityBufferedVisible {
-		collection.bufferedFirstTouches = make(
-			[]storeio.PageRef, 0, fileVisibilitySlots(options.QueueSlots),
-		)
 	}
 	if options.MaterializationDamageGranule != 0 {
 		imageArenaBytes := options.MaxPageSize + options.PageSize
@@ -2136,7 +2049,7 @@ func (c *Collection) createInitialState() error {
 	catalog, err := planFilePageCatalog(
 		c.options.pageCatalog, c.cacheStoreID(), 1,
 		uint32(c.options.PageSize), layout.DataStart,
-		storeio.StateRootLogicalID+1,
+		1,
 	)
 	if err != nil {
 		return err
@@ -2156,9 +2069,10 @@ func (c *Collection) createInitialState() error {
 			return err
 		}
 	}
-	// One leaf/tablet/catalog for the empty graph, one root when indexed, plus the
-	// state-root page PublishInline stages. The transaction reserves exactly this.
-	reserve := storeio.EmptyPrimaryGraphPageCount + 1
+	// One leaf/tablet/catalog for the empty graph, plus one exact-index root when
+	// indexed. PublishInline uses the Batch's dedicated alternate-root buffer, so
+	// it does not consume a transaction-page slot.
+	reserve := storeio.EmptyPrimaryGraphPageCount
 	if len(c.options.indexes) != 0 {
 		reserve++
 	}
@@ -2188,8 +2102,8 @@ func (c *Collection) createInitialState() error {
 	}
 	root := storeio.StateRoot{
 		StoreID: c.cacheStoreID(), Generation: 1, PageSize: uint32(c.options.PageSize),
-		NextLogicalID: tx.NextLogicalID(), ChunkDocuments: uint32(c.options.Collection.ChunkDocuments),
-		IndexCount: uint32(len(c.options.indexes)), IndexCatalogHash: c.options.indexCatalogHash,
+		NextLogicalID: tx.NextLogicalID(),
+		IndexCount:    uint32(len(c.options.indexes)), IndexCatalogHash: c.options.indexCatalogHash,
 		IndexMaxDepth:    uint32(max(c.options.Collection.IndexOptions.MaxDepth, 0)),
 		MaxKeyBytes:      uint32(c.options.MaxKeyBytes),
 		InlineValueBytes: uint32(c.options.InlineValueBytes),
@@ -2250,11 +2164,7 @@ func (c *Collection) createInitialState() error {
 		return err
 	}
 	c.cache.MarkDurable(1)
-	super := storeio.Superblock{
-		StoreID: root.StoreID, Generation: 1,
-		FileEnd: tx.FileEnd(), PageSize: uint32(c.options.PageSize),
-	}
-	state := &fileStoreState{root: root, super: super}
+	state := &fileStoreState{root: root, fileEnd: tx.FileEnd()}
 	c.inlineFree = inlineFree
 	c.pageValidator.update(state)
 	c.initializeFileState(state)
@@ -2313,7 +2223,7 @@ func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 		)
 		return deleted, err
 	}
-	return c.deletePrimaryWithMerge(key)
+	return c.deletePrimaryWithEmptyReclaim(key)
 }
 
 // Snapshot pins one immutable durable root generation. Close must be
@@ -2341,7 +2251,7 @@ type Snapshot struct {
 	// this reader's whole lifetime, and the snapshot's generation filters the
 	// records — records linked later carry strictly newer generations, so
 	// this view resolves exactly its generation's postings even as the writer
-	// keeps appending (§3's per-generation view).
+	// keeps appending.
 	epoch *primaryExactEpoch
 	lease storeio.GenerationLease
 	once  sync.Once
@@ -2775,8 +2685,6 @@ func (c *Collection) Stats() Stats {
 		),
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
-		SuppressedRootWrites:          commit.SuppressedRootWrites,
-		SuppressedRootBytes:           commit.SuppressedRootBytes,
 		SupersededRootWrites:          commit.SupersededRootWrites,
 		SupersededRootBytes:           commit.SupersededRootBytes,
 		TailWitnessWrites:             commit.TailWitnessWrites,
@@ -2797,10 +2705,6 @@ func (c *Collection) Stats() Stats {
 		MaterializationFallbacks:      c.materializationFallbacks.Load(),
 		MaterializationSnapshotSkips:  c.materializationSnapshotSkips.Load(),
 		MaterializationBusySkips:      c.materializationBusySkips.Load(),
-		BufferedInplaceAttempts:       c.bufferedInplaceAttempts.Load(),
-		BufferedInplaceUpdates:        c.bufferedInplaceUpdates.Load(),
-		BufferedInplaceFallbacks:      c.bufferedInplaceFallbacks.Load(),
-		BufferedFirstTouchOverflows:   c.bufferedFirstTouchOverflows.Load(),
 		JournalAcks:                   c.journalAcks.Load(),
 		ChainAcks:                     c.chainAcks.Load(),
 		JournalSyncs:                  c.journalSyncs.Load(),
@@ -2812,17 +2716,10 @@ func (c *Collection) Stats() Stats {
 		PrimaryLeafSplitRequired:      c.primaryLeafSplitRequired.Load(),
 		PrimaryEmptyLeaves:            c.primaryEmptyLeaves.Load(),
 		PrimaryLeafSplits:             c.primaryLeafSplits.Load(),
-		PrimaryLeafMerges:             c.primaryLeafMerges.Load(),
-		PrimaryLeafReclass:            c.primaryLeafReclass.Load(),
-		MergeReclassEvaluations:       c.mergeReclassEvaluations.Load(),
-		MergeReclassWarranted:         c.mergeReclassWarrantedHits.Load(),
-		MergeReclassCommits:           c.mergeReclassCommits.Load(),
-		MergeReclassAborts:            c.mergeReclassAborts.Load(),
-		MergeReclassSkips:             c.mergeReclassSkips.Load(),
+		PrimaryEmptyReclaims:          c.primaryEmptyReclaims.Load(),
 		PrimaryMacroSplitRequired:     c.primaryMacroSplitRequired.Load(),
 		PrimarySplitMaxNS:             c.primarySplitMaxNS.Load(),
-		PrimaryMergeMaxNS:             c.primaryMergeMaxNS.Load(),
-		PrimaryReclassMaxNS:           c.primaryReclassMaxNS.Load(),
+		PrimaryEmptyReclaimMaxNS:      c.primaryEmptyReclaimMaxNS.Load(),
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch) + len(c.primaryRootScratch),
 		),
@@ -2883,13 +2780,7 @@ func (c *Collection) Stats() Stats {
 	}
 	if state != nil {
 		stats.DocumentCount = state.root.DocumentCount
-		stats.LiveChunks = state.root.LiveChunks
-		stats.ChunkHighWater = state.root.ChunkHighWater
-		stats.ChunkSlots = uint64(state.root.LiveChunks) * uint64(state.root.ChunkDocuments)
-		if state.root.PrimaryRoot == (storeio.PageRef{}) {
-			stats.VacantChunkSlots = stats.ChunkSlots - state.root.DocumentCount
-		}
-		stats.FileEnd = state.super.FileEnd
+		stats.FileEnd = state.fileEnd
 	}
 	return stats
 }
@@ -3157,8 +3048,6 @@ func (c *Collection) closeResourcesLocked() error {
 	if c.committer != nil {
 		if err := c.committer.Close(); err != nil {
 			result = errors.Join(result, err)
-		} else if c.buffered() {
-			c.clearBufferedInplaceLocked()
 		}
 		c.cache.MarkDurable(c.committer.DurableGeneration())
 	}

@@ -38,7 +38,7 @@ func (v *fileStorePageValidator) update(state *fileStoreState) {
 	}
 	// These bounds never decrease. Publish them before the corresponding state
 	// pointer so a reader of that state cannot validate against older bounds.
-	v.fileEnd.Store(state.super.FileEnd)
+	v.fileEnd.Store(state.fileEnd)
 	v.nextLogicalID.Store(state.root.NextLogicalID)
 	v.generation.Store(state.root.Generation)
 }
@@ -48,22 +48,9 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 		return nil
 	}
 	switch ref.Kind {
-	case storeio.PageStateRoot:
-		// State roots are selected and decoded directly from the double
-		// superblock. PageCache rejects their fixed logical ID before I/O, and
-		// the validator repeats that admission boundary so a direct caller can
-		// never accidentally turn this into a second root-selection path.
-		return fmt.Errorf("%w: state roots are never collection-cache admitted",
-			storeio.ErrPageCacheReference)
 	case storeio.PageOverflow:
-		// The ordered-primary graph reaches an out-of-line value only by following
-		// its leaf record's PageRef chain; the overflow codec's vestigial chunk/slot
-		// addressing carries no meaning here, and a primary state root leaves
-		// ChunkHighWater zero. Admit overflow extents against the same fixed
-		// sentinels the producer stamps (see store_file_overflow.go).
 		_, err := storeio.OpenOverflowPage(
 			page, v.fileEnd.Load(), v.nextLogicalID.Load(), v.pageSize,
-			primaryOverflowChunkHighWater, primaryOverflowChunkDocuments,
 		)
 		return err
 	case storeio.PageFreeImage:
@@ -200,10 +187,6 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 			},
 		)
 		return err
-	case storeio.PageTabletDirectory:
-		// Reserved by format 0, but not selected by the phase-4a graph.
-		return fmt.Errorf("%w: tablet directory has no selected codec",
-			storeio.ErrPageCacheReference)
 	default:
 		// validPageKind is intentionally private to storeio, so this default is
 		// also the format-evolution tripwire: adding a durable kind cannot

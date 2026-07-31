@@ -52,11 +52,11 @@ func (s *Snapshot) rangePrimaryGraph(
 	catalogBounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
 		SelectedRootGeneration: state.root.Generation,
-		FileEnd:                state.super.FileEnd,
+		FileEnd:                state.fileEnd,
 		NextLogicalID:          state.root.NextLogicalID,
 	}
 	leafBounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           state.super.FileEnd,
+		FileEnd:           state.fileEnd,
 		NextLogicalID:     state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 	}

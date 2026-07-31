@@ -7,15 +7,6 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func (c *Collection) primaryGraphReadOnly() bool {
-	if c == nil {
-		return false
-	}
-	state := c.state.Load()
-	return state != nil &&
-		state.root.PrimaryRoot != (storeio.PageRef{})
-}
-
 // resolvePrimaryGraph appends one exact inline value through the ordered
 // primary graph selected by state. Every resident view is reconstructed from a
 // page whose complete typed validation ran once at cache admission. All leases
@@ -41,7 +32,7 @@ func (c *Collection) resolvePrimaryGraph(
 	// page-walk oracle instead. That substitution is sound here because every
 	// state a Snapshot pins was materialized under the writer first: its rooted
 	// graph carries every mutation its generation acknowledges.
-	// Load the router pointer once: a structural split/merge/reclass swaps the
+	// Load the router pointer once: a structural split or empty reclaim swaps the
 	// whole instance, so re-reading the field mid-read could observe two
 	// generations. One consistent instance plus the generation guard keeps a
 	// concurrent swap correct (a mismatch falls back to the rooted oracle).
@@ -101,7 +92,7 @@ func (c *Collection) resolvePrimaryGraphRouted(
 		dst, leafLease.Page(), state.root.StoreID, route.Bucket,
 		route.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
+			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
@@ -125,7 +116,7 @@ func (c *Collection) resolvePrimaryGraphRouted(
 // the read must instead retry against the newer publication (superseded=true).
 //
 // The opposite mismatch — the router BEHIND the pinned state — is the
-// structural swap window: a split/merge/reclass publishes its state under the
+// structural swap window: a split or empty reclaim publishes its state under the
 // snapshot gate and rebuilds the router outside it. A structural publication
 // is a checkpoint (its pending parents were folded first), so that state's
 // rooted graph is complete and the page walk is exactly right; retrying there
@@ -218,7 +209,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	bounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
 		SelectedRootGeneration: state.root.Generation,
-		FileEnd:                state.super.FileEnd,
+		FileEnd:                state.fileEnd,
 		NextLogicalID:          state.root.NextLogicalID,
 	}
 
@@ -328,7 +319,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 		dst, leafLease.Page(), state.root.StoreID, leafRoute.Bucket,
 		leafRoute.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
+			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
@@ -347,7 +338,7 @@ func validateOpenedPrimaryGraph(
 	fileEnd uint64,
 ) error {
 	if root.PrimaryRoot == (storeio.PageRef{}) {
-		return nil
+		return fmt.Errorf("vibejson: collection has no ordered-primary root")
 	}
 	bounds := storeio.GlobalTabletCatalogBounds{
 		StoreID: root.StoreID, SelectedRootGeneration: root.Generation,
@@ -550,7 +541,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		c.cache, state.root.PrimaryRoot,
 		storeio.GlobalTabletCatalogBounds{
 			StoreID: state.root.StoreID, SelectedRootGeneration: state.root.Generation,
-			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+			FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 		},
 	)
 	if err != nil {

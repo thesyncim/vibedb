@@ -71,9 +71,8 @@ absolute per-term and per-tile records; a slot-reassigning structural rewrite
 emits a bounded rebase. At a fold, affected content-defined runs or giant-term
 stripes are re-encoded through the deterministic cutter, while untouched term
 leaves carry their durable page references forward. A complete key comparison
-still decides every primary hit. See the
-[ordered-hybrid store specification](design/ordered-hybrid-store.md) for the
-measured primitives, scale bounds, and structural gates.
+still decides every primary hit. The byte-level routing and leaf bounds are
+specified in [format.md](format.md).
 
 ## Canonical frames and frame-native staging
 
@@ -136,8 +135,6 @@ representation, not a second request grammar. The `sql` package parses,
 `query` lowers onto the shared compiled evaluator, and `sql/driver` supplies
 catalog, storage, and transaction policy. This keeps SELECT and mutation
 predicates on one implementation instead of duplicating them in an adapter.
-The legacy `pgwire` constructors for a heap database or one durable collection
-remain deliberately read-only SELECT sources.
 
 Each SQL table is a durable collection plus catalog metadata for a declared
 JSON schema, one scalar document-derived primary-key path, and exact index
@@ -252,8 +249,6 @@ optimizations because they do not change what readers consult.
 
 ## Design map
 
-- [Ordered hybrid store](design/ordered-hybrid-store.md): the primary graph and
-  exact-term index.
 - [Hybrid mutations](design/hybrid-mutations.md): read-neutral batching and
   buffered checkpoints.
 - [Canonical materialization](design/canonical-materialization.md): in-place

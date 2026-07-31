@@ -442,7 +442,7 @@ func TestCatalogShimAnswersOnSCRAMAuthenticatedConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}
-	server, err := NewServer(FromSQLDatabase(database), Options{
+	server, err := NewServer(database, Options{
 		Auth: SCRAM(func(name string) (Verifier, bool) {
 			return verifier, name == "alice"
 		}),

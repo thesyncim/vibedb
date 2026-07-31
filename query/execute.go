@@ -1748,7 +1748,7 @@ func (p *plan) fillAggregateCells(dst *Result, row int, accs []aggAcc, g *group,
 }
 
 func (w *Workspace) countCell(n int) Cell {
-	return Cell{kind: KindNumber, flag: cellInteger, word: uint64(n)}
+	return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(n)}
 }
 
 func prepareResult(dst *Result, p *plan, rows int) error {

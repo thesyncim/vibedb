@@ -1,10 +1,12 @@
 package pgwire
 
 import (
+	"context"
 	"io"
 	"testing"
 
 	"github.com/thesyncim/vibedb/query"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // DataRow is the only backend message emitted once per result row. Parsing,
@@ -12,15 +14,15 @@ import (
 // query-lifetime costs; this test deliberately begins after those stages and
 // protects only the warmed per-row encoding contract.
 func TestWarmDataRowEncodingIsAllocationFree(t *testing.T) {
-	src := FromDatabase(testDatabase(t, "docs", []string{
+	db := testDatabase(t, "docs", []string{
 		`{"blob":"small"}`,
 		`{"blob":"also small"}`,
-	}))
-	lease, err := src.resolve("docs", false)
+	})
+	session, err := db.NewSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.release()
+	defer session.Close()
 
 	for _, tc := range []struct {
 		name    string
@@ -36,17 +38,18 @@ func TestWarmDataRowEncodingIsAllocationFree(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := query.PrepareStatement(tc.sql)
+			stmt, err := session.Prepare(context.Background(), tc.sql)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer stmt.Release()
+			defer stmt.Close()
 
-			var exec query.Exec
-			cursor, err := stmt.RunInto(&exec, lease.src, nil)
-			if err != nil {
+			var runtimeCursor sqldriver.Cursor
+			if err := stmt.QueryInto(context.Background(), nil, &runtimeCursor); err != nil {
 				t.Fatal(err)
 			}
+			defer runtimeCursor.Close()
+			cursor := runtimeCursor.Snapshot()
 			if !cursor.Next() {
 				t.Fatal("query returned no row")
 			}

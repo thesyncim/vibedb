@@ -11,12 +11,8 @@ import (
 )
 
 // openSyncPrimaryStructuralStore builds a seeded ordered-primary store on the
-// journal-backed synchronous lane and opens it for mutation. Every one of these
-// tests drives structural transactions (split/merge/reclass/batch-split) that no
-// other synchronous test crossed before: the pre-fix sync lane never advanced its
-// deferred durable root past a structural generation, so the first split left a
-// stale crash-recovery baseline and the next structural transaction re-planned
-// against it and failed the tablet-root/retirement page-write validation.
+// journal-backed synchronous lane and opens it for mutation. The tests drive
+// split, empty-reclaim, and batch-split transactions across durable-root changes.
 func openSyncPrimaryStructuralStore(t *testing.T) (*Collection, *os.File, string) {
 	t.Helper()
 	options := syncPrimaryJournalTestOptions()
@@ -65,7 +61,7 @@ func reopenSyncPrimaryStore(
 }
 
 // TestFilePrimarySyncLeafSplitSignal is the sync-lane analogue of
-// TestFilePrimaryLeafSplitSignal and the P0 regression gate. On the journal-backed
+// TestFilePrimaryLeafSplitSignal. On the journal-backed
 // synchronous lane it inserts well past several narrow-leaf capacities so multiple
 // leaf splits fire, and asserts every Put is accepted -- ErrPrimaryLeafSplitRequired
 // must never surface, and neither the tablet-root identity nor the overlapping
@@ -76,7 +72,7 @@ func TestFilePrimarySyncLeafSplitSignal(t *testing.T) {
 	coll, file, path := openSyncPrimaryStructuralStore(t)
 
 	// One narrow leaf holds ~195 live keys; 600 sequential inserts drive at least
-	// three splits, so the run crosses the exact second-split boundary the P0 bug
+	// three splits, so the run crosses the exact second-split boundary the root-publication bug
 	// failed at (~320 keys) and several beyond it.
 	const inserts = 600
 	oracle := map[string]string{"seed": `{"v":0}`}
@@ -139,8 +135,8 @@ func TestFilePrimarySyncLeafSplitSignal(t *testing.T) {
 // order so splits fire across the whole keyspace, validates every insert
 // immediately, then asserts a byte-exact point differential and an ordered-scan
 // differential against a map oracle. The shuffle guarantees splits land on
-// interior leaves, whose tablet-root rewrite is exactly the second-split path the
-// P0 bug broke.
+// interior leaves, whose tablet-root rewrite is exactly the second-split path
+// whose root publication this test guards.
 func TestFilePrimarySyncRoutedSplitDifferential(t *testing.T) {
 	target := 1200
 	if testing.Short() {
@@ -233,15 +229,11 @@ func TestFilePrimarySyncRoutedSplitDifferential(t *testing.T) {
 	}
 }
 
-// TestFilePrimarySyncMergeReclass exercises the delete-side structural
-// transactions on the journal-backed synchronous lane. It grows the graph past
-// several split points, then sweeps the lowest keys in ascending order so whole
-// leaves in the low keyspace thin below the capacity-relative merge floor and
-// wide leaves reclass down toward the narrow class -- firing merges, empty-leaf
-// removal, and reclass, each of which is a structural transaction that must
-// advance the deferred durable root exactly as a split does. Content is validated
-// against an oracle throughout and after a reopen.
-func TestFilePrimarySyncMergeReclass(t *testing.T) {
+// TestFilePrimarySyncEmptyLeafReclaim exercises delete-side empty-leaf
+// structural transactions on the journal-backed synchronous lane. It grows the
+// graph past several split points, then empties leaves in the low keyspace.
+// Content is validated against an oracle throughout and after a reopen.
+func TestFilePrimarySyncEmptyLeafReclaim(t *testing.T) {
 	coll, file, path := openSyncPrimaryStructuralStore(t)
 
 	const grow = 700
@@ -260,10 +252,8 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 		t.Fatal("growth phase fired no leaf splits")
 	}
 
-	// Sweep the lowest 45% in ascending key order. Concentrating the deletes empties
-	// and thins whole low-keyspace leaves -- firing merges and empty-leaf removal
-	// there, and reclass for any wide leaf passing through the narrow-comfortable
-	// band on its way down -- while the untouched upper leaves stay occupied.
+	// Sweep the lowest 45% in ascending key order. Concentrating the deletes
+	// empties whole low-keyspace leaves while the upper leaves stay occupied.
 	sort.Strings(keys)
 	shrink := grow * 45 / 100
 	buf := make([]byte, 0, 32)
@@ -278,42 +268,39 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 		}
 		delete(oracle, key)
 		// The delete is visible immediately, and a surviving key remains readable
-		// (proves the merge/reclass rewrite preserved neighbours).
+		// (proves empty-leaf reclaim preserved neighbours).
 		if _, ok, err := coll.AppendRaw(buf[:0], []byte(key)); err != nil || ok {
 			t.Fatalf("deleted key %q still visible: ok=%v err=%v", key, ok, err)
 		}
 	}
 
 	stats := coll.Stats()
-	if stats.PrimaryLeafMerges == 0 && stats.PrimaryLeafReclass == 0 &&
-		stats.PrimaryEmptyLeaves == 0 {
-		t.Fatalf("delete-heavy sync phase fired no merge, reclass, or empty-leaf removal "+
-			"(merges=%d reclass=%d empty=%d)",
-			stats.PrimaryLeafMerges, stats.PrimaryLeafReclass, stats.PrimaryEmptyLeaves)
+	if stats.PrimaryEmptyReclaims == 0 {
+		t.Fatal("delete-heavy sync phase reclaimed no empty leaves")
 	}
 	if stats.ChainAcks != 0 {
 		t.Fatalf("sync structural lane must not take the retired chain fence, got chain=%d",
 			stats.ChainAcks)
 	}
-	t.Logf("sync merge/reclass: splits=%d merges=%d reclass=%d empty=%d",
-		stats.PrimaryLeafSplits, stats.PrimaryLeafMerges,
-		stats.PrimaryLeafReclass, stats.PrimaryEmptyLeaves)
+	t.Logf("sync empty reclaim: splits=%d reclaims=%d empty=%d",
+		stats.PrimaryLeafSplits, stats.PrimaryEmptyReclaims,
+		stats.PrimaryEmptyLeaves)
 
 	// Live differential over every surviving key.
 	for key, want := range oracle {
 		got, ok, readErr := coll.AppendRaw(buf[:0], []byte(key))
 		if readErr != nil || !ok || string(got) != want {
-			t.Fatalf("post-merge readback %q = %q,%v,%v want %q", key, got, ok, readErr, want)
+			t.Fatalf("post-reclaim readback %q = %q,%v,%v want %q", key, got, ok, readErr, want)
 		}
 		buf = got
 	}
 
-	// Durability across the merge/reclass transactions.
+	// Durability across the empty-leaf reclaim transactions.
 	rc, rf := reopenSyncPrimaryStore(t, coll, file, path)
 	defer rf.Close()
 	defer rc.Close()
 	if got := snapshotCollectionContent(t, rc); !mapsEqual(got, oracle) {
-		t.Fatalf("reopen after sync merge/reclass recovered %d keys, want %d",
+		t.Fatalf("reopen after sync empty reclaim recovered %d keys, want %d",
 			len(got), len(oracle))
 	}
 }
@@ -322,8 +309,8 @@ func TestFilePrimarySyncMergeReclass(t *testing.T) {
 // boundaries on the journal-backed synchronous lane. A single Update whose members
 // span more than one leaf's capacity commits its member splits as separate
 // structural transactions before the one atomic publish; every one of those splits
-// must advance the deferred durable root, so a multi-split batch is the batch-path
-// form of the P0 regression. Batches amortize the per-mutation sync into one group
+// must advance the deferred durable root, so a multi-split batch guards the same
+// root-publication invariant. Batches amortize the per-mutation sync into one group
 // commit, so this stays fast while still crossing several split points. The batched
 // result must equal the identical sequential application and survive a reopen.
 func TestFilePrimarySyncBatchSplit(t *testing.T) {

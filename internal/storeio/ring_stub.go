@@ -34,10 +34,6 @@ func (*Ring) prepareWriteFrame(int, []byte, int64, uint64, bool) error {
 	return ErrUnavailable
 }
 
-func (*Ring) PrepareReadFixed(int, int, int, int64, uint64, bool) error {
-	return ErrUnavailable
-}
-
 func (*Ring) prepareReadArena(int, int, int, int64, uint64) error { return ErrUnavailable }
 
 func (*Ring) PrepareDataSync(int, uint64, bool) error { return ErrUnavailable }

@@ -85,9 +85,9 @@ const (
 	// unbounded allocation and keeps durable's creation clamp from drifting.
 	RecoveryJournalMaxCapacityBytes = uint64(16) << 20
 
-	recoveryJournalMagic   = "RJRNL01\x00"
+	recoveryJournalMagic   = "RJRNL00\x00"
 	recoveryJournalVersion = DevelopmentFormatVersion
-	recoveryRecordMagic    = uint32(0x314a5252) // "RRJ1", little-endian.
+	recoveryRecordMagic    = uint32(0x304a5252) // "RRJ0", little-endian.
 
 	// RecordKindPut marks a same-size inline value replacement.
 	recoveryRecordKindPut = uint16(1)
@@ -582,21 +582,6 @@ func EncodeRecoveryRecord(
 	binary.LittleEndian.PutUint32(buf[cursor:cursor+4], checksum)
 	binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], ^checksum)
 	return padded, nil
-}
-
-// EncodeRecoveryBatchRecord writes one sector-padded batch record into dst and
-// returns the exact padded length. The record carries one sequence and
-// generation over rec.Entries; a single CRC (and its complement) covers the
-// prefix and every framed entry, so a torn append fails validation and recovery
-// replays either all entries or none. dst must be at least the padded length.
-func EncodeRecoveryBatchRecord(
-	dst []byte, sectorSize uint32, rec RecoveryRecord,
-) (int, error) {
-	plan, ok := prepareRecoveryBatch(sectorSize, rec.Entries)
-	if !ok {
-		return 0, fmt.Errorf("%w: batch record length", ErrInvalidWrite)
-	}
-	return encodeRecoveryBatchRecordPrepared(dst, sectorSize, rec, plan)
 }
 
 func encodeRecoveryBatchRecordPrepared(

@@ -184,7 +184,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		// Complementing against the live universe is a metadata-only operation
 		// on a heap Snapshot (LiveMaskSource) but would need real page I/O on
 		// durable, so NOT stays unbounded for any backend that can't provide
-		// it — matching durable's historical behavior of declining NOT
+		// it — matching durable's behavior of declining NOT
 		// entirely, now expressed as an optional capability instead of a
 		// hard-coded backend split. Checked before recursing into the child: a
 		// backend that can never complete a NOT should decline it at zero cost,

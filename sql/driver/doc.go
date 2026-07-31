@@ -129,7 +129,7 @@
 // Only default and database/sql snapshot isolation are accepted. Batch
 // document and byte bounds return ErrTransactionTooLarge wrapping
 // durable.ErrBatchTooLarge without partial publication. Catalog format version
-// 2 is the current and only accepted format; this unreleased driver does not
+// 0 is the current and only accepted format; this unreleased driver does not
 // carry forward layouts with different key or index semantics.
 //
 // # Driver values

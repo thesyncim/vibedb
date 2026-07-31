@@ -281,7 +281,7 @@ type refResult struct {
 }
 
 type refCell struct {
-	kind CellKind
+	kind ValueType
 	b    bool
 	num  string // exact spelling for a projected number
 	numF float64
@@ -441,14 +441,14 @@ func refAggregateCellsGrouped(q *Query, accs []refAcc, keys []refScalar) []refCe
 func refAggCell(col Column, a refAcc) refCell {
 	switch col.agg {
 	case aggCount:
-		return refCell{kind: KindNumber, agg: true, numF: float64(a.count)}
+		return refCell{kind: TypeNumber, agg: true, numF: float64(a.count)}
 	case aggSum:
 		return refNumericOrNull(a.n, a.sum)
 	case aggAvg:
 		if a.n == 0 {
-			return refCell{kind: KindNull}
+			return refCell{kind: TypeNull}
 		}
-		return refCell{kind: KindNumber, agg: true, numF: a.sum / float64(a.n)}
+		return refCell{kind: TypeNumber, agg: true, numF: a.sum / float64(a.n)}
 	case aggMin:
 		return refNumericOrNull(a.n, a.min)
 	default: // aggMax
@@ -458,9 +458,9 @@ func refAggCell(col Column, a refAcc) refCell {
 
 func refNumericOrNull(n int, v float64) refCell {
 	if n == 0 {
-		return refCell{kind: KindNull}
+		return refCell{kind: TypeNull}
 	}
-	return refCell{kind: KindNumber, agg: true, numF: v}
+	return refCell{kind: TypeNumber, agg: true, numF: v}
 }
 
 func groupIndex(q *Query, path string) int {
@@ -751,16 +751,16 @@ func refLiteralValue(value any) (any, bool) {
 func refCellFromScalar(s refScalar) refCell {
 	switch s.kind {
 	case kindNull:
-		return refCell{kind: KindNull}
+		return refCell{kind: TypeNull}
 	case kindBool:
-		return refCell{kind: KindBool, b: s.b}
+		return refCell{kind: TypeBool, b: s.b}
 	case kindNumber:
 		f, _ := ratOf(s.num).Float64()
-		return refCell{kind: KindNumber, num: s.num, numF: f}
+		return refCell{kind: TypeNumber, num: s.num, numF: f}
 	case kindString:
-		return refCell{kind: KindString, s: s.s}
+		return refCell{kind: TypeString, s: s.s}
 	default:
-		return refCell{kind: KindJSON, raw: s.raw}
+		return refCell{kind: TypeJSON, raw: s.raw}
 	}
 }
 
@@ -793,14 +793,14 @@ func compareCell(g Cell, w refCell) string {
 		return fmt.Sprintf("kind: got %v want %v", g.Kind(), w.kind)
 	}
 	switch w.kind {
-	case KindNull:
+	case TypeNull:
 		return ""
-	case KindBool:
+	case TypeBool:
 		gb, _ := g.Bool()
 		if gb != w.b {
 			return fmt.Sprintf("bool: got %v want %v", gb, w.b)
 		}
-	case KindNumber:
+	case TypeNumber:
 		gf, _ := g.Float64()
 		if w.agg {
 			if gf != w.numF {
@@ -811,12 +811,12 @@ func compareCell(g Cell, w refCell) string {
 		if ratOf(string(g.JSON())).Cmp(ratOf(w.num)) != 0 {
 			return fmt.Sprintf("number: got %s want %s", g.JSON(), w.num)
 		}
-	case KindString:
+	case TypeString:
 		gs, _ := g.Text()
 		if gs != w.s {
 			return fmt.Sprintf("string: got %q want %q", gs, w.s)
 		}
-	case KindJSON:
+	case TypeJSON:
 		if !jsonEqual(g.JSON(), w.raw) {
 			return fmt.Sprintf("json: got %s want %s", g.JSON(), w.raw)
 		}
@@ -856,17 +856,17 @@ func dumpRef(r refResult) string {
 	for _, row := range r.rows {
 		for _, c := range row {
 			switch c.kind {
-			case KindNumber:
+			case TypeNumber:
 				if c.agg {
 					fmt.Fprintf(&b, "%v ", c.numF)
 				} else {
 					fmt.Fprintf(&b, "%s ", c.num)
 				}
-			case KindString:
+			case TypeString:
 				fmt.Fprintf(&b, "%q ", c.s)
-			case KindBool:
+			case TypeBool:
 				fmt.Fprintf(&b, "%v ", c.b)
-			case KindNull:
+			case TypeNull:
 				b.WriteString("null ")
 			default:
 				fmt.Fprintf(&b, "%s ", c.raw)

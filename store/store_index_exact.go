@@ -411,7 +411,7 @@ func (s Snapshot) exactIndex(name string) (storeIndexSnapshot, bool) {
 			hi = mid
 		}
 	}
-	if lo == len(s.state.secondary) || s.state.secondary[lo].name != name || s.state.secondary[lo].exact == nil {
+	if lo == len(s.state.secondary) || s.state.secondary[lo].name != name {
 		return storeIndexSnapshot{}, false
 	}
 	return s.state.secondary[lo], true

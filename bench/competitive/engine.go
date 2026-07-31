@@ -36,10 +36,7 @@ type Config struct {
 	// Dir is a private, empty directory the engine may fill.
 	Dir string
 	// Durability selects one explicit acknowledgement and persistence contract.
-	// The zero value preserves the historical per-engine setup, but resolves
-	// to the engine's concrete mode before construction: buffered-visible for
-	// every file-backed engine and volatile for vibejson heap. Results still
-	// print the resolved mode rather than relying on an implicit default.
+	// The zero value is buffered-visible.
 	Durability DurabilityMode
 	// Indexed asks the engine to declare and maintain a secondary index over
 	// FilterPath. Engines with no such capability ignore it.
@@ -49,8 +46,8 @@ type Config struct {
 	// keep resident. It is set to vibejson durable's default ResidentBytes.
 	CacheBytes int64
 	// StorageProfile selects which optional, engine-provided storage
-	// compression the footprint-only harnesses permit. The zero value is the
-	// historical intrinsic lane: optional competitor compression is forced
+	// compression the footprint-only harnesses permit. In the zero-value
+	// intrinsic lane, optional competitor compression is forced
 	// off so the formats are compared without an extra codec. Production
 	// enables the pinned dependency's recommended built-in block compression
 	// where one exists. Engines without such a switch accept both profiles as
@@ -84,9 +81,8 @@ const DefaultCacheBytes = 64 << 20
 type StorageProfile uint8
 
 const (
-	// StorageProfileIntrinsic preserves the original comparison: Badger and
-	// Pebble are forced to store uncompressed SST blocks, matching engines
-	// that expose no optional compression switch.
+	// StorageProfileIntrinsic forces Badger and Pebble to store uncompressed
+	// SST blocks, matching engines that expose no optional compression switch.
 	StorageProfileIntrinsic StorageProfile = iota
 	// StorageProfileProduction permits each pinned dependency's recommended
 	// built-in storage compression. Badger v4.9.5 and Pebble v1.1.5 both use
@@ -233,15 +229,9 @@ func dependencyVersion(path string) string {
 type DurabilityMode uint8
 
 const (
-	// DurabilityDefault asks the selected engine for its historical benchmark
-	// default. Constructors resolve it to one of the concrete modes below.
-	DurabilityDefault DurabilityMode = iota
-	// DurabilityVolatile is process memory only. It exists solely to label the
-	// heap engine honestly; it is never a durable competitor lane.
-	DurabilityVolatile
 	// DurabilityBufferedVisible acknowledges reader-visible state without a
 	// stable-storage barrier. Checkpoint is the explicit persistence boundary.
-	DurabilityBufferedVisible
+	DurabilityBufferedVisible DurabilityMode = iota
 	// DurabilityAsyncStableInFlight acknowledges reader-visible state after
 	// bounded admission while a stable commit continues in the background.
 	DurabilityAsyncStableInFlight
@@ -255,10 +245,6 @@ const (
 
 func (m DurabilityMode) String() string {
 	switch m {
-	case DurabilityDefault:
-		return "default"
-	case DurabilityVolatile:
-		return "volatile"
 	case DurabilityBufferedVisible:
 		return "buffered-visible"
 	case DurabilityAsyncStableInFlight:
@@ -275,10 +261,6 @@ func (m DurabilityMode) String() string {
 // ParseDurabilityMode parses the stable command-line spelling.
 func ParseDurabilityMode(value string) (DurabilityMode, error) {
 	switch value {
-	case "default":
-		return DurabilityDefault, nil
-	case "volatile":
-		return DurabilityVolatile, nil
 	case "buffered-visible":
 		return DurabilityBufferedVisible, nil
 	case "async-stable-in-flight":
@@ -288,20 +270,17 @@ func ParseDurabilityMode(value string) (DurabilityMode, error) {
 	case "power-safe":
 		return DurabilityPowerSafe, nil
 	default:
-		return DurabilityDefault, fmt.Errorf(
-			"unknown durability mode %q (want default, volatile, buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe)",
+		return DurabilityBufferedVisible, fmt.Errorf(
+			"unknown durability mode %q (want buffered-visible, async-stable-in-flight, ordinary-sync, or power-safe)",
 			value,
 		)
 	}
 }
 
-// ResolveDurabilityMode maps the historical default to an explicit mode and
-// rejects guarantee shapes the engine cannot natively provide. Unsupported
+// ResolveDurabilityMode rejects guarantee shapes the engine cannot natively
+// provide. Unsupported
 // modes are not silently weakened or strengthened into a misleading row.
 func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityMode, error) {
-	if requested == DurabilityDefault {
-		requested = DurabilityBufferedVisible
-	}
 	supported := false
 	switch engine {
 	case "vibejson-durable":
@@ -317,10 +296,10 @@ func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityM
 			requested == DurabilityOrdinarySync ||
 			requested == DurabilityPowerSafe
 	default:
-		return DurabilityDefault, fmt.Errorf("unknown engine %q", engine)
+		return DurabilityBufferedVisible, fmt.Errorf("unknown engine %q", engine)
 	}
 	if !supported {
-		return DurabilityDefault, fmt.Errorf(
+		return DurabilityBufferedVisible, fmt.Errorf(
 			"%s does not natively support durability mode %s",
 			engine, requested,
 		)

@@ -8,9 +8,8 @@ import (
 )
 
 // journalCommitGroup amortizes the buffered-journal lane's per-mutation fsync
-// across concurrent callers. It is phase 1 of the parallel-tablet-writers design
-// (docs/design/parallel-tablet-writers.md §5, §11): group-committed
-// acknowledgements on the EXISTING single writer, no tablet sharding.
+// across concurrent callers with group-committed acknowledgements on the
+// single writer.
 //
 // Each caller appends its OWN redo record under c.writer, so journal append
 // order still equals publish order still equals generation order — the on-disk
@@ -57,7 +56,7 @@ type journalCommitGroup struct {
 	// file, so a leader's Sync never races the journal's Close.
 	journal   *storeio.RecoveryJournal
 	powerSafe bool
-	// linger is Options.CommitCoalesce repurposed (design §5.3) as the optional
+	// linger is Options.CommitCoalesce, the optional
 	// upper bound a leader waits after taking the sync slot for more deposits to
 	// join its group. Zero — the default — takes neither the sleep nor any
 	// allocation, so the natural sync-in-flight window is the only window.

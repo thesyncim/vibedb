@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -40,8 +41,8 @@ func TestCreateBuildsEmptyPrimaryStore(t *testing.T) {
 				file.Close()
 				t.Fatalf("Create empty primary: %v", err)
 			}
-			if !fs.primaryGraphReadOnly() {
-				t.Fatal("freshly created store is not primary-layout")
+			if fs.state.Load().root.PrimaryRoot == (storeio.PageRef{}) {
+				t.Fatal("freshly created store has no ordered-primary root")
 			}
 			if fs.Len() != 0 {
 				t.Fatalf("empty store Len = %d, want 0", fs.Len())

@@ -183,9 +183,8 @@ func TestStoreExactIndexPhysicalAliasDeduplication(t *testing.T) {
 
 // TestStoreBuilderCollectionIndexesThroughCreateIndex pins the one index door a
 // bulk-built collection has: CreateIndex plus BackfillIndex after Build. The
-// builder itself stages no indexes — its former staging field was deleted with
-// the public declaration API — so this is also the regression guard that a
-// bulk-built collection's chunks backfill and dedup exactly like Put-built ones.
+// public declaration API is the only entry point; bulk-built chunks must
+// backfill and deduplicate exactly like Put-built ones.
 func TestStoreBuilderCollectionIndexesThroughCreateIndex(t *testing.T) {
 	builder, err := NewBuilder(Options{ChunkDocuments: 2})
 	if err != nil {

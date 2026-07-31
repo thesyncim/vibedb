@@ -78,7 +78,7 @@ func makeMaterializationTestPage(
 	page := make([]byte, ref.Length)
 	payload, err := InitPage(page, PageHeader{
 		StoreID: storeID, Generation: ref.Generation, LogicalID: ref.LogicalID,
-		PageSize: ref.Length, PayloadLength: 128, Kind: ref.Kind, Flags: ref.Flags,
+		PageSize: ref.Length, PayloadLength: 128, Kind: ref.Kind,
 	})
 	if err != nil {
 		tb.Fatal(err)
@@ -330,7 +330,7 @@ func TestMaterializationAfterPatchDigestBindsPatchGeometry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if firstDigest == secondDigest {
-		t.Fatal("MATAP002 digest did not bind patch geometry")
+		t.Fatal("after-patch digest did not bind patch geometry")
 	}
 }
 
@@ -555,13 +555,6 @@ func TestMaterializationJournalBuilderAndEncoderRejectInvalidInput(t *testing.T)
 		{"patch-order", fixture.header, fixture.targets, []MaterializationPatch{
 			fixture.patches[1], fixture.patches[0], fixture.patches[2], fixture.patches[3],
 		}},
-		{"target-aux", fixture.header, []MaterializationTarget{
-			func() MaterializationTarget {
-				target := fixture.targets[0]
-				target.Ref.Aux = 1
-				return target
-			}(),
-		}, fixture.patches[:2]},
 		{"wrong-target-store", fixture.header, []MaterializationTarget{
 			func() MaterializationTarget {
 				target := fixture.targets[0]
@@ -591,7 +584,6 @@ func TestMaterializationRejectsHybridPrimaryUntilTypedRecoveryExists(t *testing.
 	}
 	for _, kind := range []PageKind{
 		PagePrimaryCatalog,
-		PageTabletDirectory,
 		PagePrimaryLocator,
 		PageTabletRoute,
 		PagePrimaryAnchor,

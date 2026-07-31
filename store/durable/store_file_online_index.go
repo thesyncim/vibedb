@@ -851,7 +851,7 @@ catalogAddsName:
 		storeio.WriteTransactionOptions{
 			StoreID: c.storeID, Generation: generation,
 			PageSize: uint32(c.options.PageSize),
-			FileEnd:  state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+			FileEnd:  state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 			Reusable: c.reusable, ReuseJournal: c.reuseJournal,
 			ReusableIndex:    &c.freeExtentIndex,
 			ReusablePromoter: c.reusableExtentPromoter(),
@@ -907,7 +907,7 @@ catalogAddsName:
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, state, generation, state.root.PrimaryRoot,
-		freeLog.head, freeLog.checksum, freeLog.inline,
+		freeLog.head, freeLog.inline,
 		state.root.DocumentCount,
 	)
 	if err != nil {
@@ -1165,7 +1165,7 @@ func (c *Collection) stageOnlineCatalogLocked(
 		StoreID: c.storeID, Generation: generation,
 		PageSize: uint32(c.options.PageSize), DataStart: layout.DataStart,
 		FileEnd: tx.FileEnd(), NextLogicalID: tx.NextLogicalID(),
-		TotalBytes: uint32(catalog.CanonicalSize()), RequireDigest: true,
+		TotalBytes:     uint32(catalog.CanonicalSize()),
 		ExpectedDigest: catalog.Digest(),
 	}
 	for i := range pages {

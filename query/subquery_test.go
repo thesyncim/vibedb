@@ -87,7 +87,7 @@ func TestSQLUncorrelatedSubqueries(t *testing.T) {
 		{
 			name: "IN SELECT",
 			sql:  `SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = 'pro') ORDER BY id`,
-			want: "64:\"o1\"|\n64:\"o3\"|",
+			want: "4:\"o1\"|\n4:\"o3\"|",
 		},
 		{
 			name: "NOT IN null is unknown",
@@ -97,7 +97,7 @@ func TestSQLUncorrelatedSubqueries(t *testing.T) {
 		{
 			name: "EXISTS true",
 			sql:  `SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE tier = 'pro') ORDER BY id`,
-			want: "64:\"o1\"|\n64:\"o2\"|\n64:\"o3\"|\n64:\"o4\"|",
+			want: "4:\"o1\"|\n4:\"o2\"|\n4:\"o3\"|\n4:\"o4\"|",
 		},
 		{
 			name: "EXISTS false",
@@ -108,7 +108,7 @@ func TestSQLUncorrelatedSubqueries(t *testing.T) {
 		{
 			name: "scalar",
 			sql:  `SELECT id FROM orders WHERE customer = (SELECT id FROM customers WHERE score = 7)`,
-			want: "64:\"o1\"|",
+			want: "4:\"o1\"|",
 		},
 		{
 			name: "empty scalar is null",
@@ -179,14 +179,14 @@ func TestSQLSubqueryPlaceholderOrder(t *testing.T) {
 			sql: `SELECT id FROM orders WHERE id = ? OR customer IN (` +
 				`SELECT id FROM customers WHERE tier = ?) ORDER BY id`,
 			args: []any{"o2", "pro"},
-			want: "64:\"o1\"|\n64:\"o2\"|\n64:\"o3\"|",
+			want: "4:\"o1\"|\n4:\"o2\"|\n4:\"o3\"|",
 		},
 		{
 			name: "outer after nested",
 			sql: `SELECT id FROM orders WHERE customer IN (` +
 				`SELECT id FROM customers WHERE tier = ?) AND id <> ? ORDER BY id`,
 			args: []any{"pro", "o3"},
-			want: "64:\"o1\"|",
+			want: "4:\"o1\"|",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

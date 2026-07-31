@@ -14,14 +14,16 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// TestPhase0Diag attributes the buffered churn/update per-mutation CPU on the
-// exact harness shapes: bulk-load the low-cardinality 10k corpus, then replay
+// TestBufferedChurnDiagnostic attributes buffered churn/update CPU per
+// mutation on the exact harness shapes: bulk-load the low-cardinality 10k
+// corpus, then replay
 // the mixed churn trace (Zipfian keys, checkpoint every 64 mutations) under a
 // CPU profile while reading the structural and overlay counters. It is a
-// diagnostic, run explicitly with -run TestPhase0Diag, never in CI.
-func TestPhase0Diag(t *testing.T) {
-	if os.Getenv("PHASE0") == "" {
-		t.Skip("set PHASE0=1 to run the phase-0 diagnostic")
+// diagnostic, run explicitly with -run TestBufferedChurnDiagnostic, never in
+// CI.
+func TestBufferedChurnDiagnostic(t *testing.T) {
+	if os.Getenv("VIBEDB_CHURN_DIAG") == "" {
+		t.Skip("set VIBEDB_CHURN_DIAG=1 to run the churn diagnostic")
 	}
 	const (
 		corpusSize          = 10_000
@@ -64,9 +66,6 @@ func TestPhase0Diag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The chunk builder (durable.CreateFrom) and its PHASE0_CHUNK diagnostic path
-	// were removed with the chunk store; every durable store is now an ordered
-	// primary graph built by CreateFromPrimary.
 	if _, err := durable.CreateFromPrimary(built, f, opts); err != nil {
 		t.Fatal(err)
 	}
@@ -142,15 +141,13 @@ func TestPhase0Diag(t *testing.T) {
 	}
 
 	before := coll.Stats()
-	fmt.Printf("\n[after warmup] mergeEval=%d splits=%d merges=%d reclass=%d inplaceUpd=%d len=%d\n",
-		before.MergeReclassEvaluations, before.PrimaryLeafSplits,
-		before.PrimaryLeafMerges, before.PrimaryLeafReclass,
-		before.BufferedInplaceUpdates, coll.Len())
+	fmt.Printf("\n[after warmup] splits=%d emptyReclaims=%d len=%d\n",
+		before.PrimaryLeafSplits, before.PrimaryEmptyReclaims, coll.Len())
 	var updateLat, churnLat []int64
 
-	profPath := filepath.Join(os.Getenv("PHASE0_OUT"), "phase0-churn-cpu.prof")
-	if os.Getenv("PHASE0_OUT") == "" {
-		profPath = filepath.Join(dir, "phase0-churn-cpu.prof")
+	profPath := filepath.Join(os.Getenv("VIBEDB_CHURN_DIAG_OUT"), "churn-cpu.prof")
+	if os.Getenv("VIBEDB_CHURN_DIAG_OUT") == "" {
+		profPath = filepath.Join(dir, "churn-cpu.prof")
 	}
 	pf, err := os.Create(profPath)
 	if err != nil {
@@ -206,26 +203,17 @@ func TestPhase0Diag(t *testing.T) {
 
 	d := func(a, b uint64) uint64 { return b - a }
 
-	fmt.Printf("\n===== PHASE 0 DIAGNOSTIC (churn workload, buffered-visible, cp=64) =====\n")
+	fmt.Printf("\n===== CHURN DIAGNOSTIC (buffered-visible, cp=64) =====\n")
 	fmt.Printf("update  count=%d  p50=%.2fus  p99=%.2fus\n", len(updateLat), p50(updateLat), p99(updateLat))
 	fmt.Printf("churn   count=%d  p50=%.2fus  p99=%.2fus\n", len(churnLat), p50(churnLat), p99(churnLat))
 	fmt.Printf("--- counter deltas over the measured loop ---\n")
-	fmt.Printf("merge/reclass evaluations    = %d\n", d(before.MergeReclassEvaluations, after.MergeReclassEvaluations))
-	fmt.Printf("merge/reclass warranted      = %d\n", d(before.MergeReclassWarranted, after.MergeReclassWarranted))
-	fmt.Printf("merge/reclass commits        = %d\n", d(before.MergeReclassCommits, after.MergeReclassCommits))
-	fmt.Printf("merge/reclass aborts         = %d\n", d(before.MergeReclassAborts, after.MergeReclassAborts))
-	fmt.Printf("merge/reclass skips (hyst.)  = %d\n", d(before.MergeReclassSkips, after.MergeReclassSkips))
 	fmt.Printf("primary leaf splits          = %d\n", d(before.PrimaryLeafSplits, after.PrimaryLeafSplits))
-	fmt.Printf("primary leaf merges          = %d\n", d(before.PrimaryLeafMerges, after.PrimaryLeafMerges))
-	fmt.Printf("primary leaf reclass         = %d\n", d(before.PrimaryLeafReclass, after.PrimaryLeafReclass))
-	fmt.Printf("buffered inplace attempts    = %d\n", d(before.BufferedInplaceAttempts, after.BufferedInplaceAttempts))
-	fmt.Printf("buffered inplace updates     = %d\n", d(before.BufferedInplaceUpdates, after.BufferedInplaceUpdates))
-	fmt.Printf("buffered inplace fallbacks   = %d\n", d(before.BufferedInplaceFallbacks, after.BufferedInplaceFallbacks))
+	fmt.Printf("primary empty reclaims       = %d\n", d(before.PrimaryEmptyReclaims, after.PrimaryEmptyReclaims))
 	fmt.Printf("automatic checkpoints        = %d\n", d(before.AutomaticCheckpoints, after.AutomaticCheckpoints))
 	fmt.Printf("journal acks                 = %d\n", d(before.JournalAcks, after.JournalAcks))
 	fmt.Printf("chain acks                   = %d\n", d(before.ChainAcks, after.ChainAcks))
 	fmt.Printf("cpu profile written to       = %s\n", profPath)
-	fmt.Printf("=======================================================================\n")
+	fmt.Printf("========================================================\n")
 }
 
 func operationTraceLocal(reads, updates, churns int) []int {

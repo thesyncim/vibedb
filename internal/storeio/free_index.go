@@ -235,8 +235,8 @@ func validateFreeSegment(segment FreeSegment, pageSize uint32, fileEnd, nextLogi
 		segment.Ref.Offset%uint64(pageSize) != 0 ||
 		segment.Ref.Length == 0 || segment.Ref.Length%pageSize != 0 ||
 		uint64(segment.Ref.Length) > fileEnd || segment.Ref.Offset > fileEnd-uint64(segment.Ref.Length) ||
-		segment.Ref.LogicalID <= StateRootLogicalID || segment.Ref.LogicalID >= nextLogicalID ||
-		segment.Ref.Generation == 0 || segment.Ref.Flags != 0 || segment.Ref.Aux != 0 ||
+		segment.Ref.LogicalID == 0 || segment.Ref.LogicalID >= nextLogicalID ||
+		segment.Ref.Generation == 0 ||
 		int(segment.Count) > FreeImageRecordCapacity(segment.Ref.Length) ||
 		segment.FirstOffset%uint64(pageSize) != 0 ||
 		segment.FirstOffset < layout.DataStart ||

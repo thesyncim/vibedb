@@ -10,9 +10,7 @@ import (
 const (
 	PostingPagePayloadHeaderSize = 32
 	PostingSegmentHeaderSize     = 48
-	postingPageVersionV1         = uint32(1)
 	postingPageVersion           = DevelopmentFormatVersion
-	postingPageKnownFlags        = uint16(0)
 	// PostingSegmentCollision marks a certificate whose hash stream contains
 	// more than one exact scalar or compound tuple. Readers must recheck its
 	// documents.
@@ -59,7 +57,6 @@ type PostingPageHeader struct {
 	LogicalID  uint64
 	PageSize   uint32
 	IndexID    uint32
-	Flags      uint16
 }
 
 // PostingSegmentHeader is the admitted value-only metadata for one stream.
@@ -80,7 +77,6 @@ type PostingPageView struct {
 	header  PostingPageHeader
 	payload []byte
 	count   uint16
-	version uint32
 }
 
 // PostingSegmentView is one admitted segment inside a PostingPageView.
@@ -127,7 +123,6 @@ func EncodePostingPage(dst []byte, header PostingPageHeader, segments []PostingS
 	binary.LittleEndian.PutUint32(payload[0:4], postingPageVersion)
 	binary.LittleEndian.PutUint32(payload[4:8], header.IndexID)
 	binary.LittleEndian.PutUint16(payload[8:10], uint16(len(segments)))
-	binary.LittleEndian.PutUint16(payload[10:12], header.Flags)
 	binary.LittleEndian.PutUint32(payload[12:16], uint32(len(segments)*PostingSegmentHeaderSize))
 	binary.LittleEndian.PutUint32(payload[16:20], uint32(encodedBytes))
 
@@ -193,11 +188,11 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 		return PostingPageView{}, fmt.Errorf("%w: %w", ErrPostingPageCorrupt, err)
 	}
 	if pageHeader.Kind != PageIndexPosting || len(payload) < PostingPagePayloadHeaderSize ||
+		!allZero(payload[10:12]) ||
 		!allZero(payload[20:PostingPagePayloadHeaderSize]) {
 		return PostingPageView{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrPostingPageCorrupt)
 	}
-	version := binary.LittleEndian.Uint32(payload[0:4])
-	if version != postingPageVersionV1 && version != postingPageVersion {
+	if binary.LittleEndian.Uint32(payload[0:4]) != postingPageVersion {
 		return PostingPageView{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrPostingPageCorrupt)
 	}
 	count := binary.LittleEndian.Uint16(payload[8:10])
@@ -207,7 +202,6 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 		LogicalID:  pageHeader.LogicalID,
 		PageSize:   pageHeader.PageSize,
 		IndexID:    binary.LittleEndian.Uint32(payload[4:8]),
-		Flags:      binary.LittleEndian.Uint16(payload[10:12]),
 	}
 	directoryBytes := binary.LittleEndian.Uint32(payload[12:16])
 	dataBytes := binary.LittleEndian.Uint32(payload[16:20])
@@ -221,7 +215,7 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 	previousStream := uint32(0)
 	dataPosition := dataStart
 	for i := 0; i < int(count); i++ {
-		segment, _, entries, entryCount, decodeErr := decodePostingSegment(payload, i, dataStart, version)
+		segment, _, entries, entryCount, decodeErr := decodePostingSegment(payload, i, dataStart)
 		if decodeErr != nil || segment.StreamID <= previousStream ||
 			segment.Flags&^postingSegmentKnownFlags != 0 || segment.Rows == 0 ||
 			dataPosition != int(binary.LittleEndian.Uint32(postingSegmentRecord(payload, i)[32:36])) ||
@@ -249,7 +243,7 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 	if dataPosition != len(payload) {
 		return PostingPageView{}, fmt.Errorf("%w: non-canonical data packing", ErrPostingPageCorrupt)
 	}
-	return PostingPageView{header: header, payload: payload, count: count, version: version}, nil
+	return PostingPageView{header: header, payload: payload, count: count}, nil
 }
 
 // Header returns the value-only page identity.
@@ -266,7 +260,6 @@ func (v PostingPageView) SegmentAt(rank int) (PostingSegmentView, bool) {
 	header, certificate, entries, count, err := decodePostingSegment(
 		v.payload, rank,
 		PostingPagePayloadHeaderSize+int(v.count)*PostingSegmentHeaderSize,
-		v.version,
 	)
 	if err != nil {
 		return PostingSegmentView{}, false
@@ -422,10 +415,10 @@ func validatePostingPageWrite(header PostingPageHeader, segments []PostingSegmen
 
 func validatePostingPageHeader(header PostingPageHeader, count int, nextLogicalID uint64, indexHighWater uint32) error {
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
-		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
-		!validPhysicalPageSize(header.PageSize) || header.Flags&^postingPageKnownFlags != 0 ||
+		header.LogicalID == 0 || header.LogicalID >= nextLogicalID ||
+		!validPhysicalPageSize(header.PageSize) ||
 		count <= 0 || count > int(^uint16(0)) || indexHighWater == 0 || header.IndexID >= indexHighWater {
-		return fmt.Errorf("%w: posting page identity, index, flags, or count", ErrInvalidWrite)
+		return fmt.Errorf("%w: posting page identity, index, or count", ErrInvalidWrite)
 	}
 	return nil
 }
@@ -434,7 +427,7 @@ func validPostingLink(link PostingLink, currentLogicalID, nextLogicalID uint64) 
 	if link == (PostingLink{}) {
 		return true
 	}
-	return link.LogicalID > StateRootLogicalID && link.LogicalID < nextLogicalID && link.LogicalID != currentLogicalID
+	return link.LogicalID != 0 && link.LogicalID < nextLogicalID && link.LogicalID != currentLogicalID
 }
 
 func postingSegmentRecord(payload []byte, rank int) []byte {
@@ -442,16 +435,9 @@ func postingSegmentRecord(payload []byte, rank int) []byte {
 	return payload[start : start+PostingSegmentHeaderSize]
 }
 
-func decodePostingSegment(payload []byte, rank, dataStart int, version uint32) (PostingSegmentHeader, []byte, []byte, uint16, error) {
+func decodePostingSegment(payload []byte, rank, dataStart int) (PostingSegmentHeader, []byte, []byte, uint16, error) {
 	record := postingSegmentRecord(payload, rank)
-	certificateLength := uint16(0)
-	if version == postingPageVersionV1 {
-		if !allZero(record[46:48]) {
-			return PostingSegmentHeader{}, nil, nil, 0, ErrPostingPageCorrupt
-		}
-	} else {
-		certificateLength = binary.LittleEndian.Uint16(record[46:48])
-	}
+	certificateLength := binary.LittleEndian.Uint16(record[46:48])
 	offset := binary.LittleEndian.Uint32(record[32:36])
 	length := binary.LittleEndian.Uint32(record[36:40])
 	if offset < uint32(dataStart) || uint64(offset)+uint64(length) > uint64(len(payload)) || length == 0 {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/query"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // The listener, its configuration, and the registry a cancel request looks a
@@ -18,16 +19,15 @@ import (
 // # Concurrency
 //
 // One connection is one session, served by one goroutine, and a session owns
-// everything that is single-consumer: its [query.Exec], its prepared
-// statements' compilers and plans, its portals, its read and write buffers.
+// everything that is single-consumer: its SQL runtime session, its prepared
+// statements and cursors, its portals, and its read and write buffers.
 // None of it is reachable from another goroutine, which is what makes the
 // engine's single-consumer contract hold without a lock on the hot path.
 //
-// Exactly three things are shared, and each is shared deliberately. The
-// [Source] is shared; read-only shapes are safe for concurrent snapshots and a
-// SQL catalog opens one independently owned runtime session per connection.
-// The [Options] are read-only after construction. And the session registry is
-// a map guarded by a mutex, touched
+// Exactly three things are shared, and each is shared deliberately. The SQL
+// database opens one independently owned runtime session per connection. The
+// [Options] are read-only after construction. And the session registry is a
+// map guarded by a mutex, touched
 // once when a session starts, once when it ends, and once per cancel request —
 // never on a query path.
 //
@@ -84,8 +84,8 @@ type Options struct {
 
 	// Database, when non-empty, is the only database name a client may ask
 	// for. An empty Database accepts any name, which is what a single-store
-	// server usually wants: the name is a label here, because a Source is
-	// already the whole set of collections this server can reach.
+	// server usually wants: the name is a label here, because the Database is
+	// already the whole SQL catalog this server can reach.
 	Database string
 
 	// MaxConnections bounds authenticated and authenticating ordinary
@@ -132,9 +132,9 @@ type Options struct {
 	OnError func(err error)
 }
 
-// A Server serves the PostgreSQL wire protocol over one [Source].
+// A Server serves the PostgreSQL wire protocol over one SQL database.
 type Server struct {
-	src  Source
+	db   *sqldriver.Database
 	opts Options
 
 	mu        sync.Mutex
@@ -151,15 +151,14 @@ type Server struct {
 	wg sync.WaitGroup
 }
 
-// NewServer builds a server over src. It rejects an implicit authentication
+// NewServer builds a server over db. The Database is borrowed and remains the
+// caller's responsibility. Each authenticated connection owns one independent
+// SQL session, which the server closes on every disconnect path. NewServer
+// rejects an implicit authentication
 // policy and malformed resource settings before any listener is accepted.
-func NewServer(src Source, opts Options) (*Server, error) {
-	if src == nil {
-		return nil, errors.New(
-			"pgwire: a Source is required; use FromSQLDatabase, FromDatabase, or FromCollection")
-	}
-	if err := src.validate(); err != nil {
-		return nil, err
+func NewServer(db *sqldriver.Database, opts Options) (*Server, error) {
+	if db == nil {
+		return nil, errors.New("pgwire: a non-nil SQL database is required")
 	}
 	if opts.Auth == nil {
 		return nil, errors.New(
@@ -205,7 +204,7 @@ func NewServer(src Source, opts Options) (*Server, error) {
 		opts.MaxResultBytes = DefaultMaxResultBytes
 	}
 	return &Server{
-		src:       src,
+		db:        db,
 		opts:      opts,
 		sessions:  map[int32]*session{},
 		conns:     map[net.Conn]struct{}{},

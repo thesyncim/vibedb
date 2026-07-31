@@ -722,8 +722,7 @@ func recoveryPageHeaderMatchesRef(
 		header.LogicalID == ref.LogicalID &&
 		header.Generation == ref.Generation &&
 		header.PageSize == ref.Length &&
-		header.Kind == ref.Kind &&
-		header.Flags == ref.Flags
+		header.Kind == ref.Kind
 }
 
 func recoveryFreeHeaderMatchesRef(

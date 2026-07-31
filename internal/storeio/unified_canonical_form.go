@@ -8,32 +8,26 @@ import (
 	"github.com/thesyncim/vibejson/document"
 )
 
-// Canonical form of a stored document (unified-leaf design §3.2, §8).
-//
 // The stored logical value of every document is its vibejson canonical form:
 // object members stably sorted by the UTF-8 bytes of their *decoded* key,
 // duplicate members retained in original relative order, arrays in order, no
 // interstitial whitespace, string escapes normalized to the one spelling
 // vibejson's Value.AppendJSON emits, number spellings preserved verbatim.
 //
-// Per §8 this lives at the storage boundary, not in the tape builder: the
+// Canonicalization lives at the storage boundary, not in the tape builder: the
 // tape keeps reflecting the document as given, and the leaf encoder renders
-// the canonical spelling from an already-validated tape. The design names
-// these primitives tape-level library work; they are implemented here over
-// the exported tape surface (Index, IndexEntry, Node) because the vibejson
-// module is a pinned external dependency of this tree. The escape normalizer
-// below is therefore a byte-exact mirror of vibejson's
+// the canonical spelling from an already-validated tape. These primitives use
+// the exported tape surface (Index, IndexEntry, Node) because vibejson is an
+// external dependency. The escape normalizer below is a byte-exact mirror of vibejson's
 // appendJSONStringBytes, and the differential tests in
-// unified_canonical_form_test.go pin the two implementations against each
-// other, as §8 requires.
+// unified_canonical_form_test.go pin the two implementations against each other.
 //
 // Key collation is total because admission validation already rejects the
 // only ambiguous inputs: vibejson's validator refuses unpaired surrogate
 // escapes (vibejson/validate.go, validateUnicodeEscape: "missing low
 // surrogate" / "unexpected low surrogate") and invalid raw UTF-8 ("invalid
 // UTF-8 in string"), so every admitted key decodes to exactly one valid
-// UTF-8 byte string and decoded-byte order is a total, stable order (§3.2;
-// citation verified against the pinned vibejson revision).
+// UTF-8 byte string and decoded-byte order is a total, stable order.
 
 // CanonicalWorkspace holds the reusable scratch a canonical render or check
 // needs so that steady-state calls allocate nothing: member references for
@@ -59,7 +53,7 @@ type canonicalMember struct {
 	length     int32
 }
 
-// AppendCanonicalIndexed appends the canonical spelling (§3.2) of the
+// AppendCanonicalIndexed appends the canonical spelling of the
 // document behind index to dst and returns the extended slice. index must be
 // a tape built by vibejson over validated input; dst's writable capacity
 // must not overlap index.Src. The render is a deterministic pure function of
@@ -81,15 +75,15 @@ func appendCanonicalEntry(dst, src []byte, entries []vibejson.IndexEntry, i int,
 	case document.String:
 		return appendCanonicalTapeString(dst, src, entries, i, ws)
 	case document.Number, document.Bool, document.Null:
-		// Number spellings are preserved verbatim (§3.2); true/false/null
+		// Number spellings are preserved verbatim; true/false/null
 		// have exactly one grammatical spelling each, so the source span is
 		// the canonical spelling by construction.
 		return append(dst, src[e.Start:e.End]...)
 	case document.Array:
 		count := int(e.Count())
 		if count == 0 {
-			// Empty containers are scalar leaves with pinned spellings
-			// (§3.2); the source span may carry interior whitespace, so emit
+			// Empty containers are scalar leaves with pinned spellings; the
+			// source span may carry interior whitespace, so emit
 			// the literal rather than the span.
 			return append(dst, '[', ']')
 		}
@@ -113,7 +107,7 @@ func appendCanonicalEntry(dst, src []byte, entries []vibejson.IndexEntry, i int,
 }
 
 // appendCanonicalObject renders one object with members stably sorted by
-// decoded key bytes (§3.2). Member references are collected into the shared
+// decoded key bytes. Member references are collected into the shared
 // workspace slice segmented by a frame base, so nested objects reuse one
 // backing array; the frame truncates its segment (and its scratch decodes)
 // on return.
@@ -156,8 +150,8 @@ func appendCanonicalObject(dst, src []byte, entries []vibejson.IndexEntry, i int
 	if !sorted {
 		// Stable sort so duplicate keys keep their original relative order:
 		// the canonical form is a pure function of the member *sequence*,
-		// and {"a":1,"a":2} and {"a":2,"a":1} stay distinct documents
-		// (§3.2). Already-sorted input (the steady state, §8) skips this
+		// and {"a":1,"a":2} and {"a":2,"a":1} stay distinct documents.
+		// Already-sorted input skips this
 		// entirely via the sortedness scan above.
 		canonicalStableSortMembers(src, entries, ws, memberBase)
 	}
@@ -201,7 +195,7 @@ func canonicalKeyCompare(src []byte, entries []vibejson.IndexEntry, ws *Canonica
 // canonicalStableSortMembers stably sorts ws.members[base:] by decoded key.
 // Small segments use binary insertion sort; larger ones a bottom-up merge
 // through the workspace aux buffer, so no call allocates at steady state.
-// Both are stable, which §3.2 makes load-bearing for duplicate keys.
+// Both are stable because duplicate keys retain their insertion order.
 func canonicalStableSortMembers(src []byte, entries []vibejson.IndexEntry, ws *CanonicalWorkspace, base int) {
 	seg := ws.members[base:]
 	if len(seg) <= 24 {
@@ -269,7 +263,7 @@ func mergeMembers(src []byte, entries []vibejson.IndexEntry, ws *CanonicalWorksp
 
 // appendCanonicalKeyString appends the canonical quoted spelling of a member
 // key, reusing the decoded bytes the collection pass produced. If the raw
-// spelling is already canonical it is copied verbatim (the §8 steady state);
+// spelling is already canonical it is copied verbatim;
 // otherwise the decoded spelling is re-encoded.
 func appendCanonicalKeyString(dst, src []byte, entries []vibejson.IndexEntry, ws *CanonicalWorkspace, m canonicalMember) []byte {
 	ke := &entries[m.keyEntry]
@@ -285,7 +279,7 @@ func appendCanonicalKeyString(dst, src []byte, entries []vibejson.IndexEntry, ws
 
 // appendCanonicalTapeString appends the canonical quoted spelling of a
 // string value entry. Already-canonical raw spellings (the overwhelmingly
-// common case in engine-generated input, §8) are copied verbatim; everything
+// common case in engine-generated input) are copied verbatim; everything
 // else is decoded into frame scratch and re-encoded.
 func appendCanonicalTapeString(dst, src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace) []byte {
 	e := &entries[i]
@@ -304,17 +298,12 @@ func appendCanonicalTapeString(dst, src []byte, entries []vibejson.IndexEntry, i
 }
 
 // appendCanonicalQuoted appends text as a quoted, canonically escaped JSON
-// string. This is a byte-exact mirror of vibejson's appendJSONStringBytes
-// (the §3.2 escape-normalization authority): short escapes for the named
+// string. This is a byte-exact mirror of vibejson's appendJSONStringBytes:
+// short escapes for the named
 // controls, lowercase \u00xx for the rest of C0, quote and backslash
-// escaped, solidus and every other character — including U+2028/U+2029 —
-// raw. (§3.2's example of U+2028 growing into its escape describes a newer
-// library revision than the pinned one; the pinned encoder writes both
-// separators raw, and byte identity with the pinned AppendCanonicalize is
-// the gate, so this mirror follows the pinned behavior. A dependency bump
-// that starts escaping them will fail the differential test, which is the
-// signal to update this function and rawQuotedStringIsCanonical together.)
-// text is valid UTF-8 by admission (§3.2), so the replacement-rune branch
+// escaped, solidus and every other character — including U+2028/U+2029 — raw.
+// Byte identity with the pinned AppendCanonicalize implementation is the
+// contract. Text is valid UTF-8 by admission, so the replacement-rune branch
 // of the original is unreachable here and deliberately omitted — the
 // differential tests would catch any drift.
 func appendCanonicalQuoted(dst, text []byte) []byte {
@@ -358,7 +347,7 @@ func appendCanonicalQuoted(dst, text []byte) []byte {
 
 // rawQuotedStringIsCanonical reports whether a raw quoted source span (open
 // quote through close quote) is already the canonical spelling of its
-// decoded string, without decoding. It is the string half of the §8
+// decoded string, without decoding. It is the string half of the
 // already-canonical fast path. raw is trusted validated JSON, so bounds
 // inside escapes are guaranteed by the grammar.
 func rawQuotedStringIsCanonical(raw []byte) bool {
@@ -429,9 +418,9 @@ func hex4Lower(b []byte) (v int, lower bool) {
 }
 
 // IndexIsCanonical reports whether the document behind index is already in
-// canonical form (§3.2): no interstitial whitespace, every object's members
+// canonical form: no interstitial whitespace, every object's members
 // in nondecreasing decoded-key order, every string canonically escaped. It
-// is the §8 already-canonical fast check: one positional pass over the tape,
+// This is the already-canonical fast check: one positional pass over the tape,
 // no decoding except for escaped keys (needed for the order comparison), no
 // output. A true result guarantees AppendCanonicalIndexed(index) equals
 // index.Src byte for byte.
@@ -467,7 +456,7 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 		}
 		return e.End, true
 	case document.Number, document.Bool, document.Null:
-		// Verbatim-preserved spellings are canonical by definition (§3.2).
+		// Verbatim-preserved spellings are canonical by definition.
 		return e.End, true
 	case document.Array:
 		count := int(e.Count())
@@ -498,8 +487,8 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 }
 
 // canonicalCheckObject verifies member spacing, canonical key spellings, and
-// nondecreasing decoded-key order (duplicates, being equal, pass — §3.2
-// retains them in sequence order). Escaped keys decode into frame scratch
+// nondecreasing decoded-key order. Duplicate keys are equal and retain their
+// sequence order. Escaped keys decode into frame scratch
 // for the comparison; unescaped keys compare as source aliases.
 func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace) (uint32, bool) {
 	e := &entries[i]

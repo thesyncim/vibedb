@@ -45,8 +45,8 @@ func TestCellCompactTaggedLayout(t *testing.T) {
 		cell Cell
 		want string
 	}{
-		{Cell{kind: KindNumber, flag: cellInteger, word: uint64(9007199254740993)}, "9007199254740993"},
-		{Cell{kind: KindNumber, word: math.Float64bits(12.5)}, "12.5"},
+		{Cell{kind: TypeNumber, flag: cellInteger, word: uint64(9007199254740993)}, "9007199254740993"},
+		{Cell{kind: TypeNumber, word: math.Float64bits(12.5)}, "12.5"},
 	}
 	buf := make([]byte, 0, 32)
 	for _, test := range computed {
@@ -60,7 +60,7 @@ func TestCellCompactTaggedLayout(t *testing.T) {
 }
 
 func TestCellAppendJSONAllocs(t *testing.T) {
-	cell := Cell{kind: KindNumber, word: math.Float64bits(12.5)}
+	cell := Cell{kind: TypeNumber, word: math.Float64bits(12.5)}
 	buf := make([]byte, 0, 32)
 	allocs := testing.AllocsPerRun(100, func() {
 		buf = cell.AppendJSON(buf[:0])

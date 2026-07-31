@@ -7,25 +7,17 @@ import (
 )
 
 // PageCatalogBounds binds every catalog page and PageRef to the selected Store
-// image. ExpectedDigest is optional; zero disables that early rejection.
+// image. Every field is exact for a non-empty catalog.
 type PageCatalogBounds struct {
 	StoreID    [16]byte
 	Generation uint64
-	// PageSize is the Store allocation quantum and exact catalog segment
-	// extent. Zero retains the minimum-quantum spelling for standalone codec
-	// callers; durable integration always supplies the selected root value.
+	// PageSize is the Store allocation quantum and exact catalog segment extent.
 	PageSize      uint32
 	DataStart     uint64
 	FileEnd       uint64
 	NextLogicalID uint64
-	// TotalBytes is optional for standalone segment callers and exact when
-	// non-zero. Streaming durable bootstrap requires it so the complete
-	// contiguous extent is bounded before its first read.
-	TotalBytes uint32
-	// RequireDigest makes ExpectedDigest mandatory even when all sixteen bytes
-	// are zero. Existing standalone callers retain the historical non-zero
-	// fast-reject spelling when this flag is false.
-	RequireDigest  bool
+	// TotalBytes bounds the complete contiguous extent before its first read.
+	TotalBytes     uint32
 	ExpectedDigest [PageCatalogDigestSize]byte
 }
 
@@ -92,6 +84,8 @@ func EncodePageCatalogSegment(
 	pageSize, dataCapacity, geometryOK := pageCatalogSegmentGeometry(bounds)
 	segmentCountInt, countOK := catalog.SegmentCountFor(pageSize)
 	if catalog == nil || !geometryOK || !countOK ||
+		bounds.TotalBytes != uint32(catalog.CanonicalSize()) ||
+		bounds.ExpectedDigest != catalog.Digest() ||
 		segmentCountInt == 0 ||
 		segmentCountInt > int(^uint16(0)) ||
 		int(header.Ordinal) >= segmentCountInt {
@@ -147,13 +141,12 @@ func OpenPageCatalogSegment(
 	pageSize, dataCapacity, geometryOK := pageCatalogSegmentGeometry(bounds)
 	if !geometryOK ||
 		pageHeader.Kind != PageCatalogSegment ||
-		pageHeader.Flags != 0 ||
 		pageHeader.PageSize != pageSize ||
 		len(payload) < PageCatalogSegmentPayloadHeaderSize ||
 		pageHeader.StoreID != bounds.StoreID ||
 		pageHeader.Generation == 0 ||
 		pageHeader.Generation > bounds.Generation ||
-		pageHeader.LogicalID <= StateRootLogicalID ||
+		pageHeader.LogicalID == 0 ||
 		pageHeader.LogicalID >= bounds.NextLogicalID ||
 		binary.LittleEndian.Uint32(payload[0:4]) != pageCatalogSegmentVersion ||
 		!pageRefReservedZero(payload[32:64]) {
@@ -177,7 +170,7 @@ func OpenPageCatalogSegment(
 	if count == 0 || count != expectedCount || ordinal >= count ||
 		total < PageCatalogCanonicalHeaderSize ||
 		total > PageCatalogMaxCanonicalBytes ||
-		bounds.TotalBytes != 0 && total != bounds.TotalBytes ||
+		total != bounds.TotalBytes ||
 		length != expectedLength ||
 		uint64(PageCatalogSegmentPayloadHeaderSize)+uint64(length) !=
 			uint64(len(payload)) {
@@ -187,9 +180,7 @@ func OpenPageCatalogSegment(
 	}
 	var digest [PageCatalogDigestSize]byte
 	copy(digest[:], payload[16:32])
-	if (bounds.RequireDigest ||
-		bounds.ExpectedDigest != ([PageCatalogDigestSize]byte{})) &&
-		digest != bounds.ExpectedDigest {
+	if digest != bounds.ExpectedDigest {
 		return PageCatalogSegmentView{}, fmt.Errorf(
 			"%w: catalog digest", ErrPageCatalogCorrupt,
 		)
@@ -217,10 +208,6 @@ func OpenPageCatalogSegment(
 // byte image, derives every physical and logical reference from head and the
 // ordinal, validates each encoded Next against that derivation, and returns a
 // catalog that owns the image.
-//
-// Durable callers must supply exact TotalBytes and set RequireDigest. Requiring
-// the flag separately from the digest preserves an all-zero digest as a valid
-// checked value instead of overloading it as "not supplied".
 func OpenPageCatalogChainAt(
 	reader io.ReaderAt,
 	head PageRef,
@@ -231,7 +218,6 @@ func OpenPageCatalogChainAt(
 	if reader == nil || !geometryOK ||
 		bounds.TotalBytes < PageCatalogCanonicalHeaderSize ||
 		bounds.TotalBytes > PageCatalogMaxCanonicalBytes ||
-		!bounds.RequireDigest ||
 		uint64(len(scratch)) < uint64(pageSize) {
 		return nil, fmt.Errorf(
 			"%w: streaming catalog contract", ErrInvalidWrite,
@@ -415,7 +401,6 @@ func OpenPageCatalogChain(
 			pageHeader.LogicalID != chainPage.Ref.LogicalID ||
 			pageHeader.PageSize != chainPage.Ref.Length ||
 			pageHeader.Kind != chainPage.Ref.Kind ||
-			pageHeader.Flags != chainPage.Ref.Flags ||
 			view.header.Ordinal != uint16(i) ||
 			view.segmentCount != uint16(len(pages)) ||
 			view.totalBytes != first.totalBytes ||
@@ -457,10 +442,6 @@ func OpenPageCatalogChain(
 	return catalog, nil
 }
 
-func pageCatalogSegmentCount(total uint32) uint16 {
-	return pageCatalogSegmentCountFor(total, PageCatalogSegmentPageSize)
-}
-
 func pageCatalogSegmentCountFor(total, pageSize uint32) uint16 {
 	if total == 0 || total > PageCatalogMaxCanonicalBytes {
 		return 0
@@ -481,9 +462,6 @@ func pageCatalogSegmentGeometry(
 	bounds PageCatalogBounds,
 ) (uint32, int, bool) {
 	pageSize := bounds.PageSize
-	if pageSize == 0 {
-		pageSize = PageCatalogSegmentPageSize
-	}
 	capacity, ok := pageCatalogSegmentDataCapacity(pageSize)
 	return pageSize, capacity, ok
 }
@@ -511,10 +489,10 @@ func validatePageCatalogSegmentHeader(
 		bounds.DataStart%uint64(pageSize) != 0 ||
 		bounds.FileEnd < bounds.DataStart ||
 		bounds.FileEnd > maxSuperblockFileOffset ||
-		bounds.NextLogicalID <= StateRootLogicalID+1 ||
+		bounds.NextLogicalID <= 1 ||
 		header.StoreID != bounds.StoreID || header.Generation == 0 ||
 		header.Generation > bounds.Generation ||
-		header.LogicalID <= StateRootLogicalID ||
+		header.LogicalID == 0 ||
 		header.LogicalID >= bounds.NextLogicalID ||
 		segmentCount == 0 || header.Ordinal >= segmentCount {
 		return fmt.Errorf("%w: catalog segment identity", ErrInvalidWrite)
@@ -540,9 +518,8 @@ func validatePageCatalogRef(ref PageRef, bounds PageCatalogBounds) error {
 	if !geometryOK ||
 		bounds.FileEnd > maxSuperblockFileOffset ||
 		ref.Kind != PageCatalogSegment ||
-		ref.Flags != 0 || ref.Aux != 0 ||
 		ref.Generation == 0 || ref.Generation > bounds.Generation ||
-		ref.LogicalID <= StateRootLogicalID ||
+		ref.LogicalID == 0 ||
 		ref.LogicalID >= bounds.NextLogicalID ||
 		ref.Length != pageSize ||
 		ref.Offset < bounds.DataStart ||

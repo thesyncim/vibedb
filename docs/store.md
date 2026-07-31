@@ -4,12 +4,9 @@ This document describes the canonical `store` and `store/durable` APIs in the
 current tree. Public Go documentation remains authoritative for individual
 methods and option fields.
 
-The ordered primary graph's design record, scale bounds, and promotion evidence
-are in
-[design/ordered-hybrid-store.md](design/ordered-hybrid-store.md). This file
-describes the implemented APIs; [architecture.md](architecture.md) describes
-the current runtime shape and [format.md](format.md) is authoritative for
-durable bytes.
+This file describes the implemented APIs; [architecture.md](architecture.md)
+describes the current runtime shape and [format.md](format.md) is authoritative
+for durable bytes.
 
 ## Storage surfaces
 
@@ -409,13 +406,11 @@ for another.
 
 The repository currently has no replication, backup manager, point-in-time
 restore, distributed execution, or cross-file transaction. The PostgreSQL
-protocol-v3 server can expose the typed SQL catalog through `FromSQLDatabase`;
+protocol-v3 server can expose the typed SQL catalog directly;
 that path supports the documented DDL, DML, SELECT, prepared-statement, join,
 and transaction subset. A nested integration module exercises pinned pgx v5
 and lib/pq releases over loopback TCP in CI. That narrow evidence does not
-imply general PostgreSQL compatibility or catalog emulation. The legacy
-`FromDatabase` and `FromCollection` protocol sources remain deliberately
-read-only.
+imply general PostgreSQL compatibility or catalog emulation.
 
 The core does provide two multi-collection catalogs:
 

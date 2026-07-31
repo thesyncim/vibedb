@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// Token filter lane (unified-leaf design §10.3): per leaf, resolve the
+// The token filter resolves the
 // predicate path against each of the leaf's templates once (hole positions
 // legitimately differ template to template), locate the needle in the leaf
 // dictionary once, then evaluate rows from tokens without rendering — a tag
@@ -18,7 +18,7 @@ import (
 // UnifiedEqFilter is the reusable state of one equality predicate over the
 // token lane. The predicate semantics are canonical-spelling equality: the
 // value at the path matches iff its canonical spelling equals the needle's
-// canonical spelling. For strings, booleans, null, and §3.4-admissible
+// canonical spelling. For strings, booleans, null, and canonical integers
 // integers — every scalar the canonicalizer pins to one spelling per value —
 // this is exactly value equality; float spellings compare textually
 // ("5.0" != "5"), which is the documented scope of this lane. A filter is
@@ -98,10 +98,10 @@ func (f *UnifiedEqFilter) EvalRendered(doc []byte) (bool, error) {
 }
 
 // prepareLeaf derives the per-leaf token-lane state: one hole resolution per
-// template (~150 ns each, amortized over the leaf's rows, §10.3) and one
+// template (~150 ns each, amortized over the leaf's rows) and one
 // dictionary scan for the needle spelling. A dictionary hit turns every
 // dict-token compare into a single byte equality; a miss proves no dict token
-// can match, because entries store exact canonical spellings (§3.4).
+// can match, because entries store exact canonical spellings.
 func (f *UnifiedEqFilter) prepareLeaf(v *CommonPrimaryUnifiedLeafView) {
 	f.templateCount = v.templateCount
 	for id := 0; id < v.templateCount; id++ {
@@ -160,7 +160,7 @@ func (f *UnifiedEqFilter) matchBody(body []byte) (matched, needsRender, ok bool)
 		switch {
 		case tag < unifiedTokenDictLimit:
 			if at {
-				// The §10.3 one-byte compare: dictionary ids name exact
+				// Dictionary ids name exact canonical spellings, so matching
 				// canonical spellings, so id equality is spelling equality.
 				return int16(tag) == f.dict, false, true
 			}
@@ -214,7 +214,7 @@ func (f *UnifiedEqFilter) matchBody(body []byte) (matched, needsRender, ok bool)
 
 // UnifiedFilterProgress accumulates one filtered scan's counters: rows
 // matched, rows that took the render-then-filter path (the reported fallback
-// lane, §10.3), and rows scanned in total.
+// lane), and rows scanned in total.
 type UnifiedFilterProgress struct {
 	Matched  int
 	Fallback int
@@ -246,7 +246,7 @@ func (c *PrimaryGraphCursor) FilterCountEq(
 			}
 			progress.Scanned++
 			if isOverflow {
-				// Overflow documents are never templated (§6): the caller
+				// Overflow documents are never templated: the caller
 				// reassembles the chain and evaluates the rendered bytes.
 				progress.Fallback++
 				return key, decodePageRef(body), nil

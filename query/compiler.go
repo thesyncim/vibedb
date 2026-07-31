@@ -353,28 +353,6 @@ func (c *compiler) not(inner Predicate) Predicate {
 	return Predicate{kind: predNot, kids: kids}
 }
 
-// aggColumn builds an aggregate column with an interned header, the arena
-// spelling of [Sum] and its siblings.
-func (c *compiler) aggColumn(kind aggKind, name, spec string) Column {
-	return Column{agg: kind, spec: spec, header: c.aggHeader(name, spec)}
-}
-
-// countColumn builds COUNT(path) with an interned header.
-func (c *compiler) countColumn(spec string) Column {
-	return Column{agg: aggCount, spec: spec, header: c.aggHeader("count", spec)}
-}
-
-// aggHeader renders "name(spec)" into the text arena rather than concatenating
-// two strings onto the heap.
-func (c *compiler) aggHeader(name, spec string) string {
-	buf := append(c.tmp[:0], name...)
-	buf = append(buf, '(')
-	buf = append(buf, spec...)
-	buf = append(buf, ')')
-	c.tmp = buf
-	return c.intern(buf)
-}
-
 // --- chunked arenas --------------------------------------------------------
 
 // arenaChunkBytes is the byte budget of an arena's first chunk. It is a byte

@@ -203,7 +203,7 @@ func TestSCRAMAcceptsASpaceInAPassword(t *testing.T) {
 
 func TestNewServerRejectsSCRAMWithoutALookup(t *testing.T) {
 	if _, err := NewServer(
-		FromDatabase(testDatabase(t, "users", corpus)),
+		testDatabase(t, "users", corpus),
 		Options{Auth: SCRAM(nil)},
 	); err == nil {
 		t.Fatal("NewServer accepted SCRAM without a verifier lookup")
@@ -217,13 +217,14 @@ func (failingEntropyReader) Read([]byte) (int, error) {
 }
 
 func TestNewServerReportsSCRAMEntropyFailureWithoutPanicking(t *testing.T) {
+	database := testDatabase(t, "users", corpus)
 	previous := cryptorand.Reader
 	cryptorand.Reader = failingEntropyReader{}
 	t.Cleanup(func() { cryptorand.Reader = previous })
 
 	auth := SCRAM(func(string) (Verifier, bool) { return Verifier{}, false })
 	_, err := NewServer(
-		FromDatabase(testDatabase(t, "users", corpus)),
+		database,
 		Options{Auth: auth},
 	)
 	if err == nil || !strings.Contains(err.Error(), "entropy unavailable") {

@@ -254,7 +254,6 @@ func prepareCommitterMaterialization(
 			StoreID: testStoreID, Generation: generation,
 			PageSize:    uint32(committer.bufferSize),
 			MaxPageSize: uint32(committer.bufferSize), NextLogicalID: 8,
-			ChunkDocuments: 64,
 		},
 	}
 	if err := batch.SetInlineSuperblock(root); err != nil {
@@ -584,7 +583,7 @@ func TestCommitterMaterializationRecoverySeedsSequenceAndOppositeSlot(t *testing
 	committer := newMaterializationTestCommitter(t, device, CommitterOptions{
 		QueueSlots: 4, MaxPagesPerBatch: 4, GroupLimit: 4,
 	})
-	if err := committer.InitializeGenerationAt(10, 0); err != nil {
+	if err := committer.InitializeRecovery(10, 0, 9); err != nil {
 		t.Fatal(err)
 	}
 	if err := committer.InitializeMaterializationRecovery(40, 1); err != nil {
@@ -902,7 +901,6 @@ func publishOrdinaryInlineRoot(t *testing.T, committer *Committer, generation ui
 			StoreID: testStoreID, Generation: generation,
 			PageSize:    uint32(committer.bufferSize),
 			MaxPageSize: uint32(committer.bufferSize), NextLogicalID: 2,
-			ChunkDocuments: 64,
 		},
 	}
 	if err := batch.SetInlineSuperblock(root); err != nil {

@@ -300,15 +300,3 @@ func hashJoinUint(h *maphash.Hash, value uint64) {
 		value >>= 8
 	}
 }
-
-// mixJoinHash is a bijective avalanche, so adjacent integers do not land in
-// adjacent buckets and an ordinary sequence of identifiers spreads instead of
-// clustering into one chain.
-func mixJoinHash(v uint64) uint64 {
-	v ^= v >> 30
-	v *= 0xbf58476d1ce4e5b9
-	v ^= v >> 27
-	v *= 0x94d049bb133111eb
-	v ^= v >> 31
-	return v
-}

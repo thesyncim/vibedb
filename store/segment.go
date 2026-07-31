@@ -109,15 +109,11 @@ type Segment struct {
 	// The two arena recyclers. Chunks grow geometrically only up to a fixed
 	// maximum (segmentMaxSrcChunk, segmentMaxEntryChunk), so a fill whose
 	// documents need more than one chunk's worth necessarily supersedes the
-	// installed chunk and installs another — and before these existed, Reset
-	// kept only the newest generation, so the very next fill superseded it at
-	// exactly the same point and threw the replacement away again. That is one
-	// discarded megabyte per batch, forever, on any corpus whose batch outgrows
-	// a chunk: measured at 37.7 MB and 51 allocations per query on an 18-field
-	// document at the default 4096-row batch, against 1.6 kB for the same query
-	// on a 6-field one that happens to fit. Reset's own contract is what makes
-	// recycling sound: after a Reset every Index the segment handed out is
-	// invalid, so every superseded generation is storage nothing can still read.
+	// installed chunk and installs another. Retaining every chunk needed at the
+	// fill high-water mark prevents repeated arena growth for batches larger than
+	// one chunk. Reset's ownership contract makes recycling sound: every Index
+	// the segment handed out is invalid afterwards, so no superseded generation
+	// remains observable.
 	srcPool   arenaPool[byte]
 	entryPool arenaPool[vibejson.IndexEntry]
 
@@ -486,16 +482,10 @@ func (s *Segment) sealIngest() {
 // releases ingest state a published chunk will never use again, while Reset
 // keeps exactly that state and drops the documents.
 //
-// It exists for the one shape that otherwise cannot be made allocation-free: a
-// consumer that indexes a bounded batch, reads it, discards it, and does the
-// same again — a batched query executor, a streaming reducer, a fixed-window
-// aggregator. Such a consumer used to mint a fresh Segment per batch and pay
-// full geometric arena growth for each one, so its allocation count scaled with
-// batches rather than staying fixed: measured on the durable query executor's
-// batch scan, the per-batch Segment was 411 of every 430 allocations one
-// execution made and essentially all of its 33.8 MB, because every batch copied
-// its source bytes into freshly doubled arenas. After Reset the arenas reach the
-// batch high-water mark once and stay there.
+// It supports allocation-stable consumers that repeatedly index, read, and
+// discard bounded batches, such as batched query executors, streaming reducers,
+// and fixed-window aggregators. The arenas reach the batch high-water mark once
+// and stay there.
 //
 // # Ownership contract
 //

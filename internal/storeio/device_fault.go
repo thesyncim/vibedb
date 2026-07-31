@@ -99,12 +99,11 @@ type FaultDevice struct {
 	real *portableDevice
 	file *os.File
 
-	mu         sync.Mutex
-	plan       FaultPlan
-	commits    int
-	records    []FaultCommitRecord
-	faulted    bool
-	growthDone bool
+	mu      sync.Mutex
+	plan    FaultPlan
+	commits int
+	records []FaultCommitRecord
+	faulted bool
 }
 
 // OpenFaultDevice constructs a FaultDevice over file. It forces the portable

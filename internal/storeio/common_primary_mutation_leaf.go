@@ -43,7 +43,7 @@ func (s *PrimaryLeafMutationScratch) reset(count int) bool {
 }
 
 // PrimaryLeafClass reports the leaf class byte from a checksum-admitted
-// PagePrimaryLeaf. Format version 5 accepts only CommonPrimaryLeafUnified.
+// PagePrimaryLeaf. The durable format accepts only CommonPrimaryLeafUnified.
 func PrimaryLeafClass(page []byte) CommonPrimaryLeafClass {
 	header, ok := decodePageHeader(page)
 	if !ok {

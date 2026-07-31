@@ -76,7 +76,7 @@ func TestMutableStoreLayoutReservedPrefixIsNeverAllocatable(t *testing.T) {
 		}
 		root := StateRoot{
 			StoreID: storeID, Generation: 1, PageSize: pageSize,
-			MaxPageSize: pageSize, NextLogicalID: 3, ChunkDocuments: 1,
+			MaxPageSize: pageSize, NextLogicalID: 3,
 		}
 		if err := validateStatePageRef(
 			ref, PageOverflow, true, root, fileEnd,

@@ -288,16 +288,6 @@ func schemaAcceptsNode(types SchemaType, node vibejson.Node) bool {
 	return schemaAcceptsKind(types, kind)
 }
 
-func schemaAcceptsRaw(types SchemaType, raw vibejson.RawValue) bool {
-	kind := raw.Kind()
-	if kind == document.Number {
-		return types&SchemaNumber != 0 ||
-			types&SchemaInteger != 0 &&
-				storeSchemaIntegerSpelling(raw.Bytes())
-	}
-	return schemaAcceptsKind(types, kind)
-}
-
 func schemaAcceptsKind(types SchemaType, kind document.Kind) bool {
 	var want SchemaType
 	switch kind {
@@ -317,95 +307,6 @@ func schemaAcceptsKind(types SchemaType, kind document.Kind) bool {
 		return false
 	}
 	return types&want != 0
-}
-
-func storeSchemaIntegerSpelling(src []byte) bool {
-	if len(src) == 0 {
-		return false
-	}
-	at := 0
-	if src[0] == '-' {
-		at = 1
-	}
-	if at == len(src) {
-		return false
-	}
-	for ; at < len(src); at++ {
-		if src[at] < '0' || src[at] > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// ValidateSegmentRows checks one bounded micro-page batch. It gathers each
-// compiled path once across all selected ordinals, preserving shape/template
-// fast paths and amortizing selector setup across as many as 64 stable slots.
-// failed is the position in rows of a constraint failure, or -1 when err is a
-// page/path error not attributable to one row.
-func (s *Schema) ValidateSegmentRows(
-	set *Segment,
-	rows []int,
-	values []vibejson.RawValue,
-) (failed int, err error) {
-	if s == nil {
-		return -1, nil
-	}
-	for at, row := range rows {
-		root := storeSchemaDocumentRaw(set.RawAt(row))
-		if !schemaAcceptsRaw(s.root, root) {
-			return at, &SchemaViolationError{
-				Expected: s.root, Actual: root.Kind(),
-			}
-		}
-	}
-	for _, field := range s.fields {
-		result, err := set.AppendPointerRows(
-			values[:0], rows, field.pointer,
-		)
-		if err != nil {
-			return -1, err
-		}
-		if len(result) != len(rows) {
-			return -1, errors.New(
-				"vibejson: schema gather length invariant",
-			)
-		}
-		for at, value := range result {
-			if len(value.Bytes()) == 0 {
-				if !field.required {
-					continue
-				}
-				return at, &SchemaViolationError{
-					Path: field.path, Expected: field.types,
-					Missing: true,
-				}
-			}
-			if !schemaAcceptsRaw(field.types, value) {
-				return at, &SchemaViolationError{
-					Path: field.path, Expected: field.types,
-					Actual: value.Kind(),
-				}
-			}
-		}
-	}
-	return -1, nil
-}
-
-func storeSchemaDocumentRaw(src []byte) vibejson.RawValue {
-	start, end := 0, len(src)
-	for start < end && storeSchemaJSONSpace(src[start]) {
-		start++
-	}
-	for end > start && storeSchemaJSONSpace(src[end-1]) {
-		end--
-	}
-	return vibejson.RawValue{Src: src[start:end]}
-}
-
-func storeSchemaJSONSpace(value byte) bool {
-	return value == ' ' || value == '\t' ||
-		value == '\r' || value == '\n'
 }
 
 func (s *Schema) identityHash() uint64 {

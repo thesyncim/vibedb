@@ -7,10 +7,6 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
-func (c *conn) validateSurface(statement *sqlast.Statement) error {
-	return c.validateSurfaceContext(backgroundContext, statement)
-}
-
 func (c *conn) validateSurfaceContext(
 	ctx context.Context,
 	statement *sqlast.Statement,

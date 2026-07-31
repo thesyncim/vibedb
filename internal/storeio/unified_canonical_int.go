@@ -2,8 +2,6 @@ package storeio
 
 import "strconv"
 
-// The canonical-int token (unified-leaf design §3.4).
-//
 // A number spelling is admitted to the typed integer token only when it
 // matches -?(0|[1-9][0-9]{0,17}) and is not -0. Such a spelling is the
 // unique minimal decimal spelling of its int64 value, so
@@ -14,10 +12,10 @@ import "strconv"
 // number-rewriting policy: rewrite only where identity is provable; every
 // other spelling stays a verbatim literal. The differential test in
 // unified_canonical_int_test.go pins admitted ⇒ byte-identical regeneration
-// and rejected ⇒ stored-literal round-trip, as §3.4 requires.
+// and rejected ⇒ stored-literal round-trip.
 
-// CanonicalIntMaxDigits is the §3.4 digit cap that makes the int64 fit
-// proof one-directional.
+// CanonicalIntMaxDigits is the digit cap that makes the int64 fit proof
+// one-directional.
 const CanonicalIntMaxDigits = 18
 
 const canonicalDecimalPairs = "" +
@@ -33,7 +31,7 @@ const canonicalDecimalPairs = "" +
 	"90919293949596979899"
 
 // CanonicalIntValue is the admission predicate: it reports whether spelling
-// is a canonical int token (§3.4) and, when it is, the int64 value whose
+// is a canonical integer token and, when it is, the int64 value whose
 // AppendCanonicalInt spelling is byte-identical to the input.
 func CanonicalIntValue(spelling []byte) (int64, bool) {
 	digits := spelling
@@ -58,7 +56,7 @@ func CanonicalIntValue(spelling []byte) (int64, bool) {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		// No overflow possible: 18 digits max stays under 2^63 (§3.4).
+		// No overflow possible: 18 digits max stays under 2^63.
 		v = v*10 + int64(c-'0')
 	}
 	if neg {
@@ -69,7 +67,7 @@ func CanonicalIntValue(spelling []byte) (int64, bool) {
 
 // AppendCanonicalInt regenerates the canonical spelling of an admitted
 // value. For any (v, true) from CanonicalIntValue the output is
-// byte-identical to the admitted spelling — the §3.4 identity the
+// byte-identical to the admitted spelling — the identity the
 // differential test pins.
 func AppendCanonicalInt(dst []byte, v int64) []byte {
 	if v >= 0 && v < 1_000_000 {
@@ -122,7 +120,7 @@ func appendCanonicalUint6(dst []byte, v uint64) []byte {
 	}
 }
 
-// AppendZigzagVarint appends the token payload encoding of §3.4: zigzag
+// AppendZigzagVarint appends the canonical-integer token payload: zigzag
 // mapping (small magnitudes of either sign become small unsigned values)
 // followed by base-128 varint, little-endian groups, high bit as
 // continuation. At most 10 bytes; the corpus-typical 5-digit id takes 3.

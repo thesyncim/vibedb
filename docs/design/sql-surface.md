@@ -74,8 +74,7 @@ corruption instead of silently recreating an empty table.
 A separate catalog lock file holds a process-and-filesystem writer lease for
 the lifetime of the connector, so two independently opened handles cannot
 overwrite one another's schema or index changes from stale catalog copies. The
-current catalog format is version 2; other versions are rejected rather than
-migrated because this surface is not released. Schemas and index definitions
+current catalog format is version 0. Schemas and index definitions
 are recompiled and validated when the database is reopened. A catalog may hold
 at most 128 tables because this driver eagerly keeps one descriptor for every
 materialized table; the explicit ceiling leaves descriptor headroom for
@@ -488,10 +487,10 @@ leases, removes spill files, and exposes no partial materialized result.
 and reports `57014`.
 
 The typed runtime exposes the same signal through `Session.SetCancelFlag`.
-The `database/sql` compatibility adapter still does not advertise
+The `database/sql` adapter does not advertise
 `QueryerContext`, `StmtQueryContext`, or scan-shaped `StmtExecContext`: bridging
 an arbitrary context's Done channel would require a watcher goroutine or
-allocation on its legacy zero-allocation hot path. It remains cancellable
+allocation on its zero-allocation hot path. It remains cancellable
 during admission, parsing, lock acquisition, validation, and bounded write
 preparation, up to the durable publication point.
 

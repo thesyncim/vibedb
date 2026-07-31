@@ -107,7 +107,8 @@ type FreeLogPages struct {
 	Resident []bool
 }
 
-// ReplayFreeLog rebuilds the durable free set from head, the newest delta page.
+// replayExternalFreeLog rebuilds the external portion of the durable free set
+// from head, the newest delta page.
 // It walks Prev to the end of the chain, takes the segment index the newest
 // page names, reads the segments it needs, and applies the collected deltas
 // oldest-to-newest.
@@ -128,7 +129,7 @@ type FreeLogPages struct {
 // dst is appended to and must have room for limit extents; exceeding limit is
 // reported rather than grown, because the caller's arena is fixed and reusing a
 // larger Go-heap copy would silently move the free set onto the heap.
-func ReplayFreeLog(
+func replayExternalFreeLog(
 	cache *PageCache, head PageRef, bounds FreeLogBounds, dst []FreeExtent, limit, segmentBudget int,
 ) ([]FreeExtent, FreeLogPages, error) {
 	var pages FreeLogPages
@@ -155,10 +156,6 @@ func ReplayFreeLog(
 // inline are the cumulative changes after it and therefore win over every
 // external record for the same offset. IndexHead is also accepted without an
 // external delta page, which is the steady state immediately after a fold.
-//
-// ReplayFreeLog remains the compatibility entry point for external-only roots.
-// Keeping this as a separate entry point prevents existing callers from
-// accidentally changing the meaning of a zero head.
 func ReplayInlineFreeLog(
 	cache *PageCache, inline *InlineFreeDelta, bounds FreeLogBounds,
 	dst []FreeExtent, limit, segmentBudget int,

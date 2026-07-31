@@ -42,7 +42,7 @@ func TestFileStoreReplayNeverAdmitsCanonicalCatalogExtent(
 		[]storeio.FreeDelta{{
 			Op: storeio.FreeOpSet, Extent: catalogExtent,
 		}},
-		state.root.PageSize, state.super.FileEnd,
+		state.root.PageSize, state.fileEnd,
 	); err != nil {
 		t.Fatal(err)
 	}

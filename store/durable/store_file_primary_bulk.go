@@ -19,7 +19,7 @@ import (
 )
 
 // CreateFromPrimary writes one immutable ordered primary graph and publishes it
-// through StateRoot.PrimaryRoot; the retired root slots stay empty. The
+// through StateRoot.PrimaryRoot. The
 // resulting collection supports point reads, snapshots, and serialized
 // Put/Delete through the ordered-primary COW path.
 //
@@ -164,7 +164,7 @@ func CreateFromPrimary(
 	catalog, err := planFilePageCatalog(
 		normalized.pageCatalog, storeID, 1,
 		uint32(normalized.PageSize), layout.DataStart,
-		storeio.StateRootLogicalID+1,
+		1,
 	)
 	if err != nil {
 		return 0, err
@@ -238,7 +238,6 @@ func CreateFromPrimary(
 		PageSize:         uint32(normalized.PageSize),
 		DocumentCount:    uint64(len(records)),
 		NextLogicalID:    tx.NextLogicalID(),
-		ChunkDocuments:   uint32(normalized.Collection.ChunkDocuments),
 		IndexCount:       uint32(len(normalized.indexes)),
 		IndexCatalogHash: normalized.indexCatalogHash,
 		IndexMaxDepth: uint32(max(
@@ -251,6 +250,11 @@ func CreateFromPrimary(
 		ExactIndexRoot:   exactIndexRoot,
 	}
 	root.Options = fileStoreCollectionOptionFlags(normalized.Collection)
+	if normalized.MaterializationDamageGranule != 0 {
+		root.Options |= storeio.StateOptionCanonicalMaterialization
+		root.MaterializationDamageGranule =
+			uint32(normalized.MaterializationDamageGranule)
+	}
 	if err := catalog.apply(
 		&root, uint32(normalized.MaxPageSize),
 	); err != nil {
@@ -314,8 +318,8 @@ func CreateFromPrimary(
 }
 
 // canonicalizePrimaryBulkRecords rewrites every record value to its vibejson
-// canonical form (unified-leaf design §3.2). Already-canonical values — the
-// steady state for engine-generated input (§8) — are left borrowed from the
+// canonical form. Already-canonical values — the steady state for
+// engine-generated input — are left borrowed from the
 // bulk snapshot; rewritten spellings live in one arena sized up front. The
 // arena never reallocates because canonicalization can only shrink or keep a
 // document's length under the pinned encoder: whitespace is dropped and every
@@ -391,7 +395,7 @@ func primaryBulkStoreID(
 	options normalizedFileStoreOptions,
 ) [16]byte {
 	hash := sha256.New()
-	_, _ = hash.Write([]byte("vibejson unified primary bulk v1\x00"))
+	_, _ = hash.Write([]byte("vibejson unified primary bulk v0\x00"))
 	var fixed [8]byte
 	writeUint64 := func(value uint64) {
 		binary.LittleEndian.PutUint64(fixed[:], value)
@@ -399,7 +403,7 @@ func primaryBulkStoreID(
 	}
 	writeUint64(uint64(options.PageSize))
 	writeUint64(uint64(options.MaxPageSize))
-	writeUint64(uint64(options.Collection.ChunkDocuments))
+	writeUint64(uint64(options.MaterializationDamageGranule))
 	writeUint64(uint64(max(options.Collection.IndexOptions.MaxDepth, 0)))
 	writeUint64(uint64(options.MaxKeyBytes))
 	writeUint64(uint64(options.InlineValueBytes))

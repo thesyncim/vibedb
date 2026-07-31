@@ -21,12 +21,11 @@ const residentPrimaryRouterWords = 4
 // A snapshot selecting an older generation must use the rooted page-walk
 // resolver instead of this newest-generation acceleration.
 type ResidentPrimaryRouter struct {
-	storeID    [16]byte
-	fences     []byte
-	rows       []uint64
-	hints      []pageCacheFrameHint
-	empty      []atomic.Uint32
-	mergeAbort []atomic.Uint32
+	storeID [16]byte
+	fences  []byte
+	rows    []uint64
+	hints   []pageCacheFrameHint
+	empty   []atomic.Uint32
 	// searchKeys accelerates the fence binary search: one big-endian packed
 	// word per rank holding the first eight fence bytes past searchSkip, the
 	// prefix every routed fence shares. A probe is then one integer compare
@@ -88,7 +87,6 @@ func BuildResidentPrimaryRouter(
 	}
 	router.hints = make([]pageCacheFrameHint, router.Len())
 	router.empty = make([]atomic.Uint32, router.Len())
-	router.mergeAbort = make([]atomic.Uint32, router.Len())
 	router.buildSearchKeys()
 	router.generation.Store(bounds.SelectedRootGeneration)
 	router.buildNS = time.Since(started).Nanoseconds()
@@ -565,76 +563,6 @@ func (r *ResidentPrimaryRouter) AcquireLeaf(
 	return cache.acquireFrameHinted(route.Ref, &r.hints[route.rank])
 }
 
-// NeighborRoute returns the current leaf handle at the lexical rank offset delta
-// (-1 or +1) from route, for a read-only merge-viability peek: the caller
-// already holds the routed leaf and only needs a neighbour's live occupancy, so
-// no key is hashed. The handle words are sampled under the same version protocol
-// as Route so a concurrent single-writer COW handle swap is observed coherently.
-func (r *ResidentPrimaryRouter) NeighborRoute(
-	route ResidentPrimaryRoute, delta int,
-) (ResidentPrimaryRoute, bool) {
-	if r == nil {
-		return ResidentPrimaryRoute{}, false
-	}
-	rank := int(route.rank) + delta
-	if rank < 0 || rank >= r.Len() {
-		return ResidentPrimaryRoute{}, false
-	}
-	at := rank * residentPrimaryRouterWords
-	for {
-		before := r.version.Load()
-		if before&1 != 0 {
-			continue
-		}
-		offset := atomic.LoadUint64(&r.rows[at+1])
-		generation := atomic.LoadUint64(&r.rows[at+2])
-		meta := atomic.LoadUint64(&r.rows[at+3])
-		if before != r.version.Load() {
-			continue
-		}
-		bucket := BucketID(uint32(meta >> 32))
-		logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
-		if !ok {
-			return ResidentPrimaryRoute{}, false
-		}
-		return ResidentPrimaryRoute{
-			Ref: PageRef{
-				Offset: offset, LogicalID: logicalID,
-				Generation: generation, Length: uint32(meta),
-				Kind: PagePrimaryLeaf,
-			},
-			Bucket: bucket,
-			rank:   uint32(rank),
-		}, true
-	}
-}
-
-// MergeAbortedAt reports the live count at which route's leaf last aborted a
-// merge evaluation, or zero if none is recorded. The merge floor uses it for
-// hysteresis: a below-floor leaf that already found no viable neighbour at its
-// current count is skipped read-only until its count changes.
-func (r *ResidentPrimaryRouter) MergeAbortedAt(
-	route ResidentPrimaryRoute,
-) uint32 {
-	if r == nil || int(route.rank) >= len(r.mergeAbort) {
-		return 0
-	}
-	return r.mergeAbort[route.rank].Load()
-}
-
-// RecordMergeAbort stamps the live count at which route's leaf found no viable
-// merge, so the next equal-count evaluation is skipped. A subsequent insert or
-// delete changes the leaf's count and the stamp no longer matches, re-arming the
-// evaluation. A structural rebuild allocates a fresh stamp array, clearing all.
-func (r *ResidentPrimaryRouter) RecordMergeAbort(
-	route ResidentPrimaryRoute, liveCount uint32,
-) {
-	if r == nil || int(route.rank) >= len(r.mergeAbort) {
-		return
-	}
-	r.mergeAbort[route.rank].Store(liveCount)
-}
-
 func (r *ResidentPrimaryRouter) fence(rank int) []byte {
 	word := r.rows[rank*residentPrimaryRouterWords]
 	return r.fences[uint32(word):uint32(word>>32)]
@@ -654,13 +582,12 @@ func (r *ResidentPrimaryRouter) ResidentBytes() int {
 	}
 	limit := uint64(maxIntValue)
 	total := uint64(cap(r.fences))
-	terms := [6][2]uint64{
+	terms := [5][2]uint64{
 		{uint64(cap(r.rows)), 8},
 		{uint64(cap(r.hints)), 8},
 		{uint64(cap(r.searchKeys)), 8},
 		{uint64(cap(r.searchTops)), 8},
 		{uint64(cap(r.empty)), 4},
-		{uint64(cap(r.mergeAbort)), 4},
 	}
 	for _, term := range terms {
 		bytes, ok := checkedSizeMul(term[0], term[1], limit)

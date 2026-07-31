@@ -2,17 +2,19 @@ package pgwire
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/thesyncim/vibedb/store"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // A protocol client written for the tests, and the fixtures every test in this
@@ -454,18 +456,41 @@ var corpus = []string{
 	`{"id":7,"name":"eve","age":21,"tier":"free","flag":false,"ratio":2.5}`,
 }
 
-// testDatabase builds a heap database holding docs under the given collection
-// name.
-func testDatabase(t testing.TB, name string, docs []string) *store.Database {
+// testDatabase builds the current SQL catalog surface used by protocol tests.
+func testDatabase(t testing.TB, name string, docs []string) *sqldriver.Database {
 	t.Helper()
-	db := &store.Database{}
-	collection, err := db.CreateCollection(name, store.Options{})
+	db, err := sqldriver.Open(filepath.Join(t.TempDir(), "catalog.vdb"))
 	if err != nil {
-		t.Fatalf("CreateCollection(%q): %v", name, err)
+		t.Fatalf("Open SQL catalog: %v", err)
 	}
+	t.Cleanup(func() { _ = db.Close() })
+	session, err := db.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer session.Close()
+	create, err := session.Prepare(context.Background(),
+		fmt.Sprintf("CREATE TABLE %s (PRIMARY KEY (_pgwire_key))", name))
+	if err != nil {
+		t.Fatalf("prepare CREATE TABLE: %v", err)
+	}
+	if _, err := create.Exec(context.Background(), nil); err != nil {
+		t.Fatalf("CREATE TABLE %q: %v", name, err)
+	}
+	_ = create.Close()
+	insert, err := session.Prepare(context.Background(),
+		fmt.Sprintf("INSERT INTO %s VALUES (?)", name))
+	if err != nil {
+		t.Fatalf("prepare INSERT: %v", err)
+	}
+	defer insert.Close()
 	for i, doc := range docs {
-		if _, err := collection.Put(strconv.Itoa(i+1), []byte(doc)); err != nil {
-			t.Fatalf("Put: %v", err)
+		if len(doc) < 2 || doc[0] != '{' {
+			t.Fatalf("protocol fixture %d is not a JSON object", i)
+		}
+		withKey := []byte(`{"_pgwire_key":` + strconv.Quote(strconv.Itoa(i+1)) + `,` + doc[1:])
+		if _, err := insert.Exec(context.Background(), []any{withKey}); err != nil {
+			t.Fatalf("INSERT: %v", err)
 		}
 	}
 	return db
@@ -477,7 +502,7 @@ func newTestServer(t *testing.T, opts Options) *Server {
 	if opts.Auth == nil {
 		opts.Auth = Trust()
 	}
-	srv, err := NewServer(FromDatabase(testDatabase(t, "users", corpus)), opts)
+	srv, err := NewServer(testDatabase(t, "users", corpus), opts)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

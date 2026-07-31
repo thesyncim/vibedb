@@ -187,7 +187,7 @@ func (c *Committer) releaseSupersededPage(
 // future checkpoint, while the decoded state retained by live snapshots does
 // not borrow it.
 //
-// Data and state-root pages deliberately remain owned by their batches. A
+// Data pages deliberately remain owned by their batches. A
 // snapshot of an older buffered generation may fault one of those pages after
 // the checkpoint marks dirty cache entries durable; the committer has neither
 // reader nor snapshot lease knowledge with which to prove such a page dead.

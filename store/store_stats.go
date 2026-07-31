@@ -55,11 +55,11 @@ func (c *Collection) Stats() Stats {
 		return Stats{ChunkDocuments: chunkDocuments}
 	}
 	stats := Stats{
-		Generation:      state.Generation,
-		Keys:            state.Count,
-		Chunks:          state.ChunkCount,
-		ChunkHighWater:  state.Chunks.Count,
-		ChunkDocuments:  state.StateOptions.ChunkDocuments,
+		Generation:     state.Generation,
+		Keys:           state.Count,
+		Chunks:         state.ChunkCount,
+		ChunkHighWater: state.Chunks.Count,
+		ChunkDocuments: state.StateOptions.ChunkDocuments,
 		ReusableChunks: len(c.free.ids),
 		Indexes:        len(c.indexes),
 		IndexedChunks:  len(c.postingChunks.ids),
@@ -68,7 +68,7 @@ func (c *Collection) Stats() Stats {
 	stats.ExternalDocumentBytes = state.mappedDocs.externalBytes()
 	visit := c.nextExactIndexVisitLocked()
 	for _, index := range c.indexes {
-		if index.exact == nil || index.visit == visit {
+		if index.visit == visit {
 			continue
 		}
 		index.visit = visit

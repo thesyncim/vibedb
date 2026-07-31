@@ -15,33 +15,17 @@ const (
 	// aligned and lets checksum code consume one contiguous prefix.
 	PageTrailerSize = 8
 
-	pageMagic = "SJPAGE01"
-	// pageVersion is 5 because ordered-primary leaves now have one canonical
-	// class-5 grammar. Version 4 admitted the superseded raw, template-columnar,
-	// and compact leaf classes, so accepting it would silently preserve a
-	// compatibility branch the unreleased format does not owe.
-	// The store has never been released; there is deliberately no migration
-	// path.
-	pageVersion = uint16(5)
+	pageMagic   = "SJPAGE00"
+	pageVersion = uint16(DevelopmentFormatVersion)
 )
 
 // ErrPageCorrupt reports a malformed, truncated, or checksum-invalid common
 // Store page.
 var ErrPageCorrupt = errors.New("vibejson: corrupt Store page")
 
-// DevelopmentFormatVersion is the schema version every on-disk structure in
-// this package carries while the format is under development.
-//
-// Nothing is released, so no file written by anyone else exists and there is no
-// compatibility ladder to climb. A layout change therefore edits its schema in
-// place instead of adding a version, and every file written before the change
-// simply stops opening — which is the intended outcome, not a regression.
-//
-// Sharing one constant is deliberate. Independent per-schema numbers invite
-// exactly the wasted care they imply: decode paths that branch on versions no
-// file can hold, and reviewers preserving compatibility with nothing. The first
-// release replaces this with a real number per schema and starts the ladder for
-// real.
+// DevelopmentFormatVersion is zero for every on-disk schema while the format
+// is unreleased. Layout changes edit schema zero in place and obsolete images
+// fail closed; there are no compatibility decoders or per-schema versions.
 const DevelopmentFormatVersion = uint32(0)
 
 // PageKind identifies the pointer-free payload schema inside a common page.
@@ -49,51 +33,22 @@ const DevelopmentFormatVersion = uint32(0)
 type PageKind uint8
 
 const (
-	// PageStateRoot is the published generation root; it names every current
-	// durable structure and is the page recovery selects an image from.
-	PageStateRoot PageKind = iota + 1
-	// Kind 2 (was PageDocument, the verbatim chunk document extent) is removed
-	// with the chunk layout. Its slot is held blank so every surviving durable
-	// kind keeps the on-disk identifier it already had.
-	_
 	// PageOverflow is a continuation extent for a document or value too large
 	// for one home page; the home page holds a PageRef into this chain.
-	PageOverflow
-	// Kinds 4–6, 8–12 are removed with the chunk/fingerprint layout: the
-	// chunk-radix directory, the pre-hybrid key directory, the exact-index
-	// directory, the compact document-group container, the three float64 columnar
-	// page kinds, and the index-group catalog. Their slots are held blank so every
-	// surviving durable kind keeps its existing on-disk identifier.
-	_ // 4  (was PageChunkDirectory)
-	_ // 5  (was PageKeyDirectory)
-	_ // 6  (was PageIndexDirectory)
-	// PageIndexPosting is a packed posting-list page. It survives the chunk
-	// deletion because the in-memory heap store encodes its query-time packed
-	// index in this format (see store/store_index_packed.go and posting_page.go).
+	PageOverflow PageKind = iota + 1
+	// PageIndexPosting is a packed posting-list page used by the in-memory heap
+	// store's query-time index (see store/store_index_packed.go and
+	// posting_page.go).
 	PageIndexPosting
-	_ // 8  (was PageDocumentGroup)
-	_ // 9  (was PageFloat64Group)
-	_ // 10 (was PageFloat64Catalog)
-	_ // 11 (was PageFloat64Stripe)
-	_ // 12 (was PageIndexGroupCatalog)
 	// PageFreeImage and PageFreeDelta carry the free set as a base image plus a
-	// chain of per-commit diffs. They replaced a B+tree of PageFreeDirectory
-	// nodes, whose identifier is deliberately gone rather than reserved: the
-	// store has never been released, so renumbering costs nothing, and leaving a
-	// hole would invite a reader to treat an old node as a valid page of some
-	// other kind instead of failing the way a removed format should.
+	// chain of per-commit diffs.
 	PageFreeImage
 	// PageFreeDelta is one per-commit free-set diff in the image-plus-delta
 	// chain described above.
 	PageFreeDelta
-	// PageFreeIndex names the image's segments. It exists so a fold rewrites the
-	// segments a commit touched instead of the whole image; see free_index.go
-	// for why the image stopped being a linked list.
+	// PageFreeIndex names the image's segments so a fold rewrites only the
+	// segments a commit touched; see free_index.go.
 	PageFreeIndex
-	// Kind 16 (was PageFingerprintDirectory, the hash-routed chunk primary-key
-	// directory) is removed with the chunk layout. Its slot is held blank so the
-	// kinds after it keep their existing on-disk identifiers.
-	_
 	// PageCatalogSegment carries the self-describing, canonical Store catalog.
 	// It is deliberately distinct from every query accelerator: reopening a
 	// file must select this decoder from the durable kind, never by guessing
@@ -107,9 +62,6 @@ const (
 	// leaves name each macro-tablet's root PageRef, suitable for
 	// StateRoot.PrimaryRoot.
 	PagePrimaryCatalog
-	// PageTabletDirectory is a tablet-directory node of that catalog, routing a
-	// key to the tablet that owns it.
-	PageTabletDirectory
 	// PagePrimaryLocator is a tablet's local-ID locator page, mapping a stable
 	// BucketID to the current leaf page and slot holding it.
 	PagePrimaryLocator
@@ -146,7 +98,6 @@ type PageHeader struct {
 	PageSize      uint32
 	PayloadLength uint32
 	Kind          PageKind
-	Flags         uint8
 }
 
 // InitPage clears one caller-owned physical page, writes its canonical header,
@@ -166,7 +117,6 @@ func InitPage(dst []byte, header PageHeader) ([]byte, error) {
 	binary.LittleEndian.PutUint16(page[8:10], pageVersion)
 	binary.LittleEndian.PutUint16(page[10:12], PageHeaderSize)
 	page[12] = byte(header.Kind)
-	page[13] = header.Flags
 	binary.LittleEndian.PutUint32(page[16:20], header.PageSize)
 	binary.LittleEndian.PutUint32(page[20:24], header.PayloadLength)
 	binary.LittleEndian.PutUint64(page[24:32], header.Generation)
@@ -200,7 +150,7 @@ func sealPage(page []byte, validatePadding bool) (uint32, error) {
 	page = page[:int(header.PageSize)]
 	payloadEnd := PageHeaderSize + int(header.PayloadLength)
 	trailer := len(page) - PageTrailerSize
-	if !allZero(page[14:16]) || !allZero(page[56:64]) ||
+	if !allZero(page[13:16]) || !allZero(page[56:64]) ||
 		validatePadding && !allZero(page[payloadEnd:trailer]) {
 		return 0, fmt.Errorf("%w: non-zero page reserved bytes or padding", ErrInvalidWrite)
 	}
@@ -211,7 +161,7 @@ func sealPage(page []byte, validatePadding bool) (uint32, error) {
 }
 
 // OpenPage verifies and decodes one physical page, returning a capacity-clipped
-// payload view that borrows src. Unknown kinds or flags, non-canonical reserved
+// payload view that borrows src. Unknown kinds, non-canonical reserved
 // bytes, impossible lengths, and checksum failures are rejected before a
 // payload byte is trusted. Padding is checksum-covered but deliberately not
 // scanned a second time; InitPage and SealPage enforce zero padding on writers,
@@ -230,7 +180,7 @@ func OpenPage(src []byte) (PageHeader, []byte, error) {
 		PageChecksum(page[:trailer]) != checksum {
 		return PageHeader{}, nil, fmt.Errorf("%w: checksum", ErrPageCorrupt)
 	}
-	if !allZero(page[14:16]) || !allZero(page[56:64]) {
+	if !allZero(page[13:16]) || !allZero(page[56:64]) {
 		return PageHeader{}, nil, fmt.Errorf("%w: reserved bytes", ErrPageCorrupt)
 	}
 	return header, page[PageHeaderSize:payloadEnd:payloadEnd], nil
@@ -244,7 +194,6 @@ func decodePageHeader(src []byte) (PageHeader, bool) {
 	}
 	header := PageHeader{
 		Kind:          PageKind(src[12]),
-		Flags:         src[13],
 		PageSize:      binary.LittleEndian.Uint32(src[16:20]),
 		PayloadLength: binary.LittleEndian.Uint32(src[20:24]),
 		Generation:    binary.LittleEndian.Uint64(src[24:32]),
@@ -258,8 +207,8 @@ func validatePageHeader(header PageHeader) error {
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 || header.LogicalID == 0 {
 		return fmt.Errorf("%w: zero page identity", ErrInvalidWrite)
 	}
-	if !validPageKind(header.Kind) || !validPageFlags(header.Kind, header.Flags) {
-		return fmt.Errorf("%w: page kind or flags", ErrInvalidWrite)
+	if !validPageKind(header.Kind) {
+		return fmt.Errorf("%w: page kind", ErrInvalidWrite)
 	}
 	if !validPageExtentSize(header.Kind, header.PageSize) ||
 		uint64(header.PayloadLength) > uint64(header.PageSize)-PageHeaderSize-PageTrailerSize {
@@ -285,13 +234,5 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageStateRoot && kind <= PagePrimaryExactCatalog
-}
-
-func validPageFlags(kind PageKind, flags uint8) bool {
-	_ = kind
-	// No surviving page kind carries header flags: the compact document-group
-	// payload the ordered-primary leaf embeds lives behind its class byte inside
-	// a flag-less PagePrimaryLeaf, and the chunk float64 sidecar flag is gone.
-	return flags == 0
+	return kind >= PageOverflow && kind <= PagePrimaryExactCatalog
 }

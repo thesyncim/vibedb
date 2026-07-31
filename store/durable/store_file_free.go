@@ -66,9 +66,8 @@ const (
 // go on describing the free set relative to that chain rather than to pages
 // that were never written.
 type freeLogCommit struct {
-	head     storeio.PageRef
-	inline   *storeio.InlineFreeDelta
-	checksum uint32
+	head   storeio.PageRef
+	inline *storeio.InlineFreeDelta
 	// changed distinguishes "wrote a new chain head" from "the free set did not
 	// move, so the published head still describes it".
 	changed bool
@@ -253,7 +252,7 @@ func fileStoreFreeLogBounds(
 	state *fileStoreState,
 ) storeio.FreeLogBounds {
 	bounds := storeio.FreeLogBounds{
-		FileEnd:       state.super.FileEnd,
+		FileEnd:       state.fileEnd,
 		NextLogicalID: state.root.NextLogicalID,
 	}
 	if extent, ok := storeio.StateRootPageCatalogExtent(state.root); ok {
@@ -458,7 +457,6 @@ func (c *Collection) syncFreeLogFor(
 	if !c.freeFoldRequired && len(c.freeDeltas) == 0 {
 		return freeLogCommit{
 			head: state.freeHead, inline: &c.nextInlineFree,
-			checksum: state.super.FreeChecksum,
 		}, nil
 	}
 	live := c.liveReusable()
@@ -1024,7 +1022,7 @@ func (c *Collection) promoteFreeSegment(
 		return err
 	}
 	view, err := storeio.OpenFreeImagePage(
-		lease.Page(), state.super.FileEnd, state.root.NextLogicalID,
+		lease.Page(), state.fileEnd, state.root.NextLogicalID,
 	)
 	if err != nil {
 		lease.Release()
@@ -1340,10 +1338,9 @@ func (c *Collection) writeFreeDeltaChain(
 	head := pages[allocated-1]
 	c.nextInlineFree = storeio.NewInlineFreeDelta(head.Ref(), indexHead)
 	return freeLogCommit{
-		head:     head.Ref(),
-		inline:   &c.nextInlineFree,
-		checksum: storeio.PageChecksum(head.Bytes()),
-		changed:  true, folded: folded,
+		head:    head.Ref(),
+		inline:  &c.nextInlineFree,
+		changed: true, folded: folded,
 	}, nil
 }
 

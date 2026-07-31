@@ -96,8 +96,8 @@ func runVerify(path string) int {
 		fmt.Printf("pages kind=%s count=%d\n", kind, report.PageCounts[kind])
 	}
 	fmt.Printf(
-		"summary root_slot=%d generation=%d file_end=%d primary=%t documents=%d free_extents=%d findings=%d\n",
-		report.RootSlot, report.Generation, report.FileEnd, report.Primary,
+		"summary root_slot=%d generation=%d file_end=%d documents=%d free_extents=%d findings=%d\n",
+		report.RootSlot, report.Generation, report.FileEnd,
 		report.Documents, report.FreeExtents, len(report.Findings),
 	)
 	if report.OK() {

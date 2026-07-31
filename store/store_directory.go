@@ -10,17 +10,6 @@ import "github.com/thesyncim/vibedb/internal/storekey"
 // exported so query workspaces can combine candidate masks without converting
 // them to keys.
 //
-// An alias, rather than a mirror plus conversions, keeps lookup and mutation
-// calls eligible for the same inlining and register ABI as before the
-// directory moved out of this package.
+// The alias keeps the public row address identical to the internal directory's
+// pointer-free value without conversions.
 type Location = storekey.Location
-
-type storeKeyNode = storekey.Node
-
-func storeKeyLookup(root *storeKeyNode, hash uint64, key string) (Location, bool) {
-	return storekey.Lookup(root, hash, key)
-}
-
-func storeKeyInsert(root *storeKeyNode, hash uint64, key string, loc Location) *storeKeyNode {
-	return storekey.Insert(root, hash, key, loc)
-}

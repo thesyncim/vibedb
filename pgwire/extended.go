@@ -20,12 +20,10 @@ import (
 // The extended query protocol: Parse, Bind, Describe, Execute, Close, Flush,
 // Sync.
 //
-// This is what real client libraries use. A writable [FromSQLDatabase] maps
-// Parse, Bind, and Execute onto the shared typed SQL runtime, including DDL,
-// DML, SELECT, transaction state, and scalar-versus-document parameter roles.
-// Legacy read-only sources map the same messages onto
-// [query.PrepareStatement] and RunInto. Both paths retain one parsed plan per
-// named statement instead of reparsing at Execute.
+// This is what real client libraries use. The SQL database maps Parse, Bind,
+// and Execute onto the shared typed SQL runtime, including DDL, DML, SELECT,
+// transaction state, and scalar-versus-document parameter roles. Named
+// statements retain one parsed plan instead of reparsing at Execute.
 //
 // # The error state
 //

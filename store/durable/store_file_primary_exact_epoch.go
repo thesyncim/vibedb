@@ -9,12 +9,11 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// The resident engine of the O(delta) indexed write path
-// (docs/design/indexed-write-path.md §3–§7).
+// The resident engine of the O(delta) indexed write path.
 //
 // One immutable index epoch per collection: a fold base — the encoded exact
-// term leaves, spanned across a deterministic content-defined cut set since
-// P1, plus a flat open-addressed tileID → live-tile table — under a
+// term leaves, spanned across a deterministic content-defined cut set, plus a
+// flat open-addressed tileID → live-tile table — under a
 // generation-stamped, append-only overlay of per-term posting records and
 // per-tile live records. A mutation appends O(touched terms) records instead
 // of re-encoding the index; a probe on Snapshot G merges the newest records
@@ -25,7 +24,7 @@ import (
 // the same final graph — the identity anchor the mutation-vs-rebuild tests
 // pin, extended across cut boundaries.
 //
-// The read rule (§3, the whole consistency story): a probe on Snapshot G
+// The read rule: a probe on Snapshot G
 // resolves term T per tile t as the newest term record for (T, t) with
 // gen ≤ G if one exists; otherwise the fold-base posting — unless a tile
 // record for t with gen ≤ G carries rebased at gen R and the base predates R.
@@ -38,7 +37,7 @@ import (
 // bits"). Liveness reads the newest tile record ≤ G, else the flat table.
 // Every branch is a pure function of (fold base, records ≤ G).
 //
-// P1's fold is O(dirty leaves): the overlay's touched terms name exactly the
+// The fold is O(dirty leaves): the overlay's touched terms name exactly the
 // content that can differ from the base, and the cutter's boundaries are
 // local by construction — rule-1 cut terms delimit runs whose leaves are pure
 // functions of the run's own content, and a giant term's stripe pieces are
@@ -58,7 +57,7 @@ import (
 // resize and never delete between folds, so a lock-free reader probing to the
 // first nil slot sees a consistent prefix of the single writer's publications.
 
-// Overlay capacity. Sized for the pressure-driven churn window (§4: records
+// Overlay capacity. Sized for the pressure-driven churn window (records
 // ≈ 32 B × record-emitting mutations per window); the mixed harness's
 // 64-mutation checkpoint cadence uses ~130 records per window, and the
 // capacity below covers ~2,000 record-emitting mutations before the
@@ -93,7 +92,7 @@ type primaryExactTermRecord struct {
 // primaryExactTileRecord is one absolute liveness overwrite: tile tileID's
 // live slot mask is live as of gen. rebased marks a slot-reassigning rewrite
 // of the owning bucket (workspace or structural rewrite): it voids the fold base's
-// postings for this tile and invalidates older term records (§3 read rule).
+// postings for this tile and invalidates older term records.
 type primaryExactTileRecord struct {
 	next    *primaryExactTileRecord
 	gen     uint64
@@ -120,8 +119,8 @@ type primaryExactTileEntry struct {
 	tileID uint32
 }
 
-// primaryLiveTable is the flat open-addressed replacement for the old
-// map[uint32]*[64]uint64 live map (§5): immutable between folds, cloned and
+// primaryLiveTable is a flat open-addressed live map: immutable between folds,
+// cloned and
 // patched O(touched tiles) at fold, one probe with linear stepping per
 // lookup. Slots hold the full 64-chunk mask pointer because the term-leaf
 // view retains per-posting live pointers for its lifetime; the primary graph
@@ -254,7 +253,7 @@ func (t *primaryLiveTable) patch(
 	}
 }
 
-// primaryExactEpoch is the immutable-base + overlay pair (§3). The struct
+// primaryExactEpoch is the immutable-base + overlay pair. The struct
 // pointer is swapped whole under snapshotGate at fold points only; a Snapshot
 // pins (epoch pointer, generation) and resolves postings as
 // (fold base + records with gen ≤ G) indefinitely.
@@ -472,7 +471,7 @@ func (e *primaryExactEpoch) allocTileRecord() (*primaryExactTileRecord, bool) {
 
 // rebaseFloor returns the generation of the newest rebase of tile ≤ atGen,
 // or 0 when none: the threshold below which the fold base and older term
-// records are voided for this tile (§3).
+// records are voided for this tile.
 func (e *primaryExactEpoch) rebaseFloor(tileID uint32, atGen uint64) uint64 {
 	entry := e.lookupTileEntry(tileID)
 	if entry == nil {
@@ -631,7 +630,7 @@ func pendingTileHead(
 	return entry.head.Load()
 }
 
-// resolvePrimaryExactState resolves the epoch through the §3 read rule at
+// resolvePrimaryExactState resolves the epoch through the newest-wins read rule at
 // generation atGen into the canonical (term → tile → bits) maps and live map
 // the cutter-backed encoder consumes. drop excludes every tile of the
 // buckets a caller is about to re-derive (structural rebuilds, the canonical
@@ -845,7 +844,7 @@ func (c *Collection) resolvePrimaryExactState(
 
 // prepareFoldedPrimaryExact resolves base+overlay at atGen (plus optional
 // fresh bucket derivations) and encodes a complete fresh epoch with an empty
-// overlay: the full fold of §7, used by structural transactions, rebase
+// overlay. The full fold is used by structural transactions, rebase
 // windows, the canonical lane's slot-reassignment fallback, and overlay
 // pressure escapes. baseGen stamps the new epoch; installing it under the
 // publish gate is the epoch swap. The encode routes through the shared
@@ -903,13 +902,13 @@ type primaryExactFoldPlan struct {
 	stripePatch bool // giantBefore && giantNow: touch only stripes
 }
 
-// prepareDirtyPrimaryExactFold is the checkpoint fold (§7) on its hot path:
+// prepareDirtyPrimaryExactFold is the checkpoint fold on its hot path:
 // it resolves base+overlay through the read rule at atGen and re-encodes
 // ONLY the leaves whose content the window's records can have changed —
 // dirty rule-1 runs, or single touched stripes of a term that is giant on
 // both sides of the window — carrying every other leaf forward by reference
 // (bytes, admitted view with the live lookup rebound, durable page ref).
-// The cut boundaries' locality (§6.1) is what makes the splice byte-exact:
+// Cut-boundary locality makes the splice byte-exact:
 // cutting the whole final content and cutting only the dirty runs/stripes
 // produce the same leaf set, and the rebuild-identity tests enforce it
 // against the bulk-build oracle. pending exposes the canonical mutation

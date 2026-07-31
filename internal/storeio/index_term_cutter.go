@@ -2,9 +2,8 @@ package storeio
 
 import "fmt"
 
-// Deterministic content-defined cuts for spanned exact-term leaves
-// (docs/design/indexed-write-path.md §6.1). One physical index's sorted term
-// sequence no longer has to fit a single IndexTermLeaf: the cutter partitions
+// Deterministic content-defined cuts for spanned exact-term leaves. One
+// physical index's sorted term sequence is partitioned
 // it into bounded leaves through three rules that are pure functions of the
 // content itself — never of mutation history — so bulk build, incremental
 // checkpoint folds, and journal replay of the same final postings produce the
@@ -40,15 +39,15 @@ import "fmt"
 // candidate cut. An upper bound preserves every safety property (an emitted
 // leaf always fits) and is itself a pure function of content, so determinism
 // and identity survive. The estimate error only ever cuts a leaf earlier than
-// strictly necessary, which costs a few header bytes of space, bounded by the
-// P1 space gate (≤ +5 % over the single-leaf baseline at the 10k shape).
+// strictly necessary, which costs a few header bytes of space. The 10k-shape
+// space test bounds that overhead to ≤ 5% over the single-leaf baseline.
 
 const (
 	// IndexTermLeafCutThreshold is the rule-1 probability numerator over a
 	// 2^16 window: a term starts a new run iff routeHash & 0xFFFF falls under
 	// it. 1365/65536 ≈ 1/48 targets a mean 48 terms per run — ≈ 4 KiB of
-	// encoded leaf at the measured 10k-shape term cost (§6.1's starting
-	// point; a run larger than the byte budget is subdivided by rule 3).
+	// encoded leaf at the measured 10k-shape term cost; a run larger than the
+	// byte budget is subdivided by rule 3.
 	IndexTermLeafCutThreshold = 1365
 
 	// IndexTermLeafStripeTiles is the fixed absolute tile width of one giant

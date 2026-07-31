@@ -3,7 +3,6 @@ package storeio
 import (
 	"encoding/binary"
 	"errors"
-	"os"
 	"testing"
 )
 
@@ -17,10 +16,8 @@ func testStatePageRef(kind PageKind, page, logical, generation uint64) PageRef {
 	}
 }
 
-// testStateRoot returns a valid populated ordered-primary state root: an empty
-// chunk census (the chunk layout is gone), a published PrimaryRoot as the sole
-// document root, and the immutable admission bounds. fileEnd covers the primary
-// catalog extent exactly.
+// testStateRoot returns a valid populated ordered-primary state root and its
+// exact file extent.
 func testStateRoot(generation uint64) (StateRoot, uint64) {
 	layout, err := MutableStoreLayout(testSuperblockPageSize)
 	if err != nil {
@@ -31,10 +28,8 @@ func testStateRoot(generation uint64) (StateRoot, uint64) {
 		Generation:       generation,
 		PageSize:         testSuperblockPageSize,
 		MaxPageSize:      64 << 10,
-		Options:          StateOptionShapeTapes | StateOptionHashKeys,
 		DocumentCount:    129,
 		NextLogicalID:    PrimaryFirstDynamicLogicalID,
-		ChunkDocuments:   64,
 		MaxKeyBytes:      256,
 		InlineValueBytes: 512,
 		MaxDocumentBytes: 4 << 20,
@@ -50,22 +45,48 @@ func testStateRoot(generation uint64) (StateRoot, uint64) {
 	return root, fileEnd
 }
 
-func TestStateRootPageRoundTrip(t *testing.T) {
+func encodeTestStateRootPayload(
+	dst []byte, root StateRoot, fileEnd uint64,
+) ([]byte, error) {
+	if len(dst) < StateRootPayloadSize {
+		return nil, ErrInvalidWrite
+	}
+	if err := validateStateRoot(root, fileEnd); err != nil {
+		return nil, err
+	}
+	payload := dst[:StateRootPayloadSize]
+	encodeStateRootPayload(payload, root)
+	return payload, nil
+}
+
+func decodeTestStateRootPayload(
+	payload []byte, identity StateRoot, fileEnd uint64,
+) (StateRoot, error) {
+	if len(payload) < StateRootPayloadSize {
+		return StateRoot{}, ErrStateRootCorrupt
+	}
+	return decodeStateRootPayload(
+		payload[:StateRootPayloadSize], identity.StoreID,
+		identity.Generation, identity.PageSize, fileEnd,
+	)
+}
+
+func TestStateRootPayloadRoundTrip(t *testing.T) {
 	want, fileEnd := testStateRoot(11)
 	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	encoded, err := encodeTestStateRootPayload(page, want, fileEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded) != int(testSuperblockPageSize) {
+	if len(encoded) != StateRootPayloadSize {
 		t.Fatalf("encoded length = %d", len(encoded))
 	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
+	got, err := decodeTestStateRootPayload(encoded, want, fileEnd)
 	if err != nil || got != want {
-		t.Fatalf("DecodeStateRootPage = (%+v,%v), want (%+v,nil)", got, err, want)
+		t.Fatalf("decodeTestStateRootPayload = (%+v,%v), want (%+v,nil)", got, err, want)
 	}
 	for cut := range encoded {
-		if _, err := DecodeStateRootPage(encoded[:cut], fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
+		if _, err := decodeTestStateRootPayload(encoded[:cut], want, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrStateRootCorrupt)
 		}
 	}
@@ -74,11 +95,11 @@ func TestStateRootPageRoundTrip(t *testing.T) {
 func TestStateRootPrimaryRootRoundTrip(t *testing.T) {
 	want, fileEnd := testStateRoot(11)
 	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	encoded, err := encodeTestStateRootPayload(page, want, fileEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
+	got, err := decodeTestStateRootPayload(encoded, want, fileEnd)
 	if err != nil || got != want {
 		t.Fatalf("primary state root = (%+v,%v), want (%+v,nil)", got, err, want)
 	}
@@ -100,10 +121,10 @@ func TestStateRootPrimaryRootRoundTrip(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			invalid := want
 			mutate(&invalid)
-			if _, err := EncodeStateRootPage(
+			if _, err := encodeTestStateRootPayload(
 				page, invalid, fileEnd,
 			); !errors.Is(err, ErrInvalidWrite) {
-				t.Fatalf("EncodeStateRootPage = %v, want %v", err, ErrInvalidWrite)
+				t.Fatalf("encodeTestStateRootPayload = %v, want %v", err, ErrInvalidWrite)
 			}
 		})
 	}
@@ -129,17 +150,17 @@ func TestStateRootExactIndexRootRoundTrip(t *testing.T) {
 	}
 	want.PageCatalogBytes = PageCatalogCanonicalHeaderSize
 	want.ExactIndexRoot = PageRef{
-		Offset: afterPrimary + uint64(testSuperblockPageSize),
+		Offset:    afterPrimary + uint64(testSuperblockPageSize),
 		LogicalID: PrimaryCatalogRootLogicalID + 2, Generation: want.Generation,
 		Length: testSuperblockPageSize, Kind: PagePrimaryExactRoot,
 	}
 	fileEnd := afterPrimary + 2*uint64(testSuperblockPageSize)
 	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	encoded, err := encodeTestStateRootPayload(page, want, fileEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
+	got, err := decodeTestStateRootPayload(encoded, want, fileEnd)
 	if err != nil || got != want {
 		t.Fatalf("exact-index state root = (%+v,%v), want (%+v,nil)", got, err, want)
 	}
@@ -150,7 +171,7 @@ func TestStateRootExactIndexRootRoundTrip(t *testing.T) {
 	invalid.PageCatalogHead = PageRef{}
 	invalid.PageCatalogBytes = 0
 	invalid.IndexCatalogHash = 0
-	if _, err := EncodeStateRootPage(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
+	if _, err := encodeTestStateRootPayload(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
 		t.Fatalf("exact root without index = %v, want %v", err, ErrInvalidWrite)
 	}
 }
@@ -163,7 +184,6 @@ func TestStateRootSchemaOnlyCatalogRoundTrip(t *testing.T) {
 		MaxPageSize:      64 << 10,
 		Options:          StateOptionSchema,
 		NextLogicalID:    3,
-		ChunkDocuments:   64,
 		IndexCatalogHash: 0x6d4b3a291807f5e3,
 		PageCatalogHead: testStatePageRef(
 			PageCatalogSegment,
@@ -176,11 +196,11 @@ func TestStateRootSchemaOnlyCatalogRoundTrip(t *testing.T) {
 	fileEnd := testMutableStoreDataStart(testSuperblockPageSize) +
 		uint64(testSuperblockPageSize)
 	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	encoded, err := encodeTestStateRootPayload(page, want, fileEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
+	got, err := decodeTestStateRootPayload(encoded, want, fileEnd)
 	if err != nil || got != want {
 		t.Fatalf(
 			"schema state root = (%+v,%v), want (%+v,nil)",
@@ -190,7 +210,7 @@ func TestStateRootSchemaOnlyCatalogRoundTrip(t *testing.T) {
 
 	invalid := want
 	invalid.IndexCatalogHash = 0
-	if _, err := EncodeStateRootPage(
+	if _, err := encodeTestStateRootPayload(
 		page, invalid, fileEnd,
 	); !errors.Is(err, ErrInvalidWrite) {
 		t.Fatalf("schema without identity = %v, want %v", err, ErrInvalidWrite)
@@ -203,11 +223,11 @@ func TestStateRootCanonicalMaterializationRoundTrip(t *testing.T) {
 	want.MaterializationDamageGranule =
 		MaterializationJournalMinSectorSize
 	page := make([]byte, testSuperblockPageSize)
-	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	encoded, err := encodeTestStateRootPayload(page, want, fileEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := DecodeStateRootPage(encoded, fileEnd)
+	got, err := decodeTestStateRootPayload(encoded, want, fileEnd)
 	if err != nil || got != want {
 		t.Fatalf(
 			"materialized state root = (%+v,%v), want (%+v,nil)",
@@ -232,7 +252,7 @@ func TestStateRootCanonicalMaterializationRoundTrip(t *testing.T) {
 			return root
 		}(),
 	} {
-		if _, err := EncodeStateRootPage(
+		if _, err := encodeTestStateRootPayload(
 			page, invalid, fileEnd,
 		); !errors.Is(err, ErrInvalidWrite) {
 			t.Fatalf(
@@ -262,10 +282,7 @@ func TestStateRootValidation(t *testing.T) {
 		{"inline above document", func(root *StateRoot, _ *uint64) {
 			root.InlineValueBytes = root.MaxDocumentBytes + 1
 		}},
-		{"chunk documents", func(root *StateRoot, _ *uint64) { root.ChunkDocuments = 65 }},
-		{"live high water", func(root *StateRoot, _ *uint64) { root.LiveChunks = root.ChunkHighWater + 1 }},
-		{"free chunk hint", func(root *StateRoot, _ *uint64) { root.FreeChunkHint = root.ChunkHighWater + 1 }},
-		{"next logical id", func(root *StateRoot, _ *uint64) { root.NextLogicalID = StateRootLogicalID }},
+		{"next logical id", func(root *StateRoot, _ *uint64) { root.NextLogicalID = 0 }},
 		{"missing primary namespace", func(root *StateRoot, _ *uint64) {
 			root.NextLogicalID = PrimaryFirstDynamicLogicalID - 1
 		}},
@@ -283,22 +300,21 @@ func TestStateRootValidation(t *testing.T) {
 			root, end := valid, fileEnd
 			test.mutate(&root, &end)
 			page := make([]byte, testSuperblockPageSize)
-			if _, err := EncodeStateRootPage(page, root, end); !errors.Is(err, ErrInvalidWrite) {
-				t.Fatalf("EncodeStateRootPage = %v, want %v", err, ErrInvalidWrite)
+			if _, err := encodeTestStateRootPayload(page, root, end); !errors.Is(err, ErrInvalidWrite) {
+				t.Fatalf("encodeTestStateRootPayload = %v, want %v", err, ErrInvalidWrite)
 			}
 		})
 	}
 
 	empty := StateRoot{
-		StoreID:        testStoreID,
-		Generation:     1,
-		PageSize:       testSuperblockPageSize,
-		MaxPageSize:    64 << 10,
-		NextLogicalID:  2,
-		ChunkDocuments: 64,
+		StoreID:       testStoreID,
+		Generation:    1,
+		PageSize:      testSuperblockPageSize,
+		MaxPageSize:   64 << 10,
+		NextLogicalID: 2,
 	}
 	page := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(
+	if _, err := encodeTestStateRootPayload(
 		page, empty, testMutableStoreDataStart(testSuperblockPageSize),
 	); err != nil {
 		t.Fatalf("empty state root: %v", err)
@@ -308,100 +324,29 @@ func TestStateRootValidation(t *testing.T) {
 func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 	root, fileEnd := testStateRoot(3)
 	page := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(page, root, fileEnd); err != nil {
+	if _, err := encodeTestStateRootPayload(page, root, fileEnd); err != nil {
 		t.Fatal(err)
 	}
-	// The retired chunk/fingerprint slots and the trailing reserved region must
-	// decode as entirely blank; any set bit is semantic corruption a valid
-	// checksum cannot hide.
-	for _, offset := range []int{
-		PageHeaderSize + stateRootChunkRefOffset,
-		PageHeaderSize + stateRootFloat64Offset,
-		PageHeaderSize + stateRootIndexGroupOffset,
-		PageHeaderSize + stateRootReservedOffset,
-	} {
-		corrupt := append([]byte(nil), page...)
+	// The trailing reserved region must decode as entirely blank; any set bit
+	// is semantic corruption a valid checksum cannot hide.
+	corrupt := append([]byte(nil), page...)
+	corrupt[stateRootReservedOffset] = 1
+	if _, err := decodeTestStateRootPayload(corrupt, root, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
+		t.Fatalf("reserved byte = %v, want %v", err, ErrStateRootCorrupt)
+	}
+	for offset := stateRootPrimaryOffset + 29; offset < stateRootPrimaryEnd; offset++ {
+		corrupt = append([]byte(nil), page...)
 		corrupt[offset] = 1
-		resealTestPage(corrupt)
-		if _, err := DecodeStateRootPage(corrupt, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
-			t.Fatalf("offset %d = %v, want %v", offset, err, ErrStateRootCorrupt)
+		if _, err := decodeTestStateRootPayload(corrupt, root, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
+			t.Fatalf("PageRef reserved byte %d = %v, want %v", offset, err, ErrStateRootCorrupt)
 		}
 	}
 
 	// A resealed page whose version field no longer matches the format must fail
 	// before any field is trusted.
-	corrupt := append([]byte(nil), page...)
-	binary.LittleEndian.PutUint32(corrupt[PageHeaderSize:PageHeaderSize+4], stateRootVersion+1)
-	resealTestPage(corrupt)
-	if _, err := DecodeStateRootPage(corrupt, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
+	corrupt = append([]byte(nil), page...)
+	binary.LittleEndian.PutUint32(corrupt[0:4], stateRootVersion+1)
+	if _, err := decodeTestStateRootPayload(corrupt, root, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
 		t.Fatalf("semantic corruption = %v, want %v", err, ErrStateRootCorrupt)
-	}
-}
-
-func TestRecoverStateRootFallsBackOnSemanticMismatch(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "state-root-recovery")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	pageSize := uint64(testSuperblockPageSize)
-	fileEnd := 6 * pageSize
-	empty := func(generation uint64) StateRoot {
-		return StateRoot{
-			StoreID: testStoreID, Generation: generation, PageSize: testSuperblockPageSize,
-			MaxPageSize: 64 << 10, NextLogicalID: 2, ChunkDocuments: 64,
-		}
-	}
-	state1 := make([]byte, testSuperblockPageSize)
-	state2 := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(state1, empty(1), fileEnd); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := EncodeStateRootPage(state2, empty(2), fileEnd); err != nil {
-		t.Fatal(err)
-	}
-	root1 := testSuperblock(1, 4*pageSize, state1)
-	root1.FileEnd = fileEnd
-	root2 := testSuperblock(2, 5*pageSize, state2)
-	root2.FileEnd = fileEnd
-	first := encodeTestSuperblock(t, root1)
-	second := encodeTestSuperblock(t, root2)
-	if err := file.Truncate(int64(fileEnd)); err != nil {
-		t.Fatal(err)
-	}
-	writeAtTest(t, file, first[:], 0)
-	writeAtTest(t, file, second[:], int64(pageSize))
-	writeAtTest(t, file, state1, int64(root1.StateOffset))
-	writeAtTest(t, file, state2, int64(root2.StateOffset))
-	scratch := make([]byte, testSuperblockPageSize)
-
-	gotSuper, gotState, slot, fallbackGeneration, err := RecoverStateRootWithFallback(
-		file, testSuperblockPageSize, scratch,
-	)
-	if err != nil || gotSuper != root2 || gotState != empty(2) || slot != 1 ||
-		fallbackGeneration != 1 {
-		t.Fatalf(
-			"recover newest = (%+v,%+v,%d,fallback=%d,%v)",
-			gotSuper, gotState, slot, fallbackGeneration, err,
-		)
-	}
-
-	// Keep both CRC layers valid while breaking the state/superblock generation
-	// binding. Recovery must reject generation two and select generation one.
-	binary.LittleEndian.PutUint64(state2[24:32], 7)
-	resealTestPage(state2)
-	root2.StateChecksum = PageChecksum(state2)
-	second = encodeTestSuperblock(t, root2)
-	writeAtTest(t, file, state2, int64(root2.StateOffset))
-	writeAtTest(t, file, second[:], int64(pageSize))
-	gotSuper, gotState, slot, fallbackGeneration, err = RecoverStateRootWithFallback(
-		file, testSuperblockPageSize, scratch,
-	)
-	if err != nil || gotSuper != root1 || gotState != empty(1) || slot != 0 ||
-		fallbackGeneration != 1 {
-		t.Fatalf(
-			"semantic fallback = (%+v,%+v,%d,fallback=%d,%v)",
-			gotSuper, gotState, slot, fallbackGeneration, err,
-		)
 	}
 }

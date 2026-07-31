@@ -1,19 +1,12 @@
 package storeio
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"testing"
 )
 
 var indexTermLeafBenchRows uint64
-
-// legacyIndexRecordBytes is the retired chunk index-directory's fixed 32-byte
-// leaf record. The packed term leaf replaced that layout; the "current32"
-// benchmark metrics keep it as the space baseline the packed encoding is
-// measured against.
-const legacyIndexRecordBytes = 32
 
 func BenchmarkIndexTermLeafBytes(b *testing.B) {
 	for _, cardinality := range []struct {
@@ -35,22 +28,12 @@ func BenchmarkIndexTermLeafBytes(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				currentRecords, currentCertificateBytes :=
-					indexTermLeafCurrentRecordCounts(fixture)
 				postings := cardinality.terms * cardinality.postings
 				for b.Loop() {
 					indexTermLeafBenchRows += uint64(len(encoded))
 				}
 				b.ReportMetric(float64(len(encoded))/float64(postings), "leaf-B/posting")
-				b.ReportMetric(float64(currentRecords*legacyIndexRecordBytes)/
-					float64(postings), "current32-B/posting")
-				b.ReportMetric(float64(currentRecords*legacyIndexRecordBytes+
-					currentCertificateBytes)/float64(postings), "current+exact-B/posting")
-				b.ReportMetric(float64(len(encoded))/
-					float64(currentRecords*legacyIndexRecordBytes+
-						currentCertificateBytes), "leaf/current")
 				b.ReportMetric(float64(len(encoded)), "leaf-bytes")
-				b.ReportMetric(float64(currentRecords), "current-records")
 			})
 		}
 	}
@@ -70,11 +53,7 @@ func BenchmarkIndexTermLeafHotEquality(b *testing.B) {
 				b, cardinality.terms, cardinality.postings, pattern,
 			)
 			view := mustOpenIndexTermLeafBenchmark(b, fixture)
-			current := makeIndexTermLeafCurrent32(fixture)
 			term := cardinality.terms / 2
-			currentCertificate := append(
-				[]byte(nil), fixture.terms[term].Key.Canonical...,
-			)
 			key := fixture.terms[term].Key
 			_, direct := view.LookupDirectBlock(key)
 			_, globalDirect := view.GlobalDirectBlock()
@@ -172,36 +151,6 @@ func BenchmarkIndexTermLeafHotEquality(b *testing.B) {
 				}
 				indexTermLeafBenchRows = rows
 			})
-			b.Run("packed-current32-route-only-lower-bound/"+name, func(b *testing.B) {
-				b.ReportAllocs()
-				var rows uint64
-				for b.Loop() {
-					var ok bool
-					var sum uint64
-					sum, ok = lookupIndexTermLeafCurrent32(current, uint32(term))
-					if !ok {
-						b.Fatal("lookup missed")
-					}
-					rows += sum
-				}
-				indexTermLeafBenchRows = rows
-			})
-			b.Run("packed-current32-exact/"+name, func(b *testing.B) {
-				b.ReportAllocs()
-				var rows uint64
-				for b.Loop() {
-					var ok bool
-					var sum uint64
-					sum, ok = lookupIndexTermLeafCurrent32Exact(
-						current, uint32(term), currentCertificate, key.Canonical,
-					)
-					if !ok {
-						b.Fatal("exact lookup missed")
-					}
-					rows += sum
-				}
-				indexTermLeafBenchRows = rows
-			})
 		}
 	}
 }
@@ -220,8 +169,6 @@ func BenchmarkIndexTermLeafOrderedIteration(b *testing.B) {
 				b, cardinality.terms, cardinality.postings, pattern,
 			)
 			view := mustOpenIndexTermLeafBenchmark(b, fixture)
-			current := makeIndexTermLeafCurrent32(fixture)
-			_, currentCertificateBytes := indexTermLeafCurrentRecordCounts(fixture)
 			globalBlock, globalDirect := view.GlobalDirectBlock()
 			onlyBlock, onlyDirect := view.OnlyDirectBlock()
 
@@ -391,20 +338,6 @@ func BenchmarkIndexTermLeafOrderedIteration(b *testing.B) {
 				b.ReportMetric(float64(view.EncodedBytes()), "reachable-B")
 				indexTermLeafBenchRows = rows
 			})
-			b.Run("packed-current32/"+name, func(b *testing.B) {
-				b.ReportAllocs()
-				var rows uint64
-				for b.Loop() {
-					for position := 0; position < len(current); position +=
-						legacyIndexRecordBytes {
-						rows += binary.LittleEndian.Uint64(current[position+16 : position+24])
-					}
-				}
-				b.ReportMetric(
-					float64(len(current)+currentCertificateBytes), "reachable-B",
-				)
-				indexTermLeafBenchRows = rows
-			})
 		}
 	}
 }
@@ -459,85 +392,6 @@ func mustOpenIndexTermLeafBenchmark(
 		b.Fatal(err)
 	}
 	return view
-}
-
-func indexTermLeafCurrentRecordCounts(
-	fixture indexTermLeafFixture,
-) (records, certificateBytes int) {
-	for i := range fixture.terms {
-		certificateBytes += len(fixture.terms[i].Key.Canonical)
-		for _, masks := range fixture.expected[string(fixture.terms[i].Key.Canonical)] {
-			for _, mask := range masks {
-				if mask != 0 {
-					records++
-				}
-			}
-		}
-	}
-	return records, certificateBytes
-}
-
-// makeIndexTermLeafCurrent32 models the current leaf's dominant physical and
-// iteration cost: one packed 32-byte record per non-empty chunk mask. Exact
-// certificate bytes are reported separately in the byte benchmark.
-func makeIndexTermLeafCurrent32(fixture indexTermLeafFixture) []byte {
-	records, _ := indexTermLeafCurrentRecordCounts(fixture)
-	encoded := make([]byte, records*legacyIndexRecordBytes)
-	position := 0
-	for term := range fixture.terms {
-		for _, input := range fixture.terms[term].Postings {
-			masks := fixture.expected[string(fixture.terms[term].Key.Canonical)][input.Posting.TileID]
-			for chunk, mask := range masks {
-				if mask == 0 {
-					continue
-				}
-				record := encoded[position:]
-				binary.LittleEndian.PutUint32(record[0:4], uint32(term))
-				binary.LittleEndian.PutUint32(record[4:8], input.Posting.TileID)
-				binary.LittleEndian.PutUint32(record[8:12], uint32(chunk))
-				binary.LittleEndian.PutUint64(record[16:24], mask)
-				position += legacyIndexRecordBytes
-			}
-		}
-	}
-	return encoded
-}
-
-func lookupIndexTermLeafCurrent32(encoded []byte, term uint32) (uint64, bool) {
-	count := len(encoded) / legacyIndexRecordBytes
-	low, high := 0, count
-	for low < high {
-		middle := int(uint(low+high) >> 1)
-		record := encoded[middle*legacyIndexRecordBytes:]
-		if binary.LittleEndian.Uint32(record[0:4]) < term {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	if low == count ||
-		binary.LittleEndian.Uint32(encoded[low*legacyIndexRecordBytes:]) != term {
-		return 0, false
-	}
-	var rows uint64
-	for low < count {
-		record := encoded[low*legacyIndexRecordBytes:]
-		if binary.LittleEndian.Uint32(record[0:4]) != term {
-			break
-		}
-		rows += binary.LittleEndian.Uint64(record[16:24])
-		low++
-	}
-	return rows, true
-}
-
-func lookupIndexTermLeafCurrent32Exact(
-	encoded []byte,
-	term uint32,
-	certificate, canonical []byte,
-) (uint64, bool) {
-	rows, ok := lookupIndexTermLeafCurrent32(encoded, term)
-	return rows, ok && bytes.Equal(certificate, canonical)
 }
 
 func indexTermLeafPatternName(pattern int) string {

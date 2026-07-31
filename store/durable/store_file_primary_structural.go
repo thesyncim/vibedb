@@ -10,8 +10,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// Phase-8 bounded structural transactions: leaf split, merge, and slot-class
-// reclaim. Each is one write transaction that rebuilds exactly one tablet's
+// Bounded structural transactions split full leaves and remove empty leaves.
+// Each is one write transaction that rebuilds exactly one tablet's
 // anchor pages, local-ID locator, and tablet root from the tablet's current
 // leaf set, then rewrites the catalog path and state root and publishes one
 // generation, retiring the predecessors. The resident router is rebuilt from
@@ -19,39 +19,17 @@ import (
 // before the swap completes falls back to the rooted page-walk oracle through
 // the existing generation guard, so the swap is race-free.
 //
-// The tablet is rebuilt wholesale (all its anchor pages) rather than by a
-// surgical single-page insert. At the leaf-level scale this phase targets a
-// tablet holds one anchor page, so the rebuild rewrites the same pages a
-// surgical edit would; a surgical anchor-page insert is a later optimization
-// measured before it is adopted. Because slot movement is confined to this one
-// bounded transaction, invariant 6 holds: any exact-index posting tile for a
-// moved row is rebuilt here. Exact indexes have not landed, so
-// structuralRepairPostingsHook is a named no-op marking where that attaches.
+// The tablet is rebuilt wholesale, including all its anchor pages. At the
+// current leaf-level scale a tablet holds one anchor page, so the rebuild
+// rewrites the same pages a surgical edit would. Because slot movement is
+// confined to this one bounded transaction, exact-index posting tiles for
+// moved rows are rebuilt in the same publication.
 const (
 	// primaryStructuralRetryLimit bounds split re-attempts after a full leaf.
 	// A lexical-median split of a full leaf leaves both halves with ample
 	// slack, so one split makes room; the small bound only guards a pathological
 	// placement cycle rather than looping forever.
 	primaryStructuralRetryLimit = 4
-
-	// primaryMergeFloor is ~25% of the narrow live *slot* capacity: the slot
-	// conjunct of the capacity-relative merge floor (primaryLeafBelowMergeFloor).
-	// It preserves the historical 48-of-195 threshold for tiny values -- the churn
-	// geometry, where a narrow leaf is slot-limited -- while the paired byte
-	// conjunct makes the floor relative to what the leaf can actually hold. The
-	// band up to primaryMergeAbsorbCeiling is the hysteresis gap that stops a
-	// just-merged leaf from immediately re-splitting.
-	primaryMergeFloor = storeio.CommonPrimaryLeafNarrowLive / 4
-
-	// primaryMergeAbsorbCeiling is ~75% of narrow live capacity. A neighbor may
-	// absorb a merge only if the combined live count stays at or below it, so
-	// the survivor always fits the narrow class comfortably.
-	primaryMergeAbsorbCeiling = storeio.CommonPrimaryLeafNarrowLive * 3 / 4
-
-	// primaryNarrowComfortable is ~70% of narrow live capacity. A wide leaf at
-	// or below it is rewritten to the narrow class at split/merge evaluation
-	// time to reclaim slot-class drift (the churn B/key regression).
-	primaryNarrowComfortable = storeio.CommonPrimaryLeafNarrowLive * 7 / 10
 )
 
 // ErrPrimaryMacroSplitRequired reports that a structural transaction cannot
@@ -66,8 +44,7 @@ type primaryStructuralKind uint8
 
 const (
 	structuralSplit primaryStructuralKind = iota
-	structuralMerge
-	structuralReclass
+	structuralEmptyReclaim
 )
 
 // structuralLeaf is one enumerated current leaf of a tablet: its stable
@@ -85,12 +62,11 @@ type structuralLeaf struct {
 
 // structuralRepairPostingsHook repairs the exact-index postings for rows a
 // structural transaction removes from the tablet. A split reassigns slots within
-// re-encoded leaves and a merge/reclass re-encodes a survivor; every such leaf's
-// new posting contribution is captured in encodeStructuralLeaf as it is fitted.
-// What that capture cannot see is a bucket that vanishes entirely -- a merged-away
-// or emptied leaf whose rows moved into a survivor with fresh slots -- so this
-// hook records those removed buckets. prepareStructuralExactLocked then drops the
-// removed and re-encoded buckets' tiles and merges the captured contributions,
+// re-encoded leaves; every such leaf's new posting contribution is captured in
+// encodeStructuralLeaf as it is fitted. What that capture cannot see is an
+// emptied bucket that vanishes entirely, so this hook records it.
+// prepareStructuralExactLocked then drops the removed and re-encoded buckets'
+// tiles and merges the captured contributions,
 // and stagePrimaryExactPagesLocked writes the result inside the same bounded
 // transaction that rebuilds the tablet, so the postings and the graph publish in
 // one atomic generation.
@@ -120,12 +96,9 @@ func (c *Collection) recordStructuralLatency(
 	case structuralSplit:
 		c.primaryLeafSplits.Add(1)
 		updateMaxU64(&c.primarySplitMaxNS, ns)
-	case structuralMerge:
-		c.primaryLeafMerges.Add(1)
-		updateMaxU64(&c.primaryMergeMaxNS, ns)
-	case structuralReclass:
-		c.primaryLeafReclass.Add(1)
-		updateMaxU64(&c.primaryReclassMaxNS, ns)
+	case structuralEmptyReclaim:
+		c.primaryEmptyReclaims.Add(1)
+		updateMaxU64(&c.primaryEmptyReclaimMaxNS, ns)
 	}
 }
 
@@ -142,7 +115,7 @@ func (c *Collection) flushPendingForStructural() error {
 		// for the retirement accounting: this advances durableState to a clean,
 		// fully-durable baseline *before* the structural transaction retires any of
 		// that baseline's pages. If the structural transaction then aborts, or a
-		// merge/reclass evaluation commits nothing, durableState still names live
+		// structural attempt commits nothing, durableState still names live
 		// pages -- never ones a half-done structural attempt already retired. The
 		// commit itself finishes the job by flushing again afterward so durableState
 		// advances past the structural generation too (see commitPrimaryStructural).
@@ -255,7 +228,7 @@ func (c *Collection) extractLeafRecords(
 }
 
 // fitStructuralLeaf places and encodes rows into the sole class-5 grammar and
-// returns the planner-selected extent. Splits and merges may assign fresh
+// returns the planner-selected extent. Splits may assign fresh
 // stable slots because their exact-index contribution is rebuilt in the same
 // structural publication.
 func (c *Collection) fitStructuralLeaf(
@@ -377,7 +350,7 @@ func (c *Collection) commitPrimaryStructural(
 		storeio.WriteTransactionOptions{
 			StoreID: c.storeID, Generation: generation,
 			PageSize:         uint32(c.options.PageSize),
-			FileEnd:          state.super.FileEnd,
+			FileEnd:          state.fileEnd,
 			NextLogicalID:    state.root.NextLogicalID,
 			Reusable:         c.reusable,
 			ReuseJournal:     c.reuseJournal,
@@ -664,7 +637,7 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, state, generation, rootPage.Ref(),
-		freeLog.head, freeLog.checksum, freeLog.inline,
+		freeLog.head, freeLog.inline,
 		state.root.DocumentCount,
 	)
 	if err != nil {
@@ -725,7 +698,7 @@ func (c *Collection) commitPrimaryStructural(
 		c.cache, nextState.root.PrimaryRoot,
 		storeio.GlobalTabletCatalogBounds{
 			StoreID: c.storeID, SelectedRootGeneration: generation,
-			FileEnd:       nextState.super.FileEnd,
+			FileEnd:       nextState.fileEnd,
 			NextLogicalID: nextState.root.NextLogicalID,
 		},
 	)
@@ -868,234 +841,19 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 	)
 }
 
-// primaryLeafBelowMergeFloor is the capacity-relative merge floor. A leaf is a
-// merge candidate only when BOTH conjuncts hold: its live count is below ~25% of
-// the narrow class's live slot budget (primaryMergeFloor), AND its live
-// key/value heap fills below 25% of the leaf's own byte capacity. The slot
-// conjunct preserves the historical 48-of-195 threshold for tiny values, where a
-// narrow leaf is slot-limited (the churn geometry). The byte conjunct is what
-// makes the floor capacity-relative rather than absolute: a leaf that is
-// byte-full for its own row size -- a handful of large documents that already
-// pack the heap, such as the low-cardinality competitive corpus's ~28-doc wide
-// leaves -- is never sparse and never a merge candidate, even though its slot
-// count sits below the absolute floor. Before this, every delete on such a leaf
-// evaluated "warranted" and paid a full checkpoint before discovering nothing to
-// merge. The two conjuncts are exactly min(slotCapacity, byteCapacity)/4 < n
-// expanded so no division or average-row arithmetic is needed.
-func primaryLeafBelowMergeFloor(liveCount, heapUsed, heapCapacity int) bool {
-	if liveCount <= 0 || heapCapacity <= 0 {
-		return false
-	}
-	return liveCount < primaryMergeFloor && heapUsed*4 < heapCapacity
-}
-
-// primaryWideLeafReclaimable reports whether a wide leaf's live rows would fit
-// the narrow class comfortably, and so a wide->narrow reclass genuinely reclaims
-// the 8 KiB->4 KiB slack. It is capacity-relative on BOTH axes: at most
-// primaryNarrowComfortable live rows (~70% of narrow slots, the historical slot
-// gate) AND a live heap at most ~70% of the narrow heap byte budget. The byte
-// gate is what stops the low-cardinality corpus's byte-full wide leaves -- a
-// handful of large documents that cannot fit the 4 KiB narrow class at all --
-// from being reclassed on every delete into a no-op re-encode that falls back to
-// wide yet still commits a full checkpoint.
-func primaryWideLeafReclaimable(liveCount, heapUsed int) bool {
-	if liveCount <= 0 || liveCount > primaryNarrowComfortable {
-		return false
-	}
-	narrowHeap := storeio.CommonPrimaryLeafNarrowHeapCapacity()
-	return narrowHeap > 0 && heapUsed*10 <= narrowHeap*7
-}
-
-// primaryMergeKind is the read-only classification of a routed leaf's own
-// occupancy after a delete: which structural transaction, if any, it warrants.
-type primaryMergeKind uint8
-
-const (
-	primaryMergeNone       primaryMergeKind = iota
-	primaryMergeEmpty                       // emptied leaf: remove it
-	primaryMergeBelowFloor                  // below the capacity floor: try a merge
-	primaryMergeReclaim                     // wide leaf now fits narrow: reclass
-)
-
-// primaryMergeEval is one read-only merge/reclass evaluation of a routed leaf.
-type primaryMergeEval struct {
-	route       storeio.ResidentPrimaryRoute
-	kind        primaryMergeKind
-	liveCount   int
-	wideReclaim bool // wide and <= narrowComfortable: a reclass fallback for merge
-}
-
-// evaluateMergeReclass peeks the routed leaf (the volatile buffered frame in
-// buffered mode) and classifies its own occupancy WITHOUT flushing. An ordinary
-// delete that leaves an ample or byte-full leaf returns primaryMergeNone here in
-// nanoseconds, never touching the checkpoint path.
-func (c *Collection) evaluateMergeReclass(
-	keyBytes []byte,
-) (primaryMergeEval, error) {
-	state := c.state.Load()
-	if state == nil {
-		return primaryMergeEval{}, ErrClosed
-	}
-	route, err := c.currentPrimaryResidentRoute(state, keyBytes)
+// structuralRemoveEmptyPrimaryLeaf removes the routed leaf after its last row
+// was deleted. Non-empty leaf compaction is handled by the unified fold/repack
+// planner, which sees the canonical encoded size for the whole dirty leaf.
+func (c *Collection) structuralRemoveEmptyPrimaryLeaf(keyBytes []byte) error {
+	empty, err := c.primaryLeafEmpty(keyBytes)
 	if err != nil {
-		// The routed leaf is gone (e.g. a concurrent structural rebuild); nothing
-		// to evaluate. Treat as no-op rather than an error: hygiene is best-effort.
-		return primaryMergeEval{}, nil
+		return fmt.Errorf("inspect primary leaf: %w", err)
 	}
-	lease, err := c.primaryRouter.Load().AcquireLeaf(c.cache, route)
-	if err != nil {
-		return primaryMergeEval{}, err
-	}
-	page := lease.Page()
-	bounds := c.primaryLeafBounds(state)
-
-	// Class 5 has no legacy narrow/wide mode to reclass on every tombstone.
-	// Nonempty merge economy belongs at the fold/repack boundary, where the
-	// planner sees the exact encoded size once for the whole dirty leaf. The
-	// per-delete hygiene path therefore handles only an actually empty leaf.
-	// Include the pending overlay row delta because buffered-visible deletes
-	// deliberately leave the sealed image unchanged until checkpoint.
-	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafUnified {
-		unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-			page, c.storeID, route.Bucket, bounds,
-		)
-		if !ok {
-			lease.Release()
-			return primaryMergeEval{}, storeio.ErrCommonPrimaryLeafCorrupt
-		}
-		_, rowDelta := c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
-		liveCount := unified.Len() + rowDelta
-		if liveCount < 0 {
-			lease.Release()
-			return primaryMergeEval{}, storeio.ErrCommonPrimaryLeafCorrupt
-		}
-		eval := primaryMergeEval{
-			route: route, liveCount: liveCount,
-		}
-		if liveCount == 0 {
-			eval.kind = primaryMergeEmpty
-		}
-		lease.Release()
-		return eval, nil
-	}
-
-	leaf, admitErr := storeio.AdmittedPrimaryLeafForMutationWithScratch(
-		page, c.storeID, route.Bucket, bounds,
-		c.primaryLeafMutationScratch,
-	)
-	if admitErr != nil {
-		lease.Release()
-		return primaryMergeEval{}, admitErr
-	}
-	n := leaf.Len()
-	wide := leaf.Class() == storeio.CommonPrimaryLeafWide
-	used, capacity := leaf.HeapOccupancy()
-	lease.Release()
-
-	eval := primaryMergeEval{
-		route: route, liveCount: n,
-		wideReclaim: wide && primaryWideLeafReclaimable(n, used),
-	}
-	switch {
-	case n == 0:
-		eval.kind = primaryMergeEmpty
-	case primaryLeafBelowMergeFloor(n, used, capacity):
-		eval.kind = primaryMergeBelowFloor
-	case eval.wideReclaim:
-		eval.kind = primaryMergeReclaim
-	}
-	return eval, nil
-}
-
-// mergeNeighborViable peeks the routed leaf's two lexical neighbours through the
-// resident router -- read-only, no flush -- and reports whether either one's
-// combined live count would fit the absorb ceiling. It is intentionally
-// count-only and anchor-page-agnostic: a positive answer means the flush is
-// worth paying so the committing path can confirm and repair the real tablet; a
-// negative answer proves no merge can commit, so the abort stays checkpoint-free.
-func (c *Collection) mergeNeighborViable(eval primaryMergeEval) bool {
-	router := c.primaryRouter.Load()
-	state := c.state.Load()
-	if router == nil || state == nil {
-		return false
-	}
-	bounds := c.primaryLeafBounds(state)
-	for _, delta := range [2]int{-1, +1} {
-		neighbor, ok := router.NeighborRoute(eval.route, delta)
-		if !ok {
-			continue
-		}
-		lease, err := router.AcquireLeaf(c.cache, neighbor)
-		if err != nil {
-			continue
-		}
-		leaf, admitErr := storeio.AdmittedPrimaryLeafForMutationWithScratch(
-			lease.Page(), c.storeID, neighbor.Bucket, bounds,
-			c.primaryLeafMutationScratch,
-		)
-		if admitErr != nil {
-			lease.Release()
-			continue
-		}
-		fits := eval.liveCount+leaf.Len() <= primaryMergeAbsorbCeiling
-		lease.Release()
-		if fits {
-			return true
-		}
-	}
-	return false
-}
-
-// structuralMergeReclassPrimaryLeaf is the delete-side structural evaluation. It
-// first classifies the routed leaf read-only (evaluateMergeReclass) and, for a
-// merge candidate, confirms a viable neighbour read-only (mergeNeighborViable)
-// and consults the per-leaf hysteresis stamp. Only when a concrete, viable
-// transaction is selected does it flush the tablet's buffered parents and commit
-// one bounded structural transaction: a leaf emptied by the delete is removed; a
-// below-floor leaf is merged right-into-left with a same-anchor-page neighbour
-// that has room; otherwise a wide leaf that now fits the narrow class comfortably
-// is reclassed. Every other outcome -- ample leaf, byte-full leaf, no viable
-// neighbour, or a hysteresis skip -- returns without a checkpoint. It is
-// best-effort hygiene: any failure aborts its own transaction and leaves the
-// published post-delete state intact.
-func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
-	c.mergeReclassEvaluations.Add(1)
-	eval, err := c.evaluateMergeReclass(keyBytes)
-	if err != nil || eval.kind == primaryMergeNone {
-		if err != nil {
-			return fmt.Errorf("evaluate primary merge: %w", err)
-		}
+	if !empty {
 		return nil
 	}
-
-	router := c.primaryRouter.Load()
-	// The read-only skip/abort applies only when merge is the leaf's sole option.
-	// A wide leaf that also qualifies for reclass always has a viable transaction,
-	// so it bypasses the hysteresis and neighbour-viability gates and proceeds to
-	// commit (the committing path tries the merge first, then falls back to the
-	// reclass).
-	if eval.kind == primaryMergeBelowFloor && !eval.wideReclaim {
-		// Hysteresis: a below-floor leaf that already found no viable neighbour at
-		// this exact live count cannot become viable until its own count changes (a
-		// delete/insert re-arms it by changing the stamp comparison) or a sibling's
-		// own delete-side evaluation merges into it. Skip it read-only.
-		if router.MergeAbortedAt(eval.route) == uint32(eval.liveCount) {
-			c.mergeReclassSkips.Add(1)
-			return nil
-		}
-		// Read-only viability: prove a neighbour can absorb this leaf before paying
-		// the flush. If none can, abort now, stamping the count so the next
-		// equal-count delete is skipped outright.
-		if !c.mergeNeighborViable(eval) {
-			router.RecordMergeAbort(eval.route, uint32(eval.liveCount))
-			c.mergeReclassAborts.Add(1)
-			return nil
-		}
-	}
-
-	c.mergeReclassWarrantedHits.Add(1)
 	if err := c.flushPendingForStructural(); err != nil {
-		return fmt.Errorf("flush before primary merge: %w", err)
+		return fmt.Errorf("flush before empty-leaf reclaim: %w", err)
 	}
 	state := c.state.Load()
 	if state == nil {
@@ -1109,65 +867,59 @@ func (c *Collection) structuralMergeReclassPrimaryLeaf(keyBytes []byte) error {
 	if err := c.acquirePrimaryMutationPath(
 		&path, state, keyBytes, route,
 	); err != nil {
-		return fmt.Errorf("acquire primary merge path: %w", err)
+		return fmt.Errorf("acquire empty-leaf path: %w", err)
 	}
 	defer path.Release()
 	current, err := c.enumerateTabletLeaves(&path.tablet)
 	if err != nil {
-		return fmt.Errorf("enumerate primary merge tablet: %w", err)
+		return fmt.Errorf("enumerate empty-leaf tablet: %w", err)
 	}
 	sourceIndex := structuralIndexOfBucket(current, route.Bucket)
 	if sourceIndex < 0 {
 		return storeio.ErrSegmentedTabletRouterCorrupt
 	}
-	ourLen := path.leaf.Len()
-
-	if ourLen == 0 {
-		if len(current) <= 1 {
-			c.mergeReclassAborts.Add(1)
-			return nil
-		}
-		if err := c.commitRemoveEmptyLeaf(
-			state, &path, current, sourceIndex,
-		); err != nil {
-			return fmt.Errorf("remove empty primary leaf: %w", err)
-		}
-		c.removePrimaryEmptyLeaf()
-		c.mergeReclassCommits.Add(1)
+	if path.leaf.Len() != 0 || len(current) <= 1 {
 		return nil
 	}
-
-	used, capacity := path.leaf.HeapOccupancy()
-	if primaryLeafBelowMergeFloor(ourLen, used, capacity) {
-		merged, err := c.tryStructuralMerge(
-			state, &path, current, sourceIndex,
-		)
-		if err != nil {
-			return fmt.Errorf("merge primary leaf: %w", err)
-		}
-		if merged {
-			c.mergeReclassCommits.Add(1)
-			return nil
-		}
+	if err := c.commitRemoveEmptyLeaf(
+		state, &path, current, sourceIndex,
+	); err != nil {
+		return fmt.Errorf("remove empty primary leaf: %w", err)
 	}
-
-	if path.leaf.Class() == storeio.CommonPrimaryLeafWide &&
-		primaryWideLeafReclaimable(ourLen, used) {
-		if err := c.reclassPrimaryLeaf(
-			state, &path, current, sourceIndex,
-		); err != nil {
-			return fmt.Errorf("reclass primary leaf: %w", err)
-		}
-		c.mergeReclassCommits.Add(1)
-		return nil
-	}
-
-	// Warranted and flushed, but the real tablet offered nothing to commit (the
-	// only count-viable neighbour is on a different anchor page). Stamp the abort
-	// so this leaf is not re-evaluated at this count.
-	router.RecordMergeAbort(route, uint32(ourLen))
-	c.mergeReclassAborts.Add(1)
+	c.removePrimaryEmptyLeaf()
 	return nil
+}
+
+// primaryLeafEmpty checks the resident unified image plus its pending overlay
+// without flushing. Most deletes leave a non-empty leaf and stop here.
+func (c *Collection) primaryLeafEmpty(keyBytes []byte) (bool, error) {
+	state := c.state.Load()
+	if state == nil {
+		return false, ErrClosed
+	}
+	route, err := c.currentPrimaryResidentRoute(state, keyBytes)
+	if err != nil {
+		return false, nil
+	}
+	lease, err := c.primaryRouter.Load().AcquireLeaf(c.cache, route)
+	if err != nil {
+		return false, err
+	}
+	view, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		lease.Page(), c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	)
+	if !ok {
+		lease.Release()
+		return false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	sealedRows := view.Len()
+	lease.Release()
+	_, rowDelta := c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
+	live := sealedRows + rowDelta
+	if live < 0 {
+		return false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	return live == 0, nil
 }
 
 // commitRemoveEmptyLeaf drops an empty leaf from the tablet, moving no rows and
@@ -1179,7 +931,7 @@ func (c *Collection) commitRemoveEmptyLeaf(
 	sourceIndex int,
 ) error {
 	return c.commitPrimaryStructural(
-		state, path, structuralMerge,
+		state, path, structuralEmptyReclaim,
 		func(tx *storeio.WriteTransaction) (
 			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef, error,
 		) {
@@ -1202,157 +954,6 @@ func (c *Collection) commitRemoveEmptyLeaf(
 					LocalID: current[i].localID, Fence: fence,
 					Ref: current[i].ref, Zone: current[i].zone,
 				})
-			}
-			return final, []storeio.PageRef{current[sourceIndex].ref}, nil
-		},
-	)
-}
-
-// tryStructuralMerge merges the below-floor leaf at sourceIndex with an adjacent
-// same-anchor-page neighbor when the combined live count stays within the
-// hysteresis ceiling. The left leaf of the pair survives (keeping its BucketID
-// and fence); the right leaf's rows move into it and it is retired.
-func (c *Collection) tryStructuralMerge(
-	state *fileStoreState,
-	path *filePrimaryMutationPath,
-	current []structuralLeaf,
-	sourceIndex int,
-) (bool, error) {
-	ourLen := path.leaf.Len()
-	for _, leftIdx := range [2]int{sourceIndex, sourceIndex - 1} {
-		rightIdx := leftIdx + 1
-		if leftIdx < 0 || rightIdx >= len(current) {
-			continue
-		}
-		if current[leftIdx].pageID != current[rightIdx].pageID {
-			continue
-		}
-		neighborIdx := rightIdx
-		if leftIdx != sourceIndex {
-			neighborIdx = leftIdx
-		}
-		lease, err := c.cache.Acquire(current[neighborIdx].ref)
-		if err != nil {
-			return false, err
-		}
-		neighbor, admitErr := storeio.AdmittedPrimaryLeafForMutation(
-			lease.Page(), c.storeID, current[neighborIdx].bucket,
-			storeio.CommonPrimaryLeafBounds{
-				FileEnd:           state.super.FileEnd,
-				NextLogicalID:     state.root.NextLogicalID,
-				AllocationQuantum: state.root.PageSize,
-			},
-		)
-		if admitErr != nil {
-			lease.Release()
-			return false, admitErr
-		}
-		if ourLen+neighbor.Len() > primaryMergeAbsorbCeiling {
-			lease.Release()
-			continue
-		}
-		leftLeaf, rightLeaf := &path.leaf, &neighbor
-		if leftIdx != sourceIndex {
-			leftLeaf, rightLeaf = &neighbor, &path.leaf
-		}
-		err = c.commitMerge(
-			state, path, current, leftIdx, rightIdx, leftLeaf, rightLeaf,
-		)
-		lease.Release()
-		return true, err
-	}
-	return false, nil
-}
-
-func (c *Collection) commitMerge(
-	state *fileStoreState,
-	path *filePrimaryMutationPath,
-	current []structuralLeaf,
-	leftIdx, rightIdx int,
-	leftLeaf, rightLeaf *storeio.CommonPrimaryLeafView,
-) error {
-	survivorBucket := current[leftIdx].bucket
-	generation := state.root.Generation + 1
-	return c.commitPrimaryStructural(
-		state, path, structuralMerge,
-		func(tx *storeio.WriteTransaction) (
-			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef, error,
-		) {
-			rows := appendLeafRecords(c.structuralRows[:0], leftLeaf)
-			rows = appendLeafRecords(rows, rightLeaf)
-			c.structuralRows = rows
-			survivorRef, err := c.encodeStructuralLeaf(
-				tx, generation, survivorBucket, rows,
-			)
-			if err != nil {
-				return nil, nil, err
-			}
-			// The right leaf's rows now carry the survivor's BucketID (the
-			// survivor's new contribution was captured in encodeStructuralLeaf); the
-			// right bucket vanishes, so its postings must be dropped.
-			c.structuralRepairPostingsHook(
-				[]storeio.BucketID{current[rightIdx].bucket},
-			)
-			final := make(
-				[]storeio.SegmentedTabletRouterLeaf, 0, len(current)-1,
-			)
-			for i := range current {
-				if i == rightIdx {
-					continue
-				}
-				ref := current[i].ref
-				if i == leftIdx {
-					ref = survivorRef
-				}
-				fence := current[i].fence
-				if len(final) == 0 {
-					fence = nil
-				}
-				final = append(final, storeio.SegmentedTabletRouterLeaf{
-					LocalID: current[i].localID, Fence: fence,
-					Ref: ref, Zone: current[i].zone,
-				})
-			}
-			return final, []storeio.PageRef{
-				current[leftIdx].ref, current[rightIdx].ref,
-			}, nil
-		},
-	)
-}
-
-// reclassPrimaryLeaf rewrites one wide leaf to the narrow class in place,
-// reclaiming slot-class drift. Its BucketID, rows, fence, and local ID are
-// unchanged; only its physical extent shrinks.
-func (c *Collection) reclassPrimaryLeaf(
-	state *fileStoreState,
-	path *filePrimaryMutationPath,
-	current []structuralLeaf,
-	sourceIndex int,
-) error {
-	bucket := current[sourceIndex].bucket
-	generation := state.root.Generation + 1
-	return c.commitPrimaryStructural(
-		state, path, structuralReclass,
-		func(tx *storeio.WriteTransaction) (
-			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef, error,
-		) {
-			rows := c.extractLeafRecords(&path.leaf)
-			newRef, err := c.encodeStructuralLeaf(
-				tx, generation, bucket, rows,
-			)
-			if err != nil {
-				return nil, nil, err
-			}
-			final := make([]storeio.SegmentedTabletRouterLeaf, len(current))
-			for i := range current {
-				ref := current[i].ref
-				if i == sourceIndex {
-					ref = newRef
-				}
-				final[i] = storeio.SegmentedTabletRouterLeaf{
-					LocalID: current[i].localID, Fence: current[i].fence,
-					Ref: ref, Zone: current[i].zone,
-				}
 			}
 			return final, []storeio.PageRef{current[sourceIndex].ref}, nil
 		},
@@ -1388,10 +989,10 @@ func (c *Collection) splitPrimaryLeafForKey(key []byte) (err error) {
 	var generation uint64
 	defer func() {
 		// The journal-backed sync lane makes no chain-fence acknowledgement: a
-		// structural split or merge changes no logical key/value, so recovery
+		// structural rewrite changes no logical key/value, so recovery
 		// reconstructs it by replaying the triggering Put/Delete through the
-		// ordinary mutation path. Only the chunk sync lane (and a defensive
-		// primary-sync store without a journal) still waits on the root fence.
+		// ordinary mutation path. A synchronous store without an open journal
+		// still waits on the root fence.
 		wait := generation != 0 && c.chainFenceSync()
 		if wait {
 			c.durabilityWait.Add(1)
@@ -1424,11 +1025,10 @@ func (c *Collection) splitPrimaryLeafForKey(key []byte) (err error) {
 	return nil
 }
 
-// deletePrimaryWithMerge is the primary Delete entry point. After a successful
-// delete it evaluates the routed leaf for merge, empty-leaf removal, or
-// slot-class reclaim. That hygiene is best-effort: any failure aborts its own
-// transaction and leaves the published post-delete state intact.
-func (c *Collection) deletePrimaryWithMerge(
+// deletePrimaryWithEmptyReclaim is the primary Delete entry point. After a
+// successful delete empties a leaf, it best-effort removes that leaf without
+// affecting the already-published delete if structural cleanup fails.
+func (c *Collection) deletePrimaryWithEmptyReclaim(
 	key []byte,
 ) (deleted bool, err error) {
 	deleted, err = c.deletePrimary(key)
@@ -1442,22 +1042,21 @@ func (c *Collection) deletePrimaryWithMerge(
 	if c.primaryEmptyLeaves.Load() == 0 {
 		return true, nil
 	}
-	_ = c.mergeReclassPrimaryLeafForKey(key)
+	_ = c.removeEmptyPrimaryLeafForKey(key)
 	return deleted, nil
 }
 
-// mergeReclassPrimaryLeafForKey runs one merge/reclass structural evaluation for
-// the leaf routed by key under the single-writer lock, waiting for durability
-// when synchronous.
-func (c *Collection) mergeReclassPrimaryLeafForKey(key []byte) (err error) {
+// removeEmptyPrimaryLeafForKey removes the leaf routed by key under the
+// single-writer lock, waiting for durability when synchronous.
+func (c *Collection) removeEmptyPrimaryLeafForKey(key []byte) (err error) {
 	c.writer.Lock()
 	var generation uint64
 	defer func() {
 		// The journal-backed sync lane makes no chain-fence acknowledgement: a
-		// structural split or merge changes no logical key/value, so recovery
+		// structural rewrite changes no logical key/value, so recovery
 		// reconstructs it by replaying the triggering Put/Delete through the
-		// ordinary mutation path. Only the chunk sync lane (and a defensive
-		// primary-sync store without a journal) still waits on the root fence.
+		// ordinary mutation path. A synchronous store without an open journal
+		// still waits on the root fence.
 		wait := generation != 0 && c.chainFenceSync()
 		if wait {
 			c.durabilityWait.Add(1)
@@ -1479,9 +1078,9 @@ func (c *Collection) mergeReclassPrimaryLeafForKey(key []byte) (err error) {
 		return ErrClosed
 	}
 	before := state.root.Generation
-	// key is borrowed for the call; structuralMergeReclassPrimaryLeaf copies it
+	// key is borrowed for the call; structuralRemoveEmptyPrimaryLeaf copies it
 	// where it persists, so pass it directly.
-	if err := c.structuralMergeReclassPrimaryLeaf(key); err != nil {
+	if err := c.structuralRemoveEmptyPrimaryLeaf(key); err != nil {
 		return err
 	}
 	if after := c.state.Load(); after != nil && after.root.Generation > before {

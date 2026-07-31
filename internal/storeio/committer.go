@@ -39,7 +39,7 @@ var (
 // are allocated during construction and reused until Close.
 type CommitterOptions struct {
 	// FrameNativeStaging declares that WriteTransaction data pages are backed
-	// by PageCache frames. It lets NewCommitter cap the legacy Device arena to
+	// by PageCache frames. It lets NewCommitter cap the Device arena to
 	// the fixed root/journal/patch working set. Generic Batch callers that need
 	// page buffers leave it false.
 	FrameNativeStaging bool
@@ -158,9 +158,9 @@ const (
 	batchPublished
 )
 
-// Batch is one preallocated persistence generation. Its methods belong to the
-// Committer's single producer. After Publish or Abort, every Batch method is
-// invalid until Begin returns that slot again.
+// Batch is one preallocated persistence generation owned by the Committer's
+// single producer. After publication or Abort, it is invalid until Begin
+// returns that slot again.
 type Batch struct {
 	committer                     *Committer
 	pages                         []Write
@@ -179,60 +179,6 @@ type Batch struct {
 	generation                    uint64
 	index                         uint32
 	state                         atomic.Uint32
-}
-
-// PageBuffer returns page's reusable staging buffer.
-func (b *Batch) PageBuffer(page int) ([]byte, error) {
-	if b == nil || b.state.Load() != batchOwned || b.materialized ||
-		page < 0 || page >= len(b.pages) {
-		return nil, ErrBatchState
-	}
-	if b.pages[page].frameNative() {
-		cache := b.committer.frameCache.Load()
-		if cache == nil || int(b.pages[page].frameIndex) >= len(cache.frames) {
-			return nil, ErrBatchState
-		}
-		return cache.extentBytes(
-			int(b.pages[page].frameIndex), b.pages[page].Length,
-		), nil
-	}
-	return b.committer.buffers[b.pages[page].Buffer], nil
-}
-
-// SetPage records the initialized prefix and physical offset of one page.
-func (b *Batch) SetPage(page int, offset int64, length int) error {
-	return b.setPage(page, offset, length, 0)
-}
-
-// setStorePage records the kind of a page already verified by
-// TransactionPage.Stage. The marker is private to the durable batching
-// optimizer; generic Batch users retain byte-for-byte write semantics.
-func (b *Batch) setStorePage(
-	page int,
-	offset int64,
-	length int,
-	kind PageKind,
-) error {
-	return b.setPage(page, offset, length, kind)
-}
-
-func (b *Batch) setPage(
-	page int,
-	offset int64,
-	length int,
-	kind PageKind,
-) error {
-	if b == nil || b.state.Load() != batchOwned || b.materialized ||
-		page < 0 || page >= len(b.pages) {
-		return ErrBatchState
-	}
-	if length < 0 || uint64(length) > uint64(^uint32(0)) {
-		return ErrInvalidWrite
-	}
-	b.pages[page].Offset = offset
-	b.pages[page].Length = uint32(length)
-	b.pages[page].kind = kind
-	return nil
 }
 
 // ResizePages returns unused trailing page buffers before publication. It is
@@ -260,70 +206,6 @@ func (b *Batch) ResizePages(pageCount int) error {
 		b.dataBufferCount = uint16(pageCount)
 	}
 	return nil
-}
-
-// RootBuffer returns the alternate-root staging buffer.
-func (b *Batch) RootBuffer() ([]byte, error) {
-	if b == nil || b.state.Load() != batchOwned {
-		return nil, ErrBatchState
-	}
-	return b.committer.buffers[b.root.Buffer], nil
-}
-
-// SetRoot records the initialized root prefix and physical offset.
-func (b *Batch) SetRoot(offset int64, length int) error {
-	if b == nil || b.state.Load() != batchOwned {
-		return ErrBatchState
-	}
-	if length < 0 || uint64(length) > uint64(^uint32(0)) {
-		return ErrInvalidWrite
-	}
-	b.root.Offset = offset
-	b.root.Length = uint32(length)
-	b.rootGeneration = 0
-	return nil
-}
-
-// SetSuperblock encodes a checksummed double-root record into the reusable root
-// buffer. The worker selects the physical slot opposite the last durable root:
-// generation parity is only a provisional offset because group commit may skip
-// one or more generations. The complete page is cleared and committed: besides
-// removing stale tail bytes, page-sized root writes retain the offset/length
-// alignment required by direct I/O. Recovery decodes only the fixed record
-// prefix. Publish must receive the same generation, preventing a durable-
-// generation counter from naming different on-disk state. No allocation is
-// performed.
-func (b *Batch) SetSuperblock(root Superblock) error {
-	if b == nil || b.state.Load() != batchOwned {
-		return ErrBatchState
-	}
-	buffer := b.committer.buffers[b.root.Buffer]
-	if uint64(root.PageSize) > uint64(len(buffer)) {
-		return ErrInvalidWrite
-	}
-	page := buffer[:root.PageSize]
-	clear(page)
-	_, err := EncodeSuperblock(page, root)
-	if err != nil {
-		return err
-	}
-	offset, err := SuperblockOffset(root.Generation, root.PageSize)
-	if err != nil {
-		return err
-	}
-	b.root.Offset = offset
-	b.root.Length = root.PageSize
-	b.rootGeneration = root.Generation
-	return nil
-}
-
-// Publish transfers the batch to the background writer without allocating.
-// generation must be greater than every previously published generation.
-func (b *Batch) Publish(generation uint64) error {
-	if b == nil || b.state.Load() != batchOwned {
-		return ErrBatchState
-	}
-	return b.committer.publish(b, generation, nil)
 }
 
 // Abort returns every buffer and descriptor without publishing the batch.
@@ -357,8 +239,6 @@ type CommitterStats struct {
 	// newly allocated data and in-place bytes.
 	MaterializationFullWriteBytes uint64
 	LargestGroup                  uint32
-	SuppressedRootWrites          uint64
-	SuppressedRootBytes           uint64
 	SupersededRootWrites          uint64
 	SupersededRootBytes           uint64
 	// SupersededPageWrites counts buffered copy-on-write pages proved
@@ -454,8 +334,6 @@ type Committer struct {
 	materializationFullWriteBytes      atomic.Uint64
 	materializationBarriers            atomic.Uint64
 	largestGroup                       atomic.Uint32
-	suppressedRootWrites               atomic.Uint64
-	suppressedRootBytes                atomic.Uint64
 	supersededRootWrites               atomic.Uint64
 	supersededRootBytes                atomic.Uint64
 	supersededPageWrites               atomic.Uint64
@@ -656,8 +534,8 @@ func (c *Committer) begin(
 	return batch, nil
 }
 
-// NeedsCheckpointFor reports whether a manual committer lacks the descriptor
-// and legacy Device staging buffers needed by a generic Batch.
+// NeedsCheckpointFor reports whether a manual committer lacks the descriptors
+// and Device staging buffers needed by a generic Batch.
 func (c *Committer) NeedsCheckpointFor(pageCount int) bool {
 	if c == nil || !c.options.ManualCheckpoint {
 		return false
@@ -966,36 +844,6 @@ func (c *Committer) FallbackGeneration() uint64 {
 	return c.fallback.Load()
 }
 
-// InitializeGeneration seeds a newly opened Committer with the generation
-// already selected by crash recovery, inferring the recovery slot from the
-// legacy generation-parity convention. New recovery callers should use
-// InitializeGenerationAt so files written across grouped generations continue
-// alternating from the physical slot actually selected by recovery.
-func (c *Committer) InitializeGeneration(generation uint64) error {
-	if generation == 0 {
-		return ErrGenerationOrder
-	}
-	fallbackGeneration := generation
-	if generation > 1 {
-		fallbackGeneration--
-	}
-	return c.InitializeRecovery(
-		generation, int((generation-1)&(superblockCopies-1)), fallbackGeneration,
-	)
-}
-
-// InitializeGenerationAt seeds a newly opened Committer with the generation
-// and physical superblock slot selected by crash recovery. The next successful
-// superblock commit writes the other slot even when logical generations skip.
-// It must be called before Begin or Publish.
-func (c *Committer) InitializeGenerationAt(generation uint64, rootSlot int) error {
-	fallbackGeneration := generation
-	if generation > 1 {
-		fallbackGeneration--
-	}
-	return c.InitializeRecovery(generation, rootSlot, fallbackGeneration)
-}
-
 // InitializeRecovery seeds the selected generation, its physical slot, and
 // the actual validated fallback generation returned by crash recovery.
 func (c *Committer) InitializeRecovery(
@@ -1080,8 +928,6 @@ func (c *Committer) Stats() CommitterStats {
 		MaterializationFullWriteBytes: c.materializationFullWriteBytes.Load(),
 		MaterializationBarriers:       c.materializationBarriers.Load(),
 		LargestGroup:                  c.largestGroup.Load(),
-		SuppressedRootWrites:          c.suppressedRootWrites.Load(),
-		SuppressedRootBytes:           c.suppressedRootBytes.Load(),
 		SupersededRootWrites:          c.supersededRootWrites.Load(),
 		SupersededRootBytes:           c.supersededRootBytes.Load(),
 		SupersededPageWrites:          c.supersededPageWrites.Load(),

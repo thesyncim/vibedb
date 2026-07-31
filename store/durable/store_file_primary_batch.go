@@ -42,9 +42,8 @@ type primaryBatchMutation struct {
 
 // primaryBatchLeaf accumulates every mutation a batch routes to one leaf and the
 // single rewritten frame they fold into. One frame is admitted per touched leaf,
-// no matter how many of the batch's documents land in it, which is the same
-// write-amplification win the chunk batch has: N puts into one leaf rewrite the
-// leaf once, not N times.
+// no matter how many of the batch's documents land in it: N puts into one leaf
+// rewrite the leaf once, not N times.
 type primaryBatchLeaf struct {
 	resident     storeio.ResidentPrimaryRoute
 	firstKey     []byte
@@ -359,7 +358,7 @@ func (c *Collection) buildPrimaryBatchLeaves(
 ) ([]byte, uint64, error) {
 	baseGen := state.root.Generation
 	c.batchPrimaryLeafArena = c.batchPrimaryLeafArena[:0]
-	running := state.super.FileEnd
+	running := state.fileEnd
 	if len(c.primaryPendingParents) == 0 {
 		gap := uint64(c.options.maxTransactionPages) * uint64(c.options.MaxPageSize)
 		if running > math.MaxUint64-gap {
@@ -570,11 +569,8 @@ func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint6
 	nextRoot := state.root
 	nextRoot.Generation = generation
 	nextRoot.DocumentCount = uint64(int64(state.root.DocumentCount) + int64(totalDelta))
-	nextSuper := state.super
-	nextSuper.Generation = generation
-	nextSuper.FileEnd = c.batchPrimaryFileEnd
 	nextState := &fileStoreState{
-		root: nextRoot, super: nextSuper,
+		root: nextRoot, fileEnd: c.batchPrimaryFileEnd,
 		freeHead: state.freeHead,
 	}
 

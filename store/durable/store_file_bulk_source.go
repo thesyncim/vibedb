@@ -22,7 +22,8 @@ type fileStoreBulkRow struct {
 // only the surviving in-memory heap store, so it is shared by the ordered
 // primary bulk builder.
 func collectFileStoreBulkRows(state *store.State, options normalizedFileStoreOptions) ([]fileStoreBulkRow, error) {
-	if state.Count < 0 || uint64(state.Count) > uint64(^uint32(0))*uint64(options.Collection.ChunkDocuments) {
+	if state.Count < 0 ||
+		uint64(state.Count) > uint64(^uint32(0))*uint64(store.MaxChunkDocuments) {
 		return nil, store.ErrTooLarge
 	}
 	rows := make([]fileStoreBulkRow, 0, state.Count)

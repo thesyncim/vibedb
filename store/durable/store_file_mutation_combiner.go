@@ -368,7 +368,7 @@ func (c *Collection) primaryKeyPresentLocked(key []byte) (bool, error) {
 	leaf, err := storeio.AdmittedPrimaryLeafForMutationWithScratch(
 		page, c.storeID, route.Bucket,
 		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.super.FileEnd,
+			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		}, c.primaryLeafMutationScratch,
@@ -389,7 +389,7 @@ func (c *Collection) applyPrimaryMutationDirect(
 			request.key, request.value,
 		)
 	case primaryMutationDelete:
-		request.deleted, request.err = c.deletePrimaryWithMerge(request.key)
+		request.deleted, request.err = c.deletePrimaryWithEmptyReclaim(request.key)
 	default:
 		request.err = errors.New("vibejson: invalid primary mutation kind")
 	}

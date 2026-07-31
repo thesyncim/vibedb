@@ -166,7 +166,7 @@ func (r *Result) admitResultCell(cell Cell) error {
 
 func resultCellPayloadBytes(cell Cell) int64 {
 	bytes := int64(len(cell.raw)) + int64(len(cell.text))
-	if len(cell.raw) != 0 || cell.kind != KindNumber {
+	if len(cell.raw) != 0 || cell.kind != TypeNumber {
 		return bytes
 	}
 	var scratch [32]byte

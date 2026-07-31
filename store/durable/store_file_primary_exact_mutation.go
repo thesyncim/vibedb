@@ -7,8 +7,7 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// Exact-index posting maintenance for the ordered primary graph
-// (docs/design/indexed-write-path.md §3).
+// Exact-index posting maintenance for the ordered primary graph.
 //
 // A mutation rewrites exactly one leaf, and a leaf owns exactly the four
 // quadrant posting tiles bucket<<2 | q (q in 0..3). Every posting bit for a
@@ -16,9 +15,7 @@ import (
 // the whole exact-index effect of a mutation is confined to those tiles.
 //
 // The buffered write rule appends O(touched terms) overlay records instead of
-// re-encoding the resident term leaves (the removed per-mutation
-// reconstruct/encode/re-admit was the measured 4,954 µs, ~3,100-alloc cliff —
-// O(one physical index's postings) per Put at the 10k benchmark shape):
+// re-encoding the resident term leaves:
 //
 //   - update with the indexed value unchanged: zero records. The slot is
 //     stable (UpdateTo/DeleteTo/PromoteCommonPrimaryLeaf* preserve published
@@ -37,7 +34,7 @@ import (
 //     bucket, all at one generation.
 //
 // The canonical per-mutation-transaction lane and structural transactions
-// keep their fold-first shape (§7): they resolve base+overlay through the
+// keep their fold-first shape: they resolve base+overlay through the
 // read rule, re-encode with the unchanged builder, and install a fresh epoch,
 // so an incrementally maintained index stays byte-identical to a fresh
 // CreateFromPrimary of the same final graph — the anchor the
@@ -58,7 +55,7 @@ func (c *Collection) primaryExactBounds(
 ) storeio.PrimaryExactIndexBounds {
 	return storeio.PrimaryExactIndexBounds{
 		StoreID: c.storeID, Generation: state.root.Generation,
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 		MaxPageSize:       state.root.MaxPageSize, IndexCount: state.root.IndexCount,
 	}
@@ -68,7 +65,7 @@ func (c *Collection) primaryExactBounds(
 // and returns, for the four tiles of bucket, the new live slot mask and, per
 // physical index, the canonical term -> tile -> bits the bucket now contributes.
 // It is fold-side and rebase-side code — the common buffered mutation never
-// calls it (§3's write rule).
+// calls it on the ordinary buffered mutation path.
 func (c *Collection) deriveBucketExactContribution(
 	leafPage []byte, bucket storeio.BucketID,
 	bounds storeio.CommonPrimaryLeafBounds,
@@ -85,9 +82,8 @@ func (c *Collection) deriveBucketExactContribution(
 	bucketLive = make(map[uint32]uint64, 4)
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
 	var canonical [storeio.IndexTermMaxKeyBytes]byte
-	var scratch []byte
-	scratch, err = storeio.VisitPrimaryLeafPostingRows(
-		leafPage, c.storeID, bucket, bounds, scratch,
+	_, err = storeio.VisitPrimaryLeafPostingRows(
+		leafPage, c.storeID, bucket, bounds, nil,
 		func(slot uint8, _, raw []byte, overflow bool) error {
 			if overflow {
 				// The row stores its value out of line, so raw is the chain head
@@ -746,8 +742,8 @@ func (c *Collection) prepareStructuralExactLocked(
 // stagePrimaryExactPagesLocked persists the exact indexes inside tx and
 // returns the new PagePrimaryExactRoot ref: it writes a durable page for
 // every staged leaf that does not already have one (carried leaves keep the
-// page their ref names — the O(dirty leaves) half of §7's fold), rebuilds
-// each index's ordered catalog and the v1 root (both small), and retires
+// page their ref names — the O(dirty leaves) half of the fold), rebuilds
+// each index's ordered catalog and root (both small), and retires
 // exactly the superseded pages: the old root, the old catalog pages, and
 // the old pages of leaves the fold replaced or dropped. It stages nothing
 // and returns a zero ref for a collection without exact indexes.

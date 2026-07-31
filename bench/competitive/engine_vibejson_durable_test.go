@@ -96,9 +96,8 @@ func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
 }
 
 // TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary pins the unified
-// primary delete fast path. Dense class-5 leaves publish overlay tombstones
-// without paying a second writer lock and merge/reclass evaluation; structural
-// hygiene runs only after a delete makes a routed leaf empty.
+// primary delete fast path. Dense leaves do not run empty-leaf reclamation;
+// structural hygiene runs only after a delete makes a routed leaf empty.
 func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 	factory, ok := FactoryNamed("vibejson-durable")
 	if !ok {
@@ -108,15 +107,15 @@ func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 	defer cleanup()
 	v := e.(*vibeDurable)
 
-	base := v.coll.Stats().MergeReclassEvaluations
+	base := v.coll.Stats().PrimaryEmptyReclaims
 	for i := 0; i < 64 && i < len(docs); i++ {
 		if err := e.Delete(docs[i].Key); err != nil {
 			t.Fatalf("delete %d: %v", i, err)
 		}
 	}
-	if got := v.coll.Stats().MergeReclassEvaluations - base; got != 0 {
+	if got := v.coll.Stats().PrimaryEmptyReclaims - base; got != 0 {
 		t.Fatalf(
-			"buffered-visible dense primary deletes ran %d merge/reclass evaluations, want 0",
+			"buffered-visible dense primary deletes ran %d empty-leaf reclaims, want 0",
 			got,
 		)
 	}

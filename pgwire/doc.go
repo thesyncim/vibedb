@@ -6,7 +6,7 @@
 //		log.Fatal(err)
 //	}
 //	defer db.Close()
-//	srv, err := pgwire.NewServer(pgwire.FromSQLDatabase(db), pgwire.Options{
+//	srv, err := pgwire.NewServer(db, pgwire.Options{
 //		Auth: pgwire.Trust(), // explicit; use SCRAM outside a trust boundary
 //	})
 //	if err != nil {
@@ -47,7 +47,7 @@
 // psql's own basic meta-commands are the one bounded exception. Stock psql
 // builds its catalog queries from fixed templates, so the exact texts it
 // emits for \l, \dn, \dt, \di, \d, and \d <name> are knowable in advance, and
-// with [FromSQLDatabase] this server recognizes those texts and answers each
+// this server recognizes those texts and answers each
 // whole query from the SQL catalog without evaluating any of the SQL inside
 // it; \df, \du, and \dv are recognized and honestly empty. The recognition
 // runs only after the SQL front end has already refused the statement, so a
@@ -90,18 +90,16 @@
 //     Bind; command.go explains why the rewrite lives here and not in the
 //     parser. Byte offsets are preserved by the rewrite, so an error's position
 //     still points into the statement the client sent.
-//   - With [FromSQLDatabase]: CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
+//   - CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
 //     DELETE, SELECT, one declared-field inner JOIN, schema validation, exact
 //     indexes, whole-document parameters, and affected-row command tags.
-//   - With [FromSQLDatabase]: stock psql's basic introspection meta-commands
+//   - Stock psql's basic introspection meta-commands
 //     — \l, \dn, \dt, \di, \d, and \d <name> — answered from the SQL catalog
 //     by the post-parse-failure recognition shim in catalog_shim.go; \df,
 //     \du, and \dv are recognized and honestly empty.
 //   - Explicit BEGIN/COMMIT/ROLLBACK with ReadyForQuery I/T/E state,
 //     read-your-writes, rollback, failed-transaction behavior, read-only mode,
 //     and implicit atomic batches for non-DDL stored-row statements.
-//   - With [FromDatabase] or [FromCollection], the original read-only SELECT
-//     source remains available without opening a SQL catalog.
 //
 // # What does not work
 //
@@ -115,9 +113,6 @@
 //   - Savepoints, chained transactions, two-table writes, and isolation modes
 //     other than the runtime's REPEATABLE READ snapshot. Read-only and
 //     read-write transaction access modes are supported.
-//   - DDL/DML/transactions on [FromDatabase] and [FromCollection]. Those
-//     constructors intentionally expose read-only stores; use
-//     [FromSQLDatabase] for the writable catalog.
 //   - pg_catalog and information_schema as queryable tables. There are no
 //     catalog tables; see above. psql's basic meta-commands (\l, \dn, \dt,
 //     \di, \d, \d name) are answered by the recognition shim against a
@@ -240,20 +235,20 @@
 // # Concurrency
 //
 // One connection is one session with its own prepared statements, portals, and
-// query executor, served by one goroutine. A writable source opens one typed
-// SQL Session per authenticated connection; read-only sources retain one
-// [query.Exec] per connection. Nothing single-consumer is shared, so the query
-// hot path needs no session lock. Many sessions run concurrently against one
-// [Source], with independent snapshots and transaction overlays.
+// query executor, served by one goroutine. The database opens one typed SQL
+// Session per authenticated connection. Nothing single-consumer is shared, so
+// the query hot path needs no session lock. Many sessions run concurrently
+// against one database, with independent snapshots and transaction overlays.
 //
 // Each session runs its executor with one worker. Session concurrency already
 // supplies parallelism; inheriting query's standalone GOMAXPROCS default in
 // every admitted connection would multiply retained durable worker pools and
 // their arenas by [Options.MaxConnections].
 //
-// One consequence is visible to a client. A session has one [query.Exec], so it
-// has one live result set: a portal suspended by an Execute row limit cannot be
-// resumed after another statement has executed on the same connection, and
+// One consequence is visible to a client. A SQL session has one reusable query
+// executor, so it has one live result set: a portal suspended by an Execute row
+// limit cannot be resumed after another statement has executed on the same
+// connection, and
 // trying returns 55000 with an explanation. Reading a portal to completion, or
 // executing without a row limit, avoids it entirely, which is what every client
 // library does by default.
@@ -266,7 +261,7 @@
 //
 // # Shared typed runtime
 //
-// [FromSQLDatabase] borrows a [github.com/thesyncim/vibedb/sql/driver.Database].
+// [NewServer] borrows a [github.com/thesyncim/vibedb/sql/driver.Database].
 // Each authenticated connection opens one single-consumer typed Session.
 // Prepare parses and lowers once, exposes scalar/document parameter roles and
 // typed output metadata, and owns the reusable compiled statement. SELECT

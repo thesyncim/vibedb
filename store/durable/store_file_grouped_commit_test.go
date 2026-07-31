@@ -36,7 +36,7 @@ func TestFileStoreGroupedCommitCoversPublishedFileEnd(t *testing.T) {
 		if err := collection.Flush(); err != nil {
 			t.Fatal(err)
 		}
-		published := collection.state.Load().super.FileEnd
+		published := collection.state.Load().fileEnd
 		if err := collection.Close(); err != nil {
 			t.Fatal(err)
 		}

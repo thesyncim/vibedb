@@ -5,72 +5,17 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// Batched-commit durability for the ordered primary.
-//
-// The single-file page-kind crash sweep that this file once carried tore a
-// commit image at every write boundary and reopened the bytes in isolation.
-// That model belonged to the retired chunk store: the ordered primary recovers
-// through a sibling redo journal, so an image copied without its journal is not
-// a store the sweep can reopen, and the per-kind census it proved was stated in
-// chunk/document/directory page kinds that no longer exist. Primary crash
-// recovery is now covered directly by the primary crash matrices
-// (TestFilePrimary*CrashBoundary/Matrix), the exhaustive sweep, and the
-// recovery-journal suites. What remains here is the retirement-ordering and
-// file-growth behaviour of the batched Update path, which is exercised through
-// real Create/Open/Update cycles rather than image surgery.
-
-// crashPage is one decoded physical page found by walking a store image.
-type crashPage struct {
-	offset uint64
-	length uint32
-	kind   storeio.PageKind
-}
-
-// walkImagePages decodes every physical page in a store image after the two
-// superblock copies.
-//
-// It reads the file the way a forensic tool would rather than the way the store
-// does: no root is consulted and no reference is followed, so a page the commit
-// wrote and then failed to link is still found. That is deliberate. The point of
-// this walk is to name what a commit put on disk, and a walk that started from
-// the roots could only ever name what the roots already reach — which is the
-// half of the question that is not in doubt.
-//
-// Extents are page-size aligned and every page records its own size, so the walk
-// steps by the decoded size when a header is valid and by one page-size quantum
-// when it is not. Free and never-written space simply fails to decode.
-func walkImagePages(image []byte, pageSize, maxPageSize int) []crashPage {
-	pages := make([]crashPage, 0, 64)
-	for offset := testMutableDataStart(pageSize); offset < len(image); {
-		end := min(offset+maxPageSize, len(image))
-		header, _, err := storeio.OpenPage(image[offset:end])
-		if err != nil {
-			offset += pageSize
-			continue
-		}
-		pages = append(pages, crashPage{
-			offset: uint64(offset), length: header.PageSize, kind: header.Kind,
-		})
-		offset += int(header.PageSize)
-	}
-	return pages
-}
+// Batched-commit retirement ordering and file-growth coverage.
 
 // commitCrashOptions configures a collection whose ordinary commits touch every
 // page kind the single-document and batched write paths can produce.
 //
-// The ordered primary stores values inline in its leaves; the incremental Put
-// path does not spill to overflow pages the way the retired chunk store did, so
-// InlineValueBytes (and the leaf page it must fit) is sized to admit every
-// document this sweep writes. An index makes the exact-index tiles participate
-// in the same torn commits.
+// InlineValueBytes is sized to keep this sweep's documents in the primary
+// leaves, excluding overflow pages from the transaction geometry under test.
 func commitCrashOptions(batchDocuments int) Options {
 	options := testFileStoreOptions()
-	options.Collection.ChunkDocuments = 4
 	options.ResidentBytes = 16 << 20
 	options.BufferCount = 1024
 	options.MaxRetiredExtents = 4096
@@ -123,18 +68,6 @@ func TestCollectionUpdateWritesItsRetirementsInTheSameCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = freeSetFromFile(t, file.Name(), options.PageSize)
-	}
-	image, err := os.ReadFile(file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// State now lives in the fixed root. No publication may allocate the
-	// standalone state-page shape that previously leaked when retirement
-	// ordering was wrong.
-	for _, page := range walkImagePages(image, options.PageSize, options.MaxPageSize) {
-		if page.kind == storeio.PageStateRoot {
-			t.Fatalf("inline-root collection allocated state page at %d", page.offset)
-		}
 	}
 }
 

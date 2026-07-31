@@ -154,7 +154,7 @@ func TestReplayFreeLogAppliesChainOldestToNewest(t *testing.T) {
 		{Op: FreeOpSet, Extent: freeLogTestExtent(60, 2, 6)},
 	}, middle, index)
 
-	got, pages, err := ReplayFreeLog(w.cache, newest, w.bounds(), nil, 64, 64)
+	got, pages, err := replayExternalFreeLog(w.cache, newest, w.bounds(), nil, 64, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestReplayFreeLogRejectsSplicedChainAndOverlap(t *testing.T) {
 	base := w.index([]FreeSegment{segmentOf(w.image(baseExtents), baseExtents)}, PageRef{})
 	oldest := w.delta([]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(40, 1, 2)}}, PageRef{}, other)
 	newest := w.delta([]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(60, 1, 2)}}, oldest, base)
-	if _, _, err := ReplayFreeLog(w.cache, newest, w.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
+	if _, _, err := replayExternalFreeLog(w.cache, newest, w.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("spliced chain = %v, want %v", err, ErrFreeLogCorrupt)
 	}
 
@@ -206,7 +206,7 @@ func TestReplayFreeLogRejectsSplicedChainAndOverlap(t *testing.T) {
 		[]FreeSegment{segmentOf(overlapping.image(overlapExtents), overlapExtents)}, PageRef{})
 	head := overlapping.delta(
 		[]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(22, 4, 2)}}, PageRef{}, index)
-	if _, _, err := ReplayFreeLog(overlapping.cache, head, overlapping.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
+	if _, _, err := replayExternalFreeLog(overlapping.cache, head, overlapping.bounds(), nil, 64, 64); !errors.Is(err, ErrFreeLogCorrupt) {
 		t.Fatalf("overlapping replay = %v, want %v", err, ErrFreeLogCorrupt)
 	}
 }
@@ -223,10 +223,10 @@ func TestReplayFreeLogRespectsCallerCapacity(t *testing.T) {
 	}
 	index := w.index([]FreeSegment{segmentOf(w.image(extents), extents)}, PageRef{})
 	head := w.delta([]FreeDelta{{Op: FreeOpSet, Extent: freeLogTestExtent(600, 1, 2)}}, PageRef{}, index)
-	if _, _, err := ReplayFreeLog(w.cache, head, w.bounds(), nil, 4, 64); !errors.Is(err, ErrRetiredExtentCapacity) {
+	if _, _, err := replayExternalFreeLog(w.cache, head, w.bounds(), nil, 4, 64); !errors.Is(err, ErrRetiredExtentCapacity) {
 		t.Fatalf("bounded replay = %v, want %v", err, ErrRetiredExtentCapacity)
 	}
-	got, _, err := ReplayFreeLog(w.cache, head, w.bounds(), nil, 9, 64)
+	got, _, err := replayExternalFreeLog(w.cache, head, w.bounds(), nil, 9, 64)
 	if err != nil || len(got) != 9 {
 		t.Fatalf("replay = (%d,%v), want 9 extents", len(got), err)
 	}
@@ -236,59 +236,3 @@ func TestReplayFreeLogRespectsCallerCapacity(t *testing.T) {
 // when recovery selects a root, then that candidate is rejected: the free
 // reference changed shape with the format, and a free B+tree node would
 // otherwise pass every structural check the superblock performs.
-func TestRecoverStateRootValidatesFreeLogHead(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "free-log-recovery-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	pageSize := uint64(testSuperblockPageSize)
-	fileEnd := 7 * pageSize
-	state := StateRoot{
-		StoreID: testStoreID, Generation: 1, PageSize: testSuperblockPageSize,
-		MaxPageSize: 64 << 10, NextLogicalID: 3, ChunkDocuments: 64,
-	}
-	statePage := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeStateRootPage(statePage, state, fileEnd); err != nil {
-		t.Fatal(err)
-	}
-	freePage := make([]byte, testSuperblockPageSize)
-	header := FreeLogHeader{
-		StoreID: testStoreID, Generation: 1, LogicalID: 2, PageSize: testSuperblockPageSize,
-	}
-	if _, err := EncodeFreeDeltaPage(freePage, header,
-		[]FreeDelta{{Op: FreeOpSet, Extent: FreeExtent{
-			Offset: 4 * pageSize, Length: pageSize, RetiredGeneration: 1,
-		}}}, PageRef{}, PageRef{}, fileEnd, state.NextLogicalID); err != nil {
-		t.Fatal(err)
-	}
-	root := testSuperblock(1, 4*pageSize, statePage)
-	root.FileEnd = fileEnd
-	root.FreeOffset = 5 * pageSize
-	root.FreeLength = testSuperblockPageSize
-	root.FreeChecksum = PageChecksum(freePage)
-	encodedRoot := encodeTestSuperblock(t, root)
-	if err := file.Truncate(int64(fileEnd)); err != nil {
-		t.Fatal(err)
-	}
-	writeAtTest(t, file, encodedRoot[:], 0)
-	writeAtTest(t, file, statePage, int64(root.StateOffset))
-	writeAtTest(t, file, freePage, int64(root.FreeOffset))
-	scratch := make([]byte, testSuperblockPageSize)
-	gotRoot, gotState, slot, err := RecoverStateRoot(file, testSuperblockPageSize, scratch)
-	if err != nil || gotRoot != root || gotState != state || slot != 0 {
-		t.Fatalf("RecoverStateRoot = (%+v,%+v,%d,%v)", gotRoot, gotState, slot, err)
-	}
-
-	// Corrupt the operation byte of the single record: the checksum still has to
-	// be repaired for the page to reach the schema check at all.
-	freePage[PageHeaderSize+FreeDeltaPayloadHeaderSize] = 0
-	resealTestPage(freePage)
-	root.FreeChecksum = PageChecksum(freePage)
-	encodedRoot = encodeTestSuperblock(t, root)
-	writeAtTest(t, file, freePage, int64(root.FreeOffset))
-	writeAtTest(t, file, encodedRoot[:], 0)
-	if _, _, _, err := RecoverStateRoot(file, testSuperblockPageSize, scratch); !errors.Is(err, ErrSuperblockNotFound) {
-		t.Fatalf("semantic free corruption = %v, want %v", err, ErrSuperblockNotFound)
-	}
-}

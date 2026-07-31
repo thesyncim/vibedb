@@ -494,7 +494,7 @@ func putSeedsAtomic(collection *durable.Collection, seeds []seedDocument) error 
 	}
 	if !collection.SupportsUpdate() {
 		return fmt.Errorf(
-			"vibedb: multi-row INSERT requires an atomic batch unsupported by this legacy table layout: %w",
+			"vibedb: multi-row INSERT requires an atomic batch unsupported by this table configuration: %w",
 			durable.ErrPrimaryBatchIndexedUnsupported)
 	}
 	return collection.Update(func(batch *durable.WriteBatch) error {
@@ -857,7 +857,7 @@ func (c *conn) updateLocked(
 	default:
 		if !t.collection.SupportsUpdate() {
 			return nil, fmt.Errorf(
-				"vibedb: multi-document UPDATE requires an atomic batch unsupported by this legacy table layout: %w",
+				"vibedb: multi-document UPDATE requires an atomic batch unsupported by this table configuration: %w",
 				durable.ErrPrimaryBatchIndexedUnsupported)
 		}
 		mutationErr = t.collection.Update(func(batch *durable.WriteBatch) error {
@@ -914,7 +914,7 @@ func (c *conn) deleteLocked(
 	default:
 		if !t.collection.SupportsUpdate() {
 			return nil, fmt.Errorf(
-				"vibedb: multi-document DELETE requires an atomic batch unsupported by this legacy table layout: %w",
+				"vibedb: multi-document DELETE requires an atomic batch unsupported by this table configuration: %w",
 				durable.ErrPrimaryBatchIndexedUnsupported)
 		}
 		mutationErr = t.collection.Update(func(batch *durable.WriteBatch) error {

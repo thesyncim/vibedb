@@ -36,7 +36,6 @@ const (
 	GlobalTabletCatalogMaxLeafPages   = 1 << 13
 	GlobalTabletCatalogMaxBranchPages = 1 << 9
 
-	GlobalTabletCatalogStateRootLogicalID       = StateRootLogicalID
 	GlobalTabletCatalogLeafLogicalIDBase        = PrimaryLeafLogicalIDBase
 	GlobalTabletCatalogLeafLogicalIDLimit       = PrimaryLeafLogicalIDLimit
 	GlobalTabletCatalogAnchorLogicalIDBase      = PrimaryAnchorLogicalIDBase
@@ -52,9 +51,9 @@ const (
 	GlobalTabletCatalogRootLogicalID            = PrimaryCatalogRootLogicalID
 	GlobalTabletCatalogFirstDynamicLogicalID    = PrimaryFirstDynamicLogicalID
 
-	globalTabletCatalogNodeVersion    = uint32(1)
-	globalTabletCatalogLocatorVersion = uint32(1)
-	globalTabletCatalogRootVersion    = uint32(1)
+	globalTabletCatalogNodeVersion    = DevelopmentFormatVersion
+	globalTabletCatalogLocatorVersion = DevelopmentFormatVersion
+	globalTabletCatalogRootVersion    = DevelopmentFormatVersion
 	globalTabletCatalogPackedBits     = 14
 	globalTabletCatalogPackedBytes    = TabletLocalIdentityLocalCount * globalTabletCatalogPackedBits / 8
 )
@@ -252,20 +251,6 @@ type GlobalTabletCatalogAnchorView struct {
 	tabletID uint32
 }
 
-// GlobalTabletCatalogSpace is an exact routing-only charge. CatalogBytes is
-// supplied from the measured catalog tree because shortest separator lengths
-// are workload dependent.
-type GlobalTabletCatalogSpace struct {
-	Tablets      uint64
-	Leaves       uint64
-	Documents    uint64
-	TabletBytes  uint64
-	CatalogBytes uint64
-	TotalBytes   uint64
-	BytesPerLeaf float64
-	BytesPerDoc  float64
-}
-
 // GlobalTabletCatalogCatalogBounds is the computed geometry of a catalog tree
 // for a given tablet count and worst-case fence width: fanouts, page and level
 // counts, and the COW, disk, and resident byte budgets. The builder uses it to
@@ -333,10 +318,6 @@ func GlobalTabletCatalogCatalogBranchLogicalID(pageID uint32) (uint64, bool) {
 		return 0, false
 	}
 	return GlobalTabletCatalogBranchPageLogicalIDBase + uint64(pageID), true
-}
-
-func GlobalTabletCatalogIsDynamicLogicalID(logicalID uint64) bool {
-	return logicalID >= GlobalTabletCatalogFirstDynamicLogicalID
 }
 
 // GlobalTabletCatalogWorstCaseFanout returns a universal lower bound for
@@ -1301,14 +1282,14 @@ func ValidateGlobalTabletCatalogAnchor(
 		return globalTabletCatalogCorrupt("anchor admission envelope")
 	}
 	var ranks [SegmentedTabletRouterMaxPages]byte
-	compat := SegmentedTabletRouterView{
+	router := SegmentedTabletRouterView{
 		rootRanks: ranks[:], storeID: bounds.StoreID,
 		tabletID: tabletID, generation: bounds.SelectedRootGeneration,
 		pageCount:  SegmentedTabletRouterMaxPages,
 		anchorKind: PagePrimaryAnchor, leafKind: PagePrimaryLeaf,
 	}
 	page, err := segmentedTabletRouterOpenAnchor(
-		src, compat, pageID, expected,
+		src, router, pageID, expected,
 	)
 	if err != nil {
 		return err
@@ -1346,8 +1327,8 @@ func OpenGlobalTabletCatalogAnchor(
 		return GlobalTabletCatalogAnchorView{},
 			globalTabletCatalogCorrupt("anchor reference")
 	}
-	compat := root.inner.segmentedView()
-	page, err := segmentedTabletRouterOpenAnchor(src, compat, pageID, ref)
+	router := root.inner.segmentedView()
+	page, err := segmentedTabletRouterOpenAnchor(src, router, pageID, ref)
 	if err != nil {
 		return GlobalTabletCatalogAnchorView{}, err
 	}
@@ -1375,11 +1356,11 @@ func OpenGlobalTabletCatalogAnchor(
 func AdmittedGlobalTabletCatalogAnchor(
 	src []byte, root *GlobalTabletCatalogTabletRootView, pageID uint8,
 ) GlobalTabletCatalogAnchorView {
-	compat := root.inner.segmentedView()
+	router := root.inner.segmentedView()
 	ref, _ := root.inner.anchorRef(pageID)
 	return GlobalTabletCatalogAnchorView{
 		page: segmentedTabletRouterAdmittedAnchor(
-			src, compat, pageID,
+			src, router, pageID,
 		),
 		ref: ref, locator: root.locator, tabletID: root.inner.tabletID,
 	}
@@ -1412,9 +1393,9 @@ func (v *GlobalTabletCatalogTabletRootView) RewriteHandle(
 		return SegmentedTabletRouterCOWResult{},
 			fmt.Errorf("%w: global tablet COW route", ErrInvalidWrite)
 	}
-	compat := v.inner.segmentedView()
-	compat.pages[route.PageID] = anchor.page
-	return compat.rewriteHandleAt(
+	router := v.inner.segmentedView()
+	router.pages[route.PageID] = anchor.page
+	return router.rewriteHandleAt(
 		rootDst, pageDst, generation, route.Bucket,
 		route.PageID, route.RowSlot, leafRef, zone, anchorRef,
 	)
@@ -1643,26 +1624,6 @@ func (v *GlobalTabletCatalogAnchorView) ResolveBucket(
 	return v.page.handleAt(rowSlot, bucket)
 }
 
-func GlobalTabletCatalogRoutingSpace(
-	documents, rowsPerLeaf, leavesPerTablet, catalogBytes uint64,
-) (GlobalTabletCatalogSpace, bool) {
-	if documents == 0 || rowsPerLeaf == 0 || leavesPerTablet == 0 {
-		return GlobalTabletCatalogSpace{}, false
-	}
-	leaves := (documents + rowsPerLeaf - 1) / rowsPerLeaf
-	tablets := (leaves + leavesPerTablet - 1) / leavesPerTablet
-	tabletBytes := tablets * (GlobalTabletCatalogTabletBytes +
-		GlobalTabletCatalogLocatorBytes +
-		SegmentedTabletRouterMaxPages*SegmentedTabletRouterAnchorPageBytes)
-	total := tabletBytes + catalogBytes
-	return GlobalTabletCatalogSpace{
-		Tablets: tablets, Leaves: leaves, Documents: documents,
-		TabletBytes: tabletBytes, CatalogBytes: catalogBytes, TotalBytes: total,
-		BytesPerLeaf: float64(total) / float64(leaves),
-		BytesPerDoc:  float64(total) / float64(documents),
-	}, true
-}
-
 func globalTabletCatalogNodePageBytes(
 	level GlobalTabletCatalogNodeLevel,
 ) (int, error) {
@@ -1832,7 +1793,7 @@ func globalTabletCatalogValidatePackedRef(
 		ref.LogicalID != logicalID || ref.Generation == 0 ||
 		ref.Generation >= uint64(1)<<48 ||
 		ref.Generation > selectingGeneration || ref.Length != length ||
-		ref.Kind != kind || ref.Flags != 0 || ref.Aux != 0 ||
+		ref.Kind != kind ||
 		!bounds.contains(ref) {
 		return fmt.Errorf("%w: packed catalog reference", ErrInvalidWrite)
 	}
@@ -1847,8 +1808,7 @@ func globalTabletCatalogValidateFullRef(
 		ref.LogicalID != logicalID || ref.Generation == 0 ||
 		ref.Generation >= uint64(1)<<48 ||
 		ref.Generation > selectingGeneration ||
-		ref.Length != uint32(length) || ref.Kind != kind ||
-		ref.Flags != 0 || ref.Aux != 0 || !bounds.contains(ref) {
+		ref.Length != uint32(length) || ref.Kind != kind || !bounds.contains(ref) {
 		return fmt.Errorf("%w: full tablet reference", ErrInvalidWrite)
 	}
 	return nil
@@ -1866,8 +1826,7 @@ func globalTabletCatalogHeaderMatchesRef(
 		header.StoreID == bounds.StoreID &&
 		header.LogicalID == ref.LogicalID &&
 		header.Generation == ref.Generation &&
-		header.PageSize == ref.Length && header.Kind == ref.Kind &&
-		ref.Flags == 0 && ref.Aux == 0 && bounds.contains(ref)
+		header.PageSize == ref.Length && header.Kind == ref.Kind && bounds.contains(ref)
 }
 
 func (b GlobalTabletCatalogBounds) valid() bool {

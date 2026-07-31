@@ -73,16 +73,14 @@ type JournalFaultPlan struct {
 type FaultJournal struct {
 	file *os.File
 
-	mu          sync.Mutex
-	plan        JournalFaultPlan
-	appends     int
-	recycles    int
-	syncs       int
-	fileSyncs   int
-	dataSyncs   int
-	faulted     bool
-	tornWrites  int
-	appendBytes int64
+	mu        sync.Mutex
+	plan      JournalFaultPlan
+	appends   int
+	recycles  int
+	syncs     int
+	fileSyncs int
+	dataSyncs int
+	faulted   bool
 }
 
 // NewFaultJournal wraps the file backing rj and installs its write and sync

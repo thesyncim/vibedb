@@ -33,8 +33,7 @@ import (
 
 func FuzzFrontendMessage(f *testing.F) {
 	// Seeds: one well-formed message of each shape the decoder has a branch
-	// for, then the malformed shapes that have historically broken hand-written
-	// protocol decoders.
+	// for, then malformed shapes that stress hand-written protocol decoders.
 	seed := func(tag byte, body []byte) {
 		f.Add(frame(tag, body))
 	}

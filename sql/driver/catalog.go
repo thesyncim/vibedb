@@ -19,7 +19,7 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const catalogVersion = 2
+const catalogVersion = 0
 
 const maxCatalogTableNameBytes = 1<<16 - 1
 
@@ -242,11 +242,11 @@ func openDatabaseWithSync(
 			d.catalogWritePending = true
 		}
 		if !meta.Materialized {
-			// Catalog v2 predates the explicit materialization bit. Presence
-			// of a valid durable file is authoritative and can be upgraded
-			// safely before this handle is exposed.
-			meta.Materialized = true
-			d.catalogWritePending = true
+			_ = d.close()
+			return nil, fmt.Errorf(
+				"vibedb: SQL catalog table %q has a data file but is not marked materialized",
+				name,
+			)
 		}
 		d.tables[name] = t
 	}
@@ -266,7 +266,7 @@ func openDatabaseWithSync(
 // Pending-fence flags are necessarily in-memory, so a reopen cannot know which
 // one failed. Fencing both possible directories is the bounded recovery record:
 // the catalog parent first, then the table directory before any visible table
-// file is adopted or a legacy Materialized bit is upgraded.
+// file is opened.
 func (d *database) recoverVisibleNamespace() error {
 	parent := filepath.Dir(d.path)
 	if err := d.directorySync(parent); err != nil {

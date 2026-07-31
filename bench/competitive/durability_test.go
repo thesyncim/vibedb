@@ -8,8 +8,6 @@ import (
 
 func TestDurabilityModeParseRoundTrip(t *testing.T) {
 	modes := []DurabilityMode{
-		DurabilityDefault,
-		DurabilityVolatile,
 		DurabilityBufferedVisible,
 		DurabilityAsyncStableInFlight,
 		DurabilityOrdinarySync,
@@ -25,32 +23,7 @@ func TestDurabilityModeParseRoundTrip(t *testing.T) {
 		}
 	}
 	if _, err := ParseDurabilityMode("sync"); err == nil {
-		t.Fatal("ParseDurabilityMode accepted ambiguous legacy sync spelling")
-	}
-}
-
-func TestDurabilityDefaultResolvesToConcreteMode(t *testing.T) {
-	tests := []struct {
-		engine string
-		want   DurabilityMode
-	}{
-		{engine: "vibejson-durable", want: DurabilityBufferedVisible},
-		{engine: "bbolt", want: DurabilityBufferedVisible},
-		{engine: "badger", want: DurabilityBufferedVisible},
-		{engine: "pebble", want: DurabilityBufferedVisible},
-		{engine: "sqlite", want: DurabilityBufferedVisible},
-	}
-	for _, test := range tests {
-		got, err := ResolveDurabilityMode(test.engine, DurabilityDefault)
-		if err != nil {
-			t.Fatalf("%s default: %v", test.engine, err)
-		}
-		if got != test.want {
-			t.Fatalf("%s default = %s, want %s", test.engine, got, test.want)
-		}
-		if got == DurabilityDefault {
-			t.Fatalf("%s retained an ambiguous default", test.engine)
-		}
+		t.Fatal("ParseDurabilityMode accepted ambiguous sync spelling")
 	}
 }
 
@@ -79,9 +52,6 @@ func TestBenchmarkDurabilityModesAreConcreteAndSupported(t *testing.T) {
 			t.Fatalf("%s has no benchmark durability modes", factory.Name)
 		}
 		for _, mode := range modes {
-			if mode == DurabilityDefault {
-				t.Fatalf("%s benchmark modes contain ambiguous default", factory.Name)
-			}
 			resolved, err := ResolveDurabilityMode(factory.Name, mode)
 			if err != nil {
 				t.Fatalf("%s mode %s: %v", factory.Name, mode, err)

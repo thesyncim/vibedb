@@ -50,7 +50,7 @@ func Repack(src, out *os.File, options Options) (RepackReport, error) {
 	}
 	defer source.Close()
 	if state := source.state.Load(); state != nil {
-		report.SourceFileEnd = int64(state.super.FileEnd)
+		report.SourceFileEnd = int64(state.fileEnd)
 	}
 
 	snapshot, err := source.Snapshot()

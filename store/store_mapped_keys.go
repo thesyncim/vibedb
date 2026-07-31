@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/storekey"
 	"github.com/thesyncim/vibedb/internal/storemem"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -87,10 +88,6 @@ type storeMappedKeys struct {
 	// sourceBlock is non-nil when Builder owns packed key spellings.
 	// Open instead borrows its caller-owned image through source.
 	sourceBlock *storemem.Block
-}
-
-func newStoreMappedKeys(source []byte, count int, wideLocations bool) (*storeMappedKeys, error) {
-	return newStoreMappedKeysLayout(source, count, wideLocations, 0)
 }
 
 // refWidth is 0 for the mapped 16-byte layout, 12 for compact owned refs, and
@@ -507,7 +504,7 @@ func storeStateKeyLookupChunk(state *State, hash uint64, key string) (*Chunk, Lo
 	if state == nil {
 		return nil, Location{}, false
 	}
-	if loc, ok := storeKeyLookup(state.keys, hash, key); ok {
+	if loc, ok := storekey.Lookup(state.keys, hash, key); ok {
 		chunk := state.Chunks.Get(loc.Chunk)
 		if chunk != nil && chunk.Live&(uint64(1)<<loc.Slot) != 0 {
 			return chunk, loc, true

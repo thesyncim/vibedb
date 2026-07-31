@@ -214,11 +214,9 @@ func TestRecoveryJournalGroupWindowCrashMatrix(t *testing.T) {
 
 				// The intended values, so recovery can be checked for torn bytes.
 				intended := map[string]string{"seed": `{"v":0}`}
-				keys := make([]string, 0, writers)
 				for w := 0; w < writers; w++ {
 					key := journalCrashKey(w)
 					intended[key] = string(journalValue(w))
-					keys = append(keys, key)
 				}
 
 				var mu sync.Mutex

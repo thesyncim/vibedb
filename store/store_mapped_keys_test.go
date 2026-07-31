@@ -9,7 +9,7 @@ import (
 func TestStoreMappedKeysGroupProbeCollisionDifferential(t *testing.T) {
 	const count = 257
 	source := make([]byte, 0, count*12)
-	mapped, err := newStoreMappedKeys(nil, count, false)
+	mapped, err := newStoreMappedKeysLayout(nil, count, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,4 +48,3 @@ func TestStoreMappedKeysGroupProbeCollisionDifferential(t *testing.T) {
 		t.Fatal("duplicate insertion succeeded")
 	}
 }
-

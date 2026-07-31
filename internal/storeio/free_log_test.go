@@ -282,7 +282,7 @@ func TestFreeLogOpenRejectsCorruption(t *testing.T) {
 		apply func([]byte)
 	}{
 		{"version", func(b []byte) { b[PageHeaderSize] ^= 0xFF }},
-		{"reserved payload byte", func(b []byte) { b[PageHeaderSize+5] = 1 }},
+		{"reserved payload byte", func(b []byte) { b[PageHeaderSize+4] = 1 }},
 		{"record count", func(b []byte) { b[PageHeaderSize+6] = 0xFF }},
 		{"operation byte", func(b []byte) { b[PageHeaderSize+FreeDeltaPayloadHeaderSize] = 0 }},
 		{"record reserved bytes", func(b []byte) { b[PageHeaderSize+FreeDeltaPayloadHeaderSize+1] = 1 }},

@@ -27,11 +27,6 @@ func benchmarkPageCatalogDefinition() PageCatalogDefinition {
 			},
 		)
 	}
-	for i := range 32 {
-		definition.Float64Paths = append(
-			definition.Float64Paths, fmt.Sprintf("/metrics/%03d", i),
-		)
-	}
 	return definition
 }
 

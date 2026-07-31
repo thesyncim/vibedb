@@ -203,5 +203,5 @@ func repackTestAdjacency(t *testing.T, collection *Collection) (float64, uint64)
 	if meanExtent != 0 {
 		ratio = meanAdj / meanExtent
 	}
-	return ratio, collection.state.Load().super.FileEnd
+	return ratio, collection.state.Load().fileEnd
 }

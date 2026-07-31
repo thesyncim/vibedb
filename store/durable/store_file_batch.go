@@ -22,13 +22,10 @@ var ErrBatchClosed = errors.New("vibejson: collection write batch is no longer a
 // state per key. Keys and documents are copied into the batch, so the caller
 // may reuse its buffers as soon as a method returns.
 //
-// Deduplication is what makes the batch expressible at all — two rows for one
-// key inside a single chunk rebuild would corrupt the page — but it is also
-// visible in one place. Deleting a key and then putting it back inside one
-// batch keeps the row at its existing {chunk, slot}, where the same pair of
-// single-document calls would free the slot and append a new one. Both publish
-// the same documents under the same keys; only the coordinates differ, and no
-// coordinate is part of the collection's contract.
+// Deduplication also makes last-write-wins semantics explicit before routing:
+// deleting a key and then putting it back in one batch publishes the final
+// document without staging an intermediate primary mutation. Physical row
+// coordinates are not part of the collection contract.
 //
 // Document syntax is validated when Update applies the batch, not when Put
 // records it. Validation needs the same parse the commit needs, and doing it

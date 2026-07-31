@@ -83,14 +83,14 @@ func TestCommitterOptionsValidation(t *testing.T) {
 func TestCommitterInitializeRecoveredGeneration(t *testing.T) {
 	committer, _, _ := newPortableCommitter(t, 2, 0)
 	defer committer.Close()
-	if err := committer.InitializeGeneration(41); err != nil {
+	if err := committer.InitializeRecovery(41, 0, 40); err != nil {
 		t.Fatal(err)
 	}
 	if committer.PublishedGeneration() != 41 || committer.DurableGeneration() != 41 {
 		t.Fatalf("initialized generations = %d/%d", committer.PublishedGeneration(), committer.DurableGeneration())
 	}
-	if err := committer.InitializeGeneration(42); !errors.Is(err, ErrGenerationOrder) {
-		t.Fatalf("second InitializeGeneration = %v, want %v", err, ErrGenerationOrder)
+	if err := committer.InitializeRecovery(42, 1, 41); !errors.Is(err, ErrGenerationOrder) {
+		t.Fatalf("second InitializeRecovery = %v, want %v", err, ErrGenerationOrder)
 	}
 	batch, err := committer.Begin(0)
 	if err != nil {
@@ -126,7 +126,7 @@ func TestCommitterAlternatesFromRecoveredPhysicalRootAcrossGroupedGenerations(t 
 		t.Fatal(err)
 	}
 	defer committer.Close()
-	if err := committer.InitializeGenerationAt(1, 0); err != nil {
+	if err := committer.InitializeRecovery(1, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -136,13 +136,12 @@ func TestCommitterAlternatesFromRecoveredPhysicalRootAcrossGroupedGenerations(t 
 		if beginErr != nil {
 			t.Fatal(beginErr)
 		}
-		state := []byte{byte(generation)}
-		root := testSuperblock(
-			generation, testMutableStoreDataStart(uint32(pageSize)), state,
-		)
+		root := testInlineSuperblock(generation)
 		root.PageSize = uint32(pageSize)
-		root.FileEnd = root.StateOffset + uint64(pageSize)
-		if setErr := batch.SetSuperblock(root); setErr != nil {
+		root.State.PageSize = uint32(pageSize)
+		root.State.MaxPageSize = uint32(pageSize)
+		root.FileEnd = testMutableStoreDataStart(uint32(pageSize))
+		if setErr := batch.SetInlineSuperblock(root); setErr != nil {
 			t.Fatal(setErr)
 		}
 		if publishErr := batch.Publish(generation); publishErr != nil {
@@ -177,13 +176,16 @@ func TestCommitterAlternatesFromRecoveredPhysicalRootAcrossGroupedGenerations(t 
 	}
 }
 
-func TestCommitterGroupedSuperblockTearRecoversPreviousPhysicalCommit(t *testing.T) {
+func TestCommitterGroupedInlineRootTearRecoversPreviousPhysicalCommit(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "grouped-root-recovery")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer file.Close()
 	pageSize := os.Getpagesize()
+	if err := file.Truncate(int64(testMutableStoreDataStart(uint32(pageSize)))); err != nil {
+		t.Fatal(err)
+	}
 	committer, err := NewCommitter(file, DeviceOptions{
 		Backend: BackendPortable, BufferCount: 4, BufferSize: pageSize,
 	}, CommitterOptions{
@@ -196,36 +198,16 @@ func TestCommitterGroupedSuperblockTearRecoversPreviousPhysicalCommit(t *testing
 
 	publish := func(generation uint64) {
 		t.Helper()
-		batch, beginErr := committer.Begin(1)
+		batch, beginErr := committer.Begin(0)
 		if beginErr != nil {
 			t.Fatal(beginErr)
 		}
-		statePage, bufferErr := batch.PageBuffer(0)
-		if bufferErr != nil {
-			t.Fatal(bufferErr)
-		}
-		stateOffset := testMutableStoreDataStart(uint32(pageSize)) +
-			(generation-1)*uint64(pageSize)
-		fileEnd := stateOffset + uint64(pageSize)
-		state := StateRoot{
-			StoreID: testStoreID, Generation: generation, PageSize: uint32(pageSize),
-			MaxPageSize: uint32(pageSize), NextLogicalID: 2, ChunkDocuments: 64,
-		}
-		if _, encodeErr := EncodeStateRootPage(statePage, state, fileEnd); encodeErr != nil {
-			t.Fatal(encodeErr)
-		}
-		if setErr := batch.setStorePage(
-			0, int64(stateOffset), pageSize, PageStateRoot,
-		); setErr != nil {
-			t.Fatal(setErr)
-		}
-		super := Superblock{
-			StoreID: testStoreID, Generation: generation,
-			StateOffset: stateOffset, StateLength: uint32(pageSize),
-			StateChecksum: PageChecksum(statePage[:pageSize]),
-			FileEnd:       fileEnd, PageSize: uint32(pageSize),
-		}
-		if setErr := batch.SetSuperblock(super); setErr != nil {
+		root := testInlineSuperblock(generation)
+		root.PageSize = uint32(pageSize)
+		root.State.PageSize = uint32(pageSize)
+		root.State.MaxPageSize = uint32(pageSize)
+		root.FileEnd = testMutableStoreDataStart(uint32(pageSize))
+		if setErr := batch.SetInlineSuperblock(root); setErr != nil {
 			t.Fatal(setErr)
 		}
 		if publishErr := batch.Publish(generation); publishErr != nil {
@@ -250,7 +232,7 @@ func TestCommitterGroupedSuperblockTearRecoversPreviousPhysicalCommit(t *testing
 	}
 
 	scratch := make([]byte, pageSize)
-	_, newest, slot, fallbackGeneration, err := RecoverStateRootWithFallback(
+	_, newest, slot, fallbackGeneration, err := RecoverInlineStateRootWithFallback(
 		file, uint32(pageSize), scratch,
 	)
 	if err != nil || newest.Generation != 3 || slot != 1 || fallbackGeneration != 1 {
@@ -265,7 +247,7 @@ func TestCommitterGroupedSuperblockTearRecoversPreviousPhysicalCommit(t *testing
 	}
 	corrupt[0] ^= 1
 	writeAtTest(t, file, corrupt[:], int64(pageSize))
-	_, recovered, slot, fallbackGeneration, err := RecoverStateRootWithFallback(
+	_, recovered, slot, fallbackGeneration, err := RecoverInlineStateRootWithFallback(
 		file, uint32(pageSize), scratch,
 	)
 	if err != nil || recovered.Generation != 1 || slot != 0 || fallbackGeneration != 1 {
@@ -570,100 +552,6 @@ func TestCommitterCoalesceWindowGroupsActiveProducer(t *testing.T) {
 	commits := device.snapshot()
 	if len(commits) != 1 || commits[0].root != "root-3" || len(commits[0].pages) != 3 {
 		t.Fatalf("coalesced commits = %+v, want one three-generation commit", commits)
-	}
-}
-
-func TestCommitterCoalesceSuppressesIntermediateStatePages(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "coalesce-state-pages")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	pageSize := os.Getpagesize()
-	device := newRecordingDevice(12, pageSize)
-	close(device.releaseFirst)
-	committer, err := newCommitter(file, DeviceOptions{
-		Backend: BackendPortable, BufferCount: 12, BufferSize: pageSize,
-	}, CommitterOptions{
-		QueueSlots: 4, MaxPagesPerBatch: 2, GroupLimit: 4,
-		CoalesceDelay: 10 * time.Millisecond,
-	}, func(*os.File, DeviceOptions) (Device, error) { return device, nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer committer.Close()
-
-	storeID := [16]byte{1}
-	for generation := uint64(1); generation <= 3; generation++ {
-		batch, beginErr := committer.Begin(2)
-		if beginErr != nil {
-			t.Fatal(beginErr)
-		}
-		data, bufferErr := batch.PageBuffer(0)
-		if bufferErr != nil {
-			t.Fatal(bufferErr)
-		}
-		copy(data, []byte{byte(generation)})
-		if err := batch.SetPage(
-			0, int64((generation*2+8)*uint64(pageSize)), 1,
-		); err != nil {
-			t.Fatal(err)
-		}
-		state, bufferErr := batch.PageBuffer(1)
-		if bufferErr != nil {
-			t.Fatal(bufferErr)
-		}
-		if _, initErr := InitPage(state, PageHeader{
-			StoreID: storeID, Generation: generation,
-			LogicalID: StateRootLogicalID,
-			PageSize:  uint32(pageSize), Kind: PageStateRoot,
-		}); initErr != nil {
-			t.Fatal(initErr)
-		}
-		if _, sealErr := SealPage(state[:pageSize]); sealErr != nil {
-			t.Fatal(sealErr)
-		}
-		if err := batch.setStorePage(
-			1, int64((generation*2+9)*uint64(pageSize)),
-			pageSize, PageStateRoot,
-		); err != nil {
-			t.Fatal(err)
-		}
-		root, bufferErr := batch.RootBuffer()
-		if bufferErr != nil {
-			t.Fatal(bufferErr)
-		}
-		root[0] = byte(generation)
-		if err := batch.SetRoot(0, 1); err != nil {
-			t.Fatal(err)
-		}
-		if err := batch.Publish(generation); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := committer.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	commits := device.snapshot()
-	if len(commits) != 1 || len(commits[0].pages) != 4 {
-		t.Fatalf(
-			"coalesced state-page writes = %+v, want 3 data + 1 state",
-			commits,
-		)
-	}
-	statePages := 0
-	for _, write := range commits[0].pages {
-		if write.kind == PageStateRoot {
-			statePages++
-		}
-	}
-	if statePages != 1 {
-		t.Fatalf("durable state pages = %d, want 1", statePages)
-	}
-	stats := committer.Stats()
-	if stats.SuppressedRootWrites != 2 ||
-		stats.SuppressedRootBytes != 2*uint64(pageSize) {
-		t.Fatalf("suppressed state-page stats = %+v", stats)
 	}
 }
 

@@ -1,88 +1,57 @@
-# Next wave: speed, space, durability, and the all-cases sweep
+# Next wave
 
-Everything still labelled projected or planned here holds until its gate runs;
-the labels are sacred. Since this document was first written, routed splits and
-merges, the recovery journal, epoch-protected reads, and the compact leaf have
-landed, and the template-columnar class was measured and rejected as a default.
-The remaining open queue is parallel tablet writers, deferred COW-leaf reseal,
-overflow dedup, indexed batches and SQL-driver widening (indexed-write-path
-P3), the fault-device sweep, overflow-aware salvage, and the publishable suite
-refresh.
-The indexed posting overlay (P0), spanned term leaves (P1), and online durable
-index creation (P2) are implemented; their outstanding benchmark gates remain
-measurements to record, not claimed wins.
+This is the current storage qualification backlog. Projected behavior remains
+unclaimed until its named test or benchmark passes.
 
-## Speed
+## Parallel writes
 
-**Hybrid epoch-protected reads — landed.** Per-frame pin traffic was the
-measured residual of the point-read path, and per-frame seqlock validation was
-measured at parity and discarded. The shipped alternative: the direct point
-read (`Collection.AppendRaw`) announces its generation in a padded per-slot
-word and reads clean frames with no lock and no per-call generation lease
-(`ReadEpochs`); the serialized writer scans the slots lock-free, and reclamation
-is generation-based — a retired extent is not reused until no epoch or lease
-`Minimum` and no recovery generation can still reach it. The read falls back to
-the leased path only when the epoch table declines the entry (full, writer
-fence, Close, or a persistence failure); a long-lived `Snapshot` still holds a
-generation lease. This did not hit the projected 320-350 ns: the measured point
-read is 437-446 ns, still trailing the 376 ns mmap engine, so point-read work
-continues. The differential oracle and the reclamation stress
-(`TestFilePrimaryReadEpochStress`, plus the zero-allocation assertion) gate it.
+Implement tablet-local staging with grouped fencing and one serialized
+publication point. The design and gates are in
+[parallel-tablet-writers.md](parallel-tablet-writers.md).
 
-**Deferred COW-leaf reseal — future.** In-place same-size patches already defer
-their reseal to the checkpoint worker (`pageCacheFrameNeedsReseal`). The
-remaining item extends that discipline to the uniform ref-changing write, which
-still seals its COW leaf image at acknowledgement (`preparePrimaryLeafMutation`
-encodes the full leaf under the writer hold). Moving that checksum to checkpoint
-capture is projected to lower uniform acknowledgement from 8.3 µs toward ~5 µs.
-Gate: the mutation benchmarks and the buffered crash boundary.
+## Deferred COW-leaf reseal
 
-## Space
+Same-size owned-frame patches already defer their checksum to checkpoint.
+Extend that discipline to ordinary ref-changing writes only if crash-boundary
+tests prove that the captured checkpoint owns every byte needed for reseal.
+Mutation and buffered-checkpoint benchmarks decide whether the added state is
+worth keeping.
 
-**Content-addressed overflow deduplication.** Repeated oversized values
-share one overflow chain, keyed by content identity with exact byte
-comparison before sharing, refcounted by root reachability exactly like
-every extent. Bulk-build first, runtime admission second. Gate: the
-footprint lanes on a corpus with repeated large values, plus retirement
-correctness when one sharer is deleted.
+## Indexed batches
 
-## Durability and crash recovery
+Allow a transactional batch to stage document and exact-index changes together
+instead of refusing indexed collections. The publication must remain atomic,
+journal replay must rebuild identical postings, and SQL must stop surfacing the
+current indexed-batch exclusion only after the store supports it.
 
-**Exhaustive crash-point enumeration.** A fault-injecting Device wrapper
-enumerates every commit's write sequence and induces a crash after every
-write and sync, plus torn tails, dropped writes, bounded reorderings,
-and ENOSPC at each distinct path (data page, alternate root, journal
-append, file growth). Every induced state must reopen to a verified
-prior-or-committed root. This subsumes sampled crash tests with a
-systematic sweep; the enumeration is bounded because the portable
-device's sequence per commit is short and explicit.
+## Overflow deduplication
 
-**Verify and catalog-loss salvage — landed, with one explicit limit.**
-`vibedb-verify verify` walks checksums, graph reachability, exact-index
-catalogs, and free-set overlap. `salvage` reconstructs a fresh graph from
-self-describing surviving primary leaves when catalogs are lost. Inline rows
-are recovered; out-of-line overflow values are counted and skipped, so
-overflow-aware salvage remains future work rather than an implied guarantee.
+Evaluate content-addressed sharing for repeated oversized values. Exact bytes
+must be compared before sharing, references must follow snapshot reachability,
+and deletion of one sharer must not reclaim a chain still reachable by another.
+Footprint measurements need a repeated-overflow corpus rather than extrapolated
+savings.
 
-## All-cases workload lanes
+## Crash enumeration
 
-Additions to the churn and qualification harnesses, each with its
-measured gate: sub-64-byte documents (per-row overhead and occupancy),
-overflow-heavy documents (chain read costs under cache pressure),
-adversarial shared-prefix keys (fence growth and catalog bloat), crash
-during bulk creation (a half-built file must fail closed), and
-many-collection database catalogs.
+Add a fault-injecting device that enumerates each write and synchronization
+boundary, including torn tails, dropped writes, bounded reordering, and ENOSPC.
+Every resulting image must either reopen to a verified committed root or fail
+closed without inventing state.
 
-## Sequencing
+## Overflow-aware salvage
 
-Routed splits and merges, the journal, epoch reads, the indexed posting
-overlay, spanned term leaves, and online durable index creation have landed.
-Parallel tablet writers are next among engine work, since the journal's group
-commit multiplies with them. Indexed batches and SQL-driver widening remain as
-P3 of the indexed write path. The reseal-deferral item slots after the
-publishable suite refresh so its gate measures against a published baseline.
-The fault-device sweep and overflow-aware salvage are parallel-safe and may
-start any time; overflow dedup and corner lanes ride the harness cadence. The
-[distributed-sharding plan](distributed-sharding.md) has its own gated
-sequence after the shard-local storage contract is stable; it does not turn
-local `TabletID` partitions into network ownership units.
+Salvage currently recovers inline rows and reports skipped out-of-line values.
+Recover overflow chains only after it can validate identity, order, bounds, and
+completeness without relying on the damaged catalog.
+
+## Workload coverage
+
+Extend qualification with sub-64-byte rows, overflow-heavy rows, adversarial
+shared-prefix keys, interruption during bulk creation, and many-collection SQL
+catalogs. Each lane records its memory, disk, latency, and correctness bounds;
+none silently joins an existing published comparison.
+
+Distributed ownership follows the separate
+[distributed-sharding plan](distributed-sharding.md) after the local storage
+contract is stable.

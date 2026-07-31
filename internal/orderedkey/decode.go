@@ -151,14 +151,14 @@ func DecodeComponent(dst, key []byte, off int) (Component, []byte, int, error) {
 		c.Kind = KindString
 		out, next, err := decodeString(dst, key, off+1, mask)
 		if err != nil {
-			return Component{}, dst[:len(dst)], 0, err
+			return Component{}, dst[:], 0, err
 		}
 		// AppendString only ever encodes valid UTF-8, so content that is not
 		// valid UTF-8 did not come from this encoder. Rejecting it keeps the
 		// set decode accepts equal to the set encode can produce, which is what
 		// makes "anything that decodes re-encodes to the same bytes" true.
 		if !utf8.Valid(out[c.PayloadStart:]) {
-			return Component{}, dst[:len(dst)], 0, ErrMalformedKey
+			return Component{}, dst[:], 0, ErrMalformedKey
 		}
 		c.PayloadEnd = len(out)
 		return c, out, next, nil
@@ -166,7 +166,7 @@ func DecodeComponent(dst, key []byte, off int) (Component, []byte, int, error) {
 		c.Kind = KindNumber
 		out, next, err := decodeNumber(dst, key, off+1, mask)
 		if err != nil {
-			return Component{}, dst[:len(dst)], 0, err
+			return Component{}, dst[:], 0, err
 		}
 		c.PayloadEnd = len(out)
 		return c, out, next, nil

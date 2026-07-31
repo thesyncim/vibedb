@@ -218,25 +218,6 @@ func (b *heapWorkBudget) admitRows(
 	return nil
 }
 
-// admitPlan is the combined admission used by snapshot lanes which gather a
-// complete field before candidate planning can narrow it.
-func (b *heapWorkBudget) admitPlan(
-	p *plan,
-	rows int,
-	source heapWorkSource,
-	postings bool,
-	workers int,
-	maskCount int,
-) error {
-	if err := b.admitPlanner(p, rows, source, postings, maskCount); err != nil {
-		return err
-	}
-	if err := b.admitRows(p, rows, source, workers); err != nil {
-		return err
-	}
-	return nil
-}
-
 // admitGroups reserves the worst-case fixed storage for rows distinct groups.
 // The reservation happens before the first group or interner entry is grown.
 // Key bytes themselves are data-dependent and are admitted separately, before

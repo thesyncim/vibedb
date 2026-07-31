@@ -7,9 +7,8 @@ import (
 )
 
 const (
-	OverflowPagePayloadHeaderSize = 64
+	OverflowPagePayloadHeaderSize = 60
 	overflowPageVersion           = DevelopmentFormatVersion
-	overflowPageKnownFlags        = uint16(0)
 )
 
 // ErrOverflowPageCorrupt reports a malformed separately checksummed large-
@@ -24,9 +23,6 @@ type OverflowPageHeader struct {
 	Generation uint64
 	LogicalID  uint64
 	PageSize   uint32
-	Chunk      uint32
-	Slot       uint8
-	Flags      uint16
 	Total      uint64
 	Offset     uint64
 	Next       PageRef
@@ -41,8 +37,8 @@ type OverflowPageView struct {
 // EncodeOverflowPage writes one complete value piece. allocationQuantum is
 // the Store's base page size; overflow extents may be any whole number of
 // allocation quanta and every physical offset remains quantum-aligned.
-func EncodeOverflowPage(dst []byte, header OverflowPageHeader, data []byte, fileEnd, nextLogicalID uint64, allocationQuantum uint32, chunkHighWater uint32, chunkDocuments uint8) ([]byte, error) {
-	if err := validateOverflowPage(header, len(data), fileEnd, nextLogicalID, allocationQuantum, chunkHighWater, chunkDocuments); err != nil {
+func EncodeOverflowPage(dst []byte, header OverflowPageHeader, data []byte, fileEnd, nextLogicalID uint64, allocationQuantum uint32) ([]byte, error) {
+	if err := validateOverflowPage(header, len(data), fileEnd, nextLogicalID, allocationQuantum); err != nil {
 		return nil, err
 	}
 	payloadLength := OverflowPagePayloadHeaderSize + len(data)
@@ -54,13 +50,10 @@ func EncodeOverflowPage(dst []byte, header OverflowPageHeader, data []byte, file
 		return nil, err
 	}
 	binary.LittleEndian.PutUint32(payload[0:4], overflowPageVersion)
-	binary.LittleEndian.PutUint16(payload[4:6], header.Flags)
-	payload[6] = header.Slot
-	binary.LittleEndian.PutUint32(payload[8:12], header.Chunk)
-	binary.LittleEndian.PutUint32(payload[12:16], uint32(len(data)))
-	binary.LittleEndian.PutUint64(payload[16:24], header.Total)
-	binary.LittleEndian.PutUint64(payload[24:32], header.Offset)
-	encodePageRef(payload[32:32+PageRefSize], header.Next)
+	encodePageRef(payload[8:8+PageRefSize], header.Next)
+	binary.LittleEndian.PutUint64(payload[40:48], header.Total)
+	binary.LittleEndian.PutUint64(payload[48:56], header.Offset)
+	binary.LittleEndian.PutUint32(payload[56:60], uint32(len(data)))
 	copy(payload[OverflowPagePayloadHeaderSize:], data)
 	page := dst[:int(header.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
@@ -71,28 +64,26 @@ func EncodeOverflowPage(dst []byte, header OverflowPageHeader, data []byte, file
 
 // OpenOverflowPage validates one complete value piece against the selecting
 // state-root bounds.
-func OpenOverflowPage(src []byte, fileEnd, nextLogicalID uint64, allocationQuantum uint32, chunkHighWater uint32, chunkDocuments uint8) (OverflowPageView, error) {
+func OpenOverflowPage(src []byte, fileEnd, nextLogicalID uint64, allocationQuantum uint32) (OverflowPageView, error) {
 	pageHeader, payload, err := OpenPage(src)
 	if err != nil {
 		return OverflowPageView{}, fmt.Errorf("%w: %w", ErrOverflowPageCorrupt, err)
 	}
 	if pageHeader.Kind != PageOverflow || len(payload) < OverflowPagePayloadHeaderSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != overflowPageVersion ||
-		!allZero(payload[7:8]) || !pageRefReservedZero(payload[32:32+PageRefSize]) {
+		!allZero(payload[4:8]) || !pageRefReservedZero(payload[8:8+PageRefSize]) {
 		return OverflowPageView{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrOverflowPageCorrupt)
 	}
 	header := OverflowPageHeader{
 		StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
 		LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
-		Flags: binary.LittleEndian.Uint16(payload[4:6]), Slot: payload[6],
-		Chunk:  binary.LittleEndian.Uint32(payload[8:12]),
-		Total:  binary.LittleEndian.Uint64(payload[16:24]),
-		Offset: binary.LittleEndian.Uint64(payload[24:32]),
-		Next:   decodePageRef(payload[32 : 32+PageRefSize]),
+		Next:   decodePageRef(payload[8 : 8+PageRefSize]),
+		Total:  binary.LittleEndian.Uint64(payload[40:48]),
+		Offset: binary.LittleEndian.Uint64(payload[48:56]),
 	}
-	dataLength := uint64(binary.LittleEndian.Uint32(payload[12:16]))
+	dataLength := uint64(binary.LittleEndian.Uint32(payload[56:60]))
 	if dataLength != uint64(len(payload)-OverflowPagePayloadHeaderSize) ||
-		validateOverflowPage(header, int(dataLength), fileEnd, nextLogicalID, allocationQuantum, chunkHighWater, chunkDocuments) != nil {
+		validateOverflowPage(header, int(dataLength), fileEnd, nextLogicalID, allocationQuantum) != nil {
 		return OverflowPageView{}, fmt.Errorf("%w: value bounds, link, or location", ErrOverflowPageCorrupt)
 	}
 	data := payload[OverflowPagePayloadHeaderSize:]
@@ -106,17 +97,15 @@ func (v OverflowPageView) Header() OverflowPageHeader { return v.header }
 // leased.
 func (v OverflowPageView) Data() []byte { return v.data }
 
-func validateOverflowPage(header OverflowPageHeader, dataLength int, fileEnd, nextLogicalID uint64, allocationQuantum uint32, chunkHighWater uint32, chunkDocuments uint8) error {
+func validateOverflowPage(header OverflowPageHeader, dataLength int, fileEnd, nextLogicalID uint64, allocationQuantum uint32) error {
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
-		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
+		header.LogicalID == 0 || header.LogicalID >= nextLogicalID ||
 		!validPageExtentSize(PageOverflow, header.PageSize) ||
 		!validPhysicalPageSize(allocationQuantum) ||
 		header.PageSize < allocationQuantum || header.PageSize%allocationQuantum != 0 ||
-		header.Flags&^overflowPageKnownFlags != 0 || chunkHighWater == 0 ||
-		header.Chunk >= chunkHighWater || chunkDocuments == 0 || chunkDocuments > 64 || header.Slot >= chunkDocuments ||
 		dataLength <= 0 || uint64(dataLength) > uint64(header.PageSize)-PageHeaderSize-PageTrailerSize-OverflowPagePayloadHeaderSize ||
 		header.Total == 0 || header.Offset >= header.Total || uint64(dataLength) > header.Total-header.Offset {
-		return fmt.Errorf("%w: overflow identity, bounds, flags, or location", ErrInvalidWrite)
+		return fmt.Errorf("%w: overflow identity, bounds, or location", ErrInvalidWrite)
 	}
 	end := header.Offset + uint64(dataLength)
 	if header.Next == (PageRef{}) {
@@ -140,11 +129,11 @@ func pageRefWithinFile(ref PageRef, kind PageKind, header OverflowPageHeader, fi
 		return false
 	}
 	return fileEnd >= layout.DataStart && fileEnd <= maxSuperblockFileOffset && fileEnd%quantum == 0 &&
-		ref.Kind == kind && ref.Flags == 0 && ref.Aux == 0 &&
+		ref.Kind == kind &&
 		validPageExtentSize(PageOverflow, ref.Length) &&
 		ref.Length >= allocationQuantum && ref.Length%allocationQuantum == 0 &&
 		ref.Generation != 0 && ref.Generation <= header.Generation &&
-		ref.LogicalID > StateRootLogicalID && ref.LogicalID < nextLogicalID && ref.LogicalID != header.LogicalID &&
+		ref.LogicalID != 0 && ref.LogicalID < nextLogicalID && ref.LogicalID != header.LogicalID &&
 		ref.Offset >= layout.DataStart && ref.Offset%quantum == 0 &&
 		ref.Offset <= maxSuperblockFileOffset && length <= fileEnd && ref.Offset <= fileEnd-length
 }
