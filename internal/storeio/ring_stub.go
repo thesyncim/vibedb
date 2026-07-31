@@ -12,6 +12,8 @@ func Open(Config) (*Ring, error) { return nil, ErrUnavailable }
 
 func (*Ring) Features() Features { return Features{} }
 
+func (*Ring) vectorWriteCapacity() int { return 0 }
+
 func (*Ring) RegisterFiles([]int) error { return ErrUnavailable }
 
 func (*Ring) RegisterBuffers(int, int) error { return ErrUnavailable }
@@ -24,6 +26,16 @@ func (*Ring) registerFrameArena([]byte) error { return ErrUnavailable }
 
 func (*Ring) PrepareWriteFixed(int, int, int, int64, uint64, bool) error {
 	return ErrUnavailable
+}
+
+func (*Ring) prepareWriteFixedDataSync(int, int, int, int64, uint64, bool) error {
+	return ErrUnavailable
+}
+
+func (*Ring) prepareWriteVectorDataSync(
+	int, []Write, int, []byte, int, uint64, bool,
+) (uint32, error) {
+	return 0, ErrUnavailable
 }
 
 func (*Ring) prepareWriteBytes(int, []byte, int64, uint64, bool) error {

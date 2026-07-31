@@ -38,12 +38,14 @@ const (
 	ioUringUnregisterFiles    = 3
 	ioUringRegisterProbe      = 8
 	ioUringOpSupported        = 1 << 0
+	ioUringOpWriteV           = 2
 	ioUringOpFsync            = 3
 	ioUringOpReadFixed        = 4
 	ioUringOpWriteFixed       = 5
 	ioUringOpRead             = 22
 	ioUringOpWrite            = 23
 	ioUringFsyncDataSync      = 1 << 0
+	rwfDataSync               = 1 << 1
 	ioSQEFixedFile            = 1 << 0
 	ioSQEIOLink               = 1 << 2
 	ioUringDefaultEntries     = 256
@@ -51,6 +53,7 @@ const (
 	ioUringProbeOperations    = 256
 	ioUringProbeHeaderSize    = 16
 	ioUringProbeOperationSize = 8
+	ioVectorMax               = 1024
 )
 
 type ioUringSQRingOffsets struct {
@@ -176,6 +179,7 @@ type requestSlot struct {
 	token       uint64
 	userData    uint64
 	buffer      int32
+	vectorCount uint32
 	outstanding bool
 }
 
@@ -225,6 +229,11 @@ type Ring struct {
 	bufferSize               int
 	buffers                  int
 	bufferBusy               []bool
+	writeVectorMap           []byte
+	writeVectors             []ioVector
+	writeVectorBuffers       []int32
+	writeVectorBusy          bool
+	writeVectorSupported     bool
 	readArena                []byte
 	readArenaFixed           bool
 	readArenaBuffer          uint16
@@ -455,11 +464,19 @@ func (r *Ring) requireOperations() error {
 		return ErrUnsupported
 	}
 	r.features.AsyncRead = supported[ioUringOpRead]
+	r.writeVectorSupported = supported[ioUringOpWriteV]
 	return nil
 }
 
 // Features returns the setup features accepted by the running kernel.
 func (r *Ring) Features() Features { return r.features }
+
+func (r *Ring) vectorWriteCapacity() int {
+	if !r.writeVectorSupported {
+		return 0
+	}
+	return len(r.writeVectors)
+}
 
 // RegisterFiles pins file descriptions into the ring. Closing an original fd
 // after successful registration is legal; the ring owns its kernel reference.
@@ -516,6 +533,18 @@ func (r *Ring) RegisterBuffers(count, size int) error {
 	r.bufferSize = size
 	r.buffers = count
 	r.bufferBusy = make([]bool, count)
+	if r.writeVectorSupported {
+		vectorCount := min(count, ioVectorMax)
+		vectorBytes := vectorCount * int(unsafe.Sizeof(ioVector{}))
+		vectorMap, vectorErr := allocateArena(vectorBytes)
+		if vectorErr == nil {
+			r.writeVectorMap = vectorMap
+			r.writeVectors = unsafe.Slice(
+				(*ioVector)(unsafe.Pointer(&vectorMap[0])), vectorCount,
+			)
+			r.writeVectorBuffers = make([]int32, vectorCount)
+		}
+	}
 	return nil
 }
 
@@ -622,7 +651,107 @@ func (r *Ring) useReadArena(arena []byte) error {
 // PrepareWriteFixed appends one positional write using a registered file and
 // buffer. linked makes failure cancel the immediately following request.
 func (r *Ring) PrepareWriteFixed(file, buffer, length int, offset int64, userData uint64, linked bool) error {
-	return r.prepareFixed(ioUringOpWriteFixed, file, buffer, length, offset, userData, linked)
+	return r.prepareFixed(ioUringOpWriteFixed, file, buffer, length, offset, userData, linked, 0)
+}
+
+// prepareWriteFixedDataSync appends a fixed positional write with per-write
+// data-integrity completion. RWF_DSYNC has the same completion contract as an
+// O_DSYNC write, so a successful CQE makes a following whole-file fdatasync
+// redundant for this write.
+func (r *Ring) prepareWriteFixedDataSync(
+	file, buffer, length int,
+	offset int64,
+	userData uint64,
+	linked bool,
+) error {
+	return r.prepareFixed(
+		ioUringOpWriteFixed, file, buffer, length, offset, userData, linked,
+		rwfDataSync,
+	)
+}
+
+// prepareWriteVectorDataSync appends one durable vectored write for a
+// contiguous file range. The iovec array and every payload live in mmap-backed
+// memory that remains stable until Pop consumes the completion.
+func (r *Ring) prepareWriteVectorDataSync(
+	file int,
+	writes []Write,
+	bufferSize int,
+	frameArena []byte,
+	frameSize int,
+	userData uint64,
+	linked bool,
+) (uint32, error) {
+	if r.closed {
+		return 0, ErrClosed
+	}
+	if !r.writeVectorSupported || len(r.writeVectors) == 0 {
+		return 0, ErrUnsupported
+	}
+	if file < 0 || file >= r.files || bufferSize != r.bufferSize ||
+		len(writes) == 0 ||
+		len(writes) > len(r.writeVectors) || r.writeVectorBusy {
+		return 0, syscall.EINVAL
+	}
+	offset := writes[0].Offset
+	nextOffset := offset
+	var total uint64
+	for index, write := range writes {
+		if write.Offset != nextOffset {
+			return 0, syscall.EINVAL
+		}
+		if _, err := validateWrite(r.buffers, bufferSize, write); err != nil {
+			return 0, err
+		}
+		data, err := writeBytes(
+			r.bufferMap, bufferSize, frameArena, frameSize, write,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if len(data) == 0 || total+uint64(len(data)) > math.MaxInt32 {
+			return 0, syscall.EINVAL
+		}
+		buffer := int32(-1)
+		if !write.frameNative() {
+			buffer = int32(write.Buffer)
+			if r.bufferBusy[buffer] {
+				return 0, ErrBufferBusy
+			}
+		}
+		r.writeVectors[index] = ioVector{
+			Base: uintptr(unsafe.Pointer(&data[0])), Len: uintptr(len(data)),
+		}
+		r.writeVectorBuffers[index] = buffer
+		total += uint64(len(data))
+		nextOffset += int64(len(data))
+		runtime.KeepAlive(data)
+	}
+	flags := uint8(ioSQEFixedFile)
+	if linked {
+		flags |= ioSQEIOLink
+	}
+	err := r.prepare(ioUringSQE{
+		Opcode:    ioUringOpWriteV,
+		Flags:     flags,
+		FD:        int32(file),
+		Offset:    uint64(offset),
+		Address:   uint64(uintptr(unsafe.Pointer(&r.writeVectors[0]))),
+		Length:    uint32(len(writes)),
+		Operation: rwfDataSync,
+	}, userData, -1, uint32(len(writes)))
+	if err != nil {
+		return 0, err
+	}
+	for index := range writes {
+		if buffer := r.writeVectorBuffers[index]; buffer >= 0 {
+			r.bufferBusy[buffer] = true
+		}
+	}
+	r.writeVectorBusy = true
+	runtime.KeepAlive(r.writeVectorMap)
+	runtime.KeepAlive(frameArena)
+	return uint32(total), nil
 }
 
 // prepareWriteBytes appends a positional non-fixed write from stable off-heap
@@ -653,7 +782,7 @@ func (r *Ring) prepareWriteBytes(
 		Offset:  uint64(offset),
 		Address: uint64(uintptr(unsafe.Pointer(&data[0]))),
 		Length:  uint32(len(data)),
-	}, userData, -1)
+	}, userData, -1, 0)
 	runtime.KeepAlive(data)
 	return err
 }
@@ -690,7 +819,7 @@ func (r *Ring) prepareWriteFrame(
 		Address:     uint64(start),
 		Length:      uint32(len(data)),
 		BufferIndex: uint16(r.frameBuffer),
-	}, userData, -1)
+	}, userData, -1, 0)
 	runtime.KeepAlive(data)
 	return err
 }
@@ -724,12 +853,19 @@ func (r *Ring) prepareReadArena(file, arenaOffset, length int, offset int64, use
 		Length:      uint32(length),
 		BufferIndex: bufferIndex,
 	}
-	err := r.prepare(sqe, userData, -1)
+	err := r.prepare(sqe, userData, -1, 0)
 	runtime.KeepAlive(r.readArena)
 	return err
 }
 
-func (r *Ring) prepareFixed(op uint8, file, buffer, length int, offset int64, userData uint64, linked bool) error {
+func (r *Ring) prepareFixed(
+	op uint8,
+	file, buffer, length int,
+	offset int64,
+	userData uint64,
+	linked bool,
+	rwFlags uint32,
+) error {
 	if r.closed {
 		return ErrClosed
 	}
@@ -751,9 +887,10 @@ func (r *Ring) prepareFixed(op uint8, file, buffer, length int, offset int64, us
 		Offset:      uint64(offset),
 		Address:     uint64(uintptr(unsafe.Pointer(&r.bufferMap[buffer*r.bufferSize]))),
 		Length:      uint32(length),
+		Operation:   rwFlags,
 		BufferIndex: uint16(buffer),
 	}
-	if err := r.prepare(sqe, userData, int32(buffer)); err != nil {
+	if err := r.prepare(sqe, userData, int32(buffer), 0); err != nil {
 		return err
 	}
 	r.bufferBusy[buffer] = true
@@ -778,10 +915,15 @@ func (r *Ring) PrepareDataSync(file int, userData uint64, linked bool) error {
 		Flags:     flags,
 		FD:        int32(file),
 		Operation: ioUringFsyncDataSync,
-	}, userData, -1)
+	}, userData, -1, 0)
 }
 
-func (r *Ring) prepare(sqe ioUringSQE, userData uint64, buffer int32) error {
+func (r *Ring) prepare(
+	sqe ioUringSQE,
+	userData uint64,
+	buffer int32,
+	vectorCount uint32,
+) error {
 	head := atomic.LoadUint32(r.sqHead)
 	tail := r.sqTailValue
 	if tail-head >= *r.sqEntries || r.freeCount == 0 {
@@ -809,6 +951,7 @@ func (r *Ring) prepare(sqe ioUringSQE, userData uint64, buffer int32) error {
 	request.token = token
 	request.userData = userData
 	request.buffer = buffer
+	request.vectorCount = vectorCount
 	request.outstanding = true
 	sqe.UserData = token
 	index := tail & *r.sqMask
@@ -938,6 +1081,17 @@ func (r *Ring) PopBatch(max uint32) ([]Completion, error) {
 		if request.buffer >= 0 {
 			r.bufferBusy[request.buffer] = false
 		}
+		if request.vectorCount != 0 {
+			if request.vectorCount > uint32(len(r.writeVectorBuffers)) {
+				return nil, fmt.Errorf("%w: invalid vector request", ErrOverflow)
+			}
+			for vectorIndex := range request.vectorCount {
+				if buffer := r.writeVectorBuffers[vectorIndex]; buffer >= 0 {
+					r.bufferBusy[buffer] = false
+				}
+			}
+			r.writeVectorBusy = false
+		}
 		*request = requestSlot{}
 		r.freeRequests[r.freeCount] = requestIndex
 		r.freeCount++
@@ -1005,9 +1159,17 @@ func (r *Ring) Close() error {
 			result = errors.Join(result, err)
 		}
 	}
+	if len(r.writeVectorMap) != 0 {
+		if err := releaseArena(r.writeVectorMap); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
 	r.unmapQueues()
 	r.closed = true
 	r.bufferMap = nil
+	r.writeVectorMap = nil
+	r.writeVectors = nil
+	r.writeVectorBuffers = nil
 	r.readArena = nil
 	r.readArenaFixed = false
 	r.readBuffersRegistered = false

@@ -73,12 +73,15 @@ func benchmarkPortableCommit(b *testing.B, pageCount int, sparse bool) {
 func BenchmarkIOUringCommit(b *testing.B) {
 	for _, pageCount := range []int{1, 2, 8, 32} {
 		b.Run(fmt.Sprintf("contiguous-pages-%d", pageCount), func(b *testing.B) {
-			benchmarkIOUringCommit(b, pageCount)
+			benchmarkIOUringCommit(b, pageCount, false)
 		})
 	}
+	b.Run("sparse-pages-8", func(b *testing.B) {
+		benchmarkIOUringCommit(b, 8, true)
+	})
 }
 
-func benchmarkIOUringCommit(b *testing.B, pageCount int) {
+func benchmarkIOUringCommit(b *testing.B, pageCount int, sparse bool) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	file, err := os.CreateTemp(b.TempDir(), "io-uring-commit")
@@ -106,8 +109,12 @@ func benchmarkIOUringCommit(b *testing.B, pageCount int) {
 			b.Fatal(bufferErr)
 		}
 		buffer[0] = byte(index + 1)
+		multiplier := index + 1
+		if sparse {
+			multiplier = 2*index + 1
+		}
 		writes[index] = Write{
-			Offset: int64((index + 1) * pageSize),
+			Offset: int64(multiplier * pageSize),
 			Length: uint32(pageSize), Buffer: uint16(index),
 		}
 	}

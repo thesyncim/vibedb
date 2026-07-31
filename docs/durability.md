@@ -84,6 +84,12 @@ acknowledgement. `fdatasync` is used only where the checkpoint writes
 preallocated existing extents. A sync error is terminal for the live writer;
 the code does not retry dirty pages that the kernel may already have discarded.
 
+For a contiguous Linux commit, the `io_uring` backend can express the same two
+durability epochs as a soft-linked `RWF_DSYNC` data write followed by an
+`RWF_DSYNC` root write. The link prevents the root write from starting after a
+failed or short data write. Unsupported filesystems retain the explicit data
+barrier, root write, and final barrier path.
+
 ## Crash windows
 
 ### Buffered-visible

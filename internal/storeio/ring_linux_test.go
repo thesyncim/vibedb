@@ -234,6 +234,67 @@ func TestRingDeviceCommit(t *testing.T) {
 	assertFileBytes(t, file, 0, root)
 }
 
+func TestRingDeviceContiguousVectorCommit(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	device, file := newRingTestDevice(t)
+	defer device.Close()
+	ringDevice := device.(*ringDevice)
+	if ringDevice.ring.vectorWriteCapacity() < 2 {
+		t.Skip("kernel does not support stable vectored writes")
+	}
+	pageSize := os.Getpagesize()
+	first := deviceBuffer(t, device, 0)
+	second := deviceBuffer(t, device, 1)
+	for index := range first {
+		first[index] = byte(index)
+		second[index] = byte(index + 1)
+	}
+	root := []byte("vector-root")
+	copy(deviceBuffer(t, device, 2), root)
+	writes := []Write{
+		{Offset: int64(pageSize), Length: uint32(pageSize), Buffer: 0},
+		{Offset: int64(2 * pageSize), Length: uint32(pageSize), Buffer: 1},
+	}
+	rootWrite := Write{Length: uint32(len(root)), Buffer: 2}
+	if !ringDevice.vectorCommitEligible(writes, rootWrite) {
+		t.Fatal("contiguous writes did not select vector commit")
+	}
+	if err := device.Commit(writes, rootWrite); err != nil {
+		t.Fatal(err)
+	}
+	assertFileBytes(t, file, int64(pageSize), first)
+	assertFileBytes(t, file, int64(2*pageSize), second)
+	assertFileBytes(t, file, 0, root)
+	if ringDevice.ring.writeVectorBusy {
+		t.Fatal("vector scratch remained busy after commit")
+	}
+}
+
+func TestRingDeviceDataSyncFallback(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	device, file := newRingTestDevice(t)
+	defer device.Close()
+	ringDevice := device.(*ringDevice)
+	ringDevice.dsyncOff = true
+	page := []byte("fallback-page")
+	root := []byte("fallback-root")
+	copy(deviceBuffer(t, device, 0), page)
+	copy(deviceBuffer(t, device, 1), root)
+	pageOffset := int64(os.Getpagesize())
+	if err := device.Commit(
+		[]Write{{Offset: pageOffset, Length: uint32(len(page)), Buffer: 0}},
+		Write{Length: uint32(len(root)), Buffer: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	assertFileBytes(t, file, pageOffset, page)
+	assertFileBytes(t, file, 0, root)
+}
+
 func TestRingCommitter(t *testing.T) {
 	committer, file := newRingTestCommitter(t)
 	pageSize := os.Getpagesize()
@@ -254,7 +315,7 @@ func TestRingCommitter(t *testing.T) {
 	}
 }
 
-func TestRingDataFailureDoesNotSubmitRoot(t *testing.T) {
+func TestRingDataFailureDoesNotPublishRoot(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
