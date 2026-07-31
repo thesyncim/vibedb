@@ -3,9 +3,11 @@ package storeio
 import (
 	"bytes"
 	"fmt"
+	"unsafe"
 
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/scanner"
 )
 
 // The stored logical value of every document is its vibejson canonical form:
@@ -39,6 +41,26 @@ type CanonicalWorkspace struct {
 	members []canonicalMember
 	aux     []canonicalMember
 	scratch []byte
+}
+
+// NewCanonicalWorkspace returns a workspace with fixed retained capacities.
+// Callers that admit work through a bounded scratch lane can size it once and
+// avoid input-dependent growth on the hot path.
+func NewCanonicalWorkspace(memberCapacity, scratchCapacity int) CanonicalWorkspace {
+	return CanonicalWorkspace{
+		members: make([]canonicalMember, 0, memberCapacity),
+		aux:     make([]canonicalMember, 0, memberCapacity),
+		scratch: make([]byte, 0, scratchCapacity),
+	}
+}
+
+// CapacityBytes reports the retained backing storage owned by the workspace.
+func (w *CanonicalWorkspace) CapacityBytes() uint64 {
+	if w == nil {
+		return 0
+	}
+	return uint64(cap(w.members)+cap(w.aux))*uint64(unsafe.Sizeof(canonicalMember{})) +
+		uint64(cap(w.scratch))
 }
 
 // canonicalMember is one object member reference during a canonical render:
@@ -268,10 +290,11 @@ func mergeMembers(src []byte, entries []vibejson.IndexEntry, ws *CanonicalWorksp
 func appendCanonicalKeyString(dst, src []byte, entries []vibejson.IndexEntry, ws *CanonicalWorkspace, m canonicalMember) []byte {
 	ke := &entries[m.keyEntry]
 	raw := src[ke.Start:ke.End]
-	// An unescaped string is canonical unconditionally: every raw character
-	// the validator admits is one the pinned encoder writes raw, so the
-	// tape's escaped flag decides the fast path with no byte scan.
-	if ke.Flags()&vibejson.TapeFlagEscaped == 0 || rawQuotedStringIsCanonical(raw) {
+	// An unescaped string is canonical unless it contains a raw U+2028 or
+	// U+2029, which the encoder escapes for JSON/JavaScript compatibility.
+	escaped := ke.Flags()&vibejson.TapeFlagEscaped != 0
+	if !escaped && scanner.ValidUTF8NoLineSeparator(raw[1:len(raw)-1]) ||
+		escaped && rawQuotedStringIsCanonical(raw) {
 		return append(dst, raw...)
 	}
 	return appendCanonicalQuoted(dst, canonicalKeyBytes(src, entries, ws, m))
@@ -284,9 +307,11 @@ func appendCanonicalKeyString(dst, src []byte, entries []vibejson.IndexEntry, ws
 func appendCanonicalTapeString(dst, src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace) []byte {
 	e := &entries[i]
 	raw := src[e.Start:e.End]
-	// Same flag shortcut as appendCanonicalKeyString: unescaped implies
-	// canonical under the pinned encoder.
-	if e.Flags()&vibejson.TapeFlagEscaped == 0 || rawQuotedStringIsCanonical(raw) {
+	// Same fast path as appendCanonicalKeyString: an unescaped string still
+	// needs a line-separator check before it can be copied verbatim.
+	escaped := e.Flags()&vibejson.TapeFlagEscaped != 0
+	if !escaped && scanner.ValidUTF8NoLineSeparator(raw[1:len(raw)-1]) ||
+		escaped && rawQuotedStringIsCanonical(raw) {
 		return append(dst, raw...)
 	}
 	scratchBase := len(ws.scratch)
@@ -299,11 +324,10 @@ func appendCanonicalTapeString(dst, src []byte, entries []vibejson.IndexEntry, i
 
 // appendCanonicalQuoted appends text as a quoted, canonically escaped JSON
 // string. This is a byte-exact mirror of vibejson's appendJSONStringBytes:
-// short escapes for the named
-// controls, lowercase \u00xx for the rest of C0, quote and backslash
-// escaped, solidus and every other character — including U+2028/U+2029 — raw.
-// Byte identity with the pinned AppendCanonicalize implementation is the
-// contract. Text is valid UTF-8 by admission, so the replacement-rune branch
+// short escapes for the named controls, lowercase \u00xx for the rest of C0,
+// quote and backslash escaped, solidus raw, and U+2028/U+2029 escaped for
+// JSON/JavaScript compatibility. Text is valid UTF-8 by admission, so the
+// replacement-rune branch
 // of the original is unreachable here and deliberately omitted — the
 // differential tests would catch any drift.
 func appendCanonicalQuoted(dst, text []byte) []byte {
@@ -313,7 +337,15 @@ func appendCanonicalQuoted(dst, text []byte) []byte {
 	for i := 0; i < len(text); {
 		c := text[i]
 		if c >= 0x80 {
-			// Valid multi-byte UTF-8 passes through raw.
+			if c == 0xe2 && i+2 < len(text) && text[i+1] == 0x80 &&
+				(text[i+2] == 0xa8 || text[i+2] == 0xa9) {
+				dst = append(dst, text[start:i]...)
+				dst = append(dst, '\\', 'u', '2', '0', '2', hex[text[i+2]&0xf])
+				i += 3
+				start = i
+				continue
+			}
+			// Every other valid multi-byte UTF-8 sequence passes through raw.
 			i++
 			continue
 		}
@@ -356,9 +388,10 @@ func rawQuotedStringIsCanonical(raw []byte) bool {
 	for i < end {
 		c := raw[i]
 		if c != '\\' {
-			// Every raw character the validator admits here is one the
-			// canonical encoder writes raw (including U+2028/U+2029 in the
-			// pinned library revision — see appendCanonicalQuoted).
+			if c == 0xe2 && i+2 < end && raw[i+1] == 0x80 &&
+				(raw[i+2] == 0xa8 || raw[i+2] == 0xa9) {
+				return false
+			}
 			i++
 			continue
 		}
@@ -368,13 +401,17 @@ func rawQuotedStringIsCanonical(raw []byte) bool {
 			// characters.
 			i += 2
 		case 'u':
-			// A \u escape is canonical only for characters the encoder
-			// cannot write raw or shorter: C0 controls without a short
-			// form, spelled with lowercase hex digits. Everything else —
-			// printable characters, U+2028/U+2029, surrogate pairs — is
-			// written raw by the encoder, so its escape is non-canonical.
+			// A \u escape is canonical for U+2028/U+2029 and for C0
+			// controls without a short form, always with lowercase digits.
 			v, lower := hex4Lower(raw[i+2:])
-			if v < 0 || !lower || v >= 0x20 {
+			if v < 0 || !lower {
+				return false
+			}
+			if v == 0x2028 || v == 0x2029 {
+				i += 6
+				continue
+			}
+			if v >= 0x20 {
 				return false
 			}
 			switch v {
@@ -448,10 +485,12 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 	}
 	switch e.Kind() {
 	case document.String:
-		// Flag shortcut, as on the render path: unescaped implies canonical
-		// under the pinned encoder.
-		if e.Flags()&vibejson.TapeFlagEscaped != 0 &&
-			!rawQuotedStringIsCanonical(src[e.Start:e.End]) {
+		raw := src[e.Start:e.End]
+		if e.Flags()&vibejson.TapeFlagEscaped == 0 {
+			if !scanner.ValidUTF8NoLineSeparator(raw[1 : len(raw)-1]) {
+				return 0, false
+			}
+		} else if !rawQuotedStringIsCanonical(raw) {
 			return 0, false
 		}
 		return e.End, true

@@ -102,9 +102,8 @@ func TestCanonicalRenderHandcrafted(t *testing.T) {
 		// Surrogate pairs decode to raw characters; unpaired surrogates are
 		// rejected at admission and cannot occur.
 		"\"\\uD83D\\uDE00\"", "\"\U0001F600\"", "{\"\U0001F600\":1}",
-		// Raw U+2028/U+2029 stay raw in the pinned library revision, and
-		// their escaped spellings normalize to the raw characters (see
-		// appendCanonicalQuoted's provenance note).
+		// Raw U+2028/U+2029 normalize to their lowercase escapes for
+		// JSON/JavaScript compatibility; those escaped spellings remain fixed.
 		"\"a b\"", "\"a b\"", "\"\\u2028\"", "\"\\u2029\"",
 		// Escaped keys sort by their *decoded* spelling: "c" decodes
 		// to "c" and must sort after "b" even though its raw first byte
@@ -236,7 +235,7 @@ func TestCanonicalCheckRejectsNonCanonical(t *testing.T) {
 		" {}", "{} ", "{\"a\" :1}", "{\"a\": 1}", "{\"b\":1,\"a\":2}",
 		"[1, 2]", "{ }", "[ ]",
 		"\"\\u0041\"", "\"\\/\"", "\"\\u000A\"", "\"\\u000a\"",
-		"\"\\u2028\"", "\"\\u2029\"", "\"\\uD83D\\uDE00\"", "\"\\u001F\"",
+		"\"\\uD83D\\uDE00\"", "\"\\u001F\"",
 		// Decoded-key order violation behind canonical-looking spellings.
 		"{\"\\u0063\":1,\"b\":2}",
 	}
