@@ -954,7 +954,12 @@ type Collection struct {
 	options      normalizedFileStoreOptions
 	storeID      [16]byte
 
-	writer           sync.Mutex
+	writer sync.Mutex
+	// mutationCombiner is a short, bounded arrival lane for synchronous
+	// unindexed primary mutations. It shares one journal barrier across a
+	// contended group and hands the group to the existing atomic Update path.
+	mutationCombiner *primaryMutationCombiner
+	mutationWait     sync.WaitGroup
 	onlineIndexBuild atomic.Bool
 	durabilityWait   sync.WaitGroup
 	snapshotGate     sync.RWMutex
@@ -2062,6 +2067,9 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		freeImagePerPage:   imagePerPage,
 		freeIndexPerPage:   indexPerPage,
 		pendingVisible:     make([]filePendingState, fileVisibilitySlots(options.QueueSlots)),
+		mutationCombiner: newPrimaryMutationCombiner(
+			options.QueueSlots, options.MaxBatchDocuments, options.MaxBatchBytes,
+		),
 	}
 	if options.Durability == DurabilityBufferedVisible {
 		collection.bufferedFirstTouches = make(
@@ -2283,6 +2291,12 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
+	if len(src) > 0 && c.shouldQueuePrimaryMutation(key, src) {
+		created, _, err = c.submitPrimaryMutation(
+			primaryMutationPut, key, src,
+		)
+		return created, err
+	}
 	return c.putPrimaryWithSplit(key, src)
 }
 
@@ -2292,6 +2306,12 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 	if c == nil {
 		return false, ErrClosed
+	}
+	if c.shouldQueuePrimaryMutation(key, nil) {
+		_, deleted, err = c.submitPrimaryMutation(
+			primaryMutationDelete, key, nil,
+		)
+		return deleted, err
 	}
 	return c.deletePrimaryWithMerge(key)
 }
@@ -3057,6 +3077,13 @@ func (c *Collection) Close() error {
 	}
 	c.closed = true
 	c.writer.Unlock()
+	if c.mutationCombiner != nil {
+		for _, request := range c.mutationCombiner.stop() {
+			request.err = ErrClosed
+			close(request.done)
+		}
+	}
+	c.mutationWait.Wait()
 	// DurabilitySync publishers release the construction lock before their
 	// durability wait so independent writers can share one device commit.
 	// Closed prevents any new waiter from registering before this drain.
