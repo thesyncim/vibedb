@@ -211,8 +211,14 @@ type Ring struct {
 	freeRequests []uint32
 	freeCount    uint32
 	nextToken    uint64
+	requestCount uint64
+	requestMask  uint64
+	requestPow2  bool
+	maxToken     uint64
 	pending      uint32
 	outstanding  uint32
+	sqTailValue  uint32
+	popScratch   []Completion
 
 	files                    int
 	bufferMap                []byte
@@ -220,6 +226,9 @@ type Ring struct {
 	buffers                  int
 	bufferBusy               []bool
 	readArena                []byte
+	readArenaFixed           bool
+	readArenaBuffer          uint16
+	readBuffersRegistered    bool
 	frameArena               []byte
 	frameBuffer              int
 	bufferRegistrationBroken bool
@@ -252,6 +261,14 @@ func Open(config Config) (*Ring, error) {
 	}
 	r.requests = make([]requestSlot, params.SQEntries)
 	r.freeRequests = make([]uint32, params.SQEntries)
+	r.requestCount = uint64(len(r.requests))
+	r.requestPow2 = r.requestCount&(r.requestCount-1) == 0
+	if r.requestPow2 {
+		r.requestMask = r.requestCount - 1
+	}
+	r.maxToken = (uint64(math.MaxUint64) - (r.requestCount - 1)) / r.requestCount
+	r.sqTailValue = atomic.LoadUint32(r.sqTail)
+	r.popScratch = make([]Completion, params.SQEntries)
 	for i := range r.freeRequests {
 		r.freeRequests[i] = uint32(len(r.freeRequests) - 1 - i)
 	}
@@ -382,6 +399,9 @@ func (r *Ring) mapQueues(params *ioUringParams) error {
 	r.sqArray = unsafe.Slice((*uint32)(unsafe.Pointer(&r.sqRing[params.SQOffsets.Array])), params.SQEntries)
 	r.sqes = unsafe.Slice((*ioUringSQE)(unsafe.Pointer(&r.sqesMap[0])), params.SQEntries)
 	r.cqes = unsafe.Slice((*ioUringCQE)(unsafe.Pointer(&r.cqRing[params.CQOffsets.CQEs])), params.CQEntries)
+	for index := range r.sqArray {
+		r.sqArray[index] = uint32(index)
+	}
 	r.droppedBase = atomic.LoadUint32(r.sqDropped)
 	r.overflowBase = atomic.LoadUint32(r.cqOverflow)
 	return nil
@@ -472,7 +492,7 @@ func (r *Ring) RegisterBuffers(count, size int) error {
 	if r.closed {
 		return ErrClosed
 	}
-	if r.buffers != 0 || count <= 0 || count > math.MaxUint16+1 || size <= 0 ||
+	if r.buffers != 0 || r.readBuffersRegistered || len(r.readArena) != 0 || count <= 0 || count > math.MaxUint16+1 || size <= 0 ||
 		uint64(size) > math.MaxUint32 || size%syscall.Getpagesize() != 0 {
 		return syscall.EINVAL
 	}
@@ -568,10 +588,11 @@ func (r *Ring) Buffer(index int) ([]byte, error) {
 	return r.bufferMap[start : start+r.bufferSize], nil
 }
 
-// useReadArena binds the PageCache's stable mmap memory for non-fixed
-// asynchronous reads. The ring borrows arena until Close; it never unmaps it.
-// Keeping this package-private prevents arbitrary Go-heap slices from reaching
-// an asynchronous kernel request.
+// useReadArena binds the PageCache's stable mmap memory for asynchronous reads.
+// It opportunistically registers that arena for READ_FIXED and falls back to a
+// stable-address READ when registration is refused. The ring borrows the arena
+// until Close; it never unmaps it. Keeping this package-private prevents
+// arbitrary Go-heap slices from reaching an asynchronous kernel request.
 func (r *Ring) useReadArena(arena []byte) error {
 	if r.closed {
 		return ErrClosed
@@ -581,6 +602,20 @@ func (r *Ring) useReadArena(arena []byte) error {
 		return syscall.EINVAL
 	}
 	r.readArena = arena
+	if r.buffers == 0 {
+		var vector ioVector
+		vector.Base = uintptr(unsafe.Pointer(&arena[0]))
+		vector.Len = uintptr(len(arena))
+		if err := ioUringRegister(
+			r.fd, ioUringRegisterBuffers, unsafe.Pointer(&vector), 1,
+		); err == nil {
+			r.readArenaFixed = true
+			r.readBuffersRegistered = true
+			r.features.FixedRead = true
+		}
+		runtime.KeepAlive(vector)
+	}
+	runtime.KeepAlive(arena)
 	return nil
 }
 
@@ -680,13 +715,20 @@ func (r *Ring) prepareReadArena(file, arenaOffset, length int, offset int64, use
 		length > math.MaxInt32 || arenaOffset > len(r.readArena)-length || offset < 0 {
 		return syscall.EINVAL
 	}
+	opcode := uint8(ioUringOpRead)
+	bufferIndex := uint16(0)
+	if r.readArenaFixed {
+		opcode = ioUringOpReadFixed
+		bufferIndex = r.readArenaBuffer
+	}
 	sqe := ioUringSQE{
-		Opcode:  ioUringOpRead,
-		Flags:   ioSQEFixedFile,
-		FD:      int32(file),
-		Offset:  uint64(offset),
-		Address: uint64(uintptr(unsafe.Pointer(&r.readArena[arenaOffset]))),
-		Length:  uint32(length),
+		Opcode:      opcode,
+		Flags:       ioSQEFixedFile,
+		FD:          int32(file),
+		Offset:      uint64(offset),
+		Address:     uint64(uintptr(unsafe.Pointer(&r.readArena[arenaOffset]))),
+		Length:      uint32(length),
+		BufferIndex: bufferIndex,
 	}
 	err := r.prepare(sqe, userData, -1)
 	runtime.KeepAlive(r.readArena)
@@ -747,15 +789,14 @@ func (r *Ring) PrepareDataSync(file int, userData uint64, linked bool) error {
 
 func (r *Ring) prepare(sqe ioUringSQE, userData uint64, buffer int32) error {
 	head := atomic.LoadUint32(r.sqHead)
-	tail := atomic.LoadUint32(r.sqTail)
+	tail := r.sqTailValue
 	if tail-head >= *r.sqEntries || r.freeCount == 0 {
 		return ErrQueueFull
 	}
 	r.freeCount--
 	requestIndex := r.freeRequests[r.freeCount]
 	r.nextToken++
-	maxToken := (uint64(math.MaxUint64) - uint64(len(r.requests)-1)) / uint64(len(r.requests))
-	if r.nextToken == 0 || r.nextToken > maxToken {
+	if r.nextToken == 0 || r.nextToken > r.maxToken {
 		// Token wrap is unreachable in practice, but resetting is safe because a
 		// free request slot cannot still have a completion in the queue.
 		r.nextToken = 1
@@ -778,8 +819,7 @@ func (r *Ring) prepare(sqe ioUringSQE, userData uint64, buffer int32) error {
 	sqe.UserData = token
 	index := tail & *r.sqMask
 	r.sqes[index] = sqe
-	r.sqArray[index] = index
-	atomic.StoreUint32(r.sqTail, tail+1)
+	r.sqTailValue = tail + 1
 	r.pending++
 	r.outstanding++
 	return nil
@@ -795,8 +835,21 @@ func (r *Ring) SubmitAndWait(min uint32) error {
 	if min > r.outstanding {
 		return syscall.EINVAL
 	}
+	if r.pending != 0 {
+		// The ring is not SQPOLL-enabled: the kernel cannot consume these SQEs
+		// until io_uring_enter. Publishing the tail once for the whole batch
+		// avoids one release store per prepared request while retaining the
+		// required SQE/array-before-tail ordering.
+		atomic.StoreUint32(r.sqTail, r.sqTailValue)
+	}
 	for r.pending != 0 {
-		submitted, err := ioUringEnter(r.fd, r.pending, 0, 0)
+		wait := uint32(0)
+		flags := uint32(0)
+		if available := r.available(); available < min {
+			wait = min - available
+			flags = ioUringEnterGetEvents
+		}
+		submitted, err := ioUringEnter(r.fd, r.pending, wait, flags)
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
@@ -805,6 +858,9 @@ func (r *Ring) SubmitAndWait(min uint32) error {
 		}
 		if submitted == 0 {
 			return fmt.Errorf("io_uring submit: %w", syscall.EAGAIN)
+		}
+		if submitted > r.pending {
+			return fmt.Errorf("%w: kernel submitted more SQEs than requested", ErrOverflow)
 		}
 		r.pending -= submitted
 	}
@@ -835,35 +891,73 @@ func (r *Ring) available() uint32 {
 
 // Pop consumes one completion. ok is false when the completion queue is empty.
 func (r *Ring) Pop() (completion Completion, ok bool, err error) {
-	if r.closed {
-		return Completion{}, false, ErrClosed
-	}
-	if err := r.checkAccounting(); err != nil {
+	completions, err := r.PopBatch(1)
+	if err != nil {
 		return Completion{}, false, err
 	}
-	head := atomic.LoadUint32(r.cqHead)
-	if head == atomic.LoadUint32(r.cqTail) {
+	if len(completions) == 0 {
 		return Completion{}, false, nil
 	}
-	cqe := r.cqes[head&*r.cqMask]
-	requestIndex := uint32(cqe.UserData % uint64(len(r.requests)))
-	request := &r.requests[requestIndex]
-	if !request.outstanding || request.token != cqe.UserData {
-		return Completion{}, false, fmt.Errorf("%w: unknown completion token", ErrOverflow)
+	return completions[0], true, nil
+}
+
+// PopBatch consumes up to max ready completions and returns them from a ring
+// owned scratch slice. A malformed CQE returns ErrOverflow; callers must treat
+// the ring as failed, just as they must for a single Pop accounting error. The
+// returned slice is overwritten by the next Pop or PopBatch call.
+func (r *Ring) PopBatch(max uint32) ([]Completion, error) {
+	if r.closed {
+		return nil, ErrClosed
 	}
-	completion = Completion{UserData: request.userData, Result: cqe.Result, Flags: cqe.Flags}
-	if request.buffer >= 0 {
-		r.bufferBusy[request.buffer] = false
+	if max == 0 {
+		return nil, nil
 	}
-	*request = requestSlot{}
-	if r.freeCount >= uint32(len(r.freeRequests)) {
-		return Completion{}, false, fmt.Errorf("%w: duplicate completion token", ErrOverflow)
+	if max > uint32(len(r.popScratch)) {
+		return nil, syscall.EINVAL
 	}
-	r.freeRequests[r.freeCount] = requestIndex
-	r.freeCount++
-	r.outstanding--
-	atomic.StoreUint32(r.cqHead, head+1)
-	return completion, true, nil
+	if err := r.checkAccounting(); err != nil {
+		return nil, err
+	}
+	head := atomic.LoadUint32(r.cqHead)
+	available := atomic.LoadUint32(r.cqTail) - head
+	if available == 0 {
+		return nil, nil
+	}
+	if available > max {
+		available = max
+	}
+	if r.freeCount > uint32(len(r.freeRequests)) || available > r.outstanding ||
+		available > uint32(len(r.freeRequests))-r.freeCount {
+		return nil, fmt.Errorf("%w: completion count exceeds request accounting", ErrOverflow)
+	}
+
+	for index := uint32(0); index < available; index++ {
+		cqe := r.cqes[(head+index)&*r.cqMask]
+		requestIndex := r.requestIndex(cqe.UserData)
+		request := &r.requests[requestIndex]
+		if !request.outstanding || request.token != cqe.UserData {
+			return nil, fmt.Errorf("%w: unknown completion token", ErrOverflow)
+		}
+		r.popScratch[index] = Completion{
+			UserData: request.userData, Result: cqe.Result, Flags: cqe.Flags,
+		}
+		if request.buffer >= 0 {
+			r.bufferBusy[request.buffer] = false
+		}
+		*request = requestSlot{}
+		r.freeRequests[r.freeCount] = requestIndex
+		r.freeCount++
+		r.outstanding--
+	}
+	atomic.StoreUint32(r.cqHead, head+available)
+	return r.popScratch[:available], nil
+}
+
+func (r *Ring) requestIndex(token uint64) uint32 {
+	if r.requestPow2 {
+		return uint32(token & r.requestMask)
+	}
+	return uint32(token % r.requestCount)
 }
 
 func (r *Ring) checkAccounting() error {
@@ -899,7 +993,7 @@ func (r *Ring) Close() error {
 			}
 		}
 	}
-	if r.buffers != 0 {
+	if r.buffers != 0 || r.readBuffersRegistered {
 		if err := ioUringRegister(r.fd, ioUringUnregisterBuffers, nil, 0); err != nil {
 			result = errors.Join(result, fmt.Errorf("io_uring unregister buffers: %w", err))
 		}
@@ -921,9 +1015,12 @@ func (r *Ring) Close() error {
 	r.closed = true
 	r.bufferMap = nil
 	r.readArena = nil
+	r.readArenaFixed = false
+	r.readBuffersRegistered = false
 	r.frameArena = nil
 	r.requests = nil
 	r.freeRequests = nil
+	r.popScratch = nil
 	return result
 }
 

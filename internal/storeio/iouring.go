@@ -49,6 +49,10 @@ type Features struct {
 	// memory. PageCache uses it to read directly into its mmap arena without
 	// registered-buffer pinning or a staging copy.
 	AsyncRead bool
+	// FixedRead reports that the PageCache arena was also accepted as a
+	// registered buffer, allowing IORING_OP_READ_FIXED for speculative reads.
+	// It is an optional setup optimization; AsyncRead remains the fallback.
+	FixedRead bool
 }
 
 // Completion is one consumed completion queue entry. UserData is the opaque

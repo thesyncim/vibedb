@@ -48,4 +48,6 @@ func (*Ring) Available() uint32 { return 0 }
 
 func (*Ring) Pop() (Completion, bool, error) { return Completion{}, false, ErrUnavailable }
 
+func (*Ring) PopBatch(uint32) ([]Completion, error) { return nil, ErrUnavailable }
+
 func (*Ring) Close() error { return nil }

@@ -93,13 +93,16 @@ func (d *ringDevice) Commit(pages []Write, root Write) error {
 		if err := d.ring.SubmitAndWait(uint32(len(pages))); err != nil {
 			return err
 		}
+		completions, err := d.ring.PopBatch(uint32(len(pages)))
+		if err != nil {
+			return err
+		}
+		if len(completions) != len(pages) {
+			return ErrOverflow
+		}
 		var first error
-		for range pages {
-			completion, ok, err := d.ring.Pop()
-			if err != nil {
-				return err
-			}
-			if !ok || completion.UserData >= uint64(len(pages)) {
+		for _, completion := range completions {
+			if completion.UserData >= uint64(len(pages)) {
 				return ErrOverflow
 			}
 			write := pages[completion.UserData]
@@ -130,15 +133,15 @@ func (d *ringDevice) Commit(pages []Write, root Write) error {
 	if err := d.ring.SubmitAndWait(want); err != nil {
 		return commitOutcomeUnknown(err)
 	}
+	completions, err := d.ring.PopBatch(want)
+	if err != nil {
+		return commitOutcomeUnknown(err)
+	}
+	if len(completions) != int(want) {
+		return commitOutcomeUnknown(ErrOverflow)
+	}
 	var first error
-	for range want {
-		completion, ok, err := d.ring.Pop()
-		if err != nil {
-			return commitOutcomeUnknown(err)
-		}
-		if !ok {
-			return commitOutcomeUnknown(ErrOverflow)
-		}
+	for _, completion := range completions {
 		var expected uint32
 		switch completion.UserData {
 		case ringDataSyncTag, ringRootSyncTag:
@@ -166,13 +169,16 @@ func (d *ringDevice) Prewrite(pages []Write) error {
 	if err := d.ring.SubmitAndWait(uint32(len(pages))); err != nil {
 		return err
 	}
+	completions, err := d.ring.PopBatch(uint32(len(pages)))
+	if err != nil {
+		return err
+	}
+	if len(completions) != len(pages) {
+		return ErrOverflow
+	}
 	var first error
-	for range pages {
-		completion, ok, err := d.ring.Pop()
-		if err != nil {
-			return err
-		}
-		if !ok || completion.UserData >= uint64(len(pages)) {
+	for _, completion := range completions {
+		if completion.UserData >= uint64(len(pages)) {
 			return ErrOverflow
 		}
 		write := pages[completion.UserData]
@@ -288,15 +294,15 @@ func (d *ringDevice) materializationCombinedRootPhase(
 	if err := d.ring.SubmitAndWait(want); err != nil {
 		return true, false, err
 	}
+	completions, err := d.ring.PopBatch(want)
+	if err != nil {
+		return true, false, err
+	}
+	if len(completions) != int(want) {
+		return true, false, ErrOverflow
+	}
 	var first error
-	for range want {
-		completion, ok, err := d.ring.Pop()
-		if err != nil {
-			return true, false, err
-		}
-		if !ok {
-			return true, false, ErrOverflow
-		}
+	for _, completion := range completions {
 		var expected uint32
 		switch {
 		case completion.UserData == ringRootTag:
@@ -323,14 +329,14 @@ func (d *ringDevice) materializationCombinedRootPhase(
 	if err := d.ring.SubmitAndWait(1); err != nil {
 		return true, false, err
 	}
-	completion, ok, err := d.ring.Pop()
+	completions, err = d.ring.PopBatch(1)
 	if err != nil {
 		return true, false, err
 	}
-	if !ok || completion.UserData != ringDataSyncTag {
+	if len(completions) != 1 || completions[0].UserData != ringDataSyncTag {
 		return true, false, ErrOverflow
 	}
-	if err := completionResult(completion, 0); err != nil {
+	if err := completionResult(completions[0], 0); err != nil {
 		return true, false, err
 	}
 	return true, true, nil
@@ -348,13 +354,16 @@ func (d *ringDevice) materializationPhase(writes []Write) error {
 	if err := d.ring.SubmitAndWait(uint32(len(writes))); err != nil {
 		return err
 	}
+	completions, err := d.ring.PopBatch(uint32(len(writes)))
+	if err != nil {
+		return err
+	}
+	if len(completions) != len(writes) {
+		return ErrOverflow
+	}
 	var first error
-	for range writes {
-		completion, ok, err := d.ring.Pop()
-		if err != nil {
-			return err
-		}
-		if !ok || completion.UserData >= uint64(len(writes)) {
+	for _, completion := range completions {
+		if completion.UserData >= uint64(len(writes)) {
 			return ErrOverflow
 		}
 		write := writes[completion.UserData]
@@ -375,14 +384,14 @@ func (d *ringDevice) materializationPhase(writes []Write) error {
 	if err := d.ring.SubmitAndWait(1); err != nil {
 		return err
 	}
-	completion, ok, err := d.ring.Pop()
+	completions, err = d.ring.PopBatch(1)
 	if err != nil {
 		return err
 	}
-	if !ok || completion.UserData != ringDataSyncTag {
+	if len(completions) != 1 || completions[0].UserData != ringDataSyncTag {
 		return ErrOverflow
 	}
-	return completionResult(completion, 0)
+	return completionResult(completions[0], 0)
 }
 
 func completionResult(completion Completion, expected uint32) error {
