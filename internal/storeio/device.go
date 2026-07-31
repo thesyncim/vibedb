@@ -161,8 +161,10 @@ func (w Write) frameNative() bool {
 
 // Device is the internal, single-owner durable page-I/O boundary. Buffer
 // storage is fixed at construction and is reused for every commit. Commit is
-// synchronous at this layer: it returns only after data pages, a data barrier,
-// the alternate root, and its final barrier have completed in that order.
+// synchronous at this layer: it returns only after every data page reaches
+// data-integrity completion before the alternate root starts, and the root
+// itself reaches data-integrity completion. Backends may enforce those two
+// ordered durability epochs with explicit barriers or per-write durability.
 // Store's background writer supplies asynchronous application semantics above
 // this boundary.
 //

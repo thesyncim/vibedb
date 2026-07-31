@@ -123,6 +123,30 @@ func TestRingDeviceCommitSteadyAllocation(t *testing.T) {
 	}
 }
 
+func TestRingDeviceVectorCommitSteadyAllocation(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	device, _ := newRingTestDevice(t)
+	defer device.Close()
+	pageSize := os.Getpagesize()
+	writes := [...]Write{
+		{Offset: int64(pageSize), Length: uint32(pageSize), Buffer: 0},
+		{Offset: int64(2 * pageSize), Length: uint32(pageSize), Buffer: 1},
+	}
+	rootWrite := Write{Length: 9, Buffer: 2}
+	if !device.(*ringDevice).vectorCommitEligible(writes[:], rootWrite) {
+		t.Skip("kernel does not support stable vectored writes")
+	}
+	if allocs := testing.AllocsPerRun(20, func() {
+		if err := device.Commit(writes[:], rootWrite); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("ring vector Commit allocations = %g, want 0", allocs)
+	}
+}
+
 func TestRingCommitterSteadyAllocation(t *testing.T) {
 	committer, _ := newRingTestCommitter(t)
 	defer committer.Close()
