@@ -34,9 +34,10 @@ type Config struct {
 	// Entries is the maximum number of outstanding requests. Zero selects 256.
 	// Open rounds it up to a power of two and caps it at 32,768.
 	Entries uint32
-	// SingleIssuer enables the Linux single-issuer and deferred-task-run hints
+	// SingleIssuer enables Linux single-issuer and cooperative-task-run hints
 	// when the kernel accepts them. The caller must lock its goroutine to one OS
-	// thread before Open and keep it locked until Close.
+	// thread before Open and keep it locked until Close. Task execution remains
+	// prompt because this synchronous owner cannot overlap deferred completions.
 	SingleIssuer bool
 }
 
