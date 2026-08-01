@@ -95,6 +95,22 @@ func (e *MapperError) Error() string {
 
 func (e *MapperError) Unwrap() error { return ErrUnsupportedMapper }
 
+// ErrInvalidPlacement is the sentinel every ClusterConfig validation failure
+// matches under errors.Is.
+var ErrInvalidPlacement = errors.New("distribution: invalid placement configuration")
+
+// PlacementError reports why a ClusterConfig was rejected. It wraps
+// ErrInvalidPlacement.
+type PlacementError struct {
+	Reason string
+}
+
+func (e *PlacementError) Error() string {
+	return "distribution: invalid placement configuration: " + e.Reason
+}
+
+func (e *PlacementError) Unwrap() error { return ErrInvalidPlacement }
+
 // ErrScatterRejected is the sentinel returned when admission forbids an unknown
 // or all-shard scatter route.
 var ErrScatterRejected = errors.New("distribution: scatter route rejected")

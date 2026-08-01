@@ -107,6 +107,10 @@ type database struct {
 	tableDirFencePending bool
 	closed               bool
 	closeDone            bool
+	// cluster is the optional local-cluster routing state attached by the
+	// OpenCluster facade. It is nil for the default single-store driver, whose
+	// write path is unchanged.
+	cluster *clusterRouting
 }
 
 func openDatabase(path string) (*database, error) {
