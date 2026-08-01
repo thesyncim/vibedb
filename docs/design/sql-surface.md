@@ -268,23 +268,45 @@ The physical choice remains adaptive where memory admission or cardinality
 decides between indexed and scan paths; the JSON says so instead of pretending
 to be a static choice. Both forms use the engine's vibejson encoder.
 
-## Inner, left, and right joins
+## Generalized joins
 
-The SQL join is a declared-field equi-join. `INNER JOIN`, `LEFT [OUTER] JOIN`,
-and `RIGHT [OUTER] JOIN` are supported:
+`INNER JOIN`, `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN`,
+and `CROSS JOIN` compose into ordered chains. Each operand may be a physical
+collection, an uncorrelated derived table, or a non-recursive CTE:
 
 ```sql
-SELECT u.id, o.total
-FROM users AS u
-INNER JOIN orders AS o ON u.id = o.user_id
-WHERE o.state = ?
-ORDER BY o.total DESC
+WITH active AS MATERIALIZED (
+  SELECT id, name FROM users WHERE enabled = TRUE
+)
+SELECT active.name, o.id, p.state
+FROM active
+JOIN (
+  SELECT id, user_id, total FROM orders WHERE total >= ?
+) AS o ON active.id = o.user_id AND o.total <= ?
+LEFT JOIN payments AS p
+  ON o.id = p.order_id AND p.state = 'settled'
+ORDER BY o.id
 ```
 
-A left join preserves each row from its driving `FROM` table. When no joined
-document matches, every projected field from the joined alias is SQL `NULL`.
-Fan-out remains exact: a driving row with three matches produces three rows,
-while one with no match produces exactly one null-extended row.
+An `ON` expression may contain multiple equality keys and residual predicates.
+The executor hashes a composite key when at least one cross-relation equality
+is available, then evaluates the complete `ON` expression on each candidate.
+A keyless condition and `CROSS JOIN` use the bounded nested-loop kernel. SQL
+NULL never equals another key. `JOIN ... USING (tenant, region, id)` is the
+composite convenience spelling; every listed column participates in matching.
+
+Fan-out is exact. LEFT and RIGHT preserve the corresponding input, FULL
+preserves both, and every missing partner is represented by SQL NULL in all of
+that operand's projected columns. CROSS emits the Cartesian product. A WHERE
+predicate runs after the join relation exists, so filtering a nullable side has
+ordinary SQL outer-join semantics rather than being pushed into an operand.
+
+Output naming is independent of the selected physical kernel. An unaliased
+path from source zero keeps its path (`id`, `value`); joined paths remain
+range-variable-qualified (`o.id`, `o.value`). `AS` overrides that rule.
+Explicitly repeated aliases remain repeated ordinal columns and are emitted as
+duplicate pgwire `RowDescription` names; an ambiguous named reference is a
+typed error.
 
 The driver captures every participating durable collection in one coherent
 snapshot. All publication gates are held while the generation leases are
@@ -293,50 +315,35 @@ from observing a new generation of one table with an already-obsolete
 generation of another. It does not make independent writes to different tables
 atomic.
 
-Declared-field joins can produce several rows for one driving document. The
-durable executor does not yet expand that pair space directly, so the driver
-uses a bounded heap fallback:
+Autocommit generalized joins receive that coherent durable catalog directly.
+Physical dependencies therefore stay on durable sources, and eligible operand
+subplans retain primary-point and exact-index execution instead of first being
+copied into an adapter catalog. A sole physical dependency hidden behind a CTE
+still drives `Statement.Collection()` and the direct durable source. The legacy
+single-clause physical INNER/LEFT one-key shape keeps its existing
+storage-aware, bounded heap fan-out path; the prepared-plan classifier chooses
+once and leaves that fast path unchanged. A statement without generalized
+joins has no join state and pays one nil pointer test at execution.
 
-1. Capture the coherent durable cut.
-2. Measure all referenced keys and documents against the query working-set
-   budget.
-3. If admitted, materialize that exact cut into the heap executor, close the
-   durable leases, and run the shared fan-out plan from the owning heap copy.
-4. If it is too large, return `driver.ErrJoinMaterializationTooLarge` before
-   query execution or partial results.
+Every physical, derived, and CTE operand spool and each live joined relation is
+charged to the statement-wide `query.ExecOptions.IntermediateBytes` allowance.
+Composite-hash build state, decoded keys, and output-pair workspace are charged
+to `query.ExecOptions.JoinPairBytes`. Both default to finite 64 MiB limits.
+Admission, cancellation, and evaluation errors publish no partial cursor or
+pgwire `DataRow`, release the coherent cut, and leave prepared and protocol
+sessions reusable. Warm typed `QueryInto` execution reuses relation and join
+storage.
 
-The current driver budget is a fixed 64 MiB, with a conservative charge of
-`16 * (key bytes + document bytes) + 512 bytes` per source row to cover heap
-indexes, structural tapes, metadata, and build scratch. The budget is an
-admission bound on the estimated materialized working set, not merely a limit
-on output rows.
+`EXPLAIN` reports every stage's join kind, logical algorithm, keys, residual
+predicate, and operand. `EXPLAIN ANALYZE` adds the actual algorithm, build rows,
+and emitted pair count from the one measured execution. Both plain and prepared
+forms revalidate all recursively discovered physical dependencies before
+execution.
 
-`RIGHT JOIN` is normalized to an equivalent `LEFT JOIN` during parsing, with
-the preserved relation made the driving `FROM` relation. This keeps one outer
-join implementation and preserves null extension, fan-out, ordering, and
-snapshot behavior.
-
-`JOIN ... USING (field)` is accepted as a convenience spelling for an
-explicit equality. It currently accepts one simple field name; nested or
-composite keys use `ON` and are still subject to the one-key join limit.
-
-The current relational plan has two explicit join limits:
-
-- one statement may expand one joined relation, so the driver currently
-  accepts one declared-field JOIN;
-- that JOIN must relate the joined table directly to the driving `FROM` table;
-  chained joins are rejected.
-
-Only inner, left, and right `JOIN ... ON left_path = right_path` (or the
-single-field `USING` equivalent) are supported. SQL exposes no
-physical storage-key pseudo-column; `"$key"` is an ordinary quoted JSON field.
-Join the tables' declared JSON primary-key fields when relational identity is
-the intended relationship.
-
-The current executor has no post-join predicate phase. A `WHERE` condition over
-the nullable side of a left join is therefore rejected rather than pushed into
-the build side, which would silently change its meaning. Conditions over the
-preserved table remain supported.
+`LATERAL`, `NATURAL JOIN`, correlated operands, and mutation joins remain
+explicitly unsupported. SQL exposes no physical storage-key pseudo-column:
+`"$key"` is an ordinary quoted JSON field. Join the declared JSON primary-key
+fields when relational identity is intended.
 
 ## Predicate subqueries
 
@@ -385,8 +392,7 @@ SELECT id FROM ranked ORDER BY score DESC
 A `WITH` list is lexical. A definition can see earlier siblings and inherited
 outer definitions; a nested `WITH` may shadow them. It cannot see itself or a
 later sibling as a CTE. Definitions are SELECT-only. Scope also reaches
-predicate subqueries. A CTE reference may be the statement's sole `FROM`
-relation; CTEs in JOIN positions wait for the generic relation-join operator.
+predicate subqueries and every operand in a join chain.
 
 Column alias lists rename the corresponding leading outputs. An alias list may
 be shorter than the result, but not longer. Duplicate output names remain
@@ -412,9 +418,11 @@ Physical dependencies are walked recursively once per definition and
 deduplicated in source order. If the whole CTE graph reads one durable
 collection, `Statement.Collection()` resolves that collection and the driver
 keeps the direct durable source, primary-point path, and eligible exact-index
-execution. Multiple physical collections are captured at one reusable coherent
-generation cut before bounded catalog materialization. In a transaction the
-same graph reads the BEGIN snapshot plus the transaction overlay, preserving
+execution, including when the CTE is a generalized-join operand. Multiple
+physical collections execute from one reusable coherent generation cut;
+generalized joins consume that cut directly, while other catalog-requiring CTE
+shapes retain their bounded adapter materialization. In a transaction the same
+graph reads the BEGIN snapshot plus the transaction overlay, preserving
 repeatable reads and read-your-writes.
 
 Relation spools share the statement-wide intermediate allowance described
@@ -429,7 +437,8 @@ FROM-less SELECT body, so constant-only CTEs are not admitted by the front end.
 
 ## Derived tables
 
-An uncorrelated `SELECT` may be used as the sole `FROM` relation:
+An uncorrelated `SELECT` may be used as a `FROM` relation, including any operand
+in a join chain:
 
 ```sql
 SELECT d.customer, d.total
@@ -465,13 +474,14 @@ explicitly disables the bound. Intermediate exhaustion is SQLSTATE `54000` and
 cannot emit a partial result row.
 
 The derived query reads the same catalog snapshot as the outer statement.
-Derived relations in JOIN positions and `LATERAL` are typed unsupported until
-the generic relation-join/apply operator lands; they are never approximated as
-independent or per-row execution.
+Joined derived relations materialize once as bounded operands; they are not
+re-evaluated per outer row. `LATERAL` and correlated derived relations remain
+typed unsupported features rather than being approximated as independent
+execution.
 
-Joins inside a transaction use the same bounded heap path over the snapshots
-captured by BEGIN plus that transaction's staged overlay. They preserve
-repeatable reads and read-your-writes.
+Joins inside a transaction use the snapshots captured by BEGIN plus that
+transaction's staged overlay. They preserve repeatable reads and
+read-your-writes.
 
 ## UPDATE and DELETE
 
@@ -681,9 +691,8 @@ operation:
   data-modifying common table expressions, set operations, window functions,
   `COUNT(DISTINCT ...)`, computed scalar expressions, and user-defined
   functions;
-- derived relations or CTEs in JOIN positions, `LATERAL`, and derived-table
+- `LATERAL`, correlated derived relations, `NATURAL JOIN`, and derived-table
   column alias lists;
-- full outer, cross, natural, composite `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
 - generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,
   `ON DUPLICATE KEY`, and nested flat-INSERT construction;
