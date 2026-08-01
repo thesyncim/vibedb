@@ -205,20 +205,33 @@ func TestFileStoreDirectReadWriteUnderCachePressure(t *testing.T) {
 	// silently turned a fixed count into a fixture that no longer applied any
 	// pressure at all.
 	const (
-		minimumRecords = 2048
-		maximumRecords = 1 << 20
+		minimumRecords      = 2048
+		maximumRecords      = 1 << 16
+		pressurePayloadSize = 4096
 	)
+	// Reach the checked file/cache ratio with page-sized values rather than up
+	// to a million tiny point commits. The assertion below remains the source
+	// of truth for pressure; this only removes commit-count amplification from
+	// the fixture so slow shared disks cannot consume the package timeout before
+	// the concurrent read/write phase starts.
+	valueBuffer := make([]byte, 0, pressurePayloadSize+128)
 	records := 0
 	for row := 0; row < maximumRecords; row++ {
 		key := pressureKey(uint32(row))
-		value := fmt.Appendf(nil, `{"id":%d,"version":0,"payload":"%064d"}`, row, row)
+		value := fmt.Appendf(
+			valueBuffer[:0],
+			`{"id":%d,"version":0,"payload":"%0*d"}`,
+			row, pressurePayloadSize, row,
+		)
 		if _, err := collection.Put([]byte(key), value); err != nil {
 			t.Fatal(err)
 		}
 		records = row + 1
-		if records >= minimumRecords && records%256 == 0 &&
-			collection.Stats().FileEnd > 10*collection.Stats().CapacityBytes {
-			break
+		if records >= minimumRecords && records%256 == 0 {
+			stats := collection.Stats()
+			if stats.FileEnd > 10*stats.CapacityBytes {
+				break
+			}
 		}
 	}
 	if err := collection.Flush(); err != nil {
