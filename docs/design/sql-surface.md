@@ -390,12 +390,19 @@ ordinals: wildcard expansion preserves them, while a named reference is a
 typed ambiguous-column error. Exact decimal spellings, SQL NULL, and nested
 JSON values cross the relation boundary without scalar conversion.
 
-Derived rows are held in a private ordinal-keyed spool and are charged, along
-with every simultaneously live nested result, to
-`query.ExecOptions.IntermediateBytes`. Admission is fail-closed before the
-indexed spool grows. The spool feeds the existing scan, predicate, grouping,
-ordering, and aggregate kernel, so the outer query does not use a second SQL
-evaluator. Warmed in-memory execution remains allocation-free.
+Derived rows are held in a private ordinal-addressed columnar spool and are
+charged, along with every simultaneously live nested result, to
+`query.ExecOptions.IntermediateBytes`. Row, column, scalar, and payload storage
+is measured and admitted before any spool slice grows. Cells cross the boundary
+without JSON row encoding or a second decode pass. The spool feeds the existing
+scan, predicate, grouping, ordering, and aggregate semantics through a dedicated
+columnar kernel; warmed in-memory execution remains allocation-free.
+
+Typed sessions configure the shared allowance with
+`Session.SetIntermediateLimit`. Pgwire servers expose the same control as
+`Options.MaxIntermediateBytes`; zero selects the finite default and `-1`
+explicitly disables the bound. Intermediate exhaustion is SQLSTATE `54000` and
+cannot emit a partial result row.
 
 The derived query reads the same catalog snapshot as the outer statement.
 Derived relations in JOIN positions and `LATERAL` are typed unsupported until

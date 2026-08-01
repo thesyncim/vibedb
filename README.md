@@ -165,7 +165,10 @@ catalog, err := vibedriver.Open("example.vdb")
 if err != nil { log.Fatal(err) }
 defer catalog.Close()
 
-srv, err := pgwire.NewServer(catalog, pgwire.Options{Auth: pgwire.Trust()})
+srv, err := pgwire.NewServer(catalog, pgwire.Options{
+	Auth:                 pgwire.Trust(),
+	MaxIntermediateBytes: 64 << 20,
+})
 if err != nil { log.Fatal(err) }
 ln, err := net.Listen("tcp", "127.0.0.1:5433")
 if err != nil { log.Fatal(err) }
