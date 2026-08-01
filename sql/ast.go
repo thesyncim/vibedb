@@ -130,7 +130,8 @@ type TableRef struct {
 	// one, whichever order the statement wrote them in, so the build and probe
 	// sides are already sorted out.
 	On *JoinCond
-	// Pos is the byte offset of the collection name.
+	// Pos is the byte offset where the relation begins: the collection name or
+	// a derived query's opening parenthesis.
 	Pos int
 }
 

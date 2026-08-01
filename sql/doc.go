@@ -52,7 +52,7 @@
 //	collection-ref = name [ [ "AS" ] name ] ;
 //	derived-ref  = "(" select ")" ( "AS" name | name ) ;
 //	join         = ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN"
-//	               | "RIGHT" [ "OUTER" ] "JOIN" ) table-ref
+//	               | "RIGHT" [ "OUTER" ] "JOIN" ) collection-ref
 //	               ( "ON" join-cond | "USING" "(" name ")" ) ;
 //	join-cond    = [ "(" ] path "=" path [ ")" ] ;
 //
@@ -101,7 +101,8 @@
 //	name         = ident | quoted-ident ;
 //
 // [Parse] accepts the SELECT production alone and refuses the rest by naming
-// [ParseStatement], which accepts all six.
+// [ParseStatement], which accepts every statement production implemented by
+// this package.
 //
 // A string literal is single-quoted and a quoted identifier is double-quoted;
 // in both, an embedded quote is written by doubling it. Numbers follow

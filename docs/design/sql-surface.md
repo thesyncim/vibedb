@@ -257,7 +257,10 @@ projection remain query-engine operations.
 versioned JSON for the bound logical plan. It reports the full predicate tree,
 source-aware access-path alternatives when the catalog is available, the
 filter/late projection split, grouping, ordering, limit, and join shape. Plain
-EXPLAIN never scans rows. `EXPLAIN ANALYZE SELECT ...` executes the target once
+EXPLAIN never scans rows, but it validates every physical dependency against
+one coherent cut: a fresh capture outside a transaction or the cut pinned by
+BEGIN inside one. A stale prepared plan therefore cannot outlive a dropped or
+unsnappable relation. `EXPLAIN ANALYZE SELECT ...` executes the target once
 through the normal query path and adds measured elapsed time, result rows,
 index work, scan work, spills, join strategy counters, and the measured access
 path from that execution.

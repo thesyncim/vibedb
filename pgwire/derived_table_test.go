@@ -1,6 +1,9 @@
 package pgwire
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/query"
@@ -22,9 +25,10 @@ func TestDerivedTableErrorClassification(t *testing.T) {
 			code: sqlstateAmbiguousColumn,
 		},
 		{
-			err: &query.IntermediateBudgetError{
-				Resource: "derived relation", Bytes: 2, Limit: 1,
-			},
+			err: fmt.Errorf("materialize nested plan: %w",
+				&query.IntermediateBudgetError{
+					Resource: "derived relation", Bytes: 2, Limit: 1,
+				}),
 			code: sqlstateProgramLimitExceeded,
 		},
 	}
@@ -32,6 +36,65 @@ func TestDerivedTableErrorClassification(t *testing.T) {
 		if got := asPGError(test.err).code; got != test.code {
 			t.Errorf("asPGError(%T) = %q, want %q", test.err, got, test.code)
 		}
+	}
+}
+
+func TestDerivedTableFeatureRefusalsKeepSQLStatePositionAndRecovery(t *testing.T) {
+	c := connect(t)
+	for _, test := range []struct {
+		name      string
+		statement string
+		marker    string
+	}{
+		{
+			name: "column alias list",
+			statement: `SELECT d.id FROM (` +
+				`SELECT id FROM users` +
+				`) AS d(id)`,
+			marker: "(id)",
+		},
+		{
+			name: "lateral",
+			statement: `SELECT d.id FROM LATERAL (` +
+				`SELECT id FROM users` +
+				`) AS d`,
+			marker: "LATERAL",
+		},
+		{
+			name: "derived join input",
+			statement: `SELECT d.id FROM users AS u JOIN (` +
+				`SELECT id FROM users` +
+				`) AS d ON u.id = d.id`,
+			marker: "(SELECT",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fields := expectError(t, c.query(test.statement),
+				sqlstateFeatureNotSupported)
+			wantPosition := strconv.Itoa(strings.Index(test.statement, test.marker) + 1)
+			if fields['P'] != wantPosition {
+				t.Fatalf("ErrorResponse position = %q, want %q", fields['P'], wantPosition)
+			}
+		})
+	}
+
+	statement := `SELECT d.id FROM (SELECT id FROM users) AS d(id)`
+	c.send(msgParse, parseMsg("unsupported-derived", statement))
+	c.send(msgSync, nil)
+	msgs := c.until(msgReadyForQuery)
+	fields := expectError(t, msgs, sqlstateFeatureNotSupported)
+	wantPosition := strconv.Itoa(strings.Index(statement, "(id)") + 1)
+	if fields['P'] != wantPosition {
+		t.Fatalf("extended ErrorResponse position = %q, want %q",
+			fields['P'], wantPosition)
+	}
+	if has(msgs, msgParseComplete) {
+		t.Fatalf("unsupported Parse emitted ParseComplete: %s", tags(msgs))
+	}
+
+	msgs = c.query(`SELECT id FROM users WHERE id = 1`)
+	if got := commandTagOf(t, msgs); got != "SELECT 1" {
+		t.Fatalf("recovery tag = %q, want SELECT 1", got)
 	}
 }
 
@@ -96,6 +159,30 @@ func TestDerivedTableColumnSQLStatesAndRecovery(t *testing.T) {
 		c.query(`SELECT d.id FROM (SELECT id, id FROM docs) d`),
 		sqlstateAmbiguousColumn,
 	)
+	for _, test := range []struct {
+		name      string
+		statement string
+		code      string
+	}{
+		{
+			name:      "undefined-derived-column",
+			statement: `SELECT d.missing FROM (SELECT id FROM docs) d`,
+			code:      sqlstateUndefinedColumn,
+		},
+		{
+			name:      "ambiguous-derived-column",
+			statement: `SELECT d.id FROM (SELECT id, id FROM docs) d`,
+			code:      sqlstateAmbiguousColumn,
+		},
+	} {
+		c.send(msgParse, parseMsg(test.name, test.statement))
+		c.send(msgSync, nil)
+		msgs := c.until(msgReadyForQuery)
+		expectError(t, msgs, test.code)
+		if has(msgs, msgParseComplete) {
+			t.Fatalf("%s emitted ParseComplete: %s", test.name, tags(msgs))
+		}
+	}
 	msgs := c.query(`SELECT d.id FROM (SELECT id FROM docs) d`)
 	if got := commandTagOf(t, msgs); got != "SELECT 1" {
 		t.Fatalf("recovery tag = %q, want SELECT 1", got)

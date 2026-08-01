@@ -967,11 +967,55 @@ func (p *Parser) parseDerivedTableRef(ref TableRef) (TableRef, error) {
 	if alias == "" {
 		return ref, p.errHere("a derived table requires a non-empty alias, written AS alias or directly after ')'")
 	}
+	if p.tok.kind == tokLParen {
+		return ref, p.rejectDerivedColumnAliasList()
+	}
 	ref.Kind = RelationDerived
 	ref.Query = query
 	ref.Alias = alias
 	ref.HasAlias = true
 	return ref, p.rejectDuplicateRangeAlias(ref)
+}
+
+// rejectDerivedColumnAliasList distinguishes a valid-but-unsupported SQL
+// column alias list from malformed punctuation. Refusing immediately at the
+// opening parenthesis would turn d(), d(id,), and d(id name) into 0A000 even
+// though those inputs are not valid instances of the feature. Walking this
+// small grammar first keeps protocol classification honest and retains the
+// same clause-item bound used by accepted identifier lists.
+func (p *Parser) rejectDerivedColumnAliasList() error {
+	pos := p.tok.pos
+	p.advance() // consume '('
+	items := 0
+	for {
+		switch p.tok.kind {
+		case tokError:
+			return p.errHere(p.tok.text)
+		case tokIdent, tokQuotedIdent:
+			if p.tok.text == "" {
+				return p.errHere("a derived-table column alias may not be empty")
+			}
+		default:
+			return p.errHere("expected a column name in the derived-table alias list")
+		}
+		items++
+		if items > maxClauseItems {
+			return p.errfAt(pos,
+				"a derived-table alias list may hold at most %d columns", maxClauseItems)
+		}
+		p.advance()
+		if p.tok.kind == tokRParen {
+			return newFeatureNotSupportedError(
+				p.lx.src,
+				pos,
+				"derived-table column alias lists are not supported yet; name each inner SELECT output with AS instead",
+			)
+		}
+		if p.tok.kind != tokComma {
+			return p.errHere("expected ',' or ')' after a derived-table column alias")
+		}
+		p.advance()
+	}
 }
 
 func (p *Parser) rejectDuplicateRangeAlias(ref TableRef) error {

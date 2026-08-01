@@ -142,6 +142,37 @@ func TestDatabaseSQLDerivedTableMissingDependency(t *testing.T) {
 	}
 }
 
+func TestPreparedExplainDerivedTableRevalidatesPhysicalDependencies(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	explain, err := db.Prepare(
+		`EXPLAIN SELECT d.id FROM (SELECT id FROM docs) AS d`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer explain.Close()
+	var plan string
+	if err := explain.QueryRow().Scan(&plan); err != nil {
+		t.Fatalf("derived EXPLAIN before DROP: %v", err)
+	}
+	if plan == "" {
+		t.Fatal("derived EXPLAIN returned an empty plan")
+	}
+	if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := explain.Query()
+	if rows != nil {
+		rows.Close()
+	}
+	if !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("prepared derived EXPLAIN after DROP = %v, want ErrTableNotFound", err)
+	}
+}
+
 func TestTransactionDerivedTableSnapshotAndReadYourWrites(t *testing.T) {
 	db := openTestDB(t)
 	db.SetMaxOpenConns(4)

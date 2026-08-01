@@ -214,6 +214,86 @@ func TestDerivedJoinAndLateralRefusalsStayTyped(t *testing.T) {
 	}
 }
 
+func TestDerivedTableColumnAliasListsStayTyped(t *testing.T) {
+	for _, test := range []struct {
+		src    string
+		marker string
+	}{
+		{
+			src:    `SELECT d.id FROM (SELECT id FROM docs) AS d(id)`,
+			marker: `(id)`,
+		},
+		{
+			src: `SELECT outer_d.id FROM (` +
+				`SELECT inner_d.id FROM (SELECT id FROM docs) inner_d(id)` +
+				`) outer_d`,
+			marker: `(id)`,
+		},
+		{
+			src:    `SELECT d.id FROM (SELECT id FROM docs) AS d("renamed", order)`,
+			marker: `("renamed"`,
+		},
+	} {
+		t.Run(test.src, func(t *testing.T) {
+			_, err := Parse(test.src)
+			var unsupported *FeatureNotSupportedError
+			if !errors.As(err, &unsupported) {
+				t.Fatalf("Parse error = %T %v, want *FeatureNotSupportedError", err, err)
+			}
+			wantPos := strings.Index(test.src, test.marker)
+			if unsupported.Pos != wantPos ||
+				!strings.Contains(unsupported.Msg, "column alias lists") {
+				t.Fatalf("typed refusal = offset %d, %q; want %d naming column alias lists",
+					unsupported.Pos, unsupported.Msg, wantPos)
+			}
+		})
+	}
+}
+
+func TestMalformedDerivedTableColumnAliasListsRemainSyntaxErrors(t *testing.T) {
+	for _, test := range []struct {
+		src     string
+		marker  string
+		message string
+	}{
+		{
+			src:     `SELECT d.id FROM (SELECT id FROM docs) AS d()`,
+			marker:  `)`,
+			message: "expected a column name",
+		},
+		{
+			src:     `SELECT d.id FROM (SELECT id FROM docs) AS d(id,)`,
+			marker:  `)`,
+			message: "expected a column name",
+		},
+		{
+			src:     `SELECT d.id FROM (SELECT id FROM docs) AS d(id name)`,
+			marker:  `name`,
+			message: "expected ',' or ')'",
+		},
+		{
+			src:     `SELECT d.id FROM (SELECT id FROM docs) AS d("")`,
+			marker:  `""`,
+			message: "may not be empty",
+		},
+	} {
+		t.Run(test.src, func(t *testing.T) {
+			_, err := Parse(test.src)
+			var unsupported *FeatureNotSupportedError
+			if errors.As(err, &unsupported) {
+				t.Fatalf("malformed alias list was classified as supported grammar: %v", err)
+			}
+			var parse *ParseError
+			wantPos := strings.LastIndex(test.src, test.marker)
+			if !errors.As(err, &parse) || parse.Pos != wantPos ||
+				!strings.Contains(parse.Msg, test.message) {
+				t.Fatalf("Parse error = %T %v, want offset %d containing %q",
+					err, err, wantPos, test.message)
+			}
+		})
+	}
+}
+
 func TestDerivedTableNestingBound(t *testing.T) {
 	build := func(depth int) string {
 		return strings.Repeat(`SELECT * FROM (`, depth) +

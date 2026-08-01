@@ -246,26 +246,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return nil, err
 	}
 	if s.query.RequiresCatalog() {
-		clear(s.conn.joinCatalog)
-		collections := s.conn.joinCatalog[:0]
-		for _, name := range s.joinNames {
-			t, ok := s.conn.db.tables[name]
-			if !ok {
-				s.conn.releaseJoinCatalog(collections)
-				s.conn.db.mu.RUnlock()
-				return nil, fmt.Errorf("%w: %q", ErrTableNotFound, name)
-			}
-			collections = append(collections, durable.NamedCollection{
-				Name: name, Collection: t.collection,
-			})
-		}
-		if err := contextCheckpoint(ctx); err != nil {
-			s.conn.releaseJoinCatalog(collections)
-			s.conn.db.mu.RUnlock()
-			return nil, err
-		}
-		catalog, snapshotErr := durable.SnapshotCollections(collections)
-		s.conn.releaseJoinCatalog(collections)
+		catalog, snapshotErr := s.snapshotCatalogDependenciesLocked(ctx)
 		s.conn.db.mu.RUnlock()
 		if snapshotErr != nil {
 			return nil, snapshotErr
@@ -437,11 +418,12 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	options := query.ExplainOptions{
 		PrimaryPoint: s.primaryPoint,
 	}
-	// The driver materializes joins into the heap executor, whose source has
-	// no durable catalog. Keep the plan logical rather than attributing the
-	// original table's indexes to the materialized execution.
+	// The driver materializes catalog-dependent joins and relation-valued
+	// subplans into the heap executor, whose source has no durable catalog. Keep
+	// the plan logical rather than attributing an original table's indexes to
+	// the materialized execution.
 	if s.query.RequiresCatalog() {
-		return options, contextCheckpoint(ctx)
+		return options, s.validateCatalogDependenciesForExplain(ctx)
 	}
 	options.IndexCatalogKnown = true
 	collection := s.query.Collection()
@@ -480,6 +462,73 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 		return query.ExplainOptions{}, closeErr
 	}
 	return options, contextCheckpoint(ctx)
+}
+
+// snapshotCatalogDependenciesLocked captures every physical relation the
+// prepared statement may read at one durable instant. The caller holds db.mu
+// for reading; retaining that lock through SnapshotCollections keeps DROP and
+// replacement publication from changing the catalog between name resolution
+// and the generation cut.
+func (s *stmt) snapshotCatalogDependenciesLocked(
+	ctx context.Context,
+) (durable.DatabaseSnapshot, error) {
+	clear(s.conn.joinCatalog)
+	collections := s.conn.joinCatalog[:0]
+	for _, name := range s.joinNames {
+		t, ok := s.conn.db.tables[name]
+		if !ok {
+			s.conn.releaseJoinCatalog(collections)
+			return durable.DatabaseSnapshot{},
+				fmt.Errorf("%w: %q", ErrTableNotFound, name)
+		}
+		collections = append(collections, durable.NamedCollection{
+			Name: name, Collection: t.collection,
+		})
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		s.conn.releaseJoinCatalog(collections)
+		return durable.DatabaseSnapshot{}, err
+	}
+	catalog, err := durable.SnapshotCollections(collections)
+	s.conn.releaseJoinCatalog(collections)
+	return catalog, err
+}
+
+// validateCatalogDependenciesForExplain performs the source-acquisition part
+// of ordinary execution without materializing or scanning rows. A logical
+// EXPLAIN may omit physical access details for catalog plans, but it must not
+// claim an executable plan after one of its recursively discovered physical
+// dependencies has disappeared or can no longer be snapshotted.
+func (s *stmt) validateCatalogDependenciesForExplain(ctx context.Context) error {
+	if s.conn.tx != nil {
+		if s.conn.tx.done {
+			return errors.New("vibedb: transaction is finished")
+		}
+		for _, name := range s.joinNames {
+			if err := contextCheckpoint(ctx); err != nil {
+				return err
+			}
+			if _, ok := s.conn.tx.tables[name]; !ok {
+				return fmt.Errorf(
+					"%w: %q was not present when the transaction began",
+					ErrTableNotFound, name,
+				)
+			}
+		}
+		return contextCheckpoint(ctx)
+	}
+	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
+		return err
+	}
+	catalog, err := s.snapshotCatalogDependenciesLocked(ctx)
+	s.conn.db.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	if err := catalog.Close(); err != nil {
+		return err
+	}
+	return contextCheckpoint(ctx)
 }
 
 func (c *conn) releaseJoinCatalog(collections []durable.NamedCollection) {

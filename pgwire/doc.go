@@ -130,9 +130,10 @@
 //     PostgreSQL's textual plan format.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
-//   - The SQL constructs the dialect itself refuses — correlated and FROM-list
-//     subqueries, full/cross/natural joins, CASE, CAST, arithmetic, set
-//     operations, window functions, and scalar functions. RIGHT JOIN,
+//   - The SQL constructs the dialect itself refuses — correlated subqueries,
+//     derived relations in JOIN positions, LATERAL, full/cross/natural joins,
+//     CASE, CAST, arithmetic, set operations, window functions, and scalar
+//     functions. Sole-source uncorrelated derived tables, RIGHT JOIN,
 //     uncorrelated predicate subqueries, LIKE/ILIKE, and non-aggregate SELECT
 //     DISTINCT are supported. Each refusal carries a message naming the missing
 //     capability and a position;
