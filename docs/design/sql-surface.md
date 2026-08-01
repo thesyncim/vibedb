@@ -235,6 +235,18 @@ remain correct full scans; an index is an optimization, not a requirement for a
 WHERE clause. Sorting, grouping, aggregation, HAVING, OFFSET, and final
 projection remain query-engine operations.
 
+`EXPLAIN SELECT ...` returns one `QUERY PLAN` text column containing compact,
+versioned JSON for the bound logical plan. It reports the full predicate tree,
+source-aware access-path alternatives when the catalog is available, the
+filter/late projection split, grouping, ordering, limit, and join shape. Plain
+EXPLAIN never scans rows. `EXPLAIN ANALYZE SELECT ...` executes the target once
+through the normal query path and adds measured elapsed time, result rows,
+index work, scan work, spills, join strategy counters, and the measured access
+path from that execution.
+The physical choice remains adaptive where memory admission or cardinality
+decides between indexed and scan paths; the JSON says so instead of pretending
+to be a static choice. Both forms use the engine's vibejson encoder.
+
 ## Inner, left, and right joins
 
 The SQL join is a declared-field equi-join. `INNER JOIN`, `LEFT [OUTER] JOIN`,

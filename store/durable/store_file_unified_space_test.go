@@ -1,102 +1,25 @@
 package durable
 
 import (
-	"fmt"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/benchcorpus"
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// unifiedCompetitiveCorpus reproduces bench/competitive/corpus.go byte for
-// byte (same PCG seeds, same draw order, same substitution scheme) so the
-// space test measures exactly the corpus used for the compact baselines
-// (81.8 / 184.5 B/doc). The generator is
-// copied rather than imported because bench/competitive is a separate module
-// by design (its competitor dependencies must not leak into the root module).
+// unifiedCompetitiveCorpus adapts the single shared deterministic corpus to
+// the parallel key/document slices used by the durable tests. The nested
+// competitive module imports the same dependency-free generator, so neither
+// benchmark can silently drift away from the bytes reported by the other.
 func unifiedCompetitiveCorpus(n int, high bool) ([]string, [][]byte) {
-	countries := make([]string, 0, 100)
-	const letters = "ABCDEFGHIJ"
-	for i := range len(letters) {
-		for j := range len(letters) {
-			countries = append(countries, string(letters[i])+string(letters[j]))
-		}
-	}
-	countries[26] = "PT"
-	tiers := []string{"free", "pro", "team", "enterprise"}
-	regions := []string{"eu-west-1", "eu-central-1", "us-east-1", "us-west-2", "ap-south-1"}
-	tagPool := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"}
-	notes := []string{
-		"steady state, no anomalies observed in the last reporting window",
-		"processed during the scheduled maintenance window",
-		"flagged for review after a threshold breach on the ingest path",
-		"nominal; retention policy applied and checkpoint acknowledged",
-	}
-	rng := rand.New(rand.NewPCG(0x5DEECE66D, 0xB16B00B5))
-	fill := rand.New(rand.NewPCG(0xC0FFEE, 0x1234567))
-	uniq := func(sample string) string {
-		if !high {
-			return sample
-		}
-		out := make([]byte, len(sample))
-		for i := range out {
-			out[i] = byte('a' + fill.IntN(26))
-		}
-		return string(out)
-	}
+	corpus := benchcorpus.Corpus(n, high)
 	keys := make([]string, n)
 	docs := make([][]byte, n)
-	buf := make([]byte, 0, 512)
-	for i := range n {
-		country := countries[rng.IntN(len(countries))]
-		tier := uniq(tiers[rng.IntN(len(tiers))])
-		region := uniq(regions[rng.IntN(len(regions))])
-		note := uniq(notes[rng.IntN(len(notes))])
-		score := rng.IntN(1000)
-		joinedY := 2018 + rng.IntN(7)
-		joinedM := 1 + rng.IntN(12)
-		joinedD := 1 + rng.IntN(28)
-		nTags := 2 + rng.IntN(3)
-
-		buf = buf[:0]
-		buf = append(buf, `{"id":`...)
-		buf = strconv.AppendInt(buf, int64(i), 10)
-		buf = append(buf, `,"name":"user-`...)
-		buf = strconv.AppendInt(buf, int64(i), 10)
-		buf = append(buf, `","country":"`...)
-		buf = append(buf, country...)
-		buf = append(buf, `","score":`...)
-		buf = strconv.AppendInt(buf, int64(score), 10)
-		buf = append(buf, `,"active":`...)
-		if i%3 == 0 {
-			buf = append(buf, "false"...)
-		} else {
-			buf = append(buf, "true"...)
-		}
-		buf = append(buf, `,"profile":{"tier":"`...)
-		buf = append(buf, tier...)
-		buf = append(buf, `","region":"`...)
-		buf = append(buf, region...)
-		buf = append(buf, `","joined":"`...)
-		buf = append(buf, fmt.Sprintf("%04d-%02d-%02d", joinedY, joinedM, joinedD)...)
-		buf = append(buf, `"},"tags":[`...)
-		for t := range nTags {
-			if t > 0 {
-				buf = append(buf, ',')
-			}
-			buf = append(buf, '"')
-			buf = append(buf, uniq(tagPool[(i+t*3)%len(tagPool)])...)
-			buf = append(buf, '"')
-		}
-		buf = append(buf, `],"note":"`...)
-		buf = append(buf, note...)
-		buf = append(buf, `"}`...)
-
-		keys[i] = fmt.Sprintf("doc:%08d", i)
-		docs[i] = append([]byte(nil), buf...)
+	for i := range corpus {
+		keys[i] = corpus[i].Key
+		docs[i] = corpus[i].JSON
 	}
 	return keys, docs
 }

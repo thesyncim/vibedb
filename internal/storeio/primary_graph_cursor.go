@@ -312,13 +312,14 @@ func (c *PrimaryGraphCursor) CurrentUnifiedLeafPage() (
 	return c.leafBucket, c.leafLease.Page(), true
 }
 
-// VisitCurrentLeafAllInline drains only the current unbounded leaf through the
-// fused sequential decoder. An overflow row stops the drain and returns its
-// borrowed key and chain head; re-enter to continue the same leaf. A zero ref
-// means the current leaf is exhausted. The caller advances explicitly with
-// NextLeaf, which lets an overlay-aware scan use this fused path for clean
-// leaves and a generation merge only for dirty leaves.
-func (c *PrimaryGraphCursor) VisitCurrentLeafAllInline(
+// VisitCurrentLeafInlineUntil drains the current unbounded leaf's base rows up
+// to the exact lexical rank limit through the fused sequential decoder. An
+// overflow row stops the drain and returns its borrowed key and chain head;
+// re-enter with the same limit to continue. A zero ref means limit was reached.
+// Overlay-aware scans apply one sorted edit at that boundary, then continue
+// with the next untouched base span.
+func (c *PrimaryGraphCursor) VisitCurrentLeafInlineUntil(
+	limit int,
 	fn func(key, value []byte) error,
 ) ([]byte, PageRef, error) {
 	if c == nil || c.done || fn == nil {
@@ -329,11 +330,31 @@ func (c *PrimaryGraphCursor) VisitCurrentLeafAllInline(
 			"%w: bounded current-leaf drain", ErrInvalidWrite,
 		)
 	}
-	key, raw, err := c.visitCurrentLeafAllInline(fn)
-	if err != nil || key == nil {
-		return nil, PageRef{}, err
+	return c.visitCurrentLeafInlineUntil(limit, fn)
+}
+
+// ConsumeCurrentLeafBase validates and advances exactly one base row without
+// rendering its old value. It is the replacement/delete companion to
+// VisitCurrentLeafInlineUntil and fails closed without advancing on a stale
+// key certificate.
+func (c *PrimaryGraphCursor) ConsumeCurrentLeafBase(expectedKey []byte) error {
+	if c == nil || c.done || len(expectedKey) == 0 ||
+		len(c.lower) != 0 || len(c.upper) != 0 || len(c.prefix) != 0 {
+		return ErrInvalidWrite
 	}
-	return key, decodePageRef(raw), nil
+	rank := int(c.rows.rank)
+	if rank >= int(c.rows.count) {
+		return ErrCommonPrimaryLeafCorrupt
+	}
+	key, ok := c.unifiedLeaf.RowAt(rank)
+	if !ok || !bytes.Equal(key, expectedKey) {
+		return ErrCommonPrimaryLeafCorrupt
+	}
+	consumed, _, overflow, ok := c.rows.NextRawBorrowed()
+	if !ok || overflow || !bytes.Equal(consumed, expectedKey) {
+		return ErrCommonPrimaryLeafCorrupt
+	}
+	return nil
 }
 
 // NextLeaf releases the current leaf and selects its rooted lexical successor.
@@ -362,7 +383,7 @@ func (c *PrimaryGraphCursor) nextRawBorrowed() (
 	if isOverflow {
 		return k, body, true, true
 	}
-	c.spliceScratch = c.unifiedLeaf.AppendAdmittedRowBody(
+	c.spliceScratch = c.unifiedRenderer.Append(
 		c.spliceScratch[:0], body,
 	)
 	return k, c.spliceScratch, false, true
@@ -415,12 +436,14 @@ func (c *PrimaryGraphCursor) visitAllInline(
 	fn func(key, value []byte) error,
 ) ([]byte, PageRef, error) {
 	for {
-		key, raw, err := c.visitCurrentLeafAllInline(fn)
+		key, ref, err := c.visitCurrentLeafInlineUntil(
+			int(c.rows.count), fn,
+		)
 		if err != nil {
 			return nil, PageRef{}, err
 		}
 		if key != nil {
-			return key, decodePageRef(raw), nil
+			return key, ref, nil
 		}
 		if err := c.advanceLeaf(); err != nil {
 			c.Close()
@@ -432,16 +455,20 @@ func (c *PrimaryGraphCursor) visitAllInline(
 	}
 }
 
-// visitCurrentLeafAllInline fuses the succinct boundary decoder, key decoder,
-// admitted row renderer, and callback dispatch into one leaf-local loop. The
-// iterator state is written back only when the leaf drains, an overflow row is
-// returned, or the callback stops the scan.
-func (c *PrimaryGraphCursor) visitCurrentLeafAllInline(
+// visitCurrentLeafInlineUntil fuses the succinct boundary decoder, key
+// decoder, admitted renderer, and callback dispatch for one exact base span.
+// Iterator state is written back only at the span boundary, overflow, or
+// callback stop.
+func (c *PrimaryGraphCursor) visitCurrentLeafInlineUntil(
+	limit int,
 	fn func(key, value []byte) error,
-) (overflowKey, overflowRaw []byte, err error) {
+) (overflowKey []byte, overflow PageRef, err error) {
 	it := &c.rows
-	if it.finished {
-		return nil, nil, nil
+	if limit < int(it.rank) || limit > int(it.count) {
+		return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
+	}
+	if it.finished || int(it.rank) == limit {
+		return nil, PageRef{}, nil
 	}
 	payload := it.payload
 	layout := &it.layout
@@ -449,12 +476,13 @@ func (c *PrimaryGraphCursor) visitCurrentLeafAllInline(
 	rank := int(it.rank)
 	bitPos := int(it.bitPos)
 	offset := int(it.offset)
-	for rank < count {
+	for rank < limit {
 		nextPosition, ok := commonPrimaryLeafNextHighBitAt(
 			payload, layout.highStart, layout.highBytes, bitPos+1,
 		)
 		if !ok {
-			break
+			it.finished = true
+			return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 		}
 		nextRank := rank + 1
 		end := uint16(
@@ -469,17 +497,17 @@ func (c *PrimaryGraphCursor) visitCurrentLeafAllInline(
 		key := payload[start : start+keyLength : start+keyLength]
 		valueStart := start + keyLength
 		raw := payload[valueStart:int(end):int(end)]
-		overflow := payload[layout.overflowStart+rank/8]&
+		isOverflow := payload[layout.overflowStart+rank/8]&
 			(byte(1)<<uint(rank&7)) != 0
 		rank = nextRank
 		bitPos = nextPosition
 		offset = int(end)
-		if overflow {
+		if isOverflow {
 			it.rank = uint16(rank)
 			it.bitPos = uint16(bitPos)
 			it.offset = uint16(offset)
 			it.finished = rank >= count
-			return key, raw, nil
+			return key, decodePageRef(raw), nil
 		}
 		c.spliceScratch = c.unifiedRenderer.Append(
 			c.spliceScratch[:0], raw,
@@ -489,14 +517,14 @@ func (c *PrimaryGraphCursor) visitCurrentLeafAllInline(
 			it.bitPos = uint16(bitPos)
 			it.offset = uint16(offset)
 			it.finished = rank >= count
-			return nil, nil, err
+			return nil, PageRef{}, err
 		}
 	}
 	it.rank = uint16(rank)
 	it.bitPos = uint16(bitPos)
 	it.offset = uint16(offset)
-	it.finished = true
-	return nil, nil, nil
+	it.finished = rank >= count
+	return nil, PageRef{}, nil
 }
 
 func (c *PrimaryGraphCursor) advanceLeaf() error {

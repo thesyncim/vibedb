@@ -60,6 +60,7 @@ type keyword uint8
 const (
 	kwNone keyword = iota
 	kwAll
+	kwAnalyze
 	kwAnd
 	kwAs
 	kwAsc
@@ -82,6 +83,7 @@ const (
 	kwDrop
 	kwEscape
 	kwExcept
+	kwExplain
 	kwExists
 	kwFalse
 	kwFetch
@@ -170,6 +172,8 @@ func keywordOf(s string) keyword {
 	switch string(buf[:len(s)]) {
 	case "ALL":
 		return kwAll
+	case "ANALYZE":
+		return kwAnalyze
 	case "AND":
 		return kwAnd
 	case "AS":
@@ -214,6 +218,8 @@ func keywordOf(s string) keyword {
 		return kwEscape
 	case "EXCEPT":
 		return kwExcept
+	case "EXPLAIN":
+		return kwExplain
 	case "EXISTS":
 		return kwExists
 	case "FALSE":

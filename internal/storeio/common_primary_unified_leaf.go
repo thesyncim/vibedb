@@ -1741,62 +1741,130 @@ func (v *CommonPrimaryUnifiedLeafView) AppendAdmittedRowBody(dst, body []byte) [
 	return append(dst, entry.static[segPrevious:]...)
 }
 
+const (
+	// A unified leaf may name up to 255 templates, but ordered workloads usually
+	// alternate among a very small shape set. Eight compact direct-mapped
+	// entries cover that set without a search loop or an allocation. A collision
+	// merely replaces an unproven candidate; rendering remains complete.
+	unifiedRendererPlanCache = 8
+
+	// Templates through sixteen scalar holes use predecoded static spans. The
+	// bound keeps every renderer stack-resident and small; wider documents retain
+	// the complete admitted generic renderer below.
+	unifiedRendererPlannedHoles = 16
+)
+
+type unifiedPrimaryRenderPlan struct {
+	template unifiedTemplateView
+	// staticEnds retains one native cumulative end per skeleton segment. Both
+	// planned executors consume segments in order and carry the prior end in a
+	// register, so this needs one load per span without packed start/end pairs.
+	staticEnds [unifiedRendererPlannedHoles + 1]uint32
+	epoch      uint32
+	id         uint8
+	plannable  bool
+	fast       bool
+	// scanShape is learned from the first row that reaches the broad ordered
+	// document specialization. Zero is untried, one is admitted, and two keeps
+	// a mismatching template on the generic planned executor for the rest of the
+	// leaf. It is a performance hint only; every attempted row rechecks tags.
+	scanShape uint8
+}
+
+func (p *unifiedPrimaryRenderPlan) appendStatic(
+	dst []byte,
+	previous uint32,
+	segment int,
+) ([]byte, uint32) {
+	end := p.staticEnds[segment]
+	return append(dst, p.template.static[previous:end]...), end
+}
+
 // unifiedPrimaryRowRenderer is the sequential-scan resolver for one admitted
-// unified leaf. Reset resolves the dictionary directory once per leaf, while
-// Append retains the most recently used template. Lexically adjacent rows
-// overwhelmingly share a template, so the scan loop avoids re-decoding both
-// directories for every row and every token without allocating a side table.
+// unified leaf. Reset resolves the dictionary directory once per leaf. Append
+// retains eight compact admitted template plans because lexical rows can
+// alternate among a handful of shapes (for example, array arities) rather
+// than repeat one template. Common bounded templates also decode their static
+// segment table once per leaf instead of once per row. All storage is fixed
+// and caller-owned.
 type unifiedPrimaryRowRenderer struct {
 	view             CommonPrimaryUnifiedLeafView
-	template         unifiedTemplateView
 	dictionaryData   []byte
-	dictionaryBounds [unifiedTokenDictLimit]uint64
-	templateID       uint8
-	templateSet      bool
-	threeHoles       bool
+	dictionaryBounds [unifiedTokenDictLimit + 1]uint32
+	plans            [unifiedRendererPlanCache]unifiedPrimaryRenderPlan
 	threeStatic      [4][]byte
-}
-
-// CommonPrimaryUnifiedRowRenderer retains one admitted leaf's decoded
-// dictionary directory and hottest template while a caller walks that leaf in
-// lexical order. Its zero value is ready for Reset. It is single-consumer and
-// borrows the admitted view until the next Reset.
-//
-// Use this instead of calling AppendAdmittedRowBody independently for every
-// row: adjacent rows usually share a template, so the retained resolver avoids
-// re-decoding the template and dictionary directories on the scan hot path.
-type CommonPrimaryUnifiedRowRenderer struct {
-	inner unifiedPrimaryRowRenderer
-}
-
-// Reset selects the admitted leaf and clears the prior template cache.
-func (r *CommonPrimaryUnifiedRowRenderer) Reset(
-	view CommonPrimaryUnifiedLeafView,
-) {
-	r.inner.Reset(view)
-}
-
-// Append reconstructs one admitted inline body into dst.
-func (r *CommonPrimaryUnifiedRowRenderer) Append(dst, body []byte) []byte {
-	return r.inner.Append(dst, body)
+	epoch            uint32
+	threeTemplateID  uint8
+	threeTemplateSet bool
 }
 
 func (r *unifiedPrimaryRowRenderer) Reset(
 	view CommonPrimaryUnifiedLeafView,
 ) {
 	r.view = view
-	r.templateSet = false
+	r.epoch++
+	r.threeTemplateSet = false
+	if r.epoch == 0 {
+		// Preserve the epoch-zero empty marker after uint32 wrap. This is not a
+		// practical scan cadence, but keeping the cache proof total is cheap.
+		r.plans = [unifiedRendererPlanCache]unifiedPrimaryRenderPlan{}
+		r.epoch = 1
+	}
 	r.dictionaryData =
 		view.env.payload[view.dictionaryData:view.heapStart:view.heapStart]
-	var previous uint32
+	r.dictionaryBounds[0] = 0
 	for id := 0; id < view.dictionaryCount; id++ {
 		end := binary.LittleEndian.Uint32(
 			view.env.payload[view.dictionaryDir+id*4:],
 		)
-		r.dictionaryBounds[id] =
-			uint64(previous) | uint64(end)<<32
+		r.dictionaryBounds[id+1] = end
+	}
+}
+
+// resetRenderPlan keeps template admission off Append's common path. It runs
+// only on a direct-map miss.
+func (r *unifiedPrimaryRowRenderer) resetRenderPlan(
+	plan *unifiedPrimaryRenderPlan,
+	templateID uint8,
+) *unifiedPrimaryRenderPlan {
+	entry := r.view.admittedTemplateEntry(int(templateID))
+	plan.template = entry
+	plan.epoch = r.epoch
+	plan.id = templateID
+	plan.plannable = entry.holes <= unifiedRendererPlannedHoles
+	plan.fast = false
+	plan.scanShape = 0
+	return plan
+}
+
+func (r *unifiedPrimaryRowRenderer) prepareThreeStatic(
+	entry unifiedTemplateView,
+	templateID uint8,
+) {
+	var previous uint32
+	for segment := range r.threeStatic {
+		end := binary.LittleEndian.Uint32(entry.ends[segment*4:])
+		r.threeStatic[segment] = entry.static[previous:end:end]
 		previous = end
 	}
+	r.threeTemplateID = templateID
+	r.threeTemplateSet = true
+}
+
+// prepareRenderPlan decodes a bounded template's static boundaries after a
+// direct-map hit proves reuse. A one-row or collision-heavy stream therefore
+// pays only the old generic renderer, while recurring shapes specialize on
+// their second occurrence.
+func (r *unifiedPrimaryRowRenderer) prepareRenderPlan(
+	plan *unifiedPrimaryRenderPlan,
+) {
+	entry := plan.template
+	for segment := 0; segment <= entry.holes; segment++ {
+		plan.staticEnds[segment] = binary.LittleEndian.Uint32(
+			entry.ends[segment*4:],
+		)
+	}
+	plan.fast = true
 }
 
 // Append reconstructs one admitted inline row using Reset's leaf-local
@@ -1807,30 +1875,24 @@ func (r *unifiedPrimaryRowRenderer) Append(dst, body []byte) []byte {
 		return append(dst, body[1:]...)
 	}
 	templateID := body[0]
-	if !r.templateSet || r.templateID != templateID {
-		r.template = r.view.admittedTemplateEntry(int(templateID))
-		r.templateID = templateID
-		r.templateSet = true
-		r.threeHoles = r.template.holes == 3
-		if r.threeHoles {
-			end0 := int(binary.LittleEndian.Uint32(r.template.ends))
-			end1 := int(binary.LittleEndian.Uint32(r.template.ends[4:]))
-			end2 := int(binary.LittleEndian.Uint32(r.template.ends[8:]))
-			static := r.template.static
-			r.threeStatic = [4][]byte{
-				static[:end0:end0],
-				static[end0:end1:end1],
-				static[end1:end2:end2],
-				static[end2:],
-			}
-		}
+	slot := templateID & (unifiedRendererPlanCache - 1)
+	plan := &r.plans[slot]
+	if plan.epoch != r.epoch || plan.id != templateID {
+		plan = r.resetRenderPlan(plan, templateID)
+	} else if plan.plannable && !plan.fast {
+		r.prepareRenderPlan(plan)
 	}
 	// Three scalar holes are the dominant document shape in ordered scans.
 	// Its overwhelmingly common token signature is two canonical integers
 	// followed by a short string. Recognize the admitted signature before
 	// touching dst, then render it without the generic per-hole loop and
 	// switch. Other signatures retain the complete generic path below.
-	if r.threeHoles && body[1] == unifiedTokenInt {
+	if plan.template.holes == 3 {
+		if !r.threeTemplateSet || r.threeTemplateID != templateID {
+			r.prepareThreeStatic(plan.template, templateID)
+		}
+	}
+	if plan.template.holes == 3 && body[1] == unifiedTokenInt {
 		value0, n0 := DecodeZigzagVarint(body[2:])
 		token1 := 2 + n0
 		if body[token1] == unifiedTokenInt {
@@ -1853,7 +1915,20 @@ func (r *unifiedPrimaryRowRenderer) Append(dst, body []byte) []byte {
 			}
 		}
 	}
-	entry := r.template
+	if plan.fast && plan.template.holes >= 11 &&
+		plan.template.holes <= 13 && plan.scanShape != 2 {
+		base := len(dst)
+		if rendered, ok := r.appendOrderedDocumentShape(dst, body, plan); ok {
+			plan.scanShape = 1
+			return rendered
+		}
+		plan.scanShape = 2
+		dst = dst[:base]
+	}
+	if plan.fast {
+		return r.appendPlanned(dst, body, plan)
+	}
+	entry := plan.template
 	cursor := 1
 	segPrevious := 0
 	for hole := 0; hole < entry.holes; hole++ {
@@ -1864,8 +1939,8 @@ func (r *unifiedPrimaryRowRenderer) Append(dst, body []byte) []byte {
 		cursor++
 		switch {
 		case tag < unifiedTokenDictLimit:
-			bounds := r.dictionaryBounds[tag]
-			start, end := uint32(bounds), uint32(bounds>>32)
+			start := r.dictionaryBounds[tag]
+			end := r.dictionaryBounds[int(tag)+1]
 			dst = append(dst, r.dictionaryData[start:end]...)
 		case tag >= unifiedTokenShortBase &&
 			tag < unifiedTokenShortBase+unifiedTokenShortMax:
@@ -1890,6 +1965,293 @@ func (r *unifiedPrimaryRowRenderer) Append(dst, body []byte) []byte {
 		}
 	}
 	return append(dst, entry.static[segPrevious:]...)
+}
+
+// appendOrderedDocumentShape is a schema-neutral specialization for a common
+// scalar signature: boolean, string, integer, five strings, integer, then two
+// to four strings. Object key names and static spellings remain entirely in
+// the admitted template; only the row's token classes select this executor.
+// A mismatch returns false and the caller immediately re-renders through the
+// complete planned path, then disables this hint for that template/leaf.
+func (r *unifiedPrimaryRowRenderer) appendOrderedDocumentShape(
+	dst, body []byte,
+	plan *unifiedPrimaryRenderPlan,
+) ([]byte, bool) {
+	var staticPrevious uint32
+	dst, staticPrevious = plan.appendStatic(dst, staticPrevious, 0)
+	cursor := 1
+	switch body[cursor] {
+	case unifiedTokenTrue:
+		dst = append(dst, "true"...)
+	case unifiedTokenFalse:
+		dst = append(dst, "false"...)
+	default:
+		return dst, false
+	}
+	cursor++
+
+	dst, staticPrevious = plan.appendStatic(dst, staticPrevious, 1)
+	tag := body[cursor]
+	cursor++
+	switch {
+	case tag < unifiedTokenDictLimit:
+		start := r.dictionaryBounds[tag]
+		end := r.dictionaryBounds[int(tag)+1]
+		dst = append(dst, r.dictionaryData[start:end]...)
+	case tag >= unifiedTokenShortBase &&
+		tag < unifiedTokenShortBase+unifiedTokenShortMax:
+		length := int(tag-unifiedTokenShortBase) + 1
+		dst = append(dst, body[cursor:cursor+length]...)
+		cursor += length
+	case tag == unifiedTokenLongLiteral:
+		length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+		cursor += n
+		dst = append(dst, body[cursor:cursor+int(length)]...)
+		cursor += int(length)
+	default:
+		return dst, false
+	}
+	dst, staticPrevious = plan.appendStatic(dst, staticPrevious, 2)
+	if body[cursor] != unifiedTokenInt {
+		return dst, false
+	}
+	value, n := DecodeZigzagVarint(body[cursor+1:])
+	cursor += n + 1
+	dst = AppendCanonicalInt(dst, value)
+
+	for hole := 3; hole < 8; hole++ {
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole)
+		tag = body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := r.dictionaryBounds[tag]
+			end := r.dictionaryBounds[int(tag)+1]
+			dst = append(dst, r.dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		default:
+			return dst, false
+		}
+	}
+	dst, staticPrevious = plan.appendStatic(dst, staticPrevious, 8)
+	if body[cursor] != unifiedTokenInt {
+		return dst, false
+	}
+	value, n = DecodeZigzagVarint(body[cursor+1:])
+	cursor += n + 1
+	dst = AppendCanonicalInt(dst, value)
+
+	for hole := 9; hole < plan.template.holes; hole++ {
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole)
+		tag = body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := r.dictionaryBounds[tag]
+			end := r.dictionaryBounds[int(tag)+1]
+			dst = append(dst, r.dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		default:
+			return dst, false
+		}
+	}
+	if cursor != len(body) {
+		return dst, false
+	}
+	dst, _ = plan.appendStatic(dst, staticPrevious, plan.template.holes)
+	return dst, true
+}
+
+// appendPlanned renders a common bounded template from predecoded static
+// spans. The token tags remain the signature: every row may independently use
+// a dictionary, literal, typed constant, or integer spelling at each scalar
+// position. Admission proved the stream, so this executor needs no speculative
+// schema assumptions and the arbitrary-shape path stays available below.
+func (r *unifiedPrimaryRowRenderer) appendPlanned(
+	dst, body []byte,
+	plan *unifiedPrimaryRenderPlan,
+) []byte {
+	cursor := 1
+	holes := plan.template.holes
+	dictionaryData := r.dictionaryData
+	dictionaryBounds := &r.dictionaryBounds
+	hole := 0
+	var staticPrevious uint32
+	// Four-way strip mining removes most loop-control branches from the common
+	// 8-16-hole documents without baking in a schema or a token position. Every
+	// lane still dispatches on its admitted row's own token signature.
+	for ; hole+4 <= holes; hole += 4 {
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole)
+		tag := body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := dictionaryBounds[tag]
+			end := dictionaryBounds[int(tag)+1]
+			dst = append(dst, dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole+1)
+		tag = body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := dictionaryBounds[tag]
+			end := dictionaryBounds[int(tag)+1]
+			dst = append(dst, dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole+2)
+		tag = body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := dictionaryBounds[tag]
+			end := dictionaryBounds[int(tag)+1]
+			dst = append(dst, dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole+3)
+		tag = body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := dictionaryBounds[tag]
+			end := dictionaryBounds[int(tag)+1]
+			dst = append(dst, dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+	}
+	for ; hole < holes; hole++ {
+		dst, staticPrevious = plan.appendStatic(dst, staticPrevious, hole)
+		tag := body[cursor]
+		cursor++
+		switch {
+		case tag < unifiedTokenDictLimit:
+			start := dictionaryBounds[tag]
+			end := dictionaryBounds[int(tag)+1]
+			dst = append(dst, dictionaryData[start:end]...)
+		case tag >= unifiedTokenShortBase &&
+			tag < unifiedTokenShortBase+unifiedTokenShortMax:
+			length := int(tag-unifiedTokenShortBase) + 1
+			dst = append(dst, body[cursor:cursor+length]...)
+			cursor += length
+		case tag == unifiedTokenLongLiteral:
+			length, n, _ := readUnifiedTokenUvarint(body[cursor:])
+			cursor += n
+			dst = append(dst, body[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		case tag == unifiedTokenTrue:
+			dst = append(dst, "true"...)
+		case tag == unifiedTokenFalse:
+			dst = append(dst, "false"...)
+		case tag == unifiedTokenNull:
+			dst = append(dst, "null"...)
+		case tag == unifiedTokenInt:
+			value, n := DecodeZigzagVarint(body[cursor:])
+			cursor += n
+			dst = AppendCanonicalInt(dst, value)
+		}
+	}
+	dst, _ = plan.appendStatic(dst, staticPrevious, holes)
+	return dst
 }
 
 // AppendRawRank splices the canonical document at lexical rank onto dst. It
@@ -1922,6 +2284,16 @@ func (v *CommonPrimaryUnifiedLeafView) LookupBodyHashed(
 ) (body []byte, overflow, ok bool) {
 	_, body, overflow, ok = v.LookupBodySlotHashed(hash, key)
 	return body, overflow, ok
+}
+
+// RankAtSlot resolves one admitted stable slot to its lexical base rank.
+// Overlay scans use it once per final edit; ordinary row iteration should keep
+// using AllRows rather than inverting the slot directory per row.
+func (v *CommonPrimaryUnifiedLeafView) RankAtSlot(slot uint8) (int, bool) {
+	if v == nil {
+		return 0, false
+	}
+	return v.env.slotRank(slot)
 }
 
 // ChooseInsertSlotHashed returns the stable slot a new row may claim while

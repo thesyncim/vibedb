@@ -1,6 +1,158 @@
 package driver
 
-import "testing"
+import (
+	stdsql "database/sql"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/thesyncim/vibejson"
+)
+
+func TestExplainReturnsSourceAwarePlanWithoutScanningRows(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	var plan string
+	if err := db.QueryRow(
+		`EXPLAIN SELECT id FROM docs WHERE id = ?`, "x",
+	).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !vibejson.Valid([]byte(plan)) {
+		t.Fatalf("EXPLAIN returned invalid JSON: %s", plan)
+	}
+	for _, want := range []string{
+		`"node":"scan"`,
+		`"collection":"docs"`,
+		`"access_path":"primary-key-point-or-scan"`,
+		`"scope":"source-aware"`,
+		`"predicate":{"kind":"comparison","path":"id","operator":"="}`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN missing %s: %s", want, plan)
+		}
+	}
+}
+
+func TestExplainBindsParametersAndSeesDeclaredIndexes(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"seed","kind":"active"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE INDEX docs_kind ON docs (kind)`); err != nil {
+		t.Fatal(err)
+	}
+	var plan string
+	if err := db.QueryRow(
+		`EXPLAIN SELECT id FROM docs WHERE kind = ? LIMIT ?`, "active", int64(7),
+	).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"access_path":"adaptive-exact-index-or-scan"`,
+		`"limit":7`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN missing %s: %s", want, plan)
+		}
+	}
+}
+
+func TestExplainAnalyzeExecutesAndReportsMeasuredWork(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range []string{
+		`{"id":"a","kind":"active"}`,
+		`{"id":"b","kind":"inactive"}`,
+		`{"id":"c","kind":"active"}`,
+	} {
+		if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var plan string
+	if err := db.QueryRow(
+		`EXPLAIN ANALYZE SELECT id FROM docs WHERE kind = ? ORDER BY id LIMIT ?`,
+		"active", int64(1),
+	).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !vibejson.Valid([]byte(plan)) {
+		t.Fatalf("EXPLAIN ANALYZE returned invalid JSON: %s", plan)
+	}
+	for _, want := range []string{
+		`"analyze":{`,
+		`"actual_access_path":"full-scan"`,
+		`"rows":1`,
+		`"rows_total":3`,
+		`"elapsed_ns":`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN ANALYZE missing %s: %s", want, plan)
+		}
+	}
+}
+
+type explainQueryRower interface {
+	QueryRow(query string, args ...any) *stdsql.Row
+}
+
+func assertExplainAnalyzeJoin(
+	t *testing.T, queryer explainQueryRower, wantRows int,
+) {
+	t.Helper()
+	var plan string
+	if err := queryer.QueryRow(`
+		EXPLAIN ANALYZE
+		SELECT u.name, o.total
+		FROM users AS u
+		JOIN orders AS o ON u.id = o.user_id
+		ORDER BY o.total`).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !vibejson.Valid([]byte(plan)) {
+		t.Fatalf("EXPLAIN ANALYZE JOIN returned invalid JSON: %s", plan)
+	}
+	for _, want := range []string{
+		`"collection":"orders"`,
+		`"analyze":{`,
+		`"rows":` + strconv.Itoa(wantRows),
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN ANALYZE JOIN missing %s: %s", want, plan)
+		}
+	}
+}
+
+func TestExplainAnalyzeJoinRetainsCatalogForExecution(t *testing.T) {
+	db := openTestDB(t)
+	seedJoinTables(t, db)
+
+	t.Run("autocommit", func(t *testing.T) {
+		assertExplainAnalyzeJoin(t, db, 3)
+	})
+	t.Run("explicit-transaction", func(t *testing.T) {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(
+			`INSERT INTO orders VALUES (?)`,
+			`{"id":"pending","user_id":"u2","total":99}`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		assertExplainAnalyzeJoin(t, tx, 4)
+	})
+}
 
 func TestSelectDelegatesFullSQLQuerySurface(t *testing.T) {
 	db := openTestDB(t)

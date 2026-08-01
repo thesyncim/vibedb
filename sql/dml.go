@@ -73,7 +73,12 @@ const DocumentColumn = "$doc"
 // rather than an interface because every consumer switches on the kind anyway,
 // and because the six bodies are already concrete types a caller wants by name.
 type Statement struct {
-	Kind        Kind
+	Kind Kind
+	// Explain marks a SELECT whose caller requested plan output instead of the
+	// target rows. Analyze additionally asks the driver to execute that target
+	// and attach measured runtime work to the plan.
+	Explain     bool
+	Analyze     bool
 	Select      *SelectStmt
 	Insert      *InsertStmt
 	Update      *UpdateStmt
