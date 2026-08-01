@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/query"
@@ -34,7 +35,7 @@ type joinRowSource func(joinRowVisitor) error
 func (c *conn) materializeDurableJoinSource(
 	ctx context.Context,
 	catalog durable.DatabaseSnapshot,
-	statement *sqlast.SelectStmt,
+	driving string,
 	names []string,
 ) (query.Source, error) {
 	rows := func(visit joinRowVisitor) error {
@@ -59,7 +60,7 @@ func (c *conn) materializeDurableJoinSource(
 		}
 		return nil
 	}
-	return c.materializeJoinRows(names, statement.From[0].Name, rows)
+	return c.materializeJoinRows(names, driving, rows)
 }
 
 // materializeTransactionJoinSource is the transactional twin. Every base
@@ -69,7 +70,7 @@ func (c *conn) materializeDurableJoinSource(
 func (c *conn) materializeTransactionJoinSource(
 	ctx context.Context,
 	transaction *tx,
-	statement *sqlast.SelectStmt,
+	driving string,
 	names []string,
 ) (query.Source, error) {
 	rows := func(visit joinRowVisitor) error {
@@ -111,7 +112,7 @@ func (c *conn) materializeTransactionJoinSource(
 		}
 		return nil
 	}
-	return c.materializeJoinRows(names, statement.From[0].Name, rows)
+	return c.materializeJoinRows(names, driving, rows)
 }
 
 func (c *conn) materializeJoinRows(
@@ -119,6 +120,16 @@ func (c *conn) materializeJoinRows(
 	driving string,
 	rows joinRowSource,
 ) (query.Source, error) {
+	if driving == "" && len(names) != 0 {
+		// Prepared statements normally resolve this recursively. Retaining a
+		// deterministic physical fallback keeps this boundary robust if another
+		// relation kind is introduced without its own top-level collection.
+		driving = names[0]
+	}
+	if driving == "" {
+		return query.Source{}, errors.New(
+			"vibedb: query has no physical driving collection")
+	}
 	limit, err := driverQueryMemory(c.exec.Options)
 	if err != nil {
 		return query.Source{}, err
@@ -186,36 +197,51 @@ func driverQueryMemory(options query.ExecOptions) (int64, error) {
 
 func joinTableNames(statement *sqlast.SelectStmt) []string {
 	names := make([]string, 0, len(statement.From))
-	return appendSelectTableNames(names, statement)
+	seen := make(map[string]struct{}, len(statement.From))
+	return appendSelectTableNames(names, seen, statement)
 }
 
-func appendSelectTableNames(names []string, statement *sqlast.SelectStmt) []string {
+func appendSelectTableNames(
+	names []string,
+	seen map[string]struct{},
+	statement *sqlast.SelectStmt,
+) []string {
 	for i := range statement.From {
-		name := statement.From[i].Name
-		duplicate := false
-		for _, prior := range names {
-			if prior == name {
-				duplicate = true
-				break
+		relation := &statement.From[i]
+		switch relation.Kind {
+		case sqlast.RelationCollection:
+			if relation.Name == "" {
+				continue
+			}
+			if _, duplicate := seen[relation.Name]; duplicate {
+				continue
+			}
+			seen[relation.Name] = struct{}{}
+			names = append(names, relation.Name)
+		case sqlast.RelationDerived:
+			if relation.Query != nil {
+				names = appendSelectTableNames(names, seen, relation.Query)
 			}
 		}
-		if !duplicate {
-			names = append(names, name)
-		}
 	}
-	names = appendExprTableNames(names, statement.Where)
+	names = appendExprTableNames(names, seen, statement.Where)
+	names = appendExprTableNames(names, seen, statement.Having)
 	return names
 }
 
-func appendExprTableNames(names []string, e *sqlast.Expr) []string {
+func appendExprTableNames(
+	names []string,
+	seen map[string]struct{},
+	e *sqlast.Expr,
+) []string {
 	if e == nil {
 		return names
 	}
 	if e.Subquery != nil {
-		return appendSelectTableNames(names, e.Subquery)
+		names = appendSelectTableNames(names, seen, e.Subquery)
 	}
 	for _, kid := range e.Kids {
-		names = appendExprTableNames(names, kid)
+		names = appendExprTableNames(names, seen, kid)
 	}
 	return names
 }

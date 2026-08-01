@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -71,12 +72,30 @@ func (c *conn) validateSurfaceContext(
 
 func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
 	for i := range selectStmt.From {
-		name := selectStmt.From[i].Name
-		if _, exists := c.db.tables[name]; !exists {
-			return fmt.Errorf("%w: %q", ErrTableNotFound, name)
+		relation := &selectStmt.From[i]
+		switch relation.Kind {
+		case sqlast.RelationCollection:
+			if _, exists := c.db.tables[relation.Name]; !exists {
+				return fmt.Errorf("%w: %q", ErrTableNotFound, relation.Name)
+			}
+		case sqlast.RelationDerived:
+			// A derived relation has no physical Name. Validate its complete
+			// child tree instead of accidentally consulting the catalog with
+			// the empty sentinel carried by the AST.
+			if relation.Query == nil {
+				return errors.New("vibedb: derived relation has no query")
+			}
+			if err := c.validateSelectTables(relation.Query); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("vibedb: unsupported relation kind %d", relation.Kind)
 		}
 	}
-	return validateExprSubqueries(selectStmt.Where, c.validateSelectTables)
+	if err := validateExprSubqueries(selectStmt.Where, c.validateSelectTables); err != nil {
+		return err
+	}
+	return validateExprSubqueries(selectStmt.Having, c.validateSelectTables)
 }
 
 func validateExprSubqueries(
@@ -87,7 +106,9 @@ func validateExprSubqueries(
 		return nil
 	}
 	if e.Subquery != nil {
-		return validate(e.Subquery)
+		if err := validate(e.Subquery); err != nil {
+			return err
+		}
 	}
 	for _, kid := range e.Kids {
 		if err := validateExprSubqueries(kid, validate); err != nil {

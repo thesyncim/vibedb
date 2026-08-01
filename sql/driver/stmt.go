@@ -195,7 +195,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	if s.conn.tx != nil {
 		if s.query.RequiresCatalog() {
 			source, err := s.conn.materializeTransactionJoinSource(
-				ctx, s.conn.tx, s.tree.Select, s.joinNames)
+				ctx, s.conn.tx, s.query.Collection(), s.joinNames)
 			if err != nil {
 				return nil, err
 			}
@@ -271,7 +271,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 			return nil, snapshotErr
 		}
 		source, materializeErr := s.conn.materializeDurableJoinSource(
-			ctx, catalog, s.tree.Select, s.joinNames)
+			ctx, catalog, s.query.Collection(), s.joinNames)
 		closeErr := catalog.Close()
 		if materializeErr != nil {
 			return nil, materializeErr
