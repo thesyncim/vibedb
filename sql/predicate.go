@@ -409,8 +409,8 @@ func (p *Parser) parseSubqueryScoped(
 	capture *lateralCapture,
 ) (*SelectStmt, error) {
 	start := p.tok.pos
-	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
-		return nil, p.errHere("expected SELECT or WITH ... SELECT in a subquery")
+	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) && p.tok.kind != tokLParen {
+		return nil, p.errHere("expected SELECT, WITH ... SELECT, or a parenthesized query expression in a subquery")
 	}
 	if p.nesting >= maxSubqueryDepth {
 		return nil, p.errfAt(start,
@@ -564,6 +564,11 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	if s.Offset != nil {
 		s.Offset.Pos += delta
 	}
+	var mirroredFirst *SelectStmt
+	if s.Set != nil {
+		mirroredFirst = s.Set.First
+	}
+	shiftSetExpressionPositions(s.Set, delta, mirroredFirst)
 }
 
 func shiftWindowPositions(w *WindowExpr, delta int) {

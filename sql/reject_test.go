@@ -113,7 +113,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"scalar functions", `SELECT lower(a) FROM t`, 12, "not a supported function"},
 		{"arithmetic", `SELECT a FROM t WHERE b + 1 = 2`, 24, "arithmetic"},
 		{"concatenation", `SELECT a FROM t WHERE b || 'x' = 'y'`, 24, "concatenation"},
-		{"set operations", `SELECT a FROM t UNION SELECT b FROM u`, 16, "UNION"},
 		// Parse is the SELECT-only entry point. These three are statements the
 		// dialect does support, through ParseStatement, so the message names
 		// that entry point rather than claiming the engine cannot run them.

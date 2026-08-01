@@ -43,6 +43,11 @@ func FuzzParseSQL(f *testing.F) {
 		`WITH active(id) AS MATERIALIZED (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS NOT MATERIALIZED (SELECT id FROM active) SELECT id FROM selected WHERE id = ?`,
 		`WITH outer_cte AS (WITH inner_cte AS (SELECT id FROM docs) SELECT id FROM inner_cte) SELECT id FROM outer_cte`,
+		`SELECT id AS key FROM live_docs WHERE tenant = ? UNION ALL ` +
+			`SELECT id FROM archive WHERE tenant = ? INTERSECT DISTINCT ` +
+			`(SELECT id FROM allowed ORDER BY id LIMIT ?) ORDER BY key OFFSET ?`,
+		`(SELECT id FROM one EXCEPT ALL SELECT id FROM two) UNION ` +
+			`(SELECT id FROM three UNION DISTINCT SELECT id FROM four)`,
 		`SELECT team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), ` +
 			`SUM(score) OVER (PARTITION BY team ORDER BY score ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`,
 		`SELECT LAG(value, ?, NULL) OVER (ORDER BY seq NULLS FIRST) FROM events`,
@@ -88,7 +93,7 @@ func FuzzParseSQL(f *testing.F) {
 			}
 			// Formatting must not panic either; a driver logs this.
 			_ = parseErr.Error()
-			if len(stmt.Columns) != 0 || len(stmt.From) != 0 {
+			if len(stmt.Columns) != 0 || len(stmt.From) != 0 || stmt.Set != nil {
 				t.Fatal("a rejected statement left fields behind")
 			}
 			return
@@ -122,6 +127,10 @@ func checkStatementInvariantsScoped(
 	outer *LateralSpec,
 ) {
 	t.Helper()
+	if s.Set != nil {
+		checkSetStatementInvariantsScoped(t, s, outer)
+		return
+	}
 	if len(s.Columns) == 0 {
 		t.Fatal("an accepted statement projects nothing")
 	}

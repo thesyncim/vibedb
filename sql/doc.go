@@ -12,8 +12,11 @@
 // express. A construct is accepted only where it maps onto something the
 // executor already has — comparison, membership, null and existence tests,
 // jsonb containment, boolean combination, projection, grouping, the five
-// reductions, ordering, and inner or left equi-joins. Everything else is refused
-// here, with a position and a reason.
+// reductions, ordering, and relational joins. Everything else is refused with
+// a position and a reason. Set expressions are the one deliberately staged
+// boundary: this package now preserves their complete syntax tree, while query
+// lowering must either consume [SelectStmt.Set] or return a typed positioned
+// refusal. It may never lower the mirrored first operand as the whole query.
 //
 // That is a stronger rule than it sounds, and it is the reason for most of the
 // choices below. A parser that accepted a window function and failed at
@@ -30,23 +33,32 @@
 // Keywords are case-insensitive; everything else in the grammar below is
 // literal.
 //
-//	statement    = explain | select | insert | update | delete
+//	statement    = explain | query-statement | insert | update | delete
 //	             | create-table | create-index ;
 
-//	explain      = "EXPLAIN" [ "ANALYZE" ] select ;
+//	explain      = "EXPLAIN" [ "ANALYZE" ] query-statement ;
 //
-//	select       = [ with-clause ] "SELECT" [ "ALL" ] select-list
+//	query-statement = query-expression [ query-tail ] [ ";" ] EOF ;
+//	query-expression = union-except ;
+//	union-except = intersect
+//	               { ( "UNION" | "EXCEPT" ) [ "ALL" | "DISTINCT" ] intersect } ;
+//	intersect    = set-primary
+//	               { "INTERSECT" [ "ALL" | "DISTINCT" ] set-primary } ;
+//	set-primary  = select | "(" query-expression [ query-tail ] ")" ;
+//	query-tail   = "ORDER" "BY" sort-key { "," sort-key }
+//	               [ limit-offset ]
+//	             | limit-offset ;
+//
+//	select       = [ with-clause ] "SELECT" [ "ALL" | "DISTINCT" ] select-list
 //	               "FROM" table-ref { join }
 //	               [ "WHERE" predicate ]
 //	               [ "GROUP" "BY" path { "," path } ]
-//	               [ "HAVING" predicate ]
-//	               [ "ORDER" "BY" sort-key { "," sort-key } ]
-//	               [ limit-offset ] [ ";" ] EOF ;
+//	               [ "HAVING" predicate ] ;
 //
 //	with-clause  = "WITH" cte { "," cte } ;
 //	cte          = name [ "(" name { "," name } ")" ] "AS"
 //	               [ "MATERIALIZED" | "NOT" "MATERIALIZED" ]
-//	               "(" select ")" ;
+//	               "(" query-statement ")" ;
 //
 //	select-list  = result-column { "," result-column } ;
 //	result-column= ( "*" | ident "." "*" | path | aggregate ) [ "AS" name ] ;
@@ -55,7 +67,7 @@
 //
 //	table-ref    = collection-ref | derived-ref ;
 //	collection-ref = name [ [ "AS" ] name ] ;
-//	derived-ref  = "(" select ")" ( "AS" name | name ) ;
+//	derived-ref  = "(" query-statement ")" ( "AS" name | name ) ;
 //	join         = ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN"
 //	               | "RIGHT" [ "OUTER" ] "JOIN"
 //	               | "FULL" [ "OUTER" ] "JOIN" )
@@ -67,12 +79,12 @@
 //	disjunction  = conjunction { "OR" conjunction } ;
 //	conjunction  = negation { "AND" negation } ;
 //	negation     = "NOT" negation | primary ;
-//	primary      = "(" predicate ")" | "EXISTS" "(" select ")" | leaf ;
+//	primary      = "(" predicate ")" | "EXISTS" "(" query-statement ")" | leaf ;
 //	leaf         = left "IS" [ "NOT" ] ( "NULL" | "MISSING" )
-//	             | left [ "NOT" ] "IN" "(" ( select | operand { "," operand } ) ")"
+//	             | left [ "NOT" ] "IN" "(" ( query-statement | operand { "," operand } ) ")"
 //	             | left [ "NOT" ] "BETWEEN" operand "AND" operand
 //	             | left "@>" json-document
-//	             | left comparison ( operand | "(" select ")" ) ;
+//	             | left comparison ( operand | "(" query-statement ")" ) ;
 //	left         = path | aggregate ;          (* aggregate only in HAVING *)
 //	comparison   = "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ;
 //	operand      = string | number | "TRUE" | "FALSE" | "?" ;
@@ -110,6 +122,15 @@
 // [Parse] accepts the SELECT production alone and refuses the rest by naming
 // [ParseStatement], which accepts every statement production implemented by
 // this package.
+//
+// INTERSECT binds tighter than UNION and EXCEPT; UNION and EXCEPT associate
+// left. Omitted set quantifiers mean DISTINCT. Parentheses are retained as
+// [SetGroupExpr] nodes rather than flattened because they own local tails.
+// Final set ORDER BY names the syntactic first operand's outputs by ordinal;
+// operand input paths are not visible at that scope. [SelectStmt.Set] is a cold
+// sidecar, nil on every ordinary SELECT. When non-nil, the ordinary fields are
+// only a shallow mirror of [SetExpression.First] for output metadata, and every
+// consumer must branch on Set before attempting ordinary SELECT lowering.
 //
 // A string literal is single-quoted and a quoted identifier is double-quoted;
 // in both, an embedded quote is written by doubling it. Numbers follow
@@ -380,8 +401,8 @@
 // escape only.
 // implicit correlation from a non-LATERAL derived relation, correlated
 // RIGHT/FULL LATERAL, JOIN LATERAL ... USING, and subqueries in the SELECT list;
-// NATURAL joins and comma-separated FROM items; set operations, recursive and
-// data-modifying common table expressions, CASE,
+// NATURAL joins and comma-separated FROM items; VALUES/TABLE set operands,
+// recursive and data-modifying common table expressions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine
 // evaluates predicates over stored values, not computed expressions); ORDER BY
 // and GROUP BY over output positions or aggregates.

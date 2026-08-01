@@ -23,6 +23,10 @@ const (
 	benchDelete         = `DELETE FROM docs WHERE tenant = ? AND state IN ('done', 'failed')`
 	benchCreateTable    = `CREATE TABLE docs (id STRING PRIMARY KEY, tenant STRING NOT NULL, score NUMBER, meta OBJECT)`
 	benchCreateIndex    = `CREATE INDEX by_tenant_state ON docs (tenant, meta.state)`
+	benchSetExpression  = `(SELECT id AS key FROM live_docs WHERE tenant = ? ORDER BY key LIMIT ?) ` +
+		`UNION ALL SELECT id FROM archive WHERE tenant IN (?, ?) ` +
+		`INTERSECT DISTINCT (SELECT id FROM allowed WHERE active = TRUE LIMIT ?) ` +
+		`ORDER BY key OFFSET ?`
 )
 
 // BenchmarkParse measures a warmed Parser writing into its own arenas, which is
@@ -37,6 +41,7 @@ func BenchmarkParse(b *testing.B) {
 		{"Join", benchJoin},
 		{"GroupedAggregate", benchGrouped},
 		{"Rich", benchRich},
+		{"SetExpression", benchSetExpression},
 	}
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
@@ -121,7 +126,7 @@ func BenchmarkParseOneShot(b *testing.B) {
 // BenchmarkParseRejection measures the refusal path, which a driver exercises
 // whenever an application sends SQL outside the subset.
 func BenchmarkParseRejection(b *testing.B) {
-	const src = `SELECT a FROM t WHERE b LIKE 'x%'`
+	const src = `SELECT a FROM t WHERE b SIMILAR TO 'x%'`
 	var p Parser
 	var stmt SelectStmt
 	b.ReportAllocs()

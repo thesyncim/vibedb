@@ -18,6 +18,9 @@ import (
 // A field that does not appear here is a field the tests cannot see.
 
 func dumpStmt(s *SelectStmt) string {
+	if s.Set != nil {
+		return dumpSetStmt(s)
+	}
 	var b strings.Builder
 	if s.With != nil {
 		b.WriteString("with")

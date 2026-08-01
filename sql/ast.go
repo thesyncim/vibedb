@@ -81,6 +81,14 @@ type SelectStmt struct {
 	// ParamBase is the first outer-statement placeholder occupied by this
 	// statement when it is a subquery. It is zero for a top-level statement.
 	ParamBase int
+
+	// Set is the cold query-expression sidecar. It is nil for an ordinary
+	// SELECT, preserving the existing direct lowering path. When non-nil, this
+	// SelectStmt mirrors Set.First only for stable output metadata; Params is
+	// global and Set owns all executable leaves plus the exact binary/group tree
+	// and query-expression tail. A consumer MUST branch on Set before lowering
+	// any ordinary fields. Ignoring it would execute only the first operand.
+	Set *SetExpression
 }
 
 // A WithClause owns the non-recursive common table expressions declared for

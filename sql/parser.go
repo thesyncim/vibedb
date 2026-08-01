@@ -23,6 +23,11 @@ const maxExprDepth = 64
 // arena, so it needs a separate call-stack bound.
 const maxSubqueryDepth = 32
 
+// maxSetExpressionDepth bounds authored parenthesized query expressions.
+// Unlike predicate parentheses, every level owns semantic scope and must be
+// retained as a group node, so this has its own recursion bound.
+const maxSetExpressionDepth = 64
+
 // maxParams bounds the placeholders in one statement, so a pathological input
 // cannot make the parser mint ordinals until the arena exhausts memory. It is
 // well past any statement a driver would prepare.
@@ -162,6 +167,10 @@ type Parser struct {
 	// lateral is allocated only after an accepted LATERAL token. It owns both
 	// cold arenas and the transient lexical links installed on a child parser.
 	lateral *lateralParserState
+	// set is allocated only after a top-level set operator or parenthesized
+	// query expression is encountered. Ordinary SELECT parsing therefore keeps
+	// no set-node arenas or scratch slices alive.
+	set *setParserState
 	// existsProjection allows SELECT 1 (and equivalent literals) only while
 	// parsing an EXISTS body. EXISTS never observes its output value, so
 	// lowering the literal to a whole-document projection avoids inventing a
@@ -197,6 +206,7 @@ type lateralCapture struct {
 	owner         *Parser
 	bindingBase   int
 	referenceBase int
+	forwardBase   int
 	source        int
 	pos           int
 	scope         lateralRangeScope
@@ -472,6 +482,9 @@ func (p *Parser) reset(src string) {
 	if p.lateral != nil {
 		p.lateral.reset()
 	}
+	if p.set != nil {
+		p.set.reset()
+	}
 
 	p.lx = lexer{
 		src: src, cancel: p.cancel,
@@ -658,6 +671,10 @@ func (p *Parser) internToken(t token) string {
 // --- statement -------------------------------------------------------------
 
 func (p *Parser) parseStatement() error {
+	statementPos := p.tok.pos
+	if p.tok.kind == tokLParen {
+		return p.parseSetStatement(statementPos)
+	}
 	hasWith := p.atKeyword(kwWith)
 	if hasWith {
 		if err := p.parseWithClause(); err != nil {
@@ -737,6 +754,9 @@ func (p *Parser) parseStatement() error {
 	if err := p.parseLimitOffset(); err != nil {
 		return err
 	}
+	if isSetOperatorToken(p.tok) {
+		return p.parseSetStatement(statementPos)
+	}
 	if err := p.expectEnd(); err != nil {
 		return err
 	}
@@ -774,10 +794,6 @@ func (p *Parser) expectSelect() error {
 // forwards a multi-statement string is a well-known injection shape, and
 // silently running only the first half of one would be worse than refusing it.
 func (p *Parser) expectEnd() error {
-	switch {
-	case p.atKeyword(kwUnion), p.atKeyword(kwIntersect), p.atKeyword(kwExcept):
-		return p.errHere("set operations (UNION, INTERSECT, EXCEPT) are not supported")
-	}
 	if p.tok.kind == tokSemicolon {
 		p.advance()
 		if p.tok.kind != tokEOF {
@@ -2106,6 +2122,7 @@ func (p *Parser) beginLateralCapture(pos int) *lateralCapture {
 	capture.owner = p
 	capture.bindingBase = len(state.bindingScratch)
 	capture.referenceBase = len(state.referenceScratch)
+	capture.forwardBase = len(state.forward)
 	capture.source = len(p.from)
 	capture.pos = pos
 	capture.scope = lateralRangeScope{
