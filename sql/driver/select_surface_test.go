@@ -1,6 +1,8 @@
 package driver
 
 import (
+	stdsql "database/sql"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -96,6 +98,60 @@ func TestExplainAnalyzeExecutesAndReportsMeasuredWork(t *testing.T) {
 			t.Errorf("EXPLAIN ANALYZE missing %s: %s", want, plan)
 		}
 	}
+}
+
+type explainQueryRower interface {
+	QueryRow(query string, args ...any) *stdsql.Row
+}
+
+func assertExplainAnalyzeJoin(
+	t *testing.T, queryer explainQueryRower, wantRows int,
+) {
+	t.Helper()
+	var plan string
+	if err := queryer.QueryRow(`
+		EXPLAIN ANALYZE
+		SELECT u.name, o.total
+		FROM users AS u
+		JOIN orders AS o ON u.id = o.user_id
+		ORDER BY o.total`).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !vibejson.Valid([]byte(plan)) {
+		t.Fatalf("EXPLAIN ANALYZE JOIN returned invalid JSON: %s", plan)
+	}
+	for _, want := range []string{
+		`"collection":"orders"`,
+		`"analyze":{`,
+		`"rows":` + strconv.Itoa(wantRows),
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN ANALYZE JOIN missing %s: %s", want, plan)
+		}
+	}
+}
+
+func TestExplainAnalyzeJoinRetainsCatalogForExecution(t *testing.T) {
+	db := openTestDB(t)
+	seedJoinTables(t, db)
+
+	t.Run("autocommit", func(t *testing.T) {
+		assertExplainAnalyzeJoin(t, db, 3)
+	})
+	t.Run("explicit-transaction", func(t *testing.T) {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(
+			`INSERT INTO orders VALUES (?)`,
+			`{"id":"pending","user_id":"u2","total":99}`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		assertExplainAnalyzeJoin(t, tx, 4)
+	})
 }
 
 func TestSelectDelegatesFullSQLQuerySurface(t *testing.T) {
