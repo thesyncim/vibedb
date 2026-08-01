@@ -391,7 +391,7 @@ func BenchmarkUnifiedCopyThenParseProbe(b *testing.B) {
 	reportP50(b, lat)
 }
 
-func benchmarkScanAll(b *testing.B, highCardinality bool) {
+func benchmarkUnifiedRenderedScan(b *testing.B, highCardinality, consumeAllBytes bool) {
 	n := 100_000
 	if testing.Short() {
 		n = 10_000
@@ -403,20 +403,56 @@ func benchmarkScanAll(b *testing.B, highCardinality bool) {
 		b.Fatal(err)
 	}
 	defer snapshot.Close()
-	var sink byte
-	rows := 0
-	visit := func(key, value []byte) error {
-		sink ^= value[0] ^ value[len(value)-1]
-		rows++
+
+	// Prime the snapshot-owned splice scratch and count the actual canonical
+	// bytes returned by this corpus. Cold growth is bounded setup; every gate
+	// below measures and enforces the allocation-free steady state.
+	renderedBytes := int64(0)
+	warmRows := 0
+	if _, err := snapshot.RangeRawBuffer(nil, func(_ []byte, value []byte) error {
+		renderedBytes += int64(len(value))
+		warmRows++
 		return nil
-	}
-	// Prime the snapshot-owned splice scratch. Cold growth is bounded setup;
-	// repeated scans are the steady-state lane and must allocate nothing.
-	if _, err := snapshot.RangeRawBuffer(nil, visit); err != nil {
+	}); err != nil {
 		b.Fatal(err)
 	}
+	if warmRows != n {
+		b.Fatalf("warm scan visited %d want %d", warmRows, n)
+	}
+
+	var sink byte
+	rows := 0
+	var visit func(key, value []byte) error
+	if consumeAllBytes {
+		visit = func(_ []byte, value []byte) error {
+			sink ^= touchUnifiedScanAllBytes(value)
+			rows++
+			return nil
+		}
+	} else {
+		visit = func(_ []byte, value []byte) error {
+			sink ^= value[0] ^ value[len(value)-1]
+			rows++
+			return nil
+		}
+	}
+
+	var allocationErr error
+	allocs := testing.AllocsPerRun(5, func() {
+		rows = 0
+		_, allocationErr = snapshot.RangeRawBuffer(nil, visit)
+	})
+	if allocationErr != nil {
+		b.Fatalf("allocation probe: %v", allocationErr)
+	}
 	if rows != n {
-		b.Fatalf("warm scan visited %d want %d", rows, n)
+		b.Fatalf("allocation probe visited %d want %d", rows, n)
+	}
+	if allocs != 0 {
+		b.Fatalf("warmed scan allocated %.2f times, want 0", allocs)
+	}
+	if consumeAllBytes {
+		b.SetBytes(renderedBytes)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -431,21 +467,43 @@ func benchmarkScanAll(b *testing.B, highCardinality bool) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/doc")
+	if consumeAllBytes {
+		b.ReportMetric(float64(renderedBytes)/float64(n), "bytes/doc")
+	}
 	benchScanSink = sink
+}
+
+func touchUnifiedScanAllBytes(value []byte) byte {
+	var sink byte
+	for _, b := range value {
+		sink ^= b
+	}
+	return sink
 }
 
 var benchScanSink byte
 
-// The two scan gates exercise the sole durable format at both dictionary
-// extremes. Low cardinality stresses templated/dictionary reconstruction;
-// high cardinality prevents a fast shared-value path from hiding row-render
-// regressions.
-func BenchmarkUnifiedScanAllLowCardinality(b *testing.B) {
-	benchmarkScanAll(b, false)
+// The canonical-render gates exercise exact JSON reconstruction at both
+// dictionary extremes. Their first+last-byte sink prevents dead-code removal
+// without pretending to measure consumption of the whole returned document.
+func BenchmarkUnifiedCanonicalRenderLowCardinality(b *testing.B) {
+	benchmarkUnifiedRenderedScan(b, false, false)
 }
 
-func BenchmarkUnifiedScanAllHighCardinality(b *testing.B) {
-	benchmarkScanAll(b, true)
+func BenchmarkUnifiedCanonicalRenderHighCardinality(b *testing.B) {
+	benchmarkUnifiedRenderedScan(b, true, false)
+}
+
+// The all-bytes gates include the same canonical renderer, then serially touch
+// every returned byte. They report the actual bytes per document and fail if a
+// warmed scan allocates, making this the honest local analogue of the
+// cross-engine BenchmarkScanAllBytes lane.
+func BenchmarkUnifiedScanAllBytesLowCardinality(b *testing.B) {
+	benchmarkUnifiedRenderedScan(b, false, true)
+}
+
+func BenchmarkUnifiedScanAllBytesHighCardinality(b *testing.B) {
+	benchmarkUnifiedRenderedScan(b, true, true)
 }
 
 func benchmarkFilterEq(b *testing.B, path, needle string) {

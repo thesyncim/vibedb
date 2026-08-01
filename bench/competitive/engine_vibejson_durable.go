@@ -10,31 +10,89 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// durableCollection is the subset of store/durable's collection type this
-// harness uses. As with heapCollection, it is spelled as a local interface so
-// the in-flight rename of the concrete type cannot break the benchmark.
-type durableCollection interface {
-	Put(key []byte, src []byte) (bool, error)
-	Delete(key []byte) (bool, error)
-	AppendRaw(dst []byte, key []byte) ([]byte, bool, error)
-	RangeRawCurrentBuffer(
-		scratch []byte, fn func(key, value []byte) error,
-	) ([]byte, error)
-	Snapshot() (*durable.Snapshot, error)
-	Len() uint64
-	Stats() durable.Stats
-	Flush() error
-	Close() error
-}
+// The durable ordered-primary format accepts keys up to 256 bytes. Keep each
+// benchmark client one fixed buffer of exactly that bound: valid operations
+// never allocate for string conversion and invalid input cannot grow retained
+// adapter memory. AppendRaw, Put, and Delete borrow the key only for their
+// call, so the client may overwrite this buffer at its next operation.
+const vibeDurableKeyBytes = 256
 
 type vibeDurable struct {
 	cfg     Config
 	path    string
 	file    *os.File
-	coll    durableCollection
+	coll    *durable.Collection
 	snap    *durable.Snapshot
 	exec    query.Exec
 	scratch []byte
+	keyBuf  [vibeDurableKeyBytes]byte
+	scan    *vibeDurableScanState
+}
+
+func vibeDurablePointKey(
+	buf *[vibeDurableKeyBytes]byte,
+	key string,
+) ([]byte, error) {
+	if len(key) > len(buf) {
+		return nil, durable.ErrKeyTooLarge
+	}
+	copy(buf[:], key)
+	return buf[:len(key)], nil
+}
+
+// vibeDurableScanState owns the reconstruction buffer and callbacks for one
+// benchmark client. The callback method values are bound once when the session
+// is created, rather than rebuilt as escaping closures on every scan.
+type vibeDurableScanState struct {
+	scratch []byte
+	rows    int
+	sink    byte
+	first   func(key, value []byte) error
+	all     func(key, value []byte) error
+}
+
+func newVibeDurableScanState() *vibeDurableScanState {
+	state := new(vibeDurableScanState)
+	state.first = state.consumeFirstByte
+	state.all = state.consumeAllBytes
+	return state
+}
+
+func (s *vibeDurableScanState) consumeFirstByte(_ []byte, value []byte) error {
+	if len(value) > 0 {
+		s.sink ^= value[0]
+	}
+	s.rows++
+	return nil
+}
+
+func (s *vibeDurableScanState) consumeAllBytes(_ []byte, value []byte) error {
+	s.sink ^= touchAll(value)
+	s.rows++
+	return nil
+}
+
+// rangeVibeDurableCurrent is the adapter's single dependency on the durable
+// current-scan API. Keeping that boundary in one place makes scan API changes
+// mechanical without reintroducing per-call adapter closures.
+func rangeVibeDurableCurrent(
+	coll *durable.Collection,
+	scratch []byte,
+	visit func(key, value []byte) error,
+) ([]byte, error) {
+	return coll.RangeRawCurrentBuffer(scratch, visit)
+}
+
+func (s *vibeDurableScanState) run(
+	coll *durable.Collection,
+	visit func(key, value []byte) error,
+) (int, error) {
+	s.rows = 0
+	s.sink = 0
+	scratch, err := rangeVibeDurableCurrent(coll, s.scratch, visit)
+	s.scratch = scratch
+	foldScanSink(s.sink)
+	return s.rows, err
 }
 
 func newVibeDurable(cfg Config) (Engine, error) {
@@ -48,7 +106,7 @@ func newVibeDurable(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.StorageProfile = profile.Profile
-	return &vibeDurable{cfg: cfg}, nil
+	return &vibeDurable{cfg: cfg, scan: newVibeDurableScanState()}, nil
 }
 
 func (v *vibeDurable) Name() string { return "vibejson-durable" }
@@ -280,7 +338,11 @@ func (v *vibeDurable) releaseSnapshot() {
 }
 
 func (v *vibeDurable) Get(dst []byte, key string) ([]byte, error) {
-	out, ok, err := v.coll.AppendRaw(dst, []byte(key))
+	keyBytes, err := vibeDurablePointKey(&v.keyBuf, key)
+	if err != nil {
+		return dst, err
+	}
+	out, ok, err := v.coll.AppendRaw(dst, keyBytes)
 	if err != nil {
 		return dst, err
 	}
@@ -293,7 +355,11 @@ func (v *vibeDurable) Get(dst []byte, key string) ([]byte, error) {
 func (v *vibeDurable) Put(key string, doc []byte) error {
 	// See snapshot: a write path must not hold a snapshot lease open.
 	v.releaseSnapshot()
-	_, err := v.coll.Put([]byte(key), doc)
+	keyBytes, err := vibeDurablePointKey(&v.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	_, err = v.coll.Put(keyBytes, doc)
 	return err
 }
 
@@ -301,7 +367,11 @@ func (v *vibeDurable) Upsert(key string, doc []byte) error { return v.Put(key, d
 
 func (v *vibeDurable) Delete(key string) error {
 	v.releaseSnapshot()
-	deleted, err := v.coll.Delete([]byte(key))
+	keyBytes, err := vibeDurablePointKey(&v.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	deleted, err := v.coll.Delete(keyBytes)
 	if err == nil && !deleted {
 		return fmt.Errorf("missing key %q", key)
 	}
@@ -309,35 +379,15 @@ func (v *vibeDurable) Delete(key string) error {
 }
 
 func (v *vibeDurable) Scan() (int, error) {
-	n := 0
-	var sink byte
-	scratch, err := v.coll.RangeRawCurrentBuffer(v.scratch, func(key, value []byte) error {
-		if len(value) > 0 {
-			sink ^= value[0]
-		}
-		n++
-		return nil
-	})
-	v.scratch = scratch
-	foldScanSink(sink)
-	return n, err
+	return v.scan.run(v.coll, v.scan.first)
 }
 
 func (v *vibeDurable) ScanAllBytes() (int, error) {
-	n := 0
-	var sink byte
-	scratch, err := v.coll.RangeRawCurrentBuffer(v.scratch, func(key, value []byte) error {
-		sink ^= touchAll(value)
-		n++
-		return nil
-	})
-	v.scratch = scratch
-	foldScanSink(sink)
-	return n, err
+	return v.scan.run(v.coll, v.scan.all)
 }
 
 func (v *vibeDurable) Visit(fn func(key string, value []byte) error) error {
-	scratch, err := v.coll.RangeRawCurrentBuffer(v.scratch, func(key, value []byte) error {
+	scratch, err := rangeVibeDurableCurrent(v.coll, v.scratch, func(key, value []byte) error {
 		return fn(string(key), value)
 	})
 	v.scratch = scratch
@@ -493,15 +543,20 @@ func (v *vibeDurable) Close() error {
 }
 
 // vibeDurableSession is one client's private view onto the shared durable
-// collection. The collection handle is shared and concurrency-safe; only the
-// current-scan reconstruction buffer is per caller.
+// collection. The collection handle is shared and concurrency-safe; the key
+// conversion and current-scan reconstruction buffers are per caller.
 type vibeDurableSession struct {
-	coll    durableCollection
-	scratch []byte
+	coll   *durable.Collection
+	keyBuf [vibeDurableKeyBytes]byte
+	scan   *vibeDurableScanState
 }
 
 func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
-	out, ok, err := s.coll.AppendRaw(dst, []byte(key))
+	keyBytes, err := vibeDurablePointKey(&s.keyBuf, key)
+	if err != nil {
+		return dst, err
+	}
+	out, ok, err := s.coll.AppendRaw(dst, keyBytes)
 	if err != nil {
 		return dst, err
 	}
@@ -512,14 +567,22 @@ func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
 }
 
 func (s *vibeDurableSession) Put(key string, doc []byte) error {
-	_, err := s.coll.Put([]byte(key), doc)
+	keyBytes, err := vibeDurablePointKey(&s.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	_, err = s.coll.Put(keyBytes, doc)
 	return err
 }
 
 func (s *vibeDurableSession) Upsert(key string, doc []byte) error { return s.Put(key, doc) }
 
 func (s *vibeDurableSession) Delete(key string) error {
-	deleted, err := s.coll.Delete([]byte(key))
+	keyBytes, err := vibeDurablePointKey(&s.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	deleted, err := s.coll.Delete(keyBytes)
 	if err == nil && !deleted {
 		return fmt.Errorf("missing key %q", key)
 	}
@@ -527,19 +590,10 @@ func (s *vibeDurableSession) Delete(key string) error {
 }
 
 func (s *vibeDurableSession) ScanAllBytes() (int, error) {
-	n := 0
-	var sink byte
-	scratch, err := s.coll.RangeRawCurrentBuffer(s.scratch, func(key, value []byte) error {
-		sink ^= touchAll(value)
-		n++
-		return nil
-	})
-	s.scratch = scratch
-	foldScanSink(sink)
-	return n, err
+	return s.scan.run(s.coll, s.scan.all)
 }
 
-// Session vends a per-client scan buffer over the shared collection.
+// Session vends per-client key and scan buffers over the shared collection.
 func (v *vibeDurable) Session(int) EngineSession {
-	return &vibeDurableSession{coll: v.coll}
+	return &vibeDurableSession{coll: v.coll, scan: newVibeDurableScanState()}
 }

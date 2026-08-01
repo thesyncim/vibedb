@@ -198,3 +198,122 @@ func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 		)
 	}
 }
+
+func TestVibeDurableScanAllBytesWarmedAllocatesNothing(t *testing.T) {
+	factory, ok := FactoryNamed("vibejson-durable")
+	if !ok {
+		t.Fatal("vibejson-durable factory missing")
+	}
+	corpus := Corpus(2_048)
+	engine, _, cleanup := newLoadedCorpus(t, factory, Config{
+		Durability: DurabilityBufferedVisible,
+	}, corpus)
+	defer cleanup()
+
+	session := engine.Session(0)
+	for _, test := range []struct {
+		name string
+		scan func() (int, error)
+	}{
+		{name: "engine", scan: engine.ScanAllBytes},
+		{name: "session", scan: session.ScanAllBytes},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rows, err := test.scan()
+			if err != nil {
+				t.Fatalf("warm ScanAllBytes: %v", err)
+			}
+			if rows != len(corpus) {
+				t.Fatalf("warm ScanAllBytes visited %d rows, want %d", rows, len(corpus))
+			}
+
+			var scanErr error
+			allocs := testing.AllocsPerRun(20, func() {
+				rows, scanErr = test.scan()
+			})
+			if scanErr != nil {
+				t.Fatalf("warmed ScanAllBytes: %v", scanErr)
+			}
+			if rows != len(corpus) {
+				t.Fatalf("warmed ScanAllBytes visited %d rows, want %d", rows, len(corpus))
+			}
+			if allocs != 0 {
+				t.Fatalf("warmed ScanAllBytes allocated %.2f times, want 0", allocs)
+			}
+		})
+	}
+}
+
+// TestVibeDurablePointMutationWarmedAllocations keeps the benchmark adapter
+// honest: its string key conversion lives in caller-owned retained storage, so
+// the only steady allocation is durable's immutable state publication. Both
+// the single-client handle and a concurrent-harness session own their scratch.
+func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
+	factory, ok := FactoryNamed("vibejson-durable")
+	if !ok {
+		t.Fatal("vibejson-durable factory missing")
+	}
+	engine, _, cleanup := newLoaded(t, factory, Config{
+		Durability: DurabilityBufferedVisible,
+	})
+	defer cleanup()
+
+	for _, test := range []struct {
+		name   string
+		handle EngineSession
+		key    string
+		value  []byte
+	}{
+		{
+			name: "engine", handle: engine,
+			key: docs[100].Key, value: docs[100].JSON,
+		},
+		{
+			name: "session", handle: engine.Session(1),
+			key: docs[101].Key, value: docs[101].JSON,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.handle.Put(test.key, test.value); err != nil {
+				t.Fatalf("warm Put: %v", err)
+			}
+			readBuf := make([]byte, 0, len(test.value)+64)
+			if _, err := test.handle.Get(readBuf[:0], test.key); err != nil {
+				t.Fatalf("warm Get: %v", err)
+			}
+			getAllocs := testing.AllocsPerRun(50, func() {
+				if _, err := test.handle.Get(readBuf[:0], test.key); err != nil {
+					panic(err)
+				}
+			})
+			if getAllocs != 0 {
+				t.Fatalf("warmed Get allocated %.2f times, want 0", getAllocs)
+			}
+			putAllocs := testing.AllocsPerRun(50, func() {
+				if err := test.handle.Put(test.key, test.value); err != nil {
+					panic(err)
+				}
+			})
+			if putAllocs != 1 {
+				t.Fatalf(
+					"warmed Put allocated %.2f times, want 1 published state",
+					putAllocs,
+				)
+			}
+			deleteRestoreAllocs := testing.AllocsPerRun(50, func() {
+				if err := test.handle.Delete(test.key); err != nil {
+					panic(err)
+				}
+				if err := test.handle.Upsert(test.key, test.value); err != nil {
+					panic(err)
+				}
+			})
+			if deleteRestoreAllocs != 2 {
+				t.Fatalf(
+					"warmed delete+restore allocated %.2f times, want 2 published states",
+					deleteRestoreAllocs,
+				)
+			}
+		})
+	}
+}
