@@ -21,6 +21,17 @@ func (e *FeatureNotSupportedError) Unwrap() error {
 func newFeatureNotSupportedError(
 	src string, pos int, reason string,
 ) *FeatureNotSupportedError {
+	return NewFeatureNotSupportedError(src, pos, reason)
+}
+
+// NewFeatureNotSupportedError constructs a typed, source-positioned refusal
+// for a valid SQL shape that a lowering or execution layer cannot implement
+// faithfully yet. It lets downstream SQL consumers preserve the parser's
+// FeatureNotSupportedError contract and protocol adapters' SQLSTATE 0A000
+// mapping without matching error prose.
+func NewFeatureNotSupportedError(
+	src string, pos int, reason string,
+) *FeatureNotSupportedError {
 	return &FeatureNotSupportedError{ParseError: parseErrorAt(src, pos, reason)}
 }
 

@@ -184,6 +184,26 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 	if len(s.tree.From) <= 1 {
 		return nil
 	}
+	// The parser exposes correlated occurrences through a cold LateralSpec
+	// sidecar. Until this executor has a parameterized APPLY input, compiling
+	// those paths as ordinary child-local paths would silently read the wrong
+	// values. Refuse before allocating join state or preparing any child. An
+	// explicitly LATERAL but decorrelated child is exactly the ordinary derived
+	// relation plan and remains safe.
+	for i := range s.tree.From {
+		ref := &s.tree.From[i]
+		if ref.Lateral == nil {
+			continue
+		}
+		if ref.Lateral.Decorrelated && len(ref.Lateral.Bindings) == 0 &&
+			len(ref.Lateral.References) == 0 {
+			continue
+		}
+		return sqlast.NewFeatureNotSupportedError(
+			s.text, ref.Lateral.Pos,
+			"correlated LATERAL execution is not supported yet; remove the outer reference or use a decorrelated derived relation",
+		)
+	}
 	j := new(statementRelationJoin)
 	s.ensureNested().relationJoin = j
 	j.operands = make([]relationJoinOperand, len(s.tree.From))

@@ -262,6 +262,34 @@ func dumpWindowBound(b *strings.Builder, bound WindowFrameBound) {
 }
 
 func dumpTable(b *strings.Builder, t *TableRef) {
+	if t.Lateral != nil {
+		b.WriteString("lateral")
+		if t.Lateral.Decorrelated {
+			b.WriteString("-decorrelated")
+		}
+		b.WriteByte('[')
+		for i := range t.Lateral.Bindings {
+			if i != 0 {
+				b.WriteByte(',')
+			}
+			binding := &t.Lateral.Bindings[i]
+			fmt.Fprintf(b, "%d=depth%d/source%d:", i+1, binding.Depth, binding.Source)
+			path := PathExpr{Segments: binding.Segments}
+			b.WriteString(path.Spec())
+		}
+		if len(t.Lateral.References) != 0 {
+			b.WriteString(";refs=")
+			for i := range t.Lateral.References {
+				if i != 0 {
+					b.WriteByte(',')
+				}
+				reference := &t.Lateral.References[i]
+				fmt.Fprintf(b, "%d@", reference.Binding+1)
+				dumpPath(b, reference.Path)
+			}
+		}
+		b.WriteString("]-")
+	}
 	switch t.Kind {
 	case RelationCollection:
 		b.WriteString(t.Name)
@@ -295,9 +323,9 @@ func dumpTable(b *strings.Builder, t *TableRef) {
 	}
 }
 
-// dumpPath renders a path as "<source index>:<engine path spec>", so a case
-// asserts both which range variable a path bound to and the exact spelling the
-// engine's path compiler will receive.
+// dumpPath renders a path as "<source index>:<engine path spec>". Correlated
+// occurrences remain ordinary-sized PathExpr nodes; dumpTable renders their
+// exact occurrence-to-slot mapping from the relation's LateralSpec sidecar.
 func dumpPath(b *strings.Builder, p *PathExpr) {
 	if p == nil {
 		b.WriteString("<nil>")
@@ -334,6 +362,9 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 			b.WriteString(" (")
 			b.WriteString(dumpStmt(e.Subquery))
 			b.WriteByte(')')
+		} else if e.RightPath != nil {
+			b.WriteByte(' ')
+			dumpPath(b, e.RightPath)
 		} else {
 			b.WriteByte(' ')
 			dumpOperand(b, e.Value)

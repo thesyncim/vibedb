@@ -159,6 +159,9 @@ type Parser struct {
 	// arena and scratch slice behind one pointer preserves the ordinary parser's
 	// state size and allocation profile.
 	window *windowParserState
+	// lateral is allocated only after an accepted LATERAL token. It owns both
+	// cold arenas and the transient lexical links installed on a child parser.
+	lateral *lateralParserState
 	// existsProjection allows SELECT 1 (and equivalent literals) only while
 	// parsing an EXISTS body. EXISTS never observes its output value, so
 	// lowering the literal to a whole-document projection avoids inventing a
@@ -181,6 +184,81 @@ type cteScope struct {
 	outer *cteScope
 }
 
+// lateralRangeScope is parse-time-only lexical visibility. limit freezes the
+// parent's FROM prefix at the LATERAL token, even though that slice grows as
+// later joins are parsed.
+type lateralRangeScope struct {
+	parser *Parser
+	limit  int
+	outer  *lateralRangeScope
+}
+
+type lateralCapture struct {
+	owner         *Parser
+	bindingBase   int
+	referenceBase int
+	source        int
+	pos           int
+	scope         lateralRangeScope
+}
+
+type lateralForwardCandidate struct {
+	path   *PathExpr
+	alias  string
+	source int
+}
+
+type lateralScratchBinding struct {
+	binding LateralBinding
+	path    *PathExpr
+}
+
+type lateralScratchReference struct {
+	path    *PathExpr
+	binding int
+}
+
+type lateralParserState struct {
+	captures   chunkArena[lateralCapture]
+	bindings   chunkArena[LateralBinding]
+	specs      chunkArena[LateralSpec]
+	references chunkArena[LateralReference]
+
+	bindingScratch   []lateralScratchBinding
+	referenceScratch []lateralScratchReference
+	forward          []lateralForwardCandidate
+	outerRanges      *lateralRangeScope
+	capture          *lateralCapture
+	sized            bool
+}
+
+func (s *lateralParserState) reset() {
+	if !s.sized {
+		s.captures.first = 2
+		s.bindings.first = 4
+		s.specs.first = 2
+		s.references.first = 8
+		s.sized = true
+	}
+	s.captures.rewind()
+	s.bindings.rewind()
+	s.specs.rewind()
+	s.references.rewind()
+	s.bindingScratch = s.bindingScratch[:0]
+	s.referenceScratch = s.referenceScratch[:0]
+	s.forward = s.forward[:0]
+	s.outerRanges = nil
+	s.capture = nil
+}
+
+func (p *Parser) lateralState() *lateralParserState {
+	if p.lateral == nil {
+		p.lateral = new(lateralParserState)
+		p.lateral.reset()
+	}
+	return p.lateral
+}
+
 // A pendingPath is a path whose leading identifier has been read but not yet
 // decided to be a range variable or a field.
 //
@@ -199,7 +277,7 @@ type pendingPath struct {
 // Parse parses one SELECT statement into dst, reusing p's storage. See
 // [Parser] for the lifetime dst inherits.
 func (p *Parser) Parse(dst *SelectStmt, src string) error {
-	return p.parseSelectText(dst, src, nil, 0, false)
+	return p.parseSelectText(dst, src, nil, nil, nil, 0, false)
 }
 
 // parseSelectText is Parse with the lexical context a nested SELECT inherits.
@@ -208,7 +286,9 @@ func (p *Parser) Parse(dst *SelectStmt, src string) error {
 func (p *Parser) parseSelectText(
 	dst *SelectStmt,
 	src string,
-	outer *cteScope,
+	outerCTEs *cteScope,
+	outerRanges *lateralRangeScope,
+	capture *lateralCapture,
 	nesting int,
 	existsProjection bool,
 ) error {
@@ -216,10 +296,15 @@ func (p *Parser) parseSelectText(
 	if err := validateStatementText(src, p.cancel); err != nil {
 		return err
 	}
-	p.outerCTEs = outer
+	p.outerCTEs = outerCTEs
 	p.nesting = nesting
 	p.existsProjection = existsProjection
 	p.reset(src)
+	if outerRanges != nil || capture != nil {
+		state := p.lateralState()
+		state.outerRanges = outerRanges
+		state.capture = capture
+	}
 	p.out = dst
 	if err := p.parseStatement(); err != nil {
 		// The half-parsed statement is thrown away rather than returned
@@ -383,6 +468,9 @@ func (p *Parser) reset(src string) {
 	}
 	if p.window != nil {
 		p.window.reset()
+	}
+	if p.lateral != nil {
+		p.lateral.reset()
 	}
 
 	p.lx = lexer{
@@ -1773,8 +1861,19 @@ func (p *Parser) parseJoin() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if p.lateral != nil {
+		if err := p.rejectLateralForwardAlias(ref.Alias, len(p.from)); err != nil {
+			return false, err
+		}
+	}
 	var cond *JoinCond
 	if join != JoinCross {
+		if ref.Lateral != nil && p.atKeyword(kwUsing) {
+			return false, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"JOIN LATERAL ... USING is not supported yet; write the equivalent ON predicate explicitly",
+			)
+		}
 		if p.acceptKeyword(kwUsing) {
 			cond, err = p.parseUsingCond(len(p.from))
 		} else {
@@ -1895,11 +1994,21 @@ func (p *Parser) boundPath(path *PathExpr, source int) *PathExpr {
 func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	ref := TableRef{Join: join, Pos: p.tok.pos}
 	if p.atKeyword(kwLateral) {
-		return ref, newFeatureNotSupportedError(
-			p.lx.src,
-			p.tok.pos,
-			"LATERAL derived tables are not supported: derived FROM queries are uncorrelated and execute once",
-		)
+		lateralPos := p.tok.pos
+		if join == JoinNone {
+			return ref, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"a leading LATERAL item has no preceding explicit FROM source in this dialect; write CROSS JOIN LATERAL after the source it may reference",
+			)
+		}
+		p.advance()
+		if p.tok.kind != tokLParen {
+			return ref, p.errHere(
+				"LATERAL must be followed by a parenthesized SELECT derived table",
+			)
+		}
+		ref.Pos = p.tok.pos
+		return p.parseDerivedTableRef(ref, p.beginLateralCapture(lateralPos))
 	}
 	switch p.tok.kind {
 	case tokIdent:
@@ -1908,7 +2017,7 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 		}
 	case tokQuotedIdent:
 	case tokLParen:
-		return p.parseDerivedTableRef(ref)
+		return p.parseDerivedTableRef(ref, nil)
 	default:
 		return ref, p.errHere("expected a collection name")
 	}
@@ -1942,12 +2051,21 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 // The nested statement uses the same child-parser path as predicate subqueries,
 // which preserves independent FROM scope, arena ownership, nesting limits,
 // cancellation, position rebasing, and placeholder accounting in one place.
-func (p *Parser) parseDerivedTableRef(ref TableRef) (TableRef, error) {
+func (p *Parser) parseDerivedTableRef(
+	ref TableRef,
+	capture *lateralCapture,
+) (TableRef, error) {
 	p.advance() // consume '('
 	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
 		return ref, p.errHere("expected SELECT after '(' in a derived table, optionally preceded by WITH definitions")
 	}
-	query, err := p.parseSubquery(false)
+	var query *SelectStmt
+	var err error
+	if capture == nil {
+		query, err = p.parseSubquery(false)
+	} else {
+		query, err = p.parseSubqueryScoped(false, &capture.scope, capture)
+	}
 	if err != nil {
 		return ref, err
 	}
@@ -1965,7 +2083,93 @@ func (p *Parser) parseDerivedTableRef(ref TableRef) (TableRef, error) {
 	ref.Query = query
 	ref.Alias = alias
 	ref.HasAlias = true
+	if capture != nil {
+		ref.Lateral = p.finishLateralCapture(capture)
+		if len(ref.Lateral.Bindings) != 0 &&
+			(ref.Join == JoinRight || ref.Join == JoinFull) {
+			kind := "RIGHT"
+			if ref.Join == JoinFull {
+				kind = "FULL"
+			}
+			return ref, p.errfAt(ref.Lateral.Bindings[0].Pos,
+				"%s JOIN LATERAL cannot correlate to its left side; use INNER, CROSS, or LEFT JOIN LATERAL, or remove the outer reference",
+				kind,
+			)
+		}
+	}
 	return ref, p.rejectDuplicateRangeAlias(ref)
+}
+
+func (p *Parser) beginLateralCapture(pos int) *lateralCapture {
+	state := p.lateralState()
+	capture := state.captures.one()
+	capture.owner = p
+	capture.bindingBase = len(state.bindingScratch)
+	capture.referenceBase = len(state.referenceScratch)
+	capture.source = len(p.from)
+	capture.pos = pos
+	capture.scope = lateralRangeScope{
+		parser: p,
+		limit:  len(p.from),
+		outer:  state.outerRanges,
+	}
+	return capture
+}
+
+func (p *Parser) finishLateralCapture(capture *lateralCapture) *LateralSpec {
+	if capture == nil || capture.owner != p || p.lateral == nil {
+		return nil
+	}
+	bindings := p.lateral.bindingScratch[capture.bindingBase:]
+	var run []LateralBinding
+	if len(bindings) != 0 {
+		run = p.lateral.bindings.allocDirty(len(bindings))
+		for i := range bindings {
+			run[i] = bindings[i].binding
+			run[i].Pos = bindings[i].path.Pos
+		}
+		// Nested LATERAL bodies are parsed before their containing SELECT's
+		// deferred paths are resolved. Sort by the first occurrence's byte
+		// position so the public slot order remains lexical rather than an
+		// artifact of parser traversal. The insertion sort is allocation-free
+		// and correlation lists are bounded by the statement item limits.
+		for i := 1; i < len(run); i++ {
+			binding := run[i]
+			j := i
+			for j > 0 && binding.Pos < run[j-1].Pos {
+				run[j] = run[j-1]
+				j--
+			}
+			run[j] = binding
+		}
+	}
+	references := p.lateral.referenceScratch[capture.referenceBase:]
+	var referenceRun []LateralReference
+	if len(references) != 0 {
+		referenceRun = p.lateral.references.allocDirty(len(references))
+		for i := range references {
+			old := &bindings[references[i].binding].binding
+			binding := 0
+			for j := range run {
+				if run[j].Depth == old.Depth && run[j].Source == old.Source &&
+					sameSegments(run[j].Segments, old.Segments) {
+					binding = j
+					break
+				}
+			}
+			referenceRun[i] = LateralReference{
+				Path: references[i].path, Binding: binding,
+			}
+		}
+	}
+	spec := p.lateral.specs.one()
+	spec.Bindings = run
+	spec.References = referenceRun
+	spec.Decorrelated = len(run) == 0
+	spec.Pos = capture.pos
+	p.lateral.bindingScratch = p.lateral.bindingScratch[:capture.bindingBase]
+	p.lateral.referenceScratch = p.lateral.referenceScratch[:capture.referenceBase]
+	return spec
 }
 
 // rejectDerivedColumnAliasList distinguishes a valid-but-unsupported SQL

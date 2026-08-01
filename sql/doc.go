@@ -57,9 +57,11 @@
 //	collection-ref = name [ [ "AS" ] name ] ;
 //	derived-ref  = "(" select ")" ( "AS" name | name ) ;
 //	join         = ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN"
-//	               | "RIGHT" [ "OUTER" ] "JOIN" ) collection-ref
-//	               ( "ON" join-cond | "USING" "(" name ")" ) ;
-//	join-cond    = [ "(" ] path "=" path [ ")" ] ;
+//	               | "RIGHT" [ "OUTER" ] "JOIN"
+//	               | "FULL" [ "OUTER" ] "JOIN" )
+//	               [ "LATERAL" ] table-ref
+//	               ( "ON" predicate | "USING" "(" name { "," name } ")" )
+//	             | "CROSS" "JOIN" [ "LATERAL" ] table-ref ;
 //
 //	predicate    = disjunction ;
 //	disjunction  = conjunction { "OR" conjunction } ;
@@ -116,12 +118,17 @@
 // JSON: "007" and "1." are refused here rather than at lowering. Comments are
 // "-- to end of line" and "/* ... */".
 //
-// A derived-ref is currently accepted only as the sole FROM relation. Its
-// alias is mandatory, its nested SELECT is uncorrelated, and the AST records
-// [RelationDerived] plus [TableRef.Query] so a lowerer can distinguish it from
-// a physical collection without interpreting an empty name. LATERAL and joins
-// involving a derived relation are typed feature refusals until execution has
-// parameterized relation plans and derived join inputs.
+// A derived-ref has a mandatory alias and may occupy any relation position.
+// LATERAL is accepted on the right of explicit CROSS, INNER, and LEFT joins.
+// Its query may qualify paths with only preceding FROM aliases; local aliases
+// and CTEs shadow those outer aliases lexically. [LateralSpec.Bindings] gives a
+// lowerer a stable first-reference-ordered slot table, while
+// [LateralSpec.References] maps each exact correlated [PathExpr] occurrence to
+// its slot without widening ordinary path nodes. A LATERAL query with no
+// captures has [LateralSpec.Decorrelated] set, allowing it to use the ordinary
+// evaluate-once derived plan. Uncorrelated RIGHT/FULL LATERAL is likewise
+// accepted as decorrelated; correlation from their nullable left side is
+// rejected with the offending path position.
 //
 // WITH is non-recursive and lexically scoped. A CTE body sees earlier sibling
 // definitions and enclosing WITH scopes; a nested WITH may shadow either.
@@ -172,6 +179,9 @@
 //     the statement declares one by that name in FROM or JOIN — either an
 //     explicit AS alias or, absent one, the collection name itself. The rest of
 //     the chain is then the path into that source's documents.
+//   - Inside an explicitly LATERAL derived query, a qualified name not declared
+//     locally is then searched through the frozen chain of preceding outer FROM
+//     sources, nearest lexical scope first. A later source is never visible.
 //   - Otherwise the whole chain, leading identifier included, is a path into
 //     the statement's only source. A statement with more than one source has no
 //     "only source", so an unqualified path there is rejected rather than
@@ -368,12 +378,10 @@
 // no distinct reduction variant; SIMILAR TO and regular-expression operators
 // have no matcher. LIKE and ILIKE are supported with the default backslash
 // escape only.
-// correlated and LATERAL subqueries and subqueries in the SELECT list (the
-// nested executor evaluates uncorrelated predicate and FROM subqueries once);
-// joins involving a derived relation or CTE; full, cross,
-// and natural joins and comma-separated FROM items; composite JOIN ... USING
-// (the current form accepts one simple field name); set operations, recursive
-// and data-modifying common table expressions, window functions, CASE,
+// implicit correlation from a non-LATERAL derived relation, correlated
+// RIGHT/FULL LATERAL, JOIN LATERAL ... USING, and subqueries in the SELECT list;
+// NATURAL joins and comma-separated FROM items; set operations, recursive and
+// data-modifying common table expressions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine
 // evaluates predicates over stored values, not computed expressions); ORDER BY
 // and GROUP BY over output positions or aggregates.

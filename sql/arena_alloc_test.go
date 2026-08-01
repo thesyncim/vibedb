@@ -31,6 +31,7 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"derived table", `SELECT d.id FROM (` +
 			`SELECT id FROM customers WHERE tier = ?` +
 			`) AS d WHERE d.id = ?`},
+		{"lateral derived table", lateralAllocSQL},
 		{"common table expressions", `WITH active(id) AS MATERIALIZED (` +
 			`SELECT id FROM customers WHERE tier = ?` +
 			`), selected AS NOT MATERIALIZED (` +
@@ -74,6 +75,7 @@ func TestWarmParseOfMixedShapesIsAllocationFree(t *testing.T) {
 	sources := []string{
 		benchSimple, benchFiltered, benchJoin, benchLeftJoin, benchGrouped, benchRich,
 		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) d WHERE d.id = ?`,
+		lateralAllocSQL,
 		`WITH active AS (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS MATERIALIZED (SELECT id FROM active) SELECT id FROM selected`,
 	}
