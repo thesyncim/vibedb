@@ -1284,7 +1284,8 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	if s.takeCancel() {
-		if kind != sqlast.KindCreateTable && kind != sqlast.KindCreateIndex {
+		if kind != sqlast.KindCreateTable &&
+			kind != sqlast.KindCreateIndex && kind != sqlast.KindDropTable {
 			return queryCanceled()
 		}
 		// DDL's atomic catalog publication is the commit point and cannot
@@ -1310,6 +1311,8 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 		return "CREATE TABLE"
 	case sqlast.KindCreateIndex:
 		return "CREATE INDEX"
+	case sqlast.KindDropTable:
+		return "DROP TABLE"
 	default:
 		return kind.String()
 	}

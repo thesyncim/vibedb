@@ -69,6 +69,8 @@ const (
 	DDLCreateTable
 	// DDLCreateIndex declares an index over one or more paths.
 	DDLCreateIndex
+	// DDLDropTable removes a table from the SQL catalog.
+	DDLDropTable
 )
 
 // String answers the statement's leading keywords.
@@ -84,6 +86,8 @@ func (k DMLKind) String() string {
 		return "CREATE TABLE"
 	case DDLCreateIndex:
 		return "CREATE INDEX"
+	case DDLDropTable:
+		return "DROP TABLE"
 	}
 	return "?"
 }
@@ -177,6 +181,8 @@ func PrepareParsedDML(
 		d.kind = DDLCreateTable
 	case sqlast.KindCreateIndex:
 		d.kind = DDLCreateIndex
+	case sqlast.KindDropTable:
+		d.kind = DDLDropTable
 	default:
 		return nil, fmt.Errorf(
 			"query: PrepareParsedDML was given unsupported statement kind %d",

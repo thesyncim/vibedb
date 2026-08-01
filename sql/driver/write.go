@@ -62,6 +62,8 @@ func (c *conn) execMutationContext(
 	switch statement.Kind() {
 	case query.DDLCreateTable:
 		return d.createTableLockedContext(ctx, statement)
+	case query.DDLDropTable:
+		return d.dropTableLockedContext(ctx, statement)
 	}
 	t, ok := d.tables[statement.Collection()]
 	if !ok {
@@ -80,6 +82,57 @@ func (c *conn) execMutationContext(
 
 func (d *database) createTableLocked(statement *query.DMLStatement) (sqldriver.Result, error) {
 	return d.createTableLockedContext(backgroundContext, statement)
+}
+
+// dropTableLockedContext publishes the namespace removal before attempting
+// physical cleanup. That ordering is the essential durability rule: a crash
+// after the catalog rename may leave an unreachable table file, but a crash
+// after deleting the file must never leave the catalog claiming the table
+// still exists. Existing snapshots are retained in retired until their
+// collection can close, so DROP remains safe with cursors that outlive it.
+func (d *database) dropTableLockedContext(
+	ctx context.Context,
+	statement *query.DMLStatement,
+) (sqldriver.Result, error) {
+	drop := statement.Tree().DropTable
+	name := drop.Table
+	t, exists := d.tables[name]
+	if !exists {
+		if drop.IfExists {
+			return result{}, nil
+		}
+		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, name)
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
+	previousPending := d.catalogWritePending
+	meta := d.catalog.Tables[name]
+	delete(d.catalog.Tables, name)
+	delete(d.tables, name)
+	if t.collection != nil || t.file != nil {
+		d.retired = append(d.retired, retiredTable{
+			name: name, path: d.tablePath(name),
+			journal: durable.RecoveryJournalPath(d.tablePath(name)),
+			file:    t.file, collection: t.collection,
+		})
+	}
+	published, err := d.persistCatalogLocked()
+	if err != nil {
+		if !published {
+			d.catalog.Tables[name] = meta
+			d.tables[name] = t
+			if len(d.retired) != 0 {
+				d.retired = d.retired[:len(d.retired)-1]
+			}
+			d.catalogWritePending = previousPending
+		}
+		return nil, err
+	}
+	if err := d.settleDroppedTablesLocked(); err != nil {
+		return nil, err
+	}
+	return result{}, nil
 }
 
 func (d *database) createTableLockedContext(
@@ -1045,6 +1098,15 @@ func (c *conn) matchingKeysLocked(
 	limits durable.Options,
 	valueBytes int,
 ) ([]string, error) {
+	window, err := newMutationWindow(
+		statement, args, t.meta.PrimaryKey, limits.MaxBatchDocuments)
+	if err != nil {
+		return nil, err
+	}
+	if window.limited && window.limit == 0 {
+		c.matchKeys = c.matchKeys[:0]
+		return c.matchKeys, nil
+	}
 	budget := mutationMatchBudget{
 		table:        statement.Collection(),
 		maxDocuments: limits.MaxBatchDocuments,
@@ -1076,6 +1138,8 @@ func (c *conn) matchingKeysLocked(
 			return c.pointKeys, nil
 		}
 		present := keys[:0]
+		selector := newMutationKeySelector(window, limits.MaxBatchDocuments)
+		selector.keys = c.matchKeys[:0]
 		scratch := c.pointRaw[:0]
 		for _, key := range keys {
 			var found bool
@@ -1085,22 +1149,39 @@ func (c *conn) matchingKeysLocked(
 				return nil, err
 			}
 			if found {
-				if err := budget.admit(len(key)); err != nil {
-					c.pointRaw = scratch
-					return nil, err
+				if window.limited {
+					selector.add(key)
+				} else {
+					if err := budget.admit(len(key)); err != nil {
+						c.pointRaw = scratch
+						return nil, err
+					}
+					present = append(present, key)
 				}
-				present = append(present, key)
 			}
 		}
 		clear(keys[len(present):])
 		c.pointRaw = scratch
 		c.pointKeys = present
-		return present, nil
+		if !window.limited {
+			return present, nil
+		}
+		if err := admitMutationSelection(&budget, selector.keys); err != nil {
+			return nil, err
+		}
+		c.matchKeys = selector.keys
+		return c.matchKeys, nil
 	}
 
 	clear(c.matchKeys)
 	keys = c.matchKeys[:0]
+	selector := newMutationKeySelector(window, limits.MaxBatchDocuments)
+	selector.keys = keys
 	filter, err := statement.Filter(&c.exec, args, func(key, _ []byte) error {
+		if window.limited {
+			selector.add(string(key))
+			return nil
+		}
 		if err := budget.admit(len(key)); err != nil {
 			return err
 		}
@@ -1113,6 +1194,13 @@ func (c *conn) matchingKeysLocked(
 	if t.collection == nil {
 		if err := filter.Done(); err != nil {
 			return nil, err
+		}
+		if window.limited {
+			if err := admitMutationSelection(&budget, selector.keys); err != nil {
+				return nil, err
+			}
+			c.matchKeys = selector.keys
+			return c.matchKeys, nil
 		}
 		c.matchKeys = keys
 		return keys, nil
@@ -1130,8 +1218,27 @@ func (c *conn) matchingKeysLocked(
 	if err := filter.Done(); err != nil {
 		return nil, err
 	}
+	if window.limited {
+		if err := admitMutationSelection(&budget, selector.keys); err != nil {
+			return nil, err
+		}
+		c.matchKeys = selector.keys
+		return c.matchKeys, nil
+	}
 	c.matchKeys = keys
 	return keys, nil
+}
+
+func admitMutationSelection(
+	budget *mutationMatchBudget,
+	keys []string,
+) error {
+	for _, key := range keys {
+		if err := budget.admit(len(key)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mutationMatchBudget bounds the result of a filtered UPDATE or DELETE while

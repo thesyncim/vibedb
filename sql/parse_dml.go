@@ -73,6 +73,8 @@ func KindOf(src string) Kind {
 		// kind" here, and callers that need the distinction have the parsed
 		// statement by the time they do.
 		return KindCreateTable
+	case tok.kw == kwDrop:
+		return KindDropTable
 	}
 	return KindSelect
 }
@@ -99,7 +101,8 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwCreate):
 		return p.parseCreate(dst)
 	case p.atKeyword(kwDrop):
-		return p.errHere("DROP is not supported: removing a collection or an index is a catalog operation with consequences a statement cannot undo, so it is left to the application that owns the catalog")
+		dst.Kind, dst.DropTable = KindDropTable, &p.drop
+		return p.parseDropTable()
 	case p.atKeyword(kwAlter):
 		return p.errHere("ALTER is not supported: a declared schema is frozen when the collection is created, and altering one would have to revalidate every stored document")
 	case p.atKeyword(kwTruncate):
@@ -414,6 +417,8 @@ func (p *Parser) parseUpdate() error {
 	if err := p.parseDMLWhere("UPDATE"); err != nil {
 		return err
 	}
+	p.upd.OrderBy = p.mutationOrderBy
+	p.upd.Limit = p.mutationLimit
 	p.upd.Filter = p.out
 	if p.acceptKeyword(kwReturning) {
 		p.saveFilter()
@@ -493,6 +498,8 @@ func (p *Parser) parseDelete() error {
 	default:
 		p.del.Filter = p.out
 	}
+	p.del.OrderBy = p.mutationOrderBy
+	p.del.Limit = p.mutationLimit
 	if p.acceptKeyword(kwReturning) {
 		p.saveFilter()
 		if err := p.parseMutationReturning(name, pos); err != nil {
@@ -502,6 +509,19 @@ func (p *Parser) parseDelete() error {
 	}
 	p.del.Params = p.params
 	return nil
+}
+
+// detachMutationWindow removes ORDER BY/LIMIT from the synthetic SELECT used
+// as a mutation predicate. query.Filter intentionally evaluates a predicate
+// batch by batch; retaining these clauses there would make a LIMIT reset at
+// every batch and would make ORDER BY local to a batch. The driver applies the
+// captured window once, over the complete matching-key stream.
+func (p *Parser) detachMutationWindow() {
+	p.mutationOrderBy = append(p.mutationOrderBy[:0], p.out.OrderBy...)
+	p.mutationLimit = p.out.Limit
+	p.out.OrderBy = nil
+	p.out.Limit = nil
+	p.out.Offset = nil
 }
 
 // saveFilter copies the synthetic SELECT's clause slices before RETURNING
@@ -628,18 +648,29 @@ func (p *Parser) parseDMLWhere(clause string) error {
 		}
 		p.out.Where = where
 	}
+	if err := p.parseOrderBy(); err != nil {
+		return err
+	}
+	if err := p.parseLimitOffset(); err != nil {
+		return err
+	}
 	switch {
 	case p.atKeyword(kwGroup), p.atKeyword(kwHaving):
 		return p.errfHere("%s has no GROUP BY or HAVING: it acts on documents, not on groups of them", clause)
 	case p.atKeyword(kwOrder):
-		return p.errfHere("%s has no ORDER BY: which documents it touches is decided by the condition, and the order it touches them in is not observable", clause)
+		return p.errfHere("%s has an invalid ORDER BY clause", clause)
 	case p.atKeyword(kwLimit), p.atKeyword(kwOffset):
-		return p.errfHere("%s has no LIMIT: a bounded delete would have to choose which matching documents to spare, and the engine has no ordering to choose by", clause)
+		return p.errfHere("%s has an invalid LIMIT/OFFSET clause", clause)
+	case p.out.Offset != nil:
+		return p.errfHere("%s does not support OFFSET; use LIMIT with an optional primary-key ORDER BY", clause)
+	case len(p.out.OrderBy) != 0 && p.out.Limit == nil:
+		return p.errfHere("%s ORDER BY requires LIMIT so the mutation remains within one bounded write batch", clause)
 	}
 	if p.atKeyword(kwReturning) {
 		if err := p.resolvePaths(); err != nil {
 			return err
 		}
+		p.detachMutationWindow()
 		p.out.Params = p.params
 		return p.validate()
 	}
@@ -652,6 +683,7 @@ func (p *Parser) parseDMLWhere(clause string) error {
 	if err := p.resolvePaths(); err != nil {
 		return err
 	}
+	p.detachMutationWindow()
 	p.out.Params = p.params
 	return p.validate()
 }

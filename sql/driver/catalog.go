@@ -76,6 +76,20 @@ type table struct {
 	conflicts  txConflictClock
 }
 
+// retiredTable keeps the physical resources of a logically dropped table
+// alive until the durable collection can close. Existing SQL cursors and
+// transactions may still hold generation leases after the catalog no longer
+// names the table; deleting the catalog entry first is what makes DROP
+// crash-safe, while this bounded list makes the later file cleanup explicit.
+type retiredTable struct {
+	name       string
+	path       string
+	journal    string
+	file       *os.File
+	collection *durable.Collection
+	removed    bool
+}
+
 type database struct {
 	mu                   sync.RWMutex
 	path                 string
@@ -85,6 +99,7 @@ type database struct {
 	closeCollection      func(*durable.Collection) error
 	catalog              catalogFile
 	tables               map[string]*table
+	retired              []retiredTable
 	catalogWritePending  bool
 	catalogFencePending  bool
 	tableDirFencePending bool
@@ -550,12 +565,102 @@ func (d *database) retryNamespaceFencesLocked() error {
 	return nil
 }
 
+// settleDroppedTablesLocked finishes the physical half of a DROP TABLE after
+// its catalog entry has been durably removed. A live snapshot may keep the
+// durable collection from closing immediately; that is not a catalog failure
+// and is retried on a later catalog operation or final database close. The
+// table file is never removed before the catalog publication, so a crash in
+// this cleanup window leaves only an unreachable orphan, not a catalog entry
+// whose data file disappeared.
+func (d *database) settleDroppedTablesLocked() error {
+	if len(d.retired) == 0 {
+		return nil
+	}
+	remaining := d.retired[:0]
+	removedAny := false
+	for i := range d.retired {
+		retired := &d.retired[i]
+		if retired.collection != nil {
+			if err := d.collectionClose(retired.collection); err != nil {
+				if errors.Is(err, storeio.ErrLeasesActive) {
+					remaining = append(remaining, *retired)
+					continue
+				}
+				d.retired = append(remaining, *retired)
+				return fmt.Errorf(
+					"%w: finish DROP TABLE %q: %v",
+					durable.ErrCommitOutcomeUnknown, retired.name, err,
+				)
+			}
+			retired.collection = nil
+		}
+		if retired.file != nil {
+			if err := retired.file.Close(); err != nil {
+				d.retired = append(remaining, *retired)
+				return fmt.Errorf(
+					"%w: close dropped SQL table %q: %v",
+					durable.ErrCommitOutcomeUnknown, retired.name, err,
+				)
+			}
+			retired.file = nil
+		}
+		if retired.removed {
+			continue
+		}
+		if err := os.Remove(retired.path); err != nil && !os.IsNotExist(err) {
+			d.retired = append(remaining, *retired)
+			return fmt.Errorf(
+				"%w: remove dropped SQL table %q: %v",
+				durable.ErrCommitOutcomeUnknown, retired.name, err,
+			)
+		}
+		if err := os.Remove(retired.journal); err != nil && !os.IsNotExist(err) {
+			d.retired = append(remaining, *retired)
+			return fmt.Errorf(
+				"%w: remove dropped SQL table journal %q: %v",
+				durable.ErrCommitOutcomeUnknown, retired.name, err,
+			)
+		}
+		retired.removed = true
+		removedAny = true
+		remaining = append(remaining, *retired)
+	}
+	if removedAny {
+		d.tableDirFencePending = true
+		if err := d.directorySync(d.dataDir); err != nil {
+			d.retired = remaining
+			return fmt.Errorf(
+				"%w: sync SQL table directory after DROP TABLE: %w",
+				durable.ErrCommitOutcomeUnknown, err,
+			)
+		}
+		d.tableDirFencePending = false
+	}
+	// Entries marked removed have crossed both namespace fences and no longer
+	// own a resource. Entries retained above are only the ones waiting on a
+	// live snapshot or a retryable cleanup error.
+	if len(remaining) != 0 {
+		kept := remaining[:0]
+		for _, retired := range remaining {
+			if !retired.removed || retired.collection != nil || retired.file != nil {
+				kept = append(kept, retired)
+			}
+		}
+		remaining = kept
+	}
+	d.retired = remaining
+	return nil
+}
+
 // settleCatalogLocked completes any full-catalog rewrite that became required
 // only after a table file was already committed. This ordering prevents a
 // durable catalog from claiming a data file that was never published, while
 // ensuring later acknowledged writes cannot depend on an unrecorded file.
 func (d *database) settleCatalogLocked() error {
 	if err := d.retryNamespaceFencesLocked(); err != nil {
+		return err
+	}
+	if err := d.settleDroppedTablesLocked(); err != nil {
 		return err
 	}
 	if !d.catalogWritePending {
@@ -958,6 +1063,13 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			result = errors.Join(result, d.collectionClose(t.collection))
 		}
 	}
+	for i := range d.retired {
+		if d.retired[i].collection != nil {
+			result = errors.Join(
+				result, d.collectionClose(d.retired[i].collection),
+			)
+		}
+	}
 	if result != nil && !terminal {
 		// Collection.Close is retryable after outstanding leases or transient
 		// checkpoint failures clear. Keep every caller-owned descriptor and the
@@ -973,6 +1085,15 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			// No handle can be exposed after a terminal close, even when its
 			// final Close returned an error.
 			t.collection = nil
+		}
+	}
+	for i := range d.retired {
+		if d.retired[i].file != nil {
+			result = errors.Join(result, d.retired[i].file.Close())
+			d.retired[i].file = nil
+		}
+		if terminal {
+			d.retired[i].collection = nil
 		}
 	}
 	if d.lockFile != nil {

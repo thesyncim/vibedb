@@ -260,7 +260,7 @@ func (t *tx) execMutationCore(
 		return nil, ErrReadOnlyTransaction
 	}
 	switch statement.Kind() {
-	case query.DDLCreateTable, query.DDLCreateIndex:
+	case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable:
 		return nil, ErrDDLInTransaction
 	}
 	tableName := statement.Collection()
@@ -482,6 +482,15 @@ func (c *conn) matchingKeysTransaction(
 	state *txTable,
 	valueBytes int,
 ) ([]string, error) {
+	window, err := newMutationWindow(
+		statement, args, state.primaryKey, state.limits.MaxBatchDocuments)
+	if err != nil {
+		return nil, err
+	}
+	if window.limited && window.limit == 0 {
+		c.matchKeys = c.matchKeys[:0]
+		return c.matchKeys, nil
+	}
 	budget := transactionMatchBudget{
 		table:      statement.Collection(),
 		state:      state,
@@ -509,6 +518,8 @@ func (c *conn) matchingKeysTransaction(
 			return nil, err
 		}
 		present := keys[:0]
+		selector := newMutationKeySelector(window, state.limits.MaxBatchDocuments)
+		selector.keys = c.matchKeys[:0]
 		scratch := c.pointRaw[:0]
 		for _, key := range keys {
 			var found bool
@@ -518,23 +529,40 @@ func (c *conn) matchingKeysTransaction(
 				return nil, err
 			}
 			if found {
-				if err := budget.admit(key); err != nil {
-					c.pointRaw = scratch
-					return nil, err
+				if window.limited {
+					selector.add(key)
+				} else {
+					if err := budget.admit(key); err != nil {
+						c.pointRaw = scratch
+						return nil, err
+					}
+					present = append(present, key)
 				}
-				present = append(present, key)
 			}
 		}
 		clear(keys[len(present):])
 		c.pointRaw = scratch
 		c.pointKeys = present
-		return present, nil
+		if !window.limited {
+			return present, nil
+		}
+		if err := admitTransactionSelection(&budget, selector.keys); err != nil {
+			return nil, err
+		}
+		c.matchKeys = selector.keys
+		return c.matchKeys, nil
 	}
 
 	clear(c.matchKeys)
 	keys = c.matchKeys[:0]
+	selector := newMutationKeySelector(window, state.limits.MaxBatchDocuments)
+	selector.keys = keys
 	filter, err := statement.Filter(&c.exec, args, func(key, _ []byte) error {
 		owned := string(key)
+		if window.limited {
+			selector.add(owned)
+			return nil
+		}
 		if err := budget.admit(owned); err != nil {
 			return err
 		}
@@ -569,8 +597,27 @@ func (c *conn) matchingKeysTransaction(
 	if err := filter.Done(); err != nil {
 		return nil, err
 	}
+	if window.limited {
+		if err := admitTransactionSelection(&budget, selector.keys); err != nil {
+			return nil, err
+		}
+		c.matchKeys = selector.keys
+		return c.matchKeys, nil
+	}
 	c.matchKeys = keys
 	return keys, nil
+}
+
+func admitTransactionSelection(
+	budget *transactionMatchBudget,
+	keys []string,
+) error {
+	for _, key := range keys {
+		if err := budget.admit(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // transactionMatchBudget applies the transaction's distinct-key and byte

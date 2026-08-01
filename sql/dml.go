@@ -32,6 +32,8 @@ const (
 	KindCreateTable
 	// KindCreateIndex is a CREATE INDEX, carried in [Statement.CreateIndex].
 	KindCreateIndex
+	// KindDropTable is a DROP TABLE, carried in [Statement.DropTable].
+	KindDropTable
 )
 
 // String answers the statement's leading keyword.
@@ -47,6 +49,8 @@ func (k Kind) String() string {
 		return "CREATE TABLE"
 	case KindCreateIndex:
 		return "CREATE INDEX"
+	case KindDropTable:
+		return "DROP TABLE"
 	}
 	return "SELECT"
 }
@@ -76,6 +80,7 @@ type Statement struct {
 	Delete      *DeleteStmt
 	CreateTable *CreateTableStmt
 	CreateIndex *CreateIndexStmt
+	DropTable   *DropTableStmt
 }
 
 // ReturnsRows reports whether this parsed statement must execute through a
@@ -100,6 +105,8 @@ func (s *Statement) Table() string {
 		return s.CreateTable.Table
 	case KindCreateIndex:
 		return s.CreateIndex.Table
+	case KindDropTable:
+		return s.DropTable.Table
 	}
 	if s.Select == nil || len(s.Select.From) == 0 {
 		return ""
@@ -116,7 +123,7 @@ func (s *Statement) Params() int {
 		return s.Update.Params
 	case KindDelete:
 		return s.Delete.Params
-	case KindCreateTable, KindCreateIndex:
+	case KindCreateTable, KindCreateIndex, KindDropTable:
 		// A DDL statement has no placeholders. A schema is not data: a type, a
 		// path, and a table name are all compiled into the definition when the
 		// statement is prepared, so there is nothing left for a bind to supply.
@@ -229,6 +236,14 @@ type UpdateStmt struct {
 	// promise "UPDATE writes exactly the documents SELECT returns" structural: a
 	// lowering pass hands this to the SELECT lowering unchanged.
 	Filter *SelectStmt
+	// OrderBy is the mutation's optional bounded-selection ordering. The
+	// driver deliberately keeps it outside Filter: query.Filter evaluates a
+	// filtered scan in batches, while a mutation must choose one global set of
+	// keys before it publishes a batch.
+	OrderBy []OrderTerm
+	// Limit caps the number of selected documents. It is nil when UPDATE acts
+	// on every matching document.
+	Limit *Operand
 	// Returning projects the replacement documents after UPDATE, in selected
 	// key order. It is nil when the statement reports only RowsAffected.
 	Returning *SelectStmt
@@ -247,6 +262,10 @@ type DeleteStmt struct {
 	// Filter is the equivalent SELECT whose surviving rows this statement
 	// deletes. See [UpdateStmt.Filter].
 	Filter *SelectStmt
+	// OrderBy and Limit have the same bounded-selection contract as
+	// [UpdateStmt.OrderBy] and [UpdateStmt.Limit].
+	OrderBy []OrderTerm
+	Limit   *Operand
 	// Returning projects the documents removed by DELETE, in selected key
 	// order. It is nil when the statement reports only RowsAffected.
 	Returning *SelectStmt

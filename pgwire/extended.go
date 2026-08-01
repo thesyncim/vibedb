@@ -645,7 +645,8 @@ func (s *session) beforeExtendedExecute(stmt *prepared) error {
 			withHint("send Sync after the session command before executing stored-row SQL")
 	}
 	kind := stmt.runtime.Kind()
-	ddl := kind == sqlast.KindCreateTable || kind == sqlast.KindCreateIndex
+	ddl := kind == sqlast.KindCreateTable ||
+		kind == sqlast.KindCreateIndex || kind == sqlast.KindDropTable
 	if ddl {
 		if s.extendedSQL {
 			return newError(sqlstateFeatureNotSupported,

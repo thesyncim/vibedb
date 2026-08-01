@@ -109,14 +109,17 @@ type Parser struct {
 	del       DeleteStmt
 	tbl       CreateTableStmt
 	idx       CreateIndexStmt
+	drop      DropTableStmt
 
 	// DML filters and RETURNING projections reuse the clause buffers below.
 	// These retained copies keep a filter's slice headers valid while a
 	// mutation's RETURNING projection is parsed.
-	filterColumns []ResultColumn
-	filterFrom    []TableRef
-	filterGroupBy []*PathExpr
-	filterOrderBy []OrderTerm
+	filterColumns   []ResultColumn
+	filterFrom      []TableRef
+	filterGroupBy   []*PathExpr
+	filterOrderBy   []OrderTerm
+	mutationOrderBy []OrderTerm
+	mutationLimit   *Operand
 
 	// Parse-time scratch that no parsed statement retains.
 	//
@@ -269,6 +272,8 @@ func (p *Parser) reset(src string) {
 	p.filterFrom = p.filterFrom[:0]
 	p.filterGroupBy = p.filterGroupBy[:0]
 	p.filterOrderBy = p.filterOrderBy[:0]
+	p.mutationOrderBy = p.mutationOrderBy[:0]
+	p.mutationLimit = nil
 	if p.nested != nil {
 		p.nested.used = 0
 	}

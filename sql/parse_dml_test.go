@@ -68,6 +68,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `update users set ?0 where (cmp = 0:tier s"free") returning path(0:id) params=1`,
 		},
 		{
+			name: "update ordered limit",
+			src:  `UPDATE users SET "$doc" = ? WHERE tier = 'free' ORDER BY id DESC LIMIT ?`,
+			want: `update users set ?0 where (cmp = 0:tier s"free") order 0:id:desc limit ?1 params=2`,
+		},
+		{
 			name: "update by a JSON field named dollar key",
 			src:  `UPDATE users SET "$doc" = ? WHERE "$key" = 'u1'`,
 			want: `update users set ?0 where (cmp = 0:/$key s"u1") params=1`,
@@ -88,6 +93,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `delete from users where (cmp > 0:age n30) returning path(0:id) params=0`,
 		},
 		{
+			name: "delete ordered limit",
+			src:  `DELETE FROM users ORDER BY id LIMIT 2`,
+			want: `delete from users all order 0:id:asc limit n2 params=0`,
+		},
+		{
 			name: "delete by a JSON field named dollar key",
 			src:  `DELETE FROM users WHERE "$key" = ?`,
 			want: `delete from users where (cmp = 0:/$key ?0) params=1`,
@@ -96,6 +106,16 @@ func TestDMLGrammarShapes(t *testing.T) {
 			name: "delete by dollar-key field membership",
 			src:  `DELETE FROM users WHERE "$key" IN ('a', 'b')`,
 			want: `delete from users where (in 0:/$key s"a" s"b") params=0`,
+		},
+		{
+			name: "drop a table",
+			src:  `DROP TABLE users`,
+			want: `drop table users`,
+		},
+		{
+			name: "drop a table if it exists",
+			src:  `DROP TABLE IF EXISTS users`,
+			want: `drop table if exists users`,
 		},
 		{
 			name: "a nested path in a condition",
@@ -235,14 +255,14 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"UPDATE ... FROM", `UPDATE t SET "$doc" = ? FROM u`, -1, "never from another collection"},
 
 		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
-		{"DELETE ... LIMIT", `DELETE FROM t WHERE a = 1 LIMIT 5`, -1, "no LIMIT"},
-		{"DELETE ... ORDER BY", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "no ORDER BY"},
+		{"mutation ORDER BY without LIMIT", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "ORDER BY requires LIMIT"},
+		{"mutation OFFSET", `DELETE FROM t WHERE a = 1 LIMIT 5 OFFSET 1`, -1, "does not support OFFSET"},
 		{"a table alias", `UPDATE t AS x SET "$doc" = ?`, -1, "nothing to qualify"},
 
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
 		{"REPLACE", `REPLACE INTO t VALUES ('k', ?)`, 0, "REPLACE"},
 		{"TRUNCATE", `TRUNCATE TABLE t`, 0, "TRUNCATE"},
-		{"DROP", `DROP TABLE t`, 0, "DROP"},
+		{"DROP INDEX", `DROP INDEX t`, 5, "TABLE after DROP"},
 		{"ALTER", `ALTER TABLE t ADD COLUMN a STRING`, 0, "ALTER"},
 	})
 }

@@ -112,7 +112,7 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 	bodies := 0
 	for _, present := range []bool{
 		s.Select != nil, s.Insert != nil, s.Update != nil, s.Delete != nil,
-		s.CreateTable != nil, s.CreateIndex != nil,
+		s.CreateTable != nil, s.CreateIndex != nil, s.DropTable != nil,
 	} {
 		if present {
 			bodies++
@@ -155,6 +155,10 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 			t.Fatal("KindCreateIndex with no CreateIndexStmt")
 		}
 		checkCreateIndex(t, s.CreateIndex)
+	case KindDropTable:
+		if s.DropTable == nil || s.DropTable.Table == "" {
+			t.Fatal("KindDropTable with no table name")
+		}
 	default:
 		t.Fatalf("unknown statement kind %d", s.Kind)
 	}
@@ -212,6 +216,14 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)
 	}
+	for _, term := range s.OrderBy {
+		if term.Path == nil {
+			t.Fatal("UPDATE ORDER BY has no path")
+		}
+	}
+	if s.Limit != nil && s.Limit.Kind == OperandParam {
+		seen++
+	}
 	if s.Returning != nil {
 		checkStatementInvariants(t, s.Returning)
 		for i := range s.Returning.Columns {
@@ -231,6 +243,14 @@ func checkDelete(t *testing.T, s *DeleteStmt) {
 	seen := 0
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)
+	}
+	for _, term := range s.OrderBy {
+		if term.Path == nil {
+			t.Fatal("DELETE ORDER BY has no path")
+		}
+	}
+	if s.Limit != nil && s.Limit.Kind == OperandParam {
+		seen++
 	}
 	if s.Returning != nil {
 		checkStatementInvariants(t, s.Returning)
