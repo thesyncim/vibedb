@@ -52,12 +52,13 @@ const (
 
 // Safe defaults selected for zero-valued resource fields.
 const (
-	DefaultMaxConnections = 128
-	DefaultReadTimeout    = 10 * time.Second
-	DefaultWriteTimeout   = 30 * time.Second
-	DefaultIdleTimeout    = 5 * time.Minute
-	DefaultMaxResultRows  = query.DefaultResultRows
-	DefaultMaxResultBytes = query.DefaultResultBytes
+	DefaultMaxConnections       = 128
+	DefaultReadTimeout          = 10 * time.Second
+	DefaultWriteTimeout         = 30 * time.Second
+	DefaultIdleTimeout          = 5 * time.Minute
+	DefaultMaxResultRows        = query.DefaultResultRows
+	DefaultMaxResultBytes       = query.DefaultResultBytes
+	DefaultMaxIntermediateBytes = query.DefaultIntermediateBytes
 
 	// UnlimitedConnections and UnlimitedResults are explicit opt-outs from the
 	// corresponding finite defaults. A negative timeout explicitly disables
@@ -123,6 +124,13 @@ type Options struct {
 	MaxResultRows  int
 	MaxResultBytes int64
 
+	// MaxIntermediateBytes bounds statement-wide logical storage retained by
+	// derived tables, predicate subqueries, CTE materializations, and other
+	// relation-valued subplans. Zero selects DefaultMaxIntermediateBytes and
+	// UnlimitedResults (-1) explicitly disables the bound. Caller-visible
+	// result rows and bytes remain governed independently above.
+	MaxIntermediateBytes int64
+
 	// OnError is called with every session-terminating error, including the
 	// ordinary ones (a client that closed its connection). It is the only
 	// logging hook, and it is a function rather than an interface so that a
@@ -179,6 +187,10 @@ func NewServer(db *sqldriver.Database, opts Options) (*Server, error) {
 	if opts.MaxResultBytes < UnlimitedResults {
 		return nil, fmt.Errorf("pgwire: MaxResultBytes must be >= %d", UnlimitedResults)
 	}
+	if opts.MaxIntermediateBytes < UnlimitedResults {
+		return nil, fmt.Errorf(
+			"pgwire: MaxIntermediateBytes must be >= %d", UnlimitedResults)
+	}
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = DefaultMaxConnections
 	}
@@ -202,6 +214,9 @@ func NewServer(db *sqldriver.Database, opts Options) (*Server, error) {
 	}
 	if opts.MaxResultBytes == 0 {
 		opts.MaxResultBytes = DefaultMaxResultBytes
+	}
+	if opts.MaxIntermediateBytes == 0 {
+		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
 	return &Server{
 		db:        db,

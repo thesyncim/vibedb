@@ -2213,18 +2213,20 @@ func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
 		srv.opts.WriteTimeout != DefaultWriteTimeout ||
 		srv.opts.IdleTimeout != DefaultIdleTimeout ||
 		srv.opts.MaxResultRows != DefaultMaxResultRows ||
-		srv.opts.MaxResultBytes != DefaultMaxResultBytes {
+		srv.opts.MaxResultBytes != DefaultMaxResultBytes ||
+		srv.opts.MaxIntermediateBytes != DefaultMaxIntermediateBytes {
 		t.Fatalf("zero resource fields did not select finite defaults: %+v", srv.opts)
 	}
 
 	unbounded, err := NewServer(database, Options{
-		Auth:           Trust(),
-		MaxConnections: UnlimitedConnections,
-		ReadTimeout:    -1,
-		WriteTimeout:   -1,
-		IdleTimeout:    -1,
-		MaxResultRows:  UnlimitedResults,
-		MaxResultBytes: UnlimitedResults,
+		Auth:                 Trust(),
+		MaxConnections:       UnlimitedConnections,
+		ReadTimeout:          -1,
+		WriteTimeout:         -1,
+		IdleTimeout:          -1,
+		MaxResultRows:        UnlimitedResults,
+		MaxResultBytes:       UnlimitedResults,
+		MaxIntermediateBytes: UnlimitedResults,
 	})
 	if err != nil {
 		t.Fatalf("explicit opt-outs: %v", err)
@@ -2233,8 +2235,14 @@ func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
 	if unbounded.opts.MaxConnections != UnlimitedConnections ||
 		unbounded.opts.ReadTimeout != 0 ||
 		unbounded.opts.WriteTimeout != 0 ||
-		unbounded.opts.IdleTimeout != 0 {
+		unbounded.opts.IdleTimeout != 0 ||
+		unbounded.opts.MaxIntermediateBytes != UnlimitedResults {
 		t.Fatalf("explicit unbounded settings were not preserved: %+v", unbounded.opts)
+	}
+	if invalid, err := NewServer(database, Options{
+		Auth: Trust(), MaxIntermediateBytes: -2,
+	}); err == nil || invalid != nil {
+		t.Fatalf("invalid intermediate limit = (%v, %v), want (nil, error)", invalid, err)
 	}
 }
 

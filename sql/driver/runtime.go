@@ -176,6 +176,29 @@ func (s *Session) SetResultLimits(rows int, bytes int64) error {
 	return nil
 }
 
+// SetIntermediateLimit configures the statement-wide byte allowance shared by
+// relation-valued subplans, including derived tables, predicate subqueries,
+// and CTE materializations. Zero selects the query package default and -1
+// disables the limit. The option is only read when a statement has nested
+// relational work, so configuring it adds no branch to ordinary row loops.
+// Configure a session before preparing or executing statements.
+func (s *Session) SetIntermediateLimit(bytes int64) error {
+	if err := s.live(); err != nil {
+		return err
+	}
+	if bytes < -1 {
+		return errors.New("vibedb: intermediate limit must be -1, zero, or positive")
+	}
+	if s.current != nil {
+		return ErrCursorOpen
+	}
+	if s.state != SessionIdle {
+		return ErrTransactionActive
+	}
+	s.conn.exec.Options.IntermediateBytes = bytes
+	return nil
+}
+
 // Prepare parses and lowers one statement exactly once.
 //
 // An error while a transaction is active moves the session to

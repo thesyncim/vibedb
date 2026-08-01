@@ -139,6 +139,30 @@ func TestDerivedTableSimpleAndExtendedProtocol(t *testing.T) {
 	}
 }
 
+func TestConfiguredIntermediateBudgetFailsBeforeAnyDataRowAndRecovers(t *testing.T) {
+	srv := newTestServer(t, Options{MaxIntermediateBytes: 1})
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+	statement := `SELECT d.id FROM (SELECT id FROM users) AS d`
+
+	msgs := c.query(statement)
+	expectError(t, msgs, sqlstateProgramLimitExceeded)
+	if has(msgs, msgDataRow) {
+		t.Fatal("intermediate-budget failure emitted a partial simple-query DataRow")
+	}
+
+	msgs = extendedSQL(c, statement, nil)
+	expectError(t, msgs, sqlstateProgramLimitExceeded)
+	if has(msgs, msgDataRow) {
+		t.Fatal("intermediate-budget failure emitted a partial extended-query DataRow")
+	}
+
+	msgs = c.query(`SELECT id FROM users WHERE id = 1`)
+	if got := commandTagOf(t, msgs); got != "SELECT 1" {
+		t.Fatalf("post-budget recovery tag = %q, want SELECT 1", got)
+	}
+}
+
 func TestDerivedTableColumnSQLStatesAndRecovery(t *testing.T) {
 	c := connectSQLCatalog(t)
 	for _, statement := range []string{

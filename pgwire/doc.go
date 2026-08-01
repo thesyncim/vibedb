@@ -359,9 +359,11 @@
 // partially emitted backend message.
 //
 // Each SELECT result is materialized under [Options.MaxResultRows] and
-// [Options.MaxResultBytes] before any DataRow is encoded. Their zero values
-// select finite defaults of [DefaultMaxResultRows] and
-// [DefaultMaxResultBytes]; [UnlimitedResults] is the explicit opt-out.
+// [Options.MaxResultBytes] before any DataRow is encoded. Relation-valued
+// subplans share the separate statement-wide [Options.MaxIntermediateBytes]
+// allowance. Their zero values select finite defaults of
+// [DefaultMaxResultRows], [DefaultMaxResultBytes], and
+// [DefaultMaxIntermediateBytes]; [UnlimitedResults] is the explicit opt-out.
 // Exhaustion is reported as SQLSTATE 54000 and never emits a partial DataRow.
 // Socket admission is likewise finite by default, and read, idle, and write
 // deadlines cover startup, message reads, and every underlying socket write.

@@ -703,6 +703,57 @@ func TestZeroSessionReportsClosed(t *testing.T) {
 	}
 }
 
+func TestSessionIntermediateLimitLifecycle(t *testing.T) {
+	database, session := openRuntimeSession(t)
+	defer database.Close()
+	defer session.Close()
+
+	if err := session.SetIntermediateLimit(-2); err == nil {
+		t.Fatal("SetIntermediateLimit accepted a value below -1")
+	}
+	if got := session.conn.exec.Options.IntermediateBytes; got != 0 {
+		t.Fatalf("rejected intermediate limit changed option to %d", got)
+	}
+	if err := session.SetIntermediateLimit(4096); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.conn.exec.Options.IntermediateBytes; got != 4096 {
+		t.Fatalf("intermediate limit = %d, want 4096", got)
+	}
+
+	create := runtimePrepare(t, session,
+		`CREATE TABLE docs (id STRING PRIMARY KEY)`)
+	if _, err := create.Exec(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	selectAll := runtimePrepare(t, session, `SELECT id FROM docs`)
+	cursor, err := selectAll.Query(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetIntermediateLimit(8192); !errors.Is(err, ErrCursorOpen) {
+		t.Fatalf("SetIntermediateLimit with live cursor = %v", err)
+	}
+	if err := cursor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Begin(context.Background(), TxOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetIntermediateLimit(8192); !errors.Is(err, ErrTransactionActive) {
+		t.Fatalf("SetIntermediateLimit in transaction = %v", err)
+	}
+	if err := session.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetIntermediateLimit(-1); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.conn.exec.Options.IntermediateBytes; got != -1 {
+		t.Fatalf("unlimited intermediate option = %d, want -1", got)
+	}
+}
+
 func TestTypedRuntimeCancellationAndExternalFailureState(t *testing.T) {
 	ctx := context.Background()
 	database, session := openRuntimeSession(t)
