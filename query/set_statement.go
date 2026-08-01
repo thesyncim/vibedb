@@ -304,6 +304,9 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 	if err != nil {
 		return 0, 0, err
 	}
+	if err = validateSetStatementLeafResult(source, columns, exec, cursor); err != nil {
+		return 0, 0, err
+	}
 	mergeSetStatementStats(&r.parent.Stats, exec.Stats)
 	resultBytes = exec.Result.resultBytesUsed
 	if err = frame.intermediate.reserve("set-expression leaf result", resultBytes); err != nil {
@@ -311,11 +314,6 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 	}
 	reserved = true
 	r.observeIntermediate(frame.intermediate.used)
-	if len(exec.Result.Columns) != columns {
-		return 0, 0, &SetTreeArityError{
-			Node: source, Left: columns, Right: len(exec.Result.Columns),
-		}
-	}
 	charge, err = dst.materialize(
 		cursor, columns, frame, cancel, "set-expression leaf spool",
 	)
@@ -324,6 +322,47 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 	}
 	r.observeIntermediate(frame.intermediate.used)
 	return dst.rows, charge, nil
+}
+
+func validateSetStatementLeafResult(
+	source, columns int,
+	exec *Exec,
+	cursor Cursor,
+) error {
+	result := &exec.Result
+	if len(result.Columns) != columns {
+		return &SetTreeArityError{
+			Node: source, Left: columns, Right: len(result.Columns),
+		}
+	}
+	if result.RowCount < 0 {
+		return fmt.Errorf(
+			"query: prepared set leaf %d returned negative row count %d: %w",
+			source, result.RowCount, ErrSetTreeSource,
+		)
+	}
+	if result.resultBytesUsed < 0 {
+		return fmt.Errorf(
+			"query: prepared set leaf %d returned negative result bytes %d: %w",
+			source, result.resultBytesUsed, ErrSetTreeSource,
+		)
+	}
+	for column := range result.Columns {
+		if len(result.Columns[column].Cells) != result.RowCount {
+			return fmt.Errorf(
+				"query: prepared set leaf %d column %d has %d cells for %d rows: %w",
+				source, column, len(result.Columns[column].Cells), result.RowCount,
+				ErrSetTreeSource,
+			)
+		}
+	}
+	if cursor.res != result || cursor.st == nil || cursor.st.outputs != columns {
+		return fmt.Errorf(
+			"query: prepared set leaf %d returned a detached %d-column cursor: %w",
+			source, columns, ErrSetTreeSource,
+		)
+	}
+	return nil
 }
 
 func setStatementLeafSource(src Source, outer, collection string) (Source, error) {
