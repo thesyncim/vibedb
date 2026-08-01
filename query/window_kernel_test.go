@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"math/rand"
 	"slices"
 	"strings"
@@ -234,6 +235,300 @@ func TestWindowKernelGroupsFrameBounds(t *testing.T) {
 	}
 }
 
+func TestWindowKernelFrameExclusions(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{setTestMissing, `10`}, {`null`, `20`}, {`1`, `1`}, {`1.0`, `2`}, {`2`, `4`},
+	})
+	full := func(exclusion windowFrameExclusion) windowRowsFrame {
+		return windowRowsFrame{
+			start:     windowFrameBound{kind: windowUnboundedPreceding},
+			end:       windowFrameBound{kind: windowUnboundedFollowing},
+			exclusion: exclusion,
+		}
+	}
+	tests := []struct {
+		name      string
+		exclusion windowFrameExclusion
+		want      [][]string
+	}{
+		{
+			name: "no others", exclusion: windowExcludeNoOthers,
+			want: [][]string{
+				{`5`, `37`, `1`, `20`, `10`, `4`, `20`},
+				{`5`, `37`, `1`, `20`, `10`, `4`, `20`},
+				{`5`, `37`, `1`, `20`, `10`, `4`, `20`},
+				{`5`, `37`, `1`, `20`, `10`, `4`, `20`},
+				{`5`, `37`, `1`, `20`, `10`, `4`, `20`},
+			},
+		},
+		{
+			name: "current row", exclusion: windowExcludeCurrentRow,
+			want: [][]string{
+				{`4`, `27`, `1`, `20`, `20`, `4`, `1`},
+				{`4`, `17`, `1`, `10`, `10`, `4`, `1`},
+				{`4`, `36`, `2`, `20`, `10`, `4`, `20`},
+				{`4`, `35`, `1`, `20`, `10`, `4`, `20`},
+				{`4`, `33`, `1`, `20`, `10`, `2`, `20`},
+			},
+		},
+		{
+			name: "group", exclusion: windowExcludeGroup,
+			want: [][]string{
+				{`3`, `7`, `1`, `4`, `1`, `4`, `2`},
+				{`3`, `7`, `1`, `4`, `1`, `4`, `2`},
+				{`3`, `34`, `4`, `20`, `10`, `4`, `20`},
+				{`3`, `34`, `4`, `20`, `10`, `4`, `20`},
+				{`4`, `33`, `1`, `20`, `10`, `2`, `20`},
+			},
+		},
+		{
+			name: "ties", exclusion: windowExcludeTies,
+			want: [][]string{
+				{`4`, `17`, `1`, `10`, `10`, `4`, `1`},
+				{`4`, `27`, `1`, `20`, `20`, `4`, `1`},
+				{`4`, `35`, `1`, `20`, `10`, `4`, `20`},
+				{`4`, `36`, `2`, `20`, `10`, `4`, `20`},
+				{`5`, `37`, `1`, `20`, `10`, `4`, `20`},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := full(test.exclusion)
+			plan := windowPlan{
+				order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+				functions: []windowFunctionSpec{
+					{kind: windowCount, column: -1, frame: frame},
+					{kind: windowSum, column: 1, frame: frame},
+					{kind: windowMin, column: 1, frame: frame},
+					{kind: windowMax, column: 1, frame: frame},
+					{kind: windowFirstValue, column: 1, frame: frame},
+					{kind: windowLastValue, column: 1, frame: frame},
+					{kind: windowNthValue, column: 1, nth: 2, frame: frame},
+				},
+			}
+			assertSetRows(t, runWindowTest(t, &input, &plan), test.want)
+		})
+	}
+}
+
+func TestWindowKernelFrameExclusionsUseSortedPositionsWithUnsortedInput(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`2`, `4`}, {`null`, `20`}, {`1.0`, `2`}, {setTestMissing, `10`}, {`1`, `1`},
+	})
+	full := func(exclusion windowFrameExclusion) windowRowsFrame {
+		return windowRowsFrame{
+			start:     windowFrameBound{kind: windowUnboundedPreceding},
+			end:       windowFrameBound{kind: windowUnboundedFollowing},
+			exclusion: exclusion,
+		}
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowSum, column: 1, frame: full(windowExcludeCurrentRow)},
+			{kind: windowMax, column: 1, frame: full(windowExcludeCurrentRow)},
+			{kind: windowSum, column: 1, frame: full(windowExcludeTies)},
+			{kind: windowMax, column: 1, frame: full(windowExcludeTies)},
+		},
+	}
+	assertSetRows(t, runWindowTest(t, &input, &plan), [][]string{
+		{`33`, `20`, `37`, `20`},
+		{`17`, `10`, `27`, `20`},
+		{`35`, `20`, `36`, `20`},
+		{`27`, `20`, `17`, `10`},
+		{`36`, `20`, `35`, `20`},
+	})
+}
+
+func TestWindowKernelFrameExclusionAverageAndEmptyFrame(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{{`1`, `2`}, {`1.0`, `4`}, {`2`, `6`}})
+	full := func(exclusion windowFrameExclusion) windowRowsFrame {
+		return windowRowsFrame{
+			start:     windowFrameBound{kind: windowUnboundedPreceding},
+			end:       windowFrameBound{kind: windowUnboundedFollowing},
+			exclusion: exclusion,
+		}
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowAvg, column: 1, frame: full(windowExcludeCurrentRow)},
+			{kind: windowAvg, column: 1, frame: full(windowExcludeGroup)},
+			{kind: windowAvg, column: 1, frame: full(windowExcludeTies)},
+		},
+	}
+	assertSetRows(t, runWindowTest(t, &input, &plan), [][]string{
+		{`5`, `6`, `4`}, {`4`, `6`, `5`}, {`3`, `3`, `4`},
+	})
+
+	empty := windowRowsFrame{
+		unit:      windowFrameRange,
+		start:     windowFrameBound{kind: windowCurrentRow},
+		end:       windowFrameBound{kind: windowCurrentRow},
+		exclusion: windowExcludeGroup,
+	}
+	emptyPlan := windowPlan{functions: []windowFunctionSpec{
+		{kind: windowCount, column: -1, frame: empty},
+		{kind: windowSum, column: 1, frame: empty},
+		{kind: windowAvg, column: 1, frame: empty},
+		{kind: windowMin, column: 1, frame: empty},
+		{kind: windowMax, column: 1, frame: empty},
+		{kind: windowFirstValue, column: 1, frame: empty},
+		{kind: windowLastValue, column: 1, frame: empty},
+		{kind: windowNthValue, column: 1, nth: 1, frame: empty},
+	}}
+	assertSetRows(t, runWindowTest(t, &input, &emptyPlan), [][]string{
+		{`0`, `null`, `null`, `null`, `null`, `null`, `null`, `null`},
+		{`0`, `null`, `null`, `null`, `null`, `null`, `null`, `null`},
+		{`0`, `null`, `null`, `null`, `null`, `null`, `null`, `null`},
+	})
+}
+
+func TestWindowKernelRangePeerFrames(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`, `1`, `10`}, {`1.0`, `1.00`, `20`}, {`1`, `2`, `30`}, {`2`, `1`, `40`},
+	})
+	running := windowRowsFrame{
+		unit:  windowFrameRange,
+		start: windowFrameBound{kind: windowUnboundedPreceding},
+		end:   windowFrameBound{kind: windowCurrentRow},
+	}
+	peers := windowRowsFrame{
+		unit:  windowFrameRange,
+		start: windowFrameBound{kind: windowCurrentRow},
+		end:   windowFrameBound{kind: windowCurrentRow},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{
+			{column: 0, nulls: windowNullsFirst}, {column: 1, nulls: windowNullsFirst},
+		},
+		functions: []windowFunctionSpec{
+			{kind: windowCount, column: -1, frame: running},
+			{kind: windowSum, column: 2, frame: running},
+			{kind: windowCount, column: -1, frame: peers},
+		},
+	}
+	assertSetRows(t, runWindowTest(t, &input, &plan), [][]string{
+		{`2`, `30`, `2`}, {`2`, `30`, `2`}, {`3`, `60`, `1`}, {`4`, `100`, `1`},
+	})
+
+	withoutOrder := windowPlan{functions: []windowFunctionSpec{
+		{kind: windowCount, column: -1, frame: peers},
+	}}
+	assertSetRows(t, runWindowTest(t, &input, &withoutOrder), [][]string{{`4`}, {`4`}, {`4`}, {`4`}})
+}
+
+func TestWindowKernelRangeNumericOffsetsExactAscendingDescendingAndNulls(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{setTestMissing, `100`}, {`null`, `200`}, {`-1`, `1`}, {`0`, `2`},
+		{`1.0`, `4`}, {`1.5`, `8`}, {`2`, `16`}, {`4`, `32`},
+	})
+	frame := windowRowsFrame{
+		unit: windowFrameRange,
+		start: windowFrameBound{
+			kind: windowPreceding, rangeOffset: windowTestScalar(t, `0.5`),
+		},
+		end: windowFrameBound{
+			kind: windowFollowing, rangeOffset: windowTestScalar(t, `1`),
+		},
+	}
+	tests := []struct {
+		name string
+		key  windowOrderKey
+		want [][]string
+	}{
+		{
+			name: "ascending nulls first",
+			key:  windowOrderKey{column: 0, nulls: windowNullsFirst},
+			want: [][]string{
+				{`2`, `300`}, {`2`, `300`}, {`2`, `3`}, {`2`, `6`},
+				{`3`, `28`}, {`3`, `28`}, {`2`, `24`}, {`1`, `32`},
+			},
+		},
+		{
+			name: "descending nulls last",
+			key: windowOrderKey{
+				column: 0, descending: true, nulls: windowNullsLast,
+			},
+			want: [][]string{
+				{`2`, `300`}, {`2`, `300`}, {`1`, `1`}, {`2`, `3`},
+				{`3`, `14`}, {`3`, `28`}, {`3`, `28`}, {`1`, `32`},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := windowPlan{
+				order: []windowOrderKey{test.key},
+				functions: []windowFunctionSpec{
+					{kind: windowCount, column: -1, frame: frame},
+					{kind: windowSum, column: 1, frame: frame},
+				},
+			}
+			assertSetRows(t, runWindowTest(t, &input, &plan), test.want)
+		})
+	}
+
+	exact := buildSetTestSpool(t, [][]string{
+		{`0.1`}, {`0.1000000000000000000000000000000001`}, {`0.2`},
+	})
+	exactFrame := windowRowsFrame{
+		unit: windowFrameRange,
+		start: windowFrameBound{
+			kind: windowPreceding, rangeOffset: windowTestScalar(t, `1e-34`),
+		},
+		end: windowFrameBound{kind: windowCurrentRow},
+	}
+	exactPlan := windowPlan{
+		order:     []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: exactFrame}},
+	}
+	assertSetRows(t, runWindowTest(t, &exact, &exactPlan), [][]string{{`1`}, {`2`}, {`1`}})
+}
+
+func TestWindowKernelRangeWidePreparedReuseZeroAlloc(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`10000000000000000000000000000000000`},
+		{`10000000000000000000000000000000001`},
+		{`10000000000000000000000000000000002`},
+		{`10000000000000000000000000000000010`},
+	})
+	offset := windowTestScalar(t, `1.5`)
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			unit: windowFrameRange,
+			start: windowFrameBound{
+				kind: windowPreceding, rangeOffset: offset,
+			},
+			end: windowFrameBound{
+				kind: windowFollowing, rangeOffset: offset,
+			},
+		}}},
+	}
+	var executor windowExecutor
+	var frame statementFrame
+	if err := frame.begin(ExecOptions{IntermediateBytes: -1}); err != nil {
+		t.Fatal(err)
+	}
+	charge, err := executor.execute(&input, &plan, &frame, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame.intermediate.release(charge)
+	assertSetRows(t, &executor.result, [][]string{{`2`}, {`3`}, {`2`}, {`1`}})
+	if got := testing.AllocsPerRun(20, func() {
+		charge, err = executor.execute(&input, &plan, &frame, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame.intermediate.release(charge)
+	}); got != 0 {
+		t.Fatalf("warmed wide RANGE allocated %.2f times, want 0", got)
+	}
+}
+
 func TestWindowKernelSlidingRowsAggregates(t *testing.T) {
 	input := buildSetTestSpool(t, [][]string{
 		{`"p"`, `1`, `1`},
@@ -345,6 +640,50 @@ func TestWindowKernelValidationAndFrames(t *testing.T) {
 		{functions: []windowFunctionSpec{{kind: windowFirstValue, column: 0, frame: windowRowsFrame{
 			unit: windowFrameUnit(9), start: validFrame.start, end: validFrame.end,
 		}}}},
+		{functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			start: validFrame.start, end: validFrame.end,
+			exclusion: windowFrameExclusion(9),
+		}}}},
+		{functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			unit: windowFrameRange,
+			start: windowFrameBound{
+				kind: windowPreceding, rangeOffset: windowTestScalar(t, `1`),
+			},
+			end: windowFrameBound{kind: windowCurrentRow},
+		}}}},
+		{order: []windowOrderKey{{column: 0}, {column: 0}}, functions: []windowFunctionSpec{{
+			kind: windowCount, column: -1, frame: windowRowsFrame{
+				unit: windowFrameRange,
+				start: windowFrameBound{
+					kind: windowPreceding, rangeOffset: windowTestScalar(t, `1`),
+				},
+				end: windowFrameBound{kind: windowCurrentRow},
+			},
+		}}},
+		{order: []windowOrderKey{{column: 0}}, functions: []windowFunctionSpec{{
+			kind: windowCount, column: -1, frame: windowRowsFrame{
+				unit: windowFrameRange,
+				start: windowFrameBound{
+					kind: windowPreceding, rangeOffset: windowTestScalar(t, `-1`),
+				},
+				end: windowFrameBound{kind: windowCurrentRow},
+			},
+		}}},
+		{order: []windowOrderKey{{column: 0}}, functions: []windowFunctionSpec{{
+			kind: windowCount, column: -1, frame: windowRowsFrame{
+				unit: windowFrameRange,
+				start: windowFrameBound{
+					kind: windowPreceding, rangeOffset: windowTestScalar(t, `"x"`),
+				},
+				end: windowFrameBound{kind: windowCurrentRow},
+			},
+		}}},
+		{functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			start: windowFrameBound{
+				kind: windowPreceding, offset: 1, rangeOffset: windowTestScalar(t, `1`),
+			},
+			end: windowFrameBound{kind: windowCurrentRow},
+		}}}},
 	}
 	for at := range tests {
 		var executor windowExecutor
@@ -372,6 +711,30 @@ func TestWindowKernelValidationAndFrames(t *testing.T) {
 	}
 	if _, err := executor.execute(&malformed, &plan, &frame, nil); !errors.Is(err, errWindowInput) {
 		t.Fatalf("malformed input error = %v", err)
+	}
+
+	mixed := buildSetTestSpool(t, [][]string{{`1`}, {`"x"`}})
+	rangePlan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			unit: windowFrameRange,
+			start: windowFrameBound{
+				kind: windowPreceding, rangeOffset: windowTestScalar(t, `1`),
+			},
+			end: windowFrameBound{kind: windowCurrentRow},
+		}}},
+	}
+	var mixedExecutor windowExecutor
+	var mixedFrame statementFrame
+	if err := mixedFrame.begin(ExecOptions{IntermediateBytes: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mixedExecutor.execute(&mixed, &rangePlan, &mixedFrame, nil); !errors.Is(err, errWindowPlan) {
+		t.Fatalf("mixed RANGE ORDER BY error = %v", err)
+	}
+	if mixedExecutor.result.rows != 0 || mixedFrame.intermediate.used != 0 {
+		t.Fatalf("mixed RANGE published rows/bytes %d/%d",
+			mixedExecutor.result.rows, mixedFrame.intermediate.used)
 	}
 }
 
@@ -410,12 +773,25 @@ func TestWindowKernelBudgetAdmissionPrecedesGrowth(t *testing.T) {
 		start: windowFrameBound{kind: windowPreceding, offset: 4},
 		end:   windowFrameBound{kind: windowFollowing, offset: 3},
 	}
+	excludedFrame := frameSpec
+	excludedFrame.exclusion = windowExcludeGroup
+	rangeOffset := windowTestScalar(t, `2.5`)
+	rangeFrame := windowRowsFrame{
+		unit: windowFrameRange,
+		start: windowFrameBound{
+			kind: windowPreceding, rangeOffset: rangeOffset,
+		},
+		end: windowFrameBound{
+			kind: windowFollowing, rangeOffset: rangeOffset,
+		},
+	}
 	plan := windowPlan{
 		partition: []int{0},
 		order:     []windowOrderKey{{column: 1, nulls: windowNullsLast}},
 		functions: []windowFunctionSpec{
 			{kind: windowSum, column: 2, frame: frameSpec},
-			{kind: windowMin, column: 2, frame: frameSpec},
+			{kind: windowMin, column: 2, frame: excludedFrame},
+			{kind: windowCount, column: -1, frame: rangeFrame},
 		},
 	}
 	shape, err := measureWindowExecution(&input, &plan, nil)
@@ -450,6 +826,33 @@ func TestWindowKernelBudgetAdmissionPrecedesGrowth(t *testing.T) {
 	}
 	if frame.intermediate.used != 0 {
 		t.Fatalf("result failure retained %d budget bytes", frame.intermediate.used)
+	}
+}
+
+func TestWindowKernelRangeWideExponentBudgetFailureIsAtomic(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{{`1`}, {`2`}})
+	offset := windowTestScalar(t, `1e999999999999999999999999999999999999`)
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			unit: windowFrameRange,
+			start: windowFrameBound{
+				kind: windowPreceding, rangeOffset: offset,
+			},
+			end: windowFrameBound{kind: windowCurrentRow},
+		}}},
+	}
+	var executor windowExecutor
+	var frame statementFrame
+	if err := frame.begin(ExecOptions{IntermediateBytes: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.execute(&input, &plan, &frame, nil); !errors.Is(err, ErrAggregateBudget) {
+		t.Fatalf("wide RANGE budget error = %v, want %v", err, ErrAggregateBudget)
+	}
+	if executor.result.rows != 0 || frame.intermediate.used != 0 {
+		t.Fatalf("wide RANGE failure published rows/bytes %d/%d",
+			executor.result.rows, frame.intermediate.used)
 	}
 }
 
@@ -607,10 +1010,27 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 		}
 		input := buildSetTestSpool(t, data)
 		preceding, following := random.Intn(4), random.Intn(4)
-		frameSpec := windowRowsFrame{
-			unit:  windowFrameUnit(random.Intn(2)),
-			start: windowFrameBound{kind: windowPreceding, offset: preceding},
-			end:   windowFrameBound{kind: windowFollowing, offset: following},
+		frameSpec := windowRowsFrame{exclusion: windowFrameExclusion(random.Intn(4))}
+		frameSpec.unit = windowFrameUnit(random.Intn(3))
+		if frameSpec.unit == windowFrameRange {
+			switch random.Intn(3) {
+			case 0:
+				frameSpec.start.kind = windowUnboundedPreceding
+				frameSpec.end.kind = windowCurrentRow
+			case 1:
+				frameSpec.start.kind = windowCurrentRow
+				frameSpec.end.kind = windowCurrentRow
+			default:
+				frameSpec.start = windowFrameBound{
+					kind: windowPreceding, rangeOffset: windowTestScalar(t, fmt.Sprintf("%d", preceding)),
+				}
+				frameSpec.end = windowFrameBound{
+					kind: windowFollowing, rangeOffset: windowTestScalar(t, fmt.Sprintf("%d", following)),
+				}
+			}
+		} else {
+			frameSpec.start = windowFrameBound{kind: windowPreceding, offset: preceding}
+			frameSpec.end = windowFrameBound{kind: windowFollowing, offset: following}
 		}
 		plan := windowPlan{
 			partition: []int{0},
@@ -640,7 +1060,8 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 		result := runWindowTest(t, &input, &plan)
 		want := referenceWindowIntegerRows(t, &input, &plan)
 		if got := setTestRows(result); !equalSetTestRows(got, want) {
-			t.Fatalf("iteration %d\ndata=%v\ngot=%v\nwant=%v", iteration, data, got, want)
+			t.Fatalf("iteration %d\nframe=%+v\ndata=%v\ngot=%v\nwant=%v",
+				iteration, frameSpec, data, got, want)
 		}
 	}
 }
@@ -696,6 +1117,12 @@ func TestWindowKernelRaceIndependentExecutorsAndConcurrentCancellation(t *testin
 }
 
 func TestWindowKernelOverflowGuards(t *testing.T) {
+	if _, ok := windowExtremaEntries(math.MaxInt); ok {
+		t.Fatal("extrema tree admitted MaxInt rows")
+	}
+	if _, ok := windowScaleDifference(math.MaxInt64, math.MinInt64); ok {
+		t.Fatal("RANGE scale subtraction overflow was admitted")
+	}
 	input := relationSpool{rows: math.MaxInt}
 	plan := windowPlan{functions: []windowFunctionSpec{{kind: windowRowNumber, column: -1}}}
 	if _, err := measureWindowExecution(&input, &plan, nil); !errors.Is(err, errWindowSize) {
@@ -727,7 +1154,7 @@ var windowSink int
 
 type windowTestCapacities struct {
 	order, scratch, deque int
-	groups                int
+	groups, extrema       int
 	number, negative      int
 	columns, data         int
 }
@@ -735,7 +1162,7 @@ type windowTestCapacities struct {
 func windowExecutorCapacities(e *windowExecutor) windowTestCapacities {
 	return windowTestCapacities{
 		order: cap(e.order), scratch: cap(e.sortScratch), deque: cap(e.deque),
-		groups: cap(e.groups),
+		groups: cap(e.groups), extrema: cap(e.extrema),
 		number: cap(e.numberOut), negative: cap(e.negative),
 		columns: cap(e.result.columns), data: cap(e.result.data),
 	}
@@ -789,6 +1216,20 @@ func windowStressPlan() windowPlan {
 		start: windowFrameBound{kind: windowPreceding, offset: 1},
 		end:   windowFrameBound{kind: windowFollowing, offset: 1},
 	}
+	excludedFrame := frame
+	excludedFrame.exclusion = windowExcludeGroup
+	rangeBytes := []byte(`2.5`)
+	rangeOffset := scalar{kind: kindNumber, num: rangeBytes, raw: rangeBytes}
+	rangeFrame := windowRowsFrame{
+		unit: windowFrameRange,
+		start: windowFrameBound{
+			kind: windowPreceding, rangeOffset: rangeOffset,
+		},
+		end: windowFrameBound{
+			kind: windowFollowing, rangeOffset: rangeOffset,
+		},
+		exclusion: windowExcludeTies,
+	}
 	return windowPlan{
 		partition: []int{0},
 		order: []windowOrderKey{{
@@ -814,6 +1255,10 @@ func windowStressPlan() windowPlan {
 			{kind: windowNthValue, column: 2, nth: 3, frame: frame},
 			{kind: windowCount, column: -1, frame: groupsFrame},
 			{kind: windowSum, column: 2, frame: groupsFrame},
+			{kind: windowCount, column: -1, frame: excludedFrame},
+			{kind: windowMax, column: 2, frame: excludedFrame},
+			{kind: windowSum, column: 2, frame: rangeFrame},
+			{kind: windowFirstValue, column: 2, frame: rangeFrame},
 		},
 	}
 }
@@ -916,10 +1361,16 @@ func referenceWindowIntegerRows(
 					}
 				case windowCount, windowSum, windowMin, windowMax:
 					group := referenceWindowGroupAt(groups, local)
-					lo, hi := referenceWindowFrame(function.frame, local, rows, groups, group)
+					lo, hi := referenceWindowFrame(
+						input, plan.order, order, partitionStart,
+						function.frame, local, rows, groups, group,
+					)
 					count, sum := 0, int64(0)
 					var extreme scalar
 					for at := lo; at < hi; at++ {
+						if referenceWindowExcluded(function.frame, local, at, groups, group) {
+							continue
+						}
 						if function.kind == windowCount && function.column < 0 {
 							count++
 							continue
@@ -962,18 +1413,30 @@ func referenceWindowIntegerRows(
 					}
 				case windowFirstValue, windowLastValue, windowNthValue:
 					group := referenceWindowGroupAt(groups, local)
-					lo, hi := referenceWindowFrame(function.frame, local, rows, groups, group)
-					target, ok := lo, lo < hi
-					switch function.kind {
-					case windowLastValue:
-						target = hi - 1
-					case windowNthValue:
-						ok = function.nth <= hi-lo
-						if ok {
-							target = lo + function.nth - 1
+					lo, hi := referenceWindowFrame(
+						input, plan.order, order, partitionStart,
+						function.frame, local, rows, groups, group,
+					)
+					target, seen := -1, 0
+					for at := lo; at < hi; at++ {
+						if referenceWindowExcluded(function.frame, local, at, groups, group) {
+							continue
+						}
+						seen++
+						switch function.kind {
+						case windowFirstValue:
+							target = at
+							at = hi
+						case windowLastValue:
+							target = at
+						case windowNthValue:
+							if seen == function.nth {
+								target = at
+								at = hi
+							}
 						}
 					}
-					if !ok {
+					if target < 0 {
 						result[row][column] = `null`
 					} else {
 						result[row][column] = windowScalarString(
@@ -1037,11 +1500,29 @@ func referenceWindowTile(position, rows, buckets int) int {
 }
 
 func referenceWindowFrame(
+	input *relationSpool,
+	keys []windowOrderKey,
+	order []int,
+	partitionStart int,
 	frame windowRowsFrame,
 	position, rows int,
 	groups []int,
 	group int,
 ) (int, int) {
+	if frame.unit == windowFrameRange {
+		start := referenceWindowRangeBound(
+			input, keys, order, partitionStart, frame.start,
+			true, position, rows, groups, group,
+		)
+		end := referenceWindowRangeBound(
+			input, keys, order, partitionStart, frame.end,
+			false, position, rows, groups, group,
+		)
+		if end < start {
+			end = start
+		}
+		return start, end
+	}
 	if frame.unit == windowFrameGroups {
 		start := 0
 		switch frame.start.kind {
@@ -1117,6 +1598,89 @@ func referenceWindowFrame(
 		end = start
 	}
 	return start, end
+}
+
+func referenceWindowRangeBound(
+	input *relationSpool,
+	keys []windowOrderKey,
+	order []int,
+	partitionStart int,
+	bound windowFrameBound,
+	start bool,
+	position, rows int,
+	groups []int,
+	group int,
+) int {
+	switch bound.kind {
+	case windowUnboundedPreceding:
+		return 0
+	case windowCurrentRow:
+		if start {
+			return groups[group]
+		}
+		return groups[group+1]
+	case windowUnboundedFollowing:
+		return rows
+	}
+	key := keys[0]
+	current := input.columns[key.column][order[partitionStart+position]]
+	if current.kind == kindNull {
+		if start {
+			return groups[group]
+		}
+		return groups[group+1]
+	}
+	target := new(big.Rat).Set(ratOf(string(current.num)))
+	offset := ratOf(string(bound.rangeOffset.num))
+	subtract := bound.kind == windowPreceding
+	if key.descending {
+		subtract = !subtract
+	}
+	if subtract {
+		target.Sub(target, offset)
+	} else {
+		target.Add(target, offset)
+	}
+	for at := 0; at < rows; at++ {
+		candidate := input.columns[key.column][order[partitionStart+at]]
+		comparison := referenceWindowRangeCompare(candidate, target, key)
+		if comparison > 0 || start && comparison == 0 {
+			return at
+		}
+	}
+	return rows
+}
+
+func referenceWindowRangeCompare(value scalar, target *big.Rat, key windowOrderKey) int {
+	if value.kind == kindNull {
+		if key.nulls == windowNullsFirst {
+			return -1
+		}
+		return 1
+	}
+	comparison := ratOf(string(value.num)).Cmp(target)
+	if key.descending {
+		comparison = -comparison
+	}
+	return comparison
+}
+
+func referenceWindowExcluded(
+	frame windowRowsFrame,
+	position, candidate int,
+	groups []int,
+	group int,
+) bool {
+	switch frame.exclusion {
+	case windowExcludeCurrentRow:
+		return candidate == position
+	case windowExcludeGroup:
+		return candidate >= groups[group] && candidate < groups[group+1]
+	case windowExcludeTies:
+		return candidate != position && candidate >= groups[group] && candidate < groups[group+1]
+	default:
+		return false
+	}
 }
 
 func referenceWindowRatio(numerator, denominator int) string {

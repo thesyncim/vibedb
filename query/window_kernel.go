@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"math/bits"
 	"strconv"
 	"unsafe"
@@ -56,14 +57,16 @@ const (
 )
 
 type windowFrameBound struct {
-	kind   windowFrameBoundKind
-	offset int
+	kind        windowFrameBoundKind
+	offset      int
+	rangeOffset scalar
 }
 
 type windowRowsFrame struct {
-	unit  windowFrameUnit
-	start windowFrameBound
-	end   windowFrameBound
+	unit      windowFrameUnit
+	start     windowFrameBound
+	end       windowFrameBound
+	exclusion windowFrameExclusion
 }
 
 type windowFrameUnit uint8
@@ -71,6 +74,16 @@ type windowFrameUnit uint8
 const (
 	windowFrameRows windowFrameUnit = iota
 	windowFrameGroups
+	windowFrameRange
+)
+
+type windowFrameExclusion uint8
+
+const (
+	windowExcludeNoOthers windowFrameExclusion = iota
+	windowExcludeCurrentRow
+	windowExcludeGroup
+	windowExcludeTies
 )
 
 type windowFunctionSpec struct {
@@ -109,11 +122,14 @@ type windowExecutor struct {
 	order       []int
 	sortScratch []int
 	deque       []int
+	extrema     []int
 	groups      []int
 	numberOut   []byte
 	negative    []byte
 
 	aggregate       numberAcc
+	rangeTarget     decimalSum
+	rangeCandidate  decimalSum
 	aggregateLease  aggregateLease
 	aggregateBudget aggregateBudget
 
@@ -140,6 +156,7 @@ type windowExecutionShape struct {
 	rows              int
 	functions         int
 	needsDeque        bool
+	extremaEntries    int
 	needsGroups       bool
 	aggregateBytes    int64
 	numberOutputBytes int
@@ -243,10 +260,13 @@ func (e *windowExecutor) resetTransient() {
 	e.order = e.order[:0]
 	e.sortScratch = e.sortScratch[:0]
 	e.deque = e.deque[:0]
+	e.extrema = e.extrema[:0]
 	e.groups = e.groups[:0]
 	e.numberOut = e.numberOut[:0]
 	e.negative = e.negative[:0]
 	e.aggregate.reset()
+	e.rangeTarget.reset()
+	e.rangeCandidate.reset()
 }
 
 func measureWindowExecution(
@@ -340,10 +360,6 @@ func measureWindowExecution(
 					"%w: COUNT function %d column", errWindowPlan, at,
 				)
 			}
-			if err := validateWindowFrame(function.frame); err != nil {
-				return windowExecutionShape{}, err
-			}
-			shape.needsGroups = shape.needsGroups || function.frame.unit == windowFrameGroups
 		case windowSum, windowAvg, windowMin, windowMax:
 			if function.column < 0 || function.column >= columns ||
 				function.offset != 0 || function.buckets != 0 || function.nth != 0 ||
@@ -352,13 +368,7 @@ func measureWindowExecution(
 					"%w: aggregate function %d column", errWindowPlan, at,
 				)
 			}
-			if err := validateWindowFrame(function.frame); err != nil {
-				return windowExecutionShape{}, err
-			}
-			shape.needsGroups = shape.needsGroups || function.frame.unit == windowFrameGroups
-			if function.kind == windowMin || function.kind == windowMax {
-				shape.needsDeque = true
-			} else {
+			if function.kind != windowMin && function.kind != windowMax {
 				needsExact = true
 				for row, value := range input.columns[function.column] {
 					if err := cancellationCheckpoint(cancel, row); err != nil {
@@ -391,10 +401,58 @@ func measureWindowExecution(
 					"%w: value function %d metadata", errWindowPlan, at,
 				)
 			}
-			if err := validateWindowFrame(function.frame); err != nil {
+		}
+		if !windowFunctionUsesFrame(function.kind) {
+			continue
+		}
+		if err := validateWindowFramePlan(function.frame, len(plan.order)); err != nil {
+			return windowExecutionShape{}, err
+		}
+		if function.kind == windowMin || function.kind == windowMax {
+			if function.frame.exclusion == windowExcludeNoOthers {
+				shape.needsDeque = true
+			} else {
+				entries, ok := windowExtremaEntries(shape.rows)
+				if !ok {
+					return windowExecutionShape{}, errWindowSize
+				}
+				shape.extremaEntries = max(shape.extremaEntries, entries)
+			}
+		}
+		shape.needsGroups = shape.needsGroups || windowFrameNeedsGroups(function.frame)
+		if function.frame.unit != windowFrameRange || !windowFrameHasOffset(function.frame) {
+			continue
+		}
+		needsExact = true
+		needsNumberBuffers = true
+		orderColumn := input.columns[plan.order[0].column]
+		for row, value := range orderColumn {
+			if err := cancellationCheckpoint(cancel, row); err != nil {
 				return windowExecutionShape{}, err
 			}
-			shape.needsGroups = shape.needsGroups || function.frame.unit == windowFrameGroups
+			if value.kind == kindNull {
+				continue
+			}
+			if value.kind != kindNumber {
+				return windowExecutionShape{}, fmt.Errorf(
+					"%w: RANGE ORDER BY row %d is not numeric", errWindowPlan, row,
+				)
+			}
+			measureWindowNumber(value, &sawNumber, &maxNumberBytes, &maxCompactWeight)
+		}
+		if function.frame.start.kind == windowPreceding ||
+			function.frame.start.kind == windowFollowing {
+			measureWindowNumber(
+				function.frame.start.rangeOffset,
+				&sawNumber, &maxNumberBytes, &maxCompactWeight,
+			)
+		}
+		if function.frame.end.kind == windowPreceding ||
+			function.frame.end.kind == windowFollowing {
+			measureWindowNumber(
+				function.frame.end.rangeOffset,
+				&sawNumber, &maxNumberBytes, &maxCompactWeight,
+			)
 		}
 	}
 
@@ -402,6 +460,11 @@ func measureWindowExecution(
 	work := saturatedBytes(intBytes, intBytes) // order and stable-sort scratch
 	if shape.needsDeque {
 		work = saturatedBytes(work, intBytes)
+	}
+	if shape.extremaEntries != 0 {
+		work = saturatedBytes(work, saturatedProduct(
+			int64(shape.extremaEntries), int64(unsafe.Sizeof(int(0))),
+		))
 	}
 	if shape.needsGroups {
 		if shape.rows == math.MaxInt {
@@ -455,31 +518,77 @@ func measureWindowExecution(
 	return shape, cancellationError(cancel)
 }
 
-func validateWindowFrame(frame windowRowsFrame) error {
-	if frame.unit > windowFrameGroups ||
-		frame.start.kind > windowUnboundedFollowing || frame.end.kind > windowUnboundedFollowing ||
-		frame.start.offset < 0 || frame.end.offset < 0 {
+func validateWindowFrame(frame windowRowsFrame, orderKeyCount ...int) error {
+	if len(orderKeyCount) > 1 {
+		return errWindowFrame
+	}
+	count := -1
+	if len(orderKeyCount) == 1 {
+		count = orderKeyCount[0]
+	}
+	return validateWindowFramePlan(frame, count)
+}
+
+func validateWindowFramePlan(frame windowRowsFrame, orderKeys int) error {
+	if frame.unit > windowFrameRange || frame.exclusion > windowExcludeTies ||
+		frame.start.kind > windowUnboundedFollowing || frame.end.kind > windowUnboundedFollowing {
 		return errWindowFrame
 	}
 	if frame.start.kind == windowUnboundedFollowing ||
 		frame.end.kind == windowUnboundedPreceding {
 		return errWindowFrame
 	}
-	if frame.start.kind != windowPreceding && frame.start.kind != windowFollowing &&
-		frame.start.offset != 0 {
+	if !validateWindowFrameBound(frame.unit, frame.start) ||
+		!validateWindowFrameBound(frame.unit, frame.end) {
 		return errWindowFrame
 	}
-	if frame.end.kind != windowPreceding && frame.end.kind != windowFollowing &&
-		frame.end.offset != 0 {
+	if frame.unit == windowFrameRange && windowFrameHasOffset(frame) && orderKeys != 1 {
 		return errWindowFrame
 	}
-	if compareWindowBounds(frame.start, frame.end) > 0 {
+	if compareWindowBounds(frame.unit, frame.start, frame.end) > 0 {
 		return errWindowFrame
 	}
 	return nil
 }
 
-func compareWindowBounds(left, right windowFrameBound) int {
+func validateWindowFrameBound(unit windowFrameUnit, bound windowFrameBound) bool {
+	bounded := bound.kind == windowPreceding || bound.kind == windowFollowing
+	if unit == windowFrameRange {
+		if !bounded {
+			return bound.offset == 0 && windowScalarUnset(bound.rangeOffset)
+		}
+		if bound.offset != 0 || bound.rangeOffset.kind != kindNumber ||
+			len(bound.rangeOffset.num) == 0 {
+			return false
+		}
+		offset := parseDecimal(bound.rangeOffset.num)
+		return offset.zero || !offset.neg
+	}
+	if !windowScalarUnset(bound.rangeOffset) {
+		return false
+	}
+	if !bounded {
+		return bound.offset == 0
+	}
+	return bound.offset >= 0
+}
+
+func windowScalarUnset(value scalar) bool {
+	return value.kind == kindNull && !value.bval && len(value.num) == 0 &&
+		!value.isInt && value.ival == 0 && value.sval == "" && value.raw == nil
+}
+
+func windowFrameHasOffset(frame windowRowsFrame) bool {
+	return frame.start.kind == windowPreceding || frame.start.kind == windowFollowing ||
+		frame.end.kind == windowPreceding || frame.end.kind == windowFollowing
+}
+
+func windowFrameNeedsGroups(frame windowRowsFrame) bool {
+	return frame.unit == windowFrameGroups || frame.unit == windowFrameRange ||
+		frame.exclusion == windowExcludeGroup || frame.exclusion == windowExcludeTies
+}
+
+func compareWindowBounds(unit windowFrameUnit, left, right windowFrameBound) int {
 	left = normalizeZeroWindowBound(left)
 	right = normalizeZeroWindowBound(right)
 	if left.kind != right.kind {
@@ -490,8 +599,14 @@ func compareWindowBounds(left, right windowFrameBound) int {
 	}
 	switch left.kind {
 	case windowPreceding:
+		if unit == windowFrameRange {
+			return compareScalar(right.rangeOffset, left.rangeOffset)
+		}
 		return compareInts(right.offset, left.offset)
 	case windowFollowing:
+		if unit == windowFrameRange {
+			return compareScalar(left.rangeOffset, right.rangeOffset)
+		}
 		return compareInts(left.offset, right.offset)
 	default:
 		return 0
@@ -499,7 +614,11 @@ func compareWindowBounds(left, right windowFrameBound) int {
 }
 
 func normalizeZeroWindowBound(bound windowFrameBound) windowFrameBound {
-	if (bound.kind == windowPreceding || bound.kind == windowFollowing) && bound.offset == 0 {
+	zero := bound.offset == 0
+	if bound.rangeOffset.kind == kindNumber {
+		zero = parseDecimal(bound.rangeOffset.num).zero
+	}
+	if (bound.kind == windowPreceding || bound.kind == windowFollowing) && zero {
 		bound.kind = windowCurrentRow
 	}
 	return bound
@@ -514,6 +633,29 @@ func compareInts(left, right int) int {
 	default:
 		return 0
 	}
+}
+
+func measureWindowNumber(
+	value scalar,
+	sawNumber *bool,
+	maxNumberBytes *int,
+	maxCompactWeight *int64,
+) {
+	*sawNumber = true
+	*maxNumberBytes = max(*maxNumberBytes, len(value.num))
+	d := parseDecimal(value.num)
+	if d.zero || d.weight.wide {
+		return
+	}
+	weight := d.weight.compact
+	if weight < 0 {
+		if weight == math.MinInt64 {
+			weight = math.MaxInt64
+		} else {
+			weight = -weight
+		}
+	}
+	*maxCompactWeight = max(*maxCompactWeight, weight)
 }
 
 func (e *windowExecutor) prepare(shape windowExecutionShape) error {
@@ -535,6 +677,15 @@ func (e *windowExecutor) prepare(shape windowExecutionShape) error {
 		}
 	} else {
 		e.deque = e.deque[:0]
+	}
+	if shape.extremaEntries != 0 {
+		if cap(e.extrema) < shape.extremaEntries {
+			e.extrema = make([]int, shape.extremaEntries)
+		} else {
+			e.extrema = e.extrema[:shape.extremaEntries]
+		}
+	} else {
+		e.extrema = e.extrema[:0]
 	}
 	if shape.needsGroups {
 		need := shape.rows + 1
@@ -782,7 +933,7 @@ func (e *windowExecutor) walkPartition(
 ) error {
 	count := end - start
 	e.groups = e.groups[:0]
-	if windowFunctionUsesFrame(function.kind) && function.frame.unit == windowFrameGroups {
+	if windowFunctionUsesFrame(function.kind) && windowFrameNeedsGroups(function.frame) {
 		if err := e.buildWindowGroups(input, order, start, end, cancel); err != nil {
 			return err
 		}
@@ -893,29 +1044,29 @@ func (e *windowExecutor) walkPartition(
 			}
 		}
 	case windowCount:
-		return e.walkCount(input, function, outputColumn, start, end, writer, cancel)
+		return e.walkCount(input, order, function, outputColumn, start, end, writer, cancel)
 	case windowSum, windowAvg:
-		return e.walkExact(input, function, outputColumn, start, end, writer, cancel)
+		return e.walkExact(input, order, function, outputColumn, start, end, writer, cancel)
 	case windowMin, windowMax:
-		return e.walkExtreme(input, function, outputColumn, start, end, writer, cancel)
+		return e.walkExtreme(input, order, function, outputColumn, start, end, writer, cancel)
 	case windowFirstValue, windowLastValue, windowNthValue:
 		group := 0
 		for position := 0; position < count; position++ {
 			if err := cancellationCheckpoint(cancel, position); err != nil {
 				return err
 			}
-			lo, hi := resolveWindowFrameAt(
-				function.frame, position, count, e.groups, &group,
+			selection, err := e.resolveWindowFrameSelection(
+				input, order, function.frame, start, position, count, &group, cancel,
 			)
-			target, ok := lo, lo < hi
+			if err != nil {
+				return err
+			}
+			target, ok := selection.positionAt(0)
 			switch function.kind {
 			case windowLastValue:
-				target = hi - 1
+				target, ok = selection.positionAt(selection.count() - 1)
 			case windowNthValue:
-				ok = function.nth <= hi-lo
-				if ok {
-					target = lo + function.nth - 1
-				}
+				target, ok = selection.positionAt(function.nth - 1)
 			}
 			cell := nullCell()
 			if ok {
@@ -935,6 +1086,64 @@ func windowFunctionUsesFrame(kind windowFunctionKind) bool {
 	return kind == windowCount || kind == windowSum || kind == windowAvg ||
 		kind == windowMin || kind == windowMax || kind == windowFirstValue ||
 		kind == windowLastValue || kind == windowNthValue
+}
+
+// windowFrameSelection is one contiguous frame with at most one contiguous
+// exclusion. EXCLUDE TIES keeps the current row inside that excluded peer run.
+// This representation is sufficient for every SQL frame exclusion while
+// keeping row loops allocation-free and allowing sliding aggregates to retain
+// their contiguous base-frame state.
+type windowFrameSelection struct {
+	lo, hi         int
+	skipLo, skipHi int
+	keep           int
+}
+
+func (s windowFrameSelection) excluded(position int) bool {
+	return position >= s.skipLo && position < s.skipHi && position != s.keep
+}
+
+func (s windowFrameSelection) count() int {
+	count := s.hi - s.lo - (s.skipHi - s.skipLo)
+	if s.keep >= s.skipLo && s.keep < s.skipHi {
+		count++
+	}
+	return count
+}
+
+func (s windowFrameSelection) positionAt(ordinal int) (int, bool) {
+	if ordinal < 0 || ordinal >= s.count() {
+		return 0, false
+	}
+	first := s.skipLo - s.lo
+	if ordinal < first {
+		return s.lo + ordinal, true
+	}
+	ordinal -= first
+	if s.keep >= s.skipLo && s.keep < s.skipHi {
+		if ordinal == 0 {
+			return s.keep, true
+		}
+		ordinal--
+	}
+	return s.skipHi + ordinal, true
+}
+
+func windowExtremaEntries(rows int) (int, bool) {
+	if rows <= 0 {
+		return 0, rows == 0
+	}
+	leaves := 1
+	for leaves < rows {
+		if leaves > math.MaxInt/2 {
+			return 0, false
+		}
+		leaves *= 2
+	}
+	if leaves > math.MaxInt/2 {
+		return 0, false
+	}
+	return leaves * 2, true
 }
 
 func windowTile(position, rows, buckets int) (int, error) {
@@ -1001,6 +1210,472 @@ func resolveWindowFrame(frame windowRowsFrame, position, rows int) (int, int) {
 	return resolveWindowFrameAt(frame, position, rows, nil, &group)
 }
 
+func (e *windowExecutor) resolveWindowFrameSelection(
+	input *relationSpool,
+	order []windowOrderKey,
+	frame windowRowsFrame,
+	partitionStart, position, rows int,
+	group *int,
+	cancel *CancelFlag,
+) (windowFrameSelection, error) {
+	if len(e.groups) >= 2 {
+		advanceWindowGroup(e.groups, position, group)
+	}
+	var lo, hi int
+	var err error
+	if frame.unit == windowFrameRange {
+		lo, hi, err = e.resolveWindowRange(
+			input, order, frame, partitionStart, position, rows, *group, cancel,
+		)
+	} else {
+		lo, hi = resolveWindowFrameAt(frame, position, rows, e.groups, group)
+	}
+	if err != nil {
+		return windowFrameSelection{}, err
+	}
+	selection := windowFrameSelection{
+		lo: lo, hi: hi, skipLo: hi, skipHi: hi, keep: -1,
+	}
+	switch frame.exclusion {
+	case windowExcludeNoOthers:
+		return selection, nil
+	case windowExcludeCurrentRow:
+		selection.skipLo = max(lo, position)
+		selection.skipHi = min(hi, position+1)
+	case windowExcludeGroup, windowExcludeTies:
+		peerLo, peerHi := e.groups[*group], e.groups[*group+1]
+		selection.skipLo = max(lo, peerLo)
+		selection.skipHi = min(hi, peerHi)
+		if frame.exclusion == windowExcludeTies && position >= lo && position < hi {
+			selection.keep = position
+		}
+	}
+	if selection.skipHi < selection.skipLo {
+		selection.skipLo, selection.skipHi = hi, hi
+		selection.keep = -1
+	}
+	return selection, cancellationError(cancel)
+}
+
+func advanceWindowGroup(groups []int, position int, group *int) {
+	for *group+1 < len(groups)-1 && position >= groups[*group+1] {
+		*group = *group + 1
+	}
+}
+
+func (e *windowExecutor) resolveWindowRange(
+	input *relationSpool,
+	order []windowOrderKey,
+	frame windowRowsFrame,
+	partitionStart, position, rows, group int,
+	cancel *CancelFlag,
+) (int, int, error) {
+	lo, err := e.resolveWindowRangeBound(
+		input, order, frame.start, true, partitionStart, position, rows, group, cancel,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	hi, err := e.resolveWindowRangeBound(
+		input, order, frame.end, false, partitionStart, position, rows, group, cancel,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	if hi < lo {
+		hi = lo
+	}
+	return lo, hi, cancellationError(cancel)
+}
+
+func (e *windowExecutor) resolveWindowRangeBound(
+	input *relationSpool,
+	order []windowOrderKey,
+	bound windowFrameBound,
+	start bool,
+	partitionStart, position, rows, group int,
+	cancel *CancelFlag,
+) (int, error) {
+	switch bound.kind {
+	case windowUnboundedPreceding:
+		return 0, nil
+	case windowCurrentRow:
+		if start {
+			return e.groups[group], nil
+		}
+		return e.groups[group+1], nil
+	case windowUnboundedFollowing:
+		return rows, nil
+	}
+
+	key := order[0]
+	current := input.columns[key.column][e.order[partitionStart+position]]
+	if current.kind == kindNull {
+		if start {
+			return e.groups[group], nil
+		}
+		return e.groups[group+1], nil
+	}
+	subtract := bound.kind == windowPreceding
+	if key.descending {
+		subtract = !subtract
+	}
+	target, wideTarget, err := e.windowRangeTarget(
+		current, bound.rangeOffset, subtract, cancel,
+	)
+	if err != nil {
+		return 0, err
+	}
+	lo, hi := 0, rows
+	for lo < hi {
+		if err := cancellationCheckpoint(cancel, lo); err != nil {
+			return 0, err
+		}
+		middle := lo + (hi-lo)/2
+		candidate := input.columns[key.column][e.order[partitionStart+middle]]
+		comparison := 0
+		if wideTarget {
+			comparison, err = e.compareWideWindowRangeTarget(candidate, key, cancel)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			comparison = compareWindowOrderValues(candidate, target, key)
+		}
+		if comparison < 0 || !start && comparison == 0 {
+			lo = middle + 1
+		} else {
+			hi = middle
+		}
+	}
+	return lo, cancellationError(cancel)
+}
+
+func (e *windowExecutor) windowRangeTarget(
+	current, offset scalar,
+	subtract bool,
+	cancel *CancelFlag,
+) (scalar, bool, error) {
+	e.rangeTarget.reset()
+	currentCoeff, currentScale, currentOK := windowCompactDecimal(current)
+	offsetCoeff, offsetScale, offsetOK := windowCompactDecimal(offset)
+	compact := currentOK && offsetOK
+	if compact {
+		if subtract {
+			if offsetCoeff == math.MinInt64 {
+				compact = false
+			} else {
+				offsetCoeff = -offsetCoeff
+			}
+		}
+		if compact {
+			scale := min(currentScale, offsetScale)
+			leftShift, leftShiftOK := windowScaleDifference(currentScale, scale)
+			rightShift, rightShiftOK := windowScaleDifference(offsetScale, scale)
+			left, leftOK := multiplyPow10Int64(currentCoeff, leftShift)
+			right, rightOK := multiplyPow10Int64(offsetCoeff, rightShift)
+			coefficient, sumOK := checkedAddInt64(left, right)
+			compact = leftShiftOK && rightShiftOK && leftOK && rightOK && sumOK
+			if compact {
+				e.rangeTarget.set = true
+				e.rangeTarget.smallCoeff = coefficient
+				e.rangeTarget.smallScale = scale
+				e.rangeTarget.digits = intDigits64(coefficient)
+			}
+		}
+	}
+	if !compact {
+		if err := e.setWideWindowRangeTarget(current, offset, subtract, cancel); err != nil {
+			return scalar{}, false, err
+		}
+		return scalar{}, true, nil
+	}
+	cell, err := e.windowDecimalCell(&e.rangeTarget)
+	if err != nil {
+		return scalar{}, false, err
+	}
+	target := scalar{kind: kindNumber, num: cell.raw, raw: cell.raw}
+	if integer, ok := cell.Int64(); ok {
+		target.isInt, target.ival = true, integer
+	}
+	return target, false, nil
+}
+
+func windowCompactDecimal(value scalar) (coefficient, scale int64, ok bool) {
+	if value.isInt {
+		return value.ival, 0, true
+	}
+	d := parseDecimal(value.num)
+	if d.zero {
+		return 0, 0, true
+	}
+	digits := len(d.intDigits) + len(d.fracDigits)
+	if digits > 18 || d.weight.wide {
+		return 0, 0, false
+	}
+	for at := 0; at < digits; at++ {
+		digit, _ := significantDigitAt(&d, at)
+		coefficient = coefficient*10 + int64(digit-'0')
+	}
+	if d.neg {
+		coefficient = -coefficient
+	}
+	scale, ok = checkedAddInt64(d.weight.compact, -int64(digits-1))
+	return coefficient, scale, ok
+}
+
+func windowScaleDifference(high, low int64) (int64, bool) {
+	if high < low {
+		return 0, false
+	}
+	if low == math.MinInt64 {
+		if high >= 0 {
+			return 0, false
+		}
+		return high - low, true
+	}
+	return checkedAddInt64(high, -low)
+}
+
+func (e *windowExecutor) setWideWindowRangeTarget(
+	current, offset scalar,
+	subtract bool,
+	cancel *CancelFlag,
+) error {
+	s := &e.rangeTarget
+	inputBytes := saturatedBytes(int64(len(current.num)), int64(len(offset.num)))
+	initialNeed := saturatedBytes(
+		aggregateAccBaseBytes,
+		saturatedProduct(saturatedBytes(inputBytes, 64), 16),
+	)
+	if initialNeed == math.MaxInt64 {
+		return errWindowSize
+	}
+	if err := e.aggregateLease.reserve(&e.aggregateBudget, initialNeed); err != nil {
+		return err
+	}
+
+	currentDecimal := parseDecimal(current.num)
+	offsetDecimal := parseDecimal(offset.num)
+	currentDigits, err := setWindowBigDecimal(
+		&s.coeff, &s.scale, &currentDecimal, &s.aux, cancel,
+	)
+	if err != nil {
+		return err
+	}
+	offsetDigits, err := setWindowBigDecimal(
+		&s.termCoeff, &s.termScale, &offsetDecimal, &s.aux, cancel,
+	)
+	if err != nil {
+		return err
+	}
+	if subtract {
+		s.termCoeff.Neg(&s.termCoeff)
+	}
+
+	comparison := s.scale.Cmp(&s.termScale)
+	shift := int64(0)
+	switch {
+	case comparison > 0:
+		s.tmp.Sub(&s.scale, &s.termScale)
+	case comparison < 0:
+		s.tmp.Sub(&s.termScale, &s.scale)
+	}
+	if comparison != 0 {
+		var ok bool
+		shift, ok = boundedBigShift(&s.tmp, e.aggregateBudget.limit)
+		if !ok {
+			return budgetError(&e.aggregateBudget, math.MaxInt64)
+		}
+	}
+	predicted := saturatedBytes(int64(max(currentDigits, offsetDigits)), shift)
+	predicted = saturatedBytes(predicted, 1)
+	need := saturatedBytes(
+		aggregateAccBaseBytes,
+		saturatedProduct(saturatedBytes(predicted, inputBytes+64), 16),
+	)
+	if need == math.MaxInt64 {
+		return errWindowSize
+	}
+	if err := e.aggregateLease.reserve(&e.aggregateBudget, need); err != nil {
+		return err
+	}
+	switch {
+	case comparison > 0:
+		if err := multiplyWindowPow10(&s.coeff, shift, &s.aux, cancel); err != nil {
+			return err
+		}
+		s.scale.Set(&s.termScale)
+	case comparison < 0:
+		if err := multiplyWindowPow10(&s.termCoeff, shift, &s.aux, cancel); err != nil {
+			return err
+		}
+	}
+	s.coeff.Add(&s.coeff, &s.termCoeff)
+	s.set = true
+	s.big = true
+	if s.coeff.Sign() == 0 {
+		s.scale.SetInt64(0)
+		s.digits = 1
+		return cancellationError(cancel)
+	}
+	if predicted > int64(math.MaxInt) {
+		return errWindowSize
+	}
+	s.digits = int(predicted)
+	return cancellationError(cancel)
+}
+
+func (e *windowExecutor) compareWideWindowRangeTarget(
+	candidate scalar,
+	key windowOrderKey,
+	cancel *CancelFlag,
+) (int, error) {
+	if candidate.kind == kindNull {
+		if key.nulls == windowNullsFirst {
+			return -1, nil
+		}
+		return 1, nil
+	}
+	c := &e.rangeCandidate
+	c.reset()
+	initialNeed := saturatedBytes(
+		aggregateAccBaseBytes,
+		saturatedProduct(saturatedBytes(int64(len(candidate.num)), 64), 16),
+	)
+	if initialNeed == math.MaxInt64 {
+		return 0, errWindowSize
+	}
+	if err := e.aggregateLease.reserve(&e.aggregateBudget, initialNeed); err != nil {
+		return 0, err
+	}
+	parsed := parseDecimal(candidate.num)
+	digits, err := setWindowBigDecimal(
+		&c.coeff, &c.scale, &parsed, &c.aux, cancel,
+	)
+	if err != nil {
+		return 0, err
+	}
+	comparison := c.scale.Cmp(&e.rangeTarget.scale)
+	shift := int64(0)
+	if comparison > 0 {
+		c.tmp.Sub(&c.scale, &e.rangeTarget.scale)
+	} else if comparison < 0 {
+		c.tmp.Sub(&e.rangeTarget.scale, &c.scale)
+	}
+	if comparison != 0 {
+		var ok bool
+		shift, ok = boundedBigShift(&c.tmp, e.aggregateBudget.limit)
+		if !ok {
+			return 0, budgetError(&e.aggregateBudget, math.MaxInt64)
+		}
+	}
+	predicted := saturatedBytes(int64(max(digits, e.rangeTarget.digits)), shift)
+	need := saturatedBytes(
+		aggregateAccBaseBytes,
+		saturatedProduct(saturatedBytes(predicted, int64(len(candidate.num))+64), 16),
+	)
+	if need == math.MaxInt64 {
+		return 0, errWindowSize
+	}
+	if err := e.aggregateLease.reserve(&e.aggregateBudget, need); err != nil {
+		return 0, err
+	}
+
+	var result int
+	switch {
+	case comparison > 0:
+		c.termCoeff.Set(&c.coeff)
+		if err := multiplyWindowPow10(&c.termCoeff, shift, &c.aux, cancel); err != nil {
+			return 0, err
+		}
+		result = c.termCoeff.Cmp(&e.rangeTarget.coeff)
+	case comparison < 0:
+		c.termCoeff.Set(&e.rangeTarget.coeff)
+		if err := multiplyWindowPow10(&c.termCoeff, shift, &c.aux, cancel); err != nil {
+			return 0, err
+		}
+		result = c.coeff.Cmp(&c.termCoeff)
+	default:
+		result = c.coeff.Cmp(&e.rangeTarget.coeff)
+	}
+	if key.descending {
+		result = -result
+	}
+	return result, cancellationError(cancel)
+}
+
+func setWindowBigDecimal(
+	coefficient, scale *big.Int,
+	value *decimal,
+	scratch *big.Int,
+	cancel *CancelFlag,
+) (int, error) {
+	coefficient.SetInt64(0)
+	scale.SetInt64(0)
+	if value.zero {
+		return 1, cancellationError(cancel)
+	}
+	digits := len(value.intDigits) + len(value.fracDigits)
+	for at := 0; at < digits; at++ {
+		if err := cancellationCheckpoint(cancel, at); err != nil {
+			return 0, err
+		}
+		digit, _ := significantDigitAt(value, at)
+		coefficient.Mul(coefficient, aggregateBigTen)
+		scratch.SetInt64(int64(digit - '0'))
+		coefficient.Add(coefficient, scratch)
+	}
+	if value.neg {
+		coefficient.Neg(coefficient)
+	}
+	if !value.weight.wide {
+		scale.SetInt64(value.weight.compact)
+	} else {
+		for at, count := 0, weightMagnitudeLen(&value.weight); at < count; at++ {
+			if err := cancellationCheckpoint(cancel, at); err != nil {
+				return 0, err
+			}
+			scale.Mul(scale, aggregateBigTen)
+			scratch.SetInt64(int64(weightMagnitudeDigit(&value.weight, at) - '0'))
+			scale.Add(scale, scratch)
+		}
+		if value.weight.neg {
+			scale.Neg(scale)
+		}
+	}
+	scratch.SetInt64(int64(digits - 1))
+	scale.Sub(scale, scratch)
+	return digits, cancellationError(cancel)
+}
+
+func multiplyWindowPow10(
+	value *big.Int,
+	shift int64,
+	scratch *big.Int,
+	cancel *CancelFlag,
+) error {
+	const chunkDigits = int64(18)
+	const chunk = int64(1_000_000_000_000_000_000)
+	scratch.SetInt64(chunk)
+	for at := int64(0); shift >= chunkDigits; at++ {
+		if err := cancellationCheckpoint(cancel, int(at)); err != nil {
+			return err
+		}
+		value.Mul(value, scratch)
+		shift -= chunkDigits
+	}
+	if shift != 0 {
+		power := int64(1)
+		for range shift {
+			power *= 10
+		}
+		scratch.SetInt64(power)
+		value.Mul(value, scratch)
+	}
+	return cancellationError(cancel)
+}
+
 func resolveWindowFrameAt(
 	frame windowRowsFrame,
 	position, rows int,
@@ -1008,9 +1683,7 @@ func resolveWindowFrameAt(
 	group *int,
 ) (int, int) {
 	if frame.unit == windowFrameGroups {
-		for *group+1 < len(groups)-1 && position >= groups[*group+1] {
-			*group = *group + 1
-		}
+		advanceWindowGroup(groups, position, group)
 		start := resolveWindowGroupStart(frame.start, *group, rows, groups)
 		end := resolveWindowGroupEnd(frame.end, *group, rows, groups)
 		if end < start {
@@ -1146,6 +1819,7 @@ func resolveWindowEnd(bound windowFrameBound, position, rows int) int {
 
 func (e *windowExecutor) walkCount(
 	input *relationSpool,
+	order []windowOrderKey,
 	function windowFunctionSpec,
 	outputColumn, partitionStart, partitionEnd int,
 	writer *windowOutputWriter,
@@ -1158,9 +1832,13 @@ func (e *windowExecutor) walkCount(
 		if err := cancellationCheckpoint(cancel, position); err != nil {
 			return err
 		}
-		wantLo, wantHi := resolveWindowFrameAt(
-			function.frame, position, rows, e.groups, &group,
+		selection, err := e.resolveWindowFrameSelection(
+			input, order, function.frame, partitionStart, position, rows, &group, cancel,
 		)
+		if err != nil {
+			return err
+		}
+		wantLo, wantHi := selection.lo, selection.hi
 		for hi < wantHi {
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
@@ -1182,8 +1860,18 @@ func (e *windowExecutor) walkCount(
 			}
 			lo++
 		}
+		selectedCount := count
+		for at := selection.skipLo; at < selection.skipHi; at++ {
+			if err := cancellationCheckpoint(cancel, at); err != nil {
+				return err
+			}
+			if selection.excluded(at) &&
+				(function.column < 0 || input.columns[function.column][e.order[partitionStart+at]].kind != kindNull) {
+				selectedCount--
+			}
+		}
 		if err := writer.put(
-			outputColumn, e.order[partitionStart+position], windowIntegerCell(count),
+			outputColumn, e.order[partitionStart+position], windowIntegerCell(selectedCount),
 		); err != nil {
 			return err
 		}
@@ -1193,6 +1881,7 @@ func (e *windowExecutor) walkCount(
 
 func (e *windowExecutor) walkExact(
 	input *relationSpool,
+	order []windowOrderKey,
 	function windowFunctionSpec,
 	outputColumn, partitionStart, partitionEnd int,
 	writer *windowOutputWriter,
@@ -1206,9 +1895,13 @@ func (e *windowExecutor) walkExact(
 		if err := cancellationCheckpoint(cancel, position); err != nil {
 			return err
 		}
-		wantLo, wantHi := resolveWindowFrameAt(
-			function.frame, position, rows, e.groups, &group,
+		selection, err := e.resolveWindowFrameSelection(
+			input, order, function.frame, partitionStart, position, rows, &group, cancel,
 		)
+		if err != nil {
+			return err
+		}
+		wantLo, wantHi := selection.lo, selection.hi
 		for hi < wantHi {
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
@@ -1240,6 +1933,24 @@ func (e *windowExecutor) walkExact(
 			}
 			lo++
 		}
+		for at := selection.skipLo; at < selection.skipHi; at++ {
+			if err := cancellationCheckpoint(cancel, at); err != nil {
+				return err
+			}
+			if !selection.excluded(at) {
+				continue
+			}
+			value := input.columns[function.column][e.order[partitionStart+at]]
+			if value.kind == kindNumber {
+				if err := e.subtractWindowNumber(value); err != nil {
+					return err
+				}
+				e.aggregate.n--
+				if e.aggregate.n == 0 {
+					e.aggregate.sum.reset()
+				}
+			}
+		}
 		cell, err := e.windowExactCell(function.kind)
 		if err != nil {
 			return err
@@ -1247,11 +1958,36 @@ func (e *windowExecutor) walkExact(
 		if err := writer.put(outputColumn, e.order[partitionStart+position], cell); err != nil {
 			return err
 		}
+		for at := selection.skipLo; at < selection.skipHi; at++ {
+			if err := cancellationCheckpoint(cancel, at); err != nil {
+				return err
+			}
+			if !selection.excluded(at) {
+				continue
+			}
+			value := input.columns[function.column][e.order[partitionStart+at]]
+			if value.kind == kindNumber {
+				if err := e.aggregate.sum.add(
+					value, &e.aggregateLease, &e.aggregateBudget,
+				); err != nil {
+					return err
+				}
+				e.aggregate.n++
+			}
+		}
 	}
 	return cancellationError(cancel)
 }
 
 func (e *windowExecutor) subtractWindowNumber(value scalar) error {
+	negated, err := e.negatedWindowNumber(value)
+	if err != nil {
+		return err
+	}
+	return e.aggregate.sum.add(negated, &e.aggregateLease, &e.aggregateBudget)
+}
+
+func (e *windowExecutor) negatedWindowNumber(value scalar) (scalar, error) {
 	negated := value
 	negated.isInt = false
 	if value.isInt && value.ival != math.MinInt64 {
@@ -1264,14 +2000,14 @@ func (e *windowExecutor) subtractWindowNumber(value scalar) error {
 	} else {
 		e.negative = e.negative[:0]
 		if cap(e.negative) < len(value.num)+1 {
-			return errWindowSize
+			return scalar{}, errWindowSize
 		}
 		e.negative = append(e.negative, '-')
 		e.negative = append(e.negative, value.num...)
 		negated.num = e.negative
 		negated.raw = e.negative
 	}
-	return e.aggregate.sum.add(negated, &e.aggregateLease, &e.aggregateBudget)
+	return negated, nil
 }
 
 func (e *windowExecutor) windowExactCell(kind windowFunctionKind) (Cell, error) {
@@ -1609,11 +2345,18 @@ func windowAverageInt64(negative bool, digits []byte, scale int64) (int64, bool)
 
 func (e *windowExecutor) walkExtreme(
 	input *relationSpool,
+	order []windowOrderKey,
 	function windowFunctionSpec,
 	outputColumn, partitionStart, partitionEnd int,
 	writer *windowOutputWriter,
 	cancel *CancelFlag,
 ) error {
+	if function.frame.exclusion != windowExcludeNoOthers {
+		return e.walkExcludedExtreme(
+			input, order, function, outputColumn,
+			partitionStart, partitionEnd, writer, cancel,
+		)
+	}
 	e.deque = e.deque[:0]
 	head := 0
 	rows := partitionEnd - partitionStart
@@ -1623,9 +2366,13 @@ func (e *windowExecutor) walkExtreme(
 		if err := cancellationCheckpoint(cancel, position); err != nil {
 			return err
 		}
-		wantLo, wantHi := resolveWindowFrameAt(
-			function.frame, position, rows, e.groups, &group,
+		selection, err := e.resolveWindowFrameSelection(
+			input, order, function.frame, partitionStart, position, rows, &group, cancel,
 		)
+		if err != nil {
+			return err
+		}
+		wantLo, wantHi := selection.lo, selection.hi
 		for hi < wantHi {
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
@@ -1659,8 +2406,95 @@ func (e *windowExecutor) walkExtreme(
 			lo++
 		}
 		cell := nullCell()
-		if head < len(e.deque) {
-			row := e.order[partitionStart+e.deque[head]]
+		for at := head; at < len(e.deque); at++ {
+			position := e.deque[at]
+			if selection.excluded(position) {
+				continue
+			}
+			row := e.order[partitionStart+position]
+			cell = cellFromScalar(input.columns[function.column][row])
+			break
+		}
+		if err := writer.put(outputColumn, e.order[partitionStart+position], cell); err != nil {
+			return err
+		}
+	}
+	return cancellationError(cancel)
+}
+
+func (e *windowExecutor) walkExcludedExtreme(
+	input *relationSpool,
+	order []windowOrderKey,
+	function windowFunctionSpec,
+	outputColumn, partitionStart, partitionEnd int,
+	writer *windowOutputWriter,
+	cancel *CancelFlag,
+) error {
+	rows := partitionEnd - partitionStart
+	entries, ok := windowExtremaEntries(rows)
+	if !ok || entries > len(e.extrema) {
+		return errWindowSize
+	}
+	tree := e.extrema[:entries]
+	for at := range tree {
+		if err := cancellationCheckpoint(cancel, at); err != nil {
+			return err
+		}
+		tree[at] = -1
+	}
+	leaves := entries / 2
+	for position := 0; position < rows; position++ {
+		value := input.columns[function.column][e.order[partitionStart+position]]
+		if value.kind == kindNumber {
+			tree[leaves+position] = position
+		}
+	}
+	for node := leaves - 1; node > 0; node-- {
+		if err := cancellationCheckpoint(cancel, node); err != nil {
+			return err
+		}
+		tree[node] = e.chooseWindowExtreme(
+			input, function, partitionStart, tree[node*2], tree[node*2+1],
+		)
+	}
+
+	group := 0
+	for position := 0; position < rows; position++ {
+		if err := cancellationCheckpoint(cancel, position); err != nil {
+			return err
+		}
+		selection, err := e.resolveWindowFrameSelection(
+			input, order, function.frame, partitionStart, position, rows, &group, cancel,
+		)
+		if err != nil {
+			return err
+		}
+		best, err := e.queryWindowExtreme(
+			input, function, partitionStart, tree, leaves,
+			selection.lo, selection.skipLo, cancel,
+		)
+		if err != nil {
+			return err
+		}
+		if selection.keep >= selection.skipLo && selection.keep < selection.skipHi {
+			value := input.columns[function.column][e.order[partitionStart+selection.keep]]
+			if value.kind == kindNumber {
+				best = e.chooseWindowExtreme(
+					input, function, partitionStart, best, selection.keep,
+				)
+			}
+		}
+		tail, err := e.queryWindowExtreme(
+			input, function, partitionStart, tree, leaves,
+			selection.skipHi, selection.hi, cancel,
+		)
+		if err != nil {
+			return err
+		}
+		best = e.chooseWindowExtreme(input, function, partitionStart, best, tail)
+		cell := nullCell()
+		if best >= 0 {
+			row := e.order[partitionStart+best]
 			cell = cellFromScalar(input.columns[function.column][row])
 		}
 		if err := writer.put(outputColumn, e.order[partitionStart+position], cell); err != nil {
@@ -1668,4 +2502,55 @@ func (e *windowExecutor) walkExtreme(
 		}
 	}
 	return cancellationError(cancel)
+}
+
+func (e *windowExecutor) queryWindowExtreme(
+	input *relationSpool,
+	function windowFunctionSpec,
+	partitionStart int,
+	tree []int,
+	leaves, lo, hi int,
+	cancel *CancelFlag,
+) (int, error) {
+	best := -1
+	left, right := leaves+lo, leaves+hi
+	for left < right {
+		if err := cancellationCheckpoint(cancel, left); err != nil {
+			return -1, err
+		}
+		if left&1 != 0 {
+			best = e.chooseWindowExtreme(input, function, partitionStart, best, tree[left])
+			left++
+		}
+		if right&1 != 0 {
+			right--
+			best = e.chooseWindowExtreme(input, function, partitionStart, best, tree[right])
+		}
+		left /= 2
+		right /= 2
+	}
+	return best, cancellationError(cancel)
+}
+
+func (e *windowExecutor) chooseWindowExtreme(
+	input *relationSpool,
+	function windowFunctionSpec,
+	partitionStart, left, right int,
+) int {
+	if left < 0 {
+		return right
+	}
+	if right < 0 {
+		return left
+	}
+	leftValue := input.columns[function.column][e.order[partitionStart+left]]
+	rightValue := input.columns[function.column][e.order[partitionStart+right]]
+	comparison := compareScalar(leftValue, rightValue)
+	if function.kind == windowMax {
+		comparison = -comparison
+	}
+	if comparison < 0 || comparison == 0 && left < right {
+		return left
+	}
+	return right
 }

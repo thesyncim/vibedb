@@ -33,9 +33,31 @@ func FuzzWindowKernelAgainstReference(f *testing.F) {
 		}
 		input := buildSetTestSpoolColumns(t, decoded, 3)
 		frameSpec := windowRowsFrame{
-			unit:  windowFrameUnit(next() & 1),
-			start: windowFrameBound{kind: windowPreceding, offset: int(next() % 5)},
-			end:   windowFrameBound{kind: windowFollowing, offset: int(next() % 5)},
+			unit:      windowFrameUnit(next() % 3),
+			exclusion: windowFrameExclusion(next() % 4),
+		}
+		if frameSpec.unit == windowFrameRange {
+			switch next() % 3 {
+			case 0:
+				frameSpec.start.kind = windowUnboundedPreceding
+				frameSpec.end.kind = windowCurrentRow
+			case 1:
+				frameSpec.start.kind = windowCurrentRow
+				frameSpec.end.kind = windowCurrentRow
+			default:
+				offsets := [...]string{`0`, `0.5`, `1`, `2`, `1e-34`}
+				frameSpec.start = windowFrameBound{
+					kind:        windowPreceding,
+					rangeOffset: windowTestScalar(t, offsets[int(next())%len(offsets)]),
+				}
+				frameSpec.end = windowFrameBound{
+					kind:        windowFollowing,
+					rangeOffset: windowTestScalar(t, offsets[int(next())%len(offsets)]),
+				}
+			}
+		} else {
+			frameSpec.start = windowFrameBound{kind: windowPreceding, offset: int(next() % 5)}
+			frameSpec.end = windowFrameBound{kind: windowFollowing, offset: int(next() % 5)}
 		}
 		plan := windowPlan{
 			partition: []int{0},

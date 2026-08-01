@@ -1,6 +1,9 @@
 package query
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func BenchmarkWindowKernel(b *testing.B) {
 	input := buildWindowRows(b, 2048)
@@ -12,6 +15,19 @@ func BenchmarkWindowKernel(b *testing.B) {
 		unit:  windowFrameGroups,
 		start: windowFrameBound{kind: windowPreceding, offset: 2},
 		end:   windowFrameBound{kind: windowFollowing, offset: 1},
+	}
+	excludedFrame := frameSpec
+	excludedFrame.exclusion = windowExcludeGroup
+	rangeBytes := []byte(`2.5`)
+	rangeOffset := scalar{kind: kindNumber, num: rangeBytes, raw: rangeBytes}
+	rangeFrame := windowRowsFrame{
+		unit: windowFrameRange,
+		start: windowFrameBound{
+			kind: windowPreceding, rangeOffset: rangeOffset,
+		},
+		end: windowFrameBound{
+			kind: windowFollowing, rangeOffset: rangeOffset,
+		},
 	}
 	functions := []struct {
 		name string
@@ -34,6 +50,10 @@ func BenchmarkWindowKernel(b *testing.B) {
 		{"last_value", windowFunctionSpec{kind: windowLastValue, column: 2, frame: frameSpec}},
 		{"nth_value", windowFunctionSpec{kind: windowNthValue, column: 2, nth: 4, frame: frameSpec}},
 		{"groups_sum", windowFunctionSpec{kind: windowSum, column: 2, frame: groupsFrame}},
+		{"exclude_group_sum", windowFunctionSpec{kind: windowSum, column: 2, frame: excludedFrame}},
+		{"exclude_group_max", windowFunctionSpec{kind: windowMax, column: 2, frame: excludedFrame}},
+		{"range_sum", windowFunctionSpec{kind: windowSum, column: 2, frame: rangeFrame}},
+		{"range_first_value", windowFunctionSpec{kind: windowFirstValue, column: 2, frame: rangeFrame}},
 	}
 	for _, function := range functions {
 		b.Run(function.name, func(b *testing.B) {
@@ -76,4 +96,27 @@ func benchmarkWindowPlan(b *testing.B, input *relationSpool, plan *windowPlan) {
 		windowSink += executor.result.rows
 		frame.intermediate.release(charge)
 	}
+}
+
+func BenchmarkWindowKernelWideRange(b *testing.B) {
+	rows := make([][]string, 256)
+	for row := range rows {
+		rows[row] = []string{fmt.Sprintf("10000000000000000000000000000000%03d", row)}
+	}
+	input := buildSetTestSpool(b, rows)
+	offsetBytes := []byte(`1.5`)
+	offset := scalar{kind: kindNumber, num: offsetBytes, raw: offsetBytes}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: windowRowsFrame{
+			unit: windowFrameRange,
+			start: windowFrameBound{
+				kind: windowPreceding, rangeOffset: offset,
+			},
+			end: windowFrameBound{
+				kind: windowFollowing, rangeOffset: offset,
+			},
+		}}},
+	}
+	benchmarkWindowPlan(b, &input, &plan)
 }
