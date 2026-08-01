@@ -43,6 +43,19 @@ func (c *conn) validateSurfaceContext(
 			}
 		}
 	}
+	if statement.Kind == sqlast.KindDropTable && statement.DropTable.IfExists {
+		// DROP TABLE IF EXISTS is intentionally preparable before the table is
+		// present. Execution rechecks the catalog under its exclusive lock.
+		return nil
+	}
+	if statement.Kind == sqlast.KindDropIndex {
+		if err := rlockContext(ctx, &c.db.mu); err != nil {
+			return err
+		}
+		defer c.db.mu.RUnlock()
+		_, _, err := c.db.resolveDropIndexLocked(statement.DropIndex)
+		return err
+	}
 	if err := rlockContext(ctx, &c.db.mu); err != nil {
 		return err
 	}

@@ -79,6 +79,7 @@ const (
 	kwDelete
 	kwDesc
 	kwDistinct
+	kwDo
 	kwDrop
 	kwEscape
 	kwExcept
@@ -114,6 +115,7 @@ const (
 	kwNot
 	kwNull
 	kwNulls
+	kwNothing
 	kwOffset
 	kwOn
 	kwOr
@@ -208,6 +210,8 @@ func keywordOf(s string) keyword {
 		return kwDesc
 	case "DISTINCT":
 		return kwDistinct
+	case "DO":
+		return kwDo
 	case "DROP":
 		return kwDrop
 	case "ESCAPE":
@@ -278,6 +282,8 @@ func keywordOf(s string) keyword {
 		return kwNull
 	case "NULLS":
 		return kwNulls
+	case "NOTHING":
+		return kwNothing
 	case "OFFSET":
 		return kwOffset
 	case "ON":
@@ -355,7 +361,7 @@ func keywordOf(s string) keyword {
 // this dialect's own addition, and reserving a word SQL does not would surprise
 // an author who has never seen it.
 //
-// CONFLICT, DEFAULT, RETURNING, and the three refused statement kinds MERGE,
+// CONFLICT, DEFAULT, DO, NOTHING, RETURNING, and the three refused statement kinds MERGE,
 // REPLACE, and TRUNCATE are not reserved either, and the rule above says why.
 // Reserving a word costs every document that has a field of that name, and
 // these buy nothing in return: each is matched positionally, where a clause
@@ -369,7 +375,7 @@ func reserved(kw keyword) bool {
 	case kwNone,
 		kwCount, kwSum, kwAvg, kwMin, kwMax,
 		kwMissing, kwNulls, kwFirst, kwLast, kwEscape,
-		kwConflict, kwDefault, kwReturning, kwMerge, kwReplace, kwTruncate,
+		kwConflict, kwDefault, kwDo, kwNothing, kwReturning, kwMerge, kwReplace, kwTruncate,
 		kwAlter, kwCreate, kwDrop, kwIf, kwIndex, kwKey, kwPrimary, kwTable,
 		kwUnique, kwView:
 		return false

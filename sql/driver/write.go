@@ -39,6 +39,7 @@ func (c *conn) execMutationContext(
 	statement *query.DMLStatement,
 	args []any,
 ) (sqldriver.Result, error) {
+	ctx = withCooperativeCancellation(ctx, c.exec.Options.Cancel)
 	d := c.db
 	if statement.Kind() == query.DDLCreateIndex {
 		return d.createIndexContext(ctx, statement)
@@ -62,6 +63,29 @@ func (c *conn) execMutationContext(
 	switch statement.Kind() {
 	case query.DDLCreateTable:
 		return d.createTableLockedContext(ctx, statement)
+	case query.DDLDropTable:
+		return d.dropTableLockedContext(ctx, statement)
+	case query.DDLTruncate:
+		if err := d.truncateTableStorageLockedContext(
+			ctx, statement.Tree().Truncate.Table,
+		); err != nil {
+			return nil, err
+		}
+		return result{}, nil
+	case query.DDLDropIndex:
+		tableName, found, err := d.resolveDropIndexLocked(statement.Tree().DropIndex)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return result{}, nil
+		}
+		if err := d.dropIndexStorageLockedContext(
+			ctx, tableName, statement.Tree().DropIndex.Name,
+		); err != nil {
+			return nil, err
+		}
+		return result{}, nil
 	}
 	t, ok := d.tables[statement.Collection()]
 	if !ok {
@@ -80,6 +104,63 @@ func (c *conn) execMutationContext(
 
 func (d *database) createTableLocked(statement *query.DMLStatement) (sqldriver.Result, error) {
 	return d.createTableLockedContext(backgroundContext, statement)
+}
+
+// dropTableLockedContext publishes the namespace removal before attempting
+// physical cleanup. That ordering is the essential durability rule: a crash
+// after the catalog rename may leave an unreachable table file, but a crash
+// after deleting the file must never leave the catalog claiming the table
+// still exists. Existing snapshots are retained in retired until their
+// collection can close, so DROP remains safe with cursors that outlive it.
+func (d *database) dropTableLockedContext(
+	ctx context.Context,
+	statement *query.DMLStatement,
+) (sqldriver.Result, error) {
+	drop := statement.Tree().DropTable
+	name := drop.Table
+	t, exists := d.tables[name]
+	if !exists {
+		if drop.IfExists {
+			return result{}, nil
+		}
+		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, name)
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
+	retire := t.collection != nil || t.file != nil
+	if retire {
+		if err := d.checkRetirementCapacityLocked(1); err != nil {
+			return nil, err
+		}
+	}
+	previousPending := d.catalogWritePending
+	retiredBefore := len(d.retired)
+	meta := d.catalog.Tables[name]
+	storagePath := d.tablePathForMeta(name, meta)
+	delete(d.catalog.Tables, name)
+	delete(d.tables, name)
+	if retire {
+		d.retired = append(d.retired, retiredTable{
+			name: name, path: storagePath,
+			journal: durable.RecoveryJournalPath(storagePath),
+			file:    t.file, collection: t.collection,
+		})
+	}
+	published, err := d.persistCatalogLocked()
+	if err != nil {
+		if !published {
+			d.catalog.Tables[name] = meta
+			d.tables[name] = t
+			d.retired = d.retired[:retiredBefore]
+			d.catalogWritePending = previousPending
+		}
+		return nil, err
+	}
+	if err := d.settleDroppedTablesLocked(); err != nil {
+		return nil, err
+	}
+	return result{}, nil
 }
 
 func (d *database) createTableLockedContext(
@@ -118,9 +199,14 @@ func (d *database) createTableLockedContext(
 			definition.Name, err,
 		)
 	}
+	storage, err := d.newStorageIdentityLocked()
+	if err != nil {
+		return nil, err
+	}
 	meta := &tableMeta{
 		PrimaryKey: pointer,
 		Schema:     schemaMetaFrom(definition.Schema),
+		Storage:    storage,
 	}
 	candidate := &table{
 		meta: meta, schema: definition.Schema, primary: primary,
@@ -203,6 +289,33 @@ func (d *database) createIndexContext(
 	d.mu.Unlock()
 
 	_, err = collection.CreateIndexContext(ctx, definition.Definition)
+	if err != nil {
+		// CreateIndexContext observes cancellation only before its atomic
+		// publication transaction, so a cancellation result proves no index was
+		// committed. Return it before reacquiring the catalog lock: another DDL
+		// may hold that lock while replacing this table, and cancellation must not
+		// block again or be rewritten as a later serialization conflict.
+		if cancelErr := contextCancellationError(ctx); cancelErr != nil &&
+			errors.Is(err, cancelErr) {
+			return nil, err
+		}
+	}
+	// Catalog DDL may replace the table while the durable online build is
+	// running without the catalog mutex. Check the exact object identity before
+	// interpreting any durable result: retirement can deliberately close the
+	// old collection, and that implementation detail must surface as a logical
+	// serialization conflict rather than ErrClosed. A second identity check is
+	// still required under the publication lock below because replacement can
+	// race this observation.
+	d.mu.RLock()
+	current, exists := d.tables[definition.Table]
+	d.mu.RUnlock()
+	if !exists || current != t {
+		return nil, fmt.Errorf(
+			"%w: table %q storage changed during CREATE INDEX",
+			ErrTransactionConflict, definition.Table,
+		)
+	}
 	if errors.Is(err, store.ErrIndexExists) && definition.IfNotExists {
 		err = nil
 	}
@@ -221,9 +334,19 @@ func (d *database) createIndexContext(
 	}
 
 	if err := lockContext(ctx, &d.mu); err != nil {
-		// The durable catalog is already authoritative. A canceled SQL metadata
-		// mirror is repaired on reopen or by the next catalog settlement.
+		// The durable catalog is already authoritative for this exact storage
+		// incarnation. A canceled SQL metadata mirror is repaired on reopen or by
+		// the next catalog settlement. If catalog DDL replaced the incarnation
+		// while the online build ran, the committed index belongs only to retired
+		// storage and must never be acknowledged as part of the current table.
 		d.mu.Lock()
+		if current, exists := d.tables[definition.Table]; !exists || current != t {
+			d.mu.Unlock()
+			return nil, fmt.Errorf(
+				"%w: table %q storage changed during CREATE INDEX",
+				ErrTransactionConflict, definition.Table,
+			)
+		}
 		_, _ = syncTableIndexMeta(t)
 		d.catalogWritePending = true
 		d.mu.Unlock()
@@ -233,6 +356,12 @@ func (d *database) createIndexContext(
 		)
 	}
 	defer d.mu.Unlock()
+	if current, exists := d.tables[definition.Table]; !exists || current != t {
+		return nil, fmt.Errorf(
+			"%w: table %q storage changed during CREATE INDEX",
+			ErrTransactionConflict, definition.Table,
+		)
+	}
 	if _, syncErr := syncTableIndexMeta(t); syncErr != nil {
 		d.catalogWritePending = true
 		return nil, fmt.Errorf(
@@ -333,6 +462,7 @@ func (c *conn) insertLocked(
 	if len(tree.Rows) > 1 {
 		seen = make(map[string]struct{}, len(tree.Rows))
 	}
+	conflictScratch := c.pointRaw[:0]
 	stagedBytes := 0
 	cancellable := ctx.Done() != nil
 	for i := range tree.Rows {
@@ -349,6 +479,9 @@ func (c *conn) insertLocked(
 			return nil, err
 		}
 		if _, duplicate := seen[key]; duplicate {
+			if tree.OnConflictDoNothing {
+				continue
+			}
 			return nil, fmt.Errorf(
 				"%w: %q appears twice in one VALUES batch",
 				ErrDuplicatePrimaryKey, key,
@@ -356,6 +489,18 @@ func (c *conn) insertLocked(
 		}
 		if seen != nil {
 			seen[key] = struct{}{}
+		}
+		if tree.OnConflictDoNothing && t.collection != nil {
+			var found bool
+			conflictScratch, found, err = t.collection.AppendRaw(
+				conflictScratch[:0], []byte(key))
+			if err != nil {
+				c.pointRaw = conflictScratch
+				return nil, err
+			}
+			if found {
+				continue
+			}
 		}
 		stagedBytes += len(key) + len(document)
 		if stagedBytes > limits.MaxBatchBytes {
@@ -366,6 +511,7 @@ func (c *conn) insertLocked(
 		}
 		seeds = append(seeds, seedDocument{key: key, document: document})
 	}
+	c.pointRaw = conflictScratch
 	if returning != nil {
 		if returned == nil {
 			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
@@ -401,8 +547,10 @@ func (c *conn) insertLocked(
 		}
 		return result{affected: int64(len(seeds))}, nil
 	}
-	if err := c.rejectExistingSeeds(ctx, t.collection, seeds); err != nil {
-		return nil, err
+	if !tree.OnConflictDoNothing {
+		if err := c.rejectExistingSeeds(ctx, t.collection, seeds); err != nil {
+			return nil, err
+		}
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
@@ -418,11 +566,11 @@ func (c *conn) insertLocked(
 	return result{affected: int64(len(seeds))}, nil
 }
 
-// insertReturningContext executes an INSERT and materializes its RETURNING
-// projection from the already-resolved documents before publication. A
-// projection or result-budget failure therefore leaves storage untouched, and
-// the successful path performs no storage reread.
-func (c *conn) insertReturningContext(
+// mutationReturningContext executes a mutation and materializes its RETURNING
+// projection before publication. A projection or result-budget failure leaves
+// storage untouched, and the successful path performs no storage reread for
+// INSERT/UPDATE; DELETE captures the old documents before removing them.
+func (c *conn) mutationReturningContext(
 	ctx context.Context,
 	statement *query.DMLStatement,
 	args []any,
@@ -443,9 +591,9 @@ func (c *conn) insertReturningContext(
 	if err := d.settleCatalogLocked(); err != nil {
 		return cursor, err
 	}
-	if statement.Kind() != query.DMLInsert || returning == nil {
+	if returning == nil {
 		return cursor, errors.New(
-			"vibedb: internal returning execution requires INSERT RETURNING",
+			"vibedb: internal returning execution requires a RETURNING projection",
 		)
 	}
 	t, ok := d.tables[statement.Collection()]
@@ -454,9 +602,18 @@ func (c *conn) insertReturningContext(
 			"%w: %q", ErrTableNotFound, statement.Collection(),
 		)
 	}
-	if _, err := c.insertLocked(
-		ctx, statement, args, t, returning, &cursor,
-	); err != nil {
+	var err error
+	switch statement.Kind() {
+	case query.DMLInsert:
+		_, err = c.insertLocked(ctx, statement, args, t, returning, &cursor)
+	case query.DMLUpdate:
+		_, err = c.updateLockedReturning(ctx, statement, args, t, returning, &cursor)
+	case query.DMLDelete:
+		_, err = c.deleteLockedReturning(ctx, statement, args, t, returning, &cursor)
+	default:
+		err = fmt.Errorf("vibedb: %s does not support RETURNING", statement.Kind())
+	}
+	if err != nil {
 		return query.Cursor{}, err
 	}
 	return cursor, nil
@@ -816,6 +973,17 @@ func (c *conn) updateLocked(
 	args []any,
 	t *table,
 ) (sqldriver.Result, error) {
+	return c.updateLockedReturning(ctx, statement, args, t, nil, nil)
+}
+
+func (c *conn) updateLockedReturning(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+	t *table,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
 	limits, err := tableMutationLimits(t)
 	if err != nil {
 		return nil, err
@@ -847,6 +1015,24 @@ func (c *conn) updateLocked(
 				ErrUpdatePrimaryKey, newKey, key,
 			)
 		}
+	}
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		c.pointDocs.Reset()
+		for range keys {
+			if _, err := c.pointDocs.Append(document); err != nil {
+				return nil, err
+			}
+		}
+		cursor, err := returning.RunInto(
+			&c.exec, query.FromSegment(&c.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
@@ -887,6 +1073,17 @@ func (c *conn) deleteLocked(
 	args []any,
 	t *table,
 ) (sqldriver.Result, error) {
+	return c.deleteLockedReturning(ctx, statement, args, t, nil, nil)
+}
+
+func (c *conn) deleteLockedReturning(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+	t *table,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
 	limits, err := tableMutationLimits(t)
 	if err != nil {
 		return nil, err
@@ -897,6 +1094,21 @@ func (c *conn) deleteLocked(
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
+	}
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		if err := c.loadReturningDocuments(t, keys); err != nil {
+			return nil, err
+		}
+		cursor, err := returning.RunInto(
+			&c.exec, query.FromSegment(&c.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
 	}
 	if t.collection == nil {
 		return result{}, nil
@@ -933,6 +1145,36 @@ func (c *conn) deleteLocked(
 	return result{affected: int64(affected)}, nil
 }
 
+// loadReturningDocuments captures the pre-delete documents in the same key
+// order used by the mutation. The caller holds the catalog mutex, so the
+// snapshot cannot race a driver-mediated writer; the durable snapshot still
+// keeps the read boundary explicit and makes the borrowed page data safe until
+// it has been copied into pointDocs.
+func (c *conn) loadReturningDocuments(t *table, keys []string) error {
+	c.pointDocs.Reset()
+	if t.collection == nil {
+		return nil
+	}
+	snapshot, err := t.collection.Snapshot()
+	if err != nil {
+		return err
+	}
+	defer snapshot.Close()
+	for _, key := range keys {
+		raw, found, err := snapshot.AppendRaw(c.pointRaw[:0], []byte(key))
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if _, err := c.pointDocs.Append(raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *conn) matchingKeysLocked(
 	ctx context.Context,
 	statement *query.DMLStatement,
@@ -941,6 +1183,15 @@ func (c *conn) matchingKeysLocked(
 	limits durable.Options,
 	valueBytes int,
 ) ([]string, error) {
+	window, err := newMutationWindow(
+		statement, args, t.meta.PrimaryKey, limits.MaxBatchDocuments)
+	if err != nil {
+		return nil, err
+	}
+	if window.limited && window.limit == 0 {
+		c.matchKeys = c.matchKeys[:0]
+		return c.matchKeys, nil
+	}
 	budget := mutationMatchBudget{
 		table:        statement.Collection(),
 		maxDocuments: limits.MaxBatchDocuments,
@@ -972,6 +1223,8 @@ func (c *conn) matchingKeysLocked(
 			return c.pointKeys, nil
 		}
 		present := keys[:0]
+		selector := newMutationKeySelector(window, limits.MaxBatchDocuments)
+		selector.keys = c.matchKeys[:0]
 		scratch := c.pointRaw[:0]
 		cancellable := ctx.Done() != nil
 		for _, key := range keys {
@@ -988,22 +1241,39 @@ func (c *conn) matchingKeysLocked(
 				return nil, err
 			}
 			if found {
-				if err := budget.admit(len(key)); err != nil {
-					c.pointRaw = scratch
-					return nil, err
+				if window.limited {
+					selector.add(key)
+				} else {
+					if err := budget.admit(len(key)); err != nil {
+						c.pointRaw = scratch
+						return nil, err
+					}
+					present = append(present, key)
 				}
-				present = append(present, key)
 			}
 		}
 		clear(keys[len(present):])
 		c.pointRaw = scratch
 		c.pointKeys = present
-		return present, nil
+		if !window.limited {
+			return present, nil
+		}
+		if err := admitMutationSelection(&budget, selector.keys); err != nil {
+			return nil, err
+		}
+		c.matchKeys = selector.keys
+		return c.matchKeys, nil
 	}
 
 	clear(c.matchKeys)
 	keys = c.matchKeys[:0]
+	selector := newMutationKeySelector(window, limits.MaxBatchDocuments)
+	selector.keys = keys
 	filter, err := statement.Filter(&c.exec, args, func(key, _ []byte) error {
+		if window.limited {
+			selector.add(string(key))
+			return nil
+		}
 		if err := budget.admit(len(key)); err != nil {
 			return err
 		}
@@ -1016,6 +1286,13 @@ func (c *conn) matchingKeysLocked(
 	if t.collection == nil {
 		if err := filter.Done(); err != nil {
 			return nil, err
+		}
+		if window.limited {
+			if err := admitMutationSelection(&budget, selector.keys); err != nil {
+				return nil, err
+			}
+			c.matchKeys = selector.keys
+			return c.matchKeys, nil
 		}
 		c.matchKeys = keys
 		return keys, nil
@@ -1033,8 +1310,27 @@ func (c *conn) matchingKeysLocked(
 	if err := filter.Done(); err != nil {
 		return nil, err
 	}
+	if window.limited {
+		if err := admitMutationSelection(&budget, selector.keys); err != nil {
+			return nil, err
+		}
+		c.matchKeys = selector.keys
+		return c.matchKeys, nil
+	}
 	c.matchKeys = keys
 	return keys, nil
+}
+
+func admitMutationSelection(
+	budget *mutationMatchBudget,
+	keys []string,
+) error {
+	for _, key := range keys {
+		if err := budget.admit(len(key)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mutationMatchBudget bounds the result of a filtered UPDATE or DELETE while

@@ -25,10 +25,10 @@ import (
 // dialect refuses is not the same kind of event as admitted SQL it cannot
 // parse, and the difference a client cares about is retryability: 0A000 says
 // "this server will never run this feature", while 42601 says "this admitted
-// statement text is wrong". SELECT, INSERT, UPDATE, DELETE, CREATE TABLE,
-// CREATE INDEX, and unsupported leading SQL kinds all reach the shared front
-// end. Its typed FeatureNotSupportedError maps to 0A000 with the same reason
-// database/sql returns; ordinary ParseError remains 42601 with a source
+// statement text is wrong". SELECT, stored-row mutations, bounded catalog DDL,
+// and unsupported leading SQL kinds all reach the shared front end. Its typed
+// FeatureNotSupportedError maps to 0A000 with the same reason database/sql
+// returns; ordinary ParseError remains 42601 with a source
 // position. SQLSTATEs never depend on matching another package's prose.
 
 // SQLSTATE codes this server emits. The names are the PostgreSQL condition
@@ -39,6 +39,7 @@ const (
 	sqlstateDuplicateTable             = "42P07"
 	sqlstateDuplicateObject            = "42710"
 	sqlstateUndefinedObject            = "42704"
+	sqlstateAmbiguousAlias             = "42P09"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
 	sqlstateFeatureNotSupported        = "0A000"
@@ -165,6 +166,8 @@ func asPGError(err error) *pgError {
 		errors.Is(err, query.ErrSpillBudget) ||
 		errors.Is(err, sqldriver.ErrCatalogTooLarge) ||
 		errors.Is(err, sqldriver.ErrTooManyTables) ||
+		errors.Is(err, sqldriver.ErrTooManyRetiredTables) ||
+		errors.Is(err, sqldriver.ErrTooManyStorageFiles) ||
 		errors.Is(err, sqldriver.ErrArgumentsTooLarge) ||
 		errors.Is(err, sqldriver.ErrTransactionTooLarge) ||
 		errors.Is(err, sqldriver.ErrJoinMaterializationTooLarge) ||
@@ -178,6 +181,10 @@ func asPGError(err error) *pgError {
 	switch {
 	case errors.Is(err, query.ErrCanceled):
 		return queryCanceled()
+	case errors.Is(err, query.ErrParameterType):
+		return newError(sqlstateDatatypeMismatch, err.Error())
+	case errors.Is(err, query.ErrInvalidPattern):
+		return newError(sqlstateInvalidParameterValue, err.Error())
 	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
 		return newError(sqlstateStatementCompletionUnknown, err.Error())
 	case errors.Is(err, sqldriver.ErrTableNotFound):
@@ -186,6 +193,10 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateDuplicateTable, err.Error())
 	case errors.Is(err, sqldriver.ErrIndexExists):
 		return newError(sqlstateDuplicateObject, err.Error())
+	case errors.Is(err, sqldriver.ErrIndexNotFound):
+		return newError(sqlstateUndefinedObject, err.Error())
+	case errors.Is(err, sqldriver.ErrIndexAmbiguous):
+		return newError(sqlstateAmbiguousAlias, err.Error())
 	case errors.Is(err, sqldriver.ErrDuplicatePrimaryKey):
 		return newError(sqlstateUniqueViolation, err.Error())
 	case errors.Is(err, store.ErrSchemaViolation):

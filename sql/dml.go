@@ -32,6 +32,12 @@ const (
 	KindCreateTable
 	// KindCreateIndex is a CREATE INDEX, carried in [Statement.CreateIndex].
 	KindCreateIndex
+	// KindDropTable is a DROP TABLE, carried in [Statement.DropTable].
+	KindDropTable
+	// KindTruncate is a TRUNCATE, carried in [Statement.Truncate].
+	KindTruncate
+	// KindDropIndex is a DROP INDEX, carried in [Statement.DropIndex].
+	KindDropIndex
 )
 
 // String answers the statement's leading keyword.
@@ -47,6 +53,12 @@ func (k Kind) String() string {
 		return "CREATE TABLE"
 	case KindCreateIndex:
 		return "CREATE INDEX"
+	case KindDropTable:
+		return "DROP TABLE"
+	case KindTruncate:
+		return "TRUNCATE"
+	case KindDropIndex:
+		return "DROP INDEX"
 	}
 	return "SELECT"
 }
@@ -67,7 +79,7 @@ const DocumentColumn = "$doc"
 //
 // Exactly one body pointer is non-nil, selected by Kind. It is a tagged struct
 // rather than an interface because every consumer switches on the kind anyway,
-// and because the six bodies are already concrete types a caller wants by name.
+// and because the bodies are already concrete types a caller wants by name.
 type Statement struct {
 	Kind Kind
 	// Explain marks a SELECT whose caller requested plan output instead of the
@@ -81,13 +93,18 @@ type Statement struct {
 	Delete      *DeleteStmt
 	CreateTable *CreateTableStmt
 	CreateIndex *CreateIndexStmt
+	DropTable   *DropTableStmt
+	Truncate    *TruncateStmt
+	DropIndex   *DropIndexStmt
 }
 
 // ReturnsRows reports whether this parsed statement must execute through a
 // query path.
 func (s *Statement) ReturnsRows() bool {
 	return s != nil && (s.Kind == KindSelect ||
-		s.Kind == KindInsert && s.Insert != nil && s.Insert.Returning != nil)
+		s.Kind == KindInsert && s.Insert != nil && s.Insert.Returning != nil ||
+		s.Kind == KindUpdate && s.Update != nil && s.Update.Returning != nil ||
+		s.Kind == KindDelete && s.Delete != nil && s.Delete.Returning != nil)
 }
 
 // Table answers the collection the statement reads or writes.
@@ -103,6 +120,12 @@ func (s *Statement) Table() string {
 		return s.CreateTable.Table
 	case KindCreateIndex:
 		return s.CreateIndex.Table
+	case KindDropTable:
+		return s.DropTable.Table
+	case KindTruncate:
+		return s.Truncate.Table
+	case KindDropIndex:
+		return s.DropIndex.Table
 	}
 	if s.Select == nil || len(s.Select.From) == 0 {
 		return ""
@@ -119,7 +142,7 @@ func (s *Statement) Params() int {
 		return s.Update.Params
 	case KindDelete:
 		return s.Delete.Params
-	case KindCreateTable, KindCreateIndex:
+	case KindCreateTable, KindCreateIndex, KindDropTable, KindTruncate, KindDropIndex:
 		// A DDL statement has no placeholders. A schema is not data: a type, a
 		// path, and a table name are all compiled into the definition when the
 		// statement is prepared, so there is nothing left for a bind to supply.
@@ -161,6 +184,11 @@ type InsertStmt struct {
 	// INSERT INTO t (a, b) VALUES (?, ?). It is nil when VALUES carries a
 	// whole JSON document.
 	Columns []*PathExpr
+	// OnConflictDoNothing makes an identity collision a skipped row instead of
+	// an error. It is the deliberately narrow, atomic subset of PostgreSQL's
+	// ON CONFLICT grammar supported by the storage adapter; conflict targets
+	// and DO UPDATE are not implied by this flag.
+	OnConflictDoNothing bool
 	// Returning is the projection evaluated over the documents this INSERT
 	// publishes, in VALUES order. It is nil when the statement returns no rows.
 	//
@@ -227,6 +255,17 @@ type UpdateStmt struct {
 	// promise "UPDATE writes exactly the documents SELECT returns" structural: a
 	// lowering pass hands this to the SELECT lowering unchanged.
 	Filter *SelectStmt
+	// OrderBy is the mutation's optional bounded-selection ordering. The
+	// driver deliberately keeps it outside Filter: query.Filter evaluates a
+	// filtered scan in batches, while a mutation must choose one global set of
+	// keys before it publishes a batch.
+	OrderBy []OrderTerm
+	// Limit caps the number of selected documents. It is nil when UPDATE acts
+	// on every matching document.
+	Limit *Operand
+	// Returning projects the replacement documents after UPDATE, in selected
+	// key order. It is nil when the statement reports only RowsAffected.
+	Returning *SelectStmt
 	// Params is the number of '?' placeholders.
 	Params int
 	// Pos is the byte offset of the collection name.
@@ -242,6 +281,13 @@ type DeleteStmt struct {
 	// Filter is the equivalent SELECT whose surviving rows this statement
 	// deletes. See [UpdateStmt.Filter].
 	Filter *SelectStmt
+	// OrderBy and Limit have the same bounded-selection contract as
+	// [UpdateStmt.OrderBy] and [UpdateStmt.Limit].
+	OrderBy []OrderTerm
+	Limit   *Operand
+	// Returning projects the documents removed by DELETE, in selected key
+	// order. It is nil when the statement reports only RowsAffected.
+	Returning *SelectStmt
 	// Params is the number of '?' placeholders.
 	Params int
 	// Pos is the byte offset of the collection name.

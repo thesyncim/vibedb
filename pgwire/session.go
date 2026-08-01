@@ -354,6 +354,9 @@ func (s *session) serve() error {
 		s.reportStartupFailure(err)
 		return err
 	}
+	if s.terminated {
+		return nil
+	}
 	return s.loop()
 }
 
@@ -446,6 +449,7 @@ func (s *session) startup() error {
 			// The protocol specifies no reply to a cancel request at all, and
 			// the connection is closed. Answering would let a peer probe for
 			// valid backend keys.
+			s.terminated = true
 			return nil
 
 		case protocolVersion30:
@@ -880,7 +884,9 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 			if scan.cancelErr != nil {
 				return false, scan.cancelErr
 			}
-			if strings.EqualFold(word, "CREATE") {
+			if strings.EqualFold(word, "CREATE") ||
+				strings.EqualFold(word, "DROP") ||
+				strings.EqualFold(word, "TRUNCATE") {
 				ddl = true
 			} else {
 				dml = true
@@ -908,7 +914,7 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 	if ddl {
 		return false, newError(sqlstateFeatureNotSupported,
 			"DDL must be the only non-empty statement in a simple Query message").
-			withHint("send CREATE TABLE or CREATE INDEX in its own Query message")
+			withHint("send each CREATE, DROP, or TRUNCATE statement in its own Query message")
 	}
 	if sessionChange && catalogSQL {
 		return false, newError(sqlstateFeatureNotSupported,
@@ -1340,7 +1346,7 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	if s.takeCancel() {
-		if kind != sqlast.KindCreateTable && kind != sqlast.KindCreateIndex {
+		if !runtimeKindIsDDL(kind) {
 			return queryCanceled()
 		}
 		// DDL's atomic catalog publication is the commit point and cannot
@@ -1366,8 +1372,24 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 		return "CREATE TABLE"
 	case sqlast.KindCreateIndex:
 		return "CREATE INDEX"
+	case sqlast.KindDropTable:
+		return "DROP TABLE"
+	case sqlast.KindTruncate:
+		return "TRUNCATE TABLE"
+	case sqlast.KindDropIndex:
+		return "DROP INDEX"
 	default:
 		return kind.String()
+	}
+}
+
+func runtimeKindIsDDL(kind sqlast.Kind) bool {
+	switch kind {
+	case sqlast.KindCreateTable, sqlast.KindCreateIndex, sqlast.KindDropTable,
+		sqlast.KindTruncate, sqlast.KindDropIndex:
+		return true
+	default:
+		return false
 	}
 }
 

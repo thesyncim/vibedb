@@ -251,6 +251,33 @@ func TestSimpleQueryReturnsRowsAndOneReadyForQuery(t *testing.T) {
 	}
 }
 
+func TestSimpleQueryLikeAndILike(t *testing.T) {
+	c := connect(t)
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "LIKE", sql: `SELECT name FROM users WHERE name LIKE '_y'`, want: `"cy"`},
+		{name: "ILIKE", sql: `SELECT name FROM users WHERE name ILIKE 'A%'`, want: `"amy"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := c.query(tc.sql)
+			if has(msgs, msgErrorResponse) {
+				t.Fatalf("%s: %s", tc.sql,
+					formatError(find(t, msgs, msgErrorResponse).body))
+			}
+			rows := rowsOf(t, msgs)
+			if len(rows) != 1 || len(rows[0]) != 1 || string(rows[0][0]) != tc.want {
+				t.Fatalf("%s rows = %q, want [[%s]]", tc.sql, rows, tc.want)
+			}
+			if tag := commandTagOf(t, msgs); tag != "SELECT 1" {
+				t.Fatalf("%s tag = %q, want SELECT 1", tc.sql, tag)
+			}
+		})
+	}
+}
+
 func TestSimpleQueryRunsSeveralStatementsAndStopsAtTheFirstError(t *testing.T) {
 	c := connect(t)
 	msgs := c.query(`SELECT name FROM users LIMIT 1; SELECT nope FROM absent; SELECT name FROM users LIMIT 1`)
@@ -894,6 +921,25 @@ func TestADeclaredParameterTypeDisambiguatesTheBinding(t *testing.T) {
 	}
 }
 
+func TestLikeBindingErrorsCarryStableSQLStates(t *testing.T) {
+	t.Run("non-string pattern", func(t *testing.T) {
+		c := connect(t)
+		c.send(msgParse, parseMsg("", `SELECT id FROM users WHERE name LIKE ?`, oidInt8))
+		c.send(msgBind, bindMsg("", "", nil, [][]byte{[]byte("30")}, nil))
+		c.send(msgExecute, executeMsg("", 0))
+		c.send(msgSync, nil)
+		expectError(t, c.until(msgReadyForQuery), sqlstateDatatypeMismatch)
+	})
+	t.Run("malformed bound pattern", func(t *testing.T) {
+		c := connect(t)
+		c.send(msgParse, parseMsg("", `SELECT id FROM users WHERE name LIKE ?`, oidText))
+		c.send(msgBind, bindMsg("", "", nil, [][]byte{[]byte(`a\`)}, nil))
+		c.send(msgExecute, executeMsg("", 0))
+		c.send(msgSync, nil)
+		expectError(t, c.until(msgReadyForQuery), sqlstateInvalidParameterValue)
+	})
+}
+
 func TestANullParameterBinds(t *testing.T) {
 	c := connect(t)
 	c.send(msgParse, parseMsg("", `SELECT id FROM users WHERE age = ?`))
@@ -1040,7 +1086,7 @@ func TestErrorClassification(t *testing.T) {
 	}{
 		{`SELECT name FROM nosuch`, sqlstateUndefinedTable},
 		{`SELECT FROM users`, sqlstateSyntaxError},
-		{`SELECT name FROM users WHERE name LIKE 'a%'`, sqlstateSyntaxError},
+		{`SELECT name FROM users WHERE name LIKE 'a%' ESCAPE '!'`, sqlstateSyntaxError},
 		{`INSERT INTO users VALUES (1)`, sqlstateSyntaxError},
 		{`CREATE TABLE t (a int)`, sqlstateInternalError},
 		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
@@ -1090,7 +1136,7 @@ func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
 
 func TestASyntaxErrorCarriesAPosition(t *testing.T) {
 	c := connect(t)
-	sql := `SELECT name FROM users WHERE name LIKE 'a%'`
+	sql := `SELECT name FROM users WHERE name LIKE 'a%' ESCAPE '!'`
 	fs := expectError(t, c.query(sql), sqlstateSyntaxError)
 	pos, err := strconv.Atoi(fs['P'])
 	if err != nil {
@@ -1100,10 +1146,10 @@ func TestASyntaxErrorCarriesAPosition(t *testing.T) {
 	if pos < 1 || pos > len(sql)+1 {
 		t.Fatalf("position %d is outside the statement", pos)
 	}
-	if !strings.HasPrefix(sql[pos-1:], "LIKE") {
-		t.Fatalf("position %d points at %q, want the LIKE keyword", pos, sql[pos-1:])
+	if !strings.HasPrefix(sql[pos-1:], "ESCAPE") {
+		t.Fatalf("position %d points at %q, want the ESCAPE keyword", pos, sql[pos-1:])
 	}
-	if !strings.Contains(fs['M'], "LIKE") {
+	if !strings.Contains(fs['M'], "ESCAPE") {
 		t.Errorf("the message does not name the refused construct: %q", fs['M'])
 	}
 }
@@ -1111,7 +1157,7 @@ func TestASyntaxErrorCarriesAPosition(t *testing.T) {
 func TestAPositionCountsCharactersNotBytes(t *testing.T) {
 	// A non-ASCII quoted identifier before the failure makes byte and character
 	// offsets disagree; the protocol's P field counts characters.
-	sql := `SELECT "é" FROM users WHERE "é" LIKE 'x'`
+	sql := `SELECT "é" FROM users WHERE "é" LIKE 'x' ESCAPE '!'`
 	_, err := sqlast.Parse(sql)
 	if err == nil {
 		t.Fatal("expected the statement to be refused")
@@ -1121,8 +1167,8 @@ func TestAPositionCountsCharactersNotBytes(t *testing.T) {
 	if pg.position < 1 || pg.position > len(runes)+1 {
 		t.Fatalf("position %d is outside the statement's %d characters", pg.position, len(runes))
 	}
-	if !strings.HasPrefix(string(runes[pg.position-1:]), "LIKE") {
-		t.Fatalf("character position %d points at %q, want LIKE",
+	if !strings.HasPrefix(string(runes[pg.position-1:]), "ESCAPE") {
+		t.Fatalf("character position %d points at %q, want ESCAPE",
 			pg.position, string(runes[pg.position-1:]))
 	}
 }
@@ -2494,15 +2540,15 @@ func TestMixingPlaceholderSpellingsIsRefused(t *testing.T) {
 func TestTheRewritePreservesErrorPositions(t *testing.T) {
 	// "$12" is three bytes and "?" is one, so a rewrite that shortened the text
 	// would report a position two bytes short of the offending token.
-	sql := `SELECT id FROM users WHERE age = $12 AND name LIKE 'x'`
+	sql := `SELECT id FROM users WHERE age = $12 AND name LIKE 'x' ESCAPE '!'`
 	c := connect(t)
 	fs := expectError(t, c.query(sql), sqlstateSyntaxError)
 	pos, err := strconv.Atoi(fs['P'])
 	if err != nil {
 		t.Fatalf("no position on the error: %q", fs['P'])
 	}
-	if !strings.HasPrefix(sql[pos-1:], "LIKE") {
-		t.Fatalf("position %d points at %q in the original statement, want LIKE",
+	if !strings.HasPrefix(sql[pos-1:], "ESCAPE") {
+		t.Fatalf("position %d points at %q in the original statement, want ESCAPE",
 			pos, sql[pos-1:])
 	}
 }

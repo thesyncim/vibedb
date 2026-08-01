@@ -98,6 +98,8 @@ func (m *tableMeta) UnmarshalJSON(data []byte) error {
 			}
 			decoded.Indexes = []indexMeta(indexes)
 			return nil
+		case "storage":
+			return decoder.Decode(&decoded.Storage)
 		case "materialized":
 			return decoder.Decode(&decoded.Materialized)
 		default:

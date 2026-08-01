@@ -38,6 +38,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `insert into users (j{"id":"a","x":1}) (?0) params=1`,
 		},
 		{
+			name: "skip a conflicting document",
+			src:  `INSERT INTO users VALUES (?) ON CONFLICT DO NOTHING RETURNING id`,
+			want: `insert into users (?0) on conflict do nothing returning path(0:id) params=1`,
+		},
+		{
 			name: "insert returning projected fields",
 			src:  `INSERT INTO users VALUES (?) RETURNING id, profile.name AS name`,
 			want: `insert into users (?0) returning path(0:id), path(0:profile.name) as name params=1`,
@@ -58,6 +63,16 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `update users set ?0 where (cmp = 0:tier s"free") params=1`,
 		},
 		{
+			name: "update returning",
+			src:  `UPDATE users SET "$doc" = ? WHERE tier = 'free' RETURNING id`,
+			want: `update users set ?0 where (cmp = 0:tier s"free") returning path(0:id) params=1`,
+		},
+		{
+			name: "update ordered limit",
+			src:  `UPDATE users SET "$doc" = ? WHERE tier = 'free' ORDER BY id DESC LIMIT ?`,
+			want: `update users set ?0 where (cmp = 0:tier s"free") order 0:id:desc limit ?1 params=2`,
+		},
+		{
 			name: "update by a JSON field named dollar key",
 			src:  `UPDATE users SET "$doc" = ? WHERE "$key" = 'u1'`,
 			want: `update users set ?0 where (cmp = 0:/$key s"u1") params=1`,
@@ -73,6 +88,16 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `delete from users where (and (cmp > 0:age n30) (not (cmp = 0:name s"x"))) params=0`,
 		},
 		{
+			name: "delete returning",
+			src:  `DELETE FROM users WHERE age > 30 RETURNING id`,
+			want: `delete from users where (cmp > 0:age n30) returning path(0:id) params=0`,
+		},
+		{
+			name: "delete ordered limit",
+			src:  `DELETE FROM users ORDER BY id LIMIT 2`,
+			want: `delete from users all order 0:id:asc limit n2 params=0`,
+		},
+		{
 			name: "delete by a JSON field named dollar key",
 			src:  `DELETE FROM users WHERE "$key" = ?`,
 			want: `delete from users where (cmp = 0:/$key ?0) params=1`,
@@ -81,6 +106,36 @@ func TestDMLGrammarShapes(t *testing.T) {
 			name: "delete by dollar-key field membership",
 			src:  `DELETE FROM users WHERE "$key" IN ('a', 'b')`,
 			want: `delete from users where (in 0:/$key s"a" s"b") params=0`,
+		},
+		{
+			name: "drop a table",
+			src:  `DROP TABLE users`,
+			want: `drop table users`,
+		},
+		{
+			name: "drop a table if it exists",
+			src:  `DROP TABLE IF EXISTS users`,
+			want: `drop table if exists users`,
+		},
+		{
+			name: "truncate without table keyword",
+			src:  `TRUNCATE users`,
+			want: `truncate users`,
+		},
+		{
+			name: "truncate with table keyword",
+			src:  `TRUNCATE TABLE users`,
+			want: `truncate users`,
+		},
+		{
+			name: "drop an index",
+			src:  `DROP INDEX by_age`,
+			want: `drop index by_age`,
+		},
+		{
+			name: "drop an index from a table if it exists",
+			src:  `DROP INDEX IF EXISTS by_age ON users`,
+			want: `drop index if exists by_age on users`,
 		},
 		{
 			name: "a nested path in a condition",
@@ -210,8 +265,7 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
 		{"INSERT ... SELECT", `INSERT INTO t SELECT a FROM u`, -1, "nowhere to send"},
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
-		{"ON CONFLICT", `INSERT INTO t VALUES (?) ON CONFLICT DO NOTHING`, -1, "ON CONFLICT"},
-		{"RETURNING", `DELETE FROM t RETURNING a`, -1, "RETURNING"},
+		{"conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id) DO NOTHING`, -1, "CONFLICT targets"},
 		{"aggregate RETURNING", `INSERT INTO t VALUES (?) RETURNING COUNT(*)`, -1, "aggregate"},
 
 		{"a top-level path assignment", `UPDATE t SET name = 'x'`, -1, "partial document update"},
@@ -221,15 +275,40 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"UPDATE ... FROM", `UPDATE t SET "$doc" = ? FROM u`, -1, "never from another collection"},
 
 		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
-		{"DELETE ... LIMIT", `DELETE FROM t WHERE a = 1 LIMIT 5`, -1, "no LIMIT"},
-		{"DELETE ... ORDER BY", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "no ORDER BY"},
+		{"mutation ORDER BY without LIMIT", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "ORDER BY requires LIMIT"},
+		{"mutation OFFSET", `DELETE FROM t WHERE a = 1 LIMIT 5 OFFSET 1`, -1, "does not support OFFSET"},
 		{"a table alias", `UPDATE t AS x SET "$doc" = ?`, -1, "nothing to qualify"},
 
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
 		{"REPLACE", `REPLACE INTO t VALUES ('k', ?)`, 0, "REPLACE"},
-		{"TRUNCATE", `TRUNCATE TABLE t`, 0, "TRUNCATE"},
-		{"DROP", `DROP TABLE t`, 0, "DROP"},
 		{"ALTER", `ALTER TABLE t ADD COLUMN a STRING`, 0, "ALTER"},
+	})
+}
+
+func TestRejectsUnboundedCatalogDDLSyntax(t *testing.T) {
+	runDMLRejections(t, []dmlRejection{
+		{"TRUNCATE without a table", `TRUNCATE`, -1, "collection name"},
+		{"TRUNCATE TABLE without a table", `TRUNCATE TABLE`, -1, "collection name"},
+		{"TRUNCATE several tables", `TRUNCATE t, u`, -1, "multiple tables"},
+		{"TRUNCATE restart identity", `TRUNCATE t RESTART IDENTITY`, -1, "identity options"},
+		{"TRUNCATE cascade", `TRUNCATE t CASCADE`, -1, "CASCADE/RESTRICT"},
+		{"TRUNCATE placeholder", `TRUNCATE ?`, -1, "collection name"},
+		{"DROP without an object kind", `DROP`, -1, "TABLE or INDEX"},
+		{"DROP VIEW without a name", `DROP VIEW`, -1, "object name"},
+		{"DROP another object kind", `DROP VIEW v`, -1, "DROP VIEW"},
+		{"DROP TABLE dangling comma", `DROP TABLE docs,`, -1, "collection name"},
+		{"DROP INDEX without a name", `DROP INDEX`, -1, "index name"},
+		{"DROP INDEX with incomplete IF", `DROP INDEX IF by_age`, -1, "EXISTS after IF"},
+		{"DROP INDEX IF EXISTS without a name", `DROP INDEX IF EXISTS`, -1, "index name"},
+		{"DROP several indexes", `DROP INDEX a, b`, -1, "multiple indexes"},
+		{"DROP INDEX dangling comma", `DROP INDEX a,`, -1, "index name"},
+		{"DROP INDEX ON without a table", `DROP INDEX by_age ON`, -1, "collection name"},
+		{"DROP INDEX cascade", `DROP INDEX by_age CASCADE`, -1, "CASCADE/RESTRICT"},
+		{"DROP INDEX restrict", `DROP INDEX by_age RESTRICT`, -1, "CASCADE/RESTRICT"},
+		{"DROP INDEX placeholder", `DROP INDEX ?`, -1, "index name"},
+		{"DROP INDEX table placeholder", `DROP INDEX by_age ON ?`, -1, "collection name"},
+		{"DROP INDEX qualified table", `DROP INDEX by_age ON public.users`, -1, "qualified collection"},
+		{"TRUNCATE incomplete identity option", `TRUNCATE docs RESTART`, -1, "IDENTITY"},
 	})
 }
 

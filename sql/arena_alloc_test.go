@@ -96,6 +96,8 @@ func TestWarmParseStatementIsAllocationFree(t *testing.T) {
 		{"delete", benchDelete},
 		{"create table", benchCreateTable},
 		{"create index", benchCreateIndex},
+		{"truncate", `TRUNCATE TABLE docs`},
+		{"drop index", `DROP INDEX IF EXISTS by_kind ON docs`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,6 +136,8 @@ func TestWarmParseStatementOfMixedShapesIsAllocationFree(t *testing.T) {
 		benchDelete,
 		benchCreateTable,
 		benchCreateIndex,
+		`TRUNCATE TABLE docs`,
+		`DROP INDEX IF EXISTS by_kind ON docs`,
 	}
 	var p Parser
 	var stmt Statement
@@ -165,7 +169,7 @@ func TestWarmParseStatementOfMixedShapesIsAllocationFree(t *testing.T) {
 // rejection would be a denial-of-service surface for a driver fed bad SQL in a
 // loop, so the only allocation a refusal is allowed is the *ParseError itself.
 func TestParseRejectionAllocatesOnlyItsError(t *testing.T) {
-	const src = `SELECT a FROM t WHERE b LIKE 'x'`
+	const src = `SELECT a FROM t WHERE b SIMILAR TO 'x'`
 	var p Parser
 	var stmt SelectStmt
 	for i := 0; i < 2; i++ {

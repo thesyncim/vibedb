@@ -1318,7 +1318,7 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	// capacity exhausted" on its own reads like corruption, and an operator
 	// cannot act on it.
 	if message := failure.Error(); !strings.Contains(message, "snapshot") ||
-		!strings.Contains(message, fmt.Sprintf("generation %d", pinnedGeneration)) {
+		!strings.Contains(message, fmt.Sprintf("generation is %d", pinnedGeneration)) {
 		pinned.Close()
 		t.Fatalf("backpressure did not name the pinning snapshot at generation %d: %v",
 			pinnedGeneration, failure)

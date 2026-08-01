@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -95,6 +96,81 @@ type dbConnector struct {
 	refs   int
 }
 
+const (
+	terminalRetirementInitialBackoff = 10 * time.Millisecond
+	terminalRetirementMaximumBackoff = time.Second
+)
+
+// terminalRetirements is the process ownership boundary for a database whose
+// final Collection.Close stopped at a retryable phase. database/sql does not
+// promise another Connector.Close call, and a failed open has no caller at all;
+// keeping only the connector or stack frame would therefore strand writer
+// locks when that object becomes unreachable. One bounded worker owns every
+// such database and retries their monotonic close state machines with backoff.
+// It exits when the registry empties, so the ordinary successful-close path
+// retains no goroutine or timer.
+var terminalRetirements struct {
+	sync.Mutex
+	pending map[*database]struct{}
+	running bool
+}
+
+func retainTerminalDatabase(d *database) {
+	if d == nil || d.closeCompleted() {
+		return
+	}
+	terminalRetirements.Lock()
+	if terminalRetirements.pending == nil {
+		terminalRetirements.pending = make(map[*database]struct{})
+	}
+	terminalRetirements.pending[d] = struct{}{}
+	if !terminalRetirements.running {
+		terminalRetirements.running = true
+		go drainTerminalDatabases()
+	}
+	terminalRetirements.Unlock()
+}
+
+func drainTerminalDatabases() {
+	backoff := terminalRetirementInitialBackoff
+	var databases []*database
+	for {
+		terminalRetirements.Lock()
+		if len(terminalRetirements.pending) == 0 {
+			terminalRetirements.running = false
+			terminalRetirements.Unlock()
+			return
+		}
+		clear(databases)
+		databases = databases[:0]
+		for d := range terminalRetirements.pending {
+			databases = append(databases, d)
+		}
+		terminalRetirements.Unlock()
+
+		completedAny := false
+		for _, d := range databases {
+			_ = d.closeTerminal()
+			if !d.closeCompleted() {
+				continue
+			}
+			terminalRetirements.Lock()
+			delete(terminalRetirements.pending, d)
+			terminalRetirements.Unlock()
+			completedAny = true
+		}
+		if completedAny {
+			backoff = terminalRetirementInitialBackoff
+		} else if backoff < terminalRetirementMaximumBackoff {
+			backoff *= 2
+			if backoff > terminalRetirementMaximumBackoff {
+				backoff = terminalRetirementMaximumBackoff
+			}
+		}
+		time.Sleep(backoff)
+	}
+}
+
 var (
 	_ sqldriver.Connector = (*dbConnector)(nil)
 	_ io.Closer           = (*dbConnector)(nil)
@@ -133,12 +209,16 @@ func (c *dbConnector) Close() error {
 		return nil
 	}
 	// database/sql does not retry Connector.Close. Once there are no live
-	// connections, this connector is the database's sole owner, so retire the
-	// handle even when the final durability fence reports an error. The error
-	// remains observable, but the catalog writer lease and table descriptors
-	// must not be stranded forever.
+	// connections, this connector is the database's sole owner. Completed
+	// teardown is detached even when it carries a terminal persistence error;
+	// retryable engine teardown remains owned here rather than invalidating its
+	// descriptors or writer locks.
 	err := c.db.closeTerminal()
-	c.db = nil
+	if c.db.closeCompleted() {
+		c.db = nil
+	} else {
+		retainTerminalDatabase(c.db)
+	}
 	return err
 }
 
@@ -153,9 +233,14 @@ func (c *dbConnector) release() error {
 		return nil
 	}
 	// A connector can be retired while database/sql is still draining its last
-	// connection. release is then the one and only terminal-close opportunity.
+	// connection. release is then its terminal-close attempt; incomplete engine
+	// teardown remains owned by the retired connector.
 	err := c.db.closeTerminal()
-	c.db = nil
+	if c.db.closeCompleted() {
+		c.db = nil
+	} else {
+		retainTerminalDatabase(c.db)
+	}
 	return err
 }
 
@@ -391,6 +476,16 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			tree.Insert.Returning != nil {
 			s.query, err = query.PrepareParsedStatement(
 				src, tree.Insert.Returning,
+			)
+		} else if err == nil && tree.Kind == sqlast.KindUpdate &&
+			tree.Update.Returning != nil {
+			s.query, err = query.PrepareParsedStatement(
+				src, tree.Update.Returning,
+			)
+		} else if err == nil && tree.Kind == sqlast.KindDelete &&
+			tree.Delete.Returning != nil {
+			s.query, err = query.PrepareParsedStatement(
+				src, tree.Delete.Returning,
 			)
 		}
 	}

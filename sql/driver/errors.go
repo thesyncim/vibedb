@@ -12,6 +12,12 @@ var (
 	// ErrIndexExists reports CREATE INDEX without IF NOT EXISTS naming an
 	// existing index.
 	ErrIndexExists = errors.New("vibedb: SQL index already exists")
+	// ErrIndexNotFound reports a storage replacement request naming an index
+	// absent from the table's cataloged exact-index definitions.
+	ErrIndexNotFound = errors.New("vibedb: SQL index does not exist")
+	// ErrIndexAmbiguous reports unqualified DROP INDEX when the same table-local
+	// index name exists on more than one table.
+	ErrIndexAmbiguous = errors.New("vibedb: SQL index name is ambiguous")
 	// ErrIndexBuildInProgress reports a second CREATE INDEX on a table whose
 	// online build has not reached its atomic catalog cutover.
 	ErrIndexBuildInProgress = errors.New("vibedb: SQL index build is already in progress")
@@ -54,6 +60,12 @@ var (
 	// ErrTooManyTables reports a catalog whose table count would exceed the
 	// database's bounded metadata and eagerly opened durable-handle budget.
 	ErrTooManyTables = errors.New("vibedb: SQL catalog exceeds the table-count bound")
+	// ErrTooManyRetiredTables bounds old storage incarnations whose active
+	// snapshots prevent immediate descriptor release and physical cleanup.
+	ErrTooManyRetiredTables = errors.New("vibedb: too many SQL table incarnations are retiring")
+	// ErrTooManyStorageFiles bounds recovery work in the private SQL table
+	// directory before any durable collection handles are opened.
+	ErrTooManyStorageFiles = errors.New("vibedb: SQL table storage recovery exceeds its entry bound")
 	// ErrArgumentsTooLarge reports one execution whose aggregate string,
 	// exact-number, and document argument payload exceeds the connection's
 	// bounded binding workspace.

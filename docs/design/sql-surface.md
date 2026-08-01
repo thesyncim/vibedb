@@ -61,6 +61,29 @@ layout. Choosing one layout unconditionally is important: schema enforcement,
 exact-index maintenance, statement batches, and transaction support do not
 depend on the shape of the first INSERT.
 
+`DROP TABLE` removes the table from the durable SQL catalog before retiring its
+collection file. `DROP TABLE IF EXISTS` is an idempotent no-op for an absent
+table. Physical collection cleanup is deferred while active snapshots or
+cursors hold leases; a crash after catalog publication can leave only an
+unreachable orphan file, never a catalog entry pointing at missing data.
+
+Every newly created table and storage replacement receives a cryptographically
+random, cataloged storage identity. `DROP TABLE` followed by same-name
+`CREATE TABLE` can therefore publish the replacement immediately while an old
+snapshot continues reading the retired file. Reopen removes only unreferenced
+files in the driver's private, strictly recognized storage namespace; live and
+legacy catalog paths remain protected. Recovery work and simultaneously
+retired incarnations both have hard bounds.
+
+`TRUNCATE [TABLE] name` publishes a fresh empty storage incarnation with the
+same schema and exact-index definitions. `DROP INDEX [IF EXISTS] name [ON
+table]` builds a replacement containing every document and all remaining exact
+indexes, fences that file, and atomically switches the catalog identity. Active
+snapshots continue to see the old incarnation until their leases close. A
+crash before catalog publication leaves a recoverable orphan; a crash after it
+leaves the new catalog authoritative. Unqualified index names must resolve to
+exactly one table; `ON table` is the deterministic form when names repeat.
+
 Catalog publication uses a synced temporary file, atomic replacement, and a
 namespace durability fence (directory sync on Unix and a write-through move on
 Windows). The first table file is fully committed before its directory entry is
@@ -190,11 +213,13 @@ identity, without converting through `float64`. Numeric identity supports the
 full JSON exponent syntax rather than an `int64` exponent subset; the practical
 bounds are the document and physical-key byte limits, not machine arithmetic.
 
-INSERT means insert, not upsert. It returns
+INSERT means insert, not replacement. By default it returns
 `driver.ErrDuplicatePrimaryKey` if the derived identity already exists or
-appears twice in one VALUES statement. The statement publishes nothing on that
-error. Use UPDATE for replacement. `LastInsertId` is unavailable because keys
-come from documents rather than a generated sequence.
+appears twice in one VALUES statement. `ON CONFLICT DO NOTHING` is also
+supported: conflicting rows are skipped atomically, including repeated keys in
+the same VALUES batch, and a RETURNING projection reports only rows that were
+inserted. Use UPDATE for replacement. `LastInsertId` is unavailable because
+keys come from documents rather than a generated sequence.
 
 There is no caller-supplied physical-key row form. `VALUES` without a field list
 contains exactly one complete document; a field-list INSERT includes the
@@ -208,6 +233,8 @@ The driver exposes the shared SELECT surface, including:
 - whole-document and JSON-path projection;
 - `=`, `!=`, `<>`, `<`, `<=`, `>`, and `>=`;
 - `IN`, `NOT IN`, `BETWEEN`, and `NOT BETWEEN`;
+- `LIKE`, `NOT LIKE`, `ILIKE`, and `NOT ILIKE` with `%`, `_`, and the default
+  backslash escape;
 - `IS NULL`, `IS NOT NULL`, `IS MISSING`, and `IS NOT MISSING`;
 - JSON containment with `@>`;
 - `AND`, `OR`, `NOT`, and parentheses with SQL three-valued logic;
@@ -238,10 +265,10 @@ The physical choice remains adaptive where memory admission or cardinality
 decides between indexed and scan paths; the JSON says so instead of pretending
 to be a static choice. Both forms use the engine's vibejson encoder.
 
-## Inner and left joins
+## Inner, left, and right joins
 
-The SQL join is a declared-field equi-join. Both `INNER JOIN` and
-`LEFT [OUTER] JOIN` are supported:
+The SQL join is a declared-field equi-join. `INNER JOIN`, `LEFT [OUTER] JOIN`,
+and `RIGHT [OUTER] JOIN` are supported:
 
 ```sql
 SELECT u.id, o.total
@@ -281,6 +308,15 @@ indexes, structural tapes, metadata, and build scratch. The budget is an
 admission bound on the estimated materialized working set, not merely a limit
 on output rows.
 
+`RIGHT JOIN` is normalized to an equivalent `LEFT JOIN` during parsing, with
+the preserved relation made the driving `FROM` relation. This keeps one outer
+join implementation and preserves null extension, fan-out, ordering, and
+snapshot behavior.
+
+`JOIN ... USING (field)` is accepted as a convenience spelling for an
+explicit equality. It currently accepts one simple field name; nested or
+composite keys use `ON` and are still subject to the one-key join limit.
+
 The current relational plan has two explicit join limits:
 
 - one statement may expand one joined relation, so the driver currently
@@ -288,7 +324,8 @@ The current relational plan has two explicit join limits:
 - that JOIN must relate the joined table directly to the driving `FROM` table;
   chained joins are rejected.
 
-Only inner and left `JOIN ... ON left_path = right_path` are supported. SQL exposes no
+Only inner, left, and right `JOIN ... ON left_path = right_path` (or the
+single-field `USING` equivalent) are supported. SQL exposes no
 physical storage-key pseudo-column; `"$key"` is an ordinary quoted JSON field.
 Join the tables' declared JSON primary-key fields when relational identity is
 the intended relationship.
@@ -345,6 +382,20 @@ one UPDATE statement supplies one constant whole document, a predicate that
 matches several distinct primary keys returns `ErrUpdatePrimaryKey` before
 publication; use an explicit transaction with one replacement per key. DELETE
 removes every selected document and its exact-index postings.
+
+Bounded mutation windows are also supported:
+
+```sql
+DELETE FROM users WHERE state = ? ORDER BY id DESC LIMIT 10
+UPDATE users SET "$doc" = ? WHERE state = ? ORDER BY id LIMIT ?
+```
+
+The current durable implementation accepts one `ORDER BY` term on the
+declared primary-key path and requires `LIMIT`; an unordered `LIMIT` is also
+supported. Selection is global and bounded before publication, so the limit
+does not reset at scan-batch boundaries. `OFFSET`, multi-key ordering,
+non-primary-key ordering, and `ORDER BY` without `LIMIT` remain explicit
+errors.
 
 Mutation WHERE clauses use the same predicate compiler as SELECT, including
 three-valued logic. Primary-key equality and membership take the point path;
@@ -521,14 +572,13 @@ The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
 - correlated subqueries and subqueries outside predicates, common table
-  expressions, set operations, window functions, `DISTINCT`, computed scalar
-  expressions, pattern matching, and user-defined functions;
-- right/full outer, cross, natural, `USING`, chained, and multiple fan-out joins;
-- partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, mutation joins,
-  mutation `ORDER BY`/`LIMIT`, and `UPDATE`/`DELETE RETURNING`;
-- generated keys, `INSERT ... SELECT`, defaults, upsert/on-conflict forms, and
-  nested flat-INSERT construction;
-- `ALTER`, `DROP`, `TRUNCATE`, views, unique/check/foreign-key/default/generated
+  expressions, set operations, window functions, `COUNT(DISTINCT ...)`,
+  computed scalar expressions, and user-defined functions;
+- full outer, cross, natural, composite `USING`, chained, and multiple fan-out joins;
+- partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
+- generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,
+  `ON DUPLICATE KEY`, and nested flat-INSERT construction;
+- `ALTER`, views, unique/check/foreign-key/default/generated
   constraints, and SQL types without a JSON equivalent;
 - unique/partial/range/full-text indexes, expression indexes, and selectable
   index methods;
@@ -538,7 +588,14 @@ operation:
 These are explicit errors rather than parser successes followed by
 approximations.
 
-`INSERT ... RETURNING path, ...` and `RETURNING *` are supported. They reuse
-the SELECT projection engine over the final staged documents, preserve
-multi-row VALUES order, and complete projection admission before the atomic
-write is published.
+`SELECT DISTINCT` is supported for non-aggregate projections by lowering the
+projected tuple to the engine's spill-aware grouping key. It preserves
+`ORDER BY`, `OFFSET`, and `LIMIT`; `COUNT(DISTINCT ...)` and DISTINCT queries
+whose explicit grouping changes the projected tuple remain rejected rather
+than being approximated.
+
+`INSERT`, `UPDATE`, and `DELETE ... RETURNING path, ...` and `RETURNING *` are
+supported. They reuse the SELECT projection engine over the final staged
+documents, preserve mutation order, and complete projection admission before
+the atomic write is published. DELETE returns pre-delete documents; UPDATE
+returns replacement documents.

@@ -29,13 +29,11 @@ func newFeatureNotSupportedError(
 // pgwire maps that same type and reason to 0A000; neither adapter owns a second
 // opinion about the feature boundary.
 var unsupportedStatements = map[string]string{
-	"MERGE":    "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
-	"REPLACE":  "REPLACE is not supported; INSERT into an existing key is refused, and deliberate overwrites use UPDATE",
-	"TRUNCATE": "TRUNCATE is not supported; use a bounded DELETE predicate",
-	"COPY":     "COPY is not supported: the wire endpoint does not implement the copy subprotocol",
+	"MERGE":   "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
+	"REPLACE": "REPLACE is not supported; INSERT into an existing key is refused, and deliberate overwrites use UPDATE",
+	"COPY":    "COPY is not supported: the wire endpoint does not implement the copy subprotocol",
 
 	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
-	"DROP":    "DROP is not in the bounded catalog subset; destructive catalog operations remain with the database owner",
 	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",
@@ -77,7 +75,7 @@ func unsupportedStatementReason(tok token) (string, bool) {
 	// every successful parse; classification belongs only on the cold refusal
 	// path.
 	switch tok.kw {
-	case kwSelect, kwInsert, kwUpdate, kwDelete, kwCreate:
+	case kwSelect, kwInsert, kwUpdate, kwDelete, kwCreate, kwDrop, kwTruncate:
 		return "", false
 	}
 	reason, ok := unsupportedStatements[strings.ToUpper(tok.text)]

@@ -333,6 +333,10 @@ func (s *Statement) compileHaving(e *sqlast.Expr, args []any) (int32, error) {
 			"query: '@>' is not available in HAVING: containment is answered on the " +
 				"execution path, and a post-reduction copy of it would be a second " +
 				"implementation of the same operator")
+	case sqlast.ExprLike:
+		return 0, fmt.Errorf(
+			"query: LIKE is not available in HAVING: pattern matching is answered on the " +
+				"execution path, and a post-reduction copy would be a second implementation")
 	}
 
 	column, err := s.havingColumn(e)

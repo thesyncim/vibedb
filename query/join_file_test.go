@@ -226,51 +226,42 @@ func TestDurableJoinInnerScanSpansManyBatchesUnderEviction(t *testing.T) {
 		innerRows = 4000
 	)
 	options := durableJoinOptions()
+	// Fixture construction is not the durability behavior under test. Build the
+	// heap corpus first and publish each durable primary graph once below. The
+	// snapshot still scans canonical durable pages under the same resident
+	// budget, without paying 5,500 point-publication tree rewrites and fences.
+	options.Durability = durable.DurabilityAsyncVisible
 	// Tight enough that the corpus cannot stay resident, so a frame borrowed by
 	// an early batch is genuinely recycled before the scan ends. Six MiB also
 	// retains the unified point writer's complete worst-case class-5 overlay:
 	// the collection must be able to publish any admitted point mutation even
 	// though this read test deliberately keeps its cache below the corpus.
 	options.ResidentBytes = 6 << 20
-	// Four documents per chunk with a two-kilobyte document makes a chunk page
-	// about eight kilobytes, so the complete inner scan spans roughly eight
-	// megabytes of pages against a six-megabyte resident budget. That ratio is
-	// the point: the frames an early page was read into are handed to a later
-	// read before the scan finishes, so a borrowed key is reading another
-	// document's bytes.
+	// CreateFromPrimary is an inline-only bulk builder. The fixture's documents
+	// are a little over two KiB, so admit them inline rather than falling back to
+	// the point writer this setup is specifically avoiding.
+	options.InlineValueBytes = 4 << 10
+	options.BufferCount = 0 // let the one-shot builder reserve its exact page count
+	// Four thousand two-kilobyte documents put more than eight MiB of primary
+	// payload behind a six-MiB resident budget. The complete scan therefore
+	// recycles frames from early pages before it ends, irrespective of how the
+	// bulk builder packs those documents into pages.
 	options.Collection = store.Options{ChunkDocuments: 4}
 
-	db, err := durable.OpenDatabase(t.TempDir(), durable.DatabaseOptions{Options: options})
-	if err != nil {
-		t.Fatalf("OpenDatabase: %v", err)
-	}
-	defer func() { _ = db.Close() }()
 	heap := &store.Database{}
-
-	outer, err := db.CreateCollection("outer", options)
-	if err != nil {
-		t.Fatalf("CreateCollection: %v", err)
-	}
-	heapOuter, err := heap.CreateCollection("outer", store.Options{})
+	heapOuter, err := heap.CreateCollection("outer", options.Collection)
 	if err != nil {
 		t.Fatalf("heap CreateCollection: %v", err)
 	}
 	for i := range outerRows {
 		key := fmt.Sprintf("o%04d", i)
 		doc := fmt.Sprintf(`{"id":%d,"ref":"k%04d"}`, i, i%innerRows)
-		if _, err := outer.Put([]byte(key), []byte(doc)); err != nil {
-			t.Fatalf("Put: %v", err)
-		}
 		if _, err := heapOuter.Put(key, []byte(doc)); err != nil {
-			t.Fatalf("heap Put: %v", err)
+			t.Fatalf("heap Put outer: %v", err)
 		}
 	}
 
-	inner, err := db.CreateCollection("inner", options)
-	if err != nil {
-		t.Fatalf("CreateCollection: %v", err)
-	}
-	heapInner, err := heap.CreateCollection("inner", store.Options{})
+	heapInner, err := heap.CreateCollection("inner", options.Collection)
 	if err != nil {
 		t.Fatalf("heap CreateCollection: %v", err)
 	}
@@ -283,14 +274,47 @@ func TestDurableJoinInnerScanSpansManyBatchesUnderEviction(t *testing.T) {
 		if i%2 == 0 {
 			tier = "pro"
 		}
-		doc := fmt.Sprintf(`{"tier":%q,"seat":%d,"pad":%q}`, tier, i, innerJoinPadding)
-		if _, err := inner.Put([]byte(key), []byte(doc)); err != nil {
-			t.Fatalf("Put: %v", err)
-		}
+		doc := fmt.Sprintf(`{"tier":%q,"seat":%d,"pad":%q}`, tier, i, innerJoinPadding(i))
 		if _, err := heapInner.Put(key, []byte(doc)); err != nil {
-			t.Fatalf("heap Put: %v", err)
+			t.Fatalf("heap Put inner: %v", err)
 		}
 	}
+
+	directory := t.TempDir()
+	bulkCreate := func(name string, source *store.Collection) string {
+		t.Helper()
+		filename, ok := collectionname.Encode(name)
+		if !ok {
+			t.Fatalf("invalid collection name %q", name)
+		}
+		path := filepath.Join(directory, filename)
+		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			t.Fatalf("create %s fixture: %v", name, err)
+		}
+		if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
+			_ = file.Close()
+			t.Fatalf("bulk-create %s fixture: %v", name, err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close %s fixture: %v", name, err)
+		}
+		return path
+	}
+	bulkCreate("outer", heapOuter)
+	innerPath := bulkCreate("inner", heapInner)
+	if info, err := os.Stat(innerPath); err != nil {
+		t.Fatalf("stat inner fixture: %v", err)
+	} else if info.Size() <= int64(options.ResidentBytes) {
+		t.Fatalf("inner fixture is %d bytes, want more than the %d-byte resident budget",
+			info.Size(), options.ResidentBytes)
+	}
+
+	db, err := durable.OpenDatabase(directory, durable.DatabaseOptions{Options: options})
+	if err != nil {
+		t.Fatalf("OpenDatabase: %v", err)
+	}
+	defer func() { _ = db.Close() }()
 
 	catalog, err := db.Snapshot()
 	if err != nil {
@@ -765,16 +789,23 @@ func mustDrivingSnapshot(t *testing.T, db *durable.Database) *durable.Snapshot {
 	return snapshot
 }
 
-// innerJoinPadding widens each inner document so a chunk page holds few of
-// them, which is what makes one inner batch span more pages than the resident
-// budget can hold.
-var innerJoinPadding = func() string {
+// innerJoinPadding widens each inner document with a deterministic unique
+// payload. Uniqueness matters to the bulk fixture: repeating one 2-KiB string
+// lets the canonical builder dictionary-compress the corpus below the resident
+// budget, which would make the eviction assertion vacuous even though the
+// logical JSON input remained large.
+func innerJoinPadding(row int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 	pad := make([]byte, 2048)
+	state := uint64(row+1) * 0x9e3779b97f4a7c15
 	for i := range pad {
-		pad[i] = 'x'
+		state ^= state >> 12
+		state ^= state << 25
+		state ^= state >> 27
+		pad[i] = alphabet[(state*0x2545f4914f6cdd1d)&63]
 	}
 	return string(pad)
-}()
+}
 
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {

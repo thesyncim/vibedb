@@ -24,6 +24,26 @@ func dumpAny(s *Statement) string {
 		return dumpCreateTable(s.CreateTable)
 	case KindCreateIndex:
 		return dumpCreateIndex(s.CreateIndex)
+	case KindDropTable:
+		if s.DropTable.IfExists {
+			return "drop table if exists " + s.DropTable.Table
+		}
+		return "drop table " + s.DropTable.Table
+	case KindTruncate:
+		return "truncate " + s.Truncate.Table
+	case KindDropIndex:
+		var b strings.Builder
+		b.WriteString("drop index")
+		if s.DropIndex.IfExists {
+			b.WriteString(" if exists")
+		}
+		b.WriteByte(' ')
+		b.WriteString(s.DropIndex.Name)
+		if s.DropIndex.HasTable {
+			b.WriteString(" on ")
+			b.WriteString(s.DropIndex.Table)
+		}
+		return b.String()
 	}
 	return dumpStmt(s.Select)
 }
@@ -49,6 +69,9 @@ func dumpInsert(s *InsertStmt) string {
 		}
 		b.WriteByte(')')
 	}
+	if s.OnConflictDoNothing {
+		b.WriteString(" on conflict do nothing")
+	}
 	if s.Returning != nil {
 		b.WriteString(" returning ")
 		for i := range s.Returning.Columns {
@@ -69,6 +92,16 @@ func dumpUpdate(s *UpdateStmt) string {
 	b.WriteString(" set ")
 	dumpOperand(&b, s.Doc)
 	dumpTargets(&b, s.Filter, false)
+	dumpMutationWindow(&b, s.OrderBy, s.Limit)
+	if s.Returning != nil {
+		b.WriteString(" returning ")
+		for i := range s.Returning.Columns {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			dumpColumn(&b, &s.Returning.Columns[i])
+		}
+	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }
@@ -78,6 +111,16 @@ func dumpDelete(s *DeleteStmt) string {
 	b.WriteString("delete from ")
 	b.WriteString(s.Table)
 	dumpTargets(&b, s.Filter, s.All)
+	dumpMutationWindow(&b, s.OrderBy, s.Limit)
+	if s.Returning != nil {
+		b.WriteString(" returning ")
+		for i := range s.Returning.Columns {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			dumpColumn(&b, &s.Returning.Columns[i])
+		}
+	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }
@@ -92,6 +135,25 @@ func dumpTargets(b *strings.Builder, filter *SelectStmt, all bool) {
 		dumpExpr(b, filter.Where)
 	default:
 		b.WriteString(" <no target>")
+	}
+}
+
+func dumpMutationWindow(b *strings.Builder, order []OrderTerm, limit *Operand) {
+	if len(order) != 0 {
+		b.WriteString(" order")
+		for i := range order {
+			b.WriteByte(' ')
+			dumpPath(b, order[i].Path)
+			if order[i].Desc {
+				b.WriteString(":desc")
+			} else {
+				b.WriteString(":asc")
+			}
+		}
+	}
+	if limit != nil {
+		b.WriteString(" limit ")
+		dumpOperand(b, *limit)
 	}
 }
 

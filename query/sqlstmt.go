@@ -130,7 +130,8 @@ type Statement struct {
 	// args is the argument vector the last bind used, retained only so a
 	// prepare-time validation pass has somewhere to put its placeholder
 	// stand-ins without allocating.
-	args []any
+	args        []any
+	prepareMode bool
 
 	// nested is allocated only for a statement that actually contains a
 	// subquery. Keeping one pointer here instead of three slice words makes
@@ -258,9 +259,12 @@ func prepareTreeWithLimit(
 	for i := range s.args {
 		s.args[i] = int64(0)
 	}
+	s.prepareMode = true
 	if err := s.lower(s.args); err != nil {
+		s.prepareMode = false
 		return nil, err
 	}
+	s.prepareMode = false
 	return s, nil
 }
 

@@ -80,6 +80,13 @@ func KindOf(src string) Kind {
 		// kind" here, and callers that need the distinction have the parsed
 		// statement by the time they do.
 		return KindCreateTable
+	case tok.kw == kwDrop:
+		if next := lx.next(); next.kind == tokIdent && next.kw == kwIndex {
+			return KindDropIndex
+		}
+		return KindDropTable
+	case tok.kw == kwTruncate:
+		return KindTruncate
 	}
 	return KindSelect
 }
@@ -113,6 +120,11 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 		return p.parseDelete()
 	case p.atKeyword(kwCreate):
 		return p.parseCreate(dst)
+	case p.atKeyword(kwDrop):
+		return p.parseDrop(dst)
+	case p.atKeyword(kwTruncate):
+		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
+		return p.parseTruncate()
 	}
 	if reason, unsupported := unsupportedStatementReason(p.tok); unsupported {
 		return p.featureNotSupportedHere(reason)
@@ -172,6 +184,21 @@ func (p *Parser) parseInsert() error {
 	}
 	p.rows = rows
 	p.ins.Rows = rows
+	if p.acceptKeyword(kwOn) {
+		if err := p.expectKeyword(kwConflict, "CONFLICT after ON"); err != nil {
+			return err
+		}
+		if p.tok.kind == tokLParen {
+			return p.errHere("ON CONFLICT targets are not supported; the document-derived primary key is the only conflict target")
+		}
+		if err := p.expectKeyword(kwDo, "DO after ON CONFLICT"); err != nil {
+			return err
+		}
+		if err := p.expectKeyword(kwNothing, "NOTHING after ON CONFLICT DO"); err != nil {
+			return err
+		}
+		p.ins.OnConflictDoNothing = true
+	}
 	if p.acceptKeyword(kwReturning) {
 		if err := p.parseInsertReturning(name, pos); err != nil {
 			return err
@@ -421,7 +448,16 @@ func (p *Parser) parseUpdate() error {
 	if err := p.parseDMLWhere("UPDATE"); err != nil {
 		return err
 	}
+	p.upd.OrderBy = p.mutationOrderBy
+	p.upd.Limit = p.mutationLimit
 	p.upd.Filter = p.out
+	if p.acceptKeyword(kwReturning) {
+		p.saveFilter()
+		if err := p.parseMutationReturning(name, pos); err != nil {
+			return err
+		}
+		p.upd.Returning = &p.returning
+	}
 	p.upd.Params = p.params
 	return nil
 }
@@ -493,8 +529,77 @@ func (p *Parser) parseDelete() error {
 	default:
 		p.del.Filter = p.out
 	}
+	p.del.OrderBy = p.mutationOrderBy
+	p.del.Limit = p.mutationLimit
+	if p.acceptKeyword(kwReturning) {
+		p.saveFilter()
+		if err := p.parseMutationReturning(name, pos); err != nil {
+			return err
+		}
+		p.del.Returning = &p.returning
+	}
 	p.del.Params = p.params
 	return nil
+}
+
+// detachMutationWindow removes ORDER BY/LIMIT from the synthetic SELECT used
+// as a mutation predicate. query.Filter intentionally evaluates a predicate
+// batch by batch; retaining these clauses there would make a LIMIT reset at
+// every batch and would make ORDER BY local to a batch. The driver applies the
+// captured window once, over the complete matching-key stream.
+func (p *Parser) detachMutationWindow() {
+	p.mutationOrderBy = append(p.mutationOrderBy[:0], p.out.OrderBy...)
+	p.mutationLimit = p.out.Limit
+	p.out.OrderBy = nil
+	p.out.Limit = nil
+	p.out.Offset = nil
+}
+
+// saveFilter copies the synthetic SELECT's clause slices before RETURNING
+// reuses the parser's clause buffers for its own projection. The paths and
+// expressions themselves live in parser arenas and do not need cloning.
+func (p *Parser) saveFilter() {
+	p.filterColumns = append(p.filterColumns[:0], p.out.Columns...)
+	p.filterFrom = append(p.filterFrom[:0], p.out.From...)
+	p.filterGroupBy = append(p.filterGroupBy[:0], p.out.GroupBy...)
+	p.filterOrderBy = append(p.filterOrderBy[:0], p.out.OrderBy...)
+	p.out.Columns = p.filterColumns
+	p.out.From = p.filterFrom
+	p.out.GroupBy = p.filterGroupBy
+	p.out.OrderBy = p.filterOrderBy
+}
+
+// parseMutationReturning parses the projection over documents selected by an
+// UPDATE or DELETE. It is deliberately a projection-only SELECT: mutation
+// RETURNING has no row source visible to SQL and therefore cannot group or
+// aggregate.
+func (p *Parser) parseMutationReturning(name string, pos int) error {
+	p.out = &p.returning
+	*p.out = SelectStmt{}
+	p.pending = p.pending[:0]
+	p.columns = p.columns[:0]
+	p.from = p.from[:0]
+	p.groupBy = p.groupBy[:0]
+	p.orderBy = p.orderBy[:0]
+	p.from = append(p.from, TableRef{Name: name, Alias: name, Join: JoinNone, Pos: pos})
+	p.out.From = p.from
+	if err := p.parseResultColumns(); err != nil {
+		return err
+	}
+	for i := range p.out.Columns {
+		if p.out.Columns[i].Agg != AggNone {
+			return p.errAt(p.out.Columns[i].Pos,
+				"RETURNING projects each affected document; aggregate functions are not allowed")
+		}
+	}
+	if err := p.expectEnd(); err != nil {
+		return err
+	}
+	if err := p.resolvePaths(); err != nil {
+		return err
+	}
+	p.out.Params = 0
+	return p.validate()
 }
 
 // --- shared ------------------------------------------------------------------
@@ -574,13 +679,31 @@ func (p *Parser) parseDMLWhere(clause string) error {
 		}
 		p.out.Where = where
 	}
+	if err := p.parseOrderBy(); err != nil {
+		return err
+	}
+	if err := p.parseLimitOffset(); err != nil {
+		return err
+	}
 	switch {
 	case p.atKeyword(kwGroup), p.atKeyword(kwHaving):
 		return p.errfHere("%s has no GROUP BY or HAVING: it acts on documents, not on groups of them", clause)
 	case p.atKeyword(kwOrder):
-		return p.errfHere("%s has no ORDER BY: which documents it touches is decided by the condition, and the order it touches them in is not observable", clause)
+		return p.errfHere("%s has an invalid ORDER BY clause", clause)
 	case p.atKeyword(kwLimit), p.atKeyword(kwOffset):
-		return p.errfHere("%s has no LIMIT: a bounded delete would have to choose which matching documents to spare, and the engine has no ordering to choose by", clause)
+		return p.errfHere("%s has an invalid LIMIT/OFFSET clause", clause)
+	case p.out.Offset != nil:
+		return p.errfHere("%s does not support OFFSET; use LIMIT with an optional primary-key ORDER BY", clause)
+	case len(p.out.OrderBy) != 0 && p.out.Limit == nil:
+		return p.errfHere("%s ORDER BY requires LIMIT so the mutation remains within one bounded write batch", clause)
+	}
+	if p.atKeyword(kwReturning) {
+		if err := p.resolvePaths(); err != nil {
+			return err
+		}
+		p.detachMutationWindow()
+		p.out.Params = p.params
+		return p.validate()
 	}
 	if err := p.rejectTail(); err != nil {
 		return err
@@ -591,6 +714,7 @@ func (p *Parser) parseDMLWhere(clause string) error {
 	if err := p.resolvePaths(); err != nil {
 		return err
 	}
+	p.detachMutationWindow()
 	p.out.Params = p.params
 	return p.validate()
 }
@@ -599,10 +723,10 @@ func (p *Parser) parseDMLWhere(clause string) error {
 // dialects and this one has no execution for.
 func (p *Parser) rejectTail() error {
 	if p.atKeyword(kwReturning) {
-		return p.errHere("RETURNING is supported only on INSERT; UPDATE and DELETE report how many documents they touched and return no rows")
+		return p.errHere("RETURNING is supported on INSERT, UPDATE, and DELETE")
 	}
 	if p.atKeyword(kwOn) {
-		return p.errHere("ON CONFLICT / ON DUPLICATE KEY is not supported: an INSERT onto an existing key is refused, and a deliberate overwrite is written UPDATE ... SET \"$doc\" = ?")
+		return p.errHere("ON CONFLICT supports only DO NOTHING; conflict updates are written UPDATE ... SET \"$doc\" = ?")
 	}
 	return nil
 }

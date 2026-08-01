@@ -106,12 +106,26 @@ type Parser struct {
 	// rule every other thing a Parser returns already carries. sel doubles as
 	// the synthetic SELECT an UPDATE or a DELETE selects its rows with; see
 	// parse_dml.go.
-	sel SelectStmt
-	ins InsertStmt
-	upd UpdateStmt
-	del DeleteStmt
-	tbl CreateTableStmt
-	idx CreateIndexStmt
+	sel       SelectStmt
+	returning SelectStmt
+	ins       InsertStmt
+	upd       UpdateStmt
+	del       DeleteStmt
+	tbl       CreateTableStmt
+	idx       CreateIndexStmt
+	drop      DropTableStmt
+	truncate  TruncateStmt
+	dropIndex DropIndexStmt
+
+	// DML filters and RETURNING projections reuse the clause buffers below.
+	// These retained copies keep a filter's slice headers valid while a
+	// mutation's RETURNING projection is parsed.
+	filterColumns   []ResultColumn
+	filterFrom      []TableRef
+	filterGroupBy   []*PathExpr
+	filterOrderBy   []OrderTerm
+	mutationOrderBy []OrderTerm
+	mutationLimit   *Operand
 
 	// Parse-time scratch that no parsed statement retains.
 	//
@@ -302,6 +316,13 @@ func (p *Parser) reset(src string) {
 	p.kidStack = p.kidStack[:0]
 	p.opScratch = p.opScratch[:0]
 	p.pending = p.pending[:0]
+	p.returning = SelectStmt{}
+	p.filterColumns = p.filterColumns[:0]
+	p.filterFrom = p.filterFrom[:0]
+	p.filterGroupBy = p.filterGroupBy[:0]
+	p.filterOrderBy = p.filterOrderBy[:0]
+	p.mutationOrderBy = p.mutationOrderBy[:0]
+	p.mutationLimit = nil
 	if p.nested != nil {
 		p.nested.used = 0
 	}
@@ -457,10 +478,13 @@ func (p *Parser) parseStatement() error {
 	if err := p.expectSelect(); err != nil {
 		return err
 	}
-	if p.atKeyword(kwDistinct) {
-		return p.errHere("SELECT DISTINCT is not supported: the engine has no distinct operator; GROUP BY the same paths instead")
+	p.out.Distinct = p.acceptKeyword(kwDistinct)
+	if p.out.Distinct && p.atKeyword(kwAll) {
+		return p.errHere("SELECT DISTINCT and SELECT ALL are mutually exclusive")
 	}
-	p.acceptKeyword(kwAll) // SELECT ALL is the default, so it is a no-op
+	if !p.out.Distinct {
+		p.acceptKeyword(kwAll) // SELECT ALL is the default, so it is a no-op
+	}
 	if err := p.parseResultColumns(); err != nil {
 		return err
 	}
@@ -479,6 +503,27 @@ func (p *Parser) parseStatement() error {
 	}
 	if err := p.parseGroupBy(); err != nil {
 		return err
+	}
+	if p.out.Distinct {
+		if len(p.out.GroupBy) != 0 {
+			return p.errHere("SELECT DISTINCT with GROUP BY is not supported when grouping changes the projected tuple")
+		}
+		hasAggregate := false
+		for i := range p.out.Columns {
+			if p.out.Columns[i].Agg != AggNone {
+				hasAggregate = true
+				break
+			}
+		}
+		if !hasAggregate {
+			p.groupBy = p.groupBy[:0]
+			for i := range p.out.Columns {
+				if p.out.Columns[i].Path != nil {
+					p.groupBy = append(p.groupBy, p.out.Columns[i].Path)
+				}
+			}
+			p.out.GroupBy = p.groupBy
+		}
 	}
 	if p.acceptKeyword(kwHaving) {
 		having, err := p.parseExpr(ctxHaving)
@@ -499,6 +544,9 @@ func (p *Parser) parseStatement() error {
 	if err := p.resolvePaths(); err != nil {
 		return err
 	}
+	if err := p.normalizeRightJoins(); err != nil {
+		return err
+	}
 	p.out.Params = p.params
 	return p.validate()
 }
@@ -512,12 +560,12 @@ func (p *Parser) expectSelect() error {
 	case p.acceptKeyword(kwSelect):
 		return nil
 	case p.atKeyword(kwInsert), p.atKeyword(kwUpdate), p.atKeyword(kwDelete),
-		p.atKeyword(kwCreate):
+		p.atKeyword(kwCreate), p.atKeyword(kwDrop), p.atKeyword(kwTruncate):
 		// Parse is the SELECT-only entry point, kept because a caller that only
 		// wants a query should not have to switch on a kind to find out it got
 		// one. The statement is not unsupported, so the message names the entry
 		// point that takes it rather than the capability the engine lacks.
-		return p.errHere("this entry point parses SELECT; INSERT, UPDATE, DELETE, and CREATE are parsed by ParseStatement")
+		return p.errHere("this entry point parses SELECT; mutations and catalog statements are parsed by ParseStatement")
 	}
 	if reason, unsupported := unsupportedStatementReason(p.tok); unsupported {
 		return p.featureNotSupportedHere(reason)
@@ -744,8 +792,11 @@ func (p *Parser) parseJoin() (bool, error) {
 	case p.acceptKeyword(kwLeft):
 		join = JoinLeft
 		p.acceptKeyword(kwOuter)
-	case p.atKeyword(kwRight), p.atKeyword(kwFull), p.atKeyword(kwOuter):
-		return false, p.errHere("RIGHT and FULL outer joins are not supported; write a LEFT JOIN with the preserved collection first")
+	case p.acceptKeyword(kwRight):
+		join = JoinRight
+		p.acceptKeyword(kwOuter)
+	case p.atKeyword(kwFull), p.atKeyword(kwOuter):
+		return false, p.errHere("FULL outer joins are not supported; RIGHT JOIN is supported and normalized to LEFT JOIN")
 	case p.atKeyword(kwCross):
 		return false, p.errHere("CROSS JOIN is not supported: the engine has no unrestricted product")
 	case p.atKeyword(kwNatural):
@@ -767,13 +818,15 @@ func (p *Parser) parseJoin() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if p.atKeyword(kwUsing) {
-		return false, p.errHere("JOIN ... USING is not supported; write ON left.key = right.key")
+	var cond *JoinCond
+	if p.acceptKeyword(kwUsing) {
+		cond, err = p.parseUsingCond(len(p.from))
+	} else {
+		if err := p.expectKeyword(kwOn, "ON after a JOIN"); err != nil {
+			return false, err
+		}
+		cond, err = p.parseJoinCond()
 	}
-	if err := p.expectKeyword(kwOn, "ON after a JOIN"); err != nil {
-		return false, err
-	}
-	cond, err := p.parseJoinCond()
 	if err != nil {
 		return false, err
 	}
@@ -784,6 +837,55 @@ func (p *Parser) parseJoin() (bool, error) {
 		return false, p.errfAt(ref.Pos, "a statement may join at most %d collections", maxClauseItems)
 	}
 	return false, nil
+}
+
+// parseUsingCond lowers the common one-column USING form to the explicit
+// equality the executor understands and marks the condition so deferred name
+// resolution can expose USING's merged unqualified key. A USING name belongs
+// to the relation immediately on the left and to the relation this JOIN adds.
+// The current executor only accepts the driving relation as the left side, so
+// a chained USING join is rejected during normal lowering with the same
+// precise chained-join diagnostic as an ON join.
+func (p *Parser) parseUsingCond(joinSource int) (*JoinCond, error) {
+	pos := p.tok.pos
+	if err := p.expect(tokLParen, "'(' after USING"); err != nil {
+		return nil, err
+	}
+	path, err := p.parsePath(false)
+	if err != nil {
+		return nil, err
+	}
+	// parsePath records ordinary paths for the statement-wide resolver. USING
+	// has already supplied both range variables, so remove that pending entry
+	// and clone the path into two explicitly bound operands.
+	if n := len(p.pending); n != 0 && p.pending[n-1].path == path {
+		p.pending = p.pending[:n-1]
+	}
+	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+		return nil, p.errAt(path.Pos, "USING accepts one simple field name; use ON for nested or composite keys")
+	}
+	if p.tok.kind == tokComma {
+		return nil, p.errHere("composite USING joins are not supported yet; write one equality in ON")
+	}
+	if err := p.expect(tokRParen, "')' after USING"); err != nil {
+		return nil, err
+	}
+	left := p.boundPath(path, joinSource-1)
+	right := p.boundPath(path, joinSource)
+	cond := p.conds.one()
+	*cond = JoinCond{Left: left, Right: right, Using: true, Pos: pos}
+	return cond, nil
+}
+
+// boundPath clones a parser-owned path without registering it for deferred
+// name resolution. This is used only by USING, whose unqualified name is
+// intentionally bound to both sides of the join.
+func (p *Parser) boundPath(path *PathExpr, source int) *PathExpr {
+	clone := p.paths.one()
+	segments := p.segs.allocDirty(len(path.Segments))
+	copy(segments, path.Segments)
+	*clone = PathExpr{Source: source, Segments: segments, Pos: path.Pos}
+	return clone
 }
 
 func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {

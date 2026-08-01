@@ -20,6 +20,9 @@ import (
 func dumpStmt(s *SelectStmt) string {
 	var b strings.Builder
 	b.WriteString("select")
+	if s.Distinct {
+		b.WriteString(" distinct")
+	}
 	for i := range s.Columns {
 		b.WriteByte(' ')
 		dumpColumn(&b, &s.Columns[i])
@@ -185,6 +188,16 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 		dumpLeaf(b, e)
 	case ExprContains:
 		b.WriteString("contains ")
+		dumpLeaf(b, e)
+		b.WriteByte(' ')
+		dumpOperand(b, e.Value)
+	case ExprLike:
+		if e.Insensitive {
+			b.WriteString(negated(e, "ilike", "notilike"))
+		} else {
+			b.WriteString(negated(e, "like", "notlike"))
+		}
+		b.WriteByte(' ')
 		dumpLeaf(b, e)
 		b.WriteByte(' ')
 		dumpOperand(b, e.Value)

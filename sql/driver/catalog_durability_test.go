@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -58,6 +59,101 @@ func TestCatalogFenceFailureKeepsPublishedDefinition(t *testing.T) {
 	}
 }
 
+func TestDroppedTableCleanupFailureRetainsLaterWork(t *testing.T) {
+	closeFailure := errors.New("injected retired collection close failure")
+	calls := 0
+	database := &database{
+		closeCollection: func(*durable.Collection) error {
+			calls++
+			if calls == 1 {
+				return closeFailure
+			}
+			return nil
+		},
+		retired: []retiredTable{
+			{name: "first", collection: new(durable.Collection)},
+			{name: "second", collection: new(durable.Collection)},
+		},
+	}
+
+	err := database.settleDroppedTablesLocked()
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
+		!strings.Contains(err.Error(), closeFailure.Error()) {
+		t.Fatalf("settle dropped tables = %v, want unknown close outcome", err)
+	}
+	if got := len(database.retired); got != 2 {
+		t.Fatalf("retired entries after first close failure = %d, want 2", got)
+	}
+	if database.retired[0].name != "first" || database.retired[1].name != "second" {
+		t.Fatalf("retired retry order = %q, %q, want first, second",
+			database.retired[0].name, database.retired[1].name)
+	}
+}
+
+func TestDroppedTableLaterCleanupFailurePreservesEarlierNamespaceFence(t *testing.T) {
+	directory := t.TempDir()
+	removedPath := filepath.Join(directory, "removed.vjc")
+	if err := os.WriteFile(removedPath, []byte("retired"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blockedPath := filepath.Join(directory, "blocked.vjc")
+	if err := os.Mkdir(blockedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blockedPath, "child"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	database := &database{
+		dataDir: directory,
+		retired: []retiredTable{
+			{name: "removed", path: removedPath,
+				journal: durable.RecoveryJournalPath(removedPath)},
+			{name: "blocked", path: blockedPath,
+				journal: durable.RecoveryJournalPath(blockedPath)},
+		},
+	}
+
+	err := database.settleDroppedTablesLocked()
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("later cleanup failure = %v, want unknown outcome", err)
+	}
+	if !database.tableDirFencePending {
+		t.Fatal("earlier namespace removal lost its pending directory fence")
+	}
+	if len(database.retired) != 2 || !database.retired[0].removed ||
+		database.retired[1].name != "blocked" {
+		t.Fatalf("retained cleanup state = %+v", database.retired)
+	}
+}
+
+func TestUnpublishedDropRollbackPreservesUnrelatedRetirement(t *testing.T) {
+	meta := &tableMeta{PrimaryKey: "/id"}
+	active := &table{meta: meta}
+	database := &database{
+		path: filepath.Join(t.TempDir(), "missing", "catalog.vdb"),
+		catalog: catalogFile{Version: catalogVersion, Tables: map[string]*tableMeta{
+			"docs": meta,
+		}},
+		tables:  map[string]*table{"docs": active},
+		retired: []retiredTable{{name: "unrelated"}},
+	}
+	drop, err := query.PrepareDML(`DROP TABLE docs`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer drop.Release()
+
+	if _, err := database.dropTableLockedContext(context.Background(), drop); err == nil {
+		t.Fatal("DROP unexpectedly published through a missing catalog directory")
+	}
+	if database.tables["docs"] != active || database.catalog.Tables["docs"] != meta {
+		t.Fatal("unpublished DROP did not restore the active table")
+	}
+	if len(database.retired) != 1 || database.retired[0].name != "unrelated" {
+		t.Fatalf("unpublished DROP changed unrelated retirements: %+v", database.retired)
+	}
+}
+
 func TestIndexFenceFailureKeepsPublishedDefinition(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.vdb")
 	database, err := openDatabase(path)
@@ -110,7 +206,7 @@ func TestIndexFenceFailureKeepsPublishedDefinition(t *testing.T) {
 	}
 }
 
-func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
+func TestTableFileFenceFailureCleansUnpublishedFirstWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.vdb")
 	database, err := openDatabase(path)
 	if err != nil {
@@ -149,14 +245,14 @@ func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
 		!errors.Is(err, fenceFailure) {
 		t.Fatalf("first-write fence failure = %v, want unknown outcome", err)
 	}
-	if table == nil || table.collection == nil {
-		t.Fatal("committed first write was discarded after namespace publication")
+	if table != nil {
+		t.Fatal("unfenced first write returned a live table")
 	}
-	if _, statErr := os.Stat(database.tablePath("docs")); statErr != nil {
-		t.Fatalf("published table file: %v", statErr)
+	if _, statErr := os.Stat(database.tablePath("docs")); !os.IsNotExist(statErr) {
+		t.Fatalf("unpublished table file survived fenced cleanup: %v", statErr)
 	}
 	if !database.tableDirFencePending {
-		t.Fatal("failed table namespace fence was not retained for retry")
+		t.Fatal("failed cleanup namespace fence was not retained for retry")
 	}
 
 	var retried []string
@@ -200,8 +296,8 @@ func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !found || string(raw) != `{"id":"a","kind":"x"}` {
-		t.Fatalf("reopened first write = (%s, %t), want committed document", raw, found)
+	if found {
+		t.Fatalf("reopened unpublished first write = (%s, %t), want absent", raw, found)
 	}
 	secondKey, err := primaryScalarKey("b")
 	if err != nil {
@@ -389,10 +485,10 @@ func TestFailedFirstWriteCleansTemporaryTableFile(t *testing.T) {
 	if table != nil {
 		t.Fatal("failed first write returned a materialized table")
 	}
-	if errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
 		!errors.Is(err, fenceFailure) {
 		t.Fatalf(
-			"failed-write temporary cleanup fence = %v, want known failure",
+			"failed-write temporary cleanup fence = %v, want unknown namespace outcome",
 			err,
 		)
 	}

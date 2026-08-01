@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -123,6 +124,8 @@ func TestSQLMatchesBuilder(t *testing.T) {
 		{`SELECT a FROM t WHERE a IS NOT NULL`, Select(Path("a")).Where(Not(IsNull("a")))},
 		{`SELECT a FROM t WHERE a IS MISSING`, Select(Path("a")).Where(Not(Exists("a")))},
 		{`SELECT a FROM t WHERE a IS NOT MISSING`, Select(Path("a")).Where(Exists("a"))},
+		{`SELECT a FROM t WHERE a LIKE 'x%'`, Select(Path("a")).Where(Like("a", "x%"))},
+		{`SELECT a FROM t WHERE a ILIKE 'x%'`, Select(Path("a")).Where(ILike("a", "x%"))},
 		{`SELECT a FROM t WHERE active = true OR b = 7`,
 			Select(Path("a")).Where(Or(Cmp("active", Eq, true), Cmp("b", Eq, 7)))},
 		{`SELECT b FROM t WHERE a = 1 AND b = 2`,
@@ -618,6 +621,55 @@ func TestSQLHavingIsNotIgnored(t *testing.T) {
 
 // --- rejections ------------------------------------------------------------
 
+func TestSQLLikePatterns(t *testing.T) {
+	set := mustSegment(t,
+		`{"name":"alpha"}`,
+		`{"name":"ALPHA"}`,
+		`{"name":"beta"}`,
+		`{"name":"a_b"}`,
+		`{"name":"a%b"}`,
+		`{"name":7}`,
+		`{"name":null}`,
+	)
+	checks := []struct {
+		src  string
+		want []string
+	}{
+		{`SELECT name FROM t WHERE name LIKE 'a%'`, []string{`"alpha"`, `"a_b"`, `"a%b"`}},
+		{`SELECT name FROM t WHERE name ILIKE 'a%'`, []string{`"alpha"`, `"ALPHA"`, `"a_b"`, `"a%b"`}},
+		{`SELECT name FROM t WHERE name NOT LIKE 'a%'`, []string{`"ALPHA"`, `"beta"`}},
+		{`SELECT name FROM t WHERE name NOT ILIKE 'a%'`, []string{`"beta"`}},
+		{`SELECT name FROM t WHERE name LIKE 'a\_%'`, []string{`"a_b"`}},
+	}
+	for _, tc := range checks {
+		stmt, err := PrepareStatement(tc.src)
+		if err != nil {
+			t.Fatalf("PrepareStatement(%q): %v", tc.src, err)
+		}
+		var e Exec
+		cursor, err := stmt.RunInto(&e, FromSegment(set), nil)
+		if err != nil {
+			t.Fatalf("RunInto(%q): %v", tc.src, err)
+		}
+		var got []string
+		for cursor.Next() {
+			got = append(got, string(cursor.Cell(0).JSON()))
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%q returned %v, want %v", tc.src, got, tc.want)
+		}
+	}
+	for _, src := range []string{
+		`SELECT name FROM t WHERE name LIKE 'a\'`,
+		`SELECT name FROM t WHERE name LIKE 1`,
+		`SELECT name FROM t GROUP BY name HAVING name LIKE 'a%'`,
+	} {
+		if _, err := PrepareStatement(src); err == nil {
+			t.Errorf("PrepareStatement(%q) succeeded; want an explicit rejection", src)
+		}
+	}
+}
+
 // TestSQLRejections asserts each unsupported shape is refused, and refused
 // where it can still be explained, rather than executed as something else.
 func TestSQLRejections(t *testing.T) {
@@ -656,8 +708,6 @@ func TestSQLParseErrorsCarryAPosition(t *testing.T) {
 		`SELECT a FROM`,
 		`SELECT a FROM t WHERE`,
 		`DELETE FROM t`,
-		`SELECT DISTINCT a FROM t`,
-		`SELECT a FROM t WHERE a LIKE 'x%'`,
 		`SELECT a FROM t WHERE a = NULL`,
 		`SELECT a FROM t LEFT JOIN u ON u.a = t.a`,
 	} {

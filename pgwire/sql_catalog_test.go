@@ -99,6 +99,55 @@ func TestSQLCatalogSimpleAndExtendedLifecycle(t *testing.T) {
 	}
 }
 
+func TestSQLCatalogTruncateAndDropIndexProtocol(t *testing.T) {
+	c := connectSQLCatalog(t)
+	for _, statement := range []string{
+		`CREATE TABLE docs (id STRING PRIMARY KEY, kind STRING)`,
+		`CREATE INDEX by_kind ON docs (kind)`,
+		`INSERT INTO docs VALUES ('{"id":"a","kind":"x"}')`,
+	} {
+		if msgs := c.query(statement); has(msgs, msgErrorResponse) {
+			t.Fatalf("%s: %s", statement,
+				formatError(find(t, msgs, msgErrorResponse).body))
+		}
+	}
+
+	if got := commandTagOf(t, c.query(`DROP INDEX by_kind ON docs`)); got != "DROP INDEX" {
+		t.Fatalf("DROP INDEX tag = %q", got)
+	}
+	expectError(t, c.query(`DROP INDEX by_kind ON docs`), sqlstateUndefinedObject)
+	if got := commandTagOf(t, c.query(`CREATE INDEX by_kind ON docs (kind)`)); got != "CREATE INDEX" {
+		t.Fatalf("recreated index tag = %q", got)
+	}
+
+	truncated := extendedSQL(c, `TRUNCATE TABLE docs`, nil)
+	if got := commandTagOf(t, truncated); got != "TRUNCATE TABLE" {
+		t.Fatalf("extended TRUNCATE tag = %q", got)
+	}
+	rows := rowsOf(t, c.query(`SELECT COUNT(*) FROM docs`))
+	if len(rows) != 1 || len(rows[0]) != 1 || string(rows[0][0]) != "0" {
+		t.Fatalf("rows after TRUNCATE = %q, want [[0]]", rows)
+	}
+
+	dropped := extendedSQL(c, `DROP INDEX IF EXISTS by_kind ON docs`, nil)
+	if got := commandTagOf(t, dropped); got != "DROP INDEX" {
+		t.Fatalf("extended DROP INDEX tag = %q", got)
+	}
+
+	for _, statement := range []string{
+		`CREATE TABLE alpha (id STRING PRIMARY KEY)`,
+		`CREATE TABLE beta (id STRING PRIMARY KEY)`,
+		`CREATE INDEX shared_name ON alpha (id)`,
+		`CREATE INDEX shared_name ON beta (id)`,
+	} {
+		if msgs := c.query(statement); has(msgs, msgErrorResponse) {
+			t.Fatalf("%s: %s", statement,
+				formatError(find(t, msgs, msgErrorResponse).body))
+		}
+	}
+	expectError(t, c.query(`DROP INDEX shared_name`), sqlstateAmbiguousAlias)
+}
+
 func TestSQLCatalogIndexedImplicitAndExplicitBatches(t *testing.T) {
 	c := connectSQLCatalog(t)
 	for _, statement := range []string{

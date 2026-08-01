@@ -101,10 +101,10 @@ func TestRejectsNonPredicateExpressions(t *testing.T) {
 
 func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 	runRejections(t, []rejection{
-		{"DISTINCT", `SELECT DISTINCT a FROM t`, 7, "no distinct operator"},
+		{"DISTINCT and ALL", `SELECT DISTINCT ALL a FROM t`, 16, "mutually exclusive"},
+		{"DISTINCT with GROUP BY", `SELECT DISTINCT a FROM t GROUP BY a`, 35, "grouping changes"},
 		{"COUNT DISTINCT", `SELECT COUNT(DISTINCT a) FROM t`, 13, "no distinct variant"},
-		{"LIKE", `SELECT a FROM t WHERE b LIKE 'x%'`, 24, "no pattern operator"},
-		{"ILIKE", `SELECT a FROM t WHERE b ILIKE 'x%'`, 24, "no pattern operator"},
+		{"LIKE ESCAPE", `SELECT a FROM t WHERE b LIKE 'x%' ESCAPE '!'`, 34, "LIKE ... ESCAPE"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"a subquery in FROM", `SELECT a FROM (SELECT b FROM u)`, 14, "subqueries are not supported"},
@@ -136,11 +136,10 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 
 func TestRejectsUnsupportedJoins(t *testing.T) {
 	runRejections(t, []rejection{
-		{"RIGHT JOIN", `SELECT t.a FROM t RIGHT JOIN u ON t.k = u.k`, 18, "outer joins"},
-		{"FULL JOIN", `SELECT t.a FROM t FULL JOIN u ON t.k = u.k`, 18, "outer joins"},
+		{"FULL JOIN", `SELECT t.a FROM t FULL JOIN u ON t.k = u.k`, 18, "FULL outer joins"},
 		{"CROSS JOIN", `SELECT t.a FROM t CROSS JOIN u`, 18, "unrestricted product"},
 		{"NATURAL JOIN", `SELECT t.a FROM t NATURAL JOIN u ON t.k = u.k`, 18, "write ON explicitly"},
-		{"USING", `SELECT t.a FROM t JOIN u USING (k)`, 25, "left.key = right.key"},
+		{"composite USING", `SELECT t.a FROM t JOIN u USING (k, x)`, 33, "composite USING joins"},
 		{"comma joins", `SELECT t.a FROM t, u`, 17, "explicit JOIN"},
 		{"a missing ON", `SELECT t.a FROM t JOIN u`, 24, "expected ON"},
 		{"an inequality join", `SELECT t.a FROM t JOIN u ON t.k > u.k`, 32, "single key equality"},
@@ -303,16 +302,16 @@ func TestRejectsMalformedContainmentNeedles(t *testing.T) {
 // TestErrorPositionsAreLineAndColumn checks that a multi-line statement reports
 // the line and column an editor would show, not just a byte offset.
 func TestErrorPositionsAreLineAndColumn(t *testing.T) {
-	src := "SELECT a\nFROM t\nWHERE b LIKE 'x'"
+	src := "SELECT a\nFROM t\nWHERE b LIKE 'x' ESCAPE '!'"
 	_, err := Parse(src)
 	var parseErr *ParseError
 	if !errors.As(err, &parseErr) {
 		t.Fatalf("Parse = %v, want *ParseError", err)
 	}
-	if parseErr.Line != 3 || parseErr.Col != 9 {
-		t.Fatalf("reported %d:%d, want 3:9", parseErr.Line, parseErr.Col)
+	if parseErr.Line != 3 || parseErr.Col != 18 {
+		t.Fatalf("reported %d:%d, want 3:18", parseErr.Line, parseErr.Col)
 	}
-	if !strings.Contains(parseErr.Error(), "3:9") {
-		t.Fatalf("Error() = %q, want it to show 3:9", parseErr.Error())
+	if !strings.Contains(parseErr.Error(), "3:18") {
+		t.Fatalf("Error() = %q, want it to show 3:18", parseErr.Error())
 	}
 }
