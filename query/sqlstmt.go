@@ -275,6 +275,18 @@ func prepareTreeInContext(
 	ctes *statementCTEs,
 	argBase int,
 ) (*Statement, error) {
+	// A compound query is represented by a cold parser sidecar. Until the
+	// physical set-tree lowerer publishes every leaf and tail into one owning
+	// Statement, treating the first syntactic operand as an ordinary SELECT
+	// would return a plausible but incomplete result. Refuse at the expression
+	// boundary so every caller, including database/sql and pgwire, observes the
+	// positioned SQLSTATE 0A000 contract instead of silent first-leaf execution.
+	if tree.Set != nil {
+		return nil, sqlast.NewFeatureNotSupportedError(
+			src, tree.Set.Pos,
+			"compound query execution is not supported by the SQL statement lowerer yet",
+		)
+	}
 	s := &Statement{
 		text: src, tree: tree, params: tree.Params,
 		subqueryLimit: subqueryLimit,
