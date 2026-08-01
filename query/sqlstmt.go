@@ -514,7 +514,13 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 		return Cursor{}, err
 	}
 	frame.args = args
-	return s.runIntoFrame(e, src, args, frame, "")
+	cursor, err := s.runIntoFrame(e, src, args, frame, "")
+	// The persistent frame exists only to keep nested execution allocation-free.
+	// It must not extend the lifetime of caller-owned bindings past this
+	// synchronous execution; recursive and CTE children have completed before
+	// runIntoFrame returns, and the result cursor borrows only Exec.Result.
+	frame.args = nil
+	return cursor, err
 }
 
 // runDirectInto is the no-nested-state execution path. Keeping it separate is
