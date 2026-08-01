@@ -119,18 +119,36 @@ func (s *Statement) build(args []any) error {
 
 // Collection returns the name of the driving collection — the FROM entry. A
 // statement always has one, because the parser requires FROM.
-func (s *Statement) Collection() string { return s.tree.From[0].Name }
+func (s *Statement) Collection() string {
+	if derived := s.derived(); derived != nil {
+		return derived.stmt.Collection()
+	}
+	return s.tree.From[0].Name
+}
 
 // buildColumns lowers the SELECT list, then appends any hidden column a HAVING
 // leaf needs.
 func (s *Statement) buildColumns() error {
+	name := 0
 	for i := range s.tree.Columns {
 		col := &s.tree.Columns[i]
+		if derived := s.derived(); derived != nil && col.Agg == sqlast.AggNone &&
+			col.Path != nil && len(col.Path.Segments) == 0 {
+			for ordinal := range derived.names {
+				s.q.columns = append(s.q.columns, Column{
+					spec:   derived.ordinalSpec[ordinal],
+					header: s.names[name],
+				})
+				name++
+			}
+			continue
+		}
 		s.q.columns = append(s.q.columns, Column{
 			agg:    aggKind(col.Agg),
 			spec:   s.spec(col.Path),
-			header: s.names[i],
+			header: s.names[name],
 		})
+		name++
 	}
 	return nil
 }
@@ -138,6 +156,11 @@ func (s *Statement) buildColumns() error {
 // buildGroupBy lowers GROUP BY.
 func (s *Statement) buildGroupBy() error {
 	for _, key := range s.tree.GroupBy {
+		if derived := s.derived(); derived != nil && key != nil &&
+			len(key.Segments) == 0 {
+			s.q.groupBy = append(s.q.groupBy, derived.ordinalSpec...)
+			continue
+		}
 		s.q.groupBy = append(s.q.groupBy, s.spec(key))
 	}
 	return nil

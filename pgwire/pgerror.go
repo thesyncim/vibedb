@@ -39,6 +39,8 @@ const (
 	sqlstateDuplicateTable             = "42P07"
 	sqlstateDuplicateObject            = "42710"
 	sqlstateUndefinedObject            = "42704"
+	sqlstateUndefinedColumn            = "42703"
+	sqlstateAmbiguousColumn            = "42702"
 	sqlstateAmbiguousAlias             = "42P09"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
@@ -161,6 +163,7 @@ func asPGError(err error) *pgError {
 		return already
 	}
 	if errors.Is(err, query.ErrResultBudget) ||
+		errors.Is(err, query.ErrIntermediateBudget) ||
 		errors.Is(err, query.ErrAggregateBudget) ||
 		errors.Is(err, query.ErrJoinPairBudget) ||
 		errors.Is(err, query.ErrWorkBudget) ||
@@ -186,6 +189,10 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateCardinalityViolation, err.Error())
 	case errors.Is(err, query.ErrParameterType):
 		return newError(sqlstateDatatypeMismatch, err.Error())
+	case errors.Is(err, query.ErrUndefinedColumn):
+		return newError(sqlstateUndefinedColumn, err.Error())
+	case errors.Is(err, query.ErrAmbiguousColumn):
+		return newError(sqlstateAmbiguousColumn, err.Error())
 	case errors.Is(err, query.ErrInvalidPattern):
 		return newError(sqlstateInvalidParameterValue, err.Error())
 	case errors.Is(err, durable.ErrCommitOutcomeUnknown):

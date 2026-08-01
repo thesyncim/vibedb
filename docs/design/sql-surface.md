@@ -357,11 +357,47 @@ is no per-row nested execution and warmed execution allocates nothing.
 
 `IN` preserves SQL three-valued logic when the nested result contains `NULL`.
 An empty scalar result is `NULL`; a scalar result with more than one row is an
-error. Every nested result remains subject to the query result row and byte
-budgets.
+error. Every nested result is charged to one statement-wide intermediate byte
+account; nesting does not mint another materialization allowance.
 
-Correlated subqueries are rejected rather than re-evaluated once per row, and
-subqueries in `FROM`, the projection list, and `HAVING` remain unsupported.
+Correlated predicate subqueries remain rejected rather than re-evaluated once
+per row. Scalar subqueries in the projection list and subqueries in `HAVING`
+remain unsupported.
+
+## Derived tables
+
+An uncorrelated `SELECT` may be used as the sole `FROM` relation:
+
+```sql
+SELECT d.customer, d.total
+FROM (
+  SELECT customer, SUM(amount) AS total
+  FROM orders
+  GROUP BY customer
+) AS d
+WHERE d.total > 100
+ORDER BY d.customer
+```
+
+The alias is mandatory; `AS` is optional. The inner statement completes its
+filtering, grouping, ordering, offset, and limit before the outer statement
+consumes it. Outer filtering, grouping, aggregates, ordering, offset, limit,
+and `d.*` are supported. Duplicate inner output names remain distinct
+ordinals: wildcard expansion preserves them, while a named reference is a
+typed ambiguous-column error. Exact decimal spellings, SQL NULL, and nested
+JSON values cross the relation boundary without scalar conversion.
+
+Derived rows are held in a private ordinal-keyed spool and are charged, along
+with every simultaneously live nested result, to
+`query.ExecOptions.IntermediateBytes`. Admission is fail-closed before the
+indexed spool grows. The spool feeds the existing scan, predicate, grouping,
+ordering, and aggregate kernel, so the outer query does not use a second SQL
+evaluator. Warmed in-memory execution remains allocation-free.
+
+The derived query reads the same catalog snapshot as the outer statement.
+Derived relations in JOIN positions and `LATERAL` are typed unsupported until
+the generic relation-join/apply operator lands; they are never approximated as
+independent or per-row execution.
 
 Joins inside a transaction use the same bounded heap path over the snapshots
 captured by BEGIN plus that transaction's staged overlay. They preserve
@@ -571,9 +607,11 @@ lifecycle correctly through its prepared-statement fallback.
 The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
-- correlated subqueries and subqueries outside predicates, common table
+- correlated subqueries, projection/HAVING subqueries, common table
   expressions, set operations, window functions, `COUNT(DISTINCT ...)`,
   computed scalar expressions, and user-defined functions;
+- derived relations in JOIN positions, `LATERAL`, and derived-table column
+  alias lists;
 - full outer, cross, natural, composite `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
 - generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,

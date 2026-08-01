@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -141,6 +142,7 @@ type Statement struct {
 
 type nestedStatements struct {
 	subqueries []statementSubquery
+	derived    *statementDerived
 }
 
 type subqueryUse uint8
@@ -249,6 +251,9 @@ func prepareTreeWithLimit(
 	if err := s.prepareSubqueries(); err != nil {
 		return nil, err
 	}
+	if err := s.prepareDerived(); err != nil {
+		return nil, err
+	}
 	if err := s.describe(); err != nil {
 		return nil, err
 	}
@@ -329,6 +334,11 @@ func (s *Statement) Release() {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
 		}
+		if s.nested.derived != nil {
+			s.nested.derived.stmt.Release()
+			s.nested.derived.exec.Release()
+			s.nested.derived.segment.Reset()
+		}
 	}
 	*s = Statement{}
 }
@@ -350,18 +360,47 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	if e == nil {
 		return Cursor{}, fmt.Errorf("query: RunInto requires a non-nil Exec")
 	}
+	var frame statementFrame
+	if err := frame.begin(e.Options); err != nil {
+		return Cursor{}, err
+	}
+	return s.runIntoFrame(e, src, args, &frame)
+}
+
+// runIntoFrame is RunInto with the statement-wide accounts already installed.
+// Nested statements call this entry point so recursion never manufactures a
+// fresh intermediate allowance.
+func (s *Statement) runIntoFrame(
+	e *Exec,
+	src Source,
+	args []any,
+	frame *statementFrame,
+) (Cursor, error) {
+	// Invalidate the previous root or nested result before any fallible bind or
+	// child execution. Query.RunInto performs the same reset later, but a
+	// subquery error happens before that call and must not leave a prior success
+	// looking like the failed execution's output.
+	e.Result.abortResult()
 	if len(args) != s.params {
 		return Cursor{}, fmt.Errorf(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
 			s.params, len(args))
 	}
-	if err := s.runSubqueries(e, src, args); err != nil {
+	runSource, err := s.runDerived(e, src, args, frame)
+	if err != nil {
+		s.releaseDerived(frame)
+		return Cursor{}, err
+	}
+	if err := s.runSubqueries(e, src, args, frame); err != nil {
+		s.releaseDerived(frame)
 		return Cursor{}, err
 	}
 	if err := s.bind(args); err != nil {
+		s.releaseDerived(frame)
 		return Cursor{}, err
 	}
-	if err := s.q.RunInto(e, src); err != nil {
+	if err := s.q.RunInto(e, runSource); err != nil {
+		s.releaseDerived(frame)
 		return Cursor{}, err
 	}
 	return s.cursor(&e.Result), nil
@@ -416,7 +455,12 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
 	return nil
 }
 
-func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
+func (s *Statement) runSubqueries(
+	parent *Exec,
+	src Source,
+	args []any,
+	frame *statementFrame,
+) error {
 	if s.nested == nil {
 		return nil
 	}
@@ -432,8 +476,38 @@ func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
 			return err
 		}
 		sub.exec.Options = parent.Options
-		cursor, err := sub.stmt.RunInto(&sub.exec, nestedSource, args[base:base+n])
+		remaining := frame.intermediate.remaining()
+		if remaining == 0 {
+			return &IntermediateBudgetError{
+				Resource: "predicate subquery result",
+				Bytes:    saturatedBytes(frame.intermediate.used, 1),
+				Limit:    frame.intermediate.limit,
+			}
+		}
+		if remaining > 0 {
+			// ResultBytes=0 means the default rather than an empty allowance, so
+			// install the positive remainder explicitly. The statement frame
+			// reserves the materialized result below before another subquery can
+			// consume the same bytes.
+			sub.exec.Options.ResultBytes = remaining
+		}
+		cursor, err := sub.stmt.runIntoFrame(
+			&sub.exec, nestedSource, args[base:base+n], frame,
+		)
 		if err != nil {
+			var resultErr *ResultBudgetError
+			if remaining > 0 && errors.As(err, &resultErr) &&
+				resultErr.ByteLimit == remaining {
+				return &IntermediateBudgetError{
+					Resource: "predicate subquery result",
+					Bytes:    saturatedBytes(frame.intermediate.used, resultErr.Bytes),
+					Limit:    frame.intermediate.limit,
+				}
+			}
+			return err
+		}
+		retained := sub.exec.Result.resultBytesUsed
+		if err := frame.intermediate.reserve("predicate subquery result", retained); err != nil {
 			return err
 		}
 		sub.preview = false
@@ -645,6 +719,9 @@ func (s *Statement) render(p *sqlast.PathExpr, local bool) string {
 	if p == nil {
 		return ""
 	}
+	if s.derived() != nil && p.Source == 0 {
+		return s.renderDerived(p, local)
+	}
 	qualified := !local && p.Source != 0
 	if len(p.Segments) == 0 && !qualified {
 		return ""
@@ -735,10 +812,29 @@ func (s *Statement) unshadow(start int) []byte {
 // describe computes the output schema and the parts of the statement that do
 // not depend on a binding. It runs once, at prepare.
 func (s *Statement) describe() error {
-	s.outputs = len(s.tree.Columns)
-	s.names = reserve(s.names[:0], s.outputs)
+	s.outputs = 0
+	capacity := len(s.tree.Columns)
+	if derived := s.derived(); derived != nil {
+		capacity += len(derived.names)
+	}
+	s.names = reserve(s.names[:0], capacity)
 	for i := range s.tree.Columns {
-		s.names = append(s.names, s.columnName(&s.tree.Columns[i]))
+		column := &s.tree.Columns[i]
+		if derived := s.derived(); derived != nil &&
+			column.Agg == sqlast.AggNone && column.Path != nil &&
+			len(column.Path.Segments) == 0 {
+			if column.Alias != "" {
+				return fmt.Errorf(
+					"query: derived relation wildcard expands to %d columns and cannot have the single alias %q",
+					len(derived.names), column.Alias,
+				)
+			}
+			s.names = append(s.names, derived.names...)
+			s.outputs += len(derived.names)
+			continue
+		}
+		s.names = append(s.names, s.columnName(column))
+		s.outputs++
 	}
 	return nil
 }
@@ -749,6 +845,9 @@ func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 		return col.Alias
 	}
 	spec := s.spec(col.Path)
+	if s.derived() != nil && col.Path != nil {
+		spec = s.derivedDisplaySpec(col.Path)
+	}
 	if col.Agg == sqlast.AggNone {
 		if spec == "" {
 			// The whole document, which '*' and 'alias.*' parse to. The engine

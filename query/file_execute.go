@@ -24,7 +24,8 @@ import (
 // spill, and join budgets, so a caller who does not care never has to fill it
 // in. MemoryBytes applies to every source: it is the durable batch/merge target
 // and the admission limit for heap/Segment row-proportional work, decoded text,
-// grouping, join memberships, and durable index planning. BatchRows,
+// grouping, join memberships, and durable index planning. IntermediateBytes
+// is one statement-wide account for relation-valued child plans. BatchRows,
 // BatchBytes, SpillDirectory, and SpillBytes are durable-only.
 //
 // For durable sources MemoryBytes is deliberately a batch/merge target, not a
@@ -56,6 +57,12 @@ type ExecOptions struct {
 	// returns *ResultBudgetError before the rejected result storage is grown.
 	ResultRows  int
 	ResultBytes int64
+	// IntermediateBytes bounds relation-valued subplans shared by one SQL
+	// statement, including nested derived tables and future materialized CTEs.
+	// Zero selects [DefaultIntermediateBytes]; -1 disables the bound. It is
+	// separate from ResultBytes because an intermediate relation is not caller
+	// output and may be released before the final Result is materialized.
+	IntermediateBytes int64
 	// AggregateBytes bounds the whole execution's retained exact-decimal
 	// coefficient, exponent, extremum, and result-digit storage across every
 	// group and worker partial. Zero selects a conservative 16 MiB default.
