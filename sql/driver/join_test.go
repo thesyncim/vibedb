@@ -91,17 +91,75 @@ func TestLeftJoinPreservesAndNullExtendsDrivingRows(t *testing.T) {
 	}
 }
 
-func TestLeftJoinRejectsNullableSideWhereRatherThanMiscomputing(t *testing.T) {
+func TestLeftJoinNullableSideWhereUsesPostJoinNullSemantics(t *testing.T) {
 	db := openTestDB(t)
 	seedJoinTables(t, db)
+	if _, err := db.Exec(`INSERT INTO orders VALUES (?)`,
+		`{"id":"o-null","user_id":"u2","total":null}`,
+	); err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := db.Query(`
-		SELECT u.name
+	rows, err := db.Query(`
+		SELECT u.id, o.id, u.name, o.total
 		FROM users AS u
 		LEFT JOIN orders AS o ON u.id = o.user_id
-		WHERE o.total IS NULL`)
-	if err == nil {
-		t.Fatal("nullable-side LEFT JOIN WHERE unexpectedly succeeded")
+		WHERE o.total IS NULL
+		ORDER BY u.id, o.id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns, err := rows.Columns()
+	if err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if len(columns) != 4 || columns[0] != "id" || columns[1] != "o.id" ||
+		columns[2] != "name" || columns[3] != "o.total" {
+		_ = rows.Close()
+		t.Fatalf("nullable-side LEFT JOIN columns = %v, want [id o.id name o.total]", columns)
+	}
+	type result struct {
+		userID  string
+		orderID stdsql.NullString
+		name    string
+		total   stdsql.NullInt64
+	}
+	var got []result
+	for rows.Next() {
+		var row result
+		if err := rows.Scan(&row.userID, &row.orderID, &row.name, &row.total); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		got = append(got, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := []result{
+		{userID: "u2", orderID: stdsql.NullString{String: "o-null", Valid: true}, name: "Bob"},
+		{userID: "u3", name: "Cara"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("nullable-side LEFT JOIN rows = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("nullable-side LEFT JOIN row %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	var users int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+		t.Fatalf("query after nullable-side LEFT JOIN: %v", err)
+	}
+	if users != 3 {
+		t.Fatalf("recovery user count = %d, want 3", users)
 	}
 }
 
