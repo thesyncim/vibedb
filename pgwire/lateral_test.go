@@ -13,7 +13,7 @@ CROSS JOIN LATERAL (
 	SELECT i.id FROM items i WHERE i.owner = a.id
 ) d`
 
-func TestPGWireCorrelatedLateralRefusalIs0A000AndPositioned(t *testing.T) {
+func TestPGWireCorrelatedLateralExecutesAndRemainingRefusalIsPositioned(t *testing.T) {
 	c := connectSQLCatalog(t)
 	for _, statement := range []string{
 		`CREATE TABLE accounts (id STRING PRIMARY KEY)`,
@@ -26,12 +26,28 @@ func TestPGWireCorrelatedLateralRefusalIs0A000AndPositioned(t *testing.T) {
 				formatError(find(t, msgs, msgErrorResponse).body))
 		}
 	}
-	fields := expectError(t, c.query(correlatedLateralWireSQL), sqlstateFeatureNotSupported)
-	if !strings.Contains(fields['M'], "correlated LATERAL execution") {
+	for _, msgs := range [][]backendMessage{
+		c.query(correlatedLateralWireSQL),
+		extendedSQL(c, correlatedLateralWireSQL, nil),
+	} {
+		rows := rowsOf(t, msgs)
+		if len(rows) != 1 || len(rows[0]) != 2 ||
+			string(rows[0][0]) != `"a1"` || string(rows[0][1]) != `"i1"` {
+			t.Fatalf("correlated LATERAL rows = %q, want [[a1 i1]]", rows)
+		}
+		if got := commandTagOf(t, msgs); got != "SELECT 1" {
+			t.Fatalf("correlated LATERAL command tag = %q, want SELECT 1", got)
+		}
+	}
+
+	unsupported := `SELECT a.id, d.id FROM accounts a JOIN LATERAL (` +
+		`SELECT i.id, i.owner FROM items i WHERE i.owner = a.id) d USING (id)`
+	fields := expectError(t, c.query(unsupported), sqlstateFeatureNotSupported)
+	if !strings.Contains(fields['M'], "LATERAL") || !strings.Contains(fields['M'], "USING") {
 		t.Fatalf("wire refusal = %q", fields['M'])
 	}
-	bytePos := strings.Index(correlatedLateralWireSQL, "LATERAL")
-	wantPosition := utf8.RuneCountInString(correlatedLateralWireSQL[:bytePos]) + 1
+	bytePos := strings.Index(unsupported, "USING")
+	wantPosition := utf8.RuneCountInString(unsupported[:bytePos]) + 1
 	if fields['P'] != strconv.Itoa(wantPosition) {
 		t.Fatalf("wire position = %q, want %d", fields['P'], wantPosition)
 	}
