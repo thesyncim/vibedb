@@ -73,6 +73,22 @@ var (
 	// exact-number, and document argument payload exceeds the connection's
 	// bounded binding workspace.
 	ErrArgumentsTooLarge = errors.New("vibedb: SQL arguments exceed the execution payload bound")
+	// ErrCrossShardWrite reports a multi-row INSERT whose rows do not all route
+	// to one physical shard. Version 1 dispatches each write to a single shard,
+	// so a cross-shard batch is refused before any participant receives work.
+	ErrCrossShardWrite = errors.New("vibedb: cross-shard write unsupported")
+	// ErrShardKeyImmutable reports a whole-document UPDATE whose replacement would
+	// move a row to a different shard by changing a shard-key column. A shard-key
+	// move is an explicit delete-plus-insert workflow, not an UPDATE.
+	ErrShardKeyImmutable = errors.New("vibedb: shard key is immutable")
+	// ErrScatterWrite reports a distributed UPDATE or DELETE whose predicate does
+	// not resolve to exactly one physical shard. Version 1 rejects unknown,
+	// targeted multi-shard, and scatter writes before dispatch.
+	ErrScatterWrite = errors.New("vibedb: write does not resolve to a single shard")
+	// ErrShardKeyNotLocal reports a placed table whose primary or unique key does
+	// not contain every shard-key column. Per-shard uniqueness would otherwise
+	// stop being global uniqueness, so the placement is refused when it is bound.
+	ErrShardKeyNotLocal = errors.New("vibedb: unique or primary key does not contain every shard-key column")
 )
 
 // tableDependencyError preserves the source location of a physical relation

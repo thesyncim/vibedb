@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
@@ -261,6 +262,10 @@ type conn struct {
 	tx           *tx
 	closed       bool
 	owner        *dbConnector
+	// routing is the per-connection Router used by the cluster facade's write
+	// preflight. It is created on first placed write and stays nil for the
+	// default single-store path.
+	routing *distribution.Router
 }
 
 var (
@@ -569,6 +574,7 @@ func (c *conn) Close() error {
 	c.joinSnapshot = durable.DatabaseSnapshot{}
 	c.rowset = rows{closed: true}
 	c.tx = nil
+	c.routing = nil
 	return err
 }
 

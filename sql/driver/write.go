@@ -189,6 +189,9 @@ func (d *database) createTableLockedContext(
 	}
 	path := statement.Tree().CreateTable.PrimaryKey[0]
 	pointer := string(path.AppendPointer(nil))
+	if err := d.cluster.validatePlacementLocality(definition.Name, pointer); err != nil {
+		return nil, err
+	}
 	primary, err := vibejson.CompilePointer(pointer)
 	if err != nil {
 		return nil, fmt.Errorf("vibedb: compile primary-key path %q: %w", pointer, err)
@@ -512,6 +515,9 @@ func (c *conn) insertLocked(
 		seeds = append(seeds, seedDocument{key: key, document: document})
 	}
 	c.pointRaw = conflictScratch
+	if err := c.routeInsertSeeds(tree.Table, seeds); err != nil {
+		return nil, err
+	}
 	if returning != nil {
 		if returned == nil {
 			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
@@ -997,6 +1003,9 @@ func (c *conn) updateLockedReturning(
 	if len(document) > limits.MaxDocumentBytes {
 		return nil, durable.ErrDocumentTooLarge
 	}
+	if err := c.routeUpdate(statement, args, document); err != nil {
+		return nil, err
+	}
 	keys, err := c.matchingKeysLocked(
 		ctx, statement, args, t, limits, len(document))
 	if err != nil {
@@ -1086,6 +1095,9 @@ func (c *conn) deleteLockedReturning(
 ) (sqldriver.Result, error) {
 	limits, err := tableMutationLimits(t)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.routeDelete(statement, args); err != nil {
 		return nil, err
 	}
 	keys, err := c.matchingKeysLocked(ctx, statement, args, t, limits, 0)
