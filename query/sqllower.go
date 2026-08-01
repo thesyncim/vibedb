@@ -120,6 +120,9 @@ func (s *Statement) build(args []any) error {
 // Collection returns the name of the driving collection — the FROM entry. A
 // statement always has one, because the parser requires FROM.
 func (s *Statement) Collection() string {
+	if ref := s.cteReference(); ref != nil && ref.def != nil && ref.def.stmt != nil {
+		return ref.def.stmt.Collection()
+	}
 	if derived := s.derived(); derived != nil {
 		return derived.stmt.Collection()
 	}
@@ -132,11 +135,11 @@ func (s *Statement) buildColumns() error {
 	name := 0
 	for i := range s.tree.Columns {
 		col := &s.tree.Columns[i]
-		if derived := s.derived(); derived != nil && col.Agg == sqlast.AggNone &&
+		if relation := s.relationBinding(); s.hasRelationBinding() && col.Agg == sqlast.AggNone &&
 			col.Path != nil && len(col.Path.Segments) == 0 {
-			for ordinal := range derived.names {
+			for ordinal := range relation.names {
 				s.q.columns = append(s.q.columns, Column{
-					spec:   derived.ordinalSpec[ordinal],
+					spec:   relation.ordinalSpec[ordinal],
 					header: s.names[name],
 				})
 				name++
@@ -156,9 +159,9 @@ func (s *Statement) buildColumns() error {
 // buildGroupBy lowers GROUP BY.
 func (s *Statement) buildGroupBy() error {
 	for _, key := range s.tree.GroupBy {
-		if derived := s.derived(); derived != nil && key != nil &&
+		if relation := s.relationBinding(); s.hasRelationBinding() && key != nil &&
 			len(key.Segments) == 0 {
-			s.q.groupBy = append(s.q.groupBy, derived.ordinalSpec...)
+			s.q.groupBy = append(s.q.groupBy, relation.ordinalSpec...)
 			continue
 		}
 		s.q.groupBy = append(s.q.groupBy, s.spec(key))

@@ -39,6 +39,10 @@ func (e *IntermediateBudgetError) Unwrap() error { return ErrIntermediateBudget 
 // distinct warm workspaces, but none receives a fresh intermediate allowance.
 type statementFrame struct {
 	intermediate intermediateBudget
+	// args is the top-level binding. CTE definitions retain absolute placeholder
+	// ranges even when reached through a later definition or predicate subquery.
+	// The slice is borrowed for one synchronous RunInto call.
+	args []any
 }
 
 type intermediateBudget struct {

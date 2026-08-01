@@ -18,23 +18,32 @@ var (
 	ErrAmbiguousColumn = errors.New("query: ambiguous column")
 )
 
-// RelationColumnError reports name resolution against a derived relation.
+// RelationColumnError reports name resolution against a derived relation or
+// common table expression.
 // Matches is zero for an undefined name and greater than one for ambiguity.
 type RelationColumnError struct {
 	Relation string
 	Column   string
 	Matches  int
+	Pos      int
+}
+
+func (e *RelationColumnError) Position() int {
+	if e == nil {
+		return 0
+	}
+	return e.Pos
 }
 
 func (e *RelationColumnError) Error() string {
 	if e.Matches > 1 {
 		return fmt.Sprintf(
-			"query: column %q is ambiguous in derived relation %q (%d outputs have that name): %v",
+			"query: column %q is ambiguous in relation %q (%d outputs have that name): %v",
 			e.Column, e.Relation, e.Matches, ErrAmbiguousColumn,
 		)
 	}
 	return fmt.Sprintf(
-		"query: derived relation %q has no column %q: %v",
+		"query: relation %q has no column %q: %v",
 		e.Relation, e.Column, ErrUndefinedColumn,
 	)
 }
@@ -62,14 +71,17 @@ type statementDerived struct {
 	activeBytes int64
 }
 
-func (s *Statement) prepareDerived() error {
+func (s *Statement) prepareDerived(argBase int) error {
 	if len(s.tree.From) == 0 || s.tree.From[0].Kind != sqlast.RelationDerived {
 		return nil
 	}
 	if len(s.tree.From) != 1 || s.tree.From[0].Query == nil {
 		return fmt.Errorf("query: a derived relation must be the sole FROM source")
 	}
-	child, err := prepareTree(s.text, s.tree.From[0].Query)
+	child, err := prepareTreeInContext(
+		s.text, s.tree.From[0].Query, 0, s.cteCatalog(),
+		argBase+s.tree.From[0].Query.ParamBase,
+	)
 	if err != nil {
 		return err
 	}
@@ -91,7 +103,7 @@ func (s *Statement) prepareDerived() error {
 		)
 	}
 	s.nested.derived = d
-	return s.validateDerivedReferences()
+	return s.validateRelationReferences()
 }
 
 func (s *Statement) derived() *statementDerived {
@@ -101,16 +113,21 @@ func (s *Statement) derived() *statementDerived {
 	return s.nested.derived
 }
 
-func (s *Statement) validateDerivedReferences() error {
-	d := s.derived()
-	if d == nil {
+func (s *Statement) validateRelationReferences() error {
+	if !s.hasRelationBinding() {
 		return nil
 	}
 	check := func(path *sqlast.PathExpr) error {
 		if path == nil || len(path.Segments) == 0 || path.Source != 0 {
 			return nil
 		}
-		_, err := d.resolve(path.Segments[0].Key, s.tree.From[0].Alias)
+		_, err := s.resolveRelationColumn(path.Segments[0].Key)
+		if column, ok := err.(*RelationColumnError); ok {
+			column.Pos = path.Pos
+			if column.Matches == 0 {
+				column.Pos = relationColumnPosition(s.text, path.Pos)
+			}
+		}
 		return err
 	}
 	for i := range s.tree.Columns {
@@ -152,6 +169,52 @@ func (s *Statement) validateDerivedReferences() error {
 	return nil
 }
 
+// relationColumnPosition returns the first output-name token rather than a
+// leading range qualifier. Segment positions are intentionally not retained in
+// the compact AST, so diagnostics recover this cold-path detail from the owned
+// SQL text while honoring quoted identifiers and whitespace around '.'.
+func relationColumnPosition(text string, pos int) int {
+	if pos < 0 || pos >= len(text) {
+		return pos
+	}
+	i := pos
+	if text[i] == '"' {
+		i++
+		for i < len(text) {
+			if text[i] != '"' {
+				i++
+				continue
+			}
+			i++
+			if i < len(text) && text[i] == '"' {
+				i++
+				continue
+			}
+			break
+		}
+	} else {
+		for i < len(text) {
+			b := text[i]
+			if b == '.' || b == '[' || b == ' ' || b == '\t' || b == '\r' || b == '\n' ||
+				b == ',' || b == ')' {
+				break
+			}
+			i++
+		}
+	}
+	for i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n') {
+		i++
+	}
+	if i >= len(text) || text[i] != '.' {
+		return pos
+	}
+	i++
+	for i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n') {
+		i++
+	}
+	return i
+}
+
 func (d *statementDerived) resolve(name, relation string) (int, error) {
 	found, matches := -1, 0
 	for i := range d.names {
@@ -171,8 +234,8 @@ func (d *statementDerived) resolve(name, relation string) (int, error) {
 }
 
 func (s *Statement) renderDerived(path *sqlast.PathExpr, local bool) string {
-	d := s.derived()
-	if d == nil || path == nil || path.Source != 0 || len(path.Segments) == 0 {
+	binding := s.relationBinding()
+	if len(binding.names) == 0 || path == nil || path.Source != 0 || len(path.Segments) == 0 {
 		return ""
 	}
 	for i := range s.specs {
@@ -180,14 +243,14 @@ func (s *Statement) renderDerived(path *sqlast.PathExpr, local bool) string {
 			return s.specs[i].text
 		}
 	}
-	ordinal, err := d.resolve(path.Segments[0].Key, s.tree.From[0].Alias)
+	ordinal, err := s.resolveRelationColumn(path.Segments[0].Key)
 	if err != nil {
 		// Every reference is validated during prepare. Reaching this branch
 		// would require mutation of the caller-owned AST after preparation.
 		return ""
 	}
 	start := len(s.specBuf)
-	s.specBuf = append(s.specBuf, d.ordinalSpec[ordinal]...)
+	s.specBuf = append(s.specBuf, binding.ordinalSpec[ordinal]...)
 	for _, segment := range path.Segments[1:] {
 		s.specBuf = append(s.specBuf, '/')
 		if segment.IsIndex {

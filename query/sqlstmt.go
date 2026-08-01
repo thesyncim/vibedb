@@ -143,6 +143,9 @@ type Statement struct {
 type nestedStatements struct {
 	subqueries []statementSubquery
 	derived    *statementDerived
+	ctes       *statementCTEs
+	cte        *statementCTEReference
+	ownsCTEs   bool
 }
 
 type subqueryUse uint8
@@ -250,17 +253,54 @@ func prepareTreeWithLimit(
 	tree *sqlast.SelectStmt,
 	subqueryLimit uint8,
 ) (*Statement, error) {
+	return prepareTreeInContext(src, tree, subqueryLimit, nil, 0)
+}
+
+// prepareTreeInContext prepares one SELECT inside the lexical CTE catalog and
+// absolute placeholder range of its parent. A nil catalog stays nil for an
+// ordinary SELECT, preserving the absent-feature object and allocation path.
+func prepareTreeInContext(
+	src string,
+	tree *sqlast.SelectStmt,
+	subqueryLimit uint8,
+	ctes *statementCTEs,
+	argBase int,
+) (*Statement, error) {
 	s := &Statement{
 		text: src, tree: tree, params: tree.Params,
 		subqueryLimit: subqueryLimit,
 	}
-	if err := s.prepareSubqueries(); err != nil {
+	if tree.With != nil {
+		if ctes == nil {
+			ctes = new(statementCTEs)
+			s.ensureNested().ownsCTEs = true
+		}
+		s.ensureNested().ctes = ctes
+		if err := s.prepareCTEDefinitions(argBase); err != nil {
+			s.Release()
+			return nil, err
+		}
+	}
+	if len(tree.From) != 0 && tree.From[0].Kind == sqlast.RelationCTE {
+		if ctes == nil {
+			return nil, fmt.Errorf("query: CTE reference %q has no lexical definition", tree.From[0].Name)
+		}
+		s.ensureNested().ctes = ctes
+		if err := s.prepareCTEReference(); err != nil {
+			s.Release()
+			return nil, err
+		}
+	}
+	if err := s.prepareSubqueries(argBase); err != nil {
+		s.Release()
 		return nil, err
 	}
-	if err := s.prepareDerived(); err != nil {
+	if err := s.prepareDerived(argBase); err != nil {
+		s.Release()
 		return nil, err
 	}
 	if err := s.describe(); err != nil {
+		s.Release()
 		return nil, err
 	}
 	// Validate with stand-ins. Every placeholder becomes int64(0), which is a
@@ -273,10 +313,18 @@ func prepareTreeWithLimit(
 	s.prepareMode = true
 	if err := s.lower(s.args); err != nil {
 		s.prepareMode = false
+		s.Release()
 		return nil, err
 	}
 	s.prepareMode = false
 	return s, nil
+}
+
+func (s *Statement) ensureNested() *nestedStatements {
+	if s.nested == nil {
+		s.nested = new(nestedStatements)
+	}
+	return s.nested
 }
 
 // Columns returns the output column names in SELECT order. The slice is owned
@@ -309,7 +357,7 @@ func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
 // snapshot; adapters use this to avoid constructing a single-collection Source
 // that execution would have to reject.
 func (s *Statement) RequiresCatalog() bool {
-	return len(s.tree.From) > 1 || s.nested != nil
+	return selectRequiresCatalog(s.tree, "")
 }
 
 // AppendSchema appends the statement's output schema to dst, one entry per
@@ -345,6 +393,12 @@ func (s *Statement) Release() {
 			s.nested.derived.exec.Release()
 			s.nested.derived.spool.release()
 		}
+		if s.nested.cte != nil {
+			s.nested.cte.spool.release()
+		}
+		if s.nested.ownsCTEs && s.nested.ctes != nil {
+			s.nested.ctes.release()
+		}
 	}
 	*s = Statement{}
 }
@@ -370,12 +424,13 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// Query.RunInto's destination contract by invalidating the prior result and
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
-	s.discardDerived()
+	s.discardRelations()
 	e.Stats = ExecStats{}
 	var frame statementFrame
 	if err := frame.begin(e.Options); err != nil {
 		return Cursor{}, err
 	}
+	frame.args = args
 	return s.runIntoFrame(e, src, args, &frame, "")
 }
 
@@ -406,25 +461,28 @@ func (s *Statement) runIntoFrame(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
 			s.params, len(args))
 	}
-	runSource, err := s.runDerived(e, src, args, frame)
+	if s.canFuseCTE() {
+		return s.runFusedCTE(e, src, frame, intermediateResource)
+	}
+	runSource, err := s.runRelations(e, src, args, frame)
 	if err != nil {
-		s.releaseDerived(frame)
+		s.releaseRelations(frame)
 		return Cursor{}, err
 	}
 	if err := s.runSubqueries(e, src, args, frame); err != nil {
 		s.releaseSubqueries(frame)
-		s.releaseDerived(frame)
+		s.releaseRelations(frame)
 		return Cursor{}, err
 	}
 	defer s.releaseSubqueries(frame)
 	if err := s.bind(args); err != nil {
-		s.releaseDerived(frame)
+		s.releaseRelations(frame)
 		return Cursor{}, err
 	}
 	if intermediateResource != "" {
 		remaining := frame.intermediate.remaining()
 		if remaining == 0 {
-			s.releaseDerived(frame)
+			s.releaseRelations(frame)
 			return Cursor{}, &IntermediateBudgetError{
 				Resource: intermediateResource,
 				Bytes:    saturatedBytes(frame.intermediate.used, 1),
@@ -441,7 +499,7 @@ func (s *Statement) runIntoFrame(
 		// its spool before a later result-budget or cancellation error. Sever
 		// every parent view before resetting the statement-owned spool.
 		clearExecBorrowedViews(e)
-		s.releaseDerived(frame)
+		s.releaseRelations(frame)
 		var resultErr *ResultBudgetError
 		if intermediateResource != "" && errors.As(err, &resultErr) &&
 			resultErr.ByteLimit == e.Options.ResultBytes {
@@ -458,14 +516,14 @@ func (s *Statement) runIntoFrame(
 	return s.cursor(&e.Result), nil
 }
 
-func (s *Statement) prepareSubqueries() error {
-	if err := s.collectSubqueries(s.tree.Where); err != nil {
+func (s *Statement) prepareSubqueries(argBase int) error {
+	if err := s.collectSubqueries(s.tree.Where, argBase); err != nil {
 		return err
 	}
-	return s.collectSubqueries(s.tree.Having)
+	return s.collectSubqueries(s.tree.Having, argBase)
 }
 
-func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
+func (s *Statement) collectSubqueries(e *sqlast.Expr, argBase int) error {
 	if e == nil {
 		return nil
 	}
@@ -487,7 +545,9 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
 		if use == subqueryIn {
 			limit = 0
 		}
-		stmt, err := prepareTreeWithLimit(s.text, e.Subquery, limit)
+		stmt, err := prepareTreeInContext(
+			s.text, e.Subquery, limit, s.cteCatalog(), argBase+e.Subquery.ParamBase,
+		)
 		if err != nil {
 			return err
 		}
@@ -500,7 +560,7 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
 		return nil
 	}
 	for _, kid := range e.Kids {
-		if err := s.collectSubqueries(kid); err != nil {
+		if err := s.collectSubqueries(kid, argBase); err != nil {
 			return err
 		}
 	}
@@ -664,7 +724,7 @@ func (s *Statement) releaseSubqueryResult(
 	frame *statementFrame,
 ) {
 	clearExecBorrowedViews(&sub.exec)
-	sub.stmt.releaseDerived(frame)
+	sub.stmt.releaseRelations(frame)
 	frame.intermediate.release(sub.resultBytes)
 	sub.resultBytes = 0
 }
@@ -893,7 +953,7 @@ func (s *Statement) render(p *sqlast.PathExpr, local bool) string {
 	if p == nil {
 		return ""
 	}
-	if s.derived() != nil && p.Source == 0 {
+	if s.hasRelationBinding() && p.Source == 0 {
 		return s.renderDerived(p, local)
 	}
 	qualified := !local && p.Source != 0
@@ -988,23 +1048,23 @@ func (s *Statement) unshadow(start int) []byte {
 func (s *Statement) describe() error {
 	s.outputs = 0
 	capacity := len(s.tree.Columns)
-	if derived := s.derived(); derived != nil {
-		capacity += len(derived.names)
+	if relation := s.relationBinding(); s.hasRelationBinding() {
+		capacity += len(relation.names)
 	}
 	s.names = reserve(s.names[:0], capacity)
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
-		if derived := s.derived(); derived != nil &&
+		if relation := s.relationBinding(); s.hasRelationBinding() &&
 			column.Agg == sqlast.AggNone && column.Path != nil &&
 			len(column.Path.Segments) == 0 {
 			if column.Alias != "" {
 				return fmt.Errorf(
-					"query: derived relation wildcard expands to %d columns and cannot have the single alias %q",
-					len(derived.names), column.Alias,
+					"query: relation wildcard expands to %d columns and cannot have the single alias %q",
+					len(relation.names), column.Alias,
 				)
 			}
-			s.names = append(s.names, derived.names...)
-			s.outputs += len(derived.names)
+			s.names = append(s.names, relation.names...)
+			s.outputs += len(relation.names)
 			continue
 		}
 		s.names = append(s.names, s.columnName(column))
@@ -1019,7 +1079,7 @@ func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 		return col.Alias
 	}
 	spec := s.spec(col.Path)
-	if s.derived() != nil && col.Path != nil {
+	if s.hasRelationBinding() && col.Path != nil {
 		spec = s.derivedDisplaySpec(col.Path)
 	}
 	if col.Agg == sqlast.AggNone {
