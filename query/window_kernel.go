@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"math"
 	"math/big"
 	"math/bits"
@@ -86,15 +87,32 @@ const (
 	windowExcludeTies
 )
 
+// windowNullTreatment is physical metadata for the SQL null-treatment clause.
+// The zero value deliberately preserves the historical/default RESPECT NULLS
+// behavior. The engine's explicit null and missing marker are both SQL NULL
+// for navigation, while a selected missing value remains distinguishable in
+// the published result under RESPECT NULLS.
+type windowNullTreatment uint8
+
+const (
+	windowRespectNulls windowNullTreatment = iota
+	windowIgnoreNulls
+)
+
 type windowFunctionSpec struct {
-	kind       windowFunctionKind
-	column     int
-	offset     int
-	buckets    int
-	nth        int
-	frame      windowRowsFrame
-	defaultVal scalar
-	hasDefault bool
+	kind          windowFunctionKind
+	column        int
+	offset        int
+	buckets       int
+	nth           int
+	frame         windowRowsFrame
+	defaultVal    scalar
+	hasDefault    bool
+	nullTreatment windowNullTreatment
+	fromLast      bool
+	hasFilter     bool
+	filterColumn  int
+	distinct      bool
 }
 
 // windowPlan is borrowed for one synchronous execution. The kernel never
@@ -119,19 +137,24 @@ var (
 // execute is not safe for concurrent calls on one executor. Independent
 // executors may read the same immutable relation concurrently.
 type windowExecutor struct {
-	order       []int
-	sortScratch []int
-	deque       []int
-	extrema     []int
-	groups      []int
-	numberOut   []byte
-	negative    []byte
+	order           []int
+	sortScratch     []int
+	deque           []int
+	extrema         []int
+	groups          []int
+	nonNull         []int
+	distinctSlots   []uint32
+	distinctEntries []windowDistinctEntry
+	numberOut       []byte
+	negative        []byte
 
 	aggregate       numberAcc
 	rangeTarget     decimalSum
 	rangeCandidate  decimalSum
 	aggregateLease  aggregateLease
 	aggregateBudget aggregateBudget
+	distinctSeed    maphash.Seed
+	distinctReady   bool
 
 	result relationSpool
 }
@@ -158,6 +181,9 @@ type windowExecutionShape struct {
 	needsDeque        bool
 	extremaEntries    int
 	needsGroups       bool
+	needsNonNull      bool
+	distinctSlots     int
+	distinctEntries   int
 	aggregateBytes    int64
 	numberOutputBytes int
 	negativeBytes     int
@@ -209,7 +235,7 @@ func (e *windowExecutor) execute(
 		}
 	}()
 
-	if err = e.prepare(shape); err != nil {
+	if err = e.prepare(shape, cancel); err != nil {
 		return 0, err
 	}
 	if err = e.sortRows(input, plan, cancel); err != nil {
@@ -262,6 +288,8 @@ func (e *windowExecutor) resetTransient() {
 	e.deque = e.deque[:0]
 	e.extrema = e.extrema[:0]
 	e.groups = e.groups[:0]
+	e.nonNull = e.nonNull[:0]
+	e.distinctEntries = e.distinctEntries[:0]
 	e.numberOut = e.numberOut[:0]
 	e.negative = e.negative[:0]
 	e.aggregate.reset()
@@ -321,16 +349,49 @@ func measureWindowExecution(
 			return windowExecutionShape{}, err
 		}
 		if function.kind > windowNthValue || function.offset < 0 ||
-			function.buckets < 0 || function.nth < 0 {
+			function.buckets < 0 || function.nth < 0 ||
+			function.nullTreatment > windowIgnoreNulls {
 			return windowExecutionShape{}, fmt.Errorf(
 				"%w: function %d", errWindowPlan, at,
 			)
+		}
+		aggregateFunction := windowFunctionIsAggregate(function.kind)
+		if !aggregateFunction &&
+			(function.hasFilter || function.filterColumn != 0 || function.distinct) {
+			return windowExecutionShape{}, fmt.Errorf(
+				"%w: function %d has aggregate metadata", errWindowPlan, at,
+			)
+		}
+		if aggregateFunction {
+			if !function.hasFilter && function.filterColumn != 0 ||
+				function.hasFilter && (function.filterColumn < 0 || function.filterColumn >= columns) ||
+				function.distinct && function.kind == windowCount && function.column < 0 {
+				return windowExecutionShape{}, fmt.Errorf(
+					"%w: aggregate function %d metadata", errWindowPlan, at,
+				)
+			}
+			if function.hasFilter {
+				for row, value := range input.columns[function.filterColumn] {
+					if err := cancellationCheckpoint(cancel, row); err != nil {
+						return windowExecutionShape{}, err
+					}
+					if value.kind != kindNull && value.kind != kindBool {
+						return windowExecutionShape{}, fmt.Errorf(
+							"%w: FILTER row %d is not boolean", errWindowPlan, row,
+						)
+					}
+				}
+			}
+			if function.distinct && function.kind != windowMin && function.kind != windowMax {
+				shape.distinctEntries = shape.rows
+			}
 		}
 		switch function.kind {
 		case windowRowNumber, windowRank, windowDenseRank,
 			windowPercentRank, windowCumeDist:
 			if function.column != -1 || function.offset != 0 || function.buckets != 0 ||
-				function.nth != 0 || function.hasDefault {
+				function.nth != 0 || function.hasDefault ||
+				function.nullTreatment != windowRespectNulls || function.fromLast {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: ranking function %d has input column", errWindowPlan, at,
 				)
@@ -340,22 +401,26 @@ func measureWindowExecution(
 			}
 		case windowNTile:
 			if function.column != -1 || function.offset != 0 || function.buckets <= 0 ||
-				function.nth != 0 || function.hasDefault {
+				function.nth != 0 || function.hasDefault ||
+				function.nullTreatment != windowRespectNulls || function.fromLast {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: NTILE function %d metadata", errWindowPlan, at,
 				)
 			}
 		case windowLag, windowLead:
 			if function.column < 0 || function.column >= columns ||
-				function.buckets != 0 || function.nth != 0 {
+				function.buckets != 0 || function.nth != 0 || function.fromLast {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: offset function %d column", errWindowPlan, at,
 				)
 			}
+			shape.needsNonNull = shape.needsNonNull ||
+				function.nullTreatment == windowIgnoreNulls
 		case windowCount:
 			if function.column < -1 || function.column >= columns ||
 				function.offset != 0 || function.buckets != 0 || function.nth != 0 ||
-				function.hasDefault {
+				function.hasDefault || function.nullTreatment != windowRespectNulls ||
+				function.fromLast {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: COUNT function %d column", errWindowPlan, at,
 				)
@@ -363,7 +428,8 @@ func measureWindowExecution(
 		case windowSum, windowAvg, windowMin, windowMax:
 			if function.column < 0 || function.column >= columns ||
 				function.offset != 0 || function.buckets != 0 || function.nth != 0 ||
-				function.hasDefault {
+				function.hasDefault || function.nullTreatment != windowRespectNulls ||
+				function.fromLast {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: aggregate function %d column", errWindowPlan, at,
 				)
@@ -396,11 +462,14 @@ func measureWindowExecution(
 		case windowFirstValue, windowLastValue, windowNthValue:
 			if function.column < 0 || function.column >= columns ||
 				function.offset != 0 || function.buckets != 0 || function.hasDefault ||
-				(function.kind == windowNthValue) != (function.nth > 0) {
+				(function.kind == windowNthValue) != (function.nth > 0) ||
+				(function.fromLast && function.kind != windowNthValue) {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: value function %d metadata", errWindowPlan, at,
 				)
 			}
+			shape.needsNonNull = shape.needsNonNull ||
+				function.nullTreatment == windowIgnoreNulls
 		}
 		if !windowFunctionUsesFrame(function.kind) {
 			continue
@@ -474,6 +543,22 @@ func measureWindowExecution(
 			int64(shape.rows+1), int64(unsafe.Sizeof(int(0))),
 		)
 		work = saturatedBytes(work, groupBytes)
+	}
+	if shape.needsNonNull {
+		work = saturatedBytes(work, intBytes)
+	}
+	if shape.distinctEntries != 0 {
+		var err error
+		shape.distinctSlots, err = windowDistinctCapacity(shape.distinctEntries)
+		if err != nil {
+			return windowExecutionShape{}, err
+		}
+		work = saturatedBytes(work, saturatedProduct(
+			int64(shape.distinctSlots), int64(unsafe.Sizeof(uint32(0))),
+		))
+		work = saturatedBytes(work, saturatedProduct(
+			int64(shape.distinctEntries), int64(unsafe.Sizeof(windowDistinctEntry{})),
+		))
 	}
 	if needsNumberBuffers {
 		shape.numberOutputBytes = 512
@@ -658,7 +743,7 @@ func measureWindowNumber(
 	*maxCompactWeight = max(*maxCompactWeight, weight)
 }
 
-func (e *windowExecutor) prepare(shape windowExecutionShape) error {
+func (e *windowExecutor) prepare(shape windowExecutionShape, cancel *CancelFlag) error {
 	if cap(e.order) < shape.rows {
 		e.order = make([]int, shape.rows)
 	} else {
@@ -696,6 +781,35 @@ func (e *windowExecutor) prepare(shape windowExecutionShape) error {
 		}
 	} else {
 		e.groups = e.groups[:0]
+	}
+	if shape.needsNonNull {
+		if cap(e.nonNull) < shape.rows {
+			e.nonNull = make([]int, 0, shape.rows)
+		} else {
+			e.nonNull = e.nonNull[:0]
+		}
+	} else {
+		e.nonNull = e.nonNull[:0]
+	}
+	if shape.distinctEntries != 0 && !e.distinctReady {
+		e.distinctSeed = maphash.MakeSeed()
+		e.distinctReady = true
+	}
+	if cap(e.distinctSlots) < shape.distinctSlots {
+		e.distinctSlots = make([]uint32, shape.distinctSlots)
+	} else {
+		e.distinctSlots = e.distinctSlots[:shape.distinctSlots]
+		for slot := range e.distinctSlots {
+			if err := cancellationCheckpoint(cancel, slot); err != nil {
+				return err
+			}
+			e.distinctSlots[slot] = 0
+		}
+	}
+	if cap(e.distinctEntries) < shape.distinctEntries {
+		e.distinctEntries = make([]windowDistinctEntry, 0, shape.distinctEntries)
+	} else {
+		e.distinctEntries = e.distinctEntries[:0]
 	}
 	if cap(e.numberOut) < shape.numberOutputBytes {
 		e.numberOut = make([]byte, 0, shape.numberOutputBytes)
@@ -933,8 +1047,16 @@ func (e *windowExecutor) walkPartition(
 ) error {
 	count := end - start
 	e.groups = e.groups[:0]
+	e.nonNull = e.nonNull[:0]
 	if windowFunctionUsesFrame(function.kind) && windowFrameNeedsGroups(function.frame) {
 		if err := e.buildWindowGroups(input, order, start, end, cancel); err != nil {
+			return err
+		}
+	}
+	if function.nullTreatment == windowIgnoreNulls {
+		if err := e.buildWindowNonNull(
+			input, function.column, start, end, cancel,
+		); err != nil {
 			return err
 		}
 	}
@@ -1030,9 +1152,13 @@ func (e *windowExecutor) walkPartition(
 			if err := cancellationCheckpoint(cancel, position); err != nil {
 				return err
 			}
-			target, ok := windowOffsetPosition(
-				position, count, function.offset, function.kind == windowLead,
-			)
+			lead := function.kind == windowLead
+			target, ok := windowOffsetPosition(position, count, function.offset, lead)
+			if function.nullTreatment == windowIgnoreNulls {
+				target, ok = windowNonNullOffsetPosition(
+					e.nonNull, position, function.offset, lead,
+				)
+			}
 			cell := nullCell()
 			if ok {
 				cell = cellFromScalar(input.columns[function.column][e.order[start+target]])
@@ -1044,8 +1170,18 @@ func (e *windowExecutor) walkPartition(
 			}
 		}
 	case windowCount:
+		if function.distinct {
+			return e.walkDistinct(
+				input, order, function, outputColumn, start, end, writer, cancel,
+			)
+		}
 		return e.walkCount(input, order, function, outputColumn, start, end, writer, cancel)
 	case windowSum, windowAvg:
+		if function.distinct {
+			return e.walkDistinct(
+				input, order, function, outputColumn, start, end, writer, cancel,
+			)
+		}
 		return e.walkExact(input, order, function, outputColumn, start, end, writer, cancel)
 	case windowMin, windowMax:
 		return e.walkExtreme(input, order, function, outputColumn, start, end, writer, cancel)
@@ -1061,13 +1197,7 @@ func (e *windowExecutor) walkPartition(
 			if err != nil {
 				return err
 			}
-			target, ok := selection.positionAt(0)
-			switch function.kind {
-			case windowLastValue:
-				target, ok = selection.positionAt(selection.count() - 1)
-			case windowNthValue:
-				target, ok = selection.positionAt(function.nth - 1)
-			}
+			target, ok := windowValuePosition(function, selection, e.nonNull)
 			cell := nullCell()
 			if ok {
 				cell = cellFromScalar(input.columns[function.column][e.order[start+target]])
@@ -1088,6 +1218,10 @@ func windowFunctionUsesFrame(kind windowFunctionKind) bool {
 		kind == windowLastValue || kind == windowNthValue
 }
 
+func windowFunctionIsAggregate(kind windowFunctionKind) bool {
+	return kind >= windowCount && kind <= windowMax
+}
+
 // windowFrameSelection is one contiguous frame with at most one contiguous
 // exclusion. EXCLUDE TIES keeps the current row inside that excluded peer run.
 // This representation is sufficient for every SQL frame exclusion while
@@ -1097,6 +1231,13 @@ type windowFrameSelection struct {
 	lo, hi         int
 	skipLo, skipHi int
 	keep           int
+}
+
+type windowDistinctEntry struct {
+	hash  uint64
+	value scalar
+	count int
+	slot  uint32
 }
 
 func (s windowFrameSelection) excluded(position int) bool {
@@ -1144,6 +1285,25 @@ func windowExtremaEntries(rows int) (int, bool) {
 		return 0, false
 	}
 	return leaves * 2, true
+}
+
+func windowDistinctCapacity(entries int) (int, error) {
+	if entries < 0 || uint64(entries) > (uint64(math.MaxUint32)+1)/2 ||
+		entries > math.MaxInt/2 {
+		return 0, errWindowSize
+	}
+	if entries == 0 {
+		return 0, nil
+	}
+	need := entries * 2
+	capacity := 1
+	for capacity < need {
+		if capacity > math.MaxInt/2 {
+			return 0, errWindowSize
+		}
+		capacity <<= 1
+	}
+	return capacity, nil
 }
 
 func windowTile(position, rows, buckets int) (int, error) {
@@ -1203,6 +1363,135 @@ func windowOffsetPosition(position, rows, offset int, lead bool) (int, bool) {
 		return 0, false
 	}
 	return position - offset, true
+}
+
+// buildWindowNonNull records partition-local sorted positions. The retained
+// buffer is shared by navigation functions and rebuilt for each partition,
+// bounding workspace to one integer per input row regardless of function
+// count. Explicit null and the engine's missing marker both have kindNull.
+func (e *windowExecutor) buildWindowNonNull(
+	input *relationSpool,
+	column, start, end int,
+	cancel *CancelFlag,
+) error {
+	e.nonNull = e.nonNull[:0]
+	for position := 0; position < end-start; position++ {
+		if err := cancellationCheckpoint(cancel, position); err != nil {
+			return err
+		}
+		if input.columns[column][e.order[start+position]].kind != kindNull {
+			e.nonNull = append(e.nonNull, position)
+		}
+	}
+	return cancellationError(cancel)
+}
+
+func windowLowerBound(positions []int, target int) int {
+	lo, hi := 0, len(positions)
+	for lo < hi {
+		middle := lo + (hi-lo)/2
+		if positions[middle] < target {
+			lo = middle + 1
+		} else {
+			hi = middle
+		}
+	}
+	return lo
+}
+
+func windowNonNullOffsetPosition(
+	positions []int,
+	position, offset int,
+	lead bool,
+) (int, bool) {
+	// Offset zero names the current row; null treatment cannot move it because
+	// no intervening value is counted. Existing physical plans permit zero.
+	if offset == 0 {
+		return position, true
+	}
+	at := windowLowerBound(positions, position)
+	if lead {
+		if at < len(positions) && positions[at] == position {
+			at++
+		}
+		remaining := len(positions) - at
+		if offset > remaining {
+			return 0, false
+		}
+		return positions[at+offset-1], true
+	}
+	if offset > at {
+		return 0, false
+	}
+	return positions[at-offset], true
+}
+
+func windowValuePosition(
+	function windowFunctionSpec,
+	selection windowFrameSelection,
+	nonNull []int,
+) (int, bool) {
+	ordinal, fromLast := 0, false
+	switch function.kind {
+	case windowLastValue:
+		fromLast = true
+	case windowNthValue:
+		ordinal = function.nth - 1
+		fromLast = function.fromLast
+	}
+	if function.nullTreatment == windowIgnoreNulls {
+		return windowSelectedNonNullPosition(nonNull, selection, ordinal, fromLast)
+	}
+	if fromLast {
+		ordinal = selection.count() - 1 - ordinal
+	}
+	return selection.positionAt(ordinal)
+}
+
+// windowSelectedNonNullPosition resolves an ordinal without materializing a
+// per-row filtered frame. A selection has at most three ordered pieces: the
+// prefix before the exclusion, the current row retained by EXCLUDE TIES, and
+// the suffix after the exclusion.
+func windowSelectedNonNullPosition(
+	positions []int,
+	selection windowFrameSelection,
+	ordinal int,
+	fromLast bool,
+) (int, bool) {
+	if ordinal < 0 {
+		return 0, false
+	}
+	prefixLo := windowLowerBound(positions, selection.lo)
+	prefixHi := windowLowerBound(positions, selection.skipLo)
+	suffixLo := windowLowerBound(positions, selection.skipHi)
+	suffixHi := windowLowerBound(positions, selection.hi)
+	keep := selection.keep >= selection.skipLo && selection.keep < selection.skipHi
+	if keep {
+		at := windowLowerBound(positions, selection.keep)
+		keep = at < len(positions) && positions[at] == selection.keep
+	}
+	total := prefixHi - prefixLo + suffixHi - suffixLo
+	if keep {
+		total++
+	}
+	if ordinal >= total {
+		return 0, false
+	}
+	if fromLast {
+		ordinal = total - 1 - ordinal
+	}
+	prefix := prefixHi - prefixLo
+	if ordinal < prefix {
+		return positions[prefixLo+ordinal], true
+	}
+	ordinal -= prefix
+	if keep {
+		if ordinal == 0 {
+			return selection.keep, true
+		}
+		ordinal--
+	}
+	return positions[suffixLo+ordinal], true
 }
 
 func resolveWindowFrame(frame windowRowsFrame, position, rows int) (int, int) {
@@ -1775,6 +2064,229 @@ func (e *windowExecutor) buildWindowGroups(
 	return cancellationError(cancel)
 }
 
+func windowAggregateValue(
+	input *relationSpool,
+	function windowFunctionSpec,
+	row int,
+) (scalar, bool) {
+	if function.hasFilter {
+		filter := input.columns[function.filterColumn][row]
+		if filter.kind != kindBool || !filter.bval {
+			return scalar{}, false
+		}
+	}
+	if function.kind == windowCount && function.column < 0 {
+		return scalar{}, true
+	}
+	value := input.columns[function.column][row]
+	if value.kind == kindNull {
+		return scalar{}, false
+	}
+	if function.kind != windowCount && value.kind != kindNumber {
+		return scalar{}, false
+	}
+	return value, true
+}
+
+func (e *windowExecutor) resetWindowDistinct(cancel *CancelFlag) error {
+	for at := range e.distinctEntries {
+		if err := cancellationCheckpoint(cancel, at); err != nil {
+			return err
+		}
+		e.distinctSlots[e.distinctEntries[at].slot] = 0
+	}
+	e.distinctEntries = e.distinctEntries[:0]
+	return cancellationError(cancel)
+}
+
+func (e *windowExecutor) findWindowDistinct(
+	value scalar,
+	insert bool,
+	cancel *CancelFlag,
+) (*windowDistinctEntry, bool, error) {
+	if len(e.distinctSlots) == 0 {
+		return nil, false, errWindowSize
+	}
+	hash := hashJoinValue(e.distinctSeed, value)
+	mask := uint64(len(e.distinctSlots) - 1)
+	for slot, probes := hash&mask, 0; probes < len(e.distinctSlots); probes++ {
+		if err := cancellationCheckpoint(cancel, probes); err != nil {
+			return nil, false, err
+		}
+		stored := e.distinctSlots[slot]
+		if stored == 0 {
+			if !insert {
+				return nil, false, nil
+			}
+			if len(e.distinctEntries) == cap(e.distinctEntries) ||
+				uint64(len(e.distinctEntries)) >= uint64(math.MaxUint32) {
+				return nil, false, errWindowSize
+			}
+			index := len(e.distinctEntries)
+			e.distinctEntries = append(e.distinctEntries, windowDistinctEntry{
+				hash: hash, value: value, slot: uint32(slot),
+			})
+			e.distinctSlots[slot] = uint32(index + 1)
+			return &e.distinctEntries[index], false, nil
+		}
+		entry := &e.distinctEntries[stored-1]
+		if entry.hash == hash && compareScalar(entry.value, value) == 0 {
+			return entry, true, nil
+		}
+		slot = (slot + 1) & mask
+	}
+	return nil, false, errWindowSize
+}
+
+func (e *windowExecutor) addWindowDistinct(
+	value scalar,
+	function windowFunctionKind,
+	cancel *CancelFlag,
+) error {
+	entry, _, err := e.findWindowDistinct(value, true, cancel)
+	if err != nil {
+		return err
+	}
+	if entry.count == math.MaxInt {
+		return errWindowSize
+	}
+	first := entry.count == 0
+	entry.count++
+	if !first {
+		return nil
+	}
+	if e.aggregate.n == math.MaxInt {
+		return errWindowSize
+	}
+	if function == windowSum || function == windowAvg {
+		if err := e.aggregate.sum.add(
+			value, &e.aggregateLease, &e.aggregateBudget,
+		); err != nil {
+			return err
+		}
+	}
+	e.aggregate.n++
+	return nil
+}
+
+func (e *windowExecutor) removeWindowDistinct(
+	value scalar,
+	function windowFunctionKind,
+	cancel *CancelFlag,
+) error {
+	entry, found, err := e.findWindowDistinct(value, false, cancel)
+	if err != nil {
+		return err
+	}
+	if !found || entry.count <= 0 || e.aggregate.n <= 0 {
+		return errWindowSize
+	}
+	entry.count--
+	if entry.count != 0 {
+		return nil
+	}
+	if function == windowSum || function == windowAvg {
+		if err := e.subtractWindowNumber(value); err != nil {
+			return err
+		}
+	}
+	e.aggregate.n--
+	if e.aggregate.n == 0 {
+		e.aggregate.sum.reset()
+	}
+	return nil
+}
+
+func (e *windowExecutor) walkDistinct(
+	input *relationSpool,
+	order []windowOrderKey,
+	function windowFunctionSpec,
+	outputColumn, partitionStart, partitionEnd int,
+	writer *windowOutputWriter,
+	cancel *CancelFlag,
+) error {
+	e.aggregate.reset()
+	if err := e.resetWindowDistinct(cancel); err != nil {
+		return err
+	}
+	rows := partitionEnd - partitionStart
+	lo, hi, group := 0, 0, 0
+	for position := 0; position < rows; position++ {
+		if err := cancellationCheckpoint(cancel, position); err != nil {
+			return err
+		}
+		selection, err := e.resolveWindowFrameSelection(
+			input, order, function.frame, partitionStart, position, rows, &group, cancel,
+		)
+		if err != nil {
+			return err
+		}
+		for hi < selection.hi {
+			if err := cancellationCheckpoint(cancel, hi); err != nil {
+				return err
+			}
+			row := e.order[partitionStart+hi]
+			if value, include := windowAggregateValue(input, function, row); include {
+				if err := e.addWindowDistinct(value, function.kind, cancel); err != nil {
+					return err
+				}
+			}
+			hi++
+		}
+		for lo < selection.lo {
+			if err := cancellationCheckpoint(cancel, lo); err != nil {
+				return err
+			}
+			row := e.order[partitionStart+lo]
+			if value, include := windowAggregateValue(input, function, row); include {
+				if err := e.removeWindowDistinct(value, function.kind, cancel); err != nil {
+					return err
+				}
+			}
+			lo++
+		}
+		for at := selection.skipLo; at < selection.skipHi; at++ {
+			if err := cancellationCheckpoint(cancel, at); err != nil {
+				return err
+			}
+			if !selection.excluded(at) {
+				continue
+			}
+			row := e.order[partitionStart+at]
+			if value, include := windowAggregateValue(input, function, row); include {
+				if err := e.removeWindowDistinct(value, function.kind, cancel); err != nil {
+					return err
+				}
+			}
+		}
+		cell := windowIntegerCell(e.aggregate.n)
+		if function.kind != windowCount {
+			cell, err = e.windowExactCell(function.kind)
+			if err != nil {
+				return err
+			}
+		}
+		if err := writer.put(outputColumn, e.order[partitionStart+position], cell); err != nil {
+			return err
+		}
+		for at := selection.skipLo; at < selection.skipHi; at++ {
+			if err := cancellationCheckpoint(cancel, at); err != nil {
+				return err
+			}
+			if !selection.excluded(at) {
+				continue
+			}
+			row := e.order[partitionStart+at]
+			if value, include := windowAggregateValue(input, function, row); include {
+				if err := e.addWindowDistinct(value, function.kind, cancel); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return cancellationError(cancel)
+}
+
 func resolveWindowStart(bound windowFrameBound, position, rows int) int {
 	switch bound.kind {
 	case windowUnboundedPreceding:
@@ -1843,7 +2355,8 @@ func (e *windowExecutor) walkCount(
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
 			}
-			if function.column < 0 || input.columns[function.column][e.order[partitionStart+hi]].kind != kindNull {
+			row := e.order[partitionStart+hi]
+			if _, include := windowAggregateValue(input, function, row); include {
 				if count == math.MaxInt {
 					return errWindowSize
 				}
@@ -1855,7 +2368,8 @@ func (e *windowExecutor) walkCount(
 			if err := cancellationCheckpoint(cancel, lo); err != nil {
 				return err
 			}
-			if function.column < 0 || input.columns[function.column][e.order[partitionStart+lo]].kind != kindNull {
+			row := e.order[partitionStart+lo]
+			if _, include := windowAggregateValue(input, function, row); include {
 				count--
 			}
 			lo++
@@ -1865,9 +2379,11 @@ func (e *windowExecutor) walkCount(
 			if err := cancellationCheckpoint(cancel, at); err != nil {
 				return err
 			}
-			if selection.excluded(at) &&
-				(function.column < 0 || input.columns[function.column][e.order[partitionStart+at]].kind != kindNull) {
-				selectedCount--
+			if selection.excluded(at) {
+				row := e.order[partitionStart+at]
+				if _, include := windowAggregateValue(input, function, row); include {
+					selectedCount--
+				}
 			}
 		}
 		if err := writer.put(
@@ -1906,8 +2422,8 @@ func (e *windowExecutor) walkExact(
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
 			}
-			value := input.columns[function.column][e.order[partitionStart+hi]]
-			if value.kind == kindNumber {
+			row := e.order[partitionStart+hi]
+			if value, include := windowAggregateValue(input, function, row); include {
 				if err := e.aggregate.sum.add(
 					value, &e.aggregateLease, &e.aggregateBudget,
 				); err != nil {
@@ -1921,8 +2437,8 @@ func (e *windowExecutor) walkExact(
 			if err := cancellationCheckpoint(cancel, lo); err != nil {
 				return err
 			}
-			value := input.columns[function.column][e.order[partitionStart+lo]]
-			if value.kind == kindNumber {
+			row := e.order[partitionStart+lo]
+			if value, include := windowAggregateValue(input, function, row); include {
 				if err := e.subtractWindowNumber(value); err != nil {
 					return err
 				}
@@ -1940,8 +2456,8 @@ func (e *windowExecutor) walkExact(
 			if !selection.excluded(at) {
 				continue
 			}
-			value := input.columns[function.column][e.order[partitionStart+at]]
-			if value.kind == kindNumber {
+			row := e.order[partitionStart+at]
+			if value, include := windowAggregateValue(input, function, row); include {
 				if err := e.subtractWindowNumber(value); err != nil {
 					return err
 				}
@@ -1965,8 +2481,8 @@ func (e *windowExecutor) walkExact(
 			if !selection.excluded(at) {
 				continue
 			}
-			value := input.columns[function.column][e.order[partitionStart+at]]
-			if value.kind == kindNumber {
+			row := e.order[partitionStart+at]
+			if value, include := windowAggregateValue(input, function, row); include {
 				if err := e.aggregate.sum.add(
 					value, &e.aggregateLease, &e.aggregateBudget,
 				); err != nil {
@@ -2377,8 +2893,8 @@ func (e *windowExecutor) walkExtreme(
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
 			}
-			value := input.columns[function.column][e.order[partitionStart+hi]]
-			if value.kind == kindNumber {
+			row := e.order[partitionStart+hi]
+			if value, include := windowAggregateValue(input, function, row); include {
 				for len(e.deque) > head {
 					lastPosition := e.deque[len(e.deque)-1]
 					last := input.columns[function.column][e.order[partitionStart+lastPosition]]
@@ -2444,8 +2960,8 @@ func (e *windowExecutor) walkExcludedExtreme(
 	}
 	leaves := entries / 2
 	for position := 0; position < rows; position++ {
-		value := input.columns[function.column][e.order[partitionStart+position]]
-		if value.kind == kindNumber {
+		row := e.order[partitionStart+position]
+		if _, include := windowAggregateValue(input, function, row); include {
 			tree[leaves+position] = position
 		}
 	}
@@ -2477,8 +2993,8 @@ func (e *windowExecutor) walkExcludedExtreme(
 			return err
 		}
 		if selection.keep >= selection.skipLo && selection.keep < selection.skipHi {
-			value := input.columns[function.column][e.order[partitionStart+selection.keep]]
-			if value.kind == kindNumber {
+			row := e.order[partitionStart+selection.keep]
+			if _, include := windowAggregateValue(input, function, row); include {
 				best = e.chooseWindowExtreme(
 					input, function, partitionStart, best, selection.keep,
 				)

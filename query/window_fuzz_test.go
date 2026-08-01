@@ -22,16 +22,18 @@ func FuzzWindowKernelAgainstReference(f *testing.F) {
 		orders := [...]string{
 			setTestMissing, `null`, `-2`, `-1`, `0`, `1`, `1.0`, `2`,
 		}
-		values := [...]string{`null`, `-9`, `-3`, `-1`, `0`, `2`, `4`, `8`}
+		values := [...]string{setTestMissing, `null`, `-9`, `-3`, `-1`, `0`, `2`, `4`, `8`}
+		filters := [...]string{setTestMissing, `null`, `false`, `true`}
 		decoded := make([][]string, rows)
 		for row := range decoded {
 			decoded[row] = []string{
 				partitions[int(next())%len(partitions)],
 				orders[int(next())%len(orders)],
 				values[int(next())%len(values)],
+				filters[int(next())%len(filters)],
 			}
 		}
-		input := buildSetTestSpoolColumns(t, decoded, 3)
+		input := buildSetTestSpoolColumns(t, decoded, 4)
 		frameSpec := windowRowsFrame{
 			unit:      windowFrameUnit(next() % 3),
 			exclusion: windowFrameExclusion(next() % 4),
@@ -72,16 +74,25 @@ func FuzzWindowKernelAgainstReference(f *testing.F) {
 				{kind: windowNTile, column: -1, buckets: 1 + int(next()%8)},
 				{kind: windowPercentRank, column: -1},
 				{kind: windowCumeDist, column: -1},
-				{kind: windowLag, column: 2, offset: int(next() % 5)},
-				{kind: windowLead, column: 2, offset: int(next() % 5)},
+				{kind: windowLag, column: 2, offset: int(next() % 5),
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowLead, column: 2, offset: int(next() % 5),
+					nullTreatment: windowNullTreatment(next() & 1)},
 				{kind: windowCount, column: -1, frame: frameSpec},
 				{kind: windowCount, column: 2, frame: frameSpec},
 				{kind: windowSum, column: 2, frame: frameSpec},
+				{kind: windowCount, column: 2, frame: frameSpec, distinct: true,
+					hasFilter: true, filterColumn: 3},
+				{kind: windowSum, column: 2, frame: frameSpec, distinct: true,
+					hasFilter: true, filterColumn: 3},
 				{kind: windowMin, column: 2, frame: frameSpec},
 				{kind: windowMax, column: 2, frame: frameSpec},
-				{kind: windowFirstValue, column: 2, frame: frameSpec},
-				{kind: windowLastValue, column: 2, frame: frameSpec},
-				{kind: windowNthValue, column: 2, nth: 1 + int(next()%5), frame: frameSpec},
+				{kind: windowFirstValue, column: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowLastValue, column: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowNthValue, column: 2, nth: 1 + int(next()%5), frame: frameSpec,
+					nullTreatment: windowNullTreatment(next() & 1), fromLast: next()&1 != 0},
 			},
 		}
 		var executor windowExecutor

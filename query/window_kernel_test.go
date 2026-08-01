@@ -141,6 +141,239 @@ func TestWindowKernelFrameValueFunctionsPreserveNullAndMissing(t *testing.T) {
 	}
 }
 
+func TestWindowKernelNullTreatmentOffsetsAndZeroOffset(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`4`, `"d"`},
+		{`1`, setTestMissing},
+		{`3`, `null`},
+		{`2`, `"b"`},
+		{`5`, `"e"`},
+	})
+	fallback := windowTestScalar(t, `"fallback"`)
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowLag, column: 1, offset: 1, defaultVal: fallback, hasDefault: true},
+			{kind: windowLag, column: 1, offset: 1, defaultVal: fallback, hasDefault: true,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowLead, column: 1, offset: 1, defaultVal: fallback, hasDefault: true,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowLag, column: 1, offset: 2, defaultVal: fallback, hasDefault: true,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowLead, column: 1, offset: 0, nullTreatment: windowIgnoreNulls},
+		},
+	}
+	result := runWindowTest(t, &input, &plan)
+	assertSetRows(t, result, [][]string{
+		{`null`, `"b"`, `"e"`, `"fallback"`, `"d"`},
+		{`"fallback"`, `"fallback"`, `"b"`, `"fallback"`, setTestMissing},
+		{`"b"`, `"b"`, `"d"`, `"fallback"`, `null`},
+		{setTestMissing, `"fallback"`, `"d"`, `"fallback"`, `"b"`},
+		{`"d"`, `"d"`, `"fallback"`, `"b"`, `"e"`},
+	})
+	if result.columns[4][1].kind != kindNull || result.columns[4][1].raw != nil {
+		t.Fatal("IGNORE NULLS offset zero did not preserve selected missing value")
+	}
+}
+
+func TestWindowKernelNullTreatmentFrameValuesFromFirstAndLast(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`4`, `"d"`},
+		{`1`, setTestMissing},
+		{`3`, `null`},
+		{`2`, `"b"`},
+		{`5`, `"e"`},
+	})
+	full := windowRowsFrame{
+		start: windowFrameBound{kind: windowUnboundedPreceding},
+		end:   windowFrameBound{kind: windowUnboundedFollowing},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowFirstValue, column: 1, frame: full},
+			{kind: windowFirstValue, column: 1, frame: full, nullTreatment: windowIgnoreNulls},
+			{kind: windowLastValue, column: 1, frame: full, nullTreatment: windowIgnoreNulls},
+			{kind: windowNthValue, column: 1, nth: 2, frame: full},
+			{kind: windowNthValue, column: 1, nth: 2, frame: full,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowNthValue, column: 1, nth: 3, frame: full, fromLast: true},
+			{kind: windowNthValue, column: 1, nth: 3, frame: full,
+				nullTreatment: windowIgnoreNulls, fromLast: true},
+		},
+	}
+	result := runWindowTest(t, &input, &plan)
+	for row, got := range setTestRows(result) {
+		want := []string{setTestMissing, `"b"`, `"e"`, `"b"`, `"d"`, `null`, `"b"`}
+		if !slices.Equal(got, want) {
+			t.Fatalf("row %d = %v, want %v", row, got, want)
+		}
+	}
+	if result.columns[0][0].kind != kindNull || result.columns[0][0].raw != nil {
+		t.Fatal("RESPECT NULLS did not preserve selected missing value")
+	}
+}
+
+func TestWindowKernelIgnoreNullsAllNullPartition(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`, setTestMissing}, {`2`, `null`}, {`3`, setTestMissing},
+	})
+	fallback := windowTestScalar(t, `"fallback"`)
+	full := windowRowsFrame{
+		start: windowFrameBound{kind: windowUnboundedPreceding},
+		end:   windowFrameBound{kind: windowUnboundedFollowing},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowLag, column: 1, offset: 1, defaultVal: fallback, hasDefault: true,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowLead, column: 1, offset: 1, defaultVal: fallback, hasDefault: true,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowFirstValue, column: 1, frame: full, nullTreatment: windowIgnoreNulls},
+			{kind: windowLastValue, column: 1, frame: full, nullTreatment: windowIgnoreNulls},
+			{kind: windowNthValue, column: 1, nth: 1, frame: full,
+				nullTreatment: windowIgnoreNulls, fromLast: true},
+		},
+	}
+	assertSetRows(t, runWindowTest(t, &input, &plan), [][]string{
+		{`"fallback"`, `"fallback"`, `null`, `null`, `null`},
+		{`"fallback"`, `"fallback"`, `null`, `null`, `null`},
+		{`"fallback"`, `"fallback"`, `null`, `null`, `null`},
+	})
+}
+
+func TestWindowKernelIgnoreNullsComposesWithExclusionAndSortedPositions(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`2`, `null`}, {`1`, `"a"`}, {`2.0`, `"b"`},
+		{`3`, setTestMissing}, {`2.00`, `"c"`}, {`4`, `"d"`},
+	})
+	frame := windowRowsFrame{
+		unit:      windowFrameGroups,
+		start:     windowFrameBound{kind: windowUnboundedPreceding},
+		end:       windowFrameBound{kind: windowUnboundedFollowing},
+		exclusion: windowExcludeTies,
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowFirstValue, column: 1, frame: frame, nullTreatment: windowIgnoreNulls},
+			{kind: windowLastValue, column: 1, frame: frame, nullTreatment: windowIgnoreNulls},
+			{kind: windowNthValue, column: 1, nth: 2, frame: frame,
+				nullTreatment: windowIgnoreNulls, fromLast: true},
+		},
+	}
+	got := setTestRows(runWindowTest(t, &input, &plan))
+	want := referenceWindowIntegerRows(t, &input, &plan)
+	if !equalSetTestRows(got, want) {
+		t.Fatalf("got=%v\nwant=%v", got, want)
+	}
+}
+
+func TestWindowKernelAggregateFilterAndDistinctExactSemantics(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`, `1`, `true`},
+		{`2`, `1.0`, `true`},
+		{`3`, `2`, `false`},
+		{`4`, `2.00`, `true`},
+		{`5`, `null`, `true`},
+		{`6`, `3`, setTestMissing},
+		{`7`, `3.0`, `true`},
+		{`8`, `3e0`, `true`},
+	})
+	full := windowRowsFrame{
+		start: windowFrameBound{kind: windowUnboundedPreceding},
+		end:   windowFrameBound{kind: windowUnboundedFollowing},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowCount, column: -1, frame: full, hasFilter: true, filterColumn: 2},
+			{kind: windowCount, column: 1, frame: full, hasFilter: true, filterColumn: 2},
+			{kind: windowCount, column: 1, frame: full, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowSum, column: 1, frame: full, hasFilter: true, filterColumn: 2},
+			{kind: windowSum, column: 1, frame: full, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowAvg, column: 1, frame: full, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowMin, column: 1, frame: full, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowMax, column: 1, frame: full, hasFilter: true, filterColumn: 2,
+				distinct: true},
+		},
+	}
+	result := runWindowTest(t, &input, &plan)
+	for row, got := range setTestRows(result) {
+		want := []string{`6`, `5`, `3`, `10`, `6`, `2`, `1`, `3.0`}
+		if !slices.Equal(got, want) {
+			t.Fatalf("row %d = %v, want %v", row, got, want)
+		}
+	}
+
+	containers := buildSetTestSpool(t, [][]string{
+		{`1`, `{"a":1}`}, {`2`, `{"a":1}`}, {`3`, `[1,2]`},
+		{`4`, `null`}, {`5`, setTestMissing},
+	})
+	containerPlan := windowPlan{functions: []windowFunctionSpec{{
+		kind: windowCount, column: 1, frame: full, distinct: true,
+	}}}
+	assertSetRows(t, runWindowTest(t, &containers, &containerPlan), [][]string{
+		{`2`}, {`2`}, {`2`}, {`2`}, {`2`},
+	})
+}
+
+func TestWindowKernelDistinctFilterSlidingExclusionDifferential(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`2`, `1`, `true`}, {`1`, `1`, `true`}, {`2.0`, `2`, `false`},
+		{`3`, `2`, `true`}, {`2.00`, `3`, `true`}, {`4`, `3`, `null`},
+		{`5`, `4`, `true`},
+	})
+	frame := windowRowsFrame{
+		unit:      windowFrameGroups,
+		start:     windowFrameBound{kind: windowPreceding, offset: 1},
+		end:       windowFrameBound{kind: windowFollowing, offset: 1},
+		exclusion: windowExcludeTies,
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowCount, column: 1, frame: frame, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowSum, column: 1, frame: frame, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowMin, column: 1, frame: frame, hasFilter: true, filterColumn: 2,
+				distinct: true},
+			{kind: windowMax, column: 1, frame: frame, hasFilter: true, filterColumn: 2,
+				distinct: true},
+		},
+	}
+	got := setTestRows(runWindowTest(t, &input, &plan))
+	want := referenceWindowIntegerRows(t, &input, &plan)
+	if !equalSetTestRows(got, want) {
+		t.Fatalf("got=%v\nwant=%v", got, want)
+	}
+}
+
+func TestWindowKernelDistinctEmptyFrame(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{{`1`, `1`, `true`}, {`2`, `1.0`, `true`}})
+	future := windowRowsFrame{
+		start: windowFrameBound{kind: windowFollowing, offset: 1},
+		end:   windowFrameBound{kind: windowFollowing, offset: 1},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowCount, column: 1, frame: future, distinct: true},
+			{kind: windowSum, column: 1, frame: future, distinct: true},
+			{kind: windowAvg, column: 1, frame: future, distinct: true},
+		},
+	}
+	assertSetRows(t, runWindowTest(t, &input, &plan), [][]string{
+		{`1`, `1`, `1`}, {`0`, `null`, `null`},
+	})
+}
+
 func TestWindowKernelGroupsFrames(t *testing.T) {
 	input := buildSetTestSpool(t, [][]string{
 		{`1`, `1`}, {`1.0`, `2`}, {`2`, `10`},
@@ -637,6 +870,25 @@ func TestWindowKernelValidationAndFrames(t *testing.T) {
 		{functions: []windowFunctionSpec{{kind: windowNTile, column: -1}}},
 		{functions: []windowFunctionSpec{{kind: windowNthValue, column: 0, frame: validFrame}}},
 		{functions: []windowFunctionSpec{{kind: windowFirstValue, column: 0, nth: 1, frame: validFrame}}},
+		{functions: []windowFunctionSpec{{kind: windowRowNumber, column: -1,
+			nullTreatment: windowIgnoreNulls}}},
+		{functions: []windowFunctionSpec{{kind: windowLag, column: 0, fromLast: true}}},
+		{functions: []windowFunctionSpec{{kind: windowFirstValue, column: 0, frame: validFrame,
+			fromLast: true}}},
+		{functions: []windowFunctionSpec{{kind: windowSum, column: 0, frame: validFrame,
+			nullTreatment: windowIgnoreNulls}}},
+		{functions: []windowFunctionSpec{{kind: windowLead, column: 0,
+			nullTreatment: windowNullTreatment(9)}}},
+		{functions: []windowFunctionSpec{{kind: windowRowNumber, column: -1,
+			hasFilter: true}}},
+		{functions: []windowFunctionSpec{{kind: windowCount, column: -1, frame: validFrame,
+			distinct: true}}},
+		{functions: []windowFunctionSpec{{kind: windowSum, column: 0, frame: validFrame,
+			hasFilter: true, filterColumn: 1}}},
+		{functions: []windowFunctionSpec{{kind: windowSum, column: 0, frame: validFrame,
+			hasFilter: true, filterColumn: 0}}},
+		{functions: []windowFunctionSpec{{kind: windowSum, column: 0, frame: validFrame,
+			filterColumn: 1}}},
 		{functions: []windowFunctionSpec{{kind: windowFirstValue, column: 0, frame: windowRowsFrame{
 			unit: windowFrameUnit(9), start: validFrame.start, end: validFrame.end,
 		}}}},
@@ -790,6 +1042,8 @@ func TestWindowKernelBudgetAdmissionPrecedesGrowth(t *testing.T) {
 		order:     []windowOrderKey{{column: 1, nulls: windowNullsLast}},
 		functions: []windowFunctionSpec{
 			{kind: windowSum, column: 2, frame: frameSpec},
+			{kind: windowSum, column: 2, frame: excludedFrame, distinct: true,
+				hasFilter: true, filterColumn: 3},
 			{kind: windowMin, column: 2, frame: excludedFrame},
 			{kind: windowCount, column: -1, frame: rangeFrame},
 		},
@@ -1006,7 +1260,11 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 			if random.Intn(9) == 0 {
 				order = setTestMissing
 			}
-			data[row] = []string{fmt.Sprintf("%d", random.Intn(3)), order, value}
+			filters := [...]string{`true`, `false`, `null`, setTestMissing}
+			data[row] = []string{
+				fmt.Sprintf("%d", random.Intn(3)), order, value,
+				filters[random.Intn(len(filters))],
+			}
 		}
 		input := buildSetTestSpool(t, data)
 		preceding, following := random.Intn(4), random.Intn(4)
@@ -1045,16 +1303,26 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 				{kind: windowNTile, column: -1, buckets: 1 + random.Intn(8)},
 				{kind: windowPercentRank, column: -1},
 				{kind: windowCumeDist, column: -1},
-				{kind: windowLag, column: 2, offset: random.Intn(4)},
-				{kind: windowLead, column: 2, offset: random.Intn(4)},
+				{kind: windowLag, column: 2, offset: random.Intn(4),
+					nullTreatment: windowNullTreatment(random.Intn(2))},
+				{kind: windowLead, column: 2, offset: random.Intn(4),
+					nullTreatment: windowNullTreatment(random.Intn(2))},
 				{kind: windowCount, column: -1, frame: frameSpec},
 				{kind: windowCount, column: 2, frame: frameSpec},
 				{kind: windowSum, column: 2, frame: frameSpec},
+				{kind: windowCount, column: 2, frame: frameSpec, distinct: true,
+					hasFilter: true, filterColumn: 3},
+				{kind: windowSum, column: 2, frame: frameSpec, distinct: true,
+					hasFilter: true, filterColumn: 3},
 				{kind: windowMin, column: 2, frame: frameSpec},
 				{kind: windowMax, column: 2, frame: frameSpec},
-				{kind: windowFirstValue, column: 2, frame: frameSpec},
-				{kind: windowLastValue, column: 2, frame: frameSpec},
-				{kind: windowNthValue, column: 2, nth: 2, frame: frameSpec},
+				{kind: windowFirstValue, column: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(random.Intn(2))},
+				{kind: windowLastValue, column: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(random.Intn(2))},
+				{kind: windowNthValue, column: 2, nth: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(random.Intn(2)),
+					fromLast:      random.Intn(2) != 0},
 			},
 		}
 		result := runWindowTest(t, &input, &plan)
@@ -1123,6 +1391,9 @@ func TestWindowKernelOverflowGuards(t *testing.T) {
 	if _, ok := windowScaleDifference(math.MaxInt64, math.MinInt64); ok {
 		t.Fatal("RANGE scale subtraction overflow was admitted")
 	}
+	if _, err := windowDistinctCapacity(math.MaxInt); !errors.Is(err, errWindowSize) {
+		t.Fatalf("distinct capacity overflow = %v, want %v", err, errWindowSize)
+	}
 	input := relationSpool{rows: math.MaxInt}
 	plan := windowPlan{functions: []windowFunctionSpec{{kind: windowRowNumber, column: -1}}}
 	if _, err := measureWindowExecution(&input, &plan, nil); !errors.Is(err, errWindowSize) {
@@ -1155,6 +1426,9 @@ var windowSink int
 type windowTestCapacities struct {
 	order, scratch, deque int
 	groups, extrema       int
+	nonNull               int
+	distinctSlots         int
+	distinctEntries       int
 	number, negative      int
 	columns, data         int
 }
@@ -1163,6 +1437,8 @@ func windowExecutorCapacities(e *windowExecutor) windowTestCapacities {
 	return windowTestCapacities{
 		order: cap(e.order), scratch: cap(e.sortScratch), deque: cap(e.deque),
 		groups: cap(e.groups), extrema: cap(e.extrema),
+		nonNull:       cap(e.nonNull),
+		distinctSlots: cap(e.distinctSlots), distinctEntries: cap(e.distinctEntries),
 		number: cap(e.numberOut), negative: cap(e.negative),
 		columns: cap(e.result.columns), data: cap(e.result.data),
 	}
@@ -1201,6 +1477,7 @@ func buildWindowRows(t testing.TB, rows int) relationSpool {
 			fmt.Sprintf("%d", row%7),
 			fmt.Sprintf("%d.0", row%97),
 			fmt.Sprintf("%d", row%31-15),
+			[]string{`true`, `false`, `null`}[row%3],
 		}
 	}
 	return buildSetTestSpool(t, data)
@@ -1244,15 +1521,24 @@ func windowStressPlan() windowPlan {
 			{kind: windowCumeDist, column: -1},
 			{kind: windowLag, column: 2, offset: 3},
 			{kind: windowLead, column: 2, offset: 2},
+			{kind: windowLag, column: 2, offset: 3, nullTreatment: windowIgnoreNulls},
+			{kind: windowLead, column: 2, offset: 2, nullTreatment: windowIgnoreNulls},
 			{kind: windowCount, column: -1, frame: frame},
 			{kind: windowCount, column: 2, frame: frame},
 			{kind: windowSum, column: 2, frame: frame},
+			{kind: windowCount, column: 2, frame: excludedFrame, distinct: true},
+			{kind: windowSum, column: 2, frame: excludedFrame, distinct: true,
+				hasFilter: true, filterColumn: 3},
 			{kind: windowAvg, column: 2, frame: frame},
 			{kind: windowMin, column: 2, frame: frame},
 			{kind: windowMax, column: 2, frame: frame},
 			{kind: windowFirstValue, column: 2, frame: frame},
 			{kind: windowLastValue, column: 2, frame: frame},
 			{kind: windowNthValue, column: 2, nth: 3, frame: frame},
+			{kind: windowFirstValue, column: 2, frame: excludedFrame,
+				nullTreatment: windowIgnoreNulls},
+			{kind: windowNthValue, column: 2, nth: 3, frame: excludedFrame,
+				nullTreatment: windowIgnoreNulls, fromLast: true},
 			{kind: windowCount, column: -1, frame: groupsFrame},
 			{kind: windowSum, column: 2, frame: groupsFrame},
 			{kind: windowCount, column: -1, frame: excludedFrame},
@@ -1349,11 +1635,15 @@ func referenceWindowIntegerRows(
 						"%d", referenceWindowTile(local, rows, function.buckets),
 					)
 				case windowLag, windowLead:
-					target, ok := windowOffsetPosition(
-						local, rows, function.offset, function.kind == windowLead,
+					target, ok := referenceWindowOffsetPosition(
+						input, order, partitionStart, function, local, rows,
 					)
 					if !ok {
-						result[row][column] = `null`
+						if function.hasDefault {
+							result[row][column] = windowScalarString(function.defaultVal)
+						} else {
+							result[row][column] = `null`
+						}
 					} else {
 						result[row][column] = windowScalarString(
 							input.columns[function.column][order[partitionStart+target]],
@@ -1367,17 +1657,38 @@ func referenceWindowIntegerRows(
 					)
 					count, sum := 0, int64(0)
 					var extreme scalar
+					var distinct []scalar
 					for at := lo; at < hi; at++ {
 						if referenceWindowExcluded(function.frame, local, at, groups, group) {
 							continue
+						}
+						row := order[partitionStart+at]
+						if function.hasFilter {
+							filter := input.columns[function.filterColumn][row]
+							if filter.kind != kindBool || !filter.bval {
+								continue
+							}
 						}
 						if function.kind == windowCount && function.column < 0 {
 							count++
 							continue
 						}
-						value := input.columns[function.column][order[partitionStart+at]]
+						value := input.columns[function.column][row]
 						if value.kind == kindNull {
 							continue
+						}
+						if function.distinct {
+							duplicate := false
+							for _, seen := range distinct {
+								if compareScalar(seen, value) == 0 {
+									duplicate = true
+									break
+								}
+							}
+							if duplicate {
+								continue
+							}
+							distinct = append(distinct, value)
 						}
 						if function.kind == windowCount {
 							count++
@@ -1418,22 +1729,35 @@ func referenceWindowIntegerRows(
 						function.frame, local, rows, groups, group,
 					)
 					target, seen := -1, 0
-					for at := lo; at < hi; at++ {
+					step, at, stop := 1, lo, hi
+					fromLast := function.kind == windowLastValue ||
+						(function.kind == windowNthValue && function.fromLast)
+					if fromLast {
+						step, at, stop = -1, hi-1, lo-1
+					}
+					for at != stop {
 						if referenceWindowExcluded(function.frame, local, at, groups, group) {
+							at += step
+							continue
+						}
+						value := input.columns[function.column][order[partitionStart+at]]
+						if function.nullTreatment == windowIgnoreNulls && value.kind == kindNull {
+							at += step
 							continue
 						}
 						seen++
 						switch function.kind {
-						case windowFirstValue:
+						case windowFirstValue, windowLastValue:
 							target = at
-							at = hi
-						case windowLastValue:
-							target = at
+							at = stop
 						case windowNthValue:
 							if seen == function.nth {
 								target = at
-								at = hi
+								at = stop
 							}
+						}
+						if at != stop {
+							at += step
 						}
 					}
 					if target < 0 {
@@ -1449,6 +1773,35 @@ func referenceWindowIntegerRows(
 		partitionStart = partitionEnd
 	}
 	return result
+}
+
+func referenceWindowOffsetPosition(
+	input *relationSpool,
+	order []int,
+	partitionStart int,
+	function windowFunctionSpec,
+	position, rows int,
+) (int, bool) {
+	lead := function.kind == windowLead
+	if function.nullTreatment == windowRespectNulls || function.offset == 0 {
+		return windowOffsetPosition(position, rows, function.offset, lead)
+	}
+	step := -1
+	if lead {
+		step = 1
+	}
+	remaining := function.offset
+	for at := position + step; at >= 0 && at < rows; at += step {
+		value := input.columns[function.column][order[partitionStart+at]]
+		if value.kind == kindNull {
+			continue
+		}
+		remaining--
+		if remaining == 0 {
+			return at, true
+		}
+	}
+	return 0, false
 }
 
 func windowScalarString(value scalar) string {
