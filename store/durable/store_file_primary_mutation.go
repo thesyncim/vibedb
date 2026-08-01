@@ -615,6 +615,16 @@ func (c *Collection) putPrimary(
 		}
 	}
 retryAfterUnifiedFold:
+	// The concurrent packed lane leaves state at the physical fold base. Any
+	// exclusive/exceptional mutation must first turn that logical suffix into a
+	// physical state so every mature path below can continue to use root fields
+	// as its transaction base without learning a second metadata model.
+	if c.packedLogicalCutPending() {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			return false, err
+		}
+		goto retryAfterUnifiedFold
+	}
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return false, ErrClosed
@@ -932,6 +942,12 @@ func (c *Collection) deletePrimary(
 		return false, ErrKeyTooLarge
 	}
 retryAfterUnifiedDeleteFold:
+	if c.packedLogicalCutPending() {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			return false, err
+		}
+		goto retryAfterUnifiedDeleteFold
+	}
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return false, nil
@@ -1844,11 +1860,18 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		!c.primaryUnifiedOverlay.hasPending() {
 		return nil
 	}
+	logical, logicalOK := c.writerLogicalView()
+	if !logicalOK || logical.state == nil {
+		return storeio.ErrGenerationOrder
+	}
+	// The packed lane deliberately leaves state at the physical fold base.
+	// Materialization is an exceptional path, so derive one private logical view
+	// for the existing planner rather than allocating a state per ordinary write.
+	visibleValue := *logical.state
+	visibleValue.root.Generation = logical.generation
+	visibleValue.root.DocumentCount = logical.documentCount
+	visible := &visibleValue
 	if c.primaryUnifiedOverlay.hasPending() {
-		visible := c.state.Load()
-		if visible == nil {
-			return ErrClosed
-		}
 		if err := c.preparePrimaryUnifiedOverlayParentsLocked(
 			visible,
 		); err != nil {
@@ -1889,7 +1912,6 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			c.primaryCheckpointBase = nil
 		}
 	}
-	visible := c.state.Load()
 	if base == nil || visible == nil ||
 		visible.root.Generation <= base.root.Generation ||
 		visible.root.Generation >= uint64(1)<<48 {

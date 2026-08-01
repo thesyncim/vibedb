@@ -96,13 +96,28 @@ type Collection struct {
 	// persistence error already discovered while retryable cleanup (active
 	// readers or writer unlock) still prevents completion. writer protects it.
 	closeErr error
-	// state is the writer's newest applied generation. Readers use
-	// visibleState so synchronous commits cannot leak before their fence.
-	state          atomic.Pointer[fileStoreState]
-	visibleState   atomic.Pointer[fileStoreState]
-	durableState   atomic.Pointer[fileStoreState]
-	visibilityMu   sync.Mutex
-	pendingVisible []filePendingState
+	// state and visibleState are the newest published physical roots. On the
+	// packed buffered lane logicalCut may lead those roots while mutations live
+	// only in the resident overlay. Readers sample the physical pointer and cut
+	// as one logical view; synchronous commits still cannot leak before their
+	// visibility fence.
+	state        atomic.Pointer[fileStoreState]
+	visibleState atomic.Pointer[fileStoreState]
+	durableState atomic.Pointer[fileStoreState]
+	// logicalCut is the allocation-free publication token for the narrow
+	// journal-delta buffered overlay lane. Its low 48 bits are the logical
+	// generation and its high 16 bits are the signed document-count delta from
+	// state/visibleState's physical root. The overlay and resident router are
+	// initialized first; one Store here is the reader-visible commit point.
+	logicalCut atomic.Uint64
+	// packedLogicalCutDisabled is a one-way certificate. A collection built
+	// without indexes owns the fixed concurrent contexts for its lifetime, but
+	// a successful online index cutover permanently removes it from the packed
+	// publication lane. Keeping that state separate avoids charging every later
+	// indexed read for a cut load and recheck.
+	packedLogicalCutDisabled atomic.Bool
+	visibilityMu             sync.Mutex
+	pendingVisible           []filePendingState
 
 	committer *storeio.Committer
 	cache     *storeio.PageCache

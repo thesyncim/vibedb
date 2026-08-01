@@ -570,6 +570,62 @@ func TestMetricsRemainCoherentDuringConcurrentPublication(t *testing.T) {
 	}
 }
 
+func TestBufferedFacadeTracksPackedZeroAllocationPublication(t *testing.T) {
+	db, err := vibedb.Open(
+		filepath.Join(t.TempDir(), "packed-metrics.vdb"),
+		vibedb.WithDurability(vibedb.Buffered),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	collection := db.Collection("events")
+	document := []byte(`{"ok":true}`)
+	if created, err := collection.Put("seed", document); err != nil || !created {
+		t.Fatalf("seed Put = %v,%v", created, err)
+	}
+	// Keep the leaf non-empty while seed churns. Deleting the collection's final
+	// row is deliberately structural and outside the packed point-mutation lane.
+	if created, err := collection.Put("anchor", document); err != nil || !created {
+		t.Fatalf("anchor Put = %v,%v", created, err)
+	}
+	before, err := collection.Metrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	putAllocs := testing.AllocsPerRun(50, func() {
+		if created, putErr := collection.Put("seed", document); putErr != nil || created {
+			panic("replacement Put failed")
+		}
+	})
+	if putAllocs != 0 {
+		t.Fatalf("warmed facade Put allocated %.2f times, want 0", putAllocs)
+	}
+	deleteRestoreAllocs := testing.AllocsPerRun(50, func() {
+		if deleted, deleteErr := collection.Delete("seed"); deleteErr != nil || !deleted {
+			panic("Delete failed")
+		}
+		if created, putErr := collection.Put("seed", document); putErr != nil || !created {
+			panic("restore Put failed")
+		}
+	})
+	if deleteRestoreAllocs != 0 {
+		t.Fatalf("warmed facade delete+restore allocated %.2f times, want 0", deleteRestoreAllocs)
+	}
+
+	after, err := collection.Metrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Documents != 2 || after.PublishedGeneration <= before.PublishedGeneration {
+		t.Fatalf("packed publication metrics did not advance coherently: before=%+v after=%+v", before, after)
+	}
+	if after.DurableGeneration > after.PublishedGeneration {
+		t.Fatalf("durable generation leads packed publication: %+v", after)
+	}
+}
+
 func TestMemoryMetricsRemainCoherentDuringConcurrentPublication(t *testing.T) {
 	db, err := vibedb.Open("", vibedb.WithDurability(vibedb.Memory))
 	if err != nil {

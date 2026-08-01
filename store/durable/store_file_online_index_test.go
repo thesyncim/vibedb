@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,73 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
+
+func TestOnlineCreateIndexPermanentlyDisablesPackedReadSampling(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 128, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	if !collection.packedLogicalCutEnabled() {
+		t.Fatal("fresh unindexed collection did not enable packed cut")
+	}
+	if _, err := collection.CreateIndex(store.IndexDefinition{
+		Name: "by_group", Paths: []string{"/group"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if collection.packedLogicalCutEnabled() {
+		t.Fatal("online-indexed collection retained packed cut sampling")
+	}
+	physical := collection.visibleState.Load()
+	if physical == nil {
+		t.Fatal("online index did not publish a physical state")
+	}
+	cut := collection.logicalCut.Load()
+	if fileLogicalCutGeneration(cut) != physical.root.Generation ||
+		fileLogicalCutDelta(cut) != 0 {
+		t.Fatalf("post-index cut = (%d,%d), physical generation %d",
+			fileLogicalCutGeneration(cut), fileLogicalCutDelta(cut),
+			physical.root.Generation)
+	}
+
+	previousHook := fileLogicalViewAfterStateLoadHook
+	samples := 0
+	fileLogicalViewAfterStateLoadHook = func() { samples++ }
+	defer func() { fileLogicalViewAfterStateLoadHook = previousHook }()
+	key := []byte(fixture.keys[7])
+	want := fixture.values[7]
+	dst := make([]byte, 0, 256)
+	allocs := testing.AllocsPerRun(200, func() {
+		out, found, err := collection.AppendRaw(dst[:0], key)
+		if err != nil || !found || !bytes.Equal(out, want) {
+			panic("post-index physical read failed")
+		}
+		dst = out[:0]
+	})
+	if allocs != 0 {
+		t.Fatalf("post-index AppendRaw allocations = %.2f, want 0", allocs)
+	}
+	if collection.Len() != 128 || collection.Generation() == 0 {
+		t.Fatal("post-index logical metadata is invalid")
+	}
+	if samples != 0 {
+		t.Fatalf("post-index reads sampled packed cut %d times, want 0", samples)
+	}
+	previousCanonicalizeHook := concurrentPrimaryPutCanonicalizeHook
+	canonicalizeCalls := 0
+	concurrentPrimaryPutCanonicalizeHook = func(bool) { canonicalizeCalls++ }
+	defer func() {
+		concurrentPrimaryPutCanonicalizeHook = previousCanonicalizeHook
+	}()
+	if created, err := collection.Put(key, want); err != nil || created {
+		t.Fatalf("post-index replacement = created %v, err %v", created, err)
+	}
+	concurrentPrimaryPutCanonicalizeHook = previousCanonicalizeHook
+	if canonicalizeCalls != 0 {
+		t.Fatalf("post-index Put entered concurrent canonicalizer %d times, want 0",
+			canonicalizeCalls)
+	}
+}
 
 func TestOnlineCreateIndexPublishesAtomicallyAndReopens(t *testing.T) {
 	path := t.TempDir() + "/online.vjc"

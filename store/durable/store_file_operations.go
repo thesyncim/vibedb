@@ -281,6 +281,10 @@ func (c *Collection) SnapshotInto(dst *Snapshot) error {
 			concurrentPrimaryExclusiveWaitHook("snapshot")
 		}
 		c.writer.Lock()
+		if c.closed {
+			c.writer.Unlock()
+			return ErrClosed
+		}
 		if len(c.primaryPendingParents) != 0 ||
 			c.primaryUnifiedOverlay.hasPending() {
 			if err := c.materializePrimaryParentsLocked(); err != nil {
@@ -312,6 +316,9 @@ func (c *Collection) pinSnapshotInto(snapshot *Snapshot) error {
 	state, stateErr := c.readerFileState()
 	if stateErr != nil {
 		c.snapshotGate.RUnlock()
+		if c.leases.Closing() {
+			return ErrClosed
+		}
 		return stateErr
 	}
 	epoch := c.primaryEpoch
@@ -322,7 +329,7 @@ func (c *Collection) pinSnapshotInto(snapshot *Snapshot) error {
 	lease, err := c.leases.Acquire(state.root.Generation)
 	c.snapshotGate.RUnlock()
 	if err != nil {
-		return err
+		return publicReaderLeaseError(err)
 	}
 	snapshot.collection = c
 	snapshot.state = state
@@ -373,7 +380,7 @@ func (s *Snapshot) Len() uint64 {
 	return s.state.root.DocumentCount
 }
 
-// Generation returns the pinned durable publication generation.
+// Generation returns the pinned physical publication generation.
 func (s *Snapshot) Generation() uint64 {
 	if s == nil || s.state == nil {
 		return 0
@@ -464,6 +471,11 @@ func (s *Snapshot) PrefetchKeys(keys [][]byte) (int, error) {
 // resolve in appendRawLeased always completes.
 const liveReadSupersededRetries = 4
 
+// liveReadLeasedPinnedHook is a package-test seam invoked after each slow-path
+// logical cut is pinned and once more immediately before the terminal writer
+// fence. Production leaves it nil.
+var liveReadLeasedPinnedHook func(int)
+
 // AppendRaw is the current-snapshot convenience form. It protects the read
 // with one epoch slot — no lock, no per-call generation lease — and falls back
 // to the gated lease path only when the epoch table declines the entry (full
@@ -479,12 +491,30 @@ func (c *Collection) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	if c == nil {
 		return dst, false, ErrClosed
 	}
+	if !c.packedLogicalCutEnabled() {
+		for range liveReadSupersededRetries {
+			state, epoch, ok := c.enterPhysicalReadEpoch()
+			if !ok {
+				break
+			}
+			out, found, superseded, err := c.resolvePrimaryGraphLive(
+				dst, state, state.root.Generation, key,
+			)
+			epoch.Exit()
+			if !superseded {
+				return out, found, err
+			}
+		}
+		return c.appendRawLeased(dst, key)
+	}
 	for range liveReadSupersededRetries {
-		state, epoch, ok := c.enterReadEpoch()
+		view, epoch, ok := c.enterPackedReadEpoch()
 		if !ok {
 			break
 		}
-		out, found, superseded, err := c.resolvePrimaryGraphLive(dst, state, key)
+		out, found, superseded, err := c.resolvePrimaryGraphLive(
+			dst, view.state, view.generation, key,
+		)
 		epoch.Exit()
 		if !superseded {
 			return out, found, err
@@ -498,47 +528,65 @@ func (c *Collection) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 // readers here exactly because this path blocks on the snapshot gate until the
 // writer's decision window closes.
 func (c *Collection) appendRawLeased(dst []byte, key []byte) ([]byte, bool, error) {
-	for range liveReadSupersededRetries {
+	for attempt := range liveReadSupersededRetries {
 		c.snapshotGate.RLock()
-		state, stateErr := c.readerFileState()
+		view, stateErr := c.visibleLogicalView()
 		if stateErr != nil {
 			c.snapshotGate.RUnlock()
+			if c.leases.Closing() {
+				return dst, false, ErrClosed
+			}
 			return dst, false, stateErr
 		}
-		lease, err := c.leases.Acquire(state.root.Generation)
+		lease, err := c.leases.Acquire(view.retentionGeneration())
 		c.snapshotGate.RUnlock()
 		if err != nil {
-			return dst, false, err
+			return dst, false, publicReaderLeaseError(err)
 		}
-		out, ok, superseded, err := c.resolvePrimaryGraphLive(dst, state, key)
+		if liveReadLeasedPinnedHook != nil {
+			liveReadLeasedPinnedHook(attempt)
+		}
+		out, ok, superseded, err := c.resolvePrimaryGraphLive(
+			dst, view.state, view.generation, key,
+		)
 		lease.Release()
 		if !superseded {
 			return out, ok, err
 		}
 	}
-	// Terminal, guaranteed-progress resolve: hold the snapshot gate's read side
-	// across the read. Every live publication pairs its router advance with its
-	// state publish inside one gate write hold, so a state pinned under the
-	// gate can never trail the router — the routed read is current, or the
-	// router is behind a structural publish and that state's materialized
-	// rooted graph serves exactly. This path is effectively unreachable (it
-	// needs liveReadSupersededRetries consecutive publications to land inside
-	// consecutive nanosecond windows); it exists so reader progress is a
-	// guarantee rather than a probability.
+	// Terminal, guaranteed-progress resolve: take writer exclusively, the one
+	// fence every publication obeys. Packed overlay publishers intentionally do
+	// not take snapshotGate, so that gate alone cannot close a fifth router-ahead
+	// race after the bounded optimistic retries. The writer hold makes the view
+	// and routed resolve one stable cut; snapshotGate still protects failure-state
+	// selection and lease acquisition from the persistence callback.
+	if liveReadLeasedPinnedHook != nil {
+		liveReadLeasedPinnedHook(liveReadSupersededRetries)
+	}
+	c.writer.Lock()
+	defer c.writer.Unlock()
 	c.snapshotGate.RLock()
-	state, stateErr := c.readerFileState()
+	view, stateErr := c.visibleLogicalView()
 	if stateErr != nil {
 		c.snapshotGate.RUnlock()
+		if c.leases.Closing() {
+			return dst, false, ErrClosed
+		}
 		return dst, false, stateErr
 	}
-	lease, err := c.leases.Acquire(state.root.Generation)
+	lease, err := c.leases.Acquire(view.retentionGeneration())
 	if err != nil {
 		c.snapshotGate.RUnlock()
-		return dst, false, err
+		return dst, false, publicReaderLeaseError(err)
 	}
-	out, ok, _, err := c.resolvePrimaryGraphLive(dst, state, key)
+	out, ok, superseded, err := c.resolvePrimaryGraphLive(
+		dst, view.state, view.generation, key,
+	)
 	c.snapshotGate.RUnlock()
 	lease.Release()
+	if superseded && err == nil {
+		err = storeio.ErrSegmentedTabletRouterCorrupt
+	}
 	return out, ok, err
 }
 
@@ -558,11 +606,7 @@ func (c *Collection) Len() uint64 {
 	if c == nil {
 		return 0
 	}
-	state := c.readerFileStateNoError()
-	if state == nil {
-		return 0
-	}
-	return state.root.DocumentCount
+	return c.visibleLogicalViewNoError().documentCount
 }
 
 // Generation returns the current reader-visible generation.
@@ -570,11 +614,7 @@ func (c *Collection) Generation() uint64 {
 	if c == nil {
 		return 0
 	}
-	state := c.readerFileStateNoError()
-	if state == nil {
-		return 0
-	}
-	return state.root.Generation
+	return c.visibleLogicalViewNoError().generation
 }
 
 // StateMetrics is one coherent, constant-size observation of reader-visible
@@ -585,24 +625,23 @@ type StateMetrics struct {
 	DurableGeneration   uint64
 }
 
-// StateMetrics samples document count and publication from one immutable state
-// while holding only the narrow visibility mutex. The durability watermark is
-// capped at that sampled publication: a persistence callback may have advanced
-// its atomic watermark while waiting to promote the corresponding visible
-// state, and reporting that newer watermark beside the older state would not be
-// one coherent observation. This method never takes the writer lock or gathers
-// heavyweight cache, queue, lease, or reclaimer statistics.
+// StateMetrics samples one coherent logical view while holding only the narrow
+// visibility mutex. A packed buffered overlay may advance publication and
+// document count ahead of the physical root, so the logical cut—not the root
+// alone—is authoritative. The durability watermark is capped at that sampled
+// publication. This method never takes the writer lock or gathers heavyweight
+// cache, queue, lease, or reclaimer statistics.
 func (c *Collection) StateMetrics() StateMetrics {
 	if c == nil {
 		return StateMetrics{}
 	}
 	c.visibilityMu.Lock()
 	defer c.visibilityMu.Unlock()
-	state := c.readerFileStateNoError()
-	if state == nil {
+	view := c.visibleLogicalViewNoError()
+	if view.state == nil {
 		return StateMetrics{}
 	}
-	published := state.root.Generation
+	published := view.generation
 	durable := uint64(0)
 	if c.committer != nil {
 		durable = max(
@@ -611,7 +650,7 @@ func (c *Collection) StateMetrics() StateMetrics {
 		)
 	}
 	return StateMetrics{
-		Documents:           state.root.DocumentCount,
+		Documents:           view.documentCount,
 		PublishedGeneration: published,
 		DurableGeneration:   min(durable, published),
 	}
@@ -641,10 +680,11 @@ func (c *Collection) Stats() Stats {
 	}
 	cache := c.cache.Stats()
 	commit := c.committer.Stats()
-	state := c.readerFileStateNoError()
+	view := c.visibleLogicalViewNoError()
+	state := view.state
 	current := uint64(0)
 	if state != nil {
-		current = state.root.Generation
+		current = view.generation
 	}
 	leases := c.leases.Stats(current)
 	retired := c.reclaimer.Stats()
@@ -781,7 +821,7 @@ func (c *Collection) Stats() Stats {
 		stats.ReusableBytes += extent.Length
 	}
 	if state != nil {
-		stats.DocumentCount = state.root.DocumentCount
+		stats.DocumentCount = view.documentCount
 		stats.FileEnd = state.fileEnd
 	}
 	return stats

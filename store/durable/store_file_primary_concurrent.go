@@ -32,6 +32,8 @@ const (
 	primaryConcurrentIndexLimit      = 8192
 	primaryConcurrentCacheLine       = 64
 	primaryConcurrentStripePad       = primaryConcurrentCacheLine - int(unsafe.Sizeof(sync.Mutex{}))
+	primaryConcurrentPoolClosed      = uint64(1) << 63
+	primaryConcurrentContextMask     = uint64(1)<<primaryConcurrentContextLimit - 1
 )
 
 // Hooks are package-private deterministic test seams. Production leaves them
@@ -60,23 +62,6 @@ type primaryConcurrentStripe struct {
 func primaryConcurrentStripeIndex(bucket storeio.BucketID) uint32 {
 	return primaryUnifiedOverlayBucketHash(bucket) &
 		(primaryConcurrentStripeCount - 1)
-}
-
-func primaryConcurrentDocumentCount(
-	base uint64, delta int64,
-) (uint64, bool) {
-	if delta < 0 {
-		magnitude := uint64(-(delta + 1)) + 1
-		if magnitude > base {
-			return 0, false
-		}
-		return base - magnitude, true
-	}
-	magnitude := uint64(delta)
-	if magnitude > ^uint64(0)-base {
-		return 0, false
-	}
-	return base + magnitude, true
 }
 
 // primaryConcurrentContext owns every mutable byte touched while one caller
@@ -142,7 +127,11 @@ type primaryConcurrentContextPool struct {
 	// bounded CAS attempt and never enters a channel or mutex. A caller that
 	// observes exhaustion joins wait below; later fast callers also join that
 	// lane so an already-blocked caller cannot be starved by barging.
-	free     atomic.Uint32
+	// free packs the context bits with one sticky close bit. Close invalidates
+	// every in-flight CAS expected word, so acquisition needs no separate
+	// pre/post close loads around its one claim CAS.
+	free     atomic.Uint64
+	allFree  uint64
 	waiters  atomic.Uint32
 	waitMu   sync.Mutex
 	wait     sync.Cond
@@ -170,11 +159,12 @@ func newPrimaryConcurrentContextPool(
 		rawLimit: rawLimit,
 	}
 	pool.wait.L = &pool.waitMu
-	free := ^uint32(0)
+	free := primaryConcurrentContextMask
 	if count < primaryConcurrentContextLimit {
-		free = uint32(1)<<uint(count) - 1
+		free = uint64(1)<<uint(count) - 1
 	}
 	pool.free.Store(free)
+	pool.allFree = free
 	for i := range pool.contexts {
 		pool.contexts[i].poolSlot = uint8(i)
 		pool.contexts[i].index = make(
@@ -222,11 +212,14 @@ func (p *primaryConcurrentContextPool) acquire() *primaryConcurrentContext {
 	for attempt := 0; attempt < primaryConcurrentContextLimit &&
 		p.waiters.Load() == 0; attempt++ {
 		available := p.free.Load()
-		if available == 0 {
+		if available&primaryConcurrentPoolClosed != 0 {
+			return nil
+		}
+		if available&p.allFree == 0 {
 			break
 		}
-		slot := uint32(bits.TrailingZeros32(available))
-		bit := uint32(1) << slot
+		slot := uint32(bits.TrailingZeros64(available))
+		bit := uint64(1) << slot
 		if p.free.CompareAndSwap(available, available&^bit) {
 			return &p.contexts[slot]
 		}
@@ -236,9 +229,14 @@ func (p *primaryConcurrentContextPool) acquire() *primaryConcurrentContext {
 	p.waiters.Add(1)
 	for {
 		available := p.free.Load()
-		if available != 0 {
-			slot := uint32(bits.TrailingZeros32(available))
-			bit := uint32(1) << slot
+		if available&primaryConcurrentPoolClosed != 0 {
+			p.waiters.Add(^uint32(0))
+			p.waitMu.Unlock()
+			return nil
+		}
+		if available&p.allFree != 0 {
+			slot := uint32(bits.TrailingZeros64(available))
+			bit := uint64(1) << slot
 			if p.free.CompareAndSwap(available, available&^bit) {
 				p.waiters.Add(^uint32(0))
 				p.waitMu.Unlock()
@@ -253,6 +251,32 @@ func (p *primaryConcurrentContextPool) acquire() *primaryConcurrentContext {
 	}
 }
 
+// close rejects future claims and wakes every exhausted-pool waiter. Existing
+// holders drain naturally; waitDrained is called without writer held before
+// any collection-owned resources are released.
+func (p *primaryConcurrentContextPool) close() {
+	if p == nil {
+		return
+	}
+	if old := p.free.Or(primaryConcurrentPoolClosed); old&primaryConcurrentPoolClosed != 0 {
+		return
+	}
+	p.waitMu.Lock()
+	p.wait.Broadcast()
+	p.waitMu.Unlock()
+}
+
+func (p *primaryConcurrentContextPool) waitDrained() {
+	if p == nil {
+		return
+	}
+	p.waitMu.Lock()
+	for p.free.Load()&p.allFree != p.allFree {
+		p.wait.Wait()
+	}
+	p.waitMu.Unlock()
+}
+
 func (p *primaryConcurrentContextPool) release(
 	context *primaryConcurrentContext,
 ) {
@@ -263,16 +287,17 @@ func (p *primaryConcurrentContextPool) release(
 	if slot >= uint32(len(p.contexts)) || &p.contexts[slot] != context {
 		panic("vibedb: foreign concurrent primary context release")
 	}
-	bit := uint32(1) << slot
+	bit := uint64(1) << slot
 	if old := p.free.Or(bit); old&bit != 0 {
 		panic("vibedb: duplicate concurrent primary context release")
 	}
-	if p.waiters.Load() != 0 {
+	if p.waiters.Load() != 0 ||
+		p.free.Load()&primaryConcurrentPoolClosed != 0 {
 		// Locking around Signal closes the check/sleep race: a waiter either
 		// observes the returned bit while holding waitMu or is already queued
 		// when this signal is issued.
 		p.waitMu.Lock()
-		p.wait.Signal()
+		p.wait.Broadcast()
 		p.waitMu.Unlock()
 	}
 }
@@ -374,10 +399,11 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 	if len(requests) == 0 {
 		return
 	}
-	latest := c.state.Load()
+	latestView, logicalOK := c.writerLogicalView()
+	latest := latestView.state
 	router := c.primaryRouter.Load()
-	if latest == nil || router == nil ||
-		router.Generation() != latest.root.Generation {
+	if !logicalOK || latest == nil || router == nil ||
+		router.Generation() != latestView.generation {
 		for _, request := range requests {
 			request.signal <- primaryConcurrentPublishSignal{
 				err: storeio.ErrSegmentedTabletRouterCorrupt,
@@ -419,19 +445,29 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 			c.snapshotGate.Unlock()
 		}
 	}
-	documentDelta := int64(0)
+	// The signed delta remains relative to the unchanged physical state across
+	// every allocation-free publication in this fold window.
+	documentDelta := latestView.delta
 	replacements := uint64(0)
 	for index, request := range requests {
 		// A group can begin below the on-disk generation ceiling but reach it
 		// before every member is assigned. Stop at the largest representable
 		// prefix and let the untouched suffix take the established path, which
 		// owns the collection's normal generation-exhaustion result.
-		if latest.root.Generation+uint64(published) >= uint64(1)<<48-1 {
+		if latestView.generation+uint64(published) >=
+			fileLogicalCutGenerationMask {
 			break
 		}
-		generation := latest.root.Generation + uint64(published) + 1
-		nextDocumentDelta := documentDelta + int64(request.countDelta)
-		if _, valid := primaryConcurrentDocumentCount(
+		generation := latestView.generation + uint64(published) + 1
+		nextDocumentDelta := documentDelta + request.countDelta
+		if nextDocumentDelta < fileLogicalCutMinDelta ||
+			nextDocumentDelta > fileLogicalCutMaxDelta {
+			// The packed count is an exact signed value, never a saturating one.
+			// Leave this request and its suffix untouched; the caller enters the
+			// exclusive path, folds this cut, and retries against delta zero.
+			break
+		}
+		if _, valid := fileLogicalDocumentCount(
 			latest.root.DocumentCount, nextDocumentDelta,
 		); !valid {
 			for invalid := index; invalid < len(requests); invalid++ {
@@ -497,33 +533,30 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 		published++
 	}
 	if published != 0 {
-		finalRoot := latest.root
-		finalRoot.Generation += uint64(published)
-		finalRoot.DocumentCount, _ = primaryConcurrentDocumentCount(
-			latest.root.DocumentCount, documentDelta,
-		)
-		finalState := &fileStoreState{
-			root: finalRoot, fileEnd: latest.fileEnd,
-			freeHead: latest.freeHead,
+		finalGeneration := latestView.generation + uint64(published)
+		finalCut, ok := packFileLogicalCut(finalGeneration, documentDelta)
+		if !ok {
+			panic("vibedb: invalid prepared packed logical cut")
 		}
-		// The group is one visibility cut. Overlay records retain one consecutive
-		// generation per logical replacement for journal-delta replay, while the
-		// router and public state need only expose the final generation.
-		if !reuseFence {
-			c.snapshotGate.Lock()
-			c.beginReaderFence()
-		}
-		router.AdvanceGeneration(finalRoot.Generation)
+		// The group is one visibility cut. Overlay records retain consecutive
+		// generations for journal-delta replay. The router is initialized first;
+		// the single packed Store below is the commit point. Append-only records do
+		// not need the snapshot gate: an old-cut point reader sees the router ahead
+		// and retries, while current scans filter immutable chains by their pinned
+		// generation. Destructive arena reuse still holds its reader fence.
+		router.AdvanceGeneration(finalGeneration)
 		for _, request := range requests[:published] {
 			if request.fillsEmpty && router.ClearEmpty(request.route) {
 				c.removePrimaryEmptyLeaf()
 			}
 		}
-		c.pageValidator.update(finalState)
-		c.publishFileState(finalState)
-		c.endReaderFence()
-		c.snapshotGate.Unlock()
-		reuseFence = false
+		c.pageValidator.advanceGeneration(finalGeneration)
+		c.logicalCut.Store(finalCut)
+		if reuseFence {
+			c.endReaderFence()
+			c.snapshotGate.Unlock()
+			reuseFence = false
+		}
 		if replacements != 0 {
 			c.concurrentPrimaryReplaces.Add(replacements)
 		}
@@ -551,11 +584,17 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 func (c *Collection) tryConcurrentPrimaryPut(
 	key, src []byte,
 ) (handled, created bool, err error) {
+	if !c.packedLogicalCutEnabled() || c.onlineIndexBuild.Load() {
+		return false, false, nil
+	}
 	pool := c.primaryConcurrentContexts
 	if pool == nil {
 		return false, false, nil
 	}
 	context := pool.acquire()
+	if context == nil {
+		return false, false, ErrClosed
+	}
 	defer pool.release(context)
 
 	// These bounds and the context belong exclusively to this caller and are
@@ -654,8 +693,9 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	// stripe. Reload after acquiring it so overlay lookup includes that writer;
 	// unrelated buckets may continue to advance the global generation without
 	// invalidating this bucket-local size calculation.
-	state = c.state.Load()
-	if state == nil {
+	logicalView, logicalOK := c.writerLogicalView()
+	state = logicalView.state
+	if !logicalOK || state == nil {
 		return false, false, ErrClosed
 	}
 	leafLease, err := router.AcquireLeaf(c.cache, route)
@@ -677,7 +717,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	baseSlot, body, overflow, baseFound :=
 		leaf.LookupBodySlotHashed(route.Hash, key)
 	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
-		route.Bucket, route.Hash, key, state.root.Generation,
+		route.Bucket, route.Hash, key, logicalView.generation,
 	)
 	pendingRaw, pendingRows :=
 		c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
@@ -791,11 +831,17 @@ func (c *Collection) tryConcurrentPrimaryPut(
 func (c *Collection) tryConcurrentPrimaryDelete(
 	key []byte,
 ) (handled, deleted bool, err error) {
+	if !c.packedLogicalCutEnabled() || c.onlineIndexBuild.Load() {
+		return false, false, nil
+	}
 	pool := c.primaryConcurrentContexts
 	if pool == nil {
 		return false, false, nil
 	}
 	context := pool.acquire()
+	if context == nil {
+		return false, false, ErrClosed
+	}
 	defer pool.release(context)
 
 	c.writer.RLock()
@@ -845,8 +891,9 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 	}
 	defer stripe.mu.Unlock()
 
-	state = c.state.Load()
-	if state == nil {
+	logicalView, logicalOK := c.writerLogicalView()
+	state = logicalView.state
+	if !logicalOK || state == nil {
 		return false, false, ErrClosed
 	}
 	leafLease, err := router.AcquireLeaf(c.cache, route)
@@ -868,7 +915,7 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 	baseSlot, body, overflow, baseFound :=
 		leaf.LookupBodySlotHashed(route.Hash, key)
 	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
-		route.Bucket, route.Hash, key, state.root.Generation,
+		route.Bucket, route.Hash, key, logicalView.generation,
 	)
 	stableSlot := baseSlot
 	oldLen := 0

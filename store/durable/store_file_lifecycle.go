@@ -52,25 +52,25 @@ func (c *Collection) rememberRetiredRef(ref storeio.PageRef) {
 // A full retirement table is routed through absorbRetirementPressure so the
 // error identifies either the reader pin or the undersized transaction bound.
 // absorbRetirementPressure turns a retired-extent capacity failure into a
-// caller-actionable error, distinguishing snapshot-pinned extents (close the
-// snapshots) from a genuinely exhausted table (raise MaxRetiredExtents).
+// caller-actionable error, distinguishing reader-pinned extents (release the
+// snapshot or let the direct read finish) from a genuinely exhausted table
+// (raise MaxRetiredExtents).
 func (c *Collection) absorbRetirementPressure(err error) error {
 	if c == nil || !errors.Is(err, storeio.ErrRetiredExtentCapacity) {
 		return err
 	}
 	retired := c.reclaimer.Stats()
-	current := uint64(0)
-	if state := c.state.Load(); state != nil {
-		current = state.root.Generation
-	}
-	leases := c.leases.Stats(current)
-	if leases.Active != 0 && leases.MinimumGeneration <= current {
+	current := c.visibleLogicalViewNoError().generation
+	readers := c.readerSummary(current)
+	if readers.active != 0 && readers.minimum <= current {
 		return fmt.Errorf(
-			"%w: %d of %d retired extents (%d bytes) are pinned by %d open snapshot(s), "+
-				"the oldest at generation %d against current generation %d; "+
-				"close those snapshots or raise Options.MaxRetiredExtents",
+			"%w: %d of %d retired extents (%d bytes) are pinned by %d active reader(s) "+
+				"(%d snapshot lease(s), %d direct read epoch(s)); the oldest physical "+
+				"retention generation is %d against logical generation %d; close snapshots "+
+				"or let current reads finish, or raise Options.MaxRetiredExtents",
 			err, retired.Pending, retired.Capacity, retired.PendingBytes,
-			leases.Active, leases.MinimumGeneration, current)
+			readers.active, readers.snapshots, readers.direct,
+			readers.minimum, current)
 	}
 	return fmt.Errorf(
 		"%w: committing %d retired extents would exceed the capacity of %d; "+
@@ -83,11 +83,8 @@ func (c *Collection) absorbRetirementPressure(err error) error {
 // set, and retries the retirement once. It reports ErrRetiredExtentCapacity
 // when no reader is present to free anything.
 func (c *Collection) retryRetirementAfterPressure() error {
-	current := uint64(0)
-	if state := c.state.Load(); state != nil {
-		current = state.root.Generation
-	}
-	if c.leases.Stats(current).Active == 0 {
+	current := c.visibleLogicalViewNoError().generation
+	if c.readerSummary(current).active == 0 {
 		return storeio.ErrRetiredExtentCapacity
 	}
 	c.retirementPressureCheckpoints.Add(1)
@@ -211,6 +208,14 @@ func (c *Collection) Close() error {
 		return result
 	}
 	c.closed = true
+	// Close reader admission before releasing writer so every later fast-path
+	// read is diverted to an already-closed lease registry. Existing readers
+	// drain normally and keep final teardown retryable.
+	c.leases.BeginClose()
+	c.readEpochs.BeginClose()
+	if c.primaryConcurrentContexts != nil {
+		c.primaryConcurrentContexts.close()
+	}
 	c.writer.Unlock()
 	if c.mutationCombiner != nil {
 		for _, request := range c.mutationCombiner.stop() {
@@ -219,6 +224,9 @@ func (c *Collection) Close() error {
 		}
 	}
 	c.mutationWait.Wait()
+	if c.primaryConcurrentContexts != nil {
+		c.primaryConcurrentContexts.waitDrained()
+	}
 	// DurabilitySync publishers release the construction lock before their
 	// durability wait so independent writers can share one device commit.
 	// Closed prevents any new waiter from registering before this drain.

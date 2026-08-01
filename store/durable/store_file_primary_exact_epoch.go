@@ -531,10 +531,7 @@ type retiredPrimaryExactEpoch struct {
 // oldestRecoveryGeneration). Epoch-slot point reads never touch postings,
 // but including them costs one recycle deferral and keeps one floor story.
 func (c *Collection) primaryExactReclaimFloor() uint64 {
-	current := uint64(0)
-	if state := c.state.Load(); state != nil {
-		current = state.root.Generation
-	}
+	current := c.visibleLogicalViewNoError().generation
 	return min(
 		c.leases.Minimum(current),
 		c.readEpochs.Minimum(current),
