@@ -256,30 +256,11 @@ func (s *Statement) runDerived(
 		return Source{}, err
 	}
 	d.exec.Options = parent.Options
-	remaining := frame.intermediate.remaining()
-	if remaining == 0 {
-		return Source{}, &IntermediateBudgetError{
-			Resource: "derived query result",
-			Bytes:    saturatedBytes(frame.intermediate.used, 1),
-			Limit:    frame.intermediate.limit,
-		}
-	}
-	if remaining > 0 {
-		d.exec.Options.ResultBytes = remaining
-	}
 	cursor, err := d.stmt.runIntoFrame(
 		&d.exec, nestedSource, args[base:base+n], frame,
+		"derived query result",
 	)
 	if err != nil {
-		var resultErr *ResultBudgetError
-		if remaining > 0 && errors.As(err, &resultErr) &&
-			resultErr.ByteLimit == remaining {
-			return Source{}, &IntermediateBudgetError{
-				Resource: "derived query result",
-				Bytes:    saturatedBytes(frame.intermediate.used, resultErr.Bytes),
-				Limit:    frame.intermediate.limit,
-			}
-		}
 		return Source{}, err
 	}
 	resultBytes := d.exec.Result.resultBytesUsed
@@ -288,11 +269,14 @@ func (s *Statement) runDerived(
 	}
 	defer frame.intermediate.release(resultBytes)
 
-	row := 0
-	for cursor.Next() {
-		if err := cancellationCheckpoint(parent.Options.Cancel, row); err != nil {
+	for {
+		next, err := cursor.nextWithCancel(parent.Options.Cancel)
+		if err != nil {
 			s.releaseDerived(frame)
 			return Source{}, err
+		}
+		if !next {
+			break
 		}
 		need := encodedRelationRowBytes(&cursor, len(d.names))
 		if need < 0 {
@@ -329,11 +313,10 @@ func (s *Statement) runDerived(
 			return Source{}, fmt.Errorf("query: materialize derived relation: %w", err)
 		}
 		d.activeBytes += charge
-		row++
 	}
 	// The spool owns every cell now. The child result and any child relation it
 	// borrowed may be invalidated before the outer plan starts.
-	d.exec.Result.abortResult()
+	clearExecBorrowedViews(&d.exec)
 	d.stmt.releaseDerived(frame)
 	return FromSegment(&d.segment), nil
 }
@@ -343,7 +326,7 @@ func (s *Statement) releaseDerived(frame *statementFrame) {
 	if d == nil {
 		return
 	}
-	d.exec.Result.abortResult()
+	clearExecBorrowedViews(&d.exec)
 	d.stmt.releaseDerived(frame)
 	d.segment.Reset()
 	frame.intermediate.release(d.activeBytes)
@@ -360,14 +343,28 @@ func encodedRelationRowBytes(cursor *Cursor, columns int) int {
 		}
 		// Two quotes, a colon, and the decimal ordinal.
 		additional += 3 + decimalDigits(i)
-		var scratch [32]byte
-		additional += len(cursor.Cell(i).AppendJSON(scratch[:0]))
+		additional += encodedCellJSONBytes(cursor.Cell(i))
 		if additional < 0 || bytes > int(^uint(0)>>1)-additional {
 			return -1
 		}
 		bytes += additional
 	}
 	return bytes
+}
+
+// encodedCellJSONBytes measures a Cell without copying a borrowed payload.
+// Computed machine numbers are the sole representation without raw bytes and
+// fit the fixed formatting scratch; projected strings, containers, decimals,
+// booleans, and nulls report their exact retained source length directly.
+func encodedCellJSONBytes(cell Cell) int {
+	if cell.raw != nil {
+		return len(cell.raw)
+	}
+	if cell.kind != TypeNumber {
+		return 0
+	}
+	var scratch [32]byte
+	return len(cell.AppendJSON(scratch[:0]))
 }
 
 func appendRelationRow(dst []byte, cursor *Cursor, columns int) []byte {

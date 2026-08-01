@@ -163,6 +163,12 @@ type statementSubquery struct {
 	slots   []subqueryScalar
 	hasNull bool
 	exists  bool
+	// resultBytes and activeBytes are the two reservations that can coexist
+	// while a child Result is copied into owned predicate values. resultBytes
+	// is released as soon as the copy completes; activeBytes stays charged
+	// until the outer plan has finished using those values.
+	resultBytes int64
+	activeBytes int64
 }
 
 type subqueryScalar struct {
@@ -360,11 +366,16 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	if e == nil {
 		return Cursor{}, fmt.Errorf("query: RunInto requires a non-nil Exec")
 	}
+	// An invalid statement-wide option is still an execution attempt. Match
+	// Query.RunInto's destination contract by invalidating the prior result and
+	// stats before validating anything that can fail.
+	clearExecBorrowedViews(e)
+	e.Stats = ExecStats{}
 	var frame statementFrame
 	if err := frame.begin(e.Options); err != nil {
 		return Cursor{}, err
 	}
-	return s.runIntoFrame(e, src, args, &frame)
+	return s.runIntoFrame(e, src, args, &frame, "")
 }
 
 // runIntoFrame is RunInto with the statement-wide accounts already installed.
@@ -375,12 +386,20 @@ func (s *Statement) runIntoFrame(
 	src Source,
 	args []any,
 	frame *statementFrame,
+	intermediateResource string,
 ) (Cursor, error) {
 	// Invalidate the previous root or nested result before any fallible bind or
 	// child execution. Query.RunInto performs the same reset later, but a
 	// subquery error happens before that call and must not leave a prior success
 	// looking like the failed execution's output.
-	e.Result.abortResult()
+	clearExecBorrowedViews(e)
+	if intermediateResource != "" {
+		// ResultRows and ResultBytes bound only the caller-visible result. A
+		// relation-valued child is instead bounded by the one statement frame;
+		// inheriting the outer limits changes valid LIMIT queries into failures.
+		e.Options.ResultRows = -1
+		e.Options.ResultBytes = -1
+	}
 	if len(args) != s.params {
 		return Cursor{}, fmt.Errorf(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
@@ -392,15 +411,43 @@ func (s *Statement) runIntoFrame(
 		return Cursor{}, err
 	}
 	if err := s.runSubqueries(e, src, args, frame); err != nil {
+		s.releaseSubqueries(frame)
 		s.releaseDerived(frame)
 		return Cursor{}, err
 	}
+	defer s.releaseSubqueries(frame)
 	if err := s.bind(args); err != nil {
 		s.releaseDerived(frame)
 		return Cursor{}, err
 	}
+	if intermediateResource != "" {
+		remaining := frame.intermediate.remaining()
+		if remaining == 0 {
+			s.releaseDerived(frame)
+			return Cursor{}, &IntermediateBudgetError{
+				Resource: intermediateResource,
+				Bytes:    saturatedBytes(frame.intermediate.used, 1),
+				Limit:    frame.intermediate.limit,
+			}
+		}
+		// Install the remainder immediately before final materialization. A
+		// deeper derived relation or predicate subquery may have consumed part
+		// of the allowance since this nested statement began.
+		e.Options.ResultBytes = remaining
+	}
 	if err := s.q.RunInto(e, runSource); err != nil {
 		s.releaseDerived(frame)
+		var resultErr *ResultBudgetError
+		if intermediateResource != "" && errors.As(err, &resultErr) &&
+			resultErr.ByteLimit == e.Options.ResultBytes {
+			return Cursor{}, &IntermediateBudgetError{
+				Resource: intermediateResource,
+				Bytes: saturatedBytes(
+					frame.intermediate.used, resultErr.Bytes,
+				),
+				Limit: frame.intermediate.limit,
+			}
+		}
 		return Cursor{}, err
 	}
 	return s.cursor(&e.Result), nil
@@ -476,69 +523,175 @@ func (s *Statement) runSubqueries(
 			return err
 		}
 		sub.exec.Options = parent.Options
-		remaining := frame.intermediate.remaining()
-		if remaining == 0 {
-			return &IntermediateBudgetError{
-				Resource: "predicate subquery result",
-				Bytes:    saturatedBytes(frame.intermediate.used, 1),
-				Limit:    frame.intermediate.limit,
-			}
-		}
-		if remaining > 0 {
-			// ResultBytes=0 means the default rather than an empty allowance, so
-			// install the positive remainder explicitly. The statement frame
-			// reserves the materialized result below before another subquery can
-			// consume the same bytes.
-			sub.exec.Options.ResultBytes = remaining
-		}
 		cursor, err := sub.stmt.runIntoFrame(
 			&sub.exec, nestedSource, args[base:base+n], frame,
+			"predicate subquery result",
 		)
 		if err != nil {
-			var resultErr *ResultBudgetError
-			if remaining > 0 && errors.As(err, &resultErr) &&
-				resultErr.ByteLimit == remaining {
-				return &IntermediateBudgetError{
-					Resource: "predicate subquery result",
-					Bytes:    saturatedBytes(frame.intermediate.used, resultErr.Bytes),
-					Limit:    frame.intermediate.limit,
-				}
-			}
 			return err
 		}
 		retained := sub.exec.Result.resultBytesUsed
 		if err := frame.intermediate.reserve("predicate subquery result", retained); err != nil {
 			return err
 		}
+		sub.resultBytes = retained
 		sub.preview = false
 		sub.exists = false
 		sub.hasNull = false
 		clear(sub.values)
 		sub.values = sub.values[:0]
-		sub.slots = reserve(sub.slots[:0], sub.exec.Result.RowCount)
-		sub.values = reserve(sub.values, sub.exec.Result.RowCount)
-		for cursor.Next() {
-			sub.exists = true
-			if sub.use == subqueryExists {
-				continue
+
+		rows, known, payload, hasNull, err := measureSubqueryValues(
+			&cursor, sub.use, parent.Options.Cancel,
+		)
+		if err != nil {
+			return err
+		}
+		sub.exists = rows != 0
+		sub.hasNull = hasNull
+		if sub.use == subqueryScalarUse && rows > 1 {
+			return &CardinalityViolationError{}
+		}
+		charge := predicateValuesRetainedBytes(known, payload)
+		if err := frame.intermediate.reserve(
+			"predicate subquery values", charge,
+		); err != nil {
+			return err
+		}
+		sub.activeBytes = charge
+		if known != 0 {
+			sub.slots = reserve(sub.slots[:0], known)[:known]
+			for slot := range sub.slots {
+				buf := sub.slots[slot].buf[:0]
+				sub.slots[slot] = subqueryScalar{buf: buf}
 			}
-			if sub.use == subqueryScalarUse && len(sub.slots) == 1 {
-				return &CardinalityViolationError{}
-			}
-			sub.slots = append(sub.slots, subqueryScalar{})
-			slot := &sub.slots[len(sub.slots)-1]
-			value, known, err := scalarFromCell(slot, cursor.Cell(0))
-			if err != nil {
+			sub.values = reserve(sub.values, known)
+			cursor = sub.stmt.cursor(&sub.exec.Result)
+			if err := materializeSubqueryValues(
+				sub, &cursor, parent.Options.Cancel,
+			); err != nil {
 				return err
 			}
-			if !known {
-				sub.hasNull = true
-				continue
-			}
-			sub.values = append(sub.values, value)
+		} else {
+			sub.slots = sub.slots[:0]
 		}
+		// Predicate values now own every variable-width byte. Drop the child
+		// Result, its borrowed workspace views, and any derived spool before
+		// evaluating the next sibling subquery.
+		s.releaseSubqueryResult(sub, frame)
 	}
 	return nil
+}
+
+func measureSubqueryValues(
+	cursor *Cursor,
+	use subqueryUse,
+	cancel *CancelFlag,
+) (rows, known int, payload int64, hasNull bool, err error) {
+	for {
+		var next bool
+		next, err = cursor.nextWithCancel(cancel)
+		if err != nil || !next {
+			return
+		}
+		rows++
+		if use == subqueryExists {
+			continue
+		}
+		cell := cursor.Cell(0)
+		switch cell.Kind() {
+		case TypeNull:
+			hasNull = true
+		case TypeBool:
+			known++
+		case TypeNumber:
+			known++
+			if _, integer := cell.Int64(); !integer {
+				payload = saturatedBytes(
+					payload, int64(encodedCellJSONBytes(cell)),
+				)
+			}
+		case TypeString:
+			known++
+			text, _ := cell.Text()
+			payload = saturatedBytes(payload, int64(len(text)))
+		default:
+			err = fmt.Errorf(
+				"query: a subquery predicate requires scalar values, got %v",
+				cell.Kind(),
+			)
+			return
+		}
+	}
+}
+
+func materializeSubqueryValues(
+	sub *statementSubquery,
+	cursor *Cursor,
+	cancel *CancelFlag,
+) error {
+	slot := 0
+	for {
+		next, err := cursor.nextWithCancel(cancel)
+		if err != nil {
+			return err
+		}
+		if !next {
+			return nil
+		}
+		if cursor.Cell(0).Kind() == TypeNull {
+			continue
+		}
+		value, known, err := scalarFromCell(&sub.slots[slot], cursor.Cell(0))
+		if err != nil {
+			return err
+		}
+		if !known {
+			continue
+		}
+		sub.values = append(sub.values, value)
+		slot++
+	}
+}
+
+func (s *Statement) releaseSubqueryResult(
+	sub *statementSubquery,
+	frame *statementFrame,
+) {
+	clearExecBorrowedViews(&sub.exec)
+	sub.stmt.releaseDerived(frame)
+	frame.intermediate.release(sub.resultBytes)
+	sub.resultBytes = 0
+}
+
+func (s *Statement) releaseSubqueries(frame *statementFrame) {
+	if s.nested == nil {
+		return
+	}
+	for i := range s.nested.subqueries {
+		sub := &s.nested.subqueries[i]
+		s.releaseSubqueryResult(sub, frame)
+		frame.intermediate.release(sub.activeBytes)
+		sub.activeBytes = 0
+		clear(sub.values)
+		sub.values = sub.values[:0]
+		for slot := range sub.slots {
+			buf := sub.slots[slot].buf[:0]
+			sub.slots[slot] = subqueryScalar{buf: buf}
+		}
+		sub.slots = sub.slots[:0]
+		sub.hasNull = false
+		sub.exists = false
+	}
+}
+
+func clearExecBorrowedViews(e *Exec) {
+	e.Result.abortResult()
+	e.Workspace.clearBorrowedViews()
+	e.Workspace.resetJoinBindings()
+	for i := range e.file.workers {
+		e.file.workers[i].clearBorrowedViews()
+	}
 }
 
 func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
@@ -557,7 +710,9 @@ func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
 		slot.n = Number(byteview.String(slot.buf))
 		return &slot.n, true, nil
 	case TypeString:
-		slot.s, _ = cell.Text()
+		text, _ := cell.Text()
+		slot.buf = append(slot.buf[:0], text...)
+		slot.s = byteview.String(slot.buf)
 		return &slot.s, true, nil
 	default:
 		return nil, false, fmt.Errorf(
@@ -664,12 +819,26 @@ func NewTextCursor(header, text string) Cursor {
 
 // Next advances to the next surviving row, reporting false at the end.
 func (c *Cursor) Next() bool {
+	next, _ := c.nextWithCancel(nil)
+	return next
+}
+
+// nextWithCancel is Next for internal relation materializers. It checks the
+// underlying result-row loop, including rows HAVING rejects, so cancellation
+// latency is bounded even when no row is ever yielded to the caller.
+func (c *Cursor) nextWithCancel(cancel *CancelFlag) (bool, error) {
 	if c.res == nil || c.left == 0 {
-		return false
+		return false, nil
+	}
+	if err := cancellationError(cancel); err != nil {
+		return false, err
 	}
 	for c.row < c.res.RowCount {
 		row := c.row
 		c.row++
+		if err := cancellationCheckpoint(cancel, row); err != nil {
+			return false, err
+		}
 		if !c.st.having.keep(c.res, row) {
 			continue
 		}
@@ -681,10 +850,10 @@ func (c *Cursor) Next() bool {
 		if c.left > 0 {
 			c.left--
 		}
-		return true
+		return true, nil
 	}
 	c.cur = -1
-	return false
+	return false, nil
 }
 
 // Cell returns the value of output column col in the current row. Calling it

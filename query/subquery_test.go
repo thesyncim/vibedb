@@ -156,7 +156,15 @@ func TestSQLScalarSubqueryRejectsMultipleRows(t *testing.T) {
 		t.Fatalf("cardinality error message = %q, want useful scalar-subquery context",
 			violation.Error())
 	}
-	if got := stmt.nested.subqueries[0].exec.Result.RowCount; got != 2 {
+	var nested Exec
+	if _, nestedErr := stmt.nested.subqueries[0].stmt.RunInto(
+		&nested,
+		FromDatabase(catalog, stmt.nested.subqueries[0].stmt.Collection()),
+		nil,
+	); nestedErr != nil {
+		t.Fatal(nestedErr)
+	}
+	if got := nested.Result.RowCount; got != 2 {
 		t.Fatalf("scalar nested rows = %d, want the two-row cardinality cap", got)
 	}
 }
@@ -173,7 +181,15 @@ func TestSQLExistsStopsAfterOneNestedRow(t *testing.T) {
 	if _, err := stmt.RunInto(&exec, FromDatabase(catalog, "orders"), nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := stmt.nested.subqueries[0].exec.Result.RowCount; got != 1 {
+	var nested Exec
+	if _, err := stmt.nested.subqueries[0].stmt.RunInto(
+		&nested,
+		FromDatabase(catalog, stmt.nested.subqueries[0].stmt.Collection()),
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := nested.Result.RowCount; got != 1 {
 		t.Fatalf("EXISTS nested rows = %d, want one-row early stop", got)
 	}
 }

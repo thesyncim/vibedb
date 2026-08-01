@@ -2,6 +2,7 @@ package query
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -60,6 +61,25 @@ func TestSQLDerivedTableExecutesAsRelation(t *testing.T) {
 				`) inner_d WHERE inner_d.id <> 'c1'` +
 				`) outer_d`,
 			want: "4:\"c3\"|",
+		},
+		{
+			name: "nested placeholder and predicate scopes",
+			sql: `SELECT outer_d.id FROM (` +
+				`SELECT inner_d.id FROM (` +
+				`SELECT id, tier FROM customers WHERE tier = ?` +
+				`) inner_d WHERE inner_d.id <> ? AND inner_d.id IN (` +
+				`SELECT customer FROM orders WHERE id = ?` +
+				`)` +
+				`) outer_d WHERE outer_d.id <> ?`,
+			args: []any{"pro", "missing", "o1", "missing"},
+			want: "4:\"c1\"|",
+		},
+		{
+			name: "child aggregate and outer wildcard",
+			sql: `SELECT d.* FROM (` +
+				`SELECT tier, COUNT(*) AS n FROM customers GROUP BY tier` +
+				`) d ORDER BY d.tier`,
+			want: "4:\"free\"|3:1|\n4:\"pro\"|3:2|",
 		},
 	}
 	for _, test := range tests {
@@ -235,5 +255,165 @@ func TestSQLDerivedTableWarmExecutionIsAllocationFree(t *testing.T) {
 	run()
 	if got := testing.AllocsPerRun(50, run); got != 0 {
 		t.Fatalf("warmed derived execution allocated %.1f times per run, want 0", got)
+	}
+}
+
+func TestSQLDerivedTableIntermediateOutputIgnoresFinalResultLimits(t *testing.T) {
+	catalog := subqueryDatabase(t)
+	for _, test := range []struct {
+		name    string
+		options ExecOptions
+	}{
+		{
+			name:    "row limit",
+			options: ExecOptions{ResultRows: 1},
+		},
+		{
+			name: "byte limit with unlimited intermediate budget",
+			options: ExecOptions{
+				ResultBytes:       128,
+				IntermediateBytes: -1,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stmt, err := PrepareStatement(
+				`SELECT d.id FROM (` +
+					`SELECT id FROM customers ORDER BY id` +
+					`) d LIMIT 1`,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stmt.Release()
+			var exec Exec
+			exec.Options = test.options
+			cursor, err := stmt.RunInto(
+				&exec, FromDatabase(catalog, stmt.Collection()), nil,
+			)
+			if err != nil {
+				t.Fatalf("RunInto: %v", err)
+			}
+			if !cursor.Next() || cursor.Cell(0).String() != `"c1"` || cursor.Next() {
+				t.Fatal("outer LIMIT 1 did not return exactly the first derived row")
+			}
+		})
+	}
+}
+
+func TestSQLDerivedTableInvalidIntermediateOptionInvalidatesPriorResult(t *testing.T) {
+	catalog := subqueryDatabase(t)
+	stmt, err := PrepareStatement(
+		`SELECT d.id FROM (SELECT id FROM customers WHERE id = 'c1') d`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Release()
+	var exec Exec
+	stale, err := stmt.RunInto(
+		&exec, FromDatabase(catalog, stmt.Collection()), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec.Options.IntermediateBytes = -2
+	if _, err := stmt.RunInto(
+		&exec, FromDatabase(catalog, stmt.Collection()), nil,
+	); err == nil {
+		t.Fatal("invalid IntermediateBytes succeeded")
+	}
+	staleNext := stale.Next()
+	if exec.Result.RowCount != 0 || staleNext {
+		t.Fatalf("failed execution exposed prior result: rows=%d stale.Next=%t",
+			exec.Result.RowCount, staleNext)
+	}
+}
+
+func TestSQLDerivedTableLargePayloadWarmExecutionIsAllocationFree(t *testing.T) {
+	var database store.Database
+	docs, err := database.CreateCollection("docs", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Repeat("x", 4096)
+	if _, err := docs.Put("one", []byte(fmt.Sprintf(`{"value":%q}`, payload))); err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := PrepareStatement(
+		`SELECT d.value FROM (SELECT value FROM docs) d`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Release()
+	var exec Exec
+	defer exec.Release()
+	source := FromDatabase(database.Snapshot(), stmt.Collection())
+	run := func() {
+		cursor, err := stmt.RunInto(&exec, source, nil)
+		if err != nil {
+			panic(err)
+		}
+		for cursor.Next() {
+			sqlSink += len(cursor.Cell(0).Payload())
+		}
+	}
+	run()
+	run()
+	if got := testing.AllocsPerRun(50, run); got != 0 {
+		t.Fatalf("warmed large derived payload allocated %.1f times per run, want 0", got)
+	}
+}
+
+func TestSQLNestedDerivedResultFailsBeforeGrowthAgainstLiveSpool(t *testing.T) {
+	catalog := subqueryDatabase(t)
+	const text = `SELECT outer_d.a FROM (` +
+		`SELECT inner_d.id AS a, inner_d.id AS b FROM (` +
+		`SELECT id FROM customers` +
+		`) inner_d` +
+		`) outer_d`
+
+	probe, err := PrepareStatement(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	middle := probe.derived().stmt
+	var middleExec Exec
+	if _, err := middle.RunInto(
+		&middleExec, FromDatabase(catalog, middle.Collection()), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	spoolBytes := middle.derived().activeBytes
+	resultBytes := middleExec.Result.resultBytesUsed
+	resultShape := 2*resultColumnBytes + 6*resultCellBytes
+	probe.Release()
+	if spoolBytes <= 0 || resultBytes <= 0 {
+		t.Fatalf("probe charges = spool %d result %d, want positive", spoolBytes, resultBytes)
+	}
+
+	stmt, err := PrepareStatement(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Release()
+	var exec Exec
+	// Leave one byte less than the middle result's fixed shape after its live
+	// child spool. A stale limit captured before that spool existed would admit
+	// the whole middle result and fail only at the parent's later reservation.
+	exec.Options.IntermediateBytes = spoolBytes + resultShape - 1
+	_, err = stmt.RunInto(
+		&exec, FromDatabase(catalog, stmt.Collection()), nil,
+	)
+	var budgetErr *IntermediateBudgetError
+	if !errors.As(err, &budgetErr) || budgetErr.Resource != "derived query result" {
+		t.Fatalf("RunInto error = %#v, want derived result budget", err)
+	}
+	if grown := len(stmt.derived().exec.Result.Columns); grown != 0 {
+		t.Fatalf("rejected nested result grew %d result columns before admission", grown)
+	}
+	if stmt.derived().stmt.derived().activeBytes != 0 {
+		t.Fatal("rejected nested result left its child spool active")
 	}
 }

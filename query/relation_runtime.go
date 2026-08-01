@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"unsafe"
 )
 
 // DefaultIntermediateBytes is the statement-wide logical storage allowance
@@ -127,4 +128,19 @@ func relationRetainedBytes(encoded int) int64 {
 		return math.MaxInt64
 	}
 	return int64(encoded)*expansion + rowBytes
+}
+
+// predicateValuesRetainedBytes accounts the owned scalar slots and interface
+// vector a predicate subquery keeps while the outer plan is compiled and run.
+// payload is decoded string or exact non-integer number storage copied out of
+// the child Result. The count is checked before either backing slice grows.
+func predicateValuesRetainedBytes(known int, payload int64) int64 {
+	if known < 0 || payload < 0 {
+		return math.MaxInt64
+	}
+	perValue := int64(unsafe.Sizeof(subqueryScalar{})) +
+		int64(unsafe.Sizeof(any(nil)))
+	return saturatedBytes(
+		saturatedProduct(int64(known), perValue), payload,
+	)
 }
