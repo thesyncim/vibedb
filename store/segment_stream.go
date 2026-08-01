@@ -313,7 +313,7 @@ func (s *Segment) readDocSlow(d *segmentStream, start int, pos *int) error {
 			// truncated bytes it left behind, is the cause worth reporting.
 			err = d.readErr
 		}
-		return fmt.Errorf("vibejson: invalid document at input offset %d: %w", d.offset(start), err)
+		return fmt.Errorf("vibedb: invalid document at input offset %d: %w", d.offset(start), err)
 	}
 	built := len(index.Entries)
 	if ref.Rec != nil {

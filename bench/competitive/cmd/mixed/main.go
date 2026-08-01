@@ -478,7 +478,7 @@ func main() {
 	check(err)
 
 	reportName := factory.Name
-	if factory.Name == "vibejson-durable" {
+	if factory.Name == "vibedb" {
 		if *putloop {
 			reportName += "/put"
 		} else {
@@ -518,7 +518,7 @@ func main() {
 		if durableOK {
 			fmt.Fprintf(
 				os.Stderr,
-				"vibejson-internal clients=%d overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d device-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
+				"vibedb-internal clients=%d overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d device-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
 				*clients,
 				durableAfter.PrimaryOverlayFolds-durableBefore.PrimaryOverlayFolds,
 				durableAfter.ConcurrentPrimaryFallbacks-durableBefore.ConcurrentPrimaryFallbacks,

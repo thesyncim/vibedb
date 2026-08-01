@@ -165,7 +165,7 @@ func (in *ValueInterner) insert(hash uint32, value string) uint32 {
 		// Table slots store id+1 in a uint32; the arena alone makes this
 		// unreachable in practice, so the guard only pins the invariant that a
 		// dictionary identifier round-trips through a uint32 value reference.
-		panic("vibejson: ValueInterner exceeds 32-bit identifiers")
+		panic("vibedb: ValueInterner exceeds 32-bit identifiers")
 	}
 	if (len(in.values)+1)*4 >= len(in.table)*3 {
 		in.grow()

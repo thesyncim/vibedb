@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -106,6 +107,92 @@ func TestCollectionRetirementBackpressureRecovers(t *testing.T) {
 		}
 		if string(got) != string(benchDocument(i)) {
 			t.Fatalf("read %d returned %s", i, got)
+		}
+	}
+}
+
+func TestCollectionRetirementBackpressureReportsDirectCurrentScan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "direct-pressure.vibe")
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	collection, err := Create(file, Options{
+		Collection: store.Options{ChunkDocuments: 16}, ResidentBytes: 64 << 20,
+		Backend: BackendPortable, Durability: DurabilityAsyncVisible,
+		MaxRetiredExtents: 1024, MaxBatchDocuments: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+	const keys = 32
+	for index := range keys {
+		if _, err := collection.Put(
+			[]byte(fmt.Sprintf("key-%09d", index)), benchDocument(index),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCallback) }) })
+	scanDone := make(chan error, 1)
+	go func() {
+		scanDone <- collection.RangeRawCurrent(func([]byte, []byte) error {
+			enteredOnce.Do(func() { close(callbackEntered) })
+			<-releaseCallback
+			return nil
+		})
+	}()
+	awaitConcurrentPrimary(t, callbackEntered, "retirement-pressure current scan")
+	current := collection.Generation()
+	if leases := collection.leases.Stats(current); leases.Active != 0 {
+		t.Fatalf("direct-scan fixture has %d snapshot leases, want 0", leases.Active)
+	}
+	if epochs := collection.readEpochs.Stats(current); epochs.Active != 1 {
+		t.Fatalf("direct-scan fixture epochs = %+v, want one", epochs)
+	}
+
+	var failure error
+	accepted := 0
+	for index := range 5000 {
+		if _, err := collection.Put(
+			[]byte(fmt.Sprintf("key-%09d", index%keys)), benchDocument(index),
+		); err != nil {
+			failure = err
+			break
+		}
+		accepted++
+	}
+	if failure == nil || !errors.Is(failure, storeio.ErrRetiredExtentCapacity) {
+		t.Fatalf("direct scan pressure after %d writes = %v, want retired capacity",
+			accepted, failure)
+	}
+	for _, want := range []string{"direct read", "generation", "MaxRetiredExtents"} {
+		if !strings.Contains(failure.Error(), want) {
+			t.Fatalf("direct pressure error %q does not contain %q", failure, want)
+		}
+	}
+	if collection.Stats().RetirementPressureCheckpoints == 0 {
+		t.Fatal("direct-reader pressure skipped checkpoint/retry")
+	}
+
+	releaseOnce.Do(func() { close(releaseCallback) })
+	if err := awaitConcurrentPrimary(
+		t, scanDone, "retirement-pressure current scan release",
+	); err != nil {
+		t.Fatal(err)
+	}
+	for index := range keys {
+		if _, err := collection.Put(
+			[]byte(fmt.Sprintf("key-%09d", index)), benchDocument(index),
+		); err != nil {
+			t.Fatalf("write %d still fails after direct scan release: %v", index, err)
 		}
 	}
 }

@@ -73,7 +73,7 @@ func (r VerifyReport) OK() bool { return len(r.Findings) == 0 }
 func Verify(file *os.File) (VerifyReport, error) {
 	report := VerifyReport{RootSlot: -1, PageCounts: map[string]int{}}
 	if file == nil {
-		return report, fmt.Errorf("vibejson: verify requires a non-nil file")
+		return report, fmt.Errorf("vibedb: verify requires a non-nil file")
 	}
 	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(file)
 	if err != nil {
@@ -822,12 +822,12 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 	var report SalvageReport
 	if src == nil || out == nil {
 		return report, fmt.Errorf(
-			"vibejson: salvage requires non-nil source and output files",
+			"vibedb: salvage requires non-nil source and output files",
 		)
 	}
 	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(src)
 	if err != nil {
-		return report, fmt.Errorf("vibejson: salvage cannot read geometry: %w", err)
+		return report, fmt.Errorf("vibedb: salvage cannot read geometry: %w", err)
 	}
 	pageSize := bootstrap.PageSize
 	info, err := src.Stat()
@@ -835,7 +835,7 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 		return report, err
 	}
 	if info.Size() < 0 {
-		return report, fmt.Errorf("vibejson: salvage source has no content")
+		return report, fmt.Errorf("vibedb: salvage source has no content")
 	}
 	fileSize := uint64(info.Size())
 	// Bounds are physical: floor the file to the page quantum so a torn tail
@@ -930,7 +930,7 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 		)
 		if err != nil {
 			return report, fmt.Errorf(
-				"vibejson: salvage re-open unified leaf: %w", err,
+				"vibedb: salvage re-open unified leaf: %w", err,
 			)
 		}
 		report.BucketsKept++
@@ -938,7 +938,7 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			key, body, overflow, ok := uv.RowRawAt(rank)
 			if !ok {
 				return report, fmt.Errorf(
-					"vibejson: salvage unified row %d", rank,
+					"vibedb: salvage unified row %d", rank,
 				)
 			}
 			if overflow {
@@ -948,7 +948,7 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			value, rendered := uv.AppendRowBody(nil, body)
 			if !rendered {
 				return report, fmt.Errorf(
-					"vibejson: salvage unified row body %d", rank,
+					"vibedb: salvage unified row body %d", rank,
 				)
 			}
 			records = append(records, salvagedRecord{

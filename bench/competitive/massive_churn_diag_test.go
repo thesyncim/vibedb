@@ -51,7 +51,7 @@ func TestMassiveChurnDiag(t *testing.T) {
 		GroupLimit:         64,
 	}
 	dir := t.TempDir()
-	path := filepath.Join(dir, "vibejson.db")
+	path := filepath.Join(dir, "vibedb.db")
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		t.Fatal(err)

@@ -234,27 +234,40 @@ func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
 }
 
 func (t *tx) execMutation(statement *query.DMLStatement, args []any) (sqldriver.Result, error) {
-	return t.execMutationCore(statement, args, nil, nil)
+	return t.execMutationContext(backgroundContext, statement, args)
 }
 
-func (t *tx) execMutationReturning(
+func (t *tx) execMutationContext(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+) (sqldriver.Result, error) {
+	return t.execMutationCore(ctx, statement, args, nil, nil)
+}
+
+func (t *tx) execMutationReturningContext(
+	ctx context.Context,
 	statement *query.DMLStatement,
 	args []any,
 	returning *query.Statement,
 ) (query.Cursor, error) {
 	var cursor query.Cursor
 	_, err := t.execMutationCore(
-		statement, args, returning, &cursor,
+		ctx, statement, args, returning, &cursor,
 	)
 	return cursor, err
 }
 
 func (t *tx) execMutationCore(
+	ctx context.Context,
 	statement *query.DMLStatement,
 	args []any,
 	returning *query.Statement,
 	returned *query.Cursor,
 ) (sqldriver.Result, error) {
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
 	if t.done {
 		return nil, errors.New("vibedb: transaction is finished")
 	}
@@ -308,7 +321,14 @@ func (t *tx) execMutationCore(
 		seen := make(map[string]struct{}, len(tree.Rows))
 		scratch := t.conn.pointRaw[:0]
 		prospectiveBytes := state.stagedBytes
+		cancellable := ctx.Done() != nil
 		for i := range tree.Rows {
+			if cancellable {
+				if err := contextCheckpoint(ctx); err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+			}
 			document, key, err := resolveInsertRow(
 				statement, tree, &tree.Rows[i], args,
 				state.primaryKey, state.primary, limits,
@@ -369,7 +389,7 @@ func (t *tx) execMutationCore(
 			return nil, durable.ErrDocumentTooLarge
 		}
 		keys, err := t.conn.matchingKeysTransaction(
-			statement, args, state, len(document))
+			ctx, statement, args, state, len(document))
 		if err != nil {
 			return nil, err
 		}
@@ -395,7 +415,7 @@ func (t *tx) execMutationCore(
 		}
 	case query.DMLDelete:
 		keys, err := t.conn.matchingKeysTransaction(
-			statement, args, state, 0)
+			ctx, statement, args, state, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -432,7 +452,7 @@ func (t *tx) execMutationCore(
 			)
 		}
 	}
-	if err := t.resolveStagedMutations(state, staged); err != nil {
+	if err := t.resolveStagedMutationsContext(ctx, state, staged); err != nil {
 		return nil, err
 	}
 	if returning != nil {
@@ -468,6 +488,9 @@ func (t *tx) execMutationCore(
 		}
 		*returned = cursor
 	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
 	t.applyResolvedMutations(state, staged)
 	if len(staged) != 0 {
 		t.writeTable = tableName
@@ -480,6 +503,7 @@ func (t *tx) execMutationCore(
 // point reads; every other predicate streams the merged view once. No heap
 // collection proportional to the base table is built.
 func (c *conn) matchingKeysTransaction(
+	ctx context.Context,
 	statement *query.DMLStatement,
 	args []any,
 	state *txTable,
@@ -524,7 +548,14 @@ func (c *conn) matchingKeysTransaction(
 		selector := newMutationKeySelector(window, state.limits.MaxBatchDocuments)
 		selector.keys = c.matchKeys[:0]
 		scratch := c.pointRaw[:0]
+		cancellable := ctx.Done() != nil
 		for _, key := range keys {
+			if cancellable {
+				if err := contextCheckpoint(ctx); err != nil {
+					c.pointRaw = scratch
+					return nil, err
+				}
+			}
 			var found bool
 			scratch, found, err = state.appendRaw(scratch[:0], key)
 			if err != nil {
@@ -701,7 +732,23 @@ func (t *tx) resolveStagedMutations(
 	state *txTable,
 	staged []stagedTxMutation,
 ) error {
+	return t.resolveStagedMutationsContext(
+		backgroundContext, state, staged,
+	)
+}
+
+func (t *tx) resolveStagedMutationsContext(
+	ctx context.Context,
+	state *txTable,
+	staged []stagedTxMutation,
+) error {
+	cancellable := ctx.Done() != nil
 	for i := range staged {
+		if cancellable {
+			if err := contextCheckpoint(ctx); err != nil {
+				return err
+			}
+		}
 		mutation := &staged[i]
 		if entry, present := state.pending[mutation.key]; present {
 			mutation.existed = entry.existed

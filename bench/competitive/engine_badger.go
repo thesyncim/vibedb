@@ -113,7 +113,7 @@ func (b *badgerEngine) Durability() string {
 		// unix.Msync(MS_SYNC) (ristretto/z/mmap_unix.go), which pushes dirty
 		// pages to the filesystem but does not force the drive to flush its
 		// write cache. bbolt and Pebble issue plain fsync and have the same
-		// limitation. vibejson explicitly issues F_FULLFSYNC, and SQLite is
+		// limitation. VibeDB explicitly issues F_FULLFSYNC, and SQLite is
 		// given PRAGMA fullfsync to match it. Badger exposes no option to
 		// request F_FULLFSYNC, so its sync=true row is not comparable with
 		// those two crash-safe rows.

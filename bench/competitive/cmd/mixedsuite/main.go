@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultEngines = "vibejson-durable,bbolt,badger,pebble,sqlite"
+	defaultEngines = "vibedb,bbolt,badger,pebble,sqlite"
 	defaultSeed    = int64(0x51C5B)
 )
 
@@ -424,7 +424,7 @@ func validateMixedRows(cfg config, requested string, header []string, rows []raw
 	for _, row := range rows {
 		gotEngine := row.values[engineAt]
 		engineMatches := gotEngine == requested
-		if requested == "vibejson-durable" {
+		if requested == "vibedb" {
 			engineMatches = engineMatches ||
 				strings.HasPrefix(gotEngine, requested+"/")
 		}

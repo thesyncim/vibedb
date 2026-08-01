@@ -10,15 +10,15 @@ import (
 var (
 	// ErrLeaseCapacity applies bounded backpressure when every configured
 	// snapshot-generation lease is active.
-	ErrLeaseCapacity = errors.New("vibejson: Store snapshot lease capacity exhausted")
+	ErrLeaseCapacity = errors.New("vibedb: Store snapshot lease capacity exhausted")
 	// ErrGenerationLeasesClosed reports acquisition after shutdown starts.
-	ErrGenerationLeasesClosed = errors.New("vibejson: Store snapshot leases are closed")
+	ErrGenerationLeasesClosed = errors.New("vibedb: Store snapshot leases are closed")
 	// ErrLeasesActive reports an attempted close while readers still protect
 	// generations and their physical extents.
-	ErrLeasesActive = errors.New("vibejson: Store snapshot leases are still active")
+	ErrLeasesActive = errors.New("vibedb: Store snapshot leases are still active")
 	// ErrRetiredExtentCapacity reports that reclamation metadata reached its
 	// configured bound before readers or recovery roots released old extents.
-	ErrRetiredExtentCapacity = errors.New("vibejson: Store retired extent capacity exhausted")
+	ErrRetiredExtentCapacity = errors.New("vibedb: Store retired extent capacity exhausted")
 )
 
 // GenerationLeaseOptions fixes snapshot tracking memory at construction.
@@ -54,13 +54,12 @@ type GenerationLeaseStats struct {
 // lifetime independent of Go GC timing and let copy-on-write reclamation prove
 // that no reader can still dereference a retired extent.
 type GenerationLeases struct {
-	mu              sync.Mutex
-	slots           []generationLeaseSlot
-	free            []uint32
-	next            uint64
-	observedThrough uint64
-	closing         bool
-	closed          bool
+	mu      sync.Mutex
+	slots   []generationLeaseSlot
+	free    []uint32
+	next    uint64
+	closing bool
+	closed  bool
 }
 
 // NewGenerationLeases allocates the complete fixed lease table.
@@ -82,18 +81,9 @@ func NewGenerationLeases(options GenerationLeaseOptions) (*GenerationLeases, err
 // GenerationLease is a single-owner snapshot token. Do not copy it after
 // first use. Release is idempotent for one value.
 type GenerationLease struct {
-	owner      *GenerationLeases
-	index      uint32
-	generation uint64
-	token      uint64
-}
-
-// Generation returns the protected immutable Store generation.
-func (l *GenerationLease) Generation() uint64 {
-	if l == nil || l.owner == nil {
-		return 0
-	}
-	return l.generation
+	owner *GenerationLeases
+	index uint32
+	token uint64
 }
 
 // Release stops protecting the generation.
@@ -104,7 +94,6 @@ func (l *GenerationLease) Release() {
 	owner := l.owner
 	owner.release(l.index, l.token)
 	l.owner = nil
-	l.generation = 0
 	l.token = 0
 }
 
@@ -131,10 +120,7 @@ func (l *GenerationLeases) Acquire(generation uint64) (GenerationLease, error) {
 	}
 	token := l.next
 	l.slots[index] = generationLeaseSlot{generation: generation, token: token, active: true}
-	if generation > l.observedThrough {
-		l.observedThrough = generation
-	}
-	return GenerationLease{owner: l, index: index, generation: generation, token: token}, nil
+	return GenerationLease{owner: l, index: index, token: token}, nil
 }
 
 func (l *GenerationLeases) release(index uint32, token uint64) {
@@ -181,51 +167,6 @@ func (l *GenerationLeases) AnyActive() bool {
 	return active
 }
 
-// SafeFromSnapshots reports whether a page first published at generation can
-// be unreachable from every currently active reader. A lease can retain a page
-// whose generation is less than or equal to its own, so safety requires every
-// active lease generation to be strictly less than generation. Equality is
-// unsafe.
-//
-// The lease table retains two constant-size summaries under the same mutex as
-// its slots. No active lease, or a page born after the newest generation ever
-// handed to a lease, proves safety without walking the fixed slot table. Only
-// an active historical reader needs the exact bounded scan. Keeping the
-// summary here, instead of beside the public Snapshot API, includes temporary
-// reader leases such as current-state point lookups.
-//
-// The result is linearized with Acquire and Release by the lease mutex. It is
-// a point-in-time observation: a writer that needs safety to remain true while
-// it materializes or rewrites storage must already prevent new lease
-// acquisition with its publication gate and keep that gate held through the
-// operation. This method does not cover alternate recovery roots or page-cache
-// pins, which have separate ownership fences.
-//
-// Generation zero is never a valid page generation and returns false. A nil
-// table has no active snapshots and returns true for every non-zero generation.
-func (l *GenerationLeases) SafeFromSnapshots(generation uint64) bool {
-	if generation == 0 {
-		return false
-	}
-	if l == nil {
-		return true
-	}
-	l.mu.Lock()
-	if len(l.free) == len(l.slots) || generation > l.observedThrough {
-		l.mu.Unlock()
-		return true
-	}
-	safe := true
-	for i := range l.slots {
-		if l.slots[i].active && l.slots[i].generation >= generation {
-			safe = false
-			break
-		}
-	}
-	l.mu.Unlock()
-	return safe
-}
-
 // Stats returns bounded lease usage and the current reclamation floor.
 func (l *GenerationLeases) Stats(current uint64) GenerationLeaseStats {
 	if l == nil {
@@ -245,6 +186,29 @@ func (l *GenerationLeases) Stats(current uint64) GenerationLeaseStats {
 	}
 	l.mu.Unlock()
 	return stats
+}
+
+// BeginClose rejects new leases while retaining existing ones. It is separate
+// from Close so collection shutdown can establish reader admission before it
+// performs persistence work, then test quiescence at final teardown.
+func (l *GenerationLeases) BeginClose() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.closing = true
+	l.mu.Unlock()
+}
+
+// Closing reports whether BeginClose has rejected future acquisitions.
+func (l *GenerationLeases) Closing() bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	closing := l.closing || l.closed
+	l.mu.Unlock()
+	return closing
 }
 
 // Close prevents new leases. It returns ErrLeasesActive until every existing

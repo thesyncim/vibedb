@@ -11,10 +11,10 @@ var (
 	// target is absent, loading, dirty, or pinned. The caller must use its
 	// ordinary copy-on-write path; it must never wait while holding the
 	// publication gate.
-	ErrCanonicalPageBusy = errors.New("vibejson: canonical Store page is not exclusively writable")
+	ErrCanonicalPageBusy = errors.New("vibedb: canonical Store page is not exclusively writable")
 	// ErrCanonicalPageChanged reports that the resident page no longer equals
 	// the before-image used to construct a materialization transaction.
-	ErrCanonicalPageChanged = errors.New("vibejson: canonical Store page changed during materialization")
+	ErrCanonicalPageChanged = errors.New("vibedb: canonical Store page changed during materialization")
 )
 
 // ReplaceCanonicalDirty atomically swaps one clean, unpinned resident page to

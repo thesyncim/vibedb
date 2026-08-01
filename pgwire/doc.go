@@ -1,5 +1,6 @@
-// Package pgwire serves vibedb's SQL surface over the PostgreSQL frontend
-// and backend protocol, version 3.0, implemented from the specification.
+// Package pgwire provides an experimental PostgreSQL wire-protocol endpoint supporting a documented SQL subset.
+// It implements frontend/backend protocol version 3.0 from the specification;
+// it does not claim PostgreSQL SQL or catalog compatibility.
 //
 //	db, err := driver.Open("/data/app.vdb")
 //	if err != nil {
@@ -44,12 +45,13 @@
 // JDBC's DatabaseMetaData, of every ORM's schema reflection, and of every BI
 // tool's table browser, and those still fail here.
 //
-// psql's own basic meta-commands are the one bounded exception. Stock psql
-// builds its catalog queries from fixed templates, so the exact texts it
+// psql's own basic meta-commands are the one bounded exception. The pinned
+// PostgreSQL 18.4 psql client builds its catalog queries from fixed templates, so the exact texts it
 // emits for \l, \dn, \dt, \di, \d, and \d <name> are knowable in advance, and
 // this server recognizes those texts and answers each
 // whole query from the SQL catalog without evaluating any of the SQL inside
-// it; \df, \du, and \dv are recognized and honestly empty. The recognition
+// it; \d <name> currently accepts a bare ASCII identifier of at most 128
+// bytes, and \df, \du, and \dv are recognized and honestly empty. The recognition
 // runs only after the SQL front end has already refused the statement, so a
 // query the dialect accepts never pays for it and an unrecognized query keeps
 // the front end's original error unchanged — catalog_shim.go carries the full
@@ -93,9 +95,10 @@
 //   - CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
 //     DELETE, SELECT, one declared-field inner JOIN, schema validation, exact
 //     indexes, whole-document parameters, and affected-row command tags.
-//   - Stock psql's basic introspection meta-commands
+//   - The pinned PostgreSQL 18.4 psql client's basic introspection meta-commands
 //     — \l, \dn, \dt, \di, \d, and \d <name> — answered from the SQL catalog
-//     by the post-parse-failure recognition shim in catalog_shim.go; \df,
+//     by the post-parse-failure recognition shim in catalog_shim.go. The name
+//     capture is a bare ASCII identifier of at most 128 bytes; \df,
 //     \du, and \dv are recognized and honestly empty.
 //   - Explicit BEGIN/COMMIT/ROLLBACK with ReadyForQuery I/T/E state,
 //     read-your-writes, rollback, failed-transaction behavior, read-only mode,
@@ -122,6 +125,9 @@
 //     fails with the parser's refusal.
 //   - COPY, the function-call subprotocol, LISTEN/NOTIFY, cursors (DECLARE and
 //     FETCH), SQL-level PREPARE/EXECUTE, and replication.
+//   - EXPLAIN and EXPLAIN ANALYZE return one JSON QUERY PLAN row for the
+//     documented SELECT subset. The report is VibeDB's stable plan schema, not
+//     PostgreSQL's textual plan format.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
 //   - The SQL constructs the dialect itself refuses — correlated and FROM-list
@@ -285,12 +291,16 @@
 // the session arms the query executor's reusable atomic CancelFlag only while
 // a Query, Execute, or transaction-finalizing Sync is active. A request which
 // arrives while the backend is idle is ignored rather than retained to cancel
-// the next command. Heap and durable scans, parallel workers, joins, filtered
-// DML, and spill I/O check the flag at bounded units of work. Cancellation
-// drains reusable pipelines, releases snapshot leases, removes spill files,
-// exposes no partial materialized result, and reports 57014. During DataRow
-// delivery it stops at the next row boundary; rows already written cannot be
-// retracted, which is ordinary PostgreSQL error-stream behavior.
+// the next command. Before execution, UTF-8 admission, simple-query statement
+// splitting, command classification, transaction/SET/fixed-result parsing,
+// catalog recognition, Parse-message ownership copying, and numbered-parameter
+// rewriting check the same signal at bounded byte or token intervals. Heap and
+// durable scans, parallel workers, joins, filtered DML, and spill I/O then check
+// it at bounded units of work. Cancellation drains reusable pipelines, releases
+// snapshot leases, removes spill files, exposes no partial materialized result,
+// and reports 57014. During DataRow delivery it stops at the next row boundary;
+// rows already written cannot be retracted, which is ordinary PostgreSQL
+// error-stream behavior.
 //
 // Socket admission keeps a small pre-startup cushion above MaxConnections so a
 // CancelRequest has an opportunity to contend when all ordinary session slots
@@ -304,10 +314,10 @@
 // starvation indefinite under a hostile or stalled peer.
 //
 // Cancellation is cooperative rather than an abandoned execution goroutine.
-// Its latency is the executor's bounded checkpoint interval plus any durable
-// operation already inside one indivisible publication step. Once durable
-// publication begins it runs to completion and returns its storage outcome;
-// SQL DDL may explicitly return
+// Its latency is one bounded protocol pre-parser interval, then the executor's
+// bounded checkpoint interval, plus any durable operation already inside one
+// indivisible publication step. Once durable publication begins it runs to
+// completion and returns its storage outcome; SQL DDL may explicitly return
 // [github.com/thesyncim/vibedb/store/durable.ErrCommitOutcomeUnknown] after a
 // namespace publication whose durability fence failed. Returning early while
 // a write continued invisibly would be less correct than surfacing that
@@ -321,7 +331,10 @@
 // frontend body at most 16 MiB; every declared element count is checked against
 // the bytes actually present, and every field accessor bounds-checks and
 // latches a failure rather than panicking. Text is checked against the UTF-8
-// encoding the server reports.
+// encoding the server reports. Protocol-side linear scans checkpoint
+// cancellation at least once per 4 KiB of input, including inside quoted
+// literals and comments, so the message-size bound cannot become a
+// non-interruptible parser-size bound.
 //
 // Per-message bounds are not treated as per-session bounds. Prepared names,
 // SQL, copied parameter OIDs, numbered-parameter occurrence maps and rewritten

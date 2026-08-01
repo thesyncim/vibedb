@@ -43,10 +43,9 @@ func filePrimaryPendingCapacity(options normalizedFileStoreOptions) int {
 // that a rank's slot is usually occupied and nearest-fit snaps the leaf onto a
 // far free extent, scattering the order the hint is restoring; oversizing it
 // spreads leaves wider than they need and grows the file with reclaimable gaps.
-// Measured on the churn qualification (100k mutations, 513 leaves): this value
-// holds the adjacency plateau near 25x for a ~7% file-size cost, an 8 KiB stride
-// only reaches ~50x, and a 12 KiB stride reaches ~5x for a ~19% file-size cost.
-// Nearest-fit only needs the stride monotonic in rank; the value is the knob.
+// BenchmarkFilePrimaryChurn establishes the spacing tradeoff. Nearest-fit only
+// needs the stride monotonic in rank; the value is the knob. Exact measured
+// adjacency and file-size results live in docs/performance.md.
 const primaryLeafPlacementStride = uint64(storeio.CommonPrimaryLeafWideBytes +
 	storeio.CommonPrimaryLeafNarrowBytes/2)
 
@@ -530,10 +529,10 @@ func (c *Collection) ensureSyncJournalMutationRoomLocked(
 // grows the file. It reuses the exact primitive the heap builder validates with
 // — Schema.ValidateIndex over a per-document vibejson.Index built with the
 // collection's index options — so a document admitted here is one a rebuild
-// would also accept. A schemaless collection returns immediately; the caller has
-// already proven src is well-formed JSON with vibejson.Validate, so the index
-// build cannot fail on structural grounds. It runs under the writer lock, so the
-// reused IndexEntry arena is writer-private.
+// would also accept. BuildIndexOptions is itself the validating parser; a
+// separate Validate pass would parse schema writes twice before canonicalizing
+// them. It runs under the writer lock, so the reused IndexEntry arena is
+// writer-private.
 func (c *Collection) validatePrimarySchema(src []byte) error {
 	schema := c.options.Collection.Schema
 	if schema == nil {
@@ -611,14 +610,21 @@ func (c *Collection) putPrimary(
 			return false, err
 		}
 	} else {
-		if err := vibejson.Validate(src); err != nil {
-			return false, err
-		}
 		if err := c.validatePrimarySchema(src); err != nil {
 			return false, err
 		}
 	}
 retryAfterUnifiedFold:
+	// The concurrent packed lane leaves state at the physical fold base. Any
+	// exclusive/exceptional mutation must first turn that logical suffix into a
+	// physical state so every mature path below can continue to use root fields
+	// as its transaction base without learning a second metadata model.
+	if c.packedLogicalCutPending() {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			return false, err
+		}
+		goto retryAfterUnifiedFold
+	}
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return false, ErrClosed
@@ -936,6 +942,12 @@ func (c *Collection) deletePrimary(
 		return false, ErrKeyTooLarge
 	}
 retryAfterUnifiedDeleteFold:
+	if c.packedLogicalCutPending() {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			return false, err
+		}
+		goto retryAfterUnifiedDeleteFold
+	}
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return false, nil
@@ -1727,7 +1739,7 @@ func (c *Collection) cowPrimaryMutation(
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false,
-			fmt.Errorf("vibejson: persist reusable extents: %w", err)
+			fmt.Errorf("vibedb: persist reusable extents: %w", err)
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, state, generation, rootPage.Ref(),
@@ -1750,7 +1762,7 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return storeio.PageRef{}, false, false,
-			fmt.Errorf("vibejson: reserve retired extents: %w", err)
+			fmt.Errorf("vibedb: reserve retired extents: %w", err)
 	}
 	retirementReserved = true
 	// The journal-backed sync lane reaches this transactional path only for an
@@ -1848,11 +1860,18 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		!c.primaryUnifiedOverlay.hasPending() {
 		return nil
 	}
+	logical, logicalOK := c.writerLogicalView()
+	if !logicalOK || logical.state == nil {
+		return storeio.ErrGenerationOrder
+	}
+	// The packed lane deliberately leaves state at the physical fold base.
+	// Materialization is an exceptional path, so derive one private logical view
+	// for the existing planner rather than allocating a state per ordinary write.
+	visibleValue := *logical.state
+	visibleValue.root.Generation = logical.generation
+	visibleValue.root.DocumentCount = logical.documentCount
+	visible := &visibleValue
 	if c.primaryUnifiedOverlay.hasPending() {
-		visible := c.state.Load()
-		if visible == nil {
-			return ErrClosed
-		}
 		if err := c.preparePrimaryUnifiedOverlayParentsLocked(
 			visible,
 		); err != nil {
@@ -1893,7 +1912,6 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			c.primaryCheckpointBase = nil
 		}
 	}
-	visible := c.state.Load()
 	if base == nil || visible == nil ||
 		visible.root.Generation <= base.root.Generation ||
 		visible.root.Generation >= uint64(1)<<48 {
@@ -2777,7 +2795,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"vibejson: persist primary checkpoint reusable extents: %w",
+			"vibedb: persist primary checkpoint reusable extents: %w",
 			err,
 		)
 	}
@@ -2794,7 +2812,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return fmt.Errorf(
-			"vibejson: reserve primary checkpoint retirements: %w",
+			"vibedb: reserve primary checkpoint retirements: %w",
 			err,
 		)
 	}

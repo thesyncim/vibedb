@@ -65,7 +65,7 @@ var (
 
 	// ErrIndexTermLeafCorrupt reports a checksum-valid but structurally or
 	// semantically invalid exact-term leaf as well as checksum damage.
-	ErrIndexTermLeafCorrupt = errors.New("vibejson: corrupt exact-term index leaf")
+	ErrIndexTermLeafCorrupt = errors.New("vibedb: corrupt exact-term index leaf")
 )
 
 // IndexTermLeafLiveLookup resolves the immutable stable-slot liveness tile
@@ -88,12 +88,11 @@ type IndexTermLeafPosting struct {
 	// universe (slots are uint8: tile = bucket<<2 | slot>>6, bit = slot&63)
 	// — hand that mask straight back, skipping the per-posting payload
 	// re-decode and codec re-selection OpenTermPosting would repeat on bytes
-	// BuildTermPosting produced in the same call chain. Measured on the
-	// checkpoint fold at the 10k shape, that duplicated selection was about
-	// half the whole encode's CPU. Foreign postings (device reads, other
-	// chunks) leave Chunk0Only false and keep the full admission; a
-	// mismatched caller mask is still caught by the built leaf's own
-	// admission, which re-validates every posting against liveness.
+	// BuildTermPosting produced in the same call chain. Foreign postings (device
+	// reads, other chunks) leave Chunk0Only false and keep the full admission; a
+	// mismatched caller mask is still caught by the built leaf's own admission,
+	// which re-validates every posting against liveness. The measured reason for
+	// preserving this handoff lives in docs/performance.md.
 	Chunk0Bits uint64
 	Chunk0Only bool
 }
@@ -242,8 +241,7 @@ type indexTermLeafDerivedPosting struct {
 	// payload borrows the input posting's inline array or component for the
 	// duration of one build. dictionaryEligible marks payloads long enough
 	// to be dictionary candidates; payloadHash keys the builder's
-	// use-counting table so no per-posting identity string is materialized
-	// (the string form was ~220 KB of garbage per 10k-posting build).
+	// use-counting table so no per-posting identity string is materialized.
 	payload            []byte
 	direct             [2]TermPostingMask
 	directCount        uint8
@@ -297,9 +295,9 @@ func AppendIndexTermLeaf(
 
 	// The builder runs once per bulk build AND once per exact-index
 	// checkpoint fold, so its working set comes from a pooled scratch and
-	// the derived postings live in one flat slab: the per-call map, string,
-	// and per-term slice churn was ~630 KB of garbage per 10k-posting build,
-	// enough to make GC the dominant cost of a dirty indexed checkpoint.
+	// the derived postings live in one flat slab. This avoids per-call map,
+	// string, and per-term slice churn on dirty indexed checkpoints; measured
+	// allocation provenance lives in docs/performance.md.
 	totalPostings := 0
 	for i := range terms {
 		if totalPostings > int(^uint16(0))-len(terms[i].Postings) {

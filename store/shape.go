@@ -503,7 +503,7 @@ func (c *ShapeCache) insertPending(fp uint64) {
 		// Table slots hold id+1 beside the pending bit; the eight bytes per
 		// entry make this unreachable in practice, so the guard only pins
 		// the invariant.
-		panic("vibejson: ShapeCache exceeds 31-bit identifiers")
+		panic("vibedb: ShapeCache exceeds 31-bit identifiers")
 	}
 	if (c.used+1)*4 >= len(c.table)*3 {
 		c.grow()

@@ -59,7 +59,7 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := 0
-	if _, err := snapshot.RangeRawReadAheadBuffer(nil, func(_, _ []byte) error {
+	if _, err := snapshot.RangeRawBuffer(nil, func(_, _ []byte) error {
 		rows++
 		return nil
 	}); err != nil {
@@ -381,7 +381,7 @@ func TestFileStoreDirectIOUring(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := 0
-	if _, err := snapshot.RangeRawReadAheadBuffer(nil, func(_, _ []byte) error {
+	if _, err := snapshot.RangeRawBuffer(nil, func(_, _ []byte) error {
 		rows++
 		return nil
 	}); err != nil {

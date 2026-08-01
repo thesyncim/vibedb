@@ -223,14 +223,14 @@ func normalizeOpenedFileStoreOptions(
 			supplied.Collection.IndexOptions.MaxDepth !=
 				int(root.IndexMaxDepth) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
-			"vibejson: collection persisted option mismatch",
+			"vibedb: collection persisted option mismatch",
 		)
 	}
 	persistedFlags := root.Options & storeio.StateOptionSchema
 	assertedFlags := fileStoreCollectionOptionFlags(supplied.Collection)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
-			"vibejson: collection persisted representation mismatch",
+			"vibedb: collection persisted representation mismatch",
 		)
 	}
 
@@ -281,7 +281,7 @@ func normalizeOpenedFileStoreOptions(
 	if !normalized.pageCatalog.Equal(catalog) {
 		if catalogAsserted {
 			return normalizedFileStoreOptions{}, fmt.Errorf(
-				"vibejson: collection exact catalog assertion mismatch",
+				"vibedb: collection exact catalog assertion mismatch",
 			)
 		}
 		return normalizedFileStoreOptions{}, fmt.Errorf(

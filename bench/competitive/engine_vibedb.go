@@ -15,9 +15,9 @@ import (
 // never allocate for string conversion and invalid input cannot grow retained
 // adapter memory. AppendRaw, Put, and Delete borrow the key only for their
 // call, so the client may overwrite this buffer at its next operation.
-const vibeDurableKeyBytes = 256
+const vibeDBKeyBytes = 256
 
-type vibeDurable struct {
+type vibeDBEngine struct {
 	cfg     Config
 	path    string
 	file    *os.File
@@ -25,12 +25,12 @@ type vibeDurable struct {
 	snap    *durable.Snapshot
 	exec    query.Exec
 	scratch []byte
-	keyBuf  [vibeDurableKeyBytes]byte
-	scan    *vibeDurableScanState
+	keyBuf  [vibeDBKeyBytes]byte
+	scan    *vibeDBScanState
 }
 
-func vibeDurablePointKey(
-	buf *[vibeDurableKeyBytes]byte,
+func vibeDBPointKey(
+	buf *[vibeDBKeyBytes]byte,
 	key string,
 ) ([]byte, error) {
 	if len(key) > len(buf) {
@@ -40,10 +40,10 @@ func vibeDurablePointKey(
 	return buf[:len(key)], nil
 }
 
-// vibeDurableScanState owns the reconstruction buffer and callbacks for one
+// vibeDBScanState owns the reconstruction buffer and callbacks for one
 // benchmark client. The callback method values are bound once when the session
 // is created, rather than rebuilt as escaping closures on every scan.
-type vibeDurableScanState struct {
+type vibeDBScanState struct {
 	scratch []byte
 	rows    int
 	sink    byte
@@ -51,14 +51,14 @@ type vibeDurableScanState struct {
 	all     func(key, value []byte) error
 }
 
-func newVibeDurableScanState() *vibeDurableScanState {
-	state := new(vibeDurableScanState)
+func newVibeDBScanState() *vibeDBScanState {
+	state := new(vibeDBScanState)
 	state.first = state.consumeFirstByte
 	state.all = state.consumeAllBytes
 	return state
 }
 
-func (s *vibeDurableScanState) consumeFirstByte(_ []byte, value []byte) error {
+func (s *vibeDBScanState) consumeFirstByte(_ []byte, value []byte) error {
 	if len(value) > 0 {
 		s.sink ^= value[0]
 	}
@@ -66,16 +66,16 @@ func (s *vibeDurableScanState) consumeFirstByte(_ []byte, value []byte) error {
 	return nil
 }
 
-func (s *vibeDurableScanState) consumeAllBytes(_ []byte, value []byte) error {
+func (s *vibeDBScanState) consumeAllBytes(_ []byte, value []byte) error {
 	s.sink ^= touchAll(value)
 	s.rows++
 	return nil
 }
 
-// rangeVibeDurableCurrent is the adapter's single dependency on the durable
+// rangeVibeDBCurrent is the adapter's single dependency on the durable
 // current-scan API. Keeping that boundary in one place makes scan API changes
 // mechanical without reintroducing per-call adapter closures.
-func rangeVibeDurableCurrent(
+func rangeVibeDBCurrent(
 	coll *durable.Collection,
 	scratch []byte,
 	visit func(key, value []byte) error,
@@ -83,37 +83,37 @@ func rangeVibeDurableCurrent(
 	return coll.RangeRawCurrentBuffer(scratch, visit)
 }
 
-func (s *vibeDurableScanState) run(
+func (s *vibeDBScanState) run(
 	coll *durable.Collection,
 	visit func(key, value []byte) error,
 ) (int, error) {
 	s.rows = 0
 	s.sink = 0
-	scratch, err := rangeVibeDurableCurrent(coll, s.scratch, visit)
+	scratch, err := rangeVibeDBCurrent(coll, s.scratch, visit)
 	s.scratch = scratch
 	foldScanSink(s.sink)
 	return s.rows, err
 }
 
-func newVibeDurable(cfg Config) (Engine, error) {
-	mode, err := ResolveDurabilityMode("vibejson-durable", cfg.Durability)
+func newVibeDB(cfg Config) (Engine, error) {
+	mode, err := ResolveDurabilityMode("vibedb", cfg.Durability)
 	if err != nil {
 		return nil, err
 	}
 	cfg.Durability = mode
-	profile, err := ResolveStorageProfile("vibejson-durable", cfg.StorageProfile)
+	profile, err := ResolveStorageProfile("vibedb", cfg.StorageProfile)
 	if err != nil {
 		return nil, err
 	}
 	cfg.StorageProfile = profile.Profile
-	return &vibeDurable{cfg: cfg, scan: newVibeDurableScanState()}, nil
+	return &vibeDBEngine{cfg: cfg, scan: newVibeDBScanState()}, nil
 }
 
-func (v *vibeDurable) Name() string { return "vibejson-durable" }
+func (v *vibeDBEngine) Name() string { return "vibedb" }
 
-func (v *vibeDurable) DurabilityMode() DurabilityMode { return v.cfg.Durability }
+func (v *vibeDBEngine) DurabilityMode() DurabilityMode { return v.cfg.Durability }
 
-func (v *vibeDurable) Durability() string {
+func (v *vibeDBEngine) Durability() string {
 	switch v.cfg.Durability {
 	case DurabilityPowerSafe:
 		return "DurabilityBufferedVisible + CheckpointPowerSafe + RecoveryJournal over the ordered primary graph (every Put/Delete appends one redo record to the paired journal and syncs it at the platform's strongest power-loss boundary — F_FULLFSYNC class — before returning, so each acknowledged mutation survives sudden power loss; concurrent acknowledgements share one barrier through the journal's group commit; checkpoints fold at the same strength; the strict visibility-follows-durability lane is DurabilitySync, which pays the same single journal fence but does not group)"
@@ -126,7 +126,7 @@ func (v *vibeDurable) Durability() string {
 	}
 }
 
-func (v *vibeDurable) Tuning() string {
+func (v *vibeDBEngine) Tuning() string {
 	if v.cfg.Untuned {
 		return "defaults only, for comparison against the tuned row"
 	}
@@ -146,7 +146,7 @@ func (v *vibeDurable) Tuning() string {
 		"CreateFromPrimary emits the sole canonical class-5 representation"
 }
 
-func (v *vibeDurable) options() durable.Options {
+func (v *vibeDBEngine) options() durable.Options {
 	opts := durable.Options{
 		ResidentBytes: v.cfg.CacheBytes,
 	}
@@ -207,8 +207,8 @@ func (v *vibeDurable) options() durable.Options {
 	return opts
 }
 
-func (v *vibeDurable) Load(docs []Doc) error {
-	v.path = filepath.Join(v.cfg.Dir, "vibejson.db")
+func (v *vibeDBEngine) Load(docs []Doc) error {
+	v.path = filepath.Join(v.cfg.Dir, "vibedb.db")
 	f, err := os.OpenFile(v.path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
@@ -236,7 +236,7 @@ func (v *vibeDurable) Load(docs []Doc) error {
 // single transaction — none of those replay individual mutations either. The
 // in-memory build is included in the measurement, because a caller who only
 // wants the file still has to pay it.
-func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
+func (v *vibeDBEngine) loadBulk(f *os.File, docs []Doc) error {
 	opts := v.options()
 	// The heap options are left at their zero value, matching the durable
 	// Options' own embedded collection defaults, so the intermediate
@@ -281,7 +281,7 @@ func (v *vibeDurable) loadBulk(f *os.File, docs []Doc) error {
 // creates an empty ordered-primary collection and replays every document through
 // the primary mutation path — the synchronous lane acknowledging through its
 // recovery journal — exactly like the measured workload.
-func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
+func (v *vibeDBEngine) loadByPut(f *os.File, docs []Doc) error {
 	opts := v.options()
 	db, err := durable.Create(f, opts)
 	if err != nil {
@@ -302,7 +302,7 @@ func (v *vibeDurable) loadByPut(f *os.File, docs []Doc) error {
 // BufferCount the mutation workload is tuned to; zeroing it lets the bulk write
 // auto-size its own pool. Open still uses the tuned BufferCount, so the measured
 // mutation staging depth -- the thing the tuning fixes -- is unchanged.
-func (v *vibeDurable) primaryBulkOptions() durable.Options {
+func (v *vibeDBEngine) primaryBulkOptions() durable.Options {
 	opts := v.options()
 	opts.BufferCount = 0
 	opts.QueueSlots = 0
@@ -318,7 +318,7 @@ func (v *vibeDurable) primaryBulkOptions() durable.Options {
 // with "retired extent capacity exhausted". Holding one open across a
 // long-running write loop can exhaust the configured bound. The point-write
 // benchmark therefore holds no snapshot across a write.
-func (v *vibeDurable) snapshot() (*durable.Snapshot, error) {
+func (v *vibeDBEngine) snapshot() (*durable.Snapshot, error) {
 	if v.snap != nil {
 		return v.snap, nil
 	}
@@ -330,15 +330,15 @@ func (v *vibeDurable) snapshot() (*durable.Snapshot, error) {
 	return snap, nil
 }
 
-func (v *vibeDurable) releaseSnapshot() {
+func (v *vibeDBEngine) releaseSnapshot() {
 	if v.snap != nil {
 		_ = v.snap.Close()
 		v.snap = nil
 	}
 }
 
-func (v *vibeDurable) Get(dst []byte, key string) ([]byte, error) {
-	keyBytes, err := vibeDurablePointKey(&v.keyBuf, key)
+func (v *vibeDBEngine) Get(dst []byte, key string) ([]byte, error) {
+	keyBytes, err := vibeDBPointKey(&v.keyBuf, key)
 	if err != nil {
 		return dst, err
 	}
@@ -352,10 +352,10 @@ func (v *vibeDurable) Get(dst []byte, key string) ([]byte, error) {
 	return out, nil
 }
 
-func (v *vibeDurable) Put(key string, doc []byte) error {
+func (v *vibeDBEngine) Put(key string, doc []byte) error {
 	// See snapshot: a write path must not hold a snapshot lease open.
 	v.releaseSnapshot()
-	keyBytes, err := vibeDurablePointKey(&v.keyBuf, key)
+	keyBytes, err := vibeDBPointKey(&v.keyBuf, key)
 	if err != nil {
 		return err
 	}
@@ -363,11 +363,11 @@ func (v *vibeDurable) Put(key string, doc []byte) error {
 	return err
 }
 
-func (v *vibeDurable) Upsert(key string, doc []byte) error { return v.Put(key, doc) }
+func (v *vibeDBEngine) Upsert(key string, doc []byte) error { return v.Put(key, doc) }
 
-func (v *vibeDurable) Delete(key string) error {
+func (v *vibeDBEngine) Delete(key string) error {
 	v.releaseSnapshot()
-	keyBytes, err := vibeDurablePointKey(&v.keyBuf, key)
+	keyBytes, err := vibeDBPointKey(&v.keyBuf, key)
 	if err != nil {
 		return err
 	}
@@ -378,37 +378,37 @@ func (v *vibeDurable) Delete(key string) error {
 	return err
 }
 
-func (v *vibeDurable) Scan() (int, error) {
+func (v *vibeDBEngine) Scan() (int, error) {
 	return v.scan.run(v.coll, v.scan.first)
 }
 
-func (v *vibeDurable) ScanAllBytes() (int, error) {
+func (v *vibeDBEngine) ScanAllBytes() (int, error) {
 	return v.scan.run(v.coll, v.scan.all)
 }
 
-func (v *vibeDurable) Visit(fn func(key string, value []byte) error) error {
-	scratch, err := rangeVibeDurableCurrent(v.coll, v.scratch, func(key, value []byte) error {
+func (v *vibeDBEngine) Visit(fn func(key string, value []byte) error) error {
+	scratch, err := rangeVibeDBCurrent(v.coll, v.scratch, func(key, value []byte) error {
 		return fn(string(key), value)
 	})
 	v.scratch = scratch
 	return err
 }
 
-func (v *vibeDurable) FilterCount(value string) (int, error) {
+func (v *vibeDBEngine) FilterCount(value string) (int, error) {
 	if v.cfg.Indexed {
 		return 0, fmt.Errorf("FilterCount must run against an unindexed instance")
 	}
 	return v.runFilter(value)
 }
 
-func (v *vibeDurable) IndexedCount(value string) (int, error) {
+func (v *vibeDBEngine) IndexedCount(value string) (int, error) {
 	if !v.cfg.Indexed {
 		return 0, ErrNoIndex
 	}
 	return v.runFilter(value)
 }
 
-func (v *vibeDurable) runFilter(value string) (int, error) {
+func (v *vibeDBEngine) runFilter(value string) (int, error) {
 	snap, err := v.snapshot()
 	if err != nil {
 		return 0, err
@@ -428,21 +428,21 @@ func (v *vibeDurable) runFilter(value string) (int, error) {
 	return int(n), nil
 }
 
-func (v *vibeDurable) DiskBytes() (int64, error) {
+func (v *vibeDBEngine) DiskBytes() (int64, error) {
 	if err := v.Checkpoint(); err != nil {
 		return 0, err
 	}
 	return dirBytes(v.cfg.Dir)
 }
 
-func (v *vibeDurable) Checkpoint() error {
+func (v *vibeDBEngine) Checkpoint() error {
 	if v.coll == nil {
 		return nil
 	}
 	return v.coll.Flush()
 }
 
-func (v *vibeDurable) MaintenanceFloor() error {
+func (v *vibeDBEngine) MaintenanceFloor() error {
 	if v.coll == nil || v.file == nil {
 		return nil
 	}
@@ -503,14 +503,14 @@ func (v *vibeDurable) MaintenanceFloor() error {
 	return nil
 }
 
-func (v *vibeDurable) MaintenanceFloorDescription() string {
+func (v *vibeDBEngine) MaintenanceFloorDescription() string {
 	return "offline out-of-place durable.Repack (vacuum-into), then remove the benchmark source pair; cutover protocol excluded"
 }
 
 // AutomaticCheckpoints reports persistence boundaries forced by bounded
 // staging pressure rather than requested through the benchmark's schedule.
 // The mixed harness samples it outside the timed interval.
-func (v *vibeDurable) AutomaticCheckpoints() uint64 {
+func (v *vibeDBEngine) AutomaticCheckpoints() uint64 {
 	if v.coll == nil {
 		return 0
 	}
@@ -519,14 +519,14 @@ func (v *vibeDurable) AutomaticCheckpoints() uint64 {
 
 // DurableStats exposes value-only internal counters to opt-in diagnostic
 // harnesses. Published benchmark tables do not depend on it.
-func (v *vibeDurable) DurableStats() durable.Stats {
+func (v *vibeDBEngine) DurableStats() durable.Stats {
 	if v.coll == nil {
 		return durable.Stats{}
 	}
 	return v.coll.Stats()
 }
 
-func (v *vibeDurable) Close() error {
+func (v *vibeDBEngine) Close() error {
 	v.exec.Release()
 	v.releaseSnapshot()
 	if v.coll != nil {
@@ -542,17 +542,17 @@ func (v *vibeDurable) Close() error {
 	return nil
 }
 
-// vibeDurableSession is one client's private view onto the shared durable
+// vibeDBEngineSession is one client's private view onto the shared durable
 // collection. The collection handle is shared and concurrency-safe; the key
 // conversion and current-scan reconstruction buffers are per caller.
-type vibeDurableSession struct {
+type vibeDBEngineSession struct {
 	coll   *durable.Collection
-	keyBuf [vibeDurableKeyBytes]byte
-	scan   *vibeDurableScanState
+	keyBuf [vibeDBKeyBytes]byte
+	scan   *vibeDBScanState
 }
 
-func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
-	keyBytes, err := vibeDurablePointKey(&s.keyBuf, key)
+func (s *vibeDBEngineSession) Get(dst []byte, key string) ([]byte, error) {
+	keyBytes, err := vibeDBPointKey(&s.keyBuf, key)
 	if err != nil {
 		return dst, err
 	}
@@ -566,8 +566,8 @@ func (s *vibeDurableSession) Get(dst []byte, key string) ([]byte, error) {
 	return out, nil
 }
 
-func (s *vibeDurableSession) Put(key string, doc []byte) error {
-	keyBytes, err := vibeDurablePointKey(&s.keyBuf, key)
+func (s *vibeDBEngineSession) Put(key string, doc []byte) error {
+	keyBytes, err := vibeDBPointKey(&s.keyBuf, key)
 	if err != nil {
 		return err
 	}
@@ -575,10 +575,10 @@ func (s *vibeDurableSession) Put(key string, doc []byte) error {
 	return err
 }
 
-func (s *vibeDurableSession) Upsert(key string, doc []byte) error { return s.Put(key, doc) }
+func (s *vibeDBEngineSession) Upsert(key string, doc []byte) error { return s.Put(key, doc) }
 
-func (s *vibeDurableSession) Delete(key string) error {
-	keyBytes, err := vibeDurablePointKey(&s.keyBuf, key)
+func (s *vibeDBEngineSession) Delete(key string) error {
+	keyBytes, err := vibeDBPointKey(&s.keyBuf, key)
 	if err != nil {
 		return err
 	}
@@ -589,11 +589,11 @@ func (s *vibeDurableSession) Delete(key string) error {
 	return err
 }
 
-func (s *vibeDurableSession) ScanAllBytes() (int, error) {
+func (s *vibeDBEngineSession) ScanAllBytes() (int, error) {
 	return s.scan.run(s.coll, s.scan.all)
 }
 
 // Session vends per-client key and scan buffers over the shared collection.
-func (v *vibeDurable) Session(int) EngineSession {
-	return &vibeDurableSession{coll: v.coll, scan: newVibeDurableScanState()}
+func (v *vibeDBEngine) Session(int) EngineSession {
+	return &vibeDBEngineSession{coll: v.coll, scan: newVibeDBScanState()}
 }

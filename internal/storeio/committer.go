@@ -27,17 +27,17 @@ const (
 
 var (
 	// ErrBatchState reports use of a free, aborted, or already-published batch.
-	ErrBatchState = errors.New("vibejson: Store persistence batch is not owned")
+	ErrBatchState = errors.New("vibedb: Store persistence batch is not owned")
 	// ErrTooManyPages reports a transaction larger than its configured bounded
 	// page-descriptor capacity.
-	ErrTooManyPages = errors.New("vibejson: Store persistence batch has too many pages")
+	ErrTooManyPages = errors.New("vibedb: Store persistence batch has too many pages")
 	// ErrGenerationOrder reports a persistence generation that does not advance
 	// the preceding published generation.
-	ErrGenerationOrder = errors.New("vibejson: Store persistence generation is not increasing")
+	ErrGenerationOrder = errors.New("vibedb: Store persistence generation is not increasing")
 	// ErrCheckpointRequired reports bounded buffered-visible staging pressure.
 	// The caller must checkpoint the generations it has already published
 	// before retrying. No rejected batch has been accepted or made visible.
-	ErrCheckpointRequired = errors.New("vibejson: Store buffered checkpoint required")
+	ErrCheckpointRequired = errors.New("vibedb: Store buffered checkpoint required")
 )
 
 // CommitterOptions fixes automatic persistence queue memory. All descriptors

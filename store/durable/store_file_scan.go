@@ -47,7 +47,7 @@ func (c *Collection) RangeRawCurrentBuffer(
 	}
 
 	var captured primaryCurrentScanOverlayCapture
-	state, pin, rooted, err := c.capturePrimaryCurrentScan(&captured)
+	view, pin, rooted, err := c.capturePrimaryCurrentScan(&captured)
 	if err != nil {
 		return scratch, err
 	}
@@ -63,7 +63,7 @@ func (c *Collection) RangeRawCurrentBuffer(
 		return snapshot.RangeRawBuffer(scratch, fn)
 	}
 	defer pin.release()
-	return c.rangeRawCurrentAt(state, &captured, scratch, fn)
+	return c.rangeRawCurrentAt(view, &captured, scratch, fn)
 }
 
 // primaryCurrentScanOverlayCapture mirrors the overlay's fixed open-addressed
@@ -138,64 +138,71 @@ func (p *primaryCurrentScanPin) release() {
 
 func (c *Collection) capturePrimaryCurrentScan(
 	captured *primaryCurrentScanOverlayCapture,
-) (*fileStoreState, primaryCurrentScanPin, bool, error) {
+) (fileLogicalView, primaryCurrentScanPin, bool, error) {
 	c.writer.RLock()
 	defer c.writer.RUnlock()
-	if len(c.primaryPendingParents) != 0 {
-		return nil, primaryCurrentScanPin{}, false, nil
+	if c.closed {
+		return fileLogicalView{}, primaryCurrentScanPin{}, false, ErrClosed
 	}
-	if state, epoch, ok := c.enterReadEpoch(); ok {
+	if len(c.primaryPendingParents) != 0 {
+		return fileLogicalView{}, primaryCurrentScanPin{}, false, nil
+	}
+	if view, epoch, ok := c.enterReadEpoch(); ok {
+		state := view.state
 		if state.root.PrimaryRoot == (storeio.PageRef{}) {
 			epoch.Exit()
-			return nil, primaryCurrentScanPin{}, false,
+			return fileLogicalView{}, primaryCurrentScanPin{}, false,
 				storeio.ErrSegmentedTabletRouterCorrupt
 		}
 		if err := captured.capture(
 			c.primaryUnifiedOverlay,
 			state.root.PrimaryRoot.Generation,
-			state.root.Generation,
+			view.generation,
 		); err != nil {
 			epoch.Exit()
-			return nil, primaryCurrentScanPin{}, false, err
+			return fileLogicalView{}, primaryCurrentScanPin{}, false, err
 		}
-		return state, primaryCurrentScanPin{
+		return view, primaryCurrentScanPin{
 			epoch: epoch, direct: true,
 		}, true, nil
 	}
 
 	c.snapshotGate.RLock()
-	state, stateErr := c.readerFileState()
+	view, stateErr := c.visibleLogicalView()
 	if stateErr != nil {
 		c.snapshotGate.RUnlock()
-		return nil, primaryCurrentScanPin{}, false, stateErr
+		return fileLogicalView{}, primaryCurrentScanPin{}, false, stateErr
 	}
-	lease, leaseErr := c.leases.Acquire(state.root.Generation)
+	lease, leaseErr := c.leases.Acquire(view.retentionGeneration())
 	c.snapshotGate.RUnlock()
 	if leaseErr != nil {
-		return nil, primaryCurrentScanPin{}, false, leaseErr
+		return fileLogicalView{}, primaryCurrentScanPin{}, false,
+			publicReaderLeaseError(leaseErr)
 	}
+	state := view.state
 	if state.root.PrimaryRoot == (storeio.PageRef{}) {
 		lease.Release()
-		return nil, primaryCurrentScanPin{}, false,
+		return fileLogicalView{}, primaryCurrentScanPin{}, false,
 			storeio.ErrSegmentedTabletRouterCorrupt
 	}
 	if err := captured.capture(
 		c.primaryUnifiedOverlay,
 		state.root.PrimaryRoot.Generation,
-		state.root.Generation,
+		view.generation,
 	); err != nil {
 		lease.Release()
-		return nil, primaryCurrentScanPin{}, false, err
+		return fileLogicalView{}, primaryCurrentScanPin{}, false, err
 	}
-	return state, primaryCurrentScanPin{lease: lease}, true, nil
+	return view, primaryCurrentScanPin{lease: lease}, true, nil
 }
 
 func (c *Collection) rangeRawCurrentAt(
-	state *fileStoreState,
+	view fileLogicalView,
 	captured *primaryCurrentScanOverlayCapture,
 	scratch []byte,
 	fn func(key, value []byte) error,
 ) ([]byte, error) {
+	state := view.state
 	catalogBounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
 		SelectedRootGeneration: state.root.PrimaryRoot.Generation,
@@ -211,7 +218,7 @@ func (c *Collection) rangeRawCurrentAt(
 		return scratch, err
 	}
 	defer cursor.Close()
-	if state.root.Generation == state.root.PrimaryRoot.Generation {
+	if view.generation == state.root.PrimaryRoot.Generation {
 		cursor.AdoptSpliceScratch(scratch)
 		for {
 			key, ref, err := cursor.VisitInline(fn)
@@ -250,7 +257,7 @@ func (c *Collection) rangeRawCurrentAt(
 			overlayCount, err = overlay.latestBucketRecordsFromHead(
 				&indexes, bucket, head,
 				state.root.PrimaryRoot.Generation,
-				state.root.Generation,
+				view.generation,
 			)
 			if err != nil {
 				return scratch, err
@@ -347,12 +354,12 @@ func (c *Collection) rangeRawCurrentAt(
 			return scratch, err
 		}
 	}
-	if visited != state.root.DocumentCount {
+	if visited != view.documentCount {
 		return scratch, fmt.Errorf(
 			"%w: current scan visited %d rows, want %d",
 			storeio.ErrCommonPrimaryLeafCorrupt,
 			visited,
-			state.root.DocumentCount,
+			view.documentCount,
 		)
 	}
 	return scratch, nil
@@ -405,20 +412,6 @@ func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
 // slice preserves any grown capacity for the next scan. Inline-only scans and
 // warmed overflow scans allocate nothing when scratch has sufficient capacity.
 func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
-	if s == nil || s.collection == nil || s.state == nil {
-		return scratch, ErrClosed
-	}
-	if fn == nil {
-		return scratch, nil
-	}
-	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
-}
-
-// RangeRawReadAheadBuffer is currently an alias of RangeRawBuffer, retained
-// for its callers in the query layer: the ordered-primary scan reads inline
-// values from the leaves it already walks in order, so it has no separate
-// document-extent read-ahead lane.
-func (s *Snapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return scratch, ErrClosed
 	}

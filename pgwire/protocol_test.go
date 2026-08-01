@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bytes"
 	"context"
+	stdsql "database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/conformance"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -339,7 +342,10 @@ func TestSimpleQueryStatementIterationIsBounded(t *testing.T) {
 			iter := statementIterator{src: src}
 			count := 0
 			for {
-				_, ok := iter.next()
+				_, ok, err := iter.next()
+				if err != nil {
+					panic(err)
+				}
 				if !ok {
 					break
 				}
@@ -1013,6 +1019,63 @@ func TestTextInputsMustMatchTheReportedUTF8Encoding(t *testing.T) {
 	})
 }
 
+func TestSimpleQueryExplainAndAnalyzeReturnOnePlanRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "explain",
+			sql:  `EXPLAIN SELECT name FROM users WHERE tier = 'pro'`,
+			want: []string{`"node":"scan"`, `"collection":"users"`},
+		},
+		{
+			name: "explain analyze",
+			sql: `EXPLAIN ANALYZE SELECT name FROM users ` +
+				`WHERE tier = 'pro' ORDER BY name LIMIT 2`,
+			want: []string{`"node":"scan"`, `"collection":"users"`, `"analyze":{`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := connect(t)
+			msgs := c.query(tc.sql)
+			wantTags := []byte{
+				msgRowDescription, msgDataRow, msgCommandComplete, msgReadyForQuery,
+			}
+			if got := tagBytes(msgs); !bytes.Equal(got, wantTags) {
+				t.Fatalf("message sequence is %s, want %s",
+					tags(msgs), tags(msgsOf(wantTags)))
+			}
+
+			cols := decodeRowDescription(t, msgs[0].body)
+			if len(cols) != 1 || cols[0].name != "QUERY PLAN" {
+				t.Fatalf("RowDescription is %+v, want one QUERY PLAN column", cols)
+			}
+			rows := rowsOf(t, msgs)
+			if len(rows) != 1 || len(rows[0]) != 1 {
+				t.Fatalf("EXPLAIN rows = %q, want one row with one plan", rows)
+			}
+			var plan string
+			if err := json.Unmarshal(rows[0][0], &plan); err != nil {
+				t.Fatalf("QUERY PLAN wire value is not a JSON string: %q: %v",
+					rows[0][0], err)
+			}
+			if !json.Valid([]byte(plan)) {
+				t.Fatalf("QUERY PLAN is not valid JSON: %s", plan)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(plan, want) {
+					t.Errorf("QUERY PLAN missing %s: %s", want, plan)
+				}
+			}
+			if got := commandTagOf(t, msgs); got != "SELECT 1" {
+				t.Fatalf("CommandComplete tag = %q, want SELECT 1", got)
+			}
+		})
+	}
+}
+
 // --- error classification --------------------------------------------------
 
 func TestErrorClassification(t *testing.T) {
@@ -1037,6 +1100,37 @@ func TestErrorClassification(t *testing.T) {
 	for _, tc := range cases {
 		msgs := c.query(tc.sql)
 		expectErrorSoft(t, msgs, tc.code, tc.sql)
+	}
+}
+
+func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
+	db, err := stdsql.Open("vibedb", filepath.Join(t.TempDir(), "unsupported.vdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	c := connect(t)
+	for _, tc := range conformance.UnsupportedSQLCases {
+		t.Run(tc.ID, func(t *testing.T) {
+			statement, prepareErr := db.Prepare(tc.Statement)
+			if statement != nil {
+				_ = statement.Close()
+				t.Fatal("database/sql prepared an unsupported statement")
+			}
+			var unsupported *sqlast.FeatureNotSupportedError
+			if !errors.As(prepareErr, &unsupported) {
+				t.Fatalf("database/sql error = %T %v, want typed feature refusal",
+					prepareErr, prepareErr)
+			}
+			if !strings.Contains(unsupported.Msg, tc.ReasonContains) {
+				t.Fatalf("database/sql reason = %q, want %q", unsupported.Msg, tc.ReasonContains)
+			}
+			fields := expectError(t, c.query(tc.Statement), sqlstateFeatureNotSupported)
+			if fields['M'] != unsupported.Msg {
+				t.Fatalf("pgwire reason = %q, database/sql reason = %q",
+					fields['M'], unsupported.Msg)
+			}
+		})
 	}
 }
 
@@ -1491,7 +1585,7 @@ func TestRepeatedNumberedParameterCopiesWireValueOnce(t *testing.T) {
 	m := &frontendMessage{params: [][]byte{raw}}
 	stmt := &prepared{paramOrder: order, wireParams: 1}
 	args, wireArgs, slots, store, decoded, err := bindArgs(
-		nil, nil, nil, nil, nil, m, stmt)
+		nil, nil, nil, nil, nil, m, stmt, nil)
 	if err != nil {
 		t.Fatalf("bindArgs: %v", err)
 	}
@@ -1523,6 +1617,53 @@ func TestRepeatedNumberedParameterCopiesWireValueOnce(t *testing.T) {
 	if got := boundLiteralCharge(charges, stmt); got <= maxPreparedBindBytes {
 		t.Fatalf("execution charge for repeated $1 = %d, want over %d",
 			got, maxPreparedBindBytes)
+	}
+}
+
+func TestNumberedParameterRewriteCancelsInsideLargeQuotedRun(t *testing.T) {
+	src := "$1, '" + strings.Repeat("x", 1<<20) + "'"
+	checks := 0
+	out, order, highest, err := rewriteNumberedParameters(src, func() error {
+		checks++
+		if checks == 6 {
+			return query.ErrCanceled
+		}
+		return nil
+	})
+	if !errors.Is(err, query.ErrCanceled) || out != "" || order != nil || highest != 0 {
+		t.Fatalf("canceled rewrite = (%q, %v, %d, %v)", out, order, highest, err)
+	}
+	if checks != 6 {
+		t.Fatalf("rewrite cancellation checks = %d, want 6", checks)
+	}
+	if _, _, _, err := rewriteNumberedParameters(`SELECT $1`, nil); err != nil {
+		t.Fatalf("rewrite was not reusable after cancellation: %v", err)
+	}
+}
+
+func TestBindArgumentsCancelDuringLargeWireCopyAndRemainReusable(t *testing.T) {
+	raw := bytes.Repeat([]byte("x"), 1<<20)
+	m := &frontendMessage{params: [][]byte{raw}}
+	stmt := &prepared{wireParams: 1}
+	checks := 0
+	_, _, _, _, _, err := bindArgs(
+		nil, nil, nil, nil, nil, m, stmt, func() error {
+			checks++
+			if checks == 8 {
+				return query.ErrCanceled
+			}
+			return nil
+		},
+	)
+	if !errors.Is(err, query.ErrCanceled) {
+		t.Fatalf("large Bind cancellation = %v, want %v", err, query.ErrCanceled)
+	}
+	args, _, _, store, _, err := bindArgs(
+		nil, nil, nil, nil, nil, m, stmt, nil,
+	)
+	if err != nil || len(args) != 1 || len(store) != len(raw) {
+		t.Fatalf("Bind after cancellation = args %d, store %d, error %v",
+			len(args), len(store), err)
 	}
 }
 
@@ -2428,7 +2569,7 @@ func TestRewriteNumberedParametersPreservesLength(t *testing.T) {
 		{`SELECT a FROM b /* $9 */ WHERE c = $1`, []int{1}},
 	}
 	for _, tc := range cases {
-		out, order, highest, err := rewriteNumberedParameters(tc.sql)
+		out, order, highest, err := rewriteNumberedParameters(tc.sql, nil)
 		if err != nil {
 			t.Errorf("%q: %v", tc.sql, err)
 			continue
@@ -2446,7 +2587,7 @@ func TestRewriteNumberedParametersPreservesLength(t *testing.T) {
 	}
 	// A statement with no numbered parameter is returned untouched.
 	src := `SELECT a FROM b WHERE c = ?`
-	out, order, _, err := rewriteNumberedParameters(src)
+	out, order, _, err := rewriteNumberedParameters(src, nil)
 	if err != nil || out != src || order != nil {
 		t.Fatalf("a '?' statement was rewritten: %q %v %v", out, order, err)
 	}

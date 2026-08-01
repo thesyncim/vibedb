@@ -133,7 +133,7 @@ On an Apple M4 Max, the clean buffered-visible CP64 qualification used a 10,000
 document corpus, 2,000 warmup operations, 20,000 measured operations, and the
 median of 10 isolated repetitions. No forced checkpoint occurred.
 
-| Workload | Clients | VibeJSON ops/s | Badger ops/s | VibeJSON / Badger | VibeJSON vs 1 client |
+| Workload | Clients | VibeDB ops/s | Badger ops/s | VibeDB / Badger | VibeDB vs 1 client |
 |---|---:|---:|---:|---:|---:|
 | write | 1 | 408,754 | 173,801 | 2.35x | 1.00x |
 | write | 8 | 623,981 | 249,858 | 2.50x | 1.53x |

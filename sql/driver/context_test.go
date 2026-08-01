@@ -2,14 +2,18 @@ package driver
 
 import (
 	"context"
+	stdsql "database/sql"
 	sqldriver "database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/conformance"
 	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -29,6 +33,73 @@ type observedErrContext struct {
 	context.Context
 	once     sync.Once
 	observed chan struct{}
+}
+
+type nthDoneContext struct {
+	context.Context
+	at       int32
+	calls    atomic.Int32
+	once     sync.Once
+	observed chan struct{}
+}
+
+type deadlineSignalContext struct {
+	context.Context
+	done chan struct{}
+}
+
+func (c *deadlineSignalContext) Done() <-chan struct{} { return c.done }
+
+func (c *deadlineSignalContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *nthDoneContext) Done() <-chan struct{} {
+	if c.calls.Add(1) == c.at {
+		c.once.Do(func() { close(c.observed) })
+	}
+	return c.Context.Done()
+}
+
+func cancelActiveStatement(t *testing.T, statement *stdsql.Stmt, name string) {
+	t.Helper()
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &nthDoneContext{
+		Context: base, at: 2, observed: make(chan struct{}),
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := statement.ExecContext(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		cancel()
+		t.Fatalf("%s completed before its cancellation window: %v", name, err)
+	case <-ctx.observed:
+		// The second Done observation cannot happen until the operation-local
+		// cancellation scope is installed and execution is dispatched. Give the
+		// statement one scheduler turn to enter its durable scan, then deliver
+		// an ordinary context cancellation.
+		time.Sleep(100 * time.Microsecond)
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatalf("%s did not install its cancellation watcher", name)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("active %s = %v, want context.Canceled", name, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("active %s did not stop at a bounded checkpoint", name)
+	}
 }
 
 func (c *observedErrContext) Err() error {
@@ -259,7 +330,7 @@ func TestBeginTxCancellationReleasesPartiallyCapturedSnapshots(t *testing.T) {
 	}
 }
 
-func TestExecutionContextInterfacesDoNotOverclaimCancellation(t *testing.T) {
+func TestExecutionContextInterfacesExposeCooperativeCancellation(t *testing.T) {
 	connection := directTestConn(t)
 	directExec(t, connection,
 		`CREATE TABLE docs (id STRING PRIMARY KEY)`, nil)
@@ -270,16 +341,283 @@ func TestExecutionContextInterfacesDoNotOverclaimCancellation(t *testing.T) {
 	defer prepared.Close()
 
 	if _, ok := connection.(sqldriver.QueryerContext); ok {
-		t.Fatal("connection advertises QueryerContext without an interruptible query executor")
+		t.Fatal("connection QueryerContext would need transient-statement row ownership")
 	}
-	if _, ok := prepared.(sqldriver.StmtQueryContext); ok {
-		t.Fatal("statement advertises StmtQueryContext without an interruptible query executor")
+	if _, ok := prepared.(sqldriver.StmtQueryContext); !ok {
+		t.Fatal("statement does not advertise cancellable QueryContext")
 	}
-	if _, ok := prepared.(sqldriver.StmtExecContext); ok {
-		t.Fatal("statement advertises StmtExecContext without an interruptible transaction executor")
+	if _, ok := prepared.(sqldriver.StmtExecContext); !ok {
+		t.Fatal("statement does not advertise cancellable ExecContext")
 	}
 	if _, ok := connection.(sqldriver.ExecerContext); !ok {
-		t.Fatal("connection lost its bounded, prepublication-cancellable ExecContext")
+		t.Fatal("connection lost cancellable ExecContext")
+	}
+}
+
+func TestContextCancellationScopeCancelsAndDoesNotPoisonConnection(t *testing.T) {
+	connection := directTestConn(t)
+	c := connection.(*conn)
+	previous := new(query.CancelFlag)
+	c.exec.Options.Cancel = previous
+
+	ctx, cancel := context.WithCancel(context.Background())
+	scope, err := c.beginContextCancellation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope == nil || c.exec.Options.Cancel != previous {
+		t.Fatal("cancellable context did not reuse the installed cancellation flag")
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for !scope.flag.Canceled() {
+		if time.Now().After(deadline) {
+			t.Fatal("context watcher did not cancel the executor flag")
+		}
+		time.Sleep(time.Microsecond)
+	}
+	if err := scope.finish(query.ErrCanceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mapped cancellation = %v, want context.Canceled", err)
+	}
+	if c.exec.Options.Cancel != previous || previous.Canceled() {
+		t.Fatal("finished context operation did not restore the prior clean flag")
+	}
+	deadlineCtx := &deadlineSignalContext{
+		Context: context.Background(), done: make(chan struct{}),
+	}
+	deadlineScope, err := c.beginContextCancellation(deadlineCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(deadlineCtx.done)
+	if err := deadlineScope.finish(query.ErrCanceled); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("mapped deadline cancellation = %v, want DeadlineExceeded", err)
+	}
+	if c.exec.Options.Cancel != previous || previous.Canceled() {
+		t.Fatal("finished deadline operation did not restore the prior clean flag")
+	}
+	if scope, err := c.beginContextCancellation(context.Background()); err != nil || scope != nil {
+		t.Fatalf("background context scope = (%v, %v), want nil, nil", scope, err)
+	}
+	if c.exec.Options.Cancel != previous {
+		t.Fatal("background context changed the executor flag")
+	}
+	allocations := testing.AllocsPerRun(1_000, func() {
+		scope, err := c.beginContextCancellation(context.Background())
+		if err != nil || scope != nil {
+			panic("background cancellation scope changed during allocation gate")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("background cancellation scope allocated %.2f times, want zero",
+			allocations)
+	}
+}
+
+func TestPrepareObservesInstalledCancellationFlagAndConnectionIsReusable(t *testing.T) {
+	connection := directTestConn(t)
+	c := connection.(*conn)
+	directExec(t, connection, `CREATE TABLE docs (id STRING PRIMARY KEY)`, nil)
+	var cancel query.CancelFlag
+	c.exec.Options.Cancel = &cancel
+	cancel.Cancel()
+	large := "SELECT * FROM docs /*" + strings.Repeat("x", 1<<20) + "*/"
+	prepared, err := c.PrepareContext(context.Background(), large)
+	if prepared != nil {
+		_ = prepared.Close()
+	}
+	if !errors.Is(err, query.ErrCanceled) {
+		t.Fatalf("PrepareContext with installed cancellation = %v, want %v",
+			err, query.ErrCanceled)
+	}
+
+	cancel.Reset()
+	prepared, err = c.PrepareContext(context.Background(), "SELECT * FROM docs")
+	if err != nil {
+		t.Fatalf("connection after canceled parse: %v", err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDatabaseSQLCancellationContractIsAtomicAndReusable(t *testing.T) {
+	contract, ok := conformance.CancellationFor(conformance.DatabaseSQL)
+	if !ok || !contract.NoPartialWrite || !contract.Reusable {
+		t.Fatalf("database/sql cancellation contract = %+v, %v", contract, ok)
+	}
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"kept"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if rows, err := db.QueryContext(ctx, `SELECT id FROM docs`); !errors.Is(err, context.Canceled) {
+		if rows != nil {
+			_ = rows.Close()
+		}
+		t.Fatalf("canceled QueryContext = %v, want context.Canceled", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM docs WHERE id = ?`, "kept"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ExecContext = %v, want context.Canceled", err)
+	}
+
+	deadlineCtx, deadlineCancel := context.WithDeadline(
+		context.Background(), time.Now().Add(-time.Second),
+	)
+	defer deadlineCancel()
+	if _, err := db.QueryContext(deadlineCtx, `SELECT id FROM docs`); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired QueryContext = %v, want DeadlineExceeded", err)
+	}
+
+	var id string
+	if err := db.QueryRow(`SELECT id FROM docs WHERE id = ?`, "kept").Scan(&id); err != nil {
+		t.Fatalf("connection after cancellation: %v", err)
+	}
+	if id != "kept" {
+		t.Fatalf("canceled delete changed row to %q", id)
+	}
+}
+
+func TestDatabaseSQLCancelsActiveScanAndMutation(t *testing.T) {
+	db := openTestDB(t)
+	db.SetMaxOpenConns(1)
+	for _, table := range []string{"left_docs", "right_docs"} {
+		if _, err := db.Exec(`CREATE TABLE ` + table +
+			` (id STRING PRIMARY KEY, grp STRING NOT NULL)`); err != nil {
+			t.Fatal(err)
+		}
+		const batch = 64
+		insertSQL := `INSERT INTO ` + table + ` VALUES ` +
+			strings.TrimSuffix(strings.Repeat("(?),", batch), ",")
+		insert, err := db.Prepare(insertSQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := 1024
+		if table == "left_docs" {
+			rows = 8192
+		}
+		for first := 0; first < rows; first += batch {
+			args := make([]any, batch)
+			for index := range batch {
+				group := "all"
+				if table == "left_docs" && first+index < 32 {
+					group = "victim"
+				}
+				args[index] = fmt.Sprintf(
+					`{"id":"%s-%04d","grp":"%s"}`,
+					table, first+index, group,
+				)
+			}
+			if _, err := insert.Exec(args...); err != nil {
+				_ = insert.Close()
+				t.Fatal(err)
+			}
+		}
+		if err := insert.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sqlConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlConn.Close()
+	// BatchRows is an existing execution control, not a test hook. Setting it
+	// to one makes the scan cross many real durable batch/cancellation
+	// checkpoints, giving the test a deterministic active-command window.
+	if err := sqlConn.Raw(func(raw any) error {
+		raw.(*conn).exec.Options.BatchRows = 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		rows, err := sqlConn.QueryContext(ctx, `
+			SELECT COUNT(*)
+			FROM left_docs AS l
+			JOIN right_docs AS r ON l.grp = r.grp`)
+		if err == nil {
+			for rows.Next() {
+			}
+			err = rows.Err()
+			_ = rows.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		cancel()
+		t.Fatalf("join completed before its cancellation window: %v", err)
+	case <-time.After(2 * time.Millisecond):
+		cancel()
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("active QueryContext = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("active QueryContext did not stop at a bounded checkpoint")
+	}
+
+	deleteStmt, err := sqlConn.PrepareContext(context.Background(),
+		`DELETE FROM left_docs WHERE grp = 'victim'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deleteStmt.Close()
+	cancelActiveStatement(t, deleteStmt, "autocommit DELETE")
+
+	// Repeat the scan inside an explicit transaction. A canceled statement must
+	// leave no partial overlay behind, while the transaction itself remains
+	// usable for a later statement and commit.
+	transaction, err := sqlConn.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	txDelete, err := transaction.PrepareContext(context.Background(),
+		`DELETE FROM left_docs WHERE grp = 'victim'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txDelete.Close()
+	cancelActiveStatement(t, txDelete, "transaction DELETE")
+	if err := txDelete.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.ExecContext(context.Background(),
+		`INSERT INTO left_docs VALUES (?)`,
+		`{"id":"after-cancel","grp":"committed"}`,
+	); err != nil {
+		t.Fatalf("transaction after canceled statement: %v", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("commit after canceled statement: %v", err)
+	}
+
+	var total, victims int
+	if err := sqlConn.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM left_docs`).Scan(&total); err != nil {
+		t.Fatalf("query after active cancellation: %v", err)
+	}
+	if err := sqlConn.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM left_docs WHERE grp = 'victim'`).Scan(&victims); err != nil {
+		t.Fatalf("victim query after active cancellation: %v", err)
+	}
+	if total != 8193 || victims != 32 {
+		t.Fatalf("rows after canceled deletes = total %d victims %d, want 8193/32",
+			total, victims)
 	}
 }
 

@@ -45,9 +45,9 @@ import "fmt"
 const (
 	// IndexTermLeafCutThreshold is the rule-1 probability numerator over a
 	// 2^16 window: a term starts a new run iff routeHash & 0xFFFF falls under
-	// it. 1365/65536 ≈ 1/48 targets a mean 48 terms per run — ≈ 4 KiB of
-	// encoded leaf at the measured 10k-shape term cost; a run larger than the
-	// byte budget is subdivided by rule 3.
+	// it. 1365/65536 ≈ 1/48 targets a mean 48 terms per run; a run larger than
+	// the byte budget is subdivided by rule 3. Encoding-size provenance lives
+	// in docs/performance.md.
 	IndexTermLeafCutThreshold = 1365
 
 	// IndexTermLeafStripeTiles is the fixed absolute tile width of one giant

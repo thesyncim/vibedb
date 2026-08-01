@@ -51,9 +51,9 @@ type IndexInfo struct {
 
 var (
 	// ErrIndexExists reports a CreateIndex name collision.
-	ErrIndexExists = errors.New("vibejson: collection index already exists")
+	ErrIndexExists = errors.New("vibedb: collection index already exists")
 	// ErrIndexNotFound reports an unknown index name.
-	ErrIndexNotFound = errors.New("vibejson: collection index not found")
+	ErrIndexNotFound = errors.New("vibedb: collection index not found")
 )
 
 type storeIndexBuild struct {

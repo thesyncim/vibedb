@@ -43,7 +43,7 @@ type Config struct {
 	Indexed bool
 	// CacheBytes is the read-cache budget every engine is given, so that no
 	// engine wins or loses purely on how much of the corpus it was allowed to
-	// keep resident. It is set to vibejson durable's default ResidentBytes.
+	// keep resident. It is set to VibeDB's default ResidentBytes.
 	CacheBytes int64
 	// StorageProfile selects which optional, engine-provided storage
 	// compression the footprint-only harnesses permit. In the zero-value
@@ -191,7 +191,7 @@ func ResolveStorageProfile(engine string, profile StorageProfile) (StorageProfil
 			),
 			compression: storageCompressionNone,
 		}, nil
-	case "vibejson-durable", "bbolt", "sqlite":
+	case "vibedb", "bbolt", "sqlite":
 		return StorageProfileResolution{
 			Profile:     profile,
 			Compression: "unsupported/no-op",
@@ -283,7 +283,7 @@ func ParseDurabilityMode(value string) (DurabilityMode, error) {
 func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityMode, error) {
 	supported := false
 	switch engine {
-	case "vibejson-durable":
+	case "vibedb":
 		supported = requested == DurabilityBufferedVisible ||
 			requested == DurabilityAsyncStableInFlight ||
 			requested == DurabilityOrdinarySync ||
@@ -312,7 +312,7 @@ func ResolveDurabilityMode(engine string, requested DurabilityMode) (DurabilityM
 // position.
 func BenchmarkDurabilityModes(engine string) []DurabilityMode {
 	switch engine {
-	case "vibejson-durable":
+	case "vibedb":
 		return []DurabilityMode{
 			DurabilityBufferedVisible,
 			DurabilityAsyncStableInFlight,
@@ -489,7 +489,7 @@ type Factory struct {
 // Factories is the registry, in report order.
 func Factories() []Factory {
 	return []Factory{
-		{Name: "vibejson-durable", New: newVibeDurable},
+		{Name: "vibedb", New: newVibeDB},
 		{Name: "bbolt", New: newBbolt},
 		{Name: "badger", New: newBadger},
 		{Name: "pebble", New: newPebble},
@@ -508,7 +508,7 @@ func Factories() []Factory {
 // engine's actual IndexedCount behaviour agree, so the two cannot drift.
 func IndexCapable(name string) bool {
 	switch name {
-	case "vibejson-durable", "sqlite":
+	case "vibedb", "sqlite":
 		return true
 	default:
 		return false
@@ -667,7 +667,7 @@ type Footprint struct {
 	// Sys is everything the Go runtime has taken from the OS. Subtracting it
 	// from MaxRSS estimates the memory an engine holds outside the runtime's
 	// accounting entirely: bbolt's mmap of its file, modernc.org/sqlite's own
-	// page allocator, Pebble's manually managed block cache, and vibejson's
+	// page allocator, Pebble's manually managed block cache, and VibeDB's
 	// internal/storemem anonymous blocks.
 	Sys uint64
 	// RuntimeResident is Sys minus the span memory the runtime has handed back

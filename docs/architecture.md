@@ -5,14 +5,17 @@ graph is the layout: every collection — freshly created, bulk-built, or
 reopened — reads, mutates, checkpoints, and indexes against it. For public
 APIs, see [store.md](store.md); for bytes on disk, see [format.md](format.md).
 
-## The central rule: one reader-visible representation
+## The central rule: one bounded generation cut
 
-Every published generation is complete. A point read, ordered scan, exact-index
-probe, and query all begin from one immutable root. Primary reads and scans
-follow one canonical graph. An exact probe resolves one captured index epoch:
-its immutable spanned-leaf fold base plus the bounded generation-stamped
-posting and liveness records visible at the reader's generation. No reader
-consults a WAL, tombstone set, unbounded merge structure, or version list.
+Every published generation is semantically complete. A point read, ordered
+scan, exact-index probe, and query begin from one immutable root and the bounded
+immutable records that root selects. In deferred primary lanes, the selected
+view is a canonical page graph plus a generation-stamped row overlay capped at
+32,768 records; point reads select the newest applicable record and scans merge
+the same records in key order, including deletes. An exact probe similarly
+resolves its immutable spanned-leaf fold base plus bounded generation-stamped
+posting and liveness records. Readers never consult the recovery journal or an
+unbounded merge structure.
 
 That rule expands into a family of invariants:
 
@@ -20,10 +23,12 @@ That rule expands into a family of invariants:
    for a generation.
 2. Hashes and compact certificates may reject candidates; exact keys and JSON
    values remain authoritative.
-3. A successful delete removes the row and postings immediately. It creates no
-   tombstone or future merge obligation.
-4. Snapshot-visible bytes are immutable. A writer either owns a frame
-   exclusively or uses copy-on-write.
+3. A successful delete removes the row and postings from the published logical
+   view immediately. An eligible deferred lane may encode that absence as a
+   bounded overlay delete record until the next foreground fold.
+4. Snapshot-visible pages and overlay records are immutable. A writer either
+   owns a frame exclusively, uses copy-on-write, or links a new immutable
+   overlay record.
 5. Every queue, cache, transaction, lease table, and retired-extent set is
    bounded at open.
 6. Publication happens only after every query-visible structure for the new
@@ -78,10 +83,11 @@ specified in [format.md](format.md).
 
 The page cache is not merely a copy of durable bytes. In the deferred-canonical
 lanes (buffered-visible and the journal-backed synchronous lane), an owned cache
-frame is the canonical reader-visible page for its stable reference. A mutation
-edits or replaces complete frames, then publishes a new in-process root.
-Repeated changes to the same owned frame can coalesce into one checkpoint
-after-image without adding a reader overlay.
+frame can be the reader-visible base page for its stable reference. A qualifying
+mutation may edit or replace complete frames; the unified primary lane may
+instead link a bounded immutable row record over that base. Repeated changes
+coalesce at a foreground checkpoint, which folds the visible cut into a new
+canonical graph.
 
 Two ownership questions must remain separate:
 
@@ -106,6 +112,7 @@ read root
   → tablet root
   → anchor page
   → ordered hash leaf
+  → newest visible overlay record, if one exists
   → bounded hash candidates
   → exact key confirmation
 ```
@@ -120,11 +127,11 @@ generation-lease path only when the epoch table declines the entry (full,
 writer fence, or Close). A long-lived `Snapshot` still holds a generation lease
 rather than an epoch slot.
 
-An ordered scan follows the rooted tablet cursor for that snapshot. It never
-trusts a physical sibling pointer that a later COW generation could make stale,
-and it never sorts hash order or subtracts tombstones. Query execution takes an
-explicit heap or durable snapshot and uses the same source for indexes, scans,
-and document rechecks.
+An ordered scan follows the rooted tablet cursor for that snapshot and merges
+the bounded overlay at the captured generation, suppressing rows whose newest
+record is a delete. It never trusts a physical sibling pointer that a later COW
+generation could make stale. Query execution takes an explicit heap or durable
+snapshot and uses the same cut for indexes, scans, and document rechecks.
 
 ## SQL and JSON documents
 
@@ -168,12 +175,13 @@ A mutation is planned against one state:
 
 1. Validate and copy the key and complete JSON value.
 2. Resolve the existing row and affected exact-index tuples.
-3. Construct complete after-images for every touched primary leaf/page and
-   metadata path, plus absolute exact-index term/tile records or a bounded
-   structural rebase when stable slots move.
+3. Construct either complete after-images for every touched primary leaf/page,
+   or an eligible immutable primary overlay record, plus absolute exact-index
+   term/tile records or a bounded structural rebase when stable slots move.
 4. Recheck ownership and the source generation.
-5. COW any snapshot-visible or durable-reachable bytes; patch an exclusively
-   owned frame in place when every eligibility check passes.
+5. COW any snapshot-visible or durable-reachable bytes; otherwise patch an
+   exclusively owned frame or link a bounded overlay record when every
+   eligibility check passes.
 6. Link the exact-index records or rebase for the rewritten bucket in the same
    publish.
 7. Publish one new root after the selected acknowledgement boundary. On the
@@ -204,6 +212,7 @@ rebuilds the exact catalogs and exact root:
 
 ```text
 seal visible root
+  → fold the visible primary overlay into dirty/new leaves
   → walk dirty primary children and parents bottom-up
   → fold dirty exact runs/stripes; retain clean leaf refs
   → write complete COW page set plus fresh exact catalogs/root
@@ -224,10 +233,14 @@ each mode.
 
 ## Snapshots and copy-on-write
 
-Snapshot creation retains the current immutable root and acquires a bounded
-generation lease; it does no per-key work. Later mutations may share unchanged
-pages with that root. The first mutation of bytes the snapshot can observe
-creates the minimum replacement path, leaving the snapshot's graph intact.
+Snapshot creation currently folds any pending primary overlay and unsealed
+primary parents under the exclusive writer fence, then captures the resulting
+physical file-store state, primary router, and bounded generation lease. This is
+not a full-store copy or per-key scan, but creation can pay bounded foreground
+work proportional to the dirty primary records being sealed. A resident
+exact-index epoch may remain captured by the snapshot and is reconciled by its
+exact-index reads. Later mutations may still share unchanged pages with the captured
+cut; replaced pages and newly linked records leave the snapshot's view intact.
 
 Retired extents remain unavailable for reuse until no snapshot can reach them.
 A long-lived snapshot therefore consumes bounded retirement capacity and can
@@ -236,32 +249,34 @@ versions. Durable snapshots must be closed promptly.
 
 ## What the design deliberately excludes
 
-vibedb is not an LSM tree. It deliberately excludes reader-visible memtables,
-sorted runs, point and range tombstones, version chains, and merge cursors.
-Those structures can make acknowledgement cheap by deferring canonical
-materialization. They also make reads reconcile representations and create
-flush, compaction, and space-amplification debt.
+vibedb is not an LSM tree. It excludes unbounded memtables, sorted-run levels,
+background compaction, and offline maintenance. Its deferred primary and exact
+index records are fixed-capacity, generation-stamped foreground structures;
+pressure forces a synchronous fold or backpressures admission rather than
+creating open-ended merge or space-amplification debt.
 
-vibedb chooses the opposite trade: bounded writer work produces one
-semantically complete generation before publication. Deletes reclaim their
-logical representation immediately, scans walk one ordered view, and snapshots
-pin roots rather than versions inside a shared read path. The cost is real:
-isolated random writes
-can rewrite page paths, and it shows in the synchronous lane, where a
+The trade is that reads perform an exact bounded reconciliation against the
+captured generation until that foreground fold. Deletes disappear from the
+logical view immediately but may remain as bounded delete records. Snapshots
+currently seal pending primary records before pinning their logical cut; they
+may retain a captured exact-index epoch, but do not retain a primary-overlay
+cut. Isolated random writes can rewrite page paths, and it shows in the
+synchronous lane, where a
 per-mutation durable acknowledgement currently trails SQLite. Writer batching,
-owned-frame in-place updates, and the recovery-only journal are admissible
-optimizations because they do not change what readers consult.
+owned-frame in-place updates, bounded overlays, and the recovery-only journal
+remain predictable because their capacities and fold work are fixed at open.
 
 ## Design map
 
-- [Hybrid mutations](design/hybrid-mutations.md): read-neutral batching and
-  buffered checkpoints.
+- [Hybrid mutations](design/hybrid-mutations.md): bounded foreground staging,
+  batching, and checkpoints.
 - [Canonical materialization](design/canonical-materialization.md): in-place
   frame updates and the gated async capsule path with recovery undo.
 - [Recovery journal](design/recovery-journal.md): the recovery-only redo that
   now backs the synchronous lane.
-- [Parallel tablet writers](design/parallel-tablet-writers.md): future
-  per-tablet concurrency.
+- [Parallel tablet writers](design/parallel-tablet-writers.md): the implemented
+  4,096 full-bucket stripe preparation lane and its remaining publication and
+  structural-concurrency work.
 - [Distributed sharding](design/distributed-sharding.md): future routed
   ownership, replication, failover, and online resharding across independent
   durable roots.

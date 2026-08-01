@@ -433,6 +433,12 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	dst []store.Mask, workspace *IndexWorkspace,
 	name string, values []vibejson.Index,
 ) ([]store.Mask, error) {
+	// LastProbeStats describes this call even when validation fails before any
+	// posting work. Clear it before every early return so a caller never
+	// mistakes the preceding successful probe's counters for the failed one.
+	if workspace != nil {
+		workspace.lastProbe = IndexProbeStats{}
+	}
 	indexID, ok := s.indexNameIDs[name]
 	if !ok {
 		return dst, store.ErrIndexNotFound
@@ -455,9 +461,6 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	}
 	if err != nil {
 		return dst, err
-	}
-	if workspace != nil {
-		workspace.lastProbe = IndexProbeStats{}
 	}
 	epoch := s.epoch
 	if epoch == nil || int(indexID) >= len(epoch.exact) {
@@ -627,10 +630,9 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	}
 	// Sentinel-terminated two-array merge: both sides end on an impossible
 	// tile id, so the hot loop carries no bounds checks, and the flat-table
-	// liveness probe is inlined (hoisted slot array + mask) — together these
-	// are what hold the 64-mutation worst case inside the 1.5 µs gate. The
-	// scratch write-back happens after the sentinels so their grown capacity
-	// is what the workspace retains.
+	// liveness probe is inlined (hoisted slot array + mask). The scratch
+	// write-back happens after the sentinels so their grown capacity is what the
+	// workspace retains. BenchmarkPrimaryExactProbe owns the measured gate.
 	overlay = append(overlay, primaryExactProbeTile{tileID: ^uint32(0)})
 	base = append(base, primaryExactProbeTile{tileID: ^uint32(0)})
 	if workspace != nil {

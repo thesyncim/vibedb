@@ -37,7 +37,9 @@ func (s *Snapshot) AppendIndexMasks(dst []store.Mask, name string, values ...vib
 	return s.AppendIndexMasksInto(dst, &workspace, name, values...)
 }
 
-// AppendIndexMasksInto is AppendIndexMasks with reusable transient storage.
+// AppendIndexMasksInto is the expert, low-level form of AppendIndexMasks with
+// caller-managed reusable transient storage. Normal query execution should use
+// [IndexSession], whose workspace is private.
 func (s *Snapshot) AppendIndexMasksInto(dst []store.Mask, workspace *IndexWorkspace, name string, values ...vibejson.Index) ([]store.Mask, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return dst, ErrClosed
@@ -57,8 +59,9 @@ func (s *Snapshot) AppendIndexCandidateMasks(dst []store.Mask, name string, valu
 	return s.AppendIndexCandidateMasksInto(dst, &workspace, name, values...)
 }
 
-// AppendIndexCandidateMasksInto is AppendIndexCandidateMasks with reusable
-// transient storage.
+// AppendIndexCandidateMasksInto is the expert, low-level form of
+// AppendIndexCandidateMasks with caller-managed reusable transient storage.
+// Normal query execution should use [IndexSession].
 func (s *Snapshot) AppendIndexCandidateMasksInto(dst []store.Mask, workspace *IndexWorkspace, name string, values ...vibejson.Index) ([]store.Mask, error) {
 	return s.AppendIndexMasksInto(dst, workspace, name, values...)
 }

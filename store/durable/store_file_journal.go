@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
@@ -64,7 +65,7 @@ func (c *Collection) poisonJournal(cause error) error {
 	}
 	c.journalFailure.CompareAndSwap(nil, &journalFailureBox{
 		err: fmt.Errorf(
-			"vibejson: recovery journal acknowledgement failed, reopen required: %w",
+			"vibedb: recovery journal acknowledgement failed, reopen required: %w",
 			cause,
 		),
 	})
@@ -171,7 +172,7 @@ func newBufferedJournalDeltaEntryScratch(
 // through RecoveryJournalPath so a caller that publishes a store file by renaming
 // it (a SQL table's atomic temp-to-final publish, say) can relocate the journal
 // with it; leaving the journal behind makes a journaled root unopenable.
-const recoveryJournalSuffix = ".rjournal"
+const recoveryJournalSuffix = collectionname.JournalSuffix
 
 // RecoveryJournalPath returns the recovery-journal sibling path for a store file
 // at storePath. Every buffered-visible or synchronous primary store writes its
@@ -185,7 +186,7 @@ func RecoveryJournalPath(storePath string) string {
 func (c *Collection) journalSiblingPath() (string, error) {
 	name := c.file.Name()
 	if name == "" {
-		return "", fmt.Errorf("vibejson: recovery journal requires a named store file")
+		return "", fmt.Errorf("vibedb: recovery journal requires a named store file")
 	}
 	return RecoveryJournalPath(name), nil
 }
@@ -292,25 +293,31 @@ func createSiblingRecoveryJournal(
 	storePath string, header storeio.RecoveryJournalHeader,
 ) error {
 	if storePath == "" {
-		return fmt.Errorf("vibejson: recovery journal requires a named store file")
+		return fmt.Errorf("vibedb: recovery journal requires a named store file")
+	}
+	storeInfo, err := os.Stat(storePath)
+	if err != nil {
+		return fmt.Errorf("vibedb: stat recovery journal store file: %w", err)
 	}
 	path := storePath + ".rjournal"
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	file, err := os.OpenFile(
+		path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, storeInfo.Mode().Perm(),
+	)
 	if err != nil {
-		return fmt.Errorf("vibejson: create recovery journal file: %w", err)
+		return fmt.Errorf("vibedb: create recovery journal file: %w", err)
 	}
 	journal, err := storeio.CreateRecoveryJournal(file, header)
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
-		return fmt.Errorf("vibejson: create recovery journal: %w", err)
+		return fmt.Errorf("vibedb: create recovery journal: %w", err)
 	}
 	if err := journal.Close(); err != nil {
-		return fmt.Errorf("vibejson: close recovery journal: %w", err)
+		return fmt.Errorf("vibedb: close recovery journal: %w", err)
 	}
 	if err := syncRecoveryJournalParent(path); err != nil {
 		return fmt.Errorf(
-			"vibejson: persist recovery journal directory entry: %w", err,
+			"vibedb: persist recovery journal directory entry: %w", err,
 		)
 	}
 	return nil
@@ -332,7 +339,7 @@ func (c *Collection) openRecoveryJournalLocked(
 		if errors.Is(err, os.ErrNotExist) {
 			return storeio.ErrRecoveryJournalMissing
 		}
-		return fmt.Errorf("vibejson: open recovery journal file: %w", err)
+		return fmt.Errorf("vibedb: open recovery journal file: %w", err)
 	}
 	journal, err := storeio.OpenRecoveryJournal(file)
 	if err != nil {
@@ -1024,11 +1031,11 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 	if failure := c.PersistenceError(); failure != nil {
 		return true, failure
 	}
-	state := c.state.Load()
-	if state == nil {
+	view, logicalOK := c.writerLogicalView()
+	if !logicalOK || view.state == nil {
 		return true, ErrClosed
 	}
-	target := state.root.Generation
+	target := view.generation
 	after := c.journalDeltaAppendedGeneration.Load()
 	complete, appendErr :=
 		c.appendBufferedJournalDeltaLocked(after, target)
@@ -1140,11 +1147,11 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	if failure := c.PersistenceError(); failure != nil {
 		return true, failure
 	}
-	state := c.state.Load()
-	if state == nil {
+	view, logicalOK := c.writerLogicalView()
+	if !logicalOK || view.state == nil {
 		return true, ErrClosed
 	}
-	target := state.root.Generation
+	target := view.generation
 	durableAfter := c.journalDeltaGeneration.Load()
 	appendedAfter := c.journalDeltaAppendedGeneration.Load()
 	if target == durableAfter {

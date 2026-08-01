@@ -75,7 +75,7 @@ func run(args []string, out io.Writer) error {
 		return fmt.Errorf("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
 	}
 	if *list {
-		fmt.Fprintln(out, "vibejson-durable bbolt badger pebble sqlite")
+		fmt.Fprintln(out, "vibedb bbolt badger pebble sqlite")
 		return nil
 	}
 	if cfg.engineName == "" || cfg.corpusSize < 1 || cfg.mutationBudget < 1 ||

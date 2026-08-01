@@ -96,14 +96,12 @@ import (
 //
 // What sixteen buys is live footprint, which the dictionary can only add to:
 // a live segment keeps its source for zero-copy reads, so every splice record is
-// eight resident bytes and every distinct span a sighting-set entry, none of
-// it offset by a byte the segment stops holding. Measured on a corpus mixing short
-// and long enums, dropping the floor to eight raised the modeled at-rest
-// saving from 38.2 to 47.2 B per document (+23.6%) while raising live cost
-// from 19.7 to 36.6 B per document (+86%). Sixteen takes the long spans, whose
-// at-rest saving is large per record, and declines the short ones, whose live
-// cost per byte saved is worst. A floor of four or less is never right at any
-// setting: it admits spans that measurably lose at rest as well.
+// eight resident bytes and every distinct span a sighting-set entry, none of it
+// offset by a byte the segment stops holding. Sixteen admits longer spans whose
+// at-rest saving is large per record and declines shorter spans whose live cost
+// per byte saved is worst. A floor of four or less can never win at rest because
+// the reference is no smaller than the value. The measured floor sweep lives in
+// docs/performance.md.
 const valueDictMinSpan = 16
 
 // valueDictRefBytes is the modeled at-rest cost of one dictionary reference: the

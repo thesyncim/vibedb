@@ -474,7 +474,13 @@ func (p *Prepared) QueryInto(
 	if err != nil {
 		return p.fail(err)
 	}
+	scope, err := p.session.conn.beginContextCancellation(ctx)
+	if err != nil {
+		clear(args)
+		return p.fail(err)
+	}
 	rowset, err := p.statement.queryRows(ctx, args)
+	err = scope.finish(err)
 	if err != nil {
 		return p.fail(err)
 	}
@@ -502,7 +508,13 @@ func (p *Prepared) Exec(ctx context.Context, values []any) (Result, error) {
 	if err != nil {
 		return Result{}, p.fail(err)
 	}
+	scope, err := p.session.conn.beginContextCancellation(ctx)
+	if err != nil {
+		clear(args)
+		return Result{}, p.fail(err)
+	}
 	driverResult, err := p.statement.exec(ctx, args)
+	err = scope.finish(err)
 	if err != nil {
 		return Result{}, p.fail(err)
 	}

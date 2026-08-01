@@ -27,7 +27,11 @@ type stmt struct {
 	closed       bool
 }
 
-var _ sqldriver.Stmt = (*stmt)(nil)
+var (
+	_ sqldriver.Stmt             = (*stmt)(nil)
+	_ sqldriver.StmtExecContext  = (*stmt)(nil)
+	_ sqldriver.StmtQueryContext = (*stmt)(nil)
+)
 
 func (s *stmt) NumInput() int { return s.params }
 
@@ -99,6 +103,40 @@ func (s *stmt) Query(values []sqldriver.Value) (sqldriver.Rows, error) {
 	return s.queryRows(backgroundContext, args)
 }
 
+// QueryContext bridges ctx into the executor only for the duration of this
+// materializing query. The watcher exists only for a cancellable context; the
+// background path retains the same nil CancelFlag used by Query.
+func (s *stmt) QueryContext(
+	ctx context.Context,
+	values []sqldriver.NamedValue,
+) (rowset sqldriver.Rows, err error) {
+	if s.closed {
+		return nil, errors.New("vibedb: statement is closed")
+	}
+	if s.query == nil {
+		return nil, fmt.Errorf("vibedb: %s returns no rows; use Exec", s.tree.Kind)
+	}
+	if err := s.checkArgumentCount(len(values)); err != nil {
+		return nil, err
+	}
+	if err := checkSQLNamedValues(values); err != nil {
+		return nil, err
+	}
+	args, err := s.conn.values(values)
+	if err != nil {
+		return nil, err
+	}
+	scope, err := s.conn.beginContextCancellation(ctx)
+	if err != nil {
+		clear(args)
+		return nil, err
+	}
+	if scope != nil {
+		defer func() { err = scope.finish(err) }()
+	}
+	return s.queryRows(ctx, args)
+}
+
 // queryRows is the typed query primitive shared by database/sql and the public
 // runtime. args must be connection-owned storage: it is cleared on return so an
 // idle session never pins caller values. Runtime callers copy interface headers
@@ -140,8 +178,8 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	if s.mutation != nil {
 		var cursor query.Cursor
 		if s.conn.tx != nil {
-			cursor, err = s.conn.tx.execMutationReturning(
-				s.mutation, args, s.query,
+			cursor, err = s.conn.tx.execMutationReturningContext(
+				ctx, s.mutation, args, s.query,
 			)
 		} else {
 			cursor, err = s.conn.mutationReturningContext(
@@ -574,7 +612,14 @@ func (s *stmt) Exec(values []sqldriver.Value) (sqldriver.Result, error) {
 	return s.exec(backgroundContext, s.conn.positionalValues(values))
 }
 
-func (s *stmt) execContext(ctx context.Context, arguments []sqldriver.NamedValue) (sqldriver.Result, error) {
+// ExecContext is the context-aware mutation boundary required by database/sql.
+// Scan-shaped UPDATE and DELETE operations observe ctx through the same query
+// CancelFlag as SELECT. Cancellation is joined before return, and publication
+// still begins only after the final contextCheckpoint in the mutation path.
+func (s *stmt) ExecContext(
+	ctx context.Context,
+	arguments []sqldriver.NamedValue,
+) (result sqldriver.Result, err error) {
 	if err := s.preflightExec(len(arguments)); err != nil {
 		return nil, err
 	}
@@ -584,6 +629,14 @@ func (s *stmt) execContext(ctx context.Context, arguments []sqldriver.NamedValue
 	args, err := s.conn.values(arguments)
 	if err != nil {
 		return nil, err
+	}
+	scope, err := s.conn.beginContextCancellation(ctx)
+	if err != nil {
+		clear(args)
+		return nil, err
+	}
+	if scope != nil {
+		defer func() { err = scope.finish(err) }()
 	}
 	return s.exec(ctx, args)
 }
@@ -606,7 +659,7 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 		if err := contextCheckpoint(ctx); err != nil {
 			return nil, err
 		}
-		return s.conn.tx.execMutation(s.mutation, args)
+		return s.conn.tx.execMutationContext(ctx, s.mutation, args)
 	}
 	return s.conn.execMutationContext(ctx, s.mutation, args)
 }

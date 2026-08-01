@@ -21,7 +21,7 @@ const (
 
 // ErrPageCorrupt reports a malformed, truncated, or checksum-invalid common
 // Store page.
-var ErrPageCorrupt = errors.New("vibejson: corrupt Store page")
+var ErrPageCorrupt = errors.New("vibedb: corrupt Store page")
 
 // DevelopmentFormatVersion is zero for every on-disk schema while the format
 // is unreleased. Layout changes edit schema zero in place and obsolete images

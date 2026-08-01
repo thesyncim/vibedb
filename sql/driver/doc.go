@@ -153,13 +153,21 @@
 //
 // # Context cancellation
 //
-// Connection, preparation, transaction-start, and bounded CREATE/INSERT work
-// use context-aware driver interfaces. Cancellation can stop lock acquisition,
-// parsing, validation, and write preparation before the durable publication
-// checkpoint. Once publication begins it runs to completion and returns its
-// storage outcome, including durable.ErrCommitOutcomeUnknown when a published
-// namespace change cannot be fenced. The driver never returns cancellation
-// while a write continues in the background.
+// Connection, preparation, queries, transaction staging, and every mutation
+// use context-aware driver interfaces. For a cancellable context, database/sql
+// bridges ctx.Done to the executor's cooperative CancelFlag for exactly one
+// operation and joins that watcher before returning. SELECT, JOIN, grouping,
+// sorting, filtered UPDATE/DELETE, and spill work therefore stop at bounded
+// checkpoints without leaking workers, temporary files, snapshots, partial
+// results, or partially staged transaction state. A context with no Done
+// channel retains the allocation-free nil-flag execution path.
+//
+// Cancellation can stop lock acquisition, parsing, validation, scans, and
+// write preparation before the durable publication checkpoint. Once
+// publication begins it runs to completion and returns its storage outcome,
+// including durable.ErrCommitOutcomeUnknown when a published namespace change
+// cannot be fenced. The driver never returns cancellation while a write
+// continues in the background.
 //
 // The typed runtime additionally accepts a reusable [query.CancelFlag] through
 // [Session.SetCancelFlag]. The executor observes that flag at bounded
@@ -168,13 +176,10 @@
 // adds one pointer comparison and no allocation. Protocol adapters may bridge
 // a request context to that flag from their existing cancellation goroutine.
 //
-// database/sql deliberately does not advertise QueryerContext,
-// StmtQueryContext, or StmtExecContext for scan-shaped work: its interfaces
-// provide no persistent per-connection cancellation signal to the executor.
-// database/sql can reject a canceled context before dispatch, but an already
-// active SELECT, filtered UPDATE, or DELETE scan runs to completion. Query
-// memory, result, batch, and spill ceilings remain resource-admission bounds,
-// not execution deadlines.
+// database/sql advertises StmtQueryContext and StmtExecContext. Direct
+// connection ExecContext uses the same prepared execution path, including for
+// scan-shaped UPDATE and DELETE. Query memory, result, batch, and spill
+// ceilings remain resource-admission bounds independent of deadlines.
 //
 // # Concurrency and pooling
 //

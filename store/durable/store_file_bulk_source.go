@@ -49,7 +49,7 @@ func collectFileStoreBulkRows(state *store.State, options normalizedFileStoreOpt
 		return nil, collectErr
 	}
 	if len(rows) != state.Count {
-		return nil, fmt.Errorf("vibejson: collection bulk source count invariant")
+		return nil, fmt.Errorf("vibedb: collection bulk source count invariant")
 	}
 	return rows, nil
 }

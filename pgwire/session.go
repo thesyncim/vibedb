@@ -52,6 +52,11 @@ type session struct {
 	// protocol adapter.
 	sql         *sqldriver.Session
 	queryCancel query.CancelFlag
+	// cancelCheck is the session-bound method value passed through protocol-side
+	// scanners and the SQL runtime. Binding it once avoids rebuilding an escaping
+	// closure for every Parse or Query; a nil callback remains the standalone
+	// command helpers' no-check hot path.
+	cancelCheck func() error
 	// cancelMu makes the active-command boundary atomic with delivery of an
 	// out-of-band CancelRequest. Without it, a request received while this
 	// backend was idle could leave queryCancel armed and cancel the next
@@ -88,6 +93,11 @@ type session struct {
 	// arenas.
 	statementBindBytes int
 	portalBytes        int
+	// catalogOIDs are session-local continuation tokens for psql's multi-query
+	// \d exchange. They are assigned monotonically and never reused, so a table
+	// created between name resolution and detail lookup cannot retarget an oid.
+	catalogOIDs    []catalogOIDEntry
+	nextCatalogOID uint32
 
 	// msg is the decoded frontend message, reused so a session that serves a
 	// million messages allocates one set of parameter slices.
@@ -254,6 +264,7 @@ func newSession(s *Server, conn net.Conn) *session {
 		statements: map[string]*prepared{},
 		portals:    map[string]*portal{},
 	}
+	session.bindCancellationCheck()
 	// bufio.Writer may flush from inside Write when one DataRow is larger than
 	// its buffer. Arming only session.flush is therefore too late: the socket
 	// write has already happened. Refresh immediately before every operation
@@ -301,6 +312,7 @@ func (s *session) shutdownCancel() {
 // out-of-band CancelRequest. Session execution is single-threaded, so command
 // windows never nest.
 func (s *session) beginCancelable() {
+	s.bindCancellationCheck()
 	s.cancelMu.Lock()
 	s.queryCancel.Reset()
 	s.cancelActive = true
@@ -308,6 +320,12 @@ func (s *session) beginCancelable() {
 		s.queryCancel.Cancel()
 	}
 	s.cancelMu.Unlock()
+}
+
+func (s *session) bindCancellationCheck() {
+	if s.cancelCheck == nil {
+		s.cancelCheck = s.cancellationError
+	}
 }
 
 // endCancelable closes the current cancellation window and consumes any
@@ -552,6 +570,13 @@ func (s *session) takeCancel() bool {
 	return s.queryCancel.Take()
 }
 
+func (s *session) cancellationError() error {
+	if s.queryCancel.Canceled() {
+		return query.ErrCanceled
+	}
+	return nil
+}
+
 // startupParameter applies one startup-packet parameter.
 //
 // The four protocol-level names are handled here; everything else goes through
@@ -728,7 +753,7 @@ func (s *session) simpleQuery(sql string) error {
 	implicit, preflightErr := s.preflightSimpleQuery(sql)
 	if preflightErr != nil {
 		s.markTransactionFailed()
-		s.w.errorResponse(preflightErr)
+		s.w.errorResponse(asPGErrorIn(preflightErr, sql))
 		s.w.readyForQuery(s.transactionStatus())
 		return s.flush()
 	}
@@ -740,11 +765,17 @@ func (s *session) simpleQuery(sql string) error {
 		}
 	}
 
-	iter := statementIterator{src: sql}
+	iter := statementIterator{src: sql, check: s.cancelCheck}
 	count := 0
 	failed := false
 	for {
-		text, ok := iter.next()
+		text, ok, nextErr := iter.next()
+		if nextErr != nil {
+			s.markTransactionFailed()
+			s.w.errorResponse(asPGErrorIn(nextErr, sql))
+			failed = true
+			break
+		}
 		if !ok {
 			break
 		}
@@ -757,6 +788,7 @@ func (s *session) simpleQuery(sql string) error {
 			break
 		}
 		if s.takeCancel() {
+			s.markTransactionFailed()
 			s.w.errorResponse(newError(sqlstateQueryCanceled,
 				"canceling statement due to a cancel request"))
 			failed = true
@@ -805,8 +837,8 @@ func (s *session) simpleQuery(sql string) error {
 	return s.flush()
 }
 
-func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
-	iter := statementIterator{src: src}
+func (s *session) preflightSimpleQuery(src string) (bool, error) {
+	iter := statementIterator{src: src, check: s.cancelCheck}
 	count := 0
 	var first statementKind
 	catalogSQL := false
@@ -818,7 +850,10 @@ func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
 	terminalCount := 0
 	terminalAt := 0
 	for {
-		text, ok := iter.next()
+		text, ok, err := iter.next()
+		if err != nil {
+			return false, err
+		}
 		if !ok {
 			break
 		}
@@ -828,7 +863,10 @@ func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
 				"a simple Query message may contain at most %d non-empty statements",
 				maxSimpleStatements))
 		}
-		kind, _ := classify(text)
+		kind, _, err := classifyCancelable(text, s.cancelCheck)
+		if err != nil {
+			return false, err
+		}
 		if count == 1 {
 			first = kind
 		}
@@ -837,11 +875,14 @@ func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
 			catalogSQL = true
 		case kindCatalogSQL:
 			catalogSQL = true
-			scan := scanner{src: text}
-			leader := scan.word()
-			if strings.EqualFold(leader, "CREATE") ||
-				strings.EqualFold(leader, "DROP") ||
-				strings.EqualFold(leader, "TRUNCATE") {
+			scan := newScanner(text, s.cancelCheck)
+			word := scan.word()
+			if scan.cancelErr != nil {
+				return false, scan.cancelErr
+			}
+			if strings.EqualFold(word, "CREATE") ||
+				strings.EqualFold(word, "DROP") ||
+				strings.EqualFold(word, "TRUNCATE") {
 				ddl = true
 			} else {
 				dml = true
@@ -949,11 +990,18 @@ func (s *session) runSimple(text string) error {
 // prepare turns statement text into a prepared statement, classifying it first
 // so that a refusal carries the right SQLSTATE.
 func (s *session) prepare(name, text string) (*prepared, error) {
-	if !utf8.ValidString(text) {
+	valid, err := validUTF8Cancelable(text, s.cancelCheck)
+	if err != nil {
+		return nil, asPGErrorIn(err, text)
+	}
+	if !valid {
 		return nil, newError(sqlstateCharacterNotInRepertoire,
 			"SQL text is not valid UTF-8")
 	}
-	kind, reason := classify(text)
+	kind, reason, err := classifyCancelable(text, s.cancelCheck)
+	if err != nil {
+		return nil, asPGErrorIn(err, text)
+	}
 	p := &prepared{name: name, sql: text, kind: kind}
 	switch kind {
 	case kindEmpty:
@@ -962,9 +1010,11 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	case kindCatalogSQL:
 
 	case kindBegin, kindCommit, kindRollback:
-		readOnly, err := parseTransactionCommand(text, kind)
+		readOnly, err := parseTransactionCommandCancelable(
+			text, kind, s.cancelCheck,
+		)
 		if err != nil {
-			return nil, err
+			return nil, asPGErrorIn(err, text)
 		}
 		p.txReadOnly = readOnly
 		switch kind {
@@ -976,9 +1026,6 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 			p.tag = "ROLLBACK"
 		}
 		return p, nil
-
-	case kindUnsupported:
-		return nil, newError(sqlstateFeatureNotSupported, reason)
 
 	case kindUnknown:
 		if reason != "" {
@@ -993,12 +1040,12 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		var cmd setCommand
 		var err error
 		if kind == kindSet {
-			cmd, err = parseSet(text)
+			cmd, err = parseSetCancelable(text, s.cancelCheck)
 		} else {
-			cmd, err = parseReset(text)
+			cmd, err = parseResetCancelable(text, s.cancelCheck)
 		}
 		if err != nil {
-			return nil, err
+			return nil, asPGErrorIn(err, text)
 		}
 		if !cmd.all {
 			if _, _, ok := lookupParameter(cmd.name); !ok {
@@ -1009,9 +1056,9 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		return p, nil
 
 	case kindShow:
-		name, err := parseShow(text)
+		name, err := parseShowCancelable(text, s.cancelCheck)
 		if err != nil {
-			return nil, err
+			return nil, asPGErrorIn(err, text)
 		}
 		fixed, err := s.showResult(name)
 		if err != nil {
@@ -1021,8 +1068,8 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		return p, nil
 
 	case kindDiscard:
-		if err := parseDiscard(text); err != nil {
-			return nil, err
+		if err := parseDiscardCancelable(text, s.cancelCheck); err != nil {
+			return nil, asPGErrorIn(err, text)
 		}
 		p.tag = "DISCARD"
 		return p, nil
@@ -1031,9 +1078,11 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	// A SELECT tries the compatibility shim before the stored-row front end.
 	if kind == kindSelect {
 		shim := shimFunctions{database: s.database, user: s.user, pid: s.pid}
-		fixed, ok, err := shim.parseFixedSelect(text)
+		fixed, ok, err := shim.parseFixedSelectCancelable(
+			text, s.cancelCheck,
+		)
 		if err != nil {
-			return nil, err
+			return nil, asPGErrorIn(err, text)
 		}
 		if ok {
 			p.fixed, p.cols, p.tag = &fixed, fixed.cols, fixed.tag
@@ -1044,9 +1093,11 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	// ever sees them; see command.go for why that happens here rather than in
 	// the parser. The rewrite preserves byte offsets, so the error reported
 	// below still points at the byte the client wrote.
-	lowered, order, highest, err := rewriteNumberedParameters(text)
+	lowered, order, highest, err := rewriteNumberedParameters(
+		text, s.cancelCheck,
+	)
 	if err != nil {
-		return nil, err
+		return nil, asPGErrorIn(err, text)
 	}
 	runtime, err := s.sql.Prepare(context.Background(), lowered)
 	if err != nil {
@@ -1056,7 +1107,11 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		// untouched, and a refused statement pays one recognition attempt
 		// on an already-failed cold path. An unrecognized statement keeps
 		// the runtime's original error unchanged. See catalog_shim.go.
-		if fixed, ok := s.catalogShim(text); ok {
+		fixed, ok, shimErr := s.catalogShim(text, s.cancelCheck)
+		if shimErr != nil {
+			return nil, asPGErrorIn(shimErr, text)
+		}
+		if ok {
 			p.fixed, p.cols, p.tag = fixed, fixed.cols, fixed.tag
 			return p, nil
 		}

@@ -18,20 +18,67 @@ import "fmt"
 // byte — the invariant the '@>' needle scan depends on, since it reads raw JSON
 // straight out of the source starting from pos.
 type lexer struct {
-	src string
-	pos int
+	src            string
+	pos            int
+	cancel         func() error
+	cancelErr      error
+	nextCancelByte int
+	tokens         uint
+}
+
+const (
+	parserCancelByteInterval  = 4 << 10
+	parserCancelTokenInterval = 256
+)
+
+func (lx *lexer) captureCancellation() bool {
+	if lx.cancelErr != nil {
+		return true
+	}
+	if err := lx.cancel(); err != nil {
+		lx.cancelErr = err
+		return true
+	}
+	return false
+}
+
+func (lx *lexer) cancelAtToken() bool {
+	if lx.cancel == nil {
+		return false
+	}
+	lx.tokens++
+	return lx.tokens%parserCancelTokenInterval == 1 && lx.captureCancellation()
+}
+
+func (lx *lexer) cancelAtByte() bool {
+	if lx.cancel == nil || lx.pos < lx.nextCancelByte {
+		return false
+	}
+	lx.nextCancelByte = lx.pos + parserCancelByteInterval
+	return lx.captureCancellation()
+}
+
+func (lx *lexer) canceledToken() token {
+	return errorToken(lx.pos, "parsing canceled")
 }
 
 // next returns the token beginning at or after pos and advances past it.
 func (lx *lexer) next() token {
+	if lx.cancelAtToken() {
+		return lx.canceledToken()
+	}
 	for {
-		lx.skipSpace()
+		if !lx.skipSpace() {
+			return lx.canceledToken()
+		}
 		if lx.pos >= len(lx.src) {
 			return token{kind: tokEOF, pos: lx.pos}
 		}
 		c := lx.src[lx.pos]
 		if c == '-' && lx.pos+1 < len(lx.src) && lx.src[lx.pos+1] == '-' {
-			lx.skipLineComment()
+			if !lx.skipLineComment() {
+				return lx.canceledToken()
+			}
 			continue
 		}
 		if c == '/' && lx.pos+1 < len(lx.src) && lx.src[lx.pos+1] == '*' {
@@ -136,24 +183,32 @@ func (lx *lexer) next() token {
 	return errfToken(start, "unexpected character %q", string(rune(c)))
 }
 
-func (lx *lexer) skipSpace() {
+func (lx *lexer) skipSpace() bool {
 	for lx.pos < len(lx.src) {
+		if lx.cancelAtByte() {
+			return false
+		}
 		switch lx.src[lx.pos] {
 		case ' ', '\t', '\n', '\r', '\v', '\f':
 			lx.pos++
 		default:
-			return
+			return true
 		}
 	}
+	return true
 }
 
 // skipLineComment consumes "-- ..." through the end of the line. The newline
 // itself is left for skipSpace, so line counting in errors stays correct.
-func (lx *lexer) skipLineComment() {
+func (lx *lexer) skipLineComment() bool {
 	lx.pos += 2
 	for lx.pos < len(lx.src) && lx.src[lx.pos] != '\n' {
+		if lx.cancelAtByte() {
+			return false
+		}
 		lx.pos++
 	}
+	return true
 }
 
 // skipBlockComment consumes "/* ... */". Block comments do not nest, matching
@@ -163,6 +218,9 @@ func (lx *lexer) skipBlockComment() (token, bool) {
 	start := lx.pos
 	lx.pos += 2
 	for lx.pos+1 < len(lx.src) {
+		if lx.cancelAtByte() {
+			return lx.canceledToken(), false
+		}
 		if lx.src[lx.pos] == '*' && lx.src[lx.pos+1] == '/' {
 			lx.pos += 2
 			return token{}, true
@@ -185,6 +243,9 @@ func (lx *lexer) accept(c byte) bool {
 func (lx *lexer) lexIdent() token {
 	start := lx.pos
 	for lx.pos < len(lx.src) && isIdentPart(lx.src[lx.pos]) {
+		if lx.cancelAtByte() {
+			return lx.canceledToken()
+		}
 		lx.pos++
 	}
 	text := lx.src[start:lx.pos]
@@ -202,6 +263,9 @@ func (lx *lexer) lexQuoted(quote byte, kind tokenKind) token {
 	body := lx.pos
 	escaped := false
 	for lx.pos < len(lx.src) {
+		if lx.cancelAtByte() {
+			return lx.canceledToken()
+		}
 		if lx.src[lx.pos] != quote {
 			lx.pos++
 			continue
@@ -234,6 +298,9 @@ func (lx *lexer) lexNumber() token {
 	lx.accept('-')
 	intStart := lx.pos
 	for lx.pos < len(lx.src) && isDigit(lx.src[lx.pos]) {
+		if lx.cancelAtByte() {
+			return lx.canceledToken()
+		}
 		lx.pos++
 	}
 	switch {
@@ -246,6 +313,9 @@ func (lx *lexer) lexNumber() token {
 		lx.pos++
 		fracStart := lx.pos
 		for lx.pos < len(lx.src) && isDigit(lx.src[lx.pos]) {
+			if lx.cancelAtByte() {
+				return lx.canceledToken()
+			}
 			lx.pos++
 		}
 		if lx.pos == fracStart {
@@ -259,6 +329,9 @@ func (lx *lexer) lexNumber() token {
 		}
 		expStart := lx.pos
 		for lx.pos < len(lx.src) && isDigit(lx.src[lx.pos]) {
+			if lx.cancelAtByte() {
+				return lx.canceledToken()
+			}
 			lx.pos++
 		}
 		if lx.pos == expStart {

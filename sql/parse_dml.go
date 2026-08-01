@@ -21,7 +21,7 @@ package sql
 // it inherit.
 func (p *Parser) ParseStatement(dst *Statement, src string) error {
 	*dst = Statement{}
-	if err := validateStatementText(src); err != nil {
+	if err := validateStatementText(src, p.cancel); err != nil {
 		return err
 	}
 	p.reset(src)
@@ -30,7 +30,14 @@ func (p *Parser) ParseStatement(dst *Statement, src string) error {
 		// returned beside the error: a caller that ignores the error and lowers
 		// dst anyway must get nothing rather than whichever clauses parsed.
 		*dst = Statement{}
+		if p.lx.cancelErr != nil {
+			return p.lx.cancelErr
+		}
 		return err
+	}
+	if p.lx.cancelErr != nil {
+		*dst = Statement{}
+		return p.lx.cancelErr
 	}
 	return nil
 }
@@ -84,10 +91,9 @@ func KindOf(src string) Kind {
 	return KindSelect
 }
 
-// parseAnyStatement dispatches on the leading keyword. The three statement
-// kinds SQL has that this engine has no execution for at all are named here
-// rather than left to fall through as "expected SELECT", because a MERGE
-// rejected as a syntax error reads as if the syntax were the problem.
+// parseAnyStatement dispatches on supported leading keywords, then consults
+// the shared typed unsupported taxonomy before falling through to SELECT's
+// syntax parser.
 func (p *Parser) parseAnyStatement(dst *Statement) error {
 	switch {
 	case p.atKeyword(kwExplain):
@@ -112,19 +118,16 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwDelete):
 		dst.Kind, dst.Delete = KindDelete, &p.del
 		return p.parseDelete()
-	case p.atKeyword(kwMerge):
-		return p.errHere("MERGE is not supported: it is a conditional insert-or-update over a join, and this engine has neither a conditional write nor a join that returns rows to write from")
-	case p.atKeyword(kwReplace):
-		return p.errHere("REPLACE is not supported; INSERT into a key that already exists is refused, and a deliberate overwrite is written UPDATE ... SET \"$doc\" = ?")
 	case p.atKeyword(kwCreate):
 		return p.parseCreate(dst)
 	case p.atKeyword(kwDrop):
 		return p.parseDrop(dst)
-	case p.atKeyword(kwAlter):
-		return p.errHere("ALTER is not supported: a declared schema is frozen when the collection is created, and altering one would have to revalidate every stored document")
 	case p.atKeyword(kwTruncate):
 		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
 		return p.parseTruncate()
+	}
+	if reason, unsupported := unsupportedStatementReason(p.tok); unsupported {
+		return p.featureNotSupportedHere(reason)
 	}
 	dst.Kind, dst.Select = KindSelect, &p.sel
 	p.out = &p.sel
@@ -384,7 +387,17 @@ func (p *Parser) parseDocumentOperand() (Operand, error) {
 func (p *Parser) scanJSONDocument(from int) (text string, start, end int, err error) {
 	src := p.lx.src
 	i := from
+	if err := p.checkCancellation(); err != nil {
+		return "", i, 0, err
+	}
+	nextCheck := i + parserCancelByteInterval
 	for i < len(src) && isJSONSpace(src[i]) {
+		if i >= nextCheck {
+			if err := p.checkCancellation(); err != nil {
+				return "", i, 0, err
+			}
+			nextCheck = i + parserCancelByteInterval
+		}
 		i++
 	}
 	if i >= len(src) {

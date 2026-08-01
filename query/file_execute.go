@@ -123,7 +123,7 @@ type ExecOptions struct {
 // inside each batch, which meant no amount of Exec reuse could ever warm the
 // scan — every BatchRows documents re-grew all of it from empty.
 type fileWorkspace struct {
-	index      durable.IndexWorkspace
+	index      durable.IndexSession
 	overflow   []byte
 	accs       []aggAcc
 	fileGroups []fileGroup
@@ -1184,11 +1184,9 @@ func (p *plan) makeFilePartial(
 	// omission. Postings are an inverted index over a Segment's top-level keys
 	// and scalars; building one costs a hash and a bucket append per member of
 	// every document, and this Segment is probed exactly once and then dropped,
-	// so the build can never amortize. Measured on an unindexed filtered count
-	// at 1% selectivity — the case most favourable to pruning, since the probe
-	// discards 99% of the batch — enabling them cost 4.2 allocations per
-	// scanned document, 210 of every 211 the whole backend made, and ran 1.9x
-	// slower than the honest columnar scan they were meant to avoid. Real
+	// so the build can never amortize. The filtered-count benchmark covers the
+	// most favorable pruning case and still makes the temporary index slower
+	// and allocation-heavy; exact results live in docs/performance.md. Real
 	// pushdown happens before the scan, against the snapshot's persistent
 	// indexes (fileCandidateMasks); once a batch is in hand the compiled
 	// predicate's single pass over at most BatchRows rows is already cheaper
@@ -1416,10 +1414,10 @@ type fileArena struct {
 // dropped every row in it, and the newest thing in a single arena is always the
 // batch the worker just finished — which is by construction one the consumer has
 // not reached. A rewind conditioned on that never fires when the pipeline is
-// busy: measured under the race detector, a LIMIT 10 over fifty thousand
-// documents retained 1.0 MB, against 18 kB when the scheduler happened to leave
-// the workers idle enough for the condition to come true. A bound that holds
-// only when the machine is not busy is not a bound.
+// busy: the race-detector regression test showed retention depending on whether
+// the scheduler happened to leave workers idle. A bound that holds only when
+// the machine is not busy is not a bound; measured provenance lives in
+// docs/performance.md.
 //
 // Giving each batch its own generation makes the question answerable. A
 // generation is reusable once the consumer's drop frontier has passed the batch

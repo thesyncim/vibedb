@@ -15,10 +15,10 @@ var (
 	// ErrDuplicateKey reports that Builder.Append received a key it
 	// already owns. Bulk construction requires unique keys so every document is
 	// written exactly once into its final micro-page.
-	ErrDuplicateKey = errors.New("vibejson: duplicate Builder key")
+	ErrDuplicateKey = errors.New("vibedb: duplicate Builder key")
 	// ErrBuilderClosed reports use after Build transferred the builder's
 	// immutable graph into a collection.
-	ErrBuilderClosed = errors.New("vibejson: Builder is closed")
+	ErrBuilderClosed = errors.New("vibedb: Builder is closed")
 )
 
 // Builder constructs a keyed collection without publishing and path-copying
@@ -36,19 +36,17 @@ var (
 // Use it for any load of more than a chunk's worth of rows. Put rebuilds its
 // whole chunk per write — that is what makes a published chunk immutable and a
 // delete tombstone-free — so a loop of Put over N rows does O(N*ChunkDocuments)
-// copying and allocates roughly an order of magnitude more per row than Append
-// does. Measured on a 100,000-row, 24 MiB corpus: Append plus Build allocated
-// 821 B and 0.19 allocations per row, where the same rows through Put allocated
-// about 7.8 kB and 14 allocations each.
+// copying. Append and Build avoid that repeated published-state work. Measured
+// allocation and footprint comparisons, with reproduction commands, live in
+// docs/performance.md rather than in this API contract.
 //
 // Build is where the load's memory peaks, and by a wide margin. Every appended
 // page stages its source and structural tapes on the Go heap and holds them
 // until compactDocuments copies the whole graph into one off-heap block, so the
 // builder's Go-heap working set grows with the corpus and is at its largest at
-// the moment that block is allocated — the same corpus measured 77 MiB of live
-// Go heap and 119 MiB of MemStats.HeapSys against 3.9 MiB of steady-state
-// HeapAlloc afterwards. Size a process for the load, not for the result, and
-// see the package documentation on why HeapAlloc shows neither.
+// the moment that block is allocated. Size a process for the load, not only for
+// the steady-state result, and see the package documentation for the distinction
+// between Go-heap high water and off-heap collection storage.
 type Builder struct {
 	options  Options
 	seed     maphash.Seed
@@ -434,7 +432,7 @@ func (b *Builder) compactBaseKeys() (*storeMappedKeys, error) {
 	}
 	base, err := newStoreOwnedKeys(b.count, b.keyBytes, b.chunks.Count >= storeMappedLocationMaxChunk, b.options.ChunkDocuments)
 	if err != nil {
-		return nil, fmt.Errorf("vibejson: compact Builder keys: %w", err)
+		return nil, fmt.Errorf("vibedb: compact Builder keys: %w", err)
 	}
 	position := 0
 	refBase := uint64(0)
@@ -462,7 +460,7 @@ func (b *Builder) compactBaseKeys() (*storeMappedKeys, error) {
 	})
 	if !valid || position != len(base.source) || refBase != uint64(b.count) {
 		base.release()
-		return nil, errors.New("vibejson: Builder compact key invariant")
+		return nil, errors.New("vibedb: Builder compact key invariant")
 	}
 	refBase = 0
 	b.chunks.Each(func(_ uint32, chunk *Chunk) bool {
@@ -539,7 +537,7 @@ func (t *storeBuilderKeyTable) reserve(b *Builder, entries int) {
 		row := (packed & storeBuilderKeyOrdinalMask) - 1
 		key, ok := b.keyAt(row)
 		if !ok {
-			panic("vibejson: Builder key table ordinal invariant")
+			panic("vibedb: Builder key table ordinal invariant")
 		}
 		t.insert(maphash.String(b.seed, key), row)
 	}

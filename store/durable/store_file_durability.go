@@ -1,6 +1,17 @@
 package durable
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/thesyncim/vibedb/internal/storeio"
+)
+
+func publicReaderLeaseError(err error) error {
+	if errors.Is(err, storeio.ErrGenerationLeasesClosed) {
+		return ErrClosed
+	}
+	return err
+}
 
 const defaultFileVisibilitySlots = 64
 
@@ -82,6 +93,7 @@ func (c *Collection) initializeFileState(state *fileStoreState) {
 	c.state.Store(state)
 	c.durableState.Store(state)
 	c.visibleState.Store(state)
+	c.resetPackedLogicalCut(state)
 }
 
 // publishFileState records the writer's applied state after the committer has
@@ -99,6 +111,13 @@ func (c *Collection) publishFileState(state *fileStoreState) {
 		state, c.committer.DurableGeneration(),
 	)
 	c.visibilityMu.Unlock()
+	// The physical pointer (including visibleState on the packed lane) is the
+	// first half of a fold/structural publication. Resetting the packed cut last
+	// closes the old-physical/new-reset race via readers' state-cut-state retry.
+	if fileLogicalCutBeforeResetHook != nil {
+		fileLogicalCutBeforeResetHook(state)
+	}
+	c.resetPackedLogicalCut(state)
 }
 
 // recordPendingFileStateLocked installs state in the fixed visibility ring

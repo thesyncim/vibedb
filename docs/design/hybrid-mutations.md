@@ -1,4 +1,4 @@
-# Read-neutral mutations
+# Bounded foreground mutations
 
 **Status:** implemented for point mutations and transactional batches on the
 ordered primary graph, including batches that maintain exact indexes. Batch
@@ -7,10 +7,13 @@ indexed.
 
 ## Rule
 
-A mutation publishes one complete canonical generation. Readers never consult
-a memtable, tombstone table, delta chain, or write queue. Writer-side batching
-and deferred checkpoint work are allowed only when they preserve that single
-reader-visible representation.
+A mutation publishes one semantically complete generation. Deferred primary
+lanes may represent it as an immutable canonical base plus a bounded,
+generation-stamped row overlay; readers resolve point values and scans against
+that exact cut, including overlay delete records. Readers never consult the
+writer queue or recovery journal. Batching and deferred checkpoint work remain
+bounded, and pressure is handled by foreground fold/backpressure rather than
+background compaction.
 
 ## Point mutations
 
@@ -26,8 +29,10 @@ never consult the queue.
 
 When the writer exclusively owns an eligible canonical cache frame, a
 same-length update may patch that frame and defer resealing until checkpoint.
-Every failed eligibility check uses copy-on-write. The optimization changes
-writer work, not the snapshot or read path.
+The unified primary lane may instead link an immutable row record. Failed
+eligibility checks use the exclusive structural/copy-on-write fallback. Both
+forms preserve the same generation-stable logical answer, although overlay
+records are part of the read path until folded.
 
 ## Transactional batches
 

@@ -155,8 +155,12 @@ func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
 	if persistenceErr == nil {
 		t.Fatal("journal failure did not poison the collection")
 	}
-	if closeErr := collection.Close(); !errors.Is(closeErr, persistenceErr) {
+	closeErr := collection.Close()
+	if !errors.Is(closeErr, persistenceErr) {
 		t.Fatalf("faulted Close = %v, want sticky %v", closeErr, persistenceErr)
+	}
+	if repeated := collection.Close(); repeated != closeErr {
+		t.Fatalf("repeated faulted Close = %v, want cached exact error %v", repeated, closeErr)
 	}
 
 	// The one-shot seam is exhausted. Opening the same physical image must select

@@ -312,6 +312,10 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 	e.Result.RowCount = 0
 	e.Stats = ExecStats{}
 	defer func() {
+		// Candidate planning retains only reusable scratch. Unbind its borrowed
+		// durable snapshot at the call boundary so a warm Exec never keeps a
+		// closed collection graph alive between executions.
+		e.file.index.Reset(nil)
 		if err != nil {
 			e.Result.abortResult()
 			if errors.Is(err, ErrCanceled) ||

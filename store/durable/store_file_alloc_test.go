@@ -3,27 +3,28 @@ package durable
 import (
 	"os"
 	"testing"
-
-	"github.com/thesyncim/vibedb/store"
 )
 
 // TestFileStoreWarmedPointMutationAllocations pins the writer-side cost of the
-// mature same-size replacement and delete paths. A root-only schema keeps the
-// parallel schemaless lane out of the measurement: buffered-visible exercises
-// exclusive overlay publication and async-visible exercises the rooted
-// mutation path. Once the collection-owned workspaces are warm, the only
-// permitted allocation is the immutable fileStoreState each mutation publishes.
+// mature same-size replacement and delete paths. Schemaless buffered-visible
+// exercises the packed logical-cut lane and must allocate nothing. Async-visible
+// still physically publishes one immutable fileStoreState per mutation; removing
+// that separate allocation requires a bounded retired-state slot/seqlock design
+// because visible, durable, and snapshot pointers can retain older states.
 func TestFileStoreWarmedPointMutationAllocations(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		durability DurabilityMode
+		putAllocs  float64
+		pairAllocs float64
 	}{
-		{name: "buffered", durability: DurabilityBufferedVisible},
-		{name: "async", durability: DurabilityAsyncVisible},
+		{name: "buffered-packed", durability: DurabilityBufferedVisible},
+		{name: "async-physical", durability: DurabilityAsyncVisible,
+			putAllocs: 1, pairAllocs: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFileStoreWarmedPointMutationAllocations(
-				t, tc.durability,
+				t, tc.durability, tc.putAllocs, tc.pairAllocs,
 			)
 		})
 	}
@@ -32,6 +33,7 @@ func TestFileStoreWarmedPointMutationAllocations(t *testing.T) {
 func testFileStoreWarmedPointMutationAllocations(
 	t *testing.T,
 	durability DurabilityMode,
+	wantPutAllocs, wantPairAllocs float64,
 ) {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), "buffered-put-alloc-*")
@@ -43,12 +45,6 @@ func testFileStoreWarmedPointMutationAllocations(
 	options.Durability = durability
 	options.QueueSlots = 512
 	options.GroupLimit = 512
-	options.Collection.Schema, err = store.CompileSchema(store.SchemaDefinition{
-		Root: store.SchemaObject,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	collection, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -82,10 +78,10 @@ func testFileStoreWarmedPointMutationAllocations(
 			panic("same-size buffered replacement failed")
 		}
 	})
-	if replaceAllocs != 1 {
+	if replaceAllocs != wantPutAllocs {
 		t.Fatalf(
-			"same-size Put store allocations = %.2f, want 1 published state",
-			replaceAllocs,
+			"same-size Put store allocations = %.2f, want %.0f",
+			replaceAllocs, wantPutAllocs,
 		)
 	}
 	if err := collection.Flush(); err != nil {
@@ -99,10 +95,10 @@ func testFileStoreWarmedPointMutationAllocations(
 			panic("restore failed")
 		}
 	})
-	if deleteRestoreAllocs != 2 {
+	if deleteRestoreAllocs != wantPairAllocs {
 		t.Fatalf(
-			"delete+restore store allocations = %.2f, want 2 published states",
-			deleteRestoreAllocs,
+			"delete+restore store allocations = %.2f, want %.0f",
+			deleteRestoreAllocs, wantPairAllocs,
 		)
 	}
 }

@@ -68,11 +68,11 @@ var (
 
 	// ErrPageCatalogDefinition reports caller input that cannot have one
 	// unambiguous durable meaning.
-	ErrPageCatalogDefinition = errors.New("vibejson: invalid Store page catalog definition")
+	ErrPageCatalogDefinition = errors.New("vibedb: invalid Store page catalog definition")
 	// ErrPageCatalogCorrupt reports a checksum-valid catalog page or complete
 	// chain that is malformed, non-canonical, out of bounds, or grafted from a
 	// different Store image.
-	ErrPageCatalogCorrupt = errors.New("vibejson: corrupt Store page catalog")
+	ErrPageCatalogCorrupt = errors.New("vibedb: corrupt Store page catalog")
 )
 
 // PageCatalogIndex is one logical alias and its ordered physical exact-index

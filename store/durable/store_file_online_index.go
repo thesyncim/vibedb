@@ -16,7 +16,7 @@ import (
 // ErrIndexBuildInProgress reports a second online index declaration against a
 // collection that is already reconciling and publishing another one.
 var ErrIndexBuildInProgress = errors.New(
-	"vibejson: durable collection index build is already in progress",
+	"vibedb: durable collection index build is already in progress",
 )
 
 type onlineIndexBucket struct {
@@ -133,6 +133,12 @@ func (c *Collection) CreateIndexContext(
 	if c.closed {
 		c.writer.Unlock()
 		return store.IndexInfo{}, ErrClosed
+	}
+	if c.packedLogicalCutPending() {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			c.writer.Unlock()
+			return store.IndexInfo{}, err
+		}
 	}
 	if _, exists := c.options.indexNameIDs[definition.Name]; exists {
 		c.writer.Unlock()
@@ -996,6 +1002,11 @@ catalogAddsName:
 	c.primaryRouter.Load().AdvanceGeneration(generation)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
+	// publishFileState installs the indexed physical root and resets any former
+	// packed suffix. From this point onward indexes permanently exclude the
+	// allocation-free publication lane, so make readers take the original
+	// physical fast path before a post-commit Flush can report an error.
+	c.packedLogicalCutDisabled.Store(true)
 	if retiring {
 		c.cache.MarkUnreachable(c.retireRefScratch)
 		c.extractNeverDurableRetirements(absorbedStart)

@@ -41,7 +41,7 @@ func Repack(src, out *os.File, options Options) (RepackReport, error) {
 	var report RepackReport
 	if src == nil || out == nil {
 		return report, fmt.Errorf(
-			"vibejson: repack requires non-nil source and output files",
+			"vibedb: repack requires non-nil source and output files",
 		)
 	}
 	source, err := Open(src, options)

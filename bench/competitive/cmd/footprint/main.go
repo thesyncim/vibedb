@@ -38,7 +38,7 @@ func main() {
 		"The two are shape- and length-identical and differ only in value entropy, isolating each format's "+
 		"sensitivity to entropy at fixed shape and length.")
 	header := flag.Bool("header", false, "print a column header first")
-	corpusStats := flag.Bool("corpus-stats", false, "print the corpus's size and gzip -9 size, then exit")
+	corpusStats := flag.Bool("corpus-stats", false, "print exact key, JSON, key-inclusive logical, and JSON gzip -9 sizes, then exit")
 	files := flag.Bool("files", false, "additionally list every file the engine left behind, with its apparent "+
 		"size and its allocated blocks. This is how to see which file is sparse and by how much, which is the "+
 		"difference between reporting Badger at 257 MiB and reporting it at 26.6 MiB.")
@@ -62,11 +62,7 @@ func main() {
 		// corpus is redundancy that a dictionary-based writer can collapse and a
 		// key/value store cannot.
 		d := competitive.CorpusOf(*corpus, cardinality)
-		total, gz, err := competitive.CorpusRedundancy(d)
-		check(err)
-		fmt.Printf("cardinality=%s docs=%d raw=%.2f MiB gzip-9=%.2f MiB (%.1f%% of raw)\n",
-			cardinality, len(d), float64(total)/(1<<20), float64(gz)/(1<<20),
-			100*float64(gz)/float64(total))
+		check(printCorpusStats(os.Stdout, cardinality, d))
 		return
 	}
 
@@ -77,10 +73,12 @@ func main() {
 		// The harness's own cost with no engine at all: the corpus is built and
 		// dropped exactly as it is for a real engine. Every row below has to be
 		// read against this one.
-		_ = competitive.CorpusOf(*corpus, cardinality)
+		docs := competitive.CorpusOf(*corpus, cardinality)
+		logicalBytes := competitive.CorpusBytes(docs).LogicalBytes
+		docs = nil
 		fp, err := competitive.Measure(nil, "")
 		check(err)
-		report(os.Stdout, "baseline", "-", cardinality, false, fp, competitive.StorageProfileResolution{
+		report(os.Stdout, "baseline", "-", cardinality, false, int64(logicalBytes), fp, competitive.StorageProfileResolution{
 			Profile:     storageProfile,
 			Compression: "n/a",
 			Provenance:  "harness-baseline:no-engine",
@@ -100,6 +98,7 @@ func main() {
 	check(err)
 
 	docs := competitive.CorpusOf(*corpus, cardinality)
+	logicalBytes := competitive.CorpusBytes(docs).LogicalBytes
 	dir, err := os.MkdirTemp("", "vibebench-footprint-")
 	check(err)
 	defer os.RemoveAll(dir)
@@ -127,10 +126,10 @@ func main() {
 	name := factory.Name
 	if *putloop {
 		name += "/put"
-	} else if factory.Name == "vibejson-durable" {
+	} else if factory.Name == "vibedb" {
 		name += "/bulk-unified"
 	}
-	report(os.Stdout, name, e.DurabilityMode().String(), cardinality, *indexed, fp, profile)
+	report(os.Stdout, name, e.DurabilityMode().String(), cardinality, *indexed, int64(logicalBytes), fp, profile)
 
 	if *files {
 		entries, err := competitive.DirFileSizes(dir)
@@ -148,8 +147,9 @@ func main() {
 }
 
 func printHeader(w io.Writer) {
-	fmt.Fprintf(w, "%-40s %-12s %-24s %-24s %8s %8s %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
+	fmt.Fprintf(w, "%-40s %-12s %-24s %-24s %8s %8s %12s %12s %14s %16s %14s %12s %18s %12s %12s %12s %12s %-12s %-20s %s\n",
 		"git-commit", "vcs-modified", "engine", "durability", "corpus", "indexed", "disk", "diskalloc",
+		"disk-bytes", "allocated-bytes", "logical-bytes", "disk/logical", "allocated/logical",
 		"heapalloc", "heapsys", "resident", "maxrss", "storage-profile",
 		"compression", "compression-provenance")
 }
@@ -159,16 +159,43 @@ func report(
 	name, durability string,
 	card competitive.Cardinality,
 	indexed bool,
+	logicalBytes int64,
 	fp competitive.Footprint,
 	profile competitive.StorageProfileResolution,
 ) {
 	commit, modified := vcsProvenance()
-	fmt.Fprintf(w, "%-40s %-12s %-24s %-24s %8s %8v %12s %12s %12s %12s %12s %12s %-12s %-20s %s\n",
+	diskRatio, allocatedRatio := 0.0, 0.0
+	if logicalBytes > 0 {
+		diskRatio = float64(fp.DiskBytes) / float64(logicalBytes)
+		allocatedRatio = float64(fp.DiskAllocatedBytes) / float64(logicalBytes)
+	}
+	fmt.Fprintf(w, "%-40s %-12s %-24s %-24s %8s %8v %12s %12s %14d %16d %14d %12.4f %18.4f %12s %12s %12s %12s %-12s %-20s %s\n",
 		commit, modified, name, durability, card, indexed,
 		mib(fp.DiskBytes), mib(fp.DiskAllocatedBytes),
+		fp.DiskBytes, fp.DiskAllocatedBytes, logicalBytes, diskRatio, allocatedRatio,
 		mib(int64(fp.HeapAlloc)), mib(int64(fp.HeapSys)),
 		mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()),
 		profile.Profile, profile.Compression, profile.Provenance)
+}
+
+func printCorpusStats(w io.Writer, cardinality competitive.Cardinality, docs []competitive.Doc) error {
+	counts := competitive.CorpusBytes(docs)
+	jsonBytes, gz, err := competitive.CorpusRedundancy(docs)
+	if err != nil {
+		return err
+	}
+	if counts.LogicalBytes == 0 {
+		return fmt.Errorf("logical corpus is empty")
+	}
+	fmt.Fprintf(
+		w,
+		"cardinality=%s docs=%d key-bytes=%d json-bytes=%d logical-bytes=%d json-gzip-9-bytes=%d key=%.2f-MiB json=%.2f-MiB logical=%.2f-MiB json-gzip-9=%.2f-MiB json-gzip-percent=%.1f\n",
+		cardinality, len(docs), counts.KeyBytes, jsonBytes, counts.LogicalBytes, gz,
+		float64(counts.KeyBytes)/(1<<20), float64(jsonBytes)/(1<<20),
+		float64(counts.LogicalBytes)/(1<<20), float64(gz)/(1<<20),
+		100*float64(gz)/float64(jsonBytes),
+	)
+	return nil
 }
 
 func vcsProvenance() (revision, modified string) {

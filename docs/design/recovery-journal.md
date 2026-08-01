@@ -5,9 +5,10 @@
 ## Purpose
 
 The journal provides a bounded, append-and-sync acknowledgement path without
-adding a representation readers must merge. Normal reads always follow the
-published canonical root and pages. Only open-time recovery reads journal
-records.
+itself becoming a reader representation. Only open-time recovery reads journal
+records. Normal reads follow the published immutable generation cut, which can
+be a canonical page graph plus the separate bounded in-memory primary overlay;
+they never inspect or replay journal bytes.
 
 Each store owns a paired journal file. The store root and journal header carry
 the same random identity, so files from different stores cannot be paired. The

@@ -20,7 +20,17 @@ package sql
 func (p *Parser) scanJSONValue(from int) (text string, start, end int, err error) {
 	src := p.lx.src
 	i := from
+	if err := p.checkCancellation(); err != nil {
+		return "", i, 0, err
+	}
+	nextCheck := i + parserCancelByteInterval
 	for i < len(src) && isJSONSpace(src[i]) {
+		if i >= nextCheck {
+			if err := p.checkCancellation(); err != nil {
+				return "", i, 0, err
+			}
+			nextCheck = i + parserCancelByteInterval
+		}
 		i++
 	}
 	if i >= len(src) {
@@ -33,8 +43,8 @@ func (p *Parser) scanJSONValue(from int) (text string, start, end int, err error
 	case '"':
 		end, err = p.scanJSONString(i)
 	default:
-		end = scanJSONScalar(src, i)
-		if end == start {
+		end, err = p.scanJSONScalar(i)
+		if err == nil && end == start {
 			err = p.errAt(start, "expected a JSON document after '@>'")
 		}
 	}
@@ -50,7 +60,17 @@ func (p *Parser) scanJSONContainer(i int) (int, error) {
 	src := p.lx.src
 	start := i
 	depth := 0
+	if err := p.checkCancellation(); err != nil {
+		return 0, err
+	}
+	nextCheck := i + parserCancelByteInterval
 	for i < len(src) {
+		if i >= nextCheck {
+			if err := p.checkCancellation(); err != nil {
+				return 0, err
+			}
+			nextCheck = i + parserCancelByteInterval
+		}
 		switch src[i] {
 		case '{', '[':
 			depth++
@@ -89,7 +109,17 @@ func (p *Parser) scanJSONString(i int) (int, error) {
 	src := p.lx.src
 	start := i
 	i++ // opening quote
+	if err := p.checkCancellation(); err != nil {
+		return 0, err
+	}
+	nextCheck := i + parserCancelByteInterval
 	for i < len(src) {
+		if i >= nextCheck {
+			if err := p.checkCancellation(); err != nil {
+				return 0, err
+			}
+			nextCheck = i + parserCancelByteInterval
+		}
 		switch src[i] {
 		case '\\':
 			// A trailing backslash at end of input would step past the end;
@@ -107,15 +137,26 @@ func (p *Parser) scanJSONString(i int) (int, error) {
 
 // scanJSONScalar returns the offset just past a JSON scalar run: everything up
 // to the first byte that cannot continue a number or a bare keyword.
-func scanJSONScalar(src string, i int) int {
+func (p *Parser) scanJSONScalar(i int) (int, error) {
+	src := p.lx.src
+	if err := p.checkCancellation(); err != nil {
+		return 0, err
+	}
+	nextCheck := i + parserCancelByteInterval
 	for i < len(src) {
+		if i >= nextCheck {
+			if err := p.checkCancellation(); err != nil {
+				return 0, err
+			}
+			nextCheck = i + parserCancelByteInterval
+		}
 		c := src[i]
 		if isJSONSpace(c) || c == ',' || c == ')' || c == ']' || c == '}' {
 			break
 		}
 		i++
 	}
-	return i
+	return i, nil
 }
 
 func isJSONSpace(c byte) bool {

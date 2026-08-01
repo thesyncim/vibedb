@@ -12,11 +12,11 @@ var (
 	// ErrCollectionName reports an empty, invalid UTF-8, or NUL-bearing
 	// collection name.
 	ErrCollectionName = errors.New(
-		"vibejson: invalid collection name",
+		"vibedb: invalid collection name",
 	)
 	// ErrCollectionExists reports duplicate collection creation.
 	ErrCollectionExists = errors.New(
-		"vibejson: collection already exists",
+		"vibedb: collection already exists",
 	)
 )
 

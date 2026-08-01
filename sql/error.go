@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// A ParseError reports one rejected SQL statement. Every error this package
-// produces is a *ParseError, and every one names a position, because the
+// A ParseError reports one rejected SQL statement. Every parser error is a
+// *ParseError or unwraps to one, and every one names a position, because the
 // caller's next action is almost always to point at the offending byte: a
 // database/sql driver surfaces the message to an application author who has the
 // statement text in front of them but not the parser's state.
@@ -44,6 +44,11 @@ func (e *ParseError) Error() string {
 // borrowed src to compute its own position would either pin the whole statement
 // text or report the wrong one.
 func newParseError(src string, pos int, msg string) *ParseError {
+	error := parseErrorAt(src, pos, msg)
+	return &error
+}
+
+func parseErrorAt(src string, pos int, msg string) ParseError {
 	if pos < 0 {
 		pos = 0
 	}
@@ -55,12 +60,15 @@ func newParseError(src string, pos int, msg string) *ParseError {
 	if nl := strings.LastIndexByte(src[:pos], '\n'); nl >= 0 {
 		col = pos - nl
 	}
-	return &ParseError{Pos: pos, Line: line, Col: col, Msg: msg}
+	return ParseError{Pos: pos, Line: line, Col: col, Msg: msg}
 }
 
 // errAt builds a positioned error. It is a method so every rejection in the
 // parser reads the same and none of them can forget to carry a position.
 func (p *Parser) errAt(pos int, msg string) error {
+	if p.lx.cancelErr != nil {
+		return p.lx.cancelErr
+	}
 	return newParseError(p.lx.src, pos, msg)
 }
 
@@ -69,6 +77,9 @@ func (p *Parser) errAt(pos int, msg string) error {
 // for every fixed message: a rejection is cold, but a fuzz campaign runs
 // millions of them.
 func (p *Parser) errfAt(pos int, format string, args ...any) error {
+	if p.lx.cancelErr != nil {
+		return p.lx.cancelErr
+	}
 	return newParseError(p.lx.src, pos, fmt.Sprintf(format, args...))
 }
 
@@ -77,6 +88,9 @@ func (p *Parser) errfAt(pos int, format string, args ...any) error {
 // useless next to "unterminated string literal", and the lexer already knows
 // which byte broke.
 func (p *Parser) errHere(msg string) error {
+	if p.lx.cancelErr != nil {
+		return p.lx.cancelErr
+	}
 	if p.tok.kind == tokError {
 		return newParseError(p.lx.src, p.tok.pos, p.tok.text)
 	}
@@ -84,6 +98,9 @@ func (p *Parser) errHere(msg string) error {
 }
 
 func (p *Parser) errfHere(format string, args ...any) error {
+	if p.lx.cancelErr != nil {
+		return p.lx.cancelErr
+	}
 	if p.tok.kind == tokError {
 		return newParseError(p.lx.src, p.tok.pos, p.tok.text)
 	}

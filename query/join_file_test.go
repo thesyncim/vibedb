@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -282,7 +283,11 @@ func TestDurableJoinInnerScanSpansManyBatchesUnderEviction(t *testing.T) {
 	directory := t.TempDir()
 	bulkCreate := func(name string, source *store.Collection) string {
 		t.Helper()
-		path := filepath.Join(directory, name+".vjc")
+		filename, ok := collectionname.Encode(name)
+		if !ok {
+			t.Fatalf("invalid collection name %q", name)
+		}
+		path := filepath.Join(directory, filename)
 		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			t.Fatalf("create %s fixture: %v", name, err)
@@ -540,7 +545,11 @@ func durableJoinCorpus(tb testing.TB, outerRows, innerRows int) *durable.Databas
 	load := func(name string, fill func(*store.Collection)) {
 		source := &store.Collection{}
 		fill(source)
-		file, err := os.Create(filepath.Join(dir, name+".vjc"))
+		filename, ok := collectionname.Encode(name)
+		if !ok {
+			tb.Fatalf("invalid collection name %q", name)
+		}
+		file, err := os.Create(filepath.Join(dir, filename))
 		if err != nil {
 			tb.Fatal(err)
 		}

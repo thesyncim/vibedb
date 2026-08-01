@@ -388,13 +388,11 @@
 //
 // A [Parser] holds chunked arenas that a warmed parse refills rather than
 // reallocates, the same shape as query's prepared-statement compiler and for
-// the same reason. The
-// steady state is zero allocation: on an Apple M4 Max, a simple SELECT parses
-// in about 118 ns, a two-collection join in about 730 ns, and a grouped
-// aggregate with HAVING and ORDER BY in about 730 ns, each at 0 allocs/op and
-// roughly 180 MB/s of statement text. The package-level [Parse] is the owning
-// convenience form and allocates (about 11 allocations for a simple SELECT); a
-// caller preparing statements in a loop holds a Parser.
+// the same reason. Reusing a warmed Parser is the allocation-free hot-loop
+// form. The package-level [Parse] is the owning convenience form and may
+// allocate; a caller preparing statements in a loop holds a Parser. Measured
+// results and their reproduction commands live in docs/performance.md rather
+// than in this API contract.
 //
 // Parsing is on the prepare path, so this matters far less than the executor's
 // per-row work — but a driver that prepares per request is an ordinary shape,

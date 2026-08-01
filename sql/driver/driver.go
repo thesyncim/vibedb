@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -309,7 +308,11 @@ func (c *conn) Prepare(src string) (sqldriver.Stmt, error) {
 }
 
 func (c *conn) PrepareContext(ctx context.Context, src string) (sqldriver.Stmt, error) {
-	return c.prepareContext(ctx, src)
+	statement, err := c.prepareContext(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+	return statement, nil
 }
 
 // prepareContext is the parse-once preparation primitive shared by
@@ -319,11 +322,31 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	if err := c.usable(ctx); err != nil {
 		return nil, err
 	}
-	if !utf8.ValidString(src) {
-		return nil, errors.New("vibedb: SQL text must be valid UTF-8")
+	var tree *sqlast.Statement
+	var err error
+	cancel := c.exec.Options.Cancel
+	if ctx.Done() == nil && cancel == nil {
+		tree, err = sqlast.ParseStatement(src)
+	} else {
+		var parser sqlast.Parser
+		parser.SetCancellationCheck(func() error {
+			if contextErr := contextCheckpoint(ctx); contextErr != nil {
+				return contextErr
+			}
+			if cancel != nil && cancel.Canceled() {
+				return query.ErrCanceled
+			}
+			return nil
+		})
+		tree = new(sqlast.Statement)
+		err = parser.ParseStatement(tree, src)
 	}
-	tree, err := sqlast.ParseStatement(src)
 	if err != nil {
+		var parseErr *sqlast.ParseError
+		if errors.As(err, &parseErr) &&
+			parseErr.Msg == "statement is not valid UTF-8" {
+			return nil, errors.New("vibedb: SQL text must be valid UTF-8")
+		}
 		return nil, err
 	}
 	if err := contextCheckpoint(ctx); err != nil {
@@ -388,32 +411,13 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 }
 
 func (c *conn) ExecContext(ctx context.Context, src string, args []sqldriver.NamedValue) (sqldriver.Result, error) {
-	// Transaction staging has no context-aware executor. Returning ErrSkip
-	// makes database/sql use the statement's required Exec fallback instead of
-	// claiming cancellation support that the transaction cannot provide.
-	if c.tx != nil {
-		return nil, sqldriver.ErrSkip
-	}
-	// UPDATE and DELETE can evaluate an arbitrarily large predicate scan.
-	// The executor exposes a reusable CancelFlag, but this database/sql adapter
-	// cannot bridge an arbitrary ctx.Done channel into that flag during a scan
-	// without a watcher goroutine or an allocation on its zero-allocation hot
-	// path. Advertise only the bounded CREATE/INSERT context surface and let
-	// database/sql use statement execution without a context for scans. KindOf is an
-	// allocation-free one-token router; classifying here avoids parsing and
-	// lowering a scan mutation only to return ErrSkip and make database/sql
-	// parse it a second time.
-	switch sqlast.KindOf(src) {
-	case sqlast.KindUpdate, sqlast.KindDelete:
-		return nil, sqldriver.ErrSkip
-	}
 	s, err := c.PrepareContext(ctx, src)
 	if err != nil {
 		return nil, err
 	}
 	prepared := s.(*stmt)
 	defer prepared.Close()
-	return prepared.execContext(ctx, args)
+	return prepared.ExecContext(ctx, args)
 }
 
 func (c *conn) Begin() (sqldriver.Tx, error) {

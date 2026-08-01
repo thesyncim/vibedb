@@ -23,9 +23,9 @@ import (
 // whenever neither the running processor's free list nor the scheduler's can
 // supply one, which happens the more often the shorter the scan, because a fast
 // scan cycles goroutines faster than the free lists refill. That scaffolding was
-// the entire residual allocation of a warm durable execution — eighteen
-// allocations and 2.3 kB that did not move with the corpus at all, being fixed
-// per execution rather than per batch or per document.
+// the entire residual allocation of a warm durable execution: fixed per
+// execution rather than per batch or per document. The measured allocation
+// record lives in docs/performance.md.
 //
 // # Reusing channels means draining them
 //
@@ -355,7 +355,7 @@ func (pool *filePool) runScan(
 			err = job.overlay.RangePresent(overlayInsert)
 		}
 	case job.overlay != nil:
-		*job.overflow, err = job.snapshot.RangeRawReadAheadBuffer((*job.overflow)[:0], overlayRow)
+		*job.overflow, err = job.snapshot.RangeRawBuffer((*job.overflow)[:0], overlayRow)
 		if err == nil {
 			err = cancellationError(job.cancel)
 		}
@@ -363,7 +363,7 @@ func (pool *filePool) runScan(
 			err = job.overlay.RangeInserts(overlayInsert)
 		}
 	case job.masks == nil:
-		*job.overflow, err = job.snapshot.RangeRawReadAheadBuffer((*job.overflow)[:0], row)
+		*job.overflow, err = job.snapshot.RangeRawBuffer((*job.overflow)[:0], row)
 	default:
 		*job.overflow, err = job.snapshot.RangeMasksRawBuffer(job.masks, (*job.overflow)[:0], row)
 	}

@@ -83,6 +83,10 @@ func seizeSnapshotCut(order []*Collection) (snapshotCutHold, error) {
 		hold.writers++
 	}
 	for _, collection := range order {
+		if collection.closed {
+			hold.release()
+			return snapshotCutHold{}, ErrClosed
+		}
 		if collection.deferredCanonicalLane() &&
 			collection.primaryRouter.Load() != nil &&
 			(len(collection.primaryPendingParents) != 0 ||
@@ -235,7 +239,7 @@ func SnapshotCollections(collections []NamedCollection) (DatabaseSnapshot, error
 		}
 		if previous, exists := seen[entry.Collection]; exists {
 			return DatabaseSnapshot{}, fmt.Errorf(
-				"vibejson: one durable collection cannot be cataloged as both %q and %q",
+				"vibedb: one durable collection cannot be cataloged as both %q and %q",
 				previous, entry.Name)
 		}
 		seen[entry.Collection] = entry.Name
@@ -393,7 +397,7 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	primaryRouter := c.primaryRouter.Load()
 	lease, err := c.leases.Acquire(state.root.Generation)
 	if err != nil {
-		return nil, err
+		return nil, publicReaderLeaseError(err)
 	}
 	return &Snapshot{
 		collection: c, state: state,

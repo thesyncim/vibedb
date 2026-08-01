@@ -32,17 +32,17 @@ var (
 	// ErrTabletAnchorMapCorrupt reports that an anchor-map image failed
 	// checksum or structural admission; a rejected image must never be routed.
 	ErrTabletAnchorMapCorrupt = errors.New(
-		"vibejson: corrupt tablet anchor-map lab image",
+		"vibedb: corrupt tablet anchor-map lab image",
 	)
 	// ErrTabletAnchorMapScratch reports that ApplyBatch was handed a scratch
 	// buffer too small to stage the edited fence set.
 	ErrTabletAnchorMapScratch = errors.New(
-		"vibejson: tablet anchor-map lab scratch is too small",
+		"vibedb: tablet anchor-map lab scratch is too small",
 	)
 	// ErrTabletAnchorHandleCorrupt reports that an anchor-handle image failed
 	// checksum or structural admission.
 	ErrTabletAnchorHandleCorrupt = errors.New(
-		"vibejson: corrupt tablet anchor-handle lab image",
+		"vibedb: corrupt tablet anchor-handle lab image",
 	)
 )
 

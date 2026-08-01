@@ -1277,8 +1277,9 @@ func (c *Collection) canonicalPrimaryMutationValue(src []byte) ([]byte, error) {
 	var index vibejson.Index
 	for {
 		var err error
-		index, err = vibejson.BuildIndex(
+		index, err = vibejson.BuildIndexOptions(
 			src, c.primaryUnifiedIndexScratch[:cap(c.primaryUnifiedIndexScratch)],
+			c.options.Collection.IndexOptions,
 		)
 		if !errors.Is(err, document.ErrIndexFull) {
 			if err != nil {

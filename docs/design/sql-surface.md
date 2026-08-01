@@ -2,9 +2,10 @@
 
 ## One language, one runtime
 
-The public relational surface is SQL through Go's `database/sql` package and
-PostgreSQL protocol v3. JSON is the stored row representation; it is not a
-second query language or a parallel request grammar.
+The public relational surface is SQL through Go's `database/sql` package and an
+experimental PostgreSQL wire-protocol endpoint supporting a documented SQL
+subset. JSON is the stored row representation; it is not a second query
+language or a parallel request grammar.
 
 The implementation has one responsibility per layer:
 
@@ -538,13 +539,17 @@ execution finish, so a pooled idle connection does not pin caller buffers.
 ## Cancellation
 
 The driver exposes context-aware connection, preparation, transaction-start,
-and bounded CREATE/INSERT paths. Context cancellation can stop admission,
-catalog-lock acquisition, parsing, validation, and write preparation before the
-durable publication point. Once publication starts, the operation runs to a
-storage outcome instead of returning a cancellation while a write continues
-invisibly. A namespace fence failure after a visible catalog or table-file
-replacement is reported explicitly as `durable.ErrCommitOutcomeUnknown`; it is
-not mislabeled as either cancellation or rollback.
+query, and mutation paths. For a cancellable context, `database/sql` installs
+one operation-local cooperative cancellation flag and joins its watcher before
+returning. Context cancellation and deadlines can stop admission, catalog-lock
+acquisition, parsing, validation, scans, joins, grouping, sorting, filtered
+DML, spill I/O, and write preparation before the durable publication point.
+The background path creates no watcher and retains the nil-flag execution path.
+Once publication starts, the operation runs to a storage outcome instead of
+returning a cancellation while a write continues invisibly. A namespace fence
+failure after a visible catalog or table-file replacement is reported
+explicitly as `durable.ErrCommitOutcomeUnknown`; it is not mislabeled as either
+cancellation or rollback.
 
 The query executor has a reusable cooperative `query.CancelFlag`. It checks the
 flag at bounded points in heap and durable scans, parallel workers, joins,
@@ -554,12 +559,12 @@ leases, removes spill files, and exposes no partial materialized result.
 and reports `57014`.
 
 The typed runtime exposes the same signal through `Session.SetCancelFlag`.
-The `database/sql` adapter does not advertise
-`QueryerContext`, `StmtQueryContext`, or scan-shaped `StmtExecContext`: bridging
-an arbitrary context's Done channel would require a watcher goroutine or
-allocation on its zero-allocation hot path. It remains cancellable
-during admission, parsing, lock acquisition, validation, and bounded write
-preparation, up to the durable publication point.
+The `database/sql` adapter advertises `StmtQueryContext` and
+`StmtExecContext`; direct connection `ExecContext` uses that same prepared
+execution path. It deliberately does not advertise `QueryerContext`, because a
+connection-level query would also need to transfer ownership of its transient
+prepared statement to the returned rows. `database/sql` performs that
+lifecycle correctly through its prepared-statement fallback.
 
 ## Deliberately unsupported
 

@@ -33,21 +33,21 @@ type IndexDefinition struct {
 var (
 	// ErrIndexDefinition reports an empty name, invalid path, or invalid
 	// compound width.
-	ErrIndexDefinition = errors.New("vibejson: invalid collection index definition")
+	ErrIndexDefinition = errors.New("vibedb: invalid collection index definition")
 	// ErrIndexArity reports a lookup whose value count does not match the
 	// declared column count.
-	ErrIndexArity = errors.New("vibejson: collection index lookup arity mismatch")
+	ErrIndexArity = errors.New("vibedb: collection index lookup arity mismatch")
 	// ErrIndexScalar reports a lookup value that is absent, invalid, or a
 	// JSON container. Exact indexes deliberately accept scalars only.
-	ErrIndexScalar = errors.New("vibejson: collection exact index requires scalar values")
+	ErrIndexScalar = errors.New("vibedb: collection exact index requires scalar values")
 	// ErrMaskOrder reports a sparse bitmap stream whose chunk ids are not
 	// strictly increasing. Ordered masks permit allocation-free merge, lookup,
 	// and range execution without copying or sorting caller storage.
-	ErrMaskOrder = errors.New("vibejson: collection masks are not strictly ordered")
+	ErrMaskOrder = errors.New("vibedb: collection masks are not strictly ordered")
 	// ErrMaskChunk reports a non-zero mask for a chunk absent from the
 	// selected snapshot. Failing closed prevents stale or cross-snapshot masks
 	// from silently dropping rows.
-	ErrMaskChunk = errors.New("vibejson: collection mask chunk is not live")
+	ErrMaskChunk = errors.New("vibedb: collection mask chunk is not live")
 )
 
 // ExactIndex is the compiled, allocation-free form of one exact-index

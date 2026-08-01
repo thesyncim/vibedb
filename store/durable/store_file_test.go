@@ -938,7 +938,7 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 	}
 	beforeReadAhead := fs.Stats()
 	var readAheadKeys []string
-	scratch, err = snapshot.RangeRawReadAheadBuffer(scratch[:0], func(key, _ []byte) error {
+	scratch, err = snapshot.RangeRawBuffer(scratch[:0], func(key, _ []byte) error {
 		readAheadKeys = append(readAheadKeys, string(key))
 		return nil
 	})
@@ -1148,13 +1148,13 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 	allocs = testing.AllocsPerRun(100, func() {
 		visitBytes = 0
 		var runErr error
-		scratch, runErr = snapshot.RangeRawReadAheadBuffer(scratch[:0], visit)
+		scratch, runErr = snapshot.RangeRawBuffer(scratch[:0], visit)
 		if runErr != nil || visitBytes == 0 {
 			panic("read-ahead range failed")
 		}
 	})
 	if allocs != 0 {
-		t.Fatalf("warmed RangeRawReadAheadBuffer allocated %.2f times, want 0", allocs)
+		t.Fatalf("warmed RangeRawBuffer allocated %.2f times, want 0", allocs)
 	}
 }
 

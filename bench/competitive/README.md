@@ -4,7 +4,10 @@ This separate Go module compares vibedb's in-memory and durable stores with
 bbolt, Badger, Pebble, and pure-Go SQLite on one deterministic JSON corpus.
 Measured values live only in [RESULTS.md](RESULTS.md). The repository-wide
 publication and interpretation rules live in
-[docs/performance.md](../../docs/performance.md).
+[docs/performance.md](../../docs/performance.md). The generated
+[coverage matrix](COVERAGE.md) maps required measurement shapes to executable
+evidence and labels diagnostics and gaps; it does not claim that a result has
+been run.
 
 | Engine | Kind |
 | --- | --- |
@@ -73,7 +76,7 @@ go test -run '^$' \
   -count=6 -timeout=180m .
 
 go test -run '^$' \
-  -bench='^Benchmark(PointRead|Scan|ScanAllBytes)/(vibejson-durable|bbolt|badger|pebble|sqlite)$' \
+  -bench='^Benchmark(PointRead|Scan|ScanAllBytes)/(vibedb|bbolt|badger|pebble|sqlite)$' \
   -benchtime=2s -count=3 -timeout=30m .
 ```
 
@@ -94,7 +97,7 @@ The default conditioning pass runs once per engine and is discarded.
 test -z "$(git status --porcelain=v1 --untracked-files=normal)"
 publication_commit=$(git rev-parse HEAD)
 publication_dir=$(mktemp -d /tmp/vibedb-publish.XXXXXX)
-publication_engines=vibejson-durable,bbolt,badger,pebble,sqlite
+publication_engines=vibedb,bbolt,badger,pebble,sqlite
 
 go build -trimpath -o "$publication_dir/mixed" ./cmd/mixed
 go build -trimpath -o "$publication_dir/mixedsuite" ./cmd/mixedsuite
@@ -224,7 +227,7 @@ always show both; there is no separate compact/verbatim store-mode axis.
 
 Footprint and sustained-churn disk runs have two explicit storage profiles:
 
-| `-storage-profile` | Badger | Pebble | vibejson durable, bbolt, SQLite |
+| `-storage-profile` | Badger | Pebble | VibeDB, bbolt, SQLite |
 | --- | --- | --- | --- |
 | `intrinsic` (default) | SST compression forced off | SST compression forced off | no optional compression switch; labelled `unsupported/no-op` |
 | `production` | Snappy SST blocks | Snappy SST blocks | no optional compression switch; labelled `unsupported/no-op` |
@@ -273,7 +276,7 @@ for profile in intrinsic production; do
       /tmp/vibedb-footprint -engine="$engine" \
         -cardinality="$cardinality" -storage-profile="$profile"
     done
-    /tmp/vibedb-footprint -engine=vibejson-durable \
+    /tmp/vibedb-footprint -engine=vibedb \
       -putloop -cardinality="$cardinality" -storage-profile="$profile"
   done
 done
@@ -281,8 +284,14 @@ done
 
 `heap-MiB`, runtime-resident memory, and peak RSS measure different scopes.
 Disk output includes both apparent size and allocated blocks. A published row
-must report `git-commit=$publication_commit` and `vcs-modified=false` because
-`cmd/footprint` records provenance but has no separate publishability flag.
+also reports `logical-bytes`, the exact sum of every key and JSON document once,
+plus `disk/logical` and `allocated/logical`. Engine framing, indexes, journals,
+preallocation, and filesystem rounding appear only in the physical numerators.
+The separate corpus-stat output reports `key-bytes` and `json-bytes`; its
+`json-gzip-9-bytes` entropy control compresses JSON only and never masquerades
+as a key-inclusive logical size. A published row must report
+`git-commit=$publication_commit` and `vcs-modified=false` because cmd/footprint
+records provenance but has no separate publishability flag.
 
 ## Sustained churn
 

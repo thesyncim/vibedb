@@ -293,7 +293,7 @@ func normalizeEntries(entries uint32) (uint32, error) {
 		entries = ioUringDefaultEntries
 	}
 	if entries > ioUringMaxEntries {
-		return 0, fmt.Errorf("vibejson: io_uring entries %d exceed %d", entries, ioUringMaxEntries)
+		return 0, fmt.Errorf("vibedb: io_uring entries %d exceed %d", entries, ioUringMaxEntries)
 	}
 	entries--
 	entries |= entries >> 1

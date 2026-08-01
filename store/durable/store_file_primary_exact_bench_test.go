@@ -104,7 +104,7 @@ func primaryExactBenchCorpus(b *testing.B, documents, values int) []primaryExact
 }
 
 // primaryExactBenchOptions is the competitive harness's tuned buffered-visible
-// configuration (bench/competitive/engine_vibejson_durable.go, options), copied
+// configuration (bench/competitive/engine_vibedb.go, options), copied
 // field for field — same MaxDocumentBytes, BufferCount, QueueSlots, and
 // GroupLimit — because a per-mutation number measured under different staging
 // bounds would not be comparable with the harness's published findings, which

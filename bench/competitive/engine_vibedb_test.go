@@ -6,21 +6,21 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// TestVibeDurableOrdinarySyncJournalsThroughPrimary proves the adapter now
+// TestVibeDBOrdinarySyncJournalsThroughPrimary proves the adapter now
 // measures the ordered primary graph: loadBulk builds through CreateFromPrimary,
 // so every Put routes through the primary mutation path, and ordinary-sync's
 // journalAckLocked -- which fires ONLY from that path -- records one
 // acknowledgement per mutation. journalAcks being non-zero and accounting for
 // the whole window (with chainAcks) is the primary-routing proof: a chunk-layout
 // store would journal nothing.
-func TestVibeDurableOrdinarySyncJournalsThroughPrimary(t *testing.T) {
-	factory, ok := FactoryNamed("vibejson-durable")
+func TestVibeDBOrdinarySyncJournalsThroughPrimary(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityOrdinarySync})
 	defer cleanup()
-	v := e.(*vibeDurable)
+	v := e.(*vibeDBEngine)
 
 	base := v.coll.Stats()
 	const puts = 200
@@ -51,24 +51,24 @@ func TestVibeDurableOrdinarySyncJournalsThroughPrimary(t *testing.T) {
 	}
 }
 
-// TestVibeDurablePowerSafeJournalsEveryAcknowledgement holds the power-safe row
+// TestVibeDBPowerSafeJournalsEveryAcknowledgement holds the power-safe row
 // to the same engagement proof as ordinary-sync. This table was burned once by
 // a lane that silently disengaged its durability mechanism and published a win;
 // any journal-backed comparison row must therefore prove per-mutation journal
 // acknowledgements, not assume them from configuration. Fewer mutations than
 // the ordinary-sync variant because each acknowledgement here pays a real
 // drive-cache drain (~4 ms on this platform's F_FULLFSYNC class).
-func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
+func TestVibeDBPowerSafeJournalsEveryAcknowledgement(t *testing.T) {
 	if testing.Short() {
 		t.Skip("each acknowledgement pays a full power-safe barrier")
 	}
-	factory, ok := FactoryNamed("vibejson-durable")
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityPowerSafe})
 	defer cleanup()
-	v := e.(*vibeDurable)
+	v := e.(*vibeDBEngine)
 
 	base := v.coll.Stats()
 	const puts = 50
@@ -95,17 +95,17 @@ func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
 	}
 }
 
-// TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary pins the unified
+// TestVibeDBBufferedVisibleRoutesDeletesThroughPrimary pins the unified
 // primary delete fast path. Dense leaves do not run empty-leaf reclamation;
 // structural hygiene runs only after a delete makes a routed leaf empty.
-func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
-	factory, ok := FactoryNamed("vibejson-durable")
+func TestVibeDBBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityBufferedVisible})
 	defer cleanup()
-	v := e.(*vibeDurable)
+	v := e.(*vibeDBEngine)
 
 	base := v.coll.Stats().PrimaryEmptyReclaims
 	for i := 0; i < 64 && i < len(docs); i++ {
@@ -121,14 +121,14 @@ func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 	}
 }
 
-// TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot confirms the query
+// TestVibeDBUnindexedFilterRunsOnPrimarySnapshot confirms the query
 // FromFile filter path opens the primary-layout snapshot the unindexed instance
 // now loads through CreateFromPrimary: a full scan-and-filter must return the
 // corpus's ~1% FilterValue population, not error on the layout.
-func TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
-	factory, ok := FactoryNamed("vibejson-durable")
+func TestVibeDBUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	e, _, cleanup := newLoaded(t, factory, Config{Durability: DurabilityBufferedVisible})
 	defer cleanup()
@@ -141,15 +141,15 @@ func TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
 	}
 }
 
-func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
-	engine, err := newVibeDurable(Config{
+func TestVibeDBBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
+	engine, err := newVibeDB(Config{
 		Durability: DurabilityBufferedVisible,
 		CacheBytes: DefaultCacheBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	buffered := engine.(*vibeDurable)
+	buffered := engine.(*vibeDBEngine)
 	options := buffered.options()
 	if options.Durability != durable.DurabilityBufferedVisible {
 		t.Fatalf("store durability = %d, want buffered-visible", options.Durability)
@@ -170,14 +170,14 @@ func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 		)
 	}
 
-	powerSafeEngine, err := newVibeDurable(Config{
+	powerSafeEngine, err := newVibeDB(Config{
 		Durability: DurabilityPowerSafe,
 		CacheBytes: DefaultCacheBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	powerSafe := powerSafeEngine.(*vibeDurable).options()
+	powerSafe := powerSafeEngine.(*vibeDBEngine).options()
 	// The power-safe row rides the journal group commit: buffered-visible
 	// with a per-mutation redo record synced at the platform's strongest
 	// power-loss boundary, not the strict DurabilitySync lane (whose
@@ -199,10 +199,10 @@ func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 	}
 }
 
-func TestVibeDurableScanAllBytesWarmedAllocatesNothing(t *testing.T) {
-	factory, ok := FactoryNamed("vibejson-durable")
+func TestVibeDBScanAllBytesWarmedAllocatesNothing(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	corpus := Corpus(2_048)
 	engine, _, cleanup := newLoadedCorpus(t, factory, Config{
@@ -244,14 +244,14 @@ func TestVibeDurableScanAllBytesWarmedAllocatesNothing(t *testing.T) {
 	}
 }
 
-// TestVibeDurablePointMutationWarmedAllocations keeps the benchmark adapter
+// TestVibeDBPointMutationWarmedAllocations keeps the benchmark adapter
 // honest: its string key conversion lives in caller-owned retained storage, so
-// the only steady allocation is durable's immutable state publication. Both
+// warmed buffered inline replacements publish without heap allocation. Both
 // the single-client handle and a concurrent-harness session own their scratch.
-func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
-	factory, ok := FactoryNamed("vibejson-durable")
+func TestVibeDBPointMutationWarmedAllocations(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	engine, _, cleanup := newLoaded(t, factory, Config{
 		Durability: DurabilityBufferedVisible,
@@ -294,9 +294,9 @@ func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
 					panic(err)
 				}
 			})
-			if putAllocs != 1 {
+			if putAllocs != 0 {
 				t.Fatalf(
-					"warmed Put allocated %.2f times, want 1 published state",
+					"warmed Put allocated %.2f times, want 0",
 					putAllocs,
 				)
 			}
@@ -308,9 +308,9 @@ func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
 					panic(err)
 				}
 			})
-			if deleteRestoreAllocs != 2 {
+			if deleteRestoreAllocs != 0 {
 				t.Fatalf(
-					"warmed delete+restore allocated %.2f times, want 2 published states",
+					"warmed delete+restore allocated %.2f times, want 0",
 					deleteRestoreAllocs,
 				)
 			}
