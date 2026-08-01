@@ -143,6 +143,10 @@ type Statement struct {
 }
 
 type nestedStatements struct {
+	// frame is inline with the already-cold nested state so recursive relation
+	// execution never makes RunInto's stack frame escape. Ordinary statements
+	// keep nested nil and use the direct path below.
+	frame        statementFrame
 	subqueries   []statementSubquery
 	derived      *statementDerived
 	relationJoin *statementRelationJoin
@@ -481,16 +485,44 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// Query.RunInto's destination contract by invalidating the prior result and
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
-	if s.nested != nil {
-		s.discardRelations()
-	}
 	e.Stats = ExecStats{}
-	var frame statementFrame
+	if s.nested == nil {
+		// IntermediateBytes is a statement-wide option even when this statement
+		// has no relation-valued child. Validate it without constructing a frame;
+		// passing a stack frame into the recursive nested executor would force one
+		// heap allocation on every ordinary execution.
+		if _, err := normalizeIntermediateBytes(e.Options); err != nil {
+			return Cursor{}, err
+		}
+		return s.runDirectInto(e, src, args)
+	}
+	s.discardRelations()
+	frame := &s.nested.frame
 	if err := frame.begin(e.Options); err != nil {
 		return Cursor{}, err
 	}
 	frame.args = args
-	return s.runIntoFrame(e, src, args, &frame, "")
+	return s.runIntoFrame(e, src, args, frame, "")
+}
+
+// runDirectInto is the no-nested-state execution path. Keeping it separate is
+// an escape-analysis boundary: the recursive relation executor may retain a
+// statementFrame during one synchronous nested run, but an ordinary SELECT has
+// no frame to retain and therefore remains allocation-free.
+func (s *Statement) runDirectInto(e *Exec, src Source, args []any) (Cursor, error) {
+	if len(args) != s.params {
+		return Cursor{}, fmt.Errorf(
+			"query: statement has %d placeholder(s) and %d argument(s) were bound",
+			s.params, len(args),
+		)
+	}
+	if err := s.bind(args); err != nil {
+		return Cursor{}, err
+	}
+	if err := s.q.RunInto(e, src); err != nil {
+		return Cursor{}, err
+	}
+	return s.cursor(&e.Result), nil
 }
 
 // runIntoFrame is RunInto with the statement-wide accounts already installed.

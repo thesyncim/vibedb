@@ -1,11 +1,7 @@
 package query
 
 import (
-	"errors"
-	"strings"
 	"testing"
-
-	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 const correlatedLateralSQL = `SELECT a.id, d.id
@@ -14,20 +10,15 @@ CROSS JOIN LATERAL (
 	SELECT i.id FROM items i WHERE i.owner = a.id
 ) d`
 
-func TestPrepareStatementRefusesCorrelatedLateralBeforeLowering(t *testing.T) {
+func TestPrepareStatementWiresCorrelatedLateralBeforeLowering(t *testing.T) {
 	statement, err := PrepareStatement(correlatedLateralSQL)
-	if statement != nil {
-		statement.Release()
-		t.Fatal("correlated LATERAL prepared")
+	if err != nil {
+		t.Fatal(err)
 	}
-	var unsupported *sqlast.FeatureNotSupportedError
-	if !errors.As(err, &unsupported) {
-		t.Fatalf("PrepareStatement error = %T %v, want *sql.FeatureNotSupportedError", err, err)
-	}
-	wantPos := strings.Index(correlatedLateralSQL, "LATERAL")
-	if unsupported.Pos != wantPos ||
-		!strings.Contains(unsupported.Msg, "correlated LATERAL execution") {
-		t.Fatalf("typed refusal = %+v, want position %d", unsupported, wantPos)
+	defer statement.Release()
+	join := statement.relationJoin()
+	if join == nil || len(join.operands) != 2 || join.operands[1].lateral == nil {
+		t.Fatal("correlated LATERAL did not prepare an APPLY operand")
 	}
 }
 

@@ -56,14 +56,15 @@ type relationJoinOperand struct {
 	offset   int
 	columns  int
 
-	query  *Query
-	cursor Statement
-	stmt   *Statement
-	cte    *statementCTEReference
-	exec   Exec
-	spool  relationSpool
-	active int64
-	bound  *relationSpool
+	query   *Query
+	cursor  Statement
+	stmt    *Statement
+	lateral *statementLateral
+	cte     *statementCTEReference
+	exec    Exec
+	spool   relationSpool
+	active  int64
+	bound   *relationSpool
 }
 
 type relationJoinSource struct {
@@ -184,26 +185,6 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 	if len(s.tree.From) <= 1 {
 		return nil
 	}
-	// The parser exposes correlated occurrences through a cold LateralSpec
-	// sidecar. Until this executor has a parameterized APPLY input, compiling
-	// those paths as ordinary child-local paths would silently read the wrong
-	// values. Refuse before allocating join state or preparing any child. An
-	// explicitly LATERAL but decorrelated child is exactly the ordinary derived
-	// relation plan and remains safe.
-	for i := range s.tree.From {
-		ref := &s.tree.From[i]
-		if ref.Lateral == nil {
-			continue
-		}
-		if ref.Lateral.Decorrelated && len(ref.Lateral.Bindings) == 0 &&
-			len(ref.Lateral.References) == 0 {
-			continue
-		}
-		return sqlast.NewFeatureNotSupportedError(
-			s.text, ref.Lateral.Pos,
-			"correlated LATERAL execution is not supported yet; remove the outer reference or use a decorrelated derived relation",
-		)
-	}
 	j := new(statementRelationJoin)
 	s.ensureNested().relationJoin = j
 	j.operands = make([]relationJoinOperand, len(s.tree.From))
@@ -230,10 +211,18 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 			if ref.Query == nil {
 				return fmt.Errorf("query: joined derived relation %q has no query", ref.Alias)
 			}
-			child, err := prepareTreeInContext(
-				s.text, ref.Query, 0, s.cteCatalog(),
-				argBase+ref.Query.ParamBase,
-			)
+			var child *Statement
+			var err error
+			if ref.Lateral != nil && !ref.Lateral.Decorrelated {
+				op.lateral, child, err = prepareStatementLateral(
+					s, j, ref, i, argBase,
+				)
+			} else {
+				child, err = prepareTreeInContext(
+					s.text, ref.Query, 0, s.cteCatalog(),
+					argBase+ref.Query.ParamBase,
+				)
+			}
 			if err != nil {
 				return err
 			}
@@ -290,6 +279,9 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 		cond := stage.ref.On
 		if stage.ref.Join == sqlast.JoinCross {
 			stage.algorithm = "nested-loop-cross"
+			if j.operands[stage.index].lateral != nil {
+				stage.algorithm = "bounded-lateral-apply"
+			}
 			continue
 		}
 		if cond == nil {
@@ -311,6 +303,9 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 		stage.algorithm = "bounded-nested-loop"
 		if len(stage.keys) != 0 {
 			stage.algorithm = "composite-hash"
+		}
+		if j.operands[stage.index].lateral != nil {
+			stage.algorithm = "bounded-lateral-apply"
 		}
 		if cond.Using {
 			stage.using = make([]relationJoinUsing, len(cond.Keys))
@@ -544,6 +539,9 @@ func (j *statementRelationJoin) run(
 		j.lastBuildRows[i] = 0
 	}
 	for i := range j.operands {
+		if j.operands[i].lateral != nil {
+			continue
+		}
 		if err := j.materializeOperand(owner, parent, src, args, frame, i); err != nil {
 			j.releaseExecution(frame)
 			return Source{}, err
@@ -558,10 +556,22 @@ func (j *statementRelationJoin) run(
 			j.activeBytes[target] = 0
 		}
 		j.spools[target].reset()
-		charge, pairs, hashed, err := j.runStage(
-			&j.stages[i], left, j.operands[i+1].bound,
-			&j.spools[target], parent.Options, args, frame,
-		)
+		var charge int64
+		var pairs int
+		var hashed bool
+		var err error
+		op := &j.operands[i+1]
+		if op.lateral != nil {
+			charge, pairs, err = op.lateral.runStage(
+				j, &j.stages[i], op, owner, parent, src, args,
+				left, &j.spools[target], frame,
+			)
+		} else {
+			charge, pairs, hashed, err = j.runStage(
+				&j.stages[i], left, op.bound,
+				&j.spools[target], parent.Options, args, frame,
+			)
+		}
 		if err != nil {
 			j.releaseExecution(frame)
 			return Source{}, err
@@ -1541,6 +1551,9 @@ func (j *statementRelationJoin) releaseExecution(frame *statementFrame) {
 			op.cte.spool.reset()
 			op.cte.activeBytes = 0
 		}
+		if op.lateral != nil {
+			op.lateral.releaseExecution(frame)
+		}
 		op.spool.reset()
 		frame.intermediate.release(op.active)
 		op.active = 0
@@ -1568,6 +1581,9 @@ func (j *statementRelationJoin) discardExecution() {
 			op.cte.spool.reset()
 			op.cte.activeBytes = 0
 		}
+		if op.lateral != nil {
+			op.lateral.discardExecution()
+		}
 		op.spool.reset()
 		op.active = 0
 		op.bound = nil
@@ -1590,6 +1606,9 @@ func (j *statementRelationJoin) release() {
 		}
 		op.exec.Release()
 		op.spool.release()
+		if op.lateral != nil {
+			op.lateral.release()
+		}
 	}
 	for i := range j.spools {
 		j.spools[i].release()
@@ -1631,7 +1650,10 @@ func (s *Statement) explainRelationJoins(analyze bool) []explainJoin {
 			KeyCount:   len(stage.keys),
 			Cross:      ref.Join == sqlast.JoinCross,
 		}
-		if len(stage.keys) != 0 {
+		if j.operands[stage.index].lateral != nil {
+			item.AccessPath = "lateral-apply"
+		}
+		if stage.algorithm == "composite-hash" {
 			item.BuildSide = "right"
 			if ref.Join == sqlast.JoinRight {
 				item.BuildSide = "left"
