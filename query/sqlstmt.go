@@ -449,7 +449,7 @@ func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
 				continue
 			}
 			if sub.use == subqueryScalarUse && len(sub.slots) == 1 {
-				return fmt.Errorf("query: scalar subquery returned more than one row")
+				return &CardinalityViolationError{}
 			}
 			sub.slots = append(sub.slots, subqueryScalar{})
 			slot := &sub.slots[len(sub.slots)-1]

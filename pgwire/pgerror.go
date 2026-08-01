@@ -53,6 +53,7 @@ const (
 	sqlstateCharacterNotInRepertoire   = "22021"
 	sqlstateNumericValueOutOfRange     = "22003"
 	sqlstateInvalidParameterValue      = "22023"
+	sqlstateCardinalityViolation       = "21000"
 	sqlstateProgramLimitExceeded       = "54000"
 	sqlstateObjectNotInPrereqState     = "55000"
 	sqlstateInternalError              = "XX000"
@@ -181,6 +182,8 @@ func asPGError(err error) *pgError {
 	switch {
 	case errors.Is(err, query.ErrCanceled):
 		return queryCanceled()
+	case errors.Is(err, query.ErrCardinalityViolation):
+		return newError(sqlstateCardinalityViolation, err.Error())
 	case errors.Is(err, query.ErrParameterType):
 		return newError(sqlstateDatatypeMismatch, err.Error())
 	case errors.Is(err, query.ErrInvalidPattern):

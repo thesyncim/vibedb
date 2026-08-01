@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -111,8 +112,8 @@ func TestSQLUncorrelatedSubqueries(t *testing.T) {
 			want: "4:\"o1\"|",
 		},
 		{
-			name: "empty scalar is null",
-			sql:  `SELECT id FROM orders WHERE customer = (SELECT id FROM customers WHERE score = 100)`,
+			name: "empty scalar is null and not false",
+			sql:  `SELECT id FROM orders WHERE NOT (customer = (SELECT id FROM customers WHERE score = 100))`,
 			want: "",
 		},
 	}
@@ -140,9 +141,20 @@ func TestSQLScalarSubqueryRejectsMultipleRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	var exec Exec
-	if _, err := stmt.RunInto(&exec, FromDatabase(catalog, "orders"), nil); err == nil ||
-		!strings.Contains(err.Error(), "more than one row") {
-		t.Fatalf("RunInto error = %v, want scalar cardinality error", err)
+	_, err = stmt.RunInto(&exec, FromDatabase(catalog, "orders"), nil)
+	if err == nil {
+		t.Fatal("RunInto succeeded, want scalar cardinality error")
+	}
+	var violation *CardinalityViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("RunInto error = %T %v, want *CardinalityViolationError", err, err)
+	}
+	if !errors.Is(err, ErrCardinalityViolation) {
+		t.Fatalf("RunInto error = %v, want errors.Is(ErrCardinalityViolation)", err)
+	}
+	if !strings.Contains(violation.Error(), "more than one row") {
+		t.Fatalf("cardinality error message = %q, want useful scalar-subquery context",
+			violation.Error())
 	}
 	if got := stmt.nested.subqueries[0].exec.Result.RowCount; got != 2 {
 		t.Fatalf("scalar nested rows = %d, want the two-row cardinality cap", got)
