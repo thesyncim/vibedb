@@ -119,6 +119,11 @@ type JoinCond struct {
 	// Left names a key of an earlier range variable, Right of the joined one.
 	Left  *PathExpr
 	Right *PathExpr
+	// Using records that the equality came from JOIN ... USING rather than ON.
+	// The distinction is semantic: USING contributes one unqualified output
+	// column whose value is the coalescing of the two keys, while an equivalent
+	// ON equality leaves an unqualified name ambiguous.
+	Using bool
 	Pos   int
 }
 

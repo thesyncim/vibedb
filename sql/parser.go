@@ -749,12 +749,13 @@ func (p *Parser) parseJoin() (bool, error) {
 	return false, nil
 }
 
-// parseUsingCond lowers the common one-column USING form to the same explicit
-// equality the executor already understands. A USING name belongs to the
-// relation immediately on the left and to the relation this JOIN adds. The
-// current executor only accepts the driving relation as the left side, so a
-// chained USING join is rejected during normal lowering with the same precise
-// chained-join diagnostic as an ON join.
+// parseUsingCond lowers the common one-column USING form to the explicit
+// equality the executor understands and marks the condition so deferred name
+// resolution can expose USING's merged unqualified key. A USING name belongs
+// to the relation immediately on the left and to the relation this JOIN adds.
+// The current executor only accepts the driving relation as the left side, so
+// a chained USING join is rejected during normal lowering with the same
+// precise chained-join diagnostic as an ON join.
 func (p *Parser) parseUsingCond(joinSource int) (*JoinCond, error) {
 	pos := p.tok.pos
 	if err := p.expect(tokLParen, "'(' after USING"); err != nil {
@@ -782,7 +783,7 @@ func (p *Parser) parseUsingCond(joinSource int) (*JoinCond, error) {
 	left := p.boundPath(path, joinSource-1)
 	right := p.boundPath(path, joinSource)
 	cond := p.conds.one()
-	*cond = JoinCond{Left: left, Right: right, Pos: pos}
+	*cond = JoinCond{Left: left, Right: right, Using: true, Pos: pos}
 	return cond, nil
 }
 

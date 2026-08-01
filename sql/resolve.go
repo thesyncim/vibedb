@@ -48,6 +48,10 @@ func (p *Parser) resolvePaths() error {
 					path.Segments[0].Key, path.Segments[0].Key+".*")
 			}
 		}
+		if source, ok := p.usingColumnSource(path); ok {
+			path.Source = source
+			continue
+		}
 		if len(p.out.From) != 1 {
 			if entry.star {
 				return p.errAt(path.Pos,
@@ -60,6 +64,40 @@ func (p *Parser) resolvePaths() error {
 		path.Source = 0
 	}
 	return nil
+}
+
+// usingColumnSource resolves the one unqualified column JOIN ... USING adds to
+// the joined row.
+//
+// SQL defines that column as COALESCE(left.key, right.key). For the join shapes
+// this executor accepts, that expression has an exact path representation: on
+// an inner join the keys compare equal, and on an outer join the preserved
+// side is the only side that can survive without a match. Selecting the
+// preserved side therefore returns the same value without adding a computed
+// projection to the query engine. RIGHT JOIN is still in its source spelling
+// when resolution runs, so its newly joined (right) source is the preserved
+// one; normalizeRightJoins subsequently swaps it into source zero.
+//
+// Only the exact, simple USING name is merged. A qualified spelling continues
+// to address that relation's own key, and another unqualified path remains
+// ambiguous. Composite USING lists are rejected by the parser.
+func (p *Parser) usingColumnSource(path *PathExpr) (int, bool) {
+	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+		return 0, false
+	}
+	for i := 1; i < len(p.out.From); i++ {
+		ref := &p.out.From[i]
+		cond := ref.On
+		if cond == nil || !cond.Using ||
+			len(cond.Left.Segments) != 1 || cond.Left.Segments[0] != path.Segments[0] {
+			continue
+		}
+		if ref.Join == JoinRight {
+			return i, true
+		}
+		return cond.Left.Source, true
+	}
+	return 0, false
 }
 
 // normalizeRightJoins rewrites RIGHT JOIN into the LEFT JOIN orientation used
@@ -92,26 +130,36 @@ func (p *Parser) normalizeRightJoins() error {
 }
 
 func (p *Parser) swapSources(a, b int) {
-	for i := range p.out.Columns {
-		if path := p.out.Columns[i].Path; path != nil {
-			path.Source = swappedSource(path.Source, a, b)
-		}
+	// Every parsed path is registered in pending exactly once. DISTINCT and
+	// ORDER BY aliases intentionally share projection pointers, so walking AST
+	// clauses independently would swap those pointers twice and silently restore
+	// their original source. Remap the parser registry once instead.
+	for i := range p.pending {
+		path := p.pending[i].path
+		path.Source = swappedSource(path.Source, a, b)
 	}
-	for i := range p.out.GroupBy {
-		p.out.GroupBy[i].Source = swappedSource(p.out.GroupBy[i].Source, a, b)
-	}
-	for i := range p.out.OrderBy {
-		p.out.OrderBy[i].Path.Source = swappedSource(p.out.OrderBy[i].Path.Source, a, b)
-	}
-	remapExprSources(p.out.Where, a, b)
-	remapExprSources(p.out.Having, a, b)
 	for i := range p.out.From {
 		if cond := p.out.From[i].On; cond != nil {
-			cond.Left.Source = swappedSource(cond.Left.Source, a, b)
-			cond.Right.Source = swappedSource(cond.Right.Source, a, b)
+			// USING synthesizes already-bound paths and removes its unqualified
+			// source path from pending. Explicit ON paths were remapped above.
+			if !p.pathPending(cond.Left) {
+				cond.Left.Source = swappedSource(cond.Left.Source, a, b)
+			}
+			if !p.pathPending(cond.Right) {
+				cond.Right.Source = swappedSource(cond.Right.Source, a, b)
+			}
 		}
 	}
 	p.out.From[a], p.out.From[b] = p.out.From[b], p.out.From[a]
+}
+
+func (p *Parser) pathPending(path *PathExpr) bool {
+	for i := range p.pending {
+		if p.pending[i].path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func swappedSource(source, a, b int) int {
@@ -122,22 +170,6 @@ func swappedSource(source, a, b int) int {
 		return a
 	default:
 		return source
-	}
-}
-
-func remapExprSources(e *Expr, a, b int) {
-	if e == nil {
-		return
-	}
-	if e.Path != nil {
-		e.Path.Source = swappedSource(e.Path.Source, a, b)
-	}
-	if e.Subquery != nil {
-		// A nested SELECT has its own source namespace.
-		return
-	}
-	for _, kid := range e.Kids {
-		remapExprSources(kid, a, b)
 	}
 }
 
