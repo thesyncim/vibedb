@@ -212,6 +212,15 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)
 	}
+	if s.Returning != nil {
+		checkStatementInvariants(t, s.Returning)
+		for i := range s.Returning.Columns {
+			if s.Returning.Columns[i].Agg != AggNone {
+				t.Fatalf("RETURNING column %d is aggregate kind %d",
+					i, s.Returning.Columns[i].Agg)
+			}
+		}
+	}
 	if seen != s.Params {
 		t.Fatalf("UPDATE reports %d placeholders and holds %d", s.Params, seen)
 	}
@@ -222,6 +231,15 @@ func checkDelete(t *testing.T, s *DeleteStmt) {
 	seen := 0
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)
+	}
+	if s.Returning != nil {
+		checkStatementInvariants(t, s.Returning)
+		for i := range s.Returning.Columns {
+			if s.Returning.Columns[i].Agg != AggNone {
+				t.Fatalf("RETURNING column %d is aggregate kind %d",
+					i, s.Returning.Columns[i].Agg)
+			}
+		}
 	}
 	if s.All && s.Filter != nil && s.Filter.Where != nil {
 		t.Fatal("a DELETE marked as acting on everything carries a condition")

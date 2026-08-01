@@ -67,13 +67,15 @@
 // type-separated; numerically equal spellings such as 1, 1.0, and 1e0 identify
 // one row.
 //
-// INSERT ... RETURNING path, ... and RETURNING * execute through Query. The
-// projection is evaluated from the final staged JSON documents in VALUES order
-// before publication, without a storage reread. A projection or result-budget
-// failure therefore publishes nothing.
+// INSERT, UPDATE, and DELETE ... RETURNING path, ... and RETURNING * execute
+// through Query. The projection is evaluated from staged JSON documents before
+// publication, without a storage reread. DELETE projects pre-delete documents;
+// UPDATE projects replacements. A projection or result-budget failure therefore
+// publishes nothing.
 //
 // INSERT rejects an existing or repeated derived key with
-// ErrDuplicatePrimaryKey and never replaces it. UPDATE is the explicit
+// ErrDuplicatePrimaryKey and never replaces it, unless the statement explicitly
+// uses ON CONFLICT DO NOTHING, which skips those rows. UPDATE is the explicit
 // replacement operation, accepts only SET "$doc" = ..., and cannot change the
 // derived primary key. Because one statement supplies one replacement document,
 // an UPDATE matching several distinct keys returns [ErrUpdatePrimaryKey]; use a

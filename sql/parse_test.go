@@ -32,6 +32,11 @@ func TestGrammarShapes(t *testing.T) {
 			want: `select path(0:team) path(0:score) from docs`,
 		},
 		{
+			name: "distinct projection",
+			src:  `SELECT DISTINCT team FROM docs ORDER BY team`,
+			want: `select distinct path(0:team) from docs group 0:team order 0:team:asc`,
+		},
+		{
 			name: "output alias",
 			src:  `SELECT team AS t FROM docs`,
 			want: `select path(0:team) as t from docs`,

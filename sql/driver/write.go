@@ -333,6 +333,7 @@ func (c *conn) insertLocked(
 	if len(tree.Rows) > 1 {
 		seen = make(map[string]struct{}, len(tree.Rows))
 	}
+	conflictScratch := c.pointRaw[:0]
 	stagedBytes := 0
 	cancellable := ctx.Done() != nil
 	for i := range tree.Rows {
@@ -349,6 +350,9 @@ func (c *conn) insertLocked(
 			return nil, err
 		}
 		if _, duplicate := seen[key]; duplicate {
+			if tree.OnConflictDoNothing {
+				continue
+			}
 			return nil, fmt.Errorf(
 				"%w: %q appears twice in one VALUES batch",
 				ErrDuplicatePrimaryKey, key,
@@ -356,6 +360,18 @@ func (c *conn) insertLocked(
 		}
 		if seen != nil {
 			seen[key] = struct{}{}
+		}
+		if tree.OnConflictDoNothing && t.collection != nil {
+			var found bool
+			conflictScratch, found, err = t.collection.AppendRaw(
+				conflictScratch[:0], []byte(key))
+			if err != nil {
+				c.pointRaw = conflictScratch
+				return nil, err
+			}
+			if found {
+				continue
+			}
 		}
 		stagedBytes += len(key) + len(document)
 		if stagedBytes > limits.MaxBatchBytes {
@@ -366,6 +382,7 @@ func (c *conn) insertLocked(
 		}
 		seeds = append(seeds, seedDocument{key: key, document: document})
 	}
+	c.pointRaw = conflictScratch
 	if returning != nil {
 		if returned == nil {
 			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
@@ -401,8 +418,10 @@ func (c *conn) insertLocked(
 		}
 		return result{affected: int64(len(seeds))}, nil
 	}
-	if err := c.rejectExistingSeeds(t.collection, seeds); err != nil {
-		return nil, err
+	if !tree.OnConflictDoNothing {
+		if err := c.rejectExistingSeeds(t.collection, seeds); err != nil {
+			return nil, err
+		}
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
@@ -418,11 +437,11 @@ func (c *conn) insertLocked(
 	return result{affected: int64(len(seeds))}, nil
 }
 
-// insertReturningContext executes an INSERT and materializes its RETURNING
-// projection from the already-resolved documents before publication. A
-// projection or result-budget failure therefore leaves storage untouched, and
-// the successful path performs no storage reread.
-func (c *conn) insertReturningContext(
+// mutationReturningContext executes a mutation and materializes its RETURNING
+// projection before publication. A projection or result-budget failure leaves
+// storage untouched, and the successful path performs no storage reread for
+// INSERT/UPDATE; DELETE captures the old documents before removing them.
+func (c *conn) mutationReturningContext(
 	ctx context.Context,
 	statement *query.DMLStatement,
 	args []any,
@@ -443,9 +462,9 @@ func (c *conn) insertReturningContext(
 	if err := d.settleCatalogLocked(); err != nil {
 		return cursor, err
 	}
-	if statement.Kind() != query.DMLInsert || returning == nil {
+	if returning == nil {
 		return cursor, errors.New(
-			"vibedb: internal returning execution requires INSERT RETURNING",
+			"vibedb: internal returning execution requires a RETURNING projection",
 		)
 	}
 	t, ok := d.tables[statement.Collection()]
@@ -454,9 +473,18 @@ func (c *conn) insertReturningContext(
 			"%w: %q", ErrTableNotFound, statement.Collection(),
 		)
 	}
-	if _, err := c.insertLocked(
-		ctx, statement, args, t, returning, &cursor,
-	); err != nil {
+	var err error
+	switch statement.Kind() {
+	case query.DMLInsert:
+		_, err = c.insertLocked(ctx, statement, args, t, returning, &cursor)
+	case query.DMLUpdate:
+		_, err = c.updateLockedReturning(ctx, statement, args, t, returning, &cursor)
+	case query.DMLDelete:
+		_, err = c.deleteLockedReturning(ctx, statement, args, t, returning, &cursor)
+	default:
+		err = fmt.Errorf("vibedb: %s does not support RETURNING", statement.Kind())
+	}
+	if err != nil {
 		return query.Cursor{}, err
 	}
 	return cursor, nil
@@ -808,6 +836,17 @@ func (c *conn) updateLocked(
 	args []any,
 	t *table,
 ) (sqldriver.Result, error) {
+	return c.updateLockedReturning(ctx, statement, args, t, nil, nil)
+}
+
+func (c *conn) updateLockedReturning(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+	t *table,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
 	limits, err := tableMutationLimits(t)
 	if err != nil {
 		return nil, err
@@ -839,6 +878,24 @@ func (c *conn) updateLocked(
 				ErrUpdatePrimaryKey, newKey, key,
 			)
 		}
+	}
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		c.pointDocs.Reset()
+		for range keys {
+			if _, err := c.pointDocs.Append(document); err != nil {
+				return nil, err
+			}
+		}
+		cursor, err := returning.RunInto(
+			&c.exec, query.FromSegment(&c.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
@@ -879,6 +936,17 @@ func (c *conn) deleteLocked(
 	args []any,
 	t *table,
 ) (sqldriver.Result, error) {
+	return c.deleteLockedReturning(ctx, statement, args, t, nil, nil)
+}
+
+func (c *conn) deleteLockedReturning(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+	t *table,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
 	limits, err := tableMutationLimits(t)
 	if err != nil {
 		return nil, err
@@ -889,6 +957,21 @@ func (c *conn) deleteLocked(
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
+	}
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		if err := c.loadReturningDocuments(t, keys); err != nil {
+			return nil, err
+		}
+		cursor, err := returning.RunInto(
+			&c.exec, query.FromSegment(&c.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
 	}
 	if t.collection == nil {
 		return result{}, nil
@@ -923,6 +1006,36 @@ func (c *conn) deleteLocked(
 		return nil, mutationErr
 	}
 	return result{affected: int64(affected)}, nil
+}
+
+// loadReturningDocuments captures the pre-delete documents in the same key
+// order used by the mutation. The caller holds the catalog mutex, so the
+// snapshot cannot race a driver-mediated writer; the durable snapshot still
+// keeps the read boundary explicit and makes the borrowed page data safe until
+// it has been copied into pointDocs.
+func (c *conn) loadReturningDocuments(t *table, keys []string) error {
+	c.pointDocs.Reset()
+	if t.collection == nil {
+		return nil
+	}
+	snapshot, err := t.collection.Snapshot()
+	if err != nil {
+		return err
+	}
+	defer snapshot.Close()
+	for _, key := range keys {
+		raw, found, err := snapshot.AppendRaw(c.pointRaw[:0], []byte(key))
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if _, err := c.pointDocs.Append(raw); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *conn) matchingKeysLocked(

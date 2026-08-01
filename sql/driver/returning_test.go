@@ -90,6 +90,131 @@ func TestInsertReturningMustUseQueryAndFailureIsAtomic(t *testing.T) {
 	assertSurfaceCount(t, db, `SELECT COUNT(*) FROM docs`, 1)
 }
 
+func TestInsertOnConflictDoNothing(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY, value STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"a","value":"old"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query(`
+		INSERT INTO docs VALUES (?), (?), (?), (?)
+		ON CONFLICT DO NOTHING RETURNING id`,
+		`{"id":"a","value":"ignored"}`,
+		`{"id":"b","value":"new"}`,
+		`{"id":"b","value":"duplicate-in-batch"}`,
+		`{"id":"c","value":"new"}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"b", "c"}) {
+		t.Fatalf("ON CONFLICT RETURNING rows = %v, want [b c]", got)
+	}
+	assertSurfaceCount(t, db, `SELECT COUNT(*) FROM docs`, 3)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = tx.Query(`
+		INSERT INTO docs VALUES (?), (?), (?)
+		ON CONFLICT DO NOTHING RETURNING id`,
+		`{"id":"a","value":"ignored"}`,
+		`{"id":"d","value":"new"}`,
+		`{"id":"d","value":"duplicate-in-transaction"}`,
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	got = got[:0]
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"d"}) {
+		t.Fatalf("transactional ON CONFLICT RETURNING rows = %v, want [d]", got)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	assertSurfaceCount(t, db, `SELECT COUNT(*) FROM docs`, 4)
+}
+
+func TestSelectDistinctProjection(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY, team STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?), (?), (?), (?)`,
+		`{"id":"1","team":"red"}`,
+		`{"id":"2","team":"blue"}`,
+		`{"id":"3","team":"red"}`,
+		`{"id":"4","team":"blue"}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT DISTINCT team FROM docs ORDER BY team`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		var team string
+		if err := rows.Scan(&team); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, team)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"blue", "red"}) {
+		t.Fatalf("SELECT DISTINCT = %v, want [blue red]", got)
+	}
+
+	var limited []string
+	rows, err = db.Query(`SELECT DISTINCT team FROM docs ORDER BY team LIMIT 1 OFFSET 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var team string
+		if err := rows.Scan(&team); err != nil {
+			t.Fatal(err)
+		}
+		limited = append(limited, team)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(limited, []string{"red"}) {
+		t.Fatalf("SELECT DISTINCT LIMIT/OFFSET = %v, want [red]", limited)
+	}
+}
+
 func TestInsertReturningTypedRuntimeTransaction(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(t.TempDir() + "/catalog.vdb")

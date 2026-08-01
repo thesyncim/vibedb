@@ -49,6 +49,9 @@ func dumpInsert(s *InsertStmt) string {
 		}
 		b.WriteByte(')')
 	}
+	if s.OnConflictDoNothing {
+		b.WriteString(" on conflict do nothing")
+	}
 	if s.Returning != nil {
 		b.WriteString(" returning ")
 		for i := range s.Returning.Columns {
@@ -69,6 +72,15 @@ func dumpUpdate(s *UpdateStmt) string {
 	b.WriteString(" set ")
 	dumpOperand(&b, s.Doc)
 	dumpTargets(&b, s.Filter, false)
+	if s.Returning != nil {
+		b.WriteString(" returning ")
+		for i := range s.Returning.Columns {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			dumpColumn(&b, &s.Returning.Columns[i])
+		}
+	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }
@@ -78,6 +90,15 @@ func dumpDelete(s *DeleteStmt) string {
 	b.WriteString("delete from ")
 	b.WriteString(s.Table)
 	dumpTargets(&b, s.Filter, s.All)
+	if s.Returning != nil {
+		b.WriteString(" returning ")
+		for i := range s.Returning.Columns {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			dumpColumn(&b, &s.Returning.Columns[i])
+		}
+	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
 }

@@ -38,6 +38,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `insert into users (j{"id":"a","x":1}) (?0) params=1`,
 		},
 		{
+			name: "skip a conflicting document",
+			src:  `INSERT INTO users VALUES (?) ON CONFLICT DO NOTHING RETURNING id`,
+			want: `insert into users (?0) on conflict do nothing returning path(0:id) params=1`,
+		},
+		{
 			name: "insert returning projected fields",
 			src:  `INSERT INTO users VALUES (?) RETURNING id, profile.name AS name`,
 			want: `insert into users (?0) returning path(0:id), path(0:profile.name) as name params=1`,
@@ -58,6 +63,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `update users set ?0 where (cmp = 0:tier s"free") params=1`,
 		},
 		{
+			name: "update returning",
+			src:  `UPDATE users SET "$doc" = ? WHERE tier = 'free' RETURNING id`,
+			want: `update users set ?0 where (cmp = 0:tier s"free") returning path(0:id) params=1`,
+		},
+		{
 			name: "update by a JSON field named dollar key",
 			src:  `UPDATE users SET "$doc" = ? WHERE "$key" = 'u1'`,
 			want: `update users set ?0 where (cmp = 0:/$key s"u1") params=1`,
@@ -71,6 +81,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			name: "delete by condition",
 			src:  `DELETE FROM users WHERE age > 30 AND NOT (name = 'x')`,
 			want: `delete from users where (and (cmp > 0:age n30) (not (cmp = 0:name s"x"))) params=0`,
+		},
+		{
+			name: "delete returning",
+			src:  `DELETE FROM users WHERE age > 30 RETURNING id`,
+			want: `delete from users where (cmp > 0:age n30) returning path(0:id) params=0`,
 		},
 		{
 			name: "delete by a JSON field named dollar key",
@@ -210,8 +225,7 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
 		{"INSERT ... SELECT", `INSERT INTO t SELECT a FROM u`, -1, "nowhere to send"},
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
-		{"ON CONFLICT", `INSERT INTO t VALUES (?) ON CONFLICT DO NOTHING`, -1, "ON CONFLICT"},
-		{"RETURNING", `DELETE FROM t RETURNING a`, -1, "RETURNING"},
+		{"conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id) DO NOTHING`, -1, "CONFLICT targets"},
 		{"aggregate RETURNING", `INSERT INTO t VALUES (?) RETURNING COUNT(*)`, -1, "aggregate"},
 
 		{"a top-level path assignment", `UPDATE t SET name = 'x'`, -1, "partial document update"},

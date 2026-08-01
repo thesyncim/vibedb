@@ -160,6 +160,21 @@ func (p *Parser) parseInsert() error {
 	}
 	p.rows = rows
 	p.ins.Rows = rows
+	if p.acceptKeyword(kwOn) {
+		if err := p.expectKeyword(kwConflict, "CONFLICT after ON"); err != nil {
+			return err
+		}
+		if p.tok.kind == tokLParen {
+			return p.errHere("ON CONFLICT targets are not supported; the document-derived primary key is the only conflict target")
+		}
+		if err := p.expectKeyword(kwDo, "DO after ON CONFLICT"); err != nil {
+			return err
+		}
+		if err := p.expectKeyword(kwNothing, "NOTHING after ON CONFLICT DO"); err != nil {
+			return err
+		}
+		p.ins.OnConflictDoNothing = true
+	}
 	if p.acceptKeyword(kwReturning) {
 		if err := p.parseInsertReturning(name, pos); err != nil {
 			return err
@@ -400,6 +415,13 @@ func (p *Parser) parseUpdate() error {
 		return err
 	}
 	p.upd.Filter = p.out
+	if p.acceptKeyword(kwReturning) {
+		p.saveFilter()
+		if err := p.parseMutationReturning(name, pos); err != nil {
+			return err
+		}
+		p.upd.Returning = &p.returning
+	}
 	p.upd.Params = p.params
 	return nil
 }
@@ -471,8 +493,62 @@ func (p *Parser) parseDelete() error {
 	default:
 		p.del.Filter = p.out
 	}
+	if p.acceptKeyword(kwReturning) {
+		p.saveFilter()
+		if err := p.parseMutationReturning(name, pos); err != nil {
+			return err
+		}
+		p.del.Returning = &p.returning
+	}
 	p.del.Params = p.params
 	return nil
+}
+
+// saveFilter copies the synthetic SELECT's clause slices before RETURNING
+// reuses the parser's clause buffers for its own projection. The paths and
+// expressions themselves live in parser arenas and do not need cloning.
+func (p *Parser) saveFilter() {
+	p.filterColumns = append(p.filterColumns[:0], p.out.Columns...)
+	p.filterFrom = append(p.filterFrom[:0], p.out.From...)
+	p.filterGroupBy = append(p.filterGroupBy[:0], p.out.GroupBy...)
+	p.filterOrderBy = append(p.filterOrderBy[:0], p.out.OrderBy...)
+	p.out.Columns = p.filterColumns
+	p.out.From = p.filterFrom
+	p.out.GroupBy = p.filterGroupBy
+	p.out.OrderBy = p.filterOrderBy
+}
+
+// parseMutationReturning parses the projection over documents selected by an
+// UPDATE or DELETE. It is deliberately a projection-only SELECT: mutation
+// RETURNING has no row source visible to SQL and therefore cannot group or
+// aggregate.
+func (p *Parser) parseMutationReturning(name string, pos int) error {
+	p.out = &p.returning
+	*p.out = SelectStmt{}
+	p.pending = p.pending[:0]
+	p.columns = p.columns[:0]
+	p.from = p.from[:0]
+	p.groupBy = p.groupBy[:0]
+	p.orderBy = p.orderBy[:0]
+	p.from = append(p.from, TableRef{Name: name, Alias: name, Join: JoinNone, Pos: pos})
+	p.out.From = p.from
+	if err := p.parseResultColumns(); err != nil {
+		return err
+	}
+	for i := range p.out.Columns {
+		if p.out.Columns[i].Agg != AggNone {
+			return p.errAt(p.out.Columns[i].Pos,
+				"RETURNING projects each affected document; aggregate functions are not allowed")
+		}
+	}
+	if err := p.expectEnd(); err != nil {
+		return err
+	}
+	if err := p.resolvePaths(); err != nil {
+		return err
+	}
+	p.out.Params = 0
+	return p.validate()
 }
 
 // --- shared ------------------------------------------------------------------
@@ -560,6 +636,13 @@ func (p *Parser) parseDMLWhere(clause string) error {
 	case p.atKeyword(kwLimit), p.atKeyword(kwOffset):
 		return p.errfHere("%s has no LIMIT: a bounded delete would have to choose which matching documents to spare, and the engine has no ordering to choose by", clause)
 	}
+	if p.atKeyword(kwReturning) {
+		if err := p.resolvePaths(); err != nil {
+			return err
+		}
+		p.out.Params = p.params
+		return p.validate()
+	}
 	if err := p.rejectTail(); err != nil {
 		return err
 	}
@@ -577,10 +660,10 @@ func (p *Parser) parseDMLWhere(clause string) error {
 // dialects and this one has no execution for.
 func (p *Parser) rejectTail() error {
 	if p.atKeyword(kwReturning) {
-		return p.errHere("RETURNING is supported only on INSERT; UPDATE and DELETE report how many documents they touched and return no rows")
+		return p.errHere("RETURNING is supported on INSERT, UPDATE, and DELETE")
 	}
 	if p.atKeyword(kwOn) {
-		return p.errHere("ON CONFLICT / ON DUPLICATE KEY is not supported: an INSERT onto an existing key is refused, and a deliberate overwrite is written UPDATE ... SET \"$doc\" = ?")
+		return p.errHere("ON CONFLICT supports only DO NOTHING; conflict updates are written UPDATE ... SET \"$doc\" = ?")
 	}
 	return nil
 }

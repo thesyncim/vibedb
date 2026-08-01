@@ -361,6 +361,16 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			s.query, err = query.PrepareParsedStatement(
 				src, tree.Insert.Returning,
 			)
+		} else if err == nil && tree.Kind == sqlast.KindUpdate &&
+			tree.Update.Returning != nil {
+			s.query, err = query.PrepareParsedStatement(
+				src, tree.Update.Returning,
+			)
+		} else if err == nil && tree.Kind == sqlast.KindDelete &&
+			tree.Delete.Returning != nil {
+			s.query, err = query.PrepareParsedStatement(
+				src, tree.Delete.Returning,
+			)
 		}
 	}
 	if err != nil {

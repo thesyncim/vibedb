@@ -82,7 +82,9 @@ type Statement struct {
 // query path.
 func (s *Statement) ReturnsRows() bool {
 	return s != nil && (s.Kind == KindSelect ||
-		s.Kind == KindInsert && s.Insert != nil && s.Insert.Returning != nil)
+		s.Kind == KindInsert && s.Insert != nil && s.Insert.Returning != nil ||
+		s.Kind == KindUpdate && s.Update != nil && s.Update.Returning != nil ||
+		s.Kind == KindDelete && s.Delete != nil && s.Delete.Returning != nil)
 }
 
 // Table answers the collection the statement reads or writes.
@@ -156,6 +158,11 @@ type InsertStmt struct {
 	// INSERT INTO t (a, b) VALUES (?, ?). It is nil when VALUES carries a
 	// whole JSON document.
 	Columns []*PathExpr
+	// OnConflictDoNothing makes an identity collision a skipped row instead of
+	// an error. It is the deliberately narrow, atomic subset of PostgreSQL's
+	// ON CONFLICT grammar supported by the storage adapter; conflict targets
+	// and DO UPDATE are not implied by this flag.
+	OnConflictDoNothing bool
 	// Returning is the projection evaluated over the documents this INSERT
 	// publishes, in VALUES order. It is nil when the statement returns no rows.
 	//
@@ -222,6 +229,9 @@ type UpdateStmt struct {
 	// promise "UPDATE writes exactly the documents SELECT returns" structural: a
 	// lowering pass hands this to the SELECT lowering unchanged.
 	Filter *SelectStmt
+	// Returning projects the replacement documents after UPDATE, in selected
+	// key order. It is nil when the statement reports only RowsAffected.
+	Returning *SelectStmt
 	// Params is the number of '?' placeholders.
 	Params int
 	// Pos is the byte offset of the collection name.
@@ -237,6 +247,9 @@ type DeleteStmt struct {
 	// Filter is the equivalent SELECT whose surviving rows this statement
 	// deletes. See [UpdateStmt.Filter].
 	Filter *SelectStmt
+	// Returning projects the documents removed by DELETE, in selected key
+	// order. It is nil when the statement reports only RowsAffected.
+	Returning *SelectStmt
 	// Params is the number of '?' placeholders.
 	Params int
 	// Pos is the byte offset of the collection name.

@@ -656,7 +656,6 @@ func TestSQLParseErrorsCarryAPosition(t *testing.T) {
 		`SELECT a FROM`,
 		`SELECT a FROM t WHERE`,
 		`DELETE FROM t`,
-		`SELECT DISTINCT a FROM t`,
 		`SELECT a FROM t WHERE a LIKE 'x%'`,
 		`SELECT a FROM t WHERE a = NULL`,
 		`SELECT a FROM t LEFT JOIN u ON u.a = t.a`,

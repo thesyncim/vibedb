@@ -126,7 +126,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 				s.mutation, args, s.query,
 			)
 		} else {
-			cursor, err = s.conn.insertReturningContext(
+			cursor, err = s.conn.mutationReturningContext(
 				ctx, s.mutation, args, s.query,
 			)
 		}

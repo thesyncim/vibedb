@@ -189,11 +189,13 @@ identity, without converting through `float64`. Numeric identity supports the
 full JSON exponent syntax rather than an `int64` exponent subset; the practical
 bounds are the document and physical-key byte limits, not machine arithmetic.
 
-INSERT means insert, not upsert. It returns
+INSERT means insert, not replacement. By default it returns
 `driver.ErrDuplicatePrimaryKey` if the derived identity already exists or
-appears twice in one VALUES statement. The statement publishes nothing on that
-error. Use UPDATE for replacement. `LastInsertId` is unavailable because keys
-come from documents rather than a generated sequence.
+appears twice in one VALUES statement. `ON CONFLICT DO NOTHING` is also
+supported: conflicting rows are skipped atomically, including repeated keys in
+the same VALUES batch, and a RETURNING projection reports only rows that were
+inserted. Use UPDATE for replacement. `LastInsertId` is unavailable because
+keys come from documents rather than a generated sequence.
 
 There is no caller-supplied physical-key row form. `VALUES` without a field list
 contains exactly one complete document; a field-list INSERT includes the
@@ -225,10 +227,10 @@ remain correct full scans; an index is an optimization, not a requirement for a
 WHERE clause. Sorting, grouping, aggregation, HAVING, OFFSET, and final
 projection remain query-engine operations.
 
-## Inner and left joins
+## Inner, left, and right joins
 
-The SQL join is a declared-field equi-join. Both `INNER JOIN` and
-`LEFT [OUTER] JOIN` are supported:
+The SQL join is a declared-field equi-join. `INNER JOIN`, `LEFT [OUTER] JOIN`,
+and `RIGHT [OUTER] JOIN` are supported:
 
 ```sql
 SELECT u.id, o.total
@@ -268,6 +270,15 @@ indexes, structural tapes, metadata, and build scratch. The budget is an
 admission bound on the estimated materialized working set, not merely a limit
 on output rows.
 
+`RIGHT JOIN` is normalized to an equivalent `LEFT JOIN` during parsing, with
+the preserved relation made the driving `FROM` relation. This keeps one outer
+join implementation and preserves null extension, fan-out, ordering, and
+snapshot behavior.
+
+`JOIN ... USING (field)` is accepted as a convenience spelling for an
+explicit equality. It currently accepts one simple field name; nested or
+composite keys use `ON` and are still subject to the one-key join limit.
+
 The current relational plan has two explicit join limits:
 
 - one statement may expand one joined relation, so the driver currently
@@ -275,7 +286,8 @@ The current relational plan has two explicit join limits:
 - that JOIN must relate the joined table directly to the driving `FROM` table;
   chained joins are rejected.
 
-Only inner and left `JOIN ... ON left_path = right_path` are supported. SQL exposes no
+Only inner, left, and right `JOIN ... ON left_path = right_path` (or the
+single-field `USING` equivalent) are supported. SQL exposes no
 physical storage-key pseudo-column; `"$key"` is an ordinary quoted JSON field.
 Join the tables' declared JSON primary-key fields when relational identity is
 the intended relationship.
@@ -504,13 +516,13 @@ The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
 - correlated subqueries and subqueries outside predicates, common table
-  expressions, set operations, window functions, `DISTINCT`, computed scalar
-  expressions, pattern matching, and user-defined functions;
-- right/full outer, cross, natural, `USING`, chained, and multiple fan-out joins;
+  expressions, set operations, window functions, `COUNT(DISTINCT ...)`,
+  computed scalar expressions, pattern matching, and user-defined functions;
+- full outer, cross, natural, composite `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, mutation joins,
-  mutation `ORDER BY`/`LIMIT`, and `UPDATE`/`DELETE RETURNING`;
-- generated keys, `INSERT ... SELECT`, defaults, upsert/on-conflict forms, and
-  nested flat-INSERT construction;
+  mutation `ORDER BY`/`LIMIT`;
+- generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,
+  `ON DUPLICATE KEY`, and nested flat-INSERT construction;
 - `ALTER`, `DROP`, `TRUNCATE`, views, unique/check/foreign-key/default/generated
   constraints, and SQL types without a JSON equivalent;
 - unique/partial/range/full-text indexes, expression indexes, and selectable
@@ -521,7 +533,14 @@ operation:
 These are explicit errors rather than parser successes followed by
 approximations.
 
-`INSERT ... RETURNING path, ...` and `RETURNING *` are supported. They reuse
-the SELECT projection engine over the final staged documents, preserve
-multi-row VALUES order, and complete projection admission before the atomic
-write is published.
+`SELECT DISTINCT` is supported for non-aggregate projections by lowering the
+projected tuple to the engine's spill-aware grouping key. It preserves
+`ORDER BY`, `OFFSET`, and `LIMIT`; `COUNT(DISTINCT ...)` and DISTINCT queries
+whose explicit grouping changes the projected tuple remain rejected rather
+than being approximated.
+
+`INSERT`, `UPDATE`, and `DELETE ... RETURNING path, ...` and `RETURNING *` are
+supported. They reuse the SELECT projection engine over the final staged
+documents, preserve mutation order, and complete projection admission before
+the atomic write is published. DELETE returns pre-delete documents; UPDATE
+returns replacement documents.

@@ -101,7 +101,7 @@ func TestRejectsNonPredicateExpressions(t *testing.T) {
 
 func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 	runRejections(t, []rejection{
-		{"DISTINCT", `SELECT DISTINCT a FROM t`, 7, "no distinct operator"},
+		{"DISTINCT with GROUP BY", `SELECT DISTINCT a FROM t GROUP BY a`, 35, "grouping changes"},
 		{"COUNT DISTINCT", `SELECT COUNT(DISTINCT a) FROM t`, 13, "no distinct variant"},
 		{"LIKE", `SELECT a FROM t WHERE b LIKE 'x%'`, 24, "no pattern operator"},
 		{"ILIKE", `SELECT a FROM t WHERE b ILIKE 'x%'`, 24, "no pattern operator"},
@@ -136,11 +136,10 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 
 func TestRejectsUnsupportedJoins(t *testing.T) {
 	runRejections(t, []rejection{
-		{"RIGHT JOIN", `SELECT t.a FROM t RIGHT JOIN u ON t.k = u.k`, 18, "outer joins"},
-		{"FULL JOIN", `SELECT t.a FROM t FULL JOIN u ON t.k = u.k`, 18, "outer joins"},
+		{"FULL JOIN", `SELECT t.a FROM t FULL JOIN u ON t.k = u.k`, 18, "FULL outer joins"},
 		{"CROSS JOIN", `SELECT t.a FROM t CROSS JOIN u`, 18, "unrestricted product"},
 		{"NATURAL JOIN", `SELECT t.a FROM t NATURAL JOIN u ON t.k = u.k`, 18, "write ON explicitly"},
-		{"USING", `SELECT t.a FROM t JOIN u USING (k)`, 25, "left.key = right.key"},
+		{"composite USING", `SELECT t.a FROM t JOIN u USING (k, x)`, 33, "composite USING joins"},
 		{"comma joins", `SELECT t.a FROM t, u`, 17, "explicit JOIN"},
 		{"a missing ON", `SELECT t.a FROM t JOIN u`, 24, "expected ON"},
 		{"an inequality join", `SELECT t.a FROM t JOIN u ON t.k > u.k`, 32, "single key equality"},

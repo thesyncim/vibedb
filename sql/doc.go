@@ -47,8 +47,9 @@
 //	             | ( "SUM" | "AVG" | "MIN" | "MAX" ) "(" path ")" ;
 //
 //	table-ref    = name [ [ "AS" ] name ] ;
-//	join         = ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN" )
-//	               table-ref "ON" join-cond ;
+//	join         = ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN"
+//	               | "RIGHT" [ "OUTER" ] "JOIN" ) table-ref
+//	               ( "ON" join-cond | "USING" "(" name ")" ) ;
 //	join-cond    = [ "(" ] path "=" path [ ")" ] ;
 //
 //	predicate    = disjunction ;
@@ -230,10 +231,12 @@
 // There is no caller-supplied physical-key row form and no generated sequence,
 // so driver.Result's LastInsertId returns an error.
 //
-// INSERT onto a key that already exists is refused. Put happens to be an
-// upsert, and letting INSERT inherit that would make "this row is new" silently
-// mean "this row is new or was something else", which loses data without saying
-// so.
+// INSERT onto a key that already exists is refused by default. The explicit
+// exception is `ON CONFLICT DO NOTHING`, which skips an existing or repeated
+// derived key atomically; `DO UPDATE` remains unsupported. Put happens to be an
+// upsert, and letting plain INSERT inherit that would make "this row is new"
+// silently mean "this row is new or was something else", which loses data
+// without saying so.
 //
 // # SET assigns the whole document, and a path assignment is refused
 //
@@ -335,20 +338,19 @@
 // # What is refused, and why
 //
 // Each of these is refused with a message naming the missing capability:
-// SELECT DISTINCT and COUNT(DISTINCT ...) (no distinct operator); LIKE, ILIKE,
+// COUNT(DISTINCT ...) (the reduction has no distinct variant); LIKE, ILIKE,
 // SIMILAR TO, and regular-expression operators (no pattern operator);
 // correlated subqueries and subqueries in FROM or the SELECT list (the nested
-// executor evaluates uncorrelated predicate subqueries once); right/full,
-// cross, and natural joins and comma-separated FROM items;
-// JOIN ... USING (schemaless documents have no declared columns to match by
-// name); set operations, common table expressions, window functions, CASE,
+// executor evaluates uncorrelated predicate subqueries once); full, cross,
+// and natural joins and comma-separated FROM items; composite JOIN ... USING
+// (the current form accepts one simple field name); set operations, common table expressions, window functions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine
 // evaluates predicates over stored values, not computed expressions); ORDER BY
 // and GROUP BY over output positions or aggregates.
 //
 // The mutation and definition grammar refuses, each by name: a nested INSERT
-// column list, generated keys, INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT /
-// ON DUPLICATE KEY, UPDATE/DELETE RETURNING, a path assignment in SET, two
+// column list, generated keys, INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT
+// DO UPDATE / ON DUPLICATE KEY, a path assignment in SET, two
 // assignments in one UPDATE, UPDATE ... FROM, DELETE ... USING, LIMIT / ORDER
 // BY / GROUP BY / HAVING on a mutation, a table alias on a single-collection
 // statement, DROP, ALTER, MERGE, REPLACE, TRUNCATE, CREATE VIEW, CREATE UNIQUE
@@ -356,9 +358,11 @@
 // direction, DEFAULT, UNIQUE, CHECK, and FOREIGN KEY. INSERT also refuses the
 // old key/document pair: VALUES without a field list contains exactly one
 // complete JSON document whose declared primary-key field determines identity.
-// INSERT RETURNING accepts the ordinary projection list (including * and
-// aliases, but not aggregates) and evaluates it over the staged documents in
-// VALUES order before publication.
+// INSERT, UPDATE, and DELETE RETURNING accept the ordinary projection list
+// (including * and aliases, but not aggregates) and evaluate it over staged
+// documents before publication. DELETE projects pre-delete documents, while
+// UPDATE projects replacement documents. INSERT ON CONFLICT DO NOTHING
+// projects only rows that were actually inserted.
 //
 // Which backend accepts which statement is a property of the engine rather than
 // of this grammar, and belongs to the layer that executes: see the sql/driver

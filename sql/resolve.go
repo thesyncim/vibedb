@@ -62,6 +62,85 @@ func (p *Parser) resolvePaths() error {
 	return nil
 }
 
+// normalizeRightJoins rewrites RIGHT JOIN into the LEFT JOIN orientation used
+// by the shared executor. It runs after path resolution, so swapping the two
+// input relations only requires remapping source ordinals; aliases and JSON
+// paths retain their original meaning.
+//
+// The current SQL executor supports one joined relation directly against the
+// driving FROM relation. Rejecting a RIGHT JOIN later in a chained statement
+// would produce a less useful lowering error after this rewrite, so leave the
+// join shape untouched unless it is the first joined relation.
+func (p *Parser) normalizeRightJoins() error {
+	for i := 1; i < len(p.out.From); i++ {
+		if p.out.From[i].Join != JoinRight {
+			continue
+		}
+		if i != 1 || len(p.out.From) != 2 {
+			return p.errAt(p.out.From[i].Pos,
+				"RIGHT JOIN is supported only for one joined relation; use LEFT JOIN for a chained query")
+		}
+		condition := p.out.From[i].On
+		p.swapSources(0, 1)
+		p.out.From[0].Join = JoinNone
+		p.out.From[0].On = nil
+		p.out.From[1].Join = JoinLeft
+		p.out.From[1].On = condition
+		return nil
+	}
+	return nil
+}
+
+func (p *Parser) swapSources(a, b int) {
+	for i := range p.out.Columns {
+		if path := p.out.Columns[i].Path; path != nil {
+			path.Source = swappedSource(path.Source, a, b)
+		}
+	}
+	for i := range p.out.GroupBy {
+		p.out.GroupBy[i].Source = swappedSource(p.out.GroupBy[i].Source, a, b)
+	}
+	for i := range p.out.OrderBy {
+		p.out.OrderBy[i].Path.Source = swappedSource(p.out.OrderBy[i].Path.Source, a, b)
+	}
+	remapExprSources(p.out.Where, a, b)
+	remapExprSources(p.out.Having, a, b)
+	for i := range p.out.From {
+		if cond := p.out.From[i].On; cond != nil {
+			cond.Left.Source = swappedSource(cond.Left.Source, a, b)
+			cond.Right.Source = swappedSource(cond.Right.Source, a, b)
+		}
+	}
+	p.out.From[a], p.out.From[b] = p.out.From[b], p.out.From[a]
+}
+
+func swappedSource(source, a, b int) int {
+	switch source {
+	case a:
+		return b
+	case b:
+		return a
+	default:
+		return source
+	}
+}
+
+func remapExprSources(e *Expr, a, b int) {
+	if e == nil {
+		return
+	}
+	if e.Path != nil {
+		e.Path.Source = swappedSource(e.Path.Source, a, b)
+	}
+	if e.Subquery != nil {
+		// A nested SELECT has its own source namespace.
+		return
+	}
+	for _, kid := range e.Kids {
+		remapExprSources(kid, a, b)
+	}
+}
+
 // rangeVar answers the index of the range variable named name, or -1.
 //
 // The comparison is case-sensitive, unlike keyword matching. Identifiers here

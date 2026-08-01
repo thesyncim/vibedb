@@ -20,6 +20,9 @@ import (
 func dumpStmt(s *SelectStmt) string {
 	var b strings.Builder
 	b.WriteString("select")
+	if s.Distinct {
+		b.WriteString(" distinct")
+	}
 	for i := range s.Columns {
 		b.WriteByte(' ')
 		dumpColumn(&b, &s.Columns[i])

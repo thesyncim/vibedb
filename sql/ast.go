@@ -21,6 +21,11 @@ type SelectStmt struct {
 	// Columns is the SELECT list in source order.
 	Columns []ResultColumn
 
+	// Distinct requests one row per distinct projected value tuple. The parser
+	// lowers the non-aggregate form to GROUP BY over the projection paths so the
+	// existing spill-aware grouping engine supplies equality and bounded memory.
+	Distinct bool
+
 	// From holds the range variables. From[0] is the FROM collection; each
 	// later entry is a JOIN, in source order, and carries its own ON
 	// condition. Every [PathExpr] in the statement names one of these by
@@ -75,6 +80,10 @@ const (
 	JoinInner
 	// JoinLeft is a left outer equi-join.
 	JoinLeft
+	// JoinRight is a right outer equi-join. The parser normalizes it to a
+	// JoinLeft before the AST is returned, so lowerers only need to execute one
+	// outer-join orientation.
+	JoinRight
 )
 
 // A TableRef is one range variable: a collection, the name paths use to

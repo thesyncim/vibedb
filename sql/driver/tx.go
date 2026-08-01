@@ -295,7 +295,7 @@ func (t *tx) execMutationCore(
 		}
 		remainingDocuments := limits.MaxBatchDocuments -
 			len(state.order) + replaceable
-		if len(tree.Rows) > remainingDocuments {
+		if !tree.OnConflictDoNothing && len(tree.Rows) > remainingDocuments {
 			return nil, fmt.Errorf(
 				"%w: INSERT has %d rows but table %q has room for at most %d transaction keys: %w",
 				ErrTransactionTooLarge, len(tree.Rows), tableName,
@@ -320,10 +320,26 @@ func (t *tx) execMutationCore(
 				return nil, err
 			}
 			if _, duplicate := seen[key]; duplicate {
+				if tree.OnConflictDoNothing {
+					continue
+				}
 				return nil, fmt.Errorf("%w: %q appears twice in one VALUES batch",
 					ErrDuplicatePrimaryKey, key)
 			}
 			seen[key] = struct{}{}
+			var found bool
+			scratch, found, err = state.appendRaw(scratch[:0], key)
+			if err != nil {
+				t.conn.pointRaw = scratch
+				return nil, err
+			}
+			if found && tree.OnConflictDoNothing {
+				continue
+			}
+			if found {
+				t.conn.pointRaw = scratch
+				return nil, fmt.Errorf("%w: %q", ErrDuplicatePrimaryKey, key)
+			}
 			previous := state.pending[key]
 			if previous != nil {
 				prospectiveBytes -= len(key) + len(previous.document)
@@ -336,16 +352,6 @@ func (t *tx) execMutationCore(
 					ErrTransactionTooLarge, prospectiveBytes, tableName,
 					limits.MaxBatchBytes, durable.ErrBatchTooLarge,
 				)
-			}
-			var found bool
-			scratch, found, err = state.appendRaw(scratch[:0], key)
-			if err != nil {
-				t.conn.pointRaw = scratch
-				return nil, err
-			}
-			if found {
-				t.conn.pointRaw = scratch
-				return nil, fmt.Errorf("%w: %q", ErrDuplicatePrimaryKey, key)
 			}
 			staged = append(staged, stagedTxMutation{key: key, document: document})
 		}
@@ -427,14 +433,27 @@ func (t *tx) execMutationCore(
 		return nil, err
 	}
 	if returning != nil {
-		if statement.Kind() != query.DMLInsert || returned == nil {
+		if returned == nil {
 			return nil, errors.New(
-				"vibedb: internal returning execution requires INSERT RETURNING",
+				"vibedb: internal RETURNING cursor is nil",
 			)
 		}
 		t.conn.pointDocs.Reset()
 		for i := range staged {
-			if _, err := t.conn.pointDocs.Append(staged[i].document); err != nil {
+			var document []byte
+			if statement.Kind() == query.DMLDelete {
+				raw, found, err := state.appendRaw(t.conn.pointRaw[:0], staged[i].key)
+				if err != nil {
+					return nil, err
+				}
+				if !found {
+					continue
+				}
+				document = raw
+			} else {
+				document = staged[i].document
+			}
+			if _, err := t.conn.pointDocs.Append(document); err != nil {
 				return nil, err
 			}
 		}

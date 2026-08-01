@@ -145,6 +145,89 @@ func TestNaturalInnerJoinProjectsEveryMatchingPair(t *testing.T) {
 	}
 }
 
+func TestRightJoinPreservesRightRelation(t *testing.T) {
+	db := openTestDB(t)
+	seedJoinTables(t, db)
+
+	rows, err := db.Query(`
+		SELECT o.id, u.name
+		FROM orders AS o
+		RIGHT JOIN users AS u ON o.user_id = u.id
+		ORDER BY u.name, o.id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	type pair struct {
+		orderID stdsql.NullString
+		name    string
+	}
+	var got []pair
+	for rows.Next() {
+		var row pair
+		if err := rows.Scan(&row.orderID, &row.name); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []pair{
+		{orderID: stdsql.NullString{String: "o1", Valid: true}, name: "Alice"},
+		{orderID: stdsql.NullString{String: "o2", Valid: true}, name: "Alice"},
+		{orderID: stdsql.NullString{String: "o3", Valid: true}, name: "Bob"},
+		{name: "Cara"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("right joined rows = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("right joined row %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestUsingJoinMatchesSameNamedField(t *testing.T) {
+	db := openTestDB(t)
+	for _, statement := range []string{
+		`CREATE TABLE using_left (PRIMARY KEY (id))`,
+		`CREATE TABLE using_right (PRIMARY KEY (id))`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, document := range []string{
+		`{"id":"same","name":"left"}`,
+		`{"id":"left-only","name":"left"}`,
+	} {
+		if _, err := db.Exec(`INSERT INTO using_left VALUES (?)`, document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, document := range []string{
+		`{"id":"same","name":"right"}`,
+		`{"id":"right-only","name":"right"}`,
+	} {
+		if _, err := db.Exec(`INSERT INTO using_right VALUES (?)`, document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got string
+	if err := db.QueryRow(`
+		SELECT l.name
+		FROM using_left AS l
+		JOIN using_right AS r USING (id)`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "left" {
+		t.Fatalf("USING result = %q, want left", got)
+	}
+}
+
 func TestNaturalJoinInsideTransactionReadsItsOverlay(t *testing.T) {
 	db := openTestDB(t)
 	seedJoinTables(t, db)
