@@ -249,6 +249,10 @@ func asPGError(err error) *pgError {
 	if errors.As(err, &cteAliasArity) {
 		return newError(sqlstateInvalidColumnReference, cteAliasArity.Msg)
 	}
+	var runtimeCTEAliasArity *query.CTEColumnAliasArityError
+	if errors.As(err, &runtimeCTEAliasArity) {
+		return newError(sqlstateInvalidColumnReference, runtimeCTEAliasArity.Error())
+	}
 	var parse *sqlast.ParseError
 	if errors.As(err, &parse) {
 		e := newError(sqlstateSyntaxError, parse.Msg)

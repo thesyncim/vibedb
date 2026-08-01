@@ -255,6 +255,7 @@ type conn struct {
 	pointKeys    []string
 	matchKeys    []string
 	joinCatalog  []durable.NamedCollection
+	joinSnapshot durable.DatabaseSnapshot
 	rowset       rows
 	open         bool
 	tx           *tx
@@ -466,8 +467,12 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 				}
 				t := c.db.tables[s.query.Collection()]
 				if t != nil {
+					s.pointPredicate = s.query.DrivingPredicate()
 					s.primaryPoint = isPrimaryPredicate(
-						tree.Select.Where, t.meta.PrimaryKey)
+						s.pointPredicate, t.meta.PrimaryKey)
+					if !s.primaryPoint {
+						s.pointPredicate = nil
+					}
 				}
 				c.db.mu.RUnlock()
 			}
@@ -538,12 +543,13 @@ func (c *conn) Close() error {
 		_ = c.tx.Rollback()
 	}
 	c.exec.Release()
+	snapshotErr := c.joinSnapshot.Close()
 	owner := c.owner
-	var err error
+	err := snapshotErr
 	if owner != nil {
 		// release may perform the database's terminal close, so it must run
 		// while c still holds the ownership graph needed by that operation.
-		err = owner.release()
+		err = errors.Join(err, owner.release())
 	}
 	// A closed direct driver.Conn is never reusable. Sever every retained
 	// ownership and high-water edge after release so a caller holding the
@@ -560,6 +566,7 @@ func (c *conn) Close() error {
 	c.pointKeys = nil
 	c.matchKeys = nil
 	c.joinCatalog = nil
+	c.joinSnapshot = durable.DatabaseSnapshot{}
 	c.rowset = rows{closed: true}
 	c.tx = nil
 	return err

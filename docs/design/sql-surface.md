@@ -367,6 +367,66 @@ Correlated predicate subqueries remain rejected rather than re-evaluated once
 per row. Scalar subqueries in the projection list and subqueries in `HAVING`
 remain unsupported.
 
+## Common table expressions
+
+Non-recursive, SELECT-valued common table expressions are supported by direct
+and prepared `database/sql` execution and by pgwire's simple and extended
+protocols:
+
+```sql
+WITH active(id, score) AS MATERIALIZED (
+  SELECT id, score FROM users WHERE enabled = TRUE
+), ranked AS NOT MATERIALIZED (
+  SELECT id, score FROM active WHERE score >= ?
+)
+SELECT id FROM ranked ORDER BY score DESC
+```
+
+A `WITH` list is lexical. A definition can see earlier siblings and inherited
+outer definitions; a nested `WITH` may shadow them. It cannot see itself or a
+later sibling as a CTE. Definitions are SELECT-only. Scope also reaches
+predicate subqueries. A CTE reference may be the statement's sole `FROM`
+relation; CTEs in JOIN positions wait for the generic relation-join operator.
+
+Column alias lists rename the corresponding leading outputs. An alias list may
+be shorter than the result, but not longer. Duplicate output names remain
+distinct ordinals and are repeated verbatim in pgwire `RowDescription`; `*`
+preserves them, while a named ambiguous reference is rejected. Undefined,
+ambiguous, duplicate-definition, alias-arity, self/forward-reference, and
+unsupported-feature errors carry typed SQLSTATEs and exact UTF-8 character
+positions over pgwire.
+
+Materialization policy is observable and exact:
+
+- `MATERIALIZED` evaluates a definition once and shares its result;
+- `NOT MATERIALIZED` evaluates each syntactic reference independently;
+- the default shares a multiply referenced definition, while a single safe
+  identity-shaped reference may be fused into its defining plan;
+- every other single reference uses one private relation spool.
+
+`EXPLAIN` reports each definition's mode, reason, reference count, and measured
+evaluation count. Both plain and prepared EXPLAIN revalidate recursively found
+physical dependencies, so a plan cannot silently survive `DROP TABLE`.
+
+Physical dependencies are walked recursively once per definition and
+deduplicated in source order. If the whole CTE graph reads one durable
+collection, `Statement.Collection()` resolves that collection and the driver
+keeps the direct durable source, primary-point path, and eligible exact-index
+execution. Multiple physical collections are captured at one reusable coherent
+generation cut before bounded catalog materialization. In a transaction the
+same graph reads the BEGIN snapshot plus the transaction overlay, preserving
+repeatable reads and read-your-writes.
+
+Relation spools share the statement-wide intermediate allowance described
+below. Admission, cancellation, or binding failure publishes no partial spool
+or result and leaves a prepared statement reusable. Warm CTE execution and the
+ordinary no-CTE path allocate no marginal heap storage; a statement without
+`WITH` does not initialize CTE state.
+
+`WITH RECURSIVE`, data-modifying CTE bodies, and recursive/fixpoint semantics
+remain typed unsupported features. The dialect also does not yet accept a
+FROM-less SELECT body, so constant-only CTEs are not admitted by the front end.
+
 ## Derived tables
 
 An uncorrelated `SELECT` may be used as the sole `FROM` relation:
@@ -617,11 +677,12 @@ lifecycle correctly through its prepared-statement fallback.
 The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
-- correlated subqueries, projection/HAVING subqueries, common table
-  expressions, set operations, window functions, `COUNT(DISTINCT ...)`,
-  computed scalar expressions, and user-defined functions;
-- derived relations in JOIN positions, `LATERAL`, and derived-table column
-  alias lists;
+- correlated subqueries, projection/HAVING subqueries, recursive or
+  data-modifying common table expressions, set operations, window functions,
+  `COUNT(DISTINCT ...)`, computed scalar expressions, and user-defined
+  functions;
+- derived relations or CTEs in JOIN positions, `LATERAL`, and derived-table
+  column alias lists;
 - full outer, cross, natural, composite `USING`, chained, and multiple fan-out joins;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
 - generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,

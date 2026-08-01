@@ -42,7 +42,7 @@ type physicalDependency struct {
 // before any heap collection is built.
 func (c *conn) materializeDurableJoinSource(
 	ctx context.Context,
-	catalog durable.DatabaseSnapshot,
+	catalog *durable.DatabaseSnapshot,
 	driving string,
 	dependencies []physicalDependency,
 ) (query.Source, error) {

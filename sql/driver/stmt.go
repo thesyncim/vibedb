@@ -14,18 +14,19 @@ import (
 )
 
 type stmt struct {
-	conn         *conn
-	tree         *sqlast.Statement
-	query        *query.Statement
-	mutation     *query.DMLStatement
-	primaryPoint bool
-	catalogJoin  bool
-	params       int
-	paramKinds   []ParamKind
-	dependencies []physicalDependency
-	explain      bool
-	analyze      bool
-	closed       bool
+	conn           *conn
+	tree           *sqlast.Statement
+	query          *query.Statement
+	mutation       *query.DMLStatement
+	pointPredicate *sqlast.Expr
+	primaryPoint   bool
+	catalogJoin    bool
+	params         int
+	paramKinds     []ParamKind
+	dependencies   []physicalDependency
+	explain        bool
+	analyze        bool
+	closed         bool
 }
 
 var (
@@ -78,6 +79,7 @@ func (s *stmt) Close() error {
 	s.tree = nil
 	s.query = nil
 	s.mutation = nil
+	s.pointPredicate = nil
 	s.primaryPoint = false
 	s.catalogJoin = false
 	s.paramKinds = nil
@@ -218,7 +220,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		var source query.Source
 		if s.primaryPoint {
 			keys, keyErr := s.conn.bindPointPredicateKeys(
-				s.tree.Select.Where, args, state.limits.MaxKeyBytes)
+				s.pointPredicate, args, state.limits.MaxKeyBytes)
 			if keyErr != nil {
 				return nil, keyErr
 			}
@@ -254,11 +256,8 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		source, materializeErr := s.conn.materializeDurableJoinSource(
 			ctx, catalog, s.query.Collection(), s.dependencies)
 		closeErr := catalog.Close()
-		if materializeErr != nil {
-			return nil, materializeErr
-		}
-		if closeErr != nil {
-			return nil, closeErr
+		if err := errors.Join(materializeErr, closeErr); err != nil {
+			return nil, err
 		}
 		cursor, runErr := s.query.RunInto(&s.conn.exec, source, args)
 		if runErr != nil {
@@ -285,7 +284,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 			err = limitErr
 		} else {
 			keys, keyErr := s.conn.bindPointPredicateKeys(
-				s.tree.Select.Where, args, limits.MaxKeyBytes)
+				s.pointPredicate, args, limits.MaxKeyBytes)
 			if keyErr != nil {
 				err = keyErr
 			} else if t.collection == nil {
@@ -514,17 +513,19 @@ func (s *stmt) missingDependency(name string, transaction bool) error {
 // prepared statement may read at one durable instant. The caller holds db.mu
 // for reading; retaining that lock through SnapshotCollections keeps DROP and
 // replacement publication from changing the catalog between name resolution
-// and the generation cut.
+// and the generation cut. The connection-owned destination retains only its
+// high-water scratch after Close, so a stable catalog capture is allocation
+// free once warm and cannot leak leases across executions.
 func (s *stmt) snapshotCatalogDependenciesLocked(
 	ctx context.Context,
-) (durable.DatabaseSnapshot, error) {
+) (*durable.DatabaseSnapshot, error) {
 	clear(s.conn.joinCatalog)
 	collections := s.conn.joinCatalog[:0]
 	for _, dependency := range s.dependencies {
 		t, ok := s.conn.db.tables[dependency.name]
 		if !ok {
 			s.conn.releaseJoinCatalog(collections)
-			return durable.DatabaseSnapshot{},
+			return nil,
 				missingTableDependency(
 					dependency.name, dependency.pos, false,
 				)
@@ -535,11 +536,16 @@ func (s *stmt) snapshotCatalogDependenciesLocked(
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		s.conn.releaseJoinCatalog(collections)
-		return durable.DatabaseSnapshot{}, err
+		return nil, err
 	}
-	catalog, err := durable.SnapshotCollections(collections)
+	err := durable.SnapshotCollectionsIntoContext(
+		ctx, &s.conn.joinSnapshot, collections,
+	)
 	s.conn.releaseJoinCatalog(collections)
-	return catalog, err
+	if err != nil {
+		return nil, err
+	}
+	return &s.conn.joinSnapshot, nil
 }
 
 // validateCatalogDependenciesForExplain performs the source-acquisition part
