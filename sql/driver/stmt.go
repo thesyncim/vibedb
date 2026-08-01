@@ -19,6 +19,7 @@ type stmt struct {
 	query        *query.Statement
 	mutation     *query.DMLStatement
 	primaryPoint bool
+	catalogJoin  bool
 	params       int
 	paramKinds   []ParamKind
 	dependencies []physicalDependency
@@ -78,6 +79,7 @@ func (s *stmt) Close() error {
 	s.query = nil
 	s.mutation = nil
 	s.primaryPoint = false
+	s.catalogJoin = false
 	s.paramKinds = nil
 	s.dependencies = nil
 	s.explain = false
@@ -469,7 +471,7 @@ func (s *stmt) requiresCatalogSource() bool {
 	if !s.query.RequiresCatalog() {
 		return false
 	}
-	return s.query.NumJoins() != 0 || len(s.dependencies) != 1
+	return s.catalogJoin || len(s.dependencies) != 1
 }
 
 func (s *stmt) transactionRequiresCatalogSource() bool {
@@ -478,6 +480,11 @@ func (s *stmt) transactionRequiresCatalogSource() bool {
 	}
 	if !s.query.RequiresCatalog() {
 		return false
+	}
+	if len(s.dependencies) != 1 {
+		// Keep the index below structurally guarded even if the catalog-source
+		// classifier changes independently in the future.
+		return true
 	}
 	// FromFileOverlay cannot be recursively rebound yet. Retain the coherent
 	// transaction-catalog fallback only while staged writes coexist with a

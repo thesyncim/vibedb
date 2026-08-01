@@ -77,3 +77,22 @@ func TestCTEMissingPhysicalDependencyPositionAndProtocolRecovery(t *testing.T) {
 		t.Fatalf("post-error recovery tag = %q, want SELECT 1", got)
 	}
 }
+
+func TestCTEMissingDependencyUTF8CharacterPosition(t *testing.T) {
+	c := connect(t)
+	statement := `WITH "é" AS (` +
+		`SELECT id FROM missing_relation` +
+		`) SELECT id FROM "é"`
+	want := strconv.Itoa(len([]rune(statement[:strings.Index(
+		statement, "missing_relation",
+	)])) + 1)
+	fields := expectError(t, c.query(statement), sqlstateUndefinedTable)
+	if fields['P'] != want {
+		t.Fatalf("UTF-8 dependency position = %q, want %q", fields['P'], want)
+	}
+
+	msgs := c.query(`SELECT id FROM users WHERE id = 1`)
+	if got := commandTagOf(t, msgs); got != "SELECT 1" {
+		t.Fatalf("UTF-8 error recovery tag = %q, want SELECT 1", got)
+	}
+}

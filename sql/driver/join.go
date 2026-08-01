@@ -280,6 +280,43 @@ func hasPhysicalDependency(dependencies []physicalDependency, name string) bool 
 	return false
 }
 
+func selectContainsJoin(statement *sqlast.SelectStmt) bool {
+	if len(statement.From) > 1 {
+		return true
+	}
+	if statement.With != nil {
+		for i := range statement.With.CTEs {
+			definition := &statement.With.CTEs[i]
+			if definition.Query != nil && selectContainsJoin(definition.Query) {
+				return true
+			}
+		}
+	}
+	for i := range statement.From {
+		relation := &statement.From[i]
+		if relation.Kind == sqlast.RelationDerived &&
+			relation.Query != nil && selectContainsJoin(relation.Query) {
+			return true
+		}
+	}
+	return exprContainsJoin(statement.Where) || exprContainsJoin(statement.Having)
+}
+
+func exprContainsJoin(e *sqlast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Subquery != nil && selectContainsJoin(e.Subquery) {
+		return true
+	}
+	for _, kid := range e.Kids {
+		if exprContainsJoin(kid) {
+			return true
+		}
+	}
+	return false
+}
+
 // joinTableNames remains as a test/debug compatibility helper. Execution uses
 // physicalDependency directly so positions are never discarded.
 func joinTableNames(statement *sqlast.SelectStmt) []string {

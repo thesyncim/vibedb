@@ -457,6 +457,7 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			// primary-point fact as SELECT.
 			if s.query.RequiresCatalog() || tree.Select.With != nil {
 				s.dependencies = selectPhysicalDependencies(tree.Select)
+				s.catalogJoin = selectContainsJoin(tree.Select)
 			}
 			if !s.query.RequiresCatalog() {
 				if lockErr := rlockContext(ctx, &c.db.mu); lockErr != nil {
