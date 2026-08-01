@@ -612,7 +612,7 @@ func (w *setWorkspace) insert(
 	row int,
 	cancel *CancelFlag,
 ) (*setHashEntry, error) {
-	if len(w.slots) == 0 || len(w.entries) >= math.MaxUint32 {
+	if len(w.slots) == 0 || uint64(len(w.entries)) >= uint64(math.MaxUint32) {
 		return nil, errSetSize
 	}
 	mask := uint64(len(w.slots) - 1)
