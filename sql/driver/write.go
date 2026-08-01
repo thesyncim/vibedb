@@ -39,6 +39,7 @@ func (c *conn) execMutationContext(
 	statement *query.DMLStatement,
 	args []any,
 ) (sqldriver.Result, error) {
+	ctx = withCooperativeCancellation(ctx, c.exec.Options.Cancel)
 	d := c.db
 	if statement.Kind() == query.DDLCreateIndex {
 		return d.createIndexContext(ctx, statement)
@@ -288,6 +289,17 @@ func (d *database) createIndexContext(
 	d.mu.Unlock()
 
 	_, err = collection.CreateIndexContext(ctx, definition.Definition)
+	if err != nil {
+		// CreateIndexContext observes cancellation only before its atomic
+		// publication transaction, so a cancellation result proves no index was
+		// committed. Return it before reacquiring the catalog lock: another DDL
+		// may hold that lock while replacing this table, and cancellation must not
+		// block again or be rewritten as a later serialization conflict.
+		if cancelErr := contextCancellationError(ctx); cancelErr != nil &&
+			errors.Is(err, cancelErr) {
+			return nil, err
+		}
+	}
 	// Catalog DDL may replace the table while the durable online build is
 	// running without the catalog mutex. Check the exact object identity before
 	// interpreting any durable result: retirement can deliberately close the

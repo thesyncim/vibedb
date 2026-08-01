@@ -82,12 +82,14 @@ type table struct {
 // cursors and transactions may still hold generation leases after the catalog
 // stops naming this storage identity.
 type retiredTable struct {
-	name       string
-	path       string
-	journal    string
-	file       *os.File
-	collection *durable.Collection
-	removed    bool
+	name         string
+	path         string
+	journal      string
+	extraPath    string
+	extraJournal string
+	file         *os.File
+	collection   *durable.Collection
+	removed      bool
 }
 
 type database struct {
@@ -140,10 +142,14 @@ func openDatabaseWithSync(
 	opened := false
 	defer func() {
 		if !opened {
-			// A failed open has no caller that can retry cleanup. Release the
-			// catalog writer lease and every descriptor even if a partially
-			// opened collection reports a close error.
+			// A failed open has no caller that can retry cleanup. Completed
+			// teardown releases the catalog writer immediately; a retryable
+			// collection phase is transferred to the process retirement registry
+			// so this stack frame never becomes its last owner.
 			_ = d.closeTerminal()
+			if !d.closeCompleted() {
+				retainTerminalDatabase(d)
+			}
 		}
 	}()
 	if err := d.recoverVisibleNamespace(); err != nil {
@@ -567,6 +573,19 @@ func (d *database) collectionClose(collection *durable.Collection) error {
 	return collection.Close()
 }
 
+func (d *database) collectionCloseState(
+	collection *durable.Collection,
+) (error, bool) {
+	err := d.collectionClose(collection)
+	if d.closeCollection != nil {
+		// The injection seam predates CloseCompleted. A nil injected result means
+		// the test double consumed the resource; a non-nil result models a
+		// retryable phase. Production always consults the engine's exact state.
+		return err, err == nil || collection.CloseCompleted()
+	}
+	return err, collection.CloseCompleted()
+}
+
 // retryNamespaceFencesLocked closes the crash-consistency dependency chain
 // after a published namespace mutation whose directory sync failed. No later
 // mutation may acknowledge success while either fence is pending: a durable
@@ -620,17 +639,24 @@ func (d *database) settleDroppedTablesLocked() error {
 	for i := range d.retired {
 		retired := &d.retired[i]
 		if retired.collection != nil {
-			if err := d.collectionClose(retired.collection); err != nil {
-				if errors.Is(err, storeio.ErrLeasesActive) {
+			closeErr, completed := d.collectionCloseState(retired.collection)
+			if !completed {
+				if errors.Is(closeErr, storeio.ErrLeasesActive) {
 					remaining = append(remaining, *retired)
 					continue
 				}
 				return retainFailure(i, fmt.Errorf(
-					"%w: finish retiring SQL table incarnation %q: %v",
-					durable.ErrCommitOutcomeUnknown, retired.name, err,
+					"%w: finish retiring SQL table incarnation %q: %w",
+					durable.ErrCommitOutcomeUnknown, retired.name, closeErr,
 				))
 			}
 			retired.collection = nil
+			if closeErr != nil {
+				return retainFailure(i, fmt.Errorf(
+					"%w: retired SQL table incarnation %q closed with a terminal error: %w",
+					durable.ErrCommitOutcomeUnknown, retired.name, closeErr,
+				))
+			}
 		}
 		if retired.file != nil {
 			if err := retired.file.Close(); err != nil {
@@ -644,25 +670,24 @@ func (d *database) settleDroppedTablesLocked() error {
 		if retired.removed {
 			continue
 		}
-		if err := os.Remove(retired.path); err != nil {
-			if !os.IsNotExist(err) {
-				return retainFailure(i, fmt.Errorf(
-					"%w: remove retired SQL table %q: %v",
-					durable.ErrCommitOutcomeUnknown, retired.name, err,
-				))
+		for _, candidate := range [...]string{
+			retired.path, retired.journal,
+			retired.extraPath, retired.extraJournal,
+		} {
+			if candidate == "" {
+				continue
 			}
-		} else {
-			removedAny = true
-		}
-		if err := os.Remove(retired.journal); err != nil {
-			if !os.IsNotExist(err) {
-				return retainFailure(i, fmt.Errorf(
-					"%w: remove retired SQL table journal %q: %v",
-					durable.ErrCommitOutcomeUnknown, retired.name, err,
-				))
+			if err := os.Remove(candidate); err != nil {
+				if !os.IsNotExist(err) {
+					return retainFailure(i, fmt.Errorf(
+						"%w: remove retired SQL storage %q for %q: %v",
+						durable.ErrCommitOutcomeUnknown,
+						filepath.Base(candidate), retired.name, err,
+					))
+				}
+			} else {
+				removedAny = true
 			}
-		} else {
-			removedAny = true
 		}
 		retired.removed = true
 		remaining = append(remaining, *retired)
@@ -944,6 +969,13 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	if t.collection != nil {
 		return t, nil
 	}
+	// A candidate whose engine Close stops at a retryable lifecycle phase must
+	// remain owned by the database. Reserve its bounded cleanup slot before any
+	// engine resource is created, so no error path can strand a writer lock or
+	// caller-owned descriptor.
+	if err := d.checkRetirementCapacityLocked(1); err != nil {
+		return nil, err
+	}
 	if err := d.ensureDataDir(); err != nil {
 		return nil, err
 	}
@@ -974,24 +1006,9 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		}
 	}
 	if err != nil {
-		var cleanupErr error
-		if collection != nil {
-			cleanupErr = errors.Join(cleanupErr, collection.Close())
-		}
-		cleanupErr = errors.Join(cleanupErr, file.Close())
-		removeErr := os.Remove(tmpPath)
-		if removeErr != nil && !os.IsNotExist(removeErr) {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf(
-				"remove failed temporary SQL table file: %w",
-				removeErr,
-			))
-		} else if syncErr := d.directorySync(d.dataDir); syncErr != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf(
-				"sync failed temporary SQL table cleanup: %w",
-				syncErr,
-			))
-		}
-		return nil, errors.Join(err, cleanupErr)
+		return nil, errors.Join(err, d.discardUnpublishedStorageLocked(
+			collection, file, tmpPath,
+		))
 	}
 	file, collection, err = d.publishTableStorageLocked(
 		tmpPath, path, file, collection, durableOptions(t),
@@ -1032,20 +1049,32 @@ func (d *database) close() error {
 	return d.closeWithPolicy(false)
 }
 
-// closeTerminal is the one-shot close used after a database/sql connector has
-// lost its final connection reference, and while unwinding a failed open.
-// database/sql never retries Connector.Close, so retaining the catalog writer
-// lease after reporting a durability or descriptor error would permanently
-// prevent this process from reopening the DSN.
+// closeTerminal is the terminal close attempted after a database/sql connector
+// loses its final connection reference, and while unwinding a failed open.
+// Completed collection teardown releases every descriptor and the catalog
+// writer even when it reports a sticky persistence error. Retryable incomplete
+// teardown retains ownership instead: closing its caller-owned descriptor or
+// dropping the final Go reference would violate durable.Collection's lifecycle
+// contract and can strand engine resources invisibly.
 //
 // The connector reference invariant proves there are no row or transaction
 // snapshots at this point: conn.Close rejects open rows and rolls back an open
 // transaction before releasing its reference. SQL collections use synchronous
-// durability, so Collection.Close either releases its internal resources or
-// reports an invariant/resource error; the caller-owned table descriptor is
-// then closed here as the final ownership boundary.
+// durability, so the no-reader invariant makes retryable teardown exceptional;
+// CloseCompleted remains the authoritative ownership boundary rather than an
+// assumption about a particular error.
 func (d *database) closeTerminal() error {
 	return d.closeWithPolicy(true)
+}
+
+func (d *database) closeCompleted() bool {
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	done := d.closeDone
+	d.mu.Unlock()
+	return done
 }
 
 func (d *database) closeWithPolicy(terminal bool) error {
@@ -1062,22 +1091,34 @@ func (d *database) closeWithPolicy(terminal bool) error {
 		result = errors.Join(result, err)
 	}
 	d.closed = true
+	retryable := false
 	for _, t := range d.tables {
 		if t.collection != nil {
-			result = errors.Join(result, d.collectionClose(t.collection))
+			closeErr, completed := d.collectionCloseState(t.collection)
+			result = errors.Join(result, closeErr)
+			if completed {
+				t.collection = nil
+			} else {
+				retryable = true
+			}
 		}
 	}
 	for i := range d.retired {
 		if d.retired[i].collection != nil {
-			result = errors.Join(
-				result, d.collectionClose(d.retired[i].collection),
-			)
+			closeErr, completed := d.collectionCloseState(d.retired[i].collection)
+			result = errors.Join(result, closeErr)
+			if completed {
+				d.retired[i].collection = nil
+			} else {
+				retryable = true
+			}
 		}
 	}
-	if result != nil && !terminal {
+	if retryable {
 		// Collection.Close is retryable after outstanding leases or transient
-		// checkpoint failures clear. Keep every caller-owned descriptor and the
-		// catalog writer lease alive so a later close can finish coherently.
+		// checkpoint failures clear. This applies even to a terminal connector
+		// attempt: invalidating its descriptor or dropping the last Go owner while
+		// engine teardown is incomplete would violate the collection lifecycle.
 		return result
 	}
 	for _, t := range d.tables {
@@ -1085,19 +1126,25 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			result = errors.Join(result, t.file.Close())
 			t.file = nil
 		}
-		if terminal {
-			// No handle can be exposed after a terminal close, even when its
-			// final Close returned an error.
-			t.collection = nil
-		}
 	}
-	for i := range d.retired {
-		if d.retired[i].file != nil {
-			result = errors.Join(result, d.retired[i].file.Close())
-			d.retired[i].file = nil
+	if terminal {
+		completed, cleanupErr := d.settleTerminalRetiredLocked()
+		result = errors.Join(result, cleanupErr)
+		if !completed {
+			if result == nil {
+				result = fmt.Errorf(
+					"%w: terminal SQL storage retirement remains incomplete",
+					durable.ErrCommitOutcomeUnknown,
+				)
+			}
+			return result
 		}
-		if terminal {
-			d.retired[i].collection = nil
+	} else {
+		for i := range d.retired {
+			if d.retired[i].file != nil {
+				result = errors.Join(result, d.retired[i].file.Close())
+				d.retired[i].file = nil
+			}
 		}
 	}
 	if d.lockFile != nil {
@@ -1105,8 +1152,79 @@ func (d *database) closeWithPolicy(terminal bool) error {
 		result = errors.Join(result, d.lockFile.Close())
 		d.lockFile = nil
 	}
-	if terminal || result == nil {
-		d.closeDone = true
-	}
+	d.closeDone = true
 	return result
+}
+
+// settleTerminalRetiredLocked is the best-effort, retryable retirement drain
+// used after every collection has completed engine teardown. Unlike the normal
+// mutation path it keeps visiting later paths after one removal fails: terminal
+// ownership must not detach merely because an earlier sticky close error made
+// settleDroppedTablesLocked return before namespace cleanup.
+//
+// A false result means d still owns either an undeleted path or an unfenced
+// namespace mutation. The terminal-retirement registry retains d and retries;
+// the catalog writer lock is deliberately released only after this drain
+// completes, preventing a new opener from racing the old owner's cleanup.
+func (d *database) settleTerminalRetiredLocked() (bool, error) {
+	if len(d.retired) == 0 && !d.tableDirFencePending {
+		return true, nil
+	}
+	remaining := d.retired[:0]
+	removedAny := false
+	var result error
+	for i := range d.retired {
+		retired := d.retired[i]
+		if retired.collection != nil {
+			remaining = append(remaining, retired)
+			continue
+		}
+		if retired.file != nil {
+			// os.File.Close renders the descriptor unusable even when it reports
+			// an error. Clear the pointer, preserve the sticky error, and continue
+			// removing every namespace entry owned by this retirement.
+			result = errors.Join(result, retired.file.Close())
+			retired.file = nil
+		}
+		if !retired.removed {
+			removed := true
+			for _, candidate := range [...]string{
+				retired.path, retired.journal,
+				retired.extraPath, retired.extraJournal,
+			} {
+				if candidate == "" {
+					continue
+				}
+				if err := os.Remove(candidate); err != nil {
+					if !os.IsNotExist(err) {
+						removed = false
+						result = errors.Join(result, fmt.Errorf(
+							"remove terminal SQL storage %q for %q: %w",
+							filepath.Base(candidate), retired.name, err,
+						))
+					}
+				} else {
+					removedAny = true
+				}
+			}
+			retired.removed = removed
+		}
+		if !retired.removed {
+			remaining = append(remaining, retired)
+		}
+	}
+	d.retired = remaining
+	if removedAny {
+		d.tableDirFencePending = true
+	}
+	if d.tableDirFencePending {
+		if err := d.directorySync(d.dataDir); err != nil {
+			return false, errors.Join(result, fmt.Errorf(
+				"%w: fence terminal SQL storage retirement: %w",
+				durable.ErrCommitOutcomeUnknown, err,
+			))
+		}
+		d.tableDirFencePending = false
+	}
+	return len(d.retired) == 0, result
 }

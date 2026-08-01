@@ -414,6 +414,103 @@ func TestContextCancellationScopeCancelsAndDoesNotPoisonConnection(t *testing.T)
 	}
 }
 
+func TestCooperativeCancelFlagInterruptsContendedCatalogLock(t *testing.T) {
+	var mu sync.RWMutex
+	mu.Lock()
+
+	var flag query.CancelFlag
+	ctx := withCooperativeCancellation(context.Background(), &flag)
+	done := make(chan error, 1)
+	go func() {
+		done <- lockContext(ctx, &mu)
+	}()
+
+	// Let lockContext enter its bounded polling path before cancellation. This
+	// models pgwire, whose protocol CancelRequest arms the shared atomic flag
+	// while Prepared.Exec is running with context.Background.
+	time.Sleep(5 * contextLockPoll)
+	flag.Cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, query.ErrCanceled) {
+			t.Fatalf("lockContext = %v, want %v", err, query.ErrCanceled)
+		}
+	case <-time.After(time.Second):
+		mu.Unlock()
+		t.Fatal("cooperative cancellation did not interrupt lock acquisition")
+	}
+	mu.Unlock()
+}
+
+func TestRuntimeCancelFlagInterruptsPreparedDDLWaitingForCatalogLock(t *testing.T) {
+	database, session := openRuntimeSession(t)
+	prepared, err := session.Prepare(context.Background(),
+		`CREATE TABLE canceled (id STRING PRIMARY KEY)`)
+	if err != nil {
+		_ = session.Close()
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	safeToClose := true
+	defer func() {
+		if safeToClose {
+			_ = prepared.Close()
+			_ = session.Close()
+			_ = database.Close()
+		}
+	}()
+	var flag query.CancelFlag
+	if err := session.SetCancelFlag(&flag); err != nil {
+		t.Fatal(err)
+	}
+
+	session.conn.db.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			session.conn.db.mu.Unlock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, err := prepared.Exec(context.Background(), nil)
+		done <- err
+	}()
+	time.Sleep(5 * contextLockPoll)
+	flag.Cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, query.ErrCanceled) {
+			t.Fatalf("Prepared.Exec = %v, want %v", err, query.ErrCanceled)
+		}
+	case <-time.After(time.Second):
+		// Release the artificial blocker and join Exec before deferred session
+		// cleanup. A failing test must not race Session.Close against the same
+		// single-consumer runtime object and obscure the cancellation failure.
+		session.conn.db.mu.Unlock()
+		locked = false
+		select {
+		case err := <-done:
+			t.Fatalf(
+				"runtime cancellation waited for catalog unlock, then returned %v", err,
+			)
+		case <-time.After(time.Second):
+			safeToClose = false
+			t.Fatal("runtime cancellation remained stuck after catalog unlock")
+		}
+	}
+	session.conn.db.mu.Unlock()
+	locked = false
+	flag.Reset()
+
+	session.conn.db.mu.RLock()
+	_, exists := session.conn.db.tables["canceled"]
+	session.conn.db.mu.RUnlock()
+	if exists {
+		t.Fatal("canceled runtime DDL was published")
+	}
+}
+
 func TestPrepareObservesInstalledCancellationFlagAndConnectionIsReusable(t *testing.T) {
 	connection := directTestConn(t)
 	c := connection.(*conn)

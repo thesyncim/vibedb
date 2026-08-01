@@ -19,6 +19,57 @@ const contextLockPoll = 100 * time.Microsecond
 // (for example JOIN materialization) is not taken.
 var backgroundContext = context.Background()
 
+// cooperativeContext composes context cancellation with the typed runtime's
+// allocation-free CancelFlag. pgwire installs one flag for the session and
+// executes prepared DDL with context.Background; without this adapter, query
+// scans observe CancelRequest but catalog-lock waits and durable DDL build loops
+// do not. Done deliberately remains the base context's channel. The lock
+// helpers below recognize this wrapper and poll the atomic flag at the same
+// bounded interval used for a contended context lock, while durable build code
+// that calls Err directly sees query.ErrCanceled immediately.
+type cooperativeContext struct {
+	context.Context
+	flag *query.CancelFlag
+}
+
+func (c cooperativeContext) Err() error {
+	if err := c.Context.Err(); err != nil {
+		return err
+	}
+	if c.flag.Canceled() {
+		return query.ErrCanceled
+	}
+	return nil
+}
+
+func (cooperativeContext) hasCooperativeCancellation() bool { return true }
+
+func withCooperativeCancellation(
+	ctx context.Context,
+	flag *query.CancelFlag,
+) context.Context {
+	if flag == nil {
+		return ctx
+	}
+	return cooperativeContext{Context: ctx, flag: flag}
+}
+
+type cooperativeCancellationContext interface {
+	hasCooperativeCancellation() bool
+}
+
+func contextCanCancel(ctx context.Context) bool {
+	if ctx.Done() != nil {
+		return true
+	}
+	cooperative, ok := ctx.(cooperativeCancellationContext)
+	return ok && cooperative.hasCooperativeCancellation()
+}
+
+func contextCancellationError(ctx context.Context) error {
+	return ctx.Err()
+}
+
 // contextCancelScope bridges one request context into the query executor's
 // cooperative cancellation flag. It reuses a flag installed by the typed
 // runtime, or owns a local flag when the connection has none. It exists only
@@ -96,15 +147,15 @@ func (s *contextCancelScope) finish(err error) error {
 // takes the ordinary Lock path. That keeps the database/sql background hot path
 // allocation-free.
 func mutexLockContext(ctx context.Context, mu *sync.Mutex) error {
-	if ctx.Done() == nil {
+	if !contextCanCancel(ctx) {
 		mu.Lock()
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextCancellationError(ctx); err != nil {
 		return err
 	}
 	if mu.TryLock() {
-		if err := ctx.Err(); err != nil {
+		if err := contextCancellationError(ctx); err != nil {
 			mu.Unlock()
 			return err
 		}
@@ -116,10 +167,13 @@ func mutexLockContext(ctx context.Context, mu *sync.Mutex) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextCancellationError(ctx)
 		case <-timer.C:
+			if err := contextCancellationError(ctx); err != nil {
+				return err
+			}
 			if mu.TryLock() {
-				if err := ctx.Err(); err != nil {
+				if err := contextCancellationError(ctx); err != nil {
 					mu.Unlock()
 					return err
 				}
@@ -134,15 +188,15 @@ func mutexLockContext(ctx context.Context, mu *sync.Mutex) error {
 // cancellable. A context without a Done channel takes the ordinary Lock path,
 // which is the zero-allocation database/sql hot path.
 func lockContext(ctx context.Context, mu *sync.RWMutex) error {
-	if ctx.Done() == nil {
+	if !contextCanCancel(ctx) {
 		mu.Lock()
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextCancellationError(ctx); err != nil {
 		return err
 	}
 	if mu.TryLock() {
-		if err := ctx.Err(); err != nil {
+		if err := contextCancellationError(ctx); err != nil {
 			mu.Unlock()
 			return err
 		}
@@ -154,10 +208,13 @@ func lockContext(ctx context.Context, mu *sync.RWMutex) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextCancellationError(ctx)
 		case <-timer.C:
+			if err := contextCancellationError(ctx); err != nil {
+				return err
+			}
 			if mu.TryLock() {
-				if err := ctx.Err(); err != nil {
+				if err := contextCancellationError(ctx); err != nil {
 					mu.Unlock()
 					return err
 				}
@@ -170,15 +227,15 @@ func lockContext(ctx context.Context, mu *sync.RWMutex) error {
 
 // rlockContext is the read-lock counterpart to lockContext.
 func rlockContext(ctx context.Context, mu *sync.RWMutex) error {
-	if ctx.Done() == nil {
+	if !contextCanCancel(ctx) {
 		mu.RLock()
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextCancellationError(ctx); err != nil {
 		return err
 	}
 	if mu.TryRLock() {
-		if err := ctx.Err(); err != nil {
+		if err := contextCancellationError(ctx); err != nil {
 			mu.RUnlock()
 			return err
 		}
@@ -190,10 +247,13 @@ func rlockContext(ctx context.Context, mu *sync.RWMutex) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextCancellationError(ctx)
 		case <-timer.C:
+			if err := contextCancellationError(ctx); err != nil {
+				return err
+			}
 			if mu.TryRLock() {
-				if err := ctx.Err(); err != nil {
+				if err := contextCancellationError(ctx); err != nil {
 					mu.RUnlock()
 					return err
 				}
@@ -212,13 +272,14 @@ func rlockContext(ctx context.Context, mu *sync.RWMutex) error {
 // durable.ErrCommitOutcomeUnknown after a namespace fence failure.
 // Cancellation therefore controls all work up to this point of no return.
 func contextCheckpoint(ctx context.Context) error {
-	if ctx.Done() == nil {
-		return nil
+	done := ctx.Done()
+	if done == nil {
+		return contextCancellationError(ctx)
 	}
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-done:
+		return contextCancellationError(ctx)
 	default:
-		return nil
+		return contextCancellationError(ctx)
 	}
 }

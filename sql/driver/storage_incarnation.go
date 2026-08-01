@@ -106,10 +106,21 @@ func (d *database) recoverOrphanedTableStorage(protected map[string]string) erro
 	defer directory.Close()
 
 	protectedNames := make(map[string]struct{}, len(protected)*2)
-	for path := range protected {
+	for path, name := range protected {
 		base := filepath.Base(path)
 		protectedNames[base] = struct{}{}
-		protectedNames[base+".rjournal"] = struct{}{}
+		meta := d.catalog.Tables[name]
+		protectJournal := meta != nil && meta.Materialized
+		if !protectJournal {
+			if _, statErr := os.Lstat(path); statErr == nil {
+				protectJournal = true
+			} else if !os.IsNotExist(statErr) {
+				return statErr
+			}
+		}
+		if protectJournal {
+			protectedNames[base+".rjournal"] = struct{}{}
+		}
 	}
 	removed := false
 	var result error
@@ -484,8 +495,8 @@ func (d *database) buildReplacementStorageLocked(
 // uniform and easy to audit:
 //
 //  1. checkpoint and close the unpublished collection and descriptor,
-//  2. atomically move its store and journal siblings,
-//  3. fence the table directory,
+//  2. publish and fence the recovery journal,
+//  3. publish and fence the store file,
 //  4. reopen the final name before any catalog cutover.
 //
 // A crash before the catalog cutover leaves either catalog-owned first-table
@@ -499,15 +510,23 @@ func (d *database) publishTableStorageLocked(
 	collection *durable.Collection,
 	options durable.Options,
 ) (*os.File, *durable.Collection, error) {
-	if err := d.collectionClose(collection); err != nil {
+	if err, completed := d.collectionCloseState(collection); err != nil {
+		if !completed {
+			return nil, nil, errors.Join(err, d.retainUnpublishedStorageLocked(
+				collection, file, tmpPath,
+			))
+		}
+		// A completed Close may retain a sticky persistence error. Ownership
+		// nevertheless ended, so the candidate is not publishable and its private
+		// descriptor and names can be removed safely.
 		return nil, nil, errors.Join(err, d.discardUnpublishedStorageLocked(
-			collection, file, tmpPath,
+			nil, file, tmpPath,
 		))
 	}
 	collection = nil
 	if err := file.Close(); err != nil {
 		return nil, nil, errors.Join(err, d.discardUnpublishedStorageLocked(
-			nil, file, tmpPath,
+			nil, nil, tmpPath,
 		))
 	}
 	file = nil
@@ -517,16 +536,24 @@ func (d *database) publishTableStorageLocked(
 			nil, nil, tmpPath, path,
 		))
 	}
-	if err := publishNewPath(tmpPath, path); err != nil {
-		return cleanup(err)
-	}
 	if err := publishJournalSibling(tmpPath, path); err != nil {
 		return cleanup(err)
 	}
 	d.tableDirFencePending = true
 	if err := d.directorySync(d.dataDir); err != nil {
 		return cleanup(fmt.Errorf(
-			"%w: fence published SQL storage: %w",
+			"%w: fence published SQL recovery journal: %w",
+			durable.ErrCommitOutcomeUnknown, err,
+		))
+	}
+	d.tableDirFencePending = false
+	if err := publishNewPath(tmpPath, path); err != nil {
+		return cleanup(err)
+	}
+	d.tableDirFencePending = true
+	if err := d.directorySync(d.dataDir); err != nil {
+		return cleanup(fmt.Errorf(
+			"%w: fence published SQL store: %w",
 			durable.ErrCommitOutcomeUnknown, err,
 		))
 	}
@@ -567,7 +594,14 @@ func (d *database) discardUnpublishedStorageLocked(
 ) error {
 	var result error
 	if collection != nil {
-		result = errors.Join(result, d.collectionClose(collection))
+		closeErr, completed := d.collectionCloseState(collection)
+		if !completed {
+			return errors.Join(closeErr, d.retainUnpublishedStorageLocked(
+				collection, file, paths...,
+			))
+		}
+		result = errors.Join(result, closeErr)
+		collection = nil
 	}
 	if file != nil {
 		result = errors.Join(result, file.Close())
@@ -599,4 +633,42 @@ func (d *database) discardUnpublishedStorageLocked(
 		}
 	}
 	return result
+}
+
+// retainUnpublishedStorageLocked transfers a candidate whose engine teardown
+// is incomplete into the bounded retry queue used by replaced table
+// incarnations. Callers reserve one retirement slot before constructing the
+// candidate. At most two store names exist around publication (temporary and
+// final), so the queue entry remains fixed-size.
+func (d *database) retainUnpublishedStorageLocked(
+	collection *durable.Collection,
+	file *os.File,
+	paths ...string,
+) error {
+	if collection == nil || collection.CloseCompleted() {
+		return errors.New("vibedb: cannot retain completed unpublished storage")
+	}
+	if len(paths) == 0 || len(paths) > 2 {
+		return errors.New("vibedb: invalid unpublished storage cleanup path count")
+	}
+	entry := retiredTable{
+		name: "unpublished SQL storage", path: paths[0],
+		journal: durable.RecoveryJournalPath(paths[0]),
+		file:    file, collection: collection,
+	}
+	if len(paths) == 2 {
+		entry.extraPath = paths[1]
+		entry.extraJournal = durable.RecoveryJournalPath(paths[1])
+	}
+	d.retired = append(d.retired, entry)
+	if len(d.retired) > maxRetiredTables {
+		// Candidate construction pre-reserves this slot. Preserve ownership even
+		// if an internal caller violated that invariant, but stop later DDL with
+		// the typed resource bound.
+		return ErrTooManyRetiredTables
+	}
+	return fmt.Errorf(
+		"%w: unpublished SQL storage cleanup is pending retry",
+		durable.ErrCommitOutcomeUnknown,
+	)
 }

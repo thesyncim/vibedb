@@ -354,6 +354,9 @@ func (s *session) serve() error {
 		s.reportStartupFailure(err)
 		return err
 	}
+	if s.terminated {
+		return nil
+	}
 	return s.loop()
 }
 
@@ -446,6 +449,7 @@ func (s *session) startup() error {
 			// The protocol specifies no reply to a cancel request at all, and
 			// the connection is closed. Answering would let a peer probe for
 			// valid backend keys.
+			s.terminated = true
 			return nil
 
 		case protocolVersion30:

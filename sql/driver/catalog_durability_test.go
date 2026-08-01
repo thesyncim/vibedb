@@ -485,10 +485,10 @@ func TestFailedFirstWriteCleansTemporaryTableFile(t *testing.T) {
 	if table != nil {
 		t.Fatal("failed first write returned a materialized table")
 	}
-	if errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
 		!errors.Is(err, fenceFailure) {
 		t.Fatalf(
-			"failed-write temporary cleanup fence = %v, want known failure",
+			"failed-write temporary cleanup fence = %v, want unknown namespace outcome",
 			err,
 		)
 	}
