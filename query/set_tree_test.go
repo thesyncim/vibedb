@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibejson"
 )
@@ -139,6 +140,55 @@ func TestSetTreeBuilderSQLPrecedenceAndLeftAssociativity(t *testing.T) {
 			t.Fatalf("A EXCEPT B UNION C = %v, want %v", got, want)
 		}
 	})
+}
+
+func TestSetTreeOperationMappingIsExhaustive(t *testing.T) {
+	tests := []struct {
+		public  SetTreeOperation
+		private setOperation
+	}{
+		{SetTreeUnionAll, setUnionAll},
+		{SetTreeUnionDistinct, setUnionDistinct},
+		{SetTreeIntersectAll, setIntersectAll},
+		{SetTreeIntersectDistinct, setIntersectDistinct},
+		{SetTreeExceptAll, setExceptAll},
+		{SetTreeExceptDistinct, setExceptDistinct},
+	}
+	for _, test := range tests {
+		got, err := test.public.binary()
+		if err != nil || got != test.private {
+			t.Fatalf("operation %d maps to %d, %v; want %d",
+				test.public, got, err, test.private)
+		}
+	}
+	if _, err := SetTreeOperation(255).binary(); !errors.Is(err, ErrSetTreePlan) {
+		t.Fatalf("impossible operation error = %v, want plan rejection", err)
+	}
+}
+
+func TestSetTreeTopologicalSingleParentShapeNeedNotBeStrictPostorder(t *testing.T) {
+	// C is scheduled before the independent (A UNION B) subtree is reduced.
+	// This is topological and single-parent, but not strict DFS postorder.
+	plan := SetTreePlan{Nodes: []SetTreeNode{
+		NewSetTreeLeaf(0, 1),
+		NewSetTreeLeaf(1, 1),
+		NewSetTreeLeaf(2, 1),
+		NewSetTreeBinary(SetTreeUnionAll, 0, 1),
+		NewSetTreeBinary(SetTreeExceptDistinct, 3, 2),
+	}, Root: 4}
+	program := &setTreeTestProgram{sources: []SetTreeSource{
+		setTreeTestSourceRows([]string{`1`}),
+		setTreeTestSourceRows([]string{`2`}),
+		setTreeTestSourceRows([]string{`2`}),
+	}}
+	var executor SetTreeExecutor
+	result, err := executor.Run(plan, program, SetTreeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := setTreeResultJSON(result), [][]string{{`1`}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("topological result = %v, want %v", got, want)
+	}
 }
 
 func TestSetTreeExplicitParenthesizedShapeOverridesPrecedence(t *testing.T) {
@@ -365,6 +415,139 @@ func TestSetTreeTotalLimitsAreTypedAndPublishNothing(t *testing.T) {
 	if err != nil || result.Rows() != 2 {
 		t.Fatalf("exact total-row limit = rows %d err %v", result.Rows(), err)
 	}
+}
+
+func TestSetTreeControlAndPeakByteAccountingAreExact(t *testing.T) {
+	intBytes := int64(unsafe.Sizeof(int(0)))
+	wantControl := int64(3)*(3*intBytes+int64(unsafe.Sizeof(uint8(0)))) +
+		int64(3)*(int64(unsafe.Sizeof(setTreeSlot{}))+intBytes)
+	if got := setTreeControlRetainedBytes(3, 3); got != wantControl {
+		t.Fatalf("control bytes = %d, want %d", got, wantControl)
+	}
+
+	leftRows := [][]string{{`1`}, {`2`}}
+	rightRows := [][]string{{`3`}}
+	leftSpool := buildSetTestSpool(t, leftRows)
+	rightSpool := buildSetTestSpool(t, rightRows)
+	shape, err := measureSetExecution(setUnionAll, &leftSpool, &rightSpool, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftCharge := relationSpoolRetainedBytes(
+		leftSpool.rows, len(leftSpool.columns), int64(len(leftSpool.data)),
+	)
+	rightCharge := relationSpoolRetainedBytes(
+		rightSpool.rows, len(rightSpool.columns), int64(len(rightSpool.data)),
+	)
+	wantPeak := saturatedBytes(
+		wantControl,
+		saturatedBytes(leftCharge, saturatedBytes(rightCharge, shape.totalCharge)),
+	)
+	plan := SetTreePlan{Nodes: []SetTreeNode{
+		NewSetTreeLeaf(0, 1), NewSetTreeLeaf(1, 1),
+		NewSetTreeBinary(SetTreeUnionAll, 0, 1),
+	}, Root: 2}
+	program := &setTreeTestProgram{sources: []SetTreeSource{
+		setTreeTestSourceRows(leftRows...), setTreeTestSourceRows(rightRows...),
+	}}
+	options := SetTreeOptions{
+		MaxRows: -1, MaxBytes: wantPeak, MaxDepth: -1, MaxNodes: -1,
+	}
+	var executor SetTreeExecutor
+	result, err := executor.Run(plan, program, options)
+	if err != nil || result.Rows() != 3 {
+		t.Fatalf("tight peak run = rows %d err %v", result.Rows(), err)
+	}
+	if got := executor.PeakBytes(); got != wantPeak {
+		t.Fatalf("peak bytes = %d, want %d", got, wantPeak)
+	}
+	rootCharge := executor.slots[executor.rootSlot].charge
+	if executor.frame.intermediate.used != rootCharge {
+		t.Fatalf("post-run retained bytes = %d, want root %d",
+			executor.frame.intermediate.used, rootCharge)
+	}
+
+	before := setTreeExecutorTestCapacities(&executor)
+	options.MaxBytes = wantPeak - 1
+	result, err = executor.Run(plan, program, options)
+	if !errors.Is(err, ErrSetTreeBytes) || result.Rows() != 0 {
+		t.Fatalf("under-peak run = rows %d err %v", result.Rows(), err)
+	}
+	var budget *SetTreeByteBudgetError
+	if !errors.As(err, &budget) || budget.Bytes != wantPeak || budget.Limit != wantPeak-1 {
+		t.Fatalf("typed peak error = %#v", budget)
+	}
+	if executor.frame.intermediate.used != 0 || executor.rootSlot != -1 ||
+		executor.PeakBytes() != 0 {
+		t.Fatalf("failed peak run retained bytes/root/peak = %d/%d/%d",
+			executor.frame.intermediate.used, executor.rootSlot, executor.PeakBytes())
+	}
+	if after := setTreeExecutorTestCapacities(&executor); after != before {
+		t.Fatalf("failed warmed admission changed capacities from %+v to %+v", before, after)
+	}
+
+	options.MaxBytes = wantPeak
+	allocations := testing.AllocsPerRun(100, func() {
+		result, err = executor.Run(plan, program, options)
+	})
+	if err != nil || result.Rows() != 3 || executor.PeakBytes() != wantPeak {
+		t.Fatalf("reused tight run = rows %d peak %d err %v",
+			result.Rows(), executor.PeakBytes(), err)
+	}
+	if allocations != 0 {
+		t.Fatalf("tight rollback/reuse allocations = %.2f, want 0", allocations)
+	}
+}
+
+func TestSetTreeControlOnlyTightLimit(t *testing.T) {
+	plan := SetTreePlan{Nodes: []SetTreeNode{NewSetTreeLeaf(0, 0)}, Root: 0}
+	program := &setTreeTestProgram{sources: []SetTreeSource{
+		&setTreeTestSource{columns: 0},
+	}}
+	control := setTreeControlRetainedBytes(1, 1)
+	options := SetTreeOptions{
+		MaxRows: -1, MaxBytes: control, MaxDepth: -1, MaxNodes: -1,
+	}
+	var executor SetTreeExecutor
+	result, err := executor.Run(plan, program, options)
+	if err != nil || result.Rows() != 0 || result.Columns() != 0 ||
+		executor.PeakBytes() != control {
+		t.Fatalf("control-only run = %dx%d peak %d err %v",
+			result.Rows(), result.Columns(), executor.PeakBytes(), err)
+	}
+	program.calls = 0
+	options.MaxBytes--
+	if _, err := executor.Run(plan, program, options); !errors.Is(err, ErrSetTreeBytes) {
+		t.Fatalf("under-control error = %v, want byte budget", err)
+	}
+	if program.calls != 0 || executor.frame.intermediate.used != 0 {
+		t.Fatalf("control rejection called %d leaves or retained %d bytes",
+			program.calls, executor.frame.intermediate.used)
+	}
+}
+
+type setTreeExecutorCapacities struct {
+	slots, free, nodes, arities, depths, parents int
+	leafColumns, leafData                        int
+	binarySlots, binaryEntries, binarySelected   int
+	binaryColumns, binaryData                    int
+}
+
+func setTreeExecutorTestCapacities(e *SetTreeExecutor) setTreeExecutorCapacities {
+	result := setTreeExecutorCapacities{
+		slots: cap(e.slots), free: cap(e.free), nodes: cap(e.nodeSlots),
+		arities: cap(e.arities), depths: cap(e.depths), parents: cap(e.parents),
+	}
+	for slot := range e.slots {
+		result.leafColumns += cap(e.slots[slot].leaf.columns)
+		result.leafData += cap(e.slots[slot].leaf.data)
+		result.binarySlots += cap(e.slots[slot].binary.workspace.slots)
+		result.binaryEntries += cap(e.slots[slot].binary.workspace.entries)
+		result.binarySelected += cap(e.slots[slot].binary.workspace.selected)
+		result.binaryColumns += cap(e.slots[slot].binary.result.columns)
+		result.binaryData += cap(e.slots[slot].binary.result.data)
+	}
+	return result
 }
 
 func TestSetTreeCancellationAndLeafFailureClearEarlierIntermediates(t *testing.T) {

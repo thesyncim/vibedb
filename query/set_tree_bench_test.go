@@ -75,6 +75,32 @@ func BenchmarkSetTreeExecutorDeepUnionAllWarm(b *testing.B) {
 	benchmarkSetTreeWarm(b, plan, program)
 }
 
+func BenchmarkSetTreeBuilderWarm(b *testing.B) {
+	const leaves = 64
+	specs := make([]SetTreeLeafSpec, leaves)
+	operations := make([]SetTreeOperation, leaves-1)
+	for leaf := range leaves {
+		specs[leaf] = SetTreeLeafSpec{Source: leaf, Columns: 2}
+		if leaf != leaves-1 {
+			operations[leaf] = SetTreeOperation(leaf % 6)
+		}
+	}
+	var builder SetTreeBuilder
+	plan, err := builder.BuildChain(specs, operations)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		plan, err = builder.BuildChain(specs, operations)
+		if err != nil || len(plan.Nodes) != leaves*2-1 {
+			b.Fatalf("nodes=%d err=%v", len(plan.Nodes), err)
+		}
+	}
+	setTreeBenchmarkSink += plan.Root
+}
+
 func benchmarkSetTreeWarm(
 	b *testing.B,
 	plan SetTreePlan,
@@ -115,6 +141,48 @@ func TestSetTreeExecutorWarmExecutionAllocations(t *testing.T) {
 	}
 	if allocations != 0 {
 		t.Fatalf("warmed set-tree Run allocations = %.2f, want 0", allocations)
+	}
+}
+
+func TestSetTreeBuilderAndIntegratedExecutionWarmAllocations(t *testing.T) {
+	builder, plan, program := newSetTreeBenchmark(16, 32)
+	defer builder.Release()
+	specs := make([]SetTreeLeafSpec, 16)
+	operations := make([]SetTreeOperation, 15)
+	for leaf := range specs {
+		specs[leaf] = SetTreeLeafSpec{Source: leaf, Columns: 1}
+		if leaf != len(specs)-1 {
+			operations[leaf] = SetTreeOperation(leaf % 6)
+		}
+	}
+	var executor SetTreeExecutor
+	result, err := executor.Run(plan, program, SetTreeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRows := result.Rows()
+
+	builderAllocs := testing.AllocsPerRun(100, func() {
+		plan, err = builder.BuildChain(specs, operations)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builderAllocs != 0 {
+		t.Fatalf("warmed BuildChain allocations = %.2f, want 0", builderAllocs)
+	}
+
+	integratedAllocs := testing.AllocsPerRun(100, func() {
+		plan, err = builder.BuildChain(specs, operations)
+		if err == nil {
+			result, err = executor.Run(plan, program, SetTreeOptions{})
+		}
+	})
+	if err != nil || result.Rows() != wantRows {
+		t.Fatalf("integrated rows=%d err=%v, want %d", result.Rows(), err, wantRows)
+	}
+	if integratedAllocs != 0 {
+		t.Fatalf("warmed BuildChain+Run allocations = %.2f, want 0", integratedAllocs)
 	}
 }
 

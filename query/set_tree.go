@@ -60,7 +60,27 @@ const (
 
 func (op SetTreeOperation) valid() bool { return op <= SetTreeExceptDistinct }
 
-func (op SetTreeOperation) binary() setOperation { return setOperation(op) }
+func (op SetTreeOperation) binary() (setOperation, error) {
+	switch op {
+	case SetTreeUnionAll:
+		return setUnionAll, nil
+	case SetTreeUnionDistinct:
+		return setUnionDistinct, nil
+	case SetTreeIntersectAll:
+		return setIntersectAll, nil
+	case SetTreeIntersectDistinct:
+		return setIntersectDistinct, nil
+	case SetTreeExceptAll:
+		return setExceptAll, nil
+	case SetTreeExceptDistinct:
+		return setExceptDistinct, nil
+	default:
+		return 0, fmt.Errorf(
+			"query: set-expression operation %d cannot be lowered: %w",
+			op, ErrSetTreePlan,
+		)
+	}
+}
 
 func (op SetTreeOperation) precedence() uint8 {
 	if op == SetTreeIntersectAll || op == SetTreeIntersectDistinct {
@@ -77,9 +97,9 @@ const (
 	SetTreeBinaryNode
 )
 
-// SetTreeNode is one postorder physical expression node. A leaf names a
-// lowering-owned source and declares its ordinal width. A binary node refers
-// to two earlier nodes and propagates their common width.
+// SetTreeNode is one topologically ordered physical expression node. A leaf
+// names a lowering-owned source and declares its ordinal width. A binary node
+// refers to two earlier nodes and propagates their common width.
 type SetTreeNode struct {
 	Kind      SetTreeNodeKind
 	Source    int
@@ -94,16 +114,19 @@ func NewSetTreeLeaf(source, columns int) SetTreeNode {
 	return SetTreeNode{Kind: SetTreeLeafNode, Source: source, Columns: columns}
 }
 
-// NewSetTreeBinary constructs one binary node over earlier postorder nodes.
+// NewSetTreeBinary constructs one binary node over earlier topological nodes.
 func NewSetTreeBinary(operation SetTreeOperation, left, right int) SetTreeNode {
 	return SetTreeNode{
 		Kind: SetTreeBinaryNode, Operation: operation, Left: left, Right: right,
 	}
 }
 
-// SetTreePlan is a lowering-supplied parenthesized tree in postorder. Root must
-// be the final node. Each earlier node has exactly one parent, preventing DAG
-// aliasing and making immediate intermediate release safe.
+// SetTreePlan is a lowering-supplied parenthesized tree in topological order.
+// Every child must precede its parent, Root must be the final node, and every
+// earlier node must have exactly one parent. Strict depth-first postorder is
+// accepted but is not required: independent subtrees may be interleaved before
+// their parents. The single-parent rule prevents DAG aliasing and makes
+// immediate intermediate release safe.
 type SetTreePlan struct {
 	Nodes []SetTreeNode
 	Root  int
@@ -322,9 +345,10 @@ func (s *setTreeSlot) release() {
 	*s = setTreeSlot{}
 }
 
-// SetTreeExecutor evaluates validated postorder plans with a liveness-reused
-// slot pool. Its zero value is ready. One executor is single-owner; independent
-// executors share no mutable statement state and may run concurrently.
+// SetTreeExecutor evaluates validated topologically ordered plans with a
+// liveness-reused slot pool. Its zero value is ready. One executor is
+// single-owner; independent executors share no mutable statement state and may
+// run concurrently.
 type SetTreeExecutor struct {
 	running atomic.Bool
 
@@ -340,6 +364,7 @@ type SetTreeExecutor struct {
 
 	totalRows    int64
 	controlBytes int64
+	peakBytes    int64
 	rootSlot     int
 }
 
@@ -383,6 +408,7 @@ func (e *SetTreeExecutor) Run(
 		e.controlBytes = 0
 		return SetTreeResult{}, e.translateError(err)
 	}
+	e.observeBytes(e.frame.intermediate.used)
 	defer func() {
 		if err != nil {
 			err = e.translateError(err)
@@ -457,7 +483,8 @@ func (e *SetTreeExecutor) preflightPlan(plan SetTreePlan) (int, error) {
 	}
 	if stack != 1 {
 		return 0, fmt.Errorf(
-			"query: set-expression postorder leaves %d live values: %w", stack, ErrSetTreePlan,
+			"query: set-expression topological plan leaves %d live values: %w",
+			stack, ErrSetTreePlan,
 		)
 	}
 	return maxSlots, nil
@@ -621,6 +648,7 @@ func (e *SetTreeExecutor) executeLeaf(
 	e.slots[slot].active = true
 	e.nodeSlots[nodeIndex] = slot
 	e.totalRows += int64(rows)
+	e.observeBytes(e.frame.intermediate.used)
 	return nil
 }
 
@@ -637,12 +665,25 @@ func (e *SetTreeExecutor) executeBinary(nodeIndex int, node SetTreeNode) error {
 	}
 	left := e.slots[leftSlot].relation()
 	right := e.slots[rightSlot].relation()
+	operation, err := node.Operation.binary()
+	if err != nil {
+		return err
+	}
+	shape, err := measureSetExecution(operation, left, right, e.arities[nodeIndex])
+	if err != nil {
+		return err
+	}
+	peak := saturatedBytes(e.frame.intermediate.used, shape.totalCharge)
+	if peak == math.MaxInt64 {
+		return ErrSetTreeSize
+	}
 	charge, err := e.slots[outputSlot].binary.execute(
-		node.Operation.binary(), left, right, &e.frame, e.options.cancel,
+		operation, left, right, &e.frame, e.options.cancel,
 	)
 	if err != nil {
 		return err
 	}
+	e.observeBytes(peak)
 	e.slots[outputSlot].kind = setTreeSlotBinary
 	e.slots[outputSlot].charge = charge
 	e.slots[outputSlot].active = true
@@ -779,6 +820,7 @@ func (e *SetTreeExecutor) resetRun() {
 	e.free = e.free[:0]
 	e.totalRows = 0
 	e.controlBytes = 0
+	e.peakBytes = 0
 	e.rootSlot = -1
 }
 
@@ -794,6 +836,7 @@ func (e *SetTreeExecutor) abortRun() {
 	}
 	e.controlBytes = 0
 	e.totalRows = 0
+	e.peakBytes = 0
 	e.rootSlot = -1
 }
 
@@ -828,6 +871,23 @@ func setTreeControlRetainedBytes(nodes, slots int) int64 {
 	)
 }
 
+func (e *SetTreeExecutor) observeBytes(bytes int64) {
+	if bytes > e.peakBytes {
+		e.peakBytes = bytes
+	}
+}
+
+// PeakBytes returns the exact maximum logical bytes simultaneously admitted by
+// the most recent successful Run. It includes tree-control vectors, live
+// leaf/root spools, and the existing binary kernel's admitted output and
+// workspace. Failed runs clear the value with every other unpublished result.
+func (e *SetTreeExecutor) PeakBytes() int64 {
+	if e == nil {
+		return 0
+	}
+	return e.peakBytes
+}
+
 // Release drops all retained tree, leaf, and binary-node high-water storage.
 // It must not race Run.
 func (e *SetTreeExecutor) Release() {
@@ -846,6 +906,7 @@ func (e *SetTreeExecutor) Release() {
 	e.parents = nil
 	e.options = setTreeOptions{}
 	e.frame = statementFrame{}
+	e.peakBytes = 0
 }
 
 // SetTreeResult is the root ordinal relation. It borrows executor-owned storage
