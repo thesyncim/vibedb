@@ -83,10 +83,10 @@ func cancelActiveStatement(t *testing.T, statement *stdsql.Stmt, name string) {
 		t.Fatalf("%s completed before its cancellation window: %v", name, err)
 	case <-ctx.observed:
 		// The second Done observation cannot happen until the operation-local
-		// cancellation scope is installed and execution is dispatched. Give the
-		// statement one scheduler turn to enter its durable scan, then deliver
-		// an ordinary context cancellation.
-		time.Sleep(100 * time.Microsecond)
+		// cancellation scope and its watcher are installed. Cancel immediately:
+		// sleeping here makes a fast architecture capable of completing a
+		// bounded mutation before the signal is delivered, which tests scheduler
+		// speed rather than the cancellation contract.
 		cancel()
 	case <-time.After(time.Second):
 		cancel()
