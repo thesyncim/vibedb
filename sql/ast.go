@@ -54,6 +54,12 @@ type SelectStmt struct {
 	// dropping a filter returns wrong rows.
 	Having *Expr
 
+	// Windows holds the named window definitions declared by this SELECT's
+	// WINDOW clause. Definitions are ordered: a definition may inherit only
+	// from an earlier entry. Window expressions carry their fully resolved
+	// effective specification, so lowerers do not perform a name lookup.
+	Windows []NamedWindow
+
 	// OrderBy holds the sort keys, in priority order.
 	OrderBy []OrderTerm
 
@@ -386,8 +392,9 @@ type WindowOrderTerm struct {
 	Pos   int
 }
 
-// WindowFrameBoundKind names one endpoint of an explicit ROWS or GROUPS frame. The
-// order is semantic and is also used to reject a start that follows its end.
+// WindowFrameBoundKind names one endpoint of an explicit ROWS, GROUPS, or
+// RANGE frame. The order is semantic and is also used to reject a start that
+// follows its end.
 type WindowFrameBoundKind uint8
 
 const (
@@ -399,39 +406,74 @@ const (
 )
 
 // WindowFrameBound is one frame endpoint. Offset is meaningful only for
-// PRECEDING/FOLLOWING and may be a non-negative integer placeholder.
+// PRECEDING/FOLLOWING. ROWS and GROUPS require a non-negative integer;
+// RANGE retains an exact non-negative numeric spelling or placeholder.
 type WindowFrameBound struct {
 	Kind   WindowFrameBoundKind
 	Offset Operand
 	Pos    int
 }
 
-// WindowFrame is the explicit ROWS or GROUPS frame attached to an OVER clause.
-// Explicit is false when no frame was written.
+// WindowFrame is the explicit frame attached to an OVER clause. Explicit is
+// false when no frame was written. ExclusionExplicit distinguishes an authored
+// EXCLUDE NO OTHERS from the identical default behavior.
 type WindowFrame struct {
-	Unit     WindowFrameUnit
-	Start    WindowFrameBound
-	End      WindowFrameBound
-	Pos      int
-	Explicit bool
+	Unit              WindowFrameUnit
+	Start             WindowFrameBound
+	End               WindowFrameBound
+	Exclusion         WindowFrameExclusion
+	Pos               int
+	ExclusionPos      int
+	Explicit          bool
+	ExclusionExplicit bool
 }
 
-// WindowFrameUnit selects physical-row or peer-group offsets.
+// WindowFrameUnit selects physical-row, peer-group, or exact order-value
+// offsets.
 type WindowFrameUnit uint8
 
 const (
 	WindowFrameRows WindowFrameUnit = iota
 	WindowFrameGroups
+	WindowFrameRange
 )
 
-// WindowSpec is one anonymous OVER specification. Named windows are rejected
-// explicitly because accepting their syntax without a shared definition
-// catalog would make sort reuse and scope resolution dishonest.
+// WindowFrameExclusion selects rows removed after frame boundary resolution.
+type WindowFrameExclusion uint8
+
+const (
+	WindowExcludeNoOthers WindowFrameExclusion = iota
+	WindowExcludeCurrentRow
+	WindowExcludeGroup
+	WindowExcludeTies
+)
+
+// WindowSpec is one resolved OVER specification. Name is the named definition
+// copied by this specification, if any. PartitionInherited, OrderInherited,
+// and FrameInherited record which effective values alias a definition's
+// parser-owned operands; they prevent nested-statement position rebasing and
+// placeholder accounting from visiting shared operands twice.
 type WindowSpec struct {
-	PartitionBy []*PathExpr
-	OrderBy     []WindowOrderTerm
-	Frame       WindowFrame
-	Pos         int
+	Name         string
+	NamePos      int
+	PartitionBy  []*PathExpr
+	PartitionPos int
+	OrderBy      []WindowOrderTerm
+	OrderPos     int
+	Frame        WindowFrame
+	Pos          int
+
+	PartitionInherited bool
+	OrderInherited     bool
+	FrameInherited     bool
+}
+
+// NamedWindow is one WINDOW-clause definition. Spec is fully resolved against
+// an earlier definition while retaining Spec.Name for AST diagnostics/dumps.
+type NamedWindow struct {
+	Name string
+	Spec WindowSpec
+	Pos  int
 }
 
 // WindowExpr is one SELECT-list window expression.
@@ -454,7 +496,10 @@ type WindowExpr struct {
 	HasDefault  bool
 	DefaultNull bool
 	Spec        WindowSpec
-	Pos         int
+	// DirectName is true for OVER name. False with Spec.Name set represents
+	// OVER (name ...), whose SQL inheritance restrictions are stricter.
+	DirectName bool
+	Pos        int
 }
 
 // An OrderTerm is one ORDER BY key.

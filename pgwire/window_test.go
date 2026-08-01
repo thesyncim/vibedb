@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -83,6 +84,75 @@ func TestWindowSimpleExtendedPeerDefaultsExactDecimalsAndRowDescription(t *testi
 	}
 }
 
+func TestWindowProtocolNamedRangeExclusionSQLStateAndPosition(t *testing.T) {
+	c := connectSQLCatalog(t)
+	seedWindowProtocol(t, c)
+	statement := `
+		SELECT id, SUM(value) OVER (
+			ordered RANGE BETWEEN $1 PRECEDING AND $2 FOLLOWING EXCLUDE TIES
+		) AS ranged
+		FROM events
+		WINDOW partitioned AS (PARTITION BY team),
+		       ordered AS (partitioned ORDER BY score)
+		ORDER BY id`
+	messages := extendedSQL(c, statement, [][]byte{[]byte("5e-1"), []byte("0.5000")})
+	description := decodeRowDescription(t, find(t, messages, msgRowDescription).body)
+	if len(description) != 2 || description[0].name != "id" ||
+		description[1].name != "ranged" || description[0].oid != oidJSON ||
+		description[1].oid != oidJSON {
+		t.Fatalf("named RANGE RowDescription = %+v", description)
+	}
+	assertWindowProtocolRows(t, rowsOf(t, messages), [][]string{
+		{`"a"`, `0.1`}, {`"b"`, `0.2`}, {`"c"`, `1`}, {`"d"`, `7`},
+	})
+
+	messages = c.query(`INSERT INTO events VALUES ` +
+		`({"id":"m","team":"z","value":200}),` +
+		`({"id":"n","team":"z","score":null,"value":100})`)
+	if has(messages, msgErrorResponse) {
+		t.Fatalf("insert NULL/missing RANGE peers: %s",
+			formatError(find(t, messages, msgErrorResponse).body))
+	}
+	messages = c.query(`
+		SELECT id, COUNT(*) OVER ranged AS peer_count,
+			SUM(value) OVER ranged AS peer_sum
+		FROM events WHERE team = 'z'
+		WINDOW ranged AS (PARTITION BY team ORDER BY score NULLS FIRST
+			RANGE BETWEEN 0.5 PRECEDING AND 1 FOLLOWING)
+		ORDER BY id`)
+	description = decodeRowDescription(t, find(t, messages, msgRowDescription).body)
+	if len(description) != 3 || description[0].oid != oidJSON ||
+		description[1].oid != oidInt8 || description[2].oid != oidJSON {
+		t.Fatalf("NULL/missing RANGE RowDescription = %+v", description)
+	}
+	assertWindowProtocolRows(t, rowsOf(t, messages), [][]string{
+		{`"m"`, `2`, `300`}, {`"n"`, `2`, `300`},
+	})
+
+	messages = extendedSQL(c, statement, [][]byte{[]byte("-0.01"), []byte("0.5")})
+	expectError(t, messages, sqlstateInvalidParameterValue)
+	if has(messages, msgDataRow) || has(messages, msgCommandComplete) {
+		t.Fatalf("invalid RANGE bind emitted rows/completion: %s", tags(messages))
+	}
+	if got := commandTagOf(t, c.query(`SELECT id FROM events WHERE id = 'a'`)); got != "SELECT 1" {
+		t.Fatalf("post-RANGE-error recovery tag = %q, want SELECT 1", got)
+	}
+	messages = c.query(`SELECT SUM(value) OVER (` +
+		`ORDER BY team RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events`)
+	expectError(t, messages, sqlstateInvalidParameterValue)
+	if has(messages, msgDataRow) {
+		t.Fatal("nonnumeric RANGE ORDER BY emitted a partial row")
+	}
+
+	invalid := `SELECT SUM(value) OVER (ORDER BY team, score RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM events`
+	fields := expectError(t, c.query(invalid), sqlstateSyntaxError)
+	position, err := strconv.Atoi(fields['P'])
+	if err != nil || position < 1 || position > len(invalid) ||
+		!strings.HasPrefix(invalid[position-1:], "1.5") {
+		t.Fatalf("multi-key RANGE position = %q/%v, fields=%v", fields['P'], err, fields)
+	}
+}
+
 func TestWindowPreparedTransactionReuseAndRuntimeSQLStateRecovery(t *testing.T) {
 	c := connectSQLCatalog(t)
 	seedWindowProtocol(t, c)
@@ -151,7 +221,8 @@ func TestWindowProtocolBudgetAndCancellationPublishNoRowsAndRecover(t *testing.T
 	budgetServer := newTestServer(t, Options{MaxIntermediateBytes: 1})
 	budgetClient := dial(t, budgetServer)
 	budgetClient.startup(map[string]string{"user": "tester"})
-	statement := `SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS position FROM users`
+	statement := `SELECT id, COUNT(*) OVER ranged AS position FROM users ` +
+		`WINDOW ranged AS (ORDER BY id RANGE CURRENT ROW EXCLUDE TIES)`
 	for _, messages := range [][]backendMessage{
 		budgetClient.query(statement),
 		extendedSQL(budgetClient, statement, nil),
@@ -184,8 +255,9 @@ func TestWindowProtocolBudgetAndCancellationPublishNoRowsAndRecover(t *testing.T
 	}()
 
 	c.send(msgParse, parseMsg("cancel-window", `
-		SELECT id, SUM(value) OVER (PARTITION BY team ORDER BY score) AS running
-		FROM events`))
+		SELECT id, SUM(value) OVER ranged AS running FROM events
+		WINDOW ranged AS (PARTITION BY team ORDER BY score
+			RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW EXCLUDE TIES)`))
 	c.send(msgSync, nil)
 	if messages := c.until(msgReadyForQuery); has(messages, msgErrorResponse) {
 		t.Fatalf("cancel-window Parse: %s", tags(messages))

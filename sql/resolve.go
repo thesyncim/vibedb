@@ -171,6 +171,13 @@ func (p *Parser) validate() error {
 }
 
 func (p *Parser) validateWindows(grouped, hasAggregate bool) error {
+	for i := range p.out.Windows {
+		if err := p.validateWindowSpecPaths(
+			&p.out.Windows[i].Spec, grouped, hasAggregate,
+		); err != nil {
+			return err
+		}
+	}
 	for i := range p.out.Columns {
 		window := p.out.Columns[i].Window
 		if window == nil {
@@ -181,17 +188,27 @@ func (p *Parser) validateWindows(grouped, hasAggregate bool) error {
 		); err != nil {
 			return err
 		}
-		for _, path := range window.Spec.PartitionBy {
-			if err := p.validateWindowPath(path, "PARTITION BY", grouped, hasAggregate); err != nil {
-				return err
-			}
+		if err := p.validateWindowSpecPaths(&window.Spec, grouped, hasAggregate); err != nil {
+			return err
 		}
-		for j := range window.Spec.OrderBy {
-			if err := p.validateWindowPath(
-				window.Spec.OrderBy[j].Path, "window ORDER BY", grouped, hasAggregate,
-			); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func (p *Parser) validateWindowSpecPaths(
+	spec *WindowSpec,
+	grouped, hasAggregate bool,
+) error {
+	for _, path := range spec.PartitionBy {
+		if err := p.validateWindowPath(path, "PARTITION BY", grouped, hasAggregate); err != nil {
+			return err
+		}
+	}
+	for i := range spec.OrderBy {
+		if err := p.validateWindowPath(
+			spec.OrderBy[i].Path, "window ORDER BY", grouped, hasAggregate,
+		); err != nil {
+			return err
 		}
 	}
 	return nil

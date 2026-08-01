@@ -84,12 +84,13 @@ type statementWindowOutput struct {
 }
 
 type statementWindowStage struct {
-	spec     *sqlast.WindowSpec
-	exprs    []*sqlast.WindowExpr
-	plan     windowPlan
-	executor windowExecutor
-	active   int64
-	base     int
+	spec                 *sqlast.WindowSpec
+	exprs                []*sqlast.WindowExpr
+	plan                 windowPlan
+	executor             windowExecutor
+	active               int64
+	base                 int
+	requiresNumericRange bool
 }
 
 func selectHasWindows(tree *sqlast.SelectStmt) bool {
@@ -230,6 +231,11 @@ func (s *Statement) prepareWindow(
 			if expr.Argument == nil {
 				stage.plan.functions[j].column = -1
 			}
+			stage.requiresNumericRange = stage.requiresNumericRange ||
+				sqlWindowFunctionUsesFrame(expr.Kind) &&
+					expr.Spec.Frame.Explicit &&
+					expr.Spec.Frame.Unit == sqlast.WindowFrameRange &&
+					windowFrameHasSQLRangeOffset(expr.Spec.Frame)
 		}
 		next += len(stage.exprs)
 	}
@@ -615,11 +621,11 @@ func (s *Statement) lowerWindowFrame(
 	args []any,
 	orderKeys int,
 ) (windowRowsFrame, error) {
-	start, err := s.lowerWindowBound(frame.Start, args)
+	start, err := s.lowerWindowBound(frame.Unit, frame.Start, args)
 	if err != nil {
 		return windowRowsFrame{}, err
 	}
-	end, err := s.lowerWindowBound(frame.End, args)
+	end, err := s.lowerWindowBound(frame.Unit, frame.End, args)
 	if err != nil {
 		return windowRowsFrame{}, err
 	}
@@ -629,25 +635,47 @@ func (s *Statement) lowerWindowFrame(
 		physical.unit = windowFrameRows
 	case sqlast.WindowFrameGroups:
 		physical.unit = windowFrameGroups
+	case sqlast.WindowFrameRange:
+		physical.unit = windowFrameRange
 	default:
 		return windowRowsFrame{}, fmt.Errorf(
 			"query: unsupported SQL window frame unit %d at byte %d",
 			frame.Unit, frame.Pos,
 		)
 	}
+	switch frame.Exclusion {
+	case sqlast.WindowExcludeNoOthers:
+		physical.exclusion = windowExcludeNoOthers
+	case sqlast.WindowExcludeCurrentRow:
+		physical.exclusion = windowExcludeCurrentRow
+	case sqlast.WindowExcludeGroup:
+		physical.exclusion = windowExcludeGroup
+	case sqlast.WindowExcludeTies:
+		physical.exclusion = windowExcludeTies
+	default:
+		return windowRowsFrame{}, fmt.Errorf(
+			"query: unsupported SQL window frame exclusion %d at byte %d",
+			frame.Exclusion, frame.ExclusionPos,
+		)
+	}
 	if err := validateWindowFrame(physical, orderKeys); err != nil {
 		unit := "ROWS"
-		if frame.Unit == sqlast.WindowFrameGroups {
+		switch frame.Unit {
+		case sqlast.WindowFrameGroups:
 			unit = "GROUPS"
+		case sqlast.WindowFrameRange:
+			unit = "RANGE"
 		}
-		return windowRowsFrame{}, fmt.Errorf(
-			"query: invalid %s frame at byte %d: %w", unit, frame.Pos, err,
-		)
+		return windowRowsFrame{}, &WindowArgumentError{
+			Clause: fmt.Sprintf("%s frame at byte %d", unit, frame.Pos),
+			Cause:  err,
+		}
 	}
 	return physical, nil
 }
 
 func (s *Statement) lowerWindowBound(
+	unit sqlast.WindowFrameUnit,
 	bound sqlast.WindowFrameBound,
 	args []any,
 ) (windowFrameBound, error) {
@@ -672,12 +700,59 @@ func (s *Statement) lowerWindowBound(
 	if bound.Kind != sqlast.WindowPreceding && bound.Kind != sqlast.WindowFollowing {
 		return physical, nil
 	}
+	if unit == sqlast.WindowFrameRange {
+		offset, err := s.windowRangeOffset(bound.Offset, args)
+		if err != nil {
+			return windowFrameBound{}, err
+		}
+		physical.rangeOffset = offset
+		return physical, nil
+	}
 	offset, err := s.windowCount(bound.Offset, args, "window frame offset")
 	if err != nil {
 		return windowFrameBound{}, err
 	}
 	physical.offset = offset
 	return physical, nil
+}
+
+func (s *Statement) windowRangeOffset(
+	operand sqlast.Operand,
+	args []any,
+) (scalar, error) {
+	value, known, err := s.operand(operand, args)
+	if err != nil {
+		return scalar{}, &WindowArgumentError{
+			Clause: "RANGE frame offset", Cause: err,
+		}
+	}
+	if !known {
+		return scalar{}, &WindowArgumentError{
+			Clause: "RANGE frame offset",
+			Cause:  fmt.Errorf("query: RANGE frame offset must be an exact non-negative number"),
+		}
+	}
+	literal, err := s.c.makeLiteral(value)
+	if err != nil {
+		return scalar{}, &WindowArgumentError{
+			Clause: "RANGE frame offset", Cause: err,
+		}
+	}
+	offset := classifyLiteral(literal)
+	if offset.kind != kindNumber {
+		return scalar{}, &WindowArgumentError{
+			Clause: "RANGE frame offset",
+			Cause:  fmt.Errorf("query: RANGE frame offset must be an exact non-negative number"),
+		}
+	}
+	decimal := parseDecimal(offset.num)
+	if decimal.neg && !decimal.zero {
+		return scalar{}, &WindowArgumentError{
+			Clause: "RANGE frame offset",
+			Cause:  fmt.Errorf("query: RANGE frame offset must not be negative"),
+		}
+	}
+	return offset, nil
 }
 
 func (s *Statement) windowCount(
@@ -739,6 +814,12 @@ func (w *statementWindow) run(
 
 	for i := range w.stages {
 		stage := &w.stages[i]
+		if err = stage.validateRangeOrder(
+			&w.inputSpool, parent.Options.Cancel,
+		); err != nil {
+			w.releaseExecution(frame)
+			return Cursor{}, err
+		}
 		stage.active, err = stage.executor.execute(
 			&w.inputSpool, &stage.plan, frame, parent.Options.Cancel,
 		)
@@ -780,6 +861,49 @@ func (w *statementWindow) run(
 	parent.Stats = inputStats
 	w.lastRows = uint64(w.inputSpool.rows)
 	return owner.cursor(&parent.Result), nil
+}
+
+func windowFrameHasSQLRangeOffset(frame sqlast.WindowFrame) bool {
+	return frame.Start.Kind == sqlast.WindowPreceding ||
+		frame.Start.Kind == sqlast.WindowFollowing ||
+		frame.End.Kind == sqlast.WindowPreceding ||
+		frame.End.Kind == sqlast.WindowFollowing
+}
+
+func (s *statementWindowStage) validateRangeOrder(
+	input *relationSpool,
+	cancel *CancelFlag,
+) error {
+	if s == nil || !s.requiresNumericRange {
+		return nil
+	}
+	if len(s.plan.order) != 1 {
+		return &WindowArgumentError{
+			Clause: "RANGE frame",
+			Cause:  fmt.Errorf("query: a RANGE offset requires exactly one ORDER BY key"),
+		}
+	}
+	column := s.plan.order[0].column
+	if input == nil || column < 0 || column >= len(input.columns) {
+		return &WindowArgumentError{
+			Clause: "RANGE ORDER BY",
+			Cause:  fmt.Errorf("query: RANGE ORDER BY has no input column"),
+		}
+	}
+	for row, value := range input.columns[column] {
+		if err := cancellationCheckpoint(cancel, row); err != nil {
+			return err
+		}
+		if value.kind != kindNull && value.kind != kindNumber {
+			return &WindowArgumentError{
+				Clause: "RANGE ORDER BY",
+				Cause: fmt.Errorf(
+					"query: RANGE ORDER BY row %d is not numeric", row,
+				),
+			}
+		}
+	}
+	return cancellationError(cancel)
 }
 
 func (w *statementWindow) bindView() {

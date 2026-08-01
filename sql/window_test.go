@@ -125,6 +125,165 @@ func TestWindowAdvancedFunctionsAndGroups(t *testing.T) {
 	}
 }
 
+func TestWindowRangeExclusionAndNamedInheritance(t *testing.T) {
+	src := `SELECT
+		SUM(v) OVER framed AS direct,
+		COUNT(*) OVER (ordered RANGE BETWEEN ? PRECEDING AND 1.2500 FOLLOWING EXCLUDE TIES) AS copied,
+		MAX(v) OVER (ordered RANGE CURRENT ROW EXCLUDE NO OTHERS) AS current
+	FROM t
+	WINDOW partitioned AS (PARTITION BY tenant),
+	       ordered AS (partitioned ORDER BY score DESC NULLS LAST),
+	       framed AS (ordered RANGE BETWEEN 2.5 PRECEDING AND CURRENT ROW EXCLUDE GROUP)`
+	statement, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statement.Params != 1 || len(statement.Windows) != 3 {
+		t.Fatalf("shape = params %d, windows %d", statement.Params, len(statement.Windows))
+	}
+	framed := statement.Columns[0].Window
+	if framed == nil || !framed.DirectName || framed.Spec.Name != "framed" ||
+		len(framed.Spec.PartitionBy) != 1 || len(framed.Spec.OrderBy) != 1 ||
+		framed.Spec.Frame.Unit != WindowFrameRange ||
+		framed.Spec.Frame.Start.Offset.Text != "2.5" ||
+		framed.Spec.Frame.Exclusion != WindowExcludeGroup {
+		t.Fatalf("direct named RANGE = %+v", framed)
+	}
+	copied := statement.Columns[1].Window
+	if copied == nil || copied.DirectName || copied.Spec.Name != "ordered" ||
+		copied.Spec.Frame.Start.Offset.Kind != OperandParam ||
+		copied.Spec.Frame.Start.Offset.Ordinal != 0 ||
+		copied.Spec.Frame.End.Offset.Text != "1.2500" ||
+		copied.Spec.Frame.Exclusion != WindowExcludeTies {
+		t.Fatalf("copied named RANGE = %+v", copied)
+	}
+	if ordered := &statement.Windows[1]; ordered.Spec.Name != "partitioned" ||
+		!ordered.Spec.PartitionInherited || ordered.Spec.OrderInherited ||
+		len(ordered.Spec.PartitionBy) != 1 || len(ordered.Spec.OrderBy) != 1 {
+		t.Fatalf("ordered definition = %+v", ordered)
+	}
+	dump := dumpStmt(statement)
+	for _, fragment := range []string{
+		"range n2.5-preceding to current-row exclude group",
+		"range ?0-preceding to n1.2500-following exclude ties",
+		"window partitioned=(partition 0:tenant)",
+		"ordered=(name=partitioned partition 0:tenant order 0:score:desc:nulls-last)",
+	} {
+		if !strings.Contains(dump, fragment) {
+			t.Fatalf("dump %q lacks %q", dump, fragment)
+		}
+	}
+}
+
+func TestWindowAllExclusionVariants(t *testing.T) {
+	for _, exclusion := range []string{
+		"CURRENT ROW", "GROUP", "TIES", "NO OTHERS",
+	} {
+		src := `SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE ` + exclusion + `) FROM t`
+		statement, err := Parse(src)
+		if err != nil {
+			t.Fatalf("EXCLUDE %s: %v", exclusion, err)
+		}
+		if !statement.Columns[0].Window.Spec.Frame.ExclusionExplicit {
+			t.Fatalf("EXCLUDE %s was not retained", exclusion)
+		}
+	}
+}
+
+func TestWindowExactRangeOffsetComparison(t *testing.T) {
+	for _, test := range []struct {
+		left, right string
+		want        int
+	}{
+		{"1", "1.0000", 0},
+		{"0.0001", "1e-4", 0},
+		{"9007199254740992", "9007199254740993", -1},
+		{"1e1000", "9e999", 1},
+		{"-0.000e100", "0", 0},
+	} {
+		got, known := compareNonNegativeSQLNumbers(test.left, test.right)
+		if !known || got != test.want {
+			t.Fatalf("compare(%s,%s) = %d/%t, want %d/true",
+				test.left, test.right, got, known, test.want)
+		}
+	}
+	valid := `SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN ` +
+		`9007199254740993 PRECEDING AND 9007199254740992 PRECEDING) FROM t`
+	if _, err := Parse(valid); err != nil {
+		t.Fatalf("exact adjacent valid frame: %v", err)
+	}
+	invalid := `SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN ` +
+		`9007199254740992 PRECEDING AND 9007199254740993 PRECEDING) FROM t`
+	if _, err := Parse(invalid); err == nil || !strings.Contains(err.Error(), "cannot precede") {
+		t.Fatalf("exact adjacent invalid frame = %v", err)
+	}
+	for _, src := range []string{
+		`SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN 0 FOLLOWING AND CURRENT ROW) FROM t`,
+		`SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN ? FOLLOWING AND CURRENT ROW) FROM t`,
+	} {
+		if _, err := Parse(src); err != nil {
+			t.Fatalf("zero-equivalent RANGE bound %q: %v", src, err)
+		}
+	}
+	invalid = `SELECT SUM(v) OVER (` +
+		`ORDER BY k RANGE BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t`
+	if _, err := Parse(invalid); err == nil || !strings.Contains(err.Error(), "cannot precede") {
+		t.Fatalf("positive FOLLOWING to CURRENT frame = %v", err)
+	}
+}
+
+func TestNamedWindowScopeAndNestedRebase(t *testing.T) {
+	src := `SELECT d.inner_rn, ROW_NUMBER() OVER w AS outer_rn
+		FROM (
+			SELECT ROW_NUMBER() OVER w AS inner_rn
+			FROM "é"
+			WINDOW w AS (ORDER BY inner_key RANGE BETWEEN ? PRECEDING AND CURRENT ROW)
+		) AS d
+		WINDOW w AS (ORDER BY outer_key)`
+	statement, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statement.Windows) != 1 || len(statement.From) != 1 ||
+		statement.From[0].Query == nil || len(statement.From[0].Query.Windows) != 1 {
+		t.Fatalf("named-window scopes = outer %d, inner %+v",
+			len(statement.Windows), statement.From[0].Query)
+	}
+	inner := statement.From[0].Query
+	if got := inner.Windows[0].Spec.OrderBy[0].Path.Pos; got != strings.Index(src, "inner_key") {
+		t.Fatalf("nested inherited path position = %d, want %d", got, strings.Index(src, "inner_key"))
+	}
+	if inner.Columns[0].Window.Spec.OrderBy[0].Path !=
+		inner.Windows[0].Spec.OrderBy[0].Path {
+		t.Fatal("direct named window did not retain shared resolved path identity")
+	}
+	if inner.Columns[0].Window.Spec.Frame.Start.Offset.Pos != strings.Index(src, "?") ||
+		inner.Windows[0].Spec.Frame.Start.Offset.Pos != strings.Index(src, "?") {
+		t.Fatalf("nested frame positions = expression %d, definition %d, want %d",
+			inner.Columns[0].Window.Spec.Frame.Start.Offset.Pos,
+			inner.Windows[0].Spec.Frame.Start.Offset.Pos, strings.Index(src, "?"))
+	}
+	if got := statement.Windows[0].Spec.OrderBy[0].Path.Spec(); got != "outer_key" {
+		t.Fatalf("outer scope resolved %q, want outer_key", got)
+	}
+}
+
+func TestNamedWindowDuplicateIsPositioned(t *testing.T) {
+	src := `SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY a), w AS (ORDER BY b)`
+	_, err := Parse(src)
+	if err == nil {
+		t.Fatal("duplicate named window succeeded")
+	}
+	var positioned *ParseError
+	if !errors.As(err, &positioned) {
+		t.Fatalf("duplicate error = %T, want ParseError", err)
+	}
+	want := strings.LastIndex(src, "w AS")
+	if positioned.Pos != want || !strings.Contains(err.Error(), "declared twice") {
+		t.Fatalf("duplicate error = %v at %d, want %d", err, positioned.Pos, want)
+	}
+}
+
 func TestWindowPositionedRefusals(t *testing.T) {
 	tests := []struct {
 		src     string
@@ -132,9 +291,13 @@ func TestWindowPositionedRefusals(t *testing.T) {
 		message string
 		feature bool
 	}{
-		{`SELECT ROW_NUMBER() OVER named FROM t`, "named", "named windows", true},
-		{`SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t`, "RANGE", "RANGE window frames", true},
-		{`SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t`, "EXCLUDE", "exclusion", true},
+		{`SELECT ROW_NUMBER() OVER named FROM t`, "named", "not defined", false},
+		{`SELECT SUM(v) OVER (ORDER BY a, b RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t`, "1.5", "exactly one ORDER BY", false},
+		{`SELECT SUM(v) OVER (ORDER BY a RANGE BETWEEN -1.5 PRECEDING AND CURRENT ROW) FROM t`, "-1.5", "must not be negative", false},
+		{`SELECT SUM(v) OVER (base PARTITION BY p) FROM t WINDOW base AS (ORDER BY k)`, "PARTITION", "cannot override PARTITION", false},
+		{`SELECT SUM(v) OVER (base ORDER BY p) FROM t WINDOW base AS (ORDER BY k)`, "ORDER BY p", "cannot override ORDER BY", false},
+		{`SELECT SUM(v) OVER (framed) FROM t WINDOW framed AS (ORDER BY k ROWS CURRENT ROW)`, "framed", "frame clause", false},
+		{`SELECT SUM(v) OVER later FROM t WINDOW earlier AS (later ORDER BY k), later AS (ORDER BY k)`, "later ORDER", "not defined", false},
 		{`SELECT SUM(v) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t`, "GROUPS", "requires ORDER BY", false},
 		{`SELECT NTILE(0) OVER (ORDER BY k) FROM t`, "0", "greater than zero", false},
 		{`SELECT NTH_VALUE(v, 0) OVER (ORDER BY k) FROM t`, "0", "greater than zero", false},
@@ -175,7 +338,7 @@ func TestWindowNestedUTF8PositionRebase(t *testing.T) {
 		at      string
 		feature bool
 	}{
-		{`SELECT d.rn FROM (SELECT ROW_NUMBER() OVER named FROM "é") AS d`, "named", true},
+		{`SELECT d.rn FROM (SELECT ROW_NUMBER() OVER named FROM "é") AS d`, "named", false},
 		{`SELECT d.tile FROM (SELECT NTILE(0) OVER (ORDER BY score) AS tile FROM "é") AS d`, "0", false},
 	} {
 		_, err := Parse(test.src)
@@ -197,7 +360,7 @@ func TestWindowNestedUTF8PositionRebase(t *testing.T) {
 }
 
 func TestWindowParserWarmedAllocations(t *testing.T) {
-	src := `SELECT ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), SUM(score) OVER (PARTITION BY team ORDER BY score DESC NULLS LAST ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`
+	src := `SELECT ROW_NUMBER() OVER ordered, SUM(score) OVER (ordered RANGE BETWEEN 2.5 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM scores WINDOW partitioned AS (PARTITION BY team), ordered AS (partitioned ORDER BY score DESC NULLS LAST)`
 	var parser Parser
 	var statement SelectStmt
 	if err := parser.Parse(&statement, src); err != nil {
@@ -214,7 +377,7 @@ func TestWindowParserWarmedAllocations(t *testing.T) {
 }
 
 func BenchmarkWindowParse(b *testing.B) {
-	src := `SELECT ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), SUM(score) OVER (PARTITION BY team ORDER BY score DESC NULLS LAST ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`
+	src := `SELECT ROW_NUMBER() OVER ordered, SUM(score) OVER (ordered RANGE BETWEEN 2.5 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM scores WINDOW partitioned AS (PARTITION BY team), ordered AS (partitioned ORDER BY score DESC NULLS LAST)`
 	var parser Parser
 	var statement SelectStmt
 	if err := parser.Parse(&statement, src); err != nil {

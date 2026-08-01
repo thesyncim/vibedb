@@ -127,6 +127,7 @@ const (
 	kwNot
 	kwNthValue
 	kwNtile
+	kwNo
 	kwNull
 	kwNulls
 	kwNothing
@@ -134,6 +135,7 @@ const (
 	kwOn
 	kwOr
 	kwOrder
+	kwOthers
 	kwOuter
 	kwOver
 	kwPartition
@@ -154,6 +156,7 @@ const (
 	kwSimilar
 	kwSum
 	kwTable
+	kwTies
 	kwTruncate
 	kwTrue
 	kwUnion
@@ -330,6 +333,8 @@ func keywordOf(s string) keyword {
 		return kwNthValue
 	case "NTILE":
 		return kwNtile
+	case "NO":
+		return kwNo
 	case "NULL":
 		return kwNull
 	case "NULLS":
@@ -344,6 +349,8 @@ func keywordOf(s string) keyword {
 		return kwOr
 	case "ORDER":
 		return kwOrder
+	case "OTHERS":
+		return kwOthers
 	case "OUTER":
 		return kwOuter
 	case "OVER":
@@ -384,6 +391,8 @@ func keywordOf(s string) keyword {
 		return kwSum
 	case "TABLE":
 		return kwTable
+	case "TIES":
+		return kwTies
 	case "TRUNCATE":
 		return kwTruncate
 	case "TRUE":

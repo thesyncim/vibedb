@@ -133,6 +133,109 @@ func TestDatabaseSQLWindowPeerDefaultsExactDecimalsAndSchema(t *testing.T) {
 	}
 }
 
+func TestDatabaseSQLWindowNamedRangeExclusionAndBindRecovery(t *testing.T) {
+	db := openTestDB(t)
+	seedWindowDriverTable(t, db)
+	prepared, err := db.Prepare(`
+		SELECT id,
+			SUM(value) OVER (
+				ordered RANGE BETWEEN ? PRECEDING AND ? FOLLOWING EXCLUDE TIES
+			) AS ranged
+		FROM events
+		WINDOW partitioned AS (PARTITION BY team),
+		       ordered AS (partitioned ORDER BY score)
+		ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+
+	rows, err := prepared.Query(query.Number("5e-1"), query.Number("0.5000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		var id string
+		var ranged []byte
+		if err := rows.Scan(&id, &ranged); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		got = append(got, id+":"+string(ranged))
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a:0.1", "b:0.2", "c:1", "d:7"}; !slices.Equal(got, want) {
+		t.Fatalf("named RANGE EXCLUDE TIES = %v, want %v", got, want)
+	}
+
+	for _, args := range [][]any{
+		{"0.5", query.Number("0.5")},
+		{query.Number("-0.01"), query.Number("0.5")},
+		{nil, query.Number("0.5")},
+	} {
+		failed, err := prepared.Query(args...)
+		if failed != nil {
+			_ = failed.Close()
+		}
+		if !errors.Is(err, query.ErrWindowArgument) {
+			t.Fatalf("invalid RANGE bind %v = %v, want ErrWindowArgument", args, err)
+		}
+	}
+	var id string
+	var ranged []byte
+	if err := prepared.QueryRow(query.Number("0.5"), query.Number("0.5")).Scan(
+		&id, &ranged,
+	); err != nil || id != "a" || string(ranged) != "0.1" {
+		t.Fatalf("RANGE recovery row = %q/%q, %v", id, ranged, err)
+	}
+	if _, err := db.Exec(`INSERT INTO events VALUES ` +
+		`('{"id":"m","team":"z","value":200}'),` +
+		`('{"id":"n","team":"z","score":null,"value":100}')`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.Query(`
+		SELECT id, COUNT(*) OVER ranged AS peer_count,
+			SUM(value) OVER ranged AS peer_sum
+		FROM events WHERE team = 'z'
+		WINDOW ranged AS (PARTITION BY team ORDER BY score NULLS FIRST
+			RANGE BETWEEN 0.5 PRECEDING AND 1 FOLLOWING)
+		ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peers := 0
+	for rows.Next() {
+		var peerCount int64
+		var peerSum []byte
+		if err := rows.Scan(&id, &peerCount, &peerSum); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if peerCount != 2 || string(peerSum) != "300" {
+			rows.Close()
+			t.Fatalf("NULL/missing RANGE peer = %q/%d/%q", id, peerCount, peerSum)
+		}
+		peers++
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if peers != 2 {
+		t.Fatalf("NULL/missing RANGE rows = %d, want 2", peers)
+	}
+	failed, err := db.Query(`SELECT SUM(value) OVER (` +
+		`ORDER BY team RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events`)
+	if failed != nil {
+		_ = failed.Close()
+	}
+	if !errors.Is(err, query.ErrWindowArgument) {
+		t.Fatalf("nonnumeric RANGE ORDER BY = %v, want ErrWindowArgument", err)
+	}
+}
+
 func TestDatabaseSQLWindowPreparedTransactionReuse(t *testing.T) {
 	db := openTestDB(t)
 	db.SetMaxOpenConns(2)
@@ -192,7 +295,8 @@ func TestDriverWindowBudgetCancellationNoPartialRowsAndRecovery(t *testing.T) {
 		}
 	}
 	prepared := runtimePrepare(t, session,
-		`SELECT id, ROW_NUMBER() OVER (ORDER BY score) AS position FROM events`)
+		`SELECT id, SUM(score) OVER ranged AS position FROM events `+
+			`WINDOW ranged AS (ORDER BY score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES)`)
 	if err := session.SetIntermediateLimit(1); err != nil {
 		t.Fatal(err)
 	}

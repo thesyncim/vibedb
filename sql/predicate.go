@@ -498,6 +498,10 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 			shiftSelectPositions(s.With.CTEs[i].Query, delta)
 		}
 	}
+	for i := range s.Windows {
+		s.Windows[i].Pos += delta
+		shiftWindowSpecPositions(&s.Windows[i].Spec, delta)
+	}
 	for i := range s.Columns {
 		s.Columns[i].Pos += delta
 		shiftPathPosition(s.Columns[i].Path, delta)
@@ -561,25 +565,48 @@ func shiftWindowPositions(w *WindowExpr, delta int) {
 	if w.HasDefault {
 		w.Default.Pos += delta
 	}
-	w.Spec.Pos += delta
-	for _, path := range w.Spec.PartitionBy {
-		shiftPathPosition(path, delta)
+	shiftWindowSpecPositions(&w.Spec, delta)
+}
+
+func shiftWindowSpecPositions(spec *WindowSpec, delta int) {
+	if spec == nil {
+		return
 	}
-	for i := range w.Spec.OrderBy {
-		w.Spec.OrderBy[i].Pos += delta
-		shiftPathPosition(w.Spec.OrderBy[i].Path, delta)
+	spec.Pos += delta
+	if spec.Name != "" {
+		spec.NamePos += delta
 	}
-	if w.Spec.Frame.Explicit {
-		w.Spec.Frame.Pos += delta
-		w.Spec.Frame.Start.Pos += delta
-		if w.Spec.Frame.Start.Kind == WindowPreceding ||
-			w.Spec.Frame.Start.Kind == WindowFollowing {
-			w.Spec.Frame.Start.Offset.Pos += delta
+	if len(spec.PartitionBy) != 0 {
+		spec.PartitionPos += delta
+	}
+	if len(spec.OrderBy) != 0 {
+		spec.OrderPos += delta
+	}
+	if !spec.PartitionInherited {
+		for _, path := range spec.PartitionBy {
+			shiftPathPosition(path, delta)
 		}
-		w.Spec.Frame.End.Pos += delta
-		if w.Spec.Frame.End.Kind == WindowPreceding ||
-			w.Spec.Frame.End.Kind == WindowFollowing {
-			w.Spec.Frame.End.Offset.Pos += delta
+	}
+	if !spec.OrderInherited {
+		for i := range spec.OrderBy {
+			spec.OrderBy[i].Pos += delta
+			shiftPathPosition(spec.OrderBy[i].Path, delta)
+		}
+	}
+	if spec.Frame.Explicit {
+		spec.Frame.Pos += delta
+		if spec.Frame.ExclusionExplicit {
+			spec.Frame.ExclusionPos += delta
+		}
+		spec.Frame.Start.Pos += delta
+		if spec.Frame.Start.Kind == WindowPreceding ||
+			spec.Frame.Start.Kind == WindowFollowing {
+			spec.Frame.Start.Offset.Pos += delta
+		}
+		spec.Frame.End.Pos += delta
+		if spec.Frame.End.Kind == WindowPreceding ||
+			spec.Frame.End.Kind == WindowFollowing {
+			spec.Frame.End.Offset.Pos += delta
 		}
 	}
 }

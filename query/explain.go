@@ -94,6 +94,7 @@ type explainWindowOrder struct {
 
 type explainWindowFunction struct {
 	Name     string              `json:"name"`
+	Window   string              `json:"window,omitempty"`
 	Argument string              `json:"argument,omitempty"`
 	Offset   *int                `json:"offset,omitempty"`
 	Buckets  *int                `json:"buckets,omitempty"`
@@ -103,10 +104,11 @@ type explainWindowFunction struct {
 }
 
 type explainWindowFrame struct {
-	Mode  string `json:"mode"`
-	Unit  string `json:"unit"`
-	Start string `json:"start"`
-	End   string `json:"end"`
+	Mode      string `json:"mode"`
+	Unit      string `json:"unit"`
+	Start     string `json:"start"`
+	End       string `json:"end"`
+	Exclusion string `json:"exclusion"`
 }
 
 type explainCTE struct {
@@ -462,7 +464,7 @@ func (w *statementWindow) explain(analyze bool) []explainWindow {
 		for at, expr := range stage.exprs {
 			physical := &stage.plan.functions[at]
 			function := explainWindowFunction{
-				Name: strings.ToLower(expr.Kind.String()),
+				Name: strings.ToLower(expr.Kind.String()), Window: expr.Spec.Name,
 			}
 			if expr.Argument != nil {
 				function.Argument = w.input.spec(expr.Argument)
@@ -491,6 +493,9 @@ func (w *statementWindow) explain(analyze bool) []explainWindow {
 					Mode: mode, Unit: explainWindowFrameUnit(physical.frame.unit),
 					Start: explainWindowFrameBound(physical.frame.start),
 					End:   explainWindowFrameBound(physical.frame.end),
+					Exclusion: explainWindowFrameExclusion(
+						physical.frame.exclusion,
+					),
 				}
 			}
 			explained.Functions = append(explained.Functions, function)
@@ -510,6 +515,8 @@ func explainWindowFrameUnit(unit windowFrameUnit) string {
 		return "rows"
 	case windowFrameGroups:
 		return "groups"
+	case windowFrameRange:
+		return "range"
 	default:
 		return "unknown"
 	}
@@ -520,13 +527,34 @@ func explainWindowFrameBound(bound windowFrameBound) string {
 	case windowUnboundedPreceding:
 		return "unbounded preceding"
 	case windowPreceding:
+		if bound.rangeOffset.kind == kindNumber {
+			return byteview.String(bound.rangeOffset.num) + " preceding"
+		}
 		return fmt.Sprintf("%d preceding", bound.offset)
 	case windowCurrentRow:
 		return "current row"
 	case windowFollowing:
+		if bound.rangeOffset.kind == kindNumber {
+			return byteview.String(bound.rangeOffset.num) + " following"
+		}
 		return fmt.Sprintf("%d following", bound.offset)
 	case windowUnboundedFollowing:
 		return "unbounded following"
+	default:
+		return "unknown"
+	}
+}
+
+func explainWindowFrameExclusion(exclusion windowFrameExclusion) string {
+	switch exclusion {
+	case windowExcludeNoOthers:
+		return "no others"
+	case windowExcludeCurrentRow:
+		return "current row"
+	case windowExcludeGroup:
+		return "group"
+	case windowExcludeTies:
+		return "ties"
 	default:
 		return "unknown"
 	}

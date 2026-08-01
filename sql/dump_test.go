@@ -77,6 +77,16 @@ func dumpStmt(s *SelectStmt) string {
 		b.WriteString(" having ")
 		dumpExpr(&b, s.Having)
 	}
+	if len(s.Windows) != 0 {
+		b.WriteString(" window")
+		for i := range s.Windows {
+			b.WriteByte(' ')
+			b.WriteString(s.Windows[i].Name)
+			b.WriteString("=(")
+			dumpWindowSpec(&b, &s.Windows[i].Spec)
+			b.WriteByte(')')
+		}
+	}
 	if len(s.OrderBy) > 0 {
 		b.WriteString(" order")
 		for i := range s.OrderBy {
@@ -158,20 +168,35 @@ func dumpWindow(b *strings.Builder, w *WindowExpr) {
 		dumpOperand(b, w.Nth)
 	}
 	b.WriteString(") over(")
-	if len(w.Spec.PartitionBy) != 0 {
+	dumpWindowSpec(b, &w.Spec)
+	b.WriteByte(')')
+}
+
+func dumpWindowSpec(b *strings.Builder, spec *WindowSpec) {
+	wrote := false
+	if spec.Name != "" {
+		b.WriteString("name=")
+		b.WriteString(spec.Name)
+		wrote = true
+	}
+	if len(spec.PartitionBy) != 0 {
+		if wrote {
+			b.WriteByte(' ')
+		}
 		b.WriteString("partition")
-		for _, path := range w.Spec.PartitionBy {
+		for _, path := range spec.PartitionBy {
 			b.WriteByte(' ')
 			dumpPath(b, path)
 		}
+		wrote = true
 	}
-	if len(w.Spec.OrderBy) != 0 {
-		if len(w.Spec.PartitionBy) != 0 {
+	if len(spec.OrderBy) != 0 {
+		if wrote {
 			b.WriteByte(' ')
 		}
 		b.WriteString("order")
-		for i := range w.Spec.OrderBy {
-			term := &w.Spec.OrderBy[i]
+		for i := range spec.OrderBy {
+			term := &spec.OrderBy[i]
 			b.WriteByte(' ')
 			dumpPath(b, term.Path)
 			if term.Desc {
@@ -186,21 +211,37 @@ func dumpWindow(b *strings.Builder, w *WindowExpr) {
 				b.WriteString(":nulls-last")
 			}
 		}
+		wrote = true
 	}
-	if w.Spec.Frame.Explicit {
-		if len(w.Spec.PartitionBy) != 0 || len(w.Spec.OrderBy) != 0 {
+	if spec.Frame.Explicit {
+		if wrote {
 			b.WriteByte(' ')
 		}
-		if w.Spec.Frame.Unit == WindowFrameGroups {
+		switch spec.Frame.Unit {
+		case WindowFrameGroups:
 			b.WriteString("groups ")
-		} else {
+		case WindowFrameRange:
+			b.WriteString("range ")
+		default:
 			b.WriteString("rows ")
 		}
-		dumpWindowBound(b, w.Spec.Frame.Start)
+		dumpWindowBound(b, spec.Frame.Start)
 		b.WriteString(" to ")
-		dumpWindowBound(b, w.Spec.Frame.End)
+		dumpWindowBound(b, spec.Frame.End)
+		if spec.Frame.ExclusionExplicit {
+			b.WriteString(" exclude ")
+			switch spec.Frame.Exclusion {
+			case WindowExcludeCurrentRow:
+				b.WriteString("current-row")
+			case WindowExcludeGroup:
+				b.WriteString("group")
+			case WindowExcludeTies:
+				b.WriteString("ties")
+			default:
+				b.WriteString("no-others")
+			}
+		}
 	}
-	b.WriteByte(')')
 }
 
 func dumpWindowBound(b *strings.Builder, bound WindowFrameBound) {

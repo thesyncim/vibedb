@@ -45,6 +45,10 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT LAG(value, ?, NULL) OVER (ORDER BY seq NULLS FIRST) FROM events`,
 		`SELECT NTILE(?) OVER (ORDER BY score), PERCENT_RANK() OVER (ORDER BY score), ` +
 			`NTH_VALUE(value, 2) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events`,
+		`SELECT SUM(value) OVER framed, SUM(value) OVER (` +
+			`ordered RANGE BETWEEN ? PRECEDING AND 1.2500 FOLLOWING EXCLUDE TIES) FROM events ` +
+			`WINDOW partitioned AS (PARTITION BY team), ordered AS (partitioned ORDER BY score), ` +
+			`framed AS (ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP)`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -145,6 +149,27 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			seen += cte.Query.Params
 		}
 	}
+	for i := range s.Windows {
+		window := &s.Windows[i]
+		if window.Name == "" {
+			t.Fatalf("Windows[%d] has no name", i)
+		}
+		for prior := 0; prior < i; prior++ {
+			if s.Windows[prior].Name == window.Name {
+				t.Fatalf("Windows[%d] duplicates name %q", i, window.Name)
+			}
+		}
+		if window.Spec.Name != "" {
+			found := false
+			for prior := 0; prior < i; prior++ {
+				found = found || s.Windows[prior].Name == window.Spec.Name
+			}
+			if !found {
+				t.Fatalf("Windows[%d] inherits unknown/later window %q", i, window.Spec.Name)
+			}
+		}
+		seen += checkWindowSpecInvariants(t, s, &window.Spec, true)
+	}
 	for i := range s.From {
 		ref := &s.From[i]
 		if ref.Alias == "" {
@@ -189,12 +214,6 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 				t.Fatalf("Columns[%d] mixes a window with an ordinary expression", i)
 			}
 			seen += checkWindowInvariants(t, s, window)
-			for _, path := range window.Spec.PartitionBy {
-				checkPath(t, s, path)
-			}
-			for j := range window.Spec.OrderBy {
-				checkPath(t, s, window.Spec.OrderBy[j].Path)
-			}
 			continue
 		}
 		if s.Columns[i].Path == nil {
@@ -263,11 +282,35 @@ func checkWindowInvariants(t *testing.T, s *SelectStmt, w *WindowExpr) int {
 	if w.HasDefault && !w.DefaultNull && w.Default.Kind == OperandParam {
 		seen++
 	}
-	if w.Spec.Frame.Explicit {
-		seen += checkWindowFrameBound(t, w.Spec.Frame.Start)
-		seen += checkWindowFrameBound(t, w.Spec.Frame.End)
-	}
+	seen += checkWindowSpecInvariants(t, s, &w.Spec, !w.Spec.FrameInherited)
 	return seen
+}
+
+func checkWindowSpecInvariants(
+	t *testing.T,
+	s *SelectStmt,
+	spec *WindowSpec,
+	countFrame bool,
+) int {
+	t.Helper()
+	for _, path := range spec.PartitionBy {
+		checkPath(t, s, path)
+	}
+	for i := range spec.OrderBy {
+		checkPath(t, s, spec.OrderBy[i].Path)
+	}
+	if !spec.Frame.Explicit {
+		return 0
+	}
+	if spec.Frame.Unit > WindowFrameRange ||
+		spec.Frame.Exclusion > WindowExcludeTies {
+		t.Fatalf("invalid window frame = %+v", spec.Frame)
+	}
+	if !countFrame {
+		return 0
+	}
+	return checkWindowFrameBound(t, spec.Frame.Start) +
+		checkWindowFrameBound(t, spec.Frame.End)
 }
 
 func checkWindowCount(t *testing.T, op Operand, clause string) int {

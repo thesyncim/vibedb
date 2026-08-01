@@ -401,12 +401,14 @@ type nestedParsers struct {
 }
 
 type windowParserState struct {
-	exprs      chunkArena[WindowExpr]
-	pathRuns   chunkArena[*PathExpr]
-	orderRuns  chunkArena[WindowOrderTerm]
-	partitions []*PathExpr
-	orders     []WindowOrderTerm
-	sized      bool
+	exprs          chunkArena[WindowExpr]
+	pathRuns       chunkArena[*PathExpr]
+	orderRuns      chunkArena[WindowOrderTerm]
+	definitionRuns chunkArena[NamedWindow]
+	partitions     []*PathExpr
+	orders         []WindowOrderTerm
+	definitions    []NamedWindow
+	sized          bool
 }
 
 func (w *windowParserState) reset() {
@@ -414,13 +416,16 @@ func (w *windowParserState) reset() {
 		w.exprs.first = 4
 		w.pathRuns.first = 8
 		w.orderRuns.first = 8
+		w.definitionRuns.first = 4
 		w.sized = true
 	}
 	w.exprs.rewind()
 	w.pathRuns.rewind()
 	w.orderRuns.rewind()
+	w.definitionRuns.rewind()
 	w.partitions = w.partitions[:0]
 	w.orders = w.orders[:0]
+	w.definitions = w.definitions[:0]
 }
 
 func (p *Parser) windowState() *windowParserState {
@@ -635,6 +640,9 @@ func (p *Parser) parseStatement() error {
 		}
 		p.out.Having = having
 	}
+	if err := p.parseWindowClause(); err != nil {
+		return err
+	}
 	if err := p.parseOrderBy(); err != nil {
 		return err
 	}
@@ -681,11 +689,6 @@ func (p *Parser) expectEnd() error {
 	switch {
 	case p.atKeyword(kwUnion), p.atKeyword(kwIntersect), p.atKeyword(kwExcept):
 		return p.errHere("set operations (UNION, INTERSECT, EXCEPT) are not supported")
-	case p.atKeyword(kwWindow):
-		return newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"named WINDOW clauses are not supported; repeat the anonymous OVER (...) specification",
-		)
 	}
 	if p.tok.kind == tokSemicolon {
 		p.advance()
@@ -1017,18 +1020,123 @@ func (p *Parser) parseWindowSpec(w *WindowExpr) error {
 	w.Spec.Pos = p.tok.pos
 	p.advance() // OVER
 	if p.tok.kind != tokLParen {
-		if p.tok.kind == tokIdent || p.tok.kind == tokQuotedIdent {
-			return newFeatureNotSupportedError(
-				p.lx.src, p.tok.pos,
-				"named windows are not supported; write the specification as OVER (...) instead",
-			)
+		name, pos, err := p.parseWindowName("after OVER")
+		if err != nil {
+			return err
 		}
-		return p.errHere("expected '(' after OVER")
+		w.Spec.Name, w.Spec.NamePos = name, pos
+		w.DirectName = true
+		return nil
 	}
 	p.advance()
+	return p.parseWindowDefinition(&w.Spec)
+}
+
+// parseWindowClause reads the statement-local named-window catalog and then
+// resolves every SELECT-list reference. Window calls precede this clause in
+// SQL source order, so deferring the lookup is required; definitions themselves
+// resolve eagerly and may inherit only from an earlier definition.
+func (p *Parser) parseWindowClause() error {
+	if !p.atKeyword(kwWindow) && p.window == nil {
+		return nil
+	}
+	state := p.windowState()
+	if p.acceptKeyword(kwWindow) {
+		for {
+			name, pos, err := p.parseWindowName("after WINDOW")
+			if err != nil {
+				return err
+			}
+			for i := range state.definitions {
+				if state.definitions[i].Name == name {
+					return p.errfAt(pos,
+						"window %q is declared twice; its first declaration is at byte %d",
+						name, state.definitions[i].Pos,
+					)
+				}
+			}
+			if err := p.expectKeyword(kwAs, "AS after a window name"); err != nil {
+				return err
+			}
+			if p.tok.kind != tokLParen {
+				return p.errHere("expected '(' after AS in a WINDOW definition")
+			}
+			spec := WindowSpec{Pos: p.tok.pos}
+			p.advance()
+			if err := p.parseWindowDefinition(&spec); err != nil {
+				return err
+			}
+			if err := p.resolveWindowSpec(&spec, false, state.definitions); err != nil {
+				return err
+			}
+			state.definitions = append(state.definitions, NamedWindow{
+				Name: name, Spec: spec, Pos: pos,
+			})
+			if len(state.definitions) > maxClauseItems {
+				return p.errfAt(pos, "WINDOW may hold at most %d definitions", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		definitions := state.definitionRuns.allocDirty(len(state.definitions))
+		copy(definitions, state.definitions)
+		p.out.Windows = definitions
+	}
+
+	for i := range p.out.Columns {
+		window := p.out.Columns[i].Window
+		if window == nil {
+			continue
+		}
+		if err := p.resolveWindowSpec(
+			&window.Spec, window.DirectName, state.definitions,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *Parser) parseWindowName(after string) (string, int, error) {
+	pos := p.tok.pos
+	switch p.tok.kind {
+	case tokIdent:
+		if reserved(p.tok.kw) {
+			return "", pos, p.errfHere(
+				"expected a window name %s, but found the reserved word %s; quote it to use it as a name",
+				after, p.tok.text,
+			)
+		}
+		fallthrough
+	case tokQuotedIdent:
+		if p.tok.text == "" {
+			return "", pos, p.errHere("a window name may not be empty")
+		}
+		name := p.internToken(p.tok)
+		p.advance()
+		return name, pos, nil
+	default:
+		return "", pos, p.errfHere("expected a window name %s", after)
+	}
+}
+
+func (p *Parser) parseWindowDefinition(spec *WindowSpec) error {
+	if p.tok.kind == tokQuotedIdent ||
+		p.tok.kind == tokIdent && !reserved(p.tok.kw) {
+		name, pos, err := p.parseWindowName("at the start of the window specification")
+		if err != nil {
+			return err
+		}
+		spec.Name, spec.NamePos = name, pos
+	}
+
 	state := p.windowState()
 	partitionBase, orderBase := len(state.partitions), len(state.orders)
-	if p.acceptKeyword(kwPartition) {
+	if p.atKeyword(kwPartition) {
+		spec.PartitionPos = p.tok.pos
+		p.advance()
 		if err := p.expectKeyword(kwBy, "BY after PARTITION"); err != nil {
 			return err
 		}
@@ -1049,7 +1157,9 @@ func (p *Parser) parseWindowSpec(w *WindowExpr) error {
 			p.advance()
 		}
 	}
-	if p.acceptKeyword(kwOrder) {
+	if p.atKeyword(kwOrder) {
+		spec.OrderPos = p.tok.pos
+		p.advance()
 		if err := p.expectKeyword(kwBy, "BY after ORDER"); err != nil {
 			return err
 		}
@@ -1068,31 +1178,19 @@ func (p *Parser) parseWindowSpec(w *WindowExpr) error {
 			p.advance()
 		}
 	}
-	if p.atKeyword(kwRange) {
-		return newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"RANGE window frames are not supported; write ROWS or GROUPS explicitly",
-		)
-	}
-	if p.atKeyword(kwRows) || p.atKeyword(kwGroups) {
+	if p.atKeyword(kwRows) || p.atKeyword(kwGroups) || p.atKeyword(kwRange) {
 		unit := WindowFrameRows
-		if p.atKeyword(kwGroups) {
+		switch {
+		case p.atKeyword(kwGroups):
 			unit = WindowFrameGroups
+		case p.atKeyword(kwRange):
+			unit = WindowFrameRange
 		}
 		frame, err := p.parseWindowFrame(unit)
 		if err != nil {
 			return err
 		}
-		if unit == WindowFrameGroups && len(state.orders) == orderBase {
-			return p.errAt(frame.Pos, "a GROUPS window frame requires ORDER BY")
-		}
-		w.Spec.Frame = frame
-	}
-	if p.atKeyword(kwExclude) {
-		return newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"window frame exclusion is not supported",
-		)
+		spec.Frame = frame
 	}
 	if err := p.expect(tokRParen, "')' after the window specification"); err != nil {
 		return err
@@ -1101,17 +1199,97 @@ func (p *Parser) parseWindowSpec(w *WindowExpr) error {
 	if len(partitions) != 0 {
 		run := state.pathRuns.allocDirty(len(partitions))
 		copy(run, partitions)
-		w.Spec.PartitionBy = run
+		spec.PartitionBy = run
 	}
 	orders := state.orders[orderBase:]
 	if len(orders) != 0 {
 		run := state.orderRuns.allocDirty(len(orders))
 		copy(run, orders)
-		w.Spec.OrderBy = run
+		spec.OrderBy = run
 	}
 	state.partitions = state.partitions[:partitionBase]
 	state.orders = state.orders[:orderBase]
 	return nil
+}
+
+func (p *Parser) resolveWindowSpec(
+	spec *WindowSpec,
+	direct bool,
+	definitions []NamedWindow,
+) error {
+	if spec.Name == "" {
+		return p.validateWindowSpec(spec)
+	}
+	var base *WindowSpec
+	for i := len(definitions) - 1; i >= 0; i-- {
+		if definitions[i].Name == spec.Name {
+			base = &definitions[i].Spec
+			break
+		}
+	}
+	if base == nil {
+		return p.errfAt(spec.NamePos,
+			"window %q is not defined in this SELECT", spec.Name)
+	}
+	if direct {
+		spec.PartitionBy = base.PartitionBy
+		spec.PartitionPos = base.PartitionPos
+		spec.OrderBy = base.OrderBy
+		spec.OrderPos = base.OrderPos
+		spec.Frame = base.Frame
+		spec.PartitionInherited = len(base.PartitionBy) != 0
+		spec.OrderInherited = len(base.OrderBy) != 0
+		spec.FrameInherited = base.Frame.Explicit
+		return p.validateWindowSpec(spec)
+	}
+	if base.Frame.Explicit {
+		return p.errfAt(spec.NamePos,
+			"window %q has a frame clause and cannot be copied with OVER (...)", spec.Name)
+	}
+	if len(spec.PartitionBy) != 0 {
+		return p.errAt(spec.PartitionPos,
+			"an inherited window cannot override PARTITION BY")
+	}
+	if len(base.OrderBy) != 0 && len(spec.OrderBy) != 0 {
+		return p.errAt(spec.OrderPos,
+			"an inherited window cannot override ORDER BY")
+	}
+	if len(base.PartitionBy) != 0 {
+		spec.PartitionBy = base.PartitionBy
+		spec.PartitionPos = base.PartitionPos
+		spec.PartitionInherited = true
+	}
+	if len(spec.OrderBy) == 0 && len(base.OrderBy) != 0 {
+		spec.OrderBy = base.OrderBy
+		spec.OrderPos = base.OrderPos
+		spec.OrderInherited = true
+	}
+	return p.validateWindowSpec(spec)
+}
+
+func (p *Parser) validateWindowSpec(spec *WindowSpec) error {
+	if !spec.Frame.Explicit {
+		return nil
+	}
+	if spec.Frame.Unit == WindowFrameGroups && len(spec.OrderBy) == 0 {
+		return p.errAt(spec.Frame.Pos, "a GROUPS window frame requires ORDER BY")
+	}
+	if spec.Frame.Unit == WindowFrameRange && windowFrameHasRangeOffset(spec.Frame) &&
+		len(spec.OrderBy) != 1 {
+		pos := spec.Frame.Start.Pos
+		if spec.Frame.Start.Kind != WindowPreceding &&
+			spec.Frame.Start.Kind != WindowFollowing {
+			pos = spec.Frame.End.Pos
+		}
+		return p.errAt(pos,
+			"a RANGE frame with a PRECEDING or FOLLOWING offset requires exactly one ORDER BY key")
+	}
+	return nil
+}
+
+func windowFrameHasRangeOffset(frame WindowFrame) bool {
+	return frame.Start.Kind == WindowPreceding || frame.Start.Kind == WindowFollowing ||
+		frame.End.Kind == WindowPreceding || frame.End.Kind == WindowFollowing
 }
 
 func (p *Parser) parseWindowOrderTerm() (WindowOrderTerm, error) {
@@ -1148,13 +1326,10 @@ func (p *Parser) parseWindowOrderTerm() (WindowOrderTerm, error) {
 
 func (p *Parser) parseWindowFrame(unit WindowFrameUnit) (WindowFrame, error) {
 	frame := WindowFrame{Unit: unit, Pos: p.tok.pos, Explicit: true}
-	unitName := "ROWS"
-	if unit == WindowFrameGroups {
-		unitName = "GROUPS"
-	}
-	p.advance() // ROWS or GROUPS
+	unitName := windowFrameUnitName(unit)
+	p.advance() // ROWS, GROUPS, or RANGE
 	if p.acceptKeyword(kwBetween) {
-		start, err := p.parseWindowFrameBound()
+		start, err := p.parseWindowFrameBound(unit)
 		if err != nil {
 			return frame, err
 		}
@@ -1164,7 +1339,7 @@ func (p *Parser) parseWindowFrame(unit WindowFrameUnit) (WindowFrame, error) {
 		if err := p.expectKeyword(kwAnd, "AND between window frame bounds"); err != nil {
 			return frame, err
 		}
-		end, err := p.parseWindowFrameBound()
+		end, err := p.parseWindowFrameBound(unit)
 		if err != nil {
 			return frame, err
 		}
@@ -1172,9 +1347,12 @@ func (p *Parser) parseWindowFrame(unit WindowFrameUnit) (WindowFrame, error) {
 			return frame, p.errfAt(end.Pos, "a %s frame cannot end at UNBOUNDED PRECEDING", unitName)
 		}
 		frame.Start, frame.End = start, end
+		if err := p.parseWindowFrameExclusion(&frame); err != nil {
+			return frame, err
+		}
 		return frame, p.validateStaticWindowFrame(frame)
 	}
-	start, err := p.parseWindowFrameBound()
+	start, err := p.parseWindowFrameBound(unit)
 	if err != nil {
 		return frame, err
 	}
@@ -1183,10 +1361,26 @@ func (p *Parser) parseWindowFrame(unit WindowFrameUnit) (WindowFrame, error) {
 	}
 	frame.Start = start
 	frame.End = WindowFrameBound{Kind: WindowCurrentRow, Pos: start.Pos}
+	if err := p.parseWindowFrameExclusion(&frame); err != nil {
+		return frame, err
+	}
 	return frame, p.validateStaticWindowFrame(frame)
 }
 
-func (p *Parser) parseWindowFrameBound() (WindowFrameBound, error) {
+func windowFrameUnitName(unit WindowFrameUnit) string {
+	switch unit {
+	case WindowFrameRows:
+		return "ROWS"
+	case WindowFrameGroups:
+		return "GROUPS"
+	case WindowFrameRange:
+		return "RANGE"
+	default:
+		return "window"
+	}
+}
+
+func (p *Parser) parseWindowFrameBound(unit WindowFrameUnit) (WindowFrameBound, error) {
 	bound := WindowFrameBound{Pos: p.tok.pos}
 	switch {
 	case p.acceptKeyword(kwUnbounded):
@@ -1206,7 +1400,13 @@ func (p *Parser) parseWindowFrameBound() (WindowFrameBound, error) {
 		bound.Kind = WindowCurrentRow
 		return bound, nil
 	}
-	offset, err := p.parseWindowCount("window frame offset")
+	var offset Operand
+	var err error
+	if unit == WindowFrameRange {
+		offset, err = p.parseWindowRangeOffset()
+	} else {
+		offset, err = p.parseWindowCount("window frame offset")
+	}
 	if err != nil {
 		return bound, err
 	}
@@ -1220,6 +1420,47 @@ func (p *Parser) parseWindowFrameBound() (WindowFrameBound, error) {
 		return bound, p.errHere("expected PRECEDING or FOLLOWING after a window frame offset")
 	}
 	return bound, nil
+}
+
+func (p *Parser) parseWindowRangeOffset() (Operand, error) {
+	if p.tok.kind != tokNumber && p.tok.kind != tokParam {
+		return Operand{}, p.errHere(
+			"expected an exact non-negative number or '?' for a RANGE frame offset",
+		)
+	}
+	if p.tok.kind == tokNumber && p.tok.text[0] == '-' &&
+		!sqlNumberTextIsZero(p.tok.text) {
+		return Operand{}, p.errHere("a RANGE frame offset must not be negative")
+	}
+	return p.parseOperand()
+}
+
+func (p *Parser) parseWindowFrameExclusion(frame *WindowFrame) error {
+	if !p.atKeyword(kwExclude) {
+		return nil
+	}
+	frame.ExclusionPos = p.tok.pos
+	frame.ExclusionExplicit = true
+	p.advance()
+	switch {
+	case p.acceptKeyword(kwCurrent):
+		if err := p.expectKeyword(kwRow, "ROW after EXCLUDE CURRENT"); err != nil {
+			return err
+		}
+		frame.Exclusion = WindowExcludeCurrentRow
+	case p.acceptKeyword(kwGroup):
+		frame.Exclusion = WindowExcludeGroup
+	case p.acceptKeyword(kwTies):
+		frame.Exclusion = WindowExcludeTies
+	case p.acceptKeyword(kwNo):
+		if err := p.expectKeyword(kwOthers, "OTHERS after EXCLUDE NO"); err != nil {
+			return err
+		}
+		frame.Exclusion = WindowExcludeNoOthers
+	default:
+		return p.errHere("expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE")
+	}
+	return nil
 }
 
 func (p *Parser) parseWindowCount(clause string) (Operand, error) {
@@ -1260,16 +1501,43 @@ func (p *Parser) parseWindowDefault() (Operand, bool, error) {
 }
 
 func (p *Parser) validateStaticWindowFrame(frame WindowFrame) error {
-	unitName := "ROWS"
-	if frame.Unit == WindowFrameGroups {
-		unitName = "GROUPS"
-	}
-	if frame.Start.Kind > frame.End.Kind {
+	unitName := windowFrameUnitName(frame.Unit)
+	startKind, startMayBeCurrent := staticWindowBoundKind(frame.Start)
+	endKind, endMayBeCurrent := staticWindowBoundKind(frame.End)
+	if startKind > endKind {
+		// A parameterized PRECEDING/FOLLOWING offset can be zero, which SQL
+		// treats exactly as CURRENT ROW. Defer shape-dependent ordering to the
+		// physical validator rather than rejecting a valid zero bind at prepare.
+		minimumStart, maximumEnd := startKind, endKind
+		if startMayBeCurrent && WindowCurrentRow < minimumStart {
+			minimumStart = WindowCurrentRow
+		}
+		if endMayBeCurrent && WindowCurrentRow > maximumEnd {
+			maximumEnd = WindowCurrentRow
+		}
+		if minimumStart <= maximumEnd {
+			return nil
+		}
 		return p.errfAt(frame.End.Pos, "a %s frame end cannot precede its start", unitName)
 	}
-	if frame.Start.Kind != frame.End.Kind ||
-		(frame.Start.Kind != WindowPreceding && frame.Start.Kind != WindowFollowing) ||
+	if startKind != endKind ||
+		(startKind != WindowPreceding && startKind != WindowFollowing) ||
 		frame.Start.Offset.Kind != OperandNumber || frame.End.Offset.Kind != OperandNumber {
+		return nil
+	}
+	if frame.Unit == WindowFrameRange {
+		comparison, known := compareNonNegativeSQLNumbers(
+			frame.Start.Offset.Text, frame.End.Offset.Text,
+		)
+		if !known {
+			return nil
+		}
+		if frame.Start.Kind == WindowPreceding {
+			comparison = -comparison
+		}
+		if comparison > 0 {
+			return p.errfAt(frame.End.Pos, "a %s frame end cannot precede its start", unitName)
+		}
 		return nil
 	}
 	left, _ := strconv.ParseInt(frame.Start.Offset.Text, 10, 64)
@@ -1282,6 +1550,150 @@ func (p *Parser) validateStaticWindowFrame(frame WindowFrame) error {
 		return p.errfAt(frame.End.Pos, "a %s frame end cannot precede its start", unitName)
 	}
 	return nil
+}
+
+func staticWindowBoundKind(bound WindowFrameBound) (WindowFrameBoundKind, bool) {
+	if bound.Kind != WindowPreceding && bound.Kind != WindowFollowing {
+		return bound.Kind, false
+	}
+	if bound.Offset.Kind == OperandParam {
+		return bound.Kind, true
+	}
+	if bound.Offset.Kind == OperandNumber && sqlNumberTextIsZero(bound.Offset.Text) {
+		return WindowCurrentRow, false
+	}
+	return bound.Kind, false
+}
+
+func sqlNumberTextIsZero(text string) bool {
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case 'e', 'E':
+			return true
+		case '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			return false
+		}
+	}
+	return true
+}
+
+type sqlNumberView struct {
+	mantissa string
+	first    int
+	digits   int
+	weight   int64
+	zero     bool
+}
+
+// compareNonNegativeSQLNumbers compares two admitted exact SQL/JSON numeric
+// spellings without allocating. known is false only when an exponent is too
+// wide for the compact comparison metadata; the physical decimal comparator
+// remains authoritative for that cold extreme at bind time.
+func compareNonNegativeSQLNumbers(left, right string) (comparison int, known bool) {
+	a, ok := parseSQLNumberView(left)
+	if !ok {
+		return 0, false
+	}
+	b, ok := parseSQLNumberView(right)
+	if !ok {
+		return 0, false
+	}
+	if a.zero || b.zero {
+		switch {
+		case a.zero && b.zero:
+			return 0, true
+		case a.zero:
+			return -1, true
+		default:
+			return 1, true
+		}
+	}
+	if a.weight != b.weight {
+		if a.weight < b.weight {
+			return -1, true
+		}
+		return 1, true
+	}
+	leftAt, rightAt := a.first, b.first
+	for i, n := 0, max(a.digits, b.digits); i < n; i++ {
+		ld := nextSQLNumberDigit(a.mantissa, &leftAt)
+		rd := nextSQLNumberDigit(b.mantissa, &rightAt)
+		if ld < rd {
+			return -1, true
+		}
+		if ld > rd {
+			return 1, true
+		}
+	}
+	return 0, true
+}
+
+func parseSQLNumberView(text string) (sqlNumberView, bool) {
+	start := 0
+	if len(text) != 0 && text[0] == '-' {
+		if !sqlNumberTextIsZero(text) {
+			return sqlNumberView{}, false
+		}
+		start = 1
+	}
+	exponentAt := len(text)
+	for i := start; i < len(text); i++ {
+		if text[i] == 'e' || text[i] == 'E' {
+			exponentAt = i
+			break
+		}
+	}
+	exponent := int64(0)
+	if exponentAt != len(text) {
+		parsed, err := strconv.ParseInt(text[exponentAt+1:], 10, 64)
+		if err != nil {
+			return sqlNumberView{}, false
+		}
+		exponent = parsed
+	}
+	mantissa := text[start:exponentAt]
+	decimalDigits, logical, firstLogical, firstByte := 0, 0, -1, -1
+	seenDot := false
+	for i := 0; i < len(mantissa); i++ {
+		if mantissa[i] == '.' {
+			seenDot = true
+			continue
+		}
+		if !seenDot {
+			decimalDigits++
+		}
+		if firstLogical < 0 && mantissa[i] != '0' {
+			firstLogical, firstByte = logical, i
+		}
+		logical++
+	}
+	if firstLogical < 0 {
+		return sqlNumberView{zero: true}, true
+	}
+	delta := int64(decimalDigits - firstLogical - 1)
+	const maxInt64 = int64((1 << 63) - 1)
+	const minInt64 = -maxInt64 - 1
+	if delta > 0 && exponent > maxInt64-delta ||
+		delta < 0 && exponent < minInt64-delta {
+		return sqlNumberView{}, false
+	}
+	return sqlNumberView{
+		mantissa: mantissa,
+		first:    firstByte,
+		digits:   logical - firstLogical,
+		weight:   exponent + delta,
+	}, true
+}
+
+func nextSQLNumberDigit(mantissa string, at *int) byte {
+	for *at < len(mantissa) {
+		digit := mantissa[*at]
+		(*at)++
+		if digit != '.' {
+			return digit
+		}
+	}
+	return '0'
 }
 
 // parseAliasName reads an alias identifier, quoted or not. A keyword is
