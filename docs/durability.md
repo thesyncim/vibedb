@@ -97,9 +97,12 @@ barrier, root write, and final barrier path.
 - Before `Flush`: the durable file names the previous checkpoint. All later
   acknowledged mutations may disappear after process or machine failure.
 - An ordinary class-5 update/delete cut can complete `Flush` by appending the
-  entire consecutive generation interval as one recovery-journal batch and
-  syncing it once. Before that sync recovery ignores the tail; after it,
-  recovery replays the exact cut over the previous physical root.
+  entire consecutive generation interval as one format-v1 recovery-journal
+  batch and syncing it once. Eligible existing-key replacements carry only a
+  compact scalar patch plus the checksum of the complete expected result;
+  deletes and unqualified replacements retain full logical redo. Before that
+  sync recovery ignores the tail; after it, recovery replays the exact cut over
+  the previous physical root.
 - A structural mutation, incomplete delta interval, journal or overlay
   pressure, snapshot materialization, or `Close` takes the full physical path
   below and recycles the journal after the new root is durable.
@@ -144,6 +147,46 @@ selects the old root; a final barrier error yields `ErrCommitOutcomeUnknown`
 and reopen determines which root won; after success the new generation is
 visible and power-safe under the platform assumptions above.
 
+## Foreground physical reclamation
+
+A completed physical root may run one bounded online hole-punch pass after the
+root is durable and the recovery-journal base covers it. This is post-durability
+space reclamation, not another commit point: it never changes allocator
+metadata or apparent file length, and replay never depends on a successful
+deallocation. Journal-only buffered `Flush` boundaries do not run the pass.
+
+The physical-generation guard permits one pass for each newly authoritative
+root. The planner samples the coherent durable root, fallback root, and journal
+base under `snapshotGate`, and records exactly the authority it sampled only
+after a successful planning result. Repeated notification for one generation
+is therefore a no-op; a hard validation error before deallocation does not
+consume authority for a different generation.
+
+Candidate discovery is fixed at no more than 1,024 exact free identities and 64
+coalesced runs. Reusable, pending-retirement, and absorbed-retirement sources
+receive independent cursors and fair active-source shares; unused shares are
+redistributed for at most three rounds. The spend phase performs no more than
+six successful deallocation calls and no more than 20 MiB per physical
+generation. An oversized exact extent is chunked and resumed at later physical
+boundaries rather than making one boundary unbounded.
+
+The reader fence is held only while the generation floors are sampled and the
+bounded candidate values are copied. It and `snapshotGate` are released before
+validation and before every `F_PUNCHHOLE` or `fallocate(PUNCH_HOLE)` syscall;
+the writer lock continues to prevent allocation reuse. Linux and Darwin expose
+the platform operations. Other platforms, unsupported filesystem responses,
+or a syscall error disable further attempts for that open collection. `EINTR`
+is retried at most four times; other errors are counted once and are not retried
+at later boundaries. `HolePunchRanges`, `HolePunchBytes`,
+`HolePunchSkippedRanges`, `HolePunchUnsupported`, and `HolePunchErrors` report
+the outcome. Unsupported/error outcomes do not poison the writer or fail the
+already successful durability boundary.
+
+This online reclamation path requires neither a background compactor nor an
+offline maintenance cycle. A filesystem without hole-punch support still
+reuses the same logical free extents inside the store; only returning their
+physical blocks to the filesystem is unavailable without a rewrite.
+
 ## Persistence failures
 
 Any write or synchronization failure poisons the writer. A journal append or
@@ -170,6 +213,37 @@ newest valid root. The root records journal identity, and recovery pairs the
 files by identity, page geometry, and base-generation epoch, failing closed on
 a missing or mismatched sibling. A synchronous store whose root names no
 journal (created async-visible, reopened sync) acknowledges through the chain
-fence instead. See [the design][journal] for record and group-commit details.
+fence instead.
+
+The journal has two independently checksummed 512-byte headers and a record
+region sized once before its identity can be published. Later appends are
+positional writes into that fixed region and never extend the file. The
+ordinary buffered format-v1 delta lane currently uses a fully sized 2.5 MiB
+record region with a foreground policy reserve of up to 512 KiB for the next
+carried suffix, leaving a 2 MiB qualified current append window. Exact batch
+fit remains authoritative: a wider current or future suffix takes the bounded
+physical checkpoint fallback. Linux normally allocates the complete region
+with `fallocate`; systems without that primitive set its full size once with
+truncate. Per-mutation journals retain their separate option-derived bounded
+capacity.
+
+Journal format v0 admits legacy put/delete records and batches and remains
+writable as v0 after reopen. Format v1 is restricted to the ordinary buffered
+delta lane and additionally admits compact scalar patches inside batches. The
+patch names the old scalar span and carries the new canonical integer, boolean,
+or null spelling plus a checksum of the complete expected canonical document.
+Replay reconstructs that whole result and fails closed unless its checksum
+matches. Current code rejects unknown versions, scalar-patch entries in v0,
+and a v1 journal reopened under the per-mutation or synchronous lane; older
+v0-only binaries reject the nonzero v1 header before decoding its records.
+
+A v1 batch contains one entry for every consecutive logical generation ending
+at its record generation. If replay is forced to checkpoint a prefix under
+bounded staging pressure and is interrupted again, the next open derives the
+covered prefix from the selected physical root and resumes at the first
+uncovered entry. It does not reapply a length-changing scalar patch. V0 batches
+keep their original atomic grammar—all entries share one generation and replay
+starts at entry zero. See [the design][journal] for the complete framing,
+failure, and group-commit details.
 
 [journal]: design/recovery-journal.md

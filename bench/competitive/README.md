@@ -23,12 +23,18 @@ changes in the working tree are benchmarked directly.
 
 ```sh
 cd bench/competitive
-go test -run 'TestFullEquivalence|TestCorpusVariantsAreShapeMatched' \
+go test -run \
+  '^(TestFullEquivalence|TestFullEquivalenceIndexedDurable|TestCorpusVariantsAreShapeMatched)$' \
   -count=1 -timeout=60m .
+go test ./cmd/... -count=1 -timeout=60m
 ```
 
 `TestFullEquivalence` checks all 100,000 keys byte for byte and verifies that
 each scan visits every key exactly once with the same bytes.
+`TestFullEquivalenceIndexedDurable` covers the indexed durable arm at its
+bounded posting geometry. The command-package tests pin the isolated runner's
+multi-client trace, final-state oracle, checkpoint coordinator, output schema,
+and publication flags.
 `TestCorpusVariantsAreShapeMatched` verifies that the low- and
 high-cardinality corpora have identical document lengths and predicate
 selectivity. A cross-engine number is not publishable unless both pass.
@@ -76,19 +82,49 @@ go test -run '^$' \
 `cmd/mixed` runs one engine per process and reports per-operation latency,
 throughput, retained Go memory, peak RSS, apparent disk bytes, and allocated
 blocks. `cmd/mixedsuite` executes children sequentially in deterministic
-Latin-square rotations so every engine occupies each order position.
+Latin-square rotations so every engine occupies each order position. Different
+engines never run concurrently; `-clients` controls concurrent workers sharing
+the one engine handle inside a child.
+
+Start from a clean commit and place binaries and results outside the worktree.
+Ten recorded repetitions are two complete rotations of the five-engine order.
+The default conditioning pass runs once per engine and is discarded.
 
 ```sh
-go build -o /tmp/vibedb-mixed ./cmd/mixed
-go build -o /tmp/vibedb-mixedsuite ./cmd/mixedsuite
+test -z "$(git status --porcelain=v1 --untracked-files=normal)"
+publication_commit=$(git rev-parse HEAD)
+publication_dir=$(mktemp -d /tmp/vibedb-publish.XXXXXX)
+publication_engines=vibejson-durable,bbolt,badger,pebble,sqlite
 
+go build -trimpath -o "$publication_dir/mixed" ./cmd/mixed
+go build -trimpath -o "$publication_dir/mixedsuite" ./cmd/mixedsuite
+
+# The standing single-client table.
 for workload in ycsb-b ycsb-a ycsb-f churn scan; do
-  /tmp/vibedb-mixedsuite -mixed-bin=/tmp/vibedb-mixed \
+  "$publication_dir/mixedsuite" -mixed-bin="$publication_dir/mixed" \
+    -engines="$publication_engines" \
     -workload="$workload" -durability=buffered-visible \
-    -checkpoint-mutations=64 \
-    -output="mixed-${workload}-buffered.tsv"
+    -clients=1 -checkpoint-mutations=64 -repetitions=10 \
+    -output="$publication_dir/mixed-single-${workload}-c1.tsv"
+done
+
+# Separate concurrent replacement and delete/restore scaling tables.
+for workload in write churn; do
+  for clients in 1 8 32; do
+    "$publication_dir/mixedsuite" -mixed-bin="$publication_dir/mixed" \
+      -engines="$publication_engines" \
+      -workload="$workload" -durability=buffered-visible \
+      -clients="$clients" -checkpoint-mutations=64 -repetitions=10 \
+      -output="$publication_dir/mixed-concurrent-${workload}-c${clients}.tsv"
+  done
 done
 ```
+
+Keep the single-client aggregate table and the concurrent scaling tables
+separate. `write` isolates same-size existing-key replacements; `churn`
+prevents a concurrency claim from hiding delete-and-restore work. Throughput is
+the median `total-ops/s` summary over the ten child samples. Never compare a
+row at one client count with a competitor row at another.
 
 Output contains:
 
@@ -97,10 +133,57 @@ Output contains:
 - `raw`: every child row with repetition and position;
 - `summary`: sample count, median, MAD, Q1/Q3, IQR, minimum, and maximum.
 
-The output path is exclusive. The default conditioning pass is discarded.
-Recorded engines never run concurrently. A publishable suite uses complete
-rotation blocks, at least the required repetition count, and no unrequested
-forced checkpoint.
+The output path is exclusive. Before publishing, every TSV must report all of
+the following:
+
+- `git-commit`, `mixed-build-vcs.revision`, and
+  `suite-build-vcs.revision` equal `$publication_commit`;
+- `git-dirty=false`, `mixed-build-vcs.modified=false`, and
+  `suite-build-vcs.modified=false`;
+- the requested workload and client count, `repetitions=10`, and
+  `conditioning=one discarded pass`;
+- `publishable-checkpoint-cadence=true`,
+  `publishable-repetition-count=true`, and `publishable-suite=true`;
+- `maximum-forced-checkpoints=0`; and
+- ten samples in every published summary row.
+
+The tool records provenance but its `publishable-suite` field is not a
+substitute for these checks: cleanliness, the exact five-engine matrix, and a
+complete ten-repetition rotation are publication policy.
+
+## Current local micro-gates
+
+Database-level results above remain separate from local implementation gates.
+Run these commands from the repository root and retain every repetition, not
+only the best line:
+
+```sh
+(
+cd ../..
+
+go test ./store/durable \
+  -run '^TestUnifiedSpaceCompetitiveCorpus$' -count=1 -v \
+  | tee "$publication_dir/space.txt"
+
+go test ./internal/storeio -run '^$' \
+  -bench '^BenchmarkUnifiedLeafPlanStableCheckpointFold$' \
+  -benchmem -count=5 \
+  | tee "$publication_dir/leaf-fold.txt"
+
+go test ./store/durable -run '^$' \
+  -bench '^(BenchmarkFilePrimaryOrderedScan|BenchmarkUnifiedScanAllLowCardinality|BenchmarkUnifiedScanAllHighCardinality|BenchmarkFileStoreScanMasked)$' \
+  -benchmem -count=5 \
+  | tee "$publication_dir/scan.txt"
+)
+```
+
+`TestUnifiedSpaceCompetitiveCorpus` reports exact core-graph bytes per
+document for both cardinalities. The ordered-primary benchmark uses its
+three-scalar corpus; the two unified full-scan arms use the competitive corpus
+at both cardinalities. `BenchmarkFileStoreScanMasked` currently selects one
+occupied stable slot per live tile. It does not reproduce historical
+1/4/16-row or dense-153-row density sweeps, and no current result should claim
+a measured density crossover from it.
 
 ## Durability lanes
 
@@ -192,14 +275,27 @@ done
 ```
 
 `heap-MiB`, runtime-resident memory, and peak RSS measure different scopes.
-Disk output includes both apparent size and allocated blocks.
+Disk output includes both apparent size and allocated blocks. A published row
+must report `git-commit=$publication_commit` and `vcs-modified=false` because
+`cmd/footprint` records provenance but has no separate publishability flag.
 
 ## Sustained churn
 
 `cmd/churndisk` keeps a fixed live set while replacing or deleting/restoring
 uniformly selected keys. It samples apparent and allocated bytes between
-buffered-visible checkpoints and runs each engine's documented maintenance
-floor afterward.
+buffered-visible checkpoints. The `pre-floor` row is the no-maintenance result:
+it includes online extent reuse and any bounded foreground hole punching
+completed at physical durability boundaries. Hole punching lowers allocated
+blocks without rewriting the live graph or shrinking the apparent file
+high-water mark.
+
+Only after final-state verification does the harness invoke each engine's
+documented maintenance hook. For vibedb, `post-floor` closes the live collection
+and performs an offline out-of-place `durable.Repack`; the benchmark then
+removes the source pair. That row is an offline floor, not steady-state online
+storage and not a production crash-atomic cutover. A no-background-maintenance
+comparison must headline `pre-floor`, especially its allocated-byte column,
+and report `post-floor` separately.
 
 ```sh
 go build -o /tmp/vibedb-churndisk ./cmd/churndisk
@@ -210,7 +306,9 @@ go build -o /tmp/vibedb-churndisk ./cmd/churndisk
 ```
 
 Use `-allow-diagnostic` only for investigation; its short or forced-checkpoint
-output is explicitly non-publishable.
+output is explicitly non-publishable. A publishable row also requires
+`git-commit=$publication_commit`, `vcs-modified=false`, `forced-cp=0`, and
+`publishable=true`; the last field alone does not prove a clean build.
 
 ## Publishing a refresh
 
@@ -219,4 +317,6 @@ Before editing [RESULTS.md](RESULTS.md), apply every rule in
 durability, repeated isolated samples, explicit machine/commit/lane
 provenance, both scan meanings, both disk meanings, cardinality controls,
 one durable representation at both cardinalities, separate bulk/replay
-construction results, and all tuning disclosed.
+construction results, concurrent rows separated by client count, and all
+tuning disclosed. Cross-engine database tables belong in `RESULTS.md`; local
+micro-gates must name their exact benchmark and stay out of those rankings.

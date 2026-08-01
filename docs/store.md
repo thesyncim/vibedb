@@ -253,6 +253,39 @@ memory admission and relies on `Flush` or `Close` for crash persistence. Use:
 opt-in buffered-journal lane. It does not delay the journal-before-publish
 `DurabilitySync` path.
 
+Every ordinary buffered-visible primary store also owns a recovery-journal
+sibling. An eligible class-5-only `Flush` can persist the complete consecutive
+overlay interval as one format-v1 batch and one sync without first rewriting
+the physical root. Compact entries cover existing-key integer, boolean, or null
+replacements; deletes and unqualified puts retain logical full redo. A
+structural publication, interval gap, exact capacity miss, or staging-pressure
+guard falls back to the bounded physical checkpoint.
+
+The ordinary v1 delta journal's current shipped geometry preallocates a 2.5 MiB
+record region plus two 512-byte headers. The foreground guard keeps up to
+512 KiB for one estimated future carried suffix, leaving the qualified 2 MiB
+current append window. Linux normally reserves the complete region with
+`fallocate`; the unsupported fallback and other platforms set its full size
+once with truncate. Later acknowledgement writes are positional and never grow
+the file. Per-mutation acknowledgement journals use their own option-derived
+bounded capacity instead.
+
+Journal format v0 remains the put/delete grammar and stays v0 when reopened;
+current writers never place a scalar-patch kind into it. Format v1 is accepted
+only for the ordinary buffered-delta lane. Each compact patch records the old
+canonical span, new scalar spelling, and checksum of the expected complete
+canonical document. Recovery reconstructs that result and fails closed unless
+the checksum matches. Unknown versions, v1 entries in v0, malformed metadata,
+or reopening v1 under an incompatible durability lane also fail closed.
+
+V1 batch entries represent consecutive generations ending at the batch target.
+If replay physically checkpoints a prefix under bounded pressure and crashes
+again, the next Open uses the selected root generation to skip exactly that
+durable prefix and resumes the suffix. It never reapplies a length-changing
+scalar patch. Legacy v0 batches keep their one-generation, replay-from-zero
+semantics. See [the recovery-journal design](design/recovery-journal.md) for the
+record and crash-window details.
+
 Recovery validates both superblocks and their roots and can fall back to the
 previous complete generation. Corruption encountered when a lower page is
 admitted is returned as an error. These guarantees still depend on the
@@ -264,6 +297,55 @@ canonical replacement rejects reads until reopen because recovery must first
 repair or select its page image. `PersistenceError` exposes the sticky cause.
 When the alternate root may already have reached storage, the cause matches
 `ErrCommitOutcomeUnknown`; reopen before deciding whether to retry.
+
+### Concurrent primary mutation lane
+
+The narrow ordinary buffered-visible primary overlay can overlap independent
+`Put` and `Delete` preparation without giving structural work a second,
+uncoordinated writer. It is enabled only for a schemaless, unindexed collection
+using the unified primary overlay with `DurabilityBufferedVisible` and without
+`Options.RecoveryJournal`. Recovery replay, an online index build, an active
+exact-index epoch, or any other lane uses the established exclusive path.
+
+Eligible collections allocate a fixed scratch pool at open. Its size is the
+configured visibility-slot count capped at 32 contexts. Every context receives
+its maximum JSON index, canonicalization, token-span, and publication storage
+up front and is reused; pool exhaustion waits on the bounded pool rather than
+creating goroutine-local scratch. For `Put`, syntax validation and canonical
+construction happen in the caller-owned context before taking the shared side
+of the collection writer gate. The locked phase then rechecks close,
+persistence, and mode state before using that provisional result.
+
+Under the shared writer gate, routing produces the complete 30-bit `BucketID`.
+A full-bit integer mix—not the tablet id or the low local-id bits—selects one of
+4,096 cache-line-padded mutex stripes. The stripe serializes leaf acquisition,
+existing-key inspection, stable-slot choice, and per-leaf overlay accounting
+only for colliding bucket identities; unrelated buckets can perform those
+stages concurrently.
+
+Prepared requests enter a fixed-capacity flat-combining publisher. One caller
+drains at most the 32 context-backed requests that reached the queue together,
+assigns their consecutive generations, links their immutable overlay records,
+and exposes one final router/state visibility cut. Leadership is handed to a
+later arrival rather than allowing one producer stream to retain it. This short
+publisher preserves the overlay's single-producer and global generation-order
+contracts without moving JSON validation or leaf inspection back under an
+exclusive collection writer.
+
+The concurrent lane admits only leaf-local operations whose final bounds are
+known: an inline replacement, resurrection of a tombstoned stable slot, an
+insert that can claim a free stable slot and still fits the leaf's exact trivial
+content bound, or an existing inline-row delete that does not empty the leaf.
+Already-missing/deleted keys retain normal API semantics. Overflow values or
+rows, non-unified leaves, stable-slot exhaustion, a required split, deletion of
+the final row, structural metadata changes, and overlay/cache pressure fall
+back safely to the exclusive path. A pressure cohort elects one coordinated
+exclusive fold/retry so it does not enqueue one full checkpoint per caller.
+
+This lane is bounded concurrency, not a lock-free algorithm or a claim of
+linear scaling. Same-bucket or hash-colliding operations serialize on a stripe;
+generation assignment and the final visibility cut serialize in the bounded
+publisher; structural/checkpoint work still fences the shared gate exclusively.
 
 ### Reads, snapshots, and reuse
 
@@ -284,6 +366,32 @@ bounded number of extents reclaimed. Closing old snapshots promptly still
 controls retained file space and descriptor pressure. Computing the snapshot
 floor scans the fixed `MaxSnapshotLeases` table (1,024 slots by default), not
 the retired set.
+
+Once a physical root is durable, the recovery journal has been recycled through
+that root, and active snapshot generations exclude an extent, the same
+foreground completion can return its filesystem blocks online. A
+physical-generation guard grants one pass per exact newly authoritative root;
+repeated completion and journal-only Flushes add no pass. Candidate discovery
+is bounded to 1,024 exact free identities and 64 coalesced physical runs across
+three independently advancing sources. Active sources redistribute unused
+shares for at most three rounds. Spending is capped separately at six
+successful deallocation calls and 20 MiB per physical generation; oversized
+identities retain progress and continue at later boundaries.
+
+The direct-reader fence and `snapshotGate` protect only coherent generation
+sampling and the fixed candidate copy. Both are released before validation and
+before any hole-punch syscall, while the collection writer lock prevents the
+allocator from reusing a copied range. Linux uses
+`fallocate(PUNCH_HOLE|KEEP_SIZE)` and Darwin uses `F_PUNCHHOLE`. `EINTR` is
+retried at most four times. An unsupported platform/filesystem or any other
+syscall error increments the corresponding hole-punch statistics and disables
+later attempts for that open collection; it does not poison the writer or fail
+the completed checkpoint.
+
+This is the normal online reclamation path. It requires no background
+compaction and no offline maintenance cycle. Logical extent reuse remains
+available on unsupported filesystems, although returning blocks to the host
+filesystem then requires an explicit rewrite such as `Repack`.
 
 ### Larger-than-RAM operation
 
@@ -394,7 +502,10 @@ for another.
 
 ## Concurrency model
 
-- heap and durable collections serialize mutations.
+- heap collections serialize mutations; durable structural, indexed,
+  journaled, and fallback mutations use the exclusive writer, while the narrow
+  buffered inline-primary cases described above may overlap through fixed
+  scratch contexts, bucket stripes, and the bounded publisher.
 - `store.Snapshot` values are immutable and concurrent-safe.
 - `durable.Snapshot` is immutable but owns a closeable lease.
 - Prepared queries are concurrent-safe with a separate result/workspace pair

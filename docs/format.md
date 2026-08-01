@@ -3,11 +3,16 @@
 This document maps the one mutable format written by `store/durable` and
 decoded by `internal/storeio`. The codecs are the byte-level authority. All
 multi-byte integers are little-endian, all reserved bytes are zero, and all
-stored format-version fields contain `DevelopmentFormatVersion == 0`.
+format-version fields inside the primary store file contain
+`DevelopmentFormatVersion == 0`. The separate recovery-journal sibling has its
+own explicitly gated format field; its supported versions 0 and 1 are described
+below.
 
-The project is unreleased. A schema change edits format 0 in place and
-regenerates the format-0 golden images. There are no migration decoders,
-alternate development versions, or retired page layouts in the current format.
+The project is unreleased. A primary-file schema change edits format 0 in place
+and regenerates the format-0 golden images. There are no migration decoders,
+alternate primary-file development versions, or retired page layouts. Recovery
+journal v0 compatibility is an explicit record-grammar contract, not a primary
+store migration decoder.
 
 ## File layout
 
@@ -182,12 +187,95 @@ The allocator publishes a free image plus bounded deltas through
 Every extent is aligned, non-overlapping, above `DataStart`, and absent from the
 selected live graph before reuse.
 
-The paired recovery journal (`recovery_journal.go`) carries acknowledged redo
-records for the synchronous mutation lane. Its identity is bound by both the
-store id and `StateRoot.JournalID`. The fixed materialization journal slots
-carry complete before-image sectors for qualified in-place canonical page
-updates. Recovery rolls back an incomplete materialization before selecting a
-root. Readers never consult either journal.
+The paired recovery journal (`recovery_journal.go`) is the separate
+`<store>.rjournal` file used by synchronous mutation acknowledgement and by
+eligible buffered-visible checkpoint deltas. Its identity is bound by both the
+store id and `StateRoot.JournalID`. Readers never consult it.
+
+The journal starts with two alternating 512-byte header sectors followed by a
+sector-aligned, fixed-capacity record region. A header records its independent
+format version, store and journal ids, page and sector geometry, base generation
+and sequence, capacity, and monotonic recycle count under a CRC32C and its
+complement. Create sizes the complete file once before publishing its identity;
+later positional appends never extend it. Linux normally reserves the blocks
+with `fallocate` and falls back to a one-time truncate only where allocation is
+unsupported; other platforms set the complete size with truncate.
+
+The current ordinary buffered-delta policy caps, and with the shipped overlay
+geometry selects, a 2.5 MiB record region. Its foreground admission guard keeps
+up to 512 KiB for one estimated future carried suffix, leaving the qualified
+2 MiB current append window. This reserve is a bounded fallback policy rather
+than another on-disk region: an exact current batch that does not fit, or a
+future suffix wider than the reserve, takes the physical checkpoint path. The
+two 512-byte headers are additional to the record-region capacity. Per-mutation
+v0 journals retain their option-derived bounded capacity rather than inheriting
+the 2.5 MiB delta policy.
+
+Every record begins with the 32-byte `RRJ0` prefix and ends with a CRC32C and
+its complement, then zero padding to the 512-byte damage granule. The prefix
+carries kind, reserved zero bytes, sequence, generation, and either key/value
+lengths or batch entry-count/body-length. One checksum covers the complete
+ordered batch, so a torn batch is not partially admitted.
+
+The header gates two record grammars:
+
+- format v0 is the legacy put/delete grammar. Batch entries are full put or
+  delete operations that all belong to the batch's single generation;
+- format v1 extends batches with compact scalar-patch entries for the ordinary
+  buffered delta lane. A scalar patch stores the key, new canonical integer,
+  boolean, or null spelling, a 16-bit canonical byte offset, an 8-bit old
+  spelling length, one reserved-zero byte, and the expected CRC32C of the
+  complete resulting canonical document. It is emitted only when smaller than
+  carrying that complete document. Scalar patch is never valid as a standalone
+  record kind.
+
+Opening a v0 journal preserves the v0 grammar for later appends; it is not
+silently upgraded. A scalar-patch kind authenticated inside v0, an unknown
+format, malformed metadata, or an attempt to use a v1 journal with another
+runtime durability lane fails closed. The v1 word occupies a field that older
+binaries required to be zero, so they reject v1 before interpreting its entry
+kinds.
+
+The fixed materialization journal slots inside the primary file carry complete
+before-image sectors for qualified in-place canonical page updates. Recovery
+rolls back an incomplete materialization before selecting a root. Readers never
+consult either journal.
+
+### Online block reclamation
+
+After a physical root is durable and the paired redo journal has been recycled
+through that root, the foreground completion path may deallocate filesystem
+blocks beneath extents already absent from every admissible root. This changes
+only physical allocation: allocator records and the apparent file length are
+unchanged.
+
+The scheduler grants one pass to each newly authoritative physical generation;
+journal-only `Flush` boundaries do not run it. Under the same snapshot gate
+used to publish durable state it samples the exact current/fallback roots and
+journal base, raises the direct-reader fence, and copies a bounded candidate
+window. One pass inspects at most 1,024 exact free identities and 64 coalesced
+physical runs across reusable, pending-retirement, and absorbed-retirement
+sources. Active sources share the discovery budget, with no more than three
+redistribution rounds. Spending is separately capped at six successful
+deallocation calls and 20 MiB. Oversized identities advance in bounded chunks
+across later physical generations.
+
+Candidate values are copied while readers are diverted, but the scheduler
+releases both the reader fence and snapshot gate before validation and before
+any filesystem syscall. The caller's writer lock still prevents allocator
+reuse. The generation guard records the exact authority returned by a
+successful planning pass, so repeated completion of one root is a no-op and a
+hard pre-syscall validation error does not consume a different generation.
+
+Linux uses `fallocate(PUNCH_HOLE|KEEP_SIZE)` and Darwin uses `F_PUNCHHOLE`;
+other platforms report the optimization unsupported. `EINTR` is retried at
+most four times. Unsupported operation or any syscall error increments the
+corresponding `durable.Stats` counter, counts the candidate as skipped, and
+disables further attempts for that open collection without poisoning or
+failing an otherwise successful durability boundary. Online reclamation needs
+no background compactor and no offline maintenance pass; filesystems without
+hole punching retain logically reusable space but may not return its blocks to
+the filesystem until an explicit rewrite such as `Repack`.
 
 ## Publication and recovery
 
@@ -208,7 +296,14 @@ synchronizes changed sectors, and finally publishes the alternate root.
 
 Recovery validates checksums, complements, reserved bytes, store identities,
 generation relationships, all graph references, catalog digests, exact-index
-postings, and allocator disjointness. It fails closed on any disagreement.
+postings, and allocator disjointness. For a v1 scalar patch it first reconstructs
+the complete canonical result and requires the recorded result checksum before
+calling the ordinary mutation path. V1 delta entries name one consecutive
+generation each, ending at the batch generation. If bounded replay pressure
+physically checkpoints a prefix and recovery is interrupted again, the next
+open derives and skips exactly the prefix already covered by the selected root;
+legacy v0 batches retain their one-generation replay-from-entry-zero rule.
+Recovery fails closed on any disagreement.
 
 ## Verification and golden images
 
