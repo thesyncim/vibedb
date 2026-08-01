@@ -26,7 +26,7 @@ type SelectStmt struct {
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
 
-	// From holds the range variables. From[0] is the FROM collection; each
+	// From holds the range variables. From[0] is the driving relation; each
 	// later entry is a JOIN, in source order, and carries its own ON
 	// condition. Every [PathExpr] in the statement names one of these by
 	// index, so a lowering pass never has to re-resolve a name.
@@ -86,14 +86,39 @@ const (
 	JoinRight
 )
 
-// A TableRef is one range variable: a collection, the name paths use to
-// qualify against it, and, for a joined collection, its equi-join condition.
+// A RelationKind identifies the row source behind a range variable.
+type RelationKind uint8
+
+const (
+	// RelationCollection is a physical collection. It is the zero value so
+	// every existing TableRef literal remains a collection unless it opts into
+	// another relation shape explicitly.
+	RelationCollection RelationKind = iota
+	// RelationDerived is an uncorrelated SELECT materialized as a relation.
+	// [TableRef.Query] holds the nested statement and [TableRef.Alias] is
+	// mandatory. Correlated execution is deliberately a different future kind:
+	// a lowerer must never infer LATERAL semantics from this value.
+	RelationDerived
+)
+
+// A TableRef is one range variable: a physical collection or derived query,
+// the name paths use to qualify against it, and, for a joined relation, its
+// equi-join condition.
 type TableRef struct {
-	// Name is the collection named in the statement.
+	// Kind discriminates the relation payload. Its zero value is
+	// RelationCollection for source compatibility with physical-table ASTs.
+	Kind RelationKind
+	// Name is the physical collection named in the statement. It is empty for
+	// RelationDerived; lowerers must switch on Kind rather than treating an
+	// empty collection name as meaningful.
 	Name string
+	// Query is the nested SELECT for RelationDerived and nil for
+	// RelationCollection. A derived query has its own source scope and parser
+	// arena, and is uncorrelated by construction.
+	Query *SelectStmt
 	// Alias is the name paths qualify with. It is the explicit AS alias when
-	// the statement gave one and Name otherwise, so resolution has a single
-	// key to compare against and never has to consider two.
+	// the statement gave one and Name otherwise. Derived relations always have
+	// an explicit, non-empty alias.
 	Alias string
 	// HasAlias records whether Alias was written explicitly, purely so a
 	// diagnostic can echo the statement back accurately.

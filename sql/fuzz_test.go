@@ -36,6 +36,7 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT a FROM t WHERE m @> {"k": [1, 2, {"n": null}]}`,
 		`SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
 		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
+		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) AS d WHERE d.id = ?`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -102,25 +103,43 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		t.Fatal("an accepted statement projects nothing")
 	}
 	if len(s.From) == 0 {
-		t.Fatal("an accepted statement reads no collection")
+		t.Fatal("an accepted statement reads no relation")
 	}
+	seen := 0
 	for i := range s.From {
-		if s.From[i].Alias == "" {
+		ref := &s.From[i]
+		if ref.Alias == "" {
 			t.Fatalf("From[%d] has no range-variable name", i)
 		}
-		if (s.From[i].Join == JoinNone) != (i == 0) {
-			t.Fatalf("From[%d] has join kind %d", i, s.From[i].Join)
+		if (ref.Join == JoinNone) != (i == 0) {
+			t.Fatalf("From[%d] has join kind %d", i, ref.Join)
+		}
+		switch ref.Kind {
+		case RelationCollection:
+			if ref.Name == "" || ref.Query != nil {
+				t.Fatalf("From[%d] has invalid collection payload: %+v", i, ref)
+			}
+		case RelationDerived:
+			if ref.Name != "" || ref.Query == nil || !ref.HasAlias || i != 0 || len(s.From) != 1 {
+				t.Fatalf("From[%d] has invalid derived payload: %+v", i, ref)
+			}
+			checkStatementInvariants(t, ref.Query)
+			if ref.Query.ParamBase != seen {
+				t.Fatalf("From[%d] derived ParamBase = %d, want %d", i, ref.Query.ParamBase, seen)
+			}
+			seen += ref.Query.Params
+		default:
+			t.Fatalf("From[%d] has unknown relation kind %d", i, ref.Kind)
 		}
 		if i == 0 {
 			continue
 		}
-		if s.From[i].On == nil {
+		if ref.On == nil {
 			t.Fatalf("From[%d] is a join with no condition", i)
 		}
-		checkPath(t, s, s.From[i].On.Left)
-		checkPath(t, s, s.From[i].On.Right)
+		checkPath(t, s, ref.On.Left)
+		checkPath(t, s, ref.On.Right)
 	}
-	seen := 0
 	for i := range s.Columns {
 		if s.Columns[i].Path == nil {
 			if s.Columns[i].Agg != AggCount {

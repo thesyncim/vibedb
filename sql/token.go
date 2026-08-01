@@ -104,6 +104,7 @@ const (
 	kwJoin
 	kwKey
 	kwLast
+	kwLateral
 	kwLeft
 	kwLike
 	kwLimit
@@ -260,6 +261,8 @@ func keywordOf(s string) keyword {
 		return kwKey
 	case "LAST":
 		return kwLast
+	case "LATERAL":
+		return kwLateral
 	case "LEFT":
 		return kwLeft
 	case "LIKE":

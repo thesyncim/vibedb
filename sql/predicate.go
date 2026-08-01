@@ -1,5 +1,7 @@
 package sql
 
+import "errors"
+
 // The predicate grammar.
 //
 // Precedence, loosest to tightest:
@@ -361,6 +363,9 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 // the shape remains allocation-free.
 func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	start := p.tok.pos
+	if !p.atKeyword(kwSelect) {
+		return nil, p.errHere("expected SELECT in a subquery")
+	}
 	if p.nesting >= maxSubqueryDepth {
 		return nil, p.errfAt(start,
 			"subqueries nest deeper than %d levels", maxSubqueryDepth)
@@ -401,10 +406,7 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	child.nesting = p.nesting + 1
 	if err := child.Parse(sub, p.lx.src[start:end]); err != nil {
 		child.existsProjection = false
-		if pe, ok := err.(*ParseError); ok {
-			return nil, newParseError(p.lx.src, start+pe.Pos, pe.Msg)
-		}
-		return nil, err
+		return nil, p.rebaseSubqueryError(err, start)
 	}
 	child.existsProjection = false
 	if p.params+sub.Params > maxParams {
@@ -417,6 +419,25 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	return sub, nil
 }
 
+// rebaseSubqueryError moves a child parser's source-relative position into the
+// containing statement while preserving its semantic error class. In
+// particular, a valid-but-unsupported construct inside a nested SELECT must
+// remain a FeatureNotSupportedError so protocol adapters can still map it to
+// SQLSTATE 0A000 without matching prose.
+func (p *Parser) rebaseSubqueryError(err error, start int) error {
+	var unsupported *FeatureNotSupportedError
+	if errors.As(err, &unsupported) {
+		return newFeatureNotSupportedError(
+			p.lx.src, start+unsupported.Pos, unsupported.Msg,
+		)
+	}
+	var parse *ParseError
+	if errors.As(err, &parse) {
+		return newParseError(p.lx.src, start+parse.Pos, parse.Msg)
+	}
+	return err
+}
+
 func shiftSelectPositions(s *SelectStmt, delta int) {
 	for i := range s.Columns {
 		s.Columns[i].Pos += delta
@@ -424,6 +445,9 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	}
 	for i := range s.From {
 		s.From[i].Pos += delta
+		if s.From[i].Query != nil {
+			shiftSelectPositions(s.From[i].Query, delta)
+		}
 		if s.From[i].On != nil {
 			s.From[i].On.Pos += delta
 			shiftPathPosition(s.From[i].On.Left, delta)

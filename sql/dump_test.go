@@ -93,7 +93,16 @@ func dumpColumn(b *strings.Builder, c *ResultColumn) {
 }
 
 func dumpTable(b *strings.Builder, t *TableRef) {
-	b.WriteString(t.Name)
+	switch t.Kind {
+	case RelationCollection:
+		b.WriteString(t.Name)
+	case RelationDerived:
+		b.WriteString("derived(")
+		b.WriteString(dumpStmt(t.Query))
+		b.WriteByte(')')
+	default:
+		fmt.Fprintf(b, "relation-kind-%d", t.Kind)
+	}
 	if t.HasAlias {
 		fmt.Fprintf(b, "/%s", t.Alias)
 	}

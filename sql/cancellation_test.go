@@ -77,3 +77,31 @@ func TestParserReturnsPreexistingCancellationUnchanged(t *testing.T) {
 		t.Fatalf("ParseStatement = %v, want exact %v", err, want)
 	}
 }
+
+func TestParserCancellationRemainsBoundedInsideDerivedTable(t *testing.T) {
+	const payloadBytes = 1 << 20
+	src := `SELECT d.id FROM (SELECT id FROM docs /*` +
+		strings.Repeat("x", payloadBytes) + `*/) AS d`
+	admissionChecks := 1 + (len(src)-1)/parserCancelByteInterval
+	// Admission validates the complete source first. The following token check
+	// and bounded comment scan exercise the parent parser while it delimits the
+	// nested SELECT; cancellation must still escape unchanged.
+	stopAt := admissionChecks + 3
+	checks := 0
+	want := errors.New("cancel derived parse")
+	var parser Parser
+	parser.SetCancellationCheck(func() error {
+		checks++
+		if checks >= stopAt {
+			return want
+		}
+		return nil
+	})
+	var statement SelectStmt
+	if err := parser.Parse(&statement, src); err != want {
+		t.Fatalf("Parse cancellation = %v, want exact %v", err, want)
+	}
+	if len(statement.Columns) != 0 || len(statement.From) != 0 {
+		t.Fatalf("canceled derived parse returned a partial AST: %+v", statement)
+	}
+}

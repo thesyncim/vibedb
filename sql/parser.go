@@ -787,6 +787,16 @@ func (p *Parser) parseFrom() error {
 // parseJoin parses one JOIN clause, reporting true when the next token does not
 // open one.
 func (p *Parser) parseJoin() (bool, error) {
+	if len(p.from) > 0 && p.from[0].Kind == RelationDerived {
+		switch p.tok.kw {
+		case kwJoin, kwInner, kwLeft, kwRight, kwFull, kwOuter, kwCross, kwNatural:
+			return false, newFeatureNotSupportedError(
+				p.lx.src,
+				p.tok.pos,
+				"joining a derived table is not supported yet: use the derived table as the sole FROM relation",
+			)
+		}
+	}
 	join := JoinInner
 	switch {
 	case p.acceptKeyword(kwLeft):
@@ -890,6 +900,13 @@ func (p *Parser) boundPath(path *PathExpr, source int) *PathExpr {
 
 func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	ref := TableRef{Join: join, Pos: p.tok.pos}
+	if p.atKeyword(kwLateral) {
+		return ref, newFeatureNotSupportedError(
+			p.lx.src,
+			p.tok.pos,
+			"LATERAL derived tables are not supported: derived FROM queries are uncorrelated and execute once",
+		)
+	}
 	switch p.tok.kind {
 	case tokIdent:
 		if err := p.checkNameable("a collection name"); err != nil {
@@ -897,7 +914,7 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 		}
 	case tokQuotedIdent:
 	case tokLParen:
-		return ref, p.errHere("subqueries are not supported: the engine executes one plan over declared collections")
+		return p.parseDerivedTableRef(ref)
 	default:
 		return ref, p.errHere("expected a collection name")
 	}
@@ -920,12 +937,50 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	if ref.HasAlias {
 		ref.Alias = alias
 	}
+	return ref, p.rejectDuplicateRangeAlias(ref)
+}
+
+// parseDerivedTableRef parses the parenthesized SELECT of a derived relation.
+// The nested statement uses the same child-parser path as predicate subqueries,
+// which preserves independent FROM scope, arena ownership, nesting limits,
+// cancellation, position rebasing, and placeholder accounting in one place.
+func (p *Parser) parseDerivedTableRef(ref TableRef) (TableRef, error) {
+	if ref.Join != JoinNone {
+		return ref, newFeatureNotSupportedError(
+			p.lx.src,
+			ref.Pos,
+			"a derived table is not supported in a JOIN position yet: use it as the sole FROM relation",
+		)
+	}
+	p.advance() // consume '('
+	if !p.atKeyword(kwSelect) {
+		return ref, p.errHere("expected SELECT after '(' in a derived table")
+	}
+	query, err := p.parseSubquery(false)
+	if err != nil {
+		return ref, err
+	}
+	alias, err := p.parseTableAlias()
+	if err != nil {
+		return ref, err
+	}
+	if alias == "" {
+		return ref, p.errHere("a derived table requires a non-empty alias, written AS alias or directly after ')'")
+	}
+	ref.Kind = RelationDerived
+	ref.Query = query
+	ref.Alias = alias
+	ref.HasAlias = true
+	return ref, p.rejectDuplicateRangeAlias(ref)
+}
+
+func (p *Parser) rejectDuplicateRangeAlias(ref TableRef) error {
 	for i := range p.from {
 		if p.from[i].Alias == ref.Alias {
-			return ref, p.errfAt(ref.Pos, "range variable %q is declared twice; give one of them a distinct AS alias", ref.Alias)
+			return p.errfAt(ref.Pos, "range variable %q is declared twice; give one of them a distinct AS alias", ref.Alias)
 		}
 	}
-	return ref, nil
+	return nil
 }
 
 // parseTableAlias parses an optional table alias, with or without AS. Unlike a
