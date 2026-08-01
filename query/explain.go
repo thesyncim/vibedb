@@ -339,6 +339,9 @@ func (s *Statement) ExplainWith(options ExplainOptions) (string, error) {
 	if s == nil || s.tree == nil {
 		return "", queryExplainError("query: cannot explain a nil or released Statement")
 	}
+	if set := s.setSQL(); set != nil {
+		return set.explain(options, nil)
+	}
 	p, err := s.q.compiled()
 	if err != nil {
 		return "", err
@@ -363,6 +366,12 @@ func (s *Statement) ExplainBoundWith(args []any, options ExplainOptions) (string
 	if len(args) != s.params {
 		return "", queryExplainError("query: explain argument count does not match statement")
 	}
+	if set := s.setSQL(); set != nil {
+		if err := set.bindForExplain(args); err != nil {
+			return "", err
+		}
+		return set.explain(options, nil)
+	}
 	if err := s.bind(args); err != nil {
 		return "", err
 	}
@@ -381,6 +390,9 @@ func (s *Statement) ExplainBoundWith(args []any, options ExplainOptions) (string
 func (s *Statement) ExplainAnalyze(options ExplainOptions, analysis ExplainAnalysis) (string, error) {
 	if s == nil || s.tree == nil {
 		return "", queryExplainError("query: cannot explain a nil or released Statement")
+	}
+	if set := s.setSQL(); set != nil {
+		return set.explain(options, &analysis)
 	}
 	p, err := s.q.compiled()
 	if err != nil {

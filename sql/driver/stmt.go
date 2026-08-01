@@ -510,7 +510,7 @@ func (s *stmt) requiresCatalogSource() bool {
 // Keeping the decision on the prepared statement makes the ordinary no-JOIN
 // path one nil-cheap pointer test with no feature state or allocation.
 func (s *stmt) usesDirectDurableCatalog() bool {
-	return s != nil && s.query != nil && s.query.UsesGeneralizedRelationJoin()
+	return s != nil && s.query != nil && s.query.UsesDirectCatalogExecution()
 }
 
 func (s *stmt) transactionRequiresCatalogSource() bool {

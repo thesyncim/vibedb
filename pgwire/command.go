@@ -127,6 +127,14 @@ func classifyCancelable(
 	if s.malformed {
 		return kindUnknown, "unterminated block comment", nil
 	}
+	// A parenthesized query expression has no leading keyword at this protocol
+	// layer. Route it through the SELECT path and let the real SQL parser prove
+	// that the parentheses contain a valid grouped set expression. Treating the
+	// scanner's empty word as empty SQL would emit EmptyQueryResponse for valid
+	// `(SELECT ...) UNION ...` text and bypass every typed/positioned diagnostic.
+	if word == "" && s.pos < len(s.src) && s.src[s.pos] == '(' {
+		return kindSelect, "", nil
+	}
 	switch {
 	case word == "":
 		return kindEmpty, "", nil

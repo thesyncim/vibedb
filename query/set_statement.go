@@ -23,6 +23,15 @@ type setStatementRunner interface {
 	releaseRelations(*statementFrame)
 }
 
+// setStatementResultConsumer is the cold SQL-tail hook. The generic prepared
+// runtime copies the root directly when it is nil. A SQL query-expression tail
+// instead consumes the still-live root relation through the ordinary compiled
+// ORDER/LIMIT pipeline, so the set tree is never evaluated or materialized a
+// second time.
+type setStatementResultConsumer interface {
+	consumePreparedSetResult(*setStatementRuntime, SetTreeResult, *CancelFlag) error
+}
+
 type setStatementLeaf struct {
 	runner    setStatementRunner
 	paramBase int
@@ -178,11 +187,12 @@ func (d *setStatementDescriptor) NumParams() int {
 // single-consumer; independent runtimes over independently prepared runners
 // share no state and may execute concurrently.
 type setStatementRuntime struct {
-	running atomic.Bool
-	desc    *setStatementDescriptor
-	tree    SetTreeExecutor
-	execs   []Exec
-	cursor  Statement
+	running  atomic.Bool
+	desc     *setStatementDescriptor
+	tree     SetTreeExecutor
+	execs    []Exec
+	cursor   Statement
+	consumer setStatementResultConsumer
 
 	parent *Exec
 	source Source
@@ -382,6 +392,9 @@ func (r *setStatementRuntime) consumeSetTreeResult(
 			Node: r.desc.plan.Root, Left: len(r.desc.names), Right: result.Columns(),
 		}
 	}
+	if r.consumer != nil {
+		return r.consumer.consumePreparedSetResult(r, result, cancel)
+	}
 	return materializeSetStatementResult(
 		&r.parent.Result, result, r.desc.names, r.parent.Options, cancel,
 	)
@@ -552,6 +565,7 @@ func (r *setStatementRuntime) Release() {
 	}
 	r.execs = nil
 	r.cursor = Statement{}
+	r.consumer = nil
 	r.desc = nil
 	r.parent = nil
 	r.source = Source{}

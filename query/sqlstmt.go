@@ -151,6 +151,7 @@ type nestedStatements struct {
 	derived      *statementDerived
 	relationJoin *statementRelationJoin
 	window       *statementWindow
+	set          *statementSetSQL
 	ctes         *statementCTEs
 	cte          *statementCTEReference
 	ownsCTEs     bool
@@ -275,17 +276,25 @@ func prepareTreeInContext(
 	ctes *statementCTEs,
 	argBase int,
 ) (*Statement, error) {
-	// A compound query is represented by a cold parser sidecar. Until the
-	// physical set-tree lowerer publishes every leaf and tail into one owning
-	// Statement, treating the first syntactic operand as an ordinary SELECT
-	// would return a plausible but incomplete result. Refuse at the expression
-	// boundary so every caller, including database/sql and pgwire, observes the
-	// positioned SQLSTATE 0A000 contract instead of silent first-leaf execution.
-	if tree.Set != nil {
+	if recursive, pos := RecursiveSQLStatementRequired(tree); recursive &&
+		!recursiveSQLBridgeReentry(tree) {
+		// The owning top-level bridge rewrites each recursive definition to its
+		// anchor before re-entering this ordinary path. Every other encounter is
+		// still authored recursive SQL and must dispatch explicitly; allowing it
+		// to fall into plain CTE preparation produces a misleading lexical lookup
+		// failure and can never execute the fixpoint semantics.
+		if subqueryLimit == 0 && ctes == nil && argBase == 0 && tree.Set == nil {
+			return PrepareParsedRecursiveSQLStatement(
+				src, tree, RecursiveSQLStatementOptions{},
+			)
+		}
 		return nil, sqlast.NewFeatureNotSupportedError(
-			src, tree.Set.Pos,
-			"compound query execution is not supported by the SQL statement lowerer yet",
+			src, pos,
+			"WITH RECURSIVE must enter through the owning recursive statement prepare hook",
 		)
+	}
+	if tree.Set != nil {
+		return prepareSetSQLStatement(src, tree, subqueryLimit, ctes, argBase)
 	}
 	s := &Statement{
 		text: src, tree: tree, params: tree.Params,
@@ -366,6 +375,24 @@ func prepareTreeInContext(
 	return s, nil
 }
 
+func recursiveSQLBridgeReentry(tree *sqlast.SelectStmt) bool {
+	if tree == nil || tree.With == nil {
+		return false
+	}
+	found := false
+	for i := range tree.With.CTEs {
+		definition := &tree.With.CTEs[i]
+		if definition.Recursive.Anchor == nil {
+			continue
+		}
+		found = true
+		if definition.Query != definition.Recursive.Anchor {
+			return false
+		}
+	}
+	return found
+}
+
 func (s *Statement) ensureNested() *nestedStatements {
 	if s.nested == nil {
 		s.nested = new(nestedStatements)
@@ -396,7 +423,12 @@ func (s *Statement) SQL() string { return s.text }
 // must execute against [FromDatabase] or [FromFileDatabase], whose database
 // snapshot resolves every collection at one instant; a caller holding a single
 // collection can refuse it before it takes a snapshot it would only discard.
-func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
+func (s *Statement) NumJoins() int {
+	if set := s.setSQL(); set != nil {
+		return set.joins
+	}
+	return len(s.tree.From) - 1
+}
 
 // UsesGeneralizedRelationJoin reports whether this prepared statement executes
 // JOINs through the relation-spool pipeline. Adapters use it to retain their
@@ -409,6 +441,9 @@ func (s *Statement) UsesGeneralizedRelationJoin() bool {
 	}
 	if window := s.window(); window != nil {
 		return window.input.UsesGeneralizedRelationJoin()
+	}
+	if set := s.setSQL(); set != nil {
+		return set.generalizedJoin
 	}
 	return s.relationJoin() != nil
 }
@@ -427,6 +462,9 @@ func (s *Statement) RequiresCatalog() bool {
 // that advertised it would be advertising a column [Cursor.Cell] refuses to
 // return.
 func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
+	if set := s.setSQL(); set != nil {
+		return set.AppendSchema(dst)
+	}
 	start := len(dst)
 	dst = s.q.AppendSchema(dst)
 	if len(dst)-start > s.outputs {
@@ -451,6 +489,9 @@ func (s *Statement) Release() {
 	}
 	s.c.release()
 	if s.nested != nil {
+		if s.nested.set != nil {
+			s.nested.set.Release()
+		}
 		for i := range s.nested.subqueries {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
@@ -569,6 +610,30 @@ func (s *Statement) runIntoFrame(
 		return Cursor{}, fmt.Errorf(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
 			s.params, len(args))
+	}
+	if set := s.setSQL(); set != nil {
+		if s.nested.ownsCTEs && s.nested.ctes != nil {
+			defer s.nested.ctes.releaseExecution(frame)
+		}
+		limit := e.Options.ResultBytes
+		if intermediateResource != "" {
+			limit = frame.intermediate.remaining()
+			if limit == 0 {
+				return Cursor{}, &IntermediateBudgetError{
+					Resource: intermediateResource,
+					Bytes:    saturatedBytes(frame.intermediate.used, 1),
+					Limit:    frame.intermediate.limit,
+				}
+			}
+			e.Options.ResultBytes = limit
+		}
+		cursor, err := set.runIntoFrame(e, src, args, frame, intermediateResource)
+		if err != nil && intermediateResource != "" {
+			err = translateSetIntermediateError(
+				err, frame, limit, intermediateResource,
+			)
+		}
+		return cursor, err
 	}
 	runSource := src
 	if s.nested != nil {

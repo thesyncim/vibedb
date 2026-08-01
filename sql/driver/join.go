@@ -212,6 +212,12 @@ func appendSelectPhysicalDependencies(
 	dependencies []physicalDependency,
 	statement *sqlast.SelectStmt,
 ) []physicalDependency {
+	if statement == nil {
+		return dependencies
+	}
+	if statement.Set != nil {
+		return appendSetPhysicalDependencies(dependencies, statement.Set.Root)
+	}
 	// Definitions are semantically validated even when unreferenced. Walking
 	// each body here, once in declaration order, captures those physical reads;
 	// RelationCTE references below deliberately do not expand the body again.
@@ -255,6 +261,26 @@ func appendSelectPhysicalDependencies(
 	return dependencies
 }
 
+func appendSetPhysicalDependencies(
+	dependencies []physicalDependency,
+	expression *sqlast.SetExpr,
+) []physicalDependency {
+	if expression == nil {
+		return dependencies
+	}
+	switch expression.Kind {
+	case sqlast.SetSelectExpr:
+		return appendSelectPhysicalDependencies(dependencies, expression.Select)
+	case sqlast.SetBinaryExpr:
+		dependencies = appendSetPhysicalDependencies(dependencies, expression.Left)
+		return appendSetPhysicalDependencies(dependencies, expression.Right)
+	case sqlast.SetGroupExpr:
+		return appendSetPhysicalDependencies(dependencies, expression.Child)
+	default:
+		return dependencies
+	}
+}
+
 func appendExprPhysicalDependencies(
 	dependencies []physicalDependency,
 	e *sqlast.Expr,
@@ -281,6 +307,12 @@ func hasPhysicalDependency(dependencies []physicalDependency, name string) bool 
 }
 
 func selectContainsJoin(statement *sqlast.SelectStmt) bool {
+	if statement == nil {
+		return false
+	}
+	if statement.Set != nil {
+		return setContainsJoin(statement.Set.Root)
+	}
 	if len(statement.From) > 1 {
 		return true
 	}
@@ -300,6 +332,22 @@ func selectContainsJoin(statement *sqlast.SelectStmt) bool {
 		}
 	}
 	return exprContainsJoin(statement.Where) || exprContainsJoin(statement.Having)
+}
+
+func setContainsJoin(expression *sqlast.SetExpr) bool {
+	if expression == nil {
+		return false
+	}
+	switch expression.Kind {
+	case sqlast.SetSelectExpr:
+		return selectContainsJoin(expression.Select)
+	case sqlast.SetBinaryExpr:
+		return setContainsJoin(expression.Left) || setContainsJoin(expression.Right)
+	case sqlast.SetGroupExpr:
+		return setContainsJoin(expression.Child)
+	default:
+		return false
+	}
 }
 
 func exprContainsJoin(e *sqlast.Expr) bool {
