@@ -103,10 +103,9 @@ var unsupportedStatements = map[string]string{
 	"NOTIFY":   "asynchronous notification is not supported",
 	"UNLISTEN": "asynchronous notification is not supported",
 
-	"LOCK":    "there is no lock manager: readers never block and there is nothing to lock against",
-	"EXPLAIN": "EXPLAIN is not supported: the engine's plan is not renderable as PostgreSQL plan text",
-	"CALL":    "there are no stored procedures",
-	"DO":      "there is no procedural language",
+	"LOCK": "there is no lock manager: readers never block and there is nothing to lock against",
+	"CALL": "there are no stored procedures",
+	"DO":   "there is no procedural language",
 
 	"WITH":   "common table expressions are not supported: the engine executes one plan and has no nested execution",
 	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
@@ -125,7 +124,7 @@ func classify(src string) (statementKind, string) {
 	switch word {
 	case "":
 		return kindEmpty, ""
-	case "SELECT":
+	case "SELECT", "EXPLAIN":
 		return kindSelect, ""
 	case "INSERT", "UPDATE", "DELETE", "CREATE":
 		return kindCatalogSQL, ""

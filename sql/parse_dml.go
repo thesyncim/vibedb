@@ -85,10 +85,14 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	switch {
 	case p.atKeyword(kwExplain):
 		p.advance()
-		if !p.atKeyword(kwSelect) {
-			return p.errHere("EXPLAIN currently accepts SELECT only")
+		analyze := p.atKeyword(kwAnalyze)
+		if analyze {
+			p.advance()
 		}
-		dst.Kind, dst.Explain, dst.Select = KindSelect, true, &p.sel
+		if !p.atKeyword(kwSelect) {
+			return p.errHere("EXPLAIN accepts SELECT or ANALYZE SELECT only")
+		}
+		dst.Kind, dst.Explain, dst.Analyze, dst.Select = KindSelect, true, analyze, &p.sel
 		p.out = &p.sel
 		*p.out = SelectStmt{}
 		return p.parseStatement()

@@ -341,9 +341,22 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	if tree.Kind.IsQuery() {
 		s.query, err = query.PrepareParsedStatement(src, tree.Select)
 		if err == nil && tree.Explain {
-			s.explainText, err = s.query.Explain()
-			if err == nil {
-				s.explain = true
+			s.explain = true
+			s.analyze = tree.Analyze
+			// EXPLAIN uses the same immutable primary-key shape fact as
+			// ordinary SELECT. Binding the actual values remains deferred to
+			// queryRows, where LIMIT/OFFSET and parameter types are known.
+			if !s.query.RequiresCatalog() {
+				if lockErr := rlockContext(ctx, &c.db.mu); lockErr != nil {
+					s.query.Release()
+					return nil, lockErr
+				}
+				t := c.db.tables[s.query.Collection()]
+				if t != nil {
+					s.primaryPoint = isPrimaryPredicate(
+						tree.Select.Where, t.meta.PrimaryKey)
+				}
+				c.db.mu.RUnlock()
 			}
 		} else if err == nil && s.query.RequiresCatalog() {
 			s.joinNames = joinTableNames(tree.Select)

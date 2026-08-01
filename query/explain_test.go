@@ -30,11 +30,29 @@ func TestExplainUsesCompiledPlanWithoutADataSource(t *testing.T) {
 		`"node":"scan"`,
 		`"collection":"docs"`,
 		`"access_path":"adaptive-posting-or-scan"`,
+		`"scope":"logical"`,
 		`"order_by":["name DESC"]`,
 		`"limit":10`,
+		`"predicate":{"kind":"comparison","path":"kind","operator":"="}`,
 	} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("explain missing %s: %s", want, plan)
 		}
+	}
+}
+
+func TestExplainBoundUsesBoundLimitWithoutADataSource(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT id FROM docs LIMIT ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+
+	plan, err := statement.ExplainBound([]any{int64(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, `"limit":7`) {
+		t.Fatalf("bound EXPLAIN limit = %s, want 7", plan)
 	}
 }

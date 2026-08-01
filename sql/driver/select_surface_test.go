@@ -7,7 +7,7 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func TestExplainReturnsCompiledPlanWithoutOpeningTheTable(t *testing.T) {
+func TestExplainReturnsSourceAwarePlanWithoutScanningRows(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
 		t.Fatal(err)
@@ -24,10 +24,76 @@ func TestExplainReturnsCompiledPlanWithoutOpeningTheTable(t *testing.T) {
 	for _, want := range []string{
 		`"node":"scan"`,
 		`"collection":"docs"`,
-		`"access_path":"adaptive-posting-or-scan"`,
+		`"access_path":"primary-key-point-or-scan"`,
+		`"scope":"source-aware"`,
+		`"predicate":{"kind":"comparison","path":"id","operator":"="}`,
 	} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("EXPLAIN missing %s: %s", want, plan)
+		}
+	}
+}
+
+func TestExplainBindsParametersAndSeesDeclaredIndexes(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"seed","kind":"active"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE INDEX docs_kind ON docs (kind)`); err != nil {
+		t.Fatal(err)
+	}
+	var plan string
+	if err := db.QueryRow(
+		`EXPLAIN SELECT id FROM docs WHERE kind = ? LIMIT ?`, "active", int64(7),
+	).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"access_path":"adaptive-exact-index-or-scan"`,
+		`"limit":7`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN missing %s: %s", want, plan)
+		}
+	}
+}
+
+func TestExplainAnalyzeExecutesAndReportsMeasuredWork(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range []string{
+		`{"id":"a","kind":"active"}`,
+		`{"id":"b","kind":"inactive"}`,
+		`{"id":"c","kind":"active"}`,
+	} {
+		if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var plan string
+	if err := db.QueryRow(
+		`EXPLAIN ANALYZE SELECT id FROM docs WHERE kind = ? ORDER BY id LIMIT ?`,
+		"active", int64(1),
+	).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !vibejson.Valid([]byte(plan)) {
+		t.Fatalf("EXPLAIN ANALYZE returned invalid JSON: %s", plan)
+	}
+	for _, want := range []string{
+		`"analyze":{`,
+		`"actual_access_path":"full-scan"`,
+		`"rows":1`,
+		`"rows_total":3`,
+		`"elapsed_ns":`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN ANALYZE missing %s: %s", want, plan)
 		}
 	}
 }

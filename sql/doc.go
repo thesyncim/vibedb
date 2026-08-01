@@ -33,7 +33,7 @@
 //	statement    = explain | select | insert | update | delete
 //	             | create-table | create-index ;
 
-//	explain      = "EXPLAIN" select ;
+//	explain      = "EXPLAIN" [ "ANALYZE" ] select ;
 //
 //	select       = "SELECT" [ "ALL" ] select-list
 //	               "FROM" table-ref { join }

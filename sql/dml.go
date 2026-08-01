@@ -70,10 +70,11 @@ const DocumentColumn = "$doc"
 // and because the six bodies are already concrete types a caller wants by name.
 type Statement struct {
 	Kind Kind
-	// Explain marks a SELECT whose caller requested its immutable logical plan
-	// instead of executing it. Select carries the explained target, so routing
-	// remains the same as an ordinary row-returning statement.
+	// Explain marks a SELECT whose caller requested plan output instead of the
+	// target rows. Analyze additionally asks the driver to execute that target
+	// and attach measured runtime work to the plan.
 	Explain     bool
+	Analyze     bool
 	Select      *SelectStmt
 	Insert      *InsertStmt
 	Update      *UpdateStmt

@@ -60,6 +60,7 @@ type keyword uint8
 const (
 	kwNone keyword = iota
 	kwAll
+	kwAnalyze
 	kwAnd
 	kwAs
 	kwAsc
@@ -169,6 +170,8 @@ func keywordOf(s string) keyword {
 	switch string(buf[:len(s)]) {
 	case "ALL":
 		return kwAll
+	case "ANALYZE":
+		return kwAnalyze
 	case "AND":
 		return kwAnd
 	case "AS":
