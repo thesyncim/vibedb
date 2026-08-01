@@ -225,7 +225,9 @@ func (p *Parser) parseLeafTail(agg AggKind, path *PathExpr, pos int) (*Expr, err
 		p.advance()
 		return p.parseBetweenTail(agg, path, pos, negated)
 	case p.atKeyword(kwLike), p.atKeyword(kwIlike):
-		return nil, p.errHere("pattern matching (LIKE) is not supported: the engine has no pattern operator, only equality, ordering, membership, and jsonb containment")
+		insensitive := p.atKeyword(kwIlike)
+		p.advance()
+		return p.parseLikeTail(agg, path, pos, negated, insensitive)
 	case p.atKeyword(kwSimilar):
 		return nil, p.errHere("SIMILAR TO is not supported: the engine has no pattern operator")
 	case negated:
@@ -258,6 +260,34 @@ func (p *Parser) parseLeafTail(agg AggKind, path *PathExpr, pos int) (*Expr, err
 	}
 	e := p.exprs.one()
 	*e = Expr{Kind: ExprCompare, Op: op, Agg: agg, Column: -1, Path: path, Value: value, Pos: pos}
+	return e, nil
+}
+
+// parseLikeTail parses LIKE and ILIKE. Pattern matching is a scalar string
+// predicate in the query engine, so its RHS is intentionally narrower than a
+// general comparison: accepting numbers or booleans would turn a type error
+// into a surprising string conversion.
+func (p *Parser) parseLikeTail(
+	agg AggKind, path *PathExpr, pos int, negated, insensitive bool,
+) (*Expr, error) {
+	if agg != AggNone {
+		return nil, p.errHere("LIKE does not apply to an aggregate result")
+	}
+	value, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	if value.Kind != OperandString && value.Kind != OperandParam {
+		return nil, p.errAt(value.Pos, "LIKE pattern must be a string literal or a placeholder")
+	}
+	if p.atKeyword(kwEscape) {
+		return nil, p.errHere("LIKE ... ESCAPE is not supported; use the default backslash escape")
+	}
+	e := p.exprs.one()
+	*e = Expr{
+		Kind: ExprLike, Negated: negated, Insensitive: insensitive,
+		Column: -1, Path: path, Value: value, Pos: pos,
+	}
 	return e, nil
 }
 

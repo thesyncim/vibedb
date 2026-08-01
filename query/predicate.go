@@ -5,6 +5,8 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
@@ -28,13 +30,15 @@ const (
 // values built by the constructors below; they compile with the query. The
 // zero Predicate is not a valid condition — build one with a constructor.
 type Predicate struct {
-	kind   predKind
-	path   string
-	op     Op
-	value  any    // Cmp literal, inferred at compile
-	json   string // Contains needle
-	values []any  // In alternatives, inferred at compile
-	kids   []Predicate
+	kind        predKind
+	path        string
+	op          Op
+	value       any    // Cmp literal, inferred at compile
+	json        string // Contains needle
+	pattern     string // Like pattern, using '%' and '_' wildcards
+	insensitive bool   // ILIKE uses Unicode simple case folding
+	values      []any  // In alternatives, inferred at compile
+	kids        []Predicate
 }
 
 type predKind uint8
@@ -56,6 +60,8 @@ const (
 	// exactly the code it has today — no extra load, no extra branch — on the
 	// path that already had its set.
 	predInBound
+	// predLike matches a string column against a SQL LIKE pattern.
+	predLike
 )
 
 // Cmp compares the value at path against a typed literal. The literal's Go
@@ -81,6 +87,20 @@ func Cmp(path string, op Op, value any) Predicate {
 // hands back for exact recheck.
 func In(path string, values ...any) Predicate {
 	return Predicate{kind: predIn, path: path, values: values}
+}
+
+// Like tests whether the string at path matches a SQL LIKE pattern. '%' matches
+// any sequence, '_' matches one Unicode code point, and backslash escapes the
+// following pattern character. Non-string, null, and absent values do not
+// match. Use ILike for case-insensitive matching.
+func Like(path, pattern string) Predicate {
+	return Predicate{kind: predLike, path: path, pattern: pattern}
+}
+
+// ILike is Like with Unicode simple case folding for literal pattern
+// characters. Wildcards and escapes retain the same meaning as Like.
+func ILike(path, pattern string) Predicate {
+	return Predicate{kind: predLike, path: path, pattern: pattern, insensitive: true}
 }
 
 // Contains tests PostgreSQL jsonb containment (@>): whether the value at path
@@ -298,6 +318,8 @@ type compiledPredicate struct {
 	op          Op
 	lit         scalar
 	needle      vibejson.Index
+	pattern     string
+	insensitive bool
 	probe       postProbe
 	boundPath   string
 	containPlan *compiledPredicate
@@ -398,6 +420,20 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		// later, against the snapshot's own catalog.
 		if len(needles) == len(lits) && len(lits) > 0 && reg.paths[col].single {
 			cp.probe = postProbe{kind: postIn, path: reg.paths[col].name}
+		}
+		return cp, nil
+	case predLike:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateLikePattern(p.pattern); err != nil {
+			return nil, fmt.Errorf("query: LIKE pattern: %w", err)
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predLike, col: col,
+			pattern: c.internString(p.pattern), insensitive: p.insensitive,
 		}
 		return cp, nil
 	case predContains:
@@ -812,6 +848,9 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return evalCmp(cols[p.col][row], p.op, p.lit)
 	case predIn:
 		return p.member(cols[p.col][row])
+	case predLike:
+		cell := cols[p.col][row]
+		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
 	case predInBound:
 		return s.binds[p.slot].matches(cols[p.col][row], &s.probes[p.slot])
 	case predContains:
@@ -842,6 +881,107 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 	default: // predNot
 		return !p.kids[0].eval(cols, row, s)
 	}
+}
+
+// validateLikePattern checks the only malformed pattern this matcher cannot
+// interpret: a trailing escape. The default SQL LIKE escape is backslash; an
+// explicit ESCAPE clause is rejected by the SQL parser because this compact
+// matcher deliberately has one fixed escape rule.
+func validateLikePattern(pattern string) error {
+	for i := 0; i < len(pattern); {
+		r, n := utf8.DecodeRuneInString(pattern[i:])
+		if r == '\\' {
+			if i+n == len(pattern) {
+				return fmt.Errorf("trailing backslash escape")
+			}
+			_, next := utf8.DecodeRuneInString(pattern[i+n:])
+			i += n + next
+			continue
+		}
+		i += n
+	}
+	return nil
+}
+
+// likeMatch implements the usual greedy LIKE matcher without allocating per
+// row. The last '%' is a backtracking point: when the literal after it does
+// not fit, the wildcard consumes one more input code point and matching
+// resumes at the first literal after the wildcard. Pattern and input are UTF-8
+// strings, so '_' and escaped literals operate on Unicode code points rather
+// than bytes.
+func likeMatch(pattern, text string, insensitive bool) bool {
+	pi, ti := 0, 0
+	star, starText := -1, -1
+	for ti < len(text) {
+		kind, r, next, ok := likeToken(pattern, pi)
+		switch {
+		case ok && kind == '%':
+			star, starText = next, ti
+			pi = next
+			continue
+		case ok && (kind == '_' || (kind == 'c' && runeEqual(r, runeAt(text, ti), insensitive))):
+			pi = next
+			ti += runeSize(text, ti)
+			continue
+		case star >= 0:
+			ti += runeSize(text, starText)
+			starText = ti
+			pi = star
+			continue
+		default:
+			return false
+		}
+	}
+	for pi < len(pattern) {
+		kind, _, next, ok := likeToken(pattern, pi)
+		if !ok || kind != '%' {
+			return false
+		}
+		pi = next
+	}
+	return true
+}
+
+// likeToken returns a pattern token. kind is '%' or '_' for wildcards and
+// 'c' for a literal code point, including one escaped by backslash.
+func likeToken(pattern string, pos int) (kind byte, literal rune, next int, ok bool) {
+	if pos >= len(pattern) {
+		return 0, 0, pos, false
+	}
+	r, n := utf8.DecodeRuneInString(pattern[pos:])
+	if r == '%' || r == '_' {
+		return byte(r), 0, pos + n, true
+	}
+	if r == '\\' {
+		if pos+n >= len(pattern) {
+			return 0, 0, pos, false
+		}
+		literal, m := utf8.DecodeRuneInString(pattern[pos+n:])
+		return 'c', literal, pos + n + m, true
+	}
+	return 'c', r, pos + n, true
+}
+
+func runeAt(s string, pos int) rune {
+	r, _ := utf8.DecodeRuneInString(s[pos:])
+	return r
+}
+
+func runeSize(s string, pos int) int {
+	_, n := utf8.DecodeRuneInString(s[pos:])
+	return n
+}
+
+func runeEqual(a, b rune, insensitive bool) bool {
+	if a == b || !insensitive {
+		return a == b
+	}
+	for folded := unicode.SimpleFold(a); folded != a; folded = unicode.SimpleFold(folded) {
+		if folded == b {
+			return true
+		}
+	}
+	return false
 }
 
 // coalesceEqualityDisjuncts rewrites the equalities within a disjunction into

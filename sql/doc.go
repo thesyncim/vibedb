@@ -337,9 +337,10 @@
 //
 // # What is refused, and why
 //
-// Each of these is refused with a message naming the missing capability:
-// COUNT(DISTINCT ...) (the reduction has no distinct variant); LIKE, ILIKE,
-// SIMILAR TO, and regular-expression operators (no pattern operator);
+// Each refused construct names its missing capability. COUNT(DISTINCT ...) has
+// no distinct reduction variant; SIMILAR TO and regular-expression operators
+// have no matcher. LIKE and ILIKE are supported with the default backslash
+// escape only.
 // correlated subqueries and subqueries in FROM or the SELECT list (the nested
 // executor evaluates uncorrelated predicate subqueries once); full, cross,
 // and natural joins and comma-separated FROM items; composite JOIN ... USING
@@ -351,10 +352,11 @@
 // The mutation and definition grammar refuses, each by name: a nested INSERT
 // column list, generated keys, INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT
 // DO UPDATE / ON DUPLICATE KEY, a path assignment in SET, two
-// assignments in one UPDATE, UPDATE ... FROM, DELETE ... USING, LIMIT / ORDER
-// BY / GROUP BY / HAVING on a mutation, a table alias on a single-collection
-// statement, DROP, ALTER, MERGE, REPLACE, TRUNCATE, CREATE VIEW, CREATE UNIQUE
-// INDEX, CREATE TABLE ... AS SELECT, a partial index, an index method or key
+// assignments in one UPDATE, UPDATE ... FROM, DELETE ... USING, GROUP BY /
+// HAVING on a mutation, unsupported mutation OFFSET or ordering forms, a table
+// alias on a single-collection statement, DROP INDEX, ALTER, MERGE, REPLACE,
+// TRUNCATE, CREATE VIEW, CREATE UNIQUE INDEX, CREATE TABLE ... AS SELECT, a
+// partial index, an index method or key
 // direction, DEFAULT, UNIQUE, CHECK, and FOREIGN KEY. INSERT also refuses the
 // old key/document pair: VALUES without a field list contains exactly one
 // complete JSON document whose declared primary-key field determines identity.

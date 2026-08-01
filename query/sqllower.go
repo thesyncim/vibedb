@@ -732,9 +732,45 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		// the same place from the other direction: its jsonb @> is UNKNOWN only
 		// for a SQL NULL column, which this model does not have.
 		return leafForm{pred: Contains(spec, e.Value.Text), total: true}, nil
+	case sqlast.ExprLike:
+		return s.likeForm(e, args)
 	default:
 		return leafForm{}, fmt.Errorf("query: unsupported predicate in SQL lowering")
 	}
+}
+
+func (s *Statement) likeForm(e *sqlast.Expr, args []any) (leafForm, error) {
+	if s.prepareMode && e.Value.Kind == sqlast.OperandParam {
+		// Prepare lowers parameterized statements once with int64(0) stand-ins
+		// so shape errors surface early. LIKE has a string-only RHS, so use an
+		// empty string for this shape pass and validate the real binding below.
+		pred := Like(s.spec(e.Path), "")
+		if e.Insensitive {
+			pred = ILike(s.spec(e.Path), "")
+		}
+		return leafForm{pred: pred, guard: s.c.not(IsNull(s.spec(e.Path)))}, nil
+	}
+	value, known, err := s.operand(e.Value, args)
+	if err != nil {
+		return leafForm{}, err
+	}
+	if !known {
+		return leafForm{noTrue: true, noFalse: true}, nil
+	}
+	var pattern string
+	switch v := value.(type) {
+	case *string:
+		pattern = *v
+	case string:
+		pattern = v
+	default:
+		return leafForm{}, fmt.Errorf("query: LIKE pattern must be bound to a string, got %T", value)
+	}
+	pred := Like(s.spec(e.Path), pattern)
+	if e.Insensitive {
+		pred = ILike(s.spec(e.Path), pattern)
+	}
+	return leafForm{pred: pred, guard: s.c.not(IsNull(s.spec(e.Path)))}, nil
 }
 
 func (s *Statement) subqueryCompareForm(e *sqlast.Expr) (leafForm, error) {

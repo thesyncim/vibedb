@@ -191,6 +191,16 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 		dumpLeaf(b, e)
 		b.WriteByte(' ')
 		dumpOperand(b, e.Value)
+	case ExprLike:
+		if e.Insensitive {
+			b.WriteString(negated(e, "ilike", "notilike"))
+		} else {
+			b.WriteString(negated(e, "like", "notlike"))
+		}
+		b.WriteByte(' ')
+		dumpLeaf(b, e)
+		b.WriteByte(' ')
+		dumpOperand(b, e.Value)
 	}
 	b.WriteByte(')')
 }

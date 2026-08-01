@@ -233,6 +233,10 @@ const (
 	// ExprContains is Path @> Value, jsonb-style containment, where Value is
 	// an OperandJSON.
 	ExprContains
+	// ExprLike is Path [NOT] LIKE/ILIKE Value. Value must be a string literal
+	// or a placeholder; the query lowerer executes SQL's '%' and '_' pattern
+	// operators and the optional backslash escape.
+	ExprLike
 	// ExprAnd is the conjunction of Kids.
 	ExprAnd
 	// ExprOr is the disjunction of Kids.
@@ -305,6 +309,8 @@ type Expr struct {
 	Path *PathExpr
 	// Value is the right operand of ExprCompare and ExprContains.
 	Value Operand
+	// Insensitive selects ILIKE rather than LIKE for ExprLike.
+	Insensitive bool
 	// List holds ExprIn's alternatives, and ExprBetween's two bounds.
 	List []Operand
 	// Kids holds the operands of ExprAnd and ExprOr, and the single operand of

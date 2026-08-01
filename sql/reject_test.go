@@ -103,8 +103,7 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 	runRejections(t, []rejection{
 		{"DISTINCT with GROUP BY", `SELECT DISTINCT a FROM t GROUP BY a`, 35, "grouping changes"},
 		{"COUNT DISTINCT", `SELECT COUNT(DISTINCT a) FROM t`, 13, "no distinct variant"},
-		{"LIKE", `SELECT a FROM t WHERE b LIKE 'x%'`, 24, "no pattern operator"},
-		{"ILIKE", `SELECT a FROM t WHERE b ILIKE 'x%'`, 24, "no pattern operator"},
+		{"LIKE ESCAPE", `SELECT a FROM t WHERE b LIKE 'x%' ESCAPE '!'`, 34, "LIKE ... ESCAPE"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"a subquery in FROM", `SELECT a FROM (SELECT b FROM u)`, 14, "subqueries are not supported"},
@@ -302,16 +301,16 @@ func TestRejectsMalformedContainmentNeedles(t *testing.T) {
 // TestErrorPositionsAreLineAndColumn checks that a multi-line statement reports
 // the line and column an editor would show, not just a byte offset.
 func TestErrorPositionsAreLineAndColumn(t *testing.T) {
-	src := "SELECT a\nFROM t\nWHERE b LIKE 'x'"
+	src := "SELECT a\nFROM t\nWHERE b LIKE 'x' ESCAPE '!'"
 	_, err := Parse(src)
 	var parseErr *ParseError
 	if !errors.As(err, &parseErr) {
 		t.Fatalf("Parse = %v, want *ParseError", err)
 	}
-	if parseErr.Line != 3 || parseErr.Col != 9 {
-		t.Fatalf("reported %d:%d, want 3:9", parseErr.Line, parseErr.Col)
+	if parseErr.Line != 3 || parseErr.Col != 18 {
+		t.Fatalf("reported %d:%d, want 3:18", parseErr.Line, parseErr.Col)
 	}
-	if !strings.Contains(parseErr.Error(), "3:9") {
-		t.Fatalf("Error() = %q, want it to show 3:9", parseErr.Error())
+	if !strings.Contains(parseErr.Error(), "3:18") {
+		t.Fatalf("Error() = %q, want it to show 3:18", parseErr.Error())
 	}
 }

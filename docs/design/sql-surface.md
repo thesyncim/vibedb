@@ -60,6 +60,12 @@ layout. Choosing one layout unconditionally is important: schema enforcement,
 exact-index maintenance, statement batches, and transaction support do not
 depend on the shape of the first INSERT.
 
+`DROP TABLE` removes the table from the durable SQL catalog before retiring its
+collection file. `DROP TABLE IF EXISTS` is an idempotent no-op for an absent
+table. Physical collection cleanup is deferred while active snapshots or
+cursors hold leases; a crash after catalog publication can leave only an
+unreachable orphan file, never a catalog entry pointing at missing data.
+
 Catalog publication uses a synced temporary file, atomic replacement, and a
 namespace durability fence (directory sync on Unix and a write-through move on
 Windows). The first table file is fully committed before its directory entry is
@@ -209,6 +215,8 @@ The driver exposes the shared SELECT surface, including:
 - whole-document and JSON-path projection;
 - `=`, `!=`, `<>`, `<`, `<=`, `>`, and `>=`;
 - `IN`, `NOT IN`, `BETWEEN`, and `NOT BETWEEN`;
+- `LIKE`, `NOT LIKE`, `ILIKE`, and `NOT ILIKE` with `%`, `_`, and the default
+  backslash escape;
 - `IS NULL`, `IS NOT NULL`, `IS MISSING`, and `IS NOT MISSING`;
 - JSON containment with `@>`;
 - `AND`, `OR`, `NOT`, and parentheses with SQL three-valued logic;
@@ -344,6 +352,20 @@ one UPDATE statement supplies one constant whole document, a predicate that
 matches several distinct primary keys returns `ErrUpdatePrimaryKey` before
 publication; use an explicit transaction with one replacement per key. DELETE
 removes every selected document and its exact-index postings.
+
+Bounded mutation windows are also supported:
+
+```sql
+DELETE FROM users WHERE state = ? ORDER BY id DESC LIMIT 10
+UPDATE users SET "$doc" = ? WHERE state = ? ORDER BY id LIMIT ?
+```
+
+The current durable implementation accepts one `ORDER BY` term on the
+declared primary-key path and requires `LIMIT`; an unordered `LIMIT` is also
+supported. Selection is global and bounded before publication, so the limit
+does not reset at scan-batch boundaries. `OFFSET`, multi-key ordering,
+non-primary-key ordering, and `ORDER BY` without `LIMIT` remain explicit
+errors.
 
 Mutation WHERE clauses use the same predicate compiler as SELECT, including
 three-valued logic. Primary-key equality and membership take the point path;
@@ -517,13 +539,12 @@ operation:
 
 - correlated subqueries and subqueries outside predicates, common table
   expressions, set operations, window functions, `COUNT(DISTINCT ...)`,
-  computed scalar expressions, pattern matching, and user-defined functions;
+  computed scalar expressions, and user-defined functions;
 - full outer, cross, natural, composite `USING`, chained, and multiple fan-out joins;
-- partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, mutation joins,
-  mutation `ORDER BY`/`LIMIT`;
+- partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
 - generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,
   `ON DUPLICATE KEY`, and nested flat-INSERT construction;
-- `ALTER`, `DROP`, `TRUNCATE`, views, unique/check/foreign-key/default/generated
+- `ALTER`, `TRUNCATE`, `DROP INDEX`, views, unique/check/foreign-key/default/generated
   constraints, and SQL types without a JSON equivalent;
 - unique/partial/range/full-text indexes, expression indexes, and selectable
   index methods;

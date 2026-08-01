@@ -106,7 +106,7 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwAlter):
 		return p.errHere("ALTER is not supported: a declared schema is frozen when the collection is created, and altering one would have to revalidate every stored document")
 	case p.atKeyword(kwTruncate):
-		return p.errHere("TRUNCATE is not supported: it is a metadata operation on a table, and this store has no such operation; write DELETE FROM, which removes documents one batch at a time")
+		return p.errHere("TRUNCATE is not supported: the durable store has no atomic collection-clear primitive; use bounded DELETE FROM statements when per-batch removal is acceptable")
 	}
 	dst.Kind, dst.Select = KindSelect, &p.sel
 	p.out = &p.sel
