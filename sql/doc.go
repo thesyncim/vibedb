@@ -35,13 +35,18 @@
 
 //	explain      = "EXPLAIN" [ "ANALYZE" ] select ;
 //
-//	select       = "SELECT" [ "ALL" ] select-list
+//	select       = [ with-clause ] "SELECT" [ "ALL" ] select-list
 //	               "FROM" table-ref { join }
 //	               [ "WHERE" predicate ]
 //	               [ "GROUP" "BY" path { "," path } ]
 //	               [ "HAVING" predicate ]
 //	               [ "ORDER" "BY" sort-key { "," sort-key } ]
 //	               [ limit-offset ] [ ";" ] EOF ;
+//
+//	with-clause  = "WITH" cte { "," cte } ;
+//	cte          = name [ "(" name { "," name } ")" ] "AS"
+//	               [ "MATERIALIZED" | "NOT" "MATERIALIZED" ]
+//	               "(" select ")" ;
 //
 //	select-list  = result-column { "," result-column } ;
 //	result-column= ( "*" | ident "." "*" | path | aggregate ) [ "AS" name ] ;
@@ -117,6 +122,16 @@
 // a physical collection without interpreting an empty name. LATERAL and joins
 // involving a derived relation are typed feature refusals until execution has
 // parameterized relation plans and derived join inputs.
+//
+// WITH is non-recursive and lexically scoped. A CTE body sees earlier sibling
+// definitions and enclosing WITH scopes; a nested WITH may shadow either.
+// Definitions retain source order, stable query identity, materialization
+// policy, output aliases, and placeholder ranges in the AST. A self or forward
+// spelling remains a physical-collection candidate because SQL permits a CTE
+// body to read a same-named catalog table; [TableRef.UnresolvedCTE] lets a
+// catalog-aware binder report the CTE-specific failure only after physical
+// lookup fails. WITH RECURSIVE and data-modifying bodies are typed feature
+// refusals.
 //
 // # Nested paths, and the one genuinely new decision
 //
@@ -355,9 +370,10 @@
 // escape only.
 // correlated and LATERAL subqueries and subqueries in the SELECT list (the
 // nested executor evaluates uncorrelated predicate and FROM subqueries once);
-// joins involving a derived relation; full, cross,
+// joins involving a derived relation or CTE; full, cross,
 // and natural joins and comma-separated FROM items; composite JOIN ... USING
-// (the current form accepts one simple field name); set operations, common table expressions, window functions, CASE,
+// (the current form accepts one simple field name); set operations, recursive
+// and data-modifying common table expressions, window functions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine
 // evaluates predicates over stored values, not computed expressions); ORDER BY
 // and GROUP BY over output positions or aggregates.

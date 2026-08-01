@@ -37,6 +37,9 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
 		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
 		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) AS d WHERE d.id = ?`,
+		`WITH active(id) AS MATERIALIZED (SELECT id FROM customers WHERE tier = ?), ` +
+			`selected AS NOT MATERIALIZED (SELECT id FROM active) SELECT id FROM selected WHERE id = ?`,
+		`WITH outer_cte AS (WITH inner_cte AS (SELECT id FROM docs) SELECT id FROM inner_cte) SELECT id FROM outer_cte`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -106,6 +109,37 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		t.Fatal("an accepted statement reads no relation")
 	}
 	seen := 0
+	if s.With != nil {
+		if len(s.With.CTEs) == 0 {
+			t.Fatal("WITH clause has no definitions")
+		}
+		for i := range s.With.CTEs {
+			cte := &s.With.CTEs[i]
+			if cte.Name == "" || cte.Query == nil {
+				t.Fatalf("WITH[%d] has invalid payload: %+v", i, cte)
+			}
+			if len(cte.Columns) != len(cte.ColumnPos) {
+				t.Fatalf("WITH[%d] has %d aliases and %d positions", i, len(cte.Columns), len(cte.ColumnPos))
+			}
+			for prior := 0; prior < i; prior++ {
+				if s.With.CTEs[prior].Name == cte.Name {
+					t.Fatalf("WITH[%d] duplicates name %q", i, cte.Name)
+				}
+			}
+			if cte.ColumnArityDeferred {
+				if cteOutputArityKnown(cte.Query) {
+					t.Fatalf("WITH[%d] deferred a statically known output arity", i)
+				}
+			} else if len(cte.Columns) > len(cte.Query.Columns) {
+				t.Fatalf("WITH[%d] has %d aliases for %d outputs", i, len(cte.Columns), len(cte.Query.Columns))
+			}
+			checkStatementInvariants(t, cte.Query)
+			if cte.Query.ParamBase != seen {
+				t.Fatalf("WITH[%d] ParamBase = %d, want %d", i, cte.Query.ParamBase, seen)
+			}
+			seen += cte.Query.Params
+		}
+	}
 	for i := range s.From {
 		ref := &s.From[i]
 		if ref.Alias == "" {
@@ -120,7 +154,7 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 				t.Fatalf("From[%d] has invalid collection payload: %+v", i, ref)
 			}
 		case RelationDerived:
-			if ref.Name != "" || ref.Query == nil || !ref.HasAlias || i != 0 || len(s.From) != 1 {
+			if ref.Name != "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || !ref.HasAlias || i != 0 || len(s.From) != 1 {
 				t.Fatalf("From[%d] has invalid derived payload: %+v", i, ref)
 			}
 			checkStatementInvariants(t, ref.Query)
@@ -128,6 +162,10 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 				t.Fatalf("From[%d] derived ParamBase = %d, want %d", i, ref.Query.ParamBase, seen)
 			}
 			seen += ref.Query.Params
+		case RelationCTE:
+			if ref.Name == "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || i != 0 || len(s.From) != 1 {
+				t.Fatalf("From[%d] has invalid CTE payload: %+v", i, ref)
+			}
 		default:
 			t.Fatalf("From[%d] has unknown relation kind %d", i, ref.Kind)
 		}

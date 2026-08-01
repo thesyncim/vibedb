@@ -62,7 +62,6 @@ var unsupportedStatements = map[string]string{
 	"CALL": "there are no stored procedures",
 	"DO":   "there is no procedural language",
 
-	"WITH":   "common table expressions are not supported: the engine executes one plan and has no nested execution",
 	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
 	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
 }

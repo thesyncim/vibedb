@@ -15,7 +15,6 @@ func TestLeadingFeatureRefusalsAreTypedAndPositioned(t *testing.T) {
 		{"copy", "COPY docs TO STDOUT", "COPY is not supported"},
 		{"savepoint", "SAVEPOINT nested", "savepoints are not supported"},
 		{"alter table", "ALTER TABLE docs ADD COLUMN n STRING", "ALTER is not in the bounded catalog subset"},
-		{"common table expressions", "WITH x AS (SELECT 1) SELECT * FROM x", "common table expressions are not supported"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseStatement(tc.src)

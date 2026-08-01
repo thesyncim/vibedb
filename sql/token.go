@@ -108,6 +108,7 @@ const (
 	kwLeft
 	kwLike
 	kwLimit
+	kwMaterialized
 	kwMax
 	kwMerge
 	kwMin
@@ -125,6 +126,7 @@ const (
 	kwOver
 	kwPrimary
 	kwReplace
+	kwRecursive
 	kwReturning
 	kwRight
 	kwSelect
@@ -148,7 +150,7 @@ const (
 
 // maxKeywordLen is the longest keyword above. It bounds the stack buffer
 // keywordOf folds into, so keyword recognition needs no map and no heap.
-const maxKeywordLen = 9 // INTERSECT
+const maxKeywordLen = 12 // MATERIALIZED
 
 // keywordOf recognizes s case-insensitively, or answers kwNone.
 //
@@ -269,6 +271,8 @@ func keywordOf(s string) keyword {
 		return kwLike
 	case "LIMIT":
 		return kwLimit
+	case "MATERIALIZED":
+		return kwMaterialized
 	case "MAX":
 		return kwMax
 	case "MERGE":
@@ -303,6 +307,8 @@ func keywordOf(s string) keyword {
 		return kwPrimary
 	case "REPLACE":
 		return kwReplace
+	case "RECURSIVE":
+		return kwRecursive
 	case "RETURNING":
 		return kwReturning
 	case "RIGHT":

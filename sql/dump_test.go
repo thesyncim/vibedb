@@ -19,6 +19,36 @@ import (
 
 func dumpStmt(s *SelectStmt) string {
 	var b strings.Builder
+	if s.With != nil {
+		b.WriteString("with")
+		for i := range s.With.CTEs {
+			cte := &s.With.CTEs[i]
+			fmt.Fprintf(&b, " %s", cte.Name)
+			if len(cte.Columns) != 0 {
+				b.WriteByte('(')
+				for j, name := range cte.Columns {
+					if j != 0 {
+						b.WriteByte(',')
+					}
+					b.WriteString(name)
+				}
+				b.WriteByte(')')
+			}
+			switch cte.Materialization {
+			case CTEMaterialized:
+				b.WriteString(" materialized")
+			case CTENotMaterialized:
+				b.WriteString(" not-materialized")
+			}
+			if cte.ColumnArityDeferred {
+				b.WriteString(" arity-deferred")
+			}
+			b.WriteString("=(")
+			b.WriteString(dumpStmt(cte.Query))
+			b.WriteByte(')')
+		}
+		b.WriteByte(' ')
+	}
 	b.WriteString("select")
 	if s.Distinct {
 		b.WriteString(" distinct")
@@ -100,8 +130,15 @@ func dumpTable(b *strings.Builder, t *TableRef) {
 		b.WriteString("derived(")
 		b.WriteString(dumpStmt(t.Query))
 		b.WriteByte(')')
+	case RelationCTE:
+		b.WriteString("cte(")
+		b.WriteString(t.Name)
+		b.WriteByte(')')
 	default:
 		fmt.Fprintf(b, "relation-kind-%d", t.Kind)
+	}
+	if t.UnresolvedCTE.Kind != CTEReferenceNone {
+		fmt.Fprintf(b, " unresolved-cte-%d", t.UnresolvedCTE.Kind)
 	}
 	if t.HasAlias {
 		fmt.Fprintf(b, "/%s", t.Alias)
