@@ -140,6 +140,183 @@ masked-density sweeps are not carried forward because the current named
 benchmark reproduces one occupied row per live posting tile, not the former
 1/4/16/dense matrix.
 
+## Parser and internal threshold provenance
+
+Machine-specific microbenchmarks are recorded here, not in exported Go
+documentation. They are regression and tuning evidence, not portable API
+promises. The following historical measurements were taken on an Apple M4 Max
+with Go 1.26; rerun the named benchmarks on the intended deployment machine
+before changing a threshold.
+
+### SQL parser
+
+A warmed `sql.Parser` refills retained arenas and measured zero allocations per
+parse. The simple SELECT measured about 118 ns, while the join and grouped
+aggregate shapes each measured about 730 ns, roughly 180 MB/s of statement
+text. The owning package-level `sql.Parse` convenience path measured about 11
+allocations for the simple SELECT.
+
+```sh
+go test ./sql -run '^$' \
+  -bench 'BenchmarkParse($|/)|BenchmarkParseStatement|BenchmarkParseOneShot' \
+  -benchmem -count=10
+```
+
+### Join strategy thresholds
+
+`BenchmarkJoinThresholdSweep` measured nanoseconds per outer row for the two
+heap strategies:
+
+| inner matches | membership | membership + index | lookup |
+| ---: | ---: | ---: | ---: |
+| 16 | 76.2 | 4.2 | 175.2 |
+| 256 | 121.0 | 23.6 | 176.7 |
+| 1,024 | 153.4 | 101.2 | 183.2 |
+| 2,048 | 175.3 | 134.0 | 180.8 |
+| 3,072 | 188.5 | 172.6 | 184.9 |
+| 4,096 | 210.9 | 208.1 | 183.4 |
+| 16,384 | 381.2 | 664.5 | 191.7 |
+| 65,536 | 1,196.3 | 8,090.0 | 235.4 |
+
+That crossover is the provenance for `joinMembershipMax = 2048`. The count is
+used instead of byte size because comparison work and cache footprint scale
+with entries. The unindexed crossover is the conservative one; the benchmark
+did not justify a second index-dependent threshold.
+
+`BenchmarkJoinCostModel` separately measured the heap semi-join filter inputs:
+
+| inner collection | inner row scanned | outer row probed | probe / scan |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 44.8 | 199.8 | 4.5 |
+| 10,000 | 44.7 | 229.5 | 5.1 |
+| 100,000 | 47.4 | 389.2 | 8.2 |
+| 400,000 | 52.4 | 546.3 | 10.4 |
+
+The floor of the measured break-even range is the provenance for
+`joinBloomScanRatio = 4`. This gate compares exact materialized counts; it is
+not a cardinality estimator.
+
+The durable filter needs a separate threshold because its filter-building scan
+is serial while an ordinary durable scan is parallel. At 1% inner selectivity,
+`BenchmarkDurableJoinFilterCrossover` measured:
+
+| inner / outer | unfiltered | forced filter | outcome |
+| ---: | ---: | ---: | ---: |
+| 0.5 | 270.7 | 91.2 | filter 2.97× faster |
+| 1.0 | 252.3 | 129.2 | filter 1.95× faster |
+| 2.0 | 255.2 | 208.5 | filter 1.22× faster |
+| 4.0 | 260.9 | 369.1 | filter 1.41× slower |
+
+The crossing near 2.6 is the provenance for `joinFileBloomScanRatio = 2`.
+Parallelizing the bind scan would invalidate this result and requires both a
+new sweep and a new balance proof for the reused file-worker channels.
+
+```sh
+go test ./query -run '^$' \
+  -bench 'BenchmarkJoinThresholdSweep|BenchmarkJoinCostModel|BenchmarkDurableJoin(CostModel|FilterCrossover)' \
+  -benchmem -count=10
+```
+
+### Bulk construction and value dictionaries
+
+On the 100,000-row, 24 MiB bulk corpus, `store.Builder` plus `Build` measured
+821 allocated bytes and 0.19 allocations per row; repeated `Collection.Put`
+measured about 7.8 KiB and 14 allocations per row. Builder construction peaked
+at 77 MiB of live Go heap and 119 MiB of `MemStats.HeapSys`, versus 3.9 MiB of
+steady-state `HeapAlloc` after publication. These values explain the stable API
+guidance: use Builder for bulk load, and size the process for load high-water,
+not only the final collection.
+
+For the same class of loaded collection, one 100,000-document, 24 MiB corpus
+measured 3.9 MiB of Go `HeapAlloc` against 165 MiB of peak process RSS because
+published pointer-free blocks live outside the Go heap. Use `store.Stats` for
+off-heap collection bytes and process metrics for total residency; neither
+`HeapAlloc` alone nor a post-load sample describes the high-water footprint.
+
+The executable allocation gates are:
+
+```sh
+go test ./store -run 'TestStore(BuilderPageArenaAllocation|BuilderBulkLoadAllocation|CollectionReplaceAllocation)' -count=10
+```
+
+Value dictionaries are an at-rest lever, not a live-heap lever. On the long
+repeated-enum corpus they added 36 B per document to a Segment and 64 B per
+document to a chunked Collection while modeling 103 B per document of
+persisted-source saving. In the length-floor sweep, lowering the floor from 16
+to 8 increased modeled saving from 38.2 to 47.2 B per document but live cost
+from 19.7 to 36.6 B per document. That tradeoff is the provenance for the
+16-byte default; the algebraic sighting economics remain executable in
+`TestValueDictSightingEconomics`.
+
+```sh
+go test ./store -run 'TestValueDict(SightingEconomics|FloorKeepsShortInline)' -count=10
+```
+
+Other implementation constants retain named benchmark coverage beside the
+code. Their machine results should be published here when used to change a
+default; source comments describe only the stable invariant and name the
+benchmark that must be rerun.
+
+### Migrated local optimization records
+
+The following historical observations explain current implementation shapes.
+They were moved out of permanent source/API comments so they can be refreshed
+without changing package documentation:
+
+- Reusing the durable execution pool removed a fixed 18 allocations and about
+  2.3 KiB per warm execution. Building temporary per-batch postings in the
+  favorable 1%-selectivity filtered-count case cost 4.2 allocations per scanned
+  document and ran 1.9× slower, so pushdown uses persistent snapshot indexes and
+  each admitted batch takes one columnar pass.
+- Per-batch arena generations replaced a scheduler-dependent rewind condition.
+  Under the race detector, the old condition retained about 1.0 MiB for a
+  `LIMIT 10` over 50,000 documents when workers stayed busy, versus about 18 KiB
+  when they happened to idle.
+- Build-and-retry for containment tapes measured 134.5 ns for `BuildIndex` on
+  the 245-byte fixture, versus 257 ns for an exact pre-count before the build.
+- The parallel scan sweep on 16 processors measured the following ns/document
+  for a 1% filter; it is the provenance for the 1,024-row split floor and
+  256-row-per-worker policy:
+
+  | rows | narrow w=1 | narrow w=2 | narrow w=4 | wide w=1 | wide w=2 | wide w=4 |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 256 | 31.4 | 39.7 | 36.6 | 60.8 | 70.2 | 46.9 |
+  | 512 | 31.0 | 34.8 | 24.3 | 58.5 | 49.1 | 40.4 |
+  | 1,024 | 30.9 | 27.7 | 19.4 | 57.3 | 38.6 | 31.5 |
+  | 4,096 | 29.9 | 19.7 | 13.2 | 58.4 | 30.2 | 16.4 |
+
+- Passing SipHash state by value enabled inlining and changed the 14-byte-key
+  hash profile from about 84 ns to about 20 ns. The resident primary router's
+  packed fence prefix addressed a separate roughly 90 ns byte-search cost at
+  100,000 keys.
+- Flat pooled exact-term build scratch removed about 630 KiB of transient
+  allocation per 10,000-posting build; avoiding per-posting identity strings
+  accounted for roughly 220 KiB of that class. Passing a just-derived chunk-0
+  mask directly into leaf construction avoided duplicated codec selection that
+  had been about half of checkpoint-fold encode CPU on the 10,000-shape fixture.
+- Primary-leaf placement on the 100,000-mutation, 513-leaf churn fixture held
+  adjacency near 25× for about 7% file-size cost. An 8 KiB stride reached about
+  50×; 12 KiB reached about 5× for about 19% file-size cost. Rerun
+  `BenchmarkFilePrimaryChurn` before changing the stride.
+- The former free-space tree lost reclaimed extents across reopen: identical
+  write volume occupied 6.3 MiB in one session and 23.9 MiB across eight. The
+  self-describing segmented free log exists to make the durable and in-memory
+  free sets identical after every commit and reopen.
+- Raising durability `GroupLimit` from 2 to 64 did not change achieved group
+  size or throughput in the measured writer shapes; it caps a group already
+  formed. `CommitCoalesce`, not `GroupLimit`, controls intentional waiting.
+
+Relevant local gates can be rerun with:
+
+```sh
+go test ./query -run '^$' \
+  -bench 'BenchmarkSegmentParallel|BenchmarkNarrowRowParallel|BenchmarkJoinBloomPrefilter' \
+  -benchmem -count=10
+go test ./store/durable -run '^$' \
+  -bench 'BenchmarkFilePrimaryChurn|BenchmarkPrimaryExactProbe|BenchmarkFileStoreCommitGrouping' \
+  -benchmem -count=10
+```
+
 ## Reading the numbers honestly
 
 - Compare only equal durability lanes, checkpoint cadence, operation mix, and

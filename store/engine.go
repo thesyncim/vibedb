@@ -302,10 +302,10 @@ func prepareStoreSegment(
 	// len(src)+2 scratch tape — an order of magnitude more entries than any
 	// document actually has — builds into it, copies the exact tape out through
 	// exactSpillTape, and sealIngest discards the scratch at the end of this
-	// same rebuild. Measured on a 240-byte corpus that was 3.8 kB of pure
-	// garbage per Put, a third of everything Put allocated, to produce a
-	// 416-byte tape. Reserving from the chunk's own measured entries-per-byte
-	// removes both allocations and leaves tens of bytes of slack instead.
+	// same rebuild. Reserving from the chunk's own observed entries-per-byte
+	// removes both transient growth allocations while keeping the retained slack
+	// bounded. The allocation gate and measured provenance live in
+	// TestStoreCollectionReplaceAllocation and docs/performance.md.
 	entryCap := storeReplacementEntries(old, replaceSlot, replaceBytes)
 	if !options.ShapeTapes || old == nil {
 		if entryCap != 0 {
@@ -902,10 +902,12 @@ func (c *Collection) noteChunkPostingsLocked(id uint32, old, next *Chunk) {
 	}
 }
 
-// Snapshot returns the collection's current immutable view. It is O(1), never
-// blocks a writer, and remains valid while later writes publish new views.
-// The error return always reports nil; it exists so collection satisfies the same
-// [Mutable] shape as durable.Collection, whose Snapshot can fail on I/O.
+// Snapshot returns this in-memory collection's current immutable view. This
+// heap-only operation is O(1), never blocks a writer, and remains valid while
+// later writes publish new views. Durable collection snapshots have a distinct
+// bounded-fold contract. The error return always reports nil; it exists so
+// Collection satisfies the same [Mutable] shape as durable.Collection, whose
+// Snapshot can fail on I/O.
 func (c *Collection) Snapshot() (Snapshot, error) {
 	return Snapshot{state: c.state.Load()}, nil
 }

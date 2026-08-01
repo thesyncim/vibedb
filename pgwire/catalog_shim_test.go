@@ -351,7 +351,10 @@ func TestPSQLDescribeMissingTableResolvesToZeroRows(t *testing.T) {
 	assertReadyStatus(t, msgs, statusIdle)
 
 	// An unknown oid in the detail queries is the same contract.
-	msgs = c.query(catalogQueryFor(t, `\d name: pg_class row`, "16385"))
+	// The fixture owns two tables and therefore legitimately assigns 16384 and
+	// 16385. Use the largest valid uint32 oid so this remains unknown as the
+	// fixture grows without relying on the current table count.
+	msgs = c.query(catalogQueryFor(t, `\d name: pg_class row`, "4294967295"))
 	if has(msgs, msgErrorResponse) || len(rowsOf(t, msgs)) != 0 {
 		t.Fatalf("unknown-oid detail query did not answer zero rows: %s", tags(msgs))
 	}

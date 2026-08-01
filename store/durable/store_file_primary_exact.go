@@ -630,10 +630,9 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	}
 	// Sentinel-terminated two-array merge: both sides end on an impossible
 	// tile id, so the hot loop carries no bounds checks, and the flat-table
-	// liveness probe is inlined (hoisted slot array + mask) — together these
-	// are what hold the 64-mutation worst case inside the 1.5 µs gate. The
-	// scratch write-back happens after the sentinels so their grown capacity
-	// is what the workspace retains.
+	// liveness probe is inlined (hoisted slot array + mask). The scratch
+	// write-back happens after the sentinels so their grown capacity is what the
+	// workspace retains. BenchmarkPrimaryExactProbe owns the measured gate.
 	overlay = append(overlay, primaryExactProbeTile{tileID: ^uint32(0)})
 	base = append(base, primaryExactProbeTile{tileID: ^uint32(0)})
 	if workspace != nil {

@@ -14,8 +14,9 @@ import (
 // hold it could persist exactly one edit per commit, because mutating a tree
 // costs pages, allocating those pages changes the free set, and a changed free
 // set changes the tree's shape. Everything a commit reclaimed past the first
-// extent stayed in memory and was abandoned at the next restart, clean or not:
-// the same write volume cost 6.3 MiB in one session and 23.9 MiB across eight.
+// extent stayed in memory and was abandoned at the next restart, clean or not,
+// so identical write volume consumed progressively more space across restarts.
+// The measured reproduction lives in docs/performance.md.
 //
 // A flat log breaks that cycle because a record can describe its own
 // allocation. Content is fixed once an extent is chosen, so d records need

@@ -204,11 +204,9 @@ type Options struct {
 	BufferCount int
 	QueueSlots  int
 	// GroupLimit caps how many adjacent generations share one durability
-	// fence; zero selects 32. It is a ceiling, not a target, and measurement
-	// shows it is almost never the binding constraint: how many generations are
-	// queued when the worker picks one up is. Raising it from 2 to 64 changes
-	// neither the achieved group size nor throughput on any writer shape tested.
-	// Reach for CommitCoalesce instead.
+	// fence; zero selects 32. It limits an already formed group rather than
+	// waiting to create one; CommitCoalesce is the option that permits such a
+	// wait. Measured tuning results live in docs/performance.md.
 	GroupLimit int
 	// CommitCoalesce bounds optional durability grouping. The background
 	// committer uses it to wait for adjacent accepted generations; the opt-in

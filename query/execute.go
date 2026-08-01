@@ -311,13 +311,12 @@ type evalScratch struct {
 // entry storage and returns the resulting Index, which borrows src.
 //
 // It builds first and grows on [document.ErrIndexFull] rather than sizing the
-// tape with [vibejson.RequiredIndexEntries] first. That count is not cheap
-// bookkeeping: it is a second complete validation pass over the same bytes,
-// and it runs once per row here. Measured on the 245-byte benchmark document,
-// the pre-count costs 257 ns against BuildIndex's 134.5 ns, so sizing exactly
-// made a containment row nearly three times the price of the build it was
-// sizing. Build-and-retry is the shape store.Collection.validateDocument and
-// store.Segment.buildDoc already use, for exactly this reason.
+// tape with [vibejson.RequiredIndexEntries] first. That count is a second
+// complete validation pass over the same bytes, and it runs once per row here.
+// The containment benchmark shows that exact pre-sizing costs more than the
+// build it sizes. Build-and-retry is the shape store.Collection.validateDocument
+// and store.Segment.buildDoc already use, for exactly this reason; measured
+// results live in docs/performance.md.
 //
 // The scratch outlives the scan, so a retry is a warmup cost and not a
 // per-row one: the cold rows of a scan double the buffer a few times, and

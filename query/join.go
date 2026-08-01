@@ -25,12 +25,10 @@ import (
 //
 // Choosing a driving side is the hard part of any join planner, and doing it
 // well normally needs cardinality statistics. This engine has none, and the
-// consequence of guessing wrong is not a rounding error: a nested-equality
-// probe costs 126 ns per document against a DocSet or a durable segment and
-// 1.77 ns against a heap Snapshot, a 71x cliff that sits at a path-shape
-// boundary an estimator cannot see. A planner that guessed would therefore be
-// wrong by two orders of magnitude on exactly the shapes it could not
-// distinguish.
+// cost changes sharply across storage and path shapes an estimator cannot see.
+// A planner that guessed would therefore be wrong on exactly the shapes it
+// could not distinguish. The measured cost tables live in
+// docs/performance.md.
 //
 // So nothing is estimated. The inner side runs first, its join-key values are
 // collected, and the collection stops the moment it passes a threshold:
@@ -379,79 +377,21 @@ func (c *compiler) joinPlan(index int) *plan {
 // before it abandons the membership strategy and drives the join as a per-row
 // keyed lookup instead.
 //
-// It is a measured crossover, not a guess. BenchmarkJoinThresholdSweep runs one
-// query over a 20,000-row driving collection with the threshold forced to each
-// side, so every pair of rows below differs only in which strategy answered
-// identical work (ns per outer row, Apple M4 Max, Go 1.26):
-//
-//	inner matches   membership   membership+index   lookup
-//	           16         76.2                4.2    175.2
-//	          256        121.0               23.6    176.7
-//	        1,024        153.4              101.2    183.2
-//	        2,048        175.3              134.0    180.8
-//	        3,072        188.5              172.6    184.9
-//	        4,096        210.9              208.1    183.4
-//	       16,384        381.2              664.5    191.7
-//	       65,536      1,196.3            8,090.0    235.4
-//
-// The lookup is nearly flat because its cost is one hash probe and one document
-// decode per outer row whatever the inner side looks like. The membership's is
-// not: it pays an inner scan proportional to the matches, and then a search per
-// outer row over a set that stops being cache-resident. The two cross between
-// 2,048 and 3,072 without an index, and between 4,096 and 8,192 with one, where
-// the membership's per-row search is replaced by one index probe per value and
-// a mask intersection.
-//
-// 2,048 is the last power of two on the membership's side of the unindexed
-// crossing, and comfortably inside the indexed one. Choosing the lower of the
-// two is deliberate, because the penalties are not symmetric: below the crossing
-// the membership is 2.4x faster without an index and 48x with one, so giving
-// that up early is expensive, while just above it the membership is only about
-// 1.01x slower before the threshold cuts it off. Making the threshold
-// index-aware — 4,096 when the outer path carries a ready exact index — was
-// measured and declined twice, before and after the executor grew its late
-// materialization phase: at 4,096 it would buy 2% (178.7 against 182.8), for a
-// second constant and a branch on a decision that has to be made while the set
-// is still being collected.
-//
-// The threshold counts values rather than bytes because what makes a large
-// membership expensive is the comparisons per outer row and the cache lines the
-// set spans, and both scale with the count, not with the spelling.
+// BenchmarkJoinThresholdSweep establishes the crossover. The threshold counts
+// values rather than bytes because comparison work and cache footprint scale
+// with entry count, not spelling. Exact measurements and the reason for using
+// one conservative threshold for indexed and unindexed joins live in
+// docs/performance.md.
 const joinMembershipMax = 2048
 
 // joinBloomScanRatio is how many inner rows the binder will scan, per outer row,
 // to build a semi-join reduction filter.
 //
-// It is the break-even ratio of two per-row costs this package measures
-// directly, in BenchmarkJoinCostModel (Apple M4 Max, Go 1.26, ns per row,
-// allocation-free steady state):
-//
-//	inner collection   inner row scanned   outer row probed   ratio
-//	           1,000                44.8              199.8     4.5
-//	          10,000                44.7              229.5     5.1
-//	         100,000                47.4              389.2     8.2
-//	         400,000                52.4              546.3    10.4
-//
-// A probe is the expensive one and gets more so as the inner collection grows:
-// it is a random hash lookup into a structure that stops fitting cache, plus a
-// document admission, plus a path resolution per inner filter path, plus the
-// filter itself. Scanning stays sequential and stays flat. Four is the floor of
-// the lowest break-even measured, so it is the one that holds everywhere in the
-// range — and it held across the executor's late-materialization rewrite, which
-// moved every absolute number here without moving the constant.
-//
-// Earlier this constant was set to half the break-even, as insurance against
-// not knowing how much of the outer side a filter would reject. That insurance
-// is no longer needed and was actively harmful — it declined filters measured
-// to be 1.55x wins — because keepFiltering now measures that rejection on real
-// rows instead of assuming it. The pre-scan gate's job is only to bound how
-// much scanning a filter may attempt before the measurement exists.
-//
-// What this is not is a cardinality estimator. Both quantities it compares —
-// the inner candidate popcount and the driving snapshot's length — are exact
-// counts already materialized before the scan starts. The engine still refuses
-// to estimate how many rows a predicate will select; it only refuses to spend
-// more on finding out than the answer can be worth.
+// BenchmarkJoinCostModel establishes the break-even. This is not a cardinality
+// estimate: both inputs are exact counts already materialized before the scan,
+// and keepFiltering measures rejection on real rows. The gate only bounds how
+// much pre-scan work may be spent before that evidence exists. Exact cost tables
+// and reproduction commands live in docs/performance.md.
 const joinBloomScanRatio = 4
 
 // joinBatchRows is how many inner rows are extracted, filtered, and collected
@@ -1256,21 +1196,14 @@ func (j *planJoin) drain(
 // real rows, and a filter over an inner predicate that keeps nearly everything
 // cannot reject much of anything, because a filter holding nearly every inner
 // key admits every outer key that exists. That is the case the pre-scan gate
-// cannot see and the case where a filter is pure loss — measured at 1.56x
-// slower than never building one.
+// cannot see and the case where a filter is pure loss.
 //
 // The comparison weighs the gain against the WHOLE scan, not against the part
-// of it still to come. That is not what the sunk-cost argument says it should
-// be, and the sunk-cost argument is the one that lost. An earlier version here
-// compared against the remaining scan on the reasoning that rows already read
-// are paid for whichever way this goes; BenchmarkJoinBloomPrefilter then
-// measured that version keeping a filter at 50% inner selectivity and being 7%
-// slower for it (297.2 against 278.2 ns per outer row), where the total form
-// abandons and lands within noise of not building one (283.9 against 280.6).
-// The marginal model is wrong because it accounts for none of what a surviving
-// filter goes on to cost: a test on every outer row, and 64 KiB of blocks
-// competing for cache with the scan itself. Charging the whole scan is the
-// cruder rule that happens to price those in.
+// of it still to come. BenchmarkJoinBloomPrefilter rejects the tempting
+// sunk-cost model: it accounts for none of what a surviving filter goes on to
+// cost, including a test on every outer row and its blocks competing with the
+// scan for cache. Charging the whole scan is the conservative rule that prices
+// those in; the exact comparison lives in docs/performance.md.
 //
 // A completed scan is still never abandoned, for a reason the measurement does
 // not contradict: at that point there is no scan left to save at all, only the

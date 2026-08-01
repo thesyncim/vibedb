@@ -1,13 +1,16 @@
 # vibedb
 
 vibedb is an embedded JSON document database written in Go. It provides a
-mutable in-memory store, a bounded-residency durable store, immutable O(1)
+mutable in-memory store, a bounded-residency durable store, immutable generation
 snapshots, exact JSON indexes, ordered scans, and a typed query engine. Durable
 mutations publish semantically complete generations. Eligible foreground lanes
 represent a generation as an immutable canonical base plus a bounded,
 generation-stamped row overlay; point reads and scans merge that overlay
 exactly, including delete records. The overlay is folded by bounded foreground
 checkpoint work—there is no background compaction or offline maintenance.
+Creating a durable snapshot may wait for the current writer and seal bounded
+dirty overlay/parent state; pinning the sealed immutable generation itself is
+constant time.
 
 The project is unreleased. Public APIs and the primary-file version-0 on-disk
 format may change in place; development files are recreated after a format

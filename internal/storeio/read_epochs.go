@@ -5,11 +5,10 @@ import (
 	"unsafe"
 )
 
-// readEpochSlots is fixed so the writer's complete reader scan is a handful of
-// loads from one cache line. Direct point reads occupy a slot for well under a
-// microsecond, so eight concurrent slots absorb far more read parallelism than
-// the store's measured read throughput ever produces; a full table falls back
-// to the still-correct generation-lease path rather than spinning.
+// readEpochSlots is fixed so the writer's complete reader scan remains bounded
+// and cache-local. Eight slots cover the short direct-read critical sections;
+// a full table falls back to the still-correct generation-lease path rather
+// than spinning. The sizing measurements live in docs/performance.md.
 const readEpochSlots = 8
 
 // readEpochActive distinguishes an occupied slot from the idle zero word while

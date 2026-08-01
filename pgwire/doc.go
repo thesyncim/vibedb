@@ -289,12 +289,16 @@
 // the session arms the query executor's reusable atomic CancelFlag only while
 // a Query, Execute, or transaction-finalizing Sync is active. A request which
 // arrives while the backend is idle is ignored rather than retained to cancel
-// the next command. Heap and durable scans, parallel workers, joins, filtered
-// DML, and spill I/O check the flag at bounded units of work. Cancellation
-// drains reusable pipelines, releases snapshot leases, removes spill files,
-// exposes no partial materialized result, and reports 57014. During DataRow
-// delivery it stops at the next row boundary; rows already written cannot be
-// retracted, which is ordinary PostgreSQL error-stream behavior.
+// the next command. Before execution, UTF-8 admission, simple-query statement
+// splitting, command classification, transaction/SET/fixed-result parsing,
+// catalog recognition, Parse-message ownership copying, and numbered-parameter
+// rewriting check the same signal at bounded byte or token intervals. Heap and
+// durable scans, parallel workers, joins, filtered DML, and spill I/O then check
+// it at bounded units of work. Cancellation drains reusable pipelines, releases
+// snapshot leases, removes spill files, exposes no partial materialized result,
+// and reports 57014. During DataRow delivery it stops at the next row boundary;
+// rows already written cannot be retracted, which is ordinary PostgreSQL
+// error-stream behavior.
 //
 // Socket admission keeps a small pre-startup cushion above MaxConnections so a
 // CancelRequest has an opportunity to contend when all ordinary session slots
@@ -308,10 +312,10 @@
 // starvation indefinite under a hostile or stalled peer.
 //
 // Cancellation is cooperative rather than an abandoned execution goroutine.
-// Its latency is the executor's bounded checkpoint interval plus any durable
-// operation already inside one indivisible publication step. Once durable
-// publication begins it runs to completion and returns its storage outcome;
-// SQL DDL may explicitly return
+// Its latency is one bounded protocol pre-parser interval, then the executor's
+// bounded checkpoint interval, plus any durable operation already inside one
+// indivisible publication step. Once durable publication begins it runs to
+// completion and returns its storage outcome; SQL DDL may explicitly return
 // [github.com/thesyncim/vibedb/store/durable.ErrCommitOutcomeUnknown] after a
 // namespace publication whose durability fence failed. Returning early while
 // a write continued invisibly would be less correct than surfacing that
@@ -325,7 +329,10 @@
 // frontend body at most 16 MiB; every declared element count is checked against
 // the bytes actually present, and every field accessor bounds-checks and
 // latches a failure rather than panicking. Text is checked against the UTF-8
-// encoding the server reports.
+// encoding the server reports. Protocol-side linear scans checkpoint
+// cancellation at least once per 4 KiB of input, including inside quoted
+// literals and comments, so the message-size bound cannot become a
+// non-interruptible parser-size bound.
 //
 // Per-message bounds are not treated as per-session bounds. Prepared names,
 // SQL, copied parameter OIDs, numbered-parameter occurrence maps and rewritten

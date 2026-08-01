@@ -44,8 +44,8 @@ func KeyHashBytes(storeID [16]byte, key []byte) uint64 {
 // sipRound passes state by value so the compiler keeps the whole permutation
 // in registers and inlines it. The former pointer-parameter spelling exceeded
 // the inlining budget: every round paid a call plus four spilled words each
-// way, which the point-read profile measured as the single largest cost of a
-// warm read (~84ns of SipHash for a 14-byte key against ~20ns inlined).
+// way, which the point-read profile identified as the largest warm-read cost.
+// Machine-specific numbers live in docs/performance.md.
 func sipRound(v0, v1, v2, v3 uint64) (uint64, uint64, uint64, uint64) {
 	v0 += v1
 	v1 = bits.RotateLeft64(v1, 13)

@@ -182,15 +182,12 @@ type Segment struct {
 	// tuning failure. A live segment retains every document's verbatim source so
 	// that reads stay zero-copy, so enabling the dictionary removes nothing
 	// from the source: the arena, the splice records, and the sighting set are
-	// all additions on top of bytes that stay resident. Measured on a corpus
-	// of long repeated enum strings — the case the mode exists for — it added
-	// 36 B per document to a Segment and 64 B per document to a collection, whose
-	// dictionary is per chunk. Its payoff is entirely at rest: the repeated
-	// source it lets a compacting or persisting writer drop, which
-	// SegmentStats.DictSavedBytes models and which the same corpus put at 103 B
-	// per document. Enable it when you are writing the segment out or compacting
-	// it, not to shrink a live segment. See segment_valuedict.go for the
-	// representation, its read contract, and the read==source invariant.
+	// all additions on top of bytes that stay resident. Its payoff is entirely
+	// at rest: the repeated source it lets a compacting or persisting writer
+	// drop, which SegmentStats.DictSavedBytes models. Enable it when you are
+	// writing the segment out or compacting it, not to shrink a live segment.
+	// Measured tradeoffs live in docs/performance.md; see segment_valuedict.go
+	// for the representation, its read contract, and the read==source invariant.
 	ValueDict bool
 
 	// Value-dictionary state (segment_valuedict.go), populated only under

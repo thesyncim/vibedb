@@ -72,22 +72,10 @@ type scanWorker struct {
 // more than the scan does, and a split is a straight regression on the small
 // queries an interactive workload is mostly made of.
 //
-// Both numbers come from BenchmarkSegmentParallel and BenchmarkNarrowRowParallel,
-// measured on 16 processors. The crossover moves with how much work a row is,
-// so the threshold is placed against the cheaper of the two corpora — a
-// two-field row, where per-row work is at its floor and the fixed cost of
-// splitting is at its most visible. ns/doc for a one-percent filter:
-//
-//	rows    narrow row              wide row (21 fields)
-//	        w=1    w=2    w=4       w=1    w=2    w=4
-//	  256   31.4   39.7   36.6      60.8   70.2   46.9
-//	  512   31.0   34.8   24.3      58.5   49.1   40.4
-//	 1024   30.9   27.7   19.4      57.3   38.6   31.5
-//	 4096   29.9   19.7   13.2      58.4   30.2   16.4
-//
-// So 256 rows regresses on a narrow row at every worker count, 512 is where a
-// four-way split starts winning, and 1024 wins on both corpora at every count.
-// One thousand rows split four ways is therefore the first point that is a win
+// BenchmarkSegmentParallel and BenchmarkNarrowRowParallel establish the
+// crossover across both a cheap narrow row and a wider row. The policy is set
+// by the cheaper corpus, where fixed split/join cost is most visible. One
+// thousand rows split four ways is the first conservative point that is a win
 // whatever a row costs, which is what a default has to be.
 const (
 	parallelScanMinRows       = 1024
@@ -122,10 +110,9 @@ func scanWorkerCount(rows, requested int) int {
 //
 // They are parked rather than started per execution because starting a
 // goroutine is not free: when neither the running processor's free list nor the
-// scheduler's has a goroutine to hand back, the runtime allocates one, which
-// showed up as an intermittent half-kilobyte allocation on a path whose
-// contract is to have none — the more so the shorter the scan, because a fast
-// scan cycles goroutines faster than the free lists refill.
+// scheduler's has a goroutine to hand back, the runtime allocates one on a path
+// whose warmed contract is allocation-free — the more so the shorter the scan,
+// because a fast scan cycles goroutines faster than the free lists refill.
 //
 // The pool is a separate object from the Workspace, and the workers hold no
 // pointer back into one between scans, which is what start's release loop is

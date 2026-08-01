@@ -21,10 +21,9 @@
 // published collection keeps its documents — source bytes, structural tapes,
 // key directory, and index pages — in pointer-free blocks that
 // internal/storemem places outside the Go heap on common Unix platforms, so
-// they are process RSS that HeapAlloc cannot see. A 100,000-document, 24 MiB
-// corpus measured 3.9 MiB of HeapAlloc against 165 MiB of peak RSS. Read
-// [Stats]'s External*Bytes fields for what the collection holds off-heap, and
-// getrusage for the process total.
+// they are process RSS that HeapAlloc cannot see. Read [Stats]'s External*Bytes
+// fields for what the collection holds off-heap, and getrusage for the process
+// total. Measured examples live in docs/performance.md.
 //
 // The gap runs the other way during a load. Both write paths stage a chunk's
 // source and structural tapes on the Go heap and only move them off it when the

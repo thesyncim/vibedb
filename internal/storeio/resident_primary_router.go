@@ -34,8 +34,8 @@ type ResidentPrimaryRouter struct {
 	// because zero is the minimum byte: strict packed inequality always
 	// matches strict lexical order, and ties defer to the full compare.
 	// Immutable after build, like the fences it summarizes: UpdateLeaf swaps
-	// handles, never fences. Costs 8 bytes per leaf, bought against the
-	// measured ~90ns per point read the byte-wise search cost at 100k keys.
+	// handles, never fences. Costs 8 bytes per leaf; the point-read benchmark
+	// owns the machine-specific justification.
 	searchKeys []uint64
 	// searchTops holds every searchTopGroup'th packed window (rank 1, 1+g,
 	// 1+2g, ...). A point lookup binary-searches this small dense array first

@@ -148,13 +148,31 @@ func buildCatalogShapes() []catalogShape {
 // It runs only after a parse failure, so its cost is one walk of a small
 // table on a path that has already lost; it allocates nothing on a miss.
 func recognizeCatalogQuery(text string) (*catalogShape, string, bool) {
-	text = strings.TrimSpace(text)
+	shape, capture, ok, _ := recognizeCatalogQueryCancelable(text, nil)
+	return shape, capture, ok
+}
+
+func recognizeCatalogQueryCancelable(
+	text string,
+	check func() error,
+) (*catalogShape, string, bool, error) {
+	var err error
+	text, err = trimSpaceCancelable(text, check)
+	if err != nil {
+		return nil, "", false, err
+	}
 	for i := range catalogShapes {
-		if capture, ok := matchCatalogShape(text, &catalogShapes[i]); ok {
-			return &catalogShapes[i], capture, true
+		capture, ok, err := matchCatalogShapeCancelable(
+			text, &catalogShapes[i], check,
+		)
+		if err != nil {
+			return nil, "", false, err
+		}
+		if ok {
+			return &catalogShapes[i], capture, true, nil
 		}
 	}
-	return nil, "", false
+	return nil, "", false, nil
 }
 
 // matchCatalogShape matches text against one shape's literal segments,
@@ -162,32 +180,49 @@ func recognizeCatalogQuery(text string) (*catalogShape, string, bool) {
 // capture in one query must be identical — psql always copies the same oid —
 // and the final segment must end the text exactly.
 func matchCatalogShape(text string, shape *catalogShape) (string, bool) {
+	capture, ok, _ := matchCatalogShapeCancelable(text, shape, nil)
+	return capture, ok
+}
+
+func matchCatalogShapeCancelable(
+	text string,
+	shape *catalogShape,
+	check func() error,
+) (string, bool, error) {
+	if check != nil {
+		if err := check(); err != nil {
+			return "", false, err
+		}
+	}
 	segments := shape.segments
 	if !strings.HasPrefix(text, segments[0]) {
-		return "", false
+		return "", false, nil
 	}
 	rest := text[len(segments[0]):]
 	capture := ""
 	for _, segment := range segments[1:] {
-		next := strings.Index(rest, segment)
+		next, err := indexStringCancelable(rest, segment, check)
+		if err != nil {
+			return "", false, err
+		}
 		if next < 0 {
-			return "", false
+			return "", false, nil
 		}
 		span := rest[:next]
 		if !validCatalogCapture(shape.capture, span) {
-			return "", false
+			return "", false, nil
 		}
 		if capture == "" {
 			capture = span
 		} else if capture != span {
-			return "", false
+			return "", false, nil
 		}
 		rest = rest[next+len(segment):]
 	}
 	if rest != "" {
-		return "", false
+		return "", false, nil
 	}
-	return capture, true
+	return capture, true, nil
 }
 
 func validCatalogCapture(kind catalogCapture, span string) bool {
@@ -284,29 +319,40 @@ func (a *catalogAnswer) tableByOID(capture string) *sqldriver.TableInfo {
 // a failed Prepare inside an explicit transaction has already moved the
 // session to the failed state, and answering rows out of a transaction this
 // server just marked failed would disagree with the state it reports.
-func (s *session) catalogShim(text string) (*fixedResult, bool) {
+func (s *session) catalogShim(
+	text string,
+	check func() error,
+) (*fixedResult, bool, error) {
 	if s.sql == nil || s.sql.State() != sqldriver.SessionIdle {
-		return nil, false
+		return nil, false, nil
 	}
-	shape, capture, ok := recognizeCatalogQuery(text)
+	shape, capture, ok, err := recognizeCatalogQueryCancelable(text, check)
+	if err != nil {
+		return nil, false, err
+	}
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	tables, err := s.sql.Tables(context.Background())
 	if err != nil {
-		return nil, false
+		return nil, false, nil
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return nil, false, err
+		}
 	}
 	if !s.ensureCatalogOIDs(tables) {
-		return nil, false
+		return nil, false, nil
 	}
 	answer := catalogAnswer{
 		database: s.database, user: s.user, tables: tables, oids: s.catalogOIDs,
 	}
 	fixed := shape.respond(&answer, capture)
 	if fixed == nil {
-		return nil, false
+		return nil, false, nil
 	}
-	return fixed, true
+	return fixed, true, nil
 }
 
 func (s *session) ensureCatalogOIDs(tables []sqldriver.TableInfo) bool {

@@ -187,8 +187,11 @@ validated when `Update` applies the batch, not when `Put` records it.
 
 ### Snapshots and reads
 
-`Snapshot` is O(1) and does not wait for an in-progress writer. A snapshot stays
-valid after any later write.
+`Snapshot` returns an immutable reader-visible generation and stays valid after
+every later write. Creating one may wait for the current writer and
+synchronously fold the bounded dirty overlay and its unsealed parents; once
+that fold is complete, pinning the resulting generation is O(1). No background
+or offline maintenance is required.
 
 `Snapshot.GetRaw` is lock-free, clock-free, and allocation-free. The returned
 `RawValue` borrows snapshot storage. Use `AppendRaw` when the bytes must outlive

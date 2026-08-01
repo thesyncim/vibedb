@@ -43,10 +43,9 @@ func filePrimaryPendingCapacity(options normalizedFileStoreOptions) int {
 // that a rank's slot is usually occupied and nearest-fit snaps the leaf onto a
 // far free extent, scattering the order the hint is restoring; oversizing it
 // spreads leaves wider than they need and grows the file with reclaimable gaps.
-// Measured on the churn qualification (100k mutations, 513 leaves): this value
-// holds the adjacency plateau near 25x for a ~7% file-size cost, an 8 KiB stride
-// only reaches ~50x, and a 12 KiB stride reaches ~5x for a ~19% file-size cost.
-// Nearest-fit only needs the stride monotonic in rank; the value is the knob.
+// BenchmarkFilePrimaryChurn establishes the spacing tradeoff. Nearest-fit only
+// needs the stride monotonic in rank; the value is the knob. Exact measured
+// adjacency and file-size results live in docs/performance.md.
 const primaryLeafPlacementStride = uint64(storeio.CommonPrimaryLeafWideBytes +
 	storeio.CommonPrimaryLeafNarrowBytes/2)
 

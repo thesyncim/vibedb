@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // The layer in front of the SQL engine: statement splitting, statement
@@ -67,76 +69,105 @@ const (
 // The second result is a specific refusal or syntax-error message when one is
 // available.
 func classify(src string) (statementKind, string) {
-	s := scanner{src: src}
-	word := strings.ToUpper(s.word())
-	if s.malformed {
-		return kindUnknown, "unterminated block comment"
+	kind, reason, _ := classifyCancelable(src, nil)
+	return kind, reason
+}
+
+func classifyCancelable(
+	src string,
+	check func() error,
+) (statementKind, string, error) {
+	s := newScanner(src, check)
+	word := s.word()
+	if s.cancelErr != nil {
+		return kindUnknown, "", s.cancelErr
 	}
-	switch word {
-	case "":
-		return kindEmpty, ""
-	case "SELECT":
-		return kindSelect, ""
-	case "INSERT", "UPDATE", "DELETE", "CREATE":
-		return kindCatalogSQL, ""
-	case "BEGIN", "START":
-		return kindBegin, ""
-	case "COMMIT", "END":
-		return kindCommit, ""
-	case "ROLLBACK", "ABORT":
-		return kindRollback, ""
-	case "SET":
-		return kindSet, ""
-	case "RESET":
-		return kindReset, ""
-	case "SHOW":
-		return kindShow, ""
-	case "DISCARD":
-		return kindDiscard, ""
+	if s.malformed {
+		return kindUnknown, "unterminated block comment", nil
+	}
+	switch {
+	case word == "":
+		return kindEmpty, "", nil
+	case strings.EqualFold(word, "SELECT"):
+		return kindSelect, "", nil
+	case strings.EqualFold(word, "INSERT"), strings.EqualFold(word, "UPDATE"),
+		strings.EqualFold(word, "DELETE"), strings.EqualFold(word, "CREATE"):
+		return kindCatalogSQL, "", nil
+	case strings.EqualFold(word, "BEGIN"), strings.EqualFold(word, "START"):
+		return kindBegin, "", nil
+	case strings.EqualFold(word, "COMMIT"), strings.EqualFold(word, "END"):
+		return kindCommit, "", nil
+	case strings.EqualFold(word, "ROLLBACK"), strings.EqualFold(word, "ABORT"):
+		return kindRollback, "", nil
+	case strings.EqualFold(word, "SET"):
+		return kindSet, "", nil
+	case strings.EqualFold(word, "RESET"):
+		return kindReset, "", nil
+	case strings.EqualFold(word, "SHOW"):
+		return kindShow, "", nil
+	case strings.EqualFold(word, "DISCARD"):
+		return kindDiscard, "", nil
 	}
 	// Every remaining keyword is handed to the shared SQL front end. It owns
 	// the typed feature-not-supported taxonomy; an actually unknown word remains
 	// a positioned syntax error there.
-	return kindCatalogSQL, ""
+	return kindCatalogSQL, "", nil
 }
 
 // parseTransactionCommand admits the deliberately small transaction grammar
 // implemented by the typed runtime. Isolation and access modes belong in a
 // future SQL AST rather than being accepted and ignored here.
 func parseTransactionCommand(src string, kind statementKind) (bool, error) {
-	s := scanner{src: src}
-	leading := strings.ToUpper(s.word())
+	return parseTransactionCommandCancelable(src, kind, nil)
+}
+
+func parseTransactionCommandCancelable(
+	src string,
+	kind statementKind,
+	check func() error,
+) (readOnlyResult bool, err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			readOnlyResult = false
+			err = s.cancelErr
+		}
+	}()
+	leading := s.word()
 	switch kind {
 	case kindBegin:
-		if leading == "START" {
+		if strings.EqualFold(leading, "START") {
 			if !strings.EqualFold(s.word(), "TRANSACTION") {
 				return false, newError(sqlstateSyntaxError,
 					"START must be followed by TRANSACTION")
 			}
-		} else if next := strings.ToUpper(s.peekWord()); next == "WORK" || next == "TRANSACTION" {
+		} else if next := s.peekWord(); strings.EqualFold(next, "WORK") ||
+			strings.EqualFold(next, "TRANSACTION") {
 			s.word()
 		}
 		readOnly := false
 		seenAccess := false
 		seenIsolation := false
 		for {
-			switch next := strings.ToUpper(s.peekWord()); next {
-			case "":
+			next := s.peekWord()
+			switch {
+			case next == "":
 				if !s.atEnd() {
 					return false, newError(sqlstateSyntaxError,
 						"malformed BEGIN transaction mode")
 				}
 				return readOnly, nil
-			case "READ":
+			case strings.EqualFold(next, "READ"):
 				s.word()
-				access := strings.ToUpper(s.word())
-				if seenAccess || (access != "ONLY" && access != "WRITE") {
+				access := s.word()
+				if seenAccess || (!strings.EqualFold(access, "ONLY") &&
+					!strings.EqualFold(access, "WRITE")) {
 					return false, newError(sqlstateSyntaxError,
 						"READ must be followed once by ONLY or WRITE")
 				}
 				seenAccess = true
-				readOnly = access == "ONLY"
-			case "ISOLATION":
+				readOnly = strings.EqualFold(access, "ONLY")
+			case strings.EqualFold(next, "ISOLATION"):
 				s.word()
 				if seenIsolation || !strings.EqualFold(s.word(), "LEVEL") ||
 					!strings.EqualFold(s.word(), "REPEATABLE") ||
@@ -153,11 +184,13 @@ func parseTransactionCommand(src string, kind statementKind) (bool, error) {
 			}
 		}
 	case kindCommit:
-		if next := strings.ToUpper(s.peekWord()); next == "WORK" || next == "TRANSACTION" {
+		if next := s.peekWord(); strings.EqualFold(next, "WORK") ||
+			strings.EqualFold(next, "TRANSACTION") {
 			s.word()
 		}
 	case kindRollback:
-		if next := strings.ToUpper(s.peekWord()); next == "WORK" || next == "TRANSACTION" {
+		if next := s.peekWord(); strings.EqualFold(next, "WORK") ||
+			strings.EqualFold(next, "TRANSACTION") {
 			s.word()
 		}
 	default:
@@ -170,6 +203,119 @@ func parseTransactionCommand(src string, kind statementKind) (bool, error) {
 	return false, nil
 }
 
+const protocolCancelByteInterval = 4 << 10
+
+func cancellationAt(
+	check func() error,
+	at int,
+	next *int,
+) error {
+	if check == nil || at < *next {
+		return nil
+	}
+	*next = at + protocolCancelByteInterval
+	return check()
+}
+
+func indexByteCancelable(src string, needle byte, check func() error) (int, error) {
+	if check == nil {
+		return strings.IndexByte(src, needle), nil
+	}
+	next := 0
+	for i := 0; i < len(src); i++ {
+		if err := cancellationAt(check, i, &next); err != nil {
+			return -1, err
+		}
+		if src[i] == needle {
+			return i, nil
+		}
+	}
+	return -1, nil
+}
+
+func indexStringCancelable(src, needle string, check func() error) (int, error) {
+	if check == nil {
+		return strings.Index(src, needle), nil
+	}
+	if needle == "" {
+		if err := check(); err != nil {
+			return -1, err
+		}
+		return 0, nil
+	}
+	for start := 0; start+len(needle) <= len(src); start += protocolCancelByteInterval {
+		if err := check(); err != nil {
+			return -1, err
+		}
+		end := min(len(src), start+protocolCancelByteInterval+len(needle)-1)
+		if index := strings.Index(src[start:end], needle); index >= 0 {
+			return start + index, nil
+		}
+	}
+	return -1, nil
+}
+
+func trimSpaceCancelable(src string, check func() error) (string, error) {
+	if check == nil {
+		return strings.TrimSpace(src), nil
+	}
+	next := 0
+	start := 0
+	for start < len(src) {
+		if err := cancellationAt(check, start, &next); err != nil {
+			return "", err
+		}
+		r, size := utf8.DecodeRuneInString(src[start:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		start += size
+	}
+	next = 0
+	end := len(src)
+	for end > start {
+		if err := cancellationAt(check, len(src)-end, &next); err != nil {
+			return "", err
+		}
+		r, size := utf8.DecodeLastRuneInString(src[start:end])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		end -= size
+	}
+	return src[start:end], nil
+}
+
+func validUTF8Cancelable(src string, check func() error) (bool, error) {
+	if check == nil {
+		return utf8.ValidString(src), nil
+	}
+	for start := 0; start < len(src); {
+		if err := check(); err != nil {
+			return false, err
+		}
+		end := min(len(src), start+protocolCancelByteInterval)
+		if end < len(src) && !utf8.RuneStart(src[end]) {
+			// Keep a valid multi-byte rune wholly inside the next chunk. A valid
+			// encoding has at most UTFMax-1 continuation bytes; a longer run is
+			// invalid and can be rejected by the ordinary validator immediately.
+			boundary := end
+			for boundary > start && end-boundary < utf8.UTFMax &&
+				!utf8.RuneStart(src[boundary]) {
+				boundary--
+			}
+			if utf8.RuneStart(src[boundary]) {
+				end = boundary
+			}
+		}
+		if end == start || !utf8.ValidString(src[start:end]) {
+			return false, nil
+		}
+		start = end
+	}
+	return true, nil
+}
+
 // A scanner walks SQL text past whitespace and comments. It is the smallest
 // thing that can answer "what is the first word" and "where does this statement
 // end" without a second SQL parser, and it deliberately understands only the
@@ -180,24 +326,55 @@ type scanner struct {
 	src       string
 	pos       int
 	malformed bool
+	check     func() error
+	nextCheck int
+	cancelErr error
+}
+
+func newScanner(src string, check func() error) scanner {
+	return scanner{src: src, check: check}
+}
+
+func (s *scanner) canceledAt(at int) bool {
+	if s.cancelErr != nil {
+		return true
+	}
+	if err := cancellationAt(s.check, at, &s.nextCheck); err != nil {
+		s.cancelErr = err
+		return true
+	}
+	return false
 }
 
 // skip advances past whitespace and comments. Block comments do not nest here,
 // matching this dialect's lexer.
 func (s *scanner) skip() {
 	for s.pos < len(s.src) {
+		if s.canceledAt(s.pos) {
+			return
+		}
 		c := s.src[s.pos]
 		switch {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
 			s.pos++
 		case c == '-' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '-':
-			if i := strings.IndexByte(s.src[s.pos:], '\n'); i < 0 {
+			i, err := indexByteCancelable(s.src[s.pos:], '\n', s.check)
+			if err != nil {
+				s.cancelErr = err
+				return
+			}
+			if i < 0 {
 				s.pos = len(s.src)
 			} else {
 				s.pos += i + 1
 			}
 		case c == '/' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '*':
-			if i := strings.Index(s.src[s.pos+2:], "*/"); i < 0 {
+			i, err := indexStringCancelable(s.src[s.pos+2:], "*/", s.check)
+			if err != nil {
+				s.cancelErr = err
+				return
+			}
+			if i < 0 {
 				s.pos = len(s.src)
 				s.malformed = true
 			} else {
@@ -213,8 +390,14 @@ func (s *scanner) skip() {
 // not one.
 func (s *scanner) word() string {
 	s.skip()
+	if s.cancelErr != nil {
+		return ""
+	}
 	start := s.pos
 	for s.pos < len(s.src) && isWordByte(s.src[s.pos]) {
+		if s.canceledAt(s.pos) {
+			return ""
+		}
 		s.pos++
 	}
 	return s.src[start:s.pos]
@@ -223,14 +406,21 @@ func (s *scanner) word() string {
 // peekWord returns the next word without consuming it.
 func (s *scanner) peekWord() string {
 	save := s.pos
+	saveNext := s.nextCheck
 	w := s.word()
 	s.pos = save
+	if s.cancelErr == nil {
+		s.nextCheck = saveNext
+	}
 	return w
 }
 
 // symbol consumes c if it is the next non-space byte.
 func (s *scanner) symbol(c byte) bool {
 	s.skip()
+	if s.cancelErr != nil {
+		return false
+	}
 	if s.pos < len(s.src) && s.src[s.pos] == c {
 		s.pos++
 		return true
@@ -242,7 +432,7 @@ func (s *scanner) symbol(c byte) bool {
 // semicolon remain.
 func (s *scanner) atEnd() bool {
 	s.skip()
-	if s.malformed {
+	if s.malformed || s.cancelErr != nil {
 		return false
 	}
 	if s.pos < len(s.src) && s.src[s.pos] == ';' {
@@ -260,17 +450,26 @@ func (s *scanner) atEnd() bool {
 // most values would add a second SQL parser here.
 func (s *scanner) rest() (string, bool) {
 	s.skip()
-	if s.malformed {
+	if s.malformed || s.cancelErr != nil {
 		return "", false
 	}
 	start := s.pos
 	semanticEnd := start
 	for s.pos < len(s.src) {
+		if s.canceledAt(s.pos) {
+			return "", false
+		}
 		switch c := s.src[s.pos]; {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
 			s.pos++
 		case c == '\'' || c == '"':
-			end, ok := skipQuotedChecked(s.src, s.pos, c)
+			end, ok, err := skipQuotedCheckedCancelable(
+				s.src, s.pos, c, s.check,
+			)
+			if err != nil {
+				s.cancelErr = err
+				return "", false
+			}
 			if !ok {
 				s.pos = len(s.src)
 				return "", false
@@ -278,13 +477,23 @@ func (s *scanner) rest() (string, bool) {
 			s.pos = end
 			semanticEnd = end
 		case c == '-' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '-':
-			if i := strings.IndexByte(s.src[s.pos:], '\n'); i < 0 {
+			i, err := indexByteCancelable(s.src[s.pos:], '\n', s.check)
+			if err != nil {
+				s.cancelErr = err
+				return "", false
+			}
+			if i < 0 {
 				s.pos = len(s.src)
 			} else {
 				s.pos += i + 1
 			}
 		case c == '/' && s.pos+1 < len(s.src) && s.src[s.pos+1] == '*':
-			if i := strings.Index(s.src[s.pos+2:], "*/"); i < 0 {
+			i, err := indexStringCancelable(s.src[s.pos+2:], "*/", s.check)
+			if err != nil {
+				s.cancelErr = err
+				return "", false
+			}
+			if i < 0 {
 				s.pos = len(s.src)
 				s.malformed = true
 				return "", false
@@ -302,7 +511,11 @@ func (s *scanner) rest() (string, bool) {
 			semanticEnd = s.pos
 		}
 	}
-	text := strings.TrimSpace(s.src[start:semanticEnd])
+	text, err := trimSpaceCancelable(s.src[start:semanticEnd], s.check)
+	if err != nil {
+		s.cancelErr = err
+		return "", false
+	}
 	s.pos = len(s.src)
 	return text, true
 }
@@ -310,12 +523,15 @@ func (s *scanner) rest() (string, bool) {
 // quoted reads a single-quoted string literal, returning its decoded value.
 func (s *scanner) quoted() (string, bool) {
 	s.skip()
-	if s.pos >= len(s.src) || s.src[s.pos] != '\'' {
+	if s.cancelErr != nil || s.pos >= len(s.src) || s.src[s.pos] != '\'' {
 		return "", false
 	}
 	var out strings.Builder
 	i := s.pos + 1
 	for i < len(s.src) {
+		if s.canceledAt(i) {
+			return "", false
+		}
 		if s.src[i] != '\'' {
 			out.WriteByte(s.src[i])
 			i++
@@ -335,8 +551,14 @@ func (s *scanner) quoted() (string, bool) {
 // number reads an unsigned integer literal.
 func (s *scanner) number() (string, bool) {
 	s.skip()
+	if s.cancelErr != nil {
+		return "", false
+	}
 	start := s.pos
 	for s.pos < len(s.src) && s.src[s.pos] >= '0' && s.src[s.pos] <= '9' {
+		if s.canceledAt(s.pos) {
+			return "", false
+		}
 		s.pos++
 	}
 	if s.pos == start {
@@ -368,21 +590,38 @@ type statementIterator struct {
 	done      bool
 	saw       bool
 	sentEmpty bool
+	check     func() error
+	nextCheck int
 }
 
-func (s *statementIterator) next() (string, bool) {
+func (s *statementIterator) next() (string, bool, error) {
 	for !s.done {
 		start := s.pos
 		i := start
 		for i < len(s.src) {
+			if err := cancellationAt(s.check, i, &s.nextCheck); err != nil {
+				return "", false, err
+			}
 			switch s.src[i] {
 			case '\'':
-				i = skipQuoted(s.src, i, '\'')
+				end, err := skipQuotedCancelable(s.src, i, '\'', s.check)
+				if err != nil {
+					return "", false, err
+				}
+				i = end
 			case '"':
-				i = skipQuoted(s.src, i, '"')
+				end, err := skipQuotedCancelable(s.src, i, '"', s.check)
+				if err != nil {
+					return "", false, err
+				}
+				i = end
 			case '-':
 				if i+1 < len(s.src) && s.src[i+1] == '-' {
-					if n := strings.IndexByte(s.src[i:], '\n'); n < 0 {
+					n, err := indexByteCancelable(s.src[i:], '\n', s.check)
+					if err != nil {
+						return "", false, err
+					}
+					if n < 0 {
 						i = len(s.src)
 					} else {
 						i += n + 1
@@ -392,7 +631,11 @@ func (s *statementIterator) next() (string, bool) {
 				}
 			case '/':
 				if i+1 < len(s.src) && s.src[i+1] == '*' {
-					if n := strings.Index(s.src[i+2:], "*/"); n < 0 {
+					n, err := indexStringCancelable(s.src[i+2:], "*/", s.check)
+					if err != nil {
+						return "", false, err
+					}
+					if n < 0 {
 						i = len(s.src)
 					} else {
 						i += n + 4
@@ -403,9 +646,13 @@ func (s *statementIterator) next() (string, bool) {
 			case ';':
 				text := s.src[start:i]
 				s.pos = i + 1
-				if strings.TrimSpace(text) != "" {
+				trimmed, err := trimSpaceCancelable(text, s.check)
+				if err != nil {
+					return "", false, err
+				}
+				if trimmed != "" {
 					s.saw = true
-					return text, true
+					return text, true, nil
 				}
 				i = s.pos
 				start = i
@@ -416,9 +663,13 @@ func (s *statementIterator) next() (string, bool) {
 		s.done = true
 		s.pos = len(s.src)
 		text := s.src[start:]
-		if strings.TrimSpace(text) != "" {
+		trimmed, err := trimSpaceCancelable(text, s.check)
+		if err != nil {
+			return "", false, err
+		}
+		if trimmed != "" {
 			s.saw = true
-			return text, true
+			return text, true, nil
 		}
 	}
 	// An empty statement between two semicolons is dropped rather than answered
@@ -429,9 +680,9 @@ func (s *statementIterator) next() (string, bool) {
 	// iterator yields one empty statement when everything was empty.
 	if !s.saw && !s.sentEmpty {
 		s.sentEmpty = true
-		return "", true
+		return "", true, nil
 	}
-	return "", false
+	return "", false, nil
 }
 
 // skipQuoted advances past a quoted run starting at i, where the quote is
@@ -458,6 +709,36 @@ func skipQuotedChecked(src string, i int, quote byte) (int, bool) {
 		return i + 1, true
 	}
 	return len(src), false
+}
+
+func skipQuotedCheckedCancelable(
+	src string,
+	i int,
+	quote byte,
+	check func() error,
+) (int, bool, error) {
+	if check == nil {
+		end, ok := skipQuotedChecked(src, i, quote)
+		return end, ok, nil
+	}
+	start := i
+	i++
+	next := 0
+	for i < len(src) {
+		if err := cancellationAt(check, i-start, &next); err != nil {
+			return 0, false, err
+		}
+		if src[i] != quote {
+			i++
+			continue
+		}
+		if i+1 < len(src) && src[i+1] == quote {
+			i += 2
+			continue
+		}
+		return i + 1, true, nil
+	}
+	return len(src), false, nil
 }
 
 // A parameter is one run-time setting this server recognizes.
@@ -595,10 +876,23 @@ type setCommand struct {
 // transactions; a LOCAL setting in a session with no transaction block is a
 // session setting in PostgreSQL too.
 func parseSet(src string) (setCommand, error) {
-	s := scanner{src: src}
+	return parseSetCancelable(src, nil)
+}
+
+func parseSetCancelable(
+	src string,
+	check func() error,
+) (cmdResult setCommand, err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			cmdResult = setCommand{}
+			err = s.cancelErr
+		}
+	}()
 	s.word() // SET
-	switch strings.ToUpper(s.peekWord()) {
-	case "SESSION", "LOCAL":
+	switch next := s.peekWord(); {
+	case strings.EqualFold(next, "SESSION"), strings.EqualFold(next, "LOCAL"):
 		s.word()
 	}
 	name := s.word()
@@ -616,7 +910,11 @@ func parseSet(src string) (setCommand, error) {
 		if strings.EqualFold(value, "DEFAULT") {
 			return setCommand{name: "TimeZone", reset: true}, nil
 		}
-		return setCommand{name: "TimeZone", value: unquote(value)}, nil
+		value, err = unquoteCancelable(value, check)
+		if err != nil {
+			return setCommand{}, err
+		}
+		return setCommand{name: "TimeZone", value: value}, nil
 	}
 	if strings.EqualFold(name, "NAMES") {
 		value, ok := s.rest()
@@ -626,7 +924,11 @@ func parseSet(src string) (setCommand, error) {
 		if strings.EqualFold(value, "DEFAULT") {
 			return setCommand{name: "client_encoding", reset: true}, nil
 		}
-		return setCommand{name: "client_encoding", value: unquote(value)}, nil
+		value, err = unquoteCancelable(value, check)
+		if err != nil {
+			return setCommand{}, err
+		}
+		return setCommand{name: "client_encoding", value: value}, nil
 	}
 	if !s.symbol('=') {
 		if !strings.EqualFold(s.peekWord(), "TO") {
@@ -642,12 +944,29 @@ func parseSet(src string) (setCommand, error) {
 	if strings.EqualFold(value, "DEFAULT") {
 		return setCommand{name: name, reset: true}, nil
 	}
-	return setCommand{name: name, value: unquote(value)}, nil
+	value, err = unquoteCancelable(value, check)
+	if err != nil {
+		return setCommand{}, err
+	}
+	return setCommand{name: name, value: value}, nil
 }
 
 // parseReset decodes "RESET name" and "RESET ALL".
 func parseReset(src string) (setCommand, error) {
-	s := scanner{src: src}
+	return parseResetCancelable(src, nil)
+}
+
+func parseResetCancelable(
+	src string,
+	check func() error,
+) (cmdResult setCommand, err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			cmdResult = setCommand{}
+			err = s.cancelErr
+		}
+	}()
 	s.word() // RESET
 	name := s.word()
 	var cmd setCommand
@@ -671,7 +990,20 @@ func parseReset(src string) (setCommand, error) {
 
 // parseShow decodes "SHOW name", "SHOW ALL", and "SHOW TIME ZONE".
 func parseShow(src string) (string, error) {
-	s := scanner{src: src}
+	return parseShowCancelable(src, nil)
+}
+
+func parseShowCancelable(
+	src string,
+	check func() error,
+) (nameResult string, err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			nameResult = ""
+			err = s.cancelErr
+		}
+	}()
 	s.word() // SHOW
 	name := s.word()
 	var result string
@@ -692,7 +1024,16 @@ func parseShow(src string) (string, error) {
 }
 
 func parseDiscard(src string) error {
-	s := scanner{src: src}
+	return parseDiscardCancelable(src, nil)
+}
+
+func parseDiscardCancelable(src string, check func() error) (err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			err = s.cancelErr
+		}
+	}()
 	s.word() // DISCARD
 	if !strings.EqualFold(s.word(), "ALL") || !s.atEnd() {
 		return newError(sqlstateSyntaxError,
@@ -703,10 +1044,49 @@ func parseDiscard(src string) error {
 
 // unquote strips one layer of single quotes from a SET value.
 func unquote(v string) string {
+	out, _ := unquoteCancelable(v, nil)
+	return out
+}
+
+func unquoteCancelable(v string, check func() error) (string, error) {
 	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
-		return strings.ReplaceAll(v[1:len(v)-1], "''", "'")
+		inner := v[1 : len(v)-1]
+		if check == nil {
+			return strings.ReplaceAll(inner, "''", "'"), nil
+		}
+		next := 0
+		first := -1
+		for i := 0; i+1 < len(inner); i++ {
+			if err := cancellationAt(check, i, &next); err != nil {
+				return "", err
+			}
+			if inner[i] == '\'' && inner[i+1] == '\'' {
+				first = i
+				break
+			}
+		}
+		if first < 0 {
+			return inner, nil
+		}
+		var out strings.Builder
+		out.Grow(len(inner) - 1)
+		out.WriteString(inner[:first])
+		next = 0
+		for i := first; i < len(inner); {
+			if err := cancellationAt(check, i-first, &next); err != nil {
+				return "", err
+			}
+			if i+1 < len(inner) && inner[i] == '\'' && inner[i+1] == '\'' {
+				out.WriteByte('\'')
+				i += 2
+				continue
+			}
+			out.WriteByte(inner[i])
+			i++
+		}
+		return out.String(), nil
 	}
-	return v
+	return v, nil
 }
 
 // A fixedResult is a result set this package produces itself rather than
@@ -748,7 +1128,21 @@ type shimColumn struct {
 // means "not mine", not "invalid": the caller hands it to the SQL front end,
 // which is the thing that knows how to reject it accurately.
 func (fn shimFunctions) parseFixedSelect(src string) (fixedResult, bool, error) {
-	s := scanner{src: src}
+	return fn.parseFixedSelectCancelable(src, nil)
+}
+
+func (fn shimFunctions) parseFixedSelectCancelable(
+	src string,
+	check func() error,
+) (result fixedResult, recognized bool, err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			result = fixedResult{}
+			recognized = false
+			err = s.cancelErr
+		}
+	}()
 	if !strings.EqualFold(s.word(), "SELECT") {
 		return fixedResult{}, false, nil
 	}
@@ -808,41 +1202,63 @@ func (fn shimFunctions) parseShimItem(s *scanner) (shimColumn, bool) {
 	if strings.EqualFold(word, "pg_catalog") && s.symbol('.') {
 		word = s.word()
 	}
-	lower := strings.ToLower(word)
-	switch lower {
-	case "null":
+	canonical := ""
+	switch {
+	case strings.EqualFold(word, "null"):
 		return shimColumn{name: "?column?", value: nil, typ: typeText}, true
-	case "true", "false":
+	case strings.EqualFold(word, "true"), strings.EqualFold(word, "false"):
 		v := "t"
-		if lower == "false" {
+		if strings.EqualFold(word, "false") {
 			v = "f"
 		}
 		return shimColumn{name: "?column?", value: &v, typ: typeBool}, true
-	case "current_user", "session_user", "user":
+	case strings.EqualFold(word, "current_user"):
+		canonical = "current_user"
+		fallthrough
+	case strings.EqualFold(word, "session_user"):
+		if canonical == "" {
+			canonical = "session_user"
+		}
+		fallthrough
+	case strings.EqualFold(word, "user"):
+		if canonical == "" {
+			canonical = "user"
+		}
 		v := fn.user
-		return shimColumn{name: lower, value: &v, typ: typeText}, true
-	case "current_catalog":
+		return shimColumn{name: canonical, value: &v, typ: typeText}, true
+	case strings.EqualFold(word, "current_catalog"):
 		v := fn.database
-		return shimColumn{name: lower, value: &v, typ: typeText}, true
+		return shimColumn{name: "current_catalog", value: &v, typ: typeText}, true
 	}
 	// The remaining forms are function calls and must be followed by "()".
 	if !s.symbol('(') || !s.symbol(')') {
 		return shimColumn{}, false
 	}
-	switch lower {
-	case "version":
+	switch {
+	case strings.EqualFold(word, "version"):
 		v := versionString
 		return shimColumn{name: "version", value: &v, typ: typeText}, true
-	case "current_database":
+	case strings.EqualFold(word, "current_database"):
 		v := fn.database
 		return shimColumn{name: "current_database", value: &v, typ: typeText}, true
-	case "current_schema":
+	case strings.EqualFold(word, "current_schema"):
 		v := "public"
 		return shimColumn{name: "current_schema", value: &v, typ: typeText}, true
-	case "current_user", "session_user", "user":
+	case strings.EqualFold(word, "current_user"):
+		canonical = "current_user"
+		fallthrough
+	case strings.EqualFold(word, "session_user"):
+		if canonical == "" {
+			canonical = "session_user"
+		}
+		fallthrough
+	case strings.EqualFold(word, "user"):
+		if canonical == "" {
+			canonical = "user"
+		}
 		v := fn.user
-		return shimColumn{name: lower, value: &v, typ: typeText}, true
-	case "pg_backend_pid":
+		return shimColumn{name: canonical, value: &v, typ: typeText}, true
+	case strings.EqualFold(word, "pg_backend_pid"):
 		v := strconv.Itoa(int(fn.pid))
 		return shimColumn{name: "pg_backend_pid", value: &v, typ: typeInt8}, true
 	}
@@ -917,7 +1333,7 @@ func rewriteNumberedParameters(
 		hasDollar = strings.ContainsRune(src, '$')
 	} else {
 		for i := 0; i < len(src); i++ {
-			if i%(4<<10) == 0 {
+			if i%protocolCancelByteInterval == 0 {
 				if err := check(); err != nil {
 					return "", nil, 0, err
 				}
@@ -940,7 +1356,7 @@ func rewriteNumberedParameters(
 	// text and not a parameter.
 	out := make([]byte, 0, len(src))
 	for i < len(src) {
-		if check != nil && i%(4<<10) == 0 {
+		if check != nil && i%protocolCancelByteInterval == 0 {
 			if err := check(); err != nil {
 				return "", nil, 0, err
 			}
@@ -960,7 +1376,7 @@ func rewriteNumberedParameters(
 			if i+1 < len(src) && src[i+1] == '-' {
 				end := len(src)
 				for at := i; at < len(src); at++ {
-					if check != nil && (at-i)%(4<<10) == 0 {
+					if check != nil && (at-i)%protocolCancelByteInterval == 0 {
 						if err := check(); err != nil {
 							return "", nil, 0, err
 						}
@@ -984,7 +1400,7 @@ func rewriteNumberedParameters(
 			if i+1 < len(src) && src[i+1] == '*' {
 				end := len(src)
 				for at := i + 2; at+1 < len(src); at++ {
-					if check != nil && (at-i)%(4<<10) == 0 {
+					if check != nil && (at-i)%protocolCancelByteInterval == 0 {
 						if err := check(); err != nil {
 							return "", nil, 0, err
 						}
@@ -1012,6 +1428,11 @@ func rewriteNumberedParameters(
 			start := i
 			i++
 			for i < len(src) && src[i] >= '0' && src[i] <= '9' {
+				if check != nil && (i-start)%protocolCancelByteInterval == 0 {
+					if err := check(); err != nil {
+						return "", nil, 0, err
+					}
+				}
 				i++
 			}
 			digits := src[start+1 : i]
@@ -1062,28 +1483,8 @@ func skipQuotedCancelable(
 	quote byte,
 	check func() error,
 ) (int, error) {
-	if check == nil {
-		return skipQuoted(src, i, quote), nil
-	}
-	start := i
-	i++
-	for i < len(src) {
-		if (i-start)%(4<<10) == 0 {
-			if err := check(); err != nil {
-				return 0, err
-			}
-		}
-		if src[i] != quote {
-			i++
-			continue
-		}
-		if i+1 < len(src) && src[i+1] == quote {
-			i += 2
-			continue
-		}
-		return i + 1, nil
-	}
-	return len(src), nil
+	end, _, err := skipQuotedCheckedCancelable(src, i, quote, check)
+	return end, err
 }
 
 func appendStringCancelable(
@@ -1098,7 +1499,7 @@ func appendStringCancelable(
 		if err := check(); err != nil {
 			return dst, err
 		}
-		chunk := min(len(src), 4<<10)
+		chunk := min(len(src), protocolCancelByteInterval)
 		dst = append(dst, src[:chunk]...)
 		src = src[chunk:]
 	}

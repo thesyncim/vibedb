@@ -181,7 +181,12 @@ func (s *session) handleParse() error {
 			"prepared statements on one connection may retain at most %d bytes of "+
 				"names, SQL, and parameter type metadata", maxPreparedInputBytes))
 	}
-	ownedName, ownedQuery := ownPreparedText(m.name, m.query)
+	ownedName, ownedQuery, err := ownPreparedTextCancelable(
+		m.name, m.query, s.cancelCheck,
+	)
+	if err != nil {
+		return asPGErrorIn(err, m.query)
+	}
 	stmt, err := s.prepare(ownedName, ownedQuery)
 	if err != nil {
 		return err
@@ -377,14 +382,46 @@ func (s *session) handleBind() error {
 // object and its map key retain them together, so separate allocations would
 // buy no lifetime advantage.
 func ownPreparedText(name, sql string) (string, string) {
+	ownedName, ownedSQL, _ := ownPreparedTextCancelable(name, sql, nil)
+	return ownedName, ownedSQL
+}
+
+func ownPreparedTextCancelable(
+	name string,
+	sql string,
+	check func() error,
+) (string, string, error) {
+	if check != nil {
+		if err := check(); err != nil {
+			return "", "", err
+		}
+	}
 	if len(name)+len(sql) == 0 {
-		return "", ""
+		return "", "", nil
 	}
 	buf := make([]byte, len(name)+len(sql))
-	copy(buf, name)
-	copy(buf[len(name):], sql)
+	copyAt := func(at int, src string) error {
+		for len(src) != 0 {
+			chunk := min(len(src), protocolCancelByteInterval)
+			copy(buf[at:at+chunk], src[:chunk])
+			at += chunk
+			src = src[chunk:]
+			if len(src) != 0 && check != nil {
+				if err := check(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := copyAt(0, name); err != nil {
+		return "", "", err
+	}
+	if err := copyAt(len(name), sql); err != nil {
+		return "", "", err
+	}
 	text := byteview.String(buf)
-	return text[:len(name)], text[len(name):]
+	return text[:len(name)], text[len(name):], nil
 }
 
 // bindInto converts and accounts one Bind without publishing it. handleBind
@@ -394,7 +431,7 @@ func (s *session) bindInto(p *portal, m *frontendMessage, stmt *prepared) error 
 	var err error
 	if p.args, p.wireArgs, p.valueSlots, p.argStore, p.decodeStore, err = bindArgs(
 		p.args, p.wireArgs, p.valueSlots, p.argStore, p.decodeStore, m, stmt,
-		s.cancellationError,
+		s.cancelCheck,
 	); err != nil {
 		return err
 	}

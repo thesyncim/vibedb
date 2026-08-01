@@ -98,8 +98,8 @@ func (f *UnifiedEqFilter) EvalRendered(doc []byte) (bool, error) {
 }
 
 // prepareLeaf derives the per-leaf token-lane state: one hole resolution per
-// template (~150 ns each, amortized over the leaf's rows) and one
-// dictionary scan for the needle spelling. A dictionary hit turns every
+// template, amortized over the leaf's rows, and one dictionary scan for the
+// needle spelling. A dictionary hit turns every
 // dict-token compare into a single byte equality; a miss proves no dict token
 // can match, because entries store exact canonical spellings.
 func (f *UnifiedEqFilter) prepareLeaf(v *CommonPrimaryUnifiedLeafView) {

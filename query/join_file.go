@@ -49,123 +49,18 @@ import (
 // collected set — and, for a fan-out clause, the build's entry order — matches
 // the heap's element for element.
 
-// # The thresholds, re-measured
-//
-// joinMembershipMax and joinBloomScanRatio were both measured against the heap
-// backend, and neither number transfers by assumption. This is what
-// BenchmarkDurableJoinCostModel measures on the durable one (Apple M4 Max, Go
-// 1.26, warm page cache, 20,000 driving rows, ns per row, three-arm method
-// identical to BenchmarkJoinCostModel's — probe cost is the joined scan minus
-// the unjoined one):
-//
-//	inner collection   inner row scanned   outer row probed   ratio
-//	           1,000               136.0              226.7     1.7
-//	          10,000                59.0              278.3     4.7
-//	         100,000                16.7              266.9    16.0
-//
-// The heap's corresponding table is flat in both columns — 44.8 to 52.4 ns to
-// scan a row, 199.8 to 546.3 to probe one, break-even 4.5 to 10.4. The durable
-// table is not flat, and the two reasons are worth separating because only one
-// of them is real.
-//
-// The inner-scan column falls with size because it is not a marginal cost at
-// small N. A durable execution has a fixed setup — a scanner goroutine, a
-// worker pool, channels, a batch ring — and dividing that by a thousand rows
-// charges each row a share of something no row caused. By 100,000 rows the
-// fixed part has amortized and 18.3 ns is the honest marginal cost of reading
-// one inner row: a page-cache hit, an append into the batch buffer, and a share
-// of one columnar pass over a Segment. That is roughly 2.5x cheaper per row
-// than the heap's gathered extraction, which is not a surprise — the durable
-// inner side reads rows densely in scan order and never gathers at scattered
-// addresses.
-//
-// The probe column is flat at about 244 ns and that is the real finding. A
-// durable probe is a key-tree walk, a chunk-directory walk, a page admission,
-// and a document copy-out, and none of those grow with the collection because
-// all three structures are trees. On the heap the probe cost climbs with size
-// as the hash structure stops fitting cache; here the page cache absorbs that.
-//
-// This table alone would suggest the durable break-even is about 16 at the size
-// where it is trustworthy — well above the heap's 4.5 to 10.4 — and therefore
-// that the shipped ratio of 4 is merely conservative here. That conclusion is
-// wrong, and it is wrong in an instructive way: this table's inner-scan column
-// is measured through the parallel batched executor, and the scan that actually
-// builds a filter is serial, because a binding must exist before the pool is
-// started. joinFileBloomScanRatio below measures the crossover directly instead
-// of deriving it from these two columns, and that is the number that governs.
-//
-// joinMembershipMax needed no such re-derivation. It bounds how much memory a
-// collected set may occupy and how many comparisons an outer row may cost, and
-// both of those are properties of the set rather than of the storage the set
-// was read from.
-
 // joinFileBloomScanRatio is joinBloomScanRatio for a durable inner side: how
 // many inner rows the binder will scan, per outer row, to build a semi-join
 // reduction filter.
 //
-// It is a separate constant from joinBloomScanRatio because the measurement
-// says it has to be, and the reason is structural rather than a matter of
-// degree.
-//
-// BenchmarkDurableJoinFilterCrossover measures the crossover directly: 20,000
-// driving rows against inner sides from 10,000 to 80,000 — the ratio this
-// constant governs, swept — at 1% inner selectivity, with the filter forced on
-// and forced off. Apple M4 Max, Go 1.26, warm, ns per driving row:
-//
-//	inner/outer   unfiltered   forced filter   filter is
-//	        0.5        270.7            91.2     2.97x faster
-//	        1.0        252.3           129.2     1.95x faster
-//	        2.0        255.2           208.5     1.22x faster
-//	        4.0        260.9           369.1     1.41x SLOWER
-//
-// The unfiltered arm is flat because it does not read the inner side at all;
-// the filtered arm rises linearly because it reads all of it. Those two lines
-// cross at a ratio of about 2.6. Four — the heap's constant — is past the
-// crossing, which is why running the durable backend under it measured a loss
-// even in the case most favourable to the filter: at 1% selectivity the filter
-// survived and rejected 19,800 of 20,000 probes and still finished 1.27x slower
-// warm and 1.56x slower cold. Rejecting 99% of the probes and losing anyway is
-// the whole finding, and it says the probe being avoided is cheap relative to
-// the scan being spent to avoid it.
-//
-// Two is the floor of the measured crossing, chosen the same way
-// joinBloomScanRatio took the floor of its own measured range, and the table
-// shows the window it keeps is real rather than a polite way of disabling the
-// feature: a filter is still admitted at ratios up to 2, where it is worth
-// between 1.22x and 2.97x.
-//
-// The expectation going in was the opposite of all of this — that a durable
-// backend would favour the filter more than the heap does, because a filter
-// rejection converts page I/O into a cache-line test. That reasoning is sound
-// about the probe and wrong about the scan, and the scan is what dominates. The
-// inner scan that builds a filter runs on the binding goroutine alone, because
-// a binding has to exist before the driving scan starts and therefore before
-// the worker pool is started. A standalone durable query over the same
-// collection runs through that pool and reaches 16.7 ns per row
-// (BenchmarkDurableJoinCostModel); the serial bind scan behind the table above
-// costs roughly 140 ns per row, eight times more, and the entire difference is
-// the parallelism the bind cannot use. The heap has the same serial bind, but a
-// heap inner row costs about 45 ns to scan whether or not anything is parallel,
-// so its ratio survives and this one does not.
-//
-// # The measurement to redo before touching this
-//
-// Parallelising the bind scan is what would change this constant, and it would
-// change it a lot: at 16.7 ns per inner row instead of 140, the crossing moves
-// from 2.6 to somewhere above 20, and every row of the table above becomes a
-// filter win. That is a real opportunity rather than a hypothetical, because
-// the rows the constant currently declines are exactly the ones a parallel bind
-// would turn into large wins.
-//
-// It is deliberately not done here. The inner side would have to run through
-// the same filePool the driving scan uses, and that pool's correctness rests on
-// a balance argument over four reused channels — every credit taken is
-// released, every batch queued is taken, every partial published is consumed —
-// that a second job shape with a different output path and a sequential
-// early-stop rule would have to be re-derived against rather than assumed. That
-// is a change to freshly landed concurrency, and pairing it with a first
-// implementation of durable joins in one step is how a silent imbalance gets
-// introduced. The constant below is correct for the serial bind that exists.
+// It is separate from joinBloomScanRatio because the durable filter-building
+// scan is serial while ordinary durable scans are parallel, and cached durable
+// probes have a different cost shape from heap hash probes.
+// BenchmarkDurableJoinFilterCrossover measures the actual forced-on/forced-off
+// crossover rather than inferring it from the ordinary scan. Parallelizing the
+// bind scan would require re-measuring this constant and re-deriving filePool's
+// channel-balance proof for the new job shape. Exact results and reproduction
+// commands live in docs/performance.md.
 const joinFileBloomScanRatio = 2
 
 // joinFileEffectiveRatio resolves the caller's setting for a durable inner

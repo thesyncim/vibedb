@@ -107,8 +107,9 @@ func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 	return c.deletePrimaryWithEmptyReclaim(key)
 }
 
-// Snapshot pins one immutable durable root generation. Close must be
-// called; copy-out methods remain valid independently of page eviction.
+// Snapshot pins one immutable reader-visible rooted generation after any
+// bounded foreground fold needed to seal it. Close must be called; copy-out
+// methods remain valid independently of page eviction.
 //
 // A snapshot is cheap to take and expensive to keep. Holding one open blocks
 // reuse of every extent the writer retires after it was taken, so a snapshot

@@ -315,7 +315,10 @@ func TestSimpleQueryStatementIterationIsBounded(t *testing.T) {
 			iter := statementIterator{src: src}
 			count := 0
 			for {
-				_, ok := iter.next()
+				_, ok, err := iter.next()
+				if err != nil {
+					panic(err)
+				}
 				if !ok {
 					break
 				}
