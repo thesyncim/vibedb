@@ -455,9 +455,10 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			// of the wrapper that will consume it. EXPLAIN ANALYZE re-enters the
 			// ordinary execution path, so it must retain the same join catalog or
 			// primary-point fact as SELECT.
-			if s.query.RequiresCatalog() {
-				s.joinNames = joinTableNames(tree.Select)
-			} else {
+			if s.query.RequiresCatalog() || tree.Select.With != nil {
+				s.dependencies = selectPhysicalDependencies(tree.Select)
+			}
+			if !s.query.RequiresCatalog() {
 				if lockErr := rlockContext(ctx, &c.db.mu); lockErr != nil {
 					s.query.Release()
 					return nil, lockErr

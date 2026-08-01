@@ -42,6 +42,8 @@ const (
 	sqlstateUndefinedColumn            = "42703"
 	sqlstateAmbiguousColumn            = "42702"
 	sqlstateAmbiguousAlias             = "42P09"
+	sqlstateDuplicateAlias             = "42712"
+	sqlstateInvalidColumnReference     = "42P10"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
 	sqlstateFeatureNotSupported        = "0A000"
@@ -239,6 +241,14 @@ func asPGError(err error) *pgError {
 	if errors.As(err, &unsupported) {
 		return newError(sqlstateFeatureNotSupported, unsupported.Msg)
 	}
+	var duplicateCTE *sqlast.DuplicateCTEError
+	if errors.As(err, &duplicateCTE) {
+		return newError(sqlstateDuplicateAlias, duplicateCTE.Msg)
+	}
+	var cteAliasArity *sqlast.CTEColumnAliasArityError
+	if errors.As(err, &cteAliasArity) {
+		return newError(sqlstateInvalidColumnReference, cteAliasArity.Msg)
+	}
 	var parse *sqlast.ParseError
 	if errors.As(err, &parse) {
 		e := newError(sqlstateSyntaxError, parse.Msg)
@@ -255,6 +265,10 @@ func asPGErrorIn(err error, src string) *pgError {
 	e := asPGError(err)
 	if e == nil {
 		return nil
+	}
+	var positioned interface{ Position() int }
+	if e.position == 0 && errors.As(err, &positioned) {
+		e.position = charPosition(src, positioned.Position())
 	}
 	var parse *sqlast.ParseError
 	if e.position == 0 && errors.As(err, &parse) {

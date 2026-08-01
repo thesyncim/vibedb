@@ -71,12 +71,25 @@ func (c *conn) validateSurfaceContext(
 }
 
 func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
+	if selectStmt.With != nil {
+		for i := range selectStmt.With.CTEs {
+			definition := &selectStmt.With.CTEs[i]
+			if definition.Query == nil {
+				return errors.New("vibedb: CTE definition has no query")
+			}
+			if err := c.validateSelectTables(definition.Query); err != nil {
+				return err
+			}
+		}
+	}
 	for i := range selectStmt.From {
 		relation := &selectStmt.From[i]
 		switch relation.Kind {
 		case sqlast.RelationCollection:
 			if _, exists := c.db.tables[relation.Name]; !exists {
-				return fmt.Errorf("%w: %q", ErrTableNotFound, relation.Name)
+				return missingTableDependency(
+					relation.Name, relation.Pos, false,
+				)
 			}
 		case sqlast.RelationDerived:
 			// A derived relation has no physical Name. Validate its complete
@@ -87,6 +100,13 @@ func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
 			}
 			if err := c.validateSelectTables(relation.Query); err != nil {
 				return err
+			}
+		case sqlast.RelationCTE:
+			// Definitions are validated exactly once above. Expanding a
+			// reference would duplicate work and can become exponential when a
+			// CTE is referenced by several later definitions.
+			if relation.Query == nil {
+				return errors.New("vibedb: CTE relation has no definition")
 			}
 		default:
 			return fmt.Errorf("vibedb: unsupported relation kind %d", relation.Kind)

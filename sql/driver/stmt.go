@@ -21,7 +21,7 @@ type stmt struct {
 	primaryPoint bool
 	params       int
 	paramKinds   []ParamKind
-	joinNames    []string
+	dependencies []physicalDependency
 	explain      bool
 	analyze      bool
 	closed       bool
@@ -79,7 +79,7 @@ func (s *stmt) Close() error {
 	s.mutation = nil
 	s.primaryPoint = false
 	s.paramKinds = nil
-	s.joinNames = nil
+	s.dependencies = nil
 	s.explain = false
 	s.analyze = false
 	s.conn = nil
@@ -193,9 +193,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
 	if s.conn.tx != nil {
-		if s.query.RequiresCatalog() {
+		if s.transactionRequiresCatalogSource() {
 			source, err := s.conn.materializeTransactionJoinSource(
-				ctx, s.conn.tx, s.query.Collection(), s.joinNames)
+				ctx, s.conn.tx, s.query.Collection(), s.dependencies)
 			if err != nil {
 				return nil, err
 			}
@@ -211,9 +211,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		}
 		state, ok := s.conn.tx.tables[s.query.Collection()]
 		if !ok {
-			return nil, fmt.Errorf(
-				"%w: %q was not present when the transaction began",
-				ErrTableNotFound, s.query.Collection())
+			return nil, s.missingDependency(s.query.Collection(), true)
 		}
 		var source query.Source
 		if s.primaryPoint {
@@ -245,14 +243,14 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
 		return nil, err
 	}
-	if s.query.RequiresCatalog() {
+	if s.requiresCatalogSource() {
 		catalog, snapshotErr := s.snapshotCatalogDependenciesLocked(ctx)
 		s.conn.db.mu.RUnlock()
 		if snapshotErr != nil {
 			return nil, snapshotErr
 		}
 		source, materializeErr := s.conn.materializeDurableJoinSource(
-			ctx, catalog, s.query.Collection(), s.joinNames)
+			ctx, catalog, s.query.Collection(), s.dependencies)
 		closeErr := catalog.Close()
 		if materializeErr != nil {
 			return nil, materializeErr
@@ -273,7 +271,7 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	t, ok := s.conn.db.tables[s.query.Collection()]
 	if !ok {
 		s.conn.db.mu.RUnlock()
-		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, s.query.Collection())
+		return nil, s.missingDependency(s.query.Collection(), false)
 	}
 	var (
 		source   query.Source
@@ -378,7 +376,7 @@ func (s *stmt) analyzeRows(ctx context.Context, args []any) (*rows, error) {
 }
 
 func analyzeAccessPath(s *stmt, pointSource bool, stats query.ExecStats) string {
-	if s.query.RequiresCatalog() {
+	if s.requiresCatalogSource() {
 		switch {
 		case stats.JoinBuilds != 0:
 			return "hash-build-and-probe"
@@ -422,7 +420,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	// subplans into the heap executor, whose source has no durable catalog. Keep
 	// the plan logical rather than attributing an original table's indexes to
 	// the materialized execution.
-	if s.query.RequiresCatalog() {
+	if s.requiresCatalogSource() {
 		return options, s.validateCatalogDependenciesForExplain(ctx)
 	}
 	options.IndexCatalogKnown = true
@@ -430,9 +428,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	if s.conn.tx != nil {
 		state, ok := s.conn.tx.tables[collection]
 		if !ok {
-			return query.ExplainOptions{}, fmt.Errorf(
-				"%w: %q was not present when the transaction began",
-				ErrTableNotFound, collection)
+			return query.ExplainOptions{}, s.missingDependency(collection, true)
 		}
 		if state.snapshot != nil {
 			options.Indexes = state.snapshot.AppendIndexes(options.Indexes)
@@ -445,7 +441,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	t, ok := s.conn.db.tables[collection]
 	if !ok {
 		s.conn.db.mu.RUnlock()
-		return query.ExplainOptions{}, fmt.Errorf("%w: %q", ErrTableNotFound, collection)
+		return query.ExplainOptions{}, s.missingDependency(collection, false)
 	}
 	if t.collection == nil {
 		s.conn.db.mu.RUnlock()
@@ -464,6 +460,49 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	return options, contextCheckpoint(ctx)
 }
 
+// requiresCatalogSource distinguishes coherent multi-collection execution
+// from a nested plan whose every physical read resolves to one collection.
+// The latter can keep the ordinary durable Source and its exact-index path;
+// self-joins still require a catalog even though their distinct name count is
+// one because the join executor intentionally rejects FromFile.
+func (s *stmt) requiresCatalogSource() bool {
+	if !s.query.RequiresCatalog() {
+		return false
+	}
+	return s.query.NumJoins() != 0 || len(s.dependencies) != 1
+}
+
+func (s *stmt) transactionRequiresCatalogSource() bool {
+	if s.requiresCatalogSource() {
+		return true
+	}
+	if !s.query.RequiresCatalog() {
+		return false
+	}
+	// FromFileOverlay cannot be recursively rebound yet. Retain the coherent
+	// transaction-catalog fallback only while staged writes coexist with a
+	// durable BEGIN snapshot; no-pending and initially-empty views use the
+	// direct file/segment source without sacrificing read-your-writes.
+	state := s.conn.tx.tables[s.dependencies[0].name]
+	return state != nil && state.snapshot != nil && len(state.pending) != 0
+}
+
+func (s *stmt) missingDependency(name string, transaction bool) error {
+	for i := range s.dependencies {
+		if s.dependencies[i].name == name {
+			return missingTableDependency(
+				name, s.dependencies[i].pos, transaction,
+			)
+		}
+	}
+	if s.tree != nil && s.tree.Select != nil && len(s.tree.Select.From) != 0 {
+		return missingTableDependency(
+			name, s.tree.Select.From[0].Pos, transaction,
+		)
+	}
+	return missingTableDependency(name, 0, transaction)
+}
+
 // snapshotCatalogDependenciesLocked captures every physical relation the
 // prepared statement may read at one durable instant. The caller holds db.mu
 // for reading; retaining that lock through SnapshotCollections keeps DROP and
@@ -474,15 +513,17 @@ func (s *stmt) snapshotCatalogDependenciesLocked(
 ) (durable.DatabaseSnapshot, error) {
 	clear(s.conn.joinCatalog)
 	collections := s.conn.joinCatalog[:0]
-	for _, name := range s.joinNames {
-		t, ok := s.conn.db.tables[name]
+	for _, dependency := range s.dependencies {
+		t, ok := s.conn.db.tables[dependency.name]
 		if !ok {
 			s.conn.releaseJoinCatalog(collections)
 			return durable.DatabaseSnapshot{},
-				fmt.Errorf("%w: %q", ErrTableNotFound, name)
+				missingTableDependency(
+					dependency.name, dependency.pos, false,
+				)
 		}
 		collections = append(collections, durable.NamedCollection{
-			Name: name, Collection: t.collection,
+			Name: dependency.name, Collection: t.collection,
 		})
 	}
 	if err := contextCheckpoint(ctx); err != nil {
@@ -504,14 +545,13 @@ func (s *stmt) validateCatalogDependenciesForExplain(ctx context.Context) error 
 		if s.conn.tx.done {
 			return errors.New("vibedb: transaction is finished")
 		}
-		for _, name := range s.joinNames {
+		for _, dependency := range s.dependencies {
 			if err := contextCheckpoint(ctx); err != nil {
 				return err
 			}
-			if _, ok := s.conn.tx.tables[name]; !ok {
-				return fmt.Errorf(
-					"%w: %q was not present when the transaction began",
-					ErrTableNotFound, name,
+			if _, ok := s.conn.tx.tables[dependency.name]; !ok {
+				return missingTableDependency(
+					dependency.name, dependency.pos, true,
 				)
 			}
 		}
