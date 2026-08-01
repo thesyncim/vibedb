@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -68,6 +69,169 @@ func TestWindowKernelExplicitNullOrderingAndStablePeers(t *testing.T) {
 		{`3`, `2`, `2`, `10`},
 		{`1`, `1`, `1`, `null`},
 	})
+}
+
+func TestWindowKernelDistributionFunctions(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`}, {`1.0`}, {`2`}, {`3`}, {`3.00`}, {`3e0`}, {`4`},
+	})
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowNTile, column: -1, buckets: 3},
+			{kind: windowPercentRank, column: -1},
+			{kind: windowCumeDist, column: -1},
+		},
+	}
+	result := runWindowTest(t, &input, &plan)
+	assertSetRows(t, result, [][]string{
+		{`1`, `0`, `0.2857142857142857142857142857142857`},
+		{`1`, `0`, `0.2857142857142857142857142857142857`},
+		{`1`, `0.3333333333333333333333333333333333`, `0.4285714285714285714285714285714286`},
+		{`2`, `0.5`, `0.8571428571428571428571428571428571`},
+		{`2`, `0.5`, `0.8571428571428571428571428571428571`},
+		{`3`, `0.5`, `0.8571428571428571428571428571428571`},
+		{`3`, `1`, `1`},
+	})
+
+	short := buildSetTestSpool(t, [][]string{{`1`}, {`2`}, {`3`}})
+	shortPlan := windowPlan{
+		order:     plan.order,
+		functions: []windowFunctionSpec{{kind: windowNTile, column: -1, buckets: 8}},
+	}
+	assertSetRows(t, runWindowTest(t, &short, &shortPlan), [][]string{{`1`}, {`2`}, {`3`}})
+
+	singletonPlan := windowPlan{functions: []windowFunctionSpec{
+		{kind: windowPercentRank, column: -1},
+		{kind: windowCumeDist, column: -1},
+	}}
+	assertSetRows(t, runWindowTest(t, &relationSpool{rows: 1}, &singletonPlan), [][]string{{`0`, `1`}})
+}
+
+func TestWindowKernelFrameValueFunctionsPreserveNullAndMissing(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`, setTestMissing},
+		{`2`, `"b"`},
+		{`3`, `null`},
+		{`4`, `"d"`},
+	})
+	frameSpec := windowRowsFrame{
+		start: windowFrameBound{kind: windowPreceding, offset: 1},
+		end:   windowFrameBound{kind: windowFollowing, offset: 1},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowFirstValue, column: 1, frame: frameSpec},
+			{kind: windowLastValue, column: 1, frame: frameSpec},
+			{kind: windowNthValue, column: 1, nth: 2, frame: frameSpec},
+			{kind: windowNthValue, column: 1, nth: 5, frame: frameSpec},
+		},
+	}
+	result := runWindowTest(t, &input, &plan)
+	assertSetRows(t, result, [][]string{
+		{setTestMissing, `"b"`, `"b"`, `null`},
+		{setTestMissing, `null`, `"b"`, `null`},
+		{`"b"`, `"d"`, `null`, `null`},
+		{`null`, `"d"`, `"d"`, `null`},
+	})
+	if result.columns[0][0].raw != nil || result.columns[0][1].raw != nil {
+		t.Fatal("FIRST_VALUE did not preserve missing source ownership")
+	}
+}
+
+func TestWindowKernelGroupsFrames(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`, `1`}, {`1.0`, `2`}, {`2`, `10`},
+		{`3`, `100`}, {`3.0`, `200`}, {`3e0`, `300`}, {`4`, `1000`},
+	})
+	groupsFrame := windowRowsFrame{
+		unit:  windowFrameGroups,
+		start: windowFrameBound{kind: windowPreceding, offset: 1},
+		end:   windowFrameBound{kind: windowCurrentRow},
+	}
+	plan := windowPlan{
+		order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+		functions: []windowFunctionSpec{
+			{kind: windowCount, column: -1, frame: groupsFrame},
+			{kind: windowSum, column: 1, frame: groupsFrame},
+			{kind: windowFirstValue, column: 1, frame: groupsFrame},
+			{kind: windowLastValue, column: 1, frame: groupsFrame},
+			{kind: windowNthValue, column: 1, nth: 2, frame: groupsFrame},
+		},
+	}
+	result := runWindowTest(t, &input, &plan)
+	assertSetRows(t, result, [][]string{
+		{`2`, `3`, `1`, `2`, `2`},
+		{`2`, `3`, `1`, `2`, `2`},
+		{`3`, `13`, `1`, `10`, `2`},
+		{`4`, `610`, `10`, `300`, `100`},
+		{`4`, `610`, `10`, `300`, `100`},
+		{`4`, `610`, `10`, `300`, `100`},
+		{`4`, `1600`, `100`, `1000`, `200`},
+	})
+}
+
+func TestWindowKernelGroupsFrameBounds(t *testing.T) {
+	input := buildSetTestSpool(t, [][]string{
+		{`1`}, {`1.0`}, {`2`}, {`3`}, {`3.0`}, {`3e0`}, {`4`},
+	})
+	tests := []struct {
+		name  string
+		frame windowRowsFrame
+		want  []string
+	}{
+		{
+			name: "unbounded preceding to current group",
+			frame: windowRowsFrame{unit: windowFrameGroups,
+				start: windowFrameBound{kind: windowUnboundedPreceding},
+				end:   windowFrameBound{kind: windowCurrentRow}},
+			want: []string{`2`, `2`, `3`, `6`, `6`, `6`, `7`},
+		},
+		{
+			name: "current group to unbounded following",
+			frame: windowRowsFrame{unit: windowFrameGroups,
+				start: windowFrameBound{kind: windowCurrentRow},
+				end:   windowFrameBound{kind: windowUnboundedFollowing}},
+			want: []string{`7`, `7`, `5`, `4`, `4`, `4`, `1`},
+		},
+		{
+			name: "one preceding to one following",
+			frame: windowRowsFrame{unit: windowFrameGroups,
+				start: windowFrameBound{kind: windowPreceding, offset: 1},
+				end:   windowFrameBound{kind: windowFollowing, offset: 1}},
+			want: []string{`3`, `3`, `6`, `5`, `5`, `5`, `4`},
+		},
+		{
+			name: "two following to unbounded following",
+			frame: windowRowsFrame{unit: windowFrameGroups,
+				start: windowFrameBound{kind: windowFollowing, offset: 2},
+				end:   windowFrameBound{kind: windowUnboundedFollowing}},
+			want: []string{`4`, `4`, `1`, `0`, `0`, `0`, `0`},
+		},
+		{
+			name: "unbounded preceding to two preceding",
+			frame: windowRowsFrame{unit: windowFrameGroups,
+				start: windowFrameBound{kind: windowUnboundedPreceding},
+				end:   windowFrameBound{kind: windowPreceding, offset: 2}},
+			want: []string{`0`, `0`, `0`, `2`, `2`, `2`, `3`},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := windowPlan{
+				order: []windowOrderKey{{column: 0, nulls: windowNullsFirst}},
+				functions: []windowFunctionSpec{{
+					kind: windowCount, column: -1, frame: test.frame,
+				}},
+			}
+			want := make([][]string, len(test.want))
+			for row := range test.want {
+				want[row] = []string{test.want[row]}
+			}
+			assertSetRows(t, runWindowTest(t, &input, &plan), want)
+		})
+	}
 }
 
 func TestWindowKernelSlidingRowsAggregates(t *testing.T) {
@@ -175,6 +339,12 @@ func TestWindowKernelValidationAndFrames(t *testing.T) {
 			end:   windowFrameBound{kind: windowFollowing, offset: 1},
 		}}}},
 		{functions: []windowFunctionSpec{{kind: windowCount, column: -1, offset: 1, frame: validFrame}}},
+		{functions: []windowFunctionSpec{{kind: windowNTile, column: -1}}},
+		{functions: []windowFunctionSpec{{kind: windowNthValue, column: 0, frame: validFrame}}},
+		{functions: []windowFunctionSpec{{kind: windowFirstValue, column: 0, nth: 1, frame: validFrame}}},
+		{functions: []windowFunctionSpec{{kind: windowFirstValue, column: 0, frame: windowRowsFrame{
+			unit: windowFrameUnit(9), start: validFrame.start, end: validFrame.end,
+		}}}},
 	}
 	for at := range tests {
 		var executor windowExecutor
@@ -438,6 +608,7 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 		input := buildSetTestSpool(t, data)
 		preceding, following := random.Intn(4), random.Intn(4)
 		frameSpec := windowRowsFrame{
+			unit:  windowFrameUnit(random.Intn(2)),
 			start: windowFrameBound{kind: windowPreceding, offset: preceding},
 			end:   windowFrameBound{kind: windowFollowing, offset: following},
 		}
@@ -451,6 +622,9 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 				{kind: windowRowNumber, column: -1},
 				{kind: windowRank, column: -1},
 				{kind: windowDenseRank, column: -1},
+				{kind: windowNTile, column: -1, buckets: 1 + random.Intn(8)},
+				{kind: windowPercentRank, column: -1},
+				{kind: windowCumeDist, column: -1},
 				{kind: windowLag, column: 2, offset: random.Intn(4)},
 				{kind: windowLead, column: 2, offset: random.Intn(4)},
 				{kind: windowCount, column: -1, frame: frameSpec},
@@ -458,6 +632,9 @@ func TestWindowKernelDifferentialRandomIntegerFrames(t *testing.T) {
 				{kind: windowSum, column: 2, frame: frameSpec},
 				{kind: windowMin, column: 2, frame: frameSpec},
 				{kind: windowMax, column: 2, frame: frameSpec},
+				{kind: windowFirstValue, column: 2, frame: frameSpec},
+				{kind: windowLastValue, column: 2, frame: frameSpec},
+				{kind: windowNthValue, column: 2, nth: 2, frame: frameSpec},
 			},
 		}
 		result := runWindowTest(t, &input, &plan)
@@ -524,6 +701,16 @@ func TestWindowKernelOverflowGuards(t *testing.T) {
 	if _, err := measureWindowExecution(&input, &plan, nil); !errors.Is(err, errWindowSize) {
 		t.Fatalf("row workspace overflow = %v, want %v", err, errWindowSize)
 	}
+	groupsPlan := windowPlan{functions: []windowFunctionSpec{{
+		kind: windowCount, column: -1,
+		frame: windowRowsFrame{
+			unit: windowFrameGroups,
+			end:  windowFrameBound{kind: windowCurrentRow},
+		},
+	}}}
+	if _, err := measureWindowExecution(&input, &groupsPlan, nil); !errors.Is(err, errWindowSize) {
+		t.Fatalf("group workspace overflow = %v, want %v", err, errWindowSize)
+	}
 	invalidFrames := []windowRowsFrame{
 		{start: windowFrameBound{kind: windowUnboundedFollowing}, end: windowFrameBound{kind: windowUnboundedFollowing}},
 		{start: windowFrameBound{kind: windowCurrentRow}, end: windowFrameBound{kind: windowUnboundedPreceding}},
@@ -540,6 +727,7 @@ var windowSink int
 
 type windowTestCapacities struct {
 	order, scratch, deque int
+	groups                int
 	number, negative      int
 	columns, data         int
 }
@@ -547,6 +735,7 @@ type windowTestCapacities struct {
 func windowExecutorCapacities(e *windowExecutor) windowTestCapacities {
 	return windowTestCapacities{
 		order: cap(e.order), scratch: cap(e.sortScratch), deque: cap(e.deque),
+		groups: cap(e.groups),
 		number: cap(e.numberOut), negative: cap(e.negative),
 		columns: cap(e.result.columns), data: cap(e.result.data),
 	}
@@ -595,6 +784,11 @@ func windowStressPlan() windowPlan {
 		start: windowFrameBound{kind: windowPreceding, offset: 8},
 		end:   windowFrameBound{kind: windowFollowing, offset: 4},
 	}
+	groupsFrame := windowRowsFrame{
+		unit:  windowFrameGroups,
+		start: windowFrameBound{kind: windowPreceding, offset: 1},
+		end:   windowFrameBound{kind: windowFollowing, offset: 1},
+	}
 	return windowPlan{
 		partition: []int{0},
 		order: []windowOrderKey{{
@@ -604,6 +798,9 @@ func windowStressPlan() windowPlan {
 			{kind: windowRowNumber, column: -1},
 			{kind: windowRank, column: -1},
 			{kind: windowDenseRank, column: -1},
+			{kind: windowNTile, column: -1, buckets: 11},
+			{kind: windowPercentRank, column: -1},
+			{kind: windowCumeDist, column: -1},
 			{kind: windowLag, column: 2, offset: 3},
 			{kind: windowLead, column: 2, offset: 2},
 			{kind: windowCount, column: -1, frame: frame},
@@ -612,6 +809,11 @@ func windowStressPlan() windowPlan {
 			{kind: windowAvg, column: 2, frame: frame},
 			{kind: windowMin, column: 2, frame: frame},
 			{kind: windowMax, column: 2, frame: frame},
+			{kind: windowFirstValue, column: 2, frame: frame},
+			{kind: windowLastValue, column: 2, frame: frame},
+			{kind: windowNthValue, column: 2, nth: 3, frame: frame},
+			{kind: windowCount, column: -1, frame: groupsFrame},
+			{kind: windowSum, column: 2, frame: groupsFrame},
 		},
 	}
 }
@@ -651,6 +853,7 @@ func referenceWindowIntegerRows(
 			}
 			partitionEnd++
 		}
+		groups := referenceWindowGroups(t, input, plan.order, order, partitionStart, partitionEnd)
 		for position := partitionStart; position < partitionEnd; position++ {
 			row := order[position]
 			local := position - partitionStart
@@ -659,7 +862,7 @@ func referenceWindowIntegerRows(
 				switch function.kind {
 				case windowRowNumber:
 					result[row][column] = fmt.Sprintf("%d", local+1)
-				case windowRank, windowDenseRank:
+				case windowRank, windowDenseRank, windowPercentRank:
 					rank, dense := 1, 1
 					for at := 1; at <= local; at++ {
 						peer, err := windowPeers(
@@ -676,7 +879,30 @@ func referenceWindowIntegerRows(
 					if function.kind == windowDenseRank {
 						rank = dense
 					}
-					result[row][column] = fmt.Sprintf("%d", rank)
+					if function.kind == windowPercentRank {
+						result[row][column] = referenceWindowRatio(rank-1, max(rows-1, 1))
+					} else {
+						result[row][column] = fmt.Sprintf("%d", rank)
+					}
+				case windowCumeDist:
+					end := local + 1
+					for end < rows {
+						peer, err := windowPeers(
+							input, plan.order, order[position], order[partitionStart+end], nil,
+						)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !peer {
+							break
+						}
+						end++
+					}
+					result[row][column] = referenceWindowRatio(end, rows)
+				case windowNTile:
+					result[row][column] = fmt.Sprintf(
+						"%d", referenceWindowTile(local, rows, function.buckets),
+					)
 				case windowLag, windowLead:
 					target, ok := windowOffsetPosition(
 						local, rows, function.offset, function.kind == windowLead,
@@ -689,7 +915,8 @@ func referenceWindowIntegerRows(
 						)
 					}
 				case windowCount, windowSum, windowMin, windowMax:
-					lo, hi := resolveWindowFrame(function.frame, local, rows)
+					group := referenceWindowGroupAt(groups, local)
+					lo, hi := referenceWindowFrame(function.frame, local, rows, groups, group)
 					count, sum := 0, int64(0)
 					var extreme scalar
 					for at := lo; at < hi; at++ {
@@ -733,6 +960,26 @@ func referenceWindowIntegerRows(
 							result[row][column] = windowScalarString(extreme)
 						}
 					}
+				case windowFirstValue, windowLastValue, windowNthValue:
+					group := referenceWindowGroupAt(groups, local)
+					lo, hi := referenceWindowFrame(function.frame, local, rows, groups, group)
+					target, ok := lo, lo < hi
+					switch function.kind {
+					case windowLastValue:
+						target = hi - 1
+					case windowNthValue:
+						ok = function.nth <= hi-lo
+						if ok {
+							target = lo + function.nth - 1
+						}
+					}
+					if !ok {
+						result[row][column] = `null`
+					} else {
+						result[row][column] = windowScalarString(
+							input.columns[function.column][order[partitionStart+target]],
+						)
+					}
 				}
 			}
 		}
@@ -746,4 +993,168 @@ func windowScalarString(value scalar) string {
 		return setTestMissing
 	}
 	return string(value.raw)
+}
+
+func referenceWindowGroups(
+	t testing.TB,
+	input *relationSpool,
+	keys []windowOrderKey,
+	order []int,
+	start, end int,
+) []int {
+	t.Helper()
+	groups := []int{0}
+	for position := start + 1; position < end; position++ {
+		peer, err := windowPeers(input, keys, order[position-1], order[position], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !peer {
+			groups = append(groups, position-start)
+		}
+	}
+	return append(groups, end-start)
+}
+
+func referenceWindowGroupAt(groups []int, position int) int {
+	group := 0
+	for group+1 < len(groups)-1 && position >= groups[group+1] {
+		group++
+	}
+	return group
+}
+
+func referenceWindowTile(position, rows, buckets int) int {
+	base, extra := rows/buckets, rows%buckets
+	if base == 0 {
+		return position + 1
+	}
+	largeRows := (base + 1) * extra
+	if position < largeRows {
+		return position/(base+1) + 1
+	}
+	return extra + (position-largeRows)/base + 1
+}
+
+func referenceWindowFrame(
+	frame windowRowsFrame,
+	position, rows int,
+	groups []int,
+	group int,
+) (int, int) {
+	if frame.unit == windowFrameGroups {
+		start := 0
+		switch frame.start.kind {
+		case windowPreceding:
+			if frame.start.offset <= group {
+				start = groups[group-frame.start.offset]
+			}
+		case windowCurrentRow:
+			start = groups[group]
+		case windowFollowing:
+			if frame.start.offset >= len(groups)-1-group {
+				start = rows
+			} else {
+				start = groups[group+frame.start.offset]
+			}
+		}
+		end := 0
+		switch frame.end.kind {
+		case windowPreceding:
+			if frame.end.offset <= group {
+				end = groups[group-frame.end.offset+1]
+			}
+		case windowCurrentRow:
+			end = groups[group+1]
+		case windowFollowing:
+			if frame.end.offset >= len(groups)-2-group {
+				end = rows
+			} else {
+				end = groups[group+frame.end.offset+1]
+			}
+		case windowUnboundedFollowing:
+			end = rows
+		}
+		if end < start {
+			end = start
+		}
+		return start, end
+	}
+
+	start := 0
+	switch frame.start.kind {
+	case windowPreceding:
+		if frame.start.offset <= position {
+			start = position - frame.start.offset
+		}
+	case windowCurrentRow:
+		start = position
+	case windowFollowing:
+		if frame.start.offset >= rows-position {
+			start = rows
+		} else {
+			start = position + frame.start.offset
+		}
+	}
+	end := 0
+	switch frame.end.kind {
+	case windowPreceding:
+		if frame.end.offset <= position {
+			end = position - frame.end.offset + 1
+		}
+	case windowCurrentRow:
+		end = position + 1
+	case windowFollowing:
+		if frame.end.offset >= rows-1-position {
+			end = rows
+		} else {
+			end = position + frame.end.offset + 1
+		}
+	case windowUnboundedFollowing:
+		end = rows
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
+}
+
+func referenceWindowRatio(numerator, denominator int) string {
+	if numerator == 0 {
+		return "0"
+	}
+	if numerator == denominator {
+		return "1"
+	}
+	remainder := numerator
+	leading := 0
+	digits := make([]byte, 0, averageDigits+1)
+	for len(digits) < averageDigits+1 && remainder != 0 {
+		remainder *= 10
+		digit := remainder / denominator
+		remainder %= denominator
+		if len(digits) == 0 && digit == 0 {
+			leading++
+			continue
+		}
+		digits = append(digits, byte(digit)+'0')
+	}
+	if len(digits) > averageDigits {
+		guard := digits[averageDigits]
+		digits = digits[:averageDigits]
+		if guard > '5' || guard == '5' &&
+			(remainder != 0 || (digits[len(digits)-1]-'0')&1 != 0) {
+			for at := len(digits) - 1; at >= 0; at-- {
+				if digits[at] != '9' {
+					digits[at]++
+					break
+				}
+				digits[at] = '0'
+			}
+		}
+	}
+	for len(digits) > 1 && digits[len(digits)-1] == '0' {
+		digits = digits[:len(digits)-1]
+	}
+	return "0." + strings.Repeat("0", leading) + string(digits)
 }

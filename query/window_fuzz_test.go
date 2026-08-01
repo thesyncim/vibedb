@@ -33,6 +33,7 @@ func FuzzWindowKernelAgainstReference(f *testing.F) {
 		}
 		input := buildSetTestSpoolColumns(t, decoded, 3)
 		frameSpec := windowRowsFrame{
+			unit:  windowFrameUnit(next() & 1),
 			start: windowFrameBound{kind: windowPreceding, offset: int(next() % 5)},
 			end:   windowFrameBound{kind: windowFollowing, offset: int(next() % 5)},
 		}
@@ -46,6 +47,9 @@ func FuzzWindowKernelAgainstReference(f *testing.F) {
 				{kind: windowRowNumber, column: -1},
 				{kind: windowRank, column: -1},
 				{kind: windowDenseRank, column: -1},
+				{kind: windowNTile, column: -1, buckets: 1 + int(next()%8)},
+				{kind: windowPercentRank, column: -1},
+				{kind: windowCumeDist, column: -1},
 				{kind: windowLag, column: 2, offset: int(next() % 5)},
 				{kind: windowLead, column: 2, offset: int(next() % 5)},
 				{kind: windowCount, column: -1, frame: frameSpec},
@@ -53,6 +57,9 @@ func FuzzWindowKernelAgainstReference(f *testing.F) {
 				{kind: windowSum, column: 2, frame: frameSpec},
 				{kind: windowMin, column: 2, frame: frameSpec},
 				{kind: windowMax, column: 2, frame: frameSpec},
+				{kind: windowFirstValue, column: 2, frame: frameSpec},
+				{kind: windowLastValue, column: 2, frame: frameSpec},
+				{kind: windowNthValue, column: 2, nth: 1 + int(next()%5), frame: frameSpec},
 			},
 		}
 		var executor windowExecutor

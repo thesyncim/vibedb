@@ -24,6 +24,12 @@ const (
 	windowAvg
 	windowMin
 	windowMax
+	windowNTile
+	windowPercentRank
+	windowCumeDist
+	windowFirstValue
+	windowLastValue
+	windowNthValue
 )
 
 type windowNullOrder uint8
@@ -55,14 +61,24 @@ type windowFrameBound struct {
 }
 
 type windowRowsFrame struct {
+	unit  windowFrameUnit
 	start windowFrameBound
 	end   windowFrameBound
 }
+
+type windowFrameUnit uint8
+
+const (
+	windowFrameRows windowFrameUnit = iota
+	windowFrameGroups
+)
 
 type windowFunctionSpec struct {
 	kind       windowFunctionKind
 	column     int
 	offset     int
+	buckets    int
+	nth        int
 	frame      windowRowsFrame
 	defaultVal scalar
 	hasDefault bool
@@ -79,7 +95,7 @@ type windowPlan struct {
 var (
 	errWindowInput = errors.New("query: malformed window input")
 	errWindowPlan  = errors.New("query: invalid window plan")
-	errWindowFrame = errors.New("query: invalid ROWS frame")
+	errWindowFrame = errors.New("query: invalid window frame")
 	errWindowSize  = errors.New("query: window size overflow")
 	errWindowAlias = errors.New("query: window output aliases input")
 )
@@ -93,6 +109,7 @@ type windowExecutor struct {
 	order       []int
 	sortScratch []int
 	deque       []int
+	groups      []int
 	numberOut   []byte
 	negative    []byte
 
@@ -123,6 +140,7 @@ type windowExecutionShape struct {
 	rows              int
 	functions         int
 	needsDeque        bool
+	needsGroups       bool
 	aggregateBytes    int64
 	numberOutputBytes int
 	negativeBytes     int
@@ -225,6 +243,7 @@ func (e *windowExecutor) resetTransient() {
 	e.order = e.order[:0]
 	e.sortScratch = e.sortScratch[:0]
 	e.deque = e.deque[:0]
+	e.groups = e.groups[:0]
 	e.numberOut = e.numberOut[:0]
 	e.negative = e.negative[:0]
 	e.aggregate.reset()
@@ -275,32 +294,48 @@ func measureWindowExecution(
 	maxNumberBytes := 0
 	maxCompactWeight := int64(0)
 	needsExact := false
+	needsNumberBuffers := false
 	sawNumber := false
 	for at, function := range plan.functions {
 		if err := cancellationCheckpoint(cancel, at); err != nil {
 			return windowExecutionShape{}, err
 		}
-		if function.kind > windowMax || function.offset < 0 {
+		if function.kind > windowNthValue || function.offset < 0 ||
+			function.buckets < 0 || function.nth < 0 {
 			return windowExecutionShape{}, fmt.Errorf(
 				"%w: function %d", errWindowPlan, at,
 			)
 		}
 		switch function.kind {
-		case windowRowNumber, windowRank, windowDenseRank:
-			if function.column != -1 || function.offset != 0 || function.hasDefault {
+		case windowRowNumber, windowRank, windowDenseRank,
+			windowPercentRank, windowCumeDist:
+			if function.column != -1 || function.offset != 0 || function.buckets != 0 ||
+				function.nth != 0 || function.hasDefault {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: ranking function %d has input column", errWindowPlan, at,
 				)
 			}
+			if function.kind == windowPercentRank || function.kind == windowCumeDist {
+				needsNumberBuffers = true
+			}
+		case windowNTile:
+			if function.column != -1 || function.offset != 0 || function.buckets <= 0 ||
+				function.nth != 0 || function.hasDefault {
+				return windowExecutionShape{}, fmt.Errorf(
+					"%w: NTILE function %d metadata", errWindowPlan, at,
+				)
+			}
 		case windowLag, windowLead:
-			if function.column < 0 || function.column >= columns {
+			if function.column < 0 || function.column >= columns ||
+				function.buckets != 0 || function.nth != 0 {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: offset function %d column", errWindowPlan, at,
 				)
 			}
 		case windowCount:
 			if function.column < -1 || function.column >= columns ||
-				function.offset != 0 || function.hasDefault {
+				function.offset != 0 || function.buckets != 0 || function.nth != 0 ||
+				function.hasDefault {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: COUNT function %d column", errWindowPlan, at,
 				)
@@ -308,9 +343,11 @@ func measureWindowExecution(
 			if err := validateWindowFrame(function.frame); err != nil {
 				return windowExecutionShape{}, err
 			}
+			shape.needsGroups = shape.needsGroups || function.frame.unit == windowFrameGroups
 		case windowSum, windowAvg, windowMin, windowMax:
 			if function.column < 0 || function.column >= columns ||
-				function.offset != 0 || function.hasDefault {
+				function.offset != 0 || function.buckets != 0 || function.nth != 0 ||
+				function.hasDefault {
 				return windowExecutionShape{}, fmt.Errorf(
 					"%w: aggregate function %d column", errWindowPlan, at,
 				)
@@ -318,6 +355,7 @@ func measureWindowExecution(
 			if err := validateWindowFrame(function.frame); err != nil {
 				return windowExecutionShape{}, err
 			}
+			shape.needsGroups = shape.needsGroups || function.frame.unit == windowFrameGroups
 			if function.kind == windowMin || function.kind == windowMax {
 				shape.needsDeque = true
 			} else {
@@ -345,6 +383,18 @@ func measureWindowExecution(
 					}
 				}
 			}
+		case windowFirstValue, windowLastValue, windowNthValue:
+			if function.column < 0 || function.column >= columns ||
+				function.offset != 0 || function.buckets != 0 || function.hasDefault ||
+				(function.kind == windowNthValue) != (function.nth > 0) {
+				return windowExecutionShape{}, fmt.Errorf(
+					"%w: value function %d metadata", errWindowPlan, at,
+				)
+			}
+			if err := validateWindowFrame(function.frame); err != nil {
+				return windowExecutionShape{}, err
+			}
+			shape.needsGroups = shape.needsGroups || function.frame.unit == windowFrameGroups
 		}
 	}
 
@@ -352,6 +402,19 @@ func measureWindowExecution(
 	work := saturatedBytes(intBytes, intBytes) // order and stable-sort scratch
 	if shape.needsDeque {
 		work = saturatedBytes(work, intBytes)
+	}
+	if shape.needsGroups {
+		if shape.rows == math.MaxInt {
+			return windowExecutionShape{}, errWindowSize
+		}
+		groupBytes := saturatedProduct(
+			int64(shape.rows+1), int64(unsafe.Sizeof(int(0))),
+		)
+		work = saturatedBytes(work, groupBytes)
+	}
+	if needsNumberBuffers {
+		shape.numberOutputBytes = 512
+		shape.negativeBytes = averageDigits + 2
 	}
 	if needsExact && sawNumber {
 		base := saturatedBytes(
@@ -372,7 +435,7 @@ func measureWindowExecution(
 		if outputBound > int64(math.MaxInt) {
 			return windowExecutionShape{}, errWindowSize
 		}
-		shape.numberOutputBytes = max(int(outputBound), 512)
+		shape.numberOutputBytes = max(shape.numberOutputBytes, max(int(outputBound), 512))
 		if maxNumberBytes >= math.MaxInt {
 			return windowExecutionShape{}, errWindowSize
 		}
@@ -380,6 +443,8 @@ func measureWindowExecution(
 			maxNumberBytes+1, max(shape.numberOutputBytes+1, averageDigits+2),
 		)
 		work = saturatedBytes(work, shape.aggregateBytes)
+	}
+	if shape.numberOutputBytes != 0 {
 		work = saturatedBytes(work, int64(shape.numberOutputBytes))
 		work = saturatedBytes(work, int64(shape.negativeBytes))
 	}
@@ -391,7 +456,8 @@ func measureWindowExecution(
 }
 
 func validateWindowFrame(frame windowRowsFrame) error {
-	if frame.start.kind > windowUnboundedFollowing || frame.end.kind > windowUnboundedFollowing ||
+	if frame.unit > windowFrameGroups ||
+		frame.start.kind > windowUnboundedFollowing || frame.end.kind > windowUnboundedFollowing ||
 		frame.start.offset < 0 || frame.end.offset < 0 {
 		return errWindowFrame
 	}
@@ -469,6 +535,16 @@ func (e *windowExecutor) prepare(shape windowExecutionShape) error {
 		}
 	} else {
 		e.deque = e.deque[:0]
+	}
+	if shape.needsGroups {
+		need := shape.rows + 1
+		if cap(e.groups) < need {
+			e.groups = make([]int, 0, need)
+		} else {
+			e.groups = e.groups[:0]
+		}
+	} else {
+		e.groups = e.groups[:0]
 	}
 	if cap(e.numberOut) < shape.numberOutputBytes {
 		e.numberOut = make([]byte, 0, shape.numberOutputBytes)
@@ -705,6 +781,12 @@ func (e *windowExecutor) walkPartition(
 	cancel *CancelFlag,
 ) error {
 	count := end - start
+	e.groups = e.groups[:0]
+	if windowFunctionUsesFrame(function.kind) && function.frame.unit == windowFrameGroups {
+		if err := e.buildWindowGroups(input, order, start, end, cancel); err != nil {
+			return err
+		}
+	}
 	switch function.kind {
 	case windowRowNumber:
 		for position := 0; position < count; position++ {
@@ -716,7 +798,7 @@ func (e *windowExecutor) walkPartition(
 				return err
 			}
 		}
-	case windowRank, windowDenseRank:
+	case windowRank, windowDenseRank, windowPercentRank:
 		rank, dense := 1, 1
 		for position := 0; position < count; position++ {
 			if err := cancellationCheckpoint(cancel, position); err != nil {
@@ -734,12 +816,60 @@ func (e *windowExecutor) walkPartition(
 					dense++
 				}
 			}
-			value := rank
+			cell := windowIntegerCell(rank)
 			if function.kind == windowDenseRank {
-				value = dense
+				cell = windowIntegerCell(dense)
+			} else if function.kind == windowPercentRank {
+				var err error
+				cell, err = e.windowRatioCell(rank-1, max(count-1, 1))
+				if err != nil {
+					return err
+				}
+			}
+			if err := writer.put(outputColumn, e.order[start+position], cell); err != nil {
+				return err
+			}
+		}
+	case windowCumeDist:
+		for groupStart := 0; groupStart < count; {
+			groupEnd := groupStart + 1
+			for groupEnd < count {
+				peer, err := windowPeers(
+					input, order, e.order[start+groupStart], e.order[start+groupEnd], cancel,
+				)
+				if err != nil {
+					return err
+				}
+				if !peer {
+					break
+				}
+				groupEnd++
+			}
+			cell, err := e.windowRatioCell(groupEnd, count)
+			if err != nil {
+				return err
+			}
+			for position := groupStart; position < groupEnd; position++ {
+				if err := cancellationCheckpoint(cancel, position); err != nil {
+					return err
+				}
+				if err := writer.put(outputColumn, e.order[start+position], cell); err != nil {
+					return err
+				}
+			}
+			groupStart = groupEnd
+		}
+	case windowNTile:
+		for position := 0; position < count; position++ {
+			if err := cancellationCheckpoint(cancel, position); err != nil {
+				return err
+			}
+			tile, err := windowTile(position, count, function.buckets)
+			if err != nil {
+				return err
 			}
 			if err := writer.put(
-				outputColumn, e.order[start+position], windowIntegerCell(value),
+				outputColumn, e.order[start+position], windowIntegerCell(tile),
 			); err != nil {
 				return err
 			}
@@ -768,10 +898,85 @@ func (e *windowExecutor) walkPartition(
 		return e.walkExact(input, function, outputColumn, start, end, writer, cancel)
 	case windowMin, windowMax:
 		return e.walkExtreme(input, function, outputColumn, start, end, writer, cancel)
+	case windowFirstValue, windowLastValue, windowNthValue:
+		group := 0
+		for position := 0; position < count; position++ {
+			if err := cancellationCheckpoint(cancel, position); err != nil {
+				return err
+			}
+			lo, hi := resolveWindowFrameAt(
+				function.frame, position, count, e.groups, &group,
+			)
+			target, ok := lo, lo < hi
+			switch function.kind {
+			case windowLastValue:
+				target = hi - 1
+			case windowNthValue:
+				ok = function.nth <= hi-lo
+				if ok {
+					target = lo + function.nth - 1
+				}
+			}
+			cell := nullCell()
+			if ok {
+				cell = cellFromScalar(input.columns[function.column][e.order[start+target]])
+			}
+			if err := writer.put(outputColumn, e.order[start+position], cell); err != nil {
+				return err
+			}
+		}
 	default:
 		return errWindowPlan
 	}
 	return cancellationError(cancel)
+}
+
+func windowFunctionUsesFrame(kind windowFunctionKind) bool {
+	return kind == windowCount || kind == windowSum || kind == windowAvg ||
+		kind == windowMin || kind == windowMax || kind == windowFirstValue ||
+		kind == windowLastValue || kind == windowNthValue
+}
+
+func windowTile(position, rows, buckets int) (int, error) {
+	if rows <= 0 || position < 0 || position >= rows || buckets <= 0 {
+		return 0, errWindowPlan
+	}
+	base, extra := rows/buckets, rows%buckets
+	if base == 0 {
+		return position + 1, nil
+	}
+	if extra != 0 && base+1 > math.MaxInt/extra {
+		return 0, errWindowSize
+	}
+	cutoff := (base + 1) * extra
+	if position < cutoff {
+		return position/(base+1) + 1, nil
+	}
+	return extra + (position-cutoff)/base + 1, nil
+}
+
+func (e *windowExecutor) windowRatioCell(numerator, denominator int) (Cell, error) {
+	if numerator < 0 || denominator <= 0 {
+		return Cell{}, errWindowSize
+	}
+	if numerator == 0 {
+		e.numberOut = append(e.numberOut[:0], '0')
+		return Cell{
+			kind: TypeNumber, flag: cellNumberRaw | cellInteger,
+			raw: e.numberOut, word: 0,
+		}, nil
+	}
+	e.numberOut = strconv.AppendUint(e.numberOut[:0], uint64(numerator), 10)
+	cell, ok, err := e.divideWindowAverage(
+		false, e.numberOut, uint64(denominator), 0,
+	)
+	if err != nil {
+		return Cell{}, err
+	}
+	if !ok {
+		return Cell{}, errWindowSize
+	}
+	return cell, nil
 }
 
 func windowIntegerCell(value int) Cell {
@@ -792,12 +997,109 @@ func windowOffsetPosition(position, rows, offset int, lead bool) (int, bool) {
 }
 
 func resolveWindowFrame(frame windowRowsFrame, position, rows int) (int, int) {
+	group := 0
+	return resolveWindowFrameAt(frame, position, rows, nil, &group)
+}
+
+func resolveWindowFrameAt(
+	frame windowRowsFrame,
+	position, rows int,
+	groups []int,
+	group *int,
+) (int, int) {
+	if frame.unit == windowFrameGroups {
+		for *group+1 < len(groups)-1 && position >= groups[*group+1] {
+			*group = *group + 1
+		}
+		start := resolveWindowGroupStart(frame.start, *group, rows, groups)
+		end := resolveWindowGroupEnd(frame.end, *group, rows, groups)
+		if end < start {
+			end = start
+		}
+		return start, end
+	}
 	start := resolveWindowStart(frame.start, position, rows)
 	end := resolveWindowEnd(frame.end, position, rows)
 	if end < start {
 		end = start
 	}
 	return start, end
+}
+
+func resolveWindowGroupStart(
+	bound windowFrameBound,
+	group, rows int,
+	groups []int,
+) int {
+	switch bound.kind {
+	case windowUnboundedPreceding:
+		return 0
+	case windowPreceding:
+		if bound.offset > group {
+			return 0
+		}
+		return groups[group-bound.offset]
+	case windowCurrentRow:
+		return groups[group]
+	case windowFollowing:
+		if bound.offset >= len(groups)-1-group {
+			return rows
+		}
+		return groups[group+bound.offset]
+	default:
+		return rows
+	}
+}
+
+func resolveWindowGroupEnd(
+	bound windowFrameBound,
+	group, rows int,
+	groups []int,
+) int {
+	switch bound.kind {
+	case windowPreceding:
+		if bound.offset > group {
+			return 0
+		}
+		return groups[group-bound.offset+1]
+	case windowCurrentRow:
+		return groups[group+1]
+	case windowFollowing:
+		if bound.offset >= len(groups)-2-group {
+			return rows
+		}
+		return groups[group+bound.offset+1]
+	case windowUnboundedFollowing:
+		return rows
+	default:
+		return 0
+	}
+}
+
+func (e *windowExecutor) buildWindowGroups(
+	input *relationSpool,
+	order []windowOrderKey,
+	start, end int,
+	cancel *CancelFlag,
+) error {
+	e.groups = e.groups[:0]
+	e.groups = append(e.groups, 0)
+	for position := start + 1; position < end; position++ {
+		if err := cancellationCheckpoint(cancel, position-start); err != nil {
+			return err
+		}
+		peer, err := windowPeers(
+			input, order, e.order[position-1], e.order[position], cancel,
+		)
+		if err != nil {
+			return err
+		}
+		if !peer {
+			e.groups = append(e.groups, position-start)
+		}
+	}
+	e.groups = append(e.groups, end-start)
+	return cancellationError(cancel)
 }
 
 func resolveWindowStart(bound windowFrameBound, position, rows int) int {
@@ -851,11 +1153,14 @@ func (e *windowExecutor) walkCount(
 ) error {
 	rows := partitionEnd - partitionStart
 	lo, hi, count := 0, 0, 0
+	group := 0
 	for position := 0; position < rows; position++ {
 		if err := cancellationCheckpoint(cancel, position); err != nil {
 			return err
 		}
-		wantLo, wantHi := resolveWindowFrame(function.frame, position, rows)
+		wantLo, wantHi := resolveWindowFrameAt(
+			function.frame, position, rows, e.groups, &group,
+		)
 		for hi < wantHi {
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
@@ -896,11 +1201,14 @@ func (e *windowExecutor) walkExact(
 	e.aggregate.reset()
 	rows := partitionEnd - partitionStart
 	lo, hi := 0, 0
+	group := 0
 	for position := 0; position < rows; position++ {
 		if err := cancellationCheckpoint(cancel, position); err != nil {
 			return err
 		}
-		wantLo, wantHi := resolveWindowFrame(function.frame, position, rows)
+		wantLo, wantHi := resolveWindowFrameAt(
+			function.frame, position, rows, e.groups, &group,
+		)
 		for hi < wantHi {
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
@@ -1310,11 +1618,14 @@ func (e *windowExecutor) walkExtreme(
 	head := 0
 	rows := partitionEnd - partitionStart
 	lo, hi := 0, 0
+	group := 0
 	for position := 0; position < rows; position++ {
 		if err := cancellationCheckpoint(cancel, position); err != nil {
 			return err
 		}
-		wantLo, wantHi := resolveWindowFrame(function.frame, position, rows)
+		wantLo, wantHi := resolveWindowFrameAt(
+			function.frame, position, rows, e.groups, &group,
+		)
 		for hi < wantHi {
 			if err := cancellationCheckpoint(cancel, hi); err != nil {
 				return err
