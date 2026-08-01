@@ -1,8 +1,11 @@
 # Performance
 
-The current snapshot was regenerated on 2026-08-01 from clean engine commit
-`7fe67691dd889a34951682d2522661c7741d8720`. The complete tables, exact
-protocol, dependency versions, caveats, and reproduction commands are in
+The write, concurrency, space, and bulk tables were regenerated on 2026-08-01
+from clean engine commit `7fe67691dd889a34951682d2522661c7741d8720`.
+The scan-mix row and CPU/scan gates were refreshed the same day from clean
+commit `b5702bc9ed951b7d88591e8f9a5eebe826fe1fa0` on the same Apple M4 Max.
+The complete tables, exact protocol, dependency versions, caveats, and
+reproduction commands are in
 [bench/competitive/RESULTS.md](../bench/competitive/RESULTS.md). This page is
 the short reading guide.
 
@@ -13,9 +16,11 @@ With one client, vibedb is 2.52–2.79× Badger on YCSB-A, YCSB-B, YCSB-F, and
 churn. Across 1, 8, and 32 clients it is 2.35–2.50× Badger on existing-key
 replacement and 2.73–2.93× on mixed churn.
 
-This does not mean every gap is closed. The ordered-scan mix remains 43.9%
-behind Badger, and throughput scaling flattens after eight clients. Those are
-the next two measured performance targets.
+The former scan-mix deficit is also closed: the refreshed row is 1.58× Badger,
+or 57.7% ahead. That aggregate result does not hide the remaining latency gap:
+the individual ordered full-scan p50 is 7.0% slower than Badger, while p99 is
+effectively tied. Throughput scaling also flattens after eight clients. Those
+are the next two measured performance targets.
 
 ## Single-client workloads
 
@@ -29,13 +34,15 @@ durability, and a CP64 acknowledged-mutation threshold.
 | YCSB-B | **2,704,197.5** | 1,027,076.5 | 330,809 | **2.63×** |
 | YCSB-F | **732,317** | 277,999 | 99,433 | **2.63×** |
 | Churn | **1,089,310** | 390,140 | 143,698 | **2.79×** |
-| Scan mix | 166,707.5 | **297,290** | 123,688.5 | 0.56× |
+| Scan mix | **390,929.5** | 247,961.5 | 111,617.5 | **1.58×** |
 
-Vibedb point-read p50 is 0.125 µs in the first four workloads. Update p50 is
-1.83–1.90 µs, delete+restore p50 is 2.21 µs, and the ordinary workload
-checkpoint p50 is 30.1–33.0 µs. Four workload checkpoint p99 values are
-40.6–44.8 µs. Scan mix is the exception: its checkpoint p99 is 5.913 ms and
-its full-scan p50/p99 is 1.816/2.340 ms.
+Vibedb point-read p50 is 0.125 µs in all five workloads. In the first four,
+update p50 is 1.83–1.90 µs, delete+restore p50 is 2.21 µs, checkpoint p50 is
+30.1–33.0 µs, and checkpoint p99 is 40.6–44.8 µs. In the refreshed scan
+mix, update, delete+restore, and checkpoint p50/p99 are 2.083/32.396,
+2.417/41.562, and 32.396/78.188 µs. Its full-scan p50/p99 is
+1.703/1.887 ms; Badger's is 1.592/1.886 ms. The aggregate win comes from the
+whole operation mix, not from claiming the lowest raw full-scan p50.
 
 ## Concurrent writes
 
@@ -116,17 +123,17 @@ that do not save bytes remain verbatim.
 
 ## CPU and scan gates
 
-Five-sample medians from the same clean commit:
+Five-sample medians from clean commit `b5702bc`:
 
 | gate | result |
 | --- | ---: |
-| stable native checkpoint leaf fold | **1.883 µs**, 0 allocs |
-| full render/replan/encode | 255.615 µs, 0 allocs |
-| ordered scan, 100k three-scalar documents | **23.07 ns/document**, 0 allocs |
-| competitive full scan, low/high cardinality | **92.29 / 95.97 ns/document**, 0 allocs |
-| masked scan, one occupied row per live posting tile | **173.5 ns/selected document**, 0 allocs |
+| stable native checkpoint leaf fold | **1.914 µs**, 0 allocs |
+| full render/replan/encode | 256.121 µs, 0 allocs |
+| ordered scan, 100k three-scalar documents | **23.49 ns/document**, 0 allocs |
+| competitive full scan, low/high cardinality | **91.57 / 94.21 ns/document**, 0 allocs |
+| masked scan, one occupied row per live posting tile | **178.4 ns/selected document**, 0 allocs |
 
-The certified native fold is about 136× faster than full replanning. Historical
+The certified native fold is about 134× faster than full replanning. Historical
 masked-density sweeps are not carried forward because the current named
 benchmark reproduces one occupied row per live posting tile, not the former
 1/4/16/dense matrix.

@@ -14,21 +14,24 @@ surface.
 
 ## Performance snapshot
 
-The current rows come from clean commit `7fe6769` on an Apple M4 Max. Engine
-ratios use matched buffered-visible semantics; space rows report both apparent
-file size and allocated filesystem blocks.
+The write, concurrency, and space rows come from clean commit `7fe6769` on an
+Apple M4 Max. The scan-mix row and CPU/scan gates were refreshed from clean
+commit `b5702bc` on the same host. Engine ratios use matched buffered-visible
+semantics; space rows report both apparent file size and allocated filesystem
+blocks.
 
 | Lane or measurement | Result | Context |
 | --- | ---: | --- |
-| Single-client YCSB-A/B/F and churn | 2.52–2.79× Badger | scan throughput remains 43.9% behind Badger |
+| Single-client YCSB-A/B/F and churn | 2.52–2.79× Badger | matched buffered-visible CP64 runs |
+| Single-client scan mix | 1.58× Badger (57.7% ahead) | 390,929.5 versus 247,961.5 ops/s; ordered full-scan p50 remains 7.0% slower |
 | Concurrent existing-key writes | 2.35–2.50× Badger | matched 1, 8, and 32-client runs |
 | Concurrent churn | 2.73–2.93× Badger | matched 1, 8, and 32-client runs |
 | Online sustained churn, low/high cardinality | 22.075 / 16.020 · 54.841 / 36.070 MiB | apparent / allocated after 200k mutations; zero forced checkpoints; no background/offline maintenance |
 | Offline Repack floor, low/high cardinality | 9.001 / 9.520 · 18.767 / 19.520 MiB | apparent / allocated; separate out-of-place maintenance result |
 | Unified paired bulk, low/high cardinality | 9.001 / 9.520 · 18.767 / 19.520 MiB | apparent / allocated for the current durable pair |
-| Native checkpoint leaf patch / generic replan | 1.883 / 255.615 µs | median; ~136× faster; 0 allocations |
-| Unified full scans, 100k documents | 23.07 ordered · 92.29 / 95.97 competitive ns/document | low / high cardinality where applicable; 0 allocations |
-| Masked scan | 173.5 ns/selected document | one occupied row per live posting tile; 0 allocations |
+| Native checkpoint leaf patch / generic replan | 1.914 / 256.121 µs | median; ~134× faster; 0 allocations |
+| Unified full scans, 100k documents | 23.49 ordered · 91.57 / 94.21 competitive ns/document | low / high cardinality where applicable; 0 allocations |
+| Masked scan | 178.4 ns/selected document | one occupied row per live posting tile; 0 allocations |
 
 See the [short performance guide](docs/performance.md) for interpretation and
 the [competitive results](bench/competitive/RESULTS.md) for complete tables,

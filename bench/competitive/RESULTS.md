@@ -1,15 +1,18 @@
 # Competitive results
 
-> **Current published snapshot.** Every table below was regenerated on
-> 2026-08-01 from clean engine commit
-> `7fe67691dd889a34951682d2522661c7741d8720`. The benchmark binaries also
-> embed that revision with `vcs.modified=false`.
+> **Current published snapshot.** The non-scan cross-engine tables were
+> regenerated on 2026-08-01 from clean engine commit
+> `7fe67691dd889a34951682d2522661c7741d8720`. The scan-mix row and its latency
+> details were refreshed the same day from clean commit
+> `b5702bc9ed951b7d88591e8f9a5eebe826fe1fa0`. Every published benchmark binary
+> embeds its stated revision with `vcs.modified=false`.
 
 The headline result is no longer a narrow read-heavy win. At one client,
 vibedb is 2.52–2.79× Badger on YCSB-A, YCSB-B, YCSB-F, and churn. Across 1,
 8, and 32 clients it is 2.35–2.50× Badger on pure replacement writes and
-2.73–2.93× on mixed churn. The remaining measured throughput deficit is the
-ordered-scan mix, where vibedb is 43.9% behind Badger.
+2.73–2.93× on mixed churn. The refreshed ordered-scan mix is 1.58× Badger,
+or 57.7% ahead. Its individual full-scan p50 is still 7.0% slower than Badger,
+so the aggregate win is not presented as a clean sweep of scan latency.
 
 ## Provenance and protocol
 
@@ -30,6 +33,8 @@ ordered-scan mix, where vibedb is 43.9% behind Badger.
 - Every suite records the commit, dirty bit, binary hash, effective options,
   corpus shape, engine order, repetitions, and pressure-forced checkpoints.
   All published suites are clean and report zero forced checkpoints.
+- The refreshed scan artifact has SHA-256
+  `c5e7c3f32eb93cb1e6fac62b7a01aa792a7e80158c2daf675f35f0a73ab5ba8d`.
 - Correctness is checked outside timed intervals: corpus shape, operation
   trace, final key/value state, and complete consumption of returned scan
   bytes.
@@ -55,11 +60,11 @@ Total operations per second, median of ten:
 | YCSB-B: 95% read, 5% update | **2,704,197.5** | 1,027,076.5 | 330,809 | 239,517 | 212,790 | **2.63×** |
 | YCSB-F: 50% read, 50% read-modify-write | **732,317** | 277,999 | 99,433 | 24,553 | 21,607.5 | **2.63×** |
 | Churn: 70% read, 25% update, 5% delete+restore | **1,089,310** | 390,140 | 143,698 | 34,914 | 30,099.5 | **2.79×** |
-| Scan mix: 79.9% read, 15% update, 5% delete+restore, 0.1% full scan | 166,707.5 | **297,290** | 123,688.5 | 44,742 | 39,880.5 | 0.56× |
+| Scan mix: 79.9% read, 15% update, 5% delete+restore, 0.1% full scan | **390,929.5** | 247,961.5 | 111,617.5 | 48,199 | 42,935 | **1.58×** |
 
-The first four workloads are 6.92–8.17× SQLite. Scan mix is still 1.35×
-SQLite, but it is the clear Badger gap and should not be hidden inside an
-overall average.
+The first four workloads are 6.92–8.17× SQLite. The refreshed scan mix is
+3.50× SQLite and 1.58× Badger. This row is a whole mixed workload; the raw
+ordered-scan latency is reported separately below.
 
 ### vibedb operation latency
 
@@ -71,10 +76,13 @@ Median of the ten run-level percentiles, microseconds:
 | YCSB-B | read 0.125 / 0.563; update 1.896 / 33.125 | 33.021 / 44.792 |
 | YCSB-F | read 0.125 / 0.646; RMW 1.917 / 30.583 | 30.125 / 41.375 |
 | Churn | read 0.125 / 0.625; update 1.854 / 30.438; delete+restore 2.209 / 34.021 | 30.209 / 40.584 |
-| Scan mix | read 0.334 / 0.667; update 1.916 / 28.167; delete+restore 2.250 / 37.104; full scan 1,816 / 2,340 | 29.167 / 5,913 |
+| Scan mix | read 0.125 / 0.750; update 2.083 / 32.396; delete+restore 2.417 / 41.562; full scan 1,703.396 / 1,886.604 | 32.396 / 78.188 |
 
-The scan suite has a real checkpoint-tail outlier: its median run-level p99 is
-5.913 ms. The other four checkpoint p99 values are 40.6–44.8 µs.
+The refreshed scan suite's checkpoint p99 is 78.188 µs. Its full-scan p50 is
+7.0% slower than Badger's 1,591.750 µs, while its p99 is effectively tied with
+Badger's 1,886.480 µs. Read, update, delete+restore, and checkpoint work around
+the scan is materially faster, producing the aggregate throughput lead. The
+other four workload rows retain their 40.6–44.8 µs checkpoint p99 values.
 
 ## Concurrent replacement and churn
 
@@ -183,19 +191,20 @@ comparison and does not require a second storage mode.
 
 ## Current CPU and scan gates
 
-These five-sample Go microbenchmarks were captured from the same clean commit
-on the same host. They are regression gates, not cross-engine database results.
+These five-sample Go microbenchmarks were refreshed from clean commit
+`b5702bc9ed951b7d88591e8f9a5eebe826fe1fa0` on the same host. They are
+regression gates, not cross-engine database results.
 
 | gate | median | allocation |
 | --- | ---: | ---: |
-| stable native checkpoint leaf fold | **1.883 µs** | 0 B, 0 allocs |
-| full render/replan/encode of that leaf | 255.615 µs | 0 B, 0 allocs |
-| ordered scan, 100k three-scalar documents | **23.07 ns/document** | 0 B, 0 allocs |
-| full competitive scan, low cardinality | **92.29 ns/document** | 0 B, 0 allocs |
-| full competitive scan, high cardinality | **95.97 ns/document** | 0 B, 0 allocs |
-| masked scan, one occupied row per live posting tile | **173.5 ns/selected document** | 0 B, 0 allocs |
+| stable native checkpoint leaf fold | **1.914 µs** | 0 B, 0 allocs |
+| full render/replan/encode of that leaf | 256.121 µs | 0 B, 0 allocs |
+| ordered scan, 100k three-scalar documents | **23.49 ns/document** | 0 B, 0 allocs |
+| full competitive scan, low cardinality | **91.57 ns/document** | 0 B, 0 allocs |
+| full competitive scan, high cardinality | **94.21 ns/document** | 0 B, 0 allocs |
+| masked scan, one occupied row per live posting tile | **178.4 ns/selected document** | 0 B, 0 allocs |
 
-The certified native fold is 136× faster than full replanning. The old
+The certified native fold is 134× faster than full replanning. The old
 1/4/16-row and 75%-density-crossover numbers are intentionally gone: the
 current named benchmark reproducibly measures one real occupied row per live
 posting tile, so only that result is published.
