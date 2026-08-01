@@ -118,10 +118,22 @@ func (s *Statement) validateRelationReferences() error {
 		return nil
 	}
 	check := func(path *sqlast.PathExpr) error {
-		if path == nil || len(path.Segments) == 0 || path.Source != 0 {
+		if path == nil || len(path.Segments) == 0 {
 			return nil
 		}
-		_, err := s.resolveRelationColumn(path.Segments[0].Key)
+		if join := s.relationJoin(); join != nil {
+			if path.MergedUsing != 0 {
+				_, err := join.preparePath(path)
+				return s.positionRelationJoinError(err, path)
+			}
+			if path.Source < 0 || path.Source >= len(join.sources) ||
+				join.sources[path.Source].physical {
+				return nil
+			}
+		} else if path.Source != 0 {
+			return nil
+		}
+		_, err := s.resolveRelationColumnAt(path.Source, path.Segments[0].Key)
 		if column, ok := err.(*RelationColumnError); ok {
 			column.Pos = path.Pos
 			if column.Matches == 0 {
@@ -141,6 +153,9 @@ func (s *Statement) validateRelationReferences() error {
 			return nil
 		}
 		if err := check(expr.Path); err != nil {
+			return err
+		}
+		if err := check(expr.RightPath); err != nil {
 			return err
 		}
 		for _, kid := range expr.Kids {
@@ -234,6 +249,26 @@ func (d *statementDerived) resolve(name, relation string) (int, error) {
 }
 
 func (s *Statement) renderDerived(path *sqlast.PathExpr, local bool) string {
+	if join := s.relationJoin(); join != nil {
+		for i := range s.specs {
+			if s.specs[i].path == path && s.specs[i].local == local {
+				return s.specs[i].text
+			}
+		}
+		prepared, err := join.preparePath(path)
+		if err != nil {
+			return ""
+		}
+		start := len(s.specBuf)
+		s.specBuf = append(s.specBuf, '/')
+		s.specBuf = strconv.AppendInt(s.specBuf, int64(prepared.column), 10)
+		if !prepared.root {
+			s.specBuf = append(s.specBuf, prepared.spec...)
+		}
+		text := byteview.String(s.specBuf[start:len(s.specBuf):len(s.specBuf)])
+		s.specs = append(s.specs, pathSpec{path: path, local: local, text: text})
+		return text
+	}
 	binding := s.relationBinding()
 	if len(binding.names) == 0 || path == nil || path.Source != 0 || len(path.Segments) == 0 {
 		return ""

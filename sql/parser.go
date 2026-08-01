@@ -87,6 +87,7 @@ type Parser struct {
 	paths chunkArena[PathExpr] // path nodes
 	segs  chunkArena[Segment]  // path segment runs
 	conds chunkArena[JoinCond] // join conditions
+	keys  chunkArena[JoinKeyCond]
 	ctes  chunkArena[CommonTableExpr]
 	names chunkArena[string] // CTE output-name runs
 	ints  chunkArena[int]    // CTE output-name position runs
@@ -104,6 +105,8 @@ type Parser struct {
 	cteScratch         []CommonTableExpr
 	cteNameScratch     []string
 	cteAliasPosScratch []int
+	joinKeyScratch     []JoinKeyCond
+	joinNameScratch    []string
 
 	// The statement bodies [Parser.ParseStatement] hands back by pointer. They
 	// are fields rather than arena allocations because there is exactly one of
@@ -328,6 +331,7 @@ func (p *Parser) reset(src string) {
 		p.paths.first = 8
 		p.segs.first = 16
 		p.conds.first = 4
+		p.keys.first = 8
 		p.ctes.first = 4
 		p.names.first = 8
 		p.ints.first = 8
@@ -340,6 +344,7 @@ func (p *Parser) reset(src string) {
 	p.paths.rewind()
 	p.segs.rewind()
 	p.conds.rewind()
+	p.keys.rewind()
 	p.ctes.rewind()
 	p.names.rewind()
 	p.ints.rewind()
@@ -355,6 +360,8 @@ func (p *Parser) reset(src string) {
 	p.cteScratch = p.cteScratch[:0]
 	p.cteNameScratch = p.cteNameScratch[:0]
 	p.cteAliasPosScratch = p.cteAliasPosScratch[:0]
+	p.joinKeyScratch = p.joinKeyScratch[:0]
+	p.joinNameScratch = p.joinNameScratch[:0]
 	p.segScratch = p.segScratch[:0]
 	p.kidStack = p.kidStack[:0]
 	p.opScratch = p.opScratch[:0]
@@ -602,9 +609,6 @@ func (p *Parser) parseStatement() error {
 	if err := p.resolvePaths(); err != nil {
 		return err
 	}
-	if err := p.normalizeRightJoins(); err != nil {
-		return err
-	}
 	p.out.Params = p.params
 	return p.validate()
 }
@@ -845,20 +849,6 @@ func (p *Parser) parseFrom() error {
 // parseJoin parses one JOIN clause, reporting true when the next token does not
 // open one.
 func (p *Parser) parseJoin() (bool, error) {
-	if len(p.from) > 0 && (p.from[0].Kind == RelationDerived || p.from[0].Kind == RelationCTE) {
-		switch p.tok.kw {
-		case kwJoin, kwInner, kwLeft, kwRight, kwFull, kwOuter, kwCross, kwNatural:
-			relation := "a derived table"
-			if p.from[0].Kind == RelationCTE {
-				relation = "a common table expression"
-			}
-			return false, newFeatureNotSupportedError(
-				p.lx.src,
-				p.tok.pos,
-				"joining "+relation+" is not supported yet: use it as the sole FROM relation",
-			)
-		}
-	}
 	join := JoinInner
 	switch {
 	case p.acceptKeyword(kwLeft):
@@ -867,12 +857,18 @@ func (p *Parser) parseJoin() (bool, error) {
 	case p.acceptKeyword(kwRight):
 		join = JoinRight
 		p.acceptKeyword(kwOuter)
-	case p.atKeyword(kwFull), p.atKeyword(kwOuter):
-		return false, p.errHere("FULL outer joins are not supported; RIGHT JOIN is supported and normalized to LEFT JOIN")
-	case p.atKeyword(kwCross):
-		return false, p.errHere("CROSS JOIN is not supported: the engine has no unrestricted product")
+	case p.acceptKeyword(kwFull):
+		join = JoinFull
+		p.acceptKeyword(kwOuter)
+	case p.acceptKeyword(kwCross):
+		join = JoinCross
+	case p.atKeyword(kwOuter):
+		return false, p.errHere("OUTER must follow LEFT, RIGHT, or FULL")
 	case p.atKeyword(kwNatural):
-		return false, p.errHere("NATURAL JOIN is not supported: schemaless documents have no declared columns to match by name; write ON explicitly")
+		return false, newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"NATURAL JOIN is not supported: schemaless documents have no declared columns to infer faithfully; write USING explicitly or write ON explicitly",
+		)
 	}
 	if p.tok.kind == tokComma {
 		return false, p.errHere("comma-separated FROM items are not supported; write an explicit JOIN ... ON")
@@ -881,8 +877,8 @@ func (p *Parser) parseJoin() (bool, error) {
 		p.acceptKeyword(kwInner)
 	}
 	if !p.acceptKeyword(kwJoin) {
-		if join == JoinLeft {
-			return false, p.errHere("expected JOIN after LEFT")
+		if join != JoinInner {
+			return false, p.errHere("expected JOIN after join type")
 		}
 		return true, nil
 	}
@@ -891,13 +887,17 @@ func (p *Parser) parseJoin() (bool, error) {
 		return false, err
 	}
 	var cond *JoinCond
-	if p.acceptKeyword(kwUsing) {
-		cond, err = p.parseUsingCond(len(p.from))
-	} else {
-		if err := p.expectKeyword(kwOn, "ON after a JOIN"); err != nil {
-			return false, err
+	if join != JoinCross {
+		if p.acceptKeyword(kwUsing) {
+			cond, err = p.parseUsingCond(len(p.from))
+		} else {
+			if err := p.expectKeyword(kwOn, "ON or USING after a JOIN"); err != nil {
+				return false, err
+			}
+			cond, err = p.parseJoinCond()
 		}
-		cond, err = p.parseJoinCond()
+	} else if p.atKeyword(kwOn) || p.atKeyword(kwUsing) {
+		return false, p.errHere("CROSS JOIN has no ON or USING condition")
 	}
 	if err != nil {
 		return false, err
@@ -911,42 +911,87 @@ func (p *Parser) parseJoin() (bool, error) {
 	return false, nil
 }
 
-// parseUsingCond lowers the common one-column USING form to the explicit
-// equality the executor understands and marks the condition so deferred name
-// resolution can expose USING's merged unqualified key. A USING name belongs
-// to the relation immediately on the left and to the relation this JOIN adds.
-// The current executor only accepts the driving relation as the left side, so
-// a chained USING join is rejected during normal lowering with the same
-// precise chained-join diagnostic as an ON join.
+// parseUsingCond lowers every simple name to one explicitly bound equality.
+// The names remain on the condition because SQL exposes one merged,
+// unqualified output per item while retaining both qualified inputs.
 func (p *Parser) parseUsingCond(joinSource int) (*JoinCond, error) {
 	pos := p.tok.pos
 	if err := p.expect(tokLParen, "'(' after USING"); err != nil {
 		return nil, err
 	}
-	path, err := p.parsePath(false)
-	if err != nil {
-		return nil, err
-	}
-	// parsePath records ordinary paths for the statement-wide resolver. USING
-	// has already supplied both range variables, so remove that pending entry
-	// and clone the path into two explicitly bound operands.
-	if n := len(p.pending); n != 0 && p.pending[n-1].path == path {
-		p.pending = p.pending[:n-1]
-	}
-	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
-		return nil, p.errAt(path.Pos, "USING accepts one simple field name; use ON for nested or composite keys")
-	}
-	if p.tok.kind == tokComma {
-		return nil, p.errHere("composite USING joins are not supported yet; write one equality in ON")
+	baseKeys := len(p.joinKeyScratch)
+	baseNames := len(p.joinNameScratch)
+	defer func() {
+		p.joinKeyScratch = p.joinKeyScratch[:baseKeys]
+		p.joinNameScratch = p.joinNameScratch[:baseNames]
+	}()
+	for {
+		path, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		// USING has supplied both bindings, so remove parsePath's unresolved
+		// registration and clone it into the two explicit operands.
+		if n := len(p.pending); n != 0 && p.pending[n-1].path == path {
+			p.pending = p.pending[:n-1]
+		}
+		if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+			return nil, p.errAt(path.Pos, "USING accepts simple field names")
+		}
+		name := path.Segments[0].Key
+		for _, previous := range p.joinNameScratch[baseNames:] {
+			if previous == name {
+				return nil, p.errfAt(path.Pos, "USING column %q is listed twice", name)
+			}
+		}
+		left := p.boundPath(path, joinSource-1)
+		if merged := p.priorUsingMerge(name, joinSource); merged != 0 {
+			left.MergedUsing = merged
+		} else if joinSource > 1 {
+			return nil, p.errfAt(path.Pos,
+				"USING column %q is ambiguous on the accumulated left relation; qualify an ON condition, or merge that name in an earlier USING clause",
+				name)
+		}
+		right := p.boundPath(path, joinSource)
+		p.joinKeyScratch = append(p.joinKeyScratch, JoinKeyCond{
+			Left: left, Right: right, Pos: path.Pos,
+		})
+		p.joinNameScratch = append(p.joinNameScratch, name)
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.advance()
 	}
 	if err := p.expect(tokRParen, "')' after USING"); err != nil {
 		return nil, err
 	}
-	left := p.boundPath(path, joinSource-1)
-	right := p.boundPath(path, joinSource)
+	keys := p.joinKeyScratch[baseKeys:]
+	keyRun := p.keys.allocDirty(len(keys))
+	copy(keyRun, keys)
+	names := p.joinNameScratch[baseNames:]
+	nameRun := p.names.allocDirty(len(names))
+	copy(nameRun, names)
 	cond := p.conds.one()
-	*cond = JoinCond{Left: left, Right: right, Using: true, Pos: pos}
+	*cond = JoinCond{
+		Left: keyRun[0].Left, Right: keyRun[0].Right, Keys: keyRun,
+		Using: true, UsingColumns: nameRun, Pos: pos,
+	}
 	return cond, nil
+}
+
+func (p *Parser) priorUsingMerge(name string, before int) int {
+	for i := before - 1; i >= 1; i-- {
+		cond := p.from[i].On
+		if cond == nil || !cond.Using {
+			continue
+		}
+		for _, column := range cond.UsingColumns {
+			if column == name {
+				return i
+			}
+		}
+	}
+	return 0
 }
 
 // boundPath clones a parser-owned path without registering it for deferred
@@ -1002,12 +1047,6 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	if definition := p.lookupCTE(ref.Name); definition != nil {
 		ref.Kind = RelationCTE
 		ref.Query = definition.Query
-		if ref.Join != JoinNone {
-			return ref, newFeatureNotSupportedError(
-				p.lx.src, ref.Pos,
-				"a common table expression is not supported in a JOIN position yet: use it as the sole FROM relation",
-			)
-		}
 	}
 	return ref, p.rejectDuplicateRangeAlias(ref)
 }
@@ -1017,13 +1056,6 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 // which preserves independent FROM scope, arena ownership, nesting limits,
 // cancellation, position rebasing, and placeholder accounting in one place.
 func (p *Parser) parseDerivedTableRef(ref TableRef) (TableRef, error) {
-	if ref.Join != JoinNone {
-		return ref, newFeatureNotSupportedError(
-			p.lx.src,
-			ref.Pos,
-			"a derived table is not supported in a JOIN position yet: use it as the sole FROM relation",
-		)
-	}
 	p.advance() // consume '('
 	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
 		return ref, p.errHere("expected SELECT after '(' in a derived table, optionally preceded by WITH definitions")
@@ -1114,42 +1146,17 @@ func (p *Parser) parseTableAlias() (string, error) {
 	return "", nil
 }
 
-// parseJoinCond parses an ON condition: exactly one key equality, optionally
-// parenthesized.
-//
-// It is deliberately not the general predicate grammar. The engine joins by
-// matching one key on each side; a parser that accepted `ON a.x = b.y AND a.z =
-// b.w` or `ON a.x > b.y` would produce a tree that reads as valid and has no
-// executor, and the failure would surface at lowering with no position to point
-// at.
+// parseJoinCond parses the complete ON predicate. Resolution later extracts
+// every top-level cross-input equality as a composite hash key; the remaining
+// expression is evaluated as a residual during pair formation.
 func (p *Parser) parseJoinCond() (*JoinCond, error) {
 	pos := p.tok.pos
-	parens := p.tok.kind == tokLParen
-	if parens {
-		p.advance()
-	}
-	left, err := p.parsePath(false)
+	expr, err := p.parseExpr(ctxJoin)
 	if err != nil {
 		return nil, err
-	}
-	if p.tok.kind != tokEq {
-		return nil, p.errHere("a join condition must be a single key equality, written ON left.key = right.key")
-	}
-	p.advance()
-	right, err := p.parsePath(false)
-	if err != nil {
-		return nil, err
-	}
-	if parens {
-		if err := p.expect(tokRParen, "')'"); err != nil {
-			return nil, err
-		}
-	}
-	if p.atKeyword(kwAnd) || p.atKeyword(kwOr) {
-		return nil, p.errHere("a join condition must be a single key equality: the engine matches one key per join")
 	}
 	cond := p.conds.one()
-	*cond = JoinCond{Left: left, Right: right, Pos: pos}
+	*cond = JoinCond{Expr: expr, Pos: pos}
 	return cond, nil
 }
 

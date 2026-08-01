@@ -127,10 +127,12 @@ const (
 	JoinInner
 	// JoinLeft is a left outer equi-join.
 	JoinLeft
-	// JoinRight is a right outer equi-join. The parser normalizes it to a
-	// JoinLeft before the AST is returned, so lowerers only need to execute one
-	// outer-join orientation.
+	// JoinRight is a right outer join: the newly joined relation is preserved.
 	JoinRight
+	// JoinFull preserves unmatched rows from both inputs.
+	JoinFull
+	// JoinCross forms the unrestricted product and carries no ON condition.
+	JoinCross
 )
 
 // A RelationKind identifies the row source behind a range variable.
@@ -215,22 +217,39 @@ type TableRef struct {
 	Pos int
 }
 
-// A JoinCond is an equi-join's single key equality.
-//
-// It is not an [Expr] because the engine joins on one key equality and nothing
-// else. Giving the condition its own type is what makes that a compile-time
-// fact for the lowering pass instead of a runtime shape check over a general
-// predicate tree that could have held a disjunction.
-type JoinCond struct {
-	// Left names a key of an earlier range variable, Right of the joined one.
+// A JoinKeyCond is one path equality extracted from a JOIN condition. Left is
+// in the accumulated input and Right is in the newly joined relation.
+type JoinKeyCond struct {
 	Left  *PathExpr
 	Right *PathExpr
+	Pos   int
+}
+
+// A JoinCond is a JOIN condition and its planner-ready equi-key extraction.
+type JoinCond struct {
+	// Left and Right mirror Keys[0] for compatibility with consumers of the
+	// original single-key AST. They are nil when ON has no extractable key.
+	Left  *PathExpr
+	Right *PathExpr
+	// Keys contains every top-level ANDed equality between the newly joined
+	// relation and any earlier range variable. Empty Keys selects the bounded
+	// nested-loop path.
+	Keys []JoinKeyCond
+	// Expr is the complete ON predicate. Keys may narrow candidate formation,
+	// but Expr remains authoritative and is evaluated before null extension.
+	// It is nil for USING and CROSS JOIN.
+	Expr *Expr
 	// Using records that the equality came from JOIN ... USING rather than ON.
 	// The distinction is semantic: USING contributes one unqualified output
 	// column whose value is the coalescing of the two keys, while an equivalent
 	// ON equality leaves an unqualified name ambiguous.
 	Using bool
-	Pos   int
+	// UsingColumns preserves a composite USING list in source order.
+	UsingColumns []string
+	// Residual reports whether Expr contains a term beyond the extracted
+	// top-level equi keys. It is stable planner and EXPLAIN metadata.
+	Residual bool
+	Pos      int
 }
 
 // An AggKind names a result column's reduction. The constants are in the same
@@ -301,6 +320,11 @@ type OrderTerm struct {
 type PathExpr struct {
 	// Source is an index into [SelectStmt.From].
 	Source int
+	// MergedUsing is the one-based From index of the USING clause whose merged
+	// output this unqualified path names. Zero means an ordinary source path.
+	// FULL JOIN needs this identity because COALESCE(left,right) cannot be
+	// represented by either qualified input path alone.
+	MergedUsing int
 	// Segments walks into the document from its root.
 	Segments []Segment
 	// Pos is the byte offset of the path's first token.
@@ -356,6 +380,10 @@ const (
 	ExprNot
 	// ExprExists is EXISTS (SELECT ...). Subquery holds the nested statement.
 	ExprExists
+	// ExprConstant is a boolean literal used as an ON predicate. WHERE keeps
+	// requiring a path-led condition, while JOIN accepts ON TRUE/FALSE to
+	// express unrestricted or empty matches with outer semantics.
+	ExprConstant
 )
 
 // A CmpOp is a comparison operator. The constants are in the same order as
@@ -415,9 +443,13 @@ type Expr struct {
 	// executable in principle: every leaf names a value the reduction already
 	// produces, so lowering needs no second aggregation pass.
 	Column int
-	// Path is the left operand of every leaf kind, and nil for the boolean
-	// kinds. It is nil for a COUNT(*) HAVING leaf, matching ResultColumn.
+	// Path is the left operand of every path-led leaf kind, and nil for boolean
+	// nodes and ExprConstant. It is nil for a COUNT(*) HAVING leaf, matching
+	// ResultColumn.
 	Path *PathExpr
+	// RightPath is the right operand of a JOIN comparison between two paths.
+	// WHERE and HAVING leaves keep it nil and use Value or Subquery.
+	RightPath *PathExpr
 	// Value is the right operand of ExprCompare and ExprContains.
 	Value Operand
 	// Insensitive selects ILIKE rather than LIKE for ExprLike.

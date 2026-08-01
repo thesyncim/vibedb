@@ -216,6 +216,9 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 		b.WriteString("exists (")
 		b.WriteString(dumpStmt(e.Subquery))
 		b.WriteByte(')')
+	case ExprConstant:
+		b.WriteString("constant ")
+		dumpOperand(b, e.Value)
 	case ExprBetween:
 		b.WriteString(negated(e, "between", "notbetween"))
 		b.WriteByte(' ')

@@ -243,6 +243,10 @@ func checkExpr(t *testing.T, s *SelectStmt, e *Expr, having bool) int {
 		if len(e.Kids) != 1 {
 			t.Fatalf("a NOT node holds %d operands", len(e.Kids))
 		}
+	case ExprConstant:
+		if e.Path != nil || e.Value.Kind != OperandBool {
+			t.Fatalf("constant predicate = %+v, want a path-free boolean", e)
+		}
 	default:
 		if e.Agg != AggNone && !having {
 			t.Fatal("an aggregate leaf appears outside HAVING")

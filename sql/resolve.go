@@ -48,8 +48,9 @@ func (p *Parser) resolvePaths() error {
 					path.Segments[0].Key, path.Segments[0].Key+".*")
 			}
 		}
-		if source, ok := p.usingColumnSource(path); ok {
+		if source, merged, ok := p.usingColumnSource(path); ok {
 			path.Source = source
+			path.MergedUsing = merged
 			continue
 		}
 		if len(p.out.From) != 1 {
@@ -69,108 +70,33 @@ func (p *Parser) resolvePaths() error {
 // usingColumnSource resolves the one unqualified column JOIN ... USING adds to
 // the joined row.
 //
-// SQL defines that column as COALESCE(left.key, right.key). For the join shapes
-// this executor accepts, that expression has an exact path representation: on
-// an inner join the keys compare equal, and on an outer join the preserved
-// side is the only side that can survive without a match. Selecting the
-// preserved side therefore returns the same value without adding a computed
-// projection to the query engine. RIGHT JOIN is still in its source spelling
-// when resolution runs, so its newly joined (right) source is the preserved
-// one; normalizeRightJoins subsequently swaps it into source zero.
+// SQL defines that column as COALESCE(left.key, right.key). MergedUsing records
+// the exact join-stage output carrying that value; Source remains the
+// accumulated-left binding for consumers that only need name resolution.
+// RIGHT and FULL therefore need no AST source rewrite, and repeated USING in a
+// chain can feed the prior synthetic merge into the next one.
 //
-// Only the exact, simple USING name is merged. A qualified spelling continues
-// to address that relation's own key, and another unqualified path remains
-// ambiguous. Composite USING lists are rejected by the parser.
-func (p *Parser) usingColumnSource(path *PathExpr) (int, bool) {
+// Only each exact, simple name in the USING list is merged. Qualified spellings
+// continue to address their relation's own key.
+func (p *Parser) usingColumnSource(path *PathExpr) (source, merged int, ok bool) {
 	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
-		return 0, false
+		return 0, 0, false
 	}
-	for i := 1; i < len(p.out.From); i++ {
+	// The latest merge wins for a repeated USING name in a chain: it is the
+	// output of the accumulated left relation joined with source i.
+	for i := len(p.out.From) - 1; i >= 1; i-- {
 		ref := &p.out.From[i]
 		cond := ref.On
-		if cond == nil || !cond.Using ||
-			len(cond.Left.Segments) != 1 || cond.Left.Segments[0] != path.Segments[0] {
+		if cond == nil || !cond.Using {
 			continue
 		}
-		if ref.Join == JoinRight {
-			return i, true
-		}
-		return cond.Left.Source, true
-	}
-	return 0, false
-}
-
-// normalizeRightJoins rewrites RIGHT JOIN into the LEFT JOIN orientation used
-// by the shared executor. It runs after path resolution, so swapping the two
-// input relations only requires remapping source ordinals; aliases and JSON
-// paths retain their original meaning.
-//
-// The current SQL executor supports one joined relation directly against the
-// driving FROM relation. Rejecting a RIGHT JOIN later in a chained statement
-// would produce a less useful lowering error after this rewrite, so leave the
-// join shape untouched unless it is the first joined relation.
-func (p *Parser) normalizeRightJoins() error {
-	for i := 1; i < len(p.out.From); i++ {
-		if p.out.From[i].Join != JoinRight {
-			continue
-		}
-		if i != 1 || len(p.out.From) != 2 {
-			return p.errAt(p.out.From[i].Pos,
-				"RIGHT JOIN is supported only for one joined relation; use LEFT JOIN for a chained query")
-		}
-		condition := p.out.From[i].On
-		p.swapSources(0, 1)
-		p.out.From[0].Join = JoinNone
-		p.out.From[0].On = nil
-		p.out.From[1].Join = JoinLeft
-		p.out.From[1].On = condition
-		return nil
-	}
-	return nil
-}
-
-func (p *Parser) swapSources(a, b int) {
-	// Every parsed path is registered in pending exactly once. DISTINCT and
-	// ORDER BY aliases intentionally share projection pointers, so walking AST
-	// clauses independently would swap those pointers twice and silently restore
-	// their original source. Remap the parser registry once instead.
-	for i := range p.pending {
-		path := p.pending[i].path
-		path.Source = swappedSource(path.Source, a, b)
-	}
-	for i := range p.out.From {
-		if cond := p.out.From[i].On; cond != nil {
-			// USING synthesizes already-bound paths and removes its unqualified
-			// source path from pending. Explicit ON paths were remapped above.
-			if !p.pathPending(cond.Left) {
-				cond.Left.Source = swappedSource(cond.Left.Source, a, b)
-			}
-			if !p.pathPending(cond.Right) {
-				cond.Right.Source = swappedSource(cond.Right.Source, a, b)
+		for _, name := range cond.UsingColumns {
+			if name == path.Segments[0].Key {
+				return cond.Left.Source, i, true
 			}
 		}
 	}
-	p.out.From[a], p.out.From[b] = p.out.From[b], p.out.From[a]
-}
-
-func (p *Parser) pathPending(path *PathExpr) bool {
-	for i := range p.pending {
-		if p.pending[i].path == path {
-			return true
-		}
-	}
-	return false
-}
-
-func swappedSource(source, a, b int) int {
-	switch source {
-	case a:
-		return b
-	case b:
-		return a
-	default:
-		return source
-	}
+	return 0, 0, false
 }
 
 // rangeVar answers the index of the range variable named name, or -1.
@@ -240,32 +166,91 @@ func (p *Parser) validate() error {
 
 func (p *Parser) validateJoins() error {
 	for i := 1; i < len(p.out.From); i++ {
-		condition := p.out.From[i].On
-		left, right := condition.Left, condition.Right
-		if len(left.Segments) == 0 || len(right.Segments) == 0 {
-			return p.errAt(condition.Pos, "a join key must be a field path, not a whole document")
+		ref := &p.out.From[i]
+		condition := ref.On
+		if ref.Join == JoinCross {
+			if condition != nil {
+				return p.errAt(ref.Pos, "CROSS JOIN must not carry a condition")
+			}
+			continue
 		}
-		if left.Source == right.Source {
-			return p.errfAt(condition.Pos,
-				"both sides of ON name %q: an equi-join matches a key of one collection against a key of the other",
-				p.out.From[left.Source].Alias)
+		if condition == nil {
+			return p.errAt(ref.Pos, "JOIN requires ON or USING")
 		}
-		if left.Source != i && right.Source != i {
-			return p.errfAt(condition.Pos,
-				"ON does not name %q, the collection this JOIN adds", p.out.From[i].Alias)
+		if condition.Using {
+			for _, key := range condition.Keys {
+				if len(key.Left.Segments) == 0 || len(key.Right.Segments) == 0 {
+					return p.errAt(key.Pos, "a join key must be a field path")
+				}
+			}
+			continue
 		}
-		if left.Source == i {
-			// Normalizing so Right is always the newly joined side means a
-			// lowering pass reads the probe and build sides off the structure
-			// instead of re-deriving them from the source indices.
-			condition.Left, condition.Right = right, left
-			left = condition.Left
+		if condition.Expr == nil {
+			return p.errAt(condition.Pos, "ON requires a predicate")
 		}
-		if left.Source > i {
-			return p.errfAt(condition.Pos,
-				"ON references %q, which this statement joins later; a join condition may only name collections already in scope",
-				p.out.From[left.Source].Alias)
+		var validateExpr func(*Expr) error
+		validateExpr = func(expr *Expr) error {
+			if expr == nil {
+				return nil
+			}
+			if expr.Subquery != nil || expr.Kind == ExprExists {
+				return p.errAt(expr.Pos, "subqueries are not supported in ON")
+			}
+			for _, path := range []*PathExpr{expr.Path, expr.RightPath} {
+				if path == nil {
+					continue
+				}
+				if path.Source > i {
+					return p.errfAt(path.Pos,
+						"ON references %q, which this statement joins later",
+						p.out.From[path.Source].Alias)
+				}
+			}
+			for _, kid := range expr.Kids {
+				if err := validateExpr(kid); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
+		if err := validateExpr(condition.Expr); err != nil {
+			return err
+		}
+		base := len(p.joinKeyScratch)
+		terms := []*Expr{condition.Expr}
+		if condition.Expr.Kind == ExprAnd {
+			terms = condition.Expr.Kids
+		}
+		keyTerms := 0
+		for _, term := range terms {
+			if term.Kind != ExprCompare || term.Op != OpEq ||
+				term.Path == nil || term.RightPath == nil {
+				continue
+			}
+			left, right := term.Path, term.RightPath
+			if left.Source == i && right.Source < i {
+				left, right = right, left
+			}
+			if left.Source >= i || right.Source != i {
+				continue
+			}
+			if len(left.Segments) == 0 || len(right.Segments) == 0 {
+				return p.errAt(term.Pos, "a join key must be a field path, not a whole document")
+			}
+			p.joinKeyScratch = append(p.joinKeyScratch, JoinKeyCond{
+				Left: left, Right: right, Pos: term.Pos,
+			})
+			keyTerms++
+		}
+		keys := p.joinKeyScratch[base:]
+		if len(keys) != 0 {
+			run := p.keys.allocDirty(len(keys))
+			copy(run, keys)
+			condition.Keys = run
+			condition.Left, condition.Right = run[0].Left, run[0].Right
+		}
+		p.joinKeyScratch = p.joinKeyScratch[:base]
+		condition.Residual = keyTerms != len(terms)
 	}
 	return nil
 }

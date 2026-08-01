@@ -82,11 +82,25 @@ type explainCTE struct {
 }
 
 type explainJoin struct {
-	Collection string `json:"collection"`
-	Type       string `json:"type"`
-	AccessPath string `json:"access_path"`
-	OuterPath  string `json:"outer_path"`
-	InnerPath  string `json:"inner_path"`
+	Collection      string           `json:"collection"`
+	Type            string           `json:"type"`
+	AccessPath      string           `json:"access_path"`
+	OuterPath       string           `json:"outer_path,omitempty"`
+	InnerPath       string           `json:"inner_path,omitempty"`
+	Algorithm       string           `json:"algorithm,omitempty"`
+	ActualAlgorithm string           `json:"actual_algorithm,omitempty"`
+	BuildSide       string           `json:"build_side,omitempty"`
+	Keys            []explainJoinKey `json:"keys,omitempty"`
+	KeyCount        int              `json:"key_count"`
+	Using           []string         `json:"using,omitempty"`
+	Residual        bool             `json:"residual"`
+	Cross           bool             `json:"cross"`
+	Pairs           *uint64          `json:"pairs,omitempty"`
+}
+
+type explainJoinKey struct {
+	Left  string `json:"left"`
+	Right string `json:"right"`
 }
 
 type explainPredicate struct {
@@ -98,7 +112,7 @@ type explainPredicate struct {
 }
 
 func (p *plan) explainJSON(collection string, outputCount int, options ExplainOptions) (string, error) {
-	return p.explainJSONAnalysis(collection, outputCount, options, nil, nil)
+	return p.explainJSONAnalysis(collection, outputCount, options, nil, nil, nil)
 }
 
 type explainAnalyze struct {
@@ -179,6 +193,7 @@ func (p *plan) explainJSONAnalysis(
 	options ExplainOptions,
 	analysis *ExplainAnalysis,
 	ctes []explainCTE,
+	relationJoins []explainJoin,
 ) (string, error) {
 	plan := explainPlan{
 		Node:          "scan",
@@ -190,6 +205,7 @@ func (p *plan) explainJSONAnalysis(
 		Aggregate:     p.hasAggregate,
 		SingleRow:     p.singleRow,
 		CTEs:          ctes,
+		Joins:         relationJoins,
 		Analyze:       newExplainAnalyze(analysis),
 	}
 	if outputCount < 0 || outputCount > len(p.headers) {
@@ -242,6 +258,9 @@ func (p *plan) explainJSONAnalysis(
 			AccessPath: access,
 			OuterPath:  p.valuePaths[join.outerPath].spec,
 			InnerPath:  inner,
+			Algorithm:  access,
+			BuildSide:  "right",
+			KeyCount:   1,
 		})
 	}
 	encoded, err := vibejson.Marshal(&explainDocument{Version: 1, Plan: plan})
@@ -325,6 +344,7 @@ func (s *Statement) explainJSON(
 	}
 	return p.explainJSONAnalysis(
 		s.Collection(), s.outputs, options, analysis, s.explainCTEs(),
+		s.explainRelationJoins(analysis != nil),
 	)
 }
 

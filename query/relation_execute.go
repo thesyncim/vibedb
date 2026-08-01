@@ -225,10 +225,18 @@ func appendRelationPathColumn(
 		if err := cancellationCheckpoint(cancel, row); err != nil {
 			return dst[:row], err
 		}
-		raw := value.raw
-		if len(raw) == 0 {
-			raw = nullBytes
+		if value.kind == kindNull {
+			if len(value.raw) == 0 {
+				dst[row] = vibejson.RawValue{}
+			} else {
+				// SQL outer extension is an explicit NULL. Propagate it
+				// through every suffix instead of turning null.field into a
+				// document-missing value.
+				dst[row] = vibejson.RawValue{Src: value.raw}
+			}
+			continue
 		}
+		raw := value.raw
 		resolved, ok, err := pointer.GetRawTrusted(raw)
 		if err != nil {
 			return dst[:row], err

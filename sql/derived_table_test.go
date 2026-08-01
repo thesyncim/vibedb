@@ -172,18 +172,6 @@ func TestDerivedJoinAndLateralRefusalsStayTyped(t *testing.T) {
 		want string
 	}{
 		{
-			name: "derived driving join",
-			src:  `SELECT d.id FROM (SELECT id FROM docs) d JOIN other o ON d.id = o.id`,
-			pos:  41,
-			want: "joining a derived table",
-		},
-		{
-			name: "derived joined relation",
-			src:  `SELECT d.id FROM docs JOIN (SELECT id FROM other) d ON docs.id = d.id`,
-			pos:  27,
-			want: "derived table is not supported in a JOIN position",
-		},
-		{
 			name: "leading lateral",
 			src:  `SELECT d.id FROM LATERAL (SELECT id FROM docs) d`,
 			pos:  17,
@@ -211,6 +199,25 @@ func TestDerivedJoinAndLateralRefusalsStayTyped(t *testing.T) {
 				t.Fatalf("typed refusal lost ParseError at %d: %+v", tc.pos, parse)
 			}
 		})
+	}
+}
+
+func TestDerivedRelationsAreValidJoinOperands(t *testing.T) {
+	for _, src := range []string{
+		`SELECT d.id FROM (SELECT id FROM docs) d JOIN other o ON d.id = o.id`,
+		`SELECT d.id FROM docs JOIN (SELECT id FROM other) d ON docs.id = d.id`,
+	} {
+		stmt, err := Parse(src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", src, err)
+		}
+		found := false
+		for i := range stmt.From {
+			found = found || stmt.From[i].Kind == RelationDerived
+		}
+		if !found {
+			t.Fatalf("Parse(%q) lost its derived operand", src)
+		}
 	}
 }
 

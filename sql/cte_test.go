@@ -256,21 +256,27 @@ func TestCTEUnsupportedBoundariesStayTypedAndRebased(t *testing.T) {
 	}
 }
 
-func TestCTEJoinBoundariesStayTyped(t *testing.T) {
-	for _, tc := range []struct {
-		src    string
-		marker string
-	}{
-		{`WITH c AS (SELECT id FROM docs) SELECT c.id FROM c JOIN other o ON c.id = o.id`, "JOIN"},
-		{`WITH c AS (SELECT id FROM docs) SELECT c.id FROM other o JOIN c ON o.id = c.id`, "c ON"},
+func TestCTEJoinOperandsPreserveDefinitionIdentity(t *testing.T) {
+	for _, src := range []string{
+		`WITH c AS (SELECT id FROM docs) SELECT c.id FROM c JOIN other o ON c.id = o.id`,
+		`WITH c AS (SELECT id FROM docs) SELECT c.id FROM other o JOIN c ON o.id = c.id`,
 	} {
-		_, err := Parse(tc.src)
-		var unsupported *FeatureNotSupportedError
-		if !errors.As(err, &unsupported) {
-			t.Fatalf("Parse(%q) error = %T %v, want *FeatureNotSupportedError", tc.src, err, err)
+		stmt, err := Parse(src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", src, err)
 		}
-		if unsupported.Pos != strings.Index(tc.src, tc.marker) {
-			t.Fatalf("Parse(%q) error Pos = %d, want %d", tc.src, unsupported.Pos, strings.Index(tc.src, tc.marker))
+		definition := stmt.With.CTEs[0].Query
+		found := false
+		for i := range stmt.From {
+			if stmt.From[i].Kind == RelationCTE {
+				found = true
+				if stmt.From[i].Query != definition {
+					t.Fatalf("Parse(%q) CTE identity = %p, want definition %p", src, stmt.From[i].Query, definition)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("Parse(%q) did not retain a CTE operand", src)
 		}
 	}
 }
