@@ -1066,6 +1066,20 @@ func (o *primaryUnifiedOverlay) checkpointEntries(
 	dst []storeio.RecoveryBatchEntry,
 	afterGeneration, targetGeneration uint64,
 ) (entries []storeio.RecoveryBatchEntry, complete bool, err error) {
+	return o.checkpointEntriesMode(
+		dst, afterGeneration, targetGeneration, false,
+	)
+}
+
+// checkpointEntriesMode optionally emits compact scalar-patch redo for the
+// versioned ordinary-delta journal. Legacy journals and every other caller keep
+// the original full-value entry grammar, so reopening a format-0 store never
+// writes a record an older binary could silently truncate.
+func (o *primaryUnifiedOverlay) checkpointEntriesMode(
+	dst []storeio.RecoveryBatchEntry,
+	afterGeneration, targetGeneration uint64,
+	compactScalarPatches bool,
+) (entries []storeio.RecoveryBatchEntry, complete bool, err error) {
 	dst = dst[:0]
 	if o == nil || targetGeneration <= afterGeneration {
 		return dst, targetGeneration == afterGeneration, nil
@@ -1098,8 +1112,28 @@ func (o *primaryUnifiedOverlay) checkpointEntries(
 			if record.valueLen == 0 {
 				return dst[:0], false, storeio.ErrCommonPrimaryLeafCorrupt
 			}
-			entry.Kind = storeio.RecoveryRecordKindPut
-			entry.Value = o.arena[record.valueOff:valueEnd:valueEnd]
+			value := o.arena[record.valueOff:valueEnd:valueEnd]
+			offset, oldLength, newLength, patchOK :=
+				record.scalarPatch.RecoveryCanonicalPatch(record.rawDelta)
+			patchEnd := uint64(offset) + uint64(newLength)
+			// Key and entry-header bytes are identical in both encodings. Pay the
+			// metadata and whole-document checksum only when the compact payload is
+			// strictly smaller than carrying the complete canonical value.
+			if compactScalarPatches && patchOK &&
+				storeio.RecoveryScalarPatchMetadataSize+int(newLength) <
+					len(value) &&
+				patchEnd <= uint64(len(value)) {
+				entry.Kind = storeio.RecoveryRecordKindScalarPatch
+				entry.Value = value[offset:patchEnd:patchEnd]
+				entry.ScalarPatch = storeio.RecoveryScalarPatchMetadata{
+					CanonicalOffset:        offset,
+					OldScalarLength:        oldLength,
+					ExpectedResultChecksum: storeio.PageChecksum(value),
+				}
+			} else {
+				entry.Kind = storeio.RecoveryRecordKindPut
+				entry.Value = value
+			}
 		case primaryUnifiedOverlayDelete:
 			if record.valueLen != 0 {
 				return dst[:0], false, storeio.ErrCommonPrimaryLeafCorrupt

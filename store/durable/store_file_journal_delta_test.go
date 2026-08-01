@@ -375,9 +375,22 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 		max(2*completeOverlayBatch, recoveryJournalDeltaMinCapacityBytes),
 		recoveryJournalMaxCapacityBytes,
 	)
+	wantDeltaCapacity = min(
+		wantDeltaCapacity, recoveryJournalCompactDeltaCapacityBytes,
+	)
 	if got := ordinary.journal.Header().Capacity; got != wantDeltaCapacity {
 		t.Fatalf("ordinary delta journal capacity = %d, want %d",
 			got, wantDeltaCapacity)
+	}
+	if got := ordinaryHeader.Capacity -
+		recoveryJournalCompactFutureReserveBytes; got != uint64(2)<<20 {
+		t.Fatalf("ordinary delta append window = %d, want %d",
+			got, uint64(2)<<20)
+	}
+	if ordinaryHeader.FormatVersion !=
+		storeio.RecoveryJournalFormatScalarPatch {
+		t.Fatalf("ordinary delta journal format = %d, want scalar-patch",
+			ordinaryHeader.FormatVersion)
 	}
 
 	ackOptions := journalDeltaTestOptions()
@@ -396,6 +409,10 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 			"per-mutation ack journal capacity = %d, want cadence-sized %d below delta batch %d",
 			got, wantAckCapacity, completeOverlayBatch,
 		)
+	}
+	if ackHeader.FormatVersion != storeio.RecoveryJournalFormatLegacy {
+		t.Fatalf("per-mutation journal format = %d, want legacy",
+			ackHeader.FormatVersion)
 	}
 }
 

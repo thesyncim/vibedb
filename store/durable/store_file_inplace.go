@@ -52,5 +52,5 @@ func (c *Collection) completePhysicalDurabilityLocked(generation uint64) error {
 	// free set durable, and the recycled redo header proves recovery cannot need
 	// an older logical suffix. Filesystem deallocation is optional and never
 	// mutates allocator metadata, but it must not run before either fence.
-	return c.punchDurableFreeExtentsLocked()
+	return c.punchNewPhysicalGenerationLocked(generation)
 }

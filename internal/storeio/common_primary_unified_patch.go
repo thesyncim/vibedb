@@ -48,6 +48,26 @@ type CommonPrimaryUnifiedScalarPatch struct {
 	canonicalLength uint8
 }
 
+// RecoveryCanonicalPatch exposes only the canonical splice coordinates needed
+// by the recovery journal. The opaque body coordinates remain private to the
+// admitted-leaf validator. rawDelta is the complete canonical document length
+// change recorded for this mutation; a scalar certificate proves every other
+// byte is unchanged, so it also derives the replaced scalar's old length.
+// Exact (byte-identical) certificates deliberately decline: a normal Put entry
+// is both simpler and unambiguous for generation-only publications.
+func (c CommonPrimaryUnifiedScalarPatch) RecoveryCanonicalPatch(
+	rawDelta int32,
+) (canonicalOffset uint16, oldLength, newLength uint8, ok bool) {
+	if !c.valid() || c.exact() || c.canonicalLength == 0 {
+		return 0, 0, 0, false
+	}
+	old := int64(c.canonicalLength) - int64(rawDelta)
+	if old <= 0 || old > int64(CanonicalIntMaxDigits+1) {
+		return 0, 0, 0, false
+	}
+	return c.canonicalOffset, uint8(old), c.canonicalLength, true
+}
+
 func (c CommonPrimaryUnifiedScalarPatch) valid() bool {
 	return c.bodyLength&commonPrimaryUnifiedScalarPatchValid != 0
 }

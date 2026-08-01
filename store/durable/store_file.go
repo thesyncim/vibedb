@@ -1276,8 +1276,9 @@ type Collection struct {
 	primarySplitMaxNS         atomic.Uint64
 	primaryEmptyReclaimMaxNS  atomic.Uint64
 	// Hole punching is a foreground, post-durability space optimization. The
-	// source cursors and disabled flag are writer-owned; atomic counters keep the
-	// optional filesystem results independently observable and cheap to sample.
+	// source cursors, physical-generation guard, and disabled flag are
+	// writer-owned; atomic counters keep the optional filesystem results
+	// independently observable and cheap to sample.
 	holePunchRanges           atomic.Uint64
 	holePunchBytes            atomic.Uint64
 	holePunchSkippedRanges    atomic.Uint64
@@ -1288,8 +1289,10 @@ type Collection struct {
 	holePunchAbsorbedCursor   uint64
 	holePunchCandidateSource  uint8
 	holePunchDisabled         bool
+	holePunchGeneration       uint64
 	holePunchCompletionVictim uint32
 	holePunchCompletions      [fileStoreHolePunchCompletionSlots]storeio.FreeExtent
+	holePunchPartials         [fileStoreHolePunchSourceCount]fileStoreHolePunchPartial
 	// Tests may replace the platform helper per collection. Nil selects the
 	// production Linux/Darwin implementation (or the unsupported no-op).
 	holePunch func(*os.File, uint64, uint64) (bool, error)

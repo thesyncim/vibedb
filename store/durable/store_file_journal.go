@@ -31,11 +31,19 @@ const recoveryJournalCheckpointRecords = 2048
 const (
 	recoveryJournalMinCapacityBytes = uint64(512) << 10
 	// The ordinary delta lane keeps a one-MiB floor for small overlays. Larger
-	// overlays derive a two-complete-window reservation below, so the cheap
-	// Flush lane and its required future pressure carry remain compatible as
-	// the record window changes.
+	// overlays start from two legacy-framed arena estimates below, subject to the
+	// compact cap and exact foreground fallback checks.
 	recoveryJournalDeltaMinCapacityBytes = uint64(1) << 20
-	recoveryJournalMaxCapacityBytes      = storeio.RecoveryJournalMaxCapacityBytes
+	// Compact scalar-patch redo keeps the ordinary buffered journal fully
+	// preallocated while cutting its deterministic disk reservation to 2.5 MiB.
+	// The Flush guard considers at most 512 KiB of estimated future carry; it does
+	// not promise every overlay fits. That leaves the same two-MiB append window
+	// used by the qualified CP64 lane, so the smaller file does not increase its
+	// physical-drain cadence. Any larger exact window takes the existing bounded
+	// physical fallback rather than extending this file.
+	recoveryJournalCompactDeltaCapacityBytes = uint64(5) << 19
+	recoveryJournalCompactFutureReserveBytes = uint64(512) << 10
+	recoveryJournalMaxCapacityBytes          = storeio.RecoveryJournalMaxCapacityBytes
 )
 
 // journalFailureBox carries the sticky journal poison behind an atomic pointer.
@@ -97,6 +105,12 @@ var (
 	recoveryJournalDeltaCarryHook    func(target uint64)
 	recoveryJournalDeltaPreSyncHook  func(target uint64)
 	recoveryJournalDeltaPostSyncHook func(target uint64)
+	// recoveryJournalReplayBatchEntryHook is a deterministic second-crash test
+	// seam. It runs after one decoded batch entry has been applied but before the
+	// next entry. Production leaves it nil.
+	recoveryJournalReplayBatchEntryHook func(
+		*Collection, storeio.RecoveryRecord, int,
+	) error
 )
 
 // journalEnabled reports whether this collection has an open recovery journal.
@@ -195,15 +209,12 @@ func recoveryJournalCapacityBytesFor(
 	deltaOverlayBytes int,
 ) uint64 {
 	if deltaOverlayBytes > 0 {
-		// Ordinary buffered-visible never deposits an overflow value or more
-		// records than the resident overlay can hold. The complete checkpoint
-		// batch is therefore bounded exactly by the overlay's key+value arena and
-		// record count. Reserve two such batches: one for the journal-only cuts
-		// already retained since the physical base, and one for the complete
-		// future carry that pressure must append before folding the resident
-		// overlay. bufferedJournalDeltaPhysicalDrainNeeded enforces the same
-		// two-window invariant; sizing only one window makes its future-reserve
-		// check reject even the first cheap Flush.
+		// Seed the ordinary buffered-visible reservation from two legacy-framed
+		// record/arena windows. This estimate does not include scalar metadata and
+		// the 2.5-MiB policy cap deliberately prevents it from promising that every
+		// admissible overlay fits. The exact prepared batch and foreground future-
+		// reserve checks decide whether a Flush stays journal-only or takes the
+		// bounded physical fallback.
 		batch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
 			sectorSize, primaryUnifiedOverlayRecords, deltaOverlayBytes,
 		))
@@ -215,6 +226,7 @@ func recoveryJournalCapacityBytesFor(
 		}
 		capacity = max(capacity, recoveryJournalDeltaMinCapacityBytes)
 		capacity = min(capacity, recoveryJournalMaxCapacityBytes)
+		capacity = min(capacity, recoveryJournalCompactDeltaCapacityBytes)
 		return capacity
 	}
 	recordUpper := storeio.RecoveryRecordPaddedSize(
@@ -252,7 +264,12 @@ func recoveryJournalHeaderFor(
 	baseGeneration uint64, deltaOverlayBytes int,
 ) storeio.RecoveryJournalHeader {
 	sectorSize := uint32(storeio.RecoveryJournalMinSectorSize)
+	formatVersion := storeio.RecoveryJournalFormatLegacy
+	if deltaOverlayBytes > 0 {
+		formatVersion = storeio.RecoveryJournalFormatScalarPatch
+	}
 	return storeio.RecoveryJournalHeader{
+		FormatVersion:  formatVersion,
 		StoreID:        storeID,
 		JournalID:      journalID,
 		PageSize:       pageSize,
@@ -328,6 +345,16 @@ func (c *Collection) openRecoveryJournalLocked(
 		_ = journal.Close()
 		return err
 	}
+	if journal.Header().FormatVersion ==
+		storeio.RecoveryJournalFormatScalarPatch &&
+		(!c.buffered() || c.options.RecoveryJournal ||
+			c.primaryUnifiedOverlay == nil || len(c.journalDeltaEntries) == 0) {
+		_ = journal.Close()
+		return fmt.Errorf(
+			"%w: format-1 journal requires ordinary buffered delta mode",
+			storeio.ErrRecoveryJournalGeometry,
+		)
+	}
 	c.journalID = journalID
 	c.journalPowerSafe = c.options.CheckpointStrength != CheckpointFilesystem
 	c.journal = journal
@@ -340,6 +367,40 @@ func (c *Collection) openRecoveryJournalLocked(
 	return nil
 }
 
+// recoveryJournalBatchReplayStart returns the first entry not already covered
+// by the recovered physical root. Format-1 journals are used only by the
+// ordinary buffered delta lane, whose batches contain exactly one entry for
+// every consecutive generation ending at rec.Generation. Replay itself can
+// checkpoint under bounded staging pressure while deliberately retaining the
+// journal; after a second crash, skipping this durable prefix is what makes a
+// length-changing scalar patch replayable rather than applying it twice.
+//
+// Legacy journals retain their atomic WriteBatch grammar: every entry belongs
+// to the record's one generation, so they always replay from entry zero.
+func recoveryJournalBatchReplayStart(
+	formatVersion uint32, rec storeio.RecoveryRecord, rootGeneration uint64,
+) (int, error) {
+	if formatVersion != storeio.RecoveryJournalFormatScalarPatch {
+		return 0, nil
+	}
+	count := uint64(len(rec.Entries))
+	if count == 0 || rec.Generation < count {
+		return 0, fmt.Errorf(
+			"%w: invalid scalar-format batch generation range target=%d entries=%d",
+			storeio.ErrRecoveryJournalRecord, rec.Generation, count,
+		)
+	}
+	firstGeneration := rec.Generation - count + 1
+	if rootGeneration < firstGeneration {
+		return 0, nil
+	}
+	covered := rootGeneration - firstGeneration + 1
+	if covered >= count {
+		return len(rec.Entries), nil
+	}
+	return int(covered), nil
+}
+
 // replayRecoveryJournalLocked re-applies every journaled record newer than the
 // recovered root's generation through the ordinary mutation path, then
 // checkpoints and recycles so the journal is empty and the store's durable root
@@ -350,6 +411,7 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
 	applied := 0
+	var scalarPatchScratch []byte
 	apply := func(kind uint16, key, value []byte) error {
 		switch kind {
 		case storeio.RecoveryRecordKindPut:
@@ -369,17 +431,89 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 				storeio.ErrRecoveryJournalRecord, kind)
 		}
 	}
+	applyScalarPatch := func(entry storeio.RecoveryBatchEntry) error {
+		scalarPatchScratch = scalarPatchScratch[:0]
+		current, found, readErr := c.AppendRaw(
+			scalarPatchScratch, entry.Key,
+		)
+		if readErr != nil {
+			return readErr
+		}
+		metadata := entry.ScalarPatch
+		offset := int(metadata.CanonicalOffset)
+		oldLength := int(metadata.OldScalarLength)
+		if !found || oldLength == 0 || offset > len(current) ||
+			oldLength > len(current)-offset {
+			return fmt.Errorf(
+				"%w: scalar-patch preimage key=%q offset=%d old=%d bytes=%d",
+				storeio.ErrRecoveryJournalRecord, entry.Key, offset,
+				oldLength, len(current),
+			)
+		}
+		oldDocumentBytes := len(current)
+		newDocumentBytes := oldDocumentBytes - oldLength + len(entry.Value)
+		if newDocumentBytes <= 0 ||
+			newDocumentBytes > c.options.MaxDocumentBytes {
+			return fmt.Errorf(
+				"%w: scalar-patch result length %d",
+				storeio.ErrRecoveryJournalRecord, newDocumentBytes,
+			)
+		}
+		if newDocumentBytes > oldDocumentBytes {
+			current = append(current, make(
+				[]byte, newDocumentBytes-oldDocumentBytes,
+			)...)
+		}
+		copy(
+			current[offset+len(entry.Value):newDocumentBytes],
+			current[offset+oldLength:oldDocumentBytes],
+		)
+		current = current[:newDocumentBytes]
+		copy(current[offset:], entry.Value)
+		if storeio.PageChecksum(current) !=
+			metadata.ExpectedResultChecksum {
+			return fmt.Errorf(
+				"%w: scalar-patch result checksum key=%q",
+				storeio.ErrRecoveryJournalRecord, entry.Key,
+			)
+		}
+		_, putErr := c.Put(entry.Key, current)
+		if putErr == nil {
+			applied++
+			scalarPatchScratch = current[:0]
+		}
+		return putErr
+	}
 	err := c.journal.Replay(rootGeneration, func(rec storeio.RecoveryRecord) error {
 		if rec.Kind == storeio.RecoveryRecordKindBatch {
+			start, startErr := recoveryJournalBatchReplayStart(
+				c.journal.Header().FormatVersion, rec, rootGeneration,
+			)
+			if startErr != nil {
+				return startErr
+			}
 			// A batch record replays as its entries applied in order through the
 			// ordinary mutation path. The record is present in whole (its single CRC
-			// validated) or not at all, so this loop never sees a partial batch.
-			for i := range rec.Entries {
+			// validated) or not at all. A format-1 delta batch may have a prefix
+			// already covered by a pressure checkpoint from an interrupted replay;
+			// start skips exactly that consecutive-generation prefix.
+			for i := start; i < len(rec.Entries); i++ {
 				entry := rec.Entries[i]
 				// The mutation path borrows the key; replay hands the record's
 				// []byte straight back with no string round-trip.
-				if err := apply(entry.Kind, entry.Key, entry.Value); err != nil {
-					return err
+				var entryErr error
+				if entry.Kind == storeio.RecoveryRecordKindScalarPatch {
+					entryErr = applyScalarPatch(entry)
+				} else {
+					entryErr = apply(entry.Kind, entry.Key, entry.Value)
+				}
+				if entryErr != nil {
+					return entryErr
+				}
+				if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
+					if hookErr := hook(c, rec, i); hookErr != nil {
+						return hookErr
+					}
 				}
 			}
 			return nil
@@ -408,7 +542,13 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 		return err
 	}
 	c.journalReplaying = false
-	return c.recycleRecoveryJournalLocked(c.committer.DurableGeneration())
+	physicalGeneration := c.committer.DurableGeneration()
+	if err := c.recycleRecoveryJournalLocked(physicalGeneration); err != nil {
+		return err
+	}
+	// Normal physical completion owns this hook. Recovery recycles directly
+	// after its final fold, so it performs the same one bounded pass explicitly.
+	return c.punchNewPhysicalGenerationLocked(physicalGeneration)
 }
 
 // recycleRecoveryJournalLocked advances the journal head past a checkpointed
@@ -699,8 +839,10 @@ func (c *Collection) prepareBufferedJournalDeltaLocked(
 		return nil, storeio.RecoveryBatchPlan{}, false, nil
 	}
 	entries, covered, entryErr :=
-		c.primaryUnifiedOverlay.checkpointEntries(
+		c.primaryUnifiedOverlay.checkpointEntriesMode(
 			c.journalDeltaEntries[:0], after, target,
+			c.journal.Header().FormatVersion ==
+				storeio.RecoveryJournalFormatScalarPatch,
 		)
 	if entryErr != nil {
 		return nil, storeio.RecoveryBatchPlan{}, false, entryErr
@@ -811,18 +953,22 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 		return true
 	}
 
-	// Keep enough redo capacity for both this explicit Flush suffix and one
-	// complete future overlay carry. Without the future reserve, repeated CP64
-	// same-key windows fill the bounded journal long before the physical queue or
-	// dirty-frame guards fire; the next non-aligned pressure fold would then have
-	// to checkpoint from a mutation and be counted as automatic. The overlay's
-	// record and byte arenas are the exact admissibility bounds, so this is a
-	// conservative byte calculation without constructing dummy entries.
+	// Budget this explicit Flush suffix plus one policy-sized future carry.
+	// RecoveryBatchRecordPaddedSizeForPayload describes legacy framing only; a v1
+	// batch can add scalar metadata, and the compact lane deliberately caps this
+	// estimate at 512 KiB. Exact planning still gates every current append, while
+	// a future window larger than the reserve takes the bounded physical fallback.
 	header := c.journal.Header()
 	futureBytes := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		header.SectorSize, primaryUnifiedOverlayRecords,
 		len(c.primaryUnifiedOverlay.arena),
 	)
+	if header.FormatVersion == storeio.RecoveryJournalFormatScalarPatch {
+		futureBytes = min(
+			futureBytes,
+			int(recoveryJournalCompactFutureReserveBytes),
+		)
+	}
 	cursor := c.journal.Cursor()
 	if cursor > header.Capacity {
 		return true

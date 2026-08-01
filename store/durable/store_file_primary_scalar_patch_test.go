@@ -2,11 +2,88 @@ package durable
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
+
+func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
+	t.Run("tiny top-level scalar falls back to full value", func(t *testing.T) {
+		docs := make(map[string][]byte, 256)
+		for i := range 256 {
+			docs[fmt.Sprintf("scalar-%03d", i)] = []byte(`{"v":0}`)
+		}
+		coll := buildIndexedPrimaryFile(
+			t, t.TempDir(), "scalar-wire-cost-*", docs,
+			concurrentPrimaryTestOptions(),
+		)
+		key := []byte("scalar-128")
+		baseGeneration := coll.Generation()
+		created, err := coll.Put(key, []byte(`{"v":1}`))
+		if err != nil || created {
+			t.Fatalf("Put = %v,%v", created, err)
+		}
+		if coll.primaryUnifiedOverlay.count.Load() != 1 ||
+			coll.primaryUnifiedOverlay.records[0].scalarPatch ==
+				(storeio.CommonPrimaryUnifiedScalarPatch{}) {
+			t.Fatal("tiny scalar replacement did not retain its patch certificate")
+		}
+		entries, complete, err :=
+			coll.primaryUnifiedOverlay.checkpointEntriesMode(
+				make([]storeio.RecoveryBatchEntry, 0, 1),
+				baseGeneration, coll.Generation(), true,
+			)
+		if err != nil || !complete || len(entries) != 1 ||
+			entries[0].Kind != storeio.RecoveryRecordKindPut ||
+			!bytes.Equal(entries[0].Value, []byte(`{"v":1}`)) {
+			t.Fatalf("checkpoint entries = %#v complete=%v err=%v",
+				entries, complete, err)
+		}
+	})
+
+	t.Run("document scalar emits compact patch", func(t *testing.T) {
+		fixture := openConcurrentPrimaryTestFixture(
+			t, 512, concurrentPrimaryTestOptions(),
+		)
+		same, _ := concurrentPrimaryTestTargets(t, fixture)
+		key := []byte(fixture.keys[same[0]])
+		base := canonicalConcurrentPrimaryValue(t, fixture.values[same[0]])
+		start := bytes.Index(base, []byte(`"group":`))
+		if start < 0 {
+			t.Fatalf("group scalar missing from %q", base)
+		}
+		start += len(`"group":`)
+		end := start
+		for end < len(base) && base[end] >= '0' && base[end] <= '9' {
+			end++
+		}
+		newScalar := []byte("999999999999999999")
+		updated := make([]byte, 0, len(base)-(end-start)+len(newScalar))
+		updated = append(updated, base[:start]...)
+		updated = append(updated, newScalar...)
+		updated = append(updated, base[end:]...)
+		baseGeneration := fixture.collection.Generation()
+		created, err := fixture.collection.Put(key, updated)
+		if err != nil || created {
+			t.Fatalf("Put = %v,%v", created, err)
+		}
+		entries, complete, err :=
+			fixture.collection.primaryUnifiedOverlay.checkpointEntriesMode(
+				make([]storeio.RecoveryBatchEntry, 0, 1),
+				baseGeneration, fixture.collection.Generation(), true,
+			)
+		if err != nil || !complete || len(entries) != 1 ||
+			entries[0].Kind != storeio.RecoveryRecordKindScalarPatch ||
+			!bytes.Equal(entries[0].Value, newScalar) ||
+			entries[0].ScalarPatch.ExpectedResultChecksum !=
+				storeio.PageChecksum(updated) {
+			t.Fatalf("checkpoint entries = %#v complete=%v err=%v",
+				entries, complete, err)
+		}
+	})
+}
 
 // TestConcurrentPrimaryScalarPatchRequestReuse pins the context-reuse boundary:
 // a certified Put must persist its certificate in that record, the same

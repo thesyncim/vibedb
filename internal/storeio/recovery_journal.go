@@ -48,8 +48,9 @@ import (
 // root and its graph were never touched before their own two-phase publication.
 //
 // A batch record (recoveryRecordKindBatch) is the group-commit form of the same
-// protocol: one sequence, one generation, and an ordered list of put/delete
-// entries, all under a single CRC and made durable by one append plus one sync.
+// protocol: one sequence, one generation, and an ordered list of put, delete,
+// or compact scalar-patch entries, all under a single CRC and made durable by
+// one append plus one sync.
 // Because the whole record is framed by that one CRC, a torn append fails
 // validation and replay truncates before it, so recovery replays either every
 // entry of the group or none — the atomicity a multi-document Update needs, and
@@ -85,36 +86,60 @@ const (
 	// unbounded allocation and keeps durable's creation clamp from drifting.
 	RecoveryJournalMaxCapacityBytes = uint64(16) << 20
 
-	recoveryJournalMagic   = "RJRNL00\x00"
-	recoveryJournalVersion = DevelopmentFormatVersion
-	recoveryRecordMagic    = uint32(0x304a5252) // "RRJ0", little-endian.
+	recoveryJournalMagic = "RJRNL00\x00"
+	recoveryRecordMagic  = uint32(0x304a5252) // "RRJ0", little-endian.
+
+	// RecoveryJournalFormatLegacy is the original put/delete batch format. Its
+	// zero value preserves every pre-feature header byte and keeps callers that
+	// do not opt in safely on the legacy grammar.
+	RecoveryJournalFormatLegacy = uint32(0)
+	// RecoveryJournalFormatScalarPatch admits compact scalar-patch batch entries.
+	// The feature version occupies the header's former DevelopmentFormatVersion
+	// word, so an older binary's existing version==0 check rejects the journal
+	// before it can misinterpret kind 4.
+	RecoveryJournalFormatScalarPatch = uint32(1)
 
 	// RecordKindPut marks a same-size inline value replacement.
 	recoveryRecordKindPut = uint16(1)
 	// recoveryRecordKindDelete marks a key removal.
 	recoveryRecordKindDelete = uint16(2)
 	// recoveryRecordKindBatch marks a group-commit record: a single sequence and
-	// generation covering an ordered list of put/delete entries, framed by one
-	// CRC. It is the group-commit primitive — the whole record is durable after
+	// generation covering an ordered list of logical mutation entries, framed by
+	// one CRC. It is the group-commit primitive — the whole record is durable after
 	// one sync, and a torn append fails framing so recovery replays either every
 	// entry or none. A multi-document Update rides it; a future group of
 	// independent acknowledgements sharing one sync is the same record with
 	// unrelated entries.
 	recoveryRecordKindBatch = uint16(3)
+	// recoveryRecordKindScalarPatch marks a compact existing-key replacement
+	// carried only as an entry inside a batch record. Its Value is the new
+	// canonical integer, bool, or null spelling; ScalarPatch identifies the old
+	// spelling in the canonical document and seals the expected complete result.
+	// It is deliberately not a top-level record kind.
+	recoveryRecordKindScalarPatch = uint16(4)
 
-	// RecoveryRecordKindPut, RecoveryRecordKindDelete, and RecoveryRecordKindBatch
-	// are the exported record kinds a store passes to Append/AppendBatch and
-	// matches on during Replay. The internal values stay unexported so the encoder
-	// validates them, but a caller in another package needs a name for the redo
-	// verb it is journaling.
-	RecoveryRecordKindPut    = recoveryRecordKindPut
-	RecoveryRecordKindDelete = recoveryRecordKindDelete
-	RecoveryRecordKindBatch  = recoveryRecordKindBatch
+	// RecoveryRecordKindPut, RecoveryRecordKindDelete, RecoveryRecordKindBatch,
+	// and RecoveryRecordKindScalarPatch are the exported record kinds a store
+	// passes to Append/AppendBatch and matches on during Replay. ScalarPatch is
+	// batch-entry-only; EncodeRecoveryRecord and DecodeRecoveryRecord reject it as
+	// a standalone record.
+	RecoveryRecordKindPut         = recoveryRecordKindPut
+	RecoveryRecordKindDelete      = recoveryRecordKindDelete
+	RecoveryRecordKindBatch       = recoveryRecordKindBatch
+	RecoveryRecordKindScalarPatch = recoveryRecordKindScalarPatch
 
 	// RecoveryBatchEntryHeaderSize is the fixed per-entry framing inside a batch
 	// record that precedes the entry's variable key and value bytes:
 	// kind (2) + reserved (2) + keyLen (4) + valueLen (4).
 	RecoveryBatchEntryHeaderSize = 12
+	// RecoveryScalarPatchMetadataSize is the fixed wire framing inserted after a
+	// scalar-patch entry header and before its key and new scalar bytes. Byte 3 is
+	// reserved zero, keeping the checksum naturally aligned while making future
+	// format damage fail closed.
+	RecoveryScalarPatchMetadataSize = 8
+	// recoveryScalarPatchMaxCanonicalBytes is the widest scalar the compact lane
+	// accepts: a sign plus CanonicalIntMaxDigits. Bool and null are shorter.
+	recoveryScalarPatchMaxCanonicalBytes = CanonicalIntMaxDigits + 1
 )
 
 // RecoveryRecordPaddedSize returns the on-disk byte cost of one record whose key
@@ -157,18 +182,42 @@ var (
 	// the journal head, exactly as staging pressure forces one today.
 	ErrRecoveryJournalFull = errors.New("vibejson: recovery journal is full")
 	// ErrRecoveryJournalRecord reports a record that failed framing, checksum,
-	// or monotonic-sequence validation. Replay stops at the first such record;
-	// it is the truncation point of a torn or reordered tail, not corruption.
+	// monotonic-sequence, or semantic validation. Framing/checksum-invalid tails
+	// truncate replay; checksum-authenticated semantic failures are returned and
+	// fail recovery closed.
 	ErrRecoveryJournalRecord = errors.New("vibejson: invalid recovery journal record")
+	// errRecoveryJournalTruncatableTail distinguishes damage consistent with an
+	// incomplete/reordered append from a checksum-authenticated semantic error.
+	// Both still match ErrRecoveryJournalRecord for API compatibility; only this
+	// private marker may be swallowed by scanTail and Replay.
+	errRecoveryJournalTruncatableTail = errors.New("vibejson: truncatable recovery journal tail")
 )
 
-// RecoveryJournalHeader is the pointer-free identity and geometry of one
-// journal file. BaseGeneration is the store root generation the current live
-// region builds upon: recovery replays only records strictly newer than it.
+func recoveryJournalTailError(reason string) error {
+	return fmt.Errorf(
+		"%w: %w: %s",
+		ErrRecoveryJournalRecord, errRecoveryJournalTruncatableTail, reason,
+	)
+}
+
+func recoveryJournalSemanticError(reason string) error {
+	return fmt.Errorf("%w: semantic: %s", ErrRecoveryJournalRecord, reason)
+}
+
+func recoveryJournalFormatSupported(formatVersion uint32) bool {
+	return formatVersion == RecoveryJournalFormatLegacy ||
+		formatVersion == RecoveryJournalFormatScalarPatch
+}
+
+// RecoveryJournalHeader is the pointer-free format, identity, and geometry of
+// one journal file. FormatVersion gates the record grammar before scanning;
+// BaseGeneration is the store root generation the current live region builds
+// upon, and recovery replays only records strictly newer than it.
 // BaseSequence anchors monotonic-sequence validation so stale bytes left in the
 // preallocated region after a recycle can never be mistaken for live records —
 // the first live record must carry exactly BaseSequence+1.
 type RecoveryJournalHeader struct {
+	FormatVersion  uint32
 	StoreID        [16]byte
 	JournalID      [16]byte
 	PageSize       uint32
@@ -197,12 +246,35 @@ type RecoveryRecord struct {
 	Entries    []RecoveryBatchEntry
 }
 
-// RecoveryBatchEntry is one put or delete inside a batch record. Key and Value
-// borrow the decode buffer, exactly like RecoveryRecord's own fields.
+// RecoveryScalarPatchMetadata is the pointer-free certificate carried by one
+// RecoveryRecordKindScalarPatch batch entry. CanonicalOffset and
+// OldScalarLength select the spelling to replace in the pre-patch canonical
+// document. ExpectedResultChecksum is PageChecksum over the complete canonical
+// document after replacement, so recovery can reject a stale key, wrong base,
+// or damaged patch without materializing a second journal payload.
+//
+// Its wire representation is fixed at RecoveryScalarPatchMetadataSize bytes;
+// the encoder does not serialize Go struct padding.
+type RecoveryScalarPatchMetadata struct {
+	CanonicalOffset        uint16
+	OldScalarLength        uint8
+	ExpectedResultChecksum uint32
+}
+
+var (
+	_ [RecoveryScalarPatchMetadataSize - int(unsafe.Sizeof(RecoveryScalarPatchMetadata{}))]byte
+	_ [int(unsafe.Sizeof(RecoveryScalarPatchMetadata{})) - RecoveryScalarPatchMetadataSize]byte
+)
+
+// RecoveryBatchEntry is one put, delete, or compact scalar replacement inside
+// a batch record. Key and Value borrow the decode buffer, exactly like
+// RecoveryRecord's own fields. For RecoveryRecordKindScalarPatch, Value is only
+// the new canonical scalar spelling and ScalarPatch carries its patch metadata.
 type RecoveryBatchEntry struct {
-	Kind  uint16
-	Key   []byte
-	Value []byte
+	Kind        uint16
+	Key         []byte
+	Value       []byte
+	ScalarPatch RecoveryScalarPatchMetadata
 }
 
 // recoveryRecordPadded returns the sector-padded on-disk size of a record whose
@@ -261,8 +333,89 @@ func checkedRecoveryRecordPadded(
 	return checkedRecoveryPadRaw(sectorSize, raw)
 }
 
+func recoveryScalarPatchValueValid(value []byte) bool {
+	switch len(value) {
+	case 4:
+		if value[0] == 't' && value[1] == 'r' &&
+			value[2] == 'u' && value[3] == 'e' {
+			return true
+		}
+		if value[0] == 'n' && value[1] == 'u' &&
+			value[2] == 'l' && value[3] == 'l' {
+			return true
+		}
+	case 5:
+		if value[0] == 'f' && value[1] == 'a' && value[2] == 'l' &&
+			value[3] == 's' && value[4] == 'e' {
+			return true
+		}
+	}
+	_, integer := CanonicalIntValue(value)
+	return integer
+}
+
+func recoveryScalarPatchValid(
+	metadata RecoveryScalarPatchMetadata, value []byte,
+) bool {
+	oldLength := uint32(metadata.OldScalarLength)
+	if oldLength == 0 ||
+		oldLength > recoveryScalarPatchMaxCanonicalBytes ||
+		len(value) == 0 || len(value) > recoveryScalarPatchMaxCanonicalBytes ||
+		!recoveryScalarPatchValueValid(value) {
+		return false
+	}
+	// A uint16 offset can address a byte anywhere in one 64-KiB canonical
+	// document. Both the removed and inserted spellings must end within that
+	// same representable window; recovery can then use ordinary int slicing
+	// without an offset-plus-length wrap or an ambiguous widened coordinate.
+	const canonicalWindow = uint32(1) << 16
+	offset := uint32(metadata.CanonicalOffset)
+	return offset+oldLength <= canonicalWindow &&
+		offset+uint32(len(value)) <= canonicalWindow
+}
+
+func recoveryBatchEntryMetadataSize(
+	entry RecoveryBatchEntry,
+) (uint64, bool) {
+	switch entry.Kind {
+	case recoveryRecordKindPut, recoveryRecordKindDelete:
+		if entry.ScalarPatch != (RecoveryScalarPatchMetadata{}) {
+			return 0, false
+		}
+		return 0, true
+	case recoveryRecordKindScalarPatch:
+		if !recoveryScalarPatchValid(entry.ScalarPatch, entry.Value) {
+			return 0, false
+		}
+		return RecoveryScalarPatchMetadataSize, true
+	default:
+		return 0, false
+	}
+}
+
+func recoveryBatchEntriesAllowed(
+	formatVersion uint32, entries []RecoveryBatchEntry,
+) bool {
+	if !recoveryJournalFormatSupported(formatVersion) {
+		return false
+	}
+	for i := range entries {
+		if entries[i].Kind == recoveryRecordKindScalarPatch &&
+			formatVersion < RecoveryJournalFormatScalarPatch {
+			return false
+		}
+	}
+	return true
+}
+
 func checkedRecoveryBatchBodyAdd(
 	body, keyLen, valueLen uint64,
+) (uint64, bool) {
+	return checkedRecoveryBatchBodyAddMetadata(body, 0, keyLen, valueLen)
+}
+
+func checkedRecoveryBatchBodyAddMetadata(
+	body, metadataBytes, keyLen, valueLen uint64,
 ) (uint64, bool) {
 	wireLimit := uint64(^uint32(0))
 	if keyLen == 0 || keyLen > wireLimit || valueLen > wireLimit {
@@ -271,6 +424,10 @@ func checkedRecoveryBatchBodyAdd(
 	next, ok := checkedSizeAdd(
 		body, RecoveryBatchEntryHeaderSize, wireLimit,
 	)
+	if !ok {
+		return 0, false
+	}
+	next, ok = checkedSizeAdd(next, metadataBytes, wireLimit)
 	if !ok {
 		return 0, false
 	}
@@ -291,9 +448,14 @@ func checkedRecoveryBatchBodyLen(
 	}
 	var body uint64
 	for i := range entries {
+		metadataBytes, valid := recoveryBatchEntryMetadataSize(entries[i])
+		if !valid {
+			return 0, false
+		}
 		var ok bool
-		body, ok = checkedRecoveryBatchBodyAdd(
+		body, ok = checkedRecoveryBatchBodyAddMetadata(
 			body,
+			metadataBytes,
 			uint64(len(entries[i].Key)),
 			uint64(len(entries[i].Value)),
 		)
@@ -331,13 +493,16 @@ func checkedRecoveryBatchRecordPaddedSizeForBody(
 // RecoveryBatchPlan is an opaque, allocation-free sizing result for one batch
 // record. Preparing once lets a caller use the same validated layout for its
 // capacity decision, append, and byte accounting instead of rescanning every
-// entry at each step. Its fields are deliberately private: only this package
-// can mint a layout accepted by AppendPreparedBatch.
+// entry at each step. A plan is bound to the journal feature version that
+// prepared it, preventing a scalar-enabled plan from crossing into a legacy
+// journal. Its fields are deliberately private: only this package can mint a
+// layout accepted by AppendPreparedBatch.
 type RecoveryBatchPlan struct {
-	sectorSize uint32
-	entryCount int
-	bodyLen    uint64
-	padded     int
+	formatVersion uint32
+	sectorSize    uint32
+	entryCount    int
+	bodyLen       uint64
+	padded        int
 }
 
 // PaddedSize returns the exact sector-padded bytes the prepared batch consumes.
@@ -346,6 +511,17 @@ func (p RecoveryBatchPlan) PaddedSize() int { return p.padded }
 func prepareRecoveryBatch(
 	sectorSize uint32, entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, bool) {
+	return prepareRecoveryBatchForFormat(
+		RecoveryJournalFormatScalarPatch, sectorSize, entries,
+	)
+}
+
+func prepareRecoveryBatchForFormat(
+	formatVersion, sectorSize uint32, entries []RecoveryBatchEntry,
+) (RecoveryBatchPlan, bool) {
+	if !recoveryBatchEntriesAllowed(formatVersion, entries) {
+		return RecoveryBatchPlan{}, false
+	}
 	body, ok := checkedRecoveryBatchBodyLen(entries)
 	if !ok {
 		return RecoveryBatchPlan{}, false
@@ -357,17 +533,19 @@ func prepareRecoveryBatch(
 		return RecoveryBatchPlan{}, false
 	}
 	return RecoveryBatchPlan{
-		sectorSize: sectorSize,
-		entryCount: len(entries),
-		bodyLen:    body,
-		padded:     padded,
+		formatVersion: formatVersion,
+		sectorSize:    sectorSize,
+		entryCount:    len(entries),
+		bodyLen:       body,
+		padded:        padded,
 	}, true
 }
 
 func (p RecoveryBatchPlan) validFor(
 	sectorSize uint32, entryCount int,
 ) bool {
-	if p.sectorSize != sectorSize || p.entryCount != entryCount ||
+	if !recoveryJournalFormatSupported(p.formatVersion) ||
+		p.sectorSize != sectorSize || p.entryCount != entryCount ||
 		p.entryCount <= 0 || p.bodyLen > uint64(^uint32(0)) ||
 		p.padded <= 0 {
 		return false
@@ -376,6 +554,13 @@ func (p RecoveryBatchPlan) validFor(
 		p.sectorSize, p.bodyLen,
 	)
 	return ok && padded == p.padded
+}
+
+func (p RecoveryBatchPlan) validForFormat(
+	formatVersion, sectorSize uint32, entryCount int,
+) bool {
+	return p.formatVersion == formatVersion &&
+		p.validFor(sectorSize, entryCount)
 }
 
 func recoveryBatchEntryArenaFits(entryCount uint64) bool {
@@ -401,11 +586,12 @@ func RecoveryBatchRecordPaddedSize(sectorSize uint32, entries []RecoveryBatchEnt
 }
 
 // RecoveryBatchRecordPaddedSizeForPayload returns the exact padded record size
-// for a batch with entryCount framed entries and totalPayloadBytes key+value
-// bytes. It is the allocation-free upper-bound form of
-// RecoveryBatchRecordPaddedSize: a bounded producer can reserve a future batch
-// from its entry and byte arenas without constructing dummy slice headers.
-// Invalid or unrepresentable inputs saturate at the largest int.
+// for a batch with entryCount fixed entry headers and totalPayloadBytes bytes
+// after those headers. For legacy put/delete entries that payload is key+value;
+// callers estimating metadata-bearing entry kinds must add their metadata bytes
+// themselves. Consequently this is not an upper bound for scalar-patch batches
+// when passed only their key+value arena size. Invalid or unrepresentable inputs
+// saturate at the largest int.
 func RecoveryBatchRecordPaddedSizeForPayload(
 	sectorSize uint32, entryCount, totalPayloadBytes int,
 ) int {
@@ -446,6 +632,9 @@ func RecoveryBatchRecordPaddedSizeForPayload(
 // validateRecoveryJournalHeader enforces the geometry invariants every header
 // must satisfy regardless of provenance.
 func validateRecoveryJournalHeader(h RecoveryJournalHeader) error {
+	if !recoveryJournalFormatSupported(h.FormatVersion) {
+		return fmt.Errorf("%w: format version", ErrRecoveryJournalCorrupt)
+	}
 	if h.StoreID == ([16]byte{}) || h.JournalID == ([16]byte{}) {
 		return fmt.Errorf("%w: zero identity", ErrRecoveryJournalCorrupt)
 	}
@@ -489,7 +678,7 @@ func EncodeRecoveryJournalHeader(dst []byte, h RecoveryJournalHeader) ([]byte, e
 	sector := dst[:RecoveryJournalHeaderSize]
 	clear(sector)
 	copy(sector[0:8], recoveryJournalMagic)
-	binary.LittleEndian.PutUint32(sector[8:12], recoveryJournalVersion)
+	binary.LittleEndian.PutUint32(sector[8:12], h.FormatVersion)
 	binary.LittleEndian.PutUint32(sector[12:16], RecoveryJournalHeaderSize)
 	copy(sector[16:32], h.StoreID[:])
 	copy(sector[32:48], h.JournalID[:])
@@ -522,11 +711,12 @@ func DecodeRecoveryJournalHeader(src []byte) (RecoveryJournalHeader, error) {
 		PageChecksum(src[:RecoveryJournalHeaderSize-8]) != checksum {
 		return RecoveryJournalHeader{}, fmt.Errorf("%w: checksum", ErrRecoveryJournalCorrupt)
 	}
-	if binary.LittleEndian.Uint32(src[8:12]) != recoveryJournalVersion ||
+	formatVersion := binary.LittleEndian.Uint32(src[8:12])
+	if !recoveryJournalFormatSupported(formatVersion) ||
 		binary.LittleEndian.Uint32(src[12:16]) != RecoveryJournalHeaderSize {
 		return RecoveryJournalHeader{}, fmt.Errorf("%w: version or header size", ErrRecoveryJournalCorrupt)
 	}
-	var h RecoveryJournalHeader
+	h := RecoveryJournalHeader{FormatVersion: formatVersion}
 	copy(h.StoreID[:], src[16:32])
 	copy(h.JournalID[:], src[32:48])
 	h.PageSize = binary.LittleEndian.Uint32(src[48:52])
@@ -584,6 +774,28 @@ func EncodeRecoveryRecord(
 	return padded, nil
 }
 
+func encodeRecoveryScalarPatchMetadata(
+	dst []byte, metadata RecoveryScalarPatchMetadata,
+) {
+	binary.LittleEndian.PutUint16(dst[0:2], metadata.CanonicalOffset)
+	dst[2] = metadata.OldScalarLength
+	// dst[3] is reserved zero; the enclosing batch buffer was cleared.
+	binary.LittleEndian.PutUint32(dst[4:8], metadata.ExpectedResultChecksum)
+}
+
+func decodeRecoveryScalarPatchMetadata(
+	src []byte,
+) (RecoveryScalarPatchMetadata, bool) {
+	if len(src) < RecoveryScalarPatchMetadataSize || src[3] != 0 {
+		return RecoveryScalarPatchMetadata{}, false
+	}
+	return RecoveryScalarPatchMetadata{
+		CanonicalOffset:        binary.LittleEndian.Uint16(src[0:2]),
+		OldScalarLength:        src[2],
+		ExpectedResultChecksum: binary.LittleEndian.Uint32(src[4:8]),
+	}, true
+}
+
 func encodeRecoveryBatchRecordPrepared(
 	dst []byte, sectorSize uint32, rec RecoveryRecord,
 	plan RecoveryBatchPlan,
@@ -611,16 +823,26 @@ func encodeRecoveryBatchRecordPrepared(
 	bodyEnd := cursor + plan.bodyLen
 	for i := range rec.Entries {
 		entry := rec.Entries[i]
-		if entry.Kind != recoveryRecordKindPut &&
-			entry.Kind != recoveryRecordKindDelete {
-			return 0, fmt.Errorf("%w: batch entry kind", ErrInvalidWrite)
+		if entry.Kind == recoveryRecordKindScalarPatch &&
+			plan.formatVersion < RecoveryJournalFormatScalarPatch {
+			return 0, fmt.Errorf(
+				"%w: scalar-patch entry in legacy batch plan",
+				ErrInvalidWrite,
+			)
+		}
+		metadataBytes, valid := recoveryBatchEntryMetadataSize(entry)
+		if !valid {
+			return 0, fmt.Errorf(
+				"%w: batch entry kind or scalar-patch metadata",
+				ErrInvalidWrite,
+			)
 		}
 		if len(entry.Key) == 0 ||
 			uint64(len(entry.Key)) > uint64(^uint32(0)) ||
 			uint64(len(entry.Value)) > uint64(^uint32(0)) {
 			return 0, fmt.Errorf("%w: batch entry key or value length", ErrInvalidWrite)
 		}
-		entryEnd := cursor + RecoveryBatchEntryHeaderSize +
+		entryEnd := cursor + RecoveryBatchEntryHeaderSize + metadataBytes +
 			uint64(len(entry.Key)) + uint64(len(entry.Value))
 		if entryEnd > bodyEnd {
 			return 0, fmt.Errorf("%w: batch plan no longer matches entries", ErrInvalidWrite)
@@ -630,6 +852,13 @@ func encodeRecoveryBatchRecordPrepared(
 		binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], uint32(len(entry.Key)))
 		binary.LittleEndian.PutUint32(buf[cursor+8:cursor+12], uint32(len(entry.Value)))
 		cursor += RecoveryBatchEntryHeaderSize
+		if entry.Kind == recoveryRecordKindScalarPatch {
+			encodeRecoveryScalarPatchMetadata(
+				buf[cursor:cursor+RecoveryScalarPatchMetadataSize],
+				entry.ScalarPatch,
+			)
+			cursor += RecoveryScalarPatchMetadataSize
+		}
 		cursor += uint64(copy(buf[cursor:], entry.Key))
 		cursor += uint64(copy(buf[cursor:], entry.Value))
 	}
@@ -644,53 +873,56 @@ func encodeRecoveryBatchRecordPrepared(
 
 // DecodeRecoveryRecord validates one record at the start of src against the
 // expected sequence and returns the borrowed record and its padded size. A
-// record whose magic, framing, checksum, or sequence is wrong returns
-// ErrRecoveryJournalRecord: it is the truncation point of a torn or reordered
-// tail, not corruption of the store.
+// record whose magic, framing, checksum, or sequence is wrong returns a
+// truncatable ErrRecoveryJournalRecord. Once a complete record's CRC validates,
+// an unknown kind or impossible semantic payload instead returns a hard
+// ErrRecoveryJournalRecord that scanTail and Replay propagate.
 func DecodeRecoveryRecord(
 	src []byte, sectorSize uint32, expectedSequence uint64,
 ) (RecoveryRecord, int, error) {
 	if len(src) < RecoveryJournalRecordPrefixSize+RecoveryJournalRecordTrailerSize {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: short record", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("short record")
 	}
 	if binary.LittleEndian.Uint32(src[0:4]) != recoveryRecordMagic {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: magic", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("magic")
 	}
 	kind := binary.LittleEndian.Uint16(src[4:6])
 	if binary.LittleEndian.Uint16(src[6:8]) != 0 {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: reserved", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("reserved")
 	}
 	if kind == recoveryRecordKindBatch {
 		return decodeRecoveryBatchRecord(src, sectorSize, expectedSequence)
-	}
-	if kind != recoveryRecordKindPut && kind != recoveryRecordKindDelete {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: kind", ErrRecoveryJournalRecord)
 	}
 	sequence := binary.LittleEndian.Uint64(src[8:16])
 	generation := binary.LittleEndian.Uint64(src[16:24])
 	keyLen := binary.LittleEndian.Uint32(src[24:28])
 	valueLen := binary.LittleEndian.Uint32(src[28:32])
 	if sequence != expectedSequence || generation == 0 || keyLen == 0 {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: sequence or framing", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("sequence or framing")
 	}
 	keyStart := uint64(RecoveryJournalRecordPrefixSize)
 	valueStart := keyStart + uint64(keyLen)
 	bodyEnd := valueStart + uint64(valueLen)
 	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: length overruns region", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("length overruns region")
 	}
 	checksum := PageChecksum(src[:bodyEnd])
 	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
 	if stored != checksum ||
 		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: checksum", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("checksum")
+	}
+	if kind != recoveryRecordKindPut && kind != recoveryRecordKindDelete {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid standalone record kind",
+		)
 	}
 	padded, ok := checkedRecoveryPadRaw(
 		sectorSize, bodyEnd+RecoveryJournalRecordTrailerSize,
 	)
 	if !ok {
-		return RecoveryRecord{}, 0, fmt.Errorf(
-			"%w: padded record length", ErrRecoveryJournalRecord,
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid padded record length",
 		)
 	}
 	rec := RecoveryRecord{
@@ -716,11 +948,17 @@ func decodeRecoveryBatchRecord(
 	entryCount := binary.LittleEndian.Uint32(src[24:28])
 	bodyLen := binary.LittleEndian.Uint32(src[28:32])
 	if sequence != expectedSequence || generation == 0 || entryCount == 0 {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: sequence or framing", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("batch sequence or framing")
 	}
 	bodyEnd := uint64(RecoveryJournalRecordPrefixSize) + uint64(bodyLen)
 	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: length overruns region", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalTailError("batch length overruns region")
+	}
+	checksum := PageChecksum(src[:bodyEnd])
+	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
+	if stored != checksum ||
+		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
+		return RecoveryRecord{}, 0, recoveryJournalTailError("batch checksum")
 	}
 	// Every entry has a fixed header and a non-empty key. Prove the peer-chosen
 	// count fits both the framed body and native slice capacity before make;
@@ -728,61 +966,93 @@ func decodeRecoveryBatchRecord(
 	if uint64(entryCount) >
 		uint64(bodyLen)/(RecoveryBatchEntryHeaderSize+1) ||
 		uint64(entryCount) > uint64(maxIntValue) {
-		return RecoveryRecord{}, 0, fmt.Errorf(
-			"%w: batch entry count overruns body",
-			ErrRecoveryJournalRecord,
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid batch entry count overruns body",
 		)
 	}
 	if !recoveryBatchEntryArenaFits(uint64(entryCount)) {
-		return RecoveryRecord{}, 0, fmt.Errorf(
-			"%w: batch entry arena overflows address space",
-			ErrRecoveryJournalRecord,
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid batch entry arena overflows address space",
 		)
-	}
-	checksum := PageChecksum(src[:bodyEnd])
-	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
-	if stored != checksum ||
-		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: checksum", ErrRecoveryJournalRecord)
 	}
 	entries := make([]RecoveryBatchEntry, 0, entryCount)
 	cursor := uint64(RecoveryJournalRecordPrefixSize)
 	for i := uint32(0); i < entryCount; i++ {
 		if cursor+RecoveryBatchEntryHeaderSize > bodyEnd {
-			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry header overruns", ErrRecoveryJournalRecord)
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"checksum-valid batch entry header overruns",
+			)
 		}
 		entryKind := binary.LittleEndian.Uint16(src[cursor : cursor+2])
 		if binary.LittleEndian.Uint16(src[cursor+2:cursor+4]) != 0 ||
-			(entryKind != recoveryRecordKindPut && entryKind != recoveryRecordKindDelete) {
-			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry kind or reserved", ErrRecoveryJournalRecord)
+			(entryKind != recoveryRecordKindPut &&
+				entryKind != recoveryRecordKindDelete &&
+				entryKind != recoveryRecordKindScalarPatch) {
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"checksum-valid batch entry kind or reserved",
+			)
 		}
 		keyLen := uint64(binary.LittleEndian.Uint32(src[cursor+4 : cursor+8]))
 		valueLen := uint64(binary.LittleEndian.Uint32(src[cursor+8 : cursor+12]))
 		if keyLen == 0 {
-			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry key length", ErrRecoveryJournalRecord)
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"checksum-valid batch entry key length",
+			)
 		}
-		keyStart := cursor + RecoveryBatchEntryHeaderSize
+		payloadStart := cursor + RecoveryBatchEntryHeaderSize
+		var scalarPatch RecoveryScalarPatchMetadata
+		if entryKind == recoveryRecordKindScalarPatch {
+			metadataEnd := payloadStart + RecoveryScalarPatchMetadataSize
+			if metadataEnd > bodyEnd {
+				return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+					"checksum-valid scalar-patch metadata overruns body",
+				)
+			}
+			var metadataOK bool
+			scalarPatch, metadataOK = decodeRecoveryScalarPatchMetadata(
+				src[payloadStart:metadataEnd],
+			)
+			if !metadataOK {
+				return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+					"checksum-valid scalar-patch metadata",
+				)
+			}
+			payloadStart = metadataEnd
+		}
+		keyStart := payloadStart
 		valueStart := keyStart + keyLen
 		entryEnd := valueStart + valueLen
 		if entryEnd > bodyEnd {
-			return RecoveryRecord{}, 0, fmt.Errorf("%w: batch entry overruns body", ErrRecoveryJournalRecord)
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"checksum-valid batch entry overruns body",
+			)
+		}
+		value := src[valueStart:entryEnd]
+		if entryKind == recoveryRecordKindScalarPatch &&
+			!recoveryScalarPatchValid(scalarPatch, value) {
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"checksum-valid scalar-patch bounds or value",
+			)
 		}
 		entries = append(entries, RecoveryBatchEntry{
-			Kind:  entryKind,
-			Key:   src[keyStart:valueStart],
-			Value: src[valueStart:entryEnd],
+			Kind:        entryKind,
+			Key:         src[keyStart:valueStart],
+			Value:       value,
+			ScalarPatch: scalarPatch,
 		})
 		cursor = entryEnd
 	}
 	if cursor != bodyEnd {
-		return RecoveryRecord{}, 0, fmt.Errorf("%w: batch body length mismatch", ErrRecoveryJournalRecord)
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid batch body length mismatch",
+		)
 	}
 	padded, ok := checkedRecoveryPadRaw(
 		sectorSize, bodyEnd+RecoveryJournalRecordTrailerSize,
 	)
 	if !ok {
-		return RecoveryRecord{}, 0, fmt.Errorf(
-			"%w: padded batch length", ErrRecoveryJournalRecord,
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid padded batch length",
 		)
 	}
 	rec := RecoveryRecord{
@@ -792,6 +1062,26 @@ func decodeRecoveryBatchRecord(
 		Entries:    entries,
 	}
 	return rec, padded, nil
+}
+
+func validateRecoveryRecordForFormat(
+	formatVersion uint32, rec RecoveryRecord,
+) error {
+	if !recoveryJournalFormatSupported(formatVersion) {
+		return recoveryJournalSemanticError("unsupported journal format version")
+	}
+	if formatVersion >= RecoveryJournalFormatScalarPatch ||
+		rec.Kind != recoveryRecordKindBatch {
+		return nil
+	}
+	for i := range rec.Entries {
+		if rec.Entries[i].Kind == recoveryRecordKindScalarPatch {
+			return recoveryJournalSemanticError(
+				"scalar-patch entry in legacy journal",
+			)
+		}
+	}
+	return nil
 }
 
 // RecoveryJournal is the single-writer file-backed manager. It is owned by the
@@ -948,9 +1238,10 @@ func (rj *RecoveryJournal) writeHeader(slot uint32, header RecoveryJournalHeader
 }
 
 // scanTail walks the record region from its start, validating strict-monotonic
-// sequence and framing, to re-derive the append cursor after Open. It stops at
-// the first invalid record — the torn or reordered tail — leaving the cursor
-// and next sequence positioned to overwrite it.
+// sequence and framing, to re-derive the append cursor after Open. It stops only
+// at a framing/checksum-invalid tail consistent with a torn or reordered append,
+// leaving the cursor and next sequence positioned to overwrite it. A
+// checksum-authenticated semantic error is returned and fails Open closed.
 func (rj *RecoveryJournal) scanTail() error {
 	region := make([]byte, rj.header.Capacity)
 	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
@@ -963,9 +1254,16 @@ func (rj *RecoveryJournal) scanTail() error {
 			region[cursor:], rj.header.SectorSize, sequence,
 		)
 		if err != nil {
-			break
+			if errors.Is(err, errRecoveryJournalTruncatableTail) {
+				break
+			}
+			return err
 		}
-		_ = rec
+		if err := validateRecoveryRecordForFormat(
+			rj.header.FormatVersion, rec,
+		); err != nil {
+			return err
+		}
 		if cursor+uint64(padded) > rj.header.Capacity {
 			break
 		}
@@ -1047,7 +1345,9 @@ func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
 func (rj *RecoveryJournal) PrepareBatch(
 	entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, error) {
-	plan, ok := prepareRecoveryBatch(rj.header.SectorSize, entries)
+	plan, ok := prepareRecoveryBatchForFormat(
+		rj.header.FormatVersion, rj.header.SectorSize, entries,
+	)
 	if !ok {
 		return RecoveryBatchPlan{}, fmt.Errorf(
 			"%w: batch record length", ErrInvalidWrite,
@@ -1059,7 +1359,9 @@ func (rj *RecoveryJournal) PrepareBatch(
 // PreparedBatchFits reports whether a prepared batch fits at the current
 // cursor. A plan minted for another journal geometry fails closed.
 func (rj *RecoveryJournal) PreparedBatchFits(plan RecoveryBatchPlan) bool {
-	if !plan.validFor(rj.header.SectorSize, plan.entryCount) {
+	if !plan.validForFormat(
+		rj.header.FormatVersion, rj.header.SectorSize, plan.entryCount,
+	) {
 		return false
 	}
 	end, ok := checkedSizeAdd(
@@ -1091,7 +1393,9 @@ func (rj *RecoveryJournal) AppendPreparedBatch(
 	generation uint64, entries []RecoveryBatchEntry,
 	plan RecoveryBatchPlan,
 ) (uint64, error) {
-	if !plan.validFor(rj.header.SectorSize, len(entries)) {
+	if !plan.validForFormat(
+		rj.header.FormatVersion, rj.header.SectorSize, len(entries),
+	) {
 		return 0, fmt.Errorf("%w: batch plan", ErrInvalidWrite)
 	}
 	end, ok := checkedSizeAdd(
@@ -1193,8 +1497,9 @@ func (rj *RecoveryJournal) Cursor() uint64 { return rj.cursor }
 
 // Replay walks the live record region and invokes fn for every record whose
 // generation is strictly newer than baseGeneration, in append order. It stops
-// at the first framing-invalid record (the torn or reordered tail) and returns
-// nil: a torn tail is a truncation, not an error. fn's error aborts replay.
+// at the first framing/checksum-invalid record (the torn or reordered tail) and
+// returns nil. A checksum-valid semantic error is not a truncation: it returns
+// ErrRecoveryJournalRecord and fails recovery closed. fn's error aborts replay.
 func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord) error) error {
 	region := make([]byte, rj.header.Capacity)
 	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
@@ -1207,10 +1512,17 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 			region[cursor:], rj.header.SectorSize, sequence,
 		)
 		if err != nil {
-			// First invalid record truncates the replay. Everything before it was
-			// individually sync-fenced and is durable; nothing after it can be
-			// trusted.
-			break
+			if errors.Is(err, errRecoveryJournalTruncatableTail) {
+				// A framing/checksum-invalid tail is consistent with an incomplete or
+				// reordered append. Everything before it was individually sync-fenced.
+				break
+			}
+			return err
+		}
+		if err := validateRecoveryRecordForFormat(
+			rj.header.FormatVersion, rec,
+		); err != nil {
+			return err
 		}
 		if cursor+uint64(padded) > rj.header.Capacity {
 			break

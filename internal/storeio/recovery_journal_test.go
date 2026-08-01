@@ -3,6 +3,7 @@ package storeio
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -17,6 +18,7 @@ func testJournalHeader(t *testing.T, capacity uint64) RecoveryJournalHeader {
 		journalID[i] = byte(0x40 + i)
 	}
 	return RecoveryJournalHeader{
+		FormatVersion:  RecoveryJournalFormatLegacy,
 		StoreID:        storeID,
 		JournalID:      journalID,
 		PageSize:       4096,
@@ -28,13 +30,23 @@ func testJournalHeader(t *testing.T, capacity uint64) RecoveryJournalHeader {
 }
 
 func createTestJournal(t *testing.T, capacity uint64) (*RecoveryJournal, string) {
+	return createTestJournalFormat(
+		t, capacity, RecoveryJournalFormatLegacy,
+	)
+}
+
+func createTestJournalFormat(
+	t *testing.T, capacity uint64, formatVersion uint32,
+) (*RecoveryJournal, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "store.rjournal")
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		t.Fatalf("open journal file: %v", err)
 	}
-	rj, err := CreateRecoveryJournal(file, testJournalHeader(t, capacity))
+	header := testJournalHeader(t, capacity)
+	header.FormatVersion = formatVersion
+	rj, err := CreateRecoveryJournal(file, header)
 	if err != nil {
 		file.Close()
 		t.Fatalf("create journal: %v", err)
@@ -70,13 +82,22 @@ func replayAll(t *testing.T, rj *RecoveryJournal, base uint64) []RecoveryRecord 
 	t.Helper()
 	var out []RecoveryRecord
 	err := rj.Replay(base, func(rec RecoveryRecord) error {
-		out = append(out, RecoveryRecord{
+		copied := RecoveryRecord{
 			Sequence:   rec.Sequence,
 			Generation: rec.Generation,
 			Kind:       rec.Kind,
 			Key:        append([]byte(nil), rec.Key...),
 			Value:      append([]byte(nil), rec.Value...),
-		})
+		}
+		for i := range rec.Entries {
+			copied.Entries = append(copied.Entries, RecoveryBatchEntry{
+				Kind:        rec.Entries[i].Kind,
+				Key:         append([]byte(nil), rec.Entries[i].Key...),
+				Value:       append([]byte(nil), rec.Entries[i].Value...),
+				ScalarPatch: rec.Entries[i].ScalarPatch,
+			})
+		}
+		out = append(out, copied)
 		return nil
 	})
 	if err != nil {
@@ -129,6 +150,87 @@ func TestRecoveryJournalHeaderRoundTrip(t *testing.T) {
 		if _, err := DecodeRecoveryJournalHeader(corrupt); err == nil {
 			t.Fatalf("%s corruption accepted", mut.name)
 		}
+	}
+}
+
+func TestRecoveryJournalHeaderFormatVersionRoundTripAndPreservation(t *testing.T) {
+	for _, formatVersion := range []uint32{
+		RecoveryJournalFormatLegacy,
+		RecoveryJournalFormatScalarPatch,
+	} {
+		t.Run(fmt.Sprintf("format-%d", formatVersion), func(t *testing.T) {
+			header := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
+			header.FormatVersion = formatVersion
+			header.RecycleCount = 3
+			encoded := make([]byte, RecoveryJournalHeaderSize)
+			if _, err := EncodeRecoveryJournalHeader(encoded, header); err != nil {
+				t.Fatalf("EncodeRecoveryJournalHeader: %v", err)
+			}
+			if got := binary.LittleEndian.Uint32(encoded[8:12]); got != formatVersion {
+				t.Fatalf("wire format version = %d, want %d", got, formatVersion)
+			}
+			decoded, err := DecodeRecoveryJournalHeader(encoded)
+			if err != nil {
+				t.Fatalf("DecodeRecoveryJournalHeader: %v", err)
+			}
+			if decoded != header {
+				t.Fatalf("decoded header = %+v, want %+v", decoded, header)
+			}
+		})
+	}
+
+	unsupported := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
+	unsupported.FormatVersion = RecoveryJournalFormatScalarPatch + 1
+	unsupported.RecycleCount = 1
+	encoded := make([]byte, RecoveryJournalHeaderSize)
+	if _, err := EncodeRecoveryJournalHeader(
+		encoded, unsupported,
+	); !errors.Is(err, ErrRecoveryJournalCorrupt) {
+		t.Fatalf("encode unsupported version = %v, want corrupt", err)
+	}
+	// Build an otherwise-valid checksummed unsupported header from a legacy
+	// image. Decode must reject the feature word itself, not merely its CRC.
+	legacy := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
+	legacy.RecycleCount = 1
+	if _, err := EncodeRecoveryJournalHeader(encoded, legacy); err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint32(encoded[8:12], unsupported.FormatVersion)
+	checksum := PageChecksum(encoded[:RecoveryJournalHeaderSize-8])
+	binary.LittleEndian.PutUint32(
+		encoded[RecoveryJournalHeaderSize-8:RecoveryJournalHeaderSize-4], checksum,
+	)
+	binary.LittleEndian.PutUint32(encoded[RecoveryJournalHeaderSize-4:], ^checksum)
+	if _, err := DecodeRecoveryJournalHeader(
+		encoded,
+	); !errors.Is(err, ErrRecoveryJournalCorrupt) {
+		t.Fatalf("decode checksummed unsupported version = %v, want corrupt", err)
+	}
+
+	rj, path := createTestJournalFormat(
+		t, 16*RecoveryJournalMinSectorSize,
+		RecoveryJournalFormatScalarPatch,
+	)
+	if rj.Header().FormatVersion != RecoveryJournalFormatScalarPatch {
+		t.Fatalf("created format = %d, want scalar", rj.Header().FormatVersion)
+	}
+	if err := rj.Recycle(2, false); err != nil {
+		t.Fatalf("Recycle: %v", err)
+	}
+	if rj.Header().FormatVersion != RecoveryJournalFormatScalarPatch {
+		t.Fatalf("recycled format = %d, want scalar", rj.Header().FormatVersion)
+	}
+	if err := rj.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	rj = reopenTestJournal(t, path)
+	defer rj.Close()
+	if rj.Header().FormatVersion != RecoveryJournalFormatScalarPatch {
+		t.Fatalf("reopened format = %d, want scalar", rj.Header().FormatVersion)
+	}
+	if DevelopmentFormatVersion != RecoveryJournalFormatLegacy {
+		t.Fatalf("legacy wire version = %d, old binary expected %d",
+			RecoveryJournalFormatLegacy, DevelopmentFormatVersion)
 	}
 }
 
@@ -215,6 +317,587 @@ func TestRecoveryRecordRoundTrip(t *testing.T) {
 	corrupt[RecoveryJournalRecordPrefixSize+1] ^= 0x01
 	if _, _, err := DecodeRecoveryRecord(corrupt, RecoveryJournalMinSectorSize, 5); !errors.Is(err, ErrRecoveryJournalRecord) {
 		t.Fatalf("corrupt body accepted, got %v", err)
+	}
+}
+
+func TestRecoveryScalarPatchBatchEntryRoundTrip(t *testing.T) {
+	result := []byte(`{"id":1,"score":-7}`)
+	metadata := RecoveryScalarPatchMetadata{
+		CanonicalOffset:        16,
+		OldScalarLength:        2,
+		ExpectedResultChecksum: PageChecksum(result),
+	}
+	entries := []RecoveryBatchEntry{
+		{Kind: RecoveryRecordKindPut, Key: []byte("before"), Value: []byte(`{"v":1}`)},
+		{
+			Kind:        RecoveryRecordKindScalarPatch,
+			Key:         []byte("account:1"),
+			Value:       []byte("-7"),
+			ScalarPatch: metadata,
+		},
+		{Kind: RecoveryRecordKindDelete, Key: []byte("after")},
+	}
+	plan, ok := prepareRecoveryBatch(RecoveryJournalMinSectorSize, entries)
+	if !ok {
+		t.Fatal("prepare scalar-patch batch declined valid entries")
+	}
+	wantBody := uint64(
+		3*RecoveryBatchEntryHeaderSize +
+			RecoveryScalarPatchMetadataSize +
+			len("before") + len(`{"v":1}`) +
+			len("account:1") + len("-7") + len("after"),
+	)
+	if plan.bodyLen != wantBody {
+		t.Fatalf("batch body length = %d, want %d", plan.bodyLen, wantBody)
+	}
+
+	buf := make([]byte, plan.PaddedSize())
+	encoded, err := encodeRecoveryBatchRecordPrepared(
+		buf, RecoveryJournalMinSectorSize,
+		RecoveryRecord{
+			Sequence: 7, Generation: 11, Kind: RecoveryRecordKindBatch,
+			Entries: entries,
+		},
+		plan,
+	)
+	if err != nil {
+		t.Fatalf("encode scalar-patch batch: %v", err)
+	}
+	if encoded != plan.PaddedSize() {
+		t.Fatalf("encoded bytes = %d, want %d", encoded, plan.PaddedSize())
+	}
+	got, padded, err := DecodeRecoveryRecord(
+		buf, RecoveryJournalMinSectorSize, 7,
+	)
+	if err != nil {
+		t.Fatalf("decode scalar-patch batch: %v", err)
+	}
+	if padded != encoded || got.Kind != RecoveryRecordKindBatch ||
+		got.Generation != 11 || len(got.Entries) != len(entries) {
+		t.Fatalf("decoded batch = %+v padded=%d, want 3-entry batch/%d",
+			got, padded, encoded)
+	}
+	patch := got.Entries[1]
+	if patch.Kind != RecoveryRecordKindScalarPatch ||
+		string(patch.Key) != "account:1" || string(patch.Value) != "-7" ||
+		patch.ScalarPatch != metadata {
+		t.Fatalf("decoded scalar patch = %+v, want metadata %+v", patch, metadata)
+	}
+
+	// Pin the new entry's wire layout without changing the framing of existing
+	// put/delete entries: fixed header, fixed metadata, then borrowed key/value.
+	firstBytes := RecoveryBatchEntryHeaderSize + len("before") + len(`{"v":1}`)
+	entryAt := RecoveryJournalRecordPrefixSize + firstBytes
+	if binary.LittleEndian.Uint16(buf[entryAt:entryAt+2]) !=
+		RecoveryRecordKindScalarPatch ||
+		binary.LittleEndian.Uint16(buf[entryAt+2:entryAt+4]) != 0 ||
+		binary.LittleEndian.Uint32(buf[entryAt+4:entryAt+8]) != uint32(len("account:1")) ||
+		binary.LittleEndian.Uint32(buf[entryAt+8:entryAt+12]) != uint32(len("-7")) {
+		t.Fatalf("scalar-patch entry header malformed: %x",
+			buf[entryAt:entryAt+RecoveryBatchEntryHeaderSize])
+	}
+	metadataAt := entryAt + RecoveryBatchEntryHeaderSize
+	if binary.LittleEndian.Uint16(buf[metadataAt:metadataAt+2]) !=
+		metadata.CanonicalOffset ||
+		buf[metadataAt+2] != metadata.OldScalarLength ||
+		buf[metadataAt+3] != 0 ||
+		binary.LittleEndian.Uint32(buf[metadataAt+4:metadataAt+8]) !=
+			metadata.ExpectedResultChecksum {
+		t.Fatalf("scalar-patch metadata wire bytes = %x, want %+v",
+			buf[metadataAt:metadataAt+RecoveryScalarPatchMetadataSize], metadata)
+	}
+}
+
+func TestRecoveryScalarPatchIsBatchEntryOnly(t *testing.T) {
+	rec := RecoveryRecord{
+		Sequence: 1, Generation: 2, Kind: RecoveryRecordKindScalarPatch,
+		Key: []byte("k"), Value: []byte("1"),
+	}
+	buf := make([]byte, RecoveryJournalMinSectorSize)
+	if _, err := EncodeRecoveryRecord(
+		buf, RecoveryJournalMinSectorSize, rec,
+	); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("standalone scalar-patch encode = %v, want invalid write", err)
+	}
+
+	rec.Kind = RecoveryRecordKindPut
+	n, err := EncodeRecoveryRecord(buf, RecoveryJournalMinSectorSize, rec)
+	if err != nil {
+		t.Fatalf("encode ordinary record: %v", err)
+	}
+	binary.LittleEndian.PutUint16(buf[4:6], RecoveryRecordKindScalarPatch)
+	bodyEnd := RecoveryJournalRecordPrefixSize + len(rec.Key) + len(rec.Value)
+	checksum := PageChecksum(buf[:bodyEnd])
+	binary.LittleEndian.PutUint32(buf[bodyEnd:bodyEnd+4], checksum)
+	binary.LittleEndian.PutUint32(buf[bodyEnd+4:bodyEnd+8], ^checksum)
+	if _, _, err := DecodeRecoveryRecord(
+		buf[:n], RecoveryJournalMinSectorSize, 1,
+	); !errors.Is(err, ErrRecoveryJournalRecord) ||
+		errors.Is(err, errRecoveryJournalTruncatableTail) {
+		t.Fatalf("standalone scalar-patch decode = %v, want hard record error", err)
+	}
+}
+
+func TestRecoveryScalarPatchRequiresHeaderFeatureVersion(t *testing.T) {
+	entry := RecoveryBatchEntry{
+		Kind:  RecoveryRecordKindScalarPatch,
+		Key:   []byte("account:1"),
+		Value: []byte("7"),
+		ScalarPatch: RecoveryScalarPatchMetadata{
+			CanonicalOffset:        12,
+			OldScalarLength:        1,
+			ExpectedResultChecksum: 0x10203040,
+		},
+	}
+	entries := []RecoveryBatchEntry{entry}
+
+	legacy, _ := createTestJournalFormat(
+		t, 8<<10, RecoveryJournalFormatLegacy,
+	)
+	defer legacy.Close()
+	beforeCursor, beforeSequence := legacy.Cursor(), legacy.NextSequence()
+	if _, err := legacy.PrepareBatch(entries); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("legacy PrepareBatch = %v, want invalid write", err)
+	}
+	if _, err := legacy.AppendBatch(2, entries); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("legacy AppendBatch = %v, want invalid write", err)
+	}
+	foreignPlan, ok := prepareRecoveryBatch(
+		RecoveryJournalMinSectorSize, entries,
+	)
+	if !ok {
+		t.Fatal("scalar-format planner rejected valid entry")
+	}
+	if legacy.PreparedBatchFits(foreignPlan) {
+		t.Fatal("legacy journal accepted scalar-format prepared plan")
+	}
+	if _, err := legacy.AppendPreparedBatch(
+		2, entries, foreignPlan,
+	); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("legacy AppendPreparedBatch = %v, want invalid write", err)
+	}
+	if legacy.Cursor() != beforeCursor || legacy.NextSequence() != beforeSequence {
+		t.Fatalf("legacy rejection advanced cursor/sequence: %d/%d -> %d/%d",
+			beforeCursor, beforeSequence, legacy.Cursor(), legacy.NextSequence())
+	}
+
+	scalar, path := createTestJournalFormat(
+		t, 8<<10, RecoveryJournalFormatScalarPatch,
+	)
+	if _, err := scalar.AppendBatch(2, entries); err != nil {
+		t.Fatalf("scalar-format AppendBatch: %v", err)
+	}
+	if err := scalar.Sync(false); err != nil {
+		t.Fatalf("scalar-format Sync: %v", err)
+	}
+	if err := scalar.Close(); err != nil {
+		t.Fatalf("scalar-format Close: %v", err)
+	}
+	scalar = reopenTestJournal(t, path)
+	defer scalar.Close()
+	replayed := replayAll(t, scalar, 1)
+	if len(replayed) != 1 || len(replayed[0].Entries) != 1 ||
+		replayed[0].Entries[0].Kind != RecoveryRecordKindScalarPatch ||
+		string(replayed[0].Entries[0].Value) != "7" ||
+		replayed[0].Entries[0].ScalarPatch != entry.ScalarPatch {
+		t.Fatalf("scalar-format replay = %+v, want one scalar patch", replayed)
+	}
+}
+
+func TestRecoveryScalarPatchStrictValidation(t *testing.T) {
+	valid := RecoveryBatchEntry{
+		Kind:  RecoveryRecordKindScalarPatch,
+		Key:   []byte("key"),
+		Value: []byte("-999999999999999999"),
+		ScalarPatch: RecoveryScalarPatchMetadata{
+			CanonicalOffset:        ^uint16(0) - 18,
+			OldScalarLength:        recoveryScalarPatchMaxCanonicalBytes,
+			ExpectedResultChecksum: 0,
+		},
+	}
+	if _, ok := prepareRecoveryBatch(
+		RecoveryJournalMinSectorSize, []RecoveryBatchEntry{valid},
+	); !ok {
+		t.Fatal("valid boundary scalar patch was rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*RecoveryBatchEntry)
+	}{
+		{name: "zero old length", mutate: func(e *RecoveryBatchEntry) {
+			e.ScalarPatch.OldScalarLength = 0
+		}},
+		{name: "old scalar too long", mutate: func(e *RecoveryBatchEntry) {
+			e.ScalarPatch.OldScalarLength = recoveryScalarPatchMaxCanonicalBytes + 1
+		}},
+		{name: "removed spelling overruns window", mutate: func(e *RecoveryBatchEntry) {
+			e.ScalarPatch.CanonicalOffset = ^uint16(0)
+			e.ScalarPatch.OldScalarLength = 2
+		}},
+		{name: "new spelling overruns window", mutate: func(e *RecoveryBatchEntry) {
+			e.ScalarPatch.CanonicalOffset = ^uint16(0)
+			e.ScalarPatch.OldScalarLength = 1
+			e.Value = []byte("10")
+		}},
+		{name: "empty new scalar", mutate: func(e *RecoveryBatchEntry) {
+			e.Value = nil
+		}},
+		{name: "noncanonical integer", mutate: func(e *RecoveryBatchEntry) {
+			e.Value = []byte("01")
+		}},
+		{name: "unsupported string scalar", mutate: func(e *RecoveryBatchEntry) {
+			e.Value = []byte(`"x"`)
+		}},
+		{name: "metadata on put", mutate: func(e *RecoveryBatchEntry) {
+			e.Kind = RecoveryRecordKindPut
+			e.Value = []byte("value")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := valid
+			tc.mutate(&entry)
+			entries := []RecoveryBatchEntry{entry}
+			if _, ok := prepareRecoveryBatch(
+				RecoveryJournalMinSectorSize, entries,
+			); ok {
+				t.Fatal("invalid scalar patch prepared successfully")
+			}
+			if got := RecoveryBatchRecordPaddedSize(
+				RecoveryJournalMinSectorSize, entries,
+			); got != maxIntValue {
+				t.Fatalf("invalid scalar patch padded size = %d, want max int", got)
+			}
+		})
+	}
+}
+
+func TestRecoveryScalarPatchDecoderRejectsCorruptionAndBounds(t *testing.T) {
+	entry := RecoveryBatchEntry{
+		Kind:  RecoveryRecordKindScalarPatch,
+		Key:   []byte("account:7"),
+		Value: []byte("17"),
+		ScalarPatch: RecoveryScalarPatchMetadata{
+			CanonicalOffset:        12,
+			OldScalarLength:        2,
+			ExpectedResultChecksum: 0x12345678,
+		},
+	}
+	entries := []RecoveryBatchEntry{entry}
+	plan, ok := prepareRecoveryBatch(RecoveryJournalMinSectorSize, entries)
+	if !ok {
+		t.Fatal("prepare valid scalar patch")
+	}
+	encoded := make([]byte, plan.PaddedSize())
+	if _, err := encodeRecoveryBatchRecordPrepared(
+		encoded, RecoveryJournalMinSectorSize,
+		RecoveryRecord{
+			Sequence: 3, Generation: 4, Kind: RecoveryRecordKindBatch,
+			Entries: entries,
+		},
+		plan,
+	); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	bodyEnd := RecoveryJournalRecordPrefixSize + int(plan.bodyLen)
+	metadataAt := RecoveryJournalRecordPrefixSize + RecoveryBatchEntryHeaderSize
+	valueAt := metadataAt + RecoveryScalarPatchMetadataSize + len(entry.Key)
+	reseal := func(buf []byte) {
+		checksum := PageChecksum(buf[:bodyEnd])
+		binary.LittleEndian.PutUint32(buf[bodyEnd:bodyEnd+4], checksum)
+		binary.LittleEndian.PutUint32(buf[bodyEnd+4:bodyEnd+8], ^checksum)
+	}
+
+	tests := []struct {
+		name   string
+		reseal bool
+		mutate func([]byte)
+	}{
+		{name: "metadata checksum damage", mutate: func(buf []byte) {
+			buf[metadataAt+4] ^= 1
+		}},
+		{name: "reserved metadata byte", reseal: true, mutate: func(buf []byte) {
+			buf[metadataAt+3] = 1
+		}},
+		{name: "zero old length", reseal: true, mutate: func(buf []byte) {
+			buf[metadataAt+2] = 0
+		}},
+		{name: "offset plus old length overflow", reseal: true, mutate: func(buf []byte) {
+			binary.LittleEndian.PutUint16(buf[metadataAt:metadataAt+2], ^uint16(0))
+			buf[metadataAt+2] = 2
+		}},
+		{name: "noncanonical new scalar", reseal: true, mutate: func(buf []byte) {
+			copy(buf[valueAt:valueAt+2], "01")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			corrupt := append([]byte(nil), encoded...)
+			tc.mutate(corrupt)
+			if tc.reseal {
+				reseal(corrupt)
+			}
+			if _, _, err := DecodeRecoveryRecord(
+				corrupt, RecoveryJournalMinSectorSize, 3,
+			); !errors.Is(err, ErrRecoveryJournalRecord) {
+				t.Fatalf("corrupt scalar patch decode = %v, want record error", err)
+			}
+		})
+	}
+}
+
+func TestRecoveryScalarPatchPreparedPlanRevalidatesMetadata(t *testing.T) {
+	rj, _ := createTestJournalFormat(
+		t, 8<<10, RecoveryJournalFormatScalarPatch,
+	)
+	defer rj.Close()
+	entries := []RecoveryBatchEntry{{
+		Kind:  RecoveryRecordKindScalarPatch,
+		Key:   []byte("key"),
+		Value: []byte("1"),
+		ScalarPatch: RecoveryScalarPatchMetadata{
+			CanonicalOffset:        7,
+			OldScalarLength:        1,
+			ExpectedResultChecksum: 9,
+		},
+	}}
+	plan, err := rj.PrepareBatch(entries)
+	if err != nil {
+		t.Fatalf("PrepareBatch: %v", err)
+	}
+	entries[0].ScalarPatch.OldScalarLength = 0
+	writes := 0
+	rj.writeAt = func(p []byte, _ int64) (int, error) {
+		writes++
+		return len(p), nil
+	}
+	beforeCursor, beforeSequence := rj.Cursor(), rj.NextSequence()
+	if _, err := rj.AppendPreparedBatch(
+		2, entries, plan,
+	); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("AppendPreparedBatch with damaged metadata = %v, want invalid write", err)
+	}
+	if writes != 0 || rj.Cursor() != beforeCursor ||
+		rj.NextSequence() != beforeSequence {
+		t.Fatalf("rejected metadata wrote/advanced: writes=%d cursor=%d/%d sequence=%d/%d",
+			writes, beforeCursor, rj.Cursor(), beforeSequence, rj.NextSequence())
+	}
+}
+
+func TestRecoveryScalarPatchDowngradedHeaderFailsClosed(t *testing.T) {
+	entry := RecoveryBatchEntry{
+		Kind:  RecoveryRecordKindScalarPatch,
+		Key:   []byte("key"),
+		Value: []byte("1"),
+		ScalarPatch: RecoveryScalarPatchMetadata{
+			CanonicalOffset:        7,
+			OldScalarLength:        1,
+			ExpectedResultChecksum: 0xaabbccdd,
+		},
+	}
+	rj, path := createTestJournalFormat(
+		t, 8<<10, RecoveryJournalFormatScalarPatch,
+	)
+	if _, err := rj.AppendBatch(2, []RecoveryBatchEntry{entry}); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if err := rj.Sync(false); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := rj.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for downgrade: %v", err)
+	}
+	headerBytes := make([]byte, RecoveryJournalHeaderSize)
+	if _, err := file.ReadAt(headerBytes, 0); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	binary.LittleEndian.PutUint32(
+		headerBytes[8:12], RecoveryJournalFormatLegacy,
+	)
+	checksum := PageChecksum(headerBytes[:RecoveryJournalHeaderSize-8])
+	binary.LittleEndian.PutUint32(
+		headerBytes[RecoveryJournalHeaderSize-8:RecoveryJournalHeaderSize-4],
+		checksum,
+	)
+	binary.LittleEndian.PutUint32(
+		headerBytes[RecoveryJournalHeaderSize-4:], ^checksum,
+	)
+	if _, err := file.WriteAt(headerBytes, 0); err != nil {
+		t.Fatalf("write downgraded header: %v", err)
+	}
+	downgraded, err := DecodeRecoveryJournalHeader(headerBytes)
+	if err != nil {
+		t.Fatalf("decode downgraded header: %v", err)
+	}
+	if downgraded.FormatVersion != RecoveryJournalFormatLegacy {
+		t.Fatalf("downgraded format = %d, want legacy", downgraded.FormatVersion)
+	}
+
+	if _, err := OpenRecoveryJournal(file); !errors.Is(
+		err, ErrRecoveryJournalRecord,
+	) || errors.Is(err, errRecoveryJournalTruncatableTail) {
+		t.Fatalf("Open downgraded scalar journal = %v, want hard record error", err)
+	}
+	manager := newRecoveryJournalManager(file, downgraded)
+	if err := manager.Replay(1, func(RecoveryRecord) error {
+		t.Fatal("downgraded scalar record reached replay callback")
+		return nil
+	}); !errors.Is(err, ErrRecoveryJournalRecord) ||
+		errors.Is(err, errRecoveryJournalTruncatableTail) {
+		t.Fatalf("Replay downgraded scalar journal = %v, want hard record error", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close downgraded file: %v", err)
+	}
+}
+
+func TestRecoveryJournalSemanticDamageIsHardForScanAndReplay(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(record []byte, entry, metadata, value int)
+	}{
+		{
+			name: "unknown batch entry kind",
+			mutate: func(record []byte, entry, _, _ int) {
+				binary.LittleEndian.PutUint16(record[entry:entry+2], 0x7777)
+			},
+		},
+		{
+			name: "invalid scalar value",
+			mutate: func(record []byte, _, _, value int) {
+				copy(record[value:value+2], "01")
+			},
+		},
+		{
+			name: "reserved scalar metadata",
+			mutate: func(record []byte, _, metadata, _ int) {
+				record[metadata+3] = 1
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := RecoveryBatchEntry{
+				Kind:  RecoveryRecordKindScalarPatch,
+				Key:   []byte("account:9"),
+				Value: []byte("17"),
+				ScalarPatch: RecoveryScalarPatchMetadata{
+					CanonicalOffset:        12,
+					OldScalarLength:        2,
+					ExpectedResultChecksum: 0x12345678,
+				},
+			}
+			rj, path := createTestJournalFormat(
+				t, 8<<10, RecoveryJournalFormatScalarPatch,
+			)
+			if _, err := rj.AppendBatch(2, []RecoveryBatchEntry{entry}); err != nil {
+				t.Fatalf("AppendBatch: %v", err)
+			}
+			if err := rj.Sync(false); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			header := rj.Header()
+			if err := rj.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatalf("open for corruption: %v", err)
+			}
+			record := make([]byte, RecoveryJournalMinSectorSize)
+			if _, err := file.ReadAt(record, recoveryJournalRegionStart); err != nil {
+				t.Fatalf("read record: %v", err)
+			}
+			bodyEnd := RecoveryJournalRecordPrefixSize +
+				int(binary.LittleEndian.Uint32(record[28:32]))
+			entryAt := RecoveryJournalRecordPrefixSize
+			metadataAt := entryAt + RecoveryBatchEntryHeaderSize
+			valueAt := metadataAt + RecoveryScalarPatchMetadataSize + len(entry.Key)
+			tc.mutate(record, entryAt, metadataAt, valueAt)
+			checksum := PageChecksum(record[:bodyEnd])
+			binary.LittleEndian.PutUint32(record[bodyEnd:bodyEnd+4], checksum)
+			binary.LittleEndian.PutUint32(record[bodyEnd+4:bodyEnd+8], ^checksum)
+			if _, err := file.WriteAt(record, recoveryJournalRegionStart); err != nil {
+				t.Fatalf("write semantic corruption: %v", err)
+			}
+
+			if _, err := OpenRecoveryJournal(file); !errors.Is(
+				err, ErrRecoveryJournalRecord,
+			) || errors.Is(err, errRecoveryJournalTruncatableTail) {
+				t.Fatalf("Open semantic damage = %v, want hard record error", err)
+			}
+			manager := newRecoveryJournalManager(file, header)
+			if err := manager.Replay(1, func(RecoveryRecord) error {
+				t.Fatal("semantic damage reached replay callback")
+				return nil
+			}); !errors.Is(err, ErrRecoveryJournalRecord) ||
+				errors.Is(err, errRecoveryJournalTruncatableTail) {
+				t.Fatalf("Replay semantic damage = %v, want hard record error", err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatalf("close corrupt journal: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoveryJournalChecksumValidUnknownRecordKindIsHard(t *testing.T) {
+	rj, path := createTestJournalFormat(
+		t, 8<<10, RecoveryJournalFormatScalarPatch,
+	)
+	if _, err := rj.Append(
+		RecoveryRecordKindPut, 2, []byte("key"), []byte("value"),
+	); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := rj.Sync(false); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	header := rj.Header()
+	if err := rj.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	record := make([]byte, RecoveryJournalMinSectorSize)
+	if _, err := file.ReadAt(record, recoveryJournalRegionStart); err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	binary.LittleEndian.PutUint16(record[4:6], 0x7777)
+	bodyEnd := RecoveryJournalRecordPrefixSize +
+		int(binary.LittleEndian.Uint32(record[24:28])) +
+		int(binary.LittleEndian.Uint32(record[28:32]))
+	checksum := PageChecksum(record[:bodyEnd])
+	binary.LittleEndian.PutUint32(record[bodyEnd:bodyEnd+4], checksum)
+	binary.LittleEndian.PutUint32(record[bodyEnd+4:bodyEnd+8], ^checksum)
+	if _, err := file.WriteAt(record, recoveryJournalRegionStart); err != nil {
+		t.Fatalf("write unknown kind: %v", err)
+	}
+
+	if _, err := OpenRecoveryJournal(file); !errors.Is(
+		err, ErrRecoveryJournalRecord,
+	) || errors.Is(err, errRecoveryJournalTruncatableTail) {
+		t.Fatalf("Open unknown kind = %v, want hard record error", err)
+	}
+	manager := newRecoveryJournalManager(file, header)
+	if err := manager.Replay(1, func(RecoveryRecord) error {
+		t.Fatal("unknown record kind reached replay callback")
+		return nil
+	}); !errors.Is(err, ErrRecoveryJournalRecord) ||
+		errors.Is(err, errRecoveryJournalTruncatableTail) {
+		t.Fatalf("Replay unknown kind = %v, want hard record error", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close corrupt journal: %v", err)
 	}
 }
 
