@@ -947,12 +947,6 @@ func TestSQLLateralRemainingCorrelationShapesStayPositionedAndTyped(t *testing.T
 			marker: "a.id) d",
 		},
 		{
-			name: "correlated aggregate projection",
-			src: `SELECT a.id, d.total FROM accounts a CROSS JOIN LATERAL (` +
-				`SELECT SUM(a.id) AS total FROM items i WHERE i.owner = a.id GROUP BY a.id) d`,
-			marker: "a.id) AS total",
-		},
-		{
 			name: "correlated window key",
 			src: `SELECT a.id, d.n FROM accounts a CROSS JOIN LATERAL (` +
 				`SELECT ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY i.id) AS n ` +

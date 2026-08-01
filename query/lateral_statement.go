@@ -55,6 +55,7 @@ type statementLateral struct {
 	names        []string
 	localOutputs int
 	gates        []lateralGateExpr
+	group        lateralGroupProgram
 
 	rights        []relationSpool
 	active        []int64
@@ -82,6 +83,7 @@ type lateralClone struct {
 	projection []lateralProjection
 	gates      []lateralGateExpr
 	hidden     int
+	group      lateralGroupPlan
 }
 
 // lateralProjection is one authored SELECT item before relation-wildcard
@@ -91,6 +93,7 @@ type lateralProjection struct {
 	local   int
 	binding int
 	name    string
+	agg     sqlast.AggKind
 }
 
 // lateralOutput is one physical right-relation column after local wildcard
@@ -98,6 +101,7 @@ type lateralProjection struct {
 type lateralOutput struct {
 	local   int
 	binding int
+	agg     sqlast.AggKind
 }
 
 // lateralGateExpr is a prepared outer-only WHERE conjunct. Such a conjunct is
@@ -146,6 +150,12 @@ func prepareStatementLateral(
 			"correlated LATERAL execution supports CROSS, INNER, and LEFT joins",
 		)
 	}
+	if ref.Query.Set != nil {
+		return nil, nil, sqlast.NewFeatureNotSupportedError(
+			owner.text, spec.Pos,
+			"correlated LATERAL set expressions need one inherited APPLY frame per branch",
+		)
+	}
 
 	cloner := lateralClone{
 		text: owner.text, spec: spec, params: ref.Query.Params,
@@ -153,6 +163,7 @@ func prepareStatementLateral(
 		bindingUse: make([]bool, len(spec.Bindings)),
 		argUse:     make([]bool, len(spec.Bindings)),
 	}
+	cloner.group.program.countColumn = -1
 	if err := cloner.validateReferences(); err != nil {
 		return nil, nil, err
 	}
@@ -162,11 +173,28 @@ func prepareStatementLateral(
 	if err != nil {
 		return nil, nil, err
 	}
+	clone.GroupBy, err = cloner.cloneGroupBy(ref.Query.GroupBy)
+	if err != nil {
+		return nil, nil, err
+	}
 	clone.Where, err = cloner.cloneWhere(ref.Query.Where)
 	if err != nil {
 		return nil, nil, err
 	}
-	clone.OrderBy = cloner.cloneOrderBy(ref.Query.OrderBy)
+	clone.OrderBy, err = cloner.cloneOrderBy(ref.Query.OrderBy)
+	if err != nil {
+		return nil, nil, err
+	}
+	clone.Having, err = cloner.cloneHaving(ref.Query.Having, &clone.Columns)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cloner.validateGroupTail(ref.Query); err != nil {
+		return nil, nil, err
+	}
+	if err := cloner.finishColumns(ref.Query, &clone.Columns); err != nil {
+		return nil, nil, err
+	}
 	if err := cloner.rejectResidualLocations(ref.Query); err != nil {
 		return nil, nil, err
 	}
@@ -186,6 +214,7 @@ func prepareStatementLateral(
 		slots:      make([]lateralBindingSlot, len(spec.Bindings)),
 		argUse:     cloner.argUse,
 		gates:      cloner.gates,
+		group:      cloner.group.program,
 	}
 	for i := range spec.Bindings {
 		binding := &spec.Bindings[i]
@@ -226,34 +255,34 @@ func prepareStatementLateral(
 	return lateral, child, nil
 }
 
-// cloneOrderBy removes correlated sort keys. Every captured outer value is
-// constant during one child invocation, so such a key cannot affect row order;
-// retaining its Path would instead let the local compiler misread it.
-func (c *lateralClone) cloneOrderBy(terms []sqlast.OrderTerm) []sqlast.OrderTerm {
+// cloneOrderBy removes plain correlated sort keys. A captured grouping key is
+// constant during one child invocation, but a reduction over that value varies
+// with group cardinality and therefore needs a post-reduction sorter.
+func (c *lateralClone) cloneOrderBy(
+	terms []sqlast.OrderTerm,
+) ([]sqlast.OrderTerm, error) {
 	if len(terms) == 0 {
-		return nil
+		return nil, nil
 	}
 	clone := make([]sqlast.OrderTerm, 0, len(terms))
 	for i := range terms {
 		reference, binding, outer := c.reference(terms[i].Path)
 		if outer {
+			if c.group.synthetic {
+				return nil, sqlast.NewFeatureNotSupportedError(
+					c.text, terms[i].Path.Pos,
+					"ORDER BY on a correlated LATERAL aggregate needs post-reduction sorting",
+				)
+			}
 			c.mark(reference, binding, false)
 			continue
 		}
 		clone = append(clone, terms[i])
 	}
-	return clone
+	return clone, nil
 }
 
 func (c *lateralClone) rejectResidualLocations(query *sqlast.SelectStmt) error {
-	for _, path := range query.GroupBy {
-		if err := c.rejectPath(path, "GROUP BY"); err != nil {
-			return err
-		}
-	}
-	if err := c.rejectExpr(query.Having, "HAVING"); err != nil {
-		return err
-	}
 	for i := range query.Windows {
 		if err := c.rejectWindowSpec(&query.Windows[i].Spec); err != nil {
 			return err
@@ -344,39 +373,26 @@ func (c *lateralClone) cloneColumns(
 			columns = append(columns, *column)
 			continue
 		}
-		if column.Agg != sqlast.AggNone || column.Window != nil {
-			return nil, sqlast.NewFeatureNotSupportedError(
-				c.text, column.Path.Pos,
-				"correlated LATERAL aggregate and window projections need an expression-valued projection plan",
-			)
-		}
-		c.mark(reference, binding, false)
-		name := column.Alias
-		if name == "" {
-			name = column.Path.Spec()
-			if name == "" {
-				name = "*"
-			}
-		}
-		c.projection = append(c.projection, lateralProjection{
-			local: -1, binding: binding, name: name,
-		})
-	}
-	if len(columns) == 0 {
 		if query.Distinct {
 			return nil, sqlast.NewFeatureNotSupportedError(
-				c.text, query.Columns[0].Pos,
-				"DISTINCT over only correlated LATERAL projections needs a cardinality-only distinct operator",
+				c.text, column.Pos,
+				"DISTINCT over correlated LATERAL projections needs a cardinality-only distinct operator",
 			)
 		}
-		path := c.cardinalityPath(query.Where)
-		if path == nil {
-			path = &sqlast.PathExpr{Source: 0, Pos: query.Columns[0].Pos}
+		if column.Agg != sqlast.AggNone || column.Window != nil {
+			if column.Window != nil {
+				return nil, sqlast.NewFeatureNotSupportedError(
+					c.text, column.Path.Pos,
+					"correlated LATERAL window projections need an expression-valued projection plan",
+				)
+			}
+			c.group.synthetic = true
 		}
-		columns = append(columns, sqlast.ResultColumn{
-			Path: path, Pos: query.Columns[0].Pos,
+		c.mark(reference, binding, false)
+		name := lateralProjectionName(column)
+		c.projection = append(c.projection, lateralProjection{
+			local: -1, binding: binding, name: name, agg: column.Agg,
 		})
-		c.hidden = 1
 	}
 	return columns, nil
 }
@@ -418,19 +434,12 @@ func (l *statementLateral) finishProjection(
 	l.localOutputs = len(localNames)
 	l.outputs = make([]lateralOutput, 0, len(localNames)+len(projection))
 	l.names = make([]string, 0, len(localNames)+len(projection))
+	starts := make([]int, len(columns))
+	widths := make([]int, len(columns))
 	local := 0
-	for i := range projection {
-		item := &projection[i]
-		if item.binding >= 0 {
-			l.outputs = append(l.outputs, lateralOutput{local: -1, binding: item.binding})
-			l.names = append(l.names, item.name)
-			continue
-		}
-		if item.local < 0 || item.local >= len(columns) {
-			return fmt.Errorf("query: invalid prepared LATERAL projection map")
-		}
+	for i := range columns {
 		width := 1
-		column := &columns[item.local]
+		column := &columns[i]
 		if child.hasRelationBinding() && column.Agg == sqlast.AggNone &&
 			column.Path != nil && len(column.Path.Segments) == 0 {
 			width = len(child.relationBindingForSource(column.Path.Source).names)
@@ -438,17 +447,44 @@ func (l *statementLateral) finishProjection(
 		if width < 0 || local > len(localNames)-width {
 			return fmt.Errorf("query: LATERAL local wildcard arity is unstable")
 		}
+		starts[i], widths[i] = local, width
+		local += width
+	}
+	if local != len(localNames) {
+		return fmt.Errorf("query: LATERAL local projection arity is unstable")
+	}
+	localMapped := 0
+	for i := range projection {
+		item := &projection[i]
+		l.group.columnOutput = append(l.group.columnOutput, len(l.outputs))
+		l.group.columnWidth = append(l.group.columnWidth, 1)
+		if item.binding >= 0 {
+			l.outputs = append(l.outputs, lateralOutput{
+				local: -1, binding: item.binding, agg: item.agg,
+			})
+			l.names = append(l.names, item.name)
+			continue
+		}
+		if item.local < 0 || item.local >= len(columns) {
+			return fmt.Errorf("query: invalid prepared LATERAL projection map")
+		}
+		width := widths[item.local]
+		l.group.columnWidth[len(l.group.columnWidth)-1] = width
 		for ordinal := 0; ordinal < width; ordinal++ {
-			l.outputs = append(l.outputs, lateralOutput{local: local, binding: -1})
-			l.names = append(l.names, localNames[local])
-			local++
+			column := starts[item.local] + ordinal
+			l.outputs = append(l.outputs, lateralOutput{local: column, binding: -1})
+			l.names = append(l.names, localNames[column])
+			localMapped++
 		}
 	}
-	if hidden < 0 || local > len(localNames)-hidden || local+hidden != len(localNames) {
+	if hidden < 0 || localMapped+hidden != len(localNames) {
 		return fmt.Errorf(
 			"query: LATERAL local projection produced %d columns, mapped %d",
-			len(localNames), local,
+			len(localNames), localMapped,
 		)
+	}
+	if err := l.group.resolve(starts, widths); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1190,6 +1226,9 @@ func (l *statementLateral) materializeRights(
 		return fmt.Errorf("query: invalid LATERAL execution state")
 	}
 	l.evaluations = 0
+	if err := l.group.begin(parent.Options); err != nil {
+		return err
+	}
 	workspace := saturatedProduct(
 		int64(left.rows), int64(unsafe.Sizeof(relationSpool{})+unsafe.Sizeof(int64(0))),
 	)
@@ -1252,7 +1291,7 @@ func (l *statementLateral) materializeRights(
 			return err
 		}
 		charge, materializeErr := l.materializeRight(
-			cursor, &l.rights[row], frame, parent.Options.Cancel,
+			join, cursor, &l.rights[row], frame, parent.Options.Cancel,
 		)
 		frame.intermediate.release(resultBytes)
 		clearExecBorrowedViews(&op.exec)
@@ -1267,13 +1306,14 @@ func (l *statementLateral) materializeRights(
 }
 
 func (l *statementLateral) materializeRight(
+	join *statementRelationJoin,
 	cursor Cursor,
 	spool *relationSpool,
 	frame *statementFrame,
 	cancel *CancelFlag,
 ) (int64, error) {
 	spool.reset()
-	rows, payload, err := l.measureRight(cursor, cancel)
+	rows, payload, err := l.measureRight(join, cursor, cancel)
 	if err != nil {
 		return 0, err
 	}
@@ -1295,7 +1335,7 @@ func (l *statementLateral) materializeRight(
 		frame.intermediate.release(charge)
 		return 0, err
 	}
-	if err := l.fillRight(cursor, spool, rows, cancel); err != nil {
+	if err := l.fillRight(join, cursor, spool, rows, cancel); err != nil {
 		spool.reset()
 		frame.intermediate.release(charge)
 		return 0, err
@@ -1304,6 +1344,7 @@ func (l *statementLateral) materializeRight(
 }
 
 func (l *statementLateral) measureRight(
+	join *statementRelationJoin,
 	cursor Cursor,
 	cancel *CancelFlag,
 ) (rows int, payload int64, err error) {
@@ -1315,6 +1356,13 @@ func (l *statementLateral) measureRight(
 		if !next {
 			return rows, payload, nil
 		}
+		keep, keepErr := l.keepRightRow(join, &cursor, cancel)
+		if keepErr != nil {
+			return 0, 0, keepErr
+		}
+		if !keep {
+			continue
+		}
 		if rows == math.MaxInt {
 			return 0, 0, fmt.Errorf("query: LATERAL right row count overflows int")
 		}
@@ -1323,7 +1371,7 @@ func (l *statementLateral) measureRight(
 			if err := cancellationCheckpoint(cancel, column); err != nil {
 				return 0, 0, err
 			}
-			cell, err := l.outputCell(&cursor, column)
+			cell, err := l.outputCell(&cursor, column, cancel)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -1337,6 +1385,7 @@ func (l *statementLateral) measureRight(
 }
 
 func (l *statementLateral) fillRight(
+	join *statementRelationJoin,
 	cursor Cursor,
 	spool *relationSpool,
 	rows int,
@@ -1354,6 +1403,13 @@ func (l *statementLateral) fillRight(
 			}
 			return nil
 		}
+		keep, keepErr := l.keepRightRow(join, &cursor, cancel)
+		if keepErr != nil {
+			return keepErr
+		}
+		if !keep {
+			continue
+		}
 		if row >= rows {
 			return fmt.Errorf("query: LATERAL right relation grew during publication")
 		}
@@ -1361,7 +1417,7 @@ func (l *statementLateral) fillRight(
 			if err := cancellationCheckpoint(cancel, column); err != nil {
 				return err
 			}
-			cell, err := l.outputCell(&cursor, column)
+			cell, err := l.outputCell(&cursor, column, cancel)
 			if err != nil {
 				return err
 			}
@@ -1375,11 +1431,18 @@ func (l *statementLateral) fillRight(
 	}
 }
 
-func (l *statementLateral) outputCell(cursor *Cursor, column int) (Cell, error) {
+func (l *statementLateral) outputCell(
+	cursor *Cursor,
+	column int,
+	cancel *CancelFlag,
+) (Cell, error) {
 	if column < 0 || column >= len(l.outputs) {
 		return Cell{}, fmt.Errorf("query: LATERAL output ordinal is out of range")
 	}
 	output := &l.outputs[column]
+	if output.agg != sqlast.AggNone {
+		return l.aggregateOutputCell(cursor, output, cancel)
+	}
 	if output.local >= 0 {
 		if output.local >= l.localOutputs {
 			return Cell{}, fmt.Errorf("query: LATERAL local output ordinal is out of range")
@@ -1605,5 +1668,6 @@ func (l *statementLateral) release() {
 	for i := range l.rights {
 		l.rights[i].release()
 	}
+	l.group.release()
 	*l = statementLateral{}
 }
