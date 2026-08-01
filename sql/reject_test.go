@@ -111,7 +111,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"CAST", `SELECT a FROM t WHERE CAST(b AS text) = 1`, 22, "CAST"},
 		{"the cast operator", `SELECT a FROM t WHERE b::text = 'x'`, 23, "::"},
 		{"scalar functions", `SELECT lower(a) FROM t`, 12, "not a supported function"},
-		{"window functions", `SELECT SUM(a) OVER () FROM t`, 14, "OVER"},
 		{"arithmetic", `SELECT a FROM t WHERE b + 1 = 2`, 24, "arithmetic"},
 		{"concatenation", `SELECT a FROM t WHERE b || 'x' = 'y'`, 24, "concatenation"},
 		{"set operations", `SELECT a FROM t UNION SELECT b FROM u`, 16, "UNION"},

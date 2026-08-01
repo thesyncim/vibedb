@@ -501,6 +501,7 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	for i := range s.Columns {
 		s.Columns[i].Pos += delta
 		shiftPathPosition(s.Columns[i].Path, delta)
+		shiftWindowPositions(s.Columns[i].Window, delta)
 	}
 	for i := range s.From {
 		s.From[i].Pos += delta
@@ -539,6 +540,47 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	}
 	if s.Offset != nil {
 		s.Offset.Pos += delta
+	}
+}
+
+func shiftWindowPositions(w *WindowExpr, delta int) {
+	if w == nil {
+		return
+	}
+	w.Pos += delta
+	shiftPathPosition(w.Argument, delta)
+	if w.HasOffset {
+		w.Offset.Pos += delta
+	}
+	if w.HasBuckets {
+		w.Buckets.Pos += delta
+	}
+	if w.HasNth {
+		w.Nth.Pos += delta
+	}
+	if w.HasDefault {
+		w.Default.Pos += delta
+	}
+	w.Spec.Pos += delta
+	for _, path := range w.Spec.PartitionBy {
+		shiftPathPosition(path, delta)
+	}
+	for i := range w.Spec.OrderBy {
+		w.Spec.OrderBy[i].Pos += delta
+		shiftPathPosition(w.Spec.OrderBy[i].Path, delta)
+	}
+	if w.Spec.Frame.Explicit {
+		w.Spec.Frame.Pos += delta
+		w.Spec.Frame.Start.Pos += delta
+		if w.Spec.Frame.Start.Kind == WindowPreceding ||
+			w.Spec.Frame.Start.Kind == WindowFollowing {
+			w.Spec.Frame.Start.Offset.Pos += delta
+		}
+		w.Spec.Frame.End.Pos += delta
+		if w.Spec.Frame.End.Kind == WindowPreceding ||
+			w.Spec.Frame.End.Kind == WindowFollowing {
+			w.Spec.Frame.End.Offset.Pos += delta
+		}
 	}
 }
 

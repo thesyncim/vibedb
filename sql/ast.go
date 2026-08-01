@@ -291,6 +291,11 @@ type ResultColumn struct {
 	// which reads no path at all. A Path with no segments is the whole
 	// document — what '*' and 'alias.*' parse to.
 	Path *PathExpr
+	// Window is the analytic expression projected by this column, or nil for
+	// an ordinary path or grouped aggregate. Window arguments and sort keys
+	// retain their own paths; Path is nil for every window expression so a
+	// consumer cannot accidentally lower it as a pre-window projection.
+	Window *WindowExpr
 	// Alias is the explicit AS name, or "" when the statement gave none. It is
 	// the output header when set; how an unaliased column is headed is a
 	// lowering decision, since the header spelling belongs to the result
@@ -300,11 +305,167 @@ type ResultColumn struct {
 	Pos int
 }
 
+// WindowFunctionKind names a supported SQL window function.
+type WindowFunctionKind uint8
+
+const (
+	WindowRowNumber WindowFunctionKind = iota
+	WindowRank
+	WindowDenseRank
+	WindowLag
+	WindowLead
+	WindowCount
+	WindowSum
+	WindowAvg
+	WindowMin
+	WindowMax
+	WindowNTile
+	WindowPercentRank
+	WindowCumeDist
+	WindowFirstValue
+	WindowLastValue
+	WindowNthValue
+)
+
+// String answers the canonical SQL spelling of k.
+func (k WindowFunctionKind) String() string {
+	switch k {
+	case WindowRowNumber:
+		return "ROW_NUMBER"
+	case WindowRank:
+		return "RANK"
+	case WindowDenseRank:
+		return "DENSE_RANK"
+	case WindowLag:
+		return "LAG"
+	case WindowLead:
+		return "LEAD"
+	case WindowCount:
+		return "COUNT"
+	case WindowSum:
+		return "SUM"
+	case WindowAvg:
+		return "AVG"
+	case WindowMin:
+		return "MIN"
+	case WindowMax:
+		return "MAX"
+	case WindowNTile:
+		return "NTILE"
+	case WindowPercentRank:
+		return "PERCENT_RANK"
+	case WindowCumeDist:
+		return "CUME_DIST"
+	case WindowFirstValue:
+		return "FIRST_VALUE"
+	case WindowLastValue:
+		return "LAST_VALUE"
+	case WindowNthValue:
+		return "NTH_VALUE"
+	default:
+		return ""
+	}
+}
+
+// WindowNullOrder records an explicit NULLS modifier. Default preserves the
+// fact that the statement omitted one; lowering applies SQL's direction-based
+// default without pretending it was written.
+type WindowNullOrder uint8
+
+const (
+	WindowNullsDefault WindowNullOrder = iota
+	WindowNullsFirst
+	WindowNullsLast
+)
+
+// WindowOrderTerm is one ORDER BY key inside OVER (...).
+type WindowOrderTerm struct {
+	Path  *PathExpr
+	Desc  bool
+	Nulls WindowNullOrder
+	Pos   int
+}
+
+// WindowFrameBoundKind names one endpoint of an explicit ROWS or GROUPS frame. The
+// order is semantic and is also used to reject a start that follows its end.
+type WindowFrameBoundKind uint8
+
+const (
+	WindowUnboundedPreceding WindowFrameBoundKind = iota
+	WindowPreceding
+	WindowCurrentRow
+	WindowFollowing
+	WindowUnboundedFollowing
+)
+
+// WindowFrameBound is one frame endpoint. Offset is meaningful only for
+// PRECEDING/FOLLOWING and may be a non-negative integer placeholder.
+type WindowFrameBound struct {
+	Kind   WindowFrameBoundKind
+	Offset Operand
+	Pos    int
+}
+
+// WindowFrame is the explicit ROWS or GROUPS frame attached to an OVER clause.
+// Explicit is false when no frame was written.
+type WindowFrame struct {
+	Unit     WindowFrameUnit
+	Start    WindowFrameBound
+	End      WindowFrameBound
+	Pos      int
+	Explicit bool
+}
+
+// WindowFrameUnit selects physical-row or peer-group offsets.
+type WindowFrameUnit uint8
+
+const (
+	WindowFrameRows WindowFrameUnit = iota
+	WindowFrameGroups
+)
+
+// WindowSpec is one anonymous OVER specification. Named windows are rejected
+// explicitly because accepting their syntax without a shared definition
+// catalog would make sort reuse and scope resolution dishonest.
+type WindowSpec struct {
+	PartitionBy []*PathExpr
+	OrderBy     []WindowOrderTerm
+	Frame       WindowFrame
+	Pos         int
+}
+
+// WindowExpr is one SELECT-list window expression.
+type WindowExpr struct {
+	Kind WindowFunctionKind
+	// Argument is nil for ranking functions and COUNT(*).
+	Argument *PathExpr
+	// Offset is used by LAG/LEAD and defaults to one when HasOffset is false.
+	Offset    Operand
+	HasOffset bool
+	// Buckets is NTILE's required positive bucket count.
+	Buckets    Operand
+	HasBuckets bool
+	// Nth is NTH_VALUE's required positive one-based position.
+	Nth    Operand
+	HasNth bool
+	// Default is used by LAG/LEAD. DefaultNull distinguishes an explicitly
+	// written NULL from an absent third argument.
+	Default     Operand
+	HasDefault  bool
+	DefaultNull bool
+	Spec        WindowSpec
+	Pos         int
+}
+
 // An OrderTerm is one ORDER BY key.
 type OrderTerm struct {
 	// Path is the sort key. An ORDER BY that named a SELECT alias has already
 	// been resolved to the path that alias projects.
 	Path *PathExpr
+	// Output is the one-based SELECT-list ordinal when ORDER BY names the alias
+	// of a window expression. Zero means Path is authoritative. A one-based
+	// encoding keeps the zero value compatible with every existing AST literal.
+	Output int
 	// Desc sorts descending.
 	Desc bool
 	Pos  int

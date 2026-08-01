@@ -133,6 +133,9 @@ func (p *Parser) validate() error {
 	aggregates, projections := 0, 0
 	firstProjection := -1
 	for i := range p.out.Columns {
+		if p.out.Columns[i].Window != nil {
+			continue
+		}
 		if p.out.Columns[i].Agg == AggNone {
 			projections++
 			if firstProjection < 0 {
@@ -145,7 +148,7 @@ func (p *Parser) validate() error {
 	if grouped {
 		for i := range p.out.Columns {
 			column := &p.out.Columns[i]
-			if column.Agg != AggNone {
+			if column.Window != nil || column.Agg != AggNone {
 				continue
 			}
 			if !p.isGroupKey(column.Path) {
@@ -158,10 +161,61 @@ func (p *Parser) validate() error {
 		return p.errAt(p.out.Columns[firstProjection].Pos,
 			"a plain path cannot be selected alongside an aggregate without GROUP BY: the aggregate collapses every row into one, and the path has no single value there")
 	}
+	if err := p.validateWindows(grouped, aggregates > 0); err != nil {
+		return err
+	}
 	if err := p.validateOrder(grouped, aggregates > 0); err != nil {
 		return err
 	}
 	return p.validateHaving(grouped, aggregates > 0)
+}
+
+func (p *Parser) validateWindows(grouped, hasAggregate bool) error {
+	for i := range p.out.Columns {
+		window := p.out.Columns[i].Window
+		if window == nil {
+			continue
+		}
+		if err := p.validateWindowPath(
+			window.Argument, "window function argument", grouped, hasAggregate,
+		); err != nil {
+			return err
+		}
+		for _, path := range window.Spec.PartitionBy {
+			if err := p.validateWindowPath(path, "PARTITION BY", grouped, hasAggregate); err != nil {
+				return err
+			}
+		}
+		for j := range window.Spec.OrderBy {
+			if err := p.validateWindowPath(
+				window.Spec.OrderBy[j].Path, "window ORDER BY", grouped, hasAggregate,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Parser) validateWindowPath(
+	path *PathExpr,
+	clause string,
+	grouped, hasAggregate bool,
+) error {
+	if path == nil || !grouped && !hasAggregate {
+		return nil
+	}
+	if grouped && p.isGroupKey(path) {
+		return nil
+	}
+	if hasAggregate && !grouped {
+		return p.errfAt(path.Pos,
+			"%s path %q is unavailable after an aggregate without GROUP BY",
+			clause, path.Spec())
+	}
+	return p.errfAt(path.Pos,
+		"%s path %q is not a GROUP BY key and is unavailable to the window stage",
+		clause, path.Spec())
 }
 
 func (p *Parser) validateJoins() error {
@@ -262,6 +316,9 @@ func (p *Parser) validateOrder(grouped, hasAggregate bool) error {
 	if grouped {
 		for i := range p.out.OrderBy {
 			term := &p.out.OrderBy[i]
+			if term.Output != 0 {
+				continue
+			}
 			if !p.isGroupKey(term.Path) {
 				return p.errfAt(term.Pos,
 					"ORDER BY %q is not a GROUP BY key: grouped rows are ordered by their key",
@@ -271,12 +328,17 @@ func (p *Parser) validateOrder(grouped, hasAggregate bool) error {
 		return nil
 	}
 	if hasAggregate {
-		// query's compiler silently drops ORDER BY for a single-row aggregate
-		// result. Silently dropping a clause is worse than refusing it: the
-		// author wrote an ordering because they believed there were rows to
-		// order, and the belief, not the clause, is the mistake.
-		return p.errAt(p.out.OrderBy[0].Pos,
-			"ORDER BY has no effect on an aggregate without GROUP BY, which returns exactly one row")
+		for i := range p.out.OrderBy {
+			if p.out.OrderBy[i].Output == 0 {
+				// query's compiler silently drops ORDER BY for a single-row
+				// aggregate result. A window output may legitimately supply
+				// multiple post-aggregate rows only when it is named by Output;
+				// every ordinary path remains unavailable here.
+				return p.errAt(p.out.OrderBy[i].Pos,
+					"ORDER BY has no effect on an aggregate without GROUP BY, which returns exactly one row")
+			}
+		}
+		return nil
 	}
 	return nil
 }

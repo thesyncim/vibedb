@@ -155,6 +155,10 @@ type Parser struct {
 	// nested is allocated only when the statement contains a subquery, keeping
 	// ordinary Parser values at one pointer of added state rather than a slice.
 	nested *nestedParsers
+	// window is allocated only after OVER is encountered. Keeping every window
+	// arena and scratch slice behind one pointer preserves the ordinary parser's
+	// state size and allocation profile.
+	window *windowParserState
 	// existsProjection allows SELECT 1 (and equivalent literals) only while
 	// parsing an EXISTS body. EXISTS never observes its output value, so
 	// lowering the literal to a whole-document projection avoids inventing a
@@ -377,6 +381,9 @@ func (p *Parser) reset(src string) {
 	if p.nested != nil {
 		p.nested.used = 0
 	}
+	if p.window != nil {
+		p.window.reset()
+	}
 
 	p.lx = lexer{
 		src: src, cancel: p.cancel,
@@ -391,6 +398,37 @@ func (p *Parser) reset(src string) {
 type nestedParsers struct {
 	parsers []*Parser
 	used    int
+}
+
+type windowParserState struct {
+	exprs      chunkArena[WindowExpr]
+	pathRuns   chunkArena[*PathExpr]
+	orderRuns  chunkArena[WindowOrderTerm]
+	partitions []*PathExpr
+	orders     []WindowOrderTerm
+	sized      bool
+}
+
+func (w *windowParserState) reset() {
+	if !w.sized {
+		w.exprs.first = 4
+		w.pathRuns.first = 8
+		w.orderRuns.first = 8
+		w.sized = true
+	}
+	w.exprs.rewind()
+	w.pathRuns.rewind()
+	w.orderRuns.rewind()
+	w.partitions = w.partitions[:0]
+	w.orders = w.orders[:0]
+}
+
+func (p *Parser) windowState() *windowParserState {
+	if p.window == nil {
+		p.window = new(windowParserState)
+		p.window.reset()
+	}
+	return p.window
 }
 
 // Release drops every chunk p retains, returning it to its zero state and
@@ -580,7 +618,7 @@ func (p *Parser) parseStatement() error {
 				break
 			}
 		}
-		if !hasAggregate {
+		if !hasAggregate && !p.hasWindowColumns() {
 			p.groupBy = p.groupBy[:0]
 			for i := range p.out.Columns {
 				if p.out.Columns[i].Path != nil {
@@ -644,7 +682,10 @@ func (p *Parser) expectEnd() error {
 	case p.atKeyword(kwUnion), p.atKeyword(kwIntersect), p.atKeyword(kwExcept):
 		return p.errHere("set operations (UNION, INTERSECT, EXCEPT) are not supported")
 	case p.atKeyword(kwWindow):
-		return p.errHere("window functions are not supported")
+		return newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"named WINDOW clauses are not supported; repeat the anonymous OVER (...) specification",
+		)
 	}
 	if p.tok.kind == tokSemicolon {
 		p.advance()
@@ -724,25 +765,51 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		col.Alias = alias
 		return col, nil
 	}
-	switch agg, head, state := p.tryAggregate(); state {
-	case aggCall:
-		path, err := p.parseAggregateArgs(agg)
-		if err != nil {
-			return col, err
+	if kind, ok := windowOnlyFunctionOf(p.tok.kw); ok {
+		head := p.tok
+		p.advance()
+		if p.tok.kind == tokLParen {
+			window, err := p.parseWindowOnlyCall(kind, head.pos)
+			if err != nil {
+				return col, err
+			}
+			col.Window = window
+		} else {
+			path, err := p.continuePath(head, true)
+			if err != nil {
+				return col, err
+			}
+			col.Path = path
 		}
-		col.Agg, col.Path = agg, path
-	case aggHeadOnly:
-		path, err := p.continuePath(head, true)
-		if err != nil {
-			return col, err
+	} else {
+		switch agg, head, state := p.tryAggregate(); state {
+		case aggCall:
+			path, err := p.parseAggregateArgs(agg)
+			if err != nil {
+				return col, err
+			}
+			if p.atKeyword(kwOver) {
+				window, err := p.parseWindowOver(windowAggregateKind(agg), path, col.Pos)
+				if err != nil {
+					return col, err
+				}
+				col.Window = window
+			} else {
+				col.Agg, col.Path = agg, path
+			}
+		case aggHeadOnly:
+			path, err := p.continuePath(head, true)
+			if err != nil {
+				return col, err
+			}
+			col.Path = path
+		default:
+			path, err := p.parseSelectPath()
+			if err != nil {
+				return col, err
+			}
+			col.Path = path
 		}
-		col.Path = path
-	default:
-		path, err := p.parseSelectPath()
-		if err != nil {
-			return col, err
-		}
-		col.Path = path
 	}
 	alias, err := p.parseColumnAlias()
 	if err != nil {
@@ -797,9 +864,6 @@ func (p *Parser) parseAggregateArgs(agg AggKind) (*PathExpr, error) {
 // a missing comma between two projected paths — as a rename, and a schemaless
 // engine has no schema check downstream to catch it.
 func (p *Parser) parseColumnAlias() (string, error) {
-	if p.atKeyword(kwOver) {
-		return "", p.errHere("window functions (OVER) are not supported: the engine reduces groups and has no frame")
-	}
 	if p.acceptKeyword(kwAs) {
 		return p.parseAliasName("an output name after AS")
 	}
@@ -807,6 +871,417 @@ func (p *Parser) parseColumnAlias() (string, error) {
 		return "", p.errfHere("unexpected identifier %q after a column: an output name requires AS, and two paths need a comma between them", p.tok.text)
 	}
 	return "", nil
+}
+
+func (p *Parser) hasWindowColumns() bool {
+	for i := range p.columns {
+		if p.columns[i].Window != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func windowOnlyFunctionOf(kw keyword) (WindowFunctionKind, bool) {
+	switch kw {
+	case kwRowNumber:
+		return WindowRowNumber, true
+	case kwRank:
+		return WindowRank, true
+	case kwDenseRank:
+		return WindowDenseRank, true
+	case kwNtile:
+		return WindowNTile, true
+	case kwPercentRank:
+		return WindowPercentRank, true
+	case kwCumeDist:
+		return WindowCumeDist, true
+	case kwFirstValue:
+		return WindowFirstValue, true
+	case kwLastValue:
+		return WindowLastValue, true
+	case kwNthValue:
+		return WindowNthValue, true
+	case kwLag:
+		return WindowLag, true
+	case kwLead:
+		return WindowLead, true
+	default:
+		return 0, false
+	}
+}
+
+func windowAggregateKind(agg AggKind) WindowFunctionKind {
+	switch agg {
+	case AggCount:
+		return WindowCount
+	case AggSum:
+		return WindowSum
+	case AggAvg:
+		return WindowAvg
+	case AggMin:
+		return WindowMin
+	default:
+		return WindowMax
+	}
+}
+
+func (p *Parser) parseWindowOnlyCall(
+	kind WindowFunctionKind,
+	pos int,
+) (*WindowExpr, error) {
+	p.advance() // '('
+	w := p.windowState().exprs.one()
+	*w = WindowExpr{Kind: kind, Pos: pos}
+	switch kind {
+	case WindowRowNumber, WindowRank, WindowDenseRank,
+		WindowPercentRank, WindowCumeDist:
+		if p.tok.kind != tokRParen {
+			return nil, p.errfHere("%s takes no arguments", kind)
+		}
+	case WindowNTile:
+		buckets, err := p.parsePositiveWindowCount("NTILE bucket count")
+		if err != nil {
+			return nil, err
+		}
+		w.Buckets, w.HasBuckets = buckets, true
+	case WindowFirstValue, WindowLastValue:
+		argument, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		w.Argument = argument
+	case WindowNthValue:
+		argument, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		w.Argument = argument
+		if err := p.expect(tokComma, "',' between NTH_VALUE arguments"); err != nil {
+			return nil, err
+		}
+		nth, err := p.parsePositiveWindowCount("NTH_VALUE position")
+		if err != nil {
+			return nil, err
+		}
+		w.Nth, w.HasNth = nth, true
+	case WindowLag, WindowLead:
+		argument, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		w.Argument = argument
+		if p.tok.kind == tokComma {
+			p.advance()
+			offset, err := p.parseWindowCount(kind.String() + " offset")
+			if err != nil {
+				return nil, err
+			}
+			w.Offset, w.HasOffset = offset, true
+			if p.tok.kind == tokComma {
+				p.advance()
+				value, isNull, err := p.parseWindowDefault()
+				if err != nil {
+					return nil, err
+				}
+				w.Default, w.DefaultNull, w.HasDefault = value, isNull, true
+			}
+		}
+	}
+	if err := p.expect(tokRParen, "')'"); err != nil {
+		return nil, err
+	}
+	if !p.atKeyword(kwOver) {
+		return nil, p.errfHere("%s is a window function and requires OVER (...)", kind)
+	}
+	if err := p.parseWindowSpec(w); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (p *Parser) parseWindowOver(
+	kind WindowFunctionKind,
+	argument *PathExpr,
+	pos int,
+) (*WindowExpr, error) {
+	w := p.windowState().exprs.one()
+	*w = WindowExpr{Kind: kind, Argument: argument, Pos: pos}
+	if err := p.parseWindowSpec(w); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (p *Parser) parseWindowSpec(w *WindowExpr) error {
+	w.Spec.Pos = p.tok.pos
+	p.advance() // OVER
+	if p.tok.kind != tokLParen {
+		if p.tok.kind == tokIdent || p.tok.kind == tokQuotedIdent {
+			return newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"named windows are not supported; write the specification as OVER (...) instead",
+			)
+		}
+		return p.errHere("expected '(' after OVER")
+	}
+	p.advance()
+	state := p.windowState()
+	partitionBase, orderBase := len(state.partitions), len(state.orders)
+	if p.acceptKeyword(kwPartition) {
+		if err := p.expectKeyword(kwBy, "BY after PARTITION"); err != nil {
+			return err
+		}
+		for {
+			path, err := p.parseKeyPath(
+				"PARTITION BY cannot contain an aggregate or window function",
+			)
+			if err != nil {
+				return err
+			}
+			state.partitions = append(state.partitions, path)
+			if len(state.partitions)-partitionBase > maxClauseItems {
+				return p.errfAt(path.Pos, "PARTITION BY may hold at most %d keys", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	if p.acceptKeyword(kwOrder) {
+		if err := p.expectKeyword(kwBy, "BY after ORDER"); err != nil {
+			return err
+		}
+		for {
+			term, err := p.parseWindowOrderTerm()
+			if err != nil {
+				return err
+			}
+			state.orders = append(state.orders, term)
+			if len(state.orders)-orderBase > maxClauseItems {
+				return p.errfAt(term.Pos, "window ORDER BY may hold at most %d keys", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	if p.atKeyword(kwRange) {
+		return newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"RANGE window frames are not supported; write ROWS or GROUPS explicitly",
+		)
+	}
+	if p.atKeyword(kwRows) || p.atKeyword(kwGroups) {
+		unit := WindowFrameRows
+		if p.atKeyword(kwGroups) {
+			unit = WindowFrameGroups
+		}
+		frame, err := p.parseWindowFrame(unit)
+		if err != nil {
+			return err
+		}
+		if unit == WindowFrameGroups && len(state.orders) == orderBase {
+			return p.errAt(frame.Pos, "a GROUPS window frame requires ORDER BY")
+		}
+		w.Spec.Frame = frame
+	}
+	if p.atKeyword(kwExclude) {
+		return newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"window frame exclusion is not supported",
+		)
+	}
+	if err := p.expect(tokRParen, "')' after the window specification"); err != nil {
+		return err
+	}
+	partitions := state.partitions[partitionBase:]
+	if len(partitions) != 0 {
+		run := state.pathRuns.allocDirty(len(partitions))
+		copy(run, partitions)
+		w.Spec.PartitionBy = run
+	}
+	orders := state.orders[orderBase:]
+	if len(orders) != 0 {
+		run := state.orderRuns.allocDirty(len(orders))
+		copy(run, orders)
+		w.Spec.OrderBy = run
+	}
+	state.partitions = state.partitions[:partitionBase]
+	state.orders = state.orders[:orderBase]
+	return nil
+}
+
+func (p *Parser) parseWindowOrderTerm() (WindowOrderTerm, error) {
+	term := WindowOrderTerm{Pos: p.tok.pos}
+	if p.tok.kind == tokNumber {
+		return term, p.errHere("window ORDER BY does not accept an output position; name the input path")
+	}
+	path, err := p.parseKeyPath(
+		"window ORDER BY cannot contain an aggregate or window function",
+	)
+	if err != nil {
+		return term, err
+	}
+	term.Path = path
+	if p.acceptKeyword(kwAsc) {
+	} else if p.acceptKeyword(kwDesc) {
+		term.Desc = true
+	}
+	if p.acceptKeyword(kwNulls) {
+		switch {
+		case p.acceptKeyword(kwFirst):
+			term.Nulls = WindowNullsFirst
+		case p.acceptKeyword(kwLast):
+			term.Nulls = WindowNullsLast
+		default:
+			return term, p.errHere("expected FIRST or LAST after NULLS")
+		}
+	}
+	if p.atKeyword(kwCollate) {
+		return term, p.errHere("COLLATE is not supported: strings compare by decoded content")
+	}
+	return term, nil
+}
+
+func (p *Parser) parseWindowFrame(unit WindowFrameUnit) (WindowFrame, error) {
+	frame := WindowFrame{Unit: unit, Pos: p.tok.pos, Explicit: true}
+	unitName := "ROWS"
+	if unit == WindowFrameGroups {
+		unitName = "GROUPS"
+	}
+	p.advance() // ROWS or GROUPS
+	if p.acceptKeyword(kwBetween) {
+		start, err := p.parseWindowFrameBound()
+		if err != nil {
+			return frame, err
+		}
+		if start.Kind == WindowUnboundedFollowing {
+			return frame, p.errfAt(start.Pos, "a %s frame cannot start at UNBOUNDED FOLLOWING", unitName)
+		}
+		if err := p.expectKeyword(kwAnd, "AND between window frame bounds"); err != nil {
+			return frame, err
+		}
+		end, err := p.parseWindowFrameBound()
+		if err != nil {
+			return frame, err
+		}
+		if end.Kind == WindowUnboundedPreceding {
+			return frame, p.errfAt(end.Pos, "a %s frame cannot end at UNBOUNDED PRECEDING", unitName)
+		}
+		frame.Start, frame.End = start, end
+		return frame, p.validateStaticWindowFrame(frame)
+	}
+	start, err := p.parseWindowFrameBound()
+	if err != nil {
+		return frame, err
+	}
+	if start.Kind == WindowUnboundedFollowing {
+		return frame, p.errfAt(start.Pos, "a %s frame cannot start at UNBOUNDED FOLLOWING", unitName)
+	}
+	frame.Start = start
+	frame.End = WindowFrameBound{Kind: WindowCurrentRow, Pos: start.Pos}
+	return frame, p.validateStaticWindowFrame(frame)
+}
+
+func (p *Parser) parseWindowFrameBound() (WindowFrameBound, error) {
+	bound := WindowFrameBound{Pos: p.tok.pos}
+	switch {
+	case p.acceptKeyword(kwUnbounded):
+		switch {
+		case p.acceptKeyword(kwPreceding):
+			bound.Kind = WindowUnboundedPreceding
+		case p.acceptKeyword(kwFollowing):
+			bound.Kind = WindowUnboundedFollowing
+		default:
+			return bound, p.errHere("expected PRECEDING or FOLLOWING after UNBOUNDED")
+		}
+		return bound, nil
+	case p.acceptKeyword(kwCurrent):
+		if err := p.expectKeyword(kwRow, "ROW after CURRENT"); err != nil {
+			return bound, err
+		}
+		bound.Kind = WindowCurrentRow
+		return bound, nil
+	}
+	offset, err := p.parseWindowCount("window frame offset")
+	if err != nil {
+		return bound, err
+	}
+	bound.Offset = offset
+	switch {
+	case p.acceptKeyword(kwPreceding):
+		bound.Kind = WindowPreceding
+	case p.acceptKeyword(kwFollowing):
+		bound.Kind = WindowFollowing
+	default:
+		return bound, p.errHere("expected PRECEDING or FOLLOWING after a window frame offset")
+	}
+	return bound, nil
+}
+
+func (p *Parser) parseWindowCount(clause string) (Operand, error) {
+	if p.tok.kind != tokNumber && p.tok.kind != tokParam {
+		return Operand{}, p.errfHere("expected a non-negative integer or '?' for %s", clause)
+	}
+	if p.tok.kind == tokNumber {
+		text := p.tok.text
+		if _, err := strconv.ParseInt(text, 10, 64); err != nil || text[0] == '-' {
+			return Operand{}, p.errfHere("%s must be a non-negative whole number that fits in 64 bits", clause)
+		}
+	}
+	return p.parseOperand()
+}
+
+func (p *Parser) parsePositiveWindowCount(clause string) (Operand, error) {
+	value, err := p.parseWindowCount(clause)
+	if err != nil {
+		return Operand{}, err
+	}
+	if value.Kind == OperandNumber {
+		n, _ := strconv.ParseInt(value.Text, 10, 64)
+		if n == 0 {
+			return Operand{}, p.errfAt(value.Pos, "%s must be greater than zero", clause)
+		}
+	}
+	return value, nil
+}
+
+func (p *Parser) parseWindowDefault() (Operand, bool, error) {
+	if p.atKeyword(kwNull) {
+		pos := p.tok.pos
+		p.advance()
+		return Operand{Pos: pos}, true, nil
+	}
+	value, err := p.parseOperand()
+	return value, false, err
+}
+
+func (p *Parser) validateStaticWindowFrame(frame WindowFrame) error {
+	unitName := "ROWS"
+	if frame.Unit == WindowFrameGroups {
+		unitName = "GROUPS"
+	}
+	if frame.Start.Kind > frame.End.Kind {
+		return p.errfAt(frame.End.Pos, "a %s frame end cannot precede its start", unitName)
+	}
+	if frame.Start.Kind != frame.End.Kind ||
+		(frame.Start.Kind != WindowPreceding && frame.Start.Kind != WindowFollowing) ||
+		frame.Start.Offset.Kind != OperandNumber || frame.End.Offset.Kind != OperandNumber {
+		return nil
+	}
+	left, _ := strconv.ParseInt(frame.Start.Offset.Text, 10, 64)
+	right, _ := strconv.ParseInt(frame.End.Offset.Text, 10, 64)
+	if frame.Start.Kind == WindowPreceding {
+		if left < right {
+			return p.errfAt(frame.End.Pos, "a %s frame end cannot precede its start", unitName)
+		}
+	} else if left > right {
+		return p.errfAt(frame.End.Pos, "a %s frame end cannot precede its start", unitName)
+	}
+	return nil
 }
 
 // parseAliasName reads an alias identifier, quoted or not. A keyword is
@@ -1224,7 +1699,7 @@ func (p *Parser) parseOrderTerm() (OrderTerm, error) {
 	if err != nil {
 		return term, err
 	}
-	term.Path = p.resolveOrderAlias(path)
+	term.Path, term.Output = p.resolveOrderAlias(path)
 	switch {
 	case p.acceptKeyword(kwAsc):
 	case p.acceptKeyword(kwDesc):
@@ -1249,23 +1724,29 @@ func (p *Parser) parseOrderTerm() (OrderTerm, error) {
 // belong to. The path just parsed is dropped from the pending list — it is the
 // last entry, since nothing else has been parsed since — so resolution does not
 // later try to bind an identifier that turned out to be an alias.
-func (p *Parser) resolveOrderAlias(path *PathExpr) *PathExpr {
+func (p *Parser) resolveOrderAlias(path *PathExpr) (*PathExpr, int) {
 	last := len(p.pending) - 1
 	if last < 0 || p.pending[last].path != path {
-		return path
+		return path, 0
 	}
 	if p.pending[last].eligible || len(path.Segments) != 1 {
-		return path
+		return path, 0
 	}
 	name := path.Segments[0].Key
 	for i := range p.columns {
-		if p.columns[i].Alias != name || p.columns[i].Path == nil {
+		if p.columns[i].Alias != name {
 			continue
 		}
 		p.pending = p.pending[:last]
-		return p.columns[i].Path
+		if p.columns[i].Window != nil {
+			return nil, i + 1
+		}
+		if p.columns[i].Path != nil {
+			return p.columns[i].Path, 0
+		}
+		return path, 0
 	}
-	return path
+	return path, 0
 }
 
 func (p *Parser) parseLimitOffset() error {

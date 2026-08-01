@@ -75,7 +75,7 @@ func (s *Statement) lower(args []any) error {
 		p, err = c.compilePlan(&s.q)
 		if err == nil {
 			s.q.built = c.outcome(p, nil)
-			s.cached = s.params == 0 && s.nested == nil
+			s.cached = s.canCacheLowering()
 			s.lowerErr = nil
 			return nil
 		}
@@ -91,7 +91,7 @@ func (s *Statement) lower(args []any) error {
 	// binding (a bad type, an invalid Number, or a negative LIMIT/OFFSET).
 	// Keep that statement reusable so a rejected execution cannot poison the
 	// next valid bind.
-	s.cached = s.params == 0 && s.nested == nil
+	s.cached = s.canCacheLowering()
 	s.lowerErr = err
 	return err
 }
@@ -99,6 +99,9 @@ func (s *Statement) lower(args []any) error {
 // build lowers every clause of the parsed statement into the builder state the
 // compiler is about to read.
 func (s *Statement) build(args []any) error {
+	if window := s.window(); window != nil {
+		return s.buildWindow(window, args)
+	}
 	if err := s.buildColumns(); err != nil {
 		return err
 	}
@@ -117,6 +120,55 @@ func (s *Statement) build(args []any) error {
 	return s.buildLimit(args)
 }
 
+func (s *Statement) canCacheLowering() bool {
+	if s.params != 0 {
+		return false
+	}
+	return s.nested == nil || s.window() != nil
+}
+
+func (s *Statement) buildWindow(w *statementWindow, args []any) error {
+	if err := w.bind(s, args); err != nil {
+		return err
+	}
+	for i := range w.outputs {
+		output := &w.outputs[i]
+		s.q.columns = append(s.q.columns, Column{
+			spec: w.ordinalSpec[output.ordinal], header: output.name,
+		})
+	}
+	if s.tree.Distinct {
+		for i := range w.outputs {
+			s.q.groupBy = append(s.q.groupBy, w.ordinalSpec[w.outputs[i].ordinal])
+		}
+	}
+	for i := range s.tree.OrderBy {
+		term := &s.tree.OrderBy[i]
+		ordinal := -1
+		if term.Output != 0 {
+			column := term.Output - 1
+			if column < 0 || column >= len(w.outputStart) {
+				return fmt.Errorf("query: window ORDER BY output is outside the SELECT list")
+			}
+			ordinal = w.outputs[w.outputStart[column]].ordinal
+		} else {
+			ordinal = w.inputOrdinal(term.Path)
+		}
+		if ordinal < 0 || ordinal >= len(w.ordinalSpec) {
+			return fmt.Errorf("query: window ORDER BY path has no input column")
+		}
+		direction := Asc
+		if term.Desc {
+			direction = Desc
+		}
+		s.q.orderBy = append(s.q.orderBy, orderSpec{
+			path: w.ordinalSpec[ordinal], dir: direction,
+		})
+	}
+	s.having.reset()
+	return s.buildLimit(args)
+}
+
 // Collection returns the name of the driving collection — the FROM entry. A
 // statement always has one, because the parser requires FROM.
 func (s *Statement) Collection() string {
@@ -127,6 +179,9 @@ func (s *Statement) Collection() string {
 }
 
 func (s *Statement) resolveDrivingCollection() string {
+	if window := s.window(); window != nil {
+		return window.input.Collection()
+	}
 	if join := s.relationJoin(); join != nil {
 		return join.drivingCollection()
 	}
@@ -219,7 +274,7 @@ func (s *Statement) buildOrderBy() error {
 // yet had the chance to reject.
 func (s *Statement) buildLimit(args []any) error {
 	s.offset, s.limit, s.hasLimit = 0, 0, false
-	s.driverLimit = s.tree.Having != nil
+	s.driverLimit = s.tree.Having != nil && s.window() == nil
 	if s.tree.Offset != nil {
 		n, err := s.count(*s.tree.Offset, args, "OFFSET")
 		if err != nil {

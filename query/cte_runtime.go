@@ -295,6 +295,9 @@ func (s *Statement) resolveDrivingPredicate() *sqlast.Expr {
 	if s == nil || s.tree == nil {
 		return nil
 	}
+	if window := s.window(); window != nil {
+		return window.input.DrivingPredicate()
+	}
 	if s.relationJoin() != nil {
 		return nil
 	}
@@ -468,6 +471,9 @@ func (d *statementCTE) cleanupChild(frame *statementFrame) {
 }
 
 func (s *Statement) releaseRelations(frame *statementFrame) {
+	if window := s.window(); window != nil {
+		window.releaseExecution(frame)
+	}
 	if join := s.relationJoin(); join != nil {
 		join.releaseExecution(frame)
 	}
@@ -489,6 +495,9 @@ func (s *Statement) releaseCTEReference(frame *statementFrame) {
 }
 
 func (s *Statement) discardRelations() {
+	if window := s.window(); window != nil {
+		window.discardExecution()
+	}
 	if join := s.relationJoin(); join != nil {
 		join.discardExecution()
 	}

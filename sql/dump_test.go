@@ -81,7 +81,11 @@ func dumpStmt(s *SelectStmt) string {
 		b.WriteString(" order")
 		for i := range s.OrderBy {
 			b.WriteByte(' ')
-			dumpPath(&b, s.OrderBy[i].Path)
+			if s.OrderBy[i].Output != 0 {
+				fmt.Fprintf(&b, "output(%d)", s.OrderBy[i].Output-1)
+			} else {
+				dumpPath(&b, s.OrderBy[i].Path)
+			}
 			if s.OrderBy[i].Desc {
 				b.WriteString(":desc")
 			} else {
@@ -105,6 +109,8 @@ func dumpStmt(s *SelectStmt) string {
 
 func dumpColumn(b *strings.Builder, c *ResultColumn) {
 	switch {
+	case c.Window != nil:
+		dumpWindow(b, c.Window)
 	case c.Agg == AggNone:
 		b.WriteString("path(")
 		dumpPath(b, c.Path)
@@ -119,6 +125,98 @@ func dumpColumn(b *strings.Builder, c *ResultColumn) {
 	}
 	if c.Alias != "" {
 		fmt.Fprintf(b, " as %s", c.Alias)
+	}
+}
+
+func dumpWindow(b *strings.Builder, w *WindowExpr) {
+	b.WriteString(strings.ToLower(w.Kind.String()))
+	b.WriteByte('(')
+	if w.Argument != nil {
+		dumpPath(b, w.Argument)
+	} else if w.Kind == WindowCount {
+		b.WriteByte('*')
+	}
+	if w.Kind == WindowLag || w.Kind == WindowLead {
+		if w.HasOffset {
+			b.WriteByte(',')
+			dumpOperand(b, w.Offset)
+		}
+		if w.HasDefault {
+			b.WriteByte(',')
+			if w.DefaultNull {
+				b.WriteString("null")
+			} else {
+				dumpOperand(b, w.Default)
+			}
+		}
+	}
+	if w.HasBuckets {
+		dumpOperand(b, w.Buckets)
+	}
+	if w.HasNth {
+		b.WriteByte(',')
+		dumpOperand(b, w.Nth)
+	}
+	b.WriteString(") over(")
+	if len(w.Spec.PartitionBy) != 0 {
+		b.WriteString("partition")
+		for _, path := range w.Spec.PartitionBy {
+			b.WriteByte(' ')
+			dumpPath(b, path)
+		}
+	}
+	if len(w.Spec.OrderBy) != 0 {
+		if len(w.Spec.PartitionBy) != 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString("order")
+		for i := range w.Spec.OrderBy {
+			term := &w.Spec.OrderBy[i]
+			b.WriteByte(' ')
+			dumpPath(b, term.Path)
+			if term.Desc {
+				b.WriteString(":desc")
+			} else {
+				b.WriteString(":asc")
+			}
+			switch term.Nulls {
+			case WindowNullsFirst:
+				b.WriteString(":nulls-first")
+			case WindowNullsLast:
+				b.WriteString(":nulls-last")
+			}
+		}
+	}
+	if w.Spec.Frame.Explicit {
+		if len(w.Spec.PartitionBy) != 0 || len(w.Spec.OrderBy) != 0 {
+			b.WriteByte(' ')
+		}
+		if w.Spec.Frame.Unit == WindowFrameGroups {
+			b.WriteString("groups ")
+		} else {
+			b.WriteString("rows ")
+		}
+		dumpWindowBound(b, w.Spec.Frame.Start)
+		b.WriteString(" to ")
+		dumpWindowBound(b, w.Spec.Frame.End)
+	}
+	b.WriteByte(')')
+}
+
+func dumpWindowBound(b *strings.Builder, bound WindowFrameBound) {
+	switch bound.Kind {
+	case WindowUnboundedPreceding:
+		b.WriteString("unbounded-preceding")
+	case WindowPreceding:
+		dumpOperand(b, bound.Offset)
+		b.WriteString("-preceding")
+	case WindowCurrentRow:
+		b.WriteString("current-row")
+	case WindowFollowing:
+		dumpOperand(b, bound.Offset)
+		b.WriteString("-following")
+	case WindowUnboundedFollowing:
+		b.WriteString("unbounded-following")
 	}
 }
 

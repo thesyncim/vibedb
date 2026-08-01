@@ -40,6 +40,11 @@ func FuzzParseSQL(f *testing.F) {
 		`WITH active(id) AS MATERIALIZED (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS NOT MATERIALIZED (SELECT id FROM active) SELECT id FROM selected WHERE id = ?`,
 		`WITH outer_cte AS (WITH inner_cte AS (SELECT id FROM docs) SELECT id FROM inner_cte) SELECT id FROM outer_cte`,
+		`SELECT team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), ` +
+			`SUM(score) OVER (PARTITION BY team ORDER BY score ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`,
+		`SELECT LAG(value, ?, NULL) OVER (ORDER BY seq NULLS FIRST) FROM events`,
+		`SELECT NTILE(?) OVER (ORDER BY score), PERCENT_RANK() OVER (ORDER BY score), ` +
+			`NTH_VALUE(value, 2) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -179,6 +184,19 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		checkPath(t, s, ref.On.Right)
 	}
 	for i := range s.Columns {
+		if window := s.Columns[i].Window; window != nil {
+			if s.Columns[i].Path != nil || s.Columns[i].Agg != AggNone {
+				t.Fatalf("Columns[%d] mixes a window with an ordinary expression", i)
+			}
+			checkPath(t, s, window.Argument)
+			for _, path := range window.Spec.PartitionBy {
+				checkPath(t, s, path)
+			}
+			for j := range window.Spec.OrderBy {
+				checkPath(t, s, window.Spec.OrderBy[j].Path)
+			}
+			continue
+		}
 		if s.Columns[i].Path == nil {
 			if s.Columns[i].Agg != AggCount {
 				t.Fatalf("Columns[%d] has no path and is not COUNT(*)", i)
@@ -191,7 +209,11 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		checkPath(t, s, key)
 	}
 	for i := range s.OrderBy {
-		checkPath(t, s, s.OrderBy[i].Path)
+		if s.OrderBy[i].Output == 0 {
+			checkPath(t, s, s.OrderBy[i].Path)
+		} else if s.OrderBy[i].Output > len(s.Columns) {
+			t.Fatalf("OrderBy[%d] output %d is outside SELECT list", i, s.OrderBy[i].Output)
+		}
 	}
 	if s.Where != nil {
 		seen += checkExpr(t, s, s.Where, false)

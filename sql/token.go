@@ -75,7 +75,10 @@ const (
 	kwCount
 	kwCreate
 	kwCross
+	kwCumeDist
+	kwCurrent
 	kwDefault
+	kwDenseRank
 	kwDelete
 	kwDesc
 	kwDistinct
@@ -83,14 +86,18 @@ const (
 	kwDrop
 	kwEscape
 	kwExcept
+	kwExclude
 	kwExplain
 	kwExists
 	kwFalse
 	kwFetch
 	kwFirst
+	kwFirstValue
+	kwFollowing
 	kwFrom
 	kwFull
 	kwGroup
+	kwGroups
 	kwHaving
 	kwIf
 	kwIlike
@@ -104,8 +111,11 @@ const (
 	kwJoin
 	kwKey
 	kwLast
+	kwLastValue
 	kwLateral
+	kwLag
 	kwLeft
+	kwLead
 	kwLike
 	kwLimit
 	kwMaterialized
@@ -115,6 +125,8 @@ const (
 	kwMissing
 	kwNatural
 	kwNot
+	kwNthValue
+	kwNtile
 	kwNull
 	kwNulls
 	kwNothing
@@ -124,11 +136,19 @@ const (
 	kwOrder
 	kwOuter
 	kwOver
+	kwPartition
+	kwPercentRank
 	kwPrimary
+	kwPreceding
+	kwRange
+	kwRank
 	kwReplace
 	kwRecursive
 	kwReturning
 	kwRight
+	kwRow
+	kwRows
+	kwRowNumber
 	kwSelect
 	kwSet
 	kwSimilar
@@ -137,6 +157,7 @@ const (
 	kwTruncate
 	kwTrue
 	kwUnion
+	kwUnbounded
 	kwUnique
 	kwUpdate
 	kwUsing
@@ -205,8 +226,14 @@ func keywordOf(s string) keyword {
 		return kwCreate
 	case "CROSS":
 		return kwCross
+	case "CUME_DIST":
+		return kwCumeDist
+	case "CURRENT":
+		return kwCurrent
 	case "DEFAULT":
 		return kwDefault
+	case "DENSE_RANK":
+		return kwDenseRank
 	case "DELETE":
 		return kwDelete
 	case "DESC":
@@ -221,6 +248,8 @@ func keywordOf(s string) keyword {
 		return kwEscape
 	case "EXCEPT":
 		return kwExcept
+	case "EXCLUDE":
+		return kwExclude
 	case "EXPLAIN":
 		return kwExplain
 	case "EXISTS":
@@ -231,12 +260,18 @@ func keywordOf(s string) keyword {
 		return kwFetch
 	case "FIRST":
 		return kwFirst
+	case "FIRST_VALUE":
+		return kwFirstValue
+	case "FOLLOWING":
+		return kwFollowing
 	case "FROM":
 		return kwFrom
 	case "FULL":
 		return kwFull
 	case "GROUP":
 		return kwGroup
+	case "GROUPS":
+		return kwGroups
 	case "HAVING":
 		return kwHaving
 	case "IF":
@@ -263,10 +298,16 @@ func keywordOf(s string) keyword {
 		return kwKey
 	case "LAST":
 		return kwLast
+	case "LAST_VALUE":
+		return kwLastValue
 	case "LATERAL":
 		return kwLateral
+	case "LAG":
+		return kwLag
 	case "LEFT":
 		return kwLeft
+	case "LEAD":
+		return kwLead
 	case "LIKE":
 		return kwLike
 	case "LIMIT":
@@ -285,6 +326,10 @@ func keywordOf(s string) keyword {
 		return kwNatural
 	case "NOT":
 		return kwNot
+	case "NTH_VALUE":
+		return kwNthValue
+	case "NTILE":
+		return kwNtile
 	case "NULL":
 		return kwNull
 	case "NULLS":
@@ -303,8 +348,18 @@ func keywordOf(s string) keyword {
 		return kwOuter
 	case "OVER":
 		return kwOver
+	case "PARTITION":
+		return kwPartition
+	case "PERCENT_RANK":
+		return kwPercentRank
 	case "PRIMARY":
 		return kwPrimary
+	case "PRECEDING":
+		return kwPreceding
+	case "RANGE":
+		return kwRange
+	case "RANK":
+		return kwRank
 	case "REPLACE":
 		return kwReplace
 	case "RECURSIVE":
@@ -313,6 +368,12 @@ func keywordOf(s string) keyword {
 		return kwReturning
 	case "RIGHT":
 		return kwRight
+	case "ROW":
+		return kwRow
+	case "ROWS":
+		return kwRows
+	case "ROW_NUMBER":
+		return kwRowNumber
 	case "SELECT":
 		return kwSelect
 	case "SET":
@@ -329,6 +390,8 @@ func keywordOf(s string) keyword {
 		return kwTrue
 	case "UNION":
 		return kwUnion
+	case "UNBOUNDED":
+		return kwUnbounded
 	case "UNIQUE":
 		return kwUnique
 	case "UPDATE":
@@ -383,6 +446,8 @@ func reserved(kw keyword) bool {
 	switch kw {
 	case kwNone,
 		kwCount, kwSum, kwAvg, kwMin, kwMax,
+		kwCumeDist, kwDenseRank, kwFirstValue, kwLag, kwLastValue,
+		kwLead, kwNthValue, kwNtile, kwPercentRank, kwRank, kwRowNumber,
 		kwMissing, kwNulls, kwFirst, kwLast, kwEscape,
 		kwConflict, kwDefault, kwDo, kwNothing, kwReturning, kwMerge, kwReplace, kwTruncate,
 		kwAlter, kwCreate, kwDrop, kwIf, kwIndex, kwKey, kwPrimary, kwTable,
