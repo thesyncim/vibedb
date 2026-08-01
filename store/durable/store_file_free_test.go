@@ -266,6 +266,80 @@ func freeChurnRound(t *testing.T, fs *Collection, keys, round int) {
 	}
 }
 
+func TestForegroundReclaimServicesOneCompleteWindow(t *testing.T) {
+	options := testFileStoreOptions()
+	options.Durability = DurabilityBufferedVisible
+	options.CheckpointStrength = CheckpointFilesystem
+	options.MaxRetiredExtents = max(
+		options.MaxRetiredExtents, 2*freeReclaimBatch,
+	)
+	coll := buildTemplateHeavyOverlayCollection(
+		t, t.TempDir(), 128, options,
+	)
+	key := []byte(templateHeavyOverlayKey(20))
+
+	// Two physical publications move both alternate roots beyond generation
+	// one, making the synthetic generation-one retirements below eligible.
+	for revision := range 2 {
+		value := fmt.Appendf(nil, `{"revision":%d}`, revision)
+		if created, err := coll.Put(key, value); err != nil || created {
+			t.Fatalf("priming Put %d = %v,%v", revision, created, err)
+		}
+		if err := flushPhysicalForTest(coll); err != nil {
+			t.Fatalf("priming Flush %d: %v", revision, err)
+		}
+	}
+	if floor := coll.committer.FallbackGeneration(); floor <= 1 {
+		t.Fatalf("fallback generation = %d, want > 1", floor)
+	}
+
+	coll.writer.Lock()
+	defer coll.writer.Unlock()
+
+	// Model one wide checkpoint's retirement pressure without building a giant
+	// corpus. The next transaction's foreground refresh must remove exactly its
+	// fixed batch even though more work remains, proving both progress and
+	// bounded cost. These extents sit beyond the selected FileEnd and are never
+	// consumed or persisted; the collection is closed immediately after the
+	// assertion.
+	const extra = 17
+	extents := make([]storeio.FreeExtent, freeReclaimBatch+extra)
+	offset := coll.state.Load().fileEnd + uint64(coll.options.PageSize)
+	for index := range extents {
+		extents[index] = storeio.FreeExtent{
+			Offset:            offset + uint64(index*coll.options.PageSize),
+			Length:            uint64(coll.options.PageSize),
+			RetiredGeneration: 1,
+		}
+	}
+	if err := coll.reclaimer.RetireBatch(extents); err != nil {
+		t.Fatalf("seed retirements: %v", err)
+	}
+	before := coll.reclaimer.Stats().Pending
+	if err := coll.refreshReusableFor(
+		coll.state.Load(), coll.options.maxTransactionPages,
+		coll.freeFoldLimit,
+	); err != nil {
+		t.Fatalf("foreground refresh: %v", err)
+	}
+	after := coll.reclaimer.Stats().Pending
+	if got := before - after; got != freeReclaimBatch {
+		t.Fatalf("foreground reclaimed extents = %d, want bounded window %d (pending %d -> %d)",
+			got, freeReclaimBatch, before, after)
+	}
+	// Adjacent reclaimed extents are the maximum-delta coalescing shape: every
+	// old offset is deleted and the combined low offset is reset. One ordinary
+	// reclaim window must retain that complete diff without taking the
+	// repeated-abort whole-image fallback.
+	if coll.freeFoldRequired {
+		t.Fatal("one bounded reclaim pulse overflowed pending-delta scratch")
+	}
+	if got := len(coll.freePending); got == 0 || got > freePendingCapacity {
+		t.Fatalf("coalescing reclaim deltas = %d, want (0,%d]",
+			got, freePendingCapacity)
+	}
+}
+
 // Given the same logical content written in one session and across many
 // close/reopen cycles, when the files are compared, then the multi-session file
 // exceeds the single-session one by no more than the extents each Close was

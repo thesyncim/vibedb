@@ -78,7 +78,7 @@ func (v *vibeDurable) Tuning() string {
 		"ResidentBytes=64 MiB (the default, and the read-cache budget every other engine was matched to); " +
 		"PageSize=4 KiB default; buffered read and write modes (O_DIRECT is Linux-only); " +
 		"MaxBatchDocuments=1 and MaxDocumentBytes=1 KiB because this harness exposes only point mutations over a corpus whose largest document is below that bound; the restriction cuts worst-case staging reservation without changing any measured value; " +
-		"BufferCount=1024, QueueSlots=1024, GroupLimit=64 (buffered-visible normalizes the physical checkpoint group to QueueSlots). The default BufferCount is sized for the collection's " +
+		"BufferCount=8192, QueueSlots=128, GroupLimit=64. The wider descriptor pool lets the 64 MiB resident budget select its bounded 1,024-dirty-leaf overlay directory; runtime admission charges certified replacements their actual routed leaf extent plus parent scratch, while shape-changing mutations reserve the full leaf extent. 128 queue slots keep the committer's fixed descriptor arena below its one-million-entry ceiling. Buffered-visible normalizes the physical checkpoint group to QueueSlots. The default BufferCount is sized for the collection's " +
 		"worst-case transaction geometry; the explicit pool keeps this workload's staging capacity stable. " +
 		"BenchmarkPointWriteDurableDefaults measures the tuned/default pair directly. " +
 		"CommitCoalesce=0, i.e. no acknowledged-latency-for-throughput trade. " +
@@ -133,8 +133,8 @@ func (v *vibeDurable) options() durable.Options {
 		// would shrink buffered checkpoint depth for values this harness can
 		// never submit, measuring unused API range rather than the workload.
 		opts.MaxDocumentBytes = 1 << 10
-		opts.BufferCount = 1024
-		opts.QueueSlots = 1024
+		opts.BufferCount = 8192
+		opts.QueueSlots = 128
 		opts.GroupLimit = 64
 	}
 	if v.cfg.Indexed {
@@ -474,6 +474,15 @@ func (v *vibeDurable) AutomaticCheckpoints() uint64 {
 		return 0
 	}
 	return v.coll.Stats().AutomaticCheckpoints
+}
+
+// DurableStats exposes value-only internal counters to opt-in diagnostic
+// harnesses. Published benchmark tables do not depend on it.
+func (v *vibeDurable) DurableStats() durable.Stats {
+	if v.coll == nil {
+		return durable.Stats{}
+	}
+	return v.coll.Stats()
 }
 
 func (v *vibeDurable) Close() error {

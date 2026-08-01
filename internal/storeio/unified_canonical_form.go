@@ -84,30 +84,118 @@ func AppendCanonicalIndexed(dst []byte, index vibejson.Index, ws *CanonicalWorks
 	if len(index.Entries) == 0 || len(index.Src) == 0 {
 		return dst, fmt.Errorf("%w: canonical render of empty tape", ErrInvalidWrite)
 	}
-	return appendCanonicalEntry(dst, index.Src, index.Entries, 0, ws), nil
+	return appendCanonicalEntry(dst, index.Src, index.Entries, 0, ws, nil), nil
+}
+
+// CanonicalSpanIndex is an opaque, borrowed certificate tying one validated
+// canonical document to its ordered scalar-hole spans. The value and span
+// storage remain owned by the caller and must not change while the certificate
+// is in use.
+//
+// Keeping the fields private matters: consumers may trust that a non-zero
+// certificate came either from a canonical tape check or directly from the
+// canonical renderer, rather than accepting independently supplied offsets.
+type CanonicalSpanIndex struct {
+	canonical []byte
+	spans     []UnifiedTokenSpan
+	valid     bool
+}
+
+// Bytes returns the canonical document certified by c. The returned bytes are
+// borrowed from the source tape or render destination.
+func (c CanonicalSpanIndex) Bytes() []byte {
+	return c.canonical
+}
+
+// CanonicalSpanIndexOf returns a scalar-span certificate when index already
+// names a canonical document. spanStorage is fixed caller scratch; capacity
+// for every tape entry is a conservative allocation-free bound on the number
+// of scalar holes. Insufficient scratch or non-canonical input returns false.
+func CanonicalSpanIndexOf(
+	index vibejson.Index,
+	ws *CanonicalWorkspace,
+	spanStorage []UnifiedTokenSpan,
+) (CanonicalSpanIndex, bool) {
+	if len(index.Entries) == 0 || len(index.Src) == 0 || ws == nil ||
+		cap(spanStorage) < len(index.Entries) || !IndexIsCanonical(index, ws) {
+		return CanonicalSpanIndex{}, false
+	}
+	spans := appendHoleSpans(spanStorage[:0], index)
+	return CanonicalSpanIndex{
+		canonical: index.Src,
+		spans:     spans,
+		valid:     true,
+	}, true
+}
+
+type canonicalSpanTracker struct {
+	base  int
+	spans []UnifiedTokenSpan
+}
+
+// AppendCanonicalIndexedSpans renders index and simultaneously returns the
+// scalar-hole certificate for the appended document. This avoids reparsing
+// the canonical output. As with CanonicalSpanIndexOf, spanStorage needs room
+// for len(index.Entries) entries; the conservative preflight keeps bounded
+// callers allocation-free and fails closed on insufficient scratch.
+func AppendCanonicalIndexedSpans(
+	dst []byte,
+	index vibejson.Index,
+	ws *CanonicalWorkspace,
+	spanStorage []UnifiedTokenSpan,
+) ([]byte, CanonicalSpanIndex, error) {
+	if len(index.Entries) == 0 || len(index.Src) == 0 || ws == nil {
+		return dst, CanonicalSpanIndex{}, fmt.Errorf(
+			"%w: canonical render of empty tape", ErrInvalidWrite,
+		)
+	}
+	if cap(spanStorage) < len(index.Entries) {
+		return dst, CanonicalSpanIndex{}, document.ErrIndexFull
+	}
+	base := len(dst)
+	tracker := canonicalSpanTracker{
+		base:  base,
+		spans: spanStorage[:0],
+	}
+	dst = appendCanonicalEntry(
+		dst, index.Src, index.Entries, 0, ws, &tracker,
+	)
+	return dst, CanonicalSpanIndex{
+		canonical: dst[base:],
+		spans:     tracker.spans,
+		valid:     true,
+	}, nil
 }
 
 // appendCanonicalEntry renders the value at tape entry i. Navigation follows
 // the two tape rules (first child at header+1, next sibling at
 // value+value.Next); a key's own Next word is never read because the
 // key-hash enrichment may have repurposed it.
-func appendCanonicalEntry(dst, src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace) []byte {
+func appendCanonicalEntry(
+	dst, src []byte,
+	entries []vibejson.IndexEntry,
+	i int,
+	ws *CanonicalWorkspace,
+	tracker *canonicalSpanTracker,
+) []byte {
 	e := &entries[i]
+	start := len(dst)
 	switch e.Kind() {
 	case document.String:
-		return appendCanonicalTapeString(dst, src, entries, i, ws)
+		dst = appendCanonicalTapeString(dst, src, entries, i, ws)
 	case document.Number, document.Bool, document.Null:
 		// Number spellings are preserved verbatim; true/false/null
 		// have exactly one grammatical spelling each, so the source span is
 		// the canonical spelling by construction.
-		return append(dst, src[e.Start:e.End]...)
+		dst = append(dst, src[e.Start:e.End]...)
 	case document.Array:
 		count := int(e.Count())
 		if count == 0 {
 			// Empty containers are scalar leaves with pinned spellings; the
 			// source span may carry interior whitespace, so emit
 			// the literal rather than the span.
-			return append(dst, '[', ']')
+			dst = append(dst, '[', ']')
+			break
 		}
 		dst = append(dst, '[')
 		child := i + 1
@@ -115,17 +203,26 @@ func appendCanonicalEntry(dst, src []byte, entries []vibejson.IndexEntry, i int,
 			if m > 0 {
 				dst = append(dst, ',')
 			}
-			dst = appendCanonicalEntry(dst, src, entries, child, ws)
+			dst = appendCanonicalEntry(
+				dst, src, entries, child, ws, tracker,
+			)
 			child += int(entries[child].Next)
 		}
-		return append(dst, ']')
+		dst = append(dst, ']')
 	case document.Object:
-		return appendCanonicalObject(dst, src, entries, i, ws)
+		dst = appendCanonicalObject(dst, src, entries, i, ws, tracker)
 	default:
 		// Unreachable for a tape built over validated input; render nothing
 		// rather than invent bytes.
 		return dst
 	}
+	if tracker != nil && e.Flags()&vibejson.TapeFlagKey == 0 && e.Next == 1 {
+		tracker.spans = append(tracker.spans, UnifiedTokenSpan{
+			Start: uint32(start - tracker.base),
+			End:   uint32(len(dst) - tracker.base),
+		})
+	}
+	return dst
 }
 
 // appendCanonicalObject renders one object with members stably sorted by
@@ -133,7 +230,13 @@ func appendCanonicalEntry(dst, src []byte, entries []vibejson.IndexEntry, i int,
 // workspace slice segmented by a frame base, so nested objects reuse one
 // backing array; the frame truncates its segment (and its scratch decodes)
 // on return.
-func appendCanonicalObject(dst, src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace) []byte {
+func appendCanonicalObject(
+	dst, src []byte,
+	entries []vibejson.IndexEntry,
+	i int,
+	ws *CanonicalWorkspace,
+	tracker *canonicalSpanTracker,
+) []byte {
 	e := &entries[i]
 	count := int(e.Count())
 	if count == 0 {
@@ -185,7 +288,9 @@ func appendCanonicalObject(dst, src []byte, entries []vibejson.IndexEntry, i int
 		ref := ws.members[memberBase+m]
 		dst = appendCanonicalKeyString(dst, src, entries, ws, ref)
 		dst = append(dst, ':')
-		dst = appendCanonicalEntry(dst, src, entries, int(ref.keyEntry)+1, ws)
+		dst = appendCanonicalEntry(
+			dst, src, entries, int(ref.keyEntry)+1, ws, tracker,
+		)
 	}
 	dst = append(dst, '}')
 	ws.members = ws.members[:memberBase]

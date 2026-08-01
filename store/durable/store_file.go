@@ -421,17 +421,20 @@ const (
 
 type normalizedFileStoreOptions struct {
 	Options
-	maxTransactionPages            int
-	maxTransactionBytes            uint64
-	singleDocumentTransactionPages int
-	singleDocumentTransactionBytes uint64
-	singleDocumentFreeFoldLimit    int
-	freeFoldLimit                  int
-	pageCatalog                    *storeio.CanonicalPageCatalog
-	indexes                        []*store.ExactIndex
-	indexNameIDs                   map[string]uint32
-	indexCatalogHash               uint64
-	primaryUnifiedOverlayBytes     int
+	maxTransactionPages              int
+	maxTransactionBytes              uint64
+	singleDocumentTransactionPages   int
+	singleDocumentTransactionBytes   uint64
+	singleDocumentFreeFoldLimit      int
+	freeFoldLimit                    int
+	pageCatalog                      *storeio.CanonicalPageCatalog
+	indexes                          []*store.ExactIndex
+	indexNameIDs                     map[string]uint32
+	indexCatalogHash                 uint64
+	primaryUnifiedOverlayBytes       int
+	primaryUnifiedOverlayBuckets     int
+	primaryUnifiedOverlayDirtyBytes  uint64
+	primaryUnifiedOverlayParentBytes uint32
 }
 
 const (
@@ -555,7 +558,8 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 				o.WriteMode != WriteBuffered) ||
 		o.ReadConcurrency < 1 || o.ReadConcurrency > 32768 ||
 		o.ReadQueueDepth < 1 || o.ReadQueueDepth > 32768 ||
-		o.PrefetchQueue < 1 || o.PrefetchQueue > 32768 {
+		o.PrefetchQueue < 1 || o.PrefetchQueue > 32768 ||
+		o.QueueSlots < 0 || o.QueueSlots > 1<<16 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"vibejson: invalid Store page, key, value, backend, durability, checkpoint, or read option",
 		)
@@ -779,9 +783,10 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	singleDocumentTransactionPages := docSingleDocumentPages + exactIndexPages
 	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
 	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
-	// The class-5 overlay is bounded independently of MaxBatchDocuments: point
-	// mutations may touch as many as 64 routed buckets before pressure folds the
-	// window. That fold stages one maximum-size leaf per bucket, up to four
+	// The class-5 overlay is bounded independently of MaxBatchDocuments. Its
+	// runtime dirty-bucket limit is the largest prefix of the fixed 1,024-bucket
+	// directory that fits the collection's descriptor, retirement, and resident
+	// byte budgets. That fold stages one maximum-size leaf per bucket, up to four
 	// distinct rooted parent pages per bucket, the catalog root,
 	// and the configured free-log fold reserve. The exact-index allowance is
 	// shared with the ordinary batch geometry but must coexist with this wider
@@ -794,23 +799,110 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// explicit overlay geometry makes the pressure fold a first-class bounded
 	// transaction instead of relying on spare buffers.
 	const primaryOverlayParentLevels = 4
-	primaryOverlayMetadataPages :=
-		primaryOverlayParentLevels*primaryUnifiedOverlayBuckets + 1 +
-			freeFoldLimit + storeio.FreeLogMaxIndexPages +
+	const primaryOverlayPagesPerBucket = primaryOverlayParentLevels + 1
+	primaryOverlayFixedMetadataPages :=
+		1 + freeFoldLimit + storeio.FreeLogMaxIndexPages +
 			storeio.FreeLogMaxDeltaPages
-	primaryOverlayTransactionPages :=
-		primaryUnifiedOverlayBuckets + primaryOverlayMetadataPages +
-			exactIndexPages
-	primaryOverlayTransactionBytes :=
-		uint64(primaryUnifiedOverlayBuckets)*uint64(o.MaxPageSize) +
-			uint64(primaryOverlayMetadataPages)*uint64(o.PageSize) +
+	primaryOverlayFixedPages :=
+		primaryOverlayFixedMetadataPages + exactIndexPages
+	primaryOverlayFixedBytes :=
+		uint64(primaryOverlayFixedMetadataPages)*uint64(o.PageSize) +
 			exactIndexBytes
-	maxTransactionPages = max(
-		maxTransactionPages, primaryOverlayTransactionPages,
-	)
-	maxTransactionBytes = max(
-		maxTransactionBytes, primaryOverlayTransactionBytes,
-	)
+	primaryOverlayParentBytes :=
+		uint64(primaryOverlayParentLevels) * uint64(o.PageSize)
+	primaryOverlayTargetBytes := uint64(primaryUnifiedOverlayTargetBytes(
+		o.PageSize, o.MaxKeyBytes, o.InlineValueBytes,
+	))
+	primaryOverlayBucketLimit := primaryUnifiedOverlayBuckets
+	limitByPages := func(pageLimit int) {
+		if pageLimit <= primaryOverlayFixedPages {
+			primaryOverlayBucketLimit = 0
+			return
+		}
+		primaryOverlayBucketLimit = min(
+			primaryOverlayBucketLimit,
+			(pageLimit-primaryOverlayFixedPages)/primaryOverlayPagesPerBucket,
+		)
+	}
+	if o.BufferCount != 0 {
+		// One descriptor remains for the alternate root.
+		limitByPages(o.BufferCount - 1)
+	}
+	// NewCommitter retains QueueSlots*MaxPagesPerBatch descriptors. Apply its
+	// exact arena bound here so widening the overlay cannot turn a previously
+	// valid explicit BufferCount/QueueSlots pair into a construction-time error.
+	limitByPages(storeio.MaxCommitDescriptors / fileVisibilitySlots(o.QueueSlots))
+	limitByPages(o.MaxRetiredExtents)
+	// Resident admission is byte-exact at runtime. The fixed share covers free
+	// log/exact scratch and the overlay arena; every first dirty bucket then
+	// reserves four parent pages plus either its certified routed extent or one
+	// conservative MaxPageSize extent. This lets a 64 MiB collection represent
+	// many compact 4/8/32 KiB leaves without pretending 1,024 leaves are all
+	// 64 KiB, while shape-changing paths remain fully covered.
+	primaryOverlayDirtyBytes := uint64(0)
+	minimumDirtyBytes := uint64(o.PageSize) + primaryOverlayParentBytes
+	// The preferred arena is not an admission cliff. Preserve room for one
+	// complete dirty bucket, the fixed fold state, and the ordinary point-write
+	// transaction, then take the largest page-aligned arena up to the preferred
+	// window. This keeps small valid ResidentBytes configurations functional
+	// while 64 MiB production configurations retain the full fast window.
+	if o.ResidentBytes >= 0 {
+		resident := uint64(o.ResidentBytes)
+		reservedWithoutArena := max(
+			primaryOverlayFixedBytes+uint64(o.MaxPageSize)+minimumDirtyBytes,
+			maxTransactionBytes+uint64(o.MaxPageSize),
+		)
+		if resident <= reservedWithoutArena {
+			primaryOverlayTargetBytes = 0
+		} else {
+			primaryOverlayTargetBytes = min(
+				primaryOverlayTargetBytes,
+				(resident-reservedWithoutArena)/uint64(o.PageSize)*uint64(o.PageSize),
+			)
+		}
+	}
+	residentFixed := primaryOverlayFixedBytes + primaryOverlayTargetBytes +
+		uint64(o.MaxPageSize)
+	if o.ResidentBytes < 0 || primaryOverlayTargetBytes < 64<<10 ||
+		primaryOverlayBucketLimit == 0 ||
+		uint64(o.ResidentBytes) <= residentFixed ||
+		maxTransactionBytes+primaryOverlayTargetBytes+
+			uint64(o.MaxPageSize) > uint64(o.ResidentBytes) {
+		primaryOverlayBucketLimit = 0
+	} else {
+		available := uint64(o.ResidentBytes) - residentFixed
+		worst := uint64(primaryOverlayBucketLimit) *
+			(uint64(o.MaxPageSize) + primaryOverlayParentBytes)
+		primaryOverlayDirtyBytes = min(available, worst)
+		if primaryOverlayDirtyBytes < minimumDirtyBytes {
+			primaryOverlayBucketLimit = 0
+			primaryOverlayDirtyBytes = 0
+		}
+	}
+	if primaryOverlayBucketLimit == 0 {
+		// Overlay admission is one coherent geometry. Never retain an arena or
+		// construct concurrent scratch when descriptor/retirement/resident limits
+		// have disabled the dirty-bucket window.
+		primaryOverlayTargetBytes = 0
+		primaryOverlayDirtyBytes = 0
+		primaryOverlayParentBytes = 0
+	}
+	primaryOverlayMetadataPages :=
+		primaryOverlayParentLevels*primaryOverlayBucketLimit +
+			primaryOverlayFixedMetadataPages
+	primaryOverlayTransactionPages :=
+		primaryOverlayBucketLimit + primaryOverlayMetadataPages +
+			exactIndexPages
+	primaryOverlayTransactionBytes := primaryOverlayFixedBytes +
+		primaryOverlayDirtyBytes
+	if primaryOverlayBucketLimit != 0 {
+		maxTransactionPages = max(
+			maxTransactionPages, primaryOverlayTransactionPages,
+		)
+		maxTransactionBytes = max(
+			maxTransactionBytes, primaryOverlayTransactionBytes,
+		)
+	}
 	if o.MaxRetiredExtents < maxTransactionPages {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibejson: collection MaxRetiredExtents must retain one worst-case transaction")
 	}
@@ -823,10 +915,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	if o.ResidentBytes < 0 || uint64(o.ResidentBytes) < maxTransactionBytes {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibejson: collection ResidentBytes cannot retain one worst-case dirty transaction")
 	}
-	primaryUnifiedOverlayBytes := primaryUnifiedOverlayBudget(
-		uint64(o.ResidentBytes), maxTransactionBytes,
-		o.PageSize, o.MaxPageSize, o.MaxKeyBytes, o.InlineValueBytes,
-	)
+	primaryUnifiedOverlayBytes := int(primaryOverlayTargetBytes)
 	return normalizedFileStoreOptions{
 		Options:                        o,
 		maxTransactionPages:            maxTransactionPages,
@@ -837,8 +926,11 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		freeFoldLimit:                  freeFoldLimit,
 		pageCatalog:                    pageCatalog,
 		indexes:                        compiled, indexNameIDs: indexNameIDs,
-		indexCatalogHash:           catalogHash,
-		primaryUnifiedOverlayBytes: primaryUnifiedOverlayBytes,
+		indexCatalogHash:                 catalogHash,
+		primaryUnifiedOverlayBytes:       primaryUnifiedOverlayBytes,
+		primaryUnifiedOverlayBuckets:     primaryOverlayBucketLimit,
+		primaryUnifiedOverlayDirtyBytes:  primaryOverlayDirtyBytes,
+		primaryUnifiedOverlayParentBytes: uint32(primaryOverlayParentBytes),
 	}, nil
 }
 
@@ -955,8 +1047,9 @@ type Collection struct {
 
 	// writer is the collection-wide mutation gate. Ordinary mutation,
 	// checkpoint, structural, and lifecycle paths retain its exclusive side;
-	// the narrow buffered existing-row overlay lane takes the shared side so its
-	// fallible staging can overlap across independent leaf buckets. Converting
+	// the narrow buffered inline-row overlay lane takes the shared side so its
+	// fallible replacement, insert, resurrection, and tombstone staging can
+	// overlap across independent leaf buckets. Converting
 	// the existing gate, rather than adding a second checkpoint lock, makes every
 	// established writer.Lock site automatically fence the concurrent lane.
 	writer sync.RWMutex
@@ -1004,12 +1097,13 @@ type Collection struct {
 	committer *storeio.Committer
 	cache     *storeio.PageCache
 	// primaryUnifiedOverlay is the bounded, generation-stamped mutable row
-	// window for class-5 replacement updates. Its byte arena is carved out of
+	// window for class-5 inline puts and tombstones. Its byte arena is carved out of
 	// Options.ResidentBytes; PageCache owns the remainder.
 	primaryUnifiedOverlay *primaryUnifiedOverlay
 	// primaryUnifiedReplacementScratch is the exclusive writer's bounded fold
-	// workspace. Keeping it on the collection avoids promoting a 4,096-entry
-	// stack array to the heap each time overlay pressure materializes a leaf.
+	// workspace. A class-5 leaf has at most 256 stable slots regardless of how
+	// many raw generations the overlay retains, so this final-state vector is
+	// leaf-bounded rather than generation-window-bounded.
 	primaryUnifiedReplacementScratch []storeio.CommonPrimaryUnifiedReplacement
 	// primaryUnifiedSeen is writer-owned lazy route metadata. Until the first
 	// class-5 leaf is observed, ordinary stores preserve their established
@@ -1117,9 +1211,11 @@ type Collection struct {
 	// through this watermark with one fence, then advances the durable watermark.
 	journalDeltaAppendedGeneration atomic.Uint64
 	// journalDeltaEntries is fixed writer-owned framing scratch for one cheap
-	// checkpoint. The class-5 overlay itself is capped at this record count, so
-	// every eligible interval fits without allocation.
-	journalDeltaEntries [primaryUnifiedOverlayRecords]storeio.RecoveryBatchEntry
+	// checkpoint. Only the ordinary buffered delta lane retains it; stores that
+	// cannot emit an overlay delta leave the slice nil instead of carrying its
+	// pointer-rich backing array. The class-5 overlay itself is capped at this
+	// record count, so every eligible interval still fits without allocation.
+	journalDeltaEntries []storeio.RecoveryBatchEntry
 	// writeTransaction and the point-mutation scratch below are protected by
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
@@ -1164,6 +1260,28 @@ type Collection struct {
 	primaryMacroSplitRequired atomic.Uint64
 	primarySplitMaxNS         atomic.Uint64
 	primaryEmptyReclaimMaxNS  atomic.Uint64
+	// Hole punching is a foreground, post-durability space optimization. The
+	// source cursors and disabled flag are writer-owned; atomic counters keep the
+	// optional filesystem results independently observable and cheap to sample.
+	holePunchRanges           atomic.Uint64
+	holePunchBytes            atomic.Uint64
+	holePunchSkippedRanges    atomic.Uint64
+	holePunchUnsupported      atomic.Uint64
+	holePunchErrors           atomic.Uint64
+	holePunchReusableCursor   uint64
+	holePunchPendingCursor    storeio.PunchableExtentCursor
+	holePunchAbsorbedCursor   uint64
+	holePunchCandidateSource  uint8
+	holePunchDisabled         bool
+	holePunchCompletionVictim uint32
+	holePunchCompletions      [fileStoreHolePunchCompletionSlots]storeio.FreeExtent
+	// Tests may replace the platform helper per collection. Nil selects the
+	// production Linux/Darwin implementation (or the unsupported no-op).
+	holePunch func(*os.File, uint64, uint64) (bool, error)
+	// holePunchCandidateFenced is a deterministic package-test seam invoked after
+	// bounded candidate discovery completes but before either reader-admission
+	// fence is released. Production leaves it nil.
+	holePunchCandidateFenced func()
 
 	retireScratch []storeio.FreeExtent
 	// retireRefScratch mirrors exact PageRefs opportunistically for cache
@@ -1316,6 +1434,10 @@ type Collection struct {
 	freeFoldRequired   bool
 	freeLoaded         bool
 	freeNonResident    int
+	// freeImageScratchInUse is a writer-owned assertion spanning the complete
+	// fold plan/stage call. The post-flush hole-punch hook may borrow the same
+	// fixed arena only after this marker clears.
+	freeImageScratchInUse bool
 
 	// batch is the reusable transactional WriteBatch handle. The batch type and
 	// its options are shared; only the primary apply path remains.
@@ -1406,14 +1528,11 @@ type Stats struct {
 	// complete overlay/router/state publication, so qualification can detect a
 	// benchmark that silently fell back to the exclusive mutation path.
 	ConcurrentPrimaryReplaces uint64
-	// ConcurrentPrimaryFallbacks counts successful members of a concurrent
+	// ConcurrentPrimaryFallbacks counts successful mutations from a concurrent
 	// pressure cohort that were elected to take the exclusive fold/retry path.
-	// Together with ConcurrentPrimaryReplaces it accounts for every successful
-	// operation admitted by the concurrent replacement entry lane.
 	ConcurrentPrimaryFallbacks uint64
-	// ConcurrentPrimaryPublishGroups counts non-empty replacement groups made
-	// visible by the concurrent publisher. Dividing ConcurrentPrimaryReplaces
-	// by this value yields its lifetime mean successful group size.
+	// ConcurrentPrimaryPublishGroups counts non-empty mutation groups made
+	// visible by the concurrent publisher.
 	ConcurrentPrimaryPublishGroups uint64
 	// ConcurrentPrimaryLargestPublishGroup is the largest successful prefix
 	// made visible by one concurrent publisher group.
@@ -1538,13 +1657,24 @@ type Stats struct {
 	// FreeScratchLiveBytes is the portion occupied by the current fold's
 	// fenced/image/range/order slices. It returns to zero or a small retained
 	// plan without fragmenting the general heap.
-	FreeScratchLiveBytes  uint64
-	PendingRetiredExtents uint64
-	PendingRetiredBytes   uint64
-	ReusableExtents       uint64
-	ReusableBytes         uint64
-	DocumentCount         uint64
-	FileEnd               uint64
+	FreeScratchLiveBytes uint64
+	// HolePunchRanges/Bytes count successful filesystem deallocations.
+	// HolePunchSkippedRanges counts deferred candidate observations, not unique
+	// extents; the same safe range may be observed again after a cap or platform
+	// failure. Unsupported and Errors each disable the optional optimization for
+	// the process after their first occurrence; active readers instead narrow the
+	// generation-safe prefix.
+	HolePunchRanges        uint64
+	HolePunchBytes         uint64
+	HolePunchSkippedRanges uint64
+	HolePunchUnsupported   uint64
+	HolePunchErrors        uint64
+	PendingRetiredExtents  uint64
+	PendingRetiredBytes    uint64
+	ReusableExtents        uint64
+	ReusableBytes          uint64
+	DocumentCount          uint64
+	FileEnd                uint64
 }
 
 // Create initializes an empty durable collection in file and fences its
@@ -1983,24 +2113,26 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 			[primaryConcurrentStripeCount]primaryConcurrentStripe,
 		)
 	}
+	retireScratchCapacity := options.maxTransactionPages +
+		fileStorePointPrimaryRetirePages + 1 +
+		storeio.FreeLogMaxChainPages + storeio.FreeLogMaxIndexPages +
+		options.freeFoldLimit
 	collection := &Collection{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
 		primaryUnifiedOverlay: newPrimaryUnifiedOverlay(
 			options.primaryUnifiedOverlayBytes,
+			options.primaryUnifiedOverlayBuckets,
+			options.primaryUnifiedOverlayDirtyBytes,
+			uint32(options.MaxPageSize),
+			options.primaryUnifiedOverlayParentBytes,
 		),
 		readFile: ownedRead, writeFile: ownedWrite,
 		directRead: directRead, directWrite: directWrite,
 		leases: leases, readEpochs: readEpochs, reclaimer: reclaimer,
 		// A fold retires the whole superseded chain on top of the commit's own
 		// retirements, so the scratch reserves both.
-		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+
-			fileStorePointPrimaryRetirePages+1+
-			storeio.FreeLogMaxChainPages+storeio.FreeLogMaxIndexPages+
-			options.freeFoldLimit),
-		retireRefScratch: make([]storeio.PageRef, 0, options.maxTransactionPages+
-			fileStorePointPrimaryRetirePages+1+
-			storeio.FreeLogMaxChainPages+storeio.FreeLogMaxIndexPages+
-			options.freeFoldLimit),
+		retireScratch:    make([]storeio.FreeExtent, 0, retireScratchCapacity),
+		retireRefScratch: make([]storeio.PageRef, 0, retireScratchCapacity),
 		reusable:         reusableArena[:0],
 		reuseJournal:     make([]storeio.ReuseEdit, 0, options.maxTransactionPages),
 		reusableBlock:    reusableBlock,
@@ -2023,13 +2155,13 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		freeFoldOrder:   freeScratch.order[:0],
 		freeFoldPages:   make([]storeio.TransactionPage, 0, options.freeFoldLimit),
 		freeDirtyAll:    true,
-		// Half the diff capacity belongs to changes made outside a transaction;
-		// the rest is left for what the commit itself consumes. Overflowing the
-		// half is not a failure, it schedules a fold.
-		freePending: make([]storeio.FreeDelta, 0,
-			storeio.FreeLogMaxDeltaPages*deltaPerPage/2),
+		// A normal reclaim pulse retains every possible coalescing edit until the
+		// commit selects a delta append or segmented fold. The separate delta
+		// scratch also holds the transaction's reuse journal and complete
+		// retirement set, so this decision allocates nothing on the Go heap.
+		freePending: make([]storeio.FreeDelta, 0, freePendingCapacity),
 		freeDeltas: make([]storeio.FreeDelta, 0,
-			storeio.FreeLogMaxDeltaPages*deltaPerPage+options.maxTransactionPages),
+			freePendingCapacity+options.maxTransactionPages+retireScratchCapacity),
 		freeSpill: make([]storeio.FreeDelta, 0,
 			storeio.InlineFreeDeltaCapacity),
 		freeReclaimed:      make([]storeio.FreeExtent, 0, freeReclaimBatch),
@@ -2051,6 +2183,7 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		),
 		primaryConcurrentContexts: concurrentContexts,
 		primaryConcurrentStripes:  concurrentStripes,
+		journalDeltaEntries:       newBufferedJournalDeltaEntryScratch(options),
 	}
 	if options.MaterializationDamageGranule != 0 {
 		imageArenaBytes := options.MaxPageSize + options.PageSize
@@ -2254,7 +2387,8 @@ func (c *Collection) cacheStoreID() [16]byte {
 }
 
 // Put inserts or replaces one document. Every collection is an ordered primary
-// graph, so the mutation is always resolved through the routed COW path.
+// graph. Eligible inline mutations use its bounded row overlay; structural,
+// indexed, overflow, and pressure paths use routed copy-on-write.
 //
 // key is borrowed for the duration of the call and not retained after it
 // returns: the store copies it wherever it stages the key (leaf frame,
@@ -2264,19 +2398,21 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
-	handled, concurrentErr := c.tryConcurrentPrimaryReplace(key, src)
+	handled, concurrentCreated, concurrentErr :=
+		c.tryConcurrentPrimaryPut(key, src)
 	if handled {
-		return false, nil
+		return concurrentCreated, nil
 	}
 	if errors.Is(concurrentErr, errConcurrentPrimaryPressure) {
 		// Exactly one member of a pressure cohort takes the exclusive fold/retry.
 		// Later members first retry the fast lane after that fold, so a full
 		// overlay cannot turn one combined group into N queued writer.Lock calls.
 		c.primaryConcurrentPressure.Lock()
-		handled, concurrentErr = c.tryConcurrentPrimaryReplace(key, src)
+		handled, concurrentCreated, concurrentErr =
+			c.tryConcurrentPrimaryPut(key, src)
 		if handled {
 			c.primaryConcurrentPressure.Unlock()
-			return false, nil
+			return concurrentCreated, nil
 		}
 		if concurrentErr != nil &&
 			!errors.Is(concurrentErr, errConcurrentPrimaryPressure) {
@@ -2308,6 +2444,34 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 	if c == nil {
 		return false, ErrClosed
+	}
+	handled, concurrentDeleted, concurrentErr :=
+		c.tryConcurrentPrimaryDelete(key)
+	if handled {
+		return concurrentDeleted, nil
+	}
+	if errors.Is(concurrentErr, errConcurrentPrimaryPressure) {
+		c.primaryConcurrentPressure.Lock()
+		handled, concurrentDeleted, concurrentErr =
+			c.tryConcurrentPrimaryDelete(key)
+		if handled {
+			c.primaryConcurrentPressure.Unlock()
+			return concurrentDeleted, nil
+		}
+		if concurrentErr != nil &&
+			!errors.Is(concurrentErr, errConcurrentPrimaryPressure) {
+			c.primaryConcurrentPressure.Unlock()
+			return false, concurrentErr
+		}
+		deleted, err = c.deletePrimaryWithEmptyReclaim(key)
+		if err == nil && deleted {
+			c.concurrentPrimaryFallbacks.Add(1)
+		}
+		c.primaryConcurrentPressure.Unlock()
+		return deleted, err
+	}
+	if concurrentErr != nil {
+		return false, concurrentErr
 	}
 	if c.shouldQueuePrimaryMutation(key, nil) {
 		_, deleted, err = c.submitPrimaryMutation(
@@ -2824,6 +2988,11 @@ func (c *Collection) Stats() Stats {
 		PrimaryMacroSplitRequired:            c.primaryMacroSplitRequired.Load(),
 		PrimarySplitMaxNS:                    c.primarySplitMaxNS.Load(),
 		PrimaryEmptyReclaimMaxNS:             c.primaryEmptyReclaimMaxNS.Load(),
+		HolePunchRanges:                      c.holePunchRanges.Load(),
+		HolePunchBytes:                       c.holePunchBytes.Load(),
+		HolePunchSkippedRanges:               c.holePunchSkippedRanges.Load(),
+		HolePunchUnsupported:                 c.holePunchUnsupported.Load(),
+		HolePunchErrors:                      c.holePunchErrors.Load(),
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch)+len(c.primaryRootScratch),
 		) + uint64(cap(c.primaryUnifiedReplacementScratch))*
@@ -2990,6 +3159,9 @@ func (c *Collection) retryRetirementAfterPressure() error {
 		return err
 	}
 	c.retirementAbsorbed = absorbed
+	// AppendReusable replaced the prior absorbed window rather than extending
+	// it, so restart its tiny linear hole-punch source at the new prefix.
+	c.holePunchAbsorbedCursor = 0
 	if len(absorbed) == 0 {
 		return storeio.ErrRetiredExtentCapacity
 	}
@@ -3060,8 +3232,18 @@ func (c *Collection) Flush() error {
 	if err := c.committer.Wait(generation); err != nil {
 		return err
 	}
-	c.cache.MarkDurable(generation)
-	return nil
+	// Wait is outside writer so an explicit Flush does not hold publication
+	// serialization across device latency. Reacquire it only for the bounded
+	// post-fence work: this freezes allocator/reclaimer views, and Wait has
+	// already completed the durable-state callback for generation. These lanes
+	// cannot carry a recovery journal (async-created roots mint none, and a
+	// journal-backed synchronous open selected syncJournalLane above).
+	c.writer.Lock()
+	defer c.writer.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	return c.completePhysicalDurabilityLocked(generation)
 }
 
 // Close fences every publication and releases bounded I/O resources. It does
@@ -3113,6 +3295,16 @@ func (c *Collection) Close() error {
 			result = errors.Join(result, err)
 			poisoned = true
 		}
+	} else if err := c.flushPublishedPhysicalLocked(); err != nil {
+		// Async-visible and chain-fence synchronous Close have now drained every
+		// publisher, so this physical boundary is a stable final cut. Run it before
+		// closing reader registries or the committer: the post-durable hook needs
+		// their exact generation floors and the live file descriptor.
+		if c.PersistenceError() == nil {
+			return err
+		}
+		result = errors.Join(result, err)
+		poisoned = true
 	}
 	// The epoch table closes before the lease table for the same reason the
 	// lease table closes before resources: a still-in-flight direct read must

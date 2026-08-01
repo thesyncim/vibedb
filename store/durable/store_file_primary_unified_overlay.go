@@ -16,15 +16,24 @@ const (
 	// directory: replacement-heavy workloads can accumulate many generations
 	// across the same bounded set of dirty leaves before paying one fold. The
 	// hash table remains at 50% load at the record ceiling.
-	primaryUnifiedOverlayRecords = 4096
+	// Keep enough logical replacements resident to amortize one foreground
+	// physical fold across a useful write window.  The former 4,096-record
+	// ceiling forced a whole dirty-tree checkpoint roughly every four thousand
+	// updates even when the byte and resident-memory budgets still had ample
+	// room.  Thirty-two thousand entries remain representable by the uint16
+	// fold indexes and keep all metadata and redo storage statically bounded.
+	// The 8 MiB arena is still charged against Options.ResidentBytes: it trades
+	// cache residency for a longer, predictable foreground fold interval rather
+	// than introducing hidden memory.
+	primaryUnifiedOverlayRecords = 32768
 	primaryUnifiedOverlayBuckets = filePrimaryPendingParentLimit
-	primaryUnifiedOverlayTable   = 8192
+	primaryUnifiedOverlayTable   = 65536
 	// The bucket directory stays at <=50% load at the overlay's hard
 	// distinct-bucket limit. Open addressing therefore gives the mutation and
 	// scan lanes a bounded, allocation-free bucket lookup without the previous
 	// record-window rescans (including the quadratic distinct-bucket census).
-	primaryUnifiedOverlayBucketTable = 128
-	primaryUnifiedOverlayMax         = 1 << 20
+	primaryUnifiedOverlayBucketTable = 2048
+	primaryUnifiedOverlayMax         = 8 << 20
 
 	primaryUnifiedOverlayPut    = 1
 	primaryUnifiedOverlayDelete = 2
@@ -60,7 +69,11 @@ type primaryUnifiedOverlayRecord struct {
 	countDelta     int8
 	kind           uint8
 	slot           uint8
-	_              uint8
+	// reservationWide describes this key's final fold shape at generation.
+	// Old records remain immutable for readers and recovery; the bucket-wide
+	// aggregate is updated from the newest record per key, so a later certified
+	// restore can retire an older tombstone's conservative wide reservation.
+	reservationWide uint8
 }
 
 // primaryUnifiedOverlayBucket is one open-addressed directory entry. head is
@@ -69,11 +82,14 @@ type primaryUnifiedOverlayRecord struct {
 // updates, while atomics keep lock-free scans and online-index reconciliation
 // race-free.
 type primaryUnifiedOverlayBucket struct {
-	bucket      atomic.Uint32
-	head        atomic.Uint32
-	rawBytes    atomic.Int64
-	rows        atomic.Int32
-	insertSlots [4]atomic.Uint64
+	bucket        atomic.Uint32
+	head          atomic.Uint32
+	reservedBytes atomic.Uint32
+	fixedBytes    atomic.Uint32
+	wideKeys      atomic.Int32
+	rawBytes      atomic.Int64
+	rows          atomic.Int32
+	insertSlots   [4]atomic.Uint64
 }
 
 type primaryUnifiedOverlay struct {
@@ -84,6 +100,18 @@ type primaryUnifiedOverlay struct {
 	// bucketCount belongs to the writer, but an atomic keeps the directory's
 	// reset/publication protocol explicit alongside count and used.
 	bucketCount atomic.Uint32
+	// bucketLimit is the collection's normalized runtime dirty-leaf bound. The
+	// fixed directory above is the 1,024-bucket maximum; explicit smaller
+	// BufferCount or ResidentBytes configurations use only this prefix budget.
+	bucketLimit uint32
+	// dirtyByteLimit bounds the physical leaf extents plus conservative parent
+	// allowance that one fold may stage inside ResidentBytes. Same-shape native
+	// patch certificates reserve the routed extent's exact length; every other
+	// mutation reserves maxLeafBytes and upgrades an existing bucket if needed.
+	dirtyByteLimit uint64
+	dirtyBytes     atomic.Uint64
+	maxLeafBytes   uint32
+	parentBytes    uint32
 
 	// count and used publish initialized record/arena prefixes for stats and
 	// fold-side traversal. The serialized writer owns reservations; readers
@@ -97,44 +125,49 @@ type primaryUnifiedOverlay struct {
 }
 
 type primaryUnifiedOverlayPrepared struct {
-	index      uint32
-	usedAfter  uint32
-	headSlot   uint32
-	bucketSlot uint32
-	newBucket  bool
+	index         uint32
+	usedAfter     uint32
+	headSlot      uint32
+	bucketSlot    uint32
+	reservedBytes uint32
+	fixedBytes    uint32
+	wideKeys      int32
+	dirtyAfter    uint64
+	newBucket     bool
 }
 
-func newPrimaryUnifiedOverlay(bytes int) *primaryUnifiedOverlay {
-	if bytes <= 0 {
+func newPrimaryUnifiedOverlay(
+	bytes, bucketLimit int,
+	dirtyByteLimit uint64,
+	maxLeafBytes, parentBytes uint32,
+) *primaryUnifiedOverlay {
+	if bytes <= 0 || bucketLimit <= 0 ||
+		bucketLimit > primaryUnifiedOverlayBuckets ||
+		dirtyByteLimit == 0 || maxLeafBytes == 0 || parentBytes == 0 ||
+		uint64(maxLeafBytes)+uint64(parentBytes) > uint64(^uint32(0)) {
 		return nil
 	}
 	return &primaryUnifiedOverlay{
-		records: make([]primaryUnifiedOverlayRecord, primaryUnifiedOverlayRecords),
-		heads:   make([]atomic.Uint32, primaryUnifiedOverlayTable),
-		arena:   make([]byte, bytes),
+		records:        make([]primaryUnifiedOverlayRecord, primaryUnifiedOverlayRecords),
+		heads:          make([]atomic.Uint32, primaryUnifiedOverlayTable),
+		arena:          make([]byte, bytes),
+		bucketLimit:    uint32(bucketLimit),
+		dirtyByteLimit: dirtyByteLimit,
+		maxLeafBytes:   maxLeafBytes,
+		parentBytes:    parentBytes,
 	}
 }
 
-func primaryUnifiedOverlayBudget(
-	residentBytes, transactionBytes uint64,
-	pageSize, maxPageSize, maxKeyBytes, inlineValueBytes int,
+func primaryUnifiedOverlayTargetBytes(
+	pageSize, maxKeyBytes, inlineValueBytes int,
 ) int {
-	if residentBytes <= transactionBytes || pageSize <= 0 ||
-		maxPageSize <= 0 || maxKeyBytes <= 0 || inlineValueBytes <= 0 {
+	if pageSize <= 0 || maxKeyBytes <= 0 || inlineValueBytes <= 0 {
 		return 0
 	}
 	target := primaryUnifiedOverlayRecords * (maxKeyBytes + inlineValueBytes)
 	target = min(target, primaryUnifiedOverlayMax)
 	target = max(target, 64<<10)
-	target = (target + pageSize - 1) / pageSize * pageSize
-	// The physical PageCache must still retain the complete worst-case dirty
-	// transaction plus one maximum extent. The overlay is carved only from
-	// genuine surplus, so Options.ResidentBytes remains the total owned data
-	// budget rather than becoming cache + hidden heap.
-	if uint64(target)+transactionBytes+uint64(maxPageSize) > residentBytes {
-		return 0
-	}
-	return target
+	return (target + pageSize - 1) / pageSize * pageSize
 }
 
 func (o *primaryUnifiedOverlay) hasPending() bool {
@@ -323,6 +356,196 @@ func (o *primaryUnifiedOverlay) lookup(
 	return nil, primaryUnifiedOverlayMissing, 0
 }
 
+// pendingKeyReservationWide reports the newest pending fold shape for key.
+// Absence means the immutable base is still the final shape and therefore has
+// no conservative wide charge. This intentionally ignores folded generations:
+// their shape is already represented by the routed physical extent.
+func (o *primaryUnifiedOverlay) pendingKeyReservationWide(
+	bucket storeio.BucketID, hash uint64, key []byte,
+) (bool, error) {
+	if o == nil {
+		return false, nil
+	}
+	folded := o.folded.Load()
+	used := o.used.Load()
+	head := o.heads[hash&(primaryUnifiedOverlayTable-1)].Load()
+	for head != 0 {
+		if int(head) > len(o.records) {
+			return false, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		record := &o.records[head-1]
+		keyEnd := uint64(record.keyOffset) + uint64(record.keyLen)
+		if keyEnd > uint64(used) {
+			return false, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		if record.generation > folded &&
+			record.bucket == uint32(bucket) && record.hash == hash &&
+			bytes.Equal(
+				o.arena[record.keyOffset:uint32(keyEnd):uint32(keyEnd)], key,
+			) {
+			return record.reservationWide != 0, nil
+		}
+		head = record.previous
+	}
+	return false, nil
+}
+
+// sameSizeReusableRecord returns the newest pending record for key only when
+// its arena bytes are no longer needed to construct a future recovery-journal
+// batch. The caller still has to exclude readers before overwriting the value:
+// the durable journal protects crash recovery, while snapshot/epoch exclusion
+// protects an in-process reader of the older visible generation.
+func (o *primaryUnifiedOverlay) sameSizeReusableRecord(
+	bucket storeio.BucketID,
+	hash uint64,
+	key []byte,
+	valueLen int,
+	stableSlot uint8,
+	journalDurableGeneration uint64,
+) (*primaryUnifiedOverlayRecord, bool) {
+	if o == nil || len(key) == 0 || valueLen <= 0 ||
+		journalDurableGeneration == 0 ||
+		o.count.Load() >= uint32(len(o.records)) {
+		return nil, false
+	}
+	folded := o.folded.Load()
+	used := o.used.Load()
+	head := o.heads[hash&(primaryUnifiedOverlayTable-1)].Load()
+	for head != 0 {
+		if int(head) > len(o.records) {
+			return nil, false
+		}
+		record := &o.records[head-1]
+		keyEnd := uint64(record.keyOffset) + uint64(record.keyLen)
+		if record.bucket == uint32(bucket) && record.hash == hash &&
+			keyEnd <= uint64(used) &&
+			bytes.Equal(o.arena[record.keyOffset:uint32(keyEnd):uint32(keyEnd)], key) {
+			// This is the newest record for the key. Never search through an
+			// ineligible latest record and alias an older version underneath it.
+			valueEnd := uint64(record.valueOff) + uint64(record.valueLen)
+			return record,
+				record.generation > folded &&
+					record.generation <= journalDurableGeneration &&
+					record.kind == primaryUnifiedOverlayPut &&
+					record.countDelta == 0 &&
+					record.slot == stableSlot &&
+					int(record.valueLen) == valueLen &&
+					keyEnd == uint64(record.valueOff) &&
+					valueEnd <= uint64(used)
+		}
+		head = record.previous
+	}
+	return nil, false
+}
+
+func (o *primaryUnifiedOverlay) canReuseSameSizeArena(
+	bucket storeio.BucketID,
+	hash uint64,
+	key, value []byte,
+	stableSlot uint8,
+	journalDurableGeneration uint64,
+) bool {
+	_, ok := o.sameSizeReusableRecord(
+		bucket, hash, key, len(value), stableSlot,
+		journalDurableGeneration,
+	)
+	return ok
+}
+
+// prepareSameSizeArenaReuse appends a fresh generation-stamped metadata record
+// while retaining the newest journal-covered record's key/value offsets. It is
+// deliberately non-fallible after the value copy: every capacity, identity,
+// generation, and bounds check completes first, so a caller holding the reader
+// exclusion fence can overwrite and immediately publish without leaving an old
+// visible generation pointing at uncommitted bytes.
+func (o *primaryUnifiedOverlay) prepareSameSizeArenaReuse(
+	bucket storeio.BucketID,
+	hash uint64,
+	generation uint64,
+	key, value []byte,
+	stableSlot uint8,
+	journalDurableGeneration uint64,
+	leafBytes uint32,
+) (primaryUnifiedOverlayPrepared, bool) {
+	if generation == 0 || len(value) == 0 || o == nil ||
+		leafBytes == 0 || leafBytes > o.maxLeafBytes {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	previous, ok := o.sameSizeReusableRecord(
+		bucket, hash, key, len(value), stableSlot,
+		journalDurableGeneration,
+	)
+	if !ok {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	bucketSlot, bucketFound := o.bucketSlot(bucket)
+	if !bucketFound {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	entry := &o.buckets[bucketSlot]
+	currentReserved := entry.reservedBytes.Load()
+	fixedBytes := uint32(uint64(leafBytes) + uint64(o.parentBytes))
+	fixedBytes = max(fixedBytes, entry.fixedBytes.Load())
+	wideKeys := entry.wideKeys.Load()
+	if wideKeys < 0 {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	reservationWide := leafBytes == o.maxLeafBytes
+	previousWide := previous.reservationWide != 0
+	if reservationWide && !previousWide {
+		wideKeys++
+	} else if !reservationWide && previousWide {
+		wideKeys--
+	}
+	if wideKeys < 0 {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	reservedBytes := fixedBytes
+	if wideKeys != 0 {
+		reservedBytes = uint32(uint64(o.maxLeafBytes) + uint64(o.parentBytes))
+	}
+	currentDirty := o.dirtyBytes.Load()
+	if currentDirty < uint64(currentReserved) {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	dirtyAfter := currentDirty - uint64(currentReserved) + uint64(reservedBytes)
+	if dirtyAfter > o.dirtyByteLimit {
+		return primaryUnifiedOverlayPrepared{}, false
+	}
+	index := o.count.Load()
+	used := o.used.Load()
+	headSlot := uint32(hash & (primaryUnifiedOverlayTable - 1))
+	o.records[index] = primaryUnifiedOverlayRecord{
+		generation:     generation,
+		hash:           hash,
+		previous:       o.heads[headSlot].Load(),
+		bucketPrevious: o.buckets[bucketSlot].head.Load(),
+		bucket:         uint32(bucket),
+		keyOffset:      previous.keyOffset,
+		valueOff:       previous.valueOff,
+		valueLen:       previous.valueLen,
+		keyLen:         previous.keyLen,
+		kind:           primaryUnifiedOverlayPut,
+		slot:           stableSlot,
+		reservationWide: func() uint8 {
+			if reservationWide {
+				return 1
+			}
+			return 0
+		}(),
+	}
+	copy(
+		o.arena[previous.valueOff:previous.valueOff+previous.valueLen],
+		value,
+	)
+	return primaryUnifiedOverlayPrepared{
+		index: index, usedAfter: used,
+		headSlot: headSlot, bucketSlot: bucketSlot,
+		reservedBytes: reservedBytes, fixedBytes: fixedBytes,
+		wideKeys: wideKeys, dirtyAfter: dirtyAfter,
+	}, true
+}
+
 // prepare reserves and fills one record without publishing it. The caller may
 // abandon the reservation by doing nothing: the writer-owned count/used words
 // are advanced only by publish.
@@ -334,6 +557,52 @@ func (o *primaryUnifiedOverlay) prepare(
 	rawDelta, countDelta int,
 	kind, stableSlot uint8,
 ) (primaryUnifiedOverlayPrepared, error) {
+	if o == nil {
+		return primaryUnifiedOverlayPrepared{}, fmt.Errorf(
+			"%w: unified row overlay disabled", storeio.ErrPageCachePinned,
+		)
+	}
+	return o.prepareWithLeafBytes(
+		bucket, hash, generation, key, value,
+		rawDelta, countDelta, kind, stableSlot, o.maxLeafBytes,
+	)
+}
+
+// prepareWithLeafBytes is the certified fixed-extent admission path. Only the
+// concurrent existing-key lane may pass less than maxLeafBytes, and only after
+// PatchStableReplacementKeepsExtent proves the fold can patch that exact routed
+// extent. All structural/shape-changing callers use prepare above.
+func (o *primaryUnifiedOverlay) prepareWithLeafBytes(
+	bucket storeio.BucketID,
+	hash uint64,
+	generation uint64,
+	key, value []byte,
+	rawDelta, countDelta int,
+	kind, stableSlot uint8,
+	leafBytes uint32,
+) (primaryUnifiedOverlayPrepared, error) {
+	return o.prepareWithLeafReservation(
+		bucket, hash, generation, key, value,
+		rawDelta, countDelta, kind, stableSlot,
+		leafBytes, leafBytes == o.maxLeafBytes,
+	)
+}
+
+// prepareWithLeafReservation records both the routed fixed extent and whether
+// this key's newest final shape needs the conservative maximum extent. The
+// distinction lets a Delete -> certified Put transition remove only that key's
+// wide charge without discarding the immutable tombstone record needed by old
+// readers or recovery-journal construction.
+func (o *primaryUnifiedOverlay) prepareWithLeafReservation(
+	bucket storeio.BucketID,
+	hash uint64,
+	generation uint64,
+	key, value []byte,
+	rawDelta, countDelta int,
+	kind, stableSlot uint8,
+	fixedLeafBytes uint32,
+	reservationWide bool,
+) (primaryUnifiedOverlayPrepared, error) {
 	if o == nil || generation == 0 || len(key) == 0 ||
 		kind != primaryUnifiedOverlayPut &&
 			kind != primaryUnifiedOverlayDelete ||
@@ -344,7 +613,8 @@ func (o *primaryUnifiedOverlay) prepare(
 		)
 	}
 	if int(int32(rawDelta)) != rawDelta ||
-		countDelta < -1 || countDelta > 1 {
+		countDelta < -1 || countDelta > 1 ||
+		fixedLeafBytes == 0 || fixedLeafBytes > o.maxLeafBytes {
 		return primaryUnifiedOverlayPrepared{}, fmt.Errorf(
 			"%w: unified row overlay delta", storeio.ErrInvalidWrite,
 		)
@@ -360,9 +630,51 @@ func (o *primaryUnifiedOverlay) prepare(
 	}
 	bucketSlot, bucketFound := o.bucketSlot(bucket)
 	if !bucketFound &&
-		o.bucketCount.Load() >= primaryUnifiedOverlayBuckets {
+		o.bucketCount.Load() >= o.bucketLimit {
 		return primaryUnifiedOverlayPrepared{}, fmt.Errorf(
 			"%w: unified row overlay bucket pressure",
+			storeio.ErrPageCachePinned,
+		)
+	}
+	currentReserved := uint32(0)
+	currentFixed := uint32(0)
+	currentWide := int32(0)
+	if bucketFound {
+		entry := &o.buckets[bucketSlot]
+		currentReserved = entry.reservedBytes.Load()
+		currentFixed = entry.fixedBytes.Load()
+		currentWide = entry.wideKeys.Load()
+		if currentWide < 0 {
+			return primaryUnifiedOverlayPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+	}
+	fixedBytes := uint32(uint64(fixedLeafBytes) + uint64(o.parentBytes))
+	fixedBytes = max(fixedBytes, currentFixed)
+	previousWide, err := o.pendingKeyReservationWide(bucket, hash, key)
+	if err != nil {
+		return primaryUnifiedOverlayPrepared{}, err
+	}
+	wideKeys := currentWide
+	if reservationWide && !previousWide {
+		wideKeys++
+	} else if !reservationWide && previousWide {
+		wideKeys--
+	}
+	if wideKeys < 0 {
+		return primaryUnifiedOverlayPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	reservedBytes := fixedBytes
+	if wideKeys != 0 {
+		reservedBytes = uint32(uint64(o.maxLeafBytes) + uint64(o.parentBytes))
+	}
+	currentDirty := o.dirtyBytes.Load()
+	if currentDirty < uint64(currentReserved) {
+		return primaryUnifiedOverlayPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	dirtyAfter := currentDirty - uint64(currentReserved) + uint64(reservedBytes)
+	if dirtyAfter > o.dirtyByteLimit {
+		return primaryUnifiedOverlayPrepared{}, fmt.Errorf(
+			"%w: unified row overlay dirty-byte pressure",
 			storeio.ErrPageCachePinned,
 		)
 	}
@@ -385,10 +697,19 @@ func (o *primaryUnifiedOverlay) prepare(
 		countDelta:     int8(countDelta),
 		kind:           kind,
 		slot:           stableSlot,
+		reservationWide: func() uint8 {
+			if reservationWide {
+				return 1
+			}
+			return 0
+		}(),
 	}
 	return primaryUnifiedOverlayPrepared{
 		index: index, usedAfter: valueOff + uint32(len(value)),
-		headSlot: slot, bucketSlot: bucketSlot, newBucket: !bucketFound,
+		headSlot: slot, bucketSlot: bucketSlot,
+		reservedBytes: reservedBytes, fixedBytes: fixedBytes,
+		wideKeys: wideKeys, dirtyAfter: dirtyAfter,
+		newBucket: !bucketFound,
 	}, nil
 }
 
@@ -397,6 +718,9 @@ func (o *primaryUnifiedOverlay) publish(prepared primaryUnifiedOverlayPrepared) 
 	bucket := &o.buckets[prepared.bucketSlot]
 	if prepared.newBucket {
 		bucket.bucket.Store(record.bucket)
+		bucket.reservedBytes.Store(0)
+		bucket.fixedBytes.Store(0)
+		bucket.wideKeys.Store(0)
 		bucket.rawBytes.Store(0)
 		bucket.rows.Store(0)
 		for i := range bucket.insertSlots {
@@ -404,6 +728,13 @@ func (o *primaryUnifiedOverlay) publish(prepared primaryUnifiedOverlayPrepared) 
 		}
 		o.bucketCount.Add(1)
 	}
+	// prepared was computed from the immediately preceding published state by
+	// the serialized overlay publisher. Store the exact final-state reservation,
+	// including a safe downgrade when the last wide key is restored.
+	bucket.fixedBytes.Store(prepared.fixedBytes)
+	bucket.wideKeys.Store(prepared.wideKeys)
+	bucket.reservedBytes.Store(prepared.reservedBytes)
+	o.dirtyBytes.Store(prepared.dirtyAfter)
 	bucket.rawBytes.Add(int64(record.rawDelta))
 	bucket.rows.Add(int32(record.countDelta))
 	if record.countDelta > 0 {
@@ -457,132 +788,196 @@ func (o *primaryUnifiedOverlay) pendingBuckets(
 	return n, nil
 }
 
-// applyBucket replays this bucket's overlay records in generation order onto
-// the lexical base rows. Inserts and re-inserts carry their preselected stable
-// slot; replacements retain it; deletes remove the logical row.
+// applyBucket coalesces this bucket to its newest visible record per key, then
+// applies that final state to the lexical base rows. Deletes run first so an
+// otherwise-full base can make room for same-window inserts without retaining
+// the raw generation history on the stack.
 func (o *primaryUnifiedOverlay) applyBucket(
 	records []storeio.CommonPrimaryLeafRecord,
 	bucket storeio.BucketID,
 	generation uint64,
 ) ([]storeio.CommonPrimaryLeafRecord, error) {
-	folded := o.folded.Load()
-	var indexes [primaryUnifiedOverlayRecords]uint16
-	n := 0
-	head := o.pendingBucketHead(bucket, folded)
-	for head != 0 {
-		record := &o.records[head-1]
-		if record.generation <= folded {
-			break
-		}
-		if record.generation <= generation {
-			indexes[n] = uint16(head - 1)
-			n++
-		}
-		head = record.bucketPrevious
+	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
+	n, err := o.latestBucketRecords(&indexes, bucket, generation)
+	if err != nil {
+		return records, err
 	}
-	for at := n - 1; at >= 0; at-- {
-		record := &o.records[indexes[at]]
-		if record.bucket != uint32(bucket) {
-			return records, storeio.ErrCommonPrimaryLeafCorrupt
-		}
-		if record.generation > generation {
-			continue
-		}
-		keyEnd := record.keyOffset + uint32(record.keyLen)
-		if keyEnd > uint32(len(o.arena)) {
-			return records, storeio.ErrCommonPrimaryLeafCorrupt
-		}
-		key := o.arena[record.keyOffset:keyEnd:keyEnd]
-		lo, hi := 0, len(records)
-		for lo < hi {
-			mid := int(uint(lo+hi) >> 1)
-			if bytes.Compare(records[mid].Key, key) < 0 {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		found := lo < len(records) && bytes.Equal(records[lo].Key, key)
-		switch record.kind {
-		case primaryUnifiedOverlayPut:
-			valueEnd := record.valueOff + record.valueLen
-			if valueEnd > uint32(len(o.arena)) || record.valueLen == 0 {
-				return records, storeio.ErrCommonPrimaryLeafCorrupt
-			}
-			row := storeio.CommonPrimaryLeafRecord{
-				Slot: record.slot,
-				Key:  key,
-				Value: storeio.CommonPrimaryLeafValue{
-					Inline: o.arena[record.valueOff:valueEnd:valueEnd],
-				},
-			}
-			if found {
-				records[lo] = row
+	for _, phase := range [...]uint8{
+		primaryUnifiedOverlayDelete,
+		primaryUnifiedOverlayPut,
+	} {
+		for _, index := range indexes[:n] {
+			record := &o.records[index]
+			if record.kind != phase {
 				continue
 			}
-			if len(records) == cap(records) {
-				return records, storeio.ErrCommonPrimaryLeafFull
-			}
-			records = records[:len(records)+1]
-			copy(records[lo+1:], records[lo:len(records)-1])
-			records[lo] = row
-		case primaryUnifiedOverlayDelete:
-			if !found {
+			keyEnd := record.keyOffset + uint32(record.keyLen)
+			if keyEnd > uint32(len(o.arena)) {
 				return records, storeio.ErrCommonPrimaryLeafCorrupt
 			}
-			copy(records[lo:], records[lo+1:])
-			records[len(records)-1] = storeio.CommonPrimaryLeafRecord{}
-			records = records[:len(records)-1]
-		default:
-			return records, storeio.ErrCommonPrimaryLeafCorrupt
+			key := o.arena[record.keyOffset:keyEnd:keyEnd]
+			lo, hi := 0, len(records)
+			for lo < hi {
+				mid := int(uint(lo+hi) >> 1)
+				if bytes.Compare(records[mid].Key, key) < 0 {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			found := lo < len(records) && bytes.Equal(records[lo].Key, key)
+			switch record.kind {
+			case primaryUnifiedOverlayPut:
+				valueEnd := record.valueOff + record.valueLen
+				if valueEnd > uint32(len(o.arena)) || record.valueLen == 0 {
+					return records, storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				row := storeio.CommonPrimaryLeafRecord{
+					Slot: record.slot,
+					Key:  key,
+					Value: storeio.CommonPrimaryLeafValue{
+						Inline: o.arena[record.valueOff:valueEnd:valueEnd],
+					},
+				}
+				if found {
+					records[lo] = row
+					continue
+				}
+				if len(records) == cap(records) {
+					return records, storeio.ErrCommonPrimaryLeafFull
+				}
+				records = records[:len(records)+1]
+				copy(records[lo+1:], records[lo:len(records)-1])
+				records[lo] = row
+			case primaryUnifiedOverlayDelete:
+				// Insert -> Delete has no base row but is a valid coalesced final
+				// absence. A base-backed tombstone removes the existing row.
+				if !found {
+					continue
+				}
+				copy(records[lo:], records[lo+1:])
+				records[len(records)-1] = storeio.CommonPrimaryLeafRecord{}
+				records = records[:len(records)-1]
+			default:
+				return records, storeio.ErrCommonPrimaryLeafCorrupt
+			}
 		}
 	}
 	return records, nil
 }
 
-// latestBucketRecords collects the newest visible overlay record per key for
-// one bucket, sorted lexically by key. dst is caller-owned fixed storage so a
-// masked scan can merge inserted rows with the base leaf without allocating.
+// latestBucketRecords collects the newest visible overlay record per stable
+// slot for one bucket, sorted lexically by key. A stable slot belongs to one key
+// throughout an overlay window, so the caller-owned 256-entry dst doubles as an
+// O(1) slot-index table during the history walk. The fixed seen bitmap makes a
+// 32,768-record hot-bucket fold O(history), rather than comparing every record
+// with as many as 256 already-selected keys. Repeated slots and duplicate keys
+// across slots are still validated explicitly and fail closed.
 func (o *primaryUnifiedOverlay) latestBucketRecords(
-	dst *[primaryUnifiedOverlayRecords]uint16,
+	dst *[storeio.CommonPrimaryLeafWideSlots]uint16,
 	bucket storeio.BucketID,
 	generation uint64,
-) int {
+) (int, error) {
 	if o == nil || dst == nil {
-		return 0
+		return 0, nil
 	}
 	folded := o.folded.Load()
+	count := int(o.count.Load())
+	if count > len(o.records) {
+		return 0, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	used := o.used.Load()
+	if used > uint32(len(o.arena)) {
+		return 0, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	var seenSlots [storeio.CommonPrimaryLeafWideSlots / 64]uint64
 	n := 0
-	head := o.pendingBucketHead(bucket, folded)
+	newerGeneration := uint64(0)
+	bucketSlot, found := o.bucketSlot(bucket)
+	if !found {
+		return 0, nil
+	}
+	head := o.buckets[bucketSlot].head.Load()
 	for head != 0 {
+		// publish exposes the bucket head before count/used, while the owning
+		// collection generation remains old. A snapshot can therefore encounter
+		// one completely initialized future record beyond those two watermarks.
+		// Validate it against immutable backing storage, but require the tighter
+		// published watermarks before accepting any record visible at generation.
+		if head > uint32(len(o.records)) {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
 		index := head - 1
 		record := &o.records[index]
+		if record.bucket != uint32(bucket) {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		if record.generation == 0 ||
+			newerGeneration != 0 && record.generation >= newerGeneration {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		newerGeneration = record.generation
 		if record.generation <= folded {
 			break
 		}
-		head = record.bucketPrevious
+		next := record.bucketPrevious
+		if next >= head && next != 0 {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		head = next
+		keyEnd := uint64(record.keyOffset) + uint64(record.keyLen)
+		valueEnd := uint64(record.valueOff) + uint64(record.valueLen)
+		if record.keyLen == 0 || keyEnd > uint64(len(o.arena)) ||
+			uint64(record.valueOff) != keyEnd ||
+			valueEnd > uint64(len(o.arena)) ||
+			record.kind == primaryUnifiedOverlayPut &&
+				record.valueLen == 0 ||
+			record.kind == primaryUnifiedOverlayDelete && record.valueLen != 0 ||
+			record.kind != primaryUnifiedOverlayPut &&
+				record.kind != primaryUnifiedOverlayDelete {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
 		if record.generation > generation {
 			continue
 		}
-		keyEnd := record.keyOffset + uint32(record.keyLen)
-		if keyEnd > uint32(len(o.arena)) {
-			continue
+		if index >= uint32(count) || valueEnd > uint64(used) {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
 		}
-		key := o.arena[record.keyOffset:keyEnd:keyEnd]
-		duplicate := false
-		for at := 0; at < n; at++ {
-			other := &o.records[dst[at]]
-			otherEnd := other.keyOffset + uint32(other.keyLen)
-			if otherEnd <= uint32(len(o.arena)) &&
-				bytes.Equal(key, o.arena[other.keyOffset:otherEnd:otherEnd]) {
-				duplicate = true
-				break
+		key := o.arena[record.keyOffset:uint32(keyEnd):uint32(keyEnd)]
+		slot := int(record.slot)
+		word := slot >> 6
+		bit := uint64(1) << uint(slot&63)
+		if seenSlots[word]&bit != 0 {
+			other := &o.records[dst[slot]]
+			otherEnd := uint64(other.keyOffset) + uint64(other.keyLen)
+			if other.keyLen == 0 || otherEnd > uint64(used) {
+				return 0, storeio.ErrCommonPrimaryLeafCorrupt
 			}
-		}
-		if duplicate {
+			if !bytes.Equal(
+				key,
+				o.arena[other.keyOffset:uint32(otherEnd):uint32(otherEnd)],
+			) {
+				return 0, storeio.ErrCommonPrimaryLeafCorrupt
+			}
 			continue
 		}
-		dst[n] = uint16(index)
+		if n == len(dst) {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		seenSlots[word] |= bit
+		dst[slot] = uint16(index)
+		n++
+	}
+	// Compact the slot-index table in place. The output index never advances
+	// beyond the slot currently being read, so writing the dense prefix cannot
+	// overwrite an unseen slot's saved record index.
+	n = 0
+	for slot := range len(dst) {
+		if seenSlots[slot>>6]&(uint64(1)<<uint(slot&63)) == 0 {
+			continue
+		}
+		index := dst[slot]
+		dst[n] = index
 		n++
 	}
 	for i := 1; i < n; i++ {
@@ -604,7 +999,22 @@ func (o *primaryUnifiedOverlay) latestBucketRecords(
 		}
 		dst[at] = index
 	}
-	return n
+	// Stable-slot identity catches the common corruption case during the history
+	// walk. Sorting makes the converse invariant equally cheap to verify: the
+	// same key may not be assigned to two distinct stable slots.
+	for i := 1; i < n; i++ {
+		previous := &o.records[dst[i-1]]
+		previousEnd := previous.keyOffset + uint32(previous.keyLen)
+		current := &o.records[dst[i]]
+		currentEnd := current.keyOffset + uint32(current.keyLen)
+		if bytes.Equal(
+			o.arena[previous.keyOffset:previousEnd:previousEnd],
+			o.arena[current.keyOffset:currentEnd:currentEnd],
+		) {
+			return 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+	}
+	return n, nil
 }
 
 // checkpointEntries exposes every raw overlay publication in
@@ -682,6 +1092,9 @@ func (o *primaryUnifiedOverlay) markFolded(generation uint64, recycle bool) {
 	for i := range o.buckets {
 		bucket := &o.buckets[i]
 		bucket.head.Store(0)
+		bucket.reservedBytes.Store(0)
+		bucket.fixedBytes.Store(0)
+		bucket.wideKeys.Store(0)
 		bucket.rawBytes.Store(0)
 		bucket.rows.Store(0)
 		for slot := range bucket.insertSlots {
@@ -689,6 +1102,7 @@ func (o *primaryUnifiedOverlay) markFolded(generation uint64, recycle bool) {
 		}
 	}
 	o.bucketCount.Store(0)
+	o.dirtyBytes.Store(0)
 	if !recycle {
 		return
 	}

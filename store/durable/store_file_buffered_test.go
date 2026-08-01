@@ -319,22 +319,39 @@ func TestFileStoreCheckpointStrengthIsExplicitAndConstrained(t *testing.T) {
 }
 
 func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T) {
-	// A buffered-visible class-5 overlay tracks at most 64 distinct dirty leaves
-	// per fold. Touching a 65th distinct leaf with no intervening Flush is the
-	// genuine staging-pressure trigger: it folds the first window into a rooted
-	// publication and accounts it as a device-silent overlay fold.
+	// A buffered-visible class-5 overlay tracks a normalized, bounded number of
+	// distinct dirty leaves per fold. Touching the next distinct leaf with no
+	// intervening Flush is the genuine staging-pressure trigger: it folds the
+	// first window into a rooted publication and accounts it as a device-silent
+	// overlay fold.
 	//
-	// This seeds a corpus wide enough to span well past 64 routed leaves through
-	// the bulk cutover -- which does not run the row-overlay logic, so the seed
-	// leaves both pressure counters at zero -- then updates one key from
-	// each of more than 64 distinct leaves inside a single window. No snapshot is
-	// held, so the completed fold can recycle its row arena immediately.
+	// This seeds a corpus wide enough to span the explicitly narrowed runtime
+	// window. The bulk cutover does not run the row-overlay logic, so the seed
+	// leaves both pressure counters at zero; the test then updates one key from
+	// each of more than that many distinct leaves inside a single window. No
+	// snapshot is held, so the completed fold can recycle its row arena
+	// immediately.
 	const corpusSize = 12_000
 	built, keys, _ := buildFilePrimaryCorpus(t, corpusSize)
 	options := Options{
-		Backend:       BackendPortable,
-		ResidentBytes: 32 << 20,
-		Durability:    DurabilityBufferedVisible,
+		Backend:           BackendPortable,
+		ResidentBytes:     32 << 20,
+		Durability:        DurabilityBufferedVisible,
+		MaxBatchDocuments: 1,
+		MaxDocumentBytes:  1 << 10,
+		// Exercise runtime pressure without requiring a corpus wider than the
+		// 1,024-leaf compile-time ceiling. Normalization derives the exact
+		// admitted leaf window from this descriptor pool.
+		BufferCount: 384,
+	}
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pressureLimit := normalized.primaryUnifiedOverlayBuckets
+	if pressureLimit <= 0 || pressureLimit >= primaryUnifiedOverlayBuckets {
+		t.Fatalf("overlay pressure limit = %d, want a narrowed runtime window in (0, %d)",
+			pressureLimit, primaryUnifiedOverlayBuckets)
 	}
 	file := createPrimaryPointFile(t, built, options, "buffered-pressure.db")
 	path := file.Name()
@@ -356,10 +373,10 @@ func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T)
 		)
 	}
 
-	// One key per distinct routed leaf, enough to cross the 64-leaf cap. Selecting
-	// by route bucket guarantees the update window touches strictly more than
-	// filePrimaryPendingParentLimit distinct leaves.
-	const wantLeaves = filePrimaryPendingParentLimit + 16
+	// One key per distinct routed leaf, enough to cross the normalized cap.
+	// Selecting by route bucket guarantees the update window touches strictly
+	// more than the collection's admitted dirty-leaf count.
+	wantLeaves := pressureLimit + 8
 	state := collection.state.Load()
 	seen := make(map[storeio.BucketID]struct{}, wantLeaves)
 	targets := make([]string, 0, wantLeaves)
@@ -377,10 +394,10 @@ func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T)
 			break
 		}
 	}
-	if len(targets) <= filePrimaryPendingParentLimit {
+	if len(targets) <= pressureLimit {
 		t.Fatalf(
 			"seed corpus spanned only %d distinct leaves, need more than %d",
-			len(targets), filePrimaryPendingParentLimit,
+			len(targets), pressureLimit,
 		)
 	}
 
@@ -579,6 +596,7 @@ func TestFileStoreBufferedVisibleNeverDurableReusePlateausAndReopens(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeSnapshots := collection.committer.Stats()
 
 	key := []byte("hot")
 	var last []byte
@@ -598,9 +616,11 @@ func TestFileStoreBufferedVisibleNeverDurableReusePlateausAndReopens(t *testing.
 		if _, err := collection.Put(key, value); err != nil {
 			t.Fatalf("cycle %d Put: %v", cycle, err)
 		}
-		// Snapshot materializes the current overlay without authorizing a
-		// physical checkpoint. Closing it before the next mutation gives the
-		// following publication the exact no-reader supersession proof.
+		// An admitted Snapshot materializes the current overlay without
+		// authorizing a physical checkpoint. Bounded staging pressure may force a
+		// later foreground checkpoint; closing each snapshot before the next
+		// mutation gives every intervening publication the exact no-reader
+		// supersession proof.
 		snapshot, err := collection.Snapshot()
 		if err != nil {
 			t.Fatalf("cycle %d Snapshot: %v", cycle, err)
@@ -615,6 +635,16 @@ func TestFileStoreBufferedVisibleNeverDurableReusePlateausAndReopens(t *testing.
 		}
 		if err := snapshot.Close(); err != nil {
 			t.Fatal(err)
+		}
+		if cycle == 0 {
+			stats := collection.committer.Stats()
+			if stats.DeviceCommits != beforeSnapshots.DeviceCommits ||
+				stats.DurableGeneration != beforeSnapshots.DurableGeneration {
+				t.Fatalf(
+					"ordinary snapshot crossed a physical checkpoint: before=%+v after=%+v",
+					beforeSnapshots, stats,
+				)
+			}
 		}
 		if cycle == warmup-1 {
 			plateau = collection.state.Load().fileEnd
@@ -631,8 +661,12 @@ func TestFileStoreBufferedVisibleNeverDurableReusePlateausAndReopens(t *testing.
 			plateau, after, after-plateau, maxGrowth,
 		)
 	}
-	if stats := collection.committer.Stats(); stats.SupersededPageWrites == 0 {
+	stats := collection.committer.Stats()
+	if stats.SupersededPageWrites == 0 {
 		t.Fatalf("materialized churn superseded no queued page writes: %+v", stats)
+	}
+	if forced := collection.Stats().AutomaticCheckpoints; forced == 0 {
+		t.Fatal("bounded snapshot churn forced no observable checkpoint")
 	}
 	if err := flushPhysicalForTest(collection); err != nil {
 		t.Fatal(err)

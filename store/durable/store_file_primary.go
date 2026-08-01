@@ -528,7 +528,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 	if overlay := c.primaryUnifiedOverlay; overlay != nil {
 		c.primaryUnifiedReplacementScratch = make(
 			[]storeio.CommonPrimaryUnifiedReplacement,
-			0, primaryUnifiedOverlayRecords,
+			0, storeio.CommonPrimaryLeafWideSlots,
 		)
 		indexEntries := min(c.options.InlineValueBytes+2, 8192)
 		indexEntries = max(indexEntries, 64)
@@ -557,9 +557,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 	// volatile-retire scratch. Async-visible on a primary graph uses the committer
 	// path and does not.
 	if c.buffered() || c.synchronous() {
-		pendingCapacity := min(
-			c.options.MaxRetiredExtents, filePrimaryPendingParentLimit,
-		)
+		pendingCapacity := filePrimaryPendingCapacity(c.options)
 		c.primaryPendingParents = make(
 			[]filePrimaryPendingParent, 0, pendingCapacity,
 		)

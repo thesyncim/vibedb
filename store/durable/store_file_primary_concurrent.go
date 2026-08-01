@@ -2,7 +2,9 @@ package durable
 
 import (
 	"errors"
+	"math/bits"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -37,9 +39,14 @@ const (
 var (
 	errConcurrentPrimaryPressure = errors.New("vibejson: concurrent primary overlay pressure")
 
-	concurrentPrimaryReplaceStagedHook  func(storeio.BucketID)
-	concurrentPrimaryReplacePublishHook func(storeio.BucketID, uint64)
-	concurrentPrimaryExclusiveWaitHook  func(string)
+	concurrentPrimaryReplaceStagedHook   func(storeio.BucketID)
+	concurrentPrimaryReplacePublishHook  func(storeio.BucketID, uint64)
+	concurrentPrimaryStripeContendedHook func(storeio.BucketID)
+	concurrentPrimaryExclusiveWaitHook   func(string)
+	// concurrentPrimaryPutCanonicalizeHook brackets only the writer-private
+	// canonicalization phase. Tests use it to prove an exclusive writer can
+	// pass while that phase is in flight; production leaves it nil.
+	concurrentPrimaryPutCanonicalizeHook func(done bool)
 )
 
 // primaryConcurrentStripe keeps adjacent bucket locks on different cache
@@ -55,52 +62,89 @@ func primaryConcurrentStripeIndex(bucket storeio.BucketID) uint32 {
 		(primaryConcurrentStripeCount - 1)
 }
 
+func primaryConcurrentDocumentCount(
+	base uint64, delta int64,
+) (uint64, bool) {
+	if delta < 0 {
+		magnitude := uint64(-(delta + 1)) + 1
+		if magnitude > base {
+			return 0, false
+		}
+		return base - magnitude, true
+	}
+	magnitude := uint64(delta)
+	if magnitude > ^uint64(0)-base {
+		return 0, false
+	}
+	return base + magnitude, true
+}
+
 // primaryConcurrentContext owns every mutable byte touched while one caller
 // validates and canonicalizes a candidate replacement. The collection's
 // historical scratch remains exclusive-writer-owned for every fallback lane.
 type primaryConcurrentContext struct {
-	index     []vibejson.IndexEntry
-	canonical []byte
-	workspace storeio.CanonicalWorkspace
-	publish   primaryConcurrentPublishRequest
+	index      []vibejson.IndexEntry
+	patchSpans []storeio.UnifiedTokenSpan
+	canonical  []byte
+	workspace  storeio.CanonicalWorkspace
+	publish    primaryConcurrentPublishRequest
+	poolSlot   uint8
 }
 
 func (c *primaryConcurrentContext) canonicalize(
 	src []byte,
-) (canonical []byte, eligible bool, err error) {
+) (
+	canonical []byte,
+	spanned storeio.CanonicalSpanIndex,
+	eligible bool,
+	err error,
+) {
 	index, err := vibejson.BuildIndex(src, c.index[:cap(c.index)])
 	if errors.Is(err, document.ErrIndexFull) {
-		return nil, false, nil
+		return nil, storeio.CanonicalSpanIndex{}, false, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, storeio.CanonicalSpanIndex{}, false, err
 	}
 	c.index = index.Entries
-	if storeio.IndexIsCanonical(index, &c.workspace) {
-		return src, true, nil
+	if canonicalIndex, ok := storeio.CanonicalSpanIndexOf(
+		index, &c.workspace, c.patchSpans[:0],
+	); ok {
+		return src, canonicalIndex, true, nil
 	}
-	out, err := storeio.AppendCanonicalIndexed(
-		c.canonical[:0], index, &c.workspace,
+	out, canonicalIndex, err := storeio.AppendCanonicalIndexedSpans(
+		c.canonical[:0], index, &c.workspace, c.patchSpans[:0],
 	)
+	if errors.Is(err, document.ErrIndexFull) {
+		return nil, storeio.CanonicalSpanIndex{}, false, nil
+	}
 	if err != nil {
-		return nil, false, err
+		return nil, storeio.CanonicalSpanIndex{}, false, err
 	}
 	if cap(out) > cap(c.canonical) {
 		// The 2x source admission bound should make this unreachable. Do not
 		// retain an unexpectedly grown buffer if the canonical encoder evolves.
-		return nil, false, nil
+		return nil, storeio.CanonicalSpanIndex{}, false, nil
 	}
 	c.canonical = out
-	return out, true, nil
+	return out, canonicalIndex, true, nil
 }
 
-// primaryConcurrentContextPool is fixed at collection construction. Context
-// slices warm only to documents admitted by the inline fast path and are then
-// reused; unlike sync.Pool, GC cannot silently discard and recreate them.
+// primaryConcurrentContextPool is fixed at collection construction. Every
+// context receives its maximum admitted tape, span, canonical, and workspace
+// capacity up front and is then reused; unlike sync.Pool, GC cannot silently
+// discard and recreate it.
 type primaryConcurrentContextPool struct {
-	contexts  []primaryConcurrentContext
-	available chan *primaryConcurrentContext
-	rawLimit  int
+	contexts []primaryConcurrentContext
+	// free contains one bit per context. The ordinary path claims a bit with a
+	// bounded CAS attempt and never enters a channel or mutex. A caller that
+	// observes exhaustion joins wait below; later fast callers also join that
+	// lane so an already-blocked caller cannot be starved by barging.
+	free     atomic.Uint32
+	waiters  atomic.Uint32
+	waitMu   sync.Mutex
+	wait     sync.Cond
+	rawLimit int
 }
 
 func newPrimaryConcurrentContextPool(
@@ -120,13 +164,22 @@ func newPrimaryConcurrentContextPool(
 	rawLimit := min(options.InlineValueBytes, primaryConcurrentRawScratchLimit)
 	indexEntries := min(rawLimit+2, primaryConcurrentIndexLimit)
 	pool := &primaryConcurrentContextPool{
-		contexts:  make([]primaryConcurrentContext, count),
-		available: make(chan *primaryConcurrentContext, count),
-		rawLimit:  rawLimit,
+		contexts: make([]primaryConcurrentContext, count),
+		rawLimit: rawLimit,
 	}
+	pool.wait.L = &pool.waitMu
+	free := ^uint32(0)
+	if count < primaryConcurrentContextLimit {
+		free = uint32(1)<<uint(count) - 1
+	}
+	pool.free.Store(free)
 	for i := range pool.contexts {
+		pool.contexts[i].poolSlot = uint8(i)
 		pool.contexts[i].index = make(
 			[]vibejson.IndexEntry, 0, indexEntries,
+		)
+		pool.contexts[i].patchSpans = make(
+			[]storeio.UnifiedTokenSpan, 0, 2*indexEntries,
 		)
 		pool.contexts[i].canonical = make([]byte, 0, 2*rawLimit)
 		pool.contexts[i].workspace = storeio.NewCanonicalWorkspace(
@@ -135,7 +188,6 @@ func newPrimaryConcurrentContextPool(
 		pool.contexts[i].publish.signal = make(
 			chan primaryConcurrentPublishSignal, 1,
 		)
-		pool.available <- &pool.contexts[i]
 	}
 	return pool
 }
@@ -150,6 +202,8 @@ func (p *primaryConcurrentContextPool) capacityBytes() uint64 {
 		context := &p.contexts[i]
 		bytes += uint64(cap(context.index)) *
 			uint64(unsafe.Sizeof(vibejson.IndexEntry{}))
+		bytes += uint64(cap(context.patchSpans)) *
+			uint64(unsafe.Sizeof(storeio.UnifiedTokenSpan{}))
 		bytes += uint64(cap(context.canonical))
 		bytes += context.workspace.CapacityBytes()
 	}
@@ -160,7 +214,41 @@ func (p *primaryConcurrentContextPool) acquire() *primaryConcurrentContext {
 	if p == nil {
 		return nil
 	}
-	return <-p.available
+	// At most one claim can win per context. Retrying once per fixed slot absorbs
+	// every claimant already in flight without an unbounded CAS spin; genuine
+	// exhaustion or a sustained collision then enters the sleeping lane.
+	for attempt := 0; attempt < primaryConcurrentContextLimit &&
+		p.waiters.Load() == 0; attempt++ {
+		available := p.free.Load()
+		if available == 0 {
+			break
+		}
+		slot := uint32(bits.TrailingZeros32(available))
+		bit := uint32(1) << slot
+		if p.free.CompareAndSwap(available, available&^bit) {
+			return &p.contexts[slot]
+		}
+	}
+
+	p.waitMu.Lock()
+	p.waiters.Add(1)
+	for {
+		available := p.free.Load()
+		if available != 0 {
+			slot := uint32(bits.TrailingZeros32(available))
+			bit := uint32(1) << slot
+			if p.free.CompareAndSwap(available, available&^bit) {
+				p.waiters.Add(^uint32(0))
+				p.waitMu.Unlock()
+				return &p.contexts[slot]
+			}
+			// A fast claimant that passed the waiter check before we published
+			// it made progress. Re-read the predicate under waitMu; once those
+			// bounded in-flight claims finish, fast callers must join this lane.
+			continue
+		}
+		p.wait.Wait()
+	}
 }
 
 func (p *primaryConcurrentContextPool) release(
@@ -169,7 +257,22 @@ func (p *primaryConcurrentContextPool) release(
 	if p == nil || context == nil {
 		return
 	}
-	p.available <- context
+	slot := uint32(context.poolSlot)
+	if slot >= uint32(len(p.contexts)) || &p.contexts[slot] != context {
+		panic("vibejson: foreign concurrent primary context release")
+	}
+	bit := uint32(1) << slot
+	if old := p.free.Or(bit); old&bit != 0 {
+		panic("vibejson: duplicate concurrent primary context release")
+	}
+	if p.waiters.Load() != 0 {
+		// Locking around Signal closes the check/sleep race: a waiter either
+		// observes the returned bit while holding waitMu or is already queued
+		// when this signal is issued.
+		p.waitMu.Lock()
+		p.wait.Signal()
+		p.waitMu.Unlock()
+	}
 }
 
 type primaryConcurrentPublishSignal struct {
@@ -179,12 +282,16 @@ type primaryConcurrentPublishSignal struct {
 }
 
 type primaryConcurrentPublishRequest struct {
-	key        []byte
-	canonical  []byte
-	route      storeio.ResidentPrimaryRoute
-	rawDelta   int
-	stableSlot uint8
-	signal     chan primaryConcurrentPublishSignal
+	key         []byte
+	canonical   []byte
+	route       storeio.ResidentPrimaryRoute
+	rawDelta    int
+	countDelta  int
+	kind        uint8
+	stableSlot  uint8
+	fixedExtent bool
+	fillsEmpty  bool
+	signal      chan primaryConcurrentPublishSignal
 }
 
 // primaryConcurrentPublisher is a bounded flat-combining handoff. Every
@@ -242,7 +349,7 @@ func (p *primaryConcurrentPublisher) runOne(collection *Collection) {
 	p.count = 0
 	p.mu.Unlock()
 
-	collection.publishConcurrentPrimaryReplaces(p.batch[:count])
+	collection.publishConcurrentPrimaryMutations(p.batch[:count])
 	clear(p.batch[:count])
 
 	p.mu.Lock()
@@ -258,7 +365,7 @@ func (p *primaryConcurrentPublisher) runOne(collection *Collection) {
 	}
 }
 
-func (c *Collection) publishConcurrentPrimaryReplaces(
+func (c *Collection) publishConcurrentPrimaryMutations(
 	requests []*primaryConcurrentPublishRequest,
 ) {
 	if len(requests) == 0 {
@@ -275,23 +382,42 @@ func (c *Collection) publishConcurrentPrimaryReplaces(
 		}
 		return
 	}
-	for _, request := range requests {
-		route, ok := router.Route(request.key)
-		if !ok || route.Ref != request.route.Ref ||
-			route.Bucket != request.route.Bucket ||
-			route.Hash != request.route.Hash {
-			for _, pending := range requests {
-				pending.signal <- primaryConcurrentPublishSignal{
-					err: storeio.ErrSegmentedTabletRouterCorrupt,
-				}
-			}
-			return
-		}
-	}
 
 	var results [primaryConcurrentContextLimit]primaryConcurrentPublishSignal
 	published := 0
 	c.primaryUnifiedSeen = true
+	journalCovered := c.journalDeltaGeneration.Load()
+	reuseCandidate := false
+	for _, request := range requests {
+		if request.kind == primaryUnifiedOverlayPut &&
+			request.countDelta == 0 && request.rawDelta == 0 &&
+			c.primaryUnifiedOverlay.canReuseSameSizeArena(
+				request.route.Bucket, request.route.Hash,
+				request.key, request.canonical, request.stableSlot,
+				journalCovered,
+			) {
+			reuseCandidate = true
+			break
+		}
+	}
+	// Overwriting a journal-covered arena value is safe only after excluding
+	// every reader of the older visible generation. Snapshot leases are frozen
+	// by snapshotGate and new direct epochs are diverted by the fence. Keep both
+	// through state publication so no reader can observe the overwritten old
+	// bytes under the old generation.
+	reuseFence := false
+	if reuseCandidate {
+		c.snapshotGate.Lock()
+		c.beginReaderFence()
+		if !c.anyActiveReaders() {
+			reuseFence = true
+		} else {
+			c.endReaderFence()
+			c.snapshotGate.Unlock()
+		}
+	}
+	documentDelta := int64(0)
+	replacements := uint64(0)
 	for index, request := range requests {
 		// A group can begin below the on-disk generation ceiling but reach it
 		// before every member is assigned. Stop at the largest representable
@@ -301,22 +427,56 @@ func (c *Collection) publishConcurrentPrimaryReplaces(
 			break
 		}
 		generation := latest.root.Generation + uint64(published) + 1
+		nextDocumentDelta := documentDelta + int64(request.countDelta)
+		if _, valid := primaryConcurrentDocumentCount(
+			latest.root.DocumentCount, nextDocumentDelta,
+		); !valid {
+			for invalid := index; invalid < len(requests); invalid++ {
+				results[invalid].err = storeio.ErrInvalidWrite
+			}
+			break
+		}
 		if concurrentPrimaryReplacePublishHook != nil {
 			concurrentPrimaryReplacePublishHook(
 				request.route.Bucket, generation,
 			)
 		}
-		prepared, err := c.primaryUnifiedOverlay.prepare(
-			request.route.Bucket, request.route.Hash, generation,
-			request.key, request.canonical, request.rawDelta, 0,
-			primaryUnifiedOverlayPut, request.stableSlot,
-		)
+		var prepared primaryUnifiedOverlayPrepared
+		reused := false
+		leafBytes := c.primaryUnifiedOverlay.maxLeafBytes
+		if request.fixedExtent {
+			leafBytes = request.route.Ref.Length
+		}
+		if reuseFence && request.kind == primaryUnifiedOverlayPut &&
+			request.countDelta == 0 && request.rawDelta == 0 {
+			prepared, reused =
+				c.primaryUnifiedOverlay.prepareSameSizeArenaReuse(
+					request.route.Bucket, request.route.Hash, generation,
+					request.key, request.canonical, request.stableSlot,
+					journalCovered, leafBytes,
+				)
+		}
+		var err error
+		if !reused {
+			prepared, err = c.primaryUnifiedOverlay.prepareWithLeafReservation(
+				request.route.Bucket, request.route.Hash, generation,
+				request.key, request.canonical, request.rawDelta,
+				request.countDelta, request.kind, request.stableSlot,
+				request.route.Ref.Length, !request.fixedExtent,
+			)
+		}
 		if err != nil {
 			// Record/arena pressure is global. Nothing later in this drained
 			// group can create capacity, so leave this request and the suffix for
-			// one coordinated exclusive fold/retry path.
-			for pressure := index; pressure < len(requests); pressure++ {
-				results[pressure].err = errConcurrentPrimaryPressure
+			// one coordinated exclusive fold/retry path. Invariant and validation
+			// errors are not capacity signals: preserve them so callers fail closed
+			// instead of performing an unrelated fold and hiding the original cause.
+			publishErr := err
+			if errors.Is(err, storeio.ErrPageCachePinned) {
+				publishErr = errConcurrentPrimaryPressure
+			}
+			for pending := index; pending < len(requests); pending++ {
+				results[pending].err = publishErr
 			}
 			break
 		}
@@ -325,11 +485,19 @@ func (c *Collection) publishConcurrentPrimaryReplaces(
 		// filter it; no new reader can select the future generation yet.
 		c.primaryUnifiedOverlay.publish(prepared)
 		results[index].handled = true
+		documentDelta = nextDocumentDelta
+		if request.kind == primaryUnifiedOverlayPut &&
+			request.countDelta == 0 {
+			replacements++
+		}
 		published++
 	}
 	if published != 0 {
 		finalRoot := latest.root
 		finalRoot.Generation += uint64(published)
+		finalRoot.DocumentCount, _ = primaryConcurrentDocumentCount(
+			latest.root.DocumentCount, documentDelta,
+		)
 		finalState := &fileStoreState{
 			root: finalRoot, fileEnd: latest.fileEnd,
 			freeHead: latest.freeHead,
@@ -337,110 +505,144 @@ func (c *Collection) publishConcurrentPrimaryReplaces(
 		// The group is one visibility cut. Overlay records retain one consecutive
 		// generation per logical replacement for journal-delta replay, while the
 		// router and public state need only expose the final generation.
-		c.snapshotGate.Lock()
-		c.beginReaderFence()
+		if !reuseFence {
+			c.snapshotGate.Lock()
+			c.beginReaderFence()
+		}
 		router.AdvanceGeneration(finalRoot.Generation)
+		for _, request := range requests[:published] {
+			if request.fillsEmpty && router.ClearEmpty(request.route) {
+				c.removePrimaryEmptyLeaf()
+			}
+		}
 		c.pageValidator.update(finalState)
 		c.publishFileState(finalState)
 		c.endReaderFence()
 		c.snapshotGate.Unlock()
-		c.concurrentPrimaryReplaces.Add(uint64(published))
-		c.concurrentPrimaryPublishGroups.Add(1)
+		reuseFence = false
+		if replacements != 0 {
+			c.concurrentPrimaryReplaces.Add(replacements)
+		}
 		groupSize := uint64(published)
+		c.concurrentPrimaryPublishGroups.Add(1)
 		for largest := c.concurrentPrimaryLargestPublishGroup.Load(); groupSize > largest &&
 			!c.concurrentPrimaryLargestPublishGroup.CompareAndSwap(largest, groupSize); largest = c.concurrentPrimaryLargestPublishGroup.Load() {
 		}
+	}
+	if reuseFence {
+		c.endReaderFence()
+		c.snapshotGate.Unlock()
 	}
 	for index, request := range requests {
 		request.signal <- results[index]
 	}
 }
 
-// tryConcurrentPrimaryReplace applies the one mutation shape whose fallible
-// work is leaf-local: an existing inline row replacement in an ordinary
-// buffered-visible, schemaless, unindexed collection. handled=false means the
-// caller must release this function's defers and enter the unchanged exclusive
-// path; this function never attempts an RWMutex upgrade.
-func (c *Collection) tryConcurrentPrimaryReplace(
+// tryConcurrentPrimaryPut applies every Put whose fallible work is leaf-local:
+// an inline replacement, a resurrection, or an insert that can claim one free
+// stable envelope slot and still satisfy the leaf's exact trivial-content
+// bound. Splits, overflow, and slot exhaustion remain structural fallbacks.
+// handled=false means the caller must release this function's defers and enter
+// that unchanged lane; this function never attempts an RWMutex upgrade.
+func (c *Collection) tryConcurrentPrimaryPut(
 	key, src []byte,
-) (handled bool, err error) {
+) (handled, created bool, err error) {
 	pool := c.primaryConcurrentContexts
 	if pool == nil {
-		return false, nil
+		return false, false, nil
 	}
 	context := pool.acquire()
 	defer pool.release(context)
 
+	// These bounds and the context belong exclusively to this caller and are
+	// immutable for the collection's lifetime. Keep validation and JSON tape /
+	// canonical construction outside writer so an exclusive checkpoint or
+	// structural writer cannot be convoyed behind CPU-private work. Any result
+	// remains provisional until the locked closed, persistence, and lane checks
+	// below have re-established their public error precedence.
+	eligible := true
+	var preflightErr error
+	var canonical []byte
+	var canonicalIndex storeio.CanonicalSpanIndex
+	switch {
+	case len(key) == 0 || len(key) > c.options.MaxKeyBytes ||
+		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes:
+		preflightErr = ErrKeyTooLarge
+	case len(src) == 0 || len(src) > c.options.MaxDocumentBytes:
+		preflightErr = ErrDocumentTooLarge
+	case len(src) > c.options.InlineValueBytes || len(src) > pool.rawLimit:
+		// Values that cannot possibly enter the inline overlay are left to the
+		// established path without paying for a parallel tape build.
+		eligible = false
+	default:
+		if hook := concurrentPrimaryPutCanonicalizeHook; hook == nil {
+			canonical, canonicalIndex, eligible, preflightErr =
+				context.canonicalize(src)
+		} else {
+			hook(false)
+			canonical, canonicalIndex, eligible, preflightErr =
+				context.canonicalize(src)
+			hook(true)
+		}
+		if preflightErr == nil && eligible &&
+			len(canonical) > c.options.InlineValueBytes {
+			eligible = false
+		}
+	}
+
 	c.writer.RLock()
 	defer c.writer.RUnlock()
 	if c.closed {
-		return false, ErrClosed
+		return false, false, ErrClosed
 	}
 	if failure := c.PersistenceError(); failure != nil {
-		return false, failure
+		return false, false, failure
 	}
 	if !c.buffered() || c.options.RecoveryJournal ||
 		c.options.Collection.Schema != nil ||
 		len(c.options.indexes) != 0 || c.primaryEpoch != nil ||
 		c.onlineIndexBuild.Load() || c.journalReplaying ||
 		c.primaryUnifiedOverlay == nil {
-		return false, nil
+		return false, false, nil
 	}
-	// Preserve the established buffered-visible reader veto. A deferred
-	// Snapshot acquires its generation lease while holding writer exclusively,
-	// so this sample is stable for snapshot leases for the lifetime of our
-	// shared hold: an existing lease declines here, and a new one cannot be
-	// pinned until RUnlock. Direct read epochs are a conservative sampled veto;
-	// a reader arriving after the sample remains safe through generation-filtered
-	// overlay publication and the publisher's reader fence.
-	if c.anyActiveReaders() {
-		return false, nil
-	}
-	if len(key) == 0 || len(key) > c.options.MaxKeyBytes ||
-		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
-		return false, ErrKeyTooLarge
-	}
-	if len(src) == 0 || len(src) > c.options.MaxDocumentBytes {
-		return false, ErrDocumentTooLarge
-	}
-	// Values that cannot possibly enter the inline overlay are left to the
-	// established path without paying for a parallel tape build.
-	if len(src) > c.options.InlineValueBytes || len(src) > pool.rawLimit {
-		return false, nil
-	}
-	canonical, eligible, err := context.canonicalize(src)
-	if err != nil {
-		return false, err
+	if preflightErr != nil {
+		return false, false, preflightErr
 	}
 	if !eligible {
-		return false, nil
+		return false, false, nil
 	}
-	if len(canonical) > c.options.InlineValueBytes ||
-		len(key)+len(canonical) > len(c.primaryUnifiedOverlay.arena) {
-		return false, nil
+	// Readers do not veto append-only overlay publication: they filter immutable
+	// records by generation, and the publisher fences router/state advancement.
+	// The only destructive optimization, arena reuse, independently raises a
+	// reader fence and declines while either a Snapshot lease or direct epoch is
+	// active. A long-lived Snapshot may therefore consume the bounded append
+	// window, but pressure still falls back through the established fenced fold.
+	if len(key)+len(canonical) > len(c.primaryUnifiedOverlay.arena) {
+		return false, false, nil
 	}
 
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
-		return false, ErrClosed
+		return false, false, ErrClosed
 	}
 	router := c.primaryRouter.Load()
 	if router == nil {
-		return false, storeio.ErrSegmentedTabletRouterCorrupt
+		return false, false, storeio.ErrSegmentedTabletRouterCorrupt
 	}
 	route, ok := router.Route(key)
 	if !ok || route.Ref == (storeio.PageRef{}) {
-		return false, storeio.ErrSegmentedTabletRouterCorrupt
+		return false, false, storeio.ErrSegmentedTabletRouterCorrupt
 	}
 
 	stripe := &c.primaryConcurrentStripes[primaryConcurrentStripeIndex(route.Bucket)]
 	if !stripe.mu.TryLock() {
-		// A same-bucket (or rare hash-collision) waiter is cheaper on the mature
-		// exclusive path than parked here holding a shared writer admission and a
-		// canonicalization context. Dropping RLock through the defer before the
-		// fallback also lets Go's RWMutex writer preference stop a hot-bucket
-		// stampede from starving that path.
-		return false, nil
+		// Wait only for this bounded leaf stripe. Falling back to the exclusive
+		// writer here makes Go's RWMutex writer preference convoy every unrelated
+		// shared writer behind a single same-leaf collision.
+		if concurrentPrimaryStripeContendedHook != nil {
+			concurrentPrimaryStripeContendedHook(route.Bucket)
+		}
+		stripe.mu.Lock()
 	}
 	defer stripe.mu.Unlock()
 
@@ -450,58 +652,96 @@ func (c *Collection) tryConcurrentPrimaryReplace(
 	// invalidating this bucket-local size calculation.
 	state = c.state.Load()
 	if state == nil {
-		return false, ErrClosed
+		return false, false, ErrClosed
 	}
 	leafLease, err := router.AcquireLeaf(c.cache, route)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	page := leafLease.Page()
 	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
 		leafLease.Release()
-		return false, nil
+		return false, false, nil
 	}
 	leaf, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
 		page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
 	)
 	if !ok {
 		leafLease.Release()
-		return false, storeio.ErrCommonPrimaryLeafCorrupt
+		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 	baseSlot, body, overflow, baseFound :=
 		leaf.LookupBodySlotHashed(route.Hash, key)
 	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
 		route.Bucket, route.Hash, key, state.root.Generation,
 	)
+	pendingRaw, pendingRows :=
+		c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
+	leafWasEmpty := leaf.Len()+pendingRows == 0
 	oldLen := 0
 	stableSlot := baseSlot
+	countDelta := 0
 	switch disposition {
 	case primaryUnifiedOverlayValue:
 		oldLen = len(current)
 		stableSlot = overlaySlot
 	case primaryUnifiedOverlayDeleted:
-		leafLease.Release()
-		return false, nil
+		created = true
+		countDelta = 1
+		stableSlot = overlaySlot
+		overflow = false
 	case primaryUnifiedOverlayMissing:
-		if !baseFound || overflow {
-			leafLease.Release()
-			return false, nil
+		if baseFound {
+			if overflow {
+				leafLease.Release()
+				return false, false, nil
+			}
+			oldLen = leaf.AdmittedRowBodyLen(body)
+			break
 		}
-		oldLen = leaf.AdmittedRowBodyLen(body)
+		var slotOK bool
+		stableSlot, slotOK = leaf.ChooseInsertSlotHashed(
+			route.Hash,
+			c.primaryUnifiedOverlay.pendingInsertSlots(route.Bucket),
+		)
+		if !slotOK {
+			leafLease.Release()
+			return false, false, nil
+		}
+		created = true
+		countDelta = 1
 	default:
 		leafLease.Release()
-		return false, storeio.ErrCommonPrimaryLeafCorrupt
+		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	pendingRaw, pendingRows :=
-		c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
 	rawDelta := len(canonical) - oldLen
+	if created {
+		rawDelta = storeio.CommonPrimaryUnifiedInsertedTrivialBytes(
+			key, len(canonical),
+		)
+		if rawDelta == 0 {
+			leafLease.Release()
+			return false, false, storeio.ErrInvalidWrite
+		}
+	}
 	fits := storeio.CommonPrimaryUnifiedTrivialFits(
-		leaf.Len()+pendingRows,
+		leaf.Len()+pendingRows+countDelta,
 		leaf.TrivialContentBytes()+pendingRaw+rawDelta,
 	)
+	fixedExtent := false
+	if fits && baseFound && !overflow {
+		fixedExtent, err = leaf.PatchStableCanonicalReplacementKeepsExtent(
+			key, stableSlot, canonicalIndex,
+			context.index, &context.workspace,
+		)
+		if err != nil {
+			leafLease.Release()
+			return false, false, err
+		}
+	}
 	leafLease.Release()
 	if !fits {
-		return false, nil
+		return false, false, nil
 	}
 	if concurrentPrimaryReplaceStagedHook != nil {
 		concurrentPrimaryReplaceStagedHook(route.Bucket)
@@ -512,12 +752,174 @@ func (c *Collection) tryConcurrentPrimaryReplace(
 	request.canonical = canonical
 	request.route = route
 	request.rawDelta = rawDelta
+	request.countDelta = countDelta
+	request.kind = primaryUnifiedOverlayPut
 	request.stableSlot = stableSlot
+	request.fixedExtent = fixedExtent
+	request.fillsEmpty = created && leafWasEmpty
 	handled, publishErr := c.primaryOverlayPublish.submit(c, request)
 	request.key = nil
 	request.canonical = nil
 	request.route = storeio.ResidentPrimaryRoute{}
 	request.rawDelta = 0
+	request.countDelta = 0
+	request.kind = 0
 	request.stableSlot = 0
-	return handled, publishErr
+	request.fixedExtent = false
+	request.fillsEmpty = false
+	return handled, handled && created, publishErr
+}
+
+// tryConcurrentPrimaryDelete publishes a tombstone for an existing inline row
+// while retaining its stable slot for a later resurrection. Deleting the final
+// row in a leaf deliberately falls back: empty-route marking and eager leaf
+// reclaim remain structural operations fenced by the exclusive writer.
+func (c *Collection) tryConcurrentPrimaryDelete(
+	key []byte,
+) (handled, deleted bool, err error) {
+	pool := c.primaryConcurrentContexts
+	if pool == nil {
+		return false, false, nil
+	}
+	context := pool.acquire()
+	defer pool.release(context)
+
+	c.writer.RLock()
+	defer c.writer.RUnlock()
+	if c.closed {
+		return false, false, ErrClosed
+	}
+	if failure := c.PersistenceError(); failure != nil {
+		return false, false, failure
+	}
+	if !c.buffered() || c.options.RecoveryJournal ||
+		c.options.Collection.Schema != nil ||
+		len(c.options.indexes) != 0 || c.primaryEpoch != nil ||
+		c.onlineIndexBuild.Load() || c.journalReplaying ||
+		c.primaryUnifiedOverlay == nil {
+		return false, false, nil
+	}
+	// See tryConcurrentPrimaryPut: immutable tombstones may overlap both direct
+	// point-read epochs and long-lived Snapshot leases.
+	if len(key) == 0 || len(key) > c.options.MaxKeyBytes ||
+		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
+		return false, false, ErrKeyTooLarge
+	}
+	if len(key) > len(c.primaryUnifiedOverlay.arena) {
+		return false, false, nil
+	}
+
+	state := c.state.Load()
+	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
+		return false, false, ErrClosed
+	}
+	router := c.primaryRouter.Load()
+	if router == nil {
+		return false, false, storeio.ErrSegmentedTabletRouterCorrupt
+	}
+	route, ok := router.Route(key)
+	if !ok || route.Ref == (storeio.PageRef{}) {
+		return false, false, storeio.ErrSegmentedTabletRouterCorrupt
+	}
+
+	stripe := &c.primaryConcurrentStripes[primaryConcurrentStripeIndex(route.Bucket)]
+	if !stripe.mu.TryLock() {
+		if concurrentPrimaryStripeContendedHook != nil {
+			concurrentPrimaryStripeContendedHook(route.Bucket)
+		}
+		stripe.mu.Lock()
+	}
+	defer stripe.mu.Unlock()
+
+	state = c.state.Load()
+	if state == nil {
+		return false, false, ErrClosed
+	}
+	leafLease, err := router.AcquireLeaf(c.cache, route)
+	if err != nil {
+		return false, false, err
+	}
+	page := leafLease.Page()
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		leafLease.Release()
+		return false, false, nil
+	}
+	leaf, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	)
+	if !ok {
+		leafLease.Release()
+		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	baseSlot, body, overflow, baseFound :=
+		leaf.LookupBodySlotHashed(route.Hash, key)
+	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, state.root.Generation,
+	)
+	stableSlot := baseSlot
+	oldLen := 0
+	switch disposition {
+	case primaryUnifiedOverlayValue:
+		stableSlot = overlaySlot
+		oldLen = len(current)
+	case primaryUnifiedOverlayDeleted:
+		leafLease.Release()
+		return true, false, nil
+	case primaryUnifiedOverlayMissing:
+		if !baseFound {
+			leafLease.Release()
+			return true, false, nil
+		}
+		if overflow {
+			leafLease.Release()
+			return false, false, nil
+		}
+		oldLen = leaf.AdmittedRowBodyLen(body)
+	default:
+		leafLease.Release()
+		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+
+	pendingRaw, pendingRows :=
+		c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
+	currentRows := leaf.Len() + pendingRows
+	// Keep the empty-leaf router transition and reclaim on the mature path.
+	if currentRows <= 1 {
+		leafLease.Release()
+		return false, false, nil
+	}
+	rawDelta := -storeio.CommonPrimaryUnifiedInsertedTrivialBytes(key, oldLen)
+	if rawDelta == 0 || !storeio.CommonPrimaryUnifiedTrivialFits(
+		currentRows-1,
+		leaf.TrivialContentBytes()+pendingRaw+rawDelta,
+	) {
+		leafLease.Release()
+		return false, false, nil
+	}
+	leafLease.Release()
+	if concurrentPrimaryReplaceStagedHook != nil {
+		concurrentPrimaryReplaceStagedHook(route.Bucket)
+	}
+
+	request := &context.publish
+	request.key = key
+	request.canonical = nil
+	request.route = route
+	request.rawDelta = rawDelta
+	request.countDelta = -1
+	request.kind = primaryUnifiedOverlayDelete
+	request.stableSlot = stableSlot
+	request.fixedExtent = false
+	request.fillsEmpty = false
+	handled, publishErr := c.primaryOverlayPublish.submit(c, request)
+	request.key = nil
+	request.canonical = nil
+	request.route = storeio.ResidentPrimaryRoute{}
+	request.rawDelta = 0
+	request.countDelta = 0
+	request.kind = 0
+	request.stableSlot = 0
+	request.fixedExtent = false
+	request.fillsEmpty = false
+	return handled, handled, publishErr
 }

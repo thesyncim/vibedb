@@ -137,6 +137,21 @@ func (c *Collection) bufferedJournalDeltaLane() bool {
 		c.journalEnabled() && !c.journalReplaying
 }
 
+// newBufferedJournalDeltaEntryScratch retains the complete fixed framing
+// window only for stores that can emit ordinary buffered overlay deltas. The
+// returned slice intentionally has full length and capacity; callers reset it
+// to length zero while preserving an allocation-free append ceiling.
+func newBufferedJournalDeltaEntryScratch(
+	options normalizedFileStoreOptions,
+) []storeio.RecoveryBatchEntry {
+	if options.Durability != DurabilityBufferedVisible ||
+		options.RecoveryJournal ||
+		options.primaryUnifiedOverlayBytes == 0 {
+		return nil
+	}
+	return make([]storeio.RecoveryBatchEntry, primaryUnifiedOverlayRecords)
+}
+
 // recoveryJournalSuffix names a store file's paired recovery journal, which
 // lives beside the store file and is resolved by path on reopen. It is exported
 // through RecoveryJournalPath so a caller that publishes a store file by renaming
@@ -773,12 +788,12 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 // fence, and the bounded redo region are all finite.
 //
 // Half the descriptor arena, capped at 32 staged roots, is a deterministic
-// upper bound independent of page shape. The dirty-byte guard retains two
-// worst-case materializations: one for the requested drain itself and one for
-// the next overlay fold. At the normal 64-mutation Flush cadence this makes the
-// physical drain rare enough to stay outside p95 while ensuring pressure is
-// paid at an explicit Flush rather than by an otherwise-unrequested mutation
-// checkpoint.
+// upper bound independent of page shape. The dirty-byte guard retains one
+// complete worst-case materialization. A second simultaneous reserve is not a
+// safety requirement: materializePrimaryParentsLocked already drains a prior
+// published cut and retries the intact overlay when the next fold cannot acquire
+// frames. Reserving two made a wider but still resident-bounded dirty-leaf
+// window force every cheap Flush onto the physical path.
 func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 	pendingBytes int,
 ) bool {
@@ -792,11 +807,6 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 		return true
 	}
 	reserve := c.options.maxTransactionBytes
-	if reserve <= ^uint64(0)/2 {
-		reserve *= 2
-	} else {
-		reserve = ^uint64(0)
-	}
 	if c.cache.DirtyCapacityAvailable() < reserve {
 		return true
 	}

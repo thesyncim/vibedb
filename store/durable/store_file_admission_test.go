@@ -33,7 +33,11 @@ func TestCollectionRetirementBackpressureRecovers(t *testing.T) {
 	// test needs to reach backpressure in a short loop.
 	collection, err := Create(file, Options{
 		Collection: store.Options{ChunkDocuments: 16}, ResidentBytes: 64 << 20,
-		Backend: BackendPortable, MaxRetiredExtents: 1024, MaxBatchDocuments: 1,
+		Backend: BackendPortable, Durability: DurabilityAsyncVisible,
+		MaxRetiredExtents: 1024, MaxBatchDocuments: 1,
+		// Async-visible publishes physical COW generations and therefore isolates
+		// the retirement contract. The synchronous/buffered lanes may safely keep
+		// many immutable row-overlay versions under this same snapshot.
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -15,11 +15,14 @@ func (o *primaryUnifiedOverlay) primaryUnifiedFixedReplacements(
 	bucket storeio.BucketID,
 	generation uint64,
 ) ([]storeio.CommonPrimaryUnifiedReplacement, bool, error) {
-	if o == nil || cap(dst) < primaryUnifiedOverlayRecords {
+	if o == nil || cap(dst) < storeio.CommonPrimaryLeafWideSlots {
 		return dst[:0], false, nil
 	}
-	var indexes [primaryUnifiedOverlayRecords]uint16
-	count := o.latestBucketRecords(&indexes, bucket, generation)
+	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
+	count, err := o.latestBucketRecords(&indexes, bucket, generation)
+	if err != nil {
+		return dst[:0], false, err
+	}
 	if count == 0 {
 		return dst[:0], false, nil
 	}

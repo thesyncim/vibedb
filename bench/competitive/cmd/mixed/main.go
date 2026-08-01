@@ -11,17 +11,21 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	competitive "github.com/thesyncim/vibedb/bench/competitive"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 const (
@@ -268,9 +272,13 @@ func main() {
 	}
 
 	// A whole-store scan cannot assert an exact document count under concurrent
-	// churn: a delete+restore on another client's shard transiently hides a key.
-	// At N=1 the count is exact; at N>1 the scan may only be short, never long.
-	strictScan := *clients == 1
+	// churn: each other client can transiently hide at most one key between its
+	// delete and restore. A client's own operations are serial, so the one-client
+	// case remains exact.
+	minimumScanDocuments := len(docs)
+	if *clients > 1 {
+		minimumScanDocuments -= *clients - 1
+	}
 
 	runClient := func(st *clientState, coord *checkpointCoordinator, measured bool) {
 		count := st.warmupOps
@@ -284,20 +292,24 @@ func main() {
 			}
 			choice := choices[(st.choiceOff+seq)%len(choices)]
 			idx := st.keyTrace[seq]
-			var elapsed int64
+			mutations := mutationCount(choice)
 			start := time.Now()
-			kind, mutations, err := st.run(docs, updated, strictScan, choice, idx)
-			elapsed = time.Since(start).Nanoseconds()
+			kind, actualMutations, err := st.run(
+				docs, updated, minimumScanDocuments, coord, choice, idx,
+			)
+			elapsed := time.Since(start).Nanoseconds()
+			if err == nil && actualMutations != mutations {
+				err = fmt.Errorf(
+					"operation %s reported %d mutations after reserving %d",
+					opNames[choice], actualMutations, mutations,
+				)
+			}
 			if err != nil {
 				st.err = err
 				return
 			}
 			if measured {
 				st.latencies[kind] = append(st.latencies[kind], elapsed)
-			}
-			if err := coord.add(mutations); err != nil {
-				st.err = err
-				return
 			}
 		}
 	}
@@ -326,9 +338,22 @@ func main() {
 	// queued for the timed operations to inherit.
 	check(engine.Checkpoint())
 	automaticCheckpointStart := automaticCheckpointCount(engine)
+	diagnosticStats := os.Getenv("VIBEDB_MIXED_INTERNAL_STATS") != ""
+	var (
+		runtimeBefore runtime.MemStats
+		durableBefore durable.Stats
+		durableOK     bool
+	)
+	if diagnosticStats {
+		runtime.ReadMemStats(&runtimeBefore)
+		durableBefore, durableOK = durableStats(engine)
+	}
 
 	// Measured phase. total ops/s = total measured ops / wall time; the timer
-	// brackets every worker plus the final durability fence.
+	// brackets every worker plus the final durability fence. Per-operation
+	// latency starts before mutation admission and ends after any checkpoint the
+	// operation was elected to perform, so it describes acknowledgement latency
+	// rather than only the engine call hidden inside that acknowledgement.
 	measuredCoord := newCheckpointCoordinator(engine, *checkpointMutations, true)
 	throughputStart := time.Now()
 	runPhase(measuredCoord, true)
@@ -337,6 +362,16 @@ func main() {
 	check(measuredCoord.finalFlush())
 	measuredNanos := time.Since(throughputStart).Nanoseconds()
 	automaticCheckpoints := automaticCheckpointCount(engine) - automaticCheckpointStart
+	var (
+		runtimeAfter runtime.MemStats
+		durableAfter durable.Stats
+	)
+	if diagnosticStats {
+		runtime.ReadMemStats(&runtimeAfter)
+		if durableOK {
+			durableAfter, _ = durableStats(engine)
+		}
+	}
 
 	// Release each session's read state (a cached snapshot or held read
 	// transaction) before the final single-threaded oracle and footprint reading.
@@ -472,12 +507,46 @@ func main() {
 	if checkpointSummary.calls != 0 {
 		printResult("checkpoint", checkpointSummary)
 	}
+	if diagnosticStats {
+		fmt.Fprintf(
+			os.Stderr,
+			"mixed-runtime engine=%s clients=%d total-alloc-bytes=%d mallocs=%d\n",
+			factory.Name, *clients,
+			runtimeAfter.TotalAlloc-runtimeBefore.TotalAlloc,
+			runtimeAfter.Mallocs-runtimeBefore.Mallocs,
+		)
+		if durableOK {
+			fmt.Fprintf(
+				os.Stderr,
+				"vibejson-internal clients=%d overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d device-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
+				*clients,
+				durableAfter.PrimaryOverlayFolds-durableBefore.PrimaryOverlayFolds,
+				durableAfter.ConcurrentPrimaryFallbacks-durableBefore.ConcurrentPrimaryFallbacks,
+				durableAfter.ConcurrentPrimaryReplaces-durableBefore.ConcurrentPrimaryReplaces,
+				durableAfter.ConcurrentPrimaryPublishGroups-durableBefore.ConcurrentPrimaryPublishGroups,
+				durableAfter.AutomaticCheckpoints-durableBefore.AutomaticCheckpoints,
+				durableAfter.JournalDeltaCheckpoints-durableBefore.JournalDeltaCheckpoints,
+				durableAfter.JournalDeltaRecords-durableBefore.JournalDeltaRecords,
+				durableAfter.JournalDeltaBytes-durableBefore.JournalDeltaBytes,
+				durableAfter.JournalDeltaFullFallbacks-durableBefore.JournalDeltaFullFallbacks,
+				durableAfter.DeviceBytes-durableBefore.DeviceBytes,
+				durableAfter.PrimaryLeafSplits-durableBefore.PrimaryLeafSplits,
+				durableAfter.PrimaryEmptyReclaims-durableBefore.PrimaryEmptyReclaims,
+			)
+		}
+	}
 }
 
 // run executes one operation against the client's session, updating the client's
 // own scratch and the shard-owned entries of the shared updated slice. It is the
 // per-operation body of both the warmup and measured loops.
-func (st *clientState) run(docs []competitive.Doc, updated []bool, strictScan bool, choice, idx int) (kind, mutations int, err error) {
+func (st *clientState) run(
+	docs []competitive.Doc,
+	updated []bool,
+	minimumScanDocuments int,
+	coord *checkpointCoordinator,
+	choice, idx int,
+) (kind, mutations int, err error) {
 	key := docs[idx].Key
 	switch choice {
 	case opRead:
@@ -490,7 +559,12 @@ func (st *clientState) run(docs []competitive.Doc, updated []bool, strictScan bo
 		} else {
 			st.replacement = competitive.AppendSameSizeUpdatedJSON(st.replacement[:0], docs, idx)
 		}
-		err := st.session.Put(key, st.replacement)
+		admission, err := coord.admit(1)
+		if err != nil {
+			return opUpdate, 0, err
+		}
+		operationErr := st.session.Put(key, st.replacement)
+		err = completeMutation(coord, admission, operationErr)
 		if err == nil {
 			updated[idx] = !updated[idx]
 		}
@@ -506,33 +580,66 @@ func (st *clientState) run(docs []competitive.Doc, updated []bool, strictScan bo
 		} else {
 			st.replacement = competitive.AppendSameSizeUpdatedJSON(st.replacement[:0], docs, idx)
 		}
-		err = st.session.Put(key, st.replacement)
+		admission, err := coord.admit(1)
+		if err != nil {
+			return opReadModifyWrite, 0, err
+		}
+		operationErr := st.session.Put(key, st.replacement)
+		err = completeMutation(coord, admission, operationErr)
 		if err == nil {
 			updated[idx] = !updated[idx]
 		}
 		return opReadModifyWrite, mutationCount(choice), err
 	case opChurn:
-		if err := st.session.Delete(key); err != nil {
+		deleteAdmission, err := coord.admit(1)
+		if err != nil {
 			return opChurn, 0, err
 		}
-		err := st.session.Upsert(key, docs[idx].JSON)
+		deleteErr := st.session.Delete(key)
+		if err := completeMutation(coord, deleteAdmission, deleteErr); err != nil {
+			return opChurn, 1, err
+		}
+		restoreAdmission, err := coord.admit(1)
+		if err != nil {
+			return opChurn, 1, err
+		}
+		restoreErr := st.session.Upsert(key, docs[idx].JSON)
+		err = completeMutation(coord, restoreAdmission, restoreErr)
 		if err == nil {
 			updated[idx] = false
 		}
 		return opChurn, mutationCount(choice), err
 	case opScan:
 		n, err := st.session.ScanAllBytes()
-		if err == nil {
-			if strictScan && n != len(docs) {
-				err = fmt.Errorf("ordered scan visited %d documents, want %d", n, len(docs))
-			} else if !strictScan && n > len(docs) {
-				err = fmt.Errorf("ordered scan visited %d documents, want <= %d", n, len(docs))
-			}
+		if err == nil && (n < minimumScanDocuments || n > len(docs)) {
+			err = fmt.Errorf(
+				"ordered scan visited %d documents, want [%d,%d]",
+				n, minimumScanDocuments, len(docs),
+			)
 		}
 		return opScan, 0, err
 	default:
 		return 0, 0, fmt.Errorf("unknown mixed operation %d", choice)
 	}
+}
+
+// completeMutation releases exactly one state-change admission after its
+// engine call. The common success path returns one of the existing errors
+// directly; errors.Join is reserved for the exceptional case where both the
+// engine mutation and its elected checkpoint fail.
+func completeMutation(
+	coord *checkpointCoordinator,
+	admission mutationAdmission,
+	operationErr error,
+) error {
+	checkpointErr := coord.complete(admission)
+	if operationErr == nil {
+		return checkpointErr
+	}
+	if checkpointErr == nil {
+		return operationErr
+	}
+	return errors.Join(operationErr, checkpointErr)
 }
 
 // measuredKindCount is the exact number of operations of one kind this client
@@ -549,6 +656,9 @@ func (st *clientState) measuredKindCount(choices []int, kind int) int {
 }
 
 func printHeader(w io.Writer) {
+	// Keep the established latency column names for mixedsuite compatibility.
+	// Their samples are end-to-end acknowledgement latencies: mutation admission,
+	// the engine call, and any elected checkpoint are all inside the timer.
 	fmt.Fprintf(w, "%-20s %-24s %-8s %-4s %7s %9s %7s %10s %9s %7s %7s %-18s %10s %11s %11s %11s %12s %10s %10s %10s %11s %12s\n",
 		"engine", "durability", "workload", "card", "docs", "measured",
 		"warmup", "checkpoint", "forced-cp", "indexed", "clients", "operation", "calls",
@@ -558,6 +668,18 @@ func printHeader(w io.Writer) {
 
 type automaticCheckpointReporter interface {
 	AutomaticCheckpoints() uint64
+}
+
+type durableStatsReporter interface {
+	DurableStats() durable.Stats
+}
+
+func durableStats(engine competitive.Engine) (durable.Stats, bool) {
+	reporter, ok := engine.(durableStatsReporter)
+	if !ok {
+		return durable.Stats{}, false
+	}
+	return reporter.DurableStats(), true
 }
 
 func automaticCheckpointCount(engine competitive.Engine) uint64 {
@@ -579,60 +701,246 @@ func mutationCount(operation int) int {
 	}
 }
 
-// checkpointCoordinator is the run's single checkpointer. The scheduled
-// checkpoint every N mutations must stay exactly one caller for cross-client
-// comparability — the engine's checkpoint is a stop-the-world exclusive gate, so
-// concurrent callers would serialize anyway — so a mutex both counts global
-// mutations (via the tested checkpointSchedule) and guards the one Checkpoint
-// call. Reads (mutations==0) never touch the lock. Holding the lock across the
-// Checkpoint is deliberate: it stalls other mutators exactly as the engine's own
-// gate would, and guarantees no second concurrent checkpoint.
+// checkpointer is the narrow part of competitive.Engine the epoch coordinator
+// needs. Keeping it narrow makes the concurrency protocol independently
+// testable without a benchmark engine fixture.
+type checkpointer interface{ Checkpoint() error }
+
+// mutationAdmission is one state-change reservation in a durability epoch.
+// coordinated is false when checkpointing is disabled or for a read, keeping
+// both paths off the epoch atomic state.
+type mutationAdmission struct {
+	coordinated bool
+	epoch       uint64
+	mutations   int
+}
+
+const checkpointCountShift = 32
+
+func packCheckpointCounts(admitted, active uint32) uint64 {
+	return uint64(admitted)<<checkpointCountShift | uint64(active)
+}
+
+func unpackCheckpointCounts(state uint64) (admitted, active uint32) {
+	return uint32(state >> checkpointCountShift), uint32(state)
+}
+
+type checkpointFailure struct{ err error }
+
+// checkpointCoordinator is the run's single durability-epoch coordinator.
+// Immediately before each engine mutation starts, admit reserves one state
+// change in the current epoch. Once the configured budget is full, no mutation
+// in the next epoch may enter until every active mutation in this one has
+// returned and the elected last completer has checkpointed it. This establishes
+// an exact cut for every workload, instead of allowing N-1 already-acknowledged
+// writes to race across a checkpoint while waiting to update an after-the-fact
+// counter.
+// Delete+restore acquires two consecutive one-change admissions, so a checkpoint
+// may correctly fall between its two independent engine mutations. Reads never
+// touch the coordinator and can proceed during a checkpoint.
 type checkpointCoordinator struct {
-	engine competitive.Engine
+	engine checkpointer
 	record bool
 
-	mu        sync.Mutex
-	schedule  checkpointSchedule // guarded by mu
-	latencies []int64            // guarded by mu
+	// state packs admitted in the high word and active in the low word. Ordinary
+	// admission/completion changes only this word; the transition mutex is used
+	// solely by callers waiting on a full epoch and by the elected checkpoint
+	// reset. A full, drained epoch remains (every,0) until Checkpoint returns.
+	state atomic.Uint64
+	epoch atomic.Uint64
+	every uint32
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	waiters atomic.Int32
+	failure atomic.Pointer[checkpointFailure]
+
+	// latencies has one writer at a time under mu. The benchmark reads it only
+	// after all clients join.
+	latencies []int64
+
+	// pendingFinal is used only by checkpoint-mutations=0. It preserves the
+	// original final-only contract without putting its hot mutation path through
+	// epoch admission.
+	pendingFinal atomic.Uint64
 }
 
-func newCheckpointCoordinator(engine competitive.Engine, every int, record bool) *checkpointCoordinator {
-	return &checkpointCoordinator{
-		engine:   engine,
-		record:   record,
-		schedule: checkpointSchedule{every: every},
+func newCheckpointCoordinator(engine checkpointer, every int, record bool) *checkpointCoordinator {
+	c := &checkpointCoordinator{
+		engine: engine, record: record,
 	}
+	c.cond = sync.NewCond(&c.mu)
+	if every < 0 || uint64(every) > uint64(^uint32(0)) {
+		c.failure.Store(&checkpointFailure{err: fmt.Errorf(
+			"checkpoint epoch size %d exceeds packed counter capacity", every,
+		)})
+	} else {
+		c.every = uint32(every)
+	}
+	return c
 }
 
-func (c *checkpointCoordinator) add(mutations int) error {
+func (c *checkpointCoordinator) failureErr() error {
+	if failure := c.failure.Load(); failure != nil {
+		return failure.err
+	}
+	return nil
+}
+
+// failLocked publishes the first terminal coordinator error and wakes every
+// full-epoch waiter. c.mu must be held.
+func (c *checkpointCoordinator) failLocked(err error) error {
+	if err == nil {
+		return nil
+	}
+	failure := &checkpointFailure{err: err}
+	if !c.failure.CompareAndSwap(nil, failure) {
+		err = c.failure.Load().err
+	}
+	c.cond.Broadcast()
+	return err
+}
+
+func (c *checkpointCoordinator) admit(mutations int) (mutationAdmission, error) {
 	if mutations == 0 {
-		return nil
+		return mutationAdmission{}, nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.schedule.Add(mutations) {
-		return nil
+	if mutations != 1 {
+		return mutationAdmission{}, fmt.Errorf(
+			"checkpoint epoch requires one state change per admission, got %d",
+			mutations,
+		)
 	}
-	err := c.checkpointLocked()
-	c.schedule.Mark()
-	return err
+	if c.every == 0 {
+		if err := c.failureErr(); err != nil {
+			return mutationAdmission{}, err
+		}
+		return mutationAdmission{mutations: mutations}, nil
+	}
+	// Do not barge past callers already queued at a full epoch. The zero-waiter
+	// path below is the ordinary allocation-free pair of atomic operations.
+	if c.waiters.Load() == 0 {
+		if admission, admitted := c.tryAdmit(); admitted {
+			return admission, nil
+		}
+	}
+	return c.waitAndAdmit()
 }
 
-// finalFlush performs the trailing checkpoint if any mutation remains unfenced,
-// matching the single-client "checkpoint once after all measured mutations"
-// contract. It runs after every worker has joined.
-func (c *checkpointCoordinator) finalFlush() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.schedule.Pending() == 0 {
-		return nil
+// tryAdmit reserves one mutation when the current epoch still has capacity.
+// The successful active increment pins the epoch until this admission is
+// completed, so reading epoch after the CAS cannot cross a checkpoint reset.
+func (c *checkpointCoordinator) tryAdmit() (mutationAdmission, bool) {
+	for {
+		state := c.state.Load()
+		admitted, active := unpackCheckpointCounts(state)
+		if admitted >= c.every {
+			return mutationAdmission{}, false
+		}
+		next := packCheckpointCounts(admitted+1, active+1)
+		if !c.state.CompareAndSwap(state, next) {
+			continue
+		}
+		return mutationAdmission{
+			coordinated: true,
+			epoch:       c.epoch.Load(),
+			mutations:   1,
+		}, true
 	}
-	err := c.checkpointLocked()
-	c.schedule.Mark()
-	return err
 }
 
-func (c *checkpointCoordinator) checkpointLocked() error {
+// waitAndAdmit is entered only after an epoch fills or when an older waiter is
+// already queued. The waiter count closes the barging gate before taking mu;
+// after a reset, broadcast waiters fill the new epoch before fresh fast-path
+// callers can bypass them.
+func (c *checkpointCoordinator) waitAndAdmit() (
+	mutationAdmission, error,
+) {
+	c.waiters.Add(1)
+	defer c.waiters.Add(-1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for {
+		if err := c.failureErr(); err != nil {
+			return mutationAdmission{}, err
+		}
+		admission, admitted := c.tryAdmit()
+		if admitted {
+			return admission, nil
+		}
+		c.cond.Wait()
+	}
+}
+
+// complete releases one admitted mutation. The last active mutation in a full
+// epoch is elected to checkpoint; its caller does not return, and the next
+// epoch is not admitted, until the checkpoint finishes.
+func (c *checkpointCoordinator) complete(admission mutationAdmission) error {
+	if admission.mutations == 0 {
+		return nil
+	}
+	if !admission.coordinated {
+		c.pendingFinal.Add(uint64(admission.mutations))
+		return nil
+	}
+	currentEpoch := c.epoch.Load()
+	for {
+		state := c.state.Load()
+		admitted, active := unpackCheckpointCounts(state)
+		if admission.epoch != currentEpoch || active == 0 {
+			return fmt.Errorf(
+				"checkpoint epoch completion out of order: admission=%d current=%d active=%d",
+				admission.epoch, currentEpoch, active,
+			)
+		}
+		next := packCheckpointCounts(admitted, active-1)
+		if !c.state.CompareAndSwap(state, next) {
+			continue
+		}
+		if active == 1 && admitted == c.every {
+			return c.checkpointFullEpoch(admission.epoch)
+		}
+		return nil
+	}
+}
+
+// checkpointFullEpoch is called only by the CAS that changes (every,1) to
+// (every,0). The closed packed state excludes next-epoch admission until the
+// engine checkpoint returns and resetLocked publishes epoch+1 followed by 0/0.
+func (c *checkpointCoordinator) checkpointFullEpoch(epoch uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.checkpointStateLocked(epoch, c.every)
+}
+
+// checkpointStateLocked validates and checkpoints one fully drained state.
+// For a trailing partial epoch it first atomically closes admission by changing
+// (admitted,0) to (every,0). c.mu must be held.
+func (c *checkpointCoordinator) checkpointStateLocked(
+	epoch uint64, admitted uint32,
+) error {
+	state := c.state.Load()
+	stateAdmitted, active := unpackCheckpointCounts(state)
+	if epoch != c.epoch.Load() || admitted == 0 ||
+		stateAdmitted != admitted || active != 0 {
+		return c.failLocked(fmt.Errorf(
+			"invalid checkpoint epoch state: admission=%d current=%d admitted=%d/%d active=%d",
+			epoch, c.epoch.Load(), admitted, stateAdmitted, active,
+		))
+	}
+	if admitted < c.every && !c.state.CompareAndSwap(
+		state, packCheckpointCounts(c.every, 0),
+	) {
+		return c.failLocked(fmt.Errorf(
+			"checkpoint trailing epoch changed during close",
+		))
+	}
+	return c.checkpointAndResetLocked(epoch)
+}
+
+// checkpointAndResetLocked keeps the transition mutex only around the one
+// engine fence and reset. The per-mutation path never takes it.
+func (c *checkpointCoordinator) checkpointAndResetLocked(epoch uint64) error {
 	var start time.Time
 	if c.record {
 		start = time.Now()
@@ -641,22 +949,50 @@ func (c *checkpointCoordinator) checkpointLocked() error {
 	if c.record {
 		c.latencies = append(c.latencies, time.Since(start).Nanoseconds())
 	}
-	return err
+	if err != nil {
+		return c.failLocked(err)
+	}
+	c.epoch.Store(epoch + 1)
+	c.state.Store(0)
+	c.cond.Broadcast()
+	return nil
 }
 
-type checkpointSchedule struct {
-	every   int
-	pending int
+// finalFlush performs the trailing checkpoint if any mutation remains unfenced,
+// matching the single-client "checkpoint once after all measured mutations"
+// contract. It runs after every worker has joined.
+func (c *checkpointCoordinator) finalFlush() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.failureErr(); err != nil {
+		return err
+	}
+	if c.every == 0 {
+		if c.pendingFinal.Swap(0) == 0 {
+			return nil
+		}
+		var start time.Time
+		if c.record {
+			start = time.Now()
+		}
+		err := c.engine.Checkpoint()
+		if c.record {
+			c.latencies = append(c.latencies, time.Since(start).Nanoseconds())
+		}
+		return c.failLocked(err)
+	}
+	state := c.state.Load()
+	admitted, active := unpackCheckpointCounts(state)
+	if active != 0 {
+		return c.failLocked(fmt.Errorf(
+			"checkpoint final flush has %d active mutations", active,
+		))
+	}
+	if admitted == 0 {
+		return nil
+	}
+	return c.checkpointStateLocked(c.epoch.Load(), admitted)
 }
-
-func (s *checkpointSchedule) Add(mutations int) bool {
-	s.pending += mutations
-	return s.every > 0 && s.pending >= s.every
-}
-
-func (s *checkpointSchedule) Mark() { s.pending = 0 }
-
-func (s *checkpointSchedule) Pending() int { return s.pending }
 
 func percentile(sorted []int64, quantile float64) int64 {
 	at := int(quantile*float64(len(sorted)-1) + 0.5)

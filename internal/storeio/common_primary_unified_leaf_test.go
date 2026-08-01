@@ -81,7 +81,7 @@ func unifiedTestCorpus(n int) ([]CommonPrimaryLeafRecord, [][]byte) {
 }
 
 func encodeUnifiedTestLeaf(
-	t *testing.T, records []CommonPrimaryLeafRecord,
+	t testing.TB, records []CommonPrimaryLeafRecord,
 ) ([]byte, int) {
 	t.Helper()
 	storeID := unifiedTestStoreID()
@@ -106,7 +106,7 @@ func encodeUnifiedTestLeaf(
 }
 
 func openUnifiedTestLeaf(
-	t *testing.T, page []byte,
+	t testing.TB, page []byte,
 ) CommonPrimaryUnifiedLeafView {
 	t.Helper()
 	view, err := openUnifiedTestLeafErr(page)
@@ -260,6 +260,31 @@ func TestUnifiedLeafPlanStableIntegerPatchMatchesFullPlanner(t *testing.T) {
 	if replacementRank < 0 {
 		t.Fatal("fixture has no templated score row")
 	}
+	indexStorage := make([]vibejson.IndexEntry, 0, 512)
+	spanStorage := make([]UnifiedTokenSpan, 0, 1024)
+	workspace := NewCanonicalWorkspace(512, len(replacement.Value)*2)
+	stableExtent, err := view.PatchStableReplacementKeepsExtent(
+		replacement, indexStorage, &workspace, spanStorage,
+	)
+	if err != nil || !stableExtent {
+		t.Fatalf("integer extent certificate = %v,%v, want true,nil",
+			stableExtent, err)
+	}
+	stringChange := replacement
+	stringChange.Value = append([]byte(nil), replacement.Value...)
+	name := bytes.Index(stringChange.Value, []byte(`"name":"user-`))
+	if name < 0 {
+		t.Fatal("fixture replacement has no name string")
+	}
+	name += len(`"name":"`)
+	stringChange.Value[name] = 'v'
+	stableExtent, err = view.PatchStableReplacementKeepsExtent(
+		stringChange, indexStorage, &workspace, spanStorage,
+	)
+	if err != nil || stableExtent {
+		t.Fatalf("dictionary-eligible extent certificate = %v,%v, want false,nil",
+			stableExtent, err)
+	}
 
 	header := view.Header()
 	header.Generation = 2
@@ -313,6 +338,101 @@ func TestUnifiedLeafPlanStableIntegerPatchMatchesFullPlanner(t *testing.T) {
 	got, found := opened.AppendRawRank(nil, replacementRank)
 	if !found || !bytes.Equal(got, replacement.Value) {
 		t.Fatalf("patched row = %q,%v, want %q", got, found, replacement.Value)
+	}
+}
+
+// TestUnifiedLeafStableExtentSpannedCertificateDifferential proves that a
+// scalar-span certificate emitted while canonicalizing has exactly the same
+// stable-extent admission result as the original parse-the-canonical-value
+// certificate. The mixed leaf corpus covers templated and trivial rows; the
+// deterministic generated values exercise arbitrary shape mismatches and
+// canonical rewrites without relying on handpicked accept-only cases.
+func TestUnifiedLeafStableExtentSpannedCertificateDifferential(t *testing.T) {
+	records, _ := unifiedTestCorpus(220)
+	page, count := encodeUnifiedTestLeaf(t, records)
+	view := openUnifiedTestLeaf(t, page)
+	slots, slotsOK := view.PostingSlots()
+	if !slotsOK {
+		t.Fatal("posting slots")
+	}
+
+	const scratchEntries = 2048
+	sourceStorage := make([]vibejson.IndexEntry, scratchEntries)
+	newIndexStorage := make([]vibejson.IndexEntry, scratchEntries)
+	oldIndexStorage := make([]vibejson.IndexEntry, scratchEntries)
+	newSpanStorage := make([]UnifiedTokenSpan, 0, 2*scratchEntries)
+	oldSpanStorage := make([]UnifiedTokenSpan, 0, 2*scratchEntries)
+	newWorkspace := NewCanonicalWorkspace(scratchEntries, 64<<10)
+	oldWorkspace := NewCanonicalWorkspace(scratchEntries, 64<<10)
+	canonicalStorage := make([]byte, 0, 64<<10)
+	accepted, declined := 0, 0
+	compare := func(label string, key []byte, slot uint8, src []byte) {
+		t.Helper()
+		sourceIndex, err := vibejson.BuildIndex(src, sourceStorage)
+		if err != nil {
+			t.Fatalf("%s source index: %v", label, err)
+		}
+		canonical := src
+		certificate, alreadyCanonical := CanonicalSpanIndexOf(
+			sourceIndex, &newWorkspace, newSpanStorage[:0],
+		)
+		if !alreadyCanonical {
+			canonical, certificate, err = AppendCanonicalIndexedSpans(
+				canonicalStorage[:0], sourceIndex,
+				&newWorkspace, newSpanStorage[:0],
+			)
+			if err != nil {
+				t.Fatalf("%s spanned canonical render: %v", label, err)
+			}
+		}
+		newOK, newErr := view.PatchStableCanonicalReplacementKeepsExtent(
+			key, slot, certificate,
+			newIndexStorage, &newWorkspace,
+		)
+
+		oldOK, oldErr := view.PatchStableReplacementKeepsExtent(
+			CommonPrimaryUnifiedReplacement{
+				Key: key, Value: canonical, Slot: slot,
+			},
+			oldIndexStorage,
+			&oldWorkspace,
+			oldSpanStorage[:0],
+		)
+		if oldOK != newOK || (oldErr == nil) != (newErr == nil) ||
+			oldErr != nil && oldErr.Error() != newErr.Error() {
+			t.Fatalf(
+				"%s certificate divergence: old=%v,%v new=%v,%v\nsource=%q\ncanonical=%q",
+				label, oldOK, oldErr, newOK, newErr, src, canonical,
+			)
+		}
+		if oldOK {
+			accepted++
+		} else {
+			declined++
+		}
+	}
+
+	for rank := 0; rank < count; rank++ {
+		compare(
+			fmt.Sprintf("corpus/%d", rank),
+			records[rank].Key, slots[rank], records[rank].Value.Inline,
+		)
+	}
+
+	rng := rand.New(rand.NewPCG(0xC3A7, 0x5EED))
+	for i := range 1_000 {
+		src := appendRandomCanonicalTestValue(nil, rng, 4)
+		rank := i % count
+		compare(
+			fmt.Sprintf("generated/%d", i),
+			records[rank].Key, slots[rank], src,
+		)
+	}
+	if accepted == 0 || declined == 0 {
+		t.Fatalf(
+			"differential coverage accepted=%d declined=%d, want both paths",
+			accepted, declined,
+		)
 	}
 }
 

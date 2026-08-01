@@ -525,9 +525,11 @@ func (r *ResidentPrimaryRouter) UpdateLeaf(
 // AdvanceGeneration records a canonical-frame mutation whose stable leaf
 // handle did not change.
 func (r *ResidentPrimaryRouter) AdvanceGeneration(generation uint64) {
-	r.version.Add(1)
+	// version is exclusively the row-handle seqlock. No ref word changes here,
+	// so perturbing it would make concurrent routes retry without protecting any
+	// additional state; readers that require a stable generation sample the
+	// independent generation atomic explicitly.
 	r.generation.Store(generation)
-	r.version.Add(1)
 }
 
 // MarkEmpty records one phase-7 empty leaf for session-local accounting.

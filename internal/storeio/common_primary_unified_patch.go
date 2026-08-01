@@ -3,8 +3,11 @@ package storeio
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -30,6 +33,181 @@ type CommonPrimaryUnifiedReplacement struct {
 type unifiedPrimaryPatchValueDelta struct {
 	value string
 	delta int
+}
+
+// PatchStableReplacementKeepsExtent is the allocation-free admission
+// certificate for a single native class-5 replacement. It proves the same
+// local invariants as PatchPlanStableReplacements without copying the page,
+// sealing a checksum, or running a leaf-wide dictionary census. The narrower
+// result deliberately rejects every changed dictionary-eligible spelling;
+// integer, bool, null, and equal-cost shape-stable changes can therefore prove
+// that the current physical extent remains sufficient using only the selected
+// row.
+//
+// indexStorage and spanStorage are caller-owned fixed scratch. Insufficient
+// capacity declines the certificate rather than allocating or weakening the
+// proof.
+func (v *CommonPrimaryUnifiedLeafView) PatchStableReplacementKeepsExtent(
+	replacement CommonPrimaryUnifiedReplacement,
+	indexStorage []vibejson.IndexEntry,
+	workspace *CanonicalWorkspace,
+	spanStorage []UnifiedTokenSpan,
+) (bool, error) {
+	if v == nil || len(replacement.Key) == 0 ||
+		len(replacement.Value) == 0 || workspace == nil ||
+		cap(indexStorage) == 0 || cap(spanStorage) == 0 {
+		return false, nil
+	}
+	newIndex, err := vibejson.BuildIndex(
+		replacement.Value, indexStorage[:cap(indexStorage)],
+	)
+	if errors.Is(err, document.ErrIndexFull) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	canonical, indexed := CanonicalSpanIndexOf(
+		newIndex, workspace, spanStorage,
+	)
+	if !indexed {
+		return false, nil
+	}
+	return v.PatchStableCanonicalReplacementKeepsExtent(
+		replacement.Key, replacement.Slot, canonical,
+		indexStorage, workspace,
+	)
+}
+
+// PatchStableCanonicalReplacementKeepsExtent is the spanned sibling of
+// PatchStableReplacementKeepsExtent. canonical must be the opaque certificate
+// returned for the exact replacement value by CanonicalSpanIndexOf or
+// AppendCanonicalIndexedSpans. It consumes those already-validated spans and
+// therefore avoids rebuilding a tape over a newly rendered canonical value.
+//
+// indexStorage remains fixed scratch for the admitted old trivial row, when
+// one exists. The certificate retains the caller's span capacity after its
+// new-value prefix for that old-row comparison; insufficient space declines
+// rather than allocating.
+func (v *CommonPrimaryUnifiedLeafView) PatchStableCanonicalReplacementKeepsExtent(
+	key []byte,
+	slot uint8,
+	canonical CanonicalSpanIndex,
+	indexStorage []vibejson.IndexEntry,
+	workspace *CanonicalWorkspace,
+) (bool, error) {
+	if v == nil || len(key) == 0 || !canonical.valid ||
+		len(canonical.canonical) == 0 || workspace == nil ||
+		cap(indexStorage) == 0 {
+		return false, nil
+	}
+	rank := v.env.LowerBound(key)
+	if rank >= v.env.Len() {
+		return false, nil
+	}
+	admittedKey, valueStart, valueEnd, boundsOK := v.env.keyBounds(rank)
+	if !boundsOK || !bytes.Equal(admittedKey, key) ||
+		v.env.rankOverflow(rank) {
+		return false, nil
+	}
+	slots, slotsOK := v.env.rankSlots()
+	if !slotsOK || slots[rank] != slot {
+		return false, nil
+	}
+	buildIndex := func(src []byte) (vibejson.Index, bool, error) {
+		index, err := vibejson.BuildIndex(
+			src, indexStorage[:cap(indexStorage)],
+		)
+		if errors.Is(err, document.ErrIndexFull) {
+			return vibejson.Index{}, false, nil
+		}
+		if err != nil {
+			return vibejson.Index{}, false, err
+		}
+		return index, true, nil
+	}
+	replacementValue := canonical.canonical
+	spans := canonical.spans
+	newSpanCount := len(spans)
+	oldBody := v.env.payload[valueStart:valueEnd:valueEnd]
+	if len(oldBody) == 0 {
+		return false, ErrCommonPrimaryLeafCorrupt
+	}
+	changedValueStable := func(oldValue, newValue []byte) bool {
+		if bytes.Equal(oldValue, newValue) {
+			return true
+		}
+		return unifiedTypedTokenCost(oldValue) ==
+			unifiedTypedTokenCost(newValue) &&
+			!unifiedDictionaryEligible(oldValue) &&
+			!unifiedDictionaryEligible(newValue)
+	}
+
+	if oldBody[0] == unifiedRowTrivial {
+		oldCanonical := oldBody[1:]
+		if len(oldCanonical) != len(replacementValue) {
+			return false, nil
+		}
+		oldIndex, oldIndexed, indexErr := buildIndex(oldCanonical)
+		if indexErr != nil || !oldIndexed {
+			return false, indexErr
+		}
+		if len(oldIndex.Entries) > cap(spans)-newSpanCount {
+			return false, nil
+		}
+		spans = appendHoleSpans(spans, oldIndex)
+		newSpans := spans[:newSpanCount]
+		oldSpans := spans[newSpanCount:]
+		if !unifiedSameStaticShape(
+			oldCanonical, oldSpans, replacementValue, newSpans,
+		) {
+			return false, nil
+		}
+		oldCost, newCost := 0, 0
+		for i := range newSpans {
+			oldValue := oldCanonical[oldSpans[i].Start:oldSpans[i].End]
+			newValue := replacementValue[newSpans[i].Start:newSpans[i].End]
+			if !changedValueStable(oldValue, newValue) {
+				return false, nil
+			}
+			oldCost += unifiedTypedTokenCost(oldValue)
+			newCost += unifiedTypedTokenCost(newValue)
+		}
+		return oldCost == newCost, nil
+	}
+
+	templateID := int(oldBody[0])
+	if templateID >= v.templateCount {
+		return false, ErrCommonPrimaryLeafCorrupt
+	}
+	newSpans := spans[:newSpanCount]
+	entry := v.admittedTemplateEntry(templateID)
+	if !unifiedMatchesTemplate(replacementValue, newSpans, entry) {
+		return false, nil
+	}
+	cursor := 1
+	oldCanonicalBytes := len(entry.static)
+	oldCost, newCost := 0, 0
+	var integer [24]byte
+	for hole := range newSpans {
+		oldValue, next, tokenOK := v.patchTokenValue(
+			oldBody, cursor, integer[:0],
+		)
+		if !tokenOK {
+			return false, ErrCommonPrimaryLeafCorrupt
+		}
+		cursor = next
+		newValue := replacementValue[newSpans[hole].Start:newSpans[hole].End]
+		if !changedValueStable(oldValue, newValue) {
+			return false, nil
+		}
+		oldCanonicalBytes += len(oldValue)
+		oldCost += unifiedTypedTokenCost(oldValue)
+		newCost += unifiedTypedTokenCost(newValue)
+	}
+	return cursor == len(oldBody) &&
+		oldCanonicalBytes == len(replacementValue) &&
+		oldCost == newCost, nil
 }
 
 func (b *UnifiedPrimaryLeafBuilder) addPatchValue(value []byte, delta int) {

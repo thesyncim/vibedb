@@ -12,8 +12,13 @@ import (
 const (
 	defaultCommitQueueSlots = 64
 	defaultCommitGroupLimit = 32
-	maxCommitDescriptors    = 1 << 20
-	maxCommitCoalesce       = time.Second
+	// MaxCommitDescriptors is the fixed upper bound on the committer's retained
+	// page-descriptor arena. Store integrations use the same bound while sizing
+	// adaptive transaction windows so option normalization cannot select a wider
+	// batch than NewCommitter can represent.
+	MaxCommitDescriptors = 1 << 20
+	maxCommitDescriptors = MaxCommitDescriptors
+	maxCommitCoalesce    = time.Second
 	// frameNativeCommitBuffers cover one alternate root plus the maximum
 	// journal/patch working set with spare producer/worker overlap. Immutable
 	// transaction data pages live in PageCache and do not consume this arena.

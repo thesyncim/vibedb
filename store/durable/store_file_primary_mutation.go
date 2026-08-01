@@ -11,7 +11,28 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const filePrimaryPendingParentLimit = 64
+// filePrimaryPendingParentLimit is the compile-time ceiling for one buffered
+// primary fold. Each collection selects a runtime prefix of this bound from its
+// descriptor and resident-byte budgets; keeping the arrays fixed preserves
+// allocation-free fold scratch without forcing small explicit configurations
+// to reserve the maximum transaction.
+const filePrimaryPendingParentLimit = 1024
+
+// filePrimaryPendingCapacity is also the structural fallback window. A
+// collection can disable or narrow the row overlay when ResidentBytes is tight;
+// that must not take away an atomic batch shape already admitted by the ordinary
+// transaction geometry. The runtime window therefore covers the larger of that
+// batch and the overlay fold, within the fixed structural scratch ceiling.
+func filePrimaryPendingCapacity(options normalizedFileStoreOptions) int {
+	structuralWindow := max(
+		min(options.MaxBatchDocuments, filePrimaryPendingParentLimit),
+		options.primaryUnifiedOverlayBuckets,
+	)
+	return min(
+		options.MaxRetiredExtents,
+		max(1, structuralWindow),
+	)
+}
 
 // primaryLeafPlacementStride is the per-rank spacing of the placement target
 // below: a wide leaf extent plus half a narrow one of slack. It must be at least
@@ -381,19 +402,13 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 	if cap(c.primaryPendingParents) == 0 {
 		c.primaryPendingParents = make(
 			[]filePrimaryPendingParent, 0,
-			min(
-				c.options.MaxRetiredExtents,
-				filePrimaryPendingParentLimit,
-			),
+			filePrimaryPendingCapacity(c.options),
 		)
 	}
 	if cap(c.primaryVolatileRetired) == 0 {
 		c.primaryVolatileRetired = make(
 			[]storeio.PageRef, 0,
-			min(
-				c.options.MaxRetiredExtents,
-				filePrimaryPendingParentLimit,
-			),
+			filePrimaryPendingCapacity(c.options),
 		)
 	}
 	c.clearPrimaryVolatileRetiredLocked()

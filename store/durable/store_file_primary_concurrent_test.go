@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,6 +35,11 @@ type concurrentPrimaryTestBucket struct {
 
 type concurrentPrimaryPutResult struct {
 	created bool
+	err     error
+}
+
+type concurrentPrimaryDeleteResult struct {
+	deleted bool
 	err     error
 }
 
@@ -213,6 +219,817 @@ func assertConcurrentPrimaryRaw(
 	}
 }
 
+func TestPrimaryConcurrentDocumentCountBounds(t *testing.T) {
+	maximum := ^uint64(0)
+	for _, test := range []struct {
+		name  string
+		base  uint64
+		delta int64
+		want  uint64
+		ok    bool
+	}{
+		{name: "zero", base: 7, delta: 0, want: 7, ok: true},
+		{name: "decrement", base: 7, delta: -3, want: 4, ok: true},
+		{name: "underflow", base: 2, delta: -3, ok: false},
+		{name: "increment", base: 7, delta: 3, want: 10, ok: true},
+		{name: "maximum", base: maximum - 1, delta: 1, want: maximum, ok: true},
+		{name: "overflow", base: maximum, delta: 1, ok: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := primaryConcurrentDocumentCount(test.base, test.delta)
+			if got != test.want || ok != test.ok {
+				t.Fatalf("document count = %d,%v, want %d,%v",
+					got, ok, test.want, test.ok)
+			}
+		})
+	}
+}
+
+func TestConcurrentPrimaryPublisherPreservesNonPressureErrorForSuffix(
+	t *testing.T,
+) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	route, ok := coll.primaryRouter.Load().Route(key)
+	if !ok {
+		t.Fatal("route existing key")
+	}
+	baseGeneration := coll.Generation()
+	baseRecords := coll.primaryUnifiedOverlay.count.Load()
+
+	requests := [2]primaryConcurrentPublishRequest{}
+	for index := range requests {
+		requests[index] = primaryConcurrentPublishRequest{
+			key: key, canonical: []byte(`{"publisher":"suffix"}`),
+			route: route, kind: primaryUnifiedOverlayPut,
+			countDelta: 0,
+			signal:     make(chan primaryConcurrentPublishSignal, 1),
+		}
+	}
+	// This reaches prepareWithLeafReservation and fails its exact delta
+	// validation. The second request is deliberately otherwise valid: it proves
+	// the original non-capacity failure is copied to the untouched suffix.
+	requests[0].countDelta = 2
+	batch := []*primaryConcurrentPublishRequest{&requests[0], &requests[1]}
+	coll.writer.RLock()
+	coll.publishConcurrentPrimaryMutations(batch)
+	coll.writer.RUnlock()
+
+	for index := range requests {
+		signal := <-requests[index].signal
+		if signal.handled || !errors.Is(signal.err, storeio.ErrInvalidWrite) ||
+			errors.Is(signal.err, errConcurrentPrimaryPressure) {
+			t.Fatalf(
+				"request %d result = handled=%v err=%v, want direct invalid-write error",
+				index, signal.handled, signal.err,
+			)
+		}
+	}
+	if got := coll.Generation(); got != baseGeneration {
+		t.Fatalf("generation = %d, want unchanged %d", got, baseGeneration)
+	}
+	if got := coll.primaryUnifiedOverlay.count.Load(); got != baseRecords {
+		t.Fatalf("overlay records = %d, want unchanged %d", got, baseRecords)
+	}
+}
+
+func TestConcurrentPrimaryReplaceReusesJournalCoveredArena(t *testing.T) {
+	options := concurrentPrimaryTestOptions()
+	fixture := openConcurrentPrimaryTestFixture(t, 512, options)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	first := []byte(`{"arena":"aaaa","revision":1}`)
+	second := []byte(`{"arena":"bbbb","revision":2}`)
+	if len(first) != len(second) {
+		t.Fatal("test values are not the same size")
+	}
+	if created, err := coll.Put(key, first); err != nil || created {
+		t.Fatalf("first Put = %v,%v", created, err)
+	}
+	firstGeneration := coll.Generation()
+	used := coll.primaryUnifiedOverlay.used.Load()
+	count := coll.primaryUnifiedOverlay.count.Load()
+	physical := coll.committer.DurableGeneration()
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := coll.journalDeltaGeneration.Load(); got != firstGeneration {
+		t.Fatalf("journal generation = %d, want %d", got, firstGeneration)
+	}
+	if got := coll.committer.DurableGeneration(); got != physical {
+		t.Fatalf("journal-only Flush advanced physical generation %d -> %d",
+			physical, got)
+	}
+	old := coll.primaryUnifiedOverlay.records[count-1]
+
+	if created, err := coll.Put(key, second); err != nil || created {
+		t.Fatalf("second Put = %v,%v", created, err)
+	}
+	if got := coll.primaryUnifiedOverlay.used.Load(); got != used {
+		t.Fatalf("arena used = %d, want unchanged %d", got, used)
+	}
+	if got := coll.primaryUnifiedOverlay.count.Load(); got != count+1 {
+		t.Fatalf("record count = %d, want %d", got, count+1)
+	}
+	latest := coll.primaryUnifiedOverlay.records[count]
+	if latest.keyOffset != old.keyOffset ||
+		latest.valueOff != old.valueOff {
+		t.Fatalf("latest offsets = %d/%d, want reused %d/%d",
+			latest.keyOffset, latest.valueOff,
+			old.keyOffset, old.valueOff)
+	}
+	assertConcurrentPrimaryRaw(t, coll, key, second)
+
+	entries, complete, err := coll.primaryUnifiedOverlay.checkpointEntries(
+		make([]storeio.RecoveryBatchEntry, 0, 1),
+		firstGeneration, coll.Generation(),
+	)
+	if err != nil || !complete || len(entries) != 1 ||
+		!bytes.Equal(entries[0].Key, key) ||
+		!bytes.Equal(entries[0].Value, second) {
+		t.Fatalf("post-reuse journal entries = %#v complete=%v err=%v",
+			entries, complete, err)
+	}
+
+	// The newer replacement is still volatile. A crash image must recover the
+	// first value from the already-synced journal bytes, proving that overwriting
+	// its in-memory arena copy did not weaken the previous durability cut.
+	image := captureJournalImage(t, fixture.path)
+	recoveryPath := filepath.Join(t.TempDir(), "arena-reuse-recovery.vibe")
+	if err := os.WriteFile(recoveryPath, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		recoveryPath+".rjournal", image.journal, 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoveryFile, err := os.OpenFile(recoveryPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveryFile.Close()
+	recovered, err := Open(recoveryFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	assertConcurrentPrimaryRaw(t, recovered, key, first)
+}
+
+func TestConcurrentPrimaryReplaceRepeatedArenaReuseFoldsAndReopens(t *testing.T) {
+	options := concurrentPrimaryTestOptions()
+	fixture := openConcurrentPrimaryTestFixture(t, 512, options)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	values := [][]byte{
+		[]byte(`{"arena":"aaaa","revision":1}`),
+		[]byte(`{"arena":"bbbb","revision":2}`),
+		[]byte(`{"arena":"cccc","revision":3}`),
+		[]byte(`{"arena":"dddd","revision":4}`),
+		[]byte(`{"arena":"eeee","revision":5}`),
+	}
+	for index := 1; index < len(values); index++ {
+		if len(values[index]) != len(values[0]) {
+			t.Fatalf("test value %d length = %d, want %d",
+				index, len(values[index]), len(values[0]))
+		}
+	}
+	physicalBase := coll.committer.DurableGeneration()
+	if created, err := coll.Put(key, values[0]); err != nil || created {
+		t.Fatalf("initial Put = %v,%v", created, err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := coll.committer.DurableGeneration(); got != physicalBase {
+		t.Fatalf("initial journal cut advanced physical generation %d -> %d",
+			physicalBase, got)
+	}
+	used := coll.primaryUnifiedOverlay.used.Load()
+	firstRecord := coll.primaryUnifiedOverlay.records[0]
+
+	for index, value := range values[1:] {
+		count := coll.primaryUnifiedOverlay.count.Load()
+		if created, err := coll.Put(key, value); err != nil || created {
+			t.Fatalf("reuse Put %d = %v,%v", index+1, created, err)
+		}
+		if got := coll.primaryUnifiedOverlay.used.Load(); got != used {
+			t.Fatalf("reuse %d arena used = %d, want unchanged %d",
+				index+1, got, used)
+		}
+		if got := coll.primaryUnifiedOverlay.count.Load(); got != count+1 {
+			t.Fatalf("reuse %d record count = %d, want %d",
+				index+1, got, count+1)
+		}
+		latest := coll.primaryUnifiedOverlay.records[count]
+		if latest.keyOffset != firstRecord.keyOffset ||
+			latest.valueOff != firstRecord.valueOff {
+			t.Fatalf("reuse %d offsets = %d/%d, want %d/%d",
+				index+1, latest.keyOffset, latest.valueOff,
+				firstRecord.keyOffset, firstRecord.valueOff)
+		}
+		if err := coll.Flush(); err != nil {
+			t.Fatalf("journal cut %d: %v", index+1, err)
+		}
+		if got, want := coll.journalDeltaGeneration.Load(),
+			coll.Generation(); got != want {
+			t.Fatalf("journal cut %d watermark = %d, want %d",
+				index+1, got, want)
+		}
+		if got := coll.committer.DurableGeneration(); got != physicalBase {
+			t.Fatalf("journal cut %d advanced physical generation %d -> %d",
+				index+1, physicalBase, got)
+		}
+		assertConcurrentPrimaryRaw(t, coll, key, value)
+	}
+
+	// Recovery after several overwrite/sync cycles must use the newest journal
+	// bytes, even though every metadata generation still aliases one arena slot.
+	image := captureJournalImage(t, fixture.path)
+	recoveryPath := filepath.Join(t.TempDir(), "repeated-arena-reuse.vibe")
+	if err := os.WriteFile(recoveryPath, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		recoveryPath+".rjournal", image.journal, 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoveryFile, err := os.OpenFile(recoveryPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := Open(recoveryFile, options)
+	if err != nil {
+		_ = recoveryFile.Close()
+		t.Fatal(err)
+	}
+	assertConcurrentPrimaryRaw(t, recovered, key, values[len(values)-1])
+	if err := recovered.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveryFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Folding the full alias chain must preserve generation order and aggregate
+	// the initial size delta only once. Reopen the actual file after that device
+	// checkpoint, rather than relying solely on the journal recovery copy above.
+	finalGeneration := coll.Generation()
+	if err := flushPhysicalForTest(coll); err != nil {
+		t.Fatal(err)
+	}
+	if got := coll.committer.DurableGeneration(); got != finalGeneration {
+		t.Fatalf("physical generation = %d, want %d", got, finalGeneration)
+	}
+	if got := coll.primaryUnifiedOverlay.count.Load(); got != 0 {
+		t.Fatalf("folded overlay record count = %d, want recycled", got)
+	}
+	if err := coll.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(fixture.file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.Generation(); got != finalGeneration {
+		t.Fatalf("reopened generation = %d, want %d", got, finalGeneration)
+	}
+	assertConcurrentPrimaryRaw(t, reopened, key, values[len(values)-1])
+}
+
+func TestConcurrentPrimaryReplaceReservesActualLeafBytes(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	router := coll.primaryRouter.Load()
+	route, ok := router.Route(key)
+	if !ok {
+		t.Fatal("route disappeared")
+	}
+	if route.Ref.Length >= uint32(coll.options.MaxPageSize) {
+		t.Fatalf("fixture leaf extent = %d, want compact extent below %d",
+			route.Ref.Length, coll.options.MaxPageSize)
+	}
+	integer := bytes.Replace(
+		fixture.values[0], []byte(`"group":0`), []byte(`"group":1`), 1,
+	)
+	if bytes.Equal(integer, fixture.values[0]) {
+		t.Fatalf("fixture value has no one-digit group: %s", fixture.values[0])
+	}
+	if created, err := coll.Put(key, integer); err != nil || created {
+		t.Fatalf("certified integer Put = %v,%v", created, err)
+	}
+	slot, found := coll.primaryUnifiedOverlay.bucketSlot(route.Bucket)
+	if !found {
+		t.Fatal("certified replacement did not publish an overlay bucket")
+	}
+	wantExact := route.Ref.Length +
+		coll.options.primaryUnifiedOverlayParentBytes
+	if got := coll.primaryUnifiedOverlay.buckets[slot].reservedBytes.Load(); got != wantExact {
+		t.Fatalf("certified bucket reservation = %d, want route %d + parents %d = %d",
+			got, route.Ref.Length,
+			coll.options.primaryUnifiedOverlayParentBytes, wantExact)
+	}
+
+	// An equal-length string change is not a local extent certificate: changing
+	// a dictionary-eligible spelling can alter the leaf-wide dictionary choice.
+	// It must conservatively upgrade the already-dirty bucket to MaxPageSize.
+	stringChange := bytes.Replace(
+		integer, []byte(`primary row 0`), []byte(`xrimary row 0`), 1,
+	)
+	if bytes.Equal(stringChange, integer) {
+		t.Fatalf("fixture value has no mutable string: %s", integer)
+	}
+	if created, err := coll.Put(key, stringChange); err != nil || created {
+		t.Fatalf("uncertified string Put = %v,%v", created, err)
+	}
+	wantWide := uint32(coll.options.MaxPageSize) +
+		coll.options.primaryUnifiedOverlayParentBytes
+	if got := coll.primaryUnifiedOverlay.buckets[slot].reservedBytes.Load(); got != wantWide {
+		t.Fatalf("uncertified bucket reservation = %d, want max leaf + parents %d",
+			got, wantWide)
+	}
+}
+
+func TestConcurrentPrimaryDeleteRestoreDowngradesFinalReservation(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	targets, _ := concurrentPrimaryTestTargets(t, fixture)
+	keys := [2][]byte{
+		[]byte(fixture.keys[targets[0]]),
+		[]byte(fixture.keys[targets[1]]),
+	}
+	values := [2][]byte{
+		fixture.values[targets[0]], fixture.values[targets[1]],
+	}
+	route, ok := coll.primaryRouter.Load().Route(keys[0])
+	if !ok {
+		t.Fatal("route first restore key")
+	}
+	other, ok := coll.primaryRouter.Load().Route(keys[1])
+	if !ok || other.Bucket != route.Bucket || other.Ref != route.Ref {
+		t.Fatalf("restore routes differ: first=%+v second=%+v ok=%v",
+			route, other, ok)
+	}
+	if route.Ref.Length >= uint32(coll.options.MaxPageSize) {
+		t.Fatalf("fixture leaf extent = %d, want compact extent below %d",
+			route.Ref.Length, coll.options.MaxPageSize)
+	}
+
+	wantWide := uint32(coll.options.MaxPageSize) +
+		coll.options.primaryUnifiedOverlayParentBytes
+	wantFixed := route.Ref.Length +
+		coll.options.primaryUnifiedOverlayParentBytes
+	for i := range keys {
+		deleted, err := coll.Delete(keys[i])
+		if err != nil || !deleted {
+			t.Fatalf("Delete %d = %v,%v", i, deleted, err)
+		}
+		slot, found := coll.primaryUnifiedOverlay.bucketSlot(route.Bucket)
+		if !found {
+			t.Fatal("delete did not publish overlay bucket")
+		}
+		if got := coll.primaryUnifiedOverlay.buckets[slot].wideKeys.Load(); got != int32(i+1) {
+			t.Fatalf("wide keys after delete %d = %d, want %d", i, got, i+1)
+		}
+		if got := coll.primaryUnifiedOverlay.buckets[slot].reservedBytes.Load(); got != wantWide {
+			t.Fatalf("reservation after delete %d = %d, want %d", i, got, wantWide)
+		}
+	}
+
+	for i := range keys {
+		created, err := coll.Put(keys[i], values[i])
+		if err != nil || !created {
+			t.Fatalf("certified restore %d = %v,%v", i, created, err)
+		}
+		slot, _ := coll.primaryUnifiedOverlay.bucketSlot(route.Bucket)
+		wantWideKeys := int32(1 - i)
+		if got := coll.primaryUnifiedOverlay.buckets[slot].wideKeys.Load(); got != wantWideKeys {
+			t.Fatalf("wide keys after restore %d = %d, want %d",
+				i, got, wantWideKeys)
+		}
+		wantReservation := wantWide
+		if wantWideKeys == 0 {
+			wantReservation = wantFixed
+		}
+		if got := coll.primaryUnifiedOverlay.buckets[slot].reservedBytes.Load(); got != wantReservation {
+			t.Fatalf("reservation after restore %d = %d, want %d",
+				i, got, wantReservation)
+		}
+	}
+	if got := coll.primaryUnifiedOverlay.dirtyBytes.Load(); got != uint64(wantFixed) {
+		t.Fatalf("final dirty bytes = %d, want %d", got, wantFixed)
+	}
+	for i := 0; i < 2; i++ {
+		record := &coll.primaryUnifiedOverlay.records[i]
+		if record.kind != primaryUnifiedOverlayDelete || record.reservationWide != 1 {
+			t.Fatalf("old tombstone %d mutated: kind=%d wide=%d",
+				i, record.kind, record.reservationWide)
+		}
+	}
+}
+
+func TestConcurrentPrimaryDeleteRestoreWithActiveSnapshot(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	want := canonicalConcurrentPrimaryValue(t, fixture.values[0])
+	snapshot, err := coll.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	baseGeneration := coll.Generation()
+	baseFolds := coll.Stats().PrimaryOverlayFolds
+	var staged atomic.Int64
+	previous := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		staged.Add(1)
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previous })
+
+	deleted, err := coll.Delete(key)
+	if err != nil || !deleted {
+		t.Fatalf("snapshot-overlap Delete = %v,%v", deleted, err)
+	}
+	if got, found, readErr := coll.AppendRaw(nil, key); readErr != nil || found {
+		t.Fatalf("current deleted read = %s,%v,%v", got, found, readErr)
+	}
+	if got, found, readErr := snapshot.AppendRaw(nil, key); readErr != nil ||
+		!found || !bytes.Equal(got, want) {
+		t.Fatalf("snapshot after delete = %s,%v,%v want %s",
+			got, found, readErr, want)
+	}
+	created, err := coll.Put(key, fixture.values[0])
+	if err != nil || !created {
+		t.Fatalf("snapshot-overlap restore = %v,%v", created, err)
+	}
+	if got, found, readErr := snapshot.AppendRaw(nil, key); readErr != nil ||
+		!found || !bytes.Equal(got, want) {
+		t.Fatalf("snapshot after restore = %s,%v,%v want %s",
+			got, found, readErr, want)
+	}
+	if got := staged.Load(); got != 2 {
+		t.Fatalf("snapshot-overlap concurrent stages = %d, want 2", got)
+	}
+	if got := coll.Generation(); got != baseGeneration+2 {
+		t.Fatalf("snapshot-overlap generation = %d, want %d",
+			got, baseGeneration+2)
+	}
+	if got := coll.Stats().PrimaryOverlayFolds; got != baseFolds {
+		t.Fatalf("snapshot-overlap folds = %d, baseline %d", got, baseFolds)
+	}
+}
+
+func TestConcurrentPrimaryDeleteRestoreWithPinnedDirectEpoch(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	want := canonicalConcurrentPrimaryValue(t, fixture.values[0])
+	state, epoch, ok := coll.enterReadEpoch()
+	if !ok {
+		t.Fatal("pin direct read epoch")
+	}
+	defer epoch.Exit()
+	baseGeneration := state.root.Generation
+	baseFolds := coll.Stats().PrimaryOverlayFolds
+	var staged atomic.Int64
+	previous := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		staged.Add(1)
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previous })
+
+	deleted, err := coll.Delete(key)
+	if err != nil || !deleted {
+		t.Fatalf("epoch-overlap Delete = %v,%v", deleted, err)
+	}
+	if got, found, readErr := coll.resolvePrimaryGraph(nil, state, key); readErr != nil ||
+		!found || !bytes.Equal(got, want) {
+		t.Fatalf("pinned generation after delete = %s,%v,%v want %s",
+			got, found, readErr, want)
+	}
+	created, err := coll.Put(key, fixture.values[0])
+	if err != nil || !created {
+		t.Fatalf("epoch-overlap restore = %v,%v", created, err)
+	}
+	if got, found, readErr := coll.resolvePrimaryGraph(nil, state, key); readErr != nil ||
+		!found || !bytes.Equal(got, want) {
+		t.Fatalf("pinned generation after restore = %s,%v,%v want %s",
+			got, found, readErr, want)
+	}
+	if got := staged.Load(); got != 2 {
+		t.Fatalf("epoch-overlap concurrent stages = %d, want 2", got)
+	}
+	if got := coll.Generation(); got != baseGeneration+2 {
+		t.Fatalf("epoch-overlap generation = %d, want %d",
+			got, baseGeneration+2)
+	}
+	if got := coll.Stats().PrimaryOverlayFolds; got != baseFolds {
+		t.Fatalf("epoch-overlap folds = %d, baseline %d", got, baseFolds)
+	}
+}
+
+func TestConcurrentPrimaryActiveSnapshotPressureIsBounded(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	wantSnapshot := canonicalConcurrentPrimaryValue(t, fixture.values[0])
+	snapshot, err := coll.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	baseGeneration := coll.Generation()
+	baseStats := coll.Stats()
+	values := [2][]byte{
+		[]byte(`{"pressure":100000}`),
+		[]byte(`{"pressure":200000}`),
+	}
+	for generation := range primaryUnifiedOverlayRecords {
+		created, putErr := coll.Put(key, values[generation&1])
+		if putErr != nil || created {
+			t.Fatalf("pressure fill %d = %v,%v", generation, created, putErr)
+		}
+	}
+	if got := coll.primaryUnifiedOverlay.count.Load(); got != primaryUnifiedOverlayRecords {
+		t.Fatalf("pressure overlay records = %d, want %d",
+			got, primaryUnifiedOverlayRecords)
+	}
+	final := values[primaryUnifiedOverlayRecords&1]
+	created, err := coll.Put(key, final)
+	if err != nil || created {
+		t.Fatalf("bounded pressure Put = %v,%v", created, err)
+	}
+	if got := coll.Generation(); got != baseGeneration+primaryUnifiedOverlayRecords+1 {
+		t.Fatalf("pressure generation = %d, want %d",
+			got, baseGeneration+primaryUnifiedOverlayRecords+1)
+	}
+	after := coll.Stats()
+	if got := after.PrimaryOverlayFolds - baseStats.PrimaryOverlayFolds; got != 1 {
+		t.Fatalf("snapshot pressure folds = %d, want 1", got)
+	}
+	if got := after.ConcurrentPrimaryFallbacks - baseStats.ConcurrentPrimaryFallbacks; got != 1 {
+		t.Fatalf("snapshot pressure fallbacks = %d, want 1", got)
+	}
+	if got, found, readErr := snapshot.AppendRaw(nil, key); readErr != nil ||
+		!found || !bytes.Equal(got, wantSnapshot) {
+		t.Fatalf("snapshot after pressure = %s,%v,%v want %s",
+			got, found, readErr, wantSnapshot)
+	}
+	assertConcurrentPrimaryRaw(
+		t, coll, key, canonicalConcurrentPrimaryValue(t, final),
+	)
+}
+
+func TestConcurrentPrimarySameBucketCompetingInsertsCrashRecover(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	router := coll.primaryRouter.Load()
+	var (
+		keys  [2][]byte
+		route storeio.ResidentPrimaryRoute
+	)
+	foundCandidates := false
+	for _, bucket := range concurrentPrimaryTestBuckets(t, fixture) {
+		if len(bucket.indices) < 3 {
+			continue
+		}
+		base := fixture.keys[bucket.indices[len(bucket.indices)/2]]
+		first := []byte(base + "-insert-a")
+		second := []byte(base + "-insert-b")
+		firstRoute, firstOK := router.Route(first)
+		secondRoute, secondOK := router.Route(second)
+		if firstOK && secondOK && firstRoute.Bucket == secondRoute.Bucket &&
+			firstRoute.Ref == secondRoute.Ref {
+			keys = [2][]byte{first, second}
+			route = firstRoute
+			foundCandidates = true
+			break
+		}
+	}
+	if !foundCandidates {
+		t.Fatal("no same-bucket insert candidates")
+	}
+	values := [2][]byte{
+		canonicalConcurrentPrimaryValue(t, []byte(`{"insert":"alpha","n":1}`)),
+		canonicalConcurrentPrimaryValue(t, []byte(`{"insert":"bravo","n":2}`)),
+	}
+	for _, key := range keys {
+		if _, found, err := coll.AppendRaw(nil, key); err != nil || found {
+			t.Fatalf("candidate %q already present: found=%v err=%v", key, found, err)
+		}
+	}
+	snapshot, err := coll.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	baseGeneration := coll.Generation()
+	baseCount := coll.Len()
+	baseFolds := coll.Stats().PrimaryOverlayFolds
+
+	entered := make(chan struct{}, 1)
+	contended := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var (
+		blocked atomic.Bool
+		staged  atomic.Int64
+	)
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	previousPublish := concurrentPrimaryReplacePublishHook
+	previousContended := concurrentPrimaryStripeContendedHook
+	concurrentPrimaryReplaceStagedHook = func(bucket storeio.BucketID) {
+		if bucket == route.Bucket {
+			staged.Add(1)
+		}
+	}
+	concurrentPrimaryReplacePublishHook = func(bucket storeio.BucketID, _ uint64) {
+		if bucket == route.Bucket && blocked.CompareAndSwap(false, true) {
+			entered <- struct{}{}
+			<-release
+		}
+	}
+	concurrentPrimaryStripeContendedHook = func(bucket storeio.BucketID) {
+		if bucket == route.Bucket {
+			contended <- struct{}{}
+		}
+	}
+	t.Cleanup(func() {
+		concurrentPrimaryReplaceStagedHook = previousStaged
+		concurrentPrimaryReplacePublishHook = previousPublish
+		concurrentPrimaryStripeContendedHook = previousContended
+	})
+
+	results := make(chan concurrentPrimaryPutResult, 2)
+	go func() {
+		created, putErr := coll.Put(keys[0], values[0])
+		results <- concurrentPrimaryPutResult{created: created, err: putErr}
+	}()
+	awaitConcurrentPrimary(t, entered, "first insert publisher")
+	go func() {
+		created, putErr := coll.Put(keys[1], values[1])
+		results <- concurrentPrimaryPutResult{created: created, err: putErr}
+	}()
+	awaitConcurrentPrimary(t, contended, "second same-bucket insert")
+	close(release)
+	for range 2 {
+		result := awaitConcurrentPrimary(t, results, "same-bucket insert result")
+		if result.err != nil || !result.created {
+			t.Fatalf("same-bucket insert = %v,%v", result.created, result.err)
+		}
+	}
+	if got := staged.Load(); got != 2 {
+		t.Fatalf("concurrent insert stages = %d, want 2", got)
+	}
+	if got := coll.Generation(); got != baseGeneration+2 {
+		t.Fatalf("insert generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := coll.Len(); got != baseCount+2 {
+		t.Fatalf("insert count = %d, want %d", got, baseCount+2)
+	}
+	var slots [2]uint8
+	for i := range keys {
+		assertConcurrentPrimaryRaw(t, coll, keys[i], values[i])
+		if got, present, readErr := snapshot.AppendRaw(nil, keys[i]); readErr != nil || present {
+			t.Fatalf("old snapshot insert %d = %s,%v,%v", i, got, present, readErr)
+		}
+		insertRoute, routeOK := router.Route(keys[i])
+		if !routeOK {
+			t.Fatalf("insert route %d disappeared", i)
+		}
+		value, disposition, slot := coll.primaryUnifiedOverlay.lookup(
+			insertRoute.Bucket, insertRoute.Hash, keys[i], coll.Generation(),
+		)
+		if disposition != primaryUnifiedOverlayValue || !bytes.Equal(value, values[i]) {
+			t.Fatalf("insert overlay %d = %s,%d", i, value, disposition)
+		}
+		slots[i] = slot
+	}
+	if slots[0] == slots[1] {
+		t.Fatalf("competing inserts claimed slot %d", slots[0])
+	}
+	if got := coll.Stats().PrimaryOverlayFolds; got != baseFolds {
+		t.Fatalf("competing insert folds = %d, baseline %d", got, baseFolds)
+	}
+	if got := len(coll.primaryPendingParents); got != 0 {
+		t.Fatalf("competing inserts created %d structural parents", got)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	image := captureJournalImage(t, fixture.path)
+	recoveryPath := filepath.Join(t.TempDir(), "concurrent-insert-recovery.vibe")
+	if err := os.WriteFile(recoveryPath, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recoveryPath+".rjournal", image.journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recoveryFile, err := os.OpenFile(recoveryPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveryFile.Close()
+	recovered, err := Open(recoveryFile, concurrentPrimaryTestOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if got := recovered.Generation(); got != baseGeneration+2 {
+		t.Fatalf("recovered insert generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := recovered.Len(); got != baseCount+2 {
+		t.Fatalf("recovered insert count = %d, want %d", got, baseCount+2)
+	}
+	for i := range keys {
+		assertConcurrentPrimaryRaw(t, recovered, keys[i], values[i])
+	}
+}
+
+func TestConcurrentPrimaryReplaceLateReaderDisablesArenaReuse(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	key := []byte(fixture.keys[0])
+	first := []byte(`{"arena":"left","revision":1}`)
+	second := []byte(`{"arena":"next","revision":2}`)
+	if len(first) != len(second) {
+		t.Fatal("test values are not the same size")
+	}
+	if created, err := coll.Put(key, first); err != nil || created {
+		t.Fatalf("first Put = %v,%v", created, err)
+	}
+	firstGeneration := coll.Generation()
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	used := coll.primaryUnifiedOverlay.used.Load()
+
+	staged := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	previous := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		close(staged)
+		<-release
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previous })
+	result := make(chan concurrentPrimaryPutResult, 1)
+	go func() {
+		created, err := coll.Put(key, second)
+		result <- concurrentPrimaryPutResult{created: created, err: err}
+	}()
+	awaitConcurrentPrimary(t, staged, "same-size replacement staging")
+	epoch, ok := coll.readEpochs.Enter(firstGeneration)
+	if !ok {
+		t.Fatal("could not pin late direct-read epoch")
+	}
+	defer epoch.Exit()
+	releaseOnce.Do(func() { close(release) })
+	put := awaitConcurrentPrimary(t, result, "reader-fenced replacement")
+	if put.err != nil || put.created {
+		t.Fatalf("second Put = %v,%v", put.created, put.err)
+	}
+	if got, want := coll.primaryUnifiedOverlay.used.Load(),
+		used+uint32(len(key)+len(second)); got != want {
+		t.Fatalf("reader-fenced arena used = %d, want fresh-copy %d", got, want)
+	}
+	router := coll.primaryRouter.Load()
+	route, ok := router.Route(key)
+	if !ok {
+		t.Fatal("route disappeared")
+	}
+	old, disposition, _ := coll.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, firstGeneration,
+	)
+	if disposition != primaryUnifiedOverlayValue || !bytes.Equal(old, first) {
+		t.Fatalf("old reader generation = %q,%d, want %s",
+			old, disposition, first)
+	}
+	assertConcurrentPrimaryRaw(t, coll, key, second)
+}
+
 func TestConcurrentPrimaryReplaceDisjointStripesStageBeforePublish(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
 		t, 4096, concurrentPrimaryTestOptions(),
@@ -293,6 +1110,703 @@ func TestConcurrentPrimaryReplaceDisjointStripesStageBeforePublish(t *testing.T)
 	if got := fixture.collection.Stats().ConcurrentPrimaryReplaces -
 		baseStats.ConcurrentPrimaryReplaces; got != 2 {
 		t.Fatalf("concurrent replacements = %d, want 2", got)
+	}
+}
+
+func TestConcurrentPrimaryDeleteRestoreKeepsStableSlotAndExactCuts(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	coll := fixture.collection
+	at := len(fixture.keys) / 2
+	key := []byte(fixture.keys[at])
+	want := canonicalConcurrentPrimaryValue(t, fixture.values[at])
+	state := coll.state.Load()
+	route, ok := coll.primaryRouter.Load().Route(key)
+	if !ok {
+		t.Fatalf("route existing key %q", key)
+	}
+	lease, err := coll.primaryRouter.Load().AcquireLeaf(coll.cache, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		lease.Page(), coll.storeID, route.Bucket,
+		coll.primaryLeafBounds(state),
+	)
+	if !admitted {
+		lease.Release()
+		t.Fatal("target is not an admitted unified leaf")
+	}
+	baseSlot, body, overflow, found :=
+		leaf.LookupBodySlotHashed(route.Hash, key)
+	if !found || overflow {
+		lease.Release()
+		t.Fatalf("base lookup = found %v overflow %v", found, overflow)
+	}
+	baseLen := leaf.AdmittedRowBodyLen(body)
+	lease.Release()
+
+	baseGeneration := coll.Generation()
+	baseCount := coll.Len()
+	baseOverlayCount := coll.primaryUnifiedOverlay.count.Load()
+	baseFolds := coll.Stats().PrimaryOverlayFolds
+	var staged atomic.Int64
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		staged.Add(1)
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previousStaged })
+
+	deleted, err := coll.Delete(key)
+	if err != nil || !deleted {
+		t.Fatalf("Delete = %v,%v", deleted, err)
+	}
+	if got := coll.Generation(); got != baseGeneration+1 {
+		t.Fatalf("delete generation = %d, want %d", got, baseGeneration+1)
+	}
+	if got := coll.Len(); got != baseCount-1 {
+		t.Fatalf("delete count = %d, want %d", got, baseCount-1)
+	}
+	if got, present, readErr := coll.AppendRaw(nil, key); readErr != nil || present {
+		t.Fatalf("deleted read = %s,%v,%v", got, present, readErr)
+	}
+	deleteRecord := coll.primaryUnifiedOverlay.records[baseOverlayCount]
+	if deleteRecord.kind != primaryUnifiedOverlayDelete ||
+		deleteRecord.countDelta != -1 || deleteRecord.slot != baseSlot ||
+		int(deleteRecord.rawDelta) !=
+			-storeio.CommonPrimaryUnifiedInsertedTrivialBytes(key, baseLen) {
+		t.Fatalf("delete record = %#v", deleteRecord)
+	}
+	if _, disposition, slot := coll.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, baseGeneration+1,
+	); disposition != primaryUnifiedOverlayDeleted || slot != baseSlot {
+		t.Fatalf("delete cut = disposition %d slot %d, want deleted/%d",
+			disposition, slot, baseSlot)
+	}
+
+	// A repeated Delete is a leaf-local no-op: no record or generation appears.
+	deleted, err = coll.Delete(key)
+	if err != nil || deleted {
+		t.Fatalf("second Delete = %v,%v", deleted, err)
+	}
+	if got := coll.Generation(); got != baseGeneration+1 {
+		t.Fatalf("no-op delete generation = %d, want %d", got, baseGeneration+1)
+	}
+	if got := coll.primaryUnifiedOverlay.count.Load(); got != baseOverlayCount+1 {
+		t.Fatalf("no-op delete overlay count = %d, want %d", got, baseOverlayCount+1)
+	}
+
+	created, err := coll.Put(key, fixture.values[at])
+	if err != nil || !created {
+		t.Fatalf("restore Put = %v,%v", created, err)
+	}
+	if got := coll.Generation(); got != baseGeneration+2 {
+		t.Fatalf("restore generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := coll.Len(); got != baseCount {
+		t.Fatalf("restore count = %d, want %d", got, baseCount)
+	}
+	assertConcurrentPrimaryRaw(t, coll, key, want)
+	restoreRecord := coll.primaryUnifiedOverlay.records[baseOverlayCount+1]
+	if restoreRecord.kind != primaryUnifiedOverlayPut ||
+		restoreRecord.countDelta != 1 || restoreRecord.slot != baseSlot ||
+		int(restoreRecord.rawDelta) !=
+			storeio.CommonPrimaryUnifiedInsertedTrivialBytes(key, len(want)) {
+		t.Fatalf("restore record = %#v", restoreRecord)
+	}
+	if int(deleteRecord.rawDelta)+int(restoreRecord.rawDelta) != 0 {
+		t.Fatalf("round-trip raw delta = %d + %d, want zero",
+			deleteRecord.rawDelta, restoreRecord.rawDelta)
+	}
+	if value, disposition, slot := coll.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, baseGeneration+2,
+	); disposition != primaryUnifiedOverlayValue || slot != baseSlot ||
+		!bytes.Equal(value, want) {
+		t.Fatalf("restore cut = %s,%d,%d, want %s,value,%d",
+			value, disposition, slot, want, baseSlot)
+	}
+	if _, disposition, _ := coll.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, baseGeneration+1,
+	); disposition != primaryUnifiedOverlayDeleted {
+		t.Fatalf("historical delete cut disposition = %d", disposition)
+	}
+	if raw, rows := coll.primaryUnifiedOverlay.pendingBucketDeltas(
+		route.Bucket,
+	); raw != 0 || rows != 0 {
+		t.Fatalf("round-trip bucket deltas = %d,%d, want 0,0", raw, rows)
+	}
+	if got := staged.Load(); got != 2 {
+		t.Fatalf("concurrent stages = %d, want delete+restore", got)
+	}
+	if got := len(coll.primaryPendingParents); got != 0 {
+		t.Fatalf("delete+restore created %d structural parents", got)
+	}
+	if got := coll.Stats().PrimaryOverlayFolds; got != baseFolds {
+		t.Fatalf("delete+restore folds = %d, baseline %d", got, baseFolds)
+	}
+	if current, routeOK := coll.primaryRouter.Load().Route(key); !routeOK ||
+		current.Ref != route.Ref {
+		t.Fatalf("resident route changed from %v to %v,%v", route.Ref, current.Ref, routeOK)
+	}
+
+	entries, complete, err := coll.primaryUnifiedOverlay.checkpointEntries(
+		make([]storeio.RecoveryBatchEntry, 0, 2),
+		baseGeneration, baseGeneration+2,
+	)
+	if err != nil || !complete || len(entries) != 2 ||
+		entries[0].Kind != storeio.RecoveryRecordKindDelete ||
+		entries[1].Kind != storeio.RecoveryRecordKindPut ||
+		!bytes.Equal(entries[1].Value, want) {
+		t.Fatalf("checkpoint entries = %#v complete=%v err=%v",
+			entries, complete, err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := coll.DurableGeneration(); got != baseGeneration+2 {
+		t.Fatalf("durable generation = %d, want %d", got, baseGeneration+2)
+	}
+	image := captureJournalImage(t, fixture.path)
+	recoveryPath := filepath.Join(t.TempDir(), "delete-restore-recovery.vibe")
+	if err := os.WriteFile(recoveryPath, image.store, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		recoveryPath+".rjournal", image.journal, 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoveryFile, err := os.OpenFile(recoveryPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveryFile.Close()
+	recovered, err := Open(recoveryFile, concurrentPrimaryTestOptions())
+	if err != nil {
+		_ = recoveryFile.Close()
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if got := recovered.Generation(); got != baseGeneration+2 {
+		t.Fatalf("recovered generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := recovered.Len(); got != baseCount {
+		t.Fatalf("recovered count = %d, want %d", got, baseCount)
+	}
+	assertConcurrentPrimaryRaw(t, recovered, key, want)
+}
+
+func TestConcurrentPrimaryDeleteRestoreDisjointStripesStageInParallel(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 4096, concurrentPrimaryTestOptions(),
+	)
+	_, targets := concurrentPrimaryTestTargets(t, fixture)
+	baseGeneration := fixture.collection.Generation()
+	baseCount := fixture.collection.Len()
+	baseFolds := fixture.collection.Stats().PrimaryOverlayFolds
+
+	staged := make(chan storeio.BucketID, 4)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(bucket storeio.BucketID) {
+		staged <- bucket
+		<-release
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previousStaged })
+
+	deleteResults := make(chan concurrentPrimaryDeleteResult, 2)
+	for _, target := range targets {
+		go func() {
+			deleted, err := fixture.collection.Delete(
+				[]byte(fixture.keys[target]),
+			)
+			deleteResults <- concurrentPrimaryDeleteResult{
+				deleted: deleted, err: err,
+			}
+		}()
+	}
+	first := awaitConcurrentPrimary(t, staged, "first staged delete")
+	second := awaitConcurrentPrimary(t, staged, "second staged delete")
+	if first == second ||
+		primaryConcurrentStripeIndex(first) == primaryConcurrentStripeIndex(second) {
+		t.Fatalf("delete buckets are not disjoint stripes: %d/%d", first, second)
+	}
+	releaseOnce.Do(func() { close(release) })
+	for range 2 {
+		result := awaitConcurrentPrimary(t, deleteResults, "disjoint delete")
+		if result.err != nil || !result.deleted {
+			t.Fatalf("disjoint Delete = %v,%v", result.deleted, result.err)
+		}
+	}
+	if got := fixture.collection.Generation(); got != baseGeneration+2 {
+		t.Fatalf("delete generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := fixture.collection.Len(); got != baseCount-2 {
+		t.Fatalf("delete count = %d, want %d", got, baseCount-2)
+	}
+
+	putResults := make(chan concurrentPrimaryPutResult, 2)
+	for _, target := range targets {
+		go func() {
+			created, err := fixture.collection.Put(
+				[]byte(fixture.keys[target]), fixture.values[target],
+			)
+			putResults <- concurrentPrimaryPutResult{
+				created: created, err: err,
+			}
+		}()
+	}
+	// release is already closed; both resurrection calls still report their
+	// completed leaf-local inspection through the same deterministic seam.
+	first = awaitConcurrentPrimary(t, staged, "first staged restore")
+	second = awaitConcurrentPrimary(t, staged, "second staged restore")
+	if first == second ||
+		primaryConcurrentStripeIndex(first) == primaryConcurrentStripeIndex(second) {
+		t.Fatalf("restore buckets are not disjoint stripes: %d/%d", first, second)
+	}
+	for range 2 {
+		result := awaitConcurrentPrimary(t, putResults, "disjoint restore")
+		if result.err != nil || !result.created {
+			t.Fatalf("disjoint restore = %v,%v", result.created, result.err)
+		}
+	}
+	if got := fixture.collection.Generation(); got != baseGeneration+4 {
+		t.Fatalf("round-trip generation = %d, want %d", got, baseGeneration+4)
+	}
+	if got := fixture.collection.Len(); got != baseCount {
+		t.Fatalf("round-trip count = %d, want %d", got, baseCount)
+	}
+	for _, target := range targets {
+		assertConcurrentPrimaryRaw(
+			t, fixture.collection, []byte(fixture.keys[target]),
+			canonicalConcurrentPrimaryValue(t, fixture.values[target]),
+		)
+	}
+	if got := len(fixture.collection.primaryPendingParents); got != 0 {
+		t.Fatalf("parallel churn created %d structural parents", got)
+	}
+	if got := fixture.collection.Stats().PrimaryOverlayFolds; got != baseFolds {
+		t.Fatalf("parallel churn folds = %d, baseline %d", got, baseFolds)
+	}
+	entries, complete, err :=
+		fixture.collection.primaryUnifiedOverlay.checkpointEntries(
+			make([]storeio.RecoveryBatchEntry, 0, 4),
+			baseGeneration, baseGeneration+4,
+		)
+	if err != nil || !complete || len(entries) != 4 ||
+		entries[0].Kind != storeio.RecoveryRecordKindDelete ||
+		entries[1].Kind != storeio.RecoveryRecordKindDelete ||
+		entries[2].Kind != storeio.RecoveryRecordKindPut ||
+		entries[3].Kind != storeio.RecoveryRecordKindPut {
+		t.Fatalf("parallel churn journal = %#v complete=%v err=%v",
+			entries, complete, err)
+	}
+}
+
+func TestConcurrentPrimaryDeleteRestoreSameBucketNoLostCount(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 4096, concurrentPrimaryTestOptions(),
+	)
+	targets, _ := concurrentPrimaryTestTargets(t, fixture)
+	keys := [2][]byte{
+		[]byte(fixture.keys[targets[0]]),
+		[]byte(fixture.keys[targets[1]]),
+	}
+	values := [2][]byte{
+		fixture.values[targets[0]], fixture.values[targets[1]],
+	}
+	route, ok := fixture.collection.primaryRouter.Load().Route(keys[0])
+	if !ok {
+		t.Fatal("route first same-bucket key")
+	}
+	other, ok := fixture.collection.primaryRouter.Load().Route(keys[1])
+	if !ok || other.Bucket != route.Bucket {
+		t.Fatalf("same-bucket routes = %d/%d, ok=%v", route.Bucket, other.Bucket, ok)
+	}
+	baseGeneration := fixture.collection.Generation()
+	baseCount := fixture.collection.Len()
+
+	var phase atomic.Int32
+	var blocked [2]atomic.Bool
+	var stages [2]atomic.Int64
+	entered := [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
+	contended := [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	previousPublish := concurrentPrimaryReplacePublishHook
+	previousContended := concurrentPrimaryStripeContendedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		stages[phase.Load()].Add(1)
+	}
+	concurrentPrimaryReplacePublishHook = func(
+		bucket storeio.BucketID, _ uint64,
+	) {
+		at := phase.Load()
+		if bucket == route.Bucket && blocked[at].CompareAndSwap(false, true) {
+			entered[at] <- struct{}{}
+			<-release[at]
+		}
+	}
+	concurrentPrimaryStripeContendedHook = func(bucket storeio.BucketID) {
+		if bucket == route.Bucket {
+			contended[phase.Load()] <- struct{}{}
+		}
+	}
+	t.Cleanup(func() {
+		concurrentPrimaryReplaceStagedHook = previousStaged
+		concurrentPrimaryReplacePublishHook = previousPublish
+		concurrentPrimaryStripeContendedHook = previousContended
+	})
+
+	deleteResults := make(chan concurrentPrimaryDeleteResult, 2)
+	go func() {
+		deleted, err := fixture.collection.Delete(keys[0])
+		deleteResults <- concurrentPrimaryDeleteResult{deleted: deleted, err: err}
+	}()
+	awaitConcurrentPrimary(t, entered[0], "blocked same-bucket delete publisher")
+	go func() {
+		deleted, err := fixture.collection.Delete(keys[1])
+		deleteResults <- concurrentPrimaryDeleteResult{deleted: deleted, err: err}
+	}()
+	awaitConcurrentPrimary(t, contended[0], "same-bucket delete contention")
+	close(release[0])
+	for range 2 {
+		result := awaitConcurrentPrimary(t, deleteResults, "same-bucket delete")
+		if result.err != nil || !result.deleted {
+			t.Fatalf("same-bucket Delete = %v,%v", result.deleted, result.err)
+		}
+	}
+	if got := fixture.collection.Generation(); got != baseGeneration+2 {
+		t.Fatalf("same-bucket delete generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := fixture.collection.Len(); got != baseCount-2 {
+		t.Fatalf("same-bucket delete count = %d, want %d", got, baseCount-2)
+	}
+	if got := stages[0].Load(); got != 2 {
+		t.Fatalf("same-bucket fast deletes = %d, want both serialized", got)
+	}
+
+	phase.Store(1)
+	putResults := make(chan concurrentPrimaryPutResult, 2)
+	go func() {
+		created, err := fixture.collection.Put(keys[0], values[0])
+		putResults <- concurrentPrimaryPutResult{created: created, err: err}
+	}()
+	awaitConcurrentPrimary(t, entered[1], "blocked same-bucket restore publisher")
+	go func() {
+		created, err := fixture.collection.Put(keys[1], values[1])
+		putResults <- concurrentPrimaryPutResult{created: created, err: err}
+	}()
+	awaitConcurrentPrimary(t, contended[1], "same-bucket restore contention")
+	close(release[1])
+	for range 2 {
+		result := awaitConcurrentPrimary(t, putResults, "same-bucket restore")
+		if result.err != nil || !result.created {
+			t.Fatalf("same-bucket restore = %v,%v", result.created, result.err)
+		}
+	}
+	if got := fixture.collection.Generation(); got != baseGeneration+4 {
+		t.Fatalf("same-bucket round-trip generation = %d, want %d", got, baseGeneration+4)
+	}
+	if got := fixture.collection.Len(); got != baseCount {
+		t.Fatalf("same-bucket round-trip count = %d, want %d", got, baseCount)
+	}
+	if got := stages[1].Load(); got != 2 {
+		t.Fatalf("same-bucket fast restores = %d, want both serialized", got)
+	}
+	for i := range keys {
+		assertConcurrentPrimaryRaw(
+			t, fixture.collection, keys[i],
+			canonicalConcurrentPrimaryValue(t, values[i]),
+		)
+	}
+}
+
+func TestConcurrentPrimaryDeleteFallbackShapes(t *testing.T) {
+	type fallbackCase struct {
+		name         string
+		count        int
+		options      func(*testing.T) Options
+		open         func(*testing.T, Options) concurrentPrimaryTestFixture
+		seedOverflow bool
+	}
+	baseOptions := func(*testing.T) Options { return concurrentPrimaryTestOptions() }
+	cases := []fallbackCase{
+		{
+			name:    "last-row",
+			count:   1,
+			options: baseOptions,
+		},
+		{
+			name:  "recovery-journal",
+			count: 256,
+			options: func(*testing.T) Options {
+				options := concurrentPrimaryTestOptions()
+				options.RecoveryJournal = true
+				return options
+			},
+		},
+		{
+			name:  "exact-index",
+			count: 256,
+			options: func(*testing.T) Options {
+				return primaryExactOverlayTestOptions("/group")
+			},
+		},
+		{
+			name:  "schema",
+			count: 1,
+			options: func(t *testing.T) Options {
+				schema, err := store.CompileSchema(store.SchemaDefinition{
+					Root: store.SchemaObject,
+					Fields: []store.SchemaField{{
+						Path: "/id", Types: store.SchemaInteger, Required: true,
+					}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				options := concurrentPrimaryTestOptions()
+				options.Collection.Schema = schema
+				return options
+			},
+			open: openConcurrentPrimarySeededTestFixture,
+		},
+		{
+			name:         "overflow",
+			count:        256,
+			seedOverflow: true,
+			options: func(*testing.T) Options {
+				options := concurrentPrimaryTestOptions()
+				options.InlineValueBytes = 64
+				options.MaxDocumentBytes = 2048
+				return options
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			options := test.options(t)
+			var fixture concurrentPrimaryTestFixture
+			if test.open != nil {
+				fixture = test.open(t, options)
+			} else {
+				fixture = openConcurrentPrimaryTestFixture(t, test.count, options)
+			}
+			key := []byte(fixture.keys[0])
+			if test.seedOverflow {
+				overflowValue := fmt.Appendf(
+					nil, `{"overflow":%q}`, bytes.Repeat([]byte("x"), 512),
+				)
+				created, err := fixture.collection.Put(key, overflowValue)
+				if err != nil || created {
+					t.Fatalf("seed overflow = %v,%v", created, err)
+				}
+			}
+			baseGeneration := fixture.collection.Generation()
+			baseCount := fixture.collection.Len()
+			var staged atomic.Int64
+			previousStaged := concurrentPrimaryReplaceStagedHook
+			concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+				staged.Add(1)
+			}
+			t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previousStaged })
+			deleted, err := fixture.collection.Delete(key)
+			if err != nil || !deleted {
+				t.Fatalf("fallback Delete = %v,%v", deleted, err)
+			}
+			if got := staged.Load(); got != 0 {
+				t.Fatalf("fallback shape staged %d concurrent deletes", got)
+			}
+			if got := fixture.collection.Generation(); got <= baseGeneration {
+				t.Fatalf("fallback generation = %d, want > %d", got, baseGeneration)
+			}
+			if got := fixture.collection.Len(); got != baseCount-1 {
+				t.Fatalf("fallback count = %d, want %d", got, baseCount-1)
+			}
+			if got, present, readErr := fixture.collection.AppendRaw(nil, key); readErr != nil || present {
+				t.Fatalf("fallback deleted read = %s,%v,%v", got, present, readErr)
+			}
+		})
+	}
+}
+
+func TestConcurrentPrimaryDeleteRestoreMultiOwnerStress(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 4096, concurrentPrimaryTestOptions(),
+	)
+	const (
+		workers = 8
+		loops   = 16
+	)
+	targets := make([]int, 0, workers)
+	seenStripes := make(map[uint32]struct{}, workers)
+	for _, bucket := range concurrentPrimaryTestBuckets(t, fixture) {
+		if len(bucket.indices) < 2 {
+			continue
+		}
+		stripe := primaryConcurrentStripeIndex(bucket.id)
+		if _, exists := seenStripes[stripe]; exists {
+			continue
+		}
+		seenStripes[stripe] = struct{}{}
+		targets = append(targets, bucket.indices[0])
+		if len(targets) == workers {
+			break
+		}
+	}
+	if len(targets) != workers {
+		t.Fatalf("found %d distinct dense stripes, want %d", len(targets), workers)
+	}
+	baseGeneration := fixture.collection.Generation()
+	baseCount := fixture.collection.Len()
+	baseFolds := fixture.collection.Stats().PrimaryOverlayFolds
+	var staged atomic.Int64
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		staged.Add(1)
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previousStaged })
+
+	start := make(chan struct{})
+	errorsOut := make(chan error, workers)
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for _, target := range targets {
+		go func() {
+			defer wait.Done()
+			<-start
+			key := []byte(fixture.keys[target])
+			value := fixture.values[target]
+			for iteration := range loops {
+				deleted, err := fixture.collection.Delete(key)
+				if err != nil || !deleted {
+					errorsOut <- fmt.Errorf(
+						"worker %d delete %d = %v,%v",
+						target, iteration, deleted, err,
+					)
+					return
+				}
+				created, err := fixture.collection.Put(key, value)
+				if err != nil || !created {
+					errorsOut <- fmt.Errorf(
+						"worker %d restore %d = %v,%v",
+						target, iteration, created, err,
+					)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsOut)
+	for err := range errorsOut {
+		t.Fatal(err)
+	}
+	wantMutations := uint64(2 * workers * loops)
+	if got := fixture.collection.Generation(); got != baseGeneration+wantMutations {
+		t.Fatalf("stress generation = %d, want %d",
+			got, baseGeneration+wantMutations)
+	}
+	if got := fixture.collection.Len(); got != baseCount {
+		t.Fatalf("stress count = %d, want %d", got, baseCount)
+	}
+	if got := staged.Load(); got != int64(wantMutations) {
+		t.Fatalf("stress concurrent stages = %d, want %d", got, wantMutations)
+	}
+	if got := fixture.collection.Stats().PrimaryOverlayFolds; got != baseFolds {
+		t.Fatalf("stress folds = %d, baseline %d", got, baseFolds)
+	}
+	for _, target := range targets {
+		assertConcurrentPrimaryRaw(
+			t, fixture.collection, []byte(fixture.keys[target]),
+			canonicalConcurrentPrimaryValue(t, fixture.values[target]),
+		)
+	}
+}
+
+func TestConcurrentPrimaryDeletePressurePublishesPrefixAndRetries(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 4096, concurrentPrimaryTestOptions(),
+	)
+	_, targets := concurrentPrimaryTestTargets(t, fixture)
+	fillKey := []byte(fixture.keys[targets[0]])
+	for generation := range primaryUnifiedOverlayRecords - 1 {
+		value := fmt.Appendf(nil, `{"pressure":%d}`, generation)
+		created, err := fixture.collection.Put(fillKey, value)
+		if err != nil || created {
+			t.Fatalf("fill replacement %d = %v,%v", generation, created, err)
+		}
+	}
+	if got := fixture.collection.primaryUnifiedOverlay.count.Load(); got != primaryUnifiedOverlayRecords-1 {
+		t.Fatalf("pre-pressure overlay count = %d, want %d",
+			got, primaryUnifiedOverlayRecords-1)
+	}
+	baseGeneration := fixture.collection.Generation()
+	baseCount := fixture.collection.Len()
+	baseStats := fixture.collection.Stats()
+	var staged atomic.Int64
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		staged.Add(1)
+	}
+	t.Cleanup(func() { concurrentPrimaryReplaceStagedHook = previousStaged })
+
+	results := make(chan concurrentPrimaryDeleteResult, 2)
+	for _, target := range targets {
+		go func() {
+			deleted, err := fixture.collection.Delete(
+				[]byte(fixture.keys[target]),
+			)
+			results <- concurrentPrimaryDeleteResult{deleted: deleted, err: err}
+		}()
+	}
+	for range 2 {
+		result := awaitConcurrentPrimary(t, results, "pressure delete")
+		if result.err != nil || !result.deleted {
+			t.Fatalf("pressure Delete = %v,%v", result.deleted, result.err)
+		}
+	}
+	if got := fixture.collection.Generation(); got != baseGeneration+2 {
+		t.Fatalf("pressure delete generation = %d, want %d", got, baseGeneration+2)
+	}
+	if got := fixture.collection.Len(); got != baseCount-2 {
+		t.Fatalf("pressure delete count = %d, want %d", got, baseCount-2)
+	}
+	afterDelete := fixture.collection.Stats()
+	if got := afterDelete.PrimaryOverlayFolds - baseStats.PrimaryOverlayFolds; got != 1 {
+		t.Fatalf("pressure delete folds = %d, want one foreground fold", got)
+	}
+	if got := afterDelete.AutomaticCheckpoints - baseStats.AutomaticCheckpoints; got != 0 {
+		t.Fatalf("pressure delete automatic checkpoints = %d, want zero", got)
+	}
+	if got := staged.Load(); got < 3 {
+		t.Fatalf("pressure delete stages = %d, want prefix plus pressure retry", got)
+	}
+
+	for _, target := range targets {
+		created, err := fixture.collection.Put(
+			[]byte(fixture.keys[target]), fixture.values[target],
+		)
+		if err != nil || !created {
+			t.Fatalf("post-pressure restore %d = %v,%v", target, created, err)
+		}
+	}
+	if got := fixture.collection.Generation(); got != baseGeneration+4 {
+		t.Fatalf("pressure round-trip generation = %d, want %d", got, baseGeneration+4)
+	}
+	if got := fixture.collection.Len(); got != baseCount {
+		t.Fatalf("pressure round-trip count = %d, want %d", got, baseCount)
+	}
+	for _, target := range targets {
+		assertConcurrentPrimaryRaw(
+			t, fixture.collection, []byte(fixture.keys[target]),
+			canonicalConcurrentPrimaryValue(t, fixture.values[target]),
+		)
 	}
 }
 
@@ -510,12 +2024,12 @@ func TestConcurrentPrimaryReplaceReadersSeeCompleteCanonicalValues(t *testing.T)
 		t.Fatalf("generation = %d, want %d", got, baseGeneration+writes)
 	}
 	// The first replacement is deliberately staged before the readers start.
-	// Later calls may sample an occupied direct-read epoch and take the
-	// established snapshot-safe fallback, or land between epochs and retain the
-	// concurrent lane; both schedules must preserve complete canonical values.
+	// Direct-read epochs do not veto append-only immutable overlay publication,
+	// so every later replacement must retain the concurrent lane while readers
+	// verify complete canonical values.
 	staged := stagedCalls.Load()
-	if staged < 1 || staged > writes {
-		t.Fatalf("staged calls = %d, want between 1 and %d", staged, writes)
+	if staged != writes {
+		t.Fatalf("staged calls = %d, want %d", staged, writes)
 	}
 	if got := fixture.collection.Stats().ConcurrentPrimaryReplaces -
 		baseStats.ConcurrentPrimaryReplaces; got != uint64(staged) {
@@ -640,6 +2154,206 @@ func TestConcurrentPrimaryExclusiveOperationsWaitAndIncludeCut(t *testing.T) {
 	}
 }
 
+func TestConcurrentPrimaryPutCanonicalizationDoesNotConvoyExclusiveWriter(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	prepareKey := []byte(fixture.keys[0])
+	prepareValue := []byte(`{ "flush_cut": 1, "prepared": true }`)
+	if created, err := collection.Put(prepareKey, prepareValue); err != nil || created {
+		t.Fatalf("prepare replacement: created=%v err=%v", created, err)
+	}
+	preparedGeneration := collection.Generation()
+
+	candidateKey := []byte(fixture.keys[1])
+	candidateValue := []byte(`{ "candidate": true, "order": [3, 2, 1] }`)
+	want := canonicalConcurrentPrimaryValue(t, candidateValue)
+	canonicalEntered := make(chan struct{})
+	releaseCanonical := make(chan struct{})
+	canonicalComplete := make(chan struct{})
+	flushHoldingWriter := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	staged := make(chan struct{})
+	var canonicalEnteredOnce sync.Once
+	var canonicalCompleteOnce sync.Once
+	var flushHoldingOnce sync.Once
+	var stagedOnce sync.Once
+	var releaseCanonicalOnce sync.Once
+	var releaseFlushOnce sync.Once
+	defer releaseCanonicalOnce.Do(func() { close(releaseCanonical) })
+	defer releaseFlushOnce.Do(func() { close(releaseFlush) })
+
+	previousCanonical := concurrentPrimaryPutCanonicalizeHook
+	previousPreSync := recoveryJournalDeltaPreSyncHook
+	previousStaged := concurrentPrimaryReplaceStagedHook
+	concurrentPrimaryPutCanonicalizeHook = func(done bool) {
+		if !done {
+			canonicalEnteredOnce.Do(func() { close(canonicalEntered) })
+			<-releaseCanonical
+			return
+		}
+		canonicalCompleteOnce.Do(func() { close(canonicalComplete) })
+	}
+	recoveryJournalDeltaPreSyncHook = func(uint64) {
+		flushHoldingOnce.Do(func() { close(flushHoldingWriter) })
+		<-releaseFlush
+	}
+	concurrentPrimaryReplaceStagedHook = func(storeio.BucketID) {
+		stagedOnce.Do(func() { close(staged) })
+	}
+	t.Cleanup(func() {
+		concurrentPrimaryPutCanonicalizeHook = previousCanonical
+		recoveryJournalDeltaPreSyncHook = previousPreSync
+		concurrentPrimaryReplaceStagedHook = previousStaged
+	})
+
+	putDone := make(chan concurrentPrimaryPutResult, 1)
+	go func() {
+		created, err := collection.Put(candidateKey, candidateValue)
+		putDone <- concurrentPrimaryPutResult{created: created, err: err}
+	}()
+	awaitConcurrentPrimary(t, canonicalEntered, "private canonicalization entry")
+
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- collection.Flush() }()
+	// The Flush hook runs only after Flush owns writer exclusively. If the Put
+	// took writer.RLock before private canonicalization, this wait deadlocks and
+	// the test times out exactly at the convoy regression.
+	awaitConcurrentPrimary(t, flushHoldingWriter, "Flush writer acquisition")
+	releaseCanonicalOnce.Do(func() { close(releaseCanonical) })
+	awaitConcurrentPrimary(t, canonicalComplete, "private canonicalization completion")
+	select {
+	case <-staged:
+		t.Fatal("candidate routed or staged while Flush still held writer")
+	default:
+	}
+	releaseFlushOnce.Do(func() { close(releaseFlush) })
+	if err := awaitConcurrentPrimary(t, flushDone, "exclusive Flush"); err != nil {
+		t.Fatal(err)
+	}
+	result := awaitConcurrentPrimary(t, putDone, "post-Flush candidate")
+	if result.err != nil || result.created {
+		t.Fatalf("candidate replacement: created=%v err=%v",
+			result.created, result.err)
+	}
+	awaitConcurrentPrimary(t, staged, "candidate shared staging")
+	if got := collection.Generation(); got != preparedGeneration+1 {
+		t.Fatalf("generation = %d, want %d", got, preparedGeneration+1)
+	}
+	if got := collection.DurableGeneration(); got != preparedGeneration {
+		t.Fatalf("durable generation = %d, want flushed cut %d",
+			got, preparedGeneration)
+	}
+	assertConcurrentPrimaryRaw(t, collection, candidateKey, want)
+}
+
+func TestConcurrentPrimaryPutPreflightDefersErrorsUntilLaneRecheck(t *testing.T) {
+	persistenceFailure := errors.New("preflight persistence failure")
+	tests := []struct {
+		name      string
+		configure func(*Collection) func()
+		wantErr   error
+	}{
+		{
+			name: "closed wins",
+			configure: func(collection *Collection) func() {
+				collection.closed = true
+				return func() { collection.closed = false }
+			},
+			wantErr: ErrClosed,
+		},
+		{
+			name: "persistence failure wins",
+			configure: func(collection *Collection) func() {
+				collection.journalFailure.Store(&journalFailureBox{
+					err: persistenceFailure,
+				})
+				return func() { collection.journalFailure.Store(nil) }
+			},
+			wantErr: persistenceFailure,
+		},
+		{
+			name: "lane change wins",
+			configure: func(collection *Collection) func() {
+				collection.onlineIndexBuild.Store(true)
+				return func() { collection.onlineIndexBuild.Store(false) }
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := openConcurrentPrimaryTestFixture(
+				t, 256, concurrentPrimaryTestOptions(),
+			)
+			collection := fixture.collection
+			canonicalEntered := make(chan struct{})
+			releaseCanonical := make(chan struct{})
+			var enteredOnce sync.Once
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(releaseCanonical) })
+			previousCanonical := concurrentPrimaryPutCanonicalizeHook
+			concurrentPrimaryPutCanonicalizeHook = func(done bool) {
+				if done {
+					return
+				}
+				enteredOnce.Do(func() { close(canonicalEntered) })
+				<-releaseCanonical
+			}
+			t.Cleanup(func() {
+				concurrentPrimaryPutCanonicalizeHook = previousCanonical
+			})
+
+			type tryResult struct {
+				handled bool
+				created bool
+				err     error
+			}
+			resultChannel := make(chan tryResult, 1)
+			go func() {
+				handled, created, err := collection.tryConcurrentPrimaryPut(
+					[]byte(fixture.keys[0]), []byte(`{"unfinished":`),
+				)
+				resultChannel <- tryResult{
+					handled: handled, created: created, err: err,
+				}
+			}()
+			awaitConcurrentPrimary(t, canonicalEntered, "preflight canonicalization")
+			collection.writer.Lock()
+			restore := test.configure(collection)
+			collection.writer.Unlock()
+			restored := false
+			defer func() {
+				if restored {
+					return
+				}
+				collection.writer.Lock()
+				restore()
+				collection.writer.Unlock()
+			}()
+			releaseOnce.Do(func() { close(releaseCanonical) })
+			result := awaitConcurrentPrimary(t, resultChannel, "preflight result")
+			collection.writer.Lock()
+			restore()
+			collection.writer.Unlock()
+			restored = true
+			if result.handled || result.created {
+				t.Fatalf("preflight result handled/created = %v/%v, want false/false",
+					result.handled, result.created)
+			}
+			if test.wantErr == nil {
+				if result.err != nil {
+					t.Fatalf("lane recheck error = %v, want nil", result.err)
+				}
+				return
+			}
+			if !errors.Is(result.err, test.wantErr) {
+				t.Fatalf("preflight error = %v, want %v", result.err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestConcurrentPrimaryReplaceUnsupportedShapesFallBack(t *testing.T) {
 	type fallbackCase struct {
 		name    string
@@ -647,7 +2361,6 @@ func TestConcurrentPrimaryReplaceUnsupportedShapesFallBack(t *testing.T) {
 		open    func(*testing.T, Options) concurrentPrimaryTestFixture
 		mutate  func(*testing.T, concurrentPrimaryTestFixture)
 	}
-	baseOptions := func(*testing.T) Options { return concurrentPrimaryTestOptions() }
 	replace := func(value []byte) func(*testing.T, concurrentPrimaryTestFixture) {
 		return func(t *testing.T, fixture concurrentPrimaryTestFixture) {
 			created, err := fixture.collection.Put([]byte(fixture.keys[0]), value)
@@ -702,33 +2415,6 @@ func TestConcurrentPrimaryReplaceUnsupportedShapesFallBack(t *testing.T) {
 			},
 			open:   openConcurrentPrimarySeededTestFixture,
 			mutate: replace([]byte(`{"id":0,"schema":"checked"}`)),
-		},
-		{
-			name:    "insert",
-			options: baseOptions,
-			mutate: func(t *testing.T, fixture concurrentPrimaryTestFixture) {
-				key := []byte("new-concurrent-primary-key")
-				value := canonicalConcurrentPrimaryValue(t, []byte(`{ "inserted": true }`))
-				created, err := fixture.collection.Put(key, value)
-				if err != nil || !created {
-					t.Fatalf("insert: created=%v err=%v", created, err)
-				}
-				assertConcurrentPrimaryRaw(t, fixture.collection, key, value)
-			},
-		},
-		{
-			name:    "delete",
-			options: baseOptions,
-			mutate: func(t *testing.T, fixture concurrentPrimaryTestFixture) {
-				key := []byte(fixture.keys[0])
-				deleted, err := fixture.collection.Delete(key)
-				if err != nil || !deleted {
-					t.Fatalf("delete: deleted=%v err=%v", deleted, err)
-				}
-				if got, found, err := fixture.collection.AppendRaw(nil, key); err != nil || found {
-					t.Fatalf("deleted read: found=%v value=%s err=%v", found, got, err)
-				}
-			},
 		},
 		{
 			name: "overflow-replacement",
@@ -848,6 +2534,135 @@ func TestConcurrentPrimaryScratchIsFixedAndLargeInputFallsBack(t *testing.T) {
 			before.ConcurrentPrimaryScratchBytes,
 			after.ConcurrentPrimaryScratchBytes,
 		)
+	}
+}
+
+func TestConcurrentPrimaryContextPoolExhaustionWakesWithoutLoss(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	pool := fixture.collection.primaryConcurrentContexts
+	if pool == nil || len(pool.contexts) < 2 {
+		t.Fatalf("concurrent context pool = %v, want at least two slots", pool)
+	}
+	held := make([]*primaryConcurrentContext, len(pool.contexts))
+	for i := range held {
+		held[i] = pool.acquire()
+	}
+	if free := pool.free.Load(); free != 0 {
+		t.Fatalf("free mask after exhaustion = %#x, want zero", free)
+	}
+
+	const waiting = 64
+	acquired := make(chan uint8, waiting)
+	for range waiting {
+		go func() {
+			context := pool.acquire()
+			acquired <- context.poolSlot
+			pool.release(context)
+		}()
+	}
+	deadline := time.Now().Add(concurrentPrimaryTestTimeout)
+	for pool.waiters.Load() != waiting && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if got := pool.waiters.Load(); got != waiting {
+		t.Fatalf("blocked waiters = %d, want %d", got, waiting)
+	}
+
+	// One returned slot must hand off through every waiter. Each release wakes
+	// the next, so a missed exhaustion wake strands this loop deterministically.
+	pool.release(held[0])
+	held[0] = nil
+	for i := range waiting {
+		select {
+		case slot := <-acquired:
+			if slot != 0 {
+				t.Fatalf("waiter %d acquired slot %d, want the sole free slot 0", i, slot)
+			}
+		case <-time.After(concurrentPrimaryTestTimeout):
+			t.Fatalf("waiter %d remained blocked after chained releases", i)
+		}
+	}
+	for _, context := range held[1:] {
+		pool.release(context)
+	}
+	if got := pool.waiters.Load(); got != 0 {
+		t.Fatalf("waiters after drain = %d, want zero", got)
+	}
+	wantFree := ^uint32(0)
+	if len(pool.contexts) < primaryConcurrentContextLimit {
+		wantFree = (uint32(1) << uint(len(pool.contexts))) - 1
+	}
+	if got := pool.free.Load(); got != wantFree {
+		t.Fatalf("free mask after drain = %#x, want %#x", got, wantFree)
+	}
+}
+
+func TestConcurrentPrimaryContextPoolCASMaintainsUniqueOwnership(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	pool := fixture.collection.primaryConcurrentContexts
+	if pool == nil {
+		t.Fatal("concurrent context pool is nil")
+	}
+	var owners [primaryConcurrentContextLimit]atomic.Int32
+	start := make(chan struct{})
+	failure := make(chan string, 1)
+	const (
+		workers    = 128
+		iterations = 500
+	)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			<-start
+			for range iterations {
+				context := pool.acquire()
+				slot := int(context.poolSlot)
+				if slot >= len(pool.contexts) || &pool.contexts[slot] != context {
+					select {
+					case failure <- fmt.Sprintf("foreign context slot %d", slot):
+					default:
+					}
+					return
+				}
+				if owners[slot].Add(1) != 1 {
+					select {
+					case failure <- fmt.Sprintf("slot %d acquired concurrently", slot):
+					default:
+					}
+					owners[slot].Add(-1)
+					pool.release(context)
+					return
+				}
+				runtime.Gosched()
+				owners[slot].Add(-1)
+				pool.release(context)
+			}
+		}()
+	}
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(concurrentPrimaryTestTimeout):
+		t.Fatal("contended context pool did not drain")
+	}
+	select {
+	case message := <-failure:
+		t.Fatal(message)
+	default:
+	}
+	if got := pool.waiters.Load(); got != 0 {
+		t.Fatalf("waiters after stress = %d, want zero", got)
 	}
 }
 

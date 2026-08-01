@@ -302,10 +302,13 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 		return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 	overlay := s.collection.primaryUnifiedOverlay
-	var indexes [primaryUnifiedOverlayRecords]uint16
-	overlayCount := overlay.latestBucketRecords(
+	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
+	overlayCount, overlayErr := overlay.latestBucketRecords(
 		&indexes, bucket, s.state.root.Generation,
 	)
+	if overlayErr != nil {
+		return scratch, overlayErr
+	}
 	emit := func(
 		slot uint8, key, raw []byte, overflow, encoded bool,
 	) error {

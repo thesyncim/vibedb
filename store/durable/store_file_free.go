@@ -44,11 +44,19 @@ import (
 
 const (
 	// freeReclaimBatch bounds how many retired extents one commit folds into the
-	// free set. It exists so the merge scratch is a fixed allocation and so one
-	// commit's diff cannot outgrow its delta pages; the reclaimer keeps whatever
-	// does not fit and offers it again next commit, so nothing is lost by
-	// draining slowly.
-	freeReclaimBatch = 256
+	// free set. A maximum-width primary checkpoint retires about 509 extents, so
+	// 512 lets the next foreground checkpoint service that complete fixed window
+	// instead of accumulating roughly half of it on every cycle. The merge
+	// scratch remains a fixed allocation. A batch whose exact delta does not fit
+	// FreeLogMaxDeltaPages takes the already-bounded segmented fold path; the
+	// reclaimer keeps whatever does not fit and offers it again next commit.
+	freeReclaimBatch = 512
+	// One reclaimed extent can coalesce with the durable neighbours on both
+	// sides. Retain that complete worst-case representation until syncFreeLogFor
+	// selects its bounded segmented fold. A second batch after an aborted
+	// transaction still hits appendFreePending's conservative whole-image
+	// fallback, keeping repeated-failure memory fixed.
+	freePendingCapacity = 2*freeReclaimBatch + 1
 	// freeLogMinFoldChain is the shortest chain worth folding. The fold point is
 	// otherwise the size of the image, and an image of one page would then force
 	// a fold every commit, doubling metadata writes to save four pages.
@@ -147,6 +155,12 @@ func (c *Collection) refreshReusableFor(
 			c.reusable = c.reusable[:before]
 			return err
 		}
+		if len(c.reusable) > before {
+			// A no-op Flush may have completed an empty process-local sweep before
+			// the durable free log is lazily replayed. Make the first replayed
+			// reusable identity visible without discarding any earlier progress.
+			c.rewindHolePunchReusable(c.reusable[before].Offset)
+		}
 		c.freeSegments = append(c.freeSegments[:0], pages.Segments...)
 		c.freeResident = append(c.freeResident[:0], pages.Resident...)
 		c.freeIndexPages = append(c.freeIndexPages[:0], pages.Index...)
@@ -184,6 +198,7 @@ func (c *Collection) refreshReusableFor(
 		}
 		clear(c.retirementAbsorbed)
 		c.retirementAbsorbed = c.retirementAbsorbed[:0]
+		c.holePunchAbsorbedCursor = 0
 	}
 	durable := c.committer.DurableGeneration()
 	c.cache.MarkDurable(durable)
@@ -194,10 +209,20 @@ func (c *Collection) refreshReusableFor(
 	// starts, so the ordinary drain below can make room without mutating an
 	// in-flight allocator. This is pressure relief, not a steady-state fence:
 	// the normal async path remains wait-free while it has configured headroom.
+	//
+	// A manual committer must not take this wait. Its worker deliberately stays
+	// asleep until Flush authorizes a checkpoint, so waiting for a merely
+	// published generation here would deadlock Snapshot while holding writer.
+	// Manual publication also has a stronger no-reader proof available later:
+	// PublishInlineRetiring can supersede and extract exact never-durable writes.
+	// Let the exact RetireBatch admission at the end of preparation enforce the
+	// bound on that lane; it fails before publication if the actual retirement
+	// set (rather than this worst-case estimate) cannot fit.
 	retired := c.reclaimer.Stats()
 	leases := c.leases.Stats(state.root.Generation)
 	reserve := uint64(min(transactionPages, int(retired.Capacity)))
-	if leases.Active == 0 && retired.Pending > retired.Capacity-reserve &&
+	if c.options.Durability == DurabilityAsyncVisible &&
+		leases.Active == 0 && retired.Pending > retired.Capacity-reserve &&
 		durable < state.root.Generation {
 		if err := c.waitPublished(state.root.Generation); err != nil {
 			return err
@@ -332,6 +357,15 @@ func (c *Collection) mergeReusable(batch []storeio.FreeExtent) error {
 		}
 	}
 	base := low
+	// A reclaimed range can merge with the existing predecessor selected at
+	// base, producing one new identity whose offset is below batch[0]. Rewind
+	// only to that first affected identity so the monotone foreground punch
+	// sweep sees the new bytes without rescanning the stable prefix.
+	affectedOffset := batch[0].Offset
+	if base < head {
+		affectedOffset = min(affectedOffset, c.reusable[base].Offset)
+	}
+	c.rewindHolePunchReusable(affectedOffset)
 	c.reusable = c.reusable[:head+count]
 	// Merge right to left, in place. The write cursor stays strictly above the
 	// unread set-side index — w = i + j + 2 (+1 while an extent is held) with
@@ -543,6 +577,13 @@ func (c *Collection) foldFreeLog(
 			inline: &c.nextInlineFree, changed: true, folded: true,
 		}, nil
 	}
+	if c.freeImageScratchInUse {
+		return freeLogCommit{}, fmt.Errorf(
+			"%w: nested free-image planner", storeio.ErrFreeLogCorrupt,
+		)
+	}
+	c.freeImageScratchInUse = true
+	defer func() { c.freeImageScratchInUse = false }()
 	// Retire the superseded pages before the image is built, not after. They are
 	// free space the instant this commit publishes, so the segments this fold is
 	// about to write have to contain them — a fold that retired afterwards left

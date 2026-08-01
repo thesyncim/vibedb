@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -46,6 +47,20 @@ func checkCanonicalAgainstLibrary(t *testing.T, ws *CanonicalWorkspace, src []by
 	if !bytes.Equal(got, want) {
 		t.Fatalf("canonical render diverges from library:\n src  %q\n got  %q\n want %q", src, got, want)
 	}
+	spanStorage := make([]UnifiedTokenSpan, 0, len(index.Entries))
+	spanned, certificate, err := AppendCanonicalIndexedSpans(
+		nil, index, ws, spanStorage,
+	)
+	if err != nil {
+		t.Fatalf("AppendCanonicalIndexedSpans(%q): %v", src, err)
+	}
+	if !bytes.Equal(spanned, want) ||
+		!bytes.Equal(certificate.Bytes(), want) {
+		t.Fatalf(
+			"spanned canonical render diverges:\n src  %q\n got  %q\n cert %q\n want %q",
+			src, spanned, certificate.Bytes(), want,
+		)
+	}
 	if gotCheck, wantCheck := IndexIsCanonical(index, ws), bytes.Equal(src, want); gotCheck != wantCheck {
 		t.Fatalf("IndexIsCanonical(%q) = %v, want %v (canonical form %q)", src, gotCheck, wantCheck, want)
 	}
@@ -53,6 +68,27 @@ func checkCanonicalAgainstLibrary(t *testing.T, ws *CanonicalWorkspace, src []by
 	// fast check accepts them, so journal replay of canonical bytes is a
 	// fixed point.
 	canonIndex := buildTestIndex(t, want)
+	wantSpans := appendHoleSpans(
+		make([]UnifiedTokenSpan, 0, len(canonIndex.Entries)), canonIndex,
+	)
+	if !slices.Equal(certificate.spans, wantSpans) {
+		t.Fatalf(
+			"rendered span certificate diverges:\n src  %q\n got  %#v\n want %#v",
+			src, certificate.spans, wantSpans,
+		)
+	}
+	indexedCertificate, ok := CanonicalSpanIndexOf(
+		canonIndex, ws,
+		make([]UnifiedTokenSpan, 0, len(canonIndex.Entries)),
+	)
+	if !ok || !bytes.Equal(indexedCertificate.Bytes(), want) ||
+		!slices.Equal(indexedCertificate.spans, wantSpans) {
+		t.Fatalf(
+			"indexed canonical certificate = ok %v, bytes %q, spans %#v; want %q/%#v",
+			ok, indexedCertificate.Bytes(), indexedCertificate.spans,
+			want, wantSpans,
+		)
+	}
 	again, err := AppendCanonicalIndexed(nil, canonIndex, ws)
 	if err != nil {
 		t.Fatalf("AppendCanonicalIndexed(canonical %q): %v", want, err)
@@ -255,6 +291,18 @@ func TestCanonicalRenderEmptyTapeFailsClosed(t *testing.T) {
 	if _, err := AppendCanonicalIndexed(nil, vibejson.Index{}, ws); err == nil {
 		t.Fatal("AppendCanonicalIndexed(zero index) succeeded, want error")
 	}
+	if _, _, err := AppendCanonicalIndexedSpans(
+		nil, vibejson.Index{}, ws, nil,
+	); err == nil {
+		t.Fatal("AppendCanonicalIndexedSpans(zero index) succeeded, want error")
+	}
+	index := buildTestIndex(t, []byte(competitiveShapeJSON))
+	if _, _, err := AppendCanonicalIndexedSpans(
+		nil, index, ws,
+		make([]UnifiedTokenSpan, 0, len(index.Entries)-1),
+	); !errors.Is(err, document.ErrIndexFull) {
+		t.Fatalf("short span scratch error = %v, want ErrIndexFull", err)
+	}
 }
 
 // TestCanonicalRenderZeroAllocs pins the allocation contract: once the
@@ -264,6 +312,7 @@ func TestCanonicalRenderZeroAllocs(t *testing.T) {
 	src := []byte(competitiveShapeJSON)
 	index := buildTestIndex(t, src)
 	dst := make([]byte, 0, 4*len(src))
+	spans := make([]UnifiedTokenSpan, 0, len(index.Entries))
 	var err error
 	dst, err = AppendCanonicalIndexed(dst[:0], index, ws)
 	if err != nil {
@@ -275,7 +324,20 @@ func TestCanonicalRenderZeroAllocs(t *testing.T) {
 	}); allocs != 0 {
 		t.Errorf("AppendCanonicalIndexed allocates %.1f/op, want 0", allocs)
 	}
+	if allocs := testing.AllocsPerRun(200, func() {
+		dst, _, _ = AppendCanonicalIndexedSpans(
+			dst[:0], index, ws, spans[:0],
+		)
+	}); allocs != 0 {
+		t.Errorf("AppendCanonicalIndexedSpans allocates %.1f/op, want 0", allocs)
+	}
 	ok := true
+	if allocs := testing.AllocsPerRun(200, func() {
+		_, indexed := CanonicalSpanIndexOf(canonIndex, ws, spans[:0])
+		ok = ok && indexed
+	}); allocs != 0 {
+		t.Errorf("CanonicalSpanIndexOf allocates %.1f/op, want 0", allocs)
+	}
 	if allocs := testing.AllocsPerRun(200, func() {
 		ok = ok && IndexIsCanonical(canonIndex, ws)
 	}); allocs != 0 {

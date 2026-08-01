@@ -594,11 +594,11 @@ func TestUnifiedPrimaryOverlayJournalReplay(t *testing.T) {
 	}
 }
 
-// TestUnifiedPrimaryOverlayFoldWithPinnedReader fills the fixed record window,
-// holds an epoch reader across the pressure fold, and proves both sides of the
-// reuse rule: the old generation still resolves through retained records while
-// the new generation may fall back structurally without being shadowed by
-// those records; once the reader exits, another class-5 route recycles the
+// TestUnifiedPrimaryOverlayFoldWithPinnedReader fills the fixed record/arena
+// window, holds an epoch reader across the pressure fold, and proves both sides
+// of the reuse rule: the old generation still resolves through retained records
+// while the new generation may fall back structurally without being shadowed
+// by those records; once the reader exits, another class-5 route recycles the
 // window and resumes overlay publication.
 func TestUnifiedPrimaryOverlayFoldWithPinnedReader(t *testing.T) {
 	dir := t.TempDir()
@@ -612,18 +612,37 @@ func TestUnifiedPrimaryOverlayFoldWithPinnedReader(t *testing.T) {
 		append([]byte(nil), before...),
 		[]byte(`"active":true`), []byte(`"active":null`), 1,
 	)
-	for i := range primaryUnifiedOverlayRecords {
+	if len(after) != len(before) {
+		t.Fatalf("fixed test values differ in size: before=%d after=%d",
+			len(before), len(after))
+	}
+	// Keep this reader-lifetime test bounded independently of the production
+	// record and byte windows. Reslicing the already fixed backing store changes
+	// only the test collection's pressure threshold; all publication, fold,
+	// retained-history, and recycle paths remain the production implementation.
+	const window = 512
+	if len(unified.primaryUnifiedOverlay.records) < window {
+		t.Fatalf("overlay records = %d, want at least %d",
+			len(unified.primaryUnifiedOverlay.records), window)
+	}
+	unified.primaryUnifiedOverlay.records =
+		unified.primaryUnifiedOverlay.records[:window]
+	recordBytes := len(key) + len(after)
+	for i := range window {
 		value := after
-		if i&1 != 0 {
+		if i&1 != 0 || i == window-1 {
 			value = before
 		}
 		if _, err := unified.Put(key, value); err != nil {
 			t.Fatalf("fill overlay %d: %v", i, err)
 		}
 	}
-	if got := unified.primaryUnifiedOverlay.count.Load(); got !=
-		primaryUnifiedOverlayRecords {
-		t.Fatalf("overlay count = %d, want %d", got, primaryUnifiedOverlayRecords)
+	if got := unified.primaryUnifiedOverlay.count.Load(); got != uint32(window) {
+		t.Fatalf("overlay count = %d, want %d", got, window)
+	}
+	if got, want := unified.primaryUnifiedOverlay.used.Load(),
+		uint32(window*recordBytes); got != want {
+		t.Fatalf("overlay used bytes = %d, want %d", got, want)
 	}
 	pinnedState, epoch, entered := unified.enterReadEpoch()
 	if !entered {

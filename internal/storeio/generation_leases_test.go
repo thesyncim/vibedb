@@ -400,6 +400,288 @@ func TestExtentReclaimerRespectsReadersAndRecoveryRoots(t *testing.T) {
 	}
 }
 
+func TestExtentReclaimerAppendPunchableCopiesEligiblePrefixWithoutMutation(
+	t *testing.T,
+) {
+	leases, err := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epochs := NewReadEpochs()
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{
+			MaxRetiredExtents: 4,
+			Epochs:            epochs,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents := []FreeExtent{
+		{Offset: 4 << 10, Length: 4 << 10, RetiredGeneration: 2},
+		{Offset: 8 << 10, Length: 4 << 10, RetiredGeneration: 3},
+		{Offset: 12 << 10, Length: 4 << 10, RetiredGeneration: 4},
+		{Offset: 16 << 10, Length: 4 << 10, RetiredGeneration: 5},
+	}
+	if err := reclaimer.RetireBatch(extents); err != nil {
+		t.Fatal(err)
+	}
+	reader4, err := leases.Acquire(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch5, ok := epochs.Enter(5)
+	if !ok || epochs.Diverted() {
+		t.Fatal("failed to pin direct reader at generation 5")
+	}
+	before := reclaimer.Stats()
+	dst := make([]FreeExtent, 0, len(extents))
+	dst = reclaimer.AppendPunchable(dst, 6, 7, 99)
+	if len(dst) != 2 || dst[0] != extents[0] || dst[1] != extents[1] {
+		t.Fatalf(
+			"reader-narrowed punchable = %+v, want first two extents",
+			dst,
+		)
+	}
+	if after := reclaimer.Stats(); after != before {
+		t.Fatalf("AppendPunchable mutated stats: before=%+v after=%+v", before, after)
+	}
+	// Releasing only the oldest lease advances the floor to the still-pinned
+	// direct reader. The generation-4 retirement becomes safe while the
+	// generation-5 retirement remains reader-reachable.
+	reader4.Release()
+	dst = reclaimer.AppendPunchable(dst[:0], 6, 7, cap(dst))
+	if len(dst) != 3 || !slices.Equal(dst, extents[:3]) {
+		t.Fatalf("epoch-narrowed punchable = %+v, want first three", dst)
+	}
+	epoch5.Exit()
+	// The fallback root is also a strict fence: a retirement stamped generation
+	// 4 is still reachable from a generation-4 fallback.
+	dst = reclaimer.AppendPunchable(dst[:0], 6, 4, cap(dst))
+	if len(dst) != 2 || !slices.Equal(dst, extents[:2]) {
+		t.Fatalf("fallback-narrowed punchable = %+v, want first two", dst)
+	}
+	// Destination capacity and the explicit limit both bound a copy without
+	// changing pending authority.
+	dst = reclaimer.AppendPunchable(dst[:0], 6, 7, 3)
+	if len(dst) != 3 || !slices.Equal(dst, extents[:3]) {
+		t.Fatalf("bounded punchable = %+v, want first three", dst)
+	}
+	// Copying did not drain authority; the ordinary allocator transfer still
+	// observes and removes the same complete prefix.
+	reused, err := reclaimer.AppendReusable(
+		make([]FreeExtent, 0, len(extents)), 6, 7, len(extents),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reused, extents) {
+		t.Fatalf("reused after punch snapshot = %+v, want %+v", reused, extents)
+	}
+}
+
+func TestExtentReclaimerAppendPunchableAfterIsMonotoneAndNonCircular(
+	t *testing.T,
+) {
+	leases, err := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: 6},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents := []FreeExtent{
+		{Offset: 8 << 10, Length: 4 << 10, RetiredGeneration: 2},
+		{Offset: 4 << 10, Length: 4 << 10, RetiredGeneration: 2},
+		{Offset: 20 << 10, Length: 4 << 10, RetiredGeneration: 4},
+		{Offset: 16 << 10, Length: 4 << 10, RetiredGeneration: 3},
+		{Offset: 12 << 10, Length: 4 << 10, RetiredGeneration: 3},
+	}
+	if err := reclaimer.RetireBatch(extents); err != nil {
+		t.Fatal(err)
+	}
+	want := slices.Clone(extents)
+	slices.SortFunc(want, compareReclamationGeneration)
+	before := reclaimer.Stats()
+	got := make([]FreeExtent, 0, len(want))
+	window := make([]FreeExtent, 0, 2)
+	var cursor PunchableExtentCursor
+	done := false
+	for !done {
+		window, cursor, done = reclaimer.AppendPunchableAfter(
+			window[:0], 6, 6, cursor, 2,
+		)
+		got = append(got, window...)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("monotone traversal = %+v, want %+v", got, want)
+	}
+	if cursor.after != want[len(want)-1] {
+		t.Fatalf("final cursor = %+v, want %+v", cursor.after, want[len(want)-1])
+	}
+	window, next, done := reclaimer.AppendPunchableAfter(
+		window[:0], 6, 6, cursor, cap(window),
+	)
+	if len(window) != 0 || next != cursor || !done {
+		t.Fatalf("exhausted traversal = %+v cursor=%+v done=%t", window, next, done)
+	}
+	if after := reclaimer.Stats(); after != before {
+		t.Fatalf("traversal mutated authority: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestExtentReclaimerAppendPunchableAfterSurvivesHeadRemovalAndCompaction(
+	t *testing.T,
+) {
+	leases, err := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: 4},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents := []FreeExtent{
+		{Offset: 4 << 10, Length: 4 << 10, RetiredGeneration: 2},
+		{Offset: 8 << 10, Length: 4 << 10, RetiredGeneration: 2},
+		{Offset: 12 << 10, Length: 4 << 10, RetiredGeneration: 3},
+		{Offset: 16 << 10, Length: 4 << 10, RetiredGeneration: 4},
+		{Offset: 20 << 10, Length: 4 << 10, RetiredGeneration: 5},
+	}
+	if err := reclaimer.RetireBatch(extents[:4]); err != nil {
+		t.Fatal(err)
+	}
+	window := make([]FreeExtent, 0, 2)
+	window, cursor, done := reclaimer.AppendPunchableAfter(
+		window, 6, 6, PunchableExtentCursor{}, 1,
+	)
+	if !slices.Equal(window, extents[:1]) || done {
+		t.Fatalf("first window = %+v done=%t", window, done)
+	}
+	reused, err := reclaimer.AppendReusable(
+		make([]FreeExtent, 0, 1), 6, 6, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reused, extents[:1]) {
+		t.Fatalf("head removal = %+v, want %+v", reused, extents[:1])
+	}
+	// Filling the physical tail forces compactPendingLocked to move the active
+	// entries back to index zero before appending. The identity cursor must be
+	// independent of both shifts.
+	if err := reclaimer.Retire(extents[4]); err != nil {
+		t.Fatal(err)
+	}
+	window, cursor, done = reclaimer.AppendPunchableAfter(
+		window[:0], 6, 6, cursor, cap(window),
+	)
+	if !slices.Equal(window, extents[1:3]) || done {
+		t.Fatalf("post-compaction window = %+v done=%t", window, done)
+	}
+	window, _, done = reclaimer.AppendPunchableAfter(
+		window[:0], 6, 6, cursor, cap(window),
+	)
+	if !slices.Equal(window, extents[3:]) || !done {
+		t.Fatalf("tail window = %+v done=%t", window, done)
+	}
+}
+
+func TestExtentReclaimerAppendPunchableAfterFindsFloorGrowthAndReretirement(
+	t *testing.T,
+) {
+	leases, err := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: 3},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents := []FreeExtent{
+		{Offset: 4 << 10, Length: 4 << 10, RetiredGeneration: 2},
+		{Offset: 8 << 10, Length: 4 << 10, RetiredGeneration: 3},
+		{Offset: 12 << 10, Length: 4 << 10, RetiredGeneration: 4},
+	}
+	if err := reclaimer.RetireBatch(extents); err != nil {
+		t.Fatal(err)
+	}
+	window := make([]FreeExtent, 0, 3)
+	window, cursor, done := reclaimer.AppendPunchableAfter(
+		window, 6, 3, PunchableExtentCursor{}, cap(window),
+	)
+	if !slices.Equal(window, extents[:1]) || !done {
+		t.Fatalf("narrow-floor window = %+v done=%t", window, done)
+	}
+	window, cursor, done = reclaimer.AppendPunchableAfter(
+		window[:0], 6, 5, cursor, cap(window),
+	)
+	if !slices.Equal(window, extents[1:]) || !done {
+		t.Fatalf("advanced-floor window = %+v done=%t", window, done)
+	}
+	reused, err := reclaimer.AppendReusable(
+		make([]FreeExtent, 0, len(extents)), 6, 6, len(extents),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reused, extents) {
+		t.Fatalf("reused = %+v, want %+v", reused, extents)
+	}
+	rereturned := FreeExtent{
+		Offset: extents[0].Offset, Length: extents[0].Length,
+		RetiredGeneration: 7,
+	}
+	if err := reclaimer.Retire(rereturned); err != nil {
+		t.Fatal(err)
+	}
+	window, next, done := reclaimer.AppendPunchableAfter(
+		window[:0], 8, 8, cursor, cap(window),
+	)
+	if len(window) != 1 || window[0] != rereturned || !done ||
+		next.after != rereturned {
+		t.Fatalf("re-retired window = %+v cursor=%+v done=%t", window, next.after, done)
+	}
+}
+
+func TestExtentReclaimerAppendPunchableAfterAllocatesZero(t *testing.T) {
+	leases, err := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimer.Retire(FreeExtent{
+		Offset: 4 << 10, Length: 4 << 10, RetiredGeneration: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]FreeExtent, 0, 1)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		var cursor PunchableExtentCursor
+		var done bool
+		dst, cursor, done = reclaimer.AppendPunchableAfter(
+			dst[:0], 3, 3, cursor, 1,
+		)
+		if len(dst) != 1 || !done || cursor.after.RetiredGeneration != 2 {
+			panic("unexpected punchable traversal")
+		}
+	}); allocs != 0 {
+		t.Fatalf("AppendPunchableAfter allocations = %g, want 0", allocs)
+	}
+}
+
 func TestExtentReclaimerRejectsOverlap(t *testing.T) {
 	leases, _ := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
 	reclaimer, _ := NewExtentReclaimer(leases, ExtentReclaimerOptions{MaxRetiredExtents: 2})

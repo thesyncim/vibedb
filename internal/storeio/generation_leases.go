@@ -678,7 +678,8 @@ func (r *ExtentReclaimer) AppendReusable(
 		case pending[0].RetiredGeneration >= floor:
 			eligible = 0
 		case pending[eligible-1].RetiredGeneration >= floor:
-			for low, high := 0, eligible; low < high; {
+			low, high := 0, eligible
+			for low < high {
 				middle := int(uint(low+high) >> 1)
 				if pending[middle].RetiredGeneration < floor {
 					low = middle + 1
@@ -716,6 +717,118 @@ func (r *ExtentReclaimer) AppendReusable(
 	}
 	r.mu.Unlock()
 	return dst, nil
+}
+
+// AppendPunchable copies, without removing, the generation-ordered prefix of
+// pending retirements that no active reader, physically durable root, or
+// fallback root can still address. It is the storage-release counterpart of
+// AppendReusable and deliberately derives the identical three-way generation
+// floor. This means a pinned historical reader narrows the copied prefix rather
+// than disabling physical reclamation of older-safe extents.
+//
+// The method deliberately does not mutate pending, pendingBytes, or the
+// interval index. Hole punching changes filesystem allocation only; allocator
+// and free-log authority continue to move exclusively through AppendReusable
+// and the ordinary commit path. A non-positive limit or full destination is a
+// bounded no-op.
+func (r *ExtentReclaimer) AppendPunchable(
+	dst []FreeExtent,
+	currentGeneration, oldestRecoveryGeneration uint64,
+	limit int,
+) []FreeExtent {
+	dst, _, _ = r.AppendPunchableAfter(
+		dst, currentGeneration, oldestRecoveryGeneration,
+		PunchableExtentCursor{}, limit,
+	)
+	return dst
+}
+
+// PunchableExtentCursor is fixed-size, process-local progress through pending
+// retirements. Its zero value starts before every valid extent. Callers should
+// retain the returned value unchanged; its fields are deliberately private so
+// only an extent actually copied by AppendPunchableAfter can advance it.
+//
+// The cursor identifies the last copied (retired generation, offset, length),
+// rather than an array index. Removing or compacting the pending head therefore
+// cannot skip work, while re-retiring the same physical range at a newer
+// generation naturally places it after the cursor.
+type PunchableExtentCursor struct {
+	after FreeExtent
+}
+
+// AppendPunchableAfter copies a bounded, non-circular window from the
+// generation-ordered punchable prefix. It starts strictly after cursor and
+// returns the last copied identity as next. done reports that no extent in the
+// currently punchable prefix remains after next; next is intentionally
+// preserved at the end so retirements appended at a higher generation become
+// visible to a later call without revisiting older extents.
+//
+// Reader, direct-read epoch, and recovery-root safety use exactly the same
+// strict generation floor as AppendReusable. The method does not remove or
+// otherwise mutate allocator authority. A non-positive limit or full
+// destination makes no progress and conservatively reports done=false.
+func (r *ExtentReclaimer) AppendPunchableAfter(
+	dst []FreeExtent,
+	currentGeneration, oldestRecoveryGeneration uint64,
+	cursor PunchableExtentCursor,
+	limit int,
+) ([]FreeExtent, PunchableExtentCursor, bool) {
+	if r == nil || currentGeneration == 0 || oldestRecoveryGeneration == 0 {
+		return dst, cursor, true
+	}
+	if limit <= 0 || len(dst) == cap(dst) {
+		return dst, cursor, false
+	}
+	readerFloor := r.leases.Minimum(currentGeneration)
+	// Match AppendReusable's publication protocol exactly. A direct reader that
+	// this minimum scan misses must revalidate against a state at least as new as
+	// the publication whose retirements are under consideration.
+	floor := min(
+		readerFloor,
+		r.epochs.Minimum(currentGeneration),
+		oldestRecoveryGeneration,
+	)
+	r.mu.Lock()
+	pending := r.activePendingLocked()
+	eligible := len(pending)
+	if eligible != 0 {
+		switch {
+		case pending[0].RetiredGeneration >= floor:
+			eligible = 0
+		case pending[eligible-1].RetiredGeneration >= floor:
+			low, high := 0, eligible
+			for low < high {
+				middle := int(uint(low+high) >> 1)
+				if pending[middle].RetiredGeneration < floor {
+					low = middle + 1
+				} else {
+					high = middle
+				}
+			}
+			eligible = low
+		}
+	}
+	// Find the first identity strictly greater than the last copied extent. The
+	// complete tuple is important when a future format permits more than one
+	// physical shape at the same generation and offset.
+	low, high := 0, eligible
+	for low < high {
+		middle := int(uint(low+high) >> 1)
+		if compareReclamationGeneration(pending[middle], cursor.after) <= 0 {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	at := low
+	copied := min(eligible-at, limit, cap(dst)-len(dst))
+	if copied != 0 {
+		dst = append(dst, pending[at:at+copied]...)
+		cursor.after = pending[at+copied-1]
+	}
+	done := at+copied == eligible
+	r.mu.Unlock()
+	return dst, cursor, done
 }
 
 // AppendPending copies the extents still waiting on a reader or the alternate
@@ -824,6 +937,10 @@ func compareReclamationGeneration(a, b FreeExtent) int {
 	case a.Offset < b.Offset:
 		return -1
 	case a.Offset > b.Offset:
+		return 1
+	case a.Length < b.Length:
+		return -1
+	case a.Length > b.Length:
 		return 1
 	default:
 		return 0

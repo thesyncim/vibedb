@@ -478,10 +478,15 @@ func (b *onlineIndexBuild) scanBucket(
 		return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
 	}
 	overlay := c.primaryUnifiedOverlay
-	var overlayIndexes [primaryUnifiedOverlayRecords]uint16
-	overlayCount := overlay.latestBucketRecords(
+	var overlayIndexes [storeio.CommonPrimaryLeafWideSlots]uint16
+	overlayCount, overlayErr := overlay.latestBucketRecords(
 		&overlayIndexes, route.Bucket, state.root.Generation,
 	)
+	if overlayErr != nil {
+		return onlineIndexBucket{}, errors.Join(
+			storeio.ErrPrimaryExactIndexCorrupt, overlayErr,
+		)
+	}
 	baseRank, overlayAt := 0, 0
 	for baseRank < unified.Len() || overlayAt < overlayCount {
 		var baseKey, baseBody []byte

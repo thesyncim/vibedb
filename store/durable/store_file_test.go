@@ -46,10 +46,23 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	if normalized.maxTransactionBytes >= oldFixedFrameBound {
 		t.Fatalf("packed dirty bound = %d, fixed-frame bound %d", normalized.maxTransactionBytes, oldFixedFrameBound)
 	}
-	options.ResidentBytes = int64(normalized.maxTransactionBytes)
-	if _, err := options.normalized(); err != nil {
-		t.Fatalf("exact dirty budget rejected: %v", err)
+	// ResidentBytes now also narrows the adaptive dirty-leaf overlay window.
+	// Converge to its one-bucket floor before checking the exact transaction
+	// boundary; using the original wider window's byte bound would legitimately
+	// select a smaller transaction on the second normalization.
+	for {
+		options.ResidentBytes = int64(normalized.maxTransactionBytes)
+		next, nextErr := options.normalized()
+		if nextErr != nil {
+			t.Fatalf("exact adaptive dirty budget rejected: %v", nextErr)
+		}
+		if next.maxTransactionBytes == normalized.maxTransactionBytes {
+			normalized = next
+			break
+		}
+		normalized = next
 	}
+	options.ResidentBytes = int64(normalized.maxTransactionBytes)
 	options.ResidentBytes--
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("undersized dirty budget accepted")
@@ -83,6 +96,11 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	options.PrefetchQueue = 32769
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("invalid prefetch queue accepted")
+	}
+	options = testFileStoreOptions()
+	options.QueueSlots = int(^uint(0) >> 1)
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("overflowing commit queue accepted")
 	}
 	options = testFileStoreOptions()
 	options.MaxRetiredExtents = 1<<24 + 1
@@ -1211,26 +1229,22 @@ func TestFileStoreOverflowExtentsMatchTheirPiece(t *testing.T) {
 	}
 }
 
-// Given retirement pressure that exhausts reclamation metadata while a snapshot
-// pins the reclamation floor, when the snapshot is released, then writes
-// recover.
+// Given bounded write-resource pressure while a snapshot pins both historical
+// cache frames and the reclamation floor, when the snapshot is released, then
+// writes recover.
 //
-// Refusing a write while nothing is reclaimable is correct backpressure: a
-// pinned snapshot holds the floor down, so retired extents legally cannot be
-// reused yet. The defect was that the collection never recovered afterwards.
-// Reclamation declined the entire batch whenever the pending set exceeded the
-// room left in the reusable arena, and since that call is the only drain of the
-// pending set, declining removed the one process that would have created the
-// room. The condition could not clear itself, so releasing the snapshot changed
-// nothing and every subsequent write failed. Only restarting the process
-// recovered the collection, abandoning every pending extent.
+// Refusing a write while its old graph remains observable is correct bounded
+// backpressure. Depending on the exact cache/free-arena geometry, either the
+// retirement metadata or the page cache can report its limit first. The defect
+// was that the collection never recovered after the pin went away: reclamation
+// declined the entire batch whenever the pending set exceeded the room left in
+// the reusable arena, removing the one process that could create room. Only a
+// restart recovered the collection, abandoning every pending extent.
 //
-// Reaching the defect needs free extents already resident in the arena: the
-// guard compared the pending count against the room left, so with an empty
-// arena it could never trip before the pending set hit its own capacity. Hence
-// the unpinned warm-up, which leaves ~200 extents resident before the pinned
-// churn begins.
-func TestFileStoreRecoversAfterRetirementPressureClears(t *testing.T) {
+// The unpinned warm-up leaves free extents resident so the integration test
+// still traverses that stalled-drain geometry even when cache admission is the
+// first component to surface the shared snapshot pin.
+func TestFileStoreRecoversAfterPinnedResourcePressureClears(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-reclaim-pressure-*")
 	if err != nil {
 		t.Fatal(err)
@@ -1262,21 +1276,24 @@ func TestFileStoreRecoversAfterRetirementPressureClears(t *testing.T) {
 		t.Skip("warm-up left no resident free extents; the arena geometry no longer reproduces the defect")
 	}
 
-	// Churn under a pinned snapshot until reclamation metadata is exhausted.
+	// Churn under a pinned snapshot until one bounded resource is exhausted.
 	// Reaching that point is expected backpressure, not the defect under test.
 	pinned, err := fs.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	exhausted := false
-	for round := 200; round < 900 && !exhausted; round++ {
+	pressured := false
+	var pressureErr error
+	for round := 200; round < 900 && !pressured; round++ {
 		for i := range keys {
 			if err := put(round, i); err != nil {
-				if !errors.Is(err, storeio.ErrRetiredExtentCapacity) {
-					pinned.Close()
+				if !errors.Is(err, storeio.ErrRetiredExtentCapacity) &&
+					!errors.Is(err, storeio.ErrPageCachePinned) {
+					_ = pinned.Close()
 					t.Fatalf("unexpected Put failure under a pinned snapshot: %v", err)
 				}
-				exhausted = true
+				pressured = true
+				pressureErr = err
 				break
 			}
 		}
@@ -1284,17 +1301,18 @@ func TestFileStoreRecoversAfterRetirementPressureClears(t *testing.T) {
 	if err := pinned.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !exhausted {
-		t.Skip("retirement pressure never reached capacity; the arena geometry no longer reproduces it")
+	if !pressured {
+		t.Skip("pinned churn reached no bounded-resource pressure; the arena geometry no longer reproduces it")
 	}
+	t.Logf("pinned write pressure: %v", pressureErr)
 
-	// The floor is free again, so reclamation must resume and writes must
-	// succeed. Before the fix every one of these failed, permanently.
+	// The pin is gone, so cache eviction and reclamation must resume and writes
+	// must succeed. Before the fix every one of these failed permanently.
 	for round := 1000; round < 1016; round++ {
 		for i := range keys {
 			if err := put(round, i); err != nil {
 				t.Fatalf("Put still failing at round %d after the snapshot was released: %v; "+
-					"reclamation did not resume once the floor advanced", round, err)
+					"bounded resources did not recover once the pin cleared", round, err)
 			}
 		}
 	}
