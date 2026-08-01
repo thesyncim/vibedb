@@ -188,7 +188,7 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			if s.Columns[i].Path != nil || s.Columns[i].Agg != AggNone {
 				t.Fatalf("Columns[%d] mixes a window with an ordinary expression", i)
 			}
-			checkPath(t, s, window.Argument)
+			seen += checkWindowInvariants(t, s, window)
 			for _, path := range window.Spec.PartitionBy {
 				checkPath(t, s, path)
 			}
@@ -226,6 +226,69 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 	if seen != s.Params {
 		t.Fatalf("statement reports %d placeholders and holds %d", s.Params, seen)
 	}
+}
+
+// checkWindowInvariants validates the function-specific optional fields and
+// returns the number of placeholders owned by the window expression. Window
+// operands live outside WHERE/HAVING, so omitting them here would let Params
+// disagree with the accepted tree even though ordinary predicates are sound.
+func checkWindowInvariants(t *testing.T, s *SelectStmt, w *WindowExpr) int {
+	t.Helper()
+	requiresArgument := true
+	switch w.Kind {
+	case WindowRowNumber, WindowRank, WindowDenseRank,
+		WindowNTile, WindowPercentRank, WindowCumeDist:
+		requiresArgument = false
+	case WindowCount:
+		// COUNT(*) deliberately has no path; COUNT(path) does.
+		requiresArgument = false
+	}
+	if requiresArgument && w.Argument == nil {
+		t.Fatalf("%s has no argument", w.Kind)
+	}
+	if w.Argument != nil {
+		checkPath(t, s, w.Argument)
+	}
+
+	seen := 0
+	if w.HasOffset {
+		seen += checkWindowCount(t, w.Offset, "LAG/LEAD offset")
+	}
+	if w.HasBuckets {
+		seen += checkWindowCount(t, w.Buckets, "NTILE bucket count")
+	}
+	if w.HasNth {
+		seen += checkWindowCount(t, w.Nth, "NTH_VALUE position")
+	}
+	if w.HasDefault && !w.DefaultNull && w.Default.Kind == OperandParam {
+		seen++
+	}
+	if w.Spec.Frame.Explicit {
+		seen += checkWindowFrameBound(t, w.Spec.Frame.Start)
+		seen += checkWindowFrameBound(t, w.Spec.Frame.End)
+	}
+	return seen
+}
+
+func checkWindowCount(t *testing.T, op Operand, clause string) int {
+	t.Helper()
+	switch op.Kind {
+	case OperandNumber:
+		return 0
+	case OperandParam:
+		return 1
+	default:
+		t.Fatalf("%s has operand kind %d", clause, op.Kind)
+		return 0
+	}
+}
+
+func checkWindowFrameBound(t *testing.T, bound WindowFrameBound) int {
+	t.Helper()
+	if bound.Kind != WindowPreceding && bound.Kind != WindowFollowing {
+		return 0
+	}
+	return checkWindowCount(t, bound.Offset, "window frame offset")
 }
 
 func checkRowCount(t *testing.T, op *Operand) int {
