@@ -28,6 +28,9 @@ var (
 )
 
 func (r *rows) Columns() []string {
+	if r.stmt != nil && r.stmt.explain {
+		return []string{"QUERY PLAN"}
+	}
 	if r.stmt == nil || r.stmt.query == nil {
 		return nil
 	}
@@ -108,6 +111,15 @@ func (r *rows) value(cell query.Cell) sqldriver.Value {
 }
 
 func (r *rows) columnSchema() []query.OutputColumn {
+	if r.stmt != nil && r.stmt.explain {
+		if !r.schemaOK {
+			r.schema = append(r.schema[:0], query.OutputColumn{
+				Header: "QUERY PLAN", Type: query.TypeString,
+			})
+			r.schemaOK = true
+		}
+		return r.schema
+	}
 	if r.stmt == nil || r.stmt.query == nil {
 		return nil
 	}
@@ -136,6 +148,9 @@ func (c *conn) resetRows(
 }
 
 func (r *rows) ColumnTypeScanType(index int) reflect.Type {
+	if r.stmt != nil && r.stmt.explain {
+		return reflect.TypeFor[string]()
+	}
 	schema := r.columnSchema()
 	if index >= 0 && index < len(schema) && schema[index].Reduction == query.ReductionCount {
 		return reflect.TypeFor[int64]()
@@ -144,6 +159,9 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 }
 
 func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
+	if r.stmt != nil && r.stmt.explain {
+		return "TEXT"
+	}
 	schema := r.columnSchema()
 	if index < 0 || index >= len(schema) || schema[index].Reduction == query.ReductionNone {
 		return "JSON"
@@ -155,6 +173,9 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 }
 
 func (r *rows) ColumnTypeNullable(index int) (bool, bool) {
+	if r.stmt != nil && r.stmt.explain {
+		return false, true
+	}
 	schema := r.columnSchema()
 	return index < 0 || index >= len(schema) || schema[index].Reduction != query.ReductionCount, true
 }

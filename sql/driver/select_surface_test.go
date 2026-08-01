@@ -1,6 +1,36 @@
 package driver
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/thesyncim/vibejson"
+)
+
+func TestExplainReturnsCompiledPlanWithoutOpeningTheTable(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	var plan string
+	if err := db.QueryRow(
+		`EXPLAIN SELECT id FROM docs WHERE id = ?`, "x",
+	).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !vibejson.Valid([]byte(plan)) {
+		t.Fatalf("EXPLAIN returned invalid JSON: %s", plan)
+	}
+	for _, want := range []string{
+		`"node":"scan"`,
+		`"collection":"docs"`,
+		`"access_path":"adaptive-posting-or-scan"`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("EXPLAIN missing %s: %s", want, plan)
+		}
+	}
+}
 
 func TestSelectDelegatesFullSQLQuerySurface(t *testing.T) {
 	db := openTestDB(t)

@@ -225,6 +225,13 @@ remain correct full scans; an index is an optimization, not a requirement for a
 WHERE clause. Sorting, grouping, aggregation, HAVING, OFFSET, and final
 projection remain query-engine operations.
 
+`EXPLAIN SELECT ...` returns one `QUERY PLAN` text column containing compact,
+versioned JSON for the prepared logical plan. It reports scan access-path
+alternatives, the filter/late projection split, grouping, ordering, limit, and
+join shape. It never opens a data snapshot or scans rows, and ordinary query
+execution does not collect explain counters. The physical index choice remains
+adaptive because it depends on the source catalog at execution time.
+
 ## Inner and left joins
 
 The SQL join is a declared-field equi-join. Both `INNER JOIN` and

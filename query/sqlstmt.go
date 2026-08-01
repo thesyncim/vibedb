@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -564,6 +565,23 @@ type Cursor struct {
 	cur  int
 	skip int
 	left int
+}
+
+// NewTextCursor creates a one-row text cursor for protocol metadata such as a
+// compile-time EXPLAIN result. The returned cursor owns its small result and
+// follows the same value lifetime as every other Cursor; Close is represented
+// by dropping the value.
+func NewTextCursor(header, text string) Cursor {
+	raw, _ := vibejson.Marshal(&text)
+	statement := &Statement{outputs: 1}
+	result := &Result{
+		Columns: []ResultColumn{{
+			Header: header,
+			Cells:  []Cell{{kind: TypeString, text: text, raw: raw}},
+		}},
+		RowCount: 1,
+	}
+	return statement.cursor(result)
 }
 
 // Next advances to the next surviving row, reporting false at the end.

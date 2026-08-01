@@ -30,8 +30,10 @@
 // Keywords are case-insensitive; everything else in the grammar below is
 // literal.
 //
-//	statement    = select | insert | update | delete
+//	statement    = explain | select | insert | update | delete
 //	             | create-table | create-index ;
+
+//	explain      = "EXPLAIN" select ;
 //
 //	select       = "SELECT" [ "ALL" ] select-list
 //	               "FROM" table-ref { join }

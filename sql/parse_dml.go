@@ -83,6 +83,15 @@ func KindOf(src string) Kind {
 // rejected as a syntax error reads as if the syntax were the problem.
 func (p *Parser) parseAnyStatement(dst *Statement) error {
 	switch {
+	case p.atKeyword(kwExplain):
+		p.advance()
+		if !p.atKeyword(kwSelect) {
+			return p.errHere("EXPLAIN currently accepts SELECT only")
+		}
+		dst.Kind, dst.Explain, dst.Select = KindSelect, true, &p.sel
+		p.out = &p.sel
+		*p.out = SelectStmt{}
+		return p.parseStatement()
 	case p.atKeyword(kwInsert):
 		dst.Kind, dst.Insert = KindInsert, &p.ins
 		return p.parseInsert()

@@ -81,6 +81,7 @@ const (
 	kwDrop
 	kwEscape
 	kwExcept
+	kwExplain
 	kwExists
 	kwFalse
 	kwFetch
@@ -210,6 +211,8 @@ func keywordOf(s string) keyword {
 		return kwEscape
 	case "EXCEPT":
 		return kwExcept
+	case "EXPLAIN":
+		return kwExplain
 	case "EXISTS":
 		return kwExists
 	case "FALSE":

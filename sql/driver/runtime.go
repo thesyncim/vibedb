@@ -406,6 +406,9 @@ func (p *Prepared) Columns() []string {
 	if p == nil || p.statement == nil || p.statement.query == nil {
 		return nil
 	}
+	if p.statement.explain {
+		return []string{"QUERY PLAN"}
+	}
 	return p.statement.query.Columns()
 }
 
@@ -413,6 +416,11 @@ func (p *Prepared) Columns() []string {
 func (p *Prepared) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
 	if p == nil || p.statement == nil || p.statement.query == nil {
 		return dst
+	}
+	if p.statement.explain {
+		return append(dst, query.OutputColumn{
+			Header: "QUERY PLAN", Ordinal: 0, Type: query.TypeString,
+		})
 	}
 	return p.statement.query.AppendSchema(dst)
 }

@@ -69,7 +69,11 @@ const DocumentColumn = "$doc"
 // rather than an interface because every consumer switches on the kind anyway,
 // and because the six bodies are already concrete types a caller wants by name.
 type Statement struct {
-	Kind        Kind
+	Kind Kind
+	// Explain marks a SELECT whose caller requested its immutable logical plan
+	// instead of executing it. Select carries the explained target, so routing
+	// remains the same as an ordinary row-returning statement.
+	Explain     bool
 	Select      *SelectStmt
 	Insert      *InsertStmt
 	Update      *UpdateStmt

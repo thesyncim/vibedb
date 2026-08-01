@@ -21,6 +21,8 @@ type stmt struct {
 	params       int
 	paramKinds   []ParamKind
 	joinNames    []string
+	explain      bool
+	explainText  string
 	closed       bool
 }
 
@@ -73,6 +75,8 @@ func (s *stmt) Close() error {
 	s.primaryPoint = false
 	s.paramKinds = nil
 	s.joinNames = nil
+	s.explain = false
+	s.explainText = ""
 	s.conn = nil
 	return nil
 }
@@ -117,6 +121,12 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
+	}
+	if s.explain {
+		s.conn.open = true
+		return s.conn.resetRows(
+			s, query.NewTextCursor("QUERY PLAN", s.explainText), nil,
+		), nil
 	}
 	var err error
 	if s.mutation != nil {
