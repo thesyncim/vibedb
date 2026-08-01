@@ -2,25 +2,30 @@ package sql
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
 func TestLeadingFeatureRefusalsAreTypedAndPositioned(t *testing.T) {
-	for _, src := range []string{
-		"EXPLAIN SELECT * FROM docs",
-		"COPY docs TO STDOUT",
-		"SAVEPOINT nested",
-		"ALTER TABLE docs ADD COLUMN n STRING",
-		"WITH x AS (SELECT 1) SELECT * FROM x",
+	for _, tc := range []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"explain", "EXPLAIN SELECT * FROM docs", "EXPLAIN is not supported"},
+		{"copy", "COPY docs TO STDOUT", "COPY is not supported"},
+		{"savepoint", "SAVEPOINT nested", "savepoints are not supported"},
+		{"alter table", "ALTER TABLE docs ADD COLUMN n STRING", "ALTER is not in the bounded catalog subset"},
+		{"common table expressions", "WITH x AS (SELECT 1) SELECT * FROM x", "common table expressions are not supported"},
 	} {
-		t.Run(src, func(t *testing.T) {
-			_, err := ParseStatement(src)
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseStatement(tc.src)
 			var unsupported *FeatureNotSupportedError
 			if !errors.As(err, &unsupported) {
 				t.Fatalf("ParseStatement error = %T %v, want *FeatureNotSupportedError", err, err)
 			}
 			var parse *ParseError
-			if !errors.As(err, &parse) || parse.Pos != 0 || parse.Msg == "" {
+			if !errors.As(err, &parse) || parse.Pos != 0 || !strings.Contains(parse.Msg, tc.want) {
 				t.Fatalf("typed refusal lost parse diagnostics: %+v", parse)
 			}
 		})

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -520,7 +521,11 @@ func durableJoinCorpus(tb testing.TB, outerRows, innerRows int) *durable.Databas
 	load := func(name string, fill func(*store.Collection)) {
 		source := &store.Collection{}
 		fill(source)
-		file, err := os.Create(filepath.Join(dir, name+".vjc"))
+		filename, ok := collectionname.Encode(name)
+		if !ok {
+			tb.Fatalf("invalid collection name %q", name)
+		}
+		file, err := os.Create(filepath.Join(dir, filename))
 		if err != nil {
 			tb.Fatal(err)
 		}

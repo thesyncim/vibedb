@@ -355,7 +355,7 @@ func (pool *filePool) runScan(
 			err = job.overlay.RangePresent(overlayInsert)
 		}
 	case job.overlay != nil:
-		*job.overflow, err = job.snapshot.RangeRawReadAheadBuffer((*job.overflow)[:0], overlayRow)
+		*job.overflow, err = job.snapshot.RangeRawBuffer((*job.overflow)[:0], overlayRow)
 		if err == nil {
 			err = cancellationError(job.cancel)
 		}
@@ -363,7 +363,7 @@ func (pool *filePool) runScan(
 			err = job.overlay.RangeInserts(overlayInsert)
 		}
 	case job.masks == nil:
-		*job.overflow, err = job.snapshot.RangeRawReadAheadBuffer((*job.overflow)[:0], row)
+		*job.overflow, err = job.snapshot.RangeRawBuffer((*job.overflow)[:0], row)
 	default:
 		*job.overflow, err = job.snapshot.RangeMasksRawBuffer(job.masks, (*job.overflow)[:0], row)
 	}

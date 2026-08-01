@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -50,7 +51,11 @@ func joinBenchDurableDatabase(b testing.TB, dir string, outerRows, customers, ma
 	load := func(name string, fill func(*store.Collection)) {
 		source := &store.Collection{}
 		fill(source)
-		file, err := os.Create(filepath.Join(dir, name+".vjc"))
+		filename, ok := collectionname.Encode(name)
+		if !ok {
+			b.Fatalf("invalid collection name %q", name)
+		}
+		file, err := os.Create(filepath.Join(dir, filename))
 		if err != nil {
 			b.Fatal(err)
 		}

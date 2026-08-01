@@ -84,7 +84,7 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scanScratch, err = scanSnapshot.RangeRawReadAheadBuffer(scanScratch, func(key, value []byte) error {
+	scanScratch, err = scanSnapshot.RangeRawBuffer(scanScratch, func(key, value []byte) error {
 		scanRows++
 		scanBytes += uint64(len(key) + len(value))
 		return nil

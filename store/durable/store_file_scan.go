@@ -418,20 +418,6 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
 }
 
-// RangeRawReadAheadBuffer is currently an alias of RangeRawBuffer, retained
-// for its callers in the query layer: the ordered-primary scan reads inline
-// values from the leaves it already walks in order, so it has no separate
-// document-extent read-ahead lane.
-func (s *Snapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
-	if s == nil || s.collection == nil || s.state == nil {
-		return scratch, ErrClosed
-	}
-	if fn == nil {
-		return scratch, nil
-	}
-	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
-}
-
 // rangePrimaryGraph is the ordered-primary scan core. lower is inclusive,
 // upper is exclusive, and a non-empty prefix additionally bounds the result.
 func (s *Snapshot) rangePrimaryGraph(
