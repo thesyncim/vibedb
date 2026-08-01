@@ -131,6 +131,9 @@ func (w *setWorkspace) release() {
 type setExecutor struct {
 	workspace setWorkspace
 	result    relationSpool
+	// lastTotalCharge is the peak reservation measured by the most recent
+	// successful execute. Every new execute and release clears it first.
+	lastTotalCharge int64
 }
 
 func (e *setExecutor) relation() *relationSpool {
@@ -146,6 +149,7 @@ func (e *setExecutor) release() {
 	}
 	e.workspace.release()
 	e.result.release()
+	e.lastTotalCharge = 0
 }
 
 // execute applies op over left and right. Every input and output column is
@@ -162,7 +166,11 @@ func (e *setExecutor) execute(
 	frame *statementFrame,
 	cancel *CancelFlag,
 ) (charge int64, err error) {
-	if e == nil || frame == nil {
+	if e == nil {
+		return 0, fmt.Errorf("%w: nil executor or statement frame", errSetInput)
+	}
+	e.lastTotalCharge = 0
+	if frame == nil {
 		return 0, fmt.Errorf("%w: nil executor or statement frame", errSetInput)
 	}
 	if left == &e.result || right == &e.result {
@@ -242,6 +250,7 @@ func (e *setExecutor) execute(
 	frame.intermediate.release(shape.totalCharge - charge)
 	reserved = false
 	e.workspace.reset()
+	e.lastTotalCharge = shape.totalCharge
 	return charge, nil
 }
 

@@ -669,21 +669,16 @@ func (e *SetTreeExecutor) executeBinary(nodeIndex int, node SetTreeNode) error {
 	if err != nil {
 		return err
 	}
-	shape, err := measureSetExecution(operation, left, right, e.arities[nodeIndex])
-	if err != nil {
-		return err
-	}
-	peak := saturatedBytes(e.frame.intermediate.used, shape.totalCharge)
-	if peak == math.MaxInt64 {
-		return ErrSetTreeSize
-	}
+	usedBefore := e.frame.intermediate.used
 	charge, err := e.slots[outputSlot].binary.execute(
 		operation, left, right, &e.frame, e.options.cancel,
 	)
 	if err != nil {
 		return err
 	}
-	e.observeBytes(peak)
+	e.observeBytes(saturatedBytes(
+		usedBefore, e.slots[outputSlot].binary.lastTotalCharge,
+	))
 	e.slots[outputSlot].kind = setTreeSlotBinary
 	e.slots[outputSlot].charge = charge
 	e.slots[outputSlot].active = true

@@ -75,6 +75,36 @@ func BenchmarkSetTreeExecutorDeepUnionAllWarm(b *testing.B) {
 	benchmarkSetTreeWarm(b, plan, program)
 }
 
+// BenchmarkSetTreeExecutorSizingPassGuard uses empty relations so binary-node
+// validation and sizing remain visible instead of being hidden by row hashing
+// or publication work. Track ns/op per fixed binary-nodes/op when changing the
+// tree/kernel boundary; tree execution must not pre-measure a node that the
+// binary kernel necessarily measures itself.
+func BenchmarkSetTreeExecutorSizingPassGuard(b *testing.B) {
+	const leaves = 256
+	builder, plan, program := newSetTreeBenchmark(leaves, 0)
+	defer builder.Release()
+	var executor SetTreeExecutor
+	result, err := executor.Run(plan, program, SetTreeOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		result, err = executor.Run(plan, program, SetTreeOptions{})
+		if err != nil || result.Rows() != 0 {
+			b.Fatalf("rows=%d err=%v, want 0", result.Rows(), err)
+		}
+	}
+	b.ReportMetric(leaves-1, "binary-nodes/op")
+	b.ReportMetric(
+		float64(b.Elapsed().Nanoseconds())/float64(b.N*(leaves-1)),
+		"ns/binary-node",
+	)
+	setTreeBenchmarkSink += result.Rows()
+}
+
 func BenchmarkSetTreeBuilderWarm(b *testing.B) {
 	const leaves = 64
 	specs := make([]SetTreeLeafSpec, leaves)
