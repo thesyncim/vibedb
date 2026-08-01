@@ -74,7 +74,12 @@ func KindOf(src string) Kind {
 		// statement by the time they do.
 		return KindCreateTable
 	case tok.kw == kwDrop:
+		if next := lx.next(); next.kind == tokIdent && next.kw == kwIndex {
+			return KindDropIndex
+		}
 		return KindDropTable
+	case tok.kw == kwTruncate:
+		return KindTruncate
 	}
 	return KindSelect
 }
@@ -114,12 +119,12 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwCreate):
 		return p.parseCreate(dst)
 	case p.atKeyword(kwDrop):
-		dst.Kind, dst.DropTable = KindDropTable, &p.drop
-		return p.parseDropTable()
+		return p.parseDrop(dst)
 	case p.atKeyword(kwAlter):
 		return p.errHere("ALTER is not supported: a declared schema is frozen when the collection is created, and altering one would have to revalidate every stored document")
 	case p.atKeyword(kwTruncate):
-		return p.errHere("TRUNCATE is not supported: the durable store has no atomic collection-clear primitive; use bounded DELETE FROM statements when per-batch removal is acceptable")
+		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
+		return p.parseTruncate()
 	}
 	dst.Kind, dst.Select = KindSelect, &p.sel
 	p.out = &p.sel

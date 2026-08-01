@@ -49,6 +49,11 @@ func FuzzParseStatement(f *testing.F) {
 		`CREATE INDEX ON t (a)`,
 		`CREATE INDEX n ON t (a.b[0], c)`,
 		`CREATE INDEX IF NOT EXISTS ON t (`,
+		`TRUNCATE t`,
+		`TRUNCATE TABLE "events"`,
+		`DROP INDEX by_age`,
+		`DROP INDEX IF EXISTS by_age ON users`,
+		`SELECT DISTINCT ALL a FROM t`,
 		`SELECT a FROM t WHERE b = ?`,
 		`MERGE INTO t`,
 		"\x00\x80\xff",
@@ -113,6 +118,7 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 	for _, present := range []bool{
 		s.Select != nil, s.Insert != nil, s.Update != nil, s.Delete != nil,
 		s.CreateTable != nil, s.CreateIndex != nil, s.DropTable != nil,
+		s.Truncate != nil, s.DropIndex != nil,
 	} {
 		if present {
 			bodies++
@@ -121,7 +127,7 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 	if bodies != 1 {
 		t.Fatalf("an accepted statement carries %d bodies, want exactly 1", bodies)
 	}
-	if s.Table() == "" {
+	if s.Table() == "" && s.Kind != KindDropIndex {
 		t.Fatal("an accepted statement names no collection")
 	}
 	switch s.Kind {
@@ -158,6 +164,17 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 	case KindDropTable:
 		if s.DropTable == nil || s.DropTable.Table == "" {
 			t.Fatal("KindDropTable with no table name")
+		}
+	case KindTruncate:
+		if s.Truncate == nil || s.Truncate.Table == "" {
+			t.Fatal("KindTruncate with no table name")
+		}
+	case KindDropIndex:
+		if s.DropIndex == nil || s.DropIndex.Name == "" {
+			t.Fatal("KindDropIndex with no index name")
+		}
+		if s.DropIndex.HasTable != (s.DropIndex.Table != "") {
+			t.Fatal("KindDropIndex has inconsistent ON table state")
 		}
 	default:
 		t.Fatalf("unknown statement kind %d", s.Kind)

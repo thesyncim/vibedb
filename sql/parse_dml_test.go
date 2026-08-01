@@ -118,6 +118,26 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `drop table if exists users`,
 		},
 		{
+			name: "truncate without table keyword",
+			src:  `TRUNCATE users`,
+			want: `truncate users`,
+		},
+		{
+			name: "truncate with table keyword",
+			src:  `TRUNCATE TABLE users`,
+			want: `truncate users`,
+		},
+		{
+			name: "drop an index",
+			src:  `DROP INDEX by_age`,
+			want: `drop index by_age`,
+		},
+		{
+			name: "drop an index from a table if it exists",
+			src:  `DROP INDEX IF EXISTS by_age ON users`,
+			want: `drop index if exists by_age on users`,
+		},
+		{
 			name: "a nested path in a condition",
 			src:  `DELETE FROM users WHERE profile.region = 'eu'`,
 			want: `delete from users where (cmp = 0:profile.region s"eu") params=0`,
@@ -261,9 +281,30 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
 		{"REPLACE", `REPLACE INTO t VALUES ('k', ?)`, 0, "REPLACE"},
-		{"TRUNCATE", `TRUNCATE TABLE t`, 0, "TRUNCATE"},
-		{"DROP INDEX", `DROP INDEX t`, 5, "TABLE after DROP"},
 		{"ALTER", `ALTER TABLE t ADD COLUMN a STRING`, 0, "ALTER"},
+	})
+}
+
+func TestRejectsUnboundedCatalogDDLSyntax(t *testing.T) {
+	runDMLRejections(t, []dmlRejection{
+		{"TRUNCATE without a table", `TRUNCATE`, -1, "collection name"},
+		{"TRUNCATE TABLE without a table", `TRUNCATE TABLE`, -1, "collection name"},
+		{"TRUNCATE several tables", `TRUNCATE t, u`, -1, "trailing input"},
+		{"TRUNCATE restart identity", `TRUNCATE t RESTART IDENTITY`, -1, "table alias"},
+		{"TRUNCATE cascade", `TRUNCATE t CASCADE`, -1, "table alias"},
+		{"TRUNCATE placeholder", `TRUNCATE ?`, -1, "collection name"},
+		{"DROP without an object kind", `DROP`, -1, "TABLE or INDEX"},
+		{"DROP another object kind", `DROP VIEW v`, -1, "TABLE or INDEX"},
+		{"DROP INDEX without a name", `DROP INDEX`, -1, "index name"},
+		{"DROP INDEX with incomplete IF", `DROP INDEX IF by_age`, -1, "EXISTS after IF"},
+		{"DROP INDEX IF EXISTS without a name", `DROP INDEX IF EXISTS`, -1, "index name"},
+		{"DROP several indexes", `DROP INDEX a, b`, -1, "trailing input"},
+		{"DROP INDEX ON without a table", `DROP INDEX by_age ON`, -1, "collection name"},
+		{"DROP INDEX cascade", `DROP INDEX by_age CASCADE`, -1, "trailing input"},
+		{"DROP INDEX restrict", `DROP INDEX by_age RESTRICT`, -1, "trailing input"},
+		{"DROP INDEX placeholder", `DROP INDEX ?`, -1, "index name"},
+		{"DROP INDEX table placeholder", `DROP INDEX by_age ON ?`, -1, "collection name"},
+		{"DROP INDEX qualified table", `DROP INDEX by_age ON public.users`, -1, "qualified collection"},
 	})
 }
 

@@ -29,6 +29,21 @@ func dumpAny(s *Statement) string {
 			return "drop table if exists " + s.DropTable.Table
 		}
 		return "drop table " + s.DropTable.Table
+	case KindTruncate:
+		return "truncate " + s.Truncate.Table
+	case KindDropIndex:
+		var b strings.Builder
+		b.WriteString("drop index")
+		if s.DropIndex.IfExists {
+			b.WriteString(" if exists")
+		}
+		b.WriteByte(' ')
+		b.WriteString(s.DropIndex.Name)
+		if s.DropIndex.HasTable {
+			b.WriteString(" on ")
+			b.WriteString(s.DropIndex.Table)
+		}
+		return b.String()
 	}
 	return dumpStmt(s.Select)
 }

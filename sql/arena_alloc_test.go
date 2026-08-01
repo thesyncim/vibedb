@@ -96,6 +96,8 @@ func TestWarmParseStatementIsAllocationFree(t *testing.T) {
 		{"delete", benchDelete},
 		{"create table", benchCreateTable},
 		{"create index", benchCreateIndex},
+		{"truncate", `TRUNCATE TABLE docs`},
+		{"drop index", `DROP INDEX IF EXISTS by_kind ON docs`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,6 +136,8 @@ func TestWarmParseStatementOfMixedShapesIsAllocationFree(t *testing.T) {
 		benchDelete,
 		benchCreateTable,
 		benchCreateIndex,
+		`TRUNCATE TABLE docs`,
+		`DROP INDEX IF EXISTS by_kind ON docs`,
 	}
 	var p Parser
 	var stmt Statement

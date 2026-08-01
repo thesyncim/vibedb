@@ -34,6 +34,10 @@ const (
 	KindCreateIndex
 	// KindDropTable is a DROP TABLE, carried in [Statement.DropTable].
 	KindDropTable
+	// KindTruncate is a TRUNCATE, carried in [Statement.Truncate].
+	KindTruncate
+	// KindDropIndex is a DROP INDEX, carried in [Statement.DropIndex].
+	KindDropIndex
 )
 
 // String answers the statement's leading keyword.
@@ -51,6 +55,10 @@ func (k Kind) String() string {
 		return "CREATE INDEX"
 	case KindDropTable:
 		return "DROP TABLE"
+	case KindTruncate:
+		return "TRUNCATE"
+	case KindDropIndex:
+		return "DROP INDEX"
 	}
 	return "SELECT"
 }
@@ -71,7 +79,7 @@ const DocumentColumn = "$doc"
 //
 // Exactly one body pointer is non-nil, selected by Kind. It is a tagged struct
 // rather than an interface because every consumer switches on the kind anyway,
-// and because the six bodies are already concrete types a caller wants by name.
+// and because the bodies are already concrete types a caller wants by name.
 type Statement struct {
 	Kind Kind
 	// Explain marks a SELECT whose caller requested plan output instead of the
@@ -86,6 +94,8 @@ type Statement struct {
 	CreateTable *CreateTableStmt
 	CreateIndex *CreateIndexStmt
 	DropTable   *DropTableStmt
+	Truncate    *TruncateStmt
+	DropIndex   *DropIndexStmt
 }
 
 // ReturnsRows reports whether this parsed statement must execute through a
@@ -112,6 +122,10 @@ func (s *Statement) Table() string {
 		return s.CreateIndex.Table
 	case KindDropTable:
 		return s.DropTable.Table
+	case KindTruncate:
+		return s.Truncate.Table
+	case KindDropIndex:
+		return s.DropIndex.Table
 	}
 	if s.Select == nil || len(s.Select.From) == 0 {
 		return ""
@@ -128,7 +142,7 @@ func (s *Statement) Params() int {
 		return s.Update.Params
 	case KindDelete:
 		return s.Delete.Params
-	case KindCreateTable, KindCreateIndex, KindDropTable:
+	case KindCreateTable, KindCreateIndex, KindDropTable, KindTruncate, KindDropIndex:
 		// A DDL statement has no placeholders. A schema is not data: a type, a
 		// path, and a table name are all compiled into the definition when the
 		// statement is prepared, so there is nothing left for a bind to supply.

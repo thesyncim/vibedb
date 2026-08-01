@@ -110,6 +110,8 @@ type Parser struct {
 	tbl       CreateTableStmt
 	idx       CreateIndexStmt
 	drop      DropTableStmt
+	truncate  TruncateStmt
+	dropIndex DropIndexStmt
 
 	// DML filters and RETURNING projections reuse the clause buffers below.
 	// These retained copies keep a filter's slice headers valid while a
@@ -385,7 +387,12 @@ func (p *Parser) parseStatement() error {
 		return err
 	}
 	p.out.Distinct = p.acceptKeyword(kwDistinct)
-	p.acceptKeyword(kwAll) // SELECT ALL is the default, so it is a no-op
+	if p.out.Distinct && p.atKeyword(kwAll) {
+		return p.errHere("SELECT DISTINCT and SELECT ALL are mutually exclusive")
+	}
+	if !p.out.Distinct {
+		p.acceptKeyword(kwAll) // SELECT ALL is the default, so it is a no-op
+	}
 	if err := p.parseResultColumns(); err != nil {
 		return err
 	}
@@ -461,12 +468,13 @@ func (p *Parser) expectSelect() error {
 	case p.acceptKeyword(kwSelect):
 		return nil
 	case p.atKeyword(kwInsert), p.atKeyword(kwUpdate), p.atKeyword(kwDelete),
-		p.atKeyword(kwCreate), p.atKeyword(kwDrop), p.atKeyword(kwAlter):
+		p.atKeyword(kwCreate), p.atKeyword(kwDrop), p.atKeyword(kwTruncate),
+		p.atKeyword(kwAlter):
 		// Parse is the SELECT-only entry point, kept because a caller that only
 		// wants a query should not have to switch on a kind to find out it got
 		// one. The statement is not unsupported, so the message names the entry
 		// point that takes it rather than the capability the engine lacks.
-		return p.errHere("this entry point parses SELECT; INSERT, UPDATE, DELETE, and CREATE are parsed by ParseStatement")
+		return p.errHere("this entry point parses SELECT; mutations and catalog statements are parsed by ParseStatement")
 	case p.atKeyword(kwValues):
 		return p.errHere("a bare VALUES list is not a statement; write INSERT INTO ... VALUES, parsed by ParseStatement")
 	case p.atKeyword(kwWith):
