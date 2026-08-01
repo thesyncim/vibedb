@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -66,7 +67,9 @@ type Statement struct {
 
 	// params is the placeholder count, the value a driver validates its
 	// argument count against before it does anything else.
-	params int
+	params           int
+	requiresCatalog  bool
+	drivingPredicate *sqlast.Expr
 
 	// c and q are this statement's own compiler and the Query it compiles
 	// into. They are values rather than pointers so a Statement is one
@@ -141,6 +144,11 @@ type Statement struct {
 
 type nestedStatements struct {
 	subqueries []statementSubquery
+	derived    *statementDerived
+	ctes       *statementCTEs
+	cte        *statementCTEReference
+	ownsCTEs   bool
+	driving    string
 }
 
 type subqueryUse uint8
@@ -161,6 +169,12 @@ type statementSubquery struct {
 	slots   []subqueryScalar
 	hasNull bool
 	exists  bool
+	// resultBytes and activeBytes are the two reservations that can coexist
+	// while a child Result is copied into owned predicate values. resultBytes
+	// is released as soon as the copy completes; activeBytes stays charged
+	// until the outer plan has finished using those values.
+	resultBytes int64
+	activeBytes int64
 }
 
 type subqueryScalar struct {
@@ -242,14 +256,59 @@ func prepareTreeWithLimit(
 	tree *sqlast.SelectStmt,
 	subqueryLimit uint8,
 ) (*Statement, error) {
+	return prepareTreeInContext(src, tree, subqueryLimit, nil, 0)
+}
+
+// prepareTreeInContext prepares one SELECT inside the lexical CTE catalog and
+// absolute placeholder range of its parent. A nil catalog stays nil for an
+// ordinary SELECT, preserving the absent-feature object and allocation path.
+func prepareTreeInContext(
+	src string,
+	tree *sqlast.SelectStmt,
+	subqueryLimit uint8,
+	ctes *statementCTEs,
+	argBase int,
+) (*Statement, error) {
 	s := &Statement{
 		text: src, tree: tree, params: tree.Params,
 		subqueryLimit: subqueryLimit,
 	}
-	if err := s.prepareSubqueries(); err != nil {
+	if tree.With != nil {
+		if ctes == nil {
+			ctes = new(statementCTEs)
+			s.ensureNested().ownsCTEs = true
+		}
+		s.ensureNested().ctes = ctes
+		if err := s.prepareCTEDefinitions(argBase); err != nil {
+			s.Release()
+			return nil, err
+		}
+	}
+	if len(tree.From) != 0 && tree.From[0].Kind == sqlast.RelationCTE {
+		if ctes == nil {
+			return nil, fmt.Errorf("query: CTE reference %q has no lexical definition", tree.From[0].Name)
+		}
+		s.ensureNested().ctes = ctes
+		if err := s.prepareCTEReference(); err != nil {
+			s.Release()
+			return nil, err
+		}
+	}
+	if err := s.prepareSubqueries(argBase); err != nil {
+		s.Release()
 		return nil, err
 	}
+	if err := s.prepareDerived(argBase); err != nil {
+		s.Release()
+		return nil, err
+	}
+	s.requiresCatalog = selectRequiresCatalog(tree)
+	s.drivingPredicate = s.resolveDrivingPredicate()
+	if s.nested != nil {
+		s.nested.driving = s.resolveDrivingCollection()
+	}
 	if err := s.describe(); err != nil {
+		s.Release()
 		return nil, err
 	}
 	// Validate with stand-ins. Every placeholder becomes int64(0), which is a
@@ -262,10 +321,18 @@ func prepareTreeWithLimit(
 	s.prepareMode = true
 	if err := s.lower(s.args); err != nil {
 		s.prepareMode = false
+		s.Release()
 		return nil, err
 	}
 	s.prepareMode = false
 	return s, nil
+}
+
+func (s *Statement) ensureNested() *nestedStatements {
+	if s.nested == nil {
+		s.nested = new(nestedStatements)
+	}
+	return s.nested
 }
 
 // Columns returns the output column names in SELECT order. The slice is owned
@@ -298,7 +365,7 @@ func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
 // snapshot; adapters use this to avoid constructing a single-collection Source
 // that execution would have to reject.
 func (s *Statement) RequiresCatalog() bool {
-	return len(s.tree.From) > 1 || s.nested != nil
+	return s.requiresCatalog
 }
 
 // AppendSchema appends the statement's output schema to dst, one entry per
@@ -329,6 +396,17 @@ func (s *Statement) Release() {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
 		}
+		if s.nested.derived != nil {
+			s.nested.derived.stmt.Release()
+			s.nested.derived.exec.Release()
+			s.nested.derived.spool.release()
+		}
+		if s.nested.cte != nil {
+			s.nested.cte.spool.release()
+		}
+		if s.nested.ownsCTEs && s.nested.ctes != nil {
+			s.nested.ctes.release()
+		}
 	}
 	*s = Statement{}
 }
@@ -350,31 +428,116 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	if e == nil {
 		return Cursor{}, fmt.Errorf("query: RunInto requires a non-nil Exec")
 	}
+	// An invalid statement-wide option is still an execution attempt. Match
+	// Query.RunInto's destination contract by invalidating the prior result and
+	// stats before validating anything that can fail.
+	clearExecBorrowedViews(e)
+	if s.nested != nil {
+		s.discardRelations()
+	}
+	e.Stats = ExecStats{}
+	var frame statementFrame
+	if err := frame.begin(e.Options); err != nil {
+		return Cursor{}, err
+	}
+	frame.args = args
+	return s.runIntoFrame(e, src, args, &frame, "")
+}
+
+// runIntoFrame is RunInto with the statement-wide accounts already installed.
+// Nested statements call this entry point so recursion never manufactures a
+// fresh intermediate allowance.
+func (s *Statement) runIntoFrame(
+	e *Exec,
+	src Source,
+	args []any,
+	frame *statementFrame,
+	intermediateResource string,
+) (Cursor, error) {
+	// Invalidate the previous root or nested result before any fallible bind or
+	// child execution. Query.RunInto performs the same reset later, but a
+	// subquery error happens before that call and must not leave a prior success
+	// looking like the failed execution's output.
+	clearExecBorrowedViews(e)
+	if intermediateResource != "" {
+		// ResultRows and ResultBytes bound only the caller-visible result. A
+		// relation-valued child is instead bounded by the one statement frame;
+		// inheriting the outer limits changes valid LIMIT queries into failures.
+		e.Options.ResultRows = -1
+		e.Options.ResultBytes = -1
+	}
 	if len(args) != s.params {
 		return Cursor{}, fmt.Errorf(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
 			s.params, len(args))
 	}
-	if err := s.runSubqueries(e, src, args); err != nil {
+	runSource := src
+	if s.nested != nil {
+		if s.canFuseCTE() {
+			return s.runFusedCTE(e, src, frame, intermediateResource)
+		}
+		var err error
+		runSource, err = s.runRelations(e, src, args, frame)
+		if err != nil {
+			s.releaseRelations(frame)
+			return Cursor{}, err
+		}
+	}
+	if err := s.runSubqueries(e, src, args, frame); err != nil {
+		s.releaseSubqueries(frame)
+		s.releaseRelations(frame)
 		return Cursor{}, err
 	}
+	defer s.releaseSubqueries(frame)
 	if err := s.bind(args); err != nil {
+		s.releaseRelations(frame)
 		return Cursor{}, err
 	}
-	if err := s.q.RunInto(e, src); err != nil {
+	if intermediateResource != "" {
+		remaining := frame.intermediate.remaining()
+		if remaining == 0 {
+			s.releaseRelations(frame)
+			return Cursor{}, &IntermediateBudgetError{
+				Resource: intermediateResource,
+				Bytes:    saturatedBytes(frame.intermediate.used, 1),
+				Limit:    frame.intermediate.limit,
+			}
+		}
+		// Install the remainder immediately before final materialization. A
+		// deeper derived relation or predicate subquery may have consumed part
+		// of the allowance since this nested statement began.
+		e.Options.ResultBytes = remaining
+	}
+	if err := s.q.RunInto(e, runSource); err != nil {
+		// A relation execution may have parked grouped/order state that borrows
+		// its spool before a later result-budget or cancellation error. Sever
+		// every parent view before resetting the statement-owned spool.
+		clearExecBorrowedViews(e)
+		s.releaseRelations(frame)
+		var resultErr *ResultBudgetError
+		if intermediateResource != "" && errors.As(err, &resultErr) &&
+			resultErr.ByteLimit == e.Options.ResultBytes {
+			return Cursor{}, &IntermediateBudgetError{
+				Resource: intermediateResource,
+				Bytes: saturatedBytes(
+					frame.intermediate.used, resultErr.Bytes,
+				),
+				Limit: frame.intermediate.limit,
+			}
+		}
 		return Cursor{}, err
 	}
 	return s.cursor(&e.Result), nil
 }
 
-func (s *Statement) prepareSubqueries() error {
-	if err := s.collectSubqueries(s.tree.Where); err != nil {
+func (s *Statement) prepareSubqueries(argBase int) error {
+	if err := s.collectSubqueries(s.tree.Where, argBase); err != nil {
 		return err
 	}
-	return s.collectSubqueries(s.tree.Having)
+	return s.collectSubqueries(s.tree.Having, argBase)
 }
 
-func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
+func (s *Statement) collectSubqueries(e *sqlast.Expr, argBase int) error {
 	if e == nil {
 		return nil
 	}
@@ -396,7 +559,9 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
 		if use == subqueryIn {
 			limit = 0
 		}
-		stmt, err := prepareTreeWithLimit(s.text, e.Subquery, limit)
+		stmt, err := prepareTreeInContext(
+			s.text, e.Subquery, limit, s.cteCatalog(), argBase+e.Subquery.ParamBase,
+		)
 		if err != nil {
 			return err
 		}
@@ -409,14 +574,19 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr) error {
 		return nil
 	}
 	for _, kid := range e.Kids {
-		if err := s.collectSubqueries(kid); err != nil {
+		if err := s.collectSubqueries(kid, argBase); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
+func (s *Statement) runSubqueries(
+	parent *Exec,
+	src Source,
+	args []any,
+	frame *statementFrame,
+) error {
 	if s.nested == nil {
 		return nil
 	}
@@ -432,39 +602,175 @@ func (s *Statement) runSubqueries(parent *Exec, src Source, args []any) error {
 			return err
 		}
 		sub.exec.Options = parent.Options
-		cursor, err := sub.stmt.RunInto(&sub.exec, nestedSource, args[base:base+n])
+		cursor, err := sub.stmt.runIntoFrame(
+			&sub.exec, nestedSource, args[base:base+n], frame,
+			"predicate subquery result",
+		)
 		if err != nil {
 			return err
 		}
+		retained := sub.exec.Result.resultBytesUsed
+		if err := frame.intermediate.reserve("predicate subquery result", retained); err != nil {
+			return err
+		}
+		sub.resultBytes = retained
 		sub.preview = false
 		sub.exists = false
 		sub.hasNull = false
 		clear(sub.values)
 		sub.values = sub.values[:0]
-		sub.slots = reserve(sub.slots[:0], sub.exec.Result.RowCount)
-		sub.values = reserve(sub.values, sub.exec.Result.RowCount)
-		for cursor.Next() {
-			sub.exists = true
-			if sub.use == subqueryExists {
-				continue
+
+		rows, known, payload, hasNull, err := measureSubqueryValues(
+			&cursor, sub.use, parent.Options.Cancel,
+		)
+		if err != nil {
+			return err
+		}
+		sub.exists = rows != 0
+		sub.hasNull = hasNull
+		if sub.use == subqueryScalarUse && rows > 1 {
+			return &CardinalityViolationError{}
+		}
+		charge := predicateValuesRetainedBytes(known, payload)
+		if err := frame.intermediate.reserve(
+			"predicate subquery values", charge,
+		); err != nil {
+			return err
+		}
+		sub.activeBytes = charge
+		if known != 0 {
+			sub.slots = reserve(sub.slots[:0], known)[:known]
+			for slot := range sub.slots {
+				buf := sub.slots[slot].buf[:0]
+				sub.slots[slot] = subqueryScalar{buf: buf}
 			}
-			if sub.use == subqueryScalarUse && len(sub.slots) == 1 {
-				return fmt.Errorf("query: scalar subquery returned more than one row")
-			}
-			sub.slots = append(sub.slots, subqueryScalar{})
-			slot := &sub.slots[len(sub.slots)-1]
-			value, known, err := scalarFromCell(slot, cursor.Cell(0))
-			if err != nil {
+			sub.values = reserve(sub.values, known)
+			cursor = sub.stmt.cursor(&sub.exec.Result)
+			if err := materializeSubqueryValues(
+				sub, &cursor, parent.Options.Cancel,
+			); err != nil {
 				return err
 			}
-			if !known {
-				sub.hasNull = true
-				continue
-			}
-			sub.values = append(sub.values, value)
+		} else {
+			sub.slots = sub.slots[:0]
 		}
+		// Predicate values now own every variable-width byte. Drop the child
+		// Result, its borrowed workspace views, and any derived spool before
+		// evaluating the next sibling subquery.
+		s.releaseSubqueryResult(sub, frame)
 	}
 	return nil
+}
+
+func measureSubqueryValues(
+	cursor *Cursor,
+	use subqueryUse,
+	cancel *CancelFlag,
+) (rows, known int, payload int64, hasNull bool, err error) {
+	for {
+		var next bool
+		next, err = cursor.nextWithCancel(cancel)
+		if err != nil || !next {
+			return
+		}
+		rows++
+		if use == subqueryExists {
+			continue
+		}
+		cell := cursor.Cell(0)
+		switch cell.Kind() {
+		case TypeNull:
+			hasNull = true
+		case TypeBool:
+			known++
+		case TypeNumber:
+			known++
+			if _, integer := cell.Int64(); !integer {
+				payload = saturatedBytes(
+					payload, int64(encodedCellJSONBytes(cell)),
+				)
+			}
+		case TypeString:
+			known++
+			text, _ := cell.Text()
+			payload = saturatedBytes(payload, int64(len(text)))
+		default:
+			err = fmt.Errorf(
+				"query: a subquery predicate requires scalar values, got %v",
+				cell.Kind(),
+			)
+			return
+		}
+	}
+}
+
+func materializeSubqueryValues(
+	sub *statementSubquery,
+	cursor *Cursor,
+	cancel *CancelFlag,
+) error {
+	slot := 0
+	for {
+		next, err := cursor.nextWithCancel(cancel)
+		if err != nil {
+			return err
+		}
+		if !next {
+			return nil
+		}
+		if cursor.Cell(0).Kind() == TypeNull {
+			continue
+		}
+		value, known, err := scalarFromCell(&sub.slots[slot], cursor.Cell(0))
+		if err != nil {
+			return err
+		}
+		if !known {
+			continue
+		}
+		sub.values = append(sub.values, value)
+		slot++
+	}
+}
+
+func (s *Statement) releaseSubqueryResult(
+	sub *statementSubquery,
+	frame *statementFrame,
+) {
+	clearExecBorrowedViews(&sub.exec)
+	sub.stmt.releaseRelations(frame)
+	frame.intermediate.release(sub.resultBytes)
+	sub.resultBytes = 0
+}
+
+func (s *Statement) releaseSubqueries(frame *statementFrame) {
+	if s.nested == nil {
+		return
+	}
+	for i := range s.nested.subqueries {
+		sub := &s.nested.subqueries[i]
+		s.releaseSubqueryResult(sub, frame)
+		frame.intermediate.release(sub.activeBytes)
+		sub.activeBytes = 0
+		clear(sub.values)
+		sub.values = sub.values[:0]
+		for slot := range sub.slots {
+			buf := sub.slots[slot].buf[:0]
+			sub.slots[slot] = subqueryScalar{buf: buf}
+		}
+		sub.slots = sub.slots[:0]
+		sub.hasNull = false
+		sub.exists = false
+	}
+}
+
+func clearExecBorrowedViews(e *Exec) {
+	e.Result.abortResult()
+	e.Workspace.clearBorrowedViews()
+	e.Workspace.resetJoinBindings()
+	for i := range e.file.workers {
+		e.file.workers[i].clearBorrowedViews()
+	}
 }
 
 func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
@@ -483,7 +789,9 @@ func scalarFromCell(slot *subqueryScalar, cell Cell) (any, bool, error) {
 		slot.n = Number(byteview.String(slot.buf))
 		return &slot.n, true, nil
 	case TypeString:
-		slot.s, _ = cell.Text()
+		text, _ := cell.Text()
+		slot.buf = append(slot.buf[:0], text...)
+		slot.s = byteview.String(slot.buf)
 		return &slot.s, true, nil
 	default:
 		return nil, false, fmt.Errorf(
@@ -590,12 +898,26 @@ func NewTextCursor(header, text string) Cursor {
 
 // Next advances to the next surviving row, reporting false at the end.
 func (c *Cursor) Next() bool {
+	next, _ := c.nextWithCancel(nil)
+	return next
+}
+
+// nextWithCancel is Next for internal relation materializers. It checks the
+// underlying result-row loop, including rows HAVING rejects, so cancellation
+// latency is bounded even when no row is ever yielded to the caller.
+func (c *Cursor) nextWithCancel(cancel *CancelFlag) (bool, error) {
 	if c.res == nil || c.left == 0 {
-		return false
+		return false, nil
+	}
+	if err := cancellationError(cancel); err != nil {
+		return false, err
 	}
 	for c.row < c.res.RowCount {
 		row := c.row
 		c.row++
+		if err := cancellationCheckpoint(cancel, row); err != nil {
+			return false, err
+		}
 		if !c.st.having.keep(c.res, row) {
 			continue
 		}
@@ -607,10 +929,10 @@ func (c *Cursor) Next() bool {
 		if c.left > 0 {
 			c.left--
 		}
-		return true
+		return true, nil
 	}
 	c.cur = -1
-	return false
+	return false, nil
 }
 
 // Cell returns the value of output column col in the current row. Calling it
@@ -644,6 +966,9 @@ func (s *Statement) localSpec(p *sqlast.PathExpr) string { return s.render(p, tr
 func (s *Statement) render(p *sqlast.PathExpr, local bool) string {
 	if p == nil {
 		return ""
+	}
+	if s.hasRelationBinding() && p.Source == 0 {
+		return s.renderDerived(p, local)
 	}
 	qualified := !local && p.Source != 0
 	if len(p.Segments) == 0 && !qualified {
@@ -735,10 +1060,29 @@ func (s *Statement) unshadow(start int) []byte {
 // describe computes the output schema and the parts of the statement that do
 // not depend on a binding. It runs once, at prepare.
 func (s *Statement) describe() error {
-	s.outputs = len(s.tree.Columns)
-	s.names = reserve(s.names[:0], s.outputs)
+	s.outputs = 0
+	capacity := len(s.tree.Columns)
+	if relation := s.relationBinding(); s.hasRelationBinding() {
+		capacity += len(relation.names)
+	}
+	s.names = reserve(s.names[:0], capacity)
 	for i := range s.tree.Columns {
-		s.names = append(s.names, s.columnName(&s.tree.Columns[i]))
+		column := &s.tree.Columns[i]
+		if relation := s.relationBinding(); s.hasRelationBinding() &&
+			column.Agg == sqlast.AggNone && column.Path != nil &&
+			len(column.Path.Segments) == 0 {
+			if column.Alias != "" {
+				return fmt.Errorf(
+					"query: relation wildcard expands to %d columns and cannot have the single alias %q",
+					len(relation.names), column.Alias,
+				)
+			}
+			s.names = append(s.names, relation.names...)
+			s.outputs += len(relation.names)
+			continue
+		}
+		s.names = append(s.names, s.columnName(column))
+		s.outputs++
 	}
 	return nil
 }
@@ -749,6 +1093,9 @@ func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 		return col.Alias
 	}
 	spec := s.spec(col.Path)
+	if s.hasRelationBinding() && col.Path != nil {
+		spec = s.derivedDisplaySpec(col.Path)
+	}
 	if col.Agg == sqlast.AggNone {
 		if spec == "" {
 			// The whole document, which '*' and 'alias.*' parse to. The engine

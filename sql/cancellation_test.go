@@ -77,3 +77,60 @@ func TestParserReturnsPreexistingCancellationUnchanged(t *testing.T) {
 		t.Fatalf("ParseStatement = %v, want exact %v", err, want)
 	}
 }
+
+func TestParserCancellationRemainsBoundedInsideDerivedTable(t *testing.T) {
+	const payloadBytes = 1 << 20
+	src := `SELECT d.id FROM (SELECT id FROM docs /*` +
+		strings.Repeat("x", payloadBytes) + `*/) AS d`
+	admissionChecks := 1 + (len(src)-1)/parserCancelByteInterval
+	// Admission validates the complete source first. The following token check
+	// and bounded comment scan exercise the parent parser while it delimits the
+	// nested SELECT; cancellation must still escape unchanged.
+	stopAt := admissionChecks + 3
+	checks := 0
+	want := errors.New("cancel derived parse")
+	var parser Parser
+	parser.SetCancellationCheck(func() error {
+		checks++
+		if checks >= stopAt {
+			return want
+		}
+		return nil
+	})
+	var statement SelectStmt
+	if err := parser.Parse(&statement, src); err != want {
+		t.Fatalf("Parse cancellation = %v, want exact %v", err, want)
+	}
+	if len(statement.Columns) != 0 || len(statement.From) != 0 {
+		t.Fatalf("canceled derived parse returned a partial AST: %+v", statement)
+	}
+}
+
+func TestParserCancellationRemainsBoundedInsideCTE(t *testing.T) {
+	const payloadBytes = 1 << 20
+	src := `WITH active AS (SELECT id FROM docs /*` +
+		strings.Repeat("x", payloadBytes) + `*/) SELECT id FROM active`
+	admissionChecks := 1 + (len(src)-1)/parserCancelByteInterval
+	stopAt := admissionChecks + 3
+	checks := 0
+	want := errors.New("cancel CTE parse")
+	var parser Parser
+	parser.SetCancellationCheck(func() error {
+		checks++
+		if checks >= stopAt {
+			return want
+		}
+		return nil
+	})
+	var statement SelectStmt
+	if err := parser.Parse(&statement, src); err != want {
+		t.Fatalf("Parse cancellation = %v, want exact %v", err, want)
+	}
+	if statement.With != nil || len(statement.Columns) != 0 || len(statement.From) != 0 {
+		t.Fatalf("canceled CTE parse returned a partial AST: %+v", statement)
+	}
+	parser.SetCancellationCheck(nil)
+	if err := parser.Parse(&statement, `WITH c AS (SELECT id FROM docs) SELECT id FROM c`); err != nil {
+		t.Fatalf("parser was not reusable after CTE cancellation: %v", err)
+	}
+}

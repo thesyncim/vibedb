@@ -93,8 +93,11 @@
 //     parser. Byte offsets are preserved by the rewrite, so an error's position
 //     still points into the statement the client sent.
 //   - CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
-//     DELETE, SELECT, one declared-field inner JOIN, schema validation, exact
-//     indexes, whole-document parameters, and affected-row command tags.
+//     DELETE, SELECT, non-recursive SELECT-valued CTEs, one declared-field
+//     inner JOIN, schema validation, exact indexes, whole-document parameters,
+//     and affected-row command tags. CTEs work through simple Query and the
+//     Parse/Bind/Execute path; duplicate output names remain duplicate
+//     RowDescription fields.
 //   - The pinned PostgreSQL 18.4 psql client's basic introspection meta-commands
 //     — \l, \dn, \dt, \di, \d, and \d <name> — answered from the SQL catalog
 //     by the post-parse-failure recognition shim in catalog_shim.go. The name
@@ -130,9 +133,11 @@
 //     PostgreSQL's textual plan format.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
-//   - The SQL constructs the dialect itself refuses — correlated and FROM-list
-//     subqueries, full/cross/natural joins, CASE, CAST, arithmetic, set
-//     operations, window functions, and scalar functions. RIGHT JOIN,
+//   - The SQL constructs the dialect itself refuses — correlated subqueries,
+//     recursive or data-modifying CTEs, derived relations or CTEs in JOIN
+//     positions, LATERAL, full/cross/natural joins, CASE, CAST, arithmetic, set
+//     operations, window functions, and scalar functions. Sole-source
+//     non-recursive CTEs and uncorrelated derived tables, RIGHT JOIN,
 //     uncorrelated predicate subqueries, LIKE/ILIKE, and non-aggregate SELECT
 //     DISTINCT are supported. Each refusal carries a message naming the missing
 //     capability and a position;
@@ -358,9 +363,11 @@
 // partially emitted backend message.
 //
 // Each SELECT result is materialized under [Options.MaxResultRows] and
-// [Options.MaxResultBytes] before any DataRow is encoded. Their zero values
-// select finite defaults of [DefaultMaxResultRows] and
-// [DefaultMaxResultBytes]; [UnlimitedResults] is the explicit opt-out.
+// [Options.MaxResultBytes] before any DataRow is encoded. Relation-valued
+// subplans share the separate statement-wide [Options.MaxIntermediateBytes]
+// allowance. Their zero values select finite defaults of
+// [DefaultMaxResultRows], [DefaultMaxResultBytes], and
+// [DefaultMaxIntermediateBytes]; [UnlimitedResults] is the explicit opt-out.
 // Exhaustion is reported as SQLSTATE 54000 and never emits a partial DataRow.
 // Socket admission is likewise finite by default, and read, idle, and write
 // deadlines cover startup, message reads, and every underlying socket write.

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/query"
@@ -27,23 +28,31 @@ const (
 type joinRowVisitor func(table string, key, document []byte) error
 type joinRowSource func(joinRowVisitor) error
 
+// physicalDependency is one distinct catalog collection and the position of
+// its first physical reference. Definitions are walked in stable source order;
+// repeated references do not multiply snapshots or validation work.
+type physicalDependency struct {
+	name string
+	pos  int
+}
+
 // materializeDurableJoinSource copies one already-consistent durable catalog
 // cut into the heap executor that supports fan-out. It measures the complete
 // input first, so an oversized join fails before a Query starts executing and
 // before any heap collection is built.
 func (c *conn) materializeDurableJoinSource(
 	ctx context.Context,
-	catalog durable.DatabaseSnapshot,
-	statement *sqlast.SelectStmt,
-	names []string,
+	catalog *durable.DatabaseSnapshot,
+	driving string,
+	dependencies []physicalDependency,
 ) (query.Source, error) {
 	rows := func(visit joinRowVisitor) error {
-		for _, name := range names {
-			snapshot, ok := catalog.Collection(name)
+		for _, dependency := range dependencies {
+			snapshot, ok := catalog.Collection(dependency.name)
 			if !ok {
 				return fmt.Errorf(
 					"%w: %q is absent from the captured join snapshot",
-					ErrTableNotFound, name)
+					ErrTableNotFound, dependency.name)
 			}
 			if snapshot == nil {
 				continue
@@ -52,14 +61,14 @@ func (c *conn) materializeDurableJoinSource(
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				return visit(name, key, document)
+				return visit(dependency.name, key, document)
 			}); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	return c.materializeJoinRows(names, statement.From[0].Name, rows)
+	return c.materializeJoinRows(dependencies, driving, rows)
 }
 
 // materializeTransactionJoinSource is the transactional twin. Every base
@@ -69,19 +78,19 @@ func (c *conn) materializeDurableJoinSource(
 func (c *conn) materializeTransactionJoinSource(
 	ctx context.Context,
 	transaction *tx,
-	statement *sqlast.SelectStmt,
-	names []string,
+	driving string,
+	dependencies []physicalDependency,
 ) (query.Source, error) {
 	rows := func(visit joinRowVisitor) error {
 		if transaction.done {
 			return fmt.Errorf("vibedb: transaction is finished")
 		}
-		for _, name := range names {
-			state, ok := transaction.tables[name]
+		for _, dependency := range dependencies {
+			state, ok := transaction.tables[dependency.name]
 			if !ok {
-				return fmt.Errorf(
-					"%w: %q was not present when the transaction began",
-					ErrTableNotFound, name)
+				return missingTableDependency(
+					dependency.name, dependency.pos, true,
+				)
 			}
 			if state.snapshot != nil {
 				if err := state.snapshot.RangeRaw(func(key, document []byte) error {
@@ -91,7 +100,7 @@ func (c *conn) materializeTransactionJoinSource(
 					if _, shadowed := state.pending[string(key)]; shadowed {
 						return nil
 					}
-					return visit(name, key, document)
+					return visit(dependency.name, key, document)
 				}); err != nil {
 					return err
 				}
@@ -104,21 +113,31 @@ func (c *conn) materializeTransactionJoinSource(
 				if mutation.remove {
 					continue
 				}
-				if err := visit(name, []byte(key), mutation.document); err != nil {
+				if err := visit(dependency.name, []byte(key), mutation.document); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	return c.materializeJoinRows(names, statement.From[0].Name, rows)
+	return c.materializeJoinRows(dependencies, driving, rows)
 }
 
 func (c *conn) materializeJoinRows(
-	names []string,
+	dependencies []physicalDependency,
 	driving string,
 	rows joinRowSource,
 ) (query.Source, error) {
+	if driving == "" && len(dependencies) != 0 {
+		// Prepared statements normally resolve this recursively. Retaining a
+		// deterministic physical fallback keeps this boundary robust if another
+		// relation kind is introduced without its own top-level collection.
+		driving = dependencies[0].name
+	}
+	if driving == "" {
+		return query.Source{}, errors.New(
+			"vibedb: query has no physical driving collection")
+	}
 	limit, err := driverQueryMemory(c.exec.Options)
 	if err != nil {
 		return query.Source{}, err
@@ -131,13 +150,13 @@ func (c *conn) materializeJoinRows(
 	}
 
 	var database store.Database
-	collections := make(map[string]*store.Collection, len(names))
-	for _, name := range names {
-		collection, err := database.CreateCollection(name, store.Options{})
+	collections := make(map[string]*store.Collection, len(dependencies))
+	for _, dependency := range dependencies {
+		collection, err := database.CreateCollection(dependency.name, store.Options{})
 		if err != nil {
 			return query.Source{}, err
 		}
-		collections[name] = collection
+		collections[dependency.name] = collection
 	}
 	if err := rows(func(table string, key, document []byte) error {
 		collection := collections[table]
@@ -184,38 +203,127 @@ func driverQueryMemory(options query.ExecOptions) (int64, error) {
 	return memory, nil
 }
 
-func joinTableNames(statement *sqlast.SelectStmt) []string {
-	names := make([]string, 0, len(statement.From))
-	return appendSelectTableNames(names, statement)
+func selectPhysicalDependencies(statement *sqlast.SelectStmt) []physicalDependency {
+	dependencies := make([]physicalDependency, 0, len(statement.From))
+	return appendSelectPhysicalDependencies(dependencies, statement)
 }
 
-func appendSelectTableNames(names []string, statement *sqlast.SelectStmt) []string {
-	for i := range statement.From {
-		name := statement.From[i].Name
-		duplicate := false
-		for _, prior := range names {
-			if prior == name {
-				duplicate = true
-				break
+func appendSelectPhysicalDependencies(
+	dependencies []physicalDependency,
+	statement *sqlast.SelectStmt,
+) []physicalDependency {
+	// Definitions are semantically validated even when unreferenced. Walking
+	// each body here, once in declaration order, captures those physical reads;
+	// RelationCTE references below deliberately do not expand the body again.
+	if statement.With != nil {
+		for i := range statement.With.CTEs {
+			definition := &statement.With.CTEs[i]
+			if definition.Query != nil {
+				dependencies = appendSelectPhysicalDependencies(
+					dependencies, definition.Query,
+				)
 			}
 		}
-		if !duplicate {
-			names = append(names, name)
+	}
+	for i := range statement.From {
+		relation := &statement.From[i]
+		switch relation.Kind {
+		case sqlast.RelationCollection:
+			if relation.Name == "" {
+				continue
+			}
+			if hasPhysicalDependency(dependencies, relation.Name) {
+				continue
+			}
+			dependencies = append(dependencies, physicalDependency{
+				name: relation.Name,
+				pos:  relation.Pos,
+			})
+		case sqlast.RelationDerived:
+			if relation.Query != nil {
+				dependencies = appendSelectPhysicalDependencies(
+					dependencies, relation.Query,
+				)
+			}
+		case sqlast.RelationCTE:
+			// The definition was visited exactly once above. Query is stable
+			// identity, not another ownership edge for dependency traversal.
 		}
 	}
-	names = appendExprTableNames(names, statement.Where)
-	return names
+	dependencies = appendExprPhysicalDependencies(dependencies, statement.Where)
+	dependencies = appendExprPhysicalDependencies(dependencies, statement.Having)
+	return dependencies
 }
 
-func appendExprTableNames(names []string, e *sqlast.Expr) []string {
+func appendExprPhysicalDependencies(
+	dependencies []physicalDependency,
+	e *sqlast.Expr,
+) []physicalDependency {
 	if e == nil {
-		return names
+		return dependencies
 	}
 	if e.Subquery != nil {
-		return appendSelectTableNames(names, e.Subquery)
+		dependencies = appendSelectPhysicalDependencies(dependencies, e.Subquery)
 	}
 	for _, kid := range e.Kids {
-		names = appendExprTableNames(names, kid)
+		dependencies = appendExprPhysicalDependencies(dependencies, kid)
+	}
+	return dependencies
+}
+
+func hasPhysicalDependency(dependencies []physicalDependency, name string) bool {
+	for i := range dependencies {
+		if dependencies[i].name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func selectContainsJoin(statement *sqlast.SelectStmt) bool {
+	if len(statement.From) > 1 {
+		return true
+	}
+	if statement.With != nil {
+		for i := range statement.With.CTEs {
+			definition := &statement.With.CTEs[i]
+			if definition.Query != nil && selectContainsJoin(definition.Query) {
+				return true
+			}
+		}
+	}
+	for i := range statement.From {
+		relation := &statement.From[i]
+		if relation.Kind == sqlast.RelationDerived &&
+			relation.Query != nil && selectContainsJoin(relation.Query) {
+			return true
+		}
+	}
+	return exprContainsJoin(statement.Where) || exprContainsJoin(statement.Having)
+}
+
+func exprContainsJoin(e *sqlast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Subquery != nil && selectContainsJoin(e.Subquery) {
+		return true
+	}
+	for _, kid := range e.Kids {
+		if exprContainsJoin(kid) {
+			return true
+		}
+	}
+	return false
+}
+
+// joinTableNames remains as a test/debug compatibility helper. Execution uses
+// physicalDependency directly so positions are never discarded.
+func joinTableNames(statement *sqlast.SelectStmt) []string {
+	dependencies := selectPhysicalDependencies(statement)
+	names := make([]string, len(dependencies))
+	for i := range dependencies {
+		names[i] = dependencies[i].name
 	}
 	return names
 }

@@ -90,6 +90,17 @@
 // reads; eligible exact predicates use posting candidates; the remaining
 // shapes use the shared scan executor.
 //
+// Non-recursive SELECT-valued common table expressions support lexical earlier
+// siblings, nested shadowing, output aliases, and MATERIALIZED/NOT MATERIALIZED
+// policy. A multiply referenced default CTE is shared; a safe single-reference
+// identity shape fuses into its defining plan. One recursively discovered
+// physical collection keeps the direct durable and exact-index path. Multiple
+// collections use one coherent reusable capture, and transactional execution
+// reads the BEGIN snapshot plus staged writes. All relation spools share
+// ExecOptions.IntermediateBytes, publish no partial result on error or
+// cancellation, and retain no CTE state or marginal allocation when WITH is
+// absent.
+//
 // SUM, MIN, and MAX preserve exact JSON decimals. AVG emits an exact finite
 // quotient when it fits the query engine's 34-significant-digit policy and
 // otherwise rounds once, ties to even. Exact reduction workspace is bounded

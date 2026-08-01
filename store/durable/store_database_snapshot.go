@@ -1,10 +1,29 @@
 package durable
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
+)
+
+const (
+	// MaxSnapshotCollections bounds the caller-owned catalog accepted by
+	// SnapshotCollectionsInto. A million members is already far beyond a
+	// practical process-local durable catalog, while fixing the maximum retained
+	// metadata and the amount of work one capture can request.
+	MaxSnapshotCollections = 1 << 20
+)
+
+var (
+	// ErrSnapshotCollectionsLimit reports an external catalog larger than the
+	// reusable capture API's documented finite bound.
+	ErrSnapshotCollectionsLimit = errors.New(
+		"vibedb: durable snapshot collection limit exceeded",
+	)
 )
 
 var nextCollectionSnapshotOrder atomic.Uint64
@@ -102,6 +121,64 @@ func seizeSnapshotCut(order []*Collection) (snapshotCutHold, error) {
 	return hold, nil
 }
 
+// seizeSnapshotCutContext is the cancellable external-catalog variant. The
+// ordinary Database and SnapshotCollections paths stay on seizeSnapshotCut, so
+// opting out of cancellation adds no context branch to their acquisition loops.
+func seizeSnapshotCutContext(
+	ctx context.Context, order []*Collection,
+) (snapshotCutHold, error) {
+	hold := snapshotCutHold{order: order}
+	for _, collection := range order {
+		if err := ctx.Err(); err != nil {
+			hold.release()
+			return snapshotCutHold{}, err
+		}
+		collection.writer.Lock()
+		hold.writers++
+		if err := ctx.Err(); err != nil {
+			hold.release()
+			return snapshotCutHold{}, err
+		}
+	}
+	for _, collection := range order {
+		if err := ctx.Err(); err != nil {
+			hold.release()
+			return snapshotCutHold{}, err
+		}
+		if collection.closed {
+			hold.release()
+			return snapshotCutHold{}, ErrClosed
+		}
+		if collection.deferredCanonicalLane() &&
+			collection.primaryRouter.Load() != nil &&
+			(len(collection.primaryPendingParents) != 0 ||
+				collection.primaryUnifiedOverlay.hasPending()) {
+			if err := collection.materializePrimaryParentsLocked(); err != nil {
+				hold.release()
+				return snapshotCutHold{}, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			hold.release()
+			return snapshotCutHold{}, err
+		}
+		collection.snapshotGate.RLock()
+		hold.gates++
+		if err := ctx.Err(); err != nil {
+			hold.release()
+			return snapshotCutHold{}, err
+		}
+	}
+	return hold, nil
+}
+
+func snapshotCaptureContextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
 // release undoes the hold in LIFO order — read gates first, then writers — over
 // exactly the prefix that was acquired. Releasing the gates before the writers
 // keeps a reclaimer waiting on a gate from proceeding until no writer this cut
@@ -182,12 +259,28 @@ type DatabaseSnapshot struct {
 	// entries is ordered by name so lookup can binary-search it, and so a
 	// snapshot's iteration order is the catalog's own stable order.
 	entries []databaseSnapshotEntry
+
+	// storage is the destination-owned high-water entry bank. entries is either
+	// empty or a published prefix of storage. Keeping the bank separate lets a
+	// capture stage entries without exposing a partial result and preserves each
+	// entry's reusable Snapshot object after Close.
+	storage []databaseSnapshotEntry
+
+	// ordered and gateOrder are external-catalog capture scratch. They are
+	// cleared before every return so a reusable destination never retains caller
+	// strings or collection handles after the capture.
+	ordered   []NamedCollection
+	gateOrder []*Collection
 }
 
 // A databaseSnapshotEntry binds one collection name to its captured view.
 type databaseSnapshotEntry struct {
-	name     string
+	name string
+	// snapshot is non-nil only while this entry is published. storage remains
+	// owned by the destination across Close and is rebound to the next captured
+	// generation without allocating.
 	snapshot *Snapshot
+	storage  *Snapshot
 }
 
 // A NamedCollection binds an application-owned collection handle to the name
@@ -282,6 +375,220 @@ func SnapshotCollections(collections []NamedCollection) (DatabaseSnapshot, error
 	return result, nil
 }
 
+// SnapshotCollectionsInto captures application-owned collections into reusable
+// caller-owned storage. It has the same name, ordering, nil-collection, cut,
+// and lease semantics as [SnapshotCollections], with a finite catalog bound of
+// [MaxSnapshotCollections].
+//
+// dst is closed before validation or capture starts. On every return with an
+// error its previous capture and every partially acquired new lease have been
+// released, Len reports zero, and no collection is published through dst.
+// Successful calls copy names into destination-owned immutable strings, so the
+// input slice and its strings may be reused immediately. After one successful
+// call for a stable catalog, the take/use/close loop allocates nothing: dst
+// retains its ordering buffers, names, entry bank, and one Snapshot object per
+// materialized collection.
+//
+// dst is single-consumer and must not be copied or accessed concurrently with
+// this call. A nil Collection remains a cataloged empty collection, exactly as
+// in SnapshotCollections.
+func SnapshotCollectionsInto(
+	dst *DatabaseSnapshot, collections []NamedCollection,
+) error {
+	return snapshotCollectionsInto(nil, dst, collections)
+}
+
+// SnapshotCollectionsIntoContext is [SnapshotCollectionsInto] with cooperative
+// cancellation before and after ordering, while acquiring each writer/gate,
+// and while pinning each collection. Cancellation never publishes a partial
+// destination. A cancellation that arrives while waiting for a mutex is
+// observed immediately after that mutex is acquired; Go mutexes do not expose
+// a cancellable blocking acquisition.
+func SnapshotCollectionsIntoContext(
+	ctx context.Context,
+	dst *DatabaseSnapshot,
+	collections []NamedCollection,
+) error {
+	if ctx == nil {
+		return snapshotCollectionsInto(nil, dst, collections)
+	}
+	return snapshotCollectionsInto(ctx, dst, collections)
+}
+
+func snapshotCollectionsInto(
+	ctx context.Context,
+	dst *DatabaseSnapshot,
+	collections []NamedCollection,
+) error {
+	if dst == nil {
+		return fmt.Errorf(
+			"vibedb: SnapshotCollectionsInto requires non-nil destination",
+		)
+	}
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	if err := snapshotCaptureContextErr(ctx); err != nil {
+		return err
+	}
+	if len(collections) > MaxSnapshotCollections {
+		return fmt.Errorf(
+			"%w: %d > %d",
+			ErrSnapshotCollectionsLimit, len(collections),
+			MaxSnapshotCollections,
+		)
+	}
+	if len(collections) == 0 {
+		return nil
+	}
+
+	dst.ordered = slices.Grow(dst.ordered[:0], len(collections))
+	dst.ordered = append(dst.ordered, collections...)
+	defer dst.clearSnapshotCollectionScratch()
+
+	slices.SortFunc(dst.ordered, func(a, b NamedCollection) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	if err := snapshotCaptureContextErr(ctx); err != nil {
+		return err
+	}
+
+	dst.gateOrder = slices.Grow(dst.gateOrder[:0], len(collections))
+	for i := range dst.ordered {
+		entry := &dst.ordered[i]
+		if entry.Name == "" {
+			return ErrCollectionName
+		}
+		if i != 0 && dst.ordered[i-1].Name == entry.Name {
+			return ErrCollectionExists
+		}
+		if entry.Collection != nil {
+			dst.gateOrder = append(dst.gateOrder, entry.Collection)
+		}
+		if err := snapshotCaptureContextErr(ctx); err != nil {
+			return err
+		}
+	}
+
+	sortCollectionSnapshotOrder(dst.gateOrder)
+	if err := snapshotCaptureContextErr(ctx); err != nil {
+		return err
+	}
+	for i := 1; i < len(dst.gateOrder); i++ {
+		if dst.gateOrder[i-1] != dst.gateOrder[i] {
+			continue
+		}
+		first, second := duplicateCollectionNames(
+			dst.ordered, dst.gateOrder[i],
+		)
+		return fmt.Errorf(
+			"vibedb: one durable collection cannot be cataloged as both %q and %q",
+			first, second,
+		)
+	}
+
+	staged := dst.prepareSnapshotEntries(len(dst.ordered))
+	for i := range dst.ordered {
+		input := &dst.ordered[i]
+		entry := &staged[i]
+		if entry.name != input.Name {
+			entry.name = strings.Clone(input.Name)
+		}
+		entry.snapshot = nil
+		if input.Collection != nil && entry.storage == nil {
+			entry.storage = new(Snapshot)
+		}
+	}
+	if err := snapshotCaptureContextErr(ctx); err != nil {
+		return err
+	}
+
+	var (
+		hold snapshotCutHold
+		err  error
+	)
+	if ctx == nil {
+		hold, err = seizeSnapshotCut(dst.gateOrder)
+	} else {
+		hold, err = seizeSnapshotCutContext(ctx, dst.gateOrder)
+	}
+	if err != nil {
+		return err
+	}
+	defer hold.release()
+
+	for i := range dst.ordered {
+		if err := snapshotCaptureContextErr(ctx); err != nil {
+			closeDatabaseSnapshotEntries(staged)
+			return err
+		}
+		input := &dst.ordered[i]
+		if input.Collection == nil {
+			continue
+		}
+		entry := &staged[i]
+		if err := input.Collection.snapshotGateHeldInto(entry.storage); err != nil {
+			closeDatabaseSnapshotEntries(staged)
+			return err
+		}
+		entry.snapshot = entry.storage
+	}
+	if err := snapshotCaptureContextErr(ctx); err != nil {
+		closeDatabaseSnapshotEntries(staged)
+		return err
+	}
+
+	// Publication is one slice-header assignment after every member is pinned.
+	dst.entries = staged
+	return nil
+}
+
+func duplicateCollectionNames(
+	ordered []NamedCollection, collection *Collection,
+) (first, second string) {
+	for i := range ordered {
+		if ordered[i].Collection != collection {
+			continue
+		}
+		if first == "" {
+			first = ordered[i].Name
+			continue
+		}
+		return first, ordered[i].Name
+	}
+	return first, second
+}
+
+func (s *DatabaseSnapshot) prepareSnapshotEntries(
+	count int,
+) []databaseSnapshotEntry {
+	if len(s.storage) < count {
+		s.storage = slices.Grow(s.storage, count-len(s.storage))
+		s.storage = s.storage[:count]
+	}
+	return s.storage[:count]
+}
+
+func (s *DatabaseSnapshot) clearSnapshotCollectionScratch() {
+	clear(s.ordered)
+	s.ordered = s.ordered[:0]
+	clear(s.gateOrder)
+	s.gateOrder = s.gateOrder[:0]
+}
+
+func closeDatabaseSnapshotEntries(entries []databaseSnapshotEntry) error {
+	var first error
+	for i := range entries {
+		if entries[i].snapshot != nil {
+			if err := entries[i].snapshot.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+		entries[i].snapshot = nil
+	}
+	return first
+}
+
 // Snapshot captures every cataloged collection at one instant, acquiring one
 // generation lease per collection. The caller must Close the result.
 //
@@ -306,9 +613,9 @@ func (d *Database) Snapshot() (DatabaseSnapshot, error) {
 }
 
 // SnapshotInto is [Database.Snapshot] writing into caller-owned storage,
-// reusing dst's entry slice. It is the form a query loop uses: the per-call
-// cost drops to one *Snapshot per collection, which is what a single-collection
-// [Collection.Snapshot] already costs, rather than that plus a fresh catalog.
+// reusing dst's entry bank and one Snapshot object per collection. It is the
+// form a query loop uses: after the destination reaches the catalog's high-water
+// size, taking and closing a stable catalog allocates nothing.
 //
 // dst is closed first if it holds a previous capture, because silently
 // overwriting it would leak that capture's leases — and a leaked lease does not
@@ -345,6 +652,16 @@ func (d *Database) SnapshotInto(dst *DatabaseSnapshot) error {
 	// see seizeSnapshotCut for why the two must interleave to keep the cut from
 	// skewing. Handle order rather than name order is what lets a capture that
 	// overlaps a caller-owned SnapshotCollections avoid the opposite lock order.
+	staged := dst.prepareSnapshotEntries(len(d.order))
+	for i, source := range d.order {
+		entry := &staged[i]
+		entry.name = source.name
+		entry.snapshot = nil
+		if entry.storage == nil {
+			entry.storage = new(Snapshot)
+		}
+	}
+
 	hold, err := seizeSnapshotCut(d.snapshotOrder)
 	if err != nil {
 		return err
@@ -354,21 +671,18 @@ func (d *Database) SnapshotInto(dst *DatabaseSnapshot) error {
 	// Phase 3 — pin every member's state and acquire its lease with every gate
 	// held at once, so the captured generations are a set that genuinely
 	// coexisted: no member could publish between the first pin and the last.
-	for _, entry := range d.order {
-		snapshot, err := entry.collection.snapshotGateHeld()
+	for i, source := range d.order {
+		entry := &staged[i]
+		err := source.collection.snapshotGateHeldInto(entry.storage)
 		if err != nil {
 			// A partial capture must pin nothing. The gates are still held, so
 			// releasing here cannot race a reclaimer that is waiting on them.
-			for i := range dst.entries {
-				_ = dst.entries[i].snapshot.Close()
-			}
-			dst.entries = dst.entries[:0]
+			_ = closeDatabaseSnapshotEntries(staged)
 			return err
 		}
-		dst.entries = append(dst.entries, databaseSnapshotEntry{
-			name: entry.name, snapshot: snapshot,
-		})
+		entry.snapshot = entry.storage
 	}
+	dst.entries = staged
 	return nil
 }
 
@@ -383,9 +697,36 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	if c == nil {
 		return nil, ErrClosed
 	}
+	snapshot := new(Snapshot)
+	if err := c.snapshotGateHeldFreshInto(snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+// snapshotGateHeldInto is snapshotGateHeld using reusable caller-owned
+// Snapshot storage. The caller holds the collection's publication gate and
+// writer lock as part of a multi-collection cut.
+func (c *Collection) snapshotGateHeldInto(snapshot *Snapshot) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if snapshot == nil {
+		return fmt.Errorf("vibedb: snapshot capture requires non-nil storage")
+	}
+	if err := snapshot.Close(); err != nil {
+		return err
+	}
+	snapshot.once = sync.Once{}
+	return c.snapshotGateHeldFreshInto(snapshot)
+}
+
+// snapshotGateHeldFreshInto binds unowned storage. The caller has already
+// validated/reset the destination and holds the multi-collection cut.
+func (c *Collection) snapshotGateHeldFreshInto(snapshot *Snapshot) error {
 	state, stateErr := c.readerFileState()
 	if stateErr != nil {
-		return nil, stateErr
+		return stateErr
 	}
 	// The catalog and epoch pointer must come from one publication generation,
 	// exactly as in pinSnapshot. Online CREATE INDEX replaces both under
@@ -397,15 +738,17 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	primaryRouter := c.primaryRouter.Load()
 	lease, err := c.leases.Acquire(state.root.Generation)
 	if err != nil {
-		return nil, publicReaderLeaseError(err)
+		return publicReaderLeaseError(err)
 	}
-	return &Snapshot{
-		collection: c, state: state,
-		primaryRouter: primaryRouter,
-		indexes:       indexes, indexNameIDs: indexNameIDs,
-		indexDefinitions: indexDefinitions,
-		epoch:            epoch, lease: lease,
-	}, nil
+	snapshot.collection = c
+	snapshot.state = state
+	snapshot.primaryRouter = primaryRouter
+	snapshot.indexes = indexes
+	snapshot.indexNameIDs = indexNameIDs
+	snapshot.indexDefinitions = indexDefinitions
+	snapshot.epoch = epoch
+	snapshot.lease = lease
+	return nil
 }
 
 // Collection returns the captured view of name, reporting whether the
@@ -452,18 +795,48 @@ func (s DatabaseSnapshot) All(fn func(name string, snapshot *Snapshot) bool) {
 // losing the second error message.
 //
 // The entry storage is kept so a [Database.SnapshotInto] loop stays warm; only
-// the leases and the captured states are given back.
+// the leases and the captured states are given back. Names, ordering scratch,
+// reusable Snapshot objects, and their scan/index scratch remain at their
+// observed high-water capacities. Call [DatabaseSnapshot.Release] when the
+// destination is leaving a pool or a rare broad capture should not pin that
+// memory.
 func (s *DatabaseSnapshot) Close() error {
 	if s == nil {
 		return nil
 	}
-	var first error
-	for i := range s.entries {
-		if err := s.entries[i].snapshot.Close(); err != nil && first == nil {
-			first = err
-		}
-		s.entries[i].snapshot = nil
-	}
+	first := closeDatabaseSnapshotEntries(s.entries)
 	s.entries = s.entries[:0]
+	return first
+}
+
+// Release closes the capture and drops every destination-owned reusable
+// buffer, name, and Snapshot object. It is idempotent. The zeroed destination
+// remains reusable, but its next capture pays cold allocation costs again.
+//
+// Close is normally preferable in an execution loop because it retains the
+// catalog and each child Snapshot's scan reconstruction buffers. Release is the
+// deterministic memory-lifetime boundary for pool eviction and one-off high
+// cardinality captures.
+func (s *DatabaseSnapshot) Release() error {
+	if s == nil {
+		return nil
+	}
+	first := s.Close()
+	for i := range s.storage {
+		entry := &s.storage[i]
+		if entry.storage != nil {
+			if err := entry.storage.Close(); err != nil && first == nil {
+				first = err
+			}
+			*entry.storage = Snapshot{}
+		}
+		*entry = databaseSnapshotEntry{}
+	}
+	clear(s.ordered)
+	clear(s.gateOrder)
+	s.entries = nil
+	s.storage = nil
+	s.ordered = nil
+	s.gateOrder = nil
 	return first
 }

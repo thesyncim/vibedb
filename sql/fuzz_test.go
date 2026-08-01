@@ -36,6 +36,10 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT a FROM t WHERE m @> {"k": [1, 2, {"n": null}]}`,
 		`SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
 		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
+		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) AS d WHERE d.id = ?`,
+		`WITH active(id) AS MATERIALIZED (SELECT id FROM customers WHERE tier = ?), ` +
+			`selected AS NOT MATERIALIZED (SELECT id FROM active) SELECT id FROM selected WHERE id = ?`,
+		`WITH outer_cte AS (WITH inner_cte AS (SELECT id FROM docs) SELECT id FROM inner_cte) SELECT id FROM outer_cte`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -102,25 +106,78 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		t.Fatal("an accepted statement projects nothing")
 	}
 	if len(s.From) == 0 {
-		t.Fatal("an accepted statement reads no collection")
+		t.Fatal("an accepted statement reads no relation")
+	}
+	seen := 0
+	if s.With != nil {
+		if len(s.With.CTEs) == 0 {
+			t.Fatal("WITH clause has no definitions")
+		}
+		for i := range s.With.CTEs {
+			cte := &s.With.CTEs[i]
+			if cte.Name == "" || cte.Query == nil {
+				t.Fatalf("WITH[%d] has invalid payload: %+v", i, cte)
+			}
+			if len(cte.Columns) != len(cte.ColumnPos) {
+				t.Fatalf("WITH[%d] has %d aliases and %d positions", i, len(cte.Columns), len(cte.ColumnPos))
+			}
+			for prior := 0; prior < i; prior++ {
+				if s.With.CTEs[prior].Name == cte.Name {
+					t.Fatalf("WITH[%d] duplicates name %q", i, cte.Name)
+				}
+			}
+			if cte.ColumnArityDeferred {
+				if cteOutputArityKnown(cte.Query) {
+					t.Fatalf("WITH[%d] deferred a statically known output arity", i)
+				}
+			} else if len(cte.Columns) > len(cte.Query.Columns) {
+				t.Fatalf("WITH[%d] has %d aliases for %d outputs", i, len(cte.Columns), len(cte.Query.Columns))
+			}
+			checkStatementInvariants(t, cte.Query)
+			if cte.Query.ParamBase != seen {
+				t.Fatalf("WITH[%d] ParamBase = %d, want %d", i, cte.Query.ParamBase, seen)
+			}
+			seen += cte.Query.Params
+		}
 	}
 	for i := range s.From {
-		if s.From[i].Alias == "" {
+		ref := &s.From[i]
+		if ref.Alias == "" {
 			t.Fatalf("From[%d] has no range-variable name", i)
 		}
-		if (s.From[i].Join == JoinNone) != (i == 0) {
-			t.Fatalf("From[%d] has join kind %d", i, s.From[i].Join)
+		if (ref.Join == JoinNone) != (i == 0) {
+			t.Fatalf("From[%d] has join kind %d", i, ref.Join)
+		}
+		switch ref.Kind {
+		case RelationCollection:
+			if ref.Name == "" || ref.Query != nil {
+				t.Fatalf("From[%d] has invalid collection payload: %+v", i, ref)
+			}
+		case RelationDerived:
+			if ref.Name != "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || !ref.HasAlias || i != 0 || len(s.From) != 1 {
+				t.Fatalf("From[%d] has invalid derived payload: %+v", i, ref)
+			}
+			checkStatementInvariants(t, ref.Query)
+			if ref.Query.ParamBase != seen {
+				t.Fatalf("From[%d] derived ParamBase = %d, want %d", i, ref.Query.ParamBase, seen)
+			}
+			seen += ref.Query.Params
+		case RelationCTE:
+			if ref.Name == "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || i != 0 || len(s.From) != 1 {
+				t.Fatalf("From[%d] has invalid CTE payload: %+v", i, ref)
+			}
+		default:
+			t.Fatalf("From[%d] has unknown relation kind %d", i, ref.Kind)
 		}
 		if i == 0 {
 			continue
 		}
-		if s.From[i].On == nil {
+		if ref.On == nil {
 			t.Fatalf("From[%d] is a join with no condition", i)
 		}
-		checkPath(t, s, s.From[i].On.Left)
-		checkPath(t, s, s.From[i].On.Right)
+		checkPath(t, s, ref.On.Left)
+		checkPath(t, s, ref.On.Right)
 	}
-	seen := 0
 	for i := range s.Columns {
 		if s.Columns[i].Path == nil {
 			if s.Columns[i].Agg != AggCount {

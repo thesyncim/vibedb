@@ -1091,7 +1091,7 @@ func TestErrorClassification(t *testing.T) {
 		{`CREATE TABLE t (a int)`, sqlstateInternalError},
 		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
 		{`DECLARE c CURSOR FOR SELECT 1`, sqlstateFeatureNotSupported},
-		{`WITH x AS (SELECT 1) SELECT * FROM x`, sqlstateFeatureNotSupported},
+		{`WITH RECURSIVE x AS (SELECT id FROM users) SELECT id FROM x`, sqlstateFeatureNotSupported},
 		{`banana`, sqlstateSyntaxError},
 		{`SET statement_timeout = 100`, sqlstateFeatureNotSupported},
 		{`SET search_path = public`, sqlstateFeatureNotSupported},
@@ -1112,7 +1112,18 @@ func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
 	c := connect(t)
 	for _, tc := range conformance.UnsupportedSQLCases {
 		t.Run(tc.ID, func(t *testing.T) {
-			statement, prepareErr := db.Prepare(tc.Statement)
+			text := tc.Statement
+			reason := tc.ReasonContains
+			if tc.ID == "cte" {
+				// Non-recursive CTE syntax is now part of the bounded frontend.
+				// Keep this cross-adapter taxonomy case on the explicitly
+				// unsupported recursive operator until its fixpoint executor lands.
+				text = `WITH RECURSIVE x AS (` +
+					`SELECT id FROM docs` +
+					`) SELECT id FROM x`
+				reason = "recursive CTEs"
+			}
+			statement, prepareErr := db.Prepare(text)
 			if statement != nil {
 				_ = statement.Close()
 				t.Fatal("database/sql prepared an unsupported statement")
@@ -1122,10 +1133,10 @@ func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
 				t.Fatalf("database/sql error = %T %v, want typed feature refusal",
 					prepareErr, prepareErr)
 			}
-			if !strings.Contains(unsupported.Msg, tc.ReasonContains) {
-				t.Fatalf("database/sql reason = %q, want %q", unsupported.Msg, tc.ReasonContains)
+			if !strings.Contains(unsupported.Msg, reason) {
+				t.Fatalf("database/sql reason = %q, want %q", unsupported.Msg, reason)
 			}
-			fields := expectError(t, c.query(tc.Statement), sqlstateFeatureNotSupported)
+			fields := expectError(t, c.query(text), sqlstateFeatureNotSupported)
 			if fields['M'] != unsupported.Msg {
 				t.Fatalf("pgwire reason = %q, database/sql reason = %q",
 					fields['M'], unsupported.Msg)
@@ -2213,18 +2224,20 @@ func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
 		srv.opts.WriteTimeout != DefaultWriteTimeout ||
 		srv.opts.IdleTimeout != DefaultIdleTimeout ||
 		srv.opts.MaxResultRows != DefaultMaxResultRows ||
-		srv.opts.MaxResultBytes != DefaultMaxResultBytes {
+		srv.opts.MaxResultBytes != DefaultMaxResultBytes ||
+		srv.opts.MaxIntermediateBytes != DefaultMaxIntermediateBytes {
 		t.Fatalf("zero resource fields did not select finite defaults: %+v", srv.opts)
 	}
 
 	unbounded, err := NewServer(database, Options{
-		Auth:           Trust(),
-		MaxConnections: UnlimitedConnections,
-		ReadTimeout:    -1,
-		WriteTimeout:   -1,
-		IdleTimeout:    -1,
-		MaxResultRows:  UnlimitedResults,
-		MaxResultBytes: UnlimitedResults,
+		Auth:                 Trust(),
+		MaxConnections:       UnlimitedConnections,
+		ReadTimeout:          -1,
+		WriteTimeout:         -1,
+		IdleTimeout:          -1,
+		MaxResultRows:        UnlimitedResults,
+		MaxResultBytes:       UnlimitedResults,
+		MaxIntermediateBytes: UnlimitedResults,
 	})
 	if err != nil {
 		t.Fatalf("explicit opt-outs: %v", err)
@@ -2233,8 +2246,14 @@ func TestNewServerRequiresAuthenticationAndAppliesFiniteDefaults(t *testing.T) {
 	if unbounded.opts.MaxConnections != UnlimitedConnections ||
 		unbounded.opts.ReadTimeout != 0 ||
 		unbounded.opts.WriteTimeout != 0 ||
-		unbounded.opts.IdleTimeout != 0 {
+		unbounded.opts.IdleTimeout != 0 ||
+		unbounded.opts.MaxIntermediateBytes != UnlimitedResults {
 		t.Fatalf("explicit unbounded settings were not preserved: %+v", unbounded.opts)
+	}
+	if invalid, err := NewServer(database, Options{
+		Auth: Trust(), MaxIntermediateBytes: -2,
+	}); err == nil || invalid != nil {
+		t.Fatalf("invalid intermediate limit = (%v, %v), want (nil, error)", invalid, err)
 	}
 }
 

@@ -23,6 +23,7 @@ const (
 	sourceFileOverlay
 	sourceDatabase
 	sourceFileDatabase
+	sourceRelationSpool
 )
 
 // A Source is the collection a compiled query runs over. Construct one with
@@ -72,6 +73,13 @@ func (s Source) subquerySource(outer, collection string) (Source, error) {
 // execution, and projected result cells borrow its bytes.
 func FromSegment(s *store.Segment) Source {
 	return Source{kind: sourceSegment, payload: unsafe.Pointer(s)}
+}
+
+// fromRelationSpool binds the private statement-owned columnar relation
+// source. It is intentionally unexported: callers cannot provide the lifetime
+// and ownership guarantees Statement establishes before returning this handle.
+func fromRelationSpool(s *relationSpool) Source {
+	return Source{kind: sourceRelationSpool, payload: unsafe.Pointer(s)}
 }
 
 // FromSnapshot names an immutable heap [store.Snapshot]. Declared exact
@@ -361,7 +369,7 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 	}
 	e.Workspace.heapWorkParent = nil
 	switch src.kind {
-	case sourceSegment, sourceHeapSnapshot, sourceDatabase:
+	case sourceSegment, sourceHeapSnapshot, sourceDatabase, sourceRelationSpool:
 		memoryBytes, limitErr := normalizeHeapMemoryBytes(e.Options)
 		if limitErr != nil {
 			return limitErr
@@ -382,6 +390,16 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 		}
 		e.Stats = ExecStats{}
 		return p.runInto(&e.Result, docs, &e.Workspace, e.Options.Workers)
+	case sourceRelationSpool:
+		spool := (*relationSpool)(src.payload)
+		if spool == nil {
+			return fmt.Errorf("query: relation spool source is nil")
+		}
+		if err := rejectJoins(p, "relation spool"); err != nil {
+			return err
+		}
+		e.Stats = ExecStats{}
+		return p.runRelationInto(&e.Result, spool, &e.Workspace)
 	case sourceHeapSnapshot:
 		if err := rejectJoins(p, "FromSnapshot"); err != nil {
 			return err

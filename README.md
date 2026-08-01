@@ -165,7 +165,10 @@ catalog, err := vibedriver.Open("example.vdb")
 if err != nil { log.Fatal(err) }
 defer catalog.Close()
 
-srv, err := pgwire.NewServer(catalog, pgwire.Options{Auth: pgwire.Trust()})
+srv, err := pgwire.NewServer(catalog, pgwire.Options{
+	Auth:                 pgwire.Trust(),
+	MaxIntermediateBytes: 64 << 20,
+})
 if err != nil { log.Fatal(err) }
 ln, err := net.Listen("tcp", "127.0.0.1:5433")
 if err != nil { log.Fatal(err) }
@@ -174,8 +177,9 @@ go func() { log.Print(srv.Serve(ln)) }()
 
 pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
 parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
-`SELECT`, uncorrelated predicate subqueries, inner, left, and right joins, prepared
-statements, and explicit transactions. Stock
+`SELECT`, non-recursive SELECT-valued CTEs with materialization policy,
+uncorrelated predicate subqueries, sole-source derived tables, inner, left, and
+right joins, prepared statements, and explicit transactions. Stock
 `psql` can connect and issue the same supported direct SQL. Whole-document
 parameters are described as PostgreSQL `json`; projected JSON values preserve
 their exact wire spelling. `INSERT ... RETURNING`, `UPDATE ... RETURNING`, and

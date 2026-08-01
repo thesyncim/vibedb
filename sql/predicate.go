@@ -1,5 +1,7 @@
 package sql
 
+import "errors"
+
 // The predicate grammar.
 //
 // Precedence, loosest to tightest:
@@ -146,7 +148,7 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	switch {
 	case p.tok.kind == tokLParen:
 		p.advance()
-		if p.atKeyword(kwSelect) {
+		if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
 			return nil, p.errHere("a SELECT subquery cannot stand alone as a condition; use EXISTS (SELECT ...)")
 		}
 		inner, err := p.parseOr(ctx)
@@ -243,7 +245,7 @@ func (p *Parser) parseLeafTail(agg AggKind, path *PathExpr, pos int) (*Expr, err
 	p.advance()
 	if p.tok.kind == tokLParen {
 		p.advance()
-		if p.atKeyword(kwSelect) {
+		if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
 			sub, err := p.parseSubquery(false)
 			if err != nil {
 				return nil, err
@@ -315,7 +317,7 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 	if err := p.expect(tokLParen, "'(' after IN"); err != nil {
 		return nil, err
 	}
-	if p.atKeyword(kwSelect) {
+	if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
 		sub, err := p.parseSubquery(false)
 		if err != nil {
 			return nil, err
@@ -361,6 +363,9 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 // the shape remains allocation-free.
 func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	start := p.tok.pos
+	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
+		return nil, p.errHere("expected SELECT or WITH ... SELECT in a subquery")
+	}
 	if p.nesting >= maxSubqueryDepth {
 		return nil, p.errfAt(start,
 			"subqueries nest deeper than %d levels", maxSubqueryDepth)
@@ -397,16 +402,11 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	p.nested.used++
 	child.cancel = p.cancel
 	sub := &child.sel
-	child.existsProjection = exists
-	child.nesting = p.nesting + 1
-	if err := child.Parse(sub, p.lx.src[start:end]); err != nil {
-		child.existsProjection = false
-		if pe, ok := err.(*ParseError); ok {
-			return nil, newParseError(p.lx.src, start+pe.Pos, pe.Msg)
-		}
-		return nil, err
+	if err := child.parseSelectText(
+		sub, p.lx.src[start:end], &p.activeCTEs, p.nesting+1, exists,
+	); err != nil {
+		return nil, p.rebaseSubqueryError(err, start)
 	}
-	child.existsProjection = false
 	if p.params+sub.Params > maxParams {
 		return nil, p.errfAt(start, "a statement may hold at most %d placeholders", maxParams)
 	}
@@ -417,13 +417,65 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	return sub, nil
 }
 
+// rebaseSubqueryError moves a child parser's source-relative position into the
+// containing statement while preserving its semantic error class. In
+// particular, a valid-but-unsupported construct inside a nested SELECT must
+// remain a FeatureNotSupportedError so protocol adapters can still map it to
+// SQLSTATE 0A000 without matching prose.
+func (p *Parser) rebaseSubqueryError(err error, start int) error {
+	var duplicate *DuplicateCTEError
+	if errors.As(err, &duplicate) {
+		return newDuplicateCTEError(
+			p.lx.src, start+duplicate.Pos, duplicate.Name,
+			start+duplicate.FirstPos,
+		)
+	}
+	var arity *CTEColumnAliasArityError
+	if errors.As(err, &arity) {
+		return newCTEColumnAliasArityError(
+			p.lx.src, start+arity.Pos, arity.Name,
+			arity.Aliases, arity.Outputs,
+		)
+	}
+	var unsupported *FeatureNotSupportedError
+	if errors.As(err, &unsupported) {
+		return newFeatureNotSupportedError(
+			p.lx.src, start+unsupported.Pos, unsupported.Msg,
+		)
+	}
+	var parse *ParseError
+	if errors.As(err, &parse) {
+		return newParseError(p.lx.src, start+parse.Pos, parse.Msg)
+	}
+	return err
+}
+
 func shiftSelectPositions(s *SelectStmt, delta int) {
+	if s.With != nil {
+		s.With.Pos += delta
+		for i := range s.With.CTEs {
+			s.With.CTEs[i].Pos += delta
+			for j := range s.With.CTEs[i].ColumnPos {
+				s.With.CTEs[i].ColumnPos[j] += delta
+			}
+			if s.With.CTEs[i].HintPos >= 0 {
+				s.With.CTEs[i].HintPos += delta
+			}
+			shiftSelectPositions(s.With.CTEs[i].Query, delta)
+		}
+	}
 	for i := range s.Columns {
 		s.Columns[i].Pos += delta
 		shiftPathPosition(s.Columns[i].Path, delta)
 	}
 	for i := range s.From {
 		s.From[i].Pos += delta
+		if s.From[i].Kind == RelationDerived && s.From[i].Query != nil {
+			shiftSelectPositions(s.From[i].Query, delta)
+		}
+		if s.From[i].UnresolvedCTE.Kind != CTEReferenceNone {
+			s.From[i].UnresolvedCTE.DefinitionPos += delta
+		}
 		if s.From[i].On != nil {
 			s.From[i].On.Pos += delta
 			shiftPathPosition(s.From[i].On.Left, delta)

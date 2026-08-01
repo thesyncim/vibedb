@@ -87,17 +87,23 @@ type Parser struct {
 	paths chunkArena[PathExpr] // path nodes
 	segs  chunkArena[Segment]  // path segment runs
 	conds chunkArena[JoinCond] // join conditions
+	ctes  chunkArena[CommonTableExpr]
+	names chunkArena[string] // CTE output-name runs
+	ints  chunkArena[int]    // CTE output-name position runs
 
 	// Reused whole-clause slices. Unlike the arenas these hold no interior
 	// pointers into themselves, so a plain reslice-to-zero is enough.
-	columns  []ResultColumn
-	from     []TableRef
-	groupBy  []*PathExpr
-	orderBy  []OrderTerm
-	rows     []InsertRow
-	cols     []ColumnDef
-	keyPaths []*PathExpr
-	idxPaths []*PathExpr
+	columns            []ResultColumn
+	from               []TableRef
+	groupBy            []*PathExpr
+	orderBy            []OrderTerm
+	rows               []InsertRow
+	cols               []ColumnDef
+	keyPaths           []*PathExpr
+	idxPaths           []*PathExpr
+	cteScratch         []CommonTableExpr
+	cteNameScratch     []string
+	cteAliasPosScratch []int
 
 	// The statement bodies [Parser.ParseStatement] hands back by pointer. They
 	// are fields rather than arena allocations because there is exactly one of
@@ -107,6 +113,7 @@ type Parser struct {
 	// the synthetic SELECT an UPDATE or a DELETE selects its rows with; see
 	// parse_dml.go.
 	sel       SelectStmt
+	with      WithClause
 	returning SelectStmt
 	ins       InsertStmt
 	upd       UpdateStmt
@@ -151,9 +158,20 @@ type Parser struct {
 	// constant-expression executor for a value that is discarded.
 	existsProjection bool
 	nesting          int
+	outerCTEs        *cteScope
+	activeCTEs       cteScope
 
 	params int
 	sized  bool
+}
+
+// A cteScope is parse-time-only lexical state. Relation nodes retain the
+// matched definition query pointer, so no AST borrows this chain after parsing
+// completes. Values live in Parser fields to keep nested warmed parses free of
+// scope-object allocations.
+type cteScope struct {
+	defs  []CommonTableExpr
+	outer *cteScope
 }
 
 // A pendingPath is a path whose leading identifier has been read but not yet
@@ -174,10 +192,26 @@ type pendingPath struct {
 // Parse parses one SELECT statement into dst, reusing p's storage. See
 // [Parser] for the lifetime dst inherits.
 func (p *Parser) Parse(dst *SelectStmt, src string) error {
+	return p.parseSelectText(dst, src, nil, 0, false)
+}
+
+// parseSelectText is Parse with the lexical context a nested SELECT inherits.
+// Keeping the context explicit prevents a child Parser retained for warm reuse
+// from leaking an old parent's CTE scope into a later parse.
+func (p *Parser) parseSelectText(
+	dst *SelectStmt,
+	src string,
+	outer *cteScope,
+	nesting int,
+	existsProjection bool,
+) error {
 	*dst = SelectStmt{}
 	if err := validateStatementText(src, p.cancel); err != nil {
 		return err
 	}
+	p.outerCTEs = outer
+	p.nesting = nesting
+	p.existsProjection = existsProjection
 	p.reset(src)
 	p.out = dst
 	if err := p.parseStatement(); err != nil {
@@ -294,6 +328,9 @@ func (p *Parser) reset(src string) {
 		p.paths.first = 8
 		p.segs.first = 16
 		p.conds.first = 4
+		p.ctes.first = 4
+		p.names.first = 8
+		p.ints.first = 8
 		p.sized = true
 	}
 	p.text.rewind()
@@ -303,6 +340,9 @@ func (p *Parser) reset(src string) {
 	p.paths.rewind()
 	p.segs.rewind()
 	p.conds.rewind()
+	p.ctes.rewind()
+	p.names.rewind()
+	p.ints.rewind()
 
 	p.columns = p.columns[:0]
 	p.from = p.from[:0]
@@ -312,11 +352,15 @@ func (p *Parser) reset(src string) {
 	p.cols = p.cols[:0]
 	p.keyPaths = p.keyPaths[:0]
 	p.idxPaths = p.idxPaths[:0]
+	p.cteScratch = p.cteScratch[:0]
+	p.cteNameScratch = p.cteNameScratch[:0]
+	p.cteAliasPosScratch = p.cteAliasPosScratch[:0]
 	p.segScratch = p.segScratch[:0]
 	p.kidStack = p.kidStack[:0]
 	p.opScratch = p.opScratch[:0]
 	p.pending = p.pending[:0]
 	p.returning = SelectStmt{}
+	p.with = WithClause{}
 	p.filterColumns = p.filterColumns[:0]
 	p.filterFrom = p.filterFrom[:0]
 	p.filterGroupBy = p.filterGroupBy[:0]
@@ -333,6 +377,7 @@ func (p *Parser) reset(src string) {
 	}
 	p.depth = 0
 	p.params = 0
+	p.activeCTEs = cteScope{outer: p.outerCTEs}
 	p.advance()
 }
 
@@ -475,6 +520,19 @@ func (p *Parser) internToken(t token) string {
 // --- statement -------------------------------------------------------------
 
 func (p *Parser) parseStatement() error {
+	hasWith := p.atKeyword(kwWith)
+	if hasWith {
+		if err := p.parseWithClause(); err != nil {
+			return err
+		}
+		switch {
+		case p.atKeyword(kwInsert), p.atKeyword(kwUpdate), p.atKeyword(kwDelete), p.atKeyword(kwMerge):
+			return newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"data-modifying WITH statements are not supported; the primary statement must be SELECT",
+			)
+		}
+	}
 	if err := p.expectSelect(); err != nil {
 		return err
 	}
@@ -787,6 +845,20 @@ func (p *Parser) parseFrom() error {
 // parseJoin parses one JOIN clause, reporting true when the next token does not
 // open one.
 func (p *Parser) parseJoin() (bool, error) {
+	if len(p.from) > 0 && (p.from[0].Kind == RelationDerived || p.from[0].Kind == RelationCTE) {
+		switch p.tok.kw {
+		case kwJoin, kwInner, kwLeft, kwRight, kwFull, kwOuter, kwCross, kwNatural:
+			relation := "a derived table"
+			if p.from[0].Kind == RelationCTE {
+				relation = "a common table expression"
+			}
+			return false, newFeatureNotSupportedError(
+				p.lx.src,
+				p.tok.pos,
+				"joining "+relation+" is not supported yet: use it as the sole FROM relation",
+			)
+		}
+	}
 	join := JoinInner
 	switch {
 	case p.acceptKeyword(kwLeft):
@@ -890,6 +962,13 @@ func (p *Parser) boundPath(path *PathExpr, source int) *PathExpr {
 
 func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	ref := TableRef{Join: join, Pos: p.tok.pos}
+	if p.atKeyword(kwLateral) {
+		return ref, newFeatureNotSupportedError(
+			p.lx.src,
+			p.tok.pos,
+			"LATERAL derived tables are not supported: derived FROM queries are uncorrelated and execute once",
+		)
+	}
 	switch p.tok.kind {
 	case tokIdent:
 		if err := p.checkNameable("a collection name"); err != nil {
@@ -897,7 +976,7 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 		}
 	case tokQuotedIdent:
 	case tokLParen:
-		return ref, p.errHere("subqueries are not supported: the engine executes one plan over declared collections")
+		return p.parseDerivedTableRef(ref)
 	default:
 		return ref, p.errHere("expected a collection name")
 	}
@@ -920,12 +999,104 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	if ref.HasAlias {
 		ref.Alias = alias
 	}
-	for i := range p.from {
-		if p.from[i].Alias == ref.Alias {
-			return ref, p.errfAt(ref.Pos, "range variable %q is declared twice; give one of them a distinct AS alias", ref.Alias)
+	if definition := p.lookupCTE(ref.Name); definition != nil {
+		ref.Kind = RelationCTE
+		ref.Query = definition.Query
+		if ref.Join != JoinNone {
+			return ref, newFeatureNotSupportedError(
+				p.lx.src, ref.Pos,
+				"a common table expression is not supported in a JOIN position yet: use it as the sole FROM relation",
+			)
 		}
 	}
-	return ref, nil
+	return ref, p.rejectDuplicateRangeAlias(ref)
+}
+
+// parseDerivedTableRef parses the parenthesized SELECT of a derived relation.
+// The nested statement uses the same child-parser path as predicate subqueries,
+// which preserves independent FROM scope, arena ownership, nesting limits,
+// cancellation, position rebasing, and placeholder accounting in one place.
+func (p *Parser) parseDerivedTableRef(ref TableRef) (TableRef, error) {
+	if ref.Join != JoinNone {
+		return ref, newFeatureNotSupportedError(
+			p.lx.src,
+			ref.Pos,
+			"a derived table is not supported in a JOIN position yet: use it as the sole FROM relation",
+		)
+	}
+	p.advance() // consume '('
+	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
+		return ref, p.errHere("expected SELECT after '(' in a derived table, optionally preceded by WITH definitions")
+	}
+	query, err := p.parseSubquery(false)
+	if err != nil {
+		return ref, err
+	}
+	alias, err := p.parseTableAlias()
+	if err != nil {
+		return ref, err
+	}
+	if alias == "" {
+		return ref, p.errHere("a derived table requires a non-empty alias, written AS alias or directly after ')'")
+	}
+	if p.tok.kind == tokLParen {
+		return ref, p.rejectDerivedColumnAliasList()
+	}
+	ref.Kind = RelationDerived
+	ref.Query = query
+	ref.Alias = alias
+	ref.HasAlias = true
+	return ref, p.rejectDuplicateRangeAlias(ref)
+}
+
+// rejectDerivedColumnAliasList distinguishes a valid-but-unsupported SQL
+// column alias list from malformed punctuation. Refusing immediately at the
+// opening parenthesis would turn d(), d(id,), and d(id name) into 0A000 even
+// though those inputs are not valid instances of the feature. Walking this
+// small grammar first keeps protocol classification honest and retains the
+// same clause-item bound used by accepted identifier lists.
+func (p *Parser) rejectDerivedColumnAliasList() error {
+	pos := p.tok.pos
+	p.advance() // consume '('
+	items := 0
+	for {
+		switch p.tok.kind {
+		case tokError:
+			return p.errHere(p.tok.text)
+		case tokIdent, tokQuotedIdent:
+			if p.tok.text == "" {
+				return p.errHere("a derived-table column alias may not be empty")
+			}
+		default:
+			return p.errHere("expected a column name in the derived-table alias list")
+		}
+		items++
+		if items > maxClauseItems {
+			return p.errfAt(pos,
+				"a derived-table alias list may hold at most %d columns", maxClauseItems)
+		}
+		p.advance()
+		if p.tok.kind == tokRParen {
+			return newFeatureNotSupportedError(
+				p.lx.src,
+				pos,
+				"derived-table column alias lists are not supported yet; name each inner SELECT output with AS instead",
+			)
+		}
+		if p.tok.kind != tokComma {
+			return p.errHere("expected ',' or ')' after a derived-table column alias")
+		}
+		p.advance()
+	}
+}
+
+func (p *Parser) rejectDuplicateRangeAlias(ref TableRef) error {
+	for i := range p.from {
+		if p.from[i].Alias == ref.Alias {
+			return p.errfAt(ref.Pos, "range variable %q is declared twice; give one of them a distinct AS alias", ref.Alias)
+		}
+	}
+	return nil
 }
 
 // parseTableAlias parses an optional table alias, with or without AS. Unlike a

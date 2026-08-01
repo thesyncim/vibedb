@@ -18,6 +18,13 @@ package sql
 
 // A SelectStmt is one parsed SELECT statement.
 type SelectStmt struct {
+	// With holds the non-recursive common-table-expression definitions visible
+	// to this SELECT, or nil when the statement has no WITH clause. Definitions
+	// stay in source order because that is both placeholder order and lexical
+	// visibility order: a body sees earlier siblings, never itself or a later
+	// sibling.
+	With *WithClause
+
 	// Columns is the SELECT list in source order.
 	Columns []ResultColumn
 
@@ -26,7 +33,7 @@ type SelectStmt struct {
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
 
-	// From holds the range variables. From[0] is the FROM collection; each
+	// From holds the range variables. From[0] is the driving relation; each
 	// later entry is a JOIN, in source order, and carries its own ON
 	// condition. Every [PathExpr] in the statement names one of these by
 	// index, so a lowering pass never has to re-resolve a name.
@@ -70,6 +77,46 @@ type SelectStmt struct {
 	ParamBase int
 }
 
+// A WithClause owns the non-recursive common table expressions declared for
+// one SELECT. Its definitions and strings are backed by the Parser's arenas
+// and obey the same borrowed-lifetime contract as the rest of the AST.
+type WithClause struct {
+	CTEs []CommonTableExpr
+	// Pos is the byte offset of WITH.
+	Pos int
+}
+
+// CTEMaterialization records the optimization-boundary spelling attached to a
+// common table expression. It is policy, not execution state: the lowerer is
+// responsible for proving when a body can be fused safely.
+type CTEMaterialization uint8
+
+const (
+	CTEMaterializationDefault CTEMaterialization = iota
+	CTEMaterialized
+	CTENotMaterialized
+)
+
+// A CommonTableExpr is one WITH definition.
+type CommonTableExpr struct {
+	Name string
+	// Columns optionally replaces the body's output names positionally. A
+	// shorter list is legal; unmentioned outputs keep their derived names.
+	Columns   []string
+	ColumnPos []int
+	// ColumnArityDeferred is true when a wildcard makes the body's expanded
+	// output count runtime-dependent. In that case a catalog/runtime binder
+	// checks Columns against the materialized schema; the parser must not infer
+	// arity from len(Query.Columns).
+	ColumnArityDeferred bool
+	Query               *SelectStmt
+	Materialization     CTEMaterialization
+	// Pos is the byte offset of Name. HintPos is the byte offset of
+	// MATERIALIZED or NOT, or -1 when no policy was written.
+	Pos     int
+	HintPos int
+}
+
 // A JoinKind names a join's flavour.
 type JoinKind uint8
 
@@ -86,14 +133,72 @@ const (
 	JoinRight
 )
 
-// A TableRef is one range variable: a collection, the name paths use to
-// qualify against it, and, for a joined collection, its equi-join condition.
+// A RelationKind identifies the row source behind a range variable.
+type RelationKind uint8
+
+const (
+	// RelationCollection is a physical collection. It is the zero value so
+	// every existing TableRef literal remains a collection unless it opts into
+	// another relation shape explicitly.
+	RelationCollection RelationKind = iota
+	// RelationDerived is an uncorrelated SELECT materialized as a relation.
+	// [TableRef.Query] holds the nested statement and [TableRef.Alias] is
+	// mandatory. Correlated execution is deliberately a different future kind:
+	// a lowerer must never infer LATERAL semantics from this value.
+	RelationDerived
+	// RelationCTE is a reference to a lexically visible common table
+	// expression. [TableRef.Query] points at the exact definition body, giving
+	// lowerers stable identity without a name lookup or per-reference object.
+	RelationCTE
+)
+
+// CTEReferenceKind classifies a physical-looking relation reference that may
+// instead be an illegal self or forward CTE reference if catalog lookup fails.
+// The parser cannot reject it outright: in
+//
+//	WITH users AS (SELECT * FROM users) SELECT * FROM users
+//
+// the body legally reads a physical collection named users when one exists.
+// A catalog-aware binder resolves [TableRef.Name] physically first, then uses
+// this metadata for a positioned undefined-relation diagnostic if it does not.
+type CTEReferenceKind uint8
+
+const (
+	CTEReferenceNone CTEReferenceKind = iota
+	CTEReferenceSelf
+	CTEReferenceForward
+)
+
+// CTEReferenceMetadata describes a deferred self/forward CTE candidate.
+type CTEReferenceMetadata struct {
+	Kind CTEReferenceKind
+	// DefinitionPos is the byte offset of the matching CTE definition.
+	DefinitionPos int
+}
+
+// A TableRef is one range variable: a physical collection or derived query,
+// the name paths use to qualify against it, and, for a joined relation, its
+// equi-join condition.
 type TableRef struct {
-	// Name is the collection named in the statement.
+	// Kind discriminates the relation payload. Its zero value is
+	// RelationCollection for source compatibility with physical-table ASTs.
+	Kind RelationKind
+	// Name is the physical collection or visible CTE name written in the
+	// statement. It is empty for RelationDerived; lowerers must switch on Kind
+	// rather than treating an empty collection name as meaningful.
 	Name string
+	// Query is the nested SELECT for RelationDerived, the stable definition
+	// identity for RelationCTE, and nil for RelationCollection. A derived query
+	// has its own source scope and parser arena, and is uncorrelated by
+	// construction.
+	Query *SelectStmt
+	// UnresolvedCTE is non-zero only on a RelationCollection that shares a name
+	// with its enclosing CTE or a later sibling. Catalog-aware binding uses it
+	// only after physical collection lookup fails.
+	UnresolvedCTE CTEReferenceMetadata
 	// Alias is the name paths qualify with. It is the explicit AS alias when
-	// the statement gave one and Name otherwise, so resolution has a single
-	// key to compare against and never has to consider two.
+	// the statement gave one and Name otherwise. Derived relations always have
+	// an explicit, non-empty alias.
 	Alias string
 	// HasAlias records whether Alias was written explicitly, purely so a
 	// diagnostic can echo the statement back accurately.
@@ -105,7 +210,8 @@ type TableRef struct {
 	// one, whichever order the statement wrote them in, so the build and probe
 	// sides are already sorted out.
 	On *JoinCond
-	// Pos is the byte offset of the collection name.
+	// Pos is the byte offset where the relation begins: the collection name or
+	// a derived query's opening parenthesis.
 	Pos int
 }
 

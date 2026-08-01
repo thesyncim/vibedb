@@ -1,6 +1,7 @@
 package query
 
 import (
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -68,7 +69,16 @@ type explainPlan struct {
 	Aggregate     bool              `json:"aggregate,omitempty"`
 	SingleRow     bool              `json:"single_row,omitempty"`
 	Joins         []explainJoin     `json:"joins,omitempty"`
+	CTEs          []explainCTE      `json:"ctes,omitempty"`
 	Analyze       *explainAnalyze   `json:"analyze,omitempty"`
+}
+
+type explainCTE struct {
+	Name        string `json:"name"`
+	Mode        string `json:"mode"`
+	Reason      string `json:"reason"`
+	References  int    `json:"references"`
+	Evaluations uint64 `json:"evaluations,omitempty"`
 }
 
 type explainJoin struct {
@@ -88,7 +98,7 @@ type explainPredicate struct {
 }
 
 func (p *plan) explainJSON(collection string, outputCount int, options ExplainOptions) (string, error) {
-	return p.explainJSONAnalysis(collection, outputCount, options, nil)
+	return p.explainJSONAnalysis(collection, outputCount, options, nil, nil)
 }
 
 type explainAnalyze struct {
@@ -168,6 +178,7 @@ func (p *plan) explainJSONAnalysis(
 	outputCount int,
 	options ExplainOptions,
 	analysis *ExplainAnalysis,
+	ctes []explainCTE,
 ) (string, error) {
 	plan := explainPlan{
 		Node:          "scan",
@@ -178,6 +189,7 @@ func (p *plan) explainJSONAnalysis(
 		LateColumns:   explainColumns(p.valuePaths, p.lateCols),
 		Aggregate:     p.hasAggregate,
 		SingleRow:     p.singleRow,
+		CTEs:          ctes,
 		Analyze:       newExplainAnalyze(analysis),
 	}
 	if outputCount < 0 || outputCount > len(p.headers) {
@@ -253,7 +265,7 @@ func (s *Statement) ExplainWith(options ExplainOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.explainJSON(s.Collection(), s.outputs, options)
+	return s.explainJSON(p, options, nil)
 }
 
 // ExplainBound renders the plan after binding args, without opening a source
@@ -276,11 +288,14 @@ func (s *Statement) ExplainBoundWith(args []any, options ExplainOptions) (string
 	if err := s.bind(args); err != nil {
 		return "", err
 	}
+	if err := s.bindFusedExplain(args); err != nil {
+		return "", err
+	}
 	p, err := s.q.compiled()
 	if err != nil {
 		return "", err
 	}
-	return p.explainJSON(s.Collection(), s.outputs, options)
+	return s.explainJSON(p, options, nil)
 }
 
 // ExplainAnalyze renders the current compiled plan with measured execution
@@ -293,7 +308,78 @@ func (s *Statement) ExplainAnalyze(options ExplainOptions, analysis ExplainAnaly
 	if err != nil {
 		return "", err
 	}
-	return p.explainJSONAnalysis(s.Collection(), s.outputs, options, &analysis)
+	return s.explainJSON(p, options, &analysis)
+}
+
+func (s *Statement) explainJSON(
+	p *plan,
+	options ExplainOptions,
+	analysis *ExplainAnalysis,
+) (string, error) {
+	if s.canFuseCTE() {
+		var err error
+		p, err = s.cteReference().def.stmt.q.compiled()
+		if err != nil {
+			return "", err
+		}
+	}
+	return p.explainJSONAnalysis(
+		s.Collection(), s.outputs, options, analysis, s.explainCTEs(),
+	)
+}
+
+func (s *Statement) bindFusedExplain(args []any) error {
+	if !s.canFuseCTE() {
+		return nil
+	}
+	def := s.cteReference().def
+	n := def.stmt.NumParams()
+	if def.argBase < 0 || def.argBase+n > len(args) {
+		return queryExplainError("query: invalid fused CTE placeholder range")
+	}
+	return def.stmt.bind(args[def.argBase : def.argBase+n])
+}
+
+func (s *Statement) explainCTEs() []explainCTE {
+	if s == nil || s.tree == nil || s.tree.With == nil || s.cteCatalog() == nil {
+		return nil
+	}
+	result := make([]explainCTE, 0, len(s.tree.With.CTEs))
+	for i := range s.tree.With.CTEs {
+		definition := &s.tree.With.CTEs[i]
+		def := s.cteCatalog().find(definition.Query)
+		if def == nil {
+			continue
+		}
+		mode, reason := explainCTEMode(def)
+		result = append(result, explainCTE{
+			Name: definition.Name, Mode: mode, Reason: reason,
+			References: def.references, Evaluations: def.runEvaluations,
+		})
+	}
+	return result
+}
+
+func explainCTEMode(def *statementCTE) (string, string) {
+	if def == nil || def.definition == nil {
+		return "unused", "definition is not referenced"
+	}
+	switch def.definition.Materialization {
+	case sqlast.CTEMaterialized:
+		return "materialized", "MATERIALIZED forces one lazy shared evaluation"
+	case sqlast.CTENotMaterialized:
+		return "not-materialized", "NOT MATERIALIZED evaluates each syntactic reference independently"
+	}
+	if def.references == 0 {
+		return "unused", "definition is validated but never evaluated"
+	}
+	if def.references > 1 {
+		return "materialized", "default policy shares a multiply referenced definition"
+	}
+	if def.firstReference != nil && def.firstReference.mode() == cteFused {
+		return "fused", "single safe identity projection is fused into the child plan"
+	}
+	return "reference-local", "single reference retains a semantic materialization boundary"
 }
 
 func explainColumns(paths []compiledPath, columns []int) []string {

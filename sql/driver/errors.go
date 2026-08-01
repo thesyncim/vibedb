@@ -1,6 +1,9 @@
 package driver
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// ErrTableNotFound reports a statement naming a table absent from the SQL
@@ -71,3 +74,32 @@ var (
 	// bounded binding workspace.
 	ErrArgumentsTooLarge = errors.New("vibedb: SQL arguments exceed the execution payload bound")
 )
+
+// tableDependencyError preserves the source location of a physical relation
+// across prepare-time validation and execution-time catalog revalidation. It
+// wraps ErrTableNotFound so database/sql callers retain errors.Is semantics;
+// protocol adapters may use Position without matching message text.
+type tableDependencyError struct {
+	name        string
+	pos         int
+	transaction bool
+}
+
+func (e *tableDependencyError) Error() string {
+	if e.transaction {
+		return fmt.Sprintf(
+			"%v: %q was not present when the transaction began",
+			ErrTableNotFound, e.name,
+		)
+	}
+	return fmt.Sprintf("%v: %q", ErrTableNotFound, e.name)
+}
+
+func (e *tableDependencyError) Unwrap() error { return ErrTableNotFound }
+
+// Position returns the zero-based SQL byte offset of the missing relation.
+func (e *tableDependencyError) Position() int { return e.pos }
+
+func missingTableDependency(name string, pos int, transaction bool) error {
+	return &tableDependencyError{name: name, pos: pos, transaction: transaction}
+}

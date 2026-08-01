@@ -28,6 +28,18 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"subqueries", `SELECT id FROM orders WHERE customer IN (` +
 			`SELECT id FROM customers WHERE tier = ?) AND ` +
 			`EXISTS (SELECT 1 FROM regions WHERE active = TRUE)`},
+		{"derived table", `SELECT d.id FROM (` +
+			`SELECT id FROM customers WHERE tier = ?` +
+			`) AS d WHERE d.id = ?`},
+		{"common table expressions", `WITH active(id) AS MATERIALIZED (` +
+			`SELECT id FROM customers WHERE tier = ?` +
+			`), selected AS NOT MATERIALIZED (` +
+			`SELECT id FROM active WHERE id = ?` +
+			`) SELECT id FROM selected WHERE id = ?`},
+		{"nested and wildcard common table expressions", `WITH outer_cte AS (` +
+			`WITH inner_cte(a, b) AS (SELECT * FROM documents) ` +
+			`SELECT * FROM inner_cte` +
+			`) SELECT * FROM outer_cte`},
 		{"grouped aggregate", benchGrouped},
 		{"containment and membership", benchRich},
 	}
@@ -61,6 +73,9 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 func TestWarmParseOfMixedShapesIsAllocationFree(t *testing.T) {
 	sources := []string{
 		benchSimple, benchFiltered, benchJoin, benchLeftJoin, benchGrouped, benchRich,
+		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) d WHERE d.id = ?`,
+		`WITH active AS (SELECT id FROM customers WHERE tier = ?), ` +
+			`selected AS MATERIALIZED (SELECT id FROM active) SELECT id FROM selected`,
 	}
 	var p Parser
 	var stmt SelectStmt

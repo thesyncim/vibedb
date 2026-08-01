@@ -39,7 +39,11 @@ const (
 	sqlstateDuplicateTable             = "42P07"
 	sqlstateDuplicateObject            = "42710"
 	sqlstateUndefinedObject            = "42704"
+	sqlstateUndefinedColumn            = "42703"
+	sqlstateAmbiguousColumn            = "42702"
 	sqlstateAmbiguousAlias             = "42P09"
+	sqlstateDuplicateAlias             = "42712"
+	sqlstateInvalidColumnReference     = "42P10"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
 	sqlstateFeatureNotSupported        = "0A000"
@@ -53,6 +57,7 @@ const (
 	sqlstateCharacterNotInRepertoire   = "22021"
 	sqlstateNumericValueOutOfRange     = "22003"
 	sqlstateInvalidParameterValue      = "22023"
+	sqlstateCardinalityViolation       = "21000"
 	sqlstateProgramLimitExceeded       = "54000"
 	sqlstateObjectNotInPrereqState     = "55000"
 	sqlstateInternalError              = "XX000"
@@ -160,6 +165,7 @@ func asPGError(err error) *pgError {
 		return already
 	}
 	if errors.Is(err, query.ErrResultBudget) ||
+		errors.Is(err, query.ErrIntermediateBudget) ||
 		errors.Is(err, query.ErrAggregateBudget) ||
 		errors.Is(err, query.ErrJoinPairBudget) ||
 		errors.Is(err, query.ErrWorkBudget) ||
@@ -181,8 +187,14 @@ func asPGError(err error) *pgError {
 	switch {
 	case errors.Is(err, query.ErrCanceled):
 		return queryCanceled()
+	case errors.Is(err, query.ErrCardinalityViolation):
+		return newError(sqlstateCardinalityViolation, err.Error())
 	case errors.Is(err, query.ErrParameterType):
 		return newError(sqlstateDatatypeMismatch, err.Error())
+	case errors.Is(err, query.ErrUndefinedColumn):
+		return newError(sqlstateUndefinedColumn, err.Error())
+	case errors.Is(err, query.ErrAmbiguousColumn):
+		return newError(sqlstateAmbiguousColumn, err.Error())
 	case errors.Is(err, query.ErrInvalidPattern):
 		return newError(sqlstateInvalidParameterValue, err.Error())
 	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
@@ -229,6 +241,18 @@ func asPGError(err error) *pgError {
 	if errors.As(err, &unsupported) {
 		return newError(sqlstateFeatureNotSupported, unsupported.Msg)
 	}
+	var duplicateCTE *sqlast.DuplicateCTEError
+	if errors.As(err, &duplicateCTE) {
+		return newError(sqlstateDuplicateAlias, duplicateCTE.Msg)
+	}
+	var cteAliasArity *sqlast.CTEColumnAliasArityError
+	if errors.As(err, &cteAliasArity) {
+		return newError(sqlstateInvalidColumnReference, cteAliasArity.Msg)
+	}
+	var runtimeCTEAliasArity *query.CTEColumnAliasArityError
+	if errors.As(err, &runtimeCTEAliasArity) {
+		return newError(sqlstateInvalidColumnReference, runtimeCTEAliasArity.Error())
+	}
 	var parse *sqlast.ParseError
 	if errors.As(err, &parse) {
 		e := newError(sqlstateSyntaxError, parse.Msg)
@@ -245,6 +269,10 @@ func asPGErrorIn(err error, src string) *pgError {
 	e := asPGError(err)
 	if e == nil {
 		return nil
+	}
+	var positioned interface{ Position() int }
+	if e.position == 0 && errors.As(err, &positioned) {
+		e.position = charPosition(src, positioned.Position())
 	}
 	var parse *sqlast.ParseError
 	if e.position == 0 && errors.As(err, &parse) {

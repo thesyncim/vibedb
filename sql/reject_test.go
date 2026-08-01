@@ -107,7 +107,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"LIKE ESCAPE", `SELECT a FROM t WHERE b LIKE 'x%' ESCAPE '!'`, 34, "LIKE ... ESCAPE"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
-		{"a subquery in FROM", `SELECT a FROM (SELECT b FROM u)`, 14, "subqueries are not supported"},
 		{"CASE", `SELECT a FROM t WHERE CASE WHEN b THEN 1 END = 1`, 22, "CASE"},
 		{"CAST", `SELECT a FROM t WHERE CAST(b AS text) = 1`, 22, "CAST"},
 		{"the cast operator", `SELECT a FROM t WHERE b::text = 'x'`, 23, "::"},
@@ -116,7 +115,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"arithmetic", `SELECT a FROM t WHERE b + 1 = 2`, 24, "arithmetic"},
 		{"concatenation", `SELECT a FROM t WHERE b || 'x' = 'y'`, 24, "concatenation"},
 		{"set operations", `SELECT a FROM t UNION SELECT b FROM u`, 16, "UNION"},
-		{"common table expressions", `WITH x AS (SELECT 1) SELECT a FROM x`, 0, "common table expressions are not supported"},
 		// Parse is the SELECT-only entry point. These three are statements the
 		// dialect does support, through ParseStatement, so the message names
 		// that entry point rather than claiming the engine cannot run them.

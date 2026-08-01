@@ -541,6 +541,13 @@ func (s *session) negotiate(body []byte) error {
 		return fatal(sqlstateInternalError,
 			"could not configure this connection's result limits: "+err.Error())
 	}
+	if err := runtime.SetIntermediateLimit(
+		s.server.opts.MaxIntermediateBytes,
+	); err != nil {
+		_ = runtime.Close()
+		return fatal(sqlstateInternalError,
+			"could not configure this connection's intermediate limit: "+err.Error())
+	}
 	s.sql = runtime
 	s.w.authenticationOK()
 
