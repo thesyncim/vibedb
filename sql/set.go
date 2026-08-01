@@ -25,15 +25,48 @@ type SetExprKind uint8
 
 const (
 	SetSelectExpr SetExprKind = iota
+	SetValuesExpr
+	SetTableExpr
 	SetBinaryExpr
 	SetGroupExpr
 )
+
+// SetValue is one scalar in a VALUES row. Null is separate because Operand's
+// zero kind is a string literal and comparison operands deliberately exclude
+// NULL. Placeholder ordinals are absolute within the complete set expression.
+type SetValue struct {
+	Operand Operand
+	Null    bool
+	Pos     int
+}
+
+// SetValuesRow retains one authored VALUES tuple in row-major order.
+type SetValuesRow struct {
+	Values []SetValue
+	Pos    int
+}
+
+// SetValuesOperand is the lossless scalar VALUES payload of a set leaf.
+type SetValuesOperand struct {
+	Rows []SetValuesRow
+	Pos  int
+}
+
+// SetTableOperand retains TABLE's exact relation identity. Select is the
+// equivalent parser-owned SELECT * relation used only by ordinary relation
+// lowering; keeping both makes TABLE unmissable to AST consumers.
+type SetTableOperand struct {
+	Ref TableRef
+	Pos int
+}
 
 // SetExpr is one node in a lossless set-expression tree.
 type SetExpr struct {
 	Kind      SetExprKind
 	Operation SetOperation
 	Select    *SelectStmt
+	Values    *SetValuesOperand
+	Table     *SetTableOperand
 	Left      *SetExpr
 	Right     *SetExpr
 	Child     *SetExpr
@@ -108,12 +141,22 @@ type SetExpression struct {
 
 type setParserState struct {
 	nodes    chunkArena[SetExpr]
+	values   chunkArena[SetValue]
+	rows     chunkArena[SetValuesRow]
+	operands chunkArena[SetValuesOperand]
+	tables   chunkArena[SetTableOperand]
+	firsts   chunkArena[SelectStmt]
+	columns  chunkArena[ResultColumn]
+	paths    chunkArena[PathExpr]
+	refs     chunkArena[TableRef]
 	tails    chunkArena[SetTail]
 	orders   chunkArena[SetOrderTerm]
 	outputs  chunkArena[SetOutputColumn]
 	contexts chunkArena[setParseContext]
 
 	orderScratch []SetOrderTerm
+	valueScratch []SetValue
+	rowScratch   []SetValuesRow
 	expression   SetExpression
 	parser       setExpressionParser
 	sized        bool
@@ -122,6 +165,14 @@ type setParserState struct {
 func (s *setParserState) reset() {
 	if !s.sized {
 		s.nodes.first = 8
+		s.values.first = 16
+		s.rows.first = 4
+		s.operands.first = 2
+		s.tables.first = 2
+		s.firsts.first = 2
+		s.columns.first = 4
+		s.paths.first = 2
+		s.refs.first = 2
 		s.tails.first = 2
 		s.orders.first = 4
 		s.outputs.first = 4
@@ -129,11 +180,21 @@ func (s *setParserState) reset() {
 		s.sized = true
 	}
 	s.nodes.rewind()
+	s.values.rewind()
+	s.rows.rewind()
+	s.operands.rewind()
+	s.tables.rewind()
+	s.firsts.rewind()
+	s.columns.rewind()
+	s.paths.rewind()
+	s.refs.rewind()
 	s.tails.rewind()
 	s.orders.rewind()
 	s.outputs.rewind()
 	s.contexts.rewind()
 	s.orderScratch = s.orderScratch[:0]
+	s.valueScratch = s.valueScratch[:0]
+	s.rowScratch = s.rowScratch[:0]
 	s.expression = SetExpression{}
 	s.parser = setExpressionParser{}
 }
@@ -354,15 +415,25 @@ func (s *setExpressionParser) parsePrimary(
 		}
 		return node, nil
 	}
+	if s.tok.kind == tokIdent && s.tok.kw == kwValues {
+		leaf, err := s.parseValuesLeaf()
+		if err != nil {
+			return nil, err
+		}
+		context.first = false
+		return leaf, nil
+	}
+	if s.tok.kind == tokIdent && s.tok.kw == kwTable {
+		leaf, err := s.parseTableLeaf(context.scope)
+		if err != nil {
+			return nil, err
+		}
+		context.first = false
+		return leaf, nil
+	}
 	if s.tok.kind != tokIdent ||
 		(s.tok.kw != kwSelect && s.tok.kw != kwWith) {
-		if s.tok.kind == tokIdent && (s.tok.kw == kwValues || s.tok.kw == kwTable) {
-			return nil, newFeatureNotSupportedError(
-				s.owner.lx.src, s.tok.pos,
-				"VALUES and TABLE set operands are not supported yet; write a SELECT operand",
-			)
-		}
-		return nil, s.errHere("expected SELECT or a parenthesized set expression")
+		return nil, s.errHere("expected SELECT, VALUES, TABLE, or a parenthesized set expression")
 	}
 	if s.tok.kw == kwWith && !context.first {
 		return nil, s.owner.errAt(
@@ -382,6 +453,239 @@ func (s *setExpressionParser) parsePrimary(
 	}
 	context.first = false
 	return leaf, nil
+}
+
+func (s *setExpressionParser) parseValuesLeaf() (*SetExpr, error) {
+	start, base := s.tok.pos, s.params
+	s.advance() // VALUES
+	rowsBase := len(s.state.rowScratch)
+	valuesBase := len(s.state.valueScratch)
+	defer func() {
+		s.state.rowScratch = s.state.rowScratch[:rowsBase]
+		s.state.valueScratch = s.state.valueScratch[:valuesBase]
+	}()
+	width := -1
+	for {
+		rowPos := s.tok.pos
+		if s.tok.kind != tokLParen {
+			return nil, s.errHere("expected '(' to begin a VALUES row")
+		}
+		s.advance()
+		valueBase := len(s.state.valueScratch)
+		for {
+			if s.tok.kind == tokRParen {
+				return nil, s.errHere("a VALUES row must contain at least one scalar")
+			}
+			if s.tok.kind == tokError {
+				return nil, s.errHere(s.tok.text)
+			}
+			value, err := s.parseSetValue()
+			if err != nil {
+				return nil, err
+			}
+			s.state.valueScratch = append(s.state.valueScratch, value)
+			if len(s.state.valueScratch)-valueBase > maxClauseItems {
+				return nil, s.owner.errfAt(
+					value.Pos, "a VALUES row may hold at most %d columns", maxClauseItems,
+				)
+			}
+			if s.tok.kind != tokComma {
+				break
+			}
+			s.advance()
+			if s.tok.kind == tokRParen {
+				return nil, s.errHere("expected a scalar after ',' in a VALUES row")
+			}
+		}
+		if s.tok.kind != tokRParen {
+			return nil, s.errHere("expected ',' or ')' after a VALUES scalar")
+		}
+		s.advance()
+		values := s.state.values.allocDirty(len(s.state.valueScratch) - valueBase)
+		copy(values, s.state.valueScratch[valueBase:])
+		s.state.valueScratch = s.state.valueScratch[:valueBase]
+		if width < 0 {
+			width = len(values)
+		} else if len(values) != width {
+			return nil, s.owner.errfAt(
+				rowPos, "VALUES rows have %d and %d columns; row arity must be uniform",
+				width, len(values),
+			)
+		}
+		s.state.rowScratch = append(s.state.rowScratch, SetValuesRow{
+			Values: values, Pos: rowPos,
+		})
+		if len(s.state.rowScratch)-rowsBase > maxClauseItems {
+			return nil, s.owner.errfAt(
+				rowPos, "a VALUES operand may hold at most %d rows", maxClauseItems,
+			)
+		}
+		if s.tok.kind != tokComma {
+			break
+		}
+		s.advance()
+		if s.tok.kind != tokLParen {
+			return nil, s.errHere("expected '(' after ',' between VALUES rows")
+		}
+	}
+
+	rows := s.state.rows.allocDirty(len(s.state.rowScratch) - rowsBase)
+	copy(rows, s.state.rowScratch[rowsBase:])
+	operand := s.state.operands.one()
+	*operand = SetValuesOperand{Rows: rows, Pos: start}
+	first := s.valuesFirst(start, base, s.params-base, width)
+	node, err := s.node(start)
+	if err != nil {
+		return nil, err
+	}
+	*node = SetExpr{
+		Kind: SetValuesExpr, Values: operand, First: first,
+		Columns: width, ParamBase: base, Params: s.params - base,
+		Pos: start, End: -1,
+	}
+	return node, nil
+}
+
+func (s *setExpressionParser) parseSetValue() (SetValue, error) {
+	pos := s.tok.pos
+	value := SetValue{Pos: pos}
+	switch s.tok.kind {
+	case tokNumber:
+		value.Operand = Operand{
+			Kind: OperandNumber, Text: s.owner.internString(s.tok.text), Pos: pos,
+		}
+		s.advance()
+		return value, nil
+	case tokString:
+		value.Operand = Operand{
+			Kind: OperandString, Text: s.owner.internToken(s.tok), Pos: pos,
+		}
+		s.advance()
+		return value, nil
+	case tokParam:
+		if s.params >= maxParams {
+			return SetValue{}, s.owner.errfAt(
+				pos, "a statement may hold at most %d placeholders", maxParams,
+			)
+		}
+		value.Operand = Operand{
+			Kind: OperandParam, Ordinal: s.params, Pos: pos,
+		}
+		s.params++
+		s.advance()
+		return value, nil
+	case tokIdent:
+		switch s.tok.kw {
+		case kwTrue:
+			value.Operand = Operand{Kind: OperandBool, Bool: true, Pos: pos}
+			s.advance()
+			return value, nil
+		case kwFalse:
+			value.Operand = Operand{Kind: OperandBool, Pos: pos}
+			s.advance()
+			return value, nil
+		case kwNull:
+			value.Null = true
+			s.advance()
+			return value, nil
+		case kwDefault:
+			return SetValue{}, newFeatureNotSupportedError(
+				s.owner.lx.src, pos,
+				"DEFAULT is not defined for a schemaless VALUES operand; write an explicit scalar or NULL",
+			)
+		}
+	}
+	return SetValue{}, newFeatureNotSupportedError(
+		s.owner.lx.src, pos,
+		"VALUES set operands accept scalar literals, NULL, and placeholders; use a SELECT operand for expressions",
+	)
+}
+
+func (s *setExpressionParser) valuesFirst(
+	pos, base, params, columns int,
+) *SelectStmt {
+	first := s.state.firsts.one()
+	columnRun := s.state.columns.allocDirty(columns)
+	for column := 0; column < columns; column++ {
+		buffer := s.owner.tmp[:0]
+		buffer = append(buffer, "column"...)
+		buffer = strconv.AppendInt(buffer, int64(column+1), 10)
+		name := s.owner.intern(buffer)
+		s.owner.tmp = buffer[:0]
+		columnRun[column] = ResultColumn{Alias: name, Pos: pos}
+	}
+	*first = SelectStmt{
+		Columns: columnRun, Params: params, ParamBase: base,
+	}
+	return first
+}
+
+func (s *setExpressionParser) parseTableLeaf(scope *cteScope) (*SetExpr, error) {
+	start, base := s.tok.pos, s.params
+	s.advance() // TABLE
+	if s.tok.kind != tokIdent && s.tok.kind != tokQuotedIdent {
+		return nil, s.errHere("expected a collection or common-table-expression name after TABLE")
+	}
+	if s.tok.kind == tokIdent && reserved(s.tok.kw) {
+		return nil, s.owner.errfAt(
+			s.tok.pos,
+			"expected a collection name, but found the reserved word %s; write %q to use it as a name",
+			s.tok.text, s.tok.text,
+		)
+	}
+	namePos := s.tok.pos
+	name := s.owner.internToken(s.tok)
+	if name == "" {
+		return nil, s.owner.errAt(namePos, "a collection name may not be empty")
+	}
+	s.advance()
+	if s.tok.kind == tokDot {
+		return nil, newFeatureNotSupportedError(
+			s.owner.lx.src, s.tok.pos,
+			"qualified TABLE names are not supported; quote a dotted collection name as one identifier",
+		)
+	}
+	if s.tok.kind == tokIdent && s.tok.kw == kwAs {
+		return nil, newFeatureNotSupportedError(
+			s.owner.lx.src, s.tok.pos,
+			"TABLE operands do not carry a range alias; wrap TABLE in a SELECT operand when an alias is needed",
+		)
+	}
+	ref := TableRef{Name: name, Alias: name, Pos: namePos}
+	if definition := lookupSetCTE(scope, name); definition != nil {
+		ref.Kind = RelationCTE
+		ref.Query = definition.Query
+	}
+	table := s.state.tables.one()
+	*table = SetTableOperand{Ref: ref, Pos: start}
+	path := s.state.paths.one()
+	*path = PathExpr{Source: 0, Pos: start}
+	columns := s.state.columns.allocDirty(1)
+	columns[0] = ResultColumn{Path: path, Pos: start}
+	refs := s.state.refs.allocDirty(1)
+	refs[0] = ref
+	first := s.state.firsts.one()
+	*first = SelectStmt{Columns: columns, From: refs, ParamBase: base}
+	node, err := s.node(start)
+	if err != nil {
+		return nil, err
+	}
+	*node = SetExpr{
+		Kind: SetTableExpr, Select: first, Table: table, First: first,
+		Columns: 1, ArityDeferred: true, ParamBase: base, Pos: start, End: -1,
+	}
+	return node, nil
+}
+
+func lookupSetCTE(scope *cteScope, name string) *CommonTableExpr {
+	for ; scope != nil; scope = scope.outer {
+		for i := len(scope.defs) - 1; i >= 0; i-- {
+			if scope.defs[i].Name == name {
+				return &scope.defs[i]
+			}
+		}
+	}
+	return nil
 }
 
 func (s *setExpressionParser) parseLeaf(scope *cteScope) (*SetExpr, error) {
@@ -653,9 +957,14 @@ func (s *setExpressionParser) parseOrderTerm(
 		)
 	}
 	match := -1
+	deferredOutput := false
 	for column := range first.Columns {
 		candidate, deferred := s.outputName(first, &first.Columns[column])
-		if deferred || candidate != name {
+		if deferred {
+			deferredOutput = true
+			continue
+		}
+		if candidate != name {
 			continue
 		}
 		if match >= 0 {
@@ -665,12 +974,15 @@ func (s *setExpressionParser) parseOrderTerm(
 		}
 		match = column
 	}
-	if match < 0 {
+	if match < 0 && !deferredOutput {
 		return term, s.owner.errfAt(
 			term.Pos, "set ORDER BY name %q is not an output of the syntactic first operand", name,
 		)
 	}
-	term.Name, term.Output = name, match+1
+	term.Name = name
+	if !deferredOutput {
+		term.Output = match + 1
+	}
 	if s.tok.kind == tokIdent && s.tok.kw == kwAsc {
 		s.advance()
 	} else if s.tok.kind == tokIdent && s.tok.kw == kwDesc {
@@ -824,6 +1136,29 @@ func shiftSetExprPositions(expr *SetExpr, delta int, mirroredFirst *SelectStmt) 
 	}
 	switch expr.Kind {
 	case SetSelectExpr:
+		if expr.Select != mirroredFirst {
+			shiftSelectPositions(expr.Select, delta)
+		}
+	case SetValuesExpr:
+		if expr.Values != nil {
+			expr.Values.Pos += delta
+			for row := range expr.Values.Rows {
+				expr.Values.Rows[row].Pos += delta
+				for value := range expr.Values.Rows[row].Values {
+					item := &expr.Values.Rows[row].Values[value]
+					item.Pos += delta
+					item.Operand.Pos += delta
+				}
+			}
+		}
+		if expr.First != mirroredFirst {
+			shiftSelectPositions(expr.First, delta)
+		}
+	case SetTableExpr:
+		if expr.Table != nil {
+			expr.Table.Pos += delta
+			expr.Table.Ref.Pos += delta
+		}
 		if expr.Select != mirroredFirst {
 			shiftSelectPositions(expr.Select, delta)
 		}

@@ -72,9 +72,6 @@ var unsupportedStatements = map[string]string{
 	"LOCK": "there is no SQL lock manager: immutable readers never block writers",
 	"CALL": "there are no stored procedures",
 	"DO":   "there is no procedural language",
-
-	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
-	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
 }
 
 func unsupportedStatementReason(tok token) (string, bool) {

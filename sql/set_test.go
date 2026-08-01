@@ -234,8 +234,11 @@ func TestSetExpressionMalformedAndUnsupportedDiagnosticsAreTypedAndPositioned(t 
 		{"missing right operand", `SELECT id FROM one UNION`, "", "expected SELECT", false},
 		{"double modifier", `SELECT id FROM one UNION ALL DISTINCT SELECT id FROM two`, "DISTINCT", "exactly one", false},
 		{"unparenthesized WITH", `SELECT id FROM one UNION WITH q AS (SELECT id FROM two) SELECT id FROM q`, "WITH", "parenthesized", false},
-		{"values operand", "SELECT \"café\" FROM one\nUNION ALL\nVALUES (1)", "VALUES", "not supported", true},
-		{"table operand", `SELECT id FROM one EXCEPT TABLE two`, "TABLE", "not supported", true},
+		{"values expression", "SELECT \"café\" FROM one\nUNION ALL\nVALUES (missing)", "missing", "accept scalar literals", true},
+		{"values default", `VALUES (DEFAULT) UNION VALUES (1)`, "DEFAULT", "not defined", true},
+		{"qualified table", `SELECT id FROM one EXCEPT TABLE public.two`, ".", "qualified TABLE", true},
+		{"with values root", `WITH c AS (SELECT id FROM one) VALUES (1)`, "VALUES", "lexical execution owner", true},
+		{"with table root", `WITH c AS (SELECT id FROM one) TABLE c`, "TABLE", "lexical execution owner", true},
 		{"arity mismatch", `SELECT a, b FROM one INTERSECT SELECT c FROM two`, "INTERSECT", "2 and 1", false},
 		{"unknown final output", `SELECT id FROM one UNION SELECT id FROM two ORDER BY missing`, "missing", "not an output", false},
 		{"operand local tail", `SELECT id FROM one ORDER BY id UNION SELECT id FROM two`, "ORDER", "operand-local", false},
@@ -255,13 +258,59 @@ func TestSetExpressionMalformedAndUnsupportedDiagnosticsAreTypedAndPositioned(t 
 			if errors.As(err, &unsupported) != test.typed {
 				t.Fatalf("error type = %T, typed unsupported = %v", err, test.typed)
 			}
-			if test.name == "values operand" && (parseError.Line != 3 || parseError.Col != 1) {
-				t.Fatalf("UTF-8 positioned error = %d:%d, want 3:1", parseError.Line, parseError.Col)
+			if test.name == "values expression" && (parseError.Line != 3 || parseError.Col != 9) {
+				t.Fatalf("UTF-8 positioned error = %d:%d, want 3:9", parseError.Line, parseError.Col)
 			}
 			if statement.Set != nil || len(statement.Columns) != 0 || len(statement.From) != 0 {
 				t.Fatal("rejected set expression left a consumable partial AST")
 			}
 		})
+	}
+}
+
+func TestSetExpressionValuesAndTableOperandsPreserveShapeParamsAndMetadata(t *testing.T) {
+	statement := parseSetForTest(t,
+		`(VALUES (?, 'a'), (2, NULL) ORDER BY column1 LIMIT ?) `+
+			`UNION ALL TABLE live INTERSECT DISTINCT VALUES (?, 'z') `+
+			`ORDER BY column2 DESC OFFSET ?`)
+	root := statement.Set.Root
+	if root.Kind != SetBinaryExpr || root.Operation != SetUnionAll ||
+		root.Left.Kind != SetGroupExpr || root.Left.Child.Kind != SetValuesExpr ||
+		root.Right.Kind != SetBinaryExpr || root.Right.Operation != SetIntersectDistinct ||
+		root.Right.Left.Kind != SetTableExpr || root.Right.Right.Kind != SetValuesExpr {
+		t.Fatalf("VALUES/TABLE tree shape = %s", dumpStmt(statement))
+	}
+	if statement.Params != 4 || root.Left.ParamBase != 0 || root.Left.Params != 2 ||
+		root.Right.Left.ParamBase != 2 || root.Right.Left.Params != 0 ||
+		root.Right.Right.ParamBase != 2 || root.Right.Right.Params != 1 ||
+		statement.Set.Tail.ParamBase != 3 || statement.Set.Tail.Params != 1 {
+		t.Fatalf("VALUES/TABLE parameter ranges = %s", dumpStmt(statement))
+	}
+	values := root.Left.Child.Values
+	if values == nil || len(values.Rows) != 2 || len(values.Rows[0].Values) != 2 ||
+		values.Rows[0].Values[0].Operand.Ordinal != 0 ||
+		!values.Rows[1].Values[1].Null {
+		t.Fatalf("VALUES payload = %+v", values)
+	}
+	if got := statement.Set.Outputs; len(got) != 2 ||
+		got[0].Name != "column1" || got[1].Name != "column2" ||
+		got[0].Deferred || got[1].Deferred {
+		t.Fatalf("VALUES first metadata = %+v", got)
+	}
+	table := root.Right.Left
+	if table.Table == nil || table.Table.Ref.Name != "live" ||
+		table.Select == nil || len(table.Select.From) != 1 ||
+		table.Select.From[0].Name != "live" || !table.ArityDeferred {
+		t.Fatalf("TABLE payload = %+v", table)
+	}
+	checkStatementInvariants(t, statement)
+
+	for _, source := range []string{`VALUES (1)`, `TABLE live`} {
+		root := parseSetForTest(t, source)
+		if root.Set.Root.First != root.Set.First {
+			t.Fatalf("bare %q lost first identity", source)
+		}
+		checkStatementInvariants(t, root)
 	}
 }
 
@@ -274,6 +323,13 @@ func TestSetExpressionParserReuseClearsColdSidecar(t *testing.T) {
 	}
 	if statement.Set == nil || parser.set == nil {
 		t.Fatal("compound parse did not install cold set state")
+	}
+	if err := parser.Parse(&statement, `VALUES (?, 'x'), (2, NULL) UNION ALL TABLE live`); err != nil {
+		t.Fatal(err)
+	}
+	if statement.Set == nil || statement.Set.Root.Left.Kind != SetValuesExpr ||
+		statement.Set.Root.Right.Kind != SetTableExpr || statement.Params != 1 {
+		t.Fatalf("VALUES/TABLE reuse parse = %s", dumpStmt(&statement))
 	}
 	if err := parser.Parse(&statement, `SELECT name FROM ordinary WHERE id = ?`); err != nil {
 		t.Fatal(err)
@@ -291,6 +347,13 @@ func TestSetExpressionParserReuseClearsColdSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkStatementInvariants(t, &statement)
+	if err := parser.Parse(&statement, `TABLE after_compound`); err != nil {
+		t.Fatal(err)
+	}
+	if statement.Set == nil || statement.Set.Root.Kind != SetTableExpr ||
+		statement.Params != 0 || statement.Set.Root.Values != nil {
+		t.Fatalf("TABLE parse retained stale VALUES state: %s", dumpStmt(&statement))
+	}
 
 	var ordinaryParser Parser
 	if err := ordinaryParser.Parse(&statement, `SELECT id FROM ordinary`); err != nil {
@@ -336,6 +399,10 @@ func TestSetExpressionParseStatementAndExplainPreserveRoot(t *testing.T) {
 		`(SELECT id FROM one EXCEPT SELECT id FROM two)`,
 		`EXPLAIN SELECT id FROM one INTERSECT SELECT id FROM two`,
 		`EXPLAIN ANALYZE (SELECT id FROM one UNION SELECT id FROM two)`,
+		`VALUES (1), (2)`,
+		`TABLE one`,
+		`EXPLAIN VALUES (1) UNION ALL VALUES (2)`,
+		`EXPLAIN ANALYZE TABLE one`,
 	}
 	for _, source := range cases {
 		var parser Parser

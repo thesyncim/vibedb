@@ -23,6 +23,13 @@ type setStatementRunner interface {
 	releaseRelations(*statementFrame)
 }
 
+// setStatementSourceIndependent marks a leaf that is completely described by
+// its prepared payload and bindings. The marker is cold to set execution and
+// lets VALUES run without manufacturing a fake physical collection.
+type setStatementSourceIndependent interface {
+	setStatementSourceIndependent()
+}
+
 // setStatementResultConsumer is the cold SQL-tail hook. The generic prepared
 // runtime copies the root directly when it is nil. A SQL query-expression tail
 // instead consumes the still-live root relation through the ordinary compiled
@@ -290,11 +297,15 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 			source, errSetStatementConfig,
 		)
 	}
-	leafSource, err := setStatementLeafSource(
-		r.source, r.desc.driving, leaf.runner.Collection(),
-	)
-	if err != nil {
-		return 0, 0, err
+	leafSource := r.source
+	if _, independent := leaf.runner.(setStatementSourceIndependent); !independent {
+		var err error
+		leafSource, err = setStatementLeafSource(
+			r.source, r.desc.driving, leaf.runner.Collection(),
+		)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 	exec := &r.execs[source]
 	exec.Options = r.parent.Options

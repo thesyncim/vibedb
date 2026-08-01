@@ -47,8 +47,9 @@ type statementSetSQL struct {
 	descriptor  *setStatementDescriptor
 	runtime     setStatementRuntime
 	leaves      []setSQLLeaf
+	values      []setSQLValues
 	groups      []setSQLGroup
-	sourceOrder []int
+	sourceOrder []setSQLSource
 
 	// tailCompiler/tailQuery are absent unless this expression has a scoped
 	// ORDER BY/LIMIT/OFFSET. ordinalSpec is immutable backing for both columns
@@ -82,6 +83,24 @@ type setSQLLeaf struct {
 type setSQLGroup struct {
 	expr   *sqlast.SetExpr
 	runner *statementSetSQL
+}
+
+type setSQLValues struct {
+	expr   *sqlast.SetExpr
+	runner setSQLValuesRunner
+}
+
+type setSQLSourceKind uint8
+
+const (
+	setSQLSelectSource setSQLSourceKind = iota
+	setSQLValuesSource
+	setSQLGroupSource
+)
+
+type setSQLSource struct {
+	kind  setSQLSourceKind
+	index int
 }
 
 type setSQLLowered struct {
@@ -141,6 +160,8 @@ func setSQLHasLexicalCTE(expr *sqlast.SetExpr) bool {
 	switch expr.Kind {
 	case sqlast.SetSelectExpr:
 		return expr.Select != nil && expr.Select.With != nil
+	case sqlast.SetValuesExpr, sqlast.SetTableExpr:
+		return false
 	case sqlast.SetBinaryExpr:
 		return setSQLHasLexicalCTE(expr.Left) || setSQLHasLexicalCTE(expr.Right)
 	case sqlast.SetGroupExpr:
@@ -160,7 +181,7 @@ func (r *statementSetSQL) prepare(src string) error {
 		return err
 	}
 	plan.Root = prepared.node
-	leaves := make([]setStatementLeaf, len(r.leaves)+len(r.groups))
+	leaves := make([]setStatementLeaf, len(r.sourceOrder))
 	// Sources are assigned in encounter order across both slices below. The
 	// descriptor receives the exact runner order recorded by sourceRunner.
 	for source := range leaves {
@@ -173,6 +194,9 @@ func (r *statementSetSQL) prepare(src string) error {
 	if err != nil {
 		return err
 	}
+	// Output metadata comes from the syntactic first operand, but source
+	// acquisition must use the first physical dependency. VALUES has none.
+	descriptor.driving = r.driving
 	r.descriptor = descriptor
 	if err := r.runtime.prepare(descriptor); err != nil {
 		return err
@@ -190,20 +214,24 @@ func (r *statementSetSQL) prepare(src string) error {
 	return nil
 }
 
-// sourceOrder retains the mixed leaf/group runner order without an interface
-// allocation per entry: non-negative indexes address leaves, negative indexes
-// encode groups as -index-1.
-//
-// It is declared separately from the two ownership slices because those slices
-// make recursive release and truthful explain traversal concrete and cheap.
+// sourceOrder retains heterogeneous runner order without an interface value in
+// prepared storage. The concrete ownership slices make release and truthful
+// explain traversal explicit while this compact tag keeps lookup exhaustive.
 func (r *statementSetSQL) sourceRunner(source int) (setStatementRunner, int) {
 	entry := r.sourceOrder[source]
-	if entry >= 0 {
-		leaf := &r.leaves[entry]
+	switch entry.kind {
+	case setSQLSelectSource:
+		leaf := &r.leaves[entry.index]
 		return leaf.stmt, leaf.tree.ParamBase
+	case setSQLValuesSource:
+		value := &r.values[entry.index]
+		return &value.runner, value.expr.ParamBase
+	case setSQLGroupSource:
+		group := &r.groups[entry.index]
+		return group.runner, group.expr.ParamBase
+	default:
+		return nil, 0
 	}
-	group := &r.groups[-entry-1]
-	return group.runner, group.expr.ParamBase
 }
 
 func (r *statementSetSQL) lowerExpr(
@@ -230,11 +258,59 @@ func (r *statementSetSQL) lowerExpr(
 		leafIndex := len(r.leaves)
 		r.leaves = append(r.leaves, setSQLLeaf{tree: expr.Select, stmt: stmt})
 		source := len(r.sourceOrder)
-		r.sourceOrder = append(r.sourceOrder, leafIndex)
+		r.sourceOrder = append(r.sourceOrder, setSQLSource{
+			kind: setSQLSelectSource, index: leafIndex,
+		})
 		columns := len(stmt.Columns())
 		node := len(plan.Nodes)
 		plan.Nodes = append(plan.Nodes, NewSetTreeLeaf(source, columns))
 		r.observeRunner(stmt)
+		return setSQLLowered{node: node, columns: columns, firstSource: source}, nil
+
+	case sqlast.SetTableExpr:
+		if expr.Select == nil || expr.Table == nil || expr.Select.Set != nil {
+			return setSQLLowered{}, fmt.Errorf(
+				"query: invalid TABLE set leaf at byte %d: %w", expr.Pos, ErrSetTreePlan,
+			)
+		}
+		stmt, err := prepareTreeInContext(
+			src, expr.Select, 0, r.ctes, r.rootArgBase+expr.ParamBase,
+		)
+		if err != nil {
+			return setSQLLowered{}, err
+		}
+		leafIndex := len(r.leaves)
+		r.leaves = append(r.leaves, setSQLLeaf{tree: expr.Select, stmt: stmt})
+		source := len(r.sourceOrder)
+		r.sourceOrder = append(r.sourceOrder, setSQLSource{
+			kind: setSQLSelectSource, index: leafIndex,
+		})
+		columns := len(stmt.Columns())
+		node := len(plan.Nodes)
+		plan.Nodes = append(plan.Nodes, NewSetTreeLeaf(source, columns))
+		r.observeRunner(stmt)
+		return setSQLLowered{node: node, columns: columns, firstSource: source}, nil
+
+	case sqlast.SetValuesExpr:
+		if expr.Values == nil || expr.First == nil {
+			return setSQLLowered{}, fmt.Errorf(
+				"query: invalid VALUES set leaf at byte %d: %w", expr.Pos, ErrSetTreePlan,
+			)
+		}
+		valueIndex := len(r.values)
+		r.values = append(r.values, setSQLValues{expr: expr})
+		value := &r.values[valueIndex]
+		if err := value.runner.prepare(expr); err != nil {
+			return setSQLLowered{}, err
+		}
+		source := len(r.sourceOrder)
+		r.sourceOrder = append(r.sourceOrder, setSQLSource{
+			kind: setSQLValuesSource, index: valueIndex,
+		})
+		columns := len(value.runner.Columns())
+		node := len(plan.Nodes)
+		plan.Nodes = append(plan.Nodes, NewSetTreeLeaf(source, columns))
+		r.observeRunner(&value.runner)
 		return setSQLLowered{node: node, columns: columns, firstSource: source}, nil
 
 	case sqlast.SetBinaryExpr:
@@ -287,7 +363,9 @@ func (r *statementSetSQL) lowerExpr(
 		groupIndex := len(r.groups)
 		r.groups = append(r.groups, setSQLGroup{expr: expr, runner: group})
 		source := len(r.sourceOrder)
-		r.sourceOrder = append(r.sourceOrder, -groupIndex-1)
+		r.sourceOrder = append(r.sourceOrder, setSQLSource{
+			kind: setSQLGroupSource, index: groupIndex,
+		})
 		columns := len(group.Columns())
 		node := len(plan.Nodes)
 		plan.Nodes = append(plan.Nodes, NewSetTreeLeaf(source, columns))
@@ -326,14 +404,12 @@ func setSQLOperation(operation sqlast.SetOperation) (SetTreeOperation, error) {
 
 func (r *statementSetSQL) observeRunner(runner setStatementRunner) {
 	collection := runner.Collection()
-	if len(r.sourceOrder) == 1 {
-		// descriptor.driving is independently derived from the syntactic first
-		// operand; this local comparison only classifies catalog acquisition.
+	if collection != "" && r.driving == "" {
 		r.driving = collection
-		r.requiresCatalog = runnerRequiresCatalog(runner)
-	} else if collection != r.driving || runnerRequiresCatalog(runner) {
+	} else if collection != "" && collection != r.driving {
 		r.requiresCatalog = true
 	}
+	r.requiresCatalog = r.requiresCatalog || runnerRequiresCatalog(runner)
 	r.joins += runnerNumJoins(runner)
 	r.generalizedJoin = r.generalizedJoin || runnerGeneralizedJoin(runner)
 	// Every compound relation pipeline can read a coherent durable catalog
@@ -438,6 +514,22 @@ func (r *statementSetSQL) bindTail(args []any) error {
 	for i := range r.tail.OrderBy {
 		term := &r.tail.OrderBy[i]
 		ordinal := term.Output - 1
+		if term.Output == 0 {
+			ordinal = -1
+			matches := 0
+			for candidate := range r.descriptor.names {
+				if r.descriptor.names[candidate] == term.Name {
+					ordinal = candidate
+					matches++
+				}
+			}
+			if matches != 1 {
+				return &RelationColumnError{
+					Relation: "set expression", Column: term.Name,
+					Matches: matches, Pos: term.Pos,
+				}
+			}
+		}
 		if ordinal < 0 || ordinal >= len(r.ordinalSpec) {
 			return &RelationColumnError{
 				Relation: "set expression", Column: term.Name,
@@ -539,6 +631,11 @@ func (r *statementSetSQL) AppendSchema(dst []OutputColumn) []OutputColumn {
 	return r.descriptor.AppendSchema(dst)
 }
 
+// A grouped SQL set runner resolves its own heterogeneous leaves from the
+// caller's statement-wide source. Treating it as one physical leaf would bind
+// the group's empty/independent or distinct driving name twice.
+func (*statementSetSQL) setStatementSourceIndependent() {}
+
 func (r *statementSetSQL) runIntoFrame(
 	parent *Exec,
 	src Source,
@@ -582,6 +679,9 @@ func (r *statementSetSQL) Release() {
 	for i := range r.leaves {
 		r.leaves[i].stmt.Release()
 	}
+	for i := range r.values {
+		r.values[i].runner.Release()
+	}
 	for i := range r.groups {
 		r.groups[i].runner.Release()
 	}
@@ -609,6 +709,10 @@ func (r *statementSetSQL) bindForExplain(args []any) error {
 				return err
 			}
 		case *statementSetSQL:
+			if err := leaf.bindForExplain(args[local : local+count]); err != nil {
+				return err
+			}
+		case *setSQLValuesRunner:
 			if err := leaf.bindForExplain(args[local : local+count]); err != nil {
 				return err
 			}

@@ -29,11 +29,106 @@ func TestLeadingParenthesizedQueryIsNeverClassifiedEmpty(t *testing.T) {
 	for _, source := range []string{
 		`(SELECT id FROM a) UNION SELECT id FROM b`,
 		"/* lead */\n(SELECT id FROM a)",
+		`VALUES (1)`,
+		`TABLE a`,
 	} {
 		kind, reason := classify(source)
 		if kind != kindSelect || reason != "" {
 			t.Fatalf("classify(%q) = %v/%q, want SELECT", source, kind, reason)
 		}
+	}
+}
+
+func TestSQLSetValuesTableRootsSimpleExtendedAndPositionedRecovery(t *testing.T) {
+	c := connectSQLCatalog(t)
+	seedProtocolSetTables(t, c)
+
+	msgs := c.query(`VALUES (1, 'one'), (2, NULL) ORDER BY column1 DESC`)
+	if has(msgs, msgErrorResponse) {
+		t.Fatalf("bare VALUES: %s", formatError(find(t, msgs, msgErrorResponse).body))
+	}
+	description := decodeRowDescription(t, find(t, msgs, msgRowDescription).body)
+	if len(description) != 2 || description[0].name != "column1" ||
+		description[1].name != "column2" {
+		t.Fatalf("VALUES RowDescription = %+v", description)
+	}
+	rows := rowsOf(t, msgs)
+	if len(rows) != 2 || string(rows[0][0]) != "2" || rows[0][1] != nil ||
+		string(rows[1][0]) != "1" || string(rows[1][1]) != `"one"` {
+		t.Fatalf("VALUES rows = %q", rows)
+	}
+	if got := commandTagOf(t, msgs); got != "SELECT 2" {
+		t.Fatalf("VALUES command tag = %q", got)
+	}
+
+	msgs = extendedSQL(c,
+		`(VALUES ($1) ORDER BY column1) UNION ALL `+
+			`SELECT n FROM set_a ORDER BY column1`,
+		[][]byte{[]byte("0")},
+	)
+	rows = rowsOf(t, msgs)
+	if len(rows) != 4 || string(rows[0][0]) != "0" ||
+		string(rows[1][0]) != "1" || string(rows[2][0]) != "2" ||
+		string(rows[3][0]) != "4" {
+		t.Fatalf("extended leading VALUES rows = %q", rows)
+	}
+
+	msgs = c.query(`TABLE set_a`)
+	if has(msgs, msgErrorResponse) {
+		t.Fatalf("bare TABLE: %s", formatError(find(t, msgs, msgErrorResponse).body))
+	}
+	description = decodeRowDescription(t, find(t, msgs, msgRowDescription).body)
+	rows = rowsOf(t, msgs)
+	if len(description) != 1 || description[0].name != "*" || len(rows) != 3 ||
+		!strings.Contains(string(rows[0][0]), `"id":"a1"`) {
+		t.Fatalf("TABLE description/rows = %+v/%q", description, rows)
+	}
+
+	statement := `/* préfix */ VALUES (1) UNION SELECT id, n FROM set_a`
+	fields := expectError(t, c.query(statement), sqlstateSyntaxError)
+	bytePosition := strings.Index(statement, "UNION")
+	want := strconv.Itoa(len([]rune(statement[:bytePosition])) + 1)
+	if fields['P'] != want {
+		t.Fatalf("VALUES arity position = %q, want %q", fields['P'], want)
+	}
+	unsupported := `/* préfix */ VALUES (missing) UNION VALUES (1)`
+	fields = expectError(t, c.query(unsupported), sqlstateFeatureNotSupported)
+	bytePosition = strings.Index(unsupported, "missing")
+	want = strconv.Itoa(len([]rune(unsupported[:bytePosition])) + 1)
+	if fields['P'] != want {
+		t.Fatalf("VALUES unsupported position = %q, want %q", fields['P'], want)
+	}
+	if got := commandTagOf(t, c.query(`VALUES (7)`)); got != "SELECT 1" {
+		t.Fatalf("post-VALUES-error recovery tag = %q", got)
+	}
+
+	planRows := rowsOf(t, c.query(
+		`EXPLAIN ANALYZE VALUES (1), (2) UNION ALL VALUES (3)`,
+	))
+	if len(planRows) != 1 || !strings.Contains(
+		string(planRows[0][0]), `\"kind\":\"values\"`,
+	) || !strings.Contains(string(planRows[0][0]), `\"rows\":3`) {
+		t.Fatalf("VALUES EXPLAIN ANALYZE rows = %q", planRows)
+	}
+}
+
+func TestSQLSetValuesIntermediateBudgetNoPartialAndRecovery(t *testing.T) {
+	srv := newTestServer(t, Options{MaxIntermediateBytes: 1})
+	c := dial(t, srv)
+	c.startup(map[string]string{"user": "tester"})
+	for _, msgs := range [][]backendMessage{
+		c.query(`VALUES (1), (2) UNION ALL VALUES (3)`),
+		extendedSQL(c, `VALUES ($1), (2) UNION ALL VALUES (3)`, [][]byte{[]byte("1")}),
+	} {
+		expectError(t, msgs, sqlstateProgramLimitExceeded)
+		if has(msgs, msgDataRow) {
+			t.Fatal("VALUES budget failure emitted a partial DataRow")
+		}
+	}
+	// The same one-byte intermediate limit would reject another VALUES root.
+	// Use the protocol's fixed SELECT path to prove synchronization instead.
+	if got := commandTagOf(t, c.query(`SELECT 1`)); got != "SELECT 1" {
+		t.Fatalf("post-VALUES-budget recovery tag = %q", got)
 	}
 }
 

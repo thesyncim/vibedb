@@ -102,9 +102,7 @@ var unsupportedStatements = map[string]string{
 	"CALL": "there are no stored procedures",
 	"DO":   "there is no procedural language",
 
-	"WITH":   "common table expressions are not supported: the engine executes one plan and has no nested execution",
-	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
-	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
+	"WITH": "common table expressions are not supported: the engine executes one plan and has no nested execution",
 }
 
 // classify reports what kind of statement src is, from its leading keyword.
@@ -138,7 +136,8 @@ func classifyCancelable(
 	switch {
 	case word == "":
 		return kindEmpty, "", nil
-	case strings.EqualFold(word, "SELECT"), strings.EqualFold(word, "EXPLAIN"):
+	case strings.EqualFold(word, "SELECT"), strings.EqualFold(word, "EXPLAIN"),
+		strings.EqualFold(word, "VALUES"), strings.EqualFold(word, "TABLE"):
 		return kindSelect, "", nil
 	case strings.EqualFold(word, "INSERT"), strings.EqualFold(word, "UPDATE"),
 		strings.EqualFold(word, "DELETE"), strings.EqualFold(word, "CREATE"),

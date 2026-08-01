@@ -50,3 +50,22 @@ func BenchmarkParseSetExpression(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkParseValuesTableSetExpression(b *testing.B) {
+	const source = `(VALUES (?, 'one'), (2, NULL) ORDER BY column1 LIMIT ?) ` +
+		`UNION ALL TABLE live INTERSECT DISTINCT VALUES (?, 'three') ` +
+		`ORDER BY column2 OFFSET ?`
+	var parser Parser
+	var statement SelectStmt
+	if err := parser.Parse(&statement, source); err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(source)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := parser.Parse(&statement, source); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

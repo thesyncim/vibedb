@@ -108,7 +108,8 @@ func checkSetExprInvariants(
 	switch expr.Kind {
 	case SetSelectExpr:
 		if expr.Select == nil || expr.First != expr.Select ||
-			expr.Left != nil || expr.Right != nil || expr.Child != nil || expr.Tail != nil {
+			expr.Values != nil || expr.Table != nil || expr.Left != nil ||
+			expr.Right != nil || expr.Child != nil || expr.Tail != nil {
 			t.Fatalf("invalid set leaf at %d: %+v", expr.Pos, expr)
 		}
 		if expr.Select.Set != nil {
@@ -127,9 +128,51 @@ func checkSetExprInvariants(
 		checkStatementInvariantsScoped(t, expr.Select, outer)
 		return wantBase + expr.Params
 
+	case SetValuesExpr:
+		if expr.Values == nil || expr.First == nil || expr.Select != nil ||
+			expr.Table != nil || expr.Left != nil || expr.Right != nil ||
+			expr.Child != nil || expr.Tail != nil || expr.ArityDeferred ||
+			expr.Columns <= 0 || len(expr.First.Columns) != expr.Columns ||
+			expr.First.ParamBase != wantBase || expr.First.Params != expr.Params {
+			t.Fatalf("invalid VALUES set leaf at %d: %+v", expr.Pos, expr)
+		}
+		params := 0
+		for row := range expr.Values.Rows {
+			if len(expr.Values.Rows[row].Values) != expr.Columns {
+				t.Fatalf("VALUES row %d width = %d, want %d", row,
+					len(expr.Values.Rows[row].Values), expr.Columns)
+			}
+			for column := range expr.Values.Rows[row].Values {
+				value := expr.Values.Rows[row].Values[column]
+				if !value.Null && value.Operand.Kind == OperandParam {
+					if value.Operand.Ordinal != wantBase+params {
+						t.Fatalf("VALUES parameter ordinal = %d, want %d",
+							value.Operand.Ordinal, wantBase+params)
+					}
+					params++
+				}
+			}
+		}
+		if params != expr.Params {
+			t.Fatalf("VALUES parameters = %d, metadata says %d", params, expr.Params)
+		}
+		return wantBase + expr.Params
+
+	case SetTableExpr:
+		if expr.Table == nil || expr.Select == nil || expr.First != expr.Select ||
+			expr.Values != nil || expr.Left != nil || expr.Right != nil ||
+			expr.Child != nil || expr.Tail != nil || expr.Params != 0 ||
+			!expr.ArityDeferred || len(expr.Select.From) != 1 ||
+			expr.Select.From[0].Name != expr.Table.Ref.Name {
+			t.Fatalf("invalid TABLE set leaf at %d: %+v", expr.Pos, expr)
+		}
+		checkStatementInvariantsScoped(t, expr.Select, outer)
+		return wantBase
+
 	case SetBinaryExpr:
 		if expr.Operation > SetExceptDistinct || expr.Left == nil || expr.Right == nil ||
-			expr.Select != nil || expr.Child != nil || expr.Tail != nil ||
+			expr.Select != nil || expr.Values != nil || expr.Table != nil ||
+			expr.Child != nil || expr.Tail != nil ||
 			expr.First != expr.Left.First {
 			t.Fatalf("invalid binary set node at %d: %+v", expr.Pos, expr)
 		}
@@ -150,7 +193,8 @@ func checkSetExprInvariants(
 
 	case SetGroupExpr:
 		if expr.Child == nil || expr.First != expr.Child.First ||
-			expr.Select != nil || expr.Left != nil || expr.Right != nil || expr.End <= expr.Pos {
+			expr.Select != nil || expr.Values != nil || expr.Table != nil ||
+			expr.Left != nil || expr.Right != nil || expr.End <= expr.Pos {
 			t.Fatalf("invalid authored set group at %d: %+v", expr.Pos, expr)
 		}
 		end := checkSetExprInvariants(t, expr.Child, wantBase, outer)
@@ -186,6 +230,13 @@ func checkSetTailInvariants(
 	for i := range tail.OrderBy {
 		term := &tail.OrderBy[i]
 		if outputs != nil {
+			deferred := false
+			for output := range outputs {
+				deferred = deferred || outputs[output].Deferred
+			}
+			if term.Output == 0 && deferred && term.Name != "" {
+				continue
+			}
 			if term.Output <= 0 || term.Output > len(outputs) ||
 				term.Name != outputs[term.Output-1].Name {
 				t.Fatalf("set ORDER BY[%d] does not name a first-operand output: %+v", i, term)

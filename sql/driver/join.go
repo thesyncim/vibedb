@@ -271,6 +271,10 @@ func appendSetPhysicalDependencies(
 	switch expression.Kind {
 	case sqlast.SetSelectExpr:
 		return appendSelectPhysicalDependencies(dependencies, expression.Select)
+	case sqlast.SetValuesExpr:
+		return dependencies
+	case sqlast.SetTableExpr:
+		return appendSelectPhysicalDependencies(dependencies, expression.Select)
 	case sqlast.SetBinaryExpr:
 		dependencies = appendSetPhysicalDependencies(dependencies, expression.Left)
 		return appendSetPhysicalDependencies(dependencies, expression.Right)
@@ -340,6 +344,10 @@ func setContainsJoin(expression *sqlast.SetExpr) bool {
 	}
 	switch expression.Kind {
 	case sqlast.SetSelectExpr:
+		return selectContainsJoin(expression.Select)
+	case sqlast.SetValuesExpr:
+		return false
+	case sqlast.SetTableExpr:
 		return selectContainsJoin(expression.Select)
 	case sqlast.SetBinaryExpr:
 		return setContainsJoin(expression.Left) || setContainsJoin(expression.Right)

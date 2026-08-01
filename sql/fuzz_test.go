@@ -48,6 +48,8 @@ func FuzzParseSQL(f *testing.F) {
 			`(SELECT id FROM allowed ORDER BY id LIMIT ?) ORDER BY key OFFSET ?`,
 		`(SELECT id FROM one EXCEPT ALL SELECT id FROM two) UNION ` +
 			`(SELECT id FROM three UNION DISTINCT SELECT id FROM four)`,
+		`VALUES (?, 'x', NULL), (2, 'y', TRUE) UNION ALL TABLE live ORDER BY column1`,
+		`(TABLE archive) INTERSECT DISTINCT (VALUES ({bad}))`,
 		`SELECT team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), ` +
 			`SUM(score) OVER (PARTITION BY team ORDER BY score ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`,
 		`SELECT LAG(value, ?, NULL) OVER (ORDER BY seq NULLS FIRST) FROM events`,
@@ -488,7 +490,8 @@ func checkExprScoped(
 				count++
 			}
 		}
-		if e.Kind == ExprCompare && e.Value.Kind == OperandParam {
+		if (e.Kind == ExprCompare || e.Kind == ExprLike) &&
+			e.Value.Kind == OperandParam {
 			count++
 		}
 		return count

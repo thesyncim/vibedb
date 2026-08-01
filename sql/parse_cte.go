@@ -271,6 +271,12 @@ func markDeferredCTESetExpr(
 		if expr.Select != skip {
 			markDeferredCTEReferences(expr.Select, candidates)
 		}
+	case SetValuesExpr:
+		return
+	case SetTableExpr:
+		if expr.Select != skip {
+			markDeferredCTEReferences(expr.Select, candidates)
+		}
 	case SetBinaryExpr:
 		markDeferredCTESetExpr(expr.Left, skip, candidates)
 		markDeferredCTESetExpr(expr.Right, skip, candidates)

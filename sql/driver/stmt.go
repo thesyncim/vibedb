@@ -196,6 +196,21 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		s.conn.open = true
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
+	// A source-independent compound (currently bare/all-VALUES) still uses the
+	// complete prepared set runtime and its ordinary result/intermediate
+	// accounts. An empty collection is impossible for an ordinary SELECT, so
+	// this branch cannot divert a physical query or its transaction snapshot.
+	if s.query.Collection() == "" && len(s.dependencies) == 0 {
+		cursor, runErr := s.query.RunInto(&s.conn.exec, query.Source{}, args)
+		if runErr != nil {
+			return nil, runErr
+		}
+		if err := contextCheckpoint(ctx); err != nil {
+			return nil, err
+		}
+		s.conn.open = true
+		return s.conn.resetRows(s, cursor, nil), nil
+	}
 	if s.conn.tx != nil {
 		if s.transactionRequiresCatalogSource() {
 			source, err := s.conn.materializeTransactionJoinSource(
@@ -453,8 +468,11 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	if s.requiresCatalogSource() {
 		return options, s.validateCatalogDependenciesForExplain(ctx)
 	}
-	options.IndexCatalogKnown = true
 	collection := s.query.Collection()
+	if collection == "" && len(s.dependencies) == 0 {
+		return options, contextCheckpoint(ctx)
+	}
+	options.IndexCatalogKnown = true
 	if s.conn.tx != nil {
 		state, ok := s.conn.tx.tables[collection]
 		if !ok {

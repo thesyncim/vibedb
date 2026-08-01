@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func seedSQLSetTables(t *testing.T, db *stdsql.DB) {
@@ -105,11 +107,19 @@ func TestSQLSetPreparedAndExplainRevalidateDependencies(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer explainStatement.Close()
+	tableStatement, err := db.Prepare(
+		`TABLE set_a UNION ALL TABLE set_b`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tableStatement.Close()
 	if _, err := db.Exec(`DROP TABLE set_b`); err != nil {
 		t.Fatal(err)
 	}
 	for name, statement := range map[string]*stdsql.Stmt{
 		"query": queryStatement, "explain": explainStatement,
+		"table": tableStatement,
 	} {
 		rows, err := statement.Query()
 		if rows != nil {
@@ -125,6 +135,116 @@ func TestSQLSetPreparedAndExplainRevalidateDependencies(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTableNotFound) {
 		t.Fatalf("plain set EXPLAIN after DROP = %v", err)
+	}
+	rows, err = db.Query(`EXPLAIN TABLE set_a UNION ALL TABLE set_b`)
+	if rows != nil {
+		_ = rows.Close()
+	}
+	if !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("plain TABLE set EXPLAIN after DROP = %v", err)
+	}
+}
+
+func TestSQLSetValuesAndTableRootsPreparedTransactionsAndAllModes(t *testing.T) {
+	db := openTestDB(t)
+	seedSQLSetTables(t, db)
+
+	for _, test := range []struct {
+		operation string
+		want      []string
+	}{
+		{"UNION ALL", []string{"1", "2", "2", "2", "3"}},
+		{"UNION DISTINCT", []string{"1", "2", "3"}},
+		{"INTERSECT ALL", []string{"2"}},
+		{"INTERSECT DISTINCT", []string{"2"}},
+		{"EXCEPT ALL", []string{"1", "2"}},
+		{"EXCEPT DISTINCT", []string{"1"}},
+	} {
+		t.Run(test.operation, func(t *testing.T) {
+			rows, err := db.Query(
+				`VALUES (1), (2), (2) ` + test.operation +
+					` VALUES (2), (3) ORDER BY column1`,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := scanSQLSetStrings(t, rows); !slices.Equal(got, test.want) {
+				t.Fatalf("VALUES rows = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	rows, err := db.Query(`TABLE set_a`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(columns, []string{"*"}) {
+		t.Fatalf("TABLE columns = %v, want [*]", columns)
+	}
+	tableRows := scanSQLSetStrings(t, rows)
+	if len(tableRows) != 3 || !strings.Contains(tableRows[0], `"id":"a1"`) {
+		t.Fatalf("TABLE rows = %v", tableRows)
+	}
+
+	prepared, err := db.Prepare(
+		`(VALUES (?) ORDER BY column1) UNION ALL ` +
+			`SELECT n FROM set_a ORDER BY column1`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+	rows, err = prepared.Query(int64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := scanSQLSetStrings(t, rows), []string{"0", "1", "2", "4"}; !slices.Equal(got, want) {
+		t.Fatalf("prepared VALUES/SELECT rows = %v, want %v", got, want)
+	}
+
+	transaction, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.Exec(
+		`INSERT INTO set_a VALUES ('{"id":"tx","n":9}')`,
+	); err != nil {
+		_ = transaction.Rollback()
+		t.Fatal(err)
+	}
+	rows, err = transaction.Query(
+		`VALUES (0) UNION ALL SELECT n FROM set_a ORDER BY column1`,
+	)
+	if err != nil {
+		_ = transaction.Rollback()
+		t.Fatal(err)
+	}
+	if got, want := scanSQLSetStrings(t, rows), []string{"0", "1", "2", "4", "9"}; !slices.Equal(got, want) {
+		_ = transaction.Rollback()
+		t.Fatalf("transaction VALUES/SELECT rows = %v, want %v", got, want)
+	}
+	if err := transaction.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := `VALUES (1) UNION SELECT id, n FROM set_a`
+	_, err = db.Prepare(invalid)
+	var positioned *sqlast.ParseError
+	if !errors.As(err, &positioned) || positioned.Pos != strings.Index(invalid, "UNION") {
+		t.Fatalf("positioned VALUES arity error = %T %v", err, err)
+	}
+
+	var plan string
+	if err := db.QueryRow(`EXPLAIN ANALYZE VALUES (1), (2) UNION ALL VALUES (3)`).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, `"kind":"values"`) ||
+		!strings.Contains(plan, `"rows":3`) {
+		t.Fatalf("VALUES EXPLAIN ANALYZE = %s", plan)
 	}
 }
 

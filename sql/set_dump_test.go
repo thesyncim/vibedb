@@ -41,6 +41,35 @@ func dumpSetExpr(b *strings.Builder, expression *SetExpr) {
 		b.WriteString("leaf[")
 		b.WriteString(dumpStmt(expression.Select))
 		b.WriteByte(']')
+	case SetValuesExpr:
+		b.WriteString("values[")
+		if expression.Values != nil {
+			for row := range expression.Values.Rows {
+				if row != 0 {
+					b.WriteByte(',')
+				}
+				b.WriteByte('(')
+				for column := range expression.Values.Rows[row].Values {
+					if column != 0 {
+						b.WriteByte(',')
+					}
+					value := expression.Values.Rows[row].Values[column]
+					if value.Null {
+						b.WriteString("null")
+					} else {
+						dumpOperand(b, value.Operand)
+					}
+				}
+				b.WriteByte(')')
+			}
+		}
+		b.WriteByte(']')
+	case SetTableExpr:
+		b.WriteString("table[")
+		if expression.Table != nil {
+			fmt.Fprintf(b, "%q", expression.Table.Ref.Name)
+		}
+		b.WriteByte(']')
 	case SetBinaryExpr:
 		b.WriteByte('(')
 		dumpSetExpr(b, expression.Left)

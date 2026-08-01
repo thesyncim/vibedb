@@ -44,7 +44,11 @@
 //	               { ( "UNION" | "EXCEPT" ) [ "ALL" | "DISTINCT" ] intersect } ;
 //	intersect    = set-primary
 //	               { "INTERSECT" [ "ALL" | "DISTINCT" ] set-primary } ;
-//	set-primary  = select | "(" query-expression [ query-tail ] ")" ;
+//	set-primary  = select | values | table | "(" query-expression [ query-tail ] ")" ;
+//	values       = "VALUES" values-row { "," values-row } ;
+//	values-row   = "(" values-scalar { "," values-scalar } ")" ;
+//	values-scalar= string | number | "TRUE" | "FALSE" | "NULL" | "?" ;
+//	table        = "TABLE" name ;
 //	query-tail   = "ORDER" "BY" sort-key { "," sort-key }
 //	               [ limit-offset ]
 //	             | limit-offset ;
@@ -401,8 +405,8 @@
 // escape only.
 // implicit correlation from a non-LATERAL derived relation, correlated
 // RIGHT/FULL LATERAL, JOIN LATERAL ... USING, and subqueries in the SELECT list;
-// NATURAL joins and comma-separated FROM items; VALUES/TABLE set operands,
-// recursive and data-modifying common table expressions, CASE,
+// NATURAL joins and comma-separated FROM items; recursive and data-modifying
+// common table expressions, CASE,
 // CAST, arithmetic, string concatenation, and scalar functions (the engine
 // evaluates predicates over stored values, not computed expressions); ORDER BY
 // and GROUP BY over output positions or aggregates.

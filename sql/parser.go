@@ -672,7 +672,7 @@ func (p *Parser) internToken(t token) string {
 
 func (p *Parser) parseStatement() error {
 	statementPos := p.tok.pos
-	if p.tok.kind == tokLParen {
+	if p.tok.kind == tokLParen || p.atKeyword(kwValues) || p.atKeyword(kwTable) {
 		return p.parseSetStatement(statementPos)
 	}
 	hasWith := p.atKeyword(kwWith)
@@ -685,6 +685,11 @@ func (p *Parser) parseStatement() error {
 			return newFeatureNotSupportedError(
 				p.lx.src, p.tok.pos,
 				"data-modifying WITH statements are not supported; the primary statement must be SELECT",
+			)
+		case p.atKeyword(kwValues), p.atKeyword(kwTable):
+			return newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"WITH directly before VALUES or TABLE is not supported; make a SELECT the first operand so its common table expressions have one lexical execution owner",
 			)
 		}
 	}

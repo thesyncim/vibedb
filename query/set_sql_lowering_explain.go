@@ -30,6 +30,7 @@ type explainSQLSetNode struct {
 	Collection string             `json:"collection,omitempty"`
 	AccessPath string             `json:"access_path,omitempty"`
 	Output     []string           `json:"output,omitempty"`
+	Rows       int                `json:"rows,omitempty"`
 	Left       *explainSQLSetNode `json:"left,omitempty"`
 	Right      *explainSQLSetNode `json:"right,omitempty"`
 	Child      *explainSQLSetNode `json:"child,omitempty"`
@@ -88,6 +89,32 @@ func (r *statementSetSQL) explainExpr(
 		}
 		return &explainSQLSetNode{
 			Kind: "scan", Collection: leaf.Collection(), Output: leaf.Columns(),
+			AccessPath: explainAccessPath(
+				plan.where, plan.valuePaths, len(plan.joins), options,
+			),
+		}, nil
+
+	case sqlast.SetValuesExpr:
+		value := r.findValues(expr)
+		if value == nil {
+			return nil, fmt.Errorf("query: set explain lost a prepared VALUES leaf: %w", ErrSetTreePlan)
+		}
+		return &explainSQLSetNode{
+			Kind: "values", AccessPath: "constructed-rows",
+			Output: value.Columns(), Rows: value.rows,
+		}, nil
+
+	case sqlast.SetTableExpr:
+		leaf := r.findLeaf(expr.Select)
+		if leaf == nil {
+			return nil, fmt.Errorf("query: set explain lost a prepared TABLE leaf: %w", ErrSetTreePlan)
+		}
+		plan, err := leaf.explainSourcePlan()
+		if err != nil {
+			return nil, err
+		}
+		return &explainSQLSetNode{
+			Kind: "table", Collection: leaf.Collection(), Output: leaf.Columns(),
 			AccessPath: explainAccessPath(
 				plan.where, plan.valuePaths, len(plan.joins), options,
 			),
@@ -191,6 +218,15 @@ func (r *statementSetSQL) findGroup(expr *sqlast.SetExpr) *statementSetSQL {
 	for i := range r.groups {
 		if r.groups[i].expr == expr {
 			return r.groups[i].runner
+		}
+	}
+	return nil
+}
+
+func (r *statementSetSQL) findValues(expr *sqlast.SetExpr) *setSQLValuesRunner {
+	for i := range r.values {
+		if r.values[i].expr == expr {
+			return &r.values[i].runner
 		}
 	}
 	return nil

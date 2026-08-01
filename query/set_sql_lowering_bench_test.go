@@ -33,3 +33,30 @@ func BenchmarkSQLSetLoweringWarm(b *testing.B) {
 		b.Fatalf("rows = %d, want 3", execution.Result.RowCount)
 	}
 }
+
+func BenchmarkSQLSetValuesRootWarm(b *testing.B) {
+	statement, err := PrepareStatement(
+		`VALUES (?, ?), (?, NULL) UNION DISTINCT VALUES (?, ?)`,
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer statement.Release()
+	a, btext, c, d, etext := int64(1), "one", int64(2), int64(1), "one"
+	args := []any{&a, &btext, &c, &d, &etext}
+	var execution Exec
+	if _, err = statement.RunInto(&execution, Source{}, args); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err = statement.RunInto(&execution, Source{}, args); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	if execution.Result.RowCount != 2 {
+		b.Fatalf("rows = %d, want 2", execution.Result.RowCount)
+	}
+}
