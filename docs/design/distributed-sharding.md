@@ -5,22 +5,31 @@ routing, replica protocol, distributed ownership, or cross-shard guarantee is
 implemented today.
 
 **Idea:** place independent durable collections behind stateless routers, give
-each shard one Raft leader, and let an adaptive durability controller choose
-and safely change its voter count and failure-domain placement inside an
-explicit SLO envelope. Keep the strongly consistent topology service out of
-the steady-state query path, and move ranges with a
-copy/catch-up/verify/switch workflow. Scale readers by adding replicas and
-writers by adding independently owned shards.
+each shard one fenced writer authority, and let an adaptive durability
+controller choose and safely change its voter count and failure-domain
+placement inside an explicit SLO envelope wherever replication is in use.
+Keep the strongly consistent topology service out of the steady-state query
+path, and move ranges with a copy/catch-up/verify/switch workflow. Scale
+readers by adding replicas and writers by adding independently owned shards.
 
 **Decision:** follow the Vitess separation of a cached, strongly consistent
 control plane from the data plane, while retaining vibedb's canonical-root
-storage model inside every shard. Replicate each shard with one embedded Raft
-group, multiplexed by a Multi-Raft scheduler, using a pinned and audited
-version of [`etcd-io/raft`](https://github.com/etcd-io/raft).
-Vibedb implements the durable log, transport, snapshots, and state-machine
-integration, not another consensus algorithm. Do not claim CockroachDB's
-global transaction or snapshot contract until the separate gates for those
-features pass.
+storage model inside every shard. Sharding for write capacity and replication
+for availability are separate requirements: a shard needs deterministic
+placement, one fenced writer authority, an independently owned physical
+partition, and a router, and that minimum does not itself require Raft or any
+other replication protocol. This design's qualified default satisfies that
+writer authority, and adds optional failover, by replicating each shard with
+one embedded Raft group, multiplexed by a Multi-Raft scheduler, using a pinned
+and audited version of [`etcd-io/raft`](https://github.com/etcd-io/raft); Raft
+is the chosen implementation, not a hard prerequisite for sharding or for
+running a shard leader-only. A shard may instead run leader-only under a
+statically configured ownership epoch and no replication protocol at all (see
+[Ownership, fencing, and failover](#ownership-fencing-and-failover)), and adopt
+Raft later without a placement or routing change. Vibedb implements the
+durable log, transport, snapshots, and state-machine integration, not another
+consensus algorithm. Do not claim CockroachDB's global transaction or snapshot
+contract until the separate gates for those features pass.
 
 The proposed systems contribution is **evidence-carrying elastic
 durability**. A planner may optimize voter cardinality and placement, but a
@@ -38,14 +47,23 @@ Raft membership. It is not a priority claim. The controller must beat
 contract-matched fixed and adaptive baselines under the preregistered Phase 6
 gate before any novelty or efficiency claim is made.
 
-The data Raft group is the only steady-state write authority. The topology
-service owns range placement, desired membership, workflow intent, and cached
-leader hints; it does not mint an independent data-plane term or lease.
-Consequently an established RF3 shard can elect a leader and continue through
-a topology outage while its data quorum remains connected, although route,
-new membership, and resharding changes pause. A previously committed
-protection plan may only pause safely or roll forward from its committed plan
-revision and replicated state.
+Where a shard is Raft-replicated, its data Raft group is the only
+steady-state write authority; where it instead runs leader-only, the single
+fenced writer identified by its `OwnershipEpoch` fills that role. Either way,
+the topology service owns range placement, desired membership, workflow
+intent, and cached leader hints. For a Raft-replicated shard the topology
+service does not mint a competing data-plane term or lease of its own — Raft's
+term is already the write fence, and `OwnershipEpoch` is only derived from it.
+For a leader-only shard there is no Raft term to derive from, so the topology
+service (or static configuration) is exactly what assigns and advances
+`OwnershipEpoch` directly, as described in
+[Ownership, fencing, and failover](#ownership-fencing-and-failover); that
+narrower role is not a second, independent epoch competing with the one
+fencing primitive a shard has. Consequently an established RF3 shard can elect
+a leader and continue through a topology outage while its data quorum remains
+connected, although route, new membership, and resharding changes pause. A
+previously committed protection plan may only pause safely or roll forward
+from its committed plan revision and replicated state.
 
 ## Why this is a separate design
 
@@ -110,7 +128,14 @@ RF1 is therefore still supported: it is one member total, commits locally
 without a replication network round trip, and has no database failover or
 redundancy. Using the same one-voter Raft integration avoids a second storage
 protocol and lets the controller strengthen it online when eligible capacity
-appears.
+appears. Leader-only operation is a first-class, indefinitely supportable
+deployment shape, not a placeholder: RF1 realizes it by reusing the Raft
+integration with one voter, and a shard may equally run leader-only with no
+Raft group at all, fenced only by a statically configured `OwnershipEpoch`
+(see [Ownership, fencing, and failover](#ownership-fencing-and-failover)).
+Both satisfy the same fenced-writer requirement without added redundancy;
+only the RF1 path reuses the Raft integration so a later strengthening needs
+no separate protocol swap.
 
 Failure claims require synchronous voters in independent declared failure
 domains. Two files on one host do not constitute RF2 fault tolerance. Odd
@@ -546,7 +571,7 @@ explicit shard-replication contract. It is not CockroachDB-equivalent SQL.
 | Property | Planned vibedb target | Typical Vitess shape | CockroachDB |
 | --- | --- | --- | --- |
 | routing | stateless cached router plus explicit shard key | VTGate plus Vindex/keyspace ranges | distributed SQL over automatically split ranges |
-| write ownership | one Raft leader per shard | one MySQL primary per shard | one leaseholder over a Raft-replicated range |
+| write ownership | one fenced writer per shard (a Raft leader by default, or a leader-only writer under a static `OwnershipEpoch`) | one MySQL primary per shard | one leaseholder over a Raft-replicated range |
 | acknowledged durability | autonomously realized RF1/RF3/RF5 inside an explicit protection envelope; RF2 manual-only | configured MySQL semi-sync or async replication | Raft quorum under configured survival policy |
 | current read | shard leader after `ReadIndex` | primary tablet | leaseholder, with other modes explicitly selected |
 | follower read | explicit eventual or `replica-at-least` | explicit tablet type and freshness policy | follower-read contract at a safe timestamp |
@@ -618,6 +643,7 @@ epoch:
 | `ReplicaSetVersion` | Raft log index of the latest applied membership configuration |
 | `OperationEpoch` | replicated generation and exclusive mode serializing protection, range, repair, restore, drain, and feature-finalization work |
 | `ShardTerm` | externally exposed Raft term; never allocated by the topology service |
+| `OwnershipEpoch` | typed write-fencing epoch checked by the shard service on every proposal; derived from `ShardTerm`/`ConfState` when Raft-replicated, or assigned by topology/static configuration for a leader-only shard |
 | `CommitSequence` | Raft log index; may advance for no-op and configuration entries |
 | `StateRoot.Generation` | local physical publication generation; never a network log position |
 | `LastLogIndex` | highest contiguous Raft log index durably present on one member |
@@ -666,6 +692,16 @@ Routers are stateless and horizontally replicated. Each caches:
   `EffectiveRF` or exact transition quorums, `DesiredRF`,
   `ProtectionStatus`, and `ReplicaSetVersion`; and
 - query plans for single-shard and scatter execution.
+
+VibeGate's cached "query plans" are routing-time artifacts — which shard or
+shards a statement targets, and whether it is single-shard or scatter — not a
+serialized distributed execution plan. The wire contract between a gateway
+and a shard's leader or eligible replica is SQL text plus typed bound
+parameters, the target `ShardID`, `RoutingVersion`, and `OwnershipEpoch`, and
+the selected read policy; it never carries a serialized `durable`/planner
+execution plan. Each shard parses and plans that SQL locally with vibedb's
+ordinary parser and planner, so no second, frozen distributed plan format is
+introduced anywhere in this design.
 
 A steady-state single-shard operation performs no topology RPC. A stale route
 may reach any cached voter. A non-leader rejects it with `NOT_LEADER` and a
@@ -741,19 +777,22 @@ The workflow controller owns resumable operations:
 
 Every transition is persisted before its side effects are considered complete.
 Any controller instance may resume an interrupted workflow. Locks serialize
-intent but are not part of the data-safety proof; committed Raft entries and
-range generations are the durable fences.
+intent but are not part of the data-safety proof; committed Raft entries (or,
+for a leader-only shard, its durably applied, `OwnershipEpoch`-fenced
+`OperationState` records) and range generations are the durable fences.
 
-Each shard also replicates
-`OperationState(OperationEpoch, ExclusiveMode, TransitionID)`.
-`BeginProtectionChange`, `BeginRangeTransition`, restore, repair, drain, and
-feature finalization acquire it by ordered apply-time compare-and-swap from
-`Idle`; their configuration changes, fences, imports, and activation commands
-carry and recheck the same epoch and transition ID. Completion or a legal
-pre-irreversible abort advances the epoch before returning to `Idle`.
-Multi-shard workflows acquire groups in deterministic `ShardID` order and
-release partial acquisitions before retrying. A topology lock improves
-scheduling, but it cannot bypass this replicated interlock.
+Each shard also durably maintains
+`OperationState(OperationEpoch, ExclusiveMode, TransitionID)`: replicated
+through its Raft group where the shard is Raft-replicated, or persisted
+locally under the shard's `OwnershipEpoch`-fenced writer where it is
+leader-only. `BeginProtectionChange`, `BeginRangeTransition`, restore, repair,
+drain, and feature finalization acquire it by ordered apply-time
+compare-and-swap from `Idle`; their configuration changes, fences, imports,
+and activation commands carry and recheck the same epoch and transition ID.
+Completion or a legal pre-irreversible abort advances the epoch before
+returning to `Idle`. Multi-shard workflows acquire groups in deterministic
+`ShardID` order and release partial acquisitions before retrying. A topology
+lock improves scheduling, but it cannot bypass this interlock.
 
 ## Routing and physical order
 
@@ -842,9 +881,23 @@ The existing recovery journal is paired to one store, bounded, and recycled
 after checkpoint. It may contribute its logical batch-record codec, but it is
 not the distributed replica log.
 
-Each shard has a separate bounded Raft write-ahead log with a different
-lifetime. Raft owns terms, indexes, commitment, elections, and configuration
-entries. A normal state-machine command contains:
+Neither the recovery journal nor a shard's Raft log is the retained stream
+that online split/move, backup positioning, and replication catch-up require.
+A shard's Raft log, described next, is replication machinery: it is scoped to
+one Raft group's lifetime, compacted behind the latest durable snapshot, and
+absent entirely for a shard running leader-only without Raft. This design
+therefore also needs a separate retained logical change stream, with stable
+per-shard commit positions that outlive checkpoint, repack, and Raft log
+compaction alike and that exist whether or not Raft replication is enabled for
+the shard. It is the source of the change positions consumed by online
+reshard (see [Online split, move, and merge](#online-split-move-and-merge))
+and by backup/restore; its storage format, retention, and consumer contract
+are specified separately and are not satisfied by tailing the Raft log
+directly.
+
+Each Raft-replicated shard has a separate bounded Raft write-ahead log with a
+different lifetime. Raft owns terms, indexes, commitment, elections, and
+configuration entries. A normal state-machine command contains:
 
 ```text
 ClusterID
@@ -991,10 +1044,23 @@ byte equality is not required.
 ## Ownership, fencing, and failover
 
 A route version, workflow lock, or owner field stored only in topology is not
-data fencing. Raft election, term, log matching, and quorum commitment are the
-write fence. VibeTopo remains authoritative for which `ShardID` owns a key
-range, while the group's committed range state is authoritative for whether
-that shard is `Inactive`, `Active`, `Frozen`, or `Moved`.
+data fencing. For a Raft-replicated shard, Raft election, term, log matching,
+and quorum commitment are the write fence. VibeTopo remains authoritative for
+which `ShardID` owns a key range, while the group's committed range state is
+authoritative for whether that shard is `Inactive`, `Active`, `Frozen`, or
+`Moved`.
+
+Fencing itself is a typed contract, not only a Raft artifact. Every shard
+exposes a monotonically increasing, typed `OwnershipEpoch` that the shard
+service checks on every proposal independently of whatever mechanism advances
+it. Where a shard is Raft-replicated, `OwnershipEpoch` is derived from, and
+advances with, its `ShardTerm`/`ConfState` exactly as this section describes.
+Where a shard instead runs leader-only with no replication protocol,
+`OwnershipEpoch` is assigned and advanced directly by the topology service or
+by static configuration, and the shard service rejects any request carrying a
+stale epoch exactly as it would reject a stale Raft term. `OwnershipEpoch` is
+therefore the fencing primitive both deployment shapes share; Raft election
+and term are one qualified way to produce it, not the definition of it.
 
 All data-plane servers start non-serving. A voter accepts client-data proposals
 only while it is the current Raft leader, its range state is `Active`, and the
@@ -1123,6 +1189,17 @@ acknowledged write unless a separate membership workflow promotes them into
 the synchronous set.
 
 ### Session tokens across resharding
+
+The public session token is opaque to callers: on the wire it is
+undifferentiated bytes carrying a versioned, internal encoding of the fields
+described in [Eventual and session-consistent replicas](#eventual-and-session-consistent-replicas).
+Callers store, compare, and return it; they never parse or construct it. A
+router that receives a token against a changed `RoutingVersion` does not
+locally decide staleness — it forwards the token to the relevant shard
+leader for validation or translation. The leader either proves the token's
+visibility and serves or translates the request, or returns a typed
+`token expired` or `token indeterminate` result; it never silently downgrades
+an unprovable token to a stale read.
 
 A split or move cannot discard a token merely because its route acquired a new
 `ShardID`. Route activation publishes a durable transition certificate:
@@ -1257,6 +1334,16 @@ count, duration, and retained bytes.
 
 ## Online split, move, and merge
 
+The active routing manifest itself remains non-overlapping throughout a
+split, move, or merge: at every published `RoutingVersion`, a keyspace point
+belongs to exactly one active range. All in-flight migration state — copy/tail
+progress, fence and activation markers, and the transition certificates
+described below — lives in a separate transition record keyed by
+`transitionID`, never as a second, overlapping entry in the manifest. A reader
+or router that only ever consults the published manifest therefore cannot
+observe two active owners for one key; observing migration progress requires
+consulting the transition record explicitly.
+
 Every workflow is a persisted state machine:
 
 ```text
@@ -1272,6 +1359,17 @@ Prepare
   -> Retire
 ```
 
+The steps below are stated over each source and target's retained logical
+change stream (its stable commit positions, unaffected by checkpoint, repack,
+or Raft-log compaction) and its `OwnershipEpoch`, not over Raft particulars,
+so the same workflow applies whether a range is Raft-replicated or
+leader-only. Where a step names a "Raft group" or a Raft-derived cut, that is
+the Raft-replicated case; a leader-only source or target substitutes its
+single fenced writer authority, fenced by `OwnershipEpoch`, and its retained
+stream's commit position for the corresponding Raft-group and Raft-index
+reference. Neither substitution changes the copy/catch-up/verify/fence/
+activate sequence, the transition record, or the certificates it produces.
+
 ### Split or move
 
 1. Acquire a topology range intent, then acquire the replicated
@@ -1280,29 +1378,35 @@ Prepare
    Conflicting reshard, schema, restore, repair, drain, feature, or protection
    workflows are rejected at ordered apply.
 2. Resolve the strongest compatible active policy across each source range.
-   Allocate destination Raft groups that preserve both the source's current
+   Allocate destination shards that preserve both the source's current
    `EffectiveRF` and its failure-domain proof, not merely its lower
-   `ContractProfile`, and leave their ranges `Inactive`. Any later reduction
-   uses the ordinary authorized weakening protocol.
+   `ContractProfile` — a Raft group where the destination is replicated, or a
+   single fenced writer under a freshly allocated `OwnershipEpoch` where it is
+   leader-only — and leave their ranges `Inactive`. Any later reduction uses
+   the ordinary authorized weakening protocol.
 3. Pin a source snapshot at `copySequence` and copy rows selected by the
    destination ranges plus every retry-home completion record, exact response
    or response-blob reference, and client-GC state assigned to those ranges.
 4. Stream later commands with durable
    `ImportOrigin=(source lineage, source ShardID, source sequence,
-   operation ordinal)`. For every source Raft index and operation ordinal,
-   emit either the relevant mutation or an authenticated skip/covered-interval
-   proof, including no-op and configuration indexes. A target advances its
-   contiguous `ImportedThrough` watermark only after complete coverage through
-   that source cut; origin tags also prevent reverse replication loops.
+   operation ordinal)`. For every retained-stream commit position after
+   `copySequence` and operation ordinal, emit either the relevant mutation or
+   an authenticated skip/covered-interval proof, including any no-op and
+   configuration entries the stream carries for a Raft-replicated source. A
+   target advances its contiguous `ImportedThrough` watermark only after
+   complete coverage through that source cut; origin tags also prevent
+   reverse replication loops.
 5. Verify exact source and target rows, indexes, completion state, and
    retry-home response references at named source cuts.
 6. Optionally switch explicitly stale replica reads to exercise targets.
-7. Commit and apply `FreezeRange(transitionID, bounds)` in every source Raft
-   group. The freeze entry's actual applied Raft index is the final source cut;
-   deterministic apply computes its canonical root digest and persists both in
-   the freeze completion and transition certificate. The fence is permanent
-   for that lineage and rejects stale-route writes even when topology is
-   unavailable.
+7. Commit and apply `FreezeRange(transitionID, bounds)` at every source —
+   through its Raft group where replicated, or directly under the source's
+   fenced writer where leader-only. The freeze entry's actual applied commit
+   position (the Raft index when replicated, the retained-stream position
+   when leader-only) is the final source cut; deterministic apply computes
+   its canonical root digest and persists both in the freeze completion and
+   transition certificate. The fence is permanent for that lineage and
+   rejects stale-route writes even when topology is unavailable.
 8. Apply every target through the source final cuts, verify, and commit a
    non-serving prepared-activation record containing those proofs.
 9. In one topology transaction, compare the workflow and transition IDs plus
@@ -1398,8 +1502,9 @@ placement controller; it does not make that node a concurrent writer for an
 existing shard. To add writer capacity, VibeFlow creates destination members
 at the source's active policy and current effective protection, seeds and
 verifies them, then runs the online split or move workflow. Route activation
-gives each destination shard exactly one active Raft leader, so aggregate
-writer count rises with independently led shards. Durability Autopilot may
+gives each destination shard exactly one active fenced writer — a Raft leader
+where replicated, a leader-only writer under its own `OwnershipEpoch`
+otherwise — so aggregate writer count rises with independently led shards. Durability Autopilot may
 subsequently change those groups inside their envelope.
 
 Phase 5 exposes this as an operator-controlled runtime operation. Phase 6 may
@@ -1423,6 +1528,16 @@ never turns one indivisible hot shard key into multiple write authorities.
 Exact indexes and stable postings remain local to a collection shard. A query
 with a shard key uses the local index. Without one, the router scatters the
 index probe and merges exact results.
+
+Local uniqueness is only sound if placement makes it global: every unique
+key on a distributed table, including its primary key, must contain every
+shard-key column. A shard-local unique index can only rule out a duplicate
+among the rows it owns; if a unique or primary key omitted a shard-key
+column, two rows in different shards could carry the same value and no local
+index would ever see the conflict. This uniqueness-locality invariant is
+checked when a table's placement is bound and is a precondition for the local
+index guarantees above, independent of the excluded global-constraint cases
+below.
 
 The initial contract excludes:
 
@@ -2027,6 +2142,28 @@ Structural gates:
 6. no single-shard storage/read regression outside measured noise; and
 7. at least 75% ideal throughput scaling from one to eight independent shards
    before an automatic-scaling claim.
+
+### Scale-model versus release-scale qualification
+
+Passing the matrix above at small scale proves the state machine, fencing,
+and recovery invariants; it does not by itself prove behavior on a logical
+table or database in the 100+ TB range. This design tracks two qualification
+tiers and never conflates them:
+
+- **Continuous scale-model gates** run in CI or scheduled engineering
+  validation using many small shards: thousands of small manifests/ranges,
+  repeated split/move/merge storms, ownership-epoch and route churn, and
+  topology-outage-and-reload cycles. These prove orchestration and safety
+  invariants at low cost and high repetition, not storage behavior at full
+  size.
+- **Release qualification** exercises a full 100+ TB generated/imported
+  logical table or database across qualified shards on declared hardware, with
+  documented cost, duration, and recovery envelope. It is a release-qualification
+  event, not a routine CI gate.
+
+A scale-model pass never substitutes for a completed release-qualification
+run, and a public 100+ TB claim is never inferred from scale-model results
+alone; it requires a completed release-qualification run.
 
 ## Honest limits
 

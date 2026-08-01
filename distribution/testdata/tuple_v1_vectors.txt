@@ -1,0 +1,184 @@
+# Frozen placement scalar/tuple codec v1 golden vectors.
+#
+# THIS FILE IS AN IMMUTABLE COMPATIBILITY ARTIFACT, not a scratch fixture.
+# Every byte string here is placement identity: two callers on the same
+# tuple version must reach the same shard for the same logical value, forever.
+# If TestTupleV1GoldenVectors (../golden_vectors_test.go) fails, the
+# implementation regressed or someone tried to widen the byte format — that is
+# a stop condition requiring design review (see docs/design/
+# vitess-compatible-routing.md, PR 1a "Stop conditions" and "Acceptance
+# gate"). Do NOT edit a hex value to make a failing test pass, and do not
+# delete a vector to dodge a mismatch. Adding new vectors for new coverage is
+# fine; changing an existing hex value is a frozen-format break and needs its
+# own design review and a new tuple version.
+#
+# Grammar
+# -------
+# Blank lines and lines starting with '#' are ignored. Every other line is a
+# space-separated record; a "quoted" field is the remainder of the line from
+# its opening '"' and is parsed with Go's strconv.Unquote (so \xNN, \n, \t,
+# \", \\, and literal UTF-8 all work exactly as in a Go string literal).
+#
+#   NUMBER   <name> <group> <hex> <quoted-JSON-number-spelling>
+#   STRING   <name> <group> <hex> <quoted-string-literal>
+#   TUPLE    <name> <group> <hex> <elem-name>...
+#   DISTINCT <groupA> <groupB>
+#
+# <hex> is lowercase hex with no separators and no leading "0x", or "-" for
+# the empty byte string (used by the zero-scalar tuple).
+#
+# <group> is an equivalence-class tag: every record that shares one non-empty
+# group must encode to byte-identical <hex>. A DISTINCT line asserts every
+# record in groupA encodes to different bytes than every record in groupB.
+# Group "-" opts a record out of both checks (it still gets its own
+# byte-for-byte assertion against <hex>). TUPLE elem-name references name a
+# NUMBER or STRING record earlier in this file; the loading test also checks
+# that concatenating the referenced elements' own <hex> values reproduces the
+# tuple's <hex>, which is what "self-delimiting, no terminator" means in
+# practice.
+#
+# Every value below was produced once by distribution.V1 itself (freezing is
+# defined as "what the reviewed, oracle-cross-checked implementation emits
+# today"); the equivalence/distinctness relationships were additionally
+# cross-checked against query package's independent exact-decimal oracle
+# (compareNumberBytes/appendNumberKey, which is itself checked against
+# math/big in query/decimal_wide_test.go) before being frozen here.
+
+# --- 5 == 5.0 == 5e0 == 50e-1 (mandatory: spelling-equivalent exact numbers) ---
+NUMBER five-1     five 0201000135 "5"
+NUMBER five-2     five 0201000135 "5.0"
+NUMBER five-3     five 0201000135 "5e0"
+NUMBER five-4     five 0201000135 "50e-1"
+NUMBER five-5     five 0201000135 "5.00"
+NUMBER five-6     five 0201000135 "0.5e1"
+NUMBER five-7     five 0201000135 "500e-2"
+
+# --- -0 == 0 (mandatory: negative zero), including huge-exponent zero folds ---
+NUMBER zero-1     zero 0200 "0"
+NUMBER zero-2     zero 0200 "-0"
+NUMBER zero-3     zero 0200 "0.0"
+NUMBER zero-4     zero 0200 "-0.0"
+NUMBER zero-5     zero 0200 "0e0"
+NUMBER zero-6     zero 0200 "-0e10"
+NUMBER zero-7     zero 0200 "0.000"
+NUMBER zero-8     zero 0200 "0e99999999999999999999999999999999999999999999999999"
+NUMBER zero-9     zero 0200 "-0e999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"
+
+# --- a plain negative number equivalence class, for contrast with zero ---
+NUMBER neg42-1    neg42 0202010131023432 "-42"
+NUMBER neg42-2    neg42 0202010131023432 "-42.0"
+NUMBER neg42-3    neg42 0202010131023432 "-4.2e1"
+NUMBER neg42-4    neg42 0202010131023432 "-420e-1"
+
+# --- large exact exponents: int64-adjacent adjusted weight, both signs ---
+# (spellings straddle the int64 boundary in opposite directions for the
+# exponent literal vs. the mantissa-position adjustment; see
+# query/decimal_wide_test.go TestWideDecimalAdjustedExponentRegressions)
+NUMBER int64pos-1 int64pos 02010113393232333337323033363835343737353830370131 "0.1e9223372036854775808"
+NUMBER int64pos-2 int64pos 02010113393232333337323033363835343737353830370131 "1e9223372036854775807"
+NUMBER int64neg-1 int64neg 02010213393232333337323033363835343737353830370131 "10e-9223372036854775808"
+NUMBER int64neg-2 int64neg 02010213393232333337323033363835343737353830370131 "1e-9223372036854775807"
+
+# --- a huge (96-digit-exponent) carry across the entire exponent literal ---
+NUMBER hugecarry-1 hugecarry 02010161313030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030300131 "10e999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"
+NUMBER hugecarry-2 hugecarry 02010161313030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030300131 "1e1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+# --- non-colliding huge exponents: same mantissa digit, adjacent weight ---
+NUMBER mantissa10e-1 mantissa10e 02010161313030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030310131 "10e1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+DISTINCT hugecarry mantissa10e
+
+# --- integer boundaries ---
+NUMBER int123     adjint123 020101013203313233 "123"
+NUMBER int124     adjint124 020101013203313234 "124"
+DISTINCT adjint123 adjint124
+
+NUMBER int64max      int64max      0201010231381339323233333732303336383534373735383037 "9223372036854775807"
+NUMBER int64maxplus1 int64maxplus1 0201010231381339323233333732303336383534373735383038 "9223372036854775808"
+DISTINCT int64max int64maxplus1
+
+NUMBER int64min       int64min       0202010231381339323233333732303336383534373735383038 "-9223372036854775808"
+NUMBER int64minminus1 int64minminus1 0202010231381339323233333732303336383534373735383039 "-9223372036854775809"
+DISTINCT int64min int64minminus1
+
+NUMBER uint64max      uint64max      020101023139143138343436373434303733373039353531363135 "18446744073709551615"
+NUMBER uint64maxplus1 uint64maxplus1 020101023139143138343436373434303733373039353531363136 "18446744073709551616"
+DISTINCT uint64max uint64maxplus1
+
+NUMBER one    one    0201000131 "1"
+NUMBER negone negone 0202000131 "-1"
+
+# --- empty / zero-containing / escaped UTF-8 strings ---
+STRING str-empty  strempty 0100                 ""
+STRING str-a      stra     010161               "a"
+STRING str-b      strb     010162               "b"
+STRING str-c      strc     010163               "c"
+STRING str-hello  strhello 010568656c6c6f       "hello"
+STRING str-nul-ab nulab    0103610062           "a\x00b"
+STRING str-nul-nul nulnul  01020000             "\x00\x00"
+DISTINCT nulab nulnul
+DISTINCT strempty nulnul
+STRING str-quote  strquote  010c71756f746522696e73696465 "quote\"inside"
+STRING str-bslash strbslash 010a6261636b5c736c617368     "back\\slash"
+STRING str-tab    strtab    010774616209746162           "tab\ttab"
+STRING str-nl     strnl     010a6c696e650a627265616b     "line\nbreak"
+STRING str-bslash-n-literal strbslashn 0104615c6e62 "a\\nb"
+
+# --- binary UTF-8 distinctions ---
+STRING str-ascent  utf8eacute 010668c3a96c6c6f "h\xc3\xa9llo"
+STRING str-cjk     strcjk     0109e697a5e69cace8aa9e "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e"
+STRING str-emoji   stremoji   0104f09f9880 "\xf0\x9f\x98\x80"
+STRING str-invalid-byte strinvalid 010180 "\x80"
+STRING str-e-acute strea 0102c3a9 "\xc3\xa9"
+STRING str-e-grave streg 0102c3a8 "\xc3\xa8"
+DISTINCT strea streg
+DISTINCT strempty strinvalid
+
+# --- type separation: a String and a Number must never collide ---
+NUMBER typesep-num-five typesepfive 0201000135 "5"
+STRING typesep-str-five typesepstrfive 010135 "5"
+DISTINCT typesepfive typesepstrfive
+
+NUMBER typesep-num-zero typesepzero 0200 "0"
+STRING typesep-str-zero typesepstrzero 010130 "0"
+DISTINCT typesepzero typesepstrzero
+
+NUMBER typesep-num-negone typesepnegone 0202000131 "-1"
+STRING typesep-str-negone typesepstrnegone 01022d31 "-1"
+DISTINCT typesepnegone typesepstrnegone
+
+NUMBER typesep-num-123 typesep123 020101013203313233 "123"
+STRING typesep-str-123 typesepstr123 0103313233 "123"
+DISTINCT typesep123 typesepstr123
+
+# --- scalars reused as tuple elements below ---
+STRING elem-ab elemab 01026162 "ab"
+STRING elem-bc elembc 01026263 "bc"
+NUMBER elem-12 elem12 0201010131023132 "12"
+STRING elem-3  elem3  010133 "3"
+STRING elem-23 elem23 01023233 "23"
+STRING elem-tenant elemtenant 010674656e616e74 "tenant"
+NUMBER elem-42 elem42 0201010131023432 "42"
+
+# --- tuples: empty, mixed String/Number, and tuple-boundary safety ---
+TUPLE tuple-empty tupempty -
+TUPLE tuple-mixed tupmixed 010674656e616e7402010101310234320100 elem-tenant elem-42 str-empty
+
+# A 2-scalar tuple must not be reconstructible by any other split of scalars:
+# ["ab","c"] and ["a","bc"] share the same concatenated payload "abc" but
+# differ in where the length prefixes fall, so their encodings differ.
+TUPLE tuple-split-ab-c tupsplitabc 01026162010163 elem-ab str-c
+TUPLE tuple-split-a-bc tupsplitabc2 01016101026263 str-a elem-bc
+DISTINCT tupsplitabc tupsplitabc2
+
+# Arity is not recoverable from a length-agnostic byte compare either: three
+# one-byte strings land on different bytes than the two-scalar split above,
+# even though every string involved is drawn from {"a","b","c"}.
+TUPLE tuple-arity3-abc tuparity3 010161010162010163 str-a str-b str-c
+DISTINCT tupsplitabc2 tuparity3
+
+# A Number/String boundary is not reconstructible either: [12, "3"] and
+# [1, "23"] both interleave the digit "1" against the string bytes "23" if the
+# length prefixes are ignored, but the framing keeps them apart.
+TUPLE tuple-split-num12-3 tupsplitnum1 0201010131023132010133 elem-12 elem-3
+TUPLE tuple-split-num1-23 tupsplitnum2 020100013101023233 one elem-23
+DISTINCT tupsplitnum1 tupsplitnum2
