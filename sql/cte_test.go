@@ -237,11 +237,9 @@ func TestCTEUnsupportedBoundariesStayTypedAndRebased(t *testing.T) {
 		src    string
 		marker string
 	}{
-		{"recursive", `WITH RECURSIVE c AS (SELECT id FROM docs) SELECT id FROM c`, "RECURSIVE"},
 		{"insert body", `WITH c AS (INSERT INTO docs VALUES (?)) SELECT id FROM c`, "INSERT"},
 		{"update body", `WITH c AS (UPDATE docs SET "$doc" = ?) SELECT id FROM c`, "UPDATE"},
 		{"delete primary", `WITH c AS (SELECT id FROM docs) DELETE FROM docs`, "DELETE"},
-		{"nested recursive UTF8", `SELECT d.id FROM (/* é */ WITH RECURSIVE c AS (SELECT id FROM docs) SELECT id FROM c) d`, "RECURSIVE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Parse(tc.src)

@@ -91,11 +91,15 @@ type SelectStmt struct {
 	Set *SetExpression
 }
 
-// A WithClause owns the non-recursive common table expressions declared for
-// one SELECT. Its definitions and strings are backed by the Parser's arenas
-// and obey the same borrowed-lifetime contract as the rest of the AST.
+// A WithClause owns the common table expressions declared for one SELECT. Its
+// definitions and strings are backed by the Parser's arenas and obey the same
+// borrowed-lifetime contract as the rest of the AST.
 type WithClause struct {
 	CTEs []CommonTableExpr
+	// Recursive records the authored WITH RECURSIVE scope marker. Individual
+	// definitions carry non-zero Recursive metadata only when they actually
+	// reference themselves; SQL permits non-recursive definitions in this scope.
+	Recursive bool
 	// Pos is the byte offset of WITH.
 	Pos int
 }
@@ -123,12 +127,31 @@ type CommonTableExpr struct {
 	// checks Columns against the materialized schema; the parser must not infer
 	// arity from len(Query.Columns).
 	ColumnArityDeferred bool
-	Query               *SelectStmt
-	Materialization     CTEMaterialization
+	// Query retains the complete authored body. For a recursive definition it
+	// is the lossless UNION set expression; Recursive identifies the two leaves
+	// consumed by bounded fixpoint lowering. A consumer must branch on
+	// Recursive.Anchor before treating Query as an ordinary CTE body.
+	Query           *SelectStmt
+	Recursive       RecursiveCTE
+	Materialization CTEMaterialization
 	// Pos is the byte offset of Name. HintPos is the byte offset of
 	// MATERIALIZED or NOT, or -1 when no policy was written.
 	Pos     int
 	HintPos int
+}
+
+// RecursiveCTE is validated, allocation-free metadata for the supported SQL
+// recursive shape. Its zero value identifies an ordinary definition, including
+// an ordinary definition authored inside WITH RECURSIVE.
+//
+// Anchor and Term are exact leaves of CommonTableExpr.Query.Set. Their
+// ParamBase values are relative to that CTE body; Query.ParamBase is the body's
+// absolute base in the containing statement. Lowering adds the two with checked
+// arithmetic and never renumbers operands.
+type RecursiveCTE struct {
+	Anchor    *SelectStmt
+	Term      *SelectStmt
+	Operation SetOperation
 }
 
 // A JoinKind names a join's flavour.

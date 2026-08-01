@@ -1091,7 +1091,9 @@ func TestErrorClassification(t *testing.T) {
 		{`CREATE TABLE t (a int)`, sqlstateInternalError},
 		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
 		{`DECLARE c CURSOR FOR SELECT 1`, sqlstateFeatureNotSupported},
-		{`WITH RECURSIVE x AS (SELECT id FROM users) SELECT id FROM x`, sqlstateFeatureNotSupported},
+		{`WITH RECURSIVE x(id) AS (` +
+			`SELECT id FROM users UNION ALL SELECT id FROM x` +
+			`) SEARCH DEPTH FIRST BY id SET ord SELECT id FROM x`, sqlstateFeatureNotSupported},
 		{`banana`, sqlstateSyntaxError},
 		{`SET statement_timeout = 100`, sqlstateFeatureNotSupported},
 		{`SET search_path = public`, sqlstateFeatureNotSupported},
@@ -1115,13 +1117,13 @@ func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
 			text := tc.Statement
 			reason := tc.ReasonContains
 			if tc.ID == "cte" {
-				// Non-recursive CTE syntax is now part of the bounded frontend.
-				// Keep this cross-adapter taxonomy case on the explicitly
-				// unsupported recursive operator until its fixpoint executor lands.
-				text = `WITH RECURSIVE x AS (` +
-					`SELECT id FROM docs` +
-					`) SELECT id FROM x`
-				reason = "recursive CTEs"
+				// Ordinary and bounded recursive CTE execution are supported.
+				// Keep this cross-adapter taxonomy case on a valid standard
+				// recursive SEARCH clause that has no physical lowering yet.
+				text = `WITH RECURSIVE x(id) AS (` +
+					`SELECT id FROM docs UNION ALL SELECT id FROM x` +
+					`) SEARCH DEPTH FIRST BY id SET ord SELECT id FROM x`
+				reason = "SEARCH"
 			}
 			statement, prepareErr := db.Prepare(text)
 			if statement != nil {

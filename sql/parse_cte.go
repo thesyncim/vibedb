@@ -1,15 +1,14 @@
 package sql
 
-// Parsing and lexical binding for non-recursive SELECT CTEs.
+// Parsing and lexical binding for SELECT CTEs.
 
 func (p *Parser) parseWithClause() error {
 	withPos := p.tok.pos
 	p.advance() // WITH
+	recursive := false
 	if p.atKeyword(kwRecursive) {
-		return newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"WITH RECURSIVE is not supported yet; recursive CTEs require a bounded fixpoint executor",
-		)
+		recursive = true
+		p.advance()
 	}
 
 	for {
@@ -70,6 +69,14 @@ func (p *Parser) parseWithClause() error {
 		if err != nil {
 			return err
 		}
+		if recursive {
+			if extension := recursiveCTEClauseExtension(p.tok); extension != "" {
+				return newFeatureNotSupportedError(
+					p.lx.src, p.tok.pos,
+					extension+" on a recursive common table expression is not supported yet",
+				)
+			}
+		}
 		arityKnown := cteOutputArityKnown(query)
 		if arityKnown && len(columns) > len(query.Columns) {
 			return newCTEColumnAliasArityError(
@@ -100,7 +107,7 @@ func (p *Parser) parseWithClause() error {
 
 	definitions := p.ctes.allocDirty(len(p.cteScratch))
 	copy(definitions, p.cteScratch)
-	p.with = WithClause{CTEs: definitions, Pos: withPos}
+	p.with = WithClause{CTEs: definitions, Recursive: recursive, Pos: withPos}
 	p.out.With = &p.with
 	p.activeCTEs.defs = definitions
 
@@ -109,6 +116,11 @@ func (p *Parser) parseWithClause() error {
 	// prefer a real collection and report self/forward use only when absent.
 	for i := range definitions {
 		markDeferredCTEReferences(definitions[i].Query, definitions[i:])
+	}
+	if recursive {
+		if err := validateRecursiveCTEDefinitions(p.lx.src, definitions); err != nil {
+			return err
+		}
 	}
 	return nil
 }
