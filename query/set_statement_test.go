@@ -516,6 +516,45 @@ func (r *setStatementErrorRunner) runIntoFrame(
 }
 func (r *setStatementErrorRunner) releaseRelations(*statementFrame) {}
 
+type setStatementExtraColumnRunner struct {
+	names      []string
+	collection string
+}
+
+func (r *setStatementExtraColumnRunner) Columns() []string { return r.names }
+func (r *setStatementExtraColumnRunner) NumParams() int    { return 0 }
+func (r *setStatementExtraColumnRunner) Collection() string {
+	return r.collection
+}
+func (r *setStatementExtraColumnRunner) AppendSchema(dst []OutputColumn) []OutputColumn {
+	for column, name := range r.names {
+		dst = append(dst, OutputColumn{Header: name, Ordinal: uint32(column)})
+	}
+	return dst
+}
+func (r *setStatementExtraColumnRunner) runIntoFrame(
+	exec *Exec, _ Source, _ []any, _ *statementFrame, _ string,
+) (Cursor, error) {
+	const physicalColumns = 2
+	exec.Result.beginResultBudget(-1, -1)
+	if err := exec.Result.admitResultShape(physicalColumns, 1); err != nil {
+		return Cursor{}, err
+	}
+	exec.Result.Columns = resize(exec.Result.Columns, physicalColumns)
+	for column := range exec.Result.Columns {
+		cell := Cell{kind: TypeNumber, flag: cellInteger, word: uint64(column + 1)}
+		if err := exec.Result.admitResultCell(cell); err != nil {
+			return Cursor{}, err
+		}
+		exec.Result.Columns[column].Header = fmt.Sprintf("physical_%d", column)
+		exec.Result.Columns[column].Cells = resize(exec.Result.Columns[column].Cells, 1)
+		exec.Result.Columns[column].Cells[0] = cell
+	}
+	exec.Result.RowCount = 1
+	return Cursor{}, nil
+}
+func (r *setStatementExtraColumnRunner) releaseRelations(*statementFrame) {}
+
 type cancelingSetStatementRunner struct {
 	setStatementRunner
 	flag    *CancelFlag
@@ -534,6 +573,77 @@ func (r *cancelingSetStatementRunner) runIntoFrame(
 		r.flag.Cancel()
 	}
 	return cursor, err
+}
+
+func TestSetStatementRejectsExtraPhysicalLeafColumnsBeforePublication(t *testing.T) {
+	db := setStatementDatabase(t)
+	left, right := prepareSetStatementLeaves(t)
+	defer left.Release()
+	defer right.Release()
+	extra := &setStatementExtraColumnRunner{
+		names: []string{"second_value"}, collection: right.Collection(),
+	}
+	descriptor := prepareBinarySetStatement(
+		t, left, extra, SetTreeUnionAll, 0, 1, 1,
+	)
+	var runtime setStatementRuntime
+	if err := runtime.prepare(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Release()
+
+	args := []any{int64(1)}
+	var parent Exec
+	var frame statementFrame
+	if err := frame.begin(parent.Options); err != nil {
+		t.Fatal(err)
+	}
+	frame.args = args
+	_, err := runtime.runIntoFrame(
+		&parent, FromDatabase(db.Snapshot(), left.Collection()), args, &frame,
+	)
+	var arity *SetTreeArityError
+	if !errors.As(err, &arity) || arity.Left != 1 || arity.Right != 2 {
+		t.Fatalf("extra physical column error = %T %v, want arity 1/2", err, err)
+	}
+	if parent.Result.RowCount != 0 || parent.Result.resultBytesUsed != 0 ||
+		frame.intermediate.used != 0 {
+		t.Fatalf("width rejection published/retained rows=%d result=%d intermediate=%d",
+			parent.Result.RowCount, parent.Result.resultBytesUsed, frame.intermediate.used)
+	}
+	for leaf := range runtime.execs {
+		if runtime.execs[leaf].Result.RowCount != 0 ||
+			runtime.execs[leaf].Result.resultBytesUsed != 0 {
+			t.Fatalf("leaf %d retained rows=%d bytes=%d", leaf,
+				runtime.execs[leaf].Result.RowCount,
+				runtime.execs[leaf].Result.resultBytesUsed)
+		}
+	}
+	for slot := range runtime.tree.slots {
+		if runtime.tree.slots[slot].active {
+			t.Fatalf("set-tree slot %d remained active after width rejection", slot)
+		}
+	}
+
+	descriptor = prepareBinarySetStatement(
+		t, left, right, SetTreeUnionAll, 0, 1, 2,
+	)
+	if err := runtime.prepare(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	args = []any{int64(1), int64(4)}
+	if err := frame.begin(parent.Options); err != nil {
+		t.Fatal(err)
+	}
+	frame.args = args
+	cursor, err := runtime.runIntoFrame(
+		&parent, FromDatabase(db.Snapshot(), left.Collection()), args, &frame,
+	)
+	if err != nil || len(setStatementCursorJSON(cursor)) != 8 ||
+		frame.intermediate.used != 0 {
+		t.Fatalf("width-rejection recovery = rows %d bytes %d err %v",
+			parent.Result.RowCount, frame.intermediate.used, err)
+	}
 }
 
 func TestSetStatementExactLeafErrorCancellationRecoveryAndNoPartialResult(t *testing.T) {

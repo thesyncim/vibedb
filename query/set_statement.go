@@ -311,7 +311,7 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 	}
 	reserved = true
 	r.observeIntermediate(frame.intermediate.used)
-	if len(exec.Result.Columns) < columns {
+	if len(exec.Result.Columns) != columns {
 		return 0, 0, &SetTreeArityError{
 			Node: source, Left: columns, Right: len(exec.Result.Columns),
 		}
