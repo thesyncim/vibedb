@@ -57,3 +57,77 @@ func (e *DestinationError) Error() string {
 }
 
 func (e *DestinationError) Unwrap() error { return ErrInvalidDestination }
+
+// ErrInvalidShardValue is the sentinel every rejected shard-key value matches
+// under errors.Is: a value that cannot be canonically encoded or that a mapper
+// refuses.
+var ErrInvalidShardValue = errors.New("distribution: invalid shard-key value")
+
+// ShardValueError reports why a shard-key value was rejected. It wraps
+// ErrInvalidShardValue.
+type ShardValueError struct {
+	Reason string
+}
+
+func (e *ShardValueError) Error() string {
+	return "distribution: invalid shard-key value: " + e.Reason
+}
+
+func (e *ShardValueError) Unwrap() error { return ErrInvalidShardValue }
+
+// ErrIncompleteShardKey is the sentinel for a shard key that lacks a component
+// the requested prefix length requires.
+var ErrIncompleteShardKey = errors.New("distribution: incomplete shard key")
+
+// ErrUnsupportedMapper is the sentinel every unusable-mapper failure matches
+// under errors.Is: an unsupported prefix length or a missing mapper/manifest.
+var ErrUnsupportedMapper = errors.New("distribution: unsupported mapper")
+
+// MapperError reports why a mapper request was refused. It wraps
+// ErrUnsupportedMapper.
+type MapperError struct {
+	Reason string
+}
+
+func (e *MapperError) Error() string {
+	return "distribution: unsupported mapper: " + e.Reason
+}
+
+func (e *MapperError) Unwrap() error { return ErrUnsupportedMapper }
+
+// ErrScatterRejected is the sentinel returned when admission forbids an unknown
+// or all-shard scatter route.
+var ErrScatterRejected = errors.New("distribution: scatter route rejected")
+
+// ErrRouteExpansionLimit is the sentinel every candidate-mapping overflow
+// matches under errors.Is.
+var ErrRouteExpansionLimit = errors.New("distribution: route expansion limit exceeded")
+
+// ExpansionLimitError reports the candidate-mapping limit a route would exceed.
+// It wraps ErrRouteExpansionLimit.
+type ExpansionLimitError struct {
+	Limit int
+}
+
+func (e *ExpansionLimitError) Error() string {
+	return fmt.Sprintf("distribution: route expansion limit exceeded: candidate mappings exceed %d", e.Limit)
+}
+
+func (e *ExpansionLimitError) Unwrap() error { return ErrRouteExpansionLimit }
+
+// ErrTargetShardLimit is the sentinel every selected-shard overflow matches
+// under errors.Is.
+var ErrTargetShardLimit = errors.New("distribution: target shard limit exceeded")
+
+// TargetLimitError reports the target-shard limit a route exceeded and how many
+// shards it selected. It wraps ErrTargetShardLimit.
+type TargetLimitError struct {
+	Limit int
+	Count int
+}
+
+func (e *TargetLimitError) Error() string {
+	return fmt.Sprintf("distribution: target shard limit exceeded: %d selected shards exceed %d", e.Count, e.Limit)
+}
+
+func (e *TargetLimitError) Unwrap() error { return ErrTargetShardLimit }

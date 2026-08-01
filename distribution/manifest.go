@@ -3,12 +3,16 @@ package distribution
 import "slices"
 
 // Shard is one physical shard: a unique id, the half-open keyspace range it
-// owns, and at least one leader endpoint. It is the input record to
-// NewManifest; a validated Manifest holds defensive copies.
+// owns, at least one leader endpoint, and the ownership epoch that fences its
+// writers. It is the input record to NewManifest; a validated Manifest holds
+// defensive copies. Epoch is optional metadata carried onto routed targets; it
+// stays zero until static ownership is configured, and never participates in
+// keyspace validation.
 type Shard struct {
 	ID      ShardID
 	Range   KeyRange
 	Leaders []EndpointID
+	Epoch   OwnershipEpoch
 }
 
 // Manifest is an immutable, validated shard layout for one routing generation
