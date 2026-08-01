@@ -16,4 +16,5 @@ var UnsupportedSQLCases = []UnsupportedSQLCase{
 	{ID: "savepoint", Statement: "SAVEPOINT nested", ReasonContains: "savepoints are not supported"},
 	{ID: "alter", Statement: "ALTER TABLE docs ADD COLUMN n STRING", ReasonContains: "ALTER is not"},
 	{ID: "cte", Statement: "WITH x AS (SELECT 1) SELECT * FROM x", ReasonContains: "common table expressions"},
+	{ID: "listen", Statement: "LISTEN changes", ReasonContains: "asynchronous notification"},
 }
