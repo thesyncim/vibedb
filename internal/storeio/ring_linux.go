@@ -28,7 +28,6 @@ const (
 	ioUringSetupSubmitAll     = 1 << 7
 	ioUringSetupCoopTaskRun   = 1 << 8
 	ioUringSetupSingleIssuer  = 1 << 12
-	ioUringSetupDeferTaskRun  = 1 << 13
 	ioUringFeatSingleMmap     = 1 << 0
 	ioUringFeatNoDrop         = 1 << 1
 	ioUringEnterGetEvents     = 1 << 0
@@ -309,8 +308,11 @@ func setupRing(entries uint32, singleIssuer bool) (ioUringParams, int, bool, err
 	base := uint32(ioUringSetupCQSize | ioUringSetupSubmitAll | ioUringSetupCoopTaskRun)
 	flags := []uint32{base}
 	if singleIssuer {
+		// Keep cooperative task execution, but do not defer it. This owner waits
+		// synchronously for each durability chain; DEFER_TASKRUN adds a second
+		// enter/wakeup handoff to the critical path instead of creating useful
+		// overlap. SINGLE_ISSUER retains the same-thread ring optimization.
 		flags = []uint32{
-			base | ioUringSetupSingleIssuer | ioUringSetupDeferTaskRun,
 			base | ioUringSetupSingleIssuer,
 			base,
 		}
