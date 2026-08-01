@@ -120,6 +120,13 @@ func (s *Statement) build(args []any) error {
 // Collection returns the name of the driving collection — the FROM entry. A
 // statement always has one, because the parser requires FROM.
 func (s *Statement) Collection() string {
+	if s.nested != nil && s.nested.driving != "" {
+		return s.nested.driving
+	}
+	return s.resolveDrivingCollection()
+}
+
+func (s *Statement) resolveDrivingCollection() string {
 	if ref := s.cteReference(); ref != nil && ref.def != nil && ref.def.stmt != nil {
 		return ref.def.stmt.Collection()
 	}

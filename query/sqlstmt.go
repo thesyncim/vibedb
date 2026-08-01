@@ -67,7 +67,9 @@ type Statement struct {
 
 	// params is the placeholder count, the value a driver validates its
 	// argument count against before it does anything else.
-	params int
+	params           int
+	requiresCatalog  bool
+	drivingPredicate *sqlast.Expr
 
 	// c and q are this statement's own compiler and the Query it compiles
 	// into. They are values rather than pointers so a Statement is one
@@ -146,6 +148,7 @@ type nestedStatements struct {
 	ctes       *statementCTEs
 	cte        *statementCTEReference
 	ownsCTEs   bool
+	driving    string
 }
 
 type subqueryUse uint8
@@ -299,6 +302,11 @@ func prepareTreeInContext(
 		s.Release()
 		return nil, err
 	}
+	s.requiresCatalog = selectRequiresCatalog(tree)
+	s.drivingPredicate = s.resolveDrivingPredicate()
+	if s.nested != nil {
+		s.nested.driving = s.resolveDrivingCollection()
+	}
 	if err := s.describe(); err != nil {
 		s.Release()
 		return nil, err
@@ -357,7 +365,7 @@ func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
 // snapshot; adapters use this to avoid constructing a single-collection Source
 // that execution would have to reject.
 func (s *Statement) RequiresCatalog() bool {
-	return selectRequiresCatalog(s.tree, "")
+	return s.requiresCatalog
 }
 
 // AppendSchema appends the statement's output schema to dst, one entry per
@@ -424,7 +432,9 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// Query.RunInto's destination contract by invalidating the prior result and
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
-	s.discardRelations()
+	if s.nested != nil {
+		s.discardRelations()
+	}
 	e.Stats = ExecStats{}
 	var frame statementFrame
 	if err := frame.begin(e.Options); err != nil {
@@ -461,13 +471,17 @@ func (s *Statement) runIntoFrame(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
 			s.params, len(args))
 	}
-	if s.canFuseCTE() {
-		return s.runFusedCTE(e, src, frame, intermediateResource)
-	}
-	runSource, err := s.runRelations(e, src, args, frame)
-	if err != nil {
-		s.releaseRelations(frame)
-		return Cursor{}, err
+	runSource := src
+	if s.nested != nil {
+		if s.canFuseCTE() {
+			return s.runFusedCTE(e, src, frame, intermediateResource)
+		}
+		var err error
+		runSource, err = s.runRelations(e, src, args, frame)
+		if err != nil {
+			s.releaseRelations(frame)
+			return Cursor{}, err
+		}
 	}
 	if err := s.runSubqueries(e, src, args, frame); err != nil {
 		s.releaseSubqueries(frame)

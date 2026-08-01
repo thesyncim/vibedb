@@ -285,6 +285,13 @@ func (s *Statement) canFuseCTE() bool {
 //
 // The returned AST is owned by s and follows Statement's lifetime.
 func (s *Statement) DrivingPredicate() *sqlast.Expr {
+	if s == nil {
+		return nil
+	}
+	return s.drivingPredicate
+}
+
+func (s *Statement) resolveDrivingPredicate() *sqlast.Expr {
 	if s == nil || s.tree == nil {
 		return nil
 	}
@@ -577,7 +584,7 @@ func (s *Statement) resolveRelationColumn(name string) (int, error) {
 	return found, nil
 }
 
-func selectRequiresCatalog(tree *sqlast.SelectStmt, _ string) bool {
+func selectRequiresCatalog(tree *sqlast.SelectStmt) bool {
 	var first string
 	return scanSelectCatalog(tree, &first)
 }
