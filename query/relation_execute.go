@@ -48,7 +48,15 @@ func (p *plan) runRelationInto(
 	// before returning so the next generic Workspace cleanup cannot clear the
 	// statement-owned relation. Nested-path columns remain Workspace-owned and
 	// retain their warmed capacity.
-	defer p.unbindRelationRoots(ctx)
+	defer func() {
+		p.unbindRelationRoots(ctx)
+		if err != nil {
+			// Group/order/result-budget failures may happen after scalar views
+			// have reached retained Workspace structures. Clear those borrows
+			// before a Statement resets or reuses its spool.
+			w.clearBorrowedViews()
+		}
+	}()
 
 	if err := ctx.extractRelationValues(
 		p, spool, p.filterCols, &w.text, w,

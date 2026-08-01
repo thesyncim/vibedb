@@ -1,11 +1,16 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"unsafe"
 
 	"github.com/thesyncim/vibejson/x/byteview"
+)
+
+var errRelationSpoolSizing = errors.New(
+	"query: relation spool publication exceeded its sizing pass",
 )
 
 // relationSpool is the statement-owned, columnar ownership boundary between a
@@ -20,9 +25,10 @@ import (
 // lifetime is tied to the single-consumer Statement that owns it, which is the
 // same ownership model future shared and reference-local CTE runtimes need.
 type relationSpool struct {
-	columns [][]scalar
-	data    []byte
-	rows    int
+	columns     [][]scalar
+	data        []byte
+	rows        int
+	plannedData int
 }
 
 func (s *relationSpool) reset() {
@@ -35,6 +41,7 @@ func (s *relationSpool) reset() {
 	}
 	s.data = s.data[:0]
 	s.rows = 0
+	s.plannedData = 0
 }
 
 func (s *relationSpool) release() {
@@ -111,10 +118,13 @@ func measureRelationSpool(
 			if err := cancellationCheckpoint(cancel, column); err != nil {
 				return 0, 0, err
 			}
-			payload = saturatedBytes(
-				payload,
-				int64(relationCellOwnedBytes(cursor.Cell(column))),
+			cellBytes, err := relationCellOwnedBytesCancelable(
+				cursor.Cell(column), cancel,
 			)
+			if err != nil {
+				return 0, 0, err
+			}
+			payload = saturatedBytes(payload, int64(cellBytes))
 			if payload == math.MaxInt64 {
 				return rows, payload, nil
 			}
@@ -123,32 +133,101 @@ func measureRelationSpool(
 }
 
 func relationCellOwnedBytes(cell Cell) int {
-	if cell.kind == TypeNull && cell.flag&cellMissing != 0 {
-		return 0
-	}
-	if cell.raw == nil {
-		if cell.kind == TypeNumber {
-			return encodedCellJSONBytes(cell)
-		}
-		return 0
-	}
-	bytes := len(cell.raw)
-	if cell.kind == TypeString && relationJSONStringEscaped(cell.raw) {
-		if len(cell.text) > math.MaxInt-bytes {
-			return math.MaxInt
-		}
-		bytes += len(cell.text)
-	}
+	bytes, _ := relationCellOwnedBytesCancelable(cell, nil)
 	return bytes
 }
 
-func relationJSONStringEscaped(raw []byte) bool {
-	for _, b := range raw {
-		if b == '\\' {
-			return true
+func relationCellOwnedBytesCancelable(
+	cell Cell,
+	cancel *CancelFlag,
+) (int, error) {
+	if cell.kind == TypeNull && cell.flag&cellMissing != 0 {
+		return 0, nil
+	}
+	if cell.raw == nil {
+		switch cell.kind {
+		case TypeNumber:
+			return encodedCellJSONBytes(cell), cancellationError(cancel)
+		case TypeString:
+			encoded, escaped, err := relationEncodedStringBytesCancelable(
+				cell.text, cancel,
+			)
+			if err != nil {
+				return 0, err
+			}
+			if encoded == math.MaxInt {
+				return math.MaxInt, nil
+			}
+			if escaped {
+				if len(cell.text) > math.MaxInt-encoded {
+					return math.MaxInt, nil
+				}
+				encoded += len(cell.text)
+			}
+			return encoded, nil
+		}
+		return 0, cancellationError(cancel)
+	}
+	bytes := len(cell.raw)
+	if cell.kind == TypeString {
+		escaped, err := relationJSONStringEscapedCancelable(cell.raw, cancel)
+		if err != nil {
+			return 0, err
+		}
+		if escaped {
+			if len(cell.text) > math.MaxInt-bytes {
+				return math.MaxInt, nil
+			}
+			bytes += len(cell.text)
 		}
 	}
-	return false
+	return bytes, cancellationError(cancel)
+}
+
+func relationJSONStringEscapedCancelable(
+	raw []byte,
+	cancel *CancelFlag,
+) (bool, error) {
+	for i, b := range raw {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return false, err
+		}
+		if b == '\\' {
+			return true, nil
+		}
+	}
+	return false, cancellationError(cancel)
+}
+
+// relationEncodedStringBytesCancelable returns the exact minimal JSON encoding
+// width of text and whether that encoding cannot lend its quoted interior as
+// decoded text. It is the allocation-free sizing half of appendJSONString.
+func relationEncodedStringBytesCancelable(
+	text string,
+	cancel *CancelFlag,
+) (bytes int, escaped bool, err error) {
+	bytes = 2 // quotes
+	for i := 0; i < len(text); i++ {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return 0, false, err
+		}
+		additional := 1
+		switch text[i] {
+		case '"', '\\', '\b', '\f', '\n', '\r', '\t':
+			additional = 2
+			escaped = true
+		default:
+			if text[i] < 0x20 {
+				additional = 6 // \u00XX
+				escaped = true
+			}
+		}
+		if additional > math.MaxInt-bytes {
+			return math.MaxInt, true, nil
+		}
+		bytes += additional
+	}
+	return bytes, escaped, cancellationError(cancel)
 }
 
 func relationSpoolRetainedBytes(rows, columns int, payload int64) int64 {
@@ -187,6 +266,7 @@ func (s *relationSpool) begin(rows, columns int, payload int64) error {
 		s.data = s.data[:0]
 	}
 	s.rows = rows
+	s.plannedData = need
 	return nil
 }
 
@@ -206,6 +286,9 @@ func (s *relationSpool) fill(
 				return fmt.Errorf(
 					"query: relation spool changed between sizing and publication",
 				)
+			}
+			if len(s.data) != s.plannedData {
+				return s.sizingError(0)
 			}
 			return nil
 		}
@@ -235,14 +318,28 @@ func (s *relationSpool) ownCell(cell Cell, cancel *CancelFlag) (scalar, error) {
 	} else if len(cell.raw) != 0 {
 		start := len(s.data)
 		var err error
-		s.data, err = appendRelationOwnedBytes(s.data, cell.raw, cancel)
+		err = s.appendOwnedBytes(cell.raw, cancel)
 		if err != nil {
 			return scalar{}, err
 		}
 		raw = s.data[start:len(s.data):len(s.data)]
 	} else if cell.kind == TypeNumber {
+		need := encodedCellJSONBytes(cell)
+		if err := s.ensureData(need); err != nil {
+			return scalar{}, err
+		}
 		start := len(s.data)
 		s.data = cell.AppendJSON(s.data)
+		if len(s.data)-start != need {
+			return scalar{}, s.sizingError(0)
+		}
+		raw = s.data[start:len(s.data):len(s.data)]
+	} else if cell.kind == TypeString {
+		text, _ := cell.Text()
+		start := len(s.data)
+		if err := s.appendJSONString(text, cancel); err != nil {
+			return scalar{}, err
+		}
 		raw = s.data[start:len(s.data):len(s.data)]
 	}
 
@@ -263,7 +360,11 @@ func (s *relationSpool) ownCell(cell Cell, cancel *CancelFlag) (scalar, error) {
 		return value, nil
 	case TypeString:
 		text, _ := cell.Text()
-		if len(raw) >= 2 && !relationJSONStringEscaped(raw) {
+		escaped, err := relationJSONStringEscapedCancelable(raw, cancel)
+		if err != nil {
+			return scalar{}, err
+		}
+		if len(raw) >= 2 && !escaped {
 			return scalar{
 				kind: kindString,
 				sval: byteview.String(raw[1 : len(raw)-1]),
@@ -271,11 +372,7 @@ func (s *relationSpool) ownCell(cell Cell, cancel *CancelFlag) (scalar, error) {
 			}, nil
 		}
 		start := len(s.data)
-		var err error
-		s.data, err = appendRelationOwnedBytes(
-			s.data, byteview.Bytes(text), cancel,
-		)
-		if err != nil {
+		if err := s.appendOwnedBytes(byteview.Bytes(text), cancel); err != nil {
 			return scalar{}, err
 		}
 		return scalar{
@@ -288,21 +385,80 @@ func (s *relationSpool) ownCell(cell Cell, cancel *CancelFlag) (scalar, error) {
 	}
 }
 
-func appendRelationOwnedBytes(
-	dst, src []byte,
-	cancel *CancelFlag,
-) ([]byte, error) {
+func (s *relationSpool) ensureData(additional int) error {
+	if additional < 0 || len(s.data) > s.plannedData ||
+		additional > s.plannedData-len(s.data) ||
+		additional > cap(s.data)-len(s.data) {
+		return s.sizingError(additional)
+	}
+	return nil
+}
+
+func (s *relationSpool) sizingError(additional int) error {
+	return fmt.Errorf(
+		"%w: planned=%d used=%d additional=%d capacity=%d",
+		errRelationSpoolSizing, s.plannedData, len(s.data), additional,
+		cap(s.data),
+	)
+}
+
+func (s *relationSpool) appendOwnedBytes(src []byte, cancel *CancelFlag) error {
+	if err := s.ensureData(len(src)); err != nil {
+		return err
+	}
 	if cancel == nil {
-		return append(dst, src...), nil
+		s.data = append(s.data, src...)
+		return nil
 	}
 	const chunk = 32 << 10
 	for len(src) != 0 {
 		if err := cancellationError(cancel); err != nil {
-			return dst, err
+			return err
 		}
 		n := min(len(src), chunk)
-		dst = append(dst, src[:n]...)
+		s.data = append(s.data, src[:n]...)
 		src = src[n:]
 	}
-	return dst, cancellationError(cancel)
+	return cancellationError(cancel)
+}
+
+func (s *relationSpool) appendJSONString(text string, cancel *CancelFlag) error {
+	need, _, err := relationEncodedStringBytesCancelable(text, cancel)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureData(need); err != nil {
+		return err
+	}
+	s.data = append(s.data, '"')
+	const hex = "0123456789abcdef"
+	for i := 0; i < len(text); i++ {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return err
+		}
+		switch b := text[i]; b {
+		case '"', '\\':
+			s.data = append(s.data, '\\', b)
+		case '\b':
+			s.data = append(s.data, '\\', 'b')
+		case '\f':
+			s.data = append(s.data, '\\', 'f')
+		case '\n':
+			s.data = append(s.data, '\\', 'n')
+		case '\r':
+			s.data = append(s.data, '\\', 'r')
+		case '\t':
+			s.data = append(s.data, '\\', 't')
+		default:
+			if b < 0x20 {
+				s.data = append(
+					s.data, '\\', 'u', '0', '0', hex[b>>4], hex[b&0x0f],
+				)
+				continue
+			}
+			s.data = append(s.data, b)
+		}
+	}
+	s.data = append(s.data, '"')
+	return cancellationError(cancel)
 }

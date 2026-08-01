@@ -2,11 +2,136 @@ package query
 
 import (
 	"errors"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 )
+
+func TestRelationSpoolPublicationExactlyMatchesSizingPass(t *testing.T) {
+	large := []byte(`{"blob":"` + strings.Repeat("x", 128<<10) + `"}`)
+	var decoded []byte
+	largeCell := cellFromScalar(classifyRawInto(
+		vibejson.RawValue{Src: large}, &decoded,
+	))
+	decoded = decoded[:0]
+	escapedRaw := []byte(`"raw\nstring"`)
+	escapedCell := cellFromScalar(classifyRawInto(
+		vibejson.RawValue{Src: escapedRaw}, &decoded,
+	))
+	cells := []Cell{
+		{kind: TypeString, text: "computed α"},
+		{kind: TypeString, text: "line\n\"slash\\"},
+		{kind: TypeNumber, flag: cellInteger, word: uint64(42)},
+		{kind: TypeNumber, word: math.Float64bits(3.25)},
+		largeCell,
+		cellFromScalar(scalar{kind: kindNull}),
+		nullCell(),
+		escapedCell,
+	}
+	result := Result{Columns: make([]ResultColumn, len(cells)), RowCount: 1}
+	for column := range cells {
+		result.Columns[column].Cells = []Cell{cells[column]}
+	}
+	statement := Statement{outputs: len(cells)}
+	cursor := statement.cursor(&result)
+	var frame statementFrame
+	if err := frame.begin(ExecOptions{IntermediateBytes: -1}); err != nil {
+		t.Fatal(err)
+	}
+	var spool relationSpool
+	charge, err := spool.materialize(
+		cursor, len(cells), &frame, nil, "test relation spool",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.intermediate.release(charge)
+	if len(spool.data) != spool.plannedData {
+		t.Fatalf("published data = %d bytes, sizing pass planned %d",
+			len(spool.data), spool.plannedData)
+	}
+	wantRaw := []string{
+		`"computed α"`, `"line\n\"slash\\"`, "42", "3.25",
+		string(large), "", "null", string(escapedRaw),
+	}
+	for column := range wantRaw {
+		if got := string(spool.columns[column][0].raw); got != wantRaw[column] {
+			t.Fatalf("column %d raw = %q, want %q", column, got, wantRaw[column])
+		}
+	}
+	if got := spool.columns[0][0].sval; got != "computed α" {
+		t.Fatalf("computed string text = %q", got)
+	}
+	if got := spool.columns[1][0].sval; got != "line\n\"slash\\" {
+		t.Fatalf("escaped computed string text = %q", got)
+	}
+	if got := spool.columns[7][0].sval; got != "raw\nstring" {
+		t.Fatalf("escaped raw string text = %q", got)
+	}
+	if spool.columns[5][0].raw != nil {
+		t.Fatalf("missing raw = %q, want nil", spool.columns[5][0].raw)
+	}
+}
+
+func TestRelationSpoolPublicationRefusesUnmeasuredGrowth(t *testing.T) {
+	var spool relationSpool
+	if err := spool.begin(1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	beforeCap := cap(spool.data)
+	_, err := spool.ownCell(
+		Cell{kind: TypeString, text: strings.Repeat("x", 4096)}, nil,
+	)
+	if !errors.Is(err, errRelationSpoolSizing) {
+		t.Fatalf("undersized publication error = %v, want sizing invariant", err)
+	}
+	if len(spool.data) != 0 || cap(spool.data) != beforeCap {
+		t.Fatalf("rejected publication changed data len/cap to %d/%d, want 0/%d",
+			len(spool.data), cap(spool.data), beforeCap)
+	}
+}
+
+func TestRelationSpoolMixedCellWarmMaterializationIsAllocationFree(t *testing.T) {
+	large := []byte(`{"blob":"` + strings.Repeat("z", 64<<10) + `"}`)
+	var decoded []byte
+	cells := []Cell{
+		{kind: TypeString, text: "computed\nstring"},
+		{kind: TypeNumber, flag: cellInteger, word: uint64(99)},
+		{kind: TypeNumber, word: math.Float64bits(1.25)},
+		cellFromScalar(classifyRawInto(vibejson.RawValue{Src: large}, &decoded)),
+		cellFromScalar(scalar{kind: kindNull}),
+		nullCell(),
+	}
+	result := Result{Columns: make([]ResultColumn, len(cells)), RowCount: 1}
+	for column := range cells {
+		result.Columns[column].Cells = []Cell{cells[column]}
+	}
+	statement := Statement{outputs: len(cells)}
+	var spool relationSpool
+	run := func() {
+		var frame statementFrame
+		if err := frame.begin(ExecOptions{IntermediateBytes: -1}); err != nil {
+			panic(err)
+		}
+		charge, err := spool.materialize(
+			statement.cursor(&result), len(cells), &frame, nil,
+			"allocation relation spool",
+		)
+		if err != nil {
+			panic(err)
+		}
+		frame.intermediate.release(charge)
+		sqlSink += len(spool.data)
+	}
+	run()
+	run()
+	if got := testing.AllocsPerRun(100, run); got != 0 {
+		t.Fatalf("warmed mixed relation materialization allocated %.1f times, want 0", got)
+	}
+}
 
 func TestRelationSpoolExecutionMatchesSegmentOracle(t *testing.T) {
 	rows := [][]string{
@@ -33,6 +158,51 @@ func TestRelationSpoolExecutionMatchesSegmentOracle(t *testing.T) {
 		t.Fatalf("segment oracle: %v", err)
 	}
 	assertResultCellsEqual(t, relationExec.Result, segmentExec.Result)
+}
+
+func TestRelationSpoolExecutionErrorsClearBorrowsAndExecReuses(t *testing.T) {
+	spool := buildRelationSpoolForTest(t, [][]string{
+		{`1`, `{"x":"one"}`},
+		{`2`, `{"x":"two"}`},
+		{`3`, `{"x":"one"}`},
+	})
+	tests := []struct {
+		name string
+		plan *Query
+	}{
+		{
+			name: "ordered projection result budget",
+			plan: Select(Path("/1/x")).OrderBy("/1/x", Asc),
+		},
+		{
+			name: "grouped aggregate result budget",
+			plan: Select(Path("/1/x"), Count()).
+				GroupBy("/1/x").OrderBy("/1/x", Asc),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var exec Exec
+			exec.Options.ResultBytes = 1
+			err := test.plan.RunInto(&exec, fromRelationSpool(&spool))
+			var budgetErr *ResultBudgetError
+			if !errors.As(err, &budgetErr) {
+				t.Fatalf("RunInto error = %v, want result budget", err)
+			}
+			assertWorkspaceBorrowedViewsCleared(t, &exec.Workspace)
+			if exec.Result.RowCount != 0 {
+				t.Fatalf("failed result retained %d rows", exec.Result.RowCount)
+			}
+
+			exec.Options.ResultBytes = -1
+			if err := test.plan.RunInto(&exec, fromRelationSpool(&spool)); err != nil {
+				t.Fatalf("Exec reuse: %v", err)
+			}
+			if exec.Result.RowCount == 0 {
+				t.Fatal("Exec reuse returned no rows")
+			}
+		})
+	}
 }
 
 func TestSQLRelationSpoolPreservesExactOwnedValuesAndMissing(t *testing.T) {
@@ -211,6 +381,23 @@ func TestSQLRelationSpoolCancellationDoesNotPublishAndRecovers(t *testing.T) {
 	)
 	if err != nil || !cursor.Next() {
 		t.Fatalf("post-cancel recovery failed: row=%d err=%v", cursor.Row(), err)
+	}
+	cancel.Cancel()
+	if _, err := stmt.RunInto(
+		&exec, FromDatabase(catalog, stmt.Collection()), nil,
+	); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("cancel after success error = %v, want ErrCanceled", err)
+	}
+	if spool.rows != 0 || len(spool.data) != 0 || exec.Result.RowCount != 0 {
+		t.Fatalf("cancel after success retained rows=%d data=%d result=%d",
+			spool.rows, len(spool.data), exec.Result.RowCount)
+	}
+	assertWorkspaceBorrowedViewsCleared(t, &exec.Workspace)
+	cancel.Reset()
+	if _, err := stmt.RunInto(
+		&exec, FromDatabase(catalog, stmt.Collection()), nil,
+	); err != nil {
+		t.Fatalf("second post-cancel reuse: %v", err)
 	}
 }
 
