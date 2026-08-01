@@ -32,7 +32,10 @@ jobs:
           (cd integration/pgclient && GOOS=linux GOARCH=386 go test -run '^$' -exec=true ./...)
           (cd integration/pgclient && GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...)
       - name: Tests
-        run: go test -timeout=25m ./...
+        # Durable-backed package tests reserve large mmap arenas. Serializing
+        # package binaries keeps the aggregate virtual-memory reservation
+        # deterministic without reducing test coverage or per-package timeouts.
+        run: go test -p=1 -timeout=25m ./...
       - name: PostgreSQL client integration
         if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient
