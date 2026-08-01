@@ -113,23 +113,6 @@ func (b *intermediateBudget) release(bytes int64) {
 	b.used -= bytes
 }
 
-// relationRetainedBytes is a fail-closed pre-growth estimate for the indexed
-// Segment representation of one encoded relation row. Segment stores source
-// bytes, structural entries, shape metadata, and arena slack. Charging a fixed
-// row cost plus sixteen bytes per source byte is the same conservative policy
-// used by the durable join materializer and bounds hostile, token-dense JSON
-// without relying on allocator capacity after it has already grown.
-func relationRetainedBytes(encoded int) int64 {
-	const (
-		rowBytes  = int64(512)
-		expansion = int64(16)
-	)
-	if encoded < 0 || int64(encoded) > (math.MaxInt64-rowBytes)/expansion {
-		return math.MaxInt64
-	}
-	return int64(encoded)*expansion + rowBytes
-}
-
 // predicateValuesRetainedBytes accounts the owned scalar slots and interface
 // vector a predicate subquery keeps while the outer plan is compiled and run.
 // payload is decoded string or exact non-integer number storage copied out of

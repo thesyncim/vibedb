@@ -343,7 +343,7 @@ func (s *Statement) Release() {
 		if s.nested.derived != nil {
 			s.nested.derived.stmt.Release()
 			s.nested.derived.exec.Release()
-			s.nested.derived.segment.Reset()
+			s.nested.derived.spool.release()
 		}
 	}
 	*s = Statement{}
@@ -370,6 +370,7 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// Query.RunInto's destination contract by invalidating the prior result and
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
+	s.discardDerived()
 	e.Stats = ExecStats{}
 	var frame statementFrame
 	if err := frame.begin(e.Options); err != nil {
@@ -436,6 +437,10 @@ func (s *Statement) runIntoFrame(
 		e.Options.ResultBytes = remaining
 	}
 	if err := s.q.RunInto(e, runSource); err != nil {
+		// A relation execution may have parked grouped/order state that borrows
+		// its spool before a later result-budget or cancellation error. Sever
+		// every parent view before resetting the statement-owned spool.
+		clearExecBorrowedViews(e)
 		s.releaseDerived(frame)
 		var resultErr *ResultBudgetError
 		if intermediateResource != "" && errors.As(err, &resultErr) &&

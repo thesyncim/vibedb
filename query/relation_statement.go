@@ -3,12 +3,9 @@ package query
 import (
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
-	"github.com/thesyncim/vibedb/store"
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -49,23 +46,20 @@ func (e *RelationColumnError) Unwrap() error {
 	return ErrUndefinedColumn
 }
 
-// statementDerived is one uncorrelated, relation-valued child plan. Segment
-// uses private ordinal keys rather than SQL output names, preserving duplicate
-// names while still feeding the mature indexed JSON scan kernel without any
-// decimal or JSON-value conversion.
+// statementDerived is one uncorrelated, relation-valued child plan. Its spool
+// is ordinal and columnar: SQL output names remain display metadata, so
+// duplicate names never collapse relation identity.
 type statementDerived struct {
 	tree *sqlast.SelectStmt
 	stmt *Statement
 	exec Exec
 
-	segment store.Segment
-	row     []byte
+	spool relationSpool
 
 	names       []string
 	ordinalSpec []string
 	specData    []byte
 	activeBytes int64
-	rowHigh     int64
 }
 
 func (s *Statement) prepareDerived() error {
@@ -86,11 +80,6 @@ func (s *Statement) prepareDerived() error {
 		tree: s.tree.From[0].Query,
 		stmt: child,
 	}
-	// Ordinal keys are private and queried heavily by the outer plan. Hashing
-	// removes the linear object-member walk; shape tapes compact the common flat
-	// relation row without changing nested JSON cells.
-	d.segment.Options = document.IndexOptions{HashKeys: true}
-	d.segment.ShapeTapes = true
 	d.names = append(d.names, child.Columns()...)
 	d.ordinalSpec = make([]string, len(d.names))
 	for i := range d.ordinalSpec {
@@ -242,9 +231,8 @@ func (s *Statement) runDerived(
 	}
 	// The previous successful result was invalidated by runIntoFrame before
 	// this reset, so no surviving cursor can still borrow the old relation.
-	d.segment.Reset()
+	d.spool.reset()
 	d.activeBytes = 0
-	d.rowHigh = 0
 
 	n := d.stmt.NumParams()
 	base := d.tree.ParamBase
@@ -269,56 +257,20 @@ func (s *Statement) runDerived(
 	}
 	defer frame.intermediate.release(resultBytes)
 
-	for {
-		next, err := cursor.nextWithCancel(parent.Options.Cancel)
-		if err != nil {
-			s.releaseDerived(frame)
-			return Source{}, err
-		}
-		if !next {
-			break
-		}
-		need := encodedRelationRowBytes(&cursor, len(d.names))
-		if need < 0 {
-			s.releaseDerived(frame)
-			return Source{}, &IntermediateBudgetError{
-				Resource: "derived relation row",
-				Bytes:    math.MaxInt64,
-				Limit:    frame.intermediate.limit,
-			}
-		}
-		if int64(need) > d.rowHigh {
-			delta := int64(need) - d.rowHigh
-			if err := frame.intermediate.reserve("derived relation row buffer", delta); err != nil {
-				s.releaseDerived(frame)
-				return Source{}, err
-			}
-			d.activeBytes += delta
-			d.rowHigh = int64(need)
-		}
-		charge := relationRetainedBytes(need)
-		if err := frame.intermediate.reserve("derived relation spool", charge); err != nil {
-			s.releaseDerived(frame)
-			return Source{}, err
-		}
-		if cap(d.row) < need {
-			d.row = make([]byte, 0, need)
-		} else {
-			d.row = d.row[:0]
-		}
-		d.row = appendRelationRow(d.row, &cursor, len(d.names))
-		if _, err := d.segment.Append(d.row); err != nil {
-			frame.intermediate.release(charge)
-			s.releaseDerived(frame)
-			return Source{}, fmt.Errorf("query: materialize derived relation: %w", err)
-		}
-		d.activeBytes += charge
+	charge, err := d.spool.materialize(
+		cursor, len(d.names), frame, parent.Options.Cancel,
+		"derived relation spool",
+	)
+	if err != nil {
+		s.releaseDerived(frame)
+		return Source{}, err
 	}
+	d.activeBytes = charge
 	// The spool owns every cell now. The child result and any child relation it
 	// borrowed may be invalidated before the outer plan starts.
 	clearExecBorrowedViews(&d.exec)
 	d.stmt.releaseDerived(frame)
-	return FromSegment(&d.segment), nil
+	return fromRelationSpool(&d.spool), nil
 }
 
 func (s *Statement) releaseDerived(frame *statementFrame) {
@@ -328,28 +280,24 @@ func (s *Statement) releaseDerived(frame *statementFrame) {
 	}
 	clearExecBorrowedViews(&d.exec)
 	d.stmt.releaseDerived(frame)
-	d.segment.Reset()
+	d.spool.reset()
 	frame.intermediate.release(d.activeBytes)
 	d.activeBytes = 0
-	d.rowHigh = 0
 }
 
-func encodedRelationRowBytes(cursor *Cursor, columns int) int {
-	bytes := 2 // braces
-	for i := 0; i < columns; i++ {
-		additional := 0
-		if i != 0 {
-			additional++
-		}
-		// Two quotes, a colon, and the decimal ordinal.
-		additional += 3 + decimalDigits(i)
-		additional += encodedCellJSONBytes(cursor.Cell(i))
-		if additional < 0 || bytes > int(^uint(0)>>1)-additional {
-			return -1
-		}
-		bytes += additional
+// discardDerived invalidates a relation retained by a previous completed
+// execution when the next top-level attempt fails before it can install a new
+// statement frame. No account survives between RunInto calls, so this path
+// resets ownership without debiting a frame that no longer exists.
+func (s *Statement) discardDerived() {
+	d := s.derived()
+	if d == nil {
+		return
 	}
-	return bytes
+	clearExecBorrowedViews(&d.exec)
+	d.stmt.discardDerived()
+	d.spool.reset()
+	d.activeBytes = 0
 }
 
 // encodedCellJSONBytes measures a Cell without copying a borrowed payload.
@@ -365,27 +313,4 @@ func encodedCellJSONBytes(cell Cell) int {
 	}
 	var scratch [32]byte
 	return len(cell.AppendJSON(scratch[:0]))
-}
-
-func appendRelationRow(dst []byte, cursor *Cursor, columns int) []byte {
-	dst = append(dst, '{')
-	for i := 0; i < columns; i++ {
-		if i != 0 {
-			dst = append(dst, ',')
-		}
-		dst = append(dst, '"')
-		dst = strconv.AppendInt(dst, int64(i), 10)
-		dst = append(dst, '"', ':')
-		dst = cursor.Cell(i).AppendJSON(dst)
-	}
-	return append(dst, '}')
-}
-
-func decimalDigits(n int) int {
-	digits := 1
-	for n >= 10 {
-		n /= 10
-		digits++
-	}
-	return digits
 }

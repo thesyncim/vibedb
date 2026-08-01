@@ -52,10 +52,10 @@ func TestIntermediateBudgetNormalization(t *testing.T) {
 }
 
 func TestRelationRetainedBytesSaturates(t *testing.T) {
-	if got := relationRetainedBytes(0); got != 512 {
-		t.Fatalf("empty row charge = %d, want 512", got)
+	if got := relationSpoolRetainedBytes(0, 0, 0); got != 0 {
+		t.Fatalf("empty spool charge = %d, want 0", got)
 	}
-	if got := relationRetainedBytes(math.MaxInt); got != math.MaxInt64 {
+	if got := relationSpoolRetainedBytes(math.MaxInt, math.MaxInt, 0); got != math.MaxInt64 {
 		t.Fatalf("overflow charge = %d, want MaxInt64", got)
 	}
 }

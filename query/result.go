@@ -100,6 +100,10 @@ const (
 	cellInteger cellFlag = 1 << iota
 	cellTrue
 	cellNumberRaw
+	// cellMissing retains the distinction between an absent JSON path and an
+	// explicit null across internal relation materialization. Both remain SQL
+	// NULL through every public accessor and transport encoding.
+	cellMissing
 )
 
 var (
@@ -113,7 +117,11 @@ var (
 func cellFromScalar(s scalar) Cell {
 	switch s.kind {
 	case kindNull:
-		return Cell{kind: TypeNull, raw: nullBytes}
+		flag := cellFlag(0)
+		if s.raw == nil {
+			flag = cellMissing
+		}
+		return Cell{kind: TypeNull, flag: flag, raw: nullBytes}
 	case kindBool:
 		raw := falseBytes
 		flag := cellFlag(0)
