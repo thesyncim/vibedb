@@ -237,7 +237,6 @@ func (c *Collection) rangeRawCurrentAt(
 
 	overlay := c.primaryUnifiedOverlay
 	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
-	var renderer storeio.CommonPrimaryUnifiedRowRenderer
 	var visited uint64
 	for {
 		bucket, leaf, ok := cursor.CurrentUnifiedLeaf()
@@ -257,41 +256,93 @@ func (c *Collection) rangeRawCurrentAt(
 				return scratch, err
 			}
 		}
-		if overlayCount == 0 {
-			cursor.AdoptSpliceScratch(scratch)
-			for {
-				key, ref, visitErr := cursor.VisitCurrentLeafAllInline(fn)
-				scratch = cursor.ReleaseSpliceScratch()
-				if visitErr != nil {
-					return scratch, visitErr
-				}
-				if ref == (storeio.PageRef{}) {
-					break
-				}
-				scratch, visitErr = c.appendPrimaryOverflowValue(
-					scratch[:0], ref, bounds,
-				)
-				if visitErr != nil {
-					return scratch, visitErr
-				}
-				if visitErr = fn(key, scratch); visitErr != nil {
-					return scratch, visitErr
-				}
-				cursor.AdoptSpliceScratch(scratch)
+		leafVisible := int64(leaf.Len())
+		var previousKey []byte
+		for at, index := range indexes[:overlayCount] {
+			if int(index) >= len(overlay.records) {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 			}
-			visited += uint64(leaf.Len())
-		} else {
-			renderer.Reset(leaf)
-			var leafVisited uint64
-			scratch, leafVisited, err = c.rangeRawCurrentLeaf(
-				&leaf, &renderer, overlay, indexes[:overlayCount],
-				bounds, scratch, fn,
+			record := &overlay.records[index]
+			keyEnd64 := uint64(record.keyOffset) + uint64(record.keyLen)
+			valueEnd64 := uint64(record.valueOff) + uint64(record.valueLen)
+			if record.keyLen == 0 || keyEnd64 > uint64(len(overlay.arena)) ||
+				record.valueOff != uint32(keyEnd64) ||
+				valueEnd64 > uint64(len(overlay.arena)) {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			keyEnd := uint32(keyEnd64)
+			key := overlay.arena[record.keyOffset:keyEnd:keyEnd]
+			if at != 0 && bytes.Compare(previousKey, key) >= 0 {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			previousKey = key
+
+			rank, matchesBase := leaf.RankAtSlot(record.slot)
+			if matchesBase {
+				baseKey, rowOK := leaf.RowAt(rank)
+				if !rowOK || !bytes.Equal(baseKey, key) {
+					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				}
+			} else {
+				rank = leaf.FirstRankFrom(key)
+				if rank < leaf.Len() {
+					baseKey, rowOK := leaf.RowAt(rank)
+					if !rowOK || bytes.Equal(baseKey, key) {
+						return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+					}
+				}
+			}
+
+			switch record.kind {
+			case primaryUnifiedOverlayPut:
+				if record.valueLen == 0 {
+					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				}
+			case primaryUnifiedOverlayDelete:
+				if record.valueLen != 0 {
+					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				// A final tombstone for an overlay-native key has no base row and
+				// no visible output. It still participates in lexical validation.
+				if !matchesBase {
+					continue
+				}
+			default:
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+
+			scratch, err = c.visitRangeRawCurrentBaseUntil(
+				&cursor, rank, scratch, bounds, fn,
 			)
 			if err != nil {
 				return scratch, err
 			}
-			visited += leafVisited
+			if matchesBase {
+				if err = cursor.ConsumeCurrentLeafBase(key); err != nil {
+					return scratch, err
+				}
+				if record.kind == primaryUnifiedOverlayDelete {
+					leafVisible--
+					continue
+				}
+			} else {
+				leafVisible++
+			}
+			value := overlay.arena[record.valueOff:uint32(valueEnd64):uint32(valueEnd64)]
+			if err = fn(key, value); err != nil {
+				return scratch, err
+			}
 		}
+		scratch, err = c.visitRangeRawCurrentBaseUntil(
+			&cursor, leaf.Len(), scratch, bounds, fn,
+		)
+		if err != nil {
+			return scratch, err
+		}
+		if leafVisible < 0 {
+			return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		visited += uint64(leafVisible)
 		if err := cursor.NextLeaf(); err != nil {
 			return scratch, err
 		}
@@ -307,94 +358,39 @@ func (c *Collection) rangeRawCurrentAt(
 	return scratch, nil
 }
 
-func (c *Collection) rangeRawCurrentLeaf(
-	leaf *storeio.CommonPrimaryUnifiedLeafView,
-	renderer *storeio.CommonPrimaryUnifiedRowRenderer,
-	overlay *primaryUnifiedOverlay,
-	indexes []uint16,
-	bounds storeio.CommonPrimaryLeafBounds,
+// visitRangeRawCurrentBaseUntil drains one untouched base span, resolving any
+// overflow rows encountered before limit and then re-entering at the advanced
+// base rank. The cursor never retains scratch between calls.
+func (c *Collection) visitRangeRawCurrentBaseUntil(
+	cursor *storeio.PrimaryGraphCursor,
+	limit int,
 	scratch []byte,
+	bounds storeio.CommonPrimaryLeafBounds,
 	fn func(key, value []byte) error,
-) ([]byte, uint64, error) {
-	rows := leaf.AllRows()
-	baseKey, baseBody, baseOverflow, baseOK := rows.NextRawBorrowed()
-	overlayAt := 0
-	var visited uint64
-	for baseOK || overlayAt < len(indexes) {
-		var record *primaryUnifiedOverlayRecord
-		var overlayKey []byte
-		if overlayAt < len(indexes) {
-			if overlay == nil || int(indexes[overlayAt]) >= len(overlay.records) {
-				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
-			}
-			record = &overlay.records[indexes[overlayAt]]
-			keyEnd := record.keyOffset + uint32(record.keyLen)
-			if record.keyLen == 0 || keyEnd > uint32(len(overlay.arena)) {
-				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
-			}
-			overlayKey = overlay.arena[record.keyOffset:keyEnd:keyEnd]
+) ([]byte, error) {
+	if cursor == nil || fn == nil {
+		return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	for {
+		cursor.AdoptSpliceScratch(scratch)
+		key, ref, err := cursor.VisitCurrentLeafInlineUntil(limit, fn)
+		scratch = cursor.ReleaseSpliceScratch()
+		if err != nil {
+			return scratch, err
 		}
-
-		order := 0
-		switch {
-		case !baseOK:
-			order = 1
-		case record == nil:
-			order = -1
-		default:
-			order = bytes.Compare(baseKey, overlayKey)
+		if ref == (storeio.PageRef{}) {
+			return scratch, nil
 		}
-		if order < 0 {
-			value := baseBody
-			if baseOverflow {
-				var err error
-				scratch, err = c.appendPrimaryOverflowValue(
-					scratch[:0],
-					storeio.DecodePrimaryOverflowRef(baseBody),
-					bounds,
-				)
-				if err != nil {
-					return scratch, visited, err
-				}
-				value = scratch
-			} else {
-				scratch = renderer.Append(scratch[:0], baseBody)
-				value = scratch
-			}
-			if err := fn(baseKey, value); err != nil {
-				return scratch, visited, err
-			}
-			visited++
-			baseKey, baseBody, baseOverflow, baseOK = rows.NextRawBorrowed()
-			continue
+		scratch, err = c.appendPrimaryOverflowValue(
+			scratch[:0], ref, bounds,
+		)
+		if err != nil {
+			return scratch, err
 		}
-
-		switch record.kind {
-		case primaryUnifiedOverlayPut:
-			valueEnd := record.valueOff + record.valueLen
-			if record.valueLen == 0 || valueEnd > uint32(len(overlay.arena)) {
-				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
-			}
-			if err := fn(
-				overlayKey,
-				overlay.arena[record.valueOff:valueEnd:valueEnd],
-			); err != nil {
-				return scratch, visited, err
-			}
-			visited++
-		case primaryUnifiedOverlayDelete:
-			if record.valueLen != 0 {
-				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
-			}
-		default:
-			return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
-		}
-		overlayAt++
-		if order == 0 {
-			baseKey, baseBody, baseOverflow, baseOK = rows.NextRawBorrowed()
+		if err = fn(key, scratch); err != nil {
+			return scratch, err
 		}
 	}
-	return scratch, visited, nil
 }
 
 // RangeRaw visits live rows in bytewise lexical key order. key and value are

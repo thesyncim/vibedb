@@ -258,13 +258,14 @@ func (c *Collection) acquirePrimaryPath(
 	if !admitMutation {
 		return nil
 	}
-	path.leaf, err = storeio.AdmittedPrimaryLeafForMutation(
+	path.leaf, err = storeio.AdmittedPrimaryLeafForMutationWithScratch(
 		path.leafLease.Page(), c.storeID, path.leafRoute.Bucket,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
+		c.primaryLeafMutationScratch,
 	)
 	return err
 }
@@ -667,11 +668,18 @@ retryAfterUnifiedFold:
 			return false, err
 		}
 	}
-	leafLease, err := c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
-	if err != nil {
-		return false, err
+	if !canonicalPath && c.primaryUnifiedOverlay.hasPending() {
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			return false, err
+		}
+		goto retryAfterUnifiedFold
 	}
 	if canonicalPath {
+		leafLease, acquireErr :=
+			c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
+		if acquireErr != nil {
+			return false, acquireErr
+		}
 		handled, overlayCreated, pressure, overlayErr :=
 			c.tryPrimaryUnifiedOverlayPut(
 				state, resident, leafLease.Page(), keyBytes, src,
@@ -704,58 +712,49 @@ retryAfterUnifiedFold:
 			}
 			goto retryAfterUnifiedFold
 		}
-	} else if c.primaryUnifiedOverlay.hasPending() {
-		leafLease.Release()
-		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
-			return false, err
-		}
-		goto retryAfterUnifiedFold
-	}
-	// Overlay publication owns no page-cache dirty frame, pending-parent slot,
-	// or volatile retirement, so it does not need the structural lane's
-	// capacity reservation. Pay that reservation only after the class-5 fast
-	// path declines; the retry rebinds the route if the ensure checkpointed.
-	if canonicalPath && !canonicalCapacityEnsured {
-		leafLease.Release()
-		if err := c.ensureBufferedPrimaryMutationCapacity(
-			resident, len(src),
-		); err != nil {
-			return false, err
-		}
-		canonicalCapacityEnsured = true
-		goto retryAfterUnifiedFold
-	}
-	// Every class-5 mutation has one byte contract. The inline overlay already
-	// canonicalized its accepted value; values that reach this exceptional COW
-	// path (overflow, structural pressure, async mode, or a reader-forced
-	// fallback) must do the same before exact-index deltas, journal records, and
-	// leaf/overflow images observe them.
-	if !canonicalReady {
-		src, err = c.canonicalPrimaryMutationValue(src)
-		if err != nil {
+		// Overlay publication owns no page-cache dirty frame, pending-parent slot,
+		// or volatile retirement, so it does not need the structural lane's
+		// capacity reservation. Pay that reservation only after the class-5 fast
+		// path declines; the retry rebinds the route if the ensure checkpointed.
+		if !canonicalCapacityEnsured {
 			leafLease.Release()
-			return false, err
+			if err := c.ensureBufferedPrimaryMutationCapacity(
+				resident, len(src),
+			); err != nil {
+				return false, err
+			}
+			canonicalCapacityEnsured = true
+			goto retryAfterUnifiedFold
 		}
-		canonicalReady = true
-	}
-	leaf, err := storeio.AdmittedPrimaryLeafForMutationWithScratch(
-		leafLease.Page(), c.storeID, resident.Bucket,
-		storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.fileEnd,
-			NextLogicalID:     state.root.NextLogicalID,
-			AllocationQuantum: state.root.PageSize,
-		},
-		c.primaryLeafMutationScratch,
-	)
-	if err != nil {
-		leafLease.Release()
-		return false, err
-	}
-	slot, _, _, found := leaf.LookupRawHashed(
-		resident.Hash, keyBytes,
-	)
-	created = !found
-	if canonicalPath {
+		// Every class-5 mutation has one byte contract. The inline overlay already
+		// canonicalized its accepted value; values that reach this exceptional COW
+		// path must do the same before exact-index deltas, journal records, and
+		// leaf/overflow images observe them.
+		if !canonicalReady {
+			src, err = c.canonicalPrimaryMutationValue(src)
+			if err != nil {
+				leafLease.Release()
+				return false, err
+			}
+			canonicalReady = true
+		}
+		leaf, workspaceErr := storeio.AdmittedPrimaryLeafForMutationWithScratch(
+			leafLease.Page(), c.storeID, resident.Bucket,
+			storeio.CommonPrimaryLeafBounds{
+				FileEnd:           state.fileEnd,
+				NextLogicalID:     state.root.NextLogicalID,
+				AllocationQuantum: state.root.PageSize,
+			},
+			c.primaryLeafMutationScratch,
+		)
+		if workspaceErr != nil {
+			leafLease.Release()
+			return false, workspaceErr
+		}
+		slot, _, _, found := leaf.LookupRawHashed(
+			resident.Hash, keyBytes,
+		)
+		created = !found
 		_, becameEmpty, filledEmpty, mutationErr :=
 			c.cowBufferedPrimaryMutation(
 				state, keyBytes, src, false, found, slot,
@@ -799,7 +798,16 @@ retryAfterUnifiedFold:
 		}
 		return created, nil
 	}
-	leafLease.Release()
+	// The transactional lane acquires the rooted mutation path once below. Do
+	// not expand the leaf here merely to repeat the same admission and lookup
+	// after journal/capacity preparation.
+	if !canonicalReady {
+		src, err = c.canonicalPrimaryMutationValue(src)
+		if err != nil {
+			return false, err
+		}
+		canonicalReady = true
+	}
 	// The journal-backed sync lane appends this Put's full-value redo record inside
 	// cowPrimaryMutation, at a point of no return where it can no longer force a
 	// checkpoint. Fold and recycle a journal that cannot hold the record now, using
@@ -846,18 +854,16 @@ retryAfterUnifiedFold:
 	); err != nil {
 		return false, err
 	}
-	defer path.Release()
-	slot, _, _, resolvedFound := path.leaf.LookupRawHashed(
+	slot, _, _, found := path.leaf.LookupRawHashed(
 		path.leafRoute.Hash, keyBytes,
 	)
-	if resolvedFound != found {
-		return false, storeio.ErrCommonPrimaryLeafCorrupt
-	}
+	created = !found
 	_, becameEmpty, filledEmpty, err :=
 		c.cowPrimaryMutation(
 			state, keyBytes, src, false, found, slot,
 			resident, &path,
 		)
+	path.Release()
 	if err != nil {
 		return false, err
 	}
@@ -1100,23 +1106,25 @@ retryAfterUnifiedDeleteFold:
 	); err != nil {
 		return false, fmt.Errorf("acquire transactional delete path: %w", err)
 	}
-	defer path.Release()
 	slot, _, _, found := path.leaf.LookupRawHashed(
 		path.leafRoute.Hash, keyBytes,
 	)
 	if !found {
+		path.Release()
 		return false, nil
 	}
 	if err := c.ensureDirtyCapacityFor(
 		c.options.singleDocumentTransactionPages,
 		c.options.singleDocumentTransactionBytes,
 	); err != nil {
+		path.Release()
 		return false, err
 	}
 	_, becameEmpty, _, err := c.cowPrimaryMutation(
 		state, keyBytes, nil, true, true, slot,
 		resident, &path,
 	)
+	path.Release()
 	if err != nil {
 		return false, fmt.Errorf("rewrite transactional delete leaf: %w", err)
 	}
@@ -1177,7 +1185,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 				storeio.ErrCheckpointRequired
 		}
 		var path filePrimaryMutationPath
-		if err := c.acquirePrimaryMutationPath(
+		if err := c.acquirePrimaryRoutingPath(
 			&path, state, key, resident,
 		); err != nil {
 			return storeio.PageRef{}, false, false, err

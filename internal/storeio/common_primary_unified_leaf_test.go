@@ -219,6 +219,243 @@ func TestUnifiedLeafRoundTrip(t *testing.T) {
 	}
 }
 
+func unifiedRendererPlanCorpus(n int) ([]CommonPrimaryLeafRecord, [][]byte) {
+	// Ten recurring schemas deliberately exceed the eight-entry direct-mapped
+	// cache. The 3/9-16-hole shapes exercise the bounded planner; 17 holes
+	// proves the arbitrary-width fallback. Cycling the schemas by key also
+	// forces template IDs 0/8 and 1/9 to collide repeatedly.
+	holes := [...]int{3, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+	records := make([]CommonPrimaryLeafRecord, n)
+	want := make([][]byte, n)
+	for i := range n {
+		holeCount := holes[i%len(holes)]
+		doc := make([]byte, 0, 256)
+		if holeCount == 3 {
+			doc = fmt.Appendf(
+				doc, `{"left":%d,"middle":%d,"right":"row-%d"}`,
+				i, i*3, i,
+			)
+		} else {
+			doc = append(doc, `{"values":[`...)
+			for hole := range holeCount {
+				if hole != 0 {
+					doc = append(doc, ',')
+				}
+				doc = fmt.Appendf(doc, "%d", i+hole)
+			}
+			doc = append(doc, `]}`...)
+		}
+		records[i] = CommonPrimaryLeafRecord{
+			Key:   fmt.Appendf(nil, "plan:%08d", i),
+			Value: CommonPrimaryLeafValue{Inline: doc},
+		}
+		canonical, err := vibejson.AppendCanonicalize(nil, doc)
+		if err != nil {
+			panic(err)
+		}
+		want[i] = canonical
+	}
+	return records, want
+}
+
+func TestUnifiedPrimaryRowRendererPlanCacheDifferential(t *testing.T) {
+	records, want := unifiedRendererPlanCorpus(120)
+	page, count := encodeUnifiedTestLeaf(t, records)
+	// The encoder deliberately selects the largest prefix that fits one bounded
+	// leaf. The synthetic wide-shape corpus need not fit in full; its admitted
+	// prefix must still span every bounded/fallback width and repeat the direct
+	// cache collisions several times.
+	if count < 24 {
+		t.Fatalf("planned fixture encoded only %d/%d rows", count, len(records))
+	}
+	view := openUnifiedTestLeaf(t, page)
+	if view.TemplateCount() < 10 {
+		t.Fatalf("template count = %d, want at least 10", view.TemplateCount())
+	}
+
+	admitted, ok := AdmittedCommonPrimaryUnifiedLeaf(
+		page, unifiedTestStoreID(), 0, unifiedTestBounds(),
+	)
+	if !ok {
+		t.Fatal("admitted unified fixture")
+	}
+	seenPlanned := false
+	seenFallback := false
+	var slotTemplates [unifiedRendererPlanCache][256]bool
+	var renderer unifiedPrimaryRowRenderer
+	renderer.Reset(admitted)
+	scratch := make([]byte, 0, 512)
+	for pass := range 3 {
+		for rank := 0; rank < count; rank++ {
+			_, body, overflow, rowOK := admitted.RowRawAt(rank)
+			if !rowOK || overflow || body[0] == unifiedRowTrivial {
+				t.Fatalf(
+					"pass %d rank %d: ok=%v overflow=%v body=%x",
+					pass, rank, rowOK, overflow, body,
+				)
+			}
+			scratch = renderer.Append(scratch[:0], body)
+			slot := body[0] & (unifiedRendererPlanCache - 1)
+			slotTemplates[slot][body[0]] = true
+			plan := &renderer.plans[slot]
+			if plan.epoch != renderer.epoch || plan.id != body[0] {
+				t.Fatalf("pass %d rank %d cache did not retain template", pass, rank)
+			}
+			seenPlanned = seenPlanned || plan.fast
+			seenFallback = seenFallback || !plan.fast
+			if !bytes.Equal(scratch, want[rank]) {
+				t.Fatalf(
+					"pass %d rank %d render mismatch:\n got %q\nwant %q",
+					pass, rank, scratch, want[rank],
+				)
+			}
+			checked, checkedOK := view.AppendRowBody(nil, body)
+			if !checkedOK || !bytes.Equal(scratch, checked) {
+				t.Fatalf("pass %d rank %d checked renderer mismatch", pass, rank)
+			}
+		}
+		renderer.Reset(admitted)
+	}
+	if !seenFallback {
+		t.Fatal("low-locality cache fixture never exercised generic rendering")
+	}
+	if !seenPlanned {
+		t.Fatal("low-locality cache fixture never exercised planned rendering")
+	}
+	collided := false
+	for slot := range unifiedRendererPlanCache {
+		distinct := 0
+		for id := range 256 {
+			if slotTemplates[slot][id] {
+				distinct++
+			}
+		}
+		if distinct > 1 {
+			collided = true
+		}
+	}
+	if !collided {
+		t.Fatal("fixture did not exercise a direct-map collision")
+	}
+
+	var allocationErr error
+	allocs := testing.AllocsPerRun(20, func() {
+		renderer.Reset(admitted)
+		for rank := 0; rank < count; rank++ {
+			_, body, overflow, rowOK := admitted.RowRawAt(rank)
+			if !rowOK || overflow {
+				allocationErr = ErrCommonPrimaryLeafCorrupt
+				return
+			}
+			scratch = renderer.Append(scratch[:0], body)
+		}
+	})
+	if allocationErr != nil {
+		t.Fatal(allocationErr)
+	}
+	if allocs != 0 {
+		t.Fatalf("warmed renderer allocated %.2f times, want 0", allocs)
+	}
+}
+
+func TestUnifiedPrimaryRowRendererOrderedShapeLearnsAndFallsBack(t *testing.T) {
+	documents := [][]byte{
+		[]byte(`{"a":true,"b":"b0","c":1,"d":"d0","e":"e0","f":"f0","g":"g0","h":"h0","i":2,"j":"j0","k":"k0"}`),
+		[]byte(`{"a":false,"b":"b1","c":3,"d":"d1","e":"e1","f":"f1","g":"g1","h":"h1","i":4,"j":"j1","k":"k1"}`),
+		// The same template with null in the first scalar must reject the
+		// boolean/string/integer scan signature without changing its result.
+		[]byte(`{"a":null,"b":"b2","c":5,"d":"d2","e":"e2","f":"f2","g":"g2","h":"h2","i":6,"j":"j2","k":"k2"}`),
+		[]byte(`{"a":false,"b":"b3","c":7,"d":"d3","e":"e3","f":"f3","g":"g3","h":"h3","i":8,"j":"j3","k":"k3"}`),
+	}
+	records := make([]CommonPrimaryLeafRecord, len(documents))
+	want := make([][]byte, len(documents))
+	for i := range documents {
+		records[i] = CommonPrimaryLeafRecord{
+			Key:   fmt.Appendf(nil, "shape:%02d", i),
+			Value: CommonPrimaryLeafValue{Inline: documents[i]},
+		}
+		var err error
+		want[i], err = vibejson.AppendCanonicalize(nil, documents[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, count := encodeUnifiedTestLeaf(t, records)
+	if count != len(records) {
+		t.Fatalf("shape fixture encoded %d/%d rows", count, len(records))
+	}
+	view, ok := AdmittedCommonPrimaryUnifiedLeaf(
+		page, unifiedTestStoreID(), 0, unifiedTestBounds(),
+	)
+	if !ok {
+		t.Fatal("admitted ordered-shape fixture")
+	}
+	var renderer unifiedPrimaryRowRenderer
+	renderer.Reset(view)
+	scratch := make([]byte, 0, 256)
+	var templateID uint8
+	for rank := range count {
+		_, body, overflow, rowOK := view.RowRawAt(rank)
+		if !rowOK || overflow || body[0] == unifiedRowTrivial {
+			t.Fatalf("rank %d raw row", rank)
+		}
+		if rank == 0 {
+			templateID = body[0]
+		} else if body[0] != templateID {
+			t.Fatalf("rank %d template %d, want %d", rank, body[0], templateID)
+		}
+		scratch = renderer.Append(scratch[:0], body)
+		if !bytes.Equal(scratch, want[rank]) {
+			t.Fatalf("rank %d render = %q, want %q", rank, scratch, want[rank])
+		}
+		plan := &renderer.plans[body[0]&(unifiedRendererPlanCache-1)]
+		wantModes := [...]uint8{0, 1, 2, 2}
+		wantMode := wantModes[rank]
+		if plan.scanShape != wantMode {
+			t.Fatalf("rank %d scan shape = %d, want %d", rank, plan.scanShape, wantMode)
+		}
+		wantFast := rank != 0
+		if plan.fast != wantFast {
+			t.Fatalf("rank %d planned = %v, want %v", rank, plan.fast, wantFast)
+		}
+	}
+}
+
+var unifiedRendererBenchmarkSink byte
+
+func BenchmarkUnifiedPrimaryRowRendererPlanCache(b *testing.B) {
+	records, _ := unifiedRendererPlanCorpus(120)
+	page, count := encodeUnifiedTestLeaf(b, records)
+	view, ok := AdmittedCommonPrimaryUnifiedLeaf(
+		page, unifiedTestStoreID(), 0, unifiedTestBounds(),
+	)
+	if !ok {
+		b.Fatal("admitted unified fixture")
+	}
+	var renderer unifiedPrimaryRowRenderer
+	renderer.Reset(view)
+	scratch := make([]byte, 0, 512)
+	var sink byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		for rank := 0; rank < count; rank++ {
+			_, body, overflow, rowOK := view.RowRawAt(rank)
+			if !rowOK || overflow {
+				b.Fatal("raw row")
+			}
+			scratch = renderer.Append(scratch[:0], body)
+			sink ^= scratch[0] ^ scratch[len(scratch)-1]
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(
+		float64(b.Elapsed().Nanoseconds())/float64(b.N*count),
+		"ns/doc",
+	)
+	unifiedRendererBenchmarkSink = sink
+}
+
 func TestUnifiedLeafPlanStableIntegerPatchMatchesFullPlanner(t *testing.T) {
 	records, _ := unifiedTestCorpus(220)
 	page, count := encodeUnifiedTestLeaf(t, records)

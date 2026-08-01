@@ -174,7 +174,7 @@ go test ./internal/storeio -run '^$' \
   | tee "$publication_dir/leaf-fold.txt"
 
 go test ./store/durable -run '^$' \
-  -bench '^(BenchmarkFilePrimaryOrderedScan|BenchmarkUnifiedScanAllLowCardinality|BenchmarkUnifiedScanAllHighCardinality|BenchmarkFileStoreScanMasked)$' \
+  -bench '^(BenchmarkFilePrimaryOrderedScan|BenchmarkUnifiedCanonicalRenderLowCardinality|BenchmarkUnifiedCanonicalRenderHighCardinality|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStoreScanMasked)$' \
   -benchmem -count=5 \
   | tee "$publication_dir/scan.txt"
 )
@@ -182,11 +182,16 @@ go test ./store/durable -run '^$' \
 
 `TestUnifiedSpaceCompetitiveCorpus` reports exact core-graph bytes per
 document for both cardinalities. The ordered-primary benchmark uses its
-three-scalar corpus; the two unified full-scan arms use the competitive corpus
-at both cardinalities. `BenchmarkFileStoreScanMasked` currently selects one
-occupied stable slot per live tile. It does not reproduce historical
-1/4/16-row or dense-153-row density sweeps, and no current result should claim
-a measured density crossover from it.
+three-scalar corpus. The unified canonical-render arms use the competitive
+corpus at both cardinalities, reconstruct every exact canonical value, and use
+only a first+last-byte sink; they measure renderer cost, not full payload
+consumption. The separate unified all-bytes arms run the same canonical
+renderer and then serially consume every returned byte. Those arms report the
+actual returned bytes per document and fail unless a warmed scan allocates
+zero times. `BenchmarkFileStoreScanMasked` currently selects one occupied
+stable slot per live tile. It does not reproduce historical 1/4/16-row or
+dense-153-row density sweeps, and no current result should claim a measured
+density crossover from it.
 
 ## Durability lanes
 

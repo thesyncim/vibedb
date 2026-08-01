@@ -12,7 +12,6 @@ func TestLeadingFeatureRefusalsAreTypedAndPositioned(t *testing.T) {
 		src  string
 		want string
 	}{
-		{"explain", "EXPLAIN SELECT * FROM docs", "EXPLAIN is not supported"},
 		{"copy", "COPY docs TO STDOUT", "COPY is not supported"},
 		{"savepoint", "SAVEPOINT nested", "savepoints are not supported"},
 		{"alter table", "ALTER TABLE docs ADD COLUMN n STRING", "ALTER is not in the bounded catalog subset"},
@@ -35,10 +34,10 @@ func TestLeadingFeatureRefusalsAreTypedAndPositioned(t *testing.T) {
 func TestLeadingFeatureRefusalAllocatesOnlyItsTypedError(t *testing.T) {
 	var parser Parser
 	var statement Statement
-	const src = "EXPLAIN SELECT * FROM docs"
+	const src = "COPY docs TO STDOUT"
 	allocations := testing.AllocsPerRun(200, func() {
 		if err := parser.ParseStatement(&statement, src); err == nil {
-			panic("EXPLAIN unexpectedly parsed")
+			panic("COPY unexpectedly parsed")
 		}
 	})
 	if allocations > 1 {

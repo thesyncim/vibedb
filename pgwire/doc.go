@@ -124,10 +124,9 @@
 //     fails with the parser's refusal.
 //   - COPY, the function-call subprotocol, LISTEN/NOTIFY, cursors (DECLARE and
 //     FETCH), SQL-level PREPARE/EXECUTE, and replication.
-//   - EXPLAIN. Index and join choices are bound against the execution snapshot,
-//     arguments, and memory admission state, and the runtime does not yet expose
-//     a stable physical-plan report. EXPLAIN is refused with SQLSTATE 0A000
-//     rather than fabricating PostgreSQL plan text.
+//   - EXPLAIN and EXPLAIN ANALYZE return one JSON QUERY PLAN row for the
+//     documented SELECT subset. The report is VibeDB's stable plan schema, not
+//     PostgreSQL's textual plan format.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
 //   - The SQL constructs the dialect itself refuses — subqueries, right/full outer joins,

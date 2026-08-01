@@ -60,10 +60,9 @@ var unsupportedStatements = map[string]string{
 	"NOTIFY":   "asynchronous notification is not supported",
 	"UNLISTEN": "asynchronous notification is not supported",
 
-	"LOCK":    "there is no SQL lock manager: immutable readers never block writers",
-	"EXPLAIN": "EXPLAIN is not supported: physical choices are late-bound and the runtime has no stable plan-report API",
-	"CALL":    "there are no stored procedures",
-	"DO":      "there is no procedural language",
+	"LOCK": "there is no SQL lock manager: immutable readers never block writers",
+	"CALL": "there are no stored procedures",
+	"DO":   "there is no procedural language",
 
 	"WITH":   "common table expressions are not supported: the engine executes one plan and has no nested execution",
 	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",

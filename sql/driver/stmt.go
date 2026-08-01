@@ -5,6 +5,7 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -21,6 +22,8 @@ type stmt struct {
 	params       int
 	paramKinds   []ParamKind
 	joinNames    []string
+	explain      bool
+	analyze      bool
 	closed       bool
 }
 
@@ -77,6 +80,8 @@ func (s *stmt) Close() error {
 	s.primaryPoint = false
 	s.paramKinds = nil
 	s.joinNames = nil
+	s.explain = false
+	s.analyze = false
 	s.conn = nil
 	return nil
 }
@@ -155,6 +160,19 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
+	}
+	if s.explain {
+		if s.analyze {
+			return s.analyzeRows(ctx, args)
+		}
+		plan, err := s.explainPlan(ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		s.conn.open = true
+		return s.conn.resetRows(
+			s, query.NewTextCursor("QUERY PLAN", plan), nil,
+		), nil
 	}
 	var err error
 	if s.mutation != nil {
@@ -328,6 +346,140 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	}
 	s.conn.open = true
 	return s.conn.resetRows(s, cursor, snapshot), nil
+}
+
+// analyzeRows deliberately re-enters the existing normal query path. This
+// keeps EXPLAIN ANALYZE honest: it measures the same source selection, bind,
+// index admission, joins, scans, and result pipeline that SELECT uses. The
+// plain SELECT path never reaches this method and pays no timer/counter cost.
+func (s *stmt) analyzeRows(ctx context.Context, args []any) (*rows, error) {
+	started := time.Now()
+	s.explain = false
+	resultRows, err := s.queryRows(ctx, args)
+	s.explain = true
+	if err != nil {
+		return nil, err
+	}
+	returned := 0
+	for resultRows.cursor.Next() {
+		returned++
+	}
+
+	options := query.ExplainOptions{PrimaryPoint: s.primaryPoint}
+	if resultRows.snapshot != nil {
+		options.IndexCatalogKnown = true
+		options.Indexes = resultRows.snapshot.AppendIndexes(nil)
+	} else {
+		options, err = s.explainOptions(ctx)
+		if err != nil {
+			_ = resultRows.Close()
+			return nil, err
+		}
+	}
+	pointSource := resultRows.snapshot == nil
+	if err := resultRows.Close(); err != nil {
+		return nil, err
+	}
+	stats := s.conn.exec.Stats
+	plan, err := s.query.ExplainAnalyze(options, query.ExplainAnalysis{
+		ElapsedNanoseconds: time.Since(started).Nanoseconds(),
+		Rows:               returned,
+		ActualAccessPath:   analyzeAccessPath(s, pointSource, stats),
+		Stats:              stats,
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.conn.open = true
+	return s.conn.resetRows(
+		s, query.NewTextCursor("QUERY PLAN", plan), nil,
+	), nil
+}
+
+func analyzeAccessPath(s *stmt, pointSource bool, stats query.ExecStats) string {
+	if s.query.RequiresCatalog() {
+		switch {
+		case stats.JoinBuilds != 0:
+			return "hash-build-and-probe"
+		case stats.JoinMemberships != 0:
+			return "join-membership"
+		case stats.JoinLookups != 0:
+			return "join-key-lookup"
+		default:
+			return "join-no-matches"
+		}
+	}
+	if s.primaryPoint && pointSource {
+		return "primary-key-point"
+	}
+	if stats.IndexBounded {
+		return "exact-index"
+	}
+	return "full-scan"
+}
+
+// explainPlan is cold-path work: it binds only the EXPLAIN statement, captures
+// immutable index metadata, and never opens a row source. Keeping it here
+// leaves normal query execution on the existing source-selection and RunInto
+// path with no explain-specific planner work.
+func (s *stmt) explainPlan(ctx context.Context, args []any) (string, error) {
+	if err := contextCheckpoint(ctx); err != nil {
+		return "", err
+	}
+	options, err := s.explainOptions(ctx)
+	if err != nil {
+		return "", err
+	}
+	return s.query.ExplainBoundWith(args, options)
+}
+
+func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error) {
+	options := query.ExplainOptions{
+		PrimaryPoint: s.primaryPoint,
+	}
+	// The driver materializes joins into the heap executor, whose source has
+	// no durable catalog. Keep the plan logical rather than attributing the
+	// original table's indexes to the materialized execution.
+	if s.query.RequiresCatalog() {
+		return options, contextCheckpoint(ctx)
+	}
+	options.IndexCatalogKnown = true
+	collection := s.query.Collection()
+	if s.conn.tx != nil {
+		state, ok := s.conn.tx.tables[collection]
+		if !ok {
+			return query.ExplainOptions{}, fmt.Errorf(
+				"%w: %q was not present when the transaction began",
+				ErrTableNotFound, collection)
+		}
+		if state.snapshot != nil {
+			options.Indexes = state.snapshot.AppendIndexes(options.Indexes)
+		}
+		return options, contextCheckpoint(ctx)
+	}
+	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
+		return query.ExplainOptions{}, err
+	}
+	t, ok := s.conn.db.tables[collection]
+	if !ok {
+		s.conn.db.mu.RUnlock()
+		return query.ExplainOptions{}, fmt.Errorf("%w: %q", ErrTableNotFound, collection)
+	}
+	if t.collection == nil {
+		s.conn.db.mu.RUnlock()
+		return options, contextCheckpoint(ctx)
+	}
+	snapshot, err := t.collection.Snapshot()
+	s.conn.db.mu.RUnlock()
+	if err != nil {
+		return query.ExplainOptions{}, err
+	}
+	options.Indexes = snapshot.AppendIndexes(options.Indexes)
+	closeErr := snapshot.Close()
+	if closeErr != nil {
+		return query.ExplainOptions{}, closeErr
+	}
+	return options, contextCheckpoint(ctx)
 }
 
 func (c *conn) releaseJoinCatalog(collections []durable.NamedCollection) {

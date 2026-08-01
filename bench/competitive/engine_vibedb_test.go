@@ -6,14 +6,14 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// TestVibeDurableOrdinarySyncJournalsThroughPrimary proves the adapter now
+// TestVibeDBOrdinarySyncJournalsThroughPrimary proves the adapter now
 // measures the ordered primary graph: loadBulk builds through CreateFromPrimary,
 // so every Put routes through the primary mutation path, and ordinary-sync's
 // journalAckLocked -- which fires ONLY from that path -- records one
 // acknowledgement per mutation. journalAcks being non-zero and accounting for
 // the whole window (with chainAcks) is the primary-routing proof: a chunk-layout
 // store would journal nothing.
-func TestVibeDurableOrdinarySyncJournalsThroughPrimary(t *testing.T) {
+func TestVibeDBOrdinarySyncJournalsThroughPrimary(t *testing.T) {
 	factory, ok := FactoryNamed("vibedb")
 	if !ok {
 		t.Fatal("vibedb factory missing")
@@ -51,14 +51,14 @@ func TestVibeDurableOrdinarySyncJournalsThroughPrimary(t *testing.T) {
 	}
 }
 
-// TestVibeDurablePowerSafeJournalsEveryAcknowledgement holds the power-safe row
+// TestVibeDBPowerSafeJournalsEveryAcknowledgement holds the power-safe row
 // to the same engagement proof as ordinary-sync. This table was burned once by
 // a lane that silently disengaged its durability mechanism and published a win;
 // any journal-backed comparison row must therefore prove per-mutation journal
 // acknowledgements, not assume them from configuration. Fewer mutations than
 // the ordinary-sync variant because each acknowledgement here pays a real
 // drive-cache drain (~4 ms on this platform's F_FULLFSYNC class).
-func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
+func TestVibeDBPowerSafeJournalsEveryAcknowledgement(t *testing.T) {
 	if testing.Short() {
 		t.Skip("each acknowledgement pays a full power-safe barrier")
 	}
@@ -95,10 +95,10 @@ func TestVibeDurablePowerSafeJournalsEveryAcknowledgement(t *testing.T) {
 	}
 }
 
-// TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary pins the unified
+// TestVibeDBBufferedVisibleRoutesDeletesThroughPrimary pins the unified
 // primary delete fast path. Dense leaves do not run empty-leaf reclamation;
 // structural hygiene runs only after a delete makes a routed leaf empty.
-func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
+func TestVibeDBBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 	factory, ok := FactoryNamed("vibedb")
 	if !ok {
 		t.Fatal("vibedb factory missing")
@@ -121,11 +121,11 @@ func TestVibeDurableBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 	}
 }
 
-// TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot confirms the query
+// TestVibeDBUnindexedFilterRunsOnPrimarySnapshot confirms the query
 // FromFile filter path opens the primary-layout snapshot the unindexed instance
 // now loads through CreateFromPrimary: a full scan-and-filter must return the
 // corpus's ~1% FilterValue population, not error on the layout.
-func TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
+func TestVibeDBUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
 	factory, ok := FactoryNamed("vibedb")
 	if !ok {
 		t.Fatal("vibedb factory missing")
@@ -141,7 +141,7 @@ func TestVibeDurableUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
 	}
 }
 
-func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
+func TestVibeDBBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 	engine, err := newVibeDB(Config{
 		Durability: DurabilityBufferedVisible,
 		CacheBytes: DefaultCacheBytes,
@@ -196,5 +196,124 @@ func TestVibeDurableBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 			"power-safe checkpoint strength = %d, want power-safe",
 			powerSafe.CheckpointStrength,
 		)
+	}
+}
+
+func TestVibeDBScanAllBytesWarmedAllocatesNothing(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
+	if !ok {
+		t.Fatal("vibedb factory missing")
+	}
+	corpus := Corpus(2_048)
+	engine, _, cleanup := newLoadedCorpus(t, factory, Config{
+		Durability: DurabilityBufferedVisible,
+	}, corpus)
+	defer cleanup()
+
+	session := engine.Session(0)
+	for _, test := range []struct {
+		name string
+		scan func() (int, error)
+	}{
+		{name: "engine", scan: engine.ScanAllBytes},
+		{name: "session", scan: session.ScanAllBytes},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rows, err := test.scan()
+			if err != nil {
+				t.Fatalf("warm ScanAllBytes: %v", err)
+			}
+			if rows != len(corpus) {
+				t.Fatalf("warm ScanAllBytes visited %d rows, want %d", rows, len(corpus))
+			}
+
+			var scanErr error
+			allocs := testing.AllocsPerRun(20, func() {
+				rows, scanErr = test.scan()
+			})
+			if scanErr != nil {
+				t.Fatalf("warmed ScanAllBytes: %v", scanErr)
+			}
+			if rows != len(corpus) {
+				t.Fatalf("warmed ScanAllBytes visited %d rows, want %d", rows, len(corpus))
+			}
+			if allocs != 0 {
+				t.Fatalf("warmed ScanAllBytes allocated %.2f times, want 0", allocs)
+			}
+		})
+	}
+}
+
+// TestVibeDBPointMutationWarmedAllocations keeps the benchmark adapter
+// honest: its string key conversion lives in caller-owned retained storage, so
+// the only steady allocation is durable's immutable state publication. Both
+// the single-client handle and a concurrent-harness session own their scratch.
+func TestVibeDBPointMutationWarmedAllocations(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
+	if !ok {
+		t.Fatal("vibedb factory missing")
+	}
+	engine, _, cleanup := newLoaded(t, factory, Config{
+		Durability: DurabilityBufferedVisible,
+	})
+	defer cleanup()
+
+	for _, test := range []struct {
+		name   string
+		handle EngineSession
+		key    string
+		value  []byte
+	}{
+		{
+			name: "engine", handle: engine,
+			key: docs[100].Key, value: docs[100].JSON,
+		},
+		{
+			name: "session", handle: engine.Session(1),
+			key: docs[101].Key, value: docs[101].JSON,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.handle.Put(test.key, test.value); err != nil {
+				t.Fatalf("warm Put: %v", err)
+			}
+			readBuf := make([]byte, 0, len(test.value)+64)
+			if _, err := test.handle.Get(readBuf[:0], test.key); err != nil {
+				t.Fatalf("warm Get: %v", err)
+			}
+			getAllocs := testing.AllocsPerRun(50, func() {
+				if _, err := test.handle.Get(readBuf[:0], test.key); err != nil {
+					panic(err)
+				}
+			})
+			if getAllocs != 0 {
+				t.Fatalf("warmed Get allocated %.2f times, want 0", getAllocs)
+			}
+			putAllocs := testing.AllocsPerRun(50, func() {
+				if err := test.handle.Put(test.key, test.value); err != nil {
+					panic(err)
+				}
+			})
+			if putAllocs != 1 {
+				t.Fatalf(
+					"warmed Put allocated %.2f times, want 1 published state",
+					putAllocs,
+				)
+			}
+			deleteRestoreAllocs := testing.AllocsPerRun(50, func() {
+				if err := test.handle.Delete(test.key); err != nil {
+					panic(err)
+				}
+				if err := test.handle.Upsert(test.key, test.value); err != nil {
+					panic(err)
+				}
+			})
+			if deleteRestoreAllocs != 2 {
+				t.Fatalf(
+					"warmed delete+restore allocated %.2f times, want 2 published states",
+					deleteRestoreAllocs,
+				)
+			}
+		})
 	}
 }

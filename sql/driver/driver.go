@@ -363,19 +363,27 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	}
 	if tree.Kind.IsQuery() {
 		s.query, err = query.PrepareParsedStatement(src, tree.Select)
-		if err == nil && s.query.RequiresCatalog() {
-			s.joinNames = joinTableNames(tree.Select)
-		} else if err == nil {
-			if lockErr := rlockContext(ctx, &c.db.mu); lockErr != nil {
-				s.query.Release()
-				return nil, lockErr
+		if err == nil {
+			s.explain = tree.Explain
+			s.analyze = tree.Explain && tree.Analyze
+			// Source requirements are properties of the prepared SELECT, not
+			// of the wrapper that will consume it. EXPLAIN ANALYZE re-enters the
+			// ordinary execution path, so it must retain the same join catalog or
+			// primary-point fact as SELECT.
+			if s.query.RequiresCatalog() {
+				s.joinNames = joinTableNames(tree.Select)
+			} else {
+				if lockErr := rlockContext(ctx, &c.db.mu); lockErr != nil {
+					s.query.Release()
+					return nil, lockErr
+				}
+				t := c.db.tables[s.query.Collection()]
+				if t != nil {
+					s.primaryPoint = isPrimaryPredicate(
+						tree.Select.Where, t.meta.PrimaryKey)
+				}
+				c.db.mu.RUnlock()
 			}
-			t := c.db.tables[s.query.Collection()]
-			if t != nil {
-				s.primaryPoint = isPrimaryPredicate(
-					tree.Select.Where, t.meta.PrimaryKey)
-			}
-			c.db.mu.RUnlock()
 		}
 	} else {
 		s.mutation, err = query.PrepareParsedDML(src, tree)

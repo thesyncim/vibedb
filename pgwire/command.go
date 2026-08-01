@@ -65,6 +65,50 @@ const (
 	kindUnknown
 )
 
+// unsupportedStatements maps a leading keyword onto the feature it needs and
+// this server does not have. Every entry is a deliberate refusal with a reason
+// a reader of the message can act on, which is the whole reason the table
+// exists instead of a default branch saying "unsupported statement".
+var unsupportedStatements = map[string]string{
+	"MERGE":    "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
+	"TRUNCATE": "TRUNCATE is not supported; use a bounded DELETE predicate",
+	"COPY":     "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
+
+	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
+	"DROP":    "DROP is not in the bounded catalog subset; destructive catalog operations remain with the database owner",
+	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
+	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
+	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",
+	"VACUUM":  "storage maintenance is the owning application's, not a client's",
+	"ANALYZE": "storage maintenance is the owning application's, not a client's",
+	"REINDEX": "storage maintenance is the owning application's, not a client's",
+	"CLUSTER": "storage maintenance is the owning application's, not a client's",
+	"REFRESH": "there are no materialized views",
+
+	"SAVEPOINT": "savepoints are not supported: the runtime owns one bounded transaction overlay",
+	"RELEASE":   "savepoints are not supported, so there is no savepoint to release",
+
+	"PREPARE":    "SQL-level PREPARE is not supported: use the extended query protocol's Parse message, which every client library exposes",
+	"EXECUTE":    "SQL-level EXECUTE is not supported: use the extended query protocol's Bind and Execute messages",
+	"DEALLOCATE": "SQL-level DEALLOCATE is not supported: use the extended query protocol's Close message",
+
+	"DECLARE": "cursors are not supported: the extended query protocol's portals are the row-at-a-time mechanism here",
+	"FETCH":   "cursors are not supported: the extended query protocol's portals are the row-at-a-time mechanism here",
+	"MOVE":    "cursors are not supported: the extended query protocol's portals are the row-at-a-time mechanism here",
+
+	"LISTEN":   "asynchronous notification is not supported",
+	"NOTIFY":   "asynchronous notification is not supported",
+	"UNLISTEN": "asynchronous notification is not supported",
+
+	"LOCK": "there is no lock manager: readers never block and there is nothing to lock against",
+	"CALL": "there are no stored procedures",
+	"DO":   "there is no procedural language",
+
+	"WITH":   "common table expressions are not supported: the engine executes one plan and has no nested execution",
+	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
+	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
+}
+
 // classify reports what kind of statement src is, from its leading keyword.
 // The second result is a specific refusal or syntax-error message when one is
 // available.
@@ -88,7 +132,7 @@ func classifyCancelable(
 	switch {
 	case word == "":
 		return kindEmpty, "", nil
-	case strings.EqualFold(word, "SELECT"):
+	case strings.EqualFold(word, "SELECT"), strings.EqualFold(word, "EXPLAIN"):
 		return kindSelect, "", nil
 	case strings.EqualFold(word, "INSERT"), strings.EqualFold(word, "UPDATE"),
 		strings.EqualFold(word, "DELETE"), strings.EqualFold(word, "CREATE"):
@@ -107,6 +151,17 @@ func classifyCancelable(
 		return kindShow, "", nil
 	case strings.EqualFold(word, "DISCARD"):
 		return kindDiscard, "", nil
+	}
+	// Preserve the protocol taxonomy for callers that inspect classification,
+	// while still handing the statement to the shared SQL front end. That front
+	// end owns the typed refusal used by both database/sql and pgwire, so the two
+	// adapters cannot diverge on SQLSTATE or wording. Bound the uppercase copy to
+	// the longest keyword in the fixed table; a maximal unknown token must not
+	// trigger a second input-sized allocation.
+	if len(word) <= len("DEALLOCATE") {
+		if reason, ok := unsupportedStatements[strings.ToUpper(word)]; ok {
+			return kindCatalogSQL, reason, nil
+		}
 	}
 	// Every remaining keyword is handed to the shared SQL front end. It owns
 	// the typed feature-not-supported taxonomy; an actually unknown word remains

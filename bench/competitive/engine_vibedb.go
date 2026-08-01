@@ -10,31 +10,89 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// durableCollection is the subset of store/durable's collection type this
-// harness uses. As with heapCollection, it is spelled as a local interface so
-// the in-flight rename of the concrete type cannot break the benchmark.
-type durableCollection interface {
-	Put(key []byte, src []byte) (bool, error)
-	Delete(key []byte) (bool, error)
-	AppendRaw(dst []byte, key []byte) ([]byte, bool, error)
-	RangeRawCurrentBuffer(
-		scratch []byte, fn func(key, value []byte) error,
-	) ([]byte, error)
-	Snapshot() (*durable.Snapshot, error)
-	Len() uint64
-	Stats() durable.Stats
-	Flush() error
-	Close() error
-}
+// The durable ordered-primary format accepts keys up to 256 bytes. Keep each
+// benchmark client one fixed buffer of exactly that bound: valid operations
+// never allocate for string conversion and invalid input cannot grow retained
+// adapter memory. AppendRaw, Put, and Delete borrow the key only for their
+// call, so the client may overwrite this buffer at its next operation.
+const vibeDBKeyBytes = 256
 
 type vibeDBEngine struct {
 	cfg     Config
 	path    string
 	file    *os.File
-	coll    durableCollection
+	coll    *durable.Collection
 	snap    *durable.Snapshot
 	exec    query.Exec
 	scratch []byte
+	keyBuf  [vibeDBKeyBytes]byte
+	scan    *vibeDBScanState
+}
+
+func vibeDBPointKey(
+	buf *[vibeDBKeyBytes]byte,
+	key string,
+) ([]byte, error) {
+	if len(key) > len(buf) {
+		return nil, durable.ErrKeyTooLarge
+	}
+	copy(buf[:], key)
+	return buf[:len(key)], nil
+}
+
+// vibeDBScanState owns the reconstruction buffer and callbacks for one
+// benchmark client. The callback method values are bound once when the session
+// is created, rather than rebuilt as escaping closures on every scan.
+type vibeDBScanState struct {
+	scratch []byte
+	rows    int
+	sink    byte
+	first   func(key, value []byte) error
+	all     func(key, value []byte) error
+}
+
+func newVibeDBScanState() *vibeDBScanState {
+	state := new(vibeDBScanState)
+	state.first = state.consumeFirstByte
+	state.all = state.consumeAllBytes
+	return state
+}
+
+func (s *vibeDBScanState) consumeFirstByte(_ []byte, value []byte) error {
+	if len(value) > 0 {
+		s.sink ^= value[0]
+	}
+	s.rows++
+	return nil
+}
+
+func (s *vibeDBScanState) consumeAllBytes(_ []byte, value []byte) error {
+	s.sink ^= touchAll(value)
+	s.rows++
+	return nil
+}
+
+// rangeVibeDBCurrent is the adapter's single dependency on the durable
+// current-scan API. Keeping that boundary in one place makes scan API changes
+// mechanical without reintroducing per-call adapter closures.
+func rangeVibeDBCurrent(
+	coll *durable.Collection,
+	scratch []byte,
+	visit func(key, value []byte) error,
+) ([]byte, error) {
+	return coll.RangeRawCurrentBuffer(scratch, visit)
+}
+
+func (s *vibeDBScanState) run(
+	coll *durable.Collection,
+	visit func(key, value []byte) error,
+) (int, error) {
+	s.rows = 0
+	s.sink = 0
+	scratch, err := rangeVibeDBCurrent(coll, s.scratch, visit)
+	s.scratch = scratch
+	foldScanSink(s.sink)
+	return s.rows, err
 }
 
 func newVibeDB(cfg Config) (Engine, error) {
@@ -48,7 +106,7 @@ func newVibeDB(cfg Config) (Engine, error) {
 		return nil, err
 	}
 	cfg.StorageProfile = profile.Profile
-	return &vibeDBEngine{cfg: cfg}, nil
+	return &vibeDBEngine{cfg: cfg, scan: newVibeDBScanState()}, nil
 }
 
 func (v *vibeDBEngine) Name() string { return "vibedb" }
@@ -280,7 +338,11 @@ func (v *vibeDBEngine) releaseSnapshot() {
 }
 
 func (v *vibeDBEngine) Get(dst []byte, key string) ([]byte, error) {
-	out, ok, err := v.coll.AppendRaw(dst, []byte(key))
+	keyBytes, err := vibeDBPointKey(&v.keyBuf, key)
+	if err != nil {
+		return dst, err
+	}
+	out, ok, err := v.coll.AppendRaw(dst, keyBytes)
 	if err != nil {
 		return dst, err
 	}
@@ -293,7 +355,11 @@ func (v *vibeDBEngine) Get(dst []byte, key string) ([]byte, error) {
 func (v *vibeDBEngine) Put(key string, doc []byte) error {
 	// See snapshot: a write path must not hold a snapshot lease open.
 	v.releaseSnapshot()
-	_, err := v.coll.Put([]byte(key), doc)
+	keyBytes, err := vibeDBPointKey(&v.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	_, err = v.coll.Put(keyBytes, doc)
 	return err
 }
 
@@ -301,7 +367,11 @@ func (v *vibeDBEngine) Upsert(key string, doc []byte) error { return v.Put(key, 
 
 func (v *vibeDBEngine) Delete(key string) error {
 	v.releaseSnapshot()
-	deleted, err := v.coll.Delete([]byte(key))
+	keyBytes, err := vibeDBPointKey(&v.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	deleted, err := v.coll.Delete(keyBytes)
 	if err == nil && !deleted {
 		return fmt.Errorf("missing key %q", key)
 	}
@@ -309,35 +379,15 @@ func (v *vibeDBEngine) Delete(key string) error {
 }
 
 func (v *vibeDBEngine) Scan() (int, error) {
-	n := 0
-	var sink byte
-	scratch, err := v.coll.RangeRawCurrentBuffer(v.scratch, func(key, value []byte) error {
-		if len(value) > 0 {
-			sink ^= value[0]
-		}
-		n++
-		return nil
-	})
-	v.scratch = scratch
-	foldScanSink(sink)
-	return n, err
+	return v.scan.run(v.coll, v.scan.first)
 }
 
 func (v *vibeDBEngine) ScanAllBytes() (int, error) {
-	n := 0
-	var sink byte
-	scratch, err := v.coll.RangeRawCurrentBuffer(v.scratch, func(key, value []byte) error {
-		sink ^= touchAll(value)
-		n++
-		return nil
-	})
-	v.scratch = scratch
-	foldScanSink(sink)
-	return n, err
+	return v.scan.run(v.coll, v.scan.all)
 }
 
 func (v *vibeDBEngine) Visit(fn func(key string, value []byte) error) error {
-	scratch, err := v.coll.RangeRawCurrentBuffer(v.scratch, func(key, value []byte) error {
+	scratch, err := rangeVibeDBCurrent(v.coll, v.scratch, func(key, value []byte) error {
 		return fn(string(key), value)
 	})
 	v.scratch = scratch
@@ -493,15 +543,20 @@ func (v *vibeDBEngine) Close() error {
 }
 
 // vibeDBEngineSession is one client's private view onto the shared durable
-// collection. The collection handle is shared and concurrency-safe; only the
-// current-scan reconstruction buffer is per caller.
+// collection. The collection handle is shared and concurrency-safe; the key
+// conversion and current-scan reconstruction buffers are per caller.
 type vibeDBEngineSession struct {
-	coll    durableCollection
-	scratch []byte
+	coll   *durable.Collection
+	keyBuf [vibeDBKeyBytes]byte
+	scan   *vibeDBScanState
 }
 
 func (s *vibeDBEngineSession) Get(dst []byte, key string) ([]byte, error) {
-	out, ok, err := s.coll.AppendRaw(dst, []byte(key))
+	keyBytes, err := vibeDBPointKey(&s.keyBuf, key)
+	if err != nil {
+		return dst, err
+	}
+	out, ok, err := s.coll.AppendRaw(dst, keyBytes)
 	if err != nil {
 		return dst, err
 	}
@@ -512,14 +567,22 @@ func (s *vibeDBEngineSession) Get(dst []byte, key string) ([]byte, error) {
 }
 
 func (s *vibeDBEngineSession) Put(key string, doc []byte) error {
-	_, err := s.coll.Put([]byte(key), doc)
+	keyBytes, err := vibeDBPointKey(&s.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	_, err = s.coll.Put(keyBytes, doc)
 	return err
 }
 
 func (s *vibeDBEngineSession) Upsert(key string, doc []byte) error { return s.Put(key, doc) }
 
 func (s *vibeDBEngineSession) Delete(key string) error {
-	deleted, err := s.coll.Delete([]byte(key))
+	keyBytes, err := vibeDBPointKey(&s.keyBuf, key)
+	if err != nil {
+		return err
+	}
+	deleted, err := s.coll.Delete(keyBytes)
 	if err == nil && !deleted {
 		return fmt.Errorf("missing key %q", key)
 	}
@@ -527,19 +590,10 @@ func (s *vibeDBEngineSession) Delete(key string) error {
 }
 
 func (s *vibeDBEngineSession) ScanAllBytes() (int, error) {
-	n := 0
-	var sink byte
-	scratch, err := s.coll.RangeRawCurrentBuffer(s.scratch, func(key, value []byte) error {
-		sink ^= touchAll(value)
-		n++
-		return nil
-	})
-	s.scratch = scratch
-	foldScanSink(sink)
-	return n, err
+	return s.scan.run(s.coll, s.scan.all)
 }
 
-// Session vends a per-client scan buffer over the shared collection.
+// Session vends per-client key and scan buffers over the shared collection.
 func (v *vibeDBEngine) Session(int) EngineSession {
-	return &vibeDBEngineSession{coll: v.coll}
+	return &vibeDBEngineSession{coll: v.coll, scan: newVibeDBScanState()}
 }

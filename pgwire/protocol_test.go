@@ -973,6 +973,63 @@ func TestTextInputsMustMatchTheReportedUTF8Encoding(t *testing.T) {
 	})
 }
 
+func TestSimpleQueryExplainAndAnalyzeReturnOnePlanRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "explain",
+			sql:  `EXPLAIN SELECT name FROM users WHERE tier = 'pro'`,
+			want: []string{`"node":"scan"`, `"collection":"users"`},
+		},
+		{
+			name: "explain analyze",
+			sql: `EXPLAIN ANALYZE SELECT name FROM users ` +
+				`WHERE tier = 'pro' ORDER BY name LIMIT 2`,
+			want: []string{`"node":"scan"`, `"collection":"users"`, `"analyze":{`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := connect(t)
+			msgs := c.query(tc.sql)
+			wantTags := []byte{
+				msgRowDescription, msgDataRow, msgCommandComplete, msgReadyForQuery,
+			}
+			if got := tagBytes(msgs); !bytes.Equal(got, wantTags) {
+				t.Fatalf("message sequence is %s, want %s",
+					tags(msgs), tags(msgsOf(wantTags)))
+			}
+
+			cols := decodeRowDescription(t, msgs[0].body)
+			if len(cols) != 1 || cols[0].name != "QUERY PLAN" {
+				t.Fatalf("RowDescription is %+v, want one QUERY PLAN column", cols)
+			}
+			rows := rowsOf(t, msgs)
+			if len(rows) != 1 || len(rows[0]) != 1 {
+				t.Fatalf("EXPLAIN rows = %q, want one row with one plan", rows)
+			}
+			var plan string
+			if err := json.Unmarshal(rows[0][0], &plan); err != nil {
+				t.Fatalf("QUERY PLAN wire value is not a JSON string: %q: %v",
+					rows[0][0], err)
+			}
+			if !json.Valid([]byte(plan)) {
+				t.Fatalf("QUERY PLAN is not valid JSON: %s", plan)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(plan, want) {
+					t.Errorf("QUERY PLAN missing %s: %s", want, plan)
+				}
+			}
+			if got := commandTagOf(t, msgs); got != "SELECT 1" {
+				t.Fatalf("CommandComplete tag = %q, want SELECT 1", got)
+			}
+		})
+	}
+}
+
 // --- error classification --------------------------------------------------
 
 func TestErrorClassification(t *testing.T) {
@@ -987,7 +1044,6 @@ func TestErrorClassification(t *testing.T) {
 		{`INSERT INTO users VALUES (1)`, sqlstateSyntaxError},
 		{`CREATE TABLE t (a int)`, sqlstateInternalError},
 		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
-		{`EXPLAIN SELECT name FROM users`, sqlstateFeatureNotSupported},
 		{`DECLARE c CURSOR FOR SELECT 1`, sqlstateFeatureNotSupported},
 		{`WITH x AS (SELECT 1) SELECT * FROM x`, sqlstateFeatureNotSupported},
 		{`banana`, sqlstateSyntaxError},

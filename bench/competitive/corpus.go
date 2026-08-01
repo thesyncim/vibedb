@@ -12,17 +12,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
-	"math/rand/v2"
-	"strconv"
 
+	"github.com/thesyncim/vibedb/internal/benchcorpus"
 	"github.com/thesyncim/vibejson"
 )
 
 // Doc is one corpus record: a key and its JSON body.
-type Doc struct {
-	Key  string
-	JSON []byte
-}
+type Doc = benchcorpus.Document
 
 // AppendExpectedStoredJSON appends the representation an engine promises to
 // return for src. The durable class-5 format is canonical by construction;
@@ -100,42 +96,11 @@ const FilterField = "country"
 // hundred-element alphabet, so this predicate selects ~1% of the corpus.
 const FilterValue = "PT"
 
-// countries is the hundred-value alphabet of the indexed column. Uniform draws
-// from it give FilterValue a 1% selectivity, which is the interesting regime:
-// selective enough that an index should win by a wide margin, unselective
-// enough that a scan is not answering a near-empty question.
-var countries = buildCountries()
-
-func buildCountries() []string {
-	const letters = "ABCDEFGHIJ"
-	out := make([]string, 0, 100)
-	for i := range len(letters) {
-		for j := range len(letters) {
-			out = append(out, string(letters[i])+string(letters[j]))
-		}
-	}
-	// Place the needle at a known slot so selectivity is exactly 1-in-100.
-	out[26] = FilterValue
-	return out
-}
-
-var (
-	tiers   = []string{"free", "pro", "team", "enterprise"}
-	regions = []string{"eu-west-1", "eu-central-1", "us-east-1", "us-west-2", "ap-south-1"}
-	tagPool = []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"}
-	notes   = []string{
-		"steady state, no anomalies observed in the last reporting window",
-		"processed by the current pipeline during the maintenance window",
-		"flagged for review after a threshold breach on the ingest path",
-		"nominal; retention policy applied and checkpoint acknowledged",
-	}
-)
-
 // Key returns the storage key for document i. Keys are fixed-width and
 // lexicographically ordered so that every ordered engine (bbolt, pebble,
 // badger, SQLite WITHOUT ROWID) sees the same sequential insert pattern and
 // none is penalised by a key distribution the others do not share.
-func Key(i int) string { return fmt.Sprintf("doc:%08d", i) }
+func Key(i int) string { return benchcorpus.Key(i) }
 
 // Corpus builds n documents of the shipped low-cardinality variant.
 func Corpus(n int) []Doc { return CorpusOf(n, LowCardinality) }
@@ -150,67 +115,7 @@ func Corpus(n int) []Doc { return CorpusOf(n, LowCardinality) }
 // difference in a disk column between the two runs is therefore attributable to
 // value redundancy alone and not to a different corpus size.
 func CorpusOf(n int, card Cardinality) []Doc {
-	rng := rand.New(rand.NewPCG(0x5DEECE66D, 0xB16B00B5))
-	// A second, independent stream for the high-cardinality substitutions, so
-	// that the pool draws above stay identical between the two variants and the
-	// documents stay length-for-length comparable.
-	fill := rand.New(rand.NewPCG(0xC0FFEE, 0x1234567))
-	uniq := func(sample string) string {
-		if card == LowCardinality {
-			return sample
-		}
-		return randomLower(fill, len(sample))
-	}
-	docs := make([]Doc, n)
-	buf := make([]byte, 0, 512)
-	for i := range n {
-		country := countries[rng.IntN(len(countries))]
-		tier := uniq(tiers[rng.IntN(len(tiers))])
-		region := uniq(regions[rng.IntN(len(regions))])
-		note := uniq(notes[rng.IntN(len(notes))])
-		score := rng.IntN(1000)
-		joinedY := 2018 + rng.IntN(7)
-		joinedM := 1 + rng.IntN(12)
-		joinedD := 1 + rng.IntN(28)
-		nTags := 2 + rng.IntN(3)
-
-		buf = buf[:0]
-		buf = append(buf, `{"id":`...)
-		buf = strconv.AppendInt(buf, int64(i), 10)
-		buf = append(buf, `,"name":"user-`...)
-		buf = strconv.AppendInt(buf, int64(i), 10)
-		buf = append(buf, `","country":"`...)
-		buf = append(buf, country...)
-		buf = append(buf, `","score":`...)
-		buf = strconv.AppendInt(buf, int64(score), 10)
-		buf = append(buf, `,"active":`...)
-		if i%3 == 0 {
-			buf = append(buf, "false"...)
-		} else {
-			buf = append(buf, "true"...)
-		}
-		buf = append(buf, `,"profile":{"tier":"`...)
-		buf = append(buf, tier...)
-		buf = append(buf, `","region":"`...)
-		buf = append(buf, region...)
-		buf = append(buf, `","joined":"`...)
-		buf = append(buf, fmt.Sprintf("%04d-%02d-%02d", joinedY, joinedM, joinedD)...)
-		buf = append(buf, `"},"tags":[`...)
-		for t := range nTags {
-			if t > 0 {
-				buf = append(buf, ',')
-			}
-			buf = append(buf, '"')
-			buf = append(buf, uniq(tagPool[(i+t*3)%len(tagPool)])...)
-			buf = append(buf, '"')
-		}
-		buf = append(buf, `],"note":"`...)
-		buf = append(buf, note...)
-		buf = append(buf, `"}`...)
-
-		docs[i] = Doc{Key: Key(i), JSON: append([]byte(nil), buf...)}
-	}
-	return docs
+	return benchcorpus.Corpus(n, card == HighCardinality)
 }
 
 // UpdatedJSON returns a same-shape replacement body for document i, used by
@@ -254,16 +159,6 @@ func AppendSameSizeUpdatedJSON(dst []byte, docs []Doc, i int) []byte {
 		out[at]++
 	}
 	return out
-}
-
-// randomLower renders n random lowercase letters. Length is preserved exactly
-// so the high-cardinality corpus is byte-for-byte the same size as the low one.
-func randomLower(rng *rand.Rand, n int) string {
-	out := make([]byte, n)
-	for i := range out {
-		out[i] = byte('a' + rng.IntN(26))
-	}
-	return string(out)
 }
 
 // CorpusByteCounts separates the bytes applications ask an engine to store
