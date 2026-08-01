@@ -576,6 +576,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 			[]storeio.PageRef, 0, c.options.MaxRetiredExtents,
 		)
 	}
+	c.setupPrimaryNativeFoldContexts()
 	if err := c.openPrimaryExactIndexes(state); err != nil {
 		return fmt.Errorf(
 			"vibejson: open ordered-primary exact indexes: %w", err,

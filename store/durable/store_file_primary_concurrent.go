@@ -285,6 +285,7 @@ type primaryConcurrentPublishRequest struct {
 	key         []byte
 	canonical   []byte
 	route       storeio.ResidentPrimaryRoute
+	scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
 	rawDelta    int
 	countDelta  int
 	kind        uint8
@@ -453,7 +454,7 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 				c.primaryUnifiedOverlay.prepareSameSizeArenaReuse(
 					request.route.Bucket, request.route.Hash, generation,
 					request.key, request.canonical, request.stableSlot,
-					journalCovered, leafBytes,
+					journalCovered, leafBytes, request.scalarPatch,
 				)
 		}
 		var err error
@@ -463,6 +464,7 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 				request.key, request.canonical, request.rawDelta,
 				request.countDelta, request.kind, request.stableSlot,
 				request.route.Ref.Length, !request.fixedExtent,
+				request.scalarPatch,
 			)
 		}
 		if err != nil {
@@ -729,11 +731,19 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		leaf.TrivialContentBytes()+pendingRaw+rawDelta,
 	)
 	fixedExtent := false
+	var scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
 	if fits && baseFound && !overflow {
-		fixedExtent, err = leaf.PatchStableCanonicalReplacementKeepsExtent(
-			key, stableSlot, canonicalIndex,
-			context.index, &context.workspace,
-		)
+		var resolved bool
+		scalarPatch, fixedExtent, resolved, err =
+			leaf.PatchStableCanonicalReplacementScalarPatch(
+				key, stableSlot, canonicalIndex,
+			)
+		if err == nil && !resolved {
+			fixedExtent, err = leaf.PatchStableCanonicalReplacementKeepsExtent(
+				key, stableSlot, canonicalIndex,
+				context.index, &context.workspace,
+			)
+		}
 		if err != nil {
 			leafLease.Release()
 			return false, false, err
@@ -751,6 +761,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	request.key = key
 	request.canonical = canonical
 	request.route = route
+	request.scalarPatch = scalarPatch
 	request.rawDelta = rawDelta
 	request.countDelta = countDelta
 	request.kind = primaryUnifiedOverlayPut
@@ -761,6 +772,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	request.key = nil
 	request.canonical = nil
 	request.route = storeio.ResidentPrimaryRoute{}
+	request.scalarPatch = storeio.CommonPrimaryUnifiedScalarPatch{}
 	request.rawDelta = 0
 	request.countDelta = 0
 	request.kind = 0
@@ -905,6 +917,7 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 	request.key = key
 	request.canonical = nil
 	request.route = route
+	request.scalarPatch = storeio.CommonPrimaryUnifiedScalarPatch{}
 	request.rawDelta = rawDelta
 	request.countDelta = -1
 	request.kind = primaryUnifiedOverlayDelete
@@ -915,6 +928,7 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 	request.key = nil
 	request.canonical = nil
 	request.route = storeio.ResidentPrimaryRoute{}
+	request.scalarPatch = storeio.CommonPrimaryUnifiedScalarPatch{}
 	request.rawDelta = 0
 	request.countDelta = 0
 	request.kind = 0

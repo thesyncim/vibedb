@@ -19,7 +19,9 @@ func (o *primaryUnifiedOverlay) primaryUnifiedFixedReplacements(
 		return dst[:0], false, nil
 	}
 	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
-	count, err := o.latestBucketRecords(&indexes, bucket, generation)
+	count, err := o.latestBucketRecordsUnordered(
+		&indexes, bucket, generation,
+	)
 	if err != nil {
 		return dst[:0], false, err
 	}
@@ -43,9 +45,10 @@ func (o *primaryUnifiedOverlay) primaryUnifiedFixedReplacements(
 			return dst[:0], false, storeio.ErrCommonPrimaryLeafCorrupt
 		}
 		dst = append(dst, storeio.CommonPrimaryUnifiedReplacement{
-			Key:   o.arena[record.keyOffset:keyEnd:keyEnd],
-			Value: o.arena[record.valueOff:valueEnd:valueEnd],
-			Slot:  record.slot,
+			Key:         o.arena[record.keyOffset:keyEnd:keyEnd],
+			Value:       o.arena[record.valueOff:valueEnd:valueEnd],
+			ScalarPatch: record.scalarPatch,
+			Slot:        record.slot,
 		})
 	}
 	return dst, true, nil

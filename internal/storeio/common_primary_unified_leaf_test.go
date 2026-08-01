@@ -3,8 +3,10 @@ package storeio
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibejson"
@@ -341,6 +343,355 @@ func TestUnifiedLeafPlanStableIntegerPatchMatchesFullPlanner(t *testing.T) {
 	}
 }
 
+func TestUnifiedLeafPlanVariableIntegerWidthPatchRebuildsHeap(t *testing.T) {
+	records, want := unifiedTestCorpus(220)
+	page, count := encodeUnifiedTestLeaf(t, records)
+	source := append([]byte(nil), page...)
+	view := openUnifiedTestLeaf(t, page)
+	slots, slotsOK := view.PostingSlots()
+	if !slotsOK {
+		t.Fatal("posting slots")
+	}
+
+	replacementRank := -1
+	var replacement CommonPrimaryUnifiedReplacement
+	for rank := 0; rank < count; rank++ {
+		raw, rendered := view.AppendRawRank(nil, rank)
+		if !rendered {
+			t.Fatalf("render rank %d", rank)
+		}
+		at := bytes.Index(raw, []byte(`"score":63`))
+		if at < 0 {
+			continue
+		}
+		_, body, overflow, rowOK := view.RowRawAt(rank)
+		if !rowOK || overflow || body[0] == unifiedRowTrivial {
+			continue
+		}
+		updated := append([]byte(nil), raw...)
+		updated[at+len(`"score":6`)] = '4'
+		replacement = CommonPrimaryUnifiedReplacement{
+			Key: records[rank].Key, Value: updated, Slot: slots[rank],
+		}
+		replacementRank = rank
+		break
+	}
+	if replacementRank < 0 {
+		t.Fatal("fixture has no templated score 63 row")
+	}
+
+	header := view.Header()
+	header.Generation = 2
+	dst := make([]byte, len(page))
+	builder := NewUnifiedPrimaryLeafBuilder()
+	patched, accepted, err := view.PatchPlanStableReplacements(
+		dst, header, []CommonPrimaryUnifiedReplacement{replacement}, builder,
+	)
+	if err != nil || !accepted {
+		t.Fatalf("variable-width patch = %v,%v", accepted, err)
+	}
+	if !bytes.Equal(page, source) {
+		t.Fatal("patch mutated source page")
+	}
+	oldHeader, _ := decodePageHeader(page)
+	newHeader, _ := decodePageHeader(patched)
+	if len(patched) != len(page) ||
+		newHeader.PayloadLength != oldHeader.PayloadLength+1 {
+		t.Fatalf(
+			"extent/payload = %d/%d, want %d/%d",
+			len(patched), newHeader.PayloadLength,
+			len(page), oldHeader.PayloadLength+1,
+		)
+	}
+
+	logicalID, _ := CommonPrimaryLeafLogicalID(0)
+	opened, err := OpenCommonPrimaryUnifiedLeaf(
+		patched, unifiedTestStoreID(), 0,
+		PageRef{
+			Offset: 4096, Length: uint32(len(patched)), LogicalID: logicalID,
+			Generation: 2, Kind: PagePrimaryLeaf,
+		},
+		2, unifiedTestBounds(),
+	)
+	if err != nil {
+		t.Fatalf("open patched leaf: %v", err)
+	}
+	if !bytes.Equal(
+		view.env.payload[view.templateDir:view.heapStart],
+		opened.env.payload[opened.templateDir:opened.heapStart],
+	) {
+		t.Fatal("variable-width patch changed template/dictionary sections")
+	}
+	for rank := 0; rank < count; rank++ {
+		got, ok := opened.AppendRawRank(nil, rank)
+		expected := want[rank]
+		if rank == replacementRank {
+			expected = replacement.Value
+		}
+		if !ok || !bytes.Equal(got, expected) {
+			t.Fatalf("rank %d render = %q,%v want %q", rank, got, ok, expected)
+		}
+	}
+
+	// All scratch growth is paid by the warm call above. The common integer
+	// width-change path must not add GC pressure to a checkpoint fold.
+	allocs := testing.AllocsPerRun(200, func() {
+		if _, ok, patchErr := view.PatchPlanStableReplacements(
+			dst, header,
+			[]CommonPrimaryUnifiedReplacement{replacement}, builder,
+		); patchErr != nil || !ok {
+			panic("warm variable-width patch declined")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed variable-width patch allocates %.1f/op", allocs)
+	}
+}
+
+func TestUnifiedLeafPlanVariableWidthRejectsFullExtentAndCorruptBody(t *testing.T) {
+	makeRecords := func(member string) []CommonPrimaryLeafRecord {
+		records := make([]CommonPrimaryLeafRecord, 8)
+		for i := range records {
+			records[i] = CommonPrimaryLeafRecord{
+				Key: fmt.Appendf(nil, "doc:%08d", i),
+				Value: CommonPrimaryLeafValue{Inline: fmt.Appendf(
+					nil, `{"%s":"steady","score":63}`, member,
+				)},
+			}
+		}
+		return records
+	}
+	baseRecords := makeRecords("pad")
+	base, baseCount := encodeUnifiedTestLeaf(t, baseRecords)
+	if baseCount != len(baseRecords) {
+		t.Fatalf("base count = %d", baseCount)
+	}
+	baseHeader, _ := decodePageHeader(base)
+	slack := len(base) - PageHeaderSize - PageTrailerSize -
+		int(baseHeader.PayloadLength)
+	if slack <= 0 {
+		t.Fatalf("base slack = %d", slack)
+	}
+	records := makeRecords(strings.Repeat("p", len("pad")+slack))
+	for rank := range records {
+		records[rank].Slot = baseRecords[rank].Slot
+	}
+	page, err := EncodeBestCommonPrimaryUnifiedLeaf(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
+		},
+		unifiedTestStoreID(), records, unifiedTestBounds(),
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatalf("encode full-extent fixture: %v", err)
+	}
+	headerOnDisk, _ := decodePageHeader(page)
+	if len(page) != len(base) ||
+		int(headerOnDisk.PayloadLength) !=
+			len(page)-PageHeaderSize-PageTrailerSize {
+		t.Fatalf(
+			"full-extent fixture extent/payload = %d/%d",
+			len(page), headerOnDisk.PayloadLength,
+		)
+	}
+	view := openUnifiedTestLeaf(t, page)
+	slots, ok := view.PostingSlots()
+	if !ok {
+		t.Fatal("posting slots")
+	}
+	raw, ok := view.AppendRawRank(nil, 0)
+	if !ok {
+		t.Fatal("render rank zero")
+	}
+	at := bytes.Index(raw, []byte(`"score":63`))
+	if at < 0 {
+		t.Fatal("score token")
+	}
+	updated := append([]byte(nil), raw...)
+	updated[at+len(`"score":6`)] = '4'
+	replacement := CommonPrimaryUnifiedReplacement{
+		Key: records[0].Key, Value: updated, Slot: slots[0],
+	}
+	header := view.Header()
+	header.Generation = 2
+	if _, accepted, err := view.PatchPlanStableReplacements(
+		make([]byte, len(page)), header,
+		[]CommonPrimaryUnifiedReplacement{replacement},
+		NewUnifiedPrimaryLeafBuilder(),
+	); err != nil || accepted {
+		t.Fatalf("full-extent growth = %v,%v, want false,nil", accepted, err)
+	}
+
+	corrupted := append([]byte(nil), base...)
+	corruptView := openUnifiedTestLeaf(t, corrupted)
+	corruptSlots, _ := corruptView.PostingSlots()
+	corruptRaw, _ := corruptView.AppendRawRank(nil, 0)
+	corruptAt := bytes.Index(corruptRaw, []byte(`"score":63`))
+	corruptUpdated := append([]byte(nil), corruptRaw...)
+	corruptUpdated[corruptAt+len(`"score":6`)] = '4'
+	_, valueStart, _, boundsOK := corruptView.env.keyBounds(0)
+	if !boundsOK || corruptView.env.payload[valueStart] == unifiedRowTrivial {
+		t.Fatal("corrupt fixture row is not templated")
+	}
+	corruptView.env.payload[valueStart+1] = 0xFD
+	corruptHeader := corruptView.Header()
+	corruptHeader.Generation = 2
+	_, accepted, err := corruptView.PatchPlanStableReplacements(
+		make([]byte, len(corrupted)), corruptHeader,
+		[]CommonPrimaryUnifiedReplacement{{
+			Key: records[0].Key, Value: corruptUpdated, Slot: corruptSlots[0],
+		}},
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if accepted || !errors.Is(err, ErrCommonPrimaryLeafCorrupt) {
+		t.Fatalf("corrupt body patch = %v,%v", accepted, err)
+	}
+}
+
+func TestUnifiedLeafPlanStablePatchRejectsNonIncreasingGeneration(t *testing.T) {
+	records, _ := unifiedTestCorpus(32)
+	page, count := encodeUnifiedTestLeaf(t, records)
+	view := openUnifiedTestLeaf(t, page)
+	slots, slotsOK := view.PostingSlots()
+	if !slotsOK || count == 0 {
+		t.Fatal("posting slots")
+	}
+	value, rendered := view.AppendRawRank(nil, 0)
+	if !rendered {
+		t.Fatal("render rank zero")
+	}
+	replacement := CommonPrimaryUnifiedReplacement{
+		Key: records[0].Key, Value: value, Slot: slots[0],
+	}
+	for _, generation := range []uint64{0, view.Header().Generation} {
+		header := view.Header()
+		header.Generation = generation
+		_, accepted, err := view.PatchPlanStableReplacements(
+			make([]byte, len(page)), header,
+			[]CommonPrimaryUnifiedReplacement{replacement},
+			NewUnifiedPrimaryLeafBuilder(),
+		)
+		if accepted || !errors.Is(err, ErrInvalidWrite) {
+			t.Fatalf("generation %d patch = %v,%v", generation, accepted, err)
+		}
+	}
+}
+
+func TestUnifiedLeafPlanVariableWidthRejectsTrivialContentOverflow(t *testing.T) {
+	const count = 8
+	keys := make([][]byte, count)
+	fixedContent := commonPrimaryUnifiedHeaderBytes
+	for rank := range count {
+		keys[rank] = fmt.Appendf(nil, "doc:%08d", rank)
+		// One trivial row tag plus the canonical {"":9} framing; the shared
+		// member spelling is added below and repeated in every logical row.
+		fixedContent += len(keys[rank]) + 1 + len(`{"":9}`)
+	}
+	capacity := CommonPrimaryLeafMaxExtentBytes - PageHeaderSize - PageTrailerSize
+	maxTrivialContent := capacity - commonPrimaryLeafLayoutFor(
+		CommonPrimaryLeafWide, count, CommonPrimaryLeafMaxExtentBytes,
+	).heapStart
+	memberBytes := (maxTrivialContent - fixedContent) / count
+	remainder := (maxTrivialContent - fixedContent) % count
+	if memberBytes <= 0 || remainder < 0 {
+		t.Fatalf("invalid fixture budget %d/%d", memberBytes, remainder)
+	}
+	keys[count-1] = append(keys[count-1], strings.Repeat("x", remainder)...)
+	member := strings.Repeat("m", memberBytes)
+	records := make([]CommonPrimaryLeafRecord, count)
+	for rank := range records {
+		records[rank] = CommonPrimaryLeafRecord{
+			Key: keys[rank],
+			Value: CommonPrimaryLeafValue{Inline: fmt.Appendf(
+				nil, `{"%s":9}`, member,
+			)},
+		}
+	}
+	if err := PlaceCommonPrimaryLeafRecords(
+		CommonPrimaryLeafWide, unifiedTestStoreID(), records,
+	); err != nil {
+		t.Fatalf("place fixture: %v", err)
+	}
+	page, err := EncodeBestCommonPrimaryUnifiedLeaf(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
+		},
+		unifiedTestStoreID(), records, unifiedTestBounds(),
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatalf("encode fixture: %v", err)
+	}
+	view := openUnifiedTestLeaf(t, page)
+	if view.TemplateCount() == 0 || view.TrivialRowCount() != 0 {
+		t.Fatalf(
+			"fixture templates/trivial rows = %d/%d",
+			view.TemplateCount(), view.TrivialRowCount(),
+		)
+	}
+	if got := view.TrivialContentBytes(); got != maxTrivialContent ||
+		!CommonPrimaryUnifiedTrivialFits(count, got) ||
+		CommonPrimaryUnifiedTrivialFits(count, got+1) {
+		t.Fatalf("trivial certificate = %d cap %d", got, maxTrivialContent)
+	}
+	pageHeader, _ := decodePageHeader(page)
+	physicalCapacity := len(page) - PageHeaderSize - PageTrailerSize
+	if int(pageHeader.PayloadLength)+1 > physicalCapacity {
+		t.Fatalf(
+			"compressed fixture has no growth room: payload/capacity %d/%d",
+			pageHeader.PayloadLength, physicalCapacity,
+		)
+	}
+
+	slots, slotsOK := view.PostingSlots()
+	if !slotsOK {
+		t.Fatal("posting slots")
+	}
+	raw, rendered := view.AppendRawRank(nil, 0)
+	if !rendered {
+		t.Fatal("render rank zero")
+	}
+	at := bytes.LastIndex(raw, []byte(`:9}`))
+	if at < 0 {
+		t.Fatal("integer token")
+	}
+	updated := make([]byte, 0, len(raw)+1)
+	updated = append(updated, raw[:at+1]...)
+	updated = append(updated, '6', '4')
+	updated = append(updated, raw[at+2:]...)
+	_, valueStart, valueEnd, boundsOK := view.env.keyBounds(0)
+	if !boundsOK {
+		t.Fatal("row bounds")
+	}
+	oldBody := view.env.payload[valueStart:valueEnd:valueEnd]
+	planBuilder := NewUnifiedPrimaryLeafBuilder()
+	_, newBodyBytes, oldCanonicalBytes, stable, planErr :=
+		view.planStableReplacementBody(planBuilder, oldBody, updated)
+	if planErr != nil || !stable || newBodyBytes != len(oldBody)+1 ||
+		len(updated) != oldCanonicalBytes+1 {
+		t.Fatalf(
+			"local width certificate = stable %v err %v body %d/%d canonical %d/%d",
+			stable, planErr, newBodyBytes, len(oldBody),
+			len(updated), oldCanonicalBytes,
+		)
+	}
+	header := view.Header()
+	header.Generation = 2
+	_, accepted, err := view.PatchPlanStableReplacements(
+		make([]byte, len(page)), header,
+		[]CommonPrimaryUnifiedReplacement{{
+			Key: records[0].Key, Value: updated, Slot: slots[0],
+		}},
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || accepted {
+		t.Fatalf("trivial-overflow patch = %v,%v, want false,nil", accepted, err)
+	}
+}
+
 // TestUnifiedLeafStableExtentSpannedCertificateDifferential proves that a
 // scalar-span certificate emitted while canonicalizing has exactly the same
 // stable-extent admission result as the original parse-the-canonical-value
@@ -655,6 +1006,32 @@ func BenchmarkUnifiedLeafPlanStableCheckpointFold(b *testing.B) {
 	if replacementRank < 0 {
 		b.Fatal("no patchable row")
 	}
+	variableRank := -1
+	var variableReplacement CommonPrimaryUnifiedReplacement
+	for rank := 0; rank < count; rank++ {
+		raw, rendered := view.AppendRawRank(nil, rank)
+		if !rendered {
+			b.Fatal("render variable-width row")
+		}
+		at := bytes.Index(raw, []byte(`"score":63`))
+		if at < 0 {
+			continue
+		}
+		_, body, overflow, rowOK := view.RowRawAt(rank)
+		if !rowOK || overflow || body[0] == unifiedRowTrivial {
+			continue
+		}
+		updated := append([]byte(nil), raw...)
+		updated[at+len(`"score":6`)] = '4'
+		variableRank = rank
+		variableReplacement = CommonPrimaryUnifiedReplacement{
+			Key: records[rank].Key, Value: updated, Slot: slots[rank],
+		}
+		break
+	}
+	if variableRank < 0 {
+		b.Fatal("no variable-width row")
+	}
 	header := view.Header()
 	header.Generation = 2
 	replacements := []CommonPrimaryUnifiedReplacement{replacement}
@@ -692,6 +1069,54 @@ func BenchmarkUnifiedLeafPlanStableCheckpointFold(b *testing.B) {
 				b.Fatal(renderErr)
 			}
 			rows[replacementRank].Value.Inline = replacement.Value
+			if _, encodeErr := EncodeBestCommonPrimaryUnifiedLeaf(
+				dst, header, storeID, rows, bounds, builder,
+			); encodeErr != nil {
+				b.Fatal(encodeErr)
+			}
+		}
+		run()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			run()
+		}
+	})
+
+	variableReplacements := []CommonPrimaryUnifiedReplacement{
+		variableReplacement,
+	}
+	b.Run("native-plan-width-growth", func(b *testing.B) {
+		dst := make([]byte, CommonPrimaryLeafMaxExtentBytes)
+		builder := NewUnifiedPrimaryLeafBuilder()
+		if _, ok, err := view.PatchPlanStableReplacements(
+			dst, header, variableReplacements, builder,
+		); err != nil || !ok {
+			b.Fatalf("warm variable patch = %v,%v", ok, err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if _, ok, err := view.PatchPlanStableReplacements(
+				dst, header, variableReplacements, builder,
+			); err != nil || !ok {
+				b.Fatalf("variable patch = %v,%v", ok, err)
+			}
+		}
+	})
+
+	b.Run("generic-render-plan-encode-width-growth", func(b *testing.B) {
+		dst := make([]byte, CommonPrimaryLeafMaxExtentBytes)
+		scratch := NewPrimaryLeafMutationScratch(
+			CommonPrimaryLeafMaxExtentBytes,
+		)
+		builder := NewUnifiedPrimaryLeafBuilder()
+		run := func() {
+			rows, renderErr := view.RenderRecordsWithScratch(scratch)
+			if renderErr != nil {
+				b.Fatal(renderErr)
+			}
+			rows[variableRank].Value.Inline = variableReplacement.Value
 			if _, encodeErr := EncodeBestCommonPrimaryUnifiedLeaf(
 				dst, header, storeID, rows, bounds, builder,
 			); encodeErr != nil {

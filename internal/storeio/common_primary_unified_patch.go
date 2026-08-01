@@ -21,9 +21,94 @@ var (
 // to the native class-5 checkpoint patcher. Key and Value are borrowed for the
 // call; Slot is the posting-stable slot already owned by the key.
 type CommonPrimaryUnifiedReplacement struct {
-	Key   []byte
-	Value []byte
-	Slot  uint8
+	Key         []byte
+	Value       []byte
+	ScalarPatch CommonPrimaryUnifiedScalarPatch
+	Slot        uint8
+}
+
+const commonPrimaryUnifiedScalarPatchValid = uint8(1 << 7)
+
+// CommonPrimaryUnifiedScalarPatch is a compact, opaque admission certificate
+// for either an exact admitted templated row or one dictionary-neutral scalar
+// replacement in that row. Its six bytes fit the existing tail padding in a
+// durable overlay record. Offsets are relative to the admitted encoded body
+// and the replacement's canonical spelling; the high bit of bodyLength is the
+// validity bit and its low seven bits hold the old encoded token length.
+//
+// Values are intentionally constructible only by the admitted-leaf verifier.
+// The fold still validates every offset, static template byte, unchanged token,
+// and changed scalar before trusting the shortcut. A zero or damaged value is
+// declined by the strict parallel planner; the broader serial planner can
+// still re-enter its complete generic proof.
+type CommonPrimaryUnifiedScalarPatch struct {
+	bodyOffset      uint16
+	canonicalOffset uint16
+	bodyLength      uint8
+	canonicalLength uint8
+}
+
+func (c CommonPrimaryUnifiedScalarPatch) valid() bool {
+	return c.bodyLength&commonPrimaryUnifiedScalarPatchValid != 0
+}
+
+func (c CommonPrimaryUnifiedScalarPatch) exact() bool {
+	return c.valid() &&
+		c.bodyLength == commonPrimaryUnifiedScalarPatchValid &&
+		c.bodyOffset == 0 && c.canonicalOffset == 0 &&
+		c.canonicalLength == 0
+}
+
+func (c CommonPrimaryUnifiedScalarPatch) oldBodyLength() int {
+	return int(c.bodyLength &^ commonPrimaryUnifiedScalarPatchValid)
+}
+
+// unifiedScalarPatchValueClass classifies one changed canonical hole in one
+// pass. Scalar is exactly the dictionary-neutral int/bool/null set; cost is its
+// admitted non-dictionary token width. Keeping both answers together avoids
+// reparsing decimal integers for cost, dictionary eligibility, and compact
+// certificate admission.
+func unifiedScalarPatchValueClass(value []byte) (cost int, scalar bool) {
+	switch len(value) {
+	case 4:
+		if string(value) == "true" || string(value) == "null" {
+			return 1, true
+		}
+	case 5:
+		if string(value) == "false" {
+			return 1, true
+		}
+	}
+	if integer, ok := CanonicalIntValue(value); ok {
+		return 1 + zigzagVarintLen(integer), true
+	}
+	if len(value) <= unifiedTokenShortMax {
+		return 1 + len(value), false
+	}
+	return 1 + unifiedTokenUvarintLen(uint32(len(value))) + len(value), false
+}
+
+func unifiedScalarPatchToken(tag byte) bool {
+	return tag == unifiedTokenTrue || tag == unifiedTokenFalse ||
+		tag == unifiedTokenNull || tag == unifiedTokenInt
+}
+
+func appendUnifiedScalarPatchValue(dst, value []byte) ([]byte, bool) {
+	switch {
+	case bytes.Equal(value, unifiedPatchTrue):
+		return append(dst, unifiedTokenTrue), true
+	case bytes.Equal(value, unifiedPatchFalse):
+		return append(dst, unifiedTokenFalse), true
+	case bytes.Equal(value, unifiedPatchNull):
+		return append(dst, unifiedTokenNull), true
+	default:
+		integer, integerOK := CanonicalIntValue(value)
+		if !integerOK {
+			return dst, false
+		}
+		dst = append(dst, unifiedTokenInt)
+		return AppendZigzagVarint(dst, integer), true
+	}
 }
 
 // unifiedPrimaryPatchValueDelta is one dictionary-eligible spelling whose
@@ -77,6 +162,144 @@ func (v *CommonPrimaryUnifiedLeafView) PatchStableReplacementKeepsExtent(
 		replacement.Key, replacement.Slot, canonical,
 		indexStorage, workspace,
 	)
+}
+
+// PatchStableCanonicalReplacementScalarPatch derives the compact fold
+// certificate directly from the scalar spans already built by concurrent
+// canonical admission. It accepts only templated existing-key rows whose new
+// value is byte-exact to the admitted base or changes exactly one integer,
+// bool, or null hole. Those spellings never participate in the unified
+// dictionary, so changing their encoded width cannot invalidate the admitted
+// template or dictionary plan.
+//
+// keepsExtent retains the deliberately stricter mutation-time reservation
+// proof used by the overlay: it is true only when both the encoded body cost
+// and canonical trivial-content cost are unchanged. The returned patch remains
+// useful to a later fold when a width changes; that fold checks the complete
+// bucket's aggregate extent before publication. resolved is true whenever the
+// admitted templated row was fully checked, even if the update is not compact-
+// scalar-certifiable; callers can then use keepsExtent without repeating the
+// same key, slot, template, and token walk through the generic admission proof.
+func (v *CommonPrimaryUnifiedLeafView) PatchStableCanonicalReplacementScalarPatch(
+	key []byte,
+	slot uint8,
+	canonical CanonicalSpanIndex,
+) (
+	patch CommonPrimaryUnifiedScalarPatch,
+	keepsExtent bool,
+	resolved bool,
+	err error,
+) {
+	if v == nil || len(key) == 0 || !canonical.valid ||
+		len(canonical.canonical) == 0 {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false, nil
+	}
+	rank := v.env.LowerBound(key)
+	if rank >= v.env.Len() {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false, nil
+	}
+	admittedKey, valueStart, valueEnd, boundsOK := v.env.keyBounds(rank)
+	if !boundsOK || !bytes.Equal(admittedKey, key) ||
+		v.env.rankOverflow(rank) {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false, nil
+	}
+	slots, slotsOK := v.env.rankSlots()
+	if !slotsOK || slots[rank] != slot {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false, nil
+	}
+	oldBody := v.env.payload[valueStart:valueEnd:valueEnd]
+	if len(oldBody) == 0 {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false,
+			ErrCommonPrimaryLeafCorrupt
+	}
+	if oldBody[0] == unifiedRowTrivial {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false, nil
+	}
+	templateID := int(oldBody[0])
+	if templateID >= v.templateCount {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false,
+			ErrCommonPrimaryLeafCorrupt
+	}
+	spans := canonical.spans
+	entry := v.admittedTemplateEntry(templateID)
+	if !unifiedMatchesTemplate(canonical.canonical, spans, entry) {
+		return CommonPrimaryUnifiedScalarPatch{}, false, true, nil
+	}
+
+	cursor := 1
+	oldCanonicalBytes := len(entry.static)
+	genericStable := true
+	scalarEligible := true
+	scalarChanged := false
+	var integer [24]byte
+	for hole := range spans {
+		tokenStart := cursor
+		oldValue, next, tokenOK := v.patchTokenValue(
+			oldBody, cursor, integer[:0],
+		)
+		if !tokenOK {
+			return CommonPrimaryUnifiedScalarPatch{}, false, false,
+				ErrCommonPrimaryLeafCorrupt
+		}
+		cursor = next
+		oldCanonicalBytes += len(oldValue)
+		span := spans[hole]
+		newValue := canonical.canonical[span.Start:span.End]
+		if bytes.Equal(oldValue, newValue) {
+			continue
+		}
+		oldTokenCost, oldScalar := unifiedScalarPatchValueClass(oldValue)
+		newTokenCost, newScalar := unifiedScalarPatchValueClass(newValue)
+		if oldTokenCost != newTokenCost || !oldScalar || !newScalar {
+			genericStable = false
+		}
+		if !scalarEligible {
+			if !genericStable {
+				return CommonPrimaryUnifiedScalarPatch{}, false, true, nil
+			}
+			continue
+		}
+		if scalarChanged || !unifiedScalarPatchToken(oldBody[tokenStart]) ||
+			!oldScalar || !newScalar {
+			patch = CommonPrimaryUnifiedScalarPatch{}
+			scalarEligible = false
+			if !genericStable {
+				// The original fixed-extent proof declines at this same first
+				// unstable spelling. With no compact certificate still possible,
+				// the rest of the row cannot change either answer.
+				return CommonPrimaryUnifiedScalarPatch{}, false, true, nil
+			}
+			continue
+		}
+		oldTokenBytes := next - tokenStart
+		canonicalBytes := int(span.End - span.Start)
+		if tokenStart > int(^uint16(0)) ||
+			int(span.Start) > int(^uint16(0)) ||
+			oldTokenBytes <= 0 || oldTokenBytes >=
+			int(commonPrimaryUnifiedScalarPatchValid) ||
+			canonicalBytes <= 0 || canonicalBytes > int(^uint8(0)) {
+			patch = CommonPrimaryUnifiedScalarPatch{}
+			scalarEligible = false
+			continue
+		}
+		patch = CommonPrimaryUnifiedScalarPatch{
+			bodyOffset:      uint16(tokenStart),
+			canonicalOffset: uint16(span.Start),
+			bodyLength: commonPrimaryUnifiedScalarPatchValid |
+				uint8(oldTokenBytes),
+			canonicalLength: uint8(canonicalBytes),
+		}
+		scalarChanged = true
+	}
+	if cursor != len(oldBody) {
+		return CommonPrimaryUnifiedScalarPatch{}, false, false,
+			ErrCommonPrimaryLeafCorrupt
+	}
+	if scalarEligible && !scalarChanged {
+		patch.bodyLength = commonPrimaryUnifiedScalarPatchValid
+	}
+	canonicalDelta := len(canonical.canonical) - oldCanonicalBytes
+	return patch, genericStable && canonicalDelta == 0, true, nil
 }
 
 // PatchStableCanonicalReplacementKeepsExtent is the spanned sibling of
@@ -227,22 +450,27 @@ func (b *UnifiedPrimaryLeafBuilder) addPatchValue(value []byte, delta int) {
 }
 
 // PatchPlanStableReplacements is the native class-5 checkpoint fast path.
-// It copies an admitted page and rewrites only same-key, same-shape row bodies.
-// The returned image is byte-identical to a complete EncodeBest fold for the
-// accepted subset, except for the requested generation.
+// It preserves an admitted leaf's template and dictionary sections while
+// replacing same-key, same-shape inline row bodies. Equal-width bodies retain
+// the original copy-and-patch path and are byte-identical to a complete
+// EncodeBest fold for the previously accepted subset, except for the requested
+// generation. When an encoded body changes width, the record heap and its
+// succinct boundaries are rebuilt inside the same physical extent.
 //
 // The acceptance certificate is mechanically sound:
 //
-//   - no insert, delete, overflow, slot change, shape change, row-length change,
-//     or encoded-body-length change;
-//   - every changed hole has equal dictionary-free typed token cost;
-//   - the template census saving is therefore unchanged for every shape;
+//   - no insert, delete, overflow, slot change, or shape change;
 //   - canonical integers and the one-byte typed spellings are globally
-//     dictionary-ineligible, so their common update path is a local proof;
+//     dictionary-ineligible, so width-changing integers never alter the
+//     admitted dictionary;
 //   - if another scalar changes, one exact leaf census plus the complete delta
 //     set must reproduce the admitted dictionary candidate order and IDs;
-//   - content bytes and row count are unchanged, hence the smallest winning
-//     extent remains this extent.
+//   - aggregate encoded growth must fit the admitted physical extent.
+//
+// A variable-width result deliberately preserves the admitted physical plan;
+// a fresh EncodeBest fold is allowed to reconsider template amortization or a
+// smaller extent and therefore need not be byte-identical. Both images render
+// the same canonical rows.
 //
 // Any input outside that proof returns ok=false without publishing dst. The
 // ordinary full planner remains the complete fallback.
@@ -252,20 +480,84 @@ func (v *CommonPrimaryUnifiedLeafView) PatchPlanStableReplacements(
 	replacements []CommonPrimaryUnifiedReplacement,
 	builder *UnifiedPrimaryLeafBuilder,
 ) (page []byte, ok bool, err error) {
-	if v == nil || builder == nil || len(replacements) == 0 {
+	return v.patchPlanStableReplacements(
+		dst, header, replacements, builder, false,
+	)
+}
+
+// PatchPlanScalarReplacements is the bounded parallel-fold sibling of
+// PatchPlanStableReplacements. Every replacement must carry a compact scalar
+// certificate and every certificate must validate against the admitted leaf.
+// A missing or mismatched certificate declines with ok=false; this strict path
+// never enters the generic JSON tape or dictionary-census planner.
+func (v *CommonPrimaryUnifiedLeafView) PatchPlanScalarReplacements(
+	dst []byte,
+	header CommonPrimaryLeafHeader,
+	replacements []CommonPrimaryUnifiedReplacement,
+	builder *UnifiedPrimaryLeafBuilder,
+) (page []byte, ok bool, err error) {
+	return v.patchPlanStableReplacements(
+		dst, header, replacements, builder, true,
+	)
+}
+
+func (v *CommonPrimaryUnifiedLeafView) patchPlanStableReplacements(
+	dst []byte,
+	header CommonPrimaryLeafHeader,
+	replacements []CommonPrimaryUnifiedReplacement,
+	builder *UnifiedPrimaryLeafBuilder,
+	strictScalar bool,
+) (page []byte, ok bool, err error) {
+	// Reset reusable output state before every guard. In particular, a strict
+	// call with a missing certificate or undersized destination must not expose
+	// heap/row lengths left by the preceding successful bucket.
+	if builder != nil {
+		builder.patchValues = builder.patchValues[:0]
+		builder.heap = builder.heap[:0]
+		builder.spans = builder.spans[:0]
+		builder.rows = builder.rows[:0]
+	}
+	if v == nil || builder == nil || len(replacements) == 0 ||
+		len(replacements) > v.env.Len() {
+		return nil, false, nil
+	}
+	if strictScalar && (cap(builder.rows) < len(replacements) ||
+		cap(builder.heap) == 0) {
 		return nil, false, nil
 	}
 	extent := int(v.env.header.PageSize)
 	if len(dst) < extent ||
+		commonPrimaryLeafOverlaps(dst[:extent], v.env.page) ||
 		header.StoreID != v.env.header.StoreID ||
 		header.Bucket != v.env.header.Bucket ||
 		header.PageSize != v.env.header.PageSize ||
-		header.Generation == 0 || header.Generation >= uint64(1)<<48 {
+		header.Generation <= v.env.header.Generation ||
+		header.Generation >= uint64(1)<<48 {
 		return nil, false, fmt.Errorf("%w: unified native patch identity", ErrInvalidWrite)
 	}
-	builder.patchValues = builder.patchValues[:0]
-	page = dst[:extent]
-	copy(page, v.env.page)
+	if strictScalar {
+		defer func() {
+			if ok {
+				return
+			}
+			// A strict decline is reusable scratch, not a partially planned
+			// result. Restore all lengths a worker can observe before it hands
+			// this bounded context to the next bucket.
+			builder.patchValues = builder.patchValues[:0]
+			builder.heap = builder.heap[:0]
+			builder.spans = builder.spans[:0]
+			builder.rows = builder.rows[:0]
+		}()
+	}
+	var seenRanks [4]uint64
+	var patchByRank [CommonPrimaryLeafWideSlots]uint16
+	canonicalDelta := 0
+	bodyDelta := 0
+	fixedBodies := true
+	slots, slotsOK := v.env.rankSlots()
+	if !slotsOK {
+		return nil, false, ErrCommonPrimaryLeafCorrupt
+	}
 
 	for i := range replacements {
 		replacement := &replacements[i]
@@ -278,127 +570,337 @@ func (v *CommonPrimaryUnifiedLeafView) PatchPlanStableReplacements(
 			v.env.rankOverflow(rank) {
 			return nil, false, nil
 		}
-		slots, slotsOK := v.env.rankSlots()
-		if !slotsOK || slots[rank] != replacement.Slot {
+		if slots[rank] != replacement.Slot {
 			return nil, false, nil
 		}
+		rankBit := uint64(1) << uint(rank&63)
+		if seenRanks[rank>>6]&rankBit != 0 {
+			return nil, false, nil
+		}
+		seenRanks[rank>>6] |= rankBit
 		oldBody := v.env.payload[valueStart:valueEnd:valueEnd]
-		newBody, oldCanonicalBytes, stable, bodyErr :=
-			v.planFixedReplacementBody(builder, oldBody, replacement.Value)
+		bodyOffset, bodyBytes, oldCanonicalBytes, stable, bodyErr :=
+			v.planScalarPatchReplacementBody(
+				builder, oldBody, replacement.Value,
+				replacement.ScalarPatch, strictScalar,
+			)
+		if bodyErr == nil && !stable && !strictScalar {
+			// A missing or damaged compact certificate is never an error and
+			// never weakens validation. Re-enter the complete stable planner,
+			// which reparses and re-certifies the replacement from its bytes.
+			bodyOffset, bodyBytes, oldCanonicalBytes, stable, bodyErr =
+				v.planStableReplacementBody(
+					builder, oldBody, replacement.Value,
+				)
+		}
 		if bodyErr != nil {
 			return nil, false, bodyErr
 		}
-		if !stable || oldCanonicalBytes != len(replacement.Value) ||
-			len(newBody) != len(oldBody) {
+		if !stable {
 			return nil, false, nil
 		}
-		copy(page[PageHeaderSize+valueStart:PageHeaderSize+valueEnd], newBody)
+		if replacement.ScalarPatch.exact() {
+			// The certificate validator compared every static segment and token.
+			// An exact row needs no heap entry and no copy back into the page; the
+			// generation/CRC update below is the complete physical change.
+			continue
+		}
+		if bodyBytes != len(oldBody) {
+			fixedBodies = false
+		}
+		bodyDelta += bodyBytes - len(oldBody)
+		canonicalDelta += len(replacement.Value) - oldCanonicalBytes
+		patchByRank[rank] = uint16(len(builder.rows) + 1)
+		builder.rows = append(builder.rows, unifiedPrimaryLeafRow{
+			heapOff: int32(bodyOffset), length: int32(bodyBytes),
+			shape: int32(rank),
+		})
 	}
 
 	// Integer and tag-only changes leave patchValues empty and take no
-	// leaf-wide pass. Other scalar changes must reproduce the exact admitted
-	// dictionary after their complete coalesced delta set is applied.
+	// leaf-wide pass. Dictionary-eligible hole changes must reproduce the exact
+	// admitted dictionary after their complete coalesced delta set is applied.
 	if len(builder.patchValues) != 0 &&
 		!v.patchDictionaryStable(builder) {
 		return nil, false, nil
 	}
+	newPayloadBytes := len(v.env.payload) + bodyDelta
+	payloadCapacity := extent - PageHeaderSize - PageTrailerSize
+	newTrivialBytes := v.trivialBytes + canonicalDelta
+	if newPayloadBytes < v.heapStart || newPayloadBytes > payloadCapacity ||
+		newTrivialBytes < commonPrimaryUnifiedHeaderBytes ||
+		uint64(newTrivialBytes) > uint64(^uint32(0)) ||
+		!CommonPrimaryUnifiedTrivialFits(v.env.Len(), newTrivialBytes) {
+		return nil, false, nil
+	}
+	unifiedStart := v.templateDir - commonPrimaryUnifiedHeaderBytes
 
-	binary.LittleEndian.PutUint64(page[24:32], header.Generation)
+	if fixedBodies {
+		page = dst[:extent]
+		copy(page, v.env.page)
+		for i := range builder.rows {
+			row := &builder.rows[i]
+			_, valueStart, valueEnd, boundsOK := v.env.keyBounds(int(row.shape))
+			if !boundsOK || valueEnd-valueStart != int(row.length) {
+				return nil, false, ErrCommonPrimaryLeafCorrupt
+			}
+			body := builder.heap[row.heapOff : row.heapOff+row.length]
+			copy(page[PageHeaderSize+valueStart:PageHeaderSize+valueEnd], body)
+		}
+		binary.LittleEndian.PutUint32(
+			page[PageHeaderSize+unifiedStart+12:], uint32(newTrivialBytes),
+		)
+		binary.LittleEndian.PutUint64(page[24:32], header.Generation)
+		if _, sealErr := sealInitializedPage(page); sealErr != nil {
+			return nil, false, sealErr
+		}
+		return page, true, nil
+	}
+
+	logicalID, _ := CommonPrimaryLeafLogicalID(header.Bucket)
+	payload, initErr := InitPage(dst, PageHeader{
+		StoreID: header.StoreID, Generation: header.Generation,
+		LogicalID: logicalID, PageSize: uint32(extent),
+		PayloadLength: uint32(newPayloadBytes), Kind: commonPrimaryLeafPageKind,
+	})
+	if initErr != nil {
+		return nil, false, initErr
+	}
+	copy(payload[:v.heapStart], v.env.payload[:v.heapStart])
+	layout := v.env.layout
+	clear(payload[layout.lowStart:layout.highStart])
+	clear(payload[layout.highStart : layout.highStart+layout.highBytes])
+	clear(payload[layout.checkpointStart : layout.checkpointStart+layout.checkpointCount*layout.checkpointWidth])
+	binary.LittleEndian.PutUint32(
+		payload[unifiedStart+12:], uint32(newTrivialBytes),
+	)
+	cursor, patched := v.heapStart, 0
+	for rank := 0; rank < v.env.Len(); rank++ {
+		recordStart, recordEnd, boundsOK := v.env.recordBounds(rank)
+		if !boundsOK {
+			return nil, false, ErrCommonPrimaryLeafCorrupt
+		}
+		commonPrimaryLeafPutBoundary(payload, &layout, rank, uint16(cursor))
+		patchIndex := int(patchByRank[rank]) - 1
+		if patchIndex >= 0 {
+			_, valueStart, valueEnd, keyOK := v.env.keyBounds(rank)
+			if !keyOK || valueEnd != recordEnd {
+				return nil, false, ErrCommonPrimaryLeafCorrupt
+			}
+			cursor += copy(payload[cursor:], v.env.payload[recordStart:valueStart])
+			row := &builder.rows[patchIndex]
+			body := builder.heap[row.heapOff : row.heapOff+row.length]
+			cursor += copy(payload[cursor:], body)
+			patched++
+		} else {
+			cursor += copy(payload[cursor:], v.env.payload[recordStart:recordEnd])
+		}
+	}
+	if cursor != newPayloadBytes || patched != len(builder.rows) {
+		return nil, false, ErrCommonPrimaryLeafCorrupt
+	}
+	commonPrimaryLeafPutBoundary(
+		payload, &layout, v.env.Len(), uint16(cursor),
+	)
+	commonPrimaryLeafBuildCheckpoints(payload, &layout, v.env.Len()+1)
+	page = dst[:extent]
 	if _, sealErr := sealInitializedPage(page); sealErr != nil {
 		return nil, false, sealErr
 	}
 	return page, true, nil
 }
 
-// planFixedReplacementBody derives one new body against the admitted
-// template/dictionary while proving the template-census operands stay equal.
-func (v *CommonPrimaryUnifiedLeafView) planFixedReplacementBody(
+// planScalarPatchReplacementBody validates and consumes the six-byte compact
+// certificate without constructing a JSON tape. Validation reconstructs the
+// admitted canonical row from its template and encoded tokens: all static
+// bytes and unchanged holes must match, and the one named hole must be an
+// actual dictionary-neutral scalar replacement at the certified offsets.
+func (v *CommonPrimaryUnifiedLeafView) planScalarPatchReplacementBody(
 	b *UnifiedPrimaryLeafBuilder,
 	oldBody, canonical []byte,
-) ([]byte, int, bool, error) {
+	patch CommonPrimaryUnifiedScalarPatch,
+	bounded bool,
+) (bodyOffset, bodyBytes, oldCanonicalBytes int, stable bool, err error) {
+	if !patch.valid() || len(oldBody) == 0 || len(canonical) == 0 ||
+		oldBody[0] == unifiedRowTrivial {
+		return 0, 0, 0, false, nil
+	}
+	templateID := int(oldBody[0])
+	if templateID >= v.templateCount {
+		return 0, 0, 0, false, ErrCommonPrimaryLeafCorrupt
+	}
+	entry := v.admittedTemplateEntry(templateID)
+	exact := patch.exact()
+	bodyCursor := 1
+	canonicalCursor := 0
+	staticCursor := uint32(0)
+	oldCanonicalBytes = len(entry.static)
+	changed := false
+	var encodedStorage [11]byte
+	var encoded []byte
+	var integer [24]byte
+	for hole := 0; hole <= entry.holes; hole++ {
+		staticEnd := binary.LittleEndian.Uint32(entry.ends[hole*4:])
+		if staticEnd < staticCursor || int(staticEnd) > len(entry.static) {
+			return 0, 0, 0, false, ErrCommonPrimaryLeafCorrupt
+		}
+		static := entry.static[staticCursor:staticEnd]
+		if len(static) > len(canonical)-canonicalCursor ||
+			!bytes.Equal(canonical[canonicalCursor:canonicalCursor+len(static)], static) {
+			return 0, 0, 0, false, nil
+		}
+		canonicalCursor += len(static)
+		staticCursor = staticEnd
+		if hole == entry.holes {
+			break
+		}
+
+		tokenStart := bodyCursor
+		oldValue, next, tokenOK := v.patchTokenValue(
+			oldBody, bodyCursor, integer[:0],
+		)
+		if !tokenOK {
+			return 0, 0, 0, false, ErrCommonPrimaryLeafCorrupt
+		}
+		bodyCursor = next
+		oldCanonicalBytes += len(oldValue)
+		if !exact && tokenStart == int(patch.bodyOffset) {
+			newBytes := int(patch.canonicalLength)
+			if changed || next-tokenStart != patch.oldBodyLength() ||
+				canonicalCursor != int(patch.canonicalOffset) ||
+				newBytes == 0 || newBytes > len(canonical)-canonicalCursor {
+				return 0, 0, 0, false, nil
+			}
+			newValue := canonical[canonicalCursor : canonicalCursor+newBytes]
+			var encodedOK bool
+			encoded, encodedOK = appendUnifiedScalarPatchValue(
+				encodedStorage[:0], newValue,
+			)
+			if bytes.Equal(oldValue, newValue) ||
+				!unifiedScalarPatchToken(oldBody[tokenStart]) ||
+				!encodedOK {
+				return 0, 0, 0, false, nil
+			}
+			canonicalCursor += newBytes
+			changed = true
+			continue
+		}
+		if len(oldValue) > len(canonical)-canonicalCursor ||
+			!bytes.Equal(
+				canonical[canonicalCursor:canonicalCursor+len(oldValue)],
+				oldValue,
+			) {
+			return 0, 0, 0, false, nil
+		}
+		canonicalCursor += len(oldValue)
+	}
+	if bodyCursor != len(oldBody) || canonicalCursor != len(canonical) ||
+		exact == changed || !exact && !changed {
+		return 0, 0, 0, false, nil
+	}
+
+	bodyOffset = len(b.heap)
+	if exact {
+		return bodyOffset, len(oldBody), oldCanonicalBytes, true, nil
+	}
+	oldStart := int(patch.bodyOffset)
+	oldEnd := oldStart + patch.oldBodyLength()
+	newStart := int(patch.canonicalOffset)
+	newEnd := newStart + int(patch.canonicalLength)
+	if oldStart < 1 || oldEnd > len(oldBody) ||
+		newStart < 0 || newEnd > len(canonical) {
+		return 0, 0, 0, false, nil
+	}
+	if len(encoded) == 0 {
+		return 0, 0, 0, false, nil
+	}
+	newBodyBytes := len(oldBody) - (oldEnd - oldStart) + len(encoded)
+	if bounded && newBodyBytes > cap(b.heap)-len(b.heap) {
+		return 0, 0, 0, false, nil
+	}
+	b.heap = append(b.heap, oldBody[:oldStart]...)
+	b.heap = append(b.heap, encoded...)
+	b.heap = append(b.heap, oldBody[oldEnd:]...)
+	return bodyOffset, len(b.heap) - bodyOffset, oldCanonicalBytes, true, nil
+}
+
+// planStableReplacementBody appends one new body against the admitted
+// template/dictionary while proving its static shape remains unchanged. The
+// caller performs the complete leaf-wide dictionary and extent certificates.
+func (v *CommonPrimaryUnifiedLeafView) planStableReplacementBody(
+	b *UnifiedPrimaryLeafBuilder,
+	oldBody, canonical []byte,
+) (bodyOffset, bodyBytes, oldCanonicalBytes int, stable bool, err error) {
 	if len(oldBody) == 0 || len(canonical) == 0 {
-		return nil, 0, false, nil
+		return 0, 0, 0, false, nil
 	}
 	index, err := b.buildIndex(canonical)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, 0, 0, false, err
 	}
 	if !IndexIsCanonical(index, &b.ws) {
-		return nil, 0, false, nil
+		return 0, 0, 0, false, nil
 	}
 	b.spans = appendHoleSpans(b.spans[:0], index)
 	newSpans := b.spans
+	bodyOffset = len(b.heap)
 
 	if oldBody[0] == unifiedRowTrivial {
 		oldCanonical := oldBody[1:]
 		oldIndex, indexErr := b.buildIndex(oldCanonical)
 		if indexErr != nil {
-			return nil, 0, false, indexErr
+			return 0, 0, 0, false, indexErr
 		}
 		oldSpanStart := len(b.spans)
 		b.spans = appendHoleSpans(b.spans, oldIndex)
 		oldSpans := b.spans[oldSpanStart:]
 		if !unifiedSameStaticShape(oldCanonical, oldSpans, canonical, newSpans) {
-			return nil, 0, false, nil
+			return 0, 0, 0, false, nil
 		}
-		oldCost, newCost := 0, 0
-		for i := range newSpans {
-			oldCost += unifiedTypedTokenCost(
-				oldCanonical[oldSpans[i].Start:oldSpans[i].End],
-			)
-			newCost += unifiedTypedTokenCost(
-				canonical[newSpans[i].Start:newSpans[i].End],
-			)
-		}
-		if oldCost != newCost {
-			return nil, 0, false, nil
-		}
-		b.heap = append(b.heap[:0], unifiedRowTrivial)
+		b.heap = append(b.heap, unifiedRowTrivial)
 		b.heap = append(b.heap, canonical...)
-		// A trivial row contributes no values to the dictionary census. Shape,
-		// canonical length, and no-dictionary token cost equality preserve its
-		// template admission decision.
-		return b.heap, len(oldCanonical), true, nil
+		// A preserved trivial row contributes no values to the admitted
+		// dictionary census, regardless of its new scalar widths.
+		return bodyOffset, len(b.heap) - bodyOffset, len(oldCanonical), true, nil
 	}
 
 	templateID := int(oldBody[0])
 	if templateID >= v.templateCount {
-		return nil, 0, false, ErrCommonPrimaryLeafCorrupt
+		return 0, 0, 0, false, ErrCommonPrimaryLeafCorrupt
 	}
 	entry := v.admittedTemplateEntry(templateID)
 	if !unifiedMatchesTemplate(canonical, newSpans, entry) {
-		return nil, 0, false, nil
+		return 0, 0, 0, false, nil
 	}
-	b.heap = append(b.heap[:0], oldBody[0])
+	b.heap = append(b.heap, oldBody[0])
 	cursor := 1
-	oldCanonicalBytes := len(entry.static)
-	oldTokenCost, newTokenCost := 0, 0
+	oldCanonicalBytes = len(entry.static)
 	for hole := range newSpans {
+		tokenStart := cursor
 		oldValue, oldNext, tokenOK := v.patchTokenValue(
 			oldBody, cursor, b.patchInteger[:0],
 		)
 		if !tokenOK {
-			return nil, 0, false, ErrCommonPrimaryLeafCorrupt
+			return 0, 0, 0, false, ErrCommonPrimaryLeafCorrupt
 		}
 		cursor = oldNext
 		newValue := canonical[newSpans[hole].Start:newSpans[hole].End]
 		oldCanonicalBytes += len(oldValue)
-		oldTokenCost += unifiedTypedTokenCost(oldValue)
-		newTokenCost += unifiedTypedTokenCost(newValue)
 		if !bytes.Equal(oldValue, newValue) {
-			if unifiedTypedTokenCost(oldValue) !=
-				unifiedTypedTokenCost(newValue) {
-				return nil, 0, false, nil
-			}
 			b.addPatchValue(oldValue, -1)
 			b.addPatchValue(newValue, 1)
+			b.heap = v.appendExistingPlanToken(b.heap, newValue)
+		} else {
+			// The admitted token is already the canonical spelling under the
+			// preserved dictionary plan. Copying its exact bytes avoids a second
+			// dictionary scan and re-encoding for every unchanged hole.
+			b.heap = append(b.heap, oldBody[tokenStart:cursor]...)
 		}
-		b.heap = v.appendExistingPlanToken(b.heap, newValue)
 	}
-	if cursor != len(oldBody) || oldTokenCost != newTokenCost {
-		return nil, 0, false, nil
+	if cursor != len(oldBody) {
+		return 0, 0, 0, false, ErrCommonPrimaryLeafCorrupt
 	}
-	return b.heap, oldCanonicalBytes, true, nil
+	return bodyOffset, len(b.heap) - bodyOffset, oldCanonicalBytes, true, nil
 }
 
 func unifiedSameStaticShape(

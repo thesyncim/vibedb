@@ -677,7 +677,7 @@ func TestPrimaryUnifiedOverlaySameSizeArenaReuseAppendsRecord(t *testing.T) {
 
 	reused, ok := overlay.prepareSameSizeArenaReuse(
 		bucket, hash, 3, key, second, slot, 2,
-		overlay.maxLeafBytes,
+		overlay.maxLeafBytes, storeio.CommonPrimaryUnifiedScalarPatch{},
 	)
 	if !ok {
 		t.Fatal("prepareSameSizeArenaReuse declined an eligible record")
@@ -853,7 +853,7 @@ func TestPrimaryUnifiedOverlayDirtyByteAdmission(t *testing.T) {
 	prepared, err = downgrade.prepareWithLeafReservation(
 		1, 1, 1, []byte("restore"), nil,
 		-16, -1, primaryUnifiedOverlayDelete, 7,
-		4<<10, true,
+		4<<10, true, storeio.CommonPrimaryUnifiedScalarPatch{},
 	)
 	if err != nil {
 		t.Fatalf("prepare wide tombstone: %v", err)
@@ -872,7 +872,7 @@ func TestPrimaryUnifiedOverlayDirtyByteAdmission(t *testing.T) {
 	prepared, err = downgrade.prepareWithLeafReservation(
 		1, 1, 2, []byte("restore"), []byte("fixed"),
 		16, 1, primaryUnifiedOverlayPut, 7,
-		4<<10, false,
+		4<<10, false, storeio.CommonPrimaryUnifiedScalarPatch{},
 	)
 	if err != nil {
 		t.Fatalf("prepare certified restore: %v", err)

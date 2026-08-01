@@ -1963,8 +1963,80 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		}
 	})
 
+	// Native class-5 work is CPU-only until a sealed image exists. Run that
+	// qualification and encoding in small foreground waves, then consume every
+	// result in the same lexical order as before. AllocateNear, Stage, retirement,
+	// parent rewrites, and publication therefore remain strictly serial.
+	nativeContexts := c.primaryNativeFoldActiveContexts(
+		len(c.primaryPendingParents),
+	)
+	if nativeContexts != 0 {
+		// Results borrow the overlay arena. Drop their live slice prefixes after
+		// workers have stopped, including every error/abort path.
+		defer c.resetPrimaryNativeFoldResults(nativeContexts)
+	}
+	nativeWorkersRunning := false
+	if nativeContexts > 1 {
+		c.startPrimaryNativeFoldWorkers(nativeContexts)
+		nativeWorkersRunning = true
+		defer func() {
+			if nativeWorkersRunning {
+				c.stopPrimaryNativeFoldWorkers(nativeContexts)
+			}
+		}()
+	}
+	waveWidth := max(1, nativeContexts)
 	for index := range c.primaryPendingParents {
+		waveIndex := index % waveWidth
+		if nativeContexts != 0 && waveIndex == 0 {
+			waveCount := min(
+				waveWidth, len(c.primaryPendingParents)-index,
+			)
+			c.preparePrimaryNativeFoldWave(
+				index, waveCount, base, visible, generation,
+			)
+		}
 		pending := &c.primaryPendingParents[index]
+		var prepared *primaryNativeFoldContext
+		if nativeContexts != 0 {
+			prepared = &c.primaryNativeFoldContexts[waveIndex]
+			if prepared.retrySerial {
+				// Every worker in this wave has joined and released its lease.
+				// Retry the native certificate once on the coordinator so a
+				// transient parallel cache pin cannot select a different extent
+				// or force the expensive full planner nondeterministically.
+				c.preparePrimaryNativeFold(
+					prepared, pending, base, visible, generation,
+				)
+			}
+			if prepared.err != nil {
+				return prepared.err
+			}
+			if prepared.native {
+				page, allocateErr := tx.AllocateNear(
+					storeio.PagePrimaryLeaf,
+					uint32(len(prepared.image)),
+					pending.volatileRef.LogicalID,
+					primaryLeafPlacementHint(
+						pending.leafRoute.Bucket, layout.DataStart,
+					),
+				)
+				if allocateErr == nil {
+					copy(page.Bytes(), prepared.image)
+					allocateErr = page.Stage()
+				}
+				if allocateErr != nil {
+					return allocateErr
+				}
+				pending.checkpointLeaf = page.Ref()
+				if appendErr := c.appendPrimaryRetirement(
+					base, pending.leafRoute.Ref,
+				); appendErr != nil {
+					return appendErr
+				}
+				continue
+			}
+		}
 		lease, acquireErr := c.cache.Acquire(
 			pending.volatileRef,
 		)
@@ -1988,52 +2060,72 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 					header, pageBytes,
 				)
 			}
+			// A strict parallel scalar certificate can deliberately decline a
+			// legacy/missing certificate. Preserve the established serial native
+			// planner before entering the complete re-encode fallback: it supports
+			// the broader stable same-shape class and keeps old physical output and
+			// performance deterministic for those leaves.
 			if c.primaryUnifiedOverlay.pendingBucket(
 				pending.leafRoute.Bucket,
-			) && pending.volatileRef.Offset < base.fileEnd {
-				replacements, allPuts, patchErr :=
-					c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
-						c.primaryUnifiedReplacementScratch[:0],
-						pending.leafRoute.Bucket, generation,
-					)
+			) {
+				var replacements []storeio.CommonPrimaryUnifiedReplacement
+				allPuts := false
+				var patchErr error
+				if prepared != nil && prepared.inspected {
+					replacements = prepared.replacements
+					allPuts = prepared.allPuts
+				} else {
+					replacements, allPuts, patchErr =
+						c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
+							c.primaryUnifiedReplacementScratch[:0],
+							pending.leafRoute.Bucket, generation,
+						)
+					c.primaryUnifiedReplacementScratch = replacements[:0]
+				}
 				if patchErr != nil {
 					lease.Release()
 					return patchErr
 				}
-				leafHeader := unified.Header()
-				leafHeader.Generation = generation
-				image, patchable, patchErr :=
-					unified.PatchPlanStableReplacements(
-						c.primaryLeafScratch, leafHeader,
-						replacements, c.primaryUnifiedBuilder,
-					)
+				sourceSafe := false
+				if allPuts {
+					if prepared != nil && prepared.inspected {
+						sourceSafe = prepared.sourceSafe
+					} else {
+						sourceSafe = primaryNativeFoldPatchSourceSafe(
+							&unified, pending.volatileRef, base.fileEnd,
+						)
+					}
+				}
+				var image []byte
+				patchable := false
+				if allPuts && sourceSafe {
+					leafHeader := unified.Header()
+					leafHeader.Generation = generation
+					image, patchable, patchErr =
+						unified.PatchPlanStableReplacements(
+							c.primaryLeafScratch, leafHeader,
+							replacements, c.primaryUnifiedBuilder,
+						)
+				}
 				if patchErr != nil {
 					lease.Release()
 					return patchErr
 				}
 				if allPuts && patchable {
-					// The codec proved the complete template census, dictionary
-					// candidate order, encoded content size, and smallest extent
-					// unchanged. The image is a fresh-generation COW copy with
-					// only changed row bodies patched and its CRC resealed.
-					var page storeio.TransactionPage
-					page, acquireErr = tx.AllocateNear(
+					page, allocateErr := tx.AllocateNear(
 						storeio.PagePrimaryLeaf, uint32(len(image)),
 						pending.volatileRef.LogicalID,
 						primaryLeafPlacementHint(
-							pending.leafRoute.Bucket,
-							layout.DataStart,
+							pending.leafRoute.Bucket, layout.DataStart,
 						),
 					)
-					if acquireErr == nil {
+					if allocateErr == nil {
 						copy(page.Bytes(), image)
-					}
-					if acquireErr == nil {
-						acquireErr = page.Stage()
+						allocateErr = page.Stage()
 					}
 					lease.Release()
-					if acquireErr != nil {
-						return acquireErr
+					if allocateErr != nil {
+						return allocateErr
 					}
 					pending.checkpointLeaf = page.Ref()
 					if appendErr := c.appendPrimaryRetirement(
@@ -2202,6 +2294,10 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		); appendErr != nil {
 			return appendErr
 		}
+	}
+	if nativeWorkersRunning {
+		c.stopPrimaryNativeFoldWorkers(nativeContexts)
+		nativeWorkersRunning = false
 	}
 
 	// Retire the durable overflow chains that buffered Puts and Deletes superseded

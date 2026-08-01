@@ -1105,6 +1105,21 @@ type Collection struct {
 	// many raw generations the overlay retains, so this final-state vector is
 	// leaf-bounded rather than generation-window-bounded.
 	primaryUnifiedReplacementScratch []storeio.CommonPrimaryUnifiedReplacement
+	// primaryNativeFoldContexts is a fixed, construction-time foreground codec
+	// pool. Its goroutines exist only while an exclusive checkpoint is actively
+	// precomputing native class-5 leaf images; transaction allocation, staging,
+	// retirement, parent rewrites, and publication remain on the writer goroutine.
+	primaryNativeFoldContexts []primaryNativeFoldContext
+	// primaryNativeFoldPrecomputeHook is a deterministic package-test seam called
+	// after a worker has sealed one qualified all-Put leaf image. It may be called
+	// concurrently; package tests must synchronize their hook body. Production
+	// leaves it nil.
+	primaryNativeFoldPrecomputeHook func(storeio.BucketID)
+	// primaryNativeFoldAcquire is a narrow package-test seam for the one
+	// schedule-dependent cache condition: several simultaneous leases may return
+	// ErrPageCachePinned where serial acquisition succeeds. Production leaves it
+	// nil. A test override may likewise be called concurrently.
+	primaryNativeFoldAcquire func(storeio.PageRef) (storeio.PageLease, error)
 	// primaryUnifiedSeen is writer-owned lazy route metadata. Until the first
 	// class-5 leaf is observed, ordinary stores preserve their established
 	// capacity-before-acquire mutation order; afterwards class-5 routes may try
@@ -2996,7 +3011,8 @@ func (c *Collection) Stats() Stats {
 		PrimaryMutationScratchBytes: uint64(
 			len(c.primaryLeafScratch)+len(c.primaryRootScratch),
 		) + uint64(cap(c.primaryUnifiedReplacementScratch))*
-			uint64(unsafe.Sizeof(storeio.CommonPrimaryUnifiedReplacement{})),
+			uint64(unsafe.Sizeof(storeio.CommonPrimaryUnifiedReplacement{})) +
+			c.primaryNativeFoldAdditionalScratchBytes(),
 		ConcurrentPrimaryScratchBytes: concurrentPrimaryScratch,
 		Backend:                       Backend(commit.Backend),
 		Durability:                    c.options.Durability,

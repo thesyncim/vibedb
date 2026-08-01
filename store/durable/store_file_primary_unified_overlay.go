@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
@@ -74,7 +75,19 @@ type primaryUnifiedOverlayRecord struct {
 	// aggregate is updated from the newest record per key, so a later certified
 	// restore can retire an older tombstone's conservative wide reservation.
 	reservationWide uint8
+	// scalarPatch occupies the record's former six-byte tail padding. It is an
+	// opaque, fail-closed certificate against the routed admitted leaf base.
+	scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
 }
+
+const primaryUnifiedOverlayRecordBytes = 56
+
+var (
+	_ [primaryUnifiedOverlayRecordBytes - int(unsafe.Sizeof(primaryUnifiedOverlayRecord{}))]byte
+	_ [int(unsafe.Sizeof(primaryUnifiedOverlayRecord{})) - primaryUnifiedOverlayRecordBytes]byte
+	_ [6 - int(unsafe.Sizeof(storeio.CommonPrimaryUnifiedScalarPatch{}))]byte
+	_ [int(unsafe.Sizeof(storeio.CommonPrimaryUnifiedScalarPatch{})) - 6]byte
+)
 
 // primaryUnifiedOverlayBucket is one open-addressed directory entry. head is
 // the publication word: head==0 means the slot is empty, and publish writes
@@ -466,6 +479,7 @@ func (o *primaryUnifiedOverlay) prepareSameSizeArenaReuse(
 	stableSlot uint8,
 	journalDurableGeneration uint64,
 	leafBytes uint32,
+	scalarPatch storeio.CommonPrimaryUnifiedScalarPatch,
 ) (primaryUnifiedOverlayPrepared, bool) {
 	if generation == 0 || len(value) == 0 || o == nil ||
 		leafBytes == 0 || leafBytes > o.maxLeafBytes {
@@ -527,6 +541,7 @@ func (o *primaryUnifiedOverlay) prepareSameSizeArenaReuse(
 		keyLen:         previous.keyLen,
 		kind:           primaryUnifiedOverlayPut,
 		slot:           stableSlot,
+		scalarPatch:    scalarPatch,
 		reservationWide: func() uint8 {
 			if reservationWide {
 				return 1
@@ -570,8 +585,8 @@ func (o *primaryUnifiedOverlay) prepare(
 
 // prepareWithLeafBytes is the certified fixed-extent admission path. Only the
 // concurrent existing-key lane may pass less than maxLeafBytes, and only after
-// PatchStableReplacementKeepsExtent proves the fold can patch that exact routed
-// extent. All structural/shape-changing callers use prepare above.
+// the fused scalar/generic admission proof certifies that exact routed extent.
+// All structural/shape-changing callers use prepare above.
 func (o *primaryUnifiedOverlay) prepareWithLeafBytes(
 	bucket storeio.BucketID,
 	hash uint64,
@@ -585,6 +600,7 @@ func (o *primaryUnifiedOverlay) prepareWithLeafBytes(
 		bucket, hash, generation, key, value,
 		rawDelta, countDelta, kind, stableSlot,
 		leafBytes, leafBytes == o.maxLeafBytes,
+		storeio.CommonPrimaryUnifiedScalarPatch{},
 	)
 }
 
@@ -602,6 +618,7 @@ func (o *primaryUnifiedOverlay) prepareWithLeafReservation(
 	kind, stableSlot uint8,
 	fixedLeafBytes uint32,
 	reservationWide bool,
+	scalarPatch storeio.CommonPrimaryUnifiedScalarPatch,
 ) (primaryUnifiedOverlayPrepared, error) {
 	if o == nil || generation == 0 || len(key) == 0 ||
 		kind != primaryUnifiedOverlayPut &&
@@ -697,6 +714,7 @@ func (o *primaryUnifiedOverlay) prepareWithLeafReservation(
 		countDelta:     int8(countDelta),
 		kind:           kind,
 		slot:           stableSlot,
+		scalarPatch:    scalarPatch,
 		reservationWide: func() uint8 {
 			if reservationWide {
 				return 1
@@ -866,14 +884,14 @@ func (o *primaryUnifiedOverlay) applyBucket(
 	return records, nil
 }
 
-// latestBucketRecords collects the newest visible overlay record per stable
-// slot for one bucket, sorted lexically by key. A stable slot belongs to one key
-// throughout an overlay window, so the caller-owned 256-entry dst doubles as an
-// O(1) slot-index table during the history walk. The fixed seen bitmap makes a
-// 32,768-record hot-bucket fold O(history), rather than comparing every record
-// with as many as 256 already-selected keys. Repeated slots and duplicate keys
-// across slots are still validated explicitly and fail closed.
-func (o *primaryUnifiedOverlay) latestBucketRecords(
+// latestBucketRecordsUnordered collects the newest visible overlay record per
+// stable slot for one bucket. Its compact output is in slot order, not lexical
+// order. A stable slot belongs to one key throughout an overlay window, so the
+// caller-owned 256-entry dst doubles as an O(1) slot-index table during the
+// history walk. The native replacement patcher accepts arbitrary input order
+// and independently proves each key's admitted rank and slot, avoiding an
+// unnecessary quadratic sort on its hot fold path.
+func (o *primaryUnifiedOverlay) latestBucketRecordsUnordered(
 	dst *[storeio.CommonPrimaryLeafWideSlots]uint16,
 	bucket storeio.BucketID,
 	generation uint64,
@@ -979,6 +997,22 @@ func (o *primaryUnifiedOverlay) latestBucketRecords(
 		index := dst[slot]
 		dst[n] = index
 		n++
+	}
+	return n, nil
+}
+
+// latestBucketRecords returns the unordered slot census in lexical key order
+// for merge/scan callers. Sorting also makes duplicate keys assigned to
+// distinct slots adjacent, preserving the full corruption check for every
+// structural consumer.
+func (o *primaryUnifiedOverlay) latestBucketRecords(
+	dst *[storeio.CommonPrimaryLeafWideSlots]uint16,
+	bucket storeio.BucketID,
+	generation uint64,
+) (int, error) {
+	n, err := o.latestBucketRecordsUnordered(dst, bucket, generation)
+	if err != nil || n == 0 {
+		return n, err
 	}
 	for i := 1; i < n; i++ {
 		index := dst[i]

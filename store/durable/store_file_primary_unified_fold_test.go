@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"os"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
 // TestFilePrimaryUnifiedNativeFoldCrashBoundary exercises the checkpoint shape
@@ -114,5 +116,643 @@ func TestFilePrimaryUnifiedNativeFoldCrashBoundary(t *testing.T) {
 	defer reopened.Close()
 	for _, index := range selected {
 		assertPrimaryRaw(t, reopened, keys[index], updated[index], true)
+	}
+}
+
+// seedBufferedInlinePrimaryLeaf takes the structural buffered-COW primitive
+// directly so a test can start from an inline, cache-only leaf above the
+// checkpoint base. Ordinary inline Put intentionally chooses the row overlay.
+func seedBufferedInlinePrimaryLeaf(
+	t *testing.T,
+	collection *Collection,
+	key, value []byte,
+) storeio.PageRef {
+	t.Helper()
+	var ref storeio.PageRef
+	target := func() uint64 {
+		collection.writer.Lock()
+		defer collection.writer.Unlock()
+		state := collection.state.Load()
+		route, err := collection.currentPrimaryResidentRoute(state, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := collection.ensureBufferedPrimaryMutationCapacity(
+			route, len(value),
+		); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := collection.primaryRouter.Load().AcquireLeaf(
+			collection.cache, route,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lease.Release()
+		leaf, err := storeio.AdmittedPrimaryLeafForMutationWithScratch(
+			lease.Page(), collection.storeID, route.Bucket,
+			collection.primaryLeafBounds(state),
+			collection.primaryLeafMutationScratch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slot, _, _, found := leaf.LookupRawHashed(route.Hash, key)
+		if !found {
+			t.Fatal("seed row is missing")
+		}
+		ref, _, _, err = collection.cowBufferedPrimaryMutation(
+			state, key, value, false, true, slot, route, &leaf,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		journalTarget, err := collection.journalDepositLocked(
+			storeio.RecoveryRecordKindPut,
+			state.root.Generation+1, key, value,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return journalTarget
+	}()
+	if target != 0 {
+		if err := collection.journalGroupAwait(target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ref
+}
+
+func forcePrimaryOverlayPressureFold(
+	t *testing.T,
+	collection *Collection,
+	requireNative bool,
+) {
+	t.Helper()
+	collection.writer.Lock()
+	fullScratch := collection.primaryLeafMutationScratch
+	if requireNative {
+		// RenderRecordsWithScratch(nil) fails closed. Success therefore proves
+		// the materializer never reached the full-planner fallback.
+		collection.primaryLeafMutationScratch = nil
+	}
+	err := collection.materializePrimaryOverlayPressureLocked()
+	collection.primaryLeafMutationScratch = fullScratch
+	collection.writer.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFilePrimaryUnifiedNativeFoldAcrossVolatileCut proves the native patch
+// path is not restricted to a leaf already present on device. The first
+// pressure fold stages a fresh class-5 leaf in the manual committer; the second
+// fold patches that never-durable page, cancels its queued write through the
+// retirement handoff, and removes its cache frame. Nil-ing the full-render
+// scratch around each fold makes any planner fallback fail closed, so two
+// successful folds also pin fast-path selection rather than just final values.
+func TestFilePrimaryUnifiedNativeFoldAcrossVolatileCut(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability:      DurabilityBufferedVisible,
+		RecoveryJournal: true,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "unified-native-volatile-fold.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const widthIndex = 63 // group 63 -> 64 grows its encoded zigzag varint.
+	state := collection.state.Load()
+	firstRoute, err := collection.currentPrimaryResidentRoute(
+		state, []byte(keys[widthIndex]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := make([]int, 1, 5)
+	selected[0] = widthIndex
+	for i := range keys {
+		if i == widthIndex {
+			continue
+		}
+		route, routeErr := collection.currentPrimaryResidentRoute(
+			state, []byte(keys[i]),
+		)
+		if routeErr != nil {
+			t.Fatal(routeErr)
+		}
+		if route.Bucket == firstRoute.Bucket {
+			selected = append(selected, i)
+			if len(selected) == cap(selected) {
+				break
+			}
+		}
+	}
+	if len(selected) != cap(selected) {
+		t.Fatalf("fixture provided %d same-leaf rows, want %d",
+			len(selected), cap(selected))
+	}
+	targets := selected[:4]
+
+	mutate := func(round, index int, source []byte) []byte {
+		t.Helper()
+		value := append([]byte(nil), source...)
+		at := bytes.Index(value, []byte(`"group":`))
+		if at < 0 {
+			t.Fatal("row has no group scalar")
+		}
+		at += len(`"group":`)
+		if index == widthIndex {
+			from, to := []byte("63"), []byte("64")
+			if round&1 == 0 {
+				from, to = to, from
+			}
+			if !bytes.Equal(value[at:at+len(from)], from) {
+				t.Fatalf("round %d width scalar = %q, want %q",
+					round, value[at:at+len(from)], from)
+			}
+			copy(value[at:at+len(to)], to)
+			return value
+		}
+		before := value[at]
+		if (int(before-'0')+round)&1 == 0 {
+			value[at] = '7'
+		} else {
+			value[at] = '8'
+		}
+		if value[at] == before {
+			value[at] = '6'
+		}
+		if len(value) != len(source) || bytes.Equal(value, source) {
+			t.Fatalf("round %d replacement is not fixed-size", round)
+		}
+		return value
+	}
+	putRound := func(round int, source map[int][]byte) map[int][]byte {
+		t.Helper()
+		next := make(map[int][]byte, len(targets))
+		for _, index := range targets {
+			value := mutate(round, index, source[index])
+			next[index] = value
+			created, putErr := collection.Put([]byte(keys[index]), value)
+			if putErr != nil || created {
+				t.Fatalf("round %d Put row %d = %v,%v",
+					round, index, created, putErr)
+			}
+		}
+		return next
+	}
+	current := make(map[int][]byte, len(targets))
+	for _, index := range targets {
+		current[index] = values[index]
+	}
+	baseline := collection.Stats()
+	initialDurableGeneration := collection.committer.DurableGeneration()
+
+	// Seed the pending-parent bridge with a genuine cache-only leaf above the
+	// checkpoint base. Normal inline replacements choose the row overlay, so the
+	// test invokes the same bounded COW primitive directly to isolate this source
+	// shape without adding an insert/delete/overflow fallback to the scenario.
+	seedIndex := selected[4]
+	seedValue := mutate(1, seedIndex, values[seedIndex])
+	seedRef := seedBufferedInlinePrimaryLeaf(
+		t, collection, []byte(keys[seedIndex]), seedValue,
+	)
+	checkpointBase := collection.primaryCheckpointBaseState()
+	if checkpointBase == nil {
+		t.Fatal("seed has no checkpoint base")
+	}
+	if seedRef.Offset < checkpointBase.fileEnd {
+		t.Fatalf("seed ref %+v is not above checkpoint base fileEnd %d",
+			seedRef, checkpointBase.fileEnd)
+	}
+
+	current = putRound(1, current)
+	beforeFirstFold, err := collection.currentPrimaryResidentRoute(
+		collection.state.Load(), []byte(keys[targets[0]]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeFirstFold.Ref != seedRef {
+		t.Fatalf("first pressure source = %+v, want volatile %+v",
+			beforeFirstFold.Ref, seedRef)
+	}
+	forcePrimaryOverlayPressureFold(t, collection, true)
+	firstFoldRoute, err := collection.currentPrimaryResidentRoute(
+		collection.state.Load(), []byte(keys[targets[0]]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstFoldRoute.Ref.Generation <= initialDurableGeneration {
+		t.Fatalf("first fold ref generation = %d, durable base = %d",
+			firstFoldRoute.Ref.Generation, initialDurableGeneration)
+	}
+	if got := collection.committer.DurableGeneration(); got != initialDurableGeneration {
+		t.Fatalf("device-silent fold advanced durable generation to %d, want %d",
+			got, initialDurableGeneration)
+	}
+
+	current = putRound(2, current)
+	forcePrimaryOverlayPressureFold(t, collection, true)
+	secondFoldRoute, err := collection.currentPrimaryResidentRoute(
+		collection.state.Load(), []byte(keys[targets[0]]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondFoldRoute.Ref == firstFoldRoute.Ref {
+		t.Fatalf("second fold retained source ref %+v", firstFoldRoute.Ref)
+	}
+	retiredNeverDurable := false
+	for _, extent := range collection.retirementAbsorbed {
+		if extent.Offset == firstFoldRoute.Ref.Offset &&
+			extent.Length == uint64(firstFoldRoute.Ref.Length) {
+			retiredNeverDurable = true
+			break
+		}
+	}
+	if !retiredNeverDurable {
+		t.Fatalf("never-durable source %+v was not extracted for reuse",
+			firstFoldRoute.Ref)
+	}
+	if lease, acquireErr := collection.cache.Acquire(firstFoldRoute.Ref); acquireErr == nil {
+		lease.Release()
+		t.Fatalf("never-durable source %+v remained cache-reachable",
+			firstFoldRoute.Ref)
+	}
+	stats := collection.Stats()
+	if got := stats.PrimaryOverlayFolds - baseline.PrimaryOverlayFolds; got != 2 {
+		t.Fatalf("pressure folds = %d, want 2", got)
+	}
+	if stats.JournalDeltaFullFallbacks != baseline.JournalDeltaFullFallbacks {
+		t.Fatalf("journal fallback count = %d, want %d",
+			stats.JournalDeltaFullFallbacks,
+			baseline.JournalDeltaFullFallbacks)
+	}
+
+	// The exact pre-Flush image contains the synced recovery records but none of
+	// the manual committer's device-silent pages. Reopen therefore has to replay
+	// both mutation windows from the sealed durable base.
+	crash := clonePrimaryCrashFile(t, file, "volatile-fold-crash.vibe")
+	crashCollection, err := Open(crash, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range targets {
+		assertPrimaryRaw(t, crashCollection, keys[index], current[index], true)
+	}
+	assertPrimaryRaw(t, crashCollection, keys[seedIndex], seedValue, true)
+	if err := crashCollection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := crash.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedFile.Close()
+	reopened, err := Open(reopenedFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for _, index := range targets {
+		assertPrimaryRaw(t, reopened, keys[index], current[index], true)
+	}
+	assertPrimaryRaw(t, reopened, keys[seedIndex], seedValue, true)
+}
+
+// TestFilePrimaryUnifiedNativeFoldPinsVolatileSource proves a direct reader
+// admitted before publication keeps the cache-only source leaf alive across a
+// native fold. Once the epoch exits, the ordinary deferred-retirement cleanup
+// makes that exact generation unreachable.
+func TestFilePrimaryUnifiedNativeFoldPinsVolatileSource(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability:      DurabilityBufferedVisible,
+		RecoveryJournal: true,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "unified-native-pinned-source.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+
+	const widthIndex = 63
+	state := collection.state.Load()
+	targetRoute, err := collection.currentPrimaryResidentRoute(
+		state, []byte(keys[widthIndex]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedIndex := -1
+	var seedRoute storeio.ResidentPrimaryRoute
+	for i := range keys {
+		if i == widthIndex {
+			continue
+		}
+		route, routeErr := collection.currentPrimaryResidentRoute(
+			state, []byte(keys[i]),
+		)
+		if routeErr != nil {
+			t.Fatal(routeErr)
+		}
+		if route.Bucket == targetRoute.Bucket {
+			seedIndex, seedRoute = i, route
+			break
+		}
+	}
+	if seedIndex < 0 {
+		t.Fatal("fixture has no second row in target bucket")
+	}
+	seedValue := append([]byte(nil), values[seedIndex]...)
+	seedScalar := bytes.Index(seedValue, []byte(`"group":`)) + len(`"group":`)
+	if seedScalar < len(`"group":`) {
+		t.Fatal("seed row has no group scalar")
+	}
+	if seedValue[seedScalar] == '8' {
+		seedValue[seedScalar] = '7'
+	} else {
+		seedValue[seedScalar] = '8'
+	}
+	seedRef := seedBufferedInlinePrimaryLeaf(
+		t, collection, []byte(keys[seedIndex]), seedValue,
+	)
+	base := collection.primaryCheckpointBaseState()
+	if base == nil || seedRef.Offset < base.fileEnd {
+		t.Fatalf("seed ref %+v is not cache-only above the checkpoint base", seedRef)
+	}
+	targetValue := bytes.Replace(
+		append([]byte(nil), values[widthIndex]...),
+		[]byte(`"group":63`), []byte(`"group":64`), 1,
+	)
+	if bytes.Equal(targetValue, values[widthIndex]) {
+		t.Fatal("width-changing target mutation was not applied")
+	}
+	if created, putErr := collection.Put(
+		[]byte(keys[widthIndex]), targetValue,
+	); putErr != nil || created {
+		t.Fatalf("overlay Put = %v,%v", created, putErr)
+	}
+
+	pinnedState, epoch, entered := collection.enterReadEpoch()
+	if !entered {
+		t.Fatal("could not pin direct reader")
+	}
+	released := false
+	defer func() {
+		if !released {
+			epoch.Exit()
+		}
+	}()
+	pinnedRoute, err := collection.currentPrimaryResidentRoute(
+		pinnedState, []byte(keys[seedIndex]),
+	)
+	if err != nil || pinnedRoute.Ref != seedRef {
+		t.Fatalf("pinned source route = %+v,%v want %+v",
+			pinnedRoute.Ref, err, seedRef)
+	}
+	forcePrimaryOverlayPressureFold(t, collection, true)
+
+	deferred := false
+	for _, ref := range collection.primaryVolatileRetired {
+		if ref == seedRef {
+			deferred = true
+			break
+		}
+	}
+	if !deferred {
+		t.Fatalf("reader-pinned source %+v was not deferred", seedRef)
+	}
+	lease, err := collection.cache.Acquire(seedRef)
+	if err != nil {
+		t.Fatalf("reader-pinned source is not cache-readable: %v", err)
+	}
+	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		lease.Page(), collection.storeID, seedRoute.Bucket,
+		collection.primaryLeafBounds(pinnedState),
+	)
+	if !ok {
+		lease.Release()
+		t.Fatal("reader-pinned source is not an admitted unified leaf")
+	}
+	_, body, overflow, found := unified.LookupBodySlotHashed(
+		seedRoute.Hash, []byte(keys[seedIndex]),
+	)
+	got := unified.AppendAdmittedRowBody(nil, body)
+	lease.Release()
+	if !found || overflow || !bytes.Equal(got, seedValue) {
+		t.Fatalf("reader-pinned source row = %q,%v,%v want %q",
+			got, found, overflow, seedValue)
+	}
+
+	epoch.Exit()
+	released = true
+	collection.writer.Lock()
+	collection.clearPrimaryVolatileRetiredLocked()
+	collection.writer.Unlock()
+	if lease, acquireErr := collection.cache.Acquire(seedRef); acquireErr == nil {
+		lease.Release()
+		t.Fatalf("released reader left source %+v cache-reachable", seedRef)
+	}
+}
+
+// TestFilePrimaryUnifiedVolatileOverflowForcesFullFold pins the safety side of
+// native-fold admission. A cache-only source with a volatile overflow chain
+// must take the full renderer so the chain is re-minted into the checkpoint;
+// copying its old descriptor would publish references to pages no commit owns.
+func TestFilePrimaryUnifiedVolatileOverflowForcesFullFold(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability:      DurabilityBufferedVisible,
+		RecoveryJournal: true,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "unified-volatile-overflow-fold.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+
+	state := collection.state.Load()
+	seedRoute, err := collection.currentPrimaryResidentRoute(
+		state, []byte(keys[0]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIndex := -1
+	var targetRoute storeio.ResidentPrimaryRoute
+	for i := 1; i < len(keys); i++ {
+		route, routeErr := collection.currentPrimaryResidentRoute(
+			state, []byte(keys[i]),
+		)
+		if routeErr != nil {
+			t.Fatal(routeErr)
+		}
+		if route.Bucket == seedRoute.Bucket {
+			targetIndex, targetRoute = i, route
+			break
+		}
+	}
+	if targetIndex < 0 {
+		t.Fatal("fixture has no inline target in overflow bucket")
+	}
+	large := append([]byte(nil), `{"payload":"`...)
+	large = append(large, bytes.Repeat([]byte{'x'}, 160<<10)...)
+	large = append(large, `"}`...)
+	canonicalLarge := canonicalDocs(t, [][]byte{large})[0]
+	base := collection.primaryCheckpointBaseState()
+	if base == nil {
+		t.Fatal("overflow source has no checkpoint base")
+	}
+	if created, putErr := collection.Put([]byte(keys[0]), large); putErr != nil || created {
+		t.Fatalf("overflow Put = %v,%v", created, putErr)
+	}
+	sourceState := collection.state.Load()
+	sourceRoute, err := collection.currentPrimaryResidentRoute(
+		sourceState, []byte(keys[0]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceRoute.Ref.Offset < base.fileEnd {
+		t.Fatalf("overflow source %+v is not above base fileEnd %d",
+			sourceRoute.Ref, base.fileEnd)
+	}
+	lease, err := collection.cache.Acquire(sourceRoute.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		lease.Page(), collection.storeID, seedRoute.Bucket,
+		collection.primaryLeafBounds(sourceState),
+	)
+	if !ok {
+		lease.Release()
+		t.Fatal("overflow source is not an admitted unified leaf")
+	}
+	_, body, overflow, found := source.LookupBodySlotHashed(
+		seedRoute.Hash, []byte(keys[0]),
+	)
+	oldHead := storeio.DecodePrimaryOverflowRef(body)
+	lease.Release()
+	if !found || !overflow || oldHead == (storeio.PageRef{}) ||
+		oldHead.Offset < base.fileEnd {
+		t.Fatalf("source overflow = %+v,%v,%v", oldHead, found, overflow)
+	}
+	oldExtents, err := collection.collectPrimaryOverflowExtents(
+		nil, oldHead, collection.primaryLeafBounds(sourceState),
+	)
+	if err != nil || len(oldExtents) < 2 {
+		t.Fatalf("volatile overflow extents = %d,%v, want a chain",
+			len(oldExtents), err)
+	}
+
+	targetValue := append([]byte(nil), values[targetIndex]...)
+	targetScalar := bytes.Index(targetValue, []byte(`"group":`)) + len(`"group":`)
+	if targetScalar < len(`"group":`) {
+		t.Fatal("inline target has no group scalar")
+	}
+	if targetValue[targetScalar] == '8' {
+		targetValue[targetScalar] = '7'
+	} else {
+		targetValue[targetScalar] = '8'
+	}
+	if created, putErr := collection.Put(
+		[]byte(keys[targetIndex]), targetValue,
+	); putErr != nil || created {
+		t.Fatalf("inline overlay Put = %v,%v", created, putErr)
+	}
+	baselineFolds := collection.Stats().PrimaryOverlayFolds
+	forcePrimaryOverlayPressureFold(t, collection, false)
+	if got := collection.Stats().PrimaryOverlayFolds; got != baselineFolds+1 {
+		t.Fatalf("pressure folds = %d, want %d", got, baselineFolds+1)
+	}
+
+	foldedState := collection.state.Load()
+	foldedRoute, err := collection.currentPrimaryResidentRoute(
+		foldedState, []byte(keys[0]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err = collection.cache.Acquire(foldedRoute.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folded, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		lease.Page(), collection.storeID, seedRoute.Bucket,
+		collection.primaryLeafBounds(foldedState),
+	)
+	if !ok {
+		lease.Release()
+		t.Fatal("folded overflow leaf is not admitted")
+	}
+	_, body, overflow, found = folded.LookupBodySlotHashed(
+		seedRoute.Hash, []byte(keys[0]),
+	)
+	newHead := storeio.DecodePrimaryOverflowRef(body)
+	_, targetBody, targetOverflow, targetFound := folded.LookupBodySlotHashed(
+		targetRoute.Hash, []byte(keys[targetIndex]),
+	)
+	gotTarget := folded.AppendAdmittedRowBody(nil, targetBody)
+	lease.Release()
+	if !found || !overflow || newHead == (storeio.PageRef{}) || newHead == oldHead {
+		t.Fatalf("reminted overflow head = %+v,%v,%v; old=%+v",
+			newHead, found, overflow, oldHead)
+	}
+	if !targetFound || targetOverflow || !bytes.Equal(gotTarget, targetValue) {
+		t.Fatalf("folded inline target = %q,%v,%v want %q",
+			gotTarget, targetFound, targetOverflow, targetValue)
+	}
+	for _, ref := range append(oldExtents, sourceRoute.Ref) {
+		if stale, acquireErr := collection.cache.Acquire(ref); acquireErr == nil {
+			stale.Release()
+			t.Fatalf("superseded volatile ref %+v remained cache-reachable", ref)
+		}
+	}
+
+	crash := clonePrimaryCrashFile(t, file, "volatile-overflow-crash.vibe")
+	crashCollection, err := Open(crash, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrimaryRaw(t, crashCollection, keys[0], canonicalLarge, true)
+	assertPrimaryRaw(t, crashCollection, keys[targetIndex], targetValue, true)
+	if err := crashCollection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := crash.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
