@@ -58,21 +58,21 @@ var (
 	// ErrCommonPrimaryLeafCorrupt reports that a leaf image failed checksum or
 	// structural admission and must not be read.
 	ErrCommonPrimaryLeafCorrupt = errors.New(
-		"vibejson: corrupt common primary leaf",
+		"vibedb: corrupt common primary leaf",
 	)
 	// ErrCommonPrimaryLeafNotFound reports that a key is absent from the leaf.
 	ErrCommonPrimaryLeafNotFound = errors.New(
-		"vibejson: common primary leaf key not found",
+		"vibedb: common primary leaf key not found",
 	)
 	// ErrCommonPrimaryLeafFull reports that the current slot class has no room
 	// for another record; the caller must split.
 	ErrCommonPrimaryLeafFull = errors.New(
-		"vibejson: common primary leaf class is full",
+		"vibedb: common primary leaf class is full",
 	)
 	// ErrCommonPrimaryLeafNeedsWide reports that the rows exceed the narrow
 	// budget and must be re-encoded in the wide class.
 	ErrCommonPrimaryLeafNeedsWide = errors.New(
-		"vibejson: common primary leaf needs wide class",
+		"vibedb: common primary leaf needs wide class",
 	)
 )
 

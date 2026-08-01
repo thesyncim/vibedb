@@ -433,6 +433,12 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	dst []store.Mask, workspace *IndexWorkspace,
 	name string, values []vibejson.Index,
 ) ([]store.Mask, error) {
+	// LastProbeStats describes this call even when validation fails before any
+	// posting work. Clear it before every early return so a caller never
+	// mistakes the preceding successful probe's counters for the failed one.
+	if workspace != nil {
+		workspace.lastProbe = IndexProbeStats{}
+	}
 	indexID, ok := s.indexNameIDs[name]
 	if !ok {
 		return dst, store.ErrIndexNotFound
@@ -455,9 +461,6 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	}
 	if err != nil {
 		return dst, err
-	}
-	if workspace != nil {
-		workspace.lastProbe = IndexProbeStats{}
 	}
 	epoch := s.epoch
 	if epoch == nil || int(indexID) >= len(epoch.exact) {

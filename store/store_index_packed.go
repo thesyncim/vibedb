@@ -226,7 +226,7 @@ func storePackedIndexPrefix(entries []storeIndexChunkMask, capacity int) (count,
 func (p *storePackedIndex) encode(pageBytes []byte, streams []storePackedBuildStream) error {
 	var storeID [16]byte
 	if _, err := rand.Read(storeID[:]); err != nil {
-		return fmt.Errorf("vibejson: packed exact-index identity: %w", err)
+		return fmt.Errorf("vibedb: packed exact-index identity: %w", err)
 	}
 	segments := make([]storeio.PostingSegment, 0, storePackedIndexMaxSegments)
 	entries := make([]storeio.PostingEntry, 0, storePackedIndexMaxEntries)
@@ -309,7 +309,7 @@ func (p *storePackedIndex) encode(pageBytes []byte, streams []storePackedBuildSt
 		return err
 	}
 	if pageIndex != len(p.views) {
-		return fmt.Errorf("vibejson: packed exact-index page-count invariant")
+		return fmt.Errorf("vibedb: packed exact-index page-count invariant")
 	}
 	return nil
 }

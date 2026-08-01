@@ -365,6 +365,7 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	}
 	child := p.nested.parsers[p.nested.used]
 	p.nested.used++
+	child.cancel = p.cancel
 	sub := &child.sel
 	child.existsProjection = exists
 	child.nesting = p.nesting + 1

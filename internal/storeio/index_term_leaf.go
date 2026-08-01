@@ -65,7 +65,7 @@ var (
 
 	// ErrIndexTermLeafCorrupt reports a checksum-valid but structurally or
 	// semantically invalid exact-term leaf as well as checksum damage.
-	ErrIndexTermLeafCorrupt = errors.New("vibejson: corrupt exact-term index leaf")
+	ErrIndexTermLeafCorrupt = errors.New("vibedb: corrupt exact-term index leaf")
 )
 
 // IndexTermLeafLiveLookup resolves the immutable stable-slot liveness tile

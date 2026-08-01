@@ -13,7 +13,7 @@ const (
 
 // ErrOverflowPageCorrupt reports a malformed separately checksummed large-
 // value extent.
-var ErrOverflowPageCorrupt = errors.New("vibejson: corrupt Store overflow page")
+var ErrOverflowPageCorrupt = errors.New("vibedb: corrupt Store overflow page")
 
 // OverflowPageHeader describes one ordered piece of a JSON value. Offset is
 // the byte position of Data in the complete value. Next is zero only for the

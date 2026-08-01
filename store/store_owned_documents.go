@@ -45,7 +45,7 @@ func (b *Builder) compactDocuments(state *State) error {
 	}
 	owned, err := newStoreOwnedDocuments(b.count, dataBytes, layout)
 	if err != nil {
-		return fmt.Errorf("vibejson: compact Builder documents: %w", err)
+		return fmt.Errorf("vibedb: compact Builder documents: %w", err)
 	}
 	shapeIDs := make(map[*ShapeRecord]uint32, len(b.shapes))
 	for id, rec := range b.shapes {
@@ -190,7 +190,7 @@ func (b *Builder) compactDocuments(state *State) error {
 	})
 	if !valid || position != len(data) || rowBase != uint64(b.count) {
 		owned.release()
-		return errors.New("vibejson: Builder compact document invariant")
+		return errors.New("vibedb: Builder compact document invariant")
 	}
 	state.mappedDocs = owned
 	owned.templates = templates

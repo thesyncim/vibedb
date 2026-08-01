@@ -10,24 +10,22 @@ import (
 
 // fileCandidateMasks and fileExactCandidateMasks are the durable entry
 // points into the shared generic planner (candidates_mask.go). They stay
-// concretely typed on *durable.Snapshot/*durable.IndexWorkspace, wrapping
-// them in a durable.QuerySnapshot — durable's probes carry extra I/O-
-// workspace and stats-accumulator parameters that store.IndexSource's plain
-// method set can't express, so this adapter (not the plan-level function
-// signatures) is where that gap is bridged.
+// concretely typed on *durable.Snapshot/*durable.IndexSession. The session
+// owns reusable probe scratch and exposes only detached metrics, so query
+// retains capacity without wiring workspace or counter pointers through the
+// public API.
 
-func (p *plan) fileCandidateMasks(snapshot *durable.Snapshot, index *durable.IndexWorkspace, w *Workspace) ([]store.Mask, error) {
+func (p *plan) fileCandidateMasks(snapshot *durable.Snapshot, index *durable.IndexSession, w *Workspace) ([]store.Mask, error) {
 	if err := w.checkCanceled(); err != nil {
 		return nil, err
 	}
+	index.Reset(snapshot)
 	// Durable offers neither optional capability: the ordered primary graph
 	// carries no block-pruning summaries, and a live-row universe would mean
 	// reading every document page — real I/O rather than the metadata read a
 	// NOT needs it to be — so durable declines NOT. Candidate generation runs
 	// from the declared index catalog alone.
-	masks, _, err := snapshotCandidateMasks(
-		p, durable.QuerySnapshot{Snapshot: snapshot, Workspace: index},
-		sourceCaps{}, w, false)
+	masks, _, err := snapshotCandidateMasks(p, index, sourceCaps{}, w, false)
 	if err == nil {
 		err = w.checkCanceled()
 	}
@@ -35,12 +33,12 @@ func (p *plan) fileCandidateMasks(snapshot *durable.Snapshot, index *durable.Ind
 }
 
 // fileCandidateMasksBounded admits the complete durable planning high-water
-// before AppendIndexes, a mask append, or an IndexWorkspace probe can grow.
+// before AppendIndexes, a mask append, or an IndexSession probe can grow.
 // Declining returns the ordinary nil/full-scan plan rather than a resource
 // error: an index is an optimization, and the batched scan remains exact.
 func (p *plan) fileCandidateMasksBounded(
 	snapshot *durable.Snapshot,
-	index *durable.IndexWorkspace,
+	index *durable.IndexSession,
 	w *Workspace,
 	memoryBytes int64,
 ) ([]store.Mask, int64, error) {
@@ -76,13 +74,14 @@ func (p *plan) fileCandidateMasksBounded(
 // run. A refusal is a cost-based decline, never a query error.
 func (p *plan) fileExactCandidateMasksBounded(
 	snapshot *durable.Snapshot,
-	index *durable.IndexWorkspace,
+	index *durable.IndexSession,
 	w *Workspace,
 	memoryBytes int64,
 ) ([]store.Mask, uint64, uint64, int, bool, error) {
 	if err := w.checkCanceled(); err != nil {
 		return nil, 0, 0, 0, true, err
 	}
+	index.Reset(snapshot)
 	if p.where == nil {
 		return nil, 0, 0, 0, false, nil
 	}
@@ -118,26 +117,23 @@ func (p *plan) fileExactCandidateMasksBounded(
 	if p.fileIndexPlanMemoryBytes(bound, workspaceBytes) > memoryBytes {
 		return nil, 0, 0, 0, false, nil
 	}
-	return p.fileExactCandidateMasksLoaded(snapshot, index, w)
+	return p.fileExactCandidateMasksLoaded(index, w)
 }
 
 func (p *plan) fileExactCandidateMasksLoaded(
-	snapshot *durable.Snapshot,
-	index *durable.IndexWorkspace,
+	index *durable.IndexSession,
 	w *Workspace,
 ) ([]store.Mask, uint64, uint64, int, bool, error) {
 	if err := w.checkCanceled(); err != nil {
 		return nil, 0, 0, 0, true, err
 	}
-	var rechecks, certificates uint64
-	var postingPages int
-	qs := durable.QuerySnapshot{
-		Snapshot: snapshot, Workspace: index,
-		Rechecks: &rechecks, Certificates: &certificates, PostingPages: &postingPages,
-	}
 	// This lane consumes masks as final answers, and durable has no live-mask
 	// source, so no capabilities are offered here at all.
-	masks, bounded, exact, err := candidatesFor(p.where, qs, sourceCaps{}, p.valuePaths, w.storeIndexes, w, true)
+	masks, bounded, exact, err := candidatesFor(p.where, index, sourceCaps{}, p.valuePaths, w.storeIndexes, w, true)
+	metrics := index.Metrics()
+	rechecks := metrics.DocumentRecheckRows
+	certificates := metrics.CertificateRows
+	postingPages := int(min(metrics.PostingPages, uint64(^uint(0)>>1)))
 	if err != nil {
 		return nil, rechecks, certificates, postingPages, true, err
 	}

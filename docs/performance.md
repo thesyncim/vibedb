@@ -101,10 +101,12 @@ requirement for stable online space.
 
 ## Bulk footprint
 
-Both 100,000-document corpora contain 24,881,153 raw bytes (23.729 MiB). The
-low-cardinality corpus compresses to 1.837 MiB with gzip-9 and the
-shape-identical high-cardinality corpus to 8.041 MiB. Database cells include
-the fully preallocated paired recovery journal and are
+Both 100,000-document corpora contain 24,881,153 JSON bytes (23.729 MiB) plus
+1,200,000 key bytes (1.144 MiB), for a key-inclusive logical payload of
+26,081,153 bytes (24.873 MiB). Gzip-9 is an explicitly JSON-only entropy
+control: low cardinality compresses to 1.837 MiB and the shape-identical high
+cardinality corpus to 8.041 MiB. Database cells include the fully preallocated
+paired recovery journal and are
 **apparent / allocated MiB**.
 
 | engine/profile | low cardinality | high cardinality |

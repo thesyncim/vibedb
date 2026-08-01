@@ -54,6 +54,39 @@ func TestCapabilityManifestCoversEveryDimension(t *testing.T) {
 	}
 }
 
+func TestCancellationContractCoversBothSQLBoundaries(t *testing.T) {
+	seen := map[EntryPoint]bool{}
+	for _, cancellation := range CancellationCases {
+		if cancellation.ID == "" || cancellation.Trigger == "" ||
+			cancellation.Error == "" || !cancellation.NoPartialWrite ||
+			!cancellation.Reusable {
+			t.Fatalf("incomplete cancellation contract: %+v", cancellation)
+		}
+		if seen[cancellation.Entry] {
+			t.Fatalf("duplicate cancellation contract for %q", cancellation.Entry)
+		}
+		seen[cancellation.Entry] = true
+	}
+	for _, entry := range []EntryPoint{DatabaseSQL, PGWire} {
+		if !seen[entry] {
+			t.Fatalf("missing cancellation contract for %q", entry)
+		}
+	}
+}
+
+func TestUnsupportedSQLManifestIsComplete(t *testing.T) {
+	seen := make(map[string]bool, len(UnsupportedSQLCases))
+	for _, c := range UnsupportedSQLCases {
+		if c.ID == "" || c.Statement == "" || c.ReasonContains == "" || seen[c.ID] {
+			t.Fatalf("invalid unsupported SQL case: %+v", c)
+		}
+		seen[c.ID] = true
+	}
+	if len(seen) < 5 {
+		t.Fatalf("unsupported SQL matrix has only %d families", len(seen))
+	}
+}
+
 func TestCapabilityManifestCoversCartesianContract(t *testing.T) {
 	type cell struct {
 		entry       EntryPoint

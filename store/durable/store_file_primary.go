@@ -338,7 +338,7 @@ func validateOpenedPrimaryGraph(
 	fileEnd uint64,
 ) error {
 	if root.PrimaryRoot == (storeio.PageRef{}) {
-		return fmt.Errorf("vibejson: collection has no ordered-primary root")
+		return fmt.Errorf("vibedb: collection has no ordered-primary root")
 	}
 	bounds := storeio.GlobalTabletCatalogBounds{
 		StoreID: root.StoreID, SelectedRootGeneration: root.Generation,
@@ -349,13 +349,13 @@ func validateOpenedPrimaryGraph(
 		func(catalog *storeio.GlobalTabletCatalogNodeView) error {
 			if catalog.Level() != storeio.GlobalTabletCatalogRoot ||
 				catalog.PageID() != 0 || catalog.Count() == 0 {
-				return fmt.Errorf("vibejson: ordered primary catalog root shape")
+				return fmt.Errorf("vibedb: ordered primary catalog root shape")
 			}
 			cursor := catalog.LowerBound(nil)
 			for {
 				route, ok := cursor.Route()
 				if !ok {
-					return fmt.Errorf("vibejson: ordered primary catalog root cursor")
+					return fmt.Errorf("vibedb: ordered primary catalog root cursor")
 				}
 				if catalog.ChildLevel() == storeio.GlobalTabletCatalogLeaf {
 					if err := validateOpenedPrimaryCatalogLeaf(
@@ -370,7 +370,7 @@ func validateOpenedPrimaryGraph(
 						return err
 					}
 				} else {
-					return fmt.Errorf("vibejson: ordered primary catalog child level")
+					return fmt.Errorf("vibedb: ordered primary catalog child level")
 				}
 				if !cursor.Next() {
 					break
@@ -393,13 +393,13 @@ func validateOpenedPrimaryCatalogBranch(
 				branch.PageID() != route.ID ||
 				branch.ChildLevel() != storeio.GlobalTabletCatalogLeaf ||
 				branch.Count() == 0 {
-				return fmt.Errorf("vibejson: ordered primary catalog branch shape")
+				return fmt.Errorf("vibedb: ordered primary catalog branch shape")
 			}
 			cursor := branch.LowerBound(nil)
 			for {
 				leafRoute, ok := cursor.Route()
 				if !ok {
-					return fmt.Errorf("vibejson: ordered primary catalog branch cursor")
+					return fmt.Errorf("vibedb: ordered primary catalog branch cursor")
 				}
 				if err := validateOpenedPrimaryCatalogLeaf(
 					cache, leafRoute, bounds,
@@ -425,14 +425,14 @@ func validateOpenedPrimaryCatalogLeaf(
 		func(leaf *storeio.GlobalTabletCatalogNodeView) error {
 			if leaf.Level() != storeio.GlobalTabletCatalogLeaf ||
 				leaf.PageID() != route.ID || leaf.Count() == 0 {
-				return fmt.Errorf("vibejson: ordered primary catalog leaf shape")
+				return fmt.Errorf("vibedb: ordered primary catalog leaf shape")
 			}
 			cursor := leaf.LowerBound(nil)
 			for {
 				tabletRoute, ok := cursor.Route()
 				if !ok {
 					return fmt.Errorf(
-						"vibejson: ordered primary catalog leaf cursor",
+						"vibedb: ordered primary catalog leaf cursor",
 					)
 				}
 				if err := validateOpenedPrimaryTablet(
@@ -456,7 +456,7 @@ func validateOpenedPrimaryTablet(
 ) error {
 	lease, err := cache.Acquire(ref)
 	if err != nil {
-		return fmt.Errorf("vibejson: open ordered primary tablet: %w", err)
+		return fmt.Errorf("vibedb: open ordered primary tablet: %w", err)
 	}
 	tablet, err := storeio.OpenGlobalTabletCatalogTabletRoot(
 		lease.Page(), ref, bounds,
@@ -464,7 +464,7 @@ func validateOpenedPrimaryTablet(
 	locatorRef, locatorOK := tablet.LocatorRef()
 	lease.Release()
 	if err != nil {
-		return fmt.Errorf("vibejson: open ordered primary tablet: %w", err)
+		return fmt.Errorf("vibedb: open ordered primary tablet: %w", err)
 	}
 	if !locatorOK {
 		return fmt.Errorf(
@@ -474,14 +474,14 @@ func validateOpenedPrimaryTablet(
 	}
 	locatorLease, err := cache.Acquire(locatorRef)
 	if err != nil {
-		return fmt.Errorf("vibejson: open ordered primary locator: %w", err)
+		return fmt.Errorf("vibedb: open ordered primary locator: %w", err)
 	}
 	_, err = storeio.OpenGlobalTabletCatalogLocator(
 		locatorLease.Page(), locatorRef, bounds,
 	)
 	locatorLease.Release()
 	if err != nil {
-		return fmt.Errorf("vibejson: open ordered primary locator: %w", err)
+		return fmt.Errorf("vibedb: open ordered primary locator: %w", err)
 	}
 	return nil
 }
@@ -493,18 +493,18 @@ func withOpenedPrimaryCatalogNode(
 	visit func(*storeio.GlobalTabletCatalogNodeView) error,
 ) error {
 	if cache == nil {
-		return fmt.Errorf("vibejson: ordered primary catalog without page cache")
+		return fmt.Errorf("vibedb: ordered primary catalog without page cache")
 	}
 	lease, err := cache.Acquire(ref)
 	if err != nil {
-		return fmt.Errorf("vibejson: open ordered primary catalog: %w", err)
+		return fmt.Errorf("vibedb: open ordered primary catalog: %w", err)
 	}
 	defer lease.Release()
 	node, err := storeio.OpenGlobalTabletCatalogNode(
 		lease.Page(), ref, bounds,
 	)
 	if err != nil {
-		return fmt.Errorf("vibejson: open ordered primary catalog: %w", err)
+		return fmt.Errorf("vibedb: open ordered primary catalog: %w", err)
 	}
 	return visit(&node)
 }
@@ -549,7 +549,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("vibejson: build resident primary router: %w", err)
+		return fmt.Errorf("vibedb: build resident primary router: %w", err)
 	}
 	c.primaryRouter.Store(builtRouter)
 	// Both buffered-visible and the journal-backed synchronous lane apply through
@@ -579,7 +579,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 	c.setupPrimaryNativeFoldContexts()
 	if err := c.openPrimaryExactIndexes(state); err != nil {
 		return fmt.Errorf(
-			"vibejson: open ordered-primary exact indexes: %w", err,
+			"vibedb: open ordered-primary exact indexes: %w", err,
 		)
 	}
 	return nil

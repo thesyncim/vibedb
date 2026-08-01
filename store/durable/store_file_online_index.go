@@ -16,7 +16,7 @@ import (
 // ErrIndexBuildInProgress reports a second online index declaration against a
 // collection that is already reconciling and publishing another one.
 var ErrIndexBuildInProgress = errors.New(
-	"vibejson: durable collection index build is already in progress",
+	"vibedb: durable collection index build is already in progress",
 )
 
 type onlineIndexBucket struct {

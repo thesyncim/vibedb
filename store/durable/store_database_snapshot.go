@@ -235,7 +235,7 @@ func SnapshotCollections(collections []NamedCollection) (DatabaseSnapshot, error
 		}
 		if previous, exists := seen[entry.Collection]; exists {
 			return DatabaseSnapshot{}, fmt.Errorf(
-				"vibejson: one durable collection cannot be cataloged as both %q and %q",
+				"vibedb: one durable collection cannot be cataloged as both %q and %q",
 				previous, entry.Name)
 		}
 		seen[entry.Collection] = entry.Name

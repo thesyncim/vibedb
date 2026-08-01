@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,52 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
+
+func TestSessionCatalogOIDsAreUniqueAndStableAcrossConcurrentCreate(t *testing.T) {
+	tables := make([]sqldriver.TableInfo, 128)
+	for i := range tables {
+		tables[i].Name = fmt.Sprintf("table_%03d", i)
+	}
+	var s session
+	if !s.ensureCatalogOIDs(tables) || len(s.catalogOIDs) != len(tables) {
+		t.Fatalf("initial oid assignment = %d entries", len(s.catalogOIDs))
+	}
+	seen := make(map[uint32]string, len(tables))
+	stable := make(map[string]uint32, len(tables))
+	for _, entry := range s.catalogOIDs {
+		if previous, exists := seen[entry.oid]; exists {
+			t.Fatalf("oid %d assigned to both %q and %q", entry.oid, previous, entry.name)
+		}
+		seen[entry.oid] = entry.name
+		stable[entry.name] = entry.oid
+	}
+
+	// A lexically earlier table appears between psql's resolve and detail
+	// queries. Existing continuation tokens must not move.
+	withEarlier := append([]sqldriver.TableInfo{{Name: "aaa_new"}}, tables...)
+	if !s.ensureCatalogOIDs(withEarlier) {
+		t.Fatal("oid assignment rejected a bounded catalog")
+	}
+	for _, entry := range s.catalogOIDs {
+		if old, existed := stable[entry.name]; existed && old != entry.oid {
+			t.Fatalf("oid for %q moved from %d to %d", entry.name, old, entry.oid)
+		}
+	}
+	answer := catalogAnswer{tables: withEarlier, oids: s.catalogOIDs}
+	for name, oid := range stable {
+		table := answer.tableByOID(strconv.FormatUint(uint64(oid), 10))
+		if table == nil || table.Name != name {
+			t.Fatalf("oid %d resolved to %+v, want %q", oid, table, name)
+		}
+	}
+	if answer.tableByOID("4294967295") != nil {
+		t.Fatal("unknown oid resolved to a table")
+	}
+	absent := catalogAnswer{tables: withEarlier[:1], oids: s.catalogOIDs}
+	if absent.tableByOID(strconv.FormatUint(uint64(stable["table_000"]), 10)) != nil {
+		t.Fatal("oid for a table absent from the current snapshot returned stale metadata")
+	}
+}
 
 // The catalog shim's contract has three parts, and each part has a test that
 // would fail if it broke: the exact psql query texts are answered with the
@@ -205,10 +252,15 @@ func TestPSQLListMetaCommandsAnswerFromCatalog(t *testing.T) {
 
 func TestPSQLDescribeTableSequenceAnswersFromCatalog(t *testing.T) {
 	c := connectIntrospectionCatalog(t)
-	oid := strconv.FormatUint(uint64(catalogTableOID("users")), 10)
+	resolve := catalogQueryFor(t, `\d name: resolve oid`, "users")
+	resolvedRows := rowsOf(t, c.query(resolve))
+	if len(resolvedRows) != 1 || len(resolvedRows[0]) != 3 {
+		t.Fatalf("oid resolution rows = %q", resolvedRows)
+	}
+	oid := string(resolvedRows[0][0])
 
 	// Step 1: psql resolves the name to an oid.
-	expectShimResult(t, c.query(catalogQueryFor(t, `\d name: resolve oid`, "users")),
+	expectShimResult(t, c.query(resolve),
 		[]string{"oid", "nspname", "relname"},
 		[]int32{oidInt8, oidText, oidText},
 		[][]any{{oid, "public", "users"}})

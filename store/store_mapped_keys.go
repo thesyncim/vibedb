@@ -312,7 +312,7 @@ func (m *storeMappedKeys) setLocation(ref uint64, loc Location) {
 	if m.dense != nil {
 		want := Location{Chunk: uint32(ref >> m.denseShift), Slot: uint8(ref & uint64((1<<m.denseShift)-1))}
 		if loc != want {
-			panic("vibejson: dense collection key location invariant")
+			panic("vibedb: dense collection key location invariant")
 		}
 		return
 	}

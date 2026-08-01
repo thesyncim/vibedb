@@ -53,7 +53,7 @@ func TestResolveStorageProfile(t *testing.T) {
 		}
 	}
 
-	for _, engine := range []string{"vibejson-durable", "bbolt", "sqlite"} {
+	for _, engine := range []string{"vibedb", "bbolt", "sqlite"} {
 		for _, profile := range []StorageProfile{
 			StorageProfileIntrinsic,
 			StorageProfileProduction,

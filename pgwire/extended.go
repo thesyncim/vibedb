@@ -67,9 +67,9 @@ func (s *session) extended(tag byte) error {
 	var err error
 	switch tag {
 	case msgParse:
-		err = s.handleParse()
+		err = s.handleCancelableParse()
 	case msgBind:
-		err = s.handleBind()
+		err = s.handleCancelableBind()
 	case msgDescribe:
 		err = s.handleDescribe()
 	case msgExecute:
@@ -99,6 +99,18 @@ func (s *session) extended(tag byte) error {
 		return pg
 	}
 	return nil
+}
+
+func (s *session) handleCancelableParse() error {
+	s.beginCancelable()
+	defer s.endCancelable()
+	return s.handleParse()
+}
+
+func (s *session) handleCancelableBind() error {
+	s.beginCancelable()
+	defer s.endCancelable()
+	return s.handleBind()
 }
 
 func (s *session) finishExtendedBatch() error {
@@ -275,6 +287,9 @@ func preparedInputCharge(name, query string, oidCount int) int {
 }
 
 func (s *session) handleBind() error {
+	if err := s.cancellationError(); err != nil {
+		return asPGError(err)
+	}
 	m := &s.msg
 	stmt, ok := s.statements[m.name]
 	if !ok {
@@ -332,7 +347,7 @@ func (s *session) handleBind() error {
 			maxPortalBytes))
 	}
 	if err := s.bindInto(p, m, stmt); err != nil {
-		return err
+		return asPGError(err)
 	}
 	bindBytes := max(stmt.bindBytes, boundLiteralCharge(p.literalCharges, stmt))
 	if bindBytes-stmt.bindBytes > maxPreparedBindBytes-s.statementBindBytes {
@@ -345,6 +360,9 @@ func (s *session) handleBind() error {
 	// half-bound portal and a failed Bind retains no new session object.
 	// Message names borrow the reader body. A published named portal outlives
 	// that body, so take ownership only at the successful Bind commit point.
+	if err := s.cancellationError(); err != nil {
+		return asPGError(err)
+	}
 	p.name = strings.Clone(p.name)
 	s.portals[p.name] = p
 	s.portalBytes += p.retainedBytes
@@ -376,6 +394,7 @@ func (s *session) bindInto(p *portal, m *frontendMessage, stmt *prepared) error 
 	var err error
 	if p.args, p.wireArgs, p.valueSlots, p.argStore, p.decodeStore, err = bindArgs(
 		p.args, p.wireArgs, p.valueSlots, p.argStore, p.decodeStore, m, stmt,
+		s.cancellationError,
 	); err != nil {
 		return err
 	}
@@ -723,7 +742,13 @@ func bindArgs(
 	decodeStore []byte,
 	m *frontendMessage,
 	stmt *prepared,
+	check func() error,
 ) ([]any, []any, []boundValueSlot, []byte, []byte, error) {
+	if check != nil {
+		if err := check(); err != nil {
+			return args, wireArgs, valueSlots, store, decodeStore, err
+		}
+	}
 	// Interface slices are scanned to capacity by the garbage collector.
 	// Clear stale entries before shortening them so a bind with fewer
 	// parameters cannot pin an older value-slot backing array.
@@ -744,7 +769,12 @@ func bindArgs(
 	// values, rather than placeholder occurrences, is what prevents a repeated
 	// $1 from amplifying one bounded Bind message into an unbounded allocation.
 	total := 0
-	for _, raw := range m.params {
+	for i, raw := range m.params {
+		if check != nil && i&255 == 0 {
+			if err := check(); err != nil {
+				return args, wireArgs, valueSlots, store, decodeStore, err
+			}
+		}
 		total += len(raw)
 	}
 	if cap(store) < total {
@@ -758,6 +788,11 @@ func bindArgs(
 		decodeStore = make([]byte, 0, decoded)
 	}
 	for wire, raw := range m.params {
+		if check != nil && wire&255 == 0 {
+			if err := check(); err != nil {
+				return args, wireArgs, valueSlots, store, decodeStore, err
+			}
+		}
 		if raw == nil {
 			if stmt.paramKind(wire) == sqldriver.ParamDocument {
 				return args, wireArgs, valueSlots, store, decodeStore,
@@ -768,12 +803,28 @@ func bindArgs(
 			continue
 		}
 		start := len(store)
-		store = append(store, raw...)
+		if check == nil {
+			store = append(store, raw...)
+		} else {
+			for len(raw) > 0 {
+				if err := check(); err != nil {
+					return args, wireArgs, valueSlots, store, decodeStore, err
+				}
+				chunk := min(len(raw), 4<<10)
+				store = append(store, raw[:chunk]...)
+				raw = raw[chunk:]
+			}
+		}
 		value, err := bindParameter(store[start:len(store):len(store)],
 			formatFor(m.paramFormats, wire), stmt.parameterOID(wire),
 			stmt.paramKind(wire), &valueSlots[wire], &decodeStore)
 		if err != nil {
 			return args, wireArgs, valueSlots, store, decodeStore, err
+		}
+		if check != nil {
+			if err := check(); err != nil {
+				return args, wireArgs, valueSlots, store, decodeStore, err
+			}
 		}
 		wireArgs = append(wireArgs, value)
 	}
@@ -781,7 +832,12 @@ func bindArgs(
 		args = append(args, wireArgs...)
 		return args, wireArgs, valueSlots, store, decodeStore, nil
 	}
-	for _, wire := range stmt.paramOrder {
+	for index, wire := range stmt.paramOrder {
+		if check != nil && index&255 == 0 {
+			if err := check(); err != nil {
+				return args, wireArgs, valueSlots, store, decodeStore, err
+			}
+		}
 		args = append(args, wireArgs[wire-1])
 	}
 	return args, wireArgs, valueSlots, store, decodeStore, nil

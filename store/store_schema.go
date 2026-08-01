@@ -46,10 +46,10 @@ const (
 var (
 	// ErrSchemaDefinition reports an invalid root type, field type, path,
 	// or duplicate path while compiling a schema.
-	ErrSchemaDefinition = errors.New("vibejson: invalid collection schema")
+	ErrSchemaDefinition = errors.New("vibedb: invalid collection schema")
 	// ErrSchemaViolation reports a valid JSON document that does not
 	// satisfy its collection's optional compiled schema.
-	ErrSchemaViolation = errors.New("vibejson: collection schema violation")
+	ErrSchemaViolation = errors.New("vibedb: collection schema violation")
 )
 
 // SchemaField constrains one RFC 6901 path. Required distinguishes an

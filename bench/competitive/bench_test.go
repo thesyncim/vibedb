@@ -97,7 +97,7 @@ func newLoaded(tb testing.TB, factory Factory, cfg Config) (Engine, string, func
 
 // newLoadedCorpus is newLoaded over an explicitly supplied corpus rather than
 // the package-global docs. It exists for the one arm that cannot use the shared
-// 100k fixture: the indexed vibejson-durable engine, whose on-graph exact index
+// 100k fixture: the indexed vibedb engine, whose on-graph exact index
 // caps one physical index's postings at a single term leaf and must be sized
 // below that ceiling (see TestFullEquivalenceIndexedDurable).
 func newLoadedCorpus(tb testing.TB, factory Factory, cfg Config, corpus []Doc) (Engine, string, func()) {
@@ -250,7 +250,7 @@ func BenchmarkBulkLoadVariants(b *testing.B) {
 				continue
 			}
 			subset := docs[:size]
-			b.Run(fmt.Sprintf("vibejson-durable/%s/n=%d", v.name, size), func(b *testing.B) {
+			b.Run(fmt.Sprintf("vibedb/%s/n=%d", v.name, size), func(b *testing.B) {
 				closeForeignFixtures("")
 				b.ReportAllocs()
 				for b.Loop() {
@@ -262,7 +262,7 @@ func BenchmarkBulkLoadVariants(b *testing.B) {
 					cfg := v.cfg
 					cfg.Dir = dir
 					cfg.CacheBytes = DefaultCacheBytes
-					e, err := newVibeDurable(cfg)
+					e, err := newVibeDB(cfg)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -351,13 +351,13 @@ func BenchmarkPointWrite(b *testing.B) {
 // commit-buffer pool costs a serial writer, against the tuned configuration
 // every other row in this report uses.
 func BenchmarkPointWriteDurableDefaults(b *testing.B) {
-	durableFactory, _ := FactoryNamed("vibejson-durable")
+	durableFactory, _ := FactoryNamed("vibedb")
 	for _, untuned := range []bool{false, true} {
 		name := "tuned"
 		if untuned {
 			name = "defaults"
 		}
-		b.Run("vibejson-durable/"+name, func(b *testing.B) {
+		b.Run("vibedb/"+name, func(b *testing.B) {
 			closeForeignFixtures("")
 			e, _, cleanup := newLoaded(b, durableFactory, Config{Untuned: untuned})
 			defer cleanup()
@@ -383,7 +383,7 @@ func BenchmarkPointWriteDurableDefaults(b *testing.B) {
 //
 // This measures ITERATION ONLY and must be labelled that way wherever it is
 // published. It was reported as a scan throughput figure and it cannot be one:
-// vibejson's heap engine measured 248-byte documents at 5.41 ns/doc, which is
+// VibeDB's heap engine measured 248-byte documents at 5.41 ns/doc, which is
 // 46 GB/s, above this machine's memory bandwidth. Nothing read the documents.
 // BenchmarkScanAllBytes is the throughput measurement.
 func BenchmarkScan(b *testing.B) {
@@ -448,7 +448,7 @@ func BenchmarkScanAllBytes(b *testing.B) {
 // with no secondary index available. For the key/value stores this is a full
 // scan with a JSON extraction per document, which is precisely what they force
 // an application to do. For SQLite it is a JSON1 expression over the stored
-// text. For vibejson it is the query engine over an index-free collection.
+// text. For VibeDB it is the query engine over an index-free collection.
 func BenchmarkFilter(b *testing.B) {
 	for _, factory := range Factories() {
 		b.Run(factory.Name, func(b *testing.B) {
@@ -637,7 +637,7 @@ func BenchmarkParse(b *testing.B) {
 // this harness. Every engine must return its documented stored representation
 // for every one of the corpus's keys, and must visit every key exactly once
 // with those same bytes during a scan. Byte-preserving engines return the
-// submitted spelling; vibejson-durable returns the sole class-5 canonical form.
+// submitted spelling; vibedb returns the sole class-5 canonical form.
 //
 // It replaced a check that verified one document — docs[42] — and validated
 // Scan by its count alone. An engine that returned correct bytes for docs[42]
@@ -748,7 +748,7 @@ func TestFullEquivalence(t *testing.T) {
 				t.Fatalf("FilterCount = %d, want %d", c, want)
 			}
 
-			// The indexed vibejson-durable arm cannot run at the default corpus.
+			// The indexed vibedb arm cannot run at the default corpus.
 			// Its on-graph exact index serialises one physical index's whole
 			// posting set into a single term leaf, bounded to 65,535 postings /
 			// 64 KiB, and that ceiling binds both the bulk cutover and the Put
@@ -757,7 +757,7 @@ func TestFullEquivalence(t *testing.T) {
 			// TestFullEquivalenceIndexedDurable, sized below the ceiling. Multi-leaf
 			// term indexes are the future work that lifts the cap and folds this
 			// arm back here. Every other engine's indexed arm stays at 100k.
-			if factory.Name == "vibejson-durable" {
+			if factory.Name == "vibedb" {
 				return
 			}
 
@@ -786,7 +786,7 @@ func TestFullEquivalence(t *testing.T) {
 
 // TestFullEquivalenceIndexedDurable extends TestFullEquivalence's canonical
 // oracle to the one arm TestFullEquivalence cannot cover at the default corpus:
-// the indexed vibejson-durable engine.
+// the indexed vibedb engine.
 //
 // Its on-graph exact index serialises one physical index's whole posting set
 // into a single term leaf, bounded to 65,535 postings / 64 KiB. That ceiling
@@ -811,7 +811,7 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	var expected []byte
 	var err error
 	for i := range corpus {
-		expected, err = AppendExpectedStoredJSON(expected[:0], "vibejson-durable", corpus[i].JSON)
+		expected, err = AppendExpectedStoredJSON(expected[:0], "vibedb", corpus[i].JSON)
 		if err != nil {
 			t.Fatalf("canonicalize %q: %v", corpus[i].Key, err)
 		}
@@ -819,9 +819,9 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	}
 	_, _, _, want := CorpusStats(corpus)
 
-	factory, ok := FactoryNamed("vibejson-durable")
+	factory, ok := FactoryNamed("vibedb")
 	if !ok {
-		t.Fatal("vibejson-durable factory missing")
+		t.Fatal("vibedb factory missing")
 	}
 	if !IndexCapable(factory.Name) {
 		t.Fatalf("IndexCapable(%q) is false; this test asserts the indexed arm", factory.Name)

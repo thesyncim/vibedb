@@ -39,7 +39,7 @@ const (
 
 // ErrInlineFreeDeltaFull tells a writer to spill the cumulative records into
 // one external PageFreeDelta and begin a new inline cumulative run.
-var ErrInlineFreeDeltaFull = errors.New("vibejson: inline free delta is full")
+var ErrInlineFreeDeltaFull = errors.New("vibedb: inline free delta is full")
 
 // InlineFreeDelta is a fixed-capacity, allocation-free cumulative free-set
 // diff. ExternalPrev is the newest external delta page preceding every inline

@@ -118,14 +118,14 @@ func (s Snapshot) AppendPointerRows(dst []vibejson.RawValue, rows []Location, po
 			chunk = s.state.Chunks.Get(chunkID)
 		}
 		if chunk == nil {
-			panic("vibejson: Location chunk is not live in Snapshot")
+			panic("vibedb: Location chunk is not live in Snapshot")
 		}
 		var ords [MaxChunkDocuments]int
 		last := first
 		for last < len(rows) && rows[last].Chunk == chunkID && last-first < len(ords) {
 			slot := int(rows[last].Slot)
 			if slot >= len(chunk.Ord) || chunk.Live&(uint64(1)<<uint(slot)) == 0 {
-				panic("vibejson: Location slot is not live in Snapshot")
+				panic("vibedb: Location slot is not live in Snapshot")
 			}
 			ords[last-first] = int(chunk.Ord[slot])
 			last++
@@ -165,14 +165,14 @@ func (s Snapshot) AppendFieldRows(dst []vibejson.RawValue, rows []Location, name
 			chunk = s.state.Chunks.Get(chunkID)
 		}
 		if chunk == nil {
-			panic("vibejson: Location chunk is not live in Snapshot")
+			panic("vibedb: Location chunk is not live in Snapshot")
 		}
 		var ords [MaxChunkDocuments]int
 		last := first
 		for last < len(rows) && rows[last].Chunk == chunkID && last-first < len(ords) {
 			slot := int(rows[last].Slot)
 			if slot >= len(chunk.Ord) || chunk.Live&(uint64(1)<<uint(slot)) == 0 {
-				panic("vibejson: Location slot is not live in Snapshot")
+				panic("vibedb: Location slot is not live in Snapshot")
 			}
 			ords[last-first] = int(chunk.Ord[slot])
 			last++
@@ -192,7 +192,7 @@ func (s Snapshot) AppendRowKeys(dst []string, rows []Location) []string {
 			chunk = s.state.Chunks.Get(row.Chunk)
 		}
 		if chunk == nil || int(row.Slot) >= len(chunk.Ord) || chunk.Live&(uint64(1)<<row.Slot) == 0 {
-			panic("vibejson: Location is not live in Snapshot")
+			panic("vibedb: Location is not live in Snapshot")
 		}
 		dst = append(dst, chunk.Key(int(row.Slot)))
 	}

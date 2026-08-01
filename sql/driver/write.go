@@ -401,7 +401,7 @@ func (c *conn) insertLocked(
 		}
 		return result{affected: int64(len(seeds))}, nil
 	}
-	if err := c.rejectExistingSeeds(t.collection, seeds); err != nil {
+	if err := c.rejectExistingSeeds(ctx, t.collection, seeds); err != nil {
 		return nil, err
 	}
 	if err := contextCheckpoint(ctx); err != nil {
@@ -463,11 +463,19 @@ func (c *conn) insertReturningContext(
 }
 
 func (c *conn) rejectExistingSeeds(
+	ctx context.Context,
 	collection *durable.Collection,
 	seeds []seedDocument,
 ) error {
 	scratch := c.pointRaw[:0]
+	cancellable := ctx.Done() != nil
 	for _, seed := range seeds {
+		if cancellable {
+			if err := contextCheckpoint(ctx); err != nil {
+				c.pointRaw = scratch
+				return err
+			}
+		}
 		var found bool
 		var err error
 		scratch, found, err = collection.AppendRaw(scratch[:0], []byte(seed.key))
@@ -822,7 +830,7 @@ func (c *conn) updateLocked(
 		return nil, durable.ErrDocumentTooLarge
 	}
 	keys, err := c.matchingKeysLocked(
-		statement, args, t, limits, len(document))
+		ctx, statement, args, t, limits, len(document))
 	if err != nil {
 		return nil, err
 	}
@@ -883,7 +891,7 @@ func (c *conn) deleteLocked(
 	if err != nil {
 		return nil, err
 	}
-	keys, err := c.matchingKeysLocked(statement, args, t, limits, 0)
+	keys, err := c.matchingKeysLocked(ctx, statement, args, t, limits, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -926,6 +934,7 @@ func (c *conn) deleteLocked(
 }
 
 func (c *conn) matchingKeysLocked(
+	ctx context.Context,
 	statement *query.DMLStatement,
 	args []any,
 	t *table,
@@ -964,7 +973,14 @@ func (c *conn) matchingKeysLocked(
 		}
 		present := keys[:0]
 		scratch := c.pointRaw[:0]
+		cancellable := ctx.Done() != nil
 		for _, key := range keys {
+			if cancellable {
+				if err := contextCheckpoint(ctx); err != nil {
+					c.pointRaw = scratch
+					return nil, err
+				}
+			}
 			var found bool
 			scratch, found, err = t.collection.AppendRaw(scratch[:0], []byte(key))
 			if err != nil {

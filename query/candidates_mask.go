@@ -11,14 +11,14 @@ import (
 //
 // This file is the mask-based candidate planner shared by every backend
 // whose snapshot type satisfies store.IndexSource — today store.Snapshot
-// (directly) and store/durable's snapshot type (through durable.QuerySnapshot).
+// (directly) and store/durable's reusable IndexSession.
 // It replaces what were previously two hand-duplicated planners
 // (store_candidates.go and file_candidates.go's AND/OR/Cmp/Contains/Not
 // dispatch was ~60% structurally identical between them). The remaining
 // per-backend files keep only their genuinely distinct entry points and
 // capabilities: store_candidates.go's storeCandidateMasks* wrap
 // store.Snapshot directly, file_candidates.go's file* wrap durable's
-// workspace-and-stats-carrying probe API.
+// private-state reusable index session.
 //
 // Needle-scratch discipline: every AppendIndexMasks/AppendIndexCandidateMasks
 // call below passes w.needleScratch (a Workspace-owned, reused array),
@@ -48,13 +48,11 @@ import (
 //
 // It knows because the caller says so, not because the planner asks. Asking
 // meant an `any(snapshot)` type assertion inside the generic dispatch, and a
-// type parameter wider than one word must be copied to the heap to be boxed:
-// the heap Snapshot is a single pointer and converts for free, while durable's
-// QuerySnapshot carries five and does not, so every durable execution would pay
-// a 48-byte allocation to be told what its own call site already knew. Which
-// capabilities a backend has is a property of the backend, fixed at compile
-// time, so each concrete entry point states its own and the compiler checks the
-// claim.
+// type parameter wider than one word must be copied to the heap to be boxed.
+// Both the heap Snapshot and durable IndexSession pointer are one word and
+// convert in place, but capability selection remains a backend property fixed
+// at compile time, so each concrete entry point states its own and the compiler
+// checks the claim.
 type sourceCaps struct {
 	live store.LiveMaskSource
 }

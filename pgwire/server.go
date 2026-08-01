@@ -132,7 +132,7 @@ type Options struct {
 	OnError func(err error)
 }
 
-// A Server serves the PostgreSQL wire protocol over one SQL database.
+// A Server is an experimental PostgreSQL wire-protocol endpoint supporting a documented SQL subset over one database.
 type Server struct {
 	db   *sqldriver.Database
 	opts Options

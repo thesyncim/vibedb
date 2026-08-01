@@ -14,12 +14,10 @@ import (
 //
 // The unified SQL front end parses the bounded SELECT/INSERT/UPDATE/DELETE/
 // CREATE TABLE/CREATE INDEX surface. Protocol-only session commands,
-// transaction aliases and modes, and unsupported SQL leading kinds still need
-// routing before that parse. A client needs syntax and missing capability
-// distinguished because the SQLSTATE it branches on is the difference between
-// a bug in its query and a feature this server does not have. Classification
-// here is what keeps 0A000 and 42601 stable; see pgerror.go for why matching
-// parser prose was rejected.
+// transaction aliases and modes still need routing before that parse. Missing
+// SQL features do not: all non-protocol statement kinds reach the shared SQL
+// front end, whose typed FeatureNotSupportedError is what keeps 0A000 and 42601
+// stable across pgwire and database/sql. See pgerror.go.
 //
 // # Why an unsupported SET is refused
 //
@@ -60,58 +58,10 @@ const (
 	kindReset
 	kindShow
 	kindDiscard
-	// kindUnsupported is a statement kind this server does not implement, and
-	// carries the message naming the missing feature.
-	kindUnsupported
 	// kindUnknown is a leading token that is not a statement keyword at all,
 	// which is a syntax error rather than a missing feature.
 	kindUnknown
 )
-
-// unsupportedStatements maps a leading keyword onto the feature it needs and
-// this server does not have. Every entry is a deliberate refusal with a reason
-// a reader of the message can act on, which is the whole reason the table
-// exists instead of a default branch saying "unsupported statement".
-var unsupportedStatements = map[string]string{
-	"MERGE":    "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
-	"TRUNCATE": "TRUNCATE is not supported; use a bounded DELETE predicate",
-	"COPY":     "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
-
-	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
-	"DROP":    "DROP is not in the bounded catalog subset; destructive catalog operations remain with the database owner",
-	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
-	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
-	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",
-	"VACUUM":  "storage maintenance is the owning application's, not a client's",
-	"ANALYZE": "storage maintenance is the owning application's, not a client's",
-	"REINDEX": "storage maintenance is the owning application's, not a client's",
-	"CLUSTER": "storage maintenance is the owning application's, not a client's",
-	"REFRESH": "there are no materialized views",
-
-	"SAVEPOINT": "savepoints are not supported: the runtime owns one bounded transaction overlay",
-	"RELEASE":   "savepoints are not supported, so there is no savepoint to release",
-
-	"PREPARE":    "SQL-level PREPARE is not supported: use the extended query protocol's Parse message, which every client library exposes",
-	"EXECUTE":    "SQL-level EXECUTE is not supported: use the extended query protocol's Bind and Execute messages",
-	"DEALLOCATE": "SQL-level DEALLOCATE is not supported: use the extended query protocol's Close message",
-
-	"DECLARE": "cursors are not supported: the extended query protocol's portals are the row-at-a-time mechanism here",
-	"FETCH":   "cursors are not supported: the extended query protocol's portals are the row-at-a-time mechanism here",
-	"MOVE":    "cursors are not supported: the extended query protocol's portals are the row-at-a-time mechanism here",
-
-	"LISTEN":   "asynchronous notification is not supported",
-	"NOTIFY":   "asynchronous notification is not supported",
-	"UNLISTEN": "asynchronous notification is not supported",
-
-	"LOCK":    "there is no lock manager: readers never block and there is nothing to lock against",
-	"EXPLAIN": "EXPLAIN is not supported: the engine's plan is not renderable as PostgreSQL plan text",
-	"CALL":    "there are no stored procedures",
-	"DO":      "there is no procedural language",
-
-	"WITH":   "common table expressions are not supported: the engine executes one plan and has no nested execution",
-	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
-	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
-}
 
 // classify reports what kind of statement src is, from its leading keyword.
 // The second result is a specific refusal or syntax-error message when one is
@@ -144,10 +94,10 @@ func classify(src string) (statementKind, string) {
 	case "DISCARD":
 		return kindDiscard, ""
 	}
-	if reason, ok := unsupportedStatements[word]; ok {
-		return kindUnsupported, reason
-	}
-	return kindUnknown, ""
+	// Every remaining keyword is handed to the shared SQL front end. It owns
+	// the typed feature-not-supported taxonomy; an actually unknown word remains
+	// a positioned syntax error there.
+	return kindCatalogSQL, ""
 }
 
 // parseTransactionCommand admits the deliberately small transaction grammar
@@ -958,8 +908,27 @@ var errMixedPlaceholders = newError(sqlstateSyntaxError,
 //
 // A statement with no $n is returned unchanged with a nil order, which is the
 // signal that binding is positional and needs no permutation.
-func rewriteNumberedParameters(src string) (string, []int, int, error) {
-	if !strings.ContainsRune(src, '$') {
+func rewriteNumberedParameters(
+	src string,
+	check func() error,
+) (string, []int, int, error) {
+	hasDollar := false
+	if check == nil {
+		hasDollar = strings.ContainsRune(src, '$')
+	} else {
+		for i := 0; i < len(src); i++ {
+			if i%(4<<10) == 0 {
+				if err := check(); err != nil {
+					return "", nil, 0, err
+				}
+			}
+			if src[i] == '$' {
+				hasDollar = true
+				break
+			}
+		}
+	}
+	if !hasDollar {
 		return src, nil, 0, nil
 	}
 	var order []int
@@ -971,18 +940,41 @@ func rewriteNumberedParameters(src string) (string, []int, int, error) {
 	// text and not a parameter.
 	out := make([]byte, 0, len(src))
 	for i < len(src) {
+		if check != nil && i%(4<<10) == 0 {
+			if err := check(); err != nil {
+				return "", nil, 0, err
+			}
+		}
 		switch src[i] {
 		case '\'', '"':
-			end := skipQuoted(src, i, src[i])
-			out = append(out, src[i:end]...)
+			end, appendErr := skipQuotedCancelable(src, i, src[i], check)
+			if appendErr != nil {
+				return "", nil, 0, appendErr
+			}
+			out, appendErr = appendStringCancelable(out, src[i:end], check)
+			if appendErr != nil {
+				return "", nil, 0, appendErr
+			}
 			i = end
 		case '-':
 			if i+1 < len(src) && src[i+1] == '-' {
 				end := len(src)
-				if n := strings.IndexByte(src[i:], '\n'); n >= 0 {
-					end = i + n + 1
+				for at := i; at < len(src); at++ {
+					if check != nil && (at-i)%(4<<10) == 0 {
+						if err := check(); err != nil {
+							return "", nil, 0, err
+						}
+					}
+					if src[at] == '\n' {
+						end = at + 1
+						break
+					}
 				}
-				out = append(out, src[i:end]...)
+				var appendErr error
+				out, appendErr = appendStringCancelable(out, src[i:end], check)
+				if appendErr != nil {
+					return "", nil, 0, appendErr
+				}
 				i = end
 				continue
 			}
@@ -991,10 +983,22 @@ func rewriteNumberedParameters(src string) (string, []int, int, error) {
 		case '/':
 			if i+1 < len(src) && src[i+1] == '*' {
 				end := len(src)
-				if n := strings.Index(src[i+2:], "*/"); n >= 0 {
-					end = i + n + 4
+				for at := i + 2; at+1 < len(src); at++ {
+					if check != nil && (at-i)%(4<<10) == 0 {
+						if err := check(); err != nil {
+							return "", nil, 0, err
+						}
+					}
+					if src[at] == '*' && src[at+1] == '/' {
+						end = at + 2
+						break
+					}
 				}
-				out = append(out, src[i:end]...)
+				var appendErr error
+				out, appendErr = appendStringCancelable(out, src[i:end], check)
+				if appendErr != nil {
+					return "", nil, 0, appendErr
+				}
 				i = end
 				continue
 			}
@@ -1050,4 +1054,53 @@ func rewriteNumberedParameters(src string) (string, []int, int, error) {
 		return "", nil, 0, errMixedPlaceholders
 	}
 	return string(out), order, highest, nil
+}
+
+func skipQuotedCancelable(
+	src string,
+	i int,
+	quote byte,
+	check func() error,
+) (int, error) {
+	if check == nil {
+		return skipQuoted(src, i, quote), nil
+	}
+	start := i
+	i++
+	for i < len(src) {
+		if (i-start)%(4<<10) == 0 {
+			if err := check(); err != nil {
+				return 0, err
+			}
+		}
+		if src[i] != quote {
+			i++
+			continue
+		}
+		if i+1 < len(src) && src[i+1] == quote {
+			i += 2
+			continue
+		}
+		return i + 1, nil
+	}
+	return len(src), nil
+}
+
+func appendStringCancelable(
+	dst []byte,
+	src string,
+	check func() error,
+) ([]byte, error) {
+	if check == nil {
+		return append(dst, src...), nil
+	}
+	for len(src) > 0 {
+		if err := check(); err != nil {
+			return dst, err
+		}
+		chunk := min(len(src), 4<<10)
+		dst = append(dst, src[:chunk]...)
+		src = src[chunk:]
+	}
+	return dst, nil
 }

@@ -1,7 +1,8 @@
 # Canonical materialization
 
-**Status:** implemented behind strict eligibility checks. Readers always see
-one canonical page graph; materialization changes writer and recovery work only.
+**Status:** implemented behind strict eligibility checks. Materialized frames
+are one possible base of the generation cut; deferred primary lanes may also
+select a bounded immutable row overlay until foreground checkpoint folding.
 
 ## Current paths
 
@@ -18,9 +19,11 @@ document page and its route-summary page in the same capsule. Inserts, deletes,
 overflow transitions, structural changes, and unqualified devices use
 copy-on-write.
 
-Neither path adds a read overlay, tombstone table, memtable, delta chain, or
-version list. Point reads, scans, filters, and indexes continue to follow the
-published canonical graph.
+The capsule itself is recovery-only and never enters ordinary reads. Separately,
+the unified deferred primary lane can publish bounded generation-stamped put or
+delete records over these base pages. Point reads, scans, filters, and indexes
+resolve the published base-plus-overlay cut exactly; no background merge or
+unbounded version structure is involved.
 
 ## Eligibility
 

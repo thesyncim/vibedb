@@ -44,10 +44,10 @@ import (
 //
 // psql builds its catalog queries from compile-time templates in its
 // describe.c, chosen by the *server* version this package reports (16.0).
-// The texts below are the verbatim queries a stock psql 18.x sends for \l,
+// The texts below are the verbatim queries PostgreSQL 18.4 psql sends for \l,
 // \dn, \dt, \di, \d, \d <name>, \df, \du, and \dv against a version-16
-// server, captured with psql -E; they are stable across 18.x minors because
-// psql only revises them when the server catalog changes shape. Two spans
+// server, captured with psql -E. This is evidence for that pinned client, not a
+// promise about other psql releases. Two spans
 // inside them vary at run time — the relation name psql anchors into
 // '^(name)$', and the table oid it copies back into the \d detail queries —
 // so each recognized shape is data: literal segments with typed captures
@@ -58,11 +58,11 @@ import (
 //
 // One SQL table is presented as one pg_class row in the single namespace
 // "public", owned by the session user; the session's database is the one
-// pg_database row. A table's synthetic oid is derived from its name alone —
-// catalogTableOID below — so it is stable for the life of the catalog entry:
-// psql resolves a name to an oid in one query and sends that oid back in
-// later queries, sometimes with concurrent DDL in between, and an
-// ordinal-derived oid could silently start naming a different table. Columns
+// pg_database row. A table's synthetic oid is a session-local monotonic
+// continuation token retained for the life of the connection. psql resolves a
+// name to an oid in one query and sends that oid back in later queries;
+// retaining rather than recomputing the mapping keeps concurrent CREATE from
+// retargeting it and makes collisions impossible. Columns
 // become pg_attribute rows whose formatted type is this dialect's own
 // declared JSON type vocabulary (string, integer, ...), not an invented
 // PostgreSQL type. The primary key and each declared exact index become
@@ -221,23 +221,11 @@ func validCatalogCapture(kind catalogCapture, span string) bool {
 	}
 }
 
-// catalogTableOID derives a table's synthetic pg_class oid from its name:
-// 16384 (PostgreSQL's first user oid) plus a 28-bit FNV-1a fold of the name.
-// Deriving from the name rather than a catalog ordinal makes the oid stable
-// for as long as the table exists — across statements, transactions, and
-// concurrent DDL on other tables — which matters because psql resolves a name
-// to an oid in one query and trusts that oid in the queries that follow. A
-// hash collision inside one catalog would make two tables share an oid;
-// catalogTableByOID resolves that deterministically (first name in sorted
-// order wins), and with the catalog's 4,096-table ceiling the probability of
-// any collision is under one in ten thousand.
-func catalogTableOID(name string) uint32 {
-	const offset32, prime32 = 2166136261, 16777619
-	hash := uint32(offset32)
-	for i := 0; i < len(name); i++ {
-		hash = (hash ^ uint32(name[i])) * prime32
-	}
-	return 16384 + hash%(1<<28)
+const firstCatalogTableOID = 16384
+
+type catalogOIDEntry struct {
+	oid  uint32
+	name string
 }
 
 // A catalogAnswer is the read-only context a responder builds rows from: the
@@ -246,6 +234,16 @@ type catalogAnswer struct {
 	database string
 	user     string
 	tables   []sqldriver.TableInfo
+	oids     []catalogOIDEntry
+}
+
+func (a *catalogAnswer) oidByName(name string) (uint32, bool) {
+	for i := range a.oids {
+		if a.oids[i].name == name {
+			return a.oids[i].oid, true
+		}
+	}
+	return 0, false
 }
 
 func (a *catalogAnswer) tableByName(name string) *sqldriver.TableInfo {
@@ -262,10 +260,18 @@ func (a *catalogAnswer) tableByOID(capture string) *sqldriver.TableInfo {
 	if err != nil {
 		return nil
 	}
-	// tables is sorted by name, so a hash collision resolves to the same
-	// table on every call rather than depending on iteration order.
+	name := ""
+	for i := range a.oids {
+		if a.oids[i].oid == uint32(oid) {
+			name = a.oids[i].name
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
 	for i := range a.tables {
-		if catalogTableOID(a.tables[i].Name) == uint32(oid) {
+		if a.tables[i].Name == name {
 			return &a.tables[i]
 		}
 	}
@@ -290,12 +296,43 @@ func (s *session) catalogShim(text string) (*fixedResult, bool) {
 	if err != nil {
 		return nil, false
 	}
-	answer := catalogAnswer{database: s.database, user: s.user, tables: tables}
+	if !s.ensureCatalogOIDs(tables) {
+		return nil, false
+	}
+	answer := catalogAnswer{
+		database: s.database, user: s.user, tables: tables, oids: s.catalogOIDs,
+	}
 	fixed := shape.respond(&answer, capture)
 	if fixed == nil {
 		return nil, false
 	}
 	return fixed, true
+}
+
+func (s *session) ensureCatalogOIDs(tables []sqldriver.TableInfo) bool {
+	if s.nextCatalogOID == 0 {
+		s.nextCatalogOID = firstCatalogTableOID
+	}
+	for i := range tables {
+		found := false
+		for j := range s.catalogOIDs {
+			if s.catalogOIDs[j].name == tables[i].Name {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		if s.nextCatalogOID < firstCatalogTableOID {
+			return false
+		}
+		s.catalogOIDs = append(s.catalogOIDs, catalogOIDEntry{
+			oid: s.nextCatalogOID, name: strings.Clone(tables[i].Name),
+		})
+		s.nextCatalogOID++
+	}
+	return true
 }
 
 // --- responders -------------------------------------------------------------
@@ -432,7 +469,11 @@ func respondResolveOid(a *catalogAnswer, name string) *fixedResult {
 		// named ..." without a server error.
 		return catalogResult(cols, nil)
 	}
-	oid := strconv.FormatUint(uint64(catalogTableOID(t.Name)), 10)
+	tableOID, ok := a.oidByName(t.Name)
+	if !ok {
+		return catalogResult(cols, nil)
+	}
+	oid := strconv.FormatUint(uint64(tableOID), 10)
 	return catalogResult(cols, [][]*string{{strPtr(oid), strPtr("public"), strPtr(t.Name)}})
 }
 

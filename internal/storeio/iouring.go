@@ -10,23 +10,23 @@ var (
 	// ErrUnavailable reports that io_uring is absent, disabled, blocked by the
 	// process sandbox, or unavailable on this platform. Callers should select
 	// the portable positional-I/O backend.
-	ErrUnavailable = errors.New("vibejson: io_uring unavailable")
+	ErrUnavailable = errors.New("vibedb: io_uring unavailable")
 	// ErrUnsupported reports a ring that cannot execute the fixed-buffer file
 	// operations required by the Store page engine.
-	ErrUnsupported = errors.New("vibejson: io_uring lacks required operations")
+	ErrUnsupported = errors.New("vibedb: io_uring lacks required operations")
 	// ErrQueueFull reports that every submission slot is owned by the kernel or
 	// waiting for its completion to be consumed.
-	ErrQueueFull = errors.New("vibejson: io_uring submission queue full")
+	ErrQueueFull = errors.New("vibedb: io_uring submission queue full")
 	// ErrBufferBusy reports an attempt to submit a registered staging buffer
 	// that is already owned by an in-flight request.
-	ErrBufferBusy = errors.New("vibejson: io_uring buffer is in flight")
+	ErrBufferBusy = errors.New("vibedb: io_uring buffer is in flight")
 	// ErrOverflow reports a kernel submission drop, completion overflow, or a
 	// completion token that does not name an outstanding request. The caller
 	// must treat the ring as failed because request accounting is no longer
 	// trustworthy.
-	ErrOverflow = errors.New("vibejson: io_uring queue accounting lost")
+	ErrOverflow = errors.New("vibedb: io_uring queue accounting lost")
 	// ErrClosed reports use after a Store I/O owner begins closing.
-	ErrClosed = errors.New("vibejson: io_uring ring closed")
+	ErrClosed = errors.New("vibedb: io_uring ring closed")
 )
 
 // Config fixes the bounded memory owned by a Ring.

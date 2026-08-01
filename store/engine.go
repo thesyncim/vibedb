@@ -24,23 +24,15 @@ type Options struct {
 	// selects 64; valid explicit values are 1 through 64.
 	//
 	// 64 is the default because it is the only value at which a chunk's slot
-	// mask and an index posting word are the same object: both are one uint64,
-	// so a smaller chunk leaves (64-N)/64 of every posting bit unused and
-	// spreads the same postings over proportionally more chunk ids. That is
-	// not a rounding cost. Measured over 50k documents with one declared exact
-	// index, moving from 64 to 8 raised total retained heap from 645 to 941 B
-	// per document (+46%) on a 1000-distinct-value column, and quadrupled the
-	// posting words on a column whose equal values are adjacent. Full-scan
-	// Range was 25% slower at 8, because a scan pays per chunk.
+	// mask and an index posting word are the same object: both are one uint64.
+	// Smaller chunks leave posting bits unused, spread postings over more chunk
+	// ids, and make a full scan visit more chunks.
 	//
-	// Lowering it buys write latency, and less than the rebuild cost suggests.
-	// A mutation rebuilds its whole chunk, so a *replacement* is 1.7x cheaper
-	// at 8 than at 64 (1.39 vs 2.37 us); an *insert* is only 1.3x cheaper
-	// (1.31 vs 1.71 us), because a chunk being filled holds N/2 rows on
-	// average, not N. Bulk loads should use [Builder], which does not rebuild
-	// at all. Lower this only for a workload that is dominated by replacement
-	// of existing keys, is not scanned, and carries no index — and measure the
-	// heap, because it is the axis that moves most.
+	// Lowering it can reduce replacement latency because a mutation rebuilds its
+	// whole chunk, at the cost of higher metadata and scan overhead. Bulk loads
+	// should use [Builder], which does not rebuild existing chunks. Benchmark the
+	// intended corpus before changing this representation bound; measurements
+	// belong in the performance documentation rather than this API contract.
 	ChunkDocuments int
 	// IndexOptions configures each bounded Segment's structural index.
 	IndexOptions document.IndexOptions
@@ -55,10 +47,9 @@ type Options struct {
 	Postings bool
 	// ValueDict enables a value dictionary scoped to each immutable chunk. It
 	// increases the collection's live footprint — documents keep their verbatim
-	// source for zero-copy reads, so the dictionary is purely additive, and it
-	// measured 64 B per document on a long-repeated-enum corpus — and pays
-	// only at rest, in the repeated source a compacting or persisting writer
-	// can then drop. See [Segment.ValueDict].
+	// source for zero-copy reads, so the dictionary is purely additive — and
+	// pays only at rest, in repeated source a compacting or persisting writer can
+	// then drop. See [Segment.ValueDict].
 	ValueDict bool
 	// Schema optionally enforces compiled root and RFC 6901 field constraints
 	// on every insert or replacement. Nil preserves the schemaless fast path.
@@ -95,7 +86,7 @@ const MaxChunkDocuments = 64
 // The limit is 2^32-1 chunks (at most 274 billion documents with the default
 // chunk size), so reaching it indicates a caller architecture error rather
 // than an ordinary capacity event. The guard prevents uint32 wraparound.
-var ErrTooLarge = errors.New("vibejson: collection chunk address space exhausted")
+var ErrTooLarge = errors.New("vibedb: collection chunk address space exhausted")
 
 // Normalized returns o with zero fields resolved to their defaults and every
 // bound validated, or an error describing the first invalid setting. Callers
@@ -106,7 +97,7 @@ func (o Options) Normalized() (Options, error) {
 		o.ChunkDocuments = MaxChunkDocuments
 	}
 	if o.ChunkDocuments < 1 || o.ChunkDocuments > MaxChunkDocuments {
-		return Options{}, fmt.Errorf("vibejson: collection ChunkDocuments must be in [1,%d]", MaxChunkDocuments)
+		return Options{}, fmt.Errorf("vibedb: collection ChunkDocuments must be in [1,%d]", MaxChunkDocuments)
 	}
 	if o.Schema != nil && !o.Schema.Valid() {
 		return Options{}, fmt.Errorf(
@@ -119,9 +110,8 @@ func (o Options) Normalized() (Options, error) {
 
 // A Collection is a keyed set of JSON documents with immutable snapshots and a
 // lock-free raw read path. It is the in-memory source model the query engine
-// reads and durable collections are built from; its only surviving mutation is
-// Put, which the SQL driver uses to stage transient point-lookup rows. Writes
-// are serialized, rebuild at most one bounded document chunk, path-copy only
+// reads and durable collections are built from. Put and Delete rebuild at most
+// one bounded document chunk, path-copy only
 // bounded-radix metadata, and publish one new state through an atomic pointer. A
 // replacement parses only its new document; unchanged source and structural-tape
 // storage is immutable and shared into the new chunk.
@@ -826,6 +816,51 @@ func (c *Collection) Put(key string, src []byte) (created bool, err error) {
 	return true, nil
 }
 
+// Delete atomically removes key. It reports whether key was present. A miss is
+// a no-op and does not advance the generation. Existing snapshots retain the
+// removed row through their immutable chunk and key-directory roots.
+func (c *Collection) Delete(key string) (deleted bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.initLocked()
+	if err != nil {
+		return false, err
+	}
+	hash := maphash.String(state.seed, key)
+	old, loc, found := storeStateKeyLookupChunk(state, hash, key)
+	if !found {
+		return false, nil
+	}
+	nextChunk, err := rebuildStoreChunk(
+		state.StateOptions, c.options.Postings, old,
+		int(loc.Slot), "", nil, false,
+	)
+	if err != nil {
+		return false, err
+	}
+	next := *state
+	next.Generation++
+	next.Count--
+	next.keys = storekey.Delete(state.keys, hash, key)
+	next.Chunks = state.Chunks.set(loc.Chunk, nextChunk)
+	if nextChunk == nil {
+		next.ChunkCount--
+	}
+	c.noteChunkPostingsLocked(loc.Chunk, old, nextChunk)
+	c.addFreeLocked(loc.Chunk)
+	catalogChanged, secondaryChanged := c.noteIndexesForChunkLocked(
+		loc.Chunk, old, nextChunk, uint64(1)<<loc.Slot,
+	)
+	if catalogChanged {
+		next.Indexes = c.indexInfosLocked()
+	}
+	if secondaryChanged {
+		next.secondary = c.indexSnapshotsLocked()
+	}
+	c.state.Store(&next)
+	return true, nil
+}
+
 func (c *Collection) allocateSlotLocked(state *State) (uint32, int, *Chunk) {
 	if len(c.free.ids) == 0 {
 		return state.Chunks.Count, 0, nil
@@ -841,7 +876,7 @@ func (c *Collection) allocateSlotLocked(state *State) (uint32, int, *Chunk) {
 	}
 	free := ^chunk.Live & limitMask
 	if free == 0 {
-		panic("vibejson: full collection chunk in free set")
+		panic("vibedb: full collection chunk in free set")
 	}
 	return id, bits.TrailingZeros64(free), chunk
 }
@@ -892,6 +927,28 @@ func (c *Collection) Generation() uint64 {
 		return 0
 	}
 	return state.Generation
+}
+
+// StateMetrics is one coherent, constant-size observation of an in-memory
+// collection generation.
+type StateMetrics struct {
+	Documents  uint64
+	Generation uint64
+}
+
+// StateMetrics captures the current immutable state pointer once, so its
+// document count and generation cannot come from different publications.
+func (c *Collection) StateMetrics() StateMetrics {
+	if c == nil {
+		return StateMetrics{}
+	}
+	state := c.state.Load()
+	if state == nil {
+		return StateMetrics{}
+	}
+	return StateMetrics{
+		Documents: uint64(state.Count), Generation: state.Generation,
+	}
 }
 
 // A Snapshot is a logically immutable collection view. Its zero value is an empty

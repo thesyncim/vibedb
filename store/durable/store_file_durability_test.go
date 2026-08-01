@@ -562,15 +562,22 @@ func TestFileStoreSyncFailureNeverExposesRejectedMutation(t *testing.T) {
 		t.Fatalf("Close with snapshot after sync failure = %v, want %v and %v",
 			err, persistErr, storeio.ErrLeasesActive)
 	}
+	if collection.CloseCompleted() {
+		t.Fatal("CloseCompleted reported terminal cleanup while a snapshot lease remained")
+	}
 	if err := snapshot.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := collection.Close(); !errors.Is(err, persistErr) {
+	closeErr := collection.Close()
+	if !errors.Is(closeErr, persistErr) {
 		t.Fatalf("Close after snapshot release = %v, want sticky %v",
-			err, persistErr)
+			closeErr, persistErr)
 	}
-	if err := collection.Close(); err != nil {
-		t.Fatalf("idempotent Close = %v", err)
+	if !collection.CloseCompleted() {
+		t.Fatal("CloseCompleted did not report teardown after terminal persistence error")
+	}
+	if repeated := collection.Close(); repeated != closeErr {
+		t.Fatalf("idempotent Close = %v, want cached exact %v", repeated, closeErr)
 	}
 	// Recovery on reopen, rather than a retry on the poisoned handle, must find
 	// the durable baseline and none of the rejected mutation.

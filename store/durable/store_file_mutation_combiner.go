@@ -270,7 +270,7 @@ func (c *Collection) applyPrimaryMutationGroup(
 					request.err = err
 				}
 			default:
-				request.err = errors.New("vibejson: invalid primary mutation kind")
+				request.err = errors.New("vibedb: invalid primary mutation kind")
 			}
 		}
 		return nil
@@ -391,7 +391,7 @@ func (c *Collection) applyPrimaryMutationDirect(
 	case primaryMutationDelete:
 		request.deleted, request.err = c.deletePrimaryWithEmptyReclaim(request.key)
 	default:
-		request.err = errors.New("vibejson: invalid primary mutation kind")
+		request.err = errors.New("vibedb: invalid primary mutation kind")
 	}
 }
 

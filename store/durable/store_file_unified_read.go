@@ -49,7 +49,7 @@ func (s *Snapshot) FilterEqCount(f *EqFilter) (FilterEqResult, error) {
 		return FilterEqResult{}, ErrClosed
 	}
 	if f == nil || f.inner == nil {
-		return FilterEqResult{}, fmt.Errorf("vibejson: nil unified filter")
+		return FilterEqResult{}, fmt.Errorf("vibedb: nil unified filter")
 	}
 	state := s.state
 	catalogBounds := storeio.GlobalTabletCatalogBounds{
@@ -161,7 +161,7 @@ func (s *Snapshot) AppendField(
 		return dst, false, ErrClosed
 	}
 	if p == nil {
-		return dst, false, fmt.Errorf("vibejson: nil field probe")
+		return dst, false, fmt.Errorf("vibedb: nil field probe")
 	}
 	state := s.state
 	if state.root.PrimaryRoot == (storeio.PageRef{}) ||

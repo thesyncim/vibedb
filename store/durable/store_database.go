@@ -3,12 +3,14 @@ package durable
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
-	"unicode/utf8"
+
+	"github.com/thesyncim/vibedb/internal/collectionname"
 )
 
 // Multi-collection durable reads.
@@ -54,31 +56,41 @@ import (
 // Collection.Snapshot is untouched.
 
 var (
-	// ErrCollectionName reports an empty, invalid UTF-8, separator-bearing, or
-	// otherwise unsafe collection name. A durable database maps names onto file
-	// names, so the rule is stricter than the heap catalog's: a name that could
-	// escape the database directory or collide with the directory's own
-	// bookkeeping is refused rather than sanitized.
-	ErrCollectionName = errors.New("vibejson: invalid durable collection name")
+	// ErrCollectionName reports an empty, invalid UTF-8, or overlong collection
+	// name. Valid logical names are encoded rather than treated as path elements.
+	ErrCollectionName = errors.New("vibedb: invalid durable collection name")
 	// ErrCollectionExists reports duplicate collection creation.
-	ErrCollectionExists = errors.New("vibejson: durable collection already exists")
+	ErrCollectionExists = errors.New("vibedb: durable collection already exists")
 	// ErrDatabaseClosed reports use of a closed Database.
-	ErrDatabaseClosed = errors.New("vibejson: durable database is closed")
+	ErrDatabaseClosed = errors.New("vibedb: durable database is closed")
+	// ErrUnsupportedDatabaseLayout reports a recognizable collection filename
+	// that is not the current reversible encoding. The project is unreleased:
+	// recreate the database instead of relying on a compatibility migration.
+	ErrUnsupportedDatabaseLayout = errors.New(
+		"vibedb: unsupported durable database filename layout",
+	)
 )
 
-// collectionFileSuffix is the extension a collection's file carries inside a
-// database directory. It exists so OpenDatabase can tell a collection from any
-// other file a user or an operating system left in the directory, and so the
-// mapping from a name to a path is total and reversible.
-const collectionFileSuffix = ".vjc"
+const (
+	collectionFilePrefix = collectionname.FilePrefix
+	collectionFileSuffix = collectionname.PrimarySuffix
+	// MaxCollectionNameBytes is the UTF-8 byte limit for a logical collection
+	// name. The encoded primary plus its .rjournal suffix fits a portable
+	// 255-byte filename component at this exact bound.
+	MaxCollectionNameBytes = collectionname.MaxNameBytes
+)
 
 // A Database is a catalog of durable collections that share one directory,
 // with a consistent multi-collection snapshot.
 //
-// Layout is one file per collection: the database is a directory and a
-// collection named "orders" is the file "orders.vjc" inside it. That choice is
-// deliberate and its reasoning belongs here, because the alternative — several
-// collections sharing one file — is the one a reader will wonder about.
+// Layout is one file per collection. Logical names are encoded as "c-" plus
+// lowercase hexadecimal UTF-8 bytes plus ".vjc"; "orders", for example, is
+// "c-6f7264657273.vjc". Its journal appends ".rjournal". This reversible,
+// case-insensitive-safe mapping avoids separators, reserved devices, Unicode
+// normalization, and trailing-dot/space aliases on every supported filesystem.
+// The one-file choice is deliberate and its reasoning belongs here, because
+// the alternative — several collections sharing one file — is the one a reader
+// will wonder about.
 //
 // A collection's file is a complete, self-describing store: two superblocks, a
 // double state root, its own generation stream, its own free set, and its own
@@ -98,12 +110,18 @@ const collectionFileSuffix = ".vjc"
 // atomicity, because a shared file would not have provided that either without
 // a cross-collection transaction the engine does not have.
 //
-// A Database owns the files it opened and closes them in Close.
+// A Database owns the files it opened and closes them in Close. OpenDatabase
+// stores a cleaned absolute directory with existing symlink components
+// resolved. That directory must not be renamed or replaced before Close:
+// recovery journals are intentionally paired by stable primary pathname.
 type Database struct {
-	dir string
+	dir      string
+	fileMode os.FileMode
 
 	mu          sync.RWMutex
 	closed      bool
+	closeDone   bool
+	closeErr    error
 	collections map[string]*databaseEntry
 
 	// order is the collection set in name order. snapshotOrder contains the
@@ -119,8 +137,16 @@ type Database struct {
 // caller's *os.File lifetime, so something above it must.
 type databaseEntry struct {
 	name       string
+	filename   string
 	collection *Collection
 	file       *os.File
+	// deleting keeps a successfully closed entry in the map until both its
+	// primary and journal removals have crossed their directory fences. It is
+	// hidden from reads/snapshots but makes a failed Drop retryable by name.
+	deleting       bool
+	primaryRemoved bool
+	closeDone      bool
+	closeErr       error
 }
 
 // DatabaseOptions configure a Database itself, as opposed to the collections in
@@ -148,13 +174,28 @@ type DatabaseOptions struct {
 // document or posting leaf is scanned. A directory holding K collections
 // costs K bounded recoveries and K open descriptors.
 //
-// Every collection in the directory must accept options.Options. Durable
+// Relative dir values are resolved once at entry, so a later process-wide
+// working-directory change cannot retarget CreateCollection, DropCollection,
+// or recovery-journal I/O. Every collection in the directory must accept
+// options.Options. Durable
 // collections validate frozen geometry and schema presence against those
 // options. Index catalogs may differ when Options.Indexes is nil; a non-nil
 // slice asserts the same catalog for every collection.
 func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	if dir == "" {
-		return nil, fmt.Errorf("vibejson: durable database requires a directory")
+		return nil, fmt.Errorf("vibedb: durable database requires a directory")
+	}
+	absoluteDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir = filepath.Clean(absoluteDir)
+	if options.FileMode&^os.ModePerm != 0 || options.DirMode&^os.ModePerm != 0 {
+		return nil, fmt.Errorf("vibedb: database file and directory modes may contain permission bits only")
+	}
+	fileMode := options.FileMode
+	if fileMode == 0 {
+		fileMode = 0o600
 	}
 	dirMode := options.DirMode
 	if dirMode == 0 {
@@ -163,41 +204,145 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}
-	items, err := os.ReadDir(dir)
+	// Freeze relative paths and existing directory symlink components before
+	// retaining any primary name. Collection.Open derives its journal from the
+	// descriptor name, so every owned descriptor must carry the same stable,
+	// absolute namespace for the lifetime of the database.
+	dir, err = filepath.EvalSymlinks(dir)
 	if err != nil {
 		return nil, err
 	}
-	d := &Database{dir: dir, collections: make(map[string]*databaseEntry)}
+	dir = filepath.Clean(dir)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	items, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDatabaseLayout(root, items); err != nil {
+		return nil, err
+	}
+	if err := removeOrphanRecoveryJournals(dir, items); err != nil {
+		return nil, err
+	}
+	d := &Database{
+		dir: dir, fileMode: fileMode,
+		collections: make(map[string]*databaseEntry),
+	}
 	for _, item := range items {
-		if item.IsDir() {
-			continue
-		}
 		base := item.Name()
-		if !strings.HasSuffix(base, collectionFileSuffix) {
+		name, encoded := collectionname.Decode(base)
+		if !encoded {
+			if strings.HasSuffix(base, collectionFileSuffix) {
+				_ = d.Close()
+				return nil, fmt.Errorf(
+					"%w: %q; recreate the unreleased database",
+					ErrUnsupportedDatabaseLayout, base,
+				)
+			}
 			continue
 		}
-		name := strings.TrimSuffix(base, collectionFileSuffix)
-		if !validCollectionName(name) {
-			// A file whose stem is not a legal collection name cannot have been
-			// written by CreateCollection, so it is not this database's. Opening
-			// it would take an exclusive writer lock on a stranger's file.
-			continue
-		}
-		file, openErr := os.OpenFile(filepath.Join(dir, base), os.O_RDWR, 0)
+		file, openErr := openCatalogPrimary(root, base)
 		if openErr != nil {
 			_ = d.Close()
-			return nil, openErr
+			return nil, fmt.Errorf("vibedb: durable collection %q: %w", name, openErr)
 		}
 		collection, openErr := Open(file, options.Options)
 		if openErr != nil {
 			_ = file.Close()
 			_ = d.Close()
-			return nil, fmt.Errorf("vibejson: durable collection %q: %w", name, openErr)
+			return nil, fmt.Errorf("vibedb: durable collection %q: %w", name, openErr)
 		}
-		d.collections[name] = &databaseEntry{name: name, collection: collection, file: file}
+		d.collections[name] = &databaseEntry{
+			name: name, filename: base, collection: collection, file: file,
+		}
 	}
 	d.reorder()
 	return d, nil
+}
+
+// validateDatabaseLayout runs before orphan cleanup so an aliased primary can
+// never make its live canonical journal look orphaned on a case-insensitive
+// filesystem. Recognizable primary and journal names are engine namespace, not
+// ignorable sidecars: every such entry must use exact lowercase spelling and
+// be a regular non-symlink file.
+func validateDatabaseLayout(root *os.Root, items []fs.DirEntry) error {
+	for _, item := range items {
+		base := item.Name()
+		if collectionname.PrimaryCaseAlias(base) ||
+			collectionname.JournalCaseAlias(base) {
+			return fmt.Errorf(
+				"%w: non-canonical case alias %q",
+				ErrUnsupportedDatabaseLayout, base,
+			)
+		}
+		_, primary := collectionname.Decode(base)
+		_, journal := collectionname.DecodeJournal(base)
+		if !primary && !journal {
+			if strings.HasSuffix(strings.ToLower(base), collectionFileSuffix) {
+				return fmt.Errorf(
+					"%w: %q; recreate the unreleased database",
+					ErrUnsupportedDatabaseLayout, base,
+				)
+			}
+			continue
+		}
+		info, err := root.Lstat(base)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf(
+				"%w: canonical database entry %q is not a regular non-symlink file",
+				ErrUnsupportedDatabaseLayout, base,
+			)
+		}
+	}
+	return nil
+}
+
+// openCatalogPrimary opens one already-discovered collection relative to the
+// directory descriptor held by root. Root confines every symlink traversal to
+// the database directory; the two Lstat checks additionally make symbolic
+// links and non-regular files invalid catalog entries rather than aliases for
+// another primary. Comparing both pathname observations with the opened
+// descriptor closes the replace-between-check-and-open race.
+func openCatalogPrimary(root *os.Root, base string) (*os.File, error) {
+	before, err := root.Lstat(base)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf(
+			"%w: canonical collection %q is not a regular non-symlink file",
+			ErrUnsupportedDatabaseLayout, base,
+		)
+	}
+	file, err := root.OpenFile(base, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	descriptor, descriptorErr := file.Stat()
+	after, pathErr := root.Lstat(base)
+	if descriptorErr != nil || pathErr != nil || !descriptor.Mode().IsRegular() ||
+		!after.Mode().IsRegular() || !os.SameFile(before, after) ||
+		!os.SameFile(descriptor, after) {
+		_ = file.Close()
+		if descriptorErr != nil {
+			return nil, descriptorErr
+		}
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		return nil, fmt.Errorf(
+			"%w: canonical collection %q changed while it was opened",
+			ErrUnsupportedDatabaseLayout, base,
+		)
+	}
+	return file, nil
 }
 
 // CreateCollection creates and catalogs an empty collection named name, backed
@@ -223,12 +368,13 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 	if _, exists := d.collections[name]; exists {
 		return nil, ErrCollectionExists
 	}
-	path := filepath.Join(d.dir, name+collectionFileSuffix)
+	filename, _ := collectionname.Encode(name)
+	path := filepath.Join(d.dir, filename)
 	// O_EXCL is what makes the catalog check above authoritative rather than
 	// advisory: a file left behind by a previous process is refused here rather
 	// than silently adopted and then rejected by Create's empty-file rule under
 	// a much less obvious message.
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, d.fileMode)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil, ErrCollectionExists
@@ -241,7 +387,10 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 		_ = os.Remove(path)
 		return nil, err
 	}
-	entry := &databaseEntry{name: strings.Clone(name), collection: collection, file: file}
+	entry := &databaseEntry{
+		name: strings.Clone(name), filename: filename,
+		collection: collection, file: file,
+	}
 	d.collections[entry.name] = entry
 	d.reorder()
 	return collection, nil
@@ -253,7 +402,14 @@ func (d *Database) Collection(name string) (*Collection, bool) {
 		return nil, false
 	}
 	d.mu.RLock()
+	if d.closed {
+		d.mu.RUnlock()
+		return nil, false
+	}
 	entry, ok := d.collections[name]
+	if ok && entry.deleting {
+		ok = false
+	}
 	d.mu.RUnlock()
 	if !ok {
 		return nil, false
@@ -261,9 +417,16 @@ func (d *Database) Collection(name string) (*Collection, bool) {
 	return entry.collection, true
 }
 
-// DropCollection removes name from the catalog, closes its collection, closes
-// the file the Database opened for it, and deletes that file. Dropping a name
-// that is not cataloged is not an error.
+// DropCollection closes name and removes its primary+journal pair. The primary
+// is removed and its parent directory synchronized before the orphan journal
+// is removed and synchronized; a crash can therefore leave an ignorable orphan
+// journal, never a live primary missing recovery state. Dropping a name that is
+// not cataloged is not an error.
+//
+// A cleanup failure leaves a hidden pending-delete entry that reserves name;
+// call DropCollection(name) again after repairing the filesystem. Collection,
+// Names, All, Len, and Snapshot exclude pending deletes, while
+// CreateCollection returns ErrCollectionExists until cleanup completes.
 //
 // This differs from [store.Database.DropCollection], which leaves existing
 // handles and snapshots valid, and the difference is not an oversight. A heap
@@ -281,24 +444,47 @@ func (d *Database) DropCollection(name string) error {
 		return ErrDatabaseClosed
 	}
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed {
-		d.mu.Unlock()
 		return ErrDatabaseClosed
 	}
 	entry, ok := d.collections[name]
 	if !ok {
-		d.mu.Unlock()
 		return nil
+	}
+	if !entry.deleting {
+		entry.deleting = true
+		d.reorder()
+	}
+	closeErr := entry.close()
+	if !entry.closeDone {
+		return closeErr
+	}
+	primary := filepath.Join(d.dir, entry.filename)
+	if !entry.primaryRemoved {
+		if err := os.Remove(primary); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.Join(closeErr, err)
+		}
+		// Persist logical absence before touching the recovery journal. Reversing
+		// this order creates a crash window with a live primary whose named journal
+		// is missing, which Open must fail closed.
+		if err := syncRecoveryJournalParent(primary); err != nil {
+			return errors.Join(closeErr,
+				fmt.Errorf("vibedb: persist dropped collection: %w", err))
+		}
+		entry.primaryRemoved = true
+	}
+	journal := RecoveryJournalPath(primary)
+	if err := os.Remove(journal); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.Join(closeErr, err)
+	}
+	if err := syncRecoveryJournalParent(journal); err != nil {
+		return errors.Join(closeErr,
+			fmt.Errorf("vibedb: persist dropped collection journal: %w", err))
 	}
 	delete(d.collections, name)
 	d.reorder()
-	d.mu.Unlock()
-
-	err := entry.close()
-	if removeErr := os.Remove(filepath.Join(d.dir, name+collectionFileSuffix)); err == nil {
-		err = removeErr
-	}
-	return err
+	return closeErr
 }
 
 // Names appends the cataloged collection names to dst in name order.
@@ -350,40 +536,118 @@ func (d *Database) Dir() string {
 // Close closes every cataloged collection and every file the Database opened,
 // and marks the Database unusable. Active snapshots must be closed first.
 //
-// It reports the first error and still attempts every remaining close, because
-// leaving descriptors and writer locks held after a failed shutdown is worse
-// than losing the second error message.
+// It joins completed entries' cached terminal errors. A transient child-close
+// error is joined into that attempt's result while ownership is retained; call
+// Close again after releasing the blocking reader or repairing the writer
+// unlock. Once every entry completes, repeated calls return the exact cached
+// terminal result.
 func (d *Database) Close() error {
 	if d == nil {
 		return nil
 	}
 	d.mu.Lock()
-	if d.closed {
-		d.mu.Unlock()
-		return nil
+	defer d.mu.Unlock()
+	if d.closeDone {
+		return d.closeErr
 	}
-	d.closed = true
-	entries := d.order
-	d.order = nil
-	d.snapshotOrder = nil
-	d.collections = nil
-	d.mu.Unlock()
-
-	var first error
-	for _, entry := range entries {
-		if err := entry.close(); err != nil && first == nil {
-			first = err
+	if !d.closed {
+		d.closed = true
+		// Admission and catalog visibility end at the first attempt, but entry
+		// ownership does not. Unfinished entries remain in collections so a
+		// later Close can resume their low-level teardown state machine.
+		d.order = nil
+		d.snapshotOrder = nil
+	}
+	var retryable error
+	for _, entry := range d.collections {
+		err := entry.close()
+		if !entry.closeDone {
+			retryable = errors.Join(retryable, err)
+			continue
 		}
+		d.rememberCloseError(err)
 	}
-	return first
+	if retryable != nil {
+		return errors.Join(d.closeErr, retryable)
+	}
+	d.collections = nil
+	d.closeDone = true
+	return d.closeErr
+}
+
+// CloseCompleted reports whether Close has released every collection engine,
+// owner descriptor, and writer lock. The first Close attempt rejects new
+// catalog operations immediately; this remains false while any child teardown
+// is retryable.
+func (d *Database) CloseCompleted() bool {
+	if d == nil {
+		return true
+	}
+	d.mu.RLock()
+	done := d.closeDone
+	d.mu.RUnlock()
+	return done
+}
+
+func (d *Database) rememberCloseError(err error) {
+	if err == nil || errors.Is(d.closeErr, err) {
+		return
+	}
+	if d.closeErr == nil {
+		d.closeErr = err
+		return
+	}
+	d.closeErr = errors.Join(d.closeErr, err)
 }
 
 func (e *databaseEntry) close() error {
-	err := e.collection.Close()
-	if fileErr := e.file.Close(); err == nil {
-		err = fileErr
+	if e.closeDone {
+		return e.closeErr
 	}
-	return err
+	collectionErr := e.collection.Close()
+	if !e.collection.CloseCompleted() {
+		return collectionErr
+	}
+	// os.File.Close consumes the descriptor even when it reports an error. Once
+	// the engine has completed teardown there is no useful or safe retry of this
+	// descriptor close, so cache the joined terminal result and let catalog Drop
+	// continue removing the paired namespace.
+	e.closeErr = errors.Join(collectionErr, e.file.Close())
+	e.closeDone = true
+	return e.closeErr
+}
+
+// removeOrphanRecoveryJournals completes the only crash residue permitted by
+// primary-first Drop: a canonical journal whose encoded primary is absent. It
+// never scans collection contents and never touches arbitrary *.rjournal
+// files. All removals share one parent-directory durability fence.
+func removeOrphanRecoveryJournals(dir string, items []os.DirEntry) error {
+	present := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		present[item.Name()] = struct{}{}
+	}
+	var removedPath string
+	for _, item := range items {
+		base := item.Name()
+		if _, canonical := collectionname.DecodeJournal(base); !canonical {
+			continue
+		}
+		primary := strings.TrimSuffix(base, collectionname.JournalSuffix)
+		if _, exists := present[primary]; exists {
+			continue
+		}
+		path := filepath.Join(dir, base)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("vibedb: remove orphan recovery journal %q: %w", base, err)
+		}
+		removedPath = path
+	}
+	if removedPath != "" {
+		if err := syncRecoveryJournalParent(removedPath); err != nil {
+			return fmt.Errorf("vibedb: persist orphan recovery-journal cleanup: %w", err)
+		}
+	}
+	return nil
 }
 
 // reorder rebuilds the name-ordered catalog view and global snapshot-gate
@@ -392,6 +656,9 @@ func (d *Database) reorder() {
 	d.order = d.order[:0]
 	d.snapshotOrder = d.snapshotOrder[:0]
 	for _, entry := range d.collections {
+		if entry.deleting {
+			continue
+		}
 		d.order = append(d.order, entry)
 		d.snapshotOrder = append(d.snapshotOrder, entry.collection)
 	}
@@ -401,25 +668,8 @@ func (d *Database) reorder() {
 	sortCollectionSnapshotOrder(d.snapshotOrder)
 }
 
-// validCollectionName reports whether name may be a durable collection.
-//
-// It is stricter than the heap catalog's rule because a durable name becomes a
-// path element. Rejecting separators, the two relative directory names, and any
-// name already carrying the collection suffix is what makes the name-to-path
-// mapping injective and confined to the database directory; sanitizing instead
-// would make two distinct names collide on one file.
+// validCollectionName reports whether name has one portable reversible
+// filename encoding. Logical names never become path elements directly.
 func validCollectionName(name string) bool {
-	if name == "" || !utf8.ValidString(name) {
-		return false
-	}
-	if name == "." || name == ".." {
-		return false
-	}
-	if strings.HasSuffix(name, collectionFileSuffix) {
-		return false
-	}
-	return !strings.ContainsRune(name, 0) &&
-		!strings.ContainsRune(name, '/') &&
-		!strings.ContainsRune(name, '\\') &&
-		!strings.ContainsRune(name, os.PathSeparator)
+	return collectionname.Valid(name)
 }

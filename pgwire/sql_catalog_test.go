@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/conformance"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -664,6 +665,11 @@ func TestShutdownCancellationSurvivesACommandWindowOpening(t *testing.T) {
 }
 
 func TestSQLCatalogCancellationRollsBackAndDoesNotPoisonNextStatement(t *testing.T) {
+	contract, ok := conformance.CancellationFor(conformance.PGWire)
+	if !ok || contract.Error != "SQLSTATE 57014" ||
+		!contract.NoPartialWrite || !contract.Reusable {
+		t.Fatalf("pgwire cancellation contract = %+v, %v", contract, ok)
+	}
 	c, server := connectSQLCatalogWithServer(t)
 	c.query(`CREATE TABLE docs (id STRING PRIMARY KEY, name STRING NOT NULL)`)
 
@@ -723,6 +729,45 @@ func TestSQLCatalogCancellationRollsBackAndDoesNotPoisonNextStatement(t *testing
 	if got := commandTagOf(t, c.query(`
 		INSERT INTO docs (id, name) VALUES ('after', 'works')`)); got != "INSERT 0 1" {
 		t.Fatalf("statement after cancellation tag = %q, want INSERT 0 1", got)
+	}
+
+	// An explicit transaction has a different cleanup boundary: cancellation
+	// moves it to failed state, only ROLLBACK is accepted, and that rollback
+	// must discard writes staged before the canceled command.
+	assertReadyStatus(t, c.query(`BEGIN`), statusInTx)
+	assertReadyStatus(t, c.query(`
+		INSERT INTO docs (id, name) VALUES ('tx-canceled', 'must roll back')`),
+		statusInTx)
+	batch.Reset()
+	for range maxSimpleStatements {
+		batch.WriteString(`SELECT version();`)
+	}
+	c.send(msgQuery, append([]byte(batch.String()), 0))
+	c.drainWrites()
+	deadline = time.Now().Add(time.Second)
+	for {
+		sess.cancelMu.Lock()
+		active := sess.cancelActive
+		sess.cancelMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("explicit transaction did not enter its cancellation window")
+		}
+		runtime.Gosched()
+	}
+	server.cancelRequest(c.pid, c.secret)
+	msgs = c.until(msgReadyForQuery)
+	expectError(t, msgs, sqlstateQueryCanceled)
+	assertReadyStatus(t, msgs, statusFailedT)
+	failed := c.query(`SELECT 1`)
+	expectError(t, failed, sqlstateFailedTransaction)
+	assertReadyStatus(t, failed, statusFailedT)
+	assertReadyStatus(t, c.query(`ROLLBACK`), statusIdle)
+	if rows := rowsOf(t, c.query(
+		`SELECT id FROM docs WHERE id = 'tx-canceled'`)); len(rows) != 0 {
+		t.Fatalf("rollback after explicit cancellation retained staged row: %q", rows)
 	}
 }
 

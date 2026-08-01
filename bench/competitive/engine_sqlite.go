@@ -47,7 +47,7 @@ func newSQLite(cfg Config) (Engine, error) {
 		// on darwin, and quoting it as if it were would invalidate the whole
 		// write comparison.
 		//
-		// vibejson's DurabilitySync issues F_FULLFSYNC on darwin, which asks
+		// VibeDB's DurabilitySync issues F_FULLFSYNC on darwin, which asks
 		// the drive to flush its volatile write cache. modernc.org/sqlite is a
 		// translation of SQLite's C source, and SQLite's escape hatch for the
 		// same guarantee is PRAGMA fullfsync; its default is 0.
@@ -74,7 +74,7 @@ func newSQLite(cfg Config) (Engine, error) {
 	db.SetMaxIdleConns(1)
 
 	// WITHOUT ROWID makes the primary key the clustered B-tree, which is the
-	// same physical shape bbolt and vibejson use, rather than a rowid heap
+	// same physical shape bbolt and VibeDB use, rather than a rowid heap
 	// plus a separate unique index over the key.
 	//
 	// The generated column is always declared so the table shape is identical
@@ -149,7 +149,7 @@ func (s *sqliteEngine) DurabilityMode() DurabilityMode { return s.cfg.Durability
 func (s *sqliteEngine) Durability() string {
 	switch s.cfg.Durability {
 	case DurabilityPowerSafe:
-		return "WAL + synchronous=FULL + fullfsync=1 (F_FULLFSYNC per commit on darwin, matching vibejson DurabilitySync)"
+		return "WAL + synchronous=FULL + fullfsync=1 (F_FULLFSYNC per commit on darwin, matching VibeDB DurabilitySync)"
 	case DurabilityOrdinarySync:
 		return "WAL + synchronous=FULL + fullfsync=0 (xSync per commit; does not request F_FULLFSYNC on darwin)"
 	default:
@@ -158,9 +158,9 @@ func (s *sqliteEngine) Durability() string {
 }
 
 func (s *sqliteEngine) Tuning() string {
-	return "modernc.org/sqlite, the pure-Go translation (no cgo). journal_mode=WAL; page_size=4096 to match vibejson durable's default page; " +
+	return "modernc.org/sqlite, the pure-Go translation (no cgo). journal_mode=WAL; page_size=4096 to match VibeDB's default page; " +
 		"cache_size=-65536 i.e. a 64 MiB page cache, matching every other engine; temp_store=MEMORY; " +
-		"table is WITHOUT ROWID so the primary key is the clustered B-tree, the same physical shape as bbolt and vibejson; " +
+		"table is WITHOUT ROWID so the primary key is the clustered B-tree, the same physical shape as bbolt and VibeDB; " +
 		"bulk load is one transaction over one prepared INSERT; the index configuration adds an index over a VIRTUAL " +
 		"json_extract generated column; scans read through sql.RawBytes rather than []byte, which avoids a " +
 		"database/sql copy per row that no other engine here was charged, reverted by Config.Untuned and measured " +

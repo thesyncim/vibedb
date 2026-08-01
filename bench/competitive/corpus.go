@@ -1,10 +1,10 @@
 // Package competitive holds a cross-engine benchmark harness that measures
-// vibejson's store and store/durable against real embedded key/value and SQL
+// VibeDB's store and store/durable against real embedded key/value and SQL
 // engines on one shared JSON corpus.
 //
-// It lives in its own Go module on purpose. The root vibejson module has no
+// It lives in its own Go module on purpose. The root VibeDB module has no
 // third-party dependencies and that property is load-bearing; every competitor
-// dependency is confined to bench/competitive/go.mod, which replaces vibejson
+// dependency is confined to bench/competitive/go.mod, which replaces VibeDB
 // with the parent directory.
 package competitive
 
@@ -30,7 +30,7 @@ type Doc struct {
 // oracles use this outside timed regions so canonicalization is never charged
 // to, or hidden inside, a benchmarked read.
 func AppendExpectedStoredJSON(dst []byte, engineName string, src []byte) ([]byte, error) {
-	if engineName == "vibejson-durable" {
+	if engineName == "vibedb" {
 		return vibejson.AppendCanonicalize(dst, src)
 	}
 	return append(dst, src...), nil
@@ -266,11 +266,33 @@ func randomLower(rng *rand.Rand, n int) string {
 	return string(out)
 }
 
-// CorpusRedundancy reports the corpus's total JSON bytes and what gzip -9
-// compresses the concatenation to. It is the one honest, engine-independent
-// measure of how much of a storage engine's apparent compactness on this corpus
-// is the corpus rather than the engine, and it belongs beside every disk figure
-// this harness publishes.
+// CorpusByteCounts separates the bytes applications ask an engine to store
+// from the engine's own framing. LogicalBytes is key plus JSON bytes exactly
+// once per record; it excludes indexes, page headers, journals, allocators, and
+// filesystem rounding, all of which belong in the physical footprint columns.
+type CorpusByteCounts struct {
+	KeyBytes     int
+	JSONBytes    int
+	LogicalBytes int
+}
+
+// CorpusBytes returns the exact key, JSON-document, and key-inclusive logical
+// byte counts for docs.
+func CorpusBytes(docs []Doc) CorpusByteCounts {
+	var counts CorpusByteCounts
+	for i := range docs {
+		counts.KeyBytes += len(docs[i].Key)
+		counts.JSONBytes += len(docs[i].JSON)
+	}
+	counts.LogicalBytes = counts.KeyBytes + counts.JSONBytes
+	return counts
+}
+
+// CorpusRedundancy reports JSON-document bytes only and what gzip -9
+// compresses their concatenation to. Keys are deliberately excluded from this
+// entropy control and are reported separately by CorpusBytes. Together they
+// distinguish corpus redundancy from the key-inclusive logical payload used
+// as the denominator for physical-footprint ratios.
 func CorpusRedundancy(docs []Doc) (total, gzipped int, err error) {
 	var out bytes.Buffer
 	w, err := gzip.NewWriterLevel(&out, gzip.BestCompression)

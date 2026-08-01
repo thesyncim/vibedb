@@ -187,7 +187,7 @@ func joinFileEffectiveRatio(ratio int) int {
 var errJoinInnerStop = errors.New("query: join inner scan stopped")
 
 // A fileJoinSide is one join clause's durable inner-side storage: the snapshot
-// it reads, the index workspace its candidate probe reuses, and the batch
+// it reads, the index session its candidate probe reuses, and the batch
 // buffers the scan fills.
 //
 // It lives on the joinBinding, so it follows the same retained-capacity rule as
@@ -199,11 +199,11 @@ type fileJoinSide struct {
 	// discriminator: a binding whose inner side is durable has it non-nil, and
 	// that is what routes matches to the durable probe.
 	snapshot *durable.Snapshot
-	// index is the persistent-index planning workspace for the inner side's own
+	// index is the persistent-index planning session for the inner side's own
 	// candidate probe. It is per clause rather than shared with the driving
-	// side's because the two probe different collections, and a workspace
-	// carries the last probe's stats.
-	index durable.IndexWorkspace
+	// side because the two bind different snapshots and retain independent
+	// metrics and scratch high-water marks.
+	index durable.IndexSession
 
 	// docs is the batch Segment the inner filter runs over, and data/ends the
 	// document bytes accumulated for it. Appending into one buffer and
@@ -419,6 +419,7 @@ func durableBatchRowFixedBytes(p *plan, rows int) int64 {
 // would pin an arena the next execution is about to overwrite in place.
 func (f *fileJoinSide) reset() {
 	f.snapshot = nil
+	f.index.Reset(nil)
 	f.data = f.data[:0]
 	f.ends = f.ends[:0]
 	clear(f.keys)

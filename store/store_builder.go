@@ -15,10 +15,10 @@ var (
 	// ErrDuplicateKey reports that Builder.Append received a key it
 	// already owns. Bulk construction requires unique keys so every document is
 	// written exactly once into its final micro-page.
-	ErrDuplicateKey = errors.New("vibejson: duplicate Builder key")
+	ErrDuplicateKey = errors.New("vibedb: duplicate Builder key")
 	// ErrBuilderClosed reports use after Build transferred the builder's
 	// immutable graph into a collection.
-	ErrBuilderClosed = errors.New("vibejson: Builder is closed")
+	ErrBuilderClosed = errors.New("vibedb: Builder is closed")
 )
 
 // Builder constructs a keyed collection without publishing and path-copying
@@ -434,7 +434,7 @@ func (b *Builder) compactBaseKeys() (*storeMappedKeys, error) {
 	}
 	base, err := newStoreOwnedKeys(b.count, b.keyBytes, b.chunks.Count >= storeMappedLocationMaxChunk, b.options.ChunkDocuments)
 	if err != nil {
-		return nil, fmt.Errorf("vibejson: compact Builder keys: %w", err)
+		return nil, fmt.Errorf("vibedb: compact Builder keys: %w", err)
 	}
 	position := 0
 	refBase := uint64(0)
@@ -462,7 +462,7 @@ func (b *Builder) compactBaseKeys() (*storeMappedKeys, error) {
 	})
 	if !valid || position != len(base.source) || refBase != uint64(b.count) {
 		base.release()
-		return nil, errors.New("vibejson: Builder compact key invariant")
+		return nil, errors.New("vibedb: Builder compact key invariant")
 	}
 	refBase = 0
 	b.chunks.Each(func(_ uint32, chunk *Chunk) bool {
@@ -539,7 +539,7 @@ func (t *storeBuilderKeyTable) reserve(b *Builder, entries int) {
 		row := (packed & storeBuilderKeyOrdinalMask) - 1
 		key, ok := b.keyAt(row)
 		if !ok {
-			panic("vibejson: Builder key table ordinal invariant")
+			panic("vibedb: Builder key table ordinal invariant")
 		}
 		t.insert(maphash.String(b.seed, key), row)
 	}

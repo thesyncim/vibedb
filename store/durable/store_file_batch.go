@@ -7,12 +7,12 @@ import (
 // ErrBatchTooLarge reports a batch whose mutations do not fit the reservation
 // Options.MaxBatchDocuments sized. Nothing was published; the caller may retry
 // with fewer mutations.
-var ErrBatchTooLarge = errors.New("vibejson: collection write batch exceeds configured bound")
+var ErrBatchTooLarge = errors.New("vibedb: collection write batch exceeds configured bound")
 
 // ErrBatchClosed reports use of a WriteBatch after the Update that owns it
 // returned. Batches are pooled per collection, so a retained one would write
 // into a later caller's mutations.
-var ErrBatchClosed = errors.New("vibejson: collection write batch is no longer active")
+var ErrBatchClosed = errors.New("vibedb: collection write batch is no longer active")
 
 // WriteBatch accumulates the mutations one Update applies as one logical atomic
 // publication. Most batches need one generation. When the final rows cannot fit
@@ -146,7 +146,7 @@ func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
 		return ErrBatchClosed
 	}
 	if _, exists := b.position[string(key)]; exists {
-		return errors.New("vibejson: duplicate key in recovery batch")
+		return errors.New("vibedb: duplicate key in recovery batch")
 	}
 	entry := writeBatchEntry{
 		keyOffset: len(b.keys), keyLength: len(key),
@@ -205,7 +205,7 @@ func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 		return ErrClosed
 	}
 	if fn == nil {
-		return errors.New("vibejson: collection Update requires a function")
+		return errors.New("vibedb: collection Update requires a function")
 	}
 	// Every collection is an ordered primary graph, so a batch is always applied
 	// as one routed transaction over the graph (see updatePrimaryBatch).

@@ -20,7 +20,7 @@ import (
 // sync-journal — all take the deferred canonical path, where one generation
 // carries the whole group.
 var ErrPrimaryBatchUnsupportedLane = errors.New(
-	"vibejson: ordered primary Update requires a buffered-visible or sync-journal lane",
+	"vibedb: ordered primary Update requires a buffered-visible or sync-journal lane",
 )
 
 // primaryBatchMutation is one resolved key in a primary Update: its resident

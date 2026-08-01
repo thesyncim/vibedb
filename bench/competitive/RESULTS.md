@@ -155,9 +155,11 @@ in both cardinalities but is not part of the online performance claim.
 ## Bulk footprint
 
 The low- and high-cardinality corpora have identical shape and length:
-24,881,153 raw bytes (23.729 MiB) for 100,000 documents. Their gzip-9 sizes are
-1.837 MiB and 8.041 MiB, respectively. Cells below are one isolated run and
-include vibedb's fully preallocated paired recovery journal. They are
+24,881,153 JSON bytes (23.729 MiB) plus 1,200,000 key bytes (1.144 MiB), or
+26,081,153 key-inclusive logical bytes (24.873 MiB), for 100,000 documents.
+Their JSON-only gzip-9 sizes are 1.837 MiB and 8.041 MiB, respectively. Cells
+below are one isolated run and include vibedb's fully preallocated paired
+recovery journal. They are
 **apparent / allocated MiB**.
 
 ### Intrinsic representation

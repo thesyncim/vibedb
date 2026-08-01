@@ -1,14 +1,64 @@
 package durable
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thesyncim/vibedb/internal/collectionname"
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
+
+func testCollectionFilename(t testing.TB, name string) string {
+	t.Helper()
+	filename, ok := collectionname.Encode(name)
+	if !ok {
+		t.Fatalf("invalid test collection name %q", name)
+	}
+	return filename
+}
+
+func TestDurableDatabaseAppliesConfiguredCollectionFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission bits")
+	}
+	dir := t.TempDir()
+	db, err := OpenDatabase(dir, DatabaseOptions{
+		Options: testDatabaseOptions(), FileMode: 0o700,
+	})
+	if err != nil {
+		t.Fatalf("OpenDatabase: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.CreateCollection("private", testDatabaseOptions()); err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	filename := testCollectionFilename(t, "private")
+	info, err := os.Stat(filepath.Join(dir, filename))
+	if err != nil {
+		t.Fatalf("Stat collection: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("collection mode = %#o, want %#o", got, os.FileMode(0o700))
+	}
+	journalInfo, err := os.Stat(filepath.Join(
+		dir, filename+recoveryJournalSuffix,
+	))
+	if err != nil {
+		t.Fatalf("Stat recovery journal: %v", err)
+	}
+	if got := journalInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("recovery journal mode = %#o, want %#o", got, os.FileMode(0o700))
+	}
+}
 
 // testDatabaseOptions widen the single-collection test geometry where a
 // multi-collection capture needs it: one capture holds a lease on every
@@ -361,15 +411,21 @@ func TestDurableDatabaseCatalogLifecycle(t *testing.T) {
 	if _, err := db.CreateCollection("orders", testDatabaseOptions()); err != ErrCollectionExists {
 		t.Fatalf("duplicate create: %v want %v", err, ErrCollectionExists)
 	}
-	path := filepath.Join(db.Dir(), "orders"+collectionFileSuffix)
+	path := filepath.Join(db.Dir(), testCollectionFilename(t, "orders"))
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("collection file missing: %v", err)
+	}
+	journalPath := RecoveryJournalPath(path)
+	if _, err := os.Stat(journalPath); err != nil {
+		t.Fatalf("collection journal missing: %v", err)
 	}
 	if err := db.DropCollection("orders"); err != nil {
 		t.Fatalf("DropCollection: %v", err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("dropped collection file survives: %v", err)
+	for _, removed := range []string{path, journalPath} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Fatalf("dropped collection file %q survives: %v", removed, err)
+		}
 	}
 	if _, ok := db.Collection("orders"); ok {
 		t.Fatal("a dropped name still resolves")
@@ -377,22 +433,536 @@ func TestDurableDatabaseCatalogLifecycle(t *testing.T) {
 	if err := db.DropCollection("orders"); err != nil {
 		t.Fatalf("dropping an absent name: %v", err)
 	}
+	reopened, err := OpenDatabase(db.Dir(), DatabaseOptions{Options: testDatabaseOptions()})
+	if err != nil {
+		t.Fatalf("reopen after drop: %v", err)
+	}
+	if got := reopened.Names(nil); len(got) != 0 {
+		t.Fatalf("reopen after drop found %q", got)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopen after drop: %v", err)
+	}
 	if _, err := db.CreateCollection("orders", testDatabaseOptions()); err != nil {
 		t.Fatalf("re-create after drop: %v", err)
 	}
+	for _, recreated := range []string{path, journalPath} {
+		if _, err := os.Stat(recreated); err != nil {
+			t.Fatalf("recreated collection file %q missing: %v", recreated, err)
+		}
+	}
 }
 
-// Given names that would escape the database directory or collide with its
-// own file convention, when they are used, then creation is refused.
-func TestDurableDatabaseRejectsUnsafeCollectionNames(t *testing.T) {
+func TestDurableDatabaseDropHidesNameWhileSnapshotDelaysClose(t *testing.T) {
+	db := newTestDatabase(t, "orders")
+	orders, _ := db.Collection("orders")
+	mustPut(t, orders, "1", `{"ok":true}`)
+	snapshot, err := orders.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := db.DropCollection("orders")
+	if !errors.Is(first, storeio.ErrLeasesActive) {
+		_ = snapshot.Close()
+		t.Fatalf("DropCollection with active snapshot = %v, want %v",
+			first, storeio.ErrLeasesActive)
+	}
+	if _, ok := db.Collection("orders"); ok || db.Len() != 0 || len(db.Names(nil)) != 0 {
+		_ = snapshot.Close()
+		t.Fatalf("pending delete remained visible: collection %v len %d names %q",
+			ok, db.Len(), db.Names(nil))
+	}
+	cut, err := db.Snapshot()
+	if err != nil {
+		_ = snapshot.Close()
+		t.Fatal(err)
+	}
+	if cut.Len() != 0 {
+		_ = cut.Close()
+		_ = snapshot.Close()
+		t.Fatalf("database snapshot retained pending delete: %d collections", cut.Len())
+	}
+	if err := cut.Close(); err != nil {
+		_ = snapshot.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.CreateCollection("orders", testDatabaseOptions()); !errors.Is(err, ErrCollectionExists) {
+		_ = snapshot.Close()
+		t.Fatalf("pending-delete name reuse = %v, want %v", err, ErrCollectionExists)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DropCollection("orders"); err != nil {
+		t.Fatalf("DropCollection retry: %v", err)
+	}
+	if _, err := db.CreateCollection("orders", testDatabaseOptions()); err != nil {
+		t.Fatalf("name was not reusable after completed drop: %v", err)
+	}
+}
+
+func TestDurableDatabaseDropRemainsRetryableDuringJournalCleanup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not unlink an open recovery journal")
+	}
+	db := newTestDatabase(t, "orders")
+	primary := filepath.Join(db.Dir(), testCollectionFilename(t, "orders"))
+	journal := RecoveryJournalPath(primary)
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(journal, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DropCollection("orders"); err == nil {
+		t.Fatal("DropCollection succeeded with non-removable journal path")
+	}
+	if _, ok := db.Collection("orders"); ok || db.Len() != 0 {
+		t.Fatal("pending-delete collection remained visible")
+	}
+	if _, err := db.CreateCollection("orders", testDatabaseOptions()); err != ErrCollectionExists {
+		t.Fatalf("create over pending delete = %v, want ErrCollectionExists", err)
+	}
+	if _, err := os.Stat(primary); !os.IsNotExist(err) {
+		t.Fatalf("primary was not durably removed before journal cleanup: %v", err)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DropCollection("orders"); err != nil {
+		t.Fatalf("retry DropCollection: %v", err)
+	}
+	if _, err := db.CreateCollection("orders", testDatabaseOptions()); err != nil {
+		t.Fatalf("create after completed retry: %v", err)
+	}
+}
+
+func TestDurableDatabaseDropCompletesAfterTerminalPersistenceError(t *testing.T) {
+	getFault, restore := installJournalFaultSeam(t)
+	defer restore()
+	dir := t.TempDir()
+	options := testDatabaseOptions()
+	db, err := OpenDatabase(dir, DatabaseOptions{Options: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	collection, err := db.CreateCollection("orders", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collection.Put([]byte("baseline"), []byte(`{"n":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	fault := getFault()
+	if fault == nil {
+		t.Fatal("journal fault seam was not installed")
+	}
+	fault.Program(storeio.JournalFaultPlan{
+		Phase:       storeio.JournalFaultENOSPCAppend,
+		AppendIndex: fault.Appends(),
+	})
+	if _, err := collection.Put([]byte("rejected"), []byte(`{"n":2}`)); err == nil {
+		t.Fatal("faulted mutation succeeded")
+	}
+	persistErr := collection.PersistenceError()
+	if persistErr == nil || !fault.Faulted() {
+		t.Fatalf("terminal persistence state = %v, fired=%v", persistErr, fault.Faulted())
+	}
+	primary := filepath.Join(dir, testCollectionFilename(t, "orders"))
+	journal := RecoveryJournalPath(primary)
+	dropErr := db.DropCollection("orders")
+	if !errors.Is(dropErr, persistErr) {
+		t.Fatalf("DropCollection error = %v, want terminal %v", dropErr, persistErr)
+	}
+	if !collection.CloseCompleted() {
+		t.Fatal("terminal DropCollection left engine cleanup incomplete")
+	}
+	if _, ok := db.Collection("orders"); ok || db.Len() != 0 {
+		t.Fatal("terminal DropCollection left the name cataloged")
+	}
+	for _, removed := range []string{primary, journal} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Fatalf("terminal DropCollection retained %q: %v", removed, err)
+		}
+	}
+	if err := db.DropCollection("orders"); err != nil {
+		t.Fatalf("retry after completed terminal DropCollection: %v", err)
+	}
+	if _, err := db.CreateCollection("orders", options); err != nil {
+		t.Fatalf("recreate after terminal DropCollection: %v", err)
+	}
+}
+
+func TestDurableDatabaseOpenRemovesCanonicalOrphanJournals(t *testing.T) {
+	dir := t.TempDir()
+	options := testDatabaseOptions()
+	db, err := OpenDatabase(dir, DatabaseOptions{Options: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateCollection("orders", options); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	primary := filepath.Join(dir, testCollectionFilename(t, "orders"))
+	journal := RecoveryJournalPath(primary)
+	if err := os.Remove(primary); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(dir, "application.rjournal")
+	if err := os.WriteFile(unrelated, []byte("owned elsewhere"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenDatabase(dir, DatabaseOptions{Options: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Len() != 0 {
+		t.Fatalf("catalog length after orphan cleanup = %d, want 0", reopened.Len())
+	}
+	if _, err := os.Stat(journal); !os.IsNotExist(err) {
+		t.Fatalf("canonical orphan journal survived startup: %v", err)
+	}
+	if contents, err := os.ReadFile(unrelated); err != nil || string(contents) != "owned elsewhere" {
+		t.Fatalf("unrelated sidecar changed = %q, %v", contents, err)
+	}
+}
+
+func TestDurableDatabaseOpenFailsWhenOrphanJournalCleanupFails(t *testing.T) {
+	dir := t.TempDir()
+	filename := testCollectionFilename(t, "orders") + collectionname.JournalSuffix
+	orphan := filepath.Join(dir, filename)
+	if err := os.Mkdir(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, "blocker"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()}); err == nil {
+		t.Fatal("OpenDatabase accepted an orphan journal it could not remove")
+	}
+}
+
+func TestDurableDatabaseCloseRetainsOwnershipUntilSnapshotRelease(t *testing.T) {
+	db := newTestDatabase(t, "orders")
+	dir := db.Dir()
+	collection, _ := db.Collection("orders")
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := db.collections["orders"]
+	first := db.Close()
+	if !errors.Is(first, storeio.ErrLeasesActive) {
+		_ = snapshot.Close()
+		t.Fatalf("first Database.Close = %v, want %v", first, storeio.ErrLeasesActive)
+	}
+	if db.CloseCompleted() || !db.closed || db.collections == nil || entry.closeDone {
+		_ = snapshot.Close()
+		t.Fatalf("incomplete database close = completed %v closed %v collections nil %v entry done %v",
+			db.CloseCompleted(), db.closed, db.collections == nil, entry.closeDone)
+	}
+	if _, err := entry.file.Stat(); err != nil {
+		_ = snapshot.Close()
+		t.Fatalf("owner descriptor closed while engine teardown was retryable: %v", err)
+	}
+	if _, ok := db.Collection("orders"); ok {
+		_ = snapshot.Close()
+		t.Fatal("closing database still admitted catalog lookup")
+	}
+	if _, err := db.CreateCollection("later", testDatabaseOptions()); !errors.Is(err, ErrDatabaseClosed) {
+		_ = snapshot.Close()
+		t.Fatalf("create during closing = %v, want %v", err, ErrDatabaseClosed)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := db.Close()
+	if second != nil {
+		t.Fatalf("retry Database.Close = %v", second)
+	}
+	if !db.CloseCompleted() || db.collections != nil || !entry.closeDone {
+		t.Fatalf("completed database close = completed %v collections nil %v entry done %v",
+			db.CloseCompleted(), db.collections == nil, entry.closeDone)
+	}
+	if _, err := entry.file.Stat(); err == nil {
+		t.Fatal("owner descriptor remained open after completed teardown")
+	}
+	if repeated := db.Close(); repeated != second {
+		t.Fatalf("repeated Database.Close = %v, want cached exact %v", repeated, second)
+	}
+	reopened, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+	if err != nil {
+		t.Fatalf("reopen after retry-completed close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableDatabaseConcurrentCloseConvergesAfterRetry(t *testing.T) {
+	db := newTestDatabase(t, "orders")
+	collection, _ := db.Collection("orders")
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 8
+	run := func() []error {
+		results := make([]error, callers)
+		var wait sync.WaitGroup
+		for i := range results {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				results[i] = db.Close()
+			}()
+		}
+		wait.Wait()
+		return results
+	}
+	for i, err := range run() {
+		if !errors.Is(err, storeio.ErrLeasesActive) {
+			_ = snapshot.Close()
+			t.Fatalf("concurrent blocked Close %d = %v", i, err)
+		}
+	}
+	if db.CloseCompleted() {
+		_ = snapshot.Close()
+		t.Fatal("concurrent blocked closes reported completion")
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i, err := range run() {
+		if err != nil {
+			t.Fatalf("concurrent completing Close %d = %v", i, err)
+		}
+	}
+	if !db.CloseCompleted() {
+		t.Fatal("concurrent Close retries did not converge")
+	}
+}
+
+// Given names with no canonical UTF-8 representation inside the portable byte
+// bound, when they are used, then creation is refused.
+func TestDurableDatabaseRejectsUnrepresentableCollectionNames(t *testing.T) {
 	db := newTestDatabase(t)
 	for _, name := range []string{
-		"", ".", "..", "a/b", "a" + string(os.PathSeparator) + "b",
-		"x" + collectionFileSuffix, "nul\x00byte", "\xff\xfe",
+		"", "\xff\xfe", strings.Repeat("x", MaxCollectionNameBytes+1),
+		strings.Repeat("\u00e9", MaxCollectionNameBytes/2+1),
 	} {
 		if _, err := db.CreateCollection(name, testDatabaseOptions()); err != ErrCollectionName {
 			t.Errorf("CreateCollection(%q)=%v want %v", name, err, ErrCollectionName)
 		}
+	}
+}
+
+func TestDurableDatabasePortableCollectionFilenameRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{
+		"CON", "Orders", "a/b", `a\b`, "name. ",
+		"caf\u00e9", "cafe\u0301", strings.Repeat("x", MaxCollectionNameBytes),
+	}
+	for _, name := range names {
+		collection, err := db.CreateCollection(name, testDatabaseOptions())
+		if err != nil {
+			t.Fatalf("CreateCollection(%q): %v", name, err)
+		}
+		mustPut(t, collection, "key", `{"ok":true}`)
+		filename := testCollectionFilename(t, name)
+		if filename != strings.ToLower(filename) ||
+			!strings.HasPrefix(filename, collectionFilePrefix) ||
+			!strings.HasSuffix(filename, collectionFileSuffix) {
+			t.Fatalf("non-portable filename %q for %q", filename, name)
+		}
+		if got := len(filename + recoveryJournalSuffix); got > 255 {
+			t.Fatalf("paired filename for %q is %d bytes", name, got)
+		}
+		if _, err := os.Stat(filepath.Join(dir, filename)); err != nil {
+			t.Fatalf("encoded primary for %q: %v", name, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	want := slices.Clone(names)
+	slices.Sort(want)
+	if got := reopened.Names(nil); !slices.Equal(got, want) {
+		t.Fatalf("reopened names = %q, want %q", got, want)
+	}
+}
+
+func TestDurableDatabaseRejectsDirectNameLayout(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "orders"+collectionFileSuffix)
+	if err := os.WriteFile(legacy, []byte("not a catalog collection"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+	if !errors.Is(err, ErrUnsupportedDatabaseLayout) {
+		if db != nil {
+			_ = db.Close()
+		}
+		t.Fatalf("direct-name OpenDatabase = %v, want unsupported layout", err)
+	}
+}
+
+func TestDurableDatabaseRejectsEncodedSymlinkPrimary(t *testing.T) {
+	dir := t.TempDir()
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.vjc")
+	const contents = "outside must remain untouched"
+	if err := os.WriteFile(outside, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := testCollectionFilename(t, "escaped")
+	primary := filepath.Join(dir, base)
+	if err := os.Symlink(outside, primary); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	db, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+	if db != nil {
+		_ = db.Close()
+	}
+	if !errors.Is(err, ErrUnsupportedDatabaseLayout) {
+		t.Fatalf("encoded-symlink OpenDatabase = %v, want unsupported layout", err)
+	}
+	got, readErr := os.ReadFile(outside)
+	if readErr != nil || string(got) != contents {
+		t.Fatalf("outside target changed: contents %q, error %v", got, readErr)
+	}
+	if _, statErr := os.Stat(primary + recoveryJournalSuffix); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("lexical recovery journal was created: %v", statErr)
+	}
+}
+
+func TestDurableDatabaseRejectsEncodedDirectoryPrimary(t *testing.T) {
+	dir := t.TempDir()
+	base := testCollectionFilename(t, "directory")
+	if err := os.Mkdir(filepath.Join(dir, base), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+	if db != nil {
+		_ = db.Close()
+	}
+	if !errors.Is(err, ErrUnsupportedDatabaseLayout) {
+		t.Fatalf("encoded-directory OpenDatabase = %v, want unsupported layout", err)
+	}
+}
+
+func TestDurableDatabaseRejectsCaseAliasesBeforeOrphanCleanup(t *testing.T) {
+	canonical := testCollectionFilename(t, "o")
+	variants := []string{
+		strings.ToUpper(canonical[:1]) + canonical[1:],
+		strings.Replace(canonical, "6f", "6F", 1),
+		strings.TrimSuffix(canonical, collectionFileSuffix) + ".VJC",
+	}
+	for _, variant := range variants {
+		t.Run(variant, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, variant), []byte("alias"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			journal := filepath.Join(dir, canonical+recoveryJournalSuffix)
+			if err := os.WriteFile(journal, []byte("must survive"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			db, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+			if db != nil {
+				_ = db.Close()
+			}
+			if !errors.Is(err, ErrUnsupportedDatabaseLayout) {
+				t.Fatalf("OpenDatabase = %v, want unsupported layout", err)
+			}
+			if got, readErr := os.ReadFile(journal); readErr != nil || string(got) != "must survive" {
+				t.Fatalf("validation followed orphan cleanup: contents %q, error %v", got, readErr)
+			}
+		})
+	}
+
+	t.Run("journal suffix", func(t *testing.T) {
+		dir := t.TempDir()
+		alias := canonical + ".RJOURNAL"
+		if err := os.WriteFile(filepath.Join(dir, alias), []byte("alias"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		db, err := OpenDatabase(dir, DatabaseOptions{Options: testDatabaseOptions()})
+		if db != nil {
+			_ = db.Close()
+		}
+		if !errors.Is(err, ErrUnsupportedDatabaseLayout) {
+			t.Fatalf("OpenDatabase = %v, want unsupported layout", err)
+		}
+	})
+}
+
+func TestDurableDatabaseFreezesRelativeDirectoryBeforeWorkingDirectoryChanges(t *testing.T) {
+	base := t.TempDir()
+	other := t.TempDir()
+	t.Chdir(base)
+	db, err := OpenDatabase("catalog", DatabaseOptions{Options: testDatabaseOptions()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir, err := filepath.EvalSymlinks(filepath.Join(base, "catalog"))
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if db.Dir() != wantDir || !filepath.IsAbs(db.Dir()) {
+		_ = db.Close()
+		t.Fatalf("database directory = %q, want stable absolute %q", db.Dir(), wantDir)
+	}
+
+	t.Chdir(other)
+	collection, err := db.CreateCollection("after-chdir", testDatabaseOptions())
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	mustPut(t, collection, "key", `{"ok":true}`)
+	baseName := testCollectionFilename(t, "after-chdir")
+	if _, err := os.Stat(filepath.Join(wantDir, baseName)); err != nil {
+		_ = db.Close()
+		t.Fatalf("collection was not created in original directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(other, "catalog", baseName)); !errors.Is(err, os.ErrNotExist) {
+		_ = db.Close()
+		t.Fatalf("working-directory change received database state: %v", err)
+	}
+	if err := db.DropCollection("after-chdir"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wantDir, baseName)); !errors.Is(err, os.ErrNotExist) {
+		_ = db.Close()
+		t.Fatalf("DropCollection left original primary: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

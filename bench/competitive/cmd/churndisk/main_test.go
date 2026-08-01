@@ -8,7 +8,7 @@ import (
 )
 
 func TestSmokeFixedLiveSetTSV(t *testing.T) {
-	for _, engine := range []string{"vibejson-durable", "bbolt"} {
+	for _, engine := range []string{"vibedb", "bbolt"} {
 		t.Run(engine, func(t *testing.T) {
 			var out bytes.Buffer
 			args := []string{
@@ -93,7 +93,7 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 			if !phases["pre-floor"] || !phases["post-floor"] {
 				t.Fatalf("final floor rows missing; phases=%v", phases)
 			}
-			if engine == "vibejson-durable" {
+			if engine == "vibedb" {
 				if postFloor > preFloor {
 					t.Fatalf(
 						"offline repack increased apparent bytes: pre=%d post=%d",
@@ -104,7 +104,7 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 					strings.Join(lines[1:], "\n"),
 					"offline out-of-place durable.Repack",
 				) {
-					t.Fatal("vibejson floor rows omit offline Repack disclosure")
+					t.Fatal("vibedb floor rows omit offline Repack disclosure")
 				}
 			}
 			if last != 2000 {

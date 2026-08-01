@@ -521,10 +521,10 @@ func (s *Segment) sealIngest() {
 // method: a sealed chunk can never reach it.
 func (s *Segment) Reset() {
 	if s.source != nil || s.mappedDocs != nil {
-		panic("vibejson: Segment.Reset on a segment borrowing storage it does not own")
+		panic("vibedb: Segment.Reset on a segment borrowing storage it does not own")
 	}
 	if s.arenaMinSrc != 0 || s.arenaMinEntries != 0 || s.dropEmptySpill || s.singleAppend {
-		panic("vibejson: Segment.Reset on a published collection chunk")
+		panic("vibedb: Segment.Reset on a published collection chunk")
 	}
 	// The document and header tables are cleared before truncation, not merely
 	// truncated. Each Index holds slice headers into the arena generation it was

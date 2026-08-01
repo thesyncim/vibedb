@@ -74,6 +74,10 @@ type Parser struct {
 	tok   token
 	depth int
 	out   *SelectStmt
+	// cancel is an optional cold-path hook. A nil hook leaves the warmed parser
+	// allocation profile unchanged; a non-nil hook is observed at bounded byte
+	// and token intervals while attacker-sized input is scanned.
+	cancel func() error
 
 	// Arenas whose storage a parsed statement retains.
 	text  chunkArena[byte]     // interned identifiers, keys, and literals
@@ -157,7 +161,7 @@ type pendingPath struct {
 // [Parser] for the lifetime dst inherits.
 func (p *Parser) Parse(dst *SelectStmt, src string) error {
 	*dst = SelectStmt{}
-	if err := validateStatementText(src); err != nil {
+	if err := validateStatementText(src, p.cancel); err != nil {
 		return err
 	}
 	p.reset(src)
@@ -168,9 +172,26 @@ func (p *Parser) Parse(dst *SelectStmt, src string) error {
 		// dst anyway gets an empty statement it must reject rather than
 		// whichever clauses happened to parse before the failure.
 		*dst = SelectStmt{}
+		if p.lx.cancelErr != nil {
+			return p.lx.cancelErr
+		}
 		return err
 	}
+	if p.lx.cancelErr != nil {
+		*dst = SelectStmt{}
+		return p.lx.cancelErr
+	}
 	return nil
+}
+
+// SetCancellationCheck installs an optional cooperative cancellation hook.
+// The parser calls check at bounded byte and token intervals and returns its
+// error unchanged. Passing nil restores the allocation-free ordinary path.
+// The hook remains installed across Parse calls and is cleared by Release.
+func (p *Parser) SetCancellationCheck(check func() error) {
+	if p != nil {
+		p.cancel = check
+	}
 }
 
 // validateStatementText is the one admission check shared by the SELECT-only
@@ -182,18 +203,44 @@ func (p *Parser) Parse(dst *SelectStmt, src string) error {
 // utf8.ValidString is allocation-free and has a fast ASCII path. The second
 // walk happens only for rejected input, to put the ParseError on the first
 // malformed byte.
-func validateStatementText(src string) error {
+func validateStatementText(src string, check func() error) error {
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
+	}
 	if len(src) > maxStatementBytes {
 		return newParseError(
 			src, maxStatementBytes,
 			"statement exceeds the 16 MiB SQL input limit",
 		)
 	}
-	if utf8.ValidString(src) {
-		return nil
+	if check == nil {
+		if utf8.ValidString(src) {
+			return nil
+		}
+		return newParseError(src, firstInvalidUTF8(src),
+			"statement is not valid UTF-8")
 	}
-	return newParseError(src, firstInvalidUTF8(src),
-		"statement is not valid UTF-8")
+	nextCheck := parserCancelByteInterval
+	for pos := 0; pos < len(src); {
+		if pos >= nextCheck {
+			if err := check(); err != nil {
+				return err
+			}
+			nextCheck = pos + parserCancelByteInterval
+		}
+		if src[pos] < utf8.RuneSelf {
+			pos++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(src[pos:])
+		if size == 1 {
+			return newParseError(src, pos, "statement is not valid UTF-8")
+		}
+		pos += size
+	}
+	return nil
 }
 
 func firstInvalidUTF8(src string) int {
@@ -259,7 +306,10 @@ func (p *Parser) reset(src string) {
 		p.nested.used = 0
 	}
 
-	p.lx = lexer{src: src}
+	p.lx = lexer{
+		src: src, cancel: p.cancel,
+		nextCancelByte: parserCancelByteInterval,
+	}
 	p.depth = 0
 	p.params = 0
 	p.advance()
@@ -282,6 +332,20 @@ func (p *Parser) Release() {
 }
 
 func (p *Parser) advance() { p.tok = p.lx.next() }
+
+func (p *Parser) checkCancellation() error {
+	if p.lx.cancelErr != nil {
+		return p.lx.cancelErr
+	}
+	if p.cancel == nil {
+		return nil
+	}
+	if err := p.cancel(); err != nil {
+		p.lx.cancelErr = err
+		return err
+	}
+	return nil
+}
 
 // atKeyword reports whether the current token is the unquoted keyword kw. A
 // quoted identifier never matches, which is what makes `"select"` usable as a
@@ -324,8 +388,20 @@ func (p *Parser) intern(b []byte) string {
 		return ""
 	}
 	dst := p.text.allocDirty(len(b))
-	copy(dst, b)
-	return byteview.String(dst)
+	all := dst
+	if p.cancel == nil {
+		copy(dst, b)
+	} else {
+		for len(b) > 0 {
+			if p.checkCancellation() != nil {
+				break
+			}
+			chunk := min(len(b), parserCancelByteInterval)
+			copy(dst, b[:chunk])
+			dst, b = dst[chunk:], b[chunk:]
+		}
+	}
+	return byteview.String(all)
 }
 
 func (p *Parser) internString(s string) string {
@@ -333,8 +409,20 @@ func (p *Parser) internString(s string) string {
 		return ""
 	}
 	dst := p.text.allocDirty(len(s))
-	copy(dst, s)
-	return byteview.String(dst)
+	all := dst
+	if p.cancel == nil {
+		copy(dst, s)
+	} else {
+		for len(s) > 0 {
+			if p.checkCancellation() != nil {
+				break
+			}
+			chunk := min(len(s), parserCancelByteInterval)
+			copy(dst, s[:chunk])
+			dst, s = dst[chunk:], s[chunk:]
+		}
+	}
+	return byteview.String(all)
 }
 
 // internToken interns a token's text, collapsing the doubled quotes of a
@@ -350,6 +438,10 @@ func (p *Parser) internToken(t token) string {
 	}
 	buf := p.tmp[:0]
 	for i := 0; i < len(t.text); i++ {
+		if p.cancel != nil && i%parserCancelByteInterval == 0 &&
+			p.checkCancellation() != nil {
+			break
+		}
 		buf = append(buf, t.text[i])
 		if t.text[i] == quote {
 			i++ // skip the second half of the doubled quote
@@ -420,16 +512,15 @@ func (p *Parser) expectSelect() error {
 	case p.acceptKeyword(kwSelect):
 		return nil
 	case p.atKeyword(kwInsert), p.atKeyword(kwUpdate), p.atKeyword(kwDelete),
-		p.atKeyword(kwCreate), p.atKeyword(kwDrop), p.atKeyword(kwAlter):
+		p.atKeyword(kwCreate):
 		// Parse is the SELECT-only entry point, kept because a caller that only
 		// wants a query should not have to switch on a kind to find out it got
 		// one. The statement is not unsupported, so the message names the entry
 		// point that takes it rather than the capability the engine lacks.
 		return p.errHere("this entry point parses SELECT; INSERT, UPDATE, DELETE, and CREATE are parsed by ParseStatement")
-	case p.atKeyword(kwValues):
-		return p.errHere("a bare VALUES list is not a statement; write INSERT INTO ... VALUES, parsed by ParseStatement")
-	case p.atKeyword(kwWith):
-		return p.errHere("common table expressions (WITH) are not supported")
+	}
+	if reason, unsupported := unsupportedStatementReason(p.tok); unsupported {
+		return p.featureNotSupportedHere(reason)
 	}
 	return p.errHere("expected SELECT")
 }

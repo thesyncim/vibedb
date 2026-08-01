@@ -123,7 +123,7 @@ type ExecOptions struct {
 // inside each batch, which meant no amount of Exec reuse could ever warm the
 // scan — every BatchRows documents re-grew all of it from empty.
 type fileWorkspace struct {
-	index      durable.IndexWorkspace
+	index      durable.IndexSession
 	overflow   []byte
 	accs       []aggAcc
 	fileGroups []fileGroup

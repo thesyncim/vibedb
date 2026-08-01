@@ -19,17 +19,17 @@ const pageCacheEvictionScanZones = 64
 
 var (
 	// ErrPageCacheClosed reports use after Close has started.
-	ErrPageCacheClosed = errors.New("vibejson: Store page cache is closed")
+	ErrPageCacheClosed = errors.New("vibedb: Store page cache is closed")
 	// ErrPageCachePinned reports that no clean, unpinned contiguous slot span
 	// can admit the requested extent. Releasing leases or fencing dirty pages
 	// can make a victim available without growing the cache.
-	ErrPageCachePinned = errors.New("vibejson: no clean unpinned Store page-cache extent is available")
+	ErrPageCachePinned = errors.New("vibedb: no clean unpinned Store page-cache extent is available")
 	// ErrPageCacheReference reports a malformed or physically unordered page
 	// reference before any file I/O is attempted.
-	ErrPageCacheReference = errors.New("vibejson: invalid Store page cache reference")
+	ErrPageCacheReference = errors.New("vibedb: invalid Store page cache reference")
 	// ErrPageLeaseClosed reports a read or release against a page lease that has
 	// already been closed.
-	ErrPageLeaseClosed = errors.New("vibejson: Store page lease already closed")
+	ErrPageLeaseClosed = errors.New("vibedb: Store page lease already closed")
 )
 
 // PageCacheOptions fixes cache residency and every explicit prefetch bound.
@@ -309,7 +309,7 @@ func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 	}
 	arena, err := allocateArena(slotCount * normalized.PageSize)
 	if err != nil {
-		return nil, fmt.Errorf("vibejson: allocate Store page cache: %w", err)
+		return nil, fmt.Errorf("vibedb: allocate Store page cache: %w", err)
 	}
 	c := &PageCache{
 		file:        file,
@@ -2072,7 +2072,7 @@ func (c *PageCache) Close() error {
 	c.closed = true
 	c.mu.Unlock()
 	if err := releaseArena(arena); err != nil {
-		return fmt.Errorf("vibejson: release Store page cache: %w", err)
+		return fmt.Errorf("vibedb: release Store page cache: %w", err)
 	}
 	return nil
 }

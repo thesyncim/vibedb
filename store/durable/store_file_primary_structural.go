@@ -37,7 +37,7 @@ const (
 // exhausted, so a macro-tablet split (the next phase) is required. It is
 // counted in Stats.PrimaryMacroSplitRequired.
 var ErrPrimaryMacroSplitRequired = errors.New(
-	"vibejson: primary macro-tablet split required",
+	"vibedb: primary macro-tablet split required",
 )
 
 type primaryStructuralKind uint8
@@ -632,7 +632,7 @@ func (c *Collection) commitPrimaryStructural(
 	freeLog, err := c.syncFreeLogFor(tx, state, c.options.freeFoldLimit)
 	if err != nil {
 		return fmt.Errorf(
-			"vibejson: persist structural reusable extents: %w", err,
+			"vibedb: persist structural reusable extents: %w", err,
 		)
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
@@ -648,7 +648,7 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return fmt.Errorf(
-			"vibejson: reserve structural retirements: %w", err,
+			"vibedb: reserve structural retirements: %w", err,
 		)
 	}
 	retirementReserved = true

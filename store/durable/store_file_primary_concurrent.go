@@ -37,7 +37,7 @@ const (
 // Hooks are package-private deterministic test seams. Production leaves them
 // nil, so the hot path pays one predictable nil branch at each boundary.
 var (
-	errConcurrentPrimaryPressure = errors.New("vibejson: concurrent primary overlay pressure")
+	errConcurrentPrimaryPressure = errors.New("vibedb: concurrent primary overlay pressure")
 
 	concurrentPrimaryReplaceStagedHook   func(storeio.BucketID)
 	concurrentPrimaryReplacePublishHook  func(storeio.BucketID, uint64)
@@ -92,14 +92,16 @@ type primaryConcurrentContext struct {
 }
 
 func (c *primaryConcurrentContext) canonicalize(
-	src []byte,
+	src []byte, options document.IndexOptions,
 ) (
 	canonical []byte,
 	spanned storeio.CanonicalSpanIndex,
 	eligible bool,
 	err error,
 ) {
-	index, err := vibejson.BuildIndex(src, c.index[:cap(c.index)])
+	index, err := vibejson.BuildIndexOptions(
+		src, c.index[:cap(c.index)], options,
+	)
 	if errors.Is(err, document.ErrIndexFull) {
 		return nil, storeio.CanonicalSpanIndex{}, false, nil
 	}
@@ -259,11 +261,11 @@ func (p *primaryConcurrentContextPool) release(
 	}
 	slot := uint32(context.poolSlot)
 	if slot >= uint32(len(p.contexts)) || &p.contexts[slot] != context {
-		panic("vibejson: foreign concurrent primary context release")
+		panic("vibedb: foreign concurrent primary context release")
 	}
 	bit := uint32(1) << slot
 	if old := p.free.Or(bit); old&bit != 0 {
-		panic("vibejson: duplicate concurrent primary context release")
+		panic("vibedb: duplicate concurrent primary context release")
 	}
 	if p.waiters.Load() != 0 {
 		// Locking around Signal closes the check/sleep race: a waiter either
@@ -579,11 +581,11 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	default:
 		if hook := concurrentPrimaryPutCanonicalizeHook; hook == nil {
 			canonical, canonicalIndex, eligible, preflightErr =
-				context.canonicalize(src)
+				context.canonicalize(src, c.options.Collection.IndexOptions)
 		} else {
 			hook(false)
 			canonical, canonicalIndex, eligible, preflightErr =
-				context.canonicalize(src)
+				context.canonicalize(src, c.options.Collection.IndexOptions)
 			hook(true)
 		}
 		if preflightErr == nil && eligible &&

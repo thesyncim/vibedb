@@ -529,10 +529,10 @@ func (c *Collection) ensureSyncJournalMutationRoomLocked(
 // grows the file. It reuses the exact primitive the heap builder validates with
 // — Schema.ValidateIndex over a per-document vibejson.Index built with the
 // collection's index options — so a document admitted here is one a rebuild
-// would also accept. A schemaless collection returns immediately; the caller has
-// already proven src is well-formed JSON with vibejson.Validate, so the index
-// build cannot fail on structural grounds. It runs under the writer lock, so the
-// reused IndexEntry arena is writer-private.
+// would also accept. BuildIndexOptions is itself the validating parser; a
+// separate Validate pass would parse schema writes twice before canonicalizing
+// them. It runs under the writer lock, so the reused IndexEntry arena is
+// writer-private.
 func (c *Collection) validatePrimarySchema(src []byte) error {
 	schema := c.options.Collection.Schema
 	if schema == nil {
@@ -610,9 +610,6 @@ func (c *Collection) putPrimary(
 			return false, err
 		}
 	} else {
-		if err := vibejson.Validate(src); err != nil {
-			return false, err
-		}
 		if err := c.validatePrimarySchema(src); err != nil {
 			return false, err
 		}
@@ -1719,7 +1716,7 @@ func (c *Collection) cowPrimaryMutation(
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, false,
-			fmt.Errorf("vibejson: persist reusable extents: %w", err)
+			fmt.Errorf("vibedb: persist reusable extents: %w", err)
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, state, generation, rootPage.Ref(),
@@ -1742,7 +1739,7 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return storeio.PageRef{}, false, false,
-			fmt.Errorf("vibejson: reserve retired extents: %w", err)
+			fmt.Errorf("vibedb: reserve retired extents: %w", err)
 	}
 	retirementReserved = true
 	// The journal-backed sync lane reaches this transactional path only for an
@@ -2769,7 +2766,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"vibejson: persist primary checkpoint reusable extents: %w",
+			"vibedb: persist primary checkpoint reusable extents: %w",
 			err,
 		)
 	}
@@ -2786,7 +2783,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return fmt.Errorf(
-			"vibejson: reserve primary checkpoint retirements: %w",
+			"vibedb: reserve primary checkpoint retirements: %w",
 			err,
 		)
 	}

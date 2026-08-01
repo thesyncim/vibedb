@@ -81,19 +81,19 @@ var (
 	// ErrMaterializationJournalCorrupt reports a non-empty capsule whose
 	// framing, checksum, canonical packing, target references, or patches are
 	// invalid.
-	ErrMaterializationJournalCorrupt = errors.New("vibejson: corrupt Store materialization journal")
+	ErrMaterializationJournalCorrupt = errors.New("vibedb: corrupt Store materialization journal")
 	// ErrMaterializationJournalNotFound reports an empty slot or two slots with
 	// no checksum-valid committed capsule. An invalid capsule never authorizes
 	// target writes, so SelectMaterializationJournal may safely treat it as an
 	// interrupted pre-barrier write.
-	ErrMaterializationJournalNotFound = errors.New("vibejson: no valid Store materialization journal")
+	ErrMaterializationJournalNotFound = errors.New("vibedb: no valid Store materialization journal")
 	// ErrMaterializationJournalConflict reports two individually valid slots
 	// that cannot belong to one monotonic Store history.
-	ErrMaterializationJournalConflict = errors.New("vibejson: conflicting Store materialization journals")
+	ErrMaterializationJournalConflict = errors.New("vibedb: conflicting Store materialization journals")
 	// ErrMaterializationTargetDiverged reports target bytes outside every
 	// recorded patch that do not match the image from which the capsule was
 	// built. Recovery must not write that page.
-	ErrMaterializationTargetDiverged = errors.New("vibejson: materialization target diverged")
+	ErrMaterializationTargetDiverged = errors.New("vibedb: materialization target diverged")
 )
 
 // MaterializationJournalHeader identifies one committed recovery capsule.

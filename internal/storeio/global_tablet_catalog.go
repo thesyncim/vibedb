@@ -62,12 +62,12 @@ var (
 	// ErrGlobalTabletCatalogCorrupt reports that a catalog page failed checksum
 	// or structural admission and must not be routed against.
 	ErrGlobalTabletCatalogCorrupt = errors.New(
-		"vibejson: corrupt global tablet catalog page",
+		"vibedb: corrupt global tablet catalog page",
 	)
 	// ErrGlobalTabletCatalogNoSpace reports that a node cannot admit another
 	// child; the builder must add a level or split.
 	ErrGlobalTabletCatalogNoSpace = errors.New(
-		"vibejson: global tablet catalog page has no space",
+		"vibedb: global tablet catalog page has no space",
 	)
 )
 

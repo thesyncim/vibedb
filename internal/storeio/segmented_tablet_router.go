@@ -74,17 +74,17 @@ var (
 	// ErrSegmentedTabletRouterCorrupt reports that a router image failed
 	// checksum or structural admission and must not be routed against.
 	ErrSegmentedTabletRouterCorrupt = errors.New(
-		"vibejson: corrupt segmented tablet router image",
+		"vibedb: corrupt segmented tablet router image",
 	)
 	// ErrSegmentedTabletRouterNoSpace reports that the image cannot admit
 	// another route entry.
 	ErrSegmentedTabletRouterNoSpace = errors.New(
-		"vibejson: segmented tablet router image has no space",
+		"vibedb: segmented tablet router image has no space",
 	)
 	// ErrSegmentedTabletRouterNotFound reports that no bucket routes the queried
 	// key.
 	ErrSegmentedTabletRouterNotFound = errors.New(
-		"vibejson: segmented tablet router bucket not found",
+		"vibedb: segmented tablet router bucket not found",
 	)
 )
 

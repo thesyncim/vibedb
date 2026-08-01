@@ -7,7 +7,7 @@ import (
 
 // *Snapshot satisfies store's shared IndexSource shape with its existing
 // exported methods — no adapter needed for basic conformance. Repeated probing
-// should go through QuerySnapshot below, which reuses one workspace.
+// should go through IndexSession below, which owns reusable private scratch.
 var _ store.IndexSource = (*Snapshot)(nil)
 
 // SupportsUpdate reports whether the collection's durability lane can publish
@@ -19,60 +19,115 @@ func (c *Collection) SupportsUpdate() bool {
 	return c != nil && c.state.Load() != nil && c.deferredCanonicalLane()
 }
 
-// QuerySnapshot adapts a Snapshot for repeated, zero-allocation index
-// probing: it satisfies store.IndexSource like Snapshot itself, but
-// routes through the workspace-reusing AppendIndexMasksInto/
-// AppendIndexCandidateMasksInto forms instead of allocating a fresh
-// IndexWorkspace per call, and optionally accumulates probe statistics.
-// Use it (rather than Snapshot directly) wherever a store.IndexSource is
-// probed more than once against the same snapshot, such as query plan
-// execution.
-type QuerySnapshot struct {
-	Snapshot     *Snapshot
-	Workspace    *IndexWorkspace
-	Rechecks     *uint64
-	Certificates *uint64
-	// PostingPages accumulates IndexProbeStats.PostingPages: the
-	// index-directory leaf pages the probes read, which is their physical read
-	// work now that stable-slot masks live inline in those leaves.
-	PostingPages *int
+// IndexSession binds one borrowed Snapshot to reusable exact-index probe
+// storage. Its zero value is ready to Reset and use. The scratch workspace and
+// live counters are private: callers cannot splice their own pointers into an
+// execution or couple themselves to mutation-oriented engine fields.
+//
+// A session is single-consumer and must not be used concurrently. Reset binds
+// another snapshot and clears accumulated metrics without discarding retained
+// capacity. Release drops the capacity. The session does not own the Snapshot
+// lease; close or replace the snapshot only after the current probe finishes.
+type IndexSession struct {
+	snapshot  *Snapshot
+	workspace IndexWorkspace
+	metrics   IndexSessionMetrics
 }
 
-var _ store.IndexSource = QuerySnapshot{}
+var _ store.IndexSource = (*IndexSession)(nil)
 
-// AppendIndexes appends the immutable exact-index catalog visible to the
-// wrapped snapshot.
-func (s QuerySnapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
-	return s.Snapshot.AppendIndexes(dst)
+// IndexSessionMetrics is a detached, stable summary accumulated since the
+// session's last Reset. It reports logical candidate work and physical posting
+// reads without exposing the workspace used to produce them.
+type IndexSessionMetrics struct {
+	Probes              uint64
+	CandidateRows       uint64
+	CertificateRows     uint64
+	DocumentRecheckRows uint64
+	MatchedRows         uint64
+	CandidateChunks     uint64
+	PostingPages        uint64
 }
 
-// AppendIndexMasks appends exact stable-slot masks, reusing s.Workspace.
-func (s QuerySnapshot) AppendIndexMasks(dst []store.Mask, name string, values ...vibejson.Index) ([]store.Mask, error) {
-	out, err := s.Snapshot.AppendIndexMasksInto(dst, s.Workspace, name, values...)
-	s.accumulate()
-	return out, err
+// NewIndexSession returns a session bound to snapshot. Callers that retain a
+// session in another object can use its zero value plus Reset to avoid this one
+// construction allocation.
+func NewIndexSession(snapshot *Snapshot) *IndexSession {
+	session := new(IndexSession)
+	session.Reset(snapshot)
+	return session
 }
 
-// AppendIndexCandidateMasks appends candidate stable-slot masks (not yet
-// exact-rechecked), reusing s.Workspace.
-func (s QuerySnapshot) AppendIndexCandidateMasks(dst []store.Mask, name string, values ...vibejson.Index) ([]store.Mask, error) {
-	out, err := s.Snapshot.AppendIndexCandidateMasksInto(dst, s.Workspace, name, values...)
-	s.accumulate()
-	return out, err
-}
-
-func (s QuerySnapshot) accumulate() {
-	if s.Rechecks == nil && s.Certificates == nil && s.PostingPages == nil {
+// Reset binds snapshot and starts a fresh metrics interval while preserving
+// the session's high-water scratch capacity.
+func (s *IndexSession) Reset(snapshot *Snapshot) {
+	if s == nil {
 		return
 	}
-	stats := s.Workspace.LastProbeStats()
-	if s.Rechecks != nil {
-		*s.Rechecks += stats.DocumentRecheckRows
+	s.snapshot = snapshot
+	s.metrics = IndexSessionMetrics{}
+}
+
+// Release unbinds the snapshot and drops all retained probe capacity.
+func (s *IndexSession) Release() {
+	if s == nil {
+		return
 	}
-	if s.Certificates != nil {
-		*s.Certificates += stats.CertificateRows
+	s.snapshot = nil
+	s.metrics = IndexSessionMetrics{}
+	s.workspace.Release()
+}
+
+// Metrics returns a detached value snapshot of work accumulated since Reset.
+func (s *IndexSession) Metrics() IndexSessionMetrics {
+	if s == nil {
+		return IndexSessionMetrics{}
 	}
-	if s.PostingPages != nil {
-		*s.PostingPages += stats.PostingPages
+	return s.metrics
+}
+
+// AppendIndexes appends the immutable exact-index catalog visible to the
+// bound snapshot. An unbound session behaves like an empty catalog.
+func (s *IndexSession) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
+	if s == nil || s.snapshot == nil {
+		return dst
+	}
+	return s.snapshot.AppendIndexes(dst)
+}
+
+// AppendIndexMasks appends exact stable-slot masks using retained private
+// scratch and adds the probe's work to Metrics.
+func (s *IndexSession) AppendIndexMasks(dst []store.Mask, name string, values ...vibejson.Index) ([]store.Mask, error) {
+	if s == nil || s.snapshot == nil {
+		return dst, ErrClosed
+	}
+	out, err := s.snapshot.AppendIndexMasksInto(dst, &s.workspace, name, values...)
+	s.accumulate()
+	return out, err
+}
+
+// AppendIndexCandidateMasks appends candidate stable-slot masks using retained
+// private scratch and adds the probe's work to Metrics.
+func (s *IndexSession) AppendIndexCandidateMasks(dst []store.Mask, name string, values ...vibejson.Index) ([]store.Mask, error) {
+	if s == nil || s.snapshot == nil {
+		return dst, ErrClosed
+	}
+	out, err := s.snapshot.AppendIndexCandidateMasksInto(dst, &s.workspace, name, values...)
+	s.accumulate()
+	return out, err
+}
+
+func (s *IndexSession) accumulate() {
+	stats := s.workspace.LastProbeStats()
+	s.metrics.Probes++
+	s.metrics.CandidateRows += stats.CandidateRows
+	s.metrics.CertificateRows += stats.CertificateRows
+	s.metrics.DocumentRecheckRows += stats.DocumentRecheckRows
+	s.metrics.MatchedRows += stats.MatchedRows
+	if stats.CandidateChunks > 0 {
+		s.metrics.CandidateChunks += uint64(stats.CandidateChunks)
+	}
+	if stats.PostingPages > 0 {
+		s.metrics.PostingPages += uint64(stats.PostingPages)
 	}
 }

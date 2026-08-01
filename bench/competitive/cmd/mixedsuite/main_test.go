@@ -47,12 +47,12 @@ func TestLatinSquareScheduleIsDeterministicAndPositionBalanced(t *testing.T) {
 }
 
 func TestParseEnginesRejectsAmbiguousLists(t *testing.T) {
-	if got, err := parseEngines(" vibejson-durable, bbolt "); err != nil {
+	if got, err := parseEngines(" vibedb, bbolt "); err != nil {
 		t.Fatal(err)
-	} else if want := []string{"vibejson-durable", "bbolt"}; !slices.Equal(got, want) {
+	} else if want := []string{"vibedb", "bbolt"}; !slices.Equal(got, want) {
 		t.Fatalf("engines = %v, want %v", got, want)
 	}
-	for _, value := range []string{"vibejson-durable", "a,,b", "a,b,a"} {
+	for _, value := range []string{"vibedb", "a,,b", "a,b,a"} {
 		if _, err := parseEngines(value); err == nil {
 			t.Fatalf("parseEngines(%q) succeeded", value)
 		}
@@ -70,7 +70,7 @@ func TestSummarizeReportsMedianMADQuartilesAndRange(t *testing.T) {
 
 func TestParseMixedOutputRequiresMachineReadableShape(t *testing.T) {
 	const valid = `engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
-vibejson buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
+vibedb buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
 `
 	header, rows, err := parseMixedOutput([]byte(valid))
 	if err != nil {
@@ -87,7 +87,7 @@ vibejson buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1
 func TestValidateMixedRowsChecksRequestedConfiguration(t *testing.T) {
 	header, rows, err := parseMixedOutput([]byte(
 		`engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB
-vibejson-durable/bulk-unified buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
+vibedb/bulk-unified buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4
 `,
 	))
 	if err != nil {
@@ -98,14 +98,14 @@ vibejson-durable/bulk-unified buffered-visible ycsb-a low 10 20 2 64 0 false 1 r
 		cardinality: "low", corpus: 10, operations: 20, warmup: 2,
 		checkpointMutations: 64, clients: 1,
 	}
-	if err := validateMixedRows(cfg, "vibejson-durable", header, rows); err != nil {
+	if err := validateMixedRows(cfg, "vibedb", header, rows); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateMixedRows(cfg, "bbolt", header, rows); err == nil {
 		t.Fatal("accepted a row from the wrong engine")
 	}
 	cfg.operations++
-	if err := validateMixedRows(cfg, "vibejson-durable", header, rows); err == nil {
+	if err := validateMixedRows(cfg, "vibedb", header, rows); err == nil {
 		t.Fatal("accepted a row with the wrong measured-operation count")
 	}
 }

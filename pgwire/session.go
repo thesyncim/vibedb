@@ -88,6 +88,11 @@ type session struct {
 	// arenas.
 	statementBindBytes int
 	portalBytes        int
+	// catalogOIDs are session-local continuation tokens for psql's multi-query
+	// \d exchange. They are assigned monotonically and never reused, so a table
+	// created between name resolution and detail lookup cannot retarget an oid.
+	catalogOIDs    []catalogOIDEntry
+	nextCatalogOID uint32
 
 	// msg is the decoded frontend message, reused so a session that serves a
 	// million messages allocates one set of parameter slices.
@@ -552,6 +557,13 @@ func (s *session) takeCancel() bool {
 	return s.queryCancel.Take()
 }
 
+func (s *session) cancellationError() error {
+	if s.queryCancel.Canceled() {
+		return query.ErrCanceled
+	}
+	return nil
+}
+
 // startupParameter applies one startup-packet parameter.
 //
 // The four protocol-level names are handled here; everything else goes through
@@ -757,6 +769,7 @@ func (s *session) simpleQuery(sql string) error {
 			break
 		}
 		if s.takeCancel() {
+			s.markTransactionFailed()
 			s.w.errorResponse(newError(sqlstateQueryCanceled,
 				"canceling statement due to a cancel request"))
 			failed = true
@@ -974,9 +987,6 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		}
 		return p, nil
 
-	case kindUnsupported:
-		return nil, newError(sqlstateFeatureNotSupported, reason)
-
 	case kindUnknown:
 		if reason != "" {
 			return nil, newError(sqlstateSyntaxError, reason)
@@ -1041,9 +1051,11 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	// ever sees them; see command.go for why that happens here rather than in
 	// the parser. The rewrite preserves byte offsets, so the error reported
 	// below still points at the byte the client wrote.
-	lowered, order, highest, err := rewriteNumberedParameters(text)
+	lowered, order, highest, err := rewriteNumberedParameters(
+		text, s.cancellationError,
+	)
 	if err != nil {
-		return nil, err
+		return nil, asPGErrorIn(err, text)
 	}
 	runtime, err := s.sql.Prepare(context.Background(), lowered)
 	if err != nil {

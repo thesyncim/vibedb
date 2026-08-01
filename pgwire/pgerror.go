@@ -26,10 +26,9 @@ import (
 // parse, and the difference a client cares about is retryability: 0A000 says
 // "this server will never run this feature", while 42601 says "this admitted
 // statement text is wrong". SELECT, INSERT, UPDATE, DELETE, CREATE TABLE,
-// CREATE INDEX, and the bounded transaction grammar reach the real parser or
-// transaction decoder. Unsupported leading kinds such as ALTER, DROP, MERGE,
-// COPY, and SAVEPOINT are classified first and receive 0A000 with a specific
-// boundary. Parse errors from an admitted kind retain 42601 and a source
+// CREATE INDEX, and unsupported leading SQL kinds all reach the shared front
+// end. Its typed FeatureNotSupportedError maps to 0A000 with the same reason
+// database/sql returns; ordinary ParseError remains 42601 with a source
 // position. SQLSTATEs never depend on matching another package's prose.
 
 // SQLSTATE codes this server emits. The names are the PostgreSQL condition
@@ -214,6 +213,10 @@ func asPGError(err error) *pgError {
 		errors.Is(err, sqldriver.ErrUpdatePrimaryKey),
 		errors.Is(err, sqldriver.ErrTransactionUnsupportedLane):
 		return newError(sqlstateFeatureNotSupported, err.Error())
+	}
+	var unsupported *sqlast.FeatureNotSupportedError
+	if errors.As(err, &unsupported) {
+		return newError(sqlstateFeatureNotSupported, unsupported.Msg)
 	}
 	var parse *sqlast.ParseError
 	if errors.As(err, &parse) {

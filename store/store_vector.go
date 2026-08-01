@@ -32,7 +32,7 @@ func (v storeChunkVector) Get(id uint32) *Chunk {
 
 func (v storeChunkVector) set(id uint32, chunk *Chunk) storeChunkVector {
 	if id >= v.Count {
-		panic("vibejson: store chunk vector index out of range")
+		panic("vibedb: store chunk vector index out of range")
 	}
 	v.root = storeChunkSet(v.root, v.depth, id, chunk)
 	return v

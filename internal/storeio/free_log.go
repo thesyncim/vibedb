@@ -59,7 +59,7 @@ const (
 )
 
 // ErrFreeLogCorrupt reports a malformed durable free-set image or delta.
-var ErrFreeLogCorrupt = errors.New("vibejson: corrupt Store free log")
+var ErrFreeLogCorrupt = errors.New("vibedb: corrupt Store free log")
 
 // A FreeOp is the effect one delta record has on the free set.
 type FreeOp uint8

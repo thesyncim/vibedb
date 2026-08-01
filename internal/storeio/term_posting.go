@@ -111,7 +111,7 @@ type TermPostingIterator struct {
 }
 
 // ErrTermPostingCorrupt reports an invalid or non-canonical term posting.
-var ErrTermPostingCorrupt = errors.New("vibejson: corrupt Store term posting")
+var ErrTermPostingCorrupt = errors.New("vibedb: corrupt Store term posting")
 
 func (c TermPostingCodec) String() string {
 	switch c {

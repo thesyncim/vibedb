@@ -8,6 +8,86 @@ This file describes the implemented APIs; [architecture.md](architecture.md)
 describes the current runtime shape and [format.md](format.md) is authoritative
 for durable bytes.
 
+## Default product facade
+
+Applications that do not need storage-engine controls start at the repository
+root:
+
+```go
+db, err := vibedb.Open("application.vdb",
+    vibedb.WithDurability(vibedb.Durable),
+)
+if err != nil {
+    return err
+}
+defer db.Close()
+
+users := db.Collection("users")
+_, err = users.Put("user:1", []byte(`{"name":"Ada"}`))
+```
+
+`Open` owns a directory catalog and every collection descriptor below it.
+`Close` synchronizes buffered state, closes the collections, and then closes
+those descriptors. `Collection` returns a stable lazy handle without creating
+a file; invalid names and creation errors surface from the first operation.
+The default `Durable` profile is the strongest contract. `Buffered` makes
+`Flush` and `Close` the persistence boundaries. `Memory` uses the heap engine,
+never accesses the path passed to `Open`, and has no persistence boundary.
+
+The facade exposes common `Put`, `Delete`, `Get`, `Range`, exact-index creation,
+typed query execution, `Flush`, and constant-size `Metrics` operations. A
+one-off `Collection.Run` owns its result; `Collection.NewSession` retains the
+bounded executor behind repeated `Session.Run` calls without exposing query or
+index workspaces. Every run takes a fresh immutable snapshot, and durable
+snapshots close before the call returns. `Get` returns an owned canonical JSON
+byte slice. `Range` borrows key and canonical document bytes only for the
+callback. The facade does not expose cache pages, index workspaces, generation
+leases, or the engine's mutation-oriented statistics structure.
+
+Logical collection names are non-empty valid UTF-8 up to 120 bytes. Disk
+profiles encode them reversibly as `c-` plus lowercase hexadecimal UTF-8 plus
+`.vjc`; the journal appends `.rjournal`. Names such as `CON`, `a/b`, trailing
+dots/spaces, and distinct Unicode normalization forms are therefore portable
+and remain distinct rather than being rejected or sanitized.
+
+Callers that own an existing descriptor use the deliberately advanced
+single-collection entry point:
+
+```go
+path, err := filepath.Abs("users.vdb")
+if err != nil {
+    return err
+}
+file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+if err != nil {
+    return err
+}
+defer file.Close()
+
+users, err := vibedb.OpenFile(file, vibedb.AdvancedOptions{})
+if err != nil {
+    return err
+}
+defer users.Close() // synchronizes the collection; file remains caller-owned
+```
+
+`OpenFile` requires a stable absolute primary-file name that still resolves to
+the supplied regular-file descriptor. Durable and buffered collections also
+own `path + ".rjournal"` and synchronize the parent directory. The caller must
+have authority to create, open, write, and synchronize that sibling, and must
+move, back up, or restore the primary and journal as one pair. Anonymous,
+unlinked, relative-name, and stale-name descriptors are rejected before the
+primary is mutated.
+
+`AdvancedOptions` contains the low-level engine configuration. One centralized
+validation pass rejects profile/engine durability conflicts, disk options in
+the memory profile, permission options for caller-owned descriptors, and
+invalid bounded geometry before filesystem state is created or locked.
+
+The rest of this document describes the low-level packages used to build that
+facade. They remain public for engine embedders but are not prerequisites for
+normal CRUD use.
+
 ## Storage surfaces
 
 | Surface | Purpose | Persistence |
@@ -54,8 +134,9 @@ if err != nil {
 ### Mutation
 
 `Put` validates one complete JSON value, copies a new key and the document, and
-atomically inserts or replaces it. The caller may reuse both inputs after
-return. A validation or schema failure publishes nothing.
+atomically inserts or replaces it. `Delete` removes one key without a tombstone;
+a miss publishes nothing. The caller may reuse Put inputs after return. A
+validation or schema failure publishes nothing.
 
 Replacing a key:
 
@@ -366,7 +447,7 @@ reused. A long-lived snapshot therefore increases `PendingRetiredExtents` and
 `PendingRetiredBytes`; it does not block newer reads or commits until configured
 retirement capacity is exhausted.
 
-`durable.Snapshot.AppendRaw` always copies exact JSON into caller storage and
+`durable.Snapshot.AppendRaw` always copies canonical JSON into caller storage and
 never returns a borrowed cache page. Query execution and range scans use the
 same lease.
 
@@ -431,6 +512,17 @@ definitions act as an assertion. Each write maintains the published postings
 transactionally. One physical index spans deterministic, bounded term leaves
 behind an ordered catalog; a giant term may span consecutive fixed-tile stripe
 pieces, so posting volume is not capped by one 64 KiB leaf.
+
+Repeated durable index probes use a reusable `durable.IndexSession`. The
+session binds a borrowed snapshot, owns its scratch privately, and implements
+the shared `store.IndexSource` contract. `Reset` starts a new detached metrics
+interval while retaining warmed capacity; `Metrics` returns the stable
+value-only `IndexSessionMetrics`; `Release` drops retained capacity. Callers
+cannot inject counter pointers or reach the workspace through the session.
+
+`IndexWorkspace` and the snapshot `AppendIndex*Into` methods remain an explicit
+expert, single-consumer engine API for embedders implementing their own planner.
+The root facade and the standard query executor do not expose or require them.
 
 ### Bulk creation
 

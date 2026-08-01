@@ -62,7 +62,7 @@ const stateRootKnownOptions = StateOptionSchema |
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
 // not encode a valid Store state root.
-var ErrStateRootCorrupt = errors.New("vibejson: corrupt Store state root")
+var ErrStateRootCorrupt = errors.New("vibedb: corrupt Store state root")
 
 // PageRef is a durable pointer to one immutable logical-page version. Offset
 // is physical and changes on replacement; LogicalID is stable. Generation may

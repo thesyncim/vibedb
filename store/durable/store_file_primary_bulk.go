@@ -34,7 +34,7 @@ func CreateFromPrimary(
 ) (int64, error) {
 	if collection == nil || file == nil {
 		return 0, fmt.Errorf(
-			"vibejson: CreateFromPrimary requires non-nil collection and file",
+			"vibedb: CreateFromPrimary requires non-nil collection and file",
 		)
 	}
 	info, err := file.Stat()
@@ -78,7 +78,7 @@ func CreateFromPrimary(
 			chunk := snapshot.Chunks.Get(row.sourceChunk)
 			if chunk == nil ||
 				chunk.Live&(uint64(1)<<row.sourceSlot) == 0 {
-				return fmt.Errorf("vibejson: bulk source row references a missing document")
+				return fmt.Errorf("vibedb: bulk source row references a missing document")
 			}
 			key := chunk.Key(int(row.sourceSlot))
 			value := chunk.Docs.RawAt(int(chunk.Ord[row.sourceSlot]))
@@ -115,7 +115,9 @@ func CreateFromPrimary(
 
 	// Canonicalize every document once, up front, so the leaf encoder, exact
 	// index term derivation, and every later read observe exactly one spelling.
-	if err := canonicalizePrimaryBulkRecords(records); err != nil {
+	if err := canonicalizePrimaryBulkRecords(
+		records, normalized.Collection.IndexOptions,
+	); err != nil {
 		return 0, err
 	}
 	storeID := primaryBulkStoreID(records, normalized)
@@ -275,7 +277,7 @@ func CreateFromPrimary(
 			_ = tx.Abort()
 			_ = committer.Close()
 			return 0, fmt.Errorf(
-				"vibejson: mint recovery journal identity: %w", err)
+				"vibedb: mint recovery journal identity: %w", err)
 		}
 		if err := createSiblingRecoveryJournal(
 			file.Name(),
@@ -326,7 +328,10 @@ func CreateFromPrimary(
 // escape normalization collapses (raw control bytes are illegal JSON, so a
 // control character's source spelling is never shorter than its canonical
 // one), which the capacity check below still enforces defensively.
-func canonicalizePrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error {
+func canonicalizePrimaryBulkRecords(
+	records []storeio.PrimaryGraphRecord,
+	indexOptions document.IndexOptions,
+) error {
 	total := 0
 	for at := range records {
 		total += len(records[at].Value)
@@ -338,8 +343,8 @@ func canonicalizePrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error 
 		var index vibejson.Index
 		for {
 			var err error
-			index, err = vibejson.BuildIndex(
-				records[at].Value, entryStore[:cap(entryStore)],
+			index, err = vibejson.BuildIndexOptions(
+				records[at].Value, entryStore[:cap(entryStore)], indexOptions,
 			)
 			if err == nil {
 				entryStore = index.Entries
@@ -361,7 +366,7 @@ func canonicalizePrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error 
 		}
 		if cap(out) != cap(arena) && off != 0 {
 			return fmt.Errorf(
-				"vibejson: canonical bulk arena grew past its sized capacity",
+				"vibedb: canonical bulk arena grew past its sized capacity",
 			)
 		}
 		arena = out

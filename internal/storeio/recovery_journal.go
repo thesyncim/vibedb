@@ -156,41 +156,41 @@ var (
 	// ErrRecoveryJournalCorrupt reports a header whose framing, checksum, or
 	// identity is invalid. A corrupt header fails closed: the paired store
 	// cannot prove which records belong to it.
-	ErrRecoveryJournalCorrupt = errors.New("vibejson: corrupt recovery journal header")
+	ErrRecoveryJournalCorrupt = errors.New("vibedb: corrupt recovery journal header")
 	// ErrRecoveryJournalIdentity reports a header that framed correctly but does
 	// not pair with the selected store root (StoreID or JournalID mismatch). A
 	// referenced-but-mismatched journal must never be replayed onto the store.
-	ErrRecoveryJournalIdentity = errors.New("vibejson: recovery journal identity mismatch")
+	ErrRecoveryJournalIdentity = errors.New("vibedb: recovery journal identity mismatch")
 
 	// ErrRecoveryJournalGeometry reports a paired journal whose page geometry
 	// does not match the store that names it — the bundle halves were built
 	// for different stores even though the identities collide.
-	ErrRecoveryJournalGeometry = errors.New("vibejson: recovery journal geometry mismatch")
+	ErrRecoveryJournalGeometry = errors.New("vibedb: recovery journal geometry mismatch")
 
 	// ErrRecoveryJournalEpoch reports a journal whose base generation is ahead
 	// of the root that selected it: the store file is older than the journal
 	// (a mixed-epoch bundle, typically a restored store beside a live
 	// journal), so acknowledgements recycled during the gap are gone and the
 	// pair must fail closed rather than open with silent loss.
-	ErrRecoveryJournalEpoch = errors.New("vibejson: recovery journal is ahead of the store root")
+	ErrRecoveryJournalEpoch = errors.New("vibedb: recovery journal is ahead of the store root")
 	// ErrRecoveryJournalMissing reports a store root that references a journal
 	// (non-zero JournalID) whose file is absent. This fails closed: the store
 	// may have acknowledged mutations that only the missing journal records.
-	ErrRecoveryJournalMissing = errors.New("vibejson: referenced recovery journal is missing")
+	ErrRecoveryJournalMissing = errors.New("vibedb: referenced recovery journal is missing")
 	// ErrRecoveryJournalFull reports that the next record does not fit the
 	// preallocated capacity. The caller must force a checkpoint, which recycles
 	// the journal head, exactly as staging pressure forces one today.
-	ErrRecoveryJournalFull = errors.New("vibejson: recovery journal is full")
+	ErrRecoveryJournalFull = errors.New("vibedb: recovery journal is full")
 	// ErrRecoveryJournalRecord reports a record that failed framing, checksum,
 	// monotonic-sequence, or semantic validation. Framing/checksum-invalid tails
 	// truncate replay; checksum-authenticated semantic failures are returned and
 	// fail recovery closed.
-	ErrRecoveryJournalRecord = errors.New("vibejson: invalid recovery journal record")
+	ErrRecoveryJournalRecord = errors.New("vibedb: invalid recovery journal record")
 	// errRecoveryJournalTruncatableTail distinguishes damage consistent with an
 	// incomplete/reordered append from a checksum-authenticated semantic error.
 	// Both still match ErrRecoveryJournalRecord for API compatibility; only this
 	// private marker may be swallowed by scanTail and Replay.
-	errRecoveryJournalTruncatableTail = errors.New("vibejson: truncatable recovery journal tail")
+	errRecoveryJournalTruncatableTail = errors.New("vibedb: truncatable recovery journal tail")
 )
 
 func recoveryJournalTailError(reason string) error {

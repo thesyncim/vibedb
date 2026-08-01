@@ -17,20 +17,20 @@ const (
 var (
 	// ErrInvalidWrite reports a buffer index, byte length, file offset, order,
 	// or batch size outside the Device contract.
-	ErrInvalidWrite = errors.New("vibejson: invalid Store page write")
+	ErrInvalidWrite = errors.New("vibedb: invalid Store page write")
 	// ErrOverlappingWrite reports physical ranges that could overwrite one
 	// another or the root descriptor in a single commit.
-	ErrOverlappingWrite = errors.New("vibejson: overlapping Store page writes")
+	ErrOverlappingWrite = errors.New("vibedb: overlapping Store page writes")
 	// ErrDuplicateBuffer reports one staging buffer submitted by two concurrent
 	// data-page writes. The root may reuse a data buffer because the data phase
 	// completes before the root phase begins.
-	ErrDuplicateBuffer = errors.New("vibejson: duplicate Store page buffer")
+	ErrDuplicateBuffer = errors.New("vibedb: duplicate Store page buffer")
 	// ErrCommitOutcomeUnknown reports a persistence failure after the alternate
 	// root write may have reached the storage stack. The checksummed double root
 	// makes the file recoverable, but only recovery can determine whether the
 	// old or new generation won. A live writer must therefore stop and reopen
 	// instead of retrying a mutation whose outcome it cannot know.
-	ErrCommitOutcomeUnknown = errors.New("vibejson: Store commit outcome is unknown; reopen required")
+	ErrCommitOutcomeUnknown = errors.New("vibedb: Store commit outcome is unknown; reopen required")
 )
 
 func commitOutcomeUnknown(err error) error {

@@ -22,16 +22,16 @@ const (
 var (
 	// ErrSuperblockCorrupt reports an invalid root header, checksum, extent, or
 	// referenced root page.
-	ErrSuperblockCorrupt = errors.New("vibejson: corrupt Store superblock")
+	ErrSuperblockCorrupt = errors.New("vibedb: corrupt Store superblock")
 	// ErrSuperblockNotFound reports that neither fixed root copy is valid.
-	ErrSuperblockNotFound = errors.New("vibejson: no valid Store superblock")
+	ErrSuperblockNotFound = errors.New("vibedb: no valid Store superblock")
 	// ErrSuperblockConflict reports two individually valid root copies that do
 	// not belong to one monotonic Store history.
-	ErrSuperblockConflict = errors.New("vibejson: conflicting Store superblocks")
+	ErrSuperblockConflict = errors.New("vibedb: conflicting Store superblocks")
 	// ErrRecoveryBufferTooSmall reports caller scratch that cannot hold one
 	// referenced page or catalog. Recovery never silently selects an older root
 	// merely because caller memory is undersized.
-	ErrRecoveryBufferTooSmall = errors.New("vibejson: Store recovery buffer too small")
+	ErrRecoveryBufferTooSmall = errors.New("vibedb: Store recovery buffer too small")
 
 	pageChecksumTable = crc32.MakeTable(crc32.Castagnoli)
 )

@@ -10,15 +10,15 @@ import (
 var (
 	// ErrLeaseCapacity applies bounded backpressure when every configured
 	// snapshot-generation lease is active.
-	ErrLeaseCapacity = errors.New("vibejson: Store snapshot lease capacity exhausted")
+	ErrLeaseCapacity = errors.New("vibedb: Store snapshot lease capacity exhausted")
 	// ErrGenerationLeasesClosed reports acquisition after shutdown starts.
-	ErrGenerationLeasesClosed = errors.New("vibejson: Store snapshot leases are closed")
+	ErrGenerationLeasesClosed = errors.New("vibedb: Store snapshot leases are closed")
 	// ErrLeasesActive reports an attempted close while readers still protect
 	// generations and their physical extents.
-	ErrLeasesActive = errors.New("vibejson: Store snapshot leases are still active")
+	ErrLeasesActive = errors.New("vibedb: Store snapshot leases are still active")
 	// ErrRetiredExtentCapacity reports that reclamation metadata reached its
 	// configured bound before readers or recovery roots released old extents.
-	ErrRetiredExtentCapacity = errors.New("vibejson: Store retired extent capacity exhausted")
+	ErrRetiredExtentCapacity = errors.New("vibedb: Store retired extent capacity exhausted")
 )
 
 // GenerationLeaseOptions fixes snapshot tracking memory at construction.
