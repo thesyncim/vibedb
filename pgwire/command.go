@@ -12,8 +12,8 @@ import (
 //
 // # Why classification happens before parsing
 //
-// The unified SQL front end parses the bounded SELECT/INSERT/UPDATE/DELETE/
-// CREATE TABLE/CREATE INDEX surface. Protocol-only session commands,
+// The unified SQL front end parses the bounded SELECT, stored-row mutation,
+// and catalog DDL surface. Protocol-only session commands,
 // transaction aliases and modes, and unsupported SQL leading kinds still need
 // routing before that parse. A client needs syntax and missing capability
 // distinguished because the SQLSTATE it branches on is the difference between
@@ -47,7 +47,7 @@ type statementKind int
 const (
 	// kindSelect is handed to the SQL front end.
 	kindSelect statementKind = iota
-	// kindCatalogSQL is INSERT, UPDATE, DELETE, or CREATE. The shared typed SQL
+	// kindCatalogSQL is stored-row DML or catalog DDL. The shared typed SQL
 	// runtime parses the precise bounded subset and supplies DDL/DML semantics.
 	kindCatalogSQL
 	kindBegin
@@ -73,12 +73,10 @@ const (
 // a reader of the message can act on, which is the whole reason the table
 // exists instead of a default branch saying "unsupported statement".
 var unsupportedStatements = map[string]string{
-	"MERGE":    "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
-	"TRUNCATE": "TRUNCATE is not supported; use a bounded DELETE predicate",
-	"COPY":     "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
+	"MERGE": "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
+	"COPY":  "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
 
 	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
-	"DROP":    "DROP is not in the bounded catalog subset; destructive catalog operations remain with the database owner",
 	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",
@@ -126,7 +124,7 @@ func classify(src string) (statementKind, string) {
 		return kindEmpty, ""
 	case "SELECT", "EXPLAIN":
 		return kindSelect, ""
-	case "INSERT", "UPDATE", "DELETE", "CREATE":
+	case "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "TRUNCATE":
 		return kindCatalogSQL, ""
 	case "BEGIN", "START":
 		return kindBegin, ""

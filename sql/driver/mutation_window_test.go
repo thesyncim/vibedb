@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -115,5 +116,36 @@ func TestMutationOrderByPrimaryKeyLimitTransaction(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("remaining rows after transactional ordered DELETE = %d, want 2", count)
+	}
+}
+
+func TestMutationLimitAtExactBatchDocumentBound(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 65; i++ {
+		doc := fmt.Sprintf(`{"id":"%03d"}`, i)
+		if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := db.Exec(`DELETE FROM docs ORDER BY id LIMIT 64`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 64 {
+		t.Fatalf("DELETE LIMIT 64 affected %d rows, want 64", affected)
+	}
+	var remaining int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("rows after DELETE LIMIT 64 = %d, want 1", remaining)
 	}
 }

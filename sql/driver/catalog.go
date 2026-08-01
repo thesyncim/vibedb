@@ -259,6 +259,17 @@ func openDatabaseWithSync(
 			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
 		}
 		t.file, t.collection = file, collection
+		if !meta.Materialized {
+			// A table's unique storage identity is catalog-owned before its first
+			// mutation. First materialization publishes and fences the complete
+			// durable store before the catalog mirror is advanced, so a crash in
+			// that window leaves a valid authoritative store paired with the old
+			// false flag. Successful durable recovery is the commit record: adopt
+			// the store and repair the lagging catalog rather than making the
+			// database permanently unreopenable.
+			meta.Materialized = true
+			d.catalogWritePending = true
+		}
 		changed, syncErr := syncTableIndexMeta(t)
 		if syncErr != nil {
 			return nil, fmt.Errorf(
@@ -268,12 +279,6 @@ func openDatabaseWithSync(
 		}
 		if changed {
 			d.catalogWritePending = true
-		}
-		if !meta.Materialized {
-			return nil, fmt.Errorf(
-				"vibedb: SQL catalog table %q has a data file but is not marked materialized",
-				name,
-			)
 		}
 	}
 	if d.catalogWritePending {
@@ -589,13 +594,13 @@ func (d *database) retryNamespaceFencesLocked() error {
 	return nil
 }
 
-// settleDroppedTablesLocked finishes the physical half of a DROP TABLE after
-// its catalog entry has been durably removed. A live snapshot may keep the
-// durable collection from closing immediately; that is not a catalog failure
-// and is retried on a later catalog operation or final database close. The
-// table file is never removed before the catalog publication, so a crash in
-// this cleanup window leaves only an unreachable orphan, not a catalog entry
-// whose data file disappeared.
+// settleDroppedTablesLocked finishes physical retirement after DROP TABLE,
+// TRUNCATE, or a storage-replacing DROP INDEX has durably published its catalog
+// state. A live snapshot may keep the old collection from closing immediately;
+// that is not a catalog failure and is retried on a later catalog operation or
+// final database close. The old file is never removed before catalog
+// publication, so a crash in this cleanup window leaves only an unreachable
+// orphan, not a catalog entry whose data file disappeared.
 func (d *database) settleDroppedTablesLocked() error {
 	if len(d.retired) == 0 {
 		return nil
@@ -621,7 +626,7 @@ func (d *database) settleDroppedTablesLocked() error {
 					continue
 				}
 				return retainFailure(i, fmt.Errorf(
-					"%w: finish DROP TABLE %q: %v",
+					"%w: finish retiring SQL table incarnation %q: %v",
 					durable.ErrCommitOutcomeUnknown, retired.name, err,
 				))
 			}
@@ -630,7 +635,7 @@ func (d *database) settleDroppedTablesLocked() error {
 		if retired.file != nil {
 			if err := retired.file.Close(); err != nil {
 				return retainFailure(i, fmt.Errorf(
-					"%w: close dropped SQL table %q: %v",
+					"%w: close retired SQL table incarnation %q: %v",
 					durable.ErrCommitOutcomeUnknown, retired.name, err,
 				))
 			}
@@ -667,7 +672,7 @@ func (d *database) settleDroppedTablesLocked() error {
 		if err := d.directorySync(d.dataDir); err != nil {
 			d.retired = remaining
 			return fmt.Errorf(
-				"%w: sync SQL table directory after DROP TABLE: %w",
+				"%w: sync SQL table directory after table retirement: %w",
 				durable.ErrCommitOutcomeUnknown, err,
 			)
 		}
@@ -988,56 +993,15 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		}
 		return nil, errors.Join(err, cleanupErr)
 	}
-	if err := publishNewPath(tmpPath, path); err != nil {
-		// A platform rename error should mean the final name was not
-		// published. Check anyway: if the namespace says otherwise, retain the
-		// live handle and report an unknown outcome rather than make a retry
-		// collide with an acknowledged-looking table file.
-		if _, statErr := os.Stat(path); statErr == nil {
-			t.file, t.collection = file, collection
-			d.tableDirFencePending = true
-			t.meta.Materialized = true
-			d.catalogWritePending = true
-			return t, fmt.Errorf(
-				"%w: publish first SQL table file: %w",
-				durable.ErrCommitOutcomeUnknown, err,
-			)
-		}
-		cleanupErr := errors.Join(collection.Close(), file.Close())
-		if removeErr := os.Remove(tmpPath); removeErr != nil &&
-			!os.IsNotExist(removeErr) {
-			cleanupErr = errors.Join(cleanupErr, removeErr)
-		}
-		return nil, errors.Join(err, cleanupErr)
+	file, collection, err = d.publishTableStorageLocked(
+		tmpPath, path, file, collection, durableOptions(t),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("vibedb: publish first SQL table: %w", err)
 	}
 	t.file, t.collection = file, collection
-	d.tableDirFencePending = true
 	t.meta.Materialized = true
 	d.catalogWritePending = true
-	// A synchronous (the driver's default) or journal-opted collection writes a
-	// recovery-journal sibling beside the store file, and reopen resolves it by
-	// the store file's final path, so it must move with the rename above.
-	// Ordering is not crash-critical: the table becomes durably known only when
-	// the catalog write below records it, and a crash before that leaves both
-	// files as harmless orphans no reopen consults. The live handle is retained
-	// on failure exactly as the directory-sync failure below does.
-	if err := publishJournalSibling(tmpPath, path); err != nil {
-		return t, fmt.Errorf(
-			"%w: publish first SQL table journal: %w",
-			durable.ErrCommitOutcomeUnknown, err,
-		)
-	}
-	if err := d.directorySync(d.dataDir); err != nil {
-		// The durable file and its live namespace entry now exist. Retain the
-		// matching live table state: removing it would turn a failed fence into
-		// another unfenced namespace mutation and could make a retry duplicate
-		// an already committed first write.
-		return t, fmt.Errorf(
-			"%w: sync SQL table directory: %w",
-			durable.ErrCommitOutcomeUnknown, err,
-		)
-	}
-	d.tableDirFencePending = false
 	if err := d.settleCatalogLocked(); err != nil {
 		return t, err
 	}

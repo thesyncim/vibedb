@@ -838,7 +838,10 @@ func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
 		case kindCatalogSQL:
 			catalogSQL = true
 			scan := scanner{src: text}
-			if strings.EqualFold(scan.word(), "CREATE") {
+			leader := scan.word()
+			if strings.EqualFold(leader, "CREATE") ||
+				strings.EqualFold(leader, "DROP") ||
+				strings.EqualFold(leader, "TRUNCATE") {
 				ddl = true
 			} else {
 				dml = true
@@ -866,7 +869,7 @@ func (s *session) preflightSimpleQuery(src string) (bool, *pgError) {
 	if ddl {
 		return false, newError(sqlstateFeatureNotSupported,
 			"DDL must be the only non-empty statement in a simple Query message").
-			withHint("send CREATE TABLE or CREATE INDEX in its own Query message")
+			withHint("send each CREATE, DROP, or TRUNCATE statement in its own Query message")
 	}
 	if sessionChange && catalogSQL {
 		return false, newError(sqlstateFeatureNotSupported,
@@ -1284,8 +1287,7 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	if s.takeCancel() {
-		if kind != sqlast.KindCreateTable &&
-			kind != sqlast.KindCreateIndex && kind != sqlast.KindDropTable {
+		if !runtimeKindIsDDL(kind) {
 			return queryCanceled()
 		}
 		// DDL's atomic catalog publication is the commit point and cannot
@@ -1313,8 +1315,22 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 		return "CREATE INDEX"
 	case sqlast.KindDropTable:
 		return "DROP TABLE"
+	case sqlast.KindTruncate:
+		return "TRUNCATE TABLE"
+	case sqlast.KindDropIndex:
+		return "DROP INDEX"
 	default:
 		return kind.String()
+	}
+}
+
+func runtimeKindIsDDL(kind sqlast.Kind) bool {
+	switch kind {
+	case sqlast.KindCreateTable, sqlast.KindCreateIndex, sqlast.KindDropTable,
+		sqlast.KindTruncate, sqlast.KindDropIndex:
+		return true
+	default:
+		return false
 	}
 }
 

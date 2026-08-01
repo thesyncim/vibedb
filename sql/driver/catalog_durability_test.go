@@ -206,7 +206,7 @@ func TestIndexFenceFailureKeepsPublishedDefinition(t *testing.T) {
 	}
 }
 
-func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
+func TestTableFileFenceFailureCleansUnpublishedFirstWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.vdb")
 	database, err := openDatabase(path)
 	if err != nil {
@@ -245,14 +245,14 @@ func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
 		!errors.Is(err, fenceFailure) {
 		t.Fatalf("first-write fence failure = %v, want unknown outcome", err)
 	}
-	if table == nil || table.collection == nil {
-		t.Fatal("committed first write was discarded after namespace publication")
+	if table != nil {
+		t.Fatal("unfenced first write returned a live table")
 	}
-	if _, statErr := os.Stat(database.tablePath("docs")); statErr != nil {
-		t.Fatalf("published table file: %v", statErr)
+	if _, statErr := os.Stat(database.tablePath("docs")); !os.IsNotExist(statErr) {
+		t.Fatalf("unpublished table file survived fenced cleanup: %v", statErr)
 	}
 	if !database.tableDirFencePending {
-		t.Fatal("failed table namespace fence was not retained for retry")
+		t.Fatal("failed cleanup namespace fence was not retained for retry")
 	}
 
 	var retried []string
@@ -296,8 +296,8 @@ func TestTableFileFenceFailureKeepsCommittedFirstWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !found || string(raw) != `{"id":"a","kind":"x"}` {
-		t.Fatalf("reopened first write = (%s, %t), want committed document", raw, found)
+	if found {
+		t.Fatalf("reopened unpublished first write = (%s, %t), want absent", raw, found)
 	}
 	secondKey, err := primaryScalarKey("b")
 	if err != nil {

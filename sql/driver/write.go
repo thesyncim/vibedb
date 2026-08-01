@@ -288,6 +288,22 @@ func (d *database) createIndexContext(
 	d.mu.Unlock()
 
 	_, err = collection.CreateIndexContext(ctx, definition.Definition)
+	// Catalog DDL may replace the table while the durable online build is
+	// running without the catalog mutex. Check the exact object identity before
+	// interpreting any durable result: retirement can deliberately close the
+	// old collection, and that implementation detail must surface as a logical
+	// serialization conflict rather than ErrClosed. A second identity check is
+	// still required under the publication lock below because replacement can
+	// race this observation.
+	d.mu.RLock()
+	current, exists := d.tables[definition.Table]
+	d.mu.RUnlock()
+	if !exists || current != t {
+		return nil, fmt.Errorf(
+			"%w: table %q storage changed during CREATE INDEX",
+			ErrTransactionConflict, definition.Table,
+		)
+	}
 	if errors.Is(err, store.ErrIndexExists) && definition.IfNotExists {
 		err = nil
 	}
@@ -306,9 +322,19 @@ func (d *database) createIndexContext(
 	}
 
 	if err := lockContext(ctx, &d.mu); err != nil {
-		// The durable catalog is already authoritative. A canceled SQL metadata
-		// mirror is repaired on reopen or by the next catalog settlement.
+		// The durable catalog is already authoritative for this exact storage
+		// incarnation. A canceled SQL metadata mirror is repaired on reopen or by
+		// the next catalog settlement. If catalog DDL replaced the incarnation
+		// while the online build ran, the committed index belongs only to retired
+		// storage and must never be acknowledged as part of the current table.
 		d.mu.Lock()
+		if current, exists := d.tables[definition.Table]; !exists || current != t {
+			d.mu.Unlock()
+			return nil, fmt.Errorf(
+				"%w: table %q storage changed during CREATE INDEX",
+				ErrTransactionConflict, definition.Table,
+			)
+		}
 		_, _ = syncTableIndexMeta(t)
 		d.catalogWritePending = true
 		d.mu.Unlock()
@@ -318,6 +344,12 @@ func (d *database) createIndexContext(
 		)
 	}
 	defer d.mu.Unlock()
+	if current, exists := d.tables[definition.Table]; !exists || current != t {
+		return nil, fmt.Errorf(
+			"%w: table %q storage changed during CREATE INDEX",
+			ErrTransactionConflict, definition.Table,
+		)
+	}
 	if _, syncErr := syncTableIndexMeta(t); syncErr != nil {
 		d.catalogWritePending = true
 		return nil, fmt.Errorf(

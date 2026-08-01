@@ -356,8 +356,8 @@
 // DO UPDATE / ON DUPLICATE KEY, a path assignment in SET, two
 // assignments in one UPDATE, UPDATE ... FROM, DELETE ... USING, GROUP BY /
 // HAVING on a mutation, unsupported mutation OFFSET or ordering forms, a table
-// alias on a single-collection statement, DROP INDEX, ALTER, MERGE, REPLACE,
-// TRUNCATE, CREATE VIEW, CREATE UNIQUE INDEX, CREATE TABLE ... AS SELECT, a
+// alias on a single-collection statement, ALTER, MERGE, REPLACE, CREATE VIEW,
+// CREATE UNIQUE INDEX, CREATE TABLE ... AS SELECT, a
 // partial index, an index method or key
 // direction, DEFAULT, UNIQUE, CHECK, and FOREIGN KEY. INSERT also refuses the
 // old key/document pair: VALUES without a field list contains exactly one
@@ -367,6 +367,8 @@
 // documents before publication. DELETE projects pre-delete documents, while
 // UPDATE projects replacement documents. INSERT ON CONFLICT DO NOTHING
 // projects only rows that were actually inserted.
+// TRUNCATE [TABLE] and DROP INDEX [IF EXISTS] are represented explicitly;
+// storage adapters decide how to publish their collection-level changes.
 //
 // Which backend accepts which statement is a property of the engine rather than
 // of this grammar, and belongs to the layer that executes: see the sql/driver

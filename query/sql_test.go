@@ -625,6 +625,7 @@ func TestSQLLikePatterns(t *testing.T) {
 	set := mustSegment(t,
 		`{"name":"alpha"}`,
 		`{"name":"ALPHA"}`,
+		`{"name":"beta"}`,
 		`{"name":"a_b"}`,
 		`{"name":"a%b"}`,
 		`{"name":7}`,
@@ -636,8 +637,8 @@ func TestSQLLikePatterns(t *testing.T) {
 	}{
 		{`SELECT name FROM t WHERE name LIKE 'a%'`, []string{`"alpha"`, `"a_b"`, `"a%b"`}},
 		{`SELECT name FROM t WHERE name ILIKE 'a%'`, []string{`"alpha"`, `"ALPHA"`, `"a_b"`, `"a%b"`}},
-		{`SELECT name FROM t WHERE name NOT LIKE 'a%'`, []string{`"ALPHA"`, `7`}},
-		{`SELECT name FROM t WHERE name NOT ILIKE 'a%'`, []string{`7`}},
+		{`SELECT name FROM t WHERE name NOT LIKE 'a%'`, []string{`"ALPHA"`, `"beta"`}},
+		{`SELECT name FROM t WHERE name NOT ILIKE 'a%'`, []string{`"beta"`}},
 		{`SELECT name FROM t WHERE name LIKE 'a\_%'`, []string{`"a_b"`}},
 	}
 	for _, tc := range checks {

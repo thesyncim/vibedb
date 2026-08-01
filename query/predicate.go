@@ -62,6 +62,9 @@ const (
 	predInBound
 	// predLike matches a string column against a SQL LIKE pattern.
 	predLike
+	// predIsString is an internal SQL three-valued-logic guard for LIKE. It is
+	// not exported because the builder surface has no general JSON type tests.
+	predIsString
 )
 
 // Cmp compares the value at path against a typed literal. The literal's Go
@@ -101,6 +104,10 @@ func Like(path, pattern string) Predicate {
 // characters. Wildcards and escapes retain the same meaning as Like.
 func ILike(path, pattern string) Predicate {
 	return Predicate{kind: predLike, path: path, pattern: pattern, insensitive: true}
+}
+
+func isString(path string) Predicate {
+	return Predicate{kind: predIsString, path: path}
 }
 
 // Contains tests PostgreSQL jsonb containment (@>): whether the value at path
@@ -428,7 +435,7 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 			return nil, err
 		}
 		if err := validateLikePattern(p.pattern); err != nil {
-			return nil, fmt.Errorf("query: LIKE pattern: %w", err)
+			return nil, fmt.Errorf("%w: %v", ErrInvalidPattern, err)
 		}
 		cp := c.nodes.one()
 		*cp = compiledPredicate{
@@ -491,6 +498,14 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		}
 		cp := c.nodes.one()
 		*cp = compiledPredicate{kind: predIsNull, col: col}
+		return cp, nil
+	case predIsString:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{kind: predIsString, col: col}
 		return cp, nil
 	case predAnd, predOr, predNot:
 		kids := c.kids.alloc(len(p.kids))[:0]
@@ -823,6 +838,14 @@ func (p *compiledPredicate) selectSpan(dst []int, cols [][]scalar, lo, hi int) (
 			}
 		}
 		return dst, true
+	case predIsString:
+		col := cols[p.col][lo:hi]
+		for row, cell := range col {
+			if cell.kind == kindString {
+				dst = append(dst, lo+row)
+			}
+		}
+		return dst, true
 	default:
 		// predInBound declines with the rest. Hoisting would buy nothing: a
 		// join leaf's per-row cost is the membership search or the keyed probe
@@ -864,6 +887,8 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return present(cols[p.col][row])
 	case predIsNull:
 		return cols[p.col][row].kind == kindNull
+	case predIsString:
+		return cols[p.col][row].kind == kindString
 	case predAnd:
 		for _, kid := range p.kids {
 			if !kid.eval(cols, row, s) {
@@ -924,8 +949,8 @@ func likeMatch(pattern, text string, insensitive bool) bool {
 			ti += runeSize(text, ti)
 			continue
 		case star >= 0:
-			ti += runeSize(text, starText)
-			starText = ti
+			starText += runeSize(text, starText)
+			ti = starText
 			pi = star
 			continue
 		default:

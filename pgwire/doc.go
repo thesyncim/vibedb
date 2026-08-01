@@ -103,10 +103,11 @@
 //
 // # What does not work
 //
-//   - DDL inside a transaction. CREATE TABLE and CREATE INDEX are atomic
-//     individually, but the catalog cannot yet publish through the transaction
-//     overlay. DDL must be the only non-empty statement in a simple Query and
-//     the only catalog execution between extended-protocol Sync points.
+//   - DDL inside a transaction. CREATE, DROP, and TRUNCATE operations are
+//     atomic individually, but the catalog cannot yet publish through the
+//     transaction overlay. DDL must be the only non-empty statement in a
+//     simple Query and the only catalog execution between extended-protocol
+//     Sync points.
 //     Extended DDL publishes at Execute; if a client violates that boundary by
 //     executing a later command before Sync, the later command is refused but
 //     cannot retroactively roll back the completed DDL.
@@ -123,10 +124,12 @@
 //     FETCH), SQL-level PREPARE/EXECUTE, and replication.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
-//   - The SQL constructs the dialect itself refuses — subqueries, right/full outer joins,
-//     LIKE, CASE, CAST, arithmetic, DISTINCT, set operations, window functions,
-//     and scalar functions. Each is refused by the parser with a message naming
-//     the missing capability and a position;
+//   - The SQL constructs the dialect itself refuses — correlated and FROM-list
+//     subqueries, full/cross/natural joins, CASE, CAST, arithmetic, set
+//     operations, window functions, and scalar functions. RIGHT JOIN,
+//     uncorrelated predicate subqueries, LIKE/ILIKE, and non-aggregate SELECT
+//     DISTINCT are supported. Each refusal carries a message naming the missing
+//     capability and a position;
 //     [github.com/thesyncim/vibedb/sql] documents the full list and why.
 //
 // # Result types

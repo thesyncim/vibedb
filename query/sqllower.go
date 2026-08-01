@@ -1,11 +1,19 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"math"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
+
+// ErrParameterType reports a bound SQL parameter whose runtime type is not
+// accepted by its syntactic role.
+var ErrParameterType = errors.New("query: SQL parameter has incompatible type")
+
+// ErrInvalidPattern reports a malformed literal or bound LIKE/ILIKE pattern.
+var ErrInvalidPattern = errors.New("query: invalid LIKE pattern")
 
 // Lowering a parsed SQL statement onto the builder's plan.
 //
@@ -748,7 +756,7 @@ func (s *Statement) likeForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		if e.Insensitive {
 			pred = ILike(s.spec(e.Path), "")
 		}
-		return leafForm{pred: pred, guard: s.c.not(IsNull(s.spec(e.Path)))}, nil
+		return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
 	}
 	value, known, err := s.operand(e.Value, args)
 	if err != nil {
@@ -764,13 +772,16 @@ func (s *Statement) likeForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	case string:
 		pattern = v
 	default:
-		return leafForm{}, fmt.Errorf("query: LIKE pattern must be bound to a string, got %T", value)
+		return leafForm{}, fmt.Errorf(
+			"%w: LIKE pattern must be a string, got %T",
+			ErrParameterType, value,
+		)
 	}
 	pred := Like(s.spec(e.Path), pattern)
 	if e.Insensitive {
 		pred = ILike(s.spec(e.Path), pattern)
 	}
-	return leafForm{pred: pred, guard: s.c.not(IsNull(s.spec(e.Path)))}, nil
+	return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
 }
 
 func (s *Statement) subqueryCompareForm(e *sqlast.Expr) (leafForm, error) {

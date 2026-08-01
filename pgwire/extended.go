@@ -11,7 +11,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/query"
-	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -645,8 +644,7 @@ func (s *session) beforeExtendedExecute(stmt *prepared) error {
 			withHint("send Sync after the session command before executing stored-row SQL")
 	}
 	kind := stmt.runtime.Kind()
-	ddl := kind == sqlast.KindCreateTable ||
-		kind == sqlast.KindCreateIndex || kind == sqlast.KindDropTable
+	ddl := runtimeKindIsDDL(kind)
 	if ddl {
 		if s.extendedSQL {
 			return newError(sqlstateFeatureNotSupported,

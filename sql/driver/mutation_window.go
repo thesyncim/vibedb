@@ -84,7 +84,7 @@ func (w mutationWindow) selectionLimit(maxDocuments int) int {
 	if !w.limited {
 		return 0
 	}
-	if w.limit < maxDocuments {
+	if w.limit <= maxDocuments {
 		return w.limit
 	}
 	if maxDocuments == int(^uint(0)>>1) {

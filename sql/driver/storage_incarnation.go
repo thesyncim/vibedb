@@ -465,28 +465,88 @@ func (d *database) buildReplacementStorageLocked(
 			collection, file, tmpPath,
 		))
 	}
-	if err := publishNewPath(tmpPath, path); err != nil {
-		return errors.Join(err, d.discardUnpublishedStorageLocked(
-			collection, file, tmpPath, path,
-		))
+	file, collection, err = d.publishTableStorageLocked(
+		tmpPath, path, file, collection, durableOptions(candidate),
+	)
+	if err != nil {
+		return fmt.Errorf("vibedb: publish replacement SQL storage: %w", err)
 	}
-	if err := publishJournalSibling(tmpPath, path); err != nil {
-		return errors.Join(err, d.discardUnpublishedStorageLocked(
-			collection, file, tmpPath, path,
-		))
-	}
-	d.tableDirFencePending = true
-	if err := d.directorySync(d.dataDir); err != nil {
-		return errors.Join(fmt.Errorf(
-			"%w: fence replacement SQL storage: %w",
-			durable.ErrCommitOutcomeUnknown, err,
-		), d.discardUnpublishedStorageLocked(collection, file, path))
-	}
-	d.tableDirFencePending = false
 	candidate.file = file
 	candidate.collection = collection
 	candidate.meta.Materialized = true
 	return nil
+}
+
+// publishTableStorageLocked publishes a fully built durable collection without
+// retaining any open store or recovery-journal handle across the namespace
+// moves. Windows rename semantics require that stronger ownership boundary for
+// the journal; using it on every platform also makes the publication protocol
+// uniform and easy to audit:
+//
+//  1. checkpoint and close the unpublished collection and descriptor,
+//  2. atomically move its store and journal siblings,
+//  3. fence the table directory,
+//  4. reopen the final name before any catalog cutover.
+//
+// A crash before the catalog cutover leaves either catalog-owned first-table
+// storage (adopted by openDatabase) or an unreferenced replacement identity
+// (removed by bounded orphan recovery). An in-process failure attempts a
+// fenced cleanup and never returns a live half-published candidate.
+func (d *database) publishTableStorageLocked(
+	tmpPath string,
+	path string,
+	file *os.File,
+	collection *durable.Collection,
+	options durable.Options,
+) (*os.File, *durable.Collection, error) {
+	if err := d.collectionClose(collection); err != nil {
+		return nil, nil, errors.Join(err, d.discardUnpublishedStorageLocked(
+			collection, file, tmpPath,
+		))
+	}
+	collection = nil
+	if err := file.Close(); err != nil {
+		return nil, nil, errors.Join(err, d.discardUnpublishedStorageLocked(
+			nil, file, tmpPath,
+		))
+	}
+	file = nil
+
+	cleanup := func(err error) (*os.File, *durable.Collection, error) {
+		return nil, nil, errors.Join(err, d.discardUnpublishedStorageLocked(
+			nil, nil, tmpPath, path,
+		))
+	}
+	if err := publishNewPath(tmpPath, path); err != nil {
+		return cleanup(err)
+	}
+	if err := publishJournalSibling(tmpPath, path); err != nil {
+		return cleanup(err)
+	}
+	d.tableDirFencePending = true
+	if err := d.directorySync(d.dataDir); err != nil {
+		return cleanup(fmt.Errorf(
+			"%w: fence published SQL storage: %w",
+			durable.ErrCommitOutcomeUnknown, err,
+		))
+	}
+	d.tableDirFencePending = false
+
+	finalFile, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return cleanup(err)
+	}
+	// The durable page catalog is authoritative for exact-index definitions;
+	// this is the same recovery contract used by openDatabase after an online
+	// index publication races the SQL metadata mirror.
+	options.Indexes = nil
+	finalCollection, err := durable.Open(finalFile, options)
+	if err != nil {
+		closeErr := finalFile.Close()
+		_, _, cleanupErr := cleanup(errors.Join(err, closeErr))
+		return nil, nil, cleanupErr
+	}
+	return finalFile, finalCollection, nil
 }
 
 func (d *database) discardTableStorageLocked(name string, t *table) error {
