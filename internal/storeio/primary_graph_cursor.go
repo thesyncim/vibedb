@@ -40,6 +40,7 @@ type PrimaryGraphCursor struct {
 	anchor      GlobalTabletCatalogAnchorView
 	rowRank     int
 	leafLease   PageLease
+	leafBucket  BucketID
 	rows        CommonPrimaryLeafIterator
 
 	// Unified rows reconstruct documents into spliceScratch. The scratch is
@@ -275,11 +276,75 @@ func (c *PrimaryGraphCursor) openLeaf(
 		)
 	}
 	c.unifiedLeaf = uv
+	c.leafBucket = route.Bucket
 	c.unifiedRenderer.Reset(uv)
 	if lowerBound {
 		c.rows = uv.env.Range(c.lower, nil)
 	} else {
 		c.rows = uv.env.AllRows()
+	}
+	return nil
+}
+
+// CurrentUnifiedLeaf returns the admitted leaf selected by the cursor and its
+// stable bucket identity. The view borrows the cursor's current page lease and
+// remains valid only until NextLeaf or Close.
+func (c *PrimaryGraphCursor) CurrentUnifiedLeaf() (
+	BucketID, CommonPrimaryUnifiedLeafView, bool,
+) {
+	if c == nil || c.done || c.leafLease.Page() == nil {
+		return 0, CommonPrimaryUnifiedLeafView{}, false
+	}
+	return c.leafBucket, c.unifiedLeaf, true
+}
+
+// CurrentUnifiedLeafPage returns the admitted bytes selected by the cursor and
+// their stable bucket identity. The page borrows the cursor's current lease and
+// remains valid only until NextLeaf or Close. It is the rooted sparse-scan
+// counterpart to CurrentUnifiedLeaf for helpers that already accept an
+// admitted page image.
+func (c *PrimaryGraphCursor) CurrentUnifiedLeafPage() (
+	BucketID, []byte, bool,
+) {
+	if c == nil || c.done || c.leafLease.Page() == nil {
+		return 0, nil, false
+	}
+	return c.leafBucket, c.leafLease.Page(), true
+}
+
+// VisitCurrentLeafAllInline drains only the current unbounded leaf through the
+// fused sequential decoder. An overflow row stops the drain and returns its
+// borrowed key and chain head; re-enter to continue the same leaf. A zero ref
+// means the current leaf is exhausted. The caller advances explicitly with
+// NextLeaf, which lets an overlay-aware scan use this fused path for clean
+// leaves and a generation merge only for dirty leaves.
+func (c *PrimaryGraphCursor) VisitCurrentLeafAllInline(
+	fn func(key, value []byte) error,
+) ([]byte, PageRef, error) {
+	if c == nil || c.done || fn == nil {
+		return nil, PageRef{}, nil
+	}
+	if len(c.lower) != 0 || len(c.upper) != 0 || len(c.prefix) != 0 {
+		return nil, PageRef{}, fmt.Errorf(
+			"%w: bounded current-leaf drain", ErrInvalidWrite,
+		)
+	}
+	key, raw, err := c.visitCurrentLeafAllInline(fn)
+	if err != nil || key == nil {
+		return nil, PageRef{}, err
+	}
+	return key, decodePageRef(raw), nil
+}
+
+// NextLeaf releases the current leaf and selects its rooted lexical successor.
+// It reports nil at end; CurrentUnifiedLeaf then returns ok=false.
+func (c *PrimaryGraphCursor) NextLeaf() error {
+	if c == nil || c.done {
+		return nil
+	}
+	if err := c.advanceLeaf(); err != nil {
+		c.Close()
+		return err
 	}
 	return nil
 }
@@ -546,6 +611,7 @@ func (c *PrimaryGraphCursor) nextTablet() (PageRef, bool, error) {
 
 func (c *PrimaryGraphCursor) releaseAnchor() {
 	c.leafLease.Release()
+	c.leafBucket = 0
 	c.rows = CommonPrimaryLeafIterator{}
 	c.unifiedLeaf = CommonPrimaryUnifiedLeafView{}
 	c.anchorLease.Release()

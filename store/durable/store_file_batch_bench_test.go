@@ -16,10 +16,13 @@ import (
 // dirty pages before its single publication.
 func benchBatchOptions(documents int) Options {
 	return Options{
-		Collection:        store.Options{ChunkDocuments: 64},
-		ResidentBytes:     512 << 20,
-		Backend:           BackendPortable,
-		Durability:        DurabilityAsyncVisible,
+		Collection:    store.Options{ChunkDocuments: 64},
+		ResidentBytes: 512 << 20,
+		Backend:       BackendPortable,
+		// Update is a deferred-canonical publication capability. Benchmark the
+		// shipped buffered lane so every Update arm measures the batch path it
+		// names instead of failing the unsupported async-visible lane.
+		Durability:        DurabilityBufferedVisible,
 		MaxRetiredExtents: 1 << 17,
 		MaxBatchDocuments: documents,
 	}

@@ -14,8 +14,10 @@ var ErrBatchTooLarge = errors.New("vibejson: collection write batch exceeds conf
 // into a later caller's mutations.
 var ErrBatchClosed = errors.New("vibejson: collection write batch is no longer active")
 
-// WriteBatch accumulates the mutations one Update publishes as a single
-// generation.
+// WriteBatch accumulates the mutations one Update applies as one logical atomic
+// publication. Most batches need one generation. When the final rows cannot fit
+// the current leaf topology, Update may first publish a content-equivalent
+// topology generation and publish the logical batch in the following generation.
 //
 // Keys are deduplicated as they arrive: mutating the same key twice keeps only
 // the second mutation, so the published generation contains exactly one row
@@ -133,6 +135,30 @@ func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 	return nil
 }
 
+// appendRecovery records one already-validated legacy journal entry without
+// consulting the caller-facing MaxBatchDocuments/MaxBatchBytes admission
+// policy. Those limits are process options and may be smaller on reopen than
+// when the acknowledged record was written; recovery must honor the durable
+// record. The ordinary apply path still validates persisted key/document/schema
+// semantics before publication.
+func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
+	if b == nil || !b.active {
+		return ErrBatchClosed
+	}
+	if _, exists := b.position[string(key)]; exists {
+		return errors.New("vibejson: duplicate key in recovery batch")
+	}
+	entry := writeBatchEntry{
+		keyOffset: len(b.keys), keyLength: len(key),
+		valueOffset: len(b.values), valueLength: len(src), remove: remove,
+	}
+	b.keys = append(b.keys, key...)
+	b.values = append(b.values, src...)
+	b.entries = append(b.entries, entry)
+	b.position[string(b.key(entry))] = len(b.entries) - 1
+	return nil
+}
+
 // replaceValue compacts a superseded value in place and repairs later offsets.
 // Callback history therefore cannot grow the arena beyond MaxBatchBytes even
 // when one key alternates between Put and Delete indefinitely.
@@ -159,18 +185,21 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 	entry.valueLength = len(src)
 }
 
-// Update applies every mutation fn records as one failure-atomic generation.
+// Update applies every mutation fn records as one logical failure-atomic
+// publication.
 //
-// The batch either publishes whole or publishes nothing: an error returned by
-// fn, or by any mutation the batch stages, aborts the transaction and leaves the
-// collection exactly as it was. A prepare-time rejection — a malformed document,
-// an exceeded bound — is ordinary and never poisons; only a durability fence
-// failure does.
+// The logical batch either publishes whole or publishes nothing: an error
+// returned by fn, or by any mutation the batch stages, exposes no subset of its
+// primary rows or exact-index postings. If the final rows cannot fit the current
+// leaf topology, Update may first publish one content-equivalent topology
+// generation. A later logical or durability error can therefore leave the rows
+// and postings unchanged while Generation may advance. A prepare-time rejection
+// is ordinary and never poisons; only a durability fence failure does.
 //
-// The commit is one rewritten leaf frame per touched leaf, one batch journal
-// record synced once, and every leaf pointer flipped under one generation (see
-// updatePrimaryBatch); the batch is carried only by the buffered-visible and
-// sync-journal lanes.
+// The logical commit is one rewritten leaf frame per touched leaf, one batch
+// journal record synced once, and every logical leaf change published in one
+// generation (see updatePrimaryBatch); the batch is carried only by the
+// buffered-visible and sync-journal lanes.
 func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 	if c == nil {
 		return ErrClosed

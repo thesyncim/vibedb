@@ -1586,6 +1586,18 @@ func (v *CommonPrimaryUnifiedLeafView) RowRawAt(rank int) (key, body []byte, ove
 	return key, v.env.payload[valueStart:end:end], v.env.rankOverflow(rank), true
 }
 
+// AllRows returns a sequential iterator over the admitted leaf's borrowed raw
+// rows. Inline bodies remain encoded for
+// [CommonPrimaryUnifiedLeafView.AppendAdmittedRowBody]; overflow bodies are
+// fixed-size chain descriptors. The iterator and every slice it yields borrow
+// the page lease that admitted v and must not outlive it.
+func (v *CommonPrimaryUnifiedLeafView) AllRows() CommonPrimaryLeafIterator {
+	if v == nil {
+		return CommonPrimaryLeafIterator{}
+	}
+	return v.env.AllRows()
+}
+
 // PostingSlots returns the stable posting slot for every lexical row rank.
 // Callers that walk a whole leaf compute the directory inversion once and
 // index the returned fixed array by rank.
@@ -1743,6 +1755,30 @@ type unifiedPrimaryRowRenderer struct {
 	templateSet      bool
 	threeHoles       bool
 	threeStatic      [4][]byte
+}
+
+// CommonPrimaryUnifiedRowRenderer retains one admitted leaf's decoded
+// dictionary directory and hottest template while a caller walks that leaf in
+// lexical order. Its zero value is ready for Reset. It is single-consumer and
+// borrows the admitted view until the next Reset.
+//
+// Use this instead of calling AppendAdmittedRowBody independently for every
+// row: adjacent rows usually share a template, so the retained resolver avoids
+// re-decoding the template and dictionary directories on the scan hot path.
+type CommonPrimaryUnifiedRowRenderer struct {
+	inner unifiedPrimaryRowRenderer
+}
+
+// Reset selects the admitted leaf and clears the prior template cache.
+func (r *CommonPrimaryUnifiedRowRenderer) Reset(
+	view CommonPrimaryUnifiedLeafView,
+) {
+	r.inner.Reset(view)
+}
+
+// Append reconstructs one admitted inline body into dst.
+func (r *CommonPrimaryUnifiedRowRenderer) Append(dst, body []byte) []byte {
+	return r.inner.Append(dst, body)
 }
 
 func (r *unifiedPrimaryRowRenderer) Reset(

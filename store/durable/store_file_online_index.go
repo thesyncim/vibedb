@@ -163,9 +163,8 @@ func (c *Collection) CreateIndexContext(
 	candidate.maxTransactionPages = c.options.maxTransactionPages
 	// Free-fold arenas are fixed, pointer-free process resources. A lower fold
 	// ceiling is always safe (it rebuilds fewer free-image pages per
-	// transaction), and indexed multi-document batches are not exposed by this
-	// layout, so retain both admitted ceilings rather than growing heap-backed
-	// scratch after publication.
+	// transaction). Indexed batches use the same arenas admitted at Create, so
+	// retain both ceilings rather than growing heap-backed scratch at cutover.
 	candidate.singleDocumentFreeFoldLimit =
 		c.options.singleDocumentFreeFoldLimit
 	candidate.freeFoldLimit = c.options.freeFoldLimit

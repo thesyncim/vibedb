@@ -276,13 +276,6 @@ func (t *tx) execMutationCore(
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, tableName)
 	}
-	// An indexed ordered-primary collection cannot batch, but its single-document
-	// Put/Delete path maintains its exact indexes, so whether this transaction is
-	// admissible depends on how many mutations it ultimately stages — which is not
-	// known until commit. Staging proceeds here; commit applies a lone mutation
-	// through Put/Delete and refuses a genuine multi-key batch with the typed
-	// error. This is what lets an autocommit statement, including a pgwire
-	// implicit single-statement transaction, write an indexed table.
 	if t.writeTable != "" && t.writeTable != tableName {
 		return nil, fmt.Errorf(
 			"vibedb: a transaction writes exactly one table; it already writes %q and cannot also write %q",
@@ -761,16 +754,6 @@ func (t *tx) Commit() error {
 	if err := t.validateWriteSet(collection, state); err != nil {
 		return err
 	}
-	if !collection.SupportsUpdate() {
-		// An indexed ordered-primary collection refuses batch publication, but its
-		// single-document Put/Delete path still maintains the exact indexes (see
-		// durable.Collection.SupportsUpdate). A transaction that nets out to a
-		// single mutation — which is what an autocommit statement, including every
-		// pgwire implicit single-statement transaction, resolves to — therefore
-		// applies through that path. Only a genuine multi-key batch is refused
-		// with the typed error.
-		return t.commitSingleMutationLocked(table, collection, state)
-	}
 	beforeGeneration := collection.Generation()
 	err := collection.Update(func(batch *durable.WriteBatch) error {
 		for _, key := range state.order {
@@ -791,50 +774,6 @@ func (t *tx) Commit() error {
 		}
 		return nil
 	})
-	if collectionMutationPublished(collection, beforeGeneration, err) {
-		table.conflicts.recordTransaction(state)
-	}
-	return transactionBatchError(err)
-}
-
-// commitSingleMutationLocked publishes a transaction whose staged mutations net
-// out to at most one key against a collection that cannot batch — an indexed
-// ordered-primary collection. It applies that one mutation through the
-// single-document Put/Delete path, which maintains the collection's exact
-// indexes; a transaction that stages two or more effective mutations genuinely
-// needs the batch publisher and is refused with the typed error. An INSERT that
-// a later DELETE cancels for a key absent at BEGIN nets to nothing, so it counts
-// toward neither the effective total nor a publication.
-func (t *tx) commitSingleMutationLocked(
-	table *table,
-	collection *durable.Collection,
-	state *txTable,
-) error {
-	only := ""
-	effective := 0
-	for _, key := range state.order {
-		entry := state.pending[key]
-		if !entry.existed && entry.remove {
-			continue
-		}
-		effective++
-		only = key
-	}
-	if effective == 0 {
-		return nil
-	}
-	if effective > 1 {
-		return fmt.Errorf("%w: table %q: %w",
-			ErrTransactionIndexedTable, t.writeTable, durable.ErrPrimaryBatchIndexedUnsupported)
-	}
-	entry := state.pending[only]
-	beforeGeneration := collection.Generation()
-	var err error
-	if entry.remove {
-		_, err = collection.Delete([]byte(only))
-	} else {
-		_, err = collection.Put([]byte(only), entry.document)
-	}
 	if collectionMutationPublished(collection, beforeGeneration, err) {
 		table.conflicts.recordTransaction(state)
 	}
@@ -872,9 +811,6 @@ func (t *tx) validateWriteSet(collection *durable.Collection, state *txTable) er
 func transactionBatchError(err error) error {
 	if errors.Is(err, durable.ErrBatchTooLarge) {
 		return fmt.Errorf("%w: %w", ErrTransactionTooLarge, err)
-	}
-	if errors.Is(err, durable.ErrPrimaryBatchIndexedUnsupported) {
-		return fmt.Errorf("%w: %w", ErrTransactionIndexedTable, err)
 	}
 	if errors.Is(err, durable.ErrPrimaryBatchUnsupportedLane) {
 		return fmt.Errorf("%w: %w", ErrTransactionUnsupportedLane, err)

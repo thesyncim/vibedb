@@ -39,14 +39,10 @@ func openBatchCollection(t *testing.T, options Options) (*Collection, *os.File) 
 	return collection, file
 }
 
-// TestCollectionUpdateOnIndexedPrimaryIsUnsupported pins the one honest contract
-// the ordered-primary batch path offers an indexed collection: it refuses. A
-// single-document Put maintains the exact index inside its own publish, but the
-// batch publish path does not yet run the posting maintainer, so serving a stale
-// index is the risk it declines — every batch shape fails closed with
-// ErrPrimaryBatchIndexedUnsupported before the callback runs, and publishes
-// nothing.
-func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
+// TestCollectionUpdateMaintainsIndexedPrimaryAtomically pins the public batch
+// contract for indexed collections: primary rows and exact postings move in one
+// publication, while a snapshot retained before the batch keeps the old pair.
+func TestCollectionUpdateMaintainsIndexedPrimaryAtomically(t *testing.T) {
 	options := testBatchOptions(24)
 	options.Indexes = []store.IndexDefinition{
 		{Name: "status", Paths: []string{"/status"}},
@@ -56,39 +52,34 @@ func TestCollectionUpdateOnIndexedPrimaryIsUnsupported(t *testing.T) {
 	if _, err := collection.Put([]byte("seed"), []byte(`{"status":"active","kind":"a"}`)); err != nil {
 		t.Fatal(err)
 	}
-	generation := collection.Generation()
-	for _, shape := range []struct {
-		name string
-		fn   func(*WriteBatch) error
-	}{
-		{"put", func(b *WriteBatch) error {
-			return b.Put([]byte("k"), []byte(`{"status":"idle","kind":"b"}`))
-		}},
-		{"delete", func(b *WriteBatch) error { return b.Delete([]byte("seed")) }},
-		{"mixed", func(b *WriteBatch) error {
-			if err := b.Put([]byte("k"), []byte(`{"status":"idle","kind":"b"}`)); err != nil {
-				return err
-			}
-			return b.Delete([]byte("seed"))
-		}},
-	} {
-		t.Run(shape.name, func(t *testing.T) {
-			if err := collection.Update(shape.fn); !errors.Is(err, ErrPrimaryBatchIndexedUnsupported) {
-				t.Fatalf("indexed Update = %v, want ErrPrimaryBatchIndexedUnsupported", err)
-			}
-			if collection.Generation() != generation {
-				t.Fatalf("refused indexed batch published generation %d, want %d",
-					collection.Generation(), generation)
-			}
-			if _, ok, _ := collection.AppendRaw(nil, []byte("k")); ok {
-				t.Fatal("refused indexed batch made a document visible")
-			}
-		})
+	before, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The single-document path still maintains the index, so the collection is
-	// fully usable after the refusals — the batch refusal poisons nothing.
-	if _, err := collection.Put([]byte("k"), []byte(`{"status":"paused","kind":"a"}`)); err != nil {
-		t.Fatalf("single-document Put after refused batches: %v", err)
+	defer before.Close()
+	if err := collection.Update(func(b *WriteBatch) error {
+		if err := b.Put([]byte("k"), []byte(`{"status":"idle","kind":"b"}`)); err != nil {
+			return err
+		}
+		if err := b.Put([]byte("other"), []byte(`{"status":"idle","kind":"c"}`)); err != nil {
+			return err
+		}
+		return b.Delete([]byte("seed"))
+	}); err != nil {
+		t.Fatalf("indexed Update: %v", err)
+	}
+	idle := primaryExactTestNeedle(t, `"idle"`)
+	active := primaryExactTestNeedle(t, `"active"`)
+	if got := primaryExactTestKeys(t, collection, "status", idle); len(got) != 2 ||
+		got[0] != "k" || got[1] != "other" {
+		t.Fatalf("live idle postings = %v", got)
+	}
+	if got := primaryExactTestKeys(t, collection, "status", active); len(got) != 0 {
+		t.Fatalf("live active postings = %v", got)
+	}
+	if got := primaryExactSnapshotKeys(t, before, "status", active); len(got) != 1 ||
+		got[0] != "seed" {
+		t.Fatalf("old active postings = %v", got)
 	}
 }
 
@@ -355,9 +346,8 @@ func TestCollectionUpdateBatchIsSingleUse(t *testing.T) {
 // TestCollectionUpdateSurvivesReopen checks that a batched generation is a
 // complete durable state and not merely a correct in-memory one.
 func TestCollectionUpdateSurvivesReopen(t *testing.T) {
-	// The batch path refuses an indexed collection, so this reopen-recovery cover
-	// runs on a plain ordered-primary store; index rehydration across reopen is
-	// pinned by the single-document catalog and index suites.
+	// This broad row-shape recovery cover runs without indexes; indexed batch
+	// reopen and crash recovery are pinned by the exact batch and journal suites.
 	options := testBatchOptions(40)
 	file, err := os.CreateTemp(t.TempDir(), "file-store-batch-reopen-*")
 	if err != nil {

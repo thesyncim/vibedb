@@ -1,0 +1,573 @@
+package durable
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/thesyncim/vibedb/internal/storeio"
+)
+
+func bufferedCurrentScanOracle(
+	fixture concurrentPrimaryTestFixture,
+) map[string][]byte {
+	oracle := make(map[string][]byte, len(fixture.keys))
+	for index, key := range fixture.keys {
+		oracle[key] = bytes.Clone(fixture.values[index])
+	}
+	return oracle
+}
+
+func putBufferedCurrentScanRow(
+	t *testing.T,
+	collection *Collection,
+	oracle map[string][]byte,
+	key string,
+	value []byte,
+	wantCreated bool,
+) {
+	t.Helper()
+	canonical := canonicalConcurrentPrimaryValue(t, value)
+	created, err := collection.Put([]byte(key), value)
+	if err != nil || created != wantCreated {
+		t.Fatalf(
+			"Put(%q) = created %v, err %v; want created %v",
+			key, created, err, wantCreated,
+		)
+	}
+	oracle[key] = canonical
+}
+
+func deleteBufferedCurrentScanRow(
+	t *testing.T,
+	collection *Collection,
+	oracle map[string][]byte,
+	key string,
+) {
+	t.Helper()
+	deleted, err := collection.Delete([]byte(key))
+	if err != nil || !deleted {
+		t.Fatalf("Delete(%q) = deleted %v, err %v", key, deleted, err)
+	}
+	delete(oracle, key)
+}
+
+func assertBufferedCurrentScan(
+	t *testing.T,
+	collection *Collection,
+	oracle map[string][]byte,
+) {
+	t.Helper()
+	wantKeys := make([]string, 0, len(oracle))
+	wantBytes := 0
+	for key, value := range oracle {
+		wantKeys = append(wantKeys, key)
+		wantBytes += len(key) + len(value)
+	}
+	slices.Sort(wantKeys)
+
+	at := 0
+	gotBytes := 0
+	scratch, err := collection.RangeRawCurrentBuffer(
+		nil,
+		func(key, value []byte) error {
+			if at >= len(wantKeys) {
+				return fmt.Errorf("unexpected trailing row %q", key)
+			}
+			wantKey := wantKeys[at]
+			if string(key) != wantKey {
+				return fmt.Errorf(
+					"row %d key = %q, want %q", at, key, wantKey,
+				)
+			}
+			if want := oracle[wantKey]; !bytes.Equal(value, want) {
+				return fmt.Errorf(
+					"row %d value = %s, want %s", at, value, want,
+				)
+			}
+			gotBytes += len(key) + len(value)
+			at++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("RangeRawCurrentBuffer: %v", err)
+	}
+	if at != len(wantKeys) || gotBytes != wantBytes {
+		t.Fatalf(
+			"RangeRawCurrentBuffer visited %d rows/%d bytes, want %d/%d (scratch cap %d)",
+			at, gotBytes, len(wantKeys), wantBytes, cap(scratch),
+		)
+	}
+}
+
+func verifyBufferedCurrentScanWithHook(
+	collection *Collection,
+	oracle map[string][]byte,
+	hook func(key []byte) error,
+) error {
+	wantKeys := make([]string, 0, len(oracle))
+	wantBytes := 0
+	for key, value := range oracle {
+		wantKeys = append(wantKeys, key)
+		wantBytes += len(key) + len(value)
+	}
+	slices.Sort(wantKeys)
+	at := 0
+	gotBytes := 0
+	_, err := collection.RangeRawCurrentBuffer(
+		nil,
+		func(key, value []byte) error {
+			if at >= len(wantKeys) {
+				return fmt.Errorf("unexpected trailing row %q", key)
+			}
+			wantKey := wantKeys[at]
+			if string(key) != wantKey || !bytes.Equal(value, oracle[wantKey]) {
+				return fmt.Errorf(
+					"row %d = %q/%s, want %q/%s",
+					at, key, value, wantKey, oracle[wantKey],
+				)
+			}
+			gotBytes += len(key) + len(value)
+			at++
+			if hook != nil {
+				return hook(key)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if at != len(wantKeys) || gotBytes != wantBytes {
+		return fmt.Errorf(
+			"visited %d rows/%d bytes, want %d/%d",
+			at, gotBytes, len(wantKeys), wantBytes,
+		)
+	}
+	return nil
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferMergesOverlayInOrder(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+
+	putBufferedCurrentScanRow(
+		t, collection, oracle, fixture.keys[10],
+		[]byte(`{"scan":"replacement","id":10}`), false,
+	)
+	deleteBufferedCurrentScanRow(t, collection, oracle, fixture.keys[20])
+	putBufferedCurrentScanRow(
+		t, collection, oracle, "primary-key-000000010-current-insert",
+		[]byte(`{"scan":"insert"}`), true,
+	)
+	if len(collection.primaryPendingParents) != 0 ||
+		!collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatalf(
+			"current scan setup = %d pending parents, overlay pending %v; want 0/true",
+			len(collection.primaryPendingParents),
+			collection.primaryUnifiedOverlay.hasPending(),
+		)
+	}
+
+	beforeState := collection.state.Load()
+	beforePublished := collection.committer.PublishedGeneration()
+	beforeFolded := collection.primaryUnifiedOverlay.folded.Load()
+	beforeRecords := collection.primaryUnifiedOverlay.count.Load()
+	assertBufferedCurrentScan(t, collection, oracle)
+	if got := collection.state.Load(); got != beforeState {
+		t.Fatalf("current scan changed logical state %p -> %p", beforeState, got)
+	}
+	if got := collection.committer.PublishedGeneration(); got != beforePublished {
+		t.Fatalf(
+			"current scan published physical generation %d, want unchanged %d",
+			got, beforePublished,
+		)
+	}
+	if got := collection.primaryUnifiedOverlay.folded.Load(); got != beforeFolded {
+		t.Fatalf("current scan advanced folded generation %d -> %d", beforeFolded, got)
+	}
+	if got := collection.primaryUnifiedOverlay.count.Load(); got != beforeRecords {
+		t.Fatalf("current scan changed overlay records %d -> %d", beforeRecords, got)
+	}
+	if !collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("current scan physically folded the row overlay")
+	}
+
+	// The current-scan API returns its only variable-width reconstruction
+	// scratch. Once the largest base row has warmed that buffer, merging inline
+	// overlay values must remain allocation-free across repeated scans.
+	wantRows := len(oracle)
+	wantBytes := 0
+	for key, value := range oracle {
+		wantBytes += len(key) + len(value)
+	}
+	visited, visitedBytes := 0, 0
+	visit := func(key, value []byte) error {
+		visited++
+		visitedBytes += len(key) + len(value)
+		return nil
+	}
+	var scratch []byte
+	var err error
+	scratch, err = collection.RangeRawCurrentBuffer(scratch, visit)
+	if err != nil || visited != wantRows || visitedBytes != wantBytes {
+		t.Fatalf(
+			"warm current scan = %d rows/%d bytes, err %v; want %d/%d",
+			visited, visitedBytes, err, wantRows, wantBytes,
+		)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		visited, visitedBytes = 0, 0
+		var runErr error
+		scratch, runErr = collection.RangeRawCurrentBuffer(scratch[:0], visit)
+		if runErr != nil || visited != wantRows || visitedBytes != wantBytes {
+			panic("buffered current scan failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed RangeRawCurrentBuffer allocated %.2f times, want 0", allocs)
+	}
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferPinsGenerationDuringScan(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracleAtStart := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracleAtStart, fixture.keys[8],
+		[]byte(`{"scan":"before-future-write","id":8}`), false,
+	)
+	deleteBufferedCurrentScanRow(t, collection, oracleAtStart, fixture.keys[9])
+
+	futureKey := "primary-key-000000200-mid-scan-future"
+	futureValue := []byte(`{"scan":"future-insert"}`)
+	mutationStart := make(chan struct{})
+	mutationDone := make(chan concurrentPrimaryPutResult, 1)
+	go func() {
+		<-mutationStart
+		created, err := collection.Put([]byte(futureKey), futureValue)
+		mutationDone <- concurrentPrimaryPutResult{created: created, err: err}
+	}()
+
+	wantKeys := make([]string, 0, len(oracleAtStart))
+	for key := range oracleAtStart {
+		wantKeys = append(wantKeys, key)
+	}
+	slices.Sort(wantKeys)
+	at := 0
+	triggered := false
+	_, err := collection.RangeRawCurrentBuffer(
+		nil,
+		func(key, value []byte) error {
+			if at >= len(wantKeys) {
+				return fmt.Errorf("future scan emitted trailing row %q", key)
+			}
+			wantKey := wantKeys[at]
+			if string(key) != wantKey ||
+				!bytes.Equal(value, oracleAtStart[wantKey]) {
+				return fmt.Errorf(
+					"start-cut row %d = %q/%s, want %q/%s",
+					at, key, value, wantKey, oracleAtStart[wantKey],
+				)
+			}
+			at++
+			if !triggered && string(key) == fixture.keys[5] {
+				triggered = true
+				close(mutationStart)
+				result := awaitConcurrentPrimary(
+					t, mutationDone, "mid-scan future mutation",
+				)
+				if result.err != nil || !result.created {
+					return fmt.Errorf(
+						"mid-scan Put = created %v, err %v",
+						result.created, result.err,
+					)
+				}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("start-cut RangeRawCurrentBuffer: %v", err)
+	}
+	if !triggered || at != len(wantKeys) {
+		t.Fatalf(
+			"start-cut scan triggered %v and visited %d rows, want true/%d",
+			triggered, at, len(wantKeys),
+		)
+	}
+	if len(collection.primaryPendingParents) != 0 ||
+		!collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatalf(
+			"future mutation = %d pending parents, overlay pending %v; want 0/true",
+			len(collection.primaryPendingParents),
+			collection.primaryUnifiedOverlay.hasPending(),
+		)
+	}
+
+	nextOracle := make(map[string][]byte, len(oracleAtStart)+1)
+	for key, value := range oracleAtStart {
+		nextOracle[key] = bytes.Clone(value)
+	}
+	nextOracle[futureKey] = canonicalConcurrentPrimaryValue(t, futureValue)
+	assertBufferedCurrentScan(t, collection, nextOracle)
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferCallbackErrorReleasesFlushFence(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracle, fixture.keys[15],
+		[]byte(`{"scan":"callback-error","id":15}`), false,
+	)
+
+	callbackErr := errors.New("stop current scan")
+	callbacks := 0
+	_, err := collection.RangeRawCurrentBuffer(
+		nil,
+		func(_, _ []byte) error {
+			callbacks++
+			return callbackErr
+		},
+	)
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("RangeRawCurrentBuffer error = %v, want %v", err, callbackErr)
+	}
+	if callbacks != 1 {
+		t.Fatalf("callback count = %d, want 1", callbacks)
+	}
+	if collection.readEpochs.AnyActive() {
+		t.Fatal("callback error leaked the current scan's direct reader epoch")
+	}
+	if active := collection.leases.Stats(collection.Generation()).Active; active != 0 {
+		t.Fatalf("callback error leaked %d generation leases", active)
+	}
+
+	flushAttempt := make(chan struct{}, 1)
+	previousHook := concurrentPrimaryExclusiveWaitHook
+	concurrentPrimaryExclusiveWaitHook = func(name string) {
+		if name == "flush" {
+			flushAttempt <- struct{}{}
+		}
+	}
+	t.Cleanup(func() { concurrentPrimaryExclusiveWaitHook = previousHook })
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- collection.Flush() }()
+	awaitConcurrentPrimary(t, flushAttempt, "Flush after callback error")
+	if flushErr := awaitConcurrentPrimary(
+		t, flushDone, "Flush fence release after callback error",
+	); flushErr != nil {
+		t.Fatal(flushErr)
+	}
+	if got, want := collection.DurableGeneration(), collection.Generation(); got != want {
+		t.Fatalf("durable generation = %d, want current %d", got, want)
+	}
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferStructuralMutationStartsNextCut(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracleAtStart := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracleAtStart, fixture.keys[8],
+		[]byte(`{"scan":"captured-overlay","id":8}`), false,
+	)
+	deleteBufferedCurrentScanRow(t, collection, oracleAtStart, fixture.keys[9])
+
+	futureKey := fixture.keys[200]
+	futureValue := fmt.Appendf(
+		nil, `{"scan":"structural-future","payload":%q}`,
+		strings.Repeat("x", collection.options.InlineValueBytes+1),
+	)
+	futureCanonical := canonicalConcurrentPrimaryValue(t, futureValue)
+	mutated := false
+	scanDone := make(chan error, 1)
+	go func() {
+		scanErr := verifyBufferedCurrentScanWithHook(
+			collection, oracleAtStart,
+			func(key []byte) error {
+				if mutated || string(key) != fixture.keys[5] {
+					return nil
+				}
+				mutated = true
+				created, err := collection.Put([]byte(futureKey), futureValue)
+				if err != nil || created {
+					return fmt.Errorf(
+						"structural callback Put = created %v, err %v",
+						created, err,
+					)
+				}
+				return nil
+			},
+		)
+		if scanErr == nil && !mutated {
+			scanErr = errors.New("structural callback was not reached")
+		}
+		scanDone <- scanErr
+	}()
+	if err := awaitConcurrentPrimary(
+		t, scanDone, "current scan with structural callback mutation",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// The structural replacement completed before the first cursor reached this
+	// later key, but belongs to the next visible cut only. The first scan checked
+	// the old oracle; a fresh scan must now expose the overflow value.
+	nextOracle := make(map[string][]byte, len(oracleAtStart))
+	for key, value := range oracleAtStart {
+		nextOracle[key] = bytes.Clone(value)
+	}
+	nextOracle[futureKey] = futureCanonical
+	assertBufferedCurrentScan(t, collection, nextOracle)
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferDoesNotBlockFlushCallback(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracle, fixture.keys[18],
+		[]byte(`{"scan":"flush-overlap","id":18}`), false,
+	)
+	if !collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("flush-overlap fixture has no pending row overlay")
+	}
+
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCallback) }) })
+	scanDone := make(chan error, 1)
+	go func() {
+		scanDone <- verifyBufferedCurrentScanWithHook(
+			collection, oracle,
+			func(key []byte) error {
+				if string(key) == fixture.keys[5] {
+					enteredOnce.Do(func() { close(callbackEntered) })
+					<-releaseCallback
+				}
+				return nil
+			},
+		)
+	}()
+	awaitConcurrentPrimary(t, callbackEntered, "blocked current-scan callback")
+
+	flushAttempt := make(chan struct{}, 1)
+	previousHook := concurrentPrimaryExclusiveWaitHook
+	concurrentPrimaryExclusiveWaitHook = func(name string) {
+		if name == "flush" {
+			flushAttempt <- struct{}{}
+		}
+	}
+	t.Cleanup(func() { concurrentPrimaryExclusiveWaitHook = previousHook })
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- collection.Flush() }()
+	awaitConcurrentPrimary(t, flushAttempt, "Flush during blocked scan callback")
+	if err := awaitConcurrentPrimary(
+		t, flushDone, "Flush completion during blocked scan callback",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := collection.DurableGeneration(), collection.Generation(); got != want {
+		t.Fatalf("overlap durable generation = %d, want %d", got, want)
+	}
+	releaseOnce.Do(func() { close(releaseCallback) })
+	if err := awaitConcurrentPrimary(
+		t, scanDone, "current scan after overlapping Flush",
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferPanicReleasesReadersAndPagePins(t *testing.T) {
+	for _, forceLease := range []bool{false, true} {
+		name := "direct-epoch"
+		if forceLease {
+			name = "generation-lease"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := openConcurrentPrimaryTestFixture(
+				t, 256, concurrentPrimaryTestOptions(),
+			)
+			collection := fixture.collection
+			oracle := bufferedCurrentScanOracle(fixture)
+			putBufferedCurrentScanRow(
+				t, collection, oracle, fixture.keys[25],
+				[]byte(`{"scan":"panic-release","id":25}`), false,
+			)
+
+			var held []storeio.ReadEpoch
+			if forceLease {
+				for len(held) < 64 {
+					_, epoch, ok := collection.enterReadEpoch()
+					if !ok {
+						break
+					}
+					held = append(held, epoch)
+				}
+				if len(held) == 0 || len(held) == 64 {
+					t.Fatalf("failed to saturate direct epoch table with %d claims", len(held))
+				}
+			}
+			t.Cleanup(func() {
+				for _, epoch := range held {
+					epoch.Exit()
+				}
+			})
+			beforePins := collection.Stats().PinnedPages
+			panicValue := &struct{ label string }{label: name}
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				_, _ = collection.RangeRawCurrentBuffer(
+					nil,
+					func(_, _ []byte) error { panic(panicValue) },
+				)
+			}()
+			if recovered != panicValue {
+				t.Fatalf("recovered panic = %#v, want %#v", recovered, panicValue)
+			}
+			if active := collection.leases.Stats(collection.Generation()).Active; active != 0 {
+				t.Fatalf("panic leaked %d generation leases", active)
+			}
+			for _, epoch := range held {
+				epoch.Exit()
+			}
+			held = held[:0]
+			if collection.readEpochs.AnyActive() {
+				t.Fatal("panic leaked a direct reader epoch")
+			}
+
+			// Stats takes writer exclusively. Completing it proves panic unwound the
+			// short structural hold; its pin count also proves the current leaf lease
+			// was released while the callback unwound.
+			statsDone := make(chan Stats, 1)
+			go func() { statsDone <- collection.Stats() }()
+			after := awaitConcurrentPrimary(
+				t, statsDone, "Stats after current-scan callback panic",
+			)
+			if after.PinnedPages != beforePins {
+				t.Fatalf("panic changed pinned pages %d -> %d", beforePins, after.PinnedPages)
+			}
+		})
+	}
+}

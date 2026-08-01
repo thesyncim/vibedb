@@ -1849,6 +1849,124 @@ func buildJournalDeltaFallbackCollection(
 	)
 }
 
+// TestBufferedJournalDeltaResumesAfterSuccessfulBatch protects the batch
+// point-of-no-return bookkeeping. A successful batch owns its admitted frames
+// after router publication and must clear only the unwind tracker. Otherwise a
+// stale tracker permanently makes every later ordinary overlay Flush look like
+// a mixed physical cut and silently disables the cheap journal-delta lane.
+func TestBufferedJournalDeltaResumesAfterSuccessfulBatch(t *testing.T) {
+	const documents = 320
+	options := journalDeltaTestOptions()
+	coll := buildJournalDeltaFallbackCollection(t, options)
+	path := coll.file.Name()
+	want := primaryStoreContent(t, coll)
+	groups := make(map[string]int, documents)
+	for at := range documents {
+		groups[templateHeavyOverlayKey(at)] = at % 37
+	}
+
+	batchGroups := map[int]int{20: 57, 21: 58}
+	if err := coll.Update(func(batch *WriteBatch) error {
+		for at, group := range batchGroups {
+			if err := batch.Put(
+				[]byte(templateHeavyOverlayKey(at)),
+				journalDeltaGroupDoc(at, group),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("indexed batch: %v", err)
+	}
+	if len(coll.batchPrimaryAdmitted) != 0 {
+		t.Fatalf("successful batch retained %d admitted-frame trackers",
+			len(coll.batchPrimaryAdmitted))
+	}
+	for at, group := range batchGroups {
+		key := templateHeavyOverlayKey(at)
+		want[key] = journalDeltaCanonical(t, journalDeltaGroupDoc(at, group))
+		groups[key] = group
+	}
+	beforeBatchFlush := coll.Stats()
+	batchGeneration := coll.Generation()
+	if err := coll.Flush(); err != nil {
+		t.Fatalf("batch physical Flush: %v", err)
+	}
+	afterBatchFlush := coll.Stats()
+	if afterBatchFlush.JournalDeltaCheckpoints !=
+		beforeBatchFlush.JournalDeltaCheckpoints {
+		t.Fatalf("batch Flush incorrectly used delta lane: %d -> %d",
+			beforeBatchFlush.JournalDeltaCheckpoints,
+			afterBatchFlush.JournalDeltaCheckpoints)
+	}
+	if coll.committer.DurableGeneration() != batchGeneration {
+		t.Fatalf("batch physical generation = %d, want %d",
+			coll.committer.DurableGeneration(), batchGeneration)
+	}
+
+	const pointAt, pointGroup = 22, 59
+	pointKey := templateHeavyOverlayKey(pointAt)
+	pointRaw := journalDeltaGroupDoc(pointAt, pointGroup)
+	created, err := coll.Put([]byte(pointKey), pointRaw)
+	if err != nil || created {
+		t.Fatalf("eligible point replacement = %v,%v", created, err)
+	}
+	want[pointKey] = journalDeltaCanonical(t, pointRaw)
+	groups[pointKey] = pointGroup
+	if !coll.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("eligible point replacement produced no row overlay")
+	}
+	if !coll.bufferedJournalDeltaStateEligible(batchGeneration) {
+		t.Fatal("post-batch point replacement is not delta-state eligible")
+	}
+
+	previousPostSync := recoveryJournalDeltaPostSyncHook
+	defer func() { recoveryJournalDeltaPostSyncHook = previousPostSync }()
+	var crashImage *journalCrashImage
+	recoveryJournalDeltaPostSyncHook = func(uint64) {
+		image := captureJournalImage(t, path)
+		crashImage = &image
+	}
+	beforeDelta := coll.Stats()
+	physicalBeforeDelta := coll.committer.DurableGeneration()
+	target := coll.Generation()
+	if err := coll.Flush(); err != nil {
+		t.Fatalf("post-batch delta Flush: %v", err)
+	}
+	afterDelta := coll.Stats()
+	if afterDelta.JournalDeltaCheckpoints !=
+		beforeDelta.JournalDeltaCheckpoints+1 ||
+		afterDelta.JournalDeltaRecords != beforeDelta.JournalDeltaRecords+1 ||
+		afterDelta.JournalDeltaBytes <= beforeDelta.JournalDeltaBytes {
+		t.Fatalf("post-batch delta metrics before=%+v after=%+v",
+			beforeDelta, afterDelta)
+	}
+	if afterDelta.JournalDeltaFullFallbacks !=
+		beforeDelta.JournalDeltaFullFallbacks {
+		t.Fatalf("post-batch point Flush fell back physically: %d -> %d",
+			beforeDelta.JournalDeltaFullFallbacks,
+			afterDelta.JournalDeltaFullFallbacks)
+	}
+	if coll.DurableGeneration() != target ||
+		coll.committer.DurableGeneration() != physicalBeforeDelta ||
+		physicalBeforeDelta >= target {
+		t.Fatalf("logical/physical generation = %d/%d, want %d/%d (< target)",
+			coll.DurableGeneration(), coll.committer.DurableGeneration(),
+			target, physicalBeforeDelta)
+	}
+	if !coll.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("delta Flush physically folded the eligible point overlay")
+	}
+	if crashImage == nil {
+		t.Fatal("delta Flush did not reach post-sync crash seam")
+	}
+	assertJournalDeltaImage(
+		t, options, *crashImage, want, groups, target,
+		"successful-batch-then-delta",
+	)
+}
+
 // TestBufferedJournalDeltaIneligibleMutationsPhysicallyFold ensures Flush never
 // treats a partial overlay as the whole durable cut. Inserts, overflow values,
 // and WriteBatch all leave physical staging or a generation gap and therefore

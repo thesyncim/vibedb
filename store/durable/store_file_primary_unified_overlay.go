@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
@@ -900,6 +901,29 @@ func (o *primaryUnifiedOverlay) latestBucketRecordsUnordered(
 		return 0, nil
 	}
 	folded := o.folded.Load()
+	bucketSlot, found := o.bucketSlot(bucket)
+	if !found {
+		return 0, nil
+	}
+	return o.latestBucketRecordsUnorderedFromHead(
+		dst, bucket, o.buckets[bucketSlot].head.Load(), folded, generation,
+	)
+}
+
+// latestBucketRecordsUnorderedFromHead is the immutable-history form used by
+// a current scan after it releases the structural fence. The scan captures
+// head and folded with its visible generation; a later fold may clear the live
+// bucket directory, but an active reader pin prevents recycling these records
+// and their arena while this captured chain is traversed.
+func (o *primaryUnifiedOverlay) latestBucketRecordsUnorderedFromHead(
+	dst *[storeio.CommonPrimaryLeafWideSlots]uint16,
+	bucket storeio.BucketID,
+	head uint32,
+	afterGeneration, generation uint64,
+) (int, error) {
+	if o == nil || dst == nil || head == 0 || generation <= afterGeneration {
+		return 0, nil
+	}
 	count := int(o.count.Load())
 	if count > len(o.records) {
 		return 0, storeio.ErrCommonPrimaryLeafCorrupt
@@ -911,11 +935,6 @@ func (o *primaryUnifiedOverlay) latestBucketRecordsUnordered(
 	var seenSlots [storeio.CommonPrimaryLeafWideSlots / 64]uint64
 	n := 0
 	newerGeneration := uint64(0)
-	bucketSlot, found := o.bucketSlot(bucket)
-	if !found {
-		return 0, nil
-	}
-	head := o.buckets[bucketSlot].head.Load()
 	for head != 0 {
 		// publish exposes the bucket head before count/used, while the owning
 		// collection generation remains old. A snapshot can therefore encounter
@@ -935,7 +954,7 @@ func (o *primaryUnifiedOverlay) latestBucketRecordsUnordered(
 			return 0, storeio.ErrCommonPrimaryLeafCorrupt
 		}
 		newerGeneration = record.generation
-		if record.generation <= folded {
+		if record.generation <= afterGeneration {
 			break
 		}
 		next := record.bucketPrevious
@@ -1014,24 +1033,60 @@ func (o *primaryUnifiedOverlay) latestBucketRecords(
 	if err != nil || n == 0 {
 		return n, err
 	}
-	for i := 1; i < n; i++ {
-		index := dst[i]
-		record := &o.records[index]
-		end := record.keyOffset + uint32(record.keyLen)
-		key := o.arena[record.keyOffset:end:end]
-		at := i
-		for at > 0 {
-			previous := &o.records[dst[at-1]]
-			previousEnd := previous.keyOffset + uint32(previous.keyLen)
-			previousKey :=
-				o.arena[previous.keyOffset:previousEnd:previousEnd]
-			if bytes.Compare(previousKey, key) <= 0 {
-				break
+	return o.sortLatestBucketRecords(dst, n)
+}
+
+func (o *primaryUnifiedOverlay) latestBucketRecordsFromHead(
+	dst *[storeio.CommonPrimaryLeafWideSlots]uint16,
+	bucket storeio.BucketID,
+	head uint32,
+	afterGeneration, generation uint64,
+) (int, error) {
+	n, err := o.latestBucketRecordsUnorderedFromHead(
+		dst, bucket, head, afterGeneration, generation,
+	)
+	if err != nil || n == 0 {
+		return n, err
+	}
+	return o.sortLatestBucketRecords(dst, n)
+}
+
+func (o *primaryUnifiedOverlay) sortLatestBucketRecords(
+	dst *[storeio.CommonPrimaryLeafWideSlots]uint16,
+	n int,
+) (int, error) {
+	const insertionSortLimit = 12
+	if n <= insertionSortLimit {
+		for i := 1; i < n; i++ {
+			index := dst[i]
+			record := &o.records[index]
+			end := record.keyOffset + uint32(record.keyLen)
+			key := o.arena[record.keyOffset:end:end]
+			at := i
+			for at > 0 {
+				previous := &o.records[dst[at-1]]
+				previousEnd := previous.keyOffset + uint32(previous.keyLen)
+				previousKey :=
+					o.arena[previous.keyOffset:previousEnd:previousEnd]
+				if bytes.Compare(previousKey, key) <= 0 {
+					break
+				}
+				dst[at] = dst[at-1]
+				at--
 			}
-			dst[at] = dst[at-1]
-			at--
+			dst[at] = index
 		}
-		dst[at] = index
+	} else {
+		slices.SortFunc(dst[:n], func(a, b uint16) int {
+			left := &o.records[a]
+			leftEnd := left.keyOffset + uint32(left.keyLen)
+			right := &o.records[b]
+			rightEnd := right.keyOffset + uint32(right.keyLen)
+			return bytes.Compare(
+				o.arena[left.keyOffset:leftEnd:leftEnd],
+				o.arena[right.keyOffset:rightEnd:rightEnd],
+			)
+		})
 	}
 	// Stable-slot identity catches the common corruption case during the history
 	// walk. Sorting makes the converse invariant equally cheap to verify: the

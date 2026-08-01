@@ -74,9 +74,10 @@ func (c *Collection) primaryMutationCombinerEligible() bool {
 		c.onlineIndexBuild.Load() {
 		return false
 	}
-	// Update's primary batch publisher deliberately does not maintain the exact
-	// index. Read the epoch under the same gate CreateIndex uses before admitting
-	// a request to the batch lane; a race simply falls back to the ordinary path.
+	// Keep exact-indexed requests on their qualified direct publication path for
+	// now: the concurrent combiner's admission/latency envelope has not yet been
+	// certified for posting pressure. Read the epoch under the same gate
+	// CreateIndex uses; a race simply falls back to the ordinary path.
 	c.snapshotGate.RLock()
 	indexed := c.primaryEpoch != nil
 	c.snapshotGate.RUnlock()
@@ -280,8 +281,7 @@ func (c *Collection) applyPrimaryMutationGroup(
 	// A live online-index race or a defensive lane change means no callback ran;
 	// retry those requests through the exact single-document path. Other errors
 	// may follow publication and therefore must be returned, never replayed.
-	if errors.Is(batchErr, ErrPrimaryBatchIndexedUnsupported) ||
-		errors.Is(batchErr, ErrPrimaryBatchUnsupportedLane) {
+	if errors.Is(batchErr, ErrPrimaryBatchUnsupportedLane) {
 		for _, request := range group {
 			if request.err == nil {
 				c.applyPrimaryMutationDirect(request)

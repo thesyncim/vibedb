@@ -390,13 +390,15 @@ func (c *Collection) snapshotGateHeld() (*Snapshot, error) {
 	indexNameIDs := c.options.indexNameIDs
 	indexDefinitions := c.options.Indexes
 	epoch := c.primaryEpoch
+	primaryRouter := c.primaryRouter.Load()
 	lease, err := c.leases.Acquire(state.root.Generation)
 	if err != nil {
 		return nil, err
 	}
 	return &Snapshot{
 		collection: c, state: state,
-		indexes: indexes, indexNameIDs: indexNameIDs,
+		primaryRouter: primaryRouter,
+		indexes:       indexes, indexNameIDs: indexNameIDs,
 		indexDefinitions: indexDefinitions,
 		epoch:            epoch, lease: lease,
 	}, nil

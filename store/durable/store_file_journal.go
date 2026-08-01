@@ -411,6 +411,22 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
 	applied := 0
+	formatVersion := c.journal.Header().FormatVersion
+	// Legacy records are logical set/delete operations and therefore idempotent.
+	// Inspect their complete live suffix from the journal's own base even when a
+	// prior interrupted recovery checkpoint advanced the physical root into that
+	// suffix. In particular, a legacy batch has one record generation for all of
+	// its entries; filtering it against a prefix checkpoint could otherwise skip
+	// the un-applied tail on the second recovery. Covered point records before the
+	// first ambiguous batch remain safely skipped. Once such a batch is found, its
+	// entire following record suffix is replayed in journal order so later covered
+	// points restore any key the older batch also touched. Format 1 contains scalar
+	// patches that are not idempotent, so it retains its exact prefix filter.
+	replayAfter := rootGeneration
+	if formatVersion == storeio.RecoveryJournalFormatLegacy {
+		replayAfter = c.journal.BaseGeneration()
+	}
+	replayCoveredLegacySuffix := false
 	var scalarPatchScratch []byte
 	apply := func(kind uint16, key, value []byte) error {
 		switch kind {
@@ -430,6 +446,20 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 			return fmt.Errorf("%w: unknown replay kind %d",
 				storeio.ErrRecoveryJournalRecord, kind)
 		}
+	}
+	applyLegacyBatchSequential := func(rec storeio.RecoveryRecord) error {
+		for i := range rec.Entries {
+			entry := rec.Entries[i]
+			if err := apply(entry.Kind, entry.Key, entry.Value); err != nil {
+				return err
+			}
+			if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
+				if err := hook(c, rec, i); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}
 	applyScalarPatch := func(entry storeio.RecoveryBatchEntry) error {
 		scalarPatchScratch = scalarPatchScratch[:0]
@@ -484,19 +514,90 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 		}
 		return putErr
 	}
-	err := c.journal.Replay(rootGeneration, func(rec storeio.RecoveryRecord) error {
+	err := c.journal.Replay(replayAfter, func(rec storeio.RecoveryRecord) error {
+		if formatVersion == storeio.RecoveryJournalFormatLegacy &&
+			rec.Generation <= rootGeneration && !replayCoveredLegacySuffix {
+			if rec.Kind != storeio.RecoveryRecordKindBatch {
+				return nil
+			}
+			// The recovered root may be a checkpoint of only a prefix of this
+			// one-generation batch. Reapply it atomically, then preserve journal
+			// order for every later covered record.
+			replayCoveredLegacySuffix = true
+		}
 		if rec.Kind == storeio.RecoveryRecordKindBatch {
 			start, startErr := recoveryJournalBatchReplayStart(
-				c.journal.Header().FormatVersion, rec, rootGeneration,
+				formatVersion, rec, rootGeneration,
 			)
 			if startErr != nil {
 				return startErr
 			}
-			// A batch record replays as its entries applied in order through the
-			// ordinary mutation path. The record is present in whole (its single CRC
-			// validated) or not at all. A format-1 delta batch may have a prefix
-			// already covered by a pressure checkpoint from an interrupted replay;
-			// start skips exactly that consecutive-generation prefix.
+			if formatVersion == storeio.RecoveryJournalFormatLegacy {
+				// MaxBatchDocuments/MaxBatchBytes are reopen-time admission policy,
+				// not persisted journal semantics. When the current process sized its
+				// batch arenas below this acknowledged record, replay the entries
+				// sequentially while Open is still private. The journal remains intact
+				// across any pressure checkpoint; a second recovery re-enters at the
+				// first covered batch and restores its complete ordered suffix.
+				if !c.legacyRecoveryBatchFitsUpdate(rec) {
+					return applyLegacyBatchSequential(rec)
+				}
+				// A legacy batch is one transactional WriteBatch, not a sequence of
+				// independently visible point mutations. Replaying through Update keeps
+				// its primary rows and exact-index postings atomic in memory and prevents
+				// a pressure checkpoint from persisting a prefix that a second recovery
+				// could mistake for the whole one-generation record.
+				batchErr := c.Update(func(batch *WriteBatch) error {
+					for i := range rec.Entries {
+						entry := rec.Entries[i]
+						switch entry.Kind {
+						case storeio.RecoveryRecordKindPut:
+							if err := batch.appendRecovery(
+								entry.Key, entry.Value, false,
+							); err != nil {
+								return err
+							}
+						case storeio.RecoveryRecordKindDelete:
+							if err := batch.appendRecovery(
+								entry.Key, nil, true,
+							); err != nil {
+								return err
+							}
+						default:
+							return fmt.Errorf(
+								"%w: unknown legacy batch kind %d",
+								storeio.ErrRecoveryJournalRecord, entry.Kind,
+							)
+						}
+					}
+					return nil
+				})
+				if errors.Is(batchErr, ErrBatchTooLarge) {
+					return applyLegacyBatchSequential(rec)
+				}
+				if batchErr != nil {
+					return batchErr
+				}
+				// Count a successfully consumed legacy batch even when every entry
+				// is already a no-op (notably a pure-delete batch checkpointed by an
+				// earlier interrupted replay). The final checkpoint/recycle must still
+				// consume that ambiguous record instead of replaying it on every Open.
+				applied++
+				// Preserve the recovery fault seam, but only after the whole batch is
+				// published. A hook may checkpoint or interrupt recovery here; it can
+				// no longer observe or persist a torn prefix.
+				if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
+					for i := range rec.Entries {
+						if hookErr := hook(c, rec, i); hookErr != nil {
+							return hookErr
+						}
+					}
+				}
+				return nil
+			}
+			// A format-1 delta batch is intentionally a consecutive sequence of
+			// point generations. A pressure checkpoint may cover a prefix; start
+			// skips exactly that durable prefix before applying the remainder.
 			for i := start; i < len(rec.Entries); i++ {
 				entry := rec.Entries[i]
 				// The mutation path borrows the key; replay hands the record's
@@ -549,6 +650,24 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	// Normal physical completion owns this hook. Recovery recycles directly
 	// after its final fold, so it performs the same one bounded pass explicitly.
 	return c.punchNewPhysicalGenerationLocked(physicalGeneration)
+}
+
+func (c *Collection) legacyRecoveryBatchFitsUpdate(
+	rec storeio.RecoveryRecord,
+) bool {
+	if len(rec.Entries) > c.options.MaxBatchDocuments {
+		return false
+	}
+	remaining := c.options.MaxBatchBytes
+	for i := range rec.Entries {
+		entry := rec.Entries[i]
+		bytes := len(entry.Key) + len(entry.Value)
+		if bytes > remaining {
+			return false
+		}
+		remaining -= bytes
+	}
+	return true
 }
 
 // recycleRecoveryJournalLocked advances the journal head past a checkpointed

@@ -492,11 +492,6 @@ func putSeedsAtomic(collection *durable.Collection, seeds []seedDocument) error 
 		_, err := collection.Put([]byte(seeds[0].key), seeds[0].document)
 		return err
 	}
-	if !collection.SupportsUpdate() {
-		return fmt.Errorf(
-			"vibedb: multi-row INSERT requires an atomic batch unsupported by this table configuration: %w",
-			durable.ErrPrimaryBatchIndexedUnsupported)
-	}
 	return collection.Update(func(batch *durable.WriteBatch) error {
 		for _, seed := range seeds {
 			if err := batch.Put([]byte(seed.key), seed.document); err != nil {
@@ -839,7 +834,10 @@ func (c *conn) updateLocked(
 	}
 	for _, key := range keys {
 		if key != newKey {
-			return nil, errors.New("vibedb: UPDATE cannot change a document's primary key")
+			return nil, fmt.Errorf(
+				"%w: replacement key %q does not match selected key %q",
+				ErrUpdatePrimaryKey, newKey, key,
+			)
 		}
 	}
 	if err := contextCheckpoint(ctx); err != nil {
@@ -855,11 +853,6 @@ func (c *conn) updateLocked(
 	case 1:
 		_, mutationErr = t.collection.Put([]byte(keys[0]), document)
 	default:
-		if !t.collection.SupportsUpdate() {
-			return nil, fmt.Errorf(
-				"vibedb: multi-document UPDATE requires an atomic batch unsupported by this table configuration: %w",
-				durable.ErrPrimaryBatchIndexedUnsupported)
-		}
 		mutationErr = t.collection.Update(func(batch *durable.WriteBatch) error {
 			for _, key := range keys {
 				if err := batch.Put([]byte(key), document); err != nil {
@@ -912,11 +905,6 @@ func (c *conn) deleteLocked(
 			affected = 0
 		}
 	default:
-		if !t.collection.SupportsUpdate() {
-			return nil, fmt.Errorf(
-				"vibedb: multi-document DELETE requires an atomic batch unsupported by this table configuration: %w",
-				durable.ErrPrimaryBatchIndexedUnsupported)
-		}
 		mutationErr = t.collection.Update(func(batch *durable.WriteBatch) error {
 			for _, key := range keys {
 				if err := batch.Delete([]byte(key)); err != nil {

@@ -19,6 +19,12 @@ var (
 	// key already exists, or appears twice in one VALUES batch. INSERT never
 	// replaces; UPDATE is the explicit replacement operation.
 	ErrDuplicatePrimaryKey = errors.New("vibedb: INSERT primary key already exists")
+	// ErrUpdatePrimaryKey reports a whole-document UPDATE whose replacement
+	// derives a different primary key from a selected row. One constant
+	// replacement document therefore cannot update several distinct primary
+	// keys in a single statement; use an explicit transaction with one
+	// replacement document per key.
+	ErrUpdatePrimaryKey = errors.New("vibedb: UPDATE cannot change a document's primary key")
 	// ErrReadOnlyTransaction reports DML or DDL attempted in a read-only
 	// transaction.
 	ErrReadOnlyTransaction = errors.New("vibedb: mutation attempted in a read-only transaction")
@@ -28,11 +34,6 @@ var (
 	// ErrUnsupportedIsolation reports a requested transaction isolation level
 	// other than the default or snapshot isolation.
 	ErrUnsupportedIsolation = errors.New("vibedb: unsupported transaction isolation level")
-	// ErrTransactionIndexedTable reports the engine gate that prevents a
-	// transactional batch from maintaining an indexed table layout. New SQL
-	// tables use the mutable chunk layout, so this is a defensive backend
-	// capability error rather than an expected table lifecycle.
-	ErrTransactionIndexedTable = errors.New("vibedb: transaction cannot mutate an indexed table")
 	// ErrTransactionTooLarge reports a transaction whose distinct write keys
 	// exceed the collection's atomic WriteBatch reservation.
 	ErrTransactionTooLarge = errors.New("vibedb: transaction exceeds the collection write-batch bound")

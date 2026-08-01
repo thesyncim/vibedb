@@ -98,6 +98,99 @@ func TestSQLCatalogSimpleAndExtendedLifecycle(t *testing.T) {
 	}
 }
 
+func TestSQLCatalogIndexedImplicitAndExplicitBatches(t *testing.T) {
+	c := connectSQLCatalog(t)
+	for _, statement := range []string{
+		`CREATE TABLE docs (id STRING PRIMARY KEY, kind STRING NOT NULL)`,
+		`CREATE INDEX by_kind ON docs(kind)`,
+	} {
+		if msgs := c.query(statement); has(msgs, msgErrorResponse) {
+			t.Fatalf("%s: %s", statement,
+				formatError(find(t, msgs, msgErrorResponse).body))
+		}
+	}
+	requireOK := func(label string, msgs []backendMessage) {
+		t.Helper()
+		if has(msgs, msgErrorResponse) {
+			t.Fatalf("%s: %s", label,
+				formatError(find(t, msgs, msgErrorResponse).body))
+		}
+	}
+	assertIDs := func(kind string, want ...string) {
+		t.Helper()
+		rows := rowsOf(t, c.query(
+			`SELECT id FROM docs WHERE kind = '`+kind+`' ORDER BY id`))
+		if len(rows) != len(want) {
+			t.Fatalf("kind %q returned %q, want %v", kind, rows, want)
+		}
+		for i := range rows {
+			if got := string(rows[i][0]); got != `"`+want[i]+`"` {
+				t.Fatalf("kind %q row %d = %s, want %q", kind, i, got, want[i])
+			}
+		}
+	}
+
+	// An explicit transaction is also the table's first write, exercising atomic
+	// indexed batch materialization rather than a different first-write fallback.
+	assertReadyStatus(t, c.query("BEGIN"), statusInTx)
+	requireOK("first indexed insert", extendedSQL(c,
+		`INSERT INTO docs VALUES ($1)`,
+		[][]byte{[]byte(`{"id":"a","kind":"seed"}`)}))
+	requireOK("second indexed insert", extendedSQL(c,
+		`INSERT INTO docs VALUES ($1)`,
+		[][]byte{[]byte(`{"id":"b","kind":"seed"}`)}))
+	commit := c.query("COMMIT")
+	requireOK("first indexed COMMIT", commit)
+	assertReadyStatus(t, commit, statusIdle)
+	assertIDs("seed", "a", "b")
+
+	// One simple Query message is an implicit transaction. Its multiple indexed
+	// keys must become visible together when the message commits.
+	implicit := c.query(`
+		INSERT INTO docs (id, kind) VALUES ('c', 'inserted');
+		INSERT INTO docs (id, kind) VALUES ('d', 'inserted');
+		DELETE FROM docs WHERE id = 'b'`)
+	requireOK("implicit indexed batch", implicit)
+	assertReadyStatus(t, implicit, statusIdle)
+	assertIDs("seed", "a")
+	assertIDs("inserted", "c", "d")
+
+	assertReadyStatus(t, c.query("BEGIN"), statusInTx)
+	requireOK("indexed update", extendedSQL(c,
+		`UPDATE docs SET "$doc" = $1 WHERE id = $2`,
+		[][]byte{
+			[]byte(`{"id":"a","kind":"updated"}`),
+			[]byte("a"),
+		}))
+	requireOK("indexed delete", extendedSQL(c,
+		`DELETE FROM docs WHERE id = $1`, [][]byte{[]byte("c")}))
+	requireOK("indexed multi-row insert", extendedSQL(c,
+		`INSERT INTO docs VALUES ($1), ($2)`,
+		[][]byte{
+			[]byte(`{"id":"e","kind":"new"}`),
+			[]byte(`{"id":"f","kind":"new"}`),
+		}))
+	commit = c.query("COMMIT")
+	requireOK("mixed indexed COMMIT", commit)
+	assertReadyStatus(t, commit, statusIdle)
+	assertIDs("seed")
+	assertIDs("updated", "a")
+	assertIDs("inserted", "d")
+	assertIDs("new", "e", "f")
+
+	assertReadyStatus(t, c.query("BEGIN"), statusInTx)
+	requireOK("rollback indexed delete", extendedSQL(c,
+		`DELETE FROM docs WHERE id = $1`, [][]byte{[]byte("d")}))
+	requireOK("rollback indexed insert", extendedSQL(c,
+		`INSERT INTO docs VALUES ($1)`,
+		[][]byte{[]byte(`{"id":"g","kind":"rolled-back"}`)}))
+	rollback := c.query("ROLLBACK")
+	requireOK("indexed ROLLBACK", rollback)
+	assertReadyStatus(t, rollback, statusIdle)
+	assertIDs("inserted", "d")
+	assertIDs("rolled-back")
+}
+
 func TestSQLCatalogSubqueryRows(t *testing.T) {
 	c := connectSQLCatalog(t)
 	for _, statement := range []string{

@@ -211,7 +211,7 @@ func asPGError(err error) *pgError {
 	case errors.Is(err, sqldriver.ErrDDLInTransaction):
 		return newError(sqlstateActiveSQLTransaction, err.Error())
 	case errors.Is(err, sqldriver.ErrUnsupportedIsolation),
-		errors.Is(err, sqldriver.ErrTransactionIndexedTable),
+		errors.Is(err, sqldriver.ErrUpdatePrimaryKey),
 		errors.Is(err, sqldriver.ErrTransactionUnsupportedLane):
 		return newError(sqlstateFeatureNotSupported, err.Error())
 	}

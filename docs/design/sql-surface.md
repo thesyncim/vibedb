@@ -327,7 +327,10 @@ DELETE FROM users WHERE state = ?
 ```
 
 There is no partial JSON path editor. A replacement document must validate
-against the table schema and must retain the same derived primary key. DELETE
+against the table schema and must retain the same derived primary key. Because
+one UPDATE statement supplies one constant whole document, a predicate that
+matches several distinct primary keys returns `ErrUpdatePrimaryKey` before
+publication; use an explicit transaction with one replacement per key. DELETE
 removes every selected document and its exact-index postings.
 
 Mutation WHERE clauses use the same predicate compiler as SELECT, including
@@ -337,8 +340,9 @@ index pruning is currently a SELECT optimization, so a filtered UPDATE or
 DELETE may scan even when the equivalent SELECT can prune through an index.
 
 Multi-row INSERT and multi-document DELETE use one `Collection.Update` and are
-failure-atomic within their table. The collection's bounded batch admission
-still applies.
+failure-atomic within their table. `database/sql` accepts one statement per
+`Exec`, so an atomic mixed-operation group also uses an explicit transaction.
+The collection's bounded batch admission still applies.
 
 ## Transactions
 

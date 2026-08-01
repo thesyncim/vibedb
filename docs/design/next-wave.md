@@ -17,13 +17,6 @@ tests prove that the captured checkpoint owns every byte needed for reseal.
 Mutation and buffered-checkpoint benchmarks decide whether the added state is
 worth keeping.
 
-## Indexed batches
-
-Allow a transactional batch to stage document and exact-index changes together
-instead of refusing indexed collections. The publication must remain atomic,
-journal replay must rebuild identical postings, and SQL must stop surfacing the
-current indexed-batch exclusion only after the store supports it.
-
 ## Overflow deduplication
 
 Evaluate content-addressed sharing for repeated oversized values. Exact bytes

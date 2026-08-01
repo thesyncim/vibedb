@@ -45,6 +45,189 @@ func TestFileStoreDurabilityModeSafeZeroAndExplicitAsync(t *testing.T) {
 	}
 }
 
+func TestFileStoreAsyncCreatedSyncReopenChainFenceProgressAndRecovery(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "chain-fence-reopen-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	options := testFileStoreOptions()
+	options.Durability = DurabilityAsyncVisible
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]string{
+		"keep":   `{"value":"before"}`,
+		"remove": `{"value":"delete-me"}`,
+	} {
+		if _, err := collection.Put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("seed Put(%q): %v", key, err)
+		}
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatalf("seed Flush: %v", err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+
+	options.Durability = DurabilitySync
+	collection, err = Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !collection.chainFenceSync() || collection.journalEnabled() {
+		_ = collection.Close()
+		t.Fatal("async-created store did not reopen on the journal-less sync lane")
+	}
+
+	type mutationResult struct {
+		changed bool
+		err     error
+	}
+	runMutation := func(name string, mutate func() (bool, error)) bool {
+		t.Helper()
+		result := make(chan mutationResult, 1)
+		go func() {
+			changed, mutationErr := mutate()
+			result <- mutationResult{changed: changed, err: mutationErr}
+		}()
+		select {
+		case outcome := <-result:
+			if outcome.err != nil {
+				t.Fatalf("%s: %v", name, outcome.err)
+			}
+			return outcome.changed
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not cross the synchronous root fence", name)
+			return false
+		}
+	}
+
+	if created := runMutation("Put", func() (bool, error) {
+		return collection.Put([]byte("keep"), []byte(`{"value":"after"}`))
+	}); created {
+		t.Fatal("replacement Put reported an insert")
+	}
+	if got, found, err := collection.AppendRaw(nil, []byte("keep")); err != nil || !found || string(got) != `{"value":"after"}` {
+		t.Fatalf("visible replacement = (%s, %v, %v)", got, found, err)
+	}
+	if deleted := runMutation("Delete", func() (bool, error) {
+		return collection.Delete([]byte("remove"))
+	}); !deleted {
+		t.Fatal("Delete reported the existing key absent")
+	}
+	if got, found, err := collection.AppendRaw(nil, []byte("remove")); err != nil || found || len(got) != 0 {
+		t.Fatalf("visible deletion = (%s, %v, %v)", got, found, err)
+	}
+	if collection.Generation() != collection.DurableGeneration() {
+		t.Fatalf(
+			"sync generation = %d, durable = %d",
+			collection.Generation(), collection.DurableGeneration(),
+		)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatalf("chain-fence Flush: %v", err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatalf("chain-fence Close: %v", err)
+	}
+
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, found, err := reopened.AppendRaw(nil, []byte("keep")); err != nil || !found || string(got) != `{"value":"after"}` {
+		t.Fatalf("reopened replacement = (%s, %v, %v)", got, found, err)
+	}
+	if got, found, err := reopened.AppendRaw(nil, []byte("remove")); err != nil || found || len(got) != 0 {
+		t.Fatalf("reopened deletion = (%s, %v, %v)", got, found, err)
+	}
+}
+
+func TestFileStoreAsyncCreatedSyncReopenChainFenceFailureFailsClosed(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "chain-fence-failure-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	options := testFileStoreOptions()
+	options.Durability = DurabilityAsyncVisible
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "stable"
+	const before = `{"value":"before"}`
+	if _, err := collection.Put([]byte(key), []byte(before)); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	options.Durability = DurabilitySync
+	controller := &faultController{plan: storeio.FaultPlan{
+		Commit: 0, Phase: storeio.FaultENOSPCData, DataIndex: 0,
+	}}
+	previousFactory := storeCommitterFactory
+	storeCommitterFactory = controller.factory()
+	t.Cleanup(func() { storeCommitterFactory = previousFactory })
+	collection, err = Open(file, options)
+	if err != nil {
+		storeCommitterFactory = previousFactory
+		t.Fatal(err)
+	}
+	if !collection.chainFenceSync() {
+		storeCommitterFactory = previousFactory
+		_ = collection.Close()
+		t.Fatal("async-created store did not reopen on chain-fence sync lane")
+	}
+	if got, found, err := collection.AppendRaw(nil, []byte(key)); err != nil || !found || string(got) != before {
+		t.Fatalf("chain-fence baseline = (%s, %v, %v), want %s", got, found, err, before)
+	}
+	_, putErr := collection.Put(
+		[]byte(key), []byte(`{"value":"rejected"}`),
+	)
+	if putErr == nil {
+		storeCommitterFactory = previousFactory
+		_ = collection.Close()
+		t.Fatal("faulted chain-fence Put succeeded")
+	}
+	if controller.device == nil || !controller.device.Faulted() {
+		storeCommitterFactory = previousFactory
+		_ = collection.Close()
+		t.Fatal("programmed chain-fence device fault did not fire")
+	}
+	if got, found, readErr := collection.AppendRaw(nil, []byte(key)); readErr == nil || found || len(got) != 0 {
+		storeCommitterFactory = previousFactory
+		_ = collection.Close()
+		t.Fatalf(
+			"read after failed fence = (%s, %v, %v), want fail-closed; Put=%v PersistenceError=%v generation=%d durable=%d",
+			got, found, readErr, putErr, collection.PersistenceError(),
+			collection.Generation(), collection.DurableGeneration(),
+		)
+	}
+	_ = collection.Close()
+	storeCommitterFactory = previousFactory
+
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, found, err := reopened.AppendRaw(nil, []byte(key)); err != nil || !found || string(got) != before {
+		t.Fatalf("recovered rejected fence = (%s, %v, %v), want %s", got, found, err, before)
+	}
+}
+
 func TestFileStoreDurablePromotionSelectsNewestGroupedGeneration(t *testing.T) {
 	collection := &Collection{
 		options:        normalizedFileStoreOptions{Options: Options{Durability: DurabilitySync}},

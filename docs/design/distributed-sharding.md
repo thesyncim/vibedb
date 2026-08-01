@@ -1438,10 +1438,11 @@ with repair or a distributed transaction; they are not ordinary local exact
 indexes.
 
 The SQL layer currently provides snapshot isolation with first-committer-wins,
-writes exactly one table per transaction, and rejects indexed transactional
-writes on the current primary batch path. Distribution does not upgrade those
-semantics. Before any "shard-local ACID SQL" claim spans collections, a
-shard-group root or recoverable group transaction must close those local gaps.
+writes exactly one table per transaction, and publishes that table's primary
+rows and exact-index postings in one local batch generation. Distribution does
+not upgrade those semantics to a multi-table or multi-shard atomic commit.
+Before any "shard-local ACID SQL" claim spans collections, a shard-group root
+or recoverable group transaction must close that remaining local boundary.
 
 ## Bounded resources and backpressure
 

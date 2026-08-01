@@ -1466,16 +1466,14 @@ type Collection struct {
 	// under one generation; these are reset per Update and reused so a batch's
 	// steady-state cost is the frames it publishes, not the slices it plans with.
 	// batchPrimaryLeafArena holds the finalized image of every touched leaf at
-	// once (they must coexist until the single admit-all step), and
-	// batchPrimaryLeafImage is the rolling accumulator for one leaf whose several
-	// mutations fold onto the same frame.
+	// once (they must coexist until the single admit-all step).
 	batchPrimaryLeaves       []primaryBatchLeaf
 	batchPrimaryMutations    []primaryBatchMutation
 	batchJournalEntries      []storeio.RecoveryBatchEntry
 	batchPrimaryAdmitted     []storeio.PageRef
 	batchPrimaryPrevVolatile []storeio.PageRef
 	batchPrimaryLeafArena    []byte
-	batchPrimaryLeafImage    []byte
+	batchPrimarySplitKey     []byte
 	batchPrimaryFileEnd      uint64
 }
 
@@ -1729,7 +1727,10 @@ func Create(file *os.File, options Options) (*Collection, error) {
 	// createInitialState publishes an empty primary graph, and the committer's
 	// deferred-root checkpoint mode is selected for the buffered and journal-backed
 	// synchronous lanes exactly as it is for an opened primary store.
-	collection, err := newCollectionResources(file, normalized, storeID)
+	collection, err := newCollectionResources(
+		file, normalized, storeID,
+		normalized.Durability != DurabilityAsyncVisible,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1799,7 +1800,10 @@ func Open(file *os.File, options Options) (*Collection, error) {
 		root.MaxPageSize != uint32(normalized.MaxPageSize) {
 		return nil, fmt.Errorf("vibejson: collection options or unsupported durable catalog mismatch")
 	}
-	collection, err := newCollectionResources(file, normalized, root.StoreID)
+	collection, err := newCollectionResources(
+		file, normalized, root.StoreID,
+		root.JournalID != ([16]byte{}),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1872,12 +1876,16 @@ func Open(file *os.File, options Options) (*Collection, error) {
 // production keeps the platform committer.
 var storeCommitterFactory = storeio.NewCommitter
 
-// newCollectionResources builds the committer and cache for a collection. The
-// committer runs in deferred-root manual checkpoint mode on every lane except
-// async-visible: both buffered-visible and the journal-backed synchronous lane
-// stage canonical frames and publish the root at checkpoints rather than
-// fencing one per mutation.
-func newCollectionResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte) (*Collection, error) {
+// newCollectionResources builds the committer and cache for a collection.
+// journalBacked is the recovered root contract on Open and the journal contract
+// Create is about to mint. Buffered-visible and journal-backed synchronous
+// stores defer root publication to explicit checkpoints; async-visible and a
+// journal-less synchronous reopen must leave the committer automatic because
+// their mutations publish through (and, for sync, wait on) its root fence.
+func newCollectionResources(
+	file *os.File, options normalizedFileStoreOptions, storeID [16]byte,
+	journalBacked bool,
+) (*Collection, error) {
 	writeFile, directWrite, err := storeio.OpenPageCommitFile(file, storeio.DirectMode(options.WriteMode))
 	if err != nil {
 		return nil, err
@@ -1891,7 +1899,8 @@ func newCollectionResources(file *os.File, options normalizedFileStoreOptions, s
 		QueueSlots:         options.QueueSlots, MaxPagesPerBatch: options.maxTransactionPages,
 		GroupLimit: options.GroupLimit, CoalesceDelay: options.CommitCoalesce,
 		MaterializationDamageGranule: uint32(options.MaterializationDamageGranule),
-		ManualCheckpoint:             options.Durability != DurabilityAsyncVisible,
+		ManualCheckpoint: options.Durability == DurabilityBufferedVisible ||
+			options.Durability == DurabilitySync && journalBacked,
 	})
 	if err != nil {
 		if writeFile != file {
@@ -2513,6 +2522,11 @@ func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 type Snapshot struct {
 	collection *Collection
 	state      *fileStoreState
+	// primaryRouter is the router pointer captured with state. Its physical
+	// leaf handles may advance after this snapshot is published, but its fences
+	// and bucket identities are immutable. Mask scans use only those immutable
+	// coordinates to route through this snapshot's rooted primary graph.
+	primaryRouter *storeio.ResidentPrimaryRouter
 	// indexes and indexNameIDs pin the immutable logical/physical catalog
 	// published with epoch. Online CREATE INDEX replaces both under
 	// snapshotGate, so an older snapshot keeps resolving names against the
@@ -2542,6 +2556,11 @@ type Snapshot struct {
 	// forever. The mask scan already threads its reconstruction buffer through
 	// caller-owned scratch; this gives the full scan the same retention.
 	scanSpliceScratch []byte
+	// maskGroups retains the bucket-to-floor routing plan for exact-index mask
+	// scans. Reuse keeps warmed sparse probes allocation-free while sorting by
+	// lexical floor preserves the same callback order as RangeRaw even after a
+	// structural split assigns a non-contiguous bucket identity.
+	maskGroups []primarySnapshotMaskGroup
 }
 
 // IndexWorkspace retains the transient routing entries, their copied
@@ -2661,6 +2680,7 @@ func (c *Collection) pinSnapshot() (*Snapshot, error) {
 		return nil, stateErr
 	}
 	epoch := c.primaryEpoch
+	primaryRouter := c.primaryRouter.Load()
 	indexes := c.options.indexes
 	indexNameIDs := c.options.indexNameIDs
 	indexDefinitions := c.options.Indexes
@@ -2671,7 +2691,8 @@ func (c *Collection) pinSnapshot() (*Snapshot, error) {
 	}
 	return &Snapshot{
 		collection: c, state: state,
-		indexes: indexes, indexNameIDs: indexNameIDs,
+		primaryRouter: primaryRouter,
+		indexes:       indexes, indexNameIDs: indexNameIDs,
 		indexDefinitions: indexDefinitions,
 		epoch:            epoch, lease: lease,
 	}, nil
@@ -2693,6 +2714,8 @@ func (s *Snapshot) Close() error {
 		s.collection = nil
 		s.state = nil
 		s.epoch = nil
+		s.primaryRouter = nil
+		s.maskGroups = nil
 	})
 	return nil
 }

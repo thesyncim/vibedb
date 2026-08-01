@@ -812,7 +812,7 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		case len(documents) == 0:
 		case len(documents) == 1:
 			_, err = collection.Put([]byte(documents[0].key), documents[0].document)
-		case collection.SupportsUpdate():
+		default:
 			err = collection.Update(func(batch *durable.WriteBatch) error {
 				for _, document := range documents {
 					if putErr := batch.Put([]byte(document.key), document.document); putErr != nil {
@@ -821,18 +821,6 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 				}
 				return nil
 			})
-		default:
-			// An indexed ordered-primary collection cannot batch, but its single-
-			// document Put maintains the exact indexes, and this create discards
-			// the whole file on any error below, so seeding a fresh indexed table
-			// through a sequence of Puts is atomic at the file boundary — the only
-			// place a first INSERT of several rows can land on an indexed table.
-			for _, document := range documents {
-				if _, putErr := collection.Put([]byte(document.key), document.document); putErr != nil {
-					err = putErr
-					break
-				}
-			}
 		}
 	}
 	if err != nil {

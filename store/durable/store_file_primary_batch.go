@@ -1,9 +1,11 @@
 package durable
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	vibejson "github.com/thesyncim/vibejson"
@@ -12,32 +14,23 @@ import (
 // ErrPrimaryBatchUnsupportedLane reports an Update on an ordered-primary
 // collection whose durability lane publishes through the committer generation
 // fence rather than the canonical dirty frames a primary batch commits on. That
-// is DurabilityAsyncVisible (and the degraded primary-sync store whose journal
-// never opened, which a healthy store never reaches, since a primary sync store
-// mints its journal unconditionally). The three lanes a primary batch supports —
-// buffered-visible, buffered-visible+journal, and sync-journal — all take the
-// deferred canonical path, where one generation carries the whole group.
+// is DurabilityAsyncVisible and the journal-less synchronous lane reached by
+// reopening an async-created store as DurabilitySync. The three logical lanes a
+// primary batch supports — buffered-visible, buffered-visible+journal, and
+// sync-journal — all take the deferred canonical path, where one generation
+// carries the whole group.
 var ErrPrimaryBatchUnsupportedLane = errors.New(
 	"vibejson: ordered primary Update requires a buffered-visible or sync-journal lane",
 )
 
-// ErrPrimaryBatchIndexedUnsupported reports that Update was called on an
-// indexed primary collection. Single-document mutations maintain the exact
-// index atomically; the batch publish path does not yet, and refusing beats
-// serving a stale index.
-var ErrPrimaryBatchIndexedUnsupported = errors.New(
-	"vibejson: transactional batch on an indexed primary collection is not yet supported",
-)
-
-// primaryBatchMutation is one resolved key in a primary Update: the leaf it
-// routes to, its per-key hash, and the document bytes (nil for a delete). Keys
-// and values borrow the WriteBatch arena, stable for the whole Update.
+// primaryBatchMutation is one resolved key in a primary Update: its resident
+// route and document bytes (nil for a delete). Keys and values borrow the
+// WriteBatch arena, stable for the whole Update.
 type primaryBatchMutation struct {
-	key       []byte
-	value     []byte
-	hash      uint64
-	leafIndex int
-	remove    bool
+	key      []byte
+	value    []byte
+	resident storeio.ResidentPrimaryRoute
+	remove   bool
 }
 
 // primaryBatchLeaf accumulates every mutation a batch routes to one leaf and the
@@ -57,29 +50,24 @@ type primaryBatchLeaf struct {
 	initialLen   int
 	finalLen     int
 	docDelta     int
+	mutationAt   int
+	mutationEnd  int
 	skip         bool
 }
 
-// updatePrimaryBatch applies one WriteBatch to the ordered primary graph as a
-// single failure-atomic generation. It is the engine of Collection.Update.
+// updatePrimaryBatch applies one WriteBatch to the ordered primary graph as one
+// logical failure-atomic publication. It is the engine of Collection.Update.
 //
-// The whole batch prepares before any of it is durable, and publishes after: every
-// document is routed and its leaf frame is rewritten (all fallible, including the
-// leaf splits a member may force — each split commits as its own structural
-// transaction before the batch publishes), then one journal record covers the
-// group with one sync, then every leaf pointer flips under one generation so a
-// reader sees all of the batch or none of it.
+// Every document is routed and its final leaf frame is prepared before the
+// logical batch becomes durable. If that final image does not fit, one
+// content-equivalent topology generation prepares all required ranges and the
+// batch is replanned. One journal record then covers the complete logical group
+// with one sync, and every logical leaf change publishes in one generation, so a
+// reader sees all of the batch or none of it. A failure after topology preparation
+// can leave logical content unchanged while Generation advances.
 func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) {
 	if c == nil {
 		return ErrClosed
-	}
-	if c.primaryExactActive() {
-		// Single-document mutations maintain the exact index inside their own
-		// publish, but the batch publish path does not yet run the posting
-		// maintainer; refusing is the honest contract until the composition is
-		// built, because a batch that silently skipped index maintenance would
-		// serve stale postings.
-		return ErrPrimaryBatchIndexedUnsupported
 	}
 	c.writer.Lock()
 	var journalTarget uint64
@@ -173,7 +161,9 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
-			if splitErr := c.splitPrimaryBatchLeaf(state, splitKey); splitErr != nil {
+			if splitErr := c.preparePrimaryBatchTopology(
+				state, batch, splitKey,
+			); splitErr != nil {
 				return false, 0, errors.Join(buildErr, splitErr)
 			}
 			continue
@@ -184,7 +174,12 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		if !c.primaryBatchHasLiveLeaf() {
 			return false, 0, nil
 		}
+		preparedExact, err := c.preparePrimaryBatchExact(state, generation)
+		if err != nil {
+			return false, 0, err
+		}
 		if err := c.admitPrimaryBatchLeaves(); err != nil {
+			c.unwindPrimaryExactPrepared(&preparedExact)
 			c.unadmitPrimaryBatchLeaves()
 			return false, 0, err
 		}
@@ -193,10 +188,17 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		// reader-visible. One batch record covers the whole group with one sync; a
 		// device failure poisons and publishes nothing.
 		if err := c.journalBatchBeforePublishLocked(generation, c.batchJournalEntries); err != nil {
+			c.unwindPrimaryExactPrepared(&preparedExact)
 			c.unadmitPrimaryBatchLeaves()
 			return false, 0, err
 		}
-		c.publishPrimaryBatch(state, generation)
+		// Point of no return passed: these frames are about to become reachable
+		// through the batch's atomic router publication. Retire only the failure-
+		// unwind bookkeeping; MarkUnreachable would discard live pages. Leaving
+		// this slice populated also falsely makes every later buffered journal-
+		// delta checkpoint ineligible.
+		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
+		c.publishPrimaryBatch(state, generation, preparedExact)
 		if c.buffered() {
 			// Buffered-visible deposits its already-published batch's redo record
 			// for the shared group sync after the writer is released.
@@ -212,6 +214,74 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		lastErr = ErrPrimaryLeafSplitRequired
 	}
 	return false, 0, lastErr
+}
+
+// preparePrimaryBatchExact stages the exact-index half of one batch. Batch leaf
+// construction may reassign stable slots, so each touched leaf contributes one
+// absolute rebase group at the batch generation. All groups share one prepared
+// chain-head set and are installed with the primary router flips.
+//
+// The resident overlay is deliberately fixed-size. If the complete batch does
+// not fit, discard its unreachable records and build one fresh foreground epoch
+// from the final images of all touched buckets. This is the same bounded
+// pressure escape used by a single slot-reassigning mutation: publication stays
+// atomic and no background or offline maintenance is required.
+func (c *Collection) preparePrimaryBatchExact(
+	state *fileStoreState, generation uint64,
+) (primaryExactPrepared, error) {
+	epoch := c.primaryEpoch
+	if epoch == nil {
+		return primaryExactPrepared{}, nil
+	}
+	prepared := primaryExactPrepared{
+		active:         true,
+		gen:            generation,
+		termLinks:      c.exactTermLinkScratch[:0],
+		tileLinks:      c.exactTileLinkScratch[:0],
+		termRecordMark: epoch.termRecordN,
+		tileRecordMark: epoch.tileRecordN,
+	}
+	bounds := c.primaryLeafBounds(state)
+	pressure := false
+	for i := range c.batchPrimaryLeaves {
+		leaf := &c.batchPrimaryLeaves[i]
+		if leaf.skip {
+			continue
+		}
+		image := c.batchPrimaryLeafArena[leaf.imageOffset : leaf.imageOffset+leaf.imageLength]
+		ok, err := c.preparePrimaryExactRebase(
+			epoch, &prepared, image, leaf.resident.Bucket,
+			generation, bounds,
+		)
+		if err != nil {
+			c.unwindPrimaryExactPrepared(&prepared)
+			return primaryExactPrepared{}, err
+		}
+		if !ok {
+			pressure = true
+			break
+		}
+	}
+	if !pressure {
+		return prepared, nil
+	}
+
+	c.unwindPrimaryExactPrepared(&prepared)
+	c.resetStructuralExactLocked()
+	defer c.resetStructuralExactLocked()
+	for i := range c.batchPrimaryLeaves {
+		leaf := &c.batchPrimaryLeaves[i]
+		if leaf.skip {
+			continue
+		}
+		image := c.batchPrimaryLeafArena[leaf.imageOffset : leaf.imageOffset+leaf.imageLength]
+		if err := c.accumulateStructuralLeafLocked(
+			leaf.resident.Bucket, image, bounds,
+		); err != nil {
+			return primaryExactPrepared{}, err
+		}
+	}
+	return c.prepareStructuralExactLocked(generation)
 }
 
 // planPrimaryBatch validates and routes every WriteBatch entry, groups the
@@ -249,17 +319,8 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 		if err != nil {
 			return err
 		}
-		li := c.findPrimaryBatchLeaf(resident.Bucket)
-		if li < 0 {
-			c.batchPrimaryLeaves = append(c.batchPrimaryLeaves, primaryBatchLeaf{
-				resident:     resident,
-				firstKey:     key,
-				pendingIndex: c.primaryPendingParentIndex(resident.Bucket),
-			})
-			li = len(c.batchPrimaryLeaves) - 1
-		}
 		c.batchPrimaryMutations = append(c.batchPrimaryMutations, primaryBatchMutation{
-			key: key, value: value, hash: resident.Hash, leafIndex: li, remove: entry.remove,
+			key: key, value: value, resident: resident, remove: entry.remove,
 		})
 		kind := uint16(storeio.RecoveryRecordKindPut)
 		var journalValue []byte
@@ -272,16 +333,41 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 			Kind: kind, Key: key, Value: journalValue,
 		})
 	}
-	return nil
-}
-
-func (c *Collection) findPrimaryBatchLeaf(bucket storeio.BucketID) int {
-	for i := range c.batchPrimaryLeaves {
-		if c.batchPrimaryLeaves[i].resident.Bucket == bucket {
-			return i
+	// The WriteBatch already deduplicated keys. Sort by the full stable bucket
+	// identity and key, then form leaf ranges in one pass. This avoids the old
+	// O(batch*touched-leaves) linear leaf lookup for dispersed batches and turns
+	// final-image construction into one linear merge per leaf.
+	slices.SortFunc(
+		c.batchPrimaryMutations,
+		func(a, b primaryBatchMutation) int {
+			if a.resident.Bucket < b.resident.Bucket {
+				return -1
+			}
+			if a.resident.Bucket > b.resident.Bucket {
+				return 1
+			}
+			return bytes.Compare(a.key, b.key)
+		},
+	)
+	leafIndex := -1
+	var previousBucket storeio.BucketID
+	for i := range c.batchPrimaryMutations {
+		mutation := &c.batchPrimaryMutations[i]
+		if leafIndex < 0 || mutation.resident.Bucket != previousBucket {
+			c.batchPrimaryLeaves = append(c.batchPrimaryLeaves, primaryBatchLeaf{
+				resident: mutation.resident, firstKey: mutation.key,
+				pendingIndex: c.primaryPendingParentIndex(
+					mutation.resident.Bucket,
+				),
+				mutationAt: i, mutationEnd: i + 1,
+			})
+			leafIndex++
+			previousBucket = mutation.resident.Bucket
+		} else {
+			c.batchPrimaryLeaves[leafIndex].mutationEnd = i + 1
 		}
 	}
-	return -1
+	return nil
 }
 
 func (c *Collection) primaryBatchHasLiveLeaf() bool {
@@ -346,13 +432,9 @@ func (c *Collection) ensurePrimaryBatchCapacity(leafCount int) (bool, error) {
 // later checkpoint materializes it. On a split-required signal it returns the
 // offending key so the caller can run the split as its own transaction and retry.
 //
-// It returns the batch's published generation. Several mutations folding onto one
-// leaf must chain through strictly increasing generations, because each leaf
-// codec rejects a rewrite whose generation does not advance; a leaf's frame lands
-// at its own advanced generation and the batch publishes the state at the highest
-// of them, which is why the whole group still commits as one atomic state
-// publication even though the frames carry a small spread of generations — a leaf
-// frame lagging the state generation is the ordinary resting shape of the graph.
+// It returns the batch's one published generation. Every final leaf image is
+// derived directly from the previous cut and stamped base+1; mutation count does
+// not inflate generations because no intermediate leaf image is published.
 func (c *Collection) buildPrimaryBatchLeaves(
 	state *fileStoreState,
 ) ([]byte, uint64, error) {
@@ -366,7 +448,7 @@ func (c *Collection) buildPrimaryBatchLeaves(
 		}
 		running += gap
 	}
-	maxApplied := 0
+	live := false
 	for li := range c.batchPrimaryLeaves {
 		splitKey, err := c.buildPrimaryBatchLeaf(state, baseGen, li)
 		if err != nil {
@@ -376,9 +458,7 @@ func (c *Collection) buildPrimaryBatchLeaves(
 		if leaf.skip {
 			continue
 		}
-		if leaf.applied > maxApplied {
-			maxApplied = leaf.applied
-		}
+		live = true
 		if running > math.MaxUint64-uint64(leaf.imageLength) {
 			return nil, 0, storeio.ErrInvalidWrite
 		}
@@ -389,7 +469,10 @@ func (c *Collection) buildPrimaryBatchLeaves(
 		}
 		running += uint64(leaf.imageLength)
 	}
-	generation := baseGen + uint64(maxApplied)
+	generation := baseGen
+	if live {
+		generation++
+	}
 	if generation == 0 || generation >= uint64(1)<<48 {
 		return nil, 0, storeio.ErrGenerationOrder
 	}
@@ -407,32 +490,29 @@ func (c *Collection) buildPrimaryBatchLeaves(
 	return nil, generation, nil
 }
 
-// buildPrimaryBatchLeaf folds every mutation routed to one leaf onto a single
-// frame. Each mutation reuses preparePrimaryLeafMutation, the exact primitive the
-// single-document path uses, so sibling changes to leaf geometry or posting
-// maintenance compose here for free. Multiple mutations chain through an
-// in-memory view of the accumulating image, each stamped with the next generation
-// above baseGen, which is why the batch touches a crowded leaf once instead of
-// once per document.
+// buildPrimaryBatchLeaf renders the base leaf once, linearly merges its sorted
+// rows with the leaf's sorted, deduplicated mutations, places the complete final
+// set once, and encodes one final image. Work is O(base rows + mutations): no
+// intermediate image exists and generation advances exactly once for the leaf.
 func (c *Collection) buildPrimaryBatchLeaf(
 	state *fileStoreState, baseGen uint64, li int,
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
 	bounds := c.primaryLeafBounds(state)
 	var (
-		path     filePrimaryMutationPath
-		lease    storeio.PageLease
-		havePath bool
+		path  filePrimaryMutationPath
+		lease storeio.PageLease
+		page  []byte
 	)
 	if leaf.pendingIndex < 0 {
-		if err := c.acquirePrimaryMutationPath(
+		if err := c.acquirePrimaryRoutingPath(
 			&path, state, leaf.firstKey, leaf.resident,
 		); err != nil {
 			return nil, err
 		}
-		havePath = true
 		defer path.Release()
 		leaf.pending = filePrimaryPendingParentFromPath(leaf.resident, &path)
+		page = path.leafLease.Page()
 	} else {
 		acquired, err := c.cache.Acquire(leaf.resident.Ref)
 		if err != nil {
@@ -441,79 +521,155 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		lease = acquired
 		defer lease.Release()
 		leaf.pending = c.primaryPendingParents[leaf.pendingIndex]
+		page = lease.Page()
 	}
-
-	var accView storeio.CommonPrimaryLeafView
-	curView := &path.leaf
-	if !havePath {
-		view, admitErr := storeio.AdmittedPrimaryLeafForMutation(
-			lease.Page(), c.storeID, leaf.resident.Bucket, bounds,
-		)
-		if admitErr != nil {
-			return nil, admitErr
-		}
-		accView = view
-		curView = &accView
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		return nil, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	leaf.initialLen = curView.Len()
-	leaf.applied = 0
+	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		page, c.storeID, leaf.resident.Bucket, bounds,
+	)
+	if !ok {
+		return nil, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	baseRows, err := unified.RenderRecordsWithScratch(c.primaryLeafMutationScratch)
+	if err != nil {
+		return nil, err
+	}
+	leaf.initialLen = len(baseRows)
 	leaf.docDelta = 0
-	for mi := range c.batchPrimaryMutations {
-		m := &c.batchPrimaryMutations[mi]
-		if m.leafIndex != li {
-			continue
-		}
-		slot, _, overflow, found := curView.LookupRawHashed(m.hash, m.key)
-		if overflow {
-			return nil, fmt.Errorf(
-				"%w: ordered primary overflow mutation",
-				ErrPrimaryCutoverUnsupported,
-			)
-		}
-		if m.remove && !found {
-			continue
-		}
-		// Each fold onto this leaf advances the generation so the codec accepts the
-		// rewrite; the running image already carries the previous fold's generation.
-		stampGen := baseGen + uint64(leaf.applied) + 1
-		preparePath := filePrimaryMutationPath{leaf: *curView}
-		image, imageBytes, _, prepErr := c.preparePrimaryLeafMutation(
-			&preparePath, stampGen, m.key,
-			storeio.CommonPrimaryLeafValue{Inline: m.value},
-			m.remove, found, slot, bounds,
-		)
-		if errors.Is(prepErr, ErrPrimaryLeafSplitRequired) {
-			return m.key, prepErr
-		}
-		if prepErr != nil {
-			return nil, prepErr
-		}
-		c.batchPrimaryLeafImage = append(c.batchPrimaryLeafImage[:0], image[:imageBytes]...)
-		view, admitErr := storeio.AdmittedPrimaryLeafForMutation(
-			c.batchPrimaryLeafImage, c.storeID, leaf.resident.Bucket, bounds,
-		)
-		if admitErr != nil {
-			return nil, admitErr
-		}
-		accView = view
-		curView = &accView
-		if m.remove {
-			leaf.docDelta--
-		} else if !found {
-			leaf.docDelta++
-		}
-		leaf.applied++
+	final, applied, err := c.mergePrimaryBatchLeafRows(
+		baseRows, leaf, c.structuralRows[:0],
+	)
+	if err != nil {
+		return nil, err
 	}
+	leaf.applied = applied
+	c.structuralRows = final
 	if leaf.applied == 0 {
 		leaf.skip = true
 		return nil, nil
 	}
-	leaf.frameGen = baseGen + uint64(leaf.applied)
-	leaf.finalLen = curView.Len()
+	leaf.docDelta = len(final) - len(baseRows)
+	leaf.finalLen = len(final)
+	if len(final) > storeio.CommonPrimaryLeafWideSlots {
+		c.primaryLeafSplitRequired.Add(1)
+		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
+		)
+	}
+	if err := storeio.PlaceCommonPrimaryLeafRecords(
+		storeio.CommonPrimaryLeafWide, c.storeID, final,
+	); err != nil {
+		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
+			errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+			c.primaryLeafSplitRequired.Add(1)
+			return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+				ErrPrimaryLeafSplitRequired, err,
+			)
+		}
+		return nil, err
+	}
+	leaf.frameGen = baseGen + 1
+	image, err := storeio.EncodeBestCommonPrimaryUnifiedLeaf(
+		c.primaryLeafScratch,
+		storeio.CommonPrimaryLeafHeader{
+			StoreID: c.storeID, Generation: leaf.frameGen,
+			Bucket: leaf.resident.Bucket,
+		},
+		c.storeID, final, bounds, c.primaryUnifiedBuilder,
+	)
+	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+		c.primaryLeafSplitRequired.Add(1)
+		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+			ErrPrimaryLeafSplitRequired, err,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
 	leaf.imageOffset = len(c.batchPrimaryLeafArena)
-	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, c.batchPrimaryLeafImage...)
+	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, image...)
 	leaf.imageLength = len(c.batchPrimaryLeafArena) - leaf.imageOffset
 	return nil, nil
+}
+
+// mergePrimaryBatchLeafRows computes one leaf's final logical row set. Both
+// inputs are lexical and batch keys are deduplicated, so the merge is linear.
+// dst may reuse Collection structural scratch. applied counts effective puts,
+// replacements, and present deletes; absent deletes do not force publication.
+func (c *Collection) mergePrimaryBatchLeafRows(
+	baseRows []storeio.CommonPrimaryLeafRecord,
+	leaf *primaryBatchLeaf,
+	dst []storeio.CommonPrimaryLeafRecord,
+) ([]storeio.CommonPrimaryLeafRecord, int, error) {
+	final := dst
+	applied := 0
+	baseAt := 0
+	mutationAt := leaf.mutationAt
+	for baseAt < len(baseRows) || mutationAt < leaf.mutationEnd {
+		if mutationAt >= leaf.mutationEnd {
+			final = append(final, baseRows[baseAt:]...)
+			baseAt = len(baseRows)
+			break
+		}
+		mutation := &c.batchPrimaryMutations[mutationAt]
+		if baseAt >= len(baseRows) {
+			if !mutation.remove {
+				final = append(final, storeio.CommonPrimaryLeafRecord{
+					Key:   mutation.key,
+					Value: storeio.CommonPrimaryLeafValue{Inline: mutation.value},
+				})
+				applied++
+			}
+			mutationAt++
+			continue
+		}
+		base := baseRows[baseAt]
+		order := bytes.Compare(base.Key, mutation.key)
+		switch {
+		case order < 0:
+			final = append(final, base)
+			baseAt++
+		case order > 0:
+			if !mutation.remove {
+				final = append(final, storeio.CommonPrimaryLeafRecord{
+					Key:   mutation.key,
+					Value: storeio.CommonPrimaryLeafValue{Inline: mutation.value},
+				})
+				applied++
+			}
+			mutationAt++
+		default:
+			if base.Value.IsOverflow() {
+				return nil, 0, fmt.Errorf(
+					"%w: ordered primary overflow mutation",
+					ErrPrimaryCutoverUnsupported,
+				)
+			}
+			if !mutation.remove {
+				final = append(final, storeio.CommonPrimaryLeafRecord{
+					Key:   mutation.key,
+					Value: storeio.CommonPrimaryLeafValue{Inline: mutation.value},
+				})
+			}
+			applied++
+			baseAt++
+			mutationAt++
+		}
+	}
+	return final, applied, nil
+}
+
+func (c *Collection) primaryBatchProspectiveSplitKey(
+	rows []storeio.CommonPrimaryLeafRecord,
+) []byte {
+	if len(rows) == 0 {
+		return nil
+	}
+	key := rows[len(rows)/2].Key
+	c.batchPrimarySplitKey = append(c.batchPrimarySplitKey[:0], key...)
+	return c.batchPrimarySplitKey
 }
 
 // admitPrimaryBatchLeaves admits every rewritten leaf frame into the cache as a
@@ -558,7 +714,11 @@ func (c *Collection) unadmitPrimaryBatchLeaves() {
 // publish precede the retirement scans, so a reader admitted before the fence
 // is seen by those scans and its frame is deferred, and a reader arriving after
 // the fence takes the gated slow path against the new root.
-func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint64) {
+func (c *Collection) publishPrimaryBatch(
+	state *fileStoreState,
+	generation uint64,
+	preparedExact primaryExactPrepared,
+) {
 	totalDelta := 0
 	for i := range c.batchPrimaryLeaves {
 		if c.batchPrimaryLeaves[i].skip {
@@ -600,6 +760,7 @@ func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint6
 		}
 		router.UpdateLeaf(leaf.resident, leaf.nextLeaf, generation)
 	}
+	c.installPrimaryExactResidentLocked(preparedExact)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	for _, prev := range c.batchPrimaryPrevVolatile {
@@ -622,27 +783,4 @@ func (c *Collection) publishPrimaryBatch(state *fileStoreState, generation uint6
 			c.removePrimaryEmptyLeaf()
 		}
 	}
-}
-
-// splitPrimaryBatchLeaf runs the leaf split a batch member forced as its own
-// structural transaction, exactly as the single-document Put path does: a split
-// changes structure, not content, so committing it before the batch publishes
-// preserves the batch's content atomicity — a crash sees the split (a pure
-// re-shaping of the same keys and values) or not, and the batch that triggered it
-// replays whole or not at all on its own record. It materializes any pending
-// parents of the target tablet first so the split rewrites real pages.
-func (c *Collection) splitPrimaryBatchLeaf(state *fileStoreState, key []byte) error {
-	c.pointKeyScratch = append(c.pointKeyScratch[:0], key...)
-	keyBytes := c.pointKeyScratch
-	resident, err := c.currentPrimaryResidentRoute(state, keyBytes)
-	if err != nil {
-		return err
-	}
-	if c.primaryPendingTablet(resident.Bucket) {
-		if err := c.checkpointBufferedLocked(); err != nil {
-			return err
-		}
-		c.automaticCheckpoints.Add(1)
-	}
-	return c.structuralSplitPrimaryLeaf(keyBytes)
 }

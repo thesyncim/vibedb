@@ -112,9 +112,10 @@ read root
 
 The direct point read (`Collection.AppendRaw`) protects the read with one
 epoch slot — no lock, no per-call generation lease. A reader announces the
-generation it is about to read in a padded per-core slot; the serialized writer
-scans those slots lock-free, and a retired extent is not reused until no
-epoch or lease can still reach its generation. The read falls back to the older
+generation it is about to read in a padded per-core slot; bounded publication
+and retirement scans read those slots lock-free, and a retired extent is not
+reused until no epoch or lease can still reach its generation. The read falls
+back to the older
 generation-lease path only when the epoch table declines the entry (full,
 writer fence, or Close). A long-lived `Snapshot` still holds a generation lease
 rather than an epoch slot.
@@ -180,12 +181,16 @@ A mutation is planned against one state:
    before that publish, so visibility follows durability.
 
 `Update` batches distinct keys, rewrites each touched leaf once, descends each
-directory once, and publishes one failure-atomic generation. It is the
+directory once, and publishes one logical failure-atomic publication. It is the
 transactional `WriteBatch` — the SQL driver's `COMMIT` and the group-commit
-primitive both flow through it, and the whole batch is one journal record with
-one CRC and one sync. Automatic combining applies the same machinery to
-overlapping `Put` and `Delete` calls. The query-visible graph is complete at
-publication; writer-only planning state is never published.
+primitive both flow through it, and the logical batch is one journal record with
+one CRC and one sync. If its final rows do not fit the current leaf topology, a
+content-equivalent topology generation may publish first and the logical batch
+publishes in the following generation. A later failure exposes no subset of the
+batch, although `Generation` may advance because the representation-only shape
+is retained. Automatic combining applies the same machinery to overlapping
+`Put` and `Delete` calls. The query-visible graph is complete at publication;
+writer-only planning state is never published.
 
 ## Checkpoint path
 

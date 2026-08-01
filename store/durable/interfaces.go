@@ -10,22 +10,13 @@ import (
 // should go through QuerySnapshot below, which reuses one workspace.
 var _ store.IndexSource = (*Snapshot)(nil)
 
-// SupportsUpdate reports whether the collection's durability lane and index
-// configuration can publish [Collection.Update] batches. It describes a
-// structural capability, not a size guarantee: an individual batch may still
-// exceed its configured document or byte bounds.
-//
-// Update is available only on a deferred-canonical lane and only without exact
-// indexes; the single-document Put/Delete path maintains exact indexes, but the
-// batch publisher deliberately rejects them.
+// SupportsUpdate reports whether the collection's durability lane can publish
+// [Collection.Update] batches. It describes a structural capability, not a size
+// guarantee: an individual batch may still exceed its configured document or
+// byte bounds. Exact indexes participate in the same atomic publication as the
+// primary leaves and therefore do not narrow this capability.
 func (c *Collection) SupportsUpdate() bool {
-	if c == nil || c.state.Load() == nil || !c.deferredCanonicalLane() {
-		return false
-	}
-	c.snapshotGate.RLock()
-	supported := c.primaryEpoch == nil
-	c.snapshotGate.RUnlock()
-	return supported
+	return c != nil && c.state.Load() != nil && c.deferredCanonicalLane()
 }
 
 // QuerySnapshot adapts a Snapshot for repeated, zero-allocation index

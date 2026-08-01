@@ -53,14 +53,10 @@ func TestTransactionSelectReadsStagedInsertAndUpdate(t *testing.T) {
 	}
 }
 
-// A transaction cannot mutate an indexed primary collection (the engine gate
-// ErrPrimaryBatchIndexedUnsupported, surfaced as ErrTransactionIndexedTable —
-// see TestTransactionOnIndexedTableIsRejected). The overlay-correctness
-// contract this test exercises — a WHERE-filtered read inside a transaction
-// reflecting the transaction's own pending updates, deletes, and inserts over
-// the base rows — does not depend on the filter being index-answered, so it is
-// expressed on the unindexed primary, where the filter is answered by a scan of
-// the overlaid candidates.
+// This overlay-correctness case deliberately uses a scan predicate: it proves a
+// WHERE-filtered read inside a transaction reflects pending updates, deletes,
+// and inserts over the base rows without making index candidate pruning part of
+// the fixture.
 func TestTransactionOverlayCorrectsFilteredBaseCandidates(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`
@@ -788,12 +784,7 @@ func TestDriverValueRoundTrips(t *testing.T) {
 	}
 }
 
-// The engine is primary-only: an exact index lives on the ordered graph, whose
-// single-document Put/Delete path maintains it but whose batch publisher refuses
-// it with ErrPrimaryBatchIndexedUnsupported. A transaction that stages a single
-// mutation therefore commits through Put/Delete, but one that stages a genuine
-// multi-key batch is refused at commit with the typed ErrTransactionIndexedTable.
-func TestTransactionOnIndexedTableIsRejected(t *testing.T) {
+func TestTransactionMaintainsIndexesAcrossAtomicBatch(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
 		t.Fatal(err)
@@ -801,45 +792,88 @@ func TestTransactionOnIndexedTableIsRejected(t *testing.T) {
 	if _, err := db.Exec(`CREATE INDEX ON docs(kind)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"seed","kind":"x"}`); err != nil {
-		t.Fatal(err)
-	}
-
-	// A lone transactional mutation applies through the exact-index-maintaining
-	// Put path, exactly as an autocommit statement does.
-	single, err := db.Begin()
+	// The first write materializes the indexed table and publishes every seed in
+	// the transaction's one batch. This used to be a lifecycle-dependent special
+	// case, so keep it in the same conformance gate as steady-state commits.
+	first, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := single.Exec(
-		`INSERT INTO docs VALUES (?)`, `{"id":"one","kind":"x"}`,
+	if _, err := first.Exec(
+		`INSERT INTO docs VALUES (?), (?)`,
+		`{"id":"a","kind":"seed"}`,
+		`{"id":"b","kind":"seed"}`,
 	); err != nil {
-		t.Fatalf("staging one indexed mutation = %v, want success", err)
+		t.Fatalf("staging initial indexed batch: %v", err)
 	}
-	if err := single.Commit(); err != nil {
-		t.Fatalf("committing one indexed mutation = %v, want success", err)
+	if err := first.Commit(); err != nil {
+		t.Fatalf("committing initial indexed batch: %v", err)
 	}
 
-	// Two staged mutations need the batch publisher, which the indexed collection
-	// refuses; the driver surfaces the typed error at commit.
-	multi, err := db.Begin()
+	transaction, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer multi.Rollback()
-	if _, err := multi.Exec(
-		`INSERT INTO docs VALUES (?)`, `{"id":"two","kind":"x"}`,
+	if _, err := transaction.Exec(
+		`UPDATE docs SET "$doc" = ? WHERE id = ?`,
+		`{"id":"a","kind":"updated"}`, "a",
 	); err != nil {
-		t.Fatalf("staging first of two indexed mutations = %v", err)
+		t.Fatalf("staging indexed update: %v", err)
 	}
-	if _, err := multi.Exec(
-		`INSERT INTO docs VALUES (?)`, `{"id":"three","kind":"x"}`,
+	if _, err := transaction.Exec(`DELETE FROM docs WHERE id = ?`, "b"); err != nil {
+		t.Fatalf("staging indexed delete: %v", err)
+	}
+	if _, err := transaction.Exec(
+		`INSERT INTO docs VALUES (?), (?)`,
+		`{"id":"c","kind":"inserted"}`,
+		`{"id":"d","kind":"inserted"}`,
 	); err != nil {
-		t.Fatalf("staging second of two indexed mutations = %v", err)
+		t.Fatalf("staging indexed inserts: %v", err)
 	}
-	if err := multi.Commit(); !errors.Is(err, ErrTransactionIndexedTable) {
-		t.Fatalf("indexed multi-key transactional commit = %v, want ErrTransactionIndexedTable", err)
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("committing indexed mixed batch: %v", err)
 	}
+
+	assertKindCount := func(kind string, want int64) {
+		t.Helper()
+		var got int64
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM docs WHERE kind = ?`, kind,
+		).Scan(&got); err != nil {
+			t.Fatalf("count kind %q: %v", kind, err)
+		}
+		if got != want {
+			t.Fatalf("count kind %q = %d, want %d", kind, got, want)
+		}
+	}
+	assertKindCount("seed", 0)
+	assertKindCount("updated", 1)
+	assertKindCount("inserted", 2)
+
+	rolledBack, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rolledBack.Exec(
+		`UPDATE docs SET "$doc" = ? WHERE id = ?`,
+		`{"id":"a","kind":"rolled-back"}`, "a",
+	); err != nil {
+		t.Fatalf("staging rollback update: %v", err)
+	}
+	if _, err := rolledBack.Exec(`DELETE FROM docs WHERE id = ?`, "c"); err != nil {
+		t.Fatalf("staging rollback delete: %v", err)
+	}
+	if _, err := rolledBack.Exec(
+		`INSERT INTO docs VALUES (?)`, `{"id":"e","kind":"rolled-back"}`,
+	); err != nil {
+		t.Fatalf("staging rollback insert: %v", err)
+	}
+	if err := rolledBack.Rollback(); err != nil {
+		t.Fatalf("rolling back indexed mixed batch: %v", err)
+	}
+	assertKindCount("updated", 1)
+	assertKindCount("inserted", 2)
+	assertKindCount("rolled-back", 0)
 }
 
 func TestTransactionValidatesSchemaAtExec(t *testing.T) {

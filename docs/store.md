@@ -63,12 +63,18 @@ Replacing a key:
 - shares unchanged immutable state with older snapshots;
 - rebuilds at most the configured chunk and bounded metadata paths.
 
-Writes are serialized. Each successful write publishes one immutable state
-through an atomic pointer.
+Eligible schemaless, unindexed, inline point mutations prepare concurrently in
+fixed per-writer scratch contexts. Routing and leaf inspection use 4,096 lock
+stripes hashed from the full bucket/leaf identity, followed by a short bounded
+publisher-combiner stage. Structural work, `Update` batches, indexed or
+schema-validated writes, overflow values, and other ineligible shapes retain the
+exclusive fallback. See [parallel primary writers](design/parallel-tablet-writers.md)
+for the exact eligibility and resource bounds.
 
 ### Batched mutation
 
-`durable.Collection.Update` applies many mutations as one generation:
+`durable.Collection.Update` applies many mutations as one logical
+failure-atomic publication:
 
 ```go
 err := collection.Update(func(b *durable.WriteBatch) error {
@@ -81,11 +87,15 @@ err := collection.Update(func(b *durable.WriteBatch) error {
 })
 ```
 
-The batch rewrites each touched primary leaf once rather than once per
-document, covers the group with one journal record synced once, and flips every
-leaf pointer under one generation. It either publishes whole or publishes
-nothing: an error from the closure or from any staged mutation aborts the
-transaction.
+The logical batch rewrites each touched primary leaf once rather than once per
+document, covers the group with one journal record synced once, and publishes
+all row and exact-posting changes together. If its final rows do not fit the
+current leaf topology, it may first publish one content-equivalent topology
+generation and publish the logical batch in the following generation. The
+logical changes either publish whole or publish nothing: an error from the
+closure or a staged mutation exposes no subset of the batch. If an error occurs
+after topology preparation, rows and exact postings remain unchanged but
+`Generation` may advance.
 
 `Options.MaxBatchDocuments` bounds how many distinct keys one `Update` may carry
 and sizes the transaction reservation; zero selects 64. A larger batch reports

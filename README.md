@@ -8,7 +8,9 @@ memtables, tombstones, or version chains.
 
 The project is unreleased. Public APIs and the primary-file version-0 on-disk
 format may change in place; development files are recreated after a format
-change.
+change. Superseded APIs are deleted rather than deprecated or retained behind
+compatibility shims; development callers are expected to track the current
+surface.
 
 ## Performance snapshot
 
@@ -133,6 +135,8 @@ mode.
 - [Architecture](docs/architecture.md): representation invariants and the
   read, write, checkpoint, and snapshot paths.
 - [Store API](docs/store.md): current heap and durable surfaces.
+- [Capability matrix](docs/capabilities.md): executable native, database/sql,
+  pgwire, indexing, transaction, operation, and durability contracts.
 - [Durability](docs/durability.md): acknowledgement, crash, recovery, and
   platform-sync contracts.
 - [On-disk format](docs/format.md): current byte-level format authority.

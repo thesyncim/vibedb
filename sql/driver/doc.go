@@ -75,8 +75,10 @@
 // INSERT rejects an existing or repeated derived key with
 // ErrDuplicatePrimaryKey and never replaces it. UPDATE is the explicit
 // replacement operation, accepts only SET "$doc" = ..., and cannot change the
-// derived primary key. LastInsertId is unavailable because keys come from
-// documents.
+// derived primary key. Because one statement supplies one replacement document,
+// an UPDATE matching several distinct keys returns [ErrUpdatePrimaryKey]; use a
+// transaction with one replacement statement per key. LastInsertId is
+// unavailable because keys come from documents.
 //
 // # SELECT and joins
 //

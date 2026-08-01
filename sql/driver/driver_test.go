@@ -368,14 +368,18 @@ func TestExactIndexCountAndAutocommitMaintenance(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("COUNT(*) = %d, want 1", count)
 	}
-	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"later","kind":"x"}`); err != nil {
+	if _, err := db.Exec(
+		`INSERT INTO docs VALUES (?), (?)`,
+		`{"id":"later","kind":"x"}`,
+		`{"id":"other","kind":"x"}`,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE kind = ?`, "x").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("COUNT(*) after indexed INSERT = %d, want 2", count)
+	if count != 3 {
+		t.Fatalf("COUNT(*) after indexed multi-row INSERT = %d, want 3", count)
 	}
 	if _, err := db.Exec(
 		`UPDATE docs SET "$doc" = ? WHERE id = ?`,
@@ -386,17 +390,19 @@ func TestExactIndexCountAndAutocommitMaintenance(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE kind = ?`, "x").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("COUNT(*) after indexed UPDATE = %d, want 1", count)
+	if count != 2 {
+		t.Fatalf("COUNT(*) after indexed UPDATE = %d, want 2", count)
 	}
-	if _, err := db.Exec(`DELETE FROM docs WHERE id = ?`, "seed"); err != nil {
+	if _, err := db.Exec(
+		`DELETE FROM docs WHERE id IN (?, ?)`, "seed", "other",
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM docs WHERE kind = ?`, "x").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
-		t.Fatalf("COUNT(*) after indexed DELETE = %d, want 0", count)
+		t.Fatalf("COUNT(*) after indexed multi-document DELETE = %d, want 0", count)
 	}
 }
 

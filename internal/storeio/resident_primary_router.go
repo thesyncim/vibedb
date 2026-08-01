@@ -472,6 +472,20 @@ func (r *ResidentPrimaryRouter) ResolveBucketID(
 	return ResidentPrimaryRoute{}, false
 }
 
+// ResolveBucketFloor returns one coherent mutable leaf handle together with
+// its immutable lexical floor. A snapshot may use the handle directly when
+// its generation is not newer than the captured state; otherwise the floor is
+// the coordinate for a rooted fallback.
+func (r *ResidentPrimaryRouter) ResolveBucketFloor(
+	bucket BucketID,
+) (ResidentPrimaryRoute, []byte, bool) {
+	route, ok := r.ResolveBucketID(bucket)
+	if !ok {
+		return ResidentPrimaryRoute{}, nil, false
+	}
+	return route, r.fence(int(route.rank)), true
+}
+
 // Generation reports the state-root generation represented by the current
 // mutable leaf handles.
 func (r *ResidentPrimaryRouter) Generation() uint64 {

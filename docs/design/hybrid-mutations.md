@@ -1,8 +1,9 @@
 # Read-neutral mutations
 
-**Status:** implemented for point mutations and supported transactional
-batches on the ordered primary graph. Indexed multi-document batches remain
-unsupported and fail closed.
+**Status:** implemented for point mutations and transactional batches on the
+ordered primary graph, including batches that maintain exact indexes. Batch
+support is selected by publication lane, not by whether the collection is
+indexed.
 
 ## Rule
 
@@ -32,13 +33,22 @@ writer work, not the snapshot or read path.
 
 `Collection.Update` records mutations in a bounded `WriteBatch`. Duplicate keys
 collapse to their final operation, each touched primary leaf is rewritten once,
-and one generation is published. `MaxBatchDocuments` and the option-derived
-byte bounds reject oversized batches before partial publication.
+and the row and exact-posting changes form one logical failure-atomic
+publication. When the final rows cannot fit the current leaf topology, a
+content-equivalent topology generation may publish first and the logical batch
+publishes in the following generation. A later failure cannot expose a subset
+of the logical changes, but `Generation` may advance because the
+representation-only topology is retained. `MaxBatchDocuments` and the
+option-derived byte bounds reject oversized batches before partial logical
+publication.
 
 Callers must check `Collection.SupportsUpdate`. A collection configuration the
 batch path cannot update atomically returns the corresponding typed error; it
-does not fall back to a sequence of point mutations. In particular, indexed
-multi-document batches remain future work.
+does not fall back to a sequence of point mutations. Buffered-visible and
+journal-backed synchronous collections support both indexed and unindexed
+batches. `DurabilityAsyncVisible` and a journal-less synchronous reopen publish
+through committer generation fences instead, so `Update` fails closed there
+with `ErrPrimaryBatchUnsupportedLane`.
 
 ## Durability lanes
 

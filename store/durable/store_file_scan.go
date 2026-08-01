@@ -2,10 +2,400 @@ package durable
 
 import (
 	"bytes"
+	"fmt"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
+
+type primarySnapshotMaskGroup struct {
+	bucket   storeio.BucketID
+	selected [4]uint64
+	floor    []byte
+	route    storeio.ResidentPrimaryRoute
+}
+
+// RangeRawCurrent visits one current reader-visible generation in bytewise
+// lexical key order. Unlike Snapshot.RangeRaw, it is deliberately ephemeral:
+// the generation and its row-overlay history are pinned only for this call.
+// That lets a mixed read/write loop scan pending inline mutations directly
+// instead of first folding them into a new physical graph.
+//
+// The structural fence is held only long enough to pin a generation and copy
+// the overlay's fixed bucket-head directory. Ordinary and structural writers,
+// checkpoints, and Close may then proceed while the rooted graph and captured
+// immutable record chains remain protected by the reader pin. key and value
+// are borrowed only for the callback.
+func (c *Collection) RangeRawCurrent(fn func(key, value []byte) error) error {
+	_, err := c.RangeRawCurrentBuffer(nil, fn)
+	return err
+}
+
+// RangeRawCurrentBuffer is RangeRawCurrent with caller-owned reconstruction
+// storage. Reusing the returned slice makes warmed inline and overflow scans
+// allocation-free.
+func (c *Collection) RangeRawCurrentBuffer(
+	scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
+	if c == nil {
+		return scratch, ErrClosed
+	}
+	if fn == nil {
+		return scratch, nil
+	}
+
+	var captured primaryCurrentScanOverlayCapture
+	state, pin, rooted, err := c.capturePrimaryCurrentScan(&captured)
+	if err != nil {
+		return scratch, err
+	}
+	if !rooted {
+		// A structural deferred lane has a router newer than its sealed root.
+		// Preserve the mature Snapshot materialization path for this rare case;
+		// the common inline overlay lane never reaches it.
+		snapshot, snapshotErr := c.Snapshot()
+		if snapshotErr != nil {
+			return scratch, snapshotErr
+		}
+		defer snapshot.Close()
+		return snapshot.RangeRawBuffer(scratch, fn)
+	}
+	defer pin.release()
+	return c.rangeRawCurrentAt(state, &captured, scratch, fn)
+}
+
+// primaryCurrentScanOverlayCapture mirrors the overlay's fixed open-addressed
+// bucket directory. Each packed word is bucket<<32|head; head zero is empty.
+// Copying all 2,048 words under the short structural fence is bounded and
+// avoids a map, allocation, or long writer exclusion during callbacks.
+type primaryCurrentScanOverlayCapture struct {
+	bucket [primaryUnifiedOverlayBucketTable]uint64
+}
+
+func (d *primaryCurrentScanOverlayCapture) capture(
+	overlay *primaryUnifiedOverlay,
+	baseGeneration, generation uint64,
+) error {
+	*d = primaryCurrentScanOverlayCapture{}
+	if overlay == nil || generation <= baseGeneration {
+		return nil
+	}
+	for index := range overlay.buckets {
+		head := overlay.buckets[index].head.Load()
+		if head == 0 {
+			continue
+		}
+		if head > uint32(len(overlay.records)) {
+			return storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		// Head publication follows complete immutable record initialization.
+		// Derive the identity from that record rather than a separately loaded
+		// directory word, so a future publisher cannot produce a torn
+		// {stale bucket,new head} observation in this captured cut.
+		record := &overlay.records[head-1]
+		if record.generation == 0 {
+			return storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		d.bucket[index] = uint64(record.bucket)<<32 | uint64(head)
+	}
+	return nil
+}
+
+func (d *primaryCurrentScanOverlayCapture) head(
+	bucket storeio.BucketID,
+) uint32 {
+	mask := uint32(primaryUnifiedOverlayBucketTable - 1)
+	slot := primaryUnifiedOverlayBucketHash(bucket) & mask
+	for range primaryUnifiedOverlayBucketTable {
+		packed := d.bucket[slot]
+		head := uint32(packed)
+		if head == 0 {
+			return 0
+		}
+		if uint32(packed>>32) == uint32(bucket) {
+			return head
+		}
+		slot = (slot + 1) & mask
+	}
+	return 0
+}
+
+type primaryCurrentScanPin struct {
+	epoch  storeio.ReadEpoch
+	lease  storeio.GenerationLease
+	direct bool
+}
+
+func (p *primaryCurrentScanPin) release() {
+	if p.direct {
+		p.epoch.Exit()
+	} else {
+		p.lease.Release()
+	}
+}
+
+func (c *Collection) capturePrimaryCurrentScan(
+	captured *primaryCurrentScanOverlayCapture,
+) (*fileStoreState, primaryCurrentScanPin, bool, error) {
+	c.writer.RLock()
+	defer c.writer.RUnlock()
+	if len(c.primaryPendingParents) != 0 {
+		return nil, primaryCurrentScanPin{}, false, nil
+	}
+	if state, epoch, ok := c.enterReadEpoch(); ok {
+		if state.root.PrimaryRoot == (storeio.PageRef{}) {
+			epoch.Exit()
+			return nil, primaryCurrentScanPin{}, false,
+				storeio.ErrSegmentedTabletRouterCorrupt
+		}
+		if err := captured.capture(
+			c.primaryUnifiedOverlay,
+			state.root.PrimaryRoot.Generation,
+			state.root.Generation,
+		); err != nil {
+			epoch.Exit()
+			return nil, primaryCurrentScanPin{}, false, err
+		}
+		return state, primaryCurrentScanPin{
+			epoch: epoch, direct: true,
+		}, true, nil
+	}
+
+	c.snapshotGate.RLock()
+	state, stateErr := c.readerFileState()
+	if stateErr != nil {
+		c.snapshotGate.RUnlock()
+		return nil, primaryCurrentScanPin{}, false, stateErr
+	}
+	lease, leaseErr := c.leases.Acquire(state.root.Generation)
+	c.snapshotGate.RUnlock()
+	if leaseErr != nil {
+		return nil, primaryCurrentScanPin{}, false, leaseErr
+	}
+	if state.root.PrimaryRoot == (storeio.PageRef{}) {
+		lease.Release()
+		return nil, primaryCurrentScanPin{}, false,
+			storeio.ErrSegmentedTabletRouterCorrupt
+	}
+	if err := captured.capture(
+		c.primaryUnifiedOverlay,
+		state.root.PrimaryRoot.Generation,
+		state.root.Generation,
+	); err != nil {
+		lease.Release()
+		return nil, primaryCurrentScanPin{}, false, err
+	}
+	return state, primaryCurrentScanPin{lease: lease}, true, nil
+}
+
+func (c *Collection) rangeRawCurrentAt(
+	state *fileStoreState,
+	captured *primaryCurrentScanOverlayCapture,
+	scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.PrimaryRoot.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
+	bounds := c.primaryLeafBounds(state)
+	var cursor storeio.PrimaryGraphCursor
+	if err := storeio.InitPrimaryGraphCursor(
+		&cursor, c.cache, state.root.PrimaryRoot,
+		catalogBounds, bounds, nil, nil,
+	); err != nil {
+		return scratch, err
+	}
+	defer cursor.Close()
+	if state.root.Generation == state.root.PrimaryRoot.Generation {
+		cursor.AdoptSpliceScratch(scratch)
+		for {
+			key, ref, err := cursor.VisitInline(fn)
+			scratch = cursor.ReleaseSpliceScratch()
+			if err != nil {
+				return scratch, err
+			}
+			if ref == (storeio.PageRef{}) {
+				return scratch, nil
+			}
+			scratch, err = c.appendPrimaryOverflowValue(
+				scratch[:0], ref, bounds,
+			)
+			if err != nil {
+				return scratch, err
+			}
+			if err = fn(key, scratch); err != nil {
+				return scratch, err
+			}
+			cursor.AdoptSpliceScratch(scratch)
+		}
+	}
+
+	overlay := c.primaryUnifiedOverlay
+	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
+	var renderer storeio.CommonPrimaryUnifiedRowRenderer
+	var visited uint64
+	for {
+		bucket, leaf, ok := cursor.CurrentUnifiedLeaf()
+		if !ok {
+			break
+		}
+		head := captured.head(bucket)
+		overlayCount := 0
+		var err error
+		if head != 0 && overlay != nil {
+			overlayCount, err = overlay.latestBucketRecordsFromHead(
+				&indexes, bucket, head,
+				state.root.PrimaryRoot.Generation,
+				state.root.Generation,
+			)
+			if err != nil {
+				return scratch, err
+			}
+		}
+		if overlayCount == 0 {
+			cursor.AdoptSpliceScratch(scratch)
+			for {
+				key, ref, visitErr := cursor.VisitCurrentLeafAllInline(fn)
+				scratch = cursor.ReleaseSpliceScratch()
+				if visitErr != nil {
+					return scratch, visitErr
+				}
+				if ref == (storeio.PageRef{}) {
+					break
+				}
+				scratch, visitErr = c.appendPrimaryOverflowValue(
+					scratch[:0], ref, bounds,
+				)
+				if visitErr != nil {
+					return scratch, visitErr
+				}
+				if visitErr = fn(key, scratch); visitErr != nil {
+					return scratch, visitErr
+				}
+				cursor.AdoptSpliceScratch(scratch)
+			}
+			visited += uint64(leaf.Len())
+		} else {
+			renderer.Reset(leaf)
+			var leafVisited uint64
+			scratch, leafVisited, err = c.rangeRawCurrentLeaf(
+				&leaf, &renderer, overlay, indexes[:overlayCount],
+				bounds, scratch, fn,
+			)
+			if err != nil {
+				return scratch, err
+			}
+			visited += leafVisited
+		}
+		if err := cursor.NextLeaf(); err != nil {
+			return scratch, err
+		}
+	}
+	if visited != state.root.DocumentCount {
+		return scratch, fmt.Errorf(
+			"%w: current scan visited %d rows, want %d",
+			storeio.ErrCommonPrimaryLeafCorrupt,
+			visited,
+			state.root.DocumentCount,
+		)
+	}
+	return scratch, nil
+}
+
+func (c *Collection) rangeRawCurrentLeaf(
+	leaf *storeio.CommonPrimaryUnifiedLeafView,
+	renderer *storeio.CommonPrimaryUnifiedRowRenderer,
+	overlay *primaryUnifiedOverlay,
+	indexes []uint16,
+	bounds storeio.CommonPrimaryLeafBounds,
+	scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, uint64, error) {
+	rows := leaf.AllRows()
+	baseKey, baseBody, baseOverflow, baseOK := rows.NextRawBorrowed()
+	overlayAt := 0
+	var visited uint64
+	for baseOK || overlayAt < len(indexes) {
+		var record *primaryUnifiedOverlayRecord
+		var overlayKey []byte
+		if overlayAt < len(indexes) {
+			if overlay == nil || int(indexes[overlayAt]) >= len(overlay.records) {
+				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			record = &overlay.records[indexes[overlayAt]]
+			keyEnd := record.keyOffset + uint32(record.keyLen)
+			if record.keyLen == 0 || keyEnd > uint32(len(overlay.arena)) {
+				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			overlayKey = overlay.arena[record.keyOffset:keyEnd:keyEnd]
+		}
+
+		order := 0
+		switch {
+		case !baseOK:
+			order = 1
+		case record == nil:
+			order = -1
+		default:
+			order = bytes.Compare(baseKey, overlayKey)
+		}
+		if order < 0 {
+			value := baseBody
+			if baseOverflow {
+				var err error
+				scratch, err = c.appendPrimaryOverflowValue(
+					scratch[:0],
+					storeio.DecodePrimaryOverflowRef(baseBody),
+					bounds,
+				)
+				if err != nil {
+					return scratch, visited, err
+				}
+				value = scratch
+			} else {
+				scratch = renderer.Append(scratch[:0], baseBody)
+				value = scratch
+			}
+			if err := fn(baseKey, value); err != nil {
+				return scratch, visited, err
+			}
+			visited++
+			baseKey, baseBody, baseOverflow, baseOK = rows.NextRawBorrowed()
+			continue
+		}
+
+		switch record.kind {
+		case primaryUnifiedOverlayPut:
+			valueEnd := record.valueOff + record.valueLen
+			if record.valueLen == 0 || valueEnd > uint32(len(overlay.arena)) {
+				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if err := fn(
+				overlayKey,
+				overlay.arena[record.valueOff:valueEnd:valueEnd],
+			); err != nil {
+				return scratch, visited, err
+			}
+			visited++
+		case primaryUnifiedOverlayDelete:
+			if record.valueLen != 0 {
+				return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+		default:
+			return scratch, visited, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		overlayAt++
+		if order == 0 {
+			baseKey, baseBody, baseOverflow, baseOK = rows.NextRawBorrowed()
+		}
+	}
+	return scratch, visited, nil
+}
 
 // RangeRaw visits live rows in bytewise lexical key order. key and value are
 // borrowed only for the callback; overflow values reuse one bounded buffer.
@@ -175,23 +565,34 @@ func (s *Snapshot) RangeMasksRawRowsBuffer(
 	return s.rangePrimaryMasks(masks, scratch, fn)
 }
 
-// rangePrimaryMasks materializes selected rows from the ordered primary graph.
-// Masks are grouped by bucket (four quadrant tiles per bucket), the bucket's
-// leaf is resolved through the resident router, and its live rows are visited in
-// lexical order with their posting-stable slot; a row whose tile/bit is selected
-// is delivered. For an indexed primary every selected bit is rechecked against
-// the live-slot map, so a mask that names a dead or absent slot fails closed.
+// rangePrimaryMasks materializes selected rows from the snapshot-rooted primary
+// graph. Masks are grouped by bucket (four quadrant tiles per bucket), paired
+// with the immutable floor retained by this snapshot's router, and sorted by
+// that floor. A coherently sampled handle no newer than the snapshot visibility
+// cut pins its immutable page directly; a handle advanced after capture is
+// resolved by floor through state.root.PrimaryRoot. Any row-overlay suffix in
+// the snapshot cut is merged at that exact generation. Thus old exact masks,
+// old leaf slots, and old row images all come from one generation, and callbacks
+// retain the lexical order of RangeRaw after non-contiguous bucket allocation.
+// Every selected bit is rechecked against the pinned exact epoch's live-slot
+// map, so a mask that names a dead or absent slot fails closed.
 func (s *Snapshot) rangePrimaryMasks(
 	masks []store.Mask,
 	scratch []byte,
 	fn func(row store.Location, key, value []byte) error,
 ) ([]byte, error) {
 	state := s.state
-	router := s.collection.primaryRouter.Load()
+	router := s.primaryRouter
 	if router == nil {
 		return scratch, store.ErrMaskChunk
 	}
 	bounds := s.collection.primaryLeafBounds(state)
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.PrimaryRoot.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
 	// Liveness enforcement resolves through the pinned epoch's read rule at
 	// this snapshot's generation: newest tile record ≤ G, else the flat
 	// table — the same fence the probe's posting recheck uses.
@@ -204,6 +605,8 @@ func (s *Snapshot) rangePrimaryMasks(
 	// Using the field rather than a captured local keeps the per-bucket callback
 	// free of a boxed-capture allocation (zero-GC scan hot path).
 	s.overflowScanValue = s.overflowScanValue[:0]
+	s.maskGroups = s.maskGroups[:0]
+	floorsOrdered := true
 	var previous uint32
 	for at := 0; at < len(masks); {
 		if at != 0 && masks[at].Chunk <= previous {
@@ -213,7 +616,9 @@ func (s *Snapshot) rangePrimaryMasks(
 		if bucket >= storeio.PrimaryBucketIDLimit {
 			return scratch, store.ErrMaskChunk
 		}
-		var selected [4]uint64
+		group := primarySnapshotMaskGroup{
+			bucket: storeio.BucketID(bucket),
+		}
 		for at < len(masks) && masks[at].Chunk>>2 == bucket {
 			mask := masks[at]
 			if at != 0 && mask.Chunk <= previous {
@@ -227,26 +632,99 @@ func (s *Snapshot) rangePrimaryMasks(
 				) != 0 {
 				return scratch, store.ErrMaskChunk
 			}
-			selected[quadrant] = mask.Bits
+			group.selected[quadrant] = mask.Bits
 			at++
 		}
-		route, ok := router.ResolveBucketID(storeio.BucketID(bucket))
+		var ok bool
+		group.route, group.floor, ok = router.ResolveBucketFloor(group.bucket)
 		if !ok {
 			return scratch, store.ErrMaskChunk
 		}
-		lease, err := router.AcquireLeaf(s.collection.cache, route)
-		if err != nil {
-			return scratch, err
+		if len(s.maskGroups) != 0 {
+			order := bytes.Compare(
+				s.maskGroups[len(s.maskGroups)-1].floor, group.floor,
+			)
+			if order == 0 {
+				return scratch, store.ErrMaskChunk
+			}
+			floorsOrdered = floorsOrdered && order < 0
 		}
-		if s.collection.primaryUnifiedOverlay.pendingBucket(route.Bucket) {
+		s.maskGroups = append(s.maskGroups, group)
+	}
+	if !floorsOrdered {
+		slices.SortFunc(
+			s.maskGroups,
+			func(a, b primarySnapshotMaskGroup) int {
+				return bytes.Compare(a.floor, b.floor)
+			},
+		)
+		for i := 1; i < len(s.maskGroups); i++ {
+			if bytes.Equal(s.maskGroups[i-1].floor, s.maskGroups[i].floor) {
+				return scratch, store.ErrMaskChunk
+			}
+		}
+	}
+	if len(s.maskGroups) == 0 {
+		return scratch, nil
+	}
+	// A retained router handle whose leaf generation is not newer than the
+	// snapshot visibility cut still names an immutable page that belongs to this
+	// snapshot and takes the original one-pin fast path. A bucket rewritten after
+	// capture falls back to
+	// one lazy rooted cursor; multiple stale buckets share that descent and its
+	// lexical successors. Sampling the handle and generation through the router
+	// seqlock is race-safe even while a newer publisher flips it.
+	var cursor storeio.PrimaryGraphCursor
+	defer cursor.Close()
+	rooted := false
+	for groupAt := range s.maskGroups {
+		group := &s.maskGroups[groupAt]
+		var (
+			page  []byte
+			lease storeio.PageLease
+			err   error
+		)
+		if group.route.Ref.Generation <= state.root.Generation {
+			lease, err = router.AcquireLeaf(s.collection.cache, group.route)
+			if err != nil {
+				return scratch, err
+			}
+			page = lease.Page()
+		} else {
+			if !rooted {
+				if err = storeio.InitPrimaryGraphCursor(
+					&cursor, s.collection.cache, state.root.PrimaryRoot,
+					catalogBounds, bounds, group.floor, nil,
+				); err != nil {
+					return scratch, err
+				}
+				rooted = true
+			} else if err = cursor.NextLeaf(); err != nil {
+				return scratch, err
+			}
+			for {
+				bucket, rootedPage, pageOK := cursor.CurrentUnifiedLeafPage()
+				if !pageOK {
+					return scratch, store.ErrMaskChunk
+				}
+				if bucket == group.bucket {
+					page = rootedPage
+					break
+				}
+				if err = cursor.NextLeaf(); err != nil {
+					return scratch, err
+				}
+			}
+		}
+		if state.root.Generation > state.root.PrimaryRoot.Generation &&
+			s.collection.primaryUnifiedOverlay.pendingBucket(group.bucket) {
 			scratch, err = s.rangePrimaryOverlayMaskedLeaf(
-				lease.Page(), route.Bucket, bounds, selected,
-				scratch, fn,
+				page, group.bucket, bounds, group.selected, scratch, fn,
 			)
 		} else {
 			scratch, err = storeio.VisitPrimaryLeafSelectedPostingRows(
-				lease.Page(), state.root.StoreID, route.Bucket, bounds,
-				selected, scratch,
+				page, state.root.StoreID, group.bucket, bounds,
+				group.selected, scratch,
 				func(slot uint8, key, raw []byte, overflow bool) error {
 					quadrant := slot >> 6
 					value := raw
@@ -265,7 +743,7 @@ func (s *Snapshot) rangePrimaryMasks(
 						value = resolved
 					}
 					return fn(store.Location{
-						Chunk: uint32(route.Bucket)<<2 | uint32(quadrant),
+						Chunk: uint32(group.bucket)<<2 | uint32(quadrant),
 						Slot:  slot & 63,
 					}, key, value)
 				},
@@ -279,10 +757,11 @@ func (s *Snapshot) rangePrimaryMasks(
 	return scratch, nil
 }
 
-// rangePrimaryOverlayMaskedLeaf merges a bucket's newest visible row-overlay
-// records with its immutable class-5 base in lexical order. This is the masked
-// counterpart of point reads' overlay-first rule: inserted rows are visible,
-// replacements expose their new value, and tombstones suppress the base row.
+// rangePrimaryOverlayMaskedLeaf merges one snapshot generation's row-overlay
+// records with its immutable class-5 base in lexical order. The generation
+// bound is essential: the shared overlay may already contain records from a
+// newer publication, but an older snapshot must consume only records visible at
+// its own cut.
 func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 	page []byte,
 	bucket storeio.BucketID,
@@ -357,8 +836,7 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 			if keyEnd > uint32(len(overlay.arena)) {
 				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 			}
-			overlayKey =
-				overlay.arena[record.keyOffset:keyEnd:keyEnd]
+			overlayKey = overlay.arena[record.keyOffset:keyEnd:keyEnd]
 		}
 		order := 0
 		switch {
