@@ -233,10 +233,14 @@ each mode.
 
 ## Snapshots and copy-on-write
 
-Snapshot creation retains the current immutable root and generation-stamped
-overlay cut and acquires a bounded generation lease; it does no per-key work.
-Later mutations may share unchanged pages and earlier overlay records with that
-cut. Replaced pages and newly linked records leave the snapshot's view intact.
+Snapshot creation currently folds any pending primary overlay and unsealed
+primary parents under the exclusive writer fence, then captures the resulting
+physical file-store state, primary router, and bounded generation lease. This is
+not a full-store copy or per-key scan, but creation can pay bounded foreground
+work proportional to the dirty primary records being sealed. A resident
+exact-index epoch may remain captured by the snapshot and is reconciled by its
+exact-index reads. Later mutations may still share unchanged pages with the captured
+cut; replaced pages and newly linked records leave the snapshot's view intact.
 
 Retired extents remain unavailable for reuse until no snapshot can reach them.
 A long-lived snapshot therefore consumes bounded retirement capacity and can
@@ -254,8 +258,10 @@ creating open-ended merge or space-amplification debt.
 The trade is that reads perform an exact bounded reconciliation against the
 captured generation until that foreground fold. Deletes disappear from the
 logical view immediately but may remain as bounded delete records. Snapshots
-pin a root plus its overlay cut. Isolated random writes
-can rewrite page paths, and it shows in the synchronous lane, where a
+currently seal pending primary records before pinning their logical cut; they
+may retain a captured exact-index epoch, but do not retain a primary-overlay
+cut. Isolated random writes can rewrite page paths, and it shows in the
+synchronous lane, where a
 per-mutation durable acknowledgement currently trails SQLite. Writer batching,
 owned-frame in-place updates, bounded overlays, and the recovery-only journal
 remain predictable because their capacities and fold work are fixed at open.
