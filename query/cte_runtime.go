@@ -97,6 +97,10 @@ type statementCTE struct {
 	// active at the instant lowering inspects the definition. Identity makes
 	// adapter teardown exact when the borrowed Statement is reused.
 	recursiveOwner *RecursiveCTEStatementTerm
+	// recursiveDefinition is allocated only by the future WITH RECURSIVE
+	// lowerer. Ordinary definitions keep it nil and retain their existing
+	// materialization and execution objects.
+	recursiveDefinition *statementRecursiveDefinition
 }
 
 // statementCTEReference owns storage only for reference-local and explicitly
@@ -208,6 +212,12 @@ func (r *statementCTEReference) mode() cteExecutionMode {
 	if r == nil || r.def == nil || r.def.definition == nil {
 		return cteReferenceLocal
 	}
+	if recursive := r.def.recursiveDefinition; recursive != nil {
+		if recursive.descriptor.materialize == RecursiveCTEShared {
+			return cteSharedMaterialized
+		}
+		return cteIndependent
+	}
 	switch r.def.definition.Materialization {
 	case sqlast.CTEMaterialized:
 		return cteSharedMaterialized
@@ -231,7 +241,8 @@ func (r *statementCTEReference) mode() cteExecutionMode {
 // generalized relation planner; reporting a boundary is preferable to calling
 // a spool "inline".
 func (s *Statement) safeCTEFusionShape(def *statementCTE) bool {
-	if s == nil || def == nil || def.stmt == nil || def.recursiveOwner != nil ||
+	if s == nil || def == nil || def.stmt == nil ||
+		def.recursiveDefinition != nil || def.recursiveOwner != nil ||
 		def.recursiveBinding != nil ||
 		len(s.tree.Columns) != 1 {
 		return false
@@ -446,6 +457,12 @@ func (d *statementCTE) materializeInto(
 			spool, frame, parent.Options.Cancel, resource,
 		)
 	}
+	if d != nil && d.recursiveDefinition != nil {
+		d.runEvaluations++
+		return d.recursiveDefinition.materializeInto(
+			parent, src, consumer, frame, spool, resource,
+		)
+	}
 	args, err := d.boundArgs(frame)
 	if err != nil {
 		return 0, err
@@ -539,6 +556,9 @@ func (c *statementCTEs) releaseExecution(frame *statementFrame) {
 		if def == nil {
 			continue
 		}
+		if def.recursiveDefinition != nil {
+			def.recursiveDefinition.releaseExecution(frame)
+		}
 		def.cleanupChild(frame)
 		def.spool.reset()
 		frame.intermediate.release(def.activeBytes)
@@ -554,6 +574,9 @@ func (c *statementCTEs) discardExecution() {
 	for _, def := range c.defs {
 		if def == nil {
 			continue
+		}
+		if def.recursiveDefinition != nil {
+			def.recursiveDefinition.discardExecution()
 		}
 		clearExecBorrowedViews(&def.exec)
 		if def.stmt != nil {
@@ -573,6 +596,9 @@ func (c *statementCTEs) release() {
 	for _, def := range c.defs {
 		if def == nil {
 			continue
+		}
+		if def.recursiveDefinition != nil {
+			def.recursiveDefinition.release()
 		}
 		if def.stmt != nil {
 			def.stmt.Release()
