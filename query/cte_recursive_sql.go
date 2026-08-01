@@ -102,10 +102,28 @@ func PrepareParsedRecursiveSQLStatement(
 	}()
 
 	catalog := owner.cteCatalog()
+	prepared := make([]recursiveSQLPreparedDefinition, 0, len(plans))
+	defer func() {
+		for i := range prepared {
+			if !prepared[i].transferred {
+				prepared[i].release()
+			}
+		}
+	}()
 	for i := range plans {
-		if err := installRecursiveSQLDefinition(
+		definition, prepareErr := prepareRecursiveSQLDefinition(
 			src, owner, catalog, &plans[i], options,
-		); err != nil {
+		)
+		if prepareErr != nil {
+			return nil, prepareErr
+		}
+		prepared = append(prepared, definition)
+	}
+	// Preparing every term first makes reference counts final before any
+	// recursive publication snapshots them. This is essential when a later
+	// legal definition reads an earlier recursive definition.
+	for i := range prepared {
+		if err := prepared[i].install(owner, catalog); err != nil {
 			return nil, err
 		}
 	}
@@ -115,6 +133,7 @@ func PrepareParsedRecursiveSQLStatement(
 
 type recursiveSQLDefinitionPlan struct {
 	definition *sqlast.CommonTableExpr
+	index      int
 	authored   *sqlast.SelectStmt
 	anchor     *sqlast.SelectStmt
 	term       *sqlast.SelectStmt
@@ -153,27 +172,28 @@ func planRecursiveSQLDefinitions(
 				"recursive CTE metadata is incomplete or was not produced by the SQL parser",
 			)
 		}
-		if len(recursive.Anchor.From) == 0 ||
-			recursive.Anchor.From[0].Kind != sqlast.RelationCollection {
+		if len(recursive.Anchor.From) == 0 {
 			return nil, sqlast.NewFeatureNotSupportedError(
 				src, recursiveSQLSelectPos(recursive.Anchor),
-				"the isolated recursive bridge requires an anchor driven by a physical collection",
+				"a recursive anchor must have a row source",
 			)
 		}
 		if ref := unsupportedRecursiveSQLTermReference(
 			recursive.Anchor, definition.Name, recursive.Anchor,
+			tree.With.CTEs, i,
 		); ref != nil {
 			return nil, sqlast.NewFeatureNotSupportedError(
 				src, ref.Pos,
-				"a recursive anchor cannot read another CTE in the isolated physical bridge yet",
+				"a recursive anchor may read only preceding definitions from its lexical WITH scope",
 			)
 		}
 		if ref := unsupportedRecursiveSQLTermReference(
 			recursive.Term, definition.Name, recursive.Anchor,
+			tree.With.CTEs, i,
 		); ref != nil {
 			return nil, sqlast.NewFeatureNotSupportedError(
 				src, ref.Pos,
-				"a recursive term cannot read another CTE in the isolated physical bridge yet",
+				"a recursive term may read only its direct delta and preceding definitions from its lexical WITH scope",
 			)
 		}
 		anchorBase, err := recursiveSQLParamBase(
@@ -197,7 +217,7 @@ func planRecursiveSQLDefinitions(
 			)
 		}
 		plans = append(plans, recursiveSQLDefinitionPlan{
-			definition: definition, authored: definition.Query,
+			definition: definition, index: i, authored: definition.Query,
 			anchor: recursive.Anchor, term: recursive.Term,
 			operation:          recursive.Operation,
 			relativeAnchorBase: recursive.Anchor.ParamBase,
@@ -246,168 +266,12 @@ func recursiveSQLParamBase(
 	return base, nil
 }
 
-func installRecursiveSQLDefinition(
-	src string,
-	owner *Statement,
-	catalog *statementCTEs,
-	plan *recursiveSQLDefinitionPlan,
-	options RecursiveSQLStatementOptions,
-) error {
-	if owner == nil || catalog == nil || plan == nil {
-		return fmt.Errorf("query: recursive SQL installation has no owner catalog: %w", errStatementRecursiveDefinition)
-	}
-	definition := catalog.find(plan.anchor)
-	if definition == nil || definition.definition != plan.definition {
-		return fmt.Errorf(
-			"query: recursive SQL definition %q has no prepared owner identity: %w",
-			plan.definition.Name, errStatementRecursiveDefinition,
-		)
-	}
-
-	anchorStmt, err := prepareTreeInContext(src, plan.anchor, 0, nil, 0)
-	if err != nil {
-		return err
-	}
-	recursiveTree, recursiveName, err := recursiveSQLTermTree(
-		plan, definition.names,
-	)
-	if err != nil {
-		anchorStmt.Release()
-		return err
-	}
-	recursiveStmt, err := prepareTreeInContext(src, recursiveTree, 0, nil, 0)
-	if err != nil {
-		anchorStmt.Release()
-		return err
-	}
-
-	anchor, err := PrepareRecursiveCTEStatementTerm(
-		anchorStmt,
-		RecursiveCTEStatementTermOptions{ParamBase: plan.absoluteAnchorBase},
-	)
-	if err != nil {
-		anchorStmt.Release()
-		recursiveStmt.Release()
-		return err
-	}
-	recursive, err := PrepareRecursiveCTEStatementTerm(
-		recursiveStmt,
-		RecursiveCTEStatementTermOptions{
-			ParamBase: plan.absoluteTermBase, RecursiveRelation: recursiveName,
-		},
-	)
-	if err != nil {
-		anchor.Release()
-		anchorStmt.Release()
-		recursiveStmt.Release()
-		return err
-	}
-
-	union := RecursiveUnionDistinct
-	if plan.operation == sqlast.SetUnionAll {
-		union = RecursiveUnionAll
-	}
-	materialization := RecursiveCTEShared
-	if plan.definition.Materialization == sqlast.CTENotMaterialized {
-		materialization = RecursiveCTEReferenceLocal
-	}
-	descriptor, err := PrepareRecursiveCTEDescriptor(
-		plan.definition.Name, definition.names, anchor, recursive,
-		union, materialization, options.Limits,
-	)
-	if err != nil {
-		anchor.Release()
-		recursive.Release()
-		anchorStmt.Release()
-		recursiveStmt.Release()
-		return err
-	}
-	if _, err = installStatementRecursiveDefinition(
-		owner, definition, descriptor, anchorStmt.Collection(),
-	); err != nil {
-		anchor.Release()
-		recursive.Release()
-		anchorStmt.Release()
-		recursiveStmt.Release()
-		return err
-	}
-	return nil
-}
-
-// recursiveSQLTermTree gives the recursive Statement a private placeholder CTE
-// for its delta binding. This keeps the self-reference out of the owning
-// definition's reference count and forces reference-local delta publication
-// even when the outer recursive result is shared or explicitly MATERIALIZED.
-func recursiveSQLTermTree(
-	plan *recursiveSQLDefinitionPlan,
-	columns []string,
-) (*sqlast.SelectStmt, string, error) {
-	if plan == nil || plan.term == nil || plan.anchor == nil {
-		return nil, "", errStatementRecursiveDefinition
-	}
-	tree := new(sqlast.SelectStmt)
-	*tree = *plan.term
-	tree.ParamBase = 0
-	tree.From = append([]sqlast.TableRef(nil), plan.term.From...)
-	self := -1
-	for i := range tree.From {
-		ref := &tree.From[i]
-		if ref.Kind == sqlast.RelationCTE && ref.Name == plan.definition.Name &&
-			ref.Query == plan.anchor {
-			if self >= 0 {
-				return nil, "", fmt.Errorf(
-					"query: recursive SQL term retained multiple self references: %w",
-					errStatementRecursiveDefinition,
-				)
-			}
-			self = i
-		}
-	}
-	if self < 0 {
-		return nil, "", fmt.Errorf(
-			"query: recursive SQL term has no direct self reference: %w",
-			errStatementRecursiveDefinition,
-		)
-	}
-
-	if len(plan.anchor.From) == 0 ||
-		plan.anchor.From[0].Kind != sqlast.RelationCollection {
-		return nil, "", fmt.Errorf(
-			"query: recursive SQL anchor has no physical placeholder source: %w",
-			errStatementRecursiveDefinition,
-		)
-	}
-	driving := plan.anchor.From[0]
-	driving.Join = sqlast.JoinNone
-	driving.On = nil
-	path := &sqlast.PathExpr{Source: 0, Pos: driving.Pos}
-	placeholderColumns := make([]sqlast.ResultColumn, len(columns))
-	for i := range placeholderColumns {
-		placeholderColumns[i] = sqlast.ResultColumn{
-			Path: path, Alias: columns[i], Pos: driving.Pos,
-		}
-	}
-	placeholder := &sqlast.SelectStmt{
-		Columns: placeholderColumns,
-		From:    []sqlast.TableRef{driving},
-	}
-
-	aliases := append([]string(nil), columns...)
-	definition := []sqlast.CommonTableExpr{{
-		Name: plan.definition.Name, Columns: aliases, Query: placeholder,
-		Pos: plan.definition.Pos, HintPos: -1,
-	}}
-	tree.With = &sqlast.WithClause{
-		CTEs: definition, Pos: recursiveSQLSelectPos(tree),
-	}
-	tree.From[self].Query = placeholder
-	return tree, plan.definition.Name, nil
-}
-
 func unsupportedRecursiveSQLTermReference(
 	tree *sqlast.SelectStmt,
 	selfName string,
 	selfQuery *sqlast.SelectStmt,
+	definitions []sqlast.CommonTableExpr,
+	definitionIndex int,
 ) *sqlast.TableRef {
 	if tree == nil {
 		return nil
@@ -417,46 +281,66 @@ func unsupportedRecursiveSQLTermReference(
 	}
 	for i := range tree.From {
 		ref := &tree.From[i]
-		if ref.Kind == sqlast.RelationCTE &&
-			!(ref.Name == selfName && ref.Query == selfQuery) {
-			return ref
+		if ref.Kind == sqlast.RelationCTE {
+			if ref.Name == selfName && ref.Query == selfQuery {
+				continue
+			}
+			dependency := recursiveSQLDefinitionIndex(definitions, ref.Query)
+			if dependency < 0 || dependency >= definitionIndex {
+				return ref
+			}
 		}
 		if ref.Kind == sqlast.RelationDerived {
 			if nested := unsupportedRecursiveSQLTermReference(
-				ref.Query, selfName, selfQuery,
+				ref.Query, selfName, selfQuery, definitions, definitionIndex,
 			); nested != nil {
 				return nested
 			}
 		}
 	}
 	if ref := unsupportedRecursiveSQLExprReference(
-		tree.Where, selfName, selfQuery,
+		tree.Where, selfName, selfQuery, definitions, definitionIndex,
 	); ref != nil {
 		return ref
 	}
 	return unsupportedRecursiveSQLExprReference(
-		tree.Having, selfName, selfQuery,
+		tree.Having, selfName, selfQuery, definitions, definitionIndex,
 	)
+}
+
+func recursiveSQLDefinitionIndex(
+	definitions []sqlast.CommonTableExpr,
+	query *sqlast.SelectStmt,
+) int {
+	for i := range definitions {
+		definition := &definitions[i]
+		if definition.Query == query || definition.Recursive.Anchor == query {
+			return i
+		}
+	}
+	return -1
 }
 
 func unsupportedRecursiveSQLExprReference(
 	expr *sqlast.Expr,
 	selfName string,
 	selfQuery *sqlast.SelectStmt,
+	definitions []sqlast.CommonTableExpr,
+	definitionIndex int,
 ) *sqlast.TableRef {
 	if expr == nil {
 		return nil
 	}
 	if expr.Subquery != nil {
 		if ref := unsupportedRecursiveSQLTermReference(
-			expr.Subquery, selfName, selfQuery,
+			expr.Subquery, selfName, selfQuery, definitions, definitionIndex,
 		); ref != nil {
 			return ref
 		}
 	}
 	for _, child := range expr.Kids {
 		if ref := unsupportedRecursiveSQLExprReference(
-			child, selfName, selfQuery,
+			child, selfName, selfQuery, definitions, definitionIndex,
 		); ref != nil {
 			return ref
 		}

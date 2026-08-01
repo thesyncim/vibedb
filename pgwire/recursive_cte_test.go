@@ -16,6 +16,17 @@ const recursiveCTEWireExtendedSQL = `WITH RECURSIVE reachable(node) AS (
 )
 SELECT node FROM reachable ORDER BY node`
 
+const recursiveCTEWireDependencySQL = `WITH RECURSIVE
+filtered(src, dst) AS MATERIALIZED (
+	SELECT src, dst FROM recursive_edges WHERE dst <= $1
+),
+reachable(node) AS (
+	SELECT src FROM filtered WHERE src = $2
+	UNION
+	SELECT e.dst FROM reachable r JOIN filtered e ON r.node = e.src
+)
+SELECT node FROM reachable ORDER BY node`
+
 func TestPGWireRecursiveCTESimpleExtendedAndPositionedRefusal(t *testing.T) {
 	c := connectSQLCatalog(t)
 	for _, statement := range []string{
@@ -36,6 +47,30 @@ func TestPGWireRecursiveCTESimpleExtendedAndPositionedRefusal(t *testing.T) {
 	for name, msgs := range map[string][]backendMessage{
 		"simple":   c.query(simple),
 		"extended": extendedSQL(c, recursiveCTEWireExtendedSQL, [][]byte{[]byte("0")}),
+	} {
+		rows := rowsOf(t, msgs)
+		if len(rows) != 4 {
+			t.Fatalf("%s recursive CTE rows = %q, want four rows", name, rows)
+		}
+		for i := range rows {
+			if len(rows[i]) != 1 || string(rows[i][0]) != strconv.Itoa(i) {
+				t.Fatalf("%s recursive CTE rows = %q, want [[0] [1] [2] [3]]",
+					name, rows)
+			}
+		}
+		if got := commandTagOf(t, msgs); got != "SELECT 4" {
+			t.Fatalf("%s recursive CTE tag = %q, want SELECT 4", name, got)
+		}
+	}
+
+	dependencySimple := strings.NewReplacer("$1", "3", "$2", "0").Replace(
+		recursiveCTEWireDependencySQL,
+	)
+	for name, msgs := range map[string][]backendMessage{
+		"simple dependency": c.query(dependencySimple),
+		"extended dependency": extendedSQL(
+			c, recursiveCTEWireDependencySQL, [][]byte{[]byte("3"), []byte("0")},
+		),
 	} {
 		rows := rowsOf(t, msgs)
 		if len(rows) != 4 {

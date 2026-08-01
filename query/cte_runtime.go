@@ -81,6 +81,12 @@ type statementCTE struct {
 	ordinalSpec []string
 	specData    []byte
 	activeBytes int64
+	// activeFrame is the exact intermediate account that owns activeBytes and
+	// every relation retained by stmt while a shared publication is ready. A
+	// recursive definition executes dependencies in its feature-owned frame,
+	// which can differ from the outer catalog's frame; retaining identity here
+	// makes release debit the account that was actually charged.
+	activeFrame *statementFrame
 	state       cteMaterializationState
 
 	references     int
@@ -431,14 +437,17 @@ func (d *statementCTE) ensureMaterialized(
 	d.state = cteRunning
 	d.spool.reset()
 	d.activeBytes = 0
+	d.activeFrame = nil
 	charge, err := d.materializeInto(
 		parent, src, consumer, frame, &d.spool, "materialized CTE spool",
 	)
 	if err != nil {
 		d.state = cteIdle
+		d.activeFrame = nil
 		return err
 	}
 	d.activeBytes = charge
+	d.activeFrame = frame
 	d.state = cteReady
 	return nil
 }
@@ -556,15 +565,26 @@ func (c *statementCTEs) releaseExecution(frame *statementFrame) {
 		if def == nil {
 			continue
 		}
+		publicationFrame := def.publicationFrame(frame)
 		if def.recursiveDefinition != nil {
-			def.recursiveDefinition.releaseExecution(frame)
+			def.recursiveDefinition.releaseExecution(publicationFrame)
 		}
-		def.cleanupChild(frame)
+		def.cleanupChild(publicationFrame)
 		def.spool.reset()
-		frame.intermediate.release(def.activeBytes)
+		if publicationFrame != nil {
+			publicationFrame.intermediate.release(def.activeBytes)
+		}
 		def.activeBytes = 0
+		def.activeFrame = nil
 		def.state = cteIdle
 	}
+}
+
+func (d *statementCTE) publicationFrame(fallback *statementFrame) *statementFrame {
+	if d != nil && d.activeFrame != nil {
+		return d.activeFrame
+	}
+	return fallback
 }
 
 func (c *statementCTEs) discardExecution() {
@@ -578,12 +598,19 @@ func (c *statementCTEs) discardExecution() {
 		if def.recursiveDefinition != nil {
 			def.recursiveDefinition.discardExecution()
 		}
-		clearExecBorrowedViews(&def.exec)
-		if def.stmt != nil {
-			def.stmt.discardRelations()
+		publicationFrame := def.publicationFrame(nil)
+		if publicationFrame != nil {
+			def.cleanupChild(publicationFrame)
+			publicationFrame.intermediate.release(def.activeBytes)
+		} else {
+			clearExecBorrowedViews(&def.exec)
+			if def.stmt != nil {
+				def.stmt.discardRelations()
+			}
 		}
 		def.spool.reset()
 		def.activeBytes = 0
+		def.activeFrame = nil
 		def.state = cteIdle
 		def.runEvaluations = 0
 	}
@@ -596,6 +623,17 @@ func (c *statementCTEs) release() {
 	for _, def := range c.defs {
 		if def == nil {
 			continue
+		}
+		publicationFrame := def.publicationFrame(nil)
+		if publicationFrame != nil {
+			if def.recursiveDefinition != nil {
+				def.recursiveDefinition.releaseExecution(publicationFrame)
+			}
+			def.cleanupChild(publicationFrame)
+			publicationFrame.intermediate.release(def.activeBytes)
+			def.activeBytes = 0
+			def.activeFrame = nil
+			def.state = cteIdle
 		}
 		if def.recursiveDefinition != nil {
 			def.recursiveDefinition.release()

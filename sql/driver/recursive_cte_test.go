@@ -18,6 +18,17 @@ const recursiveCTEDriverSQL = `WITH RECURSIVE reachable(node) AS (
 )
 SELECT node FROM reachable ORDER BY node`
 
+const recursiveCTEDriverDependencySQL = `WITH RECURSIVE
+filtered(src, dst) AS MATERIALIZED (
+	SELECT src, dst FROM recursive_edges WHERE dst <= ?
+),
+reachable(node) AS (
+	SELECT src FROM filtered WHERE src = ?
+	UNION
+	SELECT e.dst FROM reachable r JOIN filtered e ON r.node = e.src
+)
+SELECT node FROM reachable ORDER BY node`
+
 func TestDatabaseSQLRecursiveCTEPreparedTransitiveClosureAndPositionedRefusal(t *testing.T) {
 	db := openTestDB(t)
 	for _, statement := range []string{
@@ -69,6 +80,35 @@ func TestDatabaseSQLRecursiveCTEPreparedTransitiveClosureAndPositionedRefusal(t 
 			t.Fatalf("recursive closure from %d = %v, want %v",
 				test.start, got, test.want)
 		}
+	}
+
+	dependency, err := db.Prepare(recursiveCTEDriverDependencySQL)
+	if err != nil {
+		t.Fatalf("prepare dependent recursive CTE: %v", err)
+	}
+	defer dependency.Close()
+	rows, err := dependency.Query(int64(3), int64(0))
+	if err != nil {
+		t.Fatalf("execute dependent recursive CTE: %v", err)
+	}
+	var dependent []int64
+	for rows.Next() {
+		var node int64
+		if err := rows.Scan(&node); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		dependent = append(dependent, node)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{0, 1, 2, 3}; !slices.Equal(dependent, want) {
+		t.Fatalf("dependent recursive closure = %v, want %v", dependent, want)
 	}
 
 	unsupportedSQL := `WITH RECURSIVE reachable(node) AS (` +

@@ -82,7 +82,10 @@ func TestRecursiveSQLBridgeGraphSnapshotIdentityAndOwnership(t *testing.T) {
 	definition := catalog.defs[0]
 	prepared := definition.recursiveDefinition
 	if prepared == nil || prepared.anchor.paramBase != 0 ||
-		prepared.recursive.paramBase != 1 || definition.references != 2 {
+		prepared.recursive.paramBase != 0 ||
+		prepared.anchorStmt.NumParams() != statement.NumParams() ||
+		prepared.recursiveStmt.NumParams() != statement.NumParams() ||
+		definition.references != 2 {
 		t.Fatalf("recursive installation = %+v refs=%d", prepared, definition.references)
 	}
 	if prepared.recursive.target == nil ||
@@ -206,7 +209,8 @@ func assertRecursiveSQLFailureAtomic(
 ) {
 	tb.Helper()
 	if exec.Result.RowCount != 0 || definition.state != cteIdle ||
-		definition.activeBytes != 0 || definition.spool.rows != 0 ||
+		definition.activeBytes != 0 || definition.activeFrame != nil ||
+		definition.spool.rows != 0 ||
 		prepared.runtime.frame != nil || prepared.execution.intermediate.used != 0 ||
 		prepared.recursive.target.recursiveBinding != nil {
 		tb.Fatalf("recursive SQL failure retained publication state")

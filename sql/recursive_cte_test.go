@@ -70,6 +70,81 @@ func TestWithRecursiveMayContainOrdinaryDefinitionsAndDeferredWildcards(t *testi
 	}
 }
 
+func TestRecursiveCTEPrecedingAndSequentialDefinitionIdentityAndParamBases(t *testing.T) {
+	statement, err := Parse(`WITH RECURSIVE
+		filtered(src, dst) AS MATERIALIZED (
+			SELECT src, dst FROM edges WHERE enabled = ?
+		),
+		forward(node) AS (
+			SELECT src FROM filtered WHERE src = ?
+			UNION
+			SELECT e.dst FROM forward f JOIN filtered e ON f.node = e.src
+		),
+		continued(node) AS (
+			SELECT node FROM forward WHERE node = ?
+			UNION ALL
+			SELECT e.dst FROM continued c JOIN filtered e ON c.node = e.src
+			WHERE e.dst <= ?
+		)
+		SELECT node FROM continued WHERE node <= ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statement.With == nil || !statement.With.Recursive ||
+		len(statement.With.CTEs) != 3 || statement.Params != 5 {
+		t.Fatalf("sequential recursive scope/params = %+v/%d",
+			statement.With, statement.Params)
+	}
+	filtered := &statement.With.CTEs[0]
+	forward := &statement.With.CTEs[1]
+	continued := &statement.With.CTEs[2]
+	if filtered.Recursive.Anchor != nil || filtered.Query.ParamBase != 0 ||
+		filtered.Query.Params != 1 {
+		t.Fatalf("preceding ordinary definition metadata = %+v", filtered)
+	}
+	if forward.Recursive.Anchor == nil || forward.Recursive.Term == nil ||
+		forward.Recursive.Operation != SetUnionDistinct ||
+		forward.Query.ParamBase != 1 || forward.Query.Params != 1 ||
+		forward.Recursive.Anchor.ParamBase != 0 ||
+		forward.Recursive.Anchor.Params != 1 ||
+		forward.Recursive.Term.ParamBase != 1 ||
+		forward.Recursive.Term.Params != 0 {
+		t.Fatalf("first recursive definition metadata = operation %d body %d/%d anchor %d/%d term %d/%d",
+			forward.Recursive.Operation,
+			forward.Query.ParamBase, forward.Query.Params,
+			forward.Recursive.Anchor.ParamBase, forward.Recursive.Anchor.Params,
+			forward.Recursive.Term.ParamBase, forward.Recursive.Term.Params)
+	}
+	if continued.Recursive.Anchor == nil || continued.Recursive.Term == nil ||
+		continued.Recursive.Operation != SetUnionAll ||
+		continued.Query.ParamBase != 2 || continued.Query.Params != 2 ||
+		continued.Recursive.Anchor.ParamBase != 0 ||
+		continued.Recursive.Anchor.Params != 1 ||
+		continued.Recursive.Term.ParamBase != 1 ||
+		continued.Recursive.Term.Params != 1 {
+		t.Fatalf("second recursive definition metadata = operation %d body %d/%d anchor %d/%d term %d/%d",
+			continued.Recursive.Operation,
+			continued.Query.ParamBase, continued.Query.Params,
+			continued.Recursive.Anchor.ParamBase, continued.Recursive.Anchor.Params,
+			continued.Recursive.Term.ParamBase, continued.Recursive.Term.Params)
+	}
+	if dependency := forward.Recursive.Anchor.From[0]; dependency.Kind != RelationCTE || dependency.Query != filtered.Query {
+		t.Fatalf("first recursive anchor dependency identity = %+v", dependency)
+	}
+	if dependency := continued.Recursive.Anchor.From[0]; dependency.Kind != RelationCTE || dependency.Query != forward.Query {
+		t.Fatalf("second recursive anchor dependency identity = %+v", dependency)
+	}
+	if self := continued.Recursive.Term.From[0]; self.Kind != RelationCTE || self.Query != continued.Recursive.Anchor {
+		t.Fatalf("second recursive delta identity = %+v", self)
+	}
+	if dependency := continued.Recursive.Term.From[1]; dependency.Kind != RelationCTE || dependency.Query != filtered.Query {
+		t.Fatalf("second recursive term dependency identity = %+v", dependency)
+	}
+	if outer := statement.From[0]; outer.Kind != RelationCTE || outer.Query != continued.Query {
+		t.Fatalf("outer sequential recursive identity = %+v", outer)
+	}
+}
+
 func TestRecursiveCTEUnsupportedShapesArePositionedAndTyped(t *testing.T) {
 	tests := []struct {
 		name   string
