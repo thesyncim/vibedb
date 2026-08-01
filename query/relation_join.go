@@ -227,7 +227,11 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 				return err
 			}
 			op.stmt = child
-			op.names = append(op.names, child.Columns()...)
+			if op.lateral != nil {
+				op.names = append(op.names, op.lateral.names...)
+			} else {
+				op.names = append(op.names, child.Columns()...)
+			}
 			op.columns = len(op.names)
 		case sqlast.RelationCTE:
 			catalog := s.cteCatalog()

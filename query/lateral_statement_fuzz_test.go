@@ -59,3 +59,52 @@ func FuzzLateralDecodedJSONStringAccounting(f *testing.F) {
 		}
 	})
 }
+
+func FuzzLateralOuterGateExactComparison(f *testing.F) {
+	for _, op := range []sqlast.CmpOp{
+		sqlast.OpEq, sqlast.OpNe, sqlast.OpLt, sqlast.OpLe,
+		sqlast.OpGt, sqlast.OpGe,
+	} {
+		f.Add(uint8(op), int64(-10), int64(2), uint8(0), false)
+		f.Add(uint8(op), int64(1), int64(1), uint8(1), true)
+	}
+	f.Fuzz(func(
+		t *testing.T,
+		raw uint8,
+		left, right int64,
+		nulls uint8,
+		negated bool,
+	) {
+		op := sqlast.CmpOp(raw % 6)
+		leftScalar := joinNumberScalar([]byte(fmt.Sprint(left)))
+		rightScalar := joinNumberScalar([]byte(fmt.Sprint(right)))
+		if nulls&1 != 0 {
+			leftScalar = scalar{kind: kindNull}
+		}
+		if nulls&2 != 0 {
+			rightScalar = scalar{kind: kindNull, raw: nullBytes}
+		}
+		lateral := statementLateral{
+			slots: []lateralBindingSlot{{value: leftScalar}, {value: rightScalar}},
+		}
+		gate := lateralGateExpr{
+			kind: sqlast.ExprCompare, op: op, left: 0, right: 1,
+			negated: negated,
+		}
+		got, err := lateral.evalGate(new(statementRelationJoin), &gate, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := triUnknown
+		if leftScalar.kind != kindNull && rightScalar.kind != kindNull {
+			want = boolTri(acceptSign(compareScalar(leftScalar, rightScalar), Op(op)))
+		}
+		if negated {
+			want = notTri(want)
+		}
+		if got != want {
+			t.Fatalf("gate(%d %v %d, nulls=%d, not=%t) = %d, want %d",
+				left, op, right, nulls, negated, got, want)
+		}
+	})
+}

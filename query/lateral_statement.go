@@ -38,9 +38,10 @@ func (e *LateralBindingValueError) Position() int {
 
 // statementLateral is the prepared adapter between SQL's correlation sidecar
 // and the relation-join pipeline. It owns no state on ordinary statements.
-// One child Statement is rebound for every left row; every produced right
-// relation remains statement-owned until the completed join relation has been
-// consumed, so no published scalar can outlive its bytes.
+// One child Statement is rebound at most once for every left row (an
+// outer-only FALSE/UNKNOWN gate can skip it); every produced right relation
+// remains statement-owned until the completed join relation has been consumed,
+// so no published scalar can outlive its bytes.
 type statementLateral struct {
 	spec       *sqlast.LateralSpec
 	params     int
@@ -48,6 +49,12 @@ type statementLateral struct {
 	bindingAST []sqlast.PathExpr
 	args       []any
 	slots      []lateralBindingSlot
+	argUse     []bool
+
+	outputs      []lateralOutput
+	names        []string
+	localOutputs int
+	gates        []lateralGateExpr
 
 	rights        []relationSpool
 	active        []int64
@@ -62,6 +69,7 @@ type lateralBindingSlot struct {
 	b      bool
 	s      string
 	n      Number
+	value  scalar
 }
 
 type lateralClone struct {
@@ -70,6 +78,42 @@ type lateralClone struct {
 	params     int
 	seen       []bool
 	bindingUse []bool
+	argUse     []bool
+	projection []lateralProjection
+	gates      []lateralGateExpr
+	hidden     int
+}
+
+// lateralProjection is one authored SELECT item before relation-wildcard
+// expansion. Local items name a column in the reduced child SELECT list;
+// correlated items name a stable outer binding synthesized by APPLY.
+type lateralProjection struct {
+	local   int
+	binding int
+	name    string
+}
+
+// lateralOutput is one physical right-relation column after local wildcard
+// expansion. Exactly one of local and binding is non-negative.
+type lateralOutput struct {
+	local   int
+	binding int
+}
+
+// lateralGateExpr is a prepared outer-only WHERE conjunct. Such a conjunct is
+// constant for one left row and can be evaluated before opening the child.
+// Keeping this representation separate from sql.Expr prevents a correlated
+// path from ever reaching the ordinary local-path compiler by accident.
+type lateralGateExpr struct {
+	kind        sqlast.ExprKind
+	op          sqlast.CmpOp
+	negated     bool
+	insensitive bool
+	left        int
+	right       int
+	value       sqlast.Operand
+	list        []sqlast.Operand
+	kids        []lateralGateExpr
 }
 
 func prepareStatementLateral(
@@ -83,10 +127,16 @@ func prepareStatementLateral(
 		return nil, nil, fmt.Errorf("query: invalid correlated LATERAL relation")
 	}
 	spec := ref.Lateral
-	if spec.Decorrelated || len(spec.Bindings) == 0 || len(spec.References) == 0 {
+	if spec.Decorrelated || len(spec.Bindings) == 0 {
 		return nil, nil, sqlast.NewFeatureNotSupportedError(
 			owner.text, spec.Pos,
 			"correlated LATERAL metadata has no direct parameter references",
+		)
+	}
+	if len(spec.References) == 0 {
+		return nil, nil, sqlast.NewFeatureNotSupportedError(
+			owner.text, spec.Bindings[0].Pos,
+			"transitive nested LATERAL correlation needs an inherited APPLY frame",
 		)
 	}
 	if ref.Join != sqlast.JoinCross && ref.Join != sqlast.JoinInner &&
@@ -101,14 +151,23 @@ func prepareStatementLateral(
 		text: owner.text, spec: spec, params: ref.Query.Params,
 		seen:       make([]bool, len(spec.References)),
 		bindingUse: make([]bool, len(spec.Bindings)),
+		argUse:     make([]bool, len(spec.Bindings)),
 	}
 	if err := cloner.validateReferences(); err != nil {
 		return nil, nil, err
 	}
 	clone := *ref.Query
 	var err error
-	clone.Where, err = cloner.cloneExpr(ref.Query.Where)
+	clone.Columns, err = cloner.cloneColumns(ref.Query)
 	if err != nil {
+		return nil, nil, err
+	}
+	clone.Where, err = cloner.cloneWhere(ref.Query.Where)
+	if err != nil {
+		return nil, nil, err
+	}
+	clone.OrderBy = cloner.cloneOrderBy(ref.Query.OrderBy)
+	if err := cloner.rejectResidualLocations(ref.Query); err != nil {
 		return nil, nil, err
 	}
 	if err := cloner.finish(); err != nil {
@@ -125,6 +184,8 @@ func prepareStatementLateral(
 		bindingAST: make([]sqlast.PathExpr, len(spec.Bindings)),
 		args:       make([]any, clone.Params),
 		slots:      make([]lateralBindingSlot, len(spec.Bindings)),
+		argUse:     cloner.argUse,
+		gates:      cloner.gates,
 	}
 	for i := range spec.Bindings {
 		binding := &spec.Bindings[i]
@@ -132,6 +193,12 @@ func prepareStatementLateral(
 			return nil, nil, sqlast.NewFeatureNotSupportedError(
 				owner.text, binding.Pos,
 				"nested or forward LATERAL correlation does not yet have an APPLY frame",
+			)
+		}
+		if len(binding.Segments) == 0 && !join.sources[binding.Source].physical {
+			return nil, nil, sqlast.NewFeatureNotSupportedError(
+				owner.text, binding.Pos,
+				"correlated LATERAL wildcard over a derived relation needs schema-aware outer-column expansion",
 			)
 		}
 		lateral.bindingAST[i] = sqlast.PathExpr{
@@ -150,7 +217,240 @@ func prepareStatementLateral(
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := lateral.finishProjection(
+		child, cloner.projection, clone.Columns, cloner.hidden,
+	); err != nil {
+		child.Release()
+		return nil, nil, err
+	}
 	return lateral, child, nil
+}
+
+// cloneOrderBy removes correlated sort keys. Every captured outer value is
+// constant during one child invocation, so such a key cannot affect row order;
+// retaining its Path would instead let the local compiler misread it.
+func (c *lateralClone) cloneOrderBy(terms []sqlast.OrderTerm) []sqlast.OrderTerm {
+	if len(terms) == 0 {
+		return nil
+	}
+	clone := make([]sqlast.OrderTerm, 0, len(terms))
+	for i := range terms {
+		reference, binding, outer := c.reference(terms[i].Path)
+		if outer {
+			c.mark(reference, binding, false)
+			continue
+		}
+		clone = append(clone, terms[i])
+	}
+	return clone
+}
+
+func (c *lateralClone) rejectResidualLocations(query *sqlast.SelectStmt) error {
+	for _, path := range query.GroupBy {
+		if err := c.rejectPath(path, "GROUP BY"); err != nil {
+			return err
+		}
+	}
+	if err := c.rejectExpr(query.Having, "HAVING"); err != nil {
+		return err
+	}
+	for i := range query.Windows {
+		if err := c.rejectWindowSpec(&query.Windows[i].Spec); err != nil {
+			return err
+		}
+	}
+	for i := range query.Columns {
+		window := query.Columns[i].Window
+		if window == nil {
+			continue
+		}
+		if err := c.rejectPath(window.Argument, "window argument"); err != nil {
+			return err
+		}
+		if err := c.rejectWindowSpec(&window.Spec); err != nil {
+			return err
+		}
+	}
+	for i := 1; i < len(query.From); i++ {
+		if query.From[i].On != nil {
+			if err := c.rejectExpr(query.From[i].On.Expr, "nested JOIN ON"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *lateralClone) rejectWindowSpec(spec *sqlast.WindowSpec) error {
+	if spec == nil {
+		return nil
+	}
+	for _, path := range spec.PartitionBy {
+		if err := c.rejectPath(path, "window PARTITION BY"); err != nil {
+			return err
+		}
+	}
+	for i := range spec.OrderBy {
+		if err := c.rejectPath(spec.OrderBy[i].Path, "window ORDER BY"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *lateralClone) rejectExpr(expr *sqlast.Expr, clause string) error {
+	if expr == nil {
+		return nil
+	}
+	if err := c.rejectPath(expr.Path, clause); err != nil {
+		return err
+	}
+	if err := c.rejectPath(expr.RightPath, clause); err != nil {
+		return err
+	}
+	for _, kid := range expr.Kids {
+		if err := c.rejectExpr(kid, clause); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *lateralClone) rejectPath(path *sqlast.PathExpr, clause string) error {
+	if path == nil {
+		return nil
+	}
+	if _, _, outer := c.reference(path); !outer {
+		return nil
+	}
+	return sqlast.NewFeatureNotSupportedError(
+		c.text, path.Pos,
+		"correlated LATERAL paths in "+clause+" need an expression-valued child plan",
+	)
+}
+
+func (c *lateralClone) cloneColumns(
+	query *sqlast.SelectStmt,
+) ([]sqlast.ResultColumn, error) {
+	columns := make([]sqlast.ResultColumn, 0, len(query.Columns))
+	c.projection = make([]lateralProjection, 0, len(query.Columns))
+	for i := range query.Columns {
+		column := &query.Columns[i]
+		reference, binding, outer := c.reference(column.Path)
+		if !outer {
+			c.projection = append(c.projection, lateralProjection{
+				local: len(columns), binding: -1,
+			})
+			columns = append(columns, *column)
+			continue
+		}
+		if column.Agg != sqlast.AggNone || column.Window != nil {
+			return nil, sqlast.NewFeatureNotSupportedError(
+				c.text, column.Path.Pos,
+				"correlated LATERAL aggregate and window projections need an expression-valued projection plan",
+			)
+		}
+		c.mark(reference, binding, false)
+		name := column.Alias
+		if name == "" {
+			name = column.Path.Spec()
+			if name == "" {
+				name = "*"
+			}
+		}
+		c.projection = append(c.projection, lateralProjection{
+			local: -1, binding: binding, name: name,
+		})
+	}
+	if len(columns) == 0 {
+		if query.Distinct {
+			return nil, sqlast.NewFeatureNotSupportedError(
+				c.text, query.Columns[0].Pos,
+				"DISTINCT over only correlated LATERAL projections needs a cardinality-only distinct operator",
+			)
+		}
+		path := c.cardinalityPath(query.Where)
+		if path == nil {
+			path = &sqlast.PathExpr{Source: 0, Pos: query.Columns[0].Pos}
+		}
+		columns = append(columns, sqlast.ResultColumn{
+			Path: path, Pos: query.Columns[0].Pos,
+		})
+		c.hidden = 1
+	}
+	return columns, nil
+}
+
+// cardinalityPath chooses an already-authored local scalar when possible, so
+// an all-correlated projection need not copy a whole child document merely to
+// preserve one output row per qualifying child row. The hidden column is never
+// exposed through the LATERAL relation schema.
+func (c *lateralClone) cardinalityPath(expr *sqlast.Expr) *sqlast.PathExpr {
+	if expr == nil {
+		return nil
+	}
+	for _, path := range []*sqlast.PathExpr{expr.Path, expr.RightPath} {
+		if path == nil {
+			continue
+		}
+		if _, _, outer := c.reference(path); !outer {
+			return path
+		}
+	}
+	for _, kid := range expr.Kids {
+		if path := c.cardinalityPath(kid); path != nil {
+			return path
+		}
+	}
+	return nil
+}
+
+func (l *statementLateral) finishProjection(
+	child *Statement,
+	projection []lateralProjection,
+	columns []sqlast.ResultColumn,
+	hidden int,
+) error {
+	if child == nil {
+		return fmt.Errorf("query: correlated LATERAL has no prepared child")
+	}
+	localNames := child.Columns()
+	l.localOutputs = len(localNames)
+	l.outputs = make([]lateralOutput, 0, len(localNames)+len(projection))
+	l.names = make([]string, 0, len(localNames)+len(projection))
+	local := 0
+	for i := range projection {
+		item := &projection[i]
+		if item.binding >= 0 {
+			l.outputs = append(l.outputs, lateralOutput{local: -1, binding: item.binding})
+			l.names = append(l.names, item.name)
+			continue
+		}
+		if item.local < 0 || item.local >= len(columns) {
+			return fmt.Errorf("query: invalid prepared LATERAL projection map")
+		}
+		width := 1
+		column := &columns[item.local]
+		if child.hasRelationBinding() && column.Agg == sqlast.AggNone &&
+			column.Path != nil && len(column.Path.Segments) == 0 {
+			width = len(child.relationBindingForSource(column.Path.Source).names)
+		}
+		if width < 0 || local > len(localNames)-width {
+			return fmt.Errorf("query: LATERAL local wildcard arity is unstable")
+		}
+		for ordinal := 0; ordinal < width; ordinal++ {
+			l.outputs = append(l.outputs, lateralOutput{local: local, binding: -1})
+			l.names = append(l.names, localNames[local])
+			local++
+		}
+	}
+	if hidden < 0 || local > len(localNames)-hidden || local+hidden != len(localNames) {
+		return fmt.Errorf(
+			"query: LATERAL local projection produced %d columns, mapped %d",
+			len(localNames), local,
+		)
+	}
+	return nil
 }
 
 func (c *lateralClone) validateReferences() error {
@@ -206,6 +506,148 @@ func (c *lateralClone) reference(path *sqlast.PathExpr) (int, int, bool) {
 	return 0, 0, false
 }
 
+func (c *lateralClone) mark(reference, binding int, argument bool) {
+	c.seen[reference] = true
+	c.bindingUse[binding] = true
+	if argument {
+		c.argUse[binding] = true
+	}
+}
+
+// cloneWhere extracts only outer-only top-level conjuncts. For one APPLY left
+// row they are constants, so SQL's WHERE rule is exactly "open the child iff
+// every gate is TRUE"; FALSE and UNKNOWN both produce no right rows. An
+// outer-only expression below OR with a local expression is deliberately not
+// extracted because doing so would change three-valued boolean semantics.
+func (c *lateralClone) cloneWhere(expr *sqlast.Expr) (*sqlast.Expr, error) {
+	if expr == nil {
+		return nil, nil
+	}
+	if expr.Kind != sqlast.ExprAnd {
+		if c.outerOnly(expr) {
+			gate, err := c.compileGate(expr)
+			if err != nil {
+				return nil, err
+			}
+			c.gates = append(c.gates, gate)
+			return nil, nil
+		}
+		return c.cloneExpr(expr)
+	}
+	clone := *expr
+	clone.Kids = make([]*sqlast.Expr, 0, len(expr.Kids))
+	for _, kid := range expr.Kids {
+		if c.outerOnly(kid) {
+			gate, err := c.compileGate(kid)
+			if err != nil {
+				return nil, err
+			}
+			c.gates = append(c.gates, gate)
+			continue
+		}
+		local, err := c.cloneExpr(kid)
+		if err != nil {
+			return nil, err
+		}
+		clone.Kids = append(clone.Kids, local)
+	}
+	switch len(clone.Kids) {
+	case 0:
+		return nil, nil
+	case 1:
+		return clone.Kids[0], nil
+	default:
+		return &clone, nil
+	}
+}
+
+func (c *lateralClone) outerOnly(expr *sqlast.Expr) bool {
+	if expr == nil || expr.Subquery != nil || expr.Kind == sqlast.ExprExists {
+		return false
+	}
+	switch expr.Kind {
+	case sqlast.ExprAnd, sqlast.ExprOr, sqlast.ExprNot:
+		if len(expr.Kids) == 0 {
+			return false
+		}
+		for _, kid := range expr.Kids {
+			if !c.outerOnly(kid) {
+				return false
+			}
+		}
+		return true
+	}
+	paths := 0
+	for _, path := range []*sqlast.PathExpr{expr.Path, expr.RightPath} {
+		if path == nil {
+			continue
+		}
+		paths++
+		if _, _, outer := c.reference(path); !outer {
+			return false
+		}
+	}
+	return paths != 0
+}
+
+func (c *lateralClone) compileGate(expr *sqlast.Expr) (lateralGateExpr, error) {
+	gate := lateralGateExpr{
+		kind: expr.Kind, op: expr.Op, negated: expr.Negated,
+		insensitive: expr.Insensitive, left: -1, right: -1,
+		value: expr.Value, list: expr.List,
+	}
+	switch expr.Kind {
+	case sqlast.ExprAnd, sqlast.ExprOr, sqlast.ExprNot:
+		gate.kids = make([]lateralGateExpr, len(expr.Kids))
+		for i := range expr.Kids {
+			kid, err := c.compileGate(expr.Kids[i])
+			if err != nil {
+				return lateralGateExpr{}, err
+			}
+			gate.kids[i] = kid
+		}
+		return gate, nil
+	case sqlast.ExprCompare, sqlast.ExprIn, sqlast.ExprBetween,
+		sqlast.ExprIsNull, sqlast.ExprIsMissing, sqlast.ExprLike:
+	case sqlast.ExprContains:
+		return lateralGateExpr{}, sqlast.NewFeatureNotSupportedError(
+			c.text, expr.Path.Pos,
+			"outer-only LATERAL containment needs a prepared captured-value containment program",
+		)
+	default:
+		return lateralGateExpr{}, sqlast.NewFeatureNotSupportedError(
+			c.text, expr.Pos, "correlated LATERAL predicate kind is not executable as an outer gate",
+		)
+	}
+	if expr.Subquery != nil {
+		return lateralGateExpr{}, sqlast.NewFeatureNotSupportedError(
+			c.text, expr.Pos,
+			"correlated LATERAL predicate subqueries need an inherited correlation frame",
+		)
+	}
+	if expr.Path != nil {
+		reference, binding, outer := c.reference(expr.Path)
+		if !outer {
+			return lateralGateExpr{}, sqlast.NewFeatureNotSupportedError(
+				c.text, expr.Path.Pos, "LATERAL outer gate contains a local path",
+			)
+		}
+		gate.left = binding
+		c.mark(reference, binding, false)
+	}
+	if expr.RightPath != nil {
+		reference, binding, outer := c.reference(expr.RightPath)
+		if !outer {
+			return lateralGateExpr{}, sqlast.NewFeatureNotSupportedError(
+				c.text, expr.RightPath.Pos, "LATERAL outer gate contains a local path",
+			)
+		}
+		gate.right = binding
+		c.mark(reference, binding, false)
+	}
+	return gate, nil
+}
+
 func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 	if expr == nil {
 		return nil, nil
@@ -247,8 +689,7 @@ func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 			Kind: sqlast.OperandParam, Ordinal: c.params + rightBinding,
 			Pos: expr.RightPath.Pos,
 		}
-		c.seen[rightRef] = true
-		c.bindingUse[rightBinding] = true
+		c.mark(rightRef, rightBinding, true)
 		return &clone, nil
 	}
 	if expr.RightPath == nil {
@@ -263,8 +704,7 @@ func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 		Kind: sqlast.OperandParam, Ordinal: c.params + leftBinding,
 		Pos: expr.Path.Pos,
 	}
-	c.seen[leftRef] = true
-	c.bindingUse[leftBinding] = true
+	c.mark(leftRef, leftBinding, true)
 	return &clone, nil
 }
 
@@ -303,6 +743,171 @@ func (c *lateralClone) finish() error {
 	return nil
 }
 
+func (l *statementLateral) gatesPass(
+	join *statementRelationJoin,
+	cancel *CancelFlag,
+) (bool, error) {
+	for i := range l.gates {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return false, err
+		}
+		value, err := l.evalGate(join, &l.gates[i], cancel)
+		if err != nil {
+			return false, err
+		}
+		if value != triTrue {
+			return false, nil
+		}
+	}
+	return true, cancellationError(cancel)
+}
+
+func (l *statementLateral) evalGate(
+	join *statementRelationJoin,
+	gate *lateralGateExpr,
+	cancel *CancelFlag,
+) (tri, error) {
+	switch gate.kind {
+	case sqlast.ExprAnd:
+		out := triTrue
+		for i := range gate.kids {
+			if err := cancellationCheckpoint(cancel, i); err != nil {
+				return triFalse, err
+			}
+			value, err := l.evalGate(join, &gate.kids[i], cancel)
+			if err != nil {
+				return triFalse, err
+			}
+			if value == triFalse {
+				return triFalse, nil
+			}
+			if value == triUnknown {
+				out = triUnknown
+			}
+		}
+		return out, nil
+	case sqlast.ExprOr:
+		out := triFalse
+		for i := range gate.kids {
+			if err := cancellationCheckpoint(cancel, i); err != nil {
+				return triFalse, err
+			}
+			value, err := l.evalGate(join, &gate.kids[i], cancel)
+			if err != nil {
+				return triFalse, err
+			}
+			if value == triTrue {
+				return triTrue, nil
+			}
+			if value == triUnknown {
+				out = triUnknown
+			}
+		}
+		return out, nil
+	case sqlast.ExprNot:
+		if len(gate.kids) != 1 {
+			return triFalse, fmt.Errorf("query: invalid prepared LATERAL NOT gate")
+		}
+		value, err := l.evalGate(join, &gate.kids[0], cancel)
+		return notTri(value), err
+	}
+	if gate.left < 0 || gate.left >= len(l.slots) {
+		return triFalse, fmt.Errorf("query: invalid prepared LATERAL gate binding")
+	}
+	cell := l.slots[gate.left].value
+	var value tri
+	switch gate.kind {
+	case sqlast.ExprCompare:
+		if gate.right >= 0 {
+			if gate.right >= len(l.slots) {
+				return triFalse, fmt.Errorf("query: invalid prepared LATERAL right gate binding")
+			}
+			right := l.slots[gate.right].value
+			if cell.kind == kindNull || right.kind == kindNull {
+				value = triUnknown
+			} else {
+				value = boolTri(acceptSign(compareScalar(cell, right), Op(gate.op)))
+			}
+		} else {
+			literal, known, err := join.joinOperand(gate.value, l.args)
+			if err != nil {
+				return triFalse, err
+			}
+			value = compareTri(cell, havingLit{value: literal, known: known}, Op(gate.op))
+		}
+	case sqlast.ExprIsNull:
+		value = boolTri(cell.kind == kindNull)
+	case sqlast.ExprIsMissing:
+		value = boolTri(cell.kind == kindNull && len(cell.raw) == 0)
+	case sqlast.ExprBetween:
+		if len(gate.list) != 2 {
+			return triFalse, fmt.Errorf("query: invalid prepared LATERAL BETWEEN gate")
+		}
+		lower, known, err := join.joinOperand(gate.list[0], l.args)
+		if err != nil {
+			return triFalse, err
+		}
+		lo := compareTri(cell, havingLit{value: lower, known: known}, Ge)
+		upper, known, err := join.joinOperand(gate.list[1], l.args)
+		if err != nil {
+			return triFalse, err
+		}
+		hi := compareTri(cell, havingLit{value: upper, known: known}, Le)
+		value = andTri(lo, hi)
+	case sqlast.ExprIn:
+		if cell.kind == kindNull {
+			value = triUnknown
+			break
+		}
+		value = triFalse
+		for i := range gate.list {
+			if err := cancellationCheckpoint(cancel, i); err != nil {
+				return triFalse, err
+			}
+			literal, known, err := join.joinOperand(gate.list[i], l.args)
+			if err != nil {
+				return triFalse, err
+			}
+			if !known {
+				if value == triFalse {
+					value = triUnknown
+				}
+				continue
+			}
+			if compareScalar(cell, literal) == 0 {
+				value = triTrue
+				break
+			}
+		}
+	case sqlast.ExprLike:
+		literal, known, err := join.joinOperand(gate.value, l.args)
+		if err != nil {
+			return triFalse, err
+		}
+		if !known || cell.kind == kindNull {
+			value = triUnknown
+			break
+		}
+		if literal.kind != kindString {
+			return triFalse, fmt.Errorf(
+				"%w: LATERAL gate LIKE pattern must be a string",
+				ErrParameterType,
+			)
+		}
+		if err := validateLikePattern(literal.sval); err != nil {
+			return triFalse, fmt.Errorf("query: invalid LATERAL gate LIKE pattern: %w", err)
+		}
+		value = boolTri(cell.kind == kindString &&
+			likeMatch(literal.sval, cell.sval, gate.insensitive))
+	default:
+		return triFalse, fmt.Errorf("query: unsupported prepared LATERAL gate kind %d", gate.kind)
+	}
+	if gate.negated {
+		value = notTri(value)
+	}
+	return value, cancellationError(cancel)
+}
+
 func (l *statementLateral) bind(
 	left *relationSpool,
 	row int,
@@ -312,7 +917,8 @@ func (l *statementLateral) bind(
 	cancel *CancelFlag,
 ) ([]any, error) {
 	if l == nil || len(l.bindings) != len(l.slots) ||
-		len(l.args) != l.params+len(l.bindings) {
+		len(l.args) != l.params+len(l.bindings) ||
+		len(l.argUse) != len(l.bindings) {
 		return nil, fmt.Errorf("query: invalid prepared LATERAL binding state")
 	}
 	if base < 0 || base+l.params > len(rootArgs) {
@@ -327,11 +933,15 @@ func (l *statementLateral) bind(
 		if err != nil {
 			return nil, err
 		}
-		argument, err := slot.argument(value, i, l.spec.Bindings[i].Pos)
-		if err != nil {
-			return nil, err
+		slot.value = value
+		l.args[l.params+i] = nil
+		if l.argUse[i] {
+			argument, err := slot.argument(value, i, l.spec.Bindings[i].Pos)
+			if err != nil {
+				return nil, err
+			}
+			l.args[l.params+i] = argument
 		}
-		l.args[l.params+i] = argument
 	}
 	return l.args, nil
 }
@@ -567,6 +1177,7 @@ func (s *lateralBindingSlot) argument(value scalar, binding, pos int) (any, erro
 }
 
 func (l *statementLateral) materializeRights(
+	join *statementRelationJoin,
 	op *relationJoinOperand,
 	owner *Statement,
 	parent *Exec,
@@ -604,6 +1215,15 @@ func (l *statementLateral) materializeRights(
 		if err != nil {
 			return err
 		}
+		passes, err := l.gatesPass(join, parent.Options.Cancel)
+		if err != nil {
+			l.releaseBinding(frame)
+			return err
+		}
+		if !passes {
+			l.releaseBinding(frame)
+			continue
+		}
 		nestedSource, err := src.subquerySource(owner.Collection(), op.stmt.Collection())
 		if err != nil {
 			l.releaseBinding(frame)
@@ -613,35 +1233,163 @@ func (l *statementLateral) materializeRights(
 		cursor, err := op.stmt.runIntoFrame(
 			&op.exec, nestedSource, bound, frame, "LATERAL child result",
 		)
-		l.releaseBinding(frame)
 		if err != nil {
+			l.releaseBinding(frame)
 			return err
 		}
 		l.evaluations++
-		if op.stmt.outputs != op.columns {
+		if op.stmt.outputs != l.localOutputs {
 			clearExecBorrowedViews(&op.exec)
 			op.stmt.releaseRelations(frame)
-			return &ApplyRightArityError{Columns: op.columns, Got: op.stmt.outputs}
+			l.releaseBinding(frame)
+			return &ApplyRightArityError{Columns: l.localOutputs, Got: op.stmt.outputs}
 		}
 		resultBytes := op.exec.Result.resultBytesUsed
 		if err := frame.intermediate.reserve("LATERAL child result", resultBytes); err != nil {
 			clearExecBorrowedViews(&op.exec)
 			op.stmt.releaseRelations(frame)
+			l.releaseBinding(frame)
 			return err
 		}
-		charge, materializeErr := l.rights[row].materialize(
-			cursor, op.columns, frame, parent.Options.Cancel,
-			"LATERAL right relation",
+		charge, materializeErr := l.materializeRight(
+			cursor, &l.rights[row], frame, parent.Options.Cancel,
 		)
 		frame.intermediate.release(resultBytes)
 		clearExecBorrowedViews(&op.exec)
 		op.stmt.releaseRelations(frame)
+		l.releaseBinding(frame)
 		if materializeErr != nil {
 			return materializeErr
 		}
 		l.active[row] = charge
 	}
 	return nil
+}
+
+func (l *statementLateral) materializeRight(
+	cursor Cursor,
+	spool *relationSpool,
+	frame *statementFrame,
+	cancel *CancelFlag,
+) (int64, error) {
+	spool.reset()
+	rows, payload, err := l.measureRight(cursor, cancel)
+	if err != nil {
+		return 0, err
+	}
+	charge := relationSpoolRetainedBytes(rows, len(l.outputs), payload)
+	if charge == math.MaxInt64 {
+		return 0, &IntermediateBudgetError{
+			Resource: "LATERAL right relation", Bytes: math.MaxInt64,
+			Limit: frame.intermediate.limit,
+		}
+	}
+	if err := frame.intermediate.reserve("LATERAL right relation", charge); err != nil {
+		return 0, err
+	}
+	if err := cancellationError(cancel); err != nil {
+		frame.intermediate.release(charge)
+		return 0, err
+	}
+	if err := spool.begin(rows, len(l.outputs), payload); err != nil {
+		frame.intermediate.release(charge)
+		return 0, err
+	}
+	if err := l.fillRight(cursor, spool, rows, cancel); err != nil {
+		spool.reset()
+		frame.intermediate.release(charge)
+		return 0, err
+	}
+	return charge, nil
+}
+
+func (l *statementLateral) measureRight(
+	cursor Cursor,
+	cancel *CancelFlag,
+) (rows int, payload int64, err error) {
+	for {
+		next, nextErr := cursor.nextWithCancel(cancel)
+		if nextErr != nil {
+			return 0, 0, nextErr
+		}
+		if !next {
+			return rows, payload, nil
+		}
+		if rows == math.MaxInt {
+			return 0, 0, fmt.Errorf("query: LATERAL right row count overflows int")
+		}
+		rows++
+		for column := range l.outputs {
+			if err := cancellationCheckpoint(cancel, column); err != nil {
+				return 0, 0, err
+			}
+			cell, err := l.outputCell(&cursor, column)
+			if err != nil {
+				return 0, 0, err
+			}
+			bytes, err := relationCellOwnedBytesCancelable(cell, cancel)
+			if err != nil {
+				return 0, 0, err
+			}
+			payload = saturatedBytes(payload, int64(bytes))
+		}
+	}
+}
+
+func (l *statementLateral) fillRight(
+	cursor Cursor,
+	spool *relationSpool,
+	rows int,
+	cancel *CancelFlag,
+) error {
+	row := 0
+	for {
+		next, err := cursor.nextWithCancel(cancel)
+		if err != nil {
+			return err
+		}
+		if !next {
+			if row != rows || len(spool.data) != spool.plannedData {
+				return fmt.Errorf("query: LATERAL right relation changed during publication")
+			}
+			return nil
+		}
+		if row >= rows {
+			return fmt.Errorf("query: LATERAL right relation grew during publication")
+		}
+		for column := range l.outputs {
+			if err := cancellationCheckpoint(cancel, column); err != nil {
+				return err
+			}
+			cell, err := l.outputCell(&cursor, column)
+			if err != nil {
+				return err
+			}
+			owned, err := spool.ownCell(cell, cancel)
+			if err != nil {
+				return err
+			}
+			spool.columns[column][row] = owned
+		}
+		row++
+	}
+}
+
+func (l *statementLateral) outputCell(cursor *Cursor, column int) (Cell, error) {
+	if column < 0 || column >= len(l.outputs) {
+		return Cell{}, fmt.Errorf("query: LATERAL output ordinal is out of range")
+	}
+	output := &l.outputs[column]
+	if output.local >= 0 {
+		if output.local >= l.localOutputs {
+			return Cell{}, fmt.Errorf("query: LATERAL local output ordinal is out of range")
+		}
+		return cursor.Cell(output.local), nil
+	}
+	if output.binding < 0 || output.binding >= len(l.slots) {
+		return Cell{}, fmt.Errorf("query: LATERAL projection binding is out of range")
+	}
+	return cellFromScalar(l.slots[output.binding].value), nil
 }
 
 func (l *statementLateral) resize(rows int) {
@@ -677,13 +1425,14 @@ func (l *statementLateral) runStage(
 	frame *statementFrame,
 ) (charge int64, pairs int, err error) {
 	// This is the statement-accounted equivalent of ApplyKernel. The child is
-	// evaluated exactly once for each left row and each right relation reserves
-	// IntermediateBytes before its spool grows. Keeping those spools until the
-	// final sizing pass avoids both volatile double evaluation and partial
-	// publication. No tuple memoization is attempted: the SQL front end has no
-	// immutability/volatility proof strong enough to make reuse truthful yet.
+	// evaluated exactly once for each gate-TRUE left row (and never for a
+	// FALSE/UNKNOWN gate); each right relation reserves IntermediateBytes before
+	// its spool grows. Keeping those spools until the final sizing pass avoids
+	// both volatile double evaluation and partial publication. No tuple
+	// memoization is attempted: the SQL front end has no immutability/volatility
+	// proof strong enough to make reuse truthful yet.
 	if err := l.materializeRights(
-		op, owner, parent, src, rootArgs, left, frame,
+		join, op, owner, parent, src, rootArgs, left, frame,
 	); err != nil {
 		return 0, 0, err
 	}
