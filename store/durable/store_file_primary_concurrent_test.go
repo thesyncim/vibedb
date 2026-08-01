@@ -219,32 +219,6 @@ func assertConcurrentPrimaryRaw(
 	}
 }
 
-func TestPrimaryConcurrentDocumentCountBounds(t *testing.T) {
-	maximum := ^uint64(0)
-	for _, test := range []struct {
-		name  string
-		base  uint64
-		delta int64
-		want  uint64
-		ok    bool
-	}{
-		{name: "zero", base: 7, delta: 0, want: 7, ok: true},
-		{name: "decrement", base: 7, delta: -3, want: 4, ok: true},
-		{name: "underflow", base: 2, delta: -3, ok: false},
-		{name: "increment", base: 7, delta: 3, want: 10, ok: true},
-		{name: "maximum", base: maximum - 1, delta: 1, want: maximum, ok: true},
-		{name: "overflow", base: maximum, delta: 1, ok: false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			got, ok := primaryConcurrentDocumentCount(test.base, test.delta)
-			if got != test.want || ok != test.ok {
-				t.Fatalf("document count = %d,%v, want %d,%v",
-					got, ok, test.want, test.ok)
-			}
-		})
-	}
-}
-
 func TestConcurrentPrimaryPublisherPreservesNonPressureErrorForSuffix(
 	t *testing.T,
 ) {
@@ -700,12 +674,12 @@ func TestConcurrentPrimaryDeleteRestoreWithPinnedDirectEpoch(t *testing.T) {
 	coll := fixture.collection
 	key := []byte(fixture.keys[0])
 	want := canonicalConcurrentPrimaryValue(t, fixture.values[0])
-	state, epoch, ok := coll.enterReadEpoch()
+	view, epoch, ok := coll.enterReadEpoch()
 	if !ok {
 		t.Fatal("pin direct read epoch")
 	}
 	defer epoch.Exit()
-	baseGeneration := state.root.Generation
+	baseGeneration := view.generation
 	baseFolds := coll.Stats().PrimaryOverlayFolds
 	var staged atomic.Int64
 	previous := concurrentPrimaryReplaceStagedHook
@@ -718,7 +692,7 @@ func TestConcurrentPrimaryDeleteRestoreWithPinnedDirectEpoch(t *testing.T) {
 	if err != nil || !deleted {
 		t.Fatalf("epoch-overlap Delete = %v,%v", deleted, err)
 	}
-	if got, found, readErr := coll.resolvePrimaryGraph(nil, state, key); readErr != nil ||
+	if got, found, readErr := coll.resolvePrimaryGraph(nil, view.state, key); readErr != nil ||
 		!found || !bytes.Equal(got, want) {
 		t.Fatalf("pinned generation after delete = %s,%v,%v want %s",
 			got, found, readErr, want)
@@ -727,7 +701,7 @@ func TestConcurrentPrimaryDeleteRestoreWithPinnedDirectEpoch(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("epoch-overlap restore = %v,%v", created, err)
 	}
-	if got, found, readErr := coll.resolvePrimaryGraph(nil, state, key); readErr != nil ||
+	if got, found, readErr := coll.resolvePrimaryGraph(nil, view.state, key); readErr != nil ||
 		!found || !bytes.Equal(got, want) {
 		t.Fatalf("pinned generation after restore = %s,%v,%v want %s",
 			got, found, readErr, want)
@@ -2590,12 +2564,75 @@ func TestConcurrentPrimaryContextPoolExhaustionWakesWithoutLoss(t *testing.T) {
 	if got := pool.waiters.Load(); got != 0 {
 		t.Fatalf("waiters after drain = %d, want zero", got)
 	}
-	wantFree := ^uint32(0)
+	wantFree := primaryConcurrentContextMask
 	if len(pool.contexts) < primaryConcurrentContextLimit {
-		wantFree = (uint32(1) << uint(len(pool.contexts))) - 1
+		wantFree = (uint64(1) << uint(len(pool.contexts))) - 1
 	}
 	if got := pool.free.Load(); got != wantFree {
 		t.Fatalf("free mask after drain = %#x, want %#x", got, wantFree)
+	}
+}
+
+func TestConcurrentPrimaryContextPoolCloseRejectsSaturatedOperations(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	pool := collection.primaryConcurrentContexts
+	if pool == nil {
+		t.Fatal("concurrent context pool is nil")
+	}
+	held := make([]*primaryConcurrentContext, len(pool.contexts))
+	for index := range held {
+		held[index] = pool.acquire()
+		if held[index] == nil {
+			t.Fatalf("context %d was not acquired", index)
+		}
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- collection.Close() }()
+	deadline := time.Now().Add(concurrentPrimaryTestTimeout)
+	for pool.free.Load()&primaryConcurrentPoolClosed == 0 &&
+		time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if pool.free.Load()&primaryConcurrentPoolClosed == 0 {
+		t.Fatal("Close did not close the saturated context pool")
+	}
+
+	type operationResult struct {
+		name string
+		err  error
+	}
+	operations := make(chan operationResult, 2)
+	go func() {
+		_, err := collection.Put(
+			[]byte(fixture.keys[0]), []byte(`{"closed":"put"}`),
+		)
+		operations <- operationResult{name: "Put", err: err}
+	}()
+	go func() {
+		_, err := collection.Delete([]byte(fixture.keys[1]))
+		operations <- operationResult{name: "Delete", err: err}
+	}()
+	for range 2 {
+		select {
+		case result := <-operations:
+			if !errors.Is(result.err, ErrClosed) {
+				t.Fatalf("post-Close %s error = %v, want ErrClosed",
+					result.name, result.err)
+			}
+		case <-time.After(concurrentPrimaryTestTimeout):
+			t.Fatal("post-Close operation blocked on saturated context pool")
+		}
+	}
+
+	for _, context := range held {
+		pool.release(context)
+	}
+	if err := awaitConcurrentPrimary(t, closeDone, "saturated-pool Close"); err != nil {
+		t.Fatal(err)
 	}
 }
 

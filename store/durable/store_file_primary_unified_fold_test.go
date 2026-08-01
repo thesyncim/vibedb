@@ -521,7 +521,7 @@ func TestFilePrimaryUnifiedNativeFoldPinsVolatileSource(t *testing.T) {
 		t.Fatalf("overlay Put = %v,%v", created, putErr)
 	}
 
-	pinnedState, epoch, entered := collection.enterReadEpoch()
+	pinnedView, epoch, entered := collection.enterReadEpoch()
 	if !entered {
 		t.Fatal("could not pin direct reader")
 	}
@@ -531,8 +531,11 @@ func TestFilePrimaryUnifiedNativeFoldPinsVolatileSource(t *testing.T) {
 			epoch.Exit()
 		}
 	}()
+	pinnedState := *pinnedView.state
+	pinnedState.root.Generation = pinnedView.generation
+	pinnedState.root.DocumentCount = pinnedView.documentCount
 	pinnedRoute, err := collection.currentPrimaryResidentRoute(
-		pinnedState, []byte(keys[seedIndex]),
+		&pinnedState, []byte(keys[seedIndex]),
 	)
 	if err != nil || pinnedRoute.Ref != seedRef {
 		t.Fatalf("pinned source route = %+v,%v want %+v",
@@ -556,7 +559,7 @@ func TestFilePrimaryUnifiedNativeFoldPinsVolatileSource(t *testing.T) {
 	}
 	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
 		lease.Page(), collection.storeID, seedRoute.Bucket,
-		collection.primaryLeafBounds(pinnedState),
+		collection.primaryLeafBounds(&pinnedState),
 	)
 	if !ok {
 		lease.Release()

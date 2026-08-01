@@ -547,14 +547,13 @@ func TestFilePrimaryIndexedMutationAllocations(t *testing.T) {
 	}
 	baseUnchanged, baseChanged := measure(false)
 	unchanged, changed := measure(true)
-	if unchanged > baseUnchanged || changed > baseChanged {
-		t.Fatalf(
-			"indexed mutation allocates beyond the unindexed lane: unchanged %.2f vs %.2f, changed %.2f vs %.2f",
-			unchanged, baseUnchanged, changed, baseChanged,
-		)
+	if baseUnchanged != 0 || baseChanged != 0 {
+		t.Fatalf("packed unindexed Put allocates %.2f/%.2f per run, want 0",
+			baseUnchanged, baseChanged)
 	}
-	// The base lane's own budget is one allocation per buffered Put; the
-	// exact-index write rule must not add to it.
+	// Indexed mutation still physically publishes one immutable state. Keep its
+	// independent historical budget explicit now that the packed unindexed lane
+	// no longer provides a one-allocation relative baseline.
 	if changed > 1 || unchanged > 1 {
 		t.Fatalf("buffered indexed Put allocates %.2f/%.2f per run, want ≤ 1",
 			unchanged, changed)

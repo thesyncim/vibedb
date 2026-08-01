@@ -11,9 +11,6 @@ func TestReadEpochsEnterExit(t *testing.T) {
 	if epochs.AnyActive() {
 		t.Fatal("fresh table reports active readers")
 	}
-	if !epochs.SafeFrom(7) {
-		t.Fatal("idle table must be safe from every generation")
-	}
 	if got := epochs.Minimum(9); got != 10 {
 		t.Fatalf("idle minimum = %d, want successor 10", got)
 	}
@@ -25,23 +22,8 @@ func TestReadEpochsEnterExit(t *testing.T) {
 	if !epochs.AnyActive() {
 		t.Fatal("active slot not visible")
 	}
-	if epochs.SafeFrom(5) {
-		t.Fatal("generation equal to an active slot must be unsafe")
-	}
-	if epochs.SafeFrom(3) {
-		t.Fatal("generation below an active slot must be unsafe")
-	}
-	if !epochs.SafeFrom(6) {
-		t.Fatal("generation above every active slot must be safe")
-	}
 	if got := epochs.Minimum(9); got != 5 {
 		t.Fatalf("minimum with active slot = %d, want 5", got)
-	}
-	if !epoch.Update(8) {
-		t.Fatal("Update failed")
-	}
-	if got := epochs.Minimum(9); got != 8 {
-		t.Fatalf("minimum after update = %d, want 8", got)
 	}
 	epoch.Exit()
 	if epochs.AnyActive() {

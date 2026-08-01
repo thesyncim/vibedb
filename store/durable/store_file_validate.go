@@ -43,6 +43,15 @@ func (v *fileStorePageValidator) update(state *fileStoreState) {
 	v.generation.Store(state.root.Generation)
 }
 
+// advanceGeneration publishes the logical admission ceiling for an overlay-only
+// cut. No page/file bounds changed, but readers selected at that generation must
+// not leave the validator's public generation behind the router/cut pair.
+func (v *fileStorePageValidator) advanceGeneration(generation uint64) {
+	if v != nil {
+		v.generation.Store(generation)
+	}
+}
+
 func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) error {
 	if v == nil {
 		return nil

@@ -246,7 +246,7 @@ func TestVibeDurableScanAllBytesWarmedAllocatesNothing(t *testing.T) {
 
 // TestVibeDurablePointMutationWarmedAllocations keeps the benchmark adapter
 // honest: its string key conversion lives in caller-owned retained storage, so
-// the only steady allocation is durable's immutable state publication. Both
+// warmed buffered inline replacements publish without heap allocation. Both
 // the single-client handle and a concurrent-harness session own their scratch.
 func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
 	factory, ok := FactoryNamed("vibejson-durable")
@@ -294,9 +294,9 @@ func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
 					panic(err)
 				}
 			})
-			if putAllocs != 1 {
+			if putAllocs != 0 {
 				t.Fatalf(
-					"warmed Put allocated %.2f times, want 1 published state",
+					"warmed Put allocated %.2f times, want 0",
 					putAllocs,
 				)
 			}
@@ -308,9 +308,9 @@ func TestVibeDurablePointMutationWarmedAllocations(t *testing.T) {
 					panic(err)
 				}
 			})
-			if deleteRestoreAllocs != 2 {
+			if deleteRestoreAllocs != 0 {
 				t.Fatalf(
-					"warmed delete+restore allocated %.2f times, want 2 published states",
+					"warmed delete+restore allocated %.2f times, want 0",
 					deleteRestoreAllocs,
 				)
 			}

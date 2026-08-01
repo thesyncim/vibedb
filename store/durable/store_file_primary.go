@@ -42,7 +42,7 @@ func (c *Collection) resolvePrimaryGraph(
 		return c.resolvePrimaryGraphPageWalk(dst, state, key)
 	}
 	dst, found, superseded, err := c.resolvePrimaryGraphRouted(
-		dst, state, keyBytes, router,
+		dst, state, state.root.Generation, keyBytes, router,
 	)
 	if superseded {
 		// The serialized writer advanced the router after the generation check
@@ -62,6 +62,7 @@ func (c *Collection) resolvePrimaryGraph(
 func (c *Collection) resolvePrimaryGraphRouted(
 	dst []byte,
 	state *fileStoreState,
+	generation uint64,
 	keyBytes []byte,
 	router *storeio.ResidentPrimaryRouter,
 ) (out []byte, found bool, superseded bool, err error) {
@@ -74,11 +75,11 @@ func (c *Collection) resolvePrimaryGraphRouted(
 	}
 	// Close the race in which the serialized writer advances the router after
 	// the generation check but while this reader is selecting its handle.
-	if router.Generation() != state.root.Generation {
+	if router.Generation() != generation {
 		return dst, false, true, nil
 	}
 	if value, disposition, _ := c.primaryUnifiedOverlay.lookup(
-		route.Bucket, route.Hash, keyBytes, state.root.Generation,
+		route.Bucket, route.Hash, keyBytes, generation,
 	); disposition == primaryUnifiedOverlayValue {
 		return append(dst, value...), true, false, nil
 	} else if disposition == primaryUnifiedOverlayDeleted {
@@ -124,6 +125,7 @@ func (c *Collection) resolvePrimaryGraphRouted(
 func (c *Collection) resolvePrimaryGraphLive(
 	dst []byte,
 	state *fileStoreState,
+	generation uint64,
 	key []byte,
 ) (out []byte, found bool, superseded bool, err error) {
 	if c == nil || state == nil ||
@@ -136,14 +138,14 @@ func (c *Collection) resolvePrimaryGraphLive(
 	}
 	router := c.primaryRouter.Load()
 	if router == nil ||
-		router.Generation() < state.root.Generation {
+		router.Generation() < generation {
 		out, found, err = c.resolvePrimaryGraphPageWalk(dst, state, key)
 		return out, found, false, err
 	}
-	if router.Generation() != state.root.Generation {
+	if router.Generation() != generation {
 		return dst, false, true, nil
 	}
-	return c.resolvePrimaryGraphRouted(dst, state, key, router)
+	return c.resolvePrimaryGraphRouted(dst, state, generation, key, router)
 }
 
 // appendPrimaryLeafValue reads one exact value from the sole admitted class-5

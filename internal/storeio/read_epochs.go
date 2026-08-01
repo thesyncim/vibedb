@@ -33,9 +33,10 @@ const readEpochDivertClosed = uint32(1) << 31
 //
 //   - the safe-reclaim horizon: no extent retired at or after the oldest
 //     active slot generation may be reused (Minimum), and
-//   - in-place eligibility: a frame born at generation g may be patched or
-//     retired immediately only when no active slot could observe it
-//     (SafeFrom/AnyActive), evaluated inside a writer fence.
+//   - destructive-action eligibility: no frame may be patched or immediately
+//     retired while any slot is active (AnyActive), evaluated inside a writer
+//     fence. A slot's generation is a conservative floor, not a per-page
+//     reachability ceiling.
 //
 // Correctness rests on two store/load protocols, both relying on Go's
 // sequentially consistent atomics:
@@ -74,6 +75,13 @@ type ReadEpochs struct {
 type ReadEpoch struct {
 	owner *ReadEpochs
 	index uint32
+}
+
+// ReadEpochStats is the bounded direct-reader summary used by reclamation
+// diagnostics and pressure recovery.
+type ReadEpochStats struct {
+	Active            uint64
+	MinimumGeneration uint64
 }
 
 // NewReadEpochs allocates the fixed table once at collection construction so
@@ -120,16 +128,6 @@ func (e *ReadEpochs) Diverted() bool {
 	return e != nil && e.divert.Load() != 0
 }
 
-// Update republishes the protected generation after the visible-state re-load
-// observed a newer publication.
-func (r ReadEpoch) Update(generation uint64) bool {
-	if r.owner == nil || generation == 0 || generation >= readEpochActive {
-		return false
-	}
-	r.owner.slots[r.index].Store(generation | readEpochActive)
-	return true
-}
-
 // Exit releases the slot. The sequentially consistent store orders every page
 // read before the release, so a writer that observes the empty slot cannot
 // reclaim bytes the reader is still copying.
@@ -142,8 +140,8 @@ func (r ReadEpoch) Exit() {
 
 // BeginWriterFence diverts new direct readers to the snapshot-gate slow path.
 // The caller must already hold the snapshot gate's write side so diverted
-// readers block instead of spinning, and must scan (AnyActive/SafeFrom) after
-// this call for the fence protocol to hold. Fences nest.
+// readers block instead of spinning, and must scan AnyActive after this call
+// for the fence protocol to hold. Fences nest.
 func (e *ReadEpochs) BeginWriterFence() {
 	if e != nil {
 		e.divert.Add(1)
@@ -173,26 +171,6 @@ func (e *ReadEpochs) AnyActive() bool {
 	return false
 }
 
-// SafeFrom mirrors GenerationLeases.SafeFromSnapshots for epoch readers: a
-// page first published at generation is invisible to every active direct read
-// exactly when every occupied slot's generation is strictly below it.
-// Generation zero is never a valid page generation and returns false.
-func (e *ReadEpochs) SafeFrom(generation uint64) bool {
-	if generation == 0 {
-		return false
-	}
-	if e == nil {
-		return true
-	}
-	for index := range e.slots {
-		word := e.slots[index].Load()
-		if word != 0 && word&^readEpochActive >= generation {
-			return false
-		}
-	}
-	return true
-}
-
 // Minimum returns the oldest generation an active direct read protects, or
 // current's successor when the table is idle, matching the lease table's
 // reclamation-floor contract.
@@ -212,6 +190,38 @@ func (e *ReadEpochs) Minimum(current uint64) uint64 {
 	return minimum
 }
 
+// Stats returns active direct-reader count and their conservative reclamation
+// floor in one fixed eight-slot scan.
+func (e *ReadEpochs) Stats(current uint64) ReadEpochStats {
+	minimum := generationSuccessor(current)
+	if e == nil {
+		return ReadEpochStats{MinimumGeneration: minimum}
+	}
+	active := uint64(0)
+	for index := range e.slots {
+		word := e.slots[index].Load()
+		if word != 0 {
+			active++
+			if generation := word &^ readEpochActive; generation < minimum {
+				minimum = generation
+			}
+		}
+	}
+	return ReadEpochStats{
+		Active: active, MinimumGeneration: minimum,
+	}
+}
+
+// BeginClose permanently diverts new direct readers without requiring existing
+// slots to be quiescent. Collection shutdown calls it at admission time, before
+// persistence and teardown work, so a later reader cannot fall through to a
+// slow registry that has not closed yet.
+func (e *ReadEpochs) BeginClose() {
+	if e != nil {
+		e.divert.Or(readEpochDivertClosed)
+	}
+}
+
 // Close permanently diverts new readers, then reports whether the table is
 // quiescent. Like GenerationLeases.Close it returns ErrLeasesActive until the
 // last in-flight read exits and stays closed either way, so a caller retries
@@ -220,7 +230,7 @@ func (e *ReadEpochs) Close() error {
 	if e == nil {
 		return nil
 	}
-	e.divert.Or(readEpochDivertClosed)
+	e.BeginClose()
 	if e.AnyActive() {
 		return ErrLeasesActive
 	}

@@ -30,6 +30,24 @@ func primaryNativeFoldTestReplacement(t *testing.T, src []byte) []byte {
 	return value
 }
 
+// primaryNativeFoldVisibleState adapts the physical root pointer to the
+// reader-visible logical cut. These tests intentionally call fold internals
+// directly; ordinary production entry points perform this adaptation before
+// invoking the planner when a packed overlay suffix is pending.
+func primaryNativeFoldVisibleState(
+	t *testing.T, collection *Collection,
+) *fileStoreState {
+	t.Helper()
+	view, err := collection.visibleLogicalView()
+	if err != nil || view.state == nil {
+		t.Fatalf("visible logical state: state=%v err=%v", view.state, err)
+	}
+	state := *view.state
+	state.root.Generation = view.generation
+	state.root.DocumentCount = view.documentCount
+	return &state
+}
+
 func primaryNativeFoldDistinctRows(
 	t *testing.T,
 	collection *Collection,
@@ -37,7 +55,7 @@ func primaryNativeFoldDistinctRows(
 	want int,
 ) []int {
 	t.Helper()
-	state := collection.state.Load()
+	state := primaryNativeFoldVisibleState(t, collection)
 	seen := make(map[storeio.BucketID]struct{}, want)
 	selected := make([]int, 0, want)
 	for index := range keys {
@@ -209,7 +227,7 @@ func TestFilePrimaryNativeFoldPrecomputeMatchesSerial(t *testing.T) {
 	}
 
 	collection.writer.Lock()
-	state := collection.state.Load()
+	state := primaryNativeFoldVisibleState(t, collection)
 	base := collection.primaryCheckpointBaseState()
 	if state == nil || base == nil {
 		collection.writer.Unlock()
@@ -293,7 +311,7 @@ func TestFilePrimaryNativeFoldPrecomputeMatchesSerial(t *testing.T) {
 		t.Fatalf("Delete row %d = %v,%v", selected[1], deleted, err)
 	}
 	collection.writer.Lock()
-	state = collection.state.Load()
+	state = primaryNativeFoldVisibleState(t, collection)
 	base = collection.primaryCheckpointBaseState()
 	route, err = collection.currentPrimaryResidentRoute(
 		state, []byte(keys[selected[1]]),
@@ -386,7 +404,7 @@ func TestFilePrimaryNativeFoldWorkerCountIdentity(t *testing.T) {
 			}
 		}
 	}
-	parallelStateBefore := parallel.state.Load()
+	parallelStateBefore := primaryNativeFoldVisibleState(t, parallel)
 	targetRoute, err := parallel.currentPrimaryResidentRoute(
 		parallelStateBefore, []byte(keys[selected[0]]),
 	)
@@ -506,7 +524,7 @@ func TestFilePrimaryNativeFoldLaterWaveErrorAbortsAndRetries(t *testing.T) {
 			t.Fatalf("Put row %d = %v,%v", index, created, putErr)
 		}
 		route, routeErr := collection.currentPrimaryResidentRoute(
-			collection.state.Load(), []byte(keys[index]),
+			primaryNativeFoldVisibleState(t, collection), []byte(keys[index]),
 		)
 		if routeErr != nil {
 			t.Fatal(routeErr)

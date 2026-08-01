@@ -644,11 +644,14 @@ func TestUnifiedPrimaryOverlayFoldWithPinnedReader(t *testing.T) {
 		uint32(window*recordBytes); got != want {
 		t.Fatalf("overlay used bytes = %d, want %d", got, want)
 	}
-	pinnedState, epoch, entered := unified.enterReadEpoch()
+	pinnedView, epoch, entered := unified.enterReadEpoch()
 	if !entered {
 		t.Fatal("could not pin test epoch reader")
 	}
-	route, err := unified.currentPrimaryResidentRoute(pinnedState, key)
+	pinnedState := *pinnedView.state
+	pinnedState.root.Generation = pinnedView.generation
+	pinnedState.root.DocumentCount = pinnedView.documentCount
+	route, err := unified.currentPrimaryResidentRoute(&pinnedState, key)
 	if err != nil {
 		epoch.Exit()
 		t.Fatal(err)
@@ -658,7 +661,7 @@ func TestUnifiedPrimaryOverlayFoldWithPinnedReader(t *testing.T) {
 		t.Fatalf("pressure Put: %v", err)
 	}
 	oldValue, disposition, _ := unified.primaryUnifiedOverlay.lookup(
-		route.Bucket, route.Hash, key, pinnedState.root.Generation,
+		route.Bucket, route.Hash, key, pinnedView.generation,
 	)
 	if disposition != primaryUnifiedOverlayValue ||
 		!bytes.Equal(oldValue, before) {

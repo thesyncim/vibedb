@@ -1024,11 +1024,11 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 	if failure := c.PersistenceError(); failure != nil {
 		return true, failure
 	}
-	state := c.state.Load()
-	if state == nil {
+	view, logicalOK := c.writerLogicalView()
+	if !logicalOK || view.state == nil {
 		return true, ErrClosed
 	}
-	target := state.root.Generation
+	target := view.generation
 	after := c.journalDeltaAppendedGeneration.Load()
 	complete, appendErr :=
 		c.appendBufferedJournalDeltaLocked(after, target)
@@ -1140,11 +1140,11 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	if failure := c.PersistenceError(); failure != nil {
 		return true, failure
 	}
-	state := c.state.Load()
-	if state == nil {
+	view, logicalOK := c.writerLogicalView()
+	if !logicalOK || view.state == nil {
 		return true, ErrClosed
 	}
-	target := state.root.Generation
+	target := view.generation
 	durableAfter := c.journalDeltaGeneration.Load()
 	appendedAfter := c.journalDeltaAppendedGeneration.Load()
 	if target == durableAfter {

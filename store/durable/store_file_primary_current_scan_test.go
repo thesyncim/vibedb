@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -450,6 +452,12 @@ func TestBufferedUnifiedRangeRawCurrentBufferDoesNotBlockFlushCallback(t *testin
 	if !collection.primaryUnifiedOverlay.hasPending() {
 		t.Fatal("flush-overlap fixture has no pending row overlay")
 	}
+	physicalGeneration := collection.state.Load().root.Generation
+	logicalGeneration := collection.Generation()
+	if logicalGeneration <= physicalGeneration {
+		t.Fatalf("scan fixture cut = logical %d physical %d, want pending suffix",
+			logicalGeneration, physicalGeneration)
+	}
 
 	callbackEntered := make(chan struct{})
 	releaseCallback := make(chan struct{})
@@ -470,6 +478,10 @@ func TestBufferedUnifiedRangeRawCurrentBufferDoesNotBlockFlushCallback(t *testin
 		)
 	}()
 	awaitConcurrentPrimary(t, callbackEntered, "blocked current-scan callback")
+	if got := collection.readEpochs.Minimum(logicalGeneration); got != physicalGeneration {
+		t.Fatalf("blocked scan retention generation = %d, want physical %d",
+			got, physicalGeneration)
+	}
 
 	flushAttempt := make(chan struct{}, 1)
 	previousHook := concurrentPrimaryExclusiveWaitHook
@@ -487,14 +499,85 @@ func TestBufferedUnifiedRangeRawCurrentBufferDoesNotBlockFlushCallback(t *testin
 	); err != nil {
 		t.Fatal(err)
 	}
+	concurrentPrimaryExclusiveWaitHook = previousHook
 	if got, want := collection.DurableGeneration(), collection.Generation(); got != want {
 		t.Fatalf("overlap durable generation = %d, want %d", got, want)
+	}
+	// Snapshot forces the journal-delta suffix into a new physical graph while
+	// the callback still walks the old one. Then an overflow replacement takes a
+	// second physical publication through the allocator/reclaimer. The original
+	// root's retirements must remain pinned at physicalGeneration throughout.
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	overflowValue := fmt.Appendf(
+		nil, `{"scan":"later-checkpoint","payload":%q}`,
+		strings.Repeat("x", collection.options.InlineValueBytes+1),
+	)
+	if created, err := collection.Put(
+		[]byte(fixture.keys[200]), overflowValue,
+	); err != nil || created {
+		t.Fatalf("later checkpoint Put = created %v, err %v", created, err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Rotate the two-root recovery fence beyond the scan's physical base. At
+	// that point the active B epoch is the only reason B-retired extents cannot
+	// enter the reusable set.
+	for attempt := 0; collection.committer.FallbackGeneration() <= physicalGeneration &&
+		attempt < 4; attempt++ {
+		nextOverflow := fmt.Appendf(
+			nil, `{"scan":"reuse-boundary-%d","payload":%q}`,
+			attempt, strings.Repeat("y", collection.options.InlineValueBytes+1),
+		)
+		if created, err := collection.Put(
+			[]byte(fixture.keys[200]), nextOverflow,
+		); err != nil || created {
+			t.Fatalf("recovery rotation Put %d = created %v, err %v",
+				attempt, created, err)
+		}
+		if err := collection.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fallback := collection.committer.FallbackGeneration(); fallback <= physicalGeneration {
+		t.Fatalf("fallback generation = %d, want beyond pinned physical %d",
+			fallback, physicalGeneration)
+	}
+	collection.writer.Lock()
+	refreshErr := collection.refreshReusable(collection.state.Load())
+	collection.writer.Unlock()
+	if refreshErr != nil {
+		t.Fatal(refreshErr)
+	}
+	pinnedRetired := collection.reclaimer.Stats()
+	if pinnedRetired.Pending == 0 ||
+		pinnedRetired.OldestRetired != physicalGeneration {
+		t.Fatalf("pinned retirements = %+v, want oldest physical generation %d",
+			pinnedRetired, physicalGeneration)
 	}
 	releaseOnce.Do(func() { close(releaseCallback) })
 	if err := awaitConcurrentPrimary(
 		t, scanDone, "current scan after overlapping Flush",
 	); err != nil {
 		t.Fatal(err)
+	}
+	collection.writer.Lock()
+	refreshErr = collection.refreshReusable(collection.state.Load())
+	collection.writer.Unlock()
+	if refreshErr != nil {
+		t.Fatal(refreshErr)
+	}
+	afterRelease := collection.reclaimer.Stats()
+	if afterRelease.Pending >= pinnedRetired.Pending ||
+		afterRelease.OldestRetired == physicalGeneration {
+		t.Fatalf("retirements did not cross reuse boundary after scan release: before %+v after %+v",
+			pinnedRetired, afterRelease)
 	}
 }
 
@@ -569,5 +652,91 @@ func TestBufferedUnifiedRangeRawCurrentBufferPanicReleasesReadersAndPagePins(t *
 				t.Fatalf("panic changed pinned pages %d -> %d", beforePins, after.PinnedPages)
 			}
 		})
+	}
+}
+
+func TestCollectionCloseAdmissionRejectsNewReadersWhileCurrentScanPinned(
+	t *testing.T,
+) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracle, fixture.keys[18],
+		[]byte(`{"scan":"close-admission","id":18}`), false,
+	)
+
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCallback) }) })
+	scanDone := make(chan error, 1)
+	go func() {
+		scanDone <- verifyBufferedCurrentScanWithHook(
+			collection, oracle,
+			func([]byte) error {
+				enteredOnce.Do(func() { close(callbackEntered) })
+				<-releaseCallback
+				return nil
+			},
+		)
+	}()
+	awaitConcurrentPrimary(t, callbackEntered, "Close-admission current scan")
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- collection.Close() }()
+	deadline := time.Now().Add(concurrentPrimaryTestTimeout)
+	for (!collection.leases.Closing() || !collection.readEpochs.Diverted()) &&
+		time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if !collection.leases.Closing() || !collection.readEpochs.Diverted() {
+		t.Fatal("Close did not establish sticky reader admission")
+	}
+
+	assertClosedPromptly := func(name string, operation func() error) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- operation() }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrClosed) {
+				t.Fatalf("post-admission %s = %v, want ErrClosed", name, err)
+			}
+		case <-time.After(concurrentPrimaryTestTimeout):
+			t.Fatalf("post-admission %s did not return promptly", name)
+		}
+	}
+	assertClosedPromptly("AppendRaw", func() error {
+		_, _, err := collection.AppendRaw(nil, []byte(fixture.keys[0]))
+		return err
+	})
+	assertClosedPromptly("Snapshot", func() error {
+		snapshot, err := collection.Snapshot()
+		if snapshot != nil {
+			_ = snapshot.Close()
+		}
+		return err
+	})
+	assertClosedPromptly("RangeRawCurrent", func() error {
+		return collection.RangeRawCurrent(func([]byte, []byte) error { return nil })
+	})
+
+	if err := awaitConcurrentPrimary(
+		t, closeDone, "Close with pinned current scan",
+	); !errors.Is(err, storeio.ErrLeasesActive) {
+		t.Fatalf("Close with pinned current scan = %v, want ErrLeasesActive", err)
+	}
+	releaseOnce.Do(func() { close(releaseCallback) })
+	if err := awaitConcurrentPrimary(
+		t, scanDone, "pinned current scan after Close admission",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

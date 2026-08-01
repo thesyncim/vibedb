@@ -245,7 +245,7 @@ func (t *WriteTransaction) Reset(
 // This transaction proves the full-page lane owns fresh or recovery-safe
 // allocator extents. It does not make canonical cache replacement or snapshot
 // exclusion implicit: the Store integration must hold its snapshot publication
-// gate from the final SafeFromSnapshots check through cache replacement and
+// gate across its final active-reader proof, cache replacement, and
 // PublishInline, and must restore every replacement if publication fails.
 func BeginHybridWriteTransaction(
 	committer *Committer,
