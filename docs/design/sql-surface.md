@@ -66,6 +66,23 @@ table. Physical collection cleanup is deferred while active snapshots or
 cursors hold leases; a crash after catalog publication can leave only an
 unreachable orphan file, never a catalog entry pointing at missing data.
 
+Every newly created table and storage replacement receives a cryptographically
+random, cataloged storage identity. `DROP TABLE` followed by same-name
+`CREATE TABLE` can therefore publish the replacement immediately while an old
+snapshot continues reading the retired file. Reopen removes only unreferenced
+files in the driver's private, strictly recognized storage namespace; live and
+legacy catalog paths remain protected. Recovery work and simultaneously
+retired incarnations both have hard bounds.
+
+`TRUNCATE [TABLE] name` publishes a fresh empty storage incarnation with the
+same schema and exact-index definitions. `DROP INDEX [IF EXISTS] name [ON
+table]` builds a replacement containing every document and all remaining exact
+indexes, fences that file, and atomically switches the catalog identity. Active
+snapshots continue to see the old incarnation until their leases close. A
+crash before catalog publication leaves a recoverable orphan; a crash after it
+leaves the new catalog authoritative. Unqualified index names must resolve to
+exactly one table; `ON table` is the deterministic form when names repeat.
+
 Catalog publication uses a synced temporary file, atomic replacement, and a
 namespace durability fence (directory sync on Unix and a write-through move on
 Windows). The first table file is fully committed before its directory entry is
@@ -556,7 +573,7 @@ operation:
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
 - generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,
   `ON DUPLICATE KEY`, and nested flat-INSERT construction;
-- `ALTER`, `TRUNCATE`, `DROP INDEX`, views, unique/check/foreign-key/default/generated
+- `ALTER`, views, unique/check/foreign-key/default/generated
   constraints, and SQL types without a JSON equivalent;
 - unique/partial/range/full-text indexes, expression indexes, and selectable
   index methods;

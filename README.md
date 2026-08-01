@@ -99,6 +99,10 @@ their exact wire spelling. `INSERT ... RETURNING`, `UPDATE ... RETURNING`, and
 `DELETE ... RETURNING` support projected JSON paths and `*`; `ON CONFLICT DO
 NOTHING` skips duplicate document identities atomically.
 `SELECT DISTINCT` is supported for non-aggregate projections.
+`TRUNCATE [TABLE]` atomically replaces a table with an empty durable
+incarnation while preserving its schema and indexes. `DROP INDEX [IF EXISTS]`
+physically rebuilds and atomically publishes the table without the named exact
+index; `ON table` disambiguates table-local index names.
 
 For example, the server above accepts a direct psql session with the documented
 cleartext fallback:

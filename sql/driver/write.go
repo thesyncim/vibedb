@@ -64,6 +64,27 @@ func (c *conn) execMutationContext(
 		return d.createTableLockedContext(ctx, statement)
 	case query.DDLDropTable:
 		return d.dropTableLockedContext(ctx, statement)
+	case query.DDLTruncate:
+		if err := d.truncateTableStorageLockedContext(
+			ctx, statement.Tree().Truncate.Table,
+		); err != nil {
+			return nil, err
+		}
+		return result{}, nil
+	case query.DDLDropIndex:
+		tableName, found, err := d.resolveDropIndexLocked(statement.Tree().DropIndex)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return result{}, nil
+		}
+		if err := d.dropIndexStorageLockedContext(
+			ctx, tableName, statement.Tree().DropIndex.Name,
+		); err != nil {
+			return nil, err
+		}
+		return result{}, nil
 	}
 	t, ok := d.tables[statement.Collection()]
 	if !ok {
@@ -106,14 +127,22 @@ func (d *database) dropTableLockedContext(
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
+	retire := t.collection != nil || t.file != nil
+	if retire {
+		if err := d.checkRetirementCapacityLocked(1); err != nil {
+			return nil, err
+		}
+	}
 	previousPending := d.catalogWritePending
+	retiredBefore := len(d.retired)
 	meta := d.catalog.Tables[name]
+	storagePath := d.tablePathForMeta(name, meta)
 	delete(d.catalog.Tables, name)
 	delete(d.tables, name)
-	if t.collection != nil || t.file != nil {
+	if retire {
 		d.retired = append(d.retired, retiredTable{
-			name: name, path: d.tablePath(name),
-			journal: durable.RecoveryJournalPath(d.tablePath(name)),
+			name: name, path: storagePath,
+			journal: durable.RecoveryJournalPath(storagePath),
 			file:    t.file, collection: t.collection,
 		})
 	}
@@ -122,9 +151,7 @@ func (d *database) dropTableLockedContext(
 		if !published {
 			d.catalog.Tables[name] = meta
 			d.tables[name] = t
-			if len(d.retired) != 0 {
-				d.retired = d.retired[:len(d.retired)-1]
-			}
+			d.retired = d.retired[:retiredBefore]
 			d.catalogWritePending = previousPending
 		}
 		return nil, err
@@ -171,9 +198,14 @@ func (d *database) createTableLockedContext(
 			definition.Name, err,
 		)
 	}
+	storage, err := d.newStorageIdentityLocked()
+	if err != nil {
+		return nil, err
+	}
 	meta := &tableMeta{
 		PrimaryKey: pointer,
 		Schema:     schemaMetaFrom(definition.Schema),
+		Storage:    storage,
 	}
 	candidate := &table{
 		meta: meta, schema: definition.Schema, primary: primary,

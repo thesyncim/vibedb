@@ -57,3 +57,50 @@ func TestDropTablePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDropTableReusesNameWithIndependentActiveSnapshot(t *testing.T) {
+	db := openTestDB(t)
+	db.SetMaxOpenConns(2)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"old"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query(`SELECT id FROM docs`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		_ = rows.Close()
+		t.Fatalf("CREATE TABLE during retired snapshot: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"new"}`); err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		_ = rows.Close()
+		t.Fatal("old snapshot lost its row after same-name recreation")
+	}
+	var old string
+	if err := rows.Scan(&old); err != nil || old != "old" {
+		_ = rows.Close()
+		t.Fatalf("old snapshot row = %q, err %v", old, err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := db.QueryRow(`SELECT id FROM docs`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if id != "new" {
+		t.Fatalf("recreated table row = %q, want new", id)
+	}
+}

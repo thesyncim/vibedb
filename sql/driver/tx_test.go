@@ -361,6 +361,45 @@ func TestTransactionConcurrentConflictPublishesNothing(t *testing.T) {
 	}
 }
 
+// A transaction is bound to the exact catalog incarnation captured at BEGIN,
+// even when that table had not materialized a durable file yet. Without the
+// identity check, DROP followed by same-name CREATE could redirect the staged
+// batch into a logically unrelated table.
+func TestTransactionCannotCommitIntoSameNameReplacement(t *testing.T) {
+	db := openTestDB(t)
+	db.SetMaxOpenConns(2)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+
+	transaction, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.Exec(
+		`INSERT INTO docs VALUES (?)`, `{"id":"stale"}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(); !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("Commit into replacement = %v, want ErrTransactionConflict", err)
+	}
+
+	var count int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("replacement row count = %d, want 0", count)
+	}
+}
+
 // Two transactions opened concurrently from one database/sql handle conflict
 // when they replace the same key.
 func TestConcurrentTransactionsOnOneHandle(t *testing.T) {

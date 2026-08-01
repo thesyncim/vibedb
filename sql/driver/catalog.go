@@ -48,6 +48,7 @@ type tableMeta struct {
 	PrimaryKey   string      `json:"primary_key"`
 	Schema       *schemaMeta `json:"schema,omitempty"`
 	Indexes      []indexMeta `json:"indexes,omitempty"`
+	Storage      string      `json:"storage,omitempty"`
 	Materialized bool        `json:"materialized,omitempty"`
 }
 
@@ -76,11 +77,10 @@ type table struct {
 	conflicts  txConflictClock
 }
 
-// retiredTable keeps the physical resources of a logically dropped table
-// alive until the durable collection can close. Existing SQL cursors and
-// transactions may still hold generation leases after the catalog no longer
-// names the table; deleting the catalog entry first is what makes DROP
-// crash-safe, while this bounded list makes the later file cleanup explicit.
+// retiredTable keeps the physical resources of a dropped or replaced table
+// incarnation alive until the durable collection can close. Existing SQL
+// cursors and transactions may still hold generation leases after the catalog
+// stops naming this storage identity.
 type retiredTable struct {
 	name       string
 	path       string
@@ -170,19 +170,23 @@ func openDatabaseWithSync(
 	if err := checkCatalogTableCount(len(d.catalog.Tables)); err != nil {
 		return nil, err
 	}
+	paths := make(map[string]string, len(d.catalog.Tables))
 	for name, meta := range d.catalog.Tables {
 		if nameErr := validateCatalogTableName(name); nameErr != nil {
-			_ = d.close()
 			return nil, fmt.Errorf(
 				"vibedb: SQL catalog table name %q: %w", name, nameErr)
 		}
 		if meta == nil {
-			_ = d.close()
 			return nil, fmt.Errorf("vibedb: SQL catalog table %q has null metadata", name)
+		}
+		if storageErr := validateStorageIdentity(meta.Storage); storageErr != nil {
+			return nil, fmt.Errorf(
+				"vibedb: SQL catalog table %q storage identity: %w",
+				name, storageErr,
+			)
 		}
 		primary, primaryErr := vibejson.CompilePointer(meta.PrimaryKey)
 		if primaryErr != nil || len(primary.Tokens) == 0 {
-			_ = d.close()
 			if primaryErr == nil {
 				primaryErr = errors.New("the primary-key path is empty")
 			}
@@ -192,11 +196,9 @@ func openDatabaseWithSync(
 		}
 		schema, schemaErr := compileSchemaMeta(meta.Schema)
 		if schemaErr != nil {
-			_ = d.close()
 			return nil, fmt.Errorf("vibedb: SQL catalog table %q schema: %w", name, schemaErr)
 		}
 		if schemaErr := validatePrimarySchema(meta.PrimaryKey, schema); schemaErr != nil {
-			_ = d.close()
 			return nil, fmt.Errorf(
 				"vibedb: SQL catalog table %q primary key: %w",
 				name, schemaErr)
@@ -205,32 +207,45 @@ func openDatabaseWithSync(
 			if _, indexErr := store.CompileExactIndex(store.IndexDefinition{
 				Name: index.Name, Paths: index.Paths,
 			}); indexErr != nil {
-				_ = d.close()
 				return nil, fmt.Errorf("vibedb: SQL catalog table %q index %q: %w", name, index.Name, indexErr)
 			}
 		}
 		t := &table{meta: meta, schema: schema, primary: primary}
 		if optionsErr := durable.ValidateOptions(durableOptions(t)); optionsErr != nil {
-			_ = d.close()
 			return nil, fmt.Errorf(
 				"vibedb: SQL catalog table %q durable definition: %w",
 				name, optionsErr)
 		}
-		dataPath := d.tablePath(name)
+		dataPath := d.tablePathForMeta(name, meta)
+		if previous, duplicate := paths[dataPath]; duplicate {
+			return nil, fmt.Errorf(
+				"vibedb: SQL catalog tables %q and %q share storage identity %q",
+				previous, name, filepath.Base(dataPath),
+			)
+		}
+		paths[dataPath] = name
+		d.tables[name] = t
+	}
+	// Only mutate the private table directory after the complete catalog has
+	// passed strict decoding and semantic validation. An unpublished replacement
+	// can leave a unique orphan after a crash; no live catalog entry can name it.
+	if err := d.recoverOrphanedTableStorage(paths); err != nil {
+		return nil, err
+	}
+	for name, t := range d.tables {
+		meta := t.meta
+		dataPath := d.tablePathForMeta(name, meta)
 		file, openErr := os.OpenFile(dataPath, os.O_RDWR, 0)
 		if os.IsNotExist(openErr) {
 			if meta.Materialized {
-				_ = d.close()
 				return nil, fmt.Errorf(
 					"vibedb: materialized SQL table %q is missing its data file",
 					name,
 				)
 			}
-			d.tables[name] = t
 			continue
 		}
 		if openErr != nil {
-			_ = d.close()
 			return nil, openErr
 		}
 		openOptions := durableOptions(t)
@@ -241,13 +256,11 @@ func openDatabaseWithSync(
 		collection, openErr := durable.Open(file, openOptions)
 		if openErr != nil {
 			_ = file.Close()
-			_ = d.close()
 			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
 		}
 		t.file, t.collection = file, collection
 		changed, syncErr := syncTableIndexMeta(t)
 		if syncErr != nil {
-			_ = d.close()
 			return nil, fmt.Errorf(
 				"vibedb: read durable table %q index catalog: %w",
 				name, syncErr,
@@ -257,13 +270,11 @@ func openDatabaseWithSync(
 			d.catalogWritePending = true
 		}
 		if !meta.Materialized {
-			_ = d.close()
 			return nil, fmt.Errorf(
 				"vibedb: SQL catalog table %q has a data file but is not marked materialized",
 				name,
 			)
 		}
-		d.tables[name] = t
 	}
 	if d.catalogWritePending {
 		if _, err := d.persistCatalogLocked(); err != nil {
@@ -397,6 +408,10 @@ func canonicalCatalogPath(path string) (string, error) {
 func durableOptions(t *table) durable.Options {
 	options := durable.Options{
 		Collection: store.Options{Schema: t.schema},
+		// SQL acknowledges a mutation only after its recovery record or root is
+		// durable. Replacement rebuilds use bounded WriteBatch chunks under this
+		// same contract; batching changes barrier count, not durability semantics.
+		Durability: durable.DurabilitySync,
 	}
 	for _, index := range t.meta.Indexes {
 		options.Indexes = append(options.Indexes, store.IndexDefinition{
@@ -504,9 +519,18 @@ func validatePrimarySchema(primaryKey string, schema *store.Schema) error {
 	return fmt.Errorf("schema does not constrain primary-key path %q", primaryKey)
 }
 
-func (d *database) tablePath(name string) string {
+func (d *database) legacyTablePath(name string) string {
 	sum := sha256.Sum256([]byte(name))
 	return filepath.Join(d.dataDir, hex.EncodeToString(sum[:])+".vjc")
+}
+
+// tablePath preserves the historical helper contract for tests and internal
+// callers while resolving cataloged incarnations when one exists.
+func (d *database) tablePath(name string) string {
+	if meta := d.catalog.Tables[name]; meta != nil {
+		return d.tablePathForMeta(name, meta)
+	}
+	return d.legacyTablePath(name)
 }
 
 func validateCatalogTableName(name string) error {
@@ -578,6 +602,16 @@ func (d *database) settleDroppedTablesLocked() error {
 	}
 	remaining := d.retired[:0]
 	removedAny := false
+	retainFailure := func(at int, err error) error {
+		d.retired = append(remaining, d.retired[at:]...)
+		if removedAny {
+			// At least one namespace deletion happened before this later cleanup
+			// failed. Preserve its durability fence so retryNamespaceFencesLocked
+			// syncs the directory before any removed marker can be discarded.
+			d.tableDirFencePending = true
+		}
+		return err
+	}
 	for i := range d.retired {
 		retired := &d.retired[i]
 		if retired.collection != nil {
@@ -586,43 +620,46 @@ func (d *database) settleDroppedTablesLocked() error {
 					remaining = append(remaining, *retired)
 					continue
 				}
-				d.retired = append(remaining, *retired)
-				return fmt.Errorf(
+				return retainFailure(i, fmt.Errorf(
 					"%w: finish DROP TABLE %q: %v",
 					durable.ErrCommitOutcomeUnknown, retired.name, err,
-				)
+				))
 			}
 			retired.collection = nil
 		}
 		if retired.file != nil {
 			if err := retired.file.Close(); err != nil {
-				d.retired = append(remaining, *retired)
-				return fmt.Errorf(
+				return retainFailure(i, fmt.Errorf(
 					"%w: close dropped SQL table %q: %v",
 					durable.ErrCommitOutcomeUnknown, retired.name, err,
-				)
+				))
 			}
 			retired.file = nil
 		}
 		if retired.removed {
 			continue
 		}
-		if err := os.Remove(retired.path); err != nil && !os.IsNotExist(err) {
-			d.retired = append(remaining, *retired)
-			return fmt.Errorf(
-				"%w: remove dropped SQL table %q: %v",
-				durable.ErrCommitOutcomeUnknown, retired.name, err,
-			)
+		if err := os.Remove(retired.path); err != nil {
+			if !os.IsNotExist(err) {
+				return retainFailure(i, fmt.Errorf(
+					"%w: remove retired SQL table %q: %v",
+					durable.ErrCommitOutcomeUnknown, retired.name, err,
+				))
+			}
+		} else {
+			removedAny = true
 		}
-		if err := os.Remove(retired.journal); err != nil && !os.IsNotExist(err) {
-			d.retired = append(remaining, *retired)
-			return fmt.Errorf(
-				"%w: remove dropped SQL table journal %q: %v",
-				durable.ErrCommitOutcomeUnknown, retired.name, err,
-			)
+		if err := os.Remove(retired.journal); err != nil {
+			if !os.IsNotExist(err) {
+				return retainFailure(i, fmt.Errorf(
+					"%w: remove retired SQL table journal %q: %v",
+					durable.ErrCommitOutcomeUnknown, retired.name, err,
+				))
+			}
+		} else {
+			removedAny = true
 		}
 		retired.removed = true
-		removedAny = true
 		remaining = append(remaining, *retired)
 	}
 	if removedAny {
@@ -771,6 +808,9 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 			continue
 		}
 		if !add(encodedJSONStringBytes(meta.PrimaryKey)) {
+			return size, catalogSizeError(size)
+		}
+		if !add(encodedJSONStringBytes(meta.Storage) + 32) {
 			return size, catalogSizeError(size)
 		}
 		if meta.Schema != nil {

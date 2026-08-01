@@ -30,6 +30,7 @@ type stagedTxMutation struct {
 }
 
 type txTable struct {
+	incarnation      *table
 	snapshot         *durable.Snapshot
 	pending          map[string]*txMutation
 	order            []string
@@ -94,11 +95,12 @@ func (c *conn) beginTx(
 			return nil, err
 		}
 		state := &txTable{
-			pending:    make(map[string]*txMutation),
-			primaryKey: table.meta.PrimaryKey,
-			primary:    table.primary,
-			schema:     table.schema,
-			limits:     limits,
+			incarnation: table,
+			pending:     make(map[string]*txMutation),
+			primaryKey:  table.meta.PrimaryKey,
+			primary:     table.primary,
+			schema:      table.schema,
+			limits:      limits,
 		}
 		state.overlaySource = query.NewFileOverlaySource(state)
 		if table.collection != nil {
@@ -260,7 +262,8 @@ func (t *tx) execMutationCore(
 		return nil, ErrReadOnlyTransaction
 	}
 	switch statement.Kind() {
-	case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable:
+	case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable,
+		query.DDLTruncate, query.DDLDropIndex:
 		return nil, ErrDDLInTransaction
 	}
 	tableName := statement.Collection()
@@ -772,8 +775,11 @@ func (t *tx) Commit() error {
 		return err
 	}
 	table := t.conn.db.tables[t.writeTable]
-	if table == nil {
-		return fmt.Errorf("vibedb: table %q no longer exists", t.writeTable)
+	if table == nil || table != state.incarnation {
+		return fmt.Errorf(
+			"%w: table %q was dropped or replaced after BEGIN",
+			ErrTransactionConflict, t.writeTable,
+		)
 	}
 	key, historyOverflow, conflict := state.conflicts.conflict(
 		state.conflictRevision, state.order,
