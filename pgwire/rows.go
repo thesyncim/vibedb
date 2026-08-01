@@ -128,7 +128,9 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 	dst = dst[:0]
 	for i, name := range names {
 		typ := typeJSON
-		if i < len(schema) && schema[i].Reduction == query.ReductionCount {
+		if i < len(schema) &&
+			(schema[i].Reduction == query.ReductionCount ||
+				schema[i].Reduction == query.ReductionWindowInteger) {
 			typ = typeInt8
 		}
 		dst = append(dst, column{name: name, typ: typ})

@@ -31,11 +31,15 @@ type exprContext uint8
 const (
 	ctxWhere exprContext = iota
 	ctxHaving
+	ctxJoin
 )
 
 func (c exprContext) String() string {
 	if c == ctxHaving {
 		return "HAVING"
+	}
+	if c == ctxJoin {
+		return "ON"
 	}
 	return "WHERE"
 }
@@ -176,6 +180,15 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		return nil, p.errHere("CASE expressions are not supported: the engine evaluates predicates, not computed values")
 	case p.atKeyword(kwCast):
 		return nil, p.errHere("CAST is not supported: values compare within their JSON type, so there is nothing to cast to")
+	case ctx == ctxJoin && (p.atKeyword(kwTrue) || p.atKeyword(kwFalse)):
+		pos := p.tok.pos
+		value, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprConstant, Column: -1, Value: value, Pos: pos}
+		return e, nil
 	case p.tok.kind == tokNumber, p.tok.kind == tokString, p.tok.kind == tokParam:
 		return nil, p.errHere("a condition must begin with a path: the engine compares a stored value against a constant, not two constants")
 	}
@@ -210,11 +223,16 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		}
 		path = p2
 	}
-	return p.parseLeafTail(agg, path, leafPos)
+	return p.parseLeafTail(ctx, agg, path, leafPos)
 }
 
 // parseLeafTail parses what follows a leaf's left operand.
-func (p *Parser) parseLeafTail(agg AggKind, path *PathExpr, pos int) (*Expr, error) {
+func (p *Parser) parseLeafTail(
+	ctx exprContext,
+	agg AggKind,
+	path *PathExpr,
+	pos int,
+) (*Expr, error) {
 	if p.acceptKeyword(kwIs) {
 		return p.parseIsTail(agg, path, pos)
 	}
@@ -243,7 +261,23 @@ func (p *Parser) parseLeafTail(agg AggKind, path *PathExpr, pos int) (*Expr, err
 		return nil, p.errHere("expected a comparison operator, IS, IN, BETWEEN, or @> after a path; a bare path is not a condition, so a boolean field is tested as `flag = TRUE`")
 	}
 	p.advance()
+	if ctx == ctxJoin && (p.tok.kind == tokQuotedIdent ||
+		p.tok.kind == tokIdent && p.tok.kw == kwNone) {
+		right, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		e := p.exprs.one()
+		*e = Expr{
+			Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
+			Path: path, RightPath: right, Pos: pos,
+		}
+		return e, nil
+	}
 	if p.tok.kind == tokLParen {
+		if ctx == ctxJoin {
+			return nil, p.errHere("subqueries are not supported in ON; materialize the relation before joining")
+		}
 		p.advance()
 		if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
 			sub, err := p.parseSubquery(false)
@@ -464,9 +498,14 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 			shiftSelectPositions(s.With.CTEs[i].Query, delta)
 		}
 	}
+	for i := range s.Windows {
+		s.Windows[i].Pos += delta
+		shiftWindowSpecPositions(&s.Windows[i].Spec, delta)
+	}
 	for i := range s.Columns {
 		s.Columns[i].Pos += delta
 		shiftPathPosition(s.Columns[i].Path, delta)
+		shiftWindowPositions(s.Columns[i].Window, delta)
 	}
 	for i := range s.From {
 		s.From[i].Pos += delta
@@ -478,8 +517,17 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 		}
 		if s.From[i].On != nil {
 			s.From[i].On.Pos += delta
-			shiftPathPosition(s.From[i].On.Left, delta)
-			shiftPathPosition(s.From[i].On.Right, delta)
+			for k := range s.From[i].On.Keys {
+				s.From[i].On.Keys[k].Pos += delta
+			}
+			if s.From[i].On.Expr != nil {
+				shiftExprPositions(s.From[i].On.Expr, delta)
+			} else {
+				for k := range s.From[i].On.Keys {
+					shiftPathPosition(s.From[i].On.Keys[k].Left, delta)
+					shiftPathPosition(s.From[i].On.Keys[k].Right, delta)
+				}
+			}
 		}
 	}
 	shiftExprPositions(s.Where, delta)
@@ -499,6 +547,70 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	}
 }
 
+func shiftWindowPositions(w *WindowExpr, delta int) {
+	if w == nil {
+		return
+	}
+	w.Pos += delta
+	shiftPathPosition(w.Argument, delta)
+	if w.HasOffset {
+		w.Offset.Pos += delta
+	}
+	if w.HasBuckets {
+		w.Buckets.Pos += delta
+	}
+	if w.HasNth {
+		w.Nth.Pos += delta
+	}
+	if w.HasDefault {
+		w.Default.Pos += delta
+	}
+	shiftWindowSpecPositions(&w.Spec, delta)
+}
+
+func shiftWindowSpecPositions(spec *WindowSpec, delta int) {
+	if spec == nil {
+		return
+	}
+	spec.Pos += delta
+	if spec.Name != "" {
+		spec.NamePos += delta
+	}
+	if len(spec.PartitionBy) != 0 {
+		spec.PartitionPos += delta
+	}
+	if len(spec.OrderBy) != 0 {
+		spec.OrderPos += delta
+	}
+	if !spec.PartitionInherited {
+		for _, path := range spec.PartitionBy {
+			shiftPathPosition(path, delta)
+		}
+	}
+	if !spec.OrderInherited {
+		for i := range spec.OrderBy {
+			spec.OrderBy[i].Pos += delta
+			shiftPathPosition(spec.OrderBy[i].Path, delta)
+		}
+	}
+	if spec.Frame.Explicit {
+		spec.Frame.Pos += delta
+		if spec.Frame.ExclusionExplicit {
+			spec.Frame.ExclusionPos += delta
+		}
+		spec.Frame.Start.Pos += delta
+		if spec.Frame.Start.Kind == WindowPreceding ||
+			spec.Frame.Start.Kind == WindowFollowing {
+			spec.Frame.Start.Offset.Pos += delta
+		}
+		spec.Frame.End.Pos += delta
+		if spec.Frame.End.Kind == WindowPreceding ||
+			spec.Frame.End.Kind == WindowFollowing {
+			spec.Frame.End.Offset.Pos += delta
+		}
+	}
+}
+
 func shiftPathPosition(path *PathExpr, delta int) {
 	if path != nil {
 		path.Pos += delta
@@ -511,6 +623,7 @@ func shiftExprPositions(e *Expr, delta int) {
 	}
 	e.Pos += delta
 	shiftPathPosition(e.Path, delta)
+	shiftPathPosition(e.RightPath, delta)
 	e.Value.Pos += delta
 	for i := range e.List {
 		e.List[i].Pos += delta

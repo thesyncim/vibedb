@@ -39,7 +39,7 @@ func TestDerivedTableErrorClassification(t *testing.T) {
 	}
 }
 
-func TestDerivedTableFeatureRefusalsKeepSQLStatePositionAndRecovery(t *testing.T) {
+func TestDerivedTableFeatureBoundariesAndJoinedRecovery(t *testing.T) {
 	c := connect(t)
 	for _, test := range []struct {
 		name      string
@@ -59,13 +59,6 @@ func TestDerivedTableFeatureRefusalsKeepSQLStatePositionAndRecovery(t *testing.T
 				`SELECT id FROM users` +
 				`) AS d`,
 			marker: "LATERAL",
-		},
-		{
-			name: "derived join input",
-			statement: `SELECT d.id FROM users AS u JOIN (` +
-				`SELECT id FROM users` +
-				`) AS d ON u.id = d.id`,
-			marker: "(SELECT",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -92,9 +85,35 @@ func TestDerivedTableFeatureRefusalsKeepSQLStatePositionAndRecovery(t *testing.T
 		t.Fatalf("unsupported Parse emitted ParseComplete: %s", tags(msgs))
 	}
 
-	msgs = c.query(`SELECT id FROM users WHERE id = 1`)
-	if got := commandTagOf(t, msgs); got != "SELECT 1" {
-		t.Fatalf("recovery tag = %q, want SELECT 1", got)
+	statement = `
+		SELECT u.id, d.name
+		FROM users AS u
+		JOIN (
+			SELECT id, name FROM users WHERE tier = 'pro'
+		) AS d ON u.id = d.id
+		ORDER BY u.id`
+	msgs = c.query(statement)
+	if has(msgs, msgErrorResponse) {
+		t.Fatalf("joined-derived recovery: %s",
+			formatError(find(t, msgs, msgErrorResponse).body))
+	}
+	description := decodeRowDescription(t, find(t, msgs, msgRowDescription).body)
+	if len(description) != 2 || description[0].name != "id" ||
+		description[1].name != "d.name" ||
+		description[0].oid != oidJSON || description[1].oid != oidJSON ||
+		description[0].size != -1 || description[1].size != -1 ||
+		description[0].format != formatText || description[1].format != formatText {
+		t.Fatalf("joined-derived RowDescription = %+v, want text JSON [id d.name]", description)
+	}
+	rows := rowsOf(t, msgs)
+	if len(rows) != 3 || len(rows[0]) != 2 || len(rows[1]) != 2 || len(rows[2]) != 2 ||
+		string(rows[0][0]) != "1" || string(rows[0][1]) != `"amy"` ||
+		string(rows[1][0]) != "3" || string(rows[1][1]) != `"cy"` ||
+		string(rows[2][0]) != "6" || rows[2][1] != nil {
+		t.Fatalf("joined-derived rows = %q, want [[1 amy] [3 cy] [6 NULL]]", rows)
+	}
+	if got := commandTagOf(t, msgs); got != "SELECT 3" {
+		t.Fatalf("joined-derived recovery tag = %q, want SELECT 3", got)
 	}
 }
 

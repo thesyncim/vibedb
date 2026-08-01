@@ -29,6 +29,13 @@ type relationSpool struct {
 	data        []byte
 	rows        int
 	plannedData int
+	joinStats   relationSpoolJoinStats
+}
+
+type relationSpoolJoinStats struct {
+	builds    int
+	buildRows uint64
+	pairs     uint64
 }
 
 func (s *relationSpool) reset() {
@@ -42,6 +49,7 @@ func (s *relationSpool) reset() {
 	s.data = s.data[:0]
 	s.rows = 0
 	s.plannedData = 0
+	s.joinStats = relationSpoolJoinStats{}
 }
 
 func (s *relationSpool) release() {

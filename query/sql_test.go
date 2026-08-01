@@ -677,12 +677,6 @@ func TestSQLRejections(t *testing.T) {
 		sql  string
 		want string
 	}{
-		{`SELECT u.name FROM users u JOIN orders o ON o."$key" = u.oid JOIN parts p ON p."$key" = o.pid`,
-			"chained join"},
-		{`SELECT u.name FROM users u JOIN orders o ON o."$key" = u.oid WHERE u.a = 1 OR o.b = 2`,
-			"two collections"},
-		{`SELECT u.name, o.t, p.t FROM users u JOIN orders o ON o.uid = u.id JOIN parts p ON p.uid = u.id`,
-			"only once"},
 		{`SELECT u.name FROM users u JOIN orders u ON u.uid = u.id`,
 			"declared twice"},
 		{`SELECT team, COUNT(*) FROM t GROUP BY team HAVING team IS MISSING`,
@@ -1027,12 +1021,21 @@ func TestSQLLeftJoinNullExtendsUnmatchedRows(t *testing.T) {
 	}
 }
 
-func TestSQLLeftJoinRejectsNullableSideWhere(t *testing.T) {
-	_, err := PrepareStatement(
-		`SELECT d.a, o.b FROM d LEFT JOIN j o ON o.fk = d.k WHERE o.b IS NULL`,
-	)
-	if err == nil || !strings.Contains(err.Error(), "nullable side of a LEFT JOIN") {
-		t.Fatalf("PrepareStatement nullable-side WHERE = %v", err)
+func TestSQLLeftJoinNullableSideWhereRunsAfterExtension(t *testing.T) {
+	db, driving, joined := sqlJoinDatabase(t)
+	src := `SELECT d.a, o.b FROM d LEFT JOIN j o ON o.fk = d.k WHERE o.b IS NULL`
+	stmt, err := PrepareStatement(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := sqlast.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := runStatement(t, stmt, FromDatabase(db.Snapshot(), "d"))
+	want := joinKleeneReference(tree, driving, joined, nil)
+	if got != want {
+		t.Fatalf("nullable-side WHERE:\n got %s\nwant %s", got, want)
 	}
 }
 
@@ -1212,11 +1215,8 @@ func TestSQLJoinAliasDoesNotShadowADrivingField(t *testing.T) {
 	}
 }
 
-// TestSQLJoinWhereRedirectionIsOnlyForTopLevelConjuncts asserts the boundary of
-// the pushdown. A condition reading the joined collection is moved into the
-// join clause's filter only where that is provably the same question — a
-// top-level ANDed term over one collection — and every other placement is
-// refused rather than moved anyway.
+// TestSQLJoinWhereRedirectionIsOnlyForTopLevelConjuncts keeps the legacy-safe
+// pushdown subset while routing mixed expressions through post-spool WHERE.
 func TestSQLJoinWhereRedirectionIsOnlyForTopLevelConjuncts(t *testing.T) {
 	for _, src := range []string{
 		`SELECT d.a, o.b FROM d JOIN j o ON o.fk = d.k WHERE o.b = 10`,
@@ -1233,13 +1233,8 @@ func TestSQLJoinWhereRedirectionIsOnlyForTopLevelConjuncts(t *testing.T) {
 		`SELECT d.a, o.b FROM d JOIN j o ON o.fk = d.k WHERE NOT (d.a = 1 AND o.b = 10)`,
 		`SELECT d.a, o.b FROM d JOIN j o ON o.fk = d.k WHERE NOT (o.b = 10 OR d.a = 1)`,
 	} {
-		_, err := PrepareStatement(src)
-		if err == nil {
-			t.Fatalf("%q lowered; a joined condition outside a top-level AND is not the "+
-				"join clause's own filter", src)
-		}
-		if !strings.Contains(err.Error(), "two collections") {
-			t.Fatalf("%q = %v, want a message naming the mixed condition", src, err)
+		if _, err := PrepareStatement(src); err != nil {
+			t.Fatalf("%q must lower through generalized post-join WHERE: %v", src, err)
 		}
 	}
 }

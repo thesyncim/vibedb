@@ -1,6 +1,9 @@
 package query
 
 import (
+	"fmt"
+	"strings"
+
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
@@ -70,7 +73,42 @@ type explainPlan struct {
 	SingleRow     bool              `json:"single_row,omitempty"`
 	Joins         []explainJoin     `json:"joins,omitempty"`
 	CTEs          []explainCTE      `json:"ctes,omitempty"`
+	Windows       []explainWindow   `json:"windows,omitempty"`
 	Analyze       *explainAnalyze   `json:"analyze,omitempty"`
+}
+
+type explainWindow struct {
+	Algorithm   string                  `json:"algorithm"`
+	PartitionBy []string                `json:"partition_by,omitempty"`
+	OrderBy     []explainWindowOrder    `json:"order_by,omitempty"`
+	Functions   []explainWindowFunction `json:"functions"`
+	SortReused  bool                    `json:"sort_reused"`
+	Rows        *uint64                 `json:"rows,omitempty"`
+}
+
+type explainWindowOrder struct {
+	Path      string `json:"path"`
+	Direction string `json:"direction"`
+	Nulls     string `json:"nulls"`
+}
+
+type explainWindowFunction struct {
+	Name     string              `json:"name"`
+	Window   string              `json:"window,omitempty"`
+	Argument string              `json:"argument,omitempty"`
+	Offset   *int                `json:"offset,omitempty"`
+	Buckets  *int                `json:"buckets,omitempty"`
+	Nth      *int                `json:"nth,omitempty"`
+	Default  bool                `json:"default"`
+	Frame    *explainWindowFrame `json:"frame,omitempty"`
+}
+
+type explainWindowFrame struct {
+	Mode      string `json:"mode"`
+	Unit      string `json:"unit"`
+	Start     string `json:"start"`
+	End       string `json:"end"`
+	Exclusion string `json:"exclusion"`
 }
 
 type explainCTE struct {
@@ -82,11 +120,25 @@ type explainCTE struct {
 }
 
 type explainJoin struct {
-	Collection string `json:"collection"`
-	Type       string `json:"type"`
-	AccessPath string `json:"access_path"`
-	OuterPath  string `json:"outer_path"`
-	InnerPath  string `json:"inner_path"`
+	Collection      string           `json:"collection"`
+	Type            string           `json:"type"`
+	AccessPath      string           `json:"access_path"`
+	OuterPath       string           `json:"outer_path,omitempty"`
+	InnerPath       string           `json:"inner_path,omitempty"`
+	Algorithm       string           `json:"algorithm,omitempty"`
+	ActualAlgorithm string           `json:"actual_algorithm,omitempty"`
+	BuildSide       string           `json:"build_side,omitempty"`
+	Keys            []explainJoinKey `json:"keys,omitempty"`
+	KeyCount        int              `json:"key_count"`
+	Using           []string         `json:"using,omitempty"`
+	Residual        bool             `json:"residual"`
+	Cross           bool             `json:"cross"`
+	Pairs           *uint64          `json:"pairs,omitempty"`
+}
+
+type explainJoinKey struct {
+	Left  string `json:"left"`
+	Right string `json:"right"`
 }
 
 type explainPredicate struct {
@@ -99,6 +151,13 @@ type explainPredicate struct {
 
 func (p *plan) explainJSON(collection string, outputCount int, options ExplainOptions) (string, error) {
 	return p.explainJSONAnalysis(collection, outputCount, options, nil, nil)
+}
+
+type explainStatementContext struct {
+	ctes          []explainCTE
+	relationJoins []explainJoin
+	windows       []explainWindow
+	windowInput   *plan
 }
 
 type explainAnalyze struct {
@@ -178,34 +237,50 @@ func (p *plan) explainJSONAnalysis(
 	outputCount int,
 	options ExplainOptions,
 	analysis *ExplainAnalysis,
-	ctes []explainCTE,
+	context *explainStatementContext,
 ) (string, error) {
+	sourcePlan := p
+	node := "scan"
+	var ctes []explainCTE
+	var relationJoins []explainJoin
+	var windows []explainWindow
+	if context != nil {
+		ctes = context.ctes
+		relationJoins = context.relationJoins
+		windows = context.windows
+		if context.windowInput != nil {
+			sourcePlan = context.windowInput
+			node = "window"
+		}
+	}
 	plan := explainPlan{
-		Node:          "scan",
+		Node:          node,
 		Collection:    collection,
-		AccessPath:    explainAccessPath(p.where, p.valuePaths, len(p.joins), options),
+		AccessPath:    explainAccessPath(sourcePlan.where, sourcePlan.valuePaths, len(sourcePlan.joins), options),
 		Scope:         "logical",
-		FilterColumns: explainColumns(p.valuePaths, p.filterCols),
-		LateColumns:   explainColumns(p.valuePaths, p.lateCols),
-		Aggregate:     p.hasAggregate,
-		SingleRow:     p.singleRow,
+		FilterColumns: explainColumns(sourcePlan.valuePaths, sourcePlan.filterCols),
+		LateColumns:   explainColumns(sourcePlan.valuePaths, sourcePlan.lateCols),
+		Aggregate:     sourcePlan.hasAggregate,
+		SingleRow:     sourcePlan.singleRow,
 		CTEs:          ctes,
+		Joins:         relationJoins,
+		Windows:       windows,
 		Analyze:       newExplainAnalyze(analysis),
 	}
 	if outputCount < 0 || outputCount > len(p.headers) {
 		outputCount = len(p.headers)
 	}
 	plan.Output = append([]string(nil), p.headers[:outputCount]...)
-	if p.where != nil {
-		plan.Where = explainPredicateSummary(p.where)
-		plan.Predicate = explainPredicateTree(p.where, p.valuePaths)
+	if sourcePlan.where != nil {
+		plan.Where = explainPredicateSummary(sourcePlan.where)
+		plan.Predicate = explainPredicateTree(sourcePlan.where, sourcePlan.valuePaths)
 	}
 	if options.IndexCatalogKnown {
 		plan.Scope = "source-aware"
 	}
-	for _, col := range p.groupCols {
-		if col >= 0 && col < len(p.valuePaths) {
-			plan.GroupBy = append(plan.GroupBy, p.valuePaths[col].spec)
+	for _, col := range sourcePlan.groupCols {
+		if col >= 0 && col < len(sourcePlan.valuePaths) {
+			plan.GroupBy = append(plan.GroupBy, sourcePlan.valuePaths[col].spec)
 		}
 	}
 	for _, order := range p.order {
@@ -222,7 +297,7 @@ func (p *plan) explainJSONAnalysis(
 	if p.hasLimit {
 		plan.Limit = &p.limit
 	}
-	for _, join := range p.joins {
+	for _, join := range sourcePlan.joins {
 		inner := "PRIMARY KEY"
 		if join.inner != nil && join.innerPath >= 0 &&
 			join.innerPath < len(join.inner.valuePaths) {
@@ -240,8 +315,11 @@ func (p *plan) explainJSONAnalysis(
 			Collection: join.collection,
 			Type:       joinType,
 			AccessPath: access,
-			OuterPath:  p.valuePaths[join.outerPath].spec,
+			OuterPath:  sourcePlan.valuePaths[join.outerPath].spec,
 			InnerPath:  inner,
+			Algorithm:  access,
+			BuildSide:  "right",
+			KeyCount:   1,
 		})
 	}
 	encoded, err := vibejson.Marshal(&explainDocument{Version: 1, Plan: plan})
@@ -323,9 +401,163 @@ func (s *Statement) explainJSON(
 			return "", err
 		}
 	}
+	context := explainStatementContext{
+		ctes:          s.explainCTEs(),
+		relationJoins: s.explainRelationJoins(analysis != nil),
+	}
+	if window := s.window(); window != nil {
+		inputPlan, err := window.input.explainSourcePlan()
+		if err != nil {
+			return "", err
+		}
+		context.windowInput = inputPlan
+		context.windows = window.explain(analysis != nil)
+		context.ctes = window.input.explainCTEs()
+		context.relationJoins = window.input.explainRelationJoins(analysis != nil)
+	}
 	return p.explainJSONAnalysis(
-		s.Collection(), s.outputs, options, analysis, s.explainCTEs(),
+		s.Collection(), s.outputs, options, analysis, &context,
 	)
+}
+
+func (s *Statement) explainSourcePlan() (*plan, error) {
+	if s == nil {
+		return nil, queryExplainError("query: cannot explain a nil Statement")
+	}
+	if s.canFuseCTE() {
+		return s.cteReference().def.stmt.explainSourcePlan()
+	}
+	return s.q.compiled()
+}
+
+func (w *statementWindow) explain(analyze bool) []explainWindow {
+	if w == nil {
+		return nil
+	}
+	stages := make([]explainWindow, 0, len(w.stages))
+	for i := range w.stages {
+		stage := &w.stages[i]
+		explained := explainWindow{
+			Algorithm:  "stable-merge-sort",
+			SortReused: len(stage.exprs) > 1,
+			Functions:  make([]explainWindowFunction, 0, len(stage.exprs)),
+		}
+		for _, path := range stage.spec.PartitionBy {
+			explained.PartitionBy = append(explained.PartitionBy, w.input.spec(path))
+		}
+		for at := range stage.spec.OrderBy {
+			term := &stage.spec.OrderBy[at]
+			order := explainWindowOrder{
+				Path: w.input.spec(term.Path), Direction: "asc", Nulls: "last",
+			}
+			if term.Desc {
+				order.Direction = "desc"
+				order.Nulls = "first"
+			}
+			if term.Nulls == sqlast.WindowNullsFirst {
+				order.Nulls = "first"
+			} else if term.Nulls == sqlast.WindowNullsLast {
+				order.Nulls = "last"
+			}
+			explained.OrderBy = append(explained.OrderBy, order)
+		}
+		for at, expr := range stage.exprs {
+			physical := &stage.plan.functions[at]
+			function := explainWindowFunction{
+				Name: strings.ToLower(expr.Kind.String()), Window: expr.Spec.Name,
+			}
+			if expr.Argument != nil {
+				function.Argument = w.input.spec(expr.Argument)
+			}
+			switch expr.Kind {
+			case sqlast.WindowLag, sqlast.WindowLead:
+				offset := physical.offset
+				function.Offset = &offset
+				function.Default = physical.hasDefault
+			case sqlast.WindowNTile:
+				buckets := physical.buckets
+				function.Buckets = &buckets
+			case sqlast.WindowNthValue:
+				nth := physical.nth
+				function.Nth = &nth
+			}
+			if sqlWindowFunctionUsesFrame(expr.Kind) {
+				mode := "explicit"
+				if !expr.Spec.Frame.Explicit {
+					mode = "default-full-partition"
+					if len(expr.Spec.OrderBy) != 0 {
+						mode = "default-peer-prefix"
+					}
+				}
+				function.Frame = &explainWindowFrame{
+					Mode: mode, Unit: explainWindowFrameUnit(physical.frame.unit),
+					Start: explainWindowFrameBound(physical.frame.start),
+					End:   explainWindowFrameBound(physical.frame.end),
+					Exclusion: explainWindowFrameExclusion(
+						physical.frame.exclusion,
+					),
+				}
+			}
+			explained.Functions = append(explained.Functions, function)
+		}
+		if analyze {
+			rows := w.lastRows
+			explained.Rows = &rows
+		}
+		stages = append(stages, explained)
+	}
+	return stages
+}
+
+func explainWindowFrameUnit(unit windowFrameUnit) string {
+	switch unit {
+	case windowFrameRows:
+		return "rows"
+	case windowFrameGroups:
+		return "groups"
+	case windowFrameRange:
+		return "range"
+	default:
+		return "unknown"
+	}
+}
+
+func explainWindowFrameBound(bound windowFrameBound) string {
+	switch bound.kind {
+	case windowUnboundedPreceding:
+		return "unbounded preceding"
+	case windowPreceding:
+		if bound.rangeOffset.kind == kindNumber {
+			return byteview.String(bound.rangeOffset.num) + " preceding"
+		}
+		return fmt.Sprintf("%d preceding", bound.offset)
+	case windowCurrentRow:
+		return "current row"
+	case windowFollowing:
+		if bound.rangeOffset.kind == kindNumber {
+			return byteview.String(bound.rangeOffset.num) + " following"
+		}
+		return fmt.Sprintf("%d following", bound.offset)
+	case windowUnboundedFollowing:
+		return "unbounded following"
+	default:
+		return "unknown"
+	}
+}
+
+func explainWindowFrameExclusion(exclusion windowFrameExclusion) string {
+	switch exclusion {
+	case windowExcludeNoOthers:
+		return "no others"
+	case windowExcludeCurrentRow:
+		return "current row"
+	case windowExcludeGroup:
+		return "group"
+	case windowExcludeTies:
+		return "ties"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Statement) bindFusedExplain(args []any) error {

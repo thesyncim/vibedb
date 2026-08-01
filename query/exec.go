@@ -399,7 +399,13 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 			return err
 		}
 		e.Stats = ExecStats{}
-		return p.runRelationInto(&e.Result, spool, &e.Workspace)
+		err := p.runRelationInto(&e.Result, spool, &e.Workspace)
+		if err == nil {
+			e.Stats.JoinBuilds += spool.joinStats.builds
+			e.Stats.JoinBuildRows += spool.joinStats.buildRows
+			e.Stats.JoinPairs += spool.joinStats.pairs
+		}
+		return err
 	case sourceHeapSnapshot:
 		if err := rejectJoins(p, "FromSnapshot"); err != nil {
 			return err

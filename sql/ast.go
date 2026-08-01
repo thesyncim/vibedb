@@ -54,6 +54,12 @@ type SelectStmt struct {
 	// dropping a filter returns wrong rows.
 	Having *Expr
 
+	// Windows holds the named window definitions declared by this SELECT's
+	// WINDOW clause. Definitions are ordered: a definition may inherit only
+	// from an earlier entry. Window expressions carry their fully resolved
+	// effective specification, so lowerers do not perform a name lookup.
+	Windows []NamedWindow
+
 	// OrderBy holds the sort keys, in priority order.
 	OrderBy []OrderTerm
 
@@ -127,10 +133,12 @@ const (
 	JoinInner
 	// JoinLeft is a left outer equi-join.
 	JoinLeft
-	// JoinRight is a right outer equi-join. The parser normalizes it to a
-	// JoinLeft before the AST is returned, so lowerers only need to execute one
-	// outer-join orientation.
+	// JoinRight is a right outer join: the newly joined relation is preserved.
 	JoinRight
+	// JoinFull preserves unmatched rows from both inputs.
+	JoinFull
+	// JoinCross forms the unrestricted product and carries no ON condition.
+	JoinCross
 )
 
 // A RelationKind identifies the row source behind a range variable.
@@ -215,22 +223,39 @@ type TableRef struct {
 	Pos int
 }
 
-// A JoinCond is an equi-join's single key equality.
-//
-// It is not an [Expr] because the engine joins on one key equality and nothing
-// else. Giving the condition its own type is what makes that a compile-time
-// fact for the lowering pass instead of a runtime shape check over a general
-// predicate tree that could have held a disjunction.
-type JoinCond struct {
-	// Left names a key of an earlier range variable, Right of the joined one.
+// A JoinKeyCond is one path equality extracted from a JOIN condition. Left is
+// in the accumulated input and Right is in the newly joined relation.
+type JoinKeyCond struct {
 	Left  *PathExpr
 	Right *PathExpr
+	Pos   int
+}
+
+// A JoinCond is a JOIN condition and its planner-ready equi-key extraction.
+type JoinCond struct {
+	// Left and Right mirror Keys[0] for compatibility with consumers of the
+	// original single-key AST. They are nil when ON has no extractable key.
+	Left  *PathExpr
+	Right *PathExpr
+	// Keys contains every top-level ANDed equality between the newly joined
+	// relation and any earlier range variable. Empty Keys selects the bounded
+	// nested-loop path.
+	Keys []JoinKeyCond
+	// Expr is the complete ON predicate. Keys may narrow candidate formation,
+	// but Expr remains authoritative and is evaluated before null extension.
+	// It is nil for USING and CROSS JOIN.
+	Expr *Expr
 	// Using records that the equality came from JOIN ... USING rather than ON.
 	// The distinction is semantic: USING contributes one unqualified output
 	// column whose value is the coalescing of the two keys, while an equivalent
 	// ON equality leaves an unqualified name ambiguous.
 	Using bool
-	Pos   int
+	// UsingColumns preserves a composite USING list in source order.
+	UsingColumns []string
+	// Residual reports whether Expr contains a term beyond the extracted
+	// top-level equi keys. It is stable planner and EXPLAIN metadata.
+	Residual bool
+	Pos      int
 }
 
 // An AggKind names a result column's reduction. The constants are in the same
@@ -272,6 +297,11 @@ type ResultColumn struct {
 	// which reads no path at all. A Path with no segments is the whole
 	// document — what '*' and 'alias.*' parse to.
 	Path *PathExpr
+	// Window is the analytic expression projected by this column, or nil for
+	// an ordinary path or grouped aggregate. Window arguments and sort keys
+	// retain their own paths; Path is nil for every window expression so a
+	// consumer cannot accidentally lower it as a pre-window projection.
+	Window *WindowExpr
 	// Alias is the explicit AS name, or "" when the statement gave none. It is
 	// the output header when set; how an unaliased column is headed is a
 	// lowering decision, since the header spelling belongs to the result
@@ -281,11 +311,206 @@ type ResultColumn struct {
 	Pos int
 }
 
+// WindowFunctionKind names a supported SQL window function.
+type WindowFunctionKind uint8
+
+const (
+	WindowRowNumber WindowFunctionKind = iota
+	WindowRank
+	WindowDenseRank
+	WindowLag
+	WindowLead
+	WindowCount
+	WindowSum
+	WindowAvg
+	WindowMin
+	WindowMax
+	WindowNTile
+	WindowPercentRank
+	WindowCumeDist
+	WindowFirstValue
+	WindowLastValue
+	WindowNthValue
+)
+
+// String answers the canonical SQL spelling of k.
+func (k WindowFunctionKind) String() string {
+	switch k {
+	case WindowRowNumber:
+		return "ROW_NUMBER"
+	case WindowRank:
+		return "RANK"
+	case WindowDenseRank:
+		return "DENSE_RANK"
+	case WindowLag:
+		return "LAG"
+	case WindowLead:
+		return "LEAD"
+	case WindowCount:
+		return "COUNT"
+	case WindowSum:
+		return "SUM"
+	case WindowAvg:
+		return "AVG"
+	case WindowMin:
+		return "MIN"
+	case WindowMax:
+		return "MAX"
+	case WindowNTile:
+		return "NTILE"
+	case WindowPercentRank:
+		return "PERCENT_RANK"
+	case WindowCumeDist:
+		return "CUME_DIST"
+	case WindowFirstValue:
+		return "FIRST_VALUE"
+	case WindowLastValue:
+		return "LAST_VALUE"
+	case WindowNthValue:
+		return "NTH_VALUE"
+	default:
+		return ""
+	}
+}
+
+// WindowNullOrder records an explicit NULLS modifier. Default preserves the
+// fact that the statement omitted one; lowering applies SQL's direction-based
+// default without pretending it was written.
+type WindowNullOrder uint8
+
+const (
+	WindowNullsDefault WindowNullOrder = iota
+	WindowNullsFirst
+	WindowNullsLast
+)
+
+// WindowOrderTerm is one ORDER BY key inside OVER (...).
+type WindowOrderTerm struct {
+	Path  *PathExpr
+	Desc  bool
+	Nulls WindowNullOrder
+	Pos   int
+}
+
+// WindowFrameBoundKind names one endpoint of an explicit ROWS, GROUPS, or
+// RANGE frame. The order is semantic and is also used to reject a start that
+// follows its end.
+type WindowFrameBoundKind uint8
+
+const (
+	WindowUnboundedPreceding WindowFrameBoundKind = iota
+	WindowPreceding
+	WindowCurrentRow
+	WindowFollowing
+	WindowUnboundedFollowing
+)
+
+// WindowFrameBound is one frame endpoint. Offset is meaningful only for
+// PRECEDING/FOLLOWING. ROWS and GROUPS require a non-negative integer;
+// RANGE retains an exact non-negative numeric spelling or placeholder.
+type WindowFrameBound struct {
+	Kind   WindowFrameBoundKind
+	Offset Operand
+	Pos    int
+}
+
+// WindowFrame is the explicit frame attached to an OVER clause. Explicit is
+// false when no frame was written. ExclusionExplicit distinguishes an authored
+// EXCLUDE NO OTHERS from the identical default behavior.
+type WindowFrame struct {
+	Unit              WindowFrameUnit
+	Start             WindowFrameBound
+	End               WindowFrameBound
+	Exclusion         WindowFrameExclusion
+	Pos               int
+	ExclusionPos      int
+	Explicit          bool
+	ExclusionExplicit bool
+}
+
+// WindowFrameUnit selects physical-row, peer-group, or exact order-value
+// offsets.
+type WindowFrameUnit uint8
+
+const (
+	WindowFrameRows WindowFrameUnit = iota
+	WindowFrameGroups
+	WindowFrameRange
+)
+
+// WindowFrameExclusion selects rows removed after frame boundary resolution.
+type WindowFrameExclusion uint8
+
+const (
+	WindowExcludeNoOthers WindowFrameExclusion = iota
+	WindowExcludeCurrentRow
+	WindowExcludeGroup
+	WindowExcludeTies
+)
+
+// WindowSpec is one resolved OVER specification. Name is the named definition
+// copied by this specification, if any. PartitionInherited, OrderInherited,
+// and FrameInherited record which effective values alias a definition's
+// parser-owned operands; they prevent nested-statement position rebasing and
+// placeholder accounting from visiting shared operands twice.
+type WindowSpec struct {
+	Name         string
+	NamePos      int
+	PartitionBy  []*PathExpr
+	PartitionPos int
+	OrderBy      []WindowOrderTerm
+	OrderPos     int
+	Frame        WindowFrame
+	Pos          int
+
+	PartitionInherited bool
+	OrderInherited     bool
+	FrameInherited     bool
+}
+
+// NamedWindow is one WINDOW-clause definition. Spec is fully resolved against
+// an earlier definition while retaining Spec.Name for AST diagnostics/dumps.
+type NamedWindow struct {
+	Name string
+	Spec WindowSpec
+	Pos  int
+}
+
+// WindowExpr is one SELECT-list window expression.
+type WindowExpr struct {
+	Kind WindowFunctionKind
+	// Argument is nil for ranking functions and COUNT(*).
+	Argument *PathExpr
+	// Offset is used by LAG/LEAD and defaults to one when HasOffset is false.
+	Offset    Operand
+	HasOffset bool
+	// Buckets is NTILE's required positive bucket count.
+	Buckets    Operand
+	HasBuckets bool
+	// Nth is NTH_VALUE's required positive one-based position.
+	Nth    Operand
+	HasNth bool
+	// Default is used by LAG/LEAD. DefaultNull distinguishes an explicitly
+	// written NULL from an absent third argument.
+	Default     Operand
+	HasDefault  bool
+	DefaultNull bool
+	Spec        WindowSpec
+	// DirectName is true for OVER name. False with Spec.Name set represents
+	// OVER (name ...), whose SQL inheritance restrictions are stricter.
+	DirectName bool
+	Pos        int
+}
+
 // An OrderTerm is one ORDER BY key.
 type OrderTerm struct {
 	// Path is the sort key. An ORDER BY that named a SELECT alias has already
 	// been resolved to the path that alias projects.
 	Path *PathExpr
+	// Output is the one-based SELECT-list ordinal when ORDER BY names the alias
+	// of a window expression. Zero means Path is authoritative. A one-based
+	// encoding keeps the zero value compatible with every existing AST literal.
+	Output int
 	// Desc sorts descending.
 	Desc bool
 	Pos  int
@@ -301,6 +526,11 @@ type OrderTerm struct {
 type PathExpr struct {
 	// Source is an index into [SelectStmt.From].
 	Source int
+	// MergedUsing is the one-based From index of the USING clause whose merged
+	// output this unqualified path names. Zero means an ordinary source path.
+	// FULL JOIN needs this identity because COALESCE(left,right) cannot be
+	// represented by either qualified input path alone.
+	MergedUsing int
 	// Segments walks into the document from its root.
 	Segments []Segment
 	// Pos is the byte offset of the path's first token.
@@ -356,6 +586,10 @@ const (
 	ExprNot
 	// ExprExists is EXISTS (SELECT ...). Subquery holds the nested statement.
 	ExprExists
+	// ExprConstant is a boolean literal used as an ON predicate. WHERE keeps
+	// requiring a path-led condition, while JOIN accepts ON TRUE/FALSE to
+	// express unrestricted or empty matches with outer semantics.
+	ExprConstant
 )
 
 // A CmpOp is a comparison operator. The constants are in the same order as
@@ -415,9 +649,13 @@ type Expr struct {
 	// executable in principle: every leaf names a value the reduction already
 	// produces, so lowering needs no second aggregation pass.
 	Column int
-	// Path is the left operand of every leaf kind, and nil for the boolean
-	// kinds. It is nil for a COUNT(*) HAVING leaf, matching ResultColumn.
+	// Path is the left operand of every path-led leaf kind, and nil for boolean
+	// nodes and ExprConstant. It is nil for a COUNT(*) HAVING leaf, matching
+	// ResultColumn.
 	Path *PathExpr
+	// RightPath is the right operand of a JOIN comparison between two paths.
+	// WHERE and HAVING leaves keep it nil and use Value or Subquery.
+	RightPath *PathExpr
 	// Value is the right operand of ExprCompare and ExprContains.
 	Value Operand
 	// Insensitive selects ILIKE rather than LIKE for ExprLike.

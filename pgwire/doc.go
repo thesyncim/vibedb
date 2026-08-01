@@ -41,8 +41,9 @@
 // LEFT JOIN, filters with a subquery, casts with ::regclass, calls scalar
 // functions like pg_table_is_visible and format_type, and tests membership
 // with ANY over an array—every one of which this dialect refuses on purpose,
-// because the executor has no operator for any of them. The same is true of
-// JDBC's DatabaseMetaData, of every ORM's schema reflection, and of every BI
+// because the dialect has no PostgreSQL catalog, namespace, cast, array, or
+// scalar-function implementation for them. The same is true of JDBC's
+// DatabaseMetaData, of every ORM's schema reflection, and of every BI
 // tool's table browser, and those still fail here.
 //
 // psql's own basic meta-commands are the one bounded exception. The pinned
@@ -64,10 +65,10 @@
 // rejects them at "pg_catalog.pg_class", because a schema-qualified relation
 // name is indistinguishable from this dialect's dotted path syntax and is
 // refused rather than guessed at. Supporting arbitrary catalog SQL would mean
-// building a subquery-capable, outer-join-capable SQL engine with a schema
-// namespace, to answer questions about a catalog that does not exist. That is
-// a much larger project than this one and a different one; the recognition
-// table answers the questions without building the engine.
+// building a PostgreSQL-compatible catalog, schema namespace, type system, and
+// function library to answer questions about metadata that does not exist.
+// That is a much larger project than this one and a different one; the
+// recognition table answers the questions without building the engine.
 //
 // # What works
 //
@@ -92,12 +93,13 @@
 //     Bind; command.go explains why the rewrite lives here and not in the
 //     parser. Byte offsets are preserved by the rewrite, so an error's position
 //     still points into the statement the client sent.
-//   - CREATE TABLE, CREATE INDEX, INSERT, UPDATE,
-//     DELETE, SELECT, non-recursive SELECT-valued CTEs, one declared-field
-//     inner JOIN, schema validation, exact indexes, whole-document parameters,
-//     and affected-row command tags. CTEs work through simple Query and the
-//     Parse/Bind/Execute path; duplicate output names remain duplicate
-//     RowDescription fields.
+//   - CREATE TABLE, CREATE INDEX, INSERT, UPDATE, DELETE, and SELECT, including
+//     non-recursive SELECT-valued CTEs and chained INNER, LEFT, RIGHT, FULL, and
+//     CROSS JOINs over physical, derived, and CTE operands. Composite USING and
+//     equi-keys, residual ON predicates, schema validation, exact indexes,
+//     whole-document parameters, and affected-row command tags use both simple
+//     Query and Parse/Bind/Execute. Explicitly duplicated output aliases remain
+//     duplicate RowDescription fields.
 //   - The pinned PostgreSQL 18.4 psql client's basic introspection meta-commands
 //     — \l, \dn, \dt, \di, \d, and \d <name> — answered from the SQL catalog
 //     by the post-parse-failure recognition shim in catalog_shim.go. The name
@@ -134,10 +136,9 @@
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
 //   - The SQL constructs the dialect itself refuses — correlated subqueries,
-//     recursive or data-modifying CTEs, derived relations or CTEs in JOIN
-//     positions, LATERAL, full/cross/natural joins, CASE, CAST, arithmetic, set
-//     operations, window functions, and scalar functions. Sole-source
-//     non-recursive CTEs and uncorrelated derived tables, RIGHT JOIN,
+//     recursive or data-modifying CTEs, LATERAL and NATURAL joins, CASE, CAST,
+//     arithmetic, set operations, window functions, and scalar functions.
+//     Non-recursive CTEs, uncorrelated derived tables, generalized joins,
 //     uncorrelated predicate subqueries, LIKE/ILIKE, and non-aggregate SELECT
 //     DISTINCT are supported. Each refusal carries a message naming the missing
 //     capability and a position;

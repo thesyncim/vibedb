@@ -1,0 +1,113 @@
+package query
+
+import "testing"
+
+func FuzzWindowKernelAgainstReference(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{8, 1, 0, 2, 3, 4, 5, 6, 7, 8, 9})
+	f.Add([]byte{16, 3, 2, 1, 0, 255, 127, 64, 32, 16, 8, 4, 2, 1})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		at := 0
+		next := func() byte {
+			if at == len(data) {
+				return 0
+			}
+			value := data[at]
+			at++
+			return value
+		}
+		rows := int(next() % 17)
+		partitions := [...]string{`0`, `1`, `2`, `null`}
+		orders := [...]string{
+			setTestMissing, `null`, `-2`, `-1`, `0`, `1`, `1.0`, `2`,
+		}
+		values := [...]string{setTestMissing, `null`, `-9`, `-3`, `-1`, `0`, `2`, `4`, `8`}
+		filters := [...]string{setTestMissing, `null`, `false`, `true`}
+		decoded := make([][]string, rows)
+		for row := range decoded {
+			decoded[row] = []string{
+				partitions[int(next())%len(partitions)],
+				orders[int(next())%len(orders)],
+				values[int(next())%len(values)],
+				filters[int(next())%len(filters)],
+			}
+		}
+		input := buildSetTestSpoolColumns(t, decoded, 4)
+		frameSpec := windowRowsFrame{
+			unit:      windowFrameUnit(next() % 3),
+			exclusion: windowFrameExclusion(next() % 4),
+		}
+		if frameSpec.unit == windowFrameRange {
+			switch next() % 3 {
+			case 0:
+				frameSpec.start.kind = windowUnboundedPreceding
+				frameSpec.end.kind = windowCurrentRow
+			case 1:
+				frameSpec.start.kind = windowCurrentRow
+				frameSpec.end.kind = windowCurrentRow
+			default:
+				offsets := [...]string{`0`, `0.5`, `1`, `2`, `1e-34`}
+				frameSpec.start = windowFrameBound{
+					kind:        windowPreceding,
+					rangeOffset: windowTestScalar(t, offsets[int(next())%len(offsets)]),
+				}
+				frameSpec.end = windowFrameBound{
+					kind:        windowFollowing,
+					rangeOffset: windowTestScalar(t, offsets[int(next())%len(offsets)]),
+				}
+			}
+		} else {
+			frameSpec.start = windowFrameBound{kind: windowPreceding, offset: int(next() % 5)}
+			frameSpec.end = windowFrameBound{kind: windowFollowing, offset: int(next() % 5)}
+		}
+		plan := windowPlan{
+			partition: []int{0},
+			order: []windowOrderKey{{
+				column: 1, descending: next()&1 != 0,
+				nulls: windowNullOrder(next() & 1),
+			}},
+			functions: []windowFunctionSpec{
+				{kind: windowRowNumber, column: -1},
+				{kind: windowRank, column: -1},
+				{kind: windowDenseRank, column: -1},
+				{kind: windowNTile, column: -1, buckets: 1 + int(next()%8)},
+				{kind: windowPercentRank, column: -1},
+				{kind: windowCumeDist, column: -1},
+				{kind: windowLag, column: 2, offset: int(next() % 5),
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowLead, column: 2, offset: int(next() % 5),
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowCount, column: -1, frame: frameSpec},
+				{kind: windowCount, column: 2, frame: frameSpec},
+				{kind: windowSum, column: 2, frame: frameSpec},
+				{kind: windowCount, column: 2, frame: frameSpec, distinct: true,
+					hasFilter: true, filterColumn: 3},
+				{kind: windowSum, column: 2, frame: frameSpec, distinct: true,
+					hasFilter: true, filterColumn: 3},
+				{kind: windowMin, column: 2, frame: frameSpec},
+				{kind: windowMax, column: 2, frame: frameSpec},
+				{kind: windowFirstValue, column: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowLastValue, column: 2, frame: frameSpec,
+					nullTreatment: windowNullTreatment(next() & 1)},
+				{kind: windowNthValue, column: 2, nth: 1 + int(next()%5), frame: frameSpec,
+					nullTreatment: windowNullTreatment(next() & 1), fromLast: next()&1 != 0},
+			},
+		}
+		var executor windowExecutor
+		var frame statementFrame
+		if err := frame.begin(ExecOptions{IntermediateBytes: -1}); err != nil {
+			t.Fatal(err)
+		}
+		charge, err := executor.execute(&input, &plan, &frame, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame.intermediate.release(charge)
+		want := referenceWindowIntegerRows(t, &input, &plan)
+		if got := setTestRows(&executor.result); !equalSetTestRows(got, want) {
+			t.Fatalf("rows=%v\ngot=%v\nwant=%v", decoded, got, want)
+		}
+	})
+}

@@ -106,30 +106,39 @@
 // otherwise rounds once, ties to even. Exact reduction workspace is bounded
 // and returns query.ErrAggregateBudget rather than falling back to float64.
 //
-// INNER JOIN and LEFT JOIN compare declared JSON fields. A left join preserves
-// each driving row and returns NULL for joined fields when no partner exists.
-// The driver captures all
-// participating durable collections in one coherent leased snapshot. A join
-// that emits matching pairs is admitted against the current fixed,
-// conservative 64 MiB working-set bound and materialized into the heap fan-out
-// executor. The durable leases then close and the owning heap copy produces the
-// results from that exact cut. An oversized input returns
-// ErrJoinMaterializationTooLarge before execution. The current plan accepts one
-// declared-field fan-out JOIN directly against the FROM table. SQL exposes no
-// physical-key pseudo-column: "$key" is an ordinary quoted JSON field, and a
-// relationship based on identity names the declared primary-key field.
+// INNER, LEFT, RIGHT, FULL, and CROSS JOIN compose into chains whose operands
+// may be durable collections, uncorrelated derived tables, or non-recursive
+// CTEs. ON accepts composite equi-keys plus residual predicates; USING accepts
+// one or more columns. Equi-key stages use the reusable composite-hash kernel,
+// while keyless and cross stages use the exact bounded nested-loop kernel.
+// Outer joins preserve the required side or sides and SQL-null-extend every
+// missing partner. SQL exposes no physical-key pseudo-column: "$key" is an
+// ordinary quoted JSON field, and a relationship based on identity names the
+// declared primary-key field.
 //
-// WHERE predicates over the nullable joined side are rejected until the shared
-// engine has a post-join predicate phase; pushing them into the joined scan
-// would change LEFT JOIN semantics. Predicates over the preserved side remain
-// supported.
+// The driver captures all participating durable collections in one coherent
+// leased snapshot. Generalized joins receive that catalog cut directly, so a
+// physical operand retains its durable scan and eligible exact-index path.
+// Transactions execute against the BEGIN cut plus the transaction overlay.
+// The legacy single-clause physical INNER/LEFT equi-join subset keeps its
+// established bounded heap path and storage-aware strategy; classification
+// happens once at preparation and ordinary point queries never initialize
+// relation-join state.
+//
+// Operand spools and joined relations share ExecOptions.IntermediateBytes;
+// hash-build and fan-out pair work use ExecOptions.JoinPairBytes. Exhaustion,
+// cancellation, or binding failure returns no partial Cursor, and a prepared
+// statement remains reusable. Warm QueryInto execution reuses generalized-join
+// storage. Unaliased source-zero paths keep their path header and joined paths
+// stay range-variable-qualified; explicit aliases override both, including
+// intentional duplicate output names.
 //
 // # Transactions
 //
 // BEGIN captures every cataloged table at one generation cut. Reads use that
 // cut overlaid with the transaction's own staged changes, providing snapshot
 // isolation, repeatable reads, phantom exclusion, and read-your-writes. Joins
-// materialize the same BEGIN cut plus overlay under the ordinary join bound.
+// execute the same BEGIN cut plus overlay under the relation and pair bounds.
 //
 // A transaction may read several tables and write exactly one. COMMIT applies
 // first-committer-wins through a bounded per-key publication clock: any write

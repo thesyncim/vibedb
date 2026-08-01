@@ -1,8 +1,11 @@
 package sql
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-func TestRightJoinNormalizesToLeftJoin(t *testing.T) {
+func TestRightJoinPreservesPublicASTSourceOrder(t *testing.T) {
 	statement, err := ParseStatement(`
 		SELECT u.name, o.total
 		FROM users AS u
@@ -16,25 +19,25 @@ func TestRightJoinNormalizesToLeftJoin(t *testing.T) {
 		t.Fatalf("FROM count = %d, want 2", len(statement.Select.From))
 	}
 	from := statement.Select.From
-	if from[0].Alias != "o" || from[0].Join != JoinNone {
-		t.Fatalf("normalized driving table = %+v, want orders/none", from[0])
+	if from[0].Alias != "u" || from[0].Join != JoinNone {
+		t.Fatalf("driving table = %+v, want users/none", from[0])
 	}
-	if from[1].Alias != "u" || from[1].Join != JoinLeft {
-		t.Fatalf("normalized joined table = %+v, want users/left", from[1])
+	if from[1].Alias != "o" || from[1].Join != JoinRight {
+		t.Fatalf("joined table = %+v, want orders/right", from[1])
 	}
 	if from[1].On.Left.Source != 0 || from[1].On.Right.Source != 1 {
-		t.Fatalf("normalized ON sources = (%d, %d), want (0, 1)",
+		t.Fatalf("ON sources = (%d, %d), want (0, 1)",
 			from[1].On.Left.Source, from[1].On.Right.Source)
 	}
-	if statement.Select.Columns[0].Path.Source != 1 ||
-		statement.Select.Columns[1].Path.Source != 0 {
-		t.Fatalf("normalized projection sources = (%d, %d), want (1, 0)",
+	if statement.Select.Columns[0].Path.Source != 0 ||
+		statement.Select.Columns[1].Path.Source != 1 {
+		t.Fatalf("projection sources = (%d, %d), want (0, 1)",
 			statement.Select.Columns[0].Path.Source,
 			statement.Select.Columns[1].Path.Source)
 	}
 }
 
-func TestRightJoinRemapsSharedDistinctOrderAliasOnce(t *testing.T) {
+func TestRightJoinKeepsSharedDistinctOrderAliasStable(t *testing.T) {
 	statement, err := ParseStatement(`
 		SELECT DISTINCT r.id AS joined_id
 		FROM lefts AS l
@@ -49,9 +52,10 @@ func TestRightJoinRemapsSharedDistinctOrderAliasOnce(t *testing.T) {
 	if projection != order {
 		t.Fatal("ORDER BY alias no longer shares the resolved projection path")
 	}
-	if query.From[0].Alias != "r" || projection.Source != 0 {
-		t.Fatalf("normalized shared path = source %d over %s, want source 0 over rights",
-			projection.Source, query.From[0].Alias)
+	if query.From[0].Alias != "l" || query.From[1].Alias != "r" ||
+		query.From[1].Join != JoinRight || projection.Source != 1 {
+		t.Fatalf("shared path = source %d over %s/%s (%d), want source 1 and RIGHT",
+			projection.Source, query.From[0].Alias, query.From[1].Alias, query.From[1].Join)
 	}
 }
 
@@ -112,13 +116,13 @@ func TestUsingResolvesOnlyItsUnqualifiedMergedColumn(t *testing.T) {
 
 func TestOuterUsingResolvesMergedColumnToPreservedSide(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		join      string
-		preserved string
-		nullable  string
+		name string
+		join string
+		kind JoinKind
 	}{
-		{"left", "LEFT JOIN", "l", "r"},
-		{"right", "RIGHT JOIN", "r", "l"},
+		{"left", "LEFT JOIN", JoinLeft},
+		{"right", "RIGHT JOIN", JoinRight},
+		{"full", "FULL JOIN", JoinFull},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			statement, err := ParseStatement(`
@@ -130,28 +134,24 @@ func TestOuterUsingResolvesMergedColumnToPreservedSide(t *testing.T) {
 				t.Fatal(err)
 			}
 			query := statement.Select
-			if query.From[0].Alias != tc.preserved || query.From[1].Alias != tc.nullable ||
-				query.From[1].Join != JoinLeft {
-				t.Fatalf("normalized sources = %s/%s (%d), want %s/%s (LEFT)",
-					query.From[0].Alias, query.From[1].Alias, query.From[1].Join,
-					tc.preserved, tc.nullable)
+			if query.From[0].Alias != "l" || query.From[1].Alias != "r" ||
+				query.From[1].Join != tc.kind {
+				t.Fatalf("sources = %s/%s (%d), want l/r (%d)",
+					query.From[0].Alias, query.From[1].Alias, query.From[1].Join, tc.kind)
 			}
 			for _, path := range []*PathExpr{
 				query.Columns[0].Path,
 				query.Where.Path,
 				query.OrderBy[0].Path,
 			} {
-				if path.Source != 0 || path.Spec() != "id" {
-					t.Fatalf("merged USING path = source %d, %q; want preserved source 0, id",
-						path.Source, path.Spec())
+				if path.MergedUsing != 1 || path.Spec() != "id" {
+					t.Fatalf("merged USING path = source %d merge %d, %q; want merge 1, id",
+						path.Source, path.MergedUsing, path.Spec())
 				}
 			}
-			qualified := map[string]int{
-				"l": query.Columns[1].Path.Source,
-				"r": query.Columns[2].Path.Source,
-			}
-			if qualified[tc.preserved] != 0 || qualified[tc.nullable] != 1 {
-				t.Fatalf("qualified sources = %#v after normalization", qualified)
+			if query.Columns[1].Path.Source != 0 || query.Columns[2].Path.Source != 1 {
+				t.Fatalf("qualified sources = %d/%d, want 0/1",
+					query.Columns[1].Path.Source, query.Columns[2].Path.Source)
 			}
 		})
 	}
@@ -182,5 +182,115 @@ func TestOrderByAliasTakesPrecedenceOverUsingColumn(t *testing.T) {
 		t.Fatalf("ORDER BY alias = source %d, %q (%p), projection = source %d, %q (%p)",
 			order.Source, order.Spec(), order,
 			projection.Source, projection.Spec(), projection)
+	}
+}
+
+func TestGeneralizedJoinASTCarriesKeysResidualsAndCross(t *testing.T) {
+	statement, err := ParseStatement(`
+		SELECT a.x
+		FROM a
+		FULL JOIN b ON a.k = b.k AND a.zone = b.zone AND a.enabled = TRUE
+		CROSS JOIN c`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := statement.Select.From[1]
+	if full.Join != JoinFull || full.On == nil || len(full.On.Keys) != 2 || !full.On.Residual {
+		t.Fatalf("FULL condition = %+v, want two keys plus a residual", full.On)
+	}
+	for i, key := range full.On.Keys {
+		if key.Left.Source != 0 || key.Right.Source != 1 {
+			t.Fatalf("key[%d] sources = %d/%d, want 0/1", i, key.Left.Source, key.Right.Source)
+		}
+	}
+	cross := statement.Select.From[2]
+	if cross.Join != JoinCross || cross.On != nil {
+		t.Fatalf("CROSS entry = %+v, want a condition-free cross join", cross)
+	}
+}
+
+func TestJoinConditionArenasOwnKeysAndUsingNames(t *testing.T) {
+	var parser Parser
+	var statement Statement
+	if err := parser.ParseStatement(&statement,
+		`SELECT a.x FROM a JOIN b USING (x, y)`); err != nil {
+		t.Fatal(err)
+	}
+	cond := statement.Select.From[1].On
+	if len(cond.Keys) != 2 || len(cond.UsingColumns) != 2 {
+		t.Fatalf("condition = %+v, want two owned keys and names", cond)
+	}
+	parser.joinKeyScratch = append(parser.joinKeyScratch, JoinKeyCond{})
+	parser.joinNameScratch = append(parser.joinNameScratch, "mutated")
+	if cond.Keys[0].Left == nil || cond.UsingColumns[0] != "x" || cond.UsingColumns[1] != "y" {
+		t.Fatalf("scratch reuse mutated condition: %+v", cond)
+	}
+}
+
+func TestRepeatedUsingBindsAccumulatedMergedKey(t *testing.T) {
+	statement, err := ParseStatement(`
+		SELECT x, a.x, b.x, c.x
+		FROM a JOIN b USING (x) FULL JOIN c USING (x)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := statement.Select
+	if got := query.From[2].On.Keys[0].Left.MergedUsing; got != 1 {
+		t.Fatalf("second USING left merge = %d, want first merge 1", got)
+	}
+	if got := query.Columns[0].Path.MergedUsing; got != 2 {
+		t.Fatalf("unqualified projection merge = %d, want accumulated merge 2", got)
+	}
+}
+
+func TestChainedUsingRejectsAmbiguousAccumulatedName(t *testing.T) {
+	src := `SELECT a.x FROM a JOIN b ON a.y = b.y JOIN c USING (x)`
+	_, err := ParseStatement(src)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous on the accumulated left relation") {
+		t.Fatalf("ParseStatement = %v, want positioned accumulated-left ambiguity", err)
+	}
+	if parse, ok := err.(*ParseError); !ok || parse.Pos != strings.LastIndex(src, "x)") {
+		t.Fatalf("ambiguity = %T %+v, want position %d", err, err, strings.LastIndex(src, "x)"))
+	}
+}
+
+func TestOnMayReferenceOnlyTheAccumulatedSide(t *testing.T) {
+	statement, err := ParseStatement(
+		`SELECT a.x FROM a LEFT JOIN b ON a.enabled = TRUE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cond := statement.Select.From[1].On
+	if len(cond.Keys) != 0 || !cond.Residual || cond.Expr == nil {
+		t.Fatalf("old-side-only ON = %+v, want a residual nested-loop condition", cond)
+	}
+}
+
+func TestOnBooleanConstantsAreResidualPredicates(t *testing.T) {
+	for _, literal := range []string{"TRUE", "FALSE"} {
+		statement, err := ParseStatement(
+			`SELECT a.x FROM a LEFT JOIN b ON ` + literal)
+		if err != nil {
+			t.Fatalf("ON %s: %v", literal, err)
+		}
+		cond := statement.Select.From[1].On
+		if cond.Expr == nil || cond.Expr.Kind != ExprConstant ||
+			cond.Expr.Value.Kind != OperandBool || len(cond.Keys) != 0 || !cond.Residual {
+			t.Fatalf("ON %s condition = %+v", literal, cond)
+		}
+	}
+}
+
+func TestNestedJoinKeyPositionsRebaseInUTF8Statement(t *testing.T) {
+	src := `SELECT d.x FROM (/* é */ SELECT a.x FROM a JOIN b ON a.k = b.k AND a.y = b.y) AS d`
+	statement, err := ParseStatement(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := statement.Select.From[0].Query.From[1].On.Keys
+	for i, marker := range []string{"a.k = b.k", "a.y = b.y"} {
+		if got, want := keys[i].Pos, strings.Index(src, marker); got != want {
+			t.Fatalf("key[%d] position = %d, want byte offset %d", i, got, want)
+		}
 	}
 }

@@ -30,6 +30,13 @@ const (
 	ReductionAvg
 	ReductionMin
 	ReductionMax
+	// ReductionWindowInteger identifies analytic outputs whose SQL type is an
+	// exact signed 64-bit integer: ranking functions, NTILE, and window COUNT.
+	ReductionWindowInteger
+	// ReductionWindowNumber identifies analytic outputs that are statically
+	// numeric but are not restricted to int64, including distribution and
+	// window aggregate functions.
+	ReductionWindowNumber
 )
 
 // OutputColumn is cold result-schema metadata. Ordinal is the stable column ID

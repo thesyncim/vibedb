@@ -1215,13 +1215,8 @@ func TestJoinLookupTransientMemoryDoesNotScaleWithOuterRows(t *testing.T) {
 	}
 }
 
-// TestJoinInTheSQLSubset states the scope the SQL front end inherits from this
-// file, now that a clause can fan out.
-//
-// Every JOIN lowers with its alias declared, so the operator is SQL's inner
-// join and the joined collection's columns are readable. What remains refused
-// is what the engine has no plan for: a chained join, a second fanning clause,
-// while LEFT JOIN uses the same one-expansion bound.
+// TestJoinInTheSQLSubset covers both the storage-aware single physical join
+// and the generalized pair-space shapes selected for chains and mixed WHERE.
 func TestJoinInTheSQLSubset(t *testing.T) {
 	for _, src := range []string{
 		`SELECT t.id, u.b FROM t JOIN u ON u.b = t.a`,
@@ -1229,28 +1224,12 @@ func TestJoinInTheSQLSubset(t *testing.T) {
 		`SELECT t.id FROM t JOIN u ON u.b = t.a WHERE u.tier = 'pro'`,
 		`SELECT t.id, SUM(u.n) FROM t JOIN u ON u.b = t.a GROUP BY t.id`,
 		`SELECT t.id, u.b FROM t LEFT JOIN u ON u.b = t.a`,
+		`SELECT t.id, v.c FROM t JOIN u ON u."$key" = t.a JOIN v ON v.c = u.b`,
+		`SELECT t.id, u.b, v.c FROM t JOIN u ON u.b = t.a JOIN v ON v.c = t.a`,
+		`SELECT t.id, u.b FROM t JOIN u ON u.b = t.a WHERE t.x = 1 OR u.y = 2`,
 	} {
 		if _, err := PrepareStatement(src); err != nil {
-			t.Fatalf("%q must lower to an inner join: %v", src, err)
-		}
-	}
-	for _, tc := range []struct {
-		sql  string
-		want string
-	}{
-		{`SELECT t.id, v.c FROM t JOIN u ON u."$key" = t.a JOIN v ON v.c = u.b`,
-			"chained join"},
-		{`SELECT t.id, u.b, v.c FROM t JOIN u ON u.b = t.a JOIN v ON v.c = t.a`,
-			"only once"},
-		{`SELECT t.id, u.b FROM t JOIN u ON u.b = t.a WHERE t.x = 1 OR u.y = 2`,
-			"two collections"},
-	} {
-		_, err := PrepareStatement(tc.sql)
-		if err == nil {
-			t.Fatalf("%q lowered; the engine has no plan for it", tc.sql)
-		}
-		if !strings.Contains(err.Error(), tc.want) {
-			t.Fatalf("%q = %v, want a message naming %q", tc.sql, err, tc.want)
+			t.Fatalf("%q must lower: %v", src, err)
 		}
 	}
 }

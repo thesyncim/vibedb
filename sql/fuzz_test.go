@@ -40,6 +40,15 @@ func FuzzParseSQL(f *testing.F) {
 		`WITH active(id) AS MATERIALIZED (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS NOT MATERIALIZED (SELECT id FROM active) SELECT id FROM selected WHERE id = ?`,
 		`WITH outer_cte AS (WITH inner_cte AS (SELECT id FROM docs) SELECT id FROM inner_cte) SELECT id FROM outer_cte`,
+		`SELECT team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), ` +
+			`SUM(score) OVER (PARTITION BY team ORDER BY score ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`,
+		`SELECT LAG(value, ?, NULL) OVER (ORDER BY seq NULLS FIRST) FROM events`,
+		`SELECT NTILE(?) OVER (ORDER BY score), PERCENT_RANK() OVER (ORDER BY score), ` +
+			`NTH_VALUE(value, 2) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events`,
+		`SELECT SUM(value) OVER framed, SUM(value) OVER (` +
+			`ordered RANGE BETWEEN ? PRECEDING AND 1.2500 FOLLOWING EXCLUDE TIES) FROM events ` +
+			`WINDOW partitioned AS (PARTITION BY team), ordered AS (partitioned ORDER BY score), ` +
+			`framed AS (ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP)`,
 		`SELECT "select"."from" FROM "where" WHERE a['x.y'] = 'it''s'`,
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
@@ -140,6 +149,27 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			seen += cte.Query.Params
 		}
 	}
+	for i := range s.Windows {
+		window := &s.Windows[i]
+		if window.Name == "" {
+			t.Fatalf("Windows[%d] has no name", i)
+		}
+		for prior := 0; prior < i; prior++ {
+			if s.Windows[prior].Name == window.Name {
+				t.Fatalf("Windows[%d] duplicates name %q", i, window.Name)
+			}
+		}
+		if window.Spec.Name != "" {
+			found := false
+			for prior := 0; prior < i; prior++ {
+				found = found || s.Windows[prior].Name == window.Spec.Name
+			}
+			if !found {
+				t.Fatalf("Windows[%d] inherits unknown/later window %q", i, window.Spec.Name)
+			}
+		}
+		seen += checkWindowSpecInvariants(t, s, &window.Spec, true)
+	}
 	for i := range s.From {
 		ref := &s.From[i]
 		if ref.Alias == "" {
@@ -179,6 +209,13 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		checkPath(t, s, ref.On.Right)
 	}
 	for i := range s.Columns {
+		if window := s.Columns[i].Window; window != nil {
+			if s.Columns[i].Path != nil || s.Columns[i].Agg != AggNone {
+				t.Fatalf("Columns[%d] mixes a window with an ordinary expression", i)
+			}
+			seen += checkWindowInvariants(t, s, window)
+			continue
+		}
 		if s.Columns[i].Path == nil {
 			if s.Columns[i].Agg != AggCount {
 				t.Fatalf("Columns[%d] has no path and is not COUNT(*)", i)
@@ -191,7 +228,11 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 		checkPath(t, s, key)
 	}
 	for i := range s.OrderBy {
-		checkPath(t, s, s.OrderBy[i].Path)
+		if s.OrderBy[i].Output == 0 {
+			checkPath(t, s, s.OrderBy[i].Path)
+		} else if s.OrderBy[i].Output > len(s.Columns) {
+			t.Fatalf("OrderBy[%d] output %d is outside SELECT list", i, s.OrderBy[i].Output)
+		}
 	}
 	if s.Where != nil {
 		seen += checkExpr(t, s, s.Where, false)
@@ -204,6 +245,93 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 	if seen != s.Params {
 		t.Fatalf("statement reports %d placeholders and holds %d", s.Params, seen)
 	}
+}
+
+// checkWindowInvariants validates the function-specific optional fields and
+// returns the number of placeholders owned by the window expression. Window
+// operands live outside WHERE/HAVING, so omitting them here would let Params
+// disagree with the accepted tree even though ordinary predicates are sound.
+func checkWindowInvariants(t *testing.T, s *SelectStmt, w *WindowExpr) int {
+	t.Helper()
+	requiresArgument := true
+	switch w.Kind {
+	case WindowRowNumber, WindowRank, WindowDenseRank,
+		WindowNTile, WindowPercentRank, WindowCumeDist:
+		requiresArgument = false
+	case WindowCount:
+		// COUNT(*) deliberately has no path; COUNT(path) does.
+		requiresArgument = false
+	}
+	if requiresArgument && w.Argument == nil {
+		t.Fatalf("%s has no argument", w.Kind)
+	}
+	if w.Argument != nil {
+		checkPath(t, s, w.Argument)
+	}
+
+	seen := 0
+	if w.HasOffset {
+		seen += checkWindowCount(t, w.Offset, "LAG/LEAD offset")
+	}
+	if w.HasBuckets {
+		seen += checkWindowCount(t, w.Buckets, "NTILE bucket count")
+	}
+	if w.HasNth {
+		seen += checkWindowCount(t, w.Nth, "NTH_VALUE position")
+	}
+	if w.HasDefault && !w.DefaultNull && w.Default.Kind == OperandParam {
+		seen++
+	}
+	seen += checkWindowSpecInvariants(t, s, &w.Spec, !w.Spec.FrameInherited)
+	return seen
+}
+
+func checkWindowSpecInvariants(
+	t *testing.T,
+	s *SelectStmt,
+	spec *WindowSpec,
+	countFrame bool,
+) int {
+	t.Helper()
+	for _, path := range spec.PartitionBy {
+		checkPath(t, s, path)
+	}
+	for i := range spec.OrderBy {
+		checkPath(t, s, spec.OrderBy[i].Path)
+	}
+	if !spec.Frame.Explicit {
+		return 0
+	}
+	if spec.Frame.Unit > WindowFrameRange ||
+		spec.Frame.Exclusion > WindowExcludeTies {
+		t.Fatalf("invalid window frame = %+v", spec.Frame)
+	}
+	if !countFrame {
+		return 0
+	}
+	return checkWindowFrameBound(t, spec.Frame.Start) +
+		checkWindowFrameBound(t, spec.Frame.End)
+}
+
+func checkWindowCount(t *testing.T, op Operand, clause string) int {
+	t.Helper()
+	switch op.Kind {
+	case OperandNumber:
+		return 0
+	case OperandParam:
+		return 1
+	default:
+		t.Fatalf("%s has operand kind %d", clause, op.Kind)
+		return 0
+	}
+}
+
+func checkWindowFrameBound(t *testing.T, bound WindowFrameBound) int {
+	t.Helper()
+	if bound.Kind != WindowPreceding && bound.Kind != WindowFollowing {
+		return 0
+	}
+	return checkWindowCount(t, bound.Offset, "window frame offset")
 }
 
 func checkRowCount(t *testing.T, op *Operand) int {
@@ -242,6 +370,10 @@ func checkExpr(t *testing.T, s *SelectStmt, e *Expr, having bool) int {
 	case ExprNot:
 		if len(e.Kids) != 1 {
 			t.Fatalf("a NOT node holds %d operands", len(e.Kids))
+		}
+	case ExprConstant:
+		if e.Path != nil || e.Value.Kind != OperandBool {
+			t.Fatalf("constant predicate = %+v, want a path-free boolean", e)
 		}
 	default:
 		if e.Agg != AggNone && !having {

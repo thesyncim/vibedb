@@ -295,6 +295,12 @@ func (s *Statement) resolveDrivingPredicate() *sqlast.Expr {
 	if s == nil || s.tree == nil {
 		return nil
 	}
+	if window := s.window(); window != nil {
+		return window.input.DrivingPredicate()
+	}
+	if s.relationJoin() != nil {
+		return nil
+	}
 	if s.canFuseCTE() {
 		return s.cteReference().def.tree.Where
 	}
@@ -347,6 +353,9 @@ func (s *Statement) runRelations(
 	args []any,
 	frame *statementFrame,
 ) (Source, error) {
+	if join := s.relationJoin(); join != nil {
+		return join.run(s, parent, src, args, frame)
+	}
 	if s.cteReference() != nil {
 		return s.runCTE(parent, src, frame)
 	}
@@ -462,6 +471,12 @@ func (d *statementCTE) cleanupChild(frame *statementFrame) {
 }
 
 func (s *Statement) releaseRelations(frame *statementFrame) {
+	if window := s.window(); window != nil {
+		window.releaseExecution(frame)
+	}
+	if join := s.relationJoin(); join != nil {
+		join.releaseExecution(frame)
+	}
 	s.releaseDerived(frame)
 	s.releaseCTEReference(frame)
 	if s.nested != nil && s.nested.ownsCTEs && s.nested.ctes != nil {
@@ -480,6 +495,12 @@ func (s *Statement) releaseCTEReference(frame *statementFrame) {
 }
 
 func (s *Statement) discardRelations() {
+	if window := s.window(); window != nil {
+		window.discardExecution()
+	}
+	if join := s.relationJoin(); join != nil {
+		join.discardExecution()
+	}
 	s.discardDerived()
 	ref := s.cteReference()
 	if ref != nil {
@@ -552,6 +573,9 @@ type relationBinding struct {
 }
 
 func (s *Statement) relationBinding() relationBinding {
+	if join := s.relationJoin(); join != nil {
+		return join.sourceBinding(0)
+	}
 	if ref := s.cteReference(); ref != nil && ref.def != nil {
 		return relationBinding{names: ref.def.names, ordinalSpec: ref.def.ordinalSpec}
 	}
@@ -562,10 +586,31 @@ func (s *Statement) relationBinding() relationBinding {
 }
 
 func (s *Statement) hasRelationBinding() bool {
-	return s.derived() != nil || s.cteReference() != nil
+	return s.relationJoin() != nil || s.derived() != nil || s.cteReference() != nil
+}
+
+func (s *Statement) relationBindingForSource(source int) relationBinding {
+	if join := s.relationJoin(); join != nil {
+		return join.sourceBinding(source)
+	}
+	if source == 0 {
+		return s.relationBinding()
+	}
+	return relationBinding{}
 }
 
 func (s *Statement) resolveRelationColumn(name string) (int, error) {
+	return s.resolveRelationColumnAt(0, name)
+}
+
+func (s *Statement) resolveRelationColumnAt(source int, name string) (int, error) {
+	if join := s.relationJoin(); join != nil {
+		relation := ""
+		if source >= 0 && source < len(s.tree.From) {
+			relation = s.tree.From[source].Alias
+		}
+		return join.resolve(source, name, relation)
+	}
 	binding := s.relationBinding()
 	found, matches := -1, 0
 	for i := range binding.names {
@@ -576,7 +621,7 @@ func (s *Statement) resolveRelationColumn(name string) (int, error) {
 	}
 	if matches != 1 {
 		return -1, &RelationColumnError{
-			Relation: s.tree.From[0].Alias,
+			Relation: s.tree.From[source].Alias,
 			Column:   name,
 			Matches:  matches,
 		}

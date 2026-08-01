@@ -111,7 +111,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"CAST", `SELECT a FROM t WHERE CAST(b AS text) = 1`, 22, "CAST"},
 		{"the cast operator", `SELECT a FROM t WHERE b::text = 'x'`, 23, "::"},
 		{"scalar functions", `SELECT lower(a) FROM t`, 12, "not a supported function"},
-		{"window functions", `SELECT SUM(a) OVER () FROM t`, 14, "OVER"},
 		{"arithmetic", `SELECT a FROM t WHERE b + 1 = 2`, 24, "arithmetic"},
 		{"concatenation", `SELECT a FROM t WHERE b || 'x' = 'y'`, 24, "concatenation"},
 		{"set operations", `SELECT a FROM t UNION SELECT b FROM u`, 16, "UNION"},
@@ -134,17 +133,9 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 
 func TestRejectsUnsupportedJoins(t *testing.T) {
 	runRejections(t, []rejection{
-		{"FULL JOIN", `SELECT t.a FROM t FULL JOIN u ON t.k = u.k`, 18, "FULL outer joins"},
-		{"CROSS JOIN", `SELECT t.a FROM t CROSS JOIN u`, 18, "unrestricted product"},
 		{"NATURAL JOIN", `SELECT t.a FROM t NATURAL JOIN u ON t.k = u.k`, 18, "write ON explicitly"},
-		{"composite USING", `SELECT t.a FROM t JOIN u USING (k, x)`, 33, "composite USING joins"},
 		{"comma joins", `SELECT t.a FROM t, u`, 17, "explicit JOIN"},
 		{"a missing ON", `SELECT t.a FROM t JOIN u`, 24, "expected ON"},
-		{"an inequality join", `SELECT t.a FROM t JOIN u ON t.k > u.k`, 32, "single key equality"},
-		{"a conjunctive join", `SELECT t.a FROM t JOIN u ON t.k = u.k AND t.j = u.j`, 38, "one key per join"},
-		{"a join against one side", `SELECT t.a FROM t JOIN u ON t.k = t.j`, 28, "an equi-join matches a key"},
-		{"a join that ignores the joined collection",
-			`SELECT a.x FROM a JOIN b ON a.k = a.k2 JOIN c ON a.k = b.k`, 28, "an equi-join matches a key"},
 		{"a forward reference in ON",
 			`SELECT a.x FROM a JOIN b ON c.k = b.k JOIN c ON a.k = c.k`, 28, "joins later"},
 		{"a duplicate range variable", `SELECT x.a FROM t AS x JOIN u AS x ON x.k = x.j`, 28, "declared twice"},

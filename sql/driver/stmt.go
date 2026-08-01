@@ -253,6 +253,34 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		if snapshotErr != nil {
 			return nil, snapshotErr
 		}
+		if s.usesDirectDurableCatalog() {
+			// Generalized SQL joins materialize their physical, derived, and CTE
+			// operands inside the query runtime. Give that runtime the coherent
+			// durable catalog directly so every physical operand can retain its
+			// durable scan/index path. The catalog is needed only until RunInto
+			// returns: durable cells are copied into result- or relation-owned
+			// storage before then.
+			cursor, runErr := s.query.RunInto(
+				&s.conn.exec,
+				query.FromFileDatabase(*catalog, s.query.Collection()),
+				args,
+			)
+			closeErr := catalog.Close()
+			if runErr != nil {
+				if closeErr != nil {
+					return nil, errors.Join(runErr, closeErr)
+				}
+				return nil, runErr
+			}
+			if closeErr != nil {
+				return nil, closeErr
+			}
+			if err := contextCheckpoint(ctx); err != nil {
+				return nil, err
+			}
+			s.conn.open = true
+			return s.conn.resetRows(s, cursor, nil), nil
+		}
 		source, materializeErr := s.conn.materializeDurableJoinSource(
 			ctx, catalog, s.query.Collection(), s.dependencies)
 		closeErr := catalog.Close()
@@ -417,10 +445,11 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	options := query.ExplainOptions{
 		PrimaryPoint: s.primaryPoint,
 	}
-	// The driver materializes catalog-dependent joins and relation-valued
-	// subplans into the heap executor, whose source has no durable catalog. Keep
-	// the plan logical rather than attributing an original table's indexes to
-	// the materialized execution.
+	// A catalog-dependent relation plan may read several physical sources, while
+	// ExplainOptions carries one index catalog. Keep that part of the plan
+	// logical rather than attributing one operand's indexes to every source;
+	// EXPLAIN ANALYZE still reports the generalized stages' actual algorithms
+	// and counters. Dependency validation uses the same coherent catalog cut.
 	if s.requiresCatalogSource() {
 		return options, s.validateCatalogDependenciesForExplain(ctx)
 	}
@@ -471,6 +500,17 @@ func (s *stmt) requiresCatalogSource() bool {
 		return false
 	}
 	return s.catalogJoin || len(s.dependencies) != 1
+}
+
+// usesDirectDurableCatalog is the cross-layer source contract for SQL JOINs.
+// The generalized relation pipeline owns operand materialization and can
+// consume every physical source from one FromFileDatabase cut. The legacy
+// physical equi-join pipeline retains the driver's existing bounded heap path
+// until the durable executor can publish projected fan-out rows itself.
+// Keeping the decision on the prepared statement makes the ordinary no-JOIN
+// path one nil-cheap pointer test with no feature state or allocation.
+func (s *stmt) usesDirectDurableCatalog() bool {
+	return s != nil && s.query != nil && s.query.UsesGeneralizedRelationJoin()
 }
 
 func (s *stmt) transactionRequiresCatalogSource() bool {

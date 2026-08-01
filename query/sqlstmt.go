@@ -143,12 +143,14 @@ type Statement struct {
 }
 
 type nestedStatements struct {
-	subqueries []statementSubquery
-	derived    *statementDerived
-	ctes       *statementCTEs
-	cte        *statementCTEReference
-	ownsCTEs   bool
-	driving    string
+	subqueries   []statementSubquery
+	derived      *statementDerived
+	relationJoin *statementRelationJoin
+	window       *statementWindow
+	ctes         *statementCTEs
+	cte          *statementCTEReference
+	ownsCTEs     bool
+	driving      string
 }
 
 type subqueryUse uint8
@@ -273,7 +275,12 @@ func prepareTreeInContext(
 		text: src, tree: tree, params: tree.Params,
 		subqueryLimit: subqueryLimit,
 	}
-	if tree.With != nil {
+	if selectHasWindows(tree) {
+		if err := s.prepareWindow(ctes, argBase); err != nil {
+			s.Release()
+			return nil, err
+		}
+	} else if tree.With != nil {
 		if ctes == nil {
 			ctes = new(statementCTEs)
 			s.ensureNested().ownsCTEs = true
@@ -284,7 +291,8 @@ func prepareTreeInContext(
 			return nil, err
 		}
 	}
-	if len(tree.From) != 0 && tree.From[0].Kind == sqlast.RelationCTE {
+	generalizedJoin := s.window() == nil && len(tree.From) > 1 && requiresGeneralizedRelationJoin(tree)
+	if s.window() == nil && !generalizedJoin && len(tree.From) != 0 && tree.From[0].Kind == sqlast.RelationCTE {
 		if ctes == nil {
 			return nil, fmt.Errorf("query: CTE reference %q has no lexical definition", tree.From[0].Name)
 		}
@@ -294,16 +302,30 @@ func prepareTreeInContext(
 			return nil, err
 		}
 	}
-	if err := s.prepareSubqueries(argBase); err != nil {
-		s.Release()
-		return nil, err
+	if s.window() == nil {
+		if err := s.prepareSubqueries(argBase); err != nil {
+			s.Release()
+			return nil, err
+		}
 	}
-	if err := s.prepareDerived(argBase); err != nil {
-		s.Release()
-		return nil, err
+	if s.window() == nil && generalizedJoin {
+		if err := s.prepareRelationJoin(argBase); err != nil {
+			s.Release()
+			return nil, err
+		}
+	} else if s.window() == nil {
+		if err := s.prepareDerived(argBase); err != nil {
+			s.Release()
+			return nil, err
+		}
 	}
-	s.requiresCatalog = selectRequiresCatalog(tree)
-	s.drivingPredicate = s.resolveDrivingPredicate()
+	if s.window() != nil {
+		s.requiresCatalog = s.window().input.RequiresCatalog()
+		s.drivingPredicate = s.window().input.DrivingPredicate()
+	} else {
+		s.requiresCatalog = selectRequiresCatalog(tree)
+		s.drivingPredicate = s.resolveDrivingPredicate()
+	}
 	if s.nested != nil {
 		s.nested.driving = s.resolveDrivingCollection()
 	}
@@ -338,12 +360,12 @@ func (s *Statement) ensureNested() *nestedStatements {
 // Columns returns the output column names in SELECT order. The slice is owned
 // by s and must not be modified.
 //
-// A column with an AS alias takes that alias. A projected path takes its
-// spelling in the engine's path language, which is the SQL path with quoting
-// removed — "u.address.city" becomes "address.city", because the range variable
-// names the collection rather than part of the path. An aggregate takes the
-// engine's own header spelling, "sum(score)" or "count(*)", so a query written
-// in SQL and the same query written with the builder produce one schema.
+// A column with an AS alias takes that alias. A driving or single-relation path
+// uses its bare engine spelling; a joined-source path retains its range-variable
+// prefix ("o.total") so selecting the generalized executor cannot change the
+// established RowDescription of the storage-aware join path. A merged USING
+// output remains bare. Aggregates use the engine's own header spelling, such as
+// "sum(score)" or "count(*)".
 func (s *Statement) Columns() []string { return s.names[:s.outputs:s.outputs] }
 
 // NumParams returns the number of '?' placeholders. Binding a different number
@@ -359,6 +381,21 @@ func (s *Statement) SQL() string { return s.text }
 // snapshot resolves every collection at one instant; a caller holding a single
 // collection can refuse it before it takes a snapshot it would only discard.
 func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
+
+// UsesGeneralizedRelationJoin reports whether this prepared statement executes
+// JOINs through the relation-spool pipeline. Adapters use it to retain their
+// existing storage-aware path for the legacy physical equi-join subset while
+// supplying a coherent catalog directly to generalized relation operands.
+// It is a single pointer test and allocates no feature state when false.
+func (s *Statement) UsesGeneralizedRelationJoin() bool {
+	if s == nil {
+		return false
+	}
+	if window := s.window(); window != nil {
+		return window.input.UsesGeneralizedRelationJoin()
+	}
+	return s.relationJoin() != nil
+}
 
 // RequiresCatalog reports whether execution may read a collection other than
 // the driving one. JOIN and nested SELECT both require one coherent database
@@ -378,6 +415,12 @@ func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
 	dst = s.q.AppendSchema(dst)
 	if len(dst)-start > s.outputs {
 		dst = dst[:start+s.outputs]
+	}
+	if window := s.window(); window != nil {
+		for i := range window.outputs {
+			dst[start+i].Reduction = window.outputs[i].reduction
+			dst[start+i].Type = window.outputs[i].valueType
+		}
 	}
 	return dst
 }
@@ -400,6 +443,12 @@ func (s *Statement) Release() {
 			s.nested.derived.stmt.Release()
 			s.nested.derived.exec.Release()
 			s.nested.derived.spool.release()
+		}
+		if s.nested.relationJoin != nil {
+			s.nested.relationJoin.release()
+		}
+		if s.nested.window != nil {
+			s.nested.window.release()
 		}
 		if s.nested.cte != nil {
 			s.nested.cte.spool.release()
@@ -473,6 +522,9 @@ func (s *Statement) runIntoFrame(
 	}
 	runSource := src
 	if s.nested != nil {
+		if s.nested.window != nil {
+			return s.nested.window.run(s, e, src, args, frame, intermediateResource)
+		}
 		if s.canFuseCTE() {
 			return s.runFusedCTE(e, src, frame, intermediateResource)
 		}
@@ -967,7 +1019,7 @@ func (s *Statement) render(p *sqlast.PathExpr, local bool) string {
 	if p == nil {
 		return ""
 	}
-	if s.hasRelationBinding() && p.Source == 0 {
+	if s.relationJoin() != nil || s.hasRelationBinding() && p.Source == 0 {
 		return s.renderDerived(p, local)
 	}
 	qualified := !local && p.Source != 0
@@ -1060,17 +1112,22 @@ func (s *Statement) unshadow(start int) []byte {
 // describe computes the output schema and the parts of the statement that do
 // not depend on a binding. It runs once, at prepare.
 func (s *Statement) describe() error {
+	if s.window() != nil {
+		return nil
+	}
 	s.outputs = 0
 	capacity := len(s.tree.Columns)
-	if relation := s.relationBinding(); s.hasRelationBinding() {
-		capacity += len(relation.names)
+	if s.hasRelationBinding() {
+		for source := range s.tree.From {
+			capacity += len(s.relationBindingForSource(source).names)
+		}
 	}
 	s.names = reserve(s.names[:0], capacity)
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
-		if relation := s.relationBinding(); s.hasRelationBinding() &&
-			column.Agg == sqlast.AggNone && column.Path != nil &&
-			len(column.Path.Segments) == 0 {
+		if s.hasRelationBinding() && column.Agg == sqlast.AggNone &&
+			column.Path != nil && len(column.Path.Segments) == 0 {
+			relation := s.relationBindingForSource(column.Path.Source)
 			if column.Alias != "" {
 				return fmt.Errorf(
 					"query: relation wildcard expands to %d columns and cannot have the single alias %q",
@@ -1093,7 +1150,9 @@ func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 		return col.Alias
 	}
 	spec := s.spec(col.Path)
-	if s.hasRelationBinding() && col.Path != nil {
+	if s.relationJoin() != nil && col.Path != nil {
+		spec = s.relationJoinDisplaySpec(col.Path)
+	} else if s.hasRelationBinding() && col.Path != nil {
 		spec = s.derivedDisplaySpec(col.Path)
 	}
 	if col.Agg == sqlast.AggNone {
@@ -1109,6 +1168,24 @@ func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 		return "count(*)"
 	}
 	return s.header(aggName(col.Agg), spec)
+}
+
+func (s *Statement) relationJoinDisplaySpec(path *sqlast.PathExpr) string {
+	if path == nil {
+		return ""
+	}
+	start := len(s.specBuf)
+	qualified := path.MergedUsing == 0 && path.Source > 0 && path.Source < len(s.tree.From)
+	if qualified {
+		s.specBuf = append(s.specBuf, s.tree.From[path.Source].Alias...)
+		s.specBuf = append(s.specBuf, '.')
+	}
+	specStart := len(s.specBuf)
+	s.specBuf = path.AppendSpec(s.specBuf)
+	if qualified && len(s.specBuf) == specStart {
+		s.specBuf = append(s.specBuf, '*')
+	}
+	return byteview.String(s.specBuf[start:len(s.specBuf):len(s.specBuf)])
 }
 
 // header renders "name(spec)" into the statement's own spec buffer, matching
