@@ -35,12 +35,11 @@ type observedErrContext struct {
 	observed chan struct{}
 }
 
-type nthDoneContext struct {
+type cancelOnNthErrContext struct {
 	context.Context
-	at       int32
-	calls    atomic.Int32
-	once     sync.Once
-	observed chan struct{}
+	cancel context.CancelFunc
+	at     int32
+	calls  atomic.Int32
 }
 
 type deadlineSignalContext struct {
@@ -59,46 +58,32 @@ func (c *deadlineSignalContext) Err() error {
 	}
 }
 
-func (c *nthDoneContext) Done() <-chan struct{} {
+func (c *cancelOnNthErrContext) Err() error {
 	if c.calls.Add(1) == c.at {
-		c.once.Do(func() { close(c.observed) })
+		c.cancel()
 	}
-	return c.Context.Done()
+	return c.Context.Err()
 }
 
-func cancelActiveStatement(t *testing.T, statement *stdsql.Stmt, name string) {
+func cancelMutationBeforePublication(t *testing.T, statement *stdsql.Stmt, name string) {
 	t.Helper()
 	base, cancel := context.WithCancel(context.Background())
-	ctx := &nthDoneContext{
-		Context: base, at: 2, observed: make(chan struct{}),
+	defer cancel()
+	ctx := &cancelOnNthErrContext{
+		Context: base,
+		cancel:  cancel,
+		// Cancellation-scope setup and connection admission consume the first
+		// observations. The fourth is inside mutation execution, before its
+		// publication boundary, and is architecture/scheduler independent.
+		at: 4,
 	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := statement.ExecContext(ctx)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		cancel()
-		t.Fatalf("%s completed before its cancellation window: %v", name, err)
-	case <-ctx.observed:
-		// The second Done observation cannot happen until the operation-local
-		// cancellation scope and its watcher are installed. Cancel immediately:
-		// sleeping here makes a fast architecture capable of completing a
-		// bounded mutation before the signal is delivered, which tests scheduler
-		// speed rather than the cancellation contract.
-		cancel()
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatalf("%s did not install its cancellation watcher", name)
+	_, err := statement.ExecContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("active %s = %v, want context.Canceled", name, err)
 	}
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("active %s = %v, want context.Canceled", name, err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("active %s did not stop at a bounded checkpoint", name)
+	if got := ctx.calls.Load(); got < ctx.at {
+		t.Fatalf("active %s used only %d checkpoints, cancellation target was %d",
+			name, got, ctx.at)
 	}
 }
 
@@ -580,7 +565,7 @@ func TestDatabaseSQLCancellationContractIsAtomicAndReusable(t *testing.T) {
 	}
 }
 
-func TestDatabaseSQLCancelsActiveScanAndMutation(t *testing.T) {
+func TestDatabaseSQLCancelsActiveScanAndMutationBeforePublication(t *testing.T) {
 	db := openTestDB(t)
 	db.SetMaxOpenConns(1)
 	for _, table := range []string{"left_docs", "right_docs"} {
@@ -673,11 +658,11 @@ func TestDatabaseSQLCancelsActiveScanAndMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer deleteStmt.Close()
-	cancelActiveStatement(t, deleteStmt, "autocommit DELETE")
+	cancelMutationBeforePublication(t, deleteStmt, "autocommit DELETE")
 
-	// Repeat the scan inside an explicit transaction. A canceled statement must
-	// leave no partial overlay behind, while the transaction itself remains
-	// usable for a later statement and commit.
+	// Repeat the mutation-side cancellation inside an explicit transaction. A
+	// canceled statement must leave no partial overlay behind, while the
+	// transaction itself remains usable for a later statement and commit.
 	transaction, err := sqlConn.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -689,7 +674,7 @@ func TestDatabaseSQLCancelsActiveScanAndMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer txDelete.Close()
-	cancelActiveStatement(t, txDelete, "transaction DELETE")
+	cancelMutationBeforePublication(t, txDelete, "transaction DELETE")
 	if err := txDelete.Close(); err != nil {
 		t.Fatal(err)
 	}
