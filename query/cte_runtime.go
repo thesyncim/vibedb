@@ -86,6 +86,17 @@ type statementCTE struct {
 	references     int
 	firstReference *statementCTEReference
 	runEvaluations uint64
+
+	// recursiveBinding is installed only for one synchronous prepared
+	// recursive-Statement term invocation. Ordinary CTEs keep it nil and pay
+	// no branch until they cross the existing materialization boundary.
+	recursiveBinding *statementRecursiveBinding
+	// recursiveOwner disables CTE fusion while one prepared Statement adapter
+	// designates this definition as its delta relation. The cached plan must
+	// never bypass the materialization hook merely because no invocation is
+	// active at the instant lowering inspects the definition. Identity makes
+	// adapter teardown exact when the borrowed Statement is reused.
+	recursiveOwner *RecursiveCTEStatementTerm
 }
 
 // statementCTEReference owns storage only for reference-local and explicitly
@@ -220,7 +231,9 @@ func (r *statementCTEReference) mode() cteExecutionMode {
 // generalized relation planner; reporting a boundary is preferable to calling
 // a spool "inline".
 func (s *Statement) safeCTEFusionShape(def *statementCTE) bool {
-	if s == nil || def == nil || def.stmt == nil || len(s.tree.Columns) != 1 {
+	if s == nil || def == nil || def.stmt == nil || def.recursiveOwner != nil ||
+		def.recursiveBinding != nil ||
+		len(s.tree.Columns) != 1 {
 		return false
 	}
 	outer := s.tree
@@ -427,6 +440,12 @@ func (d *statementCTE) materializeInto(
 	spool *relationSpool,
 	resource string,
 ) (int64, error) {
+	if d != nil && d.recursiveBinding != nil {
+		d.runEvaluations++
+		return d.recursiveBinding.materializeInto(
+			spool, frame, parent.Options.Cancel, resource,
+		)
+	}
 	args, err := d.boundArgs(frame)
 	if err != nil {
 		return 0, err
