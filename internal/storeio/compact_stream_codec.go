@@ -1091,10 +1091,95 @@ func (v compactStreamView) countDictionaryEqual(needle []byte) (matched int, sup
 	if id < 0 {
 		return 0, true
 	}
-	for row := 0; row < v.count; row++ {
-		if int(compactReadBits(v.data, row*int(v.width), int(v.width))) == id {
+	return countCompactPackedEqual(
+		v.data, v.count, int(v.width), uint64(id),
+	), true
+}
+
+// countCompactPackedEqual consumes every fixed-width dictionary id in lexical
+// row order through one little-endian bit reservoir. Unlike compactReadBits,
+// which is optimized for random access, this scan carries unused bits across
+// rows and avoids recomputing a bit offset and crossing bytes from scratch for
+// every value. Padding after count is deliberately ignored.
+func countCompactPackedEqual(
+	data []byte,
+	count, width int,
+	want uint64,
+) (matched int) {
+	if count <= 0 || width < 0 || width > 16 {
+		return 0
+	}
+	if width == 0 {
+		if want == 0 {
+			return count
+		}
+		return 0
+	}
+	if width == 7 {
+		return countCompactPacked7Equal(data, count, want)
+	}
+	mask := uint64(1)<<uint(width) - 1
+	var reservoir uint64
+	available := 0
+	cursor := 0
+	for range count {
+		for available < width {
+			reservoir |= uint64(data[cursor]) << uint(available)
+			cursor++
+			available += 8
+		}
+		if reservoir&mask == want {
+			matched++
+		}
+		reservoir >>= uint(width)
+		available -= width
+	}
+	return matched
+}
+
+// Eight 7-bit ids occupy exactly seven bytes. This width is common for
+// low-cardinality columns with 65-128 values, and consuming complete groups
+// avoids the generic reservoir's refill branch on almost every row.
+func countCompactPacked7Equal(data []byte, count int, want uint64) (matched int) {
+	row := 0
+	cursor := 0
+	for ; row+8 <= count; row, cursor = row+8, cursor+7 {
+		packed := uint64(data[cursor]) |
+			uint64(data[cursor+1])<<8 |
+			uint64(data[cursor+2])<<16 |
+			uint64(data[cursor+3])<<24 |
+			uint64(data[cursor+4])<<32 |
+			uint64(data[cursor+5])<<40 |
+			uint64(data[cursor+6])<<48
+		if packed&0x7f == want {
+			matched++
+		}
+		if packed>>7&0x7f == want {
+			matched++
+		}
+		if packed>>14&0x7f == want {
+			matched++
+		}
+		if packed>>21&0x7f == want {
+			matched++
+		}
+		if packed>>28&0x7f == want {
+			matched++
+		}
+		if packed>>35&0x7f == want {
+			matched++
+		}
+		if packed>>42&0x7f == want {
+			matched++
+		}
+		if packed>>49&0x7f == want {
 			matched++
 		}
 	}
-	return matched, true
+	for ; row < count; row++ {
+		if compactReadBits(data, row*7, 7) == want {
+			matched++
+		}
+	}
+	return matched
 }

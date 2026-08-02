@@ -24,15 +24,17 @@ are the next two measured performance targets.
 
 The log-filter path has a fused execution lane for `COUNT(*)` equality queries.
 On the 100,000-row low-cardinality log-like probe, the current fair adapter
-measured about 0.78 µs for a random point read, 0.226 ms for an unindexed equality
-count, and 5.2 µs for the same count through an exact `country` index. The
-unindexed result is a complete 100,000-row scan (945 matches,
-about 2.26 ns/document), not candidate pruning: the storage cursor resolves the
-field once per durable leaf template and compares its scalar tokens without
-reconstructing each JSON document. Rows that cannot be decided from tokens are
-rendered individually and reported through `TokenFilterFallbackRows`;
-`RowsScanned` still reports the complete corpus and `IndexBounded` remains
-false.
+measured about 0.76 µs for a random point read, 0.069 ms for an unindexed
+equality count, and 5.2 µs for the same count through an exact `country` index.
+The unindexed result is a complete 100,000-row scan (945 matches, about
+0.69 ns/document), not candidate pruning: the storage cursor resolves the
+field once per durable leaf template and compares every packed scalar ID
+without reconstructing each JSON document. A sequential bit reservoir carries
+unused ID bits between rows; seven-bit dictionaries additionally consume eight
+IDs per exact seven-byte block. Neither path consults value postings or skips
+encoded IDs. Rows that cannot be decided from tokens are rendered individually
+and reported through `TokenFilterFallbackRows`; `RowsScanned` still reports the
+complete corpus and `IndexBounded` remains false.
 
 The point-read path acquires the same immutable page-cache lease as before, but
 now opens the compact payload from the lease's already validated header and
@@ -76,7 +78,7 @@ use the exact largest-prefix search.
 
 A local ClickHouse control over the same flattened 100,000-row corpus measured
 about 1.49 ms with `ORDER BY key` and no secondary data-skipping index. The
-current warmed VibeDB public count is about 6.6× faster while performing the
+current warmed VibeDB public count is about 21.6× faster while performing the
 same full-corpus logical scan and using no filter index. For context,
 ClickHouse measured about 1.34 ms with the primary layout aligned as
 `ORDER BY (country, key)`, and about 1.97 ms with a mixed-value `set` skipping
@@ -96,17 +98,15 @@ files, matching the ClickHouse per-table accounting.
 | ClickHouse typed, `ORDER BY key`, no skipping index | **2,713,077** | **27.13** | about **1.49 ms** |
 | ClickHouse typed, `ORDER BY (country, key)` | 2,992,629 | 29.93 | about 1.34 ms |
 | ClickHouse raw JSON, `ORDER BY key` | 4,565,499 | 45.65 | not measured in this control |
-| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **0.226 ms**, zero allocations, through the warmed public query API |
-| VibeDB compact scan kernel | same file | 11.18 | about **0.35 ms**, zero allocations |
+| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **0.069 ms**, zero allocations, through the warmed public query API |
 
 The compact VibeDB database file is 2.43× smaller than the fair typed
-ClickHouse table. Its warmed public query path is about 6.6× faster in this
-control; the storage-native full-scan kernel is about 4.3× faster. Both VibeDB rows scan all
-100,000 field IDs: neither uses an index, candidate list, or data skipping.
-The aligned ClickHouse row is kept separate because `country` participates in
-its sparse primary index and physical order. The raw-JSON row is a useful
-representation control, but its filter speed must not be borrowed from the
-typed table.
+ClickHouse table. Its warmed public query path is about 21.6× faster in this
+control while scanning all 100,000 field IDs; it uses no index, candidate list,
+or data skipping. The aligned ClickHouse row is kept separate because
+`country` participates in its sparse primary index and physical order. The
+raw-JSON row is a useful representation control, but its filter speed must not
+be borrowed from the typed table.
 
 The retired class-5 leaf census explained the former gap. Its 66.93 physical
 leaf bytes per document split into 41.77 row-token bytes, 12.00 key bytes, 5.18 structural

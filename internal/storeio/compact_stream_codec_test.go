@@ -106,6 +106,33 @@ func TestCompactStreamAdaptiveSelectionAndCount(t *testing.T) {
 	}
 }
 
+func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
+	for width := 0; width <= 16; width++ {
+		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {
+			data := make([]byte, (count*width+7)/8)
+			mask := uint64(0)
+			if width != 0 {
+				mask = uint64(1)<<uint(width) - 1
+			}
+			want := mask / 3
+			expected := 0
+			for row := 0; row < count; row++ {
+				value := uint64(row*17+row/3) & mask
+				compactPutBits(data, row*width, width, value)
+				if value == want {
+					expected++
+				}
+			}
+			if got := countCompactPackedEqual(data, count, width, want); got != expected {
+				t.Fatalf(
+					"width=%d count=%d got=%d want=%d",
+					width, count, got, expected,
+				)
+			}
+		}
+	}
+}
+
 func TestCompactStreamRejectsCorruptFraming(t *testing.T) {
 	values := [][]byte{[]byte(`"PT"`), []byte(`"US"`), []byte(`"PT"`)}
 	encoded, err := encodeCompactScalarStream(values).appendBinary(nil)
