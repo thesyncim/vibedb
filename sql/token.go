@@ -35,7 +35,8 @@ const (
 	tokMinus
 	tokSlash
 	tokPercent
-	tokConcat // ||
+	tokConcat      // ||
+	tokDoubleColon // ::, retained so the unsupported shorthand is typed 0A000
 )
 
 // A token is one lexeme. text is a slice of the source for identifiers,

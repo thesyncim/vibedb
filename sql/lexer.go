@@ -178,7 +178,7 @@ func (lx *lexer) next() token {
 		return errorToken(start, "bitwise operators are not supported")
 	case ':':
 		if lx.accept(':') {
-			return errorToken(start, "cast syntax (::) is not supported")
+			return token{kind: tokDoubleColon, pos: start}
 		}
 		return errorToken(start, "named parameters are not supported; use '?' placeholders")
 	case '$':

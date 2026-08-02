@@ -159,6 +159,8 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 			return reflect.TypeFor[int64]()
 		case schema[index].Representation == query.OutputSQLText:
 			return reflect.TypeFor[[]byte]()
+		case schema[index].Representation == query.OutputSQLBool:
+			return reflect.TypeFor[bool]()
 		}
 	}
 	return reflect.TypeFor[any]()
@@ -184,6 +186,8 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 		return "TEXT"
 	case query.OutputSQLNumber:
 		return "NUMERIC"
+	case query.OutputSQLBool:
+		return "BOOLEAN"
 	default:
 		return "JSON"
 	}

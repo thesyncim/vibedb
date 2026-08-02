@@ -57,11 +57,13 @@ import (
 // produce rather than refused, which removes the worst failure mode available
 // instead of documenting it.
 //
-// The exception is COUNT, which is declared int8 (OID 20). A row tally is
-// genuinely an int64 — it is the one column in this dialect with a real static
-// type — and clients want to scan it into an integer rather than through a JSON
-// decoder. int8's binary format is eight big-endian bytes, which is the other
-// encoding this package can be certain of.
+// Statically typed SQL expressions are the exceptions. COUNT and integer
+// window reductions are int8 (OID 20); concatenation and CAST AS TEXT are text
+// (OID 25); CAST AS BOOLEAN is bool (OID 16). Their text and binary encodings
+// are implemented and checked as a pair below. Exact arithmetic and CAST AS
+// NUMERIC remain json deliberately: PostgreSQL numeric's binary base-10000
+// format is not advertised until a separately validated numeric_send exists,
+// while json carries every exact decimal spelling without a float fallback.
 //
 // # What the mapping costs
 //
@@ -135,6 +137,8 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 				typ = typeInt8
 			case schema[i].Representation == query.OutputSQLText:
 				typ = typeText
+			case schema[i].Representation == query.OutputSQLBool:
+				typ = typeBool
 			}
 		}
 		dst = append(dst, column{name: name, typ: typ})

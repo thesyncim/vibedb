@@ -60,6 +60,7 @@ const (
 	sqlstateCharacterNotInRepertoire   = "22021"
 	sqlstateDivisionByZero             = "22012"
 	sqlstateNumericValueOutOfRange     = "22003"
+	sqlstateInvalidTextRepresentation  = "22P02"
 	sqlstateInvalidParameterValue      = "22023"
 	sqlstateCardinalityViolation       = "21000"
 	sqlstateProgramLimitExceeded       = "54000"
@@ -203,6 +204,8 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateDivisionByZero, err.Error())
 	case errors.Is(err, query.ErrScalarNumericRange):
 		return newError(sqlstateNumericValueOutOfRange, err.Error())
+	case errors.Is(err, query.ErrScalarInvalidText):
+		return newError(sqlstateInvalidTextRepresentation, err.Error())
 	case errors.Is(err, query.ErrUndefinedColumn):
 		return newError(sqlstateUndefinedColumn, err.Error())
 	case errors.Is(err, query.ErrAmbiguousColumn):

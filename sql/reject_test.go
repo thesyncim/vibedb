@@ -107,7 +107,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"CASE", `SELECT a FROM t WHERE CASE WHEN b THEN 1 END = 1`, 22, "CASE"},
-		{"CAST", `SELECT a FROM t WHERE CAST(b AS text) = 1`, 22, "CAST"},
 		{"the cast operator", `SELECT a FROM t WHERE b::text = 'x'`, 23, "::"},
 		{"scalar functions", `SELECT lower(a) FROM t`, 12, "not a supported function"},
 		// Parse is the SELECT-only entry point. These three are statements the

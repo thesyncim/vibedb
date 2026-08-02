@@ -60,11 +60,13 @@ const (
 	statementScalarNull
 	statementScalarUnary
 	statementScalarBinary
+	statementScalarCast
 )
 
 type statementScalarNode struct {
 	kind       statementScalarNodeKind
 	op         sqlast.ScalarOp
+	cast       sqlast.ScalarCastTarget
 	left       int32
 	right      int32
 	dependency int32
@@ -93,6 +95,9 @@ type statementScalarValue struct {
 	value  scalar
 	cell   Cell
 	direct bool
+	// exact retains a newly parsed JSON cast's authored representation. Unlike
+	// direct, its cell borrows evalArena and must be copied at publication.
+	exact bool
 }
 
 // statementScalar is the cold prepared sidecar. It owns both the postorder
@@ -290,6 +295,17 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		r.nodes = append(r.nodes, statementScalarNode{
 			kind: statementScalarBinary, op: expr.Op, left: left, right: right, pos: expr.Pos,
 		})
+	case sqlast.ScalarCast:
+		if expr.Cast > sqlast.ScalarCastJSON {
+			return 0, fmt.Errorf("query: invalid scalar CAST target %d", expr.Cast)
+		}
+		left, err := r.compileExpr(s, expr.Left)
+		if err != nil {
+			return 0, err
+		}
+		r.nodes = append(r.nodes, statementScalarNode{
+			kind: statementScalarCast, cast: expr.Cast, left: left, right: -1, pos: expr.Pos,
+		})
 	default:
 		return 0, fmt.Errorf("query: invalid scalar expression kind %d", expr.Kind)
 	}
@@ -469,6 +485,17 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 			return TypeString
 		}
 		return TypeNumber
+	case statementScalarCast:
+		switch node.cast {
+		case sqlast.ScalarCastText:
+			return TypeString
+		case sqlast.ScalarCastBoolean:
+			return TypeBool
+		case sqlast.ScalarCastNumeric:
+			return TypeNumber
+		default:
+			return TypeAny
+		}
 	default:
 		return TypeAny
 	}
@@ -497,14 +524,32 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 			return OutputSQLText
 		}
 		return OutputSQLNumber
+	case statementScalarCast:
+		switch node.cast {
+		case sqlast.ScalarCastText:
+			return OutputSQLText
+		case sqlast.ScalarCastBoolean:
+			return OutputSQLBool
+		case sqlast.ScalarCastNumeric:
+			return OutputSQLNumber
+		default:
+			return OutputJSON
+		}
 	default:
 		return OutputJSON
 	}
 }
 
-func (r *statementScalar) evalNodes(result *Result, row, count int, arena *[]byte, budget *aggregateBudget) error {
+func (r *statementScalar) evalNodes(
+	result *Result,
+	row, start, end int,
+	arena *[]byte,
+	budget *aggregateBudget,
+	intermediate *intermediateBudget,
+	intermediateCharge *int64,
+) error {
 	r.values = resize(r.values, len(r.nodes))
-	for i := 0; i < count; i++ {
+	for i := start; i < end; i++ {
 		node := &r.nodes[i]
 		var value statementScalarValue
 		switch node.kind {
@@ -566,6 +611,15 @@ func (r *statementScalar) evalNodes(result *Result, row, count int, arena *[]byt
 				return err
 			}
 			value.value = classifyComputedNumber((*arena)[start:])
+		case statementScalarCast:
+			var err error
+			value, err = r.evalCast(
+				node, r.values[node.left], arena, budget,
+				intermediate, intermediateCharge,
+			)
+			if err != nil {
+				return err
+			}
 		}
 		r.values[i] = value
 	}
@@ -765,6 +819,20 @@ func (r *statementScalar) resultCell(value statementScalarValue, arena *[]byte) 
 	if value.direct {
 		return value.cell
 	}
+	if value.exact {
+		cell := value.cell
+		if len(cell.text) != 0 {
+			start := len(*arena)
+			*arena = append(*arena, cell.text...)
+			cell.text = byteview.String((*arena)[start:len(*arena):len(*arena)])
+		}
+		if len(cell.raw) != 0 && cell.kind != TypeNull && cell.kind != TypeBool {
+			start := len(*arena)
+			*arena = append(*arena, cell.raw...)
+			cell.raw = (*arena)[start:len(*arena):len(*arena)]
+		}
+		return cell
+	}
 	switch value.value.kind {
 	case kindNull:
 		return nullCell()
@@ -834,24 +902,34 @@ func (r *statementScalar) execute(
 	// exact caller-visible cardinality before any output slice grows.
 	rows, skipped := 0, 0
 	for row := 0; row < inputRows; row++ {
+		// LIMIT is a semantic execution bound, not merely an output trim. Once
+		// enough admitted rows exist, neither later predicates nor projections
+		// may be evaluated (and their errors must remain unobserved).
+		if s.hasLimit && rows >= s.limit {
+			break
+		}
 		if err := cancellationCheckpoint(options.Cancel, row); err != nil {
 			result.abortResult()
 			return Cursor{}, err
 		}
 		r.evalArena = r.evalArena[:0]
-		if err := r.evalNodes(result, row, r.predicateNodes, &r.evalArena, &exec.Workspace.aggregateBudget); err != nil {
+		dynamicCharge := int64(0)
+		if err := r.evalNodes(
+			result, row, 0, r.predicateNodes, &r.evalArena,
+			&exec.Workspace.aggregateBudget, &frame.intermediate, &dynamicCharge,
+		); err != nil {
+			frame.intermediate.release(dynamicCharge)
 			result.abortResult()
 			return Cursor{}, err
 		}
-		if !r.keep() {
+		keep := r.keep()
+		frame.intermediate.release(dynamicCharge)
+		if !keep {
 			continue
 		}
 		if skipped < s.offset {
 			skipped++
 			continue
-		}
-		if s.hasLimit && rows >= s.limit {
-			break
 		}
 		rows++
 	}
@@ -902,16 +980,38 @@ func (r *statementScalar) execute(
 			return Cursor{}, err
 		}
 		r.evalArena = r.evalArena[:0]
-		if err := r.evalNodes(result, row, len(r.nodes), &r.evalArena, &exec.Workspace.aggregateBudget); err != nil {
+		predicateCharge := int64(0)
+		if err := r.evalNodes(
+			result, row, 0, r.predicateNodes, &r.evalArena,
+			&exec.Workspace.aggregateBudget, &frame.intermediate, &predicateCharge,
+		); err != nil {
+			frame.intermediate.release(predicateCharge)
 			result.abortResult()
 			return Cursor{}, err
 		}
-		if !r.keep() {
+		keep := r.keep()
+		frame.intermediate.release(predicateCharge)
+		if !keep {
 			continue
 		}
 		if skipped < s.offset {
 			skipped++
 			continue
+		}
+
+		// Every output expression owns a postorder node interval compiled after
+		// predicateNodes. Resetting the arena after WHERE/OFFSET therefore drops
+		// predicate temporaries without invalidating any output dependency, and
+		// guarantees filtered/skipped rows never evaluate projection errors.
+		r.evalArena = r.evalArena[:0]
+		outputCharge := int64(0)
+		if err := r.evalNodes(
+			result, row, r.predicateNodes, len(r.nodes), &r.evalArena,
+			&exec.Workspace.aggregateBudget, &frame.intermediate, &outputCharge,
+		); err != nil {
+			frame.intermediate.release(outputCharge)
+			result.abortResult()
+			return Cursor{}, err
 		}
 		r.outputValues = resize(r.outputValues, len(r.outputs))
 		for i, root := range r.outputs {
@@ -920,10 +1020,12 @@ func (r *statementScalar) execute(
 		for column := range r.outputs {
 			cell := r.resultCell(r.outputValues[column], &r.resultArena)
 			if err := result.admitResultCell(cell); err != nil {
+				frame.intermediate.release(outputCharge)
 				return Cursor{}, err
 			}
 			result.Columns[column].Cells[outRow] = cell
 		}
+		frame.intermediate.release(outputCharge)
 		outRow++
 	}
 	for column := range r.outputs {

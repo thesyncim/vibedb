@@ -30,6 +30,7 @@ func (c scalarExprContext) clause() string {
 
 type scalarParserState struct {
 	nodes chunkArena[ScalarExpr]
+	depth int
 	sized bool
 }
 
@@ -39,6 +40,7 @@ func (s *scalarParserState) reset() {
 		s.sized = true
 	}
 	s.nodes.rewind()
+	s.depth = 0
 }
 
 func (p *Parser) scalarState() *scalarParserState {
@@ -69,7 +71,7 @@ func scalarStarts(tok token) bool {
 
 func scalarContinues(tok token) bool {
 	switch tok.kind {
-	case tokPlus, tokMinus, tokStar, tokSlash, tokPercent, tokConcat:
+	case tokPlus, tokMinus, tokStar, tokSlash, tokPercent, tokConcat, tokDoubleColon:
 		return true
 	case tokNumber:
 		// The legacy lexer keeps a directly adjacent negative sign in a JSON
@@ -118,6 +120,12 @@ func (p *Parser) parseScalarBinary(
 		}
 	}
 	for {
+		if p.tok.kind == tokDoubleColon {
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"the PostgreSQL :: cast shorthand is not supported; use CAST(expression AS type)",
+			)
+		}
 		op, precedence, pos, embedded := scalarBinaryToken(p.tok)
 		if precedence < minimum {
 			return left, nil
@@ -163,6 +171,12 @@ func scalarBinaryToken(tok token) (ScalarOp, int, int, bool) {
 }
 
 func (p *Parser) parseScalarUnary(ctx scalarExprContext) (*ScalarExpr, error) {
+	state := p.scalarState()
+	if state.depth >= maxExprDepth {
+		return nil, p.errHere("a scalar expression may nest at most 64 levels")
+	}
+	state.depth++
+	defer func() { state.depth-- }()
 	if p.tok.kind != tokPlus && p.tok.kind != tokMinus {
 		return p.parseScalarPrimary(ctx)
 	}
@@ -202,10 +216,7 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 			"CASE scalar expressions are not supported by this execution slice yet",
 		)
 	case p.atKeyword(kwCast):
-		return nil, newFeatureNotSupportedError(
-			p.lx.src, pos,
-			"CAST scalar expressions are not supported by this execution slice yet",
-		)
+		return p.parseScalarCast(ctx)
 	case p.tok.kind == tokNumber, p.tok.kind == tokString,
 		p.tok.kind == tokParam, p.atKeyword(kwTrue), p.atKeyword(kwFalse):
 		value, err := p.parseOperand()
@@ -251,6 +262,80 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 	}
 }
 
+func (p *Parser) parseScalarCast(ctx scalarExprContext) (*ScalarExpr, error) {
+	pos := p.tok.pos
+	p.advance() // CAST
+	if err := p.expect(tokLParen, "'(' after CAST"); err != nil {
+		return nil, err
+	}
+	child, err := p.parseScalarExpression(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword(kwAs, "AS in CAST"); err != nil {
+		return nil, err
+	}
+	targetPos := p.tok.pos
+	if p.tok.kind != tokIdent {
+		return nil, newFeatureNotSupportedError(
+			p.lx.src, targetPos,
+			"CAST requires one supported unquoted target: TEXT, BOOLEAN, NUMERIC, DECIMAL, or JSON",
+		)
+	}
+	target, ok := scalarCastTargetOf(p.tok.text)
+	if !ok {
+		return nil, newFeatureNotSupportedError(
+			p.lx.src, targetPos,
+			"CAST target "+p.tok.text+" is not supported; use TEXT, BOOLEAN, NUMERIC, DECIMAL, or JSON",
+		)
+	}
+	p.advance()
+	if p.tok.kind != tokRParen {
+		return nil, newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"CAST type modifiers, arrays, collations, and multi-word targets are not supported",
+		)
+	}
+	p.advance()
+	node := p.newScalar(ScalarCast, pos)
+	node.Cast, node.Left, node.TargetPos = target, child, targetPos
+	return node, nil
+}
+
+func scalarCastTargetOf(text string) (ScalarCastTarget, bool) {
+	switch {
+	case equalFoldASCII(text, "text"):
+		return ScalarCastText, true
+	case equalFoldASCII(text, "boolean"), equalFoldASCII(text, "bool"):
+		return ScalarCastBoolean, true
+	case equalFoldASCII(text, "numeric"), equalFoldASCII(text, "decimal"):
+		return ScalarCastNumeric, true
+	case equalFoldASCII(text, "json"):
+		return ScalarCastJSON, true
+	default:
+		return 0, false
+	}
+}
+
+func equalFoldASCII(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		a, b := left[i], right[i]
+		if a >= 'A' && a <= 'Z' {
+			a += 'a' - 'A'
+		}
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
 func shiftScalarPositions(expr *ScalarExpr, delta int) {
 	if expr == nil {
 		return
@@ -259,6 +344,9 @@ func shiftScalarPositions(expr *ScalarExpr, delta int) {
 	shiftPathPosition(expr.Path, delta)
 	if expr.Kind == ScalarLiteral {
 		expr.Value.Pos += delta
+	}
+	if expr.Kind == ScalarCast {
+		expr.TargetPos += delta
 	}
 	shiftScalarPositions(expr.Left, delta)
 	shiftScalarPositions(expr.Right, delta)

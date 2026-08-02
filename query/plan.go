@@ -50,6 +50,7 @@ const (
 	OutputJSON OutputRepresentation = iota
 	OutputSQLNumber
 	OutputSQLText
+	OutputSQLBool
 )
 
 // OutputColumn is cold result-schema metadata. Ordinal is the stable column ID
@@ -64,8 +65,8 @@ type OutputColumn struct {
 	Type ValueType
 	// Representation is independent of Type. VALUES, ordinary projections,
 	// set operands, and EXPLAIN may have a statically known cell kind while
-	// still retaining exact JSON encoding. Computed arithmetic and
-	// concatenation explicitly select their SQL boundary representation.
+	// still retaining exact JSON encoding. Computed arithmetic, concatenation,
+	// and explicit CAST targets select their SQL boundary representation.
 	Representation OutputRepresentation
 }
 

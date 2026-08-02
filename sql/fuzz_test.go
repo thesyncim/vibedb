@@ -64,6 +64,9 @@ func FuzzParseSQL(f *testing.F) {
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
 		`SELECT a FROM t WHERE b LIKE 'x'`,
 		`SELECT a-1, a -1, a - 1, - - -a, a*2, 1e-2 + 3E+4 FROM t`,
+		`SELECT CAST(amount AS NUMERIC), CAST(flag AS BOOLEAN), ` +
+			`CAST(payload AS JSON), CAST(id AS TEXT) FROM docs ` +
+			`WHERE CAST(score AS NUMERIC) >= CAST(? AS NUMERIC)`,
 		`SELECT * FROM t`,
 		`SELECT a + 1 AS computed FROM t ORDER BY computed`,
 		`(((((((((((`,
@@ -561,6 +564,11 @@ func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *La
 		}
 		return checkScalarInvariants(t, s, e.Left, outer) +
 			checkScalarInvariants(t, s, e.Right, outer)
+	case ScalarCast:
+		if e.Left == nil || e.Right != nil || e.Path != nil || e.Cast > ScalarCastJSON {
+			t.Fatalf("scalar CAST has invalid payload: %+v", e)
+		}
+		return checkScalarInvariants(t, s, e.Left, outer)
 	default:
 		t.Fatalf("unknown scalar kind %d", e.Kind)
 		return 0
