@@ -262,9 +262,35 @@ func (c *conn) expandPreparedViews(
 	source string,
 	tree *sqlast.SelectStmt,
 ) ([]viewDependency, error) {
-	views, err := c.snapshotViewCatalog(ctx)
-	if err != nil || len(views) == 0 {
+	if c.tx != nil {
+		if c.tx.done {
+			return nil, errors.New("vibedb: transaction is finished")
+		}
+		return c.expandPreparedViewsFromCatalog(ctx, source, tree, c.tx.views)
+	}
+	if err := rlockContext(ctx, &c.db.mu); err != nil {
 		return nil, err
+	}
+	// viewMeta objects are immutable generations. Keep the catalog read lock
+	// for the bounded admission/expansion pass instead of cloning the complete
+	// map for every preparation. The dependency sidecar below retains only the
+	// exact generation pointers it used, so those objects remain alive after
+	// unlock even when a later DROP removes their map entries.
+	dependencies, err := c.expandPreparedViewsFromCatalog(
+		ctx, source, tree, c.db.catalog.Views,
+	)
+	c.db.mu.RUnlock()
+	return dependencies, err
+}
+
+func (c *conn) expandPreparedViewsFromCatalog(
+	ctx context.Context,
+	source string,
+	tree *sqlast.SelectStmt,
+	views map[string]*viewMeta,
+) ([]viewDependency, error) {
+	if len(views) == 0 || !selectReferencesCatalogView(tree, views) {
+		return nil, nil
 	}
 	check := func() error {
 		if err := contextCheckpoint(ctx); err != nil {
@@ -296,25 +322,81 @@ func (c *conn) expandPreparedViews(
 	return dependencies, nil
 }
 
-func (c *conn) snapshotViewCatalog(ctx context.Context) (map[string]*viewMeta, error) {
-	if c.tx != nil {
-		if c.tx.done {
-			return nil, errors.New("vibedb: transaction is finished")
+// selectReferencesCatalogView is the exact, allocation-free admission check
+// for the cold expander. It mirrors ExpandSQLViews' authored-AST traversal but
+// stops at the first relation whose name is present in this immutable catalog
+// cut. A large unrelated view catalog therefore adds neither O(view-count)
+// copying nor expander-side allocations to ordinary SELECT preparation.
+func selectReferencesCatalogView(
+	tree *sqlast.SelectStmt,
+	views map[string]*viewMeta,
+) bool {
+	if tree == nil {
+		return false
+	}
+	if tree.Set != nil {
+		return setReferencesCatalogView(tree.Set.Root, views)
+	}
+	if tree.With != nil {
+		for i := range tree.With.CTEs {
+			if selectReferencesCatalogView(tree.With.CTEs[i].Query, views) {
+				return true
+			}
 		}
-		return c.tx.views, nil
 	}
-	if err := rlockContext(ctx, &c.db.mu); err != nil {
-		return nil, err
+	for i := range tree.From {
+		reference := &tree.From[i]
+		switch reference.Kind {
+		case sqlast.RelationCollection:
+			if _, exists := views[reference.Name]; exists {
+				return true
+			}
+		case sqlast.RelationDerived:
+			if selectReferencesCatalogView(reference.Query, views) {
+				return true
+			}
+		}
 	}
-	defer c.db.mu.RUnlock()
-	if len(c.db.catalog.Views) == 0 {
-		return nil, nil
+	return exprReferencesCatalogView(tree.Where, views) ||
+		exprReferencesCatalogView(tree.Having, views)
+}
+
+func setReferencesCatalogView(
+	expression *sqlast.SetExpr,
+	views map[string]*viewMeta,
+) bool {
+	if expression == nil {
+		return false
 	}
-	views := make(map[string]*viewMeta, len(c.db.catalog.Views))
-	for name, meta := range c.db.catalog.Views {
-		views[name] = meta
+	switch expression.Kind {
+	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
+		return selectReferencesCatalogView(expression.Select, views)
+	case sqlast.SetBinaryExpr:
+		return setReferencesCatalogView(expression.Left, views) ||
+			setReferencesCatalogView(expression.Right, views)
+	case sqlast.SetGroupExpr:
+		return setReferencesCatalogView(expression.Child, views)
+	default:
+		return false
 	}
-	return views, nil
+}
+
+func exprReferencesCatalogView(
+	expression *sqlast.Expr,
+	views map[string]*viewMeta,
+) bool {
+	if expression == nil {
+		return false
+	}
+	if selectReferencesCatalogView(expression.Subquery, views) {
+		return true
+	}
+	for i := range expression.Kids {
+		if exprReferencesCatalogView(expression.Kids[i], views) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *stmt) validateTransactionViewDependencies() error {

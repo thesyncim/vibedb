@@ -2,8 +2,48 @@ package driver
 
 import (
 	sqldriver "database/sql/driver"
+	"fmt"
 	"testing"
 )
+
+func BenchmarkPrepareUnrelatedSelectViewCatalog(b *testing.B) {
+	for _, views := range [...]int{0, maxCatalogViews} {
+		b.Run(fmt.Sprintf("views=%d", views), func(b *testing.B) {
+			connection := directTestConn(b).(*conn)
+			directExec(b, connection,
+				`CREATE TABLE docs (id STRING PRIMARY KEY, n NUMBER NOT NULL)`, nil)
+			connection.db.mu.Lock()
+			for i := 0; i < views; i++ {
+				name := fmt.Sprintf("unrelated_%03d", i)
+				connection.db.catalog.Views[name] = &viewMeta{
+					Query: `SELECT id FROM docs`, Outputs: []string{"id"},
+					TableDependencies: []string{"docs"},
+				}
+			}
+			connection.db.mu.Unlock()
+
+			const source = `SELECT n FROM docs WHERE id = ?`
+			statement, err := connection.Prepare(source)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := statement.Close(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				statement, err := connection.Prepare(source)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := statement.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 func BenchmarkPreparedOrdinaryViewPointQuery(b *testing.B) {
 	connection := directTestConn(b)

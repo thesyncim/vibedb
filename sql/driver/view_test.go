@@ -152,6 +152,44 @@ func TestDatabaseSQLViewReopenRevalidationAndPreparedGeneration(t *testing.T) {
 	}
 }
 
+func TestPreparedViewDependencyRetainsImmutableGeneration(t *testing.T) {
+	connection := directTestConn(t).(*conn)
+	directExec(t, connection,
+		`CREATE TABLE docs (id STRING PRIMARY KEY, n NUMBER NOT NULL)`, nil)
+	directExec(t, connection,
+		`CREATE VIEW selected AS SELECT id, n FROM docs`, nil)
+
+	statement, err := connection.Prepare(`SELECT id FROM selected`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := statement.(*stmt)
+	if prepared.views == nil || len(prepared.views.dependencies) != 1 {
+		statement.Close()
+		t.Fatalf("prepared dependencies = %#v", prepared.views)
+	}
+	generation := prepared.views.dependencies[0].meta
+	if generation == nil || generation.Query != `SELECT id, n FROM docs` {
+		statement.Close()
+		t.Fatalf("retained generation = %#v", generation)
+	}
+
+	connection.db.mu.Lock()
+	delete(connection.db.catalog.Views, "selected")
+	connection.db.mu.Unlock()
+	if generation.Query != `SELECT id, n FROM docs` {
+		statement.Close()
+		t.Fatalf("retained generation changed after catalog removal: %#v", generation)
+	}
+	if err := prepared.validatePreparedViewDependencies(context.Background()); !errors.Is(err, ErrViewChanged) {
+		statement.Close()
+		t.Fatalf("removed generation validation = %v, want ErrViewChanged", err)
+	}
+	if err := statement.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDatabaseSQLViewTransactionRetainsDefinitionAndTableSnapshot(t *testing.T) {
 	db := openTestDB(t)
 	db.SetMaxOpenConns(2)
