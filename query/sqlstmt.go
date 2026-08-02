@@ -152,6 +152,7 @@ type nestedStatements struct {
 	relationJoin *statementRelationJoin
 	window       *statementWindow
 	set          *statementSetSQL
+	scalar       *statementScalar
 	ctes         *statementCTEs
 	cte          *statementCTEReference
 	ownsCTEs     bool
@@ -360,6 +361,10 @@ func prepareTreeInCorrelationContext(
 			return nil, err
 		}
 	}
+	if err := s.prepareScalar(); err != nil {
+		s.Release()
+		return nil, err
+	}
 	if s.window() != nil {
 		s.requiresCatalog = s.window().input.RequiresCatalog()
 		s.drivingPredicate = s.window().input.DrivingPredicate()
@@ -481,6 +486,9 @@ func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
 	if set := s.setSQL(); set != nil {
 		return set.AppendSchema(dst)
 	}
+	if scalar := s.scalarStatement(); scalar != nil {
+		return scalar.appendSchema(dst, s.names)
+	}
 	start := len(dst)
 	dst = s.q.AppendSchema(dst)
 	if len(dst)-start > s.outputs {
@@ -508,6 +516,7 @@ func (s *Statement) Release() {
 		if s.nested.set != nil {
 			s.nested.set.Release()
 		}
+		s.nested.scalar = nil
 		for i := range s.nested.subqueries {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
@@ -690,6 +699,40 @@ func (s *Statement) runIntoFrame(
 		// deeper derived relation or predicate subquery may have consumed part
 		// of the allowance since this nested statement began.
 		e.Options.ResultBytes = remaining
+	}
+	if scalar := s.scalarStatement(); scalar != nil {
+		options := e.Options
+		remaining := frame.intermediate.remaining()
+		if remaining == 0 {
+			s.releaseRelations(frame)
+			return Cursor{}, &IntermediateBudgetError{
+				Resource: "scalar dependency result",
+				Bytes:    saturatedBytes(frame.intermediate.used, 1),
+				Limit:    frame.intermediate.limit,
+			}
+		}
+		e.Options.ResultRows = -1
+		e.Options.ResultBytes = remaining
+		err := s.q.RunInto(e, runSource)
+		e.Options = options
+		if err != nil {
+			clearExecBorrowedViews(e)
+			s.releaseRelations(frame)
+			var resultErr *ResultBudgetError
+			if errors.As(err, &resultErr) && resultErr.ByteLimit == remaining {
+				return Cursor{}, &IntermediateBudgetError{
+					Resource: "scalar dependency result",
+					Bytes:    saturatedBytes(frame.intermediate.used, resultErr.Bytes),
+					Limit:    frame.intermediate.limit,
+				}
+			}
+			return Cursor{}, err
+		}
+		cursor, err := scalar.execute(s, e, frame, options, intermediateResource)
+		if err != nil {
+			s.releaseRelations(frame)
+		}
+		return cursor, err
 	}
 	if err := s.q.RunInto(e, runSource); err != nil {
 		// A relation execution may have parked grouped/order state that borrows
@@ -1256,6 +1299,11 @@ func (s *Statement) describe() error {
 	s.names = reserve(s.names[:0], capacity)
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
+		if column.Scalar != nil {
+			s.names = append(s.names, s.columnName(column))
+			s.outputs++
+			continue
+		}
 		if s.hasRelationBinding() && column.Agg == sqlast.AggNone &&
 			column.Path != nil && len(column.Path.Segments) == 0 {
 			relation := s.relationBindingForSource(column.Path.Source)
@@ -1279,6 +1327,9 @@ func (s *Statement) describe() error {
 func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 	if col.Alias != "" {
 		return col.Alias
+	}
+	if col.Scalar != nil {
+		return "?column?"
 	}
 	spec := s.spec(col.Path)
 	if s.relationJoin() != nil && col.Path != nil {

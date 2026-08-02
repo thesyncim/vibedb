@@ -267,10 +267,24 @@ func (p *Parser) validate() error {
 	aggregates, projections := 0, 0
 	firstProjection := -1
 	for i := range p.out.Columns {
-		if p.out.Columns[i].Window != nil {
+		column := &p.out.Columns[i]
+		if column.Window != nil {
 			continue
 		}
-		if p.out.Columns[i].Agg == AggNone {
+		if column.Scalar != nil {
+			hasPath, hasAggregate := scalarDependencyKinds(column.Scalar)
+			if hasPath {
+				projections++
+				if firstProjection < 0 {
+					firstProjection = i
+				}
+			}
+			if hasAggregate {
+				aggregates++
+			}
+			continue
+		}
+		if column.Agg == AggNone {
 			projections++
 			if firstProjection < 0 {
 				firstProjection = i
@@ -282,6 +296,14 @@ func (p *Parser) validate() error {
 	if grouped {
 		for i := range p.out.Columns {
 			column := &p.out.Columns[i]
+			if column.Scalar != nil {
+				if path := firstUngroupedScalarPath(p, column.Scalar); path != nil {
+					return p.errfAt(path.Pos,
+						"scalar expression reads path %q, which is not a GROUP BY key",
+						path.Spec())
+				}
+				continue
+			}
 			if column.Window != nil || column.Agg != AggNone {
 				continue
 			}
@@ -302,6 +324,34 @@ func (p *Parser) validate() error {
 		return err
 	}
 	return p.validateHaving(grouped, aggregates > 0)
+}
+
+func scalarDependencyKinds(expr *ScalarExpr) (path, aggregate bool) {
+	if expr == nil {
+		return false, false
+	}
+	switch expr.Kind {
+	case ScalarPath:
+		path = true
+	case ScalarAggregate:
+		aggregate = true
+	}
+	lp, la := scalarDependencyKinds(expr.Left)
+	rp, ra := scalarDependencyKinds(expr.Right)
+	return path || lp || rp, aggregate || la || ra
+}
+
+func firstUngroupedScalarPath(p *Parser, expr *ScalarExpr) *PathExpr {
+	if expr == nil {
+		return nil
+	}
+	if expr.Kind == ScalarPath && !p.isGroupKey(expr.Path) {
+		return expr.Path
+	}
+	if path := firstUngroupedScalarPath(p, expr.Left); path != nil {
+		return path
+	}
+	return firstUngroupedScalarPath(p, expr.Right)
 }
 
 func (p *Parser) rejectLateralForwardAlias(alias string, source int) error {
@@ -420,6 +470,12 @@ func (p *Parser) validateJoins() error {
 			}
 			if expr.Subquery != nil || expr.Kind == ExprExists {
 				return p.errAt(expr.Pos, "subqueries are not supported in ON")
+			}
+			if expr.Kind == ExprScalarCompare || expr.Kind == ExprScalarIsNull {
+				return newFeatureNotSupportedError(
+					p.lx.src, expr.Pos,
+					"computed scalar expressions in ON residuals are not supported yet; outer-join null extension requires evaluating them during pair formation",
+				)
 			}
 			for _, path := range []*PathExpr{expr.Path, expr.RightPath} {
 				if path == nil || p.isLateralReference(path) {
@@ -548,6 +604,11 @@ func (p *Parser) bindHaving(e *Expr) error {
 			}
 		}
 		return nil
+	case ExprScalarCompare, ExprScalarIsNull:
+		return newFeatureNotSupportedError(
+			p.lx.src, e.Pos,
+			"computed scalar expressions in HAVING are not supported by this execution slice yet",
+		)
 	}
 	if e.Agg != AggNone {
 		column := p.aggregateColumn(e.Agg, e.Path)

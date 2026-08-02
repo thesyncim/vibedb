@@ -171,6 +171,10 @@ type Parser struct {
 	// query expression is encountered. Ordinary SELECT parsing therefore keeps
 	// no set-node arenas or scratch slices alive.
 	set *setParserState
+	// scalar is allocated only when arithmetic, concatenation, CASE, or CAST is
+	// encountered. Ordinary path-only statements retain their existing parser
+	// arena footprint and allocation profile.
+	scalar *scalarParserState
 	// existsProjection allows SELECT 1 (and equivalent literals) only while
 	// parsing an EXISTS body. EXISTS never observes its output value, so
 	// lowering the literal to a whole-document projection avoids inventing a
@@ -484,6 +488,9 @@ func (p *Parser) reset(src string) {
 	}
 	if p.set != nil {
 		p.set.reset()
+	}
+	if p.scalar != nil {
+		p.scalar.reset()
 	}
 
 	p.lx = lexer{
@@ -877,6 +884,19 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		col.Alias = alias
 		return col, nil
 	}
+	if scalarStarts(p.tok) {
+		expr, err := p.parseScalarExpression(scalarSelect)
+		if err != nil {
+			return col, err
+		}
+		col.Scalar = expr
+		alias, err := p.parseColumnAlias()
+		if err != nil {
+			return col, err
+		}
+		col.Alias = alias
+		return col, nil
+	}
 	if kind, ok := windowOnlyFunctionOf(p.tok.kw); ok {
 		head := p.tok
 		p.advance()
@@ -922,6 +942,20 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 			}
 			col.Path = path
 		}
+	}
+	if scalarContinues(p.tok) {
+		if col.Window != nil {
+			return col, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"arithmetic over a window result is not supported by the scalar execution slice yet",
+			)
+		}
+		left := p.scalarFromColumn(col)
+		expr, err := p.continueScalarExpression(left, scalarSelect)
+		if err != nil {
+			return col, err
+		}
+		col.Agg, col.Path, col.Scalar = AggNone, nil, expr
 	}
 	alias, err := p.parseColumnAlias()
 	if err != nil {
@@ -2332,10 +2366,33 @@ func (p *Parser) parseOrderTerm() (OrderTerm, error) {
 	if p.tok.kind == tokNumber {
 		return term, p.errHere("ORDER BY does not accept an output position; name the path or the output alias")
 	}
+	if p.tok.kind == tokPlus || p.tok.kind == tokMinus || p.tok.kind == tokLParen ||
+		p.atKeyword(kwCase) || p.atKeyword(kwCast) {
+		return term, newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
+		)
+	}
 	path, err := p.parseKeyPath(
 		"ORDER BY cannot sort by an aggregate: the engine orders groups by their key, not by their reduction")
 	if err != nil {
 		return term, err
+	}
+	if scalarContinues(p.tok) {
+		return term, newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
+		)
+	}
+	if len(path.Segments) == 1 {
+		for i := range p.columns {
+			if p.columns[i].Alias == path.Segments[0].Key && p.columns[i].Scalar != nil {
+				return term, newFeatureNotSupportedError(
+					p.lx.src, term.Pos,
+					"ORDER BY cannot yet name a computed scalar output; it requires a post-scalar stable sort stage",
+				)
+			}
+		}
 	}
 	term.Path, term.Output = p.resolveOrderAlias(path)
 	switch {

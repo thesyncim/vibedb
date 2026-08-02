@@ -152,10 +152,16 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 		return reflect.TypeFor[string]()
 	}
 	schema := r.columnSchema()
-	if index >= 0 && index < len(schema) &&
-		(schema[index].Reduction == query.ReductionCount ||
-			schema[index].Reduction == query.ReductionWindowInteger) {
-		return reflect.TypeFor[int64]()
+	if index >= 0 && index < len(schema) {
+		switch {
+		case schema[index].Reduction == query.ReductionCount ||
+			schema[index].Reduction == query.ReductionWindowInteger:
+			return reflect.TypeFor[int64]()
+		case schema[index].Type == query.TypeString:
+			return reflect.TypeFor[[]byte]()
+		case schema[index].Type == query.TypeBool:
+			return reflect.TypeFor[bool]()
+		}
 	}
 	return reflect.TypeFor[any]()
 }
@@ -165,7 +171,18 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 		return "TEXT"
 	}
 	schema := r.columnSchema()
-	if index < 0 || index >= len(schema) || schema[index].Reduction == query.ReductionNone {
+	if index < 0 || index >= len(schema) {
+		return "JSON"
+	}
+	switch schema[index].Type {
+	case query.TypeString:
+		return "TEXT"
+	case query.TypeBool:
+		return "BOOLEAN"
+	case query.TypeNumber:
+		return "NUMERIC"
+	}
+	if schema[index].Reduction == query.ReductionNone {
 		return "JSON"
 	}
 	if schema[index].Reduction == query.ReductionCount ||

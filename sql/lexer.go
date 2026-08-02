@@ -100,8 +100,8 @@ func (lx *lexer) next() token {
 	case c == '-' && lx.pos+1 < len(lx.src) && isDigit(lx.src[lx.pos+1]):
 		// A leading '-' is part of the numeric literal rather than a unary
 		// operator, because the engine's literal space is JSON's and a JSON
-		// number carries its own sign. A '-' not followed by a digit is
-		// therefore unambiguously subtraction, which this package rejects.
+		// number carries its own sign. The scalar parser reinterprets such a
+		// token as subtraction when it follows a completed left expression.
 		return lx.lexNumber()
 	case c == '\'':
 		return lx.lexQuoted('\'', tokString)
@@ -113,6 +113,14 @@ func (lx *lexer) next() token {
 	switch c {
 	case '*':
 		return token{kind: tokStar, pos: start}
+	case '+':
+		return token{kind: tokPlus, pos: start}
+	case '-':
+		return token{kind: tokMinus, pos: start}
+	case '/':
+		return token{kind: tokSlash, pos: start}
+	case '%':
+		return token{kind: tokPercent, pos: start}
 	case ',':
 		return token{kind: tokComma, pos: start}
 	case ';':
@@ -165,7 +173,7 @@ func (lx *lexer) next() token {
 		return errorToken(start, "expected '>' after '@'; containment is spelled '@>'")
 	case '|':
 		if lx.accept('|') {
-			return errorToken(start, "string concatenation (||) is not supported")
+			return token{kind: tokConcat, pos: start}
 		}
 		return errorToken(start, "bitwise operators are not supported")
 	case ':':
@@ -175,8 +183,8 @@ func (lx *lexer) next() token {
 		return errorToken(start, "named parameters are not supported; use '?' placeholders")
 	case '$':
 		return errorToken(start, "numbered parameters are not supported; use '?' placeholders")
-	case '+', '-', '/', '%', '^', '&', '#':
-		return errorToken(start, "arithmetic and bitwise operators are not supported")
+	case '^', '&', '#':
+		return errorToken(start, "bitwise operators are not supported")
 	case '~':
 		return errorToken(start, "regular-expression matching is not supported")
 	}

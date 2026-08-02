@@ -63,6 +63,9 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT a.b[0].c FROM t`,
 		`-- comment` + "\n" + `SELECT a /* x */ FROM t`,
 		`SELECT a FROM t WHERE b LIKE 'x'`,
+		`SELECT a-1, a -1, a - 1, - - -a, a*2, 1e-2 + 3E+4 FROM t`,
+		`SELECT * FROM t`,
+		`SELECT a + 1 AS computed FROM t ORDER BY computed`,
 		`(((((((((((`,
 		`SELECT a FROM t WHERE b = '`,
 		`SELECT a FROM t WHERE m @> {`,
@@ -277,6 +280,13 @@ func checkStatementInvariantsScoped(
 		}
 	}
 	for i := range s.Columns {
+		if scalar := s.Columns[i].Scalar; scalar != nil {
+			if s.Columns[i].Path != nil || s.Columns[i].Agg != AggNone || s.Columns[i].Window != nil {
+				t.Fatalf("Columns[%d] mixes scalar and direct expression forms", i)
+			}
+			seen += checkScalarInvariants(t, s, scalar, outer)
+			continue
+		}
 		if window := s.Columns[i].Window; window != nil {
 			if s.Columns[i].Path != nil || s.Columns[i].Agg != AggNone {
 				t.Fatalf("Columns[%d] mixes a window with an ordinary expression", i)
@@ -459,6 +469,17 @@ func checkExprScoped(
 		if e.Path != nil || e.Value.Kind != OperandBool {
 			t.Fatalf("constant predicate = %+v, want a path-free boolean", e)
 		}
+	case ExprScalarCompare:
+		if e.ScalarLeft == nil || e.ScalarRight == nil || e.Path != nil || e.RightPath != nil {
+			t.Fatalf("scalar comparison has invalid payload: %+v", e)
+		}
+		return checkScalarInvariants(t, s, e.ScalarLeft, outer) +
+			checkScalarInvariants(t, s, e.ScalarRight, outer)
+	case ExprScalarIsNull:
+		if e.ScalarLeft == nil || e.ScalarRight != nil || e.Path != nil {
+			t.Fatalf("scalar null test has invalid payload: %+v", e)
+		}
+		return checkScalarInvariants(t, s, e.ScalarLeft, outer)
 	default:
 		if e.Agg != AggNone && !having {
 			t.Fatal("an aggregate leaf appears outside HAVING")
@@ -501,6 +522,49 @@ func checkExprScoped(
 		total += checkExprScoped(t, s, kid, having, outer)
 	}
 	return total
+}
+
+func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *LateralSpec) int {
+	t.Helper()
+	if e == nil {
+		t.Fatal("nil scalar node")
+	}
+	switch e.Kind {
+	case ScalarPath, ScalarAggregate:
+		if e.Path == nil || e.Left != nil || e.Right != nil {
+			t.Fatalf("scalar dependency has invalid payload: %+v", e)
+		}
+		checkPath(t, s, e.Path, outer)
+		return 0
+	case ScalarLiteral:
+		if e.Path != nil || e.Left != nil || e.Right != nil {
+			t.Fatalf("scalar literal has invalid payload: %+v", e)
+		}
+		if e.Value.Kind == OperandParam {
+			return 1
+		}
+		return 0
+	case ScalarNull:
+		if e.Path != nil || e.Left != nil || e.Right != nil {
+			t.Fatalf("scalar NULL has invalid payload: %+v", e)
+		}
+		return 0
+	case ScalarUnary:
+		if e.Left == nil || e.Right != nil ||
+			(e.Op != ScalarPositive && e.Op != ScalarNegative) {
+			t.Fatalf("scalar unary has invalid payload: %+v", e)
+		}
+		return checkScalarInvariants(t, s, e.Left, outer)
+	case ScalarBinary:
+		if e.Left == nil || e.Right == nil || e.Op > ScalarConcat {
+			t.Fatalf("scalar binary has invalid payload: %+v", e)
+		}
+		return checkScalarInvariants(t, s, e.Left, outer) +
+			checkScalarInvariants(t, s, e.Right, outer)
+	default:
+		t.Fatalf("unknown scalar kind %d", e.Kind)
+		return 0
+	}
 }
 
 func checkPath(t *testing.T, s *SelectStmt, p *PathExpr, outer *LateralSpec) {

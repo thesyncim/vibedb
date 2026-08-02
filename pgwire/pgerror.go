@@ -55,6 +55,7 @@ const (
 	sqlstateDuplicateStatement         = "42P05"
 	sqlstateDuplicateCursor            = "42P03"
 	sqlstateCharacterNotInRepertoire   = "22021"
+	sqlstateDivisionByZero             = "22012"
 	sqlstateNumericValueOutOfRange     = "22003"
 	sqlstateInvalidParameterValue      = "22023"
 	sqlstateCardinalityViolation       = "21000"
@@ -191,6 +192,12 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateCardinalityViolation, err.Error())
 	case errors.Is(err, query.ErrParameterType):
 		return newError(sqlstateDatatypeMismatch, err.Error())
+	case errors.Is(err, query.ErrScalarType):
+		return newError(sqlstateDatatypeMismatch, err.Error())
+	case errors.Is(err, query.ErrScalarDivisionByZero):
+		return newError(sqlstateDivisionByZero, err.Error())
+	case errors.Is(err, query.ErrScalarNumericRange):
+		return newError(sqlstateNumericValueOutOfRange, err.Error())
 	case errors.Is(err, query.ErrUndefinedColumn):
 		return newError(sqlstateUndefinedColumn, err.Error())
 	case errors.Is(err, query.ErrAmbiguousColumn):

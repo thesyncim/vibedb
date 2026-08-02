@@ -374,6 +374,12 @@ type ResultColumn struct {
 	// retain their own paths; Path is nil for every window expression so a
 	// consumer cannot accidentally lower it as a pre-window projection.
 	Window *WindowExpr
+	// Scalar is a computed scalar expression. It is nil for the established
+	// path/aggregate/window forms, preserving their direct lowering path. A
+	// scalar leaf retains its own path or aggregate dependencies; Path, Agg,
+	// and Window are nil/zero when Scalar is non-nil so a consumer cannot
+	// silently execute only one dependency as the result expression.
+	Scalar *ScalarExpr
 	// Alias is the explicit AS name, or "" when the statement gave none. It is
 	// the output header when set; how an unaliased column is headed is a
 	// lowering decision, since the header spelling belongs to the result
@@ -583,6 +589,9 @@ type OrderTerm struct {
 	// of a window expression. Zero means Path is authoritative. A one-based
 	// encoding keeps the zero value compatible with every existing AST literal.
 	Output int
+	// Scalar is a computed sort key. It is nil for the established path and
+	// output-alias forms. Output remains authoritative when non-zero.
+	Scalar *ScalarExpr
 	// Desc sorts descending.
 	Desc bool
 	Pos  int
@@ -664,6 +673,12 @@ const (
 	// requiring a path-led condition, while JOIN accepts ON TRUE/FALSE to
 	// express unrestricted or empty matches with outer semantics.
 	ExprConstant
+	// ExprScalarCompare compares two computed scalar expressions. ScalarLeft
+	// and ScalarRight retain the authored arithmetic trees and SQL NULL
+	// propagates to UNKNOWN before the comparison operator is applied.
+	ExprScalarCompare
+	// ExprScalarIsNull is the two-valued IS [NOT] NULL test over ScalarLeft.
+	ExprScalarIsNull
 )
 
 // A CmpOp is a comparison operator. The constants are in the same order as
@@ -732,6 +747,11 @@ type Expr struct {
 	// local path can compare directly with a captured outer path. Ordinary WHERE
 	// and HAVING leaves keep it nil and use Value or Subquery.
 	RightPath *PathExpr
+	// ScalarLeft and ScalarRight are populated only by scalar predicate kinds.
+	// Keeping them cold avoids widening every existing path leaf with an
+	// interface value or changing its fast lowering representation.
+	ScalarLeft  *ScalarExpr
+	ScalarRight *ScalarExpr
 	// Value is the right operand of ExprCompare and ExprContains.
 	Value Operand
 	// Insensitive selects ILIKE rather than LIKE for ExprLike.

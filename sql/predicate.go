@@ -176,10 +176,10 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		e := p.exprs.one()
 		*e = Expr{Kind: ExprExists, Column: -1, Subquery: sub, Pos: pos}
 		return e, nil
-	case p.atKeyword(kwCase):
-		return nil, p.errHere("CASE expressions are not supported: the engine evaluates predicates, not computed values")
-	case p.atKeyword(kwCast):
-		return nil, p.errHere("CAST is not supported: values compare within their JSON type, so there is nothing to cast to")
+	case p.atKeyword(kwCase), p.atKeyword(kwCast),
+		p.tok.kind == tokNumber, p.tok.kind == tokString,
+		p.tok.kind == tokParam, p.tok.kind == tokPlus, p.tok.kind == tokMinus:
+		return p.parseScalarCondition(ctx, nil, p.tok.pos)
 	case ctx == ctxJoin && (p.atKeyword(kwTrue) || p.atKeyword(kwFalse)):
 		pos := p.tok.pos
 		value, err := p.parseOperand()
@@ -189,8 +189,6 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		e := p.exprs.one()
 		*e = Expr{Kind: ExprConstant, Column: -1, Value: value, Pos: pos}
 		return e, nil
-	case p.tok.kind == tokNumber, p.tok.kind == tokString, p.tok.kind == tokParam:
-		return nil, p.errHere("a condition must begin with a path: the engine compares a stored value against a constant, not two constants")
 	}
 
 	// The leaf's position is where its left operand starts, captured before
@@ -223,7 +221,69 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		}
 		path = p2
 	}
+	if scalarContinues(p.tok) {
+		column := ResultColumn{Agg: agg, Path: path, Pos: leafPos}
+		return p.parseScalarCondition(ctx, p.scalarFromColumn(column), leafPos)
+	}
 	return p.parseLeafTail(ctx, agg, path, leafPos)
+}
+
+func scalarContextForPredicate(ctx exprContext) scalarExprContext {
+	switch ctx {
+	case ctxHaving:
+		return scalarHaving
+	case ctxJoin:
+		return scalarJoin
+	default:
+		return scalarWhere
+	}
+}
+
+// parseScalarCondition parses one computed value followed by a comparison or
+// IS [NOT] NULL. Boolean composition remains in the existing predicate ladder,
+// so AND/OR/NOT keep their established precedence and flattened AST shape.
+func (p *Parser) parseScalarCondition(
+	ctx exprContext,
+	left *ScalarExpr,
+	pos int,
+) (*Expr, error) {
+	var err error
+	scalarCtx := scalarContextForPredicate(ctx)
+	if left == nil {
+		left, err = p.parseScalarExpression(scalarCtx)
+	} else {
+		left, err = p.continueScalarExpression(left, scalarCtx)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if p.acceptKeyword(kwIs) {
+		negated := p.acceptKeyword(kwNot)
+		if !p.acceptKeyword(kwNull) {
+			return nil, p.errHere("a computed scalar supports IS [NOT] NULL; IS MISSING applies only to a stored path")
+		}
+		node := p.exprs.one()
+		*node = Expr{
+			Kind: ExprScalarIsNull, Negated: negated, Column: -1,
+			ScalarLeft: left, Pos: pos,
+		}
+		return node, nil
+	}
+	op, ok := comparisonOp(p.tok.kind)
+	if !ok {
+		return nil, p.errHere("expected a comparison operator or IS [NOT] NULL after a computed scalar expression")
+	}
+	p.advance()
+	right, err := p.parseScalarExpression(scalarCtx)
+	if err != nil {
+		return nil, err
+	}
+	node := p.exprs.one()
+	*node = Expr{
+		Kind: ExprScalarCompare, Op: op, Column: -1,
+		ScalarLeft: left, ScalarRight: right, Pos: pos,
+	}
+	return node, nil
 }
 
 // parseLeafTail parses what follows a leaf's left operand.
@@ -519,6 +579,7 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 		s.Columns[i].Pos += delta
 		shiftPathPosition(s.Columns[i].Path, delta)
 		shiftWindowPositions(s.Columns[i].Window, delta)
+		shiftScalarPositions(s.Columns[i].Scalar, delta)
 	}
 	for i := range s.From {
 		s.From[i].Pos += delta
@@ -557,6 +618,7 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	for i := range s.OrderBy {
 		s.OrderBy[i].Pos += delta
 		shiftPathPosition(s.OrderBy[i].Path, delta)
+		shiftScalarPositions(s.OrderBy[i].Scalar, delta)
 	}
 	if s.Limit != nil {
 		s.Limit.Pos += delta
@@ -648,6 +710,8 @@ func shiftExprPositions(e *Expr, delta int) {
 	e.Pos += delta
 	shiftPathPosition(e.Path, delta)
 	shiftPathPosition(e.RightPath, delta)
+	shiftScalarPositions(e.ScalarLeft, delta)
+	shiftScalarPositions(e.ScalarRight, delta)
 	e.Value.Pos += delta
 	for i := range e.List {
 		e.List[i].Pos += delta

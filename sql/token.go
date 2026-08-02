@@ -31,6 +31,11 @@ const (
 	tokGt
 	tokGe
 	tokContains // @>
+	tokPlus
+	tokMinus
+	tokSlash
+	tokPercent
+	tokConcat // ||
 )
 
 // A token is one lexeme. text is a slice of the source for identifiers,

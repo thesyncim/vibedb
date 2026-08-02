@@ -102,7 +102,7 @@ func (s *Statement) build(args []any) error {
 	if window := s.window(); window != nil {
 		return s.buildWindow(window, args)
 	}
-	if err := s.buildColumns(); err != nil {
+	if err := s.buildColumns(args); err != nil {
 		return err
 	}
 	if err := s.buildJoins(args); err != nil {
@@ -199,7 +199,10 @@ func (s *Statement) resolveDrivingCollection() string {
 
 // buildColumns lowers the SELECT list, then appends any hidden column a HAVING
 // leaf needs.
-func (s *Statement) buildColumns() error {
+func (s *Statement) buildColumns(args []any) error {
+	if scalar := s.scalarStatement(); scalar != nil {
+		return scalar.buildColumns(s, args)
+	}
 	name := 0
 	for i := range s.tree.Columns {
 		col := &s.tree.Columns[i]
@@ -277,7 +280,7 @@ func (s *Statement) buildOrderBy() error {
 // yet had the chance to reject.
 func (s *Statement) buildLimit(args []any) error {
 	s.offset, s.limit, s.hasLimit = 0, 0, false
-	s.driverLimit = s.tree.Having != nil && s.window() == nil
+	s.driverLimit = (s.tree.Having != nil || s.scalarStatement() != nil) && s.window() == nil
 	if s.tree.Offset != nil {
 		n, err := s.count(*s.tree.Offset, args, "OFFSET")
 		if err != nil {
@@ -577,6 +580,9 @@ func (s *Statement) buildWhere(args []any) error {
 	base := len(s.stack)
 	defer func() { s.stack = s.stack[:base] }()
 	for _, conjunct := range conjuncts {
+		if scalar := s.scalarStatement(); scalar != nil && scalar.ownsWhere(conjunct) {
+			continue
+		}
 		source, mixed := exprSource(conjunct)
 		if mixed {
 			return fmt.Errorf(

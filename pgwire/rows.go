@@ -128,10 +128,16 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 	dst = dst[:0]
 	for i, name := range names {
 		typ := typeJSON
-		if i < len(schema) &&
-			(schema[i].Reduction == query.ReductionCount ||
-				schema[i].Reduction == query.ReductionWindowInteger) {
-			typ = typeInt8
+		if i < len(schema) {
+			switch {
+			case schema[i].Reduction == query.ReductionCount ||
+				schema[i].Reduction == query.ReductionWindowInteger:
+				typ = typeInt8
+			case schema[i].Type == query.TypeString:
+				typ = typeText
+			case schema[i].Type == query.TypeBool:
+				typ = typeBool
+			}
 		}
 		dst = append(dst, column{name: name, typ: typ})
 	}
@@ -270,6 +276,25 @@ func cellWireSize(cell query.Cell, typ columnType, format int16) (int, error) {
 		}
 		return len(encoded), nil
 
+	case oidText:
+		text, ok := cell.TextBytes()
+		if !ok {
+			return 0, newError(sqlstateInternalError,
+				"a column declared text produced a value that is not a string")
+		}
+		return len(text), nil
+
+	case oidBool:
+		_, ok := cell.Bool()
+		if !ok {
+			return 0, newError(sqlstateInternalError,
+				"a column declared bool produced a value that is not boolean")
+		}
+		if format == formatBinary {
+			return 1, nil
+		}
+		return 1, nil // PostgreSQL text bool is the one-byte spelling t/f.
+
 	default:
 		return 0, newError(sqlstateInternalError, "unhandled result column type")
 	}
@@ -308,6 +333,31 @@ func appendCell(dst []byte, cell query.Cell, typ columnType, format int16) ([]by
 				"a result cell produced no JSON encoding")
 		}
 		return dst, nil
+
+	case oidText:
+		text, ok := cell.TextBytes()
+		if !ok {
+			return dst, newError(sqlstateInternalError,
+				"a column declared text produced a value that is not a string")
+		}
+		return append(dst, text...), nil
+
+	case oidBool:
+		value, ok := cell.Bool()
+		if !ok {
+			return dst, newError(sqlstateInternalError,
+				"a column declared bool produced a value that is not boolean")
+		}
+		if format == formatBinary {
+			if value {
+				return append(dst, 1), nil
+			}
+			return append(dst, 0), nil
+		}
+		if value {
+			return append(dst, 't'), nil
+		}
+		return append(dst, 'f'), nil
 
 	default:
 		return dst, newError(sqlstateInternalError, "unhandled result column type")
