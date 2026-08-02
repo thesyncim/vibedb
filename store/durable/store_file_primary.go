@@ -114,7 +114,7 @@ func (c *Collection) resolvePrimaryGraphRouted(
 		return dst, false, false, err
 	}
 	dst, found, err = c.appendPrimaryLeafValue(
-		dst, leafLease.Page(), state.root.StoreID, route.Bucket,
+		dst, &leafLease, state.root.StoreID, route.Bucket,
 		route.Hash, keyBytes,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.fileEnd,
@@ -154,7 +154,7 @@ func (c *Collection) containsPrimaryGraphRouted(
 		return false, false, err
 	}
 	found, err = primaryLeafContains(
-		leafLease.Page(), state.root.StoreID, route.Bucket, route.Hash, key,
+		&leafLease, state.root.StoreID, route.Bucket, route.Hash, key,
 		storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
@@ -238,21 +238,15 @@ func (c *Collection) containsPrimaryGraphLive(
 // grammar.
 func (c *Collection) appendPrimaryLeafValue(
 	dst []byte,
-	page []byte,
+	lease *storeio.PageLease,
 	storeID [16]byte,
 	bucket storeio.BucketID,
 	hash uint64,
 	keyBytes []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) ([]byte, bool, error) {
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
-		return dst, false, fmt.Errorf(
-			"%w: non-compact primary leaf",
-			storeio.ErrCommonPrimaryLeafCorrupt,
-		)
-	}
-	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
-		page, storeID, bucket,
+	stripe, ok := storeio.AdmittedCachedCompactPrimaryStripe(
+		lease.Header(), lease.Payload(), storeID, bucket,
 	)
 	if !ok {
 		return dst, false, fmt.Errorf(
@@ -276,21 +270,15 @@ func (c *Collection) appendPrimaryLeafValue(
 }
 
 func primaryLeafContains(
-	page []byte,
+	lease *storeio.PageLease,
 	storeID [16]byte,
 	bucket storeio.BucketID,
 	hash uint64,
 	key []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) (bool, error) {
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
-		return false, fmt.Errorf(
-			"%w: non-compact primary leaf",
-			storeio.ErrCommonPrimaryLeafCorrupt,
-		)
-	}
-	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
-		page, storeID, bucket,
+	stripe, ok := storeio.AdmittedCachedCompactPrimaryStripe(
+		lease.Header(), lease.Payload(), storeID, bucket,
 	)
 	if !ok {
 		return false, fmt.Errorf(
@@ -315,7 +303,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 		return dst, false, err
 	}
 	dst, found, err := c.appendPrimaryLeafValue(
-		dst, lookup.lease.Page(), lookup.storeID, lookup.bucket,
+		dst, &lookup.lease, lookup.storeID, lookup.bucket,
 		lookup.hash, key, lookup.bounds,
 	)
 	lookup.lease.Release()
@@ -331,7 +319,7 @@ func (c *Collection) containsPrimaryGraphPageWalk(
 		return false, err
 	}
 	found, err := primaryLeafContains(
-		lookup.lease.Page(), lookup.storeID, lookup.bucket,
+		&lookup.lease, lookup.storeID, lookup.bucket,
 		lookup.hash, key, lookup.bounds,
 	)
 	lookup.lease.Release()

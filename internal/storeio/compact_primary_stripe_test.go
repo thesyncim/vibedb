@@ -193,6 +193,46 @@ func TestCompactPrimaryStripeCorruptionRejected(t *testing.T) {
 	}
 }
 
+func TestAdmittedCachedCompactPrimaryStripe(t *testing.T) {
+	page, want, records := compactPrimaryTestPage(t, 1000, false)
+	header, payload, err := OpenPage(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := AdmittedCachedCompactPrimaryStripe(
+		header, payload, unifiedTestStoreID(), 0,
+	)
+	if !ok || got.Len() != want.Len() {
+		t.Fatalf("cached compact admission = rows %d, %v; want rows %d, true", got.Len(), ok, want.Len())
+	}
+	row, ok := got.FindKey(records[777].Key)
+	if !ok || row != 777 {
+		t.Fatalf("cached compact point lookup = %d, %v; want 777, true", row, ok)
+	}
+
+	badIdentity := header
+	badIdentity.StoreID[0] ^= 1
+	if _, ok := AdmittedCachedCompactPrimaryStripe(
+		badIdentity, payload, unifiedTestStoreID(), 0,
+	); ok {
+		t.Fatal("cached compact admission accepted a mismatched store identity")
+	}
+	badLength := header
+	badLength.PayloadLength--
+	if _, ok := AdmittedCachedCompactPrimaryStripe(
+		badLength, payload, unifiedTestStoreID(), 0,
+	); ok {
+		t.Fatal("cached compact admission accepted a mismatched payload length")
+	}
+	badPayload := bytes.Clone(payload)
+	badPayload[0] ^= 1
+	if _, ok := AdmittedCachedCompactPrimaryStripe(
+		header, badPayload, unifiedTestStoreID(), 0,
+	); ok {
+		t.Fatal("cached compact admission accepted a mismatched payload grammar")
+	}
+}
+
 func TestCompactPrimaryStripeWarmPointAllocations(t *testing.T) {
 	_, view, records := compactPrimaryTestPage(t, 1000, false)
 	key := records[777].Key

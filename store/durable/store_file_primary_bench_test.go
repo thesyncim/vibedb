@@ -134,7 +134,7 @@ func BenchmarkFilePrimaryPut(b *testing.B) {
 	})
 }
 
-// BenchmarkFilePrimaryPointReadUnifiedShape measures class-5 point reads over
+// BenchmarkFilePrimaryPointReadUnifiedShape measures compact point reads over
 // a shape-redundant corpus, including row-body reconstruction.
 func BenchmarkFilePrimaryPointReadUnifiedShape(b *testing.B) {
 	if testing.Short() {
@@ -162,10 +162,10 @@ func BenchmarkFilePrimaryPointReadUnifiedShape(b *testing.B) {
 	classCounts := filePrimaryLeafClassCounts(
 		b, file, collection.state.Load().root,
 	)
-	if classCounts[storeio.CommonPrimaryLeafUnified] == 0 {
-		b.Fatalf("no unified leaves selected; split = %v", classCounts)
+	if classCounts[storeio.CommonPrimaryLeafCompact] == 0 {
+		b.Fatalf("no compact leaves selected; split = %v", classCounts)
 	}
-	b.Logf("unified leaves=%d", classCounts[storeio.CommonPrimaryLeafUnified])
+	b.Logf("compact leaves=%d", classCounts[storeio.CommonPrimaryLeafCompact])
 
 	order := benchReadProbeOrder(count)
 	// Precompute probe keys as []byte outside the timed loop to hold the

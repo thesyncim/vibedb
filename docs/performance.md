@@ -24,7 +24,7 @@ are the next two measured performance targets.
 
 The log-filter path has a fused execution lane for `COUNT(*)` equality queries.
 On the 100,000-row low-cardinality log-like probe, the current fair adapter
-measured about 4.1 µs for a random point read, 0.318 ms for an unindexed equality
+measured about 0.78 µs for a random point read, 0.318 ms for an unindexed equality
 count, and 5.1 µs for the same count through an exact `country` index. The
 unindexed result is a complete 100,000-row scan (945 matches,
 about 3.18 ns/document), not candidate pruning: the storage cursor resolves the
@@ -33,6 +33,14 @@ reconstructing each JSON document. Rows that cannot be decided from tokens are
 rendered individually and reported through `TokenFilterFallbackRows`;
 `RowsScanned` still reports the complete corpus and `IndexBounded` remains
 false.
+
+The point-read path acquires the same immutable page-cache lease as before, but
+now opens the compact payload from the lease's already validated header and
+payload view. It no longer hashes the entire cached leaf a second time on every
+lookup. Compact grammar and logical identity are still checked, and cold page
+admission still verifies the complete page checksum. The public probe improved
+from about 4.1 µs to 0.78 µs with zero allocations, without changing routing,
+leaf size, physical order, or adding an index.
 
 The fair adapter retains one compiled query per repeated filter value and reuses
 its `Exec`, matching a prepared-query workload. The complete warmed public path

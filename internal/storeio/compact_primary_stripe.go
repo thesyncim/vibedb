@@ -446,6 +446,31 @@ func AdmittedCompactPrimaryStripe(
 	return view, err == nil
 }
 
+// AdmittedCachedCompactPrimaryStripe opens a payload whose enclosing page was
+// already checksum- and identity-validated by PageCache. It repeats the compact
+// grammar and logical-identity checks but deliberately does not hash the whole
+// page again on every warmed point read.
+func AdmittedCachedCompactPrimaryStripe(
+	pageHeader PageHeader,
+	payload []byte,
+	storeID [16]byte,
+	bucket BucketID,
+) (CompactPrimaryStripeView, bool) {
+	logicalID, logicalOK := CommonPrimaryLeafLogicalID(bucket)
+	if !logicalOK || pageHeader.StoreID != storeID ||
+		pageHeader.LogicalID != logicalID || pageHeader.Kind != PagePrimaryLeaf ||
+		pageHeader.Generation == 0 ||
+		pageHeader.PayloadLength != uint32(len(payload)) ||
+		len(payload) < compactPrimaryHeaderBytes ||
+		string(payload[:4]) != compactPrimaryMagic {
+		return CompactPrimaryStripeView{}, false
+	}
+	view, err := openCompactPrimaryStripePayload(
+		payload, pageHeader, storeID, bucket, CommonPrimaryLeafBounds{}, false, false,
+	)
+	return view, err == nil
+}
+
 func openCompactPrimaryStripePayload(
 	payload []byte,
 	pageHeader PageHeader,
