@@ -2,6 +2,7 @@ package query
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -63,10 +64,25 @@ func TestSQLScalarDecimalDivisionByZeroAndBudget(t *testing.T) {
 		[]byte("123456789012345678901234567890"),
 		13, nil, &budget,
 	)
-	var bounded *ScalarNumericRangeError
+	var bounded *ScalarAggregateBudgetError
+	var aggregate *AggregateBudgetError
 	if !errors.As(err, &bounded) || bounded.Position() != 13 ||
-		!errors.Is(err, ErrScalarNumericRange) {
+		!errors.As(err, &aggregate) || !errors.Is(err, ErrAggregateBudget) ||
+		errors.Is(err, ErrScalarNumericRange) {
 		t.Fatalf("budget error = %T %v", err, err)
+	}
+}
+
+func TestSQLScalarDecimalSizeOverflowRemainsNumericRange(t *testing.T) {
+	var decimal sqlScalarDecimal
+	var budget aggregateBudget
+	budget.begin(math.MaxInt64)
+	err := decimal.reserve(-1, 21, "multiplication", &budget)
+	var bounded *ScalarNumericRangeError
+	if !errors.As(err, &bounded) || bounded.Position() != 21 ||
+		!errors.Is(err, ErrScalarNumericRange) ||
+		errors.Is(err, ErrAggregateBudget) {
+		t.Fatalf("size overflow = %T %v", err, err)
 	}
 }
 

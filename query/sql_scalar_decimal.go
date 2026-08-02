@@ -43,6 +43,37 @@ func (e *ScalarNumericRangeError) Error() string {
 func (e *ScalarNumericRangeError) Unwrap() error { return ErrScalarNumericRange }
 func (e *ScalarNumericRangeError) Position() int { return e.Pos }
 
+// ScalarAggregateBudgetError positions an exact-decimal resource failure at
+// the scalar operator that requested the storage. It deliberately unwraps the
+// existing AggregateBudgetError: a caller-configured execution bound is a
+// program/resource limit, not mathematical numeric overflow.
+type ScalarAggregateBudgetError struct {
+	Pos       int
+	Operation string
+	Err       error
+}
+
+func (e *ScalarAggregateBudgetError) Error() string {
+	if e == nil {
+		return ErrAggregateBudget.Error()
+	}
+	return fmt.Sprintf("query: scalar %s at byte %d: %v", e.Operation, e.Pos, e.Err)
+}
+
+func (e *ScalarAggregateBudgetError) Unwrap() error {
+	if e == nil {
+		return ErrAggregateBudget
+	}
+	return e.Err
+}
+
+func (e *ScalarAggregateBudgetError) Position() int {
+	if e == nil {
+		return 0
+	}
+	return e.Pos
+}
+
 const scalarDecimalBaseBytes = int64(768)
 
 // sqlScalarDecimal is retained per prepared operation and execution state.
@@ -498,10 +529,12 @@ func (d *sqlScalarDecimal) reserve(
 	budget *aggregateBudget,
 ) error {
 	if need < 0 {
-		need = math.MaxInt64
+		return d.rangeError(pos, operation, math.MaxInt64, budget)
 	}
 	if err := d.lease.reserve(budget, need); err != nil {
-		return d.rangeError(pos, operation, need, budget)
+		return &ScalarAggregateBudgetError{
+			Pos: pos, Operation: operation, Err: err,
+		}
 	}
 	return nil
 }
