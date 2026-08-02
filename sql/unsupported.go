@@ -21,6 +21,17 @@ func (e *FeatureNotSupportedError) Unwrap() error {
 func newFeatureNotSupportedError(
 	src string, pos int, reason string,
 ) *FeatureNotSupportedError {
+	return NewFeatureNotSupportedError(src, pos, reason)
+}
+
+// NewFeatureNotSupportedError constructs a typed, source-positioned refusal
+// for a valid SQL shape that a lowering or execution layer cannot implement
+// faithfully yet. It lets downstream SQL consumers preserve the parser's
+// FeatureNotSupportedError contract and protocol adapters' SQLSTATE 0A000
+// mapping without matching error prose.
+func NewFeatureNotSupportedError(
+	src string, pos int, reason string,
+) *FeatureNotSupportedError {
 	return &FeatureNotSupportedError{ParseError: parseErrorAt(src, pos, reason)}
 }
 
@@ -61,9 +72,6 @@ var unsupportedStatements = map[string]string{
 	"LOCK": "there is no SQL lock manager: immutable readers never block writers",
 	"CALL": "there are no stored procedures",
 	"DO":   "there is no procedural language",
-
-	"VALUES": "a bare VALUES list is not supported: the engine reads stored documents and evaluates no constructed rows",
-	"TABLE":  "the TABLE shorthand is not supported; write SELECT * FROM name",
 }
 
 func unsupportedStatementReason(tok token) (string, bool) {

@@ -1,15 +1,14 @@
 package sql
 
-// Parsing and lexical binding for non-recursive SELECT CTEs.
+// Parsing and lexical binding for SELECT CTEs.
 
 func (p *Parser) parseWithClause() error {
 	withPos := p.tok.pos
 	p.advance() // WITH
+	recursive := false
 	if p.atKeyword(kwRecursive) {
-		return newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"WITH RECURSIVE is not supported yet; recursive CTEs require a bounded fixpoint executor",
-		)
+		recursive = true
+		p.advance()
 	}
 
 	for {
@@ -59,8 +58,8 @@ func (p *Parser) parseWithClause() error {
 				p.lx.src, p.tok.pos,
 				"data-modifying common table expression bodies are not supported; use a SELECT body",
 			)
-		case !p.atKeyword(kwSelect) && !p.atKeyword(kwWith):
-			return p.errHere("expected SELECT or WITH ... SELECT in a common table expression body")
+		case !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) && p.tok.kind != tokLParen:
+			return p.errHere("expected SELECT, WITH ... SELECT, or a parenthesized query expression in a common table expression body")
 		}
 
 		// activeCTEs contains only earlier siblings at this point. The current
@@ -69,6 +68,14 @@ func (p *Parser) parseWithClause() error {
 		query, err := p.parseSubquery(false)
 		if err != nil {
 			return err
+		}
+		if recursive {
+			if extension := recursiveCTEClauseExtension(p.tok); extension != "" {
+				return newFeatureNotSupportedError(
+					p.lx.src, p.tok.pos,
+					extension+" on a recursive common table expression is not supported yet",
+				)
+			}
 		}
 		arityKnown := cteOutputArityKnown(query)
 		if arityKnown && len(columns) > len(query.Columns) {
@@ -100,7 +107,7 @@ func (p *Parser) parseWithClause() error {
 
 	definitions := p.ctes.allocDirty(len(p.cteScratch))
 	copy(definitions, p.cteScratch)
-	p.with = WithClause{CTEs: definitions, Pos: withPos}
+	p.with = WithClause{CTEs: definitions, Recursive: recursive, Pos: withPos}
 	p.out.With = &p.with
 	p.activeCTEs.defs = definitions
 
@@ -110,6 +117,11 @@ func (p *Parser) parseWithClause() error {
 	for i := range definitions {
 		markDeferredCTEReferences(definitions[i].Query, definitions[i:])
 	}
+	if recursive {
+		if err := validateRecursiveCTEDefinitions(p.lx.src, definitions); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -118,6 +130,9 @@ func (p *Parser) parseWithClause() error {
 // relation materializer, so len(query.Columns) is not an arity proof for it.
 // COUNT(*) has a nil path but is one scalar output and remains statically known.
 func cteOutputArityKnown(query *SelectStmt) bool {
+	if query.Set != nil {
+		return !query.Set.ArityDeferred
+	}
 	for i := range query.Columns {
 		column := &query.Columns[i]
 		if column.Agg == AggNone && column.Path != nil && len(column.Path.Segments) == 0 {
@@ -238,6 +253,36 @@ func markDeferredCTEReferences(query *SelectStmt, candidates []CommonTableExpr) 
 	}
 	markDeferredCTEExpr(query.Where, candidates)
 	markDeferredCTEExpr(query.Having, candidates)
+	if query.Set != nil {
+		markDeferredCTESetExpr(query.Set.Root, query.Set.First, candidates)
+	}
+}
+
+func markDeferredCTESetExpr(
+	expr *SetExpr,
+	skip *SelectStmt,
+	candidates []CommonTableExpr,
+) {
+	if expr == nil {
+		return
+	}
+	switch expr.Kind {
+	case SetSelectExpr:
+		if expr.Select != skip {
+			markDeferredCTEReferences(expr.Select, candidates)
+		}
+	case SetValuesExpr:
+		return
+	case SetTableExpr:
+		if expr.Select != skip {
+			markDeferredCTEReferences(expr.Select, candidates)
+		}
+	case SetBinaryExpr:
+		markDeferredCTESetExpr(expr.Left, skip, candidates)
+		markDeferredCTESetExpr(expr.Right, skip, candidates)
+	case SetGroupExpr:
+		markDeferredCTESetExpr(expr.Child, skip, candidates)
+	}
 }
 
 func markDeferredCTEExpr(expr *Expr, candidates []CommonTableExpr) {

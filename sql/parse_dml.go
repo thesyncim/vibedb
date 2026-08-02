@@ -105,8 +105,10 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 		if analyze {
 			p.advance()
 		}
-		if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
-			return p.errHere("EXPLAIN accepts SELECT, WITH ... SELECT, or their ANALYZE forms only")
+		if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) &&
+			!p.atKeyword(kwValues) && !p.atKeyword(kwTable) &&
+			p.tok.kind != tokLParen {
+			return p.errHere("EXPLAIN accepts SELECT, VALUES, TABLE, WITH query expressions, parenthesized query expressions, or their ANALYZE forms only")
 		}
 		dst.Kind, dst.Explain, dst.Analyze, dst.Select = KindSelect, true, analyze, &p.sel
 		p.out = &p.sel
@@ -128,6 +130,11 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwTruncate):
 		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
 		return p.parseTruncate()
+	case p.atKeyword(kwValues), p.atKeyword(kwTable):
+		dst.Kind, dst.Select = KindSelect, &p.sel
+		p.out = &p.sel
+		*p.out = SelectStmt{}
+		return p.parseStatement()
 	}
 	if reason, unsupported := unsupportedStatementReason(p.tok); unsupported {
 		return p.featureNotSupportedHere(reason)

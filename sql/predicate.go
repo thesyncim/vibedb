@@ -261,8 +261,9 @@ func (p *Parser) parseLeafTail(
 		return nil, p.errHere("expected a comparison operator, IS, IN, BETWEEN, or @> after a path; a bare path is not a condition, so a boolean field is tested as `flag = TRUE`")
 	}
 	p.advance()
-	if ctx == ctxJoin && (p.tok.kind == tokQuotedIdent ||
-		p.tok.kind == tokIdent && p.tok.kw == kwNone) {
+	if (ctx == ctxJoin || p.lateral != nil && p.lateral.capture != nil) &&
+		(p.tok.kind == tokQuotedIdent ||
+			p.tok.kind == tokIdent && p.tok.kw == kwNone) {
 		right, err := p.parsePath(false)
 		if err != nil {
 			return nil, err
@@ -396,9 +397,20 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 // whole tree. Child parsers retain and refill their arenas, so after a warm-up
 // the shape remains allocation-free.
 func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
+	return p.parseSubqueryScoped(exists, nil, nil)
+}
+
+// parseSubqueryScoped is the LATERAL-only form of parseSubquery. Ordinary
+// derived tables, CTE bodies, and predicate subqueries pass nil scope and keep
+// their historical independent-FROM contract.
+func (p *Parser) parseSubqueryScoped(
+	exists bool,
+	outerRanges *lateralRangeScope,
+	capture *lateralCapture,
+) (*SelectStmt, error) {
 	start := p.tok.pos
-	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
-		return nil, p.errHere("expected SELECT or WITH ... SELECT in a subquery")
+	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) && p.tok.kind != tokLParen {
+		return nil, p.errHere("expected SELECT, WITH ... SELECT, or a parenthesized query expression in a subquery")
 	}
 	if p.nesting >= maxSubqueryDepth {
 		return nil, p.errfAt(start,
@@ -437,7 +449,8 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	child.cancel = p.cancel
 	sub := &child.sel
 	if err := child.parseSelectText(
-		sub, p.lx.src[start:end], &p.activeCTEs, p.nesting+1, exists,
+		sub, p.lx.src[start:end], &p.activeCTEs,
+		outerRanges, capture, p.nesting+1, exists,
 	); err != nil {
 		return nil, p.rebaseSubqueryError(err, start)
 	}
@@ -509,6 +522,12 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	}
 	for i := range s.From {
 		s.From[i].Pos += delta
+		if s.From[i].Lateral != nil {
+			s.From[i].Lateral.Pos += delta
+			for binding := range s.From[i].Lateral.Bindings {
+				s.From[i].Lateral.Bindings[binding].Pos += delta
+			}
+		}
 		if s.From[i].Kind == RelationDerived && s.From[i].Query != nil {
 			shiftSelectPositions(s.From[i].Query, delta)
 		}
@@ -545,6 +564,11 @@ func shiftSelectPositions(s *SelectStmt, delta int) {
 	if s.Offset != nil {
 		s.Offset.Pos += delta
 	}
+	var mirroredFirst *SelectStmt
+	if s.Set != nil {
+		mirroredFirst = s.Set.First
+	}
+	shiftSetExpressionPositions(s.Set, delta, mirroredFirst)
 }
 
 func shiftWindowPositions(w *WindowExpr, delta int) {

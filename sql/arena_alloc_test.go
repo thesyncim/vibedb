@@ -31,6 +31,7 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"derived table", `SELECT d.id FROM (` +
 			`SELECT id FROM customers WHERE tier = ?` +
 			`) AS d WHERE d.id = ?`},
+		{"lateral derived table", lateralAllocSQL},
 		{"common table expressions", `WITH active(id) AS MATERIALIZED (` +
 			`SELECT id FROM customers WHERE tier = ?` +
 			`), selected AS NOT MATERIALIZED (` +
@@ -42,6 +43,11 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 			`) SELECT * FROM outer_cte`},
 		{"grouped aggregate", benchGrouped},
 		{"containment and membership", benchRich},
+		{"set expression", benchSetExpression},
+		{"lateral set expression", `SELECT a.id, d.id FROM accounts a LEFT JOIN LATERAL (` +
+			`SELECT id FROM items i WHERE i.owner = a.id UNION ALL ` +
+			`SELECT id FROM archived j WHERE j.owner = a.id` +
+			`) d ON TRUE`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,8 +80,10 @@ func TestWarmParseOfMixedShapesIsAllocationFree(t *testing.T) {
 	sources := []string{
 		benchSimple, benchFiltered, benchJoin, benchLeftJoin, benchGrouped, benchRich,
 		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) d WHERE d.id = ?`,
+		lateralAllocSQL,
 		`WITH active AS (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS MATERIALIZED (SELECT id FROM active) SELECT id FROM selected`,
+		benchSetExpression,
 	}
 	var p Parser
 	var stmt SelectStmt
@@ -113,6 +121,8 @@ func TestWarmParseStatementIsAllocationFree(t *testing.T) {
 		{"create index", benchCreateIndex},
 		{"truncate", `TRUNCATE TABLE docs`},
 		{"drop index", `DROP INDEX IF EXISTS by_kind ON docs`},
+		{"set expression", benchSetExpression},
+		{"explain set expression", `EXPLAIN ` + benchSetExpression},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,6 +163,8 @@ func TestWarmParseStatementOfMixedShapesIsAllocationFree(t *testing.T) {
 		benchCreateIndex,
 		`TRUNCATE TABLE docs`,
 		`DROP INDEX IF EXISTS by_kind ON docs`,
+		benchSetExpression,
+		`EXPLAIN ` + benchSetExpression,
 	}
 	var p Parser
 	var stmt Statement

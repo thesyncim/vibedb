@@ -143,10 +143,15 @@ type Statement struct {
 }
 
 type nestedStatements struct {
+	// frame is inline with the already-cold nested state so recursive relation
+	// execution never makes RunInto's stack frame escape. Ordinary statements
+	// keep nested nil and use the direct path below.
+	frame        statementFrame
 	subqueries   []statementSubquery
 	derived      *statementDerived
 	relationJoin *statementRelationJoin
 	window       *statementWindow
+	set          *statementSetSQL
 	ctes         *statementCTEs
 	cte          *statementCTEReference
 	ownsCTEs     bool
@@ -271,6 +276,26 @@ func prepareTreeInContext(
 	ctes *statementCTEs,
 	argBase int,
 ) (*Statement, error) {
+	if recursive, pos := RecursiveSQLStatementRequired(tree); recursive &&
+		!recursiveSQLBridgeReentry(tree) {
+		// The owning top-level bridge rewrites each recursive definition to its
+		// anchor before re-entering this ordinary path. Every other encounter is
+		// still authored recursive SQL and must dispatch explicitly; allowing it
+		// to fall into plain CTE preparation produces a misleading lexical lookup
+		// failure and can never execute the fixpoint semantics.
+		if subqueryLimit == 0 && ctes == nil && argBase == 0 && tree.Set == nil {
+			return PrepareParsedRecursiveSQLStatement(
+				src, tree, RecursiveSQLStatementOptions{},
+			)
+		}
+		return nil, sqlast.NewFeatureNotSupportedError(
+			src, pos,
+			"WITH RECURSIVE must enter through the owning recursive statement prepare hook",
+		)
+	}
+	if tree.Set != nil {
+		return prepareSetSQLStatement(src, tree, subqueryLimit, ctes, argBase)
+	}
 	s := &Statement{
 		text: src, tree: tree, params: tree.Params,
 		subqueryLimit: subqueryLimit,
@@ -350,6 +375,24 @@ func prepareTreeInContext(
 	return s, nil
 }
 
+func recursiveSQLBridgeReentry(tree *sqlast.SelectStmt) bool {
+	if tree == nil || tree.With == nil {
+		return false
+	}
+	found := false
+	for i := range tree.With.CTEs {
+		definition := &tree.With.CTEs[i]
+		if definition.Recursive.Anchor == nil {
+			continue
+		}
+		found = true
+		if definition.Query != definition.Recursive.Anchor {
+			return false
+		}
+	}
+	return found
+}
+
 func (s *Statement) ensureNested() *nestedStatements {
 	if s.nested == nil {
 		s.nested = new(nestedStatements)
@@ -380,7 +423,12 @@ func (s *Statement) SQL() string { return s.text }
 // must execute against [FromDatabase] or [FromFileDatabase], whose database
 // snapshot resolves every collection at one instant; a caller holding a single
 // collection can refuse it before it takes a snapshot it would only discard.
-func (s *Statement) NumJoins() int { return len(s.tree.From) - 1 }
+func (s *Statement) NumJoins() int {
+	if set := s.setSQL(); set != nil {
+		return set.joins
+	}
+	return len(s.tree.From) - 1
+}
 
 // UsesGeneralizedRelationJoin reports whether this prepared statement executes
 // JOINs through the relation-spool pipeline. Adapters use it to retain their
@@ -393,6 +441,9 @@ func (s *Statement) UsesGeneralizedRelationJoin() bool {
 	}
 	if window := s.window(); window != nil {
 		return window.input.UsesGeneralizedRelationJoin()
+	}
+	if set := s.setSQL(); set != nil {
+		return set.generalizedJoin
 	}
 	return s.relationJoin() != nil
 }
@@ -411,6 +462,9 @@ func (s *Statement) RequiresCatalog() bool {
 // that advertised it would be advertising a column [Cursor.Cell] refuses to
 // return.
 func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
+	if set := s.setSQL(); set != nil {
+		return set.AppendSchema(dst)
+	}
 	start := len(dst)
 	dst = s.q.AppendSchema(dst)
 	if len(dst)-start > s.outputs {
@@ -435,6 +489,9 @@ func (s *Statement) Release() {
 	}
 	s.c.release()
 	if s.nested != nil {
+		if s.nested.set != nil {
+			s.nested.set.Release()
+		}
 		for i := range s.nested.subqueries {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
@@ -481,16 +538,50 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// Query.RunInto's destination contract by invalidating the prior result and
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
-	if s.nested != nil {
-		s.discardRelations()
-	}
 	e.Stats = ExecStats{}
-	var frame statementFrame
+	if s.nested == nil {
+		// IntermediateBytes is a statement-wide option even when this statement
+		// has no relation-valued child. Validate it without constructing a frame;
+		// passing a stack frame into the recursive nested executor would force one
+		// heap allocation on every ordinary execution.
+		if _, err := normalizeIntermediateBytes(e.Options); err != nil {
+			return Cursor{}, err
+		}
+		return s.runDirectInto(e, src, args)
+	}
+	s.discardRelations()
+	frame := &s.nested.frame
 	if err := frame.begin(e.Options); err != nil {
 		return Cursor{}, err
 	}
 	frame.args = args
-	return s.runIntoFrame(e, src, args, &frame, "")
+	cursor, err := s.runIntoFrame(e, src, args, frame, "")
+	// The persistent frame exists only to keep nested execution allocation-free.
+	// It must not extend the lifetime of caller-owned bindings past this
+	// synchronous execution; recursive and CTE children have completed before
+	// runIntoFrame returns, and the result cursor borrows only Exec.Result.
+	frame.args = nil
+	return cursor, err
+}
+
+// runDirectInto is the no-nested-state execution path. Keeping it separate is
+// an escape-analysis boundary: the recursive relation executor may retain a
+// statementFrame during one synchronous nested run, but an ordinary SELECT has
+// no frame to retain and therefore remains allocation-free.
+func (s *Statement) runDirectInto(e *Exec, src Source, args []any) (Cursor, error) {
+	if len(args) != s.params {
+		return Cursor{}, fmt.Errorf(
+			"query: statement has %d placeholder(s) and %d argument(s) were bound",
+			s.params, len(args),
+		)
+	}
+	if err := s.bind(args); err != nil {
+		return Cursor{}, err
+	}
+	if err := s.q.RunInto(e, src); err != nil {
+		return Cursor{}, err
+	}
+	return s.cursor(&e.Result), nil
 }
 
 // runIntoFrame is RunInto with the statement-wide accounts already installed.
@@ -519,6 +610,30 @@ func (s *Statement) runIntoFrame(
 		return Cursor{}, fmt.Errorf(
 			"query: statement has %d placeholder(s) and %d argument(s) were bound",
 			s.params, len(args))
+	}
+	if set := s.setSQL(); set != nil {
+		if s.nested.ownsCTEs && s.nested.ctes != nil {
+			defer s.nested.ctes.releaseExecution(frame)
+		}
+		limit := e.Options.ResultBytes
+		if intermediateResource != "" {
+			limit = frame.intermediate.remaining()
+			if limit == 0 {
+				return Cursor{}, &IntermediateBudgetError{
+					Resource: intermediateResource,
+					Bytes:    saturatedBytes(frame.intermediate.used, 1),
+					Limit:    frame.intermediate.limit,
+				}
+			}
+			e.Options.ResultBytes = limit
+		}
+		cursor, err := set.runIntoFrame(e, src, args, frame, intermediateResource)
+		if err != nil && intermediateResource != "" {
+			err = translateSetIntermediateError(
+				err, frame, limit, intermediateResource,
+			)
+		}
+		return cursor, err
 	}
 	runSource := src
 	if s.nested != nil {

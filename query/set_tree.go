@@ -147,6 +147,21 @@ type SetTreeProgram interface {
 	Leaf(source int, cancel *CancelFlag) (SetTreeSource, error)
 }
 
+// setTreeFrameProgram is the prepared-statement boundary. Unlike SetTreeProgram,
+// it materializes each leaf directly into the executor's destination spool so
+// a child SQL Result is copied once, released immediately, and charged to the
+// caller's existing statement frame. consumeSetTreeResult runs while the root
+// spool is still live; runInFrame releases it before returning.
+type setTreeFrameProgram interface {
+	materializeSetTreeLeaf(
+		source, columns int,
+		dst *relationSpool,
+		frame *statementFrame,
+		cancel *CancelFlag,
+	) (rows int, charge int64, err error)
+	consumeSetTreeResult(result SetTreeResult, cancel *CancelFlag) error
+}
+
 // SetTreeOptions are total physical limits for one execution. Zero selects a
 // finite default and minus one disables one limit. Values below minus one are
 // invalid, and at least one limit must remain finite.
@@ -383,7 +398,7 @@ func (e *SetTreeExecutor) Run(
 	}
 	defer e.running.Store(false)
 
-	e.resetRun()
+	e.resetRun(&e.frame)
 	if program == nil {
 		return SetTreeResult{}, ErrSetTreeProgram
 	}
@@ -394,6 +409,53 @@ func (e *SetTreeExecutor) Run(
 	if err = e.frame.begin(ExecOptions{IntermediateBytes: e.options.maxBytes}); err != nil {
 		return SetTreeResult{}, err
 	}
+	return e.runPlan(plan, program, nil, &e.frame)
+}
+
+// runInFrame executes and consumes one tree inside an existing statement-wide
+// intermediate account. The program's consumer must detach the root because
+// every tree-owned spool is released before this method returns.
+func (e *SetTreeExecutor) runInFrame(
+	plan SetTreePlan,
+	program setTreeFrameProgram,
+	options SetTreeOptions,
+	frame *statementFrame,
+) (err error) {
+	if e == nil {
+		return fmt.Errorf("query: nil set-expression executor: %w", ErrSetTreeConfig)
+	}
+	if frame == nil {
+		return fmt.Errorf("query: nil set-expression statement frame: %w", ErrSetTreeConfig)
+	}
+	if program == nil {
+		return ErrSetTreeProgram
+	}
+	if !e.running.CompareAndSwap(false, true) {
+		return ErrSetTreeInUse
+	}
+	defer e.running.Store(false)
+
+	// runInFrame always consumes and releases its own result. Any retained
+	// standalone Run result therefore belongs to the executor-owned frame.
+	e.resetRun(&e.frame)
+	e.options, err = normalizeSetTreeOptions(options)
+	if err != nil {
+		return err
+	}
+	result, err := e.runPlan(plan, nil, program, frame)
+	if err != nil {
+		return err
+	}
+	defer e.resetRun(frame)
+	return program.consumeSetTreeResult(result, e.options.cancel)
+}
+
+func (e *SetTreeExecutor) runPlan(
+	plan SetTreePlan,
+	program SetTreeProgram,
+	frameProgram setTreeFrameProgram,
+	frame *statementFrame,
+) (result SetTreeResult, err error) {
 	maxSlots, err := e.preflightPlan(plan)
 	if err != nil {
 		return SetTreeResult{}, err
@@ -402,17 +464,17 @@ func (e *SetTreeExecutor) Run(
 	if e.controlBytes == math.MaxInt64 {
 		return SetTreeResult{}, ErrSetTreeSize
 	}
-	if err = e.frame.intermediate.reserve(
+	if err = frame.intermediate.reserve(
 		"set-expression control", e.controlBytes,
 	); err != nil {
 		e.controlBytes = 0
 		return SetTreeResult{}, e.translateError(err)
 	}
-	e.observeBytes(e.frame.intermediate.used)
+	e.observeBytes(frame.intermediate.used)
 	defer func() {
 		if err != nil {
 			err = e.translateError(err)
-			e.abortRun()
+			e.abortRun(frame)
 			result = SetTreeResult{}
 		}
 	}()
@@ -428,12 +490,17 @@ func (e *SetTreeExecutor) Run(
 			return SetTreeResult{}, err
 		}
 		if node.Kind == SetTreeLeafNode {
-			if err = e.executeLeaf(nodeIndex, node, program); err != nil {
+			if frameProgram != nil {
+				err = e.executeFrameLeaf(nodeIndex, node, frameProgram, frame)
+			} else {
+				err = e.executeLeaf(nodeIndex, node, program, frame)
+			}
+			if err != nil {
 				return SetTreeResult{}, err
 			}
 			continue
 		}
-		if err = e.executeBinary(nodeIndex, node); err != nil {
+		if err = e.executeBinary(nodeIndex, node, frame); err != nil {
 			return SetTreeResult{}, err
 		}
 	}
@@ -442,7 +509,7 @@ func (e *SetTreeExecutor) Run(
 	}
 	e.rootSlot = e.nodeSlots[plan.Root]
 	root := e.slots[e.rootSlot].relation()
-	e.frame.intermediate.release(e.controlBytes)
+	frame.intermediate.release(e.controlBytes)
 	e.controlBytes = 0
 	return SetTreeResult{relation: root}, nil
 }
@@ -608,6 +675,7 @@ func (e *SetTreeExecutor) executeLeaf(
 	nodeIndex int,
 	node SetTreeNode,
 	program SetTreeProgram,
+	frame *statementFrame,
 ) error {
 	source, err := program.Leaf(node.Source, e.options.cancel)
 	if err != nil {
@@ -637,7 +705,7 @@ func (e *SetTreeExecutor) executeLeaf(
 		return err
 	}
 	charge, err := materializeSetTreeLeaf(
-		&e.slots[slot].leaf, source, rows, columns, &e.frame,
+		&e.slots[slot].leaf, source, rows, columns, frame,
 		e.options.cancel, "set-expression leaf",
 	)
 	if err != nil {
@@ -648,11 +716,73 @@ func (e *SetTreeExecutor) executeLeaf(
 	e.slots[slot].active = true
 	e.nodeSlots[nodeIndex] = slot
 	e.totalRows += int64(rows)
-	e.observeBytes(e.frame.intermediate.used)
+	e.observeBytes(frame.intermediate.used)
 	return nil
 }
 
-func (e *SetTreeExecutor) executeBinary(nodeIndex int, node SetTreeNode) error {
+func (e *SetTreeExecutor) executeFrameLeaf(
+	nodeIndex int,
+	node SetTreeNode,
+	program setTreeFrameProgram,
+	frame *statementFrame,
+) error {
+	slot, err := e.acquireSlot()
+	if err != nil {
+		return err
+	}
+	rows, charge, err := program.materializeSetTreeLeaf(
+		node.Source, node.Columns, &e.slots[slot].leaf, frame, e.options.cancel,
+	)
+	if err != nil {
+		if charge > 0 {
+			frame.intermediate.release(charge)
+		}
+		e.slots[slot].leaf.reset()
+		return err
+	}
+	wantCharge := relationSpoolRetainedBytes(
+		rows, len(e.slots[slot].leaf.columns),
+		int64(len(e.slots[slot].leaf.data)),
+	)
+	consistent := false
+	if rows >= 0 && e.slots[slot].leaf.rows == rows &&
+		len(e.slots[slot].leaf.columns) == node.Columns &&
+		len(e.slots[slot].leaf.data) == e.slots[slot].leaf.plannedData {
+		consistent = true
+		for column := range e.slots[slot].leaf.columns {
+			if len(e.slots[slot].leaf.columns[column]) != rows {
+				consistent = false
+				break
+			}
+		}
+	}
+	if !consistent || charge != wantCharge {
+		frame.intermediate.release(charge)
+		e.slots[slot].leaf.reset()
+		return fmt.Errorf(
+			"query: set-expression prepared leaf %d returned an inconsistent spool: %w",
+			node.Source, ErrSetTreeSource,
+		)
+	}
+	if err := e.admitRows(nodeIndex, rows); err != nil {
+		frame.intermediate.release(charge)
+		e.slots[slot].leaf.reset()
+		return err
+	}
+	e.slots[slot].kind = setTreeSlotLeaf
+	e.slots[slot].charge = charge
+	e.slots[slot].active = true
+	e.nodeSlots[nodeIndex] = slot
+	e.totalRows += int64(rows)
+	e.observeBytes(frame.intermediate.used)
+	return nil
+}
+
+func (e *SetTreeExecutor) executeBinary(
+	nodeIndex int,
+	node SetTreeNode,
+	frame *statementFrame,
+) error {
 	leftSlot, rightSlot := e.nodeSlots[node.Left], e.nodeSlots[node.Right]
 	if leftSlot == rightSlot || leftSlot < 0 || rightSlot < 0 ||
 		leftSlot >= len(e.slots) || rightSlot >= len(e.slots) ||
@@ -669,9 +799,9 @@ func (e *SetTreeExecutor) executeBinary(nodeIndex int, node SetTreeNode) error {
 	if err != nil {
 		return err
 	}
-	usedBefore := e.frame.intermediate.used
+	usedBefore := frame.intermediate.used
 	charge, err := e.slots[outputSlot].binary.execute(
-		operation, left, right, &e.frame, e.options.cancel,
+		operation, left, right, frame, e.options.cancel,
 	)
 	if err != nil {
 		return err
@@ -688,8 +818,8 @@ func (e *SetTreeExecutor) executeBinary(nodeIndex int, node SetTreeNode) error {
 	}
 	e.totalRows += int64(rows)
 	e.nodeSlots[nodeIndex] = outputSlot
-	e.releaseSlot(leftSlot)
-	e.releaseSlot(rightSlot)
+	e.releaseSlot(leftSlot, frame)
+	e.releaseSlot(rightSlot, frame)
 	return nil
 }
 
@@ -793,24 +923,24 @@ func (e *SetTreeExecutor) acquireSlot() (int, error) {
 	return slot, nil
 }
 
-func (e *SetTreeExecutor) releaseSlot(slot int) {
+func (e *SetTreeExecutor) releaseSlot(slot int, frame *statementFrame) {
 	if slot < 0 || slot >= len(e.slots) || !e.slots[slot].active {
 		return
 	}
-	e.frame.intermediate.release(e.slots[slot].charge)
+	frame.intermediate.release(e.slots[slot].charge)
 	e.slots[slot].resetLogical()
 	e.free = append(e.free, slot)
 }
 
-func (e *SetTreeExecutor) resetRun() {
+func (e *SetTreeExecutor) resetRun(frame *statementFrame) {
 	for slot := range e.slots {
 		if e.slots[slot].active {
-			e.frame.intermediate.release(e.slots[slot].charge)
+			frame.intermediate.release(e.slots[slot].charge)
 		}
 		e.slots[slot].resetLogical()
 	}
 	if e.controlBytes != 0 {
-		e.frame.intermediate.release(e.controlBytes)
+		frame.intermediate.release(e.controlBytes)
 	}
 	e.free = e.free[:0]
 	e.totalRows = 0
@@ -819,15 +949,15 @@ func (e *SetTreeExecutor) resetRun() {
 	e.rootSlot = -1
 }
 
-func (e *SetTreeExecutor) abortRun() {
+func (e *SetTreeExecutor) abortRun(frame *statementFrame) {
 	for slot := range e.slots {
 		if e.slots[slot].active {
-			e.frame.intermediate.release(e.slots[slot].charge)
+			frame.intermediate.release(e.slots[slot].charge)
 		}
 		e.slots[slot].resetLogical()
 	}
 	if e.controlBytes != 0 {
-		e.frame.intermediate.release(e.controlBytes)
+		frame.intermediate.release(e.controlBytes)
 	}
 	e.controlBytes = 0
 	e.totalRows = 0
@@ -889,7 +1019,7 @@ func (e *SetTreeExecutor) Release() {
 	if e == nil {
 		return
 	}
-	e.resetRun()
+	e.resetRun(&e.frame)
 	for slot := range e.slots {
 		e.slots[slot].release()
 	}

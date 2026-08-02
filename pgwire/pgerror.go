@@ -199,6 +199,8 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateInvalidParameterValue, err.Error())
 	case errors.Is(err, query.ErrWindowArgument):
 		return newError(sqlstateInvalidParameterValue, err.Error())
+	case errors.Is(err, query.ErrSetTreeArity):
+		return newError(sqlstateSyntaxError, err.Error())
 	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
 		return newError(sqlstateStatementCompletionUnknown, err.Error())
 	case errors.Is(err, sqldriver.ErrTableNotFound):

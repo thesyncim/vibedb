@@ -42,6 +42,13 @@ func (p *Parser) resolvePaths() error {
 				path.Segments = path.Segments[1:]
 				continue
 			}
+			if source, depth, ok := p.outerRangeVar(path.Segments[0].Key); ok {
+				path.Source = source
+				path.Segments = path.Segments[1:]
+				p.bindLateralPath(path, depth, source)
+				continue
+			}
+			p.noteLateralForwardCandidate(path, path.Segments[0].Key)
 			if entry.star {
 				return p.errfAt(path.Pos,
 					"%q is not a collection or alias declared in FROM or JOIN, so %q projects nothing",
@@ -65,6 +72,133 @@ func (p *Parser) resolvePaths() error {
 		path.Source = 0
 	}
 	return nil
+}
+
+func (p *Parser) outerRangeVar(name string) (source, depth int, ok bool) {
+	if p.lateral == nil {
+		return 0, 0, false
+	}
+	depth = 1
+	for scope := p.lateral.outerRanges; scope != nil; scope = scope.outer {
+		if scope.parser != nil {
+			limit := min(scope.limit, len(scope.parser.from))
+			for i := 0; i < limit; i++ {
+				if scope.parser.from[i].Alias == name {
+					return i, depth, true
+				}
+			}
+		}
+		depth++
+	}
+	return 0, 0, false
+}
+
+func (p *Parser) bindLateralPath(path *PathExpr, depth, source int) {
+	if p.lateral == nil {
+		return
+	}
+	capture := p.lateral.capture
+	if capture == nil || capture.owner == nil {
+		return
+	}
+	bindLateralCapture(capture, path, depth, source, true)
+	// A nested LATERAL may reach through its parent query to an ancestor of
+	// that parent. Propagate the dependency through every owning LATERAL so no
+	// intermediate relation is incorrectly marked decorrelated.
+	for depth > 1 {
+		if capture.owner.lateral == nil {
+			break
+		}
+		capture = capture.owner.lateral.capture
+		if capture == nil || capture.owner == nil {
+			break
+		}
+		depth--
+		bindLateralCapture(capture, path, depth, source, false)
+	}
+}
+
+func bindLateralCapture(
+	capture *lateralCapture,
+	path *PathExpr,
+	depth, source int,
+	reference bool,
+) int {
+	state := capture.owner.lateralState()
+	bindings := state.bindingScratch[capture.bindingBase:]
+	bindingIndex := -1
+	for i := range bindings {
+		binding := &bindings[i].binding
+		if binding.Depth == depth && binding.Source == source &&
+			sameSegments(binding.Segments, path.Segments) {
+			bindingIndex = i
+			break
+		}
+	}
+	if bindingIndex < 0 {
+		state.bindingScratch = append(state.bindingScratch, lateralScratchBinding{
+			binding: LateralBinding{
+				Depth: depth, Source: source, Segments: path.Segments, Pos: path.Pos,
+			},
+			path: path,
+		})
+		bindingIndex = len(state.bindingScratch) - capture.bindingBase - 1
+	}
+	if reference {
+		state.referenceScratch = append(state.referenceScratch, lateralScratchReference{
+			path: path, binding: bindingIndex,
+		})
+	}
+	return bindingIndex
+}
+
+func sameSegments(left, right []Segment) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Parser) isLateralReference(path *PathExpr) bool {
+	_, ok := p.lateralReferenceBinding(path)
+	return ok
+}
+
+func (p *Parser) lateralReferenceBinding(path *PathExpr) (int, bool) {
+	if path == nil || p.lateral == nil {
+		return 0, false
+	}
+	capture := p.lateral.capture
+	if capture == nil || capture.owner == nil ||
+		capture.owner.lateral == nil {
+		return 0, false
+	}
+	references := capture.owner.lateral.referenceScratch[capture.referenceBase:]
+	for i := range references {
+		if references[i].path == path {
+			return references[i].binding, true
+		}
+	}
+	return 0, false
+}
+
+func (p *Parser) noteLateralForwardCandidate(path *PathExpr, alias string) {
+	if p.lateral == nil {
+		return
+	}
+	capture := p.lateral.capture
+	if capture == nil || capture.owner == nil {
+		return
+	}
+	state := capture.owner.lateralState()
+	state.forward = append(state.forward, lateralForwardCandidate{
+		path: path, alias: alias, source: capture.source,
+	})
 }
 
 // usingColumnSource resolves the one unqualified column JOIN ... USING adds to
@@ -170,6 +304,26 @@ func (p *Parser) validate() error {
 	return p.validateHaving(grouped, aggregates > 0)
 }
 
+func (p *Parser) rejectLateralForwardAlias(alias string, source int) error {
+	for i := range p.lateral.forward {
+		candidate := &p.lateral.forward[i]
+		if source < candidate.source || alias != candidate.alias {
+			continue
+		}
+		if source == candidate.source {
+			return p.errfAt(candidate.path.Pos,
+				"LATERAL derived table %q cannot reference its own output while it is being computed",
+				candidate.alias,
+			)
+		}
+		return p.errfAt(candidate.path.Pos,
+			"LATERAL reference %q is joined later; only preceding FROM sources are visible",
+			candidate.alias,
+		)
+	}
+	return nil
+}
+
 func (p *Parser) validateWindows(grouped, hasAggregate bool) error {
 	for i := range p.out.Windows {
 		if err := p.validateWindowSpecPaths(
@@ -268,7 +422,7 @@ func (p *Parser) validateJoins() error {
 				return p.errAt(expr.Pos, "subqueries are not supported in ON")
 			}
 			for _, path := range []*PathExpr{expr.Path, expr.RightPath} {
-				if path == nil {
+				if path == nil || p.isLateralReference(path) {
 					continue
 				}
 				if path.Source > i {
@@ -295,7 +449,8 @@ func (p *Parser) validateJoins() error {
 		keyTerms := 0
 		for _, term := range terms {
 			if term.Kind != ExprCompare || term.Op != OpEq ||
-				term.Path == nil || term.RightPath == nil {
+				term.Path == nil || term.RightPath == nil ||
+				p.isLateralReference(term.Path) || p.isLateralReference(term.RightPath) {
 				continue
 			}
 			left, right := term.Path, term.RightPath
@@ -423,11 +578,23 @@ func (p *Parser) bindHaving(e *Expr) error {
 // isGroupKey reports whether path is one of the GROUP BY keys.
 func (p *Parser) isGroupKey(path *PathExpr) bool {
 	for _, key := range p.out.GroupBy {
-		if sameSpec(key, path) {
+		if p.sameResolvedPath(key, path) {
 			return true
 		}
 	}
 	return false
+}
+
+func (p *Parser) sameResolvedPath(left, right *PathExpr) bool {
+	leftBinding, leftOuter := p.lateralReferenceBinding(left)
+	rightBinding, rightOuter := p.lateralReferenceBinding(right)
+	if leftOuter != rightOuter {
+		return false
+	}
+	if leftOuter && leftBinding != rightBinding {
+		return false
+	}
+	return sameSpec(left, right)
 }
 
 // aggregateColumn answers the output column computing agg over path, or -1.
@@ -443,7 +610,7 @@ func (p *Parser) aggregateColumn(agg AggKind, path *PathExpr) int {
 			}
 			continue
 		}
-		if sameSpec(column.Path, path) {
+		if p.sameResolvedPath(column.Path, path) {
 			return i
 		}
 	}
@@ -454,7 +621,7 @@ func (p *Parser) aggregateColumn(agg AggKind, path *PathExpr) int {
 // statement groups by a key it does not project.
 func (p *Parser) projectionColumn(path *PathExpr) int {
 	for i := range p.out.Columns {
-		if p.out.Columns[i].Agg == AggNone && sameSpec(p.out.Columns[i].Path, path) {
+		if p.out.Columns[i].Agg == AggNone && p.sameResolvedPath(p.out.Columns[i].Path, path) {
 			return i
 		}
 	}

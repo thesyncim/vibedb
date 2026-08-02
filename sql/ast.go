@@ -81,13 +81,25 @@ type SelectStmt struct {
 	// ParamBase is the first outer-statement placeholder occupied by this
 	// statement when it is a subquery. It is zero for a top-level statement.
 	ParamBase int
+
+	// Set is the cold query-expression sidecar. It is nil for an ordinary
+	// SELECT, preserving the existing direct lowering path. When non-nil, this
+	// SelectStmt mirrors Set.First only for stable output metadata; Params is
+	// global and Set owns all executable leaves plus the exact binary/group tree
+	// and query-expression tail. A consumer MUST branch on Set before lowering
+	// any ordinary fields. Ignoring it would execute only the first operand.
+	Set *SetExpression
 }
 
-// A WithClause owns the non-recursive common table expressions declared for
-// one SELECT. Its definitions and strings are backed by the Parser's arenas
-// and obey the same borrowed-lifetime contract as the rest of the AST.
+// A WithClause owns the common table expressions declared for one SELECT. Its
+// definitions and strings are backed by the Parser's arenas and obey the same
+// borrowed-lifetime contract as the rest of the AST.
 type WithClause struct {
 	CTEs []CommonTableExpr
+	// Recursive records the authored WITH RECURSIVE scope marker. Individual
+	// definitions carry non-zero Recursive metadata only when they actually
+	// reference themselves; SQL permits non-recursive definitions in this scope.
+	Recursive bool
 	// Pos is the byte offset of WITH.
 	Pos int
 }
@@ -115,12 +127,31 @@ type CommonTableExpr struct {
 	// checks Columns against the materialized schema; the parser must not infer
 	// arity from len(Query.Columns).
 	ColumnArityDeferred bool
-	Query               *SelectStmt
-	Materialization     CTEMaterialization
+	// Query retains the complete authored body. For a recursive definition it
+	// is the lossless UNION set expression; Recursive identifies the two leaves
+	// consumed by bounded fixpoint lowering. A consumer must branch on
+	// Recursive.Anchor before treating Query as an ordinary CTE body.
+	Query           *SelectStmt
+	Recursive       RecursiveCTE
+	Materialization CTEMaterialization
 	// Pos is the byte offset of Name. HintPos is the byte offset of
 	// MATERIALIZED or NOT, or -1 when no policy was written.
 	Pos     int
 	HintPos int
+}
+
+// RecursiveCTE is validated, allocation-free metadata for the supported SQL
+// recursive shape. Its zero value identifies an ordinary definition, including
+// an ordinary definition authored inside WITH RECURSIVE.
+//
+// Anchor and Term are exact leaves of CommonTableExpr.Query.Set. Their
+// ParamBase values are relative to that CTE body; Query.ParamBase is the body's
+// absolute base in the containing statement. Lowering adds the two with checked
+// arithmetic and never renumbers operands.
+type RecursiveCTE struct {
+	Anchor    *SelectStmt
+	Term      *SelectStmt
+	Operation SetOperation
 }
 
 // A JoinKind names a join's flavour.
@@ -149,10 +180,10 @@ const (
 	// every existing TableRef literal remains a collection unless it opts into
 	// another relation shape explicitly.
 	RelationCollection RelationKind = iota
-	// RelationDerived is an uncorrelated SELECT materialized as a relation.
-	// [TableRef.Query] holds the nested statement and [TableRef.Alias] is
-	// mandatory. Correlated execution is deliberately a different future kind:
-	// a lowerer must never infer LATERAL semantics from this value.
+	// RelationDerived is a SELECT materialized as a relation. [TableRef.Query]
+	// holds the nested statement and [TableRef.Alias] is mandatory. [TableRef]
+	// records LATERAL independently so ordinary and correlated derived inputs
+	// retain one relation kind and one output-schema contract.
 	RelationDerived
 	// RelationCTE is a reference to a lexically visible common table
 	// expression. [TableRef.Query] points at the exact definition body, giving
@@ -184,6 +215,43 @@ type CTEReferenceMetadata struct {
 	DefinitionPos int
 }
 
+// A LateralBinding is one stable value slot captured from a relation visible
+// to a LATERAL derived query. Bindings are unique by (Depth, Source, Segments)
+// and remain in first-reference order, so a prepared lowerer can compile them
+// once and fill the same slots for every left-side row.
+//
+// Depth is one for the SELECT immediately containing the LATERAL relation, two
+// for its parent, and so on. Source indexes that SELECT's From slice. This
+// explicit pair avoids flattening nested lexical scopes or relying on aliases
+// after parsing. Pos identifies the first path occurrence that requested the
+// binding.
+type LateralBinding struct {
+	Depth    int
+	Source   int
+	Segments []Segment
+	Pos      int
+}
+
+// A LateralReference maps one exact correlated PathExpr occurrence to its
+// zero-based LateralBinding slot. Keeping this mapping in a relation-local
+// sidecar leaves ordinary PathExpr nodes unchanged in size and cost.
+type LateralReference struct {
+	Path    *PathExpr
+	Binding int
+}
+
+// LateralSpec is the cold metadata attached to an explicitly LATERAL derived
+// relation. A nil *TableRef.Lateral is the zero-cost ordinary path.
+type LateralSpec struct {
+	Bindings   []LateralBinding
+	References []LateralReference
+	// Decorrelated is true when the derived query captured no outer paths. A
+	// lowerer may evaluate it once through the ordinary derived-relation plan.
+	Decorrelated bool
+	// Pos is the byte offset of LATERAL.
+	Pos int
+}
+
 // A TableRef is one range variable: a physical collection or derived query,
 // the name paths use to qualify against it, and, for a joined relation, its
 // equi-join condition.
@@ -197,8 +265,8 @@ type TableRef struct {
 	Name string
 	// Query is the nested SELECT for RelationDerived, the stable definition
 	// identity for RelationCTE, and nil for RelationCollection. A derived query
-	// has its own source scope and parser arena, and is uncorrelated by
-	// construction.
+	// has its own local source scope and parser arena. Only an explicitly
+	// LATERAL relation may carry paths bound outside that local scope.
 	Query *SelectStmt
 	// UnresolvedCTE is non-zero only on a RelationCollection that shares a name
 	// with its enclosing CTE or a later sibling. Catalog-aware binding uses it
@@ -211,6 +279,10 @@ type TableRef struct {
 	// HasAlias records whether Alias was written explicitly, purely so a
 	// diagnostic can echo the statement back accurately.
 	HasAlias bool
+	// Lateral is non-nil only when the statement explicitly wrote LATERAL. It
+	// owns both the stable outer-value slots and every correlated path occurrence
+	// that consumes one.
+	Lateral *LateralSpec
 	// Join is JoinNone for From[0] and the requested join kind for the rest.
 	Join JoinKind
 	// On is the equi-join condition, or nil for From[0]. Left always binds to
@@ -525,6 +597,8 @@ type OrderTerm struct {
 // variable rather than a field.
 type PathExpr struct {
 	// Source is an index into [SelectStmt.From].
+	// A path listed by a containing [LateralSpec.References] instead indexes the
+	// ancestor From named by that reference's binding.
 	Source int
 	// MergedUsing is the one-based From index of the USING clause whose merged
 	// output this unqualified path names. Zero means an ordinary source path.
@@ -653,8 +727,10 @@ type Expr struct {
 	// nodes and ExprConstant. It is nil for a COUNT(*) HAVING leaf, matching
 	// ResultColumn.
 	Path *PathExpr
-	// RightPath is the right operand of a JOIN comparison between two paths.
-	// WHERE and HAVING leaves keep it nil and use Value or Subquery.
+	// RightPath is the right operand of a comparison between two paths. JOIN ON
+	// always admits it; a LATERAL derived query also admits it in WHERE so its
+	// local path can compare directly with a captured outer path. Ordinary WHERE
+	// and HAVING leaves keep it nil and use Value or Subquery.
 	RightPath *PathExpr
 	// Value is the right operand of ExprCompare and ExprContains.
 	Value Operand

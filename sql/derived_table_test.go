@@ -175,13 +175,13 @@ func TestDerivedJoinAndLateralRefusalsStayTyped(t *testing.T) {
 			name: "leading lateral",
 			src:  `SELECT d.id FROM LATERAL (SELECT id FROM docs) d`,
 			pos:  17,
-			want: "LATERAL derived tables are not supported",
+			want: "leading LATERAL item has no preceding",
 		},
 		{
 			name: "nested lateral keeps absolute position",
 			src:  `SELECT d.id FROM (SELECT x.id FROM LATERAL (SELECT id FROM docs) x) d`,
 			pos:  35,
-			want: "LATERAL derived tables are not supported",
+			want: "leading LATERAL item has no preceding",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

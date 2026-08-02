@@ -81,11 +81,32 @@ type statementCTE struct {
 	ordinalSpec []string
 	specData    []byte
 	activeBytes int64
+	// activeFrame is the exact intermediate account that owns activeBytes and
+	// every relation retained by stmt while a shared publication is ready. A
+	// recursive definition executes dependencies in its feature-owned frame,
+	// which can differ from the outer catalog's frame; retaining identity here
+	// makes release debit the account that was actually charged.
+	activeFrame *statementFrame
 	state       cteMaterializationState
 
 	references     int
 	firstReference *statementCTEReference
 	runEvaluations uint64
+
+	// recursiveBinding is installed only for one synchronous prepared
+	// recursive-Statement term invocation. Ordinary CTEs keep it nil and pay
+	// no branch until they cross the existing materialization boundary.
+	recursiveBinding *statementRecursiveBinding
+	// recursiveOwner disables CTE fusion while one prepared Statement adapter
+	// designates this definition as its delta relation. The cached plan must
+	// never bypass the materialization hook merely because no invocation is
+	// active at the instant lowering inspects the definition. Identity makes
+	// adapter teardown exact when the borrowed Statement is reused.
+	recursiveOwner *RecursiveCTEStatementTerm
+	// recursiveDefinition is allocated only by the future WITH RECURSIVE
+	// lowerer. Ordinary definitions keep it nil and retain their existing
+	// materialization and execution objects.
+	recursiveDefinition *statementRecursiveDefinition
 }
 
 // statementCTEReference owns storage only for reference-local and explicitly
@@ -197,6 +218,12 @@ func (r *statementCTEReference) mode() cteExecutionMode {
 	if r == nil || r.def == nil || r.def.definition == nil {
 		return cteReferenceLocal
 	}
+	if recursive := r.def.recursiveDefinition; recursive != nil {
+		if recursive.descriptor.materialize == RecursiveCTEShared {
+			return cteSharedMaterialized
+		}
+		return cteIndependent
+	}
 	switch r.def.definition.Materialization {
 	case sqlast.CTEMaterialized:
 		return cteSharedMaterialized
@@ -220,7 +247,10 @@ func (r *statementCTEReference) mode() cteExecutionMode {
 // generalized relation planner; reporting a boundary is preferable to calling
 // a spool "inline".
 func (s *Statement) safeCTEFusionShape(def *statementCTE) bool {
-	if s == nil || def == nil || def.stmt == nil || len(s.tree.Columns) != 1 {
+	if s == nil || def == nil || def.stmt == nil ||
+		def.recursiveDefinition != nil || def.recursiveOwner != nil ||
+		def.recursiveBinding != nil ||
+		len(s.tree.Columns) != 1 {
 		return false
 	}
 	outer := s.tree
@@ -407,14 +437,17 @@ func (d *statementCTE) ensureMaterialized(
 	d.state = cteRunning
 	d.spool.reset()
 	d.activeBytes = 0
+	d.activeFrame = nil
 	charge, err := d.materializeInto(
 		parent, src, consumer, frame, &d.spool, "materialized CTE spool",
 	)
 	if err != nil {
 		d.state = cteIdle
+		d.activeFrame = nil
 		return err
 	}
 	d.activeBytes = charge
+	d.activeFrame = frame
 	d.state = cteReady
 	return nil
 }
@@ -427,6 +460,18 @@ func (d *statementCTE) materializeInto(
 	spool *relationSpool,
 	resource string,
 ) (int64, error) {
+	if d != nil && d.recursiveBinding != nil {
+		d.runEvaluations++
+		return d.recursiveBinding.materializeInto(
+			spool, frame, parent.Options.Cancel, resource,
+		)
+	}
+	if d != nil && d.recursiveDefinition != nil {
+		d.runEvaluations++
+		return d.recursiveDefinition.materializeInto(
+			parent, src, consumer, frame, spool, resource,
+		)
+	}
 	args, err := d.boundArgs(frame)
 	if err != nil {
 		return 0, err
@@ -520,12 +565,26 @@ func (c *statementCTEs) releaseExecution(frame *statementFrame) {
 		if def == nil {
 			continue
 		}
-		def.cleanupChild(frame)
+		publicationFrame := def.publicationFrame(frame)
+		if def.recursiveDefinition != nil {
+			def.recursiveDefinition.releaseExecution(publicationFrame)
+		}
+		def.cleanupChild(publicationFrame)
 		def.spool.reset()
-		frame.intermediate.release(def.activeBytes)
+		if publicationFrame != nil {
+			publicationFrame.intermediate.release(def.activeBytes)
+		}
 		def.activeBytes = 0
+		def.activeFrame = nil
 		def.state = cteIdle
 	}
+}
+
+func (d *statementCTE) publicationFrame(fallback *statementFrame) *statementFrame {
+	if d != nil && d.activeFrame != nil {
+		return d.activeFrame
+	}
+	return fallback
 }
 
 func (c *statementCTEs) discardExecution() {
@@ -536,12 +595,22 @@ func (c *statementCTEs) discardExecution() {
 		if def == nil {
 			continue
 		}
-		clearExecBorrowedViews(&def.exec)
-		if def.stmt != nil {
-			def.stmt.discardRelations()
+		if def.recursiveDefinition != nil {
+			def.recursiveDefinition.discardExecution()
+		}
+		publicationFrame := def.publicationFrame(nil)
+		if publicationFrame != nil {
+			def.cleanupChild(publicationFrame)
+			publicationFrame.intermediate.release(def.activeBytes)
+		} else {
+			clearExecBorrowedViews(&def.exec)
+			if def.stmt != nil {
+				def.stmt.discardRelations()
+			}
 		}
 		def.spool.reset()
 		def.activeBytes = 0
+		def.activeFrame = nil
 		def.state = cteIdle
 		def.runEvaluations = 0
 	}
@@ -554,6 +623,20 @@ func (c *statementCTEs) release() {
 	for _, def := range c.defs {
 		if def == nil {
 			continue
+		}
+		publicationFrame := def.publicationFrame(nil)
+		if publicationFrame != nil {
+			if def.recursiveDefinition != nil {
+				def.recursiveDefinition.releaseExecution(publicationFrame)
+			}
+			def.cleanupChild(publicationFrame)
+			publicationFrame.intermediate.release(def.activeBytes)
+			def.activeBytes = 0
+			def.activeFrame = nil
+			def.state = cteIdle
+		}
+		if def.recursiveDefinition != nil {
+			def.recursiveDefinition.release()
 		}
 		if def.stmt != nil {
 			def.stmt.Release()

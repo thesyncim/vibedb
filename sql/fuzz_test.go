@@ -37,9 +37,19 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
 		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
 		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) AS d WHERE d.id = ?`,
+		`SELECT a.id, d.id FROM accounts a LEFT JOIN LATERAL (` +
+			`SELECT i.id FROM items i WHERE i.owner = a.id AND a.region = ?` +
+			`) d ON TRUE`,
 		`WITH active(id) AS MATERIALIZED (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS NOT MATERIALIZED (SELECT id FROM active) SELECT id FROM selected WHERE id = ?`,
 		`WITH outer_cte AS (WITH inner_cte AS (SELECT id FROM docs) SELECT id FROM inner_cte) SELECT id FROM outer_cte`,
+		`SELECT id AS key FROM live_docs WHERE tenant = ? UNION ALL ` +
+			`SELECT id FROM archive WHERE tenant = ? INTERSECT DISTINCT ` +
+			`(SELECT id FROM allowed ORDER BY id LIMIT ?) ORDER BY key OFFSET ?`,
+		`(SELECT id FROM one EXCEPT ALL SELECT id FROM two) UNION ` +
+			`(SELECT id FROM three UNION DISTINCT SELECT id FROM four)`,
+		`VALUES (?, 'x', NULL), (2, 'y', TRUE) UNION ALL TABLE live ORDER BY column1`,
+		`(TABLE archive) INTERSECT DISTINCT (VALUES ({bad}))`,
 		`SELECT team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC NULLS LAST), ` +
 			`SUM(score) OVER (PARTITION BY team ORDER BY score ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM scores`,
 		`SELECT LAG(value, ?, NULL) OVER (ORDER BY seq NULLS FIRST) FROM events`,
@@ -85,7 +95,7 @@ func FuzzParseSQL(f *testing.F) {
 			}
 			// Formatting must not panic either; a driver logs this.
 			_ = parseErr.Error()
-			if len(stmt.Columns) != 0 || len(stmt.From) != 0 {
+			if len(stmt.Columns) != 0 || len(stmt.From) != 0 || stmt.Set != nil {
 				t.Fatal("a rejected statement left fields behind")
 			}
 			return
@@ -110,7 +120,19 @@ func FuzzParseSQL(f *testing.F) {
 // checkStatementInvariants asserts what an accepted statement promises, so a
 // lowering pass may walk it without re-validating every index.
 func checkStatementInvariants(t *testing.T, s *SelectStmt) {
+	checkStatementInvariantsScoped(t, s, nil)
+}
+
+func checkStatementInvariantsScoped(
+	t *testing.T,
+	s *SelectStmt,
+	outer *LateralSpec,
+) {
 	t.Helper()
+	if s.Set != nil {
+		checkSetStatementInvariantsScoped(t, s, outer)
+		return
+	}
 	if len(s.Columns) == 0 {
 		t.Fatal("an accepted statement projects nothing")
 	}
@@ -142,7 +164,7 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			} else if len(cte.Columns) > len(cte.Query.Columns) {
 				t.Fatalf("WITH[%d] has %d aliases for %d outputs", i, len(cte.Columns), len(cte.Query.Columns))
 			}
-			checkStatementInvariants(t, cte.Query)
+			checkStatementInvariantsScoped(t, cte.Query, nil)
 			if cte.Query.ParamBase != seen {
 				t.Fatalf("WITH[%d] ParamBase = %d, want %d", i, cte.Query.ParamBase, seen)
 			}
@@ -168,7 +190,7 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 				t.Fatalf("Windows[%d] inherits unknown/later window %q", i, window.Spec.Name)
 			}
 		}
-		seen += checkWindowSpecInvariants(t, s, &window.Spec, true)
+		seen += checkWindowSpecInvariants(t, s, &window.Spec, true, outer)
 	}
 	for i := range s.From {
 		ref := &s.From[i]
@@ -183,11 +205,43 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			if ref.Name == "" || ref.Query != nil {
 				t.Fatalf("From[%d] has invalid collection payload: %+v", i, ref)
 			}
+			if ref.Lateral != nil {
+				t.Fatalf("From[%d] physical relation carries LATERAL state: %+v", i, ref)
+			}
 		case RelationDerived:
-			if ref.Name != "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || !ref.HasAlias || i != 0 || len(s.From) != 1 {
+			if ref.Name != "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || !ref.HasAlias {
 				t.Fatalf("From[%d] has invalid derived payload: %+v", i, ref)
 			}
-			checkStatementInvariants(t, ref.Query)
+			if ref.Lateral != nil {
+				if i == 0 || ref.Lateral.Pos < 0 ||
+					ref.Lateral.Decorrelated != (len(ref.Lateral.Bindings) == 0) {
+					t.Fatalf("From[%d] has invalid LATERAL metadata: %+v", i, ref)
+				}
+				if len(ref.Lateral.Bindings) != 0 &&
+					ref.Join != JoinInner && ref.Join != JoinLeft && ref.Join != JoinCross {
+					t.Fatalf("From[%d] correlated unsupported join kind %d", i, ref.Join)
+				}
+				for binding := range ref.Lateral.Bindings {
+					item := &ref.Lateral.Bindings[binding]
+					if item.Depth < 1 || item.Source < 0 ||
+						item.Depth == 1 && item.Source >= i {
+						t.Fatalf("From[%d] binding[%d] = %+v", i, binding, item)
+					}
+				}
+				for reference := range ref.Lateral.References {
+					item := &ref.Lateral.References[reference]
+					if item.Path == nil || item.Binding < 0 || item.Binding >= len(ref.Lateral.Bindings) {
+						t.Fatalf("From[%d] reference[%d] = %+v", i, reference, item)
+					}
+					binding := &ref.Lateral.Bindings[item.Binding]
+					if item.Path.Source != binding.Source ||
+						!sameSegments(item.Path.Segments, binding.Segments) {
+						t.Fatalf("From[%d] reference[%d] %+v disagrees with binding %+v",
+							i, reference, item, binding)
+					}
+				}
+			}
+			checkStatementInvariantsScoped(t, ref.Query, ref.Lateral)
 			if ref.Query.ParamBase != seen {
 				t.Fatalf("From[%d] derived ParamBase = %d, want %d", i, ref.Query.ParamBase, seen)
 			}
@@ -196,24 +250,38 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			if ref.Name == "" || ref.Query == nil || ref.UnresolvedCTE.Kind != CTEReferenceNone || i != 0 || len(s.From) != 1 {
 				t.Fatalf("From[%d] has invalid CTE payload: %+v", i, ref)
 			}
+			if ref.Lateral != nil {
+				t.Fatalf("From[%d] CTE relation carries LATERAL state: %+v", i, ref)
+			}
 		default:
 			t.Fatalf("From[%d] has unknown relation kind %d", i, ref.Kind)
 		}
 		if i == 0 {
 			continue
 		}
+		if ref.Join == JoinCross {
+			if ref.On != nil {
+				t.Fatalf("From[%d] CROSS JOIN carries a condition", i)
+			}
+			continue
+		}
 		if ref.On == nil {
 			t.Fatalf("From[%d] is a join with no condition", i)
 		}
-		checkPath(t, s, ref.On.Left)
-		checkPath(t, s, ref.On.Right)
+		for key := range ref.On.Keys {
+			checkPath(t, s, ref.On.Keys[key].Left, outer)
+			checkPath(t, s, ref.On.Keys[key].Right, outer)
+		}
+		if ref.On.Expr != nil {
+			seen += checkExprScoped(t, s, ref.On.Expr, false, outer)
+		}
 	}
 	for i := range s.Columns {
 		if window := s.Columns[i].Window; window != nil {
 			if s.Columns[i].Path != nil || s.Columns[i].Agg != AggNone {
 				t.Fatalf("Columns[%d] mixes a window with an ordinary expression", i)
 			}
-			seen += checkWindowInvariants(t, s, window)
+			seen += checkWindowInvariants(t, s, window, outer)
 			continue
 		}
 		if s.Columns[i].Path == nil {
@@ -222,23 +290,23 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 			}
 			continue
 		}
-		checkPath(t, s, s.Columns[i].Path)
+		checkPath(t, s, s.Columns[i].Path, outer)
 	}
 	for _, key := range s.GroupBy {
-		checkPath(t, s, key)
+		checkPath(t, s, key, outer)
 	}
 	for i := range s.OrderBy {
 		if s.OrderBy[i].Output == 0 {
-			checkPath(t, s, s.OrderBy[i].Path)
+			checkPath(t, s, s.OrderBy[i].Path, outer)
 		} else if s.OrderBy[i].Output > len(s.Columns) {
 			t.Fatalf("OrderBy[%d] output %d is outside SELECT list", i, s.OrderBy[i].Output)
 		}
 	}
 	if s.Where != nil {
-		seen += checkExpr(t, s, s.Where, false)
+		seen += checkExprScoped(t, s, s.Where, false, outer)
 	}
 	if s.Having != nil {
-		seen += checkExpr(t, s, s.Having, true)
+		seen += checkExprScoped(t, s, s.Having, true, outer)
 	}
 	seen += checkRowCount(t, s.Limit)
 	seen += checkRowCount(t, s.Offset)
@@ -251,7 +319,12 @@ func checkStatementInvariants(t *testing.T, s *SelectStmt) {
 // returns the number of placeholders owned by the window expression. Window
 // operands live outside WHERE/HAVING, so omitting them here would let Params
 // disagree with the accepted tree even though ordinary predicates are sound.
-func checkWindowInvariants(t *testing.T, s *SelectStmt, w *WindowExpr) int {
+func checkWindowInvariants(
+	t *testing.T,
+	s *SelectStmt,
+	w *WindowExpr,
+	outer *LateralSpec,
+) int {
 	t.Helper()
 	requiresArgument := true
 	switch w.Kind {
@@ -266,7 +339,7 @@ func checkWindowInvariants(t *testing.T, s *SelectStmt, w *WindowExpr) int {
 		t.Fatalf("%s has no argument", w.Kind)
 	}
 	if w.Argument != nil {
-		checkPath(t, s, w.Argument)
+		checkPath(t, s, w.Argument, outer)
 	}
 
 	seen := 0
@@ -282,7 +355,7 @@ func checkWindowInvariants(t *testing.T, s *SelectStmt, w *WindowExpr) int {
 	if w.HasDefault && !w.DefaultNull && w.Default.Kind == OperandParam {
 		seen++
 	}
-	seen += checkWindowSpecInvariants(t, s, &w.Spec, !w.Spec.FrameInherited)
+	seen += checkWindowSpecInvariants(t, s, &w.Spec, !w.Spec.FrameInherited, outer)
 	return seen
 }
 
@@ -291,13 +364,14 @@ func checkWindowSpecInvariants(
 	s *SelectStmt,
 	spec *WindowSpec,
 	countFrame bool,
+	outer *LateralSpec,
 ) int {
 	t.Helper()
 	for _, path := range spec.PartitionBy {
-		checkPath(t, s, path)
+		checkPath(t, s, path, outer)
 	}
 	for i := range spec.OrderBy {
-		checkPath(t, s, spec.OrderBy[i].Path)
+		checkPath(t, s, spec.OrderBy[i].Path, outer)
 	}
 	if !spec.Frame.Explicit {
 		return 0
@@ -351,14 +425,24 @@ func checkRowCount(t *testing.T, op *Operand) int {
 
 // checkExpr walks a predicate and returns the number of placeholders in it.
 func checkExpr(t *testing.T, s *SelectStmt, e *Expr, having bool) int {
+	return checkExprScoped(t, s, e, having, nil)
+}
+
+func checkExprScoped(
+	t *testing.T,
+	s *SelectStmt,
+	e *Expr,
+	having bool,
+	outer *LateralSpec,
+) int {
 	t.Helper()
 	if e.Subquery != nil {
-		checkStatementInvariants(t, e.Subquery)
+		checkStatementInvariantsScoped(t, e.Subquery, nil)
 		if e.Kind != ExprExists && e.Path == nil {
 			t.Fatalf("a subquery leaf of kind %d has no outer path", e.Kind)
 		}
 		if e.Path != nil {
-			checkPath(t, s, e.Path)
+			checkPath(t, s, e.Path, outer)
 		}
 		return e.Subquery.Params
 	}
@@ -383,7 +467,10 @@ func checkExpr(t *testing.T, s *SelectStmt, e *Expr, having bool) int {
 			t.Fatalf("a leaf of kind %d has no path", e.Kind)
 		}
 		if e.Path != nil {
-			checkPath(t, s, e.Path)
+			checkPath(t, s, e.Path, outer)
+		}
+		if e.RightPath != nil {
+			checkPath(t, s, e.RightPath, outer)
 		}
 		if e.Column < -1 || e.Column >= len(s.Columns) {
 			t.Fatalf("a leaf binds output column %d of %d", e.Column, len(s.Columns))
@@ -403,24 +490,33 @@ func checkExpr(t *testing.T, s *SelectStmt, e *Expr, having bool) int {
 				count++
 			}
 		}
-		if e.Kind == ExprCompare && e.Value.Kind == OperandParam {
+		if (e.Kind == ExprCompare || e.Kind == ExprLike) &&
+			e.Value.Kind == OperandParam {
 			count++
 		}
 		return count
 	}
 	total := 0
 	for _, kid := range e.Kids {
-		total += checkExpr(t, s, kid, having)
+		total += checkExprScoped(t, s, kid, having, outer)
 	}
 	return total
 }
 
-func checkPath(t *testing.T, s *SelectStmt, p *PathExpr) {
+func checkPath(t *testing.T, s *SelectStmt, p *PathExpr, outer *LateralSpec) {
 	t.Helper()
 	if p == nil {
 		t.Fatal("a required path is nil")
 	}
-	if p.Source < 0 || p.Source >= len(s.From) {
+	if bindingIndex, ok := lateralReferenceIndex(outer, p); ok {
+		if bindingIndex < 0 || bindingIndex >= len(outer.Bindings) {
+			t.Fatalf("an outer path binds slot %d of %d", bindingIndex, len(outer.Bindings))
+		}
+		binding := &outer.Bindings[bindingIndex]
+		if p.Source != binding.Source || !sameSegments(p.Segments, binding.Segments) {
+			t.Fatalf("outer path %+v disagrees with binding %+v", p, binding)
+		}
+	} else if p.Source < 0 || p.Source >= len(s.From) {
 		t.Fatalf("a path binds source %d of %d", p.Source, len(s.From))
 	}
 	spec := p.Spec()
@@ -438,4 +534,16 @@ func checkPath(t *testing.T, s *SelectStmt, p *PathExpr) {
 			t.Fatalf("segment %d has a negative subscript", i)
 		}
 	}
+}
+
+func lateralReferenceIndex(spec *LateralSpec, path *PathExpr) (int, bool) {
+	if spec == nil || path == nil {
+		return 0, false
+	}
+	for i := range spec.References {
+		if spec.References[i].Path == path {
+			return spec.References[i].Binding, true
+		}
+	}
+	return 0, false
 }

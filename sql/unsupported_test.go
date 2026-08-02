@@ -43,3 +43,18 @@ func TestLeadingFeatureRefusalAllocatesOnlyItsTypedError(t *testing.T) {
 		t.Fatalf("typed feature refusal allocated %.1f times, want at most 1", allocations)
 	}
 }
+
+func TestNewFeatureNotSupportedErrorPreservesTypedPosition(t *testing.T) {
+	const src = "SELECT id\nFROM docs"
+	pos := strings.Index(src, "docs")
+	err := NewFeatureNotSupportedError(src, pos, "lowering is unavailable")
+	var unsupported *FeatureNotSupportedError
+	var parse *ParseError
+	if !errors.As(err, &unsupported) || !errors.As(err, &parse) {
+		t.Fatalf("error chain = %T %v, want feature and parse errors", err, err)
+	}
+	if parse.Pos != pos || parse.Line != 2 || parse.Col != 6 ||
+		parse.Msg != "lowering is unavailable" {
+		t.Fatalf("positioned feature refusal = %+v", parse)
+	}
+}

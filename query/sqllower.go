@@ -172,6 +172,9 @@ func (s *Statement) buildWindow(w *statementWindow, args []any) error {
 // Collection returns the name of the driving collection — the FROM entry. A
 // statement always has one, because the parser requires FROM.
 func (s *Statement) Collection() string {
+	if set := s.setSQL(); set != nil {
+		return set.Collection()
+	}
 	if s.nested != nil && s.nested.driving != "" {
 		return s.nested.driving
 	}
