@@ -276,6 +276,22 @@ func prepareTreeInContext(
 	ctes *statementCTEs,
 	argBase int,
 ) (*Statement, error) {
+	return prepareTreeInCorrelationContext(
+		src, tree, subqueryLimit, ctes, argBase, nil,
+	)
+}
+
+// prepareTreeInCorrelationContext is the LATERAL-only prepare entry. Keeping
+// the lexical frame as an argument, rather than on Statement, leaves every
+// non-correlated prepared and execution path byte-for-byte unchanged.
+func prepareTreeInCorrelationContext(
+	src string,
+	tree *sqlast.SelectStmt,
+	subqueryLimit uint8,
+	ctes *statementCTEs,
+	argBase int,
+	correlation *lateralPrepareFrame,
+) (*Statement, error) {
 	if recursive, pos := RecursiveSQLStatementRequired(tree); recursive &&
 		!recursiveSQLBridgeReentry(tree) {
 		// The owning top-level bridge rewrites each recursive definition to its
@@ -334,7 +350,7 @@ func prepareTreeInContext(
 		}
 	}
 	if s.window() == nil && generalizedJoin {
-		if err := s.prepareRelationJoin(argBase); err != nil {
+		if err := s.prepareRelationJoin(argBase, correlation); err != nil {
 			s.Release()
 			return nil, err
 		}

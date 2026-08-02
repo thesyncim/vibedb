@@ -940,13 +940,6 @@ func TestSQLLateralRemainingCorrelationShapesStayPositionedAndTyped(t *testing.T
 			marker: "a.enabled",
 		},
 		{
-			name: "nested transitive depth",
-			src: `SELECT a.id, q.id FROM accounts a CROSS JOIN LATERAL (` +
-				`SELECT d.id FROM items i CROSS JOIN LATERAL (` +
-				`SELECT x.id FROM items x WHERE x.owner = a.id) d) q`,
-			marker: "a.id) d",
-		},
-		{
 			name: "correlated window key",
 			src: `SELECT a.id, d.n FROM accounts a CROSS JOIN LATERAL (` +
 				`SELECT ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY i.id) AS n ` +
