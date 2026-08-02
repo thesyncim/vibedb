@@ -39,6 +39,7 @@ type UnifiedEqFilter struct {
 	needleValueInt bool
 	needleIntValue int64
 	scanScratch    []byte
+	numberIDs      []uint64
 
 	// Per-leaf state, rebuilt by prepareLeaf for each engaged unified leaf.
 	prepared      bool
@@ -299,9 +300,10 @@ func (c *PrimaryGraphCursor) FilterCountEq(
 	for {
 		if c.row == 0 {
 			matched, ok := 0, false
-			if f.numbersByValue && f.needleValueInt {
-				matched, ok = c.leaf.CountResolvedIntegerEqual(
-					&f.resolver, f.needleIntValue,
+			if f.numbersByValue {
+				matched, f.scanScratch, f.numberIDs, ok = c.leaf.CountResolvedNumberEqual(
+					&f.resolver, f.needle, f.needleIntValue, f.needleValueInt,
+					f.scanScratch, f.numberIDs,
 				)
 			} else if !f.numbersByValue {
 				matched, f.scanScratch, ok = c.leaf.CountResolvedSpellingEqual(

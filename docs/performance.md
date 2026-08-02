@@ -55,7 +55,12 @@ integer-spelled values measured about 0.057 ms; both scanned every row with zero
 fallback rows and zero warm allocations. Integer-valued decimal needles compile
 once to an exact int64 and then scan packed frame-of-reference offsets or delta
 varints directly, without rendering JSON or rounding through float64. Ten-bit
-FOR lanes consume four offsets per exact five-byte block. The
+FOR lanes consume four offsets per exact five-byte block. A non-integral
+`500.5` needle over the same integer stream also measured about 0.057 ms and
+zero matches: it consumes every packed offset against an impossible encoded
+value instead of using type metadata to skip the stream. Dictionary and
+front-coded decimal spellings use `JSONNumberEqual` directly over scalar
+values, including exponent and signed-zero forms. The
 indexed lane uses the durable spanned-term representation for large
 low-cardinality postings. These are machine-specific probe numbers, not API
 promises; reproduce them with `bench/competitive/cmd/speedprobe` and separate

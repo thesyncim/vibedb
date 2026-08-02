@@ -298,6 +298,23 @@ func TestUnifiedReadZeroAlloc(t *testing.T) {
 	}); n != 0 {
 		t.Fatalf("numeric filter scan allocates %v/scan", n)
 	}
+
+	fractionFilter, err := NewScalarEqFilter("/score", []byte(`500.5`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = snapshot.FilterEqCount(fractionFilter)
+	if err != nil || result.Matched != 0 || result.Fallback != 0 {
+		t.Fatalf("fractional number filter = (%+v,%v), want no match/fallback", result, err)
+	}
+	if n := testing.AllocsPerRun(3, func() {
+		result, err := snapshot.FilterEqCount(fractionFilter)
+		if err != nil || result.Matched != 0 || result.Fallback != 0 {
+			t.Fatal("fractional FilterEqCount")
+		}
+	}); n != 0 {
+		t.Fatalf("fractional filter scan allocates %v/scan", n)
+	}
 }
 
 // TestUnifiedProbeCanonicalIntSpellings pins canonical-integer losslessness on

@@ -176,6 +176,39 @@ func TestCompactStreamIntegerCountMatchesValues(t *testing.T) {
 	}
 }
 
+func TestCompactStreamNumberCountExactDecimalSemantics(t *testing.T) {
+	values := [][]byte{
+		[]byte(`1`), []byte(`1.0`), []byte(`1e0`), []byte(`0.1e1`),
+		[]byte(`2`), []byte(`"1"`), []byte(`-0`), []byte(`0.0`),
+	}
+	for _, encoded := range []compactStreamEncoding{
+		encodeCompactDictionary(values),
+		encodeCompactFront(values),
+	} {
+		view := compactCodecRoundTrip(t, encoded, values)
+		for _, test := range []struct {
+			needle      string
+			needleInt   int64
+			needleIsInt bool
+			want        int
+		}{
+			{needle: `1.00e0`, needleInt: 1, needleIsInt: true, want: 4},
+			{needle: `0`, needleInt: 0, needleIsInt: true, want: 2},
+			{needle: `0.5`, want: 0},
+		} {
+			got, _, _, supported := view.countNumberEqual(
+				[]byte(test.needle), test.needleInt, test.needleIsInt, nil, nil,
+			)
+			if !supported || got != test.want {
+				t.Fatalf(
+					"kind=%d needle=%s count=%d supported=%v want=%d",
+					view.kind, test.needle, got, supported, test.want,
+				)
+			}
+		}
+	}
+}
+
 func TestCompactStreamRejectsCorruptFraming(t *testing.T) {
 	values := [][]byte{[]byte(`"PT"`), []byte(`"US"`), []byte(`"PT"`)}
 	encoded, err := encodeCompactScalarStream(values).appendBinary(nil)

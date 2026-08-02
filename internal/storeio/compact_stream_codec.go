@@ -7,6 +7,8 @@ import (
 	"math/bits"
 	"slices"
 	"strconv"
+
+	"github.com/thesyncim/vibejson"
 )
 
 // Compact scalar streams are the independently decodable columns inside the
@@ -1130,7 +1132,7 @@ func (v compactStreamView) countSpellingEqual(
 		matched, supported = v.countDictionaryEqual(needle)
 		return matched, scratch, supported
 	case compactStreamFront:
-		matched, scratch = v.countFrontEqual(needle, scratch)
+		matched, scratch = v.countFrontEqual(needle, scratch, false)
 		return matched, scratch, true
 	case compactStreamFOR, compactStreamDelta:
 		value, ok := CanonicalIntValue(needle)
@@ -1161,7 +1163,68 @@ func (v compactStreamView) countSpellingEqual(
 	}
 }
 
-func (v compactStreamView) countFrontEqual(needle, scratch []byte) (matched int, out []byte) {
+// countNumberEqual scans one complete scalar stream with exact JSON decimal
+// semantics. ids is reusable dictionary-match storage owned by the filter.
+func (v compactStreamView) countNumberEqual(
+	needle []byte,
+	needleInt int64,
+	needleIsInt bool,
+	scratch []byte,
+	ids []uint64,
+) (matched int, out []byte, outIDs []uint64, supported bool) {
+	switch v.kind {
+	case compactStreamDictionary:
+		words := (v.dictCount + 63) / 64
+		ids = slices.Grow(ids[:0], words)[:words]
+		clear(ids)
+		for id := 0; id < v.dictCount; id++ {
+			value, _ := v.dictionaryEntry(id)
+			if compactJSONNumberEqual(value, needle) {
+				ids[id>>6] |= uint64(1) << (id & 63)
+			}
+		}
+		for row := 0; row < v.count; row++ {
+			id := int(compactReadBits(v.data, row*int(v.width), int(v.width)))
+			if ids[id>>6]&(uint64(1)<<(id&63)) != 0 {
+				matched++
+			}
+		}
+		return matched, scratch, ids, true
+	case compactStreamFront:
+		matched, scratch = v.countFrontEqual(needle, scratch, true)
+		return matched, scratch, ids, true
+	case compactStreamFOR:
+		if needleIsInt {
+			matched, supported = v.countIntegerEqual(needleInt)
+			return matched, scratch, ids, supported
+		}
+		base := int64(binary.LittleEndian.Uint64(v.data))
+		_, supported = v.countIntegerEqual(base)
+		return 0, scratch, ids, supported
+	case compactStreamDelta:
+		if needleIsInt {
+			matched, supported = v.countIntegerEqual(needleInt)
+			return matched, scratch, ids, supported
+		}
+		_, supported = v.countIntegerEqual(0)
+		return 0, scratch, ids, supported
+	default:
+		return 0, scratch, ids, false
+	}
+}
+
+func compactJSONNumberEqual(value, needle []byte) bool {
+	if len(value) == 0 ||
+		(value[0] != '-' && (value[0] < '0' || value[0] > '9')) {
+		return false
+	}
+	return vibejson.JSONNumberEqual(value, needle)
+}
+
+func (v compactStreamView) countFrontEqual(
+	needle, scratch []byte,
+	numbersByValue bool,
+) (matched int, out []byte) {
 	restarts := (v.count + compactStreamRestart - 1) / compactStreamRestart
 	cursor := 4 * restarts
 	for row := 0; row < v.count; row++ {
@@ -1184,7 +1247,11 @@ func (v compactStreamView) countFrontEqual(needle, scratch []byte) (matched int,
 			scratch = append(scratch[:prefix], v.data[cursor:cursor+suffix]...)
 			cursor += suffix
 		}
-		if bytes.Equal(scratch, needle) {
+		equal := bytes.Equal(scratch, needle)
+		if numbersByValue {
+			equal = compactJSONNumberEqual(scratch, needle)
+		}
+		if equal {
 			matched++
 		}
 	}

@@ -1171,6 +1171,55 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerEqual(
 	return matched, true
 }
 
+// CountResolvedNumberEqual evaluates exact JSON decimal equality over compact
+// numeric streams. scratch and ids are caller-owned reusable workspaces and
+// are returned on every path so the warmed query remains allocation-free.
+func (v *CompactPrimaryStripeView) CountResolvedNumberEqual(
+	resolver *UnifiedHoleResolver,
+	needle []byte,
+	needleInt int64,
+	needleIsInt bool,
+	scratch []byte,
+	ids []uint64,
+) (matched int, out []byte, outIDs []uint64, ok bool) {
+	if v == nil || resolver == nil || len(v.overflow) != 0 {
+		return 0, scratch, ids, false
+	}
+	for shape := 0; shape < v.shapeCount; shape++ {
+		entry, found := v.shapeEntry(shape)
+		if !found {
+			return 0, scratch, ids, false
+		}
+		hole := resolver.resolveCompactTemplate(entry.template)
+		if hole == UnifiedHoleAbsent {
+			continue
+		}
+		if hole < 0 || hole >= entry.template.holes {
+			return 0, scratch, ids, false
+		}
+		streamRaw := entry.streamRaw
+		for at := 0; at <= hole; at++ {
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return 0, scratch, ids, false
+			}
+			if at == hole {
+				var count int
+				count, scratch, ids, ok = stream.countNumberEqual(
+					needle, needleInt, needleIsInt, scratch, ids,
+				)
+				if !ok {
+					return 0, scratch, ids, false
+				}
+				matched += count
+				break
+			}
+			streamRaw = streamRaw[stream.encoded:]
+		}
+	}
+	return matched, scratch, ids, true
+}
+
 // AppendResolvedHole appends one scalar hole without reconstructing the rest
 // of the document. supported=false asks the caller to take its container path.
 func (v *CompactPrimaryStripeView) AppendResolvedHole(

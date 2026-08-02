@@ -583,6 +583,12 @@ func BenchmarkUnifiedFilterEqNumber(b *testing.B) {
 	benchmarkScalarFilterEq(b, "/score", `500.0`)
 }
 
+// BenchmarkUnifiedFilterEqNumberFraction proves a non-integral needle still
+// consumes the complete packed integer stream instead of rendering documents.
+func BenchmarkUnifiedFilterEqNumberFraction(b *testing.B) {
+	benchmarkScalarFilterEq(b, "/score", `500.5`)
+}
+
 // BenchmarkUnifiedFilterEqDate scans the packed date ordinal lane without
 // reconstructing its quoted Gregorian spelling per row.
 func BenchmarkUnifiedFilterEqDate(b *testing.B) {
