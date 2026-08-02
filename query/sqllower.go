@@ -68,6 +68,9 @@ func (s *Statement) lower(args []any) error {
 	c := &s.c
 	c.rewind()
 	c.prepare(&s.q)
+	if s.correlation != nil {
+		s.q.correlationSlots = s.correlation.slots
+	}
 	s.stack = s.stack[:0]
 	err := s.build(args)
 	if err == nil {
@@ -841,6 +844,9 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	spec := s.spec(e.Path)
 	switch e.Kind {
 	case sqlast.ExprCompare:
+		if slot, ok := s.correlation.slot(e); ok {
+			return s.correlationCompareForm(e.Path, e.Op, slot)
+		}
 		if e.Subquery != nil {
 			return s.subqueryCompareForm(e)
 		}

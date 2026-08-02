@@ -202,6 +202,7 @@ func (c *compiler) prepare(dst *Query) {
 	dst.orderBy = c.orderBy[:0]
 	dst.joins = c.joins[:0]
 	dst.marks = c.marks[:0]
+	dst.correlationSlots = 0
 	dst.where = Predicate{}
 	dst.hasWhere = false
 	dst.limit = 0

@@ -30,7 +30,11 @@ const (
 // values built by the constructors below; they compile with the query. The
 // zero Predicate is not a valid condition — build one with a constructor.
 type Predicate struct {
-	kind        predKind
+	kind predKind
+	// slot occupies padding that already preceded path. It is meaningful only
+	// for execution-bound internal leaves, so ordinary builder predicates keep
+	// both their size and their hot behavior.
+	slot        int32
 	path        string
 	op          Op
 	value       any    // Cmp literal, inferred at compile
@@ -65,6 +69,11 @@ const (
 	// NULL/missing outer keys have no partner and therefore match the anti leaf,
 	// independent of SQL predicate-negation rewrites around ordinary leaves.
 	predAntiBound
+	// predCmpBound compares one extracted local column with one immutable scalar
+	// slot supplied by the executing statement. predCorrelationKnown is its
+	// column-free SQL three-valued-logic guard.
+	predCmpBound
+	predCorrelationKnown
 	// predMarkBound is a grouped correlated predicate-subquery probe. Its slot
 	// addresses an immutable execution binding; hidden predMarkRef children
 	// advertise every driving column the probe reads without widening this
@@ -397,6 +406,23 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 				}
 			}
 		}
+		return cp, nil
+	case predCmpBound:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predCmpBound, col: col, op: p.op, slot: int(p.slot),
+		}
+		if p.op == Eq && reg.paths[col].single {
+			cp.probe = postProbe{kind: postEq, path: reg.paths[col].name}
+		}
+		return cp, nil
+	case predCorrelationKnown:
+		cp := c.nodes.one()
+		*cp = compiledPredicate{kind: predCorrelationKnown, col: -1, slot: int(p.slot)}
 		return cp, nil
 	case predIn:
 		col, err := c.addPath(reg, p.path)
@@ -767,6 +793,8 @@ func (p *compiledPredicate) readsColumn(col int) bool {
 			}
 		}
 		return false
+	case predCorrelationKnown:
+		return false
 	default:
 		return p.col == col
 	}
@@ -880,6 +908,15 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 	switch p.kind {
 	case predCmp:
 		return evalCmp(cols[p.col][row], p.op, p.lit)
+	case predCmpBound:
+		if p.slot < 0 || p.slot >= len(s.correlations) {
+			return false
+		}
+		right := s.correlations[p.slot]
+		return right.kind != kindNull && evalCmp(cols[p.col][row], p.op, right)
+	case predCorrelationKnown:
+		return p.slot >= 0 && p.slot < len(s.correlations) &&
+			s.correlations[p.slot].kind != kindNull
 	case predIn:
 		return p.member(cols[p.col][row])
 	case predLike:

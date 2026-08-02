@@ -701,6 +701,7 @@ func (p *plan) runFileSnapshotBatched(
 		e.file.workers[worker].eval.setWork(work)
 		e.file.workers[worker].eval.bindTo(binds)
 		e.file.workers[worker].eval.bindMarks(marks)
+		e.file.workers[worker].eval.bindCorrelations(e.Workspace.correlations)
 	}
 	pool.start(fileJob{
 		p: p, snapshot: snapshot, overlay: overlay, masks: candidateMasks,

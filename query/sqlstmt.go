@@ -70,6 +70,9 @@ type Statement struct {
 	params           int
 	requiresCatalog  bool
 	drivingPredicate *sqlast.Expr
+	// correlation is immutable, cold metadata installed only on a LATERAL child.
+	// Live slot values belong to the child Exec.Workspace, never to Statement.
+	correlation *statementCorrelationPlan
 
 	// c and q are this statement's own compiler and the Query it compiles
 	// into. They are values rather than pointers so a Statement is one
@@ -323,8 +326,11 @@ func prepareTreeInCorrelationContext(
 		text: src, tree: tree, params: tree.Params,
 		subqueryLimit: subqueryLimit,
 	}
+	if correlation != nil && correlation.apply != nil {
+		s.correlation = &correlation.apply.correlation
+	}
 	if selectHasWindows(tree) {
-		if err := s.prepareWindow(ctes, argBase); err != nil {
+		if err := s.prepareWindow(ctes, argBase, correlation); err != nil {
 			s.Release()
 			return nil, err
 		}
@@ -702,11 +708,50 @@ func (s *Statement) runIntoFrame(
 	frame *statementFrame,
 	intermediateResource string,
 ) (Cursor, error) {
+	return s.runIntoFrameMode(
+		e, src, args, frame, intermediateResource, nil, true,
+	)
+}
+
+func (s *Statement) runIntoCorrelationFrame(
+	e *Exec,
+	src Source,
+	args []any,
+	frame *statementFrame,
+	intermediateResource string,
+	correlations []scalar,
+	bindPlan bool,
+) (Cursor, error) {
+	if s.correlation == nil {
+		return Cursor{}, fmt.Errorf("query: correlation values supplied to an ordinary statement")
+	}
+	return s.runIntoFrameMode(
+		e, src, args, frame, intermediateResource, correlations, bindPlan,
+	)
+}
+
+func (s *Statement) runIntoFrameMode(
+	e *Exec,
+	src Source,
+	args []any,
+	frame *statementFrame,
+	intermediateResource string,
+	correlations []scalar,
+	bindPlan bool,
+) (Cursor, error) {
 	// Invalidate the previous root or nested result before any fallible bind or
 	// child execution. Query.RunInto performs the same reset later, but a
 	// subquery error happens before that call and must not leave a prior success
 	// looking like the failed execution's output.
 	clearExecBorrowedViews(e)
+	// Nested relation materialization runs before the final Query scan. Publish
+	// the tuple now so a nested LATERAL can borrow its containing child's slots;
+	// Query.runIntoCorrelations will re-publish the same tuple after its own entry
+	// cleanup for the final scan. The defer closes every early error/cancel path.
+	if err := e.Workspace.bindCorrelations(correlations); err != nil {
+		return Cursor{}, err
+	}
+	defer e.Workspace.resetCorrelationBindings()
 	if intermediateResource != "" {
 		// ResultRows and ResultBytes bound only the caller-visible result. A
 		// relation-valued child is instead bounded by the one statement frame;
@@ -746,9 +791,12 @@ func (s *Statement) runIntoFrame(
 	runSource := src
 	if s.nested != nil {
 		if s.nested.window != nil {
-			return s.nested.window.run(s, e, src, args, frame, intermediateResource)
+			return s.nested.window.run(
+				s, e, src, args, frame, intermediateResource,
+				correlations, bindPlan,
+			)
 		}
-		if s.canFuseCTE() {
+		if len(correlations) == 0 && s.canFuseCTE() {
 			return s.runFusedCTE(e, src, frame, intermediateResource)
 		}
 		var err error
@@ -764,9 +812,11 @@ func (s *Statement) runIntoFrame(
 		return Cursor{}, err
 	}
 	defer s.releaseSubqueries(frame)
-	if err := s.bind(args); err != nil {
-		s.releaseRelations(frame)
-		return Cursor{}, err
+	if bindPlan {
+		if err := s.bind(args); err != nil {
+			s.releaseRelations(frame)
+			return Cursor{}, err
+		}
 	}
 	if intermediateResource != "" {
 		remaining := frame.intermediate.remaining()
@@ -796,7 +846,7 @@ func (s *Statement) runIntoFrame(
 		}
 		e.Options.ResultRows = -1
 		e.Options.ResultBytes = remaining
-		err := s.q.RunInto(e, runSource)
+		err := s.q.runIntoCorrelations(e, runSource, correlations)
 		e.Options = options
 		if err != nil {
 			clearExecBorrowedViews(e)
@@ -817,7 +867,7 @@ func (s *Statement) runIntoFrame(
 		}
 		return cursor, err
 	}
-	if err := s.q.RunInto(e, runSource); err != nil {
+	if err := s.q.runIntoCorrelations(e, runSource, correlations); err != nil {
 		// A relation execution may have parked grouped/order state that borrows
 		// its spool before a later result-budget or cancellation error. Sever
 		// every parent view before resetting the statement-owned spool.

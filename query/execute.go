@@ -130,6 +130,15 @@ type Workspace struct {
 	// marks is the immutable-after-bind grouped state for correlated predicate
 	// subqueries. Each evaluator aliases it read-only during the outer scan.
 	marks []markBinding
+	// correlations is the execution-local scalar tuple supplied by a containing
+	// APPLY. Compiled plans carry only slot ordinals; values are copied here at
+	// the synchronous child boundary and cleared before the Workspace is reused.
+	correlations           []scalar
+	correlationNeedles     []vibejson.Index
+	correlationNeedleText  []byte
+	correlationStarts      []int
+	correlationEntries     []vibejson.IndexEntry
+	correlationNeedleBytes int64
 
 	// joinPairBudget bounds the multiplicative workspace of the one supported
 	// fan-out join. It is configured before join binding and activated only
@@ -224,11 +233,13 @@ func (w *Workspace) clearBorrowedViews() {
 	w.ctx.rows = 0
 	w.eval.bindTo(nil)
 	w.eval.bindMarks(nil)
+	w.resetCorrelationBindings()
 	w.eval.setWork(nil)
 	if w.pool != nil {
 		for i := range w.pool.workers {
 			w.pool.workers[i].eval.bindTo(nil)
 			w.pool.workers[i].eval.bindMarks(nil)
+			w.pool.workers[i].eval.bindCorrelations(nil)
 			w.pool.workers[i].eval.setWork(nil)
 			w.pool.workers[i].release()
 		}
@@ -311,6 +322,7 @@ type evalScratch struct {
 	binds             []joinBinding
 	probes            []joinProbe
 	marks             []markBinding
+	correlations      []scalar
 	markLeftEntries   []vibejson.IndexEntry
 	markRightEntries  []vibejson.IndexEntry
 	markLeftReserved  int64

@@ -160,11 +160,14 @@ type Query struct {
 	joins    []Join
 	// marks are proof-backed correlated predicate subqueries installed by the
 	// SQL lowerer. The builder surface cannot populate this cold sidecar.
-	marks    []correlatedMark
-	groupBy  []string
-	orderBy  []orderSpec
-	limit    int
-	hasLimit bool
+	marks []correlatedMark
+	// correlationSlots is private SQL-lowering metadata. Programmatic queries
+	// leave it zero; a correlated child records only immutable slot cardinality.
+	correlationSlots int
+	groupBy          []string
+	orderBy          []orderSpec
+	limit            int
+	hasLimit         bool
 
 	once       sync.Once
 	plan       *plan
@@ -235,6 +238,9 @@ func (q *Query) Limit(n int) *Query {
 type plan struct {
 	valuePaths []compiledPath // extracted as scalar columns
 	numPaths   []compiledPath // extracted as numeric columns (aggregate args)
+	// correlationSlots is the exact execution tuple width required by bound
+	// scalar leaves. The plan stores ordinals only and is therefore immutable.
+	correlationSlots int
 
 	headers []string // result schema; cold metadata, parallel to columns
 	columns []planColumn
@@ -429,10 +435,11 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 	grouped := len(q.groupBy) > 0
 
 	*p = plan{
-		grouped:    grouped,
-		limit:      q.limit,
-		hasLimit:   q.hasLimit,
-		fanOutJoin: -1,
+		grouped:          grouped,
+		limit:            q.limit,
+		hasLimit:         q.hasLimit,
+		fanOutJoin:       -1,
+		correlationSlots: q.correlationSlots,
 	}
 	// The column-shaped slices are sized from the select list and the path
 	// registries from every clause that can name one, so a one-shot compile

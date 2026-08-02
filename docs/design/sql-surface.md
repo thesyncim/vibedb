@@ -555,9 +555,18 @@ right relation per left row and can bind any preceding range variable. Nested
 LATERAL chains inherit outer frames. Correlated paths are supported in the
 right projection, predicates, join predicates, grouping, aggregates, and
 HAVING; uncorrelated LATERAL operands take the ordinary derived-relation path.
-The APPLY executor preserves exact values, three-valued gates, snapshot and
-transaction semantics, cancellation, and shared intermediate/pair/aggregate
-budgets without memoizing rows whose volatility is not proven.
+Preparation compiles each placeholder-free correlated right relation once;
+parameterized children lower once per top-level authored binding. Immutable
+parser sidecars map every authored outer-path occurrence to a stable typed slot,
+and a nested APPLY links inherited slots to its containing lexical frame.
+Execution only rebinds those reusable slots for each left row; it does not
+regenerate SQL, reparse the child, prepare another child plan, or lower the
+child per outer row. Dynamic equality slots retain Segment postings and heap or
+durable exact-index selection, including compound indexes. The ordinary
+non-LATERAL path owns no slot frame. The APPLY executor preserves exact values,
+three-valued gates, snapshot and transaction semantics, cancellation, and
+shared intermediate/pair/aggregate budgets without memoizing rows whose
+volatility is not proven.
 
 Correlation on the nullable side of `RIGHT` or `FULL JOIN LATERAL`, `USING` on
 a correlated LATERAL join, mixed local/outer OR predicates, correlated window
@@ -682,9 +691,11 @@ references, non-equality correlation, correlation in `JOIN ON`, and nested
 predicate subqueries inside the child remain positioned `0A000`. The same
 refusal applies to correlated scalar subqueries in the projection list,
 searched `CASE`, `HAVING`, or `ORDER BY`, and to every excluded child shape
-listed above. A predicate subquery inside a LATERAL operand still needs a
-separate inherited expression-correlation stage; LATERAL itself does not
-silently provide one. Pgwire maps refusal to one positioned `0A000`
+listed above. Predicate subqueries inside a correlated LATERAL `WHERE` or
+`HAVING` remain explicit positioned refusals: the APPLY slot frame is compiled
+once, but inherited expression correlation is not yet threaded into a nested
+predicate-subquery plan. LATERAL therefore does not silently reinterpret such
+references as local paths. Pgwire maps refusal to one positioned `0A000`
 ErrorResponse; positions count authored UTF-8 characters. A runtime `21000` or
 refusal inside an explicit transaction reports failed-transaction status until
 `ROLLBACK`.
