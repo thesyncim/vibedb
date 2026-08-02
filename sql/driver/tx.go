@@ -387,6 +387,9 @@ func (t *tx) execMutationCore(
 			staged = append(staged, stagedTxMutation{key: key, document: document})
 		}
 		t.conn.pointRaw = scratch
+		if err := t.conn.routeInsertStaged(tableName, staged); err != nil {
+			return nil, err
+		}
 	case query.DMLUpdate:
 		document, err := operandDocument(
 			statement, statement.Tree().Update.Doc, args)
@@ -395,6 +398,9 @@ func (t *tx) execMutationCore(
 		}
 		if len(document) > limits.MaxDocumentBytes {
 			return nil, durable.ErrDocumentTooLarge
+		}
+		if err := t.conn.routeUpdate(statement, args, document); err != nil {
+			return nil, err
 		}
 		keys, err := t.conn.matchingKeysTransaction(
 			ctx, statement, args, state, len(document))
@@ -422,6 +428,9 @@ func (t *tx) execMutationCore(
 			staged = append(staged, stagedTxMutation{key: key, document: document})
 		}
 	case query.DMLDelete:
+		if err := t.conn.routeDelete(statement, args); err != nil {
+			return nil, err
+		}
 		keys, err := t.conn.matchingKeysTransaction(
 			ctx, statement, args, state, 0)
 		if err != nil {
