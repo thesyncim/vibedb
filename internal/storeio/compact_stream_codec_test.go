@@ -107,7 +107,7 @@ func TestCompactStreamAdaptiveSelectionAndCount(t *testing.T) {
 }
 
 func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
-	for width := 0; width <= 16; width++ {
+	for width := 0; width <= 64; width++ {
 		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {
 			data := make([]byte, (count*width+7)/8)
 			mask := uint64(0)
@@ -127,6 +127,38 @@ func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
 				t.Fatalf(
 					"width=%d count=%d got=%d want=%d",
 					width, count, got, expected,
+				)
+			}
+		}
+	}
+}
+
+func TestCompactStreamIntegerCountMatchesValues(t *testing.T) {
+	values := make([]int64, 4097)
+	for row := range values {
+		values[row] = int64((row*37)%997 - 400)
+	}
+	for _, encoded := range []compactStreamEncoding{
+		encodeCompactFOR(values),
+		encodeCompactDelta(values),
+	} {
+		spellings := make([][]byte, len(values))
+		for row, value := range values {
+			spellings[row] = AppendCanonicalInt(nil, value)
+		}
+		view := compactCodecRoundTrip(t, encoded, spellings)
+		for _, needle := range []int64{-401, -400, 0, 596, 597} {
+			want := 0
+			for _, value := range values {
+				if value == needle {
+					want++
+				}
+			}
+			got, supported := view.countIntegerEqual(needle)
+			if !supported || got != want {
+				t.Fatalf(
+					"kind=%d needle=%d count=%d supported=%v want=%d",
+					view.kind, needle, got, supported, want,
 				)
 			}
 		}

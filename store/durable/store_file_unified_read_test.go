@@ -270,6 +270,34 @@ func TestUnifiedReadZeroAlloc(t *testing.T) {
 	}); n != 0 {
 		t.Fatalf("token filter scan allocates %v/scan", n)
 	}
+
+	numberFilter, err := NewScalarEqFilter("/score", []byte(`500.0`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNumbers := 0
+	for _, doc := range docs {
+		matched, err := numberFilter.inner.EvalRendered(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if matched {
+			wantNumbers++
+		}
+	}
+	result, err := snapshot.FilterEqCount(numberFilter)
+	if err != nil || result.Matched != wantNumbers || result.Fallback != 0 {
+		t.Fatalf("scalar number filter = (%+v,%v), want matched=%d fallback=0",
+			result, err, wantNumbers)
+	}
+	if n := testing.AllocsPerRun(3, func() {
+		result, err := snapshot.FilterEqCount(numberFilter)
+		if err != nil || result.Matched != wantNumbers || result.Fallback != 0 {
+			t.Fatal("numeric FilterEqCount")
+		}
+	}); n != 0 {
+		t.Fatalf("numeric filter scan allocates %v/scan", n)
+	}
 }
 
 // TestUnifiedProbeCanonicalIntSpellings pins canonical-integer losslessness on

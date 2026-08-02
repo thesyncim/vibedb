@@ -1072,6 +1072,53 @@ func (v compactStreamView) restartInteger(row, prefix int) (int64, bool) {
 	return value, true
 }
 
+// countIntegerEqual performs a complete scan of an integer stream without
+// formatting each value back into JSON. FOR compares the packed offsets and
+// delta streams consume every restart and varint in row order.
+func (v compactStreamView) countIntegerEqual(needle int64) (matched int, supported bool) {
+	switch v.kind {
+	case compactStreamFOR:
+		base := int64(binary.LittleEndian.Uint64(v.data))
+		delta := uint64(needle) - uint64(base)
+		if v.width < 64 {
+			limit := uint64(1) << v.width
+			if needle < base || delta >= limit {
+				// An impossible packed value preserves the full encoded-row scan
+				// for an out-of-range predicate without a separate branch per row.
+				delta = limit
+			}
+		} else if needle < base {
+			// A 64-bit packed lane has no impossible sentinel. Keep this rare
+			// boundary on the general path rather than claiming a scan we did
+			// not perform.
+			return 0, false
+		}
+		return countCompactPackedEqual(
+			v.data[8:], v.count, int(v.width), delta,
+		), true
+	case compactStreamDelta:
+		restarts := (v.count + compactStreamRestart - 1) / compactStreamRestart
+		cursor := 4 * restarts
+		var value int64
+		for row := 0; row < v.count; row++ {
+			if row%compactStreamRestart == 0 {
+				value = int64(binary.LittleEndian.Uint64(v.data[cursor:]))
+				cursor += 8
+			} else {
+				u, n, _ := readCompactUvarint(v.data[cursor:])
+				cursor += n
+				value += int64(u>>1) ^ -int64(u&1)
+			}
+			if value == needle {
+				matched++
+			}
+		}
+		return matched, true
+	default:
+		return 0, false
+	}
+}
+
 // countDictionaryEqual performs a complete encoded-id scan. supported is
 // false for non-dictionary streams; callers may decode those streams or take a
 // generic comparison path. No row index, pruning metadata, or candidate list
@@ -1106,7 +1153,7 @@ func countCompactPackedEqual(
 	count, width int,
 	want uint64,
 ) (matched int) {
-	if count <= 0 || width < 0 || width > 16 {
+	if count <= 0 || width < 0 || width > 64 {
 		return 0
 	}
 	if width == 0 {
@@ -1117,6 +1164,17 @@ func countCompactPackedEqual(
 	}
 	if width == 7 {
 		return countCompactPacked7Equal(data, count, want)
+	}
+	if width == 10 {
+		return countCompactPacked10Equal(data, count, want)
+	}
+	if width > 56 {
+		for row := 0; row < count; row++ {
+			if compactReadBits(data, row*width, width) == want {
+				matched++
+			}
+		}
+		return matched
 	}
 	mask := uint64(1)<<uint(width) - 1
 	var reservoir uint64
@@ -1178,6 +1236,38 @@ func countCompactPacked7Equal(data []byte, count int, want uint64) (matched int)
 	}
 	for ; row < count; row++ {
 		if compactReadBits(data, row*7, 7) == want {
+			matched++
+		}
+	}
+	return matched
+}
+
+// Four 10-bit values occupy exactly five bytes. This is the ordinary packed
+// width for integer ranges and dictionaries with 513-1024 distinct values.
+func countCompactPacked10Equal(data []byte, count int, want uint64) (matched int) {
+	row := 0
+	cursor := 0
+	for ; row+4 <= count; row, cursor = row+4, cursor+5 {
+		packed := uint64(data[cursor]) |
+			uint64(data[cursor+1])<<8 |
+			uint64(data[cursor+2])<<16 |
+			uint64(data[cursor+3])<<24 |
+			uint64(data[cursor+4])<<32
+		if packed&0x3ff == want {
+			matched++
+		}
+		if packed>>10&0x3ff == want {
+			matched++
+		}
+		if packed>>20&0x3ff == want {
+			matched++
+		}
+		if packed>>30&0x3ff == want {
+			matched++
+		}
+	}
+	for ; row < count; row++ {
+		if compactReadBits(data, row*10, 10) == want {
 			matched++
 		}
 	}

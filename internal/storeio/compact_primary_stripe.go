@@ -1085,6 +1085,49 @@ func (v *CompactPrimaryStripeView) CountResolvedDictionaryEqual(
 	return matched, true
 }
 
+// CountResolvedIntegerEqual evaluates exact integer equality directly over
+// FOR or delta streams after resolving the path once per shape. The stream
+// counters consume all encoded rows; no posting list or pruning metadata is
+// consulted. ok=false asks the caller to use the general scalar path.
+func (v *CompactPrimaryStripeView) CountResolvedIntegerEqual(
+	resolver *UnifiedHoleResolver,
+	needle int64,
+) (matched int, ok bool) {
+	if v == nil || resolver == nil || len(v.overflow) != 0 {
+		return 0, false
+	}
+	for shape := 0; shape < v.shapeCount; shape++ {
+		entry, found := v.shapeEntry(shape)
+		if !found {
+			return 0, false
+		}
+		hole := resolver.resolveCompactTemplate(entry.template)
+		if hole == UnifiedHoleAbsent {
+			continue
+		}
+		if hole < 0 || hole >= entry.template.holes {
+			return 0, false
+		}
+		streamRaw := entry.streamRaw
+		for at := 0; at <= hole; at++ {
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return 0, false
+			}
+			if at == hole {
+				count, supported := stream.countIntegerEqual(needle)
+				if !supported {
+					return 0, false
+				}
+				matched += count
+				break
+			}
+			streamRaw = streamRaw[stream.encoded:]
+		}
+	}
+	return matched, true
+}
+
 // AppendResolvedHole appends one scalar hole without reconstructing the rest
 // of the document. supported=false asks the caller to take its container path.
 func (v *CompactPrimaryStripeView) AppendResolvedHole(

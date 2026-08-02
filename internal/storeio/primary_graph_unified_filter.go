@@ -296,10 +296,18 @@ func (c *PrimaryGraphCursor) FilterCountEq(
 		return nil, PageRef{}, nil
 	}
 	for {
-		if c.row == 0 && !f.numbersByValue {
-			if matched, ok := c.leaf.CountResolvedDictionaryEqual(
-				&f.resolver, f.needle,
-			); ok {
+		if c.row == 0 {
+			matched, ok := 0, false
+			if f.numbersByValue && f.needleValueInt {
+				matched, ok = c.leaf.CountResolvedIntegerEqual(
+					&f.resolver, f.needleIntValue,
+				)
+			} else if !f.numbersByValue {
+				matched, ok = c.leaf.CountResolvedDictionaryEqual(
+					&f.resolver, f.needle,
+				)
+			}
+			if ok {
 				progress.Scanned += c.leaf.Len()
 				progress.Matched += matched
 				c.row = c.leaf.Len()

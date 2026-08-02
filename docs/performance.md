@@ -50,13 +50,16 @@ is now zero-allocation; changing the filter value rebuilds the cached query once
 The same token lane also handles
 nested paths and exact-decimal numeric equality: `1`, `1.0`, and `1e0` compare
 equal without float64 rounding. On the same 100,000-row storage corpus, a
-nested string equality measured about 2.29 ms and a decimal `500.0` needle over
-integer-spelled values measured about 2.48 ms; both scanned every row with zero
-fallback rows and zero warm allocations. The indexed lane uses the durable
-spanned-term representation for large low-cardinality postings. These are
-machine-specific probe numbers, not API promises; reproduce them with
-`bench/competitive/cmd/speedprobe` and separate warm-up from steady-state
-allocation measurements.
+nested string equality measured about 0.084 ms and a decimal `500.0` needle over
+integer-spelled values measured about 0.057 ms; both scanned every row with zero
+fallback rows and zero warm allocations. Integer-valued decimal needles compile
+once to an exact int64 and then scan packed frame-of-reference offsets or delta
+varints directly, without rendering JSON or rounding through float64. Ten-bit
+FOR lanes consume four offsets per exact five-byte block. The
+indexed lane uses the durable spanned-term representation for large
+low-cardinality postings. These are machine-specific probe numbers, not API
+promises; reproduce them with `bench/competitive/cmd/speedprobe` and separate
+warm-up from steady-state allocation measurements.
 
 The same public probe's ordered all-bytes scan now reconstructs and consumes
 24.88 MB of canonical JSON in about 44.5 ms (roughly 559 MB/s), also with zero
