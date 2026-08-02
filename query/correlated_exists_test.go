@@ -748,11 +748,6 @@ func TestSQLCorrelatedExistsUnsupportedProofShapesArePositioned(t *testing.T) {
 		},
 		{
 			`SELECT o.id FROM ce_outer o WHERE EXISTS (` +
-				`SELECT 1 FROM ce_inner i WHERE i.k = o.k AND i.id = o.id)`,
-			"i.id",
-		},
-		{
-			`SELECT o.id FROM ce_outer o WHERE EXISTS (` +
 				`SELECT 1 FROM ce_inner i WHERE i.k > o.k)`,
 			"i.k",
 		},

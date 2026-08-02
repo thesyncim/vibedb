@@ -155,6 +155,9 @@ type nestedStatements struct {
 	scalar       *statementScalar
 	ctes         *statementCTEs
 	cte          *statementCTEReference
+	// decorrelated holds proof-backed predicate subqueries. The name preserves
+	// the established single-key EXISTS cache/plan contract; entries may now
+	// also lower to grouped marks.
 	decorrelated []statementDecorrelatedExists
 	ownsCTEs     bool
 	driving      string
@@ -857,7 +860,7 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr, argBase int) error {
 			}
 			return sqlast.NewFeatureNotSupportedError(
 				s.text, e.Pos,
-				"correlated predicate subquery was not proved as a top-level EXISTS/NOT EXISTS equality",
+				"correlated predicate subquery was not proved as a supported top-level conjunct with complete equality correlation keys",
 			)
 		}
 		use := subqueryScalarUse

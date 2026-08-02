@@ -467,6 +467,21 @@ func (p *plan) runFileJoinedBatched(
 	if err := e.Workspace.checkCanceled(); err != nil {
 		return err
 	}
+	if p.hasLimit && p.limit == 0 {
+		for i := range p.joins {
+			if _, ok := catalog.Collection(p.joins[i].collection); !ok {
+				return fmt.Errorf(
+					"query: join: collection %q is not in the database snapshot",
+					p.joins[i].collection,
+				)
+			}
+		}
+		if err := p.validateFileMarkDependencies(catalog); err != nil {
+			return err
+		}
+		e.Stats = stats
+		return prepareResult(&e.Result, p, 0)
+	}
 	// The durable driving scan has its own bounded batch/merge frontier. The
 	// joined side is bound before that scan exists, so arm the configured
 	// admission account for its data-dependent candidate plan, membership,
@@ -479,6 +494,11 @@ func (p *plan) runFileJoinedBatched(
 		&e.Workspace, snapshot, catalog,
 		e.Options.JoinMembershipMax, e.Options.JoinFilterScanRatio,
 		&e.Workspace.heapWorkBudget, &stats,
+	); err != nil {
+		return err
+	}
+	if err := p.bindFileMarks(
+		&e.Workspace, snapshot, catalog, &e.Workspace.heapWorkBudget,
 	); err != nil {
 		return err
 	}

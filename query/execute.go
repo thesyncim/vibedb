@@ -127,6 +127,9 @@ type Workspace struct {
 	// while a join's collected set, its probe scratch, and its inner snapshot
 	// belong to exactly one of them.
 	joins []joinBinding
+	// marks is the immutable-after-bind grouped state for correlated predicate
+	// subqueries. Each evaluator aliases it read-only during the outer scan.
+	marks []markBinding
 
 	// joinPairBudget bounds the multiplicative workspace of the one supported
 	// fan-out join. It is configured before join binding and activated only
@@ -220,10 +223,12 @@ func (w *Workspace) clearBorrowedViews() {
 	w.ctx.s = nil
 	w.ctx.rows = 0
 	w.eval.bindTo(nil)
+	w.eval.bindMarks(nil)
 	w.eval.setWork(nil)
 	if w.pool != nil {
 		for i := range w.pool.workers {
 			w.pool.workers[i].eval.bindTo(nil)
+			w.pool.workers[i].eval.bindMarks(nil)
 			w.pool.workers[i].eval.setWork(nil)
 			w.pool.workers[i].release()
 		}
@@ -302,9 +307,14 @@ type evalScratch struct {
 	// text is the decoded-string arena a nested evaluation classifies through.
 	// Only a join probe uses it; a top-level scan classifies into the phase
 	// arenas the extraction owns.
-	text   []byte
-	binds  []joinBinding
-	probes []joinProbe
+	text              []byte
+	binds             []joinBinding
+	probes            []joinProbe
+	marks             []markBinding
+	markLeftEntries   []vibejson.IndexEntry
+	markRightEntries  []vibejson.IndexEntry
+	markLeftReserved  int64
+	markRightReserved int64
 }
 
 // containsTape indexes one containment haystack into the evaluator's reused
@@ -394,6 +404,8 @@ func (s *evalScratch) setWork(work *heapWorkBudget) {
 	s.work = work
 	s.entriesReserved = 0
 	s.err = nil
+	s.markLeftReserved = 0
+	s.markRightReserved = 0
 	for i := range s.probes {
 		s.probes[i].inner.setWork(work)
 	}
@@ -633,6 +645,9 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 				)
 			}
 		}
+		if err := p.validateHeapMarkDependencies(catalog); err != nil {
+			return err
+		}
 		e.Stats = ExecStats{}
 		return prepareResult(&e.Result, p, 0)
 	}
@@ -642,6 +657,11 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 		&e.Workspace.joinPairBudget,
 		e.Workspace.activeHeapWorkBudget(),
 		&e.Stats,
+	); err != nil {
+		return err
+	}
+	if err := p.bindMarks(
+		&e.Workspace, snapshot, catalog, e.Workspace.activeHeapWorkBudget(),
 	); err != nil {
 		return err
 	}
@@ -670,14 +690,14 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	w.pairInner = w.pairInner[:0]
 	w.pairInnerPair = w.pairInnerPair[:0]
 	w.interner.Reset()
-	if p.fanOutJoin < 0 {
+	if p.fanOutJoin < 0 && len(p.marks) == 0 {
 		if handled, err := p.runDirectSnapshotAggregate(dst, snapshot, w); err != nil {
 			return err
 		} else if handled {
 			return nil
 		}
 	}
-	if p.fanOutJoin < 0 {
+	if p.fanOutJoin < 0 && len(p.marks) == 0 {
 		if handled, err := p.runDirectSnapshotStringCountGroups(dst, snapshot, w); err != nil {
 			return err
 		} else if handled {
@@ -690,7 +710,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	); err != nil {
 		return err
 	}
-	if p.fanOutJoin < 0 {
+	if p.fanOutJoin < 0 && len(p.marks) == 0 {
 		// The direct-answer lanes count and reduce the driving collection's
 		// rows. A fan-out plan's row count is its pairs, which those lanes have
 		// no way to reach, so they decline rather than answer confidently about

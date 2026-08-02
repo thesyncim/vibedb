@@ -584,8 +584,8 @@ func (s *Statement) buildWhere(args []any) error {
 	defer func() { s.stack = s.stack[:base] }()
 	for _, conjunct := range conjuncts {
 		if s.decorrelatedExistsFor(conjunct) != nil {
-			// The hidden semi/anti join installed above is the complete proven
-			// replacement for this authored predicate.
+			// The hidden semi/anti join or grouped mark installed above is the
+			// complete proven replacement for this exact authored conjunct.
 			continue
 		}
 		if scalar := s.scalarStatement(); scalar != nil && scalar.ownsWhere(conjunct) {

@@ -306,6 +306,7 @@ func (w *Workspace) bindScanWorkers(scan []scanWorker) {
 		scan[i].cancel = w.cancel
 		scan[i].eval.setWork(scan[i].work)
 		scan[i].eval.bindTo(w.joins)
+		scan[i].eval.bindMarks(w.marks)
 	}
 	w.scanUsed = len(scan)
 }

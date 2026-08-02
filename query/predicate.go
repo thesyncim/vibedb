@@ -65,6 +65,12 @@ const (
 	// NULL/missing outer keys have no partner and therefore match the anti leaf,
 	// independent of SQL predicate-negation rewrites around ordinary leaves.
 	predAntiBound
+	// predMarkBound is a grouped correlated predicate-subquery probe. Its slot
+	// addresses an immutable execution binding; hidden predMarkRef children
+	// advertise every driving column the probe reads without widening this
+	// package's hot predicate or scalar layouts.
+	predMarkBound
+	predMarkRef
 	// predLike matches a string column against a SQL LIKE pattern.
 	predLike
 	// predIsString is an internal SQL three-valued-logic guard for LIKE. It is
@@ -512,7 +518,7 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		cp := c.nodes.one()
 		*cp = compiledPredicate{kind: predIsString, col: col}
 		return cp, nil
-	case predAnd, predOr, predNot:
+	case predAnd, predOr, predNot, predMarkBound:
 		kids := c.kids.alloc(len(p.kids))[:0]
 		for _, kid := range p.kids {
 			ck, err := c.compilePredicate(kid, reg)
@@ -754,7 +760,7 @@ func (p *compiledPredicate) readsColumn(col int) bool {
 		return false
 	}
 	switch p.kind {
-	case predAnd, predOr, predNot:
+	case predAnd, predOr, predNot, predMarkBound:
 		for _, kid := range p.kids {
 			if kid.readsColumn(col) {
 				return true
@@ -886,6 +892,12 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		// comparison. NULL/missing cannot find an equality partner, so matches
 		// returns false and the anti predicate keeps the row.
 		return !s.binds[p.slot].matches(cols[p.col][row], &s.probes[p.slot])
+	case predMarkBound:
+		return s.marks[p.slot].matches(cols, row, s)
+	case predMarkRef:
+		// Reference nodes are compile-time filter-column metadata and are never
+		// installed as independently evaluable predicates.
+		return false
 	case predContains:
 		cell := cols[p.col][row]
 		if len(cell.raw) == 0 {

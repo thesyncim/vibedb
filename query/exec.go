@@ -337,6 +337,7 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 				// remains warm.
 				e.Workspace.clearBorrowedViews()
 				e.Workspace.resetJoinBindings()
+				e.Workspace.resetMarkBindings()
 				e.file.abort()
 			}
 		}
@@ -350,6 +351,7 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 		return err
 	}
 	e.Workspace.resetJoinBindings()
+	e.Workspace.resetMarkBindings()
 	p, err := q.compiled()
 	if err != nil {
 		return err
@@ -485,11 +487,15 @@ func (p *plan) runEmptyFileDatabaseInto(
 			)
 		}
 	}
+	if err := p.validateFileMarkDependencies(catalog); err != nil {
+		return err
+	}
 	e.Workspace.joinPairBudget.configure(-1)
 	for len(e.Workspace.joins) < len(p.joins) {
 		e.Workspace.joins = append(e.Workspace.joins, joinBinding{})
 	}
 	e.Workspace.eval.bindTo(e.Workspace.joins[:len(p.joins)])
+	e.Workspace.eval.bindMarks(nil)
 	e.Stats = ExecStats{Workers: n.workers}
 	err = p.runSnapshotRows(
 		&e.Result, store.Snapshot{}, store.DatabaseSnapshot{},
@@ -505,8 +511,15 @@ func (p *plan) runEmptyFileDatabaseInto(
 // skew a join must not be able to express — so this is a hard rejection rather
 // than a fallback that would quietly answer a different question.
 func rejectJoins(p *plan, constructor string) error {
-	if len(p.joins) == 0 {
+	if len(p.joins) == 0 && len(p.marks) == 0 {
 		return nil
+	}
+	if len(p.joins) == 0 {
+		return fmt.Errorf(
+			"query: this query has a correlated subquery over collection %q, so both sides must come from one "+
+				"database snapshot; build the Source with FromDatabase or FromFileDatabase instead of %s",
+			p.marks[0].collection, constructor,
+		)
 	}
 	return fmt.Errorf(
 		"query: this query joins collection %q, so both sides must come from one "+

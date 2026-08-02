@@ -486,7 +486,7 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		return fmt.Errorf("query: FromFile was given a nil snapshot")
 	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: snapshot.Len()}
-	if len(p.joins) != 0 {
+	if len(p.joins) != 0 || len(p.marks) != 0 {
 		// The direct dispatchers below answer straight out of the persistent
 		// index or a covering projection, without ever evaluating the compiled
 		// predicate row by row. A join leaf is only evaluated there, so a
@@ -690,12 +690,17 @@ func (p *plan) runFileSnapshotBatched(
 	if len(p.joins) != 0 {
 		binds = e.Workspace.joins
 	}
+	var marks []markBinding
+	if len(p.marks) != 0 {
+		marks = e.Workspace.marks
+	}
 	for worker := range e.file.workers {
 		e.file.workers[worker].heapWorkParent = work
 		e.file.workers[worker].heapWorkTextReserved = 0
 		e.file.workers[worker].cancel = e.Options.Cancel
 		e.file.workers[worker].eval.setWork(work)
 		e.file.workers[worker].eval.bindTo(binds)
+		e.file.workers[worker].eval.bindMarks(marks)
 	}
 	pool.start(fileJob{
 		p: p, snapshot: snapshot, overlay: overlay, masks: candidateMasks,

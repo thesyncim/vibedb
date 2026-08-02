@@ -180,7 +180,8 @@ parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
 `SELECT`, durable ordinary views, SELECT-valued CTEs including the bounded
 recursive subset, set operations, the documented window-function subset,
 uncorrelated predicate subqueries, the documented decorrelated correlated
-`EXISTS`/`NOT EXISTS` subset, the documented derived/`LATERAL` relation subset,
+`EXISTS`/`NOT EXISTS`/`IN`/`NOT IN`/scalar subset, the documented
+derived/`LATERAL` relation subset,
 and chained inner, left, right, full, and cross joins. Composite `USING`,
 composite equi-keys, residual `ON` predicates, prepared statements, and explicit
 transactions use the same execution path. Stock `psql` can connect and issue
@@ -190,23 +191,33 @@ Exact scalar arithmetic, concatenation, and `CAST` to `TEXT`, `BOOLEAN`,
 `NUMERIC`, or `JSON` do not fall back to floating point; searched and simple
 `CASE` expressions retain ordered, lazy branch semantics.
 
-Correlated `EXISTS` and direct `NOT EXISTS` in a top-level `WHERE` conjunct are
-accepted when one local-to-outer path equality proves a semi/anti-join plan.
-The inner relation executes once, duplicate matches never fan out an outer row,
-and `NULL` or missing keys do not compare equal. Untyped objects and arrays use
-the established join contract of canonical stored JSON identity: object member
-order normalizes equal, array order remains significant, and changed members or
-values remain unequal. The adaptive membership and keyed-lookup machinery runs
-directly over one coherent durable catalog snapshot; explicit transactions add
-their pending-write overlay without weakening the BEGIN snapshot. A scalar-only
-`EXISTS` membership may bound the outer scan through an exact index; a mixed or
-container-only membership deliberately declines that optimization and scans
-the complete outer relation, because the scalar index has no completeness
-certificate for container identities. Cancellation and exact work-memory
-refusals publish no cursor, and the session remains reusable after resetting
-the signal or raising the limit. Correlated `IN`, scalar subqueries, correlation
-below `OR`, composite correlation, and nested correlated placements remain
-positioned `0A000` rather than falling back to per-row execution.
+Proof-backed correlated predicate subqueries are accepted only as a top-level
+`WHERE` conjunct, optionally under one direct `NOT`. `EXISTS`/`NOT EXISTS` may
+use one or more equality correlation keys; `IN`/`NOT IN` and scalar comparisons
+add exactly one non-aggregate projected child path. The outer and child each
+name one physical relation, every captured outer reference is consumed by a
+top-level local-to-outer equality, and every remaining child predicate is
+inner-only. The child scans once into a grouped mark table: duplicate matches
+never fan out an outer row, composite tuples are compared exactly, and scalar
+cardinality is checked only when its outer group is actually probed.
+
+`NOT IN` has its SQL null-aware truth table rather than reusing anti-join
+negation: an empty correlated group is TRUE even for a NULL/missing probe; an
+exact non-NULL match is FALSE; otherwise a NULL/missing probe or projected NULL
+makes the result UNKNOWN. Scalar groups with zero rows or one NULL yield
+UNKNOWN, one known value uses the authored comparison, and two rows—including
+identical or NULL rows—raise `21000`. Untyped objects and arrays use canonical
+stored JSON identity: object member order normalizes equal, array order remains
+significant, and changed members or values remain unequal. The existing scalar
+single-key `EXISTS` path may use an exact outer index. Grouped composite and
+value modes currently build the child once and conservatively scan the complete
+outer relation, even when a compound index exists; indexed and unindexed runs
+must remain differential-equivalent, and EXPLAIN does not claim a grouped index
+bound. The operator runs over one coherent durable catalog snapshot,
+transactions add pending writes to the BEGIN snapshot, and cancellation or
+exact work-memory refusal publishes no cursor. Nested boolean placement,
+unconsumed correlation, non-equality keys, and child
+joins/CTEs/sets/grouping/windows/tails remain positioned `0A000`.
 
 `INSERT` query sources accept one complete JSON document column from a
 `SELECT`, `WITH`, `TABLE`, parenthesized, set, CTE, join, or view-backed query.
