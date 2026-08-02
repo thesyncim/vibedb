@@ -301,6 +301,12 @@ func (c *lateralClone) cloneOrderBy(
 }
 
 func (c *lateralClone) rejectResidualLocations(query *sqlast.SelectStmt) error {
+	if err := c.rejectPredicateSubqueries(query.Where, "WHERE"); err != nil {
+		return err
+	}
+	if err := c.rejectPredicateSubqueries(query.Having, "HAVING"); err != nil {
+		return err
+	}
 	for i := range query.Windows {
 		if err := c.rejectWindowSpec(&query.Windows[i].Spec); err != nil {
 			return err
@@ -323,6 +329,32 @@ func (c *lateralClone) rejectResidualLocations(query *sqlast.SelectStmt) error {
 			if err := c.rejectExpr(query.From[i].On.Expr, "nested JOIN ON"); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (c *lateralClone) rejectPredicateSubqueries(
+	expr *sqlast.Expr,
+	clause string,
+) error {
+	if expr == nil {
+		return nil
+	}
+	if expr.Subquery != nil || expr.Kind == sqlast.ExprExists {
+		// Predicate subqueries currently own an independent parser range scope.
+		// A spelling such as ancestor.id inside that child is consequently
+		// indistinguishable in the AST from a local JSON path named ancestor.id.
+		// Refuse the boundary instead of silently executing the latter meaning.
+		return sqlast.NewFeatureNotSupportedError(
+			c.text, expr.Pos,
+			"predicate subqueries in correlated LATERAL "+clause+
+				" need inherited outer-reference metadata",
+		)
+	}
+	for _, kid := range expr.Kids {
+		if err := c.rejectPredicateSubqueries(kid, clause); err != nil {
+			return err
 		}
 	}
 	return nil

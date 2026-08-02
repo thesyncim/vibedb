@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 const nestedInheritedLateralSQL = `
@@ -242,6 +244,48 @@ func TestSQLLateralInheritedFrameIndependentPreparedStatementsRace(t *testing.T)
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
+	}
+}
+
+func TestSQLLateralPredicateSubqueryBoundaryIsPositionedAndTyped(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		where  string
+		marker string
+	}{
+		{
+			name: "exists",
+			where: `EXISTS (SELECT x.id FROM items x ` +
+				`WHERE x.owner = 1)`,
+			marker: "EXISTS",
+		},
+		{
+			name:   "in",
+			where:  `i.id IN (SELECT x.id FROM items x)`,
+			marker: "i.id IN",
+		},
+		{
+			name:   "scalar",
+			where:  `i.id = (SELECT x.id FROM items x LIMIT 1)`,
+			marker: "i.id =",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			src := `SELECT a.id, d.id FROM accounts a CROSS JOIN LATERAL (` +
+				`SELECT i.id FROM items i WHERE i.owner = a.id AND ` +
+				test.where + `) d`
+			statement, err := PrepareStatement(src)
+			if statement != nil {
+				statement.Release()
+				t.Fatal("predicate subquery prepared without inherited metadata")
+			}
+			var unsupported *sqlast.FeatureNotSupportedError
+			want := strings.Index(src, test.marker)
+			if !errors.As(err, &unsupported) || unsupported.Pos != want {
+				t.Fatalf("predicate subquery error = %T %v / %+v, want 0A000 at %d",
+					err, err, unsupported, want)
+			}
+		})
 	}
 }
 
