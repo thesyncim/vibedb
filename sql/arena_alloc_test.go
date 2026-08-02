@@ -28,6 +28,7 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"subqueries", `SELECT id FROM orders WHERE customer IN (` +
 			`SELECT id FROM customers WHERE tier = ?) AND ` +
 			`EXISTS (SELECT 1 FROM regions WHERE active = TRUE)`},
+		{"correlated predicate subquery", correlatedExistsSQL},
 		{"derived table", `SELECT d.id FROM (` +
 			`SELECT id FROM customers WHERE tier = ?` +
 			`) AS d WHERE d.id = ?`},
@@ -81,6 +82,7 @@ func TestWarmParseOfMixedShapesIsAllocationFree(t *testing.T) {
 		benchSimple, benchFiltered, benchJoin, benchLeftJoin, benchGrouped, benchRich,
 		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) d WHERE d.id = ?`,
 		lateralAllocSQL,
+		correlatedExistsSQL,
 		`WITH active AS (SELECT id FROM customers WHERE tier = ?), ` +
 			`selected AS MATERIALIZED (SELECT id FROM active) SELECT id FROM selected`,
 		benchSetExpression,

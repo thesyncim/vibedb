@@ -652,6 +652,12 @@ func (c *compiler) planJoinColumns(p *plan) error {
 		}
 		reads := len(j.innerCols) != 0 || len(j.innerNums) != 0
 		j.fanOut = j.left || (j.aliased && (reads || j.innerPath != joinPrimaryKey))
+		if j.origin == joinOriginDecorrelatedExists {
+			// A decorrelated EXISTS is definitionally a filtering operator. Keep
+			// this invariant explicit so later alias/column-planning changes cannot
+			// accidentally turn duplicate matches into fan-out.
+			j.fanOut = false
+		}
 	}
 	fanOut := -1
 	for i := range p.joins {

@@ -88,7 +88,23 @@ type Join struct {
 	where      Predicate
 	hasWhere   bool
 	left       bool
+	// anti asks the internal SQL decorrelator for existential negation. It is
+	// intentionally not exposed by the builder: NOT EXISTS is proved from the
+	// parsed correlation graph before this bit can be set, while a general
+	// public anti-join would need a larger null-aware contract.
+	anti bool
+	// origin distinguishes an authored builder join from a proof-backed hidden
+	// SQL operator. Execution does not branch on it; EXPLAIN uses it to make the
+	// decorrelation decision observable.
+	origin joinOrigin
 }
+
+type joinOrigin uint8
+
+const (
+	joinOriginAuthored joinOrigin = iota
+	joinOriginDecorrelatedExists
+)
 
 // JoinOn builds an equi-join against collection, matching each outer row's
 // value at outerPath against innerPath in the inner collection. innerPath is
@@ -197,6 +213,10 @@ type planJoin struct {
 	// left preserves a driving row whose build-side probe finds no partner and
 	// null-extends every column read from the joined collection.
 	left bool
+	// anti negates the existential leaf while retaining the exact same adaptive
+	// membership/lookup binding. The inner side is still evaluated once.
+	anti   bool
+	origin joinOrigin
 	// innerCols are the value-column indexes this clause's collection fills,
 	// in the shared column space. They are extracted after the pairs exist,
 	// addressed by the joined row of each pair.
@@ -227,9 +247,13 @@ func (c *compiler) compileJoins(q *Query, p *plan, values *pathRegistry) ([]*com
 		}
 		p.joins = append(p.joins, compiled)
 		if !compiled.left {
+			kind := predInBound
+			if compiled.anti {
+				kind = predAntiBound
+			}
 			node := c.nodes.one()
 			*node = compiledPredicate{
-				kind: predInBound, col: compiled.outerPath, op: Eq, slot: compiled.slot,
+				kind: kind, col: compiled.outerPath, op: Eq, slot: compiled.slot,
 			}
 			nodes = append(nodes, node)
 		}
@@ -333,6 +357,8 @@ func (c *compiler) compileJoin(j Join, index int, values *pathRegistry) (planJoi
 		collection: j.collection,
 		aliased:    j.alias != "",
 		left:       j.left,
+		anti:       j.anti,
+		origin:     j.origin,
 		inner:      ip,
 		outerPath:  outer,
 		innerPath:  innerPath,

@@ -22,6 +22,10 @@ func dumpStmt(s *SelectStmt) string {
 		return dumpSetStmt(s)
 	}
 	var b strings.Builder
+	if s.Correlation != nil {
+		dumpCorrelation(&b, s.Correlation)
+		b.WriteByte(' ')
+	}
 	if s.With != nil {
 		b.WriteString("with")
 		for i := range s.With.CTEs {
@@ -118,6 +122,30 @@ func dumpStmt(s *SelectStmt) string {
 		fmt.Fprintf(&b, " params=%d", s.Params)
 	}
 	return b.String()
+}
+
+func dumpCorrelation(b *strings.Builder, spec *CorrelationSpec) {
+	b.WriteString("correlation[")
+	fmt.Fprintf(b, "pos=%d", spec.Pos)
+	for i := range spec.Bindings {
+		binding := &spec.Bindings[i]
+		fmt.Fprintf(b, ";%d=depth%d/source%d@%d:",
+			i+1, binding.Depth, binding.Source, binding.Pos)
+		path := PathExpr{Segments: binding.Segments}
+		b.WriteString(path.Spec())
+	}
+	if len(spec.References) != 0 {
+		b.WriteString(";refs=")
+		for i := range spec.References {
+			if i != 0 {
+				b.WriteByte(',')
+			}
+			reference := &spec.References[i]
+			fmt.Fprintf(b, "%d@%d:", reference.Binding+1, reference.Path.Pos)
+			dumpPath(b, reference.Path)
+		}
+	}
+	b.WriteByte(']')
 }
 
 func dumpColumn(b *strings.Builder, c *ResultColumn) {

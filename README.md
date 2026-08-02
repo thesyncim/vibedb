@@ -179,15 +179,34 @@ pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
 parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
 `SELECT`, durable ordinary views, SELECT-valued CTEs including the bounded
 recursive subset, set operations, the documented window-function subset,
-uncorrelated predicate subqueries, the documented derived/`LATERAL` relation
-subset, and chained inner, left, right, full, and cross joins. Composite
-`USING`, composite equi-keys, residual `ON` predicates, prepared statements,
-and explicit transactions use the same execution path. Stock `psql` can
-connect and issue the same supported direct SQL. Whole-document parameters are
-described as PostgreSQL `json`; projected JSON values preserve their exact wire
-spelling. Exact scalar arithmetic, concatenation, and `CAST` to `TEXT`,
-`BOOLEAN`, `NUMERIC`, or `JSON` do not fall back to floating point; searched
-and simple `CASE` expressions retain ordered, lazy branch semantics.
+uncorrelated predicate subqueries, the documented decorrelated correlated
+`EXISTS`/`NOT EXISTS` subset, the documented derived/`LATERAL` relation subset,
+and chained inner, left, right, full, and cross joins. Composite `USING`,
+composite equi-keys, residual `ON` predicates, prepared statements, and explicit
+transactions use the same execution path. Stock `psql` can connect and issue
+the same supported direct SQL. Whole-document parameters are described as
+PostgreSQL `json`; projected JSON values preserve their stored wire spelling.
+Exact scalar arithmetic, concatenation, and `CAST` to `TEXT`, `BOOLEAN`,
+`NUMERIC`, or `JSON` do not fall back to floating point; searched and simple
+`CASE` expressions retain ordered, lazy branch semantics.
+
+Correlated `EXISTS` and direct `NOT EXISTS` in a top-level `WHERE` conjunct are
+accepted when one local-to-outer path equality proves a semi/anti-join plan.
+The inner relation executes once, duplicate matches never fan out an outer row,
+and `NULL` or missing keys do not compare equal. Untyped objects and arrays use
+the established join contract of canonical stored JSON identity: object member
+order normalizes equal, array order remains significant, and changed members or
+values remain unequal. The adaptive membership and keyed-lookup machinery runs
+directly over one coherent durable catalog snapshot; explicit transactions add
+their pending-write overlay without weakening the BEGIN snapshot. A scalar-only
+`EXISTS` membership may bound the outer scan through an exact index; a mixed or
+container-only membership deliberately declines that optimization and scans
+the complete outer relation, because the scalar index has no completeness
+certificate for container identities. Cancellation and exact work-memory
+refusals publish no cursor, and the session remains reusable after resetting
+the signal or raising the limit. Correlated `IN`, scalar subqueries, correlation
+below `OR`, composite correlation, and nested correlated placements remain
+positioned `0A000` rather than falling back to per-row execution.
 
 `INSERT` query sources accept one complete JSON document column from a
 `SELECT`, `WITH`, `TABLE`, parenthesized, set, CTE, join, or view-backed query.

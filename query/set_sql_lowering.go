@@ -70,6 +70,7 @@ type statementSetSQL struct {
 
 	requiresCatalog bool
 	directCatalog   bool
+	directBlocked   bool
 	generalizedJoin bool
 	joins           int
 	driving         string
@@ -453,12 +454,19 @@ func (r *statementSetSQL) observeRunner(runner setStatementRunner) {
 	} else if collection != "" && collection != r.driving {
 		r.requiresCatalog = true
 	}
-	r.requiresCatalog = r.requiresCatalog || runnerRequiresCatalog(runner)
+	runnerCatalog := runnerRequiresCatalog(runner)
+	r.requiresCatalog = r.requiresCatalog || runnerCatalog
 	r.joins += runnerNumJoins(runner)
 	r.generalizedJoin = r.generalizedJoin || runnerGeneralizedJoin(runner)
-	// Every compound relation pipeline can read a coherent durable catalog
-	// directly. This flag is meaningful only when catalog acquisition is needed.
-	r.directCatalog = r.requiresCatalog || r.generalizedJoin
+	// A set can route multiple ordinary single-collection leaves from one
+	// durable catalog even though none of those leaves requires a catalog by
+	// itself. A leaf that does require one is different: it must itself be a
+	// direct durable consumer. In particular, a legacy projected join requires
+	// coherence but still needs the driver's heap adapter; allowing a surrounding
+	// set to erase that fact routes fan-out into the semi-join-only file backend.
+	r.directBlocked = r.directBlocked ||
+		runnerCatalog && !runnerUsesDirectCatalog(runner)
+	r.directCatalog = (r.requiresCatalog || r.generalizedJoin) && !r.directBlocked
 }
 
 func runnerRequiresCatalog(runner setStatementRunner) bool {
@@ -480,6 +488,17 @@ func runnerNumJoins(runner setStatementRunner) int {
 		return v.joins
 	default:
 		return 0
+	}
+}
+
+func runnerUsesDirectCatalog(runner setStatementRunner) bool {
+	switch v := runner.(type) {
+	case *Statement:
+		return v.UsesDirectCatalogExecution()
+	case *statementSetSQL:
+		return v.directCatalog
+	default:
+		return false
 	}
 }
 
@@ -776,13 +795,7 @@ func (s *Statement) setSQL() *statementSetSQL {
 // consume a coherent durable catalog without the driver's heap fallback. The
 // ordinary point and legacy projected-join paths remain unchanged.
 func (s *Statement) UsesDirectCatalogExecution() bool {
-	if s == nil {
-		return false
-	}
-	if set := s.setSQL(); set != nil {
-		return set.directCatalog
-	}
-	return s.UsesGeneralizedRelationJoin()
+	return s.catalogCapabilities(0).direct
 }
 
 func translateSetIntermediateError(

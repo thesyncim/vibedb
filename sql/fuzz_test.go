@@ -36,6 +36,14 @@ func FuzzParseSQL(f *testing.F) {
 		`SELECT a FROM t WHERE m @> {"k": [1, 2, {"n": null}]}`,
 		`SELECT id FROM orders WHERE customer IN (SELECT id FROM customers WHERE tier = ?)`,
 		`SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE active = TRUE)`,
+		`SELECT o.id FROM orders o WHERE EXISTS (` +
+			`SELECT i.id FROM items i WHERE i.owner = o.id AND i.active = TRUE)`,
+		`SELECT o.id FROM orders o WHERE NOT EXISTS (` +
+			`SELECT i.id FROM items i WHERE EXISTS (` +
+			`SELECT x.id FROM tags x WHERE x.item = i.id AND x.tenant = o.tenant))`,
+		`SELECT o.id FROM orders o WHERE o.id IN (` +
+			`WITH picked AS (SELECT i.id FROM items i WHERE i.tenant = o.tenant) ` +
+			`SELECT picked.id FROM picked)`,
 		`SELECT d.id FROM (SELECT id FROM customers WHERE tier = ?) AS d WHERE d.id = ?`,
 		`SELECT a.id, d.id FROM accounts a LEFT JOIN LATERAL (` +
 			`SELECT i.id FROM items i WHERE i.owner = a.id AND a.region = ?` +
@@ -129,6 +137,9 @@ func FuzzParseSQL(f *testing.F) {
 // checkStatementInvariants asserts what an accepted statement promises, so a
 // lowering pass may walk it without re-validating every index.
 func checkStatementInvariants(t *testing.T, s *SelectStmt) {
+	if s.Correlation != nil {
+		t.Fatalf("top-level statement carries correlation metadata: %+v", s.Correlation)
+	}
 	checkStatementInvariantsScoped(t, s, nil)
 }
 
@@ -138,6 +149,12 @@ func checkStatementInvariantsScoped(
 	outer *LateralSpec,
 ) {
 	t.Helper()
+	if s.Correlation != nil {
+		if outer != s.Correlation {
+			t.Fatalf("statement correlation sidecar was not supplied as its outer scope")
+		}
+		checkCorrelationInvariants(t, s.Correlation)
+	}
 	if s.Set != nil {
 		checkSetStatementInvariantsScoped(t, s, outer)
 		return
@@ -173,7 +190,7 @@ func checkStatementInvariantsScoped(
 			} else if len(cte.Columns) > len(cte.Query.Columns) {
 				t.Fatalf("WITH[%d] has %d aliases for %d outputs", i, len(cte.Columns), len(cte.Query.Columns))
 			}
-			checkStatementInvariantsScoped(t, cte.Query, nil)
+			checkStatementInvariantsScoped(t, cte.Query, outer)
 			if cte.Query.ParamBase != seen {
 				t.Fatalf("WITH[%d] ParamBase = %d, want %d", i, cte.Query.ParamBase, seen)
 			}
@@ -453,7 +470,7 @@ func checkExprScoped(
 ) int {
 	t.Helper()
 	if e.Subquery != nil {
-		checkStatementInvariantsScoped(t, e.Subquery, nil)
+		checkStatementInvariantsScoped(t, e.Subquery, e.Subquery.Correlation)
 		if e.Kind != ExprExists && e.Path == nil {
 			t.Fatalf("a subquery leaf of kind %d has no outer path", e.Kind)
 		}
@@ -528,6 +545,49 @@ func checkExprScoped(
 		total += checkExprScoped(t, s, kid, having, outer)
 	}
 	return total
+}
+
+func checkCorrelationInvariants(t *testing.T, spec *CorrelationSpec) {
+	t.Helper()
+	if spec == nil {
+		return
+	}
+	if spec.Decorrelated || len(spec.Bindings) == 0 ||
+		cap(spec.Bindings) != len(spec.Bindings) ||
+		cap(spec.References) != len(spec.References) {
+		t.Fatalf("invalid predicate correlation metadata: %+v", spec)
+	}
+	for i := range spec.Bindings {
+		binding := &spec.Bindings[i]
+		if binding.Depth < 1 || binding.Source < 0 || binding.Pos < spec.Pos {
+			t.Fatalf("correlation binding[%d] = %+v", i, binding)
+		}
+		if i != 0 && binding.Pos < spec.Bindings[i-1].Pos {
+			t.Fatalf("correlation bindings are not in lexical order: %+v", spec.Bindings)
+		}
+		if cap(binding.Segments) != len(binding.Segments) {
+			t.Fatalf("correlation binding[%d] segments = len/cap %d/%d",
+				i, len(binding.Segments), cap(binding.Segments))
+		}
+	}
+	for i := range spec.References {
+		reference := &spec.References[i]
+		if reference.Path == nil || reference.Binding < 0 ||
+			reference.Binding >= len(spec.Bindings) {
+			t.Fatalf("correlation reference[%d] = %+v", i, reference)
+		}
+		binding := &spec.Bindings[reference.Binding]
+		if reference.Path.Source != binding.Source ||
+			!sameSegments(reference.Path.Segments, binding.Segments) {
+			t.Fatalf("correlation reference[%d] %+v disagrees with binding %+v",
+				i, reference, binding)
+		}
+		for prior := 0; prior < i; prior++ {
+			if spec.References[prior].Path == reference.Path {
+				t.Fatalf("correlation path appears in references %d and %d", prior, i)
+			}
+		}
+	}
 }
 
 func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *LateralSpec) int {

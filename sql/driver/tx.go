@@ -801,7 +801,8 @@ func (t *tx) runInsertSource(
 		return statement.RunIntermediateInto(&t.conn.exec, query.Source{}, args)
 	}
 	requiresCatalog := statement.RequiresCatalog() &&
-		(plan.catalogJoin || len(plan.dependencies) != 1)
+		(statement.UsesDirectCatalogExecution() ||
+			plan.catalogJoin || len(plan.dependencies) != 1)
 	if !requiresCatalog && statement.RequiresCatalog() &&
 		len(plan.dependencies) == 1 {
 		state := t.tables[plan.dependencies[0].name]

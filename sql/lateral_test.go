@@ -345,8 +345,9 @@ func TestLateralParserReuseIsDeterministicAndArenaOwned(t *testing.T) {
 }
 
 func TestLateralAbsentLeavesNoFrontendState(t *testing.T) {
-	// Correlation lives entirely in LateralSpec. Keep the ordinary path node at
-	// exactly its pre-LATERAL three-int-plus-slice footprint on every target.
+	// Correlation lives entirely in cold sidecars. Keep the ordinary path node
+	// at exactly its pre-correlation three-int-plus-slice footprint on every
+	// target.
 	wantPathSize := unsafe.Sizeof(int(0))*3 + unsafe.Sizeof([]Segment(nil))
 	if got := unsafe.Sizeof(PathExpr{}); got != wantPathSize {
 		t.Fatalf("PathExpr size = %d, want unchanged footprint %d", got, wantPathSize)
@@ -356,8 +357,11 @@ func TestLateralAbsentLeavesNoFrontendState(t *testing.T) {
 	if err := parser.Parse(&statement, `SELECT id FROM docs WHERE id = ?`); err != nil {
 		t.Fatal(err)
 	}
-	if parser.lateral != nil {
-		t.Fatalf("ordinary SELECT initialized LATERAL state: %+v", parser.lateral)
+	if parser.correlation != nil {
+		t.Fatalf("ordinary SELECT initialized correlation state: %+v", parser.correlation)
+	}
+	if statement.Correlation != nil {
+		t.Fatalf("ordinary SELECT carries correlation metadata: %+v", statement.Correlation)
 	}
 	for i := range statement.From {
 		ref := &statement.From[i]

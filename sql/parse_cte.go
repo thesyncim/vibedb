@@ -65,7 +65,17 @@ func (p *Parser) parseWithClause() error {
 		// activeCTEs contains only earlier siblings at this point. The current
 		// definition is appended after its body parses, which is precisely the
 		// non-recursive visibility rule.
-		query, err := p.parseSubquery(false)
+		var query *SelectStmt
+		if p.correlation != nil && p.correlation.capture != nil {
+			// A CTE body is a nested lexical query but remains inside the
+			// containing LATERAL/predicate correlation context. Its own FROM
+			// aliases resolve first; only actual misses reach the outer scopes.
+			query, err = p.parseSubqueryScoped(
+				false, p.correlation.outerRanges, p.correlation.capture,
+			)
+		} else {
+			query, err = p.parseSubquery(false)
+		}
 		if err != nil {
 			return err
 		}

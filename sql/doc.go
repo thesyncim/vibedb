@@ -155,6 +155,18 @@
 // accepted as decorrelated; correlation from their nullable left side is
 // rejected with the offending path position.
 //
+// Predicate subqueries use the same exact capture model through
+// [SelectStmt.Correlation]. Their local range variables and CTE-backed ranges
+// shadow outer aliases; otherwise a qualified path may bind any lexically
+// visible outer FROM source and records its exact depth, source, path, and byte
+// position. The sidecar remains nil when no outer path is captured. Parsing is
+// deliberately broader than execution: correlated EXISTS, IN, scalar, nested,
+// CTE, and set shapes remain losslessly annotated so a semantic layer can prove
+// a decorrelation or return a positioned feature refusal. Predicate subqueries
+// authored directly in JOIN ON are currently refused as a typed unsupported
+// feature after their nested grammar is validated: EXISTS and IN point at their
+// operator, while scalar comparisons point at the nested query's opening '('.
+//
 // WITH is non-recursive and lexically scoped. A CTE body sees earlier sibling
 // definitions and enclosing WITH scopes; a nested WITH may shadow either.
 // Definitions retain source order, stable query identity, materialization

@@ -410,6 +410,19 @@ func (j *planJoin) bindFile(
 				"backend does not yet materialize; joins over a durable database are "+
 				"currently semi-joins only", j.collection)
 	}
+	if inner == nil {
+		// A nil snapshot with ok=true is durable's representation of a
+		// cataloged collection that has never needed a backing file. Bind the
+		// measured empty membership directly: there are no pages to plan or
+		// scan, EXISTS matches nothing, and the totalized anti leaf retains
+		// every outer row (including NULL and missing keys). An absent name was
+		// rejected above and therefore cannot be confused with this state.
+		b.outerRows = outerRows
+		b.ratio = joinFileEffectiveRatio(ratio)
+		b.plan = j.inner
+		j.installStrategy(b, false, stats)
+		return b.scan.checkCanceled()
+	}
 
 	stoppable := j.innerPath == joinPrimaryKey
 	workMark := int64(0)
