@@ -61,6 +61,15 @@ low-cardinality postings. These are machine-specific probe numbers, not API
 promises; reproduce them with `bench/competitive/cmd/speedprobe` and separate
 warm-up from steady-state allocation measurements.
 
+Codec choice no longer forces exact-spelling filters onto whole-document
+rendering. Dictionary, front-coded, FOR, delta, Gregorian-date, and
+single-numeric-run streams all have complete encoded-value scan lanes. On the
+shape-identical high-cardinality corpus, a missing `/note` string scanned all
+100,000 front-coded values in about 0.85 ms (8.5 ns/document), with zero
+fallback rows and zero warm allocations. The general container-valued render
+fallback measured about 67 ms on the same harness; it remains disclosed as a
+different physical path rather than being used as an unindexed result.
+
 The same public probe's ordered all-bytes scan now reconstructs and consumes
 24.88 MB of canonical JSON in about 44.5 ms (roughly 559 MB/s), also with zero
 warm allocations. Sequential cursors carry per-shape ordinals and restart-coded

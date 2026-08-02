@@ -78,7 +78,18 @@ func TestCompactStreamCodecRoundTrip(t *testing.T) {
 			if encoded.kind != test.kind {
 				t.Fatalf("kind=%d want=%d", encoded.kind, test.kind)
 			}
-			compactCodecRoundTrip(t, encoded, test.values)
+			view := compactCodecRoundTrip(t, encoded, test.values)
+			needle := test.values[len(test.values)/2]
+			want := 0
+			for _, value := range test.values {
+				if bytes.Equal(value, needle) {
+					want++
+				}
+			}
+			got, _, supported := view.countSpellingEqual(needle, nil)
+			if !supported || got != want {
+				t.Fatalf("spelling count=%d supported=%v want=%d", got, supported, want)
+			}
 		})
 	}
 }

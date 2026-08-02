@@ -515,7 +515,19 @@ func benchmarkScalarFilterEq(b *testing.B, path, needle string) {
 }
 
 func benchmarkFilterEqMode(b *testing.B, path, needle string, scalar bool) {
-	keys, docs, n := benchCorpus(b)
+	benchmarkFilterEqCardinality(b, path, needle, scalar, false)
+}
+
+func benchmarkFilterEqCardinality(
+	b *testing.B,
+	path, needle string,
+	scalar, highCardinality bool,
+) {
+	n := 100_000
+	if testing.Short() {
+		n = 10_000
+	}
+	keys, docs := unifiedCompetitiveCorpus(n, highCardinality)
 	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
 	if err != nil {
@@ -569,6 +581,21 @@ func BenchmarkUnifiedFilterEqNested(b *testing.B) {
 // decimal needle intentionally differs from the corpus's integer spelling.
 func BenchmarkUnifiedFilterEqNumber(b *testing.B) {
 	benchmarkScalarFilterEq(b, "/score", `500.0`)
+}
+
+// BenchmarkUnifiedFilterEqDate scans the packed date ordinal lane without
+// reconstructing its quoted Gregorian spelling per row.
+func BenchmarkUnifiedFilterEqDate(b *testing.B) {
+	benchmarkFilterEq(b, "/profile/joined", `"2020-01-02"`)
+}
+
+// BenchmarkUnifiedFilterEqHighCardinalityString exercises a non-dictionary
+// scalar stream. The missing needle forces a complete front-coded value scan
+// while keeping selectivity from dominating the measurement.
+func BenchmarkUnifiedFilterEqHighCardinalityString(b *testing.B) {
+	benchmarkFilterEqCardinality(
+		b, "/note", `"not-present-in-the-corpus"`, false, true,
+	)
 }
 
 // BenchmarkUnifiedFilterEqFallback drives the recorded fallback lane: a

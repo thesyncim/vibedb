@@ -1119,6 +1119,120 @@ func (v compactStreamView) countIntegerEqual(needle int64) (matched int, support
 	}
 }
 
+// countSpellingEqual scans one complete scalar stream for an exact canonical
+// JSON spelling. scratch is retained by the caller for front-coded values so
+// repeated scans remain allocation-free.
+func (v compactStreamView) countSpellingEqual(
+	needle, scratch []byte,
+) (matched int, out []byte, supported bool) {
+	switch v.kind {
+	case compactStreamDictionary:
+		matched, supported = v.countDictionaryEqual(needle)
+		return matched, scratch, supported
+	case compactStreamFront:
+		matched, scratch = v.countFrontEqual(needle, scratch)
+		return matched, scratch, true
+	case compactStreamFOR, compactStreamDelta:
+		value, ok := CanonicalIntValue(needle)
+		if !ok {
+			return 0, scratch, false
+		}
+		matched, supported = v.countIntegerEqual(value)
+		return matched, scratch, supported
+	case compactStreamDate:
+		ordinal, ok := compactDateOrdinal(needle)
+		if !ok {
+			return 0, scratch, false
+		}
+		base := int32(binary.LittleEndian.Uint32(v.data))
+		delta := uint64(uint32(ordinal - base))
+		limit := uint64(1) << v.width
+		if ordinal < base || delta >= limit {
+			delta = limit
+		}
+		return countCompactPackedEqual(
+			v.data[4:], v.count, int(v.width), delta,
+		), scratch, true
+	case compactStreamPrefixInt:
+		matched, supported = v.countPrefixIntegerEqual(needle)
+		return matched, scratch, supported
+	default:
+		return 0, scratch, false
+	}
+}
+
+func (v compactStreamView) countFrontEqual(needle, scratch []byte) (matched int, out []byte) {
+	restarts := (v.count + compactStreamRestart - 1) / compactStreamRestart
+	cursor := 4 * restarts
+	for row := 0; row < v.count; row++ {
+		if row%compactStreamRestart == 0 {
+			length, n, _ := readCompactUvarint(v.data[cursor:])
+			cursor += n
+			scratch = append(scratch[:0], v.data[cursor:cursor+int(length)]...)
+			cursor += int(length)
+		} else {
+			packed := v.data[cursor]
+			cursor++
+			prefix, suffix := int(packed>>4), int(packed&15)
+			if packed == 0xff {
+				p, n, _ := readCompactUvarint(v.data[cursor:])
+				cursor += n
+				s, n, _ := readCompactUvarint(v.data[cursor:])
+				cursor += n
+				prefix, suffix = int(p), int(s)
+			}
+			scratch = append(scratch[:prefix], v.data[cursor:cursor+suffix]...)
+			cursor += suffix
+		}
+		if bytes.Equal(scratch, needle) {
+			matched++
+		}
+	}
+	return matched, scratch
+}
+
+func (v compactStreamView) countPrefixIntegerEqual(needle []byte) (matched int, supported bool) {
+	parsed, ok := parseCompactPrefixInt(needle)
+	if !ok {
+		return 0, false
+	}
+	prefix, _ := v.dictionaryEntry(0)
+	suffix, _ := v.dictionaryEntry(1)
+	if !bytes.Equal(parsed.prefix, prefix) || !bytes.Equal(parsed.suffix, suffix) ||
+		v.data[0]&1 != 0 && parsed.width != int(v.data[1]) ||
+		v.data[0]&1 == 0 && !parsed.canonical {
+		return 0, false
+	}
+	want := int64(parsed.value)
+	if v.data[0]&2 != 0 {
+		first := int64(binary.LittleEndian.Uint64(v.data[2:]))
+		delta := int64(binary.LittleEndian.Uint64(v.data[10:]))
+		for row := 0; row < v.count; row++ {
+			if first+int64(row)*delta == want {
+				matched++
+			}
+		}
+		return matched, true
+	}
+	restarts := (v.count + compactStreamRestart - 1) / compactStreamRestart
+	cursor := 2 + 4*restarts
+	var value int64
+	for row := 0; row < v.count; row++ {
+		if row%compactStreamRestart == 0 {
+			value = int64(binary.LittleEndian.Uint64(v.data[cursor:]))
+			cursor += 8
+		} else {
+			u, n, _ := readCompactUvarint(v.data[cursor:])
+			cursor += n
+			value += int64(u>>1) ^ -int64(u&1)
+		}
+		if value == want {
+			matched++
+		}
+	}
+	return matched, true
+}
+
 // countDictionaryEqual performs a complete encoded-id scan. supported is
 // false for non-dictionary streams; callers may decode those streams or take a
 // generic comparison path. No row index, pruning metadata, or candidate list

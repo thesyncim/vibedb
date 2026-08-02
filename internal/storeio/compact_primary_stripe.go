@@ -1085,6 +1085,49 @@ func (v *CompactPrimaryStripeView) CountResolvedDictionaryEqual(
 	return matched, true
 }
 
+// CountResolvedSpellingEqual evaluates exact canonical-spelling equality over
+// every compact scalar codec. scratch carries front-coded reconstruction state
+// across shapes and scans; it is returned even when ok=false.
+func (v *CompactPrimaryStripeView) CountResolvedSpellingEqual(
+	resolver *UnifiedHoleResolver,
+	needle, scratch []byte,
+) (matched int, out []byte, ok bool) {
+	if v == nil || resolver == nil || len(v.overflow) != 0 {
+		return 0, scratch, false
+	}
+	for shape := 0; shape < v.shapeCount; shape++ {
+		entry, found := v.shapeEntry(shape)
+		if !found {
+			return 0, scratch, false
+		}
+		hole := resolver.resolveCompactTemplate(entry.template)
+		if hole == UnifiedHoleAbsent {
+			continue
+		}
+		if hole < 0 || hole >= entry.template.holes {
+			return 0, scratch, false
+		}
+		streamRaw := entry.streamRaw
+		for at := 0; at <= hole; at++ {
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return 0, scratch, false
+			}
+			if at == hole {
+				var count int
+				count, scratch, ok = stream.countSpellingEqual(needle, scratch)
+				if !ok {
+					return 0, scratch, false
+				}
+				matched += count
+				break
+			}
+			streamRaw = streamRaw[stream.encoded:]
+		}
+	}
+	return matched, scratch, true
+}
+
 // CountResolvedIntegerEqual evaluates exact integer equality directly over
 // FOR or delta streams after resolving the path once per shape. The stream
 // counters consume all encoded rows; no posting list or pruning metadata is
