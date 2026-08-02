@@ -876,11 +876,25 @@ func (v *CompactPrimaryStripeView) AppendValue(dst []byte, row int) ([]byte, boo
 		return dst, false
 	}
 	shape := v.rowShape(row)
-	entry, ok := v.shapeEntry(shape)
-	if !ok {
+	return v.appendValueOrdinal(dst, row, shape, v.shapeOrdinal(row, shape))
+}
+
+// appendValueOrdinal reconstructs a row after a sequential caller has already
+// counted this shape's ordinal. Point reads use AppendValue; ordered cursors
+// carry the monotonically increasing ordinal instead of rescanning up to one
+// restart block of shape codes for every row.
+func (v *CompactPrimaryStripeView) appendValueOrdinal(
+	dst []byte,
+	row, shape, ordinal int,
+) ([]byte, bool) {
+	if v == nil || row < 0 || row >= v.rows || v.IsOverflow(row) ||
+		shape < 0 || shape >= v.shapeCount {
 		return dst, false
 	}
-	ordinal := v.shapeOrdinal(row, shape)
+	entry, ok := v.shapeEntry(shape)
+	if !ok || ordinal < 0 || ordinal >= entry.rows {
+		return dst, false
+	}
 	start := len(dst)
 	streamRaw := entry.streamRaw
 	previous := uint32(0)

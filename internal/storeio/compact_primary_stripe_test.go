@@ -253,6 +253,42 @@ func TestCompactPrimaryStripeWarmPointAllocations(t *testing.T) {
 	}
 }
 
+func TestCompactPrimaryScanDecoderMatchesRandomAccess(t *testing.T) {
+	_, view, records := compactPrimaryTestPage(t, 1000, false)
+	var decoder CompactPrimaryScanDecoder
+	ordinals := make([]int, view.ShapeCount())
+	want := make([]byte, 0, 512)
+	got := make([]byte, 0, 512)
+	for row := range records {
+		shape := view.rowShape(row)
+		ordinal := ordinals[shape]
+		ordinals[shape]++
+		var wantOK, gotOK bool
+		want, wantOK = view.AppendValue(want[:0], row)
+		got, gotOK = decoder.appendValue(
+			got[:0], &view, view.header.Bucket, row, shape, ordinal,
+		)
+		if !wantOK || !gotOK || !bytes.Equal(got, want) {
+			t.Fatalf("row %d sequential mismatch wantOK=%v gotOK=%v", row, wantOK, gotOK)
+		}
+	}
+	// Reusing the caller-owned decoder for the same immutable leaf must reset
+	// its scalar cursors when lexical iteration starts over.
+	clear(ordinals)
+	for row := range records {
+		shape := view.rowShape(row)
+		ordinal := ordinals[shape]
+		ordinals[shape]++
+		want, _ = view.AppendValue(want[:0], row)
+		got, gotOK := decoder.appendValue(
+			got[:0], &view, view.header.Bucket, row, shape, ordinal,
+		)
+		if !gotOK || !bytes.Equal(got, want) {
+			t.Fatalf("reused decoder row %d mismatch", row)
+		}
+	}
+}
+
 type compactPrimaryScanFixture struct {
 	view  CompactPrimaryStripeView
 	holes []int

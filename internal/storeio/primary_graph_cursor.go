@@ -2,11 +2,17 @@ package storeio
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"slices"
 )
 
 const primaryGraphCatalogDepth = 3
+
+// One compact restart block contains at most this many distinct shapes. Most
+// log-like leaves have one shape; a leaf with more shapes remains correct via
+// the compact view's bounded random-rank fallback.
+const primaryGraphSequentialShapeSlots = compactStreamRestart
 
 type primaryGraphCatalogPathEntry struct {
 	ref        PageRef
@@ -44,6 +50,8 @@ type PrimaryGraphCursor struct {
 	leafBucket  BucketID
 	leaf        CompactPrimaryStripeView
 	row         int
+	shapeBlock  int
+	shapeSeen   [primaryGraphSequentialShapeSlots]uint8
 
 	spliceScratch []byte
 
@@ -66,7 +74,7 @@ func InitPrimaryGraphCursor(
 	}
 	*dst = PrimaryGraphCursor{
 		cache: cache, root: root, bounds: bounds, leafBounds: leafBounds,
-		lower: lower, upper: upper, done: true,
+		lower: lower, upper: upper, shapeBlock: -1, done: true,
 	}
 	if err := dst.validate(); err != nil {
 		return err
@@ -260,13 +268,8 @@ func (c *PrimaryGraphCursor) openLeaf(
 		return err
 	}
 	c.leafLease = lease
-	if PrimaryLeafClass(lease.Page()) != CommonPrimaryLeafCompact {
-		return fmt.Errorf(
-			"%w: non-compact primary leaf", ErrCommonPrimaryLeafCorrupt,
-		)
-	}
-	view, ok := AdmittedCompactPrimaryStripe(
-		lease.Page(), c.bounds.StoreID, route.Bucket,
+	view, ok := AdmittedCachedCompactPrimaryStripe(
+		lease.Header(), lease.Payload(), c.bounds.StoreID, route.Bucket,
 	)
 	if !ok {
 		return fmt.Errorf(
@@ -275,6 +278,7 @@ func (c *PrimaryGraphCursor) openLeaf(
 	}
 	c.leaf = view
 	c.leafBucket = route.Bucket
+	c.shapeBlock = -1
 	if lowerBound {
 		c.row = view.FirstRankFrom(c.lower)
 	} else {
@@ -318,6 +322,16 @@ func (c *PrimaryGraphCursor) VisitCurrentLeafInlineUntil(
 	limit int,
 	fn func(key, value []byte) error,
 ) ([]byte, PageRef, error) {
+	return c.VisitCurrentLeafInlineUntilDecoded(nil, limit, fn)
+}
+
+// VisitCurrentLeafInlineUntilDecoded is VisitCurrentLeafInlineUntil with
+// caller-owned sequential scalar state for repeated ordered scans.
+func (c *PrimaryGraphCursor) VisitCurrentLeafInlineUntilDecoded(
+	decoder *CompactPrimaryScanDecoder,
+	limit int,
+	fn func(key, value []byte) error,
+) ([]byte, PageRef, error) {
 	if c == nil || c.done || fn == nil {
 		return nil, PageRef{}, nil
 	}
@@ -326,7 +340,7 @@ func (c *PrimaryGraphCursor) VisitCurrentLeafInlineUntil(
 			"%w: bounded current-leaf drain", ErrInvalidWrite,
 		)
 	}
-	return c.visitCurrentLeafInlineUntil(limit, fn)
+	return c.visitCurrentLeafInlineUntil(decoder, limit, fn)
 }
 
 // ConsumeCurrentLeafBase validates and advances exactly one base row without
@@ -346,8 +360,55 @@ func (c *PrimaryGraphCursor) ConsumeCurrentLeafBase(expectedKey []byte) error {
 	if !ok || !bytes.Equal(key, expectedKey) {
 		return ErrCommonPrimaryLeafCorrupt
 	}
+	shape := c.leaf.rowShape(c.row)
+	if shape < 0 || shape >= c.leaf.shapeCount {
+		return ErrCommonPrimaryLeafCorrupt
+	}
+	if c.sequentialShapeOrdinal(c.row, shape) < 0 {
+		return ErrCommonPrimaryLeafCorrupt
+	}
 	c.row++
 	return nil
+}
+
+// sequentialShapeOrdinal returns this row's ordinal within its shape while a
+// cursor advances in lexical order. For the common <=64-shape leaf, it scans
+// the restart prefix only once and then advances one byte counter per row.
+// More diverse leaves retain the bounded random-rank decoder.
+func (c *PrimaryGraphCursor) sequentialShapeOrdinal(row, shape int) int {
+	if c == nil || row < 0 || row >= c.leaf.rows ||
+		shape < 0 || shape >= c.leaf.shapeCount {
+		return -1
+	}
+	if c.leaf.shapeCount > len(c.shapeSeen) {
+		return c.leaf.shapeOrdinal(row, shape)
+	}
+	block := row / compactStreamRestart
+	if c.shapeBlock != block {
+		clear(c.shapeSeen[:c.leaf.shapeCount])
+		start := block * compactStreamRestart
+		for at := start; at < row; at++ {
+			prior := c.leaf.rowShape(at)
+			if prior == c.leaf.shapeCount && c.leaf.IsOverflow(at) {
+				continue
+			}
+			if prior < 0 || prior >= c.leaf.shapeCount ||
+				c.shapeSeen[prior] == compactStreamRestart {
+				return -1
+			}
+			c.shapeSeen[prior]++
+		}
+		c.shapeBlock = block
+	}
+	seen := c.shapeSeen[shape]
+	if seen == compactStreamRestart {
+		return -1
+	}
+	c.shapeSeen[shape]++
+	base := int(binary.LittleEndian.Uint16(
+		c.leaf.rankTable[(block*c.leaf.shapeCount+shape)*2:],
+	))
+	return base + int(seen)
 }
 
 // NextLeaf releases the current leaf and selects its rooted lexical successor.
@@ -386,7 +447,11 @@ func (c *PrimaryGraphCursor) nextRawBorrowed() (
 		return nil, nil, false, false
 	}
 	keyEnd := len(c.spliceScratch)
-	c.spliceScratch, ok = c.leaf.AppendValue(c.spliceScratch, c.row)
+	shape := c.leaf.rowShape(c.row)
+	ordinal := c.sequentialShapeOrdinal(c.row, shape)
+	c.spliceScratch, ok = c.leaf.appendValueOrdinal(
+		c.spliceScratch, c.row, shape, ordinal,
+	)
 	if !ok {
 		return nil, nil, false, false
 	}
@@ -403,11 +468,20 @@ func (c *PrimaryGraphCursor) nextRawBorrowed() (
 func (c *PrimaryGraphCursor) VisitInline(
 	fn func(key, value []byte) error,
 ) ([]byte, PageRef, error) {
+	return c.VisitInlineDecoded(nil, fn)
+}
+
+// VisitInlineDecoded is VisitInline with a bounded sequential scalar decoder.
+// It preserves the same overflow stop/re-entry contract.
+func (c *PrimaryGraphCursor) VisitInlineDecoded(
+	decoder *CompactPrimaryScanDecoder,
+	fn func(key, value []byte) error,
+) ([]byte, PageRef, error) {
 	if c == nil || c.done || fn == nil {
 		return nil, PageRef{}, nil
 	}
 	if len(c.upper) == 0 && len(c.prefix) == 0 {
-		return c.visitAllInline(fn)
+		return c.visitAllInline(decoder, fn)
 	}
 	for {
 		for {
@@ -438,11 +512,12 @@ func (c *PrimaryGraphCursor) VisitInline(
 }
 
 func (c *PrimaryGraphCursor) visitAllInline(
+	decoder *CompactPrimaryScanDecoder,
 	fn func(key, value []byte) error,
 ) ([]byte, PageRef, error) {
 	for {
 		key, ref, err := c.visitCurrentLeafInlineUntil(
-			c.leaf.Len(), fn,
+			decoder, c.leaf.Len(), fn,
 		)
 		if err != nil {
 			return nil, PageRef{}, err
@@ -462,6 +537,7 @@ func (c *PrimaryGraphCursor) visitAllInline(
 
 // visitCurrentLeafInlineUntil reconstructs one exact compact base span.
 func (c *PrimaryGraphCursor) visitCurrentLeafInlineUntil(
+	decoder *CompactPrimaryScanDecoder,
 	limit int,
 	fn func(key, value []byte) error,
 ) (overflowKey []byte, overflow PageRef, err error) {
@@ -484,9 +560,23 @@ func (c *PrimaryGraphCursor) visitCurrentLeafInlineUntil(
 			return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 		}
 		keyEnd := len(c.spliceScratch)
-		c.spliceScratch, ok = c.leaf.AppendValue(c.spliceScratch, c.row)
+		shape := c.leaf.rowShape(c.row)
+		ordinal := c.sequentialShapeOrdinal(c.row, shape)
+		if decoder == nil {
+			c.spliceScratch, ok = c.leaf.appendValueOrdinal(
+				c.spliceScratch, c.row, shape, ordinal,
+			)
+		} else {
+			c.spliceScratch, ok = decoder.appendValue(
+				c.spliceScratch, &c.leaf, c.leafBucket,
+				c.row, shape, ordinal,
+			)
+		}
 		if !ok {
-			return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
+			return nil, PageRef{}, fmt.Errorf(
+				"%w: compact value bucket=%d row=%d shape=%d ordinal=%d",
+				ErrCommonPrimaryLeafCorrupt, c.leafBucket, c.row, shape, ordinal,
+			)
 		}
 		c.row++
 		if err := fn(c.spliceScratch[:keyEnd], c.spliceScratch[keyEnd:]); err != nil {

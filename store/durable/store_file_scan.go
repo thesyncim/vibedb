@@ -211,20 +211,21 @@ func (c *Collection) rangeRawCurrentAt(
 	}
 	bounds := c.primaryLeafBounds(state)
 	var cursor storeio.PrimaryGraphCursor
+	var decoder storeio.CompactPrimaryScanDecoder
 	if err := storeio.InitPrimaryGraphCursor(
 		&cursor, c.cache, state.root.PrimaryRoot,
 		catalogBounds, bounds, nil, nil,
 	); err != nil {
-		return scratch, err
+		return scratch, fmt.Errorf("current scan cursor: %w", err)
 	}
 	defer cursor.Close()
 	if view.generation == state.root.PrimaryRoot.Generation {
 		cursor.AdoptSpliceScratch(scratch)
 		for {
-			key, ref, err := cursor.VisitInline(fn)
+			key, ref, err := cursor.VisitInlineDecoded(&decoder, fn)
 			scratch = cursor.ReleaseSpliceScratch()
 			if err != nil {
-				return scratch, err
+				return scratch, fmt.Errorf("current rooted scan: %w", err)
 			}
 			if ref == (storeio.PageRef{}) {
 				return scratch, nil
@@ -233,7 +234,7 @@ func (c *Collection) rangeRawCurrentAt(
 				scratch[:0], ref, bounds,
 			)
 			if err != nil {
-				return scratch, err
+				return scratch, fmt.Errorf("current rooted overflow: %w", err)
 			}
 			if err = fn(key, scratch); err != nil {
 				return scratch, err
@@ -261,14 +262,19 @@ func (c *Collection) rangeRawCurrentAt(
 				view.generation,
 			)
 			if err != nil {
-				return scratch, err
+				return scratch, fmt.Errorf(
+					"current scan overlay bucket=%d: %w", bucket, err,
+				)
 			}
 		}
 		leafVisible := int64(leaf.Len())
 		var previousKey []byte
 		for at, index := range indexes[:overlayCount] {
 			if int(index) >= len(overlay.records) {
-				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				return scratch, fmt.Errorf(
+					"%w: current overlay record bucket=%d index=%d",
+					storeio.ErrCommonPrimaryLeafCorrupt, bucket, index,
+				)
 			}
 			record := &overlay.records[index]
 			keyEnd64 := uint64(record.keyOffset) + uint64(record.keyLen)
@@ -276,27 +282,40 @@ func (c *Collection) rangeRawCurrentAt(
 			if record.keyLen == 0 || keyEnd64 > uint64(len(overlay.arena)) ||
 				record.valueOff != uint32(keyEnd64) ||
 				valueEnd64 > uint64(len(overlay.arena)) {
-				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				return scratch, fmt.Errorf(
+					"%w: current overlay arena bucket=%d index=%d",
+					storeio.ErrCommonPrimaryLeafCorrupt, bucket, index,
+				)
 			}
 			keyEnd := uint32(keyEnd64)
 			key := overlay.arena[record.keyOffset:keyEnd:keyEnd]
 			if at != 0 && bytes.Compare(previousKey, key) >= 0 {
-				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				return scratch, fmt.Errorf(
+					"%w: current overlay key order bucket=%d at=%d",
+					storeio.ErrCommonPrimaryLeafCorrupt, bucket, at,
+				)
 			}
 			previousKey = key
 
-			rank, matchesBase := leaf.RankAtSlot(record.slot)
-			if matchesBase {
-				baseKey, rowOK := leaf.AppendKey(baseKeyScratch[:0], rank)
-				if !rowOK || !bytes.Equal(baseKey, key) {
-					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			rank, matchesBase := leaf.FindKey(key)
+			if matchesBase && leaf.Len() <= storeio.CommonPrimaryLeafWideSlots {
+				slotRank, slotOK := leaf.RankAtSlot(record.slot)
+				if !slotOK || slotRank != rank {
+					return scratch, fmt.Errorf(
+						"%w: current overlay slot key bucket=%d slot=%d rank=%d slot_rank=%d",
+						storeio.ErrCommonPrimaryLeafCorrupt, bucket, record.slot, rank,
+						slotRank,
+					)
 				}
-			} else {
+			} else if !matchesBase {
 				rank = leaf.FirstRankFrom(key)
 				if rank < leaf.Len() {
 					baseKey, rowOK := leaf.AppendKey(baseKeyScratch[:0], rank)
 					if !rowOK || bytes.Equal(baseKey, key) {
-						return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+						return scratch, fmt.Errorf(
+							"%w: current overlay insertion key bucket=%d rank=%d",
+							storeio.ErrCommonPrimaryLeafCorrupt, bucket, rank,
+						)
 					}
 				}
 			}
@@ -304,11 +323,17 @@ func (c *Collection) rangeRawCurrentAt(
 			switch record.kind {
 			case primaryUnifiedOverlayPut:
 				if record.valueLen == 0 {
-					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+					return scratch, fmt.Errorf(
+						"%w: empty current overlay put bucket=%d",
+						storeio.ErrCommonPrimaryLeafCorrupt, bucket,
+					)
 				}
 			case primaryUnifiedOverlayDelete:
 				if record.valueLen != 0 {
-					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+					return scratch, fmt.Errorf(
+						"%w: valued current overlay delete bucket=%d",
+						storeio.ErrCommonPrimaryLeafCorrupt, bucket,
+					)
 				}
 				// A final tombstone for an overlay-native key has no base row and
 				// no visible output. It still participates in lexical validation.
@@ -316,18 +341,27 @@ func (c *Collection) rangeRawCurrentAt(
 					continue
 				}
 			default:
-				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+				return scratch, fmt.Errorf(
+					"%w: current overlay kind bucket=%d kind=%d",
+					storeio.ErrCommonPrimaryLeafCorrupt, bucket, record.kind,
+				)
 			}
 
 			scratch, err = c.visitRangeRawCurrentBaseUntil(
-				&cursor, rank, scratch, bounds, fn,
+				&cursor, &decoder, rank, scratch, bounds, fn,
 			)
 			if err != nil {
-				return scratch, err
+				return scratch, fmt.Errorf(
+					"current scan base bucket=%d limit=%d: %w",
+					bucket, rank, err,
+				)
 			}
 			if matchesBase {
 				if err = cursor.ConsumeCurrentLeafBase(key); err != nil {
-					return scratch, err
+					return scratch, fmt.Errorf(
+						"%w: consume overlay base bucket=%d rank=%d",
+						err, bucket, rank,
+					)
 				}
 				if record.kind == primaryUnifiedOverlayDelete {
 					leafVisible--
@@ -342,17 +376,25 @@ func (c *Collection) rangeRawCurrentAt(
 			}
 		}
 		scratch, err = c.visitRangeRawCurrentBaseUntil(
-			&cursor, leaf.Len(), scratch, bounds, fn,
+			&cursor, &decoder, leaf.Len(), scratch, bounds, fn,
 		)
 		if err != nil {
-			return scratch, err
+			return scratch, fmt.Errorf(
+				"current scan tail bucket=%d limit=%d: %w",
+				bucket, leaf.Len(), err,
+			)
 		}
 		if leafVisible < 0 {
-			return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			return scratch, fmt.Errorf(
+				"%w: negative current leaf count bucket=%d",
+				storeio.ErrCommonPrimaryLeafCorrupt, bucket,
+			)
 		}
 		visited += uint64(leafVisible)
 		if err := cursor.NextLeaf(); err != nil {
-			return scratch, err
+			return scratch, fmt.Errorf(
+				"current scan successor bucket=%d: %w", bucket, err,
+			)
 		}
 	}
 	if visited != view.documentCount {
@@ -371,6 +413,7 @@ func (c *Collection) rangeRawCurrentAt(
 // base rank. The cursor never retains scratch between calls.
 func (c *Collection) visitRangeRawCurrentBaseUntil(
 	cursor *storeio.PrimaryGraphCursor,
+	decoder *storeio.CompactPrimaryScanDecoder,
 	limit int,
 	scratch []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
@@ -381,7 +424,9 @@ func (c *Collection) visitRangeRawCurrentBaseUntil(
 	}
 	for {
 		cursor.AdoptSpliceScratch(scratch)
-		key, ref, err := cursor.VisitCurrentLeafInlineUntil(limit, fn)
+		key, ref, err := cursor.VisitCurrentLeafInlineUntilDecoded(
+			decoder, limit, fn,
+		)
 		scratch = cursor.ReleaseSpliceScratch()
 		if err != nil {
 			return scratch, err
@@ -468,8 +513,9 @@ func (s *Snapshot) rangePrimaryGraph(
 	// to fn exactly like an inline value, then the drain is re-entered. Passing fn
 	// straight through (no wrapper closure) keeps an inline scan allocation-free.
 	var scanErr error
+	var decoder storeio.CompactPrimaryScanDecoder
 	for scanErr == nil {
-		key, ref, err := cursor.VisitInline(fn)
+		key, ref, err := cursor.VisitInlineDecoded(&decoder, fn)
 		if err != nil {
 			scanErr = err
 			break

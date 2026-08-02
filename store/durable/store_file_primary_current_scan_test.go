@@ -239,6 +239,33 @@ func TestBufferedUnifiedRangeRawCurrentBufferMergesOverlayInOrder(t *testing.T) 
 	}
 }
 
+func TestBufferedUnifiedRangeRawCurrentBufferLargeUnindexedLeaf(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 1000, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracle, fixture.keys[500],
+		[]byte(`{"scan":"large-unindexed-replacement","id":500}`), false,
+	)
+	deleteBufferedCurrentScanRow(t, collection, oracle, fixture.keys[700])
+	assertBufferedCurrentScan(t, collection, oracle)
+}
+
+func TestBufferedUnifiedRangeRawCurrentBufferUnindexed256Insert(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, storeio.CommonPrimaryLeafWideSlots, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+	putBufferedCurrentScanRow(
+		t, collection, oracle, "primary-key-000000128-inserted",
+		[]byte(`{"scan":"unindexed-256-insert"}`), true,
+	)
+	assertBufferedCurrentScan(t, collection, oracle)
+}
+
 func TestBufferedUnifiedRangeRawCurrentBufferPinsGenerationDuringScan(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
 		t, 250, concurrentPrimaryTestOptions(),

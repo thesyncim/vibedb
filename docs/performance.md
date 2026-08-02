@@ -24,10 +24,10 @@ are the next two measured performance targets.
 
 The log-filter path has a fused execution lane for `COUNT(*)` equality queries.
 On the 100,000-row low-cardinality log-like probe, the current fair adapter
-measured about 0.78 µs for a random point read, 0.318 ms for an unindexed equality
-count, and 5.1 µs for the same count through an exact `country` index. The
+measured about 0.78 µs for a random point read, 0.226 ms for an unindexed equality
+count, and 5.2 µs for the same count through an exact `country` index. The
 unindexed result is a complete 100,000-row scan (945 matches,
-about 3.18 ns/document), not candidate pruning: the storage cursor resolves the
+about 2.26 ns/document), not candidate pruning: the storage cursor resolves the
 field once per durable leaf template and compares its scalar tokens without
 reconstructing each JSON document. Rows that cannot be decided from tokens are
 rendered individually and reported through `TokenFilterFallbackRows`;
@@ -56,9 +56,16 @@ machine-specific probe numbers, not API promises; reproduce them with
 `bench/competitive/cmd/speedprobe` and separate warm-up from steady-state
 allocation measurements.
 
+The same public probe's ordered all-bytes scan now reconstructs and consumes
+24.88 MB of canonical JSON in about 44.5 ms (roughly 559 MB/s), also with zero
+warm allocations. Sequential cursors carry per-shape ordinals and restart-coded
+integer state across rows; point reads retain bounded restart decoding. This
+reduced the low-cardinality all-bytes scan from about 54.7 ms without changing
+the compact bytes or callback semantics.
+
 A local ClickHouse control over the same flattened 100,000-row corpus measured
 about 1.49 ms with `ORDER BY key` and no secondary data-skipping index. The
-current warmed VibeDB public count is about 4.7× faster while performing the
+current warmed VibeDB public count is about 6.6× faster while performing the
 same full-corpus logical scan and using no filter index. For context,
 ClickHouse measured about 1.34 ms with the primary layout aligned as
 `ORDER BY (country, key)`, and about 1.97 ms with a mixed-value `set` skipping
@@ -78,11 +85,11 @@ files, matching the ClickHouse per-table accounting.
 | ClickHouse typed, `ORDER BY key`, no skipping index | **2,713,077** | **27.13** | about **1.49 ms** |
 | ClickHouse typed, `ORDER BY (country, key)` | 2,992,629 | 29.93 | about 1.34 ms |
 | ClickHouse raw JSON, `ORDER BY key` | 4,565,499 | 45.65 | not measured in this control |
-| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **0.32 ms**, zero allocations, through the warmed public query API |
+| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **0.226 ms**, zero allocations, through the warmed public query API |
 | VibeDB compact scan kernel | same file | 11.18 | about **0.35 ms**, zero allocations |
 
 The compact VibeDB database file is 2.43× smaller than the fair typed
-ClickHouse table. Its warmed public query path is about 4.7× faster in this
+ClickHouse table. Its warmed public query path is about 6.6× faster in this
 control; the storage-native full-scan kernel is about 4.3× faster. Both VibeDB rows scan all
 100,000 field IDs: neither uses an index, candidate list, or data skipping.
 The aligned ClickHouse row is kept separate because `country` participates in
