@@ -25,6 +25,10 @@ var (
 	// ErrDuplicateViewColumn reports a view whose durable relation schema would
 	// contain an ambiguous duplicate output name.
 	ErrDuplicateViewColumn = errors.New("vibedb: duplicate SQL view output column")
+	// ErrWrongObjectType reports relation DDL naming an existing relation of a
+	// different kind, such as DROP VIEW applied to a table. IF EXISTS does not
+	// suppress this error because the named object exists.
+	ErrWrongObjectType = errors.New("vibedb: wrong SQL relation object type")
 	// ErrIndexExists reports CREATE INDEX without IF NOT EXISTS naming an
 	// existing index.
 	ErrIndexExists = errors.New("vibedb: SQL index already exists")

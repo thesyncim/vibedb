@@ -16,6 +16,18 @@ type preparedViewDDL struct {
 	drop   *sqlast.DropViewStmt
 }
 
+type wrongViewObjectTypeError struct {
+	name string
+	pos  int
+}
+
+func (e *wrongViewObjectTypeError) Error() string {
+	return fmt.Sprintf("%v: relation %q is a table, not a view", ErrWrongObjectType, e.name)
+}
+
+func (e *wrongViewObjectTypeError) Unwrap() error { return ErrWrongObjectType }
+func (e *wrongViewObjectTypeError) Position() int { return e.pos }
+
 func (c *conn) prepareViewDDL(
 	ctx context.Context,
 	source string,
@@ -49,15 +61,18 @@ func (c *conn) prepareViewDDL(
 			return nil, fmt.Errorf("vibedb: invalid DROP VIEW descriptor")
 		}
 		prepared.drop = tree.DropView
-		if tree.DropView.IfExists {
-			return prepared, nil
-		}
 		if err := rlockContext(ctx, &c.db.mu); err != nil {
 			return nil, err
 		}
 		_, exists := c.db.catalog.Views[tree.DropView.Name]
+		_, tableExists := c.db.tables[tree.DropView.Name]
 		c.db.mu.RUnlock()
-		if !exists {
+		if tableExists {
+			return nil, &wrongViewObjectTypeError{
+				name: tree.DropView.Name, pos: tree.DropView.Pos,
+			}
+		}
+		if !exists && !tree.DropView.IfExists {
 			return nil, fmt.Errorf("%w: %q", ErrViewNotFound, tree.DropView.Name)
 		}
 	default:
@@ -147,6 +162,9 @@ func (d *database) dropViewLocked(
 	}
 	meta, exists := d.catalog.Views[drop.Name]
 	if !exists {
+		if _, tableExists := d.tables[drop.Name]; tableExists {
+			return nil, &wrongViewObjectTypeError{name: drop.Name, pos: drop.Pos}
+		}
 		if drop.IfExists {
 			return result{}, nil
 		}
