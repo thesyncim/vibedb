@@ -158,6 +158,9 @@ type Query struct {
 	where    Predicate
 	hasWhere bool
 	joins    []Join
+	// marks are proof-backed correlated predicate subqueries installed by the
+	// SQL lowerer. The builder surface cannot populate this cold sidecar.
+	marks    []correlatedMark
 	groupBy  []string
 	orderBy  []orderSpec
 	limit    int
@@ -266,6 +269,10 @@ type plan struct {
 	// an inner collection that must be resolved at the same instant the driving
 	// side was captured; see join.go.
 	joins []planJoin
+	// marks are grouped correlated predicate-subquery operators. Like joins,
+	// they require one coherent catalog snapshot and bind into the executing
+	// Workspace before the driving scan starts.
+	marks []planMark
 
 	grouped   bool
 	groupCols []int // value-column indices of GROUP BY paths
@@ -506,11 +513,17 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 		}
 		p.where = cp
 	}
-	// The join leaves are conjoined after the query's own filter, never before
-	// it. A join leaf is the most expensive test in the tree — under a lookup
-	// binding it is a hash probe plus a document decode — and And short-circuits
-	// left to right, so a cheap local conjunct that already rejected the row
-	// must get the chance to.
+	// Bound leaves are conjoined after the query's own filter, never before it.
+	// Grouped marks precede joins: both are exact probes, but a lookup-bound join
+	// may also decode a document. And short-circuits left to right, so cheap local
+	// predicates and grouped membership get the chance to reject first.
+	markNodes, err := c.compileMarks(q, p, values)
+	if err != nil {
+		return err
+	}
+	if len(markNodes) != 0 {
+		p.where = c.conjoin(p.where, markNodes)
+	}
 	joinNodes, err := c.compileJoins(q, p, values)
 	if err != nil {
 		return err

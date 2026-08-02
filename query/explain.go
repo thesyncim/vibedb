@@ -72,6 +72,7 @@ type explainPlan struct {
 	Aggregate     bool              `json:"aggregate,omitempty"`
 	SingleRow     bool              `json:"single_row,omitempty"`
 	Joins         []explainJoin     `json:"joins,omitempty"`
+	Marks         []explainMark     `json:"marks,omitempty"`
 	CTEs          []explainCTE      `json:"ctes,omitempty"`
 	Windows       []explainWindow   `json:"windows,omitempty"`
 	Analyze       *explainAnalyze   `json:"analyze,omitempty"`
@@ -134,6 +135,23 @@ type explainJoin struct {
 	Residual        bool             `json:"residual"`
 	Cross           bool             `json:"cross"`
 	Pairs           *uint64          `json:"pairs,omitempty"`
+}
+
+// explainMark reports a grouped predicate-subquery operator separately from a
+// relation join. A mark filters one driving row at most once and never emits a
+// relation pair, so presenting it as a join would make cardinality and runtime
+// counters misleading. The access-path spelling is the stable public contract;
+// Kind and Operator retain the authored SQL distinction needed to interpret
+// NULL and cardinality behavior.
+type explainMark struct {
+	Collection string           `json:"collection"`
+	Kind       string           `json:"kind"`
+	AccessPath string           `json:"access_path"`
+	Keys       []explainJoinKey `json:"keys"`
+	KeyCount   int              `json:"key_count"`
+	Probe      string           `json:"probe,omitempty"`
+	Value      string           `json:"value,omitempty"`
+	Operator   string           `json:"operator,omitempty"`
 }
 
 type explainJoinKey struct {
@@ -327,11 +345,77 @@ func (p *plan) explainJSONAnalysis(
 			KeyCount:   1,
 		})
 	}
+	for i := range sourcePlan.marks {
+		mark := &sourcePlan.marks[i]
+		explained := explainMark{
+			Collection: mark.collection,
+			Kind:       explainCorrelatedMarkKind(mark.kind),
+			AccessPath: explainCorrelatedMarkAccessPath(mark.kind),
+			KeyCount:   min(len(mark.outer), len(mark.innerKeys)),
+		}
+		for key := 0; key < explained.KeyCount; key++ {
+			explained.Keys = append(explained.Keys, explainJoinKey{
+				Left:  explainPlanPath(sourcePlan, mark.outer[key]),
+				Right: explainPlanPath(mark.inner, mark.innerKeys[key]),
+			})
+		}
+		if mark.probe >= 0 {
+			explained.Probe = explainPlanPath(sourcePlan, mark.probe)
+		}
+		if mark.value >= 0 {
+			explained.Value = explainPlanPath(mark.inner, mark.value)
+		}
+		if mark.kind == correlatedMarkScalar {
+			explained.Operator = explainOperator(mark.op)
+		}
+		plan.Marks = append(plan.Marks, explained)
+	}
 	encoded, err := vibejson.Marshal(&explainDocument{Version: 1, Plan: plan})
 	if err != nil {
 		return "", err
 	}
 	return byteview.String(encoded), nil
+}
+
+func explainPlanPath(plan *plan, column int) string {
+	if plan == nil || column < 0 || column >= len(plan.valuePaths) {
+		return ""
+	}
+	return plan.valuePaths[column].spec
+}
+
+func explainCorrelatedMarkKind(kind correlatedMarkKind) string {
+	switch kind {
+	case correlatedMarkExists:
+		return "exists"
+	case correlatedMarkNotExists:
+		return "not-exists"
+	case correlatedMarkIn:
+		return "in"
+	case correlatedMarkNotIn:
+		return "not-in"
+	case correlatedMarkScalar:
+		return "scalar"
+	default:
+		return "unknown"
+	}
+}
+
+func explainCorrelatedMarkAccessPath(kind correlatedMarkKind) string {
+	switch kind {
+	case correlatedMarkExists:
+		return "decorrelated-composite-exists-semi"
+	case correlatedMarkNotExists:
+		return "decorrelated-composite-exists-anti"
+	case correlatedMarkIn:
+		return "decorrelated-correlated-in"
+	case correlatedMarkNotIn:
+		return "decorrelated-correlated-not-in"
+	case correlatedMarkScalar:
+		return "decorrelated-correlated-scalar"
+	default:
+		return "decorrelated-correlated-unknown"
+	}
 }
 
 func (s *Statement) Explain() (string, error) {

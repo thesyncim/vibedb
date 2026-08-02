@@ -333,40 +333,11 @@ func TestPGWireCorrelatedExistsDroppedDependencyAndRefusalRecovery(t *testing.T)
 			extended bool
 		}{
 			{
-				name: "correlated IN simple",
-				source: `/* préfix */ SELECT o.id FROM ce_wire_outer AS o WHERE o.match_key IN (` +
-					`SELECT i.match_key FROM ce_wire_inner AS i WHERE i.match_key = o.match_key)`,
-				marker: "o.match_key",
-			},
-			{
-				name: "correlated NOT IN extended",
-				source: `/* préfix */ SELECT o.id FROM ce_wire_outer AS o WHERE o.match_key NOT IN (` +
-					`SELECT i.match_key FROM ce_wire_inner AS i WHERE i.match_key = o.match_key)`,
-				marker:   "o.match_key",
-				extended: true,
-			},
-			{
-				name: "scalar extended",
-				source: `/* préfix */ SELECT o.id FROM ce_wire_outer AS o ` +
-					`WHERE o.match_key = (SELECT i.match_key FROM ce_wire_inner AS i ` +
-					`WHERE i.match_key = o.match_key)`,
-				marker:   "o.match_key",
-				extended: true,
-			},
-			{
 				name: "OR simple",
 				source: `/* préfix */ SELECT o.id FROM ce_wire_outer AS o ` +
 					`WHERE o.id = 'a_dup' OR EXISTS (` +
 					`SELECT 1 FROM ce_wire_inner AS i WHERE i.match_key = o.match_key)`,
 				marker: "EXISTS",
-			},
-			{
-				name: "composite extended",
-				source: `/* préfix */ SELECT o.id FROM ce_wire_outer AS o WHERE EXISTS (` +
-					`SELECT 1 FROM ce_wire_inner AS i WHERE i.match_key = o.match_key ` +
-					`AND i.active = o.id)`,
-				marker:   "i.active",
-				extended: true,
 			},
 			{
 				name: "nested simple",
@@ -422,16 +393,15 @@ func TestPGWireCorrelatedExistsDroppedDependencyAndRefusalRecovery(t *testing.T)
 		seedCorrelatedExistsWire(t, c)
 		begin := c.query("BEGIN")
 		requireCorrelatedExistsWireCycle(t, c, begin, statusInTx)
-		unsupported := `/* préfix */ SELECT o.id FROM ce_wire_outer AS o WHERE EXISTS (` +
-			`SELECT 1 FROM ce_wire_inner AS i WHERE i.match_key = o.match_key ` +
-			`AND i.active = o.id)`
+		unsupported := `/* préfix */ SELECT o.id FROM ce_wire_outer AS o WHERE o.enabled = TRUE OR EXISTS (` +
+			`SELECT 1 FROM ce_wire_inner AS i WHERE i.match_key = o.match_key)`
 		c.send(msgParse, parseMsg("unsupported-in-transaction", unsupported))
 		c.send(msgSync, nil)
 		failure := c.until(msgReadyForQuery)
 		fields := requireCorrelatedExistsWireFailure(
 			t, failure, sqlstateFeatureNotSupported, statusFailedT,
 		)
-		bytePosition := strings.Index(unsupported, "i.active")
+		bytePosition := strings.Index(unsupported, "EXISTS")
 		wantPosition := utf8.RuneCountInString(unsupported[:bytePosition]) + 1
 		if fields['P'] != strconv.Itoa(wantPosition) {
 			t.Fatalf("failed-transaction position = %q, want %d", fields['P'], wantPosition)

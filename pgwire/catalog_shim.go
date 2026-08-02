@@ -16,8 +16,8 @@ import (
 //
 // A psql "\d users" expands into SQL this dialect refuses on purpose —
 // pg_class joined to pg_namespace, ::regclass casts, OPERATOR(pg_catalog.~)
-// regex matching, COLLATE, correlated subqueries, and scalar functions like
-// format_type and pg_table_is_visible. Building a subquery-capable SQL engine
+// regex matching, COLLATE, correlated catalog-aggregate shapes, and scalar
+// functions like format_type and pg_table_is_visible. Building a query engine
 // over a synthetic pg_catalog to run them would be a different project. But
 // the *questions* those queries ask — which tables exist, which columns, which
 // indexes — are questions the SQL catalog can answer directly. So this file

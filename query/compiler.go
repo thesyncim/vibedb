@@ -49,9 +49,11 @@ type compiler struct {
 	groupBy    []string
 	orderBy    []orderSpec
 	joins      []Join
+	marks      []correlatedMark
 	headers    []string
 	planCols   []planColumn
 	planJoins  []planJoin
+	planMarks  []planMark
 	planOrder  []planOrder
 	groupCols  []int
 	filterCols []int
@@ -66,6 +68,8 @@ type compiler struct {
 	// compiled already points at.
 	joinRegs  []*pathRegistry
 	joinPlans []*plan
+	markRegs  []*pathRegistry
+	markPlans []*plan
 	// joinAliases resolves a qualified path spec to the clause it names. It is
 	// rebuilt per compile, before any path is compiled, because a path's
 	// meaning depends on it.
@@ -197,6 +201,7 @@ func (c *compiler) prepare(dst *Query) {
 	dst.groupBy = c.groupBy[:0]
 	dst.orderBy = c.orderBy[:0]
 	dst.joins = c.joins[:0]
+	dst.marks = c.marks[:0]
 	dst.where = Predicate{}
 	dst.hasWhere = false
 	dst.limit = 0
@@ -210,6 +215,7 @@ func (c *compiler) keep(dst *Query) {
 	c.groupBy = dst.groupBy
 	c.orderBy = dst.orderBy
 	c.joins = dst.joins
+	c.marks = dst.marks
 }
 
 // rewind returns every arena and reused slice to empty while keeping the

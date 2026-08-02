@@ -552,35 +552,10 @@ func TestCorrelatedExistsUnsupportedShapesAreTypedAndPositioned(t *testing.T) {
 		last   bool
 	}{
 		{
-			name: "correlated IN",
-			source: `SELECT o.id FROM ce_outer AS o WHERE o.match_key IN (` +
-				`SELECT i.match_key FROM ce_inner AS i WHERE i.owner = o.id)`,
-			marker: "o.match_key",
-		},
-		{
-			name: "correlated NOT IN",
-			source: `SELECT o.id FROM ce_outer AS o WHERE o.match_key NOT IN (` +
-				`SELECT i.match_key FROM ce_inner AS i WHERE i.owner = o.id)`,
-			marker: "o.match_key",
-		},
-		{
-			name: "correlated scalar subquery",
-			source: `SELECT o.id FROM ce_outer AS o WHERE o.match_key = (` +
-				`SELECT i.match_key FROM ce_inner AS i WHERE i.owner = o.id)`,
-			marker: "o.match_key",
-		},
-		{
 			name: "correlation below OR",
 			source: `SELECT o.id FROM ce_outer AS o WHERE o.enabled = TRUE OR EXISTS (` +
 				`SELECT 1 FROM ce_inner AS i WHERE i.match_key = o.match_key)`,
 			marker: "EXISTS",
-		},
-		{
-			name: "composite correlation",
-			source: `SELECT o.id FROM ce_outer AS o WHERE EXISTS (` +
-				`SELECT 1 FROM ce_inner AS i WHERE i.match_key = o.match_key ` +
-				`AND i.region = o.region)`,
-			marker: "i.region",
 		},
 		{
 			name: "nested predicate subquery",
