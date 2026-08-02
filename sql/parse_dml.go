@@ -130,6 +130,8 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwTruncate):
 		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
 		return p.parseTruncate()
+	case tokenTextEqual(p.tok, "REFRESH"):
+		return p.parseUnsupportedRefreshView()
 	case p.atKeyword(kwValues), p.atKeyword(kwTable):
 		dst.Kind, dst.Select = KindSelect, &p.sel
 		p.out = &p.sel

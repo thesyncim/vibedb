@@ -125,6 +125,12 @@ func (d *database) dropTableLockedContext(
 		}
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, name)
 	}
+	if dependent := d.firstDependentViewLocked(name, false); dependent != "" {
+		return nil, fmt.Errorf(
+			"%w: table %q is required by view %q; DROP dependent views first",
+			ErrDependentObjects, name, dependent,
+		)
+	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
@@ -179,6 +185,14 @@ func (d *database) createTableLockedContext(
 			return result{}, nil
 		}
 		return nil, fmt.Errorf("%w: %q", ErrTableExists, definition.Name)
+	}
+	if _, exists := d.catalog.Views[definition.Name]; exists {
+		if definition.IfNotExists {
+			return result{}, nil
+		}
+		return nil, fmt.Errorf(
+			"%w: relation %q is an ordinary view", ErrTableExists, definition.Name,
+		)
 	}
 	if err := checkCatalogTableCount(len(d.tables) + 1); err != nil {
 		return nil, fmt.Errorf("vibedb: CREATE TABLE %q: %w",

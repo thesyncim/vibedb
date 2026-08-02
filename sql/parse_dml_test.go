@@ -286,6 +286,27 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 }
 
 func TestRejectsUnboundedCatalogDDLSyntax(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		source string
+		kind   Kind
+	}{
+		{"ordinary CREATE VIEW", `CREATE VIEW v AS SELECT a FROM t`, KindCreateView},
+		{"ordinary DROP VIEW", `DROP VIEW v`, KindDropView},
+		{"bounded DROP VIEW", `DROP VIEW IF EXISTS v RESTRICT`, KindDropView},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			statement, err := ParseStatement(test.source)
+			if err != nil {
+				t.Fatalf("ParseStatement(%q) = %v", test.source, err)
+			}
+			if statement.Kind != test.kind {
+				t.Fatalf("ParseStatement(%q) kind = %v, want %v",
+					test.source, statement.Kind, test.kind)
+			}
+		})
+	}
+
 	runDMLRejections(t, []dmlRejection{
 		{"TRUNCATE without a table", `TRUNCATE`, -1, "collection name"},
 		{"TRUNCATE TABLE without a table", `TRUNCATE TABLE`, -1, "collection name"},
@@ -293,9 +314,10 @@ func TestRejectsUnboundedCatalogDDLSyntax(t *testing.T) {
 		{"TRUNCATE restart identity", `TRUNCATE t RESTART IDENTITY`, -1, "identity options"},
 		{"TRUNCATE cascade", `TRUNCATE t CASCADE`, -1, "CASCADE/RESTRICT"},
 		{"TRUNCATE placeholder", `TRUNCATE ?`, -1, "collection name"},
-		{"DROP without an object kind", `DROP`, -1, "TABLE or INDEX"},
-		{"DROP VIEW without a name", `DROP VIEW`, -1, "object name"},
-		{"DROP another object kind", `DROP VIEW v`, -1, "DROP VIEW"},
+		{"DROP without an object kind", `DROP`, -1, "TABLE, INDEX, VIEW, or MATERIALIZED VIEW"},
+		{"DROP VIEW without a name", `DROP VIEW`, -1, "view name"},
+		{"DROP several views", `DROP VIEW v, w`, strings.Index(`DROP VIEW v, w`, ","), "trailing input"},
+		{"DROP another object kind", `DROP SEQUENCE v`, -1, "DROP SEQUENCE"},
 		{"DROP TABLE dangling comma", `DROP TABLE docs,`, -1, "collection name"},
 		{"DROP INDEX without a name", `DROP INDEX`, -1, "index name"},
 		{"DROP INDEX with incomplete IF", `DROP INDEX IF by_age`, -1, "EXISTS after IF"},
@@ -377,8 +399,6 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"CHECK", `CREATE TABLE t (a STRING, CHECK (a > 1))`, -1, "CHECK is not supported"},
 		{"REFERENCES", `CREATE TABLE t (a STRING, FOREIGN KEY (a) REFERENCES u (b))`, -1, "FOREIGN is not supported"},
 		{"CREATE TABLE AS", `CREATE TABLE t AS SELECT a FROM u`, -1, "created empty"},
-		{"CREATE VIEW", `CREATE VIEW v AS SELECT a FROM t`, -1, "CREATE VIEW"},
-
 		{"a unique index", `CREATE UNIQUE INDEX ON t (a)`, -1, "no uniqueness constraint"},
 		{"a partial index", `CREATE INDEX ON t (a) WHERE b = 1`, -1, "cover every document"},
 		{"an index method", `CREATE INDEX ON t (a) USING btree`, -1, "no method to choose"},

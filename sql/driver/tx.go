@@ -53,6 +53,7 @@ type txTable struct {
 type tx struct {
 	conn       *conn
 	tables     map[string]*txTable
+	views      map[string]*viewMeta
 	writeTable string
 	readOnly   bool
 	done       bool
@@ -75,7 +76,8 @@ func (c *conn) beginTx(
 			ErrUnsupportedIsolation, options.Isolation)
 	}
 	transaction := &tx{
-		conn: c, tables: make(map[string]*txTable), readOnly: options.ReadOnly,
+		conn: c, tables: make(map[string]*txTable),
+		readOnly: options.ReadOnly,
 	}
 	if err := lockContext(ctx, &c.db.mu); err != nil {
 		return nil, err
@@ -83,6 +85,12 @@ func (c *conn) beginTx(
 	defer c.db.mu.Unlock()
 	if c.db.closed {
 		return nil, sqldriver.ErrBadConn
+	}
+	if len(c.db.catalog.Views) != 0 {
+		transaction.views = make(map[string]*viewMeta, len(c.db.catalog.Views))
+		for name, meta := range c.db.catalog.Views {
+			transaction.views[name] = meta
+		}
 	}
 	for name, table := range c.db.tables {
 		if err := contextCheckpoint(ctx); err != nil {
@@ -966,6 +974,7 @@ func (t *tx) finish() {
 	// staged documents, validation tapes, or overlay high-water storage.
 	t.conn = nil
 	t.tables = nil
+	t.views = nil
 	t.writeTable = ""
 }
 

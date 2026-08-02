@@ -438,14 +438,33 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
-	if err := c.validateSurfaceContext(ctx, tree); err != nil {
-		return nil, err
-	}
 	s := &stmt{
 		conn:       c,
 		tree:       tree,
 		params:     tree.Params(),
 		paramKinds: statementParamKinds(tree),
+	}
+	if tree.Kind == sqlast.KindCreateView || tree.Kind == sqlast.KindDropView {
+		var ddl *preparedViewDDL
+		ddl, err = c.prepareViewDDL(ctx, src, tree)
+		if err != nil {
+			return nil, err
+		}
+		s.views = &preparedViewState{ddl: ddl}
+		return s, nil
+	}
+	if tree.Kind.IsQuery() {
+		var dependencies []viewDependency
+		dependencies, err = c.expandPreparedViews(ctx, src, tree.Select)
+		if err != nil {
+			return nil, err
+		}
+		if len(dependencies) != 0 {
+			s.views = &preparedViewState{dependencies: dependencies}
+		}
+	}
+	if err := c.validateSurfaceContext(ctx, tree); err != nil {
+		return nil, err
 	}
 	if tree.Kind.IsQuery() {
 		s.query, err = query.PrepareParsedStatement(src, tree.Select)
@@ -497,6 +516,11 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 		}
 	}
 	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	if err := s.validatePreparedViewDependencies(ctx); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 	return s, nil

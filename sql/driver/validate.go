@@ -86,7 +86,7 @@ func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
 		relation := &selectStmt.From[i]
 		switch relation.Kind {
 		case sqlast.RelationCollection:
-			if _, exists := c.db.tables[relation.Name]; !exists {
+			if !c.selectTableExists(relation.Name) {
 				return missingTableDependency(
 					relation.Name, relation.Pos, false,
 				)
@@ -116,6 +116,16 @@ func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
 		return err
 	}
 	return validateExprSubqueries(selectStmt.Having, c.validateSelectTables)
+}
+
+func (c *conn) selectTableExists(name string) bool {
+	if c.tx != nil {
+		if _, exists := c.tx.tables[name]; exists {
+			return true
+		}
+	}
+	_, exists := c.db.tables[name]
+	return exists
 }
 
 func validateExprSubqueries(

@@ -43,6 +43,8 @@ const (
 	sqlstateAmbiguousColumn            = "42702"
 	sqlstateAmbiguousAlias             = "42P09"
 	sqlstateDuplicateAlias             = "42712"
+	sqlstateDuplicateColumn            = "42701"
+	sqlstateDependentObjectsStillExist = "2BP01"
 	sqlstateInvalidColumnReference     = "42P10"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
@@ -171,8 +173,10 @@ func asPGError(err error) *pgError {
 		errors.Is(err, query.ErrJoinPairBudget) ||
 		errors.Is(err, query.ErrWorkBudget) ||
 		errors.Is(err, query.ErrSpillBudget) ||
+		errors.Is(err, query.ErrSQLViewExpansionLimit) ||
 		errors.Is(err, sqldriver.ErrCatalogTooLarge) ||
 		errors.Is(err, sqldriver.ErrTooManyTables) ||
+		errors.Is(err, sqldriver.ErrTooManyViews) ||
 		errors.Is(err, sqldriver.ErrTooManyRetiredTables) ||
 		errors.Is(err, sqldriver.ErrTooManyStorageFiles) ||
 		errors.Is(err, sqldriver.ErrArgumentsTooLarge) ||
@@ -208,12 +212,23 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateInvalidParameterValue, err.Error())
 	case errors.Is(err, query.ErrSetTreeArity):
 		return newError(sqlstateSyntaxError, err.Error())
+	case errors.Is(err, query.ErrSQLViewCycle):
+		return newError(sqlstateInvalidObjectDefinition, err.Error())
 	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
 		return newError(sqlstateStatementCompletionUnknown, err.Error())
 	case errors.Is(err, sqldriver.ErrTableNotFound):
 		return newError(sqlstateUndefinedTable, err.Error())
+	case errors.Is(err, sqldriver.ErrViewNotFound),
+		errors.Is(err, sqldriver.ErrViewChanged):
+		return newError(sqlstateUndefinedTable, err.Error())
 	case errors.Is(err, sqldriver.ErrTableExists):
 		return newError(sqlstateDuplicateTable, err.Error())
+	case errors.Is(err, sqldriver.ErrViewExists):
+		return newError(sqlstateDuplicateTable, err.Error())
+	case errors.Is(err, sqldriver.ErrDependentObjects):
+		return newError(sqlstateDependentObjectsStillExist, err.Error())
+	case errors.Is(err, sqldriver.ErrDuplicateViewColumn):
+		return newError(sqlstateDuplicateColumn, err.Error())
 	case errors.Is(err, sqldriver.ErrIndexExists):
 		return newError(sqlstateDuplicateObject, err.Error())
 	case errors.Is(err, sqldriver.ErrIndexNotFound):

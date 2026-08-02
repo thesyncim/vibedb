@@ -1385,6 +1385,10 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 		return "TRUNCATE TABLE"
 	case sqlast.KindDropIndex:
 		return "DROP INDEX"
+	case sqlast.KindCreateView:
+		return "CREATE VIEW"
+	case sqlast.KindDropView:
+		return "DROP VIEW"
 	default:
 		return kind.String()
 	}
@@ -1393,7 +1397,8 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 func runtimeKindIsDDL(kind sqlast.Kind) bool {
 	switch kind {
 	case sqlast.KindCreateTable, sqlast.KindCreateIndex, sqlast.KindDropTable,
-		sqlast.KindTruncate, sqlast.KindDropIndex:
+		sqlast.KindTruncate, sqlast.KindDropIndex,
+		sqlast.KindCreateView, sqlast.KindDropView:
 		return true
 	default:
 		return false
