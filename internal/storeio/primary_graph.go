@@ -349,7 +349,18 @@ func planCompactPrimaryLeaves(
 			return extent, extent <= maxExtent, nil
 		}
 		count, extent := 0, 0
-		for lo, high := 1, hi; lo <= high; {
+		// Log-like compact windows normally fit all 4,096 rows. Prove that
+		// common case with one encoding before paying the bounded binary search;
+		// oversized/high-cardinality windows still select the exact same largest
+		// fitting prefix below.
+		candidate, fullWindowFits, err := fits(hi)
+		if err != nil {
+			return nil, err
+		}
+		if fullWindowFits {
+			count, extent = hi, candidate
+		}
+		for lo, high := 1, hi-1; count == 0 && lo <= high; {
 			mid := (lo + high) / 2
 			candidate, ok, err := fits(mid)
 			if err != nil {
