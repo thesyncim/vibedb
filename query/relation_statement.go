@@ -167,10 +167,14 @@ func (s *Statement) validateRelationPath(path *sqlast.PathExpr) error {
 	}
 	_, err := s.resolveRelationColumnAt(path.Source, path.Segments[0].Key)
 	if column, ok := err.(*RelationColumnError); ok {
-		// Diagnostics identify the offending output name, not its optional
-		// range qualifier. Positions are byte offsets, so this remains exact
-		// in source containing multi-byte UTF-8 before the reference.
-		column.Pos = relationColumnPosition(s.text, path.Pos)
+		// Preserve the established ambiguous-reference contract at the start of
+		// the qualified path. For an undefined output, point at the missing
+		// output token itself. Both are UTF-8 byte offsets here and are converted
+		// to protocol character positions only by the adapter.
+		column.Pos = path.Pos
+		if column.Matches == 0 {
+			column.Pos = relationColumnPosition(s.text, path.Pos)
+		}
 	}
 	return err
 }

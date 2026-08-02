@@ -35,14 +35,14 @@ func TestSQLScalarDerivedColumnResolutionIsPositioned(t *testing.T) {
 			sql: `SELECT "δ".id + 1 AS value FROM (` +
 				`SELECT left_id AS id, right_id AS id FROM docs` +
 				`) AS "δ"`,
-			column: "id", matches: 2, is: ErrAmbiguousColumn, marker: "id + 1",
+			column: "id", matches: 2, is: ErrAmbiguousColumn, marker: `"δ".id`,
 		},
 		{
 			name: "predicate duplicate alias ambiguous",
 			sql: `SELECT 1 AS value FROM (` +
 				`SELECT left_id AS id, right_id AS id FROM docs` +
 				`) AS "δ" WHERE "δ".id + 1 > 0`,
-			column: "id", matches: 2, is: ErrAmbiguousColumn, marker: "id + 1",
+			column: "id", matches: 2, is: ErrAmbiguousColumn, marker: `"δ".id`,
 		},
 	}
 	for _, test := range tests {
