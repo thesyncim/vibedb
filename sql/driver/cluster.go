@@ -160,32 +160,58 @@ func (c *conn) routeInsertDocuments(table string, documents [][]byte) error {
 	if binding == nil {
 		return nil
 	}
-	_, err := insertPreflight(binding, c.clusterRouter(), documents)
-	return err
+	state := insertPreflightState{text: c.pointRaw[:0]}
+	defer func() { c.pointRaw = state.text[:0] }()
+	for i := range documents {
+		if err := state.add(binding, documents[i], i); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // routeInsertSeeds routes the staged seeds of a non-transactional placed insert.
 func (c *conn) routeInsertSeeds(table string, seeds []seedDocument) error {
-	if c.clusterBinding(table) == nil {
+	return c.routeInsertSeedsWithBinding(c.clusterBinding(table), seeds)
+}
+
+func (c *conn) routeInsertSeedsWithBinding(
+	binding *placementBinding,
+	seeds []seedDocument,
+) error {
+	if binding == nil {
 		return nil
 	}
-	documents := make([][]byte, len(seeds))
+	state := insertPreflightState{text: c.pointRaw[:0]}
+	defer func() { c.pointRaw = state.text[:0] }()
 	for i := range seeds {
-		documents[i] = seeds[i].document
+		if err := state.add(binding, seeds[i].document, i); err != nil {
+			return err
+		}
 	}
-	return c.routeInsertDocuments(table, documents)
+	return nil
 }
 
 // routeInsertStaged routes the staged documents of a transactional placed insert.
 func (c *conn) routeInsertStaged(table string, staged []stagedTxMutation) error {
-	if c.clusterBinding(table) == nil {
+	return c.routeInsertStagedWithBinding(c.clusterBinding(table), staged)
+}
+
+func (c *conn) routeInsertStagedWithBinding(
+	binding *placementBinding,
+	staged []stagedTxMutation,
+) error {
+	if binding == nil {
 		return nil
 	}
-	documents := make([][]byte, len(staged))
+	state := insertPreflightState{text: c.pointRaw[:0]}
+	defer func() { c.pointRaw = state.text[:0] }()
 	for i := range staged {
-		documents[i] = staged[i].document
+		if err := state.add(binding, staged[i].document, i); err != nil {
+			return err
+		}
 	}
-	return c.routeInsertDocuments(table, documents)
+	return nil
 }
 
 // routeUpdate enforces version 1's write rules for a placed whole-document
@@ -203,7 +229,11 @@ func (c *conn) routeUpdate(statement *query.DMLStatement, args []any, document [
 	if err != nil {
 		return err
 	}
-	return checkShardKeyImmutable(binding, router, route, document)
+	text, err := checkShardKeyImmutableInto(
+		binding, router, route, document, c.pointRaw[:0],
+	)
+	c.pointRaw = text[:0]
+	return err
 }
 
 // routeDelete enforces version 1's single-shard-only rule for a placed DELETE:

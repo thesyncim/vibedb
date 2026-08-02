@@ -497,9 +497,24 @@ type Collection struct {
 	batchJournalEntries      []storeio.RecoveryBatchEntry
 	batchPrimaryAdmitted     []storeio.PageRef
 	batchPrimaryPrevVolatile []storeio.PageRef
-	batchPrimaryLeafArena    []byte
-	batchPrimarySplitKey     []byte
-	batchPrimaryFileEnd      uint64
+	// batchPrimaryOverflowVolatile and batchPrimaryOverflowDurable are the old
+	// out-of-line chains superseded by the current batch. The former are
+	// memory-only frames retired under the publication reader fence; the latter
+	// remain on device and join the next checkpoint's durable retirement set.
+	// Both slices are writer-owned, reset for every plan, and retain their
+	// high-water storage so a warmed mixed overflow batch allocates no metadata.
+	batchPrimaryOverflowVolatile []storeio.PageRef
+	batchPrimaryOverflowDurable  []storeio.PageRef
+	batchPrimaryLeafArena        []byte
+	batchPrimarySplitKey         []byte
+	// The overflow pre-plan lays every new chain below the rewritten leaves and
+	// records the exact visible high-water marks. These are published only after
+	// all chains, leaves, exact-index records, and the WAL fence have succeeded.
+	batchPrimaryOverflowFileEnd uint64
+	batchPrimaryNextLogicalID   uint64
+	batchPrimaryOverflowPages   int
+	batchPrimaryOverflowDirty   uint64
+	batchPrimaryFileEnd         uint64
 }
 
 // Stats is a point-in-time resource and I/O accounting snapshot.

@@ -331,16 +331,26 @@ func selectReferencesCatalogView(
 	tree *sqlast.SelectStmt,
 	views map[string]*viewMeta,
 ) bool {
+	_, _, exists := firstCatalogViewReference(tree, views)
+	return exists
+}
+
+func firstCatalogViewReference(
+	tree *sqlast.SelectStmt,
+	views map[string]*viewMeta,
+) (string, int, bool) {
 	if tree == nil {
-		return false
+		return "", 0, false
 	}
 	if tree.Set != nil {
-		return setReferencesCatalogView(tree.Set.Root, views)
+		return firstSetCatalogViewReference(tree.Set.Root, views)
 	}
 	if tree.With != nil {
 		for i := range tree.With.CTEs {
-			if selectReferencesCatalogView(tree.With.CTEs[i].Query, views) {
-				return true
+			if name, pos, exists := firstCatalogViewReference(
+				tree.With.CTEs[i].Query, views,
+			); exists {
+				return name, pos, true
 			}
 		}
 	}
@@ -349,54 +359,142 @@ func selectReferencesCatalogView(
 		switch reference.Kind {
 		case sqlast.RelationCollection:
 			if _, exists := views[reference.Name]; exists {
-				return true
+				return reference.Name, reference.Pos, true
 			}
 		case sqlast.RelationDerived:
-			if selectReferencesCatalogView(reference.Query, views) {
-				return true
+			if name, pos, exists := firstCatalogViewReference(
+				reference.Query, views,
+			); exists {
+				return name, pos, true
 			}
 		}
 	}
-	return exprReferencesCatalogView(tree.Where, views) ||
-		exprReferencesCatalogView(tree.Having, views)
+	if name, pos, exists := firstExprCatalogViewReference(tree.Where, views); exists {
+		return name, pos, true
+	}
+	return firstExprCatalogViewReference(tree.Having, views)
 }
 
-func setReferencesCatalogView(
+func firstSetCatalogViewReference(
 	expression *sqlast.SetExpr,
 	views map[string]*viewMeta,
-) bool {
+) (string, int, bool) {
 	if expression == nil {
-		return false
+		return "", 0, false
 	}
 	switch expression.Kind {
 	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
-		return selectReferencesCatalogView(expression.Select, views)
+		return firstCatalogViewReference(expression.Select, views)
 	case sqlast.SetBinaryExpr:
-		return setReferencesCatalogView(expression.Left, views) ||
-			setReferencesCatalogView(expression.Right, views)
+		if name, pos, exists := firstSetCatalogViewReference(
+			expression.Left, views,
+		); exists {
+			return name, pos, true
+		}
+		return firstSetCatalogViewReference(expression.Right, views)
 	case sqlast.SetGroupExpr:
-		return setReferencesCatalogView(expression.Child, views)
+		return firstSetCatalogViewReference(expression.Child, views)
 	default:
-		return false
+		return "", 0, false
 	}
 }
 
-func exprReferencesCatalogView(
+func firstExprCatalogViewReference(
 	expression *sqlast.Expr,
 	views map[string]*viewMeta,
-) bool {
+) (string, int, bool) {
 	if expression == nil {
-		return false
+		return "", 0, false
 	}
-	if selectReferencesCatalogView(expression.Subquery, views) {
-		return true
+	if name, pos, exists := firstCatalogViewReference(
+		expression.Subquery, views,
+	); exists {
+		return name, pos, true
 	}
 	for i := range expression.Kids {
-		if exprReferencesCatalogView(expression.Kids[i], views) {
-			return true
+		if name, pos, exists := firstExprCatalogViewReference(
+			expression.Kids[i], views,
+		); exists {
+			return name, pos, true
 		}
 	}
-	return false
+	return "", 0, false
+}
+
+func rejectUnexpandedDMLViewReferences(
+	source string,
+	statement *sqlast.Statement,
+	views map[string]*viewMeta,
+) error {
+	if statement == nil {
+		return nil
+	}
+	var trees [2]*sqlast.SelectStmt
+	switch statement.Kind {
+	case sqlast.KindUpdate:
+		trees[0], trees[1] = statement.Update.Filter, statement.Update.Returning
+	case sqlast.KindDelete:
+		trees[0], trees[1] = statement.Delete.Filter, statement.Delete.Returning
+	default:
+		return nil
+	}
+	if len(views) == 0 {
+		return nil
+	}
+	for _, tree := range trees {
+		name, pos, exists := firstCatalogViewReference(tree, views)
+		if !exists {
+			continue
+		}
+		return sqlast.NewFeatureNotSupportedError(
+			source, pos,
+			fmt.Sprintf("DML query source references durable view %q; view expansion is not yet wired into atomic mutation source planning", name),
+		)
+	}
+	return nil
+}
+
+// rejectReboundPreparedDMLViewReferences is the execution-time twin of
+// rejectUnexpandedDMLViewReferences. Preparation has already established that
+// every nested relation is physical. If one of those authored names now maps
+// to a durable view, continuing would run a stale physical mutation plan.
+//
+// The caller has already validated the mutation target, so a target-kind error
+// remains 42809 and this source-generation error remains positioned 0A000.
+// The all-nil/no-view and ordinary no-subquery paths allocate nothing.
+func rejectReboundPreparedDMLViewReferences(
+	statement *sqlast.Statement,
+	views map[string]*viewMeta,
+) error {
+	if statement == nil || len(views) == 0 {
+		return nil
+	}
+	var (
+		operation string
+		trees     [2]*sqlast.SelectStmt
+	)
+	switch statement.Kind {
+	case sqlast.KindInsert:
+		operation = "INSERT"
+		if statement.Insert != nil {
+			trees[0] = statement.Insert.Source
+		}
+	case sqlast.KindUpdate:
+		operation = "UPDATE"
+		trees[0], trees[1] = statement.Update.Filter, statement.Update.Returning
+	case sqlast.KindDelete:
+		operation = "DELETE"
+		trees[0], trees[1] = statement.Delete.Filter, statement.Delete.Returning
+	default:
+		return nil
+	}
+	for _, tree := range trees {
+		name, pos, exists := firstCatalogViewReference(tree, views)
+		if exists {
+			return newPreparedDMLViewSourceError(operation, name, pos)
+		}
+	}
+	return nil
 }
 
 func (s *stmt) validateTransactionViewDependencies() error {

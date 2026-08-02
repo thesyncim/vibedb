@@ -61,6 +61,7 @@ const (
 	statementScalarUnary
 	statementScalarBinary
 	statementScalarCast
+	statementScalarCaseNode
 )
 
 type statementScalarNode struct {
@@ -70,6 +71,8 @@ type statementScalarNode struct {
 	left       int32
 	right      int32
 	dependency int32
+	caseIndex  int32
+	skip       int32
 	operand    sqlast.Operand
 	pos        int
 	bound      scalar
@@ -83,12 +86,17 @@ type statementScalarDependencySpec struct {
 }
 
 type statementScalarPredicate struct {
-	kind    sqlast.ExprKind
-	op      sqlast.CmpOp
-	left    int32
-	right   int32
-	kids    []int32
-	negated bool
+	kind     sqlast.ExprKind
+	op       sqlast.CmpOp
+	left     int32
+	right    int32
+	kids     []int32
+	negated  bool
+	pos      int
+	start    int32
+	end      int32
+	leftDom  scalarCaseDomain
+	rightDom scalarCaseDomain
 }
 
 type statementScalarValue struct {
@@ -105,20 +113,24 @@ type statementScalarValue struct {
 // only the pre-existing nil nested pointer and never execute this code.
 type statementScalar struct {
 	deps           []statementScalarDependencySpec
+	semanticDeps   []statementScalarDependencySpec
 	nodes          []statementScalarNode
 	predicates     []statementScalarPredicate
 	predRoots      []int32
+	cases          []statementScalarCase
+	caseArms       []statementScalarCaseArm
 	predicateNodes int
 	outputs        []int32
 	types          []ValueType
 
-	values       []statementScalarValue
-	outputValues []statementScalarValue
-	evalArena    []byte
-	resultArena  []byte
-	decimal      sqlScalarDecimal
-	cardinality  bool
-	hasAggregate bool
+	values             []statementScalarValue
+	outputValues       []statementScalarValue
+	evalArena          []byte
+	resultArena        []byte
+	decimal            sqlScalarDecimal
+	cardinality        bool
+	groupedCardinality bool
+	hasAggregate       bool
 }
 
 func (s *Statement) scalarStatement() *statementScalar {
@@ -203,12 +215,14 @@ func (s *Statement) prepareScalar() error {
 		runtime.outputs = append(runtime.outputs, root)
 		runtime.types = append(runtime.types, runtime.nodeType(root))
 	}
-	if len(runtime.deps) == 0 {
-		// One hidden whole-document projection carries source cardinality. It is
-		// never interpreted and is removed before publication.
+	if len(runtime.deps) == 0 && !runtime.hasSemanticAggregate() {
+		// One hidden payload-free projection requests source cardinality. The
+		// query planner materializes it for an ungrouped scan and treats it as a
+		// metadata-only marker under GROUP BY, whose RowCount already is exact.
 		runtime.deps = append(runtime.deps, statementScalarDependencySpec{})
 		runtime.cardinality = true
 	}
+	runtime.groupedCardinality = runtime.cardinality && len(s.tree.GroupBy) != 0
 	s.ensureNested().scalar = runtime
 	return nil
 }
@@ -226,8 +240,34 @@ func scalarHasAggregate(expr *sqlast.ScalarExpr) bool {
 	if expr == nil {
 		return false
 	}
-	return expr.Kind == sqlast.ScalarAggregate || scalarHasAggregate(expr.Left) ||
-		scalarHasAggregate(expr.Right)
+	if expr.Kind == sqlast.ScalarAggregate || scalarHasAggregate(expr.Left) ||
+		scalarHasAggregate(expr.Right) || scalarHasAggregate(expr.Else) {
+		return true
+	}
+	for i := range expr.Whens {
+		if scalarHasAggregate(expr.Whens[i].Match) ||
+			scalarHasAggregate(expr.Whens[i].Result) ||
+			exprPredicateHasAggregate(expr.Whens[i].Predicate) {
+			return true
+		}
+	}
+	return false
+}
+
+func exprPredicateHasAggregate(expr *sqlast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.Agg != sqlast.AggNone || scalarHasAggregate(expr.ScalarLeft) ||
+		scalarHasAggregate(expr.ScalarRight) {
+		return true
+	}
+	for _, kid := range expr.Kids {
+		if exprPredicateHasAggregate(kid) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstScalarStatementPos(tree *sqlast.SelectStmt) int {
@@ -306,6 +346,8 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		r.nodes = append(r.nodes, statementScalarNode{
 			kind: statementScalarCast, cast: expr.Cast, left: left, right: -1, pos: expr.Pos,
 		})
+	case sqlast.ScalarCase:
+		return r.compileCase(s, expr)
 	default:
 		return 0, fmt.Errorf("query: invalid scalar expression kind %d", expr.Kind)
 	}
@@ -443,6 +485,12 @@ func (r *statementScalar) buildColumns(s *Statement, args []any) error {
 	}
 	for i := range r.deps {
 		dep := &r.deps[i]
+		if r.cardinality && i == 0 {
+			s.q.columns = append(s.q.columns, Column{
+				header: "__scalar_cardinality", cardinalityOnly: true,
+			})
+			continue
+		}
 		header := dep.spec
 		if dep.agg != sqlast.AggNone {
 			header = s.header(aggName(dep.agg), dep.spec)
@@ -451,7 +499,47 @@ func (r *statementScalar) buildColumns(s *Statement, args []any) error {
 			agg: aggKind(dep.agg), spec: dep.spec, header: header,
 		})
 	}
+	semanticAggregate := false
+	for i := range r.semanticDeps {
+		dep := &r.semanticDeps[i]
+		if dep.agg != sqlast.AggNone {
+			semanticAggregate = true
+			continue
+		}
+		if r.hasLiveDependency(dep) {
+			continue
+		}
+		s.q.columns = append(s.q.columns, Column{
+			spec: dep.spec, header: dep.spec, semanticOnly: true,
+		})
+	}
+	if semanticAggregate && !r.hasAggregate {
+		// COUNT(*) supplies aggregate/group cardinality without reading or
+		// reducing a statically unreachable aggregate argument.
+		s.q.columns = append(s.q.columns, Column{
+			agg: aggCount, header: "__scalar_aggregate", semanticOnly: true,
+		})
+	}
 	return nil
+}
+
+func (r *statementScalar) hasSemanticAggregate() bool {
+	for i := range r.semanticDeps {
+		if r.semanticDeps[i].agg != sqlast.AggNone {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *statementScalar) hasLiveDependency(candidate *statementScalarDependencySpec) bool {
+	for i := range r.deps {
+		dep := &r.deps[i]
+		if dep.agg == candidate.agg && dep.spec == candidate.spec {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *statementScalar) nodeType(root int32) ValueType {
@@ -496,6 +584,8 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 		default:
 			return TypeAny
 		}
+	case statementScalarCaseNode:
+		return r.cases[node.caseIndex].domain.schemaType()
 	default:
 		return TypeAny
 	}
@@ -535,6 +625,8 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 		default:
 			return OutputJSON
 		}
+	case statementScalarCaseNode:
+		return r.cases[node.caseIndex].domain.representation()
 	default:
 		return OutputJSON
 	}
@@ -547,9 +639,19 @@ func (r *statementScalar) evalNodes(
 	budget *aggregateBudget,
 	intermediate *intermediateBudget,
 	intermediateCharge *int64,
+	cancel *CancelFlag,
 ) error {
 	r.values = resize(r.values, len(r.nodes))
 	for i := start; i < end; i++ {
+		// One source row may carry the parser's full bounded scalar program
+		// (many output expressions, each with nested arithmetic). Row-level
+		// checkpoints alone would make cancellation wait for that whole program.
+		// The nil flag remains one predictable branch and the armed atomic load is
+		// amortized across cancellationCheckMask+1 nodes.
+		if err := cancellationCheckpoint(cancel, i-start); err != nil {
+			return err
+		}
+		write := i
 		node := &r.nodes[i]
 		var value statementScalarValue
 		switch node.kind {
@@ -620,8 +722,21 @@ func (r *statementScalar) evalNodes(
 			if err != nil {
 				return err
 			}
+		case statementScalarCaseNode:
+			var err error
+			value, err = r.evalCase(
+				result, row, node, arena, budget,
+				intermediate, intermediateCharge, cancel,
+			)
+			if err != nil {
+				return err
+			}
+			if node.skip <= int32(i) || int(node.skip) > end {
+				return fmt.Errorf("query: malformed scalar CASE program range")
+			}
+			i = int(node.skip) - 1
 		}
-		r.values[i] = value
+		r.values[write] = value
 	}
 	return nil
 }
@@ -630,7 +745,7 @@ func (r *statementScalar) validateResult(result *Result) error {
 	if result == nil {
 		return &ScalarResultShapeError{Dependency: 0, Rows: 0, Cells: -1}
 	}
-	for dependency := range r.deps {
+	for dependency := 0; dependency < r.resultDependencyColumns(); dependency++ {
 		if dependency >= len(result.Columns) {
 			return &ScalarResultShapeError{
 				Dependency: dependency, Rows: result.RowCount, Cells: -1,
@@ -643,6 +758,22 @@ func (r *statementScalar) validateResult(result *Result) error {
 		}
 	}
 	return nil
+}
+
+func (r *statementScalar) resultDependencyColumns() int {
+	if r.groupedCardinality {
+		return 0
+	}
+	return len(r.deps)
+}
+
+// clearValues severs every borrowed source/result view retained by the lazy
+// scalar program while preserving the warmed slices themselves. CASE leaves
+// unselected nodes untouched, so clearing only the nodes evaluated by the last
+// row would let an earlier branch pin a Segment, snapshot page, or arena.
+func (r *statementScalar) clearValues() {
+	clear(r.values)
+	clear(r.outputValues)
 }
 
 var zeroNumberBytes = []byte("0")
@@ -868,6 +999,7 @@ func (r *statementScalar) execute(
 	intermediateResource string,
 ) (cursor Cursor, err error) {
 	result := &exec.Result
+	defer r.clearValues()
 	defer func() {
 		if err != nil {
 			result.abortResult()
@@ -917,6 +1049,7 @@ func (r *statementScalar) execute(
 		if err := r.evalNodes(
 			result, row, 0, r.predicateNodes, &r.evalArena,
 			&exec.Workspace.aggregateBudget, &frame.intermediate, &dynamicCharge,
+			options.Cancel,
 		); err != nil {
 			frame.intermediate.release(dynamicCharge)
 			result.abortResult()
@@ -962,7 +1095,7 @@ func (r *statementScalar) execute(
 	// Dependency columns remain at input cardinality until every input row has
 	// been evaluated. Shrinking an overlapping output column here would make a
 	// filtered/tail result overwrite the very dependency rows it still needs.
-	for column := len(r.deps); column < len(r.outputs); column++ {
+	for column := r.resultDependencyColumns(); column < len(r.outputs); column++ {
 		cells := result.Columns[column].Cells
 		if cap(cells) < rows {
 			cells = append(cells, make([]Cell, rows-len(cells))...)
@@ -984,6 +1117,7 @@ func (r *statementScalar) execute(
 		if err := r.evalNodes(
 			result, row, 0, r.predicateNodes, &r.evalArena,
 			&exec.Workspace.aggregateBudget, &frame.intermediate, &predicateCharge,
+			options.Cancel,
 		); err != nil {
 			frame.intermediate.release(predicateCharge)
 			result.abortResult()
@@ -1008,6 +1142,7 @@ func (r *statementScalar) execute(
 		if err := r.evalNodes(
 			result, row, r.predicateNodes, len(r.nodes), &r.evalArena,
 			&exec.Workspace.aggregateBudget, &frame.intermediate, &outputCharge,
+			options.Cancel,
 		); err != nil {
 			frame.intermediate.release(outputCharge)
 			result.abortResult()
@@ -1037,8 +1172,14 @@ func (r *statementScalar) execute(
 		result.Columns[column].Header = s.names[column]
 	}
 	for column := len(r.outputs); column < len(result.Columns); column++ {
-		clear(result.Columns[column].Cells)
-		result.Columns[column] = ResultColumn{}
+		// Keep hidden dependency-column capacity behind the truncated public
+		// result. The next execution's base projection expands Columns and reuses
+		// these exact slices; clearing cells and metadata drops every borrowed
+		// document reference without turning a CASE that reads more dependencies
+		// than it returns into one allocation per hidden column per execution.
+		cells := result.Columns[column].Cells
+		clear(cells)
+		result.Columns[column] = ResultColumn{Cells: cells[:0]}
 	}
 	result.Columns = result.Columns[:len(r.outputs)]
 	result.RowCount = rows

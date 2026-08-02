@@ -1648,6 +1648,9 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 		t.Fatalf("faulted carry Put = %v, fired=%v",
 			carryErr, fault.Faulted())
 	}
+	if errors.Is(carryErr, ErrCommitOutcomeUnknown) {
+		t.Fatalf("pre-sync delta append failure misclassified as unknown: %v", carryErr)
+	}
 	if got := fault.Appends(); got != beforeAppends+1 {
 		t.Fatalf("carry append attempts = %d, want 1", got-beforeAppends)
 	}
@@ -1685,6 +1688,62 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 		t, options, image, baseWant, baseGroups, baseGeneration,
 		"carry-append-failure",
 	)
+}
+
+// TestBufferedJournalDeltaBarrierFailureOutcomeUnknownMayReplay covers the
+// ordinary buffered-visible Flush lane's true append-then-sync boundary. A
+// complete delta record is present when its fence returns EIO, so the failed
+// Flush cannot say whether that logical generation will replay after reopen.
+func TestBufferedJournalDeltaBarrierFailureOutcomeUnknownMayReplay(t *testing.T) {
+	options := journalDeltaTestOptions()
+	getFault, restoreFault := installJournalFaultSeam(t)
+	defer restoreFault()
+	coll := buildTemplateHeavyOverlayCollection(t, t.TempDir(), 320, options)
+	fault := getFault()
+	if fault == nil {
+		t.Fatal("journal fault seam was not installed")
+	}
+	path := coll.file.Name()
+	keyString := templateHeavyOverlayKey(20)
+	key := []byte(keyString)
+	raw := journalDeltaGroupDoc(20, 71)
+	if created, err := coll.Put(key, raw); err != nil || created {
+		t.Fatalf("Put = %v,%v, want replacement", created, err)
+	}
+	target := coll.Generation()
+	beforeAppends, beforeSyncs := fault.Appends(), fault.Syncs()
+	fault.Program(storeio.JournalFaultPlan{
+		Phase:     storeio.JournalFaultSyncError,
+		SyncIndex: beforeSyncs,
+	})
+
+	flushErr := coll.Flush()
+	requireUnknownJournalOutcome(t, flushErr)
+	if !fault.Faulted() {
+		t.Fatal("programmed delta journal sync fault never fired")
+	}
+	if got := fault.Appends(); got != beforeAppends+1 {
+		t.Fatalf("delta appends = %d, want %d", got, beforeAppends+1)
+	}
+	if got := fault.Syncs(); got != beforeSyncs+1 {
+		t.Fatalf("delta syncs = %d, want %d", got, beforeSyncs+1)
+	}
+	if got := coll.journalDeltaGeneration.Load(); got >= target {
+		t.Fatalf("failed delta barrier advanced durable watermark to %d, target %d",
+			got, target)
+	}
+	requireUnknownJournalOutcome(t, coll.PersistenceError())
+
+	image := captureJournalImage(t, path)
+	_ = coll.Close()
+	recovered := reopenJournalImage(t, options, image)
+	requireJournalKey(t, recovered, keyString, journalDeltaCanonical(t, raw))
+	got := primaryExactTestKeys(
+		t, recovered, "group", primaryExactTestNeedle(t, "71"),
+	)
+	if !slices.Equal(got, []string{keyString}) {
+		t.Fatalf("replayed exact index group=71: got %v want [%s]", got, keyString)
+	}
 }
 
 // TestBufferedJournalDeltaSyncFailureIsSticky proves the logical durable
@@ -1731,6 +1790,12 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	if flushErr == nil || !fault.Faulted() {
 		t.Fatalf("faulted delta Flush = %v, fired=%v", flushErr, fault.Faulted())
 	}
+	// This scheduled physical-drain path has already made target durable in the
+	// primary root; the fault is the following journal recycle barrier, not an
+	// append-then-sync acknowledgement. Its data outcome is therefore definite.
+	if errors.Is(flushErr, ErrCommitOutcomeUnknown) {
+		t.Fatalf("post-root recycle failure misclassified as unknown: %v", flushErr)
+	}
 	if got := fault.Appends(); got != beforeAppends {
 		t.Fatalf("suffix appends = %d, want 0", got-beforeAppends)
 	}
@@ -1748,6 +1813,8 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	}
 	if persistence := coll.PersistenceError(); !errors.Is(flushErr, persistence) {
 		t.Fatalf("PersistenceError=%v, Flush=%v", persistence, flushErr)
+	} else if errors.Is(persistence, ErrCommitOutcomeUnknown) {
+		t.Fatalf("sticky recycle poison misclassified as unknown: %v", persistence)
 	}
 	if _, err := coll.Put(key, journalDeltaGroupDoc(20, 41)); !errors.Is(err, flushErr) {
 		t.Fatalf("Put after poison = %v, want %v", err, flushErr)

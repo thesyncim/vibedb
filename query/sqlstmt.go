@@ -159,6 +159,8 @@ type nestedStatements struct {
 	driving      string
 }
 
+const statementRootIntermediateResource = "query source result"
+
 type subqueryUse uint8
 
 const (
@@ -587,6 +589,78 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// runIntoFrame returns, and the result cursor borrows only Exec.Result.
 	frame.args = nil
 	return cursor, err
+}
+
+// RunIntermediateInto binds and executes s like [Statement.RunInto], but makes
+// its final Result part of the statement-wide IntermediateBytes allowance.
+// This is the execution boundary for a query result that immediately feeds a
+// larger atomic operation, such as INSERT ... SELECT.
+//
+// The returned retained byte count is exact for the successful execution: it
+// includes e.Result plus every relation, CTE, set, window, join, and scalar
+// dependency spool that remains live while the cursor is consumed. A caller
+// starts its next staging account with that count and keeps it admitted until
+// it is finished with the cursor. Historical intermediates already released by
+// the query are not included; their peaks were enforced while they were live.
+//
+// ResultRows and ResultBytes retain their ordinary caller-visible semantics.
+// If both byte limits would reject the same growth, the stricter limit selects
+// the error type and ResultBytes wins an equal-limit tie. Rejected and canceled
+// executions return a zero count and expose no partial Result. The method is
+// single-consumer and allocation-free after the same warm-up as RunInto.
+func (s *Statement) RunIntermediateInto(
+	e *Exec,
+	src Source,
+	args []any,
+) (cursor Cursor, retained int64, err error) {
+	if e == nil {
+		return Cursor{}, 0, fmt.Errorf(
+			"query: RunIntermediateInto requires a non-nil Exec",
+		)
+	}
+	// Match RunInto's failed-attempt contract before validating either budget.
+	clearExecBorrowedViews(e)
+	e.Stats = ExecStats{}
+	limit, err := normalizeIntermediateBytes(e.Options)
+	if err != nil {
+		return Cursor{}, 0, err
+	}
+
+	if s.nested == nil {
+		e.Result.beginRootIntermediate(nil, limit)
+		defer e.Result.endRootIntermediate()
+		cursor, err = s.runDirectInto(e, src, args)
+		if err != nil {
+			return Cursor{}, 0, err
+		}
+		return cursor, e.Result.resultBytesUsed, nil
+	}
+
+	s.discardRelations()
+	frame := &s.nested.frame
+	if err = frame.begin(e.Options); err != nil {
+		return Cursor{}, 0, err
+	}
+	frame.args = args
+	e.Result.beginRootIntermediate(&frame.intermediate, 0)
+	defer func() {
+		e.Result.endRootIntermediate()
+		frame.args = nil
+	}()
+
+	cursor, err = s.runIntoFrame(e, src, args, frame, "")
+	if err != nil {
+		// Every branch normally releases its own live relation state. The root
+		// cleanup is intentionally idempotent and closes that invariant at the
+		// API boundary for bind, cancellation, and future execution branches.
+		clearExecBorrowedViews(e)
+		s.releaseRelations(frame)
+		return Cursor{}, 0, err
+	}
+	retained = saturatedBytes(
+		frame.intermediate.used, e.Result.resultBytesUsed,
+	)
+	return cursor, retained, nil
 }
 
 // runDirectInto is the no-nested-state execution path. Keeping it separate is
@@ -1128,9 +1202,17 @@ func (c *Cursor) Next() bool {
 	return next
 }
 
-// nextWithCancel is Next for internal relation materializers. It checks the
-// underlying result-row loop, including rows HAVING rejects, so cancellation
-// latency is bounded even when no row is ever yielded to the caller.
+// NextWithCancel advances like [Cursor.Next], but observes cancel while it
+// walks underlying rows rejected by HAVING or OFFSET. Callers that perform a
+// second, atomic operation from a query cursor use this form so cancellation
+// latency is bounded even when the query yields no visible rows. A nil flag is
+// the same allocation-free path as Next.
+func (c *Cursor) NextWithCancel(cancel *CancelFlag) (bool, error) {
+	return c.nextWithCancel(cancel)
+}
+
+// nextWithCancel is the shared implementation for public cursor consumers and
+// internal relation materializers.
 func (c *Cursor) nextWithCancel(cancel *CancelFlag) (bool, error) {
 	if c.res == nil || c.left == 0 {
 		return false, nil

@@ -178,9 +178,11 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		return e, nil
 	case p.atKeyword(kwCase), p.atKeyword(kwCast),
 		p.tok.kind == tokNumber, p.tok.kind == tokString,
-		p.tok.kind == tokParam, p.tok.kind == tokPlus, p.tok.kind == tokMinus:
+		p.tok.kind == tokParam, p.tok.kind == tokPlus, p.tok.kind == tokMinus,
+		p.inCaseTruth() && p.atKeyword(kwNull):
 		return p.parseScalarCondition(ctx, nil, p.tok.pos)
-	case ctx == ctxJoin && (p.atKeyword(kwTrue) || p.atKeyword(kwFalse)):
+	case (ctx == ctxJoin || p.inCaseTruth()) &&
+		(p.atKeyword(kwTrue) || p.atKeyword(kwFalse)):
 		pos := p.tok.pos
 		value, err := p.parseOperand()
 		if err != nil {
@@ -201,6 +203,12 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	switch kind, head, state := p.tryAggregate(); state {
 	case aggCall:
 		if ctx != ctxHaving {
+			if p.inCaseTruth() {
+				return nil, newFeatureNotSupportedError(
+					p.lx.src, leafPos,
+					"aggregate predicates inside searched CASE require a combined grouped CASE stage",
+				)
+			}
 			return nil, p.errfHere("an aggregate is not allowed in %s: rows are filtered before they are reduced; use HAVING", ctx)
 		}
 		arg, err := p.parseAggregateArgs(kind)
@@ -224,6 +232,15 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	if scalarContinues(p.tok) {
 		column := ResultColumn{Agg: agg, Path: path, Pos: leafPos}
 		return p.parseScalarCondition(ctx, p.scalarFromColumn(column), leafPos)
+	}
+	if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+		node := p.exprs.one()
+		*node = Expr{
+			Kind: ExprScalarTruth, Column: -1,
+			ScalarLeft: p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: leafPos}),
+			Pos:        leafPos,
+		}
+		return node, nil
 	}
 	return p.parseLeafTail(ctx, agg, path, leafPos)
 }
@@ -256,6 +273,14 @@ func (p *Parser) parseScalarCondition(
 	}
 	if err != nil {
 		return nil, err
+	}
+	if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+		node := p.exprs.one()
+		*node = Expr{
+			Kind: ExprScalarTruth, Column: -1,
+			ScalarLeft: left, Pos: pos,
+		}
+		return node, nil
 	}
 	if p.acceptKeyword(kwIs) {
 		negated := p.acceptKeyword(kwNot)

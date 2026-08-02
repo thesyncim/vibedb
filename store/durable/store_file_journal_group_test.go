@@ -1,15 +1,37 @@
 package durable
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
+
+func blockNextRecoveryJournalGroupSync(
+	t *testing.T,
+) (entered <-chan uint64, release func()) {
+	t.Helper()
+	enteredCh := make(chan uint64, 1)
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	previous := recoveryJournalGroupBeforeSyncHook
+	recoveryJournalGroupBeforeSyncHook = func(through uint64) {
+		enteredCh <- through
+		<-releaseCh
+	}
+	release = func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	t.Cleanup(func() {
+		release()
+		recoveryJournalGroupBeforeSyncHook = previous
+	})
+	return enteredCh, release
+}
 
 // openJournalGroupCollection creates and opens a buffered-visible primary
 // collection with the recovery journal enabled, returning the collection, its
@@ -188,6 +210,140 @@ func TestRecoveryJournalGroupCommitSharesSync(t *testing.T) {
 				if got[k] != v {
 					t.Fatalf("reopen key %s = %q, want %q", k, got[k], v)
 				}
+			}
+		})
+	}
+}
+
+// TestRecoveryJournalGroupTicketCoverageBeatsConcurrentAppendPoison pins both
+// races between an out-of-writer group fence and a later append failure. The
+// append's ENOSPC remains the collection's first, definite sticky diagnostic.
+// A ticket already captured by the fence waits for and receives that fence's
+// independent result: success if Sync succeeds, unknown+EIO if Sync fails.
+func TestRecoveryJournalGroupTicketCoverageBeatsConcurrentAppendPoison(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		batch    bool
+		failSync bool
+	}{
+		{name: "put/successful coverage wins", failSync: false},
+		{name: "put/failed coverage keeps sync cause", failSync: true},
+		{name: "update/successful coverage wins", batch: true, failSync: false},
+		{name: "update/failed coverage keeps sync cause", batch: true, failSync: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := journalTestOptions(CheckpointFilesystem)
+			coll, path, fault := openFaultJournalCollection(t, options)
+			entered, release := blockNextRecoveryJournalGroupSync(t)
+
+			coveredKey := []byte("covered-ticket")
+			coveredValue := journalValue(301)
+			coveredDone := make(chan error, 1)
+			go func() {
+				var err error
+				if tc.batch {
+					err = coll.Update(func(batch *WriteBatch) error {
+						return batch.Put(coveredKey, coveredValue)
+					})
+				} else {
+					_, err = coll.Put(coveredKey, coveredValue)
+				}
+				coveredDone <- err
+			}()
+
+			var through uint64
+			select {
+			case through = <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("group leader did not reach the blocked Sync")
+			}
+			if through != 1 {
+				t.Fatalf("blocked Sync covers ticket %d, want 1", through)
+			}
+
+			// The later mutation reaches Append while the captured fence is held
+			// outside c.writer, then fails before depositing its own ticket.
+			appendAt := fault.Appends()
+			fault.Program(storeio.JournalFaultPlan{
+				Phase:       storeio.JournalFaultENOSPCAppend,
+				AppendIndex: appendAt,
+			})
+			failedKey := []byte("definite-append-failure")
+			_, appendErr := coll.Put(failedKey, journalValue(302))
+			if appendErr == nil || !errors.Is(appendErr, syscall.ENOSPC) {
+				t.Fatalf("later append error = %v, want ENOSPC", appendErr)
+			}
+			if errors.Is(appendErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("definite append error misclassified as unknown: %v", appendErr)
+			}
+			if persistenceErr := coll.PersistenceError(); !errors.Is(persistenceErr, syscall.ENOSPC) ||
+				errors.Is(persistenceErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("first sticky poison = %v, want definite ENOSPC", persistenceErr)
+			}
+
+			// g.fail broadcasts, but a captured ticket must not consume that
+			// fallback while its device fence is unresolved.
+			select {
+			case err := <-coveredDone:
+				t.Fatalf("covered waiter returned before its Sync resolved: %v", err)
+			default:
+			}
+
+			syncAt := fault.Syncs()
+			if tc.failSync {
+				fault.Program(storeio.JournalFaultPlan{
+					Phase:     storeio.JournalFaultSyncError,
+					SyncIndex: syncAt,
+				})
+			}
+			release()
+
+			var coveredErr error
+			select {
+			case coveredErr = <-coveredDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("covered waiter did not resolve after Sync")
+			}
+			if tc.failSync {
+				if !errors.Is(coveredErr, ErrCommitOutcomeUnknown) ||
+					!errors.Is(coveredErr, syscall.EIO) {
+					t.Fatalf("failed covered ticket = %v, want unknown+EIO", coveredErr)
+				}
+				if errors.Is(coveredErr, syscall.ENOSPC) {
+					t.Fatalf("failed covered ticket inherited unrelated append poison: %v",
+						coveredErr)
+				}
+			} else if coveredErr != nil {
+				t.Fatalf("successfully covered ticket returned later poison: %v", coveredErr)
+			}
+
+			// The collection-wide diagnostic remains first-failure-wins even when
+			// the covered waiter carries the independent sync failure.
+			persistenceErr := coll.PersistenceError()
+			if !errors.Is(persistenceErr, syscall.ENOSPC) ||
+				errors.Is(persistenceErr, ErrCommitOutcomeUnknown) ||
+				errors.Is(persistenceErr, syscall.EIO) {
+				t.Fatalf("sticky poison after fence = %v, want only definite ENOSPC",
+					persistenceErr)
+			}
+			if _, laterErr := coll.Put([]byte("after-poison"), journalValue(303)); !errors.Is(laterErr, appendErr) {
+				t.Fatalf("later operation = %v, want sticky append poison %v",
+					laterErr, appendErr)
+			}
+			if got := fault.Syncs(); got != syncAt+1 {
+				t.Fatalf("terminal poison allowed %d group Syncs, want exactly 1",
+					got-syncAt)
+			}
+
+			// The covered complete record is recoverable in both device outcomes;
+			// the ENOSPC'd append has no valid record and must not replay.
+			image := captureJournalImage(t, path)
+			_ = coll.Close()
+			recovered := reopenJournalImage(t, options, image)
+			requireJournalKey(t, recovered, string(coveredKey), string(coveredValue))
+			if got, found, readErr := recovered.AppendRaw(nil, failedKey); readErr != nil || found {
+				t.Fatalf("definite append failure replayed: got=%q found=%t err=%v",
+					got, found, readErr)
 			}
 		})
 	}

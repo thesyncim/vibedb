@@ -191,6 +191,16 @@ func (s *Statement) Params() int {
 type InsertStmt struct {
 	// Table is the collection written to.
 	Table string
+	// Source is the query whose single output column supplies complete JSON
+	// documents. It is nil for VALUES. The source tree is deliberately distinct
+	// from Returning: the former is evaluated against the pre-statement
+	// snapshot, while the latter is evaluated only over rows admitted for
+	// publication.
+	Source *SelectStmt
+	// SourcePos is the byte offset of Source's leading SELECT or query-expression
+	// token. Runtime source-shape errors use it when no narrower output position
+	// exists.
+	SourcePos int
 	// Rows are the VALUES tuples in source order. Several rows in one statement
 	// are one atomic batch, which is the reason multi-row VALUES exists here at
 	// all rather than being sugar for a loop.

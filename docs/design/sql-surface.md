@@ -186,6 +186,38 @@ are still the authoritative values.
 There are no unique, partial, range, full-text, expression, or selectable index
 methods.
 
+## Ordinary views
+
+`CREATE VIEW name [(column, ...)] AS query` stores an ordinary view definition
+in the durable SQL catalog. The definition is reparsed and revalidated on
+reopen, expands into the reader's plan, and owns no rows or indexes. Nested
+views, CTEs, set expressions, joins, and supported uncorrelated predicate
+subqueries in view queries use the same bounded query engine. A stored
+definition cannot contain bind parameters. A column list may rename a leading
+prefix of the result but may not be longer than it or create duplicate
+effective output names.
+
+Views form a bounded acyclic dependency graph. `DROP VIEW [IF EXISTS] name
+[RESTRICT]` uses `RESTRICT` by default, as does `DROP TABLE` for a table with
+dependent views. `CASCADE` and `CREATE OR REPLACE VIEW` are not approximated.
+Prepared statements retain immutable view generations and refuse execution if
+a referenced definition was dropped or replaced; transactions retain the view
+definitions and table generations captured at `BEGIN`.
+
+Ordinary views are read-only. `SELECT` and an `INSERT` query source may read
+them, but `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and index DDL cannot target
+them. View references inside UPDATE/DELETE predicate or RETURNING subqueries
+remain positioned `0A000` until those DML trees share view expansion. `CREATE`,
+`DROP`, and `REFRESH MATERIALIZED VIEW` are positioned `0A000`: the durable
+format has no atomic publication spanning catalog metadata and refreshed rows.
+
+Object-kind errors are distinct from absence. `DROP VIEW [IF EXISTS]` against a
+table, and `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE INDEX`, table-qualified
+`DROP INDEX`, or `INSERT`/`UPDATE`/`DELETE` against a view, return SQLSTATE
+`42809` with the authored object position and an operation-specific hint.
+`IF EXISTS` suppresses only absence. Prepared execution revalidates this rule
+after table-to-view or view-to-table replacement races.
+
 ## INSERT and primary-key identity
 
 The ordinary form binds one complete JSON document:
@@ -221,6 +253,74 @@ the same VALUES batch, and a RETURNING projection reports only rows that were
 inserted. Use UPDATE for replacement. `LastInsertId` is unavailable because
 keys come from documents rather than a generated sequence.
 
+An INSERT may instead take a complete query expression:
+
+```sql
+INSERT INTO archive
+WITH selected AS (
+  SELECT payload AS doc FROM events WHERE retired = TRUE
+)
+SELECT doc FROM selected
+ON CONFLICT DO NOTHING
+RETURNING id
+```
+
+The source may begin with `SELECT`, `WITH`, `TABLE`, or a parenthesized query;
+set expressions, CTEs, joins, and ordinary views are valid inside it. Its
+result must have exactly one column, and every emitted value must be a complete
+JSON document. A target column list with a query source is rejected: this slice
+does not infer row-to-document construction. Statically scalar outputs fail at
+prepare time; dynamically typed outputs are checked row by row before any
+write is visible. A `VALUES (?)` leaf propagates that document-parameter role
+through nested set, CTE, and recursive-CTE source lineage without changing
+unrelated scalar parameter roles.
+
+The source is fully evaluated from one coherent pre-statement snapshot. This
+also defines target-equals-source behavior: the query cannot observe documents
+inserted by its own statement. Schema validation, primary-key derivation,
+duplicate and existing-key decisions, routing, durable batch admission, and
+the complete RETURNING projection are staged before one table publication.
+Any source, cancellation, budget, shape, schema, key, conflict, routing, or
+RETURNING error publishes no prefix. `ON CONFLICT DO NOTHING` preserves source
+order and RETURNING reports only admitted rows.
+
+Inside a transaction the source reads the `BEGIN` snapshot plus the overlay
+that existed when the statement began; successful rows enter that overlay as
+one atomic statement. The source and staged write share the normal result,
+intermediate, cancellation, transaction, and durable document/batch limits.
+The root query result is admitted while it grows against the remainder left by
+every simultaneously live derived, CTE, set, window, join, and scalar spool;
+that exact retained total seeds atomic write staging rather than opening a
+second allowance. Validation tape, encoded-key/map ownership, document/index
+storage, and publication records are admitted before growth. Existing-key
+checks use a snapshot-linearized no-copy primary probe, so an unrelated large
+stored document is never materialized merely to decide a conflict. Prepared
+execution revalidates every physical and view dependency. Placed writes stream
+the already-staged records through fixed-width stack routing state, so they
+retain no second per-row vector; transaction staging charges the transaction
+mutation shape rather than the smaller autocommit publication shape. RETURNING
+does not open a new allowance: it releases exactly the source root Result that
+it invalidates, then admits its nested work and root Result beside the
+still-live source spools and atomic staging.
+
+The allocation claim is deliberately lane-specific. Allocation-gated tests
+show zero allocations after warm-up for the direct-session no-op conflict and
+absent-source paths, including placed-routing and escaped composite shard-key
+variants. They do not claim that a successful durable publication is
+allocation-free.
+
+The durable batch accepts documents above `InlineValueBytes` through
+`MaxDocumentBytes`; the inline threshold selects a representation rather than
+an admission limit. Mixed inline and overflow inserts, replacements, deletes,
+duplicate-resolved keys, and exact-index changes stage before one collection
+generation and one recovery-journal batch record. Pinned snapshots retain old
+durable or volatile overflow chains until their generation can be reclaimed.
+Admission, retirement-capacity, or journal failure cannot expose a partial
+logical batch; recovery replays the complete journal record or none of it. The
+warmed replacement benchmark currently reports the same one publication-state
+allocation for the inline control and mixed overflow cases; this is not a
+zero-allocation `Collection.Update` claim.
+
 There is no caller-supplied physical-key row form. `VALUES` without a field list
 contains exactly one complete document; a field-list INSERT includes the
 declared primary-key field like any other field. The declaration is the one
@@ -247,6 +347,116 @@ The `database/sql` adapter uses positional `?` placeholders. `pgwire` accepts
 PostgreSQL-style `$1`, `$2`, and so on and maps them onto the same typed
 parameter slots. Named parameters are not supported.
 
+## Scalar expressions and CAST
+
+The scalar lane supports exact `+`, `-`, `*`, `/`, `%`, unary signs, and string
+concatenation with `||` over paths, literals, parameters, and supported
+aggregates. Decimal arithmetic uses the same bounded exact-number kernel as
+aggregates and never narrows through `float64`.
+
+Searched and simple `CASE` are supported as SELECT-list scalar expressions.
+The complete CASE value may also be compared or tested with `IS [NOT] NULL`
+in a WHERE scalar condition:
+
+```sql
+SELECT CASE WHEN active AND score >= ? THEN 'ready' ELSE 'held' END,
+       CASE kind WHEN 'a' THEN 1 WHEN 'b' THEN 2 END
+FROM jobs
+```
+
+A searched WHEN accepts boolean scalar conditions, comparisons,
+`IS [NOT] NULL`, and `AND`/`OR`/`NOT`. Other predicate families, predicate
+subqueries, and aggregate conditions remain positioned refusals. A simple CASE
+compares its selector with each WHEN value in order using exact same-domain SQL
+equality; NULL does not match NULL and no coercion is inferred.
+
+CASE evaluates the selector once, conditions in source order, and only the
+chosen result. AND/OR and later arms short-circuit, so conversions and
+arithmetic errors in an unchosen per-row branch are unobserved. Statically
+decisive searched and simple arms are also removed from the executable
+dependency plan after full validation; their path payloads and exact aggregate
+state consume no runtime budget, while aggregate/group cardinality remains SQL
+correct. A data-dependent branch can still require its path column in the
+shared base plan even on rows that choose another result, so that dependency's
+intermediate/result footprint remains budgeted. An omitted ELSE produces SQL
+NULL. Boolean, numeric, text, JSON, and NULL result domains are resolved at
+prepare time where possible; irreconcilable static arms are positioned
+`0A000`, while a conflicting dynamic value is `42804`. Explicit CAST is the
+way to choose one result domain. CASE nesting shares the 64-level scalar bound,
+a statement may hold at most 1,024 WHEN arms, and cancellation checks remain
+bounded. Allocation-gated warmed query-engine CASE paths retain branch
+workspace and allocate no heap objects; cold prepare, `database/sql`, and
+protocol framing are outside that claim.
+
+`CAST(expression AS type)` has four executable target domains:
+
+- `TEXT`: preserves decoded strings, emits canonical boolean text and exact
+  decimal text, and exposes container JSON without numeric conversion;
+- `BOOLEAN` or `BOOL`: accepts booleans and trimmed, case-insensitive unique
+  prefixes of `true`/`false`, `yes`/`no`, and `on`/`off`, plus `1` and `0`;
+- `NUMERIC` or `DECIMAL`: accepts numbers or trimmed signed decimal text with
+  an optional fraction and exponent through the bounded exact-decimal kernel;
+- `JSON`: parses string input as JSON text and preserves its exact spelling;
+  already typed non-string JSON scalar or container values retain their value.
+
+SQL NULL propagates through every target. Invalid input text is `22P02`, an
+unrepresentable number is `22003`, and a source/target kind mismatch is
+`42804`; diagnostics point at the authored CAST and do not echo runtime input.
+Type modifiers, multiword types, quoted type names, arrays, `JSONB`, and the
+PostgreSQL `::` shorthand are positioned `0A000`, not silently weakened.
+
+Projection expressions are lazy: WHERE filtering and final OFFSET/LIMIT row
+admission happen before a projected CAST or arithmetic expression is
+evaluated. A conversion or division error in a filtered or skipped row
+therefore does not fail the statement or consume retained CAST workspace.
+Prepared warm execution reuses that workspace and the covered CAST variants
+allocate no heap objects.
+
+## Set operations
+
+`UNION`, `INTERSECT`, and `EXCEPT` support both `ALL` and `DISTINCT` over
+`SELECT`, `VALUES`, and `TABLE` leaves. `INTERSECT` binds more tightly than
+`UNION` and `EXCEPT`; parentheses retain authored grouping and give an operand
+its own ORDER BY/LIMIT/OFFSET. A final tail names outputs from the syntactic
+first operand, whose names and ordinal schema also describe the result.
+
+All operands must have equal width. Multiset multiplicity, SQL NULL equality
+for row identity, exact decimal values, and container spellings are preserved.
+Every leaf reads one coherent statement snapshot and the complete tree shares
+finite row, byte, depth, node, result, and intermediate limits. Admission,
+cancellation, dependency, or execution failure publishes no partial cursor;
+prepared warm execution reuses the set workspace.
+
+## Window functions
+
+Window expressions are supported in the SELECT list for `ROW_NUMBER`, `RANK`,
+`DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`,
+`FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, and the `COUNT`, `SUM`, `AVG`, `MIN`,
+and `MAX` aggregates. Arguments, partition keys, and window order keys are JSON
+paths; offsets, bucket counts, NTH positions, and LAG/LEAD defaults use the
+documented literal or positional-parameter forms.
+
+Inline and named windows support `PARTITION BY`, multi-key `ORDER BY` with
+direction and explicit NULL placement, earlier-name inheritance, and `ROWS`,
+`GROUPS`, or `RANGE` frames. Every frame boundary and `EXCLUDE NO OTHERS`,
+`CURRENT ROW`, `GROUP`, or `TIES` is implemented. RANGE offsets retain exact
+decimal spelling and require one numeric order key; NULL and missing order
+values form peers rather than being coerced. The ordered default frame includes
+the current peer group.
+
+Stages with equivalent partition and order specifications share their sort.
+The executor preserves stable peer order, SQL NULL/missing identity, exact
+decimal aggregate behavior, transaction snapshots, finite memory admission,
+cancellation, and failure atomicity. EXPLAIN reports the logical stages and
+ANALYZE reports the measured execution. Prepared warm execution reuses window
+state and the covered paths allocate no heap objects.
+
+Window `FILTER`, DISTINCT window aggregates, null-treatment modifiers such as
+`IGNORE NULLS`, arbitrary scalar arguments or keys, and window expressions
+outside the SELECT list are not part of this SQL slice; final ORDER BY may name
+the output alias of a SELECT-list window. A correlated window key inside
+LATERAL and a window in a recursive CTE term remain positioned refusals.
+
 Primary-key equality and membership use point reads. Eligible exact predicates
 use posting masks and document rechecks. Predicates without a usable access path
 remain correct full scans; an index is an optimization, not a requirement for a
@@ -272,7 +482,7 @@ to be a static choice. Both forms use the engine's vibejson encoder.
 
 `INNER JOIN`, `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN`,
 and `CROSS JOIN` compose into ordered chains. Each operand may be a physical
-collection, an uncorrelated derived table, or a non-recursive CTE:
+collection, a derived table, or a CTE relation:
 
 ```sql
 WITH active AS MATERIALIZED (
@@ -340,10 +550,22 @@ and emitted pair count from the one measured execution. Both plain and prepared
 forms revalidate all recursively discovered physical dependencies before
 execution.
 
-`LATERAL`, `NATURAL JOIN`, correlated operands, and mutation joins remain
-explicitly unsupported. SQL exposes no physical storage-key pseudo-column:
-`"$key"` is an ordinary quoted JSON field. Join the declared JSON primary-key
-fields when relational identity is intended.
+`INNER JOIN LATERAL`, `LEFT JOIN LATERAL`, and `CROSS JOIN LATERAL` execute the
+right relation per left row and can bind any preceding range variable. Nested
+LATERAL chains inherit outer frames. Correlated paths are supported in the
+right projection, predicates, join predicates, grouping, aggregates, and
+HAVING; uncorrelated LATERAL operands take the ordinary derived-relation path.
+The APPLY executor preserves exact values, three-valued gates, snapshot and
+transaction semantics, cancellation, and shared intermediate/pair/aggregate
+budgets without memoizing rows whose volatility is not proven.
+
+Correlation on the nullable side of `RIGHT` or `FULL JOIN LATERAL`, `USING` on
+a correlated LATERAL join, mixed local/outer OR predicates, correlated window
+keys or DISTINCT projections, outer derived wildcards, and grouped-correlated
+ORDER BY/LIMIT/OFFSET remain positioned `0A000`. `NATURAL JOIN` and mutation
+joins also remain unsupported. SQL exposes no physical storage-key
+pseudo-column: `"$key"` is an ordinary quoted JSON field. Join the declared JSON
+primary-key fields when relational identity is intended.
 
 ## Predicate subqueries
 
@@ -370,15 +592,17 @@ An empty scalar result is `NULL`; a scalar result with more than one row is an
 error. Every nested result is charged to one statement-wide intermediate byte
 account; nesting does not mint another materialization allowance.
 
-Correlated predicate subqueries remain rejected rather than re-evaluated once
-per row. Scalar subqueries in the projection list and subqueries in `HAVING`
-remain unsupported.
+Predicate subqueries correlated to an enclosing row remain rejected rather
+than being evaluated once per row. This includes a predicate subquery inside a
+LATERAL operand; LATERAL can bind the operand's own paths and predicates but
+does not add a correlated-subquery execution stage. Scalar subqueries in the
+projection list and subqueries in `HAVING` remain unsupported.
 
 ## Common table expressions
 
-Non-recursive, SELECT-valued common table expressions are supported by direct
-and prepared `database/sql` execution and by pgwire's simple and extended
-protocols:
+SELECT-valued common table expressions, including the bounded recursive
+subset, are supported by direct and prepared `database/sql` execution and by
+pgwire's simple and extended protocols:
 
 ```sql
 WITH active(id, score) AS MATERIALIZED (
@@ -431,14 +655,30 @@ or result and leaves a prepared statement reusable. Warm CTE execution and the
 ordinary no-CTE path allocate no marginal heap storage; a statement without
 `WITH` does not initialize CTE state.
 
-`WITH RECURSIVE`, data-modifying CTE bodies, and recursive/fixpoint semantics
-remain typed unsupported features. The dialect also does not yet accept a
-FROM-less SELECT body, so constant-only CTEs are not admitted by the front end.
+A recursive definition is an anchor followed by `UNION` or `UNION ALL` and one
+recursive term containing exactly one direct self-reference. Execution is a
+breadth-first fixpoint over the previous delta. `UNION` suppresses duplicate
+SQL rows before they enter the next delta; `UNION ALL` preserves them.
+Recursive definitions may use preceding ordinary CTEs, and later recursive
+definitions may depend on earlier ones. Joins are admitted when the recursive
+relation remains on a preserved side. Materialization policy, coherent catalog
+snapshots, prepared dependency checks, exact values, cancellation, and the
+statement-wide intermediate allowance continue to apply.
+
+The default physical bounds are 1,000 recursive iterations, 100,000 result
+rows, and 64 MiB of owned fixpoint state. Arity and every bound are checked
+before partial publication. Anchor self-reference, multiple or nested
+self-references, mutual/forward recursion, `INTERSECT`/`EXCEPT` recursion,
+aggregation or grouping in the recursive term, a self-reference on the
+nullable side of an outer join, top-level compound queries containing
+`WITH RECURSIVE`, and `SEARCH`/`CYCLE` remain positioned typed refusals.
+Data-modifying CTE bodies also remain unsupported. The dialect does not yet
+accept a FROM-less SELECT body, so constant-only SELECT CTEs are not admitted.
 
 ## Derived tables
 
-An uncorrelated `SELECT` may be used as a `FROM` relation, including any operand
-in a join chain:
+A `SELECT` may be used as a `FROM` relation, including any operand in a join
+chain:
 
 ```sql
 SELECT d.customer, d.total
@@ -474,10 +714,8 @@ explicitly disables the bound. Intermediate exhaustion is SQLSTATE `54000` and
 cannot emit a partial result row.
 
 The derived query reads the same catalog snapshot as the outer statement.
-Joined derived relations materialize once as bounded operands; they are not
-re-evaluated per outer row. `LATERAL` and correlated derived relations remain
-typed unsupported features rather than being approximated as independent
-execution.
+Ordinary joined derived relations materialize once as bounded operands; a
+correlated `LATERAL` relation instead uses the APPLY path described above.
 
 Joins inside a transaction use the snapshots captured by BEGIN plus that
 transaction's staged overlay. They preserve repeatable reads and
@@ -667,6 +905,26 @@ failure after a visible catalog or table-file replacement is reported
 explicitly as `durable.ErrCommitOutcomeUnknown`; it is not mislabeled as either
 cancellation or rollback.
 
+The same sentinel covers a recovery-journal ambiguity after a complete redo
+record append when the following sync fails. In the synchronous journal lane,
+the failed mutation is not published to the live reader, but close/reopen may
+replay the complete record; an atomic batch therefore remains all-or-none while
+its committed-versus-not-committed outcome is unknown. Definite pre-append and
+append failures are not relabeled as ambiguous. A sync failure poisons the live
+writer, preserves its device cause through `errors.Is`, and requires close,
+reopen, and data reconciliation rather than retry on that handle. Concurrent
+group-commit tickets resolve from their own captured fence: a completed sync is
+not revoked by a later append poison, and a failed fence retains its own sync
+cause independently of the first sticky diagnostic.
+
+Pgwire maps `durable.ErrCommitOutcomeUnknown` to PostgreSQL SQLSTATE `40003`
+(`statement_completion_unknown`), which takes precedence over a joined
+cancellation error. It remains an `ERROR`, not a fatal connection error. The
+extended protocol discards messages through the next `Sync`; simple protocol
+still closes with `ReadyForQuery`. The protocol session is reusable afterward,
+although the affected durable handle may remain poisoned. SQLSTATE `57014`
+continues to mean an unambiguous canceled operation before publication.
+
 The query executor has a reusable cooperative `query.CancelFlag`. It checks the
 flag at bounded points in heap and durable scans, parallel workers, joins,
 filtered DML, and spill I/O; cancellation drains worker pipelines, closes
@@ -687,17 +945,26 @@ lifecycle correctly through its prepared-statement fallback.
 The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
-- correlated subqueries, projection/HAVING subqueries, recursive or
-  data-modifying common table expressions, set operations, window functions,
-  `COUNT(DISTINCT ...)`, computed scalar expressions, and user-defined
-  functions;
-- `LATERAL`, correlated derived relations, `NATURAL JOIN`, and derived-table
+- predicate subqueries correlated to an enclosing row, scalar subqueries in
+  projection or HAVING, and a decorrelation or correlated-subquery execution
+  stage;
+- the correlated LATERAL shapes listed above, `NATURAL JOIN`, and derived-table
   column alias lists;
+- data-modifying CTE bodies, mutual/forward or multiply self-referential
+  recursion, recursive aggregation/grouping, `SEARCH`/`CYCLE`, recursive
+  `INTERSECT`/`EXCEPT`, and FROM-less constant SELECT bodies;
+- window `FILTER`, DISTINCT window aggregates, null-treatment modifiers,
+  arbitrary scalar window arguments/keys, and windows outside the SELECT list;
+- general scalar placement beyond the documented SELECT-list and WHERE CASE
+  forms, `COUNT(DISTINCT ...)`, the `::` cast shorthand, and user-defined
+  functions;
 - partial path UPDATE, `UPDATE ... FROM`, `DELETE ... USING`, and mutation joins;
-- generated keys, `INSERT ... SELECT`, defaults, `ON CONFLICT DO UPDATE`,
-  `ON DUPLICATE KEY`, and nested flat-INSERT construction;
-- `ALTER`, views, unique/check/foreign-key/default/generated
-  constraints, and SQL types without a JSON equivalent;
+- generated keys, target-column construction for INSERT query sources,
+  defaults, `ON CONFLICT DO UPDATE`, `ON DUPLICATE KEY`, and nested flat-INSERT
+  construction;
+- `ALTER TABLE`/`ALTER INDEX`, materialized views and refresh, `CREATE OR
+  REPLACE VIEW`, `DROP VIEW CASCADE`, and unique/check/foreign-key/default/
+  generated constraints, plus SQL types without a JSON equivalent;
 - unique/partial/range/full-text indexes, expression indexes, and selectable
   index methods;
 - composite primary keys in the typed SQL runtime and atomic transactions

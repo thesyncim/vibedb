@@ -405,10 +405,9 @@
 // escape only.
 // implicit correlation from a non-LATERAL derived relation, correlated
 // RIGHT/FULL LATERAL, JOIN LATERAL ... USING, and subqueries in the SELECT list;
-// NATURAL joins and comma-separated FROM items; recursive and data-modifying
-// common table expressions, CASE,
-// CAST, arithmetic, string concatenation, and scalar functions (the engine
-// evaluates predicates over stored values, not computed expressions); ORDER BY
+// NATURAL joins and comma-separated FROM items; data-modifying common table
+// expressions; searched CASE predicate families beyond boolean truth,
+// comparisons, IS NULL, AND, OR, and NOT; scalar functions; ORDER BY
 // and GROUP BY over output positions or aggregates.
 //
 // The mutation and definition grammar refuses, each by name: a nested INSERT

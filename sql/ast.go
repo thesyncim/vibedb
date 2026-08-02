@@ -679,6 +679,10 @@ const (
 	ExprScalarCompare
 	// ExprScalarIsNull is the two-valued IS [NOT] NULL test over ScalarLeft.
 	ExprScalarIsNull
+	// ExprScalarTruth reads ScalarLeft as a SQL boolean condition. It is emitted
+	// only inside searched CASE: NULL is UNKNOWN, boolean values retain their
+	// value, and a dynamic non-boolean value is a runtime datatype mismatch.
+	ExprScalarTruth
 )
 
 // A CmpOp is a comparison operator. The constants are in the same order as

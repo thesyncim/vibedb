@@ -16,18 +16,6 @@ type preparedViewDDL struct {
 	drop   *sqlast.DropViewStmt
 }
 
-type wrongViewObjectTypeError struct {
-	name string
-	pos  int
-}
-
-func (e *wrongViewObjectTypeError) Error() string {
-	return fmt.Sprintf("%v: relation %q is a table, not a view", ErrWrongObjectType, e.name)
-}
-
-func (e *wrongViewObjectTypeError) Unwrap() error { return ErrWrongObjectType }
-func (e *wrongViewObjectTypeError) Position() int { return e.pos }
-
 func (c *conn) prepareViewDDL(
 	ctx context.Context,
 	source string,
@@ -68,9 +56,9 @@ func (c *conn) prepareViewDDL(
 		_, tableExists := c.db.tables[tree.DropView.Name]
 		c.db.mu.RUnlock()
 		if tableExists {
-			return nil, &wrongViewObjectTypeError{
-				name: tree.DropView.Name, pos: tree.DropView.Pos,
-			}
+			return nil, wrongDropViewObjectType(
+				tree.DropView.Name, tree.DropView.Pos,
+			)
 		}
 		if !exists && !tree.DropView.IfExists {
 			return nil, fmt.Errorf("%w: %q", ErrViewNotFound, tree.DropView.Name)
@@ -163,7 +151,7 @@ func (d *database) dropViewLocked(
 	meta, exists := d.catalog.Views[drop.Name]
 	if !exists {
 		if _, tableExists := d.tables[drop.Name]; tableExists {
-			return nil, &wrongViewObjectTypeError{name: drop.Name, pos: drop.Pos}
+			return nil, wrongDropViewObjectType(drop.Name, drop.Pos)
 		}
 		if drop.IfExists {
 			return result{}, nil

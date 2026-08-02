@@ -18,6 +18,7 @@ func TestSQLScalarDecimalArithmeticExact(t *testing.T) {
 		{"subtract", sqlScalarSubtract, "1e40", "1", "9999999999999999999999999999999999999999"},
 		{"multiply", sqlScalarMultiply, "123456789.123456789", "0.000000001", "0.123456789123456789"},
 		{"finite divide", sqlScalarDivide, "1", "8", "0.125"},
+		{"zero divide", sqlScalarDivide, "0e999", "7", "0"},
 		{"rounded divide", sqlScalarDivide, "1", "3", "0.3333333333333333333333333333333333"},
 		{"ties even divide", sqlScalarDivide, "5", "2", "2.5"},
 		{"negative divide", sqlScalarDivide, "-10", "4", "-2.5"},

@@ -3,10 +3,9 @@ package distribution
 // The single-key write/lookup route is the promised hot path, so it gets the
 // same allocation-gated benchmark treatment as PR 1a's append APIs: one reused
 // Router driving a fully bound single-column key must resolve to one shard
-// without allocating beyond the two allocations inherent to the frozen
-// contracts — the DestinationSet slice a Mapper.MapPrefix must return, and the
-// immutable Route.Targets slice handed back to the caller. All intermediate
-// expansion, dedup, and resolution work reuses the Router's scratch buffers.
+// without allocating beyond Route's immutable Targets result. NativeMapper's
+// MapperInto extension reuses router stack scratch for its DestinationSet. All
+// intermediate expansion, dedup, and resolution work reuses Router storage.
 // TestSingleKeyRouteAllocation pins that ceiling as a regression gate;
 // BenchmarkRouteSingleKey reports ns/op and allocs/op for observability.
 
@@ -42,11 +41,28 @@ func BenchmarkRouteSingleKey(b *testing.B) {
 	}
 }
 
-// TestSingleKeyRouteAllocation gates the single-key route at no more than the two
-// contract-bound allocations. Exceeding two means an intermediate buffer stopped
-// being reused; the two are the Mapper's returned DestinationSet.Points slice and
-// the immutable Route.Targets slice, neither of which the fixed contracts allow
-// the router to elide.
+func BenchmarkRouteSingleKeyInto(b *testing.B) {
+	r, mapper, man, cons, policy := singleKeyRouteInputs(b)
+	var targets [1]Target
+	if _, err := r.RouteInto(
+		cons, mapper, man, policy, targets[:0],
+	); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		route, err := r.RouteInto(
+			cons, mapper, man, policy, targets[:0],
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchSinkRoute = route
+	}
+}
+
+// TestSingleKeyRouteAllocation gates the ordinary immutable-result API at its
+// one contract-bound allocation: Route.Targets.
 func TestSingleKeyRouteAllocation(t *testing.T) {
 	r, mapper, man, cons, policy := singleKeyRouteInputs(t)
 	if _, err := r.Route(cons, mapper, man, policy); err != nil { // warm the scratch buffers
@@ -61,7 +77,32 @@ func TestSingleKeyRouteAllocation(t *testing.T) {
 			t.Fatalf("route kind = %v, want RouteSingle", route.Kind)
 		}
 	})
-	if allocs > 2 {
-		t.Fatalf("single-key route allocations = %v, want <= 2 (MapPrefix DestinationSet slice + immutable Route.Targets slice)", allocs)
+	if allocs > 1 {
+		t.Fatalf("single-key route allocations = %v, want <= 1 immutable Route.Targets slice", allocs)
+	}
+}
+
+func TestSingleKeyRouteIntoReusesCallerTargets(t *testing.T) {
+	r, mapper, man, cons, policy := singleKeyRouteInputs(t)
+	var targets [1]Target
+	if _, err := r.RouteInto(
+		cons, mapper, man, policy, targets[:0],
+	); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		route, err := r.RouteInto(
+			cons, mapper, man, policy, targets[:0],
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if route.Kind != RouteSingle || len(route.Targets) != 1 ||
+			&route.Targets[0] != &targets[0] {
+			t.Fatal("RouteInto did not return the caller target storage")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("single-key RouteInto allocations = %v, want 0", allocs)
 	}
 }

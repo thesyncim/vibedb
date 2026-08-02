@@ -268,6 +268,46 @@ func TestNewManifestAcceptsCompleteCoverage(t *testing.T) {
 	}
 }
 
+// TestResolvePointTargetBoundariesAndFence pins the direct point-routing
+// primitive to the same half-open ownership rules as ResolvePoint and verifies
+// that dispatch identity includes the first leader, ownership epoch, and role.
+func TestResolvePointTargetBoundariesAndFence(t *testing.T) {
+	mid := pt(hb(0x80))
+	m := mustManifest(t, []Shard{
+		{
+			ID: "s0", Range: KeyRange{Start: KeyspacePoint{}, End: KeyspaceEnd{Point: mid}},
+			Leaders: []EndpointID{"ep-0a", "ep-0b"}, Epoch: 11,
+		},
+		{
+			ID: "s1", Range: KeyRange{Start: mid, End: maxKeyEnd},
+			Leaders: []EndpointID{"ep-1"}, Epoch: 22,
+		},
+	})
+
+	cases := []struct {
+		name string
+		p    KeyspacePoint
+		want Target
+	}{
+		{"minimum", KeyspacePoint{}, Target{Shard: "s0", Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
+		{"left of boundary", pt(hb(0x80) - 1), Target{Shard: "s0", Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
+		{"boundary belongs right", mid, Target{Shard: "s1", Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
+		{"maximum", pt(^uint64(0)), Target{Shard: "s1", Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := m.ResolvePointTarget(tc.p)
+			if !ok || got != tc.want {
+				t.Fatalf("ResolvePointTarget(%x) = %+v, %v; want %+v, true", tc.p, got, ok, tc.want)
+			}
+			shard, pointOK := m.ResolvePoint(tc.p)
+			if !pointOK || shard != got.Shard {
+				t.Fatalf("ResolvePoint disagreement: shard=%q ok=%v target=%+v", shard, pointOK, got)
+			}
+		})
+	}
+}
+
 // TestManifestImmutability proves the constructor deep-copies its input: after
 // construction the caller mutates the shard slice and both leader backing
 // arrays, and the manifest still reports the pre-mutation layout; mutating the

@@ -402,6 +402,9 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 	case ExprScalarIsNull:
 		b.WriteString(negated(e, "scalar-isnull ", "scalar-isnotnull "))
 		dumpScalar(b, e.ScalarLeft)
+	case ExprScalarTruth:
+		b.WriteString("scalar-truth ")
+		dumpScalar(b, e.ScalarLeft)
 	case ExprBetween:
 		b.WriteString(negated(e, "between", "notbetween"))
 		b.WriteByte(' ')
@@ -480,6 +483,27 @@ func dumpScalar(b *strings.Builder, e *ScalarExpr) {
 		b.WriteByte(' ')
 		dumpScalar(b, e.Left)
 		b.WriteByte(')')
+	case ScalarCase:
+		b.WriteString("case")
+		if e.Left != nil {
+			b.WriteByte(' ')
+			dumpScalar(b, e.Left)
+		}
+		for i := range e.Whens {
+			b.WriteString(" when ")
+			if e.Whens[i].Predicate != nil {
+				dumpExpr(b, e.Whens[i].Predicate)
+			} else {
+				dumpScalar(b, e.Whens[i].Match)
+			}
+			b.WriteString(" then ")
+			dumpScalar(b, e.Whens[i].Result)
+		}
+		if e.Else != nil {
+			b.WriteString(" else ")
+			dumpScalar(b, e.Else)
+		}
+		b.WriteString(" end")
 	default:
 		fmt.Fprintf(b, "scalar-kind(%d)", e.Kind)
 	}

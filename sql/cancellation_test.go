@@ -78,6 +78,40 @@ func TestParserReturnsPreexistingCancellationUnchanged(t *testing.T) {
 	}
 }
 
+func TestInsertSelectTailScanCancellationIdentityAndReuse(t *testing.T) {
+	const payloadBytes = 1 << 20
+	src := `INSERT INTO dst SELECT * FROM src /*` +
+		strings.Repeat("x", payloadBytes) + `*/ RETURNING id`
+	admissionChecks := 1 + (len(src)-1)/parserCancelByteInterval
+	// Admission consumes its fixed byte checkpoints first. The secondary lexer
+	// then enters the long source comment while proving the RETURNING boundary.
+	stopAt := admissionChecks + 2
+	checks := 0
+	want := errors.New("cancel INSERT SELECT boundary scan")
+	var parser Parser
+	parser.SetCancellationCheck(func() error {
+		checks++
+		if checks >= stopAt {
+			return want
+		}
+		return nil
+	})
+	var statement Statement
+	if err := parser.ParseStatement(&statement, src); err != want {
+		t.Fatalf("tail-scan cancellation = %T %v, want exact sentinel", err, err)
+	}
+	if statement.Kind != 0 || statement.Insert != nil || statement.Select != nil {
+		t.Fatalf("canceled INSERT SELECT returned partial AST: %+v", statement)
+	}
+	parser.SetCancellationCheck(nil)
+	if err := parser.ParseStatement(
+		&statement,
+		`INSERT INTO dst SELECT * FROM src RETURNING id`,
+	); err != nil {
+		t.Fatalf("parser was not reusable after tail-scan cancellation: %v", err)
+	}
+}
+
 func TestParserCancellationRemainsBoundedInsideDerivedTable(t *testing.T) {
 	const payloadBytes = 1 << 20
 	src := `SELECT d.id FROM (SELECT id FROM docs /*` +

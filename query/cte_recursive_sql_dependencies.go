@@ -314,6 +314,15 @@ func cloneRecursiveSQLFullFrameTree(
 	if len(source.Columns) != 0 {
 		tree.Columns = append([]sqlast.ResultColumn(nil), source.Columns...)
 		for i := range tree.Columns {
+			if source.Columns[i].Scalar != nil {
+				var err error
+				tree.Columns[i].Scalar, err = cloneRecursiveSQLScalar(
+					source.Columns[i].Scalar, absoluteBase, ownerParams,
+				)
+				if err != nil {
+					return nil, err
+				}
+			}
 			if source.Columns[i].Window == nil {
 				continue
 			}
@@ -406,11 +415,24 @@ func cloneRecursiveSQLExpr(
 	absoluteBase int,
 	ownerParams int,
 ) (*sqlast.Expr, error) {
+	return cloneRecursiveSQLExprTree(source, absoluteBase, ownerParams, false)
+}
+
+func cloneRecursiveSQLExprTree(
+	source *sqlast.Expr,
+	absoluteBase int,
+	ownerParams int,
+	ownPaths bool,
+) (*sqlast.Expr, error) {
 	if source == nil {
 		return nil, nil
 	}
 	expr := new(sqlast.Expr)
 	*expr = *source
+	if ownPaths {
+		expr.Path = cloneRecursiveSQLPath(source.Path)
+		expr.RightPath = cloneRecursiveSQLPath(source.RightPath)
+	}
 	if err := rebaseRecursiveSQLOperand(&expr.Value, absoluteBase, ownerParams); err != nil {
 		return nil, err
 	}
@@ -433,11 +455,26 @@ func cloneRecursiveSQLExpr(
 		}
 		expr.Subquery = query
 	}
+	if source.ScalarLeft != nil || source.ScalarRight != nil {
+		var err error
+		expr.ScalarLeft, err = cloneRecursiveSQLScalar(
+			source.ScalarLeft, absoluteBase, ownerParams,
+		)
+		if err != nil {
+			return nil, err
+		}
+		expr.ScalarRight, err = cloneRecursiveSQLScalar(
+			source.ScalarRight, absoluteBase, ownerParams,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(source.Kids) != 0 {
 		expr.Kids = make([]*sqlast.Expr, len(source.Kids))
 		for i := range source.Kids {
-			kid, err := cloneRecursiveSQLExpr(
-				source.Kids[i], absoluteBase, ownerParams,
+			kid, err := cloneRecursiveSQLExprTree(
+				source.Kids[i], absoluteBase, ownerParams, ownPaths,
 			)
 			if err != nil {
 				return nil, err
@@ -446,6 +483,85 @@ func cloneRecursiveSQLExpr(
 		}
 	}
 	return expr, nil
+}
+
+// cloneRecursiveSQLScalar gives a full-frame recursive term exclusive
+// ownership of every cold scalar node before rebasing its placeholders. CASE
+// is the only scalar node with parser-arena slices and predicate edges, but the
+// same walk handles CAST and arithmetic children so parameters cannot retain a
+// leaf-local ordinal through either form.
+func cloneRecursiveSQLScalar(
+	source *sqlast.ScalarExpr,
+	absoluteBase int,
+	ownerParams int,
+) (*sqlast.ScalarExpr, error) {
+	if source == nil {
+		return nil, nil
+	}
+	scalar := new(sqlast.ScalarExpr)
+	*scalar = *source
+	scalar.Path = cloneRecursiveSQLPath(source.Path)
+	if err := rebaseRecursiveSQLOperand(
+		&scalar.Value, absoluteBase, ownerParams,
+	); err != nil {
+		return nil, err
+	}
+	var err error
+	scalar.Left, err = cloneRecursiveSQLScalar(
+		source.Left, absoluteBase, ownerParams,
+	)
+	if err != nil {
+		return nil, err
+	}
+	scalar.Right, err = cloneRecursiveSQLScalar(
+		source.Right, absoluteBase, ownerParams,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(source.Whens) != 0 {
+		scalar.Whens = append([]sqlast.ScalarWhen(nil), source.Whens...)
+		for i := range scalar.Whens {
+			arm := &scalar.Whens[i]
+			arm.Predicate, err = cloneRecursiveSQLExprTree(
+				source.Whens[i].Predicate, absoluteBase, ownerParams, true,
+			)
+			if err != nil {
+				return nil, err
+			}
+			arm.Match, err = cloneRecursiveSQLScalar(
+				source.Whens[i].Match, absoluteBase, ownerParams,
+			)
+			if err != nil {
+				return nil, err
+			}
+			arm.Result, err = cloneRecursiveSQLScalar(
+				source.Whens[i].Result, absoluteBase, ownerParams,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	scalar.Else, err = cloneRecursiveSQLScalar(
+		source.Else, absoluteBase, ownerParams,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return scalar, nil
+}
+
+func cloneRecursiveSQLPath(source *sqlast.PathExpr) *sqlast.PathExpr {
+	if source == nil {
+		return nil
+	}
+	path := new(sqlast.PathExpr)
+	*path = *source
+	if len(source.Segments) != 0 {
+		path.Segments = append([]sqlast.Segment(nil), source.Segments...)
+	}
+	return path
 }
 
 func cloneRecursiveSQLOperand(

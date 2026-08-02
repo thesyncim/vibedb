@@ -18,12 +18,16 @@ type stmt struct {
 	tree           *sqlast.Statement
 	query          *query.Statement
 	mutation       *query.DMLStatement
+	insertSource   *insertSelectPlan
 	views          *preparedViewState
 	pointPredicate *sqlast.Expr
 	primaryPoint   bool
 	catalogJoin    bool
 	params         int
 	paramKinds     []ParamKind
+	// paramPositions stores authored byte positions plus one for document
+	// placeholders only. It remains nil for the scalar-only path.
+	paramPositions []int
 	dependencies   []physicalDependency
 	explain        bool
 	analyze        bool
@@ -80,11 +84,13 @@ func (s *stmt) Close() error {
 	s.tree = nil
 	s.query = nil
 	s.mutation = nil
+	s.insertSource = nil
 	s.views = nil
 	s.pointPredicate = nil
 	s.primaryPoint = false
 	s.catalogJoin = false
 	s.paramKinds = nil
+	s.paramPositions = nil
 	s.dependencies = nil
 	s.explain = false
 	s.analyze = false
@@ -184,12 +190,12 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	if s.mutation != nil {
 		var cursor query.Cursor
 		if s.conn.tx != nil {
-			cursor, err = s.conn.tx.execMutationReturningContext(
-				ctx, s.mutation, args, s.query,
+			cursor, err = s.conn.tx.execPreparedMutationReturningContext(
+				ctx, s, args,
 			)
 		} else {
-			cursor, err = s.conn.mutationReturningContext(
-				ctx, s.mutation, args, s.query,
+			cursor, err = s.conn.preparedMutationReturningContext(
+				ctx, s, args,
 			)
 		}
 		if err != nil {
@@ -837,7 +843,7 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 		if err := contextCheckpoint(ctx); err != nil {
 			return nil, err
 		}
-		return s.conn.tx.execMutationContext(ctx, s.mutation, args)
+		return s.conn.tx.execPreparedMutationContext(ctx, s, args)
 	}
-	return s.conn.execMutationContext(ctx, s.mutation, args)
+	return s.conn.execPreparedMutationContext(ctx, s, args)
 }

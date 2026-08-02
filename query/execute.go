@@ -1523,7 +1523,10 @@ func (p *plan) runProjectionInto(dst *Result, ctx *execCtx, selected []int, w *W
 			return err
 		}
 		for c, col := range p.columns {
-			cell := cellFromScalar(ctx.values[col.value][row])
+			cell := Cell{kind: TypeNull}
+			if col.value >= 0 {
+				cell = cellFromScalar(ctx.values[col.value][row])
+			}
 			if err := dst.admitResultCell(cell); err != nil {
 				return err
 			}
@@ -1758,8 +1761,9 @@ func prepareResult(dst *Result, p *plan, rows int) error {
 		dst.Columns = make([]ResultColumn, len(p.columns))
 	} else {
 		for i := len(p.columns); i < len(dst.Columns); i++ {
-			clear(dst.Columns[i].Cells)
-			dst.Columns[i] = ResultColumn{}
+			cells := dst.Columns[i].Cells
+			clear(cells)
+			dst.Columns[i] = ResultColumn{Cells: cells[:0]}
 		}
 		dst.Columns = dst.Columns[:len(p.columns)]
 	}

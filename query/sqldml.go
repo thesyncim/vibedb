@@ -11,6 +11,38 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
+// ErrInsertSelectShape reports an INSERT query source that cannot supply one
+// complete JSON document per row.
+var ErrInsertSelectShape = fmt.Errorf(
+	"%w: INSERT SELECT source must return exactly one JSON document column",
+	ErrParameterType,
+)
+
+// InsertSelectShapeError carries the source position and the observed shape.
+// Adapters use Position for protocol diagnostics and errors.Is for stable
+// SQLSTATE mapping.
+type InsertSelectShapeError struct {
+	Pos     int
+	Columns int
+	Type    ValueType
+	Row     int
+}
+
+func (e *InsertSelectShapeError) Error() string {
+	if e.Columns != 1 {
+		return fmt.Sprintf("%v; source exposes %d columns", ErrInsertSelectShape, e.Columns)
+	}
+	if e.Row >= 0 {
+		return fmt.Sprintf(
+			"%v; source row %d has type %v", ErrInsertSelectShape, e.Row+1, e.Type,
+		)
+	}
+	return fmt.Sprintf("%v; source column has type %v", ErrInsertSelectShape, e.Type)
+}
+
+func (e *InsertSelectShapeError) Unwrap() error { return ErrInsertSelectShape }
+func (e *InsertSelectShapeError) Position() int { return e.Pos }
+
 // The mutation and definition front end: a parsed INSERT, UPDATE, DELETE,
 // CREATE TABLE, or CREATE INDEX lowered to the values a storage layer can act
 // on.
@@ -114,6 +146,15 @@ type DMLStatement struct {
 	// statement needs no predicate evaluation — an INSERT, a DELETE with no
 	// WHERE, or a DDL statement.
 	filter *Statement
+	// source is the independently compiled SELECT of INSERT ... SELECT. It is
+	// never the RETURNING projection: source reads the statement snapshot and
+	// RETURNING consumes only the admitted write set.
+	source *Statement
+	// insertDocumentPositions is allocated only for INSERT query sources that
+	// contain placeholders on a complete-document output lineage. Each entry is
+	// the authored byte position plus one; zero retains ordinary scalar meaning
+	// and keeps a placeholder at byte zero representable without a second mask.
+	insertDocumentPositions []int
 	// all marks a DELETE written without a WHERE, which acts on every document.
 	// It is distinct from "filter is nil" so that no code path can arrive at
 	// "every document" by failing to look at one pointer.
@@ -175,6 +216,24 @@ func PrepareParsedDML(
 	switch tree.Kind {
 	case sqlast.KindInsert:
 		d.kind = DMLInsert
+		if tree.Insert.Source != nil {
+			source, err := prepareTree(src, tree.Insert.Source)
+			if err != nil {
+				return nil, err
+			}
+			d.source = source
+			if err := validateInsertSelectShape(d.source, tree.Insert); err != nil {
+				d.source.Release()
+				d.source = nil
+				return nil, err
+			}
+			if d.params != 0 {
+				d.insertDocumentPositions = make([]int, d.params)
+			}
+			d.source.markInsertDocumentOutput(
+				0, 0, d.insertDocumentPositions, 0,
+			)
+		}
 	case sqlast.KindUpdate:
 		d.kind = DMLUpdate
 		if err := d.prepareFilter(src, tree.Update.Filter, false); err != nil {
@@ -202,6 +261,30 @@ func PrepareParsedDML(
 		)
 	}
 	return d, nil
+}
+
+func validateInsertSelectShape(source *Statement, insert *sqlast.InsertStmt) error {
+	columns := source.Columns()
+	pos := insert.SourcePos
+	if len(columns) != 1 {
+		if len(insert.Source.Columns) > 1 {
+			pos = insert.Source.Columns[1].Pos
+		}
+		return &InsertSelectShapeError{
+			Pos: pos, Columns: len(columns), Row: -1,
+		}
+	}
+	schema := source.AppendSchema(nil)
+	if len(schema) == 1 && schema[0].Type != TypeAny &&
+		schema[0].Type != TypeJSON {
+		if len(insert.Source.Columns) != 0 {
+			pos = insert.Source.Columns[0].Pos
+		}
+		return &InsertSelectShapeError{
+			Pos: pos, Columns: 1, Type: schema[0].Type, Row: -1,
+		}
+	}
+	return nil
 }
 
 // prepareFilter compiles the statement's row selection unless the statement
@@ -242,6 +325,15 @@ func (d *DMLStatement) SQL() string { return d.text }
 // with a second place for a field to be forgotten.
 func (d *DMLStatement) Tree() *sqlast.Statement { return d.tree }
 
+// InsertSource returns the independently prepared query source of INSERT ...
+// SELECT, or nil for every VALUES insert and other statement kind.
+func (d *DMLStatement) InsertSource() *Statement {
+	if d == nil || d.kind != DMLInsert {
+		return nil
+	}
+	return d.source
+}
+
 // ScansEveryDocument reports whether executing this statement means visiting
 // every document of the collection: true for a filtered UPDATE or DELETE and
 // for one written without a WHERE, false for INSERT and DDL.
@@ -264,6 +356,7 @@ func (d *DMLStatement) Release() {
 		return
 	}
 	d.filter.Release()
+	d.source.Release()
 	d.scan.Release()
 	*d = DMLStatement{}
 }

@@ -29,18 +29,27 @@ func (c scalarExprContext) clause() string {
 }
 
 type scalarParserState struct {
-	nodes chunkArena[ScalarExpr]
-	depth int
-	sized bool
+	nodes       chunkArena[ScalarExpr]
+	whenRuns    chunkArena[ScalarWhen]
+	whenScratch []ScalarWhen
+	depth       int
+	caseItems   int
+	caseTruth   int
+	sized       bool
 }
 
 func (s *scalarParserState) reset() {
 	if !s.sized {
 		s.nodes.first = 16
+		s.whenRuns.first = 8
 		s.sized = true
 	}
 	s.nodes.rewind()
+	s.whenRuns.rewind()
+	s.whenScratch = s.whenScratch[:0]
 	s.depth = 0
+	s.caseItems = 0
+	s.caseTruth = 0
 }
 
 func (p *Parser) scalarState() *scalarParserState {
@@ -211,10 +220,7 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 		p.advance()
 		return p.newScalar(ScalarNull, pos), nil
 	case p.atKeyword(kwCase):
-		return nil, newFeatureNotSupportedError(
-			p.lx.src, pos,
-			"CASE scalar expressions are not supported by this execution slice yet",
-		)
+		return p.parseScalarCase(ctx)
 	case p.atKeyword(kwCast):
 		return p.parseScalarCast(ctx)
 	case p.tok.kind == tokNumber, p.tok.kind == tokString,
@@ -350,4 +356,11 @@ func shiftScalarPositions(expr *ScalarExpr, delta int) {
 	}
 	shiftScalarPositions(expr.Left, delta)
 	shiftScalarPositions(expr.Right, delta)
+	shiftScalarPositions(expr.Else, delta)
+	for i := range expr.Whens {
+		expr.Whens[i].Pos += delta
+		shiftExprPositions(expr.Whens[i].Predicate, delta)
+		shiftScalarPositions(expr.Whens[i].Match, delta)
+		shiftScalarPositions(expr.Whens[i].Result, delta)
+	}
 }

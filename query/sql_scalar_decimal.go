@@ -298,6 +298,15 @@ func (d *sqlScalarDecimal) divide(pos int, budget *aggregateBudget) (int64, erro
 	if err != nil {
 		return 0, d.rangeError(pos, "division", math.MaxInt64, budget)
 	}
+	// Zero has one canonical exact representation regardless of either
+	// operand's authored exponent. More importantly, the binary-GCD reduction
+	// below requires two non-zero magnitudes: subtracting zero from the
+	// denominator cannot make progress. Keep this branch before reduceFraction
+	// so 0/nonzero is constant-time and allocation-free.
+	if d.a.Sign() == 0 {
+		d.result.SetInt64(0)
+		return 0, nil
+	}
 	sign := d.a.Sign() * d.b.Sign()
 	d.left.Abs(&d.a)
 	d.den.Abs(&d.b)

@@ -2,10 +2,11 @@ package distribution
 
 import "slices"
 
-// Router turns bound constraints into an immutable Route against one immutable
-// manifest under a RoutePolicy. It reuses internal scratch buffers across calls
-// to keep the single-key hot path lean, so it is not safe for concurrent use:
-// use one Router per goroutine. The manifest it reads remains safe to share.
+// Router turns bound constraints into a Route against one immutable manifest
+// under a RoutePolicy. Route returns freshly owned targets; RouteInto may reuse
+// caller-owned target storage. The router reuses internal scratch buffers across
+// calls, so it is not safe for concurrent use: use one Router per goroutine. The
+// manifest it reads remains safe to share.
 type Router struct {
 	codec TupleCodec
 	dom   []canonSet // per-ordinal deduplicated finite domains for the chosen prefix
@@ -13,6 +14,11 @@ type Router struct {
 	idx   []int      // Cartesian odometer
 	dest  DestinationSet
 	hits  []int // selected shard indices
+	// mapPoints/mapRanges are the one-destination scratch guaranteed sufficient
+	// for NativeMapper. Keeping them on Router prevents slices passed through the
+	// optional MapperInto interface from forcing per-call stack arrays to escape.
+	mapPoints [1]KeyspacePoint
+	mapRanges [1]KeyRange
 }
 
 // NewRouter returns a Router that encodes canonical bytes with the frozen
@@ -34,6 +40,33 @@ func NewRouter() *Router {
 // documented truth table, and leader-only targets carry each shard's ownership
 // epoch from the manifest.
 func (r *Router) Route(cons BoundConstraints, mapper Mapper, man *Manifest, policy RoutePolicy) (Route, error) {
+	return r.route(cons, mapper, man, policy, nil)
+}
+
+// RouteInto resolves cons like [Router.Route], but materializes the returned
+// targets into targetScratch when its capacity is sufficient. The returned
+// Route owns that caller-provided slice until the caller reuses it. This removes
+// target allocation for short-lived routing decisions. A warmed single-
+// destination route is allocation-free when mapper implements [MapperInto];
+// routes that require destination normalization may still allocate. Route keeps
+// its immutable freshly-owned result contract for plans that retain a route.
+func (r *Router) RouteInto(
+	cons BoundConstraints,
+	mapper Mapper,
+	man *Manifest,
+	policy RoutePolicy,
+	targetScratch []Target,
+) (Route, error) {
+	return r.route(cons, mapper, man, policy, targetScratch)
+}
+
+func (r *Router) route(
+	cons BoundConstraints,
+	mapper Mapper,
+	man *Manifest,
+	policy RoutePolicy,
+	targetScratch []Target,
+) (Route, error) {
 	policy = policy.normalized()
 
 	var dist DistributionName
@@ -65,7 +98,7 @@ func (r *Router) Route(cons BoundConstraints, mapper Mapper, man *Manifest, poli
 	chosen := mapper.SupportedPrefixes().LongestAtMost(avail)
 	if chosen == 0 {
 		// No usable prefix: the route is unknown and therefore scatter.
-		return r.scatterOrReject(policy, man, dist, ver)
+		return r.scatterOrReject(policy, man, dist, ver, targetScratch)
 	}
 
 	// 3. Deduplicate each finite domain by canonical bytes before expansion,
@@ -87,7 +120,7 @@ func (r *Router) Route(cons BoundConstraints, mapper Mapper, man *Manifest, poli
 	}
 	if productExceeds(r.dom[:chosen], policy.Limits.MaxCandidateMappings) {
 		if policy.Admission == AdmissionAllowScatterOnOverflow {
-			return r.scatterAll(man, dist, ver), nil
+			return r.scatterAll(man, dist, ver, targetScratch), nil
 		}
 		return Route{}, &ExpansionLimitError{Limit: policy.Limits.MaxCandidateMappings}
 	}
@@ -127,13 +160,15 @@ func (r *Router) Route(cons BoundConstraints, mapper Mapper, man *Manifest, poli
 		if policy.Admission == AdmissionTargetedOnly {
 			return Route{}, ErrScatterRejected
 		}
-		return r.buildRoute(RouteScatter, man, r.hits, dist, ver), nil
+		return r.buildRoute(
+			RouteScatter, man, r.hits, dist, ver, targetScratch,
+		), nil
 	}
 
 	// 7. Otherwise enforce the target-shard limit, then classify.
 	if sel > policy.Limits.MaxTargetShards {
 		if policy.Admission == AdmissionAllowScatterOnOverflow {
-			return r.scatterAll(man, dist, ver), nil
+			return r.scatterAll(man, dist, ver, targetScratch), nil
 		}
 		return Route{}, &TargetLimitError{Limit: policy.Limits.MaxTargetShards, Count: sel}
 	}
@@ -141,30 +176,44 @@ func (r *Router) Route(cons BoundConstraints, mapper Mapper, man *Manifest, poli
 	if sel == 1 {
 		kind = RouteSingle
 	}
-	return r.buildRoute(kind, man, r.hits, dist, ver), nil
+	return r.buildRoute(kind, man, r.hits, dist, ver, targetScratch), nil
 }
 
 // scatterOrReject handles an unknown route: rejected under targeted-only
 // admission, otherwise a scatter over every active shard.
-func (r *Router) scatterOrReject(policy RoutePolicy, man *Manifest, dist DistributionName, ver RoutingVersion) (Route, error) {
+func (r *Router) scatterOrReject(
+	policy RoutePolicy,
+	man *Manifest,
+	dist DistributionName,
+	ver RoutingVersion,
+	targetScratch []Target,
+) (Route, error) {
 	if policy.Admission == AdmissionTargetedOnly {
 		return Route{}, ErrScatterRejected
 	}
-	return r.scatterAll(man, dist, ver), nil
+	return r.scatterAll(man, dist, ver, targetScratch), nil
 }
 
 // scatterAll builds a RouteScatter over every active shard.
-func (r *Router) scatterAll(man *Manifest, dist DistributionName, ver RoutingVersion) Route {
+func (r *Router) scatterAll(
+	man *Manifest,
+	dist DistributionName,
+	ver RoutingVersion,
+	targetScratch []Target,
+) Route {
 	r.hits = r.hits[:0]
 	for i := 0; i < man.ShardCount(); i++ {
 		r.hits = append(r.hits, i)
 	}
-	return r.buildRoute(RouteScatter, man, r.hits, dist, ver)
+	return r.buildRoute(
+		RouteScatter, man, r.hits, dist, ver, targetScratch,
+	)
 }
 
 // expand walks the Cartesian product of the deduplicated finite domains,
 // admitting and mapping each combination and accumulating its destinations.
 func (r *Router) expand(chosen int, mapper Mapper) error {
+	mapperInto, hasInto := mapper.(MapperInto)
 	r.combo = r.combo[:0]
 	r.idx = r.idx[:0]
 	for i := 0; i < chosen; i++ {
@@ -178,7 +227,15 @@ func (r *Router) expand(chosen int, mapper Mapper) error {
 		if err := mapper.Admits(chosen, r.combo); err != nil {
 			return err
 		}
-		ds, err := mapper.MapPrefix(r.combo)
+		var ds DestinationSet
+		var err error
+		if hasInto {
+			ds, err = mapperInto.MapPrefixInto(
+				r.combo, r.mapPoints[:0], r.mapRanges[:0],
+			)
+		} else {
+			ds, err = mapper.MapPrefix(r.combo)
+		}
 		if err != nil {
 			return err
 		}
@@ -201,10 +258,22 @@ func (r *Router) expand(chosen int, mapper Mapper) error {
 }
 
 // buildRoute selects leader-only targets for the given shard indices, carrying
-// each shard's ownership epoch, and returns an immutable Route whose Targets
-// slice is freshly allocated and safe to retain.
-func (r *Router) buildRoute(kind RouteKind, man *Manifest, idx []int, dist DistributionName, ver RoutingVersion) Route {
-	targets := make([]Target, len(idx))
+// each shard's ownership epoch. It reuses targetScratch when capacity permits;
+// otherwise it returns a freshly allocated Targets slice.
+func (r *Router) buildRoute(
+	kind RouteKind,
+	man *Manifest,
+	idx []int,
+	dist DistributionName,
+	ver RoutingVersion,
+	targetScratch []Target,
+) Route {
+	var targets []Target
+	if cap(targetScratch) < len(idx) {
+		targets = make([]Target, len(idx))
+	} else {
+		targets = targetScratch[:len(idx)]
+	}
 	for k, i := range idx {
 		s := man.shards[i]
 		targets[k] = Target{

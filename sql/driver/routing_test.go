@@ -53,10 +53,12 @@ func newTestBinding(t *testing.T, columns []string, manifest *distribution.Manif
 		}
 		pointers[i] = p
 	}
+	native := distribution.NewNativeMapper(len(columns))
 	return &placementBinding{
 		placement: distribution.TablePlacement{Table: "t", Distribution: "d", Columns: columns},
 		spec:      distribution.DistributionSpec{Name: "d", Arity: len(columns), MapperVersion: distribution.NativeMapperVersion},
-		mapper:    distribution.NewNativeMapper(len(columns)),
+		mapper:    native,
+		native:    native,
 		manifest:  manifest,
 		pointers:  pointers,
 	}

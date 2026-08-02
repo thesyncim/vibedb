@@ -145,6 +145,42 @@ func (c *statementCTEs) find(tree *sqlast.SelectStmt) *statementCTE {
 	return nil
 }
 
+// markInsertDocumentOutput crosses one CTE publication boundary using the
+// already prepared definition identity. Recursive SQL owns distinct full-frame
+// anchor and term Statements; both can contribute rows and therefore both must
+// receive the output role. A recursive delta target is execution input rather
+// than an authored producer and is deliberately terminal.
+func (c *statementCTE) markInsertDocumentOutput(
+	output int,
+	positions []int,
+	depth int,
+) {
+	if c == nil || output < 0 || depth > maxInsertDocumentLineageDepth {
+		return
+	}
+	if recursive := c.recursiveDefinition; recursive != nil {
+		if recursive.anchorStmt != nil {
+			recursive.anchorStmt.markInsertDocumentOutput(
+				output, 0, positions, depth+1,
+			)
+		}
+		if recursive.recursiveStmt != nil {
+			recursive.recursiveStmt.markInsertDocumentOutput(
+				output, 0, positions, depth+1,
+			)
+		}
+		return
+	}
+	if c.recursiveOwner != nil {
+		return
+	}
+	if c.stmt != nil {
+		c.stmt.markInsertDocumentOutput(
+			output, c.argBase, positions, depth+1,
+		)
+	}
+}
+
 func (s *Statement) prepareCTEDefinitions(argBase int) error {
 	catalog := s.cteCatalog()
 	if catalog == nil || s.tree.With == nil {
@@ -476,11 +512,14 @@ func (d *statementCTE) materializeInto(
 	if err != nil {
 		return 0, err
 	}
-	nestedSource, err := src.subquerySource(
-		consumer.Collection(), d.stmt.Collection(),
-	)
-	if err != nil {
-		return 0, err
+	nestedSource := src
+	if !d.stmt.resolvesOwnSetSources() {
+		nestedSource, err = src.subquerySource(
+			consumer.Collection(), d.stmt.Collection(),
+		)
+		if err != nil {
+			return 0, err
+		}
 	}
 	d.exec.Options = parent.Options
 	d.runEvaluations++

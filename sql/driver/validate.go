@@ -36,6 +36,16 @@ func (c *conn) validateSurfaceContext(
 				return reservedDocumentPathError(statement.Insert.Columns[i])
 			}
 		}
+		if statement.Insert.Source != nil {
+			if err := rlockContext(ctx, &c.db.mu); err != nil {
+				return err
+			}
+			err := c.validateSelectTables(statement.Insert.Source)
+			c.db.mu.RUnlock()
+			if err != nil {
+				return err
+			}
+		}
 	case sqlast.KindCreateIndex:
 		for i := range statement.CreateIndex.Paths {
 			if pseudoDocumentPath(statement.CreateIndex.Paths[i]) {

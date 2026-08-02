@@ -338,7 +338,41 @@ func scalarDependencyKinds(expr *ScalarExpr) (path, aggregate bool) {
 	}
 	lp, la := scalarDependencyKinds(expr.Left)
 	rp, ra := scalarDependencyKinds(expr.Right)
-	return path || lp || rp, aggregate || la || ra
+	ep, ea := scalarDependencyKinds(expr.Else)
+	path, aggregate = path || lp || rp || ep, aggregate || la || ra || ea
+	for i := range expr.Whens {
+		arm := &expr.Whens[i]
+		mp, ma := scalarDependencyKinds(arm.Match)
+		vp, va := scalarDependencyKinds(arm.Result)
+		pp, pa := predicateScalarDependencyKinds(arm.Predicate)
+		path = path || mp || vp || pp
+		aggregate = aggregate || ma || va || pa
+	}
+	return path, aggregate
+}
+
+func predicateScalarDependencyKinds(expr *Expr) (path, aggregate bool) {
+	if expr == nil {
+		return false, false
+	}
+	for _, scalar := range []*ScalarExpr{expr.ScalarLeft, expr.ScalarRight} {
+		p, a := scalarDependencyKinds(scalar)
+		path, aggregate = path || p, aggregate || a
+	}
+	if expr.Path != nil && expr.Agg == AggNone {
+		path = true
+	}
+	if expr.Agg != AggNone {
+		aggregate = true
+	}
+	if expr.RightPath != nil {
+		path = true
+	}
+	for _, kid := range expr.Kids {
+		p, a := predicateScalarDependencyKinds(kid)
+		path, aggregate = path || p, aggregate || a
+	}
+	return path, aggregate
 }
 
 func firstUngroupedScalarPath(p *Parser, expr *ScalarExpr) *PathExpr {
@@ -351,7 +385,50 @@ func firstUngroupedScalarPath(p *Parser, expr *ScalarExpr) *PathExpr {
 	if path := firstUngroupedScalarPath(p, expr.Left); path != nil {
 		return path
 	}
-	return firstUngroupedScalarPath(p, expr.Right)
+	if path := firstUngroupedScalarPath(p, expr.Right); path != nil {
+		return path
+	}
+	if path := firstUngroupedScalarPath(p, expr.Else); path != nil {
+		return path
+	}
+	for i := range expr.Whens {
+		arm := &expr.Whens[i]
+		if path := firstUngroupedScalarPath(p, arm.Match); path != nil {
+			return path
+		}
+		if path := firstUngroupedScalarPath(p, arm.Result); path != nil {
+			return path
+		}
+		if path := firstUngroupedPredicatePath(p, arm.Predicate); path != nil {
+			return path
+		}
+	}
+	return nil
+}
+
+func firstUngroupedPredicatePath(p *Parser, expr *Expr) *PathExpr {
+	if expr == nil {
+		return nil
+	}
+	for _, path := range []*PathExpr{expr.Path, expr.RightPath} {
+		if path == expr.Path && expr.Agg != AggNone {
+			continue
+		}
+		if path != nil && !p.isGroupKey(path) {
+			return path
+		}
+	}
+	for _, scalar := range []*ScalarExpr{expr.ScalarLeft, expr.ScalarRight} {
+		if path := firstUngroupedScalarPath(p, scalar); path != nil {
+			return path
+		}
+	}
+	for _, kid := range expr.Kids {
+		if path := firstUngroupedPredicatePath(p, kid); path != nil {
+			return path
+		}
+	}
+	return nil
 }
 
 func (p *Parser) rejectLateralForwardAlias(alias string, source int) error {

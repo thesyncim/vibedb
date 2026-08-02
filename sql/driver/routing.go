@@ -11,6 +11,7 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // placementBinding is the runtime routing context for one placed table: its
@@ -22,6 +23,7 @@ type placementBinding struct {
 	placement distribution.TablePlacement
 	spec      distribution.DistributionSpec
 	mapper    distribution.Mapper
+	native    *distribution.NativeMapper
 	manifest  *distribution.Manifest
 	policy    distribution.RoutePolicy
 	pointers  []vibejson.CompiledPointer
@@ -70,10 +72,12 @@ func newPlacementBinding(cfg distribution.ClusterConfig, table string) (*placeme
 		}
 		pointers[i] = p
 	}
+	native := distribution.NewNativeMapper(spec.Arity)
 	return &placementBinding{
 		placement: placement,
 		spec:      spec,
-		mapper:    distribution.NewNativeMapper(spec.Arity),
+		mapper:    native,
+		native:    native,
 		manifest:  manifest,
 		pointers:  pointers,
 	}, true, nil
@@ -365,64 +369,136 @@ func numberScalar(spelling string) (distribution.Scalar, bool, error) {
 // insert or replacement document, one per placement column, using the same
 // compiled-pointer + GetRaw path documentKey uses for the primary key. A
 // missing, null, or non-scalar shard-key value is a routing error.
-func documentShardKey(document []byte, binding *placementBinding, dst []distribution.Scalar) ([]distribution.Scalar, error) {
+func documentShardKey(
+	document []byte,
+	binding *placementBinding,
+	dst []distribution.Scalar,
+	textScratch []byte,
+) ([]distribution.Scalar, []byte, error) {
 	dst = dst[:0]
+	textScratch = textScratch[:0]
 	for i, ptr := range binding.pointers {
 		value, found, err := ptr.GetRaw(document)
 		if err != nil {
-			return dst, fmt.Errorf("vibedb: invalid JSON document: %w", err)
+			return dst, textScratch, fmt.Errorf("vibedb: invalid JSON document: %w", err)
 		}
 		column := binding.placement.Columns[i]
 		if !found {
-			return dst, fmt.Errorf("vibedb: shard-key column %q is missing", column)
+			return dst, textScratch, fmt.Errorf("vibedb: shard-key column %q is missing", column)
 		}
 		if value.IsNull() {
-			return dst, fmt.Errorf("vibedb: shard-key column %q is null", column)
+			return dst, textScratch, fmt.Errorf("vibedb: shard-key column %q is null", column)
 		}
 		switch value.Kind() {
 		case jsondoc.String:
-			text, ok, err := value.Text()
+			if text, ok := value.StringBytes(); ok {
+				dst = append(dst, distribution.NewString(byteview.String(text)))
+				break
+			}
+			// The first escaped component reserves the whole document length. The
+			// sum of all decoded shard-key strings cannot exceed their source JSON,
+			// so later components cannot reallocate and invalidate Scalars already
+			// aliasing this caller-owned scratch.
+			if cap(textScratch) < len(document) {
+				textScratch = make([]byte, 0, len(document))
+			}
+			start := len(textScratch)
+			var ok bool
+			textScratch, ok, err = value.AppendText(textScratch)
 			if err != nil {
-				return dst, fmt.Errorf(
+				return dst, textScratch, fmt.Errorf(
 					"vibedb: shard-key column %q has an invalid JSON string: %w", column, err)
 			}
 			if !ok {
-				return dst, fmt.Errorf(
+				return dst, textScratch, fmt.Errorf(
 					"vibedb: shard-key column %q has an invalid JSON string", column)
 			}
-			dst = append(dst, distribution.NewString(text))
+			dst = append(dst, distribution.NewString(
+				byteview.String(textScratch[start:]),
+			))
 		case jsondoc.Number:
 			number, ok := value.NumberText()
 			if !ok {
-				return dst, fmt.Errorf(
+				return dst, textScratch, fmt.Errorf(
 					"vibedb: shard-key column %q is not a valid JSON number", column)
 			}
 			scalar, err := distribution.NewNumber(number)
 			if err != nil {
-				return dst, fmt.Errorf("vibedb: shard-key column %q: %w", column, err)
+				return dst, textScratch, fmt.Errorf("vibedb: shard-key column %q: %w", column, err)
 			}
 			dst = append(dst, scalar)
 		default:
-			return dst, fmt.Errorf(
+			return dst, textScratch, fmt.Errorf(
 				"vibedb: shard-key column %q must be a JSON string or number", column)
 		}
 	}
-	return dst, nil
+	return dst, textScratch, nil
 }
 
 // routeShardKey routes one full shard key (one scalar per placement column) to
-// an immutable route. A full key resolves to a single keyspace point and so to
-// exactly one shard.
-func routeShardKey(binding *placementBinding, router *distribution.Router, key []distribution.Scalar) (distribution.Route, error) {
-	cons := make(distribution.BoundConstraints, len(key))
-	for i := range key {
-		domain, err := distribution.FiniteDomain(key[i])
-		if err != nil {
-			return distribution.Route{}, err
-		}
-		cons[i] = domain
+// its fenced leader target. A full native key resolves to one keyspace point,
+// so this path bypasses relation-style destination slices entirely.
+func routeShardKey(
+	binding *placementBinding,
+	key []distribution.Scalar,
+) (distribution.Target, error) {
+	if binding == nil || binding.native == nil || binding.manifest == nil {
+		return distribution.Target{}, errors.New(
+			"vibedb: incomplete placed-table routing binding",
+		)
 	}
-	return router.Route(cons, binding.mapper, binding.manifest, binding.policy)
+	point, err := binding.native.PointFor(key)
+	if err != nil {
+		return distribution.Target{}, err
+	}
+	target, ok := binding.manifest.ResolvePointTarget(point)
+	if !ok {
+		return distribution.Target{}, fmt.Errorf(
+			"%w: full shard key maps outside the active manifest",
+			ErrCrossShardWrite,
+		)
+	}
+	return target, nil
+}
+
+type insertPreflightState struct {
+	key    [distribution.KeyspaceWidth]distribution.Scalar
+	text   []byte
+	target distribution.Target
+	set    bool
+}
+
+func (s *insertPreflightState) add(
+	binding *placementBinding,
+	document []byte,
+	row int,
+) error {
+	key, text, err := documentShardKey(
+		document, binding, s.key[:0], s.text,
+	)
+	s.text = text
+	if err != nil {
+		return err
+	}
+	target, err := routeShardKey(binding, key)
+	if err != nil {
+		return err
+	}
+	if !s.set {
+		s.target = target
+		s.set = true
+		return nil
+	}
+	if target.Shard != s.target.Shard ||
+		target.Endpoint != s.target.Endpoint ||
+		target.OwnershipEpoch != s.target.OwnershipEpoch ||
+		target.Role != s.target.Role {
+		return fmt.Errorf(
+			"%w: row %d routes to a different shard than row 0",
+			ErrCrossShardWrite, row,
+		)
+	}
+	return nil
 }
 
 // insertPreflight routes every row of an insert to its physical shard, mapping
@@ -430,32 +506,22 @@ func routeShardKey(binding *placementBinding, router *distribution.Router, key [
 // do not all resolve to the same one shard return ErrCrossShardWrite; no row is
 // dispatched, matching version 1's single-target-shard rule.
 func insertPreflight(binding *placementBinding, router *distribution.Router, documents [][]byte) (distribution.Route, error) {
-	var chosen distribution.Route
-	var scratch []distribution.Scalar
+	_ = router // retained for source compatibility; full placed keys route directly.
+	var state insertPreflightState
 	for idx, document := range documents {
-		key, err := documentShardKey(document, binding, scratch)
-		if err != nil {
+		if err := state.add(binding, document, idx); err != nil {
 			return distribution.Route{}, err
-		}
-		scratch = key
-		route, err := routeShardKey(binding, router, key)
-		if err != nil {
-			return distribution.Route{}, err
-		}
-		if route.Kind != distribution.RouteSingle {
-			return distribution.Route{}, fmt.Errorf(
-				"%w: row %d does not resolve to a single shard", ErrCrossShardWrite, idx)
-		}
-		if idx == 0 {
-			chosen = route
-			continue
-		}
-		if !sameShardSet(chosen, route) {
-			return distribution.Route{}, fmt.Errorf(
-				"%w: row %d routes to a different shard than row 0", ErrCrossShardWrite, idx)
 		}
 	}
-	return chosen, nil
+	if !state.set {
+		return distribution.Route{Kind: distribution.RouteEmpty}, nil
+	}
+	return distribution.Route{
+		Kind:           distribution.RouteSingle,
+		Distribution:   binding.manifest.Distribution(),
+		RoutingVersion: binding.manifest.Version(),
+		Targets:        []distribution.Target{state.target},
+	}, nil
 }
 
 // singleShardRoute binds a placed update or delete predicate and requires it to
@@ -485,22 +551,41 @@ func singleShardRoute(prog *constraintProgram, router *distribution.Router, args
 // shards. It is a no-op when the update matched no rows. A replacement whose
 // shard-key columns route elsewhere returns ErrShardKeyImmutable.
 func checkShardKeyImmutable(binding *placementBinding, router *distribution.Router, target distribution.Route, replacement []byte) error {
+	_, err := checkShardKeyImmutableInto(
+		binding, router, target, replacement, nil,
+	)
+	return err
+}
+
+func checkShardKeyImmutableInto(
+	binding *placementBinding,
+	router *distribution.Router,
+	target distribution.Route,
+	replacement []byte,
+	textScratch []byte,
+) ([]byte, error) {
 	if target.Kind == distribution.RouteEmpty {
-		return nil
+		return textScratch, nil
 	}
-	key, err := documentShardKey(replacement, binding, nil)
+	var scratch [distribution.KeyspaceWidth]distribution.Scalar
+	key, textScratch, err := documentShardKey(
+		replacement, binding, scratch[:0], textScratch,
+	)
 	if err != nil {
-		return err
+		return textScratch, err
 	}
-	route, err := routeShardKey(binding, router, key)
+	routed, err := routeShardKey(binding, key)
 	if err != nil {
-		return err
+		return textScratch, err
 	}
-	if route.Kind != distribution.RouteSingle || !sameShardSet(target, route) {
-		return fmt.Errorf(
+	if len(target.Targets) != 1 || target.Targets[0].Shard != routed.Shard ||
+		target.Targets[0].Endpoint != routed.Endpoint ||
+		target.Targets[0].OwnershipEpoch != routed.OwnershipEpoch ||
+		target.Targets[0].Role != routed.Role {
+		return textScratch, fmt.Errorf(
 			"%w: replacement document routes to a different shard", ErrShardKeyImmutable)
 	}
-	return nil
+	return textScratch, nil
 }
 
 // sameShardSet reports whether two routes select the same physical shards.

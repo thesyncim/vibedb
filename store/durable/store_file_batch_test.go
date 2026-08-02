@@ -520,10 +520,8 @@ func TestCollectionUpdateNoOpBatchPublishesNothing(t *testing.T) {
 // TestCollectionUpdateLargeDocuments covers the batch path's document-size
 // boundary now that overflow-on-Put exists. A batch commits large inline
 // documents that nearly fill the inline leaf budget, atomically, and reads them
-// back across a reopen. A document past that budget is the single-document
-// overflow path's domain — the batch does not yet stage overflow chains, so it
-// refuses an over-budget value whole with ErrDocumentTooLarge rather than
-// truncating it or splitting the group, and the refusal publishes nothing.
+// back across a reopen. Documents past that budget use the same out-of-line
+// overflow representation as point puts while retaining one batch publication.
 func TestCollectionUpdateLargeDocuments(t *testing.T) {
 	options := testBatchOptions(8)
 	options.InlineValueBytes = 2048
@@ -559,7 +557,8 @@ func TestCollectionUpdateLargeDocuments(t *testing.T) {
 		t.Fatalf("length = %d, want %d", collection.Len(), len(want))
 	}
 
-	// A document past the inline budget is refused whole, publishing nothing.
+	// A document past the inline budget is represented by an overflow chain; the
+	// inline sibling and overflow value still publish as one batch generation.
 	generation := collection.Generation()
 	overflow := fmt.Appendf(nil, `{"pad":%q}`, strings.Repeat("O", options.InlineValueBytes))
 	if err := collection.Update(func(b *WriteBatch) error {
@@ -567,16 +566,15 @@ func TestCollectionUpdateLargeDocuments(t *testing.T) {
 			return err
 		}
 		return b.Put([]byte("too-big"), overflow)
-	}); !errors.Is(err, ErrDocumentTooLarge) {
-		t.Fatalf("over-budget batch = %v, want ErrDocumentTooLarge", err)
+	}); err != nil {
+		t.Fatalf("mixed inline/overflow batch: %v", err)
 	}
-	if collection.Generation() != generation {
-		t.Fatalf("refused over-budget batch published generation %d, want %d",
+	if collection.Generation() <= generation {
+		t.Fatalf("mixed inline/overflow batch generation = %d, want > %d",
 			collection.Generation(), generation)
 	}
-	if _, ok, _ := collection.AppendRaw(nil, []byte("ok")); ok {
-		t.Fatal("refused over-budget batch made its sibling visible")
-	}
+	want["ok"] = `{"v":1}`
+	want["too-big"] = string(overflow)
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -5,9 +5,11 @@ package query
 // below and handed to Select; they carry no compiled state until the query
 // compiles. The zero Column is invalid.
 type Column struct {
-	agg    aggKind
-	spec   string // path spec; empty for COUNT(*)
-	header string
+	agg             aggKind
+	spec            string // path spec; empty for COUNT(*)
+	header          string
+	semanticOnly    bool // validates SQL shape without materializing a value
+	cardinalityOnly bool // emits one payload-free NULL cell per source row
 }
 
 // aggKind names a column's reduction, or aggNone for a plain projection.

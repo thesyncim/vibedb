@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"errors"
+	"reflect"
 	"strconv"
 	"unicode/utf8"
 
@@ -47,6 +48,7 @@ const (
 	sqlstateDependentObjectsStillExist = "2BP01"
 	sqlstateInvalidColumnReference     = "42P10"
 	sqlstateInvalidTableDefinition     = "42P16"
+	sqlstateWrongObjectType            = "42809"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
 	sqlstateFeatureNotSupported        = "0A000"
@@ -89,6 +91,12 @@ type pgError struct {
 	code     string
 	message  string
 	hint     string
+	// cause retains the typed runtime error behind a protocol classification.
+	// ErrorResponse serialization deliberately exposes only the fields above,
+	// while in-process adapters and tests can still use errors.Is/errors.As to
+	// distinguish an unknown commit outcome and its underlying device failure.
+	// It is populated only on the error path and is never retained by a session.
+	cause error
 	// position is a 1-based character index into the statement text, or zero
 	// for none. Characters, not bytes: the protocol counts characters and a
 	// JSON key is arbitrary UTF-8, so a byte offset would point at the wrong
@@ -97,6 +105,11 @@ type pgError struct {
 }
 
 func (e *pgError) Error() string { return "pgwire: " + e.code + ": " + e.message }
+
+// Unwrap preserves the typed SQL/storage error after SQLSTATE classification.
+// In particular, a post-append durability failure continues to match both
+// durable.ErrCommitOutcomeUnknown and its root cause.
+func (e *pgError) Unwrap() error { return e.cause }
 
 // errorf builds an ERROR-severity failure.
 func newError(code, message string) *pgError {
@@ -109,6 +122,116 @@ func fatal(code, message string) *pgError {
 }
 
 func (e *pgError) withHint(hint string) *pgError { e.hint = hint; return e }
+
+func (e *pgError) withCause(cause error) *pgError {
+	if e != nil && e.cause == nil && cause != nil {
+		e.cause = cause
+		// Keep every pgError safe for the standard errors.Is/errors.As walkers.
+		// Those walkers intentionally do not detect cycles; retaining a cause
+		// graph which reaches e again would make later classification hang.
+		if !errorTreeAcyclic(e) {
+			e.cause = nil
+		}
+	}
+	return e
+}
+
+const maxProtocolErrorTreeNodes = 1024
+
+// errorTreeAcyclic validates the Unwrap graph before this package calls the
+// standard errors.Is/errors.As helpers or retains it behind a pgError. The Go
+// helpers deliberately trust error implementations and do not detect cycles.
+// Runtime/storage errors are small trees, so the bound also fails closed on a
+// hostile or accidentally unbounded custom wrapper without constraining any
+// legitimate chain.
+func errorTreeAcyclic(root error) bool {
+	if root == nil {
+		return true
+	}
+	type frame struct {
+		err  error
+		exit bool
+	}
+	stack := []frame{{err: root}}
+	// State 1 is on the active DFS path; state 2 is fully visited. Keeping the
+	// two states distinguishes a real cycle from a shared errors.Join subtree.
+	state := make(map[error]uint8)
+	visited := 0
+	for len(stack) != 0 {
+		last := len(stack) - 1
+		current := stack[last]
+		stack = stack[:last]
+		if current.err == nil {
+			continue
+		}
+
+		comparable := reflect.TypeOf(current.err).Comparable()
+		if current.exit {
+			if comparable {
+				state[current.err] = 2
+			}
+			continue
+		}
+		if comparable {
+			switch state[current.err] {
+			case 1:
+				return false
+			case 2:
+				continue
+			}
+			state[current.err] = 1
+		}
+		visited++
+		if visited > maxProtocolErrorTreeNodes {
+			return false
+		}
+		stack = append(stack, frame{err: current.err, exit: true})
+
+		switch unwrapped := current.err.(type) {
+		case interface{ Unwrap() []error }:
+			children := unwrapped.Unwrap()
+			if len(children) > maxProtocolErrorTreeNodes-visited ||
+				len(stack) > maxProtocolErrorTreeNodes-len(children) {
+				return false
+			}
+			for i := len(children) - 1; i >= 0; i-- {
+				stack = append(stack, frame{err: children[i]})
+			}
+		case interface{ Unwrap() error }:
+			if next := unwrapped.Unwrap(); next != nil {
+				if len(stack) >= maxProtocolErrorTreeNodes {
+					return false
+				}
+				stack = append(stack, frame{err: next})
+			}
+		}
+	}
+	return true
+}
+
+func invalidErrorTree() *pgError {
+	return newError(sqlstateInternalError,
+		"the runtime returned a cyclic or excessively deep error cause chain")
+}
+
+// classifiedProtocolError recognizes an error already classified by the
+// protocol while still applying cycle safety and authoritative outer
+// classifications such as statement_completion_unknown. The boolean is false
+// for transport/runtime errors that have not crossed a SQLSTATE mapping
+// boundary.
+func classifiedProtocolError(err error) (*pgError, bool) {
+	if err == nil {
+		return nil, false
+	}
+	if !errorTreeAcyclic(err) {
+		return invalidErrorTree(), true
+	}
+	var classified *pgError
+	if !errors.As(err, &classified) {
+		return nil, false
+	}
+	return asPGErrorAcyclic(err), true
+}
 
 // errorResponse writes e as an ErrorResponse.
 //
@@ -165,10 +288,44 @@ func asPGError(err error) *pgError {
 	if err == nil {
 		return nil
 	}
+	if !errorTreeAcyclic(err) {
+		return invalidErrorTree()
+	}
+	return asPGErrorAcyclic(err)
+}
+
+func asPGErrorAcyclic(err error) (mapped *pgError) {
+	// A direct pgError is already the protocol's authoritative classification.
+	// Preserve pointer identity: callers may have added position/hint fields and
+	// no outer runtime wrapper exists from which to infer a competing outcome.
+	if direct, ok := err.(*pgError); ok {
+		return direct
+	}
+	// Unknown completion changes the client's safe retry decision and therefore
+	// dominates cancellation and every ordinary runtime or protocol
+	// classification in the same error tree. Checking it before an existing
+	// nested *pgError is essential: errors.Join(queryCanceled(), unknownOutcome)
+	// must never invite the client to assume that no publication occurred.
+	if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		return newError(sqlstateStatementCompletionUnknown, err.Error()).
+			withCause(err)
+	}
 	var already *pgError
 	if errors.As(err, &already) {
-		return already
+		// Preserve an existing, more-specific SQLSTATE while retaining an outer
+		// wrapper or errors.Join sibling. Pointing already.cause back at err
+		// would create an unwrap cycle because err itself contains already, so
+		// classify with a shallow copy whose cause is the complete outer chain.
+		clone := *already
+		clone.cause = nil
+		clone.withCause(err)
+		return &clone
 	}
+	// SQLSTATE is an additional protocol classification, not a replacement for
+	// the typed runtime failure. Keeping the complete original chain also means
+	// a joined, more-specific error selected below does not discard sibling
+	// causes. This defer runs only on the cold error path.
+	defer func() { mapped.withCause(err) }()
 	if errors.Is(err, query.ErrResultBudget) ||
 		errors.Is(err, query.ErrIntermediateBudget) ||
 		errors.Is(err, query.ErrAggregateBudget) ||
@@ -220,13 +377,13 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateInvalidObjectDefinition, err.Error())
 	case errors.Is(err, query.ErrSQLViewColumnArity):
 		return newError(sqlstateInvalidTableDefinition, err.Error())
-	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
-		return newError(sqlstateStatementCompletionUnknown, err.Error())
 	case errors.Is(err, sqldriver.ErrTableNotFound):
 		return newError(sqlstateUndefinedTable, err.Error())
-	case errors.Is(err, sqldriver.ErrViewNotFound),
-		errors.Is(err, sqldriver.ErrViewChanged):
+	case errors.Is(err, sqldriver.ErrViewNotFound):
 		return newError(sqlstateUndefinedTable, err.Error())
+	case errors.Is(err, sqldriver.ErrViewChanged):
+		return newError(sqlstateFeatureNotSupported, err.Error()).
+			withHint("prepare the statement again so it binds the current view definition")
 	case errors.Is(err, sqldriver.ErrTableExists):
 		return newError(sqlstateDuplicateTable, err.Error())
 	case errors.Is(err, sqldriver.ErrViewExists):
@@ -235,6 +392,13 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateDependentObjectsStillExist, err.Error())
 	case errors.Is(err, sqldriver.ErrDuplicateViewColumn):
 		return newError(sqlstateDuplicateColumn, err.Error())
+	case errors.Is(err, sqldriver.ErrWrongObjectType):
+		result := newError(sqlstateWrongObjectType, err.Error())
+		var hinted interface{ SQLHint() string }
+		if errors.As(err, &hinted) && hinted.SQLHint() != "" {
+			result.withHint(hinted.SQLHint())
+		}
+		return result
 	case errors.Is(err, sqldriver.ErrIndexExists):
 		return newError(sqlstateDuplicateObject, err.Error())
 	case errors.Is(err, sqldriver.ErrIndexNotFound):
@@ -298,10 +462,13 @@ func asPGError(err error) *pgError {
 // lets a parse error carry a position. The text is needed because the position
 // is a character index and the error records a byte offset.
 func asPGErrorIn(err error, src string) *pgError {
-	e := asPGError(err)
-	if e == nil {
+	if err == nil {
 		return nil
 	}
+	if !errorTreeAcyclic(err) {
+		return invalidErrorTree()
+	}
+	e := asPGErrorAcyclic(err)
 	var positioned interface{ Position() int }
 	if e.position == 0 && errors.As(err, &positioned) {
 		e.position = charPosition(src, positioned.Position())

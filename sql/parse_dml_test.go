@@ -53,6 +53,11 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `insert into users fields -1:id -1:name (s"u1", s"Ana") returning path(0:) params=0`,
 		},
 		{
+			name: "insert from an independent query source",
+			src:  `INSERT INTO users SELECT * FROM staged WHERE ready = ? ON CONFLICT DO NOTHING RETURNING id`,
+			want: `insert into users source select path(0:) from staged where (cmp = 0:ready ?0) params=1 on conflict do nothing returning path(0:id) params=1`,
+		},
+		{
 			name: "update every document",
 			src:  `UPDATE users SET "$doc" = ?`,
 			want: `update users set ?0 <no target> params=1`,
@@ -263,7 +268,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"the removed pseudo-column pair", `INSERT INTO t ("$key", "$doc") VALUES ('k', ?)`, -1, "one complete document"},
 		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "one complete JSON document"},
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
-		{"INSERT ... SELECT", `INSERT INTO t SELECT a FROM u`, -1, "nowhere to send"},
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
 		{"conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id) DO NOTHING`, -1, "CONFLICT targets"},
 		{"aggregate RETURNING", `INSERT INTO t VALUES (?) RETURNING COUNT(*)`, -1, "aggregate"},

@@ -7,6 +7,26 @@ import (
 	"testing"
 )
 
+func TestSQLScalarNodeProgramObservesCancellation(t *testing.T) {
+	runtime := statementScalar{
+		nodes: []statementScalarNode{{kind: statementScalarNull}},
+	}
+	var cancel CancelFlag
+	cancel.Cancel()
+	var result Result
+	var arena []byte
+	var budget aggregateBudget
+	var intermediate intermediateBudget
+	var charge int64
+	err := runtime.evalNodes(
+		&result, 0, 0, 1, &arena, &budget,
+		&intermediate, &charge, &cancel,
+	)
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("scalar node cancellation = %T %v, want ErrCanceled", err, err)
+	}
+}
+
 func TestSQLScalarStatementExactArithmeticNullAndPredicate(t *testing.T) {
 	segment := mustSegment(t,
 		`{"id":"a","n":9007199254740993,"m":2,"s":"x"}`,

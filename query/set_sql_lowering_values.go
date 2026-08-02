@@ -5,6 +5,8 @@ import (
 	"math"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 type setSQLValueKind uint8
@@ -13,12 +15,18 @@ const (
 	setSQLLiteralValue setSQLValueKind = iota
 	setSQLNullValue
 	setSQLParamValue
+	setSQLDocumentParamValue
 )
 
 type setSQLPreparedValue struct {
 	kind    setSQLValueKind
 	literal literal
 	ordinal int
+}
+
+type setSQLDocumentParamMetadata struct {
+	position  int
+	parameter int
 }
 
 // setSQLValuesRunner is a source-independent prepared leaf. It resolves each
@@ -32,6 +40,11 @@ type setSQLValuesRunner struct {
 	schema []OutputColumn
 	values []setSQLPreparedValue
 	bound  []Cell
+	// documentParams is nil for every ordinary VALUES statement. INSERT query
+	// sources allocate it once at prepare so runtime diagnostics retain both the
+	// authored position and the owning statement's parameter identity without
+	// widening every prepared scalar value or adding cost to the absent path.
+	documentParams []setSQLDocumentParamMetadata
 
 	literals compiler
 	binder   Statement
@@ -299,9 +312,75 @@ func (r *setSQLValuesRunner) resolveValue(
 			return Cell{}, err
 		}
 		return setSQLCellFromLiteral(literalValue), nil
+	case setSQLDocumentParamValue:
+		return r.resolveDocumentValue(value.ordinal, args)
 	default:
 		return Cell{}, fmt.Errorf("query: invalid prepared VALUES scalar kind %d", value.kind)
 	}
+}
+
+func (r *setSQLValuesRunner) resolveDocumentValue(
+	ordinal int,
+	args []any,
+) (Cell, error) {
+	position := 0
+	parameter := ordinal + 1
+	if ordinal >= 0 && ordinal < len(r.documentParams) {
+		metadata := r.documentParams[ordinal]
+		position = metadata.position - 1
+		if metadata.parameter != 0 {
+			parameter = metadata.parameter
+		}
+	}
+	if ordinal < 0 || ordinal >= len(args) {
+		return Cell{}, &InsertSelectDocumentParameterError{
+			Pos: position, Parameter: parameter,
+			Cause: fmt.Errorf("placeholder is outside the bound argument range"),
+		}
+	}
+	var raw []byte
+	switch value := args[ordinal].(type) {
+	case string:
+		raw = byteview.Bytes(value)
+	case []byte:
+		raw = value
+	case *string:
+		if value != nil {
+			raw = byteview.Bytes(*value)
+		}
+	case *[]byte:
+		if value != nil {
+			raw = *value
+		}
+	}
+	if raw == nil {
+		return Cell{}, &InsertSelectDocumentParameterError{
+			Pos: position, Parameter: parameter,
+			Cause: fmt.Errorf(
+				"must be string, []byte, *string, or *[]byte containing JSON; got %T",
+				args[ordinal],
+			),
+		}
+	}
+	if err := vibejson.Validate(raw); err != nil {
+		return Cell{}, &InsertSelectDocumentParameterError{
+			Pos: position, Parameter: parameter,
+			Cause: fmt.Errorf("is not one valid JSON value: %w", err),
+		}
+	}
+	// The result may outlive the caller's bind buffer until its cursor closes.
+	// Own the exact JSON spelling in the runner's reusable compiler arena before
+	// exposing it as a cell. Warm execution reuses that arena and allocates zero.
+	owned := r.binder.c.bytes(raw)
+	value := classifyRawInto(vibejson.RawValue{Src: owned}, &r.binder.c.tmp)
+	if value.kind == kindString {
+		// Escaped strings decode through tmp, which the next value may reuse.
+		// Interning all document strings makes ownership independent of spelling
+		// while value.raw retains the exact JSON representation.
+		value.sval = r.binder.c.internString(value.sval)
+		value.raw = owned
+	}
+	return cellFromScalar(value), nil
 }
 
 func setSQLCellFromLiteral(value literal) Cell {
@@ -317,7 +396,8 @@ func (r *setSQLValuesRunner) bindForExplain(args []any) error {
 	}
 	r.binder.c.rewind()
 	for index := range r.values {
-		if r.values[index].kind != setSQLParamValue {
+		if r.values[index].kind != setSQLParamValue &&
+			r.values[index].kind != setSQLDocumentParamValue {
 			continue
 		}
 		if _, err := r.resolveValue(r.values[index], args); err != nil {
@@ -325,6 +405,52 @@ func (r *setSQLValuesRunner) bindForExplain(args []any) error {
 		}
 	}
 	return nil
+}
+
+// markDocumentOutput upgrades parameter cells only after this VALUES runtime
+// has been selected on the output lineage of a validated one-column INSERT
+// query source. The scalar enum carries the mode without increasing prepared-
+// value size; the position sidecar exists only on this feature path.
+func (r *setSQLValuesRunner) markDocumentOutput(
+	expression *sqlast.SetExpr,
+	output int,
+	rootArgBase int,
+	positions []int,
+) {
+	if r == nil || expression == nil || expression.Values == nil ||
+		output < 0 || output >= expression.Columns || len(r.values) == 0 {
+		return
+	}
+	for row := range expression.Values.Rows {
+		values := expression.Values.Rows[row].Values
+		if output >= len(values) || values[output].Null ||
+			values[output].Operand.Kind != sqlast.OperandParam {
+			continue
+		}
+		value := &values[output]
+		index := row*expression.Columns + output
+		if index >= len(r.values) || r.values[index].kind != setSQLParamValue {
+			continue
+		}
+		ordinal := value.Operand.Ordinal - r.base
+		if ordinal < 0 || ordinal >= r.params ||
+			r.values[index].ordinal != ordinal {
+			continue
+		}
+		if r.documentParams == nil {
+			r.documentParams = make([]setSQLDocumentParamMetadata, r.params)
+		}
+		r.values[index].kind = setSQLDocumentParamValue
+		// Store Pos+1 so a placeholder at byte zero remains distinguishable from
+		// an unrecorded entry while the externally reported position stays exact.
+		absolute := rootArgBase + value.Operand.Ordinal
+		r.documentParams[ordinal] = setSQLDocumentParamMetadata{
+			position: value.Operand.Pos + 1, parameter: absolute + 1,
+		}
+		if absolute >= 0 && absolute < len(positions) {
+			positions[absolute] = value.Operand.Pos + 1
+		}
+	}
 }
 
 func (*setSQLValuesRunner) releaseRelations(*statementFrame) {}

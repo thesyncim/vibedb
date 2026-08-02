@@ -79,8 +79,17 @@ func (s *session) extended(tag byte) error {
 	if err == nil {
 		return nil
 	}
-	var pg *pgError
-	if !errors.As(err, &pg) {
+	return s.rejectExtended(err)
+}
+
+// rejectExtended publishes one non-transport extended-protocol failure and
+// enters PostgreSQL's discard-until-Sync state. Keeping this transition in one
+// function makes execution failures, including SQLSTATE 40003 unknown commit
+// outcomes, follow exactly the same recovery boundary as Parse and Bind
+// failures. Sync remains the sole operation that clears failed.
+func (s *session) rejectExtended(err error) error {
+	pg, ok := classifiedProtocolError(err)
+	if !ok {
 		return err
 	}
 	s.markTransactionFailed()
@@ -134,7 +143,7 @@ func (s *session) finishExtendedBatch() error {
 			err = s.sql.Commit(context.Background())
 		}
 		if err != nil {
-			s.w.errorResponse(asPGError(err))
+			s.reportTransactionCompletionError(err)
 		}
 	} else if s.extendedDDL {
 		// DDL publishes outside the runtime transaction overlay, but its
@@ -255,6 +264,7 @@ func preparedDerivedCharge(stmt *prepared) int {
 	charge := preparedPlanFixedBytes
 	charge = preparedChargeMul(charge, len(stmt.sql), preparedPlanByteMultiplier)
 	charge = preparedChargeMul(charge, cap(stmt.paramKinds), 8)
+	charge = preparedChargeMul(charge, cap(stmt.paramPositions), 8)
 	charge = preparedChargeMul(charge, cap(stmt.paramOrder), 8)
 	if stmt.paramOrder != nil {
 		// rewriteNumberedParameters preserves byte length.
@@ -832,8 +842,9 @@ func bindArgs(
 		if raw == nil {
 			if stmt.paramKind(wire) == sqldriver.ParamDocument {
 				return args, wireArgs, valueSlots, store, decodeStore,
-					newError(sqlstateInvalidParameterValue,
-						"a whole-document parameter cannot be SQL NULL; bind the JSON literal null explicitly")
+					stmt.documentBindError(wire,
+						newError(sqlstateInvalidParameterValue,
+							"value cannot be SQL NULL; bind the JSON literal null explicitly"))
 			}
 			wireArgs = append(wireArgs, nil)
 			continue
@@ -855,7 +866,8 @@ func bindArgs(
 			formatFor(m.paramFormats, wire), stmt.parameterOID(wire),
 			stmt.paramKind(wire), &valueSlots[wire], &decodeStore)
 		if err != nil {
-			return args, wireArgs, valueSlots, store, decodeStore, err
+			return args, wireArgs, valueSlots, store, decodeStore,
+				stmt.documentBindError(wire, err)
 		}
 		if check != nil {
 			if err := check(); err != nil {
@@ -910,6 +922,27 @@ func (p *prepared) paramKind(i int) sqldriver.ParamKind {
 		return sqldriver.ParamScalar
 	}
 	return p.paramKinds[i]
+}
+
+// documentBindError adds protocol-facing identity and source attribution only
+// to a document parameter conversion failure. It never includes the bound
+// bytes; hostile or secret input therefore cannot be reflected through an
+// ErrorResponse. Scalar conversion and cancellation errors pass through
+// unchanged.
+func (p *prepared) documentBindError(wire int, err error) error {
+	if err == nil || p == nil || p.paramKind(wire) != sqldriver.ParamDocument {
+		return err
+	}
+	var pg *pgError
+	if !errors.As(err, &pg) || pg == nil {
+		return err
+	}
+	pg.message = fmt.Sprintf("document parameter $%d: %s", wire+1, pg.message)
+	if pg.position == 0 && wire >= 0 && wire < len(p.paramPositions) &&
+		p.paramPositions[wire] != 0 {
+		pg.position = charPosition(p.sql, p.paramPositions[wire]-1)
+	}
+	return pg
 }
 
 func (p *prepared) parameterOID(i int) int32 {
@@ -992,11 +1025,11 @@ func bindJSONDocument(
 	}
 	if !utf8.Valid(document) {
 		return nil, newError(sqlstateCharacterNotInRepertoire,
-			"a JSON document parameter is not valid UTF-8")
+			"value is not valid UTF-8")
 	}
 	if err := vibejson.Validate(document); err != nil {
 		return nil, newError(sqlstateInvalidParameterValue,
-			fmt.Sprintf("document parameter is not one valid JSON value: %v", err))
+			"value is not one valid JSON value")
 	}
 	slot.text = byteview.String(document)
 	return &slot.text, nil

@@ -109,6 +109,50 @@ type setSQLLowered struct {
 	firstSource int
 }
 
+// markInsertDocumentOutput propagates one selected output ordinal through the
+// complete prepared set tree. Every leaf contributes that ordinal, including
+// SELECT leaves and grouped runners; VALUES leaves alone own the final binding
+// mode. rootArgBase is already the absolute owning-statement base captured at
+// preparation, so nested set and CTE boundaries cannot renumber a placeholder.
+func (r *statementSetSQL) markInsertDocumentOutput(
+	output int,
+	positions []int,
+	depth int,
+) {
+	if r == nil || output < 0 || output >= len(r.Columns()) ||
+		depth > maxInsertDocumentLineageDepth {
+		return
+	}
+	for i := range r.leaves {
+		leaf := &r.leaves[i]
+		if leaf.stmt != nil && leaf.tree != nil {
+			leaf.stmt.markInsertDocumentOutput(
+				output, r.rootArgBase+leaf.tree.ParamBase,
+				positions, depth+1,
+			)
+		}
+	}
+	for i := range r.values {
+		value := &r.values[i]
+		value.runner.markDocumentOutput(
+			value.expr, output, r.rootArgBase, positions,
+		)
+	}
+	for i := range r.groups {
+		if group := r.groups[i].runner; group != nil {
+			group.markInsertDocumentOutput(output, positions, depth+1)
+		}
+	}
+}
+
+// resolvesOwnSetSources reports that the prepared set runner routes each leaf
+// itself. In particular, a VALUES-only set needs no physical Source at all;
+// forcing it through Source.subquerySource would reject a valid CTE/derived
+// relation merely because both collection names are empty.
+func (s *Statement) resolvesOwnSetSources() bool {
+	return s != nil && s.setSQL() != nil
+}
+
 // prepareSetSQLStatement replaces the old refusal at the only safe dispatch
 // point: before any mirrored first-operand field can enter ordinary lowering.
 func prepareSetSQLStatement(

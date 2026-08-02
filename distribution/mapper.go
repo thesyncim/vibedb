@@ -62,6 +62,20 @@ type Mapper interface {
 	MapPrefix(values []Scalar) (DestinationSet, error)
 }
 
+// MapperInto is the optional allocation-free mapper extension used by Router
+// when available. Implementations overwrite the logical contents of the caller
+// scratch (retaining its capacity) and may allocate only when that capacity is
+// insufficient for their result. MapPrefix retains the ordinary independently
+// owned-result contract for callers that need to keep destinations.
+type MapperInto interface {
+	Mapper
+	MapPrefixInto(
+		values []Scalar,
+		pointScratch []KeyspacePoint,
+		rangeScratch []KeyRange,
+	) (DestinationSet, error)
+}
+
 // NativeMapperVersion is the frozen version of the native reference mapper.
 const NativeMapperVersion MapperVersion = 1
 
@@ -139,6 +153,17 @@ func (m *NativeMapper) Admits(prefixLen int, values []Scalar) error {
 // MapPrefix maps a supported leading prefix to its destinations. It validates
 // the prefix itself, so it is safe to call without a preceding Admits.
 func (m *NativeMapper) MapPrefix(values []Scalar) (DestinationSet, error) {
+	return m.MapPrefixInto(values, nil, nil)
+}
+
+// MapPrefixInto maps values like MapPrefix while reusing caller-owned result
+// storage. Native mapping emits exactly one point for a full key or one range
+// for a shorter prefix, so one-element scratch makes this path allocation-free.
+func (m *NativeMapper) MapPrefixInto(
+	values []Scalar,
+	pointScratch []KeyspacePoint,
+	rangeScratch []KeyRange,
+) (DestinationSet, error) {
 	if !m.prefixes.Contains(len(values)) {
 		if len(values) < 1 || len(values) > m.arity {
 			return DestinationSet{}, ErrIncompleteShardKey
@@ -150,9 +175,13 @@ func (m *NativeMapper) MapPrefix(values []Scalar) (DestinationSet, error) {
 		return DestinationSet{}, err
 	}
 	if full {
-		return DestinationSet{Points: []KeyspacePoint{p}}, nil
+		pointScratch = append(pointScratch[:0], p)
+		return DestinationSet{Points: pointScratch}, nil
 	}
-	return DestinationSet{Ranges: []KeyRange{{Start: p, End: successorEnd(p, m.bounds[len(values)])}}}, nil
+	rangeScratch = append(rangeScratch[:0], KeyRange{
+		Start: p, End: successorEnd(p, m.bounds[len(values)]),
+	})
+	return DestinationSet{Ranges: rangeScratch}, nil
 }
 
 // PointFor returns the full-key point that MapPrefix maps values to. len(values)

@@ -14,6 +14,7 @@ const (
 	ScalarBinary
 	ScalarAggregate
 	ScalarCast
+	ScalarCase
 )
 
 // ScalarOp is an arithmetic, sign, or concatenation operation.
@@ -46,7 +47,7 @@ const (
 // ScalarExpr is a lossless, parser-owned scalar expression tree. Path and
 // Aggregate nodes identify values the prepared query must materialize;
 // Literal and Null are source-independent; Unary and Binary retain authored
-// grouping through their exact child shape.
+// grouping through their exact child shape; Case retains ordered lazy arms.
 type ScalarExpr struct {
 	Kind  ScalarExprKind
 	Op    ScalarOp
@@ -61,4 +62,19 @@ type ScalarExpr struct {
 	// distinct from Pos lets unsupported target diagnostics point at the type
 	// while runtime conversion failures point at the authored CAST.
 	TargetPos int
+	// Whens is populated only for ScalarCase. Left is the simple-CASE selector
+	// and is nil for searched CASE; Else is nil when ELSE was omitted. A WHEN
+	// owns exactly one of Predicate (searched) and Match (simple).
+	Whens []ScalarWhen
+	Else  *ScalarExpr
+}
+
+// ScalarWhen is one ordered CASE arm. Predicate retains SQL three-valued
+// boolean structure for searched CASE; Match is a scalar compared with the
+// selector for simple CASE. Result is evaluated only when that arm is chosen.
+type ScalarWhen struct {
+	Predicate *Expr
+	Match     *ScalarExpr
+	Result    *ScalarExpr
+	Pos       int
 }

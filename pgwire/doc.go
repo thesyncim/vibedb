@@ -135,9 +135,10 @@
 //     PostgreSQL's textual plan format.
 //   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
 //     loopback bind, or a TLS-terminating proxy.
-//   - The SQL constructs the dialect itself refuses — correlated subqueries,
-//     recursive or data-modifying CTEs, LATERAL and NATURAL joins, CASE, CAST,
-//     arithmetic, set operations, window functions, and scalar functions.
+//   - The SQL constructs the dialect itself refuses — unsupported correlated
+//     subquery shapes, data-modifying CTEs, NATURAL joins, searched CASE
+//     predicate families outside the executable scalar subset, and scalar
+//     functions.
 //     Non-recursive CTEs, uncorrelated derived tables, generalized joins,
 //     uncorrelated predicate subqueries, LIKE/ILIKE, and non-aggregate SELECT
 //     DISTINCT are supported. Each refusal carries a message naming the missing
@@ -323,12 +324,23 @@
 // Its latency is one bounded protocol pre-parser interval, then the executor's
 // bounded checkpoint interval, plus any durable operation already inside one
 // indivisible publication step. Once durable publication begins it runs to
-// completion and returns its storage outcome; SQL DDL may explicitly return
-// [github.com/thesyncim/vibedb/store/durable.ErrCommitOutcomeUnknown] after a
-// namespace publication whose durability fence failed. Returning early while
-// a write continued invisibly would be less correct than surfacing that
-// outcome. In every case the cancellation signal is consumed by the operation
-// it targeted and cannot poison the next statement.
+// completion and returns its storage outcome. A complete journal or namespace
+// publication whose durability fence fails returns
+// [github.com/thesyncim/vibedb/store/durable.ErrCommitOutcomeUnknown]. The
+// typed runtime and database/sql error retain both that sentinel and the
+// underlying device cause for errors.Is; pgwire reports PostgreSQL's
+// statement_completion_unknown SQLSTATE 40003. A client must reconcile the
+// affected write rather than assuming it failed and blindly retrying it.
+//
+// SQLSTATE 40003 is an ERROR, not a connection-fatal condition. An extended
+// execution failure discards messages through the next Sync; a failure found
+// while Sync finalizes an implicit transaction is reported by that Sync.
+// Simple protocol still emits its closing ReadyForQuery. Both paths return the
+// SQL session to its runtime-reported transaction state, so the protocol error
+// itself cannot poison an unrelated next statement. The affected durable
+// collection may independently remain terminally poisoned and reject later
+// operations. In every case the cancellation signal is consumed by the
+// operation it targeted and cannot poison the next statement.
 //
 // # Protocol resource bounds and hostile input
 //

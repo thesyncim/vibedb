@@ -442,11 +442,25 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 	hasProjection := false
 	for _, col := range q.columns {
 		pc := planColumn{agg: col.agg, value: -1, num: -1, slot: -1}
+		if col.cardinalityOnly {
+			// A scalar statement with no live path still needs the source's exact
+			// row cardinality.  An ungrouped plan carries that with a NULL cell,
+			// avoiding a whole-document projection and its payload.  GROUP BY
+			// already establishes cardinality, so it needs no physical column.
+			if !grouped {
+				p.headers = append(p.headers, col.header)
+				p.columns = append(p.columns, pc)
+			}
+			continue
+		}
 		switch col.agg {
 		case aggNone:
 			hasProjection = true
 			if grouped && !namesPath(q.groupBy, col.spec) {
 				return fmt.Errorf("query: projected column %q must appear in GROUP BY", col.spec)
+			}
+			if col.semanticOnly {
+				continue
 			}
 			idx, err := c.addPath(values, col.spec)
 			if err != nil {
@@ -455,6 +469,9 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 			pc.value = idx
 		case aggCount:
 			p.hasAggregate = true
+			if col.semanticOnly {
+				continue
+			}
 			if col.spec != "" {
 				idx, err := c.addPath(values, col.spec)
 				if err != nil {
@@ -464,6 +481,9 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 			}
 		default: // SUM, AVG, MIN, MAX
 			p.hasAggregate = true
+			if col.semanticOnly {
+				continue
+			}
 			idx, err := c.addPath(numReg, col.spec)
 			if err != nil {
 				return err

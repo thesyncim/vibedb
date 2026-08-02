@@ -25,7 +25,7 @@ func (p *Parser) parseCreateView(materializedPos int) error {
 	}
 	p.view.Query = &p.sel
 	if p.sel.Params != 0 {
-		position := firstViewParameterPosition(
+		position := firstParameterPosition(
 			p.lx.src, p.view.QueryPos,
 		)
 		return newFeatureNotSupportedError(
@@ -186,7 +186,7 @@ func normalizedViewQuery(source string) string {
 	return query
 }
 
-func firstViewParameterPosition(source string, start int) int {
+func firstParameterPosition(source string, start int) int {
 	if start < 0 || start > len(source) {
 		return max(start, 0)
 	}
