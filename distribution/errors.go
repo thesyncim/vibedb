@@ -111,6 +111,18 @@ func (e *PlacementError) Error() string {
 
 func (e *PlacementError) Unwrap() error { return ErrInvalidPlacement }
 
+// ErrNotShardOwner is the sentinel a shard service returns when a request names
+// a distribution or shard the process does not own.
+var ErrNotShardOwner = errors.New("distribution: shard is not the owner")
+
+// ErrOwnershipEpoch is the sentinel for a request whose fencing epoch does not
+// match the shard's configured ownership epoch.
+var ErrOwnershipEpoch = errors.New("distribution: ownership epoch mismatch")
+
+// ErrRoutingVersion is the sentinel for a request routed against a stale
+// manifest generation.
+var ErrRoutingVersion = errors.New("distribution: routing version mismatch")
+
 // ErrScatterRejected is the sentinel returned when admission forbids an unknown
 // or all-shard scatter route.
 var ErrScatterRejected = errors.New("distribution: scatter route rejected")
