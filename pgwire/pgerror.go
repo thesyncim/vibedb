@@ -46,6 +46,7 @@ const (
 	sqlstateDuplicateColumn            = "42701"
 	sqlstateDependentObjectsStillExist = "2BP01"
 	sqlstateInvalidColumnReference     = "42P10"
+	sqlstateInvalidTableDefinition     = "42P16"
 	sqlstateDatatypeMismatch           = "42804"
 	sqlstateInvalidObjectDefinition    = "42P17"
 	sqlstateFeatureNotSupported        = "0A000"
@@ -214,6 +215,8 @@ func asPGError(err error) *pgError {
 		return newError(sqlstateSyntaxError, err.Error())
 	case errors.Is(err, query.ErrSQLViewCycle):
 		return newError(sqlstateInvalidObjectDefinition, err.Error())
+	case errors.Is(err, query.ErrSQLViewColumnArity):
+		return newError(sqlstateInvalidTableDefinition, err.Error())
 	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
 		return newError(sqlstateStatementCompletionUnknown, err.Error())
 	case errors.Is(err, sqldriver.ErrTableNotFound):

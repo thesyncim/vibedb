@@ -631,7 +631,7 @@ func validateCatalogViewMeta(name string, meta *viewMeta) error {
 	if len(meta.Outputs) == 0 {
 		return fmt.Errorf("vibedb: SQL catalog view %q has no outputs", name)
 	}
-	if len(meta.Columns) != 0 && len(meta.Columns) != len(meta.Outputs) {
+	if len(meta.Columns) > len(meta.Outputs) {
 		return fmt.Errorf(
 			"vibedb: SQL catalog view %q has %d aliases for %d outputs",
 			name, len(meta.Columns), len(meta.Outputs),

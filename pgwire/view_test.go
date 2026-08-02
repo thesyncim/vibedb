@@ -115,6 +115,10 @@ func TestPGWireMaterializedViewRefusalsHaveUTF8PositionsAndRecover(t *testing.T)
 			"MATERIALIZED",
 		},
 		{
+			`/* préfix */ DROP VIEW m CASCADE`,
+			"CASCADE",
+		},
+		{
 			`/* préfix */ REFRESH MATERIALIZED VIEW m`,
 			"REFRESH",
 		},
@@ -162,6 +166,14 @@ func TestPGWireViewDefinitionErrorsRebaseIntoCreateStatement(t *testing.T) {
 		{
 			`/* préfix */ CREATE VIEW wild_view AS SELECT * FROM docs`,
 			"SELECT", sqlstateFeatureNotSupported,
+		},
+		{
+			`/* préfix */ CREATE VIEW excess_view (first, second) AS SELECT id FROM docs`,
+			"SELECT", sqlstateInvalidTableDefinition,
+		},
+		{
+			`/* préfix */ CREATE VIEW duplicate_prefix (id) AS SELECT id, id FROM docs`,
+			"SELECT", sqlstateDuplicateColumn,
 		},
 	}
 	for _, test := range tests {

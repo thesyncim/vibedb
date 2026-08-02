@@ -210,6 +210,61 @@ func TestSQLViewExpansionAppliesAliasesToCompoundOutputOrdinally(t *testing.T) {
 	}
 }
 
+func TestSQLViewExpansionLeadingAliasListPreservesTrailingNames(t *testing.T) {
+	tests := []struct {
+		name       string
+		definition string
+		set        bool
+	}{
+		{
+			name:       "select",
+			definition: `SELECT id, n FROM docs`,
+		},
+		{
+			name: "compound",
+			definition: `SELECT id, n FROM one ` +
+				`UNION ALL SELECT id, n FROM two`,
+			set: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const source = `SELECT doc_id, n FROM v`
+			tree, err := sqlast.Parse(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = ExpandSQLViews(source, tree, sqlViewMap{
+				"v": {
+					Name: "v", Query: test.definition,
+					Columns: []string{"doc_id"},
+				},
+			}, SQLViewExpansionOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			definition := tree.From[0].Query
+			if definition == nil || definition.Columns[0].Alias != "doc_id" ||
+				definition.Columns[1].Alias != "" {
+				t.Fatalf("leading alias application = %+v", definition)
+			}
+			if test.set && (definition.Set == nil ||
+				definition.Set.Outputs[0].Name != "doc_id" ||
+				definition.Set.Outputs[1].Name != "n") {
+				t.Fatalf("compound effective outputs = %+v", definition.Set)
+			}
+			prepared, err := PrepareParsedStatement(source, tree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer prepared.Release()
+			if got := prepared.Columns(); !reflect.DeepEqual(got, []string{"doc_id", "n"}) {
+				t.Fatalf("effective columns = %q, want [doc_id n]", got)
+			}
+		})
+	}
+}
+
 func TestSQLViewExpansionValidatesStableSchemaAndResolverIdentity(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -227,12 +282,14 @@ func TestSQLViewExpansionValidatesStableSchemaAndResolverIdentity(t *testing.T) 
 			want: "wildcard-dependent",
 		},
 		{
-			name: "alias arity",
+			name: "excess alias arity",
 			views: sqlViewMap{"v": {
-				Name: "v", Query: `SELECT id, n FROM docs`, Columns: []string{"only"},
+				Name: "v", Query: `SELECT id, n FROM docs`,
+				Columns: []string{"first", "second", "excess"},
 			}},
-			root: `SELECT only FROM v`,
-			want: "declares 1 output names for 2",
+			root: `SELECT first FROM v`,
+			is:   ErrSQLViewColumnArity,
+			want: "3 column aliases but its query has 2 outputs",
 		},
 		{
 			name: "cycle from unpublished root",
@@ -336,6 +393,82 @@ func TestSQLViewExpansionFiniteDepthAndConcurrentIndependence(t *testing.T) {
 	for err := range errorsOut {
 		t.Fatal(err)
 	}
+}
+
+func TestSQLViewExpansionMemoizedDAGAdmitsLongestPath(t *testing.T) {
+	const overLimitSource = `SELECT s.id FROM shallow AS s ` +
+		`JOIN deep_0 AS d ON s.id = d.id`
+	overLimit, err := sqlast.Parse(overLimitSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ExpandSQLViews(
+		overLimitSource, overLimit, sqlViewMemoizedDepthDAG(28, 5),
+		SQLViewExpansionOptions{},
+	)
+	if !errors.Is(err, ErrSQLViewExpansionLimit) {
+		t.Fatalf("shallow-first cached DAG error = %v, want depth limit", err)
+	}
+	var limit *SQLViewExpansionLimitError
+	if !errors.As(err, &limit) || limit.Name != "shared_0" ||
+		limit.Pos != strings.Index(overLimitSource, "deep_0") {
+		t.Fatalf("shallow-first cached DAG detail = %+v", limit)
+	}
+	for i := range overLimit.From {
+		if overLimit.From[i].Kind != sqlast.RelationCollection ||
+			overLimit.From[i].Query != nil {
+			t.Fatalf("depth failure partially published relation %d: %+v",
+				i, overLimit.From[i])
+		}
+	}
+
+	const boundarySource = `SELECT s.id FROM shallow AS s ` +
+		`JOIN deep_0 AS d ON s.id = d.id`
+	boundary, err := sqlast.Parse(boundarySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExpandSQLViews(
+		boundarySource, boundary, sqlViewMemoizedDepthDAG(27, 5),
+		SQLViewExpansionOptions{},
+	); err != nil {
+		t.Fatalf("32-level cached DAG boundary rejected: %v", err)
+	}
+	for i := range boundary.From {
+		if boundary.From[i].Kind != sqlast.RelationDerived ||
+			boundary.From[i].Query == nil {
+			t.Fatalf("boundary relation %d was not published: %+v",
+				i, boundary.From[i])
+		}
+	}
+}
+
+func sqlViewMemoizedDepthDAG(sharedHeight, deepHeight int) sqlViewMap {
+	views := make(sqlViewMap, sharedHeight+deepHeight+1)
+	for depth := 0; depth < sharedHeight; depth++ {
+		name := fmt.Sprintf("shared_%d", depth)
+		next := "docs"
+		if depth+1 < sharedHeight {
+			next = fmt.Sprintf("shared_%d", depth+1)
+		}
+		views[name] = SQLViewDefinition{
+			Name: name, Query: fmt.Sprintf("SELECT id FROM %s", next),
+		}
+	}
+	views["shallow"] = SQLViewDefinition{
+		Name: "shallow", Query: `SELECT id FROM shared_0`,
+	}
+	for depth := 0; depth < deepHeight; depth++ {
+		name := fmt.Sprintf("deep_%d", depth)
+		next := "shared_0"
+		if depth+1 < deepHeight {
+			next = fmt.Sprintf("deep_%d", depth+1)
+		}
+		views[name] = SQLViewDefinition{
+			Name: name, Query: fmt.Sprintf("SELECT id FROM %s", next),
+		}
+	}
+	return views
 }
 
 func TestSQLViewDefinitionDepthAdmissionMatchesTopLevelExpansion(t *testing.T) {

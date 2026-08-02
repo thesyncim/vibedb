@@ -20,6 +20,10 @@ var (
 	// ErrSQLViewExpansionLimit classifies a definition graph that exceeds the
 	// finite preparation bounds.
 	ErrSQLViewExpansionLimit = errors.New("query: SQL view expansion limit")
+	// ErrSQLViewColumnArity classifies a CREATE VIEW column list longer than
+	// the definition's ordinal output schema. A shorter list is valid SQL and
+	// renames only the leading outputs.
+	ErrSQLViewColumnArity = errors.New("query: SQL view column alias arity")
 )
 
 // SQLViewDefinition is the immutable catalog payload needed by the query
@@ -137,6 +141,34 @@ type SQLViewExpansionLimitError struct {
 	Pos   int
 }
 
+// SQLViewColumnArityError reports a view alias list that cannot be applied
+// ordinally because it contains more names than the defining query exposes.
+type SQLViewColumnArityError struct {
+	Name    string
+	Aliases int
+	Outputs int
+	Pos     int
+}
+
+func (e *SQLViewColumnArityError) Error() string {
+	if e == nil {
+		return ErrSQLViewColumnArity.Error()
+	}
+	return fmt.Sprintf(
+		"query: SQL view %q has %d column aliases but its query has %d outputs: %v",
+		e.Name, e.Aliases, e.Outputs, ErrSQLViewColumnArity,
+	)
+}
+
+func (e *SQLViewColumnArityError) Unwrap() error { return ErrSQLViewColumnArity }
+
+func (e *SQLViewColumnArityError) Position() int {
+	if e == nil {
+		return 0
+	}
+	return e.Pos
+}
+
 func (e *SQLViewExpansionLimitError) Error() string {
 	if e == nil {
 		return ErrSQLViewExpansionLimit.Error()
@@ -155,9 +187,10 @@ func (e *SQLViewExpansionLimitError) Position() int {
 }
 
 type sqlViewExpansionEntry struct {
-	name  string
-	tree  *sqlast.SelectStmt
-	state uint8
+	name   string
+	tree   *sqlast.SelectStmt
+	state  uint8
+	height int
 }
 
 type sqlViewExpansionPatch struct {
@@ -387,6 +420,7 @@ func (x *sqlViewExpander) expandReference(
 	if err != nil {
 		return err
 	}
+	x.recordChildHeight(entry.height)
 	replacement := *ref
 	replacement.Kind = sqlast.RelationDerived
 	replacement.Name = ""
@@ -409,6 +443,12 @@ func (x *sqlViewExpander) expandDefinition(
 	if existing, ok := x.entryByName[definition.Name]; ok {
 		entry := &x.entries[existing]
 		if entry.state == 2 {
+			if !sqlViewDepthAdmitted(depth, entry.height) {
+				return nil, &SQLViewExpansionLimitError{
+					Name: definition.Name, Kind: "dependency depth",
+					Limit: maxSQLViewExpansionDepth, Pos: origin,
+				}
+			}
 			return entry, nil
 		}
 	}
@@ -448,7 +488,7 @@ func (x *sqlViewExpander) expandDefinition(
 	}
 	index := len(x.entries)
 	x.entries = append(x.entries, sqlViewExpansionEntry{
-		name: definition.Name, tree: tree, state: 1,
+		name: definition.Name, tree: tree, state: 1, height: 1,
 	})
 	x.entryByName[definition.Name] = index
 	x.stack = append(x.stack, definition.Name)
@@ -459,6 +499,32 @@ func (x *sqlViewExpander) expandDefinition(
 	x.stack = x.stack[:len(x.stack)-1]
 	x.entries[index].state = 2
 	return &x.entries[index], nil
+}
+
+func sqlViewDepthAdmitted(depth, height int) bool {
+	if depth < 1 || depth > maxSQLViewExpansionDepth || height < 1 {
+		return false
+	}
+	// Written as a subtraction so adversarial integer inputs cannot overflow
+	// an addition before admission. Completed heights are themselves bounded,
+	// but keeping the predicate total makes the cache contract explicit.
+	return height <= maxSQLViewExpansionDepth-depth+1
+}
+
+func (x *sqlViewExpander) recordChildHeight(childHeight int) {
+	if childHeight < 1 || len(x.stack) == 0 {
+		return
+	}
+	parent, ok := x.entryByName[x.stack[len(x.stack)-1]]
+	if !ok {
+		// ExpandSQLViewDefinition installs its unpublished root only in stack;
+		// it is not a memoized resolver entry and needs no reusable height.
+		return
+	}
+	candidate := childHeight + 1
+	if candidate > x.entries[parent].height {
+		x.entries[parent].height = candidate
+	}
 }
 
 func applySQLViewColumns(
@@ -478,11 +544,10 @@ func applySQLViewColumns(
 	if len(aliases) == 0 {
 		return nil
 	}
-	if len(aliases) != columns {
-		return sqlast.NewFeatureNotSupportedError(
-			source, position,
-			fmt.Sprintf("view %q declares %d output names for %d query columns", name, len(aliases), columns),
-		)
+	if len(aliases) > columns {
+		return &SQLViewColumnArityError{
+			Name: name, Aliases: len(aliases), Outputs: columns, Pos: position,
+		}
 	}
 	if tree.Set == nil {
 		for i := range aliases {
@@ -491,15 +556,13 @@ func applySQLViewColumns(
 		return nil
 	}
 	first := tree.Set.First
-	if first == nil || len(first.Columns) != len(aliases) {
+	if first == nil || len(first.Columns) != columns || len(tree.Set.Outputs) != columns {
 		return errors.New("query: SQL view set expression lost first-operand output metadata")
 	}
 	for i := range aliases {
 		first.Columns[i].Alias = aliases[i]
-		if i < len(tree.Set.Outputs) {
-			tree.Set.Outputs[i].Name = aliases[i]
-			tree.Set.Outputs[i].Deferred = false
-		}
+		tree.Set.Outputs[i].Name = aliases[i]
+		tree.Set.Outputs[i].Deferred = false
 	}
 	return nil
 }

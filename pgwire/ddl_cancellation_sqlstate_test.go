@@ -548,8 +548,17 @@ func ddlStacksContaining(stacks string, want string) string {
 func TestDDLUnsupportedVariantsPreserveSQLSTATETaxonomy(t *testing.T) {
 	c := connectSQLCatalog(t)
 
+	for protocol, messages := range map[string][]backendMessage{
+		"simple":   c.query(`DROP VIEW docs`),
+		"extended": extendedSQL(c, `DROP VIEW docs`, nil),
+	} {
+		t.Run("supported/drop_view_missing/"+protocol, func(t *testing.T) {
+			expectError(t, messages, sqlstateUndefinedTable)
+		})
+	}
+
 	for _, statement := range []string{
-		`DROP VIEW docs`,
+		`DROP VIEW docs CASCADE`,
 		`DROP MATERIALIZED VIEW docs`,
 		`DROP FUNCTION public.f(integer, text)`,
 		`DROP TRIGGER trg ON docs`,

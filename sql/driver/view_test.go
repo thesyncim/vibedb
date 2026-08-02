@@ -222,6 +222,8 @@ func TestDatabaseSQLViewRefusalsAreTypedAndAtomic(t *testing.T) {
 	}{
 		{`CREATE VIEW wild AS SELECT * FROM docs`, nil},
 		{`CREATE VIEW duplicate AS SELECT id, id FROM docs`, ErrDuplicateViewColumn},
+		{`CREATE VIEW duplicate_prefix (n) AS SELECT id, n FROM docs`, ErrDuplicateViewColumn},
+		{`CREATE VIEW excess_aliases (a, b, c) AS SELECT id, n FROM docs`, query.ErrSQLViewColumnArity},
 		{`CREATE VIEW missing AS SELECT id FROM absent`, ErrTableNotFound},
 		{`CREATE VIEW self_ref AS SELECT id FROM self_ref`, query.ErrSQLViewCycle},
 		{`CREATE MATERIALIZED VIEW mat AS SELECT id FROM docs`, nil},
@@ -243,10 +245,61 @@ func TestDatabaseSQLViewRefusalsAreTypedAndAtomic(t *testing.T) {
 			}
 		})
 	}
-	for _, name := range []string{"wild", "duplicate", "missing", "self_ref", "mat"} {
+	for _, name := range []string{
+		"wild", "duplicate", "duplicate_prefix", "excess_aliases",
+		"missing", "self_ref", "mat",
+	} {
 		if _, err := db.Exec(`DROP VIEW ` + name); !errors.Is(err, ErrViewNotFound) {
 			t.Fatalf("failed CREATE published %q: %v", name, err)
 		}
+	}
+}
+
+func TestDatabaseSQLViewLeadingAliasPrefixReopensAndDrops(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.vdb")
+	db, err := stdsql.Open("vibedb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE docs (id STRING PRIMARY KEY, n NUMBER NOT NULL)`,
+		`INSERT INTO docs VALUES ({"id":"kept","n":7})`,
+		`CREATE VIEW prefixed (doc_id) AS SELECT id, n FROM docs`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = stdsql.Open("vibedb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := queryViewStrings(t, func() (*stdsql.Rows, error) {
+		return db.Query(`SELECT doc_id FROM prefixed WHERE n = 7`)
+	}); !reflect.DeepEqual(got, []string{"kept"}) {
+		db.Close()
+		t.Fatalf("reopened prefix-alias rows = %v", got)
+	}
+	if _, err := db.Exec(`DROP VIEW prefixed`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = stdsql.Open("vibedb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`SELECT doc_id FROM prefixed`); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("dropped prefix-alias view after reopen = %v", err)
 	}
 }
 
