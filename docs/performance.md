@@ -24,20 +24,20 @@ are the next two measured performance targets.
 
 The log-filter path has a fused execution lane for `COUNT(*)` equality queries.
 On the 100,000-row low-cardinality log-like probe, the current fair adapter
-measured about 0.6 µs for a point read, 1.49–1.56 ms for an unindexed equality
-count, and 6.2 µs for the same count through an exact `country` index. The
+measured about 4.1 µs for a random point read, 0.318 ms for an unindexed equality
+count, and 5.1 µs for the same count through an exact `country` index. The
 unindexed result is a complete 100,000-row scan (945 matches,
-14.94–15.63 ns/document), not candidate pruning: the storage cursor resolves the
+about 3.18 ns/document), not candidate pruning: the storage cursor resolves the
 field once per durable leaf template and compares its scalar tokens without
 reconstructing each JSON document. Rows that cannot be decided from tokens are
 rendered individually and reported through `TokenFilterFallbackRows`;
 `RowsScanned` still reports the complete corpus and `IndexBounded` remains
 false.
 
-The fair adapter deliberately constructs and compiles the query on each call,
-so its hot-loop result is about 15 allocations and 1.4 KiB per operation. A
-prepared `Query` and reused `Exec` remove that adapter-level cost: the warmed
-native full scan itself is zero-allocation. The same token lane also handles
+The fair adapter retains one compiled query per repeated filter value and reuses
+its `Exec`, matching a prepared-query workload. The complete warmed public path
+is now zero-allocation; changing the filter value rebuilds the cached query once.
+The same token lane also handles
 nested paths and exact-decimal numeric equality: `1`, `1.0`, and `1e0` compare
 equal without float64 rounding. On the same 100,000-row storage corpus, a
 nested string equality measured about 2.29 ms and a decimal `500.0` needle over
@@ -49,9 +49,9 @@ machine-specific probe numbers, not API promises; reproduce them with
 allocation measurements.
 
 A local ClickHouse control over the same flattened 100,000-row corpus measured
-about 1.49 ms with `ORDER BY key` and no secondary data-skipping index, placing
-the two unindexed scans within roughly 0–5% on this machine across repeated
-local runs; the latest VibeDB sample was about 4% slower. For context,
+about 1.49 ms with `ORDER BY key` and no secondary data-skipping index. The
+current warmed VibeDB public count is about 4.7× faster while performing the
+same full-corpus logical scan and using no filter index. For context,
 ClickHouse measured about 1.34 ms with the primary layout aligned as
 `ORDER BY (country, key)`, and about 1.97 ms with a mixed-value `set` skipping
 index. Those indexed/layout-assisted rows are disclosed separately because
@@ -70,12 +70,12 @@ files, matching the ClickHouse per-table accounting.
 | ClickHouse typed, `ORDER BY key`, no skipping index | **2,713,077** | **27.13** | about **1.49 ms** |
 | ClickHouse typed, `ORDER BY (country, key)` | 2,992,629 | 29.93 | about 1.34 ms |
 | ClickHouse raw JSON, `ORDER BY key` | 4,565,499 | 45.65 | not measured in this control |
-| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **1.25 ms** through the public query API |
+| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **0.32 ms**, zero allocations, through the warmed public query API |
 | VibeDB compact scan kernel | same file | 11.18 | about **0.35 ms**, zero allocations |
 
 The compact VibeDB database file is 2.43× smaller than the fair typed
-ClickHouse table. Its public query path is modestly faster in this control; the
-storage-native full-scan kernel is about 4.3× faster. Both VibeDB rows scan all
+ClickHouse table. Its warmed public query path is about 4.7× faster in this
+control; the storage-native full-scan kernel is about 4.3× faster. Both VibeDB rows scan all
 100,000 field IDs: neither uses an index, candidate list, or data skipping.
 The aligned ClickHouse row is kept separate because `country` participates in
 its sparse primary index and physical order. The raw-JSON row is a useful

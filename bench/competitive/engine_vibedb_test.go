@@ -139,6 +139,14 @@ func TestVibeDBUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
 	if n <= 0 {
 		t.Fatalf("FilterCount(%q) = %d on primary snapshot, want > 0", FilterValue, n)
 	}
+	if allocs := testing.AllocsPerRun(20, func() {
+		got, runErr := e.FilterCount(FilterValue)
+		if runErr != nil || got != n {
+			panic("warmed FilterCount failed")
+		}
+	}); allocs != 0 {
+		t.Fatalf("warmed FilterCount allocated %.2f times, want 0", allocs)
+	}
 }
 
 func TestVibeDBBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {

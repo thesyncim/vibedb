@@ -24,6 +24,8 @@ type vibeDBEngine struct {
 	coll        *durable.Collection
 	snap        *durable.Snapshot
 	exec        query.Exec
+	filterQuery *query.Query
+	filterValue string
 	scratch     []byte
 	keyBuf      [vibeDBKeyBytes]byte
 	scan        *vibeDBScanState
@@ -405,10 +407,13 @@ func (v *vibeDBEngine) runFilter(value string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	q := query.Select(query.Count()).Where(
-		query.Cmp(FilterField, query.Eq, value),
-	)
-	if err := q.RunInto(&v.exec, query.FromFile(snap)); err != nil {
+	if v.filterQuery == nil || v.filterValue != value {
+		v.filterQuery = query.Select(query.Count()).Where(
+			query.Cmp(FilterField, query.Eq, value),
+		)
+		v.filterValue = value
+	}
+	if err := v.filterQuery.RunInto(&v.exec, query.FromFile(snap)); err != nil {
 		return 0, err
 	}
 	col, ok := v.exec.Result.Column("count(*)")
