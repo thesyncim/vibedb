@@ -1,310 +1,288 @@
-# vibedb
+# VibeDB
 
-vibedb is an embedded JSON document database written in Go. It provides a
-mutable in-memory store, a bounded-residency durable store, immutable generation
-snapshots, exact JSON indexes, ordered scans, and a typed query engine. Durable
-mutations publish semantically complete generations. Eligible foreground lanes
-represent a generation as an immutable canonical base plus a bounded,
-generation-stamped row overlay; point reads and scans merge that overlay
-exactly, including delete records. The overlay is folded by bounded foreground
-checkpoint work—there is no background compaction or offline maintenance.
-Creating a durable snapshot may wait for the current writer and seal bounded
-dirty overlay/parent state; pinning the sealed immutable generation itself is
-constant time.
+VibeDB is an embedded JSON database for Go applications. It gives you a small
+native API, durable local storage, immutable snapshots, exact JSON indexes, and
+an optional SQL layer—all inside your process.
 
-The project is unreleased. Public APIs and the primary-file version-0 on-disk
-format may change in place; development files are recreated after a format
-change. Superseded APIs are deleted rather than deprecated or retained behind
-compatibility shims; development callers are expected to track the current
-surface.
+> [!WARNING]
+> VibeDB is under active development and has not been released. APIs and the
+> on-disk format may change without a compatibility migration. Do not use it as
+> the only copy of important data yet.
 
-## Quickstart
+## Why VibeDB?
 
-The root package is the normal application surface. It owns the database
-directory, collection files, synchronization, and descriptor shutdown:
+- Store JSON documents by application-defined keys.
+- Choose in-memory, buffered, or synchronous durability per database.
+- Query with either the native typed Go API or a documented SQL subset.
+- Connect through `database/sql`, pgx, lib/pq, or `psql` when SQL is useful.
+- Use exact single-column or compound JSON-path indexes.
+- Read immutable snapshots while writes publish new generations atomically.
+- Put explicit limits on query, join, transaction, and intermediate memory.
+- Run without background compaction or an external database service.
+
+## Install
+
+```sh
+go get github.com/thesyncim/vibedb
+```
+
+VibeDB currently follows the Go version declared in [`go.mod`](go.mod).
+
+## Native API quick start
 
 ```go
-db, err := vibedb.Open("application.vdb",
-	vibedb.WithDurability(vibedb.Durable),
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/thesyncim/vibedb"
 )
-if err != nil { log.Fatal(err) }
-defer db.Close()
 
-users := db.Collection("users")
-if _, err = users.Put("user:1", []byte(
-	`{"name":"Ada","active":true}`,
-)); err != nil {
-	log.Fatal(err)
+func main() {
+	db, err := vibedb.Open(
+		"data/app.vdb",
+		vibedb.WithDurability(vibedb.Durable),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	users := db.Collection("users")
+	_, err = users.Put("user:1", []byte(
+		`{"name":"Ada","active":true}`,
+	))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	document, found, err := users.Get("user:1")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if found {
+		fmt.Println(string(document))
+	}
 }
-
-document, found, err := users.Get("user:1")
-if err != nil { log.Fatal(err) }
-fmt.Println(found, string(document))
 ```
 
-Imports are `fmt`, `log`, and `github.com/thesyncim/vibedb`. A collection
-handle is lazy: obtaining it performs no I/O, while its first mutation creates
-the collection. `Get` returns caller-owned bytes. Logical collection names are
-valid UTF-8 up to 120 bytes and are encoded into reversible lowercase-hex disk
-filenames, so separators, reserved device words, case, and Unicode forms cannot
-collide through filesystem rules.
+`Collection` handles are lazy: asking for one does not touch the filesystem;
+the first mutation creates it. `Get` returns caller-owned bytes.
 
-After `CreateIndex`, execute the same compiled typed query across every profile
-with one-off `Collection.Run`, or retain bounded hot-loop storage behind
-`session := collection.NewSession(); defer session.Release()` and call
-`session.Run(compiled)` against a fresh immutable generation each time.
-
-Choose one explicit lifecycle contract:
-
-| Profile | Mutation success means | Persistence boundary |
-| --- | --- | --- |
-| `vibedb.Memory` | published in process memory | none; `Open` never accesses its path |
-| `vibedb.Buffered` | published from bounded memory | `Flush` or `Close` |
-| `vibedb.Durable` | recovery record power-safely fenced before visibility | each successful mutation |
-
-The low-level `store`, `store/durable`, and query packages remain available for
-custom storage geometry and execution. Descriptor-owning embedders use
-`vibedb.OpenFile(file, vibedb.AdvancedOptions{...})`; the returned collection
-must be closed before the caller closes its file. `file.Name()` must be an
-absolute stable path to that descriptor: durable and buffered collections own
-the adjacent `.rjournal` sibling, require parent-directory authority, and must
-be renamed or backed up as a primary+journal pair. The lexical primary path
-must be a regular non-symlink file and must not be renamed, replaced, unlinked,
-or retargeted until `Collection.CloseCompleted()` reports that the exclusive
-descriptor borrow has ended.
-
-## Capabilities and limits
-
-The [executable capability matrix](docs/capabilities.md) is the authority for
-which combinations of indexing, point or transactional mutation, entry point,
-and durability succeed atomically or return a documented error. It is generated
-from the same case manifest exercised by native, `database/sql`, and pgwire
-tests; prose does not define a stronger database than those tests do.
-
-The important current boundaries are explicit: separate native point calls are
-separate publications; bounded `Collection.Update` batches are atomic only in
-the publication modes listed by the matrix; a SQL transaction may read several
-tables but write exactly one; DDL is not transactional; and the SQL and pgwire
-surfaces implement the documented subset rather than a general PostgreSQL
-catalog. Pgwire recognizes the exact PostgreSQL 18.4 psql basic introspection templates for
-`\l`, `\dn`, `\dt`, `\di`, `\d`, and `\d name`; `\df`, `\du`, and `\dv` are
-recognized and honestly empty. The `\d name` capture is currently limited to
-bare ASCII identifiers of at most 128 bytes. Queryable `pg_catalog`, ORM/BI discovery, and
-ad-hoc catalog SQL remain unsupported. See the
-[SQL surface](docs/design/sql-surface.md) and
-[pgwire contract](pgwire/doc.go) for syntax, resource bounds, and unsupported
-features before adopting a client or ORM.
-
-## Performance snapshot
-
-The write, concurrency, and space rows come from clean commit `7fe6769` on an
-Apple M4 Max. The scan-mix row and CPU/scan gates were refreshed from clean
-commit `b5702bc` on the same host. Engine ratios use matched buffered-visible
-semantics; space rows report both apparent file size and allocated filesystem
-blocks.
-
-| Lane or measurement | Result | Context |
-| --- | ---: | --- |
-| Single-client YCSB-A/B/F and churn | 2.52–2.79× Badger | matched buffered-visible CP64 runs |
-| Single-client scan mix | 1.58× Badger (57.7% ahead) | 390,929.5 versus 247,961.5 ops/s; ordered full-scan p50 remains 7.0% slower |
-| Concurrent existing-key writes | 2.35–2.50× Badger | matched 1, 8, and 32-client runs |
-| Concurrent churn | 2.73–2.93× Badger | matched 1, 8, and 32-client runs |
-| Online sustained churn, low/high cardinality | 22.075 / 16.020 · 54.841 / 36.070 MiB | apparent / allocated after 200k mutations; zero forced checkpoints; no background/offline maintenance |
-| Offline Repack floor, low/high cardinality | 9.001 / 9.520 · 18.767 / 19.520 MiB | apparent / allocated; separate out-of-place maintenance result |
-| Unified paired bulk, low/high cardinality | 9.001 / 9.520 · 18.767 / 19.520 MiB | apparent / allocated for the current durable pair |
-| Native checkpoint leaf patch / generic replan | 1.914 / 256.121 µs | median; ~134× faster; 0 allocations |
-| Unified full scans, 100k documents | 23.49 ordered · 91.57 / 94.21 competitive ns/document | low / high cardinality where applicable; 0 allocations |
-| Masked scan | 178.4 ns/selected document | one occupied row per live posting tile; 0 allocations |
-
-See the [short performance guide](docs/performance.md) for interpretation and
-the [competitive results](bench/competitive/RESULTS.md) for complete tables,
-commits, corpus definitions, caveats, and reproduction commands.
-
-## SQL quickstart
+For repeated typed queries, import `github.com/thesyncim/vibedb/query`, compile
+a `query.Query` once, and reuse a collection session:
 
 ```go
-db, err := sql.Open("vibedb", "example.vdb")
-if err != nil { log.Fatal(err) }
-defer db.Close()
+compiled := query.Select(query.Path("name")).Where(
+	query.Cmp("active", query.Eq, true),
+)
 
-if _, err = db.Exec(`
-	CREATE TABLE users (
-		id STRING PRIMARY KEY,
-		name STRING NOT NULL,
-		active BOOL NOT NULL
-	)`); err != nil {
-	log.Fatal(err)
-}
-if _, err = db.Exec(`INSERT INTO users VALUES (?)`,
-	`{"id":"user:1","name":"Ada","active":true}`); err != nil {
-	log.Fatal(err)
-}
+session := users.NewSession()
+defer session.Release()
 
-var name []byte
-if err = db.QueryRow(
-	`SELECT name FROM users WHERE id = ?`, "user:1",
-).Scan(&name); err != nil {
+result, err := session.Run(compiled)
+if err != nil {
 	log.Fatal(err)
 }
-fmt.Println(string(name)) // Ada
+for row := 0; row < result.RowCount; row++ {
+	name, _ := result.Columns[0].Cells[row].Text()
+	fmt.Println(name)
+}
 ```
 
-Imports are `database/sql`, `log`, `fmt`, and a blank import of
-`github.com/thesyncim/vibedb/sql/driver`. SQL is the public textual query
-language; JSON is the stored row representation. See the
-[supported SQL surface](docs/design/sql-surface.md) for schemas, indexes,
-joins, transactions, exact-number behavior, and explicit subset limits.
+See the [store guide](docs/store.md) for updates, deletes, batches, indexes,
+snapshots, and lower-level storage configuration.
+
+## Pick the interface that fits
+
+| Interface | Best for | Package |
+| --- | --- | --- |
+| Native document API | Embedded key/document access with the smallest surface | `github.com/thesyncim/vibedb` |
+| Typed query builder | Compiled, reusable Go queries and tight execution control | `github.com/thesyncim/vibedb/query` |
+| `database/sql` | Schemas, SQL, prepared statements, and transactions in Go | `github.com/thesyncim/vibedb/sql/driver` |
+| PostgreSQL protocol | Existing pgx/lib/pq clients, direct `psql`, or non-Go clients | `github.com/thesyncim/vibedb/pgwire` |
+
+All four interfaces use the same JSON storage and query engine. SQL is a query
+language over JSON documents; it is not a separate relational storage engine.
+
+## SQL quick start
+
+```go
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+
+	_ "github.com/thesyncim/vibedb/sql/driver"
+)
+
+func main() {
+	db, err := sql.Open("vibedb", "data/app-sql.vdb")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id STRING PRIMARY KEY,
+			name STRING NOT NULL,
+			active BOOL NOT NULL
+		)
+	`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = db.Exec(
+		`INSERT INTO users VALUES (?)`,
+		`{"id":"user:1","name":"Ada","active":true}`,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var name []byte
+	err = db.QueryRow(
+		`SELECT name FROM users WHERE id = ?`,
+		"user:1",
+	).Scan(&name)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(name))
+}
+```
+
+The supported surface includes schema-checked tables, exact indexes, DML with
+`RETURNING`, joins, derived tables, CTEs, set operations, a bounded recursive
+CTE subset, a documented window-function subset, views, predicate subqueries,
+and snapshot transactions. Unsupported shapes return explicit positioned
+errors instead of silently changing semantics.
+
+VibeDB SQL is intentionally a subset, not PostgreSQL compatibility. Read the
+[SQL surface](docs/design/sql-surface.md) before choosing an ORM or generating
+queries dynamically.
 
 ## PostgreSQL clients
 
-The `pgwire` package exposes the same typed SQL catalog and query engine over
-PostgreSQL protocol v3:
+The `pgwire` package exposes the same SQL runtime over PostgreSQL protocol v3:
 
 ```go
-catalog, err := vibedriver.Open("example.vdb")
-if err != nil { log.Fatal(err) }
-defer catalog.Close()
+package main
 
-srv, err := pgwire.NewServer(catalog, pgwire.Options{
-	Auth:                 pgwire.Trust(),
-	MaxIntermediateBytes: 64 << 20,
-})
-if err != nil { log.Fatal(err) }
-ln, err := net.Listen("tcp", "127.0.0.1:5433")
-if err != nil { log.Fatal(err) }
-go func() { log.Print(srv.Serve(ln)) }()
+import (
+	"log"
+	"net"
+
+	"github.com/thesyncim/vibedb/pgwire"
+	vibedriver "github.com/thesyncim/vibedb/sql/driver"
+)
+
+func main() {
+	catalog, err := vibedriver.Open("data/app-sql.vdb")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer catalog.Close()
+
+	server, err := pgwire.NewServer(catalog, pgwire.Options{
+		Auth: pgwire.Trust(), // local development only
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:5433")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(server.Serve(listener))
+}
 ```
 
-pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
-parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
-`SELECT`, durable ordinary views, SELECT-valued CTEs including the bounded
-recursive subset, set operations, the documented window-function subset,
-uncorrelated predicate subqueries, the documented decorrelated correlated
-`EXISTS`/`NOT EXISTS`/`IN`/`NOT IN`/scalar subset, the documented
-derived/`LATERAL` relation subset,
-and chained inner, left, right, full, and cross joins. Composite `USING`,
-composite equi-keys, residual `ON` predicates, prepared statements, and explicit
-transactions use the same execution path. Stock `psql` can connect and issue
-the same supported direct SQL. Whole-document parameters are described as
-PostgreSQL `json`; projected JSON values preserve their stored wire spelling.
-Exact scalar arithmetic, concatenation, and `CAST` to `TEXT`, `BOOLEAN`,
-`NUMERIC`, or `JSON` do not fall back to floating point; searched and simple
-`CASE` expressions retain ordered, lazy branch semantics.
-
-Proof-backed correlated predicate subqueries are accepted only as a top-level
-`WHERE` conjunct, optionally under one direct `NOT`. `EXISTS`/`NOT EXISTS` may
-use one or more equality correlation keys; `IN`/`NOT IN` and scalar comparisons
-add exactly one non-aggregate projected child path. The outer and child each
-name one physical relation, every captured outer reference is consumed by a
-top-level local-to-outer equality, and every remaining child predicate is
-inner-only. The child scans once into a grouped mark table: duplicate matches
-never fan out an outer row, composite tuples are compared exactly, and scalar
-cardinality is checked only when its outer group is actually probed.
-
-`NOT IN` has its SQL null-aware truth table rather than reusing anti-join
-negation: an empty correlated group is TRUE even for a NULL/missing probe; an
-exact non-NULL match is FALSE; otherwise a NULL/missing probe or projected NULL
-makes the result UNKNOWN. Scalar groups with zero rows or one NULL yield
-UNKNOWN, one known value uses the authored comparison, and two rows—including
-identical or NULL rows—raise `21000`. Untyped objects and arrays use canonical
-stored JSON identity: object member order normalizes equal, array order remains
-significant, and changed members or values remain unequal. The existing scalar
-single-key `EXISTS` path may use an exact outer index. Grouped composite and
-value modes currently build the child once and conservatively scan the complete
-outer relation, even when a compound index exists; indexed and unindexed runs
-must remain differential-equivalent, and EXPLAIN does not claim a grouped index
-bound. The operator runs over one coherent durable catalog snapshot,
-transactions add pending writes to the BEGIN snapshot, and cancellation or
-exact work-memory refusal publishes no cursor. Nested boolean placement,
-unconsumed correlation, non-equality keys, and child
-joins/CTEs/sets/grouping/windows/tails remain positioned `0A000`.
-
-`INSERT` query sources accept one complete JSON document column from a
-`SELECT`, `WITH`, `TABLE`, parenthesized, set, CTE, join, or view-backed query.
-The source reads the pre-statement snapshot; every document, key, conflict,
-route, and `RETURNING` row is staged before one atomic publication. The same
-contract applies in transactions and under result, intermediate, and durable
-batch limits; source spools, exact lane-specific staging, and `RETURNING` share
-one `IntermediateBytes` account, while placed routing streams over that staging
-without retaining a second vector. Documents above the durable inline threshold
-remain valid up to `MaxDocumentBytes`: mixed inline and multi-page documents,
-replacements, deletes, and exact-index changes publish as one batch generation
-and recover all-or-none from one journal record. Pinned snapshots retain the
-old overflow chains until their lease closes.
-
-`INSERT ... RETURNING`, `UPDATE ... RETURNING`, and `DELETE ... RETURNING`
-support projected JSON paths and `*`; `ON CONFLICT DO NOTHING` skips duplicate
-document identities atomically. Ordinary views are durable virtual definitions
-and read-only; materialized views are explicitly refused. Supplying a table
-where `DROP VIEW` requires a view, or a view to `DROP TABLE`, `TRUNCATE`,
-`CREATE INDEX`, table-qualified `DROP INDEX`, or mutation DML, is PostgreSQL
-SQLSTATE `42809` even with `IF EXISTS`.
-`SELECT DISTINCT` is supported for non-aggregate projections.
-`TRUNCATE [TABLE]` atomically replaces a table with an empty durable
-incarnation while preserving its schema and indexes. `DROP INDEX [IF EXISTS]`
-physically rebuilds and atomically publishes the table without the named exact
-index; `ON table` disambiguates table-local index names.
-
-For example, the server above accepts a direct psql session with the documented
-cleartext fallback:
+Then connect with a PostgreSQL client:
 
 ```sh
-psql -X "host=127.0.0.1 port=5433 user=demo dbname=demo sslmode=prefer"
+psql -X "host=127.0.0.1 port=5433 user=demo dbname=demo sslmode=disable"
 ```
 
-A [nested integration gate](integration/pgclient/pgclient_test.go) exercises
-pinned pgx v5 and lib/pq releases over loopback TCP in CI. A separate
-[psql gate](integration/pgclient/psql_test.go) drives the official PostgreSQL
-18.4 client through encryption fallback, SCRAM, SQL execution, error recovery,
-and clean termination. Together they cover schema validation, indexes, writes,
-a join, rollback/read-your-writes, stable SQLSTATEs, and close/reopen
-persistence.
+The server supports the simple and extended protocols, prepared statements,
+SCRAM-SHA-256, transaction state, cancellation, text and binary results, and a
+small compatibility layer for basic `psql` introspection commands. It does not
+provide a queryable PostgreSQL catalog, general ORM/BI discovery, or TLS. Bind
+it to a trusted local interface or place it behind a TLS-terminating proxy.
 
-This is a PostgreSQL client protocol and SQL-subset implementation, not a
-PostgreSQL catalog emulator. The pinned PostgreSQL 18.4 psql client's bounded basic meta-commands (`\l`,
-`\dn`, `\dt`, `\di`, `\d`, and `\d name`) are answered from the SQL catalog;
-`\d name` currently accepts only bare ASCII names up to 128 bytes; `\df`,
-`\du`, and `\dv` return honest empty results. TLS, queryable
-`pg_catalog`, arbitrary catalog SQL, ORM/BI schema discovery, savepoints, and
-transactional DDL are explicitly unsupported. See the
-[pgwire contract](pgwire/doc.go) for the exact surface,
-authentication, result types, transaction boundaries, cancellation, and
-resource bounds.
+See the [pgwire contract](pgwire/doc.go) for the exact protocol and client
+compatibility boundary.
 
-## Durability at a glance
+## Durability profiles
 
-| Option | Success means | Reader visibility | Crash window |
-| --- | --- | --- | --- |
-| `DurabilityBufferedVisible` | accepted into bounded foreground staging; with `RecoveryJournal`, its redo record is also appended and synced | immediate | without a recovery journal, acknowledged changes after the last successful `Flush` may be lost; with one, recovery replays the synced prefix |
-| `DurabilityAsyncVisible` | accepted by the bounded background committer | immediate | acknowledged generations not yet reported by `DurableGeneration` may be lost |
-| `DurabilitySync` (zero value) | one recovery-journal record appended and synced on the primary graph, then the mutation applies and publishes | after the journal sync — visibility strictly follows durability | recovery selects the last checkpointed root and replays the journal's acknowledged records |
+The zero-value/default profile is `Durable`.
 
-If a complete recovery-journal record was appended but its sync reports an
-error, the logical outcome cannot be inferred from the error alone: reopen may
-replay the complete single mutation or batch even when the synchronous live
-reader never saw it. The API returns `durable.ErrCommitOutcomeUnknown` while
-retaining the device cause, and the live writer is terminally poisoned. Pgwire
-maps this condition to PostgreSQL SQLSTATE `40003`
-(`statement_completion_unknown`). Reconcile the affected data after close and
-reopen before deciding whether to retry; do not blindly resubmit the mutation.
+| Profile | A successful mutation means | Persistence boundary |
+| --- | --- | --- |
+| `vibedb.Memory` | Visible in process memory | None; the path is ignored |
+| `vibedb.Buffered` | Visible from bounded memory | `Flush` or `Close` |
+| `vibedb.Durable` | Persisted to the recovery journal before it becomes visible | Every successful mutation |
 
-For buffered mode, `CheckpointPowerSafe` is the zero-value `Flush` strength;
-`CheckpointFilesystem` explicitly selects an ordinary filesystem boundary.
-See [the durability contract](docs/durability.md) before choosing a weaker
-mode.
+Durable and buffered databases use the path passed to `Open` as a database
+directory. Each successful write publishes a new database state while existing
+snapshots keep seeing the state they opened. Maintenance runs as bounded
+foreground work, so there is no background compactor to tune or wait for.
 
-## Start here
+Read the [durability contract](docs/durability.md) before selecting buffered or
+advanced durability modes. In particular, a storage error can report an
+unknown commit outcome; callers must close, reopen, and reconcile instead of
+blindly retrying.
 
-- [Architecture](docs/architecture.md): representation invariants and the
-  read, write, checkpoint, and snapshot paths.
-- [Store API](docs/store.md): current heap and durable surfaces.
-- [Capability matrix](docs/capabilities.md): executable native, database/sql,
-  pgwire, indexing, transaction, operation, and durability contracts.
-- [Durability](docs/durability.md): acknowledgement, crash, recovery, and
-  platform-sync contracts.
-- [On-disk format](docs/format.md): current byte-level format authority.
-- [Performance](docs/performance.md): measured tables and benchmark honesty
-  rules; the [executable benchmark coverage matrix](bench/competitive/COVERAGE.md)
-  records which measurement shapes exist and which remain gaps.
-- [Design documents](docs/design/): current design constraints and future work.
-- [Contributing](CONTRIBUTING.md): tests, benchmarks, and documentation rules.
+## Important limitations
+
+- The project is unreleased; APIs and storage format version 0 are unstable.
+- SQL transactions may read multiple tables but write exactly one table.
+- DDL is atomic per statement but is not transactional.
+- Savepoints, two-table writes, arbitrary `pg_catalog` queries, and general ORM
+  schema discovery are not supported.
+- Pgwire does not implement TLS, replication, `COPY`, `LISTEN`/`NOTIFY`, or the
+  full PostgreSQL type and function systems.
+- Materialized views are not implemented; ordinary durable views are read-only.
+- Memory and work are explicitly bounded. Exceeding a limit returns an error
+  without publishing a partial query result or mutation.
+
+The [capability matrix](docs/capabilities.md) is the executable authority for
+which combinations of operations, indexes, transactions, and durability are
+supported.
+
+## Performance
+
+VibeDB is designed for compiled queries, reusable execution storage, bounded
+foreground work, and allocation-free warm paths. Competitive benchmarks,
+corpus definitions, raw results, and reproduction commands are checked into
+the repository rather than summarized as context-free headline numbers here:
+
+- [Performance guide](docs/performance.md)
+- [Competitive benchmark results](bench/competitive/RESULTS.md)
+- [Benchmark coverage matrix](bench/competitive/COVERAGE.md)
+
+## Documentation
+
+| Topic | Document |
+| --- | --- |
+| Start using the storage API | [Store guide](docs/store.md) |
+| Exact supported combinations | [Capability matrix](docs/capabilities.md) |
+| SQL syntax and limitations | [SQL surface](docs/design/sql-surface.md) |
+| Crash, recovery, and acknowledgement guarantees | [Durability](docs/durability.md) |
+| Storage and snapshot design | [Architecture](docs/architecture.md) |
+| On-disk format | [Format](docs/format.md) |
+| Benchmarks and methodology | [Performance](docs/performance.md) |
+| Development workflow | [Contributing](CONTRIBUTING.md) |
+
+## Contributing
+
+VibeDB favors measured behavior and explicit failure over undocumented
+fallbacks. Changes should include correctness tests, resource-bound tests where
+applicable, and benchmarks for hot-path work. See [CONTRIBUTING.md](CONTRIBUTING.md).
