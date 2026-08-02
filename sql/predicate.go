@@ -34,6 +34,8 @@ const (
 	ctxJoin
 )
 
+const joinOnPredicateSubqueryUnsupported = "predicate subqueries in JOIN ON are not supported yet; move the predicate to WHERE or materialize and join the nested relation explicitly"
+
 func (c exprContext) String() string {
 	if c == ctxHaving {
 		return "HAVING"
@@ -169,9 +171,17 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		if err := p.expect(tokLParen, "'(' after EXISTS"); err != nil {
 			return nil, err
 		}
-		sub, err := p.parseSubquery(true)
+		sub, err := p.parsePredicateSubquery(true)
 		if err != nil {
 			return nil, err
+		}
+		if ctx == ctxJoin {
+			// Parse the complete nested query first so malformed EXISTS syntax
+			// remains a ParseError. A valid shape is then refused at its operator;
+			// no executable ON expression is ever returned.
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, pos, joinOnPredicateSubqueryUnsupported,
+			)
 		}
 		e := p.exprs.one()
 		*e = Expr{Kind: ExprExists, Column: -1, Subquery: sub, Pos: pos}
@@ -324,8 +334,9 @@ func (p *Parser) parseLeafTail(
 	negated := p.acceptKeyword(kwNot)
 	switch {
 	case p.atKeyword(kwIn):
+		operatorPos := p.tok.pos
 		p.advance()
-		return p.parseInTail(agg, path, pos, negated)
+		return p.parseInTail(ctx, agg, path, pos, operatorPos, negated)
 	case p.atKeyword(kwBetween):
 		p.advance()
 		return p.parseBetweenTail(agg, path, pos, negated)
@@ -346,7 +357,7 @@ func (p *Parser) parseLeafTail(
 		return nil, p.errHere("expected a comparison operator, IS, IN, BETWEEN, or @> after a path; a bare path is not a condition, so a boolean field is tested as `flag = TRUE`")
 	}
 	p.advance()
-	if (ctx == ctxJoin || p.lateral != nil && p.lateral.capture != nil) &&
+	if (ctx == ctxJoin || p.correlation != nil && p.correlation.capture != nil) &&
 		(p.tok.kind == tokQuotedIdent ||
 			p.tok.kind == tokIdent && p.tok.kw == kwNone) {
 		right, err := p.parsePath(false)
@@ -361,14 +372,17 @@ func (p *Parser) parseLeafTail(
 		return e, nil
 	}
 	if p.tok.kind == tokLParen {
-		if ctx == ctxJoin {
-			return nil, p.errHere("subqueries are not supported in ON; materialize the relation before joining")
-		}
+		subqueryPos := p.tok.pos
 		p.advance()
 		if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
-			sub, err := p.parseSubquery(false)
+			sub, err := p.parsePredicateSubquery(false)
 			if err != nil {
 				return nil, err
+			}
+			if ctx == ctxJoin {
+				return nil, newFeatureNotSupportedError(
+					p.lx.src, subqueryPos, joinOnPredicateSubqueryUnsupported,
+				)
 			}
 			e := p.exprs.one()
 			*e = Expr{Kind: ExprCompare, Op: op, Agg: agg, Column: -1, Path: path, Subquery: sub, Pos: pos}
@@ -433,14 +447,25 @@ func (p *Parser) parseIsTail(agg AggKind, path *PathExpr, pos int) (*Expr, error
 
 // parseInTail parses the alternatives of IN, which the engine answers with a
 // sorted membership rather than a chain of equalities.
-func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool) (*Expr, error) {
+func (p *Parser) parseInTail(
+	ctx exprContext,
+	agg AggKind,
+	path *PathExpr,
+	pos, operatorPos int,
+	negated bool,
+) (*Expr, error) {
 	if err := p.expect(tokLParen, "'(' after IN"); err != nil {
 		return nil, err
 	}
 	if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
-		sub, err := p.parseSubquery(false)
+		sub, err := p.parsePredicateSubquery(false)
 		if err != nil {
 			return nil, err
+		}
+		if ctx == ctxJoin {
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, operatorPos, joinOnPredicateSubqueryUnsupported,
+			)
 		}
 		e := p.exprs.one()
 		*e = Expr{Kind: ExprIn, Negated: negated, Agg: agg, Column: -1, Path: path, Subquery: sub, Pos: pos}
@@ -473,8 +498,43 @@ func (p *Parser) parseInTail(agg AggKind, path *PathExpr, pos int, negated bool)
 	return e, nil
 }
 
-// parseSubquery parses a SELECT beginning at the current token and consumes
-// the ')' belonging to its caller.
+// parsePredicateSubquery parses a nested predicate query with the complete
+// current FROM scope visible for qualified outer references. Local range
+// aliases are still resolved first by the child parser, so aliases and CTE
+// references shadow outer names lexically. Only a proven capture is frozen
+// into the AST; uncorrelated predicate subqueries retain a nil sidecar.
+func (p *Parser) parsePredicateSubquery(exists bool) (*SelectStmt, error) {
+	capture := p.beginPredicateCorrelation()
+	sub, err := p.parseSubqueryScoped(exists, &capture.scope, capture)
+	if err != nil {
+		return nil, err
+	}
+	sub.Correlation = p.finishCorrelationCapture(capture, false, false)
+	return sub, nil
+}
+
+func (p *Parser) beginPredicateCorrelation() *correlationCapture {
+	state := p.correlationState()
+	capture := state.captures.one()
+	capture.owner = p
+	capture.bindingBase = len(state.bindingScratch)
+	capture.referenceBase = len(state.referenceScratch)
+	capture.forwardBase = len(state.forward)
+	capture.source = len(p.from)
+	// parseSubqueryScoped rebases the child before this capture is frozen, so
+	// use the query's position in the current parser source. An enclosing parse
+	// will rebase the complete SelectStmt, including this sidecar, once more.
+	capture.pos = p.tok.pos
+	capture.scope = correlationRangeScope{
+		parser: p,
+		limit:  len(p.from),
+		outer:  state.outerRanges,
+	}
+	return capture
+}
+
+// parseSubquery parses an independently scoped SELECT beginning at the current
+// token and consumes the ')' belonging to its caller.
 //
 // A child Parser is intentional. A nested statement has its own FROM scope and
 // its tree must remain live beside the outer tree; sharing the outer clause
@@ -485,13 +545,12 @@ func (p *Parser) parseSubquery(exists bool) (*SelectStmt, error) {
 	return p.parseSubqueryScoped(exists, nil, nil)
 }
 
-// parseSubqueryScoped is the LATERAL-only form of parseSubquery. Ordinary
-// derived tables, CTE bodies, and predicate subqueries pass nil scope and keep
-// their historical independent-FROM contract.
+// parseSubqueryScoped is the correlation-aware form shared by LATERAL derived
+// relations and predicate subqueries. Ordinary derived tables pass nil scope.
 func (p *Parser) parseSubqueryScoped(
 	exists bool,
-	outerRanges *lateralRangeScope,
-	capture *lateralCapture,
+	outerRanges *correlationRangeScope,
+	capture *correlationCapture,
 ) (*SelectStmt, error) {
 	start := p.tok.pos
 	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) && p.tok.kind != tokLParen {
@@ -583,6 +642,12 @@ func (p *Parser) rebaseSubqueryError(err error, start int) error {
 }
 
 func shiftSelectPositions(s *SelectStmt, delta int) {
+	if s.Correlation != nil {
+		s.Correlation.Pos += delta
+		for i := range s.Correlation.Bindings {
+			s.Correlation.Bindings[i].Pos += delta
+		}
+	}
 	if s.With != nil {
 		s.With.Pos += delta
 		for i := range s.With.CTEs {

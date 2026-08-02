@@ -82,6 +82,17 @@ type SelectStmt struct {
 	// statement when it is a subquery. It is zero for a top-level statement.
 	ParamBase int
 
+	// Correlation is the cold outer-reference sidecar of a predicate subquery.
+	// It is nil for top-level statements, uncorrelated predicate subqueries,
+	// CTE definitions, and ordinary derived relations. Keeping the occurrence
+	// map here leaves every PathExpr at its established size and makes the
+	// overwhelmingly common uncorrelated path pay neither storage nor work.
+	//
+	// A consumer must not infer executability from a non-nil sidecar: it records
+	// all syntactically valid correlated shapes so a semantic layer can either
+	// decorrelate them or issue a positioned refusal.
+	Correlation *CorrelationSpec
+
 	// Set is the cold query-expression sidecar. It is nil for an ordinary
 	// SELECT, preserving the existing direct lowering path. When non-nil, this
 	// SelectStmt mirrors Set.First only for stable output metadata; Params is
@@ -215,42 +226,51 @@ type CTEReferenceMetadata struct {
 	DefinitionPos int
 }
 
-// A LateralBinding is one stable value slot captured from a relation visible
-// to a LATERAL derived query. Bindings are unique by (Depth, Source, Segments)
-// and remain in first-reference order, so a prepared lowerer can compile them
-// once and fill the same slots for every left-side row.
+// A CorrelationBinding is one stable value slot captured from a lexically
+// visible outer relation. Bindings are unique by (Depth, Source, Segments) and
+// remain in first-reference order, so a prepared lowerer can compile them once
+// and fill the same slots for every outer row.
 //
-// Depth is one for the SELECT immediately containing the LATERAL relation, two
-// for its parent, and so on. Source indexes that SELECT's From slice. This
-// explicit pair avoids flattening nested lexical scopes or relying on aliases
-// after parsing. Pos identifies the first path occurrence that requested the
-// binding.
-type LateralBinding struct {
+// Depth is one for the immediately containing SELECT, two for its parent, and
+// so on. Source indexes that SELECT's From slice. This explicit pair avoids
+// flattening nested lexical scopes or relying on aliases after parsing. Pos
+// identifies the first path occurrence that requested the binding.
+type CorrelationBinding struct {
 	Depth    int
 	Source   int
 	Segments []Segment
 	Pos      int
 }
 
-// A LateralReference maps one exact correlated PathExpr occurrence to its
-// zero-based LateralBinding slot. Keeping this mapping in a relation-local
-// sidecar leaves ordinary PathExpr nodes unchanged in size and cost.
-type LateralReference struct {
+// A CorrelationReference maps one exact correlated PathExpr occurrence to its
+// zero-based CorrelationBinding slot. Keeping this mapping in a cold sidecar
+// leaves ordinary PathExpr nodes unchanged in size and cost.
+type CorrelationReference struct {
 	Path    *PathExpr
 	Binding int
 }
 
-// LateralSpec is the cold metadata attached to an explicitly LATERAL derived
-// relation. A nil *TableRef.Lateral is the zero-cost ordinary path.
-type LateralSpec struct {
-	Bindings   []LateralBinding
-	References []LateralReference
-	// Decorrelated is true when the derived query captured no outer paths. A
-	// lowerer may evaluate it once through the ordinary derived-relation plan.
+// CorrelationSpec is cold metadata for exact outer-path capture. Predicate
+// subqueries attach it to SelectStmt.Correlation only when at least one outer
+// path was captured. Explicit LATERAL relations attach it to TableRef.Lateral
+// even when empty so their authored LATERAL semantics remain observable.
+type CorrelationSpec struct {
+	Bindings   []CorrelationBinding
+	References []CorrelationReference
+	// Decorrelated is true only for an explicitly LATERAL derived query that
+	// captured no outer paths. Predicate-subquery specs are never empty.
 	Decorrelated bool
-	// Pos is the byte offset of LATERAL.
+	// Pos is the byte offset of LATERAL for a derived relation, or the nested
+	// query's first token for a predicate subquery.
 	Pos int
 }
+
+// LateralBinding, LateralReference, and LateralSpec preserve the original API
+// while sharing the generalized correlation representation. These are aliases,
+// not wrapper types, so existing lowerers incur no conversion or runtime cost.
+type LateralBinding = CorrelationBinding
+type LateralReference = CorrelationReference
+type LateralSpec = CorrelationSpec
 
 // A TableRef is one range variable: a physical collection or derived query,
 // the name paths use to qualify against it, and, for a joined relation, its
@@ -606,8 +626,8 @@ type OrderTerm struct {
 // variable rather than a field.
 type PathExpr struct {
 	// Source is an index into [SelectStmt.From].
-	// A path listed by a containing [LateralSpec.References] instead indexes the
-	// ancestor From named by that reference's binding.
+	// A path listed by a containing [CorrelationSpec.References] instead indexes
+	// the ancestor From named by that reference's binding.
 	Source int
 	// MergedUsing is the one-based From index of the USING clause whose merged
 	// output this unqualified path names. Zero means an ordinary source path.
@@ -769,9 +789,9 @@ type Expr struct {
 	Kids []*Expr
 	// Subquery is the nested SELECT used by ExprExists, by ExprIn instead of
 	// List, or by ExprCompare instead of Value. It is nil for every ordinary
-	// leaf. Nested statements have their own source scope; correlated
-	// references are deliberately rejected until the executor has a
-	// parameterized nested-loop plan rather than being guessed at here.
+	// leaf. Nested statements have their own local source scope; exact outer
+	// references are recorded in Subquery.Correlation for proof-backed lowering
+	// or a positioned feature refusal.
 	Subquery *SelectStmt
 	Pos      int
 }

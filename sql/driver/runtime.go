@@ -199,6 +199,28 @@ func (s *Session) SetIntermediateLimit(bytes int64) error {
 	return nil
 }
 
+// SetMemoryLimit configures the query executor's in-memory work allowance.
+// Zero selects the query package default. A positive limit must be at least
+// 64 KiB, the minimum workspace from which both heap and durable execution can
+// make progress. Configure a session while it is idle and has no live Cursor;
+// a rejected call leaves the previous limit unchanged.
+func (s *Session) SetMemoryLimit(bytes int64) error {
+	if err := s.live(); err != nil {
+		return err
+	}
+	if bytes != 0 && bytes < driverMinimumQueryMemory {
+		return errors.New("vibedb: memory limit must be zero or at least 64 KiB")
+	}
+	if s.current != nil {
+		return ErrCursorOpen
+	}
+	if s.state != SessionIdle {
+		return ErrTransactionActive
+	}
+	s.conn.exec.Options.MemoryBytes = bytes
+	return nil
+}
+
 // Prepare parses and lowers one statement exactly once.
 //
 // An error while a transaction is active moves the session to

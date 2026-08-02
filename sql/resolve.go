@@ -45,7 +45,7 @@ func (p *Parser) resolvePaths() error {
 			if source, depth, ok := p.outerRangeVar(path.Segments[0].Key); ok {
 				path.Source = source
 				path.Segments = path.Segments[1:]
-				p.bindLateralPath(path, depth, source)
+				p.bindCorrelationPath(path, depth, source)
 				continue
 			}
 			p.noteLateralForwardCandidate(path, path.Segments[0].Key)
@@ -75,11 +75,11 @@ func (p *Parser) resolvePaths() error {
 }
 
 func (p *Parser) outerRangeVar(name string) (source, depth int, ok bool) {
-	if p.lateral == nil {
+	if p.correlation == nil {
 		return 0, 0, false
 	}
 	depth = 1
-	for scope := p.lateral.outerRanges; scope != nil; scope = scope.outer {
+	for scope := p.correlation.outerRanges; scope != nil; scope = scope.outer {
 		if scope.parser != nil {
 			limit := min(scope.limit, len(scope.parser.from))
 			for i := 0; i < limit; i++ {
@@ -93,38 +93,39 @@ func (p *Parser) outerRangeVar(name string) (source, depth int, ok bool) {
 	return 0, 0, false
 }
 
-func (p *Parser) bindLateralPath(path *PathExpr, depth, source int) {
-	if p.lateral == nil {
+func (p *Parser) bindCorrelationPath(path *PathExpr, depth, source int) {
+	if p.correlation == nil {
 		return
 	}
-	capture := p.lateral.capture
+	capture := p.correlation.capture
 	if capture == nil || capture.owner == nil {
 		return
 	}
-	bindLateralCapture(capture, path, depth, source, true)
-	// A nested LATERAL may reach through its parent query to an ancestor of
-	// that parent. Propagate the dependency through every owning LATERAL so no
-	// intermediate relation is incorrectly marked decorrelated.
+	bindCorrelationCapture(capture, path, depth, source, true)
+	// A nested correlation may reach through its parent query to an ancestor of
+	// that parent. Propagate the dependency through every owning capture so no
+	// intermediate relation or predicate subquery is incorrectly treated as
+	// uncorrelated.
 	for depth > 1 {
-		if capture.owner.lateral == nil {
+		if capture.owner.correlation == nil {
 			break
 		}
-		capture = capture.owner.lateral.capture
+		capture = capture.owner.correlation.capture
 		if capture == nil || capture.owner == nil {
 			break
 		}
 		depth--
-		bindLateralCapture(capture, path, depth, source, false)
+		bindCorrelationCapture(capture, path, depth, source, false)
 	}
 }
 
-func bindLateralCapture(
-	capture *lateralCapture,
+func bindCorrelationCapture(
+	capture *correlationCapture,
 	path *PathExpr,
 	depth, source int,
 	reference bool,
 ) int {
-	state := capture.owner.lateralState()
+	state := capture.owner.correlationState()
 	bindings := state.bindingScratch[capture.bindingBase:]
 	bindingIndex := -1
 	for i := range bindings {
@@ -136,8 +137,8 @@ func bindLateralCapture(
 		}
 	}
 	if bindingIndex < 0 {
-		state.bindingScratch = append(state.bindingScratch, lateralScratchBinding{
-			binding: LateralBinding{
+		state.bindingScratch = append(state.bindingScratch, correlationScratchBinding{
+			binding: CorrelationBinding{
 				Depth: depth, Source: source, Segments: path.Segments, Pos: path.Pos,
 			},
 			path: path,
@@ -145,7 +146,7 @@ func bindLateralCapture(
 		bindingIndex = len(state.bindingScratch) - capture.bindingBase - 1
 	}
 	if reference {
-		state.referenceScratch = append(state.referenceScratch, lateralScratchReference{
+		state.referenceScratch = append(state.referenceScratch, correlationScratchReference{
 			path: path, binding: bindingIndex,
 		})
 	}
@@ -164,21 +165,21 @@ func sameSegments(left, right []Segment) bool {
 	return true
 }
 
-func (p *Parser) isLateralReference(path *PathExpr) bool {
-	_, ok := p.lateralReferenceBinding(path)
+func (p *Parser) isCorrelationReference(path *PathExpr) bool {
+	_, ok := p.correlationReferenceBinding(path)
 	return ok
 }
 
-func (p *Parser) lateralReferenceBinding(path *PathExpr) (int, bool) {
-	if path == nil || p.lateral == nil {
+func (p *Parser) correlationReferenceBinding(path *PathExpr) (int, bool) {
+	if path == nil || p.correlation == nil {
 		return 0, false
 	}
-	capture := p.lateral.capture
+	capture := p.correlation.capture
 	if capture == nil || capture.owner == nil ||
-		capture.owner.lateral == nil {
+		capture.owner.correlation == nil {
 		return 0, false
 	}
-	references := capture.owner.lateral.referenceScratch[capture.referenceBase:]
+	references := capture.owner.correlation.referenceScratch[capture.referenceBase:]
 	for i := range references {
 		if references[i].path == path {
 			return references[i].binding, true
@@ -188,15 +189,15 @@ func (p *Parser) lateralReferenceBinding(path *PathExpr) (int, bool) {
 }
 
 func (p *Parser) noteLateralForwardCandidate(path *PathExpr, alias string) {
-	if p.lateral == nil {
+	if p.correlation == nil {
 		return
 	}
-	capture := p.lateral.capture
+	capture := p.correlation.capture
 	if capture == nil || capture.owner == nil {
 		return
 	}
-	state := capture.owner.lateralState()
-	state.forward = append(state.forward, lateralForwardCandidate{
+	state := capture.owner.correlationState()
+	state.forward = append(state.forward, correlationForwardCandidate{
 		path: path, alias: alias, source: capture.source,
 	})
 }
@@ -432,8 +433,8 @@ func firstUngroupedPredicatePath(p *Parser, expr *Expr) *PathExpr {
 }
 
 func (p *Parser) rejectLateralForwardAlias(alias string, source int) error {
-	for i := range p.lateral.forward {
-		candidate := &p.lateral.forward[i]
+	for i := range p.correlation.forward {
+		candidate := &p.correlation.forward[i]
 		if source < candidate.source || alias != candidate.alias {
 			continue
 		}
@@ -546,7 +547,9 @@ func (p *Parser) validateJoins() error {
 				return nil
 			}
 			if expr.Subquery != nil || expr.Kind == ExprExists {
-				return p.errAt(expr.Pos, "subqueries are not supported in ON")
+				return newFeatureNotSupportedError(
+					p.lx.src, expr.Pos, joinOnPredicateSubqueryUnsupported,
+				)
 			}
 			if expr.Kind == ExprScalarCompare || expr.Kind == ExprScalarIsNull {
 				return newFeatureNotSupportedError(
@@ -555,7 +558,7 @@ func (p *Parser) validateJoins() error {
 				)
 			}
 			for _, path := range []*PathExpr{expr.Path, expr.RightPath} {
-				if path == nil || p.isLateralReference(path) {
+				if path == nil || p.isCorrelationReference(path) {
 					continue
 				}
 				if path.Source > i {
@@ -583,7 +586,7 @@ func (p *Parser) validateJoins() error {
 		for _, term := range terms {
 			if term.Kind != ExprCompare || term.Op != OpEq ||
 				term.Path == nil || term.RightPath == nil ||
-				p.isLateralReference(term.Path) || p.isLateralReference(term.RightPath) {
+				p.isCorrelationReference(term.Path) || p.isCorrelationReference(term.RightPath) {
 				continue
 			}
 			left, right := term.Path, term.RightPath
@@ -724,8 +727,8 @@ func (p *Parser) isGroupKey(path *PathExpr) bool {
 }
 
 func (p *Parser) sameResolvedPath(left, right *PathExpr) bool {
-	leftBinding, leftOuter := p.lateralReferenceBinding(left)
-	rightBinding, rightOuter := p.lateralReferenceBinding(right)
+	leftBinding, leftOuter := p.correlationReferenceBinding(left)
+	rightBinding, rightOuter := p.correlationReferenceBinding(right)
 	if leftOuter != rightOuter {
 		return false
 	}

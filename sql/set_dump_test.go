@@ -7,6 +7,10 @@ import (
 
 func dumpSetStmt(statement *SelectStmt) string {
 	var b strings.Builder
+	if statement.Correlation != nil {
+		dumpCorrelation(&b, statement.Correlation)
+		b.WriteByte(' ')
+	}
 	expression := statement.Set
 	b.WriteString("set{")
 	dumpSetExpr(&b, expression.Root)

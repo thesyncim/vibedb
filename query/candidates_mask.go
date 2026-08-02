@@ -118,12 +118,10 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			return nil, false, false, nil
 		}
 		if len(needles) == 0 {
-			// No alternative, or an alternative with no scalar needle. An
-			// empty membership matches nothing, which is a sound and exact
-			// bound needing no index at all.
 			// An empty membership matches nothing, which is an exact answer on
 			// its own. lits is resolved rather than p.lits because a late-bound
-			// join membership carries its values in the Workspace slot.
+			// join membership carries its values in the Workspace slot. A
+			// non-empty membership without scalar needles is unindexable.
 			if len(lits) == 0 {
 				return nil, true, true, nil
 			}
@@ -156,6 +154,33 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			w.keepStoreMasks(acc)
 		}
 		return acc, true, requireExact, nil
+	case predAntiBound:
+		// Existential negation is a two-valued complement, not SQL NOT over a
+		// nullable equality. A heap snapshot can complement an exact positive
+		// membership against its metadata-only live universe; that retains
+		// NULL, missing, and scalar/container values outside the membership.
+		// Durable deliberately offers no live universe because obtaining one
+		// would require a full document-page scan, so it declines here before
+		// paying for any positive probes.
+		if caps.live == nil {
+			return nil, false, false, nil
+		}
+		positive := *p
+		positive.kind = predInBound
+		inner, bounded, exact, err := candidatesFor(
+			&positive, snapshot, caps, paths, indexes, w, true,
+		)
+		if err != nil {
+			return nil, false, false, err
+		}
+		if !bounded || !exact {
+			return nil, false, false, nil
+		}
+		liveMasks := caps.live.AppendLiveMasks(w.nextStoreMasks())
+		w.keepStoreMasks(liveMasks)
+		out := andNotStoreMasks(w.nextStoreMasks(), liveMasks, inner)
+		w.keepStoreMasks(out)
+		return out, true, true, nil
 	case predExists, predIsNull:
 		// An exact index stores values, not the fact that a path is missing or
 		// explicitly null, so nothing in the catalog bounds these: they fall

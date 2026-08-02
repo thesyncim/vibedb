@@ -310,6 +310,11 @@ func (p *plan) explainJSONAnalysis(
 		access := "adaptive-semi-join"
 		if join.fanOut {
 			access = "hash-build-and-probe"
+		} else if join.origin == joinOriginDecorrelatedExists {
+			access = "decorrelated-exists-semi"
+			if join.anti {
+				access = "decorrelated-exists-anti"
+			}
 		}
 		plan.Joins = append(plan.Joins, explainJoin{
 			Collection: join.collection,
@@ -733,6 +738,8 @@ func explainPredicateSummary(predicate *compiledPredicate) string {
 		return "in"
 	case predInBound:
 		return "join-match"
+	case predAntiBound:
+		return "join-anti-match"
 	default:
 		return "unknown"
 	}
@@ -760,6 +767,8 @@ func explainPredicateTree(predicate *compiledPredicate, paths []compiledPath) *e
 	case predIn, predInBound:
 		node.Operator = "IN"
 		node.ValueCount = len(predicate.lits)
+	case predAntiBound:
+		node.Operator = "NO MATCH"
 	}
 	for _, child := range predicate.kids {
 		if explained := explainPredicateTree(child, paths); explained != nil {
@@ -789,6 +798,8 @@ func explainPredicateKind(kind predKind) string {
 		return "in"
 	case predInBound:
 		return "join-match"
+	case predAntiBound:
+		return "join-anti-match"
 	default:
 		return "unknown"
 	}

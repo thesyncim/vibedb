@@ -433,6 +433,9 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 				"query: FromFileDatabase names collection %q, which the database snapshot does not hold",
 				src.name)
 		}
+		if driving == nil {
+			return p.runEmptyFileDatabaseInto(e, src.files)
+		}
 		return p.runFileInto(e, driving, src.files)
 	case sourceDatabase:
 		driving, ok := src.catalog.Collection(src.name)
@@ -450,6 +453,50 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 				"FromDatabase, or FromFileDatabase",
 		)
 	}
+}
+
+// runEmptyFileDatabaseInto executes a cataloged durable collection whose
+// representation is nil because no durable file has ever been allocated for
+// it. This state is distinct from an absent collection: the source dispatch
+// above proves the driving name is present, and this method proves every join
+// dependency is present before taking the zero-row path.
+//
+// No join side is read because an empty driving relation cannot produce a pair
+// or invoke a membership leaf. The ordinary heap zero-snapshot reducer remains
+// authoritative for aggregate-over-empty and projection schema semantics.
+func (p *plan) runEmptyFileDatabaseInto(
+	e *Exec,
+	catalog durable.DatabaseSnapshot,
+) error {
+	e.Result.fileData = e.Result.fileData[:0]
+	e.Stats = ExecStats{}
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
+	n, err := normalizeFileOptions(e.Options)
+	if err != nil {
+		return err
+	}
+	for i := range p.joins {
+		if _, ok := catalog.Collection(p.joins[i].collection); !ok {
+			return fmt.Errorf(
+				"query: join: collection %q is not in the database snapshot",
+				p.joins[i].collection,
+			)
+		}
+	}
+	e.Workspace.joinPairBudget.configure(-1)
+	for len(e.Workspace.joins) < len(p.joins) {
+		e.Workspace.joins = append(e.Workspace.joins, joinBinding{})
+	}
+	e.Workspace.eval.bindTo(e.Workspace.joins[:len(p.joins)])
+	e.Stats = ExecStats{Workers: n.workers}
+	err = p.runSnapshotRows(
+		&e.Result, store.Snapshot{}, store.DatabaseSnapshot{},
+		&e.Workspace, n.workers,
+	)
+	e.Workspace.collectJoinStats(p, &e.Stats)
+	return err
 }
 
 // rejectJoins refuses a join plan on a Source that names one collection. There

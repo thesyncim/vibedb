@@ -60,6 +60,11 @@ const (
 	// exactly the code it has today — no extra load, no extra branch — on the
 	// path that already had its set.
 	predInBound
+	// predAntiBound is the explicitly two-valued anti-semi counterpart used by
+	// decorrelated NOT EXISTS. It is not represented as predNot(predInBound):
+	// NULL/missing outer keys have no partner and therefore match the anti leaf,
+	// independent of SQL predicate-negation rewrites around ordinary leaves.
+	predAntiBound
 	// predLike matches a string column against a SQL LIKE pattern.
 	predLike
 	// predIsString is an internal SQL three-valued-logic guard for LIKE. It is
@@ -340,7 +345,7 @@ type compiledPredicate struct {
 	needles []vibejson.Index
 
 	// slot addresses this node's late binding in the executing [Workspace],
-	// for predInBound only. It is an index rather than a pointer because a
+	// for predInBound and predAntiBound. It is an index rather than a pointer because a
 	// compiled plan is immutable and shared by every concurrent execution: the
 	// values a join collects belong to one Exec, so the plan may name where to
 	// find them but must never hold them.
@@ -738,7 +743,7 @@ func (c *compiler) buildNeedleIndex(src []byte) (vibejson.Index, error) {
 // negation would claim to read value column zero and drag the first projected
 // path into the filter phase.
 //
-// A join leaf (predInBound) is a leaf like any other: it carries the outer join
+// A join leaf (predInBound or predAntiBound) is a leaf like any other: it carries the outer join
 // path's real column index, so it reaches the default arm and classifies that
 // column into the filter phase, which is where a predicate's column belongs. It
 // must not be added to the boolean arm above — a join leaf reads a column, and
@@ -876,6 +881,11 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
 	case predInBound:
 		return s.binds[p.slot].matches(cols[p.col][row], &s.probes[p.slot])
+	case predAntiBound:
+		// This is existential negation, not SQL NOT applied to an UNKNOWN
+		// comparison. NULL/missing cannot find an equality partner, so matches
+		// returns false and the anti predicate keeps the row.
+		return !s.binds[p.slot].matches(cols[p.col][row], &s.probes[p.slot])
 	case predContains:
 		cell := cols[p.col][row]
 		if len(cell.raw) == 0 {

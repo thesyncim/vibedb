@@ -155,6 +155,7 @@ type nestedStatements struct {
 	scalar       *statementScalar
 	ctes         *statementCTEs
 	cte          *statementCTEReference
+	decorrelated []statementDecorrelatedExists
 	ownsCTEs     bool
 	driving      string
 }
@@ -372,6 +373,12 @@ func prepareTreeInCorrelationContext(
 		s.drivingPredicate = s.window().input.DrivingPredicate()
 	} else {
 		s.requiresCatalog = selectRequiresCatalog(tree)
+		if s.hasDecorrelatedExists() {
+			// Even a self-correlation needs the coherent database source: the
+			// adaptive join resolves its inner snapshot through the catalog rather
+			// than manufacturing a second collection cut.
+			s.requiresCatalog = true
+		}
 		s.drivingPredicate = s.resolveDrivingPredicate()
 	}
 	if s.nested != nil {
@@ -447,10 +454,7 @@ func (s *Statement) SQL() string { return s.text }
 // snapshot resolves every collection at one instant; a caller holding a single
 // collection can refuse it before it takes a snapshot it would only discard.
 func (s *Statement) NumJoins() int {
-	if set := s.setSQL(); set != nil {
-		return set.joins
-	}
-	return len(s.tree.From) - 1
+	return s.catalogCapabilities(0).joins
 }
 
 // UsesGeneralizedRelationJoin reports whether this prepared statement executes
@@ -476,7 +480,7 @@ func (s *Statement) UsesGeneralizedRelationJoin() bool {
 // snapshot; adapters use this to avoid constructing a single-collection Source
 // that execution would have to reject.
 func (s *Statement) RequiresCatalog() bool {
-	return s.requiresCatalog
+	return s.catalogCapabilities(0).requires
 }
 
 // AppendSchema appends the statement's output schema to dst, one entry per
@@ -523,6 +527,8 @@ func (s *Statement) Release() {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
 		}
+		clear(s.nested.decorrelated)
+		s.nested.decorrelated = nil
 		if s.nested.derived != nil {
 			s.nested.derived.stmt.Release()
 			s.nested.derived.exec.Release()
@@ -831,6 +837,9 @@ func (s *Statement) runIntoFrame(
 }
 
 func (s *Statement) prepareSubqueries(argBase int) error {
+	if err := s.prepareDecorrelatedExists(); err != nil {
+		return err
+	}
 	if err := s.collectSubqueries(s.tree.Where, argBase); err != nil {
 		return err
 	}
@@ -842,6 +851,15 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr, argBase int) error {
 		return nil
 	}
 	if e.Subquery != nil {
+		if e.Subquery.Correlation != nil {
+			if s.decorrelatedExistsFor(e) != nil {
+				return nil
+			}
+			return sqlast.NewFeatureNotSupportedError(
+				s.text, e.Pos,
+				"correlated predicate subquery was not proved as a top-level EXISTS/NOT EXISTS equality",
+			)
+		}
 		use := subqueryScalarUse
 		switch e.Kind {
 		case sqlast.ExprIn:

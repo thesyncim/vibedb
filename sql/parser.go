@@ -166,9 +166,11 @@ type Parser struct {
 	// arena and scratch slice behind one pointer preserves the ordinary parser's
 	// state size and allocation profile.
 	window *windowParserState
-	// lateral is allocated only after an accepted LATERAL token. It owns both
-	// cold arenas and the transient lexical links installed on a child parser.
-	lateral *lateralParserState
+	// correlation is allocated only after an accepted LATERAL token or while a
+	// predicate subquery is being parsed. It owns both cold arenas and the
+	// transient lexical links installed on a child parser. An ordinary query and
+	// an uncorrelated predicate AST retain no metadata from this state.
+	correlation *correlationParserState
 	// set is allocated only after a top-level set operator or parenthesized
 	// query expression is encountered. Ordinary SELECT parsing therefore keeps
 	// no set-node arenas or scratch slices alive.
@@ -199,56 +201,56 @@ type cteScope struct {
 	outer *cteScope
 }
 
-// lateralRangeScope is parse-time-only lexical visibility. limit freezes the
-// parent's FROM prefix at the LATERAL token, even though that slice grows as
-// later joins are parsed.
-type lateralRangeScope struct {
+// correlationRangeScope is parse-time-only lexical visibility. limit freezes
+// the visible FROM prefix: at the LATERAL token for a derived relation, or the
+// complete outer FROM for a predicate subquery.
+type correlationRangeScope struct {
 	parser *Parser
 	limit  int
-	outer  *lateralRangeScope
+	outer  *correlationRangeScope
 }
 
-type lateralCapture struct {
+type correlationCapture struct {
 	owner         *Parser
 	bindingBase   int
 	referenceBase int
 	forwardBase   int
 	source        int
 	pos           int
-	scope         lateralRangeScope
+	scope         correlationRangeScope
 }
 
-type lateralForwardCandidate struct {
+type correlationForwardCandidate struct {
 	path   *PathExpr
 	alias  string
 	source int
 }
 
-type lateralScratchBinding struct {
-	binding LateralBinding
+type correlationScratchBinding struct {
+	binding CorrelationBinding
 	path    *PathExpr
 }
 
-type lateralScratchReference struct {
+type correlationScratchReference struct {
 	path    *PathExpr
 	binding int
 }
 
-type lateralParserState struct {
-	captures   chunkArena[lateralCapture]
-	bindings   chunkArena[LateralBinding]
-	specs      chunkArena[LateralSpec]
-	references chunkArena[LateralReference]
+type correlationParserState struct {
+	captures   chunkArena[correlationCapture]
+	bindings   chunkArena[CorrelationBinding]
+	specs      chunkArena[CorrelationSpec]
+	references chunkArena[CorrelationReference]
 
-	bindingScratch   []lateralScratchBinding
-	referenceScratch []lateralScratchReference
-	forward          []lateralForwardCandidate
-	outerRanges      *lateralRangeScope
-	capture          *lateralCapture
+	bindingScratch   []correlationScratchBinding
+	referenceScratch []correlationScratchReference
+	forward          []correlationForwardCandidate
+	outerRanges      *correlationRangeScope
+	capture          *correlationCapture
 	sized            bool
 }
 
-func (s *lateralParserState) reset() {
+func (s *correlationParserState) reset() {
 	if !s.sized {
 		s.captures.first = 2
 		s.bindings.first = 4
@@ -267,12 +269,16 @@ func (s *lateralParserState) reset() {
 	s.capture = nil
 }
 
-func (p *Parser) lateralState() *lateralParserState {
-	if p.lateral == nil {
-		p.lateral = new(lateralParserState)
-		p.lateral.reset()
+func (p *Parser) correlationState() *correlationParserState {
+	if p.correlation == nil {
+		p.correlation = new(correlationParserState)
+		// This is first-use initialization, not an accessor rewind. Parser.reset
+		// owns the one rewind per parse; resetting here would let a later capture
+		// overwrite specs already published by an earlier predicate subquery or
+		// LATERAL relation in the same statement.
+		p.correlation.reset()
 	}
-	return p.lateral
+	return p.correlation
 }
 
 // A pendingPath is a path whose leading identifier has been read but not yet
@@ -303,8 +309,8 @@ func (p *Parser) parseSelectText(
 	dst *SelectStmt,
 	src string,
 	outerCTEs *cteScope,
-	outerRanges *lateralRangeScope,
-	capture *lateralCapture,
+	outerRanges *correlationRangeScope,
+	capture *correlationCapture,
 	nesting int,
 	existsProjection bool,
 ) error {
@@ -317,7 +323,7 @@ func (p *Parser) parseSelectText(
 	p.existsProjection = existsProjection
 	p.reset(src)
 	if outerRanges != nil || capture != nil {
-		state := p.lateralState()
+		state := p.correlationState()
 		state.outerRanges = outerRanges
 		state.capture = capture
 	}
@@ -485,8 +491,8 @@ func (p *Parser) reset(src string) {
 	if p.window != nil {
 		p.window.reset()
 	}
-	if p.lateral != nil {
-		p.lateral.reset()
+	if p.correlation != nil {
+		p.correlation.reset()
 	}
 	if p.set != nil {
 		p.set.reset()
@@ -1918,7 +1924,7 @@ func (p *Parser) parseJoin() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if p.lateral != nil {
+	if p.correlation != nil {
 		if err := p.rejectLateralForwardAlias(ref.Alias, len(p.from)); err != nil {
 			return false, err
 		}
@@ -1937,7 +1943,7 @@ func (p *Parser) parseJoin() (bool, error) {
 			if err := p.expectKeyword(kwOn, "ON or USING after a JOIN"); err != nil {
 				return false, err
 			}
-			cond, err = p.parseJoinCond()
+			cond, err = p.parseJoinCondWithCurrent(ref)
 		}
 	} else if p.atKeyword(kwOn) || p.atKeyword(kwUsing) {
 		return false, p.errHere("CROSS JOIN has no ON or USING condition")
@@ -1952,6 +1958,22 @@ func (p *Parser) parseJoin() (bool, error) {
 		return false, p.errfAt(ref.Pos, "a statement may join at most %d collections", maxClauseItems)
 	}
 	return false, nil
+}
+
+// parseJoinCondWithCurrent exposes the relation currently being joined while
+// validating ON syntax. Ordinary ON paths are resolved after the complete FROM
+// list is parsed, but a nested predicate subquery resolves immediately in its
+// child parser and must see both the accumulated left side and this relation.
+// The temporary entry is removed before returning; unsupported subqueries are
+// still discarded and no executable ON expression is published for them.
+func (p *Parser) parseJoinCondWithCurrent(ref TableRef) (*JoinCond, error) {
+	base := len(p.from)
+	p.from = append(p.from, ref)
+	p.out.From = p.from
+	condition, err := p.parseJoinCond()
+	p.from = p.from[:base]
+	p.out.From = p.from
+	return condition, err
 }
 
 // parseUsingCond lowers every simple name to one explicitly bound equality.
@@ -2110,7 +2132,7 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 // cancellation, position rebasing, and placeholder accounting in one place.
 func (p *Parser) parseDerivedTableRef(
 	ref TableRef,
-	capture *lateralCapture,
+	capture *correlationCapture,
 ) (TableRef, error) {
 	p.advance() // consume '('
 	if !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) {
@@ -2157,8 +2179,8 @@ func (p *Parser) parseDerivedTableRef(
 	return ref, p.rejectDuplicateRangeAlias(ref)
 }
 
-func (p *Parser) beginLateralCapture(pos int) *lateralCapture {
-	state := p.lateralState()
+func (p *Parser) beginLateralCapture(pos int) *correlationCapture {
+	state := p.correlationState()
 	capture := state.captures.one()
 	capture.owner = p
 	capture.bindingBase = len(state.bindingScratch)
@@ -2166,7 +2188,7 @@ func (p *Parser) beginLateralCapture(pos int) *lateralCapture {
 	capture.forwardBase = len(state.forward)
 	capture.source = len(p.from)
 	capture.pos = pos
-	capture.scope = lateralRangeScope{
+	capture.scope = correlationRangeScope{
 		parser: p,
 		limit:  len(p.from),
 		outer:  state.outerRanges,
@@ -2174,14 +2196,34 @@ func (p *Parser) beginLateralCapture(pos int) *lateralCapture {
 	return capture
 }
 
-func (p *Parser) finishLateralCapture(capture *lateralCapture) *LateralSpec {
-	if capture == nil || capture.owner != p || p.lateral == nil {
+func (p *Parser) finishLateralCapture(capture *correlationCapture) *LateralSpec {
+	return p.finishCorrelationCapture(capture, true, true)
+}
+
+// finishCorrelationCapture freezes one capture into exact first-reference
+// order. keepEmpty is reserved for authored LATERAL: predicate subqueries use
+// a nil sidecar when no outer path was captured. keepForward preserves the
+// candidates a LATERAL body may have named before their outer JOIN is parsed.
+func (p *Parser) finishCorrelationCapture(
+	capture *correlationCapture,
+	keepEmpty, keepForward bool,
+) *CorrelationSpec {
+	if capture == nil || capture.owner != p || p.correlation == nil {
 		return nil
 	}
-	bindings := p.lateral.bindingScratch[capture.bindingBase:]
-	var run []LateralBinding
+	state := p.correlation
+	bindings := state.bindingScratch[capture.bindingBase:]
+	if len(bindings) == 0 && !keepEmpty {
+		state.bindingScratch = state.bindingScratch[:capture.bindingBase]
+		state.referenceScratch = state.referenceScratch[:capture.referenceBase]
+		if !keepForward {
+			state.forward = state.forward[:capture.forwardBase]
+		}
+		return nil
+	}
+	var run []CorrelationBinding
 	if len(bindings) != 0 {
-		run = p.lateral.bindings.allocDirty(len(bindings))
+		run = state.bindings.allocDirty(len(bindings))
 		for i := range bindings {
 			run[i] = bindings[i].binding
 			run[i].Pos = bindings[i].path.Pos
@@ -2201,10 +2243,10 @@ func (p *Parser) finishLateralCapture(capture *lateralCapture) *LateralSpec {
 			run[j] = binding
 		}
 	}
-	references := p.lateral.referenceScratch[capture.referenceBase:]
-	var referenceRun []LateralReference
+	references := state.referenceScratch[capture.referenceBase:]
+	var referenceRun []CorrelationReference
 	if len(references) != 0 {
-		referenceRun = p.lateral.references.allocDirty(len(references))
+		referenceRun = state.references.allocDirty(len(references))
 		for i := range references {
 			old := &bindings[references[i].binding].binding
 			binding := 0
@@ -2215,18 +2257,21 @@ func (p *Parser) finishLateralCapture(capture *lateralCapture) *LateralSpec {
 					break
 				}
 			}
-			referenceRun[i] = LateralReference{
+			referenceRun[i] = CorrelationReference{
 				Path: references[i].path, Binding: binding,
 			}
 		}
 	}
-	spec := p.lateral.specs.one()
+	spec := state.specs.one()
 	spec.Bindings = run
 	spec.References = referenceRun
-	spec.Decorrelated = len(run) == 0
+	spec.Decorrelated = keepEmpty && len(run) == 0
 	spec.Pos = capture.pos
-	p.lateral.bindingScratch = p.lateral.bindingScratch[:capture.bindingBase]
-	p.lateral.referenceScratch = p.lateral.referenceScratch[:capture.referenceBase]
+	state.bindingScratch = state.bindingScratch[:capture.bindingBase]
+	state.referenceScratch = state.referenceScratch[:capture.referenceBase]
+	if !keepForward {
+		state.forward = state.forward[:capture.forwardBase]
+	}
 	return spec
 }
 

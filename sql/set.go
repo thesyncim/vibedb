@@ -237,8 +237,8 @@ func (p *Parser) parseSetStatement(start int) error {
 	// The ordinary parser reached a top-level operator without resolving its
 	// partial first SELECT. Discard that probe and reuse its child parsers for
 	// the lossless expression parse. Captures produced by nested subqueries in
-	// the probe are rolled back to the owning LATERAL's exact entry marks.
-	p.rollbackSetProbeLateral()
+	// the probe are rolled back to the owning correlation's exact entry marks.
+	p.rollbackSetProbeCorrelation()
 	if p.nested != nil {
 		p.nested.used = 0
 	}
@@ -281,15 +281,15 @@ func (p *Parser) parseSetStatement(start int) error {
 	return nil
 }
 
-func (p *Parser) rollbackSetProbeLateral() {
-	if p.lateral == nil || p.lateral.capture == nil {
+func (p *Parser) rollbackSetProbeCorrelation() {
+	if p.correlation == nil || p.correlation.capture == nil {
 		return
 	}
-	capture := p.lateral.capture
-	if capture.owner == nil || capture.owner.lateral == nil {
+	capture := p.correlation.capture
+	if capture.owner == nil || capture.owner.correlation == nil {
 		return
 	}
-	state := capture.owner.lateral
+	state := capture.owner.correlation
 	state.bindingScratch = state.bindingScratch[:capture.bindingBase]
 	state.referenceScratch = state.referenceScratch[:capture.referenceBase]
 	if capture.forwardBase <= len(state.forward) {
@@ -724,11 +724,11 @@ scanned:
 	}
 	child := s.owner.nextSetLeafParser()
 	child.cancel = s.owner.cancel
-	var outerRanges *lateralRangeScope
-	var capture *lateralCapture
-	if s.owner.lateral != nil {
-		outerRanges = s.owner.lateral.outerRanges
-		capture = s.owner.lateral.capture
+	var outerRanges *correlationRangeScope
+	var capture *correlationCapture
+	if s.owner.correlation != nil {
+		outerRanges = s.owner.correlation.outerRanges
+		capture = s.owner.correlation.capture
 	}
 	query := &child.sel
 	if err := child.parseSelectText(

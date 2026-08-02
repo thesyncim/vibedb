@@ -538,7 +538,7 @@ func (s *stmt) requiresCatalogSource() bool {
 	if !s.query.RequiresCatalog() {
 		return false
 	}
-	return s.catalogJoin || len(s.dependencies) != 1
+	return s.usesDirectDurableCatalog() || s.catalogJoin || len(s.dependencies) != 1
 }
 
 // usesDirectDurableCatalog is the cross-layer source contract for SQL JOINs.

@@ -592,11 +592,64 @@ An empty scalar result is `NULL`; a scalar result with more than one row is an
 error. Every nested result is charged to one statement-wide intermediate byte
 account; nesting does not mint another materialization allowance.
 
-Predicate subqueries correlated to an enclosing row remain rejected rather
-than being evaluated once per row. This includes a predicate subquery inside a
-LATERAL operand; LATERAL can bind the operand's own paths and predicates but
-does not add a correlated-subquery execution stage. Scalar subqueries in the
-projection list and subqueries in `HAVING` remain unsupported.
+The bounded correlated form is `EXISTS` or direct `NOT EXISTS` as the complete
+outer `WHERE` predicate or one of its top-level `AND` terms:
+
+```sql
+SELECT o.id
+FROM orders AS o
+WHERE EXISTS (
+  SELECT 1
+  FROM customers AS c
+  WHERE c.id = o.customer_id
+    AND c.active = TRUE
+)
+```
+
+The outer and child each name one physical relation. Exactly one child
+predicate must compare one local path to one captured outer path with `=`; the
+remaining child predicates must be inner-only. A semantic proof
+rewrites `EXISTS` to an adaptive semi-join and `NOT EXISTS` to an adaptive
+anti-join. The child relation and its local filter execute once per statement,
+not once per outer row, and its projection is not evaluated. Duplicate child
+keys retain an outer row exactly once. `NULL` and missing keys do not match.
+Untyped object and array keys inherit ordinary `JoinOn` equality over canonical
+stored JSON identity. Storage normalizes object member order, so reordered
+objects compare equal; array order remains significant, and a changed object
+member or value remains unequal.
+
+The decorrelated operator uses the existing adaptive membership or keyed-lookup
+strategy and remains on the direct durable-catalog path. A completed
+scalar-only `EXISTS` membership may lower through a ready exact index on the
+outer path. If the inner membership contains an object or array, including a
+mixture of scalar and container identities, the planner intentionally declines
+outer index bounding and probes and answers from a complete outer scan: the
+scalar index does not certify completeness for container identities. All
+relations come from one coherent statement snapshot. Explicit transactions
+read their BEGIN snapshot plus pending writes, and prepared execution
+revalidates every physical dependency before scanning. Join state is charged
+to the ordinary execution work-memory account; any surrounding relation-valued
+subplans still share the statement intermediate account. Cancellation or an
+exact one-byte-short public session work-memory limit publishes no cursor. The
+idle session is reusable after the cancellation signal resets or the limit is
+raised. Retained execution arenas make warmed semi- and anti-join paths
+allocation-free.
+
+Correlated `IN`/`NOT IN` and scalar subqueries remain positioned `0A000`, as do
+correlation below `OR` or generalized `NOT`, composite or non-equality
+correlation, correlation in `JOIN ON`, and nested predicate subqueries inside
+the child. The same refusal applies to correlated scalar subqueries in the
+projection list, searched `CASE`, `HAVING`, or `ORDER BY`, and to child shapes
+requiring joins, derived relations, CTEs, sets, recursion, grouping, aggregates,
+windows, distinctness, limits, or offsets. A predicate subquery inside a
+LATERAL operand still needs a separate inherited expression-correlation stage;
+LATERAL itself does not silently provide one.
+
+Pgwire maps these refusals to one positioned `0A000` ErrorResponse without a
+DataRow or CommandComplete, followed by one ReadyForQuery. Positions count
+authored UTF-8 characters. An error inside an explicit transaction reports the
+failed-transaction status until `ROLLBACK`; the next verified query then reuses
+the session normally.
 
 ## Common table expressions
 
@@ -945,9 +998,10 @@ lifecycle correctly through its prepared-statement fallback.
 The current subset rejects syntax that has no faithful shared plan or durable
 operation:
 
-- predicate subqueries correlated to an enclosing row, scalar subqueries in
-  projection or HAVING, and a decorrelation or correlated-subquery execution
-  stage;
+- correlated predicate subqueries outside the documented one-key
+  `EXISTS`/direct-`NOT EXISTS` decorrelation slice, including correlated
+  `IN`/scalar forms, composite keys, nested boolean placements, projection,
+  `JOIN ON`, and `HAVING`;
 - the correlated LATERAL shapes listed above, `NATURAL JOIN`, and derived-table
   column alias lists;
 - data-modifying CTE bodies, mutual/forward or multiply self-referential

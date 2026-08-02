@@ -1033,7 +1033,8 @@ func (c *conn) runInsertSourceLocked(
 		return statement.RunIntermediateInto(&c.exec, query.Source{}, args)
 	}
 	requiresCatalog := statement.RequiresCatalog() &&
-		(plan.catalogJoin || len(plan.dependencies) != 1)
+		(statement.UsesDirectCatalogExecution() ||
+			plan.catalogJoin || len(plan.dependencies) != 1)
 	if requiresCatalog {
 		clear(c.joinCatalog)
 		collections := c.joinCatalog[:0]

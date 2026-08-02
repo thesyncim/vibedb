@@ -124,7 +124,7 @@ func (s *Statement) canCacheLowering() bool {
 	if s.params != 0 {
 		return false
 	}
-	return s.nested == nil || s.window() != nil
+	return s.nested == nil || s.window() != nil || s.nested.onlyDecorrelatedExists()
 }
 
 func (s *Statement) buildWindow(w *statementWindow, args []any) error {
@@ -390,6 +390,9 @@ func (s *Statement) count(o sqlast.Operand, args []any, clause string) (int, err
 // per statement may fan out, because a second would be a cross product of two
 // match sets that this expansion does not build.
 func (s *Statement) buildJoins(args []any) error {
+	if err := s.buildDecorrelatedExists(args); err != nil {
+		return err
+	}
 	if len(s.tree.From) == 1 {
 		return s.buildWhere(args)
 	}
@@ -580,6 +583,11 @@ func (s *Statement) buildWhere(args []any) error {
 	base := len(s.stack)
 	defer func() { s.stack = s.stack[:base] }()
 	for _, conjunct := range conjuncts {
+		if s.decorrelatedExistsFor(conjunct) != nil {
+			// The hidden semi/anti join installed above is the complete proven
+			// replacement for this authored predicate.
+			continue
+		}
 		if scalar := s.scalarStatement(); scalar != nil && scalar.ownsWhere(conjunct) {
 			continue
 		}
