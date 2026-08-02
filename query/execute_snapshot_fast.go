@@ -103,6 +103,106 @@ func (p *plan) runDirectSnapshotIndexedCount(dst *Result, snapshot store.Snapsho
 	return true, nil
 }
 
+// runDirectSnapshotScalarCount answers the common unindexed COUNT(*) equality
+// without materialising scalar columns. AppendField already has the shape-
+// routed field extractor; comparing its raw cells directly avoids the second
+// full-row classification pass and the predicate evaluator.
+func (p *plan) runDirectSnapshotScalarCount(dst *Result, snapshot store.Snapshot, w *Workspace) (bool, error) {
+	if err := w.checkCanceled(); err != nil {
+		return true, err
+	}
+	path, lit, ok := p.scalarCountPath()
+	if !ok {
+		return false, nil
+	}
+	if p.hasLimit && p.limit == 0 {
+		return true, prepareResult(dst, p, 0)
+	}
+	if err := w.activeHeapWorkBudget().admitRows(
+		p, snapshot.Len(), heapWorkSnapshot, 1,
+	); err != nil {
+		return true, err
+	}
+	w.raws = resize(w.raws, 1)
+	w.raws[0] = snapshot.AppendField(
+		w.raws[0][:0], path.name, &w.ctx.cache,
+	)
+	if err := w.checkCanceled(); err != nil {
+		return true, err
+	}
+	w.text = w.text[:0]
+	count := 0
+	for row, raw := range w.raws[0] {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			return true, err
+		}
+		if rawEqualsScalar(raw, lit, &w.text) {
+			count++
+		}
+	}
+	w.accs = resize(w.accs, len(p.columns))
+	resetAggs(w.accs)
+	for i := range w.accs {
+		w.accs[i].count = count
+	}
+	if err := prepareResult(dst, p, 1); err != nil {
+		return true, err
+	}
+	if err := p.fillAggregateCells(dst, 0, w.accs, nil, w); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// runDirectSegmentScalarCount is the in-memory Segment counterpart of the
+// snapshot lane. It is only called when candidateRows found no persistent
+// posting bound; an available posting remains the cheaper path and preserves
+// the existing sparse execution strategy.
+func (p *plan) runDirectSegmentScalarCount(dst *Result, segment *store.Segment, w *Workspace) (bool, error) {
+	if err := w.checkCanceled(); err != nil {
+		return true, err
+	}
+	path, lit, ok := p.scalarCountPath()
+	if !ok {
+		return false, nil
+	}
+	if p.hasLimit && p.limit == 0 {
+		return true, prepareResult(dst, p, 0)
+	}
+	if err := w.activeHeapWorkBudget().admitRows(
+		p, segment.Len(), heapWorkSegment, 1,
+	); err != nil {
+		return true, err
+	}
+	w.raws = resize(w.raws, 1)
+	w.raws[0] = w.ctx.cache.AppendField(w.raws[0][:0], segment, path.name)
+	if err := w.checkCanceled(); err != nil {
+		return true, err
+	}
+	w.text = w.text[:0]
+	count := 0
+	for row, raw := range w.raws[0] {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			return true, err
+		}
+		if rawEqualsScalar(raw, lit, &w.text) {
+			count++
+		}
+	}
+	w.accs = resize(w.accs, len(p.columns))
+	resetAggs(w.accs)
+	for i := range w.accs {
+		w.accs[i].count = count
+	}
+	if err := prepareResult(dst, p, 1); err != nil {
+		return true, err
+	}
+	if err := p.fillAggregateCells(dst, 0, w.accs, nil, w); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // runDirectSnapshotStringCountGroups lowers a categorical COUNT GROUP BY to
 // one borrowed field gather and one pointer-free dense-ID table. Missing and
 // null form one group. Other value kinds decline to the generic executor.

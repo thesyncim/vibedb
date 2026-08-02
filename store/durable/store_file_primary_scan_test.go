@@ -47,12 +47,12 @@ func openRedundantPrimaryScan(
 	primaryRoot := primary.state.Load().root
 	classCounts := filePrimaryLeafClassCounts(t, primaryFile, primaryRoot)
 	t.Logf(
-		"scan unified leaves=%d",
-		classCounts[storeio.CommonPrimaryLeafUnified],
+		"scan compact leaves=%d",
+		classCounts[storeio.CommonPrimaryLeafCompact],
 	)
-	if classCounts[storeio.CommonPrimaryLeafUnified] == 0 {
+	if classCounts[storeio.CommonPrimaryLeafCompact] == 0 {
 		t.Fatalf(
-			"expected unified leaves; class split = %v",
+			"expected compact leaves; class split = %v",
 			classCounts,
 		)
 	}

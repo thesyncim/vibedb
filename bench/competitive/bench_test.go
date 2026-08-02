@@ -96,10 +96,8 @@ func newLoaded(tb testing.TB, factory Factory, cfg Config) (Engine, string, func
 }
 
 // newLoadedCorpus is newLoaded over an explicitly supplied corpus rather than
-// the package-global docs. It exists for the one arm that cannot use the shared
-// 100k fixture: the indexed vibedb engine, whose on-graph exact index
-// caps one physical index's postings at a single term leaf and must be sized
-// below that ceiling (see TestFullEquivalenceIndexedDurable).
+// the package-global docs. It is used by focused equivalence tests that want a
+// smaller fixture than the shared benchmark corpus.
 func newLoadedCorpus(tb testing.TB, factory Factory, cfg Config, corpus []Doc) (Engine, string, func()) {
 	tb.Helper()
 	dir, err := tempDir(factory.Name)
@@ -748,19 +746,6 @@ func TestFullEquivalence(t *testing.T) {
 				t.Fatalf("FilterCount = %d, want %d", c, want)
 			}
 
-			// The indexed vibedb arm cannot run at the default corpus.
-			// Its on-graph exact index serialises one physical index's whole
-			// posting set into a single term leaf, bounded to 65,535 postings /
-			// 64 KiB, and that ceiling binds both the bulk cutover and the Put
-			// mutation path. The shared 100k corpus overruns it (every term's
-			// postings share one leaf), so that arm's byte-exact oracle lives in
-			// TestFullEquivalenceIndexedDurable, sized below the ceiling. Multi-leaf
-			// term indexes are the future work that lifts the cap and folds this
-			// arm back here. Every other engine's indexed arm stays at 100k.
-			if factory.Name == "vibedb" {
-				return
-			}
-
 			idx := loadedEngine(
 				t, factory.Name, DurabilityBufferedVisible, true, "indexed",
 			)
@@ -784,26 +769,16 @@ func TestFullEquivalence(t *testing.T) {
 	}
 }
 
-// TestFullEquivalenceIndexedDurable extends TestFullEquivalence's canonical
-// oracle to the one arm TestFullEquivalence cannot cover at the default corpus:
-// the indexed vibedb engine.
-//
-// Its on-graph exact index serialises one physical index's whole posting set
-// into a single term leaf, bounded to 65,535 postings / 64 KiB. That ceiling
-// binds both the bulk cutover (AppendIndexTermLeaf) and the Put mutation path
-// (the incremental exact-tile rebuild), so a low-cardinality corpus spread
-// across enough documents overruns it. This test sizes the indexed durable arm
-// below the ceiling and applies the identical oracle: every key canonical by
-// Get, every key visited exactly once with canonical bytes, Scan and
-// ScanAllBytes counts, and IndexedCount against the corpus oracle. Multi-leaf
-// term indexes are the future work that lifts the cap and folds this arm back
-// into TestFullEquivalence at the shared corpus.
+// TestFullEquivalenceIndexedDurable exercises the indexed durable path on a
+// compact independent fixture in addition to the shared-corpus equivalence
+// test. It applies the identical oracle: every key canonical by Get, every key
+// visited exactly once with canonical bytes, Scan and ScanAllBytes counts, and
+// IndexedCount against the corpus oracle.
 //
 // It is not a benchmark and it is allowed to be slow.
 func TestFullEquivalenceIndexedDurable(t *testing.T) {
-	// 10,000 keeps the whole index's posting set inside the single term leaf
-	// (65,535 postings / 64 KiB). It is the largest round size that passes; the
-	// cap, not the test, sets the ceiling.
+	// Keep this focused oracle smaller than the shared benchmark to avoid
+	// duplicating its full indexed-load cost in the test suite.
 	const size = 10_000
 	corpus := CorpusOf(size, cardinality)
 
@@ -826,8 +801,8 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	if !IndexCapable(factory.Name) {
 		t.Fatalf("IndexCapable(%q) is false; this test asserts the indexed arm", factory.Name)
 	}
-	// Built directly rather than through loadedEngine, whose shared fixtures load
-	// the package-global 100k docs this arm cannot index.
+	// Built directly rather than through loadedEngine, keeping this focused
+	// oracle independent of the package-global benchmark fixture.
 	e, _, cleanup := newLoadedCorpus(t, factory, Config{
 		Durability: DurabilityBufferedVisible,
 		Indexed:    true,

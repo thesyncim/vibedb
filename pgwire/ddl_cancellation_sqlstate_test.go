@@ -125,10 +125,13 @@ func TestDDLInstalledCancelFlagStopsPrePublicationBuilds(t *testing.T) {
 		verify                func(*testing.T, *testClient)
 	}{
 		{
-			name:                  "create index scan",
-			statement:             `CREATE INDEX canceled_idx ON docs(extra)`,
-			frame:                 "store/durable.(*Collection).CreateIndexContext",
-			match:                 2,
+			name:      "create index scan",
+			statement: `CREATE INDEX canceled_idx ON docs(extra)`,
+			frame:     "store/durable.(*Collection).CreateIndexContext",
+			// The compact exact-index preflight adds one cancellation checkpoint
+			// while it foreground-repartitions oversized unindexed stripes. Gate the
+			// following scan checkpoint, after the collection writer is released.
+			match:                 3,
 			blockCatalogAfterGate: true,
 			verify: func(t *testing.T, c *testClient) {
 				t.Helper()

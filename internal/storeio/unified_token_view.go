@@ -177,9 +177,9 @@ const (
 //
 // Path syntax is a JSON-pointer-style "/a/b" chain of object member names;
 // a segment of decimal digits additionally matches that array element index.
-// Pointer escape sequences (~0/~1) are not supported: a segment cannot
-// contain '/' — acceptable for the store-internal probe/filter lanes this
-// phase gates, and flagged in the stage report.
+// Path segments use RFC 6901 decoding, including empty member names and ~0/~1
+// escapes, so a storage-native filter addresses exactly the same fields as the
+// query compiler's canonical pointer spelling.
 type UnifiedHoleResolver struct {
 	path       []byte
 	segments   [][2]int32
@@ -194,19 +194,35 @@ func (r *UnifiedHoleResolver) SetPath(path []byte) error {
 	if len(path) < 2 || path[0] != '/' {
 		return fmt.Errorf("%w: unified field path %q", ErrInvalidWrite, path)
 	}
-	r.path = append(r.path[:0], path[1:]...)
+	r.path = r.path[:0]
 	r.segments = r.segments[:0]
-	start := 0
-	for i := 0; i <= len(r.path); i++ {
-		if i == len(r.path) || r.path[i] == '/' {
-			if i == start {
-				return fmt.Errorf("%w: empty unified path segment", ErrInvalidWrite)
-			}
-			r.segments = append(r.segments, [2]int32{int32(start), int32(i)})
-			start = i + 1
+	for rawStart := 1; ; {
+		rawEnd := rawStart
+		for rawEnd < len(path) && path[rawEnd] != '/' {
+			rawEnd++
 		}
+		start := len(r.path)
+		for i := rawStart; i < rawEnd; i++ {
+			if path[i] != '~' {
+				r.path = append(r.path, path[i])
+				continue
+			}
+			if i+1 >= rawEnd || (path[i+1] != '0' && path[i+1] != '1') {
+				return fmt.Errorf("%w: invalid unified field path escape in %q", ErrInvalidWrite, path)
+			}
+			i++
+			if path[i] == '0' {
+				r.path = append(r.path, '~')
+			} else {
+				r.path = append(r.path, '/')
+			}
+		}
+		r.segments = append(r.segments, [2]int32{int32(start), int32(len(r.path))})
+		if rawEnd == len(path) {
+			return nil
+		}
+		rawStart = rawEnd + 1
 	}
-	return nil
 }
 
 func (r *UnifiedHoleResolver) segment(i int) []byte {
@@ -218,6 +234,9 @@ func (r *UnifiedHoleResolver) segment(i int) []byte {
 // no leading zero except "0" itself), returning -1 when it is not one.
 func (r *UnifiedHoleResolver) segmentIndex(i int) int {
 	seg := r.segment(i)
+	if len(seg) == 0 {
+		return -1
+	}
 	if len(seg) > 1 && seg[0] == '0' {
 		return -1
 	}
@@ -283,17 +302,29 @@ func (r *UnifiedHoleResolver) Resolve(v *CommonPrimaryUnifiedLeafView, templateI
 		// path, which performs its own structural validation.
 		return UnifiedHoleContainer
 	}
+	return r.resolveTemplate(entry.holes, entry.ends, entry.static)
+}
+
+// resolveCompactTemplate applies the same path-to-hole proof to a compact
+// stripe template. Both durable grammars use the identical static-segment
+// representation; keeping one resolver prevents path semantics from drifting
+// while the compact format replaces the row-token leaf.
+func (r *UnifiedHoleResolver) resolveCompactTemplate(entry compactPrimaryTemplateView) int {
+	return r.resolveTemplate(entry.holes, entry.ends, entry.static)
+}
+
+func (r *UnifiedHoleResolver) resolveTemplate(holes int, ends, static []byte) int {
 	r.filled = r.filled[:0]
 	previous := 0
-	for segment := 0; segment <= entry.holes; segment++ {
-		end := int(readUint32(entry.ends[segment*4:]))
-		if end < previous || end > len(entry.static) {
+	for segment := 0; segment <= holes; segment++ {
+		end := int(readUint32(ends[segment*4:]))
+		if end < previous || end > len(static) {
 			return UnifiedHoleContainer
 		}
 		if segment > 0 {
 			r.filled = append(r.filled, "null"...)
 		}
-		r.filled = append(r.filled, entry.static[previous:end]...)
+		r.filled = append(r.filled, static[previous:end]...)
 		previous = end
 	}
 	index, err := r.buildIndex(r.filled)

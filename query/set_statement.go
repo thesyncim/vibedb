@@ -535,6 +535,10 @@ func mergeSetStatementStats(dst *ExecStats, src ExecStats) {
 	dst.CandidateRows = saturatedSetStatementUint64(dst.CandidateRows, src.CandidateRows)
 	dst.CandidateChunks = saturatedSetStatementInt(dst.CandidateChunks, src.CandidateChunks)
 	dst.CoveringColumns = saturatedSetStatementInt(dst.CoveringColumns, src.CoveringColumns)
+	dst.TokenFilterRows = saturatedSetStatementUint64(dst.TokenFilterRows, src.TokenFilterRows)
+	dst.TokenFilterFallbackRows = saturatedSetStatementUint64(
+		dst.TokenFilterFallbackRows, src.TokenFilterFallbackRows,
+	)
 	dst.JoinMemberships = saturatedSetStatementInt(dst.JoinMemberships, src.JoinMemberships)
 	dst.JoinLookups = saturatedSetStatementInt(dst.JoinLookups, src.JoinLookups)
 	dst.JoinKeys = saturatedSetStatementUint64(dst.JoinKeys, src.JoinKeys)

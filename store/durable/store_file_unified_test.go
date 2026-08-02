@@ -82,11 +82,11 @@ func TestUnifiedPrimaryCanonicalReads(t *testing.T) {
 			unified := createUnifiedPrimary(t, filepath.Join(dir, "unified.vibe"), keys, docs)
 
 			counts := primaryLeafClassCounts(t, unified)
-			if counts[storeio.CommonPrimaryLeafUnified] == 0 {
+			if counts[storeio.CommonPrimaryLeafCompact] == 0 {
 				t.Fatalf("unified build produced no class-5 leaves: %v", counts)
 			}
 			for class, n := range counts {
-				if class != storeio.CommonPrimaryLeafUnified && n != 0 {
+				if class != storeio.CommonPrimaryLeafCompact && n != 0 {
 					t.Fatalf("unified build staged class %d leaves: %v", class, counts)
 				}
 			}
@@ -321,7 +321,7 @@ func TestUnifiedPrimaryOverlayReplaceFold(t *testing.T) {
 	}
 	class := storeio.PrimaryLeafClass(lease.Page())
 	lease.Release()
-	if class != storeio.CommonPrimaryLeafUnified {
+	if class != storeio.CommonPrimaryLeafCompact {
 		t.Fatalf("overlay fold produced class %d, want class 5", class)
 	}
 	got, ok, err = folded.AppendRaw(nil, key)
@@ -466,18 +466,20 @@ func TestUnifiedPrimaryOverlayGrowingInsertDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+	view, ok := storeio.AdmittedCompactPrimaryStripe(
 		lease.Page(), unified.storeID, foldedRoute.Bucket,
-		unified.primaryLeafBounds(unified.state.Load()),
 	)
 	if !ok {
 		lease.Release()
-		t.Fatal("folded insert leaf is not admitted class 5")
+		t.Fatal("folded insert leaf is not admitted compact")
 	}
-	foldedSlot, _, overflow, found :=
-		view.LookupBodySlotHashed(foldedRoute.Hash, insertedKey)
+	rank, found := view.FindKey(insertedKey)
+	foldedSlot, slotOK := view.PostingSlot(rank)
+	_, overflow := view.OverflowRef(rank)
 	lease.Release()
-	if !found || overflow || foldedSlot != insertedSlot {
+	if !found || overflow ||
+		view.Len() <= storeio.CommonPrimaryLeafWideSlots &&
+			(!slotOK || foldedSlot != insertedSlot) {
 		t.Fatalf("folded insert slot = %d,%v,%v want %d",
 			foldedSlot, overflow, found, insertedSlot)
 	}
@@ -582,7 +584,7 @@ func TestUnifiedPrimaryOverlayJournalReplay(t *testing.T) {
 			)
 		}
 		counts := primaryLeafClassCounts(t, recovered)
-		if counts[storeio.CommonPrimaryLeafUnified] == 0 {
+		if counts[storeio.CommonPrimaryLeafCompact] == 0 {
 			t.Fatalf("reopen %d lost class-5 leaves: %v", attempt, counts)
 		}
 		if err := recovered.Close(); err != nil {

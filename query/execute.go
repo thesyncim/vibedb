@@ -542,6 +542,13 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 	if err := w.checkCanceled(); err != nil {
 		return err
 	}
+	if candidates == nil {
+		if handled, err := p.runDirectSegmentScalarCount(dst, s, w); err != nil {
+			return err
+		} else if handled {
+			return nil
+		}
+	}
 	compact := preferSparseRows(len(candidates), s.Len(), candidates != nil)
 	var sourceRows []int
 	if compact {
@@ -728,6 +735,13 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 		// no way to reach, so they decline rather than answer confidently about
 		// the wrong cardinality.
 		if handled, err := p.runDirectSnapshotIndexedCount(dst, snapshot, w); err != nil {
+			return err
+		} else if handled {
+			return nil
+		}
+	}
+	if p.fanOutJoin < 0 && len(p.marks) == 0 {
+		if handled, err := p.runDirectSnapshotScalarCount(dst, snapshot, w); err != nil {
 			return err
 		} else if handled {
 			return nil

@@ -156,7 +156,7 @@ func verifyBufferedCurrentScanWithHook(
 
 func TestBufferedUnifiedRangeRawCurrentBufferMergesOverlayInOrder(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
-		t, 256, concurrentPrimaryTestOptions(),
+		t, 250, concurrentPrimaryTestOptions(),
 	)
 	collection := fixture.collection
 	oracle := bufferedCurrentScanOracle(fixture)
@@ -241,7 +241,7 @@ func TestBufferedUnifiedRangeRawCurrentBufferMergesOverlayInOrder(t *testing.T) 
 
 func TestBufferedUnifiedRangeRawCurrentBufferPinsGenerationDuringScan(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
-		t, 256, concurrentPrimaryTestOptions(),
+		t, 250, concurrentPrimaryTestOptions(),
 	)
 	collection := fixture.collection
 	oracleAtStart := bufferedCurrentScanOracle(fixture)

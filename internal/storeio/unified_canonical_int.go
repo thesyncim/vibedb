@@ -65,6 +65,123 @@ func CanonicalIntValue(spelling []byte) (int64, bool) {
 	return v, true
 }
 
+// exactDecimalInt64Value reports whether a validated JSON number denotes an
+// exact int64 value, regardless of spelling. Unlike CanonicalIntValue it
+// accepts fractions and exponents when their mathematical value is integral,
+// so 1.0, 10e-1, and 1e0 all return 1. It is the compiled-needle fast path for
+// comparing a decimal query literal against the leaf grammar's typed integers.
+func exactDecimalInt64Value(spelling []byte) (int64, bool) {
+	i := 0
+	neg := false
+	if spelling[i] == '-' {
+		neg = true
+		i++
+	}
+	mantissaStart := i
+	mantissaEnd := len(spelling)
+	dot := -1
+	totalDigits := 0
+	fractionDigits := 0
+	nonzero := false
+	for i < len(spelling) && spelling[i] != 'e' && spelling[i] != 'E' {
+		if spelling[i] == '.' {
+			dot = i
+		} else {
+			totalDigits++
+			if dot >= 0 {
+				fractionDigits++
+			}
+			nonzero = nonzero || spelling[i] != '0'
+		}
+		i++
+	}
+	if i < len(spelling) {
+		mantissaEnd = i
+	}
+	if !nonzero {
+		return 0, true
+	}
+
+	var exponent int64
+	if i < len(spelling) {
+		i++
+		exponentNeg := false
+		if spelling[i] == '+' || spelling[i] == '-' {
+			exponentNeg = spelling[i] == '-'
+			i++
+		}
+		for i < len(spelling) && spelling[i] == '0' {
+			i++
+		}
+		if len(spelling)-i > 18 {
+			return 0, false
+		}
+		for ; i < len(spelling); i++ {
+			exponent = exponent*10 + int64(spelling[i]-'0')
+		}
+		if exponentNeg {
+			exponent = -exponent
+		}
+	}
+	scale := exponent - int64(fractionDigits)
+	keepDigits := totalDigits
+	if scale < 0 {
+		drop := -scale
+		if drop > int64(totalDigits) {
+			return 0, false
+		}
+		trailing := int64(0)
+		for at := mantissaEnd - 1; at >= mantissaStart; at-- {
+			if spelling[at] == '.' {
+				continue
+			}
+			if spelling[at] != '0' {
+				break
+			}
+			trailing++
+		}
+		if trailing < drop {
+			return 0, false
+		}
+		keepDigits -= int(drop)
+		scale = 0
+	}
+	if scale > 19 {
+		return 0, false
+	}
+
+	limit := uint64(^uint64(0) >> 1)
+	if neg {
+		limit++
+	}
+	var magnitude uint64
+	seen := 0
+	for at := mantissaStart; at < mantissaEnd && seen < keepDigits; at++ {
+		if spelling[at] == '.' {
+			continue
+		}
+		digit := uint64(spelling[at] - '0')
+		if magnitude > (limit-digit)/10 {
+			return 0, false
+		}
+		magnitude = magnitude*10 + digit
+		seen++
+	}
+	for ; scale > 0; scale-- {
+		if magnitude > limit/10 {
+			return 0, false
+		}
+		magnitude *= 10
+	}
+	if neg {
+		if magnitude == uint64(1)<<63 {
+			return -1 << 63, true
+		}
+		return -int64(magnitude), true
+	}
+	return int64(magnitude), true
+}
+
 // AppendCanonicalInt regenerates the canonical spelling of an admitted
 // value. For any (v, true) from CanonicalIntValue the output is
 // byte-identical to the admitted spelling — the identity the

@@ -223,6 +223,7 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 		stats.CandidateRows != 64 ||
 		stats.IndexPostingPages == 0 ||
 		stats.IndexCertificateRows != 64 || stats.IndexRecheckRows != 0 ||
+		stats.TokenFilterRows != 0 || stats.TokenFilterFallbackRows != 0 ||
 		stats.RowsScanned != 0 || stats.Batches != 0 {
 		t.Fatalf("direct exact count = result %s stats %+v", resultKey(result), stats)
 	}

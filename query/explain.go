@@ -179,36 +179,38 @@ type explainStatementContext struct {
 }
 
 type explainAnalyze struct {
-	ElapsedNS            int64  `json:"elapsed_ns"`
-	Rows                 int    `json:"rows"`
-	ActualAccessPath     string `json:"actual_access_path,omitempty"`
-	Workers              int    `json:"workers"`
-	RowsTotal            uint64 `json:"rows_total"`
-	RowsScanned          uint64 `json:"rows_scanned"`
-	Batches              uint64 `json:"batches"`
-	PeakBatchRows        int    `json:"peak_batch_rows"`
-	PeakBatchBytes       int64  `json:"peak_batch_bytes"`
-	BufferedBytes        int64  `json:"buffered_bytes"`
-	SpillRuns            uint64 `json:"spill_runs"`
-	SpilledBytes         int64  `json:"spilled_bytes"`
-	IndexBounded         bool   `json:"index_bounded"`
-	IndexLookups         int    `json:"index_lookups"`
-	IndexPostingPages    int    `json:"index_posting_pages"`
-	IndexCertificateRows uint64 `json:"index_certificate_rows"`
-	IndexRecheckRows     uint64 `json:"index_recheck_rows"`
-	CandidateRows        uint64 `json:"candidate_rows"`
-	CandidateChunks      int    `json:"candidate_chunks"`
-	CoveringColumns      int    `json:"covering_columns"`
-	JoinMemberships      int    `json:"join_memberships"`
-	JoinLookups          int    `json:"join_lookups"`
-	JoinKeys             uint64 `json:"join_keys"`
-	JoinProbes           uint64 `json:"join_probes"`
-	JoinFilters          int    `json:"join_filters"`
-	JoinFilterKeys       uint64 `json:"join_filter_keys"`
-	JoinFilterRejected   uint64 `json:"join_filter_rejected"`
-	JoinBuilds           int    `json:"join_builds"`
-	JoinBuildRows        uint64 `json:"join_build_rows"`
-	JoinPairs            uint64 `json:"join_pairs"`
+	ElapsedNS               int64  `json:"elapsed_ns"`
+	Rows                    int    `json:"rows"`
+	ActualAccessPath        string `json:"actual_access_path,omitempty"`
+	Workers                 int    `json:"workers"`
+	RowsTotal               uint64 `json:"rows_total"`
+	RowsScanned             uint64 `json:"rows_scanned"`
+	Batches                 uint64 `json:"batches"`
+	PeakBatchRows           int    `json:"peak_batch_rows"`
+	PeakBatchBytes          int64  `json:"peak_batch_bytes"`
+	BufferedBytes           int64  `json:"buffered_bytes"`
+	SpillRuns               uint64 `json:"spill_runs"`
+	SpilledBytes            int64  `json:"spilled_bytes"`
+	IndexBounded            bool   `json:"index_bounded"`
+	IndexLookups            int    `json:"index_lookups"`
+	IndexPostingPages       int    `json:"index_posting_pages"`
+	IndexCertificateRows    uint64 `json:"index_certificate_rows"`
+	IndexRecheckRows        uint64 `json:"index_recheck_rows"`
+	CandidateRows           uint64 `json:"candidate_rows"`
+	CandidateChunks         int    `json:"candidate_chunks"`
+	CoveringColumns         int    `json:"covering_columns"`
+	TokenFilterRows         uint64 `json:"token_filter_rows"`
+	TokenFilterFallbackRows uint64 `json:"token_filter_fallback_rows"`
+	JoinMemberships         int    `json:"join_memberships"`
+	JoinLookups             int    `json:"join_lookups"`
+	JoinKeys                uint64 `json:"join_keys"`
+	JoinProbes              uint64 `json:"join_probes"`
+	JoinFilters             int    `json:"join_filters"`
+	JoinFilterKeys          uint64 `json:"join_filter_keys"`
+	JoinFilterRejected      uint64 `json:"join_filter_rejected"`
+	JoinBuilds              int    `json:"join_builds"`
+	JoinBuildRows           uint64 `json:"join_build_rows"`
+	JoinPairs               uint64 `json:"join_pairs"`
 }
 
 func newExplainAnalyze(analysis *ExplainAnalysis) *explainAnalyze {
@@ -217,36 +219,38 @@ func newExplainAnalyze(analysis *ExplainAnalysis) *explainAnalyze {
 	}
 	s := analysis.Stats
 	return &explainAnalyze{
-		ElapsedNS:            analysis.ElapsedNanoseconds,
-		Rows:                 analysis.Rows,
-		ActualAccessPath:     analysis.ActualAccessPath,
-		Workers:              s.Workers,
-		RowsTotal:            s.RowsTotal,
-		RowsScanned:          s.RowsScanned,
-		Batches:              s.Batches,
-		PeakBatchRows:        s.PeakBatchRows,
-		PeakBatchBytes:       s.PeakBatchBytes,
-		BufferedBytes:        s.BufferedBytes,
-		SpillRuns:            s.SpillRuns,
-		SpilledBytes:         s.SpilledBytes,
-		IndexBounded:         s.IndexBounded,
-		IndexLookups:         s.IndexLookups,
-		IndexPostingPages:    s.IndexPostingPages,
-		IndexCertificateRows: s.IndexCertificateRows,
-		IndexRecheckRows:     s.IndexRecheckRows,
-		CandidateRows:        s.CandidateRows,
-		CandidateChunks:      s.CandidateChunks,
-		CoveringColumns:      s.CoveringColumns,
-		JoinMemberships:      s.JoinMemberships,
-		JoinLookups:          s.JoinLookups,
-		JoinKeys:             s.JoinKeys,
-		JoinProbes:           s.JoinProbes,
-		JoinFilters:          s.JoinFilters,
-		JoinFilterKeys:       s.JoinFilterKeys,
-		JoinFilterRejected:   s.JoinFilterRejected,
-		JoinBuilds:           s.JoinBuilds,
-		JoinBuildRows:        s.JoinBuildRows,
-		JoinPairs:            s.JoinPairs,
+		ElapsedNS:               analysis.ElapsedNanoseconds,
+		Rows:                    analysis.Rows,
+		ActualAccessPath:        analysis.ActualAccessPath,
+		Workers:                 s.Workers,
+		RowsTotal:               s.RowsTotal,
+		RowsScanned:             s.RowsScanned,
+		Batches:                 s.Batches,
+		PeakBatchRows:           s.PeakBatchRows,
+		PeakBatchBytes:          s.PeakBatchBytes,
+		BufferedBytes:           s.BufferedBytes,
+		SpillRuns:               s.SpillRuns,
+		SpilledBytes:            s.SpilledBytes,
+		IndexBounded:            s.IndexBounded,
+		IndexLookups:            s.IndexLookups,
+		IndexPostingPages:       s.IndexPostingPages,
+		IndexCertificateRows:    s.IndexCertificateRows,
+		IndexRecheckRows:        s.IndexRecheckRows,
+		CandidateRows:           s.CandidateRows,
+		CandidateChunks:         s.CandidateChunks,
+		CoveringColumns:         s.CoveringColumns,
+		TokenFilterRows:         s.TokenFilterRows,
+		TokenFilterFallbackRows: s.TokenFilterFallbackRows,
+		JoinMemberships:         s.JoinMemberships,
+		JoinLookups:             s.JoinLookups,
+		JoinKeys:                s.JoinKeys,
+		JoinProbes:              s.JoinProbes,
+		JoinFilters:             s.JoinFilters,
+		JoinFilterKeys:          s.JoinFilterKeys,
+		JoinFilterRejected:      s.JoinFilterRejected,
+		JoinBuilds:              s.JoinBuilds,
+		JoinBuildRows:           s.JoinBuildRows,
+		JoinPairs:               s.JoinPairs,
 	}
 }
 

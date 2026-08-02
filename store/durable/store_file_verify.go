@@ -663,23 +663,24 @@ func (w *verifyWalker) walkLeaf(route storeio.SegmentedTabletRouterRoute) {
 			"read: %v", err)
 		return
 	}
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-			"non-unified leaf class %d", storeio.PrimaryLeafClass(page))
+			"non-compact leaf class %d", storeio.PrimaryLeafClass(page))
 		return
 	}
-	uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
+	stripe, err := storeio.OpenCompactPrimaryStripe(
 		page, w.storeID, route.Bucket, route.Ref,
 		w.root.Generation, w.leafBounds,
 	)
 	if err != nil {
 		w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
-			"open unified: %v", err)
+			"open compact: %v", err)
 		return
 	}
 	w.count("primary-leaf")
-	for rank := 0; rank < uv.Len(); rank++ {
-		key, ok := uv.RowAt(rank)
+	var keyScratch [storeio.CommonPrimaryLeafMaxKeyBytes]byte
+	for rank := 0; rank < stripe.Len(); rank++ {
+		key, ok := stripe.AppendKey(keyScratch[:0], rank)
 		if !ok {
 			w.fail("primary-leaf", route.Ref.Offset, route.Ref.LogicalID,
 				"unified row %d", rank)
@@ -889,12 +890,12 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Generation: header.Generation, Length: header.PageSize,
 			Kind: storeio.PagePrimaryLeaf,
 		}
-		_, leafErr := storeio.OpenCommonPrimaryUnifiedLeaf(
+		_, leafErr := storeio.OpenCompactPrimaryStripe(
 			buf[:extent], bootstrap.StoreID, bucket, expected,
 			salvageSelectingGeneration, leafBounds,
 		)
 		leafValid := storeio.PrimaryLeafClass(buf[:extent]) ==
-			storeio.CommonPrimaryLeafUnified && leafErr == nil
+			storeio.CommonPrimaryLeafCompact && leafErr == nil
 		if !leafValid {
 			// Checksum-valid page in the leaf identity band but not a valid leaf.
 			offset += extent
@@ -924,31 +925,32 @@ func Salvage(src, out *os.File, options Options) (SalvageReport, error) {
 			Generation: hit.generation, Length: uint32(hit.length),
 			Kind: storeio.PagePrimaryLeaf,
 		}
-		uv, err := storeio.OpenCommonPrimaryUnifiedLeaf(
+		stripe, err := storeio.OpenCompactPrimaryStripe(
 			buf, bootstrap.StoreID, bucket, expected,
 			salvageSelectingGeneration, leafBounds,
 		)
 		if err != nil {
 			return report, fmt.Errorf(
-				"vibedb: salvage re-open unified leaf: %w", err,
+				"vibedb: salvage re-open compact leaf: %w", err,
 			)
 		}
 		report.BucketsKept++
-		for rank := 0; rank < uv.Len(); rank++ {
-			key, body, overflow, ok := uv.RowRawAt(rank)
-			if !ok {
-				return report, fmt.Errorf(
-					"vibedb: salvage unified row %d", rank,
-				)
-			}
-			if overflow {
+		var keyScratch [storeio.CommonPrimaryLeafMaxKeyBytes]byte
+		for rank := 0; rank < stripe.Len(); rank++ {
+			key, keyOK := stripe.AppendKey(keyScratch[:0], rank)
+			if _, overflow := stripe.OverflowRef(rank); overflow {
+				if !keyOK {
+					return report, fmt.Errorf(
+						"vibedb: salvage compact overflow row %d", rank,
+					)
+				}
 				report.OverflowSkipped++
 				continue
 			}
-			value, rendered := uv.AppendRowBody(nil, body)
-			if !rendered {
+			value, valueOK := stripe.AppendValue(nil, rank)
+			if !keyOK || !valueOK {
 				return report, fmt.Errorf(
-					"vibedb: salvage unified row body %d", rank,
+					"vibedb: salvage compact row %d", rank,
 				)
 			}
 			records = append(records, salvagedRecord{

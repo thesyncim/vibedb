@@ -26,9 +26,9 @@ func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
 			t.Fatalf("Put = %v,%v", created, err)
 		}
 		if coll.primaryUnifiedOverlay.count.Load() != 1 ||
-			coll.primaryUnifiedOverlay.records[0].scalarPatch ==
+			coll.primaryUnifiedOverlay.records[0].scalarPatch !=
 				(storeio.CommonPrimaryUnifiedScalarPatch{}) {
-			t.Fatal("tiny scalar replacement did not retain its patch certificate")
+			t.Fatal("compact replacement retained a legacy scalar-patch certificate")
 		}
 		entries, complete, err :=
 			coll.primaryUnifiedOverlay.checkpointEntriesMode(
@@ -75,10 +75,9 @@ func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
 				baseGeneration, fixture.collection.Generation(), true,
 			)
 		if err != nil || !complete || len(entries) != 1 ||
-			entries[0].Kind != storeio.RecoveryRecordKindScalarPatch ||
-			!bytes.Equal(entries[0].Value, newScalar) ||
-			entries[0].ScalarPatch.ExpectedResultChecksum !=
-				storeio.PageChecksum(updated) {
+			entries[0].Kind != storeio.RecoveryRecordKindPut ||
+			!bytes.Equal(entries[0].Value, updated) ||
+			entries[0].ScalarPatch != (storeio.RecoveryScalarPatchMetadata{}) {
 			t.Fatalf("checkpoint entries = %#v complete=%v err=%v",
 				entries, complete, err)
 		}
@@ -125,8 +124,8 @@ func TestConcurrentPrimaryScalarPatchRequestReuse(t *testing.T) {
 		t.Fatalf("overlay count after Put = %d, want 1", got)
 	}
 	zero := storeio.CommonPrimaryUnifiedScalarPatch{}
-	if overlay.records[0].scalarPatch == zero {
-		t.Fatal("existing-key scalar Put did not retain a certificate")
+	if overlay.records[0].scalarPatch != zero {
+		t.Fatal("existing-key compact Put retained a legacy certificate")
 	}
 
 	deleted, err := fixture.collection.Delete(key)
@@ -147,11 +146,8 @@ func TestConcurrentPrimaryScalarPatchRequestReuse(t *testing.T) {
 	if got := overlay.count.Load(); got != 3 {
 		t.Fatalf("overlay count after resurrection = %d, want 3", got)
 	}
-	if overlay.records[2].scalarPatch == zero {
-		t.Fatal("base-exact resurrection did not derive a fresh certificate")
-	}
-	if overlay.records[2].scalarPatch == overlay.records[0].scalarPatch {
-		t.Fatal("resurrection retained the preceding changed-scalar certificate")
+	if overlay.records[2].scalarPatch != zero {
+		t.Fatal("compact resurrection retained a legacy certificate")
 	}
 	for i := range fixture.collection.primaryConcurrentContexts.contexts {
 		if fixture.collection.primaryConcurrentContexts.contexts[i].publish.scalarPatch != zero {

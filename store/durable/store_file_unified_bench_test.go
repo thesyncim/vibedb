@@ -507,6 +507,14 @@ func BenchmarkUnifiedScanAllBytesHighCardinality(b *testing.B) {
 }
 
 func benchmarkFilterEq(b *testing.B, path, needle string) {
+	benchmarkFilterEqMode(b, path, needle, false)
+}
+
+func benchmarkScalarFilterEq(b *testing.B, path, needle string) {
+	benchmarkFilterEqMode(b, path, needle, true)
+}
+
+func benchmarkFilterEqMode(b *testing.B, path, needle string, scalar bool) {
 	keys, docs, n := benchCorpus(b)
 	collection := unifiedBenchStore(b, keys, docs, unifiedBenchOptions())
 	snapshot, err := collection.Snapshot()
@@ -514,7 +522,12 @@ func benchmarkFilterEq(b *testing.B, path, needle string) {
 		b.Fatal(err)
 	}
 	defer snapshot.Close()
-	filter, err := NewEqFilter(path, []byte(needle))
+	var filter *EqFilter
+	if scalar {
+		filter, err = NewScalarEqFilter(path, []byte(needle))
+	} else {
+		filter, err = NewEqFilter(path, []byte(needle))
+	}
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -544,6 +557,18 @@ func benchmarkFilterEq(b *testing.B, path, needle string) {
 // (country == "PT") over the token lane, gate ≤ 40 ns/doc, target ≤ 20.
 func BenchmarkUnifiedFilterEq(b *testing.B) {
 	benchmarkFilterEq(b, "/country", `"PT"`)
+}
+
+// BenchmarkUnifiedFilterEqNested measures the same token scan through a
+// nested template resolution, which is still performed once per leaf shape.
+func BenchmarkUnifiedFilterEqNested(b *testing.B) {
+	benchmarkScalarFilterEq(b, "/profile/tier", `"pro"`)
+}
+
+// BenchmarkUnifiedFilterEqNumber measures exact-decimal value equality. The
+// decimal needle intentionally differs from the corpus's integer spelling.
+func BenchmarkUnifiedFilterEqNumber(b *testing.B) {
+	benchmarkScalarFilterEq(b, "/score", `500.0`)
 }
 
 // BenchmarkUnifiedFilterEqFallback drives the recorded fallback lane: a

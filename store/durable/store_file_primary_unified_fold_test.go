@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"testing"
 
@@ -132,6 +133,9 @@ func seedBufferedInlinePrimaryLeaf(
 	target := func() uint64 {
 		collection.writer.Lock()
 		defer collection.writer.Unlock()
+		if err := collection.repartitionPrimaryForExactIndexLocked(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 		state := collection.state.Load()
 		route, err := collection.currentPrimaryResidentRoute(state, key)
 		if err != nil {
@@ -312,9 +316,6 @@ func TestFilePrimaryUnifiedNativeFoldAcrossVolatileCut(t *testing.T) {
 	for _, index := range targets {
 		current[index] = values[index]
 	}
-	baseline := collection.Stats()
-	initialDurableGeneration := collection.committer.DurableGeneration()
-
 	// Seed the pending-parent bridge with a genuine cache-only leaf above the
 	// checkpoint base. Normal inline replacements choose the row overlay, so the
 	// test invokes the same bounded COW primitive directly to isolate this source
@@ -324,6 +325,8 @@ func TestFilePrimaryUnifiedNativeFoldAcrossVolatileCut(t *testing.T) {
 	seedRef := seedBufferedInlinePrimaryLeaf(
 		t, collection, []byte(keys[seedIndex]), seedValue,
 	)
+	baseline := collection.Stats()
+	initialDurableGeneration := collection.committer.DurableGeneration()
 	checkpointBase := collection.primaryCheckpointBaseState()
 	if checkpointBase == nil {
 		t.Fatal("seed has no checkpoint base")
@@ -344,7 +347,7 @@ func TestFilePrimaryUnifiedNativeFoldAcrossVolatileCut(t *testing.T) {
 		t.Fatalf("first pressure source = %+v, want volatile %+v",
 			beforeFirstFold.Ref, seedRef)
 	}
-	forcePrimaryOverlayPressureFold(t, collection, true)
+	forcePrimaryOverlayPressureFold(t, collection, false)
 	firstFoldRoute, err := collection.currentPrimaryResidentRoute(
 		collection.state.Load(), []byte(keys[targets[0]]),
 	)
@@ -361,7 +364,7 @@ func TestFilePrimaryUnifiedNativeFoldAcrossVolatileCut(t *testing.T) {
 	}
 
 	current = putRound(2, current)
-	forcePrimaryOverlayPressureFold(t, collection, true)
+	forcePrimaryOverlayPressureFold(t, collection, false)
 	secondFoldRoute, err := collection.currentPrimaryResidentRoute(
 		collection.state.Load(), []byte(keys[targets[0]]),
 	)
@@ -541,7 +544,7 @@ func TestFilePrimaryUnifiedNativeFoldPinsVolatileSource(t *testing.T) {
 		t.Fatalf("pinned source route = %+v,%v want %+v",
 			pinnedRoute.Ref, err, seedRef)
 	}
-	forcePrimaryOverlayPressureFold(t, collection, true)
+	forcePrimaryOverlayPressureFold(t, collection, false)
 
 	deferred := false
 	for _, ref := range collection.primaryVolatileRetired {
@@ -557,20 +560,18 @@ func TestFilePrimaryUnifiedNativeFoldPinsVolatileSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reader-pinned source is not cache-readable: %v", err)
 	}
-	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+	unified, ok := storeio.AdmittedCompactPrimaryStripe(
 		lease.Page(), collection.storeID, seedRoute.Bucket,
-		collection.primaryLeafBounds(&pinnedState),
 	)
 	if !ok {
 		lease.Release()
-		t.Fatal("reader-pinned source is not an admitted unified leaf")
+		t.Fatal("reader-pinned source is not an admitted compact stripe")
 	}
-	_, body, overflow, found := unified.LookupBodySlotHashed(
-		seedRoute.Hash, []byte(keys[seedIndex]),
-	)
-	got := unified.AppendAdmittedRowBody(nil, body)
+	rank, found := unified.FindKey([]byte(keys[seedIndex]))
+	_, overflow := unified.OverflowRef(rank)
+	got, decoded := unified.AppendValue(nil, rank)
 	lease.Release()
-	if !found || overflow || !bytes.Equal(got, seedValue) {
+	if !found || overflow || !decoded || !bytes.Equal(got, seedValue) {
 		t.Fatalf("reader-pinned source row = %q,%v,%v want %q",
 			got, found, overflow, seedValue)
 	}
@@ -614,7 +615,6 @@ func TestFilePrimaryUnifiedVolatileOverflowForcesFullFold(t *testing.T) {
 		t.Fatal(err)
 	}
 	targetIndex := -1
-	var targetRoute storeio.ResidentPrimaryRoute
 	for i := 1; i < len(keys); i++ {
 		route, routeErr := collection.currentPrimaryResidentRoute(
 			state, []byte(keys[i]),
@@ -623,7 +623,7 @@ func TestFilePrimaryUnifiedVolatileOverflowForcesFullFold(t *testing.T) {
 			t.Fatal(routeErr)
 		}
 		if route.Bucket == seedRoute.Bucket {
-			targetIndex, targetRoute = i, route
+			targetIndex = i
 			break
 		}
 	}
@@ -656,18 +656,15 @@ func TestFilePrimaryUnifiedVolatileOverflowForcesFullFold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		lease.Page(), collection.storeID, seedRoute.Bucket,
-		collection.primaryLeafBounds(sourceState),
+	source, ok := storeio.AdmittedCompactPrimaryStripe(
+		lease.Page(), collection.storeID, sourceRoute.Bucket,
 	)
 	if !ok {
 		lease.Release()
-		t.Fatal("overflow source is not an admitted unified leaf")
+		t.Fatal("overflow source is not an admitted compact stripe")
 	}
-	_, body, overflow, found := source.LookupBodySlotHashed(
-		seedRoute.Hash, []byte(keys[0]),
-	)
-	oldHead := storeio.DecodePrimaryOverflowRef(body)
+	sourceRank, found := source.FindKey([]byte(keys[0]))
+	oldHead, overflow := source.OverflowRef(sourceRank)
 	lease.Release()
 	if !found || !overflow || oldHead == (storeio.PageRef{}) ||
 		oldHead.Offset < base.fileEnd {
@@ -713,28 +710,24 @@ func TestFilePrimaryUnifiedVolatileOverflowForcesFullFold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	folded, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		lease.Page(), collection.storeID, seedRoute.Bucket,
-		collection.primaryLeafBounds(foldedState),
+	folded, ok := storeio.AdmittedCompactPrimaryStripe(
+		lease.Page(), collection.storeID, foldedRoute.Bucket,
 	)
 	if !ok {
 		lease.Release()
 		t.Fatal("folded overflow leaf is not admitted")
 	}
-	_, body, overflow, found = folded.LookupBodySlotHashed(
-		seedRoute.Hash, []byte(keys[0]),
-	)
-	newHead := storeio.DecodePrimaryOverflowRef(body)
-	_, targetBody, targetOverflow, targetFound := folded.LookupBodySlotHashed(
-		targetRoute.Hash, []byte(keys[targetIndex]),
-	)
-	gotTarget := folded.AppendAdmittedRowBody(nil, targetBody)
+	foldedRank, found := folded.FindKey([]byte(keys[0]))
+	newHead, overflow := folded.OverflowRef(foldedRank)
+	targetRank, targetFound := folded.FindKey([]byte(keys[targetIndex]))
+	_, targetOverflow := folded.OverflowRef(targetRank)
+	gotTarget, targetDecoded := folded.AppendValue(nil, targetRank)
 	lease.Release()
 	if !found || !overflow || newHead == (storeio.PageRef{}) || newHead == oldHead {
 		t.Fatalf("reminted overflow head = %+v,%v,%v; old=%+v",
 			newHead, found, overflow, oldHead)
 	}
-	if !targetFound || targetOverflow || !bytes.Equal(gotTarget, targetValue) {
+	if !targetFound || targetOverflow || !targetDecoded || !bytes.Equal(gotTarget, targetValue) {
 		t.Fatalf("folded inline target = %q,%v,%v want %q",
 			gotTarget, targetFound, targetOverflow, targetValue)
 	}

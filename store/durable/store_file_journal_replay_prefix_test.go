@@ -510,9 +510,9 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	// Pin that the crash image really contains a consecutive v1 batch whose first
-	// entry widens a scalar. Reapplying that entry after the prefix checkpoint
-	// replaces only the shorter old spelling and therefore fails its result CRC.
+	// The compact development format journals complete canonical values. Pin the
+	// consecutive batch so replay after a prefix checkpoint remains idempotent
+	// without retaining the removed class-5 scalar-patch compatibility lane.
 	journalFile, err := os.Open(crashPath + ".rjournal")
 	if err != nil {
 		t.Fatal(err)
@@ -528,9 +528,10 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 	checkedBatch := false
 	if err := journal.Replay(baseGeneration, func(rec storeio.RecoveryRecord) error {
 		if rec.Kind != storeio.RecoveryRecordKindBatch || len(rec.Entries) != 2 ||
-			rec.Entries[0].Kind != storeio.RecoveryRecordKindScalarPatch ||
-			int(rec.Entries[0].ScalarPatch.OldScalarLength) ==
-				len(rec.Entries[0].Value) {
+			rec.Entries[0].Kind != storeio.RecoveryRecordKindPut ||
+			rec.Entries[1].Kind != storeio.RecoveryRecordKindPut ||
+			!bytes.Equal(rec.Entries[0].Value, want[0]) ||
+			!bytes.Equal(rec.Entries[1].Value, want[1]) {
 			return fmt.Errorf("unexpected scalar replay batch: %#v", rec)
 		}
 		checkedBatch = true

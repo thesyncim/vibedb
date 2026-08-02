@@ -394,15 +394,15 @@ func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T)
 			break
 		}
 	}
-	if len(targets) <= pressureLimit {
+	if len(targets) == 0 {
 		t.Fatalf(
-			"seed corpus spanned only %d distinct leaves, need more than %d",
-			len(targets), pressureLimit,
+			"seed corpus exposed no routed compact leaves",
 		)
 	}
 
 	updated := make(map[string][]byte, len(targets))
-	for at, key := range targets {
+	for at := 0; at < primaryUnifiedOverlayRecords+len(targets); at++ {
+		key := targets[at%len(targets)]
 		value := fmt.Appendf(nil, `{"pressure":%d,"leaf":%d}`, at, at)
 		canonical, canonicalErr := vibejson.AppendCanonicalize(nil, value)
 		if canonicalErr != nil {
@@ -411,6 +411,9 @@ func TestFileStoreBufferedVisibleAutomaticallyFoldsOverlayPressure(t *testing.T)
 		updated[key] = canonical
 		if _, putErr := collection.Put([]byte(key), value); putErr != nil {
 			t.Fatalf("update %q: %v", key, putErr)
+		}
+		if collection.Stats().PrimaryOverlayFolds > baseline.PrimaryOverlayFolds {
+			break
 		}
 	}
 

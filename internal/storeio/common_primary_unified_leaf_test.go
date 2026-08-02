@@ -1601,7 +1601,10 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 			fileEnd: layout.DataStart,
 			nextID:  PrimaryFirstDynamicLogicalID,
 		}
-		plans, err := planUnifiedPrimaryLeaves(tx, records)
+		plans, err := planCompactPrimaryLeaves(
+			tx.options.StoreID, records, CompactPrimaryStripeMaxRows,
+			CommonPrimaryLeafMaxExtentBytes,
+		)
 		if err != nil {
 			t.Fatalf("planUnifiedPrimaryLeaves: %v", err)
 		}
@@ -1619,7 +1622,7 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 			t.Fatalf("plan %d not contiguous: [%d,%d) after %d",
 				at, plans[at].first, plans[at].last, next)
 		}
-		if plans[at].class != CommonPrimaryLeafUnified {
+		if plans[at].class != CommonPrimaryLeafCompact {
 			t.Fatalf("plan %d class %d", at, plans[at].class)
 		}
 		if again[at].first != plans[at].first || again[at].last != plans[at].last ||
@@ -1628,13 +1631,13 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		}
 		next = plans[at].last
 		dst := make([]byte, plans[at].extent)
-		if _, err := EncodeCommonPrimaryUnifiedLeaf(
+		if _, err := EncodeCompactPrimaryStripe(
 			dst,
 			CommonPrimaryLeafHeader{
 				StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
 				PageSize: uint32(plans[at].extent),
 			},
-			unifiedTestStoreID(), plans[at].records, unifiedTestBounds(), builder,
+			plans[at].records, builder,
 		); err != nil {
 			t.Fatalf("plan %d does not encode into %d: %v",
 				at, plans[at].extent, err)

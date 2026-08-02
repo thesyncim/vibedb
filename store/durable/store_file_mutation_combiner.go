@@ -344,14 +344,14 @@ func (c *Collection) primaryKeyPresentLocked(key []byte) (bool, error) {
 	}
 	defer lease.Release()
 	page := lease.Page()
-	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafUnified {
-		leaf, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-			page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	if storeio.PrimaryLeafClass(page) == storeio.CommonPrimaryLeafCompact {
+		leaf, ok := storeio.AdmittedCompactPrimaryStripe(
+			page, c.storeID, route.Bucket,
 		)
 		if !ok {
 			return false, storeio.ErrCommonPrimaryLeafCorrupt
 		}
-		_, _, _, found := leaf.LookupBodySlotHashed(route.Hash, key)
+		_, found := leaf.FindKey(key)
 		if c.primaryUnifiedOverlay != nil {
 			_, disposition, _ := c.primaryUnifiedOverlay.lookup(
 				route.Bucket, route.Hash, key, state.root.Generation,

@@ -135,6 +135,16 @@ type fileWorkspace struct {
 	accs       []aggAcc
 	fileGroups []fileGroup
 
+	// tokenFilter is the reusable full-scan equality kernel for the narrow
+	// scalar COUNT lane. It is deliberately execution-local: EqFilter is
+	// single-consumer, while a compiled Query may be shared by concurrent
+	// Execs. The path and needle copies let an Exec reused with freshly
+	// compiled equivalent queries retain the warmed filter without pinning any
+	// one query plan.
+	tokenFilter       *durable.EqFilter
+	tokenFilterPath   string
+	tokenFilterNeedle []byte
+
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
 	// Workspace holds outlives the makeFilePartial call that filled it (every
@@ -205,6 +215,9 @@ func (w *fileWorkspace) release() {
 	w.overflow = nil
 	w.accs = nil
 	w.fileGroups = nil
+	w.tokenFilter = nil
+	w.tokenFilterPath = ""
+	w.tokenFilterNeedle = nil
 	w.workers = nil
 	w.segments = nil
 	w.arenas = nil
@@ -217,6 +230,21 @@ func (w *fileWorkspace) release() {
 	w.rowRuns = nil
 	w.groupRuns = nil
 	w.spillFiles = nil
+}
+
+func (w *fileWorkspace) tokenEqFilterFor(path string, needle []byte) (*durable.EqFilter, error) {
+	if w.tokenFilter != nil && w.tokenFilterPath == path &&
+		slices.Equal(w.tokenFilterNeedle, needle) {
+		return w.tokenFilter, nil
+	}
+	filter, err := durable.NewScalarEqFilter(path, needle)
+	if err != nil {
+		return nil, err
+	}
+	w.tokenFilter = filter
+	w.tokenFilterPath = strings.Clone(path)
+	w.tokenFilterNeedle = append(w.tokenFilterNeedle[:0], needle...)
+	return filter, nil
 }
 
 // abort severs every logical value a canceled durable execution retained while
@@ -276,12 +304,11 @@ func (w *fileWorkspace) abort() {
 // been scanned, reduced, and consumed: nothing still refers to the slot about to
 // be rewound.
 //
-// The +1 is load-bearing and measured, not conservative:
-// TestRunFileSnapshotBatchRingReuseDifferential fails at both C/2+1 and exactly
-// C. The bound is stated in credits rather than in workers because the credit
-// channel is what actually enforces it — the executor derives L from
-// cap(pool.credits), so a pool whose channels were built for a different width
-// cannot leave the two disagreeing.
+// The +1 is load-bearing:
+// TestRunFileSnapshotBatchRingReuseDifferential exercises the wraparound with
+// the current narrow window. The executor derives L from cap(pool.credits), so
+// a pool whose channels were built for a different width cannot leave the
+// credit window and ring disagreeing.
 //
 // Reusing the pool across executions does not weaken any of this. The credit
 // channel is empty at the start of every execution (see filePool for why),
@@ -321,9 +348,10 @@ func clearTail[T any](s []T, n int) {
 // either coherent database source, because which strategy a join measured its
 // way into is the one execution decision this package makes that a caller
 // cannot predict from the plan.
-// RowsTotal is the snapshot cardinality while
-// RowsScanned is the number of JSON documents admitted to execution after
-// persistent-index pushdown. IndexCertificateRows were decided from a
+// RowsTotal is the snapshot cardinality while RowsScanned is the number of
+// logical documents visited after persistent-index pushdown. A token-filter
+// scan can visit one without reconstructing its JSON spelling.
+// IndexCertificateRows were decided from a
 // collision-free posting representative or compact categorical cover without
 // opening JSON;
 // IndexRecheckRows required exact document comparison. An ordinary
@@ -349,6 +377,12 @@ type ExecStats struct {
 	CandidateRows        uint64
 	CandidateChunks      int
 	CoveringColumns      int
+	// TokenFilterRows were evaluated directly from durable leaf templates and
+	// scalar tokens during an honest full scan. TokenFilterFallbackRows were
+	// scanned by the same lane but required canonical document rendering. Their
+	// sum is RowsScanned for a token-filter execution; neither is an index hit.
+	TokenFilterRows         uint64
+	TokenFilterFallbackRows uint64
 
 	// JoinMemberships counts the join clauses whose inner side fit under the
 	// threshold and were pushed into the outer predicate as a membership;
@@ -434,8 +468,9 @@ func normalizeFileOptions(opts ExecOptions) (normalizedFileOptions, error) {
 	}
 	batchBytes := opts.BatchBytes
 	if batchBytes == 0 {
-		// At most two batches per worker are admitted by the job queue. Leave
-		// half the target for indexes, worker columns, and the merge frontier.
+		// Leave half the target for indexes, worker columns, and the merge
+		// frontier. The pool's smaller credit window separately bounds how many
+		// raw batches can remain resident in the ring.
 		batchBytes = memoryBytes / int64(workers*4)
 		if batchBytes < 16<<10 {
 			batchBytes = 16 << 10
@@ -520,6 +555,20 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	tokenFilter, handled, directErr := p.runDirectFileTokenScalarCount(snapshot, e)
+	if handled {
+		// FilterEqCount is a serial storage-native scan. Reporting the normalized
+		// worker setting here would imply parallel work that did not happen.
+		stats.Workers = 1
+		stats.RowsScanned = tokenFilter.scanned
+		stats.TokenFilterRows = tokenFilter.token
+		stats.TokenFilterFallbackRows = tokenFilter.fallback
 		e.Stats = stats
 		if directErr == nil {
 			directErr = e.Workspace.checkCanceled()
@@ -1192,6 +1241,13 @@ func (p *plan) makeFilePartial(
 		part.err = err
 		return part
 	}
+	if path, lit, ok := p.scalarCountPath(); ok {
+		if fast, handled := p.makeFileRawScalarPartial(
+			batch, w, slots, path.name, lit,
+		); handled {
+			return fast
+		}
+	}
 	slot := &slots[batch.seq%uint64(len(slots))]
 	// The batch Segment carries no postings, and that is a decision, not an
 	// omission. Postings are an inverted index over a Segment's top-level keys
@@ -1223,6 +1279,30 @@ func (p *plan) makeFilePartial(
 	w.groupKey = w.groupKey[:0]
 	ctx := &w.ctx
 	ctx.s, ctx.rows = docs, docs.Len()
+	if path, lit, ok := p.scalarCountPath(); ok {
+		w.raws = resize(w.raws, 1)
+		raws := w.ctx.cache.AppendField(w.raws[0][:0], docs, path.name)
+		w.raws[0] = raws
+		w.text = w.text[:0]
+		count := 0
+		for row, raw := range raws {
+			if err := cancellationCheckpoint(w.cancel, row); err != nil {
+				part.err = err
+				return part
+			}
+			if rawEqualsScalar(raw, lit, &w.text) {
+				count++
+			}
+		}
+		accs := resize(slot.accs, len(p.columns))
+		resetAggs(accs)
+		for i := range accs {
+			accs[i].count = count
+		}
+		slot.accs, part.accs = accs, accs
+		part.bytes = int64(len(accs)) * aggAccStructBytes
+		return part
+	}
 	if err := ctx.extract(p, nil, w); err != nil {
 		part.err = err
 		return part
@@ -1384,6 +1464,50 @@ func (p *plan) makeFilePartial(
 	}
 	detachAggregateExtremes(part.accs, p.columns)
 	return part
+}
+
+// makeFileRawScalarPartial is the no-tape lane for a durable COUNT(*) over a
+// single top-level scalar equality. The durable source has already validated
+// each JSON value, so the common flat-object shape needs only one pass over the
+// member/value stream; it does not need a temporary Segment or a column of
+// RawValues. A document with an escaped key is handed back to the ordinary
+// path, because its decoded spelling may equal the query key.
+func (p *plan) makeFileRawScalarPartial(
+	batch fileBatch,
+	w *Workspace,
+	slots []fileSlot,
+	key string,
+	lit scalar,
+) (filePartial, bool) {
+	part := filePartial{seq: batch.seq}
+	slot := &slots[batch.seq%uint64(len(slots))]
+	w.text = w.text[:0]
+	count := 0
+	start := 0
+	for row, end := range batch.ends {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			part.err = err
+			return part, true
+		}
+		matched, complete := rawTopLevelScalarMatch(
+			batch.data[start:end], key, lit, &w.text,
+		)
+		if !complete {
+			return filePartial{}, false
+		}
+		if matched {
+			count++
+		}
+		start = end
+	}
+	accs := resize(slot.accs, len(p.columns))
+	resetAggs(accs)
+	for i := range accs {
+		accs[i].count = count
+	}
+	slot.accs, part.accs = accs, accs
+	part.bytes = int64(len(accs)) * aggAccStructBytes
+	return part, true
 }
 
 // A fileArena is one batch's bump storage for everything its partial detaches

@@ -56,16 +56,17 @@ func TestPrimaryBatchTopologyRejectsSingleUnencodableDocument(t *testing.T) {
 // long split fences cannot fit the tablet anchor grammar is rejected before the
 // structural transaction publishes anything. The collection remains writable.
 func TestPrimaryBatchTopologyAnchorPreflightRollsBack(t *testing.T) {
-	const rows = 200
+	const rows = 3000
 	options := primaryLargeTopologyOptions(rows)
 	options.MaxKeyBytes = storeio.CommonPrimaryLeafMaxKeyBytes
 	collection, _ := openBatchCollection(t, options)
 	generation := collection.Generation()
-	prefix := bytes.Repeat([]byte("p"), 255)
-	pad := bytes.Repeat([]byte("x"), 440)
+	prefix := bytes.Repeat([]byte("p"), 254)
 	err := collection.Update(func(batch *WriteBatch) error {
 		for i := range rows {
-			key := append(append([]byte(nil), prefix...), byte(i))
+			key := append(append([]byte(nil), prefix...), byte(i>>8), byte(i))
+			word := fmt.Sprintf("%08x", uint32(i)*2654435761)
+			pad := bytes.Repeat([]byte(word), 55)
 			document := fmt.Appendf(nil, `{"v":"%s","n":%d}`, pad, i)
 			if err := batch.Put(key, document); err != nil {
 				return err

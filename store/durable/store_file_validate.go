@@ -141,13 +141,13 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 			FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(),
 			AllocationQuantum: v.pageSize,
 		}
-		if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 			return fmt.Errorf(
-				"%w: non-unified primary leaf",
+				"%w: non-compact primary leaf",
 				storeio.ErrCommonPrimaryLeafCorrupt,
 			)
 		}
-		_, err = storeio.OpenCommonPrimaryUnifiedLeaf(
+		_, err = storeio.OpenCompactPrimaryStripe(
 			page, header.StoreID, bucket, ref, v.generation.Load(), leafBounds,
 		)
 		return err

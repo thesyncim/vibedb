@@ -56,18 +56,13 @@ func collectUnifiedLeafCensus(t *testing.T, c *Collection) unifiedLeafCensus {
 			t.Fatal(err)
 		}
 		page := lease.Page()
-		if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 			lease.Release()
 			t.Fatalf("leaf %d is class %d", rank, storeio.PrimaryLeafClass(page))
 		}
 		state := c.state.Load()
-		bounds := storeio.CommonPrimaryLeafBounds{
-			FileEnd:           state.fileEnd,
-			NextLogicalID:     state.root.NextLogicalID,
-			AllocationQuantum: uint32(4096),
-		}
-		view, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-			page, state.root.StoreID, route.Bucket, bounds,
+		view, ok := storeio.AdmittedCompactPrimaryStripe(
+			page, state.root.StoreID, route.Bucket,
 		)
 		if !ok {
 			lease.Release()
@@ -76,9 +71,7 @@ func collectUnifiedLeafCensus(t *testing.T, c *Collection) unifiedLeafCensus {
 		extent := len(page)
 		census.leaves++
 		census.rows += view.Len()
-		census.templates += view.TemplateCount()
-		census.dictionary += view.DictionaryCount()
-		census.trivial += view.TrivialRowCount()
+		census.templates += view.ShapeCount()
 		census.leavesByExtent[extent]++
 		census.rowsByExtent[extent] += view.Len()
 		lease.Release()

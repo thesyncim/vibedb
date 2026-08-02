@@ -63,7 +63,7 @@ func ShortestPrimaryFence(dst, leftMax, rightMin []byte) ([]byte, error) {
 
 // BuildPrimaryGraph deterministically stages one complete ordered primary
 // graph in tx. Records must be strictly bytewise lexical and contain inline
-// non-empty values. Every leaf uses the unified canonical grammar.
+// non-empty values. Every leaf uses the compact stripe grammar.
 //
 // The function stages leaves, segmented tablet pages, and catalog levels in
 // bottom-up order. It does not publish tx or modify a StateRoot; the returned
@@ -97,7 +97,7 @@ func BuildPrimaryGraphPlaced(
 const EmptyPrimaryGraphPageCount = 1 + 3 + 1 + 1
 
 // BuildEmptyPrimaryGraph stages a valid ordered primary graph that holds no
-// documents: one empty unified leaf (tablet 0, local 0) spanning the entire key
+// documents: one empty compact stripe (tablet 0, local 0) spanning the entire key
 // range, its single-anchor tablet, and a one-child catalog root. It is the
 // creation-time counterpart of BuildPrimaryGraph — a freshly created collection
 // is a primary-layout store from its first byte, and its first Put routes to
@@ -123,18 +123,13 @@ func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
 	if err != nil {
 		return PageRef{}, err
 	}
-	if _, err := EncodeCommonPrimaryUnifiedLeaf(
+	if _, err := EncodeCompactPrimaryStripe(
 		page.Bytes(),
 		CommonPrimaryLeafHeader{
 			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
 			Bucket: BucketID(bucket), PageSize: CommonPrimaryLeafNarrowBytes,
 		},
-		tx.options.StoreID, nil,
-		CommonPrimaryLeafBounds{
-			FileEnd:           tx.fileEnd,
-			NextLogicalID:     tx.nextID,
-			AllocationQuantum: tx.options.PageSize,
-		},
+		nil,
 		NewUnifiedPrimaryLeafBuilder(),
 	); err != nil {
 		return PageRef{}, err
@@ -170,7 +165,14 @@ func buildPrimaryGraphPlaced(
 		}
 	}
 
-	plans, err := planUnifiedPrimaryLeaves(tx, records)
+	maxRows := CompactPrimaryStripeMaxRows
+	if placements != nil {
+		maxRows = CommonPrimaryLeafWideSlots
+	}
+	plans, err := planCompactPrimaryLeaves(
+		tx.options.StoreID, records, maxRows,
+		min(tx.committer.bufferSize, CommonPrimaryLeafMaxExtentBytes),
+	)
 	if err != nil {
 		return PageRef{}, err
 	}
@@ -196,6 +198,23 @@ func PrimaryGraphPageCount(
 	storeID [16]byte,
 	records []PrimaryGraphRecord,
 ) (int, error) {
+	return primaryGraphPageCount(storeID, records, CompactPrimaryStripeMaxRows)
+}
+
+// PrimaryGraphPlacedPageCount is the exact graph-page count for a build that
+// also emits uint8 ordinal placements for exact-index posting tiles.
+func PrimaryGraphPlacedPageCount(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+) (int, error) {
+	return primaryGraphPageCount(storeID, records, CommonPrimaryLeafWideSlots)
+}
+
+func primaryGraphPageCount(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	maxRows int,
+) (int, error) {
 	if storeID == ([16]byte{}) || len(records) == 0 {
 		return 0, fmt.Errorf("%w: primary graph count input", ErrInvalidWrite)
 	}
@@ -207,19 +226,9 @@ func PrimaryGraphPageCount(
 			return 0, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
 		}
 	}
-	layout, err := MutableStoreLayout(physicalPageQuantum)
-	if err != nil {
-		return 0, err
-	}
-	measurement := &WriteTransaction{
-		options: WriteTransactionOptions{
-			StoreID: storeID, Generation: 1,
-			PageSize: physicalPageQuantum,
-		},
-		fileEnd: layout.DataStart,
-		nextID:  PrimaryFirstDynamicLogicalID,
-	}
-	plans, err := planUnifiedPrimaryLeaves(measurement, records)
+	plans, err := planCompactPrimaryLeaves(
+		storeID, records, maxRows, CommonPrimaryLeafMaxExtentBytes,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -258,7 +267,7 @@ func PrimaryGraphPageCount(
 
 // PrimaryGraphLeafSpan describes one planned primary leaf without staging it:
 // the input record range it will hold, the bucket it will own, and whether
-// its unified envelope assigns posting slots by hash directory. Bulk
+// its compact stripe assigns posting slots by row ordinal. Bulk
 // reservation uses it to bound the spanned exact-index page set before the
 // build transaction opens.
 type PrimaryGraphLeafSpan struct {
@@ -277,19 +286,10 @@ func PrimaryGraphLeafSpans(
 	if storeID == ([16]byte{}) || len(records) == 0 {
 		return nil, fmt.Errorf("%w: primary graph span input", ErrInvalidWrite)
 	}
-	layout, err := MutableStoreLayout(physicalPageQuantum)
-	if err != nil {
-		return nil, err
-	}
-	measurement := &WriteTransaction{
-		options: WriteTransactionOptions{
-			StoreID: storeID, Generation: 1,
-			PageSize: physicalPageQuantum,
-		},
-		fileEnd: layout.DataStart,
-		nextID:  PrimaryFirstDynamicLogicalID,
-	}
-	plans, err := planUnifiedPrimaryLeaves(measurement, records)
+	plans, err := planCompactPrimaryLeaves(
+		storeID, records, CommonPrimaryLeafWideSlots,
+		CommonPrimaryLeafMaxExtentBytes,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -304,39 +304,70 @@ func PrimaryGraphLeafSpans(
 		spans[rank] = PrimaryGraphLeafSpan{
 			Bucket: BucketID(bucket),
 			First:  plans[rank].first, Last: plans[rank].last,
+			Ordinal: true,
 		}
 	}
 	return spans, nil
 }
 
-// planUnifiedPrimaryLeaves packs records into class-5 unified leaves through
-// the single packing planner. Unlike the compact
-// planner it has no raw-leaf fallback: a run that shares no shape degrades to
-// trivial rows inside the same codec, and a single-row unified leaf is legal,
-// so the planner has exactly one output shape.
-func planUnifiedPrimaryLeaves(
-	tx *WriteTransaction,
+// planCompactPrimaryLeaves packs records into the largest compact stripe that
+// fits the configured row and extent bounds. There is no fallback format.
+func planCompactPrimaryLeaves(
+	storeID [16]byte,
 	records []PrimaryGraphRecord,
+	maxRows, maxExtent int,
 ) ([]primaryLeafPlan, error) {
+	if storeID == ([16]byte{}) || maxRows < 1 ||
+		maxRows > CompactPrimaryStripeMaxRows ||
+		maxExtent < int(physicalPageQuantum) || maxExtent > CommonPrimaryLeafMaxExtentBytes {
+		return nil, fmt.Errorf("%w: compact primary plan geometry", ErrInvalidWrite)
+	}
 	var plans []primaryLeafPlan
 	builder := NewUnifiedPrimaryLeafBuilder()
-	window := make([]CommonPrimaryLeafRecord, 0, CommonPrimaryLeafWideSlots)
+	window := make([]CommonPrimaryLeafRecord, 0, maxRows)
 	for first := 0; first < len(records); {
-		hi := min(CommonPrimaryLeafWideSlots, len(records)-first)
+		hi := min(maxRows, len(records)-first)
 		window = window[:0]
 		for at := range hi {
-			window = append(window, CommonPrimaryLeafRecord{
+			record := CommonPrimaryLeafRecord{
 				Key:   records[first+at].Key,
 				Value: CommonPrimaryLeafValue{Inline: records[first+at].Value},
-			})
+			}
+			if maxRows <= CommonPrimaryLeafWideSlots {
+				record.Slot = uint8(at)
+			}
+			window = append(window, record)
 		}
-		count, extent, err := planUnifiedLeaf(builder, tx.options.StoreID, window)
-		if err != nil {
-			return nil, err
+		fits := func(count int) (int, bool, error) {
+			payload, err := BuildCompactPrimaryStripePayload(window[:count], builder)
+			if err != nil {
+				return 0, false, err
+			}
+			need := PageHeaderSize + len(payload) + PageTrailerSize
+			quantum := int(physicalPageQuantum)
+			extent := (need + quantum - 1) &^ (quantum - 1)
+			return extent, extent <= maxExtent, nil
+		}
+		count, extent := 0, 0
+		for lo, high := 1, hi; lo <= high; {
+			mid := (lo + high) / 2
+			candidate, ok, err := fits(mid)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				count, extent = mid, candidate
+				lo = mid + 1
+			} else {
+				high = mid - 1
+			}
+		}
+		if count == 0 {
+			return nil, fmt.Errorf("%w: compact primary record exceeds extent", ErrInvalidWrite)
 		}
 		plans = append(plans, primaryLeafPlan{
 			first: first, last: first + count,
-			class:   CommonPrimaryLeafUnified,
+			class:   CommonPrimaryLeafCompact,
 			records: append([]CommonPrimaryLeafRecord(nil), window[:count]...),
 			extent:  extent,
 		})
@@ -352,10 +383,6 @@ func buildPrimaryLeaves(
 	placements []PrimaryGraphPlacement,
 ) ([]primaryBuiltLeaf, error) {
 	built := make([]primaryBuiltLeaf, len(plans))
-	bounds := CommonPrimaryLeafBounds{
-		NextLogicalID:     tx.nextID,
-		AllocationQuantum: tx.options.PageSize,
-	}
 	unifiedBuilder := NewUnifiedPrimaryLeafBuilder()
 	for rank := range plans {
 		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
@@ -365,7 +392,7 @@ func buildPrimaryLeaves(
 		if !ok || !logicalOK {
 			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
 		}
-		if plans[rank].class != CommonPrimaryLeafUnified ||
+		if plans[rank].class != CommonPrimaryLeafCompact ||
 			plans[rank].extent == 0 {
 			return nil, fmt.Errorf("%w: non-unified primary plan", ErrInvalidWrite)
 		}
@@ -374,21 +401,18 @@ func buildPrimaryLeaves(
 		if err != nil {
 			return nil, err
 		}
-		bounds.FileEnd = tx.fileEnd
 		leafHeader := CommonPrimaryLeafHeader{
 			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
 			Bucket: BucketID(bucket), PageSize: pageSize,
 		}
-		if _, err := EncodeCommonPrimaryUnifiedLeaf(
-			page.Bytes(), leafHeader, tx.options.StoreID,
-			plans[rank].records, bounds, unifiedBuilder,
+		if _, err := EncodeCompactPrimaryStripe(
+			page.Bytes(), leafHeader, plans[rank].records, unifiedBuilder,
 		); err != nil {
 			return nil, err
 		}
 		if placements != nil {
 			if err := recordPrimaryPlacements(
 				placements, input, plans[rank], BucketID(bucket),
-				page.Bytes(), tx.options.StoreID, bounds,
 			); err != nil {
 				return nil, err
 			}
@@ -405,34 +429,26 @@ func buildPrimaryLeaves(
 	return built, nil
 }
 
-// recordPrimaryPlacements fills the unified envelope's posting-stable slot for
-// every input row of one just-encoded leaf.
+// recordPrimaryPlacements fills the compact stripe's posting-stable ordinal
+// for every input row of one just-encoded leaf.
 func recordPrimaryPlacements(
 	placements []PrimaryGraphPlacement,
 	input []PrimaryGraphRecord,
 	plan primaryLeafPlan,
 	bucket BucketID,
-	page []byte,
-	storeID [16]byte,
-	bounds CommonPrimaryLeafBounds,
 ) error {
-	if plan.class != CommonPrimaryLeafUnified {
+	if plan.class != CommonPrimaryLeafCompact {
 		return fmt.Errorf("%w: non-unified placement plan", ErrInvalidWrite)
 	}
-	view, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
-	if !ok {
-		return fmt.Errorf("%w: unified placement view", ErrInvalidWrite)
-	}
-	slots, slotsOK := view.env.rankSlots()
-	if !slotsOK {
-		return fmt.Errorf("%w: unified placement slots", ErrInvalidWrite)
+	if plan.last-plan.first > CommonPrimaryLeafWideSlots {
+		return fmt.Errorf("%w: compact ordinal placement width", ErrInvalidWrite)
 	}
 	for at := plan.first; at < plan.last; at++ {
 		if !bytes.Equal(input[at].Key, plan.records[at-plan.first].Key) {
 			return fmt.Errorf("%w: unified placement input", ErrInvalidWrite)
 		}
 		placements[at] = PrimaryGraphPlacement{
-			Bucket: bucket, Slot: slots[at-plan.first],
+			Bucket: bucket, Slot: plan.records[at-plan.first].Slot,
 		}
 	}
 	return nil

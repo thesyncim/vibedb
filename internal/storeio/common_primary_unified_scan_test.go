@@ -1,3 +1,5 @@
+//go:build legacy_primary_leaf
+
 package storeio
 
 import (

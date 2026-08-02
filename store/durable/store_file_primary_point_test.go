@@ -93,9 +93,9 @@ func buildRedundantPrimaryCorpus(
 // only class 5.
 func filePrimaryLeafClassCounts(
 	t testing.TB, file *os.File, root storeio.StateRoot,
-) [6]int {
+) [7]int {
 	t.Helper()
-	var counts [6]int
+	var counts [7]int
 	info, err := file.Stat()
 	if err != nil {
 		t.Fatal(err)
@@ -247,12 +247,12 @@ func TestFilePrimaryPointRead100K(t *testing.T) {
 		primaryInfo.Size()-regions.total(),
 	)
 	t.Logf(
-		"100k unified leaves=%d",
-		classCounts[storeio.CommonPrimaryLeafUnified],
+		"100k compact leaves=%d",
+		classCounts[storeio.CommonPrimaryLeafCompact],
 	)
-	if classCounts[storeio.CommonPrimaryLeafUnified] == 0 {
+	if classCounts[storeio.CommonPrimaryLeafCompact] == 0 {
 		t.Fatalf(
-			"expected unified leaves; class split = %v",
+			"expected compact leaves; class split = %v",
 			classCounts,
 		)
 	}
@@ -492,25 +492,22 @@ func TestCreateFromPrimaryLexicalCodecIteration1K(t *testing.T) {
 		StoreID: root.StoreID, SelectedRootGeneration: root.Generation,
 		FileEnd: uint64(info.Size()), NextLogicalID: root.NextLogicalID,
 	}
-	leafBounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd: uint64(info.Size()), NextLogicalID: root.NextLogicalID,
-		AllocationQuantum: root.PageSize,
-	}
 	var previous []byte
 	seen := 0
 	visitLeaf := func(route storeio.SegmentedTabletRouterRoute) {
-		leaf, openErr := storeio.OpenCommonPrimaryUnifiedLeaf(
+		leaf, admitted := storeio.AdmittedCompactPrimaryStripe(
 			readPrimaryOpenTestPage(t, file, route.Ref),
-			root.StoreID, route.Bucket, route.Ref, root.Generation, leafBounds,
+			root.StoreID, route.Bucket,
 		)
-		if openErr != nil {
-			t.Fatal(openErr)
+		if !admitted {
+			t.Fatal("compact codec leaf not admitted")
 		}
 		for rank := 0; rank < leaf.Len(); rank++ {
-			key, body, overflow, ok := leaf.RowRawAt(rank)
-			value, rendered := leaf.AppendRowBody(nil, body)
-			if !ok || overflow || !rendered {
-				t.Fatal("unified codec row")
+			key, keyOK := leaf.AppendKey(nil, rank)
+			value, valueOK := leaf.AppendValue(nil, rank)
+			_, overflow := leaf.OverflowRef(rank)
+			if !keyOK || overflow || !valueOK {
+				t.Fatal("compact codec row")
 			}
 			if seen != 0 && bytes.Compare(previous, key) >= 0 {
 				t.Fatalf("codec order %q then %q", previous, key)

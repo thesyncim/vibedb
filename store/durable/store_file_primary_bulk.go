@@ -121,7 +121,12 @@ func CreateFromPrimary(
 		return 0, err
 	}
 	storeID := primaryBulkStoreID(records, normalized)
-	primaryPageCount, err := storeio.PrimaryGraphPageCount(storeID, records)
+	var primaryPageCount int
+	if len(normalized.indexes) == 0 {
+		primaryPageCount, err = storeio.PrimaryGraphPageCount(storeID, records)
+	} else {
+		primaryPageCount, err = storeio.PrimaryGraphPlacedPageCount(storeID, records)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -218,8 +223,14 @@ func CreateFromPrimary(
 		_ = committer.Close()
 		return 0, err
 	}
-	placements := make([]storeio.PrimaryGraphPlacement, len(records))
-	primaryRoot, err := storeio.BuildPrimaryGraphPlaced(tx, records, placements)
+	var placements []storeio.PrimaryGraphPlacement
+	var primaryRoot storeio.PageRef
+	if len(normalized.indexes) == 0 {
+		primaryRoot, err = storeio.BuildPrimaryGraph(tx, records)
+	} else {
+		placements = make([]storeio.PrimaryGraphPlacement, len(records))
+		primaryRoot, err = storeio.BuildPrimaryGraphPlaced(tx, records, placements)
+	}
 	if err != nil {
 		_ = tx.Abort()
 		_ = committer.Close()

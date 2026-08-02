@@ -267,6 +267,16 @@ func (c *Collection) acquirePrimaryPath(
 		},
 		c.primaryLeafMutationScratch,
 	)
+	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+		if stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+			path.leafLease.Page(), c.storeID, path.leafRoute.Bucket,
+		); ok {
+			return fmt.Errorf(
+				"expand compact mutation bucket=%d rows=%d payload=%d: %w",
+				path.leafRoute.Bucket, stripe.Len(), stripe.EncodedPayloadBytes(), err,
+			)
+		}
+	}
 	return err
 }
 
@@ -648,6 +658,12 @@ retryAfterUnifiedFold:
 	// the transactional path it writes no device bytes at Put and the checkpoint
 	// folds the chain into the durable graph.
 	canonicalPath := c.canonicalFramePathEligible()
+	// The buffered-journal delta lane may publish an inline overlay record while
+	// point readers are active: the record is immutable, reader-visible by
+	// generation, and owns no volatile page frame. Only its exceptional COW
+	// fallback needs canonicalFramePathEligible's reader/retirement veto.
+	overlayPath := canonicalPath || state.root.IndexCount == 0 &&
+		(c.bufferedJournalAckLane() || c.bufferedJournalDeltaLane())
 	journalCheckpointed := false
 	if canonicalPath {
 		journalCheckpointed, err =
@@ -678,13 +694,13 @@ retryAfterUnifiedFold:
 			return false, err
 		}
 	}
-	if !canonicalPath && c.primaryUnifiedOverlay.hasPending() {
+	if !overlayPath && c.primaryUnifiedOverlay.hasPending() {
 		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 			return false, err
 		}
 		goto retryAfterUnifiedFold
 	}
-	if canonicalPath {
+	if overlayPath {
 		leafLease, acquireErr :=
 			c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
 		if acquireErr != nil {
@@ -721,6 +737,10 @@ retryAfterUnifiedFold:
 				return false, err
 			}
 			goto retryAfterUnifiedFold
+		}
+		if !canonicalPath {
+			leafLease.Release()
+			goto transactionalPrimaryPut
 		}
 		// Overlay publication owns no page-cache dirty frame, pending-parent slot,
 		// or volatile retirement, so it does not need the structural lane's
@@ -759,6 +779,11 @@ retryAfterUnifiedFold:
 		)
 		if workspaceErr != nil {
 			leafLease.Release()
+			if errors.Is(workspaceErr, storeio.ErrCommonPrimaryLeafFull) {
+				return false, errors.Join(
+					ErrPrimaryLeafSplitRequired, workspaceErr,
+				)
+			}
 			return false, workspaceErr
 		}
 		slot, _, _, found := leaf.LookupRawHashed(
@@ -808,6 +833,8 @@ retryAfterUnifiedFold:
 		}
 		return created, nil
 	}
+
+transactionalPrimaryPut:
 	// The transactional lane acquires the rooted mutation path once below. Do
 	// not expand the leaf here merely to repeat the same admission and lookup
 	// after journal/capacity preparation.
@@ -959,6 +986,8 @@ retryAfterUnifiedDeleteFold:
 		return false, err
 	}
 	canonicalPath := c.canonicalFramePathEligible()
+	overlayPath := canonicalPath || state.root.IndexCount == 0 &&
+		(c.bufferedJournalAckLane() || c.bufferedJournalDeltaLane())
 	if canonicalPath {
 		checkpointed, roomErr := c.ensureSyncJournalMutationRoomLocked(0)
 		if roomErr != nil {
@@ -975,7 +1004,7 @@ retryAfterUnifiedDeleteFold:
 			}
 		}
 	}
-	if canonicalPath {
+	if overlayPath {
 		leafLease, acquireErr :=
 			c.primaryRouter.Load().AcquireLeaf(c.cache, resident)
 		if acquireErr != nil {
@@ -1048,6 +1077,11 @@ retryAfterUnifiedDeleteFold:
 		)
 		if workspaceErr != nil {
 			leafLease.Release()
+			if errors.Is(workspaceErr, storeio.ErrCommonPrimaryLeafFull) {
+				return false, errors.Join(
+					ErrPrimaryLeafSplitRequired, workspaceErr,
+				)
+			}
 			return false, fmt.Errorf(
 				"admit unified delete fallback: %w", workspaceErr,
 			)
@@ -1278,10 +1312,13 @@ func (c *Collection) cowBufferedPrimaryMutation(
 
 	leafImage, leafBytes, _, prepareErr := c.preparePrimaryLeafMutation(
 		&preparePath, generation, key, value, deleting, found, slot, leafBounds,
+		state.root.IndexCount == 0,
 	)
 	if prepareErr != nil {
 		c.unadmitPrimaryMutationFrames()
-		return storeio.PageRef{}, false, false, prepareErr
+		return storeio.PageRef{}, false, false, fmt.Errorf(
+			"prepare buffered compact primary leaf: %w", prepareErr,
+		)
 	}
 	becameEmpty = deleting && leaf.Len() == 1
 	filledEmpty = !deleting && !found && leaf.Len() == 0
@@ -1345,7 +1382,9 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		nextLeaf, leafImage, math.MaxUint64,
 	); err != nil {
 		c.unadmitPrimaryMutationFrames()
-		return storeio.PageRef{}, false, false, err
+		return storeio.PageRef{}, false, false, fmt.Errorf(
+			"admit buffered compact primary leaf: %w", err,
+		)
 	}
 	c.primaryMutationAdmitted = append(c.primaryMutationAdmitted, nextLeaf)
 
@@ -1376,7 +1415,9 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	)
 	if err != nil {
 		c.unadmitPrimaryMutationFrames()
-		return storeio.PageRef{}, false, false, err
+		return storeio.PageRef{}, false, false, fmt.Errorf(
+			"prepare buffered compact exact index: %w", err,
+		)
 	}
 
 	// Point of no return: every fallible prepare step above has succeeded, the
@@ -1537,6 +1578,7 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	leafImage, leafBytes, _, prepareErr := c.preparePrimaryLeafMutation(
 		path, generation, key, value, deleting, found, slot, leafBounds,
+		state.root.IndexCount == 0,
 	)
 	if prepareErr != nil {
 		return storeio.PageRef{}, false, false, prepareErr
@@ -2071,115 +2113,47 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		}
 		header := lease.Header()
 		if storeio.PrimaryLeafClass(lease.Page()) ==
-			storeio.CommonPrimaryLeafUnified {
-			unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+			storeio.CommonPrimaryLeafCompact {
+			stripe, ok := storeio.AdmittedCompactPrimaryStripe(
 				lease.Page(), c.storeID, pending.leafRoute.Bucket,
-				c.primaryLeafBounds(visible),
 			)
 			if !ok {
 				pageBytes := len(lease.Page())
 				lease.Release()
 				return fmt.Errorf(
-					"%w: checkpoint unified bucket=%d ref=%+v header=%+v bytes=%d",
+					"%w: checkpoint compact bucket=%d ref=%+v header=%+v bytes=%d",
 					storeio.ErrCommonPrimaryLeafCorrupt,
 					pending.leafRoute.Bucket, pending.volatileRef,
 					header, pageBytes,
 				)
 			}
-			// A strict parallel scalar certificate can deliberately decline a
-			// legacy/missing certificate. Preserve the established serial native
-			// planner before entering the complete re-encode fallback: it supports
-			// the broader stable same-shape class and keeps old physical output and
-			// performance deterministic for those leaves.
-			if c.primaryUnifiedOverlay.pendingBucket(
-				pending.leafRoute.Bucket,
-			) {
-				var replacements []storeio.CommonPrimaryUnifiedReplacement
-				allPuts := false
-				var patchErr error
-				if prepared != nil && prepared.inspected {
-					replacements = prepared.replacements
-					allPuts = prepared.allPuts
-				} else {
-					replacements, allPuts, patchErr =
-						c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
-							c.primaryUnifiedReplacementScratch[:0],
-							pending.leafRoute.Bucket, generation,
-						)
-					c.primaryUnifiedReplacementScratch = replacements[:0]
-				}
-				if patchErr != nil {
-					lease.Release()
-					return patchErr
-				}
-				sourceSafe := false
-				if allPuts {
-					if prepared != nil && prepared.inspected {
-						sourceSafe = prepared.sourceSafe
-					} else {
-						sourceSafe = primaryNativeFoldPatchSourceSafe(
-							&unified, pending.volatileRef, base.fileEnd,
-						)
-					}
-				}
-				var image []byte
-				patchable := false
-				if allPuts && sourceSafe {
-					leafHeader := unified.Header()
-					leafHeader.Generation = generation
-					image, patchable, patchErr =
-						unified.PatchPlanStableReplacements(
-							c.primaryLeafScratch, leafHeader,
-							replacements, c.primaryUnifiedBuilder,
-						)
-				}
-				if patchErr != nil {
-					lease.Release()
-					return patchErr
-				}
-				if allPuts && patchable {
-					page, allocateErr := tx.AllocateNear(
-						storeio.PagePrimaryLeaf, uint32(len(image)),
-						pending.volatileRef.LogicalID,
-						primaryLeafPlacementHint(
-							pending.leafRoute.Bucket, layout.DataStart,
-						),
-					)
-					if allocateErr == nil {
-						copy(page.Bytes(), image)
-						allocateErr = page.Stage()
-					}
-					lease.Release()
-					if allocateErr != nil {
-						return allocateErr
-					}
-					pending.checkpointLeaf = page.Ref()
-					if appendErr := c.appendPrimaryRetirement(
-						base, pending.leafRoute.Ref,
-					); appendErr != nil {
-						return appendErr
-					}
-					continue
-				}
-			}
 			records, renderErr :=
-				unified.RenderRecordsWithScratch(
+				stripe.RenderRecordsWithScratch(
 					c.primaryLeafMutationScratch,
 				)
+			if renderErr != nil {
+				renderErr = fmt.Errorf(
+					"render compact checkpoint bucket=%d rows=%d: %w",
+					pending.leafRoute.Bucket, stripe.Len(), renderErr,
+				)
+			}
 			if renderErr == nil && c.primaryUnifiedOverlay.pendingBucket(
 				pending.leafRoute.Bucket,
 			) {
 				records, renderErr = c.primaryUnifiedOverlay.applyBucket(
 					records, pending.leafRoute.Bucket, generation,
 				)
+				if renderErr != nil {
+					renderErr = fmt.Errorf(
+						"apply compact checkpoint overlay bucket=%d base_rows=%d: %w",
+						pending.leafRoute.Bucket, stripe.Len(), renderErr,
+					)
+				}
 			}
-			// Re-mint memory-only overflow chains inside the checkpoint and
-			// replace their row descriptors before sealing the class-5 image.
 			if renderErr == nil {
-				for rank := range records {
-					head := records[rank].Value.Overflow
-					if head == (storeio.PageRef{}) ||
-						head.Offset < base.fileEnd {
+				for row := range records {
+					head := records[row].Value.Overflow
+					if !records[row].Value.IsOverflow() || head.Offset < base.fileEnd {
 						continue
 					}
 					var resolved []byte
@@ -2200,23 +2174,28 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 						break
 					}
 					c.primaryCheckpointVolatileOverflow = extents
-					records[rank].Value.Overflow, renderErr =
+					records[row].Value.Overflow, renderErr =
 						c.stagePrimaryOverflowChain(tx, resolved, generation)
 					if renderErr != nil {
 						break
 					}
 				}
 			}
-			leafHeader := unified.Header()
+			leafHeader := stripe.Header()
 			leafHeader.Generation = generation
 			var image []byte
 			if renderErr == nil {
 				image, renderErr =
-					storeio.EncodeBestCommonPrimaryUnifiedLeaf(
+					storeio.EncodeBestCompactPrimaryStripe(
 						c.primaryLeafScratch, leafHeader, c.storeID,
-						records, c.primaryMutationLeafBounds(tx),
-						c.primaryUnifiedBuilder,
+						records, c.primaryUnifiedBuilder,
 					)
+				if renderErr != nil {
+					renderErr = fmt.Errorf(
+						"encode compact checkpoint bucket=%d rows=%d: %w",
+						pending.leafRoute.Bucket, len(records), renderErr,
+					)
+				}
 			}
 			var page storeio.TransactionPage
 			if renderErr == nil {
@@ -2915,10 +2894,42 @@ func (c *Collection) preparePrimaryLeafMutation(
 	deleting, found bool,
 	slot uint8,
 	bounds storeio.CommonPrimaryLeafBounds,
+	largeUnindexed bool,
 ) ([]byte, int, uint8, error) {
 	if path == nil {
 		return nil, 0, 0, storeio.ErrInvalidWrite
 	}
+	if !deleting && found && !value.IsOverflow() &&
+		len(path.leafLease.Page()) != 0 {
+		stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+			path.leafLease.Page(), c.storeID, path.leafRoute.Bucket,
+		)
+		if !ok {
+			return nil, 0, 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		rank, exists := stripe.FindKey(key)
+		if !exists {
+			return nil, 0, 0, storeio.ErrCommonPrimaryLeafNotFound
+		}
+		if _, overflow := stripe.OverflowRef(rank); overflow {
+			goto rebuild
+		}
+		var decoded bool
+		c.overflowValueScratch, decoded = stripe.AppendValue(
+			c.overflowValueScratch[:0], rank,
+		)
+		if !decoded {
+			return nil, 0, 0, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		if bytes.Equal(c.overflowValueScratch, value.Inline) {
+			image, err := storeio.CloneCompactPrimaryStripeGeneration(
+				c.primaryLeafScratch, path.leafLease.Page(), generation,
+			)
+			return image, len(image), slot, err
+		}
+	}
+
+rebuild:
 	rows := appendLeafRecords(c.structuralRows[:0], &path.leaf)
 	at := len(rows)
 	for rank := range rows {
@@ -2943,7 +2954,11 @@ func (c *Collection) preparePrimaryLeafMutation(
 		}
 		rows[at].Value = value
 	default:
-		if len(rows) == storeio.CommonPrimaryLeafWideSlots {
+		rowLimit := storeio.CommonPrimaryLeafWideSlots
+		if largeUnindexed {
+			rowLimit = storeio.CompactPrimaryStripeMaxRows
+		}
+		if len(rows) >= rowLimit {
 			c.primaryLeafSplitRequired.Add(1)
 			return nil, 0, 0, errors.Join(
 				ErrPrimaryLeafSplitRequired,
@@ -2955,21 +2970,29 @@ func (c *Collection) preparePrimaryLeafMutation(
 		rows[at] = storeio.CommonPrimaryLeafRecord{Key: key, Value: value}
 	}
 	c.structuralRows = rows
-	if err := storeio.PlaceCommonPrimaryLeafRecords(
-		storeio.CommonPrimaryLeafWide, c.storeID, rows,
-	); err != nil {
-		return nil, 0, 0, err
+	if len(rows) <= storeio.CommonPrimaryLeafWideSlots {
+		if err := storeio.PlaceCommonPrimaryLeafRecords(
+			storeio.CommonPrimaryLeafWide, c.storeID, rows,
+		); err != nil {
+			if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+				c.primaryLeafSplitRequired.Add(1)
+				return nil, 0, 0, errors.Join(
+					ErrPrimaryLeafSplitRequired, err,
+				)
+			}
+			return nil, 0, 0, err
+		}
 	}
 	if !deleting {
 		newSlot = rows[at].Slot
 	}
-	page, err := storeio.EncodeBestCommonPrimaryUnifiedLeaf(
+	page, err := storeio.EncodeBestCompactPrimaryStripe(
 		c.primaryLeafScratch,
 		storeio.CommonPrimaryLeafHeader{
 			StoreID: c.storeID, Generation: generation,
 			Bucket: path.leaf.Header().Bucket,
 		},
-		c.storeID, rows, bounds, c.primaryUnifiedBuilder,
+		c.storeID, rows, c.primaryUnifiedBuilder,
 	)
 	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
 		c.primaryLeafSplitRequired.Add(1)

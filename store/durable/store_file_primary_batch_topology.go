@@ -71,14 +71,13 @@ func (c *Collection) preparePrimaryBatchTopology(
 		return storeio.ErrSegmentedTabletRouterCorrupt
 	}
 
-	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
 		path.leafLease.Page(), c.storeID, route.Bucket,
-		c.primaryLeafBounds(state),
 	)
 	if !ok {
 		return storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	baseRows, err := unified.RenderRecordsWithScratch(
+	baseRows, err := stripe.RenderRecordsWithScratch(
 		c.primaryLeafMutationScratch,
 	)
 	if err != nil {

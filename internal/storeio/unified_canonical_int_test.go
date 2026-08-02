@@ -8,6 +8,31 @@ import (
 	"testing"
 )
 
+func TestExactDecimalInt64Value(t *testing.T) {
+	tests := []struct {
+		spelling string
+		want     int64
+		ok       bool
+	}{
+		{"0", 0, true}, {"-0.0e999999999999999999999", 0, true},
+		{"1", 1, true}, {"1.0", 1, true}, {"10e-1", 1, true},
+		{"0.001e3", 1, true}, {"120e-1", 12, true},
+		{"1.2", 0, false}, {"1e-1", 0, false},
+		{"9223372036854775807", 9223372036854775807, true},
+		{"9223372036854775808", 0, false},
+		{"-9223372036854775808", -9223372036854775808, true},
+		{"-9223372036854775809", 0, false},
+		{"1e999999999999999999999", 0, false},
+	}
+	for _, test := range tests {
+		got, ok := exactDecimalInt64Value([]byte(test.spelling))
+		if got != test.want || ok != test.ok {
+			t.Errorf("exactDecimalInt64Value(%s) = (%d,%v), want (%d,%v)",
+				test.spelling, got, ok, test.want, test.ok)
+		}
+	}
+}
+
 // checkCanonicalIntRoundTrip pins the canonical-integer contract for one
 // spelling: admitted implies byte-identical regeneration through the zigzag
 // varint payload; rejected implies the spelling stays a stored literal: the

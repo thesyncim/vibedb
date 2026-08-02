@@ -244,6 +244,7 @@ func (c *Collection) rangeRawCurrentAt(
 
 	overlay := c.primaryUnifiedOverlay
 	var indexes [storeio.CommonPrimaryLeafWideSlots]uint16
+	var baseKeyScratch [storeio.CommonPrimaryLeafMaxKeyBytes]byte
 	var visited uint64
 	for {
 		bucket, leaf, ok := cursor.CurrentUnifiedLeaf()
@@ -286,14 +287,14 @@ func (c *Collection) rangeRawCurrentAt(
 
 			rank, matchesBase := leaf.RankAtSlot(record.slot)
 			if matchesBase {
-				baseKey, rowOK := leaf.RowAt(rank)
+				baseKey, rowOK := leaf.AppendKey(baseKeyScratch[:0], rank)
 				if !rowOK || !bytes.Equal(baseKey, key) {
 					return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 				}
 			} else {
 				rank = leaf.FirstRankFrom(key)
 				if rank < leaf.Len() {
-					baseKey, rowOK := leaf.RowAt(rank)
+					baseKey, rowOK := leaf.AppendKey(baseKeyScratch[:0], rank)
 					if !rowOK || bytes.Equal(baseKey, key) {
 						return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 					}
@@ -462,32 +463,35 @@ func (s *Snapshot) rangePrimaryGraph(
 	// reconstruction reuses one allocation across every scan of this snapshot
 	// rather than growing a fresh buffer per scan.
 	cursor.AdoptSpliceScratch(s.scanSpliceScratch)
-	defer func() {
-		s.scanSpliceScratch = cursor.ReleaseSpliceScratch()
-		cursor.Close()
-	}()
 	// The fused drain stops at each out-of-line row and returns its key and chain
 	// head; the resolved value is reassembled into one reused buffer and delivered
 	// to fn exactly like an inline value, then the drain is re-entered. Passing fn
 	// straight through (no wrapper closure) keeps an inline scan allocation-free.
-	for {
+	var scanErr error
+	for scanErr == nil {
 		key, ref, err := cursor.VisitInline(fn)
 		if err != nil {
-			return err
+			scanErr = err
+			break
 		}
 		if ref == (storeio.PageRef{}) {
-			return nil
+			break
 		}
 		s.overflowScanValue, err = s.collection.appendPrimaryOverflowValue(
 			s.overflowScanValue[:0], ref, leafBounds,
 		)
 		if err != nil {
-			return err
+			scanErr = err
+			break
 		}
 		if err := fn(key, s.overflowScanValue); err != nil {
-			return err
+			scanErr = err
+			break
 		}
 	}
+	s.scanSpliceScratch = cursor.ReleaseSpliceScratch()
+	cursor.Close()
+	return scanErr
 }
 
 // RangeMasksRaw visits only the live stable slots named by ordered masks.
@@ -747,7 +751,7 @@ func (s *Snapshot) rangePrimaryMasks(
 }
 
 // rangePrimaryOverlayMaskedLeaf merges one snapshot generation's row-overlay
-// records with its immutable class-5 base in lexical order. The generation
+// records with its immutable compact base in lexical order. The generation
 // bound is essential: the shared overlay may already contain records from a
 // newer publication, but an older snapshot must consume only records visible at
 // its own cut.
@@ -759,14 +763,13 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 	scratch []byte,
 	fn func(row store.Location, key, value []byte) error,
 ) ([]byte, error) {
-	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, s.state.root.StoreID, bucket, bounds,
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, s.state.root.StoreID, bucket,
 	)
 	if !ok {
 		return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	slots, ok := unified.PostingSlots()
-	if !ok {
+	if stripe.Len() > storeio.CommonPrimaryLeafWideSlots {
 		return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 	overlay := s.collection.primaryUnifiedOverlay
@@ -778,43 +781,40 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 		return scratch, overlayErr
 	}
 	emit := func(
-		slot uint8, key, raw []byte, overflow, encoded bool,
+		slot uint8, key, raw []byte,
 	) error {
 		quadrant := slot >> 6
 		if selected[quadrant]&(uint64(1)<<uint(slot&63)) == 0 {
 			return nil
 		}
-		value := raw
-		if overflow {
-			resolved, err := s.collection.appendPrimaryOverflowValue(
-				s.overflowScanValue[:0],
-				storeio.DecodePrimaryOverflowRef(raw), bounds,
-			)
-			if err != nil {
-				return err
-			}
-			s.overflowScanValue = resolved
-			value = resolved
-		} else if encoded {
-			scratch = unified.AppendAdmittedRowBody(scratch[:0], raw)
-			value = scratch
-		}
 		return fn(store.Location{
 			Chunk: uint32(bucket)<<2 | uint32(quadrant),
 			Slot:  slot & 63,
-		}, key, value)
+		}, key, raw)
 	}
 
 	baseRank, overlayAt := 0, 0
-	for baseRank < unified.Len() || overlayAt < overlayCount {
-		var baseKey, baseBody []byte
-		var baseOverflow bool
-		if baseRank < unified.Len() {
-			var rowOK bool
-			baseKey, baseBody, baseOverflow, rowOK =
-				unified.RowRawAt(baseRank)
-			if !rowOK {
+	var keyScratch [storeio.CommonPrimaryLeafMaxKeyBytes]byte
+	for baseRank < stripe.Len() || overlayAt < overlayCount {
+		var baseKey, baseValue []byte
+		if baseRank < stripe.Len() {
+			var keyOK, valueOK, overflow bool
+			baseKey, keyOK = stripe.AppendKey(keyScratch[:0], baseRank)
+			baseValue, overflow, valueOK = stripe.AppendRawValue(scratch[:0], baseRank)
+			if !keyOK || !valueOK {
 				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			scratch = baseValue
+			if overflow {
+				resolved, resolveErr := s.collection.appendPrimaryOverflowValue(
+					s.overflowScanValue[:0],
+					storeio.DecodePrimaryOverflowRef(baseValue), bounds,
+				)
+				if resolveErr != nil {
+					return scratch, resolveErr
+				}
+				s.overflowScanValue = resolved
+				baseValue = resolved
 			}
 		}
 		var record *primaryUnifiedOverlayRecord
@@ -829,7 +829,7 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 		}
 		order := 0
 		switch {
-		case baseRank >= unified.Len():
+		case baseRank >= stripe.Len():
 			order = 1
 		case overlayAt >= overlayCount:
 			order = -1
@@ -837,9 +837,11 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 			order = bytes.Compare(baseKey, overlayKey)
 		}
 		if order < 0 {
-			if err := emit(
-				slots[baseRank], baseKey, baseBody, baseOverflow, true,
-			); err != nil {
+			slot, slotOK := stripe.PostingSlot(baseRank)
+			if !slotOK {
+				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if err := emit(slot, baseKey, baseValue); err != nil {
 				return scratch, err
 			}
 			baseRank++
@@ -854,7 +856,6 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 			if err := emit(
 				record.slot, overlayKey,
 				overlay.arena[record.valueOff:valueEnd:valueEnd],
-				false, false,
 			); err != nil {
 				return scratch, err
 			}

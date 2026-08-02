@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"errors"
 	"math/bits"
 	"sync"
@@ -71,6 +72,7 @@ type primaryConcurrentContext struct {
 	index      []vibejson.IndexEntry
 	patchSpans []storeio.UnifiedTokenSpan
 	canonical  []byte
+	value      []byte
 	workspace  storeio.CanonicalWorkspace
 	publish    primaryConcurrentPublishRequest
 	poolSlot   uint8
@@ -174,6 +176,7 @@ func newPrimaryConcurrentContextPool(
 			[]storeio.UnifiedTokenSpan, 0, 2*indexEntries,
 		)
 		pool.contexts[i].canonical = make([]byte, 0, 2*rawLimit)
+		pool.contexts[i].value = make([]byte, 0, rawLimit)
 		pool.contexts[i].workspace = storeio.NewCanonicalWorkspace(
 			indexEntries, rawLimit,
 		)
@@ -197,6 +200,7 @@ func (p *primaryConcurrentContextPool) capacityBytes() uint64 {
 		bytes += uint64(cap(context.patchSpans)) *
 			uint64(unsafe.Sizeof(storeio.UnifiedTokenSpan{}))
 		bytes += uint64(cap(context.canonical))
+		bytes += uint64(cap(context.value))
 		bytes += context.workspace.CapacityBytes()
 	}
 	return bytes
@@ -703,19 +707,28 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		return false, false, err
 	}
 	page := leafLease.Page()
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		leafLease.Release()
 		return false, false, nil
 	}
-	leaf, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	leaf, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, c.storeID, route.Bucket,
 	)
 	if !ok {
 		leafLease.Release()
 		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	baseSlot, body, overflow, baseFound :=
-		leaf.LookupBodySlotHashed(route.Hash, key)
+	baseRank, baseFound := leaf.FindKey(key)
+	largeUnindexed := leaf.Len() > storeio.CommonPrimaryLeafWideSlots ||
+		!baseFound && leaf.Len() == storeio.CommonPrimaryLeafWideSlots
+	baseSlot, slotOK := uint8(0), largeUnindexed
+	if !largeUnindexed {
+		baseSlot, slotOK = leaf.PostingSlot(baseRank)
+	}
+	if baseFound && !slotOK {
+		leafLease.Release()
+		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
 	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
 		route.Bucket, route.Hash, key, logicalView.generation,
 	)
@@ -723,6 +736,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		c.primaryUnifiedOverlay.pendingBucketDeltas(route.Bucket)
 	leafWasEmpty := leaf.Len()+pendingRows == 0
 	oldLen := 0
+	var baseValue []byte
 	stableSlot := baseSlot
 	countDelta := 0
 	switch disposition {
@@ -733,21 +747,41 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		created = true
 		countDelta = 1
 		stableSlot = overlaySlot
-		overflow = false
 	case primaryUnifiedOverlayMissing:
 		if baseFound {
-			if overflow {
+			if _, overflow := leaf.OverflowRef(baseRank); overflow {
 				leafLease.Release()
 				return false, false, nil
 			}
-			oldLen = leaf.AdmittedRowBodyLen(body)
+			var decoded bool
+			context.value, decoded = leaf.AppendValue(context.value[:0], baseRank)
+			if !decoded {
+				leafLease.Release()
+				return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			oldLen = len(context.value)
+			baseValue = context.value
+			if largeUnindexed {
+				stableSlot, slotOK = c.primaryUnifiedOverlay.chooseLargeUnindexedSlot(
+					route.Bucket, route.Hash,
+				)
+				if !slotOK {
+					leafLease.Release()
+					return false, false, errConcurrentPrimaryPressure
+				}
+			}
 			break
 		}
-		var slotOK bool
-		stableSlot, slotOK = leaf.ChooseInsertSlotHashed(
-			route.Hash,
-			c.primaryUnifiedOverlay.pendingInsertSlots(route.Bucket),
-		)
+		if largeUnindexed {
+			stableSlot, slotOK = c.primaryUnifiedOverlay.chooseLargeUnindexedSlot(
+				route.Bucket, route.Hash,
+			)
+		} else {
+			stableSlot, slotOK = leaf.ChooseInsertSlotHashed(
+				route.Hash,
+				c.primaryUnifiedOverlay.pendingInsertSlots(route.Bucket),
+			)
+		}
 		if !slotOK {
 			leafLease.Release()
 			return false, false, nil
@@ -757,6 +791,19 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	default:
 		leafLease.Release()
 		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	if baseFound && baseValue == nil {
+		if _, overflow := leaf.OverflowRef(baseRank); overflow {
+			leafLease.Release()
+			return false, false, nil
+		}
+		var decoded bool
+		context.value, decoded = leaf.AppendValue(context.value[:0], baseRank)
+		if !decoded {
+			leafLease.Release()
+			return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		baseValue = context.value
 	}
 	rawDelta := len(canonical) - oldLen
 	if created {
@@ -768,29 +815,20 @@ func (c *Collection) tryConcurrentPrimaryPut(
 			return false, false, storeio.ErrInvalidWrite
 		}
 	}
-	fits := storeio.CommonPrimaryUnifiedTrivialFits(
-		leaf.Len()+pendingRows+countDelta,
-		leaf.TrivialContentBytes()+pendingRaw+rawDelta,
-	)
-	fixedExtent := false
-	var scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
-	if fits && baseFound && !overflow {
-		var resolved bool
-		scalarPatch, fixedExtent, resolved, err =
-			leaf.PatchStableCanonicalReplacementScalarPatch(
-				key, stableSlot, canonicalIndex,
-			)
-		if err == nil && !resolved {
-			fixedExtent, err = leaf.PatchStableCanonicalReplacementKeepsExtent(
-				key, stableSlot, canonicalIndex,
-				context.index, &context.workspace,
-			)
-		}
-		if err != nil {
-			leafLease.Release()
-			return false, false, err
-		}
+	rowLimit := storeio.CommonPrimaryLeafWideSlots
+	if largeUnindexed {
+		rowLimit = storeio.CompactPrimaryStripeMaxRows
 	}
+	fits := leaf.Len()+pendingRows+countDelta <= rowLimit &&
+		leaf.EncodedPayloadBytes()+pendingRaw+rawDelta <=
+			storeio.CommonPrimaryLeafMaxExtentBytes-storeio.PageHeaderSize-storeio.PageTrailerSize
+	// A final value byte-identical to the immutable compact base cannot change
+	// any stream, shape, dictionary, or extent. This includes delete+restore.
+	// Content that differs from the base remains conservatively wide: even a
+	// same-length integer can widen a leaf-wide FOR/delta stream.
+	fixedExtent := baseFound && bytes.Equal(canonical, baseValue)
+	var scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
+	_ = canonicalIndex
 	leafLease.Release()
 	if !fits {
 		return false, false, nil
@@ -901,19 +939,27 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		return false, false, err
 	}
 	page := leafLease.Page()
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		leafLease.Release()
 		return false, false, nil
 	}
-	leaf, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	leaf, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, c.storeID, route.Bucket,
 	)
 	if !ok {
 		leafLease.Release()
 		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	baseSlot, body, overflow, baseFound :=
-		leaf.LookupBodySlotHashed(route.Hash, key)
+	largeUnindexed := leaf.Len() > storeio.CommonPrimaryLeafWideSlots
+	baseRank, baseFound := leaf.FindKey(key)
+	baseSlot, slotOK := uint8(0), largeUnindexed
+	if !largeUnindexed {
+		baseSlot, slotOK = leaf.PostingSlot(baseRank)
+	}
+	if baseFound && !slotOK {
+		leafLease.Release()
+		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
 	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
 		route.Bucket, route.Hash, key, logicalView.generation,
 	)
@@ -931,11 +977,26 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 			leafLease.Release()
 			return true, false, nil
 		}
-		if overflow {
+		if _, overflow := leaf.OverflowRef(baseRank); overflow {
 			leafLease.Release()
 			return false, false, nil
 		}
-		oldLen = leaf.AdmittedRowBodyLen(body)
+		var decoded bool
+		context.value, decoded = leaf.AppendValue(context.value[:0], baseRank)
+		if !decoded {
+			leafLease.Release()
+			return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		oldLen = len(context.value)
+		if largeUnindexed {
+			stableSlot, slotOK = c.primaryUnifiedOverlay.chooseLargeUnindexedSlot(
+				route.Bucket, route.Hash,
+			)
+			if !slotOK {
+				leafLease.Release()
+				return false, false, errConcurrentPrimaryPressure
+			}
+		}
 	default:
 		leafLease.Release()
 		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
@@ -950,10 +1011,8 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		return false, false, nil
 	}
 	rawDelta := -storeio.CommonPrimaryUnifiedInsertedTrivialBytes(key, oldLen)
-	if rawDelta == 0 || !storeio.CommonPrimaryUnifiedTrivialFits(
-		currentRows-1,
-		leaf.TrivialContentBytes()+pendingRaw+rawDelta,
-	) {
+	if rawDelta == 0 || currentRows-1 < 0 ||
+		leaf.EncodedPayloadBytes()+pendingRaw+rawDelta < 0 {
 		leafLease.Release()
 		return false, false, nil
 	}

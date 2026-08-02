@@ -22,6 +22,102 @@ the individual ordered full-scan p50 is 7.0% slower than Badger, while p99 is
 effectively tied. Throughput scaling also flattens after eight clients. Those
 are the next two measured performance targets.
 
+The log-filter path has a fused execution lane for `COUNT(*)` equality queries.
+On the 100,000-row low-cardinality log-like probe, the current fair adapter
+measured about 0.6 µs for a point read, 1.49–1.56 ms for an unindexed equality
+count, and 6.2 µs for the same count through an exact `country` index. The
+unindexed result is a complete 100,000-row scan (945 matches,
+14.94–15.63 ns/document), not candidate pruning: the storage cursor resolves the
+field once per durable leaf template and compares its scalar tokens without
+reconstructing each JSON document. Rows that cannot be decided from tokens are
+rendered individually and reported through `TokenFilterFallbackRows`;
+`RowsScanned` still reports the complete corpus and `IndexBounded` remains
+false.
+
+The fair adapter deliberately constructs and compiles the query on each call,
+so its hot-loop result is about 15 allocations and 1.4 KiB per operation. A
+prepared `Query` and reused `Exec` remove that adapter-level cost: the warmed
+native full scan itself is zero-allocation. The same token lane also handles
+nested paths and exact-decimal numeric equality: `1`, `1.0`, and `1e0` compare
+equal without float64 rounding. On the same 100,000-row storage corpus, a
+nested string equality measured about 2.29 ms and a decimal `500.0` needle over
+integer-spelled values measured about 2.48 ms; both scanned every row with zero
+fallback rows and zero warm allocations. The indexed lane uses the durable
+spanned-term representation for large low-cardinality postings. These are
+machine-specific probe numbers, not API promises; reproduce them with
+`bench/competitive/cmd/speedprobe` and separate warm-up from steady-state
+allocation measurements.
+
+A local ClickHouse control over the same flattened 100,000-row corpus measured
+about 1.49 ms with `ORDER BY key` and no secondary data-skipping index, placing
+the two unindexed scans within roughly 0–5% on this machine across repeated
+local runs; the latest VibeDB sample was about 4% slower. For context,
+ClickHouse measured about 1.34 ms with the primary layout aligned as
+`ORDER BY (country, key)`, and about 1.97 ms with a mixed-value `set` skipping
+index. Those indexed/layout-assisted rows are disclosed separately because
+they do not represent the same physical work as the full-scan row.
+
+### Direct ClickHouse space/speed control
+
+The same local ClickHouse 25.8 run also exposes an important current deficit.
+These are per-table apparent bytes after the single inserted part was complete;
+they exclude ClickHouse's shared server installation and logs, just as the
+VibeDB's row is the complete database file and excludes unrelated process
+files, matching the ClickHouse per-table accounting.
+
+| representation | bytes | bytes/document | unindexed `country = 'PT'` count |
+| --- | ---: | ---: | ---: |
+| ClickHouse typed, `ORDER BY key`, no skipping index | **2,713,077** | **27.13** | about **1.49 ms** |
+| ClickHouse typed, `ORDER BY (country, key)` | 2,992,629 | 29.93 | about 1.34 ms |
+| ClickHouse raw JSON, `ORDER BY key` | 4,565,499 | 45.65 | not measured in this control |
+| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **1.25 ms** through the public query API |
+| VibeDB compact scan kernel | same file | 11.18 | about **0.35 ms**, zero allocations |
+
+The compact VibeDB database file is 2.43× smaller than the fair typed
+ClickHouse table. Its public query path is modestly faster in this control; the
+storage-native full-scan kernel is about 4.3× faster. Both VibeDB rows scan all
+100,000 field IDs: neither uses an index, candidate list, or data skipping.
+The aligned ClickHouse row is kept separate because `country` participates in
+its sparse primary index and physical order. The raw-JSON row is a useful
+representation control, but its filter speed must not be borrowed from the
+typed table.
+
+The retired class-5 leaf census explained the former gap. Its 66.93 physical
+leaf bytes per document split into 41.77 row-token bytes, 12.00 key bytes, 5.18 structural
+bytes, 4.19 dictionary bytes, 2.07 template bytes, and only 1.71 bytes of
+extent slack. Independent per-leaf DEFLATE reaches 30.67 bytes/document at its
+fast setting and 27.52 at its densest setting. That is a feasibility bound,
+not a stored-format result, and even the slow setting does not beat the typed
+ClickHouse table. Packing or a generic codec alone is consequently not enough.
+
+The compact stream is now the unconditional development-format primary leaf
+for empty creation, bulk loading, point reads, ordered scans, exact-index
+posting enumeration, mutation folds, verification, and salvage. The same
+100,000-row low-cardinality corpus occupies 1,003,520 physical leaf bytes
+(10.04 bytes/document); catalog, tablet, root, and allocator pages bring the
+complete file to 11.18 bytes/document. The shape-identical high-cardinality
+variant occupies 119.77 bytes/document as a complete file, preventing the low
+cardinality result from hiding an irreversible or corpus-eliding encoding.
+Every key and scalar codec is decoded byte-for-byte in the format tests.
+
+The winning ingredients are generic: template-hole transposition; bit-packed
+dictionaries and frame-of-reference integers; delta integers; validated
+Gregorian date packing; bounded-restart front coding; and a reversible
+single-numeric-run string codec that applies equally to keys such as
+`doc:00001234` and values such as `"user-1234"`. It does not infer one field
+from another, omit values, add a filter index, prune rows, or derive one field
+from another.
+
+Compact storage does not introduce a background compactor. Mutations use a
+per-stripe bounded delta overlay. Crossing its deterministic threshold folds
+the delta into one replacement stripe on the foreground checkpoint path,
+publishes the replacement through the existing atomic-root protocol, and makes
+the old extents logically reusable immediately; bounded foreground hole
+punching then returns physical blocks where the filesystem supports it. The
+online-space gate charges the old stripe, maximum admitted delta, replacement,
+and recovery bytes simultaneously, so a benchmark cannot report only the
+post-fold floor while hiding asynchronous compaction debt.
+
 ## Single-client workloads
 
 Total operations per second, median of ten isolated repetitions on an Apple

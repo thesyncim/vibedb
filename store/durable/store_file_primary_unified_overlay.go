@@ -324,6 +324,44 @@ func (o *primaryUnifiedOverlay) pendingInsertSlots(
 	return occupied
 }
 
+// chooseLargeUnindexedSlot assigns a collision-free overlay-local identity.
+// Large unindexed compact stripes have no persisted uint8 posting geometry;
+// the slot exists only so the bounded overlay can coalesce repeated keys.
+func (o *primaryUnifiedOverlay) chooseLargeUnindexedSlot(
+	bucket storeio.BucketID, hash uint64,
+) (uint8, bool) {
+	if o == nil {
+		return 0, false
+	}
+	var used [4]uint64
+	folded := o.folded.Load()
+	bucketSlot, found := o.bucketSlot(bucket)
+	if found {
+		for head := o.buckets[bucketSlot].head.Load(); head != 0; {
+			if int(head) > len(o.records) {
+				return 0, false
+			}
+			record := &o.records[head-1]
+			if record.bucket != uint32(bucket) || record.generation <= folded {
+				break
+			}
+			used[record.slot>>6] |= uint64(1) << uint(record.slot&63)
+			if record.bucketPrevious >= head {
+				return 0, false
+			}
+			head = record.bucketPrevious
+		}
+	}
+	start := uint8(hash)
+	for step := 0; step < storeio.CommonPrimaryLeafWideSlots; step++ {
+		slot := start + uint8(step)
+		if used[slot>>6]&(uint64(1)<<uint(slot&63)) == 0 {
+			return slot, true
+		}
+	}
+	return 0, false
+}
+
 func (o *primaryUnifiedOverlay) lookup(
 	bucket storeio.BucketID, hash uint64, key []byte, generation uint64,
 ) ([]byte, primaryUnifiedOverlayDisposition, uint8) {
@@ -1334,10 +1372,8 @@ func (c *Collection) canonicalPrimaryUnifiedOverlayValue(
 	return canonical, true, nil
 }
 
-// tryPrimaryUnifiedOverlayPut publishes one inline class-5 insert or replacement
-// as an O(row) overlay record. A new row claims its final stable envelope slot
-// up front, so a later fold preserves the same placement without a leaf-wide
-// re-placement pass.
+// tryPrimaryUnifiedOverlayPut publishes one inline compact-stripe insert or
+// replacement as a bounded delta record.
 //
 // pressure asks the caller to checkpoint and retry; handled means the logical
 // mutation is already published.
@@ -1350,19 +1386,31 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 ) (handled, created, pressure bool, err error) {
 	overlay := c.primaryUnifiedOverlay
 	if overlay == nil ||
-		storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		return false, false, false, nil
 	}
 	c.primaryUnifiedSeen = true
 	c.recyclePrimaryUnifiedOverlayIfSafe()
-	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, c.storeID, route.Bucket,
 	)
 	if !ok {
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	baseSlot, body, overflow, baseFound :=
-		uv.LookupBodySlotHashed(route.Hash, key)
+	baseRank, baseFound := stripe.FindKey(key)
+	largeUnindexed := stripe.Len() > storeio.CommonPrimaryLeafWideSlots ||
+		!baseFound && stripe.Len() == storeio.CommonPrimaryLeafWideSlots &&
+			state.root.IndexCount == 0
+	if largeUnindexed && state.root.IndexCount != 0 {
+		return false, false, false, nil
+	}
+	baseSlot, slotOK := uint8(0), largeUnindexed
+	if !largeUnindexed {
+		baseSlot, slotOK = stripe.PostingSlot(baseRank)
+	}
+	if baseFound && !slotOK {
+		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
 	current, disposition, overlaySlot := overlay.lookup(
 		route.Bucket, route.Hash, key, state.root.Generation,
 	)
@@ -1379,24 +1427,31 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	case primaryUnifiedOverlayDeleted:
 		found = false
 		stableSlot = overlaySlot
-		overflow = false
 	case primaryUnifiedOverlayMissing:
 		if baseFound {
-			if overflow {
+			if _, overflow := stripe.OverflowRef(baseRank); overflow {
 				return false, false, false, nil
 			}
-			if c.primaryEpoch == nil {
-				oldLen = uv.AdmittedRowBodyLen(body)
-			} else {
-				c.overflowValueScratch = uv.AppendAdmittedRowBody(
-					c.overflowValueScratch[:0], body,
-				)
-				oldLen = len(c.overflowValueScratch)
-				oldRaw = c.overflowValueScratch
+			var decoded bool
+			c.overflowValueScratch, decoded = stripe.AppendValue(
+				c.overflowValueScratch[:0], baseRank,
+			)
+			if !decoded {
+				return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
 			}
+			oldLen = len(c.overflowValueScratch)
+			oldRaw = c.overflowValueScratch
 		}
 	default:
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	if largeUnindexed && disposition == primaryUnifiedOverlayMissing {
+		stableSlot, slotOK = overlay.chooseLargeUnindexedSlot(
+			route.Bucket, route.Hash,
+		)
+		if !slotOK {
+			return false, false, true, nil
+		}
 	}
 	// The leaf header carries its exact no-compression envelope. Accumulating
 	// each pending mutation's exact delta lets growing values and inserts stay
@@ -1408,7 +1463,7 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	}
 	pendingRaw, pendingRows :=
 		overlay.pendingBucketDeltas(route.Bucket)
-	leafWasEmpty := uv.Len()+pendingRows == 0
+	leafWasEmpty := stripe.Len()+pendingRows == 0
 	countDelta := 0
 	rawDelta := len(canonical) - oldLen
 	if !found {
@@ -1419,9 +1474,9 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 		if rawDelta == 0 {
 			return false, false, false, storeio.ErrInvalidWrite
 		}
-		if disposition == primaryUnifiedOverlayMissing {
+		if disposition == primaryUnifiedOverlayMissing && !largeUnindexed {
 			var slotOK bool
-			stableSlot, slotOK = uv.ChooseInsertSlotHashed(
+			stableSlot, slotOK = stripe.ChooseInsertSlotHashed(
 				route.Hash, overlay.pendingInsertSlots(route.Bucket),
 			)
 			if !slotOK {
@@ -1429,10 +1484,13 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 			}
 		}
 	}
-	if !storeio.CommonPrimaryUnifiedTrivialFits(
-		uv.Len()+pendingRows+countDelta,
-		uv.TrivialContentBytes()+pendingRaw+rawDelta,
-	) {
+	rowLimit := storeio.CommonPrimaryLeafWideSlots
+	if largeUnindexed {
+		rowLimit = storeio.CompactPrimaryStripeMaxRows
+	}
+	if stripe.Len()+pendingRows+countDelta > rowLimit ||
+		stripe.EncodedPayloadBytes()+pendingRaw+rawDelta >
+			storeio.CommonPrimaryLeafMaxExtentBytes-storeio.PageHeaderSize-storeio.PageTrailerSize {
 		return false, false, false, nil
 	}
 	generation := state.root.Generation + 1
@@ -1497,9 +1555,8 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	return true, !found, false, nil
 }
 
-// tryPrimaryUnifiedOverlayDelete publishes an inline class-5 tombstone as one
-// O(key) overlay record. Tombstones keep the removed row's stable slot so a
-// same-window reinsert can reclaim it without leaf-wide placement work.
+// tryPrimaryUnifiedOverlayDelete publishes a compact-stripe tombstone as one
+// bounded delta record.
 func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 	state *fileStoreState,
 	route storeio.ResidentPrimaryRoute,
@@ -1508,19 +1565,29 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 ) (handled, deleted, pressure bool, err error) {
 	overlay := c.primaryUnifiedOverlay
 	if overlay == nil ||
-		storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		return false, false, false, nil
 	}
 	c.primaryUnifiedSeen = true
 	c.recyclePrimaryUnifiedOverlayIfSafe()
-	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, c.storeID, route.Bucket,
 	)
 	if !ok {
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	baseSlot, body, overflow, baseFound :=
-		uv.LookupBodySlotHashed(route.Hash, key)
+	largeUnindexed := stripe.Len() > storeio.CommonPrimaryLeafWideSlots
+	if largeUnindexed && state.root.IndexCount != 0 {
+		return false, false, false, nil
+	}
+	baseRank, baseFound := stripe.FindKey(key)
+	baseSlot, slotOK := uint8(0), largeUnindexed
+	if !largeUnindexed {
+		baseSlot, slotOK = stripe.PostingSlot(baseRank)
+	}
+	if baseFound && !slotOK {
+		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
 	current, disposition, overlaySlot := overlay.lookup(
 		route.Bucket, route.Hash, key, state.root.Generation,
 	)
@@ -1538,36 +1605,38 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 		if !baseFound {
 			return true, false, false, nil
 		}
-		if overflow {
-			// Overflow retirement remains on the structural lane.
+		if _, overflow := stripe.OverflowRef(baseRank); overflow {
 			return false, false, false, nil
 		}
-		if c.primaryEpoch == nil {
-			oldLen = uv.AdmittedRowBodyLen(body)
-		} else {
-			old := uv.AppendAdmittedRowBody(
-				c.primaryUnifiedCanonical[:0], body,
-			)
-			oldLen = len(old)
-			c.overflowValueScratch = append(
-				c.overflowValueScratch[:0], old...,
-			)
-			oldRaw = c.overflowValueScratch
+		var decoded bool
+		c.overflowValueScratch, decoded = stripe.AppendValue(
+			c.overflowValueScratch[:0], baseRank,
+		)
+		if !decoded {
+			return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
 		}
+		oldLen = len(c.overflowValueScratch)
+		oldRaw = c.overflowValueScratch
 	default:
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	if largeUnindexed && disposition == primaryUnifiedOverlayMissing {
+		stableSlot, slotOK = overlay.chooseLargeUnindexedSlot(
+			route.Bucket, route.Hash,
+		)
+		if !slotOK {
+			return false, false, true, nil
+		}
 	}
 	pendingRaw, pendingRows :=
 		overlay.pendingBucketDeltas(route.Bucket)
 	rawDelta := -storeio.CommonPrimaryUnifiedInsertedTrivialBytes(key, oldLen)
 	if rawDelta == 0 ||
-		!storeio.CommonPrimaryUnifiedTrivialFits(
-			uv.Len()+pendingRows-1,
-			uv.TrivialContentBytes()+pendingRaw+rawDelta,
-		) {
+		stripe.Len()+pendingRows-1 < 0 ||
+		stripe.EncodedPayloadBytes()+pendingRaw+rawDelta < 0 {
 		return false, false, false, nil
 	}
-	becomesEmpty := uv.Len()+pendingRows-1 == 0
+	becomesEmpty := stripe.Len()+pendingRows-1 == 0
 	generation := state.root.Generation + 1
 	prepared, err := overlay.prepare(
 		route.Bucket, route.Hash, generation, key, nil,

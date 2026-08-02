@@ -45,7 +45,7 @@ func unifiedCompetitiveShapeRecords(n int) []CommonPrimaryLeafRecord {
 // documents: nested objects, array indexes, escaped keys, duplicate keys,
 // container targets, and absences.
 func TestUnifiedPathSpanOf(t *testing.T) {
-	doc := []byte(`{"a":{"b":[10,{"c":"x"},null]},"a":2,"d e":true,"n":{},"\ttab":7}`)
+	doc := []byte(`{"a":{"b":[10,{"c":"x"},null]},"a":2,"d e":true,"n":{},"\ttab":7,"":{"":9},"a/b":{"~key":"escaped"}}`)
 	cases := []struct {
 		path  string
 		want  string
@@ -61,6 +61,8 @@ func TestUnifiedPathSpanOf(t *testing.T) {
 		{"/d e", `true`, true},
 		{"/n", `{}`, true},
 		{"/\ttab", `7`, true}, // decoded-key comparison across escapes
+		{"//", `9`, true},
+		{"/a~1b/~0key", `"escaped"`, true},
 		{"/missing", "", false},
 		{"/a/b/0/deep", "", false},
 	}
@@ -83,8 +85,8 @@ func TestUnifiedPathSpanOf(t *testing.T) {
 	if err := r.SetPath([]byte("")); err == nil {
 		t.Fatal("empty path must be rejected")
 	}
-	if err := r.SetPath([]byte("/a//b")); err == nil {
-		t.Fatal("empty segment must be rejected")
+	if err := r.SetPath([]byte("/a/~2b")); err == nil {
+		t.Fatal("invalid pointer escape must be rejected")
 	}
 }
 
@@ -246,6 +248,63 @@ func TestUnifiedEqFilterLeafDifferential(t *testing.T) {
 	}
 }
 
+func TestUnifiedScalarEqFilterExactNumberSemantics(t *testing.T) {
+	spellings := []string{"1", "1.0", "1e0", "0.1e1", "2", `"1"`, "-0", "0.0"}
+	records := make([]CommonPrimaryLeafRecord, len(spellings))
+	for i, spelling := range spellings {
+		records[i] = CommonPrimaryLeafRecord{
+			Key: fmt.Appendf(nil, "number:%02d", i),
+			Value: CommonPrimaryLeafValue{
+				Inline: fmt.Appendf(nil, `{"n":%s}`, spelling),
+			},
+		}
+	}
+	page, count := encodeUnifiedTestLeaf(t, records)
+	view := openUnifiedTestLeaf(t, page)
+	for _, test := range []struct {
+		needle string
+		want   int
+	}{
+		{needle: "1", want: 4},
+		{needle: "1.00e0", want: 4},
+		{needle: "0", want: 2},
+		{needle: "2.0", want: 1},
+	} {
+		filter, err := NewUnifiedScalarEqFilter([]byte("/n"), []byte(test.needle))
+		if err != nil {
+			t.Fatal(err)
+		}
+		filter.prepareLeaf(&view)
+		matched := 0
+		for rank := 0; rank < count; rank++ {
+			_, body, overflow, ok := view.RowRawAt(rank)
+			if !ok || overflow {
+				t.Fatalf("RowRawAt(%d)", rank)
+			}
+			yes, render, bodyOK := filter.matchBody(body)
+			if !bodyOK {
+				t.Fatalf("matchBody(%d)", rank)
+			}
+			if render {
+				doc, renderOK := view.AppendRowBody(nil, body)
+				if !renderOK {
+					t.Fatalf("render(%d)", rank)
+				}
+				yes, err = filter.EvalRendered(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if yes {
+				matched++
+			}
+		}
+		if matched != test.want {
+			t.Fatalf("n = %s matched %d, want %d", test.needle, matched, test.want)
+		}
+	}
+}
+
 // TestUnifiedTokenViewZeroAlloc pins the steady-state hot calls at zero
 // allocations: the hole read, the token compare, the warmed per-template
 // resolution, and the warmed render-path evaluation.
@@ -287,6 +346,18 @@ func TestUnifiedTokenViewZeroAlloc(t *testing.T) {
 		}
 	}); n != 0 {
 		t.Fatalf("matchBody allocates %v/op", n)
+	}
+	numberFilter, err := NewUnifiedScalarEqFilter([]byte("/score"), []byte(`0.0`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	numberFilter.prepareLeaf(&view)
+	if n := testing.AllocsPerRun(200, func() {
+		if _, _, ok := numberFilter.matchBody(body); !ok {
+			t.Fatal("numeric matchBody")
+		}
+	}); n != 0 {
+		t.Fatalf("numeric matchBody allocates %v/op", n)
 	}
 	if n := testing.AllocsPerRun(50, func() {
 		if r.Resolve(&view, template) != hole {

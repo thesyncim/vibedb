@@ -354,7 +354,7 @@ func TestFilePrimaryBufferedCrashBoundary(t *testing.T) {
 }
 
 func TestFilePrimaryBufferedOverlayFoldRewritesParentChainOnce(t *testing.T) {
-	built, keys, values := buildFilePrimaryCorpus(t, 1_000)
+	built, keys, values := buildFilePrimaryCorpus(t, 5_000)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
 		Durability: DurabilityBufferedVisible,
@@ -411,7 +411,7 @@ func TestFilePrimaryBufferedOverlayFoldRewritesParentChainOnce(t *testing.T) {
 		{key: secondKey, resident: secondResident},
 	} {
 		var path filePrimaryMutationPath
-		if err := collection.acquirePrimaryMutationPath(
+		if err := collection.acquirePrimaryRoutingPath(
 			&path, state, []byte(selected.key),
 			selected.resident,
 		); err != nil {
@@ -542,7 +542,7 @@ func TestFilePrimaryBufferedOverlayFoldRewritesParentChainOnce(t *testing.T) {
 }
 
 func TestFilePrimaryBufferedOverlayCapacityForcesFold(t *testing.T) {
-	built, keys, _ := buildFilePrimaryCorpus(t, 1_000)
+	built, keys, _ := buildFilePrimaryCorpus(t, 5_000)
 	options := Options{
 		Backend: BackendPortable, ResidentBytes: 32 << 20,
 		Durability: DurabilityBufferedVisible,
@@ -657,6 +657,7 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 	}
 	assertFold := func(
 		t *testing.T, collection *Collection, before Stats,
+		wantDeviceCommits uint64,
 	) {
 		t.Helper()
 		after := collection.Stats()
@@ -668,9 +669,9 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 			t.Fatalf("automatic checkpoints changed %d -> %d",
 				before.AutomaticCheckpoints, after.AutomaticCheckpoints)
 		}
-		if after.DeviceCommits != before.DeviceCommits {
-			t.Fatalf("device commits changed %d -> %d",
-				before.DeviceCommits, after.DeviceCommits)
+		if got := after.DeviceCommits - before.DeviceCommits; got != wantDeviceCommits {
+			t.Fatalf("device commit delta = %d, want %d",
+				got, wantDeviceCommits)
 		}
 	}
 
@@ -688,10 +689,21 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 			!deleted {
 			t.Fatalf("Delete = %v,%v", deleted, err)
 		}
-		assertFold(t, collection, before)
+		assertFold(t, collection, before, 0)
 	})
 
 	t.Run("batch-pre-fold", func(t *testing.T) {
+		quiet, quietKeys := open(t)
+		quietBefore := quiet.Stats()
+		if err := quiet.Update(func(batch *WriteBatch) error {
+			return batch.Put(
+				[]byte(quietKeys[1]), []byte(`{"fold":"quiet-batch"}`),
+			)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		quietDeviceCommits := quiet.Stats().DeviceCommits - quietBefore.DeviceCommits
+
 		collection, keys := open(t)
 		if _, err := collection.Put(
 			[]byte(keys[0]), []byte(`{"fold":"before-batch"}`),
@@ -706,7 +718,9 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		assertFold(t, collection, before)
+		// The compact foreground fold seals one physical publication before the
+		// batch's own publication; it is not an automatic durability checkpoint.
+		assertFold(t, collection, before, quietDeviceCommits+1)
 	})
 }
 
@@ -735,16 +749,16 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 
 	// Routed contract: with putPrimaryWithSplit live, a full leaf performs a
 	// bounded structural split and the mutation succeeds. Insert well past a
-	// single narrow leaf's ~195-live capacity so several splits fire, and assert
+	// single compact leaf's byte capacity so several splits fire, and assert
 	// every Put is accepted -- ErrPrimaryLeafSplitRequired must never surface to
 	// the caller at leaf scale. The only remaining signal is
 	// ErrPrimaryMacroSplitRequired, which needs a tablet's full 4096 local IDs
 	// (~400k keys) and so is a bound, not a leaf-scale event.
-	const inserts = 2048
+	const inserts = 600
 	oracle := make(map[string][]byte, inserts)
 	for at := range inserts {
 		key := fmt.Sprintf("key-%04d", at)
-		value := []byte(fmt.Sprintf(`{"v":%d}`, at))
+		value := primaryStructuralSplitValue(at)
 		created, putErr := collection.Put([]byte(key), value)
 		if errors.Is(putErr, ErrPrimaryLeafSplitRequired) {
 			t.Fatalf("routed put %q surfaced a leaf-split signal", key)
@@ -755,7 +769,7 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 		oracle[key] = value
 	}
 	if got := collection.Stats().PrimaryLeafSplits; got == 0 {
-		t.Fatal("no leaf split fired across 2048 inserts into one tablet")
+		t.Fatal("no leaf split fired across 600 padded inserts into one tablet")
 	}
 	if got := collection.Stats().PrimaryMacroSplitRequired; got != 0 {
 		t.Fatalf("unexpected macro-split at leaf scale: %d", got)

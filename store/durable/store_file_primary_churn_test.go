@@ -800,11 +800,6 @@ func primaryChurnWalkGraph(
 		FileEnd:                state.fileEnd,
 		NextLogicalID:          state.root.NextLogicalID,
 	}
-	leafBounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           state.fileEnd,
-		NextLogicalID:     state.root.NextLogicalID,
-		AllocationQuantum: state.root.PageSize,
-	}
 	seenLocator := make(map[uint64]struct{})
 	framing := func(header storeio.PageHeader) int {
 		return storeio.PageHeaderSize + int(header.PayloadLength) + storeio.PageTrailerSize
@@ -855,14 +850,14 @@ func primaryChurnWalkGraph(
 					return leafErr
 				}
 				if storeio.PrimaryLeafClass(leafLease.Page()) !=
-					storeio.CommonPrimaryLeafUnified {
+					storeio.CommonPrimaryLeafCompact {
 					leafLease.Release()
 					anchorLease.Release()
 					return storeio.ErrCommonPrimaryLeafCorrupt
 				}
-				leaf, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+				leaf, admitted := storeio.AdmittedCompactPrimaryStripe(
 					leafLease.Page(), state.root.StoreID,
-					leafRoute.Bucket, leafBounds,
+					leafRoute.Bucket,
 				)
 				if !admitted {
 					leafLease.Release()
@@ -873,7 +868,7 @@ func primaryChurnWalkGraph(
 					offset: leafRoute.Ref.Offset,
 					extent: int(leaf.Header().PageSize),
 					live:   leaf.Len(),
-					class:  storeio.CommonPrimaryLeafUnified,
+					class:  storeio.CommonPrimaryLeafCompact,
 				})
 				leafLease.Release()
 			}

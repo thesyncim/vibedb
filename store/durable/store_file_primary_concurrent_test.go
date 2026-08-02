@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -61,6 +62,15 @@ func openConcurrentPrimaryTestFixture(
 	)
 	collection, err := Open(file, options)
 	if err != nil {
+		t.Fatal(err)
+	}
+	collection.writer.Lock()
+	if err := collection.repartitionPrimaryForExactIndexLocked(context.Background()); err != nil {
+		collection.writer.Unlock()
+		t.Fatal(err)
+	}
+	collection.writer.Unlock()
+	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -130,7 +140,7 @@ func concurrentPrimaryTestBuckets(
 				t.Fatalf("acquire bucket %d: %v", route.Bucket, err)
 			}
 			unified := storeio.PrimaryLeafClass(lease.Page()) ==
-				storeio.CommonPrimaryLeafUnified
+				storeio.CommonPrimaryLeafCompact
 			lease.Release()
 			if !unified {
 				continue
@@ -175,10 +185,10 @@ func concurrentPrimaryTestTargets(
 		}
 	}
 	if !sameFound {
-		t.Fatalf("%d keys supplied no unified bucket with two rows", len(fixture.keys))
+		t.Fatalf("%d keys supplied no compact bucket with two rows", len(fixture.keys))
 	}
 	if disjoint[1] == 0 {
-		t.Fatalf("%d keys supplied no two unified buckets on distinct stripes", len(fixture.keys))
+		t.Fatalf("%d keys supplied no two compact buckets on distinct stripes", len(fixture.keys))
 	}
 	return same, disjoint
 }
@@ -477,7 +487,7 @@ func TestConcurrentPrimaryReplaceRepeatedArenaReuseFoldsAndReopens(t *testing.T)
 	assertConcurrentPrimaryRaw(t, reopened, key, values[len(values)-1])
 }
 
-func TestConcurrentPrimaryReplaceReservesActualLeafBytes(t *testing.T) {
+func TestConcurrentPrimaryIdenticalReplaceReservesActualLeafBytes(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
 		t, 512, concurrentPrimaryTestOptions(),
 	)
@@ -492,18 +502,12 @@ func TestConcurrentPrimaryReplaceReservesActualLeafBytes(t *testing.T) {
 		t.Fatalf("fixture leaf extent = %d, want compact extent below %d",
 			route.Ref.Length, coll.options.MaxPageSize)
 	}
-	integer := bytes.Replace(
-		fixture.values[0], []byte(`"group":0`), []byte(`"group":1`), 1,
-	)
-	if bytes.Equal(integer, fixture.values[0]) {
-		t.Fatalf("fixture value has no one-digit group: %s", fixture.values[0])
-	}
-	if created, err := coll.Put(key, integer); err != nil || created {
-		t.Fatalf("certified integer Put = %v,%v", created, err)
+	if created, err := coll.Put(key, fixture.values[0]); err != nil || created {
+		t.Fatalf("identical Put = %v,%v", created, err)
 	}
 	slot, found := coll.primaryUnifiedOverlay.bucketSlot(route.Bucket)
 	if !found {
-		t.Fatal("certified replacement did not publish an overlay bucket")
+		t.Fatal("identical replacement did not publish an overlay bucket")
 	}
 	wantExact := route.Ref.Length +
 		coll.options.primaryUnifiedOverlayParentBytes
@@ -513,9 +517,25 @@ func TestConcurrentPrimaryReplaceReservesActualLeafBytes(t *testing.T) {
 			coll.options.primaryUnifiedOverlayParentBytes, wantExact)
 	}
 
-	// An equal-length string change is not a local extent certificate: changing
-	// a dictionary-eligible spelling can alter the leaf-wide dictionary choice.
-	// It must conservatively upgrade the already-dirty bucket to MaxPageSize.
+	// Any content change is not yet a compact-stream extent certificate: even a
+	// same-length integer can widen a leaf-wide FOR/delta stream. It must
+	// conservatively upgrade the already-dirty bucket to MaxPageSize.
+	integer := bytes.Replace(
+		fixture.values[0], []byte(`"group":0`), []byte(`"group":1`), 1,
+	)
+	if bytes.Equal(integer, fixture.values[0]) {
+		t.Fatalf("fixture value has no one-digit group: %s", fixture.values[0])
+	}
+	if created, err := coll.Put(key, integer); err != nil || created {
+		t.Fatalf("changed integer Put = %v,%v", created, err)
+	}
+	wantWide := uint32(coll.options.MaxPageSize) +
+		coll.options.primaryUnifiedOverlayParentBytes
+	if got := coll.primaryUnifiedOverlay.buckets[slot].reservedBytes.Load(); got != wantWide {
+		t.Fatalf("changed integer reservation = %d, want conservative %d", got, wantWide)
+	}
+
+	// A dictionary-eligible string change remains conservatively wide.
 	stringChange := bytes.Replace(
 		integer, []byte(`primary row 0`), []byte(`xrimary row 0`), 1,
 	)
@@ -525,8 +545,6 @@ func TestConcurrentPrimaryReplaceReservesActualLeafBytes(t *testing.T) {
 	if created, err := coll.Put(key, stringChange); err != nil || created {
 		t.Fatalf("uncertified string Put = %v,%v", created, err)
 	}
-	wantWide := uint32(coll.options.MaxPageSize) +
-		coll.options.primaryUnifiedOverlayParentBytes
 	if got := coll.primaryUnifiedOverlay.buckets[slot].reservedBytes.Load(); got != wantWide {
 		t.Fatalf("uncertified bucket reservation = %d, want max leaf + parents %d",
 			got, wantWide)
@@ -1095,7 +1113,6 @@ func TestConcurrentPrimaryDeleteRestoreKeepsStableSlotAndExactCuts(t *testing.T)
 	at := len(fixture.keys) / 2
 	key := []byte(fixture.keys[at])
 	want := canonicalConcurrentPrimaryValue(t, fixture.values[at])
-	state := coll.state.Load()
 	route, ok := coll.primaryRouter.Load().Route(key)
 	if !ok {
 		t.Fatalf("route existing key %q", key)
@@ -1104,21 +1121,30 @@ func TestConcurrentPrimaryDeleteRestoreKeepsStableSlotAndExactCuts(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaf, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+	leaf, admitted := storeio.AdmittedCompactPrimaryStripe(
 		lease.Page(), coll.storeID, route.Bucket,
-		coll.primaryLeafBounds(state),
 	)
 	if !admitted {
 		lease.Release()
 		t.Fatal("target is not an admitted unified leaf")
 	}
-	baseSlot, body, overflow, found :=
-		leaf.LookupBodySlotHashed(route.Hash, key)
+	rank, found := leaf.FindKey(key)
+	baseSlot, slotOK := leaf.PostingSlot(rank)
+	_, overflow := leaf.OverflowRef(rank)
 	if !found || overflow {
 		lease.Release()
 		t.Fatalf("base lookup = found %v overflow %v", found, overflow)
 	}
-	baseLen := leaf.AdmittedRowBodyLen(body)
+	if !slotOK {
+		lease.Release()
+		t.Fatal("base lookup has no posting slot")
+	}
+	baseValue, decoded := leaf.AppendValue(nil, rank)
+	if !decoded {
+		lease.Release()
+		t.Fatal("base lookup value did not decode")
+	}
+	baseLen := len(baseValue)
 	lease.Release()
 
 	baseGeneration := coll.Generation()

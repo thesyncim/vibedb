@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"fmt"
+	"slices"
 )
 
 const primaryGraphCatalogDepth = 3
@@ -41,13 +42,10 @@ type PrimaryGraphCursor struct {
 	rowRank     int
 	leafLease   PageLease
 	leafBucket  BucketID
-	rows        CommonPrimaryLeafIterator
+	leaf        CompactPrimaryStripeView
+	row         int
 
-	// Unified rows reconstruct documents into spliceScratch. The scratch is
-	// reused across rows and leaves within one scan.
-	unifiedLeaf     CommonPrimaryUnifiedLeafView
-	unifiedRenderer unifiedPrimaryRowRenderer
-	spliceScratch   []byte
+	spliceScratch []byte
 
 	done bool
 }
@@ -262,40 +260,38 @@ func (c *PrimaryGraphCursor) openLeaf(
 		return err
 	}
 	c.leafLease = lease
-	if PrimaryLeafClass(lease.Page()) != CommonPrimaryLeafUnified {
+	if PrimaryLeafClass(lease.Page()) != CommonPrimaryLeafCompact {
 		return fmt.Errorf(
-			"%w: non-unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+			"%w: non-compact primary leaf", ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(
-		lease.Page(), c.bounds.StoreID, route.Bucket, c.leafBounds,
+	view, ok := AdmittedCompactPrimaryStripe(
+		lease.Page(), c.bounds.StoreID, route.Bucket,
 	)
 	if !ok {
 		return fmt.Errorf(
-			"%w: unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+			"%w: compact primary leaf", ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	c.unifiedLeaf = uv
+	c.leaf = view
 	c.leafBucket = route.Bucket
-	c.unifiedRenderer.Reset(uv)
 	if lowerBound {
-		c.rows = uv.env.Range(c.lower, nil)
+		c.row = view.FirstRankFrom(c.lower)
 	} else {
-		c.rows = uv.env.AllRows()
+		c.row = 0
 	}
 	return nil
 }
 
-// CurrentUnifiedLeaf returns the admitted leaf selected by the cursor and its
-// stable bucket identity. The view borrows the cursor's current page lease and
-// remains valid only until NextLeaf or Close.
+// CurrentUnifiedLeaf returns the admitted compact leaf selected by the cursor.
+// The old name remains temporarily while mutation callers are converted.
 func (c *PrimaryGraphCursor) CurrentUnifiedLeaf() (
-	BucketID, CommonPrimaryUnifiedLeafView, bool,
+	BucketID, CompactPrimaryStripeView, bool,
 ) {
 	if c == nil || c.done || c.leafLease.Page() == nil {
-		return 0, CommonPrimaryUnifiedLeafView{}, false
+		return 0, CompactPrimaryStripeView{}, false
 	}
-	return c.leafBucket, c.unifiedLeaf, true
+	return c.leafBucket, c.leaf, true
 }
 
 // CurrentUnifiedLeafPage returns the admitted bytes selected by the cursor and
@@ -342,18 +338,15 @@ func (c *PrimaryGraphCursor) ConsumeCurrentLeafBase(expectedKey []byte) error {
 		len(c.lower) != 0 || len(c.upper) != 0 || len(c.prefix) != 0 {
 		return ErrInvalidWrite
 	}
-	rank := int(c.rows.rank)
-	if rank >= int(c.rows.count) {
+	if c.row >= c.leaf.Len() {
 		return ErrCommonPrimaryLeafCorrupt
 	}
-	key, ok := c.unifiedLeaf.RowAt(rank)
+	var keyScratch [CommonPrimaryLeafMaxKeyBytes]byte
+	key, ok := c.leaf.AppendKey(keyScratch[:0], c.row)
 	if !ok || !bytes.Equal(key, expectedKey) {
 		return ErrCommonPrimaryLeafCorrupt
 	}
-	consumed, _, overflow, ok := c.rows.NextRawBorrowed()
-	if !ok || overflow || !bytes.Equal(consumed, expectedKey) {
-		return ErrCommonPrimaryLeafCorrupt
-	}
+	c.row++
 	return nil
 }
 
@@ -370,23 +363,35 @@ func (c *PrimaryGraphCursor) NextLeaf() error {
 	return nil
 }
 
-// nextRawBorrowed yields the next unified row. Inline bodies are rendered into
-// reused scratch; the returned value borrows that scratch and is valid only
-// until the next call.
+// nextRawBorrowed yields the next compact row through cursor-owned scratch.
 func (c *PrimaryGraphCursor) nextRawBorrowed() (
 	key, raw []byte, overflow, ok bool,
 ) {
-	k, body, isOverflow, rowOK := c.rows.NextRawBorrowed()
-	if !rowOK {
+	if c.row >= c.leaf.Len() {
 		return nil, nil, false, false
 	}
-	if isOverflow {
-		return k, body, true, true
+	if ref, isOverflow := c.leaf.OverflowRef(c.row); isOverflow {
+		var keyScratch [CommonPrimaryLeafMaxKeyBytes]byte
+		key, ok = c.leaf.AppendKey(keyScratch[:0], c.row)
+		if !ok {
+			return nil, nil, false, false
+		}
+		c.spliceScratch = slices.Grow(c.spliceScratch[:0], PageRefSize)[:PageRefSize]
+		encodePageRef(c.spliceScratch, ref)
+		c.row++
+		return key, c.spliceScratch, true, true
 	}
-	c.spliceScratch = c.unifiedRenderer.Append(
-		c.spliceScratch[:0], body,
-	)
-	return k, c.spliceScratch, false, true
+	c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
+	if !ok {
+		return nil, nil, false, false
+	}
+	keyEnd := len(c.spliceScratch)
+	c.spliceScratch, ok = c.leaf.AppendValue(c.spliceScratch, c.row)
+	if !ok {
+		return nil, nil, false, false
+	}
+	c.row++
+	return c.spliceScratch[:keyEnd], c.spliceScratch[keyEnd:], false, true
 }
 
 // VisitInline is the scan hot path for inline primary graphs. It keeps the
@@ -437,7 +442,7 @@ func (c *PrimaryGraphCursor) visitAllInline(
 ) ([]byte, PageRef, error) {
 	for {
 		key, ref, err := c.visitCurrentLeafInlineUntil(
-			int(c.rows.count), fn,
+			c.leaf.Len(), fn,
 		)
 		if err != nil {
 			return nil, PageRef{}, err
@@ -455,75 +460,39 @@ func (c *PrimaryGraphCursor) visitAllInline(
 	}
 }
 
-// visitCurrentLeafInlineUntil fuses the succinct boundary decoder, key
-// decoder, admitted renderer, and callback dispatch for one exact base span.
-// Iterator state is written back only at the span boundary, overflow, or
-// callback stop.
+// visitCurrentLeafInlineUntil reconstructs one exact compact base span.
 func (c *PrimaryGraphCursor) visitCurrentLeafInlineUntil(
 	limit int,
 	fn func(key, value []byte) error,
 ) (overflowKey []byte, overflow PageRef, err error) {
-	it := &c.rows
-	if limit < int(it.rank) || limit > int(it.count) {
+	if limit < c.row || limit > c.leaf.Len() {
 		return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 	}
-	if it.finished || int(it.rank) == limit {
-		return nil, PageRef{}, nil
-	}
-	payload := it.payload
-	layout := &it.layout
-	count := int(it.count)
-	rank := int(it.rank)
-	bitPos := int(it.bitPos)
-	offset := int(it.offset)
-	for rank < limit {
-		nextPosition, ok := commonPrimaryLeafNextHighBitAt(
-			payload, layout.highStart, layout.highBytes, bitPos+1,
-		)
+	for c.row < limit {
+		if ref, overflow := c.leaf.OverflowRef(c.row); overflow {
+			var ok bool
+			c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
+			if !ok {
+				return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
+			}
+			c.row++
+			return c.spliceScratch, ref, nil
+		}
+		var ok bool
+		c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
 		if !ok {
-			it.finished = true
 			return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 		}
-		nextRank := rank + 1
-		end := uint16(
-			(nextPosition-nextRank)<<commonPrimaryLeafLowerBits,
-		) | uint16(payload[layout.lowStart+nextRank])
-		keyLength := commonPrimaryLeafKeyCode(payload, layout, rank)
-		start := offset
-		if keyLength == commonPrimaryLeafEscapeLength {
-			keyLength = int(payload[start]) + 1
-			start++
+		keyEnd := len(c.spliceScratch)
+		c.spliceScratch, ok = c.leaf.AppendValue(c.spliceScratch, c.row)
+		if !ok {
+			return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 		}
-		key := payload[start : start+keyLength : start+keyLength]
-		valueStart := start + keyLength
-		raw := payload[valueStart:int(end):int(end)]
-		isOverflow := payload[layout.overflowStart+rank/8]&
-			(byte(1)<<uint(rank&7)) != 0
-		rank = nextRank
-		bitPos = nextPosition
-		offset = int(end)
-		if isOverflow {
-			it.rank = uint16(rank)
-			it.bitPos = uint16(bitPos)
-			it.offset = uint16(offset)
-			it.finished = rank >= count
-			return key, decodePageRef(raw), nil
-		}
-		c.spliceScratch = c.unifiedRenderer.Append(
-			c.spliceScratch[:0], raw,
-		)
-		if err := fn(key, c.spliceScratch); err != nil {
-			it.rank = uint16(rank)
-			it.bitPos = uint16(bitPos)
-			it.offset = uint16(offset)
-			it.finished = rank >= count
+		c.row++
+		if err := fn(c.spliceScratch[:keyEnd], c.spliceScratch[keyEnd:]); err != nil {
 			return nil, PageRef{}, err
 		}
 	}
-	it.rank = uint16(rank)
-	it.bitPos = uint16(bitPos)
-	it.offset = uint16(offset)
-	it.finished = rank >= count
 	return nil, PageRef{}, nil
 }
 
@@ -640,8 +609,8 @@ func (c *PrimaryGraphCursor) nextTablet() (PageRef, bool, error) {
 func (c *PrimaryGraphCursor) releaseAnchor() {
 	c.leafLease.Release()
 	c.leafBucket = 0
-	c.rows = CommonPrimaryLeafIterator{}
-	c.unifiedLeaf = CommonPrimaryUnifiedLeafView{}
+	c.leaf = CompactPrimaryStripeView{}
+	c.row = 0
 	c.anchorLease.Release()
 	c.anchor = GlobalTabletCatalogAnchorView{}
 	c.rowRank = 0

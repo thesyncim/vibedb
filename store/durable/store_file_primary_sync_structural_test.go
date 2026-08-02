@@ -10,6 +10,22 @@ import (
 	"testing"
 )
 
+// primaryStructuralSplitValue is deliberately stream-incompressible enough to
+// exercise the compact leaf's byte boundary with a few hundred rows. Structural
+// tests should not need 4,097 tiny writes merely because compact stripes pack
+// tiny homogeneous documents well.
+func primaryStructuralSplitValue(i int) []byte {
+	value := fmt.Appendf(nil, `{"id":%d,"pad":"`, i)
+	x := uint64(i+1) * 0x9e3779b97f4a7c15
+	for range 420 {
+		x ^= x << 7
+		x ^= x >> 9
+		x ^= x << 8
+		value = append(value, byte('a'+x%26))
+	}
+	return append(value, '"', '}')
+}
+
 // openSyncPrimaryStructuralStore builds a seeded ordered-primary store on the
 // journal-backed synchronous lane and opens it for mutation. The tests drive
 // split, empty-reclaim, and batch-split transactions across durable-root changes.
@@ -78,7 +94,7 @@ func TestFilePrimarySyncLeafSplitSignal(t *testing.T) {
 	oracle := map[string]string{"seed": `{"v":0}`}
 	for i := 0; i < inserts; i++ {
 		key := fmt.Sprintf("key-%06d", i)
-		value := journalValue(i)
+		value := primaryStructuralSplitValue(i)
 		created, putErr := coll.Put([]byte(key), value)
 		if errors.Is(putErr, ErrPrimaryLeafSplitRequired) {
 			t.Fatalf("sync put %q surfaced a leaf-split signal", key)
@@ -163,7 +179,7 @@ func TestFilePrimarySyncRoutedSplitDifferential(t *testing.T) {
 	buffer := make([]byte, 0, 64)
 	for at, id := range order {
 		key := fmt.Sprintf("rk-%08d", id)
-		value := []byte(fmt.Sprintf(`{"id":%d,"n":%d}`, id, at))
+		value := primaryStructuralSplitValue(id*target + at)
 		created, putErr := coll.Put([]byte(key), value)
 		if putErr != nil || !created {
 			t.Fatalf("insert %d %q = created %v, err %v", at, key, created, putErr)
@@ -241,7 +257,7 @@ func TestFilePrimarySyncEmptyLeafReclaim(t *testing.T) {
 	keys := make([]string, 0, grow)
 	for i := 0; i < grow; i++ {
 		key := fmt.Sprintf("key-%06d", i)
-		value := journalValue(i)
+		value := primaryStructuralSplitValue(i)
 		if _, err := coll.Put([]byte(key), value); err != nil {
 			t.Fatalf("grow put %q: %v", key, err)
 		}
@@ -327,7 +343,7 @@ func TestFilePrimarySyncBatchSplit(t *testing.T) {
 	oracle := map[string]string{"seed": `{"v":0}`}
 	for i := 0; i < total; i++ {
 		key := fmt.Sprintf("bk-%06d", i)
-		value := journalValue(i)
+		value := primaryStructuralSplitValue(i)
 		if _, err := sequential.Put([]byte(key), value); err != nil {
 			t.Fatalf("sequential put %q: %v", key, err)
 		}
@@ -350,7 +366,7 @@ func TestFilePrimarySyncBatchSplit(t *testing.T) {
 		}
 		if err := batched.Update(func(b *WriteBatch) error {
 			for i := start; i < end; i++ {
-				if err := b.Put([]byte(fmt.Sprintf("bk-%06d", i)), journalValue(i)); err != nil {
+				if err := b.Put([]byte(fmt.Sprintf("bk-%06d", i)), primaryStructuralSplitValue(i)); err != nil {
 					return err
 				}
 			}
@@ -405,7 +421,7 @@ func TestFilePrimarySyncSplitCrashReplay(t *testing.T) {
 	oracle := map[string]string{"seed": `{"v":0}`}
 	for i := 0; i < inserts; i++ {
 		key := fmt.Sprintf("key-%06d", i)
-		value := journalValue(i)
+		value := primaryStructuralSplitValue(i)
 		if _, err := coll.Put([]byte(key), value); err != nil {
 			t.Fatalf("put %q: %v", key, err)
 		}

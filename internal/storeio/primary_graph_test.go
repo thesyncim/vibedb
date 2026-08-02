@@ -15,7 +15,7 @@ type primaryGraphTestImage struct {
 	nodes   map[PageRef]*GlobalTabletCatalogNodeView
 	tablets map[PageRef]*GlobalTabletCatalogTabletRootView
 	anchors map[PageRef]*GlobalTabletCatalogAnchorView
-	leaves  map[PageRef]*CommonPrimaryUnifiedLeafView
+	leaves  map[PageRef]*CompactPrimaryStripeView
 }
 
 func buildPrimaryGraphTestImage(
@@ -87,7 +87,7 @@ func buildPrimaryGraphTestImage(
 		nodes:   make(map[PageRef]*GlobalTabletCatalogNodeView),
 		tablets: make(map[PageRef]*GlobalTabletCatalogTabletRootView),
 		anchors: make(map[PageRef]*GlobalTabletCatalogAnchorView),
-		leaves:  make(map[PageRef]*CommonPrimaryUnifiedLeafView),
+		leaves:  make(map[PageRef]*CompactPrimaryStripeView),
 	}, records
 }
 
@@ -161,12 +161,12 @@ func (image *primaryGraphTestImage) anchor(
 
 func (image *primaryGraphTestImage) leaf(
 	t testing.TB, route SegmentedTabletRouterRoute,
-) *CommonPrimaryUnifiedLeafView {
+) *CompactPrimaryStripeView {
 	t.Helper()
 	if view := image.leaves[route.Ref]; view != nil {
 		return view
 	}
-	view, err := OpenCommonPrimaryUnifiedLeaf(
+	view, err := OpenCompactPrimaryStripe(
 		image.page(t, route.Ref), image.root.StoreID,
 		route.Bucket, route.Ref, image.root.Generation,
 		CommonPrimaryLeafBounds{
@@ -216,11 +216,11 @@ func (image *primaryGraphTestImage) lookup(
 		t.Fatal("anchor leaf route")
 	}
 	leaf := image.leaf(t, leafRoute)
-	body, overflow, found := leaf.LookupBodyHashed(leafRoute.Hash, key)
-	if !found || overflow {
+	rank, found := leaf.FindKey(key)
+	if !found {
 		return nil, false
 	}
-	value, ok := leaf.AppendRowBody(nil, body)
+	value, ok := leaf.AppendValue(nil, rank)
 	return value, ok
 }
 
@@ -330,7 +330,7 @@ func TestBuildPrimaryGraphRoundTrip(t *testing.T) {
 						if !ok {
 							t.Fatal("leaf iteration route")
 						}
-						leaf, err := OpenCommonPrimaryUnifiedLeaf(
+						leaf, err := OpenCompactPrimaryStripe(
 							image.page(t, route.Ref), image.root.StoreID,
 							route.Bucket, route.Ref, image.root.Generation,
 							leafBounds,
@@ -339,10 +339,10 @@ func TestBuildPrimaryGraphRoundTrip(t *testing.T) {
 							t.Fatal(err)
 						}
 						for rank := 0; rank < leaf.Len(); rank++ {
-							key, body, overflow, ok := leaf.RowRawAt(rank)
-							value, rendered := leaf.AppendRowBody(nil, body)
-							if !ok || overflow || !rendered {
-								t.Fatal("unified leaf iteration")
+							key, keyOK := leaf.AppendKey(nil, rank)
+							value, valueOK := leaf.AppendValue(nil, rank)
+							if !keyOK || !valueOK {
+								t.Fatal("compact leaf iteration")
 							}
 							if at >= len(records) ||
 								!bytes.Equal(key, records[at].Key) ||

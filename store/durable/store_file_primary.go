@@ -234,9 +234,8 @@ func (c *Collection) containsPrimaryGraphLive(
 	return c.containsPrimaryGraphRouted(state, generation, key, router)
 }
 
-// appendPrimaryLeafValue reads one exact value from the sole admitted class-5
-// leaf grammar. Inline rows splice their canonical spelling into dst; overflow
-// rows resolve the existing chain.
+// appendPrimaryLeafValue reads one exact value from the sole compact stripe
+// grammar.
 func (c *Collection) appendPrimaryLeafValue(
 	dst []byte,
 	page []byte,
@@ -246,35 +245,34 @@ func (c *Collection) appendPrimaryLeafValue(
 	keyBytes []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) ([]byte, bool, error) {
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		return dst, false, fmt.Errorf(
-			"%w: non-unified primary leaf",
+			"%w: non-compact primary leaf",
 			storeio.ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, storeID, bucket, bounds,
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, storeID, bucket,
 	)
 	if !ok {
 		return dst, false, fmt.Errorf(
-			"%w: unified primary leaf",
+			"%w: compact primary leaf",
 			storeio.ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	body, overflow, found := uv.LookupBodyHashed(hash, keyBytes)
+	rank, found := stripe.FindKey(keyBytes)
 	if !found {
 		return dst, false, nil
 	}
-	if overflow {
-		out, err := c.appendPrimaryOverflowValue(
-			dst, storeio.DecodePrimaryOverflowRef(body), bounds,
-		)
-		if err != nil {
-			return dst, false, err
-		}
-		return out, true, nil
+	if ref, overflow := stripe.OverflowRef(rank); overflow {
+		out, overflowErr := c.appendPrimaryOverflowValue(dst, ref, bounds)
+		return out, overflowErr == nil, overflowErr
 	}
-	return uv.AppendAdmittedRowBody(dst, body), true, nil
+	out, decoded := stripe.AppendValue(dst, rank)
+	if !decoded {
+		return dst, false, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	return out, true, nil
 }
 
 func primaryLeafContains(
@@ -285,22 +283,22 @@ func primaryLeafContains(
 	key []byte,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) (bool, error) {
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		return false, fmt.Errorf(
-			"%w: non-unified primary leaf",
+			"%w: non-compact primary leaf",
 			storeio.ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, storeID, bucket, bounds,
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, storeID, bucket,
 	)
 	if !ok {
 		return false, fmt.Errorf(
-			"%w: unified primary leaf",
+			"%w: compact primary leaf",
 			storeio.ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	_, _, found := uv.LookupBodyHashed(hash, key)
+	_, found := stripe.FindKey(key)
 	return found, nil
 }
 

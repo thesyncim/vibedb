@@ -144,6 +144,10 @@ func (c *Collection) CreateIndexContext(
 		c.writer.Unlock()
 		return store.IndexInfo{}, store.ErrIndexExists
 	}
+	if err := c.repartitionPrimaryForExactIndexLocked(ctx); err != nil {
+		c.writer.Unlock()
+		return store.IndexInfo{}, err
+	}
 	candidateOptions := c.options.Options
 	candidateOptions.Indexes = append(
 		slices.Clone(c.options.Indexes), store.IndexDefinition{
@@ -303,6 +307,61 @@ func (c *Collection) CreateIndexContext(
 		}
 		c.recycleUnpublishedOnlineEpochLocked(prepared.epoch)
 		c.writer.Unlock()
+	}
+}
+
+// repartitionPrimaryForExactIndexLocked converts scan-oriented unindexed
+// stripes into the exact index's 256-slot geometry. It is a deterministic
+// foreground structural rewrite performed only at index creation; no
+// background compactor or compatibility representation is involved.
+func (c *Collection) repartitionPrimaryForExactIndexLocked(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		router := c.primaryRouter.Load()
+		if router == nil {
+			return storeio.ErrSegmentedTabletRouterCorrupt
+		}
+		var splitKey []byte
+		for rank := 0; rank < router.Len(); rank++ {
+			route, ok := router.RouteAtRank(rank)
+			if !ok {
+				return storeio.ErrSegmentedTabletRouterCorrupt
+			}
+			lease, err := router.AcquireLeaf(c.cache, route)
+			if err != nil {
+				return err
+			}
+			stripe, admitted := storeio.AdmittedCompactPrimaryStripe(
+				lease.Page(), c.storeID, route.Bucket,
+			)
+			if !admitted {
+				lease.Release()
+				return storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if stripe.Len() > storeio.CommonPrimaryLeafWideSlots {
+				var keyScratch [storeio.CommonPrimaryLeafMaxKeyBytes]byte
+				key, decoded := stripe.AppendKey(
+					keyScratch[:0], stripe.Len()/2,
+				)
+				if !decoded {
+					lease.Release()
+					return storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				splitKey = append(splitKey, key...)
+			}
+			lease.Release()
+			if splitKey != nil {
+				break
+			}
+		}
+		if splitKey == nil {
+			return nil
+		}
+		if err := c.structuralSplitPrimaryLeaf(splitKey); err != nil {
+			return err
+		}
 	}
 }
 
@@ -472,14 +531,10 @@ func (b *onlineIndexBuild) scanBucket(
 		bucket.termMasks[termID][quadrant] |= bit
 		return nil
 	}
-	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		lease.Page(), state.root.StoreID, route.Bucket, bounds,
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		lease.Page(), state.root.StoreID, route.Bucket,
 	)
-	if !ok {
-		return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
-	}
-	slots, ok := unified.PostingSlots()
-	if !ok {
+	if !ok || stripe.Len() > storeio.CommonPrimaryLeafWideSlots {
 		return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
 	}
 	overlay := c.primaryUnifiedOverlay
@@ -493,17 +548,19 @@ func (b *onlineIndexBuild) scanBucket(
 		)
 	}
 	baseRank, overlayAt := 0, 0
-	for baseRank < unified.Len() || overlayAt < overlayCount {
-		var baseKey, baseBody []byte
-		var baseOverflow bool
-		if baseRank < unified.Len() {
-			var rowOK bool
-			baseKey, baseBody, baseOverflow, rowOK =
-				unified.RowRawAt(baseRank)
-			if !rowOK {
+	var keyScratch [storeio.CommonPrimaryLeafMaxKeyBytes]byte
+	for baseRank < stripe.Len() || overlayAt < overlayCount {
+		var baseKey, baseValue []byte
+		baseOverflow := false
+		if baseRank < stripe.Len() {
+			var keyOK, valueOK bool
+			baseKey, keyOK = stripe.AppendKey(keyScratch[:0], baseRank)
+			baseValue, baseOverflow, valueOK = stripe.AppendRawValue(scratch[:0], baseRank)
+			if !keyOK || !valueOK {
 				return onlineIndexBucket{},
 					storeio.ErrPrimaryExactIndexCorrupt
 			}
+			scratch = baseValue
 		}
 		var record *primaryUnifiedOverlayRecord
 		var overlayKey []byte
@@ -518,7 +575,7 @@ func (b *onlineIndexBuild) scanBucket(
 		}
 		order := 0
 		switch {
-		case baseRank >= unified.Len():
+		case baseRank >= stripe.Len():
 			order = 1
 		case overlayAt >= overlayCount:
 			order = -1
@@ -526,14 +583,11 @@ func (b *onlineIndexBuild) scanBucket(
 			order = bytes.Compare(baseKey, overlayKey)
 		}
 		if order < 0 {
-			if baseOverflow {
-				err = visit(slots[baseRank], baseBody, true)
-			} else {
-				scratch = unified.AppendAdmittedRowBody(
-					scratch[:0], baseBody,
-				)
-				err = visit(slots[baseRank], scratch, false)
+			slot, slotOK := stripe.PostingSlot(baseRank)
+			if !slotOK {
+				return onlineIndexBucket{}, storeio.ErrPrimaryExactIndexCorrupt
 			}
+			err = visit(slot, baseValue, baseOverflow)
 			if err != nil {
 				return onlineIndexBucket{}, err
 			}

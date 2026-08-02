@@ -387,7 +387,7 @@ func (t *WriteTransaction) AllocateNear(kind PageKind, length uint32, logicalID,
 
 func (t *WriteTransaction) allocate(kind PageKind, length uint32, logicalID, hint uint64) (TransactionPage, error) {
 	validLength := validPhysicalPageSize(length)
-	if kind == PageOverflow {
+	if kind == PageOverflow || kind == PagePrimaryLeaf {
 		validLength = validPageExtentSize(kind, length)
 	}
 	if t == nil || !t.active || t.batch == nil || !validPageKind(kind) ||

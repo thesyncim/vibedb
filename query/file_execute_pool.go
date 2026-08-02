@@ -142,18 +142,19 @@ func (w *fileWorkspace) poolFor(workers int) *filePool {
 // size makes the pool ready to serve an execution of the given width.
 //
 // The three per-execution channels are rebuilt when the width changes rather
-// than kept at a high-water capacity, because the credit channel's capacity is
-// not a performance knob: it is the bound the batch ring's soundness rests on,
-// and the ring is sized from it. Keeping a wider execution's credit channel
-// would let a narrower one's scanner run further ahead than its own ring — and
-// would also spend more memory on in-flight batches than the caller's
-// MemoryBytes was divided up for. A width change is rare; a wrong answer is
+// than kept at a high-water capacity. The credit window is deliberately half
+// the worker count (one for a single-worker execution): it still overlaps scan
+// and reduction, while keeping the retained raw-batch ring bounded. The ring
+// is sized from that capacity, so keeping a wider execution's credit channel
+// would let a narrower one run farther ahead than its ring and would spend
+// memory beyond the batch budget. A width change is rare; a wrong answer is
 // not recoverable.
 func (pool *filePool) size(workers int) {
-	if cap(pool.credits) != workers*2 {
+	credits := max(1, workers/2)
+	if cap(pool.credits) != credits {
 		pool.jobs = make(chan fileBatch, workers)
 		pool.partials = make(chan filePartial, workers)
-		pool.credits = make(chan struct{}, workers*2)
+		pool.credits = make(chan struct{}, credits)
 	}
 	if pool.scanDone == nil {
 		pool.scanDone = make(chan fileScanResult, 1)

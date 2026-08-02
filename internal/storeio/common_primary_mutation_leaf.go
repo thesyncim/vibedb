@@ -5,10 +5,8 @@ import (
 	"fmt"
 )
 
-// PrimaryLeafMutationScratch owns the bounded temporary storage used by the
-// exceptional class-5 mutation bridge. The durable image is always class 5;
-// this workspace renders it into the proven raw envelope API used by the
-// structural mutation code until that code is converted to a native row view.
+// PrimaryLeafMutationScratch owns the bounded temporary storage used to render
+// a compact stripe into the existing in-memory mutation envelope.
 type PrimaryLeafMutationScratch struct {
 	records      []CommonPrimaryLeafRecord
 	heap         []byte
@@ -22,10 +20,10 @@ func NewPrimaryLeafMutationScratch(maxExtent int) *PrimaryLeafMutationScratch {
 		maxExtent = CommonPrimaryLeafWideBytes
 	}
 	return &PrimaryLeafMutationScratch{
-		records:      make([]CommonPrimaryLeafRecord, 0, CommonPrimaryLeafWideSlots),
+		records:      make([]CommonPrimaryLeafRecord, 0, CompactPrimaryStripeMaxRows),
 		heap:         make([]byte, 0, maxExtent),
-		spans:        make([][2]int, CommonPrimaryLeafWideSlots),
-		overflowRefs: make([]PageRef, CommonPrimaryLeafWideSlots),
+		spans:        make([][2]int, CompactPrimaryStripeMaxRows),
+		overflowRefs: make([]PageRef, CompactPrimaryStripeMaxRows),
 		page:         make([]byte, maxExtent),
 	}
 }
@@ -42,16 +40,21 @@ func (s *PrimaryLeafMutationScratch) reset(count int) bool {
 	return true
 }
 
-// PrimaryLeafClass reports the leaf class byte from a checksum-admitted
-// PagePrimaryLeaf. The durable format accepts only CommonPrimaryLeafUnified.
+// PrimaryLeafClass reports the durable leaf grammar from a checksum-admitted
+// PagePrimaryLeaf.
 func PrimaryLeafClass(page []byte) CommonPrimaryLeafClass {
 	header, ok := decodePageHeader(page)
 	if !ok {
 		return 0
 	}
 	payloadEnd := PageHeaderSize + int(header.PayloadLength)
-	if payloadEnd > len(page) ||
-		int(header.PayloadLength) < commonPrimaryLeafPayloadHeader {
+	if payloadEnd > len(page) || int(header.PayloadLength) < 4 {
+		return 0
+	}
+	if string(page[PageHeaderSize:PageHeaderSize+4]) == compactPrimaryMagic {
+		return CommonPrimaryLeafCompact
+	}
+	if int(header.PayloadLength) < commonPrimaryLeafPayloadHeader {
 		return 0
 	}
 	return CommonPrimaryLeafClass(page[PageHeaderSize+2] & 0x7f)
@@ -68,7 +71,7 @@ func AdmittedPrimaryLeafForMutation(
 	)
 }
 
-// AdmittedPrimaryLeafForMutationWithScratch renders a class-5 leaf into an
+// AdmittedPrimaryLeafForMutationWithScratch renders a compact stripe into an
 // owned raw mutation workspace. The returned bytes never alias the admitted
 // durable page, so callers must copy-on-write.
 func AdmittedPrimaryLeafForMutationWithScratch(
@@ -78,28 +81,43 @@ func AdmittedPrimaryLeafForMutationWithScratch(
 	bounds CommonPrimaryLeafBounds,
 	scratch *PrimaryLeafMutationScratch,
 ) (CommonPrimaryLeafView, error) {
-	if PrimaryLeafClass(page) != CommonPrimaryLeafUnified {
+	if PrimaryLeafClass(page) != CommonPrimaryLeafCompact {
 		return CommonPrimaryLeafView{}, fmt.Errorf(
-			"%w: non-unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+			"%w: non-compact primary leaf", ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, seed, bucket, bounds)
+	stripe, ok := AdmittedCompactPrimaryStripe(page, seed, bucket)
 	if !ok {
 		return CommonPrimaryLeafView{}, fmt.Errorf(
-			"%w: unified primary leaf", ErrCommonPrimaryLeafCorrupt,
+			"%w: compact primary leaf", ErrCommonPrimaryLeafCorrupt,
 		)
 	}
 	var records []CommonPrimaryLeafRecord
 	if scratch != nil {
-		if err := uv.renderRecordsInto(scratch); err != nil {
-			return CommonPrimaryLeafView{}, err
-		}
-		records = scratch.records
-	} else {
 		var err error
-		records, _, err = uv.RenderRecords(nil, nil)
+		records, err = stripe.RenderRecordsWithScratch(scratch)
 		if err != nil {
 			return CommonPrimaryLeafView{}, err
+		}
+	} else {
+		records = make([]CommonPrimaryLeafRecord, stripe.Len())
+		for row := range records {
+			key, decoded := stripe.AppendKey(nil, row)
+			if !decoded {
+				return CommonPrimaryLeafView{}, ErrCommonPrimaryLeafCorrupt
+			}
+			value := CommonPrimaryLeafValue{}
+			if ref, overflow := stripe.OverflowRef(row); overflow {
+				value.Overflow = ref
+			} else {
+				value.Inline, decoded = stripe.AppendValue(nil, row)
+				if !decoded {
+					return CommonPrimaryLeafView{}, ErrCommonPrimaryLeafCorrupt
+				}
+			}
+			records[row] = CommonPrimaryLeafRecord{
+				Key: key, Value: value,
+			}
 		}
 	}
 	for _, attempt := range [...]struct {
@@ -136,7 +154,7 @@ func AdmittedPrimaryLeafForMutationWithScratch(
 		if _, err := EncodeCommonPrimaryLeaf(
 			dst, attempt.class,
 			CommonPrimaryLeafHeader{
-				StoreID: seed, Generation: uv.Header().Generation,
+				StoreID: seed, Generation: stripe.Header().Generation,
 				Bucket: bucket, PageSize: attempt.pageSize,
 			},
 			seed, records, bounds,

@@ -248,8 +248,8 @@ func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 	}
 	if _, err := tx.Allocate(
 		PagePrimaryLeaf, 3*testSuperblockPageSize, 0,
-	); err == nil {
-		t.Fatal("non-power-of-two hybrid primary extent accepted")
+	); err != nil {
+		t.Fatalf("exact compact primary extent rejected: %v", err)
 	}
 	if err := tx.Abort(); err != nil {
 		t.Fatal(err)
@@ -300,8 +300,13 @@ func TestWriteTransactionAllowsExactPrimaryValueExtents(t *testing.T) {
 			wantOffset += uint64(length)
 		}
 	}
+	if _, err := tx.Allocate(
+		PagePrimaryLeaf, 3*testSuperblockPageSize, 0,
+	); err != nil {
+		t.Fatalf("exact compact primary allocation = %v", err)
+	}
 	for _, kind := range []PageKind{
-		PageIndexPosting, PageCatalogSegment, PagePrimaryLeaf,
+		PageIndexPosting, PageCatalogSegment,
 		PageFreeImage, PageFreeDelta, PageFreeIndex,
 	} {
 		if _, err := tx.Allocate(

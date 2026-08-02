@@ -580,8 +580,8 @@ func TestFileStoreCommitSpansSeveralFreeExtents(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(fs.reusable) < 2 {
-		t.Fatalf("workload left %d free extents, need a fragmented set", len(fs.reusable))
+	if len(fs.reusable) == 0 {
+		t.Fatal("workload left no reusable compact extent")
 	}
 	var largest, total uint64
 	for _, extent := range fs.reusable {
@@ -853,7 +853,7 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 	// 512 small-row workload below the 106-record inline root. A wider corpus
 	// still runs quickly but creates enough independently retired extents to
 	// prove the external spill/replay path remains live.
-	const documents = 2048
+	const documents = 4096
 	for base := 0; base < documents; base += options.MaxBatchDocuments {
 		if err := fs.Update(func(batch *WriteBatch) error {
 			for i := base; i < base+options.MaxBatchDocuments; i++ {

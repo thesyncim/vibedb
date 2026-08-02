@@ -18,15 +18,15 @@ import (
 const vibeDBKeyBytes = 256
 
 type vibeDBEngine struct {
-	cfg     Config
-	path    string
-	file    *os.File
-	coll    *durable.Collection
-	snap    *durable.Snapshot
-	exec    query.Exec
-	scratch []byte
-	keyBuf  [vibeDBKeyBytes]byte
-	scan    *vibeDBScanState
+	cfg         Config
+	path        string
+	file        *os.File
+	coll        *durable.Collection
+	snap        *durable.Snapshot
+	exec        query.Exec
+	scratch     []byte
+	keyBuf      [vibeDBKeyBytes]byte
+	scan        *vibeDBScanState
 }
 
 func vibeDBPointKey(
@@ -214,17 +214,12 @@ func (v *vibeDBEngine) Load(docs []Doc) error {
 		return err
 	}
 	v.file = f
-	// A secondary index loads through the primary mutation path, which maintains
-	// the exact secondary index incrementally, one publish per Put -- the same
-	// path the indexed mutation workload exercises. Both this path and the bulk
-	// CreateFromPrimary cutover share one ceiling: a physical index's whole
-	// posting set serialises into a single term leaf (65,535 postings / 64 KiB),
-	// so a low-cardinality corpus spread across enough documents overruns it on
-	// either path and surfaces as ErrPrimaryCutoverUnsupported rather than a
-	// silent fallback. Until multi-leaf term indexes land (loadBulk's future-work
-	// note), the indexed configuration loads through Put and callers size the
-	// indexed corpus below that ceiling.
-	if v.cfg.PutLoop || v.cfg.Indexed {
+	// PutLoop deliberately exercises one acknowledged mutation per document.
+	// Ordinary indexed loads use CreateFromPrimary: the durable exact index now
+	// cuts giant low-cardinality terms into spanned leaves, so routing a large
+	// indexed corpus through the old replay workaround would hide the scalable
+	// bulk representation and make the read benchmark artificially unavailable.
+	if v.cfg.PutLoop {
 		return v.loadByPut(f, docs)
 	}
 	return v.loadBulk(f, docs)
@@ -258,13 +253,10 @@ func (v *vibeDBEngine) loadBulk(f *os.File, docs []Doc) error {
 	// resident router, journal-wired acknowledgements, and on-graph exact
 	// secondary-index posting tiles). Every corpus builds through it.
 	//
-	// The exact-index format holds one physical index's postings in a single term
-	// leaf (bounded to 65,535 postings / 64 KiB). A large low-cardinality corpus
-	// spreads one term across enough posting tiles to exceed that, which the bulk
-	// build reports as ErrPrimaryCutoverUnsupported. Multi-leaf term indexes are
-	// future work; until they land the harness sizes its indexed configurations
-	// below the single-leaf posting ceiling, and an oversized index surfaces here
-	// as that hard error rather than a silent chunk-layout fallback.
+	// The exact-index format cuts large low-cardinality terms into deterministic
+	// spanned leaves. Keeping this bulk path here is important: replaying one Put
+	// per document would measure mutation durability and conceal the scalable
+	// multi-leaf representation that read-heavy log workloads depend on.
 	if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
 		return err
 	}
@@ -413,7 +405,9 @@ func (v *vibeDBEngine) runFilter(value string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	q := query.Select(query.Count()).Where(query.Cmp(FilterField, query.Eq, value))
+	q := query.Select(query.Count()).Where(
+		query.Cmp(FilterField, query.Eq, value),
+	)
 	if err := q.RunInto(&v.exec, query.FromFile(snap)); err != nil {
 		return 0, err
 	}

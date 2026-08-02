@@ -216,34 +216,9 @@ func (c *Collection) preparePrimaryNativeFoldWave(
 	}
 }
 
-// primaryNativeFoldPatchSourceSafe proves that copying an admitted leaf cannot
-// carry a never-durable overflow reference into the transaction. Sources below
-// the checkpoint base already contain staged refs; a volatile source is safe
-// only when every row is inline.
-func primaryNativeFoldPatchSourceSafe(
-	unified *storeio.CommonPrimaryUnifiedLeafView,
-	ref storeio.PageRef,
-	baseFileEnd uint64,
-) bool {
-	if unified == nil {
-		return false
-	}
-	if ref.Offset < baseFileEnd {
-		return true
-	}
-	for rank := 0; rank < unified.Len(); rank++ {
-		_, _, overflow, ok := unified.RowRawAt(rank)
-		if !ok || overflow {
-			return false
-		}
-	}
-	return true
-}
-
-// preparePrimaryNativeFold recognizes exactly the all-Put, existing-key native
-// class-5 certificate. Inserts, deletes, overflow remints, shape changes, and
-// codec declines leave native false and are handled by the unchanged serial
-// planner. No transaction state or parent route is touched here.
+// preparePrimaryNativeFold admits the compact source in parallel, but leaves
+// encoding to the deterministic serial foreground fold. The retired class-5
+// byte-patcher cannot safely patch column streams in place.
 func (c *Collection) preparePrimaryNativeFold(
 	context *primaryNativeFoldContext,
 	pending *filePrimaryPendingParent,
@@ -278,60 +253,20 @@ func (c *Collection) preparePrimaryNativeFold(
 		return
 	}
 	defer lease.Release()
-	if storeio.PrimaryLeafClass(lease.Page()) !=
-		storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(lease.Page()) != storeio.CommonPrimaryLeafCompact {
+		context.err = storeio.ErrCommonPrimaryLeafCorrupt
 		return
 	}
-	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+	_, ok := storeio.AdmittedCompactPrimaryStripe(
 		lease.Page(), c.storeID, pending.leafRoute.Bucket,
-		c.primaryLeafBounds(visible),
 	)
 	if !ok {
 		context.err = fmt.Errorf(
-			"%w: checkpoint unified bucket=%d ref=%+v header=%+v bytes=%d",
+			"%w: checkpoint compact bucket=%d ref=%+v header=%+v bytes=%d",
 			storeio.ErrCommonPrimaryLeafCorrupt,
 			pending.leafRoute.Bucket, pending.volatileRef,
 			lease.Header(), len(lease.Page()),
 		)
-		return
-	}
-
-	replacements, allPuts, err :=
-		c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
-			context.replacements[:0], pending.leafRoute.Bucket,
-			generation,
-		)
-	if err != nil {
-		context.err = err
-		return
-	}
-	context.replacements = replacements
-	context.inspected = true
-	context.allPuts = allPuts
-	if !allPuts || len(replacements) == 0 {
-		return
-	}
-	context.sourceSafe = primaryNativeFoldPatchSourceSafe(
-		&unified, pending.volatileRef, base.fileEnd,
-	)
-	if !context.sourceSafe {
-		return
-	}
-	header := unified.Header()
-	header.Generation = generation
-	image, patchable, err := unified.PatchPlanScalarReplacements(
-		context.page, header, replacements, context.builder,
-	)
-	if err != nil {
-		context.err = err
-		return
-	}
-	if patchable {
-		if hook := c.primaryNativeFoldPrecomputeHook; hook != nil {
-			hook(pending.leafRoute.Bucket)
-		}
-		context.image = image
-		context.native = true
 	}
 }
 

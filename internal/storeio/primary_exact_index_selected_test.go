@@ -12,22 +12,21 @@ func selectedPostingTestMask(
 	ranks []int,
 ) [4]uint64 {
 	t.Helper()
-	view, ok := AdmittedCommonPrimaryUnifiedLeaf(
-		page, unifiedTestStoreID(), 0, unifiedTestBounds(),
+	view, ok := AdmittedCompactPrimaryStripe(
+		page, unifiedTestStoreID(), 0,
 	)
 	if !ok {
-		t.Fatal("AdmittedCommonPrimaryUnifiedLeaf")
-	}
-	slots, ok := view.PostingSlots()
-	if !ok {
-		t.Fatal("PostingSlots")
+		t.Fatal("AdmittedCompactPrimaryStripe")
 	}
 	var selected [4]uint64
 	for _, rank := range ranks {
 		if rank < 0 || rank >= view.Len() {
 			t.Fatalf("rank %d outside [0,%d)", rank, view.Len())
 		}
-		slot := slots[rank]
+		slot, ok := view.PostingSlot(rank)
+		if !ok {
+			t.Fatalf("posting slot at rank %d", rank)
+		}
 		selected[slot>>6] |= uint64(1) << uint(slot&63)
 	}
 	return selected
@@ -40,17 +39,23 @@ func encodeSelectedPostingTestLeaf(
 	t.Helper()
 	storeID := unifiedTestStoreID()
 	builder := NewUnifiedPrimaryLeafBuilder()
-	count, extent, err := planUnifiedLeaf(builder, storeID, records)
+	count := min(len(records), CommonPrimaryLeafWideSlots)
+	if err := PlaceCommonPrimaryLeafRecords(CommonPrimaryLeafWide, storeID, records[:count]); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := BuildCompactPrimaryStripePayload(records[:count], builder)
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := EncodeCommonPrimaryUnifiedLeaf(
+	need := PageHeaderSize + len(payload) + PageTrailerSize
+	extent := (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+	page, err := EncodeCompactPrimaryStripe(
 		make([]byte, extent),
 		CommonPrimaryLeafHeader{
 			StoreID: storeID, Generation: 1, Bucket: 0,
 			PageSize: uint32(extent),
 		},
-		storeID, records[:count], unifiedTestBounds(), builder,
+		records[:count], builder,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -70,14 +75,14 @@ func TestVisitPrimaryLeafSelectedPostingRowsMatchesFilteredFullVisit(t *testing.
 			selected := selectedPostingTestMask(t, page, ranks)
 			// Dead directory bits must remain harmless even when a caller has no
 			// exact-index epoch available to pre-validate liveness.
-			view, ok := AdmittedCommonPrimaryUnifiedLeaf(
-				page, unifiedTestStoreID(), 0, unifiedTestBounds(),
+			view, ok := AdmittedCompactPrimaryStripe(
+				page, unifiedTestStoreID(), 0,
 			)
 			if !ok {
 				t.Fatal("AdmittedCommonPrimaryUnifiedLeaf")
 			}
 			for slot := 0; slot < CommonPrimaryLeafWideSlots; slot++ {
-				if _, occupied := view.env.slotRank(uint8(slot)); !occupied {
+				if _, occupied := view.RankAtSlot(uint8(slot)); !occupied {
 					selected[slot>>6] |= uint64(1) << uint(slot&63)
 					break
 				}

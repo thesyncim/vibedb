@@ -322,8 +322,8 @@ func TestFilePrimarySnapshotRouteFlipBeforeLeafAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire snapshot route after flip: %v", err)
 	}
-	if _, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		lease.Page(), coll.storeID, bucket, coll.primaryLeafBounds(snapshot.state),
+	if _, admitted := storeio.AdmittedCompactPrimaryStripe(
+		lease.Page(), coll.storeID, bucket,
 	); !admitted {
 		lease.Release()
 		t.Fatal("old snapshot leaf no longer admitted")

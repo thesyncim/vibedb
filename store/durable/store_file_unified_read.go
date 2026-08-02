@@ -11,9 +11,10 @@ import (
 // never per store — to the render path for trivial rows, container targets,
 // overflow chains, and non-unified leaves.
 
-// EqFilter is a reusable canonical-spelling equality predicate for
-// Snapshot.FilterEqCount. It is single-consumer; reuse across scans and
-// snapshots of the same collection amortizes all resolution scratch.
+// EqFilter is a reusable equality predicate for Snapshot.FilterEqCount. Its
+// constructor selects canonical-spelling or exact scalar-value semantics. It
+// is single-consumer; reuse across scans and snapshots of the same collection
+// amortizes all resolution scratch.
 type EqFilter struct {
 	inner *storeio.UnifiedEqFilter
 }
@@ -22,6 +23,17 @@ type EqFilter struct {
 // JSON spelling of one comparand value (canonicalized internally).
 func NewEqFilter(path string, needleJSON []byte) (*EqFilter, error) {
 	inner, err := storeio.NewUnifiedEqFilter([]byte(path), needleJSON)
+	if err != nil {
+		return nil, err
+	}
+	return &EqFilter{inner: inner}, nil
+}
+
+// NewScalarEqFilter builds an equality filter with exact JSON scalar value
+// semantics. It differs from NewEqFilter only for numbers: equivalent decimal
+// spellings such as 1, 1.0, and 1e0 compare equal without binary rounding.
+func NewScalarEqFilter(path string, needleJSON []byte) (*EqFilter, error) {
+	inner, err := storeio.NewUnifiedScalarEqFilter([]byte(path), needleJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -37,8 +49,8 @@ type FilterEqResult struct {
 	Scanned  int
 }
 
-// FilterEqCount scans every live document and counts those whose value at
-// the filter's path equals the filter's needle by canonical spelling.
+// FilterEqCount scans every live document and counts those whose value at the
+// filter's path equals its needle under the filter constructor's semantics.
 // Unified leaves evaluate rows from tokens; every row the
 // token lane cannot decide — and every row of a non-unified leaf — renders
 // into reused scratch and evaluates there. Overflow documents reassemble
@@ -192,72 +204,26 @@ func (s *Snapshot) AppendField(
 	}
 	defer leafLease.Release()
 	page := leafLease.Page()
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		return s.appendFieldFallback(dst, p, key)
 	}
-	bounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           state.fileEnd,
-		NextLogicalID:     state.root.NextLogicalID,
-		AllocationQuantum: state.root.PageSize,
-	}
-	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, state.root.StoreID, route.Bucket, bounds,
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, state.root.StoreID, route.Bucket,
 	)
 	if !ok {
 		return dst, false, fmt.Errorf(
 			"%w: unified primary leaf", storeio.ErrCommonPrimaryLeafCorrupt,
 		)
 	}
-	body, overflow, found := uv.LookupBodyHashed(route.Hash, key)
+	rank, found := stripe.FindKey(key)
 	if !found {
 		return dst, false, nil
 	}
-	if overflow {
-		p.doc, err = s.collection.appendPrimaryOverflowValue(
-			p.doc[:0], storeio.DecodePrimaryOverflowRef(body), bounds,
-		)
-		if err != nil {
-			return dst, false, err
-		}
-		return p.appendPathOf(dst, p.doc)
+	out, found, supported := stripe.AppendResolvedHole(dst, rank, &p.resolver)
+	if supported {
+		return out, found, nil
 	}
-	template, ok := uv.RowTemplate(body)
-	if !ok {
-		return dst, false, fmt.Errorf(
-			"%w: unified row body", storeio.ErrCommonPrimaryLeafCorrupt,
-		)
-	}
-	if template < 0 {
-		// Trivial row: the body after the tag is the canonical document.
-		return p.appendPathOf(dst, body[1:])
-	}
-	// The routed PageRef already names the leaf's immutable identity
-	// (LogicalID, Generation) — no page re-decode needed for the cache key.
-	cacheKey := fieldProbeKey{
-		generation: route.Ref.Generation,
-		logicalID:  route.Ref.LogicalID,
-		template:   uint8(template),
-	}
-	hole, cached := p.cache[cacheKey]
-	if !cached {
-		hole = int16(p.resolver.Resolve(&uv, template))
-		p.cache[cacheKey] = hole
-	}
-	if hole == storeio.UnifiedHoleAbsent {
-		return dst, false, nil
-	}
-	if hole < 0 {
-		// Container target: render this one row and walk it.
-		p.doc = uv.AppendAdmittedRowBody(p.doc[:0], body)
-		return p.appendPathOf(dst, p.doc)
-	}
-	tok, ok := uv.RowToken(body, int(hole))
-	if !ok {
-		return dst, false, fmt.Errorf(
-			"%w: unified row token", storeio.ErrCommonPrimaryLeafCorrupt,
-		)
-	}
-	return storeio.AppendUnifiedRowToken(dst, tok), true, nil
+	return s.appendFieldFallback(dst, p, key)
 }
 
 // appendFieldFallback is the whole-document path: AppendRaw into the probe's

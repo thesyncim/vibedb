@@ -29,7 +29,7 @@ const (
 	// A lexical-median split of a full leaf leaves both halves with ample
 	// slack, so one split makes room; the small bound only guards a pathological
 	// placement cycle rather than looping forever.
-	primaryStructuralRetryLimit = 4
+	primaryStructuralRetryLimit = 16
 )
 
 // ErrPrimaryMacroSplitRequired reports that a structural transaction cannot
@@ -237,29 +237,26 @@ func (c *Collection) fitStructuralLeaf(
 	bucket storeio.BucketID,
 	rows []storeio.CommonPrimaryLeafRecord,
 ) (int, error) {
-	bounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           tx.FileEnd(),
-		NextLogicalID:     tx.NextLogicalID(),
-		AllocationQuantum: uint32(c.options.PageSize),
-	}
-	if err := storeio.PlaceCommonPrimaryLeafRecords(
-		storeio.CommonPrimaryLeafWide, c.storeID, rows,
-	); err != nil {
-		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
-			errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-			return 0, errors.Join(
-				ErrPrimaryLeafSplitRequired,
-				storeio.ErrCommonPrimaryLeafFull,
-			)
+	if len(rows) <= storeio.CommonPrimaryLeafWideSlots {
+		if err := storeio.PlaceCommonPrimaryLeafRecords(
+			storeio.CommonPrimaryLeafWide, c.storeID, rows,
+		); err != nil {
+			if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
+				errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+				return 0, errors.Join(
+					ErrPrimaryLeafSplitRequired,
+					storeio.ErrCommonPrimaryLeafFull,
+				)
+			}
+			return 0, err
 		}
-		return 0, err
 	}
-	image, err := storeio.EncodeBestCommonPrimaryUnifiedLeaf(
+	image, err := storeio.EncodeBestCompactPrimaryStripe(
 		c.primaryLeafScratch,
 		storeio.CommonPrimaryLeafHeader{
 			StoreID: c.storeID, Generation: generation, Bucket: bucket,
 		},
-		c.storeID, rows, bounds, c.primaryUnifiedBuilder,
+		c.storeID, rows, c.primaryUnifiedBuilder,
 	)
 	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
 		return 0, errors.Join(
@@ -755,7 +752,7 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 		return err
 	}
 	var path filePrimaryMutationPath
-	if err := c.acquirePrimaryMutationPath(
+	if err := c.acquirePrimaryRoutingPath(
 		&path, state, keyBytes, route,
 	); err != nil {
 		return err
@@ -776,7 +773,18 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 		func(tx *storeio.WriteTransaction) (
 			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef, error,
 		) {
-			rows := c.extractLeafRecords(&path.leaf)
+			stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+				path.leafLease.Page(), c.storeID, route.Bucket,
+			)
+			if !ok {
+				return nil, nil, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			rows, renderErr := stripe.RenderRecordsWithScratch(
+				c.primaryLeafMutationScratch,
+			)
+			if renderErr != nil {
+				return nil, nil, renderErr
+			}
 			if len(rows) < 2 {
 				return nil, nil, fmt.Errorf(
 					"%w: split needs at least two rows", storeio.ErrInvalidWrite,
@@ -890,7 +898,7 @@ func (c *Collection) structuralRemoveEmptyPrimaryLeaf(keyBytes []byte) error {
 	return nil
 }
 
-// primaryLeafEmpty checks the resident unified image plus its pending overlay
+// primaryLeafEmpty checks the resident compact image plus its pending overlay
 // without flushing. Most deletes leave a non-empty leaf and stop here.
 func (c *Collection) primaryLeafEmpty(keyBytes []byte) (bool, error) {
 	state := c.state.Load()
@@ -905,8 +913,8 @@ func (c *Collection) primaryLeafEmpty(keyBytes []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	view, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		lease.Page(), c.storeID, route.Bucket, c.primaryLeafBounds(state),
+	view, ok := storeio.AdmittedCompactPrimaryStripe(
+		lease.Page(), c.storeID, route.Bucket,
 	)
 	if !ok {
 		lease.Release()
@@ -970,13 +978,20 @@ func (c *Collection) putPrimaryWithSplit(
 	for attempt := 0; ; attempt++ {
 		created, err = c.putPrimary(key, src)
 		if !errors.Is(err, ErrPrimaryLeafSplitRequired) {
+			if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+				return created, fmt.Errorf(
+					"put primary attempt %d without split signal: %w", attempt, err,
+				)
+			}
 			return created, err
 		}
 		if attempt >= primaryStructuralRetryLimit {
 			return false, err
 		}
 		if splitErr := c.splitPrimaryLeafForKey(key); splitErr != nil {
-			return false, errors.Join(err, splitErr)
+			return false, errors.Join(
+				err, fmt.Errorf("split primary after attempt %d: %w", attempt, splitErr),
+			)
 		}
 	}
 }

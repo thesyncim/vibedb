@@ -51,6 +51,9 @@ const (
 	// dispatch on the class byte; unlike classes 3/4 its posting-stable slot is
 	// the envelope's stable cuckoo hash slot (one-slot discipline).
 	CommonPrimaryLeafUnified CommonPrimaryLeafClass = 5
+	// CommonPrimaryLeafCompact is the development compact-stripe format. It
+	// replaces class 5 as the only durable primary leaf grammar.
+	CommonPrimaryLeafCompact CommonPrimaryLeafClass = 6
 
 	// commonPrimaryUnifiedHeaderBytes frames the two unified sections. The
 	// counts are duplicated from the section directories so an open can bound
@@ -151,6 +154,7 @@ type UnifiedPrimaryLeafBuilder struct {
 	dictionaryID map[string]uint8
 	patchValues  []unifiedPrimaryPatchValueDelta
 	patchInteger [24]byte
+	compact      compactPrimaryBuildScratch
 }
 
 // NewUnifiedPrimaryLeafBuilder returns a builder with modest starting scratch.
@@ -1013,10 +1017,8 @@ func encodeCommonPrimaryUnifiedLeaf(
 }
 
 // EncodeBestCommonPrimaryUnifiedLeaf encodes the complete row set through the
-// class-5 planner, choosing its smallest winning extent. Unlike the bulk
-// planner it does not accept a prefix: every supplied row must fit one leaf.
-// Checkpoint folds use this entry so bulk and mutation history share one
-// deterministic encoder.
+// class-5 planner. It remains an internal legacy-codec test helper; production
+// storage uses EncodeBestCompactPrimaryStripe.
 func EncodeBestCommonPrimaryUnifiedLeaf(
 	dst []byte,
 	header CommonPrimaryLeafHeader,
@@ -1031,9 +1033,7 @@ func EncodeBestCommonPrimaryUnifiedLeaf(
 	if err := builder.extract(records); err != nil {
 		return nil, err
 	}
-	if len(records) > builder.rawRenderCapacity(
-		CommonPrimaryLeafMaxExtentBytes,
-	) {
+	if len(records) > builder.rawRenderCapacity(CommonPrimaryLeafMaxExtentBytes) {
 		return nil, ErrCommonPrimaryLeafFull
 	}
 	plan, err := builder.planPrefix(len(records))
@@ -1047,11 +1047,8 @@ func EncodeBestCommonPrimaryUnifiedLeaf(
 			continue
 		}
 		capacity := candidate - PageHeaderSize - PageTrailerSize
-		layout := commonPrimaryLeafLayoutFor(
-			CommonPrimaryLeafWide, len(records), candidate,
-		)
-		if layout.heapStart != 0 &&
-			layout.heapStart+plan.contentBytes <= capacity {
+		layout := commonPrimaryLeafLayoutFor(CommonPrimaryLeafWide, len(records), candidate)
+		if layout.heapStart != 0 && layout.heapStart+plan.contentBytes <= capacity {
 			extent = candidate
 			break
 		}

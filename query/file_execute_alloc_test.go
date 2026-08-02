@@ -290,8 +290,9 @@ func TestFileExecutionSteadyAllocs(t *testing.T) {
 // slot, the per-batch row headers — is reused by sequence modulo the ring
 // length, and the ring is only sound because the credit protocol guarantees a
 // sequence has been scanned, reduced, and consumed before its slot comes round
-// again. One worker makes the ring three slots wide and a small BatchRows makes
-// the corpus wrap it dozens of times, so an off-by-one in that argument
+// again. One worker makes the ring two slots wide under the executor's bounded
+// credit window, and a small BatchRows makes the corpus wrap it dozens of times,
+// so an off-by-one in that argument
 // corrupts a row rather than staying theoretical. The ordering and LIMIT make
 // the corruption observable: rows are compared by content, not counted.
 func TestRunFileSnapshotBatchRingReuseDifferential(t *testing.T) {

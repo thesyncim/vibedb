@@ -226,7 +226,7 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 		return true
 	}
 	switch kind {
-	case PageOverflow:
+	case PageOverflow, PagePrimaryLeaf:
 		return size >= physicalPageQuantum && size%physicalPageQuantum == 0
 	default:
 		return false

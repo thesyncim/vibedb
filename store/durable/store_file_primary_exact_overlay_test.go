@@ -63,11 +63,11 @@ func buildTemplateHeavyOverlayCollection(
 			t.Fatal(err)
 		}
 		if storeio.PrimaryLeafClass(lease.Page()) ==
-			storeio.CommonPrimaryLeafUnified {
+			storeio.CommonPrimaryLeafCompact {
 			unified++
 		} else {
 			lease.Release()
-			t.Fatal("non-unified primary leaf")
+			t.Fatal("non-compact primary leaf")
 		}
 		lease.Release()
 	}
@@ -95,7 +95,7 @@ func findTemplateLeafKeys(
 			t.Fatal(err)
 		}
 		if storeio.PrimaryLeafClass(lease.Page()) !=
-			storeio.CommonPrimaryLeafUnified {
+			storeio.CommonPrimaryLeafCompact {
 			lease.Release()
 			continue
 		}

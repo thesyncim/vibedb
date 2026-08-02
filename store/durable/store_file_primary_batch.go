@@ -667,11 +667,6 @@ func (c *Collection) buildPrimaryBatchLeaf(
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
 	inputBounds := c.primaryLeafBounds(state)
-	outputBounds := storeio.CommonPrimaryLeafBounds{
-		FileEnd:           c.batchPrimaryOverflowFileEnd,
-		NextLogicalID:     c.batchPrimaryNextLogicalID,
-		AllocationQuantum: state.root.PageSize,
-	}
 	var (
 		path  filePrimaryMutationPath
 		lease storeio.PageLease
@@ -696,16 +691,16 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		leaf.pending = c.primaryPendingParents[leaf.pendingIndex]
 		page = lease.Page()
 	}
-	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
 		return nil, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, c.storeID, leaf.resident.Bucket, inputBounds,
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+		page, c.storeID, leaf.resident.Bucket,
 	)
 	if !ok {
 		return nil, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	baseRows, err := unified.RenderRecordsWithScratch(c.primaryLeafMutationScratch)
+	baseRows, err := stripe.RenderRecordsWithScratch(c.primaryLeafMutationScratch)
 	if err != nil {
 		return nil, err
 	}
@@ -749,13 +744,13 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		return nil, err
 	}
 	leaf.frameGen = baseGen + 1
-	image, err := storeio.EncodeBestCommonPrimaryUnifiedLeaf(
+	image, err := storeio.EncodeBestCompactPrimaryStripe(
 		c.primaryLeafScratch,
 		storeio.CommonPrimaryLeafHeader{
 			StoreID: c.storeID, Generation: leaf.frameGen,
 			Bucket: leaf.resident.Bucket,
 		},
-		c.storeID, final, outputBounds, c.primaryUnifiedBuilder,
+		c.storeID, final, c.primaryUnifiedBuilder,
 	)
 	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
 		c.primaryLeafSplitRequired.Add(1)

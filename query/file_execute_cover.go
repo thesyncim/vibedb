@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"math/bits"
 
 	"github.com/thesyncim/vibedb/store"
@@ -15,6 +16,12 @@ type directFileIndexStats struct {
 	postingPages int
 	chunks       int
 	bounded      bool
+}
+
+type directFileTokenStats struct {
+	scanned  uint64
+	token    uint64
+	fallback uint64
 }
 
 // runDirectFileIndexedCount recognizes COUNT(*) over a predicate whose entire
@@ -152,4 +159,70 @@ func (p *plan) runDirectFileAggregate(
 		return 0, true, err
 	}
 	return 0, true, nil
+}
+
+// runDirectFileTokenScalarCount answers the common unindexed
+// COUNT(*) WHERE field = scalar shape by scanning durable leaf tokens in
+// storage order. This is not candidate pruning: FilterEqCount visits every
+// live row, resolves a field once per leaf template, and reports each row that
+// had to fall back to canonical document rendering.
+//
+// The storage token comparator has exact query equality semantics for strings,
+// booleans, and numbers, including equivalent decimal spellings without
+// float64 rounding. A configured cancellation flag declines this lane until
+// the storage cursor exposes cooperative checkpoints.
+func (p *plan) runDirectFileTokenScalarCount(
+	snapshot *durable.Snapshot,
+	e *Exec,
+) (directFileTokenStats, bool, error) {
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return directFileTokenStats{}, true, err
+	}
+	path, lit, ok := p.scalarCountEqualityPath()
+	if !ok || e.Options.Cancel != nil ||
+		(lit.kind != kindString && lit.kind != kindBool && lit.kind != kindNumber) {
+		return directFileTokenStats{}, false, nil
+	}
+	if p.hasLimit && p.limit == 0 {
+		return directFileTokenStats{}, true, prepareResult(&e.Result, p, 0)
+	}
+	if snapshot.Len() > uint64(^uint(0)>>1) {
+		return directFileTokenStats{}, true, store.ErrTooLarge
+	}
+	filter, err := e.file.tokenEqFilterFor(path.indexPath(), p.where.needle.Src)
+	if err != nil {
+		return directFileTokenStats{}, true, err
+	}
+	filtered, err := snapshot.FilterEqCount(filter)
+	if err != nil {
+		return directFileTokenStats{}, true, err
+	}
+	if filtered.Scanned != int(snapshot.Len()) ||
+		filtered.Fallback < 0 || filtered.Fallback > filtered.Scanned ||
+		filtered.Matched < 0 || filtered.Matched > filtered.Scanned {
+		return directFileTokenStats{}, true, fmt.Errorf(
+			"query: durable token filter returned invalid progress: scanned=%d fallback=%d matched=%d rows=%d",
+			filtered.Scanned, filtered.Fallback, filtered.Matched, snapshot.Len(),
+		)
+	}
+	stats := directFileTokenStats{
+		scanned:  uint64(filtered.Scanned),
+		token:    uint64(filtered.Scanned - filtered.Fallback),
+		fallback: uint64(filtered.Fallback),
+	}
+
+	e.file.accs = resize(e.file.accs, len(p.columns))
+	resetAggs(e.file.accs)
+	for i := range e.file.accs {
+		e.file.accs[i].count = filtered.Matched
+	}
+	if err := prepareResult(&e.Result, p, 1); err != nil {
+		return stats, true, err
+	}
+	if err := p.fillAggregateCells(
+		&e.Result, 0, e.file.accs, nil, &e.Workspace,
+	); err != nil {
+		return stats, true, err
+	}
+	return stats, true, nil
 }

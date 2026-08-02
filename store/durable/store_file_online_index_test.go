@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -680,6 +681,12 @@ func TestOnlineCreateIndexMatchesCanonicalAggregation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer online.Close()
+	online.writer.Lock()
+	if err := online.repartitionPrimaryForExactIndexLocked(context.Background()); err != nil {
+		online.writer.Unlock()
+		t.Fatal(err)
+	}
+	online.writer.Unlock()
 	exact, err := store.CompileExactIndex(definition)
 	if err != nil {
 		t.Fatal(err)

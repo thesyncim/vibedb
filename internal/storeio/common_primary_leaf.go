@@ -250,6 +250,9 @@ func CommonPrimaryLeafStructuralBytes(
 	class CommonPrimaryLeafClass, live, extent int,
 ) int {
 	extra := 0
+	if class == CommonPrimaryLeafCompact {
+		return PageHeaderSize + compactPrimaryHeaderBytes + PageTrailerSize
+	}
 	if class == CommonPrimaryLeafUnified {
 		// Class 5 deliberately reuses the wide slot envelope. The unified
 		// section header is fixed metadata; template and dictionary bytes are
@@ -522,7 +525,8 @@ func commonPrimaryLeafValidateExpectedRef(
 		uint64(ref.Length) <= bounds.FileEnd &&
 		ref.Offset <= bounds.FileEnd-uint64(ref.Length) &&
 		ref.Length >= CommonPrimaryLeafNarrowBytes &&
-		ref.Length <= 64<<10 && validPhysicalPageSize(ref.Length) &&
+		ref.Length <= CommonPrimaryLeafMaxExtentBytes &&
+		validPageExtentSize(PagePrimaryLeaf, ref.Length) &&
 		ref.LogicalID == logicalID &&
 		ref.Generation != 0 && ref.Generation < uint64(1)<<48 &&
 		ref.Generation <= selectingGeneration &&
@@ -568,7 +572,10 @@ func EncodeCommonPrimaryLeaf(
 			!commonPrimaryLeafValidateOverflow(
 				record.Value.Overflow, logicalID, header.Generation, bounds,
 			) {
-			return nil, fmt.Errorf("%w: primary leaf overflow ref", ErrInvalidWrite)
+			return nil, fmt.Errorf(
+				"%w: primary leaf overflow ref row=%d ref=%+v leaf_generation=%d bounds=%+v",
+				ErrInvalidWrite, rank, record.Value.Overflow, header.Generation, bounds,
+			)
 		}
 		heapEnd += len(record.Key) + valueBytes
 		if len(record.Key) >= commonPrimaryLeafEscapeLength {

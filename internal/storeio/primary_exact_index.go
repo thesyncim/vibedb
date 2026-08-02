@@ -503,41 +503,32 @@ func primaryExactCorrupt(what string) error {
 	return fmt.Errorf("%w: %s", ErrPrimaryExactIndexCorrupt, what)
 }
 
-// VisitPrimaryLeafPostingRows enumerates one unified leaf's live rows in
-// lexical key order with the stable hash-directory slot each row occupies.
-// Inline rows render into scratch; overflow descriptors borrow the page.
+// VisitPrimaryLeafPostingRows enumerates one indexed compact stripe in lexical
+// order. Indexed stripes are capped at 256 rows, so the lexical ordinal is the
+// posting slot.
 func VisitPrimaryLeafPostingRows(
 	page []byte, storeID [16]byte, bucket BucketID,
 	bounds CommonPrimaryLeafBounds, scratch []byte,
 	fn func(slot uint8, key, raw []byte, overflow bool) error,
 ) ([]byte, error) {
-	if PrimaryLeafClass(page) != CommonPrimaryLeafUnified {
-		return scratch, primaryExactCorrupt("non-unified leaf")
+	if PrimaryLeafClass(page) != CommonPrimaryLeafCompact {
+		return scratch, primaryExactCorrupt("non-compact leaf")
 	}
-	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
-	if !ok {
-		return scratch, primaryExactCorrupt("unified leaf")
+	stripe, ok := AdmittedCompactPrimaryStripe(page, storeID, bucket)
+	if !ok || stripe.Len() > CommonPrimaryLeafWideSlots {
+		return scratch, primaryExactCorrupt("compact indexed leaf")
 	}
-	slots, slotsOK := uv.env.rankSlots()
-	if !slotsOK {
-		return scratch, primaryExactCorrupt("unified slots")
-	}
-	it := uv.env.AllRows()
-	var renderer unifiedPrimaryRowRenderer
-	renderer.Reset(uv)
-	for rank := 0; ; rank++ {
-		key, raw, overflow, ok := it.NextRawBorrowed()
-		if !ok {
-			break
+	for rank := 0; rank < stripe.Len(); rank++ {
+		slot, slotOK := stripe.PostingSlot(rank)
+		var keyOK bool
+		scratch, keyOK = stripe.AppendKey(scratch[:0], rank)
+		keyEnd := len(scratch)
+		var valueOK, overflow bool
+		scratch, overflow, valueOK = stripe.AppendRawValue(scratch, rank)
+		if !slotOK || !keyOK || !valueOK {
+			return scratch, primaryExactCorrupt("compact posting row")
 		}
-		if overflow {
-			if err := fn(slots[rank], key, raw, true); err != nil {
-				return scratch, err
-			}
-			continue
-		}
-		scratch = renderer.Append(scratch[:0], raw)
-		if err := fn(slots[rank], key, scratch, false); err != nil {
+		if err := fn(slot, scratch[:keyEnd], scratch[keyEnd:], overflow); err != nil {
 			return scratch, err
 		}
 	}
@@ -554,12 +545,12 @@ func VisitPrimaryLeafSelectedPostingRows(
 	bounds CommonPrimaryLeafBounds, selected [4]uint64, scratch []byte,
 	fn func(slot uint8, key, raw []byte, overflow bool) error,
 ) ([]byte, error) {
-	if PrimaryLeafClass(page) != CommonPrimaryLeafUnified {
-		return scratch, primaryExactCorrupt("non-unified leaf")
+	if PrimaryLeafClass(page) != CommonPrimaryLeafCompact {
+		return scratch, primaryExactCorrupt("non-compact leaf")
 	}
-	uv, ok := AdmittedCommonPrimaryUnifiedLeaf(page, storeID, bucket, bounds)
-	if !ok {
-		return scratch, primaryExactCorrupt("unified leaf")
+	stripe, ok := AdmittedCompactPrimaryStripe(page, storeID, bucket)
+	if !ok || stripe.Len() > CommonPrimaryLeafWideSlots {
+		return scratch, primaryExactCorrupt("compact indexed leaf")
 	}
 	requested := 0
 	for _, word := range selected {
@@ -572,79 +563,44 @@ func VisitPrimaryLeafSelectedPostingRows(
 	// slot-to-rank inversion plus random row-directory probes. This branch also
 	// handles masks containing many dead bits efficiently; only occupied slots
 	// are delivered.
-	if requested*4 >= uv.Len()*3 {
-		slots, slotsOK := uv.env.rankSlots()
-		if !slotsOK {
-			return scratch, primaryExactCorrupt("unified slots")
-		}
-		it := uv.env.AllRows()
-		var renderer unifiedPrimaryRowRenderer
-		rendererReady := false
-		for rank := 0; ; rank++ {
-			key, raw, overflow, rowOK := it.NextRawBorrowed()
-			if !rowOK {
-				break
+	if requested*4 >= stripe.Len()*3 {
+		for rank := 0; rank < stripe.Len(); rank++ {
+			slot, slotOK := stripe.PostingSlot(rank)
+			if !slotOK {
+				return scratch, primaryExactCorrupt("compact selected slot")
 			}
-			slot := slots[rank]
 			if selected[slot>>6]&(uint64(1)<<uint(slot&63)) == 0 {
 				continue
 			}
-			if !overflow {
-				if !rendererReady {
-					renderer.Reset(uv)
-					rendererReady = true
-				}
-				scratch = renderer.Append(scratch[:0], raw)
-				raw = scratch
+			var keyOK bool
+			scratch, keyOK = stripe.AppendKey(scratch[:0], rank)
+			keyEnd := len(scratch)
+			var valueOK, overflow bool
+			scratch, overflow, valueOK = stripe.AppendRawValue(scratch, rank)
+			if !keyOK || !valueOK {
+				return scratch, primaryExactCorrupt("compact selected row")
 			}
-			if err := fn(slot, key, raw, overflow); err != nil {
+			if err := fn(slot, scratch[:keyEnd], scratch[keyEnd:], overflow); err != nil {
 				return scratch, err
 			}
 		}
 		return scratch, nil
 	}
-	var (
-		selectedRanks [4]uint64
-		slotsByRank   [CommonPrimaryLeafWideSlots]uint8
-		anySelected   bool
-	)
-	for quadrant, word := range selected {
-		for word != 0 {
-			bit := bits.TrailingZeros64(word)
-			word &= word - 1
-			slot := uint8(quadrant*64 + bit)
-			rank, occupied := uv.env.slotRank(slot)
-			if !occupied {
-				continue
-			}
-			anySelected = true
-			selectedRanks[rank>>6] |= uint64(1) << uint(rank&63)
-			slotsByRank[rank] = slot
+	for rank := 0; rank < stripe.Len(); rank++ {
+		slot, slotOK := stripe.PostingSlot(rank)
+		if !slotOK {
+			return scratch, primaryExactCorrupt("compact selected slot")
 		}
-	}
-	if !anySelected {
-		return scratch, nil
-	}
-	var renderer unifiedPrimaryRowRenderer
-	rendererReady := false
-	for rankWord, word := range selectedRanks {
-		for word != 0 {
-			bit := bits.TrailingZeros64(word)
-			word &= word - 1
-			rank := rankWord*64 + bit
-			key, raw, overflow, rowOK := uv.RowRawAt(rank)
-			if !rowOK {
-				return scratch, primaryExactCorrupt("unified selected row")
+		if selected[slot>>6]&(uint64(1)<<uint(slot&63)) != 0 {
+			var keyOK bool
+			scratch, keyOK = stripe.AppendKey(scratch[:0], rank)
+			keyEnd := len(scratch)
+			var valueOK, overflow bool
+			scratch, overflow, valueOK = stripe.AppendRawValue(scratch, rank)
+			if !keyOK || !valueOK {
+				return scratch, primaryExactCorrupt("compact selected row")
 			}
-			if !overflow {
-				if !rendererReady {
-					renderer.Reset(uv)
-					rendererReady = true
-				}
-				scratch = renderer.Append(scratch[:0], raw)
-				raw = scratch
-			}
-			if err := fn(slotsByRank[rank], key, raw, overflow); err != nil {
+			if err := fn(slot, scratch[:keyEnd], scratch[keyEnd:], overflow); err != nil {
 				return scratch, err
 			}
 		}
