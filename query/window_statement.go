@@ -115,6 +115,7 @@ func (s *Statement) window() *statementWindow {
 func (s *Statement) prepareWindow(
 	ctes *statementCTEs,
 	argBase int,
+	correlation *lateralPrepareFrame,
 ) error {
 	w := new(statementWindow)
 	s.ensureNested().window = w
@@ -174,8 +175,8 @@ func (s *Statement) prepareWindow(
 			return err
 		}
 	}
-	input, err := prepareTreeInContext(
-		s.text, &w.inputTree, s.subqueryLimit, ctes, argBase,
+	input, err := prepareTreeInCorrelationContext(
+		s.text, &w.inputTree, s.subqueryLimit, ctes, argBase, correlation,
 	)
 	if err != nil {
 		return err
@@ -774,6 +775,8 @@ func (w *statementWindow) run(
 	args []any,
 	frame *statementFrame,
 	intermediateResource string,
+	correlations []scalar,
+	bindPlan bool,
 ) (Cursor, error) {
 	w.releaseExecution(frame)
 	if err := cancellationError(parent.Options.Cancel); err != nil {
@@ -783,13 +786,24 @@ func (w *statementWindow) run(
 	// so executing first would make a parameterized statement observe the
 	// previous execution's offsets, frame bounds, bucket count, NTH position,
 	// and default values.
-	if err := owner.bind(args); err != nil {
-		return Cursor{}, err
+	if bindPlan {
+		if err := owner.bind(args); err != nil {
+			return Cursor{}, err
+		}
 	}
 	w.inputExec.Options = parent.Options
-	cursor, err := w.input.runIntoFrame(
-		&w.inputExec, src, args, frame, "window input result",
-	)
+	var cursor Cursor
+	var err error
+	if len(correlations) != 0 {
+		cursor, err = w.input.runIntoCorrelationFrame(
+			&w.inputExec, src, args, frame, "window input result",
+			correlations, bindPlan,
+		)
+	} else {
+		cursor, err = w.input.runIntoFrame(
+			&w.inputExec, src, args, frame, "window input result",
+		)
+	}
 	if err != nil {
 		w.releaseExecution(frame)
 		return Cursor{}, err

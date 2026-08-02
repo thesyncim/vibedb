@@ -81,10 +81,20 @@ func snapshotCandidateMasks[S store.IndexSource](p *plan, snapshot S, caps sourc
 // every store.IndexSource-satisfying backend.
 func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps sourceCaps, paths []compiledPath, indexes []store.IndexInfo, w *Workspace, requireExact bool) ([]store.Mask, bool, bool, error) {
 	switch p.kind {
-	case predCmp:
-		if index, ok := singleColumnIndex(p.indexPath(paths), indexes); p.op == Eq && ok {
+	case predCmp, predCmpBound:
+		if p.op != Eq {
+			return nil, false, false, nil
+		}
+		needle, present, bindable := p.equalityNeedle(w)
+		if !bindable {
+			return nil, false, false, nil
+		}
+		if !present {
+			return nil, true, true, nil
+		}
+		if index, ok := singleColumnIndex(p.indexPath(paths), indexes); ok {
 			out := w.nextStoreMasks()
-			w.needleScratch[0] = p.needle
+			w.needleScratch[0] = needle
 			var err error
 			if requireExact {
 				out, err = snapshot.AppendIndexMasks(out, index.Name, w.needleScratch[:1]...)
@@ -241,7 +251,7 @@ func andCandidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, cap
 	have := false
 	allExact := true
 	var compound store.IndexInfo
-	if index, count, ok := p.bestCompoundIndexInto(paths, indexes, &w.needleScratch); ok {
+	if index, count, ok := p.bestCompoundIndexInto(paths, indexes, w, &w.needleScratch); ok {
 		compound = index
 		acc = w.nextStoreMasks()
 		var err error
@@ -365,6 +375,28 @@ func (p *compiledPredicate) membershipBounded(paths []compiledPath, indexes []st
 	return ok
 }
 
+// equalityNeedle resolves the exact scalar value for a static or execution-
+// bound equality. present=false with bindable=true is a bound SQL NULL: the
+// comparison is UNKNOWN for every row and therefore has the exact empty
+// candidate set without touching an index.
+func (p *compiledPredicate) equalityNeedle(w *Workspace) (
+	needle vibejson.Index,
+	present bool,
+	bindable bool,
+) {
+	if p.kind == predCmp {
+		return p.needle, true, true
+	}
+	if p.kind != predCmpBound || w == nil || p.slot < 0 || p.slot >= len(w.correlations) {
+		return vibejson.Index{}, false, false
+	}
+	if w.correlations[p.slot].kind == kindNull {
+		return vibejson.Index{}, false, true
+	}
+	needle, ok := w.correlationNeedle(p.slot)
+	return needle, ok, ok
+}
+
 // canBound is the no-I/O planner pass: does the declared index catalog
 // alone (no snapshot access) let this predicate return a bounded candidate
 // set? OR requires every branch to prove usable before any backend attempts
@@ -378,9 +410,13 @@ func (p *compiledPredicate) canBound(
 	paths []compiledPath, indexes []store.IndexInfo, w *Workspace,
 ) bool {
 	switch p.kind {
-	case predCmp:
+	case predCmp, predCmpBound:
 		if p.op != Eq {
 			return false
+		}
+		_, present, bindable := p.equalityNeedle(w)
+		if !bindable || !present {
+			return bindable
 		}
 		_, ok := singleColumnIndex(p.indexPath(paths), indexes)
 		return ok
@@ -389,7 +425,7 @@ func (p *compiledPredicate) canBound(
 	case predContains:
 		return p.containPlan != nil && p.containPlan.canBound(paths, indexes, w)
 	case predAnd:
-		if _, _, ok := p.bestCompoundIndex(paths, indexes); ok {
+		if _, _, ok := p.bestCompoundIndex(paths, indexes, w); ok {
 			return true
 		}
 		for _, kid := range p.kids {
@@ -419,9 +455,13 @@ func (p *compiledPredicate) canBound(
 // general row evaluator.
 func (p *compiledPredicate) canAnswerExactly(paths []compiledPath, indexes []store.IndexInfo, w *Workspace) bool {
 	switch p.kind {
-	case predCmp:
+	case predCmp, predCmpBound:
 		if p.op != Eq {
 			return false
+		}
+		_, present, bindable := p.equalityNeedle(w)
+		if !bindable || !present {
+			return bindable
 		}
 		_, ok := singleColumnIndex(p.indexPath(paths), indexes)
 		return ok
@@ -433,7 +473,7 @@ func (p *compiledPredicate) canAnswerExactly(paths []compiledPath, indexes []sto
 		if len(p.kids) == 0 {
 			return false
 		}
-		compound, _, _ := p.bestCompoundIndex(paths, indexes)
+		compound, _, _ := p.bestCompoundIndex(paths, indexes, w)
 		for _, kid := range p.kids {
 			if kid.coveredEquality(paths, compound) {
 				continue
@@ -469,7 +509,11 @@ func (p *compiledPredicate) maxExactProbeColumns(
 	w *Workspace,
 ) int {
 	switch p.kind {
-	case predCmp:
+	case predCmp, predCmpBound:
+		_, present, bindable := p.equalityNeedle(w)
+		if !bindable || !present {
+			return 0
+		}
 		return 1
 	case predIn, predInBound:
 		lits, _, bindable := p.membership(w)
@@ -483,7 +527,7 @@ func (p *compiledPredicate) maxExactProbeColumns(
 		}
 		return p.containPlan.maxExactProbeColumns(paths, indexes, w)
 	case predAnd:
-		compound, _, _ := p.bestCompoundIndex(paths, indexes)
+		compound, _, _ := p.bestCompoundIndex(paths, indexes, w)
 		width := int(compound.ColumnCount)
 		for _, kid := range p.kids {
 			if kid.coveredEquality(paths, compound) {
@@ -510,7 +554,8 @@ func (p *compiledPredicate) maxExactProbeColumns(
 }
 
 func (p *compiledPredicate) coveredEquality(paths []compiledPath, compound store.IndexInfo) bool {
-	if compound.ColumnCount < 2 || p.kind != predCmp || p.op != Eq {
+	if compound.ColumnCount < 2 ||
+		(p.kind != predCmp && p.kind != predCmpBound) || p.op != Eq {
 		return false
 	}
 	path := p.indexPath(paths)
@@ -527,7 +572,7 @@ func (p *compiledPredicate) coveredEquality(paths []compiledPath, compound store
 // exists) and never spread the values through a generic variadic call, so
 // the local array it builds is never at risk of the escape this file's
 // header documents.
-func (p *compiledPredicate) bestCompoundIndex(paths []compiledPath, indexes []store.IndexInfo) (store.IndexInfo, [store.MaxIndexColumns]vibejson.Index, bool) {
+func (p *compiledPredicate) bestCompoundIndex(paths []compiledPath, indexes []store.IndexInfo, w *Workspace) (store.IndexInfo, [store.MaxIndexColumns]vibejson.Index, bool) {
 	var best store.IndexInfo
 	var bestValues [store.MaxIndexColumns]vibejson.Index
 	for _, index := range indexes {
@@ -537,7 +582,7 @@ func (p *compiledPredicate) bestCompoundIndex(paths []compiledPath, indexes []st
 		var values [store.MaxIndexColumns]vibejson.Index
 		matched := true
 		for i := 0; i < int(index.ColumnCount); i++ {
-			value, ok := p.findEquality(index.Columns[i], paths)
+			value, ok := p.findEquality(index.Columns[i], paths, w)
 			if !ok {
 				matched = false
 				break
@@ -556,8 +601,8 @@ func (p *compiledPredicate) bestCompoundIndex(paths []compiledPath, indexes []st
 // the form the generic andCandidatesFor uses, so its later
 // `dst[:count]...` spread passes an already-existing slice into the
 // store.IndexSource call.
-func (p *compiledPredicate) bestCompoundIndexInto(paths []compiledPath, indexes []store.IndexInfo, dst *[store.MaxIndexColumns]vibejson.Index) (store.IndexInfo, int, bool) {
-	best, bestValues, ok := p.bestCompoundIndex(paths, indexes)
+func (p *compiledPredicate) bestCompoundIndexInto(paths []compiledPath, indexes []store.IndexInfo, w *Workspace, dst *[store.MaxIndexColumns]vibejson.Index) (store.IndexInfo, int, bool) {
+	best, bestValues, ok := p.bestCompoundIndex(paths, indexes, w)
 	if !ok {
 		return best, 0, false
 	}
@@ -565,13 +610,14 @@ func (p *compiledPredicate) bestCompoundIndexInto(paths []compiledPath, indexes 
 	return best, int(best.ColumnCount), true
 }
 
-func (p *compiledPredicate) findEquality(path string, paths []compiledPath) (vibejson.Index, bool) {
-	if p.kind == predCmp && p.op == Eq && p.indexPath(paths) == path {
-		return p.needle, true
+func (p *compiledPredicate) findEquality(path string, paths []compiledPath, w *Workspace) (vibejson.Index, bool) {
+	if (p.kind == predCmp || p.kind == predCmpBound) && p.op == Eq && p.indexPath(paths) == path {
+		value, present, bindable := p.equalityNeedle(w)
+		return value, present && bindable
 	}
 	if p.kind == predAnd {
 		for _, kid := range p.kids {
-			if value, ok := kid.findEquality(path, paths); ok {
+			if value, ok := kid.findEquality(path, paths, w); ok {
 				return value, true
 			}
 		}

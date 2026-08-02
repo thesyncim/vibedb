@@ -310,6 +310,21 @@ func (q *Query) Run(src Source) (Result, error) {
 // rejects the zero Source, which names no collection at all: a query that
 // forgets its source must fail rather than report an empty result.
 func (q *Query) RunInto(e *Exec, src Source) (err error) {
+	return q.runInto(e, src, nil)
+}
+
+// runIntoCorrelations is the private APPLY execution boundary. values is one
+// immutable tuple for this synchronous call; the public builder path always
+// passes nil and therefore cannot manufacture correlation state.
+func (q *Query) runIntoCorrelations(
+	e *Exec,
+	src Source,
+	values []scalar,
+) error {
+	return q.runInto(e, src, values)
+}
+
+func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) {
 	if e == nil {
 		return fmt.Errorf("query: RunInto requires a non-nil Exec")
 	}
@@ -356,6 +371,15 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 	if err != nil {
 		return err
 	}
+	if len(correlations) != p.correlationSlots {
+		return fmt.Errorf(
+			"query: compiled plan requires %d correlation slot(s), got %d",
+			p.correlationSlots, len(correlations),
+		)
+	}
+	if err := e.Workspace.bindCorrelations(correlations); err != nil {
+		return err
+	}
 	resultRows, resultBytes, limitErr := normalizeResultBudget(e.Options)
 	if limitErr != nil {
 		return limitErr
@@ -381,6 +405,9 @@ func (q *Query) RunInto(e *Exec, src Source) (err error) {
 		e.Workspace.heapWorkBudget.disable()
 	}
 	e.Workspace.eval.setWork(e.Workspace.activeHeapWorkBudget())
+	if err := e.Workspace.buildCorrelationNeedles(); err != nil {
+		return err
+	}
 	switch src.kind {
 	case sourceSegment:
 		docs := (*store.Segment)(src.payload)

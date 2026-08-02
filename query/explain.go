@@ -806,6 +806,10 @@ func explainPredicateSummary(predicate *compiledPredicate) string {
 	switch predicate.kind {
 	case predCmp:
 		return "comparison"
+	case predCmpBound:
+		return "correlation-comparison"
+	case predCorrelationKnown:
+		return "correlation-known"
 	case predContains:
 		return "contains"
 	case predExists:
@@ -840,8 +844,10 @@ func explainPredicateTree(predicate *compiledPredicate, paths []compiledPath) *e
 		node.Path = predicate.boundPath
 	}
 	switch predicate.kind {
-	case predCmp:
+	case predCmp, predCmpBound:
 		node.Operator = explainOperator(predicate.op)
+	case predCorrelationKnown:
+		node.Operator = "IS KNOWN"
 	case predContains:
 		node.Operator = "@>"
 	case predExists:
@@ -866,6 +872,10 @@ func explainPredicateKind(kind predKind) string {
 	switch kind {
 	case predCmp:
 		return "comparison"
+	case predCmpBound:
+		return "correlation-comparison"
+	case predCorrelationKnown:
+		return "correlation-known"
 	case predContains:
 		return "contains"
 	case predExists:

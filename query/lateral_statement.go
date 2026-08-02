@@ -49,10 +49,13 @@ type statementLateral struct {
 	bindingAST   []sqlast.PathExpr
 	args         []any
 	slots        []lateralBindingSlot
+	values       []scalar
 	argUse       []bool
 	bindingUse   []bool
 	inherited    []lateralInheritedBinding
 	bindingReady bool
+	correlation  statementCorrelationPlan
+	childEpoch   uint64
 
 	outputs      []lateralOutput
 	names        []string
@@ -77,16 +80,16 @@ type lateralBindingSlot struct {
 }
 
 type lateralClone struct {
-	text       string
-	spec       *sqlast.LateralSpec
-	params     int
-	seen       []bool
-	bindingUse []bool
-	argUse     []bool
-	projection []lateralProjection
-	gates      []lateralGateExpr
-	hidden     int
-	group      lateralGroupPlan
+	text        string
+	spec        *sqlast.LateralSpec
+	seen        []bool
+	bindingUse  []bool
+	argUse      []bool
+	projection  []lateralProjection
+	gates       []lateralGateExpr
+	hidden      int
+	group       lateralGroupPlan
+	correlation []statementCorrelationReference
 }
 
 // lateralProjection is one authored SELECT item before relation-wildcard
@@ -156,7 +159,7 @@ func prepareStatementLateral(
 	}
 
 	cloner := lateralClone{
-		text: owner.text, spec: spec, params: ref.Query.Params,
+		text: owner.text, spec: spec,
 		seen:       make([]bool, len(spec.References)),
 		bindingUse: make([]bool, len(spec.Bindings)),
 		argUse:     make([]bool, len(spec.Bindings)),
@@ -199,22 +202,22 @@ func prepareStatementLateral(
 	if err := cloner.finish(); err != nil {
 		return nil, nil, err
 	}
-	if ref.Query.Params > math.MaxInt-len(spec.Bindings) {
-		return nil, nil, fmt.Errorf("query: LATERAL parameter count overflows int")
-	}
-	clone.Params = ref.Query.Params + len(spec.Bindings)
-
 	lateral := &statementLateral{
 		spec: spec, params: ref.Query.Params,
 		bindings:   make([]relationJoinPath, len(spec.Bindings)),
 		bindingAST: make([]sqlast.PathExpr, len(spec.Bindings)),
 		args:       make([]any, clone.Params),
 		slots:      make([]lateralBindingSlot, len(spec.Bindings)),
+		values:     make([]scalar, len(spec.Bindings)),
 		argUse:     cloner.argUse,
 		bindingUse: cloner.bindingUse,
 		inherited:  make([]lateralInheritedBinding, len(spec.Bindings)),
 		gates:      cloner.gates,
 		group:      cloner.group.program,
+		correlation: statementCorrelationPlan{
+			references: cloner.correlation,
+			slots:      len(spec.Bindings),
+		},
 	}
 	for i := range spec.Bindings {
 		binding := &spec.Bindings[i]
@@ -771,12 +774,13 @@ func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 			)
 		}
 		clone.RightPath = nil
-		clone.Value = sqlast.Operand{
-			Kind: sqlast.OperandParam, Ordinal: c.params + rightBinding,
-			Pos: expr.RightPath.Pos,
-		}
+		clone.Value = sqlast.Operand{}
 		c.mark(rightRef, rightBinding, true)
-		return &clone, nil
+		node := &clone
+		c.correlation = append(c.correlation, statementCorrelationReference{
+			expr: node, slot: rightBinding,
+		})
+		return node, nil
 	}
 	if expr.RightPath == nil {
 		return nil, sqlast.NewFeatureNotSupportedError(
@@ -786,12 +790,13 @@ func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 	clone.Path = expr.RightPath
 	clone.RightPath = nil
 	clone.Op = lateralReverseComparison(expr.Op)
-	clone.Value = sqlast.Operand{
-		Kind: sqlast.OperandParam, Ordinal: c.params + leftBinding,
-		Pos: expr.Path.Pos,
-	}
+	clone.Value = sqlast.Operand{}
 	c.mark(leftRef, leftBinding, true)
-	return &clone, nil
+	node := &clone
+	c.correlation = append(c.correlation, statementCorrelationReference{
+		expr: node, slot: leftBinding,
+	})
+	return node, nil
 }
 
 func lateralReverseComparison(op sqlast.CmpOp) sqlast.CmpOp {
@@ -986,51 +991,59 @@ func (l *statementLateral) evalGate(
 	return value, cancellationError(cancel)
 }
 
+func (l *statementLateral) bindArguments(rootArgs []any, base int) error {
+	if l == nil || len(l.args) != l.params {
+		return fmt.Errorf("query: invalid prepared LATERAL argument state")
+	}
+	if base < 0 || base+l.params > len(rootArgs) {
+		return fmt.Errorf("query: invalid LATERAL placeholder range")
+	}
+	copy(l.args, rootArgs[base:base+l.params])
+	return nil
+}
+
 func (l *statementLateral) bind(
 	left *relationSpool,
 	row int,
-	rootArgs []any,
-	base int,
+	parent *Exec,
 	frame *statementFrame,
 	cancel *CancelFlag,
-) ([]any, error) {
+) error {
 	if l == nil || len(l.bindings) != len(l.slots) ||
-		len(l.args) != l.params+len(l.bindings) ||
+		len(l.values) != len(l.bindings) ||
 		len(l.argUse) != len(l.bindings) ||
 		len(l.inherited) != len(l.bindings) {
-		return nil, fmt.Errorf("query: invalid prepared LATERAL binding state")
+		return fmt.Errorf("query: invalid prepared LATERAL binding state")
 	}
 	l.bindingReady = false
-	if base < 0 || base+l.params > len(rootArgs) {
-		return nil, fmt.Errorf("query: invalid LATERAL placeholder range")
-	}
-	copy(l.args[:l.params], rootArgs[base:base+l.params])
 	for i := range l.bindings {
 		slot := &l.slots[i]
 		var value scalar
 		var err error
 		if l.inherited[i].apply != nil {
-			value, err = l.inherited[i].scalar()
+			if parent == nil {
+				return fmt.Errorf("query: inherited LATERAL binding has no parent execution")
+			}
+			value, err = parent.Workspace.correlationScalar(l.inherited[i].binding)
 		} else {
 			value, err = l.bindingScalar(
 				left, row, l.bindings[i], slot, frame, cancel,
 			)
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		slot.value = value
-		l.args[l.params+i] = nil
+		l.values[i] = value
 		if l.argUse[i] {
-			argument, err := slot.argument(value, i, l.spec.Bindings[i].Pos)
+			_, err := slot.argument(value, i, l.spec.Bindings[i].Pos)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			l.args[l.params+i] = argument
 		}
 	}
 	l.bindingReady = true
-	return l.args, nil
+	return nil
 }
 
 func (l *statementLateral) bindingScalar(
@@ -1242,6 +1255,10 @@ func (l *statementLateral) releaseBinding(frame *statementFrame) {
 	frame.intermediate.release(l.bindingActive)
 	l.bindingActive = 0
 	l.bindingReady = false
+	clear(l.values)
+	for i := range l.slots {
+		l.slots[i].value = scalar{}
+	}
 }
 
 func (s *lateralBindingSlot) argument(value scalar, binding, pos int) (any, error) {
@@ -1281,6 +1298,10 @@ func (l *statementLateral) materializeRights(
 	if err := l.group.begin(parent.Options); err != nil {
 		return err
 	}
+	if err := l.bindArguments(rootArgs, op.ref.Query.ParamBase); err != nil {
+		return err
+	}
+	defer clear(l.args)
 	workspace := saturatedProduct(
 		int64(left.rows), int64(unsafe.Sizeof(relationSpool{})+unsafe.Sizeof(int64(0))),
 	)
@@ -1299,10 +1320,7 @@ func (l *statementLateral) materializeRights(
 		if err := cancellationCheckpoint(parent.Options.Cancel, row); err != nil {
 			return err
 		}
-		bound, err := l.bind(
-			left, row, rootArgs, op.ref.Query.ParamBase, frame,
-			parent.Options.Cancel,
-		)
+		err := l.bind(left, row, parent, frame, parent.Options.Cancel)
 		if err != nil {
 			return err
 		}
@@ -1321,12 +1339,17 @@ func (l *statementLateral) materializeRights(
 			return err
 		}
 		op.exec.Options = parent.Options
-		cursor, err := op.stmt.runIntoFrame(
-			&op.exec, nestedSource, bound, frame, "LATERAL child result",
+		bindPlan := l.childEpoch != frame.epoch
+		cursor, err := op.stmt.runIntoCorrelationFrame(
+			&op.exec, nestedSource, l.args, frame, "LATERAL child result",
+			l.values, bindPlan,
 		)
 		if err != nil {
 			l.releaseBinding(frame)
 			return err
+		}
+		if bindPlan {
+			l.childEpoch = frame.epoch
 		}
 		l.evaluations++
 		if op.stmt.outputs != l.localOutputs {

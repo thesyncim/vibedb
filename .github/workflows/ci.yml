@@ -48,3 +48,13 @@ jobs:
         run: go test -count=1 -timeout=5m -run '^TestPSQLClient18$' -v .
       - name: Race, storage suites
         run: go test -race -timeout=25m -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
+  lateral-race:
+    name: race (LATERAL cross-layer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Focused LATERAL race tests
+        run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire

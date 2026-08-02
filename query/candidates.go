@@ -92,6 +92,18 @@ func (p *compiledPredicate) candidates(s *store.Segment, w *Workspace) (rows []i
 		rows, ok := p.probe.run(s, w.nextCandidates())
 		w.keepCandidates(rows)
 		return rows, ok
+	case predCmpBound:
+		if p.op != Eq || p.probe.kind != postEq {
+			return nil, false
+		}
+		needle, ok := w.correlationNeedle(p.slot)
+		if !ok {
+			// A NULL correlation makes the comparison UNKNOWN for every row.
+			return nil, true
+		}
+		rows = s.AppendWhereContainsIndex(w.nextCandidates(), p.probe.path, needle)
+		w.keepCandidates(rows)
+		return rows, true
 	case predIn:
 		// An empty membership accepts no row, which is an exact bound the
 		// postings need not be consulted for.

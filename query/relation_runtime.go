@@ -39,6 +39,10 @@ func (e *IntermediateBudgetError) Unwrap() error { return ErrIntermediateBudget 
 // distinct warm workspaces, but none receives a fresh intermediate allowance.
 type statementFrame struct {
 	intermediate intermediateBudget
+	// epoch identifies one top-level execution. Correlated children use it to
+	// lower authored parameters once for the whole lexical APPLY tree rather than
+	// once per outer row.
+	epoch uint64
 	// args is the top-level binding. CTE definitions retain absolute placeholder
 	// ranges even when reached through a later definition or predicate subquery.
 	// The slice is borrowed for one synchronous RunInto call.
@@ -65,6 +69,10 @@ func (f *statementFrame) begin(options ExecOptions) error {
 	}
 	f.intermediate.limit = limit
 	f.intermediate.used = 0
+	f.epoch++
+	if f.epoch == 0 {
+		f.epoch = 1
+	}
 	return nil
 }
 
