@@ -125,10 +125,51 @@ func (r *Result) checkResultBudget(columns, rows int, payloadBytes int64) (int64
 		return 0, r.resultByteBudgetError(rows, math.MaxInt64)
 	}
 	required += payloadBytes
-	if r.resultBytesLimit >= 0 && required > r.resultBytesLimit {
-		return 0, r.resultByteBudgetError(rows, required)
+	// Preserve the ordinary result admission path: one predictable inactive
+	// branch followed by the original ResultBytes comparison. Shared-root
+	// arithmetic and error arbitration exist only for RunIntermediateInto.
+	if !r.rootIntermediateActive {
+		if r.resultBytesLimit >= 0 && required > r.resultBytesLimit {
+			return 0, r.resultByteBudgetError(rows, required)
+		}
+	} else if err := r.checkRootResultByteBudgets(rows, required); err != nil {
+		return 0, err
 	}
 	return required, nil
+}
+
+// checkRootResultByteBudgets chooses the first logical byte ceiling the root would
+// cross. Caller-visible ResultBytes wins ties, preserving ordinary result
+// semantics; a stricter shared intermediate remainder reports the typed
+// IntermediateBudgetError that actually prevented growth.
+func (r *Result) checkRootResultByteBudgets(rows int, required int64) error {
+	resultExceeded := r.resultBytesLimit >= 0 && required > r.resultBytesLimit
+	used, intermediateLimit := r.rootIntermediateBudget()
+	intermediateRequired := saturatedBytes(used, required)
+	intermediateExceeded := intermediateLimit >= 0 &&
+		intermediateRequired > intermediateLimit
+
+	if resultExceeded {
+		remaining := int64(-1)
+		if intermediateLimit >= 0 {
+			remaining = max(intermediateLimit-used, 0)
+		}
+		if !intermediateExceeded || remaining < 0 ||
+			r.resultBytesLimit <= remaining {
+			return r.resultByteBudgetError(rows, required)
+		}
+	}
+	if intermediateExceeded {
+		return &IntermediateBudgetError{
+			Resource: statementRootIntermediateResource,
+			Bytes:    intermediateRequired,
+			Limit:    intermediateLimit,
+		}
+	}
+	if resultExceeded {
+		return r.resultByteBudgetError(rows, required)
+	}
+	return nil
 }
 
 func (r *Result) resultByteBudgetError(rows int, bytes int64) error {
@@ -148,11 +189,17 @@ func (r *Result) admitResultBytes(additional int64) error {
 		return err
 	}
 	required := r.resultBytesUsed + additional
-	if r.resultBytesLimit >= 0 && required > r.resultBytesLimit {
-		err := &ResultBudgetError{
-			Rows: r.RowCount, RowLimit: r.resultRowsLimit,
-			Bytes: required, ByteLimit: r.resultBytesLimit,
+	// Keep the per-cell ordinary hot path identical after one inactive branch.
+	if !r.rootIntermediateActive {
+		if r.resultBytesLimit >= 0 && required > r.resultBytesLimit {
+			err := &ResultBudgetError{
+				Rows: r.RowCount, RowLimit: r.resultRowsLimit,
+				Bytes: required, ByteLimit: r.resultBytesLimit,
+			}
+			r.abortResult()
+			return err
 		}
+	} else if err := r.checkRootResultByteBudgets(r.RowCount, required); err != nil {
 		r.abortResult()
 		return err
 	}

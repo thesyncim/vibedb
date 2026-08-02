@@ -1,9 +1,11 @@
 package durable
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,6 +87,198 @@ func requireJournalKey(t *testing.T, coll *Collection, key, want string) {
 	got, ok, err := coll.AppendRaw(nil, []byte(key))
 	if err != nil || !ok || string(got) != want {
 		t.Fatalf("recovered key %q = (%q,%v,%v), want %q", key, got, ok, err, want)
+	}
+}
+
+func requireUnknownJournalOutcome(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("journal sync failure reported success")
+	}
+	if !errors.Is(err, ErrCommitOutcomeUnknown) {
+		t.Fatalf("journal sync failure = %v, want ErrCommitOutcomeUnknown", err)
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("journal sync failure = %v, want root cause EIO", err)
+	}
+}
+
+// TestSyncPrimaryJournalSyncFailureOutcomeUnknownMayReplay fixes the exact
+// synchronous single-record ambiguity boundary. Append has completed, the
+// durability barrier reports EIO, and the mutation has not been published to
+// the live reader; nevertheless the complete redo record may survive a crash
+// and replay. The caller and every sticky poison surface must therefore retain
+// both ErrCommitOutcomeUnknown and the device's root cause.
+func TestSyncPrimaryJournalSyncFailureOutcomeUnknownMayReplay(t *testing.T) {
+	options := syncPrimaryJournalTestOptions()
+	coll, path, fj := openFaultJournalCollection(t, options)
+
+	appendAt := fj.Appends()
+	syncAt := fj.Syncs()
+	fj.Program(storeio.JournalFaultPlan{
+		Phase:     storeio.JournalFaultSyncError,
+		SyncIndex: syncAt,
+	})
+	key := []byte("sync-unknown-single")
+	value := journalValue(71)
+	_, commitErr := coll.Put(key, value)
+	requireUnknownJournalOutcome(t, commitErr)
+	if !fj.Faulted() {
+		t.Fatal("programmed journal sync fault never fired")
+	}
+	if got := fj.Appends(); got != appendAt+1 {
+		t.Fatalf("journal appends = %d, want %d", got, appendAt+1)
+	}
+	if got := fj.Syncs(); got != syncAt+1 {
+		t.Fatalf("journal syncs = %d, want %d", got, syncAt+1)
+	}
+	if got, found, readErr := coll.AppendRaw(nil, key); readErr != nil || found {
+		t.Fatalf("failed sync mutation visible before reopen: got=%q found=%t err=%v",
+			got, found, readErr)
+	}
+	requireUnknownJournalOutcome(t, coll.PersistenceError())
+	if _, afterErr := coll.Put([]byte("after-single-poison"), journalValue(72)); !errors.Is(afterErr, commitErr) {
+		t.Fatalf("later mutation error = %v, want sticky poison %v", afterErr, commitErr)
+	}
+
+	// Capture the exact post-append/post-failed-sync image. Reading the image is
+	// intentionally not another durability fence: it models the legal device
+	// outcome in which the complete record reached stable media despite EIO.
+	image := captureJournalImage(t, path)
+	_ = coll.Close()
+	recovered := reopenJournalImage(t, options, image)
+	requireJournalKey(t, recovered, string(key), string(value))
+}
+
+// TestSyncPrimaryBatchJournalSyncFailureOutcomeUnknownMayReplay proves the
+// same boundary for the atomic batch record. The failed caller sees neither row
+// live, while reopen may replay both rows from the one checksummed record; a
+// partial batch is never an admissible outcome.
+func TestSyncPrimaryBatchJournalSyncFailureOutcomeUnknownMayReplay(t *testing.T) {
+	options := syncPrimaryJournalTestOptions()
+	coll, path, fj := openFaultJournalCollection(t, options)
+
+	appendAt := fj.Appends()
+	syncAt := fj.Syncs()
+	fj.Program(storeio.JournalFaultPlan{
+		Phase:     storeio.JournalFaultSyncError,
+		SyncIndex: syncAt,
+	})
+	keys := [2][]byte{[]byte("sync-unknown-batch-a"), []byte("sync-unknown-batch-b")}
+	values := [2][]byte{journalValue(81), journalValue(82)}
+	commitErr := coll.Update(func(batch *WriteBatch) error {
+		for i := range keys {
+			if err := batch.Put(keys[i], values[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	requireUnknownJournalOutcome(t, commitErr)
+	if !fj.Faulted() {
+		t.Fatal("programmed batch journal sync fault never fired")
+	}
+	if got := fj.Appends(); got != appendAt+1 {
+		t.Fatalf("batch journal appends = %d, want one atomic record (%d)",
+			got, appendAt+1)
+	}
+	if got := fj.Syncs(); got != syncAt+1 {
+		t.Fatalf("batch journal syncs = %d, want %d", got, syncAt+1)
+	}
+	for i := range keys {
+		if got, found, readErr := coll.AppendRaw(nil, keys[i]); readErr != nil || found {
+			t.Fatalf("failed batch row %d visible before reopen: got=%q found=%t err=%v",
+				i, got, found, readErr)
+		}
+	}
+	requireUnknownJournalOutcome(t, coll.PersistenceError())
+	if _, afterErr := coll.Put([]byte("after-batch-poison"), journalValue(83)); !errors.Is(afterErr, commitErr) {
+		t.Fatalf("later mutation error = %v, want sticky poison %v", afterErr, commitErr)
+	}
+
+	image := captureJournalImage(t, path)
+	_ = coll.Close()
+	recovered := reopenJournalImage(t, options, image)
+	for i := range keys {
+		requireJournalKey(t, recovered, string(keys[i]), string(values[i]))
+	}
+}
+
+// TestSyncPrimaryJournalAppendFailureOutcomeIsDefinite guards the other side
+// of the classification boundary. A journal append failure occurs before any
+// durability barrier and leaves no valid replay record, for either record
+// shape, so it poisons the lane while remaining a definite failed commit.
+func TestSyncPrimaryJournalAppendFailureOutcomeIsDefinite(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Collection, [2][]byte, [2][]byte) error
+		rows int
+	}{
+		{
+			name: "single",
+			rows: 1,
+			run: func(coll *Collection, keys [2][]byte, values [2][]byte) error {
+				_, err := coll.Put(keys[0], values[0])
+				return err
+			},
+		},
+		{
+			name: "atomic-batch",
+			rows: 2,
+			run: func(coll *Collection, keys [2][]byte, values [2][]byte) error {
+				return coll.Update(func(batch *WriteBatch) error {
+					for i := range keys {
+						if err := batch.Put(keys[i], values[i]); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := syncPrimaryJournalTestOptions()
+			coll, path, fj := openFaultJournalCollection(t, options)
+			keys := [2][]byte{[]byte("append-failed-a"), []byte("append-failed-b")}
+			values := [2][]byte{journalValue(91), journalValue(92)}
+			appendAt := fj.Appends()
+			fj.Program(storeio.JournalFaultPlan{
+				Phase:       storeio.JournalFaultENOSPCAppend,
+				AppendIndex: appendAt,
+			})
+
+			commitErr := tc.run(coll, keys, values)
+			if commitErr == nil {
+				t.Fatal("failed journal append reported success")
+			}
+			if !errors.Is(commitErr, syscall.ENOSPC) {
+				t.Fatalf("append failure = %v, want root cause ENOSPC", commitErr)
+			}
+			if errors.Is(commitErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("pre-sync append failure misclassified as unknown: %v", commitErr)
+			}
+			if persistenceErr := coll.PersistenceError(); !errors.Is(persistenceErr, syscall.ENOSPC) ||
+				errors.Is(persistenceErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("sticky append poison = %v, want definite ENOSPC", persistenceErr)
+			}
+			for i := 0; i < tc.rows; i++ {
+				if got, found, readErr := coll.AppendRaw(nil, keys[i]); readErr != nil || found {
+					t.Fatalf("failed append row %d visible: got=%q found=%t err=%v",
+						i, got, found, readErr)
+				}
+			}
+
+			image := captureJournalImage(t, path)
+			_ = coll.Close()
+			recovered := reopenJournalImage(t, options, image)
+			for i := 0; i < tc.rows; i++ {
+				if got, found, readErr := recovered.AppendRaw(nil, keys[i]); readErr != nil || found {
+					t.Fatalf("failed append row %d replayed: got=%q found=%t err=%v",
+						i, got, found, readErr)
+				}
+			}
+		})
 	}
 }
 
@@ -240,6 +434,7 @@ func TestRecoveryJournalGroupLeaderSyncFailurePoisonsWaiters(t *testing.T) {
 		if err == nil {
 			t.Fatalf("parked waiter %d was acknowledged across a failed sync", w)
 		}
+		requireUnknownJournalOutcome(t, err)
 	}
 	if !fj.Faulted() {
 		t.Fatal("programmed sync fault never fired")
@@ -248,11 +443,11 @@ func TestRecoveryJournalGroupLeaderSyncFailurePoisonsWaiters(t *testing.T) {
 		t.Fatalf("journal syncs after poison = %d, want %d (a second leader retried)",
 			got, faultAt+1)
 	}
-	if coll.PersistenceError() == nil {
-		t.Fatal("leader sync failure left PersistenceError nil")
-	}
+	requireUnknownJournalOutcome(t, coll.PersistenceError())
 	if _, err := coll.Put([]byte("after"), journalValue(9)); err == nil {
 		t.Fatal("mutation accepted after group fence poison")
+	} else {
+		requireUnknownJournalOutcome(t, err)
 	}
 
 	// Reopen: every key acknowledged before the failure is durable through the

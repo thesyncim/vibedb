@@ -49,7 +49,8 @@ func TestSQLSetValuesTableRootsSimpleExtendedAndPositionedRecovery(t *testing.T)
 	}
 	description := decodeRowDescription(t, find(t, msgs, msgRowDescription).body)
 	if len(description) != 2 || description[0].name != "column1" ||
-		description[1].name != "column2" {
+		description[1].name != "column2" ||
+		description[0].oid != oidJSON || description[1].oid != oidJSON {
 		t.Fatalf("VALUES RowDescription = %+v", description)
 	}
 	rows := rowsOf(t, msgs)

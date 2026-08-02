@@ -23,6 +23,13 @@ const catalogVersion = 0
 
 const maxCatalogTableNameBytes = 1<<16 - 1
 
+const (
+	maxCatalogViews            = 256
+	maxCatalogViewQueryBytes   = 1 << 20
+	maxCatalogViewColumns      = 1024
+	maxCatalogViewDependencies = 1024
+)
+
 // maxCatalogTables bounds both the in-memory catalog and the descriptors an
 // eagerly opened database can own. Every materialized SQL table has one live
 // durable file handle for the database lifetime; a byte-only catalog limit
@@ -42,6 +49,18 @@ const maxCatalogBytes = 16 << 20
 type catalogFile struct {
 	Version int                   `json:"version"`
 	Tables  map[string]*tableMeta `json:"tables"`
+	Views   map[string]*viewMeta  `json:"views,omitempty"`
+}
+
+// viewMeta is immutable after publication. Prepared statements retain its
+// pointer as an in-process definition generation: DROP/recreate installs a new
+// object, so an old plan can never silently execute against a replacement.
+type viewMeta struct {
+	Query             string   `json:"query"`
+	Columns           []string `json:"columns,omitempty"`
+	Outputs           []string `json:"outputs"`
+	ViewDependencies  []string `json:"view_dependencies,omitempty"`
+	TableDependencies []string `json:"table_dependencies,omitempty"`
 }
 
 type tableMeta struct {
@@ -143,6 +162,7 @@ func openDatabaseWithSync(
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
 	}
+	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
 	defer func() {
 		if !opened {
@@ -176,8 +196,14 @@ func openDatabaseWithSync(
 		if d.catalog.Version != catalogVersion || d.catalog.Tables == nil {
 			return nil, fmt.Errorf("vibedb: unsupported SQL catalog version %d", d.catalog.Version)
 		}
+		if d.catalog.Views == nil {
+			d.catalog.Views = make(map[string]*viewMeta)
+		}
 	}
 	if err := checkCatalogTableCount(len(d.catalog.Tables)); err != nil {
+		return nil, err
+	}
+	if err := checkCatalogViewCount(len(d.catalog.Views)); err != nil {
 		return nil, err
 	}
 	paths := make(map[string]string, len(d.catalog.Tables))
@@ -235,6 +261,20 @@ func openDatabaseWithSync(
 		}
 		paths[dataPath] = name
 		d.tables[name] = t
+	}
+	for name, meta := range d.catalog.Views {
+		if err := validateCatalogViewMeta(name, meta); err != nil {
+			return nil, err
+		}
+		if _, exists := d.tables[name]; exists {
+			return nil, fmt.Errorf(
+				"vibedb: SQL catalog relation %q is both a table and a view",
+				name,
+			)
+		}
+	}
+	if err := d.validateViewCatalog(); err != nil {
+		return nil, err
 	}
 	// Only mutate the private table directory after the complete catalog has
 	// passed strict decoding and semantic validation. An unpublished replacement
@@ -563,6 +603,93 @@ func validateCatalogTableName(name string) error {
 	}
 }
 
+func validateCatalogViewMeta(name string, meta *viewMeta) error {
+	if err := validateCatalogTableName(name); err != nil {
+		return fmt.Errorf("vibedb: SQL catalog view name %q: %w", name, err)
+	}
+	if meta == nil {
+		return fmt.Errorf("vibedb: SQL catalog view %q has null metadata", name)
+	}
+	if meta.Query == "" {
+		return fmt.Errorf("vibedb: SQL catalog view %q has an empty query", name)
+	}
+	if !utf8.ValidString(meta.Query) {
+		return fmt.Errorf("vibedb: SQL catalog view %q query is not valid UTF-8", name)
+	}
+	if len(meta.Query) > maxCatalogViewQueryBytes {
+		return fmt.Errorf(
+			"vibedb: SQL catalog view %q query is %d bytes, maximum is %d",
+			name, len(meta.Query), maxCatalogViewQueryBytes,
+		)
+	}
+	if len(meta.Columns) > maxCatalogViewColumns || len(meta.Outputs) > maxCatalogViewColumns {
+		return fmt.Errorf(
+			"vibedb: SQL catalog view %q exceeds the %d-column bound",
+			name, maxCatalogViewColumns,
+		)
+	}
+	if len(meta.Outputs) == 0 {
+		return fmt.Errorf("vibedb: SQL catalog view %q has no outputs", name)
+	}
+	if len(meta.Columns) > len(meta.Outputs) {
+		return fmt.Errorf(
+			"vibedb: SQL catalog view %q has %d aliases for %d outputs",
+			name, len(meta.Columns), len(meta.Outputs),
+		)
+	}
+	if err := validateCatalogViewNames(name, "column", meta.Columns, false); err != nil {
+		return err
+	}
+	if err := validateCatalogViewNames(name, "output", meta.Outputs, false); err != nil {
+		return err
+	}
+	if len(meta.ViewDependencies) > maxCatalogViewDependencies ||
+		len(meta.TableDependencies) > maxCatalogViewDependencies {
+		return fmt.Errorf(
+			"vibedb: SQL catalog view %q exceeds the %d-dependency bound",
+			name, maxCatalogViewDependencies,
+		)
+	}
+	if err := validateCatalogViewNames(
+		name, "view dependency", meta.ViewDependencies, true,
+	); err != nil {
+		return err
+	}
+	return validateCatalogViewNames(
+		name, "table dependency", meta.TableDependencies, true,
+	)
+}
+
+func validateCatalogViewNames(
+	view string,
+	kind string,
+	names []string,
+	allowView bool,
+) error {
+	for i, name := range names {
+		if err := validateCatalogTableName(name); err != nil {
+			return fmt.Errorf(
+				"vibedb: SQL catalog view %q %s %q: %w",
+				view, kind, name, err,
+			)
+		}
+		if allowView && name == view {
+			return fmt.Errorf(
+				"vibedb: SQL catalog view %q depends on itself", view,
+			)
+		}
+		for previous := 0; previous < i; previous++ {
+			if names[previous] == name {
+				return fmt.Errorf(
+					"vibedb: SQL catalog view %q repeats %s %q",
+					view, kind, name,
+				)
+			}
+		}
+	}
+	return nil
+}
+
 func (d *database) directorySync(path string) error {
 	if d.syncDir != nil {
 		return d.syncDir(path)
@@ -825,6 +952,9 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	if err := checkCatalogTableCount(len(catalog.Tables)); err != nil {
 		return maxCatalogBytes + 1, err
 	}
+	if err := checkCatalogViewCount(len(catalog.Views)); err != nil {
+		return maxCatalogBytes + 1, err
+	}
 	size := 256
 	add := func(part int) bool {
 		if part < 0 || part > maxCatalogBytes-size {
@@ -869,6 +999,27 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 			}
 		}
 	}
+	for name, meta := range catalog.Views {
+		if !add(encodedJSONStringBytes(name) + 512) {
+			return size, catalogSizeError(size)
+		}
+		if meta == nil {
+			continue
+		}
+		if !add(encodedJSONStringBytes(meta.Query) + 256) {
+			return size, catalogSizeError(size)
+		}
+		for _, values := range [...][]string{
+			meta.Columns, meta.Outputs,
+			meta.ViewDependencies, meta.TableDependencies,
+		} {
+			for _, value := range values {
+				if !add(encodedJSONStringBytes(value) + 32) {
+					return size, catalogSizeError(size)
+				}
+			}
+		}
+	}
 	return size, nil
 }
 
@@ -879,6 +1030,16 @@ func checkCatalogTableCount(tables int) error {
 	return fmt.Errorf(
 		"%w: catalog has %d tables, maximum is %d",
 		ErrTooManyTables, tables, maxCatalogTables,
+	)
+}
+
+func checkCatalogViewCount(views int) error {
+	if views <= maxCatalogViews {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: catalog has %d views, maximum is %d",
+		ErrTooManyViews, views, maxCatalogViews,
 	)
 }
 

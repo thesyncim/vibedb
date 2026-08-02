@@ -36,6 +36,16 @@ func (c *conn) validateSurfaceContext(
 				return reservedDocumentPathError(statement.Insert.Columns[i])
 			}
 		}
+		if statement.Insert.Source != nil {
+			if err := rlockContext(ctx, &c.db.mu); err != nil {
+				return err
+			}
+			err := c.validateSelectTables(statement.Insert.Source)
+			c.db.mu.RUnlock()
+			if err != nil {
+				return err
+			}
+		}
 	case sqlast.KindCreateIndex:
 		for i := range statement.CreateIndex.Paths {
 			if pseudoDocumentPath(statement.CreateIndex.Paths[i]) {
@@ -86,7 +96,7 @@ func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
 		relation := &selectStmt.From[i]
 		switch relation.Kind {
 		case sqlast.RelationCollection:
-			if _, exists := c.db.tables[relation.Name]; !exists {
+			if !c.selectTableExists(relation.Name) {
 				return missingTableDependency(
 					relation.Name, relation.Pos, false,
 				)
@@ -116,6 +126,16 @@ func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
 		return err
 	}
 	return validateExprSubqueries(selectStmt.Having, c.validateSelectTables)
+}
+
+func (c *conn) selectTableExists(name string) bool {
+	if c.tx != nil {
+		if _, exists := c.tx.tables[name]; exists {
+			return true
+		}
+	}
+	_, exists := c.db.tables[name]
+	return exists
 }
 
 func validateExprSubqueries(

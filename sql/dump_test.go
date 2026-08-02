@@ -124,6 +124,8 @@ func dumpColumn(b *strings.Builder, c *ResultColumn) {
 	switch {
 	case c.Window != nil:
 		dumpWindow(b, c.Window)
+	case c.Scalar != nil:
+		dumpScalar(b, c.Scalar)
 	case c.Agg == AggNone:
 		b.WriteString("path(")
 		dumpPath(b, c.Path)
@@ -392,6 +394,17 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 	case ExprConstant:
 		b.WriteString("constant ")
 		dumpOperand(b, e.Value)
+	case ExprScalarCompare:
+		fmt.Fprintf(b, "scalarcmp %s ", e.Op)
+		dumpScalar(b, e.ScalarLeft)
+		b.WriteByte(' ')
+		dumpScalar(b, e.ScalarRight)
+	case ExprScalarIsNull:
+		b.WriteString(negated(e, "scalar-isnull ", "scalar-isnotnull "))
+		dumpScalar(b, e.ScalarLeft)
+	case ExprScalarTruth:
+		b.WriteString("scalar-truth ")
+		dumpScalar(b, e.ScalarLeft)
 	case ExprBetween:
 		b.WriteString(negated(e, "between", "notbetween"))
 		b.WriteByte(' ')
@@ -425,6 +438,113 @@ func dumpExpr(b *strings.Builder, e *Expr) {
 		dumpOperand(b, e.Value)
 	}
 	b.WriteByte(')')
+}
+
+func dumpScalar(b *strings.Builder, e *ScalarExpr) {
+	if e == nil {
+		b.WriteString("<nil-scalar>")
+		return
+	}
+	switch e.Kind {
+	case ScalarPath:
+		b.WriteString("path(")
+		dumpPath(b, e.Path)
+		b.WriteByte(')')
+	case ScalarAggregate:
+		b.WriteString(strings.ToLower(e.Agg.String()))
+		b.WriteByte('(')
+		if e.Path == nil {
+			b.WriteByte('*')
+		} else {
+			dumpPath(b, e.Path)
+		}
+		b.WriteByte(')')
+	case ScalarLiteral:
+		dumpOperand(b, e.Value)
+	case ScalarNull:
+		b.WriteString("null")
+	case ScalarUnary:
+		b.WriteByte('(')
+		b.WriteString(dumpScalarOp(e.Op))
+		b.WriteByte(' ')
+		dumpScalar(b, e.Left)
+		b.WriteByte(')')
+	case ScalarBinary:
+		b.WriteByte('(')
+		b.WriteString(dumpScalarOp(e.Op))
+		b.WriteByte(' ')
+		dumpScalar(b, e.Left)
+		b.WriteByte(' ')
+		dumpScalar(b, e.Right)
+		b.WriteByte(')')
+	case ScalarCast:
+		b.WriteString("cast(")
+		b.WriteString(dumpScalarCastTarget(e.Cast))
+		b.WriteByte(' ')
+		dumpScalar(b, e.Left)
+		b.WriteByte(')')
+	case ScalarCase:
+		b.WriteString("case")
+		if e.Left != nil {
+			b.WriteByte(' ')
+			dumpScalar(b, e.Left)
+		}
+		for i := range e.Whens {
+			b.WriteString(" when ")
+			if e.Whens[i].Predicate != nil {
+				dumpExpr(b, e.Whens[i].Predicate)
+			} else {
+				dumpScalar(b, e.Whens[i].Match)
+			}
+			b.WriteString(" then ")
+			dumpScalar(b, e.Whens[i].Result)
+		}
+		if e.Else != nil {
+			b.WriteString(" else ")
+			dumpScalar(b, e.Else)
+		}
+		b.WriteString(" end")
+	default:
+		fmt.Fprintf(b, "scalar-kind(%d)", e.Kind)
+	}
+}
+
+func dumpScalarOp(op ScalarOp) string {
+	switch op {
+	case ScalarAdd:
+		return "+"
+	case ScalarSubtract:
+		return "-"
+	case ScalarMultiply:
+		return "*"
+	case ScalarDivide:
+		return "/"
+	case ScalarModulo:
+		return "%"
+	case ScalarConcat:
+		return "||"
+	case ScalarPositive:
+		return "u+"
+	case ScalarNegative:
+		return "u-"
+	default:
+		return fmt.Sprintf("op(%d)", op)
+	}
+}
+
+func dumpScalarCastTarget(target ScalarCastTarget) string {
+	switch target {
+	case ScalarCastText:
+		return "text"
+	case ScalarCastBoolean:
+		return "boolean"
+	case ScalarCastNumeric:
+		return "numeric"
+	case ScalarCastJSON:
+		return "json"
+	default:
+		return fmt.Sprintf("target(%d)", target)
+	}
 }
 
 func negated(e *Expr, plain, not string) string {

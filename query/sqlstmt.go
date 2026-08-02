@@ -152,11 +152,14 @@ type nestedStatements struct {
 	relationJoin *statementRelationJoin
 	window       *statementWindow
 	set          *statementSetSQL
+	scalar       *statementScalar
 	ctes         *statementCTEs
 	cte          *statementCTEReference
 	ownsCTEs     bool
 	driving      string
 }
+
+const statementRootIntermediateResource = "query source result"
 
 type subqueryUse uint8
 
@@ -276,6 +279,22 @@ func prepareTreeInContext(
 	ctes *statementCTEs,
 	argBase int,
 ) (*Statement, error) {
+	return prepareTreeInCorrelationContext(
+		src, tree, subqueryLimit, ctes, argBase, nil,
+	)
+}
+
+// prepareTreeInCorrelationContext is the LATERAL-only prepare entry. Keeping
+// the lexical frame as an argument, rather than on Statement, leaves every
+// non-correlated prepared and execution path byte-for-byte unchanged.
+func prepareTreeInCorrelationContext(
+	src string,
+	tree *sqlast.SelectStmt,
+	subqueryLimit uint8,
+	ctes *statementCTEs,
+	argBase int,
+	correlation *lateralPrepareFrame,
+) (*Statement, error) {
 	if recursive, pos := RecursiveSQLStatementRequired(tree); recursive &&
 		!recursiveSQLBridgeReentry(tree) {
 		// The owning top-level bridge rewrites each recursive definition to its
@@ -334,7 +353,7 @@ func prepareTreeInContext(
 		}
 	}
 	if s.window() == nil && generalizedJoin {
-		if err := s.prepareRelationJoin(argBase); err != nil {
+		if err := s.prepareRelationJoin(argBase, correlation); err != nil {
 			s.Release()
 			return nil, err
 		}
@@ -343,6 +362,10 @@ func prepareTreeInContext(
 			s.Release()
 			return nil, err
 		}
+	}
+	if err := s.prepareScalar(); err != nil {
+		s.Release()
+		return nil, err
 	}
 	if s.window() != nil {
 		s.requiresCatalog = s.window().input.RequiresCatalog()
@@ -465,6 +488,9 @@ func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
 	if set := s.setSQL(); set != nil {
 		return set.AppendSchema(dst)
 	}
+	if scalar := s.scalarStatement(); scalar != nil {
+		return scalar.appendSchema(dst, s.names)
+	}
 	start := len(dst)
 	dst = s.q.AppendSchema(dst)
 	if len(dst)-start > s.outputs {
@@ -492,6 +518,7 @@ func (s *Statement) Release() {
 		if s.nested.set != nil {
 			s.nested.set.Release()
 		}
+		s.nested.scalar = nil
 		for i := range s.nested.subqueries {
 			s.nested.subqueries[i].stmt.Release()
 			s.nested.subqueries[i].exec.Release()
@@ -562,6 +589,78 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// runIntoFrame returns, and the result cursor borrows only Exec.Result.
 	frame.args = nil
 	return cursor, err
+}
+
+// RunIntermediateInto binds and executes s like [Statement.RunInto], but makes
+// its final Result part of the statement-wide IntermediateBytes allowance.
+// This is the execution boundary for a query result that immediately feeds a
+// larger atomic operation, such as INSERT ... SELECT.
+//
+// The returned retained byte count is exact for the successful execution: it
+// includes e.Result plus every relation, CTE, set, window, join, and scalar
+// dependency spool that remains live while the cursor is consumed. A caller
+// starts its next staging account with that count and keeps it admitted until
+// it is finished with the cursor. Historical intermediates already released by
+// the query are not included; their peaks were enforced while they were live.
+//
+// ResultRows and ResultBytes retain their ordinary caller-visible semantics.
+// If both byte limits would reject the same growth, the stricter limit selects
+// the error type and ResultBytes wins an equal-limit tie. Rejected and canceled
+// executions return a zero count and expose no partial Result. The method is
+// single-consumer and allocation-free after the same warm-up as RunInto.
+func (s *Statement) RunIntermediateInto(
+	e *Exec,
+	src Source,
+	args []any,
+) (cursor Cursor, retained int64, err error) {
+	if e == nil {
+		return Cursor{}, 0, fmt.Errorf(
+			"query: RunIntermediateInto requires a non-nil Exec",
+		)
+	}
+	// Match RunInto's failed-attempt contract before validating either budget.
+	clearExecBorrowedViews(e)
+	e.Stats = ExecStats{}
+	limit, err := normalizeIntermediateBytes(e.Options)
+	if err != nil {
+		return Cursor{}, 0, err
+	}
+
+	if s.nested == nil {
+		e.Result.beginRootIntermediate(nil, limit)
+		defer e.Result.endRootIntermediate()
+		cursor, err = s.runDirectInto(e, src, args)
+		if err != nil {
+			return Cursor{}, 0, err
+		}
+		return cursor, e.Result.resultBytesUsed, nil
+	}
+
+	s.discardRelations()
+	frame := &s.nested.frame
+	if err = frame.begin(e.Options); err != nil {
+		return Cursor{}, 0, err
+	}
+	frame.args = args
+	e.Result.beginRootIntermediate(&frame.intermediate, 0)
+	defer func() {
+		e.Result.endRootIntermediate()
+		frame.args = nil
+	}()
+
+	cursor, err = s.runIntoFrame(e, src, args, frame, "")
+	if err != nil {
+		// Every branch normally releases its own live relation state. The root
+		// cleanup is intentionally idempotent and closes that invariant at the
+		// API boundary for bind, cancellation, and future execution branches.
+		clearExecBorrowedViews(e)
+		s.releaseRelations(frame)
+		return Cursor{}, 0, err
+	}
+	retained = saturatedBytes(
+		frame.intermediate.used, e.Result.resultBytesUsed,
+	)
+	return cursor, retained, nil
 }
 
 // runDirectInto is the no-nested-state execution path. Keeping it separate is
@@ -674,6 +773,40 @@ func (s *Statement) runIntoFrame(
 		// deeper derived relation or predicate subquery may have consumed part
 		// of the allowance since this nested statement began.
 		e.Options.ResultBytes = remaining
+	}
+	if scalar := s.scalarStatement(); scalar != nil {
+		options := e.Options
+		remaining := frame.intermediate.remaining()
+		if remaining == 0 {
+			s.releaseRelations(frame)
+			return Cursor{}, &IntermediateBudgetError{
+				Resource: "scalar dependency result",
+				Bytes:    saturatedBytes(frame.intermediate.used, 1),
+				Limit:    frame.intermediate.limit,
+			}
+		}
+		e.Options.ResultRows = -1
+		e.Options.ResultBytes = remaining
+		err := s.q.RunInto(e, runSource)
+		e.Options = options
+		if err != nil {
+			clearExecBorrowedViews(e)
+			s.releaseRelations(frame)
+			var resultErr *ResultBudgetError
+			if errors.As(err, &resultErr) && resultErr.ByteLimit == remaining {
+				return Cursor{}, &IntermediateBudgetError{
+					Resource: "scalar dependency result",
+					Bytes:    saturatedBytes(frame.intermediate.used, resultErr.Bytes),
+					Limit:    frame.intermediate.limit,
+				}
+			}
+			return Cursor{}, err
+		}
+		cursor, err := scalar.execute(s, e, frame, options, intermediateResource)
+		if err != nil {
+			s.releaseRelations(frame)
+		}
+		return cursor, err
 	}
 	if err := s.q.RunInto(e, runSource); err != nil {
 		// A relation execution may have parked grouped/order state that borrows
@@ -1069,9 +1202,17 @@ func (c *Cursor) Next() bool {
 	return next
 }
 
-// nextWithCancel is Next for internal relation materializers. It checks the
-// underlying result-row loop, including rows HAVING rejects, so cancellation
-// latency is bounded even when no row is ever yielded to the caller.
+// NextWithCancel advances like [Cursor.Next], but observes cancel while it
+// walks underlying rows rejected by HAVING or OFFSET. Callers that perform a
+// second, atomic operation from a query cursor use this form so cancellation
+// latency is bounded even when the query yields no visible rows. A nil flag is
+// the same allocation-free path as Next.
+func (c *Cursor) NextWithCancel(cancel *CancelFlag) (bool, error) {
+	return c.nextWithCancel(cancel)
+}
+
+// nextWithCancel is the shared implementation for public cursor consumers and
+// internal relation materializers.
 func (c *Cursor) nextWithCancel(cancel *CancelFlag) (bool, error) {
 	if c.res == nil || c.left == 0 {
 		return false, nil
@@ -1240,6 +1381,11 @@ func (s *Statement) describe() error {
 	s.names = reserve(s.names[:0], capacity)
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
+		if column.Scalar != nil {
+			s.names = append(s.names, s.columnName(column))
+			s.outputs++
+			continue
+		}
 		if s.hasRelationBinding() && column.Agg == sqlast.AggNone &&
 			column.Path != nil && len(column.Path.Segments) == 0 {
 			relation := s.relationBindingForSource(column.Path.Source)
@@ -1263,6 +1409,9 @@ func (s *Statement) describe() error {
 func (s *Statement) columnName(col *sqlast.ResultColumn) string {
 	if col.Alias != "" {
 		return col.Alias
+	}
+	if col.Scalar != nil {
+		return "?column?"
 	}
 	spec := s.spec(col.Path)
 	if s.relationJoin() != nil && col.Path != nil {

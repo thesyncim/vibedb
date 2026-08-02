@@ -86,7 +86,6 @@ func TestRejectsSyntaxErrors(t *testing.T) {
 func TestRejectsNonPredicateExpressions(t *testing.T) {
 	runRejections(t, []rejection{
 		{"a bare path is not a condition", `SELECT a FROM t WHERE flag`, 26, "flag = TRUE"},
-		{"a constant is not a condition", `SELECT a FROM t WHERE 1 = 1`, 22, "must begin with a path"},
 		{"two paths do not compare", `SELECT a FROM t WHERE b = c`, 26, "right side of a comparison is a constant"},
 		{"NULL is not an operand", `SELECT a FROM t WHERE b = NULL`, 26, "IS NULL"},
 		{"NULL is not a membership alternative", `SELECT a FROM t WHERE b IN (1, NULL)`, 31, "IS NULL"},
@@ -107,12 +106,8 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"LIKE ESCAPE", `SELECT a FROM t WHERE b LIKE 'x%' ESCAPE '!'`, 34, "LIKE ... ESCAPE"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
-		{"CASE", `SELECT a FROM t WHERE CASE WHEN b THEN 1 END = 1`, 22, "CASE"},
-		{"CAST", `SELECT a FROM t WHERE CAST(b AS text) = 1`, 22, "CAST"},
 		{"the cast operator", `SELECT a FROM t WHERE b::text = 'x'`, 23, "::"},
 		{"scalar functions", `SELECT lower(a) FROM t`, 12, "not a supported function"},
-		{"arithmetic", `SELECT a FROM t WHERE b + 1 = 2`, 24, "arithmetic"},
-		{"concatenation", `SELECT a FROM t WHERE b || 'x' = 'y'`, 24, "concatenation"},
 		// Parse is the SELECT-only entry point. These three are statements the
 		// dialect does support, through ParseStatement, so the message names
 		// that entry point rather than claiming the engine cannot run them.
@@ -153,8 +148,6 @@ func TestRejectsAmbiguousOrUnresolvablePaths(t *testing.T) {
 			`SELECT u.* FROM docs`, 7, "projects nothing"},
 		{"a star outside the select list",
 			`SELECT a FROM t WHERE b.* = 1`, 24, "only allowed in the SELECT list"},
-		{"a placeholder cannot name a path",
-			`SELECT ? FROM t`, 7, "cannot name a path"},
 		{"a placeholder cannot be a subscript",
 			`SELECT a[?] FROM t`, 9, "cannot be a subscript"},
 		{"a negative subscript",

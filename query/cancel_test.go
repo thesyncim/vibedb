@@ -35,6 +35,33 @@ func TestCancelFlagTakeIsAtomicAndReusable(t *testing.T) {
 	}
 }
 
+func TestCursorNextWithCancelIsReusableAndNilFlagIsAllocationFree(t *testing.T) {
+	base := NewTextCursor("value", "visible")
+	var cancel CancelFlag
+	cancel.Cancel()
+	cursor := base
+	if next, err := cursor.NextWithCancel(&cancel); next || !errors.Is(err, ErrCanceled) {
+		t.Fatalf("canceled advance = %v, %v; want false, ErrCanceled", next, err)
+	}
+	cancel.Reset()
+	if next, err := cursor.NextWithCancel(&cancel); !next || err != nil {
+		t.Fatalf("advance after reset = %v, %v; want true, nil", next, err)
+	}
+
+	var next bool
+	var err error
+	allocs := testing.AllocsPerRun(1000, func() {
+		cursor = base
+		next, err = cursor.NextWithCancel(nil)
+	})
+	if err != nil || !next {
+		t.Fatalf("nil-flag advance = %v, %v; want true, nil", next, err)
+	}
+	if allocs != 0 {
+		t.Fatalf("nil-flag cursor advance allocated %.2f times, want zero", allocs)
+	}
+}
+
 func TestCancelFlagStopsAndRecoversEveryScanBackend(t *testing.T) {
 	documents := [][]byte{
 		[]byte(`{"id":1,"active":true}`),

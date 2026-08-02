@@ -140,6 +140,11 @@ type prepared struct {
 	// paramKinds consolidates the scalar/document role of every wire parameter,
 	// including repeated $n occurrences.
 	paramKinds []sqldriver.ParamKind
+	// paramPositions stores the first authored document occurrence's byte
+	// position plus one for each wire parameter. It stays nil for scalar-only
+	// statements and is converted to PostgreSQL character coordinates only on
+	// the bind-error path.
+	paramPositions []int
 	// fixed is the result of a statement this package answers itself.
 	fixed *fixedResult
 	// set is the decoded SET or RESET.
@@ -169,6 +174,7 @@ func (p *prepared) release() {
 		p.runtime = nil
 	}
 	p.paramKinds = nil
+	p.paramPositions = nil
 }
 
 // A portal is one bound, executable instance of a prepared statement.
@@ -800,14 +806,13 @@ func (s *session) simpleQuery(sql string) error {
 		}
 		if s.takeCancel() {
 			s.markTransactionFailed()
-			s.w.errorResponse(newError(sqlstateQueryCanceled,
-				"canceling statement due to a cancel request"))
+			s.w.errorResponse(queryCanceled())
 			failed = true
 			break
 		}
 		if err := s.runSimple(text); err != nil {
-			var pg *pgError
-			if !errors.As(err, &pg) {
+			pg, ok := classifiedProtocolError(err)
+			if !ok {
 				return err
 			}
 			s.markTransactionFailed()
@@ -828,10 +833,10 @@ func (s *session) simpleQuery(sql string) error {
 		}
 		if failed {
 			if err := s.sql.Rollback(context.Background()); err != nil {
-				s.w.errorResponse(asPGError(err))
+				s.reportTransactionCompletionError(err)
 			}
 		} else if err := s.sql.Commit(context.Background()); err != nil {
-			s.w.errorResponse(asPGError(err))
+			s.reportTransactionCompletionError(err)
 		}
 		// A cancel racing with the indivisible commit/rollback step cannot
 		// replace the storage outcome that operation returned (including an
@@ -846,6 +851,14 @@ func (s *session) simpleQuery(sql string) error {
 	_ = s.takeCancel()
 	s.w.readyForQuery(s.transactionStatus())
 	return s.flush()
+}
+
+// reportTransactionCompletionError is the shared simple/extended commit
+// boundary. The runtime has already selected its final transaction state, so
+// this reports the exact typed failure without marking that completed
+// transaction failed or poisoning a later independent statement.
+func (s *session) reportTransactionCompletionError(err error) {
+	s.w.errorResponse(asPGError(err))
 }
 
 func (s *session) preflightSimpleQuery(src string) (bool, error) {
@@ -1178,6 +1191,19 @@ func configureRuntimeParamKinds(p *prepared) error {
 				withHint("use separate parameters for whole-document writes and scalar predicates")
 		}
 		p.paramKinds[wire] = role
+		if role == sqldriver.ParamDocument {
+			position := p.runtime.ParamPosition(occurrence)
+			if position >= 0 {
+				if p.paramPositions == nil {
+					p.paramPositions = make([]int, p.wireParams)
+				}
+				encoded := position + 1
+				if p.paramPositions[wire] == 0 ||
+					encoded < p.paramPositions[wire] {
+					p.paramPositions[wire] = encoded
+				}
+			}
+		}
 	}
 	for i := range p.paramKinds {
 		if p.paramKinds[i] == sqldriver.ParamInvalid {
@@ -1385,6 +1411,10 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 		return "TRUNCATE TABLE"
 	case sqlast.KindDropIndex:
 		return "DROP INDEX"
+	case sqlast.KindCreateView:
+		return "CREATE VIEW"
+	case sqlast.KindDropView:
+		return "DROP VIEW"
 	default:
 		return kind.String()
 	}
@@ -1393,7 +1423,8 @@ func runtimeCommandTag(kind sqlast.Kind, rows int64) string {
 func runtimeKindIsDDL(kind sqlast.Kind) bool {
 	switch kind {
 	case sqlast.KindCreateTable, sqlast.KindCreateIndex, sqlast.KindDropTable,
-		sqlast.KindTruncate, sqlast.KindDropIndex:
+		sqlast.KindTruncate, sqlast.KindDropIndex,
+		sqlast.KindCreateView, sqlast.KindDropView:
 		return true
 	default:
 		return false
@@ -1608,7 +1639,8 @@ func (s *session) executeFixed(p *portal, limit int32) error {
 }
 
 func queryCanceled() *pgError {
-	return newError(sqlstateQueryCanceled, "canceling statement due to a cancel request")
+	return newError(sqlstateQueryCanceled,
+		"canceling statement due to a cancel request").withCause(query.ErrCanceled)
 }
 
 func cancelPortal(p *portal) {

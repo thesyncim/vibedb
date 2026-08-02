@@ -1611,7 +1611,9 @@ func ownScalars(
 	}
 	need := 0
 	for i := range cols {
-		need += scalarOwnBytes(ctx.values[cols[i].value][row])
+		if cols[i].value >= 0 {
+			need += scalarOwnBytes(ctx.values[cols[i].value][row])
+		}
 	}
 	for i := range order {
 		need += scalarOwnBytes(ctx.values[order[i].value][row])
@@ -1633,7 +1635,9 @@ func ownScalars(
 	out = out[:0]
 	for i := range cols {
 		var s scalar
-		arena, s = ownScalarInto(arena, ctx.values[cols[i].value][row])
+		if cols[i].value >= 0 {
+			arena, s = ownScalarInto(arena, ctx.values[cols[i].value][row])
+		}
 		out = append(out, s)
 	}
 	for i := range order {

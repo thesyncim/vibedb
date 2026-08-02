@@ -152,10 +152,16 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 		return reflect.TypeFor[string]()
 	}
 	schema := r.columnSchema()
-	if index >= 0 && index < len(schema) &&
-		(schema[index].Reduction == query.ReductionCount ||
-			schema[index].Reduction == query.ReductionWindowInteger) {
-		return reflect.TypeFor[int64]()
+	if index >= 0 && index < len(schema) {
+		switch {
+		case schema[index].Reduction == query.ReductionCount ||
+			schema[index].Reduction == query.ReductionWindowInteger:
+			return reflect.TypeFor[int64]()
+		case schema[index].Representation == query.OutputSQLText:
+			return reflect.TypeFor[[]byte]()
+		case schema[index].Representation == query.OutputSQLBool:
+			return reflect.TypeFor[bool]()
+		}
 	}
 	return reflect.TypeFor[any]()
 }
@@ -165,14 +171,26 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 		return "TEXT"
 	}
 	schema := r.columnSchema()
-	if index < 0 || index >= len(schema) || schema[index].Reduction == query.ReductionNone {
+	if index < 0 || index >= len(schema) {
 		return "JSON"
 	}
 	if schema[index].Reduction == query.ReductionCount ||
 		schema[index].Reduction == query.ReductionWindowInteger {
 		return "BIGINT"
 	}
-	return "NUMERIC"
+	if schema[index].Reduction != query.ReductionNone {
+		return "NUMERIC"
+	}
+	switch schema[index].Representation {
+	case query.OutputSQLText:
+		return "TEXT"
+	case query.OutputSQLNumber:
+		return "NUMERIC"
+	case query.OutputSQLBool:
+		return "BOOLEAN"
+	default:
+		return "JSON"
+	}
 }
 
 func (r *rows) ColumnTypeNullable(index int) (bool, bool) {

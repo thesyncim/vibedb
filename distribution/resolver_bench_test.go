@@ -17,6 +17,7 @@ import (
 var (
 	benchSinkShard  ShardID
 	benchSinkShards []ShardID
+	benchSinkTarget Target
 )
 
 // benchShardCounts is the geometric sweep that exposes the resolver's growth
@@ -44,6 +45,22 @@ func BenchmarkResolvePoint(b *testing.B) {
 			i := 0
 			for b.Loop() {
 				benchSinkShard, _ = m.ResolvePoint(pts[i&(probes-1)])
+				i++
+			}
+		})
+	}
+}
+
+func BenchmarkResolvePointTarget(b *testing.B) {
+	const probes = 1024
+	pts := benchProbePoints(probes)
+	for _, shardCount := range benchShardCounts {
+		m := manifestFromBounds(b, evenlySpacedBounds(shardCount)...)
+		b.Run(fmt.Sprintf("shards=%d", shardCount), func(b *testing.B) {
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				benchSinkTarget, _ = m.ResolvePointTarget(pts[i&(probes-1)])
 				i++
 			}
 		})
@@ -85,5 +102,24 @@ func TestZeroAllocationResolvePoint(t *testing.T) {
 	})
 	if allocations != 0 {
 		t.Fatalf("ResolvePoint allocations = %v, want 0", allocations)
+	}
+}
+
+func TestZeroAllocationResolvePointTarget(t *testing.T) {
+	m := manifestFromBounds(t, evenlySpacedBounds(4096)...)
+	pts := benchProbePoints(1024)
+	i := 0
+	allocations := testing.AllocsPerRun(1000, func() {
+		var ok bool
+		benchSinkTarget, ok = m.ResolvePointTarget(pts[i&1023])
+		if !ok || benchSinkTarget.Shard == "" ||
+			benchSinkTarget.Endpoint == "" ||
+			benchSinkTarget.Role != RoleLeader {
+			t.Fatal("ResolvePointTarget returned an incomplete leader target")
+		}
+		i++
+	})
+	if allocations != 0 {
+		t.Fatalf("ResolvePointTarget allocations = %v, want 0", allocations)
 	}
 }

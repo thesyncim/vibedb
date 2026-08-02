@@ -181,7 +181,10 @@ func requiresGeneralizedRelationJoin(tree *sqlast.SelectStmt) bool {
 	return false
 }
 
-func (s *Statement) prepareRelationJoin(argBase int) error {
+func (s *Statement) prepareRelationJoin(
+	argBase int,
+	correlation *lateralPrepareFrame,
+) error {
 	if len(s.tree.From) <= 1 {
 		return nil
 	}
@@ -215,7 +218,7 @@ func (s *Statement) prepareRelationJoin(argBase int) error {
 			var err error
 			if ref.Lateral != nil && !ref.Lateral.Decorrelated {
 				op.lateral, child, err = prepareStatementLateral(
-					s, j, ref, i, argBase,
+					s, j, ref, i, argBase, correlation,
 				)
 			} else {
 				child, err = prepareTreeInContext(

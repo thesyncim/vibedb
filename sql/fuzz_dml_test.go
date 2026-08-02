@@ -32,6 +32,7 @@ func FuzzParseStatement(f *testing.F) {
 		`INSERT INTO t VALUES (?) RETURNING id, *`,
 		`INSERT INTO t ("$key", "$doc") VALUES ('k', {"a":1})`,
 		`INSERT INTO t VALUES ({"id":"a"}), ('{"id":"b"}')`,
+		`INSERT INTO t SELECT returning, returning, returning, returning, returning, returning, returning, returning FROM src WHERE`,
 		`INSERT INTO t (id, active) VALUES ('a', TRUE), ('b', FALSE)`,
 		`INSERT INTO t VALUES (`,
 		`UPDATE t SET "$doc" = ?`,
@@ -42,6 +43,7 @@ func FuzzParseStatement(f *testing.F) {
 		`DELETE FROM t WHERE "$key" IN ('a', 'b', ?)`,
 		`DELETE FROM t WHERE a @> {"k": [1, null]}`,
 		`DELETE FROM t WHERE "$key" = 'a' OR b = 1`,
+		`VALUES ('standalone query expression')`,
 		`CREATE TABLE t`,
 		`CREATE TABLE t (a STRING PRIMARY KEY, b INTEGER NOT NULL, c ANY)`,
 		`CREATE TABLE t (a STRING, b NUMBER, PRIMARY KEY (a, b))`,
@@ -118,7 +120,8 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 	for _, present := range []bool{
 		s.Select != nil, s.Insert != nil, s.Update != nil, s.Delete != nil,
 		s.CreateTable != nil, s.CreateIndex != nil, s.DropTable != nil,
-		s.Truncate != nil, s.DropIndex != nil,
+		s.Truncate != nil, s.DropIndex != nil, s.CreateView != nil,
+		s.DropView != nil,
 	} {
 		if present {
 			bodies++
@@ -127,7 +130,8 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 	if bodies != 1 {
 		t.Fatalf("an accepted statement carries %d bodies, want exactly 1", bodies)
 	}
-	if s.Table() == "" && s.Kind != KindDropIndex {
+	if s.Table() == "" && s.Kind != KindDropIndex &&
+		!(s.Kind == KindSelect && s.Select != nil && s.Select.Set != nil) {
 		t.Fatal("an accepted statement names no collection")
 	}
 	switch s.Kind {
@@ -176,6 +180,16 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 		if s.DropIndex.HasTable != (s.DropIndex.Table != "") {
 			t.Fatal("KindDropIndex has inconsistent ON table state")
 		}
+	case KindCreateView:
+		if s.CreateView == nil || s.CreateView.Name == "" ||
+			s.CreateView.Query == nil || s.CreateView.QuerySQL == "" {
+			t.Fatal("KindCreateView has an incomplete definition")
+		}
+		checkStatementInvariants(t, s.CreateView.Query)
+	case KindDropView:
+		if s.DropView == nil || s.DropView.Name == "" {
+			t.Fatal("KindDropView with no view name")
+		}
 	default:
 		t.Fatalf("unknown statement kind %d", s.Kind)
 	}
@@ -183,10 +197,19 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 
 func checkInsert(t *testing.T, s *InsertStmt) {
 	t.Helper()
-	if len(s.Rows) == 0 {
-		t.Fatal("an accepted INSERT writes no rows")
+	if (s.Source == nil) == (len(s.Rows) == 0) {
+		t.Fatal("an accepted INSERT must own exactly one of VALUES rows and a query source")
+	}
+	if s.Source != nil {
+		if len(s.Columns) != 0 {
+			t.Fatal("INSERT SELECT retained a VALUES column list")
+		}
+		checkStatementInvariants(t, s.Source)
 	}
 	seen := 0
+	if s.Source != nil {
+		seen = s.Source.Params
+	}
 	for i := range s.Rows {
 		row := &s.Rows[i]
 		wantValues := 1

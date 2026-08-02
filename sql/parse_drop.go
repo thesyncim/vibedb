@@ -15,11 +15,16 @@ func (p *Parser) parseDrop(dst *Statement) error {
 	case p.atKeyword(kwIndex):
 		dst.Kind, dst.DropIndex = KindDropIndex, &p.dropIndex
 		return p.parseDropIndex()
+	case p.atKeyword(kwView):
+		dst.Kind, dst.DropView = KindDropView, &p.dropView
+		return p.parseDropView()
+	case p.atKeyword(kwMaterialized):
+		return p.parseUnsupportedDrop()
 	default:
 		if p.tok.kind == tokIdent && recognizedDropObjectKind(p.tok.text) {
 			return p.parseUnsupportedDrop()
 		}
-		return p.errHere("expected TABLE or INDEX after DROP")
+		return p.errHere("expected TABLE, INDEX, VIEW, or MATERIALIZED VIEW after DROP")
 	}
 }
 

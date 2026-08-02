@@ -31,6 +31,12 @@ const (
 	tokGt
 	tokGe
 	tokContains // @>
+	tokPlus
+	tokMinus
+	tokSlash
+	tokPercent
+	tokConcat      // ||
+	tokDoubleColon // ::, retained so the unsupported shorthand is typed 0A000
 )
 
 // A token is one lexeme. text is a slice of the source for identifiers,
@@ -84,6 +90,8 @@ const (
 	kwDistinct
 	kwDo
 	kwDrop
+	kwElse
+	kwEnd
 	kwEscape
 	kwExcept
 	kwExclude
@@ -156,6 +164,7 @@ const (
 	kwSimilar
 	kwSum
 	kwTable
+	kwThen
 	kwTies
 	kwTruncate
 	kwTrue
@@ -247,6 +256,10 @@ func keywordOf(s string) keyword {
 		return kwDo
 	case "DROP":
 		return kwDrop
+	case "ELSE":
+		return kwElse
+	case "END":
+		return kwEnd
 	case "ESCAPE":
 		return kwEscape
 	case "EXCEPT":
@@ -391,6 +404,8 @@ func keywordOf(s string) keyword {
 		return kwSum
 	case "TABLE":
 		return kwTable
+	case "THEN":
+		return kwThen
 	case "TIES":
 		return kwTies
 	case "TRUNCATE":

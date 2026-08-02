@@ -57,11 +57,13 @@ import (
 // produce rather than refused, which removes the worst failure mode available
 // instead of documenting it.
 //
-// The exception is COUNT, which is declared int8 (OID 20). A row tally is
-// genuinely an int64 — it is the one column in this dialect with a real static
-// type — and clients want to scan it into an integer rather than through a JSON
-// decoder. int8's binary format is eight big-endian bytes, which is the other
-// encoding this package can be certain of.
+// Statically typed SQL expressions are the exceptions. COUNT and integer
+// window reductions are int8 (OID 20); concatenation and CAST AS TEXT are text
+// (OID 25); CAST AS BOOLEAN is bool (OID 16). Their text and binary encodings
+// are implemented and checked as a pair below. Exact arithmetic and CAST AS
+// NUMERIC remain json deliberately: PostgreSQL numeric's binary base-10000
+// format is not advertised until a separately validated numeric_send exists,
+// while json carries every exact decimal spelling without a float fallback.
 //
 // # What the mapping costs
 //
@@ -128,10 +130,16 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 	dst = dst[:0]
 	for i, name := range names {
 		typ := typeJSON
-		if i < len(schema) &&
-			(schema[i].Reduction == query.ReductionCount ||
-				schema[i].Reduction == query.ReductionWindowInteger) {
-			typ = typeInt8
+		if i < len(schema) {
+			switch {
+			case schema[i].Reduction == query.ReductionCount ||
+				schema[i].Reduction == query.ReductionWindowInteger:
+				typ = typeInt8
+			case schema[i].Representation == query.OutputSQLText:
+				typ = typeText
+			case schema[i].Representation == query.OutputSQLBool:
+				typ = typeBool
+			}
 		}
 		dst = append(dst, column{name: name, typ: typ})
 	}
@@ -270,6 +278,25 @@ func cellWireSize(cell query.Cell, typ columnType, format int16) (int, error) {
 		}
 		return len(encoded), nil
 
+	case oidText:
+		text, ok := cell.TextBytes()
+		if !ok {
+			return 0, newError(sqlstateInternalError,
+				"a column declared text produced a value that is not a string")
+		}
+		return len(text), nil
+
+	case oidBool:
+		_, ok := cell.Bool()
+		if !ok {
+			return 0, newError(sqlstateInternalError,
+				"a column declared bool produced a value that is not boolean")
+		}
+		if format == formatBinary {
+			return 1, nil
+		}
+		return 1, nil // PostgreSQL text bool is the one-byte spelling t/f.
+
 	default:
 		return 0, newError(sqlstateInternalError, "unhandled result column type")
 	}
@@ -308,6 +335,31 @@ func appendCell(dst []byte, cell query.Cell, typ columnType, format int16) ([]by
 				"a result cell produced no JSON encoding")
 		}
 		return dst, nil
+
+	case oidText:
+		text, ok := cell.TextBytes()
+		if !ok {
+			return dst, newError(sqlstateInternalError,
+				"a column declared text produced a value that is not a string")
+		}
+		return append(dst, text...), nil
+
+	case oidBool:
+		value, ok := cell.Bool()
+		if !ok {
+			return dst, newError(sqlstateInternalError,
+				"a column declared bool produced a value that is not boolean")
+		}
+		if format == formatBinary {
+			if value {
+				return append(dst, 1), nil
+			}
+			return append(dst, 0), nil
+		}
+		if value {
+			return append(dst, 't'), nil
+		}
+		return append(dst, 'f'), nil
 
 	default:
 		return dst, newError(sqlstateInternalError, "unhandled result column type")

@@ -130,6 +130,8 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwTruncate):
 		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
 		return p.parseTruncate()
+	case tokenTextEqual(p.tok, "REFRESH"):
+		return p.parseUnsupportedRefreshView()
 	case p.atKeyword(kwValues), p.atKeyword(kwTable):
 		dst.Kind, dst.Select = KindSelect, &p.sel
 		p.out = &p.sel
@@ -163,37 +165,48 @@ func (p *Parser) parseInsert() error {
 	if err := p.rejectAlias(); err != nil {
 		return err
 	}
-	if p.tok.kind == tokLParen {
+	parenthesizedSource := p.tok.kind == tokLParen &&
+		p.insertParenthesizedSource()
+	if p.tok.kind == tokLParen && !parenthesizedSource {
 		if err := p.parseInsertColumns(); err != nil {
 			return err
 		}
 	}
 	switch {
-	case p.atKeyword(kwSelect):
-		return p.errHere("INSERT ... SELECT is not supported: the engine executes one plan and has nowhere to send its rows; read with SELECT and write the documents back")
-	case p.atKeyword(kwDefault):
-		return p.errHere("INSERT ... DEFAULT VALUES is not supported: a schemaless document has no declared columns and therefore no defaults")
-	}
-	if err := p.expectKeyword(kwValues, "VALUES"); err != nil {
-		return err
-	}
-	rows := p.rows[:0]
-	for {
-		row, err := p.parseInsertRow()
-		if err != nil {
+	case p.atKeyword(kwSelect), p.atKeyword(kwWith),
+		p.atKeyword(kwTable), parenthesizedSource:
+		if len(p.ins.Columns) != 0 {
+			return p.featureNotSupportedHere(
+				"INSERT ... SELECT initially accepts one complete JSON document column; a target column list would require row-to-document construction",
+			)
+		}
+		if err := p.parseInsertSource(); err != nil {
 			return err
 		}
-		rows = append(rows, row)
-		if len(rows) > maxClauseItems {
-			return p.errfAt(row.Pos, "an INSERT may hold at most %d rows", maxClauseItems)
+	case p.atKeyword(kwDefault):
+		return p.errHere("INSERT ... DEFAULT VALUES is not supported: a schemaless document has no declared columns and therefore no defaults")
+	default:
+		if err := p.expectKeyword(kwValues, "VALUES or SELECT"); err != nil {
+			return err
 		}
-		if p.tok.kind != tokComma {
-			break
+		rows := p.rows[:0]
+		for {
+			row, err := p.parseInsertRow()
+			if err != nil {
+				return err
+			}
+			rows = append(rows, row)
+			if len(rows) > maxClauseItems {
+				return p.errfAt(row.Pos, "an INSERT may hold at most %d rows", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
 		}
-		p.advance()
+		p.rows = rows
+		p.ins.Rows = rows
 	}
-	p.rows = rows
-	p.ins.Rows = rows
 	if p.acceptKeyword(kwOn) {
 		if err := p.expectKeyword(kwConflict, "CONFLICT after ON"); err != nil {
 			return err
@@ -226,6 +239,172 @@ func (p *Parser) parseInsert() error {
 	return nil
 }
 
+func (p *Parser) insertParenthesizedSource() bool {
+	probe := p.lx
+	next := probe.next()
+	return next.kind == tokLParen || next.kind == tokIdent &&
+		(next.kw == kwSelect || next.kw == kwWith ||
+			next.kw == kwTable || next.kw == kwValues)
+}
+
+// parseInsertSource parses one query expression without letting its trailing
+// INSERT clauses become part of that expression. It first parses the complete
+// remainder as a query. A successful full parse wins, which preserves
+// unquoted, non-reserved names such as RETURNING wherever the query grammar
+// accepts them.
+//
+// On failure, the parser's exact error position bounds a constant-size search
+// for the last top-level RETURNING or ON CONFLICT boundary. Two candidates are
+// sufficient because an unreserved RETURNING may be consumed as a bare table
+// alias, moving the full parse error to the following RETURNING projection.
+// A fixed stack array retains those candidates and at most two prefixes are
+// reparsed. The work is therefore linear in statement size (one full parse,
+// one scan, and at most two prefix parses), rather than one near-full reparse
+// per keyword-shaped identifier.
+func (p *Parser) parseInsertSource() error {
+	start := p.tok.pos
+	child := p.nextSetLeafParser()
+	child.cancel = p.cancel
+	parseAt := func(end int) error {
+		query := &child.sel
+		if err := child.parseSelectText(
+			query, p.lx.src[start:end], nil, nil, nil,
+			p.nesting, false,
+		); err != nil {
+			return p.rebaseSubqueryError(err, start)
+		}
+		shiftSelectPositions(query, start)
+		p.ins.Source = query
+		p.ins.SourcePos = start
+		p.params = query.Params
+		for p.tok.kind != tokEOF && p.tok.pos < end {
+			p.advance()
+		}
+		return nil
+	}
+	fullErr := parseAt(len(p.lx.src))
+	if fullErr == nil {
+		return nil
+	}
+	parseErr, ok := fullErr.(*ParseError)
+	if !ok || parseErr.Pos <= start {
+		return fullErr
+	}
+	boundaries, boundaryCount, err := p.insertTailsAt(start, parseErr.Pos)
+	if err != nil {
+		return err
+	}
+	for i := boundaryCount - 1; i >= 0; i-- {
+		if err := parseAt(boundaries[i]); err == nil {
+			return nil
+		}
+	}
+	// The keyword-shaped tokens were part of a malformed source rather than a
+	// valid INSERT tail. Preserve the complete query's better diagnostic.
+	return fullErr
+}
+
+const maxInsertTailBoundaryProbes = 2
+
+// insertTailsAt reports the final bounded set of top-level INSERT-tail
+// boundaries at or before the complete query parse's error position.
+func (p *Parser) insertTailsAt(
+	start, errorPos int,
+) ([maxInsertTailBoundaryProbes]int, int, error) {
+	var candidates [maxInsertTailBoundaryProbes]int
+	candidateCount := 0
+	appendCandidate := func(pos int) {
+		if candidateCount != 0 && candidates[candidateCount-1] == pos {
+			return
+		}
+		if candidateCount < len(candidates) {
+			candidates[candidateCount] = pos
+			candidateCount++
+			return
+		}
+		copy(candidates[:], candidates[1:])
+		candidates[len(candidates)-1] = pos
+	}
+	lx := lexer{
+		src: p.lx.src, pos: start, cancel: p.cancel,
+		nextCancelByte: start + parserCancelByteInterval,
+	}
+	depth := 0
+	previousTop := token{pos: -1}
+	consecutiveReturningAtError := false
+	afterError := token{kind: tokEOF, pos: errorPos}
+	for {
+		tok := lx.next()
+		if tok.kind == tokError {
+			if lx.cancelErr != nil {
+				return candidates, 0, lx.cancelErr
+			}
+			return candidates, 0, p.errAt(tok.pos, tok.text)
+		}
+		if depth == 0 {
+			if tok.kind == tokSemicolon {
+				break
+			}
+			if tok.pos > errorPos && afterError.pos == errorPos {
+				afterError = tok
+			}
+			if tok.pos == errorPos {
+				if previousTop.kind == tokIdent &&
+					previousTop.kw == kwReturning {
+					appendCandidate(previousTop.pos)
+					consecutiveReturningAtError = tok.kind == tokIdent &&
+						tok.kw == kwReturning
+				}
+				if tok.kind == tokIdent && tok.kw == kwReturning {
+					appendCandidate(tok.pos)
+				}
+			}
+			if tok.kind == tokIdent && tok.kw == kwConflict &&
+				previousTop.kind == tokIdent && previousTop.kw == kwOn &&
+				(previousTop.pos == errorPos || tok.pos == errorPos) {
+				appendCandidate(previousTop.pos)
+			}
+		}
+		if tok.kind == tokEOF {
+			break
+		}
+		switch tok.kind {
+		case tokLParen:
+			depth++
+		case tokRParen:
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 {
+			previousTop = tok
+		}
+		if tok.pos > errorPos &&
+			!(previousTop.kind == tokIdent && previousTop.kw == kwOn &&
+				previousTop.pos == errorPos) {
+			break
+		}
+	}
+	if lx.cancelErr != nil {
+		return candidates, 0, lx.cancelErr
+	}
+	if consecutiveReturningAtError && candidateCount == 2 &&
+		!insertReturningProjectionStarts(afterError) {
+		// "... RETURNING returning" is the clause followed by a field, not a
+		// source alias followed by an empty RETURNING clause. Reverse the probe
+		// order so parseInsertSource tries the earlier boundary first. When a
+		// projection follows the second keyword, the later boundary wins and
+		// preserves "FROM t returning RETURNING id" instead.
+		candidates[0], candidates[1] = candidates[1], candidates[0]
+	}
+	return candidates, candidateCount, nil
+}
+
+func insertReturningProjectionStarts(tok token) bool {
+	return tok.kind == tokIdent || tok.kind == tokQuotedIdent ||
+		tok.kind == tokStar || scalarStarts(tok)
+}
+
 // parseInsertReturning parses the projection over the documents already
 // materialized by INSERT. Keeping it inside a SelectStmt makes RETURNING a
 // reuse of the query engine's projection lane rather than a second JSON path
@@ -241,8 +420,15 @@ func (p *Parser) parseInsertReturning(name string, pos int) error {
 		Name: name, Alias: name, Join: JoinNone, Pos: pos,
 	})
 	p.out.From = p.from
+	parameterBase, projectionPos := p.params, p.tok.pos
 	if err := p.parseResultColumns(); err != nil {
 		return err
+	}
+	if p.params != parameterBase {
+		return newFeatureNotSupportedError(
+			p.lx.src, firstParameterPosition(p.lx.src, projectionPos),
+			"parameters in RETURNING require a distinct bind frame for its independently prepared projection; that frame is not available yet",
+		)
 	}
 	for i := range p.out.Columns {
 		if p.out.Columns[i].Agg != AggNone {
@@ -261,8 +447,9 @@ func (p *Parser) parseInsertReturning(name string, pos int) error {
 	if err := p.resolvePaths(); err != nil {
 		return err
 	}
-	// RETURNING's projection grammar contains no value expressions, so the
-	// INSERT's VALUES placeholders belong only to the mutation plan.
+	// RETURNING is prepared and executed independently from the mutation. The
+	// positioned guard above keeps its bind frame empty while still allowing
+	// parameter-free scalar expressions such as CASE and CAST.
 	p.out.Params = 0
 	if err := p.validate(); err != nil {
 		return err
@@ -593,8 +780,15 @@ func (p *Parser) parseMutationReturning(name string, pos int) error {
 	p.orderBy = p.orderBy[:0]
 	p.from = append(p.from, TableRef{Name: name, Alias: name, Join: JoinNone, Pos: pos})
 	p.out.From = p.from
+	parameterBase, projectionPos := p.params, p.tok.pos
 	if err := p.parseResultColumns(); err != nil {
 		return err
+	}
+	if p.params != parameterBase {
+		return newFeatureNotSupportedError(
+			p.lx.src, firstParameterPosition(p.lx.src, projectionPos),
+			"parameters in RETURNING require a distinct bind frame for its independently prepared projection; that frame is not available yet",
+		)
 	}
 	for i := range p.out.Columns {
 		if p.out.Columns[i].Agg != AggNone {

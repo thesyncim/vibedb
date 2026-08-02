@@ -397,6 +397,16 @@ func (s *Snapshot) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	return s.collection.appendRawAtState(dst, key, s.state)
 }
 
+// ContainsKey reports whether key exists in this pinned snapshot without
+// copying or resolving its document payload. It follows the same validated
+// primary route as AppendRaw and is allocation-free on warmed cache paths.
+func (s *Snapshot) ContainsKey(key []byte) (bool, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return false, ErrClosed
+	}
+	return s.collection.containsPrimaryGraph(s.state, key)
+}
+
 func (c *Collection) appendRawAtState(
 	dst []byte, key []byte, state *fileStoreState,
 ) ([]byte, bool, error) {
@@ -523,6 +533,45 @@ func (c *Collection) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	return c.appendRawLeased(dst, key)
 }
 
+// ContainsKey reports whether key exists at the current reader-visible cut
+// without materializing the document. It has the same publication/snapshot
+// linearization as AppendRaw, including bounded router-supersession retries.
+func (c *Collection) ContainsKey(key []byte) (bool, error) {
+	if c == nil {
+		return false, ErrClosed
+	}
+	if !c.packedLogicalCutEnabled() {
+		for range liveReadSupersededRetries {
+			state, epoch, ok := c.enterPhysicalReadEpoch()
+			if !ok {
+				break
+			}
+			found, superseded, err := c.containsPrimaryGraphLive(
+				state, state.root.Generation, key,
+			)
+			epoch.Exit()
+			if !superseded {
+				return found, err
+			}
+		}
+		return c.containsKeyLeased(key)
+	}
+	for range liveReadSupersededRetries {
+		view, epoch, ok := c.enterPackedReadEpoch()
+		if !ok {
+			break
+		}
+		found, superseded, err := c.containsPrimaryGraphLive(
+			view.state, view.generation, key,
+		)
+		epoch.Exit()
+		if !superseded {
+			return found, err
+		}
+	}
+	return c.containsKeyLeased(key)
+}
+
 // appendRawLeased is the pre-epoch read entry, retained as the slow path every
 // declined or diverted epoch entry falls back to. A writer fence points new
 // readers here exactly because this path blocks on the snapshot gate until the
@@ -588,6 +637,63 @@ func (c *Collection) appendRawLeased(dst []byte, key []byte) ([]byte, bool, erro
 		err = storeio.ErrSegmentedTabletRouterCorrupt
 	}
 	return out, ok, err
+}
+
+func (c *Collection) containsKeyLeased(key []byte) (bool, error) {
+	for attempt := range liveReadSupersededRetries {
+		c.snapshotGate.RLock()
+		view, stateErr := c.visibleLogicalView()
+		if stateErr != nil {
+			c.snapshotGate.RUnlock()
+			if c.leases.Closing() {
+				return false, ErrClosed
+			}
+			return false, stateErr
+		}
+		lease, err := c.leases.Acquire(view.retentionGeneration())
+		c.snapshotGate.RUnlock()
+		if err != nil {
+			return false, publicReaderLeaseError(err)
+		}
+		if liveReadLeasedPinnedHook != nil {
+			liveReadLeasedPinnedHook(attempt)
+		}
+		found, superseded, err := c.containsPrimaryGraphLive(
+			view.state, view.generation, key,
+		)
+		lease.Release()
+		if !superseded {
+			return found, err
+		}
+	}
+	if liveReadLeasedPinnedHook != nil {
+		liveReadLeasedPinnedHook(liveReadSupersededRetries)
+	}
+	c.writer.Lock()
+	defer c.writer.Unlock()
+	c.snapshotGate.RLock()
+	view, stateErr := c.visibleLogicalView()
+	if stateErr != nil {
+		c.snapshotGate.RUnlock()
+		if c.leases.Closing() {
+			return false, ErrClosed
+		}
+		return false, stateErr
+	}
+	lease, err := c.leases.Acquire(view.retentionGeneration())
+	if err != nil {
+		c.snapshotGate.RUnlock()
+		return false, publicReaderLeaseError(err)
+	}
+	found, superseded, err := c.containsPrimaryGraphLive(
+		view.state, view.generation, key,
+	)
+	c.snapshotGate.RUnlock()
+	lease.Release()
+	if superseded && err == nil {
+		err = storeio.ErrSegmentedTabletRouterCorrupt
+	}
+	return found, err
 }
 
 // PrefetchKeys submits current-snapshot document reads to the bounded

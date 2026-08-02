@@ -35,9 +35,23 @@ func (p *Parser) parseCreate(dst *Statement) error {
 	case p.atKeyword(kwUnique):
 		return p.errHere("CREATE UNIQUE INDEX is not supported: this engine's indexes are lookup structures with no uniqueness constraint, and one that silently did not constrain would be worse than none")
 	case p.atKeyword(kwView):
-		return p.errHere("CREATE VIEW is not supported: a view is a stored query the engine would have to expand at plan time, and it has no such expansion")
+		p.advance()
+		dst.Kind, dst.CreateView = KindCreateView, &p.view
+		return p.parseCreateView(-1)
+	case p.atKeyword(kwMaterialized):
+		position := p.tok.pos
+		p.advance()
+		if err := p.expectKeyword(kwView, "VIEW after MATERIALIZED"); err != nil {
+			return err
+		}
+		dst.Kind, dst.CreateView = KindCreateView, &p.view
+		return p.parseCreateView(position)
+	case p.atKeyword(kwOr):
+		return p.featureNotSupportedHere(
+			"CREATE OR REPLACE VIEW is not supported because replacing a durable definition requires dependency-generation invalidation; use DROP VIEW followed by CREATE VIEW",
+		)
 	}
-	return p.errHere("expected TABLE or INDEX after CREATE")
+	return p.errHere("expected TABLE, INDEX, VIEW, or MATERIALIZED VIEW after CREATE")
 }
 
 // --- CREATE TABLE ------------------------------------------------------------

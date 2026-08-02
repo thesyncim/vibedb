@@ -12,6 +12,23 @@ var (
 	// ErrTableExists reports CREATE TABLE without IF NOT EXISTS naming an
 	// existing catalog entry.
 	ErrTableExists = errors.New("vibedb: SQL table already exists")
+	// ErrViewNotFound reports a statement naming an ordinary view absent from
+	// the durable SQL catalog.
+	ErrViewNotFound = errors.New("vibedb: SQL view does not exist")
+	// ErrViewExists reports CREATE VIEW naming an existing relation.
+	ErrViewExists = errors.New("vibedb: SQL view already exists")
+	// ErrViewChanged reports execution of a prepared plan after its view was
+	// dropped or replaced. The statement must be prepared again.
+	ErrViewChanged = errors.New("vibedb: prepared SQL view definition changed")
+	// ErrDependentObjects reports RESTRICT preventing a table or view removal.
+	ErrDependentObjects = errors.New("vibedb: dependent SQL views exist")
+	// ErrDuplicateViewColumn reports a view whose durable relation schema would
+	// contain an ambiguous duplicate output name.
+	ErrDuplicateViewColumn = errors.New("vibedb: duplicate SQL view output column")
+	// ErrWrongObjectType reports relation DDL naming an existing relation of a
+	// different kind, such as DROP VIEW applied to a table. IF EXISTS does not
+	// suppress this error because the named object exists.
+	ErrWrongObjectType = errors.New("vibedb: wrong SQL relation object type")
 	// ErrIndexExists reports CREATE INDEX without IF NOT EXISTS naming an
 	// existing index.
 	ErrIndexExists = errors.New("vibedb: SQL index already exists")
@@ -63,6 +80,8 @@ var (
 	// ErrTooManyTables reports a catalog whose table count would exceed the
 	// database's bounded metadata and eagerly opened durable-handle budget.
 	ErrTooManyTables = errors.New("vibedb: SQL catalog exceeds the table-count bound")
+	// ErrTooManyViews bounds the durable view graph and reopen validation work.
+	ErrTooManyViews = errors.New("vibedb: SQL catalog exceeds the view-count bound")
 	// ErrTooManyRetiredTables bounds old storage incarnations whose active
 	// snapshots prevent immediate descriptor release and physical cleanup.
 	ErrTooManyRetiredTables = errors.New("vibedb: too many SQL table incarnations are retiring")
@@ -100,6 +119,26 @@ type tableDependencyError struct {
 	pos         int
 	transaction bool
 }
+
+type viewDependencyError struct {
+	name        string
+	pos         int
+	transaction bool
+}
+
+func (e *viewDependencyError) Error() string {
+	if e.transaction {
+		return fmt.Sprintf(
+			"%v: %q was not present when the transaction began",
+			ErrViewChanged, e.name,
+		)
+	}
+	return fmt.Sprintf("%v: %q", ErrViewChanged, e.name)
+}
+
+func (e *viewDependencyError) Unwrap() error { return ErrViewChanged }
+
+func (e *viewDependencyError) Position() int { return e.pos }
 
 func (e *tableDependencyError) Error() string {
 	if e.transaction {

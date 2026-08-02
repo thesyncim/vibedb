@@ -116,6 +116,49 @@ func TestNativeMapperFullKeyMapsToPoint(t *testing.T) {
 	}
 }
 
+// TestNativeMapperMapPrefixIntoPinsScratchOwnership verifies the optional
+// allocation-free contract without weakening MapPrefix's independently owned
+// result contract. Full keys reuse point scratch, prefixes reuse range scratch,
+// and a later Into call cannot mutate an ordinary MapPrefix result.
+func TestNativeMapperMapPrefixIntoPinsScratchOwnership(t *testing.T) {
+	m := NewNativeMapper(2)
+	full := []Scalar{NewString("tenant"), mustNumber("7")}
+
+	owned, err := m.MapPrefix(full)
+	must(t, err)
+	if len(owned.Points) != 1 {
+		t.Fatalf("MapPrefix(full) points = %d, want 1", len(owned.Points))
+	}
+	ownedPoint := owned.Points[0]
+
+	var pointScratch [1]KeyspacePoint
+	var rangeScratch [1]KeyRange
+	into, err := m.MapPrefixInto(
+		full, pointScratch[:0], rangeScratch[:0],
+	)
+	must(t, err)
+	if len(into.Points) != 1 || len(into.Ranges) != 0 {
+		t.Fatalf("MapPrefixInto(full) = %+v, want one point", into)
+	}
+	if &into.Points[0] != &pointScratch[0] {
+		t.Fatal("MapPrefixInto(full) did not reuse caller point scratch")
+	}
+
+	prefix, err := m.MapPrefixInto(
+		full[:1], pointScratch[:0], rangeScratch[:0],
+	)
+	must(t, err)
+	if len(prefix.Points) != 0 || len(prefix.Ranges) != 1 {
+		t.Fatalf("MapPrefixInto(prefix) = %+v, want one range", prefix)
+	}
+	if &prefix.Ranges[0] != &rangeScratch[0] {
+		t.Fatal("MapPrefixInto(prefix) did not reuse caller range scratch")
+	}
+	if owned.Points[0] != ownedPoint {
+		t.Fatal("MapPrefixInto mutated an independently owned MapPrefix result")
+	}
+}
+
 // TestNativeMapperAdmits covers the value-type and length contracts: a length
 // mismatch is ErrIncompleteShardKey, an unsupported length is ErrUnsupportedMapper,
 // a non-encodable value is ErrInvalidShardValue, and String/Number are accepted.

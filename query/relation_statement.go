@@ -71,6 +71,121 @@ type statementDerived struct {
 	activeBytes int64
 }
 
+// maxInsertDocumentLineageDepth mirrors the parser's bounded nesting contract.
+// Prepared ownership is acyclic except for the recursive delta relation, which
+// is stopped explicitly below; the cap is still a defensive guard against a
+// malformed programmatic AST turning cold metadata propagation into recursion
+// without a bound.
+const maxInsertDocumentLineageDepth = 2 * 1024
+
+// markInsertDocumentOutput follows one prepared output backwards until it
+// reaches a VALUES parameter. It uses prepared relation names and ownership,
+// not a second SQL name resolver, so CTE aliases, derived columns, joins, set
+// leaves, and recursive term clones retain exactly the same ordinal identity
+// as execution.
+func (s *Statement) markInsertDocumentOutput(
+	output int,
+	argBase int,
+	positions []int,
+	depth int,
+) {
+	if s == nil || output < 0 || output >= len(s.Columns()) ||
+		depth > maxInsertDocumentLineageDepth {
+		return
+	}
+	if set := s.setSQL(); set != nil {
+		set.markInsertDocumentOutput(output, positions, depth+1)
+		return
+	}
+	if window := s.window(); window != nil {
+		// An ordinary projected input keeps its exact source ordinal. Window
+		// results themselves are computed scalars and therefore are not a
+		// complete-document parameter lineage.
+		if output < len(window.originalInput) && window.originalInput[output] >= 0 {
+			window.input.markInsertDocumentOutput(
+				window.originalInput[output], argBase, positions, depth+1,
+			)
+		}
+		return
+	}
+
+	remaining := output
+	for i := range s.tree.Columns {
+		column := &s.tree.Columns[i]
+		width := 1
+		if column.Scalar == nil && column.Agg == sqlast.AggNone &&
+			column.Path != nil && len(column.Path.Segments) == 0 &&
+			s.hasRelationBinding() {
+			width = len(s.relationBindingForSource(column.Path.Source).names)
+		}
+		if remaining >= width {
+			remaining -= width
+			continue
+		}
+		if column.Scalar != nil || column.Agg != sqlast.AggNone ||
+			column.Path == nil {
+			return
+		}
+		ordinal := remaining
+		if len(column.Path.Segments) != 0 {
+			resolved, err := s.resolveRelationColumnAt(
+				column.Path.Source, column.Path.Segments[0].Key,
+			)
+			if err != nil {
+				return
+			}
+			ordinal = resolved
+			if join := s.relationJoin(); join != nil &&
+				column.Path.Source >= 0 &&
+				column.Path.Source < len(join.operands) {
+				ordinal -= join.operands[column.Path.Source].offset
+			}
+		}
+		s.markInsertDocumentRelation(
+			column.Path.Source, ordinal, argBase, positions, depth+1,
+		)
+		return
+	}
+}
+
+func (s *Statement) markInsertDocumentRelation(
+	source int,
+	output int,
+	argBase int,
+	positions []int,
+	depth int,
+) {
+	if s == nil || output < 0 || depth > maxInsertDocumentLineageDepth {
+		return
+	}
+	if join := s.relationJoin(); join != nil {
+		if source < 0 || source >= len(join.operands) {
+			return
+		}
+		op := &join.operands[source]
+		switch {
+		case op.physical:
+			return
+		case op.stmt != nil && op.ref != nil && op.ref.Query != nil:
+			op.stmt.markInsertDocumentOutput(
+				output, argBase+op.ref.Query.ParamBase, positions, depth+1,
+			)
+		case op.cte != nil:
+			op.cte.def.markInsertDocumentOutput(output, positions, depth+1)
+		}
+		return
+	}
+	if derived := s.derived(); derived != nil {
+		derived.stmt.markInsertDocumentOutput(
+			output, argBase+derived.tree.ParamBase, positions, depth+1,
+		)
+		return
+	}
+	if reference := s.cteReference(); reference != nil {
+		reference.def.markInsertDocumentOutput(output, positions, depth+1)
+	}
+}
+
 func (s *Statement) prepareDerived(argBase int) error {
 	if len(s.tree.From) == 0 || s.tree.From[0].Kind != sqlast.RelationDerived {
 		return nil
@@ -117,67 +232,117 @@ func (s *Statement) validateRelationReferences() error {
 	if !s.hasRelationBinding() {
 		return nil
 	}
-	check := func(path *sqlast.PathExpr) error {
-		if path == nil || len(path.Segments) == 0 {
-			return nil
-		}
-		if join := s.relationJoin(); join != nil {
-			if path.MergedUsing != 0 {
-				_, err := join.preparePath(path)
-				return s.positionRelationJoinError(err, path)
-			}
-			if path.Source < 0 || path.Source >= len(join.sources) ||
-				join.sources[path.Source].physical {
-				return nil
-			}
-		} else if path.Source != 0 {
-			return nil
-		}
-		_, err := s.resolveRelationColumnAt(path.Source, path.Segments[0].Key)
-		if column, ok := err.(*RelationColumnError); ok {
-			column.Pos = path.Pos
-			if column.Matches == 0 {
-				column.Pos = relationColumnPosition(s.text, path.Pos)
-			}
-		}
-		return err
-	}
 	for i := range s.tree.Columns {
-		if err := check(s.tree.Columns[i].Path); err != nil {
+		column := &s.tree.Columns[i]
+		if err := s.validateRelationPath(column.Path); err != nil {
+			return err
+		}
+		if err := s.validateScalarRelationPaths(column.Scalar); err != nil {
 			return err
 		}
 	}
-	var walkExpr func(*sqlast.Expr) error
-	walkExpr = func(expr *sqlast.Expr) error {
-		if expr == nil {
-			return nil
-		}
-		if err := check(expr.Path); err != nil {
-			return err
-		}
-		if err := check(expr.RightPath); err != nil {
-			return err
-		}
-		for _, kid := range expr.Kids {
-			if err := walkExpr(kid); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := walkExpr(s.tree.Where); err != nil {
+	if err := s.validatePredicateRelationPaths(s.tree.Where); err != nil {
 		return err
 	}
-	if err := walkExpr(s.tree.Having); err != nil {
+	if err := s.validatePredicateRelationPaths(s.tree.Having); err != nil {
 		return err
 	}
 	for _, path := range s.tree.GroupBy {
-		if err := check(path); err != nil {
+		if err := s.validateRelationPath(path); err != nil {
 			return err
 		}
 	}
 	for i := range s.tree.OrderBy {
-		if err := check(s.tree.OrderBy[i].Path); err != nil {
+		if err := s.validateRelationPath(s.tree.OrderBy[i].Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateRelationPath proves that a path rooted in a derived relation names
+// exactly one output ordinal before lowering renders it. renderDerived uses an
+// empty string as its internal failure sentinel, so every expression form must
+// pass through this method before a dependency spec is compiled.
+func (s *Statement) validateRelationPath(path *sqlast.PathExpr) error {
+	if path == nil || len(path.Segments) == 0 {
+		return nil
+	}
+	if join := s.relationJoin(); join != nil {
+		if path.MergedUsing != 0 {
+			_, err := join.preparePath(path)
+			return s.positionRelationJoinError(err, path)
+		}
+		if path.Source < 0 || path.Source >= len(join.sources) ||
+			join.sources[path.Source].physical {
+			return nil
+		}
+	} else if path.Source != 0 {
+		return nil
+	}
+	_, err := s.resolveRelationColumnAt(path.Source, path.Segments[0].Key)
+	if column, ok := err.(*RelationColumnError); ok {
+		// Preserve the established ambiguous-reference contract at the start of
+		// the qualified path. For an undefined output, point at the missing
+		// output token itself. Both are UTF-8 byte offsets here and are converted
+		// to protocol character positions only by the adapter.
+		column.Pos = path.Pos
+		if column.Matches == 0 {
+			column.Pos = relationColumnPosition(s.text, path.Pos)
+		}
+	}
+	return err
+}
+
+func (s *Statement) validateScalarRelationPaths(expr *sqlast.ScalarExpr) error {
+	if expr == nil {
+		return nil
+	}
+	if err := s.validateRelationPath(expr.Path); err != nil {
+		return err
+	}
+	if err := s.validateScalarRelationPaths(expr.Left); err != nil {
+		return err
+	}
+	if err := s.validateScalarRelationPaths(expr.Right); err != nil {
+		return err
+	}
+	if err := s.validateScalarRelationPaths(expr.Else); err != nil {
+		return err
+	}
+	for i := range expr.Whens {
+		arm := &expr.Whens[i]
+		if err := s.validateScalarRelationPaths(arm.Match); err != nil {
+			return err
+		}
+		if err := s.validateScalarRelationPaths(arm.Result); err != nil {
+			return err
+		}
+		if err := s.validatePredicateRelationPaths(arm.Predicate); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Statement) validatePredicateRelationPaths(expr *sqlast.Expr) error {
+	if expr == nil {
+		return nil
+	}
+	if err := s.validateRelationPath(expr.Path); err != nil {
+		return err
+	}
+	if err := s.validateRelationPath(expr.RightPath); err != nil {
+		return err
+	}
+	if err := s.validateScalarRelationPaths(expr.ScalarLeft); err != nil {
+		return err
+	}
+	if err := s.validateScalarRelationPaths(expr.ScalarRight); err != nil {
+		return err
+	}
+	for _, kid := range expr.Kids {
+		if err := s.validatePredicateRelationPaths(kid); err != nil {
 			return err
 		}
 	}
@@ -337,9 +502,13 @@ func (s *Statement) runDerived(
 	if base < 0 || base+n > len(args) {
 		return Source{}, fmt.Errorf("query: invalid derived placeholder range")
 	}
-	nestedSource, err := src.subquerySource(s.Collection(), d.stmt.Collection())
-	if err != nil {
-		return Source{}, err
+	nestedSource := src
+	var err error
+	if !d.stmt.resolvesOwnSetSources() {
+		nestedSource, err = src.subquerySource(s.Collection(), d.stmt.Collection())
+		if err != nil {
+			return Source{}, err
+		}
 	}
 	d.exec.Options = parent.Options
 	cursor, err := d.stmt.runIntoFrame(

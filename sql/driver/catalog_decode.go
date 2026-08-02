@@ -38,6 +38,13 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 			}
 			decoded.Tables = map[string]*tableMeta(tables)
 			return nil
+		case "views":
+			var views catalogViewMap
+			if err := decoder.Decode(&views); err != nil {
+				return err
+			}
+			decoded.Views = map[string]*viewMeta(views)
+			return nil
 		default:
 			return unknownCatalogMember("root", name)
 		}
@@ -52,6 +59,31 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("vibedb: SQL catalog root is missing member %q", "tables")
 	}
 	*c = decoded
+	return nil
+}
+
+type catalogViewMap map[string]*viewMeta
+
+func (m *catalogViewMap) UnmarshalJSON(data []byte) error {
+	decoded := make(catalogViewMap)
+	err := decodeCatalogObject(data, "views", func(
+		name string,
+		decoder *json.Decoder,
+	) error {
+		if err := checkCatalogViewCount(len(decoded) + 1); err != nil {
+			return err
+		}
+		var meta *viewMeta
+		if err := decoder.Decode(&meta); err != nil {
+			return fmt.Errorf("view %q: %w", name, err)
+		}
+		decoded[name] = meta
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	*m = decoded
 	return nil
 }
 
@@ -108,6 +140,64 @@ func (m *tableMeta) UnmarshalJSON(data []byte) error {
 	})
 	if err != nil {
 		return err
+	}
+	*m = decoded
+	return nil
+}
+
+func (m *viewMeta) UnmarshalJSON(data []byte) error {
+	var decoded viewMeta
+	var queryPresent bool
+	var outputsPresent bool
+	err := decodeCatalogObject(data, "view metadata", func(
+		name string,
+		decoder *json.Decoder,
+	) error {
+		switch name {
+		case "query":
+			queryPresent = true
+			return decoder.Decode(&decoded.Query)
+		case "columns":
+			var columns catalogViewNameList
+			if err := decoder.Decode(&columns); err != nil {
+				return err
+			}
+			decoded.Columns = []string(columns)
+			return nil
+		case "outputs":
+			outputsPresent = true
+			var outputs catalogViewNameList
+			if err := decoder.Decode(&outputs); err != nil {
+				return err
+			}
+			decoded.Outputs = []string(outputs)
+			return nil
+		case "view_dependencies":
+			var dependencies catalogViewDependencyList
+			if err := decoder.Decode(&dependencies); err != nil {
+				return err
+			}
+			decoded.ViewDependencies = []string(dependencies)
+			return nil
+		case "table_dependencies":
+			var dependencies catalogViewDependencyList
+			if err := decoder.Decode(&dependencies); err != nil {
+				return err
+			}
+			decoded.TableDependencies = []string(dependencies)
+			return nil
+		default:
+			return unknownCatalogMember("view metadata", name)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if !queryPresent {
+		return fmt.Errorf("vibedb: SQL catalog view metadata is missing member %q", "query")
+	}
+	if !outputsPresent {
+		return fmt.Errorf("vibedb: SQL catalog view metadata is missing member %q", "outputs")
 	}
 	*m = decoded
 	return nil
@@ -247,6 +337,50 @@ func (l *catalogIndexPathList) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			decoded = append(decoded, path)
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	*l = decoded
+	return nil
+}
+
+type catalogViewNameList []string
+
+func (l *catalogViewNameList) UnmarshalJSON(data []byte) error {
+	var decoded catalogViewNameList
+	err := decodeCatalogArray(
+		data, "view columns", maxCatalogViewColumns,
+		func(decoder *json.Decoder) error {
+			var name string
+			if err := decoder.Decode(&name); err != nil {
+				return err
+			}
+			decoded = append(decoded, name)
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	*l = decoded
+	return nil
+}
+
+type catalogViewDependencyList []string
+
+func (l *catalogViewDependencyList) UnmarshalJSON(data []byte) error {
+	var decoded catalogViewDependencyList
+	err := decodeCatalogArray(
+		data, "view dependencies", maxCatalogViewDependencies,
+		func(decoder *json.Decoder) error {
+			var name string
+			if err := decoder.Decode(&name); err != nil {
+				return err
+			}
+			decoded = append(decoded, name)
 			return nil
 		},
 	)

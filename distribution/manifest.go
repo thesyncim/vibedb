@@ -141,6 +141,24 @@ func (m *Manifest) ResolvePoint(p KeyspacePoint) (ShardID, bool) {
 	return m.shards[i].ID, true
 }
 
+// ResolvePointTarget resolves p to the owning shard's fenced leader target
+// without cloning the manifest's leader slice. It is the zero-allocation point
+// routing primitive for callers that need the complete dispatch identity rather
+// than only the shard id.
+func (m *Manifest) ResolvePointTarget(p KeyspacePoint) (Target, bool) {
+	i := m.searchStart(p)
+	if i < 0 || !m.shards[i].Range.Contains(p) {
+		return Target{}, false
+	}
+	shard := &m.shards[i]
+	return Target{
+		Shard:          shard.ID,
+		Endpoint:       shard.Leaders[0],
+		OwnershipEpoch: shard.Epoch,
+		Role:           RoleLeader,
+	}, true
+}
+
 // ResolveRange returns the ids of every shard overlapping r, in keyspace
 // order, in O(log shard_count + overlapping_shards): one binary search to the
 // first candidate followed by a forward walk that stops at the first shard

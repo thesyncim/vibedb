@@ -38,6 +38,10 @@ const (
 	KindTruncate
 	// KindDropIndex is a DROP INDEX, carried in [Statement.DropIndex].
 	KindDropIndex
+	// KindCreateView is a CREATE VIEW, carried in [Statement.CreateView].
+	KindCreateView
+	// KindDropView is a DROP VIEW, carried in [Statement.DropView].
+	KindDropView
 )
 
 // String answers the statement's leading keyword.
@@ -59,6 +63,10 @@ func (k Kind) String() string {
 		return "TRUNCATE"
 	case KindDropIndex:
 		return "DROP INDEX"
+	case KindCreateView:
+		return "CREATE VIEW"
+	case KindDropView:
+		return "DROP VIEW"
 	}
 	return "SELECT"
 }
@@ -96,6 +104,8 @@ type Statement struct {
 	DropTable   *DropTableStmt
 	Truncate    *TruncateStmt
 	DropIndex   *DropIndexStmt
+	CreateView  *CreateViewStmt
+	DropView    *DropViewStmt
 }
 
 // ReturnsRows reports whether this parsed statement must execute through a
@@ -126,6 +136,10 @@ func (s *Statement) Table() string {
 		return s.Truncate.Table
 	case KindDropIndex:
 		return s.DropIndex.Table
+	case KindCreateView:
+		return s.CreateView.Name
+	case KindDropView:
+		return s.DropView.Name
 	}
 	if s.Select == nil || len(s.Select.From) == 0 {
 		return ""
@@ -142,7 +156,8 @@ func (s *Statement) Params() int {
 		return s.Update.Params
 	case KindDelete:
 		return s.Delete.Params
-	case KindCreateTable, KindCreateIndex, KindDropTable, KindTruncate, KindDropIndex:
+	case KindCreateTable, KindCreateIndex, KindDropTable, KindTruncate, KindDropIndex,
+		KindCreateView, KindDropView:
 		// A DDL statement has no placeholders. A schema is not data: a type, a
 		// path, and a table name are all compiled into the definition when the
 		// statement is prepared, so there is nothing left for a bind to supply.
@@ -176,6 +191,16 @@ func (s *Statement) Params() int {
 type InsertStmt struct {
 	// Table is the collection written to.
 	Table string
+	// Source is the query whose single output column supplies complete JSON
+	// documents. It is nil for VALUES. The source tree is deliberately distinct
+	// from Returning: the former is evaluated against the pre-statement
+	// snapshot, while the latter is evaluated only over rows admitted for
+	// publication.
+	Source *SelectStmt
+	// SourcePos is the byte offset of Source's leading SELECT or query-expression
+	// token. Runtime source-shape errors use it when no narrower output position
+	// exists.
+	SourcePos int
 	// Rows are the VALUES tuples in source order. Several rows in one statement
 	// are one atomic batch, which is the reason multi-row VALUES exists here at
 	// all rather than being sugar for a loop.

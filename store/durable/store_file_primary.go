@@ -53,6 +53,30 @@ func (c *Collection) resolvePrimaryGraph(
 	return dst, found, err
 }
 
+func (c *Collection) containsPrimaryGraph(
+	state *fileStoreState,
+	key []byte,
+) (bool, error) {
+	if c == nil || state == nil ||
+		state.root.PrimaryRoot == (storeio.PageRef{}) {
+		return false, nil
+	}
+	if len(key) == 0 || len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
+		return false, nil
+	}
+	router := c.primaryRouter.Load()
+	if router == nil || router.Generation() != state.root.Generation {
+		return c.containsPrimaryGraphPageWalk(state, key)
+	}
+	found, superseded, err := c.containsPrimaryGraphRouted(
+		state, state.root.Generation, key, router,
+	)
+	if superseded {
+		return c.containsPrimaryGraphPageWalk(state, key)
+	}
+	return found, err
+}
+
 // resolvePrimaryGraphRouted reads one key through a resident router whose
 // generation matched state's at entry. superseded=true reports that the router
 // advanced past the state before a leaf handle was selected, with nothing
@@ -102,6 +126,45 @@ func (c *Collection) resolvePrimaryGraphRouted(
 	return dst, found, false, err
 }
 
+func (c *Collection) containsPrimaryGraphRouted(
+	state *fileStoreState,
+	generation uint64,
+	key []byte,
+	router *storeio.ResidentPrimaryRouter,
+) (found bool, superseded bool, err error) {
+	route, ok := router.Route(key)
+	if !ok {
+		return false, false, fmt.Errorf(
+			"%w: resident primary route",
+			storeio.ErrSegmentedTabletRouterCorrupt,
+		)
+	}
+	if router.Generation() != generation {
+		return false, true, nil
+	}
+	if _, disposition, _ := c.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, key, generation,
+	); disposition == primaryUnifiedOverlayValue {
+		return true, false, nil
+	} else if disposition == primaryUnifiedOverlayDeleted {
+		return false, false, nil
+	}
+	leafLease, err := router.AcquireLeaf(c.cache, route)
+	if err != nil {
+		return false, false, err
+	}
+	found, err = primaryLeafContains(
+		leafLease.Page(), state.root.StoreID, route.Bucket, route.Hash, key,
+		storeio.CommonPrimaryLeafBounds{
+			FileEnd:           state.fileEnd,
+			NextLogicalID:     state.root.NextLogicalID,
+			AllocationQuantum: state.root.PageSize,
+		},
+	)
+	leafLease.Release()
+	return found, false, err
+}
+
 // resolvePrimaryGraphLive is the point-read resolver for the LIVE visible
 // state (AppendRaw's epoch and lease paths). It differs from the snapshot
 // resolver in exactly one decision: what a router-generation mismatch means.
@@ -148,6 +211,29 @@ func (c *Collection) resolvePrimaryGraphLive(
 	return c.resolvePrimaryGraphRouted(dst, state, generation, key, router)
 }
 
+func (c *Collection) containsPrimaryGraphLive(
+	state *fileStoreState,
+	generation uint64,
+	key []byte,
+) (found bool, superseded bool, err error) {
+	if c == nil || state == nil ||
+		state.root.PrimaryRoot == (storeio.PageRef{}) {
+		return false, false, nil
+	}
+	if len(key) == 0 || len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
+		return false, false, nil
+	}
+	router := c.primaryRouter.Load()
+	if router == nil || router.Generation() < generation {
+		found, err = c.containsPrimaryGraphPageWalk(state, key)
+		return found, false, err
+	}
+	if router.Generation() != generation {
+		return false, true, nil
+	}
+	return c.containsPrimaryGraphRouted(state, generation, key, router)
+}
+
 // appendPrimaryLeafValue reads one exact value from the sole admitted class-5
 // leaf grammar. Inline rows splice their canonical spelling into dst; overflow
 // rows resolve the existing chain.
@@ -191,6 +277,33 @@ func (c *Collection) appendPrimaryLeafValue(
 	return uv.AppendAdmittedRowBody(dst, body), true, nil
 }
 
+func primaryLeafContains(
+	page []byte,
+	storeID [16]byte,
+	bucket storeio.BucketID,
+	hash uint64,
+	key []byte,
+	bounds storeio.CommonPrimaryLeafBounds,
+) (bool, error) {
+	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafUnified {
+		return false, fmt.Errorf(
+			"%w: non-unified primary leaf",
+			storeio.ErrCommonPrimaryLeafCorrupt,
+		)
+	}
+	uv, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
+		page, storeID, bucket, bounds,
+	)
+	if !ok {
+		return false, fmt.Errorf(
+			"%w: unified primary leaf",
+			storeio.ErrCommonPrimaryLeafCorrupt,
+		)
+	}
+	_, _, found := uv.LookupBodyHashed(hash, key)
+	return found, nil
+}
+
 // resolvePrimaryGraphPageWalk is the rooted resolver retained both as a
 // differential correctness oracle and as the production path for snapshots
 // older than the mutable resident router's reflected generation.
@@ -199,14 +312,60 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	state *fileStoreState,
 	key []byte,
 ) ([]byte, bool, error) {
+	lookup, ok, err := c.acquirePrimaryLeafPageWalk(state, key)
+	if err != nil || !ok {
+		return dst, false, err
+	}
+	dst, found, err := c.appendPrimaryLeafValue(
+		dst, lookup.lease.Page(), lookup.storeID, lookup.bucket,
+		lookup.hash, key, lookup.bounds,
+	)
+	lookup.lease.Release()
+	return dst, found, err
+}
+
+func (c *Collection) containsPrimaryGraphPageWalk(
+	state *fileStoreState,
+	key []byte,
+) (bool, error) {
+	lookup, ok, err := c.acquirePrimaryLeafPageWalk(state, key)
+	if err != nil || !ok {
+		return false, err
+	}
+	found, err := primaryLeafContains(
+		lookup.lease.Page(), lookup.storeID, lookup.bucket,
+		lookup.hash, key, lookup.bounds,
+	)
+	lookup.lease.Release()
+	return found, err
+}
+
+type primaryLeafPageLookup struct {
+	lease   storeio.PageLease
+	storeID [16]byte
+	bucket  storeio.BucketID
+	hash    uint64
+	bounds  storeio.CommonPrimaryLeafBounds
+}
+
+// acquirePrimaryLeafPageWalk resolves the rooted catalog/tablet/anchor route
+// once and returns the validated terminal leaf lease. Payload readers and
+// existence probes share it so a no-copy primary-key probe has exactly the
+// same catalog, route, and leaf checks as AppendRaw. An existence probe does
+// not walk an overflow payload chain; corruption confined to document bytes is
+// reported when those bytes are actually read.
+func (c *Collection) acquirePrimaryLeafPageWalk(
+	state *fileStoreState,
+	key []byte,
+) (primaryLeafPageLookup, bool, error) {
 	if c == nil || state == nil ||
 		state.root.PrimaryRoot == (storeio.PageRef{}) {
-		return dst, false, nil
+		return primaryLeafPageLookup{}, false, nil
 	}
 	keyBytes := key
 	if len(keyBytes) == 0 ||
 		len(keyBytes) > storeio.CommonPrimaryLeafMaxKeyBytes {
-		return dst, false, nil
+		return primaryLeafPageLookup{}, false, nil
 	}
 	bounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
@@ -217,7 +376,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 
 	catalogLease, err := c.cache.Acquire(state.root.PrimaryRoot)
 	if err != nil {
-		return dst, false, err
+		return primaryLeafPageLookup{}, false, err
 	}
 	catalog := storeio.AdmittedGlobalTabletCatalogNode(
 		catalogLease.Page(), bounds,
@@ -226,7 +385,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	route := catalog.Route(keyBytes)
 	catalogLease.Release()
 	if route.Ref == (storeio.PageRef{}) {
-		return dst, false, fmt.Errorf(
+		return primaryLeafPageLookup{}, false, fmt.Errorf(
 			"%w: empty primary catalog root route",
 			storeio.ErrGlobalTabletCatalogCorrupt,
 		)
@@ -234,7 +393,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 
 	catalogLease, err = c.cache.Acquire(route.Ref)
 	if err != nil {
-		return dst, false, err
+		return primaryLeafPageLookup{}, false, err
 	}
 	catalog = storeio.AdmittedGlobalTabletCatalogNode(
 		catalogLease.Page(), bounds,
@@ -242,7 +401,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	if childLevel == storeio.GlobalTabletCatalogBranch {
 		if catalog.Level() != storeio.GlobalTabletCatalogBranch {
 			catalogLease.Release()
-			return dst, false, fmt.Errorf(
+			return primaryLeafPageLookup{}, false, fmt.Errorf(
 				"%w: primary catalog branch level",
 				storeio.ErrGlobalTabletCatalogCorrupt,
 			)
@@ -250,14 +409,14 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 		route = catalog.Route(keyBytes)
 		catalogLease.Release()
 		if route.Ref == (storeio.PageRef{}) {
-			return dst, false, fmt.Errorf(
+			return primaryLeafPageLookup{}, false, fmt.Errorf(
 				"%w: empty primary catalog branch route",
 				storeio.ErrGlobalTabletCatalogCorrupt,
 			)
 		}
 		catalogLease, err = c.cache.Acquire(route.Ref)
 		if err != nil {
-			return dst, false, err
+			return primaryLeafPageLookup{}, false, err
 		}
 		catalog = storeio.AdmittedGlobalTabletCatalogNode(
 			catalogLease.Page(), bounds,
@@ -265,7 +424,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	}
 	if catalog.Level() != storeio.GlobalTabletCatalogLeaf {
 		catalogLease.Release()
-		return dst, false, fmt.Errorf(
+		return primaryLeafPageLookup{}, false, fmt.Errorf(
 			"%w: primary catalog terminal level",
 			storeio.ErrGlobalTabletCatalogCorrupt,
 		)
@@ -273,7 +432,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	tabletRoute := catalog.Route(keyBytes)
 	catalogLease.Release()
 	if tabletRoute.Ref == (storeio.PageRef{}) {
-		return dst, false, fmt.Errorf(
+		return primaryLeafPageLookup{}, false, fmt.Errorf(
 			"%w: empty primary tablet route",
 			storeio.ErrGlobalTabletCatalogCorrupt,
 		)
@@ -281,7 +440,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 
 	tabletLease, err := c.cache.Acquire(tabletRoute.Ref)
 	if err != nil {
-		return dst, false, err
+		return primaryLeafPageLookup{}, false, err
 	}
 	tablet := storeio.AdmittedGlobalTabletCatalogTabletRoot(
 		tabletLease.Page(), bounds,
@@ -289,7 +448,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	anchorRoute, ok := tablet.RouteAnchor(keyBytes)
 	if !ok {
 		tabletLease.Release()
-		return dst, false, fmt.Errorf(
+		return primaryLeafPageLookup{}, false, fmt.Errorf(
 			"%w: primary tablet anchor route",
 			storeio.ErrGlobalTabletCatalogCorrupt,
 		)
@@ -297,7 +456,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	anchorLease, err := c.cache.Acquire(anchorRoute.Ref)
 	if err != nil {
 		tabletLease.Release()
-		return dst, false, err
+		return primaryLeafPageLookup{}, false, err
 	}
 	anchor := storeio.AdmittedGlobalTabletCatalogAnchor(
 		anchorLease.Page(), &tablet, anchorRoute.PageID,
@@ -307,7 +466,7 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 	anchorLease.Release()
 	tabletLease.Release()
 	if !ok || leafRoute.Ref == (storeio.PageRef{}) {
-		return dst, false, fmt.Errorf(
+		return primaryLeafPageLookup{}, false, fmt.Errorf(
 			"%w: primary anchor leaf route",
 			storeio.ErrSegmentedTabletRouterCorrupt,
 		)
@@ -315,19 +474,17 @@ func (c *Collection) resolvePrimaryGraphPageWalk(
 
 	leafLease, err := c.cache.Acquire(leafRoute.Ref)
 	if err != nil {
-		return dst, false, err
+		return primaryLeafPageLookup{}, false, err
 	}
-	dst, found, err := c.appendPrimaryLeafValue(
-		dst, leafLease.Page(), state.root.StoreID, leafRoute.Bucket,
-		leafRoute.Hash, keyBytes,
-		storeio.CommonPrimaryLeafBounds{
+	return primaryLeafPageLookup{
+		lease: leafLease, storeID: state.root.StoreID,
+		bucket: leafRoute.Bucket, hash: leafRoute.Hash,
+		bounds: storeio.CommonPrimaryLeafBounds{
 			FileEnd:           state.fileEnd,
 			NextLogicalID:     state.root.NextLogicalID,
 			AllocationQuantum: state.root.PageSize,
 		},
-	)
-	leafLease.Release()
-	return dst, found, err
+	}, true, nil
 }
 
 // validateOpenedPrimaryGraph walks the catalog levels selected by PrimaryRoot

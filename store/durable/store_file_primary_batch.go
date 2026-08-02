@@ -29,6 +29,7 @@ var ErrPrimaryBatchUnsupportedLane = errors.New(
 type primaryBatchMutation struct {
 	key      []byte
 	value    []byte
+	stored   storeio.CommonPrimaryLeafValue
 	resident storeio.ResidentPrimaryRoute
 	remove   bool
 }
@@ -127,6 +128,13 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 	budget := 2*len(batch.entries) + primaryStructuralRetryLimit + 8
 	var lastErr error
 	for attempt := 0; attempt < budget; attempt++ {
+		// A topology or checkpoint retry starts from no staged frames and no
+		// retirements borrowed from the superseded state. The ordinary retry paths
+		// occur before admission, but unadmitting defensively here keeps a future
+		// retry insertion from turning stale staged pages into dirty-capacity leaks.
+		c.unadmitPrimaryBatchLeaves()
+		c.batchPrimaryOverflowVolatile = c.batchPrimaryOverflowVolatile[:0]
+		c.batchPrimaryOverflowDurable = c.batchPrimaryOverflowDurable[:0]
 		state := c.state.Load()
 		if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 			return false, 0, ErrClosed
@@ -149,15 +157,6 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 			// whole rather than split across generations.
 			return false, 0, ErrBatchTooLarge
 		}
-		checkpointed, err := c.ensurePrimaryBatchCapacity(leafCount)
-		if err != nil {
-			return false, 0, err
-		}
-		if checkpointed {
-			// A checkpoint advanced FileEnd and rebound every leaf's physical
-			// reference; the plan's routes are stale, so re-plan against fresh state.
-			continue
-		}
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
@@ -174,8 +173,23 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		if !c.primaryBatchHasLiveLeaf() {
 			return false, 0, nil
 		}
+		checkpointed, err := c.ensurePrimaryBatchCapacity()
+		if err != nil {
+			return false, 0, err
+		}
+		if checkpointed {
+			// A checkpoint advanced FileEnd, NextLogicalID, and every resident route;
+			// discard this read-only plan and assign all overflow identities again.
+			continue
+		}
+		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
+		if err := c.admitPrimaryBatchOverflow(); err != nil {
+			c.unadmitPrimaryBatchLeaves()
+			return false, 0, err
+		}
 		preparedExact, err := c.preparePrimaryBatchExact(state, generation)
 		if err != nil {
+			c.unadmitPrimaryBatchLeaves()
 			return false, 0, err
 		}
 		if err := c.admitPrimaryBatchLeaves(); err != nil {
@@ -241,7 +255,11 @@ func (c *Collection) preparePrimaryBatchExact(
 		termRecordMark: epoch.termRecordN,
 		tileRecordMark: epoch.tileRecordN,
 	}
-	bounds := c.primaryLeafBounds(state)
+	bounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           c.batchPrimaryFileEnd,
+		NextLogicalID:     c.batchPrimaryNextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
 	pressure := false
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]
@@ -304,8 +322,7 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 		var value []byte
 		if !entry.remove {
 			value = batch.value(entry)
-			if len(value) == 0 || len(value) > c.options.MaxDocumentBytes ||
-				len(value) > c.options.InlineValueBytes {
+			if len(value) == 0 || len(value) > c.options.MaxDocumentBytes {
 				return ErrDocumentTooLarge
 			}
 			if err := vibejson.Validate(value); err != nil {
@@ -367,6 +384,78 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 			c.batchPrimaryLeaves[leafIndex].mutationEnd = i + 1
 		}
 	}
+	return c.planPrimaryBatchOverflow(state)
+}
+
+// planPrimaryBatchOverflow assigns every new out-of-line value a stable volatile
+// PageRef range. It performs no cache admission: the complete batch can still be
+// rejected for topology, journal, retirement, or cache pressure without leaving
+// a dirty frame behind. All chains precede all rewritten leaves, making one
+// monotonically checked FileEnd interval sufficient for the generation.
+func (c *Collection) planPrimaryBatchOverflow(state *fileStoreState) error {
+	generation := state.root.Generation + 1
+	if generation == 0 || generation >= uint64(1)<<48 {
+		return storeio.ErrGenerationOrder
+	}
+	running := state.fileEnd
+	if len(c.primaryPendingParents) == 0 {
+		transactionPages := uint64(c.options.maxTransactionPages)
+		maximumPage := uint64(c.options.MaxPageSize)
+		if maximumPage == 0 || transactionPages > math.MaxUint64/maximumPage {
+			return storeio.ErrInvalidWrite
+		}
+		gap := transactionPages * maximumPage
+		if running > math.MaxUint64-gap {
+			return storeio.ErrInvalidWrite
+		}
+		running += gap
+	}
+	nextLogicalID := state.root.NextLogicalID
+	c.batchPrimaryOverflowPages = 0
+	c.batchPrimaryOverflowDirty = 0
+	for i := range c.batchPrimaryMutations {
+		mutation := &c.batchPrimaryMutations[i]
+		mutation.stored = storeio.CommonPrimaryLeafValue{}
+		if mutation.remove {
+			continue
+		}
+		if c.primaryOverflowValueIsInline(len(mutation.value)) {
+			mutation.stored.Inline = mutation.value
+			continue
+		}
+		head, bytes, pages, err := c.planBufferedPrimaryOverflowChain(
+			mutation.value, generation, running, nextLogicalID,
+		)
+		if err != nil {
+			return err
+		}
+		mutation.stored.Overflow = head
+		if running > math.MaxUint64-bytes ||
+			uint64(pages) > math.MaxUint64-nextLogicalID {
+			return storeio.ErrInvalidWrite
+		}
+		running += bytes
+		nextLogicalID += uint64(pages)
+		if pages > math.MaxInt-c.batchPrimaryOverflowPages {
+			return storeio.ErrInvalidWrite
+		}
+		c.batchPrimaryOverflowPages += pages
+		remaining := len(mutation.value)
+		for remaining != 0 {
+			piece, extent, ok := c.primaryOverflowExtentGeometry(remaining)
+			if !ok {
+				return storeio.ErrInvalidWrite
+			}
+			reserved := c.cache.ReservationBytes(extent)
+			if c.batchPrimaryOverflowDirty > math.MaxUint64-reserved {
+				return storeio.ErrInvalidWrite
+			}
+			c.batchPrimaryOverflowDirty += reserved
+			remaining -= piece
+		}
+	}
+	c.batchPrimaryOverflowFileEnd = running
+	c.batchPrimaryNextLogicalID = nextLogicalID
 	return nil
 }
 
@@ -380,50 +469,134 @@ func (c *Collection) primaryBatchHasLiveLeaf() bool {
 }
 
 // ensurePrimaryBatchCapacity reserves everything the batch's publish will consume
-// before it prepares a single frame, checkpointing to make room exactly as the
+// before it admits a single frame, checkpointing to make room exactly as the
 // single-document path does. It reports whether it checkpointed, because a
-// checkpoint moves the published cut and the caller must re-plan. The single
-// document path's own reservation is untouched; this is the batch's arithmetic:
+// checkpoint moves the published cut and the caller must re-plan. This runs
+// after the read-only leaf/overflow plan, so every byte and retirement is exact:
 //
 //   - one pending-parent slot per newly touched leaf (a checkpoint drains the set);
 //   - room in the preallocated journal for the whole batch record;
-//   - dirty-cache room for the batch's leaf frames;
-//   - one deferred volatile-reference slot per touched leaf, which under an active
-//     snapshot cannot be freed and so fails closed as recoverable backpressure.
-func (c *Collection) ensurePrimaryBatchCapacity(leafCount int) (bool, error) {
+//   - dirty-cache room for every rounded overflow extent and encoded leaf frame;
+//   - deferred retirement room for superseded leaves and volatile overflow pages;
+//   - durable retirement room for every superseded on-device overflow page;
+//   - admission bookkeeping for every new chain page and leaf.
+func (c *Collection) ensurePrimaryBatchCapacity() (bool, error) {
 	before := c.automaticCheckpoints.Load()
 	newDistinct := 0
+	liveLeaves := 0
+	volatileRetirements := len(c.batchPrimaryOverflowVolatile)
+	requiredDirty := c.batchPrimaryOverflowDirty
 	for i := range c.batchPrimaryLeaves {
-		if c.batchPrimaryLeaves[i].pendingIndex < 0 {
+		leaf := &c.batchPrimaryLeaves[i]
+		if leaf.skip {
+			continue
+		}
+		liveLeaves++
+		if leaf.pendingIndex < 0 {
 			newDistinct++
 		}
+		if leaf.pending.volatileRef != (storeio.PageRef{}) {
+			volatileRetirements++
+		}
+		reserved := c.cache.ReservationBytes(uint32(leaf.imageLength))
+		if requiredDirty > math.MaxUint64-reserved {
+			return false, storeio.ErrInvalidWrite
+		}
+		requiredDirty += reserved
 	}
 	if len(c.primaryPendingParents)+newDistinct > cap(c.primaryPendingParents) {
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
 		}
 		c.automaticCheckpoints.Add(1)
+		return true, nil
 	}
 	if err := c.ensurePrimaryBatchJournalRoom(c.batchJournalEntries); err != nil {
 		return false, err
 	}
-	required := uint64(leafCount) *
-		c.cache.ReservationBytes(storeio.CommonPrimaryLeafWideBytes)
-	if c.cache.DirtyCapacityAvailable() < required {
+	if c.automaticCheckpoints.Load() != before {
+		return true, nil
+	}
+	if c.cache.DirtyCapacityAvailable() < requiredDirty {
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
 		}
 		c.automaticCheckpoints.Add(1)
+		if c.cache.DirtyCapacityAvailable() < requiredDirty {
+			return false, fmt.Errorf(
+				"%w: ordered primary batch needs %d dirty bytes",
+				storeio.ErrPageCachePinned, requiredDirty,
+			)
+		}
+		return true, nil
 	}
-	c.clearPrimaryVolatileRetiredLocked()
-	if len(c.primaryVolatileRetired)+leafCount > cap(c.primaryVolatileRetired) {
+	// setupResidentPrimaryLocked allocates this queue with exactly
+	// MaxRetiredExtents capacity. Check both the configured invariant and the
+	// concrete slice before any admission; publish can then append by direct copy
+	// with no allocation and no error path.
+	if cap(c.primaryPendingOverflowRetire) != c.options.MaxRetiredExtents {
 		return false, fmt.Errorf(
-			"%w: buffered primary volatile-reference capacity %d",
-			storeio.ErrRetiredExtentCapacity,
-			cap(c.primaryVolatileRetired),
+			"%w: ordered primary durable overflow retirement capacity %d, want %d",
+			storeio.ErrInvalidWrite, cap(c.primaryPendingOverflowRetire),
+			c.options.MaxRetiredExtents,
 		)
 	}
-	return c.automaticCheckpoints.Load() != before, nil
+	if len(c.batchPrimaryOverflowDurable) > cap(c.primaryPendingOverflowRetire) {
+		return false, fmt.Errorf(
+			"%w: ordered primary batch durable overflow retirements %d",
+			storeio.ErrRetiredExtentCapacity,
+			len(c.batchPrimaryOverflowDurable),
+		)
+	}
+	if len(c.primaryPendingOverflowRetire)+
+		len(c.batchPrimaryOverflowDurable) > cap(c.primaryPendingOverflowRetire) {
+		if err := c.checkpointBufferedLocked(); err != nil {
+			return false, err
+		}
+		c.automaticCheckpoints.Add(1)
+		return true, nil
+	}
+	c.clearPrimaryVolatileRetiredLocked()
+	volatileNeeded := len(c.primaryVolatileRetired) + volatileRetirements
+	if volatileNeeded > c.options.MaxRetiredExtents {
+		c.retirementPressureCheckpoints.Add(1)
+		if err := c.checkpointBufferedLocked(); err != nil &&
+			!errors.Is(err, storeio.ErrRetiredExtentCapacity) {
+			return false, err
+		}
+		c.clearPrimaryVolatileRetiredLocked()
+		volatileNeeded = len(c.primaryVolatileRetired) + volatileRetirements
+		if volatileNeeded > c.options.MaxRetiredExtents {
+			return false, c.absorbRetirementPressure(fmt.Errorf(
+				"%w: buffered primary volatile-reference capacity %d",
+				storeio.ErrRetiredExtentCapacity,
+				c.options.MaxRetiredExtents,
+			))
+		}
+		c.automaticCheckpoints.Add(1)
+		return true, nil
+	}
+	if volatileNeeded > cap(c.primaryVolatileRetired) {
+		grown := slices.Grow(
+			c.primaryVolatileRetired,
+			volatileNeeded-len(c.primaryVolatileRetired),
+		)
+		// slices.Grow may over-allocate geometrically. Hide that spare backing
+		// capacity so the single-mutation lane, which treats cap as its logical
+		// retirement bound, cannot silently exceed the exact admitted high-water.
+		c.primaryVolatileRetired = grown[:len(grown):volatileNeeded]
+	}
+	if liveLeaves > math.MaxInt-c.batchPrimaryOverflowPages {
+		return false, storeio.ErrInvalidWrite
+	}
+	requiredFrames := c.batchPrimaryOverflowPages + liveLeaves
+	if requiredFrames > cap(c.batchPrimaryAdmitted) {
+		c.batchPrimaryAdmitted = slices.Grow(
+			c.batchPrimaryAdmitted,
+			requiredFrames-len(c.batchPrimaryAdmitted),
+		)
+	}
+	return false, nil
 }
 
 // buildPrimaryBatchLeaves rewrites one frame per touched leaf, laying every frame
@@ -440,14 +613,9 @@ func (c *Collection) buildPrimaryBatchLeaves(
 ) ([]byte, uint64, error) {
 	baseGen := state.root.Generation
 	c.batchPrimaryLeafArena = c.batchPrimaryLeafArena[:0]
-	running := state.fileEnd
-	if len(c.primaryPendingParents) == 0 {
-		gap := uint64(c.options.maxTransactionPages) * uint64(c.options.MaxPageSize)
-		if running > math.MaxUint64-gap {
-			return nil, 0, storeio.ErrInvalidWrite
-		}
-		running += gap
-	}
+	c.batchPrimaryOverflowVolatile = c.batchPrimaryOverflowVolatile[:0]
+	c.batchPrimaryOverflowDurable = c.batchPrimaryOverflowDurable[:0]
+	running := c.batchPrimaryOverflowFileEnd
 	live := false
 	for li := range c.batchPrimaryLeaves {
 		splitKey, err := c.buildPrimaryBatchLeaf(state, baseGen, li)
@@ -498,7 +666,12 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	state *fileStoreState, baseGen uint64, li int,
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
-	bounds := c.primaryLeafBounds(state)
+	inputBounds := c.primaryLeafBounds(state)
+	outputBounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           c.batchPrimaryOverflowFileEnd,
+		NextLogicalID:     c.batchPrimaryNextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
 	var (
 		path  filePrimaryMutationPath
 		lease storeio.PageLease
@@ -527,13 +700,18 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		return nil, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 	unified, ok := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-		page, c.storeID, leaf.resident.Bucket, bounds,
+		page, c.storeID, leaf.resident.Bucket, inputBounds,
 	)
 	if !ok {
 		return nil, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 	baseRows, err := unified.RenderRecordsWithScratch(c.primaryLeafMutationScratch)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.collectPrimaryBatchOverflowRetirements(
+		baseRows, leaf, inputBounds,
+	); err != nil {
 		return nil, err
 	}
 	leaf.initialLen = len(baseRows)
@@ -577,7 +755,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 			StoreID: c.storeID, Generation: leaf.frameGen,
 			Bucket: leaf.resident.Bucket,
 		},
-		c.storeID, final, bounds, c.primaryUnifiedBuilder,
+		c.storeID, final, outputBounds, c.primaryUnifiedBuilder,
 	)
 	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
 		c.primaryLeafSplitRequired.Add(1)
@@ -617,8 +795,7 @@ func (c *Collection) mergePrimaryBatchLeafRows(
 		if baseAt >= len(baseRows) {
 			if !mutation.remove {
 				final = append(final, storeio.CommonPrimaryLeafRecord{
-					Key:   mutation.key,
-					Value: storeio.CommonPrimaryLeafValue{Inline: mutation.value},
+					Key: mutation.key, Value: mutation.stored,
 				})
 				applied++
 			}
@@ -634,23 +811,15 @@ func (c *Collection) mergePrimaryBatchLeafRows(
 		case order > 0:
 			if !mutation.remove {
 				final = append(final, storeio.CommonPrimaryLeafRecord{
-					Key:   mutation.key,
-					Value: storeio.CommonPrimaryLeafValue{Inline: mutation.value},
+					Key: mutation.key, Value: mutation.stored,
 				})
 				applied++
 			}
 			mutationAt++
 		default:
-			if base.Value.IsOverflow() {
-				return nil, 0, fmt.Errorf(
-					"%w: ordered primary overflow mutation",
-					ErrPrimaryCutoverUnsupported,
-				)
-			}
 			if !mutation.remove {
 				final = append(final, storeio.CommonPrimaryLeafRecord{
-					Key:   mutation.key,
-					Value: storeio.CommonPrimaryLeafValue{Inline: mutation.value},
+					Key: mutation.key, Value: mutation.stored,
 				})
 			}
 			applied++
@@ -659,6 +828,57 @@ func (c *Collection) mergePrimaryBatchLeafRows(
 		}
 	}
 	return final, applied, nil
+}
+
+// collectPrimaryBatchOverflowRetirements enumerates old chains replaced or
+// deleted in this leaf. A chain at or above the checkpoint base is volatile and
+// can be dropped with its old leaf after the atomic router flip; a lower chain
+// is durable and must be retired by the next checkpoint transaction.
+func (c *Collection) collectPrimaryBatchOverflowRetirements(
+	baseRows []storeio.CommonPrimaryLeafRecord,
+	leaf *primaryBatchLeaf,
+	bounds storeio.CommonPrimaryLeafBounds,
+) error {
+	baseAt := 0
+	mutationAt := leaf.mutationAt
+	checkpointBase := c.primaryCheckpointBaseState()
+	for baseAt < len(baseRows) && mutationAt < leaf.mutationEnd {
+		mutation := &c.batchPrimaryMutations[mutationAt]
+		order := bytes.Compare(baseRows[baseAt].Key, mutation.key)
+		switch {
+		case order < 0:
+			baseAt++
+		case order > 0:
+			mutationAt++
+		default:
+			old := baseRows[baseAt].Value
+			if old.IsOverflow() {
+				if checkpointBase != nil &&
+					old.Overflow.Offset >= checkpointBase.fileEnd {
+					extents, err := c.collectPrimaryOverflowExtents(
+						c.batchPrimaryOverflowVolatile,
+						old.Overflow, bounds,
+					)
+					if err != nil {
+						return err
+					}
+					c.batchPrimaryOverflowVolatile = extents
+				} else {
+					extents, err := c.collectPrimaryOverflowExtents(
+						c.batchPrimaryOverflowDurable,
+						old.Overflow, bounds,
+					)
+					if err != nil {
+						return err
+					}
+					c.batchPrimaryOverflowDurable = extents
+				}
+			}
+			baseAt++
+			mutationAt++
+		}
+	}
+	return nil
 }
 
 func (c *Collection) primaryBatchProspectiveSplitKey(
@@ -672,13 +892,38 @@ func (c *Collection) primaryBatchProspectiveSplitKey(
 	return c.batchPrimarySplitKey
 }
 
+// admitPrimaryBatchOverflow materializes every pre-planned new chain. None of
+// these PageRefs is reachable yet; batchPrimaryAdmitted records the exact prefix
+// so any encode/cache/exact/WAL failure can discard all staged frames.
+func (c *Collection) admitPrimaryBatchOverflow() error {
+	generation := uint64(0)
+	for i := range c.batchPrimaryMutations {
+		mutation := &c.batchPrimaryMutations[i]
+		if mutation.remove || !mutation.stored.IsOverflow() {
+			continue
+		}
+		if generation == 0 {
+			generation = mutation.stored.Overflow.Generation
+		} else if generation != mutation.stored.Overflow.Generation {
+			return storeio.ErrGenerationOrder
+		}
+		if err := c.admitBufferedPrimaryOverflowChain(
+			mutation.value, generation, mutation.stored.Overflow,
+			c.batchPrimaryFileEnd, c.batchPrimaryNextLogicalID,
+			&c.batchPrimaryAdmitted,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // admitPrimaryBatchLeaves admits every rewritten leaf frame into the cache as a
 // buffered dirty page. The frames are not reader-visible until publishPrimaryBatch
 // flips the router, so admitting them all before the journal fence changes nothing
 // a reader can observe. Capacity was reserved, so a failure here is unexpected and
 // unadmits what it staged, leaving nothing visible and nothing journaled.
 func (c *Collection) admitPrimaryBatchLeaves() error {
-	c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]
 		if leaf.skip {
@@ -728,6 +973,7 @@ func (c *Collection) publishPrimaryBatch(
 	}
 	nextRoot := state.root
 	nextRoot.Generation = generation
+	nextRoot.NextLogicalID = c.batchPrimaryNextLogicalID
 	nextRoot.DocumentCount = uint64(int64(state.root.DocumentCount) + int64(totalDelta))
 	nextState := &fileStoreState{
 		root: nextRoot, fileEnd: c.batchPrimaryFileEnd,
@@ -766,8 +1012,20 @@ func (c *Collection) publishPrimaryBatch(
 	for _, prev := range c.batchPrimaryPrevVolatile {
 		c.retirePrimaryVolatileRefLocked(prev)
 	}
+	for _, prev := range c.batchPrimaryOverflowVolatile {
+		c.retirePrimaryVolatileRefLocked(prev)
+	}
 	c.endReaderFence()
 	c.snapshotGate.Unlock()
+	if len(c.batchPrimaryOverflowDurable) != 0 {
+		// ensurePrimaryBatchCapacity proved len+batch <= cap, and setup fixes cap to
+		// MaxRetiredExtents. append therefore neither allocates nor exposes a
+		// recoverable failure after the router/state publication point of no return.
+		c.primaryPendingOverflowRetire = append(
+			c.primaryPendingOverflowRetire,
+			c.batchPrimaryOverflowDurable...,
+		)
+	}
 
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]

@@ -59,6 +59,10 @@ func dumpInsert(s *InsertStmt) string {
 			dumpPath(&b, column)
 		}
 	}
+	if s.Source != nil {
+		b.WriteString(" source ")
+		b.WriteString(dumpStmt(s.Source))
+	}
 	for i := range s.Rows {
 		b.WriteString(" (")
 		for j, value := range s.Rows[i].Values {

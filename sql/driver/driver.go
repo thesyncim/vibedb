@@ -17,6 +17,7 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 )
 
 func init() {
@@ -246,22 +247,27 @@ func (c *dbConnector) release() error {
 }
 
 type conn struct {
-	db           *database
-	exec         query.Exec
-	args         []any
-	pointDocs    store.Segment
-	pointRaw     []byte
-	pointKeyRaw  []byte
-	pointKeyEnds []int
-	pointKeys    []string
-	matchKeys    []string
-	joinCatalog  []durable.NamedCollection
-	joinSnapshot durable.DatabaseSnapshot
-	rowset       rows
-	open         bool
-	tx           *tx
-	closed       bool
-	owner        *dbConnector
+	db             *database
+	exec           query.Exec
+	args           []any
+	pointDocs      store.Segment
+	pointRaw       []byte
+	pointKeyRaw    []byte
+	pointKeyEnds   []int
+	pointKeys      []string
+	matchKeys      []string
+	insertSeeds    []seedDocument
+	insertKeyRaw   []byte
+	insertSeen     map[string]struct{}
+	insertTape     []vibejson.IndexEntry
+	joinCatalog    []durable.NamedCollection
+	joinSnapshot   durable.DatabaseSnapshot
+	insertSnapshot durable.Snapshot
+	rowset         rows
+	open           bool
+	tx             *tx
+	closed         bool
+	owner          *dbConnector
 	// routing is the per-connection Router used by the cluster facade's write
 	// preflight. It is created on first placed write and stays nil for the
 	// default single-store path.
@@ -443,14 +449,41 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
-	if err := c.validateSurfaceContext(ctx, tree); err != nil {
-		return nil, err
-	}
 	s := &stmt{
 		conn:       c,
 		tree:       tree,
 		params:     tree.Params(),
 		paramKinds: statementParamKinds(tree),
+	}
+	s.paramPositions = statementDocumentParamPositions(tree, s.paramKinds)
+	if tree.Kind == sqlast.KindCreateView || tree.Kind == sqlast.KindDropView {
+		var ddl *preparedViewDDL
+		ddl, err = c.prepareViewDDL(ctx, src, tree)
+		if err != nil {
+			return nil, err
+		}
+		s.views = &preparedViewState{ddl: ddl}
+		return s, nil
+	}
+	if err := c.validateViewStatementContext(ctx, src, tree); err != nil {
+		return nil, err
+	}
+	viewQuery := tree.Select
+	if tree.Kind == sqlast.KindInsert && tree.Insert.Source != nil {
+		viewQuery = tree.Insert.Source
+	}
+	if viewQuery != nil {
+		var dependencies []viewDependency
+		dependencies, err = c.expandPreparedViews(ctx, src, viewQuery)
+		if err != nil {
+			return nil, err
+		}
+		if len(dependencies) != 0 {
+			s.views = &preparedViewState{dependencies: dependencies}
+		}
+	}
+	if err := c.validateSurfaceContext(ctx, tree); err != nil {
+		return nil, err
 	}
 	if tree.Kind.IsQuery() {
 		s.query, err = query.PrepareParsedStatement(src, tree.Select)
@@ -485,6 +518,19 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	} else {
 		s.mutation, err = query.PrepareParsedDML(src, tree)
 		if err == nil && tree.Kind == sqlast.KindInsert &&
+			tree.Insert.Source != nil {
+			s.applyInsertSourceDocumentParams()
+		}
+		if err == nil && tree.Kind == sqlast.KindInsert &&
+			tree.Insert.Source != nil {
+			s.insertSource = &insertSelectPlan{
+				statement:    s.mutation.InsertSource(),
+				tree:         tree.Insert.Source,
+				dependencies: selectPhysicalDependencies(tree.Insert.Source),
+				catalogJoin:  selectContainsJoin(tree.Insert.Source),
+			}
+		}
+		if err == nil && tree.Kind == sqlast.KindInsert &&
 			tree.Insert.Returning != nil {
 			s.query, err = query.PrepareParsedStatement(
 				src, tree.Insert.Returning,
@@ -502,6 +548,11 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 		}
 	}
 	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	if err := s.validatePreparedViewDependencies(ctx); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 	return s, nil
@@ -549,6 +600,7 @@ func (c *conn) Close() error {
 	}
 	c.exec.Release()
 	snapshotErr := c.joinSnapshot.Close()
+	snapshotErr = errors.Join(snapshotErr, c.insertSnapshot.Close())
 	owner := c.owner
 	err := snapshotErr
 	if owner != nil {
@@ -570,8 +622,13 @@ func (c *conn) Close() error {
 	c.pointKeyEnds = nil
 	c.pointKeys = nil
 	c.matchKeys = nil
+	c.insertSeeds = nil
+	c.insertKeyRaw = nil
+	c.insertSeen = nil
+	c.insertTape = nil
 	c.joinCatalog = nil
 	c.joinSnapshot = durable.DatabaseSnapshot{}
+	c.insertSnapshot = durable.Snapshot{}
 	c.rowset = rows{closed: true}
 	c.tx = nil
 	c.routing = nil

@@ -52,7 +52,6 @@ var unsupportedStatements = map[string]string{
 	"ANALYZE": "storage maintenance is the owning application's, not a client's",
 	"REINDEX": "storage maintenance is the owning application's, not a client's",
 	"CLUSTER": "storage maintenance is the owning application's, not a client's",
-	"REFRESH": "there are no materialized views",
 
 	"SAVEPOINT": "savepoints are not supported: the runtime owns one bounded transaction overlay",
 	"RELEASE":   "savepoints are not supported, so there is no savepoint to release",

@@ -18,11 +18,16 @@ type stmt struct {
 	tree           *sqlast.Statement
 	query          *query.Statement
 	mutation       *query.DMLStatement
+	insertSource   *insertSelectPlan
+	views          *preparedViewState
 	pointPredicate *sqlast.Expr
 	primaryPoint   bool
 	catalogJoin    bool
 	params         int
 	paramKinds     []ParamKind
+	// paramPositions stores authored byte positions plus one for document
+	// placeholders only. It remains nil for the scalar-only path.
+	paramPositions []int
 	dependencies   []physicalDependency
 	explain        bool
 	analyze        bool
@@ -52,7 +57,7 @@ func (s *stmt) preflightExec(got int) error {
 	if s.closed {
 		return errors.New("vibedb: statement is closed")
 	}
-	if s.mutation == nil {
+	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
 		return errors.New("vibedb: SELECT returns rows; use Query")
 	}
 	if s.query != nil {
@@ -79,10 +84,13 @@ func (s *stmt) Close() error {
 	s.tree = nil
 	s.query = nil
 	s.mutation = nil
+	s.insertSource = nil
+	s.views = nil
 	s.pointPredicate = nil
 	s.primaryPoint = false
 	s.catalogJoin = false
 	s.paramKinds = nil
+	s.paramPositions = nil
 	s.dependencies = nil
 	s.explain = false
 	s.analyze = false
@@ -182,12 +190,12 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	if s.mutation != nil {
 		var cursor query.Cursor
 		if s.conn.tx != nil {
-			cursor, err = s.conn.tx.execMutationReturningContext(
-				ctx, s.mutation, args, s.query,
+			cursor, err = s.conn.tx.execPreparedMutationReturningContext(
+				ctx, s, args,
 			)
 		} else {
-			cursor, err = s.conn.mutationReturningContext(
-				ctx, s.mutation, args, s.query,
+			cursor, err = s.conn.preparedMutationReturningContext(
+				ctx, s, args,
 			)
 		}
 		if err != nil {
@@ -201,6 +209,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	// accounts. An empty collection is impossible for an ordinary SELECT, so
 	// this branch cannot divert a physical query or its transaction snapshot.
 	if s.query.Collection() == "" && len(s.dependencies) == 0 {
+		if err := s.validatePreparedViewDependencies(ctx); err != nil {
+			return nil, err
+		}
 		cursor, runErr := s.query.RunInto(&s.conn.exec, query.Source{}, args)
 		if runErr != nil {
 			return nil, runErr
@@ -212,6 +223,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
 	if s.conn.tx != nil {
+		if err := s.validateTransactionViewDependencies(); err != nil {
+			return nil, err
+		}
 		if s.transactionRequiresCatalogSource() {
 			source, err := s.conn.materializeTransactionJoinSource(
 				ctx, s.conn.tx, s.query.Collection(), s.dependencies)
@@ -260,6 +274,10 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
 	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
+		return nil, err
+	}
+	if err := s.validateViewDependenciesLocked(); err != nil {
+		s.conn.db.mu.RUnlock()
 		return nil, err
 	}
 	if s.requiresCatalogSource() {
@@ -457,6 +475,9 @@ func (s *stmt) explainPlan(ctx context.Context, args []any) (string, error) {
 }
 
 func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error) {
+	if err := s.validatePreparedViewDependencies(ctx); err != nil {
+		return query.ExplainOptions{}, err
+	}
 	options := query.ExplainOptions{
 		PrimaryPoint: s.primaryPoint,
 	}
@@ -806,7 +827,7 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 	if s.closed {
 		return nil, errors.New("vibedb: statement is closed")
 	}
-	if s.mutation == nil {
+	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
 		return nil, errors.New("vibedb: SELECT returns rows; use Query")
 	}
 	if err := s.conn.usable(ctx); err != nil {
@@ -815,11 +836,14 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 	if s.conn.open {
 		return nil, errors.New("vibedb: close the current rows before executing another statement on this connection")
 	}
+	if s.views != nil && s.views.ddl != nil {
+		return s.conn.execViewDDL(ctx, s.views.ddl)
+	}
 	if s.conn.tx != nil {
 		if err := contextCheckpoint(ctx); err != nil {
 			return nil, err
 		}
-		return s.conn.tx.execMutationContext(ctx, s.mutation, args)
+		return s.conn.tx.execPreparedMutationContext(ctx, s, args)
 	}
-	return s.conn.execMutationContext(ctx, s.mutation, args)
+	return s.conn.execPreparedMutationContext(ctx, s, args)
 }

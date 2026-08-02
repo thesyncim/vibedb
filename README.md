@@ -177,16 +177,38 @@ go func() { log.Print(srv.Serve(ln)) }()
 
 pgx and lib/pq clients can issue the document SQL subset with PostgreSQL `$1`
 parameters: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`,
-`SELECT`, non-recursive SELECT-valued CTEs with materialization policy,
-uncorrelated predicate subqueries, derived tables, and chained inner, left,
-right, full, and cross joins over physical, derived, and CTE relations.
-Composite `USING`, composite equi-keys, residual `ON` predicates, prepared
-statements, and explicit transactions use the same execution path. Stock
-`psql` can connect and issue the same supported direct SQL. Whole-document
-parameters are described as PostgreSQL `json`; projected JSON values preserve
-their exact wire spelling. `INSERT ... RETURNING`, `UPDATE ... RETURNING`, and
-`DELETE ... RETURNING` support projected JSON paths and `*`; `ON CONFLICT DO
-NOTHING` skips duplicate document identities atomically.
+`SELECT`, durable ordinary views, SELECT-valued CTEs including the bounded
+recursive subset, set operations, the documented window-function subset,
+uncorrelated predicate subqueries, the documented derived/`LATERAL` relation
+subset, and chained inner, left, right, full, and cross joins. Composite
+`USING`, composite equi-keys, residual `ON` predicates, prepared statements,
+and explicit transactions use the same execution path. Stock `psql` can
+connect and issue the same supported direct SQL. Whole-document parameters are
+described as PostgreSQL `json`; projected JSON values preserve their exact wire
+spelling. Exact scalar arithmetic, concatenation, and `CAST` to `TEXT`,
+`BOOLEAN`, `NUMERIC`, or `JSON` do not fall back to floating point; searched
+and simple `CASE` expressions retain ordered, lazy branch semantics.
+
+`INSERT` query sources accept one complete JSON document column from a
+`SELECT`, `WITH`, `TABLE`, parenthesized, set, CTE, join, or view-backed query.
+The source reads the pre-statement snapshot; every document, key, conflict,
+route, and `RETURNING` row is staged before one atomic publication. The same
+contract applies in transactions and under result, intermediate, and durable
+batch limits; source spools, exact lane-specific staging, and `RETURNING` share
+one `IntermediateBytes` account, while placed routing streams over that staging
+without retaining a second vector. Documents above the durable inline threshold
+remain valid up to `MaxDocumentBytes`: mixed inline and multi-page documents,
+replacements, deletes, and exact-index changes publish as one batch generation
+and recover all-or-none from one journal record. Pinned snapshots retain the
+old overflow chains until their lease closes.
+
+`INSERT ... RETURNING`, `UPDATE ... RETURNING`, and `DELETE ... RETURNING`
+support projected JSON paths and `*`; `ON CONFLICT DO NOTHING` skips duplicate
+document identities atomically. Ordinary views are durable virtual definitions
+and read-only; materialized views are explicitly refused. Supplying a table
+where `DROP VIEW` requires a view, or a view to `DROP TABLE`, `TRUNCATE`,
+`CREATE INDEX`, table-qualified `DROP INDEX`, or mutation DML, is PostgreSQL
+SQLSTATE `42809` even with `IF EXISTS`.
 `SELECT DISTINCT` is supported for non-aggregate projections.
 `TRUNCATE [TABLE]` atomically replaces a table with an empty durable
 incarnation while preserving its schema and indexes. `DROP INDEX [IF EXISTS]`
@@ -223,9 +245,18 @@ resource bounds.
 
 | Option | Success means | Reader visibility | Crash window |
 | --- | --- | --- | --- |
-| `DurabilityBufferedVisible` | accepted into bounded foreground staging | immediate | acknowledged changes after the last successful `Flush` may be lost |
+| `DurabilityBufferedVisible` | accepted into bounded foreground staging; with `RecoveryJournal`, its redo record is also appended and synced | immediate | without a recovery journal, acknowledged changes after the last successful `Flush` may be lost; with one, recovery replays the synced prefix |
 | `DurabilityAsyncVisible` | accepted by the bounded background committer | immediate | acknowledged generations not yet reported by `DurableGeneration` may be lost |
 | `DurabilitySync` (zero value) | one recovery-journal record appended and synced on the primary graph, then the mutation applies and publishes | after the journal sync — visibility strictly follows durability | recovery selects the last checkpointed root and replays the journal's acknowledged records |
+
+If a complete recovery-journal record was appended but its sync reports an
+error, the logical outcome cannot be inferred from the error alone: reopen may
+replay the complete single mutation or batch even when the synchronous live
+reader never saw it. The API returns `durable.ErrCommitOutcomeUnknown` while
+retaining the device cause, and the live writer is terminally poisoned. Pgwire
+maps this condition to PostgreSQL SQLSTATE `40003`
+(`statement_completion_unknown`). Reconcile the affected data after close and
+reopen before deciding whether to retry; do not blindly resubmit the mutation.
 
 For buffered mode, `CheckpointPowerSafe` is the zero-value `Flush` strength;
 `CheckpointFilesystem` explicitly selects an ordinary filesystem boundary.

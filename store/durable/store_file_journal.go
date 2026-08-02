@@ -50,6 +50,13 @@ const (
 // journalFailureBox carries the sticky journal poison behind an atomic pointer.
 type journalFailureBox struct{ err error }
 
+func recoveryJournalAcknowledgementFailure(cause error) error {
+	return fmt.Errorf(
+		"vibedb: recovery journal acknowledgement failed, reopen required: %w",
+		cause,
+	)
+}
+
 // poisonJournal records a terminal journal failure and rolls the reader view
 // to the committer's poison rules, then returns the sticky error. It is
 // idempotent: the first failure wins so later callers report the original
@@ -64,16 +71,52 @@ func (c *Collection) poisonJournal(cause error) error {
 		return nil
 	}
 	c.journalFailure.CompareAndSwap(nil, &journalFailureBox{
-		err: fmt.Errorf(
-			"vibedb: recovery journal acknowledgement failed, reopen required: %w",
-			cause,
-		),
+		err: recoveryJournalAcknowledgementFailure(cause),
 	})
 	// Roll the reader view exactly as an automatic-persistence failure does. The
 	// journal is buffered-only, so this preserves the last admitted immutable view
 	// while every later mutation is rejected by PersistenceError.
 	c.poisonPersistence(cause)
 	return c.journalFailure.Load().err
+}
+
+// poisonJournalCommitOutcomeUnknown is the journal-sync counterpart of the
+// committer's post-root-fence classification. Callers use it only after a
+// complete redo record has been appended and the following durability barrier
+// fails: the record may have reached stable storage despite the barrier's
+// error, so only reopen/replay can determine whether the mutation committed.
+//
+// Append failures and recycle failures deliberately stay on poisonJournal.
+// An append failure precedes the durability boundary and recovery rejects its
+// incomplete tail; a recycle follows an already-durable physical root and
+// therefore cannot make that root's commit outcome ambiguous.
+func journalCommitOutcomeUnknown(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	if !errors.Is(cause, ErrCommitOutcomeUnknown) {
+		cause = fmt.Errorf("%w: %w", ErrCommitOutcomeUnknown, cause)
+	}
+	return cause
+}
+
+func (c *Collection) poisonJournalCommitOutcomeUnknown(cause error) error {
+	return c.poisonJournal(journalCommitOutcomeUnknown(cause))
+}
+
+// poisonJournalCommitOutcomeUnknownForFence returns both diagnostic channels
+// needed by group commit. sticky is the collection-wide first poison. fence is
+// always this failed sync's independently classified error, even when an
+// earlier concurrent append failure won the sticky CompareAndSwap.
+func (c *Collection) poisonJournalCommitOutcomeUnknownForFence(
+	cause error,
+) (sticky, fence error) {
+	classified := journalCommitOutcomeUnknown(cause)
+	sticky = c.poisonJournal(classified)
+	if errors.Is(sticky, classified) {
+		return sticky, sticky
+	}
+	return sticky, recoveryJournalAcknowledgementFailure(classified)
 }
 
 // ErrStoreDirectIOUnsupported reports that ReadDirectRequire or
@@ -798,7 +841,9 @@ func (c *Collection) journalDepositLocked(
 // replay. Journal capacity is ensured before the leaf frame is prepared
 // (ensureBufferedPrimaryMutationCapacity), so the append cannot report full
 // here; any append or sync error is a device failure and is terminal for the
-// journal lane, poisoning die-don't-retry with nothing published.
+// journal lane, poisoning die-don't-retry with nothing published. An append
+// failure is a definite rejection; a failure from the following Sync has an
+// unknown commit outcome because its complete record may replay after reopen.
 func (c *Collection) journalBeforePublishLocked(
 	deleting bool, generation uint64, key, value []byte,
 ) error {
@@ -814,7 +859,7 @@ func (c *Collection) journalBeforePublishLocked(
 		return c.poisonJournal(err)
 	}
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return c.poisonJournal(err)
+		return c.poisonJournalCommitOutcomeUnknown(err)
 	}
 	if recoveryJournalPostSyncHook != nil {
 		recoveryJournalPostSyncHook()
@@ -830,8 +875,10 @@ func (c *Collection) journalBeforePublishLocked(
 // member of the batch before the whole group is durable. Journal capacity is
 // ensured for the whole record before prepare (ensurePrimaryBatchJournalRoom), so
 // the append cannot report full here; an append or sync error is a device failure
-// and poisons die-don't-retry with nothing published. It is a no-op for
-// buffered-visible (which journals its batch after publishing) and during replay.
+// and poisons die-don't-retry with nothing published. Append failure rejects the
+// whole batch definitely; Sync failure leaves the whole record's commit outcome
+// unknown because recovery may replay it atomically. It is a no-op for buffered-
+// visible (which journals its batch after publishing) and during replay.
 func (c *Collection) journalBatchBeforePublishLocked(
 	generation uint64, entries []storeio.RecoveryBatchEntry,
 ) error {
@@ -842,7 +889,7 @@ func (c *Collection) journalBatchBeforePublishLocked(
 		return c.poisonJournal(err)
 	}
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-		return c.poisonJournal(err)
+		return c.poisonJournalCommitOutcomeUnknown(err)
 	}
 	if recoveryJournalPostSyncHook != nil {
 		recoveryJournalPostSyncHook()
@@ -1137,7 +1184,9 @@ func (c *Collection) drainBufferedJournalDeltaPhysicalLocked(
 // The batch retains every raw record rather than coalescing repeated keys.
 // Recovery applies one entry per logical generation, so the reopened public
 // generation lands exactly on target as well as reconstructing the same rows
-// and exact-index postings.
+// and exact-index postings. Once a complete suffix has been appended, a failed
+// Sync is an unknown outcome: recovery may replay that suffix even though this
+// Flush could not acknowledge it.
 func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	handled bool, err error,
 ) {
@@ -1210,7 +1259,7 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		recoveryJournalDeltaPreSyncHook(target)
 	}
 	if syncErr := c.journal.Sync(c.journalPowerSafe); syncErr != nil {
-		return true, c.poisonJournal(syncErr)
+		return true, c.poisonJournalCommitOutcomeUnknown(syncErr)
 	}
 	if recoveryJournalDeltaPostSyncHook != nil {
 		recoveryJournalDeltaPostSyncHook(target)

@@ -35,6 +35,19 @@ type Result struct {
 	resultRowsLimit  int
 	resultBytesLimit int64
 	resultBytesUsed  int64
+
+	// rootIntermediate is installed only while Statement.RunIntermediateInto
+	// synchronously materializes its caller-visible root. Every ordinary Result
+	// keeps it nil. The pointed-to frame already owns all relation, CTE, set,
+	// window, and scalar-dependency reservations, so result admission can test
+	// their live total plus the root result before either storage grows.
+	//
+	// A statement without nested state uses rootIntermediateLimit directly and
+	// leaves rootIntermediate nil. rootIntermediateActive distinguishes that
+	// direct mode from an ordinary Result's zero value.
+	rootIntermediate       *intermediateBudget
+	rootIntermediateLimit  int64
+	rootIntermediateActive bool
 }
 
 // Release drops all storage retained by r. Reusing r through [Query.RunInto]
@@ -55,6 +68,51 @@ func (r *Result) Release() {
 	r.resultRowsLimit = 0
 	r.resultBytesLimit = 0
 	r.resultBytesUsed = 0
+	r.endRootIntermediate()
+}
+
+// RetainedBytes reports the logical column, cell, and payload storage admitted
+// for the current result. It is the same exact accounting used by
+// ExecOptions.ResultBytes, including representations borrowed from a heap
+// source. Relation consumers use it when a caller-visible Result becomes an
+// intermediate input to a larger atomic operation.
+func (r *Result) RetainedBytes() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.resultBytesUsed
+}
+
+// beginRootIntermediate makes the current result part of one statement-wide
+// intermediate allowance. frame is nil only for a direct statement, where no
+// other intermediate resource can coexist with the result. The binding is
+// borrowed for one synchronous execution and must be ended before returning to
+// the caller.
+func (r *Result) beginRootIntermediate(
+	frame *intermediateBudget,
+	directLimit int64,
+) {
+	r.rootIntermediate = frame
+	r.rootIntermediateLimit = directLimit
+	r.rootIntermediateActive = true
+}
+
+func (r *Result) endRootIntermediate() {
+	r.rootIntermediate = nil
+	r.rootIntermediateLimit = 0
+	r.rootIntermediateActive = false
+}
+
+// rootIntermediateBudget reports the live non-result charge and the shared
+// ceiling. It deliberately does not reserve resultBytesUsed in the frame: the
+// result already owns that logical charge, and admission always tests the sum.
+// This lets the caller carry the returned retained total into a subsequent
+// atomic staging phase without a reserve/release handoff or double charge.
+func (r *Result) rootIntermediateBudget() (used, limit int64) {
+	if r.rootIntermediate == nil {
+		return 0, r.rootIntermediateLimit
+	}
+	return r.rootIntermediate.used, r.rootIntermediate.limit
 }
 
 // A ResultColumn is one output column: its Header (the projection path or the

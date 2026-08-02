@@ -423,6 +423,19 @@ func (p *Prepared) ParamKind(index int) ParamKind {
 	return p.statement.paramKinds[index]
 }
 
+// ParamPosition reports the zero-based authored byte offset of a document
+// placeholder. Scalar and out-of-range parameters return -1. The SQL text may
+// contain multi-byte UTF-8; protocol adapters convert this byte offset to their
+// own character-position convention.
+func (p *Prepared) ParamPosition(index int) int {
+	if p == nil || p.statement == nil || index < 0 ||
+		index >= len(p.statement.paramPositions) ||
+		p.statement.paramPositions[index] == 0 {
+		return -1
+	}
+	return p.statement.paramPositions[index] - 1
+}
+
 // Columns returns immutable borrowed output names for a SELECT. It returns nil
 // for statements that do not return rows and after Close.
 func (p *Prepared) Columns() []string {
@@ -709,7 +722,9 @@ func statementParamKinds(statement *sqlast.Statement) []ParamKind {
 	}
 	switch statement.Kind {
 	case sqlast.KindInsert:
-		if len(statement.Insert.Columns) == 0 {
+		if statement.Insert.Source != nil {
+			markInsertSourceDocumentParams(kinds, statement.Insert.Source)
+		} else if len(statement.Insert.Columns) == 0 {
 			for i := range statement.Insert.Rows {
 				if len(statement.Insert.Rows[i].Values) != 0 {
 					markDocumentParam(kinds, statement.Insert.Rows[i].Values[0])
@@ -720,6 +735,125 @@ func statementParamKinds(statement *sqlast.Statement) []ParamKind {
 		markDocumentParam(kinds, statement.Update.Doc)
 	}
 	return kinds
+}
+
+func statementDocumentParamPositions(
+	statement *sqlast.Statement,
+	kinds []ParamKind,
+) []int {
+	if statement == nil || len(kinds) == 0 {
+		return nil
+	}
+	var positions []int
+	record := func(operand sqlast.Operand) {
+		if operand.Kind != sqlast.OperandParam || operand.Ordinal < 0 ||
+			operand.Ordinal >= len(kinds) || kinds[operand.Ordinal] != ParamDocument {
+			return
+		}
+		if positions == nil {
+			positions = make([]int, len(kinds))
+		}
+		positions[operand.Ordinal] = operand.Pos + 1
+	}
+	switch statement.Kind {
+	case sqlast.KindInsert:
+		if statement.Insert.Source != nil {
+			if statement.Insert.Source.Set != nil {
+				recordInsertSourceDocumentPositions(
+					statement.Insert.Source.Set.Root, record,
+				)
+			}
+		} else if len(statement.Insert.Columns) == 0 {
+			for i := range statement.Insert.Rows {
+				if len(statement.Insert.Rows[i].Values) != 0 {
+					record(statement.Insert.Rows[i].Values[0])
+				}
+			}
+		}
+	case sqlast.KindUpdate:
+		record(statement.Update.Doc)
+	}
+	return positions
+}
+
+func recordInsertSourceDocumentPositions(
+	expression *sqlast.SetExpr,
+	record func(sqlast.Operand),
+) {
+	if expression == nil {
+		return
+	}
+	switch expression.Kind {
+	case sqlast.SetValuesExpr:
+		if expression.Columns != 1 || expression.Values == nil {
+			return
+		}
+		for row := range expression.Values.Rows {
+			values := expression.Values.Rows[row].Values
+			if len(values) == 1 && !values[0].Null {
+				record(values[0].Operand)
+			}
+		}
+	case sqlast.SetBinaryExpr:
+		recordInsertSourceDocumentPositions(expression.Left, record)
+		recordInsertSourceDocumentPositions(expression.Right, record)
+	case sqlast.SetGroupExpr:
+		recordInsertSourceDocumentPositions(expression.Child, record)
+	}
+}
+
+func (s *stmt) applyInsertSourceDocumentParams() {
+	if s == nil || s.mutation == nil {
+		return
+	}
+	for ordinal := range s.paramKinds {
+		position, ok := s.mutation.InsertDocumentParameterPosition(ordinal)
+		if !ok {
+			continue
+		}
+		s.paramKinds[ordinal] = ParamDocument
+		if s.paramPositions == nil {
+			s.paramPositions = make([]int, len(s.paramKinds))
+		}
+		s.paramPositions[ordinal] = position + 1
+	}
+}
+
+// markInsertSourceDocumentParams marks only VALUES leaves that directly feed
+// the one-column INSERT query result. VALUES is scalar everywhere else: a
+// standalone VALUES statement, a SELECT predicate, and a set tail retain
+// ordinary SQL parameter inference. Binary and grouped set nodes preserve the
+// one-column ordinal contract, so all of their VALUES leaves are document
+// producers while SELECT-leaf predicate parameters remain scalar.
+func markInsertSourceDocumentParams(kinds []ParamKind, source *sqlast.SelectStmt) {
+	if source == nil || source.Set == nil || source.Set.Root == nil ||
+		source.Set.Root.Columns != 1 {
+		return
+	}
+	markInsertSourceSetDocumentParams(kinds, source.Set.Root)
+}
+
+func markInsertSourceSetDocumentParams(kinds []ParamKind, expression *sqlast.SetExpr) {
+	if expression == nil {
+		return
+	}
+	switch expression.Kind {
+	case sqlast.SetValuesExpr:
+		if expression.Columns != 1 || expression.Values == nil {
+			return
+		}
+		for row := range expression.Values.Rows {
+			values := expression.Values.Rows[row].Values
+			if len(values) == 1 && !values[0].Null {
+				markDocumentParam(kinds, values[0].Operand)
+			}
+		}
+	case sqlast.SetBinaryExpr:
+		markInsertSourceSetDocumentParams(kinds, expression.Left)
+		markInsertSourceSetDocumentParams(kinds, expression.Right)
+	case sqlast.SetGroupExpr:
+		markInsertSourceSetDocumentParams(kinds, expression.Child)
+	}
 }
 
 func markDocumentParam(kinds []ParamKind, operand sqlast.Operand) {

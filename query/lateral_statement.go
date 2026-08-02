@@ -43,13 +43,16 @@ func (e *LateralBindingValueError) Position() int {
 // remains statement-owned until the completed join relation has been consumed,
 // so no published scalar can outlive its bytes.
 type statementLateral struct {
-	spec       *sqlast.LateralSpec
-	params     int
-	bindings   []relationJoinPath
-	bindingAST []sqlast.PathExpr
-	args       []any
-	slots      []lateralBindingSlot
-	argUse     []bool
+	spec         *sqlast.LateralSpec
+	params       int
+	bindings     []relationJoinPath
+	bindingAST   []sqlast.PathExpr
+	args         []any
+	slots        []lateralBindingSlot
+	argUse       []bool
+	bindingUse   []bool
+	inherited    []lateralInheritedBinding
+	bindingReady bool
 
 	outputs      []lateralOutput
 	names        []string
@@ -126,6 +129,7 @@ func prepareStatementLateral(
 	ref *sqlast.TableRef,
 	index int,
 	argBase int,
+	correlation *lateralPrepareFrame,
 ) (*statementLateral, *Statement, error) {
 	if ref == nil || ref.Query == nil || ref.Lateral == nil {
 		return nil, nil, fmt.Errorf("query: invalid correlated LATERAL relation")
@@ -135,12 +139,6 @@ func prepareStatementLateral(
 		return nil, nil, sqlast.NewFeatureNotSupportedError(
 			owner.text, spec.Pos,
 			"correlated LATERAL metadata has no direct parameter references",
-		)
-	}
-	if len(spec.References) == 0 {
-		return nil, nil, sqlast.NewFeatureNotSupportedError(
-			owner.text, spec.Bindings[0].Pos,
-			"transitive nested LATERAL correlation needs an inherited APPLY frame",
 		)
 	}
 	if ref.Join != sqlast.JoinCross && ref.Join != sqlast.JoinInner &&
@@ -213,15 +211,25 @@ func prepareStatementLateral(
 		args:       make([]any, clone.Params),
 		slots:      make([]lateralBindingSlot, len(spec.Bindings)),
 		argUse:     cloner.argUse,
+		bindingUse: cloner.bindingUse,
+		inherited:  make([]lateralInheritedBinding, len(spec.Bindings)),
 		gates:      cloner.gates,
 		group:      cloner.group.program,
 	}
 	for i := range spec.Bindings {
 		binding := &spec.Bindings[i]
+		if binding.Depth > 1 {
+			inherited, err := correlation.resolve(owner.text, binding)
+			if err != nil {
+				return nil, nil, err
+			}
+			lateral.inherited[i] = inherited
+			continue
+		}
 		if binding.Depth != 1 || binding.Source < 0 || binding.Source >= index {
 			return nil, nil, sqlast.NewFeatureNotSupportedError(
 				owner.text, binding.Pos,
-				"nested or forward LATERAL correlation does not yet have an APPLY frame",
+				"forward LATERAL correlation has no preceding APPLY input",
 			)
 		}
 		if len(binding.Segments) == 0 && !join.sources[binding.Source].physical {
@@ -240,8 +248,9 @@ func prepareStatementLateral(
 		lateral.bindings[i] = prepared
 	}
 
-	child, err := prepareTreeInContext(
+	child, err := prepareTreeInCorrelationContext(
 		owner.text, &clone, 0, owner.cteCatalog(), argBase+ref.Query.ParamBase,
+		&lateralPrepareFrame{apply: lateral},
 	)
 	if err != nil {
 		return nil, nil, err
@@ -251,6 +260,15 @@ func prepareStatementLateral(
 	); err != nil {
 		child.Release()
 		return nil, nil, err
+	}
+	for i := range lateral.bindingUse {
+		if !lateral.bindingUse[i] {
+			child.Release()
+			return nil, nil, sqlast.NewFeatureNotSupportedError(
+				owner.text, spec.Bindings[i].Pos,
+				"transitive nested LATERAL binding has no executable descendant reference",
+			)
+		}
 	}
 	return lateral, child, nil
 }
@@ -283,6 +301,12 @@ func (c *lateralClone) cloneOrderBy(
 }
 
 func (c *lateralClone) rejectResidualLocations(query *sqlast.SelectStmt) error {
+	if err := c.rejectPredicateSubqueries(query.Where, "WHERE"); err != nil {
+		return err
+	}
+	if err := c.rejectPredicateSubqueries(query.Having, "HAVING"); err != nil {
+		return err
+	}
 	for i := range query.Windows {
 		if err := c.rejectWindowSpec(&query.Windows[i].Spec); err != nil {
 			return err
@@ -305,6 +329,32 @@ func (c *lateralClone) rejectResidualLocations(query *sqlast.SelectStmt) error {
 			if err := c.rejectExpr(query.From[i].On.Expr, "nested JOIN ON"); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (c *lateralClone) rejectPredicateSubqueries(
+	expr *sqlast.Expr,
+	clause string,
+) error {
+	if expr == nil {
+		return nil
+	}
+	if expr.Subquery != nil || expr.Kind == sqlast.ExprExists {
+		// Predicate subqueries currently own an independent parser range scope.
+		// A spelling such as ancestor.id inside that child is consequently
+		// indistinguishable in the AST from a local JSON path named ancestor.id.
+		// Refuse the boundary instead of silently executing the latter meaning.
+		return sqlast.NewFeatureNotSupportedError(
+			c.text, expr.Pos,
+			"predicate subqueries in correlated LATERAL "+clause+
+				" need inherited outer-reference metadata",
+		)
+	}
+	for _, kid := range expr.Kids {
+		if err := c.rejectPredicateSubqueries(kid, clause); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -507,7 +557,7 @@ func (c *lateralClone) validateReferences() error {
 			}
 		}
 		binding := &c.spec.Bindings[reference.Binding]
-		if binding.Depth != 1 || binding.Source != reference.Path.Source ||
+		if binding.Depth < 1 || binding.Source != reference.Path.Source ||
 			!lateralSegmentsEqual(binding.Segments, reference.Path.Segments) {
 			return sqlast.NewFeatureNotSupportedError(
 				c.text, reference.Path.Pos,
@@ -768,14 +818,6 @@ func (c *lateralClone) finish() error {
 			)
 		}
 	}
-	for i := range c.bindingUse {
-		if !c.bindingUse[i] {
-			return sqlast.NewFeatureNotSupportedError(
-				c.text, c.spec.Bindings[i].Pos,
-				"transitive nested LATERAL binding does not yet have an APPLY frame",
-			)
-		}
-	}
 	return nil
 }
 
@@ -954,18 +996,26 @@ func (l *statementLateral) bind(
 ) ([]any, error) {
 	if l == nil || len(l.bindings) != len(l.slots) ||
 		len(l.args) != l.params+len(l.bindings) ||
-		len(l.argUse) != len(l.bindings) {
+		len(l.argUse) != len(l.bindings) ||
+		len(l.inherited) != len(l.bindings) {
 		return nil, fmt.Errorf("query: invalid prepared LATERAL binding state")
 	}
+	l.bindingReady = false
 	if base < 0 || base+l.params > len(rootArgs) {
 		return nil, fmt.Errorf("query: invalid LATERAL placeholder range")
 	}
 	copy(l.args[:l.params], rootArgs[base:base+l.params])
 	for i := range l.bindings {
 		slot := &l.slots[i]
-		value, err := l.bindingScalar(
-			left, row, l.bindings[i], slot, frame, cancel,
-		)
+		var value scalar
+		var err error
+		if l.inherited[i].apply != nil {
+			value, err = l.inherited[i].scalar()
+		} else {
+			value, err = l.bindingScalar(
+				left, row, l.bindings[i], slot, frame, cancel,
+			)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -979,6 +1029,7 @@ func (l *statementLateral) bind(
 			l.args[l.params+i] = argument
 		}
 	}
+	l.bindingReady = true
 	return l.args, nil
 }
 
@@ -1190,6 +1241,7 @@ func (l *statementLateral) releaseBinding(frame *statementFrame) {
 	}
 	frame.intermediate.release(l.bindingActive)
 	l.bindingActive = 0
+	l.bindingReady = false
 }
 
 func (s *lateralBindingSlot) argument(value scalar, binding, pos int) (any, error) {
@@ -1659,6 +1711,7 @@ func (l *statementLateral) discardExecution() {
 	clear(l.active)
 	l.workspace = 0
 	l.bindingActive = 0
+	l.bindingReady = false
 }
 
 func (l *statementLateral) release() {

@@ -44,6 +44,147 @@ func (c *Collection) primaryOverflowPageCount(length int) int {
 	return 1 + (length-1)/perPage
 }
 
+// primaryOverflowExtentGeometry returns the value bytes and rounded extent
+// length for the next page of an overflow chain. Keeping this arithmetic in one
+// helper makes the pre-plan and encoder identical, and widening before the
+// round-up keeps the calculation exact on 386.
+func (c *Collection) primaryOverflowExtentGeometry(remaining int) (
+	piece int, extent uint32, ok bool,
+) {
+	quantum := uint64(c.options.PageSize)
+	maximum := uint64(c.options.MaxPageSize)
+	if remaining <= 0 || quantum == 0 || maximum < primaryOverflowPageOverhead {
+		return 0, 0, false
+	}
+	perPage := c.options.MaxPageSize - primaryOverflowPageOverhead
+	piece = min(perPage, remaining)
+	raw := uint64(primaryOverflowPageOverhead) + uint64(piece)
+	if raw > math.MaxUint64-(quantum-1) {
+		return 0, 0, false
+	}
+	rounded := (raw + quantum - 1) / quantum * quantum
+	if rounded < quantum || rounded > maximum || rounded > math.MaxUint32 {
+		return 0, 0, false
+	}
+	return piece, uint32(rounded), true
+}
+
+// planBufferedPrimaryOverflowChain assigns one volatile chain's complete
+// physical and logical identity without touching the cache. Batch publication
+// uses this read-only pass to prove FileEnd/NextLogicalID and dirty-capacity
+// bounds for every chain before the first frame is admitted.
+func (c *Collection) planBufferedPrimaryOverflowChain(
+	value []byte, generation, baseOffset, baseLogicalID uint64,
+) (head storeio.PageRef, totalBytes uint64, pages int, err error) {
+	if len(value) == 0 || len(value) > c.options.MaxDocumentBytes ||
+		generation == 0 || baseLogicalID == 0 || c.options.PageSize <= 0 ||
+		baseOffset%uint64(c.options.PageSize) != 0 {
+		return storeio.PageRef{}, 0, 0, fmt.Errorf(
+			"%w: overflow value layout", storeio.ErrInvalidWrite,
+		)
+	}
+	offset := baseOffset
+	logicalID := baseLogicalID
+	remaining := len(value)
+	for remaining != 0 {
+		piece, extent, ok := c.primaryOverflowExtentGeometry(remaining)
+		if !ok || offset > math.MaxUint64-uint64(extent) ||
+			logicalID == math.MaxUint64 {
+			return storeio.PageRef{}, 0, 0, storeio.ErrInvalidWrite
+		}
+		ref := storeio.PageRef{
+			Offset: offset, LogicalID: logicalID,
+			Generation: generation, Length: extent,
+			Kind: storeio.PageOverflow,
+		}
+		if pages == 0 {
+			head = ref
+		}
+		offset += uint64(extent)
+		logicalID++
+		pages++
+		remaining -= piece
+	}
+	return head, offset - baseOffset, pages, nil
+}
+
+// admitBufferedPrimaryOverflowChain encodes and admits a chain whose identities
+// were fixed by planBufferedPrimaryOverflowChain. admitted is updated after
+// each successful frame, so a later failure can discard the exact staged prefix
+// without leaking dirty cache capacity.
+func (c *Collection) admitBufferedPrimaryOverflowChain(
+	value []byte, generation uint64, head storeio.PageRef,
+	fileEnd, nextLogicalID uint64, admitted *[]storeio.PageRef,
+) error {
+	planned, totalBytes, pages, err := c.planBufferedPrimaryOverflowChain(
+		value, generation, head.Offset, head.LogicalID,
+	)
+	if err != nil {
+		return err
+	}
+	if planned != head || head.Offset > math.MaxUint64-totalBytes ||
+		head.Offset+totalBytes > fileEnd ||
+		uint64(pages) > math.MaxUint64-head.LogicalID ||
+		head.LogicalID+uint64(pages) > nextLogicalID {
+		return storeio.ErrInvalidWrite
+	}
+	if cap(c.overflowPageScratch) < c.options.MaxPageSize {
+		c.overflowPageScratch = make([]byte, c.options.MaxPageSize)
+	}
+	offset := head.Offset
+	logicalID := head.LogicalID
+	valueOffset := 0
+	for valueOffset < len(value) {
+		piece, extent, ok := c.primaryOverflowExtentGeometry(
+			len(value) - valueOffset,
+		)
+		if !ok {
+			return storeio.ErrInvalidWrite
+		}
+		ref := storeio.PageRef{
+			Offset: offset, LogicalID: logicalID,
+			Generation: generation, Length: extent,
+			Kind: storeio.PageOverflow,
+		}
+		var next storeio.PageRef
+		if valueOffset+piece < len(value) {
+			nextPiece, nextExtent, nextOK := c.primaryOverflowExtentGeometry(
+				len(value) - valueOffset - piece,
+			)
+			if !nextOK || nextPiece == 0 ||
+				offset > math.MaxUint64-uint64(extent) ||
+				logicalID == math.MaxUint64 {
+				return storeio.ErrInvalidWrite
+			}
+			next = storeio.PageRef{
+				Offset: offset + uint64(extent), LogicalID: logicalID + 1,
+				Generation: generation, Length: nextExtent,
+				Kind: storeio.PageOverflow,
+			}
+		}
+		buf := c.overflowPageScratch[:int(extent)]
+		header := storeio.OverflowPageHeader{
+			StoreID: c.storeID, Generation: generation,
+			LogicalID: logicalID, PageSize: extent,
+			Total: uint64(len(value)), Offset: uint64(valueOffset), Next: next,
+		}
+		if _, err := storeio.EncodeOverflowPage(
+			buf, header, value[valueOffset:valueOffset+piece],
+			fileEnd, nextLogicalID, uint32(c.options.PageSize),
+		); err != nil {
+			return err
+		}
+		if err := c.cache.AdmitBufferedDirty(ref, buf, math.MaxUint64); err != nil {
+			return err
+		}
+		*admitted = append(*admitted, ref)
+		offset += uint64(extent)
+		logicalID++
+		valueOffset += piece
+	}
+	return nil
+}
+
 // stagePrimaryOverflowChain writes value out of line as a forward-linked chain
 // of PageOverflow extents allocated from tx, and returns the head PageRef to
 // embed in the leaf record. Each extent is sized to its own piece (rounded up to
@@ -131,84 +272,21 @@ func (c *Collection) mintBufferedPrimaryOverflowChain(
 	value []byte, generation uint64,
 	baseOffset, baseLogicalID uint64,
 ) (head storeio.PageRef, totalBytes uint64, pages int, err error) {
-	quantum := uint32(c.options.PageSize)
-	maxExtent := uint32(c.options.MaxPageSize)
-	perPage := int(maxExtent) - primaryOverflowPageOverhead
-	if perPage <= 0 || len(value) == 0 ||
-		len(value) > c.options.MaxDocumentBytes {
-		return storeio.PageRef{}, 0, 0, fmt.Errorf(
-			"%w: overflow value length", storeio.ErrInvalidWrite,
-		)
+	head, totalBytes, pages, err = c.planBufferedPrimaryOverflowChain(
+		value, generation, baseOffset, baseLogicalID,
+	)
+	if err != nil {
+		return storeio.PageRef{}, 0, 0, err
 	}
-	total := uint64(len(value))
-	c.overflowRefScratch = c.overflowRefScratch[:0]
-	c.overflowOffsetScratch = c.overflowOffsetScratch[:0]
-	// Reserve every extent's identity first so each piece's Next names a later,
-	// higher-logical-ID extent whose offset and length are already fixed.
-	fileOffset := baseOffset
-	logicalID := baseLogicalID
-	for start := 0; start < len(value); {
-		n := min(perPage, len(value)-start)
-		raw := primaryOverflowPageOverhead + n
-		extent := (uint32(raw) + quantum - 1) / quantum * quantum
-		if extent < quantum {
-			extent = quantum
-		}
-		if fileOffset > math.MaxUint64-uint64(extent) {
-			return storeio.PageRef{}, 0, 0, storeio.ErrInvalidWrite
-		}
-		c.overflowRefScratch = append(c.overflowRefScratch, storeio.PageRef{
-			Offset: fileOffset, LogicalID: logicalID,
-			Generation: generation, Length: extent,
-			Kind: storeio.PageOverflow,
-		})
-		c.overflowOffsetScratch = append(c.overflowOffsetScratch, start)
-		fileOffset += uint64(extent)
-		logicalID++
-		start += n
-	}
-	pages = len(c.overflowRefScratch)
-	totalBytes = fileOffset - baseOffset
-	// Bounds are read after the whole layout is fixed so every Next reference
-	// resolves against the ceilings the caller will publish for the visible state.
-	fileEnd := fileOffset
+	fileEnd := baseOffset + totalBytes
 	nextLogicalID := baseLogicalID + uint64(pages)
-	if cap(c.overflowPageScratch) < int(maxExtent) {
-		c.overflowPageScratch = make([]byte, maxExtent)
+	if err := c.admitBufferedPrimaryOverflowChain(
+		value, generation, head, fileEnd, nextLogicalID,
+		&c.primaryMutationAdmitted,
+	); err != nil {
+		return storeio.PageRef{}, 0, 0, err
 	}
-	for i := range c.overflowRefScratch {
-		ref := c.overflowRefScratch[i]
-		start := c.overflowOffsetScratch[i]
-		end := len(value)
-		var next storeio.PageRef
-		if i+1 < len(c.overflowRefScratch) {
-			end = c.overflowOffsetScratch[i+1]
-			next = c.overflowRefScratch[i+1]
-		}
-		header := storeio.OverflowPageHeader{
-			StoreID: c.storeID, Generation: generation,
-			LogicalID: ref.LogicalID, PageSize: ref.Length,
-			Total: total, Offset: uint64(start), Next: next,
-		}
-		buf := c.overflowPageScratch[:ref.Length]
-		if _, err := storeio.EncodeOverflowPage(
-			buf, header, value[start:end], fileEnd, nextLogicalID,
-			quantum,
-		); err != nil {
-			return storeio.PageRef{}, 0, 0, err
-		}
-		if err := c.cache.AdmitBufferedDirty(
-			ref, buf, math.MaxUint64,
-		); err != nil {
-			return storeio.PageRef{}, 0, 0, err
-		}
-		// Record the admission immediately so a failure on a LATER extent (or any
-		// fallible caller step after the whole chain is minted) can hand every
-		// already-admitted frame back through unadmitPrimaryMutationFrames;
-		// nothing references these frames until the caller publishes.
-		c.primaryMutationAdmitted = append(c.primaryMutationAdmitted, ref)
-	}
-	return c.overflowRefScratch[0], totalBytes, pages, nil
+	return head, totalBytes, pages, nil
 }
 
 // appendPrimaryOverflowValue walks the overflow chain rooted at first and

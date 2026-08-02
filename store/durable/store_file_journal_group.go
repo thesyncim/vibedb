@@ -7,6 +7,11 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
+// recoveryJournalGroupBeforeSyncHook is a deterministic concurrency-test seam.
+// It runs after the leader publishes the exact ticket boundary its Sync covers
+// and before entering the device barrier. Production leaves it nil.
+var recoveryJournalGroupBeforeSyncHook func(through uint64)
+
 // journalCommitGroup amortizes the buffered-journal lane's per-mutation fsync
 // across concurrent callers with group-committed acknowledgements on the
 // single writer.
@@ -79,11 +84,21 @@ type journalCommitGroup struct {
 	// are taken by the next leader, so the device's own sync latency is the
 	// natural, self-tuning group window.
 	syncing bool
-	// failed is the sticky group poison: a leader whose sync fails records the
-	// error here and every current and future waiter returns it (die-don't-retry),
-	// mirroring poisonJournal for the shared fence. syncing is held true
-	// across the poison so no second waiter can ever become leader and retry a
-	// terminally failed sync.
+	// syncCaptured distinguishes the coalescing window from the device barrier.
+	// Before capture, every deposited ticket belongs to the pending fence. After
+	// capture, syncingThrough is its immutable upper bound; later deposits belong
+	// to a possible following fence.
+	syncCaptured   bool
+	syncingThrough uint64
+	// failedSyncThrough and failedSync retain the exact per-ticket outcome of a
+	// failed device fence independently from the collection's first sticky
+	// poison. A concurrent later append can therefore remain a definite global
+	// ENOSPC while tickets covered by this fence receive unknown+EIO.
+	failedSyncThrough uint64
+	failedSync        error
+	// failed is the terminal fallback for tickets not resolved by successful or
+	// failed-sync coverage. It mirrors the collection poison, but it never
+	// overrides a stronger per-ticket result.
 	failed error
 }
 
@@ -99,6 +114,10 @@ func (c *Collection) initJournalGroupLocked() {
 	g.deposited = 0
 	g.synced = 0
 	g.syncing = false
+	g.syncCaptured = false
+	g.syncingThrough = 0
+	g.failedSyncThrough = 0
+	g.failedSync = nil
 	g.failed = nil
 }
 
@@ -127,9 +146,10 @@ func (g *journalCommitGroup) recycleAdvance() {
 	g.mu.Unlock()
 }
 
-// fail poisons the shared fence so every current and future waiter returns err.
-// It is called under c.writer when an append device error kills the journal, so
-// no waiter is acknowledged out of a journal that can no longer be synced.
+// fail records the shared fence's terminal fallback. It is called under
+// c.writer when an append or recycle device error kills the journal. Covered
+// waiters still resolve from synced/failedSync first, and waiters assigned to an
+// in-flight fence wait for that fence's actual result.
 func (g *journalCommitGroup) fail(err error) {
 	g.mu.Lock()
 	if g.failed == nil {
@@ -144,19 +164,36 @@ func (g *journalCommitGroup) fail(err error) {
 // group leader if no other caller is. It is called with NO collection lock held
 // (the writer was released after the deposit). A sync failure poisons the
 // collection die-don't-retry and returns the sticky error to every waiter the
-// failed sync would have covered.
+// failed sync would have covered. Because each waiter already appended a
+// complete record, that error is classified as an unknown commit outcome while
+// preserving the device cause.
 func (c *Collection) journalGroupAwait(target uint64) error {
 	g := &c.journalGroup
 	g.mu.Lock()
 	for {
-		if g.failed != nil {
-			err := g.failed
-			g.mu.Unlock()
-			return err
-		}
+		// Coverage is the waiter oracle. A later global poison cannot revoke a
+		// completed sync, and a prior global poison cannot hide this ticket's
+		// independently failed device fence.
 		if g.synced >= target {
 			g.mu.Unlock()
 			return nil
+		}
+		if g.failedSync != nil && g.failedSyncThrough >= target {
+			err := g.failedSync
+			g.mu.Unlock()
+			return err
+		}
+		if g.failed != nil {
+			// During coalescing the eventual capture still includes every current
+			// deposit. During Sync, only tickets at or below syncingThrough are
+			// covered. Do not let the fallback race ahead of that fence result.
+			if g.syncing && (!g.syncCaptured || target <= g.syncingThrough) {
+				g.cond.Wait()
+				continue
+			}
+			err := g.failed
+			g.mu.Unlock()
+			return err
 		}
 		if g.syncing {
 			g.cond.Wait()
@@ -164,6 +201,8 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 		}
 		// Become the leader for one sync covering everything appended so far.
 		g.syncing = true
+		g.syncCaptured = false
+		g.syncingThrough = 0
 		g.mu.Unlock()
 		if g.linger > 0 {
 			// CommitCoalesce repurposed: linger to grow the group at the cost of
@@ -173,22 +212,34 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 		}
 		g.mu.Lock()
 		captured := g.deposited
+		g.syncCaptured = true
+		g.syncingThrough = captured
 		groupSize := captured - g.synced
 		g.mu.Unlock()
+		if recoveryJournalGroupBeforeSyncHook != nil {
+			recoveryJournalGroupBeforeSyncHook(captured)
+		}
 
 		err := g.journal.Sync(g.powerSafe)
 		if err != nil {
-			// syncing stays true across the poison so no other waiter becomes a
-			// second leader and retries a terminally failed sync.
-			poisoned := c.poisonJournal(err)
+			// Preserve the collection's first poison while retaining this fence's
+			// own unknown outcome and root sync cause for every covered ticket.
+			sticky, fence := c.poisonJournalCommitOutcomeUnknownForFence(err)
 			g.mu.Lock()
 			if g.failed == nil {
-				g.failed = poisoned
+				g.failed = sticky
+			}
+			if captured > g.failedSyncThrough {
+				g.failedSyncThrough = captured
+				g.failedSync = fence
 			}
 			g.syncing = false
+			g.syncCaptured = false
+			g.syncingThrough = 0
 			g.cond.Broadcast()
-			g.mu.Unlock()
-			return poisoned
+			// Loop under the mutex: a concurrent recycle may already have made
+			// target durable, in which case successful coverage correctly wins.
+			continue
 		}
 		c.journalSyncs.Add(1)
 		for {
@@ -200,6 +251,8 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 		}
 		g.mu.Lock()
 		g.syncing = false
+		g.syncCaptured = false
+		g.syncingThrough = 0
 		if captured > g.synced {
 			g.synced = captured
 		}

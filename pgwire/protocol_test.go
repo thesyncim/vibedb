@@ -1357,9 +1357,26 @@ func TestTheFixedSelectShimAnswersAHandshake(t *testing.T) {
 			t.Errorf("%s returned %v, want %q", tc.sql, rows, tc.want)
 		}
 	}
-	// A SELECT with a FROM is not the shim's and reaches the engine.
-	if has(c.query(`SELECT 1 FROM users`), msgCommandComplete) {
-		t.Error("SELECT 1 FROM users was answered by the shim; it must reach the parser")
+	// A SELECT with a FROM is not the shim's. It reaches scalar lowering and
+	// therefore has the collection's cardinality, not the shim's singleton
+	// handshake result.
+	if _, recognized, err := (shimFunctions{}).parseFixedSelect(`SELECT 1 FROM users`); err != nil || recognized {
+		t.Fatalf("fixed SELECT routing = recognized %v, error %v", recognized, err)
+	}
+	stored := c.query(`SELECT 1 FROM users`)
+	if has(stored, msgErrorResponse) {
+		t.Fatalf("stored constant SELECT failed: %s",
+			formatError(find(t, stored, msgErrorResponse).body))
+	}
+	rows := rowsOf(t, stored)
+	if len(rows) != len(corpus) || commandTagOf(t, stored) != "SELECT 7" {
+		t.Fatalf("stored constant SELECT rows/tag = %q/%q, want %d/SELECT 7",
+			rows, commandTagOf(t, stored), len(corpus))
+	}
+	for row := range rows {
+		if len(rows[row]) != 1 || string(rows[row][0]) != "1" {
+			t.Fatalf("stored constant SELECT row %d = %q, want [1]", row, rows[row])
+		}
 	}
 }
 
