@@ -65,11 +65,14 @@ the compact bytes or callback semantics.
 
 Compact bulk planning now tries the complete 4,096-row window before binary
 searching for a smaller extent. Log-like windows normally fit, so they are
-encoded once rather than once per search step. The 20,000-document
-`BenchmarkFileStoreCreateFromFloor` improved from about 289 ms to 49 ms
-(roughly 5.9×, or 14.45 µs to 2.46 µs per document) while selecting identical
-leaf boundaries and writing identical compact bytes. High-cardinality windows
-that do not fit still use the exact largest-prefix search.
+encoded once rather than once per search step. Bulk reservation, exact-index
+sizing, and construction also share that immutable leaf plan instead of
+rediscovering its boundaries. The 20,000-document
+`BenchmarkFileStoreCreateFromFloor` improved from about 289 ms to 38 ms
+(roughly 7.6×, or 14.45 µs to 1.90 µs per document); allocated setup bytes fell
+from about 15.62 MB to 9.98 MB. It still selects identical leaf boundaries and
+writes identical compact bytes. High-cardinality windows that do not fit still
+use the exact largest-prefix search.
 
 A local ClickHouse control over the same flattened 100,000-row corpus measured
 about 1.49 ms with `ORDER BY key` and no secondary data-skipping index. The

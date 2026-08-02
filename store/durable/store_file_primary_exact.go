@@ -943,9 +943,10 @@ func (c *Collection) encodePrimaryExactLeaves(
 // primaryExactIndexPageBound returns a safe upper bound on the pages
 // buildPrimaryExactIndexes will stage for records, computed before the build
 // transaction opens so the single bulk commit can reserve exactly one
-// bounded batch. It plans the primary leaves (no staging), simulates each
-// term's posting tiles — exact for ordinal-slot leaf classes, bounded by
-// min(rows, 4) bucket quadrants for hash-directory classes — and runs the
+// bounded batch. It consumes the primary build's already planned leaf spans
+// and simulates each term's posting tiles — exact for ordinal-slot leaf
+// classes, bounded by min(rows, 4) bucket quadrants for hash-directory
+// classes — and runs the
 // REAL cutter over the simulated content. Simulated per-term sizes dominate
 // the actual ones tile-for-stripe, greedy cut counts are monotone in item
 // sizes, and a term the simulation splits into stripe pieces costs at least
@@ -955,15 +956,15 @@ func (c *Collection) encodePrimaryExactLeaves(
 func primaryExactIndexPageBound(
 	storeID [16]byte,
 	records []storeio.PrimaryGraphRecord,
+	spans []storeio.PrimaryGraphLeafSpan,
 	indexes []*store.ExactIndex,
 	maxPageSize uint32,
 ) (int, error) {
 	if len(indexes) == 0 {
 		return 0, nil
 	}
-	spans, err := storeio.PrimaryGraphLeafSpans(storeID, records)
-	if err != nil {
-		return 0, err
+	if len(spans) == 0 {
+		return 0, storeio.ErrInvalidWrite
 	}
 	budget := storeio.IndexTermLeafCutBudget(maxPageSize)
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent

@@ -121,25 +121,26 @@ func CreateFromPrimary(
 		return 0, err
 	}
 	storeID := primaryBulkStoreID(records, normalized)
-	var primaryPageCount int
-	if len(normalized.indexes) == 0 {
-		primaryPageCount, err = storeio.PrimaryGraphPageCount(storeID, records)
-	} else {
-		primaryPageCount, err = storeio.PrimaryGraphPlacedPageCount(storeID, records)
-	}
+	placed := len(normalized.indexes) != 0
+	primaryPlan, err := storeio.PlanPrimaryGraph(storeID, records, placed)
 	if err != nil {
 		return 0, err
 	}
+	primaryPageCount := primaryPlan.PageCount()
 	pageCount := primaryPageCount
-	if len(normalized.indexes) != 0 {
+	if placed {
 		// The spanned exact indexes stage one page per cutter-emitted term
 		// leaf plus each index's catalog and the shared root; the bound is
 		// computed by planning the leaves and running the real cutter over
 		// simulated posting tiles, so the single transaction that stages the
 		// graph and every exact-index page together reserves a count that can
 		// never under-provision (see primaryExactIndexPageBound).
+		spans, spanErr := primaryPlan.LeafSpans()
+		if spanErr != nil {
+			return 0, spanErr
+		}
 		exactPageBound, boundErr := primaryExactIndexPageBound(
-			storeID, records, normalized.indexes,
+			storeID, records, spans, normalized.indexes,
 			uint32(normalized.MaxPageSize),
 		)
 		if boundErr != nil {
@@ -225,11 +226,15 @@ func CreateFromPrimary(
 	}
 	var placements []storeio.PrimaryGraphPlacement
 	var primaryRoot storeio.PageRef
-	if len(normalized.indexes) == 0 {
-		primaryRoot, err = storeio.BuildPrimaryGraph(tx, records)
+	if !placed {
+		primaryRoot, err = storeio.BuildPlannedPrimaryGraph(
+			tx, &primaryPlan, nil,
+		)
 	} else {
 		placements = make([]storeio.PrimaryGraphPlacement, len(records))
-		primaryRoot, err = storeio.BuildPrimaryGraphPlaced(tx, records, placements)
+		primaryRoot, err = storeio.BuildPlannedPrimaryGraph(
+			tx, &primaryPlan, placements,
+		)
 	}
 	if err != nil {
 		_ = tx.Abort()

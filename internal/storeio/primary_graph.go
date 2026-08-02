@@ -30,6 +30,90 @@ type primaryLeafPlan struct {
 	extent int
 }
 
+// PrimaryGraphPlan is one immutable, exact compact-leaf plan shared by bulk
+// reservation, optional exact-index sizing, and graph construction. It borrows
+// records and their byte slices until the build finishes; callers must not
+// mutate them. Reusing the plan prevents each phase from re-encoding every
+// candidate leaf solely to rediscover identical boundaries.
+type PrimaryGraphPlan struct {
+	storeID [16]byte
+	records []PrimaryGraphRecord
+	leaves  []primaryLeafPlan
+	pages   int
+	placed  bool
+}
+
+// PlanPrimaryGraph computes exact compact leaf boundaries and total graph page
+// count. placed selects <=256-row leaves with stable uint8 posting slots for an
+// exact secondary index; false permits the 4,096-row unindexed scan layout.
+func PlanPrimaryGraph(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	placed bool,
+) (PrimaryGraphPlan, error) {
+	return planPrimaryGraph(
+		storeID, records, placed, CommonPrimaryLeafMaxExtentBytes,
+	)
+}
+
+func planPrimaryGraph(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	placed bool,
+	maxExtent int,
+) (PrimaryGraphPlan, error) {
+	if err := validatePrimaryGraphRecords(storeID, records); err != nil {
+		return PrimaryGraphPlan{}, err
+	}
+	maxRows := CompactPrimaryStripeMaxRows
+	if placed {
+		maxRows = CommonPrimaryLeafWideSlots
+	}
+	leaves, err := planCompactPrimaryLeaves(
+		storeID, records, maxRows, maxExtent,
+	)
+	if err != nil {
+		return PrimaryGraphPlan{}, err
+	}
+	pages, err := primaryGraphPageCountForLeaves(len(leaves))
+	if err != nil {
+		return PrimaryGraphPlan{}, err
+	}
+	return PrimaryGraphPlan{
+		storeID: storeID, records: records, leaves: leaves,
+		pages: pages, placed: placed,
+	}, nil
+}
+
+// PageCount is the exact number of transaction pages Build will stage.
+func (p *PrimaryGraphPlan) PageCount() int {
+	if p == nil {
+		return 0
+	}
+	return p.pages
+}
+
+// LeafSpans returns the planned ordered leaves for exact-index sizing.
+func (p *PrimaryGraphPlan) LeafSpans() ([]PrimaryGraphLeafSpan, error) {
+	if p == nil || !p.placed || len(p.leaves) == 0 {
+		return nil, fmt.Errorf("%w: primary graph span plan", ErrInvalidWrite)
+	}
+	spans := make([]PrimaryGraphLeafSpan, len(p.leaves))
+	for rank := range p.leaves {
+		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
+		localID := uint32(rank % TabletLocalIdentityLocalCount)
+		bucket, ok := MakeTabletLocalIdentityBucket(tabletID, localID)
+		if !ok {
+			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
+		}
+		spans[rank] = PrimaryGraphLeafSpan{
+			Bucket: BucketID(bucket), First: p.leaves[rank].first,
+			Last: p.leaves[rank].last, Ordinal: true,
+		}
+	}
+	return spans, nil
+}
+
 type primaryBuiltLeaf struct {
 	firstKey []byte
 	lastKey  []byte
@@ -156,30 +240,40 @@ func buildPrimaryGraphPlaced(
 		len(records) == 0 {
 		return PageRef{}, fmt.Errorf("%w: primary graph transaction or input", ErrInvalidWrite)
 	}
-	for at := range records {
-		if len(records[at].Key) == 0 ||
-			len(records[at].Key) > CommonPrimaryLeafMaxKeyBytes ||
-			len(records[at].Value) == 0 ||
-			at != 0 && bytes.Compare(records[at-1].Key, records[at].Key) >= 0 {
-			return PageRef{}, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
-		}
-	}
-
-	maxRows := CompactPrimaryStripeMaxRows
-	if placements != nil {
-		maxRows = CommonPrimaryLeafWideSlots
-	}
-	plans, err := planCompactPrimaryLeaves(
-		tx.options.StoreID, records, maxRows,
+	plan, err := planPrimaryGraph(
+		tx.options.StoreID, records, placements != nil,
 		min(tx.committer.bufferSize, CommonPrimaryLeafMaxExtentBytes),
 	)
 	if err != nil {
 		return PageRef{}, err
 	}
-	if len(plans) > TabletLocalIdentityTabletCount*TabletLocalIdentityLocalCount {
-		return PageRef{}, fmt.Errorf("%w: primary leaf namespace exhausted", ErrInvalidWrite)
+	return BuildPlannedPrimaryGraph(tx, &plan, placements)
+}
+
+// BuildPlannedPrimaryGraph stages a plan returned by PlanPrimaryGraph without
+// repeating compact leaf planning. The transaction's store identity and page
+// capacity must match the plan; placements must match its placed mode.
+func BuildPlannedPrimaryGraph(
+	tx *WriteTransaction,
+	plan *PrimaryGraphPlan,
+	placements []PrimaryGraphPlacement,
+) (PageRef, error) {
+	if tx == nil || !tx.active || plan == nil ||
+		tx.options.PageSize != physicalPageQuantum ||
+		tx.options.StoreID != plan.storeID || tx.options.Generation == 0 ||
+		tx.nextID < PrimaryFirstDynamicLogicalID || len(plan.records) == 0 ||
+		plan.pages == 0 || plan.placed != (placements != nil) ||
+		placements != nil && len(placements) != len(plan.records) {
+		return PageRef{}, fmt.Errorf("%w: planned primary graph input", ErrInvalidWrite)
 	}
-	built, err := buildPrimaryLeaves(tx, records, plans, placements)
+	for i := range plan.leaves {
+		if plan.leaves[i].extent > tx.committer.bufferSize {
+			return PageRef{}, fmt.Errorf("%w: planned primary graph extent", ErrInvalidWrite)
+		}
+	}
+	built, err := buildPrimaryLeaves(
+		tx, plan.records, plan.leaves, placements,
+	)
 	if err != nil {
 		return PageRef{}, err
 	}
@@ -198,7 +292,8 @@ func PrimaryGraphPageCount(
 	storeID [16]byte,
 	records []PrimaryGraphRecord,
 ) (int, error) {
-	return primaryGraphPageCount(storeID, records, CompactPrimaryStripeMaxRows)
+	plan, err := PlanPrimaryGraph(storeID, records, false)
+	return plan.PageCount(), err
 }
 
 // PrimaryGraphPlacedPageCount is the exact graph-page count for a build that
@@ -207,32 +302,32 @@ func PrimaryGraphPlacedPageCount(
 	storeID [16]byte,
 	records []PrimaryGraphRecord,
 ) (int, error) {
-	return primaryGraphPageCount(storeID, records, CommonPrimaryLeafWideSlots)
+	plan, err := PlanPrimaryGraph(storeID, records, true)
+	return plan.PageCount(), err
 }
 
-func primaryGraphPageCount(
+func validatePrimaryGraphRecords(
 	storeID [16]byte,
 	records []PrimaryGraphRecord,
-	maxRows int,
-) (int, error) {
+) error {
 	if storeID == ([16]byte{}) || len(records) == 0 {
-		return 0, fmt.Errorf("%w: primary graph count input", ErrInvalidWrite)
+		return fmt.Errorf("%w: primary graph input", ErrInvalidWrite)
 	}
 	for at := range records {
 		if len(records[at].Key) == 0 ||
 			len(records[at].Key) > CommonPrimaryLeafMaxKeyBytes ||
 			len(records[at].Value) == 0 ||
 			at != 0 && bytes.Compare(records[at-1].Key, records[at].Key) >= 0 {
-			return 0, fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
+			return fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
 		}
 	}
-	plans, err := planCompactPrimaryLeaves(
-		storeID, records, maxRows, CommonPrimaryLeafMaxExtentBytes,
-	)
-	if err != nil {
-		return 0, err
+	return nil
+}
+
+func primaryGraphPageCountForLeaves(leafCount int) (int, error) {
+	if leafCount < 1 {
+		return 0, fmt.Errorf("%w: primary leaf count", ErrInvalidWrite)
 	}
-	leafCount := len(plans)
 	if leafCount > TabletLocalIdentityTabletCount*TabletLocalIdentityLocalCount {
 		return 0, fmt.Errorf("%w: primary leaf namespace exhausted", ErrInvalidWrite)
 	}
@@ -283,31 +378,11 @@ func PrimaryGraphLeafSpans(
 	storeID [16]byte,
 	records []PrimaryGraphRecord,
 ) ([]PrimaryGraphLeafSpan, error) {
-	if storeID == ([16]byte{}) || len(records) == 0 {
-		return nil, fmt.Errorf("%w: primary graph span input", ErrInvalidWrite)
-	}
-	plans, err := planCompactPrimaryLeaves(
-		storeID, records, CommonPrimaryLeafWideSlots,
-		CommonPrimaryLeafMaxExtentBytes,
-	)
+	plan, err := PlanPrimaryGraph(storeID, records, true)
 	if err != nil {
 		return nil, err
 	}
-	spans := make([]PrimaryGraphLeafSpan, len(plans))
-	for rank := range plans {
-		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
-		localID := uint32(rank % TabletLocalIdentityLocalCount)
-		bucket, ok := MakeTabletLocalIdentityBucket(tabletID, localID)
-		if !ok {
-			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
-		}
-		spans[rank] = PrimaryGraphLeafSpan{
-			Bucket: BucketID(bucket),
-			First:  plans[rank].first, Last: plans[rank].last,
-			Ordinal: true,
-		}
-	}
-	return spans, nil
+	return plan.LeafSpans()
 }
 
 // planCompactPrimaryLeaves packs records into the largest compact stripe that
