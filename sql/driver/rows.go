@@ -157,10 +157,8 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 		case schema[index].Reduction == query.ReductionCount ||
 			schema[index].Reduction == query.ReductionWindowInteger:
 			return reflect.TypeFor[int64]()
-		case schema[index].Type == query.TypeString:
+		case schema[index].Representation == query.OutputSQLText:
 			return reflect.TypeFor[[]byte]()
-		case schema[index].Type == query.TypeBool:
-			return reflect.TypeFor[bool]()
 		}
 	}
 	return reflect.TypeFor[any]()
@@ -174,22 +172,21 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 	if index < 0 || index >= len(schema) {
 		return "JSON"
 	}
-	switch schema[index].Type {
-	case query.TypeString:
-		return "TEXT"
-	case query.TypeBool:
-		return "BOOLEAN"
-	case query.TypeNumber:
-		return "NUMERIC"
-	}
-	if schema[index].Reduction == query.ReductionNone {
-		return "JSON"
-	}
 	if schema[index].Reduction == query.ReductionCount ||
 		schema[index].Reduction == query.ReductionWindowInteger {
 		return "BIGINT"
 	}
-	return "NUMERIC"
+	if schema[index].Reduction != query.ReductionNone {
+		return "NUMERIC"
+	}
+	switch schema[index].Representation {
+	case query.OutputSQLText:
+		return "TEXT"
+	case query.OutputSQLNumber:
+		return "NUMERIC"
+	default:
+		return "JSON"
+	}
 }
 
 func (r *rows) ColumnTypeNullable(index int) (bool, bool) {

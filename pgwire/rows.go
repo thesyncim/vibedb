@@ -133,10 +133,8 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 			case schema[i].Reduction == query.ReductionCount ||
 				schema[i].Reduction == query.ReductionWindowInteger:
 				typ = typeInt8
-			case schema[i].Type == query.TypeString:
+			case schema[i].Representation == query.OutputSQLText:
 				typ = typeText
-			case schema[i].Type == query.TypeBool:
-				typ = typeBool
 			}
 		}
 		dst = append(dst, column{name: name, typ: typ})

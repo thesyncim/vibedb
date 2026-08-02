@@ -27,7 +27,11 @@ func TestSQLScalarStatementExactArithmeticNullAndPredicate(t *testing.T) {
 	}
 	schema := statement.AppendSchema(nil)
 	if len(schema) != 4 || schema[0].Type != TypeAny || schema[1].Type != TypeNumber ||
-		schema[2].Type != TypeNumber || schema[3].Type != TypeString {
+		schema[2].Type != TypeNumber || schema[3].Type != TypeString ||
+		schema[0].Representation != OutputJSON ||
+		schema[1].Representation != OutputSQLNumber ||
+		schema[2].Representation != OutputSQLNumber ||
+		schema[3].Representation != OutputSQLText {
 		t.Fatalf("scalar schema = %+v", schema)
 	}
 	var exec Exec

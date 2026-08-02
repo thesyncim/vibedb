@@ -13,6 +13,10 @@ func TestScalarSQLStateMappingAndUTF8Position(t *testing.T) {
 	}{
 		{&query.ScalarTypeError{Pos: 3, Operation: "addition", Left: query.TypeString, Right: query.TypeNumber}, sqlstateDatatypeMismatch},
 		{&query.ScalarDivisionByZeroError{Pos: 3}, sqlstateDivisionByZero},
+		{&query.ScalarAggregateBudgetError{
+			Pos: 3, Operation: "multiplication",
+			Err: &query.AggregateBudgetError{Limit: 8, Used: 7, Requested: 2},
+		}, sqlstateProgramLimitExceeded},
 		{&query.ScalarNumericRangeError{Pos: 3, Operation: "division", Requested: 9, Limit: 8}, sqlstateNumericValueOutOfRange},
 	}
 	for _, test := range tests {

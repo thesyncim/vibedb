@@ -39,6 +39,19 @@ const (
 	ReductionWindowNumber
 )
 
+// OutputRepresentation identifies the caller-visible SQL representation of a
+// statically typed expression. Its zero value deliberately preserves the
+// engine's established JSON boundary: knowing that a JSON cell currently
+// contains a string or number is not enough to reinterpret that value as SQL
+// text or numeric. Only lowering that actually computes a SQL scalar opts in.
+type OutputRepresentation uint8
+
+const (
+	OutputJSON OutputRepresentation = iota
+	OutputSQLNumber
+	OutputSQLText
+)
+
 // OutputColumn is cold result-schema metadata. Ordinal is the stable column ID
 // used by the typed result batch; Header is its display spelling.
 type OutputColumn struct {
@@ -49,6 +62,11 @@ type OutputColumn struct {
 	// current aggregate family. Future aggregate or schema-aware output types
 	// extend ValueType without changing column ordinals or instruction opcodes.
 	Type ValueType
+	// Representation is independent of Type. VALUES, ordinary projections,
+	// set operands, and EXPLAIN may have a statically known cell kind while
+	// still retaining exact JSON encoding. Computed arithmetic and
+	// concatenation explicitly select their SQL boundary representation.
+	Representation OutputRepresentation
 }
 
 // AppendSchema appends q's output schema to dst, compiling q if execution has

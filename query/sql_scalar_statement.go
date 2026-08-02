@@ -478,9 +478,28 @@ func (r *statementScalar) appendSchema(dst []OutputColumn, names []string) []Out
 	for i := range r.outputs {
 		dst = append(dst, OutputColumn{
 			Header: names[i], Ordinal: uint32(i), Type: r.types[i],
+			Representation: r.nodeRepresentation(r.outputs[i]),
 		})
 	}
 	return dst
+}
+
+func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
+	if root < 0 || int(root) >= len(r.nodes) {
+		return OutputJSON
+	}
+	node := &r.nodes[root]
+	switch node.kind {
+	case statementScalarUnary:
+		return OutputSQLNumber
+	case statementScalarBinary:
+		if node.op == sqlast.ScalarConcat {
+			return OutputSQLText
+		}
+		return OutputSQLNumber
+	default:
+		return OutputJSON
+	}
 }
 
 func (r *statementScalar) evalNodes(result *Result, row, count int, arena *[]byte, budget *aggregateBudget) error {
