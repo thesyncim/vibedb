@@ -1,0 +1,31 @@
+# Frozen shard-service wire codec v1 golden vectors.
+#
+# THIS FILE IS AN IMMUTABLE COMPATIBILITY ARTIFACT, not a scratch fixture.
+# Every byte string here is the on-wire encoding of a named ShardRequest or
+# ShardResponse under wire version 1. A gateway and a shard on the same wire
+# version must agree on these bytes, forever. If TestShardWireV1GoldenVectors
+# (../golden_vectors_test.go) fails, the codec regressed or someone tried to
+# make a real mismatch disappear by editing this file. Either is a stop
+# condition: review the codec change or the fixture, do not paper over it.
+#
+# Grammar: one record per line, three whitespace-separated columns.
+#   REQUEST  <name> <lowercase-hex-frame>
+#   RESPONSE <name> <lowercase-hex-frame>
+# The <name> must match a fixture in goldenRequests()/goldenResponses(); the
+# test asserts every fixture has a record and every record has a fixture.
+# A frame is: tag byte ('Q'=0x51 request, 'R'=0x52 response), a big-endian
+# int32 length covering itself but not the tag, then the body, which opens with
+# a one-byte wire version (0x01).
+#
+# To re-author after an intentional, reviewed format change:
+#   SHARDSERVICE_EMIT_GOLDEN=1 go test ./shardservice/ -run TestEmitGoldenVectors -v
+
+REQUEST select_no_params 5100000063010000001753454c4543542069642046524f4d206d657373616765730000000b74656e616e745f64617461000000032d38300000000000000003000000000000000700000000012a05f200000000000010000000000000000003e800000000
+REQUEST insert_all_param_kinds 51000000a7010000002c494e5345525420494e544f206d657373616765732056414c554553202824312c24322c24332c24342c2435290000000b74656e616e745f646174610000000338302d000000000000002a0000000000000009000000000000000000000000000000000000000000000000000000000501020103000000053530652d31040000000b68656c6c6f00776f726c64050000000d7b2261223a5b312c322c335d7d
+REQUEST empty_and_zero_fields 510000004b0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000304000000000300000001300200
+
+RESPONSE rows_two_columns 520000003c0101000000020000000269640000001400000003646f63000000720000000200000000013100000000077b2278223a317d00000000013201
+RESPONSE rows_empty 5200000017010100000001000000016e0000001400000000
+RESPONSE completion 520000000e0102000000000000002a
+RESPONSE error_not_owner 520000002b010301000000206e6f74206f776e65723a207468697320736861726420736572766573202d3830
+RESPONSE error_stale_epoch 520000003c010302000000316f776e6572736869702065706f6368206d69736d617463683a207265717565737420362c20636f6e666967757265642037
