@@ -460,6 +460,12 @@ func recoveryJournalBatchReplayStart(
 func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
+	// OpenRecoveryJournal has just validated the complete live region and
+	// derived this cursor before the collection becomes reachable. Avoid a
+	// second capacity-sized read when that authoritative scan found no record.
+	if c.journal.Cursor() == 0 {
+		return nil
+	}
 	applied := 0
 	formatVersion := c.journal.Header().FormatVersion
 	// Legacy records are logical set/delete operations and therefore idempotent.

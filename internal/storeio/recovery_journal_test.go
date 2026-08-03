@@ -68,6 +68,20 @@ func reopenTestJournal(t *testing.T, path string) *RecoveryJournal {
 	return rj
 }
 
+func TestRecoveryJournalEmptyScanAndReplayDoNotAllocate(t *testing.T) {
+	rj, _ := createTestJournal(t, 2<<20)
+	defer rj.Close()
+	var scanErr error
+	if allocs := testing.AllocsPerRun(10, func() {
+		scanErr = rj.scanTail()
+	}); allocs != 0 {
+		t.Fatalf("empty tail scan allocations = %.1f, want 0", allocs)
+	}
+	if scanErr != nil {
+		t.Fatal(scanErr)
+	}
+}
+
 func appendPut(t *testing.T, rj *RecoveryJournal, generation uint64, key, value string) {
 	t.Helper()
 	if _, err := rj.Append(recoveryRecordKindPut, generation, []byte(key), []byte(value)); err != nil {

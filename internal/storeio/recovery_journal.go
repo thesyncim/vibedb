@@ -1243,6 +1243,21 @@ func (rj *RecoveryJournal) writeHeader(slot uint32, header RecoveryJournalHeader
 // leaving the cursor and next sequence positioned to overwrite it. A
 // checksum-authenticated semantic error is returned and fails Open closed.
 func (rj *RecoveryJournal) scanTail() error {
+	rj.cursor = 0
+	rj.nextSequence = rj.header.BaseSequence + 1
+	// A fresh or fully recycled journal begins with a zeroed preallocated
+	// region. Bad magic is already the format's authoritative truncatable-tail
+	// marker, so prove that case from the first word before materializing the
+	// complete bounded region. Read-only opens and clean checkpoints therefore
+	// do not allocate Capacity bytes merely to rediscover an empty log.
+	if _, err := readFullAt(
+		rj.file, rj.scratch[:4], recoveryJournalRegionStart,
+	); err != nil {
+		return err
+	}
+	if binary.LittleEndian.Uint32(rj.scratch[:4]) != recoveryRecordMagic {
+		return nil
+	}
 	region := make([]byte, rj.header.Capacity)
 	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
 		return err
