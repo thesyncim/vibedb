@@ -157,7 +157,14 @@ records. That removes another roughly 361 KiB, taking the same build from
 changes); recent five-iteration runs completed in 14.9–21.0 ms. Byte-parity
 tests prove the direct graph path writes the identical compact payload. It
 still selects identical leaf boundaries, and high-cardinality windows that do
-not fit still use the exact largest-prefix search.
+not fit still use the exact largest-prefix search. The compact encoder now
+reuses one byte-view descriptor array across the already-sequential key and
+scalar-stream phases, groups shape rows in one packed `uint16` order, and
+pre-sizes the exact row plan. Together these scratch changes reduce the same
+build again from 2.195 MB to about 1.678 MB and from 156 to about 126
+allocations, with steady five-iteration runs still around 15 ms. Combined with
+the compact descriptor work, that is 41.6% less allocation than the 2.876 MB
+baseline, with no serialized-byte change.
 
 A local ClickHouse control over the same flattened 100,000-row corpus measured
 about 1.49 ms with `ORDER BY key` and no secondary data-skipping index. The

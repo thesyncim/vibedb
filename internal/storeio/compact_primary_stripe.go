@@ -17,15 +17,14 @@ const (
 )
 
 type compactPrimaryBuildScratch struct {
-	payload    []byte
-	shapeRows  [][]int
-	shapeCodes []byte
-	keys       [][]byte
-	canonicals [][]byte
-	counts     []uint16
-	values     [][]byte
-	overflow   []byte
-	stream     compactStreamScratch
+	payload      []byte
+	shapeOrder   []uint16
+	shapeEnds    []uint16
+	shapeCodes   []byte
+	streamValues [][]byte
+	counts       []uint16
+	overflow     []byte
+	stream       compactStreamScratch
 }
 
 // BuildCompactPrimaryStripePayload builds the replacement class-5 payload.
@@ -134,11 +133,9 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 	rankBytes := int(rankBytes64)
 
 	scratch := &builder.compact
-	scratch.shapeRows = slices.Grow(scratch.shapeRows[:0], shapeCount)[:shapeCount]
-	for shape := range scratch.shapeRows {
-		scratch.shapeRows[shape] = scratch.shapeRows[shape][:0]
-	}
-	shapeRows := scratch.shapeRows
+	scratch.counts = slices.Grow(scratch.counts[:0], shapeCount)[:shapeCount]
+	clear(scratch.counts)
+	counts := scratch.counts
 	scratch.shapeCodes = slices.Grow(scratch.shapeCodes[:0], shapeCodeBytes)[:shapeCodeBytes]
 	clear(scratch.shapeCodes)
 	shapeCodes := scratch.shapeCodes
@@ -155,11 +152,38 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 			return nil, fmt.Errorf("%w: compact stripe row shape", ErrInvalidWrite)
 		}
 		compactPutBits(shapeCodes, row*shapeWidth, shapeWidth, uint64(shape))
-		shapeRows[shape] = append(shapeRows[shape], row)
+		counts[shape]++
+	}
+	scratch.shapeEnds = slices.Grow(scratch.shapeEnds[:0], shapeCount)[:shapeCount]
+	shapeEnds := scratch.shapeEnds
+	rowsWithShape := uint16(0)
+	for shape := range shapeCount {
+		rowsWithShape += counts[shape]
+		shapeEnds[shape] = rowsWithShape
+	}
+	scratch.shapeOrder = slices.Grow(
+		scratch.shapeOrder[:0], int(rowsWithShape),
+	)[:rowsWithShape]
+	shapeOrder := scratch.shapeOrder
+	for shape := range shapeCount {
+		if shape == 0 {
+			counts[shape] = 0
+		} else {
+			counts[shape] = shapeEnds[shape-1]
+		}
+	}
+	for row := range rowCount {
+		shape := int(builder.rows[row].shape)
+		if shape >= 0 {
+			shapeOrder[counts[shape]] = uint16(row)
+			counts[shape]++
+		}
 	}
 
-	scratch.keys = slices.Grow(scratch.keys[:0], rowCount)[:rowCount]
-	keys := scratch.keys
+	scratch.streamValues = slices.Grow(
+		scratch.streamValues[:0], rowCount,
+	)[:rowCount]
+	keys := scratch.streamValues
 	for row := range rowCount {
 		keys[row] = builder.keyAt(row)
 	}
@@ -235,9 +259,7 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 	}
 	payload = append(payload, shapeCodes...)
 
-	scratch.counts = slices.Grow(scratch.counts[:0], shapeCount)[:shapeCount]
 	clear(scratch.counts)
-	counts := scratch.counts
 	for block := 0; block < restarts; block++ {
 		for shape := range shapeCount {
 			var encoded [2]byte
@@ -256,10 +278,15 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 
 	shapeDataStart := len(payload)
 	for shape := range shapeCount {
+		shapeStart := uint16(0)
+		if shape != 0 {
+			shapeStart = shapeEnds[shape-1]
+		}
+		shapeRows := shapeOrder[shapeStart:shapeEnds[shape]]
 		entryStart := len(payload)
 		payload = append(payload, make([]byte, compactPrimaryShapeHeader)...)
 		plan := &builder.shapes[shape]
-		binary.LittleEndian.PutUint32(payload[entryStart:], uint32(len(shapeRows[shape])))
+		binary.LittleEndian.PutUint32(payload[entryStart:], uint32(len(shapeRows)))
 		binary.LittleEndian.PutUint16(payload[entryStart+4:], uint16(plan.holes))
 
 		templateStart := len(payload)
@@ -271,26 +298,24 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 		binary.LittleEndian.PutUint32(payload[entryStart+8:], uint32(templateBytes))
 
 		streamsStart := len(payload)
-		scratch.canonicals = slices.Grow(
-			scratch.canonicals[:0], len(shapeRows[shape]),
-		)[:len(shapeRows[shape])]
-		for ordinal, rowIndex := range shapeRows[shape] {
+		for _, encodedRow := range shapeRows {
+			rowIndex := int(encodedRow)
 			row := &builder.rows[rowIndex]
 			if int(row.spanEnd-row.spanStart) != plan.holes {
 				return nil, fmt.Errorf("%w: compact stripe hole count", ErrInvalidWrite)
 			}
-			scratch.canonicals[ordinal] = builder.canonicalOf(rowIndex)
 		}
-		scratch.values = slices.Grow(
-			scratch.values[:0], len(shapeRows[shape]),
-		)[:0]
+		scratch.streamValues = slices.Grow(
+			scratch.streamValues[:0], len(shapeRows),
+		)[:len(shapeRows)]
 		for hole := range plan.holes {
-			values := scratch.values[:0]
-			for ordinal, rowIndex := range shapeRows[shape] {
+			values := scratch.streamValues
+			for ordinal, encodedRow := range shapeRows {
+				rowIndex := int(encodedRow)
 				row := &builder.rows[rowIndex]
 				span := builder.spans[int(row.spanStart)+hole]
-				canonical := scratch.canonicals[ordinal]
-				values = append(values, canonical[span.Start:span.End])
+				canonical := builder.canonicalOf(rowIndex)
+				values[ordinal] = canonical[span.Start:span.End]
 			}
 			stream := scratch.stream.encode(values)
 			payload, err = stream.appendBinary(payload)

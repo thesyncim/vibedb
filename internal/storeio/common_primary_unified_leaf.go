@@ -349,7 +349,7 @@ func (b *UnifiedPrimaryLeafBuilder) extractPrimaryGraph(
 func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 	b.heap = b.heap[:0]
 	b.spans = b.spans[:0]
-	b.rows = b.rows[:0]
+	b.rows = slices.Grow(b.rows[:0], count)[:0]
 	b.shapes = b.shapes[:0]
 	for i := range count {
 		key := b.keyAt(i)
