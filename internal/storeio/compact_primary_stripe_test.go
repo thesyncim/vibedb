@@ -87,13 +87,13 @@ func TestCompactPrimaryStripeRoundTrip(t *testing.T) {
 	if err := resolver.SetPath([]byte("/country")); err != nil {
 		t.Fatal(err)
 	}
-	holes, ok := view.ResolveHoles(nil, &resolver)
+	_, ok := view.ResolveHoles(nil, &resolver)
 	if !ok {
 		t.Fatal("resolve compact country holes")
 	}
-	matched, ok := view.CountDictionaryHoleEqual(holes, []byte(`"PT"`))
+	matched, _, ok := view.CountResolvedSpellingEqual(&resolver, []byte(`"PT"`), nil)
 	if !ok {
-		t.Fatal("compact country stream is not dictionary encoded")
+		t.Fatal("compact country spelling scan")
 	}
 	want := 0
 	filter, err := NewUnifiedEqFilter([]byte("/country"), []byte(`"PT"`))

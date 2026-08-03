@@ -221,6 +221,29 @@ func TestCompactAlphabetPacksAcrossValuesWithinRestartBlock(t *testing.T) {
 	}
 }
 
+func TestCompactAlphabetSequentialZeroWidthMiddle(t *testing.T) {
+	values := make([][]byte, compactStreamRestart+1)
+	for row := range values {
+		values[row] = []byte(`"a"`)
+		if row&1 != 0 {
+			values[row] = []byte(`"aa"`)
+		}
+	}
+	var scratch compactStreamScratch
+	encoded, ok := scratch.encodeAlphabet(2, values, 0)
+	if !ok || encoded.width != 0 || len(encoded.dict) != 3 {
+		t.Fatalf("kind=%d width=%d dictionaries=%d", encoded.kind, encoded.width, len(encoded.dict))
+	}
+	view := compactCodecRoundTrip(t, encoded, values)
+	var state compactStreamSequentialState
+	for row := range values {
+		got, valid := state.appendValue(nil, view, row)
+		if !valid || !bytes.Equal(got, values[row]) {
+			t.Fatalf("row=%d got=%q valid=%v want=%q", row, got, valid, values[row])
+		}
+	}
+}
+
 func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
 	for width := 0; width <= 64; width++ {
 		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {
@@ -363,6 +386,10 @@ func TestCompactStreamAdaptiveAlphabetSelection(t *testing.T) {
 	encoded := encodeCompactScalarStream(values)
 	if encoded.kind != compactStreamAlphabet {
 		t.Fatalf("adaptive kind=%d want alphabet", encoded.kind)
+	}
+	if len(encoded.dict) != 3 || !bytes.Equal(encoded.dict[1], []byte{'"'}) ||
+		!bytes.Equal(encoded.dict[2], []byte{'"'}) {
+		t.Fatalf("alphabet affixes=%q, want shared quotes", encoded.dict[1:])
 	}
 	view := compactCodecRoundTrip(t, encoded, values)
 	buf := make([]byte, 0, 80)

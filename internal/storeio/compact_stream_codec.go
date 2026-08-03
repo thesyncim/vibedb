@@ -43,6 +43,8 @@ type compactStreamEncoding struct {
 
 type compactAlphabetPlan struct {
 	width      int
+	prefix     int
+	suffix     int
 	totalBytes int
 	encoded    int
 }
@@ -383,17 +385,12 @@ func (s *compactStreamScratch) measureAlphabet(
 	limit int,
 ) (compactAlphabetPlan, bool) {
 	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
-	lengthFloor := 4 * blocks
-	for _, value := range values {
-		lengthFloor += compactUvarintLen(uint64(len(value)))
-	}
-	if limit > 0 && compactStreamHeader+2+1+lengthFloor >= limit {
-		return compactAlphabetPlan{}, false
-	}
+	prefix, suffix := compactSharedAffixes(values)
 	var present [256]bool
 	count := 0
 	for _, value := range values {
-		for _, b := range value {
+		middle := value[prefix : len(value)-suffix]
+		for _, b := range middle {
 			if !present[b] {
 				present[b] = true
 				count++
@@ -409,12 +406,20 @@ func (s *compactStreamScratch) measureAlphabet(
 		last := min(first+compactStreamRestart, len(values))
 		characters := 0
 		for _, value := range values[first:last] {
-			totalBytes += compactUvarintLen(uint64(len(value)))
-			characters += len(value)
+			middle := len(value) - prefix - suffix
+			totalBytes += compactUvarintLen(uint64(middle))
+			characters += middle
 		}
 		totalBytes += (characters*width + 7) / 8
 	}
-	if encodedBytes := compactStreamHeader + 2 + count + totalBytes; limit > 0 && encodedBytes >= limit {
+	dictionaryEntries, affixBytes := 1, 0
+	if prefix != 0 || suffix != 0 {
+		dictionaryEntries = 3
+		affixBytes = prefix + suffix
+	}
+	encodedBytes := compactStreamHeader + 2*dictionaryEntries + count +
+		affixBytes + totalBytes
+	if limit > 0 && encodedBytes >= limit {
 		return compactAlphabetPlan{}, false
 	}
 	alphabet := slices.Grow(s.alphabet[slot][:0], count)[:0]
@@ -425,9 +430,30 @@ func (s *compactStreamScratch) measureAlphabet(
 	}
 	s.alphabet[slot] = alphabet
 	return compactAlphabetPlan{
-		width: width, totalBytes: totalBytes,
-		encoded: compactStreamHeader + 2 + count + totalBytes,
+		width: width, prefix: prefix, suffix: suffix,
+		totalBytes: totalBytes, encoded: encodedBytes,
 	}, true
+}
+
+func compactSharedAffixes(values [][]byte) (prefix, suffix int) {
+	if len(values) < 2 {
+		return 0, 0
+	}
+	prefix = len(values[0])
+	for _, value := range values[1:] {
+		prefix = min(prefix, compactCommonPrefix(values[0], value))
+	}
+	suffix = len(values[0]) - prefix
+	for _, value := range values[1:] {
+		limit := min(len(values[0])-prefix, len(value)-prefix)
+		shared := 0
+		for shared < limit &&
+			values[0][len(values[0])-1-shared] == value[len(value)-1-shared] {
+			shared++
+		}
+		suffix = min(suffix, shared)
+	}
+	return prefix, suffix
 }
 
 func (s *compactStreamScratch) finishAlphabet(
@@ -453,8 +479,9 @@ func (s *compactStreamScratch) finishAlphabet(
 		lengthStart := len(data)
 		characters := 0
 		for _, value := range values[first:last] {
-			data = appendCompactUvarint(data, uint64(len(value)))
-			characters += len(value)
+			middle := len(value) - plan.prefix - plan.suffix
+			data = appendCompactUvarint(data, uint64(middle))
+			characters += middle
 		}
 		lengthBytes := len(data) - lengthStart
 		if lengthBytes > int(^uint16(0)) {
@@ -465,7 +492,8 @@ func (s *compactStreamScratch) finishAlphabet(
 		data = append(data, make([]byte, (characters*width+7)/8)...)
 		bit := 0
 		for _, value := range values[first:last] {
-			for _, b := range value {
+			middle := value[plan.prefix : len(value)-plan.suffix]
+			for _, b := range middle {
 				compactPutBits(data[start:], bit, width, uint64(code[b]))
 				bit += width
 			}
@@ -474,8 +502,16 @@ func (s *compactStreamScratch) finishAlphabet(
 	if len(data) != totalBytes {
 		panic("compact alphabet sizing drift")
 	}
-	dictionary := slices.Grow(s.dict[slot][:0], 1)[:1]
+	dictionaryEntries := 1
+	if plan.prefix != 0 || plan.suffix != 0 {
+		dictionaryEntries = 3
+	}
+	dictionary := slices.Grow(s.dict[slot][:0], dictionaryEntries)[:dictionaryEntries]
 	dictionary[0] = alphabet
+	if dictionaryEntries == 3 {
+		dictionary[1] = values[0][:plan.prefix]
+		dictionary[2] = values[0][len(values[0])-plan.suffix:]
+	}
 	s.data[slot], s.dict[slot] = data, dictionary
 	return compactStreamEncoding{
 		kind: compactStreamAlphabet, width: uint8(width), count: len(values),
@@ -1256,8 +1292,8 @@ func (v compactStreamView) validate() error {
 			return corrupt("prefix-integer restart data")
 		}
 	case compactStreamAlphabet:
-		alphabet, ok := v.dictionaryEntry(0)
-		if !ok || v.dictCount != 1 || len(alphabet) == 0 || len(alphabet) > 64 ||
+		alphabet, _, _, ok := v.alphabetParts()
+		if !ok || len(alphabet) == 0 || len(alphabet) > 64 ||
 			v.width != uint8(bits.Len(uint(len(alphabet)-1))) {
 			return corrupt("alphabet metadata")
 		}
@@ -1273,6 +1309,23 @@ func (v compactStreamView) validate() error {
 		return corrupt("kind")
 	}
 	return nil
+}
+
+func (v compactStreamView) alphabetParts() (
+	alphabet, prefix, suffix []byte,
+	ok bool,
+) {
+	if v.kind != compactStreamAlphabet || v.dictCount != 1 && v.dictCount != 3 {
+		return nil, nil, nil, false
+	}
+	alphabetEnd := int(binary.LittleEndian.Uint16(v.dictDir))
+	alphabet = v.dictData[:alphabetEnd:alphabetEnd]
+	if v.dictCount == 3 {
+		prefixEnd := int(binary.LittleEndian.Uint16(v.dictDir[2:]))
+		prefix = v.dictData[alphabetEnd:prefixEnd:prefixEnd]
+		suffix = v.dictData[prefixEnd:len(v.dictData):len(v.dictData)]
+	}
+	return alphabet, prefix, suffix, true
 }
 
 func validateCompactAlphabet(data []byte, count, width, alphabet int) bool {
@@ -1465,7 +1518,7 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 	if v.kind != compactStreamAlphabet || row < 0 || row >= v.count {
 		return dst, false
 	}
-	alphabet, ok := v.dictionaryEntry(0)
+	alphabet, prefix, suffix, ok := v.alphabetParts()
 	if !ok {
 		return dst, false
 	}
@@ -1499,6 +1552,8 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 		return dst, false
 	}
 	start := len(dst)
+	dst = append(dst, prefix...)
+	middle := len(dst)
 	dst = append(dst, make([]byte, length)...)
 	for char := 0; char < length; char++ {
 		code := int(compactReadBits(
@@ -1508,9 +1563,9 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 		if code >= len(alphabet) {
 			return dst[:start], false
 		}
-		dst[start+char] = alphabet[code]
+		dst[middle+char] = alphabet[code]
 	}
-	return dst, true
+	return append(dst, suffix...), true
 }
 
 func (v compactStreamView) prefixInteger(row int) (int64, bool) {
@@ -1799,19 +1854,24 @@ func compactJSONNumberEqual(value, needle []byte) bool {
 func (v compactStreamView) countAlphabetEqual(
 	needle, scratch []byte,
 ) (matched int, out []byte) {
-	alphabet, _ := v.dictionaryEntry(0)
+	alphabet, prefix, suffix, _ := v.alphabetParts()
 	var codes [256]uint8
 	var admitted [256]bool
 	for code, b := range alphabet {
 		codes[b] = uint8(code)
 		admitted[b] = true
 	}
-	possible := true
+	possible := len(needle) >= len(prefix)+len(suffix) &&
+		bytes.HasPrefix(needle, prefix) && bytes.HasSuffix(needle, suffix)
+	var middle []byte
+	if possible {
+		middle = needle[len(prefix) : len(needle)-len(suffix)]
+	}
 	width := int(v.width)
-	needleBytes := (len(needle)*width + 7) / 8
+	needleBytes := (len(middle)*width + 7) / 8
 	scratch = slices.Grow(scratch[:0], needleBytes)[:needleBytes]
 	clear(scratch)
-	for at, b := range needle {
+	for at, b := range middle {
 		if !admitted[b] {
 			possible = false
 			continue
@@ -1829,7 +1889,7 @@ func (v compactStreamView) countAlphabetEqual(
 		for range rows {
 			length, n, _ := readCompactUvarint(v.data[lengthCursor:])
 			lengthCursor += n
-			equal := possible && int(length) == len(needle) &&
+			equal := possible && int(length) == len(middle) &&
 				compactPackedBitsEqual(
 					v.data, bit, scratch, int(length)*width,
 				)
@@ -1868,7 +1928,7 @@ func compactPackedBitsEqual(data []byte, bit int, want []byte, nbits int) bool {
 func (v compactStreamView) countAlphabetNumberEqual(
 	needle, scratch []byte,
 ) (matched int, out []byte) {
-	alphabet, _ := v.dictionaryEntry(0)
+	alphabet, prefix, suffix, _ := v.alphabetParts()
 	blocks := (v.count + compactStreamRestart - 1) / compactStreamRestart
 	width := int(v.width)
 	for block := 0; block < blocks; block++ {
@@ -1881,12 +1941,16 @@ func (v compactStreamView) countAlphabetNumberEqual(
 		for range rows {
 			length, n, _ := readCompactUvarint(v.data[lengthCursor:])
 			lengthCursor += n
-			scratch = slices.Grow(scratch[:0], int(length))[:int(length)]
+			fullLength := len(prefix) + int(length) + len(suffix)
+			scratch = slices.Grow(scratch[:0], fullLength)[:fullLength]
+			copy(scratch, prefix)
+			middle := len(prefix)
 			for char := 0; char < int(length); char++ {
-				scratch[char] = alphabet[int(compactReadBits(
+				scratch[middle+char] = alphabet[int(compactReadBits(
 					v.data, bit+char*width, width,
 				))]
 			}
+			copy(scratch[middle+int(length):], suffix)
 			if compactJSONNumberEqual(scratch, needle) {
 				matched++
 			}

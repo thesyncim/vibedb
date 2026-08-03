@@ -16,11 +16,13 @@ type compactPrimaryScanShape struct {
 }
 
 type compactStreamSequentialState struct {
-	next   int
-	cursor int
-	bit    int
-	value  int64
-	width  int
+	next        int
+	cursor      int
+	bit         int
+	value       int64
+	width       int
+	alphabetEnd int
+	prefixEnd   int
 }
 
 // CompactPrimaryScanDecoder retains bounded sequential scalar state for one
@@ -139,10 +141,16 @@ func (s *compactStreamSequentialState) appendValue(
 			}
 			s.bit = (s.cursor + lengthBytes) * 8
 		}
-		alphabet, ok := v.dictionaryEntry(0)
-		if !ok {
-			return dst, false
+		if s.next == 0 {
+			s.alphabetEnd = int(binary.LittleEndian.Uint16(v.dictDir))
+			s.prefixEnd = s.alphabetEnd
+			if v.dictCount == 3 {
+				s.prefixEnd = int(binary.LittleEndian.Uint16(v.dictDir[2:]))
+			}
 		}
+		alphabet := v.dictData[:s.alphabetEnd]
+		prefix := v.dictData[s.alphabetEnd:s.prefixEnd]
+		suffix := v.dictData[s.prefixEnd:]
 		length, n, ok := readCompactUvarint(v.data[s.cursor:])
 		if !ok || length > CommonPrimaryLeafMaxExtentBytes {
 			return dst, false
@@ -153,7 +161,16 @@ func (s *compactStreamSequentialState) appendValue(
 			return dst, false
 		}
 		start := len(dst)
+		dst = append(dst, prefix...)
+		middle := len(dst)
 		dst = append(dst, make([]byte, int(length))...)
+		if v.width == 0 {
+			for char := range int(length) {
+				dst[middle+char] = alphabet[0]
+			}
+			s.next++
+			return append(dst, suffix...), true
+		}
 		mask := uint16(1<<v.width) - 1
 		for char := 0; char < int(length); char++ {
 			byteAt := s.bit >> 3
@@ -166,14 +183,14 @@ func (s *compactStreamSequentialState) appendValue(
 			if code >= len(alphabet) {
 				return dst[:start], false
 			}
-			dst[start+char] = alphabet[code]
+			dst[middle+char] = alphabet[code]
 			s.bit += int(v.width)
 		}
 		if s.bit != endBit {
 			return dst[:start], false
 		}
 		s.next++
-		return dst, true
+		return append(dst, suffix...), true
 	}
 	prefix := 0
 	switch v.kind {
