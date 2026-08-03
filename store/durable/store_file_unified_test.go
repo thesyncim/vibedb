@@ -623,6 +623,7 @@ func TestUnifiedPrimaryOverlayFoldWithPinnedReader(t *testing.T) {
 	// only the test collection's pressure threshold; all publication, fold,
 	// retained-history, and recycle paths remain the production implementation.
 	const window = 512
+	unified.primaryUnifiedOverlay.ensureBacking()
 	if len(unified.primaryUnifiedOverlay.records) < window {
 		t.Fatalf("overlay records = %d, want at least %d",
 			len(unified.primaryUnifiedOverlay.records), window)

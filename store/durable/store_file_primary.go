@@ -681,7 +681,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 			[]vibejson.IndexEntry, 0, indexEntries,
 		)
 		canonicalBytes := min(
-			len(overlay.arena), max(4096, 2*c.options.InlineValueBytes),
+			overlay.capacityBytes(), max(4096, 2*c.options.InlineValueBytes),
 		)
 		c.primaryUnifiedCanonical = make([]byte, 0, canonicalBytes)
 	}

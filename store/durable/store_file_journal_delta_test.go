@@ -369,7 +369,7 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 	ordinaryHeader := ordinary.journal.Header()
 	completeOverlayBatch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		ordinaryHeader.SectorSize, primaryUnifiedOverlayRecords,
-		len(ordinary.primaryUnifiedOverlay.arena),
+		ordinary.primaryUnifiedOverlay.capacityBytes(),
 	))
 	wantDeltaCapacity := min(
 		max(2*completeOverlayBatch, recoveryJournalDeltaMinCapacityBytes),

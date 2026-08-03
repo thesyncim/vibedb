@@ -23,6 +23,52 @@ func newTestPrimaryUnifiedOverlay(
 	)
 }
 
+func TestPrimaryUnifiedOverlayLazyBacking(t *testing.T) {
+	const (
+		arenaBytes  = 64 << 10
+		maxLeaf     = uint32(64 << 10)
+		parentBytes = uint32(4 * 4096)
+	)
+	overlay := newLazyPrimaryUnifiedOverlay(
+		arenaBytes, primaryUnifiedOverlayBuckets,
+		uint64(primaryUnifiedOverlayBuckets)*uint64(maxLeaf+parentBytes),
+		maxLeaf, parentBytes,
+	)
+	if overlay == nil {
+		t.Fatal("lazy overlay disabled")
+	}
+	if len(overlay.records) != 0 || len(overlay.heads) != 0 ||
+		len(overlay.arena) != 0 {
+		t.Fatal("lazy overlay allocated backing before first mutation")
+	}
+	if capacity, resident, dirty := overlay.stats(); capacity != arenaBytes || resident != 0 || dirty != 0 {
+		t.Fatalf(
+			"lazy stats = (%d, %d, %d), want (%d, 0, 0)",
+			capacity, resident, dirty, arenaBytes,
+		)
+	}
+	if _, disposition, _ := overlay.lookup(1, 7, []byte("key"), 1); disposition != primaryUnifiedOverlayMissing {
+		t.Fatalf("empty lazy lookup disposition = %d", disposition)
+	}
+	prepared, err := overlay.prepare(
+		1, 7, 1, []byte("key"), []byte("value"),
+		0, 0, primaryUnifiedOverlayPut, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay.publish(prepared)
+	if len(overlay.records) != primaryUnifiedOverlayRecords ||
+		len(overlay.heads) != primaryUnifiedOverlayTable ||
+		len(overlay.arena) != arenaBytes {
+		t.Fatal("first mutation did not allocate complete bounded backing")
+	}
+	value, disposition, _ := overlay.lookup(1, 7, []byte("key"), 1)
+	if disposition != primaryUnifiedOverlayValue || string(value) != "value" {
+		t.Fatalf("lazy lookup = (%q, %d)", value, disposition)
+	}
+}
+
 // legacyLatestBucketRecordsKeyOracle retains the former key-deduplication walk
 // as a test-only differential oracle. It intentionally pays O(history*256);
 // production must use the slot-indexed implementation.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -110,7 +111,13 @@ type primaryUnifiedOverlay struct {
 	records []primaryUnifiedOverlayRecord
 	heads   []atomic.Uint32
 	arena   []byte
-	buckets [primaryUnifiedOverlayBucketTable]primaryUnifiedOverlayBucket
+	// backingBytes is the configured arena capacity even before a read-only
+	// collection performs its first mutation. backingOnce keeps the sizeable
+	// record/hash/byte backing pay-for-use while preserving one immutable,
+	// bounded allocation shape after publication starts.
+	backingBytes int
+	backingOnce  sync.Once
+	buckets      [primaryUnifiedOverlayBucketTable]primaryUnifiedOverlayBucket
 	// bucketCount belongs to the writer, but an atomic keeps the directory's
 	// reset/publication protocol explicit alongside count and used.
 	bucketCount atomic.Uint32
@@ -155,6 +162,20 @@ func newPrimaryUnifiedOverlay(
 	dirtyByteLimit uint64,
 	maxLeafBytes, parentBytes uint32,
 ) *primaryUnifiedOverlay {
+	o := newLazyPrimaryUnifiedOverlay(
+		bytes, bucketLimit, dirtyByteLimit, maxLeafBytes, parentBytes,
+	)
+	if o != nil {
+		o.ensureBacking()
+	}
+	return o
+}
+
+func newLazyPrimaryUnifiedOverlay(
+	bytes, bucketLimit int,
+	dirtyByteLimit uint64,
+	maxLeafBytes, parentBytes uint32,
+) *primaryUnifiedOverlay {
 	if bytes <= 0 || bucketLimit <= 0 ||
 		bucketLimit > primaryUnifiedOverlayBuckets ||
 		dirtyByteLimit == 0 || maxLeafBytes == 0 || parentBytes == 0 ||
@@ -162,14 +183,27 @@ func newPrimaryUnifiedOverlay(
 		return nil
 	}
 	return &primaryUnifiedOverlay{
-		records:        make([]primaryUnifiedOverlayRecord, primaryUnifiedOverlayRecords),
-		heads:          make([]atomic.Uint32, primaryUnifiedOverlayTable),
-		arena:          make([]byte, bytes),
+		backingBytes:   bytes,
 		bucketLimit:    uint32(bucketLimit),
 		dirtyByteLimit: dirtyByteLimit,
 		maxLeafBytes:   maxLeafBytes,
 		parentBytes:    parentBytes,
 	}
+}
+
+func (o *primaryUnifiedOverlay) ensureBacking() {
+	o.backingOnce.Do(func() {
+		o.records = make([]primaryUnifiedOverlayRecord, primaryUnifiedOverlayRecords)
+		o.heads = make([]atomic.Uint32, primaryUnifiedOverlayTable)
+		o.arena = make([]byte, o.backingBytes)
+	})
+}
+
+func (o *primaryUnifiedOverlay) capacityBytes() int {
+	if o == nil {
+		return 0
+	}
+	return o.backingBytes
 }
 
 func primaryUnifiedOverlayTargetBytes(
@@ -365,7 +399,7 @@ func (o *primaryUnifiedOverlay) chooseLargeUnindexedSlot(
 func (o *primaryUnifiedOverlay) lookup(
 	bucket storeio.BucketID, hash uint64, key []byte, generation uint64,
 ) ([]byte, primaryUnifiedOverlayDisposition, uint8) {
-	if o == nil {
+	if o == nil || o.count.Load() == 0 {
 		return nil, primaryUnifiedOverlayMissing, 0
 	}
 	folded := o.folded.Load()
@@ -415,7 +449,7 @@ func (o *primaryUnifiedOverlay) lookup(
 func (o *primaryUnifiedOverlay) pendingKeyReservationWide(
 	bucket storeio.BucketID, hash uint64, key []byte,
 ) (bool, error) {
-	if o == nil {
+	if o == nil || o.count.Load() == 0 {
 		return false, nil
 	}
 	folded := o.folded.Load()
@@ -675,6 +709,7 @@ func (o *primaryUnifiedOverlay) prepareWithLeafReservation(
 			"%w: unified row overlay delta", storeio.ErrInvalidWrite,
 		)
 	}
+	o.ensureBacking()
 	index := o.count.Load()
 	used := o.used.Load()
 	needed := uint64(len(key)) + uint64(len(value))
@@ -1295,7 +1330,7 @@ func (o *primaryUnifiedOverlay) stats() (capacity, resident, dirty uint64) {
 	if o == nil {
 		return 0, 0, 0
 	}
-	capacity = uint64(len(o.arena))
+	capacity = uint64(o.capacityBytes())
 	resident = uint64(o.used.Load())
 	if o.hasPending() {
 		dirty = resident

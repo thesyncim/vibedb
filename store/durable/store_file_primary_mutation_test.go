@@ -558,6 +558,7 @@ func TestFilePrimaryBufferedOverlayCapacityForcesFold(t *testing.T) {
 	// Make record pressure deterministic without changing the production
 	// overlay budget. One record fills the window; the next Put must fold it,
 	// recycle the reader-free arena, and retry in a new window.
+	collection.primaryUnifiedOverlay.ensureBacking()
 	collection.primaryUnifiedOverlay.records =
 		collection.primaryUnifiedOverlay.records[:1]
 
@@ -677,6 +678,7 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 
 	t.Run("delete-pressure", func(t *testing.T) {
 		collection, keys := open(t)
+		collection.primaryUnifiedOverlay.ensureBacking()
 		collection.primaryUnifiedOverlay.records =
 			collection.primaryUnifiedOverlay.records[:1]
 		if _, err := collection.Put(

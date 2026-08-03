@@ -664,7 +664,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	// reader fence and declines while either a Snapshot lease or direct epoch is
 	// active. A long-lived Snapshot may therefore consume the bounded append
 	// window, but pressure still falls back through the established fenced fold.
-	if len(key)+len(canonical) > len(c.primaryUnifiedOverlay.arena) {
+	if len(key)+len(canonical) > c.primaryUnifiedOverlay.capacityBytes() {
 		return false, false, nil
 	}
 
@@ -903,7 +903,7 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
 		return false, false, ErrKeyTooLarge
 	}
-	if len(key) > len(c.primaryUnifiedOverlay.arena) {
+	if len(key) > c.primaryUnifiedOverlay.capacityBytes() {
 		return false, false, nil
 	}
 

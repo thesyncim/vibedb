@@ -1134,7 +1134,7 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 	header := c.journal.Header()
 	futureBytes := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		header.SectorSize, primaryUnifiedOverlayRecords,
-		len(c.primaryUnifiedOverlay.arena),
+		c.primaryUnifiedOverlay.capacityBytes(),
 	)
 	if header.FormatVersion == storeio.RecoveryJournalFormatScalarPatch {
 		futureBytes = min(

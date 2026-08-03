@@ -286,7 +286,7 @@ func newCollectionResources(
 		options.freeFoldLimit
 	collection := &Collection{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
-		primaryUnifiedOverlay: newPrimaryUnifiedOverlay(
+		primaryUnifiedOverlay: newLazyPrimaryUnifiedOverlay(
 			options.primaryUnifiedOverlayBytes,
 			options.primaryUnifiedOverlayBuckets,
 			options.primaryUnifiedOverlayDirtyBytes,
