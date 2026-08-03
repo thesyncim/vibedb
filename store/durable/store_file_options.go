@@ -307,6 +307,57 @@ type Options struct {
 	MaxBatchBytes int
 }
 
+// TxnLimits bounds one multi-collection commit across participants. Accounting
+// completes before any durable work; exceeding any bound is a typed refusal
+// with nothing staged, journaled, or published.
+//
+// The zero value is fail-closed at the caller-owned UpdateCollections
+// primitive: any zero dimension refuses a K ≥ 2 commit. Zero-to-default
+// substitution happens only in layers that own defaults — Database.Update,
+// facade AdvancedOptions, and SQL driver option normalization — never inside
+// the primitive.
+type TxnLimits struct {
+	// MaxCollections bounds how many dirty participants one commit may name.
+	// Zero is fail-closed at UpdateCollections. Database.Update normalizes
+	// zero to defaultTxnMaxCollections (16), hard-capped by
+	// storeio.TxnMarkerMaxParticipants.
+	MaxCollections int
+	// MaxDocuments bounds the total distinct keys staged across every
+	// participant. Zero is fail-closed at UpdateCollections; Database.Update
+	// normalizes zero to defaultTxnMaxDocuments (4× the single-collection
+	// MaxBatchDocuments default).
+	MaxDocuments int
+	// MaxBytes bounds the total key and value bytes staged across every
+	// participant. Zero is fail-closed at UpdateCollections; Database.Update
+	// normalizes zero to defaultTxnMaxBytes (4× the single-collection
+	// MaxBatchBytes default).
+	MaxBytes int64
+}
+
+const (
+	// defaultTxnMaxCollections is the Database.Update / package-default
+	// MaxCollections. It matches the design's default of 16 and sits below
+	// storeio.TxnMarkerMaxParticipants (64), the hard encode-time ceiling.
+	defaultTxnMaxCollections = 16
+	// defaultTxnMaxDocuments is 4× store.MaxChunkDocuments, the zero-value
+	// Options.MaxBatchDocuments default.
+	defaultTxnMaxDocuments = 4 * store.MaxChunkDocuments
+	// defaultTxnMaxBytes is 4× the zero-value Options.MaxBatchBytes:
+	// MaxBatchDocuments×MaxKeyBytes + defaultBatchValueBytes with the
+	// zero-value MaxKeyBytes of 256.
+	defaultTxnMaxBytes = 4 * (int64(store.MaxChunkDocuments)*256 + defaultBatchValueBytes)
+)
+
+// defaultTxnLimits returns the pinned package defaults Database.Update applies
+// when normalizing a zero TxnLimits dimension.
+func defaultTxnLimits() TxnLimits {
+	return TxnLimits{
+		MaxCollections: defaultTxnMaxCollections,
+		MaxDocuments:   defaultTxnMaxDocuments,
+		MaxBytes:       defaultTxnMaxBytes,
+	}
+}
+
 // ValidateOptions reports whether options can be normalized and represented by
 // the durable on-disk format, without opening or creating a collection.
 //

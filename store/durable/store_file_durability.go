@@ -246,6 +246,20 @@ func (c *Collection) poisonPersistence(_ error) {
 	c.snapshotGate.Unlock()
 }
 
+// joinCatalogCommitOutcomeUnknown joins a multi-collection decision-sync
+// failure into this collection's sticky persistence-failure slot as
+// ErrCommitOutcomeUnknown. The decision sync is the sole unknown-outcome
+// window: every collection registered with the decision log must refuse
+// further writes until reopen resolves the atomic all-or-nothing outcome.
+// T4's TxnLog coordinator is the only caller; prepare failures stay on plain
+// poisonJournal and must never reach this hook.
+func joinCatalogCommitOutcomeUnknown(c *Collection, cause error) error {
+	if c == nil {
+		return nil
+	}
+	return c.poisonJournalCommitOutcomeUnknown(cause)
+}
+
 // PersistenceError reports the sticky I/O failure that stopped this
 // collection's writer. A non-nil result requires Close and Open before any
 // further mutation; errors.Is may match ErrCommitOutcomeUnknown when recovery
