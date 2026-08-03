@@ -97,6 +97,19 @@ Follow [docs/performance.md](docs/performance.md). In particular:
 - label every value measured, projected, or a gate;
 - never replace a database-level table with an isolated primitive result.
 
+An automated allocation gate guards the hot paths. `bench/gate` runs a curated
+set of warm read, scan, apply, and bulk-build benchmarks on your revision and on
+the merge-base, then fails when a gated `allocs/op` count rises at all or a gated
+`B/op` count rises by more than 5%; it never gates `ns/op`, so machine load
+cannot trip it. Run `go run ./bench/gate` before proposing any change to a warm
+read, scan, join, apply, or durable write path, and expect the same check on
+every pull request. When a change deliberately trades a new allocation on a gated
+path for a larger win, adjust the curated entry and its policy in
+[bench/gate](bench/gate) — the curated table and its gating rules live in the
+tool's code, not its prose — and record the justifying measurement in
+[bench/gate/README.md](bench/gate/README.md) in the same change, rather than
+silently loosening the gate.
+
 Cross-engine figures have one authoritative home:
 [bench/competitive/RESULTS.md](bench/competitive/RESULTS.md). Record the exact
 commit, dirty state, machine, Go version, corpus variant, mode, and sampling
