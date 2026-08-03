@@ -200,9 +200,9 @@ func TestCompactAlphabetPacksAcrossValuesWithinRestartBlock(t *testing.T) {
 	if plan.width != 5 {
 		t.Fatalf("width=%d, want 5", plan.width)
 	}
-	// Two offsets, two length-section headers, one byte of length per row,
+	// Two offsets, a base and width byte for each fixed-length block,
 	// 40 packed bytes for the full block, and one for the final row.
-	const wantDataBytes = 2*4 + 2*2 + rows + 40 + 1
+	const wantDataBytes = 2*4 + 2*2 + 40 + 1
 	if plan.totalBytes != wantDataBytes {
 		t.Fatalf("data bytes=%d, want %d", plan.totalBytes, wantDataBytes)
 	}
@@ -219,6 +219,30 @@ func TestCompactAlphabetPacksAcrossValuesWithinRestartBlock(t *testing.T) {
 			t.Fatalf("row=%d got=%q valid=%v want=%q", row, got, valid, values[row])
 		}
 	}
+}
+
+func TestCompactAlphabetBitPacksVariableLengths(t *testing.T) {
+	values := make([][]byte, compactStreamRestart+1)
+	seeds := []string{"abc", "bcde", "cdefg", "defghi"}
+	characters := 0
+	for row := range values {
+		values[row] = []byte(seeds[row%len(seeds)])
+		characters += len(values[row])
+	}
+	var scratch compactStreamScratch
+	plan, ok := scratch.measureAlphabet(2, values, 0)
+	if !ok || plan.prefix != 0 || plan.suffix != 0 {
+		t.Fatalf("alphabet plan=%+v ok=%v", plan, ok)
+	}
+	encoded := scratch.finishAlphabet(2, values, plan)
+	// Two offsets; the full block has a one-byte base, one-byte width, and
+	// sixteen bytes of 2-bit deltas; the final block needs only base+width.
+	wantDataBytes := 2*4 + (1 + 1 + 16) + (1 + 1) +
+		(characters*plan.width+7)/8
+	if plan.totalBytes != wantDataBytes {
+		t.Fatalf("data bytes=%d, want %d", plan.totalBytes, wantDataBytes)
+	}
+	compactCodecRoundTrip(t, encoded, values)
 }
 
 func TestCompactAlphabetSequentialZeroWidthMiddle(t *testing.T) {
@@ -464,17 +488,20 @@ func TestCompactAlphabetRejectsCorruption(t *testing.T) {
 		append([]byte(nil), encoded...),
 		append([]byte(nil), encoded...),
 		append([]byte(nil), encoded...),
+		append([]byte(nil), encoded...),
 	}
 	tests[0][dictStart+1] = tests[0][dictStart]
 	binary.LittleEndian.PutUint32(tests[1][dataStart:], 0)
-	cursor := dataStart + 4 + 2
-	for range values {
-		_, n, valid := readCompactUvarint(tests[2][cursor:])
-		if !valid {
-			t.Fatal("alphabet fixture length")
-		}
-		cursor += n
+	cursor := dataStart + 4
+	_, n, valid := readCompactUvarint(tests[2][cursor:])
+	if !valid {
+		t.Fatal("alphabet fixture length base")
 	}
+	cursor += n
+	lengthWidth := int(tests[2][cursor])
+	tests[3][cursor] = 65
+	cursor++
+	cursor += (len(values)*lengthWidth + 7) / 8
 	tests[2][cursor] |= 3
 	for i, malformed := range tests {
 		if _, err := openCompactStream(malformed); err == nil {

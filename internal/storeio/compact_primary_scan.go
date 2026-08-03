@@ -19,6 +19,7 @@ type compactStreamSequentialState struct {
 	next        int
 	cursor      int
 	bit         int
+	lengthBit   int
 	value       int64
 	width       int
 	alphabetEnd int
@@ -131,14 +132,23 @@ func (s *compactStreamSequentialState) appendValue(
 		if row%compactStreamRestart == 0 {
 			block := row / compactStreamRestart
 			s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
-			if len(v.data)-s.cursor < 2 {
+			base, n, ok := readCompactUvarint(v.data[s.cursor:])
+			if !ok {
 				return dst, false
 			}
-			lengthBytes := int(binary.LittleEndian.Uint16(v.data[s.cursor:]))
-			s.cursor += 2
+			s.value = int64(base)
+			s.cursor += n
+			if s.cursor >= len(v.data) {
+				return dst, false
+			}
+			s.width = int(v.data[s.cursor])
+			s.cursor++
+			rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+			lengthBytes := (rows*s.width + 7) / 8
 			if lengthBytes > len(v.data)-s.cursor {
 				return dst, false
 			}
+			s.lengthBit = s.cursor * 8
 			s.bit = (s.cursor + lengthBytes) * 8
 		}
 		if s.next == 0 {
@@ -151,11 +161,11 @@ func (s *compactStreamSequentialState) appendValue(
 		alphabet := v.dictData[:s.alphabetEnd]
 		prefix := v.dictData[s.alphabetEnd:s.prefixEnd]
 		suffix := v.dictData[s.prefixEnd:]
-		length, n, ok := readCompactUvarint(v.data[s.cursor:])
-		if !ok || length > CommonPrimaryLeafMaxExtentBytes {
+		length := uint64(s.value) + compactReadBits(v.data, s.lengthBit, s.width)
+		s.lengthBit += s.width
+		if length > CommonPrimaryLeafMaxExtentBytes {
 			return dst, false
 		}
-		s.cursor += n
 		endBit := s.bit + int(length)*int(v.width)
 		if endBit > len(v.data)*8 {
 			return dst, false

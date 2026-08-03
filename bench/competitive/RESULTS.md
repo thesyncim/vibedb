@@ -167,7 +167,7 @@ the point-put rows have mutated and include the sibling.
 
 | engine | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk, immutable | **0.973 / 0.973** | **7.098 / 7.098** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **6.609 / 6.609** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | bbolt | 45.750 / 29.734 | 45.750 / 29.734 |
@@ -178,7 +178,7 @@ the point-put rows have mutated and include the sibling.
 
 | engine | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk, immutable | **0.973 / 0.973** | **7.098 / 7.098** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **6.609 / 6.609** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | bbolt | 45.750 / 29.734 | 45.750 / 29.734 |

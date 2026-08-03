@@ -119,7 +119,7 @@ func (s *compactPrototypeStripe) countCountry(needle []byte) int {
 func (s *compactPrototypeStripe) countCountryProduction(needle []byte) int {
 	matched := 0
 	for shape := range s.shapes {
-		count, supported := s.shapes[shape].productionCountry.countDictionaryEqual(needle)
+		count, _, supported := s.shapes[shape].productionCountry.countSpellingEqual(needle, nil)
 		if supported {
 			matched += count
 		}

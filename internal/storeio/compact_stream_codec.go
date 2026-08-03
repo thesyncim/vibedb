@@ -31,6 +31,7 @@ const (
 	compactStreamAlphabet
 	compactStreamKindLimit
 	compactDictionaryHashThreshold = 16
+	compactDictionaryScanPreferred = 128
 )
 
 type compactStreamEncoding struct {
@@ -177,7 +178,12 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 	// must still select it. Defer its sort and row-ID stream until that work can
 	// affect the result; high-cardinality columns normally choose alphabet or
 	// front coding and otherwise paid for a discarded O(rows log rows) build.
-	if dictionaryBytes <= bestBytes {
+	// A small dictionary scans packed IDs much faster than spelling-oriented
+	// codecs. Keep it when its exact size is within 25% of the byte minimum;
+	// this is a representation choice, not a posting index or row-skipping path.
+	preferDictionaryScan := len(s.dict[0]) <= compactDictionaryScanPreferred &&
+		dictionaryBytes <= bestBytes+bestBytes/4
+	if dictionaryBytes <= bestBytes || preferDictionaryScan {
 		return s.finishDictionary(values)
 	}
 	if bestSlot < 0 {
@@ -401,15 +407,22 @@ func (s *compactStreamScratch) measureAlphabet(
 		return compactAlphabetPlan{}, false
 	}
 	width := bits.Len(uint(count - 1))
-	totalBytes := 4*blocks + 2*blocks
+	totalBytes := 4 * blocks
 	for first := 0; first < len(values); first += compactStreamRestart {
 		last := min(first+compactStreamRestart, len(values))
-		characters := 0
-		for _, value := range values[first:last] {
+		lo, hi, characters := 0, 0, 0
+		for row, value := range values[first:last] {
 			middle := len(value) - prefix - suffix
-			totalBytes += compactUvarintLen(uint64(middle))
+			if row == 0 {
+				lo, hi = middle, middle
+			} else {
+				lo, hi = min(lo, middle), max(hi, middle)
+			}
 			characters += middle
 		}
+		lengthWidth := bits.Len(uint(hi - lo))
+		totalBytes += compactUvarintLen(uint64(lo)) + 1 +
+			((last-first)*lengthWidth+7)/8
 		totalBytes += (characters*width + 7) / 8
 	}
 	dictionaryEntries, affixBytes := 1, 0
@@ -474,20 +487,28 @@ func (s *compactStreamScratch) finishAlphabet(
 		last := min(first+compactStreamRestart, len(values))
 		block := first / compactStreamRestart
 		binary.LittleEndian.PutUint32(data[block*4:], uint32(len(data)))
-		lengthHeader := len(data)
-		data = append(data, 0, 0)
-		lengthStart := len(data)
-		characters := 0
-		for _, value := range values[first:last] {
+		lo, hi, characters := 0, 0, 0
+		for row, value := range values[first:last] {
 			middle := len(value) - plan.prefix - plan.suffix
-			data = appendCompactUvarint(data, uint64(middle))
+			if row == 0 {
+				lo, hi = middle, middle
+			} else {
+				lo, hi = min(lo, middle), max(hi, middle)
+			}
 			characters += middle
 		}
-		lengthBytes := len(data) - lengthStart
-		if lengthBytes > int(^uint16(0)) {
-			panic("compact alphabet length directory exceeds block bound")
+		lengthWidth := bits.Len(uint(hi - lo))
+		data = appendCompactUvarint(data, uint64(lo))
+		data = append(data, byte(lengthWidth))
+		lengthStart := len(data)
+		data = append(data, make([]byte, ((last-first)*lengthWidth+7)/8)...)
+		for row, value := range values[first:last] {
+			middle := len(value) - plan.prefix - plan.suffix
+			compactPutBits(
+				data[lengthStart:], row*lengthWidth, lengthWidth,
+				uint64(middle-lo),
+			)
 		}
-		binary.LittleEndian.PutUint16(data[lengthHeader:], uint16(lengthBytes))
 		start := len(data)
 		data = append(data, make([]byte, (characters*width+7)/8)...)
 		bit := 0
@@ -1328,6 +1349,21 @@ func (v compactStreamView) alphabetParts() (
 	return alphabet, prefix, suffix, true
 }
 
+func (v compactStreamView) alphabetBlock(
+	block int,
+) (base uint64, lengths []byte, packedBit, rows, width int) {
+	cursor := int(binary.LittleEndian.Uint32(v.data[block*4:]))
+	base, n, _ := readCompactUvarint(v.data[cursor:])
+	cursor += n
+	width = int(v.data[cursor])
+	cursor++
+	rows = min(compactStreamRestart, v.count-block*compactStreamRestart)
+	lengthBytes := (rows*width + 7) / 8
+	lengths = v.data[cursor : cursor+lengthBytes]
+	packedBit = (cursor + lengthBytes) * 8
+	return base, lengths, packedBit, rows, width
+}
+
 func validateCompactAlphabet(data []byte, count, width, alphabet int) bool {
 	blocks := (count + compactStreamRestart - 1) / compactStreamRestart
 	cursor := 4 * blocks
@@ -1338,28 +1374,31 @@ func validateCompactAlphabet(data []byte, count, width, alphabet int) bool {
 		if int(binary.LittleEndian.Uint32(data[block*4:])) != cursor {
 			return false
 		}
-		if len(data)-cursor < 2 {
+		base, n, ok := readCompactUvarint(data[cursor:])
+		if !ok || base > CommonPrimaryLeafMaxExtentBytes {
 			return false
 		}
-		lengthBytes := int(binary.LittleEndian.Uint16(data[cursor:]))
-		cursor += 2
-		lengthEnd := cursor + lengthBytes
-		if lengthEnd > len(data) {
+		cursor += n
+		if cursor >= len(data) {
 			return false
 		}
+		lengthWidth := int(data[cursor])
+		cursor++
 		rows := min(compactStreamRestart, count-block*compactStreamRestart)
+		lengthBytes := (rows*lengthWidth + 7) / 8
+		if lengthWidth > 64 || lengthBytes > len(data)-cursor {
+			return false
+		}
+		lengths := data[cursor : cursor+lengthBytes]
+		cursor += lengthBytes
 		characters := 0
-		for range rows {
-			length, n, ok := readCompactUvarint(data[cursor:])
-			if !ok || length > CommonPrimaryLeafMaxExtentBytes ||
+		for row := range rows {
+			length := base + compactReadBits(lengths, row*lengthWidth, lengthWidth)
+			if length > CommonPrimaryLeafMaxExtentBytes ||
 				length > uint64(^uint(0)>>1)-uint64(characters) {
 				return false
 			}
-			cursor += n
 			characters += int(length)
-		}
-		if cursor != lengthEnd {
-			return false
 		}
 		packed := (characters*width + 7) / 8
 		if packed > len(data)-cursor {
@@ -1524,27 +1563,31 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 	}
 	block := row / compactStreamRestart
 	cursor := int(binary.LittleEndian.Uint32(v.data[block*4:]))
-	if len(v.data)-cursor < 2 {
+	base, n, valid := readCompactUvarint(v.data[cursor:])
+	if !valid {
 		return dst, false
 	}
-	lengthBytes := int(binary.LittleEndian.Uint16(v.data[cursor:]))
-	cursor += 2
+	cursor += n
+	if cursor >= len(v.data) {
+		return dst, false
+	}
+	lengthWidth := int(v.data[cursor])
+	cursor++
+	rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+	lengthBytes := (rows*lengthWidth + 7) / 8
 	packedStart := cursor + lengthBytes
 	if packedStart > len(v.data) {
 		return dst, false
 	}
-	rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
 	startChar, length := 0, 0
 	for at := 0; at < rows; at++ {
-		decodedLength, n, valid := readCompactUvarint(v.data[cursor:])
-		if !valid || decodedLength > CommonPrimaryLeafMaxExtentBytes {
-			return dst, false
-		}
-		cursor += n
+		decodedLength := int(base + compactReadBits(
+			v.data[cursor:packedStart], at*lengthWidth, lengthWidth,
+		))
 		if at < row%compactStreamRestart {
-			startChar += int(decodedLength)
+			startChar += decodedLength
 		} else if at == row%compactStreamRestart {
-			length = int(decodedLength)
+			length = decodedLength
 		}
 	}
 	packedBytes := ((startChar+length)*int(v.width) + 7) / 8
@@ -1880,15 +1923,9 @@ func (v compactStreamView) countAlphabetEqual(
 	}
 	blocks := (v.count + compactStreamRestart - 1) / compactStreamRestart
 	for block := 0; block < blocks; block++ {
-		lengthStart := int(binary.LittleEndian.Uint32(v.data[block*4:]))
-		lengthBytes := int(binary.LittleEndian.Uint16(v.data[lengthStart:]))
-		lengthStart += 2
-		packedStart := lengthStart + lengthBytes
-		rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
-		lengthCursor, bit := lengthStart, packedStart*8
-		for range rows {
-			length, n, _ := readCompactUvarint(v.data[lengthCursor:])
-			lengthCursor += n
+		base, lengths, bit, rows, lengthWidth := v.alphabetBlock(block)
+		for row := range rows {
+			length := base + compactReadBits(lengths, row*lengthWidth, lengthWidth)
 			equal := possible && int(length) == len(middle) &&
 				compactPackedBitsEqual(
 					v.data, bit, scratch, int(length)*width,
@@ -1932,15 +1969,9 @@ func (v compactStreamView) countAlphabetNumberEqual(
 	blocks := (v.count + compactStreamRestart - 1) / compactStreamRestart
 	width := int(v.width)
 	for block := 0; block < blocks; block++ {
-		lengthStart := int(binary.LittleEndian.Uint32(v.data[block*4:]))
-		lengthBytes := int(binary.LittleEndian.Uint16(v.data[lengthStart:]))
-		lengthStart += 2
-		packedStart := lengthStart + lengthBytes
-		rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
-		lengthCursor, bit := lengthStart, packedStart*8
-		for range rows {
-			length, n, _ := readCompactUvarint(v.data[lengthCursor:])
-			lengthCursor += n
+		base, lengths, bit, rows, lengthWidth := v.alphabetBlock(block)
+		for row := range rows {
+			length := base + compactReadBits(lengths, row*lengthWidth, lengthWidth)
 			fullLength := len(prefix) + int(length) + len(suffix)
 			scratch = slices.Grow(scratch[:0], fullLength)[:fullLength]
 			copy(scratch, prefix)

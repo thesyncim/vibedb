@@ -86,7 +86,7 @@ func collectUnifiedLeafCensus(t *testing.T, c *Collection) unifiedLeafCensus {
 // TestUnifiedSpaceCompetitiveCorpus is the unified space and census test:
 // deliverable: both competitive corpora (100k ~249 B documents, low and high
 // cardinality) built through the unified path must land at or below the
-// compact complete-file baselines of 10.3 / 75.0 B/doc, and the template
+// compact complete-file baselines of 10.3 / 70.0 B/doc, and the template
 // census reports shapes per leaf and the trivial-row fraction. Skipped under
 // -short: it builds 200k documents.
 func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
@@ -94,7 +94,7 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 		t.Skip("space gate builds two 100k-document stores")
 	}
 	const n = 100_000
-	gates := map[string]float64{"low": 10.3, "high": 75.0}
+	gates := map[string]float64{"low": 10.3, "high": 70.0}
 	for _, name := range []string{"low", "high"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()

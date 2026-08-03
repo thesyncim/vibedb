@@ -80,8 +80,9 @@ fallback measured about 67 ms on the same harness; it remains disclosed as a
 different physical path rather than being used as an unindexed result.
 
 The latest high-cardinality alphabet layout stores exact common stream prefixes
-and suffixes once, then packs the remaining codes continuously within each
-bounded 64-row restart block. Besides removing repeated JSON-string quotes and
+and suffixes once, frame-of-reference bit-packs row lengths, then packs the
+remaining codes continuously within each bounded 64-row restart block. Besides
+removing repeated JSON-string quotes, one-byte-per-row length entries, and
 per-value byte padding,
 its sequential decoder improved the high-cardinality all-bytes scan from about
 58.8 ms to 52.9 ms (roughly 471 MB/s). Every packed character remains
@@ -197,9 +198,9 @@ posting enumeration, mutation folds, verification, and salvage. The same
 100,000-row low-cardinality corpus occupies 905,216 physical leaf bytes
 (9.05 bytes/document); catalog, tablet, root, and allocator pages bring the
 complete file to 10.20 bytes/document. The shape-identical high-cardinality
-variant occupies 74.42 bytes/document as a complete file, preventing the low
+variant occupies 69.30 bytes/document as a complete file, preventing the low
 cardinality result from hiding an irreversible or corpus-eliding encoding.
-That is 7.098 MiB, below the same JSON corpus's 8.041 MiB gzip-9 output even
+That is 6.609 MiB, below the same JSON corpus's 8.041 MiB gzip-9 output even
 though the database file also retains all keys and structural metadata. Every
 key and scalar codec is decoded byte-for-byte in the format tests.
 
@@ -209,9 +210,10 @@ dictionaries and frame-of-reference integers; block-packed delta integers;
 validated Gregorian date packing; bounded-restart front coding; a reversible
 single-numeric-run string codec; and adaptive alphabet packing for scalar
 streams with at most 64 distinct bytes. Exact common stream affixes are stored
-once, and the remaining alphabet codes are continuous within each 64-row
-restart block, avoiding repeated structural bytes and per-value byte padding
-while retaining bounded point reads. The numeric-run codec applies equally
+once, row lengths use a per-block minimum plus packed deltas, and the remaining
+alphabet codes are continuous within each 64-row restart block. This avoids
+repeated structural bytes, byte-wide lengths, and per-value byte padding while
+retaining bounded point reads. The numeric-run codec applies equally
 to keys such as
 `doc:00001234` and values such as `"user-1234"`. It does not infer one field
 from another, omit values, add a filter index, prune rows, or derive one field
@@ -318,7 +320,7 @@ sibling journal.
 
 | engine/profile | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk, immutable | **0.973 / 0.973** | **7.098 / 7.098** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **6.609 / 6.609** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | Pebble with Snappy | 33.978 / 34.000 | 40.993 / 41.027 |
