@@ -71,13 +71,13 @@ rendering. Dictionary, front-coded, alphabet-packed, FOR, delta,
 Gregorian-date, and single-numeric-run streams all have complete encoded-value
 scan lanes. On the
 shape-identical high-cardinality corpus, a missing `/note` string scanned all
-100,000 alphabet-packed values in about 0.745 ms (7.45 ns/document), with zero
+100,000 alphabet-packed values in about 0.65 ms (6.5 ns/document), with zero
 fallback rows and zero warm allocations. The general container-valued render
 fallback measured about 67 ms on the same harness; it remains disclosed as a
 different physical path rather than being used as an unindexed result.
 
-The high-cardinality all-bytes scan also improved from about 88 ms to 60 ms
-(roughly 414 MB/s) because sequential decoding carries each alphabet stream's
+The high-cardinality all-bytes scan also improved from about 88 ms to 59.4 ms
+(roughly 419 MB/s) because sequential decoding carries each alphabet stream's
 bounded-restart cursor. Every packed character remains independently
 reconstructible; this is not dictionary substitution or value inference.
 
@@ -106,6 +106,12 @@ time from a reusable vector instead of retaining every column simultaneously.
 Bulk snapshot traversal fills the final borrowed record plan directly instead
 of allocating an intermediate chunk/slot list and then walking the source a
 second time.
+Oversized windows now select the actual largest fitting prefix. After the first
+exact search, neighbouring leaves probe the preceding exact row count, expand
+until they prove one fitting and one failing bound, and binary-search only that
+bracket. A density phase change expands the bracket; it never substitutes a
+heuristic boundary. On the 100,000-row high-cardinality corpus this reduced the
+bulk load from about 3.59 s to 2.08 s and the leaf count from 195 to 129.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
 setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf
@@ -158,7 +164,7 @@ posting enumeration, mutation folds, verification, and salvage. The same
 100,000-row low-cardinality corpus occupies 905,216 physical leaf bytes
 (9.05 bytes/document); catalog, tablet, root, and allocator pages bring the
 complete file to 10.20 bytes/document. The shape-identical high-cardinality
-variant occupies 89.17 bytes/document as a complete file, preventing the low
+variant occupies 85.48 bytes/document as a complete file, preventing the low
 cardinality result from hiding an irreversible or corpus-eliding encoding.
 Every key and scalar codec is decoded byte-for-byte in the format tests.
 

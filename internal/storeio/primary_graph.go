@@ -412,6 +412,7 @@ func planCompactPrimaryLeaves(
 	var plans []primaryLeafPlan
 	builder := NewUnifiedPrimaryLeafBuilder()
 	window := make([]CommonPrimaryLeafRecord, 0, maxRows)
+	countHint := 0
 	for first := 0; first < len(records); {
 		hi := min(maxRows, len(records)-first)
 		window = window[:0]
@@ -446,28 +447,88 @@ func planCompactPrimaryLeaves(
 			return extent, extent <= maxExtent, nil
 		}
 		count, extent := 0, 0
-		// Log-like compact windows normally fit all 4,096 rows. Prove that
-		// common case with one encoding before paying the bounded binary search;
-		// oversized/high-cardinality windows still select the exact same largest
-		// fitting prefix below.
-		candidate, fullWindowFits, err := fits(hi)
-		if err != nil {
-			return nil, err
-		}
-		if fullWindowFits {
-			count, extent = hi, candidate
-		}
-		for lo, high := 1, hi-1; count == 0 && lo <= high; {
-			mid := (lo + high) / 2
-			candidate, ok, err := fits(mid)
+		if countHint == 0 {
+			// Prove the common complete-window case before paying a search. The
+			// first oversized window establishes the exact hint used below.
+			candidate, fullWindowFits, err := fits(hi)
 			if err != nil {
 				return nil, err
 			}
+			if fullWindowFits {
+				count, extent = hi, candidate
+			}
+			for lo, high := 1, hi-1; count != hi && lo <= high; {
+				mid := (lo + high) / 2
+				candidate, ok, err := fits(mid)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					count, extent = mid, candidate
+					lo = mid + 1
+				} else {
+					high = mid - 1
+				}
+			}
+		} else {
+			// Neighbouring ordered leaves normally have similar encoded density.
+			// Probe the preceding exact count, expand until one fitting and one
+			// failing bound are proved, then binary-search only that bracket. A
+			// phase change merely expands farther; it cannot change the selected
+			// largest prefix.
+			probe := min(countHint, hi)
+			candidate, ok, err := fits(probe)
+			if err != nil {
+				return nil, err
+			}
+			step := max(countHint/8, 1)
+			failed := hi + 1
 			if ok {
-				count, extent = mid, candidate
-				lo = mid + 1
+				count, extent = probe, candidate
+				for count < hi {
+					next := min(hi, count+step)
+					candidate, ok, err = fits(next)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						failed = next
+						break
+					}
+					count, extent = next, candidate
+					step = min(step*2, hi)
+				}
 			} else {
-				high = mid - 1
+				failed = probe
+				for count == 0 {
+					next := max(1, failed-step)
+					candidate, ok, err = fits(next)
+					if err != nil {
+						return nil, err
+					}
+					if ok {
+						count, extent = next, candidate
+						break
+					}
+					if next == 1 {
+						break
+					}
+					failed = next
+					step = min(step*2, hi)
+				}
+			}
+			for lo, high := count+1, failed-1; count != 0 && lo <= high; {
+				mid := (lo + high) / 2
+				candidate, ok, err = fits(mid)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					count, extent = mid, candidate
+					lo = mid + 1
+				} else {
+					high = mid - 1
+				}
 			}
 		}
 		if count == 0 {
@@ -496,6 +557,7 @@ func planCompactPrimaryLeaves(
 			plan.records = append([]CommonPrimaryLeafRecord(nil), window[:count]...)
 		}
 		plans = append(plans, plan)
+		countHint = count
 		first += count
 	}
 	return plans, nil

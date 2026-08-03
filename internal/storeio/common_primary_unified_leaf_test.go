@@ -1651,6 +1651,28 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("plan %d retained payload drift: %v", at, err)
 		}
+		if plans[at].last < len(records) {
+			next := records[plans[at].last]
+			larger := append(window, CommonPrimaryLeafRecord{
+				Key: next.Key, Value: CommonPrimaryLeafValue{Inline: next.Value},
+			})
+			largerPayload, largerErr := BuildCompactPrimaryStripePayload(
+				larger, NewUnifiedPrimaryLeafBuilder(),
+			)
+			if largerErr == nil {
+				need := PageHeaderSize + len(largerPayload) + PageTrailerSize
+				largerExtent := (need + int(physicalPageQuantum) - 1) &^
+					(int(physicalPageQuantum) - 1)
+				if largerExtent <= CommonPrimaryLeafWideBytes {
+					t.Fatalf(
+						"plan %d stopped at %d rows but %d rows fit in %d bytes",
+						at, len(window), len(larger), largerExtent,
+					)
+				}
+			} else if largerErr != ErrCommonPrimaryLeafFull {
+				t.Fatalf("plan %d larger-prefix probe: %v", at, largerErr)
+			}
+		}
 		dst := make([]byte, plans[at].extent)
 		header := CommonPrimaryLeafHeader{
 			StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
@@ -1686,6 +1708,85 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 	}
 	t.Logf("planner: %d leaves for %d records; first extent %d rows %d",
 		len(plans), n, plans[0].extent, plans[0].last-plans[0].first)
+}
+
+func TestUnifiedPlannerExactAcrossDensityPhaseChanges(t *testing.T) {
+	const (
+		rows    = 640
+		maxRows = 128
+	)
+	records := make([]PrimaryGraphRecord, rows)
+	alphabet := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	for i := range records {
+		key := fmt.Appendf(nil, "phase:%08d", i)
+		if i < 160 || i >= 400 {
+			records[i] = PrimaryGraphRecord{
+				Key: key, Value: fmt.Appendf(nil, `{"id":%d,"ok":true}`, i),
+			}
+			continue
+		}
+		note := make([]byte, 256)
+		state := uint64(i + 1)
+		for at := range note {
+			state = state*6364136223846793005 + 1442695040888963407
+			note[at] = alphabet[state%uint64(len(alphabet))]
+		}
+		records[i] = PrimaryGraphRecord{
+			Key: key, Value: fmt.Appendf(nil, `{"id":%d,"note":"%s","ok":true}`, i, note),
+		}
+	}
+
+	plans, err := planCompactPrimaryLeaves(
+		unifiedTestStoreID(), records, maxRows, CommonPrimaryLeafWideBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawDrop, sawRise := false, false
+	previousCount := 0
+	for rank, plan := range plans {
+		count := plan.last - plan.first
+		if rank != 0 {
+			sawDrop = sawDrop || count < previousCount
+			sawRise = sawRise || count > previousCount
+		}
+		previousCount = count
+
+		hi := min(maxRows, len(records)-plan.first)
+		largest := 0
+		for candidate := 1; candidate <= hi; candidate++ {
+			window := make([]CommonPrimaryLeafRecord, candidate)
+			for row := range window {
+				record := records[plan.first+row]
+				window[row] = CommonPrimaryLeafRecord{
+					Key: record.Key, Value: CommonPrimaryLeafValue{Inline: record.Value},
+				}
+			}
+			payload, buildErr := BuildCompactPrimaryStripePayload(
+				window, NewUnifiedPrimaryLeafBuilder(),
+			)
+			if buildErr == ErrCommonPrimaryLeafFull {
+				continue
+			}
+			if buildErr != nil {
+				t.Fatalf("plan %d candidate %d: %v", rank, candidate, buildErr)
+			}
+			need := PageHeaderSize + len(payload) + PageTrailerSize
+			extent := (need + int(physicalPageQuantum) - 1) &^
+				(int(physicalPageQuantum) - 1)
+			if extent <= CommonPrimaryLeafWideBytes {
+				largest = candidate
+			}
+		}
+		if count != largest {
+			t.Fatalf("plan %d selected %d rows; exhaustive maximum is %d",
+				rank, count, largest)
+		}
+	}
+	if !sawDrop || !sawRise {
+		t.Fatalf("phase corpus did not exercise both hint directions: drop=%t rise=%t",
+			sawDrop, sawRise)
+	}
 }
 
 func TestUnifiedPlannerBoundsLargePayloadRetention(t *testing.T) {
