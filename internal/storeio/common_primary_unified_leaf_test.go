@@ -1582,10 +1582,16 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 	records := make([]PrimaryGraphRecord, n)
 	for i := range n {
 		key := fmt.Appendf(nil, "doc:%08d", i)
+		note := make([]byte, 32)
+		state := uint64(i + 1)
+		for at := range note {
+			state = state*6364136223846793005 + 1442695040888963407
+			note[at] = byte('a' + state%26)
+		}
 		doc := fmt.Appendf(nil,
-			`{"id":%d,"name":"user-%d","country":"%s","score":%d,"active":%t,"profile":{"tier":"%s","region":"eu-west-1","joined":"2020-01-02"},"tags":["alpha","beta"],"note":"steady state, no anomalies observed"}`,
+			`{"id":%d,"name":"user-%d","country":"%s","score":%d,"active":%t,"profile":{"tier":"%s","region":"eu-west-1","joined":"2020-01-02"},"tags":["alpha","beta"],"note":"%s"}`,
 			i, i, []string{"PT", "US", "DE", "FR"}[i%4], i%1000, i%3 == 0,
-			[]string{"free", "pro", "team"}[i%3])
+			[]string{"free", "pro", "team"}[i%3], note)
 		records[i] = PrimaryGraphRecord{Key: key, Value: doc}
 	}
 	layout, err := MutableStoreLayout(physicalPageQuantum)
@@ -1603,7 +1609,7 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		}
 		plans, err := planCompactPrimaryLeaves(
 			tx.options.StoreID, records, CompactPrimaryStripeMaxRows,
-			CommonPrimaryLeafMaxExtentBytes,
+			CommonPrimaryLeafWideBytes,
 		)
 		if err != nil {
 			t.Fatalf("planUnifiedPrimaryLeaves: %v", err)
@@ -1616,7 +1622,7 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		t.Fatalf("plan count differs: %d vs %d", len(plans), len(again))
 	}
 	next := 0
-	builder := NewUnifiedPrimaryLeafBuilder()
+	retainedPayloads := 0
 	for at := range plans {
 		if plans[at].first != next || plans[at].last <= plans[at].first {
 			t.Fatalf("plan %d not contiguous: [%d,%d) after %d",
@@ -1626,28 +1632,106 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 			t.Fatalf("plan %d class %d", at, plans[at].class)
 		}
 		if again[at].first != plans[at].first || again[at].last != plans[at].last ||
-			again[at].extent != plans[at].extent {
+			again[at].extent != plans[at].extent ||
+			!bytes.Equal(again[at].payload, plans[at].payload) ||
+			len(again[at].records) != len(plans[at].records) {
 			t.Fatalf("plan %d differs across runs", at)
 		}
 		next = plans[at].last
+		window := make([]CommonPrimaryLeafRecord, plans[at].last-plans[at].first)
+		for row := range window {
+			record := records[plans[at].first+row]
+			window[row] = CommonPrimaryLeafRecord{
+				Key: record.Key, Value: CommonPrimaryLeafValue{Inline: record.Value},
+			}
+		}
+		fresh, err := BuildCompactPrimaryStripePayload(
+			window, NewUnifiedPrimaryLeafBuilder(),
+		)
+		if err != nil {
+			t.Fatalf("plan %d retained payload drift: %v", at, err)
+		}
 		dst := make([]byte, plans[at].extent)
-		if _, err := EncodeCompactPrimaryStripe(
-			dst,
-			CommonPrimaryLeafHeader{
-				StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
-				PageSize: uint32(plans[at].extent),
-			},
-			plans[at].records, builder,
-		); err != nil {
+		header := CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
+			PageSize: uint32(plans[at].extent),
+		}
+		var encodeErr error
+		if len(plans[at].payload) != 0 {
+			retainedPayloads++
+			if !bytes.Equal(fresh, plans[at].payload) {
+				t.Fatalf("plan %d retained payload differs from fresh encoding", at)
+			}
+			_, encodeErr = encodeCompactPrimaryStripePayload(
+				dst, header, plans[at].payload,
+			)
+		} else {
+			if len(plans[at].records) != len(window) {
+				t.Fatalf("plan %d retained neither bounded representation", at)
+			}
+			_, encodeErr = EncodeCompactPrimaryStripe(
+				dst, header, plans[at].records, NewUnifiedPrimaryLeafBuilder(),
+			)
+		}
+		if encodeErr != nil {
 			t.Fatalf("plan %d does not encode into %d: %v",
-				at, plans[at].extent, err)
+				at, plans[at].extent, encodeErr)
 		}
 	}
 	if next != n {
 		t.Fatalf("plans cover %d of %d records", next, n)
 	}
+	if retainedPayloads == 0 {
+		t.Fatal("planner retained no selected payloads")
+	}
 	t.Logf("planner: %d leaves for %d records; first extent %d rows %d",
 		len(plans), n, plans[0].extent, plans[0].last-plans[0].first)
+}
+
+func TestUnifiedPlannerBoundsLargePayloadRetention(t *testing.T) {
+	const rows = 64
+	records := make([]PrimaryGraphRecord, rows)
+	for row := range records {
+		value := []byte(`{"payload":"`)
+		for at := 0; at < 2048; at++ {
+			position := (row*37 + at*17 + (at>>5)*13) % 93
+			b := byte(' ' + position)
+			if b >= '"' {
+				b++
+			}
+			if b >= '\\' {
+				b++
+			}
+			value = append(value, b)
+		}
+		value = append(value, `"}`...)
+		records[row] = PrimaryGraphRecord{
+			Key: fmt.Appendf(nil, "large:%08d", row), Value: value,
+		}
+	}
+	plans, err := planCompactPrimaryLeaves(
+		unifiedTestStoreID(), records, CompactPrimaryStripeMaxRows,
+		CommonPrimaryLeafWideBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) < 2 {
+		t.Fatalf("large payload fixture produced %d plan, want multiple", len(plans))
+	}
+	plannedRows := 0
+	for at := range plans {
+		if len(plans[at].payload) != 0 || len(plans[at].records) == 0 {
+			t.Fatalf(
+				"plan %d retained payload=%d records=%d, want bounded records",
+				at, len(plans[at].payload), len(plans[at].records),
+			)
+		}
+		plannedRows += len(plans[at].records)
+	}
+	if plannedRows != rows {
+		t.Fatalf("large payload planned rows=%d want=%d", plannedRows, rows)
+	}
 }
 
 // BenchmarkUnifiedAppendRawByKey measures the point-read splice: hashed slot

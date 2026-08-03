@@ -156,7 +156,10 @@ func CreateFromPrimary(
 				ErrPrimaryCutoverUnsupported, pageCount+1,
 			)
 		}
-		bufferCount = requestedBuffers
+		// BufferCount sizes the long-lived mutation committer. This committer
+		// publishes exactly one fully planned transaction and closes, so retaining
+		// caller surplus cannot increase concurrency or absorb a later batch.
+		// Keep the explicit under-provision check, but stage only the exact graph.
 	}
 	if bufferCount > 1<<15 {
 		return 0, fmt.Errorf(
@@ -338,12 +341,13 @@ func CreateFromPrimary(
 // canonicalizePrimaryBulkRecords rewrites every record value to its vibejson
 // canonical form. Already-canonical values — the steady state for
 // engine-generated input — are left borrowed from the
-// bulk snapshot; rewritten spellings live in one arena sized up front. The
-// arena never reallocates because canonicalization can only shrink or keep a
-// document's length under the pinned encoder: whitespace is dropped and every
-// escape normalization collapses (raw control bytes are illegal JSON, so a
-// control character's source spelling is never shorter than its canonical
-// one), which the capacity check below still enforces defensively.
+// bulk snapshot; rewritten spellings live in one arena allocated lazily at the
+// first rewrite and sized for the complete source corpus. The arena never
+// reallocates because canonicalization can only shrink or keep a document's
+// length under the pinned encoder: whitespace is dropped and every escape
+// normalization collapses (raw control bytes are illegal JSON, so a control
+// character's source spelling is never shorter than its canonical one), which
+// the capacity check below still enforces defensively.
 func canonicalizePrimaryBulkRecords(
 	records []storeio.PrimaryGraphRecord,
 	indexOptions document.IndexOptions,
@@ -352,7 +356,7 @@ func canonicalizePrimaryBulkRecords(
 	for at := range records {
 		total += len(records[at].Value)
 	}
-	arena := make([]byte, 0, total)
+	var arena []byte
 	var ws storeio.CanonicalWorkspace
 	entryStore := make([]vibejson.IndexEntry, 0, 128)
 	for at := range records {
@@ -374,6 +378,9 @@ func canonicalizePrimaryBulkRecords(
 		}
 		if storeio.IndexIsCanonical(index, &ws) {
 			continue
+		}
+		if arena == nil {
+			arena = make([]byte, 0, total)
 		}
 		off := len(arena)
 		out, err := storeio.AppendCanonicalIndexed(arena, index, &ws)

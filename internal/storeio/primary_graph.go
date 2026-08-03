@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"fmt"
+	"unsafe"
 )
 
 // PrimaryGraphRecord is one immutable key/value row supplied to
@@ -22,13 +23,24 @@ type PrimaryGraphPlacement struct {
 }
 
 type primaryLeafPlan struct {
-	first   int
-	last    int
-	class   CommonPrimaryLeafClass
+	first int
+	last  int
+	class CommonPrimaryLeafClass
+	// payload is the exact validated compact stripe produced while selecting
+	// extent. It is retained only when no larger than the descriptor plan it
+	// replaces, and prevents graph construction from parsing and encoding the
+	// same immutable rows a second time.
+	payload []byte
+	// records is the bounded-memory fallback for payloads larger than their row
+	// descriptors. Exactly one of payload and records is retained.
 	records []CommonPrimaryLeafRecord
 	// extent is the planner-selected physical page size.
 	extent int
 }
+
+// The adaptive retention decision compares the two actual Go-heap plans. It is
+// intentionally architecture-sized rather than an on-disk format constant.
+const primaryLeafPlanRecordBytes = int(unsafe.Sizeof(CommonPrimaryLeafRecord{}))
 
 // PrimaryGraphPlan is one immutable, exact compact-leaf plan shared by bulk
 // reservation, optional exact-index sizing, and graph construction. It borrows
@@ -413,7 +425,13 @@ func planCompactPrimaryLeaves(
 			}
 			window = append(window, record)
 		}
+		builtCount := 0
+		var builtPayload []byte
 		fits := func(count int) (int, bool, error) {
+			// A failed larger probe may have reused the builder's payload backing
+			// array before returning. Invalidate the preceding borrowed result so
+			// final selection rebuilds it rather than retaining mutated scratch.
+			builtCount = 0
 			payload, err := BuildCompactPrimaryStripePayload(window[:count], builder)
 			if err == ErrCommonPrimaryLeafFull {
 				return maxExtent + int(physicalPageQuantum), false, nil
@@ -421,6 +439,7 @@ func planCompactPrimaryLeaves(
 			if err != nil {
 				return 0, false, err
 			}
+			builtCount, builtPayload = count, payload
 			need := PageHeaderSize + len(payload) + PageTrailerSize
 			quantum := int(physicalPageQuantum)
 			extent := (need + quantum - 1) &^ (quantum - 1)
@@ -454,12 +473,29 @@ func planCompactPrimaryLeaves(
 		if count == 0 {
 			return nil, fmt.Errorf("%w: compact primary record exceeds extent", ErrInvalidWrite)
 		}
-		plans = append(plans, primaryLeafPlan{
+		if builtCount != count {
+			var err error
+			builtPayload, err = BuildCompactPrimaryStripePayload(window[:count], builder)
+			if err != nil {
+				return nil, err
+			}
+		}
+		need := PageHeaderSize + len(builtPayload) + PageTrailerSize
+		plannedExtent := (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+		if plannedExtent != extent || plannedExtent > maxExtent {
+			return nil, fmt.Errorf("%w: compact primary plan drift", ErrInvalidWrite)
+		}
+		plan := primaryLeafPlan{
 			first: first, last: first + count,
-			class:   CommonPrimaryLeafCompact,
-			records: append([]CommonPrimaryLeafRecord(nil), window[:count]...),
-			extent:  extent,
-		})
+			class:  CommonPrimaryLeafCompact,
+			extent: extent,
+		}
+		if len(builtPayload) <= count*primaryLeafPlanRecordBytes {
+			plan.payload = append([]byte(nil), builtPayload...)
+		} else {
+			plan.records = append([]CommonPrimaryLeafRecord(nil), window[:count]...)
+		}
+		plans = append(plans, plan)
 		first += count
 	}
 	return plans, nil
@@ -472,7 +508,7 @@ func buildPrimaryLeaves(
 	placements []PrimaryGraphPlacement,
 ) ([]primaryBuiltLeaf, error) {
 	built := make([]primaryBuiltLeaf, len(plans))
-	unifiedBuilder := NewUnifiedPrimaryLeafBuilder()
+	var unifiedBuilder *UnifiedPrimaryLeafBuilder
 	for rank := range plans {
 		tabletID := uint32(rank / TabletLocalIdentityLocalCount)
 		localID := uint32(rank % TabletLocalIdentityLocalCount)
@@ -481,8 +517,10 @@ func buildPrimaryLeaves(
 		if !ok || !logicalOK {
 			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
 		}
-		if plans[rank].class != CommonPrimaryLeafCompact ||
-			plans[rank].extent == 0 {
+		retainedPayload := len(plans[rank].payload) != 0
+		retainedRecords := len(plans[rank].records) != 0
+		if plans[rank].class != CommonPrimaryLeafCompact || plans[rank].extent == 0 ||
+			retainedPayload == retainedRecords {
 			return nil, fmt.Errorf("%w: non-unified primary plan", ErrInvalidWrite)
 		}
 		pageSize := uint32(plans[rank].extent)
@@ -494,10 +532,21 @@ func buildPrimaryLeaves(
 			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
 			Bucket: BucketID(bucket), PageSize: pageSize,
 		}
-		if _, err := EncodeCompactPrimaryStripe(
-			page.Bytes(), leafHeader, plans[rank].records, unifiedBuilder,
-		); err != nil {
-			return nil, err
+		var encodeErr error
+		if retainedPayload {
+			_, encodeErr = encodeCompactPrimaryStripePayload(
+				page.Bytes(), leafHeader, plans[rank].payload,
+			)
+		} else {
+			if unifiedBuilder == nil {
+				unifiedBuilder = NewUnifiedPrimaryLeafBuilder()
+			}
+			_, encodeErr = EncodeCompactPrimaryStripe(
+				page.Bytes(), leafHeader, plans[rank].records, unifiedBuilder,
+			)
+		}
+		if encodeErr != nil {
+			return nil, encodeErr
 		}
 		if placements != nil {
 			if err := recordPrimaryPlacements(
@@ -526,18 +575,13 @@ func recordPrimaryPlacements(
 	plan primaryLeafPlan,
 	bucket BucketID,
 ) error {
-	if plan.class != CommonPrimaryLeafCompact {
+	if plan.class != CommonPrimaryLeafCompact || plan.first < 0 ||
+		plan.last > len(input) || plan.last-plan.first > CommonPrimaryLeafWideSlots {
 		return fmt.Errorf("%w: non-unified placement plan", ErrInvalidWrite)
 	}
-	if plan.last-plan.first > CommonPrimaryLeafWideSlots {
-		return fmt.Errorf("%w: compact ordinal placement width", ErrInvalidWrite)
-	}
 	for at := plan.first; at < plan.last; at++ {
-		if !bytes.Equal(input[at].Key, plan.records[at-plan.first].Key) {
-			return fmt.Errorf("%w: unified placement input", ErrInvalidWrite)
-		}
 		placements[at] = PrimaryGraphPlacement{
-			Bucket: bucket, Slot: plan.records[at-plan.first].Slot,
+			Bucket: bucket, Slot: uint8(at - plan.first),
 		}
 	}
 	return nil
