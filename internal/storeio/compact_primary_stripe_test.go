@@ -115,6 +115,38 @@ func TestCompactPrimaryStripeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCompactPreparedPrefixesMatchOneShot(t *testing.T) {
+	for _, high := range []bool{false, true} {
+		corpus := benchcorpus.Corpus(512, high)
+		records := make([]CommonPrimaryLeafRecord, len(corpus))
+		for row := range corpus {
+			records[row] = CommonPrimaryLeafRecord{
+				Key:   []byte(corpus[row].Key),
+				Value: CommonPrimaryLeafValue{Inline: corpus[row].JSON},
+			}
+		}
+		prepared := NewUnifiedPrimaryLeafBuilder()
+		if err := prepareCompactPrimaryStripe(records, prepared); err != nil {
+			t.Fatal(err)
+		}
+		for _, count := range []int{512, 1, 257, 64, 511, 65, 2, 256, 127} {
+			got, err := buildPreparedCompactPrimaryStripePayload(records[:count], prepared)
+			if err != nil {
+				t.Fatalf("high=%t count=%d prepared: %v", high, count, err)
+			}
+			want, err := BuildCompactPrimaryStripePayload(
+				records[:count], NewUnifiedPrimaryLeafBuilder(),
+			)
+			if err != nil {
+				t.Fatalf("high=%t count=%d one-shot: %v", high, count, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("high=%t count=%d prepared bytes differ", high, count)
+			}
+		}
+	}
+}
+
 func TestCompactPrimaryStripeOverflowRoundTrip(t *testing.T) {
 	storeID := unifiedTestStoreID()
 	overflow := PageRef{

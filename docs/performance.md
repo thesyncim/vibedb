@@ -123,6 +123,11 @@ successive probes neither clear a map nor retain per-key objects; collisions
 still compare complete scalar bytes. Dictionaries below 16 values stay on a
 direct comparison lane. This reduced the high-cardinality load again to about
 1.21 s while keeping the low-cardinality load at about 0.24 s.
+Exact fit probes now share one immutable parse and canonical extraction for
+their complete 4,096-row planning window. Each candidate still serializes its
+exact prefix, and prepared-prefix tests compare those bytes with independent
+one-shot builds. This reduced the high-cardinality load again to about 1.02 s
+without changing the low-cardinality result or retained allocation.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
 setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf

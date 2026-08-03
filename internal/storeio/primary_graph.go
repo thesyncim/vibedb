@@ -426,6 +426,9 @@ func planCompactPrimaryLeaves(
 			}
 			window = append(window, record)
 		}
+		if err := prepareCompactPrimaryStripe(window, builder); err != nil {
+			return nil, err
+		}
 		builtCount := 0
 		var builtPayload []byte
 		fits := func(count int) (int, bool, error) {
@@ -433,7 +436,7 @@ func planCompactPrimaryLeaves(
 			// array before returning. Invalidate the preceding borrowed result so
 			// final selection rebuilds it rather than retaining mutated scratch.
 			builtCount = 0
-			payload, err := BuildCompactPrimaryStripePayload(window[:count], builder)
+			payload, err := buildPreparedCompactPrimaryStripePayload(window[:count], builder)
 			if err == ErrCommonPrimaryLeafFull {
 				return maxExtent + int(physicalPageQuantum), false, nil
 			}
@@ -536,7 +539,7 @@ func planCompactPrimaryLeaves(
 		}
 		if builtCount != count {
 			var err error
-			builtPayload, err = BuildCompactPrimaryStripePayload(window[:count], builder)
+			builtPayload, err = buildPreparedCompactPrimaryStripePayload(window[:count], builder)
 			if err != nil {
 				return nil, err
 			}

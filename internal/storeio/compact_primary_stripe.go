@@ -36,22 +36,49 @@ func BuildCompactPrimaryStripePayload(
 	records []CommonPrimaryLeafRecord,
 	builder *UnifiedPrimaryLeafBuilder,
 ) ([]byte, error) {
+	if err := prepareCompactPrimaryStripe(records, builder); err != nil {
+		return nil, err
+	}
+	return buildPreparedCompactPrimaryStripePayload(records, builder)
+}
+
+func prepareCompactPrimaryStripe(
+	records []CommonPrimaryLeafRecord,
+	builder *UnifiedPrimaryLeafBuilder,
+) error {
 	if builder == nil || len(records) > CompactPrimaryStripeMaxRows {
-		return nil, fmt.Errorf("%w: compact stripe input", ErrInvalidWrite)
+		return fmt.Errorf("%w: compact stripe input", ErrInvalidWrite)
 	}
 	for row := range records {
 		if len(records[row].Key) == 0 || len(records[row].Key) > CommonPrimaryLeafMaxKeyBytes ||
 			(records[row].Value.IsOverflow() == (len(records[row].Value.Inline) != 0)) ||
 			row != 0 && bytes.Compare(records[row-1].Key, records[row].Key) >= 0 {
-			return nil, fmt.Errorf("%w: compact stripe record", ErrInvalidWrite)
+			return fmt.Errorf("%w: compact stripe record", ErrInvalidWrite)
 		}
 	}
 	if err := builder.extract(records); err != nil {
-		return nil, err
+		return err
 	}
-	shapeCount := len(builder.shapes)
+	return nil
+}
+
+func buildPreparedCompactPrimaryStripePayload(
+	records []CommonPrimaryLeafRecord,
+	builder *UnifiedPrimaryLeafBuilder,
+) ([]byte, error) {
+	if builder == nil || len(records) > len(builder.records) ||
+		len(records) > CompactPrimaryStripeMaxRows {
+		return nil, fmt.Errorf("%w: prepared compact stripe input", ErrInvalidWrite)
+	}
+	shapeCount := 0
+	for row := range records {
+		shape := int(builder.rows[row].shape)
+		if shape >= 0 {
+			shapeCount = max(shapeCount, shape+1)
+		}
+	}
 	if shapeCount > len(records) ||
-		shapeCount > int(^uint16(0)) {
+		shapeCount > len(builder.shapes) || shapeCount > int(^uint16(0)) {
 		return nil, fmt.Errorf("%w: compact stripe shapes", ErrInvalidWrite)
 	}
 	overflowCount := 0
@@ -84,7 +111,7 @@ func BuildCompactPrimaryStripePayload(
 	scratch.shapeCodes = slices.Grow(scratch.shapeCodes[:0], shapeCodeBytes)[:shapeCodeBytes]
 	clear(scratch.shapeCodes)
 	shapeCodes := scratch.shapeCodes
-	for row := range builder.rows {
+	for row := range records {
 		shape := int(builder.rows[row].shape)
 		if shape < 0 {
 			if !records[row].Value.IsOverflow() {
