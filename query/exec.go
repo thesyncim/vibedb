@@ -21,6 +21,7 @@ const (
 	sourceHeapSnapshot
 	sourceFileSnapshot
 	sourceFileOverlay
+	sourceSnapshotOverlay
 	sourceDatabase
 	sourceFileDatabase
 	sourceRelationSpool
@@ -28,8 +29,9 @@ const (
 
 // A Source is the collection a compiled query runs over. Construct one with
 // exactly one of [FromSegment], [FromSnapshot], [FromFile],
-// [FromFileOverlay], [FromDatabase], or [FromFileDatabase]; the zero Source
-// names nothing and every execution rejects it.
+// [FromFileOverlay], [FromSnapshotOverlay], [FromDatabase], or
+// [FromFileDatabase]; the zero Source names nothing and every execution
+// rejects it.
 //
 // Source is a concrete discriminated struct rather than an interface. A
 // Segment, a heap snapshot, a durable snapshot, an overlay, and a coherent
@@ -41,10 +43,11 @@ const (
 type Source struct {
 	kind sourceKind
 	// payload is a *store.Segment for sourceSegment and a *FileOverlaySource
-	// for sourceFileOverlay. Those variants are disjoint, so one GC-visible
-	// pointer keeps Source the same size it had before overlay support; adding
-	// an interface field here made every ordinary database/sql query retain 16
-	// extra bytes even though it never used an overlay.
+	// for sourceFileOverlay and sourceSnapshotOverlay. Those variants are
+	// disjoint, so one GC-visible pointer keeps Source the same size it had
+	// before overlay support; adding an interface field here made every
+	// ordinary database/sql query retain 16 extra bytes even though it never
+	// used an overlay.
 	payload unsafe.Pointer
 	heap    store.Snapshot
 	file    *durable.Snapshot
@@ -59,7 +62,7 @@ func (s Source) subquerySource(outer, collection string) (Source, error) {
 		return FromDatabase(s.catalog, collection), nil
 	case sourceFileDatabase:
 		return FromFileDatabase(s.files, collection), nil
-	case sourceHeapSnapshot, sourceFileSnapshot, sourceSegment:
+	case sourceHeapSnapshot, sourceFileSnapshot, sourceSegment, sourceSnapshotOverlay:
 		if collection == outer {
 			return s, nil
 		}
@@ -165,6 +168,23 @@ func FromFileOverlay(s *durable.Snapshot, overlay *FileOverlaySource) Source {
 	}
 }
 
+// FromSnapshotOverlay names one heap [store.Snapshot] plus a bounded
+// staged-write layer. It is the Memory-profile dual of [FromFileOverlay]:
+// overlay hits shadow the snapshot row, inserts append after the base rows,
+// and [FileOverlay.LenDelta] corrects visible cardinality. Joins and
+// correlated subqueries are rejected the same way [FromSnapshot] rejects them
+// — there is no catalog behind this Source.
+//
+// The snapshot and overlay stay owned by the caller and must remain valid until
+// execution returns. A nil overlay is rejected; callers with no writes use
+// [FromSnapshot], which retains the ordinary heap fast path unchanged.
+func FromSnapshotOverlay(s store.Snapshot, overlay *FileOverlaySource) Source {
+	return Source{
+		kind: sourceSnapshotOverlay, heap: s,
+		payload: unsafe.Pointer(overlay),
+	}
+}
+
 // FromDatabase names collection as the driving side of a query executed
 // against catalog, a [store.DatabaseSnapshot] capturing every collection at one
 // instant. Execution over the driving collection is exactly [FromSnapshot]'s;
@@ -257,6 +277,13 @@ type Exec struct {
 	// handle its options used to carry, and it shares the general Workspace for
 	// candidate planning rather than nesting a second copy of one.
 	file fileWorkspace
+
+	// overlayDocs is the retained materialization scratch [FromSnapshotOverlay]
+	// refills before handing the merged view to the Segment executor. Keeping
+	// it on Exec is what makes a warmed overlay read reuse Segment capacity
+	// instead of allocating a fresh collection on every RunInto.
+	overlayDocs  store.Segment
+	overlayMerge snapshotOverlayMerge
 }
 
 // Release drops every buffer e retains, returning it to its zero state.
@@ -273,6 +300,8 @@ func (e *Exec) Release() {
 	e.Result.Release()
 	e.Workspace.Release()
 	e.file.release()
+	e.overlayDocs = store.Segment{}
+	e.overlayMerge = snapshotOverlayMerge{}
 	e.Stats = ExecStats{}
 }
 
@@ -395,7 +424,7 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 	}
 	e.Workspace.heapWorkParent = nil
 	switch src.kind {
-	case sourceSegment, sourceHeapSnapshot, sourceDatabase, sourceRelationSpool:
+	case sourceSegment, sourceHeapSnapshot, sourceSnapshotOverlay, sourceDatabase, sourceRelationSpool:
 		memoryBytes, limitErr := normalizeHeapMemoryBytes(e.Options)
 		if limitErr != nil {
 			return limitErr
@@ -455,6 +484,16 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 			overlay = (*FileOverlaySource)(src.payload).overlay
 		}
 		return p.runFileOverlayInto(e, src.file, overlay)
+	case sourceSnapshotOverlay:
+		if err := rejectJoins(p, "FromSnapshotOverlay"); err != nil {
+			return err
+		}
+		var overlay FileOverlay
+		if src.payload != nil {
+			overlay = (*FileOverlaySource)(src.payload).overlay
+		}
+		e.Stats = ExecStats{}
+		return p.runSnapshotOverlayInto(e, src.heap, overlay)
 	case sourceFileDatabase:
 		driving, ok := src.files.Collection(src.name)
 		if !ok {
@@ -479,7 +518,7 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		return fmt.Errorf(
 			"query: the zero Source names no collection; " +
 				"build one with FromSegment, FromSnapshot, FromFile, FromFileOverlay, " +
-				"FromDatabase, or FromFileDatabase",
+				"FromSnapshotOverlay, FromDatabase, or FromFileDatabase",
 		)
 	}
 }
