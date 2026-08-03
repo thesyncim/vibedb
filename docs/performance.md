@@ -118,6 +118,11 @@ existing dictionary-first tie rule are unchanged. Avoiding discarded
 dictionary work reduced the same high-cardinality bulk load again to about
 1.51 s, while the low-cardinality load improved from about 0.30 s to 0.24 s.
 Both complete database files remain exactly the same size.
+The borrowed-value census now uses a bounded generation-stamped hash table, so
+successive probes neither clear a map nor retain per-key objects; collisions
+still compare complete scalar bytes. Dictionaries below 16 values stay on a
+direct comparison lane. This reduced the high-cardinality load again to about
+1.21 s while keeping the low-cardinality load at about 0.24 s.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
 setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf

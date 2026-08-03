@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/maphash"
 	"math/bits"
 	"slices"
 	"strconv"
 
 	"github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // Compact scalar streams are the independently decodable columns inside the
@@ -30,6 +30,7 @@ const (
 	compactStreamDeltaPack
 	compactStreamAlphabet
 	compactStreamKindLimit
+	compactDictionaryHashThreshold = 16
 )
 
 type compactStreamEncoding struct {
@@ -45,14 +46,18 @@ type compactStreamEncoding struct {
 // before reusing this workspace for the next column, so one fixed candidate
 // set serves every stream without per-column allocation churn.
 type compactStreamScratch struct {
-	candidates    [8]compactStreamEncoding
-	data          [8][]byte
-	dict          [8][][]byte
-	alphabet      [8][]byte
-	integers      []int64
-	dates         []int32
-	parsed        []uint64
-	dictionaryIDs map[string]uint32
+	candidates      [8]compactStreamEncoding
+	data            [8][]byte
+	dict            [8][][]byte
+	alphabet        [8][]byte
+	integers        []int64
+	dates           []int32
+	parsed          []uint64
+	dictionaryTable []uint32
+	dictionaryStamp []uint32
+	dictionaryEpoch uint32
+	dictionarySeed  maphash.Seed
+	dictionaryReady bool
 }
 
 func (e compactStreamEncoding) encodedBytes() int {
@@ -168,23 +173,40 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 }
 
 func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
-	if s.dictionaryIDs == nil {
-		s.dictionaryIDs = make(map[string]uint32, len(values))
-	} else {
-		clear(s.dictionaryIDs)
-	}
 	dictionary := slices.Grow(s.dict[0][:0], len(values))[:0]
-	dictionaryBytes := 0
-	for _, value := range values {
-		key := byteview.String(value)
-		if _, found := s.dictionaryIDs[key]; found {
-			continue
-		}
-		s.dictionaryIDs[key] = uint32(len(dictionary))
-		dictionary = append(dictionary, value)
-		dictionaryBytes += len(value)
-	}
 	s.dict[0] = dictionary
+	dictionaryBytes := 0
+	hashed := false
+	for _, value := range values {
+		if hashed {
+			if _, found := s.dictionaryLookup(value); found {
+				continue
+			}
+		} else {
+			found := false
+			for _, existing := range dictionary {
+				if bytes.Equal(existing, value) {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+		}
+		dictionary = append(dictionary, value)
+		s.dict[0] = dictionary
+		dictionaryBytes += len(value)
+		if hashed {
+			s.dictionaryInsert(value, uint32(len(dictionary)-1))
+		} else if len(dictionary) == compactDictionaryHashThreshold {
+			s.resetDictionaryTable(len(values))
+			for id, existing := range dictionary {
+				s.dictionaryInsert(existing, uint32(id))
+			}
+			hashed = true
+		}
+	}
 	width := bits.Len(uint(max(0, len(dictionary)-1)))
 	return compactStreamHeader + 2*len(dictionary) + dictionaryBytes +
 		(len(values)*width+7)/8
@@ -193,26 +215,81 @@ func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
 func (s *compactStreamScratch) finishDictionary(values [][]byte) compactStreamEncoding {
 	dictionary := s.dict[0]
 	slices.SortFunc(dictionary, bytes.Compare)
-	clear(s.dictionaryIDs)
-	for id, value := range dictionary {
-		s.dictionaryIDs[byteview.String(value)] = uint32(id)
-	}
 	width := bits.Len(uint(max(0, len(dictionary)-1)))
 	dataBytes := (len(values)*width + 7) / 8
 	data := slices.Grow(s.data[0][:0], dataBytes)[:dataBytes]
 	clear(data)
-	for row, value := range values {
-		id, found := s.dictionaryIDs[byteview.String(value)]
-		if !found {
-			panic("compact dictionary planner lost value")
+	if len(dictionary) < compactDictionaryHashThreshold {
+		for row, value := range values {
+			id, found := slices.BinarySearchFunc(dictionary, value, bytes.Compare)
+			if !found {
+				panic("compact dictionary planner lost value")
+			}
+			compactPutBits(data, row*width, width, uint64(id))
 		}
-		compactPutBits(data, row*width, width, uint64(id))
+	} else {
+		s.resetDictionaryTable(len(dictionary))
+		for id, value := range dictionary {
+			s.dictionaryInsert(value, uint32(id))
+		}
+		for row, value := range values {
+			id, found := s.dictionaryLookup(value)
+			if !found {
+				panic("compact dictionary planner lost value")
+			}
+			compactPutBits(data, row*width, width, uint64(id))
+		}
 	}
 	s.data[0] = data
 	return compactStreamEncoding{
 		kind: compactStreamDictionary, width: uint8(width), count: len(values),
 		data: data, dict: dictionary,
 	}
+}
+
+func (s *compactStreamScratch) resetDictionaryTable(entries int) {
+	size := 2
+	for size < entries*2 {
+		size <<= 1
+	}
+	if len(s.dictionaryTable) < size {
+		s.dictionaryTable = make([]uint32, size)
+		s.dictionaryStamp = make([]uint32, size)
+		s.dictionaryEpoch = 1
+	} else {
+		s.dictionaryEpoch++
+		if s.dictionaryEpoch == 0 {
+			clear(s.dictionaryStamp)
+			s.dictionaryEpoch = 1
+		}
+	}
+	if !s.dictionaryReady {
+		s.dictionarySeed = maphash.MakeSeed()
+		s.dictionaryReady = true
+	}
+}
+
+func (s *compactStreamScratch) dictionaryLookup(value []byte) (uint32, bool) {
+	mask := uint64(len(s.dictionaryTable) - 1)
+	at := maphash.Bytes(s.dictionarySeed, value) & mask
+	for s.dictionaryStamp[at] == s.dictionaryEpoch {
+		id := s.dictionaryTable[at]
+		if bytes.Equal(s.dict[0][id], value) {
+			return id, true
+		}
+		at = (at + 1) & mask
+	}
+	return 0, false
+}
+
+func (s *compactStreamScratch) dictionaryInsert(value []byte, id uint32) {
+	mask := uint64(len(s.dictionaryTable) - 1)
+	at := maphash.Bytes(s.dictionarySeed, value) & mask
+	for s.dictionaryStamp[at] == s.dictionaryEpoch {
+		at = (at + 1) & mask
+	}
+	s.dictionaryTable[at] = id
+	s.dictionaryStamp[at] = s.dictionaryEpoch
 }
 
 func (s *compactStreamScratch) encodeFront(slot int, values [][]byte) compactStreamEncoding {
