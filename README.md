@@ -257,6 +257,40 @@ The [capability matrix](docs/capabilities.md) is the executable authority for
 which combinations of operations, indexes, transactions, and durability are
 supported.
 
+## Distributed tier (experimental, server-only)
+
+VibeDB is embedded-first: none of the four embedded interfaces above require a
+cluster, and the default embedded behavior is unchanged whether or not a
+placement configuration is supplied. The repository also carries an early,
+server-only distributed tier plus the routing types it shares with one opt-in
+embedded facade:
+
+- a leader-only shard service (`shardservice`) that executes admitted SQL
+  locally through a borrowed `sql/driver` session;
+- a stateless routing gateway (`gateway`) that pins one immutable catalog
+  generation and dispatches bounded, leader-only reads to the shards;
+- the frozen placement scalar and tuple codec (`distribution`) used as
+  cross-shard routing identity; and
+- the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server
+  tier.
+
+The shard service, gateway, and their binaries are server-only and not part of
+the embedded API. The one embedded touch point is opt-in and carries no
+network: the `sql/driver` local-cluster facade (`OpenCluster` /
+`OpenClusterConnector`) runs the same placement and write preflight over the
+shared `distribution` types against a single embedded store as a degenerate
+single-shard local cluster.
+
+This tier is leader-only: it has no replication, failover, or online
+resharding. It is unreleased and unstable like the rest of VibeDB. The
+[capability matrix](docs/capabilities.md) covers the embedded surface only.
+
+Read the design before relying on any of it:
+
+- [Distributed sharding](docs/design/distributed-sharding.md)
+- [Vitess-compatible routing](docs/design/vitess-compatible-routing.md)
+- [Placement tuple format v1](docs/design/distribution-tuple-format-v1.md)
+
 ## Performance
 
 VibeDB is designed for compiled queries, reusable execution storage, bounded

@@ -628,8 +628,18 @@ for another.
 
 ## Current product boundaries
 
-The repository currently has no replication, backup manager, point-in-time
-restore, distributed execution, or cross-file transaction. The PostgreSQL
+The repository's embedded API has no replication, failover, backup manager,
+point-in-time restore, or cross-file transaction. Distributed execution now
+exists, but only as a separate, unreleased, server-only tier the embedded API
+does not expose: a leader-only shard service (`shardservice`) and a stateless
+routing gateway (`gateway`), run by the `cmd/vibedb-shard` and
+`cmd/vibedb-gateway` binaries. They route on the frozen placement scalar and
+tuple codec (`distribution`), which the opt-in single-shard `sql/driver`
+local-cluster facade (`OpenCluster`, no network) also uses and which is
+therefore reachable from the embedded surface. That tier is itself leader-only —
+no replication, failover, or online resharding — and its design contract lives
+in [distributed sharding](design/distributed-sharding.md) and
+[Vitess-compatible routing](design/vitess-compatible-routing.md). The PostgreSQL
 protocol-v3 server can expose the typed SQL catalog directly;
 that path supports the documented DDL, DML, SELECT, prepared-statement, join,
 and transaction subset. A nested integration module exercises pinned pgx v5
