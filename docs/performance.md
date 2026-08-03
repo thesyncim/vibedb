@@ -24,7 +24,7 @@ are the next two measured performance targets.
 
 The log-filter path has a fused execution lane for `COUNT(*)` equality queries.
 On the 100,000-row low-cardinality log-like probe, the current fair adapter
-measured about 0.76 µs for a random point read, 0.069 ms for an unindexed
+measured about 0.8 µs for a random point read, 0.069 ms for an unindexed
 equality count, and 5.2 µs for the same count through an exact `country` index.
 The unindexed result is a complete 100,000-row scan (945 matches, about
 0.69 ns/document), not candidate pruning: the storage cursor resolves the
@@ -115,9 +115,9 @@ files, matching the ClickHouse per-table accounting.
 | ClickHouse typed, `ORDER BY key`, no skipping index | **2,713,077** | **27.13** | about **1.49 ms** |
 | ClickHouse typed, `ORDER BY (country, key)` | 2,992,629 | 29.93 | about 1.34 ms |
 | ClickHouse raw JSON, `ORDER BY key` | 4,565,499 | 45.65 | not measured in this control |
-| VibeDB compact default, complete database file | 1,118,208 | **11.18** | about **0.069 ms**, zero allocations, through the warmed public query API |
+| VibeDB compact default, complete database file | 1,019,904 | **10.20** | about **0.069 ms**, zero allocations, through the warmed public query API |
 
-The compact VibeDB database file is 2.43× smaller than the fair typed
+The compact VibeDB database file is 2.66× smaller than the fair typed
 ClickHouse table. Its warmed public query path is about 21.6× faster in this
 control while scanning all 100,000 field IDs; it uses no index, candidate list,
 or data skipping. The aligned ClickHouse row is kept separate because
@@ -136,16 +136,17 @@ ClickHouse table. Packing or a generic codec alone is consequently not enough.
 The compact stream is now the unconditional development-format primary leaf
 for empty creation, bulk loading, point reads, ordered scans, exact-index
 posting enumeration, mutation folds, verification, and salvage. The same
-100,000-row low-cardinality corpus occupies 1,003,520 physical leaf bytes
-(10.04 bytes/document); catalog, tablet, root, and allocator pages bring the
-complete file to 11.18 bytes/document. The shape-identical high-cardinality
-variant occupies 119.77 bytes/document as a complete file, preventing the low
+100,000-row low-cardinality corpus occupies 905,216 physical leaf bytes
+(9.05 bytes/document); catalog, tablet, root, and allocator pages bring the
+complete file to 10.20 bytes/document. The shape-identical high-cardinality
+variant occupies 121.24 bytes/document as a complete file, preventing the low
 cardinality result from hiding an irreversible or corpus-eliding encoding.
 Every key and scalar codec is decoded byte-for-byte in the format tests.
 
 The winning ingredients are generic: template-hole transposition; bit-packed
-dictionaries and frame-of-reference integers; delta integers; validated
-Gregorian date packing; bounded-restart front coding; and a reversible
+dictionaries and frame-of-reference integers; block-packed delta integers;
+12-byte self-delimiting stream headers with 16-bit in-leaf dictionary ends;
+validated Gregorian date packing; bounded-restart front coding; and a reversible
 single-numeric-run string codec that applies equally to keys such as
 `doc:00001234` and values such as `"user-1234"`. It does not infer one field
 from another, omit values, add a filter index, prune rows, or derive one field

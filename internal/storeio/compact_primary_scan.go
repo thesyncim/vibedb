@@ -19,6 +19,7 @@ type compactStreamSequentialState struct {
 	next   int
 	cursor int
 	value  int64
+	width  int
 }
 
 // CompactPrimaryScanDecoder retains bounded sequential scalar state for one
@@ -123,6 +124,7 @@ func (s *compactStreamSequentialState) appendValue(
 	prefix := 0
 	switch v.kind {
 	case compactStreamDelta:
+	case compactStreamDeltaPack:
 	case compactStreamPrefixInt:
 		if len(v.data) < 2 || v.data[0]&2 != 0 {
 			return v.appendValue(dst, row)
@@ -134,7 +136,21 @@ func (s *compactStreamSequentialState) appendValue(
 	if row < 0 || row >= v.count || row != s.next {
 		return v.appendValue(dst, row)
 	}
-	if row%compactStreamRestart == 0 {
+	packedDelta := v.kind == compactStreamDeltaPack ||
+		v.kind == compactStreamPrefixInt && v.data[0]&4 != 0
+	if packedDelta {
+		if row%compactStreamRestart == 0 {
+			block := row / compactStreamRestart
+			s.cursor = int(binary.LittleEndian.Uint32(v.data[prefix+block*4:]))
+			s.value = int64(binary.LittleEndian.Uint64(v.data[s.cursor:]))
+			s.width = int(v.data[s.cursor+8])
+			s.cursor += 9
+		} else {
+			within := row%compactStreamRestart - 1
+			u := compactReadBits(v.data[s.cursor:], within*s.width, s.width)
+			s.value += int64(u>>1) ^ -int64(u&1)
+		}
+	} else if row%compactStreamRestart == 0 {
 		block := row / compactStreamRestart
 		at := prefix + block*4
 		if len(v.data)-at < 4 {
@@ -155,7 +171,7 @@ func (s *compactStreamSequentialState) appendValue(
 		s.value += int64(u>>1) ^ -int64(u&1)
 	}
 	s.next++
-	if v.kind == compactStreamDelta {
+	if v.kind == compactStreamDelta || v.kind == compactStreamDeltaPack {
 		return AppendCanonicalInt(dst, s.value), true
 	}
 	if s.value < 0 {

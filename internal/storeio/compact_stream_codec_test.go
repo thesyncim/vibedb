@@ -63,6 +63,10 @@ func TestCompactStreamCodecRoundTrip(t *testing.T) {
 		{"front", compactStreamFront, front, func() compactStreamEncoding { return encodeCompactFront(front) }},
 		{"FOR", compactStreamFOR, integerSpellings, func() compactStreamEncoding { return encodeCompactFOR(integers) }},
 		{"delta", compactStreamDelta, integerSpellings, func() compactStreamEncoding { return encodeCompactDelta(integers) }},
+		{"packed-delta", compactStreamDeltaPack, integerSpellings, func() compactStreamEncoding {
+			var scratch compactStreamScratch
+			return scratch.encodeDeltaPack(0, integers)
+		}},
 		{"date", compactStreamDate, dateSpellings, func() compactStreamEncoding { return encodeCompactDate(dates) }},
 		{"prefix-int", compactStreamPrefixInt, prefix, func() compactStreamEncoding {
 			encoded, ok := encodeCompactPrefixInt(prefix)
@@ -152,6 +156,10 @@ func TestCompactStreamIntegerCountMatchesValues(t *testing.T) {
 	for _, encoded := range []compactStreamEncoding{
 		encodeCompactFOR(values),
 		encodeCompactDelta(values),
+		func() compactStreamEncoding {
+			var scratch compactStreamScratch
+			return scratch.encodeDeltaPack(0, values)
+		}(),
 	} {
 		spellings := make([][]byte, len(values))
 		for row, value := range values {
@@ -209,6 +217,29 @@ func TestCompactStreamNumberCountExactDecimalSemantics(t *testing.T) {
 	}
 }
 
+func TestCompactStreamPackedPrefixIntRoundTrip(t *testing.T) {
+	values := make([][]byte, 4096)
+	for row := range values {
+		values[row] = []byte("user-" + strconv.Itoa(row*100+row%2))
+	}
+	encoded := encodeCompactScalarStream(values)
+	if encoded.kind != compactStreamPrefixInt || encoded.data[0]&4 == 0 {
+		t.Fatalf("codec kind=%d flags=%02x, want packed prefix-int", encoded.kind, encoded.data[0])
+	}
+	view := compactCodecRoundTrip(t, encoded, values)
+	needle := values[997]
+	want := 0
+	for _, value := range values {
+		if bytes.Equal(value, needle) {
+			want++
+		}
+	}
+	got, _, supported := view.countSpellingEqual(needle, nil)
+	if !supported || got != want {
+		t.Fatalf("packed prefix count=%d supported=%v want=%d", got, supported, want)
+	}
+}
+
 func TestCompactStreamRejectsCorruptFraming(t *testing.T) {
 	values := [][]byte{[]byte(`"PT"`), []byte(`"US"`), []byte(`"PT"`)}
 	encoded, err := encodeCompactScalarStream(values).appendBinary(nil)
@@ -223,10 +254,8 @@ func TestCompactStreamRejectsCorruptFraming(t *testing.T) {
 	}
 	tests[1][0] = compactStreamKindLimit
 	tests[2][2] = 1
-	tests[3][16] = 0xff
-	tests[3][17] = 0xff
-	tests[3][18] = 0xff
-	tests[3][19] = 0xff
+	tests[3][10] = 0xff
+	tests[3][11] = 0xff
 	for i, malformed := range tests {
 		if _, err := openCompactStream(malformed); err == nil {
 			t.Fatalf("corruption %d admitted", i)

@@ -18,7 +18,7 @@ import (
 // restart points so a point read never replays an unbounded stripe prefix.
 const (
 	compactStreamRestart = 64
-	compactStreamHeader  = 20
+	compactStreamHeader  = 12
 
 	compactStreamDictionary uint8 = iota
 	compactStreamFront
@@ -26,6 +26,7 @@ const (
 	compactStreamDelta
 	compactStreamDate
 	compactStreamPrefixInt
+	compactStreamDeltaPack
 	compactStreamKindLimit
 )
 
@@ -42,16 +43,16 @@ type compactStreamEncoding struct {
 // before reusing this workspace for the next column, so one fixed candidate
 // set serves every stream without per-column allocation churn.
 type compactStreamScratch struct {
-	candidates [6]compactStreamEncoding
-	data       [6][]byte
-	dict       [6][][]byte
+	candidates [7]compactStreamEncoding
+	data       [7][]byte
+	dict       [7][][]byte
 	integers   []int64
 	dates      []int32
 	parsed     []uint64
 }
 
 func (e compactStreamEncoding) encodedBytes() int {
-	n := compactStreamHeader + 4*len(e.dict) + len(e.data)
+	n := compactStreamHeader + 2*len(e.dict) + len(e.data)
 	for _, value := range e.dict {
 		n += len(value)
 	}
@@ -62,28 +63,30 @@ func (e compactStreamEncoding) encodedBytes() int {
 // arbitrary canonical scalar spellings remain representable; compact codecs
 // are selected only when the complete stream fits the enclosing page.
 func (e compactStreamEncoding) appendBinary(dst []byte) ([]byte, error) {
-	if e.kind >= compactStreamKindLimit || e.count < 0 ||
-		len(e.dict) > int(^uint16(0)) || uint64(len(e.data)) > uint64(^uint32(0)) {
+	if e.kind >= compactStreamKindLimit || e.count < 0 || len(e.dict) > int(^uint16(0)) {
 		return dst, fmt.Errorf("%w: compact stream encoding", ErrInvalidWrite)
 	}
+	if len(e.data) > int(^uint16(0)) {
+		return dst, ErrCommonPrimaryLeafFull
+	}
 	start := len(dst)
-	dst = append(dst, make([]byte, compactStreamHeader+4*len(e.dict))...)
+	dst = append(dst, make([]byte, compactStreamHeader+2*len(e.dict))...)
 	dst[start] = e.kind
 	dst[start+1] = e.width
+	binary.LittleEndian.PutUint16(dst[start+2:], uint16(len(e.dict)))
 	binary.LittleEndian.PutUint32(dst[start+4:], uint32(e.count))
-	binary.LittleEndian.PutUint16(dst[start+8:], uint16(len(e.dict)))
 	dictionaryBytes := 0
 	for id, value := range e.dict {
 		dictionaryBytes += len(value)
-		if uint64(dictionaryBytes) > uint64(^uint32(0)) {
-			return dst[:start], fmt.Errorf("%w: compact stream dictionary", ErrInvalidWrite)
+		if dictionaryBytes > int(^uint16(0)) {
+			return dst[:start], ErrCommonPrimaryLeafFull
 		}
-		binary.LittleEndian.PutUint32(
-			dst[start+compactStreamHeader+id*4:], uint32(dictionaryBytes),
+		binary.LittleEndian.PutUint16(
+			dst[start+compactStreamHeader+id*2:], uint16(dictionaryBytes),
 		)
 	}
-	binary.LittleEndian.PutUint32(dst[start+12:], uint32(dictionaryBytes))
-	binary.LittleEndian.PutUint32(dst[start+16:], uint32(len(e.data)))
+	binary.LittleEndian.PutUint16(dst[start+8:], uint16(dictionaryBytes))
+	binary.LittleEndian.PutUint16(dst[start+10:], uint16(len(e.data)))
 	for _, value := range e.dict {
 		dst = append(dst, value...)
 	}
@@ -117,6 +120,8 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		s.candidates[n] = s.encodeFOR(n, s.integers)
 		n++
 		s.candidates[n] = s.encodeDelta(n, s.integers)
+		n++
+		s.candidates[n] = s.encodeDeltaPack(n, s.integers)
 		n++
 	}
 	s.dates = slices.Grow(s.dates[:0], len(values))[:len(values)]
@@ -245,6 +250,57 @@ func (s *compactStreamScratch) encodeDelta(slot int, values []int64) compactStre
 	s.data[slot] = data
 	s.dict[slot] = s.dict[slot][:0]
 	return compactStreamEncoding{kind: compactStreamDelta, count: len(values), data: data}
+}
+
+func (s *compactStreamScratch) encodeDeltaPack(slot int, values []int64) compactStreamEncoding {
+	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
+	totalBytes := 4 * blocks
+	for first := 0; first < len(values); first += compactStreamRestart {
+		last := min(first+compactStreamRestart, len(values))
+		width := 0
+		previous := values[first]
+		for row := first + 1; row < last; row++ {
+			delta := values[row] - previous
+			zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+			width = max(width, bits.Len64(zigzag))
+			previous = values[row]
+		}
+		totalBytes += 9 + ((last-first-1)*width+7)/8
+	}
+	data := slices.Grow(s.data[slot][:0], totalBytes)[:totalBytes]
+	clear(data)
+	cursor := 4 * blocks
+	for first := 0; first < len(values); first += compactStreamRestart {
+		last := min(first+compactStreamRestart, len(values))
+		width := 0
+		previous := values[first]
+		for row := first + 1; row < last; row++ {
+			delta := values[row] - previous
+			zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+			width = max(width, bits.Len64(zigzag))
+			previous = values[row]
+		}
+		block := first / compactStreamRestart
+		binary.LittleEndian.PutUint32(data[block*4:], uint32(cursor))
+		blockStart := cursor
+		packedBytes := ((last-first-1)*width + 7) / 8
+		cursor += 9 + packedBytes
+		binary.LittleEndian.PutUint64(data[blockStart:], uint64(values[first]))
+		data[blockStart+8] = byte(width)
+		previous = values[first]
+		for row := first + 1; row < last; row++ {
+			delta := values[row] - previous
+			zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+			compactPutBits(data[blockStart+9:], (row-first-1)*width, width, zigzag)
+			previous = values[row]
+		}
+	}
+	if cursor != len(data) {
+		panic("compact packed delta sizing drift")
+	}
+	s.data[slot] = data
+	s.dict[slot] = s.dict[slot][:0]
+	return compactStreamEncoding{kind: compactStreamDeltaPack, count: len(values), data: data}
 }
 
 func (s *compactStreamScratch) encodeDate(slot int, values []int32) compactStreamEncoding {
@@ -494,6 +550,52 @@ func (s *compactStreamScratch) encodePrefixInt(
 		}
 		previous = value
 	}
+	packedBytes := 2 + 4*restarts
+	for first := 0; first < len(parsed); first += compactStreamRestart {
+		last := min(first+compactStreamRestart, len(parsed))
+		width := 0
+		previous := parsed[first]
+		for row := first + 1; row < last; row++ {
+			delta := int64(parsed[row] - previous)
+			zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+			width = max(width, bits.Len64(zigzag))
+			previous = parsed[row]
+		}
+		packedBytes += 9 + ((last-first-1)*width+7)/8
+	}
+	if packedBytes < len(data) {
+		data = slices.Grow(data[:0], packedBytes)[:2+4*restarts]
+		clear(data)
+		if fixedWidth {
+			data[0], data[1] = 1, byte(first.width)
+		}
+		data[0] |= 4
+		for first := 0; first < len(parsed); first += compactStreamRestart {
+			last := min(first+compactStreamRestart, len(parsed))
+			width := 0
+			previous := parsed[first]
+			for row := first + 1; row < last; row++ {
+				delta := int64(parsed[row] - previous)
+				zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+				width = max(width, bits.Len64(zigzag))
+				previous = parsed[row]
+			}
+			block := first / compactStreamRestart
+			binary.LittleEndian.PutUint32(data[2+block*4:], uint32(len(data)))
+			blockStart := len(data)
+			blockBytes := ((last-first-1)*width + 7) / 8
+			data = append(data, make([]byte, 9+blockBytes)...)
+			binary.LittleEndian.PutUint64(data[blockStart:], parsed[first])
+			data[blockStart+8] = byte(width)
+			previous = parsed[first]
+			for row := first + 1; row < last; row++ {
+				delta := int64(parsed[row] - previous)
+				zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+				compactPutBits(data[blockStart+9:], (row-first-1)*width, width, zigzag)
+				previous = parsed[row]
+			}
+		}
+	}
 	dictionary := slices.Grow(s.dict[slot][:0], 2)[:2]
 	dictionary[0], dictionary[1] = first.prefix, first.suffix
 	s.data[slot], s.dict[slot] = data, dictionary
@@ -673,15 +775,14 @@ func openCompactStream(src []byte) (compactStreamView, error) {
 	}
 	kind := src[0]
 	width := src[1]
-	if kind >= compactStreamKindLimit || src[2] != 0 || src[3] != 0 ||
-		binary.LittleEndian.Uint16(src[10:]) != 0 {
-		return corrupt("kind or reserved bytes")
+	if kind >= compactStreamKindLimit {
+		return corrupt("kind")
 	}
 	count := int(binary.LittleEndian.Uint32(src[4:]))
-	dictCount := int(binary.LittleEndian.Uint16(src[8:]))
-	dictBytes := int(binary.LittleEndian.Uint32(src[12:]))
-	dataBytes := int(binary.LittleEndian.Uint32(src[16:]))
-	dirBytes := 4 * dictCount
+	dictCount := int(binary.LittleEndian.Uint16(src[2:]))
+	dictBytes := int(binary.LittleEndian.Uint16(src[8:]))
+	dataBytes := int(binary.LittleEndian.Uint16(src[10:]))
+	dirBytes := 2 * dictCount
 	total64 := uint64(compactStreamHeader) + uint64(dirBytes) +
 		uint64(dictBytes) + uint64(dataBytes)
 	if total64 > uint64(len(src)) {
@@ -696,7 +797,7 @@ func openCompactStream(src []byte) (compactStreamView, error) {
 	}
 	previous := uint32(0)
 	for id := 0; id < dictCount; id++ {
-		end := binary.LittleEndian.Uint32(v.dictDir[id*4:])
+		end := uint32(binary.LittleEndian.Uint16(v.dictDir[id*2:]))
 		if end < previous || uint64(end) > uint64(len(v.dictData)) {
 			return corrupt("dictionary directory")
 		}
@@ -719,10 +820,10 @@ func admittedCompactStream(src []byte) (compactStreamView, bool) {
 	if len(src) < compactStreamHeader {
 		return compactStreamView{}, false
 	}
-	dictCount := int(binary.LittleEndian.Uint16(src[8:]))
-	dictBytes := int(binary.LittleEndian.Uint32(src[12:]))
-	dataBytes := int(binary.LittleEndian.Uint32(src[16:]))
-	dirBytes := 4 * dictCount
+	dictCount := int(binary.LittleEndian.Uint16(src[2:]))
+	dictBytes := int(binary.LittleEndian.Uint16(src[8:]))
+	dataBytes := int(binary.LittleEndian.Uint16(src[10:]))
+	dirBytes := 2 * dictCount
 	total64 := uint64(compactStreamHeader) + uint64(dirBytes) +
 		uint64(dictBytes) + uint64(dataBytes)
 	if total64 > uint64(len(src)) {
@@ -744,9 +845,9 @@ func (v compactStreamView) dictionaryEntry(id int) ([]byte, bool) {
 	}
 	start := uint32(0)
 	if id != 0 {
-		start = binary.LittleEndian.Uint32(v.dictDir[(id-1)*4:])
+		start = uint32(binary.LittleEndian.Uint16(v.dictDir[(id-1)*2:]))
 	}
-	end := binary.LittleEndian.Uint32(v.dictDir[id*4:])
+	end := uint32(binary.LittleEndian.Uint16(v.dictDir[id*2:]))
 	if end < start || uint64(end) > uint64(len(v.dictData)) {
 		return nil, false
 	}
@@ -845,6 +946,10 @@ func (v compactStreamView) validate() error {
 		if v.width != 0 || v.dictCount != 0 || !validateCompactRestartVarints(v.data, v.count, 0) {
 			return corrupt("delta data")
 		}
+	case compactStreamDeltaPack:
+		if v.width != 0 || v.dictCount != 0 || !validateCompactPackedDeltas(v.data, v.count, 0) {
+			return corrupt("packed delta data")
+		}
 	case compactStreamDate:
 		if v.dictCount != 0 || v.width > 32 {
 			return corrupt("date metadata")
@@ -865,13 +970,18 @@ func (v compactStreamView) validate() error {
 		}
 	case compactStreamPrefixInt:
 		if v.width != 0 || v.dictCount != 2 || len(v.data) < 2 ||
-			v.data[0] > 3 || v.data[0]&1 == 0 && v.data[1] != 0 ||
+			v.data[0] > 7 || v.data[0]&6 == 6 ||
+			v.data[0]&1 == 0 && v.data[1] != 0 ||
 			v.data[0]&1 != 0 && v.data[1] == 0 {
 			return corrupt("prefix-integer data")
 		}
 		if v.data[0]&2 != 0 {
 			if len(v.data) != 18 {
 				return corrupt("linear prefix-integer data")
+			}
+		} else if v.data[0]&4 != 0 {
+			if !validateCompactPackedDeltas(v.data, v.count, 2) {
+				return corrupt("packed prefix-integer data")
 			}
 		} else if !validateCompactRestartVarints(v.data, v.count, 2) {
 			return corrupt("prefix-integer restart data")
@@ -880,6 +990,29 @@ func (v compactStreamView) validate() error {
 		return corrupt("kind")
 	}
 	return nil
+}
+
+func validateCompactPackedDeltas(data []byte, count, prefix int) bool {
+	blocks := (count + compactStreamRestart - 1) / compactStreamRestart
+	cursor := prefix + 4*blocks
+	if cursor > len(data) {
+		return false
+	}
+	for block := 0; block < blocks; block++ {
+		if int(binary.LittleEndian.Uint32(data[prefix+block*4:])) != cursor || len(data)-cursor < 9 {
+			return false
+		}
+		width := int(data[cursor+8])
+		if width > 64 {
+			return false
+		}
+		rows := min(compactStreamRestart, count-block*compactStreamRestart)
+		cursor += 9 + ((rows-1)*width+7)/8
+		if cursor > len(data) {
+			return false
+		}
+	}
+	return cursor == len(data)
 }
 
 func validateCompactRestartVarints(data []byte, count, prefix int) bool {
@@ -954,6 +1087,12 @@ func (v compactStreamView) appendValue(dst []byte, row int) ([]byte, bool) {
 			return dst, false
 		}
 		return AppendCanonicalInt(dst, value), true
+	case compactStreamDeltaPack:
+		value, ok := v.packedDeltaInteger(row)
+		if !ok {
+			return dst, false
+		}
+		return AppendCanonicalInt(dst, value), true
 	case compactStreamDate:
 		base := int32(binary.LittleEndian.Uint32(v.data))
 		value := base + int32(compactReadBits(v.data[4:], row*int(v.width), int(v.width)))
@@ -995,6 +1134,9 @@ func (v compactStreamView) prefixInteger(row int) (int64, bool) {
 		return 0, false
 	}
 	if v.data[0]&2 == 0 {
+		if v.data[0]&4 != 0 {
+			return v.packedDeltaIntegerAt(row, 2)
+		}
 		return v.restartInteger(row, 2)
 	}
 	if len(v.data) != 18 {
@@ -1074,6 +1216,29 @@ func (v compactStreamView) restartInteger(row, prefix int) (int64, bool) {
 	return value, true
 }
 
+func (v compactStreamView) packedDeltaInteger(row int) (int64, bool) {
+	if v.kind != compactStreamDeltaPack || row < 0 || row >= v.count {
+		return 0, false
+	}
+	return v.packedDeltaIntegerAt(row, 0)
+}
+
+func (v compactStreamView) packedDeltaIntegerAt(row, prefix int) (int64, bool) {
+	if row < 0 || row >= v.count {
+		return 0, false
+	}
+	block := row / compactStreamRestart
+	cursor := int(binary.LittleEndian.Uint32(v.data[prefix+block*4:]))
+	value := int64(binary.LittleEndian.Uint64(v.data[cursor:]))
+	width := int(v.data[cursor+8])
+	packed := v.data[cursor+9:]
+	for at := block * compactStreamRestart; at < row; at++ {
+		u := compactReadBits(packed, (at-block*compactStreamRestart)*width, width)
+		value += int64(u>>1) ^ -int64(u&1)
+	}
+	return value, true
+}
+
 // countIntegerEqual performs a complete scan of an integer stream without
 // formatting each value back into JSON. FOR compares the packed offsets and
 // delta streams consume every restart and varint in row order.
@@ -1116,6 +1281,26 @@ func (v compactStreamView) countIntegerEqual(needle int64) (matched int, support
 			}
 		}
 		return matched, true
+	case compactStreamDeltaPack:
+		blocks := (v.count + compactStreamRestart - 1) / compactStreamRestart
+		for block := 0; block < blocks; block++ {
+			cursor := int(binary.LittleEndian.Uint32(v.data[block*4:]))
+			value := int64(binary.LittleEndian.Uint64(v.data[cursor:]))
+			width := int(v.data[cursor+8])
+			packed := v.data[cursor+9:]
+			rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+			if value == needle {
+				matched++
+			}
+			for row := 1; row < rows; row++ {
+				u := compactReadBits(packed, (row-1)*width, width)
+				value += int64(u>>1) ^ -int64(u&1)
+				if value == needle {
+					matched++
+				}
+			}
+		}
+		return matched, true
 	default:
 		return 0, false
 	}
@@ -1134,7 +1319,7 @@ func (v compactStreamView) countSpellingEqual(
 	case compactStreamFront:
 		matched, scratch = v.countFrontEqual(needle, scratch, false)
 		return matched, scratch, true
-	case compactStreamFOR, compactStreamDelta:
+	case compactStreamFOR, compactStreamDelta, compactStreamDeltaPack:
 		value, ok := CanonicalIntValue(needle)
 		if !ok {
 			return 0, scratch, false
@@ -1201,7 +1386,7 @@ func (v compactStreamView) countNumberEqual(
 		base := int64(binary.LittleEndian.Uint64(v.data))
 		_, supported = v.countIntegerEqual(base)
 		return 0, scratch, ids, supported
-	case compactStreamDelta:
+	case compactStreamDelta, compactStreamDeltaPack:
 		if needleIsInt {
 			matched, supported = v.countIntegerEqual(needleInt)
 			return matched, scratch, ids, supported
@@ -1277,6 +1462,27 @@ func (v compactStreamView) countPrefixIntegerEqual(needle []byte) (matched int, 
 		for row := 0; row < v.count; row++ {
 			if first+int64(row)*delta == want {
 				matched++
+			}
+		}
+		return matched, true
+	}
+	if v.data[0]&4 != 0 {
+		blocks := (v.count + compactStreamRestart - 1) / compactStreamRestart
+		for block := 0; block < blocks; block++ {
+			cursor := int(binary.LittleEndian.Uint32(v.data[2+block*4:]))
+			value := int64(binary.LittleEndian.Uint64(v.data[cursor:]))
+			width := int(v.data[cursor+8])
+			packed := v.data[cursor+9:]
+			rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+			if value == want {
+				matched++
+			}
+			for row := 1; row < rows; row++ {
+				u := compactReadBits(packed, (row-1)*width, width)
+				value += int64(u>>1) ^ -int64(u&1)
+				if value == want {
+					matched++
+				}
 			}
 		}
 		return matched, true

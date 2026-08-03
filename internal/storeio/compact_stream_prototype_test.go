@@ -97,6 +97,8 @@ type compactPrototypeStripe struct {
 type compactPrototypeStats struct {
 	fixed, keys, shapeCodes, templates int
 	codecBytes                         [6]int
+	productionCodecBytes               [compactStreamKindLimit]int
+	productionKeyBytes                 int
 	holeBytes                          [32]int
 	holeValues                         [32]int
 }
@@ -167,6 +169,7 @@ func buildCompactPrototype(t testing.TB, rows int, high bool) ([]compactPrototyp
 		productionKey := encodeCompactScalarStream(keys)
 		productionKeyView := compactCodecRoundTrip(t, productionKey, keys)
 		stripe.productionBytes += productionKeyView.encoded
+		stats.productionKeyBytes += productionKeyView.encoded
 
 		shapeWidth := bits.Len(uint(max(0, len(builder.shapes)-1)))
 		stripe.shapeCodes = make([]byte, (len(window)*shapeWidth+7)/8)
@@ -226,10 +229,16 @@ func buildCompactPrototype(t testing.TB, rows int, high bool) ([]compactPrototyp
 				stats.holeBytes[hole] += streamBytes
 				stats.holeValues[hole] += len(columns[hole])
 				production := encodeCompactScalarStream(columns[hole])
-				productionView := compactCodecRoundTrip(t, production, columns[hole])
-				stripe.productionBytes += productionView.encoded
-				if hole == out.countryStream {
-					out.productionCountry = productionView
+				productionBytes := production.encodedBytes()
+				stripe.productionBytes += productionBytes
+				stats.productionCodecBytes[production.kind] += productionBytes
+				if productionBytes <= int(^uint16(0)) {
+					productionView := compactCodecRoundTrip(t, production, columns[hole])
+					if hole == out.countryStream {
+						out.productionCountry = productionView
+					}
+				} else if hole == out.countryStream {
+					t.Fatal("country production stream exceeds one leaf")
 				}
 			}
 		}
@@ -791,6 +800,15 @@ func TestCompactStreamPrototypeCompetitiveGate(t *testing.T) {
 			float64(stats.codecBytes[compactPrototypeDelta])/100_000,
 			float64(stats.codecBytes[compactPrototypeDate])/100_000,
 			float64(stats.codecBytes[compactPrototypePrefixInt])/100_000)
+		t.Logf("high=%v production streams: keys=%.2f dict=%.2f front=%.2f FOR=%.2f delta=%.2f packed-delta=%.2f date=%.2f prefix-int=%.2f B/doc",
+			high, float64(stats.productionKeyBytes)/100_000,
+			float64(stats.productionCodecBytes[compactStreamDictionary])/100_000,
+			float64(stats.productionCodecBytes[compactStreamFront])/100_000,
+			float64(stats.productionCodecBytes[compactStreamFOR])/100_000,
+			float64(stats.productionCodecBytes[compactStreamDelta])/100_000,
+			float64(stats.productionCodecBytes[compactStreamDeltaPack])/100_000,
+			float64(stats.productionCodecBytes[compactStreamDate])/100_000,
+			float64(stats.productionCodecBytes[compactStreamPrefixInt])/100_000)
 		for hole := range stats.holeBytes {
 			if stats.holeValues[hole] != 0 {
 				t.Logf("high=%v hole[%d]=%.2f B/doc values=%d", high, hole,

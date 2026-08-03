@@ -415,6 +415,9 @@ func planCompactPrimaryLeaves(
 		}
 		fits := func(count int) (int, bool, error) {
 			payload, err := BuildCompactPrimaryStripePayload(window[:count], builder)
+			if err == ErrCommonPrimaryLeafFull {
+				return maxExtent + int(physicalPageQuantum), false, nil
+			}
 			if err != nil {
 				return 0, false, err
 			}

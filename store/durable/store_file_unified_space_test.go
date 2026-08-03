@@ -33,6 +33,8 @@ type unifiedLeafCensus struct {
 	templates      int
 	dictionary     int
 	trivial        int
+	payloadBytes   int
+	extentBytes    int
 	leavesByExtent map[int]int
 	rowsByExtent   map[int]int
 }
@@ -72,6 +74,8 @@ func collectUnifiedLeafCensus(t *testing.T, c *Collection) unifiedLeafCensus {
 		census.leaves++
 		census.rows += view.Len()
 		census.templates += view.ShapeCount()
+		census.payloadBytes += view.EncodedPayloadBytes()
+		census.extentBytes += extent
 		census.leavesByExtent[extent]++
 		census.rowsByExtent[extent] += view.Len()
 		lease.Release()
@@ -139,8 +143,8 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 			if census.rows != n {
 				t.Fatalf("census rows %d want %d", census.rows, n)
 			}
-			t.Logf("[%s] raw=%.1f B/doc unified=%.2f B/doc (gate ≤ %.1f)",
-				name, float64(rawBytes)/n, unifiedPerDoc, gates[name])
+			t.Logf("[%s] raw=%.1f B/doc unified=%d bytes %.2f B/doc (gate ≤ %.1f)",
+				name, float64(rawBytes)/n, unifiedEnd, unifiedPerDoc, gates[name])
 			t.Logf("[%s] census: leaves=%d rows=%d shapes/leaf=%.2f dict/leaf=%.1f trivial=%d (%.4f%%) leavesByExtent=%v rowsByExtent=%v",
 				name, census.leaves, census.rows,
 				float64(census.templates)/float64(census.leaves),
@@ -148,6 +152,12 @@ func TestUnifiedSpaceCompetitiveCorpus(t *testing.T) {
 				census.trivial,
 				100*float64(census.trivial)/float64(census.rows),
 				census.leavesByExtent, census.rowsByExtent)
+			t.Logf("[%s] compact payload=%.2f B/doc leaf extents=%.2f B/doc extent slack=%.2f B/doc",
+				name,
+				float64(census.payloadBytes)/n,
+				float64(census.extentBytes)/n,
+				float64(census.extentBytes-census.payloadBytes)/n,
+			)
 			if unifiedPerDoc > gates[name] {
 				t.Fatalf("[%s] unified space %.2f B/doc exceeds the gate %.1f",
 					name, unifiedPerDoc, gates[name])
