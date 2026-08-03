@@ -2,6 +2,7 @@ package storeio
 
 import (
 	"bytes"
+	"encoding/binary"
 	"strconv"
 	"testing"
 )
@@ -61,6 +62,14 @@ func TestCompactStreamCodecRoundTrip(t *testing.T) {
 	}{
 		{"dictionary", compactStreamDictionary, dictionary, func() compactStreamEncoding { return encodeCompactDictionary(dictionary) }},
 		{"front", compactStreamFront, front, func() compactStreamEncoding { return encodeCompactFront(front) }},
+		{"alphabet", compactStreamAlphabet, front, func() compactStreamEncoding {
+			var scratch compactStreamScratch
+			encoded, ok := scratch.encodeAlphabet(0, front, 0)
+			if !ok {
+				t.Fatal("alphabet rejected")
+			}
+			return encoded
+		}},
 		{"FOR", compactStreamFOR, integerSpellings, func() compactStreamEncoding { return encodeCompactFOR(integers) }},
 		{"delta", compactStreamDelta, integerSpellings, func() compactStreamEncoding { return encodeCompactDelta(integers) }},
 		{"packed-delta", compactStreamDeltaPack, integerSpellings, func() compactStreamEncoding {
@@ -192,6 +201,14 @@ func TestCompactStreamNumberCountExactDecimalSemantics(t *testing.T) {
 	for _, encoded := range []compactStreamEncoding{
 		encodeCompactDictionary(values),
 		encodeCompactFront(values),
+		func() compactStreamEncoding {
+			var scratch compactStreamScratch
+			encoded, ok := scratch.encodeAlphabet(0, values, 0)
+			if !ok {
+				t.Fatal("numeric alphabet rejected")
+			}
+			return encoded
+		}(),
 	} {
 		view := compactCodecRoundTrip(t, encoded, values)
 		for _, test := range []struct {
@@ -240,6 +257,43 @@ func TestCompactStreamPackedPrefixIntRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCompactStreamAdaptiveAlphabetSelection(t *testing.T) {
+	values := make([][]byte, 1000)
+	for row := range values {
+		value := make([]byte, 66)
+		value[0], value[len(value)-1] = '"', '"'
+		state := uint64(row + 1)
+		for at := 1; at < len(value)-1; at++ {
+			state = state*6364136223846793005 + 1442695040888963407
+			value[at] = byte('a' + state%26)
+		}
+		values[row] = value
+	}
+	encoded := encodeCompactScalarStream(values)
+	if encoded.kind != compactStreamAlphabet {
+		t.Fatalf("adaptive kind=%d want alphabet", encoded.kind)
+	}
+	view := compactCodecRoundTrip(t, encoded, values)
+	buf := make([]byte, 0, 80)
+	allocs := testing.AllocsPerRun(1000, func() {
+		out, ok := view.appendValue(buf[:0], 731)
+		if !ok || !bytes.Equal(out, values[731]) {
+			panic("alphabet point decode")
+		}
+		buf = out
+	})
+	if allocs != 0 {
+		t.Fatalf("alphabet point allocations=%v want 0", allocs)
+	}
+	missing := []byte(`"not-present-in-this-alphabet-stream"`)
+	if got, supported := view.countDictionaryEqual(missing); supported || got != 0 {
+		t.Fatalf("alphabet exposed dictionary counter: %d %v", got, supported)
+	}
+	if got, _ := view.countAlphabetEqual(missing, nil); got != 0 {
+		t.Fatalf("alphabet missing count=%d", got)
+	}
+}
+
 func TestCompactDateOrdinalExhaustiveRoundTrip(t *testing.T) {
 	limit := int32(compactDaysBeforeYear(10_000))
 	var spelling [12]byte
@@ -271,6 +325,39 @@ func TestCompactStreamRejectsCorruptFraming(t *testing.T) {
 	for i, malformed := range tests {
 		if _, err := openCompactStream(malformed); err == nil {
 			t.Fatalf("corruption %d admitted", i)
+		}
+	}
+}
+
+func TestCompactAlphabetRejectsCorruption(t *testing.T) {
+	values := [][]byte{[]byte("ab"), []byte("ac"), []byte("ba")}
+	var scratch compactStreamScratch
+	encoding, ok := scratch.encodeAlphabet(0, values, 0)
+	if !ok || len(encoding.dict) != 1 || len(encoding.dict[0]) != 3 {
+		t.Fatal("alphabet fixture")
+	}
+	encoded, err := encoding.appendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dictStart := compactStreamHeader + 2
+	dataStart := dictStart + len(encoding.dict[0])
+	tests := [][]byte{
+		append([]byte(nil), encoded...),
+		append([]byte(nil), encoded...),
+		append([]byte(nil), encoded...),
+	}
+	tests[0][dictStart+1] = tests[0][dictStart]
+	binary.LittleEndian.PutUint32(tests[1][dataStart:], 0)
+	cursor := dataStart + 4
+	_, n, valid := readCompactUvarint(tests[2][cursor:])
+	if !valid {
+		t.Fatal("alphabet fixture length")
+	}
+	tests[2][cursor+n] |= 3
+	for i, malformed := range tests {
+		if _, err := openCompactStream(malformed); err == nil {
+			t.Fatalf("alphabet corruption %d admitted", i)
 		}
 	}
 }

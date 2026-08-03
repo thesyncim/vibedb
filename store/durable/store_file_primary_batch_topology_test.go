@@ -30,7 +30,7 @@ func TestPrimaryBatchTopologyRejectsSingleUnencodableDocument(t *testing.T) {
 	generation := collection.Generation()
 	document := make([]byte, 0, 65536)
 	document = append(document, `{"v":"`...)
-	document = append(document, bytes.Repeat([]byte("x"), 65500)...)
+	document = appendWideJSONSafePattern(document, 65500, 0)
 	document = append(document, `"}`...)
 	if len(document) > options.MaxDocumentBytes {
 		t.Fatalf("fixture document = %d, bound %d", len(document), options.MaxDocumentBytes)

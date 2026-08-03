@@ -36,6 +36,26 @@ func testFileStoreOptions() Options {
 	}
 }
 
+// appendWideJSONSafePattern appends a deterministic pattern spanning every
+// printable ASCII byte except the two bytes that JSON strings must escape.
+// Compression-boundary fixtures use it when their purpose depends on physical
+// size: its 93-symbol alphabet is deliberately wider than the compact scalar
+// alphabet codec, and changing seed gives adjacent rows no shared prefix.
+func appendWideJSONSafePattern(dst []byte, length, seed int) []byte {
+	for at := range length {
+		position := (seed + at*17 + (at>>5)*13) % 93
+		value := byte(' ' + position)
+		if value >= '"' {
+			value++
+		}
+		if value >= '\\' {
+			value++
+		}
+		dst = append(dst, value)
+	}
+	return dst
+}
+
 func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	options := testFileStoreOptions()
 	normalized, err := options.normalized()

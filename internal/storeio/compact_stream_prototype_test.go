@@ -800,10 +800,11 @@ func TestCompactStreamPrototypeCompetitiveGate(t *testing.T) {
 			float64(stats.codecBytes[compactPrototypeDelta])/100_000,
 			float64(stats.codecBytes[compactPrototypeDate])/100_000,
 			float64(stats.codecBytes[compactPrototypePrefixInt])/100_000)
-		t.Logf("high=%v production streams: keys=%.2f dict=%.2f front=%.2f FOR=%.2f delta=%.2f packed-delta=%.2f date=%.2f prefix-int=%.2f B/doc",
+		t.Logf("high=%v production streams: keys=%.2f dict=%.2f front=%.2f alphabet=%.2f FOR=%.2f delta=%.2f packed-delta=%.2f date=%.2f prefix-int=%.2f B/doc",
 			high, float64(stats.productionKeyBytes)/100_000,
 			float64(stats.productionCodecBytes[compactStreamDictionary])/100_000,
 			float64(stats.productionCodecBytes[compactStreamFront])/100_000,
+			float64(stats.productionCodecBytes[compactStreamAlphabet])/100_000,
 			float64(stats.productionCodecBytes[compactStreamFOR])/100_000,
 			float64(stats.productionCodecBytes[compactStreamDelta])/100_000,
 			float64(stats.productionCodecBytes[compactStreamDeltaPack])/100_000,

@@ -121,6 +121,43 @@ func (s *compactStreamSequentialState) appendValue(
 	v compactStreamView,
 	row int,
 ) ([]byte, bool) {
+	if v.kind == compactStreamAlphabet {
+		if row < 0 || row >= v.count || row != s.next {
+			return v.appendValue(dst, row)
+		}
+		if row%compactStreamRestart == 0 {
+			block := row / compactStreamRestart
+			s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
+		}
+		alphabet, ok := v.dictionaryEntry(0)
+		if !ok {
+			return dst, false
+		}
+		length, n, ok := readCompactUvarint(v.data[s.cursor:])
+		if !ok || length > CommonPrimaryLeafMaxExtentBytes {
+			return dst, false
+		}
+		s.cursor += n
+		packedBytes := (int(length)*int(v.width) + 7) / 8
+		if packedBytes > len(v.data)-s.cursor {
+			return dst, false
+		}
+		start := len(dst)
+		dst = append(dst, make([]byte, int(length))...)
+		for char := 0; char < int(length); char++ {
+			code := int(compactReadBits(
+				v.data[s.cursor:s.cursor+packedBytes],
+				char*int(v.width), int(v.width),
+			))
+			if code >= len(alphabet) {
+				return dst[:start], false
+			}
+			dst[start+char] = alphabet[code]
+		}
+		s.cursor += packedBytes
+		s.next++
+		return dst, true
+	}
 	prefix := 0
 	switch v.kind {
 	case compactStreamDelta:

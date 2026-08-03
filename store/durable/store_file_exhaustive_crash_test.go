@@ -375,17 +375,15 @@ func TestFileStoreExhaustiveCommitCrashSweep(t *testing.T) {
 // primarySplitCrashKey and primarySplitCrashValue drive a single seed tablet from
 // one leaf to a split. The ~1.7 KiB per-row-distinct value fills a wide leaf
 // in a handful of inserts, so the split -- and the buffered structural
-// transaction it runs -- lands within a small, fast crash sweep. Distinct
-// payloads are intentional: class 5 dictionaries collapse the former repeated
-// padding so effectively that it no longer exercised a split at all.
+// transaction it runs -- lands within a small, fast crash sweep. The wide
+// JSON-safe alphabet and row-varying prefixes are intentional: dictionary,
+// front, and alphabet packing must not retire this physical-boundary fixture.
 func primarySplitCrashKey(i int) string { return fmt.Sprintf("key-%04d", i) }
 
 func primarySplitCrashValue(i int) []byte {
-	padding := make([]byte, 1700)
-	for at := range padding {
-		padding[at] = byte('a' + (i*31+at*17+(i^(at>>3)))%26)
-	}
-	return []byte(fmt.Sprintf(`{"i":%d,"pad":"%s"}`, i, padding))
+	value := fmt.Appendf(nil, `{"i":%d,"pad":"`, i)
+	value = appendWideJSONSafePattern(value, 1700, i*37)
+	return append(value, `"}`...)
 }
 
 // runPrimarySplitFaultPass creates a fresh seed primary graph (never

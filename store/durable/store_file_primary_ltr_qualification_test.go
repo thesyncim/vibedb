@@ -239,9 +239,7 @@ func primaryLTRKey(row int) string {
 func primaryLTRDocument(dst []byte, row int) []byte {
 	dst = fmt.Appendf(dst, `{"id":%d,"group":%d,"payload":"`, row, row%997)
 	padding := primaryLTRDocumentBytes - len(dst) - len(`"}`)
-	for range padding {
-		dst = append(dst, byte('a'+row%26))
-	}
+	dst = appendWideJSONSafePattern(dst, padding, row*37)
 	return append(dst, `"}`...)
 }
 

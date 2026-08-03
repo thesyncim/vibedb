@@ -67,13 +67,19 @@ promises; reproduce them with `bench/competitive/cmd/speedprobe` and separate
 warm-up from steady-state allocation measurements.
 
 Codec choice no longer forces exact-spelling filters onto whole-document
-rendering. Dictionary, front-coded, FOR, delta, Gregorian-date, and
-single-numeric-run streams all have complete encoded-value scan lanes. On the
+rendering. Dictionary, front-coded, alphabet-packed, FOR, delta,
+Gregorian-date, and single-numeric-run streams all have complete encoded-value
+scan lanes. On the
 shape-identical high-cardinality corpus, a missing `/note` string scanned all
-100,000 front-coded values in about 0.85 ms (8.5 ns/document), with zero
+100,000 alphabet-packed values in about 0.745 ms (7.45 ns/document), with zero
 fallback rows and zero warm allocations. The general container-valued render
 fallback measured about 67 ms on the same harness; it remains disclosed as a
 different physical path rather than being used as an unindexed result.
+
+The high-cardinality all-bytes scan also improved from about 88 ms to 60 ms
+(roughly 414 MB/s) because sequential decoding carries each alphabet stream's
+bounded-restart cursor. Every packed character remains independently
+reconstructible; this is not dictionary substitution or value inference.
 
 The same public probe's ordered all-bytes scan now reconstructs and consumes
 24.88 MB of canonical JSON in about 39.7 ms (roughly 627 MB/s), also with zero
@@ -141,15 +147,17 @@ posting enumeration, mutation folds, verification, and salvage. The same
 100,000-row low-cardinality corpus occupies 905,216 physical leaf bytes
 (9.05 bytes/document); catalog, tablet, root, and allocator pages bring the
 complete file to 10.20 bytes/document. The shape-identical high-cardinality
-variant occupies 121.24 bytes/document as a complete file, preventing the low
+variant occupies 89.17 bytes/document as a complete file, preventing the low
 cardinality result from hiding an irreversible or corpus-eliding encoding.
 Every key and scalar codec is decoded byte-for-byte in the format tests.
 
 The winning ingredients are generic: template-hole transposition; bit-packed
 dictionaries and frame-of-reference integers; block-packed delta integers;
 12-byte self-delimiting stream headers with 16-bit in-leaf dictionary ends;
-validated Gregorian date packing; bounded-restart front coding; and a reversible
-single-numeric-run string codec that applies equally to keys such as
+validated Gregorian date packing; bounded-restart front coding; a reversible
+single-numeric-run string codec; and adaptive alphabet packing for scalar
+streams with at most 64 distinct bytes. The numeric-run codec applies equally
+to keys such as
 `doc:00001234` and values such as `"user-1234"`. It does not infer one field
 from another, omit values, add a filter index, prune rows, or derive one field
 from another.
