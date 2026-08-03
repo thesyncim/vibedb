@@ -128,6 +128,10 @@ their complete 4,096-row planning window. Each candidate still serializes its
 exact prefix, and prepared-prefix tests compare those bytes with independent
 one-shot builds. This reduced the high-cardinality load again to about 1.02 s
 without changing the low-cardinality result or retained allocation.
+Front coding is also sized exactly before materialization and now copies its
+stream only when it wins the adaptive codec choice. The high-cardinality load
+fell again to about 0.97 s and the low-cardinality load to about 0.23 s; each
+build retained about 0.4 MB less allocation, with unchanged serialized bytes.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
 setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf

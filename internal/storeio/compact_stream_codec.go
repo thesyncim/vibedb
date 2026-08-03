@@ -113,12 +113,11 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		return compactStreamEncoding{kind: compactStreamDictionary}
 	}
 	dictionaryBytes := s.measureDictionary(values)
-	n := 1
-	s.candidates[n] = s.encodeFront(n, values)
-	n++
+	frontBytes := measureCompactFront(values)
+	n := 2
 	alphabetLimit := min(
 		dictionaryBytes,
-		s.candidates[1].encodedBytes(),
+		frontBytes,
 	)
 	if alphabet, ok := s.encodeAlphabet(n, values, alphabetLimit); ok {
 		s.candidates[n] = alphabet
@@ -156,20 +155,26 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		s.candidates[n] = numeric
 		n++
 	}
-	best := s.candidates[1]
-	for _, candidate := range s.candidates[2:n] {
-		if candidate.encodedBytes() < best.encodedBytes() {
-			best = candidate
+	bestBytes := frontBytes
+	bestSlot := -1
+	for slot := 2; slot < n; slot++ {
+		candidate := s.candidates[slot]
+		if candidate.encodedBytes() < bestBytes {
+			bestBytes = candidate.encodedBytes()
+			bestSlot = slot
 		}
 	}
 	// Dictionary was historically the first candidate, so an exact-size tie
 	// must still select it. Defer its sort and row-ID stream until that work can
 	// affect the result; high-cardinality columns normally choose alphabet or
 	// front coding and otherwise paid for a discarded O(rows log rows) build.
-	if dictionaryBytes <= best.encodedBytes() {
+	if dictionaryBytes <= bestBytes {
 		return s.finishDictionary(values)
 	}
-	return best
+	if bestSlot < 0 {
+		return s.encodeFront(1, values)
+	}
+	return s.candidates[bestSlot]
 }
 
 func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
@@ -319,6 +324,26 @@ func (s *compactStreamScratch) encodeFront(slot int, values [][]byte) compactStr
 	s.data[slot] = data
 	s.dict[slot] = s.dict[slot][:0]
 	return compactStreamEncoding{kind: compactStreamFront, count: len(values), data: data}
+}
+
+func measureCompactFront(values [][]byte) int {
+	dataBytes := 4 * ((len(values) + compactStreamRestart - 1) / compactStreamRestart)
+	var previous []byte
+	for row, value := range values {
+		if row%compactStreamRestart == 0 {
+			dataBytes += compactUvarintLen(uint64(len(value))) + len(value)
+		} else {
+			prefix := compactCommonPrefix(previous, value)
+			suffix := len(value) - prefix
+			dataBytes += 1 + suffix
+			if prefix >= 15 || suffix >= 15 {
+				dataBytes += compactUvarintLen(uint64(prefix)) +
+					compactUvarintLen(uint64(suffix))
+			}
+		}
+		previous = value
+	}
+	return compactStreamHeader + dataBytes
 }
 
 func compactUvarintLen(value uint64) int {

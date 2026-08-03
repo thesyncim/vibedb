@@ -141,6 +141,29 @@ func TestCompactStreamAdaptiveSelectionAndCount(t *testing.T) {
 	}
 }
 
+func TestMeasureCompactFrontMatchesEncoding(t *testing.T) {
+	values := make([][]byte, 130)
+	for row := range values {
+		switch row % 4 {
+		case 0:
+			values[row] = []byte(`"short"`)
+		case 1:
+			values[row] = []byte(`"shared-prefix-0123456789-alpha"`)
+		case 2:
+			values[row] = []byte(`"shared-prefix-0123456789-beta-with-a-long-suffix"`)
+		default:
+			values[row] = []byte(`"x"`)
+		}
+	}
+	for _, count := range []int{1, 2, 63, 64, 65, 127, 128, 129, 130} {
+		got := measureCompactFront(values[:count])
+		want := encodeCompactFront(values[:count]).encodedBytes()
+		if got != want {
+			t.Fatalf("count=%d measured=%d encoded=%d", count, got, want)
+		}
+	}
+}
+
 func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
 	for width := 0; width <= 64; width++ {
 		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {
