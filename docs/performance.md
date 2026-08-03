@@ -103,9 +103,12 @@ whole-corpus rewrite arena.
 
 Compact stripe construction gathers and encodes one scalar-hole column at a
 time from a reusable vector instead of retaining every column simultaneously.
+Bulk snapshot traversal fills the final borrowed record plan directly instead
+of allocating an intermediate chunk/slot list and then walking the source a
+second time.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
-setup bytes fell from about 15.62 MB to 2.96 MB. It still selects identical leaf
+setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf
 boundaries and writes identical compact bytes. High-cardinality windows that do
 not fit still use the exact largest-prefix search.
 

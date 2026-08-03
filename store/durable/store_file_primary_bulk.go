@@ -15,7 +15,6 @@ import (
 	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // CreateFromPrimary writes one immutable ordered primary graph and publishes it
@@ -69,37 +68,10 @@ func CreateFromPrimary(
 	)
 	err = collection.WithBulkSnapshot(func(snapshot *store.State) error {
 		source = snapshot
-		rows, collectErr := collectFileStoreBulkRows(snapshot, normalized)
+		var collectErr error
+		records, collectErr = collectFileStoreBulkRecords(snapshot, normalized)
 		if collectErr != nil {
 			return collectErr
-		}
-		records = make([]storeio.PrimaryGraphRecord, len(rows))
-		for at, row := range rows {
-			chunk := snapshot.Chunks.Get(row.sourceChunk)
-			if chunk == nil ||
-				chunk.Live&(uint64(1)<<row.sourceSlot) == 0 {
-				return fmt.Errorf("vibedb: bulk source row references a missing document")
-			}
-			key := chunk.Key(int(row.sourceSlot))
-			value := chunk.Docs.RawAt(int(chunk.Ord[row.sourceSlot]))
-			if len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
-				return fmt.Errorf(
-					"%w: CreateFromPrimary key exceeds the ordered-leaf bound",
-					ErrKeyTooLarge,
-				)
-			}
-			if len(value) == 0 || len(value) > normalized.InlineValueBytes {
-				return fmt.Errorf(
-					"%w: CreateFromPrimary requires non-empty inline documents",
-					ErrPrimaryCutoverUnsupported,
-				)
-			}
-			// A State is immutable. Borrowing its key and document storage keeps
-			// the bulk path to one descriptor per row; source is retained
-			// explicitly through graph construction below.
-			records[at] = storeio.PrimaryGraphRecord{
-				Key: byteview.Bytes(key), Value: value,
-			}
 		}
 		return sortPrimaryBulkRecords(records)
 	})

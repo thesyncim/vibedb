@@ -6,34 +6,34 @@ import (
 	"math/bits"
 	"os"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
-// fileStoreBulkRow identifies one live document in an in-memory heap State by
-// its source chunk and stable slot. It is the row descriptor the ordered-primary
-// bulk builder (CreateFromPrimary) walks.
-type fileStoreBulkRow struct {
-	sourceChunk uint32
-	sourceSlot  uint8
-}
-
-// collectFileStoreBulkRows enumerates every live document of a heap State in
-// chunk/slot order, enforcing the admission key and document bounds. It reads
-// only the surviving in-memory heap store, so it is shared by the ordered
-// primary bulk builder.
-func collectFileStoreBulkRows(state *store.State, options normalizedFileStoreOptions) ([]fileStoreBulkRow, error) {
+// collectFileStoreBulkRecords enumerates every live document of an immutable
+// heap State directly into the ordered-primary record plan. Key and value bytes
+// remain borrowed from state; the caller retains its bulk snapshot through graph
+// construction. Building the final descriptors in this pass avoids a separate
+// (chunk,slot) list and a second source lookup pass.
+func collectFileStoreBulkRecords(
+	state *store.State,
+	options normalizedFileStoreOptions,
+) ([]storeio.PrimaryGraphRecord, error) {
 	if state.Count < 0 ||
 		uint64(state.Count) > uint64(^uint32(0))*uint64(store.MaxChunkDocuments) {
 		return nil, store.ErrTooLarge
 	}
-	rows := make([]fileStoreBulkRow, 0, state.Count)
+	records := make([]storeio.PrimaryGraphRecord, state.Count)
+	at := 0
 	var collectErr error
-	state.Chunks.Each(func(chunkID uint32, chunk *store.Chunk) bool {
+	state.Chunks.Each(func(_ uint32, chunk *store.Chunk) bool {
 		for live := chunk.Live; live != 0; live &= live - 1 {
 			slot := uint8(bits.TrailingZeros64(live))
 			key := chunk.Key(int(slot))
 			raw := chunk.Docs.RawAt(int(chunk.Ord[slot]))
-			if len(key) > options.MaxKeyBytes {
+			if len(key) > options.MaxKeyBytes ||
+				len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
 				collectErr = ErrKeyTooLarge
 				return false
 			}
@@ -41,17 +41,28 @@ func collectFileStoreBulkRows(state *store.State, options normalizedFileStoreOpt
 				collectErr = ErrDocumentTooLarge
 				return false
 			}
-			rows = append(rows, fileStoreBulkRow{sourceChunk: chunkID, sourceSlot: slot})
+			if len(raw) == 0 || len(raw) > options.InlineValueBytes {
+				collectErr = ErrPrimaryCutoverUnsupported
+				return false
+			}
+			if at >= len(records) {
+				collectErr = fmt.Errorf("vibedb: collection bulk source count invariant")
+				return false
+			}
+			records[at] = storeio.PrimaryGraphRecord{
+				Key: byteview.Bytes(key), Value: raw,
+			}
+			at++
 		}
 		return true
 	})
 	if collectErr != nil {
 		return nil, collectErr
 	}
-	if len(rows) != state.Count {
+	if at != len(records) {
 		return nil, fmt.Errorf("vibedb: collection bulk source count invariant")
 	}
-	return rows, nil
+	return records, nil
 }
 
 // writeStorePageAt writes a fully framed page at a byte offset, verifying the
