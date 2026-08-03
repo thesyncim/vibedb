@@ -194,7 +194,7 @@ func TestRecoveryJournalHeaderFormatVersionRoundTripAndPreservation(t *testing.T
 	}
 
 	unsupported := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
-	unsupported.FormatVersion = RecoveryJournalFormatScalarPatch + 1
+	unsupported.FormatVersion = RecoveryJournalFormatConditional + 1
 	unsupported.RecycleCount = 1
 	encoded := make([]byte, RecoveryJournalHeaderSize)
 	if _, err := EncodeRecoveryJournalHeader(
