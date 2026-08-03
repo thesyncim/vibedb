@@ -56,6 +56,19 @@ type primaryBatchLeaf struct {
 	skip         bool
 }
 
+// stagedPrimaryBatch is the opaque product of stagePrimaryBatchLocked: dirty
+// frames and exact-index prep are admitted but not reader-visible. The single-
+// collection Update path fences with a kind-3 journal record before publish;
+// multi-collection commit (T4) fences with a kind-5 conditional record via
+// preparePrimaryBatchConditionalLocked, then publishes under externally held
+// snapshot gates.
+type stagedPrimaryBatch struct {
+	state         *fileStoreState
+	generation    uint64
+	preparedExact primaryExactPrepared
+	live          bool
+}
+
 // updatePrimaryBatch applies one WriteBatch to the ordered primary graph as one
 // logical failure-atomic publication. It is the engine of Collection.Update.
 //
@@ -66,6 +79,10 @@ type primaryBatchLeaf struct {
 // with one sync, and every logical leaf change publishes in one generation, so a
 // reader sees all of the batch or none of it. A failure after topology preparation
 // can leave logical content unchanged while Generation advances.
+//
+// Single-collection Update recomposes stage → kind-3 journal fence → publish
+// with its own snapshotGate acquisition so on-disk journal bytes stay
+// byte-identical to the pre-phase-split path.
 func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) {
 	if c == nil {
 		return ErrClosed
@@ -95,12 +112,6 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 	if !c.deferredCanonicalLane() {
 		return ErrPrimaryBatchUnsupportedLane
 	}
-	if c.primaryUnifiedOverlay.hasPending() {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
-			return err
-		}
-		c.primaryOverlayFolds.Add(1)
-	}
 	batch := c.fileWriteBatch()
 	defer c.releaseFileWriteBatch(batch)
 	if err := fn(batch); err != nil {
@@ -117,14 +128,69 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 	return applyErr
 }
 
-// applyPrimaryBatch runs the prepare/durability/publish protocol above, retrying
-// after a leaf split or a capacity checkpoint (both advance the published state,
-// so the batch re-plans against it). It reports whether a generation was
-// published and, for the buffered-journal lane, the group-commit ticket the
-// caller must wait on for the shared sync after releasing the writer (zero when
-// there is nothing to wait on). The sync lane fences before publish inside this
-// call and returns a zero ticket.
+// applyPrimaryBatch runs the stage/durability/publish protocol, retrying inside
+// stage after a leaf split or a capacity checkpoint. It reports whether a
+// generation was published and, for the buffered-journal lane, the group-commit
+// ticket the caller must wait on for the shared sync after releasing the writer
+// (zero when there is nothing to wait on). The sync lane fences before publish
+// inside this call and returns a zero ticket.
 func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) {
+	staged, err := c.stagePrimaryBatchLocked(batch)
+	if err != nil {
+		return false, 0, err
+	}
+	if !staged.live {
+		return false, 0, nil
+	}
+	// Point of no return for the sync lane: every fallible prepare has
+	// succeeded and every leaf frame is admitted dirty but not yet
+	// reader-visible. One kind-3 batch record covers the whole group with one
+	// sync; a device failure poisons and publishes nothing.
+	if err := c.journalBatchBeforePublishLocked(
+		staged.generation, c.batchJournalEntries,
+	); err != nil {
+		c.unwindStagedPrimaryBatch(&staged)
+		return false, 0, err
+	}
+	// Point of no return passed: these frames are about to become reachable
+	// through the batch's atomic router publication. Retire only the failure-
+	// unwind bookkeeping; MarkUnreachable would discard live pages. Leaving
+	// this slice populated also falsely makes every later buffered journal-
+	// delta checkpoint ineligible.
+	c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
+	c.publishPrimaryBatch(
+		staged.state, staged.generation, staged.preparedExact,
+	)
+	if c.buffered() {
+		// Buffered-visible deposits its already-published batch's redo record
+		// for the shared group sync after the writer is released.
+		target, ackErr := c.journalBatchDepositLocked(
+			staged.generation, c.batchJournalEntries,
+		)
+		if ackErr != nil {
+			return true, 0, ackErr
+		}
+		return true, target, nil
+	}
+	return true, 0, nil
+}
+
+// stagePrimaryBatchLocked materializes any pending overlay, plans and builds
+// every touched leaf, reserves capacity, and admits overflow chains plus leaf
+// frames. It stops before any journal fence: the caller chooses kind-3
+// (single-collection Update) or kind-5 (conditional prepare). The writer must
+// already be held. On success with live == true the returned unwind clears
+// every admitted frame; call it on any failure before publish. On a no-op
+// batch (absent deletes only) live is false and unwind is a no-op.
+func (c *Collection) stagePrimaryBatchLocked(
+	batch *WriteBatch,
+) (stagedPrimaryBatch, error) {
+	if c.primaryUnifiedOverlay.hasPending() {
+		if err := c.materializePrimaryParentsLocked(); err != nil {
+			return stagedPrimaryBatch{}, err
+		}
+		c.primaryOverlayFolds.Add(1)
+	}
 	// Each split strictly grows its tablet and each capacity checkpoint drains the
 	// pending set, so both make monotonic progress; the budget bounds a pathological
 	// placement loop the way primaryStructuralRetryLimit does for a single Put.
@@ -140,25 +206,25 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		c.batchPrimaryOverflowDurable = c.batchPrimaryOverflowDurable[:0]
 		state := c.state.Load()
 		if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
-			return false, 0, ErrClosed
+			return stagedPrimaryBatch{}, ErrClosed
 		}
 		if state.root.Generation == 0 || state.root.Generation >= uint64(1)<<48 {
-			return false, 0, storeio.ErrGenerationOrder
+			return stagedPrimaryBatch{}, storeio.ErrGenerationOrder
 		}
 		if err := c.planPrimaryBatch(state, batch); err != nil {
-			return false, 0, err
+			return stagedPrimaryBatch{}, err
 		}
 		leafCount := len(c.batchPrimaryLeaves)
 		if leafCount == 0 {
 			// Every mutation resolved to a delete of an absent key: nothing changes,
 			// nothing is journaled, nothing is published.
-			return false, 0, nil
+			return stagedPrimaryBatch{}, nil
 		}
 		if leafCount > cap(c.primaryPendingParents) {
 			// More distinct leaves than one atomic generation can hold pending. This
 			// is the reservation ceiling; a batch that would exceed it is refused
 			// whole rather than split across generations.
-			return false, 0, ErrBatchTooLarge
+			return stagedPrimaryBatch{}, ErrBatchTooLarge
 		}
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
@@ -166,19 +232,19 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 			if splitErr := c.preparePrimaryBatchTopology(
 				state, batch, splitKey,
 			); splitErr != nil {
-				return false, 0, errors.Join(buildErr, splitErr)
+				return stagedPrimaryBatch{}, errors.Join(buildErr, splitErr)
 			}
 			continue
 		}
 		if buildErr != nil {
-			return false, 0, buildErr
+			return stagedPrimaryBatch{}, buildErr
 		}
 		if !c.primaryBatchHasLiveLeaf() {
-			return false, 0, nil
+			return stagedPrimaryBatch{}, nil
 		}
 		checkpointed, err := c.ensurePrimaryBatchCapacity()
 		if err != nil {
-			return false, 0, err
+			return stagedPrimaryBatch{}, err
 		}
 		if checkpointed {
 			// A checkpoint advanced FileEnd, NextLogicalID, and every resident route;
@@ -188,49 +254,107 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
 		if err := c.admitPrimaryBatchOverflow(); err != nil {
 			c.unadmitPrimaryBatchLeaves()
-			return false, 0, err
+			return stagedPrimaryBatch{}, err
 		}
 		preparedExact, err := c.preparePrimaryBatchExact(state, generation)
 		if err != nil {
 			c.unadmitPrimaryBatchLeaves()
-			return false, 0, err
+			return stagedPrimaryBatch{}, err
 		}
 		if err := c.admitPrimaryBatchLeaves(); err != nil {
 			c.unwindPrimaryExactPrepared(&preparedExact)
 			c.unadmitPrimaryBatchLeaves()
-			return false, 0, err
+			return stagedPrimaryBatch{}, err
 		}
-		// Point of no return for the sync lane: every fallible prepare has
-		// succeeded and every leaf frame is admitted dirty but not yet
-		// reader-visible. One batch record covers the whole group with one sync; a
-		// device failure poisons and publishes nothing.
-		if err := c.journalBatchBeforePublishLocked(generation, c.batchJournalEntries); err != nil {
-			c.unwindPrimaryExactPrepared(&preparedExact)
-			c.unadmitPrimaryBatchLeaves()
-			return false, 0, err
-		}
-		// Point of no return passed: these frames are about to become reachable
-		// through the batch's atomic router publication. Retire only the failure-
-		// unwind bookkeeping; MarkUnreachable would discard live pages. Leaving
-		// this slice populated also falsely makes every later buffered journal-
-		// delta checkpoint ineligible.
-		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
-		c.publishPrimaryBatch(state, generation, preparedExact)
-		if c.buffered() {
-			// Buffered-visible deposits its already-published batch's redo record
-			// for the shared group sync after the writer is released.
-			target, ackErr := c.journalBatchDepositLocked(generation, c.batchJournalEntries)
-			if ackErr != nil {
-				return true, 0, ackErr
-			}
-			return true, target, nil
-		}
-		return true, 0, nil
+		return stagedPrimaryBatch{
+			state:         state,
+			generation:    generation,
+			preparedExact: preparedExact,
+			live:          true,
+		}, nil
 	}
 	if lastErr == nil {
 		lastErr = ErrPrimaryLeafSplitRequired
 	}
-	return false, 0, lastErr
+	return stagedPrimaryBatch{}, lastErr
+}
+
+// unwindStagedPrimaryBatch discards every dirty frame and exact-index record
+// staged for a batch that will not publish. It is idempotent.
+func (c *Collection) unwindStagedPrimaryBatch(staged *stagedPrimaryBatch) {
+	if staged == nil || !staged.live {
+		return
+	}
+	c.unwindPrimaryExactPrepared(&staged.preparedExact)
+	c.unadmitPrimaryBatchLeaves()
+	staged.live = false
+}
+
+// preparePrimaryBatchConditionalLocked appends one kind-5 conditional batch
+// record for a previously staged batch. forceSync makes the append durable in
+// place; multi-collection commit always passes true so every supported lane
+// fences before the decision record. Append and sync failures both poison with
+// plain poisonJournal — a conditional record without a decision cannot have
+// committed, so ErrCommitOutcomeUnknown is reserved for the decision sync.
+// Journal-region capacity shortfalls take the existing pressure-checkpoint
+// path and are neither poisons nor rejects. The writer must already be held.
+func (c *Collection) preparePrimaryBatchConditionalLocked(
+	staged *stagedPrimaryBatch,
+	markerID [16]byte,
+	markerEpoch, txnID uint64,
+	forceSync bool,
+) error {
+	if staged == nil || !staged.live {
+		return fmt.Errorf("%w: conditional prepare without staged batch", ErrClosed)
+	}
+	if failure := c.PersistenceError(); failure != nil {
+		return failure
+	}
+	if !c.journalEnabled() || c.journalReplaying {
+		return fmt.Errorf(
+			"%w: conditional prepare requires an open recovery journal",
+			ErrConditionalPrepareUnsupportedJournal,
+		)
+	}
+	if err := c.ensureConditionalJournalFormatLocked(); err != nil {
+		return err
+	}
+	if err := c.ensurePrimaryBatchConditionalJournalRoom(
+		c.batchJournalEntries,
+	); err != nil {
+		return err
+	}
+	if _, err := c.journal.AppendConditionalBatch(
+		staged.generation, markerID, markerEpoch, txnID, c.batchJournalEntries,
+	); err != nil {
+		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
+			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
+				return cpErr
+			}
+			c.automaticCheckpoints.Add(1)
+			if err := c.ensureConditionalJournalFormatLocked(); err != nil {
+				return err
+			}
+			if _, retryErr := c.journal.AppendConditionalBatch(
+				staged.generation, markerID, markerEpoch, txnID,
+				c.batchJournalEntries,
+			); retryErr != nil {
+				if errors.Is(retryErr, storeio.ErrRecoveryJournalFull) {
+					return retryErr
+				}
+				return c.poisonJournal(retryErr)
+			}
+		} else {
+			return c.poisonJournal(err)
+		}
+	}
+	if forceSync {
+		if err := c.journal.Sync(c.journalPowerSafe); err != nil {
+			return c.poisonJournal(err)
+		}
+	}
+	c.journalAcks.Add(1)
+	return nil
 }
 
 // preparePrimaryBatchExact stages the exact-index half of one batch. Batch leaf
@@ -962,6 +1086,25 @@ func (c *Collection) publishPrimaryBatch(
 	generation uint64,
 	preparedExact primaryExactPrepared,
 ) {
+	c.snapshotGate.Lock()
+	c.publishPrimaryBatchGateHeld(stagedPrimaryBatch{
+		state:         state,
+		generation:    generation,
+		preparedExact: preparedExact,
+		live:          true,
+	})
+	c.snapshotGate.Unlock()
+}
+
+// publishPrimaryBatchGateHeld is the gate-held body of publishPrimaryBatch.
+// Multi-collection commit acquires every participant's snapshotGate write side
+// in process-global order before calling this per member; single-collection
+// Update acquires the gate itself via publishPrimaryBatch. The writer must
+// already be held. Infallible by construction — see publishPrimaryBatch.
+func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
+	state := staged.state
+	generation := staged.generation
+	preparedExact := staged.preparedExact
 	totalDelta := 0
 	for i := range c.batchPrimaryLeaves {
 		if c.batchPrimaryLeaves[i].skip {
@@ -995,7 +1138,6 @@ func (c *Collection) publishPrimaryBatch(
 	}
 
 	router := c.primaryRouter.Load()
-	c.snapshotGate.Lock()
 	c.beginReaderFence()
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]
@@ -1014,7 +1156,6 @@ func (c *Collection) publishPrimaryBatch(
 		c.retirePrimaryVolatileRefLocked(prev)
 	}
 	c.endReaderFence()
-	c.snapshotGate.Unlock()
 	if len(c.batchPrimaryOverflowDurable) != 0 {
 		// ensurePrimaryBatchCapacity proved len+batch <= cap, and setup fixes cap to
 		// MaxRetiredExtents. append therefore neither allocates nor exposes a

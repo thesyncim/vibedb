@@ -125,6 +125,29 @@ func (c *Collection) poisonJournalCommitOutcomeUnknownForFence(
 // honor direct Store page I/O.
 var ErrStoreDirectIOUnsupported = storeio.ErrDirectIOUnsupported
 
+// ErrCollectionInDoubt reports that a standalone open found an uncovered
+// kind-5 conditional batch in the live journal window. The file participates
+// in a database transaction and must be opened through its database directory;
+// once the collection checkpoints past the record the refusal clears.
+var ErrCollectionInDoubt = errors.New(
+	"vibedb: collection holds an undecided database transaction; open its database directory",
+)
+
+// ErrConditionalPrepareUnsupportedJournal reports a defensive refusal when
+// conditional prepare is reached on a scalar-patch (ordinary buffered delta)
+// journal. That lane never upgrades to the conditional format in this pass;
+// the coordinator refuses the lane before prepare (T4).
+var ErrConditionalPrepareUnsupportedJournal = errors.New(
+	"vibedb: conditional prepare requires a conditional-format recovery journal",
+)
+
+// ErrTransactionMarkerEpochMismatch reports that a kind-5 record's MarkerEpoch
+// disagrees with the decision log's current epoch in either direction. A
+// recycled log never coexists with live old-epoch records.
+var ErrTransactionMarkerEpochMismatch = errors.New(
+	"vibedb: conditional journal record epoch disagrees with the decision log",
+)
+
 // recoveryJournalFaultHook, when non-nil, is invoked with each journal this
 // collection creates or opens. The exhaustive store-level crash sweep sets it to
 // install a FaultJournal over the journal's raw writes; production leaves it nil.
@@ -223,15 +246,20 @@ func (c *Collection) ensureOrdinaryBufferedRecoveryJournalLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := createSiblingRecoveryJournal(
-		c.file.Name(),
-		recoveryJournalHeaderFor(
-			c.storeID, journalID, uint32(c.options.PageSize),
-			c.options.MaxKeyBytes, c.options.InlineValueBytes,
-			c.options.MaxDocumentBytes, durable.root.Generation,
-			c.options.primaryUnifiedOverlayBytes,
-		),
-	); err != nil {
+	header := recoveryJournalHeaderFor(
+		c.storeID, journalID, uint32(c.options.PageSize),
+		c.options.MaxKeyBytes, c.options.InlineValueBytes,
+		c.options.MaxDocumentBytes, durable.root.Generation,
+		c.options.primaryUnifiedOverlayBytes,
+	)
+	// Catalog-owned collections mint at the conditional format word so they
+	// may prepare kind-5 records. Scalar-patch (ordinary buffered delta) stays
+	// on its own format word — that lane never upgrades in this pass.
+	if c.journalCatalogOwned &&
+		header.FormatVersion == storeio.RecoveryJournalFormatLegacy {
+		header.FormatVersion = storeio.RecoveryJournalFormatConditional
+	}
+	if err := createSiblingRecoveryJournal(c.file.Name(), header); err != nil {
 		return err
 	}
 	if err := c.openRecoveryJournalLocked(
@@ -531,13 +559,51 @@ func recoveryJournalBatchReplayStart(
 	return int(covered), nil
 }
 
+// recoveryJournalDecisionResolver answers whether a kind-5 conditional batch
+// should apply. The caller (T5) constructs it per collection, closing over that
+// collection's (StoreID, JournalID) so a decision commits the record only when
+// its participant list names them. A nil resolver is standalone open.
+type recoveryJournalDecisionResolver func(
+	markerID [16]byte, epoch, txnID uint64,
+) (committed bool, err error)
+
+// recoveryJournalReplayResolverHook, when non-nil, supplies the decision
+// resolver and marker epoch used by replayRecoveryJournalLocked. Production
+// leaves it nil so standalone Open keeps nil-resolver semantics. Tests that
+// need Open-driven resolved replay install a hook; T5 threads the real
+// resolver through replayRecoveryJournalResolvedLocked without this seam.
+var recoveryJournalReplayResolverHook func(*Collection) (
+	resolve recoveryJournalDecisionResolver, markerEpoch uint64,
+)
+
 // replayRecoveryJournalLocked re-applies every journaled record newer than the
 // recovered root's generation through the ordinary mutation path, then
 // checkpoints and recycles so the journal is empty and the store's durable root
 // covers every replayed acknowledgement. Replay suppresses its own journal
 // appends: the records are already durable, and re-journaling them would be
 // redundant work that the immediately-following recycle discards anyway.
+//
+// Standalone opens pass a nil resolver: any uncovered kind-5 fails closed with
+// ErrCollectionInDoubt. Database opens (T5) call
+// replayRecoveryJournalResolvedLocked with a participant-binding resolver.
 func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
+	if hook := recoveryJournalReplayResolverHook; hook != nil {
+		resolve, epoch := hook(c)
+		return c.replayRecoveryJournalResolvedLocked(rootGeneration, resolve, epoch)
+	}
+	return c.replayRecoveryJournalResolvedLocked(rootGeneration, nil, 0)
+}
+
+// replayRecoveryJournalResolvedLocked is the resolver-aware replay entry point.
+// markerEpoch is the decision log's current epoch; a kind-5 record whose
+// MarkerEpoch disagrees in either direction fails closed. The resolver is
+// consulted only for uncovered kind-5 records — a covered kind-5 is consumed
+// without resolution on every path. Resolver errors propagate unwrapped.
+func (c *Collection) replayRecoveryJournalResolvedLocked(
+	rootGeneration uint64,
+	resolve recoveryJournalDecisionResolver,
+	markerEpoch uint64,
+) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
 	// OpenRecoveryJournal has just validated the complete live region and
@@ -548,18 +614,19 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	}
 	applied := 0
 	formatVersion := c.journal.Header().FormatVersion
-	// Legacy records are logical set/delete operations and therefore idempotent.
-	// Inspect their complete live suffix from the journal's own base even when a
-	// prior interrupted recovery checkpoint advanced the physical root into that
-	// suffix. In particular, a legacy batch has one record generation for all of
-	// its entries; filtering it against a prefix checkpoint could otherwise skip
-	// the un-applied tail on the second recovery. Covered point records before the
-	// first ambiguous batch remain safely skipped. Once such a batch is found, its
-	// entire following record suffix is replayed in journal order so later covered
-	// points restore any key the older batch also touched. Format 1 contains scalar
-	// patches that are not idempotent, so it retains its exact prefix filter.
+	legacyBatchGrammar := formatVersion == storeio.RecoveryJournalFormatLegacy ||
+		formatVersion == storeio.RecoveryJournalFormatConditional
+	// Legacy and conditional-format records use logical set/delete operations
+	// and are therefore idempotent. Inspect their complete live suffix from the
+	// journal's own base even when a prior interrupted recovery checkpoint
+	// advanced the physical root into that suffix. Kind-5 records are excluded
+	// from the strictly-newer-generation short-circuit for the same reason: an
+	// aborted conditional at G+1 never advanced the collection generation, so a
+	// later applied record may reuse G+1 and a covered kind-5 must still be
+	// consumed. Format 1 contains scalar patches that are not idempotent, so it
+	// retains its exact prefix filter.
 	replayAfter := rootGeneration
-	if formatVersion == storeio.RecoveryJournalFormatLegacy {
+	if legacyBatchGrammar {
 		replayAfter = c.journal.BaseGeneration()
 	}
 	replayCoveredLegacySuffix := false
@@ -592,6 +659,76 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 			if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
 				if err := hook(c, rec, i); err != nil {
 					return err
+				}
+			}
+		}
+		return nil
+	}
+	// applyLegacyBatchAtomic replays one one-generation batch through Update.
+	// countAtomic adds the ambiguous no-op consume count used by kind-3 legacy
+	// batches; kind-5 callers pass false because they already counted the
+	// record as consumed-on-decode before resolving.
+	applyLegacyBatchAtomic := func(rec storeio.RecoveryRecord, countAtomic bool) error {
+		// MaxBatchDocuments/MaxBatchBytes are reopen-time admission policy,
+		// not persisted journal semantics. When the current process sized its
+		// batch arenas below this acknowledged record, replay the entries
+		// sequentially while Open is still private. The journal remains intact
+		// across any pressure checkpoint; a second recovery re-enters at the
+		// first covered batch and restores its complete ordered suffix.
+		if !c.legacyRecoveryBatchFitsUpdate(rec) {
+			return applyLegacyBatchSequential(rec)
+		}
+		// A legacy/conditional batch is one transactional WriteBatch, not a
+		// sequence of independently visible point mutations. Replaying through
+		// Update keeps its primary rows and exact-index postings atomic in
+		// memory and prevents a pressure checkpoint from persisting a prefix
+		// that a second recovery could mistake for the whole one-generation
+		// record.
+		batchErr := c.Update(func(batch *WriteBatch) error {
+			for i := range rec.Entries {
+				entry := rec.Entries[i]
+				switch entry.Kind {
+				case storeio.RecoveryRecordKindPut:
+					if err := batch.appendRecovery(
+						entry.Key, entry.Value, false,
+					); err != nil {
+						return err
+					}
+				case storeio.RecoveryRecordKindDelete:
+					if err := batch.appendRecovery(
+						entry.Key, nil, true,
+					); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf(
+						"%w: unknown legacy batch kind %d",
+						storeio.ErrRecoveryJournalRecord, entry.Kind,
+					)
+				}
+			}
+			return nil
+		})
+		if errors.Is(batchErr, ErrBatchTooLarge) {
+			return applyLegacyBatchSequential(rec)
+		}
+		if batchErr != nil {
+			return batchErr
+		}
+		if countAtomic {
+			// Count a successfully consumed legacy batch even when every entry
+			// is already a no-op (notably a pure-delete batch checkpointed by an
+			// earlier interrupted replay). The final checkpoint/recycle must still
+			// consume that ambiguous record instead of replaying it on every Open.
+			applied++
+		}
+		// Preserve the recovery fault seam, but only after the whole batch is
+		// published. A hook may checkpoint or interrupt recovery here; it can
+		// no longer observe or persist a torn prefix.
+		if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
+			for i := range rec.Entries {
+				if hookErr := hook(c, rec, i); hookErr != nil {
+					return hookErr
 				}
 			}
 		}
@@ -651,7 +788,44 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 		return putErr
 	}
 	err := c.journal.Replay(replayAfter, func(rec storeio.RecoveryRecord) error {
-		if formatVersion == storeio.RecoveryJournalFormatLegacy &&
+		if rec.Kind == storeio.RecoveryRecordKindConditionalBatch {
+			// Consumed-on-decode: every decoded kind-5 — applied or skipped —
+			// forces the post-replay fold+recycle so a stray conditional never
+			// survives reopen (including under a nil resolver for covered
+			// records that permit standalone open).
+			applied++
+			if rec.Generation <= rootGeneration {
+				// Covered: cannot change recovered state; consume without
+				// consulting the resolver on every open path.
+				return nil
+			}
+			if resolve == nil {
+				return ErrCollectionInDoubt
+			}
+			if rec.Conditional.MarkerEpoch != markerEpoch {
+				return fmt.Errorf(
+					"%w: record epoch %d decision epoch %d",
+					ErrTransactionMarkerEpochMismatch,
+					rec.Conditional.MarkerEpoch, markerEpoch,
+				)
+			}
+			committed, resolveErr := resolve(
+				rec.Conditional.MarkerID,
+				rec.Conditional.MarkerEpoch,
+				rec.Conditional.TxnID,
+			)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			if !committed {
+				// Same-epoch undecided or decided-elsewhere: presumed abort.
+				return nil
+			}
+			// Committed and uncovered: apply like a legacy one-generation batch.
+			// Consumed-on-decode already counted this record.
+			return applyLegacyBatchAtomic(rec, false)
+		}
+		if legacyBatchGrammar &&
 			rec.Generation <= rootGeneration && !replayCoveredLegacySuffix {
 			if rec.Kind != storeio.RecoveryRecordKindBatch {
 				return nil
@@ -668,68 +842,8 @@ func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 			if startErr != nil {
 				return startErr
 			}
-			if formatVersion == storeio.RecoveryJournalFormatLegacy {
-				// MaxBatchDocuments/MaxBatchBytes are reopen-time admission policy,
-				// not persisted journal semantics. When the current process sized its
-				// batch arenas below this acknowledged record, replay the entries
-				// sequentially while Open is still private. The journal remains intact
-				// across any pressure checkpoint; a second recovery re-enters at the
-				// first covered batch and restores its complete ordered suffix.
-				if !c.legacyRecoveryBatchFitsUpdate(rec) {
-					return applyLegacyBatchSequential(rec)
-				}
-				// A legacy batch is one transactional WriteBatch, not a sequence of
-				// independently visible point mutations. Replaying through Update keeps
-				// its primary rows and exact-index postings atomic in memory and prevents
-				// a pressure checkpoint from persisting a prefix that a second recovery
-				// could mistake for the whole one-generation record.
-				batchErr := c.Update(func(batch *WriteBatch) error {
-					for i := range rec.Entries {
-						entry := rec.Entries[i]
-						switch entry.Kind {
-						case storeio.RecoveryRecordKindPut:
-							if err := batch.appendRecovery(
-								entry.Key, entry.Value, false,
-							); err != nil {
-								return err
-							}
-						case storeio.RecoveryRecordKindDelete:
-							if err := batch.appendRecovery(
-								entry.Key, nil, true,
-							); err != nil {
-								return err
-							}
-						default:
-							return fmt.Errorf(
-								"%w: unknown legacy batch kind %d",
-								storeio.ErrRecoveryJournalRecord, entry.Kind,
-							)
-						}
-					}
-					return nil
-				})
-				if errors.Is(batchErr, ErrBatchTooLarge) {
-					return applyLegacyBatchSequential(rec)
-				}
-				if batchErr != nil {
-					return batchErr
-				}
-				// Count a successfully consumed legacy batch even when every entry
-				// is already a no-op (notably a pure-delete batch checkpointed by an
-				// earlier interrupted replay). The final checkpoint/recycle must still
-				// consume that ambiguous record instead of replaying it on every Open.
-				applied++
-				// Preserve the recovery fault seam, but only after the whole batch is
-				// published. A hook may checkpoint or interrupt recovery here; it can
-				// no longer observe or persist a torn prefix.
-				if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
-					for i := range rec.Entries {
-						if hookErr := hook(c, rec, i); hookErr != nil {
-							return hookErr
-						}
-					}
-				}
-				return nil
+			if legacyBatchGrammar {
+				return applyLegacyBatchAtomic(rec, true)
 			}
 			// A format-1 delta batch is intentionally a consecutive sequence of
 			// point generations. A pressure checkpoint may cover a prefix; start
@@ -810,6 +924,11 @@ func (c *Collection) legacyRecoveryBatchFitsUpdate(
 // generation inside the checkpoint's root publication. It is a no-op when no
 // journal is configured. The caller holds the writer and has already made the
 // checkpointed generation durable.
+//
+// Catalog-owned collections whose journal is still at the legacy format word
+// remint at the conditional format during this recycle — the one bounded
+// foreground upgrade path a prepare takes before appending a kind-5 record.
+// Scalar-patch journals are never upgraded here.
 func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 	if c.journalReplaying {
 		// A checkpoint forced mid-replay (staging pressure from the replayed
@@ -839,6 +958,18 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 		// The durable generation never regressed; nothing to recycle past.
 		return nil
 	}
+	if c.journalCatalogOwned &&
+		c.journal.Header().FormatVersion == storeio.RecoveryJournalFormatLegacy {
+		if err := c.remintRecoveryJournalConditionalLocked(baseGeneration); err != nil {
+			poisoned := c.poisonJournal(err)
+			c.journalGroup.fail(poisoned)
+			return poisoned
+		}
+		c.journalDeltaGeneration.Store(baseGeneration)
+		c.journalDeltaAppendedGeneration.Store(baseGeneration)
+		c.journalGroup.recycleAdvance()
+		return nil
+	}
 	if err := c.journal.Recycle(
 		baseGeneration, c.journalPowerSafe,
 	); err != nil {
@@ -860,6 +991,148 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 	// durable via the root and must complete without waiting for a sync of the
 	// records the recycle just discarded.
 	c.journalGroup.recycleAdvance()
+	return nil
+}
+
+// remintRecoveryJournalConditionalLocked replaces a legacy journal with a fresh
+// conditional-format sibling at baseGeneration. The live window is empty after
+// the caller's checkpoint, so truncating and recreating preserves crash
+// semantics while advancing the format word. The caller holds the writer.
+func (c *Collection) remintRecoveryJournalConditionalLocked(
+	baseGeneration uint64,
+) error {
+	old := c.journal.Header()
+	journalID := c.journalID
+	if err := c.closeRecoveryJournalLocked(); err != nil {
+		return err
+	}
+	c.journalReady.Store(false)
+	header := old
+	header.FormatVersion = storeio.RecoveryJournalFormatConditional
+	header.BaseGeneration = baseGeneration
+	header.BaseSequence = 0
+	header.RecycleCount = 0
+	if err := createSiblingRecoveryJournal(c.file.Name(), header); err != nil {
+		return err
+	}
+	return c.openRecoveryJournalLocked(journalID, baseGeneration)
+}
+
+// ensureConditionalJournalFormatLocked upgrades a legacy journal to the
+// conditional format when the collection is catalog-owned. An empty live
+// window remints in place (safe even with staged unpublished frames). A
+// non-empty window takes one bounded foreground checkpoint, which recycles
+// and remints — that path requires no staged batch, so prepare after stage
+// must already be on the conditional format. Scalar-patch journals refuse
+// defensively. The writer must already be held.
+func (c *Collection) ensureConditionalJournalFormatLocked() error {
+	if !c.journalEnabled() {
+		return ErrConditionalPrepareUnsupportedJournal
+	}
+	switch c.journal.Header().FormatVersion {
+	case storeio.RecoveryJournalFormatConditional:
+		return nil
+	case storeio.RecoveryJournalFormatScalarPatch:
+		return ErrConditionalPrepareUnsupportedJournal
+	case storeio.RecoveryJournalFormatLegacy:
+		if !c.journalCatalogOwned {
+			return ErrConditionalPrepareUnsupportedJournal
+		}
+		if c.journal.Cursor() == 0 {
+			gen := c.journal.BaseGeneration()
+			if durable := c.committer.DurableGeneration(); durable > gen {
+				gen = durable
+			}
+			if err := c.remintRecoveryJournalConditionalLocked(gen); err != nil {
+				return err
+			}
+			return nil
+		}
+		if len(c.batchPrimaryAdmitted) != 0 {
+			return fmt.Errorf(
+				"%w: upgrade conditional journal format before staging",
+				ErrConditionalPrepareUnsupportedJournal,
+			)
+		}
+		if err := c.checkpointBufferedLocked(); err != nil {
+			return err
+		}
+		c.automaticCheckpoints.Add(1)
+		if c.journal.Header().FormatVersion !=
+			storeio.RecoveryJournalFormatConditional {
+			return fmt.Errorf(
+				"%w: legacy journal did not remint at conditional format",
+				ErrConditionalPrepareUnsupportedJournal,
+			)
+		}
+		return nil
+	default:
+		return fmt.Errorf(
+			"%w: journal format %d",
+			ErrConditionalPrepareUnsupportedJournal,
+			c.journal.Header().FormatVersion,
+		)
+	}
+}
+
+// ensurePrimaryBatchConditionalJournalRoom guarantees a kind-5 record carrying
+// entries fits before prepare appends. Capacity shortfalls take the ordinary
+// pressure-checkpoint path and are not persistence poisons.
+func (c *Collection) ensurePrimaryBatchConditionalJournalRoom(
+	entries []storeio.RecoveryBatchEntry,
+) error {
+	if c.journalReplaying || !c.journalEnabled() {
+		return nil
+	}
+	if c.journal.FitsConditionalBatch(entries) {
+		return nil
+	}
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return err
+	}
+	c.automaticCheckpoints.Add(1)
+	if err := c.ensureConditionalJournalFormatLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// journalHoldsConditional reports whether the journal's live window still holds
+// any kind-5 record for markerID at epoch. The caller must hold the writer.
+// Used by decision-log recycle legality (T4) and DropCollection retirement (T5).
+func (c *Collection) journalHoldsConditional(
+	markerID [16]byte, epoch uint64,
+) bool {
+	if !c.journalEnabled() ||
+		c.journal.Header().FormatVersion !=
+			storeio.RecoveryJournalFormatConditional ||
+		c.journal.Cursor() == 0 {
+		return false
+	}
+	found := false
+	_ = c.journal.Replay(c.journal.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
+		if rec.Kind == storeio.RecoveryRecordKindConditionalBatch &&
+			rec.Conditional.MarkerID == markerID &&
+			rec.Conditional.MarkerEpoch == epoch {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// checkpointPastConditionalsLocked performs one bounded foreground checkpoint
+// plus recycle that folds the live window past every conditional record. Used
+// by T5's DropCollection retirement barrier and T4's laggard fold under
+// decision-log region pressure. The caller holds the writer.
+func (c *Collection) checkpointPastConditionalsLocked() error {
+	if failure := c.PersistenceError(); failure != nil {
+		return failure
+	}
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return err
+	}
+	c.automaticCheckpoints.Add(1)
 	return nil
 }
 
