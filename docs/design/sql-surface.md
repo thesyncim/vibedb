@@ -1071,7 +1071,10 @@ operation:
 - unique/partial/range/full-text indexes, expression indexes, and selectable
   index methods;
 - composite primary keys in the typed SQL runtime and atomic transactions
-  spanning more than one table.
+  spanning more than one table. Removing the multi-table refusal (and the
+  savepoint refusal) is designed in
+  [multi-table-transactions.md](multi-table-transactions.md); both refusals
+  stand until that design's named tests pass.
 
 These are explicit errors rather than parser successes followed by
 approximations.

@@ -3,6 +3,14 @@
 This is the current storage qualification backlog. Projected behavior remains
 unclaimed until its named test or benchmark passes.
 
+## Multi-table transactions
+
+Land the crash-atomic multi-collection commit: conditional journal records
+decided by one database-scoped decision-log sync, first-class native
+transactions, the SQL fence removal, and savepoints. The design, crash
+matrix, and gates are in
+[multi-table-transactions.md](multi-table-transactions.md).
+
 ## Parallel writes
 
 Implement tablet-local staging with grouped fencing and one serialized
