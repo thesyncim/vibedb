@@ -2537,6 +2537,44 @@ func TestConcurrentPrimaryScratchIsFixedAndLargeInputFallsBack(t *testing.T) {
 	}
 }
 
+func TestConcurrentPrimaryContextBackingIsLazy(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 256, concurrentPrimaryTestOptions(),
+	)
+	pool := fixture.collection.primaryConcurrentContexts
+	if pool == nil {
+		t.Fatal("concurrent context pool is nil")
+	}
+	if pool.initialized.Load() {
+		t.Fatal("read-only open initialized concurrent context backing")
+	}
+	for i := range pool.contexts {
+		context := &pool.contexts[i]
+		if context.index != nil || context.patchSpans != nil ||
+			context.canonical != nil || context.value != nil ||
+			context.publish.signal != nil {
+			t.Fatalf("context %d allocated backing before first use", i)
+		}
+	}
+	created, err := fixture.collection.Put(
+		[]byte(fixture.keys[0]), []byte(`{"lazy":true}`),
+	)
+	if err != nil || created {
+		t.Fatalf("first replacement = created %v, err %v", created, err)
+	}
+	if !pool.initialized.Load() {
+		t.Fatal("first eligible mutation did not initialize context backing")
+	}
+	for i := range pool.contexts {
+		context := &pool.contexts[i]
+		if cap(context.index) == 0 || cap(context.patchSpans) == 0 ||
+			cap(context.canonical) == 0 || cap(context.value) == 0 ||
+			context.publish.signal == nil {
+			t.Fatalf("context %d backing is incomplete after first use", i)
+		}
+	}
+}
+
 func TestConcurrentPrimaryContextPoolExhaustionWakesWithoutLoss(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
 		t, 256, concurrentPrimaryTestOptions(),

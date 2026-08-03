@@ -125,6 +125,12 @@ func (c *primaryConcurrentContext) canonicalize(
 // discard and recreate it.
 type primaryConcurrentContextPool struct {
 	contexts []primaryConcurrentContext
+	// contextOnce defers the sizeable per-caller JSON/canonical workspaces
+	// until an eligible mutation first claims the lane. initialized publishes
+	// those immutable slice/channel headers to lock-free Stats readers.
+	contextOnce  sync.Once
+	initialized  atomic.Bool
+	indexEntries int
 	// free contains one bit per context. The ordinary path claims a bit with a
 	// bounded CAS attempt and never enters a channel or mutex. A caller that
 	// observes exhaustion joins wait below; later fast callers also join that
@@ -158,7 +164,7 @@ func newPrimaryConcurrentContextPool(
 	indexEntries := min(rawLimit+2, primaryConcurrentIndexLimit)
 	pool := &primaryConcurrentContextPool{
 		contexts: make([]primaryConcurrentContext, count),
-		rawLimit: rawLimit,
+		rawLimit: rawLimit, indexEntries: indexEntries,
 	}
 	pool.wait.L = &pool.waitMu
 	free := primaryConcurrentContextMask
@@ -169,22 +175,38 @@ func newPrimaryConcurrentContextPool(
 	pool.allFree = free
 	for i := range pool.contexts {
 		pool.contexts[i].poolSlot = uint8(i)
-		pool.contexts[i].index = make(
-			[]vibejson.IndexEntry, 0, indexEntries,
-		)
-		pool.contexts[i].patchSpans = make(
-			[]storeio.UnifiedTokenSpan, 0, 2*indexEntries,
-		)
-		pool.contexts[i].canonical = make([]byte, 0, 2*rawLimit)
-		pool.contexts[i].value = make([]byte, 0, rawLimit)
-		pool.contexts[i].workspace = storeio.NewCanonicalWorkspace(
-			indexEntries, rawLimit,
-		)
-		pool.contexts[i].publish.signal = make(
-			chan primaryConcurrentPublishSignal, 1,
-		)
 	}
 	return pool
+}
+
+func (p *primaryConcurrentContextPool) ensureContexts() bool {
+	if p == nil {
+		return false
+	}
+	p.contextOnce.Do(func() {
+		if p.free.Load()&primaryConcurrentPoolClosed != 0 {
+			return
+		}
+		for i := range p.contexts {
+			context := &p.contexts[i]
+			context.index = make(
+				[]vibejson.IndexEntry, 0, p.indexEntries,
+			)
+			context.patchSpans = make(
+				[]storeio.UnifiedTokenSpan, 0, 2*p.indexEntries,
+			)
+			context.canonical = make([]byte, 0, 2*p.rawLimit)
+			context.value = make([]byte, 0, p.rawLimit)
+			context.workspace = storeio.NewCanonicalWorkspace(
+				p.indexEntries, p.rawLimit,
+			)
+			context.publish.signal = make(
+				chan primaryConcurrentPublishSignal, 1,
+			)
+		}
+		p.initialized.Store(true)
+	})
+	return p.initialized.Load()
 }
 
 func (p *primaryConcurrentContextPool) capacityBytes() uint64 {
@@ -193,6 +215,9 @@ func (p *primaryConcurrentContextPool) capacityBytes() uint64 {
 	}
 	bytes := uint64(cap(p.contexts)) *
 		uint64(unsafe.Sizeof(primaryConcurrentContext{}))
+	if !p.initialized.Load() {
+		return bytes
+	}
 	for i := range p.contexts {
 		context := &p.contexts[i]
 		bytes += uint64(cap(context.index)) *
@@ -207,7 +232,7 @@ func (p *primaryConcurrentContextPool) capacityBytes() uint64 {
 }
 
 func (p *primaryConcurrentContextPool) acquire() *primaryConcurrentContext {
-	if p == nil {
+	if !p.ensureContexts() {
 		return nil
 	}
 	// At most one claim can win per context. Retrying once per fixed slot absorbs
@@ -595,11 +620,6 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	if pool == nil {
 		return false, false, nil
 	}
-	context := pool.acquire()
-	if context == nil {
-		return false, false, ErrClosed
-	}
-	defer pool.release(context)
 
 	// These bounds and the context belong exclusively to this caller and are
 	// immutable for the collection's lifetime. Keep validation and JSON tape /
@@ -611,6 +631,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	var preflightErr error
 	var canonical []byte
 	var canonicalIndex storeio.CanonicalSpanIndex
+	var context *primaryConcurrentContext
 	switch {
 	case len(key) == 0 || len(key) > c.options.MaxKeyBytes ||
 		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes:
@@ -622,6 +643,11 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		// established path without paying for a parallel tape build.
 		eligible = false
 	default:
+		context = pool.acquire()
+		if context == nil {
+			return false, false, ErrClosed
+		}
+		defer pool.release(context)
 		if hook := concurrentPrimaryPutCanonicalizeHook; hook == nil {
 			canonical, canonicalIndex, eligible, preflightErr =
 				context.canonicalize(src, c.options.Collection.IndexOptions)
