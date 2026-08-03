@@ -104,16 +104,22 @@ const (
 // catalog to what a catalog should be: a name-to-handle map plus the lock
 // discipline that makes a cross-collection cut well defined.
 //
-// What one file per collection costs is real and should be stated: N open file
-// descriptors and N writer locks rather than one, and N independent fsyncs for
-// a logical change spanning collections. It does not cost cross-collection
-// atomicity, because a shared file would not have provided that either without
-// a cross-collection transaction the engine does not have.
+// Cross-collection atomicity rides a sibling sidecar, not a shared primary
+// file. Database.Update (and the caller-owned UpdateCollections primitive)
+// prepares one conditional journal record per dirty participant, then appends
+// and syncs a single decision record in txn.vtm — that sync is the sole
+// atomic commit point — before publishing under every snapshotGate held at
+// once. Read cuts never observe a torn multi-collection commit. Standalone
+// [Open] of a participant that still holds an uncovered conditional fails
+// closed; open the database directory instead. The one-file layout's cost
+// remains: N open descriptors and N writer locks, and a K-participant commit
+// performs K+1 fsyncs.
 //
 // A Database owns the files it opened and closes them in Close. OpenDatabase
 // stores a cleaned absolute directory with existing symlink components
 // resolved. That directory must not be renamed or replaced before Close:
-// recovery journals are intentionally paired by stable primary pathname.
+// recovery journals are intentionally paired by stable primary pathname, and
+// txn.vtm is paired by the same directory.
 type Database struct {
 	dir      string
 	fileMode os.FileMode
@@ -172,7 +178,12 @@ type DatabaseOptions struct {
 //
 // Recovery is per collection and bounded exactly as [Open]'s is: no key,
 // document or posting leaf is scanned. A directory holding K collections
-// costs K bounded recoveries and K open descriptors.
+// costs K bounded recoveries and K open descriptors. When txn.vtm is present,
+// OpenDatabase loads the decision log first, opens every collection with a
+// participant-binding resolver (so committed conditionals roll forward and
+// undecided ones are presumed abort and consumed), then reconciles
+// participant presence and log-removal legality. Collection opens complete
+// before the attached TxnLog accepts its first commit.
 //
 // Relative dir values are resolved once at entry, so a later process-wide
 // working-directory change cannot retarget CreateCollection, DropCollection,
@@ -228,16 +239,27 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	if err := removeOrphanRecoveryJournals(dir, items); err != nil {
 		return nil, err
 	}
+	txnRecovery, err := loadDatabaseTxnRecovery(dir, TxnLogOptions{})
+	if err != nil {
+		return nil, err
+	}
 	d := &Database{
 		dir: dir, fileMode: fileMode,
 		collections: make(map[string]*databaseEntry),
 	}
+	opened := make([]*Collection, 0, len(items))
 	for _, item := range items {
 		base := item.Name()
+		if isTxnMarkerFilename(base) {
+			continue
+		}
 		name, encoded := collectionname.Decode(base)
 		if !encoded {
 			if strings.HasSuffix(base, collectionFileSuffix) {
 				_ = d.Close()
+				if txnRecovery.log != nil {
+					_ = txnRecovery.log.Close()
+				}
 				return nil, fmt.Errorf(
 					"%w: %q; recreate the unreleased database",
 					ErrUnsupportedDatabaseLayout, base,
@@ -248,17 +270,45 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 		file, openErr := openCatalogPrimary(root, base)
 		if openErr != nil {
 			_ = d.Close()
+			if txnRecovery.log != nil {
+				_ = txnRecovery.log.Close()
+			}
 			return nil, fmt.Errorf("vibedb: durable collection %q: %w", name, openErr)
 		}
-		collection, openErr := Open(file, options.Options)
+		cfg := collectionOpenConfig{catalogOwned: true}
+		if txnRecovery.absent {
+			cfg.absentLog = true
+		} else {
+			cfg.decisions = txnRecovery.decisions
+		}
+		collection, openErr := openCollection(file, options.Options, cfg)
 		if openErr != nil {
 			_ = file.Close()
 			_ = d.Close()
+			if txnRecovery.log != nil {
+				_ = txnRecovery.log.Close()
+			}
 			return nil, fmt.Errorf("vibedb: durable collection %q: %w", name, openErr)
 		}
 		d.collections[name] = &databaseEntry{
 			name: name, filename: base, collection: collection, file: file,
 		}
+		opened = append(opened, collection)
+	}
+	if err := reconcileDatabaseTxnAfterOpens(txnRecovery, opened); err != nil {
+		_ = d.Close()
+		if txnRecovery.log != nil {
+			_ = txnRecovery.log.Close()
+		}
+		return nil, err
+	}
+	// Attach only when txn.vtm still exists after reconciliation. Lazy mint on
+	// the first Database.Update stands otherwise. Collection opens (and their
+	// stray consumption) completed above before any commit can run.
+	if !txnRecovery.absent && txnRecovery.log != nil && txnRecovery.log.marker != nil {
+		attachDatabaseTxnLog(d, txnRecovery.log)
+	} else if txnRecovery.log != nil {
+		_ = txnRecovery.log.Close()
 	}
 	d.reorder()
 	return d, nil
@@ -278,6 +328,14 @@ func validateDatabaseLayout(root *os.Root, items []fs.DirEntry) error {
 				"%w: non-canonical case alias %q",
 				ErrUnsupportedDatabaseLayout, base,
 			)
+		}
+		if isTxnMarkerFilename(base) {
+			// txn.vtm is a reserved sidecar, never a decodable collection
+			// filename (no c- prefix). Require a regular non-symlink file.
+			if err := validateTxnMarkerLayout(root, base); err != nil {
+				return err
+			}
+			continue
 		}
 		_, primary := collectionname.Decode(base)
 		_, journal := collectionname.DecodeJournal(base)
@@ -381,11 +439,14 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 		}
 		return nil, err
 	}
-	collection, err := Create(file, options)
+	collection, err := createCollection(file, options, true)
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
 		return nil, err
+	}
+	if log := lookupDatabaseTxnLog(d); log != nil {
+		log.registerCollection(collection)
 	}
 	entry := &databaseEntry{
 		name: strings.Clone(name), filename: filename,
@@ -423,6 +484,12 @@ func (d *Database) Collection(name string) (*Collection, bool) {
 // journal, never a live primary missing recovery state. Dropping a name that is
 // not cataloged is not an error.
 //
+// When the collection still holds conditional journal records or an
+// undischarged decision names its StoreID, DropCollection first folds the
+// journal past those records and appends a participant-retired record to
+// txn.vtm, then performs today's ordered primary→journal deletion. A crash
+// around that barrier leaves a consistent reopen image either way.
+//
 // A cleanup failure leaves a hidden pending-delete entry that reserves name;
 // call DropCollection(name) again after repairing the filesystem. Collection,
 // Names, All, Len, and Snapshot exclude pending deletes, while
@@ -453,6 +520,9 @@ func (d *Database) DropCollection(name string) error {
 		return nil
 	}
 	if !entry.deleting {
+		if err := d.retireCollectionBeforeDrop(entry); err != nil {
+			return err
+		}
 		entry.deleting = true
 		d.reorder()
 	}
@@ -557,6 +627,12 @@ func (d *Database) Close() error {
 		// later Close can resume their low-level teardown state machine.
 		d.order = nil
 		d.snapshotOrder = nil
+		// Detach and close the decision log on the first attempt so a closed
+		// Database cannot leak the txn.vtm fd or leave a stale registry entry
+		// for a reopened Database in the same process.
+		if log := detachDatabaseTxnLog(d); log != nil {
+			d.rememberCloseError(log.Close())
+		}
 	}
 	var retryable error
 	for _, entry := range d.collections {

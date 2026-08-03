@@ -230,18 +230,23 @@ func (h snapshotCutHold) release() {
 //
 // # What the cut does not guarantee
 //
-// It does not make separate writes atomic. A Database has no cross-collection
-// transaction: an application that puts one document into orders and then
-// another into customers has performed two independent commits, and a snapshot
-// may legitimately fall between them. The snapshot is consistent with respect
-// to the database's own commits, not with respect to an application's intent
-// spanning several of them.
+// It does not invent atomicity for independent point writes. An application
+// that puts one document into orders through Collection.Update and then
+// another into customers through a second Update has performed two commits, and
+// a snapshot may legitimately fall between them. Database.Update (and
+// UpdateCollections) is the cross-collection transaction: its decision-log
+// sync is the sole commit point, every participant publishes under gates held
+// at once, and this cut therefore never observes a torn multi-collection
+// commit. The snapshot is consistent with respect to the database's own
+// commits — including those transactions — not with respect to an
+// application's intent that spans several independent ones.
 //
-// It does not survive a crash. A lease is process memory, not a durable
-// reservation. After a restart each collection recovers to its own last
-// committed generation, and because those commits were independent, the
-// recovered set need not be a cut this snapshot would ever have produced.
-// Consistency here is a read-time property of a running process.
+// It does not survive a crash as a lease. A lease is process memory, not a
+// durable reservation. After a restart OpenDatabase reconciles txn.vtm against
+// each collection's journal so every decided multi-collection transaction is
+// all-committed or all-aborted across participants; independent
+// single-collection commits recover per file as before. Consistency of this
+// snapshot value is still a read-time property of a running process.
 //
 // It is not a timestamp, and this is the limitation that matters for where the
 // engine might go next. The cut is established by mutual exclusion: it works

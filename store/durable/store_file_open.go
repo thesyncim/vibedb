@@ -8,9 +8,28 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
+// collectionOpenConfig threads catalog ownership and the decision resolver
+// into the shared open path. Standalone Open leaves every field zero.
+type collectionOpenConfig struct {
+	catalogOwned bool
+	decisions    *storeio.TxnDecisions
+	// absentLog selects the L1/L3 resolver that returns ErrTransactionLogMissing
+	// for every uncovered kind-5 lookup. Used when the database directory has
+	// no txn.vtm (or when OpenWithTransactions is called with a nil decisions
+	// pointer). Mutually exclusive with a non-nil decisions pointer.
+	absentLog bool
+}
+
 // Create initializes an empty durable collection in file and fences its
-// first root before returning.
+// first root before returning. Standalone creates leave journalCatalogOwned
+// false so the journal mints at the lane's ordinary format word.
 func Create(file *os.File, options Options) (*Collection, error) {
+	return createCollection(file, options, false)
+}
+
+func createCollection(
+	file *os.File, options Options, catalogOwned bool,
+) (*Collection, error) {
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
@@ -49,6 +68,7 @@ func Create(file *os.File, options Options) (*Collection, error) {
 	if err != nil {
 		return nil, err
 	}
+	collection.journalCatalogOwned = catalogOwned
 	collection.writerLocked = true
 	locked = false
 	if err := collection.createInitialState(); err != nil {
@@ -61,7 +81,21 @@ func Create(file *os.File, options Options) (*Collection, error) {
 // Open performs bounded recovery: it reads the two superblocks, the
 // selected state root, and its top-level directory pages, then starts with an
 // empty read cache. It does not scan keys, documents, or postings.
+//
+// Standalone Open passes a nil decision resolver into journal replay. An
+// uncovered kind-5 conditional batch in the live journal window fails closed
+// with ErrCollectionInDoubt: the file participates in a database transaction
+// and must be opened through its database directory (or OpenWithTransactions).
+// The refusal is transient — once the collection checkpoints past the record
+// the file is self-contained again. Covered kind-5 records are consumed
+// without resolution and do not refuse standalone open.
 func Open(file *os.File, options Options) (*Collection, error) {
+	return openCollection(file, options, collectionOpenConfig{})
+}
+
+func openCollection(
+	file *os.File, options Options, cfg collectionOpenConfig,
+) (*Collection, error) {
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
@@ -122,6 +156,9 @@ func Open(file *os.File, options Options) (*Collection, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Catalog-owned opens set the flag before the journal is opened or
+	// recycled so a foreground reopen fold mints the conditional format word.
+	collection.journalCatalogOwned = cfg.catalogOwned
 	collection.writerLocked = true
 	locked = false
 	if err := collection.committer.InitializeRecovery(
@@ -177,12 +214,45 @@ func Open(file *os.File, options Options) (*Collection, error) {
 			_ = collection.closeResources()
 			return nil, err
 		}
-		if err := collection.replayRecoveryJournalLocked(root.Generation); err != nil {
+		resolve, markerEpoch, resolveErr := collectionOpenResolver(
+			cfg, collection.storeID, root.JournalID, file.Name(),
+		)
+		if resolveErr != nil {
+			_ = collection.closeResources()
+			return nil, resolveErr
+		}
+		if err := collection.replayRecoveryJournalResolvedLocked(
+			root.Generation, resolve, markerEpoch,
+		); err != nil {
 			_ = collection.closeResources()
 			return nil, err
 		}
 	}
 	return collection, nil
+}
+
+// collectionOpenResolver builds the per-collection decision resolver. The
+// resolver closes over this collection's (StoreID, JournalID) so a decision
+// commits the record only when its participant list names them.
+func collectionOpenResolver(
+	cfg collectionOpenConfig,
+	storeID, journalID [16]byte,
+	primaryPath string,
+) (recoveryJournalDecisionResolver, uint64, error) {
+	if cfg.decisions != nil {
+		return participantBindingResolver(
+			cfg.decisions, storeID, journalID,
+		), cfg.decisions.Epoch(), nil
+	}
+	if cfg.absentLog {
+		epoch, _, err := peekCollectionConditionalEpoch(primaryPath)
+		if err != nil {
+			return nil, 0, err
+		}
+		return absentLogResolver(), epoch, nil
+	}
+	// Standalone Open: nil resolver → ErrCollectionInDoubt on uncovered kind-5.
+	return nil, 0, nil
 }
 
 // createInitialState builds a fresh, empty ordered-primary collection. A newly
