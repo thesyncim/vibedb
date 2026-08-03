@@ -41,6 +41,12 @@ type compactStreamEncoding struct {
 	dict  [][]byte
 }
 
+type compactAlphabetPlan struct {
+	width      int
+	totalBytes int
+	encoded    int
+}
+
 // compactStreamScratch retains every candidate's backing storage while the
 // planner chooses the smallest representation. A stripe emits the winner
 // before reusing this workspace for the next column, so one fixed candidate
@@ -114,15 +120,12 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 	}
 	dictionaryBytes := s.measureDictionary(values)
 	frontBytes := measureCompactFront(values)
-	n := 2
+	n := 3
 	alphabetLimit := min(
 		dictionaryBytes,
 		frontBytes,
 	)
-	if alphabet, ok := s.encodeAlphabet(n, values, alphabetLimit); ok {
-		s.candidates[n] = alphabet
-		n++
-	}
+	alphabet, hasAlphabet := s.measureAlphabet(2, values, alphabetLimit)
 	s.integers = slices.Grow(s.integers[:0], len(values))[:len(values)]
 	allIntegers := true
 	for i := range values {
@@ -157,7 +160,11 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 	}
 	bestBytes := frontBytes
 	bestSlot := -1
-	for slot := 2; slot < n; slot++ {
+	if hasAlphabet && alphabet.encoded < bestBytes {
+		bestBytes = alphabet.encoded
+		bestSlot = 2
+	}
+	for slot := 3; slot < n; slot++ {
 		candidate := s.candidates[slot]
 		if candidate.encodedBytes() < bestBytes {
 			bestBytes = candidate.encodedBytes()
@@ -173,6 +180,9 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 	}
 	if bestSlot < 0 {
 		return s.encodeFront(1, values)
+	}
+	if bestSlot == 2 {
+		return s.finishAlphabet(2, values, alphabet)
 	}
 	return s.candidates[bestSlot]
 }
@@ -360,13 +370,25 @@ func (s *compactStreamScratch) encodeAlphabet(
 	values [][]byte,
 	limit int,
 ) (compactStreamEncoding, bool) {
+	plan, ok := s.measureAlphabet(slot, values, limit)
+	if !ok {
+		return compactStreamEncoding{}, false
+	}
+	return s.finishAlphabet(slot, values, plan), true
+}
+
+func (s *compactStreamScratch) measureAlphabet(
+	slot int,
+	values [][]byte,
+	limit int,
+) (compactAlphabetPlan, bool) {
 	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
 	lengthFloor := 4 * blocks
 	for _, value := range values {
 		lengthFloor += compactUvarintLen(uint64(len(value)))
 	}
 	if limit > 0 && compactStreamHeader+2+1+lengthFloor >= limit {
-		return compactStreamEncoding{}, false
+		return compactAlphabetPlan{}, false
 	}
 	var present [256]bool
 	count := 0
@@ -379,7 +401,7 @@ func (s *compactStreamScratch) encodeAlphabet(
 		}
 	}
 	if count == 0 || count > 64 {
-		return compactStreamEncoding{}, false
+		return compactAlphabetPlan{}, false
 	}
 	width := bits.Len(uint(count - 1))
 	totalBytes := lengthFloor
@@ -387,17 +409,33 @@ func (s *compactStreamScratch) encodeAlphabet(
 		totalBytes += (len(value)*width + 7) / 8
 	}
 	if encodedBytes := compactStreamHeader + 2 + count + totalBytes; limit > 0 && encodedBytes >= limit {
-		return compactStreamEncoding{}, false
+		return compactAlphabetPlan{}, false
 	}
 	alphabet := slices.Grow(s.alphabet[slot][:0], count)[:0]
-	var code [256]uint8
 	for b := range present {
 		if present[b] {
-			code[b] = uint8(len(alphabet))
 			alphabet = append(alphabet, byte(b))
 		}
 	}
 	s.alphabet[slot] = alphabet
+	return compactAlphabetPlan{
+		width: width, totalBytes: totalBytes,
+		encoded: compactStreamHeader + 2 + count + totalBytes,
+	}, true
+}
+
+func (s *compactStreamScratch) finishAlphabet(
+	slot int,
+	values [][]byte,
+	plan compactAlphabetPlan,
+) compactStreamEncoding {
+	alphabet := s.alphabet[slot]
+	var code [256]uint8
+	for id, b := range alphabet {
+		code[b] = uint8(id)
+	}
+	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
+	width, totalBytes := plan.width, plan.totalBytes
 	data := slices.Grow(s.data[slot][:0], totalBytes)[:4*blocks]
 	clear(data)
 	for row, value := range values {
@@ -420,7 +458,7 @@ func (s *compactStreamScratch) encodeAlphabet(
 	return compactStreamEncoding{
 		kind: compactStreamAlphabet, width: uint8(width), count: len(values),
 		data: data, dict: dictionary,
-	}, true
+	}
 }
 
 func (s *compactStreamScratch) encodeFOR(slot int, values []int64) compactStreamEncoding {

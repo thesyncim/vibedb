@@ -164,6 +164,26 @@ func TestMeasureCompactFrontMatchesEncoding(t *testing.T) {
 	}
 }
 
+func TestMeasureCompactAlphabetMatchesEncoding(t *testing.T) {
+	values := make([][]byte, 130)
+	for row := range values {
+		values[row] = []byte("value/" + leftPadDecimal(row, 5) +
+			"/abcdefghijklmnopqrstuvwxyz")
+	}
+	for _, count := range []int{1, 2, 63, 64, 65, 127, 128, 129, 130} {
+		var scratch compactStreamScratch
+		plan, ok := scratch.measureAlphabet(2, values[:count], 0)
+		if !ok {
+			t.Fatalf("count=%d alphabet rejected", count)
+		}
+		encoded := scratch.finishAlphabet(2, values[:count], plan)
+		if got := encoded.encodedBytes(); got != plan.encoded {
+			t.Fatalf("count=%d measured=%d encoded=%d", count, plan.encoded, got)
+		}
+		compactCodecRoundTrip(t, encoded, values[:count])
+	}
+}
+
 func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
 	for width := 0; width <= 64; width++ {
 		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {
