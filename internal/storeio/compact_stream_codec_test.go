@@ -541,3 +541,82 @@ func leftPadDecimal(value, width int) string {
 	copy(buf[width-len(raw):], raw)
 	return string(buf)
 }
+
+// TestCompactStreamPlannerEstimateExact pins the scalar planner's borrowed cost
+// estimates to the bytes the finished encoding actually serializes.
+// measureDictionary and measureAlphabet steer candidate selection and the
+// alphabet size limit before the winning encoding is built; a drifting estimate
+// would let leaf-capacity planning admit a stream image that does not match its
+// reserved extent. Both the borrowed estimate and the serialized length are
+// checked against the finished encoding across cardinality extremes.
+func TestCompactStreamPlannerEstimateExact(t *testing.T) {
+	sequential := make([][]byte, 4096)
+	for i := range sequential {
+		sequential[i] = []byte("primary-key-" + leftPadDecimal(i, 9))
+	}
+	lowCardinality := make([][]byte, 300)
+	for i := range lowCardinality {
+		lowCardinality[i] = []byte([]string{`"PT"`, `"US"`, `"DE"`, `"FR"`}[i%4])
+	}
+	empties := make([][]byte, 64)
+	for i := range empties {
+		empties[i] = []byte{}
+	}
+	cases := []struct {
+		name   string
+		values [][]byte
+	}{
+		{"unique-sequential-keys", sequential},
+		{"low-cardinality", lowCardinality},
+		{"single-value", [][]byte{[]byte(`"only"`)}},
+		{"two-values", [][]byte{[]byte(`"a"`), []byte(`"b"`)}},
+		{"empty-strings", empties},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The dictionary estimate builds the census in insertion order; the
+			// finished encoding sorts the same set. Neither the byte total nor the
+			// packed id width depends on ordering, so the two must agree exactly.
+			var dictScratch compactStreamScratch
+			dictEstimate := dictScratch.measureDictionary(tc.values)
+			dictionary := dictScratch.finishDictionary(tc.values)
+			if got := dictionary.encodedBytes(); got != dictEstimate {
+				t.Fatalf("dictionary estimate=%d encodedBytes=%d", dictEstimate, got)
+			}
+			// A dictionary whose entries overflow the u16 section bounds is
+			// unserializable and never selected; the size invariant above still
+			// holds, so only match the serialized length when it fits a page.
+			if dictBinary, err := dictionary.appendBinary(nil); err == nil &&
+				len(dictBinary) != dictEstimate {
+				t.Fatalf("dictionary estimate=%d serialized=%d", dictEstimate, len(dictBinary))
+			}
+			// The alphabet estimate reserves its limit from the same borrowed pass
+			// that finishAlphabet then packs; when a stream qualifies, its plan
+			// figure must equal the finished image.
+			var alphaScratch compactStreamScratch
+			if plan, ok := alphaScratch.measureAlphabet(2, tc.values, 0); ok {
+				alphabet := alphaScratch.finishAlphabet(2, tc.values, plan)
+				if got := alphabet.encodedBytes(); got != plan.encoded {
+					t.Fatalf("alphabet estimate=%d encodedBytes=%d", plan.encoded, got)
+				}
+				if alphaBinary, alphaErr := alphabet.appendBinary(nil); alphaErr == nil &&
+					len(alphaBinary) != plan.encoded {
+					t.Fatalf("alphabet estimate=%d serialized=%d", plan.encoded, len(alphaBinary))
+				}
+			}
+			// Whichever candidate the planner selects, its reported encodedBytes is
+			// the exact serialized length the enclosing page reserves.
+			var pick compactStreamScratch
+			winner := pick.encode(tc.values)
+			winnerBinary, err := winner.appendBinary(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(winnerBinary) != winner.encodedBytes() {
+				t.Fatalf("winner kind=%d encodedBytes=%d serialized=%d",
+					winner.kind, winner.encodedBytes(), len(winnerBinary))
+			}
+			compactCodecRoundTrip(t, winner, tc.values)
+		})
+	}
+}

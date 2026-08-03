@@ -892,6 +892,9 @@ transactionalPrimaryPut:
 	if err := c.acquirePrimaryMutationPath(
 		&path, state, keyBytes, resident,
 	); err != nil {
+		if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+			return false, errors.Join(ErrPrimaryLeafSplitRequired, err)
+		}
 		return false, err
 	}
 	slot, _, _, found := path.leaf.LookupRawHashed(
