@@ -8,6 +8,7 @@ import (
 
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/byteview"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
@@ -977,7 +978,8 @@ func primaryExactIndexPageBound(
 			clear(bucketRows)
 			for row := span.First; row < span.Last; row++ {
 				key, present, termErr := appendPrimaryExactDocumentTerm(
-					canonical[:0], components[:], exact, records[row].Value,
+					canonical[:0], components[:], exact,
+					byteview.Bytes(records[row].Value),
 				)
 				if termErr != nil {
 					return 0, termErr
@@ -1113,7 +1115,8 @@ func buildPrimaryExactIndexes(
 		bit := uint64(1) << uint(placement.Slot&63)
 		for indexID, exact := range indexes {
 			key, present, err := appendPrimaryExactDocumentTerm(
-				canonical[:0], components[:], exact, record.Value,
+				canonical[:0], components[:], exact,
+				byteview.Bytes(record.Value),
 			)
 			if err != nil {
 				return storeio.PageRef{}, err

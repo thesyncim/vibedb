@@ -4,14 +4,26 @@ import (
 	"bytes"
 	"fmt"
 	"unsafe"
+
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // PrimaryGraphRecord is one immutable key/value row supplied to
-// BuildPrimaryGraph. Both slices are borrowed until the builder returns.
+// BuildPrimaryGraph. Both strings are zero-copy immutable views borrowed until
+// the builder returns; their compact headers bound bulk-planning allocation.
 type PrimaryGraphRecord struct {
-	Key   []byte
-	Value []byte
+	Key   string
+	Value string
 }
+
+// BorrowPrimaryGraphRecord forms one immutable, allocation-free descriptor.
+// The caller must keep key/value live and unchanged through graph construction.
+func BorrowPrimaryGraphRecord(key, value []byte) PrimaryGraphRecord {
+	return PrimaryGraphRecord{Key: byteview.String(key), Value: byteview.String(value)}
+}
+
+func (r PrimaryGraphRecord) keyBytes() []byte   { return byteview.Bytes(r.Key) }
+func (r PrimaryGraphRecord) valueBytes() []byte { return byteview.Bytes(r.Value) }
 
 // PrimaryGraphPlacement is the posting-stable location assigned to one input
 // record by the bottom-up builder: the leaf's stable BucketID and the row's
@@ -329,7 +341,7 @@ func validatePrimaryGraphRecords(
 		if len(records[at].Key) == 0 ||
 			len(records[at].Key) > CommonPrimaryLeafMaxKeyBytes ||
 			len(records[at].Value) == 0 ||
-			at != 0 && bytes.Compare(records[at-1].Key, records[at].Key) >= 0 {
+			at != 0 && records[at-1].Key >= records[at].Key {
 			return fmt.Errorf("%w: non-canonical primary records", ErrInvalidWrite)
 		}
 	}
@@ -417,9 +429,12 @@ func planCompactPrimaryLeaves(
 		hi := min(maxRows, len(records)-first)
 		window = window[:0]
 		for at := range hi {
+			source := records[first+at]
 			record := CommonPrimaryLeafRecord{
-				Key:   records[first+at].Key,
-				Value: CommonPrimaryLeafValue{Inline: records[first+at].Value},
+				Key: source.keyBytes(),
+				Value: CommonPrimaryLeafValue{
+					Inline: source.valueBytes(),
+				},
 			}
 			if maxRows <= CommonPrimaryLeafWideSlots {
 				record.Slot = uint8(at)
@@ -624,8 +639,8 @@ func buildPrimaryLeaves(
 			return nil, err
 		}
 		built[rank] = primaryBuiltLeaf{
-			firstKey: input[plans[rank].first].Key,
-			lastKey:  input[plans[rank].last-1].Key,
+			firstKey: input[plans[rank].first].keyBytes(),
+			lastKey:  input[plans[rank].last-1].keyBytes(),
 			ref:      page.Ref(),
 		}
 	}

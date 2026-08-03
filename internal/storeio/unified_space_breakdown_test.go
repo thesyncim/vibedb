@@ -169,9 +169,9 @@ func TestCompactCompetitiveSpaceBreakdown(t *testing.T) {
 			corpus := benchcorpus.Corpus(rows, high)
 			graph := make([]PrimaryGraphRecord, len(corpus))
 			for i := range corpus {
-				graph[i] = PrimaryGraphRecord{
-					Key: []byte(corpus[i].Key), Value: corpus[i].JSON,
-				}
+				graph[i] = BorrowPrimaryGraphRecord(
+					[]byte(corpus[i].Key), corpus[i].JSON,
+				)
 			}
 			seed := unifiedTestStoreID()
 			plans, err := planCompactPrimaryLeaves(
@@ -197,8 +197,10 @@ func TestCompactCompetitiveSpaceBreakdown(t *testing.T) {
 				window = window[:0]
 				for at := plan.first; at < plan.last; at++ {
 					window = append(window, CommonPrimaryLeafRecord{
-						Key:   graph[at].Key,
-						Value: CommonPrimaryLeafValue{Inline: graph[at].Value},
+						Key: graph[at].keyBytes(),
+						Value: CommonPrimaryLeafValue{
+							Inline: graph[at].valueBytes(),
+						},
 					})
 				}
 				payload, err := BuildCompactPrimaryStripePayload(window, builder)

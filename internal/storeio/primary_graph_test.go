@@ -5,7 +5,22 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"unsafe"
 )
+
+func TestPrimaryGraphRecordIsCompactBorrowedView(t *testing.T) {
+	if size := unsafe.Sizeof(PrimaryGraphRecord{}); size > 32 {
+		t.Fatalf("record descriptor=%d bytes, want at most 32", size)
+	}
+	key := []byte("borrowed-key")
+	value := []byte(`{"borrowed":true}`)
+	record := BorrowPrimaryGraphRecord(key, value)
+	keyView, valueView := record.keyBytes(), record.valueBytes()
+	if !bytes.Equal(keyView, key) || !bytes.Equal(valueView, value) ||
+		&keyView[0] != &key[0] || &valueView[0] != &value[0] {
+		t.Fatal("primary graph record copied or changed its borrowed bytes")
+	}
+}
 
 type primaryGraphTestImage struct {
 	file    *os.File
@@ -25,8 +40,7 @@ func buildPrimaryGraphTestImage(
 	records := make([]PrimaryGraphRecord, count)
 	for at := range records {
 		records[at] = PrimaryGraphRecord{
-			Key:   []byte(fmt.Sprintf("key-%08d", at)),
-			Value: []byte(fmt.Sprintf(`{"rank":%d}`, at)),
+			Key: fmt.Sprintf("key-%08d", at), Value: fmt.Sprintf(`{"rank":%d}`, at),
 		}
 	}
 	file, err := os.CreateTemp(t.TempDir(), "primary-graph-*")
@@ -284,8 +298,8 @@ func TestBuildPrimaryGraphRoundTrip(t *testing.T) {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
 			image, records := buildPrimaryGraphTestImage(t, count)
 			for at := range records {
-				value, ok := image.lookup(t, records[at].Key)
-				if !ok || !bytes.Equal(value, records[at].Value) {
+				value, ok := image.lookup(t, records[at].keyBytes())
+				if !ok || !bytes.Equal(value, records[at].valueBytes()) {
 					t.Fatalf("lookup %d = %q,%v", at, value, ok)
 				}
 			}
@@ -345,8 +359,8 @@ func TestBuildPrimaryGraphRoundTrip(t *testing.T) {
 								t.Fatal("compact leaf iteration")
 							}
 							if at >= len(records) ||
-								!bytes.Equal(key, records[at].Key) ||
-								!bytes.Equal(value, records[at].Value) {
+								!bytes.Equal(key, records[at].keyBytes()) ||
+								!bytes.Equal(value, records[at].valueBytes()) {
 								t.Fatalf("iteration row %d = %q/%q", at, key, value)
 							}
 							at++

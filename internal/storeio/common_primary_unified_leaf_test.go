@@ -1592,7 +1592,7 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 			`{"id":%d,"name":"user-%d","country":"%s","score":%d,"active":%t,"profile":{"tier":"%s","region":"eu-west-1","joined":"2020-01-02"},"tags":["alpha","beta"],"note":"%s"}`,
 			i, i, []string{"PT", "US", "DE", "FR"}[i%4], i%1000, i%3 == 0,
 			[]string{"free", "pro", "team"}[i%3], note)
-		records[i] = PrimaryGraphRecord{Key: key, Value: doc}
+		records[i] = BorrowPrimaryGraphRecord(key, doc)
 	}
 	layout, err := MutableStoreLayout(physicalPageQuantum)
 	if err != nil {
@@ -1642,7 +1642,8 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		for row := range window {
 			record := records[plans[at].first+row]
 			window[row] = CommonPrimaryLeafRecord{
-				Key: record.Key, Value: CommonPrimaryLeafValue{Inline: record.Value},
+				Key:   record.keyBytes(),
+				Value: CommonPrimaryLeafValue{Inline: record.valueBytes()},
 			}
 		}
 		fresh, err := BuildCompactPrimaryStripePayload(
@@ -1654,7 +1655,8 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		if plans[at].last < len(records) {
 			next := records[plans[at].last]
 			larger := append(window, CommonPrimaryLeafRecord{
-				Key: next.Key, Value: CommonPrimaryLeafValue{Inline: next.Value},
+				Key:   next.keyBytes(),
+				Value: CommonPrimaryLeafValue{Inline: next.valueBytes()},
 			})
 			largerPayload, largerErr := BuildCompactPrimaryStripePayload(
 				larger, NewUnifiedPrimaryLeafBuilder(),
@@ -1720,9 +1722,9 @@ func TestUnifiedPlannerExactAcrossDensityPhaseChanges(t *testing.T) {
 	for i := range records {
 		key := fmt.Appendf(nil, "phase:%08d", i)
 		if i < 160 || i >= 400 {
-			records[i] = PrimaryGraphRecord{
-				Key: key, Value: fmt.Appendf(nil, `{"id":%d,"ok":true}`, i),
-			}
+			records[i] = BorrowPrimaryGraphRecord(
+				key, fmt.Appendf(nil, `{"id":%d,"ok":true}`, i),
+			)
 			continue
 		}
 		note := make([]byte, 256)
@@ -1731,9 +1733,10 @@ func TestUnifiedPlannerExactAcrossDensityPhaseChanges(t *testing.T) {
 			state = state*6364136223846793005 + 1442695040888963407
 			note[at] = alphabet[state%uint64(len(alphabet))]
 		}
-		records[i] = PrimaryGraphRecord{
-			Key: key, Value: fmt.Appendf(nil, `{"id":%d,"note":"%s","ok":true}`, i, note),
-		}
+		records[i] = BorrowPrimaryGraphRecord(
+			key,
+			fmt.Appendf(nil, `{"id":%d,"note":"%s","ok":true}`, i, note),
+		)
 	}
 
 	plans, err := planCompactPrimaryLeaves(
@@ -1759,7 +1762,8 @@ func TestUnifiedPlannerExactAcrossDensityPhaseChanges(t *testing.T) {
 			for row := range window {
 				record := records[plan.first+row]
 				window[row] = CommonPrimaryLeafRecord{
-					Key: record.Key, Value: CommonPrimaryLeafValue{Inline: record.Value},
+					Key:   record.keyBytes(),
+					Value: CommonPrimaryLeafValue{Inline: record.valueBytes()},
 				}
 			}
 			payload, buildErr := BuildCompactPrimaryStripePayload(
@@ -1806,9 +1810,9 @@ func TestUnifiedPlannerBoundsLargePayloadRetention(t *testing.T) {
 			value = append(value, b)
 		}
 		value = append(value, `"}`...)
-		records[row] = PrimaryGraphRecord{
-			Key: fmt.Appendf(nil, "large:%08d", row), Value: value,
-		}
+		records[row] = BorrowPrimaryGraphRecord(
+			fmt.Appendf(nil, "large:%08d", row), value,
+		)
 	}
 	plans, err := planCompactPrimaryLeaves(
 		unifiedTestStoreID(), records, CompactPrimaryStripeMaxRows,

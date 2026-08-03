@@ -50,7 +50,7 @@ func collectFileStoreBulkRecords(
 				return false
 			}
 			records[at] = storeio.PrimaryGraphRecord{
-				Key: byteview.Bytes(key), Value: raw,
+				Key: key, Value: byteview.String(raw),
 			}
 			at++
 		}

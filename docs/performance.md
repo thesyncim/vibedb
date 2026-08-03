@@ -146,9 +146,13 @@ high-cardinality load again to about 0.94 s while keeping low cardinality at
 about 0.23 s and preserving the exact stream representation.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
-setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf
-boundaries and writes identical compact bytes. High-cardinality windows that do
-not fit still use the exact largest-prefix search.
+setup bytes originally fell from about 15.62 MB to 2.90 MB. Compact immutable
+key/value descriptors now use two borrowed string views instead of two slice
+headers, reducing the current 20,000-row build again from 2.876 MB to 2.557 MB
+of allocation (11.1%) without copying source bytes. Recent five-iteration runs
+completed in 16.1–23.0 ms. It still selects identical leaf boundaries and
+writes identical compact bytes. High-cardinality windows that do not fit still
+use the exact largest-prefix search.
 
 A local ClickHouse control over the same flattened 100,000-row corpus measured
 about 1.49 ms with `ORDER BY key` and no secondary data-skipping index. The

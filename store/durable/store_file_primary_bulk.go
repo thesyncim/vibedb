@@ -1,7 +1,6 @@
 package durable
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -10,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
@@ -84,7 +84,7 @@ func CreateFromRecords(
 			return 0, ErrPrimaryCutoverUnsupported
 		}
 		records[i] = storeio.PrimaryGraphRecord{
-			Key: byteview.Bytes(input[i].Key), Value: input[i].Value,
+			Key: input[i].Key, Value: byteview.String(input[i].Value),
 		}
 	}
 	if err := sortPrimaryBulkRecords(records); err != nil {
@@ -427,7 +427,7 @@ func canonicalizePrimaryBulkRecords(
 		for {
 			var err error
 			index, err = vibejson.BuildIndexOptions(
-				records[at].Value, entryStore[:cap(entryStore)], indexOptions,
+				byteview.Bytes(records[at].Value), entryStore[:cap(entryStore)], indexOptions,
 			)
 			if err == nil {
 				entryStore = index.Entries
@@ -456,7 +456,7 @@ func canonicalizePrimaryBulkRecords(
 			)
 		}
 		arena = out
-		records[at].Value = arena[off:len(arena):len(arena)]
+		records[at].Value = byteview.String(arena[off:len(arena):len(arena)])
 	}
 	return nil
 }
@@ -467,10 +467,10 @@ func canonicalizePrimaryBulkRecords(
 // typed error after lexical sorting, before any page is allocated or written.
 func sortPrimaryBulkRecords(records []storeio.PrimaryGraphRecord) error {
 	slices.SortFunc(records, func(a, b storeio.PrimaryGraphRecord) int {
-		return bytes.Compare(a.Key, b.Key)
+		return strings.Compare(a.Key, b.Key)
 	})
 	for at := 1; at < len(records); at++ {
-		if bytes.Equal(records[at-1].Key, records[at].Key) {
+		if records[at-1].Key == records[at].Key {
 			return fmt.Errorf("%w %q", store.ErrDuplicateKey, records[at].Key)
 		}
 	}
@@ -509,9 +509,9 @@ func primaryBulkStoreID(
 	writeUint64(uint64(len(records)))
 	for _, record := range records {
 		writeUint64(uint64(len(record.Key)))
-		_, _ = hash.Write(record.Key)
+		_, _ = hash.Write(byteview.Bytes(record.Key))
 		writeUint64(uint64(len(record.Value)))
-		_, _ = hash.Write(record.Value)
+		_, _ = hash.Write(byteview.Bytes(record.Value))
 	}
 	sum := hash.Sum(nil)
 	var storeID [16]byte

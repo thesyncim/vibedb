@@ -647,9 +647,9 @@ func TestPrimaryBulkDuplicateRuleMatchesBuilder(t *testing.T) {
 	}
 	builderErr := builder.Append("duplicate", []byte(`{"n":2}`))
 	records := []storeio.PrimaryGraphRecord{
-		{Key: []byte("z"), Value: []byte(`{"n":0}`)},
-		{Key: []byte("duplicate"), Value: []byte(`{"n":1}`)},
-		{Key: []byte("duplicate"), Value: []byte(`{"n":2}`)},
+		{Key: "z", Value: `{"n":0}`},
+		{Key: "duplicate", Value: `{"n":1}`},
+		{Key: "duplicate", Value: `{"n":2}`},
 	}
 	bulkErr := sortPrimaryBulkRecords(records)
 	if !errors.Is(builderErr, store.ErrDuplicateKey) ||
