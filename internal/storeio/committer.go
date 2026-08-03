@@ -40,8 +40,9 @@ var (
 	ErrCheckpointRequired = errors.New("vibedb: Store buffered checkpoint required")
 )
 
-// CommitterOptions fixes automatic persistence queue memory. All descriptors
-// are allocated during construction and reused until Close.
+// CommitterOptions fixes automatic persistence queue memory. Descriptor
+// backing is allocated on the first Begin and reused until Close, so a
+// read-only opener does not materialize a write queue it never uses.
 type CommitterOptions struct {
 	// FrameNativeStaging declares that WriteTransaction data pages are backed
 	// by PageCache frames. It lets NewCommitter cap the Device arena to
@@ -280,15 +281,16 @@ type Committer struct {
 	device        Device
 	backend       Backend
 
-	buffers      [][]byte
-	bufferSize   int
-	bufferCount  int
-	freeBuffers  *indexPool
-	freeBatches  *indexPool
-	batches      []Batch
-	writeStorage []Write
-	indexStorage []uint32
-	producerSeen []uint64
+	buffers        [][]byte
+	bufferSize     int
+	bufferCount    int
+	freeBuffers    *indexPool
+	freeBatches    *indexPool
+	batches        []Batch
+	writeStorage   []Write
+	indexStorage   []uint32
+	descriptorOnce sync.Once
+	producerSeen   []uint64
 
 	pending     []*Batch
 	pendingMask uint64
@@ -417,8 +419,6 @@ func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 		freeBuffers:     newIndexPool(arenaDevice.BufferCount),
 		freeBatches:     newIndexPool(normalizedCommitter.QueueSlots),
 		batches:         make([]Batch, normalizedCommitter.QueueSlots),
-		writeStorage:    make([]Write, normalizedCommitter.QueueSlots*normalizedCommitter.MaxPagesPerBatch),
-		indexStorage:    make([]uint32, normalizedCommitter.QueueSlots*(normalizedCommitter.MaxPagesPerBatch+2)),
 		producerSeen:    make([]uint64, (arenaDevice.BufferCount+63)/64),
 		pending:         make([]*Batch, normalizedCommitter.QueueSlots),
 		pendingMask:     uint64(normalizedCommitter.QueueSlots - 1),
@@ -441,13 +441,9 @@ func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 	c.wait = sync.NewCond(&c.waitMu)
 	c.materializationNextSequence.Store(1)
 	for i := range c.batches {
-		start := i * normalizedCommitter.MaxPagesPerBatch
-		indexStart := i * (normalizedCommitter.MaxPagesPerBatch + 2)
 		batch := &c.batches[i]
 		batch.committer = c
 		batch.index = uint32(i)
-		batch.pages = c.writeStorage[start : start : start+normalizedCommitter.MaxPagesPerBatch]
-		batch.bufferIndexes = c.indexStorage[indexStart : indexStart : indexStart+normalizedCommitter.MaxPagesPerBatch+2]
 	}
 	initialized := make(chan committerInit, 1)
 	go c.run(file, initialized, open)
@@ -455,6 +451,21 @@ func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 		return nil, result.err
 	}
 	return c, nil
+}
+
+func (c *Committer) ensureDescriptorStorage() {
+	c.descriptorOnce.Do(func() {
+		pages := c.options.MaxPagesPerBatch
+		c.writeStorage = make([]Write, c.options.QueueSlots*pages)
+		c.indexStorage = make([]uint32, c.options.QueueSlots*(pages+2))
+		for i := range c.batches {
+			start := i * pages
+			indexStart := i * (pages + 2)
+			batch := &c.batches[i]
+			batch.pages = c.writeStorage[start : start : start+pages]
+			batch.bufferIndexes = c.indexStorage[indexStart : indexStart : indexStart+pages+2]
+		}
+	})
 }
 
 // Begin acquires one reusable descriptor and pageCount+1 staging buffers. It
@@ -505,6 +516,7 @@ func (c *Committer) begin(
 		bufferedPageCount+1 > c.bufferCount {
 		return nil, ErrTooManyPages
 	}
+	c.ensureDescriptorStorage()
 	batchIndex, err := c.acquire(c.freeBatches)
 	if err != nil {
 		return nil, err

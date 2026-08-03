@@ -55,6 +55,42 @@ func TestCommitterPortableLifecycle(t *testing.T) {
 	}
 }
 
+func TestCommitterDefersDescriptorStorageUntilBegin(t *testing.T) {
+	committer, _, _ := newPortableCommitter(t, 6, 2)
+	defer committer.Close()
+	if len(committer.writeStorage) != 0 || len(committer.indexStorage) != 0 {
+		t.Fatal("committer allocated descriptor storage before first Begin")
+	}
+	for i := range committer.batches {
+		if committer.batches[i].pages != nil ||
+			committer.batches[i].bufferIndexes != nil {
+			t.Fatalf("batch %d was bound before first Begin", i)
+		}
+	}
+	batch, err := committer.Begin(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(committer.writeStorage),
+		committer.options.QueueSlots*committer.options.MaxPagesPerBatch; got != want {
+		t.Fatalf("write descriptors = %d, want %d", got, want)
+	}
+	if got, want := len(committer.indexStorage),
+		committer.options.QueueSlots*(committer.options.MaxPagesPerBatch+2); got != want {
+		t.Fatalf("buffer indexes = %d, want %d", got, want)
+	}
+	for i := range committer.batches {
+		if cap(committer.batches[i].pages) != committer.options.MaxPagesPerBatch ||
+			cap(committer.batches[i].bufferIndexes) !=
+				committer.options.MaxPagesPerBatch+2 {
+			t.Fatalf("batch %d descriptor storage is not fully bound", i)
+		}
+	}
+	if err := batch.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCommitterOptionsValidation(t *testing.T) {
 	normalized, err := (CommitterOptions{QueueSlots: 3}).normalized(8)
 	if err != nil {
