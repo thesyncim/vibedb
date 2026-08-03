@@ -277,9 +277,15 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): the implemented
   4,096 full-bucket stripe preparation lane and its remaining publication and
   structural-concurrency work.
-- [Distributed sharding](design/distributed-sharding.md): future routed
-  ownership, replication, failover, and online resharding across independent
-  durable roots.
+- [Distributed sharding](design/distributed-sharding.md) and
+  [Vitess-compatible routing](design/vitess-compatible-routing.md): the
+  separate, server-only distributed tier. Its routed leader-only shard
+  execution (`shardservice`) and stateless routing gateway (`gateway`) exist
+  today; both are server-only and not part of the embedded API. They route on
+  the frozen placement scalar (`distribution`), which also backs the opt-in
+  single-shard `sql/driver` local-cluster facade and is therefore reachable from
+  the embedded surface. Replication, failover, and online resharding across
+  independent durable roots remain future work.
 - [Unification](design/unification.md): the unified mutable collection and
   its remaining performance gates.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
