@@ -76,11 +76,13 @@ fallback measured about 67 ms on the same harness; it remains disclosed as a
 different physical path rather than being used as an unindexed result.
 
 The same public probe's ordered all-bytes scan now reconstructs and consumes
-24.88 MB of canonical JSON in about 44.5 ms (roughly 559 MB/s), also with zero
+24.88 MB of canonical JSON in about 39.7 ms (roughly 627 MB/s), also with zero
 warm allocations. Sequential cursors carry per-shape ordinals and restart-coded
-integer state across rows; point reads retain bounded restart decoding. This
-reduced the low-cardinality all-bytes scan from about 54.7 ms without changing
-the compact bytes or callback semantics.
+integer state across rows; point reads retain bounded restart decoding. A
+constant-time proleptic-Gregorian transform renders date ordinals without a
+per-value year search or month loop. Together these changes reduced the
+low-cardinality all-bytes scan from about 54.7 ms without changing the compact
+bytes or callback semantics.
 
 Compact bulk planning now tries the complete 4,096-row window before binary
 searching for a smaller extent. Log-like windows normally fit, so they are

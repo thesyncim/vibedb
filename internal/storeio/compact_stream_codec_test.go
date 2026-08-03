@@ -240,6 +240,18 @@ func TestCompactStreamPackedPrefixIntRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCompactDateOrdinalExhaustiveRoundTrip(t *testing.T) {
+	limit := int32(compactDaysBeforeYear(10_000))
+	var spelling [12]byte
+	for ordinal := int32(0); ordinal < limit; ordinal++ {
+		got := appendCompactDate(spelling[:0], ordinal)
+		roundTrip, ok := compactDateOrdinal(got)
+		if !ok || roundTrip != ordinal {
+			t.Fatalf("ordinal=%d spelling=%q roundTrip=%d ok=%v", ordinal, got, roundTrip, ok)
+		}
+	}
+}
+
 func TestCompactStreamRejectsCorruptFraming(t *testing.T) {
 	values := [][]byte{[]byte(`"PT"`), []byte(`"US"`), []byte(`"PT"`)}
 	encoded, err := encodeCompactScalarStream(values).appendBinary(nil)

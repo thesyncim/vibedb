@@ -720,33 +720,28 @@ func compactDaysBeforeYear(year int) int {
 }
 
 func appendCompactDate(dst []byte, ordinal int32) []byte {
-	dayNumber := int(ordinal)
-	lo, hi := 0, 10_000
-	for lo+1 < hi {
-		mid := (lo + hi) / 2
-		if compactDaysBeforeYear(mid) <= dayNumber {
-			lo = mid
-		} else {
-			hi = mid
-		}
+	// Shift the ordinal's 0000-01-01 origin to a March-based 400-year era.
+	// March makes leap day the final day of a year, allowing direct division
+	// instead of a year search and month loop. The negative-era branch covers
+	// only 0000-01-01 through 0000-02-29 under Go's truncating division.
+	z := int64(ordinal) - 60
+	era := z / 146097
+	if z < 0 {
+		era = (z - 146096) / 146097
 	}
-	year := lo
-	dayOfYear := dayNumber - compactDaysBeforeYear(year)
-	leap := year%4 == 0 && (year%100 != 0 || year%400 == 0)
-	monthDays := [...]int{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
-	month := 1
-	for month <= 12 {
-		days := monthDays[month-1]
-		if month == 2 && leap {
-			days++
-		}
-		if dayOfYear < days {
-			break
-		}
-		dayOfYear -= days
-		month++
+	dayOfEra := z - era*146097
+	yearOfEra := (dayOfEra - dayOfEra/1460 + dayOfEra/36524 - dayOfEra/146096) / 365
+	year := yearOfEra + era*400
+	dayOfYear := dayOfEra - (365*yearOfEra + yearOfEra/4 - yearOfEra/100)
+	monthPrime := (5*dayOfYear + 2) / 153
+	day := dayOfYear - (153*monthPrime+2)/5 + 1
+	month := monthPrime + 3
+	if monthPrime >= 10 {
+		month -= 12
 	}
-	day := dayOfYear + 1
+	if month <= 2 {
+		year++
+	}
 	return append(dst,
 		'"', byte('0'+year/1000), byte('0'+year/100%10),
 		byte('0'+year/10%10), byte('0'+year%10), '-',
