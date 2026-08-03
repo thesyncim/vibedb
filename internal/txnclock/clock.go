@@ -1,0 +1,212 @@
+// Package txnclock owns the bounded first-committer-wins conflict clock shared
+// by the SQL driver and the native facade.
+//
+// Record is gated by Arm/Disarm: when the armed count is zero, RecordKeys is one
+// atomic load and a return. Begin, Finish, and Conflict stay live so a
+// validation edge can observe publications that raced the arm. The SQL driver
+// keeps its clocks always-armed under database.mu; the facade arms only while
+// at least one read-write transaction is open.
+package txnclock
+
+import "sync/atomic"
+
+// HistoryKeys caps retained per-collection conflict history independently of
+// collection size or transaction lifetime. Reaching it is deliberately rare:
+// the oldest active transaction is conservatively marked conflicting, history
+// restarts at the overflowing write, and transactions begun afterwards retain
+// exact per-key semantics.
+const HistoryKeys = 4096
+
+// Clock is a bounded, per-collection first-committer-wins conflict clock.
+//
+// Writes retains only the newest write revision for keys that can still
+// conflict with an active transaction. Once the oldest transaction finishes,
+// Finish rebuilds the map without obsolete entries; once the last transaction
+// finishes, it releases the map entirely. Live memory is therefore proportional
+// to keys changed since the oldest active transaction began, rather than to the
+// collection's lifetime.
+//
+// Active and Writes are exported so in-module adapters can mirror them for
+// white-box tests without duplicating clock state.
+type Clock struct {
+	armed        atomic.Uint32
+	revision     uint64
+	historyFloor uint64
+	Active       map[uint64]uint32
+	Writes       map[string]uint64
+}
+
+// Arm declares one armed holder. Matching Disarm releases it. RecordKeys is a
+// no-op while the armed count is zero.
+func (c *Clock) Arm() {
+	c.armed.Add(1)
+}
+
+// Disarm releases one armed holder. Disarm on a zero count is a no-op so a
+// mismatched caller cannot wrap the counter.
+func (c *Clock) Disarm() {
+	for {
+		cur := c.armed.Load()
+		if cur == 0 {
+			return
+		}
+		if c.armed.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+// Armed reports the current armed-holder count.
+func (c *Clock) Armed() uint32 {
+	return c.armed.Load()
+}
+
+// Begin captures the current revision for a new transaction.
+func (c *Clock) Begin() uint64 {
+	revision := c.revision
+	if c.Active == nil {
+		c.Active = make(map[uint64]uint32)
+	}
+	c.Active[revision]++
+	return revision
+}
+
+// Conflict reports whether any of keys was written after begin. A begin at or
+// below the history floor is an overflow conflict: the exact key set that
+// collided was discarded when the bounded history reset.
+func (c *Clock) Conflict(
+	begin uint64,
+	keys []string,
+) (key string, historyOverflow, conflict bool) {
+	if begin < c.historyFloor {
+		return "", true, true
+	}
+	for _, key := range keys {
+		if c.Writes[key] > begin {
+			return key, false, true
+		}
+	}
+	return "", false, false
+}
+
+// Finish drops one transaction begun at begin and releases history that no
+// remaining active transaction can observe.
+func (c *Clock) Finish(begin uint64) {
+	count := c.Active[begin]
+	switch count {
+	case 0:
+		return
+	case 1:
+		delete(c.Active, begin)
+	default:
+		c.Active[begin] = count - 1
+	}
+	if len(c.Active) == 0 {
+		// Do not retain a historical high-water allocation when no transaction
+		// can observe it.
+		c.Active = nil
+		c.Writes = nil
+		c.historyFloor = 0
+		return
+	}
+	if len(c.Writes) == 0 {
+		return
+	}
+	oldest := c.revision
+	haveExact := false
+	for revision := range c.Active {
+		if revision < c.historyFloor {
+			continue
+		}
+		if !haveExact || revision < oldest {
+			oldest = revision
+			haveExact = true
+		}
+	}
+	if !haveExact {
+		c.Writes = nil
+		return
+	}
+	remaining := 0
+	for _, revision := range c.Writes {
+		if revision > oldest {
+			remaining++
+		}
+	}
+	if remaining == len(c.Writes) {
+		return
+	}
+	if remaining == 0 {
+		c.Writes = nil
+		return
+	}
+	// Rebuild instead of deleting in place so obsolete key storage becomes
+	// collectible and the clock remains bounded by currently relevant writes.
+	writes := make(map[string]uint64, remaining)
+	for key, revision := range c.Writes {
+		if revision > oldest {
+			writes[key] = revision
+		}
+	}
+	c.Writes = writes
+}
+
+// RecordKeys records a committed write set. When the clock is unarmed this is
+// one atomic load and a return.
+func (c *Clock) RecordKeys(keys []string) {
+	if c.armed.Load() == 0 {
+		return
+	}
+	c.recordKeys(keys)
+}
+
+func (c *Clock) recordKeys(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	newKeys := 0
+	for i, key := range keys {
+		if _, exists := c.Writes[key]; exists {
+			continue
+		}
+		duplicate := false
+		for j := 0; j < i; j++ {
+			if keys[j] == key {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			newKeys++
+		}
+	}
+	revision, retained := c.nextWrite(newKeys)
+	if !retained {
+		return
+	}
+	for _, key := range keys {
+		c.Writes[key] = revision
+	}
+}
+
+func (c *Clock) nextWrite(newKeys int) (uint64, bool) {
+	c.revision++
+	if len(c.Active) == 0 {
+		c.Writes = nil
+		c.historyFloor = 0
+		return c.revision, false
+	}
+	if len(c.Writes)+newKeys > HistoryKeys {
+		// Transactions already active cannot distinguish a key overwritten
+		// before this reset from one never touched. Doom exactly those older
+		// transactions, release their key history, and let transactions begun
+		// at or after this revision proceed with a fresh exact history.
+		c.historyFloor = c.revision
+		c.Writes = nil
+		return c.revision, false
+	}
+	if c.Writes == nil {
+		c.Writes = make(map[string]uint64, newKeys)
+	}
+	return c.revision, true
+}
