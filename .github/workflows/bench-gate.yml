@@ -1,0 +1,29 @@
+name: bench-gate
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: bench-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  allocation-gate:
+    name: allocation gate
+    runs-on: ubuntu-latest
+    steps:
+      # Full history so the pull request's base commit is present for the base
+      # worktree the gate checks out. The default pull_request checkout is the
+      # test-merge commit, whose parents include that base commit.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Allocation regression gate
+        # allocs/op and B/op are compared between the base commit and the merged
+        # head on this one runner; ns/op is never gated, so runner variance
+        # cannot fail the job. See bench/gate/README.md.
+        env:
+          GATE_BASE: ${{ github.event.pull_request.base.sha }}
+        run: go run ./bench/gate
