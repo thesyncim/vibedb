@@ -1,12 +1,14 @@
 // Command vibedb-verify is the offline verify and salvage tool for vibedb store
-// files. It is read-only against its input and wants a quiescent file or a copy:
-// it does not take the writer lock and does not apply the in-place
-// materialization rollback that opening the store would, so a concurrent writer
-// may retire and reuse the extents it reads.
+// files and database directories. It is read-only against its input and wants a
+// quiescent file, directory, or a copy: it does not take the writer lock and
+// does not apply the in-place materialization rollback that opening the store
+// would, so a concurrent writer may retire and reuse the extents it reads.
+// Database-directory verify likewise opens txn.vtm and collection journals only
+// to scan; it never appends, syncs, recycles, or removes residue.
 //
 // Usage:
 //
-//	vibedb-verify verify  <store-file>
+//	vibedb-verify verify  <store-file|database-dir>
 //	vibedb-verify salvage <store-file> <output-file>
 //	vibedb-verify repack  <store-file> <output-file>
 //
@@ -20,11 +22,20 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 
+	"github.com/thesyncim/vibedb/internal/collectionname"
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
+)
+
+const (
+	txnMarkerFilename    = "txn.vtm"
+	txnMarkerRegionStart = 2 * storeio.TxnMarkerHeaderSize
 )
 
 func main() {
@@ -63,12 +74,24 @@ func run(args []string) int {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  vibedb-verify verify  <store-file>")
+	fmt.Fprintln(os.Stderr, "  vibedb-verify verify  <store-file|database-dir>")
 	fmt.Fprintln(os.Stderr, "  vibedb-verify salvage <store-file> <output-file>")
 	fmt.Fprintln(os.Stderr, "  vibedb-verify repack  <store-file> <output-file>")
 }
 
 func runVerify(path string) int {
+	info, err := os.Stat(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error open=%q: %v\n", path, err)
+		return 1
+	}
+	if info.IsDir() {
+		return runVerifyDatabase(path)
+	}
+	return runVerifyStore(path)
+}
+
+func runVerifyStore(path string) int {
 	file, err := os.Open(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error open=%q: %v\n", path, err)
@@ -106,6 +129,380 @@ func runVerify(path string) int {
 	}
 	fmt.Printf("result fail findings=%d\n", len(report.Findings))
 	return 1
+}
+
+// txnVerifyFinding is one machine-parseable pairing/integrity violation for a
+// database directory. Kind values are stable diagnostics the tests pin.
+type txnVerifyFinding struct {
+	Kind    string
+	Offset  int64
+	Logical uint64
+	Detail  string
+}
+
+type txnVerifyReport struct {
+	TxnLog     string
+	Decisions  int
+	Journals   int
+	Findings   []txnVerifyFinding
+}
+
+func (r txnVerifyReport) OK() bool { return len(r.Findings) == 0 }
+
+func runVerifyDatabase(dir string) int {
+	report, err := verifyDatabaseTxn(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error verify=%q: %v\n", dir, err)
+		return 1
+	}
+	for _, finding := range report.Findings {
+		fmt.Printf(
+			"finding kind=%s offset=%d logical=%d detail=%q\n",
+			finding.Kind, finding.Offset, finding.Logical, finding.Detail,
+		)
+	}
+	fmt.Printf(
+		"summary txn_log=%s decisions=%d journals=%d findings=%d\n",
+		report.TxnLog, report.Decisions, report.Journals, len(report.Findings),
+	)
+	if report.OK() {
+		fmt.Println("result ok")
+		return 0
+	}
+	fmt.Printf("result fail findings=%d\n", len(report.Findings))
+	return 1
+}
+
+func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
+	report := txnVerifyReport{TxnLog: "absent"}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return report, err
+	}
+
+	primaries := make(map[[16]byte]primaryIdentity)
+	journals := make(map[[16]byte]journalIdentity)
+	var conditionals []conditionalRecord
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		base := entry.Name()
+		path := filepath.Join(dir, base)
+		if _, ok := collectionname.Decode(base); ok {
+			id, err := readPrimaryIdentity(path)
+			if err != nil {
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:   "primary_unreadable",
+					Detail: fmt.Sprintf("%s: %v", base, err),
+				})
+				continue
+			}
+			primaries[id.StoreID] = id
+			continue
+		}
+		if _, ok := collectionname.DecodeJournal(base); ok {
+			id, conds, err := scanJournalPairing(path)
+			if err != nil {
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:   "journal_unreadable",
+					Detail: fmt.Sprintf("%s: %v", base, err),
+				})
+				continue
+			}
+			journals[id.JournalID] = id
+			report.Journals++
+			conditionals = append(conditionals, conds...)
+		}
+	}
+
+	markerPath := filepath.Join(dir, txnMarkerFilename)
+	markerInfo, statErr := os.Stat(markerPath)
+	if statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return report, statErr
+		}
+		report.TxnLog = "absent"
+		if len(conditionals) > 0 {
+			for _, cond := range conditionals {
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:    "in_doubt",
+					Logical: cond.TxnID,
+					Detail: fmt.Sprintf(
+						"journal %x holds conditional txn=%d but decision log is absent",
+						cond.JournalID, cond.TxnID,
+					),
+				})
+			}
+		}
+		return report, nil
+	}
+	if !markerInfo.Mode().IsRegular() {
+		report.Findings = append(report.Findings, txnVerifyFinding{
+			Kind:   "txn_log_corrupt",
+			Detail: "txn.vtm is not a regular file",
+		})
+		report.TxnLog = "unusable"
+		return report, nil
+	}
+
+	marker, decisions, openErr := storeio.OpenTxnMarker(
+		markerPath, storeio.TxnMarkerOptions{},
+	)
+	if openErr != nil {
+		if len(conditionals) > 0 {
+			report.TxnLog = "unusable"
+			report.Findings = append(report.Findings, txnVerifyFinding{
+				Kind: "in_doubt",
+				Detail: fmt.Sprintf(
+					"decision log unusable (%v) while journals hold conditional records",
+					openErr,
+				),
+			})
+			return report, nil
+		}
+		if errors.Is(openErr, storeio.ErrTxnMarkerNoValidHeader) {
+			// L2 mint residue: remintable when no journal holds conditionals.
+			report.TxnLog = "absent"
+			return report, nil
+		}
+		report.TxnLog = "unusable"
+		report.Findings = append(report.Findings, txnVerifyFinding{
+			Kind:   "txn_log_corrupt",
+			Detail: openErr.Error(),
+		})
+		return report, nil
+	}
+	defer marker.Close()
+	report.TxnLog = "present"
+
+	if offset, torn := txnMarkerTornTail(markerPath, marker); torn {
+		report.Findings = append(report.Findings, txnVerifyFinding{
+			Kind:   "torn_decision",
+			Offset: offset,
+			Detail: "decision log record region ends in a torn append",
+		})
+	}
+
+	markerID := decisions.MarkerID()
+	epoch := decisions.Epoch()
+	maxTxn := decisions.MaxTxnID()
+	for txnID := uint64(1); txnID <= maxTxn; txnID++ {
+		participants, ok := decisions.Lookup(markerID, epoch, txnID)
+		if !ok {
+			continue
+		}
+		report.Decisions++
+		for _, p := range participants {
+			if decisions.Retired(p.StoreID) {
+				continue
+			}
+			primary, hasPrimary := primaries[p.StoreID]
+			journal, hasJournal := journals[p.JournalID]
+			switch {
+			case !hasPrimary:
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:    "missing_participant",
+					Logical: txnID,
+					Detail: fmt.Sprintf(
+						"decision txn=%d names missing store %x",
+						txnID, p.StoreID,
+					),
+				})
+			case primary.JournalID != p.JournalID:
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:    "missing_participant",
+					Logical: txnID,
+					Detail: fmt.Sprintf(
+						"decision txn=%d store %x journal identity mismatch",
+						txnID, p.StoreID,
+					),
+				})
+			case !hasJournal:
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:    "missing_participant",
+					Logical: txnID,
+					Detail: fmt.Sprintf(
+						"decision txn=%d names missing journal %x for store %x",
+						txnID, p.JournalID, p.StoreID,
+					),
+				})
+			case journal.StoreID != p.StoreID:
+				report.Findings = append(report.Findings, txnVerifyFinding{
+					Kind:    "missing_participant",
+					Logical: txnID,
+					Detail: fmt.Sprintf(
+						"decision txn=%d journal %x store identity mismatch",
+						txnID, p.JournalID,
+					),
+				})
+			}
+		}
+	}
+
+	for _, cond := range conditionals {
+		if cond.MarkerID != markerID || cond.MarkerEpoch != epoch {
+			report.Findings = append(report.Findings, txnVerifyFinding{
+				Kind:    "epoch_mismatch",
+				Logical: cond.TxnID,
+				Detail: fmt.Sprintf(
+					"journal %x conditional txn=%d marker/epoch (%x,%d) != log (%x,%d)",
+					cond.JournalID, cond.TxnID,
+					cond.MarkerID, cond.MarkerEpoch,
+					markerID, epoch,
+				),
+			})
+			continue
+		}
+		participants, ok := decisions.Lookup(markerID, epoch, cond.TxnID)
+		if !ok {
+			report.Findings = append(report.Findings, txnVerifyFinding{
+				Kind:    "in_doubt",
+				Logical: cond.TxnID,
+				Detail: fmt.Sprintf(
+					"journal %x holds same-epoch conditional txn=%d with no decision",
+					cond.JournalID, cond.TxnID,
+				),
+			})
+			continue
+		}
+		bound := false
+		for _, p := range participants {
+			if p.StoreID == cond.StoreID && p.JournalID == cond.JournalID {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			report.Findings = append(report.Findings, txnVerifyFinding{
+				Kind:    "in_doubt",
+				Logical: cond.TxnID,
+				Detail: fmt.Sprintf(
+					"journal %x holds conditional txn=%d not named by the decision",
+					cond.JournalID, cond.TxnID,
+				),
+			})
+		}
+	}
+	return report, nil
+}
+
+type primaryIdentity struct {
+	StoreID   [16]byte
+	JournalID [16]byte
+	Path      string
+}
+
+type journalIdentity struct {
+	StoreID   [16]byte
+	JournalID [16]byte
+	Path      string
+}
+
+type conditionalRecord struct {
+	StoreID     [16]byte
+	JournalID   [16]byte
+	MarkerID    [16]byte
+	MarkerEpoch uint64
+	TxnID       uint64
+	Generation  uint64
+}
+
+func readPrimaryIdentity(path string) (primaryIdentity, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return primaryIdentity{}, err
+	}
+	defer file.Close()
+	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(file)
+	if err != nil {
+		return primaryIdentity{}, err
+	}
+	scratch := make([]byte, bootstrap.MaxPageSize)
+	_, root, _, _, err := storeio.RecoverInlineStateRootWithFallback(
+		file, bootstrap.PageSize, scratch,
+	)
+	if err != nil {
+		return primaryIdentity{}, err
+	}
+	return primaryIdentity{
+		StoreID: root.StoreID, JournalID: root.JournalID, Path: path,
+	}, nil
+}
+
+func scanJournalPairing(
+	path string,
+) (journalIdentity, []conditionalRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return journalIdentity{}, nil, err
+	}
+	defer file.Close()
+	journal, err := storeio.OpenRecoveryJournal(file)
+	if err != nil {
+		return journalIdentity{}, nil, err
+	}
+	defer journal.Close()
+	header := journal.Header()
+	id := journalIdentity{
+		StoreID: header.StoreID, JournalID: header.JournalID, Path: path,
+	}
+	if header.FormatVersion != storeio.RecoveryJournalFormatConditional ||
+		journal.Cursor() == 0 {
+		return id, nil, nil
+	}
+	var conds []conditionalRecord
+	err = journal.Replay(journal.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
+		if rec.Kind != storeio.RecoveryRecordKindConditionalBatch {
+			return nil
+		}
+		conds = append(conds, conditionalRecord{
+			StoreID:     header.StoreID,
+			JournalID:   header.JournalID,
+			MarkerID:    rec.Conditional.MarkerID,
+			MarkerEpoch: rec.Conditional.MarkerEpoch,
+			TxnID:       rec.Conditional.TxnID,
+			Generation:  rec.Generation,
+		})
+		return nil
+	})
+	return id, conds, err
+}
+
+// txnMarkerTornTail reports whether the live record region contains non-zero
+// bytes past the scanned cursor — the offline signature of a truncatable torn
+// append that OpenTxnMarker leaves in place without mutating the file.
+func txnMarkerTornTail(path string, marker *storeio.TxnMarker) (int64, bool) {
+	if marker == nil {
+		return 0, false
+	}
+	cursor := marker.Cursor()
+	capacity := marker.Header().Capacity
+	if cursor >= capacity {
+		return 0, false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer file.Close()
+	offset := int64(txnMarkerRegionStart) + int64(cursor)
+	remain := capacity - cursor
+	if remain > storeio.TxnMarkerMinSectorSize {
+		remain = storeio.TxnMarkerMinSectorSize
+	}
+	buf := make([]byte, remain)
+	n, err := file.ReadAt(buf, offset)
+	if err != nil && n == 0 {
+		return 0, false
+	}
+	for i := 0; i < n; i++ {
+		if buf[i] != 0 {
+			return offset, true
+		}
+	}
+	return 0, false
 }
 
 func runSalvage(srcPath, outPath string) int {
