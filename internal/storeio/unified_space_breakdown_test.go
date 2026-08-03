@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"compress/flate"
+	"encoding/binary"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/benchcorpus"
@@ -129,6 +130,157 @@ func TestUnifiedCompetitiveSpaceBreakdown(t *testing.T) {
 	}
 	if total.structural+total.keys+total.rows+total.templates+total.dict+total.slack != total.extents {
 		t.Fatal("space categories do not sum to physical leaf extents")
+	}
+}
+
+func TestCompactCompetitiveSpaceBreakdown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("space breakdown plans both 100k competitive corpora")
+	}
+	const rows = 100_000
+	kindName := func(kind uint8) string {
+		switch kind {
+		case compactStreamDictionary:
+			return "dictionary"
+		case compactStreamFront:
+			return "front"
+		case compactStreamFOR:
+			return "for"
+		case compactStreamDelta:
+			return "delta"
+		case compactStreamDate:
+			return "date"
+		case compactStreamPrefixInt:
+			return "prefix-int"
+		case compactStreamDeltaPack:
+			return "delta-pack"
+		case compactStreamAlphabet:
+			return "alphabet"
+		default:
+			return "unknown"
+		}
+	}
+	for _, high := range []bool{false, true} {
+		name := "low"
+		if high {
+			name = "high"
+		}
+		t.Run(name, func(t *testing.T) {
+			corpus := benchcorpus.Corpus(rows, high)
+			graph := make([]PrimaryGraphRecord, len(corpus))
+			for i := range corpus {
+				graph[i] = PrimaryGraphRecord{
+					Key: []byte(corpus[i].Key), Value: corpus[i].JSON,
+				}
+			}
+			seed := unifiedTestStoreID()
+			plans, err := planCompactPrimaryLeaves(
+				seed, graph, CompactPrimaryStripeMaxRows,
+				CommonPrimaryLeafMaxExtentBytes,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			builder := NewUnifiedPrimaryLeafBuilder()
+			window := make([]CommonPrimaryLeafRecord, 0, CompactPrimaryStripeMaxRows)
+			type totals struct {
+				extent, payload, pageFrame, slack int
+				primaryHeader, shapeDir, keys     int
+				slots, shapeCodes, ranks          int
+				shapeHeaders, templates, streams  int
+				streamHeaders, dictionary         int
+				streamData                        int
+				kinds                             [compactStreamKindLimit]int
+			}
+			var total totals
+			for _, plan := range plans {
+				window = window[:0]
+				for at := plan.first; at < plan.last; at++ {
+					window = append(window, CommonPrimaryLeafRecord{
+						Key:   graph[at].Key,
+						Value: CommonPrimaryLeafValue{Inline: graph[at].Value},
+					})
+				}
+				payload, err := BuildCompactPrimaryStripePayload(window, builder)
+				if err != nil {
+					t.Fatal(err)
+				}
+				need := PageHeaderSize + len(payload) + PageTrailerSize
+				extent := (need + int(physicalPageQuantum) - 1) &^
+					(int(physicalPageQuantum) - 1)
+				shapeCount := int(binary.LittleEndian.Uint16(payload[8:]))
+				keyBytes := int(binary.LittleEndian.Uint32(payload[12:]))
+				shapeCodeBytes := int(binary.LittleEndian.Uint32(payload[16:]))
+				rankBytes := int(binary.LittleEndian.Uint32(payload[20:]))
+				shapeBytes := int(binary.LittleEndian.Uint32(payload[24:]))
+				slotBytes := int(binary.LittleEndian.Uint32(payload[28:]))
+				shapeDirBytes := 4 * shapeCount
+
+				total.extent += extent
+				total.payload += len(payload)
+				total.pageFrame += PageHeaderSize + PageTrailerSize
+				total.slack += extent - need
+				total.primaryHeader += compactPrimaryHeaderBytes
+				total.shapeDir += shapeDirBytes
+				total.keys += keyBytes
+				total.slots += slotBytes
+				total.shapeCodes += shapeCodeBytes
+				total.ranks += rankBytes
+
+				shapeStart := compactPrimaryHeaderBytes + shapeDirBytes +
+					keyBytes + slotBytes + shapeCodeBytes + rankBytes
+				if shapeStart+shapeBytes != len(payload) {
+					t.Fatalf("shape geometry = %d+%d, payload %d",
+						shapeStart, shapeBytes, len(payload))
+				}
+				for shape := range shapeCount {
+					rel := 0
+					if shape != 0 {
+						rel = int(binary.LittleEndian.Uint32(
+							payload[compactPrimaryHeaderBytes+(shape-1)*4:],
+						))
+					}
+					entry := shapeStart + rel
+					templateBytes := int(binary.LittleEndian.Uint32(payload[entry+8:]))
+					streamBytes := int(binary.LittleEndian.Uint32(payload[entry+12:]))
+					holes := int(binary.LittleEndian.Uint16(payload[entry+4:]))
+					total.shapeHeaders += compactPrimaryShapeHeader
+					total.templates += templateBytes
+					total.streams += streamBytes
+					cursor := entry + compactPrimaryShapeHeader + templateBytes
+					for range holes {
+						stream, err := openCompactStream(payload[cursor:])
+						if err != nil {
+							t.Fatal(err)
+						}
+						total.streamHeaders += compactStreamHeader + len(stream.dictDir)
+						total.dictionary += len(stream.dictData)
+						total.streamData += len(stream.data)
+						total.kinds[stream.kind] += stream.encoded
+						cursor += stream.encoded
+					}
+					if cursor != entry+compactPrimaryShapeHeader+
+						templateBytes+streamBytes {
+						t.Fatal("stream geometry drift")
+					}
+				}
+			}
+			perRow := func(value int) float64 { return float64(value) / rows }
+			t.Logf("leaves=%d extent=%.3f payload=%.3f page-frame=%.3f slack=%.3f header=%.3f shape-dir=%.3f keys=%.3f slots=%.3f shape-codes=%.3f ranks=%.3f shape-headers=%.3f templates=%.3f streams=%.3f stream-headers=%.3f dictionaries=%.3f stream-data=%.3f B/doc",
+				len(plans), perRow(total.extent), perRow(total.payload),
+				perRow(total.pageFrame), perRow(total.slack),
+				perRow(total.primaryHeader), perRow(total.shapeDir),
+				perRow(total.keys), perRow(total.slots),
+				perRow(total.shapeCodes), perRow(total.ranks),
+				perRow(total.shapeHeaders), perRow(total.templates),
+				perRow(total.streams), perRow(total.streamHeaders),
+				perRow(total.dictionary), perRow(total.streamData))
+			for kind, bytes := range total.kinds {
+				if bytes != 0 {
+					t.Logf("codec[%s]=%.3f B/doc", kindName(uint8(kind)), perRow(bytes))
+				}
+			}
+		})
 	}
 }
 

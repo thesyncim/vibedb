@@ -184,6 +184,43 @@ func TestMeasureCompactAlphabetMatchesEncoding(t *testing.T) {
 	}
 }
 
+func TestCompactAlphabetPacksAcrossValuesWithinRestartBlock(t *testing.T) {
+	const rows = compactStreamRestart + 1
+	values := make([][]byte, rows)
+	const alphabet = "abcdefghijklmnopq"
+	for row := range values {
+		values[row] = []byte{alphabet[row%len(alphabet)]}
+	}
+
+	var scratch compactStreamScratch
+	plan, ok := scratch.measureAlphabet(2, values, 0)
+	if !ok {
+		t.Fatal("alphabet rejected")
+	}
+	if plan.width != 5 {
+		t.Fatalf("width=%d, want 5", plan.width)
+	}
+	// Two offsets, two length-section headers, one byte of length per row,
+	// 40 packed bytes for the full block, and one for the final row.
+	const wantDataBytes = 2*4 + 2*2 + rows + 40 + 1
+	if plan.totalBytes != wantDataBytes {
+		t.Fatalf("data bytes=%d, want %d", plan.totalBytes, wantDataBytes)
+	}
+	oldPerValuePadding := 2*4 + rows + rows
+	if plan.totalBytes >= oldPerValuePadding {
+		t.Fatalf("block packing=%d did not beat per-value padding=%d", plan.totalBytes, oldPerValuePadding)
+	}
+
+	encoded := scratch.finishAlphabet(2, values, plan)
+	view := compactCodecRoundTrip(t, encoded, values)
+	for _, row := range []int{0, compactStreamRestart - 1, compactStreamRestart} {
+		got, valid := view.appendValue(nil, row)
+		if !valid || !bytes.Equal(got, values[row]) {
+			t.Fatalf("row=%d got=%q valid=%v want=%q", row, got, valid, values[row])
+		}
+	}
+}
+
 func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
 	for width := 0; width <= 64; width++ {
 		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {
@@ -403,12 +440,15 @@ func TestCompactAlphabetRejectsCorruption(t *testing.T) {
 	}
 	tests[0][dictStart+1] = tests[0][dictStart]
 	binary.LittleEndian.PutUint32(tests[1][dataStart:], 0)
-	cursor := dataStart + 4
-	_, n, valid := readCompactUvarint(tests[2][cursor:])
-	if !valid {
-		t.Fatal("alphabet fixture length")
+	cursor := dataStart + 4 + 2
+	for range values {
+		_, n, valid := readCompactUvarint(tests[2][cursor:])
+		if !valid {
+			t.Fatal("alphabet fixture length")
+		}
+		cursor += n
 	}
-	tests[2][cursor+n] |= 3
+	tests[2][cursor] |= 3
 	for i, malformed := range tests {
 		if _, err := openCompactStream(malformed); err == nil {
 			t.Fatalf("alphabet corruption %d admitted", i)

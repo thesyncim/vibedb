@@ -158,15 +158,16 @@ The low- and high-cardinality corpora have identical shape and length:
 24,881,153 JSON bytes (23.729 MiB) plus 1,200,000 key bytes (1.144 MiB), or
 26,081,153 key-inclusive logical bytes (24.873 MiB), for 100,000 documents.
 Their JSON-only gzip-9 sizes are 1.837 MiB and 8.041 MiB, respectively. Cells
-below are one isolated run and include vibedb's fully preallocated paired
-recovery journal. They are
-**apparent / allocated MiB**.
+below are one isolated run and are **apparent / allocated MiB**. VibeDB's
+ordinary buffered unified-bulk images are immutable here, so their lazy
+recovery journal does not yet exist and these rows are the complete footprint;
+the point-put rows have mutated and include the sibling.
 
 ### Intrinsic representation
 
 | engine | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk pair | **9.001 / 9.520** | **18.767 / 19.520** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **7.910 / 7.910** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | bbolt | 45.750 / 29.734 | 45.750 / 29.734 |
@@ -177,7 +178,7 @@ recovery journal. They are
 
 | engine | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk pair | **9.001 / 9.520** | **18.767 / 19.520** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **7.910 / 7.910** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | bbolt | 45.750 / 29.734 | 45.750 / 29.734 |

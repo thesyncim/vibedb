@@ -18,6 +18,7 @@ type compactPrimaryScanShape struct {
 type compactStreamSequentialState struct {
 	next   int
 	cursor int
+	bit    int
 	value  int64
 	width  int
 }
@@ -128,6 +129,15 @@ func (s *compactStreamSequentialState) appendValue(
 		if row%compactStreamRestart == 0 {
 			block := row / compactStreamRestart
 			s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
+			if len(v.data)-s.cursor < 2 {
+				return dst, false
+			}
+			lengthBytes := int(binary.LittleEndian.Uint16(v.data[s.cursor:]))
+			s.cursor += 2
+			if lengthBytes > len(v.data)-s.cursor {
+				return dst, false
+			}
+			s.bit = (s.cursor + lengthBytes) * 8
 		}
 		alphabet, ok := v.dictionaryEntry(0)
 		if !ok {
@@ -138,23 +148,30 @@ func (s *compactStreamSequentialState) appendValue(
 			return dst, false
 		}
 		s.cursor += n
-		packedBytes := (int(length)*int(v.width) + 7) / 8
-		if packedBytes > len(v.data)-s.cursor {
+		endBit := s.bit + int(length)*int(v.width)
+		if endBit > len(v.data)*8 {
 			return dst, false
 		}
 		start := len(dst)
 		dst = append(dst, make([]byte, int(length))...)
+		mask := uint16(1<<v.width) - 1
 		for char := 0; char < int(length); char++ {
-			code := int(compactReadBits(
-				v.data[s.cursor:s.cursor+packedBytes],
-				char*int(v.width), int(v.width),
-			))
+			byteAt := s.bit >> 3
+			shift := s.bit & 7
+			word := uint16(v.data[byteAt])
+			if shift+int(v.width) > 8 {
+				word |= uint16(v.data[byteAt+1]) << 8
+			}
+			code := int(word>>shift) & int(mask)
 			if code >= len(alphabet) {
 				return dst[:start], false
 			}
 			dst[start+char] = alphabet[code]
+			s.bit += int(v.width)
 		}
-		s.cursor += packedBytes
+		if s.bit != endBit {
+			return dst[:start], false
+		}
 		s.next++
 		return dst, true
 	}

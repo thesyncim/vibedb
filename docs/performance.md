@@ -70,16 +70,21 @@ Codec choice no longer forces exact-spelling filters onto whole-document
 rendering. Dictionary, front-coded, alphabet-packed, FOR, delta,
 Gregorian-date, and single-numeric-run streams all have complete encoded-value
 scan lanes. On the
-shape-identical high-cardinality corpus, a missing `/note` string scanned all
-100,000 alphabet-packed values in about 0.65 ms (6.5 ns/document), with zero
-fallback rows and zero warm allocations. The general container-valued render
+shape-identical high-cardinality corpus, an absent, alphabet-representable
+`/note` string of a populated value length scanned all 100,000
+alphabet-packed values in about 0.48 ms (4.8 ns/document), with zero fallback
+rows and zero warm allocations. The needle deliberately cannot be rejected
+from alphabet metadata. The prior format took about 0.79 ms on the identical
+gate. The general container-valued render
 fallback measured about 67 ms on the same harness; it remains disclosed as a
 different physical path rather than being used as an unindexed result.
 
-The high-cardinality all-bytes scan also improved from about 88 ms to 59.4 ms
-(roughly 419 MB/s) because sequential decoding carries each alphabet stream's
-bounded-restart cursor. Every packed character remains independently
-reconstructible; this is not dictionary substitution or value inference.
+The latest high-cardinality alphabet layout packs codes continuously within
+each bounded 64-row restart block. Besides removing per-value byte padding,
+its sequential decoder improved the high-cardinality all-bytes scan from about
+58.8 ms to 52.2 ms (roughly 477 MB/s). Every packed character remains
+independently reconstructible; this is not dictionary substitution or value
+inference.
 
 The same public probe's ordered all-bytes scan now reconstructs and consumes
 24.88 MB of canonical JSON in about 39.7 ms (roughly 627 MB/s), also with zero
@@ -190,16 +195,20 @@ posting enumeration, mutation folds, verification, and salvage. The same
 100,000-row low-cardinality corpus occupies 905,216 physical leaf bytes
 (9.05 bytes/document); catalog, tablet, root, and allocator pages bring the
 complete file to 10.20 bytes/document. The shape-identical high-cardinality
-variant occupies 85.48 bytes/document as a complete file, preventing the low
+variant occupies 82.94 bytes/document as a complete file, preventing the low
 cardinality result from hiding an irreversible or corpus-eliding encoding.
-Every key and scalar codec is decoded byte-for-byte in the format tests.
+That is 7.910 MiB, below the same JSON corpus's 8.041 MiB gzip-9 output even
+though the database file also retains all keys and structural metadata. Every
+key and scalar codec is decoded byte-for-byte in the format tests.
 
 The winning ingredients are generic: template-hole transposition; bit-packed
 dictionaries and frame-of-reference integers; block-packed delta integers;
 12-byte self-delimiting stream headers with 16-bit in-leaf dictionary ends;
 validated Gregorian date packing; bounded-restart front coding; a reversible
 single-numeric-run string codec; and adaptive alphabet packing for scalar
-streams with at most 64 distinct bytes. The numeric-run codec applies equally
+streams with at most 64 distinct bytes. Alphabet codes are continuous within
+each 64-row restart block, avoiding per-value byte padding while retaining
+bounded point reads. The numeric-run codec applies equally
 to keys such as
 `doc:00001234` and values such as `"user-1234"`. It does not infer one field
 from another, omit values, add a filter index, prune rows, or derive one field
@@ -306,7 +315,7 @@ sibling journal.
 
 | engine/profile | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk, immutable | **0.973 / 0.973** | **8.152 / 8.152** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **7.910 / 7.910** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | Pebble with Snappy | 33.978 / 34.000 | 40.993 / 41.027 |

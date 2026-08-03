@@ -596,11 +596,12 @@ func BenchmarkUnifiedFilterEqDate(b *testing.B) {
 }
 
 // BenchmarkUnifiedFilterEqHighCardinalityString exercises a non-dictionary
-// scalar stream. The missing needle forces a complete front-coded value scan
-// while keeping selectivity from dominating the measurement.
+// scalar stream. The absent needle uses only bytes present in the stream
+// alphabet and matches one corpus value length, so the codec must compare
+// packed payload bits instead of rejecting it from alphabet metadata.
 func BenchmarkUnifiedFilterEqHighCardinalityString(b *testing.B) {
 	benchmarkFilterEqCardinality(
-		b, "/note", `"not-present-in-the-corpus"`, false, true,
+		b, "/note", `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, false, true,
 	)
 }
 
