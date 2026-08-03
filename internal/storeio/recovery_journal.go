@@ -98,6 +98,13 @@ const (
 	// word, so an older binary's existing version==0 check rejects the journal
 	// before it can misinterpret kind 4.
 	RecoveryJournalFormatScalarPatch = uint32(1)
+	// RecoveryJournalFormatConditional admits conditional batch records (kind 5)
+	// used by multi-collection prepare. It occupies the same header format word
+	// older binaries require to hold a known value, so a legacy or scalar-patch
+	// reader rejects the journal before any record decode. Scalar-patch entries
+	// (kind 4) remain scalar-patch-format-only: the ordinary buffered delta lane
+	// never coexists with conditional records under this format word.
+	RecoveryJournalFormatConditional = uint32(2)
 
 	// RecordKindPut marks a same-size inline value replacement.
 	recoveryRecordKindPut = uint16(1)
@@ -117,21 +124,33 @@ const (
 	// spelling in the canonical document and seals the expected complete result.
 	// It is deliberately not a top-level record kind.
 	recoveryRecordKindScalarPatch = uint16(4)
+	// recoveryRecordKindConditionalBatch marks a prepare-time batch whose body is
+	// the ordinary batch entry grammar prefixed by a 32-byte conditional header
+	// (MarkerID, MarkerEpoch, TxnID). One sequence, one generation, one CRC —
+	// identical framing discipline to kind 3. Decide-time resolution is not this
+	// package's job; decode surfaces the conditional header to the replay caller.
+	recoveryRecordKindConditionalBatch = uint16(5)
 
 	// RecoveryRecordKindPut, RecoveryRecordKindDelete, RecoveryRecordKindBatch,
-	// and RecoveryRecordKindScalarPatch are the exported record kinds a store
-	// passes to Append/AppendBatch and matches on during Replay. ScalarPatch is
+	// RecoveryRecordKindScalarPatch, and RecoveryRecordKindConditionalBatch are
+	// the exported record kinds a store passes to Append/AppendBatch/
+	// AppendConditionalBatch and matches on during Replay. ScalarPatch is
 	// batch-entry-only; EncodeRecoveryRecord and DecodeRecoveryRecord reject it as
-	// a standalone record.
-	RecoveryRecordKindPut         = recoveryRecordKindPut
-	RecoveryRecordKindDelete      = recoveryRecordKindDelete
-	RecoveryRecordKindBatch       = recoveryRecordKindBatch
-	RecoveryRecordKindScalarPatch = recoveryRecordKindScalarPatch
+	// a standalone record. ConditionalBatch is top-level and conditional-format-
+	// only.
+	RecoveryRecordKindPut              = recoveryRecordKindPut
+	RecoveryRecordKindDelete           = recoveryRecordKindDelete
+	RecoveryRecordKindBatch            = recoveryRecordKindBatch
+	RecoveryRecordKindScalarPatch      = recoveryRecordKindScalarPatch
+	RecoveryRecordKindConditionalBatch = recoveryRecordKindConditionalBatch
 
 	// RecoveryBatchEntryHeaderSize is the fixed per-entry framing inside a batch
 	// record that precedes the entry's variable key and value bytes:
 	// kind (2) + reserved (2) + keyLen (4) + valueLen (4).
 	RecoveryBatchEntryHeaderSize = 12
+	// RecoveryConditionalHeaderSize is the fixed wire prefix of a conditional
+	// batch body: MarkerID (16) + MarkerEpoch (8) + TxnID (8).
+	RecoveryConditionalHeaderSize = 32
 	// RecoveryScalarPatchMetadataSize is the fixed wire framing inserted after a
 	// scalar-patch entry header and before its key and new scalar bytes. Byte 3 is
 	// reserved zero, keeping the checksum naturally aligned while making future
@@ -206,7 +225,8 @@ func recoveryJournalSemanticError(reason string) error {
 
 func recoveryJournalFormatSupported(formatVersion uint32) bool {
 	return formatVersion == RecoveryJournalFormatLegacy ||
-		formatVersion == RecoveryJournalFormatScalarPatch
+		formatVersion == RecoveryJournalFormatScalarPatch ||
+		formatVersion == RecoveryJournalFormatConditional
 }
 
 // RecoveryJournalHeader is the pointer-free format, identity, and geometry of
@@ -231,19 +251,34 @@ type RecoveryJournalHeader struct {
 	RecycleCount uint64
 }
 
+// RecoveryConditionalHeader is the pointer-free prepare binding carried by one
+// RecoveryRecordKindConditionalBatch record. MarkerID identifies the decision
+// log; MarkerEpoch is the epoch under which the record was written; TxnID is
+// unique within that epoch. Replay callers receive these fields and decide
+// apply/skip/fail-closed themselves — this package only decodes.
+type RecoveryConditionalHeader struct {
+	MarkerID    [16]byte
+	MarkerEpoch uint64
+	TxnID       uint64
+}
+
 // RecoveryRecord is one decoded redo record. Key and Value borrow the decode
 // buffer and must be copied if retained past the next decode.
 //
 // For a batch record (Kind == RecoveryRecordKindBatch) the logical mutations are
 // carried in Entries instead of Key/Value; Sequence and Generation are the
-// group's single sequence and generation.
+// group's single sequence and generation. For a conditional batch
+// (Kind == RecoveryRecordKindConditionalBatch) Entries holds the same put/
+// delete grammar and Conditional carries the prepare binding; Key/Value stay
+// empty.
 type RecoveryRecord struct {
-	Sequence   uint64
-	Generation uint64
-	Kind       uint16
-	Key        []byte
-	Value      []byte
-	Entries    []RecoveryBatchEntry
+	Sequence    uint64
+	Generation  uint64
+	Kind        uint16
+	Key         []byte
+	Value       []byte
+	Entries     []RecoveryBatchEntry
+	Conditional RecoveryConditionalHeader
 }
 
 // RecoveryScalarPatchMetadata is the pointer-free certificate carried by one
@@ -400,8 +435,18 @@ func recoveryBatchEntriesAllowed(
 		return false
 	}
 	for i := range entries {
-		if entries[i].Kind == recoveryRecordKindScalarPatch &&
-			formatVersion < RecoveryJournalFormatScalarPatch {
+		switch entries[i].Kind {
+		case recoveryRecordKindPut, recoveryRecordKindDelete:
+			if entries[i].ScalarPatch != (RecoveryScalarPatchMetadata{}) {
+				return false
+			}
+		case recoveryRecordKindScalarPatch:
+			// Scalar-patch remains the scalar-patch format's lane only. The
+			// conditional journal format never coexists with it.
+			if formatVersion != RecoveryJournalFormatScalarPatch {
+				return false
+			}
+		default:
 			return false
 		}
 	}
@@ -824,9 +869,9 @@ func encodeRecoveryBatchRecordPrepared(
 	for i := range rec.Entries {
 		entry := rec.Entries[i]
 		if entry.Kind == recoveryRecordKindScalarPatch &&
-			plan.formatVersion < RecoveryJournalFormatScalarPatch {
+			plan.formatVersion != RecoveryJournalFormatScalarPatch {
 			return 0, fmt.Errorf(
-				"%w: scalar-patch entry in legacy batch plan",
+				"%w: scalar-patch entry outside scalar-patch journal",
 				ErrInvalidWrite,
 			)
 		}
@@ -892,6 +937,11 @@ func DecodeRecoveryRecord(
 	}
 	if kind == recoveryRecordKindBatch {
 		return decodeRecoveryBatchRecord(src, sectorSize, expectedSequence)
+	}
+	if kind == recoveryRecordKindConditionalBatch {
+		return decodeRecoveryConditionalBatchRecord(
+			src, sectorSize, expectedSequence,
+		)
 	}
 	sequence := binary.LittleEndian.Uint64(src[8:16])
 	generation := binary.LittleEndian.Uint64(src[16:24])
@@ -1070,18 +1120,38 @@ func validateRecoveryRecordForFormat(
 	if !recoveryJournalFormatSupported(formatVersion) {
 		return recoveryJournalSemanticError("unsupported journal format version")
 	}
-	if formatVersion >= RecoveryJournalFormatScalarPatch ||
-		rec.Kind != recoveryRecordKindBatch {
+	switch rec.Kind {
+	case recoveryRecordKindPut, recoveryRecordKindDelete:
 		return nil
-	}
-	for i := range rec.Entries {
-		if rec.Entries[i].Kind == recoveryRecordKindScalarPatch {
+	case recoveryRecordKindBatch:
+		for i := range rec.Entries {
+			if rec.Entries[i].Kind != recoveryRecordKindScalarPatch {
+				continue
+			}
+			if formatVersion != RecoveryJournalFormatScalarPatch {
+				return recoveryJournalSemanticError(
+					"scalar-patch entry outside scalar-patch journal",
+				)
+			}
+		}
+		return nil
+	case recoveryRecordKindConditionalBatch:
+		if formatVersion != RecoveryJournalFormatConditional {
 			return recoveryJournalSemanticError(
-				"scalar-patch entry in legacy journal",
+				"conditional-batch record outside conditional journal",
 			)
 		}
+		for i := range rec.Entries {
+			if rec.Entries[i].Kind == recoveryRecordKindScalarPatch {
+				return recoveryJournalSemanticError(
+					"scalar-patch entry in conditional journal",
+				)
+			}
+		}
+		return nil
+	default:
+		return recoveryJournalSemanticError("unsupported record kind")
 	}
-	return nil
 }
 
 // RecoveryJournal is the single-writer file-backed manager. It is owned by the
