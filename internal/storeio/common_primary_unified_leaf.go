@@ -146,6 +146,8 @@ type UnifiedPrimaryLeafBuilder struct {
 	rows         []unifiedPrimaryLeafRow
 	shapes       []unifiedPrimaryLeafShape
 	records      []CommonPrimaryLeafRecord
+	graphRecords []PrimaryGraphRecord
+	graphPlaced  bool
 	plan         unifiedPrefixPlan
 	shapeRows    []int32
 	shapeSavings []int64
@@ -169,9 +171,41 @@ func NewUnifiedPrimaryLeafBuilder() *UnifiedPrimaryLeafBuilder {
 func (b *UnifiedPrimaryLeafBuilder) canonicalOf(i int) []byte {
 	row := &b.rows[i]
 	if row.heapOff < 0 {
-		return b.records[i].Value.Inline[:row.length]
+		return b.inlineValueAt(i)[:row.length]
 	}
 	return b.heap[row.heapOff : int(row.heapOff)+int(row.length)]
+}
+
+func (b *UnifiedPrimaryLeafBuilder) keyAt(i int) []byte {
+	if b.graphRecords != nil {
+		return b.graphRecords[i].keyBytes()
+	}
+	return b.records[i].Key
+}
+
+func (b *UnifiedPrimaryLeafBuilder) inlineValueAt(i int) []byte {
+	if b.graphRecords != nil {
+		return b.graphRecords[i].valueBytes()
+	}
+	return b.records[i].Value.Inline
+}
+
+func (b *UnifiedPrimaryLeafBuilder) overflowAt(i int) (PageRef, bool) {
+	if b.graphRecords != nil {
+		return PageRef{}, false
+	}
+	value := b.records[i].Value
+	return value.Overflow, value.IsOverflow()
+}
+
+func (b *UnifiedPrimaryLeafBuilder) slotAt(i int) uint8 {
+	if b.graphRecords != nil {
+		if b.graphPlaced {
+			return uint8(i)
+		}
+		return 0
+	}
+	return b.records[i].Slot
 }
 
 // buildIndex builds a tape over src, growing the reusable entry storage on
@@ -294,35 +328,56 @@ func (b *UnifiedPrimaryLeafBuilder) shapeEqual(a, bi int) bool {
 // later rows cannot invalidate earlier references.
 func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) error {
 	b.records = records
+	b.graphRecords = nil
+	b.graphPlaced = false
+	return b.extractRows(len(records))
+}
+
+// extractPrimaryGraph parses graph-builder descriptors directly. This avoids
+// expanding every 32-byte immutable descriptor into an 88-byte mutation
+// record solely to feed the shared compact encoder.
+func (b *UnifiedPrimaryLeafBuilder) extractPrimaryGraph(
+	records []PrimaryGraphRecord,
+	placed bool,
+) error {
+	b.records = nil
+	b.graphRecords = records
+	b.graphPlaced = placed
+	return b.extractRows(len(records))
+}
+
+func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 	b.heap = b.heap[:0]
 	b.spans = b.spans[:0]
 	b.rows = b.rows[:0]
 	b.shapes = b.shapes[:0]
-	for i := range records {
-		record := &records[i]
-		if len(record.Key) == 0 || len(record.Key) > CommonPrimaryLeafMaxKeyBytes {
+	for i := range count {
+		key := b.keyAt(i)
+		inline := b.inlineValueAt(i)
+		_, overflow := b.overflowAt(i)
+		if len(key) == 0 || len(key) > CommonPrimaryLeafMaxKeyBytes {
 			return fmt.Errorf("%w: unified leaf key", ErrInvalidWrite)
 		}
-		if i != 0 && bytes.Compare(records[i-1].Key, record.Key) >= 0 {
+		if i != 0 && bytes.Compare(b.keyAt(i-1), key) >= 0 {
 			return fmt.Errorf("%w: unified leaf keys not lexical", ErrInvalidWrite)
 		}
-		if record.Value.IsOverflow() {
+		if overflow {
 			// Overflow rows carry a chain reference, never canonical bytes; the
 			// chain itself holds the canonical spelling and the row takes
 			// no part in the template census.
 			b.rows = append(b.rows, unifiedPrimaryLeafRow{heapOff: -1, shape: -1})
 			continue
 		}
-		if len(record.Value.Inline) == 0 {
+		if len(inline) == 0 {
 			return fmt.Errorf("%w: unified leaf empty value", ErrInvalidWrite)
 		}
-		index, err := b.buildIndex(record.Value.Inline)
+		index, err := b.buildIndex(inline)
 		if err != nil {
 			return err
 		}
 		row := unifiedPrimaryLeafRow{heapOff: -1}
 		if IndexIsCanonical(index, &b.ws) {
-			row.length = int32(len(record.Value.Inline))
+			row.length = int32(len(inline))
 		} else {
 			off := len(b.heap)
 			b.heap, err = AppendCanonicalIndexed(b.heap, index, &b.ws)
@@ -341,7 +396,7 @@ func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) e
 		row.spanStart = int32(len(b.spans))
 		b.spans = appendHoleSpans(b.spans, index)
 		row.spanEnd = int32(len(b.spans))
-		canonical := record.Value.Inline
+		canonical := inline
 		if row.heapOff >= 0 {
 			canonical = b.heap[row.heapOff : int(row.heapOff)+int(row.length)]
 		}

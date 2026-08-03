@@ -39,19 +39,18 @@ type primaryLeafPlan struct {
 	last  int
 	class CommonPrimaryLeafClass
 	// payload is the exact validated compact stripe produced while selecting
-	// extent. It is retained only when no larger than the descriptor plan it
-	// replaces, and prevents graph construction from parsing and encoding the
-	// same immutable rows a second time.
+	// extent. Small payloads are retained to prevent graph construction from
+	// parsing and encoding the same immutable rows a second time; large ones
+	// are rebuilt directly from the source descriptors without another copy.
 	payload []byte
-	// records is the bounded-memory fallback for payloads larger than their row
-	// descriptors. Exactly one of payload and records is retained.
-	records []CommonPrimaryLeafRecord
 	// extent is the planner-selected physical page size.
 	extent int
 }
 
-// The adaptive retention decision compares the two actual Go-heap plans. It is
-// intentionally architecture-sized rather than an on-disk format constant.
+// The adaptive retention ceiling preserves the established CPU/memory balance:
+// retain an encoded payload only while it costs no more than the mutation-row
+// representation the direct graph path replaced. It is intentionally
+// architecture-sized rather than an on-disk format constant.
 const primaryLeafPlanRecordBytes = int(unsafe.Sizeof(CommonPrimaryLeafRecord{}))
 
 // PrimaryGraphPlan is one immutable, exact compact-leaf plan shared by bulk
@@ -423,25 +422,12 @@ func planCompactPrimaryLeaves(
 	}
 	var plans []primaryLeafPlan
 	builder := NewUnifiedPrimaryLeafBuilder()
-	window := make([]CommonPrimaryLeafRecord, 0, maxRows)
 	countHint := 0
 	for first := 0; first < len(records); {
 		hi := min(maxRows, len(records)-first)
-		window = window[:0]
-		for at := range hi {
-			source := records[first+at]
-			record := CommonPrimaryLeafRecord{
-				Key: source.keyBytes(),
-				Value: CommonPrimaryLeafValue{
-					Inline: source.valueBytes(),
-				},
-			}
-			if maxRows <= CommonPrimaryLeafWideSlots {
-				record.Slot = uint8(at)
-			}
-			window = append(window, record)
-		}
-		if err := prepareCompactPrimaryStripe(window, builder); err != nil {
+		window := records[first : first+hi]
+		placed := maxRows <= CommonPrimaryLeafWideSlots
+		if err := prepareCompactPrimaryGraphStripe(window, placed, builder); err != nil {
 			return nil, err
 		}
 		builtCount := 0
@@ -451,7 +437,7 @@ func planCompactPrimaryLeaves(
 			// array before returning. Invalidate the preceding borrowed result so
 			// final selection rebuilds it rather than retaining mutated scratch.
 			builtCount = 0
-			payload, err := buildPreparedCompactPrimaryStripePayload(window[:count], builder)
+			payload, err := buildPreparedCompactPrimaryGraphStripePayload(window[:count], builder)
 			if err == ErrCommonPrimaryLeafFull {
 				return maxExtent + int(physicalPageQuantum), false, nil
 			}
@@ -554,7 +540,7 @@ func planCompactPrimaryLeaves(
 		}
 		if builtCount != count {
 			var err error
-			builtPayload, err = buildPreparedCompactPrimaryStripePayload(window[:count], builder)
+			builtPayload, err = buildPreparedCompactPrimaryGraphStripePayload(window[:count], builder)
 			if err != nil {
 				return nil, err
 			}
@@ -571,8 +557,6 @@ func planCompactPrimaryLeaves(
 		}
 		if len(builtPayload) <= count*primaryLeafPlanRecordBytes {
 			plan.payload = append([]byte(nil), builtPayload...)
-		} else {
-			plan.records = append([]CommonPrimaryLeafRecord(nil), window[:count]...)
 		}
 		plans = append(plans, plan)
 		countHint = count
@@ -598,9 +582,9 @@ func buildPrimaryLeaves(
 			return nil, fmt.Errorf("%w: primary leaf identity", ErrInvalidWrite)
 		}
 		retainedPayload := len(plans[rank].payload) != 0
-		retainedRecords := len(plans[rank].records) != 0
 		if plans[rank].class != CommonPrimaryLeafCompact || plans[rank].extent == 0 ||
-			retainedPayload == retainedRecords {
+			plans[rank].first < 0 || plans[rank].last > len(input) ||
+			plans[rank].first >= plans[rank].last {
 			return nil, fmt.Errorf("%w: non-unified primary plan", ErrInvalidWrite)
 		}
 		pageSize := uint32(plans[rank].extent)
@@ -621,8 +605,10 @@ func buildPrimaryLeaves(
 			if unifiedBuilder == nil {
 				unifiedBuilder = NewUnifiedPrimaryLeafBuilder()
 			}
-			_, encodeErr = EncodeCompactPrimaryStripe(
-				page.Bytes(), leafHeader, plans[rank].records, unifiedBuilder,
+			_, encodeErr = encodeCompactPrimaryGraphStripe(
+				page.Bytes(), leafHeader,
+				input[plans[rank].first:plans[rank].last],
+				placements != nil, unifiedBuilder,
 			)
 		}
 		if encodeErr != nil {

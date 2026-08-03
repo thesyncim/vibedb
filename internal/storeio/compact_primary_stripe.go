@@ -62,28 +62,59 @@ func prepareCompactPrimaryStripe(
 	return nil
 }
 
+func prepareCompactPrimaryGraphStripe(
+	records []PrimaryGraphRecord,
+	placed bool,
+	builder *UnifiedPrimaryLeafBuilder,
+) error {
+	if builder == nil || len(records) > CompactPrimaryStripeMaxRows {
+		return fmt.Errorf("%w: compact graph stripe input", ErrInvalidWrite)
+	}
+	return builder.extractPrimaryGraph(records, placed)
+}
+
 func buildPreparedCompactPrimaryStripePayload(
 	records []CommonPrimaryLeafRecord,
 	builder *UnifiedPrimaryLeafBuilder,
 ) ([]byte, error) {
-	if builder == nil || len(records) > len(builder.records) ||
+	if builder == nil || builder.graphRecords != nil ||
+		len(records) > len(builder.records) ||
 		len(records) > CompactPrimaryStripeMaxRows {
 		return nil, fmt.Errorf("%w: prepared compact stripe input", ErrInvalidWrite)
 	}
+	return buildPreparedCompactPrimaryStripePayloadRows(len(records), builder)
+}
+
+func buildPreparedCompactPrimaryGraphStripePayload(
+	records []PrimaryGraphRecord,
+	builder *UnifiedPrimaryLeafBuilder,
+) ([]byte, error) {
+	if builder == nil || builder.graphRecords == nil ||
+		len(records) > len(builder.graphRecords) ||
+		len(records) > CompactPrimaryStripeMaxRows {
+		return nil, fmt.Errorf("%w: prepared compact graph stripe input", ErrInvalidWrite)
+	}
+	return buildPreparedCompactPrimaryStripePayloadRows(len(records), builder)
+}
+
+func buildPreparedCompactPrimaryStripePayloadRows(
+	rowCount int,
+	builder *UnifiedPrimaryLeafBuilder,
+) ([]byte, error) {
 	shapeCount := 0
-	for row := range records {
+	for row := range rowCount {
 		shape := int(builder.rows[row].shape)
 		if shape >= 0 {
 			shapeCount = max(shapeCount, shape+1)
 		}
 	}
-	if shapeCount > len(records) ||
+	if shapeCount > rowCount ||
 		shapeCount > len(builder.shapes) || shapeCount > int(^uint16(0)) {
 		return nil, fmt.Errorf("%w: compact stripe shapes", ErrInvalidWrite)
 	}
 	overflowCount := 0
-	for row := range records {
-		if records[row].Value.IsOverflow() {
+	for row := range rowCount {
+		if _, overflow := builder.overflowAt(row); overflow {
 			overflowCount++
 		}
 	}
@@ -94,8 +125,8 @@ func buildPreparedCompactPrimaryStripePayload(
 	} else if shapeCount != 0 {
 		shapeWidth = bits.Len(uint(shapeCount - 1))
 	}
-	shapeCodeBytes := (len(records)*shapeWidth + 7) / 8
-	restarts := (len(records) + compactStreamRestart - 1) / compactStreamRestart
+	shapeCodeBytes := (rowCount*shapeWidth + 7) / 8
+	restarts := (rowCount + compactStreamRestart - 1) / compactStreamRestart
 	rankBytes64 := uint64(restarts) * uint64(shapeCount) * 2
 	if rankBytes64 > uint64(^uint32(0)) {
 		return nil, fmt.Errorf("%w: compact stripe rank checkpoints", ErrInvalidWrite)
@@ -111,10 +142,10 @@ func buildPreparedCompactPrimaryStripePayload(
 	scratch.shapeCodes = slices.Grow(scratch.shapeCodes[:0], shapeCodeBytes)[:shapeCodeBytes]
 	clear(scratch.shapeCodes)
 	shapeCodes := scratch.shapeCodes
-	for row := range records {
+	for row := range rowCount {
 		shape := int(builder.rows[row].shape)
 		if shape < 0 {
-			if !records[row].Value.IsOverflow() {
+			if _, overflow := builder.overflowAt(row); !overflow {
 				return nil, fmt.Errorf("%w: compact stripe row shape", ErrInvalidWrite)
 			}
 			compactPutBits(shapeCodes, row*shapeWidth, shapeWidth, uint64(shapeCount))
@@ -127,10 +158,10 @@ func buildPreparedCompactPrimaryStripePayload(
 		shapeRows[shape] = append(shapeRows[shape], row)
 	}
 
-	scratch.keys = slices.Grow(scratch.keys[:0], len(records))[:len(records)]
+	scratch.keys = slices.Grow(scratch.keys[:0], rowCount)[:rowCount]
 	keys := scratch.keys
-	for row := range records {
-		keys[row] = records[row].Key
+	for row := range rowCount {
+		keys[row] = builder.keyAt(row)
 	}
 
 	headerBytes := compactPrimaryHeaderBytes + 4*shapeCount
@@ -138,7 +169,7 @@ func buildPreparedCompactPrimaryStripePayload(
 	clear(scratch.payload)
 	payload := scratch.payload
 	copy(payload, compactPrimaryMagic)
-	binary.LittleEndian.PutUint32(payload[4:], uint32(len(records)))
+	binary.LittleEndian.PutUint32(payload[4:], uint32(rowCount))
 	binary.LittleEndian.PutUint16(payload[8:], uint16(shapeCount))
 	payload[10] = byte(shapeWidth)
 	if hasOverflow {
@@ -154,15 +185,15 @@ func buildPreparedCompactPrimaryStripePayload(
 	binary.LittleEndian.PutUint32(payload[12:], uint32(len(payload)-keyStart))
 
 	slotStart := len(payload)
-	if len(records) <= CommonPrimaryLeafWideSlots {
+	if rowCount <= CommonPrimaryLeafWideSlots {
 		anyNonZero := false
-		for row := range records {
-			anyNonZero = anyNonZero || records[row].Slot != 0
+		for row := range rowCount {
+			anyNonZero = anyNonZero || builder.slotAt(row) != 0
 		}
 		writeSlots := false
 		if anyNonZero {
-			for row := range records {
-				if records[row].Slot != uint8(row) {
+			for row := range rowCount {
+				if builder.slotAt(row) != uint8(row) {
 					writeSlots = true
 					break
 				}
@@ -170,8 +201,8 @@ func buildPreparedCompactPrimaryStripePayload(
 		}
 		if writeSlots {
 			var used [4]uint64
-			for row := range records {
-				slot := records[row].Slot
+			for row := range rowCount {
+				slot := builder.slotAt(row)
 				bit := uint64(1) << uint(slot&63)
 				if used[slot>>6]&bit != 0 {
 					return nil, fmt.Errorf("%w: compact stripe duplicate slot", ErrInvalidWrite)
@@ -185,20 +216,20 @@ func buildPreparedCompactPrimaryStripePayload(
 	binary.LittleEndian.PutUint32(payload[20:], uint32(rankBytes))
 	binary.LittleEndian.PutUint32(payload[28:], uint32(len(payload)-slotStart))
 	if hasOverflow {
-		bitmapBytes := (len(records) + 7) / 8
+		bitmapBytes := (rowCount + 7) / 8
 		scratch.overflow = slices.Grow(scratch.overflow[:0], bitmapBytes)[:bitmapBytes]
 		clear(scratch.overflow)
-		for row := range records {
-			if records[row].Value.IsOverflow() {
+		for row := range rowCount {
+			if _, overflow := builder.overflowAt(row); overflow {
 				scratch.overflow[row>>3] |= byte(1) << uint(row&7)
 			}
 		}
 		payload = append(payload, scratch.overflow...)
-		for row := range records {
-			if records[row].Value.IsOverflow() {
+		for row := range rowCount {
+			if ref, overflow := builder.overflowAt(row); overflow {
 				start := len(payload)
 				payload = append(payload, make([]byte, PageRefSize)...)
-				encodePageRef(payload[start:], records[row].Value.Overflow)
+				encodePageRef(payload[start:], ref)
 			}
 		}
 	}
@@ -214,7 +245,7 @@ func buildPreparedCompactPrimaryStripePayload(
 			payload = append(payload, encoded[:]...)
 		}
 		first := block * compactStreamRestart
-		last := min(first+compactStreamRestart, len(records))
+		last := min(first+compactStreamRestart, rowCount)
 		for row := first; row < last; row++ {
 			shape := int(compactReadBits(shapeCodes, row*shapeWidth, shapeWidth))
 			if shape < shapeCount {
@@ -314,6 +345,23 @@ func EncodeCompactPrimaryStripe(
 	builder *UnifiedPrimaryLeafBuilder,
 ) ([]byte, error) {
 	payloadBytes, err := BuildCompactPrimaryStripePayload(records, builder)
+	if err != nil {
+		return nil, err
+	}
+	return encodeCompactPrimaryStripePayload(dst, header, payloadBytes)
+}
+
+func encodeCompactPrimaryGraphStripe(
+	dst []byte,
+	header CommonPrimaryLeafHeader,
+	records []PrimaryGraphRecord,
+	placed bool,
+	builder *UnifiedPrimaryLeafBuilder,
+) ([]byte, error) {
+	if err := prepareCompactPrimaryGraphStripe(records, placed, builder); err != nil {
+		return nil, err
+	}
+	payloadBytes, err := buildPreparedCompactPrimaryGraphStripePayload(records, builder)
 	if err != nil {
 		return nil, err
 	}

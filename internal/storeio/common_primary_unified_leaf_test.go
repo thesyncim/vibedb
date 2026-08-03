@@ -1633,8 +1633,7 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 		}
 		if again[at].first != plans[at].first || again[at].last != plans[at].last ||
 			again[at].extent != plans[at].extent ||
-			!bytes.Equal(again[at].payload, plans[at].payload) ||
-			len(again[at].records) != len(plans[at].records) {
+			!bytes.Equal(again[at].payload, plans[at].payload) {
 			t.Fatalf("plan %d differs across runs", at)
 		}
 		next = plans[at].last
@@ -1675,6 +1674,20 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 				t.Fatalf("plan %d larger-prefix probe: %v", at, largerErr)
 			}
 		}
+		graphBuilder := NewUnifiedPrimaryLeafBuilder()
+		graphWindow := records[plans[at].first:plans[at].last]
+		if err := prepareCompactPrimaryGraphStripe(graphWindow, false, graphBuilder); err != nil {
+			t.Fatalf("plan %d prepare graph payload: %v", at, err)
+		}
+		graphPayload, err := buildPreparedCompactPrimaryGraphStripePayload(
+			graphWindow, graphBuilder,
+		)
+		if err != nil {
+			t.Fatalf("plan %d graph payload: %v", at, err)
+		}
+		if !bytes.Equal(graphPayload, fresh) {
+			t.Fatalf("plan %d graph payload differs from mutation payload", at)
+		}
 		dst := make([]byte, plans[at].extent)
 		header := CommonPrimaryLeafHeader{
 			StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0,
@@ -1690,11 +1703,8 @@ func TestUnifiedPlannerDeterministicCoverage(t *testing.T) {
 				dst, header, plans[at].payload,
 			)
 		} else {
-			if len(plans[at].records) != len(window) {
-				t.Fatalf("plan %d retained neither bounded representation", at)
-			}
-			_, encodeErr = EncodeCompactPrimaryStripe(
-				dst, header, plans[at].records, NewUnifiedPrimaryLeafBuilder(),
+			_, encodeErr = encodeCompactPrimaryGraphStripe(
+				dst, header, graphWindow, false, NewUnifiedPrimaryLeafBuilder(),
 			)
 		}
 		if encodeErr != nil {
@@ -1826,13 +1836,13 @@ func TestUnifiedPlannerBoundsLargePayloadRetention(t *testing.T) {
 	}
 	plannedRows := 0
 	for at := range plans {
-		if len(plans[at].payload) != 0 || len(plans[at].records) == 0 {
+		if len(plans[at].payload) != 0 {
 			t.Fatalf(
-				"plan %d retained payload=%d records=%d, want bounded records",
-				at, len(plans[at].payload), len(plans[at].records),
+				"plan %d retained payload=%d, want source-backed rebuild",
+				at, len(plans[at].payload),
 			)
 		}
-		plannedRows += len(plans[at].records)
+		plannedRows += plans[at].last - plans[at].first
 	}
 	if plannedRows != rows {
 		t.Fatalf("large payload planned rows=%d want=%d", plannedRows, rows)
