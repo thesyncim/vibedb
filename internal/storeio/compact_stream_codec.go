@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // Compact scalar streams are the independently decodable columns inside the
@@ -44,13 +45,14 @@ type compactStreamEncoding struct {
 // before reusing this workspace for the next column, so one fixed candidate
 // set serves every stream without per-column allocation churn.
 type compactStreamScratch struct {
-	candidates [8]compactStreamEncoding
-	data       [8][]byte
-	dict       [8][][]byte
-	alphabet   [8][]byte
-	integers   []int64
-	dates      []int32
-	parsed     []uint64
+	candidates    [8]compactStreamEncoding
+	data          [8][]byte
+	dict          [8][][]byte
+	alphabet      [8][]byte
+	integers      []int64
+	dates         []int32
+	parsed        []uint64
+	dictionaryIDs map[string]uint32
 }
 
 func (e compactStreamEncoding) encodedBytes() int {
@@ -105,13 +107,12 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 	if len(values) == 0 {
 		return compactStreamEncoding{kind: compactStreamDictionary}
 	}
-	n := 0
-	s.candidates[n] = s.encodeDictionary(n, values)
-	n++
+	dictionaryBytes := s.measureDictionary(values)
+	n := 1
 	s.candidates[n] = s.encodeFront(n, values)
 	n++
 	alphabetLimit := min(
-		s.candidates[0].encodedBytes(),
+		dictionaryBytes,
 		s.candidates[1].encodedBytes(),
 	)
 	if alphabet, ok := s.encodeAlphabet(n, values, alphabetLimit); ok {
@@ -150,40 +151,64 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		s.candidates[n] = numeric
 		n++
 	}
-	best := s.candidates[0]
-	for _, candidate := range s.candidates[1:n] {
+	best := s.candidates[1]
+	for _, candidate := range s.candidates[2:n] {
 		if candidate.encodedBytes() < best.encodedBytes() {
 			best = candidate
 		}
 	}
+	// Dictionary was historically the first candidate, so an exact-size tie
+	// must still select it. Defer its sort and row-ID stream until that work can
+	// affect the result; high-cardinality columns normally choose alphabet or
+	// front coding and otherwise paid for a discarded O(rows log rows) build.
+	if dictionaryBytes <= best.encodedBytes() {
+		return s.finishDictionary(values)
+	}
 	return best
 }
 
-func (s *compactStreamScratch) encodeDictionary(slot int, values [][]byte) compactStreamEncoding {
-	dictionary := slices.Grow(s.dict[slot][:0], len(values))[:len(values)]
-	copy(dictionary, values)
-	slices.SortFunc(dictionary, bytes.Compare)
-	unique := 0
-	for _, value := range dictionary {
-		if unique == 0 || !bytes.Equal(dictionary[unique-1], value) {
-			dictionary[unique] = value
-			unique++
-		}
+func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
+	if s.dictionaryIDs == nil {
+		s.dictionaryIDs = make(map[string]uint32, len(values))
+	} else {
+		clear(s.dictionaryIDs)
 	}
-	dictionary = dictionary[:unique]
-	s.dict[slot] = dictionary
+	dictionary := slices.Grow(s.dict[0][:0], len(values))[:0]
+	dictionaryBytes := 0
+	for _, value := range values {
+		key := byteview.String(value)
+		if _, found := s.dictionaryIDs[key]; found {
+			continue
+		}
+		s.dictionaryIDs[key] = uint32(len(dictionary))
+		dictionary = append(dictionary, value)
+		dictionaryBytes += len(value)
+	}
+	s.dict[0] = dictionary
+	width := bits.Len(uint(max(0, len(dictionary)-1)))
+	return compactStreamHeader + 2*len(dictionary) + dictionaryBytes +
+		(len(values)*width+7)/8
+}
+
+func (s *compactStreamScratch) finishDictionary(values [][]byte) compactStreamEncoding {
+	dictionary := s.dict[0]
+	slices.SortFunc(dictionary, bytes.Compare)
+	clear(s.dictionaryIDs)
+	for id, value := range dictionary {
+		s.dictionaryIDs[byteview.String(value)] = uint32(id)
+	}
 	width := bits.Len(uint(max(0, len(dictionary)-1)))
 	dataBytes := (len(values)*width + 7) / 8
-	data := slices.Grow(s.data[slot][:0], dataBytes)[:dataBytes]
+	data := slices.Grow(s.data[0][:0], dataBytes)[:dataBytes]
 	clear(data)
 	for row, value := range values {
-		id, found := slices.BinarySearchFunc(dictionary, value, bytes.Compare)
+		id, found := s.dictionaryIDs[byteview.String(value)]
 		if !found {
 			panic("compact dictionary planner lost value")
 		}
 		compactPutBits(data, row*width, width, uint64(id))
 	}
-	s.data[slot] = data
+	s.data[0] = data
 	return compactStreamEncoding{
 		kind: compactStreamDictionary, width: uint8(width), count: len(values),
 		data: data, dict: dictionary,

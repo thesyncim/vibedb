@@ -120,6 +120,17 @@ func TestCompactStreamAdaptiveSelectionAndCount(t *testing.T) {
 	if encoded.kind != compactStreamDictionary {
 		t.Fatalf("adaptive kind=%d want dictionary", encoded.kind)
 	}
+	gotBinary, err := encoded.appendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBinary, err := encodeCompactDictionary(values).appendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBinary, wantBinary) {
+		t.Fatal("deferred dictionary bytes differ from eager encoding")
+	}
 	view := compactCodecRoundTrip(t, encoded, values)
 	matched, supported := view.countDictionaryEqual([]byte(`"PT"`))
 	if !supported || matched != want {

@@ -112,6 +112,12 @@ until they prove one fitting and one failing bound, and binary-search only that
 bracket. A density phase change expands the bracket; it never substitutes a
 heuristic boundary. On the 100,000-row high-cardinality corpus this reduced the
 bulk load from about 3.59 s to 2.08 s and the leaf count from 195 to 129.
+Scalar codec planning now measures dictionary cost from borrowed values and
+only sorts and packs the dictionary if it wins; deterministic ordering and the
+existing dictionary-first tie rule are unchanged. Avoiding discarded
+dictionary work reduced the same high-cardinality bulk load again to about
+1.51 s, while the low-cardinality load improved from about 0.30 s to 0.24 s.
+Both complete database files remain exactly the same size.
 The 20,000-document `BenchmarkFileStoreCreateFromFloor` improved from about
 289 ms to 29 ms (roughly 10×, or 14.45 µs to 1.45 µs per document); allocated
 setup bytes fell from about 15.62 MB to 2.90 MB. It still selects identical leaf
