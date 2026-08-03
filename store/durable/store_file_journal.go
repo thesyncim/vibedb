@@ -202,12 +202,18 @@ func (c *Collection) bufferedJournalDeltaLane() bool {
 func newBufferedJournalDeltaEntryScratch(
 	options normalizedFileStoreOptions,
 ) []storeio.RecoveryBatchEntry {
-	if options.Durability != DurabilityBufferedVisible ||
-		options.RecoveryJournal ||
-		options.primaryUnifiedOverlayBytes == 0 {
+	if !bufferedJournalDeltaEntryScratchEnabled(options) {
 		return nil
 	}
 	return make([]storeio.RecoveryBatchEntry, primaryUnifiedOverlayRecords)
+}
+
+func bufferedJournalDeltaEntryScratchEnabled(
+	options normalizedFileStoreOptions,
+) bool {
+	return options.Durability == DurabilityBufferedVisible &&
+		!options.RecoveryJournal &&
+		options.primaryUnifiedOverlayBytes != 0
 }
 
 // recoveryJournalSuffix names a store file's paired recovery journal, which
@@ -398,7 +404,8 @@ func (c *Collection) openRecoveryJournalLocked(
 	if journal.Header().FormatVersion ==
 		storeio.RecoveryJournalFormatScalarPatch &&
 		(!c.buffered() || c.options.RecoveryJournal ||
-			c.primaryUnifiedOverlay == nil || len(c.journalDeltaEntries) == 0) {
+			c.primaryUnifiedOverlay == nil ||
+			!bufferedJournalDeltaEntryScratchEnabled(c.options)) {
 		_ = journal.Close()
 		return fmt.Errorf(
 			"%w: format-1 journal requires ordinary buffered delta mode",
@@ -1016,6 +1023,12 @@ func (c *Collection) prepareBufferedJournalDeltaLocked(
 	}
 	if !c.bufferedJournalDeltaStateEligible(after) {
 		return nil, storeio.RecoveryBatchPlan{}, false, nil
+	}
+	if c.journalDeltaEntries == nil {
+		// This framing window is needed only by a foreground Flush that found a
+		// consecutive overlay delta. Read-only opens and stores that close without
+		// a logical delta never materialize it.
+		c.journalDeltaEntries = newBufferedJournalDeltaEntryScratch(c.options)
 	}
 	entries, covered, entryErr :=
 		c.primaryUnifiedOverlay.checkpointEntriesMode(

@@ -350,7 +350,6 @@ func newCollectionResources(
 		),
 		primaryConcurrentContexts: concurrentContexts,
 		primaryConcurrentStripes:  concurrentStripes,
-		journalDeltaEntries:       newBufferedJournalDeltaEntryScratch(options),
 	}
 	if options.MaterializationDamageGranule != 0 {
 		imageArenaBytes := options.MaxPageSize + options.PageSize

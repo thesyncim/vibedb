@@ -160,6 +160,37 @@ func TestBufferedJournalDeltaEntryScratchEligibility(t *testing.T) {
 	}
 }
 
+func TestBufferedJournalDeltaEntryScratchIsLazy(t *testing.T) {
+	options := unindexedBufferedOverlayGeometryOptions()
+	coll := buildTemplateHeavyOverlayCollection(
+		t, t.TempDir(), 128, options,
+	)
+	defer coll.Close()
+	if coll.journalDeltaEntries != nil {
+		t.Fatal("read-only open allocated journal delta entry scratch")
+	}
+	key := []byte(templateHeavyOverlayKey(0))
+	value := bytes.Replace(
+		templateHeavyOverlayDoc(0), []byte(`"active":true`),
+		[]byte(`"active":null`), 1,
+	)
+	if _, err := coll.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	if coll.journalDeltaEntries != nil {
+		t.Fatal("overlay publication allocated checkpoint-only journal scratch")
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(coll.journalDeltaEntries); got != primaryUnifiedOverlayRecords {
+		t.Fatalf(
+			"journal delta entry scratch = %d records, want %d",
+			got, primaryUnifiedOverlayRecords,
+		)
+	}
+}
+
 func TestPrimaryUnifiedOverlayAdaptiveBucketGeometry(t *testing.T) {
 	t.Run("competitive maximum", func(t *testing.T) {
 		options := unindexedBufferedOverlayGeometryOptions()
