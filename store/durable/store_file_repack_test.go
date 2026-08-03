@@ -170,9 +170,26 @@ func TestFilePrimaryRepackRoundTrip(t *testing.T) {
 	}
 }
 
-// repackTestAdjacency reports the mean |Δoffset| between lexically adjacent
-// leaves divided by the mean extent size (the locality gate metric) for the
+// repackTestAdjacency reports the lexical-adjacency locality ratio for the
 // collection's current durable graph, plus its file end.
+//
+// Locality means each lexically-adjacent leaf is placed immediately after its
+// predecessor, so |offset[i]-offset[i-1]| equals extent[i-1] for a perfectly
+// clustered layout. The ratio is the summed adjacent offset deltas divided by
+// the summed *predecessor* extents those deltas are compared against — not the
+// mean extent over all leaves. For any contiguous layout the two sums are equal
+// term for term, so the ratio is exactly 1.00 regardless of how leaf extents are
+// distributed across size classes; a scattered (churned) graph reads far above
+// 1.00 because its deltas dwarf the extents separating ordered neighbours.
+//
+// The earlier mean-delta / mean-extent form only equalled 1.00 when every leaf
+// shared one extent class. It drifted above 1.00 on a bulk build that produced a
+// mix of extent classes — e.g. after the compact delta-stream packing lands one
+// leaf's optimally encoded payload a few bytes over a 4 KiB quantum, giving it a
+// 16 KiB extent among 12 KiB neighbours — even though that layout is perfectly
+// contiguous with zero reclaimable inter-leaf space. Pairing each delta with its
+// own predecessor extent removes that size-class bias while still catching real
+// scatter.
 func repackTestAdjacency(t *testing.T, collection *Collection) (float64, uint64) {
 	t.Helper()
 	if err := collection.Flush(); err != nil {
@@ -185,23 +202,18 @@ func repackTestAdjacency(t *testing.T, collection *Collection) (float64, uint64)
 	if len(leaves) == 0 {
 		t.Fatal("graph walk returned no leaves")
 	}
-	var adjSum, extentSum float64
-	for i := range leaves {
-		extentSum += float64(leaves[i].extent)
-		if i == 0 {
-			continue
-		}
+	var adjSum, adjExtentSum float64
+	for i := 1; i < len(leaves); i++ {
 		delta := int64(leaves[i].offset) - int64(leaves[i-1].offset)
 		if delta < 0 {
 			delta = -delta
 		}
 		adjSum += float64(delta)
+		adjExtentSum += float64(leaves[i-1].extent)
 	}
-	meanExtent := extentSum / float64(len(leaves))
-	meanAdj := adjSum / float64(max(len(leaves)-1, 1))
 	ratio := 0.0
-	if meanExtent != 0 {
-		ratio = meanAdj / meanExtent
+	if adjExtentSum != 0 {
+		ratio = adjSum / adjExtentSum
 	}
 	return ratio, collection.state.Load().fileEnd
 }

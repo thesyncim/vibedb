@@ -734,20 +734,24 @@ func primaryChurnCollectSample(
 	graphStructural := leafStructural + nonLeafStructural
 
 	slices.Sort(occupancy)
-	var adjSum float64
+	// Pair each offset delta with its own predecessor extent, matching
+	// repackTestAdjacency: dividing mean delta by mean extent reads above 1.00
+	// for a perfectly contiguous layout whenever extent classes are mixed.
+	var adjSum, adjExtentSum float64
 	for i := 1; i < len(leaves); i++ {
 		delta := int64(leaves[i].offset) - int64(leaves[i-1].offset)
 		if delta < 0 {
 			delta = -delta
 		}
 		adjSum += float64(delta)
+		adjExtentSum += float64(leaves[i-1].extent)
 	}
 	pairs := max(len(leaves)-1, 1)
 	meanAdj := adjSum / float64(pairs)
 	meanExtent := float64(extentSum) / float64(len(leaves))
 	adjRatio := 0.0
-	if meanExtent != 0 {
-		adjRatio = meanAdj / meanExtent
+	if adjExtentSum != 0 {
+		adjRatio = adjSum / adjExtentSum
 	}
 	leafBytesPerKey := 0.0
 	graphBytesPerKey := 0.0
