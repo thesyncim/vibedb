@@ -21,8 +21,9 @@ type compactPrimaryBuildScratch struct {
 	shapeRows  [][]int
 	shapeCodes []byte
 	keys       [][]byte
+	canonicals [][]byte
 	counts     []uint16
-	columns    [][][]byte
+	values     [][]byte
 	overflow   []byte
 	stream     compactStreamScratch
 }
@@ -212,20 +213,28 @@ func BuildCompactPrimaryStripePayload(
 		binary.LittleEndian.PutUint32(payload[entryStart+8:], uint32(templateBytes))
 
 		streamsStart := len(payload)
-		scratch.columns = slices.Grow(scratch.columns[:0], plan.holes)[:plan.holes]
-		for hole := range scratch.columns {
-			scratch.columns[hole] = scratch.columns[hole][:0]
-		}
-		columns := scratch.columns
-		for _, rowIndex := range shapeRows[shape] {
+		scratch.canonicals = slices.Grow(
+			scratch.canonicals[:0], len(shapeRows[shape]),
+		)[:len(shapeRows[shape])]
+		for ordinal, rowIndex := range shapeRows[shape] {
 			row := &builder.rows[rowIndex]
-			canonical := builder.canonicalOf(rowIndex)
-			for hole, span := range builder.spans[row.spanStart:row.spanEnd] {
-				columns[hole] = append(columns[hole], canonical[span.Start:span.End])
+			if int(row.spanEnd-row.spanStart) != plan.holes {
+				return nil, fmt.Errorf("%w: compact stripe hole count", ErrInvalidWrite)
 			}
+			scratch.canonicals[ordinal] = builder.canonicalOf(rowIndex)
 		}
-		for hole := range columns {
-			stream := scratch.stream.encode(columns[hole])
+		scratch.values = slices.Grow(
+			scratch.values[:0], len(shapeRows[shape]),
+		)[:0]
+		for hole := range plan.holes {
+			values := scratch.values[:0]
+			for ordinal, rowIndex := range shapeRows[shape] {
+				row := &builder.rows[rowIndex]
+				span := builder.spans[int(row.spanStart)+hole]
+				canonical := scratch.canonicals[ordinal]
+				values = append(values, canonical[span.Start:span.End])
+			}
+			stream := scratch.stream.encode(values)
 			payload, err = stream.appendBinary(payload)
 			if err != nil {
 				return nil, err
