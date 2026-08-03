@@ -418,6 +418,11 @@ steady-state `HeapAlloc` after publication. These values explain the stable API
 guidance: use Builder for bulk load, and size the process for load high-water,
 not only the final collection.
 
+That guidance applies when the desired result is an in-memory
+`store.Collection`. Durable callers that already own the input batch use
+`durable.CreateFromRecords`, which bypasses this intermediate heap collection
+and feeds borrowed rows directly to the canonical compact-graph planner.
+
 For the same class of loaded collection, one 100,000-document, 24 MiB corpus
 measured 3.9 MiB of Go `HeapAlloc` against 165 MiB of peak process RSS because
 published pointer-free blocks live outside the Go heap. Use `store.Stats` for

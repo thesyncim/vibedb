@@ -160,9 +160,10 @@ func loadedEngine(
 // BenchmarkBulkLoad measures loading the whole corpus into an empty engine
 // through that engine's bulk path: one bbolt write transaction, one Badger
 // WriteBatch, one Pebble batch, one SQLite transaction over a prepared
-// INSERT, and durable.CreateFromPrimary for store/durable. The durable lane
-// materializes the source through store.Builder first and charges that work
-// inside the measurement.
+// INSERT, and durable.CreateFromRecords for store/durable. The durable lane
+// borrows the same corpus rows and charges descriptor planning,
+// canonicalization, graph construction, publication, and reopen inside the
+// measurement; it does not build a redundant in-memory database first.
 //
 // It runs with and without a secondary index over the filter field. The
 // indexed-filter result must be read against its own indexed-load cost, not

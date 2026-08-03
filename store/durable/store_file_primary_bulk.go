@@ -15,7 +15,85 @@ import (
 	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
+
+// PrimaryBulkRecord is one key/document pair borrowed by CreateFromRecords for
+// the duration of the call. The native durable bulk path validates,
+// canonicalizes, sorts, and writes these rows directly; it does not construct
+// an intermediate in-memory store.Collection.
+type PrimaryBulkRecord struct {
+	Key   string
+	Value []byte
+}
+
+// CreateFromRecords writes borrowed rows directly into the ordered durable
+// primary graph. It is the native bulk-load entry point for callers that
+// already own a complete batch. Inputs may be reused after the call returns.
+func CreateFromRecords(
+	input []PrimaryBulkRecord,
+	file *os.File,
+	options Options,
+) (int64, error) {
+	if file == nil {
+		return 0, fmt.Errorf("vibedb: CreateFromRecords requires a non-nil file")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if info.Size() != 0 {
+		return 0, ErrNotEmpty
+	}
+	if options.Collection.Schema != nil {
+		return 0, fmt.Errorf(
+			"%w: schemas are not available in CreateFromRecords",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
+	requestedBuffers := options.BufferCount
+	normalized, err := options.normalized()
+	if err != nil {
+		return 0, err
+	}
+	if normalized.PageSize != 4096 ||
+		normalized.MaxPageSize < storeio.GlobalTabletCatalogRootBytes {
+		return 0, fmt.Errorf(
+			"%w: CreateFromRecords requires 4 KiB pages and a 64 KiB maximum page",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
+	if len(input) == 0 {
+		return 0, fmt.Errorf(
+			"%w: CreateFromRecords requires at least one document",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
+	records := make([]storeio.PrimaryGraphRecord, len(input))
+	for i := range input {
+		if len(input[i].Key) == 0 ||
+			len(input[i].Key) > normalized.MaxKeyBytes ||
+			len(input[i].Key) > storeio.CommonPrimaryLeafMaxKeyBytes {
+			return 0, ErrKeyTooLarge
+		}
+		if len(input[i].Value) == 0 ||
+			len(input[i].Value) > normalized.MaxDocumentBytes {
+			return 0, ErrDocumentTooLarge
+		}
+		if len(input[i].Value) > normalized.InlineValueBytes {
+			return 0, ErrPrimaryCutoverUnsupported
+		}
+		records[i] = storeio.PrimaryGraphRecord{
+			Key: byteview.Bytes(input[i].Key), Value: input[i].Value,
+		}
+	}
+	if err := sortPrimaryBulkRecords(records); err != nil {
+		return 0, err
+	}
+	return createFromPrimaryGraphRecords(
+		records, input, file, normalized, requestedBuffers,
+	)
+}
 
 // CreateFromPrimary writes one immutable ordered primary graph and publishes it
 // through StateRoot.PrimaryRoot. The
@@ -84,7 +162,18 @@ func CreateFromPrimary(
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
+	return createFromPrimaryGraphRecords(
+		records, source, file, normalized, requestedBuffers,
+	)
+}
 
+func createFromPrimaryGraphRecords(
+	records []storeio.PrimaryGraphRecord,
+	source any,
+	file *os.File,
+	normalized normalizedFileStoreOptions,
+	requestedBuffers int,
+) (int64, error) {
 	// Canonicalize every document once, up front, so the leaf encoder, exact
 	// index term derivation, and every later read observe exactly one spelling.
 	if err := canonicalizePrimaryBulkRecords(

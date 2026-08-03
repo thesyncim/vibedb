@@ -145,7 +145,7 @@ func (v *vibeDBEngine) Tuning() string {
 		"worst-case transaction geometry; the explicit pool keeps this workload's staging capacity stable. " +
 		"BenchmarkPointWriteDurableDefaults measures the tuned/default pair directly. " +
 		"CommitCoalesce=0, i.e. no acknowledged-latency-for-throughput trade. " +
-		"CreateFromPrimary emits the sole canonical class-5 representation"
+		"CreateFromRecords emits the sole canonical class-5 representation directly from the borrowed bulk batch"
 }
 
 func (v *vibeDBEngine) options() durable.Options {
@@ -217,7 +217,7 @@ func (v *vibeDBEngine) Load(docs []Doc) error {
 	}
 	v.file = f
 	// PutLoop deliberately exercises one acknowledged mutation per document.
-	// Ordinary indexed loads use CreateFromPrimary: the durable exact index now
+	// Ordinary indexed loads use CreateFromRecords: the durable exact index now
 	// cuts giant low-cardinality terms into spanned leaves, so routing a large
 	// indexed corpus through the old replay workaround would hide the scalable
 	// bulk representation and make the read benchmark artificially unavailable.
@@ -227,29 +227,17 @@ func (v *vibeDBEngine) Load(docs []Doc) error {
 	return v.loadBulk(f, docs)
 }
 
-// loadBulk is store/durable's bulk path: build the collection in memory, then
-// write it as one durable generation. It is the fair counterpart of bbolt's
-// single write transaction, Badger's WriteBatch, Pebble's batch, and SQLite's
-// single transaction — none of those replay individual mutations either. The
-// in-memory build is included in the measurement, because a caller who only
-// wants the file still has to pay it.
+// loadBulk is store/durable's native borrowed-record bulk path. It is the fair
+// counterpart of bbolt's single write transaction, Badger's WriteBatch,
+// Pebble's batch, and SQLite's single transaction — none of those replay
+// individual mutations or require a second in-memory database either.
 func (v *vibeDBEngine) loadBulk(f *os.File, docs []Doc) error {
 	opts := v.options()
-	// The heap options are left at their zero value, matching the durable
-	// Options' own embedded collection defaults, so the intermediate
-	// collection is shaped exactly like the one durable would have built.
-	builder, err := store.NewBuilder(store.Options{})
-	if err != nil {
-		return err
-	}
+	records := make([]durable.PrimaryBulkRecord, len(docs))
 	for i := range docs {
-		if err := builder.Append(docs[i].Key, docs[i].JSON); err != nil {
-			return err
+		records[i] = durable.PrimaryBulkRecord{
+			Key: docs[i].Key, Value: docs[i].JSON,
 		}
-	}
-	built, err := builder.Build()
-	if err != nil {
-		return err
 	}
 	// The ordered primary graph is the only engine now (routed splits/merges, the
 	// resident router, journal-wired acknowledgements, and on-graph exact
@@ -259,7 +247,7 @@ func (v *vibeDBEngine) loadBulk(f *os.File, docs []Doc) error {
 	// spanned leaves. Keeping this bulk path here is important: replaying one Put
 	// per document would measure mutation durability and conceal the scalable
 	// multi-leaf representation that read-heavy log workloads depend on.
-	if _, err := durable.CreateFromPrimary(built, f, v.primaryBulkOptions()); err != nil {
+	if _, err := durable.CreateFromRecords(records, f, v.primaryBulkOptions()); err != nil {
 		return err
 	}
 	db, err := durable.Open(f, opts)
@@ -291,7 +279,7 @@ func (v *vibeDBEngine) loadByPut(f *os.File, docs []Doc) error {
 }
 
 // primaryBulkOptions is the tuned options with BufferCount cleared. The single
-// CreateFromPrimary transaction stages the whole graph at once and needs at
+// CreateFromRecords transaction stages the whole graph at once and needs at
 // least pageCount+1 commit buffers, which for a large corpus exceeds the small
 // BufferCount the mutation workload is tuned to; zeroing it lets the bulk write
 // auto-size its own pool. Open still uses the tuned BufferCount, so the measured

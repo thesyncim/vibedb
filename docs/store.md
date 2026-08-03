@@ -96,6 +96,7 @@ normal CRUD use.
 | `store.Collection` | Mutable in-memory keyed collection with immutable snapshots | None; bulk source for `durable.CreateFromPrimary` |
 | `store.Database` | In-memory catalog and consistent snapshot of independent collections | None beyond each collection |
 | `store.Builder` | Bulk construction of a `store.Collection` | None |
+| `durable.CreateFromRecords` | Native bulk construction from borrowed key/document rows | One durable generation |
 | `durable.Collection` | Bounded-residency durable collection | Automatic incremental commits |
 | `durable.Database` | Directory catalog and process-consistent snapshot; one durable file per collection | Per-collection automatic commits |
 
@@ -280,10 +281,11 @@ mutations.
 
 ## Persisting an in-memory collection
 
-The heap store has no image checkpoint of its own. Persistence is bulk
-conversion: `durable.CreateFromPrimary` walks a completed in-memory collection
-once and writes one immutable ordered primary graph, after which reads and
-mutations continue against the durable collection.
+The heap store has no image checkpoint of its own. `durable.CreateFromPrimary`
+walks a completed in-memory collection once and writes one immutable ordered
+primary graph. Callers that already own a complete row batch should use
+`durable.CreateFromRecords`; it borrows those rows for the call and feeds the
+same canonical planner directly, avoiding a redundant `store.Collection`.
 
 ## Durable collections
 
@@ -529,12 +531,14 @@ The root facade and the standard query executor do not expose or require them.
 
 ### Bulk creation
 
-`durable.CreateFromPrimary` converts a completed in-memory store directly into
-one durable generation. It preserves keys and declared exact indexes without
-replaying individual `Put` calls. There is no document-format option: empty
-creation, bulk creation, point mutations, batch mutations, structural
-split/merge, and checkpoint fold all emit the same canonical unified leaf
-grammar.
+`durable.CreateFromRecords` is the native bulk path: it borrows a complete row
+batch, validates and canonicalizes each document, sorts and rejects duplicate
+keys, and writes one durable generation without replaying individual `Put`
+calls or constructing the heap engine. `durable.CreateFromPrimary` feeds the
+same implementation from a completed in-memory store. Both preserve declared
+exact indexes. There is no document-format option: empty creation, bulk
+creation, point mutations, batch mutations, structural split/merge, and
+checkpoint fold all emit the same canonical unified leaf grammar.
 
 Each leaf chooses its physical extent from 4–64 KiB and chooses templated,
 dictionary-backed, typed-token, or canonical-trivial row spellings inside that

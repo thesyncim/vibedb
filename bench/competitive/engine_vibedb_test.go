@@ -7,7 +7,7 @@ import (
 )
 
 // TestVibeDBOrdinarySyncJournalsThroughPrimary proves the adapter now
-// measures the ordered primary graph: loadBulk builds through CreateFromPrimary,
+// measures the ordered primary graph: loadBulk builds through CreateFromRecords,
 // so every Put routes through the primary mutation path, and ordinary-sync's
 // journalAckLocked -- which fires ONLY from that path -- records one
 // acknowledgement per mutation. journalAcks being non-zero and accounting for
@@ -123,7 +123,7 @@ func TestVibeDBBufferedVisibleRoutesDeletesThroughPrimary(t *testing.T) {
 
 // TestVibeDBUnindexedFilterRunsOnPrimarySnapshot confirms the query
 // FromFile filter path opens the primary-layout snapshot the unindexed instance
-// now loads through CreateFromPrimary: a full scan-and-filter must return the
+// now loads through CreateFromRecords: a full scan-and-filter must return the
 // corpus's ~1% FilterValue population, not error on the layout.
 func TestVibeDBUnindexedFilterRunsOnPrimarySnapshot(t *testing.T) {
 	factory, ok := FactoryNamed("vibedb")
