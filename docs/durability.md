@@ -204,10 +204,14 @@ mutation against the poisoned live handle.
 On the ordered primary graph the [recovery-only redo journal][journal] backs
 `DurabilitySync`: it is minted unconditionally and is how that lane
 acknowledges — one bounded append plus one sync before publication — not an
-option. Every buffered-visible primary store also owns the paired journal.
-Without `Options.RecoveryJournal`, mutation acknowledgement stays volatile and
-`Flush` uses one bounded batch to protect an eligible update/delete interval.
-With the option, every mutation receives the synchronous-style durable record.
+option. With `Options.RecoveryJournal`, every mutation receives the
+synchronous-style durable record and the sibling is created eagerly. Without
+the option, a fresh or bulk-built buffered-visible primary has no sibling; its
+first valid mutation creates one synchronously, and its first physical
+`Flush`/`Close` roots the identity before any journal-only acknowledgement is
+allowed. Later `Flush` calls use one bounded batch to protect an eligible
+update/delete interval. No journal creation or compaction runs in the
+background.
 Readers never consult the journal; recovery alone replays records after the
 newest valid root. The root records journal identity, and recovery pairs the
 files by identity, page geometry, and base-generation epoch, failing closed on

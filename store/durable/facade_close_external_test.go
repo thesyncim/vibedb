@@ -31,6 +31,12 @@ func TestFacadeOpenFileCloseCachesTerminalPersistenceError(t *testing.T) {
 	if _, err := collection.Put("k", []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collection.Put("k", []byte(`{"n":2}`)); err != nil {
+		t.Fatal(err)
+	}
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")

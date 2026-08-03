@@ -662,6 +662,11 @@ func (c *Collection) tryConcurrentPrimaryPut(
 			eligible = false
 		}
 	}
+	if preflightErr == nil && eligible {
+		if err := c.ensureOrdinaryBufferedRecoveryJournal(); err != nil {
+			return false, false, err
+		}
+	}
 
 	c.writer.RLock()
 	defer c.writer.RUnlock()
@@ -907,6 +912,12 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		return false, false, ErrClosed
 	}
 	defer pool.release(context)
+	if len(key) != 0 && len(key) <= c.options.MaxKeyBytes &&
+		len(key) <= storeio.CommonPrimaryLeafMaxKeyBytes {
+		if err := c.ensureOrdinaryBufferedRecoveryJournal(); err != nil {
+			return false, false, err
+		}
+	}
 
 	c.writer.RLock()
 	defer c.writer.RUnlock()

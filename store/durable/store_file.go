@@ -212,17 +212,19 @@ type Collection struct {
 	readEpochs    *storeio.ReadEpochs
 	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
-	// journal is the bounded redo log paired with every primary
-	// DurabilityBufferedVisible and DurabilitySync store. It is owned by the
-	// serialized writer exactly like the committer and appended and synced under
-	// c.writer. Options.RecoveryJournal selects per-mutation durable
-	// acknowledgement for buffered-visible; without it, Flush may append one
-	// complete class-5 delta batch. Full checkpoints fold and recycle the log.
+	// journal is the bounded redo log paired eagerly with DurabilitySync and
+	// explicit RecoveryJournal stores, and lazily on the first valid ordinary
+	// buffered-visible mutation. It is owned by the serialized writer exactly like
+	// the committer and appended and synced under c.writer. RecoveryJournal selects
+	// per-mutation durable acknowledgement for buffered-visible; without it, Flush
+	// may append one complete class-5 delta batch after a physical root has named
+	// the lazy journal. Full checkpoints fold and recycle the log.
 	// journalID mirrors the root identity so recovery cannot pair a stray file;
 	// journalPowerSafe selects the barrier strength from CheckpointStrength.
 	journal          *storeio.RecoveryJournal
 	journalID        [16]byte
 	journalPowerSafe bool
+	journalReady     atomic.Bool
 	// journalReplaying suppresses journal appends while Open re-applies recovered
 	// records through the ordinary mutation path: those records are already
 	// durable, and the recycle that follows replay discards them regardless.

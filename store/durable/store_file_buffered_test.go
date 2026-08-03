@@ -28,7 +28,10 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 		_ = file.Close()
 	}()
 
-	before := captureJournalImage(t, file.Name())
+	beforeStore, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
 	value := []byte(`{"value":"buffered"}`)
 	if created, err := collection.Put([]byte("key"), value); err != nil || !created {
 		t.Fatalf("Put = (%v, %v), want created", created, err)
@@ -47,10 +50,15 @@ func TestFileStoreBufferedVisibleCrashBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(during, before.store) {
+	if !bytes.Equal(during, beforeStore) {
 		t.Fatal("acknowledged buffered Put changed the file before a checkpoint")
 	}
 
+	// The first valid mutation has synchronously minted the sibling, but the
+	// durable root still names no journal. A crash therefore ignores this orphan
+	// and recovers the unchanged bulk/create image.
+	before := captureJournalImage(t, file.Name())
+	before.store = beforeStore
 	beforeCrash := openBufferedImage(t, before, options)
 	if got, found, err := beforeCrash.AppendRaw(nil, []byte("key")); err != nil || found {
 		t.Fatalf("recovery before checkpoint = (%q, %v, %v), want absent", got, found, err)

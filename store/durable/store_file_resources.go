@@ -17,11 +17,12 @@ import (
 var storeCommitterFactory = storeio.NewCommitter
 
 // newCollectionResources builds the committer and cache for a collection.
-// journalBacked is the recovered root contract on Open and the journal contract
-// Create is about to mint. Buffered-visible and journal-backed synchronous
-// stores defer root publication to explicit checkpoints; async-visible and a
-// journal-less synchronous reopen must leave the committer automatic because
-// their mutations publish through (and, for sync, wait on) its root fence.
+// journalBacked is the recovered root contract on Open and the eager-journal
+// contract Create is about to mint. Buffered-visible stores defer root
+// publication regardless of whether their ordinary delta journal is still lazy;
+// journal-backed synchronous stores defer too. Async-visible and a journal-less
+// synchronous reopen leave the committer automatic because their mutations
+// publish through (and, for sync, wait on) its root fence.
 func newCollectionResources(
 	file *os.File, options normalizedFileStoreOptions, storeID [16]byte,
 	journalBacked bool,

@@ -189,8 +189,11 @@ selected live graph before reuse.
 
 The paired recovery journal (`recovery_journal.go`) is the separate
 `<store>.rjournal` file used by synchronous mutation acknowledgement and by
-eligible buffered-visible checkpoint deltas. Its identity is bound by both the
-store id and `StateRoot.JournalID`. Readers never consult it.
+eligible buffered-visible checkpoint deltas. It is eager for synchronous and
+explicit per-mutation-journal stores, but ordinary buffered-visible bulk images
+omit it until their first valid mutation. The first physical checkpoint then
+publishes its identity in `StateRoot.JournalID`; a journal-only checkpoint is
+forbidden before that root is durable. Readers never consult it.
 
 The journal starts with two alternating 512-byte header sectors followed by a
 sector-aligned, fixed-capacity record region. A header records its independent

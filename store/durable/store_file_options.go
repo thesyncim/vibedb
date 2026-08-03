@@ -239,11 +239,13 @@ type Options struct {
 	// The sync strength follows CheckpointStrength (power-safe issues the
 	// F_FULLFSYNC-class barrier, filesystem the ordinary fdatasync-class one).
 	//
-	// When false, a buffered-visible store still owns a smaller sibling journal.
-	// Mutations remain volatile, but Flush can append and sync one ordered batch
-	// for a complete bounded class-5 overlay instead of copying its physical
-	// leaves. Exceptional mutations, pressure, and Close take a physical
-	// checkpoint and recycle the journal.
+	// When false, a fresh or bulk-built buffered-visible store has no sibling
+	// journal. Its first valid mutation mints one synchronously; the first physical
+	// Flush/Close roots that identity, and later Flush calls can append and sync one
+	// ordered batch for a complete bounded class-5 overlay instead of copying its
+	// physical leaves. Exceptional mutations, pressure, and Close take a physical
+	// checkpoint and recycle the journal. No background task creates or compacts
+	// the file.
 	//
 	// It has no effect on DurabilityAsyncVisible, and none on DurabilitySync: a
 	// primary-layout synchronous store is journal-backed UNCONDITIONALLY (the

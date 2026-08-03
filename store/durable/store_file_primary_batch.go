@@ -109,6 +109,9 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 	if len(batch.entries) == 0 {
 		return nil
 	}
+	if err := c.ensureOrdinaryBufferedRecoveryJournalLocked(); err != nil {
+		return err
+	}
 	_, target, applyErr := c.applyPrimaryBatch(batch)
 	journalTarget = target
 	return applyErr

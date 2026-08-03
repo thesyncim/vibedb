@@ -166,10 +166,12 @@ files, matching the ClickHouse per-table accounting.
 | ClickHouse raw JSON, `ORDER BY key` | 4,565,499 | 45.65 | not measured in this control |
 | VibeDB compact default, complete database file | 1,019,904 | **10.20** | about **0.069 ms**, zero allocations, through the warmed public query API |
 
-The compact VibeDB database file is 2.66× smaller than the fair typed
-ClickHouse table. Its warmed public query path is about 21.6× faster in this
-control while scanning all 100,000 field IDs; it uses no index, candidate list,
-or data skipping. The aligned ClickHouse row is kept separate because
+The compact immutable VibeDB online footprint is 2.66× smaller than the fair
+typed ClickHouse table. Ordinary buffered-visible bulk creation does not mint
+its lazy mutation journal, so this comparison omits no required VibeDB sidecar.
+Its warmed public query path is about 21.6× faster in this control while
+scanning all 100,000 field IDs; it uses no index, candidate list, or data
+skipping. The aligned ClickHouse row is kept separate because
 `country` participates in its sparse primary index and physical order. The
 raw-JSON row is a useful representation control, but its filter speed must not
 be borrowed from the typed table.
@@ -296,13 +298,15 @@ Both 100,000-document corpora contain 24,881,153 JSON bytes (23.729 MiB) plus
 1,200,000 key bytes (1.144 MiB), for a key-inclusive logical payload of
 26,081,153 bytes (24.873 MiB). Gzip-9 is an explicitly JSON-only entropy
 control: low cardinality compresses to 1.837 MiB and the shape-identical high
-cardinality corpus to 8.041 MiB. Database cells include the fully preallocated
-paired recovery journal and are
-**apparent / allocated MiB**.
+cardinality corpus to 8.041 MiB. Database cells are **apparent / allocated
+MiB**. The unified bulk image has not been mutated, so its ordinary
+buffered-visible lazy journal does not exist and the row is the complete online
+footprint. Point-put builds mutate the store and therefore include their bounded
+sibling journal.
 
 | engine/profile | low cardinality | high cardinality |
 | --- | ---: | ---: |
-| vibedb unified bulk pair | **9.001 / 9.520** | **18.767 / 19.520** |
+| vibedb unified bulk, immutable | **0.973 / 0.973** | **8.152 / 8.152** |
 | vibedb point-put build | 16.341 / 16.379 | 28.606 / 29.250 |
 | SQLite | 28.109 / 28.109 | 28.109 / 28.109 |
 | Pebble with Snappy | 33.978 / 34.000 | 40.993 / 41.027 |

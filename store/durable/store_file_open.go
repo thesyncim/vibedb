@@ -285,9 +285,10 @@ func (c *Collection) createInitialState() error {
 	// Mint the paired journal before the root that names it is published, so a
 	// crash after the root is durable finds the journal file present. The
 	// synchronous lane is journal-backed on the primary graph unconditionally --
-	// it is how sync acknowledges -- and every buffered-visible store carries one
-	// for either checkpoint deltas or per-mutation acknowledgement.
-	// Async-visible never carries one. This is the
+	// it is how sync acknowledges -- and explicit RecoveryJournal mode needs one
+	// before its first acknowledged mutation. Ordinary buffered-visible stores
+	// defer the sibling until their first valid mutation. Async-visible never
+	// carries one. This is the
 	// creation-time counterpart of CreateFromPrimary's journal mint.
 	journalRequired := c.options.Durability == DurabilitySync ||
 		c.journalConfigured()

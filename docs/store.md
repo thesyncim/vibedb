@@ -349,13 +349,17 @@ memory admission and relies on `Flush` or `Close` for crash persistence. Use:
 opt-in buffered-journal lane. It does not delay the journal-before-publish
 `DurabilitySync` path.
 
-Every ordinary buffered-visible primary store also owns a recovery-journal
-sibling. An eligible class-5-only `Flush` can persist the complete consecutive
-overlay interval as one format-v1 batch and one sync without first rewriting
-the physical root. Compact entries cover existing-key integer, boolean, or null
-replacements; deletes and unqualified puts retain logical full redo. A
-structural publication, interval gap, exact capacity miss, or staging-pressure
-guard falls back to the bounded physical checkpoint.
+Fresh and bulk-built ordinary buffered-visible stores initially have no
+recovery-journal sibling. The first valid mutation mints the bounded file in
+the foreground, and the first `Flush` or pressure checkpoint physically roots
+its identity. After that one-time transition, an eligible class-5-only `Flush`
+can persist the complete consecutive overlay interval as one format-v1 batch
+and one sync without rewriting the physical root. Compact entries cover
+existing-key integer, boolean, or null replacements; deletes and unqualified
+puts retain logical full redo. A structural publication, interval gap, exact
+capacity miss, or staging-pressure guard falls back to the bounded physical
+checkpoint. Journal creation and all checkpoints are synchronous foreground
+work; there is no background compaction task.
 
 The ordinary v1 delta journal's current shipped geometry preallocates a 2.5 MiB
 record region plus two 512-byte headers. The foreground guard keeps up to

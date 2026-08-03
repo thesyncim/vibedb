@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -158,30 +159,30 @@ var (
 )
 
 // journalEnabled reports whether this collection has an open recovery journal.
-// Every newly created buffered-visible store carries one: RecoveryJournal
-// selects per-mutation durable acknowledgement, while the ordinary lane uses
-// it only at Flush boundaries. The synchronous lane is also journal-backed
-// unconditionally. A synchronous store whose root names no journal (created
-// async-visible, reopened sync) has none and stays on the committer fence
-// (chainFenceSync).
+// RecoveryJournal selects per-mutation durable acknowledgement. Ordinary
+// buffered-visible stores mint this sibling only on their first valid mutation;
+// their immutable/create-from-bulk footprint is therefore just the primary
+// file. The synchronous lane is journal-backed unconditionally. A synchronous
+// store whose root names no journal (created async-visible, reopened sync) has
+// none and stays on the committer fence (chainFenceSync).
 func (c *Collection) journalEnabled() bool {
 	return c != nil && c.journal != nil
 }
 
-// journalConfigured reports whether a newly created collection needs the
-// recovery-journal sibling. Every buffered-visible store carries one: the
-// RecoveryJournal option selects per-mutation durable acknowledgements, while
-// ordinary buffered-visible uses the same file only when Flush publishes a
-// bounded delta checkpoint. It is decided from options alone so Create can mint
-// the sibling before c.journal is set.
+// journalConfigured reports whether a newly created buffered collection needs
+// the recovery-journal sibling immediately. Ordinary buffered-visible stores
+// defer it until their first valid mutation; explicit per-mutation recovery
+// cannot defer because Put/Update acknowledge through the journal itself.
 func (c *Collection) journalConfigured() bool {
-	return c.options.Durability == DurabilityBufferedVisible
+	return c.options.Durability == DurabilityBufferedVisible &&
+		c.options.RecoveryJournal
 }
 
 // bufferedJournalAckLane is the opt-in buffered mode that appends and syncs a
 // redo record for every acknowledged mutation. Merely having a paired journal
-// no longer selects this path: ordinary buffered-visible also has a journal,
-// but keeps mutation acknowledgements volatile and writes it only from Flush.
+// no longer selects this path: a mutated ordinary buffered-visible store also
+// has one, but keeps mutation acknowledgements volatile and writes it only from
+// Flush after a physical root has named the lazy identity.
 func (c *Collection) bufferedJournalAckLane() bool {
 	return c.buffered() && c.options.RecoveryJournal &&
 		c.journalEnabled()
@@ -191,8 +192,78 @@ func (c *Collection) bufferedJournalAckLane() bool {
 // It never runs during recovery replay: Open must physically fold and recycle
 // the records it is currently consuming.
 func (c *Collection) bufferedJournalDeltaLane() bool {
-	return c.buffered() && !c.options.RecoveryJournal &&
-		c.journalEnabled() && !c.journalReplaying
+	if !c.buffered() || c.options.RecoveryJournal ||
+		!c.journalEnabled() || c.journalReplaying {
+		return false
+	}
+	durable := c.durableState.Load()
+	return durable != nil && c.journalID != ([16]byte{}) &&
+		durable.root.JournalID == c.journalID
+}
+
+// ensureOrdinaryBufferedRecoveryJournalLocked mints the bounded delta journal
+// on the first valid ordinary-buffered mutation. The caller holds writer. The
+// current durable root does not name the new identity yet, so
+// bufferedJournalDeltaLane remains false until a foreground physical checkpoint
+// publishes it. This unpublished state is deliberate: a crash may leave an
+// ignored orphan sibling, but can never make recovery depend on an unrooted log.
+func (c *Collection) ensureOrdinaryBufferedRecoveryJournalLocked() error {
+	if !c.buffered() || c.options.RecoveryJournal || c.journalEnabled() {
+		return nil
+	}
+	durable := c.durableState.Load()
+	if durable == nil {
+		return ErrClosed
+	}
+	var journalID [16]byte
+	if _, err := rand.Read(journalID[:]); err != nil {
+		return fmt.Errorf("vibedb: mint recovery journal identity: %w", err)
+	}
+	path, err := c.journalSiblingPath()
+	if err != nil {
+		return err
+	}
+	if err := createSiblingRecoveryJournal(
+		c.file.Name(),
+		recoveryJournalHeaderFor(
+			c.storeID, journalID, uint32(c.options.PageSize),
+			c.options.MaxKeyBytes, c.options.InlineValueBytes,
+			c.options.MaxDocumentBytes, durable.root.Generation,
+			c.options.primaryUnifiedOverlayBytes,
+		),
+	); err != nil {
+		return err
+	}
+	if err := c.openRecoveryJournalLocked(
+		journalID, durable.root.Generation,
+	); err != nil {
+		// The durable root does not reference this identity, so removing a sibling
+		// that could not be opened is safe and keeps a failed first mutation from
+		// permanently charging the immutable footprint.
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+// ensureOrdinaryBufferedRecoveryJournal serializes the one-time journal mint
+// before an eligible packed mutation takes writer.RLock. Keeping initialization
+// outside the shared section preserves the concurrent fast path for that first
+// mutation while still publishing the journal pointer under writer's memory
+// ordering.
+func (c *Collection) ensureOrdinaryBufferedRecoveryJournal() error {
+	if c.journalReady.Load() {
+		return nil
+	}
+	c.writer.Lock()
+	defer c.writer.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	if failure := c.PersistenceError(); failure != nil {
+		return failure
+	}
+	return c.ensureOrdinaryBufferedRecoveryJournalLocked()
 }
 
 // newBufferedJournalDeltaEntryScratch retains the complete fixed framing
@@ -224,9 +295,10 @@ func bufferedJournalDeltaEntryScratchEnabled(
 const recoveryJournalSuffix = collectionname.JournalSuffix
 
 // RecoveryJournalPath returns the recovery-journal sibling path for a store file
-// at storePath. Every buffered-visible or synchronous primary store writes its
-// journal here, and Open resolves it here, so an external move of the store file
-// must move this sibling with it.
+// at storePath. Synchronous stores, explicit RecoveryJournal stores, and mutated
+// ordinary buffered-visible stores write their journal here. Open resolves a
+// root-referenced sibling here, so an external move of a mutable store file must
+// move this sibling with it when it exists.
 func RecoveryJournalPath(storePath string) string {
 	return storePath + recoveryJournalSuffix
 }
@@ -415,6 +487,7 @@ func (c *Collection) openRecoveryJournalLocked(
 	c.journalID = journalID
 	c.journalPowerSafe = c.options.CheckpointStrength != CheckpointFilesystem
 	c.journal = journal
+	c.journalReady.Store(true)
 	c.journalDeltaGeneration.Store(rootGeneration)
 	c.journalDeltaAppendedGeneration.Store(rootGeneration)
 	c.initJournalGroupLocked()

@@ -624,6 +624,9 @@ func (c *Collection) putPrimary(
 			return false, err
 		}
 	}
+	if err := c.ensureOrdinaryBufferedRecoveryJournalLocked(); err != nil {
+		return false, err
+	}
 retryAfterUnifiedFold:
 	// The concurrent packed lane leaves state at the physical fold base. Any
 	// exclusive/exceptional mutation must first turn that logical suffix into a
@@ -967,6 +970,9 @@ func (c *Collection) deletePrimary(
 		len(key) > c.options.MaxKeyBytes ||
 		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
 		return false, ErrKeyTooLarge
+	}
+	if err := c.ensureOrdinaryBufferedRecoveryJournalLocked(); err != nil {
+		return false, err
 	}
 retryAfterUnifiedDeleteFold:
 	if c.packedLogicalCutPending() {
@@ -3130,6 +3136,9 @@ func (c *Collection) stagePrimaryState(
 	root.DocumentCount = documentCount
 	root.NextLogicalID = tx.NextLogicalID()
 	root.PrimaryRoot = primaryRoot
+	if c.journalID != ([16]byte{}) {
+		root.JournalID = c.journalID
+	}
 	return &fileStoreState{
 		root: root, fileEnd: tx.FileEnd(),
 		freeHead: freeHead,

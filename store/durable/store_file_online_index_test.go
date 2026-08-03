@@ -528,7 +528,14 @@ func runOnlineIndexFaultPass(
 	}
 	records = device.Records()
 	faulted = device.Faulted()
-	image = captureJournalImage(t, path)
+	image.store, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image.journal, err = os.ReadFile(path + ".rjournal")
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 	_ = collection.Close()
 	_ = file.Close()
 	return image, records, faulted
@@ -545,8 +552,10 @@ func assertOnlineIndexCrashImage(
 	if err := os.WriteFile(path, image.store, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path+".rjournal", image.journal, 0o600); err != nil {
-		t.Fatal(err)
+	if len(image.journal) != 0 {
+		if err := os.WriteFile(path+".rjournal", image.journal, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {

@@ -347,11 +347,13 @@ func createFromPrimaryGraphRecords(
 	// Mint the paired journal before the root that names it is published, so a
 	// crash after the root is durable finds the journal file present.
 	// DurabilitySync is journal-backed on the primary graph unconditionally — it
-	// is how sync acknowledges — and every buffered-visible store carries a
-	// journal for checkpoint deltas or per-mutation acknowledgement.
-	// Async-visible never carries one.
+	// is how sync acknowledges — and explicit RecoveryJournal mode needs one for
+	// per-mutation acknowledgement. Ordinary buffered-visible bulk stores defer
+	// the sibling until their first valid mutation, preserving the compact
+	// immutable/log-serving footprint. Async-visible never carries one.
 	if normalized.Durability == DurabilitySync ||
-		normalized.Durability == DurabilityBufferedVisible {
+		normalized.Durability == DurabilityBufferedVisible &&
+			normalized.RecoveryJournal {
 		var journalID [16]byte
 		if _, err := rand.Read(journalID[:]); err != nil {
 			_ = tx.Abort()

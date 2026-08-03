@@ -622,6 +622,7 @@ func TestRecoveryJournalScalarFormatRejectsRuntimeLaneChange(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	path := coll.file.Name()
 	if got := coll.journal.Header().FormatVersion; got !=
 		storeio.RecoveryJournalFormatScalarPatch {

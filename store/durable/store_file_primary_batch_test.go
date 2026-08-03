@@ -239,6 +239,21 @@ func TestFilePrimaryBatchDeterministic(t *testing.T) {
 	); err != nil {
 		t.Fatalf("CreateFromPrimary: %v", err)
 	}
+	baseCollection, err := Open(baseFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created, err := baseCollection.Put(
+		[]byte("seed"), []byte(`{"v":0}`),
+	); err != nil || created {
+		t.Fatalf("root deterministic lazy journal: created=%v err=%v", created, err)
+	}
+	if err := baseCollection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseCollection.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := baseFile.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -55,6 +55,12 @@ func concurrentPrimaryTestOptions() Options {
 func openConcurrentPrimaryTestFixture(
 	t *testing.T, count int, options Options,
 ) concurrentPrimaryTestFixture {
+	return openConcurrentPrimaryTestFixtureMode(t, count, options, true)
+}
+
+func openConcurrentPrimaryTestFixtureMode(
+	t *testing.T, count int, options Options, rootJournal bool,
+) concurrentPrimaryTestFixture {
 	t.Helper()
 	built, keys, values := buildFilePrimaryCorpus(t, count)
 	file := createPrimaryPointFile(
@@ -72,6 +78,21 @@ func openConcurrentPrimaryTestFixture(
 	collection.writer.Unlock()
 	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
+	}
+	if rootJournal {
+		// Production bulk images intentionally omit the ordinary buffered journal.
+		// Root that one-time lazy identity before measuring the concurrent lane,
+		// then clear the priming mutation's public fast-path counters.
+		if created, err := collection.Put([]byte(keys[0]), values[0]); err != nil || created {
+			t.Fatalf("prime lazy journal: created=%v err=%v", created, err)
+		}
+		if err := collection.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		collection.concurrentPrimaryReplaces.Store(0)
+		collection.concurrentPrimaryFallbacks.Store(0)
+		collection.concurrentPrimaryPublishGroups.Store(0)
+		collection.concurrentPrimaryLargestPublishGroup.Store(0)
 	}
 	t.Cleanup(func() {
 		if err := collection.Close(); err != nil {
@@ -2538,8 +2559,8 @@ func TestConcurrentPrimaryScratchIsFixedAndLargeInputFallsBack(t *testing.T) {
 }
 
 func TestConcurrentPrimaryContextBackingIsLazy(t *testing.T) {
-	fixture := openConcurrentPrimaryTestFixture(
-		t, 256, concurrentPrimaryTestOptions(),
+	fixture := openConcurrentPrimaryTestFixtureMode(
+		t, 256, concurrentPrimaryTestOptions(), false,
 	)
 	pool := fixture.collection.primaryConcurrentContexts
 	if pool == nil {

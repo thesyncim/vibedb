@@ -51,6 +51,28 @@ func journalDeltaCanonical(t testing.TB, raw []byte) string {
 	return string(got)
 }
 
+// rootLazyBufferedJournal establishes the post-first-checkpoint baseline needed
+// by tests of the cheap delta lane itself. The dedicated lifecycle test below
+// covers the unpublished first-mutation state; the remaining tests should not
+// accidentally include that one-time physical root in their checkpoint counts.
+func rootLazyBufferedJournal(t testing.TB, coll *Collection) {
+	t.Helper()
+	if coll.bufferedJournalDeltaLane() {
+		return
+	}
+	if _, err := coll.Put(
+		[]byte(templateHeavyOverlayKey(0)), templateHeavyOverlayDoc(0),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if !coll.bufferedJournalDeltaLane() {
+		t.Fatal("first physical flush did not root lazy delta journal")
+	}
+}
+
 func TestBufferedJournalDeltaOverlayFoldTransactionGeometry(t *testing.T) {
 	options := journalDeltaTestOptions()
 	options.ResidentBytes = 64 << 20
@@ -177,8 +199,33 @@ func TestBufferedJournalDeltaEntryScratchIsLazy(t *testing.T) {
 	if _, err := coll.Put(key, value); err != nil {
 		t.Fatal(err)
 	}
+	if !coll.journalEnabled() || coll.journalID == ([16]byte{}) {
+		t.Fatalf("first valid mutation did not mint lazy journal: enabled=%t id=%x buffered=%t recovery=%t",
+			coll.journalEnabled(), coll.journalID, coll.buffered(), coll.options.RecoveryJournal)
+	}
 	if coll.journalDeltaEntries != nil {
 		t.Fatal("overlay publication allocated checkpoint-only journal scratch")
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if coll.journalDeltaEntries != nil {
+		t.Fatal("first flush rooted lazy journal but allocated delta scratch")
+	}
+	if durable := coll.durableState.Load(); durable == nil ||
+		durable.root.JournalID != coll.journalID {
+		t.Fatalf("first flush did not publish lazy journal: durable=%+v journal=%x",
+			durable, coll.journalID)
+	}
+	if !coll.bufferedJournalDeltaLane() {
+		t.Fatal("rooted lazy journal did not enable delta lane")
+	}
+	value = bytes.Replace(
+		templateHeavyOverlayDoc(0), []byte(`"active":true`),
+		[]byte(`"active":false`), 1,
+	)
+	if _, err := coll.Put(key, value); err != nil {
+		t.Fatal(err)
 	}
 	if err := coll.Flush(); err != nil {
 		t.Fatal(err)
@@ -381,6 +428,7 @@ func TestBufferedJournalDeltaOneFoldDirtyHeadroom(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	available := coll.cache.DirtyCapacityAvailable()
 	reserve := coll.options.maxTransactionBytes
 	if available < reserve || available >= 2*reserve {
@@ -397,6 +445,9 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 	ordinary := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, ordinaryOptions,
 	)
+	if err := ordinary.ensureOrdinaryBufferedRecoveryJournalLocked(); err != nil {
+		t.Fatal(err)
+	}
 	ordinaryHeader := ordinary.journal.Header()
 	completeOverlayBatch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		ordinaryHeader.SectorSize, primaryUnifiedOverlayRecords,
@@ -556,6 +607,7 @@ func TestBufferedJournalDeltaCrashReplayAndClose(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -827,6 +879,7 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 320, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	path := coll.file.Name()
 	want := primaryStoreContent(t, coll)
 	groups := make(map[string]int, 320)
@@ -972,6 +1025,7 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	path := coll.file.Name()
 	physicalBase := coll.committer.DurableGeneration()
 	baseline := coll.Stats()
@@ -1066,6 +1120,7 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	path := coll.file.Name()
 	baseline := coll.Stats()
 	baseRecycle := coll.journal.Header().RecycleCount
@@ -1162,6 +1217,7 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -1331,6 +1387,7 @@ func TestBufferedJournalDeltaTornUnsyncedCarryTruncates(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		restoreFault()
@@ -1422,6 +1479,7 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -1576,6 +1634,7 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 func TestBufferedJournalDeltaSnapshotKeepsPhysicalBase(t *testing.T) {
 	options := journalDeltaTestOptions()
 	coll := buildTemplateHeavyOverlayCollection(t, t.TempDir(), 128, options)
+	rootLazyBufferedJournal(t, coll)
 	want := primaryStoreContent(t, coll)
 
 	keyA := templateHeavyOverlayKey(20)
@@ -1648,6 +1707,7 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -1730,6 +1790,7 @@ func TestBufferedJournalDeltaBarrierFailureOutcomeUnknownMayReplay(t *testing.T)
 	getFault, restoreFault := installJournalFaultSeam(t)
 	defer restoreFault()
 	coll := buildTemplateHeavyOverlayCollection(t, t.TempDir(), 320, options)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -1789,6 +1850,7 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	getFault, restoreFault := installJournalFaultSeam(t)
 	defer restoreFault()
 	coll := buildTemplateHeavyOverlayCollection(t, t.TempDir(), 320, options)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -1870,6 +1932,7 @@ func TestBufferedJournalDeltaCloseFoldsUnsyncedCarry(t *testing.T) {
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
+	rootLazyBufferedJournal(t, coll)
 	fault := getFault()
 	if fault == nil {
 		t.Fatal("journal fault seam was not installed")
@@ -1942,9 +2005,11 @@ func buildJournalDeltaFallbackCollection(
 	for at := range 320 {
 		docs[templateHeavyOverlayKey(at)] = templateHeavyOverlayDoc(at)
 	}
-	return buildIndexedPrimaryFile(
+	coll := buildIndexedPrimaryFile(
 		t, t.TempDir(), "journal-delta-fallback-*", docs, options,
 	)
+	rootLazyBufferedJournal(t, coll)
+	return coll
 }
 
 // TestBufferedJournalDeltaResumesAfterSuccessfulBatch protects the batch
