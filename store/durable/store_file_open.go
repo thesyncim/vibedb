@@ -378,20 +378,25 @@ func (c *Collection) createInitialState() error {
 			_ = tx.Abort()
 			return fmt.Errorf("vibedb: mint recovery journal identity: %w", err)
 		}
-		if err := createSiblingRecoveryJournal(
-			c.file.Name(),
-			recoveryJournalHeaderFor(
-				c.cacheStoreID(), journalID, uint32(c.options.PageSize),
-				c.options.MaxKeyBytes, c.options.InlineValueBytes,
-				c.options.MaxDocumentBytes, 1,
-				func() int {
-					if c.buffered() && !c.options.RecoveryJournal {
-						return c.options.primaryUnifiedOverlayBytes
-					}
-					return 0
-				}(),
-			),
-		); err != nil {
+		header := recoveryJournalHeaderFor(
+			c.cacheStoreID(), journalID, uint32(c.options.PageSize),
+			c.options.MaxKeyBytes, c.options.InlineValueBytes,
+			c.options.MaxDocumentBytes, 1,
+			func() int {
+				if c.buffered() && !c.options.RecoveryJournal {
+					return c.options.primaryUnifiedOverlayBytes
+				}
+				return 0
+			}(),
+		)
+		// Catalog-owned sync journals mint at the conditional format word so
+		// they may prepare kind-5 records without a later remint. Scalar-patch
+		// headers (ordinary buffered delta) keep their own format word.
+		if c.journalCatalogOwned &&
+			header.FormatVersion == storeio.RecoveryJournalFormatLegacy {
+			header.FormatVersion = storeio.RecoveryJournalFormatConditional
+		}
+		if err := createSiblingRecoveryJournal(c.file.Name(), header); err != nil {
 			_ = tx.Abort()
 			return err
 		}
