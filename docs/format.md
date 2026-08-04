@@ -5,8 +5,11 @@ decoded by `internal/storeio`. The codecs are the byte-level authority. All
 multi-byte integers are little-endian, all reserved bytes are zero, and all
 format-version fields inside the primary store file contain
 `DevelopmentFormatVersion == 0`. The separate recovery-journal sibling has its
-own explicitly gated format field; its supported versions 0 and 1 are described
-below.
+own explicitly gated format field; its supported format words 0, 1, and
+`RecoveryJournalFormatConditional` (numeric 2) are described below. StateRoot
+and the format-0 primary layout are unchanged by multi-collection transactions;
+new on-disk surface is confined to the journal format word and the `txn.vtm`
+decision-log sidecar.
 
 The project is unreleased. A primary-file schema change edits format 0 in place
 and regenerates the format-0 golden images. There are no migration decoders,
@@ -220,7 +223,7 @@ carries kind, reserved zero bytes, sequence, generation, and either key/value
 lengths or batch entry-count/body-length. One checksum covers the complete
 ordered batch, so a torn batch is not partially admitted.
 
-The header gates two record grammars:
+The header gates three record grammars:
 
 - format v0 is the legacy put/delete grammar. Batch entries are full put or
   delete operations that all belong to the batch's single generation;
@@ -230,19 +233,60 @@ The header gates two record grammars:
   spelling length, one reserved-zero byte, and the expected CRC32C of the
   complete resulting canonical document. It is emitted only when smaller than
   carrying that complete document. Scalar patch is never valid as a standalone
-  record kind.
+  record kind;
+- format word `RecoveryJournalFormatConditional` (numeric 2) — the conditional
+  journal format — admits kinds 1, 2, 3, and 5 and rejects scalar-patch kind 4.
+  Kind 5 (*conditional batch*) is a kind-3 batch whose body is prefixed by a
+  32-byte conditional header: `MarkerID [16]byte`, `MarkerEpoch uint64`,
+  `TxnID uint64`. One CRC32C plus complement covers the envelope, conditional
+  header, and entries; the record is zero-padded to the 512-byte append sector
+  exactly as kind 3. Catalog-owned journals mint at this format word; a legacy
+  or scalar-patch journal on a catalog-owned collection takes one bounded
+  foreground checkpoint (recycling the header) before it may prepare a
+  conditional record.
 
 Opening a v0 journal preserves the v0 grammar for later appends; it is not
-silently upgraded. A scalar-patch kind authenticated inside v0, an unknown
-format, malformed metadata, or an attempt to use a v1 journal with another
-runtime durability lane fails closed. The v1 word occupies a field that older
-binaries required to be zero, so they reject v1 before interpreting its entry
-kinds.
+silently upgraded. A scalar-patch kind authenticated inside v0, a kind-5
+record inside a v0 or v1 journal, an unknown format, malformed metadata, or an
+attempt to use a v1 journal with another runtime durability lane fails closed.
+Each gated format word occupies a field that older binaries required to hold a
+known value, so they reject an unrecognized word before interpreting its
+entry kinds.
+
+### Transaction decision log
+
+One sidecar per database directory, reserved name `txn.vtm`, lives beside the
+collection files in a `durable.Database` directory or the SQL driver's
+`<catalog>.tables/` directory. It is not a decodable collection filename. The
+primary `StateRoot` layout and `DevelopmentFormatVersion == 0` remain
+unchanged; the decision log is a sibling container, not a primary-format
+revision.
+
+The container follows the recovery journal's discipline: two alternating,
+independently checksummed 512-byte header sectors, a bounded preallocated
+record region, positional sector-aligned appends, strict sequence validation,
+and torn-tail truncation. Header fields include its own gated format version,
+`MarkerID [16]byte` minted at creation, `Epoch uint64`, `BaseSequence uint64`,
+capacity, recycle count, and checksum. Two record kinds, each sealed by CRC32C
+plus complement and padded to the append sector:
+
+- kind 1 `decision`: sequence (database commit sequence), `TxnID`, participant
+  count, and per-participant `{StoreID, JournalID, PreparedGeneration}`;
+- kind 2 `participant-retired`: sequence and `StoreID`, written after
+  `DropCollection` checkpoints the collection past every conditional record.
+
+A decision is the durable fact that transaction `TxnID` committed naming those
+participants. Replay applies a kind-5 journal record only when a decision
+resolver reports that triple committed and the decision names this
+collection's `(StoreID, JournalID)`. The log is minted lazily at the head of
+the first multi-collection commit, fenced through parent-directory fsync before
+any prepare may reference its `MarkerID`. Offline pairing checks live in
+`cmd/vibedb-verify`.
 
 The fixed materialization journal slots inside the primary file carry complete
 before-image sectors for qualified in-place canonical page updates. Recovery
 rolls back an incomplete materialization before selecting a root. Readers never
-consult either journal.
+consult either journal or the decision log.
 
 ### Online block reclamation
 

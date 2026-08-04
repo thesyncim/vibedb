@@ -33,6 +33,9 @@ That rule expands into a family of invariants:
    bounded at open.
 6. Publication happens only after every query-visible structure for the new
    generation is complete.
+7. One decision record in the database decision log (`txn.vtm`) selects the
+   cross-collection cut for a multi-collection commit; recovery and read cuts
+   never observe a torn participant subset.
 
 The primary graph realizes this with a `StateRoot` selecting an ordered-tablet
 catalog, its leaves, and an exact-index root whose per-index catalogs route to
@@ -165,9 +168,12 @@ the heap copy owns the same cut through result production. An oversized fallback
 fails before execution. A join inside a transaction materializes the BEGIN cut
 plus the transaction overlay under the same bound.
 
-This coherent read cut does not create a cross-table commit. One SQL transaction
-may read several tables but writes exactly one, matching the largest atomic
-publication the storage layer actually has.
+The same global writer order that builds the coherent read cut also publishes
+multi-collection commits. A SQL or native transaction may read and write
+several tables: one dirty table still takes today's single-collection
+`Update` path; two or more prepare conditional journal records and cross one
+decision sync so every participant becomes visible together, or none do after
+recovery. Autocommit point writes remain per-collection publications.
 
 ## Write path
 
@@ -190,14 +196,19 @@ A mutation is planned against one state:
 
 `Update` batches distinct keys, rewrites each touched leaf once, descends each
 directory once, and publishes one logical failure-atomic publication. It is the
-transactional `WriteBatch` — the SQL driver's `COMMIT` and the group-commit
-primitive both flow through it, and the logical batch is one journal record with
-one CRC and one sync. If its final rows do not fit the current leaf topology, a
-content-equivalent topology generation may publish first and the logical batch
-publishes in the following generation. A later failure exposes no subset of the
-batch, although `Generation` may advance because the representation-only shape
-is retained. Automatic combining applies the same machinery to overlapping
-`Put` and `Delete` calls. The query-visible graph is complete at publication;
+single-collection transactional `WriteBatch` — a one-table SQL `COMMIT`, a
+facade transaction that dirties one collection, and the group-commit primitive
+all flow through it, and the logical batch is one journal record with one CRC
+and one sync. A multi-collection commit stages the same per-collection batch
+machinery, appends one conditional (kind-5) journal record per participant,
+and treats the decision-log sync as the sole atomic commit point before
+publishing every participant together. If a single-collection batch's final
+rows do not fit the current leaf topology, a content-equivalent topology
+generation may publish first and the logical batch publishes in the following
+generation. A later failure exposes no subset of the batch, although
+`Generation` may advance because the representation-only shape is retained.
+Automatic combining applies the same machinery to overlapping `Put` and
+`Delete` calls. The query-visible graph is complete at publication;
 writer-only planning state is never published.
 
 ## Checkpoint path
@@ -274,6 +285,9 @@ remain predictable because their capacities and fold work are fixed at open.
   frame updates and the gated async capsule path with recovery undo.
 - [Recovery journal](design/recovery-journal.md): the recovery-only redo that
   now backs the synchronous lane.
+- [Multi-table transactions](design/multi-table-transactions.md): conditional
+  journal records, the `txn.vtm` decision log, and crash-atomic multi-collection
+  commit.
 - [Parallel tablet writers](design/parallel-tablet-writers.md): the implemented
   4,096 full-bucket stripe preparation lane and its remaining publication and
   structural-concurrency work.

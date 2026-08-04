@@ -199,6 +199,66 @@ failure with the journal failure. `errors.Is` may match
 generation. Close the collection and reopen the file; do not retry the logical
 mutation against the poisoned live handle.
 
+Multi-collection prepare append and prepare sync failures use the same
+append-or-sync-is-terminal, die-don't-retry rule: they poison the failing
+collection with the plain persistence error and abort the transaction
+definitely. They do not open the unknown-outcome window. Only a decision-record
+sync failure escalates to `ErrCommitOutcomeUnknown`, and that poison widens to
+every collection under the catalog (see below).
+
+## Database transactions
+
+A write that touches exactly one collection still takes today's
+`Collection.Update` path: one journal record, one sync, byte-identical to the
+single-collection contract. A write that dirties K ≥ 2 collections under one
+catalog commits through the database transaction protocol:
+
+1. Validate bounds and per-participant conflicts; refuse before staging.
+2. Stage every participant under writers held in the process-global snapshot
+   order. Any failure unwinds all staged work; nothing is journaled.
+3. Prepare: append and sync one conditional batch record (recovery-journal
+   format word `RecoveryJournalFormatConditional`, kind 5) in each
+   participant's own journal. An append or sync failure poisons that
+   collection with the plain persistence error and aborts the whole
+   transaction definitely — the decision was never attempted.
+4. Decide: append the decision record to the database decision log
+   (`txn.vtm`) and cross one power-safe sync. **That sync is the sole atomic
+   commit point.** Append failure is a definite abort. Sync failure is the
+   unknown-outcome window below.
+5. Publish: flip every participant's publication gate in the same global
+   order so no multi-collection read cut observes a partial set.
+
+Cost: a K-participant commit performs K+1 fsyncs (K prepare syncs plus the
+decision sync) and holds K writers across them. Reducing that to one sync is a
+named follow-up (shared redo in the decision log); this pass keeps the
+K+1-sync protocol.
+
+| Lane | Multi-collection visibility | Crash promise | Acknowledgement |
+| --- | --- | --- | --- |
+| sync-journal (fixed SQL default) | atomic: all gates flip together | crash-atomic | after K prepare syncs + decision sync |
+| buffered-journal (power-safe / filesystem) | atomic | crash-atomic | same; durability precedes visibility for multi-collection commits, stronger than the lane's single-collection contract |
+| buffered-volatile (both) | — | refused: `ErrDatabaseTransactionUnsupportedLane` | — |
+| async-COW, sync chain-fence | — | refused: same typed error | — |
+| Memory profile (heap store) | atomic: all writers held, all pointers flip | no crash dimension | in-process |
+
+The facade Buffered profile maps to buffered-visible publication, so native
+multi-collection transactions on that profile are a typed refusal in this
+pass.
+
+> A multi-collection COMMIT has exactly one unknown-outcome window: the
+> decision record's sync. If that sync reports an error, COMMIT returns
+> `ErrCommitOutcomeUnknown`, every collection handle under the catalog
+> refuses further writes with the sticky persistence failure, and only
+> closing and reopening the database resolves the outcome. The unknown
+> outcome is atomic: reopen reveals either every participating collection's
+> writes or none of them. There is no crash, error, or recovery in which one
+> participant's writes survive without the others'.
+
+Catalog-scope poison is intentional: a half-poisoned catalog could otherwise
+commit collection B after collection A's outcome went unknown. After reopen,
+probe any one participant key of the transaction — its presence decides the
+whole transaction. Mint operation identities outside the retry loop.
+
 ## Recovery journal
 
 On the ordered primary graph the [recovery-only redo journal][journal] backs
@@ -237,9 +297,14 @@ delta lane and additionally admits compact scalar patches inside batches. The
 patch names the old scalar span and carries the new canonical integer, boolean,
 or null spelling plus a checksum of the complete expected canonical document.
 Replay reconstructs that whole result and fails closed unless its checksum
-matches. Current code rejects unknown versions, scalar-patch entries in v0,
-and a v1 journal reopened under the per-mutation or synchronous lane; older
-v0-only binaries reject the nonzero v1 header before decoding its records.
+matches. Catalog-owned collections mint journals at format word
+`RecoveryJournalFormatConditional` (numeric 2), which admits kinds 1, 2, 3,
+and 5 (conditional batch) and rejects scalar-patch kind 4. Kind 5 carries the
+same batch grammar as kind 3, prefixed by a 32-byte conditional header binding
+the record to the database decision log. Current code rejects unknown versions,
+scalar-patch entries in v0, a v1 journal reopened under the per-mutation or
+synchronous lane, and kind 5 inside a legacy or scalar-patch journal; older
+binaries reject a nonzero format word they do not know before decoding.
 
 A v1 batch contains one entry for every consecutive logical generation ending
 at its record generation. If replay is forced to checkpoint a prefix under
@@ -247,7 +312,10 @@ bounded staging pressure and is interrupted again, the next open derives the
 covered prefix from the selected physical root and resumes at the first
 uncovered entry. It does not reapply a length-changing scalar patch. V0 batches
 keep their original atomic grammar—all entries share one generation and replay
-starts at entry zero. See [the design][journal] for the complete framing,
+starts at entry zero. Conditional batches (kind 5) apply only when the decision
+log reports the transaction committed and names this collection among its
+participants; undecided same-epoch records are presumed aborted and skipped.
+See [the design][journal] and [format.md](format.md) for the complete framing,
 failure, and group-commit details.
 
 [journal]: design/recovery-journal.md

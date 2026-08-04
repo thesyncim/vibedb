@@ -35,14 +35,23 @@ The default `Durable` profile is the strongest contract. `Buffered` makes
 never accesses the path passed to `Open`, and has no persistence boundary.
 
 The facade exposes common `Put`, `Delete`, `Get`, `Range`, exact-index creation,
-typed query execution, `Flush`, and constant-size `Metrics` operations. A
-one-off `Collection.Run` owns its result; `Collection.NewSession` retains the
-bounded executor behind repeated `Session.Run` calls without exposing query or
-index workspaces. Every run takes a fresh immutable snapshot, and durable
-snapshots close before the call returns. `Get` returns an owned canonical JSON
-byte slice. `Range` borrows key and canonical document bytes only for the
-callback. The facade does not expose cache pages, index workspaces, generation
-leases, or the engine's mutation-oriented statistics structure.
+typed query execution, `Flush`, and constant-size `Metrics` operations, plus
+first-class `Update` / `View` / `Begin` / `BeginReadOnly` transactions over one
+or more collections. A one-off `Collection.Run` owns its result;
+`Collection.NewSession` retains the bounded executor behind repeated
+`Session.Run` calls without exposing query or index workspaces. Every run takes
+a fresh immutable snapshot, and durable snapshots close before the call
+returns. `Get` returns an owned canonical JSON byte slice. `Range` borrows key
+and canonical document bytes only for the callback. The facade does not expose
+cache pages, index workspaces, generation leases, or the engine's
+mutation-oriented statistics structure.
+
+Writes to collections absent at `Begin` stage normally; commit creates the
+empty collection first, then commits it as an ordinary participant. If the
+transaction then aborts — conflict, typed refusal, or a crash before the
+decision — the newly created empty collection remains. It holds no documents
+and is benign, but it is user-visible catalog residue rather than silently
+garbage-collected.
 
 Logical collection names are non-empty valid UTF-8 up to 120 bytes. Disk
 profiles encode them reversibly as `c-` plus lowercase hexadecimal UTF-8 plus
@@ -77,7 +86,11 @@ own `path + ".rjournal"` and synchronize the parent directory. The caller must
 have authority to create, open, write, and synchronize that sibling, and must
 move, back up, or restore the primary and journal as one pair. Anonymous,
 unlinked, relative-name, and stale-name descriptors are rejected before the
-primary is mutated.
+primary is mutated. Standalone open fails closed with a typed in-doubt error
+when the journal's live window holds an uncovered conditional (kind-5) record:
+the file participates in a database transaction and must be opened through its
+database directory. After the collection checkpoints past that record, the
+file is self-contained again.
 
 `AdvancedOptions` contains the low-level engine configuration. One centralized
 validation pass rejects profile/engine durability conflicts, disk options in
@@ -103,8 +116,12 @@ normal CRUD use.
 A collection is one physical JSON namespace. `store.Database` catalogs
 in-memory collections. `durable.Database` catalogs one collection file per
 name in a directory. Its multi-collection snapshot is a consistent in-process
-read cut; it does not make separate collection writes one crash-atomic or
-transactional operation.
+read cut. Multi-collection writes commit through `Database.Update` /
+`UpdateCollections`: one dirty collection takes today's `Collection.Update`
+path; two or more prepare conditional journal records and cross one decision
+sync in `txn.vtm`, the database decision log, so visibility and crash recovery
+are all-or-nothing across participants on supported lanes (see
+[durability.md](durability.md#database-transactions)).
 
 ## In-memory collections
 
@@ -629,7 +646,7 @@ for another.
 ## Current product boundaries
 
 The repository's embedded API has no replication, failover, backup manager,
-point-in-time restore, or cross-file transaction. Distributed execution now
+point-in-time restore, or cross-database transaction. Distributed execution now
 exists, but only as a separate, unreleased, server-only tier the embedded API
 does not expose: a leader-only shard service (`shardservice`) and a stateless
 routing gateway (`gateway`), run by the `cmd/vibedb-shard` and
@@ -642,19 +659,28 @@ in [distributed sharding](design/distributed-sharding.md) and
 [Vitess-compatible routing](design/vitess-compatible-routing.md). The PostgreSQL
 protocol-v3 server can expose the typed SQL catalog directly;
 that path supports the documented DDL, DML, SELECT, prepared-statement, join,
-and transaction subset. A nested integration module exercises pinned pgx v5
-and lib/pq releases over loopback TCP in CI. That narrow evidence does not
-imply general PostgreSQL compatibility or catalog emulation.
+and transaction subset, including multi-table commits and savepoints. A nested
+integration module exercises pinned pgx v5 and lib/pq releases over loopback
+TCP in CI. That narrow evidence does not imply general PostgreSQL compatibility
+or catalog emulation.
 
-The core does provide two multi-collection catalogs:
+The core provides two multi-collection catalogs:
 
-- `store.Database` owns heap collections and takes a consistent heap snapshot.
-- `durable.Database` owns one durable file per collection and takes a
-  process-consistent leased read cut. `durable.SnapshotCollections` provides
-  the same read cut for a catalog that owns the collection handles itself.
+- `store.Database` owns heap collections, takes a consistent heap snapshot, and
+  commits multi-collection transactions by holding every participant writer and
+  flipping published-state pointers together (no crash dimension).
+- `durable.Database` owns one durable file per collection, takes a
+  process-consistent leased read cut, and commits multi-collection transactions
+  through the `txn.vtm` decision log on journal-backed lanes.
+  `durable.SnapshotCollections` provides the same read cut for a catalog that
+  owns the collection handles itself.
 
-Neither catalog makes writes to separate collections atomic or crash-atomic.
-Their shared guarantee is a coherent read snapshot.
+Both catalogs share a coherent read snapshot. On supported lanes, both also
+publish multi-collection writes as one crash-atomic (durable) or
+visibility-atomic (heap) transaction. Buffered-volatile, async-COW, and
+chain-fence lanes refuse multi-collection commits with a typed error; the
+facade Buffered profile refuses native multi-collection transactions for the
+same reason.
 
 The query engine runs existence and fan-out joins over heap database snapshots.
 Its direct durable path currently runs existence joins but does not materialize
@@ -664,8 +690,8 @@ join: it captures the tables through `durable.SnapshotCollections`, admits the
 complete input against a fixed, conservative 64 MiB working-set bound, copies
 that coherent cut into the heap executor, and fails before execution if the
 bound would be exceeded. The SQL catalog persists table names, JSON schemas,
-primary-key paths, and exact-index definitions; it still commits one table at
-a time.
+primary-key paths, and exact-index definitions, and commits dirty tables
+through the same single- or multi-collection paths as the durable engine.
 
-Broader distributed and cross-file transactional features are not implied by
-these catalog and join APIs.
+Broader distributed and cross-database transactional features are not implied
+by these catalog and join APIs.

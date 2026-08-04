@@ -243,10 +243,16 @@ blindly retrying.
 ## Important limitations
 
 - The project is unreleased; APIs and storage format version 0 are unstable.
-- SQL transactions may read multiple tables but write exactly one table.
 - DDL is atomic per statement but is not transactional.
-- Savepoints, two-table writes, arbitrary `pg_catalog` queries, and general ORM
-  schema discovery are not supported.
+- Transactions provide snapshot isolation; write skew is possible because the
+  read set is not validated. Conflict detection covers handle-mediated writes
+  on the same `vibedb.Database`, `*sql.DB`, or pgwire endpoint — not writers
+  through a different handle to the same files.
+- An aborted transaction that wrote to a table absent at BEGIN can leave that
+  empty table in the catalog; it holds no documents but is user-visible
+  residue.
+- Arbitrary `pg_catalog` queries and general ORM schema discovery are not
+  supported.
 - Pgwire does not implement TLS, replication, `COPY`, `LISTEN`/`NOTIFY`, or the
   full PostgreSQL type and function systems.
 - Materialized views are not implemented; ordinary durable views are read-only.

@@ -522,8 +522,9 @@ The driver captures every participating durable collection in one coherent
 snapshot. All publication gates are held while the generation leases are
 acquired, so the joined generations genuinely coexisted. This prevents a join
 from observing a new generation of one table with an already-obsolete
-generation of another. It does not make independent writes to different tables
-atomic.
+generation of another. Independent autocommit writes to different tables remain
+separate publications; a multi-table transaction is the crash-atomic commit
+path.
 
 Autocommit generalized joins receive that coherent durable catalog directly.
 Physical dependencies therefore stay on durable sources, and eligible operand
@@ -870,50 +871,90 @@ BEGIN captures a generation-leased snapshot of every table present in the
 catalog while the driver excludes its writers. Every later SELECT and mutation
 reads that fixed cut overlaid with the transaction's staged writes. The result
 is snapshot isolation with repeatable reads, phantom exclusion, and
-read-your-writes.
+read-your-writes. The read set is not validated, so write skew is possible:
+T1 reads `oncall/alice` and writes `oncall/bob`; T2 reads `oncall/bob` and
+writes `oncall/alice`; both commit; a cross-row invariant can break. This is
+the model the driver ships for one table and for many; it never blocks readers
+and never holds a writer across client think-time.
 
-A transaction may read several tables but may write exactly one. Durable
-tables have independent publication roots, so there is no atomic commit across
-two tables. DDL is rejected inside a transaction.
+A transaction may read and write several tables. One dirty table commits
+through today's `Collection.Update` path. Two or more dirty tables commit
+through the durable multi-collection protocol: conditional journal records in
+each participant's journal and one decision sync in `txn.vtm`, so visibility
+and crash recovery are all-or-nothing across participants on journal-backed
+lanes. Writes to tables absent at BEGIN materialize an empty durable file as a
+participant; an aborted or crashed transaction can leave that empty table
+behind as documented catalog residue. DDL is rejected inside a transaction.
 
 COMMIT uses a bounded per-table, per-key publication clock. If any written key
 was published after BEGIN, including a change-and-restore (ABA),
-`driver.ErrTransactionConflict` is returned and nothing is published. This
-first-committer-wins check retains revisions rather than copies of the original
-documents, and disjoint-key writers remain independent. The clock retains at
-most 4,096 changed keys; overflow moves a history floor and conservatively
-rejects older transactions instead of risking a missed conflict. Otherwise all
-staged puts and deletes are submitted in one `Collection.Update`, including
+`driver.ErrTransactionConflict` is returned (SQLSTATE `40001` on the wire) and
+nothing is published. This first-committer-wins check retains revisions rather
+than copies of the original documents, and disjoint-key writers remain
+independent. Conflict scope is handle-mediated — the same `*sql.DB` or pgwire
+endpoint. The clock retains at most 4,096 changed keys; overflow moves a
+history floor and conservatively rejects older transactions instead of risking
+a missed conflict. There is no auto-retry: a retry re-runs caller code.
+Otherwise all staged puts and deletes are submitted — one dirty table through
+`Collection.Update`, several through `UpdateCollections` — including
 exact-index maintenance. ROLLBACK closes the leases and discards the overlay.
+
+A COMMIT whose decision-record sync fails returns
+`ErrCommitOutcomeUnknown` (SQLSTATE `40003` on the wire), poisons every
+collection under the catalog against further writes, and must be resolved by
+closing and reopening the database. The unknown outcome is atomic: reopen
+reveals every participating table's writes or none of them.
+
+### Savepoints
+
+`SAVEPOINT name`, `RELEASE [SAVEPOINT] name`, and
+`ROLLBACK TO [SAVEPOINT] name` are supported in the SQL grammar, the
+`database/sql` driver, and pgwire. Frames are LIFO marks over per-table overlay
+watermarks (staged-order lengths plus a displaced-entry undo log for keys
+overwritten after the mark). `ROLLBACK TO` rewinds the overlay without ending
+the transaction and returns a failed session to in-transaction state — Ready
+for Query `T` on the wire. `RELEASE` erases marks LIFO through the name;
+duplicate names replace. Real commitment remains only at COMMIT. The stack is
+bounded at 64 frames (`ErrTooManySavepoints`); an unknown name is
+`ErrSavepointNotFound` (SQLSTATE `3B001`). Savepoint or release in a failed
+transaction is SQLSTATE `25P02`. `database/sql` users reach all three as
+statement text through `tx.Exec`. Nested native `Update` closures are a typed
+error, not an implicit savepoint.
 
 The typed runtime accepts only its default and snapshot isolation levels;
 `database/sql` maps those directly, and the PostgreSQL spellings admitted by
 `pgwire` are listed below. Read-only transactions reject mutations.
 
 Transactions and atomic multi-row statements are bounded by the collection's
-`MaxBatchDocuments` and `MaxBatchBytes`. The SQL-created layout currently uses
-the durable defaults (64 distinct keys and the default bounded byte
-reservation). Overflow returns `driver.ErrTransactionTooLarge` wrapping
-`durable.ErrBatchTooLarge` and publishes nothing.
+`MaxBatchDocuments` and `MaxBatchBytes`, plus cross-table `TxnLimits`
+(default 16 collections; document and byte totals four times the
+single-collection defaults). Overflow returns `driver.ErrTransactionTooLarge`
+with the failing dimension named and publishes nothing. Unsupported durability
+lanes refuse multi-table commits with
+`driver.ErrTransactionUnsupportedLane`.
 
 PostgreSQL sessions expose the same state as ReadyForQuery `I`, `T`, or `E`.
 `BEGIN`, `BEGIN READ WRITE`, `BEGIN READ ONLY`, and
 `BEGIN ISOLATION LEVEL REPEATABLE READ` map to the typed runtime; other
 isolation claims are rejected rather than silently weakened. An error inside
-an explicit transaction leaves only ROLLBACK usable. COMMIT in that failed
-state performs the rollback and emits PostgreSQL's `ROLLBACK` command tag.
+an explicit transaction leaves ROLLBACK and `ROLLBACK TO` usable; other
+commands report failed-transaction status (`25P02`) until one of those
+recovers the session. COMMIT in that failed state performs the rollback and
+emits PostgreSQL's `ROLLBACK` command tag. Chained transactions and
+transaction-mode clauses beyond the admitted BEGIN spellings stay refused.
 
 An extended-protocol batch of non-DDL stored-row statements runs in one
 implicit transaction through Sync. A multi-statement simple Query without
 explicit transaction control does the same, so an error rolls back earlier
-writes in that message. Catalog DDL cannot yet participate in the durable
-transaction overlay: CREATE TABLE and CREATE INDEX are atomic individually,
-must run outside an explicit transaction, and must be the only non-empty
-statement in a simple Query message and the only catalog execution between
-extended-protocol Sync points. This is an explicit `0A000` boundary rather
-than partial transactional behavior. Extended-protocol DDL publishes when its
-Execute completes; if a client then violates the boundary with another catalog
-execution before Sync, that later execution is refused but the already
+writes in that message. Savepoint commands are admitted as non-terminal members
+of an explicit transaction block. Catalog DDL cannot yet participate in the
+durable transaction overlay: CREATE TABLE and CREATE INDEX are atomic
+individually, must run outside an explicit transaction, and must be the only
+non-empty statement in a simple Query message and the only catalog execution
+between extended-protocol Sync points. This is an explicit `0A000` boundary
+rather than partial transactional behavior. Extended-protocol DDL publishes
+when its Execute completes; if a client then violates the boundary with another
+catalog execution before Sync, that later execution is refused but the already
 completed DDL is not retroactively rolled back.
 
 ## NULL, missing fields, and driver values
@@ -1070,11 +1111,15 @@ operation:
   generated constraints, plus SQL types without a JSON equivalent;
 - unique/partial/range/full-text indexes, expression indexes, and selectable
   index methods;
-- composite primary keys in the typed SQL runtime and atomic transactions
-  spanning more than one table. Removing the multi-table refusal (and the
-  savepoint refusal) is designed in
-  [multi-table-transactions.md](multi-table-transactions.md); both refusals
-  stand until that design's named tests pass.
+- composite primary keys in the typed SQL runtime;
+- transactional DDL, chained transactions, and isolation modes beyond the
+  admitted BEGIN spellings;
+- multi-table commits on durability lanes outside the journal-backed set
+  (typed `ErrTransactionUnsupportedLane`).
+
+Multi-table transactions and savepoints are supported; the storage contract is
+in [multi-table-transactions.md](multi-table-transactions.md) and
+[durability.md](../durability.md#database-transactions).
 
 These are explicit errors rather than parser successes followed by
 approximations.

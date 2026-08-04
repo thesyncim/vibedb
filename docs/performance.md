@@ -585,6 +585,26 @@ go test ./store/durable -run '^$' \
   -benchmem -count=10
 ```
 
+## Multi-collection transactions (informational)
+
+These numbers pin the current commit cost; they are not yet competitive-harness
+rows. Bench-gate wiring for transaction latency is a named follow-up.
+
+- A single-collection commit remains one journal append plus one sync — the
+  same path and allocation shape as before multi-collection transactions.
+- A K-participant durable commit performs K+1 fsyncs (one prepare sync per
+  participant journal, then the decision-log sync in `txn.vtm`) and holds K
+  writers across them. Multi-collection read cuts block for the duration of an
+  in-flight commit; single-collection snapshots do not.
+- The K=2 commit path is pinned to at most 64 allocations per participant
+  (`TestDatabaseTxnAllocationBudget`); the single-table path stays
+  allocation-identical to its baseline pin.
+- Reducing K+1 syncs to one (shared redo in the decision log) is deferred until
+  measured numbers justify a second format evolution.
+
+See [durability.md](durability.md#database-transactions) for the protocol and
+per-lane table.
+
 ## Reading the numbers honestly
 
 - Compare only equal durability lanes, checkpoint cadence, operation mix, and
