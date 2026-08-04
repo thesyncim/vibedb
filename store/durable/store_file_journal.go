@@ -925,10 +925,11 @@ func (c *Collection) legacyRecoveryBatchFitsUpdate(
 // journal is configured. The caller holds the writer and has already made the
 // checkpointed generation durable.
 //
-// Catalog-owned collections whose journal is still at the legacy format word
-// remint at the conditional format during this recycle — the one bounded
-// foreground upgrade path a prepare takes before appending a kind-5 record.
-// Scalar-patch journals are never upgraded here.
+// Format upgrades to the conditional journal word happen only through
+// ensureConditionalJournalFormatLocked (prepare / multi-collection stage), not
+// here: Close's final checkpoint must recycle on the live journal handle even
+// when the path has been replaced by a hostile directory, so DropCollection
+// remains retryable after the caller repairs the filesystem.
 func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 	if c.journalReplaying {
 		// A checkpoint forced mid-replay (staging pressure from the replayed
@@ -956,18 +957,6 @@ func (c *Collection) recycleRecoveryJournalLocked(baseGeneration uint64) error {
 	}
 	if baseGeneration < c.journal.BaseGeneration() {
 		// The durable generation never regressed; nothing to recycle past.
-		return nil
-	}
-	if c.journalCatalogOwned &&
-		c.journal.Header().FormatVersion == storeio.RecoveryJournalFormatLegacy {
-		if err := c.remintRecoveryJournalConditionalLocked(baseGeneration); err != nil {
-			poisoned := c.poisonJournal(err)
-			c.journalGroup.fail(poisoned)
-			return poisoned
-		}
-		c.journalDeltaGeneration.Store(baseGeneration)
-		c.journalDeltaAppendedGeneration.Store(baseGeneration)
-		c.journalGroup.recycleAdvance()
 		return nil
 	}
 	if err := c.journal.Recycle(
@@ -1021,10 +1010,12 @@ func (c *Collection) remintRecoveryJournalConditionalLocked(
 // ensureConditionalJournalFormatLocked upgrades a legacy journal to the
 // conditional format when the collection is catalog-owned. An empty live
 // window remints in place (safe even with staged unpublished frames). A
-// non-empty window takes one bounded foreground checkpoint, which recycles
-// and remints — that path requires no staged batch, so prepare after stage
-// must already be on the conditional format. Scalar-patch journals refuse
-// defensively. The writer must already be held.
+// non-empty window takes one bounded foreground checkpoint to empty the
+// window, then remints — that path requires no staged batch, so prepare
+// after stage must already be on the conditional format. Recycle itself
+// never remints: Close must be able to fold on the live journal handle
+// even when the path is hostile. Scalar-patch journals refuse defensively.
+// The writer must already be held.
 func (c *Collection) ensureConditionalJournalFormatLocked() error {
 	if !c.journalEnabled() {
 		return ErrConditionalPrepareUnsupportedJournal
@@ -1038,26 +1029,25 @@ func (c *Collection) ensureConditionalJournalFormatLocked() error {
 		if !c.journalCatalogOwned {
 			return ErrConditionalPrepareUnsupportedJournal
 		}
-		if c.journal.Cursor() == 0 {
-			gen := c.journal.BaseGeneration()
-			if durable := c.committer.DurableGeneration(); durable > gen {
-				gen = durable
+		if c.journal.Cursor() != 0 {
+			if len(c.batchPrimaryAdmitted) != 0 {
+				return fmt.Errorf(
+					"%w: upgrade conditional journal format before staging",
+					ErrConditionalPrepareUnsupportedJournal,
+				)
 			}
-			if err := c.remintRecoveryJournalConditionalLocked(gen); err != nil {
+			if err := c.checkpointBufferedLocked(); err != nil {
 				return err
 			}
-			return nil
+			c.automaticCheckpoints.Add(1)
 		}
-		if len(c.batchPrimaryAdmitted) != 0 {
-			return fmt.Errorf(
-				"%w: upgrade conditional journal format before staging",
-				ErrConditionalPrepareUnsupportedJournal,
-			)
+		gen := c.journal.BaseGeneration()
+		if durable := c.committer.DurableGeneration(); durable > gen {
+			gen = durable
 		}
-		if err := c.checkpointBufferedLocked(); err != nil {
+		if err := c.remintRecoveryJournalConditionalLocked(gen); err != nil {
 			return err
 		}
-		c.automaticCheckpoints.Add(1)
 		if c.journal.Header().FormatVersion !=
 			storeio.RecoveryJournalFormatConditional {
 			return fmt.Errorf(
