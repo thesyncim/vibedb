@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
+	"github.com/thesyncim/vibedb/internal/txnclock"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -92,6 +93,11 @@ type AdvancedOptions struct {
 	// zero values select private 0o600 and 0o700 permissions respectively.
 	FileMode os.FileMode
 	DirMode  os.FileMode
+	// TxnLimits bounds one multi-collection transaction across participants.
+	// Zero dimensions normalize to the durable package defaults (16
+	// collections; documents and bytes four times the single-collection
+	// batch defaults). Violations surface as ErrTxTooLarge.
+	TxnLimits durable.TxnLimits
 }
 
 // Option configures Open.
@@ -136,6 +142,7 @@ type normalizedOptions struct {
 	dirMode          os.FileMode
 	maxKeyBytes      int
 	maxDocumentBytes int
+	txnLimits        durable.TxnLimits
 }
 
 // normalizeOptions is the single compatibility boundary for Open and
@@ -156,6 +163,7 @@ func normalizeOptions(options AdvancedOptions, target openTarget) (normalizedOpt
 		profile: options.Durability, engine: cloneEngineOptions(options.Engine),
 		fileMode: options.FileMode, dirMode: options.DirMode,
 		maxKeyBytes: defaultMaxKeyBytes, maxDocumentBytes: defaultMaxDocumentBytes,
+		txnLimits: normalizeFacadeTxnLimits(options.TxnLimits),
 	}
 	if schema := normalized.engine.Collection.Schema; schema != nil {
 		if !schema.Valid() {
@@ -230,6 +238,7 @@ type Database struct {
 	engine           durable.Options
 	maxKeyBytes      int
 	maxDocumentBytes int
+	txnLimits        durable.TxnLimits
 
 	closed    atomic.Bool
 	closeDone atomic.Bool
@@ -240,6 +249,19 @@ type Database struct {
 
 	handlesMu sync.Mutex
 	handles   map[string]*Collection
+
+	// commitMu serializes Commit validation and publication across every
+	// transaction on this handle. Begin does not take it; think-time overlaps.
+	commitMu sync.Mutex
+
+	clockMu   sync.Mutex
+	clocks    map[string]*txnclock.Clock
+	rwTxCount int
+
+	// updateDepth tracks Update/View closure nesting per goroutine. Concurrent
+	// closures on distinct goroutines are allowed; re-entering Update on the
+	// same goroutine is a typed refusal (not a savepoint).
+	updateDepth sync.Map // uint64 goid → int depth
 }
 
 // Open opens path using the Durable profile unless an option selects another
@@ -266,7 +288,9 @@ func Open(path string, options ...Option) (*Database, error) {
 		engine:           normalized.engine,
 		maxKeyBytes:      normalized.maxKeyBytes,
 		maxDocumentBytes: normalized.maxDocumentBytes,
+		txnLimits:        normalized.txnLimits,
 		handles:          make(map[string]*Collection),
+		clocks:           make(map[string]*txnclock.Clock),
 	}
 	if normalized.profile == Memory {
 		return db, nil
@@ -658,9 +682,15 @@ func (c *Collection) Put(key string, document []byte) (created bool, err error) 
 			c.memoryCanonical = nil
 		}
 		c.memoryPutMu.Unlock()
+		if canonicalErr == nil {
+			c.recordCommittedKey(key)
+		}
 		return created, facadeError(canonicalErr)
 	}
 	created, err = disk.Put(byteview.Bytes(key), document)
+	if err == nil {
+		c.recordCommittedKey(key)
+	}
 	return created, facadeError(err)
 }
 
@@ -675,12 +705,19 @@ func (c *Collection) Delete(key string) (deleted bool, err error) {
 		return false, ErrKeyTooLarge
 	}
 	if memory != nil {
-		return memory.Delete(key)
+		deleted, err = memory.Delete(key)
+		if err == nil {
+			c.recordCommittedKey(key)
+		}
+		return deleted, facadeError(err)
 	}
 	if disk == nil {
 		return false, nil
 	}
 	deleted, err = disk.Delete(byteview.Bytes(key))
+	if err == nil {
+		c.recordCommittedKey(key)
+	}
 	return deleted, facadeError(err)
 }
 
@@ -900,7 +937,48 @@ func facadeError(err error) error {
 	if errors.Is(err, durable.ErrDocumentTooLarge) {
 		return fmt.Errorf("%w: %w", ErrDocumentTooLarge, err)
 	}
+	if errors.Is(err, durable.ErrTxnTooLarge) ||
+		errors.Is(err, durable.ErrBatchTooLarge) ||
+		errors.Is(err, store.ErrTxnTooLarge) ||
+		errors.Is(err, store.ErrBatchTooLarge) {
+		return fmt.Errorf("%w: %w", ErrTxTooLarge, err)
+	}
 	return err
+}
+
+func (c *Collection) recordCommittedKey(key string) {
+	if c == nil || c.owner == nil || key == "" {
+		return
+	}
+	c.owner.recordClockKey(c.name, key)
+}
+
+// normalizeFacadeTxnLimits substitutes package defaults for any zero
+// dimension. UpdateCollections itself stays fail-closed at zero; this layer
+// owns the defaults.
+func normalizeFacadeTxnLimits(limits durable.TxnLimits) durable.TxnLimits {
+	defaults := defaultFacadeTxnLimits()
+	if limits.MaxCollections == 0 {
+		limits.MaxCollections = defaults.MaxCollections
+	}
+	if limits.MaxDocuments == 0 {
+		limits.MaxDocuments = defaults.MaxDocuments
+	}
+	if limits.MaxBytes == 0 {
+		limits.MaxBytes = defaults.MaxBytes
+	}
+	return limits
+}
+
+func defaultFacadeTxnLimits() durable.TxnLimits {
+	// Pin the same numbers durable.Database.Update uses (defaultTxnLimits).
+	const defaultBatchValueBytes = 16 << 20
+	return durable.TxnLimits{
+		MaxCollections: 16,
+		MaxDocuments:   4 * store.MaxChunkDocuments,
+		MaxBytes: 4 * (int64(store.MaxChunkDocuments)*int64(defaultMaxKeyBytes) +
+			defaultBatchValueBytes),
+	}
 }
 
 func (c *Collection) bounds(
