@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,39 +12,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
 )
-
-// captureRun redirects os.Stdout and os.Stderr around one run() invocation.
-// These tests never call t.Parallel, so the process-global stream swap is
-// serialized within this binary.
-func captureRun(t *testing.T, args ...string) (code int, stdout, stderr string) {
-	t.Helper()
-	originalOut, originalErr := os.Stdout, os.Stderr
-	outReader, outWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	errReader, errWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	os.Stdout, os.Stderr = outWriter, errWriter
-
-	var outBuf, errBuf bytes.Buffer
-	drained := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(&outBuf, outReader); drained <- struct{}{} }()
-	go func() { _, _ = io.Copy(&errBuf, errReader); drained <- struct{}{} }()
-
-	code = run(args)
-
-	os.Stdout, os.Stderr = originalOut, originalErr
-	_ = outWriter.Close()
-	_ = errWriter.Close()
-	<-drained
-	<-drained
-	_ = outReader.Close()
-	_ = errReader.Close()
-	return code, outBuf.String(), errBuf.String()
-}
 
 func verifyTestOptions() durable.Options {
 	return durable.Options{
