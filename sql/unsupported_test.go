@@ -13,7 +13,7 @@ func TestLeadingFeatureRefusalsAreTypedAndPositioned(t *testing.T) {
 		want string
 	}{
 		{"copy", "COPY docs TO STDOUT", "COPY is not supported"},
-		{"savepoint", "SAVEPOINT nested", "savepoints are not supported"},
+		{"lock", "LOCK TABLE docs IN ACCESS EXCLUSIVE MODE", "there is no SQL lock manager"},
 		{"alter table", "ALTER TABLE docs ADD COLUMN n STRING", "ALTER is not in the bounded catalog subset"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

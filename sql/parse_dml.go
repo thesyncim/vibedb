@@ -90,6 +90,12 @@ func KindOf(src string) Kind {
 		return KindDropTable
 	case tok.kw == kwTruncate:
 		return KindTruncate
+	case tok.kw == kwSavepoint:
+		return KindSavepoint
+	case tok.kw == kwRelease:
+		return KindReleaseSavepoint
+	case tok.kw == kwRollback:
+		return KindRollbackToSavepoint
 	}
 	return KindSelect
 }
@@ -130,6 +136,15 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwTruncate):
 		dst.Kind, dst.Truncate = KindTruncate, &p.truncate
 		return p.parseTruncate()
+	case p.atKeyword(kwSavepoint):
+		dst.Kind, dst.Savepoint = KindSavepoint, &p.savepoint
+		return p.parseSavepoint()
+	case p.atKeyword(kwRelease):
+		dst.Kind, dst.ReleaseSavepoint = KindReleaseSavepoint, &p.releaseSavepoint
+		return p.parseReleaseSavepoint()
+	case p.atKeyword(kwRollback):
+		dst.Kind, dst.RollbackToSavepoint = KindRollbackToSavepoint, &p.rollbackTo
+		return p.parseRollbackToSavepoint()
 	case tokenTextEqual(p.tok, "REFRESH"):
 		return p.parseUnsupportedRefreshView()
 	case p.atKeyword(kwValues), p.atKeyword(kwTable):
@@ -145,6 +160,56 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	p.out = &p.sel
 	*p.out = SelectStmt{}
 	return p.parseStatement()
+}
+
+// --- SAVEPOINT control -------------------------------------------------------
+
+func (p *Parser) parseSavepoint() error {
+	p.savepoint = SavepointStmt{}
+	p.advance() // SAVEPOINT
+	name, namePos, err := p.parseSavepointName()
+	if err != nil {
+		return err
+	}
+	p.savepoint.Name, p.savepoint.Pos = name, namePos
+	return p.expectEnd()
+}
+
+func (p *Parser) parseReleaseSavepoint() error {
+	p.releaseSavepoint = SavepointStmt{}
+	p.advance() // RELEASE
+	p.acceptKeyword(kwSavepoint)
+	name, pos, err := p.parseSavepointName()
+	if err != nil {
+		return err
+	}
+	p.releaseSavepoint.Name, p.releaseSavepoint.Pos = name, pos
+	return p.expectEnd()
+}
+
+func (p *Parser) parseRollbackToSavepoint() error {
+	p.rollbackTo = SavepointStmt{}
+	p.advance() // ROLLBACK
+	if err := p.expectKeyword(kwTo, "TO after ROLLBACK"); err != nil {
+		return err
+	}
+	p.acceptKeyword(kwSavepoint)
+	name, pos, err := p.parseSavepointName()
+	if err != nil {
+		return err
+	}
+	p.rollbackTo.Name, p.rollbackTo.Pos = name, pos
+	return p.expectEnd()
+}
+
+func (p *Parser) parseSavepointName() (string, int, error) {
+	if err := p.checkNameable("a savepoint name"); err != nil {
+		return "", 0, err
+	}
+	pos := p.tok.pos
+	name := p.internToken(p.tok)
+	p.advance()
+	return name, pos, nil
 }
 
 // --- INSERT ------------------------------------------------------------------

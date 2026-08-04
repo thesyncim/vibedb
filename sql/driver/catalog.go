@@ -126,6 +126,16 @@ type database struct {
 	tableDirFencePending bool
 	closed               bool
 	closeDone            bool
+	// txnLog is the caller-owned decision log for multi-table commits, opened
+	// against dataDir after RecoverDatabaseTransactions and before per-table
+	// OpenWithTransactions. Nil only while open is incomplete.
+	txnLog *durable.TxnLog
+	// txnDecisions is the open-time scan passed to OpenWithTransactions. It may
+	// be nil when txn.vtm is absent (L1 clean absence).
+	txnDecisions *storeio.TxnDecisions
+	// txnLimits is the driver's normalized cross-table commit bound, matching
+	// durable's package defaults. UpdateCollections is fail-closed at zero.
+	txnLimits durable.TxnLimits
 	// cluster is the optional local-cluster routing state attached by the
 	// OpenCluster facade. It is nil for the default single-store driver, whose
 	// write path is unchanged.
@@ -161,6 +171,7 @@ func openDatabaseWithSync(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
+		txnLimits: defaultDriverTxnLimits(),
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -179,6 +190,16 @@ func openDatabaseWithSync(
 	if err := d.recoverVisibleNamespace(); err != nil {
 		return nil, err
 	}
+	// Load txn.vtm before any table open so every participant's journal replay
+	// can resolve kind-5 records, and so stray conditionals are consumed before
+	// the log accepts a new commit.
+	decisions, txnLog, err := durable.RecoverDatabaseTransactions(
+		d.dataDir, durable.TxnLogOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	d.txnDecisions, d.txnLog = decisions, txnLog
 	raw, exists, err := readCatalogFile(absolute)
 	if err != nil {
 		return nil, err
@@ -303,7 +324,9 @@ func openDatabaseWithSync(
 		// Passing nil lets Open rehydrate its complete definition after a crash
 		// between durable publication and the SQL catalog mirror.
 		openOptions.Indexes = nil
-		collection, openErr := durable.Open(file, openOptions)
+		collection, openErr := durable.OpenWithTransactions(
+			file, openOptions, d.txnDecisions,
+		)
 		if openErr != nil {
 			_ = file.Close()
 			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
@@ -474,6 +497,18 @@ func durableOptions(t *table) durable.Options {
 		})
 	}
 	return options
+}
+
+// defaultDriverTxnLimits mirrors durable's package defaults for Database.Update.
+// The numbers are pinned here because UpdateCollections is fail-closed at zero
+// and does not substitute defaults for caller-owned catalogs.
+func defaultDriverTxnLimits() durable.TxnLimits {
+	const defaultBatchValueBytes = 16 << 20
+	return durable.TxnLimits{
+		MaxCollections: 16,
+		MaxDocuments:   4 * store.MaxChunkDocuments,
+		MaxBytes:       4 * (int64(store.MaxChunkDocuments)*256 + defaultBatchValueBytes),
+	}
 }
 
 func syncTableIndexMeta(t *table) (bool, error) {
@@ -1181,6 +1216,15 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	if err != nil {
 		return nil, fmt.Errorf("vibedb: publish first SQL table: %w", err)
 	}
+	// publishTableStorageLocked reopens with standalone Open. Reopen through
+	// the transaction resolver so catalog-owned journals mint and recycle at
+	// the conditional format word, matching OpenDatabase's wiring.
+	file, collection, err = d.reopenTableWithTransactionsLocked(
+		path, file, collection, durableOptions(t),
+	)
+	if err != nil {
+		return nil, err
+	}
 	t.file, t.collection = file, collection
 	t.meta.Materialized = true
 	d.catalogWritePending = true
@@ -1188,6 +1232,41 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		return t, err
 	}
 	return t, nil
+}
+
+func (d *database) reopenTableWithTransactionsLocked(
+	path string,
+	file *os.File,
+	collection *durable.Collection,
+	options durable.Options,
+) (*os.File, *durable.Collection, error) {
+	if collection != nil {
+		if err, completed := d.collectionCloseState(collection); err != nil || !completed {
+			return nil, nil, errors.Join(err, fmt.Errorf(
+				"vibedb: close table before transaction reopen: completed=%v", completed,
+			))
+		}
+		collection = nil
+	}
+	if file != nil {
+		if err := file.Close(); err != nil {
+			return nil, nil, err
+		}
+		file = nil
+	}
+	finalFile, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	options.Indexes = nil
+	finalCollection, err := durable.OpenWithTransactions(
+		finalFile, options, d.txnDecisions,
+	)
+	if err != nil {
+		_ = finalFile.Close()
+		return nil, nil, err
+	}
+	return finalFile, finalCollection, nil
 }
 
 // publishJournalSibling relocates a store file's recovery-journal sibling when
@@ -1311,6 +1390,11 @@ func (d *database) closeWithPolicy(terminal bool) error {
 				d.retired[i].file = nil
 			}
 		}
+	}
+	if d.txnLog != nil {
+		result = errors.Join(result, d.txnLog.Close())
+		d.txnLog = nil
+		d.txnDecisions = nil
 	}
 	if d.lockFile != nil {
 		result = errors.Join(result, storeio.UnlockWriter(d.lockFile))

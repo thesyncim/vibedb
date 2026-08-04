@@ -13,7 +13,7 @@ type UnsupportedSQLCase struct {
 // makes both public adapters execute representative entries from it.
 var UnsupportedSQLCases = []UnsupportedSQLCase{
 	{ID: "copy", Statement: "COPY docs TO STDOUT", ReasonContains: "COPY is not supported"},
-	{ID: "savepoint", Statement: "SAVEPOINT nested", ReasonContains: "savepoints are not supported"},
+	{ID: "lock", Statement: "LOCK TABLE docs IN ACCESS EXCLUSIVE MODE", ReasonContains: "there is no SQL lock manager"},
 	{ID: "alter", Statement: "ALTER TABLE docs ADD COLUMN n STRING", ReasonContains: "ALTER is not"},
 	{ID: "cte", Statement: "WITH x AS (SELECT 1) SELECT * FROM x", ReasonContains: "common table expressions"},
 	{ID: "listen", Statement: "LISTEN changes", ReasonContains: "asynchronous notification"},

@@ -53,9 +53,6 @@ var unsupportedStatements = map[string]string{
 	"REINDEX": "storage maintenance is the owning application's, not a client's",
 	"CLUSTER": "storage maintenance is the owning application's, not a client's",
 
-	"SAVEPOINT": "savepoints are not supported: the runtime owns one bounded transaction overlay",
-	"RELEASE":   "savepoints are not supported, so there is no savepoint to release",
-
 	"PREPARE":    "SQL-level PREPARE is not supported: use the adapter's prepared-statement API",
 	"EXECUTE":    "SQL-level EXECUTE is not supported: use the adapter's prepared-statement API",
 	"DEALLOCATE": "SQL-level DEALLOCATE is not supported: close the adapter's prepared statement",
@@ -81,7 +78,8 @@ func unsupportedStatementReason(tok token) (string, bool) {
 	// every successful parse; classification belongs only on the cold refusal
 	// path.
 	switch tok.kw {
-	case kwSelect, kwInsert, kwUpdate, kwDelete, kwCreate, kwDrop, kwTruncate:
+	case kwSelect, kwInsert, kwUpdate, kwDelete, kwCreate, kwDrop, kwTruncate,
+		kwSavepoint, kwRelease, kwRollback:
 		return "", false
 	}
 	reason, ok := unsupportedStatements[strings.ToUpper(tok.text)]

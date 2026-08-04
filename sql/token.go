@@ -154,11 +154,14 @@ const (
 	kwRank
 	kwReplace
 	kwRecursive
+	kwRelease
 	kwReturning
 	kwRight
+	kwRollback
 	kwRow
 	kwRows
 	kwRowNumber
+	kwSavepoint
 	kwSelect
 	kwSet
 	kwSimilar
@@ -166,6 +169,7 @@ const (
 	kwTable
 	kwThen
 	kwTies
+	kwTo
 	kwTruncate
 	kwTrue
 	kwUnion
@@ -384,16 +388,22 @@ func keywordOf(s string) keyword {
 		return kwReplace
 	case "RECURSIVE":
 		return kwRecursive
+	case "RELEASE":
+		return kwRelease
 	case "RETURNING":
 		return kwReturning
 	case "RIGHT":
 		return kwRight
+	case "ROLLBACK":
+		return kwRollback
 	case "ROW":
 		return kwRow
 	case "ROWS":
 		return kwRows
 	case "ROW_NUMBER":
 		return kwRowNumber
+	case "SAVEPOINT":
+		return kwSavepoint
 	case "SELECT":
 		return kwSelect
 	case "SET":
@@ -408,6 +418,8 @@ func keywordOf(s string) keyword {
 		return kwThen
 	case "TIES":
 		return kwTies
+	case "TO":
+		return kwTo
 	case "TRUNCATE":
 		return kwTruncate
 	case "TRUE":
@@ -475,7 +487,8 @@ func reserved(kw keyword) bool {
 		kwMissing, kwNulls, kwFirst, kwLast, kwEscape,
 		kwConflict, kwDefault, kwDo, kwNothing, kwReturning, kwMerge, kwReplace, kwTruncate,
 		kwAlter, kwCreate, kwDrop, kwIf, kwIndex, kwKey, kwPrimary, kwTable,
-		kwUnique, kwView:
+		kwUnique, kwView,
+		kwSavepoint, kwRelease, kwRollback, kwTo:
 		return false
 	}
 	return true

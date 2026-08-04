@@ -69,6 +69,12 @@ var (
 	// ErrTransactionConflict reports a first-committer-wins conflict. Nothing
 	// from the transaction was published.
 	ErrTransactionConflict = errors.New("vibedb: transaction conflict")
+	// ErrTooManySavepoints reports that a transaction exceeded the bounded
+	// SAVEPOINT nesting depth (64).
+	ErrTooManySavepoints = errors.New("vibedb: too many SAVEPOINT marks")
+	// ErrSavepointNotFound reports RELEASE or ROLLBACK TO naming a mark that
+	// is not on the transaction's savepoint stack.
+	ErrSavepointNotFound = errors.New("vibedb: SAVEPOINT does not exist")
 	// ErrJoinMaterializationTooLarge reports a JOIN whose durable inputs cannot
 	// be expanded through the heap fan-out executor within the query memory
 	// budget. No query execution has begun when this is returned.

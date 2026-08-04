@@ -57,6 +57,9 @@ func (s *stmt) preflightExec(got int) error {
 	if s.closed {
 		return errors.New("vibedb: statement is closed")
 	}
+	if s.tree != nil && isSavepointKind(s.tree.Kind) {
+		return s.checkArgumentCount(got)
+	}
 	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
 		return errors.New("vibedb: SELECT returns rows; use Query")
 	}
@@ -827,14 +830,26 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 	if s.closed {
 		return nil, errors.New("vibedb: statement is closed")
 	}
-	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
-		return nil, errors.New("vibedb: SELECT returns rows; use Query")
-	}
 	if err := s.conn.usable(ctx); err != nil {
 		return nil, err
 	}
 	if s.conn.open {
 		return nil, errors.New("vibedb: close the current rows before executing another statement on this connection")
+	}
+	if s.tree != nil && isSavepointKind(s.tree.Kind) {
+		if s.conn.tx == nil {
+			return nil, ErrNoTransaction
+		}
+		if err := contextCheckpoint(ctx); err != nil {
+			return nil, err
+		}
+		if err := s.conn.tx.execSavepointStatement(s.tree); err != nil {
+			return nil, err
+		}
+		return result{}, nil
+	}
+	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
+		return nil, errors.New("vibedb: SELECT returns rows; use Query")
 	}
 	if s.views != nil && s.views.ddl != nil {
 		return s.conn.execViewDDL(ctx, s.views.ddl)
@@ -846,4 +861,38 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 		return s.conn.tx.execPreparedMutationContext(ctx, s, args)
 	}
 	return s.conn.execPreparedMutationContext(ctx, s, args)
+}
+
+func isSavepointKind(kind sqlast.Kind) bool {
+	switch kind {
+	case sqlast.KindSavepoint, sqlast.KindReleaseSavepoint, sqlast.KindRollbackToSavepoint:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *tx) execSavepointStatement(tree *sqlast.Statement) error {
+	if t == nil || tree == nil {
+		return errors.New("vibedb: internal savepoint statement is nil")
+	}
+	switch tree.Kind {
+	case sqlast.KindSavepoint:
+		if tree.Savepoint == nil {
+			return errors.New("vibedb: internal SAVEPOINT body is nil")
+		}
+		return t.savepoint(tree.Savepoint.Name)
+	case sqlast.KindReleaseSavepoint:
+		if tree.ReleaseSavepoint == nil {
+			return errors.New("vibedb: internal RELEASE SAVEPOINT body is nil")
+		}
+		return t.releaseSavepoint(tree.ReleaseSavepoint.Name)
+	case sqlast.KindRollbackToSavepoint:
+		if tree.RollbackToSavepoint == nil {
+			return errors.New("vibedb: internal ROLLBACK TO SAVEPOINT body is nil")
+		}
+		return t.rollbackToSavepoint(tree.RollbackToSavepoint.Name)
+	default:
+		return fmt.Errorf("vibedb: unsupported savepoint statement %s", tree.Kind)
+	}
 }

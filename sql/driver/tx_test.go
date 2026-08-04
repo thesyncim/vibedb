@@ -6,7 +6,6 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -220,7 +219,7 @@ func TestTransactionRefusesExecWhileRowsBorrowWorkspace(t *testing.T) {
 	}
 }
 
-func TestFailedFirstTransactionCommitLeavesTableUnmaterialized(t *testing.T) {
+func TestFailedFirstTransactionCommitMayLeaveEmptyTableResidue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.vdb")
 	database, err := openDatabase(path)
 	if err != nil {
@@ -253,24 +252,32 @@ func TestFailedFirstTransactionCommitLeavesTableUnmaterialized(t *testing.T) {
 		conflicts:        conflicts,
 		conflictRevision: conflictRevision,
 	}
+	state.name = "docs"
 	transaction := &tx{
 		conn: connection, tables: map[string]*txTable{"docs": state},
-		writeTable: "docs",
 	}
 	connection.tx = transaction
 	if err := transaction.Commit(); err == nil {
 		t.Fatal("invalid first transactional publication succeeded")
 	}
 
+	// COMMIT materializes absent tables empty before applying staged seeds. A
+	// failed apply can leave that empty durable file as documented residue; it
+	// must not retain the rejected document.
 	database.mu.RLock()
-	materialized := database.tables["docs"].collection != nil
-	dataPath := database.tablePath("docs")
+	collection := database.tables["docs"].collection
 	database.mu.RUnlock()
-	if materialized {
-		t.Fatal("failed first transaction installed an empty collection")
-	}
-	if _, err := os.Stat(dataPath); !os.IsNotExist(err) {
-		t.Fatalf("failed first transaction data file = %v, want absent", err)
+	if collection != nil {
+		snap, snapErr := collection.Snapshot()
+		if snapErr != nil {
+			t.Fatal(snapErr)
+		}
+		defer snap.Close()
+		if _, found, lookErr := snap.AppendRaw(nil, []byte(`"broken"`)); lookErr != nil {
+			t.Fatal(lookErr)
+		} else if found {
+			t.Fatal("failed first transaction retained the rejected document")
+		}
 	}
 
 	index, err := query.PrepareDML(`CREATE INDEX ON docs (kind)`)
@@ -1006,10 +1013,10 @@ func TestFinishedTransactionReleasesRetainedState(t *testing.T) {
 	database := &database{}
 	connection := &conn{db: database}
 	transaction := &tx{
-		conn:       connection,
-		writeTable: "docs",
+		conn: connection,
 		tables: map[string]*txTable{
 			"docs": {
+				name: "docs",
 				pending: map[string]*txMutation{
 					"key": {document: make([]byte, 1<<20)},
 				},
@@ -1023,8 +1030,7 @@ func TestFinishedTransactionReleasesRetainedState(t *testing.T) {
 	if err := transaction.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if transaction.conn != nil || transaction.tables != nil ||
-		transaction.writeTable != "" {
+	if transaction.conn != nil || transaction.tables != nil {
 		t.Fatal("finished transaction retained connection or staged table state")
 	}
 	if connection.tx != nil {
@@ -1196,12 +1202,6 @@ func TestFailedStatementDoesNotPartiallyChangeTransactionOverlay(t *testing.T) {
 		t.Fatalf(
 			"read-your-writes after failed statement = (%s, %t, %v), want original",
 			raw, found, readErr,
-		)
-	}
-	if transaction.writeTable != "" {
-		t.Fatalf(
-			"failed statement installed conflict/write intent for %q",
-			transaction.writeTable,
 		)
 	}
 }

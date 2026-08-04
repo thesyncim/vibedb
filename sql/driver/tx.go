@@ -5,6 +5,7 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"slices"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/query"
@@ -38,6 +39,7 @@ type insertSelectStageAccount struct {
 }
 
 type txTable struct {
+	name             string
 	incarnation      *table
 	snapshot         *durable.Snapshot
 	pending          map[string]*txMutation
@@ -53,18 +55,23 @@ type txTable struct {
 	existenceScratch []byte
 	validationTape   []vibejson.IndexEntry
 	stagedBytes      int
-	keyChunk         []byte
-	keyChunks        [][]byte
+	// highWaterKeys and highWaterBytes track peak overlay occupancy for
+	// admission. ROLLBACK TO restores order and stagedBytes but does not lower
+	// these watermarks.
+	highWaterKeys  int
+	highWaterBytes int
+	keyChunk       []byte
+	keyChunks      [][]byte
 }
 
-// tx owns the generation-leased snapshots captured by BeginTx. Writes are
-// limited to one table because one durable Collection.Update is the engine's
-// largest atomic publication unit.
+// tx owns the generation-leased snapshots captured by BeginTx. The dirty set
+// is every table with a non-empty overlay; COMMIT validates each dirty table
+// and publishes through one Collection.Update or durable.UpdateCollections.
 type tx struct {
 	conn       *conn
 	tables     map[string]*txTable
 	views      map[string]*viewMeta
-	writeTable string
+	savepoints []savepointFrame
 	readOnly   bool
 	done       bool
 	staged     []stagedTxMutation
@@ -114,6 +121,7 @@ func (c *conn) beginTx(
 			return nil, err
 		}
 		state := &txTable{
+			name:        name,
 			incarnation: table,
 			pending:     make(map[string]*txMutation),
 			primaryKey:  table.meta.PrimaryKey,
@@ -361,11 +369,6 @@ func (t *tx) execMutationCore(
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, tableName)
 	}
-	if t.writeTable != "" && t.writeTable != tableName {
-		return nil, fmt.Errorf(
-			"vibedb: a transaction writes exactly one table; it already writes %q and cannot also write %q",
-			t.writeTable, tableName)
-	}
 	limits := state.limits
 
 	clear(t.staged)
@@ -522,7 +525,10 @@ func (t *tx) execMutationCore(
 	}
 
 	limit := limits.MaxBatchDocuments
-	distinct := len(state.order)
+	distinct := state.highWaterKeys
+	if distinct < len(state.order) {
+		distinct = len(state.order)
+	}
 	for _, mutation := range staged {
 		if _, present := state.pending[mutation.key]; !present {
 			distinct++
@@ -533,12 +539,19 @@ func (t *tx) execMutationCore(
 			"%w: statement would bring table %q to %d distinct keys, limit %d: %w",
 			ErrTransactionTooLarge, tableName, distinct, limit, durable.ErrBatchTooLarge)
 	}
-	stagedBytes := state.stagedBytes
+	stagedBytes := state.highWaterBytes
+	if stagedBytes < state.stagedBytes {
+		stagedBytes = state.stagedBytes
+	}
+	probeBytes := state.stagedBytes
 	for _, mutation := range staged {
 		if previous := state.pending[mutation.key]; previous != nil {
-			stagedBytes -= len(mutation.key) + len(previous.document)
+			probeBytes -= len(mutation.key) + len(previous.document)
 		}
-		stagedBytes += len(mutation.key) + len(mutation.document)
+		probeBytes += len(mutation.key) + len(mutation.document)
+		if probeBytes > stagedBytes {
+			stagedBytes = probeBytes
+		}
 		if stagedBytes > limits.MaxBatchBytes {
 			return nil, fmt.Errorf(
 				"%w: statement would stage %d key/document bytes for table %q, limit %d: %w",
@@ -610,9 +623,6 @@ func (t *tx) execMutationCore(
 		return nil, err
 	}
 	t.applyResolvedMutations(state, staged)
-	if len(staged) != 0 {
-		t.writeTable = tableName
-	}
 	return result{affected: int64(len(staged))}, nil
 }
 
@@ -1128,6 +1138,7 @@ func (t *tx) stageKnown(
 		state.pending[key] = entry
 		state.order = append(state.order, key)
 	} else {
+		t.recordSavepointOverwrite(state, key, entry)
 		state.stagedBytes -= len(key) + len(entry.document)
 	}
 	entry.remove = remove
@@ -1137,6 +1148,12 @@ func (t *tx) stageKnown(
 		entry.document = append(entry.document[:0], document...)
 	}
 	state.stagedBytes += len(key) + len(entry.document)
+	if len(state.order) > state.highWaterKeys {
+		state.highWaterKeys = len(state.order)
+	}
+	if state.stagedBytes > state.highWaterBytes {
+		state.highWaterBytes = state.stagedBytes
+	}
 }
 
 // ownMutationKey moves an ephemeral statement key into append-only
@@ -1173,15 +1190,21 @@ func (s *txTable) ownMutationKey(key string) string {
 	return byteview.String(s.keyChunk[start:len(s.keyChunk):len(s.keyChunk)])
 }
 
+type commitDirtyTable struct {
+	name  string
+	state *txTable
+	table *table
+}
+
 func (t *tx) Commit() error {
 	if t.done {
 		return errors.New("vibedb: transaction is already finished")
 	}
 	defer t.finish()
-	if t.writeTable == "" {
+	dirtyNames := t.dirtyTableNames()
+	if len(dirtyNames) == 0 {
 		return nil
 	}
-	state := t.tables[t.writeTable]
 	t.releaseSnapshots()
 
 	t.conn.db.mu.Lock()
@@ -1189,77 +1212,104 @@ func (t *tx) Commit() error {
 	if err := t.conn.db.settleCatalogLocked(); err != nil {
 		return err
 	}
-	table := t.conn.db.tables[t.writeTable]
-	if table == nil || table != state.incarnation {
-		return fmt.Errorf(
-			"%w: table %q was dropped or replaced after BEGIN",
-			ErrTransactionConflict, t.writeTable,
-		)
-	}
-	key, historyOverflow, conflict := state.conflicts.conflict(
-		state.conflictRevision, state.order,
-	)
-	if conflict {
-		if historyOverflow {
+
+	dirty := make([]commitDirtyTable, 0, len(dirtyNames))
+	for _, name := range dirtyNames {
+		state := t.tables[name]
+		table := t.conn.db.tables[name]
+		if table == nil || table != state.incarnation {
 			return fmt.Errorf(
-				"%w: table %q exceeded its bounded conflict history after BEGIN",
-				ErrTransactionConflict, t.writeTable,
+				"%w: table %q was dropped or replaced after BEGIN",
+				ErrTransactionConflict, name,
 			)
 		}
-		return fmt.Errorf(
-			"%w: table %q key %q changed after BEGIN",
-			ErrTransactionConflict, t.writeTable, key,
+		key, historyOverflow, conflict := state.conflicts.conflict(
+			state.conflictRevision, state.order,
 		)
-	}
-	if table.collection == nil {
-		seeds := make([]seedDocument, 0, len(state.order))
-		for _, key := range state.order {
-			entry := state.pending[key]
-			if !entry.remove {
-				seeds = append(seeds, seedDocument{
-					key: key, document: entry.document,
-				})
+		if conflict {
+			if historyOverflow {
+				return fmt.Errorf(
+					"%w: table %q exceeded its bounded conflict history after BEGIN",
+					ErrTransactionConflict, name,
+				)
 			}
+			return fmt.Errorf(
+				"%w: table %q key %q changed after BEGIN",
+				ErrTransactionConflict, name, key,
+			)
 		}
-		if len(seeds) == 0 {
-			return nil
-		}
-		_, err := t.conn.db.materializeLocked(t.writeTable, seeds)
-		if table.collection != nil {
-			table.conflicts.recordTransaction(state)
-		}
-		return transactionBatchError(err)
+		dirty = append(dirty, commitDirtyTable{name: name, state: state, table: table})
 	}
+
+	// Materialize every absent dirty table as an EMPTY durable file first. The
+	// staged seeds join the transaction as ordinary batch entries. An aborted
+	// or crashed transaction can leave that empty table behind — documented
+	// catalog residue.
+	for i := range dirty {
+		if dirty[i].table.collection != nil {
+			continue
+		}
+		if _, err := t.conn.db.materializeLocked(dirty[i].name, nil); err != nil {
+			return transactionBatchError(err)
+		}
+		dirty[i].table = t.conn.db.tables[dirty[i].name]
+		if dirty[i].table == nil || dirty[i].table.collection == nil {
+			return fmt.Errorf(
+				"vibedb: materialize table %q left no durable collection",
+				dirty[i].name,
+			)
+		}
+	}
+
+	for i := range dirty {
+		if err := t.validateWriteSet(
+			dirty[i].table.collection, dirty[i].name, dirty[i].state,
+		); err != nil {
+			return err
+		}
+	}
+
+	if len(dirty) == 1 {
+		return t.commitOneTable(dirty[0].name, dirty[0].table, dirty[0].state)
+	}
+	return t.commitManyTables(dirty)
+}
+
+func (t *tx) dirtyTableNames() []string {
+	names := make([]string, 0, len(t.tables))
+	for name, state := range t.tables {
+		if stateHasDirtyOverlay(state) {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+func stateHasDirtyOverlay(state *txTable) bool {
+	if state == nil || len(state.order) == 0 {
+		return false
+	}
+	for _, key := range state.order {
+		entry := state.pending[key]
+		if entry == nil {
+			continue
+		}
+		// INSERT+DELETE of a key absent at BEGIN is a net no-op and must not
+		// force a durable participant.
+		if !entry.existed && entry.remove {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (t *tx) commitOneTable(name string, table *table, state *txTable) error {
 	collection := table.collection
-	// Validate the write set against the currently committed state BEFORE
-	// staging the batch: Collection.Update holds the writer mutex across fn and
-	// Snapshot re-acquires it on the deferred-canonical lane, so a conflict
-	// check inside fn self-deadlocks. The whole commit runs under db.mu, which
-	// serializes every driver-mediated mutation, so a snapshot taken here
-	// observes all prior commits and nothing can interleave between check and
-	// apply.
-	if err := t.validateWriteSet(collection, state); err != nil {
-		return err
-	}
 	beforeGeneration := collection.Generation()
 	err := collection.Update(func(batch *durable.WriteBatch) error {
-		for _, key := range state.order {
-			entry := state.pending[key]
-			// INSERT followed by DELETE in one transaction is a net no-op for
-			// a key absent at BEGIN. Do not make another transaction conflict
-			// with an event that was never published.
-			if !entry.existed && entry.remove {
-				continue
-			}
-			if entry.remove {
-				if err := batch.Delete([]byte(key)); err != nil {
-					return transactionBatchError(err)
-				}
-			} else if err := batch.Put([]byte(key), entry.document); err != nil {
-				return transactionBatchError(err)
-			}
-		}
-		return nil
+		return fillWriteBatchFromTxTable(batch, state)
 	})
 	if collectionMutationPublished(collection, beforeGeneration, err) {
 		table.conflicts.recordTransaction(state)
@@ -1267,12 +1317,89 @@ func (t *tx) Commit() error {
 	return transactionBatchError(err)
 }
 
+func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
+	if t.conn.db.txnLog == nil {
+		return errors.New("vibedb: database transaction log is not open")
+	}
+	members := make([]durable.NamedCollection, 0, len(t.conn.db.tables))
+	for name, table := range t.conn.db.tables {
+		if table.collection == nil {
+			continue
+		}
+		members = append(members, durable.NamedCollection{
+			Name: name, Collection: table.collection,
+		})
+	}
+	slices.SortFunc(members, func(a, b durable.NamedCollection) int {
+		if a.Name < b.Name {
+			return -1
+		}
+		if a.Name > b.Name {
+			return 1
+		}
+		return 0
+	})
+	byName := make(map[string]*txTable, len(dirty))
+	for i := range dirty {
+		byName[dirty[i].name] = dirty[i].state
+	}
+	before := make(map[string]uint64, len(dirty))
+	for i := range dirty {
+		before[dirty[i].name] = dirty[i].table.collection.Generation()
+	}
+	err := durable.UpdateCollections(
+		t.conn.db.txnLog, members, t.conn.db.txnLimits,
+		func(batch *durable.DatabaseBatch) error {
+			for name, state := range byName {
+				wb, batchErr := batch.Collection(name)
+				if batchErr != nil {
+					return batchErr
+				}
+				if fillErr := fillWriteBatchFromTxTable(wb, state); fillErr != nil {
+					return fillErr
+				}
+			}
+			return nil
+		},
+	)
+	for i := range dirty {
+		name := dirty[i].name
+		collection := dirty[i].table.collection
+		if collectionMutationPublished(collection, before[name], err) {
+			dirty[i].table.conflicts.recordTransaction(dirty[i].state)
+		}
+	}
+	return transactionBatchError(err)
+}
+
+func fillWriteBatchFromTxTable(batch *durable.WriteBatch, state *txTable) error {
+	for _, key := range state.order {
+		entry := state.pending[key]
+		// INSERT followed by DELETE in one transaction is a net no-op for
+		// a key absent at BEGIN. Do not make another transaction conflict
+		// with an event that was never published.
+		if !entry.existed && entry.remove {
+			continue
+		}
+		if entry.remove {
+			if err := batch.Delete([]byte(key)); err != nil {
+				return transactionBatchError(err)
+			}
+		} else if err := batch.Put([]byte(key), entry.document); err != nil {
+			return transactionBatchError(err)
+		}
+	}
+	return nil
+}
+
 // validateWriteSet enforces optimistic-concurrency: every key the transaction
 // touched must still hold the value it held at BEGIN, otherwise a concurrent
 // commit changed it and this transaction must abort. It reads a fresh snapshot
 // of the currently committed state; the caller runs under db.mu, so that state
 // is stable for the duration of the check and the subsequent apply.
-func (t *tx) validateWriteSet(collection *durable.Collection, state *txTable) error {
+func (t *tx) validateWriteSet(
+	collection *durable.Collection, tableName string, state *txTable,
+) error {
 	live, err := collection.Snapshot()
 	if err != nil {
 		return err
@@ -1289,17 +1416,23 @@ func (t *tx) validateWriteSet(collection *durable.Collection, state *txTable) er
 		if found != entry.existed {
 			return fmt.Errorf(
 				"%w: table %q key %q changed after BEGIN",
-				ErrTransactionConflict, t.writeTable, key)
+				ErrTransactionConflict, tableName, key)
 		}
 	}
 	return nil
 }
 
 func transactionBatchError(err error) error {
-	if errors.Is(err, durable.ErrBatchTooLarge) {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, durable.ErrBatchTooLarge) ||
+		errors.Is(err, durable.ErrTxnTooLarge) ||
+		errors.Is(err, durable.ErrTxnLimitsRequired) {
 		return fmt.Errorf("%w: %w", ErrTransactionTooLarge, err)
 	}
-	if errors.Is(err, durable.ErrPrimaryBatchUnsupportedLane) {
+	if errors.Is(err, durable.ErrPrimaryBatchUnsupportedLane) ||
+		errors.Is(err, durable.ErrDatabaseTransactionUnsupportedLane) {
 		return fmt.Errorf("%w: %w", ErrTransactionUnsupportedLane, err)
 	}
 	return err
@@ -1335,7 +1468,7 @@ func (t *tx) finish() {
 	t.conn = nil
 	t.tables = nil
 	t.views = nil
-	t.writeTable = ""
+	t.savepoints = nil
 }
 
 func (t *tx) releaseSnapshots() {

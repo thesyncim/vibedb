@@ -829,3 +829,11 @@ type Operand struct {
 	Ordinal int
 	Pos     int
 }
+
+// A SavepointStmt names one transaction overlay mark. SAVEPOINT, RELEASE, and
+// ROLLBACK TO share this shape: each carries only the mark name and its byte
+// offset in the statement text.
+type SavepointStmt struct {
+	Name string
+	Pos  int
+}

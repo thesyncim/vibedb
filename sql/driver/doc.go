@@ -140,15 +140,23 @@
 // isolation, repeatable reads, phantom exclusion, and read-your-writes. Joins
 // execute the same BEGIN cut plus overlay under the relation and pair bounds.
 //
-// A transaction may read several tables and write exactly one. COMMIT applies
-// first-committer-wins through a bounded per-key publication clock: any write
-// to the same key after BEGIN conflicts, including change-and-restore (ABA),
-// without retaining a copy of the original document. Disjoint keys may commit
-// concurrently. All accepted changes then enter one durable WriteBatch;
-// ROLLBACK discards the overlay, and exact indexes participate in the same
-// batch. DDL is refused inside a transaction. If the bounded conflict history
-// overflows, transactions older than its new floor fail conservatively rather
-// than risk a missed conflict.
+// A transaction may read and write several tables. COMMIT validates every
+// dirty table under the catalog lock (incarnation, bounded first-committer-wins
+// conflict clock, write-set existence), materializes tables absent at BEGIN as
+// empty durable participants, then publishes: one dirty table through today's
+// Collection.Update path; two or more through durable.UpdateCollections against
+// the driver-owned decision log in <catalog>.tables/. Disjoint keys may commit
+// concurrently across tables. Write skew is possible under snapshot isolation:
+// the read set is not validated. An aborted or crashed transaction that wrote
+// to a table absent at BEGIN can leave that empty table behind as catalog
+// residue. SAVEPOINT / RELEASE / ROLLBACK TO manage a bounded overlay stack
+// (64 frames); ROLLBACK TO does not lower high-water admission accounting and
+// recovers a failed session to in-transaction state. DDL remains refused inside
+// a transaction. If the bounded conflict history overflows, transactions older
+// than its new floor fail conservatively rather than risk a missed conflict.
+// A multi-table COMMIT whose decision sync fails returns
+// durable.ErrCommitOutcomeUnknown: the unknown outcome is atomic across every
+// participating table, and further writes under the catalog refuse until reopen.
 //
 // Only default and database/sql snapshot isolation are accepted. Batch
 // document and byte bounds return ErrTransactionTooLarge wrapping

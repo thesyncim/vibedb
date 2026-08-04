@@ -465,6 +465,9 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 		s.views = &preparedViewState{ddl: ddl}
 		return s, nil
 	}
+	if isSavepointKind(tree.Kind) {
+		return s, nil
+	}
 	if err := c.validateViewStatementContext(ctx, src, tree); err != nil {
 		return nil, err
 	}

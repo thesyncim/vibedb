@@ -292,6 +292,69 @@ func (s *Session) Commit(ctx context.Context) error {
 	return err
 }
 
+// Savepoint records a named overlay mark in the active transaction.
+//
+// Valid only in SessionInTransaction. A failed transaction returns
+// ErrTransactionFailed so a wire adapter can map the outcome to SQLSTATE 25P02.
+func (s *Session) Savepoint(ctx context.Context, name string) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if s.state != SessionInTransaction || s.conn.tx == nil {
+		return ErrNoTransaction
+	}
+	return s.fail(s.conn.tx.savepoint(name))
+}
+
+// ReleaseSavepoint erases savepoint marks LIFO through name.
+//
+// Valid only in SessionInTransaction. A failed transaction returns
+// ErrTransactionFailed (SQLSTATE 25P02 at the wire layer).
+func (s *Session) ReleaseSavepoint(ctx context.Context, name string) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if s.state != SessionInTransaction || s.conn.tx == nil {
+		return ErrNoTransaction
+	}
+	return s.fail(s.conn.tx.releaseSavepoint(name))
+}
+
+// RollbackTo rewinds the transaction overlay to the named savepoint without
+// ending the transaction.
+//
+// Valid in SessionInTransaction and SessionFailedTransaction. Success from the
+// failed state recovers the session to SessionInTransaction — the property
+// client stacks rely on after a statement error.
+func (s *Session) RollbackTo(ctx context.Context, name string) error {
+	if err := s.live(); err != nil {
+		return err
+	}
+	if s.current != nil {
+		return ErrCursorOpen
+	}
+	if s.state != SessionInTransaction && s.state != SessionFailedTransaction {
+		return ErrNoTransaction
+	}
+	if s.conn.tx == nil {
+		return ErrNoTransaction
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		if s.state == SessionInTransaction {
+			s.state = SessionFailedTransaction
+		}
+		return err
+	}
+	if err := s.conn.tx.rollbackToSavepoint(name); err != nil {
+		if s.state == SessionInTransaction {
+			s.state = SessionFailedTransaction
+		}
+		return err
+	}
+	s.state = SessionInTransaction
+	return nil
+}
+
 // Rollback discards the current transaction and returns to SessionIdle.
 //
 // Cleanup is unconditional even when ctx is already canceled: Rollback is the

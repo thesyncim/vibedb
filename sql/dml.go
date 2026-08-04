@@ -42,6 +42,14 @@ const (
 	KindCreateView
 	// KindDropView is a DROP VIEW, carried in [Statement.DropView].
 	KindDropView
+	// KindSavepoint is SAVEPOINT name, carried in [Statement.Savepoint].
+	KindSavepoint
+	// KindReleaseSavepoint is RELEASE [SAVEPOINT] name, carried in
+	// [Statement.ReleaseSavepoint].
+	KindReleaseSavepoint
+	// KindRollbackToSavepoint is ROLLBACK TO [SAVEPOINT] name, carried in
+	// [Statement.RollbackToSavepoint].
+	KindRollbackToSavepoint
 )
 
 // String answers the statement's leading keyword.
@@ -67,6 +75,12 @@ func (k Kind) String() string {
 		return "CREATE VIEW"
 	case KindDropView:
 		return "DROP VIEW"
+	case KindSavepoint:
+		return "SAVEPOINT"
+	case KindReleaseSavepoint:
+		return "RELEASE"
+	case KindRollbackToSavepoint:
+		return "ROLLBACK TO"
 	}
 	return "SELECT"
 }
@@ -104,8 +118,11 @@ type Statement struct {
 	DropTable   *DropTableStmt
 	Truncate    *TruncateStmt
 	DropIndex   *DropIndexStmt
-	CreateView  *CreateViewStmt
-	DropView    *DropViewStmt
+	CreateView          *CreateViewStmt
+	DropView            *DropViewStmt
+	Savepoint           *SavepointStmt
+	ReleaseSavepoint    *SavepointStmt
+	RollbackToSavepoint *SavepointStmt
 }
 
 // ReturnsRows reports whether this parsed statement must execute through a
@@ -157,10 +174,13 @@ func (s *Statement) Params() int {
 	case KindDelete:
 		return s.Delete.Params
 	case KindCreateTable, KindCreateIndex, KindDropTable, KindTruncate, KindDropIndex,
-		KindCreateView, KindDropView:
+		KindCreateView, KindDropView,
+		KindSavepoint, KindReleaseSavepoint, KindRollbackToSavepoint:
 		// A DDL statement has no placeholders. A schema is not data: a type, a
 		// path, and a table name are all compiled into the definition when the
 		// statement is prepared, so there is nothing left for a bind to supply.
+		// Savepoint control statements likewise bind no parameters: the mark
+		// name is an identifier resolved when the statement is prepared.
 		return 0
 	}
 	if s.Select == nil {

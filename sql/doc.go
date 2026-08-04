@@ -34,7 +34,8 @@
 // literal.
 //
 //	statement    = explain | query-statement | insert | update | delete
-//	             | create-table | create-index ;
+//	             | create-table | create-index
+//	             | savepoint | release-savepoint | rollback-to-savepoint ;
 
 //	explain      = "EXPLAIN" [ "ANALYZE" ] query-statement ;
 //
@@ -119,6 +120,10 @@
 //
 //	create-index = "CREATE" "INDEX" [ "IF" "NOT" "EXISTS" ] [ name ]
 //	               "ON" name "(" path { "," path } ")" [ ";" ] EOF ;
+//
+//	savepoint            = "SAVEPOINT" name [ ";" ] EOF ;
+//	release-savepoint    = "RELEASE" [ "SAVEPOINT" ] name [ ";" ] EOF ;
+//	rollback-to-savepoint = "ROLLBACK" "TO" [ "SAVEPOINT" ] name [ ";" ] EOF ;
 //
 //	path         = name { "." name | "[" integer "]" | "[" string "]" } ;
 //	name         = ident | quoted-ident ;

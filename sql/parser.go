@@ -131,8 +131,11 @@ type Parser struct {
 	drop      DropTableStmt
 	truncate  TruncateStmt
 	dropIndex DropIndexStmt
-	view      CreateViewStmt
-	dropView  DropViewStmt
+	view             CreateViewStmt
+	dropView         DropViewStmt
+	savepoint        SavepointStmt
+	releaseSavepoint SavepointStmt
+	rollbackTo       SavepointStmt
 
 	// DML filters and RETURNING projections reuse the clause buffers below.
 	// These retained copies keep a filter's slice headers valid while a
