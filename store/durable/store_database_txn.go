@@ -437,6 +437,12 @@ func (l *TxnLog) commitMulti(
 		// T5 wires this at open; until then the coordinator sets it under the
 		// writer for every multi-collection participant.
 		c.journalCatalogOwned = true
+		// Upgrade legacy journals BEFORE staging: ensureConditionalJournalFormat
+		// cannot remint once a staged batch holds admitted frames over a
+		// non-empty legacy window.
+		if err := c.ensureConditionalJournalFormatLocked(); err != nil {
+			return err
+		}
 	}
 
 	staged := make([]stagedPrimaryBatch, len(order))

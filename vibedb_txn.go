@@ -522,19 +522,6 @@ func (t *Tx) commitSingleDurable(state *txCollectionState) error {
 }
 
 func (t *Tx) commitMultiDurable(dirty []*txCollectionState) error {
-	// Catalog-owned create currently mints a legacy journal header; the first
-	// multi-collection prepare needs the conditional format word. Flushing each
-	// dirty participant runs the bounded foreground checkpoint/recycle that
-	// remints at the conditional format while no staged batch is held — the
-	// same upgrade ensureConditionalJournalFormatLocked performs for an empty
-	// live window. Without this, a collection that already holds kind-3 records
-	// fails prepare with ErrConditionalPrepareUnsupportedJournal.
-	for _, state := range dirty {
-		coll := t.db.Collection(state.name)
-		if err := coll.Flush(); err != nil {
-			return err
-		}
-	}
 	return t.db.disk.Update(func(batch *durable.DatabaseBatch) error {
 		for _, state := range dirty {
 			wb, err := batch.Collection(state.name)

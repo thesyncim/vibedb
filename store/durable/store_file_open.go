@@ -214,15 +214,25 @@ func openCollection(
 			_ = collection.closeResources()
 			return nil, err
 		}
-		resolve, markerEpoch, resolveErr := collectionOpenResolver(
-			cfg, collection.storeID, root.JournalID, file.Name(),
-		)
-		if resolveErr != nil {
-			_ = collection.closeResources()
-			return nil, resolveErr
-		}
-		if err := collection.replayRecoveryJournalResolvedLocked(
-			root.Generation, resolve, markerEpoch,
+		// Catalog-owned opens thread an explicit resolver. Standalone Open
+		// goes through replayRecoveryJournalLocked so the test resolver hook
+		// (and nil-resolver ErrCollectionInDoubt) remain the single path.
+		if cfg.decisions != nil || cfg.absentLog {
+			resolve, markerEpoch, resolveErr := collectionOpenResolver(
+				cfg, collection.storeID, root.JournalID, file.Name(),
+			)
+			if resolveErr != nil {
+				_ = collection.closeResources()
+				return nil, resolveErr
+			}
+			if err := collection.replayRecoveryJournalResolvedLocked(
+				root.Generation, resolve, markerEpoch,
+			); err != nil {
+				_ = collection.closeResources()
+				return nil, err
+			}
+		} else if err := collection.replayRecoveryJournalLocked(
+			root.Generation,
 		); err != nil {
 			_ = collection.closeResources()
 			return nil, err

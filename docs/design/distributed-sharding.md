@@ -1552,12 +1552,12 @@ verified workflow. Mutable lookup indexes need either careful ordered locking
 with repair or a distributed transaction; they are not ordinary local exact
 indexes.
 
-The SQL layer currently provides snapshot isolation with first-committer-wins,
-writes exactly one table per transaction, and publishes that table's primary
-rows and exact-index postings in one local batch generation. Distribution does
-not upgrade those semantics to a multi-table or multi-shard atomic commit.
-Before any "shard-local ACID SQL" claim spans collections, a shard-group root
-or recoverable group transaction must close that remaining local boundary.
+The SQL layer currently provides snapshot isolation with first-committer-wins
+and crash-atomic multi-table commits inside one database (conditional journal
+records decided by one `txn.vtm` sync). Distribution does not upgrade those
+semantics to a multi-shard atomic commit. Cross-shard atomicity remains a
+separate track; see [multi-table-transactions.md](multi-table-transactions.md)
+for the local contract and its named follow-ups.
 
 ## Bounded resources and backpressure
 
