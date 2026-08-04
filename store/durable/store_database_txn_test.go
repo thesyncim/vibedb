@@ -509,6 +509,18 @@ func TestDatabaseTxnStageUnwind(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
+	// Remint at the conditional format before capturing the baseline: the
+	// coordinator upgrades legacy journals before staging, and that remint is
+	// durable even when a later stage failure unwinds admitted frames.
+	for _, coll := range []*Collection{a.Collection, b.Collection, c.Collection} {
+		coll.writer.Lock()
+		coll.journalCatalogOwned = true
+		if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
+			coll.writer.Unlock()
+			t.Fatalf("upgrade: %v", err)
+		}
+		coll.writer.Unlock()
+	}
 	before := [][]byte{
 		journalBytes(t, a.Collection),
 		journalBytes(t, b.Collection),

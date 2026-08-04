@@ -1,9 +1,9 @@
 # Multi-table transactions
 
-**Status:** designed; not implemented. Projected behavior remains unclaimed
-until its named tests pass. The staged delivery plan and executor task specs
-live outside the repository; this document is the design authority they
-implement.
+**Status:** implemented on `feat/txn-multitable`. Projected behavior remains
+unclaimed until its named tests pass in CI. The staged delivery plan and
+executor task specs live outside the repository; this document is the design
+authority they implement.
 
 ## Purpose
 
