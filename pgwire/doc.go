@@ -106,8 +106,11 @@
 //     capture is a bare ASCII identifier of at most 128 bytes; \df,
 //     \du, and \dv are recognized and honestly empty.
 //   - Explicit BEGIN/COMMIT/ROLLBACK with ReadyForQuery I/T/E state,
-//     read-your-writes, rollback, failed-transaction behavior, read-only mode,
-//     and implicit atomic batches for non-DDL stored-row statements.
+//     SAVEPOINT / RELEASE / ROLLBACK TO (including recovery from a failed
+//     transaction back to status T), multi-table writes in explicit and
+//     implicit transactions, read-your-writes, rollback, failed-transaction
+//     behavior, read-only mode, and implicit atomic batches for non-DDL
+//     stored-row statements.
 //
 // # What does not work
 //
@@ -119,9 +122,9 @@
 //     Extended DDL publishes at Execute; if a client violates that boundary by
 //     executing a later command before Sync, the later command is refused but
 //     cannot retroactively roll back the completed DDL.
-//   - Savepoints, chained transactions, two-table writes, and isolation modes
-//     other than the runtime's REPEATABLE READ snapshot. Read-only and
-//     read-write transaction access modes are supported.
+//   - Chained transactions (COMMIT AND CHAIN / ROLLBACK AND CHAIN) and
+//     isolation modes other than the runtime's REPEATABLE READ snapshot.
+//     Read-only and read-write transaction access modes are supported.
 //   - pg_catalog and information_schema as queryable tables. There are no
 //     catalog tables; see above. psql's basic meta-commands (\l, \dn, \dt,
 //     \di, \d, \d name) are answered by the recognition shim against a

@@ -693,7 +693,7 @@ func (s *session) beforeExtendedExecute(stmt *prepared) error {
 		s.extendedSessionChange = true
 		return nil
 	}
-	if stmt.kind == kindBegin || stmt.kind == kindCommit || stmt.kind == kindRollback {
+	if isTransactionCommandKind(stmt.kind) {
 		if s.extendedDDL || s.extendedSessionChange {
 			return newError(sqlstateFeatureNotSupported,
 				"transaction control cannot share a batch with DDL or session-parameter changes")

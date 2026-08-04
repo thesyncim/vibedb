@@ -155,6 +155,8 @@ type prepared struct {
 	tag string
 	// txReadOnly is the one BEGIN mode the runtime needs to carry.
 	txReadOnly bool
+	// savepointName is the mark named by SAVEPOINT, RELEASE, or ROLLBACK TO.
+	savepointName string
 	// paramOIDs are the parameter types the client declared in Parse. They are
 	// hints this server did not ask for and does not require, and are used only
 	// to disambiguate a bound value; see bindValue.
@@ -920,6 +922,11 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 			txCount++
 			terminalCount++
 			terminalAt = count
+		case kindSavepoint, kindReleaseSavepoint, kindRollbackToSavepoint:
+			// Savepoint commands are non-terminal members of a transaction
+			// block: they may appear between BEGIN and a final COMMIT/ROLLBACK,
+			// including ROLLBACK TO recovering a failed transaction mid-batch.
+			txCount++
 		}
 	}
 	if count <= 1 {
@@ -1051,6 +1058,25 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		}
 		return p, nil
 
+	case kindSavepoint, kindReleaseSavepoint, kindRollbackToSavepoint:
+		name, err := parseSavepointCommandCancelable(
+			text, kind, s.cancelCheck,
+		)
+		if err != nil {
+			return nil, asPGErrorIn(err, text)
+		}
+		p.savepointName = name
+		switch kind {
+		case kindSavepoint:
+			p.tag = "SAVEPOINT"
+		case kindReleaseSavepoint:
+			p.tag = "RELEASE"
+		case kindRollbackToSavepoint:
+			// PostgreSQL reports ROLLBACK for ROLLBACK TO SAVEPOINT.
+			p.tag = "ROLLBACK"
+		}
+		return p, nil
+
 	case kindUnknown:
 		if reason != "" {
 			return nil, newError(sqlstateSyntaxError, reason)
@@ -1058,7 +1084,7 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		return nil, newError(sqlstateSyntaxError,
 			"this statement does not begin with a keyword this server recognizes").
 			withHint("the SQL surface is SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, " +
-				"CREATE INDEX, transactions, SET, RESET, SHOW, and DISCARD")
+				"CREATE INDEX, transactions, savepoints, SET, RESET, SHOW, and DISCARD")
 
 	case kindSet, kindReset:
 		var cmd setCommand
@@ -1268,7 +1294,8 @@ func sortRowsByFirstColumn(rows [][]*string) {
 func (s *session) execute(p *portal, limit int32) error {
 	stmt := p.stmt
 	if s.sql != nil && s.sql.State() == sqldriver.SessionFailedTransaction &&
-		stmt.kind != kindCommit && stmt.kind != kindRollback {
+		stmt.kind != kindCommit && stmt.kind != kindRollback &&
+		stmt.kind != kindRollbackToSavepoint {
 		return asPGError(sqldriver.ErrTransactionFailed)
 	}
 	if s.takeCancel() {
@@ -1310,6 +1337,9 @@ func (s *session) execute(p *portal, limit int32) error {
 
 	case stmt.kind == kindBegin || stmt.kind == kindCommit || stmt.kind == kindRollback:
 		return s.executeTransaction(stmt)
+
+	case isSavepointCommandKind(stmt.kind):
+		return s.executeSavepoint(stmt)
 
 	case stmt.runtime != nil && stmt.runtime.ReturnsRows():
 		return s.executeRuntimeQuery(p, limit)
@@ -1357,6 +1387,35 @@ func (s *session) executeTransaction(stmt *prepared) error {
 		return queryCanceled()
 	}
 	s.w.commandComplete(tag)
+	return nil
+}
+
+func (s *session) executeSavepoint(stmt *prepared) error {
+	if s.takeCancel() {
+		return queryCanceled()
+	}
+	// Clone the mark name before it escapes into the typed session: simple
+	// Query text is a view into the reader's reused body buffer, and the
+	// savepoint stack must outlive that message.
+	name := strings.Clone(stmt.savepointName)
+	var err error
+	switch stmt.kind {
+	case kindSavepoint:
+		err = s.sql.Savepoint(context.Background(), name)
+	case kindReleaseSavepoint:
+		err = s.sql.ReleaseSavepoint(context.Background(), name)
+	case kindRollbackToSavepoint:
+		// ROLLBACK TO recovers SessionFailedTransaction to SessionInTransaction
+		// at the runtime; ReadyForQuery then reports T rather than E.
+		err = s.sql.RollbackTo(context.Background(), name)
+	default:
+		return newError(sqlstateInternalError, "invalid savepoint command kind")
+	}
+	_ = s.takeCancel()
+	if err != nil {
+		return asPGErrorIn(err, stmt.sql)
+	}
+	s.w.commandComplete(stmt.tag)
 	return nil
 }
 

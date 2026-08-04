@@ -53,6 +53,13 @@ const (
 	kindBegin
 	kindCommit
 	kindRollback
+	// kindSavepoint is SAVEPOINT name.
+	kindSavepoint
+	// kindReleaseSavepoint is RELEASE [SAVEPOINT] name.
+	kindReleaseSavepoint
+	// kindRollbackToSavepoint is ROLLBACK TO [SAVEPOINT] name. It is distinct
+	// from kindRollback so a failed transaction can recover without ending.
+	kindRollbackToSavepoint
 	// kindEmpty is a statement with no tokens: whitespace, comments, or a bare
 	// semicolon. The protocol has its own reply for it.
 	kindEmpty
@@ -82,9 +89,6 @@ var unsupportedStatements = map[string]string{
 	"REINDEX": "storage maintenance is the owning application's, not a client's",
 	"CLUSTER": "storage maintenance is the owning application's, not a client's",
 	"REFRESH": "there are no materialized views",
-
-	"SAVEPOINT": "savepoints are not supported: the runtime owns one bounded transaction overlay",
-	"RELEASE":   "savepoints are not supported, so there is no savepoint to release",
 
 	"PREPARE":    "SQL-level PREPARE is not supported: use the extended query protocol's Parse message, which every client library exposes",
 	"EXECUTE":    "SQL-level EXECUTE is not supported: use the extended query protocol's Bind and Execute messages",
@@ -147,8 +151,20 @@ func classifyCancelable(
 		return kindBegin, "", nil
 	case strings.EqualFold(word, "COMMIT"), strings.EqualFold(word, "END"):
 		return kindCommit, "", nil
-	case strings.EqualFold(word, "ROLLBACK"), strings.EqualFold(word, "ABORT"):
+	case strings.EqualFold(word, "ABORT"):
 		return kindRollback, "", nil
+	case strings.EqualFold(word, "ROLLBACK"):
+		// ROLLBACK TO is a savepoint command, not a transaction-ending
+		// ROLLBACK. Peek before committing the kind so chained-transaction
+		// and bare-ROLLBACK parsing stay on the terminal path.
+		if strings.EqualFold(s.peekWord(), "TO") {
+			return kindRollbackToSavepoint, "", nil
+		}
+		return kindRollback, "", nil
+	case strings.EqualFold(word, "SAVEPOINT"):
+		return kindSavepoint, "", nil
+	case strings.EqualFold(word, "RELEASE"):
+		return kindReleaseSavepoint, "", nil
 	case strings.EqualFold(word, "SET"):
 		return kindSet, "", nil
 	case strings.EqualFold(word, "RESET"):
@@ -258,10 +274,98 @@ func parseTransactionCommandCancelable(
 		return false, newError(sqlstateInternalError, "invalid transaction command kind")
 	}
 	if !s.atEnd() {
+		// SAVEPOINT / RELEASE / ROLLBACK TO are classified separately. What
+		// remains here is AND CHAIN and other trailing modes this server
+		// refuses rather than silently ignore.
 		return false, newError(sqlstateFeatureNotSupported,
-			"transaction modes, savepoints, and chained transactions are not supported")
+			"chained transactions and additional transaction modes are not supported")
 	}
 	return false, nil
+}
+
+// parseSavepointCommandCancelable admits SAVEPOINT, RELEASE [SAVEPOINT], and
+// ROLLBACK TO [SAVEPOINT] name. The name is a bare identifier; quoted names
+// and parameters are outside this surface.
+func parseSavepointCommandCancelable(
+	src string,
+	kind statementKind,
+	check func() error,
+) (nameResult string, err error) {
+	s := newScanner(src, check)
+	defer func() {
+		if s.cancelErr != nil {
+			nameResult = ""
+			err = s.cancelErr
+		}
+	}()
+	switch kind {
+	case kindSavepoint:
+		if !strings.EqualFold(s.word(), "SAVEPOINT") {
+			return "", newError(sqlstateSyntaxError, "expected SAVEPOINT")
+		}
+		name := s.word()
+		if name == "" {
+			return "", newError(sqlstateSyntaxError, "SAVEPOINT requires a name")
+		}
+		if !s.atEnd() {
+			return "", newError(sqlstateSyntaxError, "malformed SAVEPOINT command")
+		}
+		return name, nil
+	case kindReleaseSavepoint:
+		if !strings.EqualFold(s.word(), "RELEASE") {
+			return "", newError(sqlstateSyntaxError, "expected RELEASE")
+		}
+		if strings.EqualFold(s.peekWord(), "SAVEPOINT") {
+			s.word()
+		}
+		name := s.word()
+		if name == "" {
+			return "", newError(sqlstateSyntaxError, "RELEASE requires a savepoint name")
+		}
+		if !s.atEnd() {
+			return "", newError(sqlstateSyntaxError, "malformed RELEASE command")
+		}
+		return name, nil
+	case kindRollbackToSavepoint:
+		if !strings.EqualFold(s.word(), "ROLLBACK") {
+			return "", newError(sqlstateSyntaxError, "expected ROLLBACK")
+		}
+		if !strings.EqualFold(s.word(), "TO") {
+			return "", newError(sqlstateSyntaxError, "ROLLBACK TO requires TO")
+		}
+		if strings.EqualFold(s.peekWord(), "SAVEPOINT") {
+			s.word()
+		}
+		name := s.word()
+		if name == "" {
+			return "", newError(sqlstateSyntaxError, "ROLLBACK TO requires a savepoint name")
+		}
+		if !s.atEnd() {
+			return "", newError(sqlstateSyntaxError, "malformed ROLLBACK TO command")
+		}
+		return name, nil
+	default:
+		return "", newError(sqlstateInternalError, "invalid savepoint command kind")
+	}
+}
+
+func isSavepointCommandKind(kind statementKind) bool {
+	switch kind {
+	case kindSavepoint, kindReleaseSavepoint, kindRollbackToSavepoint:
+		return true
+	default:
+		return false
+	}
+}
+
+func isTransactionCommandKind(kind statementKind) bool {
+	switch kind {
+	case kindBegin, kindCommit, kindRollback,
+		kindSavepoint, kindReleaseSavepoint, kindRollbackToSavepoint:
+		return true
+	default:
+		return false
+	}
 }
 
 const protocolCancelByteInterval = 4 << 10
