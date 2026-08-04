@@ -210,9 +210,14 @@ func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
+	// BufferSize must cover the largest allocated extent below. Hosts with a
+	// 4 KiB OS page (GitHub's linux runners) used to set BufferSize to only
+	// 2*PageSize via max(Getpagesize(), 2*PageSize), so the compact 3*PageSize
+	// leaf allocation failed with ErrTooManyPages even though MaxPagesPerBatch
+	// still had room.
 	committer, err := NewCommitter(file, DeviceOptions{
 		Backend: BackendPortable, BufferCount: 12,
-		BufferSize: max(os.Getpagesize(), 2*int(testSuperblockPageSize)),
+		BufferSize: max(os.Getpagesize(), 3*int(testSuperblockPageSize)),
 	}, CommitterOptions{
 		QueueSlots: 4, MaxPagesPerBatch: 8, GroupLimit: 2,
 	})

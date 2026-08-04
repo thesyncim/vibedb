@@ -75,10 +75,16 @@ func TestPrimaryBatchPhaseSplitByteIdenticalFrozenContract(t *testing.T) {
 			// Capture journal before Close: Close checkpoints and recycles, so
 			// the post-Close sibling no longer holds the Update's kind-3 record.
 			afterJournal, afterStore := readStoreJournalOptional(t, path)
-			if bytes.Equal(beforeStore, afterStore) {
-				t.Fatal("store bytes unchanged after Update")
-			}
-			if lane.name != "buffered" {
+			// Primary batch leaves admit as memory-only buffered dirty frames;
+			// journaled lanes fence durability in the sibling journal, so the
+			// store image may be byte-identical until a later checkpoint/Flush
+			// when allocation reuses existing free extents instead of growing
+			// the file. Buffered Flush forces materialization and must dirty it.
+			if lane.name == "buffered" {
+				if bytes.Equal(beforeStore, afterStore) {
+					t.Fatal("store bytes unchanged after Flush")
+				}
+			} else {
 				if bytes.Equal(beforeJournal, afterJournal) {
 					t.Fatal("journal bytes unchanged after Update")
 				}
