@@ -15,22 +15,28 @@ import (
 // TestDatabaseSQLCapabilityMatrix executes every database/sql row in the
 // shared public manifest against a pre-materialized table. That detail keeps
 // initial temporary-file publication from masquerading as steady-state batch
-// support. Keys and operations are real nested subtests, each with a fresh
-// catalog and persistence lifecycle.
+// support. Tables, keys, and operations are real nested subtests, each with a
+// fresh catalog and persistence lifecycle.
 func TestDatabaseSQLCapabilityMatrix(t *testing.T) {
 	for _, capability := range conformance.CasesFor(conformance.DatabaseSQL) {
 		capability := capability
 		t.Run(capability.ID, func(t *testing.T) {
-			for _, keys := range capability.Keys {
-				keys := keys
-				t.Run(string(keys), func(t *testing.T) {
-					for _, operation := range capability.Operations {
-						operation := operation
-						t.Run(string(operation), func(t *testing.T) {
-							scenario := capability
-							scenario.Keys = []conformance.Keys{keys}
-							scenario.Operations = []conformance.Operation{operation}
-							runDatabaseSQLCapability(t, scenario)
+			for _, tables := range capability.Tables {
+				tables := tables
+				t.Run(string(tables), func(t *testing.T) {
+					for _, keys := range capability.Keys {
+						keys := keys
+						t.Run(string(keys), func(t *testing.T) {
+							for _, operation := range capability.Operations {
+								operation := operation
+								t.Run(string(operation), func(t *testing.T) {
+									scenario := capability
+									scenario.Tables = []conformance.Tables{tables}
+									scenario.Keys = []conformance.Keys{keys}
+									scenario.Operations = []conformance.Operation{operation}
+									runDatabaseSQLCapability(t, scenario)
+								})
+							}
 						})
 					}
 				})
@@ -46,37 +52,46 @@ func runDatabaseSQLCapability(t *testing.T, capability conformance.Case) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`
-				CREATE TABLE docs (
+	multi := len(capability.Tables) == 1 && capability.Tables[0] == conformance.MultipleTables
+	for _, table := range sqlCapabilityTables(multi) {
+		if _, err := db.Exec(fmt.Sprintf(`
+				CREATE TABLE %s (
 					id STRING PRIMARY KEY,
 					grp STRING NOT NULL,
 					n INTEGER NOT NULL
-				)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(
-		`INSERT INTO docs VALUES (?), (?), (?), (?)`,
-		sqlCapabilityDoc("a", "old", 1),
-		sqlCapabilityDoc("b", "old", 2),
-		sqlCapabilityDoc("c", "multi-delete", 3),
-		sqlCapabilityDoc("d", "multi-delete", 4),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if capability.Indexing == conformance.Indexed {
-		if _, err := db.Exec(`CREATE INDEX by_grp ON docs(grp)`); err != nil {
+				)`, table)); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			fmt.Sprintf(`INSERT INTO %s VALUES (?), (?), (?), (?)`, table),
+			sqlCapabilityDoc("a", "old", 1),
+			sqlCapabilityDoc("b", "old", 2),
+			sqlCapabilityDoc("c", "multi-delete", 3),
+			sqlCapabilityDoc("d", "multi-delete", 4),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if capability.Indexing == conformance.Indexed {
+			if _, err := db.Exec(
+				fmt.Sprintf(`CREATE INDEX by_grp_%s ON %s(grp)`, table, table),
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
 	if capability.Result == conformance.DocumentedError {
 		assertDatabaseSQLDocumentedError(t, db, capability)
+	} else if capability.Transaction == conformance.Savepoints {
+		applyDatabaseSQLSavepoint(t, db, multi)
 	} else {
-		applyDatabaseSQLCapability(t, db, capability)
-		assertDatabaseSQLRollback(t, db, capability.Transaction)
+		applyDatabaseSQLCapability(t, db, capability, multi)
+		assertDatabaseSQLRollback(t, db, capability.Transaction, multi)
 	}
-	assertDatabaseSQLIndexOracle(t, db)
-	want := databaseSQLContent(t, db)
+	for _, table := range sqlCapabilityTables(multi) {
+		assertDatabaseSQLIndexOracle(t, db, table)
+	}
+	want := databaseSQLAllContent(t, db, multi)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -86,10 +101,19 @@ func runDatabaseSQLCapability(t *testing.T, capability conformance.Case) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if got := databaseSQLContent(t, db); !sqlCapabilityMapsEqual(got, want) {
+	if got := databaseSQLAllContent(t, db, multi); !sqlCapabilityAllEqual(got, want) {
 		t.Fatalf("reopened content = %v, want %v", got, want)
 	}
-	assertDatabaseSQLIndexOracle(t, db)
+	for _, table := range sqlCapabilityTables(multi) {
+		assertDatabaseSQLIndexOracle(t, db, table)
+	}
+}
+
+func sqlCapabilityTables(multi bool) []string {
+	if multi {
+		return []string{"docs", "extras"}
+	}
+	return []string{"docs"}
 }
 
 func assertDatabaseSQLDocumentedError(
@@ -99,7 +123,7 @@ func assertDatabaseSQLDocumentedError(
 	if len(capability.Operations) != 1 {
 		t.Fatalf("documented-error case has operations %v, want one", capability.Operations)
 	}
-	want := databaseSQLContent(t, db)
+	want := databaseSQLContent(t, db, "docs")
 	var err error
 	switch capability.Operations[0] {
 	case conformance.Update:
@@ -122,7 +146,7 @@ func assertDatabaseSQLDocumentedError(
 	default:
 		t.Fatalf("unsupported documented-error operation %q", capability.Operations[0])
 	}
-	if got := databaseSQLContent(t, db); !sqlCapabilityMapsEqual(got, want) {
+	if got := databaseSQLContent(t, db, "docs"); !sqlCapabilityMapsEqual(got, want) {
 		t.Fatalf("documented error changed content = %v, want %v", got, want)
 	}
 	// A capability refusal must not poison the connection or collection.
@@ -133,13 +157,13 @@ func assertDatabaseSQLDocumentedError(
 	if _, err := db.Exec(`DELETE FROM docs WHERE id = ?`, "after-error"); err != nil {
 		t.Fatalf("cleanup after documented error: %v", err)
 	}
-	if got := databaseSQLContent(t, db); !sqlCapabilityMapsEqual(got, want) {
+	if got := databaseSQLContent(t, db, "docs"); !sqlCapabilityMapsEqual(got, want) {
 		t.Fatalf("post-error usability probe changed content = %v, want %v", got, want)
 	}
 }
 
 func applyDatabaseSQLCapability(
-	t *testing.T, db *sql.DB, capability conformance.Case,
+	t *testing.T, db *sql.DB, capability conformance.Case, multi bool,
 ) {
 	t.Helper()
 	if len(capability.Operations) != 1 || len(capability.Keys) != 1 {
@@ -148,45 +172,7 @@ func applyDatabaseSQLCapability(
 	operation := capability.Operations[0]
 	keys := capability.Keys[0]
 	if capability.Transaction == conformance.Autocommit {
-		if keys == conformance.OneKey {
-			switch operation {
-			case conformance.Insert:
-				if _, err := db.Exec(`INSERT INTO docs VALUES (?)`,
-					sqlCapabilityDoc("auto-one", "inserted", 10)); err != nil {
-					t.Fatal(err)
-				}
-			case conformance.Update:
-				if _, err := db.Exec(
-					`UPDATE docs SET "$doc" = ? WHERE id = ?`,
-					sqlCapabilityDoc("a", "updated", 11), "a",
-				); err != nil {
-					t.Fatal(err)
-				}
-			case conformance.Delete:
-				if _, err := db.Exec(`DELETE FROM docs WHERE id = ?`, "c"); err != nil {
-					t.Fatal(err)
-				}
-			default:
-				t.Fatalf("unsupported autocommit one-key operation %q", operation)
-			}
-			return
-		}
-		switch operation {
-		case conformance.Insert:
-			if _, err := db.Exec(
-				`INSERT INTO docs VALUES (?), (?)`,
-				sqlCapabilityDoc("auto-a", "inserted", 20),
-				sqlCapabilityDoc("auto-b", "inserted", 21),
-			); err != nil {
-				t.Fatal(err)
-			}
-		case conformance.Delete:
-			if _, err := db.Exec(`DELETE FROM docs WHERE grp = ?`, "multi-delete"); err != nil {
-				t.Fatal(err)
-			}
-		default:
-			t.Fatalf("unsupported autocommit multi-key operation %q", operation)
-		}
+		applyDatabaseSQLAutocommit(t, db, "docs", keys, operation)
 		return
 	}
 
@@ -194,104 +180,247 @@ func applyDatabaseSQLCapability(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if keys == conformance.OneKey {
-		switch operation {
-		case conformance.Insert:
-			if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`,
-				sqlCapabilityDoc("tx-one", "inserted", 30)); err != nil {
-				t.Fatal(err)
-			}
-		case conformance.Update:
-			if _, err := tx.Exec(
-				`UPDATE docs SET "$doc" = ? WHERE id = ?`,
-				sqlCapabilityDoc("a", "updated", 31), "a",
-			); err != nil {
-				t.Fatal(err)
-			}
-		case conformance.Delete:
-			if _, err := tx.Exec(`DELETE FROM docs WHERE id = ?`, "c"); err != nil {
-				t.Fatal(err)
-			}
-		case conformance.Mixed:
-			if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`,
-				sqlCapabilityDoc("tx-one", "before", 32)); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := tx.Exec(
-				`UPDATE docs SET "$doc" = ? WHERE id = ?`,
-				sqlCapabilityDoc("tx-one", "updated", 33), "tx-one",
-			); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := tx.Exec(`DELETE FROM docs WHERE id = ?`, "tx-one"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`,
-				sqlCapabilityDoc("tx-one", "mixed-final", 34)); err != nil {
-				t.Fatal(err)
-			}
-		default:
-			t.Fatalf("unsupported transaction one-key operation %q", operation)
-		}
-	} else {
-		switch operation {
-		case conformance.Insert:
-			if _, err := tx.Exec(
-				`INSERT INTO docs VALUES (?), (?)`,
-				sqlCapabilityDoc("tx-a", "inserted", 40),
-				sqlCapabilityDoc("tx-b", "inserted", 41),
-			); err != nil {
-				t.Fatal(err)
-			}
-		case conformance.Update:
-			for _, key := range []string{"a", "b"} {
-				if _, err := tx.Exec(
-					`UPDATE docs SET "$doc" = ? WHERE id = ?`,
-					sqlCapabilityDoc(key, "updated", 42), key,
-				); err != nil {
-					t.Fatal(err)
-				}
-			}
-		case conformance.Delete:
-			if _, err := tx.Exec(`DELETE FROM docs WHERE grp = ?`, "multi-delete"); err != nil {
-				t.Fatal(err)
-			}
-		case conformance.Mixed:
-			if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`,
-				sqlCapabilityDoc("mixed", "inserted", 43)); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := tx.Exec(
-				`UPDATE docs SET "$doc" = ? WHERE id = ?`,
-				sqlCapabilityDoc("a", "mixed-update", 44), "a",
-			); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := tx.Exec(`DELETE FROM docs WHERE id = ?`, "c"); err != nil {
-				t.Fatal(err)
-			}
-		default:
-			t.Fatalf("unsupported transaction multi-key operation %q", operation)
-		}
+	applyDatabaseSQLTx(t, tx, "docs", keys, operation)
+	if multi {
+		applyDatabaseSQLTx(t, tx, "extras", keys, operation)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func assertDatabaseSQLRollback(
-	t *testing.T, db *sql.DB, transaction conformance.Transaction,
+func applyDatabaseSQLAutocommit(
+	t *testing.T, db *sql.DB, table string,
+	keys conformance.Keys, operation conformance.Operation,
 ) {
 	t.Helper()
-	want := databaseSQLContent(t, db)
+	if keys == conformance.OneKey {
+		switch operation {
+		case conformance.Insert:
+			if _, err := db.Exec(
+				fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+				sqlCapabilityDoc("auto-one", "inserted", 10),
+			); err != nil {
+				t.Fatal(err)
+			}
+		case conformance.Update:
+			if _, err := db.Exec(
+				fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+				sqlCapabilityDoc("a", "updated", 11), "a",
+			); err != nil {
+				t.Fatal(err)
+			}
+		case conformance.Delete:
+			if _, err := db.Exec(
+				fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, table), "c",
+			); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unsupported autocommit one-key operation %q", operation)
+		}
+		return
+	}
+	switch operation {
+	case conformance.Insert:
+		if _, err := db.Exec(
+			fmt.Sprintf(`INSERT INTO %s VALUES (?), (?)`, table),
+			sqlCapabilityDoc("auto-a", "inserted", 20),
+			sqlCapabilityDoc("auto-b", "inserted", 21),
+		); err != nil {
+			t.Fatal(err)
+		}
+	case conformance.Delete:
+		if _, err := db.Exec(
+			fmt.Sprintf(`DELETE FROM %s WHERE grp = ?`, table), "multi-delete",
+		); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unsupported autocommit multi-key operation %q", operation)
+	}
+}
+
+func applyDatabaseSQLTx(
+	t *testing.T, tx *sql.Tx, table string,
+	keys conformance.Keys, operation conformance.Operation,
+) {
+	t.Helper()
+	if keys == conformance.OneKey {
+		switch operation {
+		case conformance.Insert:
+			if _, err := tx.Exec(
+				fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+				sqlCapabilityDoc("tx-one", "inserted", 30),
+			); err != nil {
+				t.Fatal(err)
+			}
+		case conformance.Update:
+			if _, err := tx.Exec(
+				fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+				sqlCapabilityDoc("a", "updated", 31), "a",
+			); err != nil {
+				t.Fatal(err)
+			}
+		case conformance.Delete:
+			if _, err := tx.Exec(
+				fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, table), "c",
+			); err != nil {
+				t.Fatal(err)
+			}
+		case conformance.Mixed:
+			if _, err := tx.Exec(
+				fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+				sqlCapabilityDoc("tx-one", "before", 32),
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(
+				fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+				sqlCapabilityDoc("tx-one", "updated", 33), "tx-one",
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(
+				fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, table), "tx-one",
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(
+				fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+				sqlCapabilityDoc("tx-one", "mixed-final", 34),
+			); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unsupported transaction one-key operation %q", operation)
+		}
+		return
+	}
+	switch operation {
+	case conformance.Insert:
+		if _, err := tx.Exec(
+			fmt.Sprintf(`INSERT INTO %s VALUES (?), (?)`, table),
+			sqlCapabilityDoc("tx-a", "inserted", 40),
+			sqlCapabilityDoc("tx-b", "inserted", 41),
+		); err != nil {
+			t.Fatal(err)
+		}
+	case conformance.Update:
+		for _, key := range []string{"a", "b"} {
+			if _, err := tx.Exec(
+				fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+				sqlCapabilityDoc(key, "updated", 42), key,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+	case conformance.Delete:
+		if _, err := tx.Exec(
+			fmt.Sprintf(`DELETE FROM %s WHERE grp = ?`, table), "multi-delete",
+		); err != nil {
+			t.Fatal(err)
+		}
+	case conformance.Mixed:
+		if _, err := tx.Exec(
+			fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+			sqlCapabilityDoc("mixed", "inserted", 43),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(
+			fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+			sqlCapabilityDoc("a", "mixed-update", 44), "a",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(
+			fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, table), "c",
+		); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unsupported transaction multi-key operation %q", operation)
+	}
+}
+
+func applyDatabaseSQLSavepoint(t *testing.T, db *sql.DB, multi bool) {
+	t.Helper()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SAVEPOINT s1`); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range sqlCapabilityTables(multi) {
+		if _, err := tx.Exec(
+			fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+			sqlCapabilityDoc("a", "s1", 50), "a",
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`SAVEPOINT s2`); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range sqlCapabilityTables(multi) {
+		if _, err := tx.Exec(
+			fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, table), "a",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(
+			fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+			sqlCapabilityDoc("a", "s2", 51),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`ROLLBACK TO s1`); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range sqlCapabilityTables(multi) {
+		var got string
+		if err := tx.QueryRow(
+			fmt.Sprintf(`SELECT grp FROM %s WHERE id = ?`, table), "a",
+		).Scan(&got); err != nil || got != "old" {
+			t.Fatalf("%s after ROLLBACK TO s1 grp = %q err=%v, want old", table, got, err)
+		}
+	}
+	if _, err := tx.Exec(`RELEASE s1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range sqlCapabilityTables(multi) {
+		var got string
+		if err := db.QueryRow(
+			fmt.Sprintf(`SELECT grp FROM %s WHERE id = ?`, table), "a",
+		).Scan(&got); err != nil || got != "old" {
+			t.Fatalf("%s after savepoint commit grp = %q err=%v, want old", table, got, err)
+		}
+	}
+}
+
+func assertDatabaseSQLRollback(
+	t *testing.T, db *sql.DB, transaction conformance.Transaction, multi bool,
+) {
+	t.Helper()
+	want := databaseSQLAllContent(t, db, multi)
 	if transaction == conformance.Explicit {
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`,
-			sqlCapabilityDoc("rolled", "rollback", 90)); err != nil {
-			t.Fatal(err)
+		for _, table := range sqlCapabilityTables(multi) {
+			if _, err := tx.Exec(
+				fmt.Sprintf(`INSERT INTO %s VALUES (?)`, table),
+				sqlCapabilityDoc("rolled", "rollback", 90),
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
 		// The first row of this sibling statement is valid, but the second
 		// duplicates the BEGIN snapshot. The statement must reject without
@@ -319,23 +448,28 @@ func assertDatabaseSQLRollback(
 		if err := tx.Rollback(); err != nil {
 			t.Fatal(err)
 		}
-		if got := databaseSQLContent(t, db); !sqlCapabilityMapsEqual(got, want) {
+		if got := databaseSQLAllContent(t, db, multi); !sqlCapabilityAllEqual(got, want) {
 			t.Fatalf("rejected-sibling rollback content = %v, want %v", got, want)
 		}
-		assertDatabaseSQLIndexOracle(t, db)
+		for _, table := range sqlCapabilityTables(multi) {
+			assertDatabaseSQLIndexOracle(t, db, table)
+		}
 
 		// A real COMMIT rejection is the second rollback proof. A competing
 		// autocommit changes the same key after BEGIN; first-committer-wins must
-		// reject the staged transaction and leave exactly the competing cut.
+		// reject the staged transaction and leave exactly the competing cut on
+		// every participant.
 		conflicted, err := db.Begin()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := conflicted.Exec(
-			`UPDATE docs SET "$doc" = ? WHERE id = ?`,
-			sqlCapabilityDoc("a", "rejected-commit", 93), "a",
-		); err != nil {
-			t.Fatal(err)
+		for _, table := range sqlCapabilityTables(multi) {
+			if _, err := conflicted.Exec(
+				fmt.Sprintf(`UPDATE %s SET "$doc" = ? WHERE id = ?`, table),
+				sqlCapabilityDoc("a", "rejected-commit", 93), "a",
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if _, err := db.Exec(
 			`UPDATE docs SET "$doc" = ? WHERE id = ?`,
@@ -343,14 +477,16 @@ func assertDatabaseSQLRollback(
 		); err != nil {
 			t.Fatal(err)
 		}
-		winner := databaseSQLContent(t, db)
+		winner := databaseSQLAllContent(t, db, multi)
 		if err := conflicted.Commit(); !errors.Is(err, ErrTransactionConflict) {
 			t.Fatalf("conflicted COMMIT = %v, want ErrTransactionConflict", err)
 		}
-		if got := databaseSQLContent(t, db); !sqlCapabilityMapsEqual(got, winner) {
+		if got := databaseSQLAllContent(t, db, multi); !sqlCapabilityAllEqual(got, winner) {
 			t.Fatalf("conflicted COMMIT content = %v, want winner %v", got, winner)
 		}
-		assertDatabaseSQLIndexOracle(t, db)
+		for _, table := range sqlCapabilityTables(multi) {
+			assertDatabaseSQLIndexOracle(t, db, table)
+		}
 		if _, err := db.Exec(`INSERT INTO docs VALUES (?)`,
 			sqlCapabilityDoc("after-rejection", "usable", 95)); err != nil {
 			t.Fatalf("write after rejected COMMIT: %v", err)
@@ -359,30 +495,31 @@ func assertDatabaseSQLRollback(
 			t.Fatalf("cleanup after rejected COMMIT: %v", err)
 		}
 		return
-	} else {
-		if _, err := db.Exec(
-			`INSERT INTO docs VALUES (?), (?)`,
-			sqlCapabilityDoc("rollback-good", "rollback", 90),
-			sqlCapabilityDoc("a", "duplicate", 91),
-		); err == nil {
-			t.Fatal("duplicate multi-row INSERT succeeded")
-		}
 	}
-	if got := databaseSQLContent(t, db); !sqlCapabilityMapsEqual(got, want) {
+	if _, err := db.Exec(
+		`INSERT INTO docs VALUES (?), (?)`,
+		sqlCapabilityDoc("rollback-good", "rollback", 90),
+		sqlCapabilityDoc("a", "duplicate", 91),
+	); err == nil {
+		t.Fatal("duplicate multi-row INSERT succeeded")
+	}
+	if got := databaseSQLAllContent(t, db, multi); !sqlCapabilityAllEqual(got, want) {
 		t.Fatalf("rollback content = %v, want %v", got, want)
 	}
 }
 
-func assertDatabaseSQLIndexOracle(t *testing.T, db *sql.DB) {
+func assertDatabaseSQLIndexOracle(t *testing.T, db *sql.DB, table string) {
 	t.Helper()
-	content := databaseSQLContent(t, db)
+	content := databaseSQLContent(t, db, table)
 	want := map[string][]string{"absent-sentinel": nil}
 	for key, group := range content {
 		want[group] = append(want[group], key)
 	}
 	for group, keys := range want {
 		slices.Sort(keys)
-		rows, err := db.Query(`SELECT id FROM docs WHERE grp = ? ORDER BY id`, group)
+		rows, err := db.Query(
+			fmt.Sprintf(`SELECT id FROM %s WHERE grp = ? ORDER BY id`, table), group,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -399,14 +536,23 @@ func assertDatabaseSQLIndexOracle(t *testing.T, db *sql.DB) {
 			t.Fatal(err)
 		}
 		if !slices.Equal(got, keys) {
-			t.Fatalf("group=%q keys=%v want=%v", group, got, keys)
+			t.Fatalf("%s group=%q keys=%v want=%v", table, group, got, keys)
 		}
 	}
 }
 
-func databaseSQLContent(t *testing.T, db *sql.DB) map[string]string {
+func databaseSQLAllContent(t *testing.T, db *sql.DB, multi bool) map[string]map[string]string {
 	t.Helper()
-	rows, err := db.Query(`SELECT id, grp FROM docs ORDER BY id`)
+	out := make(map[string]map[string]string)
+	for _, table := range sqlCapabilityTables(multi) {
+		out[table] = databaseSQLContent(t, db, table)
+	}
+	return out
+}
+
+func databaseSQLContent(t *testing.T, db *sql.DB, table string) map[string]string {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf(`SELECT id, grp FROM %s ORDER BY id`, table))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,6 +581,18 @@ func sqlCapabilityMapsEqual(a, b map[string]string) bool {
 	}
 	for key, value := range a {
 		if b[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func sqlCapabilityAllEqual(a, b map[string]map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for table, content := range a {
+		if !sqlCapabilityMapsEqual(content, b[table]) {
 			return false
 		}
 	}

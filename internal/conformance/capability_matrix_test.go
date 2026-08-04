@@ -15,6 +15,7 @@ const capabilityEnd = "<!-- capability-matrix:end -->"
 func TestCapabilityManifestCoversEveryDimension(t *testing.T) {
 	entries := map[EntryPoint]bool{}
 	indexing := map[Indexing]bool{}
+	tables := map[Tables]bool{}
 	transactions := map[Transaction]bool{}
 	keys := map[Keys]bool{}
 	operations := map[Operation]bool{}
@@ -28,6 +29,9 @@ func TestCapabilityManifestCoversEveryDimension(t *testing.T) {
 		entries[c.Entry] = true
 		indexing[c.Indexing] = true
 		transactions[c.Transaction] = true
+		for _, value := range c.Tables {
+			tables[value] = true
+		}
 		for _, value := range c.Keys {
 			keys[value] = true
 		}
@@ -37,7 +41,7 @@ func TestCapabilityManifestCoversEveryDimension(t *testing.T) {
 		for _, value := range c.Lanes {
 			lanes[value] = true
 		}
-		if len(c.Keys) == 0 || len(c.Operations) == 0 || len(c.Lanes) == 0 {
+		if len(c.Tables) == 0 || len(c.Keys) == 0 || len(c.Operations) == 0 || len(c.Lanes) == 0 {
 			t.Fatalf("capability %q has an empty executable dimension", c.ID)
 		}
 		if c.Result == DocumentedError && c.Error == "" {
@@ -47,10 +51,26 @@ func TestCapabilityManifestCoversEveryDimension(t *testing.T) {
 			t.Fatalf("capability %q requests rollback without atomic success", c.ID)
 		}
 	}
-	if len(entries) != 3 || len(indexing) != 2 || len(transactions) != 2 ||
-		len(keys) != 2 || len(operations) != 4 || len(lanes) != 8 {
-		t.Fatalf("manifest dimensions: entries=%v indexing=%v transactions=%v keys=%v operations=%v lanes=%v",
-			entries, indexing, transactions, keys, operations, lanes)
+	if len(entries) != 3 || len(indexing) != 2 || len(tables) != 2 ||
+		len(transactions) != 3 || len(keys) != 2 || len(operations) != 4 || len(lanes) != 8 {
+		t.Fatalf("manifest dimensions: entries=%v indexing=%v tables=%v transactions=%v keys=%v operations=%v lanes=%v",
+			entries, indexing, tables, transactions, keys, operations, lanes)
+	}
+	for _, id := range []string{
+		"native-database-txn-unindexed",
+		"native-database-txn-indexed",
+		"native-database-txn-unsupported-lane",
+		"database-sql-transaction-multi-table-unindexed",
+		"database-sql-transaction-multi-table-indexed",
+		"database-sql-transaction-savepoint",
+		"pgwire-transaction-multi-table-unindexed",
+		"pgwire-transaction-multi-table-indexed",
+		"pgwire-transaction-savepoint",
+		"pgwire-transaction-serialization-failure",
+	} {
+		if !ids[id] {
+			t.Fatalf("missing multi-table / savepoint capability %q", id)
+		}
 	}
 }
 
@@ -91,30 +111,54 @@ func TestCapabilityManifestCoversCartesianContract(t *testing.T) {
 	type cell struct {
 		entry       EntryPoint
 		indexing    Indexing
+		tables      Tables
+		transaction Transaction
+		keys        Keys
+		operation   Operation
+		lane        Lane
+		result      Result
+	}
+	type shape struct {
+		entry       EntryPoint
+		indexing    Indexing
+		tables      Tables
 		transaction Transaction
 		keys        Keys
 		operation   Operation
 		lane        Lane
 	}
 	covered := map[cell]string{}
+	shapes := map[shape]string{}
 	for _, capability := range Cases {
-		for _, keys := range capability.Keys {
-			for _, operation := range capability.Operations {
-				for _, lane := range capability.Lanes {
-					key := cell{
-						entry: capability.Entry, indexing: capability.Indexing,
-						transaction: capability.Transaction, keys: keys,
-						operation: operation, lane: lane,
+		for _, tables := range capability.Tables {
+			for _, keys := range capability.Keys {
+				for _, operation := range capability.Operations {
+					for _, lane := range capability.Lanes {
+						key := cell{
+							entry: capability.Entry, indexing: capability.Indexing,
+							tables: tables, transaction: capability.Transaction,
+							keys: keys, operation: operation, lane: lane,
+							result: capability.Result,
+						}
+						if prior := covered[key]; prior != "" {
+							t.Fatalf("capability cell %+v is claimed by both %q and %q",
+								key, prior, capability.ID)
+						}
+						covered[key] = capability.ID
+						shapes[shape{
+							entry: capability.Entry, indexing: capability.Indexing,
+							tables: tables, transaction: capability.Transaction,
+							keys: keys, operation: operation, lane: lane,
+						}] = capability.ID
 					}
-					if prior := covered[key]; prior != "" {
-						t.Fatalf("capability cell %+v is claimed by both %q and %q",
-							key, prior, capability.ID)
-					}
-					covered[key] = capability.ID
 				}
 			}
 		}
 	}
+	// The historical one-table Autocommit/Explicit product remains fully
+	// covered. Multiple-table and savepoint rows are additive and pinned by ID.
+	// Documented-error rows may share an operational shape with a success row
+	// when they exercise a distinct outcome (for example SQLSTATE 40001).
 	for _, entry := range []EntryPoint{Native, DatabaseSQL, PGWire} {
 		lanes := []Lane{SQLDefaultSyncJournal}
 		if entry == Native {
@@ -125,8 +169,11 @@ func TestCapabilityManifestCoversCartesianContract(t *testing.T) {
 				for _, keys := range []Keys{OneKey, MultipleKeys} {
 					for _, operation := range AllOperations {
 						for _, lane := range lanes {
-							key := cell{entry, indexing, transaction, keys, operation, lane}
-							if covered[key] == "" {
+							key := shape{
+								entry, indexing, OneTable, transaction,
+								keys, operation, lane,
+							}
+							if shapes[key] == "" {
 								t.Fatalf("capability manifest is missing Cartesian cell %+v", key)
 							}
 						}
