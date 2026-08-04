@@ -44,6 +44,9 @@ import (
 //	go test ./store/durable -run '^TestFilePrimaryChurnQualification$' -count=1 -v
 //	go test ./store/durable -run '^TestFilePrimaryChurnQualification$' -short -v
 func TestFilePrimaryChurnQualification(t *testing.T) {
+	if raceDetectorEnabled {
+		t.Skip("primary churn qualification is a geometry/throughput gate, not a race target")
+	}
 	cfg := primaryChurnConfigFor(testing.Short())
 	universe := cfg.present * 2
 

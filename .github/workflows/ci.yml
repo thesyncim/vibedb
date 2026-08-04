@@ -47,7 +47,9 @@ jobs:
           VIBEDB_TEST_PSQL: "1"
         run: go test -count=1 -timeout=5m -run '^TestPSQLClient18$' -v .
       - name: Race, storage suites
-        run: go test -race -timeout=25m -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
+        # Qualification tests build multi-hundred-MiB corpora and are geometry/
+        # throughput gates; under -race on ARM they alone can exhaust the budget.
+        run: go test -race -timeout=25m -skip 'Qualification' -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
   lateral-race:
     name: race (LATERAL cross-layer)
     runs-on: ubuntu-latest

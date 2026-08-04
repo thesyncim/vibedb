@@ -57,6 +57,9 @@ type primaryLTRMeasurement struct {
 // A smaller byte scale is accepted for focused harness development. It keeps
 // the same 1:8 cache:file ratio, capped at the CI cache size.
 func TestFilePrimaryLargerThanCacheQualification(t *testing.T) {
+	if raceDetectorEnabled {
+		t.Skip("larger-than-cache qualification builds a 256 MiB corpus; it is a geometry/throughput gate, not a race target")
+	}
 	config := primaryLTRConfigForScale(t, *primaryLTRScale)
 	path := filepath.Join(t.TempDir(), "primary-ltr.vibe")
 	records := primaryLTRBuild(t, path, config)
