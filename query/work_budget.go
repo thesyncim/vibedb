@@ -18,7 +18,9 @@ var ErrSpillBudget = errors.New("query: spill storage exceeds execution budget")
 var ErrSpillCorrupt = errors.New("query: corrupt spill run")
 
 // WorkBudgetError reports a bounded intermediate that cannot be completed
-// within its configured resource limit.
+// within its configured resource limit. Limit names the admission account for
+// Resource; a nested operator may report its remaining sub-budget rather than
+// the statement-wide ExecOptions.MemoryBytes ceiling.
 type WorkBudgetError struct {
 	Resource string
 	Bytes    int64

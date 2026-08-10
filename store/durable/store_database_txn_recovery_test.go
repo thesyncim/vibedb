@@ -49,6 +49,105 @@ func collectionFilename(t testing.TB, name string) string {
 	return filename
 }
 
+func testTxnDecisionsInDir(
+	t testing.TB, dir string,
+) *storeio.TxnDecisions {
+	t.Helper()
+	path := filepath.Join(dir, txnMarkerFilename)
+	marker, err := storeio.CreateTxnMarker(path, storeio.TxnMarkerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, decisions, err := storeio.OpenTxnMarker(path, storeio.TxnMarkerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	return decisions
+}
+
+func testTxnDecisions(t testing.TB) *storeio.TxnDecisions {
+	t.Helper()
+	return testTxnDecisionsInDir(t, t.TempDir())
+}
+
+func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
+	decisions := testTxnDecisions(t)
+
+	t.Run("different directory", func(t *testing.T) {
+		file, err := os.Create(filepath.Join(t.TempDir(), "collection.vdb"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := OpenWithTransactions(file, Options{}, decisions); !errors.Is(
+			err, ErrTransactionLogDirectoryMismatch,
+		) {
+			t.Fatalf("different directory error = %v, want directory mismatch", err)
+		}
+	})
+
+	t.Run("unresolved symlink", func(t *testing.T) {
+		target := t.TempDir()
+		realPath := filepath.Join(target, "collection.vdb")
+		if err := os.WriteFile(realPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "collection-dir")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		file, err := os.Open(filepath.Join(link, "collection.vdb"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		_, err = OpenWithTransactions(file, Options{}, decisions)
+		if err == nil || errors.Is(err, ErrTransactionLogDirectoryMismatch) {
+			t.Fatalf("unresolved directory error = %v, want resolution failure", err)
+		}
+	})
+
+	t.Run("retargeted symlink", func(t *testing.T) {
+		dirA := t.TempDir()
+		dirB := t.TempDir()
+		decisions := testTxnDecisionsInDir(t, dirB)
+		const name = "collection.vdb"
+		if err := os.WriteFile(filepath.Join(dirA, name), []byte("a"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dirB, name), []byte("b"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "collection-dir")
+		if err := os.Symlink(dirA, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		file, err := os.Open(filepath.Join(link, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(dirB, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenWithTransactions(file, Options{}, decisions); !errors.Is(
+			err, ErrTransactionLogDirectoryMismatch,
+		) {
+			t.Fatalf("retargeted directory error = %v, want directory mismatch", err)
+		}
+	})
+}
+
 // cloneDatabaseDir copies every regular file in src to a fresh temp directory.
 // Crash-image tests use this before Database.Close, which checkpoints and
 // recycles journals and would otherwise discard unpublished kind-5 records.

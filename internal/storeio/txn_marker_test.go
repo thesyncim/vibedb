@@ -562,3 +562,10 @@ func TestTxnMarkerEmptyScanDoesNotAllocate(t *testing.T) {
 		t.Fatalf("source directory = %q, want %q", decisions.SourceDir(), wantDir)
 	}
 }
+
+func TestTxnMarkerCanonicalDirectoryFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "txn.vtm")
+	if _, err := canonicalTxnMarkerDir(path); err == nil {
+		t.Fatal("canonical transaction directory accepted an unresolved path")
+	}
+}

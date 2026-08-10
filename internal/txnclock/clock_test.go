@@ -83,6 +83,79 @@ func TestClockRevisionWindows(t *testing.T) {
 	clock.Finish(second)
 }
 
+func TestClockConflictUnchangedRevisionAndActualWrite(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+
+	older := clock.Begin()
+	clock.RecordKeys([]string{"before"})
+	current := clock.Begin()
+	if current != clock.revision {
+		t.Fatalf("begin revision = %d, clock revision %d", current, clock.revision)
+	}
+	if key, overflow, conflict := clock.Conflict(
+		current, []string{"before", "absent"},
+	); conflict || overflow || key != "" {
+		t.Fatalf(
+			"unchanged-revision conflict = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+
+	clock.RecordKeys([]string{"after"})
+	if clock.revision == current {
+		t.Fatal("actual write did not advance the ordinary revision")
+	}
+	if key, overflow, conflict := clock.Conflict(
+		current, []string{"absent"},
+	); conflict || overflow || key != "" {
+		t.Fatalf(
+			"unrelated-write conflict = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+	if key, overflow, conflict := clock.Conflict(
+		current, []string{"after"},
+	); !conflict || overflow || key != "after" {
+		t.Fatalf(
+			"actual-write conflict = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+
+	clock.Finish(older)
+	clock.Finish(current)
+}
+
+func TestClockConflictFastPathPreservesFailClosedPrecedence(t *testing.T) {
+	t.Run("history floor", func(t *testing.T) {
+		// historyFloor normally never exceeds revision. Construct the defensive
+		// boundary directly so moving the equality fast path above the floor
+		// check can never silently reopen a discarded token.
+		clock := Clock{revision: 7, historyFloor: 8}
+		if key, overflow, conflict := clock.Conflict(
+			7, []string{"untouched"},
+		); !conflict || !overflow || key != "" {
+			t.Fatalf(
+				"equal revision below floor = (%q, overflow %v, conflict %v)",
+				key, overflow, conflict,
+			)
+		}
+	})
+
+	t.Run("stopped maximum", func(t *testing.T) {
+		clock := Clock{revision: maxRevision, revisionStopped: true}
+		if key, overflow, conflict := clock.Conflict(
+			maxRevision, []string{"untouched"},
+		); !conflict || !overflow || key != "" {
+			t.Fatalf(
+				"equal stopped revision = (%q, overflow %v, conflict %v)",
+				key, overflow, conflict,
+			)
+		}
+	})
+}
+
 func TestClockRevisionExhaustionFailsClosedWithoutWrapping(t *testing.T) {
 	var clock Clock
 	clock.Arm()
@@ -130,6 +203,84 @@ func TestClockRevisionExhaustionFailsClosedWithoutWrapping(t *testing.T) {
 	if _, overflow, conflict := clock.Conflict(clock.Begin(), nil); !conflict || !overflow {
 		t.Fatalf("quiescence reopened exhausted clock: overflow %v conflict %v", overflow, conflict)
 	}
+}
+
+func TestClockUnregisteredMaximumObservationFailsClosed(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+	clock.revision = maxRevision - 1
+
+	older := clock.Begin()
+	clock.RecordKeys([]string{"reached-maximum"})
+	observed := clock.Observe()
+	if observed != maxRevision || clock.Active[maxRevision] != 0 {
+		t.Fatalf(
+			"maximum observation = revision %d active %d",
+			observed, clock.Active[maxRevision],
+		)
+	}
+	if key, overflow, conflict := clock.Conflict(
+		observed, []string{"untouched"},
+	); !conflict || !overflow || key != "" {
+		t.Fatalf(
+			"unregistered maximum observation = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+
+	// With no maximum-revision holder, another publication legitimately reuses
+	// MaxUint64. The observed token cannot order that publication and must not
+	// become an equality fast-path success.
+	clock.RecordKeys([]string{"same-revision-write"})
+	if clock.revisionStopped || clock.revision != observed {
+		t.Fatalf(
+			"reused maximum = revision %d stopped %v",
+			clock.revision, clock.revisionStopped,
+		)
+	}
+	if key, overflow, conflict := clock.Conflict(
+		observed, []string{"same-revision-write"},
+	); !conflict || !overflow || key != "" {
+		t.Fatalf(
+			"same-revision publication = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+
+	atMaximum := clock.Begin()
+	// A later registered maximum holder must not make the older unregistered
+	// observation appear safe: token provenance is intentionally not encoded.
+	if key, overflow, conflict := clock.Conflict(
+		observed, []string{"same-revision-write"},
+	); !conflict || !overflow || key != "" {
+		t.Fatalf(
+			"observation after later maximum begin = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+	if key, overflow, conflict := clock.Conflict(
+		atMaximum, []string{"same-revision-write"},
+	); !conflict || !overflow || key != "" {
+		t.Fatalf(
+			"registered maximum boundary = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+	clock.RecordKeys([]string{"unrepresentable"})
+	if !clock.revisionStopped {
+		t.Fatal("write after registered maximum begin did not stop the clock")
+	}
+	if key, overflow, conflict := clock.Conflict(
+		atMaximum, []string{"untouched"},
+	); !conflict || !overflow || key != "" {
+		t.Fatalf(
+			"registered maximum after stop = (%q, overflow %v, conflict %v)",
+			key, overflow, conflict,
+		)
+	}
+
+	clock.Finish(older)
+	clock.Finish(atMaximum)
 }
 
 func TestClockMaximumRevisionWithoutReadersRemainsUsable(t *testing.T) {
@@ -342,13 +493,41 @@ func BenchmarkClockRecordKeysUnarmed(b *testing.B) {
 	}
 }
 
+var (
+	benchmarkConflictKey      string
+	benchmarkConflictOverflow bool
+	benchmarkConflictFound    bool
+)
+
 func BenchmarkClockConflictNoWrites(b *testing.B) {
-	var clock Clock
-	begin := clock.Begin()
-	keys := []string{"key"}
-	b.ReportAllocs()
-	for b.Loop() {
-		clock.Conflict(begin, keys)
+	benchmarkClockConflictSizes(b, false)
+}
+
+func BenchmarkClockConflictAfterUnrelatedWrite(b *testing.B) {
+	benchmarkClockConflictSizes(b, true)
+}
+
+func benchmarkClockConflictSizes(b *testing.B, advance bool) {
+	for _, count := range []int{1, 64, HistoryKeys} {
+		keys := make([]string, count)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("key-%04d", i)
+		}
+		b.Run(fmt.Sprintf("keys=%d", count), func(b *testing.B) {
+			var clock Clock
+			clock.Arm()
+			begin := clock.Begin()
+			if advance {
+				clock.RecordKeys([]string{"unrelated"})
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				benchmarkConflictKey,
+					benchmarkConflictOverflow,
+					benchmarkConflictFound = clock.Conflict(begin, keys)
+			}
+		})
 	}
 }
 

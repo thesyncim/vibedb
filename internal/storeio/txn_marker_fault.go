@@ -101,7 +101,7 @@ func runTxnMarkerCreateFileSync(file *os.File) error {
 	return txnMarkerCreateFileSync(file)
 }
 
-func runTxnMarkerCreateParentDirSync(path string) error {
+func runTxnMarkerCreateParentDirSync(root *os.Root) error {
 	txnMarkerCreateFaultMu.Lock()
 	plan := txnMarkerCreateFaultPlan
 	if plan.Phase == TxnMarkerFaultCreateParentDirSync && !txnMarkerCreateFaulted {
@@ -110,7 +110,7 @@ func runTxnMarkerCreateParentDirSync(path string) error {
 		return syscall.EIO
 	}
 	txnMarkerCreateFaultMu.Unlock()
-	return txnMarkerParentDirSync(path)
+	return txnMarkerParentDirSync(root)
 }
 
 // FaultTxnMarker wraps a TxnMarker's raw file writes and sync barriers and can

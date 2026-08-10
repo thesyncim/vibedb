@@ -110,6 +110,20 @@ func (c *Clock) Conflict(
 	if begin < c.historyFloor {
 		return "", true, true
 	}
+	// With no revision advance, no retained key can have been published after
+	// an ordinary begin. MaxUint64 is different: Observe can return it without
+	// registering an active holder, and a later write is then allowed to reuse
+	// the maximum. The token carries no provenance, so a still-active observed
+	// maximum cannot be distinguished from a Begin(maximum) registered after
+	// that same-revision write. Fail the exhausted boundary closed rather than
+	// infer safety from the current Active bucket. Keep the general fail-closed
+	// guards above this fast path as well.
+	if begin == c.revision {
+		if begin == maxRevision {
+			return "", true, true
+		}
+		return "", false, false
+	}
 	for _, key := range keys {
 		if c.Writes[key] > begin {
 			return key, false, true

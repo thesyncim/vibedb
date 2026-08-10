@@ -96,7 +96,8 @@ var (
 var txnMarkerPreallocate = preallocateRecoveryJournal
 
 // txnMarkerParentDirSync is a package seam for the mint's parent-directory
-// fsync fence (L2 / W7). Production opens the parent and Syncs it.
+// fsync fence (L2 / W7). Production Syncs the directory through the same
+// pinned root used to create the marker.
 var txnMarkerParentDirSync = syncTxnMarkerParentDir
 
 // txnMarkerCreateFileSync is a package seam for the mint's file sync. Production
@@ -147,11 +148,14 @@ type TxnMarkerOptions struct {
 // safe for concurrent use.
 type TxnMarker struct {
 	file *os.File
+	root *os.Root
 	path string
-	// sourceDir is canonicalized once at open/create so repeated scans retain
-	// the database identity without filesystem calls or allocations.
-	sourceDir string
-	header    TxnMarkerHeader
+	// sourceDir is canonicalized once at open/create for diagnostics. The
+	// physical directory identity is retained separately so decisions cannot be
+	// paired with a collection through a retargeted path.
+	sourceDir     string
+	sourceDirInfo os.FileInfo
+	header        TxnMarkerHeader
 	// cursor is the in-region byte offset of the next append.
 	cursor uint64
 	// nextSequence is the DCSN the next appended record will carry.
@@ -169,23 +173,64 @@ type TxnMarker struct {
 // sets keyed by TxnID within the selected header's epoch, the retired StoreID
 // set, and the high-water TxnID / DCSN for counter seeding.
 type TxnDecisions struct {
-	sourceDir string
-	markerID  [16]byte
-	epoch     uint64
-	decisions map[uint64][]TxnParticipant
-	retired   map[[16]byte]struct{}
-	maxTxnID  uint64
-	maxDCSN   uint64
+	sourceDir     string
+	sourceDirInfo os.FileInfo
+	markerID      [16]byte
+	epoch         uint64
+	decisions     map[uint64][]TxnParticipant
+	retired       map[[16]byte]struct{}
+	maxTxnID      uint64
+	maxDCSN       uint64
 }
 
-// SourceDir returns the canonical directory of the decision log that was
-// scanned. Durable collection opens use it to reject pairing a journal with a
-// decision log from another database directory.
+// SourceDir returns the canonical directory name captured when the decision
+// log was opened. It is diagnostic metadata; collection pairing is fenced by
+// the retained physical directory identity in MatchesFileDirectory.
 func (d *TxnDecisions) SourceDir() string {
 	if d == nil {
 		return ""
 	}
 	return d.sourceDir
+}
+
+// MatchesFileDirectory proves that file is still the exact entry reached
+// through a pinned handle to the same physical directory as this decision
+// log. It rejects path retargeting between the caller's open and this check.
+func (d *TxnDecisions) MatchesFileDirectory(file *os.File) (bool, error) {
+	if d == nil || d.sourceDirInfo == nil || file == nil {
+		return false, ErrInvalidWrite
+	}
+	return matchesTxnMarkerDirectory(d.sourceDirInfo, file)
+}
+
+func matchesTxnMarkerDirectory(
+	sourceDirInfo os.FileInfo, file *os.File,
+) (bool, error) {
+	dir, err := canonicalTxnMarkerDir(file.Name())
+	if err != nil {
+		return false, err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	dirInfo, err := root.Stat(".")
+	if err != nil {
+		return false, err
+	}
+	if !os.SameFile(sourceDirInfo, dirInfo) {
+		return false, nil
+	}
+	entryInfo, err := root.Stat(filepath.Base(file.Name()))
+	if err != nil {
+		return false, err
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(fileInfo, entryInfo), nil
 }
 
 // MarkerID returns the decision-log identity selected at Open.
@@ -572,6 +617,50 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 	if path == "" {
 		return nil, fmt.Errorf("%w: empty decision log path", ErrInvalidWrite)
 	}
+	sourceDir, err := canonicalTxnMarkerDir(path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(sourceDir)
+	if err != nil {
+		return nil, err
+	}
+	return createTxnMarkerInRoot(
+		root, path, filepath.Base(path), sourceDir, opts,
+	)
+}
+
+// CreateTxnMarkerAt mints name through a child handle of root. The returned
+// marker owns that child handle; the caller retains ownership of root.
+func CreateTxnMarkerAt(
+	root *os.Root, name string, opts TxnMarkerOptions,
+) (*TxnMarker, error) {
+	if root == nil || !validTxnMarkerName(name) {
+		return nil, fmt.Errorf("%w: invalid decision log root or name", ErrInvalidWrite)
+	}
+	child, err := root.OpenRoot(".")
+	if err != nil {
+		return nil, err
+	}
+	sourceDir := filepath.Clean(root.Name())
+	return createTxnMarkerInRoot(
+		child, filepath.Join(sourceDir, name), name, sourceDir, opts,
+	)
+}
+
+func createTxnMarkerInRoot(
+	root *os.Root,
+	path string,
+	name string,
+	sourceDir string,
+	opts TxnMarkerOptions,
+) (*TxnMarker, error) {
+	cleanupRoot := true
+	defer func() {
+		if cleanupRoot {
+			_ = root.Close()
+		}
+	}()
 	capacity := opts.Capacity
 	if capacity == 0 {
 		capacity = txnMarkerDefaultCapacityBytes
@@ -590,7 +679,9 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 		capacity = rounded
 	}
 
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	file, sourceDirInfo, err := openTxnMarkerEntry(
+		root, name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -598,6 +689,7 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 	defer func() {
 		if cleanup {
 			_ = file.Close()
+			_ = root.Close()
 		}
 	}()
 
@@ -622,7 +714,9 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 		return nil, err
 	}
 
-	m := newTxnMarkerManager(file, path, header)
+	m := newTxnMarkerManager(
+		file, root, path, sourceDir, sourceDirInfo, header,
+	)
 	if err := m.writeHeaderFaultable(0, header); err != nil {
 		return nil, err
 	}
@@ -632,7 +726,7 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 	if err := runTxnMarkerCreateFileSync(file); err != nil {
 		return nil, err
 	}
-	if err := runTxnMarkerCreateParentDirSync(path); err != nil {
+	if err := runTxnMarkerCreateParentDirSync(root); err != nil {
 		return nil, err
 	}
 
@@ -640,6 +734,7 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 	m.cursor = 0
 	m.nextSequence = header.BaseSequence + 1
 	cleanup = false
+	cleanupRoot = false
 	return m, nil
 }
 
@@ -651,14 +746,59 @@ func OpenTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, *TxnDecision
 	if path == "" {
 		return nil, nil, fmt.Errorf("%w: empty decision log path", ErrInvalidWrite)
 	}
-	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	sourceDir, err := canonicalTxnMarkerDir(path)
 	if err != nil {
+		return nil, nil, err
+	}
+	root, err := os.OpenRoot(sourceDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return openTxnMarkerInRoot(
+		root, path, filepath.Base(path), sourceDir, opts,
+	)
+}
+
+// OpenTxnMarkerAt opens name through a child handle of root. The returned
+// marker owns that child handle; the caller retains ownership of root.
+func OpenTxnMarkerAt(
+	root *os.Root, name string, opts TxnMarkerOptions,
+) (*TxnMarker, *TxnDecisions, error) {
+	if root == nil || !validTxnMarkerName(name) {
+		return nil, nil, fmt.Errorf(
+			"%w: invalid decision log root or name", ErrInvalidWrite,
+		)
+	}
+	child, err := root.OpenRoot(".")
+	if err != nil {
+		return nil, nil, err
+	}
+	sourceDir := filepath.Clean(root.Name())
+	return openTxnMarkerInRoot(
+		child, filepath.Join(sourceDir, name), name, sourceDir, opts,
+	)
+}
+
+func openTxnMarkerInRoot(
+	root *os.Root,
+	path string,
+	name string,
+	sourceDir string,
+	opts TxnMarkerOptions,
+) (*TxnMarker, *TxnDecisions, error) {
+	_ = opts // Open trusts the on-disk header; options reserved for symmetry.
+	file, sourceDirInfo, err := openTxnMarkerEntry(
+		root, name, os.O_RDWR, 0o600,
+	)
+	if err != nil {
+		_ = root.Close()
 		return nil, nil, err
 	}
 	cleanup := true
 	defer func() {
 		if cleanup {
 			_ = file.Close()
+			_ = root.Close()
 		}
 	}()
 
@@ -683,7 +823,9 @@ func OpenTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, *TxnDecision
 		return nil, nil, ErrTxnMarkerNoValidHeader
 	}
 
-	m := newTxnMarkerManager(file, path, header)
+	m := newTxnMarkerManager(
+		file, root, path, sourceDir, sourceDirInfo, header,
+	)
 	m.headerSlot = uint32(selected)
 	decisions := &TxnDecisions{}
 	if err := m.scanDecisions(decisions); err != nil {
@@ -694,30 +836,72 @@ func OpenTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, *TxnDecision
 }
 
 func newTxnMarkerManager(
-	file *os.File, path string, h TxnMarkerHeader,
+	file *os.File,
+	root *os.Root,
+	path string,
+	sourceDir string,
+	sourceDirInfo os.FileInfo,
+	h TxnMarkerHeader,
 ) *TxnMarker {
 	m := &TxnMarker{
-		file:       file,
-		path:       path,
-		sourceDir:  canonicalTxnMarkerDir(path),
-		header:     h,
-		scratch:    make([]byte, TxnMarkerHeaderSize),
-		markerSync: dataSync,
+		file:          file,
+		root:          root,
+		path:          path,
+		sourceDir:     sourceDir,
+		sourceDirInfo: sourceDirInfo,
+		header:        h,
+		scratch:       make([]byte, TxnMarkerHeaderSize),
+		markerSync:    dataSync,
 	}
 	m.writeAt = file.WriteAt
 	return m
 }
 
-func canonicalTxnMarkerDir(path string) string {
-	dir := filepath.Dir(path)
-	if absolute, err := filepath.Abs(dir); err == nil {
-		dir = absolute
+func openTxnMarkerEntry(
+	root *os.Root, name string, flag int, perm os.FileMode,
+) (*os.File, os.FileInfo, error) {
+	dirInfo, err := root.Stat(".")
+	if err != nil {
+		return nil, nil, err
+	}
+	file, err := root.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, nil, err
+	}
+	fileInfo, fileErr := file.Stat()
+	entryInfo, entryErr := root.Lstat(name)
+	if fileErr != nil || entryErr != nil ||
+		!entryInfo.Mode().IsRegular() || !os.SameFile(fileInfo, entryInfo) {
+		_ = file.Close()
+		if fileErr != nil {
+			return nil, nil, fileErr
+		}
+		if entryErr != nil {
+			return nil, nil, entryErr
+		}
+		return nil, nil, fmt.Errorf(
+			"%w: transaction log entry is not a stable regular file",
+			ErrInvalidWrite,
+		)
+	}
+	return file, dirInfo, nil
+}
+
+func validTxnMarkerName(name string) bool {
+	return name != "" && name != "." && name != ".." && filepath.Base(name) == name
+}
+
+func canonicalTxnMarkerDir(path string) (string, error) {
+	dir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return "", fmt.Errorf("vibedb: resolve transaction log directory: %w", err)
 	}
 	dir = filepath.Clean(dir)
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = filepath.Clean(resolved)
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("vibedb: resolve transaction log directory: %w", err)
 	}
-	return dir
+	return filepath.Clean(resolved), nil
 }
 
 // Header returns the value-only decision-log identity and geometry.
@@ -725,6 +909,15 @@ func (m *TxnMarker) Header() TxnMarkerHeader { return m.header }
 
 // Path returns the filesystem path of the decision log.
 func (m *TxnMarker) Path() string { return m.path }
+
+// MatchesFileDirectory proves that file is still an entry in the same pinned
+// physical directory as the open decision log.
+func (m *TxnMarker) MatchesFileDirectory(file *os.File) (bool, error) {
+	if m == nil || m.sourceDirInfo == nil || file == nil {
+		return false, ErrInvalidWrite
+	}
+	return matchesTxnMarkerDirectory(m.sourceDirInfo, file)
+}
 
 // NextSequence reports the DCSN the next appended record will carry.
 func (m *TxnMarker) NextSequence() uint64 { return m.nextSequence }
@@ -754,9 +947,10 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 	m.cursor = 0
 	m.nextSequence = m.header.BaseSequence + 1
 	*dst = TxnDecisions{
-		sourceDir: m.sourceDir,
-		markerID:  m.header.MarkerID,
-		epoch:     m.header.Epoch,
+		sourceDir:     m.sourceDir,
+		sourceDirInfo: m.sourceDirInfo,
+		markerID:      m.header.MarkerID,
+		epoch:         m.header.Epoch,
 	}
 
 	// Empty / fully recycled logs begin with a zeroed region. Bad magic is the
@@ -917,21 +1111,31 @@ func (m *TxnMarker) Recycle(newEpoch uint64) error {
 	return nil
 }
 
-// Close closes the underlying decision-log file.
+// Close closes the underlying decision-log file and its pinned directory.
 func (m *TxnMarker) Close() error {
-	if m == nil || m.file == nil {
+	if m == nil {
 		return nil
 	}
-	err := m.file.Close()
-	m.file = nil
-	return err
+	var fileErr, rootErr error
+	if m.file != nil {
+		fileErr = m.file.Close()
+		m.file = nil
+	}
+	if m.root != nil {
+		rootErr = m.root.Close()
+		m.root = nil
+	}
+	return errors.Join(fileErr, rootErr)
 }
 
-func syncTxnMarkerParentDir(path string) error {
+func syncTxnMarkerParentDir(root *os.Root) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	directory, err := os.Open(filepath.Dir(path))
+	if root == nil {
+		return ErrInvalidWrite
+	}
+	directory, err := root.Open(".")
 	if err != nil {
 		return err
 	}

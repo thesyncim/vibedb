@@ -29,6 +29,7 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 			runtime.UnlockOSThread()
 		}
 		c.setFailure(err)
+		c.notifyFailureDrained()
 		initialized <- committerInit{err: err}
 		close(c.done)
 		c.broadcast()
@@ -61,6 +62,7 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 		if closeErr := device.Close(); closeErr != nil {
 			c.setFailure(closeErr)
 		}
+		c.notifyFailureDrained()
 		close(c.done)
 		c.broadcast()
 	}()
@@ -597,7 +599,6 @@ func (c *Committer) setFailure(err error) {
 			callbacks.failed != nil {
 			callbacks.failed(err)
 		}
-		close(c.failureNotified)
 		c.stopAccepting()
 		close(c.failed)
 		c.broadcast()

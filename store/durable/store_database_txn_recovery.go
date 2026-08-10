@@ -70,16 +70,14 @@ func OpenWithTransactions(
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
-	if txns != nil && txns.SourceDir() != "" {
-		collectionDir, err := filepath.Abs(filepath.Dir(file.Name()))
+	if txns != nil {
+		matches, err := txns.MatchesFileDirectory(file)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf(
+				"vibedb: prove collection transaction directory: %w", err,
+			)
 		}
-		collectionDir = filepath.Clean(collectionDir)
-		if resolved, err := filepath.EvalSymlinks(collectionDir); err == nil {
-			collectionDir = filepath.Clean(resolved)
-		}
-		if collectionDir != txns.SourceDir() {
+		if !matches {
 			return nil, ErrTransactionLogDirectoryMismatch
 		}
 	}
@@ -402,18 +400,24 @@ func rescanTxnLogMarker(l *TxnLog) (*storeio.TxnDecisions, error) {
 		return nil, nil
 	}
 	path := l.path
-	if err := l.marker.Close(); err != nil {
-		l.marker = nil
-		return nil, err
-	}
-	l.marker = nil
 	marker, decisions, err := storeio.OpenTxnMarker(
 		path, storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
 	)
 	if err != nil {
 		return nil, err
 	}
+	old := l.marker
 	l.marker = marker
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
+		l.marker = old
+		_ = marker.Close()
+		return nil, err
+	}
+	if err := old.Close(); err != nil {
+		l.marker = nil
+		_ = marker.Close()
+		return nil, err
+	}
 	return decisions, nil
 }
 
