@@ -10,6 +10,13 @@
 // publishes them monotonically. [FileCatalogRefresher] reloads an atomically
 // replaced snapshot after a shard reports stale routing metadata.
 //
+// Distributed queries accept SQL and typed parameters, not caller-authored
+// routing facts. Each immutable snapshot owns a compact sorted table directory
+// and a bounded generation-local prepared-plan cache. The shared SQL routing
+// compiler derives shard constraints, merge ordering, and global limits; query
+// shapes without a proven cross-shard merge or colocation rule fail before any
+// shard is contacted.
+//
 // The client reuses the shardservice length-prefixed codec over an ordinary
 // net.Conn: one synchronous request/response round-trip per call. It maps a
 // shard's typed error frame back onto the distribution ownership sentinels and

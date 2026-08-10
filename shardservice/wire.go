@@ -136,6 +136,11 @@ type Param struct {
 	Text string
 }
 
+// Valid reports whether p names a real wire parameter member. Payload syntax
+// is validated by the SQL binder; this gate prevents the zero/unknown enum from
+// silently materializing as SQL NULL before a request reaches the codec.
+func (p Param) Valid() bool { return p.Kind.valid() }
+
 // NullParam returns a SQL NULL parameter.
 func NullParam() Param { return Param{Kind: ParamNull} }
 

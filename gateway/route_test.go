@@ -15,6 +15,19 @@ func newRouteExecutor(t *testing.T, snap *Snapshot) *Executor {
 	return NewExecutor(NewClient(nil), NewCatalogHolder(snap), Options{})
 }
 
+func routeSQL(t *testing.T, e *Executor, snap *Snapshot, sql string, class OperationClass) (*plan, error) {
+	t.Helper()
+	prepared, err := snap.Prepare(t.Context(), sql)
+	if err != nil {
+		return nil, err
+	}
+	bound, err := prepared.Bind(nil)
+	if err != nil {
+		return nil, err
+	}
+	return e.route(snap, &Query{SQL: sql, Class: class}, bound, e.profileFor(class))
+}
+
 // TestRouteGlue proves the route glue classifies the physical route, resolves
 // the target count, and enforces each operational class's admission: interactive
 // refuses an all-shard scatter, batch admits it, an empty domain routes nowhere.
@@ -22,28 +35,22 @@ func TestRouteGlue(t *testing.T) {
 	snap := testSnapshot(t, 1)
 	e := newRouteExecutor(t, snap)
 
-	finite, err := distribution.FiniteDomain(distribution.NewString("tenant-42"))
-	if err != nil {
-		t.Fatalf("FiniteDomain: %v", err)
-	}
-
 	tests := []struct {
 		name      string
-		cons      distribution.BoundConstraints
+		sql       string
 		class     OperationClass
 		wantKind  distribution.RouteKind
 		wantCalls int
 		wantErr   error
 	}{
-		{"single_finite", distribution.BoundConstraints{finite}, ClassInteractive, distribution.RouteSingle, 1, nil},
-		{"scatter_batch", distribution.BoundConstraints{distribution.UnknownDomain()}, ClassBatch, distribution.RouteScatter, 2, nil},
-		{"scatter_rejected_interactive", distribution.BoundConstraints{distribution.UnknownDomain()}, ClassInteractive, 0, 0, distribution.ErrScatterRejected},
-		{"empty_domain", distribution.BoundConstraints{distribution.EmptyDomain()}, ClassInteractive, distribution.RouteEmpty, 0, nil},
+		{"single_finite", `SELECT n FROM messages WHERE tenant_id = 'tenant-42'`, ClassInteractive, distribution.RouteSingle, 1, nil},
+		{"scatter_batch", `SELECT n FROM messages`, ClassBatch, distribution.RouteScatter, 2, nil},
+		{"scatter_rejected_interactive", `SELECT n FROM messages`, ClassInteractive, 0, 0, distribution.ErrScatterRejected},
+		{"empty_domain", `SELECT n FROM messages WHERE tenant_id = 'a' AND tenant_id = 'b'`, ClassInteractive, distribution.RouteEmpty, 0, nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			q := &Query{Distribution: "tenant_data", Constraints: tc.cons, SQL: "SELECT 1"}
-			pl, err := e.route(snap, q, e.profileFor(tc.class))
+			pl, err := routeSQL(t, e, snap, tc.sql, tc.class)
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErr)
@@ -80,12 +87,7 @@ func TestRouteGlue(t *testing.T) {
 func TestRouteCarriesShardCoordinates(t *testing.T) {
 	snap := testSnapshot(t, 1)
 	e := newRouteExecutor(t, snap)
-	q := &Query{
-		Distribution: "tenant_data",
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          "SELECT 1",
-	}
-	pl, err := e.route(snap, q, e.profileFor(ClassBatch))
+	pl, err := routeSQL(t, e, snap, `SELECT n FROM messages`, ClassBatch)
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}
@@ -117,32 +119,31 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 	}
 }
 
-// TestRouteUnknownDistribution proves routing against a distribution absent from
-// the pinned generation fails closed with the catalog sentinel.
-func TestRouteUnknownDistribution(t *testing.T) {
+// TestRouteUnknownPlacement proves SQL cannot select an arbitrary distribution;
+// its physical table must resolve through the pinned planner directory.
+func TestRouteUnknownPlacement(t *testing.T) {
 	snap := testSnapshot(t, 1)
-	e := newRouteExecutor(t, snap)
-	q := &Query{Distribution: "absent", Constraints: distribution.BoundConstraints{distribution.UnknownDomain()}}
-	_, err := e.route(snap, q, e.profileFor(ClassBatch))
-	if !errors.Is(err, ErrInvalidCatalog) {
-		t.Fatalf("err = %v, want errors.Is ErrInvalidCatalog", err)
+	_, err := snap.Prepare(t.Context(), `SELECT id FROM absent`)
+	if !errors.Is(err, ErrTableNotPlaced) {
+		t.Fatalf("err = %v, want errors.Is ErrTableNotPlaced", err)
 	}
 }
 
-// TestRouteConstraintArityComesFromPinnedCatalog proves a request cannot route
-// constraints authored for a different distribution generation.
-func TestRouteConstraintArityComesFromPinnedCatalog(t *testing.T) {
-	snap := testSnapshot(t, 1)
-	e := newRouteExecutor(t, snap)
-	q := &Query{
-		Distribution: "tenant_data",
-		Constraints: distribution.BoundConstraints{
-			distribution.UnknownDomain(),
-			distribution.UnknownDomain(),
-		},
-		SQL: "SELECT 1",
+// TestRoutePlanGenerationFence proves compiled routing metadata cannot cross a
+// catalog generation boundary.
+func TestRoutePlanGenerationFence(t *testing.T) {
+	old := testSnapshot(t, 1)
+	newer := testSnapshot(t, 2)
+	prepared, err := old.Prepare(t.Context(), `SELECT n FROM messages`)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
 	}
-	_, err := e.route(snap, q, e.profileFor(ClassBatch))
+	bound, err := prepared.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	e := newRouteExecutor(t, newer)
+	_, err = e.route(newer, &Query{SQL: `SELECT n FROM messages`}, bound, e.profileFor(ClassBatch))
 	if !errors.Is(err, ErrInvalidCatalog) {
 		t.Fatalf("err = %v, want errors.Is ErrInvalidCatalog", err)
 	}

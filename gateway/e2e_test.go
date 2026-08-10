@@ -35,6 +35,7 @@ type e2eShard struct {
 	kr       distribution.KeyRange
 	address  string
 	server   *shardservice.Server
+	keys     []string
 	ns       []int64
 }
 
@@ -238,13 +239,15 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 
 	// Seed each shard through an uncounted dialer.
 	seedClient := NewClient(plainDial(servers))
-	for _, sh := range shards {
+	for i := range c.shards {
+		c.shards[i].keys = c.keysForShard(t, c.shards[i].id, len(c.shards[i].ns))
+		sh := c.shards[i]
 		c.seed(t, seedClient, sh, `CREATE TABLE messages (tenant_id STRING PRIMARY KEY, n INTEGER NOT NULL)`, nil)
 		for j, n := range sh.ns {
 			c.seed(t, seedClient, sh,
 				`INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
 				[]shardservice.Param{
-					shardservice.StringParam(fmt.Sprintf("%s-r%d", sh.id, j)),
+					shardservice.StringParam(sh.keys[j]),
 					shardservice.NumberParam(fmt.Sprintf("%d", n)),
 				})
 		}
@@ -302,22 +305,28 @@ func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribu
 	return snap
 }
 
-// keyForShard finds a string shard-key value whose native-mapper point resolves
-// to the named shard, so a test can bind a route to a specific shard.
-func (c *e2eCluster) keyForShard(t *testing.T, want distribution.ShardID) distribution.Scalar {
+// keysForShard finds count distinct string values owned by want. The fixture
+// seeds rows under these values, keeping SQL-derived routing and physical data
+// ownership consistent.
+func (c *e2eCluster) keysForShard(t *testing.T, want distribution.ShardID, count int) []string {
 	t.Helper()
+	out := make([]string, 0, count)
 	for i := 0; i < 100000; i++ {
-		s := distribution.NewString(fmt.Sprintf("k%d", i))
+		key := fmt.Sprintf("k%d", i)
+		s := distribution.NewString(key)
 		p, err := c.mapper.PointFor([]distribution.Scalar{s})
 		if err != nil {
 			t.Fatalf("PointFor: %v", err)
 		}
 		if id, ok := c.man.ResolvePoint(p); ok && id == want {
-			return s
+			out = append(out, key)
+			if len(out) == count {
+				return out
+			}
 		}
 	}
-	t.Fatalf("no key resolves to shard %s", want)
-	return distribution.Scalar{}
+	t.Fatalf("found %d keys for shard %s, want %d", len(out), want, count)
+	return nil
 }
 
 // assertDialedOnly asserts every want address was dialed exactly once and no
@@ -337,16 +346,6 @@ func (c *e2eCluster) assertDialedOnly(t *testing.T, want ...string) {
 			t.Fatalf("shard %s dialed %d times, want 0", s.id, got)
 		}
 	}
-}
-
-// mustFinite builds a finite domain over the values, failing the test on error.
-func mustFinite(t *testing.T, values ...distribution.Scalar) distribution.ValueDomain {
-	t.Helper()
-	d, err := distribution.FiniteDomain(values...)
-	if err != nil {
-		t.Fatalf("FiniteDomain: %v", err)
-	}
-	return d
 }
 
 // sortedNs returns the n values of the given shards in ascending order — the
@@ -372,12 +371,10 @@ func TestE2EFanoutShapes(t *testing.T) {
 	c := newE2ECluster(t)
 	holder := NewCatalogHolder(c.snapshot(t, 1))
 
-	k0 := c.keyForShard(t, "s0")
-	k2 := c.keyForShard(t, "s2")
-
 	tests := []struct {
 		name       string
-		cons       distribution.BoundConstraints
+		sql        string
+		params     []shardservice.Param
 		class      OperationClass
 		wantKind   distribution.RouteKind
 		wantShards int
@@ -386,7 +383,8 @@ func TestE2EFanoutShapes(t *testing.T) {
 	}{
 		{
 			name:       "single_shard",
-			cons:       distribution.BoundConstraints{mustFinite(t, k2)},
+			sql:        `SELECT n FROM messages WHERE tenant_id IN (?, ?) ORDER BY n`,
+			params:     stringParams(c.shards[2].keys...),
 			class:      ClassInteractive,
 			wantKind:   distribution.RouteSingle,
 			wantShards: 1,
@@ -395,7 +393,8 @@ func TestE2EFanoutShapes(t *testing.T) {
 		},
 		{
 			name:       "targeted_subset",
-			cons:       distribution.BoundConstraints{mustFinite(t, k0, k2)},
+			sql:        `SELECT n FROM messages WHERE tenant_id IN (?, ?, ?, ?) ORDER BY n`,
+			params:     stringParams(append(append([]string{}, c.shards[0].keys...), c.shards[2].keys...)...),
 			class:      ClassInteractive,
 			wantKind:   distribution.RouteTargeted,
 			wantShards: 2,
@@ -404,7 +403,7 @@ func TestE2EFanoutShapes(t *testing.T) {
 		},
 		{
 			name:       "scatter_all",
-			cons:       distribution.BoundConstraints{distribution.UnknownDomain()},
+			sql:        selectOrdered,
 			class:      ClassBatch,
 			wantKind:   distribution.RouteScatter,
 			wantShards: 4,
@@ -417,11 +416,9 @@ func TestE2EFanoutShapes(t *testing.T) {
 			c.dialer.reset()
 			e := NewExecutor(c.client, holder, Options{})
 			res, err := e.Query(context.Background(), Query{
-				Distribution: c.dist,
-				Constraints:  tc.cons,
-				SQL:          selectOrdered,
-				Class:        tc.class,
-				Order:        []OrderKey{{Column: 0}},
+				SQL:    tc.sql,
+				Params: tc.params,
+				Class:  tc.class,
 			})
 			if err != nil {
 				t.Fatalf("Query: %v", err)
@@ -440,51 +437,50 @@ func TestE2EFanoutShapes(t *testing.T) {
 	}
 }
 
+func stringParams(values ...string) []shardservice.Param {
+	params := make([]shardservice.Param, len(values))
+	for i, value := range values {
+		params[i] = shardservice.StringParam(value)
+	}
+	return params
+}
+
 // TestE2EDistributedWritesRejectedBeforeDispatch proves the distributed read
 // API cannot partially commit or replay a mutation: every mutating statement
-// kind, including INSERT RETURNING, is refused before route dispatch across
-// single, targeted, and scatter shapes. A final read proves shard data stayed
-// unchanged.
+// kind, including INSERT RETURNING, is refused before route planning or
+// dispatch. A final read proves shard data stayed unchanged.
 func TestE2EDistributedWritesRejectedBeforeDispatch(t *testing.T) {
 	c := newE2ECluster(t)
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
-	k0 := c.keyForShard(t, "s0")
-	k2 := c.keyForShard(t, "s2")
 
 	tests := []struct {
 		name  string
 		sql   string
-		cons  distribution.BoundConstraints
 		class OperationClass
 	}{
 		{
 			name:  "single_insert",
 			sql:   `INSERT INTO messages (tenant_id, n) VALUES ('blocked', 99)`,
-			cons:  distribution.BoundConstraints{mustFinite(t, k2)},
 			class: ClassInteractive,
 		},
 		{
 			name:  "targeted_update",
 			sql:   `UPDATE messages SET "$doc" = '{"tenant_id":"blocked","n":99}'`,
-			cons:  distribution.BoundConstraints{mustFinite(t, k0, k2)},
 			class: ClassInteractive,
 		},
 		{
 			name:  "scatter_delete",
 			sql:   `DELETE FROM messages`,
-			cons:  distribution.BoundConstraints{distribution.UnknownDomain()},
 			class: ClassBatch,
 		},
 		{
 			name:  "scatter_ddl",
 			sql:   `DROP TABLE messages`,
-			cons:  distribution.BoundConstraints{distribution.UnknownDomain()},
 			class: ClassBatch,
 		},
 		{
 			name:  "targeted_insert_returning",
 			sql:   `INSERT INTO messages (tenant_id, n) VALUES ('blocked', 99) RETURNING tenant_id`,
-			cons:  distribution.BoundConstraints{mustFinite(t, k0, k2)},
 			class: ClassInteractive,
 		},
 	}
@@ -492,10 +488,8 @@ func TestE2EDistributedWritesRejectedBeforeDispatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c.dialer.reset()
 			_, err := e.Query(context.Background(), Query{
-				Distribution: c.dist,
-				Constraints:  tc.cons,
-				SQL:          tc.sql,
-				Class:        tc.class,
+				SQL:   tc.sql,
+				Class: tc.class,
 			})
 			if !errors.Is(err, ErrWriteNotSupported) {
 				t.Fatalf("Query err = %v, want ErrWriteNotSupported", err)
@@ -512,10 +506,8 @@ func TestE2EDistributedWritesRejectedBeforeDispatch(t *testing.T) {
 
 	c.dialer.reset()
 	_, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          `SELCT broken`,
-		Class:        ClassBatch,
+		SQL:   `SELCT broken`,
+		Class: ClassBatch,
 	})
 	var parseErr *sqlast.ParseError
 	if !errors.As(err, &parseErr) {
@@ -527,11 +519,8 @@ func TestE2EDistributedWritesRejectedBeforeDispatch(t *testing.T) {
 
 	c.dialer.reset()
 	res, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          selectOrdered,
-		Class:        ClassBatch,
-		Order:        []OrderKey{{Column: 0}},
+		SQL:   selectOrdered,
+		Class: ClassBatch,
 	})
 	if err != nil {
 		t.Fatalf("verification read: %v", err)
@@ -548,12 +537,8 @@ func TestE2EGlobalLimitTrim(t *testing.T) {
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
 
 	res, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          selectOrdered,
-		Class:        ClassBatch,
-		Order:        []OrderKey{{Column: 0}},
-		Limit:        3,
+		SQL:   selectOrdered + ` LIMIT 3`,
+		Class: ClassBatch,
 	})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
@@ -577,13 +562,31 @@ func TestE2EPerShardMaxRowsPropagated(t *testing.T) {
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{Profiles: profiles})
 
 	_, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          `SELECT n FROM messages`,
-		Class:        ClassBatch,
+		SQL:   `SELECT n FROM messages`,
+		Class: ClassBatch,
 	})
 	if !errors.Is(err, ErrResultLimit) {
 		t.Fatalf("err = %v, want errors.Is ErrResultLimit", err)
+	}
+}
+
+// TestE2EScatterAggregateRejectedBeforeDispatch proves the planner does not
+// mistake per-shard aggregate rows for a globally correct aggregate. Until a
+// distributed aggregate merge is available, the unsafe shape fails closed
+// before opening any shard connection.
+func TestE2EScatterAggregateRejectedBeforeDispatch(t *testing.T) {
+	c := newE2ECluster(t)
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+
+	_, err := e.Query(context.Background(), Query{
+		SQL:   `SELECT COUNT(*) FROM messages`,
+		Class: ClassBatch,
+	})
+	if !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("err = %v, want errors.Is ErrDistributedPlanUnsupported", err)
+	}
+	if got := c.dialer.totalDials(); got != 0 {
+		t.Fatalf("total dials = %d, want 0 (unsafe aggregate dispatches nowhere)", got)
 	}
 }
 
@@ -608,11 +611,8 @@ func TestE2EDeadlineCancelsOutstanding(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := e.Query(context.Background(), Query{
-			Distribution: c.dist,
-			Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-			SQL:          selectOrdered,
-			Class:        ClassBatch,
-			Order:        []OrderKey{{Column: 0}},
+			SQL:   selectOrdered,
+			Class: ClassBatch,
 		})
 		done <- err
 	}()
@@ -660,11 +660,8 @@ func TestE2EStaleEpochRefreshRetry(t *testing.T) {
 	})
 
 	res, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          selectOrdered,
-		Class:        ClassBatch,
-		Order:        []OrderKey{{Column: 0}},
+		SQL:   selectOrdered,
+		Class: ClassBatch,
 	})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
@@ -691,10 +688,8 @@ func TestE2ETargetedOnlyRejectsScatter(t *testing.T) {
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
 
 	_, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          selectOrdered,
-		Class:        ClassInteractive, // targeted-only
+		SQL:   selectOrdered,
+		Class: ClassInteractive, // targeted-only
 	})
 	if !errors.Is(err, distribution.ErrScatterRejected) {
 		t.Fatalf("err = %v, want errors.Is ErrScatterRejected", err)
@@ -722,11 +717,8 @@ func TestE2EPinsSingleGeneration(t *testing.T) {
 	holder.Publish(c.snapshot(t, 2))
 
 	res, err := e.Query(context.Background(), Query{
-		Distribution: c.dist,
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          selectOrdered,
-		Class:        ClassBatch,
-		Order:        []OrderKey{{Column: 0}},
+		SQL:   selectOrdered,
+		Class: ClassBatch,
 	})
 	if err != nil {
 		t.Fatalf("Query: %v", err)

@@ -28,7 +28,7 @@ func hexPoint(b byte) string {
 
 // testManifest builds a two-shard manifest splitting the keyspace at 0x80, with
 // distinct per-shard leaders and ownership epochs.
-func testManifest(t *testing.T, version distribution.RoutingVersion) *distribution.Manifest {
+func testManifest(t testing.TB, version distribution.RoutingVersion) *distribution.Manifest {
 	t.Helper()
 	shards := []distribution.Shard{
 		{
@@ -52,7 +52,7 @@ func testManifest(t *testing.T, version distribution.RoutingVersion) *distributi
 }
 
 // testConfig builds a one-distribution cluster configuration over testManifest.
-func testConfig(t *testing.T) distribution.ClusterConfig {
+func testConfig(t testing.TB) distribution.ClusterConfig {
 	t.Helper()
 	return distribution.ClusterConfig{
 		Distributions: []distribution.DistributionSpec{{Name: "tenant_data", Arity: 1, MapperVersion: 1}},
@@ -67,7 +67,7 @@ func testEndpoints() map[distribution.EndpointID]string {
 }
 
 // testSnapshot builds a valid snapshot pinned to generation.
-func testSnapshot(t *testing.T, generation uint64) *Snapshot {
+func testSnapshot(t testing.TB, generation uint64) *Snapshot {
 	t.Helper()
 	s, err := NewSnapshot(testConfig(t), testEndpoints(), generation)
 	if err != nil {
@@ -160,7 +160,7 @@ func TestSnapshotPersistDeterministic(t *testing.T) {
 func TestNewSnapshotRejects(t *testing.T) {
 	tests := []struct {
 		name      string
-		config    func(t *testing.T) distribution.ClusterConfig
+		config    func(t testing.TB) distribution.ClusterConfig
 		endpoints map[distribution.EndpointID]string
 		sentinel  error
 	}{
@@ -172,7 +172,7 @@ func TestNewSnapshotRejects(t *testing.T) {
 		},
 		{
 			name: "config_missing_manifest",
-			config: func(t *testing.T) distribution.ClusterConfig {
+			config: func(t testing.TB) distribution.ClusterConfig {
 				return distribution.ClusterConfig{
 					Distributions: []distribution.DistributionSpec{{Name: "tenant_data", Arity: 1, MapperVersion: 1}},
 				}

@@ -117,11 +117,8 @@ func newTwoShardCluster(t *testing.T, version distribution.RoutingVersion) (*Cli
 // scatterQuery is a bounded scatter read of the ordered n column across shards.
 func scatterQuery() Query {
 	return Query{
-		Distribution: "tenant_data",
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          `SELECT n FROM messages ORDER BY n`,
-		Class:        ClassBatch,
-		Order:        []OrderKey{{Column: 0}},
+		SQL:   `SELECT n FROM messages ORDER BY n`,
+		Class: ClassBatch,
 	}
 }
 
@@ -185,15 +182,9 @@ func TestExecutorSingleShardPassthrough(t *testing.T) {
 	}
 	e := NewExecutor(c, NewCatalogHolder(snap), Options{})
 
-	finite, err := distribution.FiniteDomain(distribution.NewString("tenant-x"))
-	if err != nil {
-		t.Fatalf("FiniteDomain: %v", err)
-	}
 	res, err := e.Query(context.Background(), Query{
-		Distribution: "tenant_data",
-		Constraints:  distribution.BoundConstraints{finite},
-		SQL:          `SELECT n FROM messages ORDER BY n`,
-		Class:        ClassInteractive,
+		SQL:   `SELECT n FROM messages WHERE tenant_id = 'x' ORDER BY n`,
+		Class: ClassInteractive,
 	})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
@@ -201,8 +192,8 @@ func TestExecutorSingleShardPassthrough(t *testing.T) {
 	if res.RouteKind != distribution.RouteSingle || res.ShardsFanned != 1 {
 		t.Fatalf("route = %v fanning %d shards, want Single fanning 1", res.RouteKind, res.ShardsFanned)
 	}
-	if got := decodeInts(t, res.Rows); !equalInts(got, []int64{1, 3, 5}) {
-		t.Fatalf("rows = %v, want [1 3 5]", got)
+	if got := decodeInts(t, res.Rows); !equalInts(got, []int64{5}) {
+		t.Fatalf("rows = %v, want [5]", got)
 	}
 }
 
@@ -270,13 +261,16 @@ func TestExecutorFailClosedOnShardError(t *testing.T) {
 	e := NewExecutor(c, NewCatalogHolder(twoShardSnapshot(t, 1, 3)), Options{})
 
 	q := scatterQuery()
-	q.SQL = `SELECT n FROM does_not_exist ORDER BY n` // every shard rejects
+	q.SQL = `SELECT n FROM does_not_exist ORDER BY n`
 	res, err := e.Query(context.Background(), q)
 	if err == nil {
 		t.Fatalf("Query returned a result %+v, want a fail-closed error", res)
 	}
 	if isStaleErr(err) {
-		t.Fatalf("err = %v, want a non-retryable shard error", err)
+		t.Fatalf("err = %v, want a non-retryable planner error", err)
+	}
+	if !errors.Is(err, ErrTableNotPlaced) {
+		t.Fatalf("err = %v, want errors.Is ErrTableNotPlaced", err)
 	}
 }
 
@@ -320,6 +314,25 @@ func TestExecutorCanceledBeforePreflight(t *testing.T) {
 	_, err := e.Query(ctx, Query{SQL: `SELECT 1`})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if dials != 0 {
+		t.Fatalf("dials = %d, want zero", dials)
+	}
+}
+
+func TestExecutorRejectsInvalidParameterBeforeDispatch(t *testing.T) {
+	dials := 0
+	client := NewClient(func(context.Context, string) (net.Conn, error) {
+		dials++
+		return nil, errors.New("unexpected dial")
+	})
+	e := NewExecutor(client, NewCatalogHolder(twoShardSnapshot(t, 1, 3)), Options{})
+	_, err := e.Query(context.Background(), Query{
+		SQL:    `SELECT n FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{{Kind: shardservice.ParamInvalid}},
+	})
+	if !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("err = %v, want ErrPlanParameters", err)
 	}
 	if dials != 0 {
 		t.Fatalf("dials = %d, want zero", dials)

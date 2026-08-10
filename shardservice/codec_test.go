@@ -516,6 +516,12 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 // TestParamRuntimeValue proves each wire parameter materializes into a
 // standard-library value sql/driver's runtime already binds.
 func TestParamRuntimeValue(t *testing.T) {
+	if (Param{Kind: ParamInvalid}).Valid() {
+		t.Error("invalid parameter kind reported valid")
+	}
+	if !StringParam("k").Valid() {
+		t.Error("string parameter reported invalid")
+	}
 	if got := NullParam().RuntimeValue(); got != nil {
 		t.Errorf("null = %v, want nil", got)
 	}

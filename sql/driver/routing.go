@@ -125,7 +125,20 @@ func keyContainsShardColumns(keyColumns, shardColumns []string) bool {
 // the resulting route belong to one execution.
 type constraintProgram struct {
 	binding *placementBinding
-	slots   []predicateSlot
+	shared  *ConstraintProgram
+}
+
+// ConstraintProgram is the immutable, execution-independent routing program
+// compiled from a SQL predicate and an ordered placement key. It records only
+// equality and membership predicates that can safely narrow shard routing;
+// Bind supplies typed parameters later and produces ordinal constraints without
+// reparsing SQL. The program borrows the parsed AST and remains valid for the
+// same lifetime as that AST.
+//
+// It is exported so the embedded cluster facade and distributed gateway share
+// one exact routing implementation rather than maintaining parity by convention.
+type ConstraintProgram struct {
+	slots []predicateSlot
 }
 
 // predicateSlot collects the narrowing predicates a WHERE tree places on one
@@ -148,11 +161,19 @@ type shardConstraint struct {
 // predicates per ordinal. It is the plan-time half of route-after-bind; Bind is
 // the per-execution half.
 func compileConstraintProgram(binding *placementBinding, where *sqlast.Expr) *constraintProgram {
-	prog := &constraintProgram{
+	return &constraintProgram{
 		binding: binding,
-		slots:   make([]predicateSlot, len(binding.placement.Columns)),
+		shared:  CompileConstraintProgram(binding.placement.Columns, where),
 	}
-	prog.discover(where)
+}
+
+// CompileConstraintProgram compiles the plan-time half of shard routing for
+// placementColumns and where. placementColumns are canonical JSON-pointer
+// spellings in shard-key ordinal order. The returned program is immutable and
+// safe for concurrent Bind calls.
+func CompileConstraintProgram(placementColumns []string, where *sqlast.Expr) *ConstraintProgram {
+	prog := &ConstraintProgram{slots: make([]predicateSlot, len(placementColumns))}
+	prog.discover(where, placementColumns)
 	return prog
 }
 
@@ -160,17 +181,17 @@ func compileConstraintProgram(binding *placementBinding, where *sqlast.Expr) *co
 // each leaf places on a shard-key ordinal. Inequalities, ranges, negated IN, and
 // non-shard-key leaves are ignored: they never narrow a finite domain, so the
 // ordinal stays unknown and routing fails closed.
-func (p *constraintProgram) discover(where *sqlast.Expr) {
+func (p *ConstraintProgram) discover(where *sqlast.Expr, placementColumns []string) {
 	if where == nil {
 		return
 	}
 	if where.Kind == sqlast.ExprAnd {
 		for _, kid := range where.Kids {
-			p.discover(kid)
+			p.discover(kid, placementColumns)
 		}
 		return
 	}
-	ordinal, ok := p.matchColumn(where.Path)
+	ordinal, ok := matchPlacementColumn(where.Path, placementColumns)
 	if !ok {
 		return
 	}
@@ -203,12 +224,12 @@ func (p *constraintProgram) discover(where *sqlast.Expr) {
 // matchColumn returns the shard-key ordinal a base-table path addresses. Only
 // the base table (source 0) carries the shard-key columns a single-table write
 // routes on.
-func (p *constraintProgram) matchColumn(path *sqlast.PathExpr) (int, bool) {
+func matchPlacementColumn(path *sqlast.PathExpr, placementColumns []string) (int, bool) {
 	if path == nil || path.Source != 0 {
 		return 0, false
 	}
 	spelling := string(path.AppendPointer(nil))
-	for i, col := range p.binding.placement.Columns {
+	for i, col := range placementColumns {
 		if spelling == col {
 			return i, true
 		}
@@ -221,7 +242,7 @@ func (p *constraintProgram) matchColumn(path *sqlast.PathExpr) (int, bool) {
 // DomainUnknown; intersecting predicates that contradict yield DomainEmpty; and
 // a value that cannot be bound to a placement scalar preserves DomainUnknown, so
 // routing is never narrowed by a value it cannot canonically encode.
-func (p *constraintProgram) Bind(args []any) (distribution.BoundConstraints, error) {
+func (p *ConstraintProgram) Bind(args []any) (distribution.BoundConstraints, error) {
 	cons := make(distribution.BoundConstraints, len(p.slots))
 	builder := distribution.NewConstraintBuilder()
 	var scratch []distribution.Scalar
@@ -253,6 +274,10 @@ func (p *constraintProgram) Bind(args []any) (distribution.BoundConstraints, err
 		cons[i] = builder.Domain()
 	}
 	return cons, nil
+}
+
+func (p *constraintProgram) Bind(args []any) (distribution.BoundConstraints, error) {
+	return p.shared.Bind(args)
 }
 
 // Route binds args and resolves the placed statement to an immutable route using

@@ -1,51 +1,42 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 
-	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+// maxServeRequestBytes bounds one newline-delimited JSON envelope before JSON
+// decoding or SQL parsing. Scanner grows only for an actually large request and
+// releases the buffer with the connection.
+const maxServeRequestBytes = 1 << 20
 
 // The serve subcommand: a stateless routing front-end. It loads an immutable
 // catalog generation, refreshes the atomically replaced catalog file after a
 // shard reports stale routing metadata, and accepts newline-delimited JSON requests over a
 // connection, routes and dispatches each as a bounded distributed read against
 // the pinned generation, and replies with the merged result. The wire form is a
-// minimal, stdlib-only JSON envelope; a request names a distribution, an optional
-// shard-key binding (absent means scatter), the SQL and typed parameters each
-// shard runs locally, an operational class, and the cross-shard sort keys and
-// global limit the gateway merges under.
+// minimal, stdlib-only JSON envelope; a request carries SQL, typed parameters,
+// and an operational class. The pinned catalog and shared SQL planner derive
+// placement, shard constraints, merge order, and the global limit.
 
-// serveRequest is one query envelope a client sends. Key is the bound shard-key
-// value; a nil Key routes as a scatter across every active shard subject to the
-// class's admission.
+// serveRequest is one query envelope a client sends. SQL and its typed
+// parameters are the only semantic inputs; clients cannot override routing or
+// merge metadata independently of the statement.
 type serveRequest struct {
-	Distribution string          `json:"distribution"`
-	Key          *scalarValue    `json:"key,omitempty"`
-	SQL          string          `json:"sql"`
-	Class        string          `json:"class,omitempty"`
-	Params       []serveParam    `json:"params,omitempty"`
-	Order        []serveOrderKey `json:"order,omitempty"`
-	Limit        int             `json:"limit,omitempty"`
-}
-
-// scalarValue is a bound shard-key value in exactly one closed placement scalar
-// form: a string or an exact-decimal number spelling.
-type scalarValue struct {
-	String *string `json:"string,omitempty"`
-	Number *string `json:"number,omitempty"`
+	SQL    string       `json:"sql"`
+	Class  string       `json:"class,omitempty"`
+	Params []serveParam `json:"params,omitempty"`
 }
 
 // serveParam is one typed bound parameter in placeholder order.
@@ -53,12 +44,6 @@ type serveParam struct {
 	Kind string `json:"kind"`
 	Bool bool   `json:"bool,omitempty"`
 	Text string `json:"text,omitempty"`
-}
-
-// serveOrderKey names one cross-shard sort column and its direction.
-type serveOrderKey struct {
-	Column int  `json:"column"`
-	Desc   bool `json:"desc,omitempty"`
 }
 
 // serveResponse is the merged reply plus the routing metadata a client reads for
@@ -107,7 +92,7 @@ func runServe(args []string) int {
 	defer stop()
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
-	if err := serveGateway(ctx, listener, exec, holder, logf); err != nil {
+	if err := serveGateway(ctx, listener, exec, logf); err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", err)
 		return 1
 	}
@@ -132,7 +117,7 @@ func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, 
 // serveGateway accepts connections until ctx is canceled, then closes the
 // listener and drains in-flight connections. It returns nil on a signaled
 // shutdown and the accept error otherwise.
-func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor, holder *gateway.CatalogHolder, logf func(string, ...any)) error {
+func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor, logf func(string, ...any)) error {
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
 	go func() {
@@ -153,7 +138,7 @@ func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Exec
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConn(ctx, conn, exec, holder, logf)
+			handleConn(ctx, conn, exec, logf)
 		}()
 	}
 }
@@ -161,34 +146,38 @@ func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Exec
 // handleConn serves newline-delimited JSON requests on one connection until the
 // peer disconnects or the server shuts down. Closing the connection when ctx is
 // done unblocks a blocked decode so a signaled shutdown drains promptly.
-func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, holder *gateway.CatalogHolder, logf func(string, ...any)) {
+func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf func(string, ...any)) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	dec := json.NewDecoder(conn)
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 4096), maxServeRequestBytes)
 	enc := json.NewEncoder(conn)
-	for {
+	for scanner.Scan() {
 		var req serveRequest
-		if err := dec.Decode(&req); err != nil {
-			if !errors.Is(err, io.EOF) && ctx.Err() == nil {
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			if ctx.Err() == nil {
 				logf("gateway: decode request: %v", err)
 			}
 			return
 		}
-		if err := enc.Encode(execRequest(ctx, exec, holder, req)); err != nil {
+		if err := enc.Encode(execRequest(ctx, exec, req)); err != nil {
 			if ctx.Err() == nil {
 				logf("gateway: encode response: %v", err)
 			}
 			return
 		}
 	}
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		logf("gateway: decode request: %v", err)
+	}
 }
 
-// execRequest translates one request against the pinned generation and dispatches
-// it, mapping any failure into an error reply rather than dropping the connection.
-func execRequest(ctx context.Context, exec *gateway.Executor, holder *gateway.CatalogHolder, req serveRequest) *serveResponse {
-	q, err := buildQuery(holder, req)
+// execRequest translates one request and dispatches it, mapping any failure into
+// an error reply rather than dropping the connection.
+func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) *serveResponse {
+	q, err := buildQuery(req)
 	if err != nil {
 		return &serveResponse{Error: err.Error()}
 	}
@@ -199,23 +188,10 @@ func execRequest(ctx context.Context, exec *gateway.Executor, holder *gateway.Ca
 	return encodeResult(res)
 }
 
-// buildQuery turns a request envelope into a gateway query, resolving the
-// distribution's arity from the current catalog to build the mapper and its bound
-// constraints. A nil key scatters; a present key binds the leading ordinal.
-func buildQuery(holder *gateway.CatalogHolder, req serveRequest) (gateway.Query, error) {
-	snap := holder.Current()
-	if snap == nil {
-		return gateway.Query{}, errors.New("no catalog generation is published")
-	}
-	dist := distribution.DistributionName(req.Distribution)
-	spec, ok := snap.Spec(dist)
-	if !ok {
-		return gateway.Query{}, fmt.Errorf("distribution %q is not in the catalog", req.Distribution)
-	}
-	cons, err := buildConstraints(spec.Arity, req.Key)
-	if err != nil {
-		return gateway.Query{}, err
-	}
+// buildQuery turns a request envelope into a gateway query. Placement, routing,
+// ordering, and limiting are deliberately absent here: the executor derives
+// them from SQL against its pinned catalog generation.
+func buildQuery(req serveRequest) (gateway.Query, error) {
 	params, err := buildParams(req.Params)
 	if err != nil {
 		return gateway.Query{}, err
@@ -224,57 +200,11 @@ func buildQuery(holder *gateway.CatalogHolder, req serveRequest) (gateway.Query,
 	if err != nil {
 		return gateway.Query{}, err
 	}
-	order := make([]gateway.OrderKey, len(req.Order))
-	for i, k := range req.Order {
-		order[i] = gateway.OrderKey{Column: k.Column, Desc: k.Desc}
-	}
 	return gateway.Query{
-		Distribution: dist,
-		Constraints:  cons,
-		SQL:          req.SQL,
-		Params:       params,
-		Class:        class,
-		Order:        order,
-		Limit:        req.Limit,
+		SQL:    req.SQL,
+		Params: params,
+		Class:  class,
 	}, nil
-}
-
-// buildConstraints builds one domain per shard-key ordinal: every ordinal is
-// unknown for a scatter, and a present key binds the leading ordinal to that
-// finite value while the rest stay unknown.
-func buildConstraints(arity int, key *scalarValue) (distribution.BoundConstraints, error) {
-	cons := make(distribution.BoundConstraints, arity)
-	for i := range cons {
-		cons[i] = distribution.UnknownDomain()
-	}
-	if key == nil {
-		return cons, nil
-	}
-	if arity < 1 {
-		return nil, errors.New("distribution has no shard-key ordinal to bind")
-	}
-	scalar, err := key.scalar()
-	if err != nil {
-		return nil, err
-	}
-	finite, err := distribution.FiniteDomain(scalar)
-	if err != nil {
-		return nil, err
-	}
-	cons[0] = finite
-	return cons, nil
-}
-
-// scalar returns the closed placement scalar the bound key names.
-func (v scalarValue) scalar() (distribution.Scalar, error) {
-	switch {
-	case v.String != nil:
-		return distribution.NewString(*v.String), nil
-	case v.Number != nil:
-		return distribution.NewNumber(*v.Number)
-	default:
-		return distribution.Scalar{}, errors.New("key must set string or number")
-	}
 }
 
 // buildParams maps the typed request parameters onto shard-service parameters in

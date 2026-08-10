@@ -114,23 +114,14 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 // Metrics returns a snapshot of the executor's route and fan-out counters.
 func (e *Executor) Metrics() MetricsSnapshot { return e.metrics.Snapshot() }
 
-// Query is one bounded distributed read. It names the distribution to route
-// against, the bound key, the SQL and typed
-// parameters each shard executes locally, the operational class, and the merge
-// specification. The mapper is derived from the pinned catalog generation, not
-// supplied by the caller. Order lists the sort-key columns when the SQL carries
-// an ORDER BY; Limit trims the merged result to the statement's global LIMIT.
+// Query is one bounded distributed read. SQL and its typed parameters are the
+// only semantic inputs; the pinned catalog and shared SQL routing compiler
+// derive the distribution, shard constraints, merge order, and global limit.
 type Query struct {
-	Distribution distribution.DistributionName
-	Constraints  distribution.BoundConstraints
-
 	SQL    string
 	Params []shardservice.Param
 
 	Class OperationClass
-
-	Order []OrderKey
-	Limit int
 }
 
 // Result is a distributed read's merged outcome plus the routing metadata a
@@ -159,14 +150,13 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var parser sqlast.Parser
-	parser.SetCancellationCheck(ctx.Err)
-	var stmt sqlast.Statement
-	if err := parser.ParseStatement(&stmt, q.SQL); err != nil {
-		return nil, err
-	}
-	if stmt.Kind != sqlast.KindSelect {
-		return nil, &WriteNotSupportedError{Kind: stmt.Kind}
+	args := make([]any, len(q.Params))
+	for i := range q.Params {
+		if !q.Params[i].Valid() {
+			return nil, fmt.Errorf("%w: parameter %d has invalid kind %d",
+				ErrPlanParameters, i+1, q.Params[i].Kind)
+		}
+		args[i] = q.Params[i].RuntimeValue()
 	}
 	profile := e.profileFor(q.Class)
 
@@ -176,13 +166,21 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		pl, err := e.route(snap, &q, profile)
+		prepared, err := snap.Prepare(ctx, q.SQL)
+		if err != nil {
+			return nil, err
+		}
+		bound, err := prepared.Bind(args)
+		if err != nil {
+			return nil, err
+		}
+		pl, err := e.route(snap, &q, bound, profile)
 		if err != nil {
 			return nil, err
 		}
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
-		res, err := e.dispatch(ctx, pl, profile, &q)
+		res, err := e.dispatch(ctx, pl, profile)
 		if err == nil {
 			res.RouteKind = pl.kind
 			res.Generation = pl.generation
@@ -249,14 +247,14 @@ func isStaleErr(err error) bool {
 // dispatch executes the routed plan: an empty route returns no rows without
 // contacting a shard, a single-shard route streams through unchanged, and a
 // multi-shard route fans out and merges.
-func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile, q *Query) (*Result, error) {
+func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, error) {
 	switch len(pl.calls) {
 	case 0:
 		return &Result{Kind: shardservice.ResponseRows}, nil
 	case 1:
 		return e.single(ctx, pl.calls[0], p)
 	default:
-		return e.fanout(ctx, pl, p, q)
+		return e.fanout(ctx, pl, p)
 	}
 }
 
@@ -282,7 +280,7 @@ func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Resu
 // enforces the aggregate caps, cancels outstanding shards on a hard failure or
 // once a cap is hit, and merges the results. The partial-result policy is
 // fail-closed: any shard failure fails the whole operation.
-func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile, q *Query) (*Result, error) {
+func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, error) {
 	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
 	defer cancel()
 
@@ -344,7 +342,7 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile, q *Query) (*
 		return nil, firstErr
 	}
 
-	columns, rows, err := mergeRows(results, q.Order, q.Limit)
+	columns, rows, err := mergeRows(results, pl.order, pl.limit)
 	if err != nil {
 		return nil, err
 	}

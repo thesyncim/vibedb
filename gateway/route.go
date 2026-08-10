@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -34,6 +33,8 @@ type plan struct {
 	generation   uint64
 	scatter      ScatterReason
 	calls        []shardCall
+	order        []OrderKey
+	limit        int
 }
 
 // routerPool hands each routing call its own distribution.Router. The Router
@@ -58,31 +59,19 @@ func (rp *routerPool) put(r *distribution.Router) { rp.pool.Put(r) }
 // and carries each target's ownership epoch and the manifest's routing version
 // into the per-shard request. A missing distribution, a rejected route, or an
 // unresolvable endpoint fails closed with a typed error.
-func (e *Executor) route(snap *Snapshot, q *Query, p Profile) (*plan, error) {
-	man, ok := snap.Manifest(q.Distribution)
-	if !ok {
-		return nil, &CatalogError{Reason: fmt.Sprintf("distribution %q has no manifest in generation %d", q.Distribution, snap.Generation())}
+func (e *Executor) route(snap *Snapshot, q *Query, bound *BoundPlan, p Profile) (*plan, error) {
+	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
+		return nil, &CatalogError{Reason: "distributed plan does not belong to the pinned catalog generation"}
 	}
-	spec, ok := snap.Spec(q.Distribution)
-	if !ok {
-		return nil, &CatalogError{Reason: fmt.Sprintf("distribution %q has no specification in generation %d", q.Distribution, snap.Generation())}
-	}
-	if spec.MapperVersion != distribution.NativeMapperVersion {
-		return nil, &CatalogError{Reason: fmt.Sprintf(
-			"distribution %q mapper version %d is unsupported",
-			q.Distribution, spec.MapperVersion)}
-	}
-	if len(q.Constraints) != spec.Arity {
-		return nil, &CatalogError{Reason: fmt.Sprintf(
-			"distribution %q has %d constraints but generation %d requires arity %d",
-			q.Distribution, len(q.Constraints), snap.Generation(), spec.Arity)}
-	}
-	mapper := distribution.NewNativeMapper(spec.Arity)
+	mapper := distribution.NewNativeMapper(bound.spec.Arity)
 
 	r := e.routers.get()
-	route, err := r.Route(q.Constraints, mapper, man, p.Policy)
+	route, err := r.Route(bound.constraints, mapper, bound.manifest, p.Policy)
 	e.routers.put(r)
 	if err != nil {
+		return nil, err
+	}
+	if err := bound.ValidateRoute(route); err != nil {
 		return nil, err
 	}
 
@@ -117,8 +106,10 @@ func (e *Executor) route(snap *Snapshot, q *Query, p Profile) (*plan, error) {
 		distribution: route.Distribution,
 		version:      route.RoutingVersion,
 		generation:   snap.Generation(),
-		scatter:      scatterReason(route.Kind, q.Constraints),
+		scatter:      scatterReason(route.Kind, bound.constraints),
 		calls:        calls,
+		order:        bound.order,
+		limit:        bound.limit,
 	}, nil
 }
 

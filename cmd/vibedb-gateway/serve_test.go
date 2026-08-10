@@ -109,7 +109,7 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 	}
 
 	// Run the serve front-end on its own loopback listener.
-	exec, holder, err := newGateway(catalogPath)
+	exec, _, err := newGateway(catalogPath)
 	if err != nil {
 		t.Fatalf("newGateway: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() {
-		served <- serveGateway(ctx, front, exec, holder, func(string, ...any) {})
+		served <- serveGateway(ctx, front, exec, func(string, ...any) {})
 	}()
 
 	// Issue a scatter read as JSON and read back the merged, ordered result.
@@ -132,10 +132,8 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	req := serveRequest{
-		Distribution: "tenant_data",
-		SQL:          `SELECT n FROM messages ORDER BY n`,
-		Class:        "batch",
-		Order:        []serveOrderKey{{Column: 0}},
+		SQL:   `SELECT n FROM messages ORDER BY n`,
+		Class: "batch",
 	}
 	if err := json.NewEncoder(conn).Encode(&req); err != nil {
 		t.Fatalf("encode request: %v", err)
@@ -226,11 +224,8 @@ func TestNewGatewayReloadsCatalogAfterStaleRefusal(t *testing.T) {
 	}
 
 	res, err := exec.Query(context.Background(), gateway.Query{
-		Distribution: "tenant_data",
-		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		SQL:          `SELECT n FROM messages ORDER BY n`,
-		Class:        gateway.ClassBatch,
-		Order:        []gateway.OrderKey{{Column: 0}},
+		SQL:   `SELECT n FROM messages ORDER BY n`,
+		Class: gateway.ClassBatch,
 	})
 	if err != nil {
 		t.Fatalf("Query: %v", err)

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
 )
@@ -59,6 +61,19 @@ type Snapshot struct {
 	distribution.ClusterConfig
 	endpoints  map[distribution.EndpointID]string
 	generation uint64
+	planner    []plannerTable
+	planSeed   maphash.Seed
+	planCache  atomic.Pointer[preparedPlanCache]
+}
+
+// plannerTable is the compact, cache-friendly table directory used only by the
+// distributed planner. Strings and catalog records stay in ClusterConfig; this
+// entry stores only 32-bit indices, avoiding both a retained hash map and a
+// duplicate string header per table on the route hot path.
+type plannerTable struct {
+	placement uint32
+	spec      uint32
+	manifest  uint32
 }
 
 // NewSnapshot validates config and endpoints and returns an immutable snapshot
@@ -89,15 +104,90 @@ func NewSnapshot(config distribution.ClusterConfig, endpoints map[distribution.E
 			}
 		}
 	}
+	cloned := cloneConfig(config)
+	planner := buildPlannerTables(cloned)
 	return &Snapshot{
-		ClusterConfig: cloneConfig(config),
+		ClusterConfig: cloned,
 		endpoints:     maps.Clone(endpoints),
 		generation:    generation,
+		planner:       planner,
+		planSeed:      maphash.MakeSeed(),
 	}, nil
 }
 
 // Generation reports this snapshot's monotonic publication generation.
 func (s *Snapshot) Generation() uint64 { return s.generation }
+
+// PlannerMetadataBytes reports the retained bytes in the compact table
+// directory itself. Table, column, distribution, and manifest strings are
+// shared with ClusterConfig and therefore are not counted twice.
+func (s *Snapshot) PlannerMetadataBytes() uint64 {
+	return uint64(cap(s.planner)) * uint64(unsafe.Sizeof(plannerTable{}))
+}
+
+// plannerTableFor resolves a logical table to its placement, distribution spec,
+// and manifest with one binary search and no allocation.
+func (s *Snapshot) plannerTableFor(table string) (
+	distribution.TablePlacement,
+	distribution.DistributionSpec,
+	*distribution.Manifest,
+	bool,
+) {
+	lo, hi := 0, len(s.planner)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		candidate := s.Placements[s.planner[mid].placement].Table
+		if candidate < table {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == len(s.planner) || s.Placements[s.planner[lo].placement].Table != table {
+		return distribution.TablePlacement{}, distribution.DistributionSpec{}, nil, false
+	}
+	entry := s.planner[lo]
+	return s.Placements[entry.placement],
+		s.Distributions[entry.spec],
+		s.Manifests[entry.manifest],
+		true
+}
+
+func buildPlannerTables(config distribution.ClusterConfig) []plannerTable {
+	if len(config.Placements) == 0 {
+		return nil
+	}
+	specs := make(map[distribution.DistributionName]uint32, len(config.Distributions))
+	for i := range config.Distributions {
+		specs[config.Distributions[i].Name] = uint32(i)
+	}
+	manifests := make(map[distribution.DistributionName]uint32, len(config.Manifests))
+	for i := range config.Manifests {
+		manifests[config.Manifests[i].Distribution()] = uint32(i)
+	}
+	entries := make([]plannerTable, len(config.Placements))
+	for i := range config.Placements {
+		placement := &config.Placements[i]
+		entries[i] = plannerTable{
+			placement: uint32(i),
+			spec:      specs[placement.Distribution],
+			manifest:  manifests[placement.Distribution],
+		}
+	}
+	slices.SortFunc(entries, func(a, b plannerTable) int {
+		at := config.Placements[a.placement].Table
+		bt := config.Placements[b.placement].Table
+		switch {
+		case at < bt:
+			return -1
+		case at > bt:
+			return 1
+		default:
+			return 0
+		}
+	})
+	return entries
+}
 
 // OwnershipEpoch returns the fencing epoch the named shard is served under in
 // this generation, read from the distribution's manifest — the single source of
@@ -121,14 +211,43 @@ func (s *Snapshot) OwnershipEpoch(dist distribution.DistributionName, shard dist
 // immutable, so only the pointer slice and the mutable placement columns are
 // cloned.
 func cloneConfig(c distribution.ClusterConfig) distribution.ClusterConfig {
+	// Placement columns are numerous and tiny. Store every placement's slice in
+	// one flat backing array and intern repeated distribution/column spellings,
+	// replacing O(tables) small allocations with two compact arrays.
+	columnCount := 0
+	for i := range c.Placements {
+		columnCount += len(c.Placements[i].Columns)
+	}
+	columnArena := make([]string, columnCount)
+	interned := make(map[string]string, len(c.Distributions)+columnCount)
+	intern := func(value string) string {
+		if canonical, ok := interned[value]; ok {
+			return canonical
+		}
+		interned[value] = value
+		return value
+	}
 	out := distribution.ClusterConfig{
 		Distributions: slices.Clone(c.Distributions),
 		Manifests:     slices.Clone(c.Manifests),
 	}
+	for i := range out.Distributions {
+		out.Distributions[i].Name = distribution.DistributionName(
+			intern(string(out.Distributions[i].Name)),
+		)
+	}
 	if c.Placements != nil {
 		out.Placements = make([]distribution.TablePlacement, len(c.Placements))
+		columnOffset := 0
 		for i, p := range c.Placements {
-			p.Columns = slices.Clone(p.Columns)
+			p.Table = intern(p.Table)
+			p.Distribution = distribution.DistributionName(intern(string(p.Distribution)))
+			start := columnOffset
+			for _, column := range p.Columns {
+				columnArena[columnOffset] = intern(column)
+				columnOffset++
+			}
+			p.Columns = columnArena[start:columnOffset:columnOffset]
 			out.Placements[i] = p
 		}
 	}
