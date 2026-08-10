@@ -16,9 +16,9 @@ import (
 )
 
 var (
-	// ErrTxConflict reports that another committed write changed a key in this
-	// transaction's write set after Begin. Nothing was published; the caller
-	// owns the retry loop.
+	// ErrTxConflict reports that another committed write changed a key or coarse
+	// collection dependency in this serializable transaction after Begin.
+	// Nothing was published; the caller owns the retry loop.
 	ErrTxConflict = errors.New("vibedb: transaction conflict")
 	// ErrTxTooLarge reports that a transaction exceeded a bounded limit
 	// (collections, documents, or bytes). Nothing was staged or published.
@@ -49,6 +49,12 @@ const (
 	defaultFacadeBatchValueBytes   = 16 << 20
 	defaultFacadeMaxBatchBytes     = defaultFacadeMaxBatchDocuments*defaultMaxKeyBytes +
 		defaultFacadeBatchValueBytes
+	maxSerializableReadKeys           = 4096
+	maxSerializableReadBytes          = 1 << 20
+	maxSerializableReadCollections    = 128
+	maxSerializableHistoryCollections = maxSerializableReadCollections
+	maxTxnActiveCount                 = ^uint64(0)
+	maxTxnRevision                    = ^uint64(0)
 )
 
 // Update runs fn inside a read-write transaction. On a nil return it commits;
@@ -98,14 +104,15 @@ func (d *Database) runClosure(readOnly bool, fn func(*Tx) error) (err error) {
 	return tx.Commit()
 }
 
-// Begin starts a read-write transaction: arms per-collection conflict clocks,
-// then captures one coherent multi-collection cut.
+// Begin starts a serializable read-write transaction: it samples and arms one
+// database-global logical clock before capturing a coherent multi-collection
+// cut.
 func (d *Database) Begin() (*Tx, error) {
 	return d.begin(false)
 }
 
-// BeginReadOnly starts a read-only transaction over one coherent cut. Clocks
-// are not armed; mutations refuse with ErrTxReadOnly.
+// BeginReadOnly starts a read-only transaction over one coherent cut. The
+// logical clock is not armed and commit needs no validation.
 func (d *Database) BeginReadOnly() (*Tx, error) {
 	return d.begin(true)
 }
@@ -120,11 +127,11 @@ func (d *Database) begin(readOnly bool) (*Tx, error) {
 		colls:    make(map[string]*txCollectionState),
 	}
 	if !readOnly {
-		d.armClocksForBegin(tx)
+		d.armClockForBegin(tx)
 	}
 	if err := tx.captureCut(); err != nil {
 		if !readOnly {
-			d.finishClocks(tx, nil)
+			d.finishClock(tx, nil)
 		}
 		return nil, err
 	}
@@ -145,9 +152,14 @@ type Tx struct {
 
 	colls map[string]*txCollectionState
 
-	// beginRevs records Conflict begin revisions for every collection whose
-	// clock was Begun for this transaction (cataloged at Begin or first write).
-	beginRevs map[string]uint64
+	beginRev   uint64
+	clockArmed bool
+
+	// Exact read tracking is bounded across the transaction. A collection
+	// adaptively escalates to its coarse marker before either bound is crossed.
+	readKeys        int
+	readBytes       int
+	readCollections int
 
 	// stagedTotals track cross-collection admission against TxnLimits.
 	stagedDocs  int
@@ -173,8 +185,11 @@ type txCollectionState struct {
 	maxBytes int
 
 	overlaySource query.FileOverlaySource
-	beginRev      uint64
-	hasBegin      bool
+
+	readSet     map[string]struct{}
+	readOrder   []string
+	coarseRead  bool
+	readTracked bool
 
 	keyChunk  []byte
 	keyChunks [][]byte
@@ -221,6 +236,8 @@ func (t *Tx) Commit() error {
 
 	dirty := t.dirtyStates()
 	if len(dirty) == 0 {
+		// With no publication this cut can serialize at Begin, so even a
+		// read-write handle that only read needs no commit-time validation.
 		t.finish(nil)
 		return nil
 	}
@@ -236,8 +253,9 @@ func (t *Tx) Commit() error {
 	// publication, and conflict-clock recording. A direct Put/Delete on a dirty
 	// collection therefore linearizes wholly before validation or after COMMIT;
 	// writes to unrelated collections remain independent.
-	lockedCollections := make([]*Collection, 0, len(dirty))
-	for _, state := range dirty {
+	participants := t.participantStates()
+	lockedCollections := make([]*Collection, 0, len(participants))
+	for _, state := range participants {
 		collection := db.Collection(state.name)
 		collection.txnFence.Lock()
 		lockedCollections = append(lockedCollections, collection)
@@ -260,6 +278,10 @@ func (t *Tx) Commit() error {
 		)
 	}
 
+	if err := t.validateDependencies(participants); err != nil {
+		t.finish(nil)
+		return err
+	}
 	for _, state := range dirty {
 		if err := t.validateState(state); err != nil {
 			t.finish(nil)
@@ -282,6 +304,7 @@ func (t *Tx) Commit() error {
 	}
 
 	var commitErr error
+	published := t.publicationKeys(dirty)
 	switch {
 	case len(dirty) == 1 && db.profile != Memory:
 		commitErr = t.commitSingleDurable(dirty[0])
@@ -291,10 +314,19 @@ func (t *Tx) Commit() error {
 		commitErr = t.commitMultiDurable(dirty)
 	}
 	if commitErr != nil {
-		t.finish(nil)
+		// Once publication has been attempted, conservatively advance logical
+		// history even when the storage outcome is unknown. Ordinary failures may
+		// create a false conflict for an already-open transaction; omitting this
+		// edge could allow an uncertain durable publication to go undetected.
+		t.finish(published)
 		return facadeTxnError(commitErr)
 	}
 
+	t.finish(published)
+	return nil
+}
+
+func (t *Tx) publicationKeys(dirty []*txCollectionState) map[string][]string {
 	published := make(map[string][]string, len(dirty))
 	for _, state := range dirty {
 		keys := make([]string, 0, len(state.order))
@@ -309,8 +341,7 @@ func (t *Tx) Commit() error {
 			published[state.name] = keys
 		}
 	}
-	t.finish(published)
-	return nil
+	return published
 }
 
 // Rollback discards staged writes and finishes the transaction. After Commit it
@@ -330,11 +361,27 @@ func (t *Tx) finish(published map[string][]string) {
 	t.done = true
 	t.releaseCuts()
 	if t.db != nil && !t.readOnly {
-		t.db.finishClocks(t, published)
+		t.db.finishClock(t, published)
 	}
+	t.scrubStates()
 	t.db = nil
 	t.colls = nil
-	t.beginRevs = nil
+}
+
+func (t *Tx) scrubStates() {
+	for _, state := range t.colls {
+		state.diskSnap = nil
+		state.heapSnap = store.Snapshot{}
+		state.hasHeap = false
+		state.pending = nil
+		state.order = nil
+		state.overlaySource = query.FileOverlaySource{}
+		state.readSet = nil
+		state.readOrder = nil
+		state.keyChunk = nil
+		state.keyChunks = nil
+		state.canonical = nil
+	}
 }
 
 func (t *Tx) releaseCuts() {
@@ -365,9 +412,6 @@ func (t *Tx) captureCut() error {
 			state.heapSnap = snap
 			state.absent = !ok
 			t.colls[info.Name] = state
-			if !t.readOnly {
-				t.beginClock(state)
-			}
 		}
 	default:
 		if db.disk == nil {
@@ -384,9 +428,6 @@ func (t *Tx) captureCut() error {
 			state.diskSnap = snap
 			state.absent = snap == nil
 			t.colls[name] = state
-			if !t.readOnly {
-				t.beginClock(state)
-			}
 			return true
 		})
 	}
@@ -425,26 +466,7 @@ func (t *Tx) ensureCollection(name string) *txCollectionState {
 		}
 	}
 	t.colls[name] = state
-	if !t.readOnly && !t.done {
-		t.beginClock(state)
-	}
 	return state
-}
-
-func (t *Tx) beginClock(state *txCollectionState) {
-	if state.hasBegin || t.db == nil {
-		return
-	}
-	t.db.clockMu.Lock()
-	clock := t.db.clockLocked(state.name)
-	clock.Arm()
-	state.beginRev = clock.Begin()
-	t.db.clockMu.Unlock()
-	state.hasBegin = true
-	if t.beginRevs == nil {
-		t.beginRevs = make(map[string]uint64)
-	}
-	t.beginRevs[state.name] = state.beginRev
 }
 
 func (t *Tx) dirtyStates() []*txCollectionState {
@@ -460,6 +482,17 @@ func (t *Tx) dirtyStates() []*txCollectionState {
 	return dirty
 }
 
+func (t *Tx) participantStates() []*txCollectionState {
+	states := make([]*txCollectionState, 0, len(t.colls))
+	for _, state := range t.colls {
+		if state.hasPublishableWrites() || state.coarseRead || len(state.readOrder) != 0 {
+			states = append(states, state)
+		}
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].name < states[j].name })
+	return states
+}
+
 func (s *txCollectionState) hasPublishableWrites() bool {
 	for _, key := range s.order {
 		entry := s.pending[key]
@@ -473,14 +506,6 @@ func (s *txCollectionState) hasPublishableWrites() bool {
 
 func (t *Tx) validateState(state *txCollectionState) error {
 	db := t.db
-	keys := state.order
-	db.clockMu.Lock()
-	clock := db.clockLocked(state.name)
-	_, _, conflict := clock.Conflict(state.beginRev, keys)
-	db.clockMu.Unlock()
-	if conflict {
-		return fmt.Errorf("%w: collection %q", ErrTxConflict, state.name)
-	}
 	coll := db.Collection(state.name)
 	memory, disk, err := coll.backend(false)
 	if err != nil {
@@ -521,6 +546,39 @@ func (t *Tx) validateState(state *txCollectionState) error {
 		scratch = cur
 		if found != state.pending[key].existed {
 			return fmt.Errorf("%w: collection %q key %q", ErrTxConflict, state.name, key)
+		}
+	}
+	return nil
+}
+
+func (t *Tx) validateDependencies(states []*txCollectionState) error {
+	db := t.db
+	db.clockMu.Lock()
+	defer db.clockMu.Unlock()
+	if db.txnRevisionStopped ||
+		(db.txnHistoryFloor != 0 && t.beginRev < db.txnHistoryFloor) {
+		return fmt.Errorf("%w: bounded database history", ErrTxConflict)
+	}
+	for _, state := range states {
+		history := db.txnHistories[state.name]
+		if state.coarseRead {
+			if history.ConflictCollection(t.beginRev) {
+				return fmt.Errorf("%w: collection %q", ErrTxConflict, state.name)
+			}
+			continue
+		}
+		for _, key := range state.readOrder {
+			if history.ConflictPoint(t.beginRev, key) {
+				return fmt.Errorf("%w: collection %q key %q", ErrTxConflict, state.name, key)
+			}
+		}
+		for _, key := range state.order {
+			if _, alreadyRead := state.readSet[key]; alreadyRead {
+				continue
+			}
+			if history.ConflictPoint(t.beginRev, key) {
+				return fmt.Errorf("%w: collection %q key %q", ErrTxConflict, state.name, key)
+			}
 		}
 	}
 	return nil
@@ -636,6 +694,9 @@ func (c *TxCollection) Append(dst []byte, key string) ([]byte, bool, error) {
 	if err := c.keyError(key); err != nil {
 		return dst, false, err
 	}
+	if err := c.tx.trackPointRead(c.state, key); err != nil {
+		return dst, false, err
+	}
 	if entry, ok := c.state.pending[key]; ok {
 		if entry.remove {
 			return dst, false, nil
@@ -683,6 +744,9 @@ func (c *TxCollection) Put(key string, document []byte) (created bool, err error
 	}
 	c.state.canonical = canonical
 	owned := append([]byte(nil), canonical...)
+	if err := c.tx.trackPointRead(c.state, key); err != nil {
+		return false, err
+	}
 	baseExisted, err := c.baseExisted(key)
 	if err != nil {
 		return false, err
@@ -708,6 +772,9 @@ func (c *TxCollection) Delete(key string) (deleted bool, err error) {
 	if err := c.keyError(key); err != nil {
 		return false, err
 	}
+	if err := c.tx.trackPointRead(c.state, key); err != nil {
+		return false, err
+	}
 	baseExisted, err := c.baseExisted(key)
 	if err != nil {
 		return false, err
@@ -729,6 +796,9 @@ func (c *TxCollection) Range(fn func(key string, document []byte) error) error {
 	}
 	if fn == nil {
 		return nil
+	}
+	if err := c.tx.trackCollectionRead(c.state); err != nil {
+		return err
 	}
 	seen := make(map[string]struct{}, len(c.state.pending))
 	visit := func(key string, document []byte) error {
@@ -782,6 +852,9 @@ func (c *TxCollection) Run(compiled *query.Query) (query.Result, error) {
 	}
 	if compiled == nil {
 		return query.Result{}, ErrInvalidQuery
+	}
+	if err := c.tx.trackCollectionRead(c.state); err != nil {
+		return query.Result{}, err
 	}
 	if len(c.state.pending) == 0 {
 		if c.state.hasHeap {
@@ -862,6 +935,59 @@ func (c *TxCollection) snapshotHas(key string) (bool, error) {
 		return ok, facadeError(err)
 	}
 	return false, nil
+}
+
+func (t *Tx) trackPointRead(state *txCollectionState, key string) error {
+	if t == nil || t.readOnly || state == nil || state.coarseRead {
+		return nil
+	}
+	if state.readSet != nil {
+		if _, exists := state.readSet[key]; exists {
+			return nil
+		}
+	}
+	if !state.readTracked {
+		if t.readCollections >= maxSerializableReadCollections {
+			return fmt.Errorf("%w: read collections", ErrTxTooLarge)
+		}
+		t.readCollections++
+		state.readTracked = true
+	}
+	bytes := len(state.name) + len(key) + 2*10 + 1
+	if t.readKeys >= maxSerializableReadKeys ||
+		t.readBytes+bytes > maxSerializableReadBytes {
+		return t.trackCollectionRead(state)
+	}
+	if state.readSet == nil {
+		state.readSet = make(map[string]struct{})
+	}
+	owned := state.ownKey(key)
+	state.readSet[owned] = struct{}{}
+	state.readOrder = append(state.readOrder, owned)
+	t.readKeys++
+	t.readBytes += bytes
+	return nil
+}
+
+func (t *Tx) trackCollectionRead(state *txCollectionState) error {
+	if t == nil || t.readOnly || state == nil || state.coarseRead {
+		return nil
+	}
+	if !state.readTracked {
+		if t.readCollections >= maxSerializableReadCollections {
+			return fmt.Errorf("%w: read collections", ErrTxTooLarge)
+		}
+		t.readCollections++
+		state.readTracked = true
+	}
+	// readKeys/readBytes are monotonic retained-memory high-water counters.
+	// ownKey's arena remains live until transaction finish even after exact
+	// dependencies are replaced by the coarse marker, so subtracting here would
+	// permit sequential escalations to retain an unbounded number of arenas.
+	state.readSet = nil
+	state.readOrder = nil
+	state.coarseRead = true
+	return nil
 }
 
 func (t *Tx) stage(
@@ -1081,54 +1207,170 @@ func (d *Database) batchBounds(name string) (maxDocs, maxBytes int) {
 	return maxDocs, maxBytes
 }
 
-// clockLocked returns the per-collection conflict clock, creating it if needed.
-// Caller must hold clockMu.
-func (d *Database) clockLocked(name string) *txnclock.Clock {
-	if d.clocks == nil {
-		d.clocks = make(map[string]*txnclock.Clock)
-	}
-	clock := d.clocks[name]
-	if clock == nil {
-		clock = &txnclock.Clock{}
-		d.clocks[name] = clock
-	}
-	return clock
-}
-
-func (d *Database) armClocksForBegin(tx *Tx) {
+func (d *Database) armClockForBegin(tx *Tx) {
 	d.clockMu.Lock()
-	d.rwTxCount++
+	if d.txnActive == nil {
+		d.txnActive = make(map[uint64]uint64)
+	}
+	tx.beginRev = d.txnRevision
+	d.txnActive[tx.beginRev] = incrementTxnHolderCount(d.txnActive[tx.beginRev])
+	active := d.txnActiveCount.Load()
+	if active != maxTxnActiveCount {
+		d.txnActiveCount.Store(incrementTxnHolderCount(active))
+	}
+	tx.clockArmed = true
 	d.clockMu.Unlock()
-	_ = tx
 }
 
-func (d *Database) finishClocks(tx *Tx, published map[string][]string) {
+func (d *Database) finishClock(tx *Tx, published map[string][]string) {
 	d.clockMu.Lock()
 	defer d.clockMu.Unlock()
-	if published != nil {
-		for name, keys := range published {
-			d.clockLocked(name).RecordKeys(keys)
-		}
+	// This transaction is one active holder. If it is the only holder, a future
+	// Begin necessarily captures its already-published storage state and no
+	// logical history needs to be materialized.
+	if published != nil && d.txnActiveCount.Load() > 1 {
+		d.recordPublishedLocked(published)
 	}
-	for name, rev := range tx.beginRevs {
-		if clock := d.clocks[name]; clock != nil {
-			clock.Finish(rev)
-			clock.Disarm()
-		}
+	if !tx.clockArmed {
+		return
 	}
-	if d.rwTxCount > 0 {
-		d.rwTxCount--
+	count := d.txnActive[tx.beginRev]
+	switch count {
+	case maxTxnActiveCount:
+		// Saturation permanently reserves this revision. Its exact holder count
+		// is unknowable, so no Finish may declare it quiescent.
+	case 0, 1:
+		delete(d.txnActive, tx.beginRev)
+	default:
+		d.txnActive[tx.beginRev] = count - 1
+	}
+	active := d.txnActiveCount.Load()
+	if active != maxTxnActiveCount && active != 0 {
+		d.txnActiveCount.Store(active - 1)
+	}
+	tx.clockArmed = false
+	if d.txnActiveCount.Load() == 0 {
+		d.txnActive = nil
+		d.txnHistories = nil
+		d.txnHistoryFloor = 0
+		return
+	}
+	oldest := d.oldestActiveLocked()
+	if d.txnHistoryFloor != 0 && oldest >= d.txnHistoryFloor {
+		d.txnHistoryFloor = 0
 	}
 }
 
 func (d *Database) recordClockKey(name, key string) {
-	d.clockMu.Lock()
-	defer d.clockMu.Unlock()
-	clock := d.clocks[name]
-	if clock == nil {
+	if d.txnActiveCount.Load() == 0 {
 		return
 	}
-	clock.RecordKeys([]string{key})
+	d.clockMu.Lock()
+	defer d.clockMu.Unlock()
+	if d.txnActiveCount.Load() == 0 {
+		return
+	}
+	revision, ok := d.nextTxnRevisionLocked()
+	if !ok {
+		return
+	}
+	oldest := d.oldestActiveLocked()
+	if !d.ensureHistoryCapacityLocked(revision, oldest, 1, name) {
+		return
+	}
+	d.txnHistories[name].RecordAt(revision, oldest, []string{key})
+}
+
+func (d *Database) recordPublishedLocked(published map[string][]string) {
+	revision, ok := d.nextTxnRevisionLocked()
+	if !ok {
+		return
+	}
+	oldest := d.oldestActiveLocked()
+	missing := 0
+	for name, keys := range published {
+		if len(keys) != 0 && d.txnHistories[name] == nil {
+			missing++
+		}
+	}
+	if len(d.txnHistories)+missing > maxSerializableHistoryCollections {
+		d.txnHistoryFloor = revision
+		d.txnHistories = nil
+		return
+	}
+	if d.txnHistoryFloor != 0 && oldest >= d.txnHistoryFloor {
+		d.txnHistoryFloor = 0
+	}
+	if d.txnHistories == nil {
+		d.txnHistories = make(map[string]*txnclock.ExternalHistory, missing)
+	}
+	for name, keys := range published {
+		if len(keys) == 0 {
+			continue
+		}
+		history := d.txnHistories[name]
+		if history == nil {
+			history = &txnclock.ExternalHistory{}
+			d.txnHistories[name] = history
+		}
+		history.RecordAt(revision, oldest, keys)
+	}
+}
+
+func (d *Database) ensureHistoryCapacityLocked(
+	revision, oldest uint64,
+	missing int,
+	name string,
+) bool {
+	if d.txnHistoryFloor != 0 && oldest >= d.txnHistoryFloor {
+		d.txnHistoryFloor = 0
+	}
+	if d.txnHistories[name] != nil {
+		return true
+	}
+	if len(d.txnHistories)+missing > maxSerializableHistoryCollections {
+		d.txnHistoryFloor = revision
+		d.txnHistories = nil
+		return false
+	}
+	if d.txnHistories == nil {
+		d.txnHistories = make(map[string]*txnclock.ExternalHistory)
+	}
+	d.txnHistories[name] = &txnclock.ExternalHistory{}
+	return true
+}
+
+func (d *Database) nextTxnRevisionLocked() (uint64, bool) {
+	if d.txnRevisionStopped {
+		return d.txnRevision, false
+	}
+	if d.txnRevision == maxTxnRevision {
+		if d.txnActive[maxTxnRevision] != 0 {
+			d.txnRevisionStopped = true
+			d.txnHistories = nil
+			return d.txnRevision, false
+		}
+		return d.txnRevision, true
+	}
+	d.txnRevision++
+	return d.txnRevision, true
+}
+
+func incrementTxnHolderCount(count uint64) uint64 {
+	if count >= maxTxnActiveCount-1 {
+		return maxTxnActiveCount
+	}
+	return count + 1
+}
+
+func (d *Database) oldestActiveLocked() uint64 {
+	oldest := maxTxnRevision
+	for revision := range d.txnActive {
+		if revision < oldest {
+			oldest = revision
+		}
+	}
+	return oldest
 }
 
 func (d *Database) enterUpdateClosure() error {

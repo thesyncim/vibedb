@@ -1,4 +1,4 @@
-// Package txnclock owns the bounded first-committer-wins conflict clock shared
+// Package txnclock owns bounded first-committer-wins conflict histories shared
 // by the SQL driver and the native facade.
 //
 // Record is gated by Arm/Disarm: when the armed count is zero, RecordKeys is an
@@ -17,7 +17,8 @@ import "sync/atomic"
 // exact per-key semantics.
 const HistoryKeys = 4096
 
-// Clock is a bounded, per-collection first-committer-wins conflict clock.
+// Clock is a bounded, internally revisioned first-committer-wins conflict
+// clock. ExternalHistory is the externally revisioned alternative.
 //
 // Writes retains only the newest write revision for keys that can still
 // conflict with an active transaction. Once the oldest transaction finishes,

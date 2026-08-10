@@ -254,9 +254,17 @@ type Database struct {
 	// transaction on this handle. Begin does not take it; think-time overlaps.
 	commitMu sync.Mutex
 
-	clockMu   sync.Mutex
-	clocks    map[string]*txnclock.Clock
-	rwTxCount int
+	// The native serializable lane samples one database-global logical revision
+	// before capturing its cut, then retains independently bounded histories per
+	// collection. This preserves lazy-collection correctness without allowing
+	// unrelated key churn to overflow another collection's exact history.
+	clockMu            sync.Mutex
+	txnRevision        uint64
+	txnRevisionStopped bool
+	txnActive          map[uint64]uint64
+	txnActiveCount     atomic.Uint64
+	txnHistoryFloor    uint64
+	txnHistories       map[string]*txnclock.ExternalHistory
 
 	// Deterministic in-package concurrency seams. Production leaves both nil.
 	testAfterTxValidation     func()
@@ -294,7 +302,6 @@ func Open(path string, options ...Option) (*Database, error) {
 		maxDocumentBytes: normalized.maxDocumentBytes,
 		txnLimits:        normalized.txnLimits,
 		handles:          make(map[string]*Collection),
-		clocks:           make(map[string]*txnclock.Clock),
 	}
 	if normalized.profile == Memory {
 		return db, nil
@@ -733,7 +740,7 @@ func (c *Collection) Delete(key string) (deleted bool, err error) {
 	}
 	if memory != nil {
 		deleted, err = memory.Delete(key)
-		if err == nil {
+		if err == nil && deleted {
 			c.recordCommittedKey(key)
 		}
 		return deleted, facadeError(err)
