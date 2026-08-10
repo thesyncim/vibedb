@@ -190,6 +190,13 @@ func openDatabaseWithSync(
 	if err := d.recoverVisibleNamespace(); err != nil {
 		return nil, err
 	}
+	// The transaction recovery path pins an os.Root to the private table
+	// directory. On a brand-new SQL catalog that directory is still absent;
+	// publish it through the same namespace-fenced helper used by first table
+	// materialization before asking durable recovery to open the root.
+	if err := d.ensureDataDir(); err != nil {
+		return nil, err
+	}
 	// Load txn.vtm before any table open so every participant's journal replay
 	// can resolve kind-5 records, and so stray conditionals are consumed before
 	// the log accepts a new commit.

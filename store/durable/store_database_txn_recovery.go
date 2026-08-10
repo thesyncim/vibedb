@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -122,7 +121,7 @@ func loadDatabaseTxnRecovery(
 	)
 	if err != nil {
 		if errors.Is(err, storeio.ErrTxnMarkerNoValidHeader) {
-			holds, holdErr := directoryHoldsAnyConditional(log.dir)
+			holds, holdErr := directoryHoldsAnyConditional(log.root)
 			if holdErr != nil {
 				_ = log.Close()
 				return nil, holdErr
@@ -136,6 +135,18 @@ func loadDatabaseTxnRecovery(
 			}
 			// L2 mint residue: no journal references the file; remove and
 			// reopen as absent so the next commit can re-mint.
+			current, identityErr := log.root.Lstat(txnMarkerFilename)
+			if identityErr != nil || !current.Mode().IsRegular() ||
+				!os.SameFile(info, current) {
+				_ = log.Close()
+				if identityErr != nil {
+					return nil, identityErr
+				}
+				return nil, fmt.Errorf(
+					"%w: transaction marker changed during mint residue recovery",
+					storeio.ErrTxnMarkerCorrupt,
+				)
+			}
 			if rmErr := log.root.Remove(txnMarkerFilename); rmErr != nil &&
 				!errors.Is(rmErr, os.ErrNotExist) {
 				_ = log.Close()
@@ -442,26 +453,61 @@ func absentLogResolver() recoveryJournalDecisionResolver {
 }
 
 // directoryHoldsAnyConditional reports whether any canonical collection
-// journal in dir still holds a kind-5 record. Used for L2 mint-residue policy
-// before collections are opened.
-func directoryHoldsAnyConditional(dir string) (bool, error) {
-	items, err := os.ReadDir(dir)
+// journal under root still holds a kind-5 record. Used for L2 mint-residue
+// policy before collections are opened; root keeps the scan in the same
+// physical directory whose marker was rejected.
+func directoryHoldsAnyConditional(root *os.Root) (bool, error) {
+	if root == nil {
+		return false, fmt.Errorf("vibedb: transaction recovery directory is not open")
+	}
+	directory, err := root.Open(".")
 	if err != nil {
 		return false, err
+	}
+	items, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return false, errors.Join(readErr, closeErr)
 	}
 	for _, item := range items {
 		base := item.Name()
 		if _, canonical := collectionname.DecodeJournal(base); !canonical {
 			continue
 		}
-		holds, _, _, err := journalFileConditionalBinding(
-			filepath.Join(dir, base),
-		)
+		before, err := root.Lstat(base)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
 			return false, err
+		}
+		if !before.Mode().IsRegular() {
+			return false, fmt.Errorf(
+				"%w: recovery journal %q is not a regular non-symlink file",
+				ErrUnsupportedDatabaseLayout, base,
+			)
+		}
+		file, err := root.OpenFile(base, os.O_RDWR, 0)
+		if err != nil {
+			return false, err
+		}
+		fileInfo, statErr := file.Stat()
+		after, pathErr := root.Lstat(base)
+		if statErr != nil || pathErr != nil || !fileInfo.Mode().IsRegular() ||
+			!after.Mode().IsRegular() || !os.SameFile(before, after) ||
+			!os.SameFile(fileInfo, after) {
+			_ = file.Close()
+			if statErr != nil {
+				return false, statErr
+			}
+			if pathErr != nil {
+				return false, pathErr
+			}
+			return false, fmt.Errorf(
+				"%w: recovery journal %q changed while opening",
+				ErrUnsupportedDatabaseLayout, base,
+			)
+		}
+		holds, _, _, bindingErr := journalConditionalBinding(file)
+		if bindingErr != nil {
+			return false, bindingErr
 		}
 		if holds {
 			return true, nil
@@ -480,12 +526,21 @@ func journalFileConditionalBinding(
 	if err != nil {
 		return false, [16]byte{}, 0, err
 	}
-	defer file.Close()
+	return journalConditionalBinding(file)
+}
+
+// journalConditionalBinding consumes file on every return path.
+func journalConditionalBinding(
+	file *os.File,
+) (holds bool, markerID [16]byte, epoch uint64, err error) {
 	journal, err := storeio.OpenRecoveryJournal(file)
 	if err != nil {
-		return false, [16]byte{}, 0, err
+		return false, [16]byte{}, 0, errors.Join(err, file.Close())
 	}
-	defer journal.Close()
+	defer func() {
+		// RecoveryJournal owns and closes file after a successful open.
+		err = errors.Join(err, journal.Close())
+	}()
 	if journal.Header().FormatVersion != storeio.RecoveryJournalFormatConditional ||
 		journal.Cursor() == 0 {
 		return false, [16]byte{}, 0, nil

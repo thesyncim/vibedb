@@ -878,14 +878,33 @@ func openTxnMarkerEntry(
 	if err != nil {
 		return nil, nil, err
 	}
+	creating := flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0
+	var before os.FileInfo
+	if !creating {
+		before, err = root.Lstat(name)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !before.Mode().IsRegular() {
+			return nil, nil, fmt.Errorf(
+				"%w: transaction log entry is not a regular non-symlink file",
+				ErrInvalidWrite,
+			)
+		}
+	}
 	file, err := root.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, nil, err
 	}
 	fileInfo, fileErr := file.Stat()
 	entryInfo, entryErr := root.Lstat(name)
-	if fileErr != nil || entryErr != nil ||
-		!entryInfo.Mode().IsRegular() || !os.SameFile(fileInfo, entryInfo) {
+	stable := fileErr == nil && entryErr == nil &&
+		fileInfo.Mode().IsRegular() && entryInfo.Mode().IsRegular() &&
+		os.SameFile(fileInfo, entryInfo)
+	if before != nil {
+		stable = stable && os.SameFile(before, entryInfo)
+	}
+	if !stable {
 		_ = file.Close()
 		if fileErr != nil {
 			return nil, nil, fileErr

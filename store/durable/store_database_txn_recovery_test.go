@@ -762,6 +762,35 @@ func TestDatabaseTxnMintResidueOpen(t *testing.T) {
 	}
 }
 
+func TestDirectoryHoldsAnyConditionalUsesPinnedRoot(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	journal := RecoveryJournalPath(
+		filepath.Join(dirA, collectionFilename(t, "a")),
+	)
+	if err := os.WriteFile(journal, []byte("invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "database")
+	if err := os.Symlink(dirA, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	root, err := os.OpenRoot(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dirB, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := directoryHoldsAnyConditional(root); err == nil {
+		t.Fatal("conditional scan followed the retargeted pathname")
+	}
+}
+
 // TestDatabaseTxnRecoverySecondCrash proves crash mid-replay then reopen is
 // deterministic.
 func TestDatabaseTxnRecoverySecondCrash(t *testing.T) {
