@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
 // The minimal authoritative catalog: one immutable snapshot generation of the
@@ -36,6 +37,15 @@ var ErrCatalogTooLarge = errors.New("gateway: catalog snapshot exceeds the maxim
 // ErrInvalidCatalog is the sentinel every catalog snapshot malformation matches
 // under errors.Is.
 var ErrInvalidCatalog = errors.New("gateway: invalid catalog snapshot")
+
+// ErrCatalogWriterLocked reports that another process or goroutine is
+// publishing the same durable catalog. Callers may retry; the active publisher
+// retains the only authority to compare and replace the on-disk generation.
+var ErrCatalogWriterLocked = errors.New("gateway: catalog snapshot has an active writer")
+
+// ErrCatalogGenerationNotNewer reports an attempted durable publication whose
+// generation is not strictly newer than the snapshot already on disk.
+var ErrCatalogGenerationNotNewer = errors.New("gateway: catalog generation is not newer than the durable generation")
 
 // CatalogError reports why a catalog snapshot was rejected. It wraps
 // ErrInvalidCatalog.
@@ -435,11 +445,15 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	return pc
 }
 
-// SaveSnapshot durably writes s to path with a crash-safe recipe: encode,
-// bound the size, write a sibling temporary file, fsync it, rename it over the
-// destination, then fsync the directory. A failure before the rename leaves the
-// previous catalog intact and removes the temporary file.
-func SaveSnapshot(path string, s *Snapshot) error {
+// SaveSnapshot durably publishes s to path with a crash-safe, monotonic recipe:
+// encode and bound the size, acquire the catalog's cross-process writer lease,
+// validate that the durable generation and index incarnations advance, write a
+// sibling temporary file, fsync it, rename it over the destination, then fsync
+// the directory. A failure before the rename leaves the previous catalog intact
+// and removes the temporary file. The lease makes the compare-and-rename one
+// indivisible publication, so concurrent successful writers cannot roll the
+// durable authority backward.
+func SaveSnapshot(path string, s *Snapshot) (err error) {
 	if s == nil {
 		return errors.New("gateway: SaveSnapshot requires a non-nil snapshot")
 	}
@@ -452,6 +466,37 @@ func SaveSnapshot(path string, s *Snapshot) error {
 			ErrCatalogTooLarge, len(raw), maxCatalogBytes)
 	}
 	dir := filepath.Dir(path)
+	lockFile, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := storeio.LockWriter(lockFile); err != nil {
+		_ = lockFile.Close()
+		if errors.Is(err, storeio.ErrWriterLocked) {
+			return fmt.Errorf("%w: %v", ErrCatalogWriterLocked, err)
+		}
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, storeio.UnlockWriter(lockFile), lockFile.Close())
+	}()
+
+	current, loadErr := LoadSnapshot(path)
+	switch {
+	case loadErr == nil:
+		if s.generation <= current.generation {
+			return fmt.Errorf(
+				"%w: proposed=%d durable=%d",
+				ErrCatalogGenerationNotNewer, s.generation, current.generation,
+			)
+		}
+		if !indexCatalogTransitionAllowed(current, s) {
+			return &CatalogError{Reason: "durable index identity or lifecycle transition is invalid"}
+		}
+	case !errors.Is(loadErr, os.ErrNotExist):
+		return loadErr
+	}
+
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err

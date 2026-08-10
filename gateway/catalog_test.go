@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -125,6 +126,79 @@ func TestSnapshotPersistRoundTrip(t *testing.T) {
 	}
 	if p, ok := got.Placement("messages"); !ok || len(p.Columns) != 1 || p.Columns[0] != "/tenant_id" {
 		t.Fatalf("Placement(messages) = %+v,%v", p, ok)
+	}
+}
+
+func TestSaveSnapshotRejectsDurableGenerationRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, testSnapshot(t, 5)); err != nil {
+		t.Fatalf("SaveSnapshot generation 5: %v", err)
+	}
+	for _, generation := range []uint64{5, 3} {
+		if err := SaveSnapshot(path, testSnapshot(t, generation)); !errors.Is(err, ErrCatalogGenerationNotNewer) {
+			t.Fatalf("SaveSnapshot generation %d err=%v, want ErrCatalogGenerationNotNewer", generation, err)
+		}
+	}
+	got, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation() != 5 {
+		t.Fatalf("durable generation regressed to %d, want 5", got.Generation())
+	}
+}
+
+// TestSaveSnapshotConcurrentPublishersConverge proves the writer lease covers
+// the generation comparison and rename as one operation. Contending writers
+// retry only the typed lease refusal; a generation already superseded by a
+// successful publisher terminates normally. The highest generation therefore
+// cannot be overwritten by a later successful stale publisher.
+func TestSaveSnapshotConcurrentPublishersConverge(t *testing.T) {
+	const generations = 32
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	snapshots := make([]*Snapshot, generations)
+	for i := range snapshots {
+		snapshots[i] = testSnapshot(t, uint64(i+1))
+	}
+	start := make(chan struct{})
+	results := make(chan error, generations)
+	var wg sync.WaitGroup
+	for generation := uint64(1); generation <= generations; generation++ {
+		snapshot := snapshots[generation-1]
+		wg.Add(1)
+		go func(generation uint64, snapshot *Snapshot) {
+			defer wg.Done()
+			<-start
+			for attempts := 0; attempts < 100_000; attempts++ {
+				err := SaveSnapshot(path, snapshot)
+				switch {
+				case err == nil, errors.Is(err, ErrCatalogGenerationNotNewer):
+					results <- nil
+					return
+				case errors.Is(err, ErrCatalogWriterLocked):
+					runtime.Gosched()
+				default:
+					results <- err
+					return
+				}
+			}
+			results <- errors.New("catalog writer lease did not make progress")
+		}(generation, snapshot)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation() != generations {
+		t.Fatalf("durable generation = %d, want %d", got.Generation(), generations)
 	}
 }
 

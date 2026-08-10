@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -260,6 +261,40 @@ func TestIndexCatalogPublicationFencesDefinitionAndLifecycle(t *testing.T) {
 	stale.Incarnation--
 	if publish(12, &stale) {
 		t.Fatal("older incarnation republished")
+	}
+}
+
+func TestSaveSnapshotFencesDurableIndexIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	descriptor := testIndexDescriptor()
+	descriptor.Lifecycle = IndexReady
+	first, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(path, first); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := descriptor
+	changed.Paths = []string{"/tenant_id", "/changed"}
+	next, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 2, []IndexDescriptor{changed},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(path, next); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("SaveSnapshot changed incarnation identity err=%v, want ErrInvalidCatalog", err)
+	}
+	durable, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.Generation() != 1 {
+		t.Fatalf("durable generation = %d, want 1", durable.Generation())
 	}
 }
 
