@@ -1007,9 +1007,6 @@ func (t *tx) execMutationCore(
 	if t.readOnly {
 		return nil, ErrReadOnlyTransaction
 	}
-	if err := t.beginMutationStatement(ctx, statement, prepared); err != nil {
-		return nil, err
-	}
 	if prepared != nil {
 		if err := prepared.validateTransactionViewDependencies(); err != nil {
 			return nil, err
@@ -1020,7 +1017,14 @@ func (t *tx) execMutationCore(
 		query.DDLTruncate, query.DDLDropIndex:
 		return nil, ErrDDLInTransaction
 	}
+	// Object-kind and prepared view-rebind errors are more specific than a
+	// missing physical table in a lazily captured Read Committed cut. Run this
+	// immutable catalog preflight first; it also rechecks the live catalog, so a
+	// mutation can never proceed using a stale table-as-view interpretation.
 	if err := t.validateViewTableTarget(statement.Tree()); err != nil {
+		return nil, err
+	}
+	if err := t.beginMutationStatement(ctx, statement, prepared); err != nil {
 		return nil, err
 	}
 	tableName := statement.Collection()
