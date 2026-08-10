@@ -70,6 +70,11 @@ func PrepareParsedRecursiveSQLStatement(
 	if len(plans) == 0 {
 		return PrepareParsedStatement(src, tree)
 	}
+	// The ordinary owner prepare below temporarily substitutes recursive bodies
+	// with their anchors. Capture the complete authored reachability first so a
+	// physical relation used only by a recursive term is not lost from the
+	// source contract.
+	requiresCatalog := selectRequiresCatalog(tree)
 
 	var references []recursiveSQLReferenceRewrite
 	for i := range plans {
@@ -127,6 +132,7 @@ func PrepareParsedRecursiveSQLStatement(
 			return nil, err
 		}
 	}
+	owner.requiresCatalog = owner.requiresCatalog || requiresCatalog
 	committed = true
 	return owner, nil
 }

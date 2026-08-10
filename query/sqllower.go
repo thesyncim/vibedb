@@ -172,8 +172,8 @@ func (s *Statement) buildWindow(w *statementWindow, args []any) error {
 	return s.buildLimit(args)
 }
 
-// Collection returns the name of the driving collection — the FROM entry. A
-// statement always has one, because the parser requires FROM.
+// Collection returns the name of the driving collection — the FROM entry.
+// Source-independent SELECTs have no driving collection and return "".
 func (s *Statement) Collection() string {
 	if set := s.setSQL(); set != nil {
 		return set.Collection()
@@ -196,6 +196,9 @@ func (s *Statement) resolveDrivingCollection() string {
 	}
 	if derived := s.derived(); derived != nil {
 		return derived.stmt.Collection()
+	}
+	if s.tree == nil || len(s.tree.From) == 0 {
+		return ""
 	}
 	return s.tree.From[0].Name
 }

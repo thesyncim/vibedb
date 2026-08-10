@@ -135,10 +135,52 @@ func TestScalarFormerRefusalsProduceExplicitAST(t *testing.T) {
 		}
 	}
 
-	_, err := Parse(`SELECT ?`)
-	var positioned *ParseError
-	if !errors.As(err, &positioned) || positioned.Pos != len(`SELECT ?`) ||
-		!strings.Contains(positioned.Msg, "FROM") {
-		t.Fatalf("FROM-less scalar projection error = %T %v", err, err)
+	fromless, err := Parse(`SELECT ?`)
+	if err != nil {
+		t.Fatalf("FROM-less scalar projection: %v", err)
+	}
+	if fromless.Params != 1 || len(fromless.From) != 0 ||
+		len(fromless.Columns) != 1 || fromless.Columns[0].Scalar == nil {
+		t.Fatalf("FROM-less scalar projection AST = %#v", fromless)
+	}
+}
+
+func TestFromlessSelectAcceptsOnlySourceIndependentScalars(t *testing.T) {
+	for _, source := range []string{
+		`SELECT 1`,
+		`SELECT TRUE AS enabled, NULL AS absent, 'x' || ? AS label`,
+		`SELECT CASE WHEN ? = 1 THEN CAST('2' AS NUMERIC) ELSE -3 END AS value`,
+	} {
+		statement, err := Parse(source)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", source, err)
+		}
+		if len(statement.From) != 0 {
+			t.Fatalf("Parse(%q) FROM = %#v, want none", source, statement.From)
+		}
+		for i := range statement.Columns {
+			if statement.Columns[i].Scalar == nil {
+				t.Fatalf("Parse(%q) column %d = %#v, want scalar", source, i, statement.Columns[i])
+			}
+		}
+	}
+
+	for _, test := range []struct {
+		source string
+		pos    int
+	}{
+		{`SELECT field`, 7},
+		{`SELECT *`, 7},
+		{`SELECT field + 1`, 7},
+		{`SELECT COUNT(*)`, 7},
+		{`SELECT ROW_NUMBER() OVER ()`, 7},
+		{`SELECT 1 WHERE field = 1`, 15},
+	} {
+		_, err := Parse(test.source)
+		var unsupported *FeatureNotSupportedError
+		if !errors.As(err, &unsupported) || unsupported.Pos != test.pos {
+			t.Fatalf("Parse(%q) = %T %v, want positioned unsupported at %d",
+				test.source, err, err, test.pos)
+		}
 	}
 }

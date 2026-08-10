@@ -382,8 +382,7 @@ func TestAbsentCTECatalogClassificationIsAllocationFree(t *testing.T) {
 }
 
 func TestZeroPhysicalDependencyClassificationIsGuarded(t *testing.T) {
-	// FROM-less SELECTs are not yet part of the SQL front end, but a future
-	// zero-source relation must not turn a classifier refactor into an unchecked
+	// A zero-source relation must not turn a classifier refactor into an unchecked
 	// dependencies[0] access at the driver boundary.
 	const text = `SELECT id FROM docs`
 	tree, err := sqlast.ParseStatement(text)
@@ -409,6 +408,37 @@ func TestZeroPhysicalDependencyClassificationIsGuarded(t *testing.T) {
 		return nil
 	}); err == nil {
 		t.Fatal("zero-dependency catalog fallback unexpectedly succeeded")
+	}
+}
+
+func TestUnusedPhysicalCTEsHaveNoExecutableDependencies(t *testing.T) {
+	const text = `WITH
+		unused_a AS (SELECT id FROM never_created_a),
+		unused_b AS (SELECT id FROM never_created_b)
+		SELECT 1 AS value`
+	tree, err := sqlast.ParseStatement(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := query.PrepareParsedStatement(text, tree.Select)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Release()
+	if got := prepared.Collection(); got != "" {
+		t.Fatalf("unused CTE driving collection = %q, want empty", got)
+	}
+	if prepared.RequiresCatalog() {
+		t.Fatal("unused physical CTE definitions require a catalog")
+	}
+	if dependencies := selectPhysicalDependencies(tree.Select); len(dependencies) != 2 {
+		t.Fatalf("unused lexical CTE dependencies = %+v, want two", dependencies)
+	}
+	if dependencies := selectExecutablePhysicalDependencies(tree.Select); len(dependencies) != 0 {
+		t.Fatalf("unused executable CTE dependencies = %+v, want none", dependencies)
+	}
+	if !sourceIndependentStatement(prepared) {
+		t.Fatal("unused physical CTE root was not classified source-independent")
 	}
 }
 

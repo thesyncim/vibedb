@@ -807,18 +807,10 @@ func (t *tx) runInsertSource(
 		)
 	}
 	statement := plan.statement
-	if statement.Collection() == "" && len(plan.dependencies) == 0 {
+	if sourceIndependentStatement(statement) {
 		return statement.RunIntermediateInto(&t.conn.exec, query.Source{}, args)
 	}
-	requiresCatalog := statement.RequiresCatalog() &&
-		(statement.UsesDirectCatalogExecution() ||
-			plan.catalogJoin || len(plan.dependencies) != 1)
-	if !requiresCatalog && statement.RequiresCatalog() &&
-		len(plan.dependencies) == 1 {
-		state := t.tables[plan.dependencies[0].name]
-		requiresCatalog = state != nil && state.snapshot != nil &&
-			len(state.pending) != 0
-	}
+	requiresCatalog := statement.RequiresCatalog()
 	if requiresCatalog {
 		source, err := t.conn.materializeTransactionJoinSource(
 			ctx, t, statement.Collection(), plan.dependencies,

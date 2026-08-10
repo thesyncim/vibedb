@@ -55,7 +55,7 @@
 //	             | limit-offset ;
 //
 //	select       = [ with-clause ] "SELECT" [ "ALL" | "DISTINCT" ] select-list
-//	               "FROM" table-ref { join }
+//	               [ "FROM" table-ref { join } ]
 //	               [ "WHERE" predicate ]
 //	               [ "GROUP" "BY" path { "," path } ]
 //	               [ "HAVING" predicate ] ;
@@ -69,6 +69,11 @@
 //	result-column= ( "*" | ident "." "*" | path | aggregate ) [ "AS" name ] ;
 //	aggregate    = "COUNT" "(" ( "*" | path ) ")"
 //	             | ( "SUM" | "AVG" | "MIN" | "MAX" ) "(" path ")" ;
+//
+// A SELECT without FROM is a one-row source-independent relation. Its outputs
+// may contain literals, NULL, placeholders, and the supported scalar
+// expressions composed from them; document paths, wildcards, aggregates, and
+// windows require a FROM relation and are positioned feature refusals.
 //
 //	table-ref    = collection-ref | derived-ref ;
 //	collection-ref = name [ [ "AS" ] name ] ;

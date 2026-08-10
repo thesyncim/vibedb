@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/store"
@@ -57,6 +58,14 @@ type Source struct {
 }
 
 func (s Source) subquerySource(outer, collection string) (Source, error) {
+	if collection == "" {
+		// A FROM-less child still needs the incoming database source while it
+		// resolves its own CTEs, derived relations, set leaves, or predicate
+		// subqueries. Statement substitutes the synthetic unit row only for that
+		// child's final scalar scan; replacing the source here destroys the
+		// catalog before deeper physical reads can bind.
+		return s, nil
+	}
 	switch s.kind {
 	case sourceDatabase:
 		return FromDatabase(s.catalog, collection), nil
@@ -76,6 +85,25 @@ func (s Source) subquerySource(outer, collection string) (Source, error) {
 // execution, and projected result cells borrow its bytes.
 func FromSegment(s *store.Segment) Source {
 	return Source{kind: sourceSegment, payload: unsafe.Pointer(s)}
+}
+
+var sqlUnit struct {
+	once    sync.Once
+	segment store.Segment
+}
+
+// sourceIndependentSQLSource lazily builds the immutable one-row relation used
+// only by a FROM-less SQL SELECT. Keeping it private preserves Source{} as an
+// invalid caller value while letting the statement layer run its ordinary
+// scalar plan over exactly one input row. Laziness keeps ordinary builder-only
+// users from paying for an SQL-only Segment.
+func sourceIndependentSQLSource() Source {
+	sqlUnit.once.Do(func() {
+		if _, err := sqlUnit.segment.Append([]byte("{}")); err != nil {
+			panic("query: invalid internal SQL unit document: " + err.Error())
+		}
+	})
+	return FromSegment(&sqlUnit.segment)
 }
 
 // fromRelationSpool binds the private statement-owned columnar relation

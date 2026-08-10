@@ -752,51 +752,217 @@ func (s *Statement) resolveRelationColumnAt(source int, name string) (int, error
 }
 
 func selectRequiresCatalog(tree *sqlast.SelectStmt) bool {
-	var first string
-	return scanSelectCatalog(tree, &first)
+	scan := selectCatalogScan{}
+	if scan.selectStmt(tree) {
+		return true
+	}
+	// A physical predicate subquery beneath a source-free root cannot be rebound
+	// from one collection snapshot: the root has no collection identity to
+	// match. It therefore needs a database source even when that subquery is the
+	// only reachable physical relation.
+	return scan.first != "" && scan.first != selectDrivingCollection(tree, nil)
 }
 
-func scanSelectCatalog(tree *sqlast.SelectStmt, first *string) bool {
+func selectDrivingCollection(
+	tree *sqlast.SelectStmt,
+	visited []*sqlast.SelectStmt,
+) string {
 	if tree == nil {
+		return ""
+	}
+	for i := range visited {
+		if visited[i] == tree {
+			return ""
+		}
+	}
+	visited = append(visited, tree)
+	if tree.Set != nil {
+		return setDrivingCollection(tree.Set.Root, visited)
+	}
+	if len(tree.From) == 0 {
+		return ""
+	}
+	ref := &tree.From[0]
+	switch ref.Kind {
+	case sqlast.RelationCollection:
+		return ref.Name
+	case sqlast.RelationDerived, sqlast.RelationCTE:
+		return selectDrivingCollection(ref.Query, visited)
+	default:
+		return ""
+	}
+}
+
+func setDrivingCollection(expr *sqlast.SetExpr, visited []*sqlast.SelectStmt) string {
+	if expr == nil {
+		return ""
+	}
+	switch expr.Kind {
+	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
+		return selectDrivingCollection(expr.Select, visited)
+	case sqlast.SetBinaryExpr:
+		if collection := setDrivingCollection(expr.Left, visited); collection != "" {
+			return collection
+		}
+		return setDrivingCollection(expr.Right, visited)
+	case sqlast.SetGroupExpr:
+		return setDrivingCollection(expr.Child, visited)
+	default:
+		return ""
+	}
+}
+
+// selectCatalogScan follows executable query edges rather than every lexical
+// WITH definition. Dormant definitions are still prepared and validated, but
+// SQL does not execute them and they must not make an otherwise source-free
+// statement require a physical catalog.
+type selectCatalogScan struct {
+	first   string
+	visited []*sqlast.SelectStmt
+}
+
+func (s *selectCatalogScan) selectStmt(tree *sqlast.SelectStmt) bool {
+	if tree == nil || s.saw(tree) {
 		return false
+	}
+	// A source-free intermediate cannot forward one plain collection snapshot
+	// to a deeper physical descendant because its own collection identity is
+	// empty. Require a database source even when the descendant reads the same
+	// collection as an outer statement.
+	if selectDrivingCollection(tree, nil) == "" &&
+		selectHasReachablePhysical(tree, nil) {
+		return true
+	}
+	s.visited = append(s.visited, tree)
+	if tree.Set != nil {
+		return s.setExpr(tree.Set.Root)
 	}
 	if len(tree.From) > 1 {
 		return true
-	}
-	if tree.With != nil {
-		for i := range tree.With.CTEs {
-			if scanSelectCatalog(tree.With.CTEs[i].Query, first) {
-				return true
-			}
-		}
 	}
 	for i := range tree.From {
 		ref := &tree.From[i]
 		switch ref.Kind {
 		case sqlast.RelationCollection:
-			if *first == "" {
-				*first = ref.Name
-			} else if *first != ref.Name {
+			if s.first == "" {
+				s.first = ref.Name
+			} else if s.first != ref.Name {
 				return true
 			}
-		case sqlast.RelationDerived:
-			if scanSelectCatalog(ref.Query, first) {
+		case sqlast.RelationDerived, sqlast.RelationCTE:
+			if s.selectStmt(ref.Query) {
 				return true
 			}
 		}
 	}
-	return scanExprCatalog(tree.Where, first) || scanExprCatalog(tree.Having, first)
+	return s.expr(tree.Where) || s.expr(tree.Having)
 }
 
-func scanExprCatalog(expr *sqlast.Expr, first *string) bool {
+func selectHasReachablePhysical(
+	tree *sqlast.SelectStmt,
+	visited []*sqlast.SelectStmt,
+) bool {
+	if tree == nil {
+		return false
+	}
+	for i := range visited {
+		if visited[i] == tree {
+			return false
+		}
+	}
+	visited = append(visited, tree)
+	if tree.Set != nil {
+		return setHasReachablePhysical(tree.Set.Root, visited)
+	}
+	for i := range tree.From {
+		ref := &tree.From[i]
+		switch ref.Kind {
+		case sqlast.RelationCollection:
+			return true
+		case sqlast.RelationDerived, sqlast.RelationCTE:
+			if selectHasReachablePhysical(ref.Query, visited) {
+				return true
+			}
+		}
+	}
+	return exprHasReachablePhysical(tree.Where, visited) ||
+		exprHasReachablePhysical(tree.Having, visited)
+}
+
+func setHasReachablePhysical(
+	expr *sqlast.SetExpr,
+	visited []*sqlast.SelectStmt,
+) bool {
 	if expr == nil {
 		return false
 	}
-	if scanSelectCatalog(expr.Subquery, first) {
+	switch expr.Kind {
+	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
+		return selectHasReachablePhysical(expr.Select, visited)
+	case sqlast.SetBinaryExpr:
+		return setHasReachablePhysical(expr.Left, visited) ||
+			setHasReachablePhysical(expr.Right, visited)
+	case sqlast.SetGroupExpr:
+		return setHasReachablePhysical(expr.Child, visited)
+	default:
+		return false
+	}
+}
+
+func exprHasReachablePhysical(
+	expr *sqlast.Expr,
+	visited []*sqlast.SelectStmt,
+) bool {
+	if expr == nil {
+		return false
+	}
+	if selectHasReachablePhysical(expr.Subquery, visited) {
+		return true
+	}
+	for _, child := range expr.Kids {
+		if exprHasReachablePhysical(child, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *selectCatalogScan) setExpr(expr *sqlast.SetExpr) bool {
+	if expr == nil {
+		return false
+	}
+	switch expr.Kind {
+	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
+		return s.selectStmt(expr.Select)
+	case sqlast.SetValuesExpr:
+		return false
+	case sqlast.SetBinaryExpr:
+		return s.setExpr(expr.Left) || s.setExpr(expr.Right)
+	case sqlast.SetGroupExpr:
+		return s.setExpr(expr.Child)
+	default:
+		return false
+	}
+}
+
+func (s *selectCatalogScan) expr(expr *sqlast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if s.selectStmt(expr.Subquery) {
 		return true
 	}
 	for _, kid := range expr.Kids {
-		if scanExprCatalog(kid, first) {
+		if s.expr(kid) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *selectCatalogScan) saw(tree *sqlast.SelectStmt) bool {
+	for i := range s.visited {
+		if s.visited[i] == tree {
 			return true
 		}
 	}

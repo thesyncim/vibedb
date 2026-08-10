@@ -692,6 +692,9 @@ func (s *Statement) runDirectInto(e *Exec, src Source, args []any) (Cursor, erro
 	if err := s.bind(args); err != nil {
 		return Cursor{}, err
 	}
+	if s.sourceIndependent() {
+		src = sourceIndependentSQLSource()
+	}
 	if err := s.q.RunInto(e, src); err != nil {
 		return Cursor{}, err
 	}
@@ -789,6 +792,9 @@ func (s *Statement) runIntoFrameMode(
 		return cursor, err
 	}
 	runSource := src
+	if s.sourceIndependent() {
+		runSource = sourceIndependentSQLSource()
+	}
 	if s.nested != nil {
 		if s.nested.window != nil {
 			return s.nested.window.run(
@@ -800,7 +806,7 @@ func (s *Statement) runIntoFrameMode(
 			return s.runFusedCTE(e, src, frame, intermediateResource)
 		}
 		var err error
-		runSource, err = s.runRelations(e, src, args, frame)
+		runSource, err = s.runRelations(e, runSource, args, frame)
 		if err != nil {
 			s.releaseRelations(frame)
 			return Cursor{}, err
@@ -887,6 +893,10 @@ func (s *Statement) runIntoFrameMode(
 		return Cursor{}, err
 	}
 	return s.cursor(&e.Result), nil
+}
+
+func (s *Statement) sourceIndependent() bool {
+	return s != nil && s.tree != nil && s.tree.Set == nil && len(s.tree.From) == 0
 }
 
 func (s *Statement) prepareSubqueries(argBase int) error {

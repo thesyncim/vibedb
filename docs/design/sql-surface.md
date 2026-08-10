@@ -775,8 +775,9 @@ self-references, mutual/forward recursion, `INTERSECT`/`EXCEPT` recursion,
 aggregation or grouping in the recursive term, a self-reference on the
 nullable side of an outer join, top-level compound queries containing
 `WITH RECURSIVE`, and `SEARCH`/`CYCLE` remain positioned typed refusals.
-Data-modifying CTE bodies also remain unsupported. The dialect does not yet
-accept a FROM-less SELECT body, so constant-only SELECT CTEs are not admitted.
+Data-modifying CTE bodies also remain unsupported. A source-independent
+FROM-less SELECT is a one-row relation, so constant and parameterized SELECT
+CTEs compose with the same materialization policy as stored-row definitions.
 
 ## Derived tables
 
@@ -1095,8 +1096,8 @@ operation:
 - the correlated LATERAL shapes listed above, `NATURAL JOIN`, and derived-table
   column alias lists;
 - data-modifying CTE bodies, mutual/forward or multiply self-referential
-  recursion, recursive aggregation/grouping, `SEARCH`/`CYCLE`, recursive
-  `INTERSECT`/`EXCEPT`, and FROM-less constant SELECT bodies;
+  recursion, recursive aggregation/grouping, `SEARCH`/`CYCLE`, and recursive
+  `INTERSECT`/`EXCEPT`;
 - window `FILTER`, DISTINCT window aggregates, null-treatment modifiers,
   arbitrary scalar window arguments/keys, and windows outside the SELECT list;
 - general scalar placement beyond the documented SELECT-list and WHERE CASE

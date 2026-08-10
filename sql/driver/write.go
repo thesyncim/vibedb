@@ -1029,12 +1029,10 @@ func (c *conn) runInsertSourceLocked(
 		)
 	}
 	statement := plan.statement
-	if statement.Collection() == "" && len(plan.dependencies) == 0 {
+	if sourceIndependentStatement(statement) {
 		return statement.RunIntermediateInto(&c.exec, query.Source{}, args)
 	}
-	requiresCatalog := statement.RequiresCatalog() &&
-		(statement.UsesDirectCatalogExecution() ||
-			plan.catalogJoin || len(plan.dependencies) != 1)
+	requiresCatalog := statement.RequiresCatalog()
 	if requiresCatalog {
 		clear(c.joinCatalog)
 		collections := c.joinCatalog[:0]

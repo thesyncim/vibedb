@@ -120,17 +120,17 @@ type Parser struct {
 	// rule every other thing a Parser returns already carries. sel doubles as
 	// the synthetic SELECT an UPDATE or a DELETE selects its rows with; see
 	// parse_dml.go.
-	sel       SelectStmt
-	with      WithClause
-	returning SelectStmt
-	ins       InsertStmt
-	upd       UpdateStmt
-	del       DeleteStmt
-	tbl       CreateTableStmt
-	idx       CreateIndexStmt
-	drop      DropTableStmt
-	truncate  TruncateStmt
-	dropIndex DropIndexStmt
+	sel              SelectStmt
+	with             WithClause
+	returning        SelectStmt
+	ins              InsertStmt
+	upd              UpdateStmt
+	del              DeleteStmt
+	tbl              CreateTableStmt
+	idx              CreateIndexStmt
+	drop             DropTableStmt
+	truncate         TruncateStmt
+	dropIndex        DropIndexStmt
 	view             CreateViewStmt
 	dropView         DropViewStmt
 	savepoint        SavepointStmt
@@ -724,10 +724,12 @@ func (p *Parser) parseStatement() error {
 	if err := p.parseResultColumns(); err != nil {
 		return err
 	}
-	if err := p.expectKeyword(kwFrom, "FROM"); err != nil {
-		return err
-	}
-	if err := p.parseFrom(); err != nil {
+	if p.acceptKeyword(kwFrom) {
+		if err := p.parseFrom(); err != nil {
+			return err
+		}
+		p.discardExistsLiteralProjection()
+	} else if err := p.validateSourceIndependentColumns(); err != nil {
 		return err
 	}
 	if p.acceptKeyword(kwWhere) {
@@ -788,6 +790,51 @@ func (p *Parser) parseStatement() error {
 	}
 	p.out.Params = p.params
 	return p.validate()
+}
+
+// validateSourceIndependentColumns keeps a FROM-less SELECT deliberately
+// narrow: it is a one-row scalar relation, not an implicit document source.
+// Literals, parameters, and scalar expressions composed solely from them can
+// use the ordinary scalar runtime. Paths, wildcards, aggregates, and windows
+// need source or reduction semantics and remain positioned refusals.
+func (p *Parser) validateSourceIndependentColumns() error {
+	for i := range p.out.Columns {
+		column := &p.out.Columns[i]
+		switch {
+		case column.Window != nil:
+			return newFeatureNotSupportedError(
+				p.lx.src, column.Pos,
+				"a window expression requires a FROM relation",
+			)
+		case column.Agg != AggNone:
+			return newFeatureNotSupportedError(
+				p.lx.src, column.Pos,
+				"an aggregate requires a FROM relation",
+			)
+		case column.Scalar != nil:
+			hasPath, hasAggregate := scalarDependencyKinds(column.Scalar)
+			if hasPath {
+				return newFeatureNotSupportedError(
+					p.lx.src, column.Pos,
+					"a FROM-less SELECT cannot read a document path; add FROM to name its relation",
+				)
+			}
+			if hasAggregate {
+				return newFeatureNotSupportedError(
+					p.lx.src, column.Pos,
+					"an aggregate requires a FROM relation",
+				)
+			}
+		case column.Path != nil:
+			return newFeatureNotSupportedError(
+				p.lx.src, column.Pos,
+				"a FROM-less SELECT cannot read a document path or wildcard; add FROM to name its relation",
+			)
+		default:
+			return p.errAt(column.Pos, "a FROM-less SELECT output must be a scalar expression")
+		}
+	}
+	return nil
 }
 
 // expectSelect consumes the leading SELECT, naming the specific unsupported
@@ -883,18 +930,6 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 
 func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	col := ResultColumn{Pos: p.tok.pos}
-	if p.existsProjection && (p.tok.kind == tokNumber ||
-		p.tok.kind == tokString ||
-		p.atKeyword(kwTrue) || p.atKeyword(kwFalse) || p.atKeyword(kwNull)) {
-		p.advance()
-		col.Path = p.newPath(col.Pos, nil, false, true)
-		alias, err := p.parseColumnAlias()
-		if err != nil {
-			return col, err
-		}
-		col.Alias = alias
-		return col, nil
-	}
 	if scalarStarts(p.tok) {
 		expr, err := p.parseScalarExpression(scalarSelect)
 		if err != nil {
@@ -974,6 +1009,24 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	}
 	col.Alias = alias
 	return col, nil
+}
+
+// discardExistsLiteralProjection retains the existing cheap whole-row plan
+// when an EXISTS body has a physical FROM source. A FROM-less body must keep
+// its scalar literal so Statement can evaluate it over the synthetic unit row.
+func (p *Parser) discardExistsLiteralProjection() {
+	if !p.existsProjection {
+		return
+	}
+	for i := range p.out.Columns {
+		column := &p.out.Columns[i]
+		if column.Scalar == nil ||
+			(column.Scalar.Kind != ScalarLiteral && column.Scalar.Kind != ScalarNull) {
+			continue
+		}
+		column.Scalar = nil
+		column.Path = p.newPath(column.Pos, nil, false, true)
+	}
 }
 
 // parseSelectPath parses a SELECT-list path, including the bare '*' that names

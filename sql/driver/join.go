@@ -204,32 +204,50 @@ func driverQueryMemory(options query.ExecOptions) (int64, error) {
 }
 
 func selectPhysicalDependencies(statement *sqlast.SelectStmt) []physicalDependency {
-	dependencies := make([]physicalDependency, 0, len(statement.From))
-	return appendSelectPhysicalDependencies(dependencies, statement)
+	walk := physicalDependencyWalk{includeDefinitions: true}
+	if statement != nil {
+		walk.dependencies = make([]physicalDependency, 0, len(statement.From))
+	}
+	walk.appendSelect(statement)
+	return walk.dependencies
 }
 
-func appendSelectPhysicalDependencies(
-	dependencies []physicalDependency,
+// selectExecutablePhysicalDependencies excludes dormant WITH definitions. It
+// is the source-routing twin of selectPhysicalDependencies, whose lexical walk
+// is retained for PostgreSQL-style name validation and durable view metadata.
+func selectExecutablePhysicalDependencies(
 	statement *sqlast.SelectStmt,
 ) []physicalDependency {
-	if statement == nil {
-		return dependencies
+	walk := physicalDependencyWalk{}
+	if statement != nil {
+		walk.dependencies = make([]physicalDependency, 0, len(statement.From))
+	}
+	walk.appendSelect(statement)
+	return walk.dependencies
+}
+
+// physicalDependencyWalk follows relation edges with an optional lexical WITH
+// walk. visited closes recursive-CTE self edges and prevents a referenced
+// definition from being expanded again after its lexical validation pass.
+type physicalDependencyWalk struct {
+	dependencies       []physicalDependency
+	visited            []*sqlast.SelectStmt
+	includeDefinitions bool
+}
+
+func (w *physicalDependencyWalk) appendSelect(statement *sqlast.SelectStmt) {
+	if statement == nil || w.saw(statement) {
+		return
+	}
+	w.visited = append(w.visited, statement)
+	if w.includeDefinitions && statement.With != nil {
+		for i := range statement.With.CTEs {
+			w.appendSelect(statement.With.CTEs[i].Query)
+		}
 	}
 	if statement.Set != nil {
-		return appendSetPhysicalDependencies(dependencies, statement.Set.Root)
-	}
-	// Definitions are semantically validated even when unreferenced. Walking
-	// each body here, once in declaration order, captures those physical reads;
-	// RelationCTE references below deliberately do not expand the body again.
-	if statement.With != nil {
-		for i := range statement.With.CTEs {
-			definition := &statement.With.CTEs[i]
-			if definition.Query != nil {
-				dependencies = appendSelectPhysicalDependencies(
-					dependencies, definition.Query,
-				)
-			}
-		}
+		w.appendSet(statement.Set.Root)
+		return
 	}
 	for i := range statement.From {
 		relation := &statement.From[i]
@@ -238,67 +256,59 @@ func appendSelectPhysicalDependencies(
 			if relation.Name == "" {
 				continue
 			}
-			if hasPhysicalDependency(dependencies, relation.Name) {
+			if hasPhysicalDependency(w.dependencies, relation.Name) {
 				continue
 			}
-			dependencies = append(dependencies, physicalDependency{
+			w.dependencies = append(w.dependencies, physicalDependency{
 				name: relation.Name,
 				pos:  relation.Pos,
 			})
-		case sqlast.RelationDerived:
-			if relation.Query != nil {
-				dependencies = appendSelectPhysicalDependencies(
-					dependencies, relation.Query,
-				)
-			}
-		case sqlast.RelationCTE:
-			// The definition was visited exactly once above. Query is stable
-			// identity, not another ownership edge for dependency traversal.
+		case sqlast.RelationDerived, sqlast.RelationCTE:
+			w.appendSelect(relation.Query)
 		}
 	}
-	dependencies = appendExprPhysicalDependencies(dependencies, statement.Where)
-	dependencies = appendExprPhysicalDependencies(dependencies, statement.Having)
-	return dependencies
+	w.appendExpr(statement.Where)
+	w.appendExpr(statement.Having)
 }
 
-func appendSetPhysicalDependencies(
-	dependencies []physicalDependency,
-	expression *sqlast.SetExpr,
-) []physicalDependency {
+func (w *physicalDependencyWalk) appendSet(expression *sqlast.SetExpr) {
 	if expression == nil {
-		return dependencies
+		return
 	}
 	switch expression.Kind {
 	case sqlast.SetSelectExpr:
-		return appendSelectPhysicalDependencies(dependencies, expression.Select)
+		w.appendSelect(expression.Select)
 	case sqlast.SetValuesExpr:
-		return dependencies
+		return
 	case sqlast.SetTableExpr:
-		return appendSelectPhysicalDependencies(dependencies, expression.Select)
+		w.appendSelect(expression.Select)
 	case sqlast.SetBinaryExpr:
-		dependencies = appendSetPhysicalDependencies(dependencies, expression.Left)
-		return appendSetPhysicalDependencies(dependencies, expression.Right)
+		w.appendSet(expression.Left)
+		w.appendSet(expression.Right)
 	case sqlast.SetGroupExpr:
-		return appendSetPhysicalDependencies(dependencies, expression.Child)
-	default:
-		return dependencies
+		w.appendSet(expression.Child)
 	}
 }
 
-func appendExprPhysicalDependencies(
-	dependencies []physicalDependency,
-	e *sqlast.Expr,
-) []physicalDependency {
+func (w *physicalDependencyWalk) appendExpr(e *sqlast.Expr) {
 	if e == nil {
-		return dependencies
+		return
 	}
 	if e.Subquery != nil {
-		dependencies = appendSelectPhysicalDependencies(dependencies, e.Subquery)
+		w.appendSelect(e.Subquery)
 	}
 	for _, kid := range e.Kids {
-		dependencies = appendExprPhysicalDependencies(dependencies, kid)
+		w.appendExpr(kid)
 	}
-	return dependencies
+}
+
+func (w *physicalDependencyWalk) saw(statement *sqlast.SelectStmt) bool {
+	for i := range w.visited {
+		if w.visited[i] == statement {
+			return true
+		}
+	}
+	return false
 }
 
 func hasPhysicalDependency(dependencies []physicalDependency, name string) bool {

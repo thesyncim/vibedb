@@ -58,7 +58,7 @@ func TestRejectsSyntaxErrors(t *testing.T) {
 	runRejections(t, []rejection{
 		{"empty input", ``, 0, "expected SELECT"},
 		{"nothing after SELECT", `SELECT`, 6, "expected a field path"},
-		{"no FROM", `SELECT a`, 8, "expected FROM"},
+		{"source-dependent SELECT without FROM", `SELECT a`, 7, "FROM-less SELECT"},
 		{"nothing after FROM", `SELECT a FROM`, 13, "expected a collection name"},
 		{"nothing after WHERE", `SELECT a FROM t WHERE`, 21, "expected a field path"},
 		{"nothing after a comparison", `SELECT a FROM t WHERE b =`, 25, "expected a literal"},

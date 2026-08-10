@@ -33,10 +33,11 @@ type SelectStmt struct {
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
 
-	// From holds the range variables. From[0] is the driving relation; each
-	// later entry is a JOIN, in source order, and carries its own ON
-	// condition. Every [PathExpr] in the statement names one of these by
-	// index, so a lowering pass never has to re-resolve a name.
+	// From holds the range variables. It is empty for a source-independent
+	// one-row SELECT. Otherwise From[0] is the driving relation; each later entry
+	// is a JOIN, in source order, and carries its own ON condition. Every
+	// [PathExpr] in the statement names one of these by index, so a lowering pass
+	// never has to re-resolve a name.
 	From []TableRef
 
 	// Where is the filter predicate, or nil when the statement has none.

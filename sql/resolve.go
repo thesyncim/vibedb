@@ -60,6 +60,12 @@ func (p *Parser) resolvePaths() error {
 			path.MergedUsing = merged
 			continue
 		}
+		if len(p.out.From) == 0 {
+			return newFeatureNotSupportedError(
+				p.lx.src, path.Pos,
+				"a FROM-less SELECT cannot read a document path; add FROM to name its relation",
+			)
+		}
 		if len(p.out.From) != 1 {
 			if entry.star {
 				return p.errAt(path.Pos,

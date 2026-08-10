@@ -207,11 +207,12 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		s.conn.open = true
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
-	// A source-independent compound (currently bare/all-VALUES) still uses the
+	// A source-independent SELECT or compound (including bare/all-VALUES) uses the
 	// complete prepared set runtime and its ordinary result/intermediate
-	// accounts. An empty collection is impossible for an ordinary SELECT, so
-	// this branch cannot divert a physical query or its transaction snapshot.
-	if s.query.Collection() == "" && len(s.dependencies) == 0 {
+	// accounts. The parser and dependency walk prove that a statement reaching
+	// this branch has no physical relation, so it cannot divert a stored-row
+	// query or its transaction snapshot.
+	if sourceIndependentStatement(s.query) {
 		if err := s.validatePreparedViewDependencies(ctx); err != nil {
 			return nil, err
 		}
@@ -493,7 +494,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 		return options, s.validateCatalogDependenciesForExplain(ctx)
 	}
 	collection := s.query.Collection()
-	if collection == "" && len(s.dependencies) == 0 {
+	if sourceIndependentStatement(s.query) {
 		return options, contextCheckpoint(ctx)
 	}
 	options.IndexCatalogKnown = true
@@ -532,16 +533,23 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	return options, contextCheckpoint(ctx)
 }
 
-// requiresCatalogSource distinguishes coherent multi-collection execution
-// from a nested plan whose every physical read resolves to one collection.
-// The latter can keep the ordinary durable Source and its exact-index path;
-// self-joins still require a catalog even though their distinct name count is
-// one because the join executor intentionally rejects FromFile.
+// requiresCatalogSource honors the prepared runtime's source contract. A
+// catalog can be required either for multiple physical relations or because a
+// source-free intermediate must rebind a deeper physical read; distinct-name
+// counts alone cannot distinguish those cases.
 func (s *stmt) requiresCatalogSource() bool {
-	if !s.query.RequiresCatalog() {
-		return false
-	}
-	return s.usesDirectDurableCatalog() || s.catalogJoin || len(s.dependencies) != 1
+	return s != nil && s.query != nil && s.query.RequiresCatalog()
+}
+
+// sourceIndependentStatement is the single adapter boundary for a prepared
+// query whose root reads no relation. The query runtime is authoritative here:
+// an unreferenced SELECT CTE is parsed and prepared for semantic validation but
+// contributes neither execution nor dependency/catalog classification. The
+// RequiresCatalog guard remains necessary because a root without FROM can
+// still execute a physical predicate subquery.
+func sourceIndependentStatement(statement *query.Statement) bool {
+	return statement != nil && statement.Collection() == "" &&
+		!statement.RequiresCatalog()
 }
 
 // usesDirectDurableCatalog is the cross-layer source contract for SQL JOINs.
@@ -556,23 +564,7 @@ func (s *stmt) usesDirectDurableCatalog() bool {
 }
 
 func (s *stmt) transactionRequiresCatalogSource() bool {
-	if s.requiresCatalogSource() {
-		return true
-	}
-	if !s.query.RequiresCatalog() {
-		return false
-	}
-	if len(s.dependencies) != 1 {
-		// Keep the index below structurally guarded even if the catalog-source
-		// classifier changes independently in the future.
-		return true
-	}
-	// FromFileOverlay cannot be recursively rebound yet. Retain the coherent
-	// transaction-catalog fallback only while staged writes coexist with a
-	// durable BEGIN snapshot; no-pending and initially-empty views use the
-	// direct file/segment source without sacrificing read-your-writes.
-	state := s.conn.tx.tables[s.dependencies[0].name]
-	return state != nil && state.snapshot != nil && len(state.pending) != 0
+	return s.requiresCatalogSource()
 }
 
 func (s *stmt) missingDependency(name string, transaction bool) error {

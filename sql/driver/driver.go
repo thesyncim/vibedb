@@ -498,7 +498,7 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			// ordinary execution path, so it must retain the same join catalog or
 			// primary-point fact as SELECT.
 			if s.query.RequiresCatalog() || tree.Select.With != nil {
-				s.dependencies = selectPhysicalDependencies(tree.Select)
+				s.dependencies = selectExecutablePhysicalDependencies(tree.Select)
 				s.catalogJoin = selectContainsJoin(tree.Select)
 			}
 			if !s.query.RequiresCatalog() {
@@ -529,7 +529,7 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			s.insertSource = &insertSelectPlan{
 				statement:    s.mutation.InsertSource(),
 				tree:         tree.Insert.Source,
-				dependencies: selectPhysicalDependencies(tree.Insert.Source),
+				dependencies: selectExecutablePhysicalDependencies(tree.Insert.Source),
 				catalogJoin:  selectContainsJoin(tree.Insert.Source),
 			}
 		}

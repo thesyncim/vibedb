@@ -81,51 +81,93 @@ func (c *conn) validateSurfaceContext(
 }
 
 func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {
+	walk := selectTableValidation{conn: c}
+	return walk.selectStmt(selectStmt)
+}
+
+type selectTableValidation struct {
+	conn    *conn
+	visited []*sqlast.SelectStmt
+}
+
+func (w *selectTableValidation) selectStmt(selectStmt *sqlast.SelectStmt) error {
+	if selectStmt == nil {
+		return errors.New("vibedb: SELECT has no query")
+	}
+	for i := range w.visited {
+		if w.visited[i] == selectStmt {
+			return nil
+		}
+	}
+	w.visited = append(w.visited, selectStmt)
+	// PostgreSQL resolves every lexical WITH body even when the optimizer can
+	// prove that the definition is dormant. Preserve that prepare-time contract
+	// independently from executable dependency/source routing.
 	if selectStmt.With != nil {
 		for i := range selectStmt.With.CTEs {
 			definition := &selectStmt.With.CTEs[i]
 			if definition.Query == nil {
 				return errors.New("vibedb: CTE definition has no query")
 			}
-			if err := c.validateSelectTables(definition.Query); err != nil {
+			if err := w.selectStmt(definition.Query); err != nil {
 				return err
 			}
 		}
+	}
+	if selectStmt.Set != nil {
+		return w.setExpr(selectStmt.Set.Root)
 	}
 	for i := range selectStmt.From {
 		relation := &selectStmt.From[i]
 		switch relation.Kind {
 		case sqlast.RelationCollection:
-			if !c.selectTableExists(relation.Name) {
+			if !w.conn.selectTableExists(relation.Name) {
 				return missingTableDependency(
 					relation.Name, relation.Pos, false,
 				)
 			}
-		case sqlast.RelationDerived:
-			// A derived relation has no physical Name. Validate its complete
-			// child tree instead of accidentally consulting the catalog with
-			// the empty sentinel carried by the AST.
+		case sqlast.RelationDerived, sqlast.RelationCTE:
+			// Derived and CTE relations have no physical Name. The visited set
+			// makes a lexical CTE definition cheap when its reference reaches it
+			// again and also closes recursive self edges.
 			if relation.Query == nil {
-				return errors.New("vibedb: derived relation has no query")
+				return errors.New("vibedb: derived or CTE relation has no query")
 			}
-			if err := c.validateSelectTables(relation.Query); err != nil {
+			if err := w.selectStmt(relation.Query); err != nil {
 				return err
-			}
-		case sqlast.RelationCTE:
-			// Definitions are validated exactly once above. Expanding a
-			// reference would duplicate work and can become exponential when a
-			// CTE is referenced by several later definitions.
-			if relation.Query == nil {
-				return errors.New("vibedb: CTE relation has no definition")
 			}
 		default:
 			return fmt.Errorf("vibedb: unsupported relation kind %d", relation.Kind)
 		}
 	}
-	if err := validateExprSubqueries(selectStmt.Where, c.validateSelectTables); err != nil {
+	validate := func(query *sqlast.SelectStmt) error {
+		return w.selectStmt(query)
+	}
+	if err := validateExprSubqueries(selectStmt.Where, validate); err != nil {
 		return err
 	}
-	return validateExprSubqueries(selectStmt.Having, c.validateSelectTables)
+	return validateExprSubqueries(selectStmt.Having, validate)
+}
+
+func (w *selectTableValidation) setExpr(expression *sqlast.SetExpr) error {
+	if expression == nil {
+		return errors.New("vibedb: set expression has no root")
+	}
+	switch expression.Kind {
+	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
+		return w.selectStmt(expression.Select)
+	case sqlast.SetValuesExpr:
+		return nil
+	case sqlast.SetBinaryExpr:
+		if err := w.setExpr(expression.Left); err != nil {
+			return err
+		}
+		return w.setExpr(expression.Right)
+	case sqlast.SetGroupExpr:
+		return w.setExpr(expression.Child)
+	default:
+		return fmt.Errorf("vibedb: unsupported set expression kind %d", expression.Kind)
+	}
 }
 
 func (c *conn) selectTableExists(name string) bool {
