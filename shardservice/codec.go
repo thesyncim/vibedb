@@ -278,6 +278,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !req.ReadPolicy.valid() {
 		return errBadEnum
 	}
+	if !req.ExecutionMode.valid() {
+		return errBadEnum
+	}
 	if len(req.Params) > maxParams {
 		return errFieldTooLarge
 	}
@@ -290,6 +293,7 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	e.u64(uint64(req.RoutingVersion))
 	e.u64(uint64(req.OwnershipEpoch))
 	e.u8(uint8(req.ReadPolicy))
+	e.u8(uint8(req.ExecutionMode))
 	e.u64(uint64(req.Deadline))
 	e.u64(req.MaxResultBytes)
 	e.u64(req.MaxRows)
@@ -339,6 +343,8 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	req.OwnershipEpoch = distribution.OwnershipEpoch(d.u64())
 	policy := ReadPolicy(d.u8())
 	req.ReadPolicy = policy
+	mode := ExecutionMode(d.u8())
+	req.ExecutionMode = mode
 	deadline := d.u64()
 	if deadline > math.MaxInt64 {
 		return nil, errNegativeDuration
@@ -374,6 +380,9 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		return nil, err
 	}
 	if !policy.valid() {
+		return nil, errBadEnum
+	}
+	if !mode.valid() {
 		return nil, errBadEnum
 	}
 	return req, nil

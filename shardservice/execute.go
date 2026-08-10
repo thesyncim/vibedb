@@ -3,13 +3,16 @@ package shardservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
 	"strings"
 
 	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // One connection's request lifecycle: read a frame, admit it, and on success pin
@@ -131,6 +134,12 @@ func (c *shardConn) execute(req *ShardRequest) *ShardResponse {
 		return classifyError(err)
 	}
 	defer prep.Close()
+	if req.ExecutionMode == ExecutionReadOnly && prep.Kind() != sqlast.KindSelect {
+		return NewErrorResponse(
+			ErrorReadOnly,
+			fmt.Sprintf("shardservice: %s is not permitted by a read-only request", prep.Kind()),
+		)
+	}
 
 	args := runtimeArgs(req.Params)
 	if prep.ReturnsRows() {
@@ -268,6 +277,8 @@ func (s *Server) requestContext(req *ShardRequest) (context.Context, context.Can
 // deadline, resource-limit, and malformed-request kinds respectively.
 func classifyError(err error) *ShardResponse {
 	switch {
+	case errors.Is(err, durable.ErrCommitOutcomeUnknown):
+		return NewErrorResponse(ErrorCommitOutcomeUnknown, err.Error())
 	case errors.Is(err, context.DeadlineExceeded),
 		errors.Is(err, context.Canceled),
 		errors.Is(err, query.ErrCanceled):

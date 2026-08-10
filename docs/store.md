@@ -653,7 +653,10 @@ routing gateway (`gateway`), run by the `cmd/vibedb-shard` and
 `cmd/vibedb-gateway` binaries. They route on the frozen placement scalar and
 tuple codec (`distribution`), which the opt-in single-shard `sql/driver`
 local-cluster facade (`OpenCluster`, no network) also uses and which is
-therefore reachable from the embedded surface. That tier is itself leader-only —
+therefore reachable from the embedded surface. Gateway execution is
+fail-closed and read-only: mutations are rejected before dispatch, shard
+requests carry a safe-zero read-only intent, and stale routing refusals reload
+only a strictly newer valid catalog generation. That tier is itself leader-only —
 no replication, failover, or online resharding — and its design contract lives
 in [distributed sharding](design/distributed-sharding.md) and
 [Vitess-compatible routing](design/vitess-compatible-routing.md). The PostgreSQL

@@ -21,7 +21,6 @@ func newRouteExecutor(t *testing.T, snap *Snapshot) *Executor {
 func TestRouteGlue(t *testing.T) {
 	snap := testSnapshot(t, 1)
 	e := newRouteExecutor(t, snap)
-	mapper := distribution.NewNativeMapper(1)
 
 	finite, err := distribution.FiniteDomain(distribution.NewString("tenant-42"))
 	if err != nil {
@@ -43,7 +42,7 @@ func TestRouteGlue(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			q := &Query{Distribution: "tenant_data", Constraints: tc.cons, Mapper: mapper, SQL: "SELECT 1"}
+			q := &Query{Distribution: "tenant_data", Constraints: tc.cons, SQL: "SELECT 1"}
 			pl, err := e.route(snap, q, e.profileFor(tc.class))
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
@@ -67,6 +66,9 @@ func TestRouteGlue(t *testing.T) {
 				if c.req.ReadPolicy != shardservice.ReadStrong {
 					t.Fatalf("read policy = %v, want Strong", c.req.ReadPolicy)
 				}
+				if c.req.ExecutionMode != shardservice.ExecutionReadOnly {
+					t.Fatalf("execution mode = %v, want ReadOnly", c.req.ExecutionMode)
+				}
 			}
 		})
 	}
@@ -81,7 +83,6 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 	q := &Query{
 		Distribution: "tenant_data",
 		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		Mapper:       distribution.NewNativeMapper(1),
 		SQL:          "SELECT 1",
 	}
 	pl, err := e.route(snap, q, e.profileFor(ClassBatch))
@@ -121,7 +122,26 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 func TestRouteUnknownDistribution(t *testing.T) {
 	snap := testSnapshot(t, 1)
 	e := newRouteExecutor(t, snap)
-	q := &Query{Distribution: "absent", Constraints: distribution.BoundConstraints{distribution.UnknownDomain()}, Mapper: distribution.NewNativeMapper(1)}
+	q := &Query{Distribution: "absent", Constraints: distribution.BoundConstraints{distribution.UnknownDomain()}}
+	_, err := e.route(snap, q, e.profileFor(ClassBatch))
+	if !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("err = %v, want errors.Is ErrInvalidCatalog", err)
+	}
+}
+
+// TestRouteConstraintArityComesFromPinnedCatalog proves a request cannot route
+// constraints authored for a different distribution generation.
+func TestRouteConstraintArityComesFromPinnedCatalog(t *testing.T) {
+	snap := testSnapshot(t, 1)
+	e := newRouteExecutor(t, snap)
+	q := &Query{
+		Distribution: "tenant_data",
+		Constraints: distribution.BoundConstraints{
+			distribution.UnknownDomain(),
+			distribution.UnknownDomain(),
+		},
+		SQL: "SELECT 1",
+	}
 	_, err := e.route(snap, q, e.profileFor(ClassBatch))
 	if !errors.Is(err, ErrInvalidCatalog) {
 		t.Fatalf("err = %v, want errors.Is ErrInvalidCatalog", err)

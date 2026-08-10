@@ -60,7 +60,8 @@ func TestRequestRoundTrip(t *testing.T) {
 		{
 			name: "all_param_kinds",
 			req: &ShardRequest{
-				SQL: "INSERT INTO messages VALUES ($1,$2,$3,$4,$5)",
+				SQL:           "INSERT INTO messages VALUES ($1,$2,$3,$4,$5)",
+				ExecutionMode: ExecutionReadWrite,
 				Params: []Param{
 					NullParam(),
 					BoolParam(true),
@@ -107,6 +108,9 @@ func TestRequestRoundTrip(t *testing.T) {
 			if got.Deadline != tc.req.Deadline {
 				t.Errorf("Deadline = %v, want %v", got.Deadline, tc.req.Deadline)
 			}
+			if got.ExecutionMode != tc.req.ExecutionMode {
+				t.Errorf("ExecutionMode = %v, want %v", got.ExecutionMode, tc.req.ExecutionMode)
+			}
 		})
 	}
 }
@@ -142,6 +146,14 @@ func TestResponseRoundTrip(t *testing.T) {
 		{
 			name: "error",
 			resp: NewErrorResponse(ErrorNotOwner, "not owner: shard -80"),
+		},
+		{
+			name: "read_only",
+			resp: NewErrorResponse(ErrorReadOnly, "mutation refused"),
+		},
+		{
+			name: "commit_outcome_unknown",
+			resp: NewErrorResponse(ErrorCommitOutcomeUnknown, "completion unknown"),
 		},
 	}
 	for _, tc := range tests {
@@ -196,8 +208,8 @@ func rawFrame(tag byte, body []byte) []byte {
 // is rejected with a typed error rather than a panic or a large allocation.
 func TestDecodeRequestMalformed(t *testing.T) {
 	// A minimal valid request body for mutation: version, three empty strings,
-	// two u64 (routing, epoch), policy byte, three u64 (deadline, maxbytes,
-	// maxrows), and a zero param count.
+	// two u64 (routing, epoch), policy and execution-mode bytes, three u64
+	// (deadline, maxbytes, maxrows), and a zero param count.
 	valid := func() []byte {
 		var e encbuf
 		e.u8(wireVersion1)
@@ -207,6 +219,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 		e.u64(0)
 		e.u64(0)
 		e.u8(uint8(ReadStrong))
+		e.u8(uint8(ExecutionReadOnly))
 		e.u64(0)
 		e.u64(0)
 		e.u64(0)
@@ -255,6 +268,27 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u8(0x7f) // policy byte out of range
+				e.u8(uint8(ExecutionReadOnly))
+				e.u64(0)
+				e.u64(0)
+				e.u64(0)
+				e.u32(0)
+				return rawFrame(tagRequest, e.b)
+			}(),
+			want: errBadEnum,
+		},
+		{
+			name: "bad_execution_mode",
+			frame: func() []byte {
+				var e encbuf
+				e.u8(wireVersion1)
+				e.str("")
+				e.str("")
+				e.str("")
+				e.u64(0)
+				e.u64(0)
+				e.u8(uint8(ReadStrong))
+				e.u8(0x7f) // execution mode out of range
 				e.u64(0)
 				e.u64(0)
 				e.u64(0)
@@ -274,6 +308,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u8(uint8(ReadStrong))
+				e.u8(uint8(ExecutionReadOnly))
 				e.u64(0)
 				e.u64(0)
 				e.u64(0)
@@ -293,6 +328,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u8(uint8(ReadStrong))
+				e.u8(uint8(ExecutionReadOnly))
 				e.u64(0)
 				e.u64(0)
 				e.u64(0)
@@ -321,6 +357,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u8(uint8(ReadStrong))
+				e.u8(uint8(ExecutionReadOnly))
 				e.u64(1 << 63) // high bit set: not a valid non-negative duration
 				e.u64(0)
 				e.u64(0)
@@ -431,6 +468,13 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 			name: "bad_read_policy",
 			enc: func() error {
 				return EncodeRequest(io.Discard, &ShardRequest{ReadPolicy: ReadPolicy(9)})
+			},
+			want: errBadEnum,
+		},
+		{
+			name: "bad_execution_mode",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{ExecutionMode: ExecutionMode(9)})
 			},
 			want: errBadEnum,
 		},

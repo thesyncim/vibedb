@@ -63,9 +63,24 @@ func (e *Executor) route(snap *Snapshot, q *Query, p Profile) (*plan, error) {
 	if !ok {
 		return nil, &CatalogError{Reason: fmt.Sprintf("distribution %q has no manifest in generation %d", q.Distribution, snap.Generation())}
 	}
+	spec, ok := snap.Spec(q.Distribution)
+	if !ok {
+		return nil, &CatalogError{Reason: fmt.Sprintf("distribution %q has no specification in generation %d", q.Distribution, snap.Generation())}
+	}
+	if spec.MapperVersion != distribution.NativeMapperVersion {
+		return nil, &CatalogError{Reason: fmt.Sprintf(
+			"distribution %q mapper version %d is unsupported",
+			q.Distribution, spec.MapperVersion)}
+	}
+	if len(q.Constraints) != spec.Arity {
+		return nil, &CatalogError{Reason: fmt.Sprintf(
+			"distribution %q has %d constraints but generation %d requires arity %d",
+			q.Distribution, len(q.Constraints), snap.Generation(), spec.Arity)}
+	}
+	mapper := distribution.NewNativeMapper(spec.Arity)
 
 	r := e.routers.get()
-	route, err := r.Route(q.Constraints, q.Mapper, man, p.Policy)
+	route, err := r.Route(q.Constraints, mapper, man, p.Policy)
 	e.routers.put(r)
 	if err != nil {
 		return nil, err
@@ -89,6 +104,7 @@ func (e *Executor) route(snap *Snapshot, q *Query, p Profile) (*plan, error) {
 				RoutingVersion: route.RoutingVersion,
 				OwnershipEpoch: t.OwnershipEpoch,
 				ReadPolicy:     p.ReadPolicy,
+				ExecutionMode:  shardservice.ExecutionReadOnly,
 				Deadline:       p.PerShardDeadline,
 				MaxRows:        p.PerShardRows,
 				MaxResultBytes: p.PerShardBytes,

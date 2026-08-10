@@ -15,9 +15,10 @@
 //
 // inspect prints the generation, its distributions, per-shard geometry and
 // ownership epochs, and the endpoint membership. validate loads and re-validates
-// the generation and exits non-zero on any inconsistency. serve loads one
-// generation and answers newline-delimited JSON query requests over the listener,
-// shutting down cleanly on SIGINT/SIGTERM.
+// the generation and exits non-zero on any inconsistency. serve loads an initial
+// generation, reloads the catalog file after stale-shard refusals, and answers
+// newline-delimited JSON query requests over the listener, shutting down cleanly
+// on SIGINT/SIGTERM.
 package main
 
 import (

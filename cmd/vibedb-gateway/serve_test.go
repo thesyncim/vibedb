@@ -55,6 +55,7 @@ func seedShard(t *testing.T, c *gateway.Client, sh serveShard, stmts ...string) 
 			Shard:          sh.own.Shard,
 			RoutingVersion: sh.own.RoutingVersion,
 			OwnershipEpoch: sh.own.Epoch,
+			ExecutionMode:  shardservice.ExecutionReadWrite,
 		}
 		if _, err := c.Do(context.Background(), sh.address, req); err != nil {
 			t.Fatalf("seed %q on %s: %v", sql, sh.own.Shard, err)
@@ -166,6 +167,90 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("serveGateway did not shut down on cancellation")
+	}
+}
+
+// TestNewGatewayReloadsCatalogAfterStaleRefusal exercises the production file
+// refresher: the process starts on generation 1, the catalog file is atomically
+// replaced with generation 2, and a routing-version refusal advances the
+// holder and retries only against the newer generation.
+func TestNewGatewayReloadsCatalogAfterStaleRefusal(t *testing.T) {
+	const liveVersion = distribution.RoutingVersion(4)
+	shardA := startShard(t, "ep-a", shardservice.Ownership{
+		Distribution: "tenant_data", Shard: "-80", Epoch: 7, RoutingVersion: liveVersion,
+	})
+	shardB := startShard(t, "ep-b", shardservice.Ownership{
+		Distribution: "tenant_data", Shard: "80-", Epoch: 9, RoutingVersion: liveVersion,
+	})
+	client := gateway.NewClient(nil)
+	seedShard(t, client, shardA,
+		`CREATE TABLE messages (tenant_id STRING PRIMARY KEY, n INTEGER NOT NULL)`,
+		`INSERT INTO messages (tenant_id, n) VALUES ('a', 1)`)
+	seedShard(t, client, shardB,
+		`CREATE TABLE messages (tenant_id STRING PRIMARY KEY, n INTEGER NOT NULL)`,
+		`INSERT INTO messages (tenant_id, n) VALUES ('b', 2)`)
+
+	makeSnapshot := func(generation uint64, version distribution.RoutingVersion) *gateway.Snapshot {
+		t.Helper()
+		man, err := distribution.NewManifest("tenant_data", version, []distribution.Shard{
+			{ID: "-80", Range: keyRange(0x00, false, 0x80), Leaders: []distribution.EndpointID{shardA.endpoint}, Epoch: 7},
+			{ID: "80-", Range: keyRange(0x80, true, 0x00), Leaders: []distribution.EndpointID{shardB.endpoint}, Epoch: 9},
+		})
+		if err != nil {
+			t.Fatalf("NewManifest: %v", err)
+		}
+		snap, err := gateway.NewSnapshot(distribution.ClusterConfig{
+			Distributions: []distribution.DistributionSpec{{Name: "tenant_data", Arity: 1, MapperVersion: distribution.NativeMapperVersion}},
+			Placements:    []distribution.TablePlacement{{Table: "messages", Distribution: "tenant_data", Columns: []string{"/tenant_id"}}},
+			Manifests:     []*distribution.Manifest{man},
+		}, map[distribution.EndpointID]string{
+			shardA.endpoint: shardA.address,
+			shardB.endpoint: shardB.address,
+		}, generation)
+		if err != nil {
+			t.Fatalf("NewSnapshot: %v", err)
+		}
+		return snap
+	}
+
+	catalogPath := filepath.Join(t.TempDir(), "catalog.json")
+	if err := gateway.SaveSnapshot(catalogPath, makeSnapshot(1, 3)); err != nil {
+		t.Fatalf("SaveSnapshot initial: %v", err)
+	}
+	exec, holder, err := newGateway(catalogPath)
+	if err != nil {
+		t.Fatalf("newGateway: %v", err)
+	}
+	if err := gateway.SaveSnapshot(catalogPath, makeSnapshot(2, liveVersion)); err != nil {
+		t.Fatalf("SaveSnapshot newer: %v", err)
+	}
+
+	res, err := exec.Query(context.Background(), gateway.Query{
+		Distribution: "tenant_data",
+		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
+		SQL:          `SELECT n FROM messages ORDER BY n`,
+		Class:        gateway.ClassBatch,
+		Order:        []gateway.OrderKey{{Column: 0}},
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if res.Generation != 2 || res.Retries != 1 || holder.Current().Generation() != 2 {
+		t.Fatalf("generation/retries/current = %d/%d/%d, want 2/1/2",
+			res.Generation, res.Retries, holder.Current().Generation())
+	}
+	got := make([]int64, len(res.Rows))
+	for i, row := range res.Rows {
+		if len(row) != 1 {
+			t.Fatalf("row %d has %d cells, want 1", i, len(row))
+		}
+		got[i], err = strconv.ParseInt(string(row[0].Bytes), 10, 64)
+		if err != nil {
+			t.Fatalf("row %d is not an integer: %v", i, err)
+		}
+	}
+	if !intsEqual(got, []int64{1, 2}) {
+		t.Fatalf("merged rows = %v, want [1 2]", got)
 	}
 }
 

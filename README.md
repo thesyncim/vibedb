@@ -274,7 +274,8 @@ embedded facade:
 - a leader-only shard service (`shardservice`) that executes admitted SQL
   locally through a borrowed `sql/driver` session;
 - a stateless routing gateway (`gateway`) that pins one immutable catalog
-  generation and dispatches bounded, leader-only reads to the shards;
+  generation, reloads a strictly newer valid catalog after stale refusals, and
+  dispatches bounded, leader-only, explicitly read-only queries to the shards;
 - the frozen placement scalar and tuple codec (`distribution`) used as
   cross-shard routing identity; and
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server

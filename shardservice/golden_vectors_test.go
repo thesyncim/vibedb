@@ -57,7 +57,8 @@ func goldenRequests() []goldenRequest {
 		{
 			name: "insert_all_param_kinds",
 			req: &ShardRequest{
-				SQL: "INSERT INTO messages VALUES ($1,$2,$3,$4,$5)",
+				SQL:           "INSERT INTO messages VALUES ($1,$2,$3,$4,$5)",
+				ExecutionMode: ExecutionReadWrite,
 				Params: []Param{
 					NullParam(),
 					BoolParam(true),

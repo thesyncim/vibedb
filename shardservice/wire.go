@@ -53,6 +53,35 @@ func (p ReadPolicy) String() string {
 // valid reports whether p is a known policy value the codec may carry.
 func (p ReadPolicy) valid() bool { return p <= ReadStale }
 
+// ExecutionMode declares whether a request is permitted to mutate shard state.
+// The zero value is deliberately read-only: a newly constructed or partially
+// decoded request cannot acquire write authority by omission.
+type ExecutionMode uint8
+
+const (
+	// ExecutionReadOnly permits SELECT, including WITH, set operations, and
+	// EXPLAIN SELECT. The shard verifies the parsed statement kind before it
+	// executes anything.
+	ExecutionReadOnly ExecutionMode = iota
+	// ExecutionReadWrite permits the direct shard protocol's existing DML and
+	// DDL execution. Distributed gateways never select this mode.
+	ExecutionReadWrite
+)
+
+// String renders the mode name for diagnostics.
+func (m ExecutionMode) String() string {
+	switch m {
+	case ExecutionReadOnly:
+		return "ReadOnly"
+	case ExecutionReadWrite:
+		return "ReadWrite"
+	default:
+		return "Invalid"
+	}
+}
+
+func (m ExecutionMode) valid() bool { return m <= ExecutionReadWrite }
+
 // ParamKind is the wire type of one bound parameter. It refines sql/driver's
 // scalar/document split: Null, Bool, Number, and String are the scalar members
 // (sql/driver ParamScalar), and Document is a complete JSON value (sql/driver
@@ -164,6 +193,9 @@ type ShardRequest struct {
 
 	// ReadPolicy selects the consistency contract; PR 4a honors only ReadStrong.
 	ReadPolicy ReadPolicy
+	// ExecutionMode fences mutation authority. Its zero value is read-only;
+	// direct shard writers must opt into ExecutionReadWrite explicitly.
+	ExecutionMode ExecutionMode
 
 	// Deadline is the execution budget measured from the shard's receipt of the
 	// request. Zero means the shard applies its configured default.
@@ -231,6 +263,14 @@ const (
 	// ErrorMalformedRequest reports a request the shard could not accept as
 	// well-formed.
 	ErrorMalformedRequest
+	// ErrorReadOnly reports a mutating statement carried by a read-only request.
+	ErrorReadOnly
+	// ErrorUnsupportedReadPolicy reports a consistency policy the leader-only
+	// shard cannot prove yet.
+	ErrorUnsupportedReadPolicy
+	// ErrorCommitOutcomeUnknown reports a mutation whose durable completion
+	// cannot be determined. Callers must not retry it without command identity.
+	ErrorCommitOutcomeUnknown
 )
 
 // String renders the kind name for diagnostics.
@@ -248,13 +288,19 @@ func (k ErrorKind) String() string {
 		return "ResourceLimit"
 	case ErrorMalformedRequest:
 		return "MalformedRequest"
+	case ErrorReadOnly:
+		return "ReadOnly"
+	case ErrorUnsupportedReadPolicy:
+		return "UnsupportedReadPolicy"
+	case ErrorCommitOutcomeUnknown:
+		return "CommitOutcomeUnknown"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorMalformedRequest }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorCommitOutcomeUnknown }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.

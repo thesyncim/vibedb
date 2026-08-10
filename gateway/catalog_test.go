@@ -76,6 +76,18 @@ func testSnapshot(t *testing.T, generation uint64) *Snapshot {
 	return s
 }
 
+// TestSnapshotRejectsUnsupportedMapperVersion keeps mapper selection inside the
+// authoritative generation: a gateway never guesses how to route a revision it
+// does not implement.
+func TestSnapshotRejectsUnsupportedMapperVersion(t *testing.T) {
+	config := testConfig(t)
+	config.Distributions[0].MapperVersion = distribution.NativeMapperVersion + 1
+	_, err := NewSnapshot(config, testEndpoints(), 1)
+	if !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("NewSnapshot err = %v, want ErrInvalidCatalog", err)
+	}
+}
+
 // TestSnapshotPersistRoundTrip proves a snapshot survives a durable save and
 // reload with its generation, manifest geometry, per-shard epochs, endpoint
 // membership, and placement intact.
@@ -238,12 +250,20 @@ func TestCatalogHolderPublishAndPin(t *testing.T) {
 	if pinned.Generation() != 1 {
 		t.Fatalf("pinned generation = %d, want 1", pinned.Generation())
 	}
-	h.Publish(testSnapshot(t, 2))
+	if !h.Publish(testSnapshot(t, 2)) {
+		t.Fatal("newer generation was refused")
+	}
 	if pinned.Generation() != 1 {
 		t.Fatalf("pinned generation after publish = %d, want 1", pinned.Generation())
 	}
 	if h.Current().Generation() != 2 {
 		t.Fatalf("current generation = %d, want 2", h.Current().Generation())
+	}
+	if h.Publish(testSnapshot(t, 1)) {
+		t.Fatal("stale generation was accepted")
+	}
+	if h.Current().Generation() != 2 {
+		t.Fatalf("current generation regressed to %d, want 2", h.Current().Generation())
 	}
 }
 
@@ -260,6 +280,9 @@ func TestCatalogHolderPublishNewer(t *testing.T) {
 	}
 	if h.PublishNewer(testSnapshot(t, 3)) {
 		t.Fatal("stale generation was accepted")
+	}
+	if h.PublishNewer(nil) {
+		t.Fatal("nil generation was accepted")
 	}
 	if !h.PublishNewer(testSnapshot(t, 6)) {
 		t.Fatal("newer generation was refused")
@@ -321,4 +344,7 @@ func TestCatalogHolderAtomicPublicationRace(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	if got := h.Current().Generation(); got != generations {
+		t.Fatalf("concurrent monotonic publication ended at generation %d, want %d", got, generations)
+	}
 }

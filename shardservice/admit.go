@@ -1,10 +1,16 @@
 package shardservice
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 )
+
+// ErrUnsupportedReadPolicy reports a consistency policy the leader-only shard
+// cannot currently prove. Session and stale replica reads remain reserved until
+// requests carry the required session/applied-position metadata.
+var ErrUnsupportedReadPolicy = errors.New("shardservice: unsupported read policy")
 
 // Static ownership admission: the pure gate a shard applies to every request
 // before it parses or executes anything.
@@ -53,6 +59,7 @@ func (e *AdmissionError) Response() *ShardResponse {
 //   - wrong distribution or shard  -> ErrorNotOwner       (ErrNotShardOwner)
 //   - stale routing version        -> ErrorRoutingVersion (ErrRoutingVersion)
 //   - mismatched ownership epoch    -> ErrorOwnershipEpoch (ErrOwnershipEpoch)
+//   - unsupported read policy       -> ErrorUnsupportedReadPolicy
 func (o Ownership) Admit(req *ShardRequest) error {
 	if req == nil {
 		return &AdmissionError{
@@ -95,6 +102,15 @@ func (o Ownership) Admit(req *ShardRequest) error {
 				"shardservice: ownership epoch mismatch: request %d, configured %d",
 				req.OwnershipEpoch, o.Epoch),
 			sentinel: distribution.ErrOwnershipEpoch,
+		}
+	}
+	if req.ReadPolicy != ReadStrong {
+		return &AdmissionError{
+			Kind: ErrorUnsupportedReadPolicy,
+			Message: fmt.Sprintf(
+				"shardservice: read policy %s is not supported by a leader-only shard",
+				req.ReadPolicy),
+			sentinel: ErrUnsupportedReadPolicy,
 		}
 	}
 	return nil

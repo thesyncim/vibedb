@@ -68,6 +68,7 @@ func seed(t *testing.T, c *Client, node shardNode, stmts ...seedStmt) {
 			Shard:          node.own.Shard,
 			RoutingVersion: node.own.RoutingVersion,
 			OwnershipEpoch: node.own.Epoch,
+			ExecutionMode:  shardservice.ExecutionReadWrite,
 		}
 		if _, err := c.Do(context.Background(), node.address, req); err != nil {
 			t.Fatalf("seed %q on %s: %v", s.sql, node.address, err)
@@ -118,7 +119,6 @@ func scatterQuery() Query {
 	return Query{
 		Distribution: "tenant_data",
 		Constraints:  distribution.BoundConstraints{distribution.UnknownDomain()},
-		Mapper:       distribution.NewNativeMapper(1),
 		SQL:          `SELECT n FROM messages ORDER BY n`,
 		Class:        ClassBatch,
 		Order:        []OrderKey{{Column: 0}},
@@ -192,7 +192,6 @@ func TestExecutorSingleShardPassthrough(t *testing.T) {
 	res, err := e.Query(context.Background(), Query{
 		Distribution: "tenant_data",
 		Constraints:  distribution.BoundConstraints{finite},
-		Mapper:       distribution.NewNativeMapper(1),
 		SQL:          `SELECT n FROM messages ORDER BY n`,
 		Class:        ClassInteractive,
 	})
@@ -304,6 +303,26 @@ func TestExecutorNoCatalog(t *testing.T) {
 	_, err := e.Query(context.Background(), scatterQuery())
 	if !errors.Is(err, ErrNoCatalog) {
 		t.Fatalf("err = %v, want errors.Is ErrNoCatalog", err)
+	}
+}
+
+// TestExecutorCanceledBeforePreflight proves a canceled request does not parse,
+// pin a catalog, or dial a shard.
+func TestExecutorCanceledBeforePreflight(t *testing.T) {
+	dials := 0
+	client := NewClient(func(context.Context, string) (net.Conn, error) {
+		dials++
+		return nil, errors.New("unexpected dial")
+	})
+	e := NewExecutor(client, NewCatalogHolder(nil), Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := e.Query(ctx, Query{SQL: `SELECT 1`})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if dials != 0 {
+		t.Fatalf("dials = %d, want zero", dials)
 	}
 }
 

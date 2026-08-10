@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // The thin shard client: one synchronous request/response round-trip per call
@@ -24,6 +25,13 @@ var (
 	ErrResultLimit = errors.New("gateway: shard result limit exceeded")
 	// ErrMalformedRequest reports a request the shard refused as not well-formed.
 	ErrMalformedRequest = errors.New("gateway: shard rejected the request as malformed")
+	// ErrReadPolicyUnsupported reports a consistency policy the shard cannot
+	// currently prove.
+	ErrReadPolicyUnsupported = errors.New("gateway: shard does not support the requested read policy")
+	// ErrCommitOutcomeUnknown preserves the storage layer's indeterminate
+	// completion identity across the shard wire. It must never be retried without
+	// a durable command identity and completion record.
+	ErrCommitOutcomeUnknown = durable.ErrCommitOutcomeUnknown
 	// ErrUnexpectedError reports an error frame whose kind this client does not
 	// recognize, so a future error kind fails closed rather than silently.
 	ErrUnexpectedError = errors.New("gateway: shard reported an unrecognized error kind")
@@ -59,6 +67,12 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return ErrResultLimit
 	case shardservice.ErrorMalformedRequest:
 		return ErrMalformedRequest
+	case shardservice.ErrorReadOnly:
+		return ErrWriteNotSupported
+	case shardservice.ErrorUnsupportedReadPolicy:
+		return ErrReadPolicyUnsupported
+	case shardservice.ErrorCommitOutcomeUnknown:
+		return ErrCommitOutcomeUnknown
 	default:
 		return ErrUnexpectedError
 	}

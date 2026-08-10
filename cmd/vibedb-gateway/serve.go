@@ -18,8 +18,9 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-// The serve subcommand: a stateless routing front-end. It loads one immutable
-// catalog generation, then accepts newline-delimited JSON requests over a
+// The serve subcommand: a stateless routing front-end. It loads an immutable
+// catalog generation, refreshes the atomically replaced catalog file after a
+// shard reports stale routing metadata, and accepts newline-delimited JSON requests over a
 // connection, routes and dispatches each as a bounded distributed read against
 // the pinned generation, and replies with the merged result. The wire form is a
 // minimal, stdlib-only JSON envelope; a request names a distribution, an optional
@@ -113,15 +114,18 @@ func runServe(args []string) int {
 	return 0
 }
 
-// newGateway loads and pins one catalog generation and returns an executor that
-// dispatches leader-only strong reads over the default TCP client.
+// newGateway loads the initial catalog generation and returns an executor that
+// dispatches leader-only strong reads over the default TCP client. A stale
+// shard refusal reloads the same crash-safe catalog path, publishing only a
+// strictly newer valid generation.
 func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, error) {
 	snap, err := gateway.LoadSnapshot(catalogPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(snap)
-	exec := gateway.NewExecutor(gateway.NewClient(nil), holder, gateway.Options{})
+	refresher := gateway.NewFileCatalogRefresher(catalogPath, holder)
+	exec := gateway.NewExecutor(gateway.NewClient(nil), holder, gateway.Options{Refresh: refresher.Refresh})
 	return exec, holder, nil
 }
 
@@ -227,7 +231,6 @@ func buildQuery(holder *gateway.CatalogHolder, req serveRequest) (gateway.Query,
 	return gateway.Query{
 		Distribution: dist,
 		Constraints:  cons,
-		Mapper:       distribution.NewNativeMapper(spec.Arity),
 		SQL:          req.SQL,
 		Params:       params,
 		Class:        class,

@@ -70,6 +70,13 @@ func NewSnapshot(config distribution.ClusterConfig, endpoints map[distribution.E
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+	for _, spec := range config.Distributions {
+		if spec.MapperVersion != distribution.NativeMapperVersion {
+			return nil, &CatalogError{Reason: fmt.Sprintf(
+				"distribution %q mapper version %d is unsupported",
+				spec.Name, spec.MapperVersion)}
+		}
+	}
 	for _, m := range config.Manifests {
 		for i := 0; i < m.ShardCount(); i++ {
 			shard, _ := m.ShardInfo(i)
@@ -146,10 +153,10 @@ func NewCatalogHolder(initial *Snapshot) *CatalogHolder {
 	return h
 }
 
-// Publish atomically installs s as the current generation, unconditionally.
-func (h *CatalogHolder) Publish(s *Snapshot) {
-	h.ptr.Store(s)
-}
+// Publish atomically installs s only when its generation is strictly newer
+// than the current generation, and reports whether it did. Catalog authority
+// never moves backward; stale or equal publishers are refused.
+func (h *CatalogHolder) Publish(s *Snapshot) bool { return h.PublishNewer(s) }
 
 // PublishNewer installs s only if it is a strictly newer generation than the
 // current one (or none is published), and reports whether it did. It is the
@@ -157,6 +164,9 @@ func (h *CatalogHolder) Publish(s *Snapshot) {
 // highest generation and a stale republish is refused, while a reader still
 // observes one whole generation.
 func (h *CatalogHolder) PublishNewer(s *Snapshot) bool {
+	if s == nil {
+		return false
+	}
 	for {
 		cur := h.ptr.Load()
 		if cur != nil && s.generation <= cur.generation {

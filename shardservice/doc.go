@@ -14,9 +14,11 @@
 // One connection is served by one goroutine that owns one single-consumer
 // Session, mirroring pgwire. Each request's lifecycle is admit, pin a read
 // snapshot (reads) or autocommit (writes), prepare the SQL text, bind the typed
-// parameters, execute, stream the result, and release the snapshot.
+// parameters, enforce the safe-zero read-only execution intent, execute, stream
+// the result, and release the snapshot. Direct writers opt into read-write;
+// distributed gateway requests are always read-only.
 //
 // This package depends only on the standard library, vibedb's distribution and
-// query types, and the sql/driver runtime it executes through; it adds no
-// root-module dependency and imports no network-RPC or serialization framework.
+// query types, the sql/driver runtime, and durability error identity it carries
+// over the wire; it imports no network-RPC or serialization framework.
 package shardservice

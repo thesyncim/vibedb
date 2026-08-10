@@ -2,12 +2,14 @@ package shardservice
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
 	"time"
 
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // testOwner is the static identity every server test configures its shard with.
@@ -30,6 +32,7 @@ func ownedRequest(sql string, params ...Param) *ShardRequest {
 		Shard:          own.Shard,
 		RoutingVersion: own.RoutingVersion,
 		OwnershipEpoch: own.Epoch,
+		ExecutionMode:  ExecutionReadWrite,
 	}
 }
 
@@ -411,8 +414,7 @@ func TestNewServerValidation(t *testing.T) {
 	}
 }
 
-// TestServerReadPolicyStrong proves the honored strong read policy is served and
-// the reserved values remain wire-valid (zero value is safe).
+// TestServerReadPolicyStrong proves the honored strong read policy is served.
 func TestServerReadPolicyStrong(t *testing.T) {
 	srv, _ := newServer(t, Options{})
 	conn := dial(t, srv)
@@ -422,5 +424,52 @@ func TestServerReadPolicyStrong(t *testing.T) {
 	req.ReadPolicy = ReadStrong
 	if got := exec(t, conn, req); got.Kind != ResponseRows {
 		t.Fatalf("strong read = %+v, want Rows", got)
+	}
+}
+
+// TestServerReadOnlyIntentRejectsMutations proves the safe-zero execution mode
+// checks the parsed statement kind, including a mutation whose RETURNING clause
+// would otherwise make ReturnsRows true, before any state changes.
+func TestServerReadOnlyIntentRejectsMutations(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+
+	req := ownedRequest(`INSERT INTO docs (id, name) VALUES ('blocked', 'nope') RETURNING id`)
+	req.ExecutionMode = ExecutionReadOnly
+	resp := roundTrip(t, conn, req)
+	if resp.Kind != ResponseError || resp.ErrorKind != ErrorReadOnly {
+		t.Fatalf("read-only INSERT RETURNING = %+v, want ReadOnly error", resp)
+	}
+
+	rows := exec(t, conn, ownedRequest(`SELECT id FROM docs WHERE id = 'blocked'`))
+	if rows.Kind != ResponseRows || len(rows.Rows) != 0 {
+		t.Fatalf("blocked mutation left rows: %+v", rows)
+	}
+}
+
+// TestServerReservedReadPoliciesFailClosed proves wire-valid future policies do
+// not silently receive strong-read behavior without their promised metadata.
+func TestServerReservedReadPoliciesFailClosed(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+
+	for _, policy := range []ReadPolicy{ReadSession, ReadStale} {
+		req := ownedRequest(`SELECT 1`)
+		req.ReadPolicy = policy
+		resp := roundTrip(t, conn, req)
+		if resp.Kind != ResponseError || resp.ErrorKind != ErrorUnsupportedReadPolicy {
+			t.Fatalf("policy %s = %+v, want UnsupportedReadPolicy", policy, resp)
+		}
+	}
+}
+
+// TestClassifyCommitOutcomeUnknown proves the wire preserves indeterminate
+// completion instead of mislabeling it as malformed and inviting a retry.
+func TestClassifyCommitOutcomeUnknown(t *testing.T) {
+	cause := errors.New("device sync failed")
+	resp := classifyError(fmt.Errorf("commit: %w: %w", durable.ErrCommitOutcomeUnknown, cause))
+	if resp.Kind != ResponseError || resp.ErrorKind != ErrorCommitOutcomeUnknown {
+		t.Fatalf("classifyError = %+v, want CommitOutcomeUnknown", resp)
 	}
 }

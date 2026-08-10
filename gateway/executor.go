@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 // The bounded fan-out executor: it pins one catalog generation, routes, and
@@ -22,6 +23,25 @@ import (
 // ErrNoCatalog reports that no catalog generation has been published, so no
 // operation can be routed.
 var ErrNoCatalog = errors.New("gateway: no catalog generation is published")
+
+// ErrWriteNotSupported reports a mutating statement submitted to the
+// distributed read executor. Cross-shard writes require a separate protocol
+// with durable command identity and completion semantics; Query refuses them
+// before routing or network I/O so a fan-out can never partially commit.
+var ErrWriteNotSupported = errors.New("gateway: distributed writes are not supported")
+
+// WriteNotSupportedError identifies the statement kind refused by Query. It
+// wraps ErrWriteNotSupported so callers can use errors.Is without parsing the
+// diagnostic string.
+type WriteNotSupportedError struct {
+	Kind sqlast.Kind
+}
+
+func (e *WriteNotSupportedError) Error() string {
+	return fmt.Sprintf("gateway: %s is not supported by the distributed read executor", e.Kind)
+}
+
+func (e *WriteNotSupportedError) Unwrap() error { return ErrWriteNotSupported }
 
 // ErrStaleGeneration reports that a shard rejected the pinned generation and no
 // strictly newer compatible generation was available to retry against, so the
@@ -95,14 +115,14 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 func (e *Executor) Metrics() MetricsSnapshot { return e.metrics.Snapshot() }
 
 // Query is one bounded distributed read. It names the distribution to route
-// against, the bound key, the mapper for that distribution, the SQL and typed
+// against, the bound key, the SQL and typed
 // parameters each shard executes locally, the operational class, and the merge
-// specification. Order lists the sort-key columns when the SQL carries an ORDER
-// BY; Limit trims the merged result to the statement's global LIMIT.
+// specification. The mapper is derived from the pinned catalog generation, not
+// supplied by the caller. Order lists the sort-key columns when the SQL carries
+// an ORDER BY; Limit trims the merged result to the statement's global LIMIT.
 type Query struct {
 	Distribution distribution.DistributionName
 	Constraints  distribution.BoundConstraints
-	Mapper       distribution.Mapper
 
 	SQL    string
 	Params []shardservice.Param
@@ -135,6 +155,18 @@ type Result struct {
 func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var parser sqlast.Parser
+	parser.SetCancellationCheck(ctx.Err)
+	var stmt sqlast.Statement
+	if err := parser.ParseStatement(&stmt, q.SQL); err != nil {
+		return nil, err
+	}
+	if stmt.Kind != sqlast.KindSelect {
+		return nil, &WriteNotSupportedError{Kind: stmt.Kind}
 	}
 	profile := e.profileFor(q.Class)
 

@@ -29,6 +29,7 @@ func ownedReq(sql string, params ...shardservice.Param) *shardservice.ShardReque
 		Shard:          own.Shard,
 		RoutingVersion: own.RoutingVersion,
 		OwnershipEpoch: own.Epoch,
+		ExecutionMode:  shardservice.ExecutionReadWrite,
 	}
 }
 
@@ -115,6 +116,7 @@ func TestClientErrorMapping(t *testing.T) {
 		{"wrong_shard", func(r *shardservice.ShardRequest) { r.Shard = "80-" }, shardservice.ErrorNotOwner, distribution.ErrNotShardOwner},
 		{"stale_routing_version", func(r *shardservice.ShardRequest) { r.RoutingVersion = 99 }, shardservice.ErrorRoutingVersion, distribution.ErrRoutingVersion},
 		{"stale_epoch", func(r *shardservice.ShardRequest) { r.OwnershipEpoch = 99 }, shardservice.ErrorOwnershipEpoch, distribution.ErrOwnershipEpoch},
+		{"unsupported_read_policy", func(r *shardservice.ShardRequest) { r.ReadPolicy = shardservice.ReadSession }, shardservice.ErrorUnsupportedReadPolicy, ErrReadPolicyUnsupported},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -132,6 +134,25 @@ func TestClientErrorMapping(t *testing.T) {
 				t.Fatalf("err = %v, want errors.Is %v", err, tc.sentinel)
 			}
 		})
+	}
+}
+
+// TestClientExtendedErrorMapping covers safety refusals that are difficult to
+// inject through an ordinary healthy shard execution.
+func TestClientExtendedErrorMapping(t *testing.T) {
+	tests := []struct {
+		kind     shardservice.ErrorKind
+		sentinel error
+	}{
+		{shardservice.ErrorReadOnly, ErrWriteNotSupported},
+		{shardservice.ErrorUnsupportedReadPolicy, ErrReadPolicyUnsupported},
+		{shardservice.ErrorCommitOutcomeUnknown, ErrCommitOutcomeUnknown},
+	}
+	for _, tc := range tests {
+		err := shardError(shardservice.NewErrorResponse(tc.kind, tc.kind.String()))
+		if !errors.Is(err, tc.sentinel) {
+			t.Fatalf("kind %s maps to %v, want errors.Is %v", tc.kind, err, tc.sentinel)
+		}
 	}
 }
 

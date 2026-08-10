@@ -267,6 +267,7 @@ func TestAcceptanceMalformedFraming(t *testing.T) {
 			e.u64(uint64(own.RoutingVersion))
 			e.u64(uint64(own.Epoch))
 			e.u8(uint8(ReadStrong))
+			e.u8(uint8(ExecutionReadOnly))
 			e.u64(0)
 			e.u64(0)
 			e.u64(0)
@@ -349,7 +350,8 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 	assertFieldSet(t, "ShardRequest", reqFields, map[string]bool{
 		"SQL": true, "Params": true, "Distribution": true, "Shard": true,
 		"RoutingVersion": true, "OwnershipEpoch": true, "ReadPolicy": true,
-		"Deadline": true, "MaxResultBytes": true, "MaxRows": true,
+		"ExecutionMode": true,
+		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
 	})
 	assertNoPlanField(t, "ShardRequest", reqFields)
 

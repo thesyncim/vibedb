@@ -70,6 +70,18 @@ func TestAdmit(t *testing.T) {
 			wantKind: ErrorOwnershipEpoch,
 			wantIs:   distribution.ErrOwnershipEpoch,
 		},
+		{
+			name:     "session_read_reserved",
+			mutate:   func(r *ShardRequest) { r.ReadPolicy = ReadSession },
+			wantKind: ErrorUnsupportedReadPolicy,
+			wantIs:   ErrUnsupportedReadPolicy,
+		},
+		{
+			name:     "stale_read_reserved",
+			mutate:   func(r *ShardRequest) { r.ReadPolicy = ReadStale },
+			wantKind: ErrorUnsupportedReadPolicy,
+			wantIs:   ErrUnsupportedReadPolicy,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
