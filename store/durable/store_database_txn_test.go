@@ -89,6 +89,188 @@ func journalBytes(t testing.TB, c *Collection) []byte {
 	return data
 }
 
+func putTxnPair(t testing.TB, batch *DatabaseBatch, left, right string) error {
+	t.Helper()
+	a, err := batch.Collection(left)
+	if err != nil {
+		return err
+	}
+	b, err := batch.Collection(right)
+	if err != nil {
+		return err
+	}
+	mustTxnPut(t, a, "k", `{"n":1}`)
+	mustTxnPut(t, b, "k", `{"n":1}`)
+	return nil
+}
+
+func TestTxnLogPinnedDirectoryAndParticipantIdentity(t *testing.T) {
+	t.Run("retarget after open", func(t *testing.T) {
+		dirA := t.TempDir()
+		dirB := t.TempDir()
+		a := openTxnNamedCollection(t, dirA, "a", txnTestOptions())
+		b := openTxnNamedCollection(t, dirA, "b", txnTestOptions())
+		link := filepath.Join(t.TempDir(), "database")
+		if err := os.Symlink(dirA, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		log, err := OpenTxnLog(link, TxnLogOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = log.Close() })
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(dirB, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpdateCollections(
+			log, []NamedCollection{a, b}, defaultTxnLimits(),
+			func(batch *DatabaseBatch) error { return putTxnPair(t, batch, "a", "b") },
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dirA, txnMarkerFilename)); err != nil {
+			t.Fatalf("pinned marker missing: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dirB, txnMarkerFilename)); !os.IsNotExist(err) {
+			t.Fatalf("retargeted directory marker = %v, want absent", err)
+		}
+	})
+
+	t.Run("retarget after first proof", func(t *testing.T) {
+		dirA := t.TempDir()
+		dirB := t.TempDir()
+		link := filepath.Join(t.TempDir(), "database")
+		if err := os.Symlink(dirA, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		a := openTxnNamedCollection(t, link, "a", txnTestOptions())
+		b := openTxnNamedCollection(t, link, "b", txnTestOptions())
+		log, err := OpenTxnLog(link, TxnLogOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = log.Close() })
+		commit := func() error {
+			return UpdateCollections(
+				log, []NamedCollection{a, b}, defaultTxnLimits(),
+				func(batch *DatabaseBatch) error {
+					return putTxnPair(t, batch, "a", "b")
+				},
+			)
+		}
+		if err := commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(dirB, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := commit(); !errors.Is(err, ErrTransactionLogDirectoryMismatch) {
+			t.Fatalf("commit after retarget = %v, want directory mismatch", err)
+		}
+		// Restore the collection namespace before cleanup closes its handles.
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(dirA, link); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("mixed directories", func(t *testing.T) {
+		dirA := t.TempDir()
+		dirB := t.TempDir()
+		a := openTxnNamedCollection(t, dirA, "a", txnTestOptions())
+		b := openTxnNamedCollection(t, dirB, "b", txnTestOptions())
+		log, err := OpenTxnLog(dirA, TxnLogOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = log.Close() })
+		err = UpdateCollections(
+			log, []NamedCollection{a, b}, defaultTxnLimits(),
+			func(batch *DatabaseBatch) error { return putTxnPair(t, batch, "a", "b") },
+		)
+		if !errors.Is(err, ErrTransactionLogDirectoryMismatch) {
+			t.Fatalf("mixed-directory commit = %v, want directory mismatch", err)
+		}
+		if _, err := os.Stat(filepath.Join(dirA, txnMarkerFilename)); !os.IsNotExist(err) {
+			t.Fatalf("pre-mint refusal left marker = %v, want absent", err)
+		}
+		if _, ok := collectionDoc(t, a.Collection, "k"); ok {
+			t.Fatal("mixed-directory refusal published collection a")
+		}
+		if _, ok := collectionDoc(t, b.Collection, "k"); ok {
+			t.Fatal("mixed-directory refusal published collection b")
+		}
+	})
+}
+
+func TestTxnLogRescanRejectsReplacedMarker(t *testing.T) {
+	dir := t.TempDir()
+	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
+	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
+	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	if err := UpdateCollections(
+		log, []NamedCollection{a, b}, defaultTxnLimits(),
+		func(batch *DatabaseBatch) error { return putTxnPair(t, batch, "a", "b") },
+	); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, txnMarkerFilename)
+	if err := os.Rename(path, filepath.Join(dir, "old.vtm")); err != nil {
+		t.Skipf("cannot replace an open marker on this platform: %v", err)
+	}
+	replacement, err := storeio.CreateTxnMarker(path, storeio.TxnMarkerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateCollections(
+		log, []NamedCollection{a, b}, defaultTxnLimits(),
+		func(batch *DatabaseBatch) error { return putTxnPair(t, batch, "a", "b") },
+	); !errors.Is(err, storeio.ErrTxnMarkerCorrupt) {
+		t.Fatalf("commit through replaced marker = %v, want marker corrupt", err)
+	}
+	log.commitMu.Lock()
+	_, err = rescanTxnLogMarker(log)
+	log.commitMu.Unlock()
+	if !errors.Is(err, storeio.ErrTxnMarkerCorrupt) {
+		t.Fatalf("replacement rescan = %v, want marker corrupt", err)
+	}
+	if log.marker == nil {
+		t.Fatal("replacement rescan discarded the original live marker")
+	}
+}
+
+func TestDatabaseTxnCommitAfterRegisteredCollectionDrop(t *testing.T) {
+	db := newTxnTestDatabase(t, "a", "b", "c")
+	if err := db.Update(func(batch *DatabaseBatch) error {
+		return putTxnPair(t, batch, "a", "b")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DropCollection("c"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(batch *DatabaseBatch) error {
+		return putTxnPair(t, batch, "a", "b")
+	}); err != nil {
+		t.Fatalf("commit after drop: %v", err)
+	}
+}
+
 func TestDatabaseTxnVisibilityAtomicity(t *testing.T) {
 	db := newTxnTestDatabase(t, "a", "b", "c")
 	var stop atomic.Bool

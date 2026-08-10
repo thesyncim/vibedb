@@ -206,6 +206,9 @@ func (d *TxnDecisions) MatchesFileDirectory(file *os.File) (bool, error) {
 func matchesTxnMarkerDirectory(
 	sourceDirInfo os.FileInfo, file *os.File,
 ) (bool, error) {
+	if sourceDirInfo == nil || !sourceDirInfo.IsDir() || file == nil {
+		return false, ErrInvalidWrite
+	}
 	dir, err := canonicalTxnMarkerDir(file.Name())
 	if err != nil {
 		return false, err
@@ -222,15 +225,27 @@ func matchesTxnMarkerDirectory(
 	if !os.SameFile(sourceDirInfo, dirInfo) {
 		return false, nil
 	}
-	entryInfo, err := root.Stat(filepath.Base(file.Name()))
+	entryInfo, err := root.Lstat(filepath.Base(file.Name()))
 	if err != nil {
 		return false, err
+	}
+	if !entryInfo.Mode().IsRegular() {
+		return false, nil
 	}
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return false, err
 	}
 	return os.SameFile(fileInfo, entryInfo), nil
+}
+
+// FileMatchesDirectory proves that file is the exact regular, non-symlink
+// entry reached through the same physical directory represented by directory.
+// The FileInfo must come from a pinned directory handle's Stat(".").
+func FileMatchesDirectory(
+	directory os.FileInfo, file *os.File,
+) (bool, error) {
+	return matchesTxnMarkerDirectory(directory, file)
 }
 
 // MarkerID returns the decision-log identity selected at Open.
@@ -689,7 +704,6 @@ func createTxnMarkerInRoot(
 	defer func() {
 		if cleanup {
 			_ = file.Close()
-			_ = root.Close()
 		}
 	}()
 
@@ -919,6 +933,41 @@ func (m *TxnMarker) MatchesFileDirectory(file *os.File) (bool, error) {
 	return matchesTxnMarkerDirectory(m.sourceDirInfo, file)
 }
 
+// SameFile reports whether other is another live handle to this exact marker
+// entry. Directory identity alone is insufficient for a rescan because a
+// different valid txn.vtm could be swapped into the same directory.
+func (m *TxnMarker) SameFile(other *TxnMarker) (bool, error) {
+	if m == nil || other == nil || m.file == nil || other.file == nil {
+		return false, ErrInvalidWrite
+	}
+	left, err := m.file.Stat()
+	if err != nil {
+		return false, err
+	}
+	right, err := other.file.Stat()
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(left, right), nil
+}
+
+// EntryCurrent proves that the live marker descriptor is still the exact
+// regular, non-symlink txn.vtm entry under its pinned root.
+func (m *TxnMarker) EntryCurrent() (bool, error) {
+	if m == nil || m.file == nil || m.root == nil {
+		return false, ErrInvalidWrite
+	}
+	fileInfo, err := m.file.Stat()
+	if err != nil {
+		return false, err
+	}
+	entryInfo, err := m.root.Lstat(filepath.Base(m.path))
+	if err != nil {
+		return false, err
+	}
+	return entryInfo.Mode().IsRegular() && os.SameFile(fileInfo, entryInfo), nil
+}
+
 // NextSequence reports the DCSN the next appended record will carry.
 func (m *TxnMarker) NextSequence() uint64 { return m.nextSequence }
 
@@ -1126,6 +1175,39 @@ func (m *TxnMarker) Close() error {
 		m.root = nil
 	}
 	return errors.Join(fileErr, rootErr)
+}
+
+// Remove verifies the reserved entry against the open descriptor, closes the
+// descriptor, unlinks through the retained root, and persists that unlink
+// before releasing the root. It is the namespace-safe L4 residue-removal path.
+func (m *TxnMarker) Remove() (err error) {
+	if m == nil || m.file == nil || m.root == nil {
+		return ErrInvalidWrite
+	}
+	defer func() {
+		err = errors.Join(err, m.Close())
+	}()
+	current, err := m.EntryCurrent()
+	if err != nil {
+		return err
+	}
+	if !current {
+		return fmt.Errorf(
+			"%w: transaction log entry changed before removal", ErrInvalidWrite,
+		)
+	}
+	name := filepath.Base(m.path)
+	closeErr := m.file.Close()
+	m.file = nil
+	if closeErr != nil {
+		return closeErr
+	}
+	removeErr := m.root.Remove(name)
+	var syncErr error
+	if removeErr == nil {
+		syncErr = syncTxnMarkerParentDir(m.root)
+	}
+	return errors.Join(removeErr, syncErr)
 }
 
 func syncTxnMarkerParentDir(root *os.Root) error {

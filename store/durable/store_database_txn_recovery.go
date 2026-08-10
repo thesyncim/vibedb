@@ -93,47 +93,42 @@ func OpenWithTransactions(
 func loadDatabaseTxnRecovery(
 	dir string, options TxnLogOptions,
 ) (*databaseTxnRecovery, error) {
-	if dir == "" {
-		return nil, fmt.Errorf("vibedb: transaction recovery requires a directory")
-	}
-	absolute, err := filepath.Abs(dir)
+	log, err := newTxnLogDirectory(dir, options)
 	if err != nil {
 		return nil, err
 	}
-	dir = filepath.Clean(absolute)
-	path := filepath.Join(dir, txnMarkerFilename)
-	recovery := &databaseTxnRecovery{dir: dir}
+	recovery := &databaseTxnRecovery{dir: log.dir, log: log}
 
-	info, statErr := os.Stat(path)
+	info, statErr := log.root.Lstat(txnMarkerFilename)
 	if statErr != nil {
 		if !os.IsNotExist(statErr) {
+			_ = log.Close()
 			return nil, statErr
 		}
-		log, err := OpenTxnLog(dir, options)
-		if err != nil {
-			return nil, err
-		}
-		recovery.log = log
 		recovery.absent = true
 		return recovery, nil
 	}
 	if !info.Mode().IsRegular() {
+		_ = log.Close()
 		return nil, fmt.Errorf(
 			"%w: %q is not a regular non-symlink file",
 			ErrUnsupportedDatabaseLayout, txnMarkerFilename,
 		)
 	}
 
-	marker, decisions, err := storeio.OpenTxnMarker(
-		path, storeio.TxnMarkerOptions{Capacity: options.Capacity},
+	marker, decisions, err := storeio.OpenTxnMarkerAt(
+		log.root, txnMarkerFilename,
+		storeio.TxnMarkerOptions{Capacity: options.Capacity},
 	)
 	if err != nil {
 		if errors.Is(err, storeio.ErrTxnMarkerNoValidHeader) {
-			holds, holdErr := directoryHoldsAnyConditional(dir)
+			holds, holdErr := directoryHoldsAnyConditional(log.dir)
 			if holdErr != nil {
+				_ = log.Close()
 				return nil, holdErr
 			}
 			if holds {
+				_ = log.Close()
 				return nil, fmt.Errorf(
 					"%w: %w",
 					ErrTransactionLogMissing, storeio.ErrTxnMarkerNoValidHeader,
@@ -141,31 +136,23 @@ func loadDatabaseTxnRecovery(
 			}
 			// L2 mint residue: no journal references the file; remove and
 			// reopen as absent so the next commit can re-mint.
-			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			if rmErr := log.root.Remove(txnMarkerFilename); rmErr != nil &&
+				!errors.Is(rmErr, os.ErrNotExist) {
+				_ = log.Close()
 				return nil, rmErr
 			}
-			if syncErr := syncRecoveryJournalParent(path); syncErr != nil {
+			if syncErr := syncTxnLogDirectory(log.root); syncErr != nil {
+				_ = log.Close()
 				return nil, syncErr
 			}
-			log, openErr := OpenTxnLog(dir, options)
-			if openErr != nil {
-				return nil, openErr
-			}
-			recovery.log = log
 			recovery.absent = true
 			return recovery, nil
 		}
+		_ = log.Close()
 		return nil, err
 	}
 
-	log := &TxnLog{
-		dir:        dir,
-		path:       path,
-		opts:       options,
-		nextTxnID:  1,
-		registered: make(map[*Collection]struct{}),
-		marker:     marker,
-	}
+	log.marker = marker
 	log.nextTxnID = decisions.MaxTxnID() + 1
 	if log.nextTxnID == 0 {
 		log.nextTxnID = 1
@@ -173,7 +160,6 @@ func loadDatabaseTxnRecovery(
 	if decisions.MaxTxnID() != 0 {
 		log.undischarged = 1
 	}
-	recovery.log = log
 	recovery.decisions = decisions
 	return recovery, nil
 }
@@ -212,18 +198,18 @@ func reconcileDatabaseTxnAfterOpens(
 		if recovery.log != nil {
 			recovery.log.commitMu.Lock()
 			if recovery.log.marker != nil {
-				_ = recovery.log.marker.Close()
+				removeErr := recovery.log.marker.Remove()
 				recovery.log.marker = nil
+				if removeErr != nil {
+					recovery.log.commitMu.Unlock()
+					return fmt.Errorf(
+						"vibedb: remove discharged transaction log: %w",
+						removeErr,
+					)
+				}
 			}
 			recovery.log.undischarged = 0
 			recovery.log.commitMu.Unlock()
-		}
-		path := filepath.Join(recovery.dir, txnMarkerFilename)
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("vibedb: remove discharged transaction log: %w", err)
-		}
-		if err := syncRecoveryJournalParent(path); err != nil {
-			return fmt.Errorf("vibedb: persist transaction log removal: %w", err)
 		}
 		recovery.absent = true
 		recovery.decisions = nil
@@ -399,14 +385,25 @@ func rescanTxnLogMarker(l *TxnLog) (*storeio.TxnDecisions, error) {
 	if l == nil || l.marker == nil {
 		return nil, nil
 	}
-	path := l.path
-	marker, decisions, err := storeio.OpenTxnMarker(
-		path, storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
+	marker, decisions, err := storeio.OpenTxnMarkerAt(
+		l.root, txnMarkerFilename,
+		storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
 	)
 	if err != nil {
 		return nil, err
 	}
 	old := l.marker
+	sameFile, sameErr := old.SameFile(marker)
+	if sameErr != nil || !sameFile || old.Header() != marker.Header() {
+		_ = marker.Close()
+		if sameErr != nil {
+			return nil, sameErr
+		}
+		return nil, fmt.Errorf(
+			"%w: transaction log identity changed during rescan",
+			storeio.ErrTxnMarkerCorrupt,
+		)
+	}
 	l.marker = marker
 	if err := l.verifyMarkerDirectoryLocked(); err != nil {
 		l.marker = old

@@ -146,6 +146,28 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 			t.Fatalf("retargeted directory error = %v, want directory mismatch", err)
 		}
 	})
+
+	t.Run("leaf symlink", func(t *testing.T) {
+		dir := decisions.SourceDir()
+		realPath := filepath.Join(dir, "real-collection.vdb")
+		if err := os.WriteFile(realPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkPath := filepath.Join(dir, "collection.vdb")
+		if err := os.Symlink(filepath.Base(realPath), linkPath); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		file, err := os.Open(linkPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := OpenWithTransactions(file, Options{}, decisions); !errors.Is(
+			err, ErrTransactionLogDirectoryMismatch,
+		) {
+			t.Fatalf("leaf symlink error = %v, want directory mismatch", err)
+		}
+	})
 }
 
 // cloneDatabaseDir copies every regular file in src to a fresh temp directory.

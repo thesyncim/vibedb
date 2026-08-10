@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -70,7 +71,11 @@ type TxnLogOptions struct {
 type TxnLog struct {
 	dir  string
 	path string
-	opts TxnLogOptions
+	root *os.Root
+	// rootInfo is the physical directory identity captured from root. It lets
+	// lazy mint reject mismatched participants before creating txn.vtm.
+	rootInfo os.FileInfo
+	opts     TxnLogOptions
 
 	commitMu sync.Mutex
 	marker   *storeio.TxnMarker
@@ -91,6 +96,35 @@ type TxnLog struct {
 // OpenTxnLog opens dir's decision log, lazily leaving txn.vtm unminted when
 // absent. The mint fence runs at the head of the first K ≥ 2 commit.
 func OpenTxnLog(dir string, options TxnLogOptions) (*TxnLog, error) {
+	log, err := newTxnLogDirectory(dir, options)
+	if err != nil {
+		return nil, err
+	}
+	info, err := log.root.Lstat(txnMarkerFilename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return log, nil
+		}
+		_ = log.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = log.Close()
+		return nil, fmt.Errorf(
+			"%w: %q is not a regular non-symlink file",
+			ErrUnsupportedDatabaseLayout, txnMarkerFilename,
+		)
+	}
+	if err := log.openExisting(); err != nil {
+		_ = log.Close()
+		return nil, err
+	}
+	return log, nil
+}
+
+func newTxnLogDirectory(
+	dir string, options TxnLogOptions,
+) (*TxnLog, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("vibedb: transaction log requires a directory")
 	}
@@ -98,30 +132,53 @@ func OpenTxnLog(dir string, options TxnLogOptions) (*TxnLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir = filepath.Clean(absolute)
+	dir, err = filepath.EvalSymlinks(filepath.Clean(absolute))
+	if err != nil {
+		return nil, err
+	}
+	dir = filepath.Clean(dir)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
 	path := filepath.Join(dir, txnMarkerFilename)
 	log := &TxnLog{
-		dir:         dir,
-		path:        path,
-		opts:        options,
-		nextTxnID:   1,
-		registered:  make(map[*Collection]struct{}),
-	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return log, nil
-		}
-		return nil, err
-	}
-	if err := log.openExisting(); err != nil {
-		return nil, err
+		dir:        dir,
+		path:       path,
+		root:       root,
+		rootInfo:   rootInfo,
+		opts:       options,
+		nextTxnID:  1,
+		registered: make(map[*Collection]struct{}),
 	}
 	return log, nil
 }
 
+func syncTxnLogDirectory(root *os.Root) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	if root == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
 func (l *TxnLog) openExisting() error {
-	marker, decisions, err := storeio.OpenTxnMarker(
-		l.path, storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
+	marker, decisions, err := storeio.OpenTxnMarkerAt(
+		l.root, txnMarkerFilename,
+		storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
 	)
 	if err != nil {
 		return err
@@ -152,15 +209,31 @@ func (l *TxnLog) Close() error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
-	err := l.marker.Close()
+	var markerErr, rootErr error
+	if l.marker != nil {
+		markerErr = l.marker.Close()
+	}
 	l.marker = nil
-	return err
+	if l.root != nil {
+		rootErr = l.root.Close()
+		l.root = nil
+	}
+	return errors.Join(markerErr, rootErr)
 }
 
 // registerCollection records c as catalog-scoped under this log so a later
 // decision-sync failure poisons it alongside commit participants.
 func (l *TxnLog) registerCollection(c *Collection) {
 	if l == nil || c == nil {
+		return
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	l.registerCollectionLocked(c)
+}
+
+func (l *TxnLog) registerCollectionLocked(c *Collection) {
+	if c == nil {
 		return
 	}
 	l.regMu.Lock()
@@ -170,6 +243,29 @@ func (l *TxnLog) registerCollection(c *Collection) {
 	}
 	l.registered[c] = struct{}{}
 	l.collections = append(l.collections, c)
+}
+
+func (l *TxnLog) unregisterCollection(c *Collection) {
+	if l == nil || c == nil {
+		return
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	if _, ok := l.registered[c]; !ok {
+		return
+	}
+	delete(l.registered, c)
+	for i := range l.collections {
+		if l.collections[i] != c {
+			continue
+		}
+		copy(l.collections[i:], l.collections[i+1:])
+		l.collections[len(l.collections)-1] = nil
+		l.collections = l.collections[:len(l.collections)-1]
+		break
+	}
 }
 
 func (l *TxnLog) registeredCollections() []*Collection {
@@ -263,10 +359,7 @@ func UpdateCollections(
 	if err := checkTxnLimits(limits, len(dirty), totalDocs, totalBytes); err != nil {
 		return err
 	}
-	for _, member := range ordered {
-		log.registerCollection(member.Collection)
-	}
-	return log.commitMulti(dirty, batch.byName)
+	return log.commitMulti(dirty, ordered, batch.byName)
 }
 
 func checkTxnLimits(limits TxnLimits, collections, documents int, bytes int64) error {
@@ -384,17 +477,29 @@ var (
 
 func (l *TxnLog) commitMulti(
 	dirty []NamedCollection,
+	members []NamedCollection,
 	byName map[string]*WriteBatch,
 ) (err error) {
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	for _, member := range members {
+		l.registerCollectionLocked(member.Collection)
+	}
 
 	if l.poison != nil {
 		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
 	}
 	// L2 mint fence: complete before any writer is seized for staging, and
 	// before any prepare may reference the minted MarkerID.
-	if err := l.ensureMintedLocked(); err != nil {
+	if l.marker == nil {
+		if err := l.verifyRootDirectoryLocked(); err != nil {
+			return err
+		}
+		if err := l.ensureMintedLocked(); err != nil {
+			return err
+		}
+	}
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
 		return err
 	}
 	if err := l.ensureDecisionRoomLocked(len(dirty)); err != nil {
@@ -530,12 +635,69 @@ func (l *TxnLog) commitMulti(
 	return nil
 }
 
+func (l *TxnLog) verifyRootDirectoryLocked() error {
+	if l == nil || l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	for _, collection := range l.collections {
+		if collection == nil || collection.file == nil {
+			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+		}
+		matches, err := storeio.FileMatchesDirectory(l.rootInfo, collection.file)
+		if err != nil {
+			return fmt.Errorf(
+				"vibedb: prove collection transaction directory: %w", err,
+			)
+		}
+		if !matches {
+			return ErrTransactionLogDirectoryMismatch
+		}
+	}
+	return nil
+}
+
+func (l *TxnLog) verifyMarkerDirectoryLocked() error {
+	if l == nil || l.marker == nil {
+		return fmt.Errorf("vibedb: transaction log marker is not open")
+	}
+	current, err := l.marker.EntryCurrent()
+	if err != nil {
+		return fmt.Errorf("vibedb: prove transaction log entry: %w", err)
+	}
+	if !current {
+		return fmt.Errorf(
+			"%w: transaction log entry changed while open",
+			storeio.ErrTxnMarkerCorrupt,
+		)
+	}
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	for _, collection := range l.collections {
+		if collection == nil || collection.file == nil {
+			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+		}
+		matches, err := l.marker.MatchesFileDirectory(collection.file)
+		if err != nil {
+			return fmt.Errorf(
+				"vibedb: prove collection transaction directory: %w", err,
+			)
+		}
+		if !matches {
+			return ErrTransactionLogDirectoryMismatch
+		}
+	}
+	return nil
+}
+
 func (l *TxnLog) ensureMintedLocked() error {
 	if l.marker != nil {
 		return nil
 	}
-	marker, err := storeio.CreateTxnMarker(
-		l.path, storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
+	marker, err := storeio.CreateTxnMarkerAt(
+		l.root, txnMarkerFilename,
+		storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
 	)
 	if err != nil {
 		if os.IsExist(err) {

@@ -552,6 +552,9 @@ func (d *Database) DropCollection(name string) error {
 		return errors.Join(closeErr,
 			fmt.Errorf("vibedb: persist dropped collection journal: %w", err))
 	}
+	if log := lookupDatabaseTxnLog(d); log != nil {
+		log.unregisterCollection(entry.collection)
+	}
 	delete(d.collections, name)
 	d.reorder()
 	return closeErr
