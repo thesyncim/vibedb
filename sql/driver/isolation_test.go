@@ -442,6 +442,89 @@ func TestReadCommittedDirtyKeysKeepTheirStatementObservation(t *testing.T) {
 	})
 }
 
+func TestReadCommittedPostOverflowStatementObservationSurvivesPeerFinish(t *testing.T) {
+	database, transactionSession := openRuntimeSession(t)
+	defer database.Close()
+	defer transactionSession.Close()
+	outside, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outside.Close()
+	peer, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	create := runtimePrepare(t, transactionSession,
+		`CREATE TABLE docs (id STRING PRIMARY KEY, value STRING)`)
+	if _, err := create.Exec(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	seed := runtimePrepare(t, transactionSession,
+		`INSERT INTO docs (id, value) VALUES ('key', 'initial')`)
+	if _, err := seed.Exec(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	touch := runtimePrepare(t, transactionSession,
+		`SELECT value FROM docs WHERE id = 'key'`)
+	transactionUpdate := runtimePrepare(t, transactionSession,
+		`UPDATE docs SET "$doc" = ? WHERE id = ?`)
+	outsideUpdate := runtimePrepare(t, outside,
+		`UPDATE docs SET "$doc" = ? WHERE id = ?`)
+
+	if err := transactionSession.Begin(context.Background(), TxOptions{
+		Isolation: IsolationReadCommitted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := touch.Query(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cursor.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drive the bounded clock through its overflow edge in memory. Each entry
+	// represents an unrelated committed key; using the white-box clock avoids
+	// thousands of durable fsyncs while preserving the exact mutex/order
+	// invariant used by ordinary autocommit publication.
+	db := transactionSession.conn.db
+	db.mu.Lock()
+	clock := &db.tables["docs"].conflicts
+	for i := 0; i <= txConflictHistoryKeys; i++ {
+		clock.recordKeys([]string{fmt.Sprintf("overflow-%d", i)})
+	}
+	db.mu.Unlock()
+
+	if _, err := transactionUpdate.Exec(context.Background(), []any{
+		[]byte(`{"id":"key","value":"transaction"}`), "key",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The peer owns a registered post-overflow token. Its finish used to prune
+	// the exact write needed by the older Read Committed holder's unregistered
+	// statement observation.
+	if err := peer.Begin(context.Background(), TxOptions{
+		Isolation: IsolationRepeatableRead,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outsideUpdate.Exec(context.Background(), []any{
+		[]byte(`{"id":"key","value":"outside"}`), "key",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := transactionSession.Commit(context.Background()); !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("post-overflow COMMIT = %v, want ErrTransactionConflict", err)
+	}
+}
+
 func TestSerializableRejectsWriteSkew(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY, on_call BOOL)`); err != nil {

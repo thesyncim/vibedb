@@ -177,14 +177,26 @@ func (c *Clock) Finish(begin uint64) {
 	}
 	oldest := c.revision
 	haveExact := false
+	haveObservedFence := false
 	for revision := range c.Active {
 		if revision < c.historyFloor {
+			// A holder whose original Begin token predates the floor is doomed
+			// for work stamped with that token, but it may also own newer,
+			// unregistered Observe tokens. Those tokens are used for statement
+			// cuts captured under the publication mutex. Keep the complete
+			// post-floor history until every such holder finishes: pruning to a
+			// newer registered Begin could otherwise discard a write visible to
+			// an older holder's post-floor observation.
+			haveObservedFence = true
 			continue
 		}
 		if !haveExact || revision < oldest {
 			oldest = revision
 			haveExact = true
 		}
+	}
+	if haveObservedFence {
+		return
 	}
 	if !haveExact {
 		c.Writes = nil

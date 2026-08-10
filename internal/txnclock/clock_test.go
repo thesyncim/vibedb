@@ -51,6 +51,92 @@ func TestClockHistoryIsHardBounded(t *testing.T) {
 	}
 }
 
+func TestClockPostOverflowObservationsRetainExactHistory(t *testing.T) {
+	t.Run("only pre-floor holder remains", func(t *testing.T) {
+		var clock Clock
+		clock.Arm()
+		old := clock.Begin()
+		for i := 0; i <= HistoryKeys; i++ {
+			clock.RecordKeys([]string{fmt.Sprintf("overflow-%d", i)})
+		}
+
+		observed := clock.Observe()
+		newer := clock.Begin()
+		clock.RecordKeys([]string{"protected"})
+		clock.Finish(newer)
+
+		if key, overflow, conflict := clock.Conflict(
+			observed, []string{"protected"},
+		); !conflict || overflow || key != "protected" {
+			t.Fatalf(
+				"post-overflow observation conflict = (%q, overflow %v, conflict %v)",
+				key, overflow, conflict,
+			)
+		}
+		clock.Finish(old)
+	})
+
+	t.Run("pre-floor and newer exact holders coexist", func(t *testing.T) {
+		var clock Clock
+		clock.Arm()
+		old := clock.Begin()
+		for i := 0; i <= HistoryKeys; i++ {
+			clock.RecordKeys([]string{fmt.Sprintf("overflow-%d", i)})
+		}
+
+		observed := clock.Observe()
+		clock.RecordKeys([]string{"protected"})
+		newer := clock.Begin()
+		retiring := clock.Begin()
+		clock.RecordKeys([]string{"later"})
+		clock.Finish(retiring)
+
+		if key, overflow, conflict := clock.Conflict(
+			observed, []string{"protected"},
+		); !conflict || overflow || key != "protected" {
+			t.Fatalf(
+				"coexisting-holder observation conflict = (%q, overflow %v, conflict %v)",
+				key, overflow, conflict,
+			)
+		}
+		clock.Finish(newer)
+		clock.Finish(old)
+	})
+
+	t.Run("repeated overflow stays bounded", func(t *testing.T) {
+		var clock Clock
+		clock.Arm()
+		old := clock.Begin()
+		for round := 0; round < 2; round++ {
+			for i := 0; i <= HistoryKeys; i++ {
+				clock.RecordKeys([]string{
+					fmt.Sprintf("overflow-%d-%d", round, i),
+				})
+				if len(clock.Writes) > HistoryKeys {
+					t.Fatalf(
+						"round %d retained %d keys, limit %d",
+						round, len(clock.Writes), HistoryKeys,
+					)
+				}
+			}
+			observed := clock.Observe()
+			protected := fmt.Sprintf("protected-%d", round)
+			newer := clock.Begin()
+			clock.RecordKeys([]string{protected})
+			clock.Finish(newer)
+			if key, overflow, conflict := clock.Conflict(
+				observed, []string{protected},
+			); !conflict || overflow || key != protected {
+				t.Fatalf(
+					"round %d observation conflict = (%q, overflow %v, conflict %v)",
+					round, key, overflow, conflict,
+				)
+			}
+		}
+		clock.Finish(old)
+	})
+}
+
 func TestClockRevisionWindows(t *testing.T) {
 	var clock Clock
 	clock.Arm()
