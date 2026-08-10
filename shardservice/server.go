@@ -125,6 +125,13 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 		return nil, errors.New(
 			"shardservice: ownership must name a non-empty distribution and shard with a nonzero allocation generation")
 	}
+	if _, err := db.RequireShardStore(sqldriver.ShardStoreBinding{
+		Distribution:         cfg.Distribution,
+		Shard:                cfg.Shard,
+		AllocationGeneration: cfg.AllocationGeneration,
+	}); err != nil {
+		return nil, fmt.Errorf("shardservice: SQL database does not match ownership: %w", err)
+	}
 	if opts.MaxConnections < UnlimitedConnections {
 		return nil, fmt.Errorf("shardservice: MaxConnections must be >= %d", UnlimitedConnections)
 	}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -41,9 +42,23 @@ func ownedRequest(sql string, params ...Param) *ShardRequest {
 // openDB opens a fresh durable catalog under path.
 func openDB(t *testing.T, path string) *sqldriver.Database {
 	t.Helper()
-	db, err := sqldriver.Open(path)
+	owner := testOwner()
+	binding := sqldriver.ShardStoreBinding{
+		Distribution: owner.Distribution, Shard: owner.Shard,
+		AllocationGeneration: owner.AllocationGeneration,
+	}
+	_, statErr := os.Stat(path)
+	var db *sqldriver.Database
+	var err error
+	if os.IsNotExist(statErr) {
+		db, err = sqldriver.InitializeShardStore(path, binding)
+	} else if statErr != nil {
+		t.Fatalf("stat shard store: %v", statErr)
+	} else {
+		db, err = sqldriver.OpenShardStore(path, binding)
+	}
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("open shard store: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
@@ -414,6 +429,38 @@ func TestNewServerValidation(t *testing.T) {
 		t.Fatalf("MaxResultRows default = %d, want %d",
 			srv.opts.MaxResultRows, DefaultMaxResultRows)
 	}
+}
+
+func TestNewServerRequiresMatchingDurableShardStore(t *testing.T) {
+	t.Run("unbound", func(t *testing.T) {
+		db, err := sqldriver.Open(filepath.Join(t.TempDir(), "ordinary.vdb"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		_, err = NewServer(db, testOwner(), Options{})
+		if !errors.Is(err, sqldriver.ErrShardStoreUnbound) {
+			t.Fatalf("NewServer(unbound) = %v, want ErrShardStoreUnbound", err)
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "shard.vdb")
+		owner := testOwner()
+		db, err := sqldriver.InitializeShardStore(path, sqldriver.ShardStoreBinding{
+			Distribution: owner.Distribution, Shard: owner.Shard,
+			AllocationGeneration: owner.AllocationGeneration,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		owner.AllocationGeneration++
+		_, err = NewServer(db, owner, Options{})
+		if !errors.Is(err, sqldriver.ErrShardStoreIdentityMismatch) {
+			t.Fatalf("NewServer(mismatch) = %v, want ErrShardStoreIdentityMismatch", err)
+		}
+	})
 }
 
 // TestServerReadPolicyStrong proves the honored strong read policy is served.

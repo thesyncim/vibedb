@@ -15,6 +15,14 @@
 // prevents new sessions immediately, while existing sessions retain the
 // catalog until their own [Session.Close].
 //
+// [InitializeShardStore] is the explicit, one-time constructor for a new local
+// shard root. It durably publishes a [ShardStoreIdentity] before creating the
+// table namespace. [OpenShardStore] is open-existing only and compares the
+// distribution, shard, and allocation generation before recovery. Generic
+// [Open] and [OpenCluster] reject shard-bound catalogs so a serving process
+// cannot bypass that identity check. The random LogID is local incarnation
+// metadata, not a lease or a distributed revocation mechanism.
+//
 // [Session.Prepare] parses and lowers exactly once. [Prepared] reports the
 // statement kind, placeholder count and scalar-versus-document [ParamKind], as
 // well as immutable output names and typed [query.OutputColumn] metadata.

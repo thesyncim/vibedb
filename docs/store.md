@@ -656,9 +656,15 @@ local-cluster facade (`OpenCluster`, no network) also uses and which is
 therefore reachable from the embedded surface. Gateway execution is
 fail-closed and read-only: mutations are rejected before dispatch, shard
 requests carry a safe-zero read-only intent, and stale routing refusals reload
-only a strictly newer valid catalog generation. That tier is itself leader-only —
-no replication, failover, or online resharding — and its design contract lives
-in [distributed sharding](design/distributed-sharding.md) and
+only a strictly newer valid catalog generation. A shard catalog is created
+explicitly and durably bound to its distribution, shard ID, topology allocation
+generation, and a random local LogID before table recovery; serving is
+open-existing only and generic SQL opens reject a bound shard catalog. This
+fences accidental rebinding but is not a lease: an old running process or a
+byte-for-byte copied store still requires an external replicated authority to
+revoke. The tier is itself leader-only — no replication, failover, or online
+resharding — and its design contract lives in
+[distributed sharding](design/distributed-sharding.md) and
 [Vitess-compatible routing](design/vitess-compatible-routing.md). The PostgreSQL
 protocol-v3 server can expose the typed SQL catalog directly;
 that path supports the documented DDL, DML, SELECT, prepared-statement, join,

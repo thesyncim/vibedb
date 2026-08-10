@@ -14,7 +14,6 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
-	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // End-to-end coverage of the bounded distributed read path: a real multi-shard
@@ -200,15 +199,14 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 	manShards := make([]distribution.Shard, len(specs))
 	for i, spec := range specs {
 		allocationGeneration := distribution.ShardAllocationGeneration(i + 1)
-		db, err := sqldriver.Open(filepath.Join(t.TempDir(), string(spec.id)+".vdb"))
-		if err != nil {
-			t.Fatalf("Open %s: %v", spec.id, err)
-		}
-		t.Cleanup(func() { _ = db.Close() })
-		srv, err := shardservice.NewServer(db, shardservice.Ownership{
+		ownership := shardservice.Ownership{
 			Distribution: dist, Shard: spec.id, AllocationGeneration: allocationGeneration,
 			Epoch: spec.epoch, RoutingVersion: version,
-		}, shardservice.Options{})
+		}
+		db := initializeTestShardStore(
+			t, filepath.Join(t.TempDir(), string(spec.id)+".vdb"), ownership,
+		)
+		srv, err := shardservice.NewServer(db, ownership, shardservice.Options{})
 		if err != nil {
 			t.Fatalf("NewServer %s: %v", spec.id, err)
 		}

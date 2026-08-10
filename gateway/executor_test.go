@@ -10,7 +10,6 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
-	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // shardNode is one in-process shard server plus the ownership and address a
@@ -31,11 +30,9 @@ type seedStmt struct {
 // reachable at address.
 func newShardNode(t *testing.T, address string, own shardservice.Ownership) shardNode {
 	t.Helper()
-	db, err := sqldriver.Open(filepath.Join(t.TempDir(), address+".vdb"))
-	if err != nil {
-		t.Fatalf("Open %s: %v", address, err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := initializeTestShardStore(
+		t, filepath.Join(t.TempDir(), address+".vdb"), own,
+	)
 	srv, err := shardservice.NewServer(db, own, shardservice.Options{})
 	if err != nil {
 		t.Fatalf("NewServer %s: %v", address, err)

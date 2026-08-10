@@ -27,9 +27,15 @@ type serveShard struct {
 // returns the shard's endpoint, ownership, and bound address.
 func startShard(t *testing.T, endpoint distribution.EndpointID, own shardservice.Ownership) serveShard {
 	t.Helper()
-	db, err := sqldriver.Open(filepath.Join(t.TempDir(), string(own.Shard)+".vdb"))
+	db, err := sqldriver.InitializeShardStore(
+		filepath.Join(t.TempDir(), string(own.Shard)+".vdb"),
+		sqldriver.ShardStoreBinding{
+			Distribution: own.Distribution, Shard: own.Shard,
+			AllocationGeneration: own.AllocationGeneration,
+		},
+	)
 	if err != nil {
-		t.Fatalf("Open %s: %v", own.Shard, err)
+		t.Fatalf("InitializeShardStore %s: %v", own.Shard, err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	srv, err := shardservice.NewServer(db, own, shardservice.Options{})

@@ -47,9 +47,10 @@ const maxCatalogTables = 128
 const maxCatalogBytes = 16 << 20
 
 type catalogFile struct {
-	Version int                   `json:"version"`
-	Tables  map[string]*tableMeta `json:"tables"`
-	Views   map[string]*viewMeta  `json:"views,omitempty"`
+	Version    int                   `json:"version"`
+	Tables     map[string]*tableMeta `json:"tables"`
+	Views      map[string]*viewMeta  `json:"views,omitempty"`
+	ShardStore *ShardStoreIdentity   `json:"shard_store,omitempty"`
 }
 
 // viewMeta is immutable after publication. Prepared statements retain its
@@ -213,6 +214,16 @@ func openDatabaseWithSync(
 	path string,
 	syncDir func(string) error,
 ) (*database, error) {
+	return openDatabaseWithShardStorePolicy(path, syncDir, shardStoreOpenPolicy{
+		mode: shardStoreOpenGeneric,
+	})
+}
+
+func openDatabaseWithShardStorePolicy(
+	path string,
+	syncDir func(string) error,
+	shardPolicy shardStoreOpenPolicy,
+) (*database, error) {
 	if path == "" {
 		return nil, errors.New("vibedb: the DSN must be a file path")
 	}
@@ -249,26 +260,6 @@ func openDatabaseWithSync(
 			}
 		}
 	}()
-	if err := d.recoverVisibleNamespace(); err != nil {
-		return nil, err
-	}
-	// The transaction recovery path pins an os.Root to the private table
-	// directory. On a brand-new SQL catalog that directory is still absent;
-	// publish it through the same namespace-fenced helper used by first table
-	// materialization before asking durable recovery to open the root.
-	if err := d.ensureDataDir(); err != nil {
-		return nil, err
-	}
-	// Load txn.vtm before any table open so every participant's journal replay
-	// can resolve kind-5 records, and so stray conditionals are consumed before
-	// the log accepts a new commit.
-	decisions, txnLog, err := durable.RecoverDatabaseTransactions(
-		d.dataDir, durable.TxnLogOptions{},
-	)
-	if err != nil {
-		return nil, err
-	}
-	d.txnDecisions, d.txnLog = decisions, txnLog
 	raw, exists, err := readCatalogFile(absolute)
 	if err != nil {
 		return nil, err
@@ -290,6 +281,112 @@ func openDatabaseWithSync(
 			d.catalog.Views = make(map[string]*viewMeta)
 		}
 	}
+	var initializeIdentity *ShardStoreIdentity
+	switch shardPolicy.mode {
+	case shardStoreOpenGeneric:
+		if d.catalog.ShardStore != nil {
+			return nil, &ShardStoreError{
+				Op: "open generic catalog", Path: absolute,
+				Actual: *d.catalog.ShardStore,
+				Err:    ErrShardStoreIdentityMismatch,
+			}
+		}
+	case shardStoreOpenInitialize:
+		if d.catalog.ShardStore != nil &&
+			d.catalog.ShardStore.Binding() != shardPolicy.expected {
+			return nil, &ShardStoreError{
+				Op: "initialize", Path: absolute, Expected: shardPolicy.expected,
+				Actual: *d.catalog.ShardStore,
+				Err:    ErrShardStoreIdentityMismatch,
+			}
+		}
+		if d.catalog.ShardStore == nil {
+			if exists {
+				return nil, &ShardStoreError{
+					Op: "initialize existing unbound catalog", Path: absolute,
+					Expected: shardPolicy.expected,
+					Err:      ErrShardStoreIdentityMismatch,
+				}
+			}
+			if _, statErr := os.Lstat(d.dataDir); statErr == nil {
+				return nil, &ShardStoreError{
+					Op: "initialize existing unbound storage root", Path: absolute,
+					Expected: shardPolicy.expected,
+					Err:      ErrShardStoreIdentityMismatch,
+				}
+			} else if !os.IsNotExist(statErr) {
+				return nil, statErr
+			}
+			identity, identityErr := randomShardStoreIdentity(shardPolicy.expected)
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			initializeIdentity = &identity
+		}
+	case shardStoreOpenExisting:
+		if !exists || d.catalog.ShardStore == nil {
+			return nil, &ShardStoreError{
+				Op: "open", Path: absolute, Expected: shardPolicy.expected,
+				Err: ErrShardStoreUnbound,
+			}
+		}
+		if d.catalog.ShardStore.Binding() != shardPolicy.expected {
+			return nil, &ShardStoreError{
+				Op: "open", Path: absolute, Expected: shardPolicy.expected,
+				Actual: *d.catalog.ShardStore,
+				Err:    ErrShardStoreIdentityMismatch,
+			}
+		}
+	default:
+		return nil, errors.New("vibedb: invalid shard store open policy")
+	}
+	if initializeIdentity != nil {
+		// The binding is the first durable record in a new shard root. Publish it
+		// before namespace fencing creates the private table directory, before
+		// transaction recovery, and before any durable table can be opened or
+		// repaired. A published-but-unfenced error is intentionally retryable only
+		// through an exact-coordinate InitializeShardStore call.
+		d.catalog.ShardStore = initializeIdentity
+		d.catalogWritePending = true
+		var published bool
+		if shardPolicy.persistIdentity != nil {
+			published, err = shardPolicy.persistIdentity(d)
+		} else {
+			published, err = d.persistCatalogLocked()
+		}
+		if err != nil {
+			if !published {
+				// The binding is still tentative. Failed-open teardown normally
+				// settles committed catalog mirrors; do not let that generic path
+				// retry a definitely unpublished initialization after its caller
+				// has already received an ordinary failure.
+				d.catalog.ShardStore = nil
+				d.catalogWritePending = false
+			}
+			return nil, fmt.Errorf("vibedb: initialize shard store identity: %w", err)
+		}
+	}
+
+	if err := d.recoverVisibleNamespace(); err != nil {
+		return nil, err
+	}
+	// The transaction recovery path pins an os.Root to the private table
+	// directory. On a brand-new SQL catalog that directory is still absent;
+	// publish it through the same namespace-fenced helper used by first table
+	// materialization before asking durable recovery to open the root.
+	if err := d.ensureDataDir(); err != nil {
+		return nil, err
+	}
+	// Load txn.vtm before any table open so every participant's journal replay
+	// can resolve kind-5 records, and so stray conditionals are consumed before
+	// the log accepts a new commit.
+	decisions, txnLog, err := durable.RecoverDatabaseTransactions(
+		d.dataDir, durable.TxnLogOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	d.txnDecisions, d.txnLog = decisions, txnLog
 	if err := checkCatalogTableCount(len(d.catalog.Tables)); err != nil {
 		return nil, err
 	}
@@ -1070,6 +1167,12 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 		}
 		size += part
 		return true
+	}
+	if catalog.ShardStore != nil {
+		if !add(encodedJSONStringBytes(string(catalog.ShardStore.Distribution)) +
+			encodedJSONStringBytes(string(catalog.ShardStore.Shard)) + 512) {
+			return size, catalogSizeError(size)
+		}
 	}
 	for name, meta := range catalog.Tables {
 		if !add(encodedJSONStringBytes(name) + 512) {

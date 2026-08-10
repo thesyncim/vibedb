@@ -34,16 +34,31 @@ func ownedReq(sql string, params ...shardservice.Param) *shardservice.ShardReque
 	}
 }
 
+func initializeTestShardStore(
+	t *testing.T,
+	path string,
+	own shardservice.Ownership,
+) *sqldriver.Database {
+	t.Helper()
+	db, err := sqldriver.InitializeShardStore(path, sqldriver.ShardStoreBinding{
+		Distribution: own.Distribution, Shard: own.Shard,
+		AllocationGeneration: own.AllocationGeneration,
+	})
+	if err != nil {
+		t.Fatalf("InitializeShardStore: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 // newShardServer builds a real in-process shard server over a fresh durable
 // catalog. The gateway client speaks to it over net.Pipe, exercising the real
 // wire codec end to end without binding a port.
 func newShardServer(t *testing.T) *shardservice.Server {
 	t.Helper()
-	db, err := sqldriver.Open(filepath.Join(t.TempDir(), "shard.vdb"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := initializeTestShardStore(
+		t, filepath.Join(t.TempDir(), "shard.vdb"), testOwnership(),
+	)
 	srv, err := shardservice.NewServer(db, testOwnership(), shardservice.Options{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

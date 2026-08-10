@@ -10,6 +10,9 @@
 //
 // Usage:
 //
+//	vibedb-shard init -store <path> -distribution <name> -shard <id> \
+//	    -allocation-generation <n>
+//
 //	vibedb-shard serve -store <path> -listen <addr> \
 //	    -distribution <name> -shard <id> -allocation-generation <n> \
 //	    -epoch <n> -routing-version <n>
@@ -20,6 +23,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -42,6 +46,8 @@ func run(args []string) int {
 		return 2
 	}
 	switch args[1] {
+	case "init":
+		return runInit(args[2:])
 	case "serve":
 		return runServe(args[2:])
 	default:
@@ -52,9 +58,49 @@ func run(args []string) int {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  vibedb-shard init -store <path> -distribution <name> "+
+		"-shard <id> -allocation-generation <n>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard serve -store <path> -listen <addr> "+
 		"-distribution <name> -shard <id> -allocation-generation <n> "+
 		"-epoch <n> -routing-version <n>")
+}
+
+func runInit(args []string) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	store := fs.String("store", "", "path for the new local vibedb shard catalog file")
+	distName := fs.String("distribution", "", "owned distribution group name")
+	shard := fs.String("shard", "", "owned shard identifier")
+	allocation := fs.Uint64("allocation-generation", 0, "topology shard allocation generation")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *store == "" || *distName == "" || *shard == "" || *allocation == 0 {
+		usage()
+		return 2
+	}
+	binding := sqldriver.ShardStoreBinding{
+		Distribution:         distribution.DistributionName(*distName),
+		Shard:                distribution.ShardID(*shard),
+		AllocationGeneration: distribution.ShardAllocationGeneration(*allocation),
+	}
+	db, err := sqldriver.InitializeShardStore(*store, binding)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error initialize store=%q: %v\n", *store, err)
+		return 1
+	}
+	identity, identityErr := db.ShardStoreIdentity()
+	closeErr := db.Close()
+	if identityErr != nil || closeErr != nil {
+		fmt.Fprintf(os.Stderr, "error finish store=%q: %v\n", *store,
+			errors.Join(identityErr, closeErr))
+		return 1
+	}
+	fmt.Fprintf(os.Stderr,
+		"vibedb-shard initialized distribution=%q shard=%q allocation-generation=%d log-id=%x store=%q\n",
+		identity.Distribution, identity.Shard, identity.AllocationGeneration,
+		identity.LogID, *store,
+	)
+	return 0
 }
 
 func runServe(args []string) int {
@@ -81,7 +127,12 @@ func runServe(args []string) int {
 		return 2
 	}
 
-	db, err := sqldriver.Open(*store)
+	binding := sqldriver.ShardStoreBinding{
+		Distribution:         distribution.DistributionName(*distName),
+		Shard:                distribution.ShardID(*shard),
+		AllocationGeneration: distribution.ShardAllocationGeneration(*allocation),
+	}
+	db, err := sqldriver.OpenShardStore(*store, binding)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error open store=%q: %v\n", *store, err)
 		return 1
@@ -89,9 +140,9 @@ func runServe(args []string) int {
 	defer db.Close()
 
 	cfg := shardservice.Ownership{
-		Distribution:         distribution.DistributionName(*distName),
-		Shard:                distribution.ShardID(*shard),
-		AllocationGeneration: distribution.ShardAllocationGeneration(*allocation),
+		Distribution:         binding.Distribution,
+		Shard:                binding.Shard,
+		AllocationGeneration: binding.AllocationGeneration,
 		Epoch:                distribution.OwnershipEpoch(*epoch),
 		RoutingVersion:       distribution.RoutingVersion(*routingVersion),
 	}

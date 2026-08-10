@@ -283,6 +283,14 @@ embedded facade:
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server
   tier.
 
+Every shard catalog must be created explicitly with `vibedb-shard init`. Its
+write-once SQL catalog identity binds the distribution, shard ID, and
+topology-issued allocation generation to a random local LogID; `serve` opens
+existing bound stores only, and generic SQL opens reject them. This prevents
+accidental local rebinding. It is not a lease or replication authority: it
+cannot revoke a running old process, distinguish a copied store, or prove that
+a replica is caught up.
+
 The shard service, gateway, and their binaries are server-only and not part of
 the embedded API. The one embedded touch point is opt-in and carries no
 network: the `sql/driver` local-cluster facade (`OpenCluster` /
