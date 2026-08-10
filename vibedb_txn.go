@@ -138,10 +138,10 @@ type Tx struct {
 	readOnly bool
 	done     bool
 
-	diskCut  durable.DatabaseSnapshot
-	hasDisk  bool
-	heapCut  store.DatabaseSnapshot
-	hasHeap  bool
+	diskCut durable.DatabaseSnapshot
+	hasDisk bool
+	heapCut store.DatabaseSnapshot
+	hasHeap bool
 
 	colls map[string]*txCollectionState
 
@@ -231,6 +231,22 @@ func (t *Tx) Commit() error {
 
 	db.commitMu.Lock()
 	defer db.commitMu.Unlock()
+	// dirty is name-sorted, so every transaction takes collection fences in one
+	// stable order. Keep them through conflict validation, materialization,
+	// publication, and conflict-clock recording. A direct Put/Delete on a dirty
+	// collection therefore linearizes wholly before validation or after COMMIT;
+	// writes to unrelated collections remain independent.
+	lockedCollections := make([]*Collection, 0, len(dirty))
+	for _, state := range dirty {
+		collection := db.Collection(state.name)
+		collection.txnFence.Lock()
+		lockedCollections = append(lockedCollections, collection)
+	}
+	defer func() {
+		for i := len(lockedCollections) - 1; i >= 0; i-- {
+			lockedCollections[i].txnFence.Unlock()
+		}
+	}()
 	if db.closed.Load() {
 		t.finish(nil)
 		return ErrClosed
@@ -249,6 +265,9 @@ func (t *Tx) Commit() error {
 			t.finish(nil)
 			return err
 		}
+	}
+	if hook := db.testAfterTxValidation; hook != nil {
+		hook()
 	}
 	for _, state := range dirty {
 		if !state.absent {

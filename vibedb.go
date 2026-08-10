@@ -258,6 +258,10 @@ type Database struct {
 	clocks    map[string]*txnclock.Clock
 	rwTxCount int
 
+	// Deterministic in-package concurrency seams. Production leaves both nil.
+	testAfterTxValidation     func()
+	testDirectMutationBlocked func(*Collection)
+
 	// updateDepth tracks Update/View closure nesting per goroutine. Concurrent
 	// closures on distinct goroutines are allowed; re-entering Update on the
 	// same goroutine is a typed refusal (not a savepoint).
@@ -435,6 +439,11 @@ type Collection struct {
 	// or reads; its purpose is to make the Memory profile's low-level
 	// create-then-backfill sequence one retryable facade operation.
 	indexMu sync.Mutex
+	// txnFence closes the validation-to-publication window between native
+	// transactions and direct point writes. Transactions take every dirty
+	// collection's fence in name order; Put and Delete take only their own, so
+	// unrelated collections retain independent write concurrency.
+	txnFence sync.Mutex
 
 	closed    atomic.Bool // standalone OpenFile collections only
 	closeMu   sync.Mutex
@@ -662,6 +671,17 @@ func (c *Collection) Put(key string, document []byte) (created bool, err error) 
 		if err := validateDocument(c.storeOptions(), document); err != nil {
 			return false, err
 		}
+	}
+	c.lockDirectMutation()
+	defer c.unlockDirectMutation()
+	// The fence may have waited behind a transaction that materialized this lazy
+	// collection, or Close may have won admission while it waited. Resolve again
+	// inside the publication interval before deciding whether creation is needed.
+	memory, disk, err = c.backend(false)
+	if err != nil {
+		return false, err
+	}
+	if memory == nil && disk == nil {
 		memory, disk, err = c.backend(true)
 		if err != nil {
 			return false, err
@@ -687,8 +707,9 @@ func (c *Collection) Put(key string, document []byte) (created bool, err error) 
 		}
 		return created, facadeError(canonicalErr)
 	}
+	before := disk.Generation()
 	created, err = disk.Put(byteview.Bytes(key), document)
-	if err == nil {
+	if durableMutationPublished(disk, before, err) {
 		c.recordCommittedKey(key)
 	}
 	return created, facadeError(err)
@@ -704,6 +725,12 @@ func (c *Collection) Delete(key string) (deleted bool, err error) {
 	if len(key) == 0 || len(key) > maxKeyBytes {
 		return false, ErrKeyTooLarge
 	}
+	c.lockDirectMutation()
+	defer c.unlockDirectMutation()
+	memory, disk, err = c.backend(false)
+	if err != nil {
+		return false, err
+	}
 	if memory != nil {
 		deleted, err = memory.Delete(key)
 		if err == nil {
@@ -714,11 +741,47 @@ func (c *Collection) Delete(key string) (deleted bool, err error) {
 	if disk == nil {
 		return false, nil
 	}
+	before := disk.Generation()
 	deleted, err = disk.Delete(byteview.Bytes(key))
-	if err == nil {
+	if durableMutationPublished(disk, before, err) {
 		c.recordCommittedKey(key)
 	}
 	return deleted, facadeError(err)
+}
+
+// lockDirectMutation enters the per-collection validation/publication fence for
+// a database-owned handle. Standalone OpenFile collections cannot participate
+// in a Database transaction and therefore need no facade-level fence.
+func (c *Collection) lockDirectMutation() {
+	if c == nil || c.owner == nil {
+		return
+	}
+	if !c.txnFence.TryLock() {
+		if hook := c.owner.testDirectMutationBlocked; hook != nil {
+			hook(c)
+		}
+		c.txnFence.Lock()
+	}
+}
+
+func (c *Collection) unlockDirectMutation() {
+	if c != nil && c.owner != nil {
+		c.txnFence.Unlock()
+	}
+}
+
+// durableMutationPublished conservatively recognizes both an ordinary durable
+// point-write publication and an error whose in-process outcome is uncertain.
+// The latter must still advance conflict history or a transaction that began
+// before it could overwrite the possibly published value.
+func durableMutationPublished(c *durable.Collection, before uint64, err error) bool {
+	if c == nil {
+		return false
+	}
+	if c.Generation() != before {
+		return true
+	}
+	return err != nil && c.PersistenceError() != nil
 }
 
 // Append appends key's canonical JSON document to dst. A miss leaves dst
