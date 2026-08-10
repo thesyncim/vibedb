@@ -110,7 +110,10 @@ func TestAcceptanceReadSnapshotPinned(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 	defer reader.Close()
-	if err := reader.Begin(context.Background(), sqldriver.TxOptions{ReadOnly: true}); err != nil {
+	if err := reader.Begin(context.Background(), sqldriver.TxOptions{
+		ReadOnly:  true,
+		Isolation: sqldriver.IsolationRepeatableRead,
+	}); err != nil {
 		t.Fatalf("Begin(ReadOnly): %v", err)
 	}
 	if n := countRows(t, reader, `SELECT id FROM docs`); n != 1 {
