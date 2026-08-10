@@ -1,8 +1,8 @@
 // Package txnclock owns the bounded first-committer-wins conflict clock shared
 // by the SQL driver and the native facade.
 //
-// Record is gated by Arm/Disarm: when the armed count is zero, RecordKeys is one
-// atomic load and a return. Begin, Finish, and Conflict stay live so a
+// Record is gated by Arm/Disarm: when the armed count is zero, RecordKeys is an
+// atomic fast-path check and a return. Begin, Finish, and Conflict stay live so a
 // validation edge can observe publications that raced the arm. The SQL driver
 // keeps its clocks always-armed under database.mu; the facade arms only while
 // at least one read-write transaction is open.
@@ -29,17 +29,34 @@ const HistoryKeys = 4096
 // Active and Writes are exported so in-module adapters can mirror them for
 // white-box tests without duplicating clock state.
 type Clock struct {
-	armed        atomic.Uint32
-	revision     uint64
-	historyFloor uint64
-	Active       map[uint64]uint32
-	Writes       map[string]uint64
+	armed           atomic.Uint32
+	revision        uint64
+	revisionStopped bool
+	historyFloor    uint64
+	Active          map[uint64]uint32
+	Writes          map[string]uint64
 }
+
+const (
+	maxRevision    = ^uint64(0)
+	maxActiveCount = ^uint32(0)
+)
 
 // Arm declares one armed holder. Matching Disarm releases it. RecordKeys is a
 // no-op while the armed count is zero.
 func (c *Clock) Arm() {
-	c.armed.Add(1)
+	for {
+		cur := c.armed.Load()
+		if cur == maxActiveCount {
+			// MaxUint32 is a permanent saturated sentinel. It deliberately gives
+			// up exact decrementability at the representational boundary so writes
+			// can never become invisible after too many Disarms.
+			return
+		}
+		if c.armed.CompareAndSwap(cur, cur+1) {
+			return
+		}
+	}
 }
 
 // Disarm releases one armed holder. Disarm on a zero count is a no-op so a
@@ -47,7 +64,7 @@ func (c *Clock) Arm() {
 func (c *Clock) Disarm() {
 	for {
 		cur := c.armed.Load()
-		if cur == 0 {
+		if cur == 0 || cur == maxActiveCount {
 			return
 		}
 		if c.armed.CompareAndSwap(cur, cur-1) {
@@ -67,7 +84,15 @@ func (c *Clock) Begin() uint64 {
 	if c.Active == nil {
 		c.Active = make(map[uint64]uint32)
 	}
-	c.Active[revision]++
+	count := c.Active[revision]
+	if count >= maxActiveCount-1 {
+		// MaxUint32 is a permanent saturated sentinel. Making the bucket
+		// immortal prevents a later Finish from retiring history while an
+		// uncounted transaction is still live.
+		c.Active[revision] = maxActiveCount
+		return revision
+	}
+	c.Active[revision] = count + 1
 	return revision
 }
 
@@ -78,6 +103,9 @@ func (c *Clock) Conflict(
 	begin uint64,
 	keys []string,
 ) (key string, historyOverflow, conflict bool) {
+	if c.revisionStopped {
+		return "", true, true
+	}
 	if begin < c.historyFloor {
 		return "", true, true
 	}
@@ -95,6 +123,10 @@ func (c *Clock) Finish(begin uint64) {
 	count := c.Active[begin]
 	switch count {
 	case 0:
+		return
+	case maxActiveCount:
+		// The exact number of holders is no longer representable, so this
+		// revision can never safely be declared quiescent.
 		return
 	case 1:
 		delete(c.Active, begin)
@@ -152,7 +184,7 @@ func (c *Clock) Finish(begin uint64) {
 }
 
 // RecordKeys records a committed write set. When the clock is unarmed this is
-// one atomic load and a return.
+// an atomic fast-path check and a return.
 func (c *Clock) RecordKeys(keys []string) {
 	if c.armed.Load() == 0 {
 		return
@@ -161,7 +193,7 @@ func (c *Clock) RecordKeys(keys []string) {
 }
 
 func (c *Clock) recordKeys(keys []string) {
-	if len(keys) == 0 {
+	if len(keys) == 0 || c.revisionStopped {
 		return
 	}
 	newKeys := 0
@@ -190,7 +222,21 @@ func (c *Clock) recordKeys(keys []string) {
 }
 
 func (c *Clock) nextWrite(newKeys int) (uint64, bool) {
-	c.revision++
+	if c.revision == maxRevision {
+		if c.Active[maxRevision] != 0 {
+			// A transaction begun at MaxUint64 cannot distinguish any later
+			// write using this clock. Stop the clock permanently and make every
+			// subsequent validation conflict rather than wrap to revision zero.
+			c.revisionStopped = true
+			c.Writes = nil
+			return c.revision, false
+		}
+		// It is safe to reuse MaxUint64 while every active transaction began
+		// before it: the maximum revision still compares newer than all of
+		// their begin tokens. A begin at the maximum fences the next write.
+	} else {
+		c.revision++
+	}
 	if len(c.Active) == 0 {
 		c.Writes = nil
 		c.historyFloor = 0

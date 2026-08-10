@@ -83,6 +83,126 @@ func TestClockRevisionWindows(t *testing.T) {
 	clock.Finish(second)
 }
 
+func TestClockRevisionExhaustionFailsClosedWithoutWrapping(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+	clock.revision = maxRevision - 1
+
+	beforeMaximum := clock.Begin()
+	clock.RecordKeys([]string{"at-maximum"})
+	if clock.revision != maxRevision || clock.revisionStopped {
+		t.Fatalf("first maximum write stopped clock: revision %d stopped %v", clock.revision, clock.revisionStopped)
+	}
+	if key, overflow, conflict := clock.Conflict(beforeMaximum, []string{"at-maximum"}); !conflict || overflow || key != "at-maximum" {
+		t.Fatalf("maximum revision conflict = (%q, overflow %v, conflict %v)", key, overflow, conflict)
+	}
+
+	// Reusing MaxUint64 remains exact for transactions whose tokens are lower.
+	clock.RecordKeys([]string{"also-maximum"})
+	if clock.revisionStopped {
+		t.Fatal("clock stopped without an active maximum-revision transaction")
+	}
+	if key, overflow, conflict := clock.Conflict(beforeMaximum, []string{"also-maximum"}); !conflict || overflow || key != "also-maximum" {
+		t.Fatalf("reused maximum conflict = (%q, overflow %v, conflict %v)", key, overflow, conflict)
+	}
+
+	atMaximum := clock.Begin()
+	clock.RecordKeys([]string{"unrepresentable"})
+	if clock.revision != maxRevision || !clock.revisionStopped {
+		t.Fatalf("exhausted clock = revision %d stopped %v", clock.revision, clock.revisionStopped)
+	}
+	if clock.Writes != nil {
+		t.Fatalf("exhausted clock retained %d ambiguous writes", len(clock.Writes))
+	}
+	for name, begin := range map[string]uint64{
+		"older":   beforeMaximum,
+		"maximum": atMaximum,
+		"future":  clock.Begin(),
+	} {
+		if key, overflow, conflict := clock.Conflict(begin, []string{"untouched"}); !conflict || !overflow || key != "" {
+			t.Fatalf("%s validation after exhaustion = (%q, overflow %v, conflict %v)", name, key, overflow, conflict)
+		}
+	}
+
+	clock.Finish(beforeMaximum)
+	clock.Finish(atMaximum)
+	clock.Finish(maxRevision)
+	if _, overflow, conflict := clock.Conflict(clock.Begin(), nil); !conflict || !overflow {
+		t.Fatalf("quiescence reopened exhausted clock: overflow %v conflict %v", overflow, conflict)
+	}
+}
+
+func TestClockMaximumRevisionWithoutReadersRemainsUsable(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+	clock.revision = maxRevision
+	clock.RecordKeys([]string{"no-reader"})
+	if clock.revisionStopped || clock.revision != maxRevision {
+		t.Fatalf("reader-free maximum write = revision %d stopped %v", clock.revision, clock.revisionStopped)
+	}
+	if clock.Writes != nil {
+		t.Fatalf("reader-free maximum write retained history: %v", clock.Writes)
+	}
+}
+
+func TestClockActiveCountExhaustionRetainsHistory(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+	clock.Active = map[uint64]uint32{0: maxActiveCount - 1}
+
+	if begin := clock.Begin(); begin != 0 {
+		t.Fatalf("begin revision = %d, want 0", begin)
+	}
+	if count := clock.Active[0]; count != maxActiveCount {
+		t.Fatalf("active saturation count = %d, want %d", count, uint64(maxActiveCount))
+	}
+	for i := 0; i < 3; i++ {
+		clock.Finish(0)
+	}
+	if count := clock.Active[0]; count != maxActiveCount {
+		t.Fatalf("saturated active count after Finish = %d, want %d", count, uint64(maxActiveCount))
+	}
+
+	clock.RecordKeys([]string{"protected"})
+	if key, overflow, conflict := clock.Conflict(0, []string{"protected"}); !conflict || overflow || key != "protected" {
+		t.Fatalf("saturated holder conflict = (%q, overflow %v, conflict %v)", key, overflow, conflict)
+	}
+}
+
+func TestClockActiveMaximumExactCountCanFinish(t *testing.T) {
+	var clock Clock
+	clock.Active = map[uint64]uint32{0: maxActiveCount - 2}
+	clock.Begin()
+	if count := clock.Active[0]; count != maxActiveCount-1 {
+		t.Fatalf("representable active count = %d, want %d", count, uint64(maxActiveCount-1))
+	}
+	clock.Finish(0)
+	if count := clock.Active[0]; count != maxActiveCount-2 {
+		t.Fatalf("active count after Finish = %d, want %d", count, uint64(maxActiveCount-2))
+	}
+}
+
+func TestClockArmedCountExhaustionStaysArmed(t *testing.T) {
+	var clock Clock
+	clock.armed.Store(maxActiveCount - 1)
+	clock.Arm()
+	if clock.Armed() != maxActiveCount {
+		t.Fatalf("armed saturation count = %d, want %d", clock.Armed(), uint64(maxActiveCount))
+	}
+	for i := 0; i < 3; i++ {
+		clock.Disarm()
+	}
+	if clock.Armed() != maxActiveCount {
+		t.Fatalf("Disarm reopened saturated armed gate: %d", clock.Armed())
+	}
+
+	begin := clock.Begin()
+	clock.RecordKeys([]string{"still-published"})
+	if key, overflow, conflict := clock.Conflict(begin, []string{"still-published"}); !conflict || overflow || key != "still-published" {
+		t.Fatalf("saturated armed publication = (%q, overflow %v, conflict %v)", key, overflow, conflict)
+	}
+}
+
 func TestClockUnarmedRecordIsNoop(t *testing.T) {
 	var clock Clock
 	begin := clock.Begin()
@@ -126,8 +246,8 @@ func TestClockArmingInvariantRace(t *testing.T) {
 	// while the clock is armed; after Disarm quiescence, RecordKeys must not
 	// extend history.
 	const (
-		goroutines  = 8
-		iterations  = 128
+		goroutines   = 8
+		iterations   = 128
 		keysPerWrite = 4
 	)
 	var (
@@ -210,5 +330,24 @@ func TestClockArmingInvariantRace(t *testing.T) {
 	}
 	if seen.Load() == 0 {
 		t.Fatal("race test observed no conflicts")
+	}
+}
+
+func BenchmarkClockRecordKeysUnarmed(b *testing.B) {
+	var clock Clock
+	keys := []string{"key"}
+	b.ReportAllocs()
+	for b.Loop() {
+		clock.RecordKeys(keys)
+	}
+}
+
+func BenchmarkClockConflictNoWrites(b *testing.B) {
+	var clock Clock
+	begin := clock.Begin()
+	keys := []string{"key"}
+	b.ReportAllocs()
+	for b.Loop() {
+		clock.Conflict(begin, keys)
 	}
 }
