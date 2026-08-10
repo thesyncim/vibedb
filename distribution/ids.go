@@ -11,6 +11,12 @@ type EndpointID string
 // OwnershipEpoch fences stale writers independently from routing versions.
 type OwnershipEpoch uint64
 
+// ShardAllocationGeneration is a topology-authority allocation sequence within
+// one distribution. It is globally monotonic for that distribution and never
+// reused, so catalog lineage remains provable after a shard disappears without
+// comparing unrelated shards' Raft-derived OwnershipEpoch values.
+type ShardAllocationGeneration uint64
+
 // RoutingVersion identifies one immutable manifest generation for a
 // distribution.
 type RoutingVersion uint64

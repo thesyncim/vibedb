@@ -53,13 +53,15 @@ func (r Role) String() string {
 	}
 }
 
-// Target is one selected shard endpoint. Endpoint is opaque to this package;
-// OwnershipEpoch fences stale writers independently of the routing version.
+// Target is one selected shard endpoint. AllocationGeneration identifies the
+// topology-created physical shard allocation; OwnershipEpoch fences writer
+// authority within that exact allocation independently of the routing version.
 type Target struct {
-	Shard          ShardID
-	Endpoint       EndpointID
-	OwnershipEpoch OwnershipEpoch
-	Role           Role
+	Shard                ShardID
+	AllocationGeneration ShardAllocationGeneration
+	Endpoint             EndpointID
+	OwnershipEpoch       OwnershipEpoch
+	Role                 Role
 }
 
 // Route is an immutable routing result pinned to one routing version. Targets

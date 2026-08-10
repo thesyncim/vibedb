@@ -340,13 +340,45 @@ func TestHeapSemiJoinMembershipPayloadIsAdmittedBeforeAppend(t *testing.T) {
 		t.Fatalf("wide semi-join error = %v, want WorkBudgetError", err)
 	}
 	binding := &exec.Workspace.joins[0]
-	if len(binding.lits) == 0 || len(binding.lits) >= 64 {
+	if len(binding.lits) != 0 || len(binding.text) != 0 {
 		t.Fatalf(
-			"wide membership was not stopped at an admitted prefix: lits=%d text=%d",
+			"failed membership retained logical values: lits=%d text=%d",
 			len(binding.lits),
 			len(binding.text),
 		)
 	}
+
+	// The failed execution now clears logical bindings before returning, so
+	// exercise the append boundary directly to prove a payload is admitted
+	// before it can grow either retained slice.
+	var budget heapWorkBudget
+	budget.begin(minimumHeapMemoryBytes)
+	if err := budget.admit("fixture base workspace", minimumHeapMemoryBytes-(8<<10)); err != nil {
+		t.Fatal(err)
+	}
+	var prefix joinBinding
+	for i := range 64 {
+		value := fmt.Sprintf("%06d-%s", i, strings.Repeat("x", 512))
+		beforeLits, beforeText := len(prefix.lits), len(prefix.text)
+		err := prefix.appendValue(scalar{kind: kindString, sval: value}, &budget)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, ErrWorkBudget) {
+			t.Fatalf("append %d error = %v, want ErrWorkBudget", i, err)
+		}
+		if len(prefix.lits) != beforeLits || len(prefix.text) != beforeText {
+			t.Fatalf(
+				"rejected append mutated binding: lits %d->%d text %d->%d",
+				beforeLits, len(prefix.lits), beforeText, len(prefix.text),
+			)
+		}
+		if beforeLits == 0 || beforeLits >= 64 {
+			t.Fatalf("membership stopped at prefix %d, want 1..63", beforeLits)
+		}
+		return
+	}
+	t.Fatal("wide direct membership unexpectedly fit its bounded remainder")
 }
 
 func TestJoinMembershipTextGrowthRebasesEveryBorrowedView(t *testing.T) {

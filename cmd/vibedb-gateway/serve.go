@@ -73,6 +73,10 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
+	if err := requireLoopbackListen(*listen); err != nil {
+		fmt.Fprintf(os.Stderr, "gateway: %v\n", err)
+		return 2
+	}
 
 	exec, holder, err := newGateway(*catalog)
 	if err != nil {
@@ -97,6 +101,25 @@ func runServe(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// requireLoopbackListen keeps the unauthenticated development protocol from
+// becoming a remotely reachable admin/query endpoint. Remote serving needs an
+// authenticated transport, which this newline-delimited JSON protocol does not
+// provide yet.
+func requireLoopbackListen(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("listen address %q is invalid: %w", address, err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("listen address %q must be loopback; remote unauthenticated serving is refused", address)
+	}
+	return nil
 }
 
 // newGateway loads the initial catalog generation and returns an executor that

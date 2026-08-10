@@ -15,6 +15,22 @@
 // prevents new sessions immediately, while existing sessions retain the
 // catalog until their own [Session.Close].
 //
+// [InitializeShardStore] is the explicit, one-time constructor for a new local
+// shard root. It durably publishes a [ShardStoreIdentity] before creating the
+// table namespace. [OpenShardStore] is open-existing only and compares the
+// distribution, shard, and allocation generation before recovery. Generic
+// [Open] and [OpenCluster] reject shard-bound catalogs so a serving process
+// cannot bypass that identity check. The random LogID is local incarnation
+// metadata. [Database.ClaimShardStoreServing] durably advances the identity's
+// nonzero ownership-epoch and routing-version high-waters before returning one
+// exclusive in-process claim; closing it permits an equal local restart but
+// never lowers either high-water. This protects only the exact open store. It
+// is not a lease, leader election, replicated authority, or revocation
+// mechanism for another process or a copied store. It does not police trusted
+// callers that open Sessions directly on the same Database; such callers must
+// stop and drain that work before releasing a serving claim. shardservice does
+// so for every Session it owns.
+//
 // [Session.Prepare] parses and lowers exactly once. [Prepared] reports the
 // statement kind, placeholder count and scalar-versus-document [ParamKind], as
 // well as immutable output names and typed [query.OutputColumn] metadata.
@@ -30,10 +46,12 @@
 //
 // Runtime transaction state follows PostgreSQL's failed-transaction rule. A
 // prepare or execution error after Begin moves the session to
-// [SessionFailedTransaction]; only Rollback remains usable. Commit in that state
-// first rolls back every staged change and then returns [ErrTransactionFailed].
-// A protocol error outside runtime execution can make the same transition with
-// [Session.MarkFailed].
+// [SessionFailedTransaction]. [Session.RollbackTo] remains usable and, when its
+// mark exists, recovers the session to [SessionInTransaction] without ending
+// the transaction. [Session.Rollback] remains the unconditional terminal
+// escape. Commit in the failed state first rolls back every staged change and
+// then returns [ErrTransactionFailed]. A protocol error outside runtime
+// execution can make the same transition with [Session.MarkFailed].
 //
 // # Catalog, schemas, and indexes
 //
@@ -96,7 +114,7 @@
 // identity shape fuses into its defining plan. One recursively discovered
 // physical collection keeps the direct durable and exact-index path. Multiple
 // collections use one coherent reusable capture, and transactional execution
-// reads the BEGIN snapshot plus staged writes. All relation spools share
+// reads the current isolation cut plus staged writes. All relation spools share
 // ExecOptions.IntermediateBytes, publish no partial result on error or
 // cancellation, and retain no CTE state or marginal allocation when WITH is
 // absent.
@@ -119,7 +137,7 @@
 // The driver captures all participating durable collections in one coherent
 // leased snapshot. Generalized joins receive that catalog cut directly, so a
 // physical operand retains its durable scan and eligible exact-index path.
-// Transactions execute against the BEGIN cut plus the transaction overlay.
+// Transactions execute against their statement or BEGIN cut plus the overlay.
 // The legacy single-clause physical INNER/LEFT equi-join subset keeps its
 // established bounded heap path and storage-aware strategy; classification
 // happens once at preparation and ordinary point queries never initialize
@@ -135,10 +153,14 @@
 //
 // # Transactions
 //
-// BEGIN captures every cataloged table at one generation cut. Reads use that
-// cut overlaid with the transaction's own staged changes, providing snapshot
-// isolation, repeatable reads, phantom exclusion, and read-your-writes. Joins
-// execute the same BEGIN cut plus overlay under the relation and pair bounds.
+// Default and Read Committed transactions capture only one statement's
+// executable physical dependency closure at a coherent generation cut.
+// BEGIN retains one shared immutable catalog-layout epoch; unrelated tables
+// allocate no transaction state, acquire no leases, and register no conflict
+// clocks. Repeatable Read and Snapshot retain the complete BEGIN cut, providing
+// repeatable reads and phantom exclusion. Every mode overlays staged changes
+// and preserves read-your-writes; joins consume the same statement cut under
+// the relation and pair bounds.
 //
 // A transaction may read and write several tables. COMMIT validates every
 // dirty table under the catalog lock (incarnation, bounded first-committer-wins
@@ -146,8 +168,12 @@
 // empty durable participants, then publishes: one dirty table through today's
 // Collection.Update path; two or more through durable.UpdateCollections against
 // the driver-owned decision log in <catalog>.tables/. Disjoint keys may commit
-// concurrently across tables. Write skew is possible under snapshot isolation:
-// the read set is not validated. An aborted or crashed transaction that wrote
+// concurrently across tables. Serializable publishing commits additionally
+// validate bounded exact primary-key reads (including misses) and promote
+// scans, nested execution, or exact-read overflow to a relation-coarse
+// dependency. This rejects write skew and phantoms without serializing
+// independent point writers on the same table. An aborted or crashed
+// transaction that wrote
 // to a table absent at BEGIN can leave that empty table behind as catalog
 // residue. SAVEPOINT / RELEASE / ROLLBACK TO manage a bounded overlay stack
 // (64 frames); ROLLBACK TO does not lower high-water admission accounting and
@@ -158,7 +184,8 @@
 // durable.ErrCommitOutcomeUnknown: the unknown outcome is atomic across every
 // participating table, and further writes under the catalog refuse until reopen.
 //
-// Only default and database/sql snapshot isolation are accepted. Batch
+// Default/Read Committed, Repeatable Read/Snapshot, and Serializable are
+// accepted; weaker and linearizable levels are refused. Batch
 // document and byte bounds return ErrTransactionTooLarge wrapping
 // durable.ErrBatchTooLarge without partial publication. Catalog format version
 // 0 is the current and only accepted format; this unreleased driver does not

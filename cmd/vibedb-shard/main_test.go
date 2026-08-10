@@ -1,8 +1,12 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/thesyncim/vibedb/distribution"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // TestRunArgumentHandling covers the binary's dispatch and validation branches
@@ -17,7 +21,11 @@ func TestRunArgumentHandling(t *testing.T) {
 		{"no_subcommand", []string{"vibedb-shard"}, 2},
 		{"unknown_subcommand", []string{"vibedb-shard", "wat"}, 2},
 		{"missing_required_flags", []string{"vibedb-shard", "serve", "-listen", "127.0.0.1:0"}, 2},
+		{"zero_epoch", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-routing-version", "1"}, 2},
+		{"zero_routing_version", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-epoch", "1"}, 2},
 		{"unparseable_flag", []string{"vibedb-shard", "serve", "-store"}, 2},
+		{"missing_init_flags", []string{"vibedb-shard", "init", "-store", "store.vdb"}, 2},
+		{"unparseable_init_flag", []string{"vibedb-shard", "init", "-store"}, 2},
 		{
 			name: "store_open_fails",
 			// A directory cannot be opened as a store file, so Open fails before
@@ -26,6 +34,8 @@ func TestRunArgumentHandling(t *testing.T) {
 				"vibedb-shard", "serve",
 				"-store", t.TempDir(),
 				"-distribution", "tenant_data", "-shard", "-80",
+				"-allocation-generation", "1",
+				"-epoch", "1", "-routing-version", "1",
 			},
 			want: 1,
 		},
@@ -39,6 +49,80 @@ func TestRunArgumentHandling(t *testing.T) {
 	}
 }
 
+func TestRunInitCreatesIdentityAndRetriesExactly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shard.vdb")
+	args := []string{
+		"vibedb-shard", "init",
+		"-store", path,
+		"-distribution", "tenant_data", "-shard", "-80",
+		"-allocation-generation", "7",
+	}
+	if got := run(args); got != 0 {
+		t.Fatalf("first init = %d, want 0", got)
+	}
+	binding := sqldriver.ShardStoreBinding{
+		Distribution: "tenant_data", Shard: "-80",
+		AllocationGeneration: distribution.ShardAllocationGeneration(7),
+	}
+	db, err := sqldriver.OpenShardStore(path, binding)
+	if err != nil {
+		t.Fatalf("OpenShardStore after init: %v", err)
+	}
+	identity, err := db.ShardStoreIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if identity.LogID == ([16]byte{}) {
+		t.Fatal("init generated a zero LogID")
+	}
+
+	if got := run(args); got != 0 {
+		t.Fatalf("exact init retry = %d, want 0", got)
+	}
+	db, err = sqldriver.OpenShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, err := db.ShardStoreIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if retried != identity {
+		t.Fatalf("exact init retry changed identity: got %+v want %+v", retried, identity)
+	}
+
+	mismatch := append([]string(nil), args...)
+	mismatch[len(mismatch)-1] = "8"
+	if got := run(mismatch); got != 1 {
+		t.Fatalf("mismatched init = %d, want 1", got)
+	}
+}
+
+func TestRunServeRefusesMissingStoreWithoutInitializingIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-shard.vdb")
+	args := []string{
+		"vibedb-shard", "serve",
+		"-store", path,
+		"-distribution", "tenant_data", "-shard", "-80",
+		"-allocation-generation", "1",
+		"-epoch", "1", "-routing-version", "1",
+	}
+	if got := run(args); got != 1 {
+		t.Fatalf("run(missing store) = %d, want 1", got)
+	}
+	for _, candidate := range []string{path, path + ".lock", path + ".tables"} {
+		if _, err := os.Stat(candidate); !os.IsNotExist(err) {
+			t.Fatalf("serve initialized missing path %s: %v", candidate, err)
+		}
+	}
+}
+
 // TestRunStoreOpenReportsPath is a light guard that the store path reaches Open:
 // a nested, non-existent directory path also fails cleanly with code 1.
 func TestRunStoreOpenReportsPath(t *testing.T) {
@@ -47,6 +131,8 @@ func TestRunStoreOpenReportsPath(t *testing.T) {
 		"vibedb-shard", "serve",
 		"-store", missing,
 		"-distribution", "tenant_data", "-shard", "-80",
+		"-allocation-generation", "1",
+		"-epoch", "1", "-routing-version", "1",
 	}
 	if got := run(args); got != 1 {
 		t.Fatalf("run(missing store dir) = %d, want 1", got)

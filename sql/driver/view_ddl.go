@@ -135,9 +135,12 @@ func (d *database) createViewLocked(
 		if !published {
 			delete(d.catalog.Views, name)
 			d.catalogWritePending = previousPending
+		} else {
+			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
 	}
+	d.advanceLayoutEpochLocked()
 	return result{}, nil
 }
 
@@ -174,9 +177,12 @@ func (d *database) dropViewLocked(
 		if !published {
 			d.catalog.Views[drop.Name] = meta
 			d.catalogWritePending = previousPending
+		} else {
+			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
 	}
+	d.advanceLayoutEpochLocked()
 	return result{}, nil
 }
 

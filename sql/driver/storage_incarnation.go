@@ -370,6 +370,9 @@ func (d *database) replaceTableStorageLockedContext(
 		d.catalogWritePending = previousPending
 		return errors.Join(persistErr, d.discardTableStorageLocked(name, candidate))
 	}
+	// The new incarnation remains authoritative on success and on a catalog
+	// publication with unknown durability outcome.
+	d.advanceLayoutEpochLocked()
 	if persistErr != nil {
 		return persistErr
 	}

@@ -1,12 +1,15 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
 	"testing"
 	"unsafe"
+
+	"github.com/thesyncim/vibedb/distribution"
 )
 
 func testIndexDescriptor() IndexDescriptor {
@@ -231,6 +234,16 @@ func TestIndexCatalogPublicationFencesDefinitionAndLifecycle(t *testing.T) {
 	if publish(2, &changed) {
 		t.Fatal("same incarnation changed its certified flags")
 	}
+	changed = building
+	changed.Name = "renamed"
+	if publish(2, &changed) {
+		t.Fatal("same incarnation changed its logical name")
+	}
+	changed = building
+	changed.Paths = []string{"/tenant_id"}
+	if publish(2, &changed) {
+		t.Fatal("same incarnation changed its path count")
+	}
 	ready := building
 	ready.Lifecycle = IndexReady
 	if !publish(2, &ready) {
@@ -256,6 +269,12 @@ func TestIndexCatalogPublicationFencesDefinitionAndLifecycle(t *testing.T) {
 	if !publish(11, &rebuilt) {
 		t.Fatal("generation jump did not admit a higher incarnation")
 	}
+	renamedRebuild := rebuilt
+	renamedRebuild.Incarnation++
+	renamedRebuild.Name = "renamed"
+	if publish(12, &renamedRebuild) {
+		t.Fatal("higher incarnation changed its logical name")
+	}
 	stale := rebuilt
 	stale.Incarnation--
 	if publish(12, &stale) {
@@ -263,12 +282,206 @@ func TestIndexCatalogPublicationFencesDefinitionAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestSaveSnapshotFencesDurableIndexIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	descriptor := testIndexDescriptor()
+	descriptor.Lifecycle = IndexReady
+	first, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(path, first); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := descriptor
+	changed.Paths = []string{"/tenant_id", "/changed"}
+	next, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 2, []IndexDescriptor{changed},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(path, next); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("SaveSnapshot changed incarnation identity err=%v, want ErrInvalidCatalog", err)
+	}
+	durable, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.Generation() != 1 {
+		t.Fatalf("durable generation = %d, want 1", durable.Generation())
+	}
+}
+
+func TestIndexIDHighWaterFencesReuseAfterRetirement(t *testing.T) {
+	descriptor := testIndexDescriptor()
+	descriptor.Lifecycle = IndexReady
+	withIndex := func(generation uint64, descriptor *IndexDescriptor) *Snapshot {
+		t.Helper()
+		var indexes []IndexDescriptor
+		if descriptor != nil {
+			indexes = []IndexDescriptor{*descriptor}
+		}
+		snapshot, err := NewSnapshotWithIndexes(
+			testConfig(t), testEndpoints(), generation, indexes,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+
+	first := withIndex(1, &descriptor)
+	retired := withIndex(2, nil)
+	reused := withIndex(3, &descriptor)
+	holder := NewCatalogHolder(first)
+	if !holder.PublishNewer(retired) {
+		t.Fatal("index retirement was refused")
+	}
+	if holder.PublishNewer(reused) {
+		t.Fatal("retired IndexID/incarnation was reused in memory")
+	}
+	holderPath := filepath.Join(t.TempDir(), "holder-catalog.json")
+	if err := SaveSnapshot(holderPath, holder.Current()); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(holderPath, reused); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("holder publication lost retired identity history: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(path, retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(path, reused); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("retired durable IndexID/incarnation reuse err=%v, want ErrInvalidCatalog", err)
+	}
+	reusedWithHigherIncarnation := descriptor
+	reusedWithHigherIncarnation.Incarnation++
+	if err := SaveSnapshot(path, withIndex(3, &reusedWithHigherIncarnation)); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("retired IndexID with higher incarnation err=%v, want ErrInvalidCatalog", err)
+	}
+	replacement := descriptor
+	replacement.IndexID++
+	replacement.Incarnation++
+	if err := SaveSnapshot(path, withIndex(3, &replacement)); err != nil {
+		t.Fatalf("fresh monotonic index id was refused: %v", err)
+	}
+}
+
+func TestIndexIDHighWaterRetainsNoRetiredIdentityStrings(t *testing.T) {
+	backing := strings.Repeat("x", 1<<20) + "by_tenant_created"
+	descriptor := testIndexDescriptor()
+	descriptor.Name = backing[len(backing)-len("by_tenant_created"):]
+	snapshot, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := NewCatalogHolder(snapshot)
+	retired, err := NewSnapshotWithIndexes(testConfig(t), testEndpoints(), 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !holder.PublishNewer(retired) {
+		t.Fatal("index retirement was refused")
+	}
+	current := holder.Current()
+	if current.indexIDHighWater != descriptor.IndexID {
+		t.Fatalf("index id high-water = %d, want %d", current.indexIDHighWater, descriptor.IndexID)
+	}
+	if current.plannerIndexStrings != "" || len(current.plannerIndexes) != 0 {
+		t.Fatal("retired index identity strings remain reachable from the active snapshot")
+	}
+	if len(current.shardGenerationHighWaters) != len(current.config.Distributions) {
+		t.Fatalf("shard allocation high-waters = %d, want one per distribution", len(current.shardGenerationHighWaters))
+	}
+}
+
+func TestIndexIDHighWaterSupportsSkippedCatalogGenerations(t *testing.T) {
+	descriptor := testIndexDescriptor()
+	descriptor.Lifecycle = IndexReady
+	build := func(generation, indexID uint64) *Snapshot {
+		t.Helper()
+		candidate := descriptor
+		candidate.IndexID = indexID
+		snapshot, err := NewSnapshotWithIndexes(
+			testConfig(t), testEndpoints(), generation, []IndexDescriptor{candidate},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+
+	holder := NewCatalogHolder(build(1, 41))
+	skipped := build(2, 42)
+	skipped.catalogLineagePresent = true
+	skipped.indexIDHighWater = 100
+	skipped.shardGenerationHighWaters = []distribution.ShardAllocationGeneration{2}
+	if !holder.PublishNewer(skipped) {
+		t.Fatal("generation jump with a monotonic persisted high-water was refused")
+	}
+	if holder.Current().indexIDHighWater != 100 {
+		t.Fatalf("index high-water = %d, want skipped value 100", holder.Current().indexIDHighWater)
+	}
+	if holder.PublishNewer(build(3, 50)) {
+		t.Fatal("id below the skipped high-water was admitted")
+	}
+	if !holder.PublishNewer(build(3, 101)) {
+		t.Fatal("id above the skipped high-water was refused")
+	}
+	if next, ok := holder.Current().NextIndexID(); !ok || next != 102 {
+		t.Fatalf("next index id = %d,%v, want 102,true", next, ok)
+	}
+}
+
+func TestNextIndexIDUsesActiveOrPersistedHighWater(t *testing.T) {
+	descriptor := testIndexDescriptor()
+	descriptor.IndexID = 41
+	fresh, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next, ok := fresh.NextIndexID(); !ok || next != 42 {
+		t.Fatalf("fresh next index id = %d,%v, want 42,true", next, ok)
+	}
+	if _, ok := (*Snapshot)(nil).NextIndexID(); ok {
+		t.Fatal("nil snapshot returned an index id")
+	}
+
+	exhausted, err := NewSnapshotWithIndexes(testConfig(t), testEndpoints(), 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exhausted.catalogLineagePresent = true
+	exhausted.indexIDHighWater = ^uint64(0)
+	if _, ok := exhausted.NextIndexID(); ok {
+		t.Fatal("exhausted index id namespace wrapped")
+	}
+}
+
 func TestCompactIndexDirectory(t *testing.T) {
 	if got := unsafe.Sizeof(plannerIndex{}); got != 32 {
 		t.Fatalf("plannerIndex = %d bytes, want 32", got)
 	}
+	if got := unsafe.Sizeof(plannerIndexNameRef{}); got != 8 {
+		t.Fatalf("plannerIndexNameRef = %d bytes, want 8", got)
+	}
 	if got := unsafe.Sizeof(plannerStringRef{}); got != 8 {
 		t.Fatalf("plannerStringRef = %d bytes, want 8", got)
+	}
+	if got := unsafe.Sizeof(plannerIndexLineageRef(0)); got != 4 {
+		t.Fatalf("plannerIndexLineageRef = %d bytes, want 4", got)
 	}
 	without, err := NewSnapshotWithIndexes(testConfig(t), testEndpoints(), 1, nil)
 	if err != nil {
@@ -298,6 +511,15 @@ func TestCompactIndexDirectory(t *testing.T) {
 			if got := snapshot.PlannerIndexMetadataBytes(); got != wantBytes {
 				t.Fatalf("metadata bytes = %d, want exact %d (%0.2f/index)", got, wantBytes, float64(got)/float64(count))
 			}
+			normalized, err := initialCatalogState(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if normalized.indexIDHighWater != uint64(count) ||
+				len(normalized.shardGenerationHighWaters) != len(normalized.config.Distributions) {
+				t.Fatalf("compact lineage = index high-water %d, shard water count %d",
+					normalized.indexIDHighWater, len(normalized.shardGenerationHighWaters))
+			}
 			if allocs := testing.AllocsPerRun(1000, func() {
 				_, _ = snapshot.Index("messages", name)
 			}); allocs != 0 {
@@ -310,6 +532,106 @@ func TestCompactIndexDirectory(t *testing.T) {
 				t.Fatalf("enumeration allocations = %v, want 0", allocs)
 			}
 		})
+	}
+}
+
+func TestIndexLineageDirectoryIsIDSortedIndependentlyOfNames(t *testing.T) {
+	low, high := testIndexDescriptor(), testIndexDescriptor()
+	low.IndexID, low.Name = 2, "z_by_tenant"
+	high.IndexID, high.Name = 9, "a_by_tenant"
+	snapshot, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{high, low},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.indexLineage) != 2 {
+		t.Fatalf("index lineage refs = %d, want 2", len(snapshot.indexLineage))
+	}
+	first := snapshot.indexMetadataForLineage(snapshot.indexLineage[0])
+	second := snapshot.indexMetadataForLineage(snapshot.indexLineage[1])
+	if first.IndexID != 2 || second.IndexID != 9 {
+		t.Fatalf("index lineage order = %d,%d, want 2,9", first.IndexID, second.IndexID)
+	}
+}
+
+func TestPackedIndexPropertiesAndLineageTableOwnersRoundTrip(t *testing.T) {
+	config := testConfig(t)
+	config.Placements = append(config.Placements, distribution.TablePlacement{
+		Table: "events", Distribution: "tenant_data", Columns: []string{"/tenant_id"},
+	})
+	lifecycles := [...]IndexLifecycle{
+		IndexBuilding, IndexCatchingUp, IndexReady, IndexDraining,
+	}
+	flags := [...]IndexFlags{
+		IndexLocal,
+		IndexLocal | IndexUnique,
+		IndexLocal | IndexCovering,
+		IndexLocal | IndexOrdered,
+	}
+	descriptors := make([]IndexDescriptor, len(lifecycles))
+	for i := range descriptors {
+		paths := make([]string, i+1)
+		paths[0] = "/tenant_id"
+		for path := 1; path < len(paths); path++ {
+			paths[path] = fmt.Sprintf("/field_%d", path)
+		}
+		table := "messages"
+		if i&1 == 0 {
+			table = "events"
+		}
+		descriptors[i] = IndexDescriptor{
+			IndexID: uint64(100 - i), Incarnation: uint64(i + 1),
+			Table: table, Name: fmt.Sprintf("packed_%d", i), Paths: paths,
+			Flags: flags[i], Lifecycle: lifecycles[i],
+		}
+	}
+
+	snapshot, err := NewSnapshotWithIndexes(config, testEndpoints(), 1, descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range descriptors {
+		want := &descriptors[i]
+		got, ok := snapshot.Index(want.Table, want.Name)
+		if !ok || got.IndexID != want.IndexID || got.Incarnation != want.Incarnation ||
+			got.Table != want.Table || got.Name != want.Name ||
+			got.PathCount != uint8(len(want.Paths)) || got.Flags != want.Flags ||
+			got.Lifecycle != want.Lifecycle {
+			t.Fatalf("packed descriptor %d = %+v,%v, want %+v", i, got, ok, *want)
+		}
+		for path := range want.Paths {
+			if got.Paths[path] != want.Paths[path] {
+				t.Fatalf("packed descriptor %d path %d = %q, want %q",
+					i, path, got.Paths[path], want.Paths[path])
+			}
+		}
+	}
+	for i, ref := range snapshot.indexLineage {
+		got := snapshot.indexMetadataForLineage(ref)
+		wantID := uint64(97 + i)
+		if got.IndexID != wantID {
+			t.Fatalf("lineage ordinal %d id = %d, want %d", i, got.IndexID, wantID)
+		}
+		if want := descriptors[100-int(wantID)].Table; got.Table != want {
+			t.Fatalf("lineage ordinal %d table = %q, want %q", i, got.Table, want)
+		}
+	}
+}
+
+func TestPackedIndexNameLengthBoundary(t *testing.T) {
+	descriptor := testIndexDescriptor()
+	descriptor.Name = strings.Repeat("n", math.MaxUint16)
+	snapshot, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok := snapshot.Index("messages", descriptor.Name)
+	if !ok || metadata.Name != descriptor.Name {
+		t.Fatalf("maximum-length packed name round trip = %d bytes,%v, want %d,true",
+			len(metadata.Name), ok, len(descriptor.Name))
 	}
 }
 

@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	stdsql "database/sql"
 	"errors"
 	"slices"
@@ -109,7 +110,9 @@ func TestDatabaseSQLLateralCorrelationSlotsPreparedSnapshotAndRecovery(t *testin
 		t.Fatalf("post-refusal prepared rows = %v", got)
 	}
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

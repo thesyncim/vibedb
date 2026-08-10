@@ -115,6 +115,10 @@ func (e *PlacementError) Unwrap() error { return ErrInvalidPlacement }
 // a distribution or shard the process does not own.
 var ErrNotShardOwner = errors.New("distribution: shard is not the owner")
 
+// ErrShardAllocation is the sentinel for a request naming a stale physical
+// allocation of an otherwise matching logical shard id.
+var ErrShardAllocation = errors.New("distribution: shard allocation generation mismatch")
+
 // ErrOwnershipEpoch is the sentinel for a request whose fencing epoch does not
 // match the shard's configured ownership epoch.
 var ErrOwnershipEpoch = errors.New("distribution: ownership epoch mismatch")

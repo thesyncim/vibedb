@@ -17,9 +17,10 @@ import (
 )
 
 type txMutation struct {
-	document []byte
-	remove   bool
-	existed  bool
+	document         []byte
+	remove           bool
+	existed          bool
+	conflictRevision uint64
 }
 
 // stagedTxMutation is one statement-local mutation. existed is resolved for
@@ -39,22 +40,32 @@ type insertSelectStageAccount struct {
 }
 
 type txTable struct {
-	name             string
-	incarnation      *table
-	snapshot         *durable.Snapshot
-	pending          map[string]*txMutation
-	order            []string
-	primaryKey       string
-	primary          vibejson.CompiledPointer
-	schema           *store.Schema
-	limits           durable.Options
-	conflicts        *txConflictClock
-	conflictRevision uint64
-	overlaySource    query.FileOverlaySource
-	emptyDocs        store.Segment
-	existenceScratch []byte
-	validationTape   []vibejson.IndexEntry
-	stagedBytes      int
+	name               string
+	incarnation        *table
+	snapshot           *durable.Snapshot
+	refreshSnapshot    *durable.Snapshot
+	refreshCaptured    bool
+	pending            map[string]*txMutation
+	order              []string
+	primaryKey         string
+	primary            vibejson.CompiledPointer
+	schema             *store.Schema
+	limits             durable.Options
+	conflicts          *txConflictClock
+	conflictRevision   uint64
+	statementRevision  uint64
+	serialReadCoarse   bool
+	serialReadSet      map[string]struct{}
+	serialReadOrder    []string
+	serialReadBytes    int
+	serialReadArena    []byte
+	serialReadChunks   [][]byte
+	serialReadRetained int
+	overlaySource      query.FileOverlaySource
+	emptyDocs          store.Segment
+	existenceScratch   []byte
+	validationTape     []vibejson.IndexEntry
+	stagedBytes        int
 	// highWaterKeys and highWaterBytes track peak overlay occupancy for
 	// admission. ROLLBACK TO restores order and stagedBytes but does not lower
 	// these watermarks.
@@ -64,17 +75,25 @@ type txTable struct {
 	keyChunks      [][]byte
 }
 
-// tx owns the generation-leased snapshots captured by BeginTx. The dirty set
-// is every table with a non-empty overlay; COMMIT validates each dirty table
-// and publishes through one Collection.Update or durable.UpdateCollections.
+// tx owns one coherent generation-leased cut. Read Committed replaces its base
+// snapshots at statement boundaries; fixed-cut modes retain the BEGIN cut. The
+// dirty set is every table with a non-empty overlay; COMMIT validates each
+// participant and publishes through Collection.Update or UpdateCollections.
 type tx struct {
-	conn       *conn
-	tables     map[string]*txTable
-	views      map[string]*viewMeta
-	savepoints []savepointFrame
-	readOnly   bool
-	done       bool
-	staged     []stagedTxMutation
+	conn               *conn
+	tables             map[string]*txTable
+	views              map[string]*viewMeta
+	layoutEpoch        *catalogLayoutEpoch
+	refreshStates      []*txTable
+	refreshStaged      map[string]*txTable
+	savepoints         []savepointFrame
+	readOnly           bool
+	isolation          IsolationLevel
+	done               bool
+	staged             []stagedTxMutation
+	serialReadKeys     int
+	serialReadBytes    int
+	serialReadRetained int
 }
 
 var (
@@ -86,16 +105,12 @@ func (c *conn) beginTx(
 	ctx context.Context,
 	options sqldriver.TxOptions,
 ) (*tx, error) {
-	switch options.Isolation {
-	case 0, 5: // database/sql LevelDefault and LevelSnapshot.
-	default:
-		return nil, fmt.Errorf(
-			"%w %d; transactions provide snapshot isolation",
-			ErrUnsupportedIsolation, options.Isolation)
+	isolation, err := runtimeIsolationLevel(options.Isolation)
+	if err != nil {
+		return nil, err
 	}
 	transaction := &tx{
-		conn: c, tables: make(map[string]*txTable),
-		readOnly: options.ReadOnly,
+		conn: c, readOnly: options.ReadOnly, isolation: isolation,
 	}
 	if err := lockContext(ctx, &c.db.mu); err != nil {
 		return nil, err
@@ -104,34 +119,30 @@ func (c *conn) beginTx(
 	if c.db.closed {
 		return nil, sqldriver.ErrBadConn
 	}
-	if len(c.db.catalog.Views) != 0 {
-		transaction.views = make(map[string]*viewMeta, len(c.db.catalog.Views))
-		for name, meta := range c.db.catalog.Views {
-			transaction.views[name] = meta
+	transaction.layoutEpoch = c.db.layoutEpoch
+	transaction.views = transaction.layoutEpoch.views
+	if isolation == IsolationReadCommitted {
+		// Read Committed owns no table leases, overlays, or conflict-clock
+		// registrations until a statement names a physical dependency. The
+		// immutable layout epoch above is the complete O(1) BEGIN fence.
+		if err := contextCheckpoint(ctx); err != nil {
+			return nil, err
 		}
+		return transaction, nil
 	}
-	for name, table := range c.db.tables {
+	transaction.tables = make(map[string]*txTable, len(transaction.layoutEpoch.tables))
+	for name, layout := range transaction.layoutEpoch.tables {
 		if err := contextCheckpoint(ctx); err != nil {
 			transaction.releaseSnapshots()
 			return nil, err
 		}
-		limits, err := tableMutationLimits(table)
+		state, err := newTransactionTableState(name, layout, true)
 		if err != nil {
 			transaction.releaseSnapshots()
 			return nil, err
 		}
-		state := &txTable{
-			name:        name,
-			incarnation: table,
-			pending:     make(map[string]*txMutation),
-			primaryKey:  table.meta.PrimaryKey,
-			primary:     table.primary,
-			schema:      table.schema,
-			limits:      limits,
-		}
-		state.overlaySource = query.NewFileOverlaySource(state)
-		if table.collection != nil {
-			snapshot, err := table.collection.Snapshot()
+		if layout.incarnation.collection != nil {
+			snapshot, err := layout.incarnation.collection.Snapshot()
 			if err != nil {
 				transaction.releaseSnapshots()
 				return nil, err
@@ -139,7 +150,7 @@ func (c *conn) beginTx(
 			state.snapshot = snapshot
 		}
 		if !options.ReadOnly {
-			state.conflicts = &table.conflicts
+			state.conflicts = &layout.incarnation.conflicts
 		}
 		transaction.tables[name] = state
 	}
@@ -153,9 +164,661 @@ func (c *conn) beginTx(
 	if !options.ReadOnly {
 		for _, state := range transaction.tables {
 			state.conflictRevision = state.conflicts.begin()
+			state.statementRevision = state.conflictRevision
 		}
 	}
 	return transaction, nil
+}
+
+func newTransactionTableState(
+	name string,
+	layout transactionTableLayout,
+	allocatePending bool,
+) (*txTable, error) {
+	if layout.limitsErr != nil {
+		return nil, layout.limitsErr
+	}
+	state := &txTable{
+		name:        name,
+		incarnation: layout.incarnation,
+		primaryKey:  layout.primaryKey,
+		primary:     layout.primary,
+		schema:      layout.schema,
+		limits:      layout.limits,
+	}
+	if allocatePending {
+		state.pending = make(map[string]*txMutation)
+	}
+	state.overlaySource = query.NewFileOverlaySource(state)
+	return state, nil
+}
+
+func (t *tx) tableLayoutAtBegin(
+	name string,
+) (transactionTableLayout, bool) {
+	if t == nil {
+		return transactionTableLayout{}, false
+	}
+	if state := t.tables[name]; state != nil {
+		return transactionTableLayout{
+			incarnation: state.incarnation,
+			primaryKey:  state.primaryKey,
+			primary:     state.primary,
+			schema:      state.schema,
+			limits:      state.limits,
+		}, true
+	}
+	if t.layoutEpoch == nil {
+		return transactionTableLayout{}, false
+	}
+	layout, ok := t.layoutEpoch.tables[name]
+	return layout, ok
+}
+
+func runtimeIsolationLevel(level sqldriver.IsolationLevel) (IsolationLevel, error) {
+	switch level {
+	case 0, 2: // database/sql LevelDefault and LevelReadCommitted.
+		return IsolationReadCommitted, nil
+	case 4, 5: // LevelRepeatableRead and LevelSnapshot.
+		return IsolationRepeatableRead, nil
+	case 6: // LevelSerializable.
+		return IsolationSerializable, nil
+	default:
+		return IsolationDefault, fmt.Errorf(
+			"%w %d", ErrUnsupportedIsolation, level)
+	}
+}
+
+func driverIsolationLevel(level IsolationLevel) (sqldriver.IsolationLevel, error) {
+	switch level {
+	case IsolationDefault, IsolationReadCommitted:
+		return sqldriver.IsolationLevel(2), nil
+	case IsolationRepeatableRead:
+		return sqldriver.IsolationLevel(4), nil
+	case IsolationSerializable:
+		return sqldriver.IsolationLevel(6), nil
+	default:
+		return 0, fmt.Errorf("%w %d", ErrUnsupportedIsolation, level)
+	}
+}
+
+// refreshStatementCut replaces only the committed bases in one statement's
+// executable physical dependency closure. Pending mutations and savepoint
+// marks remain attached to txTable, so Read Committed sees a fresh coherent cut
+// without losing its overlay. Every selected lease is staged under db.mu and
+// swapped only after the complete capture and final cancellation check; a
+// failure closes staging and leaves every active cut untouched.
+func (t *tx) refreshStatementCut(
+	ctx context.Context,
+	root string,
+	dependencies []physicalDependency,
+	viewDependencies []viewDependency,
+) error {
+	if t.isolation != IsolationReadCommitted {
+		return nil
+	}
+	if t.done || t.conn == nil || t.conn.db == nil {
+		return errors.New("vibedb: transaction is finished")
+	}
+	if err := lockContext(ctx, &t.conn.db.mu); err != nil {
+		return err
+	}
+	db := t.conn.db
+	if db.closed {
+		db.mu.Unlock()
+		return sqldriver.ErrBadConn
+	}
+	if err := db.settleCatalogLocked(); err != nil {
+		db.mu.Unlock()
+		return err
+	}
+	fail := func(primary error) error {
+		cleanupErr := t.closeRefreshSnapshots()
+		db.mu.Unlock()
+		return joinRefreshError(primary, cleanupErr)
+	}
+	if db.layoutEpoch != t.layoutEpoch {
+		for i := range viewDependencies {
+			dependency := &viewDependencies[i]
+			if t.views[dependency.name] != dependency.meta ||
+				db.catalog.Views[dependency.name] != dependency.meta {
+				return fail(&viewDependencyError{
+					name: dependency.name, pos: dependency.pos,
+					transaction: true,
+				})
+			}
+		}
+	}
+
+	position := func(name string) int {
+		for i := range dependencies {
+			if dependencies[i].name == name {
+				return dependencies[i].pos
+			}
+		}
+		return 0
+	}
+	capture := func(name string, pos int) error {
+		if name == "" {
+			return nil
+		}
+		state := t.tables[name]
+		if state == nil {
+			state = t.refreshStaged[name]
+		}
+		if state == nil {
+			layout, exists := t.tableLayoutAtBegin(name)
+			if !exists {
+				return missingTableDependency(name, pos, true)
+			}
+			var err error
+			state, err = newTransactionTableState(name, layout, !t.readOnly)
+			if err != nil {
+				return err
+			}
+			if !t.readOnly {
+				state.conflicts = &layout.incarnation.conflicts
+			}
+			if t.refreshStaged == nil {
+				t.refreshStaged = make(map[string]*txTable)
+			}
+			t.refreshStaged[name] = state
+		}
+		if state.refreshCaptured {
+			return nil
+		}
+		current := db.tables[name]
+		if current == nil || current != state.incarnation {
+			return fmt.Errorf(
+				"%w: table %q was dropped or replaced during a READ COMMITTED transaction",
+				ErrTransactionConflict, name,
+			)
+		}
+		if err := contextCheckpoint(ctx); err != nil {
+			return err
+		}
+		collection := current.collection
+		if collection == nil {
+			if state.snapshot != nil {
+				return fmt.Errorf(
+					"%w: table %q lost its storage incarnation during a READ COMMITTED transaction",
+					ErrTransactionConflict, name,
+				)
+			}
+		} else {
+			if state.refreshSnapshot == nil {
+				state.refreshSnapshot = new(durable.Snapshot)
+			}
+			if err := collection.SnapshotInto(state.refreshSnapshot); err != nil {
+				return err
+			}
+		}
+		state.refreshCaptured = true
+		t.refreshStates = append(t.refreshStates, state)
+		return nil
+	}
+	if err := capture(root, position(root)); err != nil {
+		return fail(err)
+	}
+	for i := range dependencies {
+		dependency := &dependencies[i]
+		if err := capture(dependency.name, dependency.pos); err != nil {
+			return fail(err)
+		}
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return fail(err)
+	}
+	for _, state := range t.refreshStates {
+		state.snapshot, state.refreshSnapshot =
+			state.refreshSnapshot, state.snapshot
+		state.refreshCaptured = false
+	}
+	// Sample only after the complete cut has installed, while db.mu still
+	// excludes publications. New pending keys inherit this exact statement
+	// observation; existing pending keys retain their earlier revision.
+	for _, state := range t.refreshStates {
+		if t.tables[state.name] == nil {
+			if t.tables == nil {
+				t.tables = make(map[string]*txTable)
+			}
+			if state.conflicts != nil {
+				state.conflictRevision = state.conflicts.begin()
+				state.statementRevision = state.conflictRevision
+			}
+			t.tables[state.name] = state
+			t.attachTableToSavepoints(state)
+		} else if state.conflicts != nil {
+			state.statementRevision = state.conflicts.observe()
+		}
+	}
+	clear(t.refreshStaged)
+	db.mu.Unlock()
+	var closeErr error
+	for i, state := range t.refreshStates {
+		if state.refreshSnapshot == nil {
+			t.refreshStates[i] = nil
+			continue
+		}
+		if err := state.refreshSnapshot.Close(); err != nil {
+			if closeErr == nil {
+				closeErr = err
+			} else {
+				closeErr = errors.Join(closeErr, err)
+			}
+		}
+		t.refreshStates[i] = nil
+	}
+	t.refreshStates = t.refreshStates[:0]
+	return closeErr
+}
+
+func (t *tx) closeRefreshSnapshots() error {
+	var closeErr error
+	for i, state := range t.refreshStates {
+		if !state.refreshCaptured {
+			t.refreshStates[i] = nil
+			continue
+		}
+		state.refreshCaptured = false
+		if state.refreshSnapshot != nil {
+			if err := state.refreshSnapshot.Close(); err != nil {
+				if closeErr == nil {
+					closeErr = err
+				} else {
+					closeErr = errors.Join(closeErr, err)
+				}
+			}
+		}
+		t.refreshStates[i] = nil
+	}
+	t.refreshStates = t.refreshStates[:0]
+	clear(t.refreshStaged)
+	return closeErr
+}
+
+func joinRefreshError(primary, cleanup error) error {
+	if cleanup == nil {
+		return primary
+	}
+	return errors.Join(primary, cleanup)
+}
+
+func (t *tx) markSerializableRead(name string) {
+	if t.isolation != IsolationSerializable || t.readOnly {
+		return
+	}
+	if state := t.tables[name]; state != nil {
+		t.promoteSerializableRead(state)
+	}
+}
+
+// trackSerializablePointReads retains exact primary-key dependencies until the
+// transaction-wide key or owned-byte bound is reached. Promotion is monotonic:
+// a coarse dependency supersedes and releases the table's exact set, and a
+// later savepoint rollback can never narrow it again.
+func (t *tx) trackSerializablePointReads(state *txTable, keys []string) {
+	if t.isolation != IsolationSerializable || t.readOnly || state == nil ||
+		state.serialReadCoarse {
+		return
+	}
+	for _, key := range keys {
+		if _, exists := state.serialReadSet[key]; exists {
+			continue
+		}
+		if t.serialReadKeys >= txSerializableReadKeys ||
+			len(key) > txSerializableReadBytes-t.serialReadBytes {
+			t.promoteSerializableRead(state)
+			return
+		}
+		owned, ok := t.ownSerializableReadKey(state, key)
+		if !ok {
+			t.promoteSerializableRead(state)
+			return
+		}
+		if state.serialReadSet == nil {
+			state.serialReadSet = make(map[string]struct{})
+		}
+		state.serialReadSet[owned] = struct{}{}
+		state.serialReadOrder = append(state.serialReadOrder, owned)
+		state.serialReadBytes += len(owned)
+		t.serialReadKeys++
+		t.serialReadBytes += len(owned)
+	}
+}
+
+func (t *tx) trackSerializablePointRead(state *txTable, key string) {
+	keys := [...]string{key}
+	t.trackSerializablePointReads(state, keys[:])
+}
+
+func (t *tx) ownSerializableReadKey(
+	state *txTable,
+	key string,
+) (string, bool) {
+	if len(key) == 0 {
+		return "", true
+	}
+	if cap(state.serialReadArena)-len(state.serialReadArena) < len(key) {
+		remaining := txSerializableReadBytes - t.serialReadRetained
+		if remaining < len(key) {
+			return "", false
+		}
+		if cap(state.serialReadArena) != 0 {
+			state.serialReadChunks = append(
+				state.serialReadChunks, state.serialReadArena,
+			)
+		}
+		next := cap(state.serialReadArena) * 2
+		if next < 64 {
+			next = 64
+		}
+		if next < len(key) {
+			next = len(key)
+		}
+		if next > remaining {
+			next = remaining
+		}
+		state.serialReadArena = make([]byte, 0, next)
+		state.serialReadRetained += next
+		t.serialReadRetained += next
+	}
+	start := len(state.serialReadArena)
+	state.serialReadArena = append(state.serialReadArena, key...)
+	return byteview.String(
+		state.serialReadArena[start:len(state.serialReadArena):len(state.serialReadArena)],
+	), true
+}
+
+func (t *tx) promoteSerializableRead(state *txTable) {
+	if state == nil || state.serialReadCoarse {
+		return
+	}
+	state.serialReadCoarse = true
+	if t.serialReadKeys >= len(state.serialReadOrder) {
+		t.serialReadKeys -= len(state.serialReadOrder)
+	} else {
+		t.serialReadKeys = 0
+	}
+	if t.serialReadBytes >= state.serialReadBytes {
+		t.serialReadBytes -= state.serialReadBytes
+	} else {
+		t.serialReadBytes = 0
+	}
+	if t.serialReadRetained >= state.serialReadRetained {
+		t.serialReadRetained -= state.serialReadRetained
+	} else {
+		t.serialReadRetained = 0
+	}
+	state.serialReadSet = nil
+	state.serialReadOrder = nil
+	state.serialReadBytes = 0
+	state.serialReadArena = nil
+	state.serialReadChunks = nil
+	state.serialReadRetained = 0
+}
+
+func (t *tx) serializablePointQuery(statement *stmt) (*txTable, bool) {
+	if t.isolation != IsolationSerializable || statement == nil ||
+		statement.query == nil || !statement.serialPointSafe {
+		return nil, false
+	}
+	state := t.tables[statement.query.Collection()]
+	return state, state != nil && statement.pointCandidate &&
+		statement.pointPath == state.primaryKey
+}
+
+// serializableDirectRelationSelect proves that one SELECT has exactly one
+// physical root and no nested execution that could read another row (including
+// another reference to the same table, whose dependency name is deduplicated).
+// It is intentionally narrower than the executor's single-source fast path.
+func serializableDirectRelationSelect(
+	statement *sqlast.SelectStmt,
+	collection string,
+) bool {
+	if statement == nil || statement.With != nil || statement.Set != nil ||
+		len(statement.From) != 1 {
+		return false
+	}
+	relation := &statement.From[0]
+	if relation.Kind != sqlast.RelationCollection ||
+		relation.Name != collection || relation.Query != nil ||
+		relation.Lateral != nil || relation.On != nil {
+		return false
+	}
+	if serializableExprHasSubquery(statement.Where) ||
+		serializableExprHasSubquery(statement.Having) {
+		return false
+	}
+	for i := range statement.Columns {
+		if serializableScalarHasSubquery(statement.Columns[i].Scalar) {
+			return false
+		}
+	}
+	for i := range statement.OrderBy {
+		if serializableScalarHasSubquery(statement.OrderBy[i].Scalar) {
+			return false
+		}
+	}
+	return true
+}
+
+func serializableExprHasSubquery(expression *sqlast.Expr) bool {
+	if expression == nil {
+		return false
+	}
+	if expression.Subquery != nil ||
+		serializableScalarHasSubquery(expression.ScalarLeft) ||
+		serializableScalarHasSubquery(expression.ScalarRight) {
+		return true
+	}
+	for _, child := range expression.Kids {
+		if serializableExprHasSubquery(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func serializableScalarHasSubquery(expression *sqlast.ScalarExpr) bool {
+	if expression == nil {
+		return false
+	}
+	if serializableScalarHasSubquery(expression.Left) ||
+		serializableScalarHasSubquery(expression.Right) ||
+		serializableScalarHasSubquery(expression.Else) {
+		return true
+	}
+	for i := range expression.Whens {
+		when := &expression.Whens[i]
+		if serializableExprHasSubquery(when.Predicate) ||
+			serializableScalarHasSubquery(when.Match) ||
+			serializableScalarHasSubquery(when.Result) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *tx) beginQueryStatement(ctx context.Context, statement *stmt) error {
+	var (
+		root  string
+		views []viewDependency
+	)
+	if statement != nil {
+		if statement.query != nil {
+			root = statement.query.Collection()
+		}
+		if statement.views != nil {
+			views = statement.views.dependencies
+		}
+	}
+	if err := t.refreshStatementCut(
+		ctx, root, statementDependencies(statement), views,
+	); err != nil {
+		return err
+	}
+	if t.isolation != IsolationSerializable || statement == nil {
+		return nil
+	}
+	_, exactDriving := t.serializablePointQuery(statement)
+	driving := ""
+	if statement.query != nil {
+		driving = statement.query.Collection()
+	}
+	for i := range statement.dependencies {
+		if exactDriving && statement.dependencies[i].name == driving {
+			continue
+		}
+		t.markSerializableRead(statement.dependencies[i].name)
+	}
+	if driving != "" && !exactDriving {
+		t.markSerializableRead(driving)
+	}
+	return nil
+}
+
+func (t *tx) beginMutationStatement(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	prepared *stmt,
+) error {
+	var (
+		root         string
+		dependencies []physicalDependency
+		views        []viewDependency
+	)
+	if statement != nil {
+		switch statement.Kind() {
+		case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable,
+			query.DDLTruncate, query.DDLDropIndex:
+		default:
+			root = statement.Collection()
+			if prepared != nil {
+				dependencies = prepared.dependencies
+			} else {
+				dependencies = dmlExecutablePhysicalDependencies(statement.Tree())
+			}
+		}
+	}
+	if prepared != nil && prepared.views != nil {
+		views = prepared.views.dependencies
+	}
+	if err := t.refreshStatementCut(
+		ctx, root, dependencies, views,
+	); err != nil {
+		return err
+	}
+	if t.isolation != IsolationSerializable || statement == nil {
+		return nil
+	}
+	target := statement.Collection()
+	exactTarget := t.serializablePointMutation(statement, prepared)
+	if !exactTarget {
+		t.markSerializableRead(target)
+	}
+	if prepared != nil {
+		for i := range prepared.dependencies {
+			if exactTarget && prepared.dependencies[i].name == target {
+				continue
+			}
+			t.markSerializableRead(prepared.dependencies[i].name)
+		}
+	}
+	if prepared != nil && prepared.insertSource != nil {
+		for i := range prepared.insertSource.dependencies {
+			t.markSerializableRead(prepared.insertSource.dependencies[i].name)
+		}
+		if prepared.insertSource.statement != nil {
+			t.markSerializableRead(prepared.insertSource.statement.Collection())
+		}
+	}
+	return nil
+}
+
+func statementDependencies(statement *stmt) []physicalDependency {
+	if statement == nil {
+		return nil
+	}
+	return statement.dependencies
+}
+
+// serializablePointMutation recognizes target reads whose complete logical
+// dependency is a bounded set of primary keys. INSERT SELECT and every scan,
+// secondary/range predicate, join, or subquery remain relation-coarse.
+func (t *tx) serializablePointMutation(
+	statement *query.DMLStatement,
+	prepared *stmt,
+) bool {
+	if statement == nil {
+		return false
+	}
+	state := t.tables[statement.Collection()]
+	if state == nil {
+		return false
+	}
+	if prepared != nil {
+		if !prepared.serialMutationSafe {
+			return false
+		}
+		switch statement.Kind() {
+		case query.DMLInsert:
+			return true
+		case query.DMLUpdate, query.DMLDelete:
+			return prepared.pointCandidate &&
+				prepared.pointPath == state.primaryKey
+		default:
+			return false
+		}
+	}
+	tree := statement.Tree()
+	if tree == nil {
+		return false
+	}
+	if !serializableDirectMutationShape(tree) {
+		return false
+	}
+	switch statement.Kind() {
+	case query.DMLInsert:
+		return true
+	case query.DMLUpdate:
+		return isPrimaryPredicate(tree.Update.Filter.Where, state.primaryKey)
+	case query.DMLDelete:
+		return isPrimaryPredicate(tree.Delete.Filter.Where, state.primaryKey)
+	default:
+		return false
+	}
+}
+
+func serializableDirectMutationShape(statement *sqlast.Statement) bool {
+	if statement == nil {
+		return false
+	}
+	switch statement.Kind {
+	case sqlast.KindInsert:
+		return statement.Insert != nil && statement.Insert.Source == nil &&
+			(statement.Insert.Returning == nil || serializableDirectRelationSelect(
+				statement.Insert.Returning, statement.Insert.Table,
+			))
+	case sqlast.KindUpdate:
+		return statement.Update != nil && statement.Update.Filter != nil &&
+			serializableDirectRelationSelect(
+				statement.Update.Filter, statement.Update.Table,
+			) && (statement.Update.Returning == nil ||
+			serializableDirectRelationSelect(
+				statement.Update.Returning, statement.Update.Table,
+			))
+	case sqlast.KindDelete:
+		return statement.Delete != nil && statement.Delete.Filter != nil &&
+			serializableDirectRelationSelect(
+				statement.Delete.Filter, statement.Delete.Table,
+			) && (statement.Delete.Returning == nil ||
+			serializableDirectRelationSelect(
+				statement.Delete.Returning, statement.Delete.Table,
+			))
+	default:
+		return false
+	}
 }
 
 func (t *tx) querySource(tableName string) (query.Source, error) {
@@ -175,9 +838,10 @@ func (t *tx) querySource(tableName string) (query.Source, error) {
 		return query.FromFileOverlay(state.snapshot, &state.overlaySource), nil
 	}
 
-	// A table without a durable file was empty at BEGIN. Its transaction view
-	// therefore consists only of the bounded pending set. Refill one retained
-	// Segment rather than allocate a heap Collection on every read.
+	// A table without a durable file was empty at the selected isolation cut.
+	// Its transaction view therefore consists only of the bounded pending set.
+	// Refill one retained Segment rather than allocate a heap Collection on
+	// every read.
 	state.emptyDocs.Reset()
 	for _, key := range state.order {
 		mutation := state.pending[key]
@@ -353,7 +1017,14 @@ func (t *tx) execMutationCore(
 		query.DDLTruncate, query.DDLDropIndex:
 		return nil, ErrDDLInTransaction
 	}
+	// Object-kind and prepared view-rebind errors are more specific than a
+	// missing physical table in a lazily captured Read Committed cut. Run this
+	// immutable catalog preflight first; it also rechecks the live catalog, so a
+	// mutation can never proceed using a stale table-as-view interpretation.
 	if err := t.validateViewTableTarget(statement.Tree()); err != nil {
+		return nil, err
+	}
+	if err := t.beginMutationStatement(ctx, statement, prepared); err != nil {
 		return nil, err
 	}
 	tableName := statement.Collection()
@@ -439,6 +1110,7 @@ func (t *tx) execMutationCore(
 					ErrDuplicatePrimaryKey, key)
 			}
 			seen[key] = struct{}{}
+			t.trackSerializablePointRead(state, key)
 			var found bool
 			scratch, found, err = state.appendRaw(scratch[:0], key)
 			if err != nil {
@@ -484,7 +1156,7 @@ func (t *tx) execMutationCore(
 			return nil, err
 		}
 		keys, err := t.conn.matchingKeysTransaction(
-			ctx, statement, args, state, len(document))
+			ctx, t, statement, args, state, len(document))
 		if err != nil {
 			return nil, err
 		}
@@ -513,7 +1185,7 @@ func (t *tx) execMutationCore(
 			return nil, err
 		}
 		keys, err := t.conn.matchingKeysTransaction(
-			ctx, statement, args, state, 0)
+			ctx, t, statement, args, state, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -839,6 +1511,7 @@ func (t *tx) runInsertSource(
 // collection proportional to the base table is built.
 func (c *conn) matchingKeysTransaction(
 	ctx context.Context,
+	transaction *tx,
 	statement *query.DMLStatement,
 	args []any,
 	state *txTable,
@@ -879,6 +1552,7 @@ func (c *conn) matchingKeysTransaction(
 		if err != nil {
 			return nil, err
 		}
+		transaction.trackSerializablePointReads(state, keys)
 		present := keys[:0]
 		selector := newMutationKeySelector(window, state.limits.MaxBatchDocuments)
 		selector.keys = c.matchKeys[:0]
@@ -990,7 +1664,7 @@ func admitTransactionSelection(
 }
 
 // transactionMatchBudget applies the transaction's distinct-key and byte
-// admission while a filtered mutation is still streaming its BEGIN snapshot.
+// admission while a filtered mutation is still streaming its isolation cut.
 // Existing pending entries are replacements rather than additional keys, and
 // their prior value bytes stop counting exactly as they will in execMutation's
 // final admission pass.
@@ -1035,15 +1709,18 @@ func (t *tx) stage(state *txTable, key string, document []byte, remove bool) err
 	existed := false
 	if entry, present := state.pending[key]; present {
 		existed = entry.existed
-	} else if state.snapshot != nil {
-		raw, found, err := state.snapshot.AppendRaw(
-			state.existenceScratch[:0], []byte(key),
-		)
-		state.existenceScratch = raw[:0]
-		if err != nil {
-			return err
+	} else {
+		t.trackSerializablePointRead(state, key)
+		if state.snapshot != nil {
+			raw, found, err := state.snapshot.AppendRaw(
+				state.existenceScratch[:0], []byte(key),
+			)
+			state.existenceScratch = raw[:0]
+			if err != nil {
+				return err
+			}
+			existed = found
 		}
-		existed = found
 	}
 	t.stageKnown(state, key, document, remove, existed)
 	return nil
@@ -1089,6 +1766,7 @@ func (t *tx) resolveStagedMutationsContext(
 			mutation.existed = entry.existed
 			continue
 		}
+		t.trackSerializablePointRead(state, mutation.key)
 		if state.snapshot == nil {
 			continue
 		}
@@ -1126,7 +1804,9 @@ func (t *tx) stageKnown(
 	entry, present := state.pending[key]
 	if !present {
 		key = state.ownMutationKey(key)
-		entry = &txMutation{existed: existed}
+		entry = &txMutation{
+			existed: existed, conflictRevision: state.statementRevision,
+		}
 		state.pending[key] = entry
 		state.order = append(state.order, key)
 	} else {
@@ -1204,6 +1884,50 @@ func (t *tx) Commit() error {
 	if err := t.conn.db.settleCatalogLocked(); err != nil {
 		return err
 	}
+	if t.isolation == IsolationSerializable {
+		readNames := make([]string, 0, len(t.tables))
+		for name, state := range t.tables {
+			if state.serialReadCoarse || len(state.serialReadOrder) != 0 {
+				readNames = append(readNames, name)
+			}
+		}
+		slices.Sort(readNames)
+		for _, name := range readNames {
+			state := t.tables[name]
+			table := t.conn.db.tables[name]
+			if table == nil || table != state.incarnation {
+				return fmt.Errorf(
+					"%w: serializable read table %q was dropped or replaced after BEGIN",
+					ErrTransactionConflict, name,
+				)
+			}
+			if state.serialReadCoarse {
+				if state.conflicts.changedSince(state.conflictRevision) {
+					return fmt.Errorf(
+						"%w: serializable read table %q changed after BEGIN",
+						ErrTransactionConflict, name,
+					)
+				}
+				continue
+			}
+			key, historyOverflow, conflict := state.conflicts.conflict(
+				state.conflictRevision, state.serialReadOrder,
+			)
+			if !conflict {
+				continue
+			}
+			if historyOverflow {
+				return fmt.Errorf(
+					"%w: serializable read table %q exceeded its bounded conflict history after BEGIN",
+					ErrTransactionConflict, name,
+				)
+			}
+			return fmt.Errorf(
+				"%w: serializable read table %q key %q changed after BEGIN",
+				ErrTransactionConflict, name, key,
+			)
+		}
+	}
 
 	dirty := make([]commitDirtyTable, 0, len(dirtyNames))
 	for _, name := range dirtyNames {
@@ -1215,9 +1939,7 @@ func (t *tx) Commit() error {
 				ErrTransactionConflict, name,
 			)
 		}
-		key, historyOverflow, conflict := state.conflicts.conflict(
-			state.conflictRevision, state.order,
-		)
+		key, historyOverflow, conflict := t.writeConflict(state)
 		if conflict {
 			if historyOverflow {
 				return fmt.Errorf(
@@ -1267,6 +1989,29 @@ func (t *tx) Commit() error {
 	return t.commitManyTables(dirty)
 }
 
+func (t *tx) writeConflict(
+	state *txTable,
+) (key string, historyOverflow, conflict bool) {
+	if t.isolation != IsolationReadCommitted {
+		return state.conflicts.conflict(state.conflictRevision, state.order)
+	}
+	var keys [1]string
+	for _, pendingKey := range state.order {
+		entry := state.pending[pendingKey]
+		if entry == nil {
+			continue
+		}
+		keys[0] = pendingKey
+		key, historyOverflow, conflict = state.conflicts.conflict(
+			entry.conflictRevision, keys[:],
+		)
+		if conflict {
+			return key, historyOverflow, true
+		}
+	}
+	return "", false, false
+}
+
 func (t *tx) dirtyTableNames() []string {
 	names := make([]string, 0, len(t.tables))
 	for name, state := range t.tables {
@@ -1287,7 +2032,8 @@ func stateHasDirtyOverlay(state *txTable) bool {
 		if entry == nil {
 			continue
 		}
-		// INSERT+DELETE of a key absent at BEGIN is a net no-op and must not
+		// INSERT+DELETE of a key absent at its first statement observation is a
+		// net no-op and must not
 		// force a durable participant.
 		if !entry.existed && entry.remove {
 			continue
@@ -1367,9 +2113,9 @@ func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
 func fillWriteBatchFromTxTable(batch *durable.WriteBatch, state *txTable) error {
 	for _, key := range state.order {
 		entry := state.pending[key]
-		// INSERT followed by DELETE in one transaction is a net no-op for
-		// a key absent at BEGIN. Do not make another transaction conflict
-		// with an event that was never published.
+		// INSERT followed by DELETE in one transaction is a net no-op for a key
+		// absent at its first statement observation. Do not make another
+		// transaction conflict with an event that was never published.
 		if !entry.existed && entry.remove {
 			continue
 		}
@@ -1384,11 +2130,12 @@ func fillWriteBatchFromTxTable(batch *durable.WriteBatch, state *txTable) error 
 	return nil
 }
 
-// validateWriteSet enforces optimistic-concurrency: every key the transaction
-// touched must still hold the value it held at BEGIN, otherwise a concurrent
-// commit changed it and this transaction must abort. It reads a fresh snapshot
-// of the currently committed state; the caller runs under db.mu, so that state
-// is stable for the duration of the check and the subsequent apply.
+// validateWriteSet enforces optimistic concurrency: every key the transaction
+// touched must still have the existence it had at its first statement
+// observation, otherwise a concurrent commit changed it and this transaction
+// must abort. It reads a fresh snapshot of the currently committed state; the
+// caller runs under db.mu, so that state is stable for the duration of the
+// check and the subsequent apply.
 func (t *tx) validateWriteSet(
 	collection *durable.Collection, tableName string, state *txTable,
 ) error {
@@ -1460,6 +2207,9 @@ func (t *tx) finish() {
 	t.conn = nil
 	t.tables = nil
 	t.views = nil
+	t.layoutEpoch = nil
+	t.refreshStates = nil
+	t.refreshStaged = nil
 	t.savepoints = nil
 }
 
@@ -1469,5 +2219,13 @@ func (t *tx) releaseSnapshots() {
 			_ = table.snapshot.Close()
 			table.snapshot = nil
 		}
+		if table.refreshSnapshot != nil {
+			_ = table.refreshSnapshot.Close()
+			table.refreshSnapshot = nil
+		}
+		table.refreshCaptured = false
 	}
+	clear(t.refreshStates)
+	t.refreshStates = t.refreshStates[:0]
+	clear(t.refreshStaged)
 }

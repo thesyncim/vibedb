@@ -1,7 +1,6 @@
 package query
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -398,20 +397,15 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		e.file.index.Reset(nil)
 		if err != nil {
 			e.Result.abortResult()
-			if errors.Is(err, ErrCanceled) ||
-				e.Options.Cancel != nil && e.Options.Cancel.Canceled() {
-				// A canceled bind can leave earlier clauses fully bound. Drop
-				// every borrowed inner snapshot and worker evaluator binding
-				// now, rather than pinning them until this Exec happens to run
-				// again. Checking the flag as well as the returned error covers
-				// a durable I/O failure that correctly wins error precedence
-				// after cancellation was observed. Retained owned capacity
-				// remains warm.
-				e.Workspace.clearBorrowedViews()
-				e.Workspace.resetJoinBindings()
-				e.Workspace.resetMarkBindings()
-				e.file.abort()
-			}
+			// Any failed bind or execution can leave earlier clauses fully
+			// bound, not only cancellation. Drop every borrowed inner snapshot
+			// and worker evaluator binding now so a warm Exec never pins a
+			// closed collection graph until its next successful run. Retained
+			// owned capacity remains warm.
+			e.Workspace.clearBorrowedViews()
+			e.Workspace.resetJoinBindings()
+			e.Workspace.resetMarkBindings()
+			e.file.abort()
 		}
 	}()
 	e.Workspace.clearBorrowedViews()

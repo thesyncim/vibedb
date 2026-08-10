@@ -19,3 +19,19 @@ func fsyncDir(path string) error {
 	closeErr := dir.Close()
 	return errors.Join(syncErr, closeErr)
 }
+
+// fsyncCatalogRoot flushes the already pinned catalog namespace rather than
+// resolving its path again after publication.
+func fsyncCatalogRoot(root *os.Root) error {
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func catalogDurabilitySupported() bool { return true }
+
+func replaceCatalogEntry(root *os.Root, temporary, destination string) error {
+	return root.Rename(temporary, destination)
+}

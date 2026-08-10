@@ -1,6 +1,9 @@
 package distribution
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // Shard is one physical shard: a unique id, the half-open keyspace range it
 // owns, at least one leader endpoint, and the ownership epoch that fences its
@@ -9,10 +12,11 @@ import "slices"
 // stays zero until static ownership is configured, and never participates in
 // keyspace validation.
 type Shard struct {
-	ID      ShardID
-	Range   KeyRange
-	Leaders []EndpointID
-	Epoch   OwnershipEpoch
+	ID                   ShardID
+	AllocationGeneration ShardAllocationGeneration
+	Range                KeyRange
+	Leaders              []EndpointID
+	Epoch                OwnershipEpoch
 }
 
 // Manifest is an immutable, validated shard layout for one routing generation
@@ -25,6 +29,17 @@ type Manifest struct {
 	starts       []KeyspacePoint // shards[i].Range.Start, retained for binary search
 }
 
+// ShardMetadata is the immutable scalar identity of one manifest shard. It
+// intentionally excludes the leaders slice so callers can inspect transition
+// metadata without receiving mutable backing storage or allocating a copy.
+type ShardMetadata struct {
+	ID                   ShardID
+	AllocationGeneration ShardAllocationGeneration
+	Range                KeyRange
+	Epoch                OwnershipEpoch
+	LeaderCount          int
+}
+
 // NewManifest validates shards and returns an immutable Manifest, or a
 // *ManifestError (matching ErrInvalidManifest) on any violation. Input slices
 // are defensively copied. Validation requires: at least one shard; unique,
@@ -32,7 +47,8 @@ type Manifest struct {
 // valid (Start < End); ranges sorted by start with no gaps or overlaps; the
 // first range starting at zero; only the final range ending at Max and the
 // final range ending exactly at Max — together, complete coverage of the
-// 8-byte keyspace.
+// 8-byte keyspace; and a unique, nonzero topology allocation generation for
+// every physical shard.
 func NewManifest(distribution DistributionName, version RoutingVersion, shards []Shard) (*Manifest, error) {
 	if len(shards) == 0 {
 		return nil, &ManifestError{Reason: "manifest defines no shards"}
@@ -82,15 +98,33 @@ func NewManifest(distribution DistributionName, version RoutingVersion, shards [
 			return nil, &ManifestError{Reason: "overlapping shard ranges"}
 		}
 	}
+	generations := make(map[ShardAllocationGeneration]struct{}, len(shards))
+	for i := range shards {
+		generation := shards[i].AllocationGeneration
+		if generation == 0 {
+			return nil, &ManifestError{Reason: "shard " + string(shards[i].ID) + " has a zero allocation generation"}
+		}
+		if _, duplicate := generations[generation]; duplicate {
+			return nil, &ManifestError{Reason: "duplicate shard allocation generation"}
+		}
+		generations[generation] = struct{}{}
+	}
 
 	cp := make([]Shard, len(shards))
 	starts := make([]KeyspacePoint, len(shards))
 	for i := range shards {
 		cp[i] = shards[i]
-		cp[i].Leaders = slices.Clone(shards[i].Leaders)
+		cp[i].ID = ShardID(strings.Clone(string(shards[i].ID)))
+		cp[i].Leaders = make([]EndpointID, len(shards[i].Leaders))
+		for j := range shards[i].Leaders {
+			cp[i].Leaders[j] = EndpointID(strings.Clone(string(shards[i].Leaders[j])))
+		}
 		starts[i] = shards[i].Range.Start
 	}
-	return &Manifest{distribution: distribution, version: version, shards: cp, starts: starts}, nil
+	return &Manifest{
+		distribution: DistributionName(strings.Clone(string(distribution))),
+		version:      version, shards: cp, starts: starts,
+	}, nil
 }
 
 // Distribution reports the distribution this manifest routes.
@@ -112,6 +146,48 @@ func (m *Manifest) ShardInfo(i int) (Shard, bool) {
 	s := m.shards[i]
 	s.Leaders = slices.Clone(m.shards[i].Leaders)
 	return s, true
+}
+
+// ShardMetadataAt returns allocation-free scalar metadata for shard i.
+func (m *Manifest) ShardMetadataAt(i int) (ShardMetadata, bool) {
+	if i < 0 || i >= len(m.shards) {
+		return ShardMetadata{}, false
+	}
+	shard := &m.shards[i]
+	return ShardMetadata{
+		ID: shard.ID, AllocationGeneration: shard.AllocationGeneration,
+		Range: shard.Range, Epoch: shard.Epoch,
+		LeaderCount: len(shard.Leaders),
+	}, true
+}
+
+// SameShardLeaders reports whether shard i and other's shard j have the exact
+// same ordered leader identity without cloning either immutable slice.
+func (m *Manifest) SameShardLeaders(i int, other *Manifest, j int) bool {
+	if m == nil || other == nil || i < 0 || i >= len(m.shards) ||
+		j < 0 || j >= len(other.shards) {
+		return false
+	}
+	return slices.Equal(m.shards[i].Leaders, other.shards[j].Leaders)
+}
+
+// Equal reports exact semantic manifest equality without allocating defensive
+// shard copies. Distribution, routing version, range geometry, shard ids,
+// ordered leaders, and ownership epochs all participate.
+func (m *Manifest) Equal(other *Manifest) bool {
+	if m == nil || other == nil || m.distribution != other.distribution ||
+		m.version != other.version || len(m.shards) != len(other.shards) {
+		return false
+	}
+	for i := range m.shards {
+		left, right := &m.shards[i], &other.shards[i]
+		if left.ID != right.ID || left.AllocationGeneration != right.AllocationGeneration ||
+			left.Range != right.Range ||
+			left.Epoch != right.Epoch || !slices.Equal(left.Leaders, right.Leaders) {
+			return false
+		}
+	}
+	return true
 }
 
 // searchStart returns the highest index whose range start is <= p, or -1 when
@@ -152,10 +228,11 @@ func (m *Manifest) ResolvePointTarget(p KeyspacePoint) (Target, bool) {
 	}
 	shard := &m.shards[i]
 	return Target{
-		Shard:          shard.ID,
-		Endpoint:       shard.Leaders[0],
-		OwnershipEpoch: shard.Epoch,
-		Role:           RoleLeader,
+		Shard:                shard.ID,
+		AllocationGeneration: shard.AllocationGeneration,
+		Endpoint:             shard.Leaders[0],
+		OwnershipEpoch:       shard.Epoch,
+		Role:                 RoleLeader,
 	}, true
 }
 

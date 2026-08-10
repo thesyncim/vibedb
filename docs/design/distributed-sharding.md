@@ -1062,6 +1062,14 @@ stale epoch exactly as it would reject a stale Raft term. `OwnershipEpoch` is
 therefore the fencing primitive both deployment shapes share; Raft election
 and term are one qualified way to produce it, not the definition of it.
 
+The current leader-only server implements only the local half of that future
+contract. Before listening, it persists nonzero `OwnershipEpoch` and route
+version high-waters beside the immutable shard-store identity and holds one
+in-process claim until its connections drain. This prevents a stale restart or
+second server over that exact open store. It does not elect an owner, expire a
+lease, revoke another process or a copied store, or replace the replicated
+authority required for automated failover.
+
 All data-plane servers start non-serving. A voter accepts client-data proposals
 only while it is the current Raft leader, its range state is `Active`, and the
 request's route generation matches. Ordered apply rechecks the range state,
@@ -1552,8 +1560,9 @@ verified workflow. Mutable lookup indexes need either careful ordered locking
 with repair or a distributed transaction; they are not ordinary local exact
 indexes.
 
-The SQL layer currently provides snapshot isolation with first-committer-wins
-and crash-atomic multi-table commits inside one database (conditional journal
+The local SQL layer provides explicit Read Committed, Repeatable Read/Snapshot,
+and Serializable modes with first-committer-wins and crash-atomic multi-table
+commits inside one database (conditional journal
 records decided by one `txn.vtm` sync). Distribution does not upgrade those
 semantics to a multi-shard atomic commit. Cross-shard atomicity remains a
 separate track; see [multi-table-transactions.md](multi-table-transactions.md)

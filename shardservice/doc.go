@@ -18,6 +18,19 @@
 // the result, and release the snapshot. Direct writers opt into read-write;
 // distributed gateway requests are always read-only.
 //
+// The wire also reserves bounded logical applied positions for session reads.
+// This leader-only phase has no replicated apply log: admission rejects every
+// session read and every present minimum before SQL preparation, and successful
+// strong reads never claim a read position. A later replicated apply path must
+// supply the real log identity and applied-index proof before enabling them.
+//
+// NewServer durably claims nonzero ownership-epoch and routing-version
+// high-waters in the bound shard SQL catalog after validating its options. One
+// live claim excludes another server over the same open store, and Close holds
+// it until every admitted connection drains. This is a bounded local startup
+// fence only: it is not a distributed lease or election and cannot revoke a
+// process serving a copied store.
+//
 // This package depends only on the standard library, vibedb's distribution and
 // query types, the sql/driver runtime, and durability error identity it carries
 // over the wire; it imports no network-RPC or serialization framework.

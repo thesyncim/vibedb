@@ -55,6 +55,9 @@ func (c ClusterConfig) Validate() error {
 
 	manifests := make(map[DistributionName]struct{}, len(c.Manifests))
 	for _, m := range c.Manifests {
+		if m == nil {
+			return &PlacementError{Reason: "manifest is nil"}
+		}
 		d := m.Distribution()
 		if _, ok := specs[d]; !ok {
 			return &PlacementError{Reason: "manifest routes unknown distribution " + string(d)}

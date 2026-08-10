@@ -47,9 +47,11 @@ const maxCatalogTables = 128
 const maxCatalogBytes = 16 << 20
 
 type catalogFile struct {
-	Version int                   `json:"version"`
-	Tables  map[string]*tableMeta `json:"tables"`
-	Views   map[string]*viewMeta  `json:"views,omitempty"`
+	Version         int                   `json:"version"`
+	Tables          map[string]*tableMeta `json:"tables"`
+	Views           map[string]*viewMeta  `json:"views,omitempty"`
+	ShardStore      *ShardStoreIdentity   `json:"shard_store,omitempty"`
+	ShardStoreFence *ShardStoreFence      `json:"shard_store_fence,omitempty"`
 }
 
 // viewMeta is immutable after publication. Prepared statements retain its
@@ -96,6 +98,59 @@ type table struct {
 	conflicts  txConflictClock
 }
 
+// transactionTableLayout is the immutable part of one table incarnation that
+// a transaction used to copy eagerly at BEGIN. Keeping it in the shared layout
+// epoch lets Read Committed materialize only statement dependencies while
+// retaining the exact primary-key, schema, admission, and incarnation identity
+// that existed when the transaction began.
+type transactionTableLayout struct {
+	incarnation *table
+	primaryKey  string
+	primary     vibejson.CompiledPointer
+	schema      *store.Schema
+	limits      durable.Options
+	limitsErr   error
+}
+
+// catalogLayoutEpoch is an immutable in-process catalog/layout generation.
+// Transactions retain one pointer instead of copying every table and view at
+// BEGIN. DDL is the cold copy-on-publish boundary: table layouts and the view
+// generation map are rebuilt once and then never mutated. Pointer identity has
+// no counter to wrap and no wall-clock dependency.
+type catalogLayoutEpoch struct {
+	generation byte
+	tables     map[string]transactionTableLayout
+	views      map[string]*viewMeta
+}
+
+func newCatalogLayoutEpoch(
+	tables map[string]*table,
+	views map[string]*viewMeta,
+) *catalogLayoutEpoch {
+	epoch := &catalogLayoutEpoch{generation: 1}
+	if len(tables) != 0 {
+		epoch.tables = make(map[string]transactionTableLayout, len(tables))
+		for name, table := range tables {
+			limits, err := tableMutationLimits(table)
+			epoch.tables[name] = transactionTableLayout{
+				incarnation: table,
+				primaryKey:  table.meta.PrimaryKey,
+				primary:     table.primary,
+				schema:      table.schema,
+				limits:      limits,
+				limitsErr:   err,
+			}
+		}
+	}
+	if len(views) != 0 {
+		epoch.views = make(map[string]*viewMeta, len(views))
+		for name, meta := range views {
+			epoch.views[name] = meta
+		}
+	}
+	return epoch
+}
+
 // retiredTable keeps the physical resources of a dropped or replaced table
 // incarnation alive until the durable collection can close. Existing SQL
 // cursors and transactions may still hold generation leases after the catalog
@@ -140,6 +195,18 @@ type database struct {
 	// OpenCluster facade. It is nil for the default single-store driver, whose
 	// write path is unchanged.
 	cluster *clusterRouting
+	// layoutEpoch changes whenever a retained table, view, or index layout
+	// publication can affect prepared dependency identity. It is protected by
+	// mu and deliberately independent of durable data generations.
+	layoutEpoch *catalogLayoutEpoch
+	// servingClaim is an in-process exclusion guard for one shard service over
+	// this writer-owning catalog. Its coordinates are also checked against the
+	// durable ShardStoreFence before the pointer is installed.
+	servingClaim *ShardStoreServingClaim
+}
+
+func (d *database) advanceLayoutEpochLocked() {
+	d.layoutEpoch = newCatalogLayoutEpoch(d.tables, d.catalog.Views)
 }
 
 func openDatabase(path string) (*database, error) {
@@ -151,6 +218,16 @@ func openDatabase(path string) (*database, error) {
 func openDatabaseWithSync(
 	path string,
 	syncDir func(string) error,
+) (*database, error) {
+	return openDatabaseWithShardStorePolicy(path, syncDir, shardStoreOpenPolicy{
+		mode: shardStoreOpenGeneric,
+	})
+}
+
+func openDatabaseWithShardStorePolicy(
+	path string,
+	syncDir func(string) error,
+	shardPolicy shardStoreOpenPolicy,
 ) (*database, error) {
 	if path == "" {
 		return nil, errors.New("vibedb: the DSN must be a file path")
@@ -171,7 +248,8 @@ func openDatabaseWithSync(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
-		txnLimits: defaultDriverTxnLimits(),
+		layoutEpoch: newCatalogLayoutEpoch(nil, nil),
+		txnLimits:   defaultDriverTxnLimits(),
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -187,19 +265,6 @@ func openDatabaseWithSync(
 			}
 		}
 	}()
-	if err := d.recoverVisibleNamespace(); err != nil {
-		return nil, err
-	}
-	// Load txn.vtm before any table open so every participant's journal replay
-	// can resolve kind-5 records, and so stray conditionals are consumed before
-	// the log accepts a new commit.
-	decisions, txnLog, err := durable.RecoverDatabaseTransactions(
-		d.dataDir, durable.TxnLogOptions{},
-	)
-	if err != nil {
-		return nil, err
-	}
-	d.txnDecisions, d.txnLog = decisions, txnLog
 	raw, exists, err := readCatalogFile(absolute)
 	if err != nil {
 		return nil, err
@@ -221,6 +286,112 @@ func openDatabaseWithSync(
 			d.catalog.Views = make(map[string]*viewMeta)
 		}
 	}
+	var initializeIdentity *ShardStoreIdentity
+	switch shardPolicy.mode {
+	case shardStoreOpenGeneric:
+		if d.catalog.ShardStore != nil {
+			return nil, &ShardStoreError{
+				Op: "open generic catalog", Path: absolute,
+				Actual: *d.catalog.ShardStore,
+				Err:    ErrShardStoreIdentityMismatch,
+			}
+		}
+	case shardStoreOpenInitialize:
+		if d.catalog.ShardStore != nil &&
+			d.catalog.ShardStore.Binding() != shardPolicy.expected {
+			return nil, &ShardStoreError{
+				Op: "initialize", Path: absolute, Expected: shardPolicy.expected,
+				Actual: *d.catalog.ShardStore,
+				Err:    ErrShardStoreIdentityMismatch,
+			}
+		}
+		if d.catalog.ShardStore == nil {
+			if exists {
+				return nil, &ShardStoreError{
+					Op: "initialize existing unbound catalog", Path: absolute,
+					Expected: shardPolicy.expected,
+					Err:      ErrShardStoreIdentityMismatch,
+				}
+			}
+			if _, statErr := os.Lstat(d.dataDir); statErr == nil {
+				return nil, &ShardStoreError{
+					Op: "initialize existing unbound storage root", Path: absolute,
+					Expected: shardPolicy.expected,
+					Err:      ErrShardStoreIdentityMismatch,
+				}
+			} else if !os.IsNotExist(statErr) {
+				return nil, statErr
+			}
+			identity, identityErr := randomShardStoreIdentity(shardPolicy.expected)
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			initializeIdentity = &identity
+		}
+	case shardStoreOpenExisting:
+		if !exists || d.catalog.ShardStore == nil {
+			return nil, &ShardStoreError{
+				Op: "open", Path: absolute, Expected: shardPolicy.expected,
+				Err: ErrShardStoreUnbound,
+			}
+		}
+		if d.catalog.ShardStore.Binding() != shardPolicy.expected {
+			return nil, &ShardStoreError{
+				Op: "open", Path: absolute, Expected: shardPolicy.expected,
+				Actual: *d.catalog.ShardStore,
+				Err:    ErrShardStoreIdentityMismatch,
+			}
+		}
+	default:
+		return nil, errors.New("vibedb: invalid shard store open policy")
+	}
+	if initializeIdentity != nil {
+		// The binding is the first durable record in a new shard root. Publish it
+		// before namespace fencing creates the private table directory, before
+		// transaction recovery, and before any durable table can be opened or
+		// repaired. A published-but-unfenced error is intentionally retryable only
+		// through an exact-coordinate InitializeShardStore call.
+		d.catalog.ShardStore = initializeIdentity
+		d.catalogWritePending = true
+		var published bool
+		if shardPolicy.persistIdentity != nil {
+			published, err = shardPolicy.persistIdentity(d)
+		} else {
+			published, err = d.persistCatalogLocked()
+		}
+		if err != nil {
+			if !published {
+				// The binding is still tentative. Failed-open teardown normally
+				// settles committed catalog mirrors; do not let that generic path
+				// retry a definitely unpublished initialization after its caller
+				// has already received an ordinary failure.
+				d.catalog.ShardStore = nil
+				d.catalogWritePending = false
+			}
+			return nil, fmt.Errorf("vibedb: initialize shard store identity: %w", err)
+		}
+	}
+
+	if err := d.recoverVisibleNamespace(); err != nil {
+		return nil, err
+	}
+	// The transaction recovery path pins an os.Root to the private table
+	// directory. On a brand-new SQL catalog that directory is still absent;
+	// publish it through the same namespace-fenced helper used by first table
+	// materialization before asking durable recovery to open the root.
+	if err := d.ensureDataDir(); err != nil {
+		return nil, err
+	}
+	// Load txn.vtm before any table open so every participant's journal replay
+	// can resolve kind-5 records, and so stray conditionals are consumed before
+	// the log accepts a new commit.
+	decisions, txnLog, err := durable.RecoverDatabaseTransactions(
+		d.dataDir, durable.TxnLogOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	d.txnDecisions, d.txnLog = decisions, txnLog
 	if err := checkCatalogTableCount(len(d.catalog.Tables)); err != nil {
 		return nil, err
 	}
@@ -361,6 +532,9 @@ func openDatabaseWithSync(
 			)
 		}
 	}
+	// Publish the first immutable in-process layout only after catalog recovery,
+	// durable opens, and any index-mirror repair have all completed.
+	d.advanceLayoutEpochLocked()
 	opened = true
 	return d, nil
 }
@@ -984,6 +1158,25 @@ func checkCatalogSize(catalog catalogFile) error {
 }
 
 func catalogSizeUpperBound(catalog catalogFile) (int, error) {
+	if catalog.ShardStore != nil {
+		if err := validateShardStoreIdentity(*catalog.ShardStore); err != nil {
+			return maxCatalogBytes + 1, fmt.Errorf(
+				"vibedb: invalid shard store identity: %w", err,
+			)
+		}
+	}
+	if catalog.ShardStoreFence != nil {
+		if catalog.ShardStore == nil {
+			return maxCatalogBytes + 1, errors.New(
+				"vibedb: shard store fence requires a shard store identity",
+			)
+		}
+		if err := validateShardStoreFence(*catalog.ShardStoreFence); err != nil {
+			return maxCatalogBytes + 1, fmt.Errorf(
+				"vibedb: invalid shard store fence: %w", err,
+			)
+		}
+	}
 	if err := checkCatalogTableCount(len(catalog.Tables)); err != nil {
 		return maxCatalogBytes + 1, err
 	}
@@ -998,6 +1191,17 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 		}
 		size += part
 		return true
+	}
+	if catalog.ShardStore != nil {
+		if !add(encodedJSONStringBytes(string(catalog.ShardStore.Distribution)) +
+			encodedJSONStringBytes(string(catalog.ShardStore.Shard)) + 512) {
+			return size, catalogSizeError(size)
+		}
+	}
+	if catalog.ShardStoreFence != nil {
+		if !add(256) {
+			return size, catalogSizeError(size)
+		}
 	}
 	for name, meta := range catalog.Tables {
 		if !add(encodedJSONStringBytes(name) + 512) {
@@ -1228,6 +1432,11 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	t.file, t.collection = file, collection
 	t.meta.Materialized = true
 	d.catalogWritePending = true
+	// First materialization changes the readable physical layout while retaining
+	// the same logical table object. Dependency-scoped Read Committed capture
+	// resolves that object directly, while the epoch records the retained
+	// nil-to-live transition for catalog-generation fencing.
+	d.advanceLayoutEpochLocked()
 	if err := d.settleCatalogLocked(); err != nil {
 		return t, err
 	}

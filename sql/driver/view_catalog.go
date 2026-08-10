@@ -368,6 +368,13 @@ func firstCatalogViewReference(
 				return name, pos, true
 			}
 		}
+		if reference.On != nil {
+			if name, pos, exists := firstExprCatalogViewReference(
+				reference.On.Expr, views,
+			); exists {
+				return name, pos, true
+			}
+		}
 	}
 	if name, pos, exists := firstExprCatalogViewReference(tree.Where, views); exists {
 		return name, pos, true

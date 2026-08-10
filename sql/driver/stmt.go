@@ -14,17 +14,21 @@ import (
 )
 
 type stmt struct {
-	conn           *conn
-	tree           *sqlast.Statement
-	query          *query.Statement
-	mutation       *query.DMLStatement
-	insertSource   *insertSelectPlan
-	views          *preparedViewState
-	pointPredicate *sqlast.Expr
-	primaryPoint   bool
-	catalogJoin    bool
-	params         int
-	paramKinds     []ParamKind
+	conn               *conn
+	tree               *sqlast.Statement
+	query              *query.Statement
+	mutation           *query.DMLStatement
+	insertSource       *insertSelectPlan
+	views              *preparedViewState
+	pointPredicate     *sqlast.Expr
+	pointPath          string
+	pointCandidate     bool
+	primaryPoint       bool
+	serialPointSafe    bool
+	serialMutationSafe bool
+	catalogJoin        bool
+	params             int
+	paramKinds         []ParamKind
 	// paramPositions stores authored byte positions plus one for document
 	// placeholders only. It remains nil for the scalar-only path.
 	paramPositions []int
@@ -90,7 +94,11 @@ func (s *stmt) Close() error {
 	s.insertSource = nil
 	s.views = nil
 	s.pointPredicate = nil
+	s.pointPath = ""
+	s.pointCandidate = false
 	s.primaryPoint = false
+	s.serialPointSafe = false
+	s.serialMutationSafe = false
 	s.catalogJoin = false
 	s.paramKinds = nil
 	s.paramPositions = nil
@@ -180,6 +188,17 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		if s.analyze {
 			return s.analyzeRows(ctx, args)
 		}
+		if s.conn.tx != nil {
+			var views []viewDependency
+			if s.views != nil {
+				views = s.views.dependencies
+			}
+			if err := s.conn.tx.refreshStatementCut(
+				ctx, s.query.Collection(), s.dependencies, views,
+			); err != nil {
+				return nil, err
+			}
+		}
 		plan, err := s.explainPlan(ctx, args)
 		if err != nil {
 			return nil, err
@@ -213,6 +232,13 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	// this branch has no physical relation, so it cannot divert a stored-row
 	// query or its transaction snapshot.
 	if sourceIndependentStatement(s.query) {
+		if s.conn.tx != nil && s.views != nil && len(s.views.dependencies) != 0 {
+			if err := s.conn.tx.refreshStatementCut(
+				ctx, "", nil, s.views.dependencies,
+			); err != nil {
+				return nil, err
+			}
+		}
 		if err := s.validatePreparedViewDependencies(ctx); err != nil {
 			return nil, err
 		}
@@ -227,6 +253,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return s.conn.resetRows(s, cursor, nil), nil
 	}
 	if s.conn.tx != nil {
+		if err := s.conn.tx.beginQueryStatement(ctx, s); err != nil {
+			return nil, err
+		}
 		if err := s.validateTransactionViewDependencies(); err != nil {
 			return nil, err
 		}
@@ -251,12 +280,18 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 			return nil, s.missingDependency(s.query.Collection(), true)
 		}
 		var source query.Source
-		if s.primaryPoint {
+		pointPredicate := s.pointPredicate
+		pointRead := s.pointCandidate && s.pointPath == state.primaryKey
+		if pointRead && s.conn.tx.isolation == IsolationSerializable {
+			_, pointRead = s.conn.tx.serializablePointQuery(s)
+		}
+		if pointRead {
 			keys, keyErr := s.conn.bindPointPredicateKeys(
-				s.pointPredicate, args, state.limits.MaxKeyBytes)
+				pointPredicate, args, state.limits.MaxKeyBytes)
 			if keyErr != nil {
 				return nil, keyErr
 			}
+			s.conn.tx.trackSerializablePointReads(state, keys)
 			source, err = s.conn.pointTransactionSource(ctx, state, keys)
 			if errors.Is(err, errPointMaterializationTooLarge) {
 				source, err = s.conn.tx.querySource(s.query.Collection())
@@ -343,13 +378,14 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		source   query.Source
 		snapshot *durable.Snapshot
 	)
-	if s.primaryPoint {
+	pointPredicate := s.pointPredicate
+	if s.pointCandidate && s.pointPath == t.meta.PrimaryKey {
 		limits, limitErr := tableMutationLimits(t)
 		if limitErr != nil {
 			err = limitErr
 		} else {
 			keys, keyErr := s.conn.bindPointPredicateKeys(
-				s.pointPredicate, args, limits.MaxKeyBytes)
+				pointPredicate, args, limits.MaxKeyBytes)
 			if keyErr != nil {
 				err = keyErr
 			} else if t.collection == nil {
@@ -410,7 +446,7 @@ func (s *stmt) analyzeRows(ctx context.Context, args []any) (*rows, error) {
 		returned++
 	}
 
-	options := query.ExplainOptions{PrimaryPoint: s.primaryPoint}
+	options := query.ExplainOptions{}
 	if resultRows.snapshot != nil {
 		options.IndexCatalogKnown = true
 		options.Indexes = resultRows.snapshot.AppendIndexes(nil)
@@ -429,7 +465,7 @@ func (s *stmt) analyzeRows(ctx context.Context, args []any) (*rows, error) {
 	plan, err := s.query.ExplainAnalyze(options, query.ExplainAnalysis{
 		ElapsedNanoseconds: time.Since(started).Nanoseconds(),
 		Rows:               returned,
-		ActualAccessPath:   analyzeAccessPath(s, pointSource, stats),
+		ActualAccessPath:   analyzeAccessPath(s, options.PrimaryPoint, pointSource, stats),
 		Stats:              stats,
 	})
 	if err != nil {
@@ -441,7 +477,11 @@ func (s *stmt) analyzeRows(ctx context.Context, args []any) (*rows, error) {
 	), nil
 }
 
-func analyzeAccessPath(s *stmt, pointSource bool, stats query.ExecStats) string {
+func analyzeAccessPath(
+	s *stmt,
+	primaryPoint, pointSource bool,
+	stats query.ExecStats,
+) string {
 	if s.requiresCatalogSource() {
 		switch {
 		case stats.JoinBuilds != 0:
@@ -454,7 +494,7 @@ func analyzeAccessPath(s *stmt, pointSource bool, stats query.ExecStats) string 
 			return "join-no-matches"
 		}
 	}
-	if s.primaryPoint && pointSource {
+	if primaryPoint && pointSource {
 		return "primary-key-point"
 	}
 	if stats.IndexBounded {
@@ -482,9 +522,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 	if err := s.validatePreparedViewDependencies(ctx); err != nil {
 		return query.ExplainOptions{}, err
 	}
-	options := query.ExplainOptions{
-		PrimaryPoint: s.primaryPoint,
-	}
+	options := query.ExplainOptions{}
 	// A catalog-dependent relation plan may read several physical sources, while
 	// ExplainOptions carries one index catalog. Keep that part of the plan
 	// logical rather than attributing one operand's indexes to every source;
@@ -506,6 +544,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 		if state.snapshot != nil {
 			options.Indexes = state.snapshot.AppendIndexes(options.Indexes)
 		}
+		options.PrimaryPoint = s.pointCandidate && s.pointPath == state.primaryKey
 		return options, contextCheckpoint(ctx)
 	}
 	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
@@ -516,6 +555,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 		s.conn.db.mu.RUnlock()
 		return query.ExplainOptions{}, s.missingDependency(collection, false)
 	}
+	options.PrimaryPoint = s.pointCandidate && s.pointPath == t.meta.PrimaryKey
 	if t.collection == nil {
 		s.conn.db.mu.RUnlock()
 		return options, contextCheckpoint(ctx)

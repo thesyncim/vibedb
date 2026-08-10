@@ -1738,7 +1738,10 @@ func (p *plan) accumulate(accs []aggAcc, ctx *execCtx, row int, budget *aggregat
 	for c, col := range p.columns {
 		switch col.agg {
 		case aggCount:
-			if col.value < 0 || present(ctx.values[col.value][row]) {
+			// COUNT(path) follows SQL's COUNT(expr): both an absent path and
+			// an explicit JSON null are excluded. `present` intentionally has
+			// different semantics for EXISTS/IS PRESENT predicates.
+			if col.value < 0 || ctx.values[col.value][row].kind != kindNull {
 				accs[c].count++
 			}
 		case aggSum, aggAvg, aggMin, aggMax:

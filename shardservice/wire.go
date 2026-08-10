@@ -191,10 +191,20 @@ type ShardRequest struct {
 	// Distribution and Shard name the target the shard admits ownership of.
 	Distribution distribution.DistributionName
 	Shard        distribution.ShardID
+	// AllocationGeneration identifies the topology-created physical shard
+	// allocation. It is checked before routing and per-allocation ownership
+	// epochs, so a reused logical label cannot admit a stale request.
+	AllocationGeneration distribution.ShardAllocationGeneration
 	// RoutingVersion pins the manifest generation the caller routed against.
 	RoutingVersion distribution.RoutingVersion
 	// OwnershipEpoch is the caller's view of the shard's fencing epoch.
 	OwnershipEpoch distribution.OwnershipEpoch
+	// HasMinPosition selects MinPosition. Phase 0 carries and validates the field
+	// but rejects every present value until a replicated apply log exists; it
+	// never silently weakens the request to an ordinary strong read. When false,
+	// MinPosition must be zero so the optional has one canonical representation.
+	HasMinPosition bool
+	MinPosition    Position
 
 	// ReadPolicy selects the consistency contract; PR 4a honors only ReadStrong.
 	ReadPolicy ReadPolicy
@@ -276,6 +286,19 @@ const (
 	// ErrorCommitOutcomeUnknown reports a mutation whose durable completion
 	// cannot be determined. Callers must not retry it without command identity.
 	ErrorCommitOutcomeUnknown
+	// ErrorPositionUnsupported reports that this shard has no replicated apply
+	// position against which it can prove a session minimum.
+	ErrorPositionUnsupported
+	// ErrorPositionIdentity reports a minimum for a different distribution or
+	// shard. A numerically larger index from another identity cannot satisfy it.
+	ErrorPositionIdentity
+	// ErrorPositionNotReached reports a valid, matching minimum above the
+	// serving replica's applied index. Phase 0 reserves this refusal for the
+	// replicated apply path; it is never guessed from local storage state.
+	ErrorPositionNotReached
+	// ErrorShardAllocation reports a stale physical allocation generation for
+	// an otherwise matching distribution and shard id.
+	ErrorShardAllocation
 )
 
 // String renders the kind name for diagnostics.
@@ -299,13 +322,21 @@ func (k ErrorKind) String() string {
 		return "UnsupportedReadPolicy"
 	case ErrorCommitOutcomeUnknown:
 		return "CommitOutcomeUnknown"
+	case ErrorPositionUnsupported:
+		return "PositionUnsupported"
+	case ErrorPositionIdentity:
+		return "PositionIdentity"
+	case ErrorPositionNotReached:
+		return "PositionNotReached"
+	case ErrorShardAllocation:
+		return "ShardAllocation"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorCommitOutcomeUnknown }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorShardAllocation }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.
@@ -338,6 +369,13 @@ type ShardResponse struct {
 	// ErrorKind and ErrorMessage are set only for ResponseError.
 	ErrorKind    ErrorKind
 	ErrorMessage string
+
+	// HasReadPosition selects ReadPosition on a row response and proves the
+	// applied log cut from which the rows were read. The current leader-only
+	// implementation has no replicated apply log and therefore leaves it false
+	// on every successful strong read. When false, ReadPosition must be zero.
+	HasReadPosition bool
+	ReadPosition    Position
 }
 
 // RowsResponse builds a ResponseRows reply over columns and rows.

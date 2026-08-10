@@ -94,6 +94,7 @@ type Options struct {
 // static ownership identity and executes the admitted statement locally.
 type Server struct {
 	db        *sqldriver.Database
+	claim     *sqldriver.ShardStoreServingClaim
 	ownership Ownership
 	opts      Options
 
@@ -106,6 +107,8 @@ type Server struct {
 	conns     map[net.Conn]struct{}
 	listeners map[net.Listener]struct{}
 	closed    bool
+	closeDone chan struct{}
+	closeErr  error
 
 	// wg tracks in-flight connections so Close can wait for them: a caller that
 	// closes the server and then the database underneath it must know no
@@ -121,9 +124,10 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if db == nil {
 		return nil, errors.New("shardservice: a non-nil SQL database is required")
 	}
-	if cfg.Distribution == "" || cfg.Shard == "" {
+	if cfg.Distribution == "" || cfg.Shard == "" || cfg.AllocationGeneration == 0 ||
+		cfg.Epoch == 0 || cfg.RoutingVersion == 0 {
 		return nil, errors.New(
-			"shardservice: ownership must name a non-empty distribution and shard")
+			"shardservice: ownership must name a non-empty distribution and shard with nonzero allocation generation, epoch, and routing version")
 	}
 	if opts.MaxConnections < UnlimitedConnections {
 		return nil, fmt.Errorf("shardservice: MaxConnections must be >= %d", UnlimitedConnections)
@@ -164,15 +168,31 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxIntermediateBytes == 0 {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
+	// Do not advance durable serving authority for a constructor that will be
+	// rejected on an option error. The claim is the final fallible construction
+	// step and is retained until Close has drained every admitted connection.
+	claim, err := db.ClaimShardStoreServing(sqldriver.ShardStoreBinding{
+		Distribution:         cfg.Distribution,
+		Shard:                cfg.Shard,
+		AllocationGeneration: cfg.AllocationGeneration,
+	}, sqldriver.ShardStoreFence{
+		OwnershipEpoch: cfg.Epoch,
+		RoutingVersion: cfg.RoutingVersion,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("shardservice: claim SQL shard serving fence: %w", err)
+	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		db:        db,
+		claim:     claim,
 		ownership: cfg,
 		opts:      opts,
 		baseCtx:   baseCtx,
 		cancel:    cancel,
 		conns:     map[net.Conn]struct{}{},
 		listeners: map[net.Listener]struct{}{},
+		closeDone: make(chan struct{}),
 	}, nil
 }
 
@@ -256,7 +276,8 @@ func (s *Server) serveConn(nc net.Conn) error {
 }
 
 // Close stops accepting, cancels every in-flight execution, closes every open
-// connection, and waits for every connection goroutine to return.
+// connection, waits for every connection goroutine to return, and only then
+// releases the store's process-local serving claim.
 //
 // Both signals are necessary: canceling baseCtx reaches a connection currently
 // inside execution, and closing its socket wakes one blocked reading or writing.
@@ -265,9 +286,10 @@ func (s *Server) serveConn(nc net.Conn) error {
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		s.mu.Unlock()
-		s.wg.Wait()
-		return nil
+		<-done
+		return s.closeErr
 	}
 	s.closed = true
 	listeners := make([]net.Listener, 0, len(s.listeners))
@@ -291,6 +313,11 @@ func (s *Server) Close() error {
 		_ = c.Close()
 	}
 	s.wg.Wait()
+	err = errors.Join(err, s.claim.Close())
+	s.mu.Lock()
+	s.closeErr = err
+	close(s.closeDone)
+	s.mu.Unlock()
 	return err
 }
 

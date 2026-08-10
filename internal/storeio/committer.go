@@ -320,13 +320,14 @@ type Committer struct {
 	// root. The worker advances it only after the root fence succeeds. This is
 	// deliberately independent of generation parity: a grouped commit can
 	// publish generation N+2 directly over durable generation N.
-	nextRootSlot    atomic.Uint32
-	failure         atomic.Pointer[commitFailure]
-	callbacks       atomic.Pointer[committerCallbacks]
-	frameCache      atomic.Pointer[PageCache]
-	failed          chan struct{}
-	failureNotified chan struct{}
-	failOnce        sync.Once
+	nextRootSlot      atomic.Uint32
+	failure           atomic.Pointer[commitFailure]
+	callbacks         atomic.Pointer[committerCallbacks]
+	frameCache        atomic.Pointer[PageCache]
+	failed            chan struct{}
+	failureNotified   chan struct{}
+	failureNotifyOnce sync.Once
+	failOnce          sync.Once
 
 	waitMu sync.Mutex
 	wait   *sync.Cond
@@ -828,6 +829,13 @@ func (c *Committer) waitFailure(failure *commitFailure) error {
 		<-c.failureNotified
 	}
 	return failure.err
+}
+
+func (c *Committer) notifyFailureDrained() {
+	if c == nil || c.failureNotified == nil {
+		return
+	}
+	c.failureNotifyOnce.Do(func() { close(c.failureNotified) })
 }
 
 // SetCallbacks installs lifecycle notifications used by the durable

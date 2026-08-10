@@ -153,8 +153,8 @@ type prepared struct {
 	cols []column
 	// tag is the CommandComplete tag for a statement with no row count.
 	tag string
-	// txReadOnly is the one BEGIN mode the runtime needs to carry.
-	txReadOnly bool
+	// txOptions carries every parsed BEGIN mode into the typed runtime.
+	txOptions sqldriver.TxOptions
 	// savepointName is the mark named by SAVEPOINT, RELEASE, or ROLLBACK TO.
 	savepointName string
 	// paramOIDs are the parameter types the client declared in Parse. They are
@@ -1041,13 +1041,15 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	case kindCatalogSQL:
 
 	case kindBegin, kindCommit, kindRollback:
-		readOnly, err := parseTransactionCommandCancelable(
+		mode, err := parseTransactionCommandCancelable(
 			text, kind, s.cancelCheck,
 		)
 		if err != nil {
 			return nil, asPGErrorIn(err, text)
 		}
-		p.txReadOnly = readOnly
+		p.txOptions = sqldriver.TxOptions{
+			ReadOnly: mode.readOnly, Isolation: mode.isolation,
+		}
 		switch kind {
 		case kindBegin:
 			p.tag = "BEGIN"
@@ -1361,8 +1363,7 @@ func (s *session) executeTransaction(stmt *prepared) error {
 	tag := stmt.tag
 	switch stmt.kind {
 	case kindBegin:
-		err = s.sql.Begin(context.Background(),
-			sqldriver.TxOptions{ReadOnly: stmt.txReadOnly})
+		err = s.sql.Begin(context.Background(), stmt.txOptions)
 	case kindCommit:
 		s.closeRuntimePortals()
 		err = s.sql.Commit(context.Background())
@@ -1384,10 +1385,18 @@ func (s *session) executeTransaction(stmt *prepared) error {
 		return asPGErrorIn(err, stmt.sql)
 	}
 	if pendingCancel && stmt.kind == kindBegin {
-		return queryCanceled()
+		return s.cancelSuccessfulBegin(stmt)
 	}
 	s.w.commandComplete(tag)
 	return nil
+}
+
+func (s *session) cancelSuccessfulBegin(stmt *prepared) error {
+	rollbackErr := s.sql.Rollback(context.Background())
+	if rollbackErr == nil {
+		return queryCanceled()
+	}
+	return asPGErrorIn(errors.Join(queryCanceled(), rollbackErr), stmt.sql)
 }
 
 func (s *session) executeSavepoint(stmt *prepared) error {

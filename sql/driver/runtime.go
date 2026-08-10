@@ -75,9 +75,11 @@ const (
 	// SessionInTransaction has an active, usable snapshot transaction.
 	SessionInTransaction
 	// SessionFailedTransaction has an active transaction that rejected a
-	// prepare or execution. Only Rollback is accepted. Commit first rolls back
-	// deterministically and then returns ErrTransactionFailed, allowing a wire
-	// adapter to map that outcome to its protocol's failed-COMMIT behavior.
+	// prepare or execution. A successful RollbackTo recovers it to
+	// SessionInTransaction; Rollback remains the unconditional terminal escape.
+	// Commit first rolls back deterministically and then returns
+	// ErrTransactionFailed, allowing a wire adapter to map that outcome to its
+	// protocol's failed-COMMIT behavior.
 	SessionFailedTransaction
 	// SessionClosed is terminal.
 	SessionClosed
@@ -98,12 +100,30 @@ func (s SessionState) String() string {
 	}
 }
 
-// TxOptions is the transaction policy the current SQL runtime supports.
-//
-// Transactions always provide snapshot isolation. ReadOnly prevents every DML
-// and DDL execution while retaining the same multi-table snapshot semantics.
+// IsolationLevel selects when a transaction refreshes its committed read cut
+// and which read dependencies COMMIT validates.
+type IsolationLevel uint8
+
+const (
+	// IsolationDefault uses Read Committed, matching database/sql and pgwire.
+	IsolationDefault IsolationLevel = iota
+	// IsolationReadCommitted captures one coherent cut at each data statement.
+	IsolationReadCommitted
+	// IsolationRepeatableRead retains the coherent cut captured by BEGIN.
+	IsolationRepeatableRead
+	// IsolationSerializable retains the BEGIN cut and rejects a publishing
+	// commit when one of its exact or relation-coarse read dependencies changed.
+	IsolationSerializable
+
+	// IsolationSnapshot is an alias for the fixed-cut Repeatable Read mode.
+	IsolationSnapshot = IsolationRepeatableRead
+)
+
+// TxOptions is the transaction policy for the current SQL runtime.
+// ReadOnly prevents every DML and DDL execution.
 type TxOptions struct {
-	ReadOnly bool
+	ReadOnly  bool
+	Isolation IsolationLevel
 }
 
 // Session is one typed SQL execution session.
@@ -241,16 +261,27 @@ func (s *Session) Prepare(ctx context.Context, text string) (*Prepared, error) {
 	return prepared, nil
 }
 
-// Begin captures one coherent, generation-leased snapshot of every cataloged
-// table. Nested transactions are rejected.
+// Begin starts a transaction at the requested isolation level. Read Committed
+// refreshes one coherent generation-leased cut per physical statement;
+// Repeatable Read and Serializable retain the cut captured here. Nested
+// transactions are rejected.
 func (s *Session) Begin(ctx context.Context, options TxOptions) error {
+	if s != nil && s.conn != nil {
+		ctx = withCooperativeCancellation(ctx, s.conn.exec.Options.Cancel)
+	}
 	if err := s.ready(ctx); err != nil {
 		return s.fail(err)
 	}
 	if s.state != SessionIdle || s.conn.tx != nil {
 		return ErrTransactionActive
 	}
-	if _, err := s.conn.BeginTx(ctx, sqldriver.TxOptions{ReadOnly: options.ReadOnly}); err != nil {
+	isolation, err := driverIsolationLevel(options.Isolation)
+	if err != nil {
+		return err
+	}
+	if _, err := s.conn.BeginTx(ctx, sqldriver.TxOptions{
+		ReadOnly: options.ReadOnly, Isolation: isolation,
+	}); err != nil {
 		return err
 	}
 	s.state = SessionInTransaction
@@ -324,8 +355,8 @@ func (s *Session) ReleaseSavepoint(ctx context.Context, name string) error {
 // ending the transaction.
 //
 // Valid in SessionInTransaction and SessionFailedTransaction. Success from the
-// failed state recovers the session to SessionInTransaction — the property
-// client stacks rely on after a statement error.
+// failed state recovers the session to SessionInTransaction without ending the
+// transaction. Rollback remains the unconditional terminal alternative.
 func (s *Session) RollbackTo(ctx context.Context, name string) error {
 	if err := s.live(); err != nil {
 		return err
@@ -358,8 +389,9 @@ func (s *Session) RollbackTo(ctx context.Context, name string) error {
 // Rollback discards the current transaction and returns to SessionIdle.
 //
 // Cleanup is unconditional even when ctx is already canceled: Rollback is the
-// one operation a failed transaction must always retain, and leaving snapshot
-// leases behind would turn cancellation into an ownership leak.
+// terminal operation a failed transaction must always retain, while RollbackTo
+// is its non-terminal recovery path. Leaving snapshot leases behind would turn
+// cancellation into an ownership leak.
 func (s *Session) Rollback(ctx context.Context) error {
 	_ = ctx
 	if err := s.live(); err != nil {
@@ -789,8 +821,9 @@ var (
 	// ErrTransactionActive reports BEGIN or an idle-only session operation while
 	// a transaction is already active.
 	ErrTransactionActive = errors.New("vibedb: SQL session already has an active transaction")
-	// ErrTransactionFailed reports a failed transaction in which only ROLLBACK
-	// remains valid.
+	// ErrTransactionFailed reports an operation refused by a failed transaction.
+	// RollbackTo can recover that transaction; Rollback remains the terminal
+	// escape.
 	ErrTransactionFailed = errors.New("vibedb: SQL transaction is failed; roll it back")
 	// ErrCursorOpen reports an operation that cannot replace the session's
 	// current typed result and snapshot lease.

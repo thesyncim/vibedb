@@ -10,7 +10,6 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
-	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // shardNode is one in-process shard server plus the ownership and address a
@@ -31,11 +30,9 @@ type seedStmt struct {
 // reachable at address.
 func newShardNode(t *testing.T, address string, own shardservice.Ownership) shardNode {
 	t.Helper()
-	db, err := sqldriver.Open(filepath.Join(t.TempDir(), address+".vdb"))
-	if err != nil {
-		t.Fatalf("Open %s: %v", address, err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := initializeTestShardStore(
+		t, filepath.Join(t.TempDir(), address+".vdb"), own,
+	)
 	srv, err := shardservice.NewServer(db, own, shardservice.Options{})
 	if err != nil {
 		t.Fatalf("NewServer %s: %v", address, err)
@@ -64,11 +61,12 @@ func seed(t *testing.T, c *Client, node shardNode, stmts ...seedStmt) {
 	for _, s := range stmts {
 		req := &shardservice.ShardRequest{
 			SQL: s.sql, Params: s.params,
-			Distribution:   node.own.Distribution,
-			Shard:          node.own.Shard,
-			RoutingVersion: node.own.RoutingVersion,
-			OwnershipEpoch: node.own.Epoch,
-			ExecutionMode:  shardservice.ExecutionReadWrite,
+			Distribution:         node.own.Distribution,
+			Shard:                node.own.Shard,
+			AllocationGeneration: node.own.AllocationGeneration,
+			RoutingVersion:       node.own.RoutingVersion,
+			OwnershipEpoch:       node.own.Epoch,
+			ExecutionMode:        shardservice.ExecutionReadWrite,
 		}
 		if _, err := c.Do(context.Background(), node.address, req); err != nil {
 			t.Fatalf("seed %q on %s: %v", s.sql, node.address, err)
@@ -98,8 +96,8 @@ func twoShardSnapshot(t *testing.T, gen uint64, version distribution.RoutingVers
 func newTwoShardCluster(t *testing.T, version distribution.RoutingVersion) (*Client, map[string]shardNode) {
 	t.Helper()
 	nodes := map[string]shardNode{
-		"shard-a": newShardNode(t, "shard-a", shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", Epoch: 7, RoutingVersion: version}),
-		"shard-b": newShardNode(t, "shard-b", shardservice.Ownership{Distribution: "tenant_data", Shard: "80-", Epoch: 9, RoutingVersion: version}),
+		"shard-a": newShardNode(t, "shard-a", shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", AllocationGeneration: 1, Epoch: 7, RoutingVersion: version}),
+		"shard-b": newShardNode(t, "shard-b", shardservice.Ownership{Distribution: "tenant_data", Shard: "80-", AllocationGeneration: 2, Epoch: 9, RoutingVersion: version}),
 	}
 	c := NewClient(dialer(nodes))
 	ddl := seedStmt{sql: `CREATE TABLE messages (tenant_id STRING PRIMARY KEY, n INTEGER NOT NULL)`}
@@ -152,7 +150,7 @@ func TestExecutorScatterMerge(t *testing.T) {
 // TestExecutorSingleShardPassthrough proves a single-shard route streams the
 // shard's own ordered result through unchanged, without a merge pass.
 func TestExecutorSingleShardPassthrough(t *testing.T) {
-	own := shardservice.Ownership{Distribution: "tenant_data", Shard: "all", Epoch: 11, RoutingVersion: 4}
+	own := shardservice.Ownership{Distribution: "tenant_data", Shard: "all", AllocationGeneration: 1, Epoch: 11, RoutingVersion: 4}
 	nodes := map[string]shardNode{"solo": newShardNode(t, "solo", own)}
 	c := NewClient(dialer(nodes))
 	seed(t, c, nodes["solo"],
@@ -163,10 +161,11 @@ func TestExecutorSingleShardPassthrough(t *testing.T) {
 	)
 
 	man, err := distribution.NewManifest("tenant_data", 4, []distribution.Shard{{
-		ID:      "all",
-		Range:   distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Max: true}},
-		Leaders: []distribution.EndpointID{"ep-solo"},
-		Epoch:   11,
+		ID:                   "all",
+		AllocationGeneration: 1,
+		Range:                distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Max: true}},
+		Leaders:              []distribution.EndpointID{"ep-solo"},
+		Epoch:                11,
 	}})
 	if err != nil {
 		t.Fatalf("NewManifest: %v", err)

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
@@ -28,6 +29,16 @@ var (
 	// ErrReadPolicyUnsupported reports a consistency policy the shard cannot
 	// currently prove.
 	ErrReadPolicyUnsupported = errors.New("gateway: shard does not support the requested read policy")
+	// ErrPositionUnsupported reports that a shard has no replicated apply log
+	// against which it can prove a requested session minimum.
+	ErrPositionUnsupported = errors.New("gateway: shard does not support logical positions")
+	// ErrPositionIdentity reports a minimum naming a different distribution,
+	// shard, or log lineage than the shard can serve.
+	ErrPositionIdentity = errors.New("gateway: logical position identity mismatch")
+	// ErrPositionNotReached reports that the serving replica has not applied the
+	// requested minimum. It is not a stale-catalog error and is never retried by
+	// refreshing routing metadata.
+	ErrPositionNotReached = errors.New("gateway: logical position has not been reached")
 	// ErrCommitOutcomeUnknown preserves the storage layer's indeterminate
 	// completion identity across the shard wire. It must never be retried without
 	// a durable command identity and completion record.
@@ -59,6 +70,8 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return distribution.ErrNotShardOwner
 	case shardservice.ErrorOwnershipEpoch:
 		return distribution.ErrOwnershipEpoch
+	case shardservice.ErrorShardAllocation:
+		return distribution.ErrShardAllocation
 	case shardservice.ErrorRoutingVersion:
 		return distribution.ErrRoutingVersion
 	case shardservice.ErrorDeadlineExceeded:
@@ -73,6 +86,12 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return ErrReadPolicyUnsupported
 	case shardservice.ErrorCommitOutcomeUnknown:
 		return ErrCommitOutcomeUnknown
+	case shardservice.ErrorPositionUnsupported:
+		return ErrPositionUnsupported
+	case shardservice.ErrorPositionIdentity:
+		return ErrPositionIdentity
+	case shardservice.ErrorPositionNotReached:
+		return ErrPositionNotReached
 	default:
 		return ErrUnexpectedError
 	}
@@ -118,6 +137,9 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := validateRequestPosition(req); err != nil {
+		return nil, err
+	}
 	conn, err := c.dial(ctx, address)
 	if err != nil {
 		return nil, err
@@ -138,11 +160,25 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := validateRequestPosition(req); err != nil {
+		return nil, err
+	}
 	// AfterFunc trips the socket's I/O deadline once ctx is done, unblocking a
 	// blocked Encode or Decode; stop cancels it on the fast path so a healthy
 	// round-trip pays nothing after it returns.
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(tripped) })
-	defer stop()
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(tripped)
+		close(callbackDone)
+	})
+	defer func() {
+		// If the callback won the race with the fast path, wait until it has
+		// finished mutating the connection before RoundTrip returns. This is
+		// required when callers pool a connection after a canceled exchange.
+		if !stop() {
+			<-callbackDone
+		}
+	}()
 
 	if err := shardservice.EncodeRequest(conn, req); err != nil {
 		return nil, firstErr(ctx, err)
@@ -154,7 +190,70 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 	if resp.Kind == shardservice.ResponseError {
 		return nil, shardError(resp)
 	}
+	if err := validateReadPosition(req, resp); err != nil {
+		return nil, err
+	}
 	return resp, nil
+}
+
+// validateRequestPosition binds a session minimum to the logical shard named
+// by the request before any connection or wire work. Shard admission repeats
+// this check against authoritative ownership; the client-side gate prevents a
+// locally inconsistent request from reaching the network at all.
+func validateRequestPosition(req *shardservice.ShardRequest) error {
+	if req == nil || !req.HasMinPosition {
+		return nil
+	}
+	if err := req.MinPosition.Validate(); err != nil {
+		return fmt.Errorf("%w: invalid minimum position: %v", ErrMalformedRequest, err)
+	}
+	if req.MinPosition.Distribution != req.Distribution ||
+		req.MinPosition.Shard != req.Shard {
+		return clientPositionError(
+			shardservice.ErrorPositionIdentity,
+			"gateway: minimum position does not name the request's logical shard",
+		)
+	}
+	return nil
+}
+
+// validateReadPosition enforces the proof contract on a successful response.
+// The codec already rejects malformed positions and positions on non-row
+// response shapes. This gate binds a requested minimum to the exact returned
+// log identity and refuses a behind index without leaking the response.
+func validateReadPosition(req *shardservice.ShardRequest, resp *shardservice.ShardResponse) error {
+	if resp.HasReadPosition {
+		if err := resp.ReadPosition.Validate(); err != nil {
+			return fmt.Errorf("%w: invalid shard read position: %v", ErrMalformedRequest, err)
+		}
+	}
+	if !req.HasMinPosition {
+		return nil
+	}
+	if !resp.HasReadPosition {
+		return clientPositionError(
+			shardservice.ErrorPositionUnsupported,
+			"gateway: shard returned no applied-position proof for the requested minimum",
+		)
+	}
+	if !req.MinPosition.SameLog(resp.ReadPosition) {
+		return clientPositionError(
+			shardservice.ErrorPositionIdentity,
+			"gateway: shard read-position proof does not match the requested log identity",
+		)
+	}
+	if resp.ReadPosition.Index < req.MinPosition.Index {
+		return clientPositionError(
+			shardservice.ErrorPositionNotReached,
+			fmt.Sprintf("gateway: shard read position %d is below requested minimum %d",
+				resp.ReadPosition.Index, req.MinPosition.Index),
+		)
+	}
+	return nil
+}
+
+func clientPositionError(kind shardservice.ErrorKind, message string) *ShardError {
+	return &ShardError{Kind: kind, Message: message, sentinel: sentinelFor(kind)}
 }
 
 // tripped is a deadline safely in the past; setting it unblocks in-flight and

@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // maxKeyEnd is the exclusive maximum end, legal only on a manifest's final
@@ -69,9 +70,10 @@ func shardsFromBounds(bounds ...uint64) []Shard {
 			end = KeyspaceEnd{Point: starts[i+1]}
 		}
 		shards[i] = Shard{
-			ID:      ShardID(fmt.Sprintf("s%d", i)),
-			Range:   KeyRange{Start: starts[i], End: end},
-			Leaders: []EndpointID{EndpointID(fmt.Sprintf("ep-%d", i))},
+			ID:                   ShardID(fmt.Sprintf("s%d", i)),
+			AllocationGeneration: ShardAllocationGeneration(i + 1),
+			Range:                KeyRange{Start: starts[i], End: end},
+			Leaders:              []EndpointID{EndpointID(fmt.Sprintf("ep-%d", i))},
 		}
 	}
 	return shards
@@ -202,6 +204,21 @@ func TestNewManifestRejects(t *testing.T) {
 			},
 			wantReason: "overlapping shard ranges",
 		},
+		{
+			name: "zero allocation generation",
+			shards: []Shard{
+				{ID: "s0", Range: KeyRange{Start: pt(0), End: maxKeyEnd}, Leaders: leader("a")},
+			},
+			wantReason: "zero allocation generation",
+		},
+		{
+			name: "duplicate allocation generation",
+			shards: []Shard{
+				{ID: "s0", AllocationGeneration: 1, Range: KeyRange{Start: pt(0), End: kend(hb(0x80))}, Leaders: leader("a")},
+				{ID: "s1", AllocationGeneration: 1, Range: KeyRange{Start: pt(hb(0x80)), End: maxKeyEnd}, Leaders: leader("b")},
+			},
+			wantReason: "duplicate shard allocation generation",
+		},
 	}
 
 	for _, c := range cases {
@@ -275,11 +292,13 @@ func TestResolvePointTargetBoundariesAndFence(t *testing.T) {
 	mid := pt(hb(0x80))
 	m := mustManifest(t, []Shard{
 		{
-			ID: "s0", Range: KeyRange{Start: KeyspacePoint{}, End: KeyspaceEnd{Point: mid}},
+			ID: "s0", AllocationGeneration: 1,
+			Range:   KeyRange{Start: KeyspacePoint{}, End: KeyspaceEnd{Point: mid}},
 			Leaders: []EndpointID{"ep-0a", "ep-0b"}, Epoch: 11,
 		},
 		{
-			ID: "s1", Range: KeyRange{Start: mid, End: maxKeyEnd},
+			ID: "s1", AllocationGeneration: 2,
+			Range:   KeyRange{Start: mid, End: maxKeyEnd},
 			Leaders: []EndpointID{"ep-1"}, Epoch: 22,
 		},
 	})
@@ -289,10 +308,10 @@ func TestResolvePointTargetBoundariesAndFence(t *testing.T) {
 		p    KeyspacePoint
 		want Target
 	}{
-		{"minimum", KeyspacePoint{}, Target{Shard: "s0", Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
-		{"left of boundary", pt(hb(0x80) - 1), Target{Shard: "s0", Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
-		{"boundary belongs right", mid, Target{Shard: "s1", Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
-		{"maximum", pt(^uint64(0)), Target{Shard: "s1", Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
+		{"minimum", KeyspacePoint{}, Target{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
+		{"left of boundary", pt(hb(0x80) - 1), Target{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
+		{"boundary belongs right", mid, Target{Shard: "s1", AllocationGeneration: 2, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
+		{"maximum", pt(^uint64(0)), Target{Shard: "s1", AllocationGeneration: 2, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -316,8 +335,8 @@ func TestResolvePointTargetBoundariesAndFence(t *testing.T) {
 // relies on.
 func TestManifestImmutability(t *testing.T) {
 	shards := []Shard{
-		{ID: "s0", Range: KeyRange{Start: pt(0), End: kend(hb(0x80))}, Leaders: []EndpointID{"ep-a", "ep-b"}},
-		{ID: "s1", Range: KeyRange{Start: pt(hb(0x80)), End: maxKeyEnd}, Leaders: []EndpointID{"ep-c"}},
+		{ID: "s0", AllocationGeneration: 1, Range: KeyRange{Start: pt(0), End: kend(hb(0x80))}, Leaders: []EndpointID{"ep-a", "ep-b"}},
+		{ID: "s1", AllocationGeneration: 2, Range: KeyRange{Start: pt(hb(0x80)), End: maxKeyEnd}, Leaders: []EndpointID{"ep-c"}},
 	}
 	m, err := NewManifest("dist", 7, shards)
 	if err != nil {
@@ -359,6 +378,29 @@ func TestManifestImmutability(t *testing.T) {
 	}
 	if _, ok := m.ShardInfo(m.ShardCount()); ok {
 		t.Fatal("ShardInfo(ShardCount) reported ok")
+	}
+}
+
+func TestManifestOwnsExactIdentityStringBacking(t *testing.T) {
+	distributionBacking := strings.Repeat("x", 1<<20) + "dist"
+	shardBacking := strings.Repeat("x", 1<<20) + "shard"
+	leaderBacking := strings.Repeat("x", 1<<20) + "endpoint"
+	distributionName := distributionBacking[len(distributionBacking)-len("dist"):]
+	shardID := shardBacking[len(shardBacking)-len("shard"):]
+	leaderID := leaderBacking[len(leaderBacking)-len("endpoint"):]
+
+	manifest, err := NewManifest(DistributionName(distributionName), 1, []Shard{{
+		ID: ShardID(shardID), AllocationGeneration: 1,
+		Range: KeyRange{End: maxKeyEnd}, Leaders: []EndpointID{EndpointID(leaderID)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, _ := manifest.ShardInfo(0)
+	if unsafe.StringData(string(manifest.Distribution())) == unsafe.StringData(distributionName) ||
+		unsafe.StringData(string(shard.ID)) == unsafe.StringData(shardID) ||
+		unsafe.StringData(string(shard.Leaders[0])) == unsafe.StringData(leaderID) {
+		t.Fatal("manifest retained caller identity string backing")
 	}
 }
 

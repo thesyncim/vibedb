@@ -70,16 +70,19 @@ func TestRowsCloseBreaksConnectionStatementRetention(t *testing.T) {
 
 func TestStmtCloseReleasesParsedAndCompiledStorage(t *testing.T) {
 	statement := &stmt{
-		tree:     new(sqlast.Statement),
-		query:    new(query.Statement),
-		mutation: new(query.DMLStatement),
-		params:   3,
+		tree:               new(sqlast.Statement),
+		query:              new(query.Statement),
+		mutation:           new(query.DMLStatement),
+		serialPointSafe:    true,
+		serialMutationSafe: true,
+		params:             3,
 	}
 	if err := statement.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if statement.tree != nil || statement.query != nil ||
 		statement.mutation != nil || statement.primaryPoint ||
+		statement.serialPointSafe || statement.serialMutationSafe ||
 		statement.conn != nil {
 		t.Fatal("closed statement retained parsed or compiled storage")
 	}

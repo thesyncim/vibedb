@@ -506,20 +506,38 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 					s.query.Release()
 					return nil, lockErr
 				}
-				t := c.db.tables[s.query.Collection()]
+				var t *table
+				if c.tx != nil {
+					if layout, exists := c.tx.tableLayoutAtBegin(
+						s.query.Collection(),
+					); exists {
+						t = layout.incarnation
+					} else {
+						t = c.db.tables[s.query.Collection()]
+					}
+				} else {
+					t = c.db.tables[s.query.Collection()]
+				}
 				if t != nil {
 					s.pointPredicate = s.query.DrivingPredicate()
-					s.primaryPoint = isPrimaryPredicate(
-						s.pointPredicate, t.meta.PrimaryKey)
-					if !s.primaryPoint {
-						s.pointPredicate = nil
-					}
+					s.pointPath, s.pointCandidate = primaryPredicateIdentity(
+						s.pointPredicate,
+					)
+					s.serialPointSafe = s.pointCandidate &&
+						serializableDirectRelationSelect(
+							tree.Select, s.query.Collection(),
+						)
+					s.primaryPoint = s.pointCandidate &&
+						s.pointPath == t.meta.PrimaryKey
 				}
 				c.db.mu.RUnlock()
 			}
 		}
 	} else {
 		s.mutation, err = query.PrepareParsedDML(src, tree)
+		if err == nil {
+			s.dependencies = dmlExecutablePhysicalDependencies(tree)
+		}
 		if err == nil && tree.Kind == sqlast.KindInsert &&
 			tree.Insert.Source != nil {
 			s.applyInsertSourceDocumentParams()
@@ -548,6 +566,23 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			s.query, err = query.PrepareParsedStatement(
 				src, tree.Delete.Returning,
 			)
+		}
+		if err == nil {
+			s.serialMutationSafe = serializableDirectMutationShape(tree) &&
+				(s.query == nil || !s.query.RequiresCatalog())
+			if s.serialMutationSafe {
+				var where *sqlast.Expr
+				switch tree.Kind {
+				case sqlast.KindUpdate:
+					where = tree.Update.Filter.Where
+				case sqlast.KindDelete:
+					where = tree.Delete.Filter.Where
+				}
+				if where != nil {
+					s.pointPath, s.pointCandidate =
+						primaryPredicateIdentity(where)
+				}
+			}
 		}
 	}
 	if err != nil {

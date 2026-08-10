@@ -244,7 +244,7 @@ func TestPGWireCorrelatedExistsTransactionSnapshotAndReadYourWrites(t *testing.T
 	outside := dial(t, server)
 	outside.startup(map[string]string{"user": "outside", "database": "app"})
 
-	begin := c.query("BEGIN")
+	begin := c.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
 	requireCorrelatedExistsWireCycle(t, c, begin, statusInTx)
 	for _, statement := range []string{
 		`INSERT INTO ce_wire_outer VALUES (` +

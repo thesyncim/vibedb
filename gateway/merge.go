@@ -47,6 +47,11 @@ var ErrUnmergeableResult = errors.New("gateway: multi-shard result is not a row 
 // width, so a malformed merge specification fails closed rather than panicking.
 var ErrMergeColumn = errors.New("gateway: order key column is out of range for the shard result")
 
+// ErrMergeSchema reports a shard response whose columns or row widths do not
+// match the other responses. Merging such data would silently shift values
+// into the wrong output columns.
+var ErrMergeSchema = errors.New("gateway: shard result schemas do not match")
+
 // scalar kinds, ordered to match the local executor's cross-type total order.
 const (
 	ckNull uint8 = iota
@@ -213,12 +218,28 @@ func compareHeads(a, b *shardRun, order []OrderKey) int {
 // already-ordered shards. A positive limit trims the merged rows. Columns come
 // from the first shard's row frame, and every response must be a row set.
 func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit int) ([]shardservice.Column, [][]shardservice.Cell, error) {
-	for _, resp := range results {
-		if resp.Kind != shardservice.ResponseRows {
-			return nil, nil, ErrUnmergeableResult
-		}
+	if len(results) == 0 {
+		return nil, nil, nil
 	}
 	columns := results[0].Columns
+	for _, resp := range results {
+		if resp == nil || resp.Kind != shardservice.ResponseRows {
+			return nil, nil, ErrUnmergeableResult
+		}
+		if len(resp.Columns) != len(columns) {
+			return nil, nil, ErrMergeSchema
+		}
+		for i := range columns {
+			if resp.Columns[i] != columns[i] {
+				return nil, nil, ErrMergeSchema
+			}
+		}
+		for _, row := range resp.Rows {
+			if len(row) != len(columns) {
+				return nil, nil, ErrMergeSchema
+			}
+		}
+	}
 	if len(order) == 0 {
 		return columns, concatRows(results, limit), nil
 	}

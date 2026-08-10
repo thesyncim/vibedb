@@ -298,14 +298,14 @@ func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 		return errors.New("vibedb: Database.Update requires a function")
 	}
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if len(d.collections) == 0 {
-		batch := &DatabaseBatch{byName: map[string]*WriteBatch{}}
-		return fn(batch)
-	}
 	participants := make([]*Collection, 0, len(d.collections))
 	for _, collection := range d.collections {
 		participants = append(participants, collection)
+	}
+	d.mu.RUnlock()
+	if len(participants) == 0 {
+		batch := &DatabaseBatch{byName: map[string]*WriteBatch{}}
+		return fn(batch)
 	}
 	return UpdateCollections(participants, fn)
 }

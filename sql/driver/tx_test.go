@@ -303,7 +303,9 @@ func TestTransactionRepeatableReadsExcludeConcurrentPhantoms(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"base","kind":"x","name":"before"}`); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,9 +716,13 @@ func TestTransactionIsolationLevelContract(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.BeginTx(context.Background(),
-		&stdsql.TxOptions{Isolation: stdsql.LevelSerializable}); err == nil {
-		t.Fatal("LevelSerializable was accepted")
+	serializable, err := db.BeginTx(context.Background(),
+		&stdsql.TxOptions{Isolation: stdsql.LevelSerializable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serializable.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 	tx, err := db.BeginTx(context.Background(),
 		&stdsql.TxOptions{Isolation: stdsql.LevelSnapshot})
@@ -1141,12 +1147,12 @@ func TestTransactionOversizedValuesNeverEnterPendingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection.tx = rolledBack
-	rolledState := rolledBack.tables["docs"]
 	if _, err := rolledBack.execMutation(
 		insert, []any{tooLarge},
 	); !errors.Is(err, durable.ErrDocumentTooLarge) {
 		t.Fatalf("rollback oversized INSERT = %v, want ErrDocumentTooLarge", err)
 	}
+	rolledState := rolledBack.tables["docs"]
 	assertEmptyTransactionPending(t, rolledState)
 	if err := rolledBack.Rollback(); err != nil {
 		t.Fatal(err)
@@ -1350,6 +1356,14 @@ func beginRawDocsTransaction(
 		t.Fatal(err)
 	}
 	connection.tx = transaction
+	if err := transaction.refreshStatementCut(
+		context.Background(), "docs",
+		[]physicalDependency{{name: "docs"}}, nil,
+	); err != nil {
+		_ = transaction.Rollback()
+		_ = database.close()
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		if !transaction.done {
 			_ = transaction.Rollback()

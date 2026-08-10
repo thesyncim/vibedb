@@ -45,6 +45,76 @@ func TestSavepointFailedTransactionRecoveryTranscript(t *testing.T) {
 	}
 }
 
+func TestSavepointReadOnlyTransactionRecovery(t *testing.T) {
+	c := connectSQLCatalog(t)
+	requireWireOK(t, c.query(`CREATE TABLE docs (
+		id STRING PRIMARY KEY, name STRING NOT NULL)`))
+
+	assertReadyStatus(t, requireQueryReady(t, c,
+		`BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY`), statusInTx)
+	assertReadyStatus(t, requireQueryReady(t, c, `SAVEPOINT write_safe`), statusInTx)
+	write := c.query(`INSERT INTO docs (id, name) VALUES ('nope', 'no')`)
+	expectError(t, write, sqlstateReadOnlyTransaction)
+	assertReadyStatus(t, write, statusFailedT)
+	assertReadyStatus(t,
+		requireQueryReady(t, c, `ROLLBACK TO write_safe`), statusInTx)
+	assertReadyStatus(t,
+		requireQueryReady(t, c, `RELEASE write_safe`), statusInTx)
+
+	assertReadyStatus(t, requireQueryReady(t, c, `SAVEPOINT ddl_safe`), statusInTx)
+	ddl := c.query(`CREATE TABLE extra (id STRING PRIMARY KEY)`)
+	expectError(t, ddl, sqlstateReadOnlyTransaction)
+	assertReadyStatus(t, ddl, statusFailedT)
+	assertReadyStatus(t,
+		requireQueryReady(t, c, `ROLLBACK TO ddl_safe`), statusInTx)
+	assertReadyStatus(t,
+		requireQueryReady(t, c, `RELEASE ddl_safe`), statusInTx)
+	if got := jsonStringColumn(t, requireSelect(t, c,
+		`SELECT id FROM docs ORDER BY id`)); len(got) != 0 {
+		t.Fatalf("read-only recovery rows = %v, want none", got)
+	}
+	assertReadyStatus(t, requireQueryReady(t, c, `COMMIT`), statusIdle)
+}
+
+func TestSavepointDuplicateNameShadowsAndReleaseReveals(t *testing.T) {
+	c := connectSQLCatalog(t)
+	requireWireOK(t, c.query(`CREATE TABLE docs (
+		id STRING PRIMARY KEY, name STRING NOT NULL)`))
+
+	assertReadyStatus(t, requireQueryReady(t, c, `BEGIN`), statusInTx)
+	assertReadyStatus(t, requireQueryReady(t, c, `SAVEPOINT mark`), statusInTx)
+	requireWireOK(t, c.query(
+		`INSERT INTO docs (id, name) VALUES ('outer', 'kept')`))
+	assertReadyStatus(t, requireQueryReady(t, c, `SAVEPOINT mark`), statusInTx)
+	requireWireOK(t, c.query(
+		`INSERT INTO docs (id, name) VALUES ('inner', 'rewound')`))
+	assertReadyStatus(t, requireQueryReady(t, c, `ROLLBACK TO mark`), statusInTx)
+	assertSavepointWireKeys(t, c, []string{"outer"})
+
+	// ROLLBACK TO retains the newest mark for another rewind.
+	requireWireOK(t, c.query(
+		`INSERT INTO docs (id, name) VALUES ('retry', 'rewound again')`))
+	assertReadyStatus(t, requireQueryReady(t, c, `ROLLBACK TO mark`), statusInTx)
+	assertSavepointWireKeys(t, c, []string{"outer"})
+
+	// RELEASE removes the newest mark and reveals the earlier homonym.
+	assertReadyStatus(t, requireQueryReady(t, c, `RELEASE mark`), statusInTx)
+	assertReadyStatus(t, requireQueryReady(t, c, `ROLLBACK TO mark`), statusInTx)
+	assertSavepointWireKeys(t, c, nil)
+	assertReadyStatus(t, requireQueryReady(t, c, `RELEASE mark`), statusInTx)
+	assertReadyStatus(t, requireQueryReady(t, c, `COMMIT`), statusIdle)
+	assertSavepointWireKeys(t, c, nil)
+}
+
+func assertSavepointWireKeys(t *testing.T, c *testClient, want []string) {
+	t.Helper()
+	got := jsonStringColumn(t, requireSelect(t, c,
+		`SELECT id FROM docs ORDER BY id`))
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("savepoint keys = %v, want %v", got, want)
+	}
+}
+
 func TestSavepointPgxStyleNestedBeginFlow(t *testing.T) {
 	c := connectSQLCatalog(t)
 	requireWireOK(t, c.query(`CREATE TABLE docs (

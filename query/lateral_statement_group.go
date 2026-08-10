@@ -529,7 +529,9 @@ func (l *statementLateral) aggregateOutputCell(
 	value := l.slots[output.binding].value
 	switch output.agg {
 	case sqlast.AggCount:
-		if !present(value) {
+		// COUNT(expr) excludes both a missing binding and an explicit JSON
+		// null; present is intentionally broader for EXISTS/IS PRESENT.
+		if value.kind == kindNull {
 			count = 0
 		}
 		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(count)}, nil

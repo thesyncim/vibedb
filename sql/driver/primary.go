@@ -32,18 +32,30 @@ func primaryPredicateKeys(
 // point predicate. Prepared SELECT statements cache this result, so their hot
 // path only binds operands and never renders the JSON path again.
 func isPrimaryPredicate(where *sqlast.Expr, primaryKey string) bool {
-	if where == nil || where.Path == nil ||
-		string(where.Path.AppendPointer(nil)) != primaryKey {
-		return false
+	path, candidate := primaryPredicateIdentity(where)
+	return candidate && path == primaryKey
+}
+
+// primaryPredicateIdentity captures the immutable shape and rendered path of a
+// possible point predicate once at prepare time. Execution can then revalidate
+// it against the current table incarnation with a string comparison and no
+// allocation.
+func primaryPredicateIdentity(where *sqlast.Expr) (path string, candidate bool) {
+	if where == nil || where.Path == nil {
+		return "", false
 	}
 	switch where.Kind {
 	case sqlast.ExprCompare:
-		return where.Op == sqlast.OpEq && where.Subquery == nil
+		candidate = where.Op == sqlast.OpEq && where.Subquery == nil
 	case sqlast.ExprIn:
-		return !where.Negated && where.Subquery == nil
+		candidate = !where.Negated && where.Subquery == nil
 	default:
-		return false
+		return "", false
 	}
+	if !candidate {
+		return "", false
+	}
+	return string(where.Path.AppendPointer(nil)), true
 }
 
 // bindPrimaryPredicateKeys binds a predicate already proven by

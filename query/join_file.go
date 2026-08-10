@@ -485,10 +485,8 @@ func (p *plan) runFileJoinedBatched(
 	// The durable driving scan has its own bounded batch/merge frontier. The
 	// joined side is bound before that scan exists, so arm the configured
 	// admission account for its data-dependent candidate plan, membership,
-	// Bloom filter, and containment tapes. Its schema- and row-bounded scratch
-	// batch uses the same value as an independent target, matching the durable
-	// MemoryBytes contract rather than pretending fixed batches are resident
-	// capacity in this account.
+	// Bloom filter, containment tapes, and retained inner-batch high water.
+	// All of those capacities coexist until the joined execution finishes.
 	e.Workspace.heapWorkBudget.begin(n.memoryBytes)
 	if err := p.bindFileJoins(
 		&e.Workspace, snapshot, catalog,
@@ -653,13 +651,11 @@ func (j *planJoin) collectFile(
 	f.keys = f.keys[:0]
 	f.keyText = f.keyText[:0]
 	f.batchRows = 0
+	// Batch capacities coexist with candidate planning and retained join
+	// membership. Charge their high-water growth directly to the statement
+	// account before each append; a child budget would either hide that sum or
+	// report a misleading remainder-local limit.
 	var batchBudget fileJoinBatchBudget
-	var batchWork heapWorkBudget
-	var batchAccount *heapWorkBudget
-	if workBudget != nil {
-		batchWork.begin(workBudget.limit)
-		batchAccount = &batchWork
-	}
 
 	needKeys := j.innerPath == joinPrimaryKey
 	over := false
@@ -668,7 +664,7 @@ func (j *planJoin) collectFile(
 			return err
 		}
 		if err := batchBudget.admitRow(
-			batchAccount, j.inner, key, value, needKeys,
+			workBudget, j.inner, key, value, needKeys,
 		); err != nil {
 			return err
 		}

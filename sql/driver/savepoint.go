@@ -29,19 +29,11 @@ func (t *tx) savepoint(name string) error {
 	if t.done {
 		return fmt.Errorf("vibedb: transaction is finished")
 	}
-	if t.readOnly {
-		return ErrReadOnlyTransaction
-	}
 	if name == "" {
 		return fmt.Errorf("vibedb: SAVEPOINT requires a name")
 	}
-	// Duplicate names replace: erase LIFO through the prior mark, then push a
-	// new frame at the current overlay watermarks (PostgreSQL semantics).
-	if _, found := t.savepointIndex(name); found {
-		if err := t.releaseSavepoint(name); err != nil {
-			return err
-		}
-	}
+	// A duplicate appends another frame. Reverse lookup makes it shadow the
+	// earlier homonym until RELEASE removes the newer frame.
 	if len(t.savepoints) >= maxSavepointFrames {
 		return fmt.Errorf(
 			"%w: at most %d SAVEPOINT marks per transaction",
@@ -61,6 +53,29 @@ func (t *tx) savepoint(name string) error {
 	}
 	t.savepoints = append(t.savepoints, frame)
 	return nil
+}
+
+// attachTableToSavepoints extends every live mark when Read Committed first
+// materializes a dependency after the mark was created. The state is empty at
+// installation, so zero is the exact pre-statement overlay watermark for every
+// frame. A later ROLLBACK TO therefore removes writes to lazily touched tables
+// just as it does for tables materialized before SAVEPOINT.
+func (t *tx) attachTableToSavepoints(state *txTable) {
+	if state == nil || len(t.savepoints) == 0 {
+		return
+	}
+	for i := range t.savepoints {
+		frame := &t.savepoints[i]
+		if frame.tables == nil {
+			frame.tables = make(map[string]*savepointTableMark)
+		}
+		if frame.tables[state.name] != nil {
+			continue
+		}
+		frame.tables[state.name] = &savepointTableMark{
+			undo: make(map[string]*txMutation),
+		}
+	}
 }
 
 func (t *tx) releaseSavepoint(name string) error {
@@ -163,6 +178,7 @@ func restoreSavepointTable(state *txTable, mark *savepointTableMark) {
 		}
 		entry.existed = previous.existed
 		entry.remove = previous.remove
+		entry.conflictRevision = previous.conflictRevision
 		if previous.remove {
 			entry.document = nil
 		} else {
@@ -178,7 +194,10 @@ func cloneTxMutation(src *txMutation) *txMutation {
 	if src == nil {
 		return nil
 	}
-	dst := &txMutation{remove: src.remove, existed: src.existed}
+	dst := &txMutation{
+		remove: src.remove, existed: src.existed,
+		conflictRevision: src.conflictRevision,
+	}
 	if len(src.document) != 0 {
 		dst.document = append([]byte(nil), src.document...)
 	}

@@ -275,6 +275,11 @@ func TestTransactionInsertSelectStagesExactNativeRecordSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	tx := session.conn.tx
+	if err := tx.beginMutationStatement(
+		ctx, prepared.statement.mutation, prepared.statement,
+	); err != nil {
+		t.Fatal(err)
+	}
 	state := tx.tables["publication_tx_target"]
 	var account insertSelectStageAccount
 	staged, err := tx.stageInsertSelect(
@@ -295,6 +300,11 @@ func TestTransactionInsertSelectStagesExactNativeRecordSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := session.Begin(ctx, TxOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.conn.tx.beginMutationStatement(
+		ctx, prepared.statement.mutation, prepared.statement,
+	); err != nil {
 		t.Fatal(err)
 	}
 	var below insertSelectStageAccount
@@ -597,6 +607,11 @@ func probeInsertSelectReturningBudget(
 			tb.Fatal(err)
 		}
 		tx := session.conn.tx
+		if err := tx.beginMutationStatement(
+			ctx, prepared.statement.mutation, prepared.statement,
+		); err != nil {
+			tb.Fatal(err)
+		}
 		state := tx.tables[prepared.statement.mutation.Collection()]
 		var account insertSelectStageAccount
 		staged, err := tx.stageInsertSelect(
@@ -739,7 +754,7 @@ func appendPublicationDocuments(
 func publicationRoutingBinding(tb testing.TB) *placementBinding {
 	tb.Helper()
 	manifest, err := distribution.NewManifest("publication", 1, []distribution.Shard{{
-		ID: "s0",
+		ID: "s0", AllocationGeneration: 1,
 		Range: distribution.KeyRange{
 			Start: distribution.KeyspacePoint{},
 			End:   distribution.KeyspaceEnd{Max: true},

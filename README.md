@@ -244,10 +244,12 @@ blindly retrying.
 
 - The project is unreleased; APIs and storage format version 0 are unstable.
 - DDL is atomic per statement but is not transactional.
-- Transactions provide snapshot isolation; write skew is possible because the
-  read set is not validated. Conflict detection covers handle-mediated writes
-  on the same `vibedb.Database`, `*sql.DB`, or pgwire endpoint — not writers
-  through a different handle to the same files.
+- Native read-write transactions are serializable. SQL and pgwire transactions
+  default to Read Committed, with explicit Repeatable Read/Snapshot and
+  Serializable modes. Conflict detection covers handle-mediated writes on the
+  same `vibedb.Database`, `*sql.DB`, or pgwire endpoint — not writers through a
+  different handle to the same files. Logical revisions, not wall-clock time,
+  order conflict checks.
 - An aborted transaction that wrote to a table absent at BEGIN can leave that
   empty table in the catalog; it holds no documents but is user-visible
   residue.
@@ -280,6 +282,20 @@ embedded facade:
   cross-shard routing identity; and
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server
   tier.
+
+Every shard catalog must be created explicitly with `vibedb-shard init`. Its
+write-once SQL catalog identity binds the distribution, shard ID, and
+topology-issued allocation generation to a random local LogID; `serve` opens
+existing bound stores only, and generic SQL opens reject them. This prevents
+accidental local rebinding. Before a server starts, it also durably advances
+nonzero ownership-epoch and routing-version high-waters and holds the only live
+serving claim for that exact open store until all connections drain. Regressed
+coordinates and a second local server fail closed. This is same-store local
+fencing, not a lease, election, or replication authority: it cannot revoke a
+running process over another store handle, distinguish or revoke a copied
+store, police a trusted caller opening direct SQL sessions on the same
+`Database`, or prove that a replica is caught up. The shard server itself does
+not release its claim until its owned sessions drain.
 
 The shard service, gateway, and their binaries are server-only and not part of
 the embedded API. The one embedded touch point is opt-in and carries no

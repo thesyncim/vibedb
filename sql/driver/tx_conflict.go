@@ -12,6 +12,11 @@ import (
 // exact per-key semantics.
 const txConflictHistoryKeys = txnclock.HistoryKeys
 
+const (
+	txSerializableReadKeys  = txnclock.HistoryKeys
+	txSerializableReadBytes = 1 << 20
+)
+
 // txConflictClock is the SQL driver's always-armed view of txnclock.Clock.
 //
 // Every method is called with database.mu held. The driver arms once on the
@@ -50,6 +55,14 @@ func (c *txConflictClock) conflict(
 	keys []string,
 ) (key string, historyOverflow, conflict bool) {
 	return c.clock.Conflict(begin, keys)
+}
+
+func (c *txConflictClock) changedSince(begin uint64) bool {
+	return c.clock.ChangedSince(begin)
+}
+
+func (c *txConflictClock) observe() uint64 {
+	return c.clock.Observe()
 }
 
 func (c *txConflictClock) finish(begin uint64) {

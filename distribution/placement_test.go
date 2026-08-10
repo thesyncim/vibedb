@@ -109,6 +109,14 @@ func TestClusterConfigValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "nil manifest",
+			cfg: ClusterConfig{
+				Distributions: []DistributionSpec{{Name: "tenant_data", Arity: 1, MapperVersion: NativeMapperVersion}},
+				Manifests:     []*Manifest{nil},
+			},
+			wantErr: true,
+		},
+		{
 			name: "empty table name",
 			cfg: ClusterConfig{
 				Distributions: []DistributionSpec{{Name: "tenant_data", Arity: 1, MapperVersion: NativeMapperVersion}},

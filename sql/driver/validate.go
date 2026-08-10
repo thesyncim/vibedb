@@ -139,6 +139,11 @@ func (w *selectTableValidation) selectStmt(selectStmt *sqlast.SelectStmt) error 
 		default:
 			return fmt.Errorf("vibedb: unsupported relation kind %d", relation.Kind)
 		}
+		if relation.On != nil {
+			if err := validateExprSubqueries(relation.On.Expr, w.selectStmt); err != nil {
+				return err
+			}
+		}
 	}
 	validate := func(query *sqlast.SelectStmt) error {
 		return w.selectStmt(query)
@@ -172,7 +177,7 @@ func (w *selectTableValidation) setExpr(expression *sqlast.SetExpr) error {
 
 func (c *conn) selectTableExists(name string) bool {
 	if c.tx != nil {
-		if _, exists := c.tx.tables[name]; exists {
+		if _, exists := c.tx.tableLayoutAtBegin(name); exists {
 			return true
 		}
 	}

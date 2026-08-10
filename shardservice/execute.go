@@ -69,6 +69,10 @@ func (c *shardConn) loop() error {
 // other decode failure consumed exactly one framed body and left the stream
 // aligned on the next frame.
 func isFramingError(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
 	return errors.Is(err, errBadTag) ||
 		errors.Is(err, errBadLength) ||
 		errors.Is(err, errFrameTooLarge) ||
@@ -156,7 +160,14 @@ func (c *shardConn) executeQuery(
 	prep *sqldriver.Prepared,
 	args []any,
 ) *ShardResponse {
-	if err := c.sess.Begin(ctx, sqldriver.TxOptions{ReadOnly: true}); err != nil {
+	// A request is one statement-level snapshot. The SQL runtime defaults to
+	// Read Committed, which refreshes the committed base before each statement;
+	// pin this read-only transaction explicitly so a concurrent write cannot
+	// leak into a result whose execution has already begun.
+	if err := c.sess.Begin(ctx, sqldriver.TxOptions{
+		ReadOnly:  true,
+		Isolation: sqldriver.IsolationRepeatableRead,
+	}); err != nil {
 		return classifyError(err)
 	}
 	// Release the snapshot unconditionally; a canceled request context must not
@@ -240,19 +251,27 @@ func runtimeArgs(params []Param) []any {
 func (s *Server) resultLimits(req *ShardRequest) (rows int, bytes int64) {
 	rows = s.opts.MaxResultRows
 	if req.MaxRows != 0 {
+		requested := req.MaxRows
 		if req.MaxRows > uint64(math.MaxInt32) {
-			rows = math.MaxInt32
-		} else {
-			rows = int(req.MaxRows)
+			requested = math.MaxInt32
 		}
+		if s.opts.MaxResultRows != UnlimitedResults &&
+			requested > uint64(s.opts.MaxResultRows) {
+			requested = uint64(s.opts.MaxResultRows)
+		}
+		rows = int(requested)
 	}
 	bytes = s.opts.MaxResultBytes
 	if req.MaxResultBytes != 0 {
+		requested := req.MaxResultBytes
 		if req.MaxResultBytes > uint64(math.MaxInt64) {
-			bytes = math.MaxInt64
-		} else {
-			bytes = int64(req.MaxResultBytes)
+			requested = math.MaxInt64
 		}
+		if s.opts.MaxResultBytes != UnlimitedResults &&
+			requested > uint64(s.opts.MaxResultBytes) {
+			requested = uint64(s.opts.MaxResultBytes)
+		}
+		bytes = int64(requested)
 	}
 	return rows, bytes
 }

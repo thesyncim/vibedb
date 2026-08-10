@@ -27,9 +27,15 @@ type serveShard struct {
 // returns the shard's endpoint, ownership, and bound address.
 func startShard(t *testing.T, endpoint distribution.EndpointID, own shardservice.Ownership) serveShard {
 	t.Helper()
-	db, err := sqldriver.Open(filepath.Join(t.TempDir(), string(own.Shard)+".vdb"))
+	db, err := sqldriver.InitializeShardStore(
+		filepath.Join(t.TempDir(), string(own.Shard)+".vdb"),
+		sqldriver.ShardStoreBinding{
+			Distribution: own.Distribution, Shard: own.Shard,
+			AllocationGeneration: own.AllocationGeneration,
+		},
+	)
 	if err != nil {
-		t.Fatalf("Open %s: %v", own.Shard, err)
+		t.Fatalf("InitializeShardStore %s: %v", own.Shard, err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	srv, err := shardservice.NewServer(db, own, shardservice.Options{})
@@ -50,12 +56,13 @@ func seedShard(t *testing.T, c *gateway.Client, sh serveShard, stmts ...string) 
 	t.Helper()
 	for _, sql := range stmts {
 		req := &shardservice.ShardRequest{
-			SQL:            sql,
-			Distribution:   sh.own.Distribution,
-			Shard:          sh.own.Shard,
-			RoutingVersion: sh.own.RoutingVersion,
-			OwnershipEpoch: sh.own.Epoch,
-			ExecutionMode:  shardservice.ExecutionReadWrite,
+			SQL:                  sql,
+			Distribution:         sh.own.Distribution,
+			Shard:                sh.own.Shard,
+			AllocationGeneration: sh.own.AllocationGeneration,
+			RoutingVersion:       sh.own.RoutingVersion,
+			OwnershipEpoch:       sh.own.Epoch,
+			ExecutionMode:        shardservice.ExecutionReadWrite,
 		}
 		if _, err := c.Do(context.Background(), sh.address, req); err != nil {
 			t.Fatalf("seed %q on %s: %v", sql, sh.own.Shard, err)
@@ -69,8 +76,8 @@ func seedShard(t *testing.T, c *gateway.Client, sh serveShard, stmts ...string) 
 // and that the listener shuts down cleanly on cancellation.
 func TestServeGatewayEndToEnd(t *testing.T) {
 	const version = distribution.RoutingVersion(3)
-	shardA := startShard(t, "ep-a", shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", Epoch: 7, RoutingVersion: version})
-	shardB := startShard(t, "ep-b", shardservice.Ownership{Distribution: "tenant_data", Shard: "80-", Epoch: 9, RoutingVersion: version})
+	shardA := startShard(t, "ep-a", shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", AllocationGeneration: 1, Epoch: 7, RoutingVersion: version})
+	shardB := startShard(t, "ep-b", shardservice.Ownership{Distribution: "tenant_data", Shard: "80-", AllocationGeneration: 2, Epoch: 9, RoutingVersion: version})
 
 	client := gateway.NewClient(nil)
 	seedShard(t, client, shardA,
@@ -84,8 +91,8 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 
 	// Persist a catalog generation pinning the two endpoints to their addresses.
 	shards := []distribution.Shard{
-		{ID: "-80", Range: keyRange(0x00, false, 0x80), Leaders: []distribution.EndpointID{shardA.endpoint}, Epoch: 7},
-		{ID: "80-", Range: keyRange(0x80, true, 0x00), Leaders: []distribution.EndpointID{shardB.endpoint}, Epoch: 9},
+		{ID: "-80", AllocationGeneration: 1, Range: keyRange(0x00, false, 0x80), Leaders: []distribution.EndpointID{shardA.endpoint}, Epoch: 7},
+		{ID: "80-", AllocationGeneration: 2, Range: keyRange(0x80, true, 0x00), Leaders: []distribution.EndpointID{shardB.endpoint}, Epoch: 9},
 	}
 	man, err := distribution.NewManifest("tenant_data", version, shards)
 	if err != nil {
@@ -175,10 +182,10 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 func TestNewGatewayReloadsCatalogAfterStaleRefusal(t *testing.T) {
 	const liveVersion = distribution.RoutingVersion(4)
 	shardA := startShard(t, "ep-a", shardservice.Ownership{
-		Distribution: "tenant_data", Shard: "-80", Epoch: 7, RoutingVersion: liveVersion,
+		Distribution: "tenant_data", Shard: "-80", AllocationGeneration: 1, Epoch: 7, RoutingVersion: liveVersion,
 	})
 	shardB := startShard(t, "ep-b", shardservice.Ownership{
-		Distribution: "tenant_data", Shard: "80-", Epoch: 9, RoutingVersion: liveVersion,
+		Distribution: "tenant_data", Shard: "80-", AllocationGeneration: 2, Epoch: 9, RoutingVersion: liveVersion,
 	})
 	client := gateway.NewClient(nil)
 	seedShard(t, client, shardA,
@@ -191,8 +198,8 @@ func TestNewGatewayReloadsCatalogAfterStaleRefusal(t *testing.T) {
 	makeSnapshot := func(generation uint64, version distribution.RoutingVersion) *gateway.Snapshot {
 		t.Helper()
 		man, err := distribution.NewManifest("tenant_data", version, []distribution.Shard{
-			{ID: "-80", Range: keyRange(0x00, false, 0x80), Leaders: []distribution.EndpointID{shardA.endpoint}, Epoch: 7},
-			{ID: "80-", Range: keyRange(0x80, true, 0x00), Leaders: []distribution.EndpointID{shardB.endpoint}, Epoch: 9},
+			{ID: "-80", AllocationGeneration: 1, Range: keyRange(0x00, false, 0x80), Leaders: []distribution.EndpointID{shardA.endpoint}, Epoch: 7},
+			{ID: "80-", AllocationGeneration: 2, Range: keyRange(0x80, true, 0x00), Leaders: []distribution.EndpointID{shardB.endpoint}, Epoch: 9},
 		})
 		if err != nil {
 			t.Fatalf("NewManifest: %v", err)

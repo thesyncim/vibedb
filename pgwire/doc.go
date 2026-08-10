@@ -109,8 +109,9 @@
 //     SAVEPOINT / RELEASE / ROLLBACK TO (including recovery from a failed
 //     transaction back to status T), multi-table writes in explicit and
 //     implicit transactions, read-your-writes, rollback, failed-transaction
-//     behavior, read-only mode, and implicit atomic batches for non-DDL
-//     stored-row statements.
+//     behavior, read-only mode, READ COMMITTED (the default), REPEATABLE READ,
+//     SERIALIZABLE, and implicit atomic batches for non-DDL stored-row
+//     statements.
 //
 // # What does not work
 //
@@ -122,8 +123,7 @@
 //     Extended DDL publishes at Execute; if a client violates that boundary by
 //     executing a later command before Sync, the later command is refused but
 //     cannot retroactively roll back the completed DDL.
-//   - Chained transactions (COMMIT AND CHAIN / ROLLBACK AND CHAIN) and
-//     isolation modes other than the runtime's REPEATABLE READ snapshot.
+//   - Chained transactions (COMMIT AND CHAIN / ROLLBACK AND CHAIN).
 //     Read-only and read-write transaction access modes are supported.
 //   - pg_catalog and information_schema as queryable tables. There are no
 //     catalog tables; see above. psql's basic meta-commands (\l, \dn, \dt,

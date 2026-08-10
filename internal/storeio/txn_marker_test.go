@@ -538,7 +538,7 @@ func TestTxnMarkerFull(t *testing.T) {
 }
 
 func TestTxnMarkerEmptyScanDoesNotAllocate(t *testing.T) {
-	m, _ := createTestTxnMarker(t, 2<<20)
+	m, path := createTestTxnMarker(t, 2<<20)
 	defer m.Close()
 	var decisions TxnDecisions
 	var scanErr error
@@ -549,5 +549,83 @@ func TestTxnMarkerEmptyScanDoesNotAllocate(t *testing.T) {
 	}
 	if scanErr != nil {
 		t.Fatal(scanErr)
+	}
+	wantDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir = filepath.Clean(wantDir)
+	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
+		wantDir = filepath.Clean(resolved)
+	}
+	if decisions.SourceDir() != wantDir {
+		t.Fatalf("source directory = %q, want %q", decisions.SourceDir(), wantDir)
+	}
+}
+
+func TestTxnMarkerCanonicalDirectoryFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "txn.vtm")
+	if _, err := canonicalTxnMarkerDir(path); err == nil {
+		t.Fatal("canonical transaction directory accepted an unresolved path")
+	}
+}
+
+func TestTxnMarkerRejectsLeafSymlink(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.vtm")
+	marker, err := CreateTxnMarker(realPath, TxnMarkerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(dir, "txn.vtm")
+	if err := os.Symlink(filepath.Base(realPath), linkPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, _, err := OpenTxnMarker(linkPath, TxnMarkerOptions{}); err == nil {
+		t.Fatal("transaction marker accepted a leaf symlink")
+	}
+}
+
+func TestTxnMarkerRemoveUsesPinnedDirectory(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	link := filepath.Join(t.TempDir(), "database")
+	if err := os.Symlink(dirA, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	pathA := filepath.Join(link, "txn.vtm")
+	markerA, err := CreateTxnMarker(pathA, TxnMarkerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathB := filepath.Join(dirB, "txn.vtm")
+	markerB, err := CreateTxnMarker(pathB, TxnMarkerOptions{})
+	if err != nil {
+		_ = markerA.Close()
+		t.Fatal(err)
+	}
+	if err := markerB.Close(); err != nil {
+		_ = markerA.Close()
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		_ = markerA.Close()
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dirB, link); err != nil {
+		_ = markerA.Close()
+		t.Fatal(err)
+	}
+	if err := markerA.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dirA, "txn.vtm")); !os.IsNotExist(err) {
+		t.Fatalf("original marker after remove: %v", err)
+	}
+	if _, err := os.Stat(pathB); err != nil {
+		t.Fatalf("retarget marker was removed: %v", err)
 	}
 }

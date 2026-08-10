@@ -154,7 +154,7 @@ func TestSQLLateralCorrelatedAggregateExactDecimalsNullMissingAndContainers(t *t
 	t.Cleanup(exec.Release)
 	want := []string{
 		`1,2,18014398509481986.0000000000000000002,9007199254740993,9007199254740993.0000000000000000001`,
-		`2,1,null,null,null`,
+		`2,0,null,null,null`,
 		`3,0,null,null,null`,
 		`4,1,null,null,null`,
 	}

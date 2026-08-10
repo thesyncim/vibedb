@@ -54,6 +54,7 @@ func TestAcceptanceEpochAdmissionNoExecution(t *testing.T) {
 	}{
 		{"wrong_distribution", func(r *ShardRequest) { r.Distribution = "other_tenant" }, ErrorNotOwner},
 		{"wrong_shard", func(r *ShardRequest) { r.Shard = "80-" }, ErrorNotOwner},
+		{"stale_allocation_generation", func(r *ShardRequest) { r.AllocationGeneration-- }, ErrorShardAllocation},
 		{"stale_routing_version", func(r *ShardRequest) { r.RoutingVersion = 2 }, ErrorRoutingVersion},
 		{"stale_epoch", func(r *ShardRequest) { r.OwnershipEpoch = 6 }, ErrorOwnershipEpoch},
 	}
@@ -110,7 +111,10 @@ func TestAcceptanceReadSnapshotPinned(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 	defer reader.Close()
-	if err := reader.Begin(context.Background(), sqldriver.TxOptions{ReadOnly: true}); err != nil {
+	if err := reader.Begin(context.Background(), sqldriver.TxOptions{
+		ReadOnly:  true,
+		Isolation: sqldriver.IsolationRepeatableRead,
+	}); err != nil {
 		t.Fatalf("Begin(ReadOnly): %v", err)
 	}
 	if n := countRows(t, reader, `SELECT id FROM docs`); n != 1 {
@@ -264,6 +268,7 @@ func TestAcceptanceMalformedFraming(t *testing.T) {
 			e.str("SELECT id FROM docs")
 			e.str(string(own.Distribution))
 			e.str(string(own.Shard))
+			e.u64(uint64(own.AllocationGeneration))
 			e.u64(uint64(own.RoutingVersion))
 			e.u64(uint64(own.Epoch))
 			e.u8(uint8(ReadStrong))
@@ -344,12 +349,14 @@ func TestAcceptanceResourceLimits(t *testing.T) {
 // typed parameters only — never a serialized plan or program — and the shard
 // re-parses the text locally.
 func TestAcceptanceNoSerializedPlan(t *testing.T) {
-	// (1) The request type carries only SQL text, typed params, ownership
-	// coordinates, and execution bounds — no plan-shaped field.
+	// (1) The request type carries only SQL text, typed params, ownership and
+	// optional session-position coordinates, and execution bounds — no
+	// plan-shaped field.
 	reqFields := structFieldNames(reflect.TypeOf(ShardRequest{}))
 	assertFieldSet(t, "ShardRequest", reqFields, map[string]bool{
 		"SQL": true, "Params": true, "Distribution": true, "Shard": true,
-		"RoutingVersion": true, "OwnershipEpoch": true, "ReadPolicy": true,
+		"AllocationGeneration": true, "RoutingVersion": true, "OwnershipEpoch": true,
+		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
 	})

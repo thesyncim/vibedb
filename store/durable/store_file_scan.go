@@ -450,13 +450,21 @@ func (c *Collection) visitRangeRawCurrentBaseUntil(
 // borrowed only for the callback; overflow values reuse one bounded buffer.
 // Returning an error stops the scan immediately.
 func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
-	_, err := s.RangeRawBuffer(nil, fn)
+	if s == nil {
+		return ErrClosed
+	}
+	scratch, err := s.rangePrimaryGraphBuffer(
+		nil, nil, nil, s.overflowScanValue, fn,
+	)
+	s.overflowScanValue = scratch
 	return err
 }
 
-// RangeRawBuffer is RangeRaw with caller-owned overflow storage. The returned
-// slice preserves any grown capacity for the next scan. Inline-only scans and
-// warmed overflow scans allocate nothing when scratch has sufficient capacity.
+// RangeRawBuffer is RangeRaw with optional caller-owned overflow storage. When
+// scratch is nil, the snapshot retains the grown buffer for subsequent scans;
+// when scratch is non-nil, the returned slice preserves its grown capacity for
+// the caller. Inline-only scans and warmed overflow scans allocate nothing when
+// the selected scratch has sufficient capacity.
 func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return scratch, ErrClosed
@@ -464,7 +472,14 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	if fn == nil {
 		return scratch, nil
 	}
-	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
+	if scratch == nil {
+		retained, err := s.rangePrimaryGraphBuffer(
+			nil, nil, nil, s.overflowScanValue, fn,
+		)
+		s.overflowScanValue = retained
+		return nil, err
+	}
+	return s.rangePrimaryGraphBuffer(nil, nil, nil, scratch, fn)
 }
 
 // rangePrimaryGraph is the ordered-primary scan core. lower is inclusive,
@@ -473,6 +488,17 @@ func (s *Snapshot) rangePrimaryGraph(
 	lower, upper, prefix []byte,
 	fn func(key, value []byte) error,
 ) error {
+	scratch, err := s.rangePrimaryGraphBuffer(
+		lower, upper, prefix, s.overflowScanValue, fn,
+	)
+	s.overflowScanValue = scratch
+	return err
+}
+
+func (s *Snapshot) rangePrimaryGraphBuffer(
+	lower, upper, prefix, scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
 	state := s.state
 	catalogBounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
@@ -501,12 +527,14 @@ func (s *Snapshot) rangePrimaryGraph(
 		)
 	}
 	if err != nil {
-		return err
+		return scratch, err
 	}
 	// Seed the cursor's splice buffer from the Snapshot's retained scratch and
 	// hand the grown buffer back when the scan ends, so class-5 row
 	// reconstruction reuses one allocation across every scan of this snapshot
-	// rather than growing a fresh buffer per scan.
+	// rather than growing a fresh buffer per scan. Keep this separate from the
+	// overflow-value scratch: the cursor's borrowed key may still reference the
+	// splice buffer when the callback receives the resolved value.
 	cursor.AdoptSpliceScratch(s.scanSpliceScratch)
 	// The fused drain stops at each out-of-line row and returns its key and chain
 	// head; the resolved value is reassembled into one reused buffer and delivered
@@ -523,21 +551,21 @@ func (s *Snapshot) rangePrimaryGraph(
 		if ref == (storeio.PageRef{}) {
 			break
 		}
-		s.overflowScanValue, err = s.collection.appendPrimaryOverflowValue(
-			s.overflowScanValue[:0], ref, leafBounds,
+		scratch, err = s.collection.appendPrimaryOverflowValue(
+			scratch[:0], ref, leafBounds,
 		)
 		if err != nil {
 			scanErr = err
 			break
 		}
-		if err := fn(key, s.overflowScanValue); err != nil {
+		if err := fn(key, scratch); err != nil {
 			scanErr = err
 			break
 		}
 	}
 	s.scanSpliceScratch = cursor.ReleaseSpliceScratch()
 	cursor.Close()
-	return scanErr
+	return scratch, scanErr
 }
 
 // RangeMasksRaw visits only the live stable slots named by ordered masks.

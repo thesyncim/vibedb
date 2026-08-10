@@ -38,20 +38,30 @@ type goldenResponse struct {
 	resp *ShardResponse
 }
 
+func goldenPosition(index uint64) Position {
+	return Position{
+		Distribution: "tenant_data",
+		Shard:        "-80",
+		LogID:        [16]byte{0x91, 0x22, 0x73, 0x44, 0x35, 0x66, 0x17, 0x88, 0x49, 0xaa, 0x5b, 0xcc, 0x7d, 0xee, 0x8f, 0x10},
+		Index:        index,
+	}
+}
+
 func goldenRequests() []goldenRequest {
 	return []goldenRequest{
 		{
 			name: "select_no_params",
 			req: &ShardRequest{
-				SQL:            "SELECT id FROM messages",
-				Distribution:   "tenant_data",
-				Shard:          "-80",
-				RoutingVersion: 3,
-				OwnershipEpoch: 7,
-				ReadPolicy:     ReadStrong,
-				Deadline:       5 * time.Second,
-				MaxResultBytes: 1 << 20,
-				MaxRows:        1000,
+				SQL:                  "SELECT id FROM messages",
+				Distribution:         "tenant_data",
+				Shard:                "-80",
+				AllocationGeneration: 1,
+				RoutingVersion:       3,
+				OwnershipEpoch:       7,
+				ReadPolicy:           ReadStrong,
+				Deadline:             5 * time.Second,
+				MaxResultBytes:       1 << 20,
+				MaxRows:              1000,
 			},
 		},
 		{
@@ -66,10 +76,25 @@ func goldenRequests() []goldenRequest {
 					StringParam("hello\x00world"),
 					DocumentParam(`{"a":[1,2,3]}`),
 				},
-				Distribution:   "tenant_data",
-				Shard:          "80-",
-				RoutingVersion: 42,
-				OwnershipEpoch: 9,
+				Distribution:         "tenant_data",
+				Shard:                "80-",
+				AllocationGeneration: 2,
+				RoutingVersion:       42,
+				OwnershipEpoch:       9,
+			},
+		},
+		{
+			name: "session_minimum",
+			req: &ShardRequest{
+				SQL:                  "SELECT id FROM messages",
+				Distribution:         "tenant_data",
+				Shard:                "-80",
+				AllocationGeneration: 1,
+				RoutingVersion:       3,
+				OwnershipEpoch:       7,
+				ReadPolicy:           ReadSession,
+				HasMinPosition:       true,
+				MinPosition:          goldenPosition(42),
 			},
 		},
 		{
@@ -99,6 +124,15 @@ func goldenResponses() []goldenResponse {
 			resp: RowsResponse([]Column{{Name: "n", TypeOID: 20}}, nil),
 		},
 		{
+			name: "rows_position",
+			resp: func() *ShardResponse {
+				resp := RowsResponse([]Column{{Name: "id", TypeOID: 20}}, nil)
+				resp.HasReadPosition = true
+				resp.ReadPosition = goldenPosition(43)
+				return resp
+			}(),
+		},
+		{
 			name: "completion",
 			resp: CompletionResponse(42),
 		},
@@ -109,6 +143,10 @@ func goldenResponses() []goldenResponse {
 		{
 			name: "error_stale_epoch",
 			resp: NewErrorResponse(ErrorOwnershipEpoch, "ownership epoch mismatch: request 6, configured 7"),
+		},
+		{
+			name: "error_stale_allocation",
+			resp: NewErrorResponse(ErrorShardAllocation, "shard allocation generation mismatch: request 1, configured 2"),
 		},
 	}
 }

@@ -277,10 +277,11 @@ func (r *Router) buildRoute(
 	for k, i := range idx {
 		s := man.shards[i]
 		targets[k] = Target{
-			Shard:          s.ID,
-			Endpoint:       s.Leaders[0],
-			OwnershipEpoch: s.Epoch,
-			Role:           RoleLeader,
+			Shard:                s.ID,
+			AllocationGeneration: s.AllocationGeneration,
+			Endpoint:             s.Leaders[0],
+			OwnershipEpoch:       s.Epoch,
+			Role:                 RoleLeader,
 		}
 	}
 	return Route{Kind: kind, Distribution: dist, RoutingVersion: ver, Targets: targets}

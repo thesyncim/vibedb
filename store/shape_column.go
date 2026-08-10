@@ -101,7 +101,11 @@ func (c *ShapeCache) AppendField(dst []vibejson.RawValue, s *Segment, name strin
 					v := &doc.Entries[ord]
 					start, end = v.Start, v.End
 				}
-				dst = append(dst, vibejson.RawValue{Src: doc.Src[start:end]})
+				raw := vibejson.RawValue{Src: doc.Src[start:end]}
+				if s.ValueDict {
+					raw = s.valueRaw(i, start, raw)
+				}
+				dst = append(dst, raw)
 			} else {
 				dst = append(dst, vibejson.RawValue{})
 			}
@@ -499,7 +503,11 @@ func (c *ShapeCache) AppendFields(dst [][]vibejson.RawValue, s *Segment, names .
 						v := &doc.Entries[ord]
 						start, end = v.Start, v.End
 					}
-					dst[j] = append(dst[j], vibejson.RawValue{Src: doc.Src[start:end]})
+					raw := vibejson.RawValue{Src: doc.Src[start:end]}
+					if s.ValueDict {
+						raw = s.valueRaw(i, start, raw)
+					}
+					dst[j] = append(dst[j], raw)
 				} else {
 					dst[j] = append(dst[j], vibejson.RawValue{})
 				}
@@ -521,7 +529,7 @@ func (c *ShapeCache) AppendFields(dst [][]vibejson.RawValue, s *Segment, names .
 			// fold, so a backed-off run skips even that and re-proves every
 			// document exactly.
 			skip--
-			dst = appendFieldsGet(dst, root, keys)
+			dst = appendFieldsGet(dst, s, i, root, keys)
 			continue
 		case rec == nil || e.Info&(vibejson.InfoCountMask|vibejson.InfoKindMask) != hdrInfo || e.Next != hdrNext:
 			// Header foreign to the inline shape: a new layout, a non-flat
@@ -536,14 +544,14 @@ func (c *ShapeCache) AppendFields(dst [][]vibejson.RawValue, s *Segment, names .
 		case !anyPresent:
 			// The run's shape contains none of the names: the exact lookups
 			// are the answer, with no resolution until the header changes.
-			dst = appendFieldsGet(dst, root, keys)
+			dst = appendFieldsGet(dst, s, i, root, keys)
 			continue
 		default:
 			fp := c.fingerprint(root, hdrCount)
 			if fp == rec.fingerprint {
 				// Inline hit: one fold routed the document for every name.
 				streak, backoff = 0, 0
-				dst = appendFieldsResolved(dst, root, slots, keys)
+				dst = appendFieldsResolved(dst, s, i, root, slots, keys)
 				continue
 			}
 			// Same header words, foreign key sequence: re-route through the
@@ -557,7 +565,7 @@ func (c *ShapeCache) AppendFields(dst [][]vibejson.RawValue, s *Segment, names .
 		}
 		if !ok {
 			// Unresolved: not flat, too wide, or sighting-gated.
-			dst = appendFieldsGet(dst, root, keys)
+			dst = appendFieldsGet(dst, s, i, root, keys)
 			continue
 		}
 		// Retarget the inline cache at the newly resolved shape and extract
@@ -575,7 +583,7 @@ func (c *ShapeCache) AppendFields(dst [][]vibejson.RawValue, s *Segment, names .
 				slots[j] = fieldColumn{ord: -1}
 			}
 		}
-		dst = appendFieldsResolved(dst, root, slots, keys)
+		dst = appendFieldsResolved(dst, s, i, root, slots, keys)
 	}
 	return dst
 }
@@ -590,9 +598,17 @@ type fieldColumn struct {
 
 // appendFieldsGet appends one document's exact extraction to every column,
 // the projection loop's shared fallback.
-func appendFieldsGet(dst [][]vibejson.RawValue, root vibejson.Node, keys []vibejson.CompiledKey) [][]vibejson.RawValue {
+func appendFieldsGet(dst [][]vibejson.RawValue, s *Segment, doc int, root vibejson.Node, keys []vibejson.CompiledKey) [][]vibejson.RawValue {
 	for j := range keys {
-		dst[j] = appendFieldGet(dst[j], root, keys[j])
+		if value, ok := root.GetCompiled(keys[j]); ok {
+			raw := value.Raw()
+			if s.ValueDict {
+				raw = s.valueRaw(doc, value.Entry.Start, raw)
+			}
+			dst[j] = append(dst[j], raw)
+		} else {
+			dst[j] = append(dst[j], vibejson.RawValue{})
+		}
 	}
 	return dst
 }
@@ -604,13 +620,17 @@ func appendFieldsGet(dst [][]vibejson.RawValue, root vibejson.Node, keys []vibej
 // shape lacks, or whose verification fails, takes the exact lookup.
 // Bounds: the caller established root as a flat object of the routed
 // shape's exact width, and every present ordinal is below it.
-func appendFieldsResolved(dst [][]vibejson.RawValue, root vibejson.Node, slots []fieldColumn, keys []vibejson.CompiledKey) [][]vibejson.RawValue {
+func appendFieldsResolved(dst [][]vibejson.RawValue, s *Segment, doc int, root vibejson.Node, slots []fieldColumn, keys []vibejson.CompiledKey) [][]vibejson.RawValue {
 	for j := range slots {
 		if ord := slots[j].ord; ord >= 0 {
 			ke := vibejson.EntryAt(root.Entry, uintptr(2*ord)+1)
 			if vibejson.BytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), slots[j].raw) {
 				value := vibejson.EntryAt(ke, 1)
-				dst[j] = append(dst[j], vibejson.RawValue{Src: byteview.SliceRange(root.Src, value.Start, value.End)})
+				raw := vibejson.RawValue{Src: byteview.SliceRange(root.Src, value.Start, value.End)}
+				if s.ValueDict {
+					raw = s.valueRaw(doc, value.Start, raw)
+				}
+				dst[j] = append(dst[j], raw)
 				continue
 			}
 		}

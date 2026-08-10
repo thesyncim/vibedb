@@ -515,6 +515,7 @@ func (s *insertPreflightState) add(
 		return nil
 	}
 	if target.Shard != s.target.Shard ||
+		target.AllocationGeneration != s.target.AllocationGeneration ||
 		target.Endpoint != s.target.Endpoint ||
 		target.OwnershipEpoch != s.target.OwnershipEpoch ||
 		target.Role != s.target.Role {
@@ -604,6 +605,7 @@ func checkShardKeyImmutableInto(
 		return textScratch, err
 	}
 	if len(target.Targets) != 1 || target.Targets[0].Shard != routed.Shard ||
+		target.Targets[0].AllocationGeneration != routed.AllocationGeneration ||
 		target.Targets[0].Endpoint != routed.Endpoint ||
 		target.Targets[0].OwnershipEpoch != routed.OwnershipEpoch ||
 		target.Targets[0].Role != routed.Role {
@@ -619,7 +621,8 @@ func sameShardSet(a, b distribution.Route) bool {
 		return false
 	}
 	for i := range a.Targets {
-		if a.Targets[i].Shard != b.Targets[i].Shard {
+		if a.Targets[i].Shard != b.Targets[i].Shard ||
+			a.Targets[i].AllocationGeneration != b.Targets[i].AllocationGeneration {
 			return false
 		}
 	}

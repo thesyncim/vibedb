@@ -165,8 +165,8 @@ join that must emit matching pairs uses the heap executor after admitting the
 complete captured input against the current fixed, conservative 64 MiB
 working-set bound. The leases protect the cut while it is copied, then close;
 the heap copy owns the same cut through result production. An oversized fallback
-fails before execution. A join inside a transaction materializes the BEGIN cut
-plus the transaction overlay under the same bound.
+fails before execution. A join inside a transaction materializes its current
+isolation cut plus the transaction overlay under the same bound.
 
 The same global writer order that builds the coherent read cut also publishes
 multi-collection commits. A SQL or native transaction may read and write

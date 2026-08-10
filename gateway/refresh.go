@@ -67,10 +67,19 @@ func (r *FileCatalogRefresher) Refresh(ctx context.Context, staleGen uint64) (*S
 	if snap.Generation() <= staleGen {
 		return nil, ErrStaleGeneration
 	}
-	r.holder.PublishNewer(snap)
+	publishErr := r.holder.publishNewerChecked(snap)
 	current := r.holder.Current()
-	if current == nil || current.Generation() <= staleGen {
-		return nil, ErrStaleGeneration
+	if current != nil && current.Generation() > staleGen {
+		// A concurrent publisher may have won with an even newer valid snapshot.
+		// In that case the caller's stale route is repaired regardless of whether
+		// this exact candidate lost the generation race.
+		return current, nil
 	}
-	return current, nil
+	if publishErr != nil {
+		if errors.Is(publishErr, ErrCatalogGenerationNotNewer) {
+			return nil, ErrStaleGeneration
+		}
+		return nil, publishErr
+	}
+	return nil, ErrStaleGeneration
 }

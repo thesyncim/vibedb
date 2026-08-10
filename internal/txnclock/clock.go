@@ -110,12 +110,42 @@ func (c *Clock) Conflict(
 	if begin < c.historyFloor {
 		return "", true, true
 	}
+	// With no revision advance, no retained key can have been published after
+	// an ordinary begin. MaxUint64 is different: Observe can return it without
+	// registering an active holder, and a later write is then allowed to reuse
+	// the maximum. The token carries no provenance, so a still-active observed
+	// maximum cannot be distinguished from a Begin(maximum) registered after
+	// that same-revision write. Fail the exhausted boundary closed rather than
+	// infer safety from the current Active bucket. Keep the general fail-closed
+	// guards above this fast path as well.
+	if begin == c.revision {
+		if begin == maxRevision {
+			return "", true, true
+		}
+		return "", false, false
+	}
 	for _, key := range keys {
 		if c.Writes[key] > begin {
 			return key, false, true
 		}
 	}
 	return "", false, false
+}
+
+// ChangedSince reports whether any write was recorded after begin. Unlike
+// Conflict, it does not consult or consume the bounded exact-key history: the
+// monotonic revision is sufficient for a relation-coarse read dependency.
+// Revision exhaustion fails closed for the same reason as Conflict.
+func (c *Clock) ChangedSince(begin uint64) bool {
+	return c.revisionStopped || c.revision > begin
+}
+
+// Observe returns the current revision without registering another active
+// holder. Callers use it to stamp work derived from a cut captured while their
+// publication mutex is held; the transaction's original Begin token remains
+// active and retains every exact-key history entry the newer stamp may need.
+func (c *Clock) Observe() uint64 {
+	return c.revision
 }
 
 // Finish drops one transaction begun at begin and releases history that no
@@ -147,14 +177,26 @@ func (c *Clock) Finish(begin uint64) {
 	}
 	oldest := c.revision
 	haveExact := false
+	haveObservedFence := false
 	for revision := range c.Active {
 		if revision < c.historyFloor {
+			// A holder whose original Begin token predates the floor is doomed
+			// for work stamped with that token, but it may also own newer,
+			// unregistered Observe tokens. Those tokens are used for statement
+			// cuts captured under the publication mutex. Keep the complete
+			// post-floor history until every such holder finishes: pruning to a
+			// newer registered Begin could otherwise discard a write visible to
+			// an older holder's post-floor observation.
+			haveObservedFence = true
 			continue
 		}
 		if !haveExact || revision < oldest {
 			oldest = revision
 			haveExact = true
 		}
+	}
+	if haveObservedFence {
+		return
 	}
 	if !haveExact {
 		c.Writes = nil
