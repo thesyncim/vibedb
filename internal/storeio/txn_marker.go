@@ -209,11 +209,13 @@ func matchesTxnMarkerDirectory(
 	if sourceDirInfo == nil || !sourceDirInfo.IsDir() || file == nil {
 		return false, ErrInvalidWrite
 	}
-	dir, err := canonicalTxnMarkerDir(file.Name())
-	if err != nil {
-		return false, err
-	}
-	root, err := os.OpenRoot(dir)
+	// Open the live parent path directly. OpenRoot pins the directory reached
+	// through the caller's current namespace, and the SameFile check below
+	// proves that pinned handle is the marker's physical directory. Resolving
+	// every path component with EvalSymlinks first adds no identity guarantee:
+	// the directory descriptor, not its spelling, is the proof. Avoiding that
+	// redundant walk also keeps this per-commit fence allocation-light.
+	root, err := os.OpenRoot(filepath.Dir(file.Name()))
 	if err != nil {
 		return false, err
 	}
