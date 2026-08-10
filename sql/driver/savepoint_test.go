@@ -2,8 +2,8 @@ package driver
 
 import (
 	"context"
+	stdsql "database/sql"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -63,32 +63,165 @@ func TestSavepointPutDeletePutAcrossMarks(t *testing.T) {
 	assertTableField(t, db, "docs", "1", "v", "base")
 }
 
-func TestSavepointDuplicateNameReplaceAndLIFORelease(t *testing.T) {
+func TestSavepointDuplicateNameShadowsAndReleaseReveals(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`SAVEPOINT mark`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"outer"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SAVEPOINT mark`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"inner"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`ROLLBACK TO mark`); err != nil {
+		t.Fatal(err)
+	}
+	assertSavepointTxCount(t, tx, 1)
+
+	// ROLLBACK TO retains the newest mark, so it can rewind another write.
+	if _, err := tx.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"retry"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`ROLLBACK TO mark`); err != nil {
+		t.Fatal(err)
+	}
+	assertSavepointTxCount(t, tx, 1)
+
+	// Releasing the newest mark reveals the older mark with the same name.
+	if _, err := tx.Exec(`RELEASE mark`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`ROLLBACK TO mark`); err != nil {
+		t.Fatal(err)
+	}
+	assertSavepointTxCount(t, tx, 0)
+	if _, err := tx.Exec(`RELEASE mark`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, db, "docs", 0)
+}
+
+func TestSavepointDatabaseSQLReadOnlyControl(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx, &stdsql.TxOptions{
+		Isolation: stdsql.LevelReadCommitted,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT write_safe`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO docs VALUES (?)`, `{"id":"nope"}`,
+	); !errors.Is(err, ErrReadOnlyTransaction) {
+		t.Fatalf("read-only INSERT = %v, want ErrReadOnlyTransaction", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ROLLBACK TO write_safe`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE write_safe`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT ddl_safe`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`CREATE TABLE extra (PRIMARY KEY (id))`,
+	); !errors.Is(err, ErrReadOnlyTransaction) {
+		t.Fatalf("read-only CREATE TABLE = %v, want ErrReadOnlyTransaction", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ROLLBACK TO ddl_safe`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE ddl_safe`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, db, "docs", 0)
+}
+
+func TestSavepointReadOnlyFailedStateRecovery(t *testing.T) {
 	ctx := context.Background()
 	session := openSavepointSession(t)
 	defer session.Close()
-	if err := session.Begin(ctx, TxOptions{}); err != nil {
+	createDocs := runtimePrepare(t, session,
+		`CREATE TABLE docs (id STRING PRIMARY KEY)`)
+	if _, err := createDocs.Exec(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	tx := session.conn.tx
-	if err := tx.savepoint("outer"); err != nil {
+	insert := runtimePrepare(t, session,
+		`INSERT INTO docs VALUES (?)`)
+	createExtra := runtimePrepare(t, session,
+		`CREATE TABLE extra (id STRING PRIMARY KEY)`)
+	count := runtimePrepare(t, session,
+		`SELECT COUNT(*) FROM docs WHERE id = ?`)
+
+	if err := session.Begin(ctx, TxOptions{
+		ReadOnly: true, Isolation: IsolationReadCommitted,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.savepoint("inner"); err != nil {
+	if err := session.Savepoint(ctx, "write_safe"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.savepoint("outer"); err != nil {
+	if _, err := insert.Exec(ctx, []any{`{"id":"nope"}`}); !errors.Is(err, ErrReadOnlyTransaction) {
+		t.Fatalf("read-only INSERT = %v, want ErrReadOnlyTransaction", err)
+	}
+	if session.State() != SessionFailedTransaction {
+		t.Fatalf("state after read-only INSERT = %s, want failed", session.State())
+	}
+	if err := session.RollbackTo(ctx, "write_safe"); err != nil {
 		t.Fatal(err)
 	}
-	// Duplicate replace erased LIFO through the prior outer, so inner is gone.
-	if err := tx.releaseSavepoint("inner"); !errors.Is(err, ErrSavepointNotFound) {
-		t.Fatalf("release replaced inner = %v, want ErrSavepointNotFound", err)
-	}
-	if err := tx.releaseSavepoint("outer"); err != nil {
+	if err := session.ReleaseSavepoint(ctx, "write_safe"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.releaseSavepoint("outer"); !errors.Is(err, ErrSavepointNotFound) {
-		t.Fatalf("second release = %v, want ErrSavepointNotFound", err)
+
+	if err := session.Savepoint(ctx, "ddl_safe"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createExtra.Exec(ctx, nil); !errors.Is(err, ErrReadOnlyTransaction) {
+		t.Fatalf("read-only CREATE TABLE = %v, want ErrReadOnlyTransaction", err)
+	}
+	if session.State() != SessionFailedTransaction {
+		t.Fatalf("state after read-only DDL = %s, want failed", session.State())
+	}
+	if err := session.RollbackTo(ctx, "ddl_safe"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.ReleaseSavepoint(ctx, "ddl_safe"); err != nil {
+		t.Fatal(err)
+	}
+	assertRuntimeCount(t, count, "", 0)
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -149,14 +282,24 @@ func TestSavepointBoundRefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < maxSavepointFrames; i++ {
-		name := fmt.Sprintf("sp%d", i)
-		if err := session.Savepoint(ctx, name); err != nil {
+		if err := session.Savepoint(ctx, "same"); err != nil {
 			t.Fatalf("savepoint %d: %v", i, err)
 		}
 	}
-	err := session.Savepoint(ctx, "overflow")
+	err := session.Savepoint(ctx, "same")
 	if !errors.Is(err, ErrTooManySavepoints) {
 		t.Fatalf("overflow = %v, want ErrTooManySavepoints", err)
+	}
+}
+
+func assertSavepointTxCount(t *testing.T, tx *stdsql.Tx, want int) {
+	t.Helper()
+	var got int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("transaction row count = %d, want %d", got, want)
 	}
 }
 

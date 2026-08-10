@@ -46,10 +46,12 @@
 //
 // Runtime transaction state follows PostgreSQL's failed-transaction rule. A
 // prepare or execution error after Begin moves the session to
-// [SessionFailedTransaction]; only Rollback remains usable. Commit in that state
-// first rolls back every staged change and then returns [ErrTransactionFailed].
-// A protocol error outside runtime execution can make the same transition with
-// [Session.MarkFailed].
+// [SessionFailedTransaction]. [Session.RollbackTo] remains usable and, when its
+// mark exists, recovers the session to [SessionInTransaction] without ending
+// the transaction. [Session.Rollback] remains the unconditional terminal
+// escape. Commit in the failed state first rolls back every staged change and
+// then returns [ErrTransactionFailed]. A protocol error outside runtime
+// execution can make the same transition with [Session.MarkFailed].
 //
 // # Catalog, schemas, and indexes
 //

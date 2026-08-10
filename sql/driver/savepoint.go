@@ -29,19 +29,11 @@ func (t *tx) savepoint(name string) error {
 	if t.done {
 		return fmt.Errorf("vibedb: transaction is finished")
 	}
-	if t.readOnly {
-		return ErrReadOnlyTransaction
-	}
 	if name == "" {
 		return fmt.Errorf("vibedb: SAVEPOINT requires a name")
 	}
-	// Duplicate names replace: erase LIFO through the prior mark, then push a
-	// new frame at the current overlay watermarks (PostgreSQL semantics).
-	if _, found := t.savepointIndex(name); found {
-		if err := t.releaseSavepoint(name); err != nil {
-			return err
-		}
-	}
+	// A duplicate appends another frame. Reverse lookup makes it shadow the
+	// earlier homonym until RELEASE removes the newer frame.
 	if len(t.savepoints) >= maxSavepointFrames {
 		return fmt.Errorf(
 			"%w: at most %d SAVEPOINT marks per transaction",

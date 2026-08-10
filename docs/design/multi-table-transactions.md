@@ -570,8 +570,11 @@ overlay watermarks (staged-order lengths plus a displaced-entry undo log for
 keys overwritten after the mark); `ROLLBACK TO` rewinds the overlay without
 ending the transaction and returns a failed session to in-transaction state —
 the property client stacks rely on; `RELEASE` erases marks LIFO through the
-name; duplicate names replace; real commitment only at COMMIT. Bounded count
-(documented constant, 64) with a typed refusal. The refusal strings in
+name; duplicate names shadow earlier marks, operations select the newest, and
+releasing that mark reveals the previous one; `ROLLBACK TO` retains its target;
+real commitment only at COMMIT. Bounded count (documented constant, 64) with a
+typed refusal. Savepoint control remains available in read-only transactions;
+DML and DDL remain refused. The refusal strings in
 `sql/unsupported.go` and `pgwire/command.go` are deleted, and the executable
 refusal taxonomy moves in the same changes: the cross-adapter manifest row
 pinning the savepoint refusal (`internal/conformance/unsupported_sql.go:16`,

@@ -75,9 +75,11 @@ const (
 	// SessionInTransaction has an active, usable snapshot transaction.
 	SessionInTransaction
 	// SessionFailedTransaction has an active transaction that rejected a
-	// prepare or execution. Only Rollback is accepted. Commit first rolls back
-	// deterministically and then returns ErrTransactionFailed, allowing a wire
-	// adapter to map that outcome to its protocol's failed-COMMIT behavior.
+	// prepare or execution. A successful RollbackTo recovers it to
+	// SessionInTransaction; Rollback remains the unconditional terminal escape.
+	// Commit first rolls back deterministically and then returns
+	// ErrTransactionFailed, allowing a wire adapter to map that outcome to its
+	// protocol's failed-COMMIT behavior.
 	SessionFailedTransaction
 	// SessionClosed is terminal.
 	SessionClosed
@@ -353,8 +355,8 @@ func (s *Session) ReleaseSavepoint(ctx context.Context, name string) error {
 // ending the transaction.
 //
 // Valid in SessionInTransaction and SessionFailedTransaction. Success from the
-// failed state recovers the session to SessionInTransaction — the property
-// client stacks rely on after a statement error.
+// failed state recovers the session to SessionInTransaction without ending the
+// transaction. Rollback remains the unconditional terminal alternative.
 func (s *Session) RollbackTo(ctx context.Context, name string) error {
 	if err := s.live(); err != nil {
 		return err
@@ -387,8 +389,9 @@ func (s *Session) RollbackTo(ctx context.Context, name string) error {
 // Rollback discards the current transaction and returns to SessionIdle.
 //
 // Cleanup is unconditional even when ctx is already canceled: Rollback is the
-// one operation a failed transaction must always retain, and leaving snapshot
-// leases behind would turn cancellation into an ownership leak.
+// terminal operation a failed transaction must always retain, while RollbackTo
+// is its non-terminal recovery path. Leaving snapshot leases behind would turn
+// cancellation into an ownership leak.
 func (s *Session) Rollback(ctx context.Context) error {
 	_ = ctx
 	if err := s.live(); err != nil {
@@ -818,8 +821,9 @@ var (
 	// ErrTransactionActive reports BEGIN or an idle-only session operation while
 	// a transaction is already active.
 	ErrTransactionActive = errors.New("vibedb: SQL session already has an active transaction")
-	// ErrTransactionFailed reports a failed transaction in which only ROLLBACK
-	// remains valid.
+	// ErrTransactionFailed reports an operation refused by a failed transaction.
+	// RollbackTo can recover that transaction; Rollback remains the terminal
+	// escape.
 	ErrTransactionFailed = errors.New("vibedb: SQL transaction is failed; roll it back")
 	// ErrCursorOpen reports an operation that cannot replace the session's
 	// current typed result and snapshot lease.

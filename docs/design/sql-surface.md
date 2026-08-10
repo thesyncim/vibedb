@@ -918,12 +918,16 @@ watermarks (staged-order lengths plus a displaced-entry undo log for keys
 overwritten after the mark). `ROLLBACK TO` rewinds the overlay without ending
 the transaction and returns a failed session to in-transaction state — Ready
 for Query `T` on the wire. `RELEASE` erases marks LIFO through the name;
-duplicate names replace. Real commitment remains only at COMMIT. The stack is
-bounded at 64 frames (`ErrTooManySavepoints`); an unknown name is
+duplicate names shadow earlier marks, operations select the newest, and
+releasing that mark reveals the previous one. `ROLLBACK TO` retains its target.
+Real commitment remains only at COMMIT. The stack is bounded at 64 frames
+(`ErrTooManySavepoints`); an unknown name is
 `ErrSavepointNotFound` (SQLSTATE `3B001`). Savepoint or release in a failed
 transaction is SQLSTATE `25P02`. `database/sql` users reach all three as
-statement text through `tx.Exec`. Nested native `Update` closures are a typed
-error, not an implicit savepoint.
+statement text through `tx.Exec`. All three remain available in a read-only
+transaction because they change only transaction-local control state; DML and
+DDL remain refused. Nested native `Update` closures are a typed error, not an
+implicit savepoint.
 
 The typed runtime accepts Default/Read Committed, Repeatable Read/Snapshot, and
 Serializable. `database/sql` maps its corresponding standard levels directly,
