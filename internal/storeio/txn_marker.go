@@ -146,9 +146,12 @@ type TxnMarkerOptions struct {
 // TxnMarker is the single-writer file-backed manager for txn.vtm. It is not
 // safe for concurrent use.
 type TxnMarker struct {
-	file   *os.File
-	path   string
-	header TxnMarkerHeader
+	file *os.File
+	path string
+	// sourceDir is canonicalized once at open/create so repeated scans retain
+	// the database identity without filesystem calls or allocations.
+	sourceDir string
+	header    TxnMarkerHeader
 	// cursor is the in-region byte offset of the next append.
 	cursor uint64
 	// nextSequence is the DCSN the next appended record will carry.
@@ -696,12 +699,25 @@ func newTxnMarkerManager(
 	m := &TxnMarker{
 		file:       file,
 		path:       path,
+		sourceDir:  canonicalTxnMarkerDir(path),
 		header:     h,
 		scratch:    make([]byte, TxnMarkerHeaderSize),
 		markerSync: dataSync,
 	}
 	m.writeAt = file.WriteAt
 	return m
+}
+
+func canonicalTxnMarkerDir(path string) string {
+	dir := filepath.Dir(path)
+	if absolute, err := filepath.Abs(dir); err == nil {
+		dir = absolute
+	}
+	dir = filepath.Clean(dir)
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = filepath.Clean(resolved)
+	}
+	return dir
 }
 
 // Header returns the value-only decision-log identity and geometry.
@@ -737,14 +753,10 @@ func (m *TxnMarker) writeHeaderFaultable(slot uint32, header TxnMarkerHeader) er
 func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 	m.cursor = 0
 	m.nextSequence = m.header.BaseSequence + 1
-	sourceDir := filepath.Dir(m.path)
-	if resolved, err := filepath.EvalSymlinks(sourceDir); err == nil {
-		sourceDir = filepath.Clean(resolved)
-	}
 	*dst = TxnDecisions{
-		sourceDir: sourceDir,
-		markerID: m.header.MarkerID,
-		epoch:    m.header.Epoch,
+		sourceDir: m.sourceDir,
+		markerID:  m.header.MarkerID,
+		epoch:     m.header.Epoch,
 	}
 
 	// Empty / fully recycled logs begin with a zeroed region. Bad magic is the

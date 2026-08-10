@@ -485,10 +485,8 @@ func (p *plan) runFileJoinedBatched(
 	// The durable driving scan has its own bounded batch/merge frontier. The
 	// joined side is bound before that scan exists, so arm the configured
 	// admission account for its data-dependent candidate plan, membership,
-	// Bloom filter, and containment tapes. Its schema- and row-bounded scratch
-	// batch uses the same value as an independent target, matching the durable
-	// MemoryBytes contract rather than pretending fixed batches are resident
-	// capacity in this account.
+	// Bloom filter, containment tapes, and retained inner-batch high water.
+	// All of those capacities coexist until the joined execution finishes.
 	e.Workspace.heapWorkBudget.begin(n.memoryBytes)
 	if err := p.bindFileJoins(
 		&e.Workspace, snapshot, catalog,
@@ -653,34 +651,11 @@ func (j *planJoin) collectFile(
 	f.keys = f.keys[:0]
 	f.keyText = f.keyText[:0]
 	f.batchRows = 0
+	// Batch capacities coexist with candidate planning and retained join
+	// membership. Charge their high-water growth directly to the statement
+	// account before each append; a child budget would either hide that sum or
+	// report a misleading remainder-local limit.
 	var batchBudget fileJoinBatchBudget
-	var batchWork heapWorkBudget
-	var batchAccount *heapWorkBudget
-	var batchCharged int64
-	if workBudget != nil {
-		// The join planner and membership structures have already consumed
-		// workBudget. A batch receives only the unreserved remainder; restarting
-		// it at the original limit lets planner and row materialization exceed
-		// the statement's MemoryBytes admission.
-		batchWork.begin(workBudget.remaining())
-		batchAccount = &batchWork
-	}
-	chargeBatch := func() error {
-		if batchAccount == nil {
-			return nil
-		}
-		used := batchWork.used.Load()
-		if used <= batchCharged {
-			return nil
-		}
-		if err := workBudget.admit(
-			"durable join batch workspace", used-batchCharged,
-		); err != nil {
-			return err
-		}
-		batchCharged = used
-		return nil
-	}
 
 	needKeys := j.innerPath == joinPrimaryKey
 	over := false
@@ -689,7 +664,7 @@ func (j *planJoin) collectFile(
 			return err
 		}
 		if err := batchBudget.admitRow(
-			batchAccount, j.inner, key, value, needKeys,
+			workBudget, j.inner, key, value, needKeys,
 		); err != nil {
 			return err
 		}
@@ -707,9 +682,6 @@ func (j *planJoin) collectFile(
 		f.batchRows++
 		if f.batchRows < joinBatchRows {
 			return nil
-		}
-		if err := chargeBatch(); err != nil {
-			return err
 		}
 		stop, drainErr := j.drainFile(b, limit, stoppable, workBudget)
 		if drainErr != nil {
@@ -733,9 +705,6 @@ func (j *planJoin) collectFile(
 			return false, err
 		}
 		return true, nil
-	}
-	if err := chargeBatch(); err != nil {
-		return false, err
 	}
 	stop, err := j.drainFile(b, limit, stoppable, workBudget)
 	if err != nil {

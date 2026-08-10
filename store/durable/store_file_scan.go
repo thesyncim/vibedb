@@ -454,9 +454,9 @@ func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
 		return ErrClosed
 	}
 	scratch, err := s.rangePrimaryGraphBuffer(
-		nil, nil, nil, s.scanSpliceScratch, fn,
+		nil, nil, nil, s.overflowScanValue, fn,
 	)
-	s.scanSpliceScratch = scratch
+	s.overflowScanValue = scratch
 	return err
 }
 
@@ -474,9 +474,9 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	}
 	if scratch == nil {
 		retained, err := s.rangePrimaryGraphBuffer(
-			nil, nil, nil, s.scanSpliceScratch, fn,
+			nil, nil, nil, s.overflowScanValue, fn,
 		)
-		s.scanSpliceScratch = retained
+		s.overflowScanValue = retained
 		return nil, err
 	}
 	return s.rangePrimaryGraphBuffer(nil, nil, nil, scratch, fn)
@@ -489,9 +489,9 @@ func (s *Snapshot) rangePrimaryGraph(
 	fn func(key, value []byte) error,
 ) error {
 	scratch, err := s.rangePrimaryGraphBuffer(
-		lower, upper, prefix, s.scanSpliceScratch, fn,
+		lower, upper, prefix, s.overflowScanValue, fn,
 	)
-	s.scanSpliceScratch = scratch
+	s.overflowScanValue = scratch
 	return err
 }
 
@@ -532,7 +532,10 @@ func (s *Snapshot) rangePrimaryGraphBuffer(
 	// Seed the cursor's splice buffer from the Snapshot's retained scratch and
 	// hand the grown buffer back when the scan ends, so class-5 row
 	// reconstruction reuses one allocation across every scan of this snapshot
-	// rather than growing a fresh buffer per scan.
+	// rather than growing a fresh buffer per scan. Keep this separate from the
+	// overflow-value scratch: the cursor's borrowed key may still reference the
+	// splice buffer when the callback receives the resolved value.
+	cursor.AdoptSpliceScratch(s.scanSpliceScratch)
 	// The fused drain stops at each out-of-line row and returns its key and chain
 	// head; the resolved value is reassembled into one reused buffer and delivered
 	// to fn exactly like an inline value, then the drain is re-entered. Passing fn
@@ -540,9 +543,7 @@ func (s *Snapshot) rangePrimaryGraphBuffer(
 	var scanErr error
 	var decoder storeio.CompactPrimaryScanDecoder
 	for scanErr == nil {
-		cursor.AdoptSpliceScratch(scratch)
 		key, ref, err := cursor.VisitInlineDecoded(&decoder, fn)
-		scratch = cursor.ReleaseSpliceScratch()
 		if err != nil {
 			scanErr = err
 			break
@@ -562,6 +563,7 @@ func (s *Snapshot) rangePrimaryGraphBuffer(
 			break
 		}
 	}
+	s.scanSpliceScratch = cursor.ReleaseSpliceScratch()
 	cursor.Close()
 	return scratch, scanErr
 }

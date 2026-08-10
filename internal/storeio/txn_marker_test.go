@@ -538,7 +538,7 @@ func TestTxnMarkerFull(t *testing.T) {
 }
 
 func TestTxnMarkerEmptyScanDoesNotAllocate(t *testing.T) {
-	m, _ := createTestTxnMarker(t, 2<<20)
+	m, path := createTestTxnMarker(t, 2<<20)
 	defer m.Close()
 	var decisions TxnDecisions
 	var scanErr error
@@ -549,5 +549,16 @@ func TestTxnMarkerEmptyScanDoesNotAllocate(t *testing.T) {
 	}
 	if scanErr != nil {
 		t.Fatal(scanErr)
+	}
+	wantDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir = filepath.Clean(wantDir)
+	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
+		wantDir = filepath.Clean(resolved)
+	}
+	if decisions.SourceDir() != wantDir {
+		t.Fatalf("source directory = %q, want %q", decisions.SourceDir(), wantDir)
 	}
 }

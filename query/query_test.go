@@ -393,7 +393,8 @@ func refAccumulate(q *Query, accs []refAcc, doc any) {
 	for c, col := range q.columns {
 		switch col.agg {
 		case aggCount:
-			if col.spec == "" || refPresent(refResolve(col.spec, doc)) {
+			value, resolved := refResolve(col.spec, doc)
+			if col.spec == "" || resolved && value != nil {
 				accs[c].count++
 			}
 		case aggSum, aggAvg, aggMin, aggMax:
