@@ -160,6 +160,7 @@ type Tx struct {
 	readKeys        int
 	readBytes       int
 	readCollections int
+	dynamicStates   int
 
 	// stagedTotals track cross-collection admission against TxnLimits.
 	stagedDocs  int
@@ -202,6 +203,16 @@ type txMutation struct {
 	existed  bool
 }
 
+// txnActiveRevision is one live logical-revision bucket in an ordered,
+// intrusive directory. Begin revisions are monotonic, so new buckets append at
+// the tail; Finish unlinks any bucket in constant time and the head is always
+// the oldest active revision. The map and list retain only live buckets.
+type txnActiveRevision struct {
+	count                uint64
+	previous, next       uint64
+	hasPrevious, hasNext bool
+}
+
 // Collection returns the transaction view of name. It never errors; invalid
 // names and finished transactions fail on the first operation instead.
 func (t *Tx) Collection(name string) *TxCollection {
@@ -214,8 +225,8 @@ func (t *Tx) Collection(name string) *TxCollection {
 	if !validCollectionName(name) {
 		return &TxCollection{name: name, tx: t, initialErr: ErrInvalidCollectionName}
 	}
-	state := t.ensureCollection(name)
-	return &TxCollection{name: name, tx: t, state: state}
+	state, err := t.ensureCollection(name)
+	return &TxCollection{name: name, tx: t, state: state, initialErr: err}
 }
 
 // Commit validates conflicts, publishes the dirty set, records into conflict
@@ -446,9 +457,16 @@ func (t *Tx) newCollectionState(name string) *txCollectionState {
 	return state
 }
 
-func (t *Tx) ensureCollection(name string) *txCollectionState {
+func (t *Tx) ensureCollection(name string) (*txCollectionState, error) {
 	if state := t.colls[name]; state != nil {
-		return state
+		return state, nil
+	}
+	// Cataloged states were captured once at Begin. Bound only dynamically
+	// discovered absent names here, before allocating or retaining a map entry,
+	// so callers may keep the lazy TxCollection API without growing a live
+	// transaction through repeated rejected names.
+	if t.dynamicStates >= maxSerializableReadCollections {
+		return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
 	}
 	state := t.newCollectionState(name)
 	state.absent = true
@@ -466,7 +484,8 @@ func (t *Tx) ensureCollection(name string) *txCollectionState {
 		}
 	}
 	t.colls[name] = state
-	return state
+	t.dynamicStates++
+	return state, nil
 }
 
 func (t *Tx) dirtyStates() []*txCollectionState {
@@ -738,24 +757,31 @@ func (c *TxCollection) Put(key string, document []byte) (created bool, err error
 	if err := validateDocument(c.tx.db.engine.Collection, document); err != nil {
 		return false, err
 	}
+	// Admit the dependency before canonicalization can allocate reusable scratch.
+	// A rejected dynamic/read collection therefore retains no document-sized
+	// buffer in the transaction.
+	if err := c.tx.trackPointRead(c.state, key); err != nil {
+		return false, err
+	}
 	canonical, err := vibejson.AppendCanonicalize(c.state.canonical[:0], document)
 	if err != nil {
+		c.state.canonical = nil
 		return false, err
 	}
 	c.state.canonical = canonical
 	owned := append([]byte(nil), canonical...)
-	if err := c.tx.trackPointRead(c.state, key); err != nil {
-		return false, err
-	}
 	baseExisted, err := c.baseExisted(key)
 	if err != nil {
+		c.state.canonical = nil
 		return false, err
 	}
 	visible, err := c.visible(key)
 	if err != nil {
+		c.state.canonical = nil
 		return false, err
 	}
 	if err := c.tx.stage(c.state, key, owned, false, baseExisted); err != nil {
+		c.state.canonical = nil
 		return false, err
 	}
 	return !visible, nil
@@ -1209,14 +1235,16 @@ func (d *Database) batchBounds(name string) (maxDocs, maxBytes int) {
 
 func (d *Database) armClockForBegin(tx *Tx) {
 	d.clockMu.Lock()
-	if d.txnActive == nil {
-		d.txnActive = make(map[uint64]uint64)
-	}
 	tx.beginRev = d.txnRevision
-	d.txnActive[tx.beginRev] = incrementTxnHolderCount(d.txnActive[tx.beginRev])
 	active := d.txnActiveCount.Load()
 	if active != maxTxnActiveCount {
-		d.txnActiveCount.Store(incrementTxnHolderCount(active))
+		count := d.addActiveRevisionLocked(tx.beginRev)
+		nextActive := incrementTxnHolderCount(active)
+		if count == maxTxnActiveCount || nextActive == maxTxnActiveCount {
+			d.saturateActiveRevisionsLocked()
+		} else {
+			d.txnActiveCount.Store(nextActive)
+		}
 	}
 	tx.clockArmed = true
 	d.clockMu.Unlock()
@@ -1234,23 +1262,14 @@ func (d *Database) finishClock(tx *Tx, published map[string][]string) {
 	if !tx.clockArmed {
 		return
 	}
-	count := d.txnActive[tx.beginRev]
-	switch count {
-	case maxTxnActiveCount:
-		// Saturation permanently reserves this revision. Its exact holder count
-		// is unknowable, so no Finish may declare it quiescent.
-	case 0, 1:
-		delete(d.txnActive, tx.beginRev)
-	default:
-		d.txnActive[tx.beginRev] = count - 1
-	}
 	active := d.txnActiveCount.Load()
 	if active != maxTxnActiveCount && active != 0 {
+		d.removeActiveRevisionLocked(tx.beginRev)
 		d.txnActiveCount.Store(active - 1)
 	}
 	tx.clockArmed = false
 	if d.txnActiveCount.Load() == 0 {
-		d.txnActive = nil
+		d.clearActiveRevisionsLocked()
 		d.txnHistories = nil
 		d.txnHistoryFloor = 0
 		return
@@ -1313,7 +1332,7 @@ func (d *Database) recordPublishedLocked(published map[string][]string) {
 			history = &txnclock.ExternalHistory{}
 			d.txnHistories[name] = history
 		}
-		history.RecordAt(revision, oldest, keys)
+		history.RecordUniqueAt(revision, oldest, keys)
 	}
 }
 
@@ -1345,7 +1364,9 @@ func (d *Database) nextTxnRevisionLocked() (uint64, bool) {
 		return d.txnRevision, false
 	}
 	if d.txnRevision == maxTxnRevision {
-		if d.txnActive[maxTxnRevision] != 0 {
+		atMax, activeAtMax := d.txnActive[maxTxnRevision]
+		if d.txnActiveCount.Load() == maxTxnActiveCount ||
+			(activeAtMax && atMax.count != 0) {
 			d.txnRevisionStopped = true
 			d.txnHistories = nil
 			return d.txnRevision, false
@@ -1363,14 +1384,91 @@ func incrementTxnHolderCount(count uint64) uint64 {
 	return count + 1
 }
 
-func (d *Database) oldestActiveLocked() uint64 {
-	oldest := maxTxnRevision
-	for revision := range d.txnActive {
-		if revision < oldest {
-			oldest = revision
-		}
+func (d *Database) addActiveRevisionLocked(revision uint64) uint64 {
+	if d.txnActive == nil {
+		d.txnActive = make(map[uint64]txnActiveRevision)
 	}
-	return oldest
+	entry, exists := d.txnActive[revision]
+	if exists {
+		entry.count = incrementTxnHolderCount(entry.count)
+		d.txnActive[revision] = entry
+		return entry.count
+	}
+	entry.count = 1
+	if d.txnActiveLinked {
+		entry.previous = d.txnActiveNewest
+		entry.hasPrevious = true
+		newest := d.txnActive[d.txnActiveNewest]
+		newest.next = revision
+		newest.hasNext = true
+		d.txnActive[d.txnActiveNewest] = newest
+	} else {
+		d.txnActiveOldest = revision
+		d.txnActiveLinked = true
+	}
+	d.txnActiveNewest = revision
+	d.txnActive[revision] = entry
+	return 1
+}
+
+func (d *Database) removeActiveRevisionLocked(revision uint64) {
+	entry, exists := d.txnActive[revision]
+	if !exists || entry.count == 0 {
+		return
+	}
+	if entry.count > 1 {
+		entry.count--
+		d.txnActive[revision] = entry
+		return
+	}
+	if entry.hasPrevious {
+		previous := d.txnActive[entry.previous]
+		previous.next = entry.next
+		previous.hasNext = entry.hasNext
+		d.txnActive[entry.previous] = previous
+	} else if entry.hasNext {
+		d.txnActiveOldest = entry.next
+	}
+	if entry.hasNext {
+		next := d.txnActive[entry.next]
+		next.previous = entry.previous
+		next.hasPrevious = entry.hasPrevious
+		d.txnActive[entry.next] = next
+	} else if entry.hasPrevious {
+		d.txnActiveNewest = entry.previous
+	}
+	delete(d.txnActive, revision)
+	if len(d.txnActive) == 0 {
+		d.clearActiveRevisionsLocked()
+	}
+}
+
+func (d *Database) saturateActiveRevisionsLocked() {
+	// Once an exact holder count saturates, retain one permanent conservative
+	// oldest-revision sentinel. Future Begin/Finish calls need no directory
+	// entries, so fail-closed saturation cannot grow memory without bound.
+	oldest := d.oldestActiveLocked()
+	d.txnActive = map[uint64]txnActiveRevision{
+		oldest: {count: maxTxnActiveCount},
+	}
+	d.txnActiveOldest = oldest
+	d.txnActiveNewest = oldest
+	d.txnActiveLinked = true
+	d.txnActiveCount.Store(maxTxnActiveCount)
+}
+
+func (d *Database) clearActiveRevisionsLocked() {
+	d.txnActive = nil
+	d.txnActiveOldest = 0
+	d.txnActiveNewest = 0
+	d.txnActiveLinked = false
+}
+
+func (d *Database) oldestActiveLocked() uint64 {
+	if !d.txnActiveLinked {
+		return maxTxnRevision
+	}
+	return d.txnActiveOldest
 }
 
 func (d *Database) enterUpdateClosure() error {

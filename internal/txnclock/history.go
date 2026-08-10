@@ -38,6 +38,21 @@ func (h *ExternalHistory) ConflictCollection(begin uint64) bool {
 // only when needed to avoid an overflow, keeping the common overwrite path
 // constant-time while preserving the hard HistoryKeys bound.
 func (h *ExternalHistory) RecordAt(revision, oldest uint64, keys []string) {
+	h.recordAt(revision, oldest, keys, false)
+}
+
+// RecordUniqueAt is RecordAt for callers that guarantee keys has no duplicate
+// elements. Transaction publication order already has that property, allowing
+// history admission to remain linear in the published key count.
+func (h *ExternalHistory) RecordUniqueAt(revision, oldest uint64, keys []string) {
+	h.recordAt(revision, oldest, keys, true)
+}
+
+func (h *ExternalHistory) recordAt(
+	revision, oldest uint64,
+	keys []string,
+	unique bool,
+) {
 	if h == nil || len(keys) == 0 {
 		return
 	}
@@ -46,10 +61,10 @@ func (h *ExternalHistory) RecordAt(revision, oldest uint64, keys []string) {
 		h.Floor = 0
 	}
 
-	newKeys := countNewExternalKeys(h.Writes, keys)
+	newKeys := countNewExternalKeys(h.Writes, keys, unique)
 	if len(h.Writes)+newKeys > HistoryKeys {
 		h.prune(oldest)
-		newKeys = countNewExternalKeys(h.Writes, keys)
+		newKeys = countNewExternalKeys(h.Writes, keys, unique)
 		if len(h.Writes)+newKeys > HistoryKeys {
 			h.Floor = revision
 			h.Writes = nil
@@ -91,22 +106,29 @@ func (h *ExternalHistory) prune(oldest uint64) {
 	h.Writes = writes
 }
 
-func countNewExternalKeys(writes map[string]uint64, keys []string) int {
+func countNewExternalKeys(
+	writes map[string]uint64,
+	keys []string,
+	unique bool,
+) int {
 	count := 0
 	for i, key := range keys {
 		if _, exists := writes[key]; exists {
 			continue
 		}
-		duplicate := false
-		for j := 0; j < i; j++ {
-			if keys[j] == key {
-				duplicate = true
-				break
+		if !unique {
+			duplicate := false
+			for j := 0; j < i; j++ {
+				if keys[j] == key {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
 			}
 		}
-		if !duplicate {
-			count++
-		}
+		count++
 	}
 	return count
 }

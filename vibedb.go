@@ -261,7 +261,10 @@ type Database struct {
 	clockMu            sync.Mutex
 	txnRevision        uint64
 	txnRevisionStopped bool
-	txnActive          map[uint64]uint64
+	txnActive          map[uint64]txnActiveRevision
+	txnActiveOldest    uint64
+	txnActiveNewest    uint64
+	txnActiveLinked    bool
 	txnActiveCount     atomic.Uint64
 	txnHistoryFloor    uint64
 	txnHistories       map[string]*txnclock.ExternalHistory

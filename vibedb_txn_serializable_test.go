@@ -202,6 +202,78 @@ func TestNativeSerializableReadTrackingEscalatesWithinBounds(t *testing.T) {
 	_ = tx.Rollback()
 }
 
+func TestNativeSerializableDynamicStateAdmissionBoundsRetention(t *testing.T) {
+	db := openSerializableMemoryDB(t)
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxSerializableReadCollections; i++ {
+		handle := tx.Collection(fmt.Sprintf("dynamic_%03d", i))
+		if handle.state == nil || handle.initialErr != nil {
+			t.Fatalf("dynamic state %d: state=%p err=%v", i, handle.state, handle.initialErr)
+		}
+	}
+	retained := len(tx.colls)
+	escaped := tx.Collection("overflow_escaped")
+	if escaped.state != nil || !errors.Is(escaped.initialErr, ErrTxTooLarge) {
+		t.Fatalf("overflow handle state=%p err=%v", escaped.state, escaped.initialErr)
+	}
+	for i := 0; i < 1024; i++ {
+		handle := tx.Collection(fmt.Sprintf("overflow_%04d", i))
+		if handle.state != nil {
+			t.Fatalf("overflow handle %d retained state", i)
+		}
+		if _, _, err := handle.Get("k"); !errors.Is(err, ErrTxTooLarge) {
+			t.Fatalf("overflow Get %d = %v", i, err)
+		}
+	}
+	if len(tx.colls) != retained || tx.dynamicStates != maxSerializableReadCollections {
+		t.Fatalf("rejected names retained states=%d dynamic=%d, want %d",
+			len(tx.colls), tx.dynamicStates, retained)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := escaped.Get("k"); !errors.Is(err, ErrTxTooLarge) {
+		t.Fatalf("escaped rejected handle = %v", err)
+	}
+}
+
+func TestNativeSerializableFailedPutsReleaseCanonicalScratch(t *testing.T) {
+	db := openSerializableMemoryDB(t)
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.txnLimits.MaxDocuments = 1
+	if _, err := tx.Collection("seed").Put("k", []byte(`{"payload":"seed"}`)); err != nil {
+		t.Fatal(err)
+	}
+	document := []byte(`{"payload":"` + strings.Repeat("x", 64<<10) + `"}`)
+	var escaped *TxCollection
+	for i := 0; i < 32; i++ {
+		handle := tx.Collection(fmt.Sprintf("failed_%03d", i))
+		if _, err := handle.Put("k", document); !errors.Is(err, ErrTxTooLarge) {
+			t.Fatalf("failed Put %d = %v", i, err)
+		}
+		if handle.state.canonical != nil {
+			t.Fatalf("failed Put %d retained %d-byte canonical scratch",
+				i, cap(handle.state.canonical))
+		}
+		escaped = handle
+	}
+	state := escaped.state
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if state.canonical != nil || state.pending != nil || state.readSet != nil {
+		t.Fatal("escaped failed-Put state retained transaction storage")
+	}
+}
+
 func TestNativeSerializableDirectWriterCannotCrossValidationPublication(t *testing.T) {
 	db := openSerializableMemoryDB(t)
 	defer db.Close()
@@ -444,7 +516,12 @@ func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) 
 	db := openSerializableMemoryDB(t)
 	defer db.Close()
 	db.clockMu.Lock()
-	db.txnActive = map[uint64]uint64{0: maxTxnActiveCount - 1}
+	db.txnActive = map[uint64]txnActiveRevision{
+		0: {count: maxTxnActiveCount - 1},
+	}
+	db.txnActiveOldest = 0
+	db.txnActiveNewest = 0
+	db.txnActiveLinked = true
 	db.txnActiveCount.Store(maxTxnActiveCount - 1)
 	db.clockMu.Unlock()
 
@@ -452,18 +529,34 @@ func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.txnActive[0] != maxTxnActiveCount ||
+	if db.txnActive[0].count != maxTxnActiveCount ||
 		db.txnActiveCount.Load() != maxTxnActiveCount {
 		t.Fatalf("begin did not saturate bucket=%d active=%d",
-			db.txnActive[0], db.txnActiveCount.Load())
+			db.txnActive[0].count, db.txnActiveCount.Load())
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if db.txnActive[0] != maxTxnActiveCount ||
+	if db.txnActive[0].count != maxTxnActiveCount ||
 		db.txnActiveCount.Load() != maxTxnActiveCount {
 		t.Fatalf("finish decremented saturated bucket=%d active=%d",
-			db.txnActive[0], db.txnActiveCount.Load())
+			db.txnActive[0].count, db.txnActiveCount.Load())
+	}
+	for i := 0; i < 1024; i++ {
+		db.clockMu.Lock()
+		db.txnRevision++
+		db.clockMu.Unlock()
+		transient, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := transient.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(db.txnActive) != 1 || db.txnActiveOldest != 0 || db.txnActiveNewest != 0 {
+		t.Fatalf("saturated directory grew: entries=%d oldest=%d newest=%d",
+			len(db.txnActive), db.txnActiveOldest, db.txnActiveNewest)
 	}
 	if _, err := db.Collection("c").Put("k", []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
@@ -471,6 +564,94 @@ func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) 
 	if history := db.txnHistories["c"]; history == nil || history.LastWrite == 0 {
 		t.Fatal("saturated coordinator allowed publication history to disarm")
 	}
+}
+
+func TestNativeSerializableActiveRevisionDirectoryTurnover(t *testing.T) {
+	db := openSerializableMemoryDB(t)
+	defer db.Close()
+	oldest, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4096; i++ {
+		db.clockMu.Lock()
+		db.txnRevision = uint64(i)
+		db.clockMu.Unlock()
+		transient, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := transient.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		db.clockMu.Lock()
+		entries := len(db.txnActive)
+		gotOldest := db.oldestActiveLocked()
+		db.clockMu.Unlock()
+		if entries != 1 || gotOldest != oldest.beginRev {
+			t.Fatalf("turnover %d: entries=%d oldest=%d want %d",
+				i, entries, gotOldest, oldest.beginRev)
+		}
+	}
+	if err := oldest.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if db.txnActiveCount.Load() != 0 || db.txnActive != nil || db.txnActiveLinked {
+		t.Fatalf("quiescence retained count=%d entries=%d linked=%v",
+			db.txnActiveCount.Load(), len(db.txnActive), db.txnActiveLinked)
+	}
+}
+
+func TestNativeSerializableActiveRevisionDirectoryUnlinksOutOfOrder(t *testing.T) {
+	db := openSerializableMemoryDB(t)
+	defer db.Close()
+	transactions := make([]*Tx, 256)
+	for i := range transactions {
+		db.clockMu.Lock()
+		db.txnRevision = uint64(i)
+		db.clockMu.Unlock()
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		transactions[i] = tx
+	}
+	for i := 1; i < len(transactions); i += 2 {
+		if err := transactions[i].Rollback(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(db.txnActive) != len(transactions)/2 || db.oldestActiveLocked() != 0 {
+		t.Fatalf("out-of-order directory entries=%d oldest=%d",
+			len(db.txnActive), db.oldestActiveLocked())
+	}
+	for i := 0; i < len(transactions); i += 2 {
+		if err := transactions[i].Rollback(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if db.txnActiveCount.Load() != 0 || db.txnActive != nil || db.txnActiveLinked {
+		t.Fatalf("out-of-order cleanup count=%d entries=%d linked=%v",
+			db.txnActiveCount.Load(), len(db.txnActive), db.txnActiveLinked)
+	}
+}
+
+func BenchmarkNativeSerializableActiveRevisionTurnover(b *testing.B) {
+	db := &Database{}
+	oldest := &Tx{}
+	db.armClockForBegin(oldest)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db.clockMu.Lock()
+		db.txnRevision++
+		db.clockMu.Unlock()
+		transient := &Tx{}
+		db.armClockForBegin(transient)
+		db.finishClock(transient, nil)
+	}
+	b.StopTimer()
+	db.finishClock(oldest, nil)
 }
 
 func TestNativeSerializableCoordinatorRevisionExhaustionIsPermanent(t *testing.T) {

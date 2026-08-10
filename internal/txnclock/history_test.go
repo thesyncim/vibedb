@@ -53,3 +53,50 @@ func TestExternalHistoryOwnsInsertedKeys(t *testing.T) {
 		t.Fatal("history retained mutable caller storage")
 	}
 }
+
+func TestExternalHistoryRecordAtRetainsDuplicateSafety(t *testing.T) {
+	var history ExternalHistory
+	keys := make([]string, HistoryKeys)
+	for i := range keys {
+		keys[i] = "same"
+	}
+	history.RecordAt(1, 0, keys)
+	if history.Floor != 0 || len(history.Writes) != 1 || history.Writes["same"] != 1 {
+		t.Fatalf("duplicate record floor=%d writes=%v", history.Floor, history.Writes)
+	}
+}
+
+func TestExternalHistoryRecordUniqueAtBoundsAndOwnsKeys(t *testing.T) {
+	var history ExternalHistory
+	keys := make([]string, HistoryKeys)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k-%05d", i)
+	}
+	borrowedBytes := []byte("k-00000")
+	keys[0] = unsafe.String(unsafe.SliceData(borrowedBytes), len(borrowedBytes))
+	history.RecordUniqueAt(1, 0, keys)
+	if history.Floor != 0 || len(history.Writes) != HistoryKeys {
+		t.Fatalf("unique record floor=%d writes=%d", history.Floor, len(history.Writes))
+	}
+	borrowedBytes[0] = 'X'
+	if !history.ConflictPoint(0, "k-00000") {
+		t.Fatal("unique history retained caller key slice storage")
+	}
+	history.RecordUniqueAt(2, 0, []string{"overflow"})
+	if history.Floor != 2 || history.Writes != nil {
+		t.Fatalf("unique overflow floor=%d writes=%d", history.Floor, len(history.Writes))
+	}
+}
+
+func BenchmarkExternalHistoryRecordUniqueAt4096(b *testing.B) {
+	keys := make([]string, HistoryKeys)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k-%05d", i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var history ExternalHistory
+		history.RecordUniqueAt(1, 0, keys)
+	}
+}
