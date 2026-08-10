@@ -156,7 +156,14 @@ func (c *shardConn) executeQuery(
 	prep *sqldriver.Prepared,
 	args []any,
 ) *ShardResponse {
-	if err := c.sess.Begin(ctx, sqldriver.TxOptions{ReadOnly: true}); err != nil {
+	// A request is one statement-level snapshot. The SQL runtime defaults to
+	// Read Committed, which refreshes the committed base before each statement;
+	// pin this read-only transaction explicitly so a concurrent write cannot
+	// leak into a result whose execution has already begun.
+	if err := c.sess.Begin(ctx, sqldriver.TxOptions{
+		ReadOnly:  true,
+		Isolation: sqldriver.IsolationRepeatableRead,
+	}); err != nil {
 		return classifyError(err)
 	}
 	// Release the snapshot unconditionally; a canceled request context must not
