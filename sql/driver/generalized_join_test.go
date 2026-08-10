@@ -264,7 +264,9 @@ func TestGeneralizedJoinTransactionSnapshotAndReadYourWrites(t *testing.T) {
 	db := openTestDB(t)
 	db.SetMaxOpenConns(4)
 	seedGeneralizedJoinTables(t, db)
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

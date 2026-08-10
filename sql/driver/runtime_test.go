@@ -338,7 +338,9 @@ func TestTypedRuntimeSnapshotCatalogErrorsAreStable(t *testing.T) {
 	if _, err := base.Exec(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Begin(ctx, TxOptions{}); err != nil {
+	if err := session.Begin(ctx, TxOptions{
+		Isolation: IsolationRepeatableRead,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	late := runtimePrepare(t, other,
@@ -358,7 +360,9 @@ func TestTypedRuntimeSnapshotCatalogErrorsAreStable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := session.Begin(ctx, TxOptions{}); err != nil {
+	if err := session.Begin(ctx, TxOptions{
+		Isolation: IsolationRepeatableRead,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	later := runtimePrepare(t, other,
@@ -375,7 +379,9 @@ func TestTypedRuntimeSnapshotCatalogErrorsAreStable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := session.Begin(ctx, TxOptions{}); err != nil {
+	if err := session.Begin(ctx, TxOptions{
+		Isolation: IsolationRepeatableRead,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	latest := runtimePrepare(t, other,
@@ -797,6 +803,14 @@ func TestTypedRuntimeCancellationAndExternalFailureState(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	flag.Cancel()
+	if err := session.Begin(ctx, TxOptions{}); !errors.Is(err, query.ErrCanceled) {
+		t.Fatalf("pre-canceled BEGIN = %v, want query.ErrCanceled", err)
+	}
+	if session.State() != SessionIdle {
+		t.Fatalf("pre-canceled BEGIN left state %s, want idle", session.State())
+	}
+	flag.Reset()
 	if err := session.Begin(ctx, TxOptions{}); err != nil {
 		t.Fatal(err)
 	}

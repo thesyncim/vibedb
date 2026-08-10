@@ -98,12 +98,30 @@ func (s SessionState) String() string {
 	}
 }
 
-// TxOptions is the transaction policy the current SQL runtime supports.
-//
-// Transactions always provide snapshot isolation. ReadOnly prevents every DML
-// and DDL execution while retaining the same multi-table snapshot semantics.
+// IsolationLevel selects when a transaction refreshes its committed read cut
+// and which read dependencies COMMIT validates.
+type IsolationLevel uint8
+
+const (
+	// IsolationDefault uses Read Committed, matching database/sql and pgwire.
+	IsolationDefault IsolationLevel = iota
+	// IsolationReadCommitted captures one coherent cut at each data statement.
+	IsolationReadCommitted
+	// IsolationRepeatableRead retains the coherent cut captured by BEGIN.
+	IsolationRepeatableRead
+	// IsolationSerializable retains the BEGIN cut and rejects a publishing
+	// commit when a table it read changed after BEGIN.
+	IsolationSerializable
+
+	// IsolationSnapshot is an alias for the fixed-cut Repeatable Read mode.
+	IsolationSnapshot = IsolationRepeatableRead
+)
+
+// TxOptions is the transaction policy for the current SQL runtime.
+// ReadOnly prevents every DML and DDL execution.
 type TxOptions struct {
-	ReadOnly bool
+	ReadOnly  bool
+	Isolation IsolationLevel
 }
 
 // Session is one typed SQL execution session.
@@ -241,16 +259,27 @@ func (s *Session) Prepare(ctx context.Context, text string) (*Prepared, error) {
 	return prepared, nil
 }
 
-// Begin captures one coherent, generation-leased snapshot of every cataloged
-// table. Nested transactions are rejected.
+// Begin starts a transaction at the requested isolation level. Read Committed
+// refreshes one coherent generation-leased cut per physical statement;
+// Repeatable Read and Serializable retain the cut captured here. Nested
+// transactions are rejected.
 func (s *Session) Begin(ctx context.Context, options TxOptions) error {
+	if s != nil && s.conn != nil {
+		ctx = withCooperativeCancellation(ctx, s.conn.exec.Options.Cancel)
+	}
 	if err := s.ready(ctx); err != nil {
 		return s.fail(err)
 	}
 	if s.state != SessionIdle || s.conn.tx != nil {
 		return ErrTransactionActive
 	}
-	if _, err := s.conn.BeginTx(ctx, sqldriver.TxOptions{ReadOnly: options.ReadOnly}); err != nil {
+	isolation, err := driverIsolationLevel(options.Isolation)
+	if err != nil {
+		return err
+	}
+	if _, err := s.conn.BeginTx(ctx, sqldriver.TxOptions{
+		ReadOnly: options.ReadOnly, Isolation: isolation,
+	}); err != nil {
 		return err
 	}
 	s.state = SessionInTransaction

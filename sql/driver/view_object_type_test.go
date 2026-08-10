@@ -1,6 +1,8 @@
 package driver
 
 import (
+	"context"
+	stdsql "database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -145,7 +147,9 @@ func TestTransactionMutationRevalidatesCurrentViewObjectType(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	transaction, err := db.Begin()
+	transaction, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

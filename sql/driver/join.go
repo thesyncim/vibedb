@@ -72,9 +72,9 @@ func (c *conn) materializeDurableJoinSource(
 }
 
 // materializeTransactionJoinSource is the transactional twin. Every base
-// snapshot came from BEGIN while the driver catalog held all writers out, and
-// pending rows are overlaid exactly as tx.view does. No fresh durable snapshot
-// is taken here, so repeatable reads and read-your-writes both survive a join.
+// snapshot belongs to the transaction's current coherent cut, and pending rows
+// are overlaid exactly as tx.view does. Cut refresh happens before this call,
+// so both Read Committed and fixed-cut joins preserve read-your-writes.
 func (c *conn) materializeTransactionJoinSource(
 	ctx context.Context,
 	transaction *tx,
@@ -224,6 +224,34 @@ func selectExecutablePhysicalDependencies(
 	}
 	walk.appendSelect(statement)
 	return walk.dependencies
+}
+
+func dmlExecutablePhysicalDependencies(
+	statement *sqlast.Statement,
+) []physicalDependency {
+	if statement == nil {
+		return nil
+	}
+	var trees [2]*sqlast.SelectStmt
+	switch statement.Kind {
+	case sqlast.KindInsert:
+		trees[0] = statement.Insert.Source
+	case sqlast.KindUpdate:
+		trees[0], trees[1] = statement.Update.Filter, statement.Update.Returning
+	case sqlast.KindDelete:
+		trees[0], trees[1] = statement.Delete.Filter, statement.Delete.Returning
+	default:
+		return nil
+	}
+	var dependencies []physicalDependency
+	for _, tree := range trees {
+		for _, dependency := range selectExecutablePhysicalDependencies(tree) {
+			if !hasPhysicalDependency(dependencies, dependency.name) {
+				dependencies = append(dependencies, dependency)
+			}
+		}
+	}
+	return dependencies
 }
 
 // physicalDependencyWalk follows relation edges with an optional lexical WITH

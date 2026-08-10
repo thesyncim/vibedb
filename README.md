@@ -244,10 +244,12 @@ blindly retrying.
 
 - The project is unreleased; APIs and storage format version 0 are unstable.
 - DDL is atomic per statement but is not transactional.
-- Transactions provide snapshot isolation; write skew is possible because the
-  read set is not validated. Conflict detection covers handle-mediated writes
-  on the same `vibedb.Database`, `*sql.DB`, or pgwire endpoint — not writers
-  through a different handle to the same files.
+- Native read-write transactions are serializable. SQL and pgwire transactions
+  default to Read Committed, with explicit Repeatable Read/Snapshot and
+  Serializable modes. Conflict detection covers handle-mediated writes on the
+  same `vibedb.Database`, `*sql.DB`, or pgwire endpoint — not writers through a
+  different handle to the same files. Logical revisions, not wall-clock time,
+  order conflict checks.
 - An aborted transaction that wrote to a table absent at BEGIN can leave that
   empty table in the catalog; it holds no documents but is user-visible
   residue.

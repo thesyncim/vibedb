@@ -1552,8 +1552,9 @@ verified workflow. Mutable lookup indexes need either careful ordered locking
 with repair or a distributed transaction; they are not ordinary local exact
 indexes.
 
-The SQL layer currently provides snapshot isolation with first-committer-wins
-and crash-atomic multi-table commits inside one database (conditional journal
+The local SQL layer provides explicit Read Committed, Repeatable Read/Snapshot,
+and Serializable modes with first-committer-wins and crash-atomic multi-table
+commits inside one database (conditional journal
 records decided by one `txn.vtm` sync). Distribution does not upgrade those
 semantics to a multi-shard atomic commit. Cross-shard atomicity remains a
 separate track; see [multi-table-transactions.md](multi-table-transactions.md)

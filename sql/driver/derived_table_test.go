@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	stdsql "database/sql"
 	"errors"
 	"fmt"
@@ -187,7 +188,9 @@ func TestTransactionDerivedTableSnapshotAndReadYourWrites(t *testing.T) {
 		}
 	}
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

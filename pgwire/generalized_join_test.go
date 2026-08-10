@@ -119,7 +119,7 @@ func TestGeneralizedJoinTransactionSnapshotAndReadYourWrites(t *testing.T) {
 	seedGeneralizedJoinProtocol(t, c)
 	outside := dial(t, server)
 	outside.startup(map[string]string{"user": "outside", "database": "app"})
-	if msgs := c.query(`BEGIN`); has(msgs, msgErrorResponse) {
+	if msgs := c.query(`BEGIN ISOLATION LEVEL REPEATABLE READ`); has(msgs, msgErrorResponse) {
 		t.Fatalf("BEGIN: %s", tags(msgs))
 	}
 	if msgs := outside.query(`INSERT INTO orders VALUES (` +

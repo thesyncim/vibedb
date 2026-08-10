@@ -173,6 +173,35 @@ func newPreparseTestSession(t *testing.T) (*session, *bytes.Buffer) {
 	return s, output
 }
 
+func TestCancellationReportedAfterSuccessfulBeginRollsBackState(t *testing.T) {
+	s, _ := newPreparseTestSession(t)
+	stmt, err := s.prepare("", "BEGIN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.release()
+	if err := s.sql.Begin(context.Background(), stmt.txOptions); err != nil {
+		t.Fatal(err)
+	}
+	s.queryCancel.Cancel()
+	if !s.takeCancel() {
+		t.Fatal("successful BEGIN cancellation was not pending at the command boundary")
+	}
+	err = s.cancelSuccessfulBegin(stmt)
+	if !errors.Is(err, query.ErrCanceled) {
+		t.Fatalf("canceled successful BEGIN = %v, want query.ErrCanceled", err)
+	}
+	if state := s.sql.State(); state != sqldriver.SessionIdle {
+		t.Fatalf("canceled successful BEGIN left runtime state %s, want idle", state)
+	}
+	if err := s.sql.Begin(context.Background(), stmt.txOptions); err != nil {
+		t.Fatalf("BEGIN after canceled successful BEGIN: %v", err)
+	}
+	if err := s.sql.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMaxSimpleQueryPreparseCancellationExecutesNothingAndReusesSession(t *testing.T) {
 	s, output := newPreparseTestSession(t)
 	prefix := "SET application_name = 'must-not-stick'; /*"

@@ -303,7 +303,9 @@ func TestTransactionRepeatableReadsExcludeConcurrentPhantoms(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"base","kind":"x","name":"before"}`); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,9 +716,13 @@ func TestTransactionIsolationLevelContract(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.BeginTx(context.Background(),
-		&stdsql.TxOptions{Isolation: stdsql.LevelSerializable}); err == nil {
-		t.Fatal("LevelSerializable was accepted")
+	serializable, err := db.BeginTx(context.Background(),
+		&stdsql.TxOptions{Isolation: stdsql.LevelSerializable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serializable.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 	tx, err := db.BeginTx(context.Background(),
 		&stdsql.TxOptions{Isolation: stdsql.LevelSnapshot})

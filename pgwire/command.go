@@ -6,6 +6,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // The layer in front of the SQL engine: statement splitting, statement
@@ -191,10 +193,15 @@ func classifyCancelable(
 	return kindCatalogSQL, "", nil
 }
 
-// parseTransactionCommand admits the deliberately small transaction grammar
-// implemented by the typed runtime. Isolation and access modes belong in a
-// future SQL AST rather than being accepted and ignored here.
-func parseTransactionCommand(src string, kind statementKind) (bool, error) {
+type transactionMode struct {
+	readOnly  bool
+	isolation sqldriver.IsolationLevel
+}
+
+// parseTransactionCommand admits the transaction grammar implemented by the
+// typed runtime and returns every mode explicitly so none can be accepted and
+// then silently ignored.
+func parseTransactionCommand(src string, kind statementKind) (transactionMode, error) {
 	return parseTransactionCommandCancelable(src, kind, nil)
 }
 
@@ -202,62 +209,83 @@ func parseTransactionCommandCancelable(
 	src string,
 	kind statementKind,
 	check func() error,
-) (readOnlyResult bool, err error) {
+) (modeResult transactionMode, err error) {
 	s := newScanner(src, check)
 	defer func() {
 		if s.cancelErr != nil {
-			readOnlyResult = false
+			modeResult = transactionMode{}
 			err = s.cancelErr
 		}
 	}()
+	mode := transactionMode{}
 	leading := s.word()
 	switch kind {
 	case kindBegin:
+		mode.isolation = sqldriver.IsolationReadCommitted
 		if strings.EqualFold(leading, "START") {
 			if !strings.EqualFold(s.word(), "TRANSACTION") {
-				return false, newError(sqlstateSyntaxError,
+				return transactionMode{}, newError(sqlstateSyntaxError,
 					"START must be followed by TRANSACTION")
 			}
 		} else if next := s.peekWord(); strings.EqualFold(next, "WORK") ||
 			strings.EqualFold(next, "TRANSACTION") {
 			s.word()
 		}
-		readOnly := false
 		seenAccess := false
 		seenIsolation := false
+		afterComma := false
 		for {
 			next := s.peekWord()
 			switch {
 			case next == "":
-				if !s.atEnd() {
-					return false, newError(sqlstateSyntaxError,
+				if afterComma || !s.atEnd() {
+					return transactionMode{}, newError(sqlstateSyntaxError,
 						"malformed BEGIN transaction mode")
 				}
-				return readOnly, nil
+				return mode, nil
 			case strings.EqualFold(next, "READ"):
 				s.word()
 				access := s.word()
 				if seenAccess || (!strings.EqualFold(access, "ONLY") &&
 					!strings.EqualFold(access, "WRITE")) {
-					return false, newError(sqlstateSyntaxError,
+					return transactionMode{}, newError(sqlstateSyntaxError,
 						"READ must be followed once by ONLY or WRITE")
 				}
 				seenAccess = true
-				readOnly = strings.EqualFold(access, "ONLY")
+				mode.readOnly = strings.EqualFold(access, "ONLY")
+				afterComma = s.symbol(',')
 			case strings.EqualFold(next, "ISOLATION"):
 				s.word()
-				if seenIsolation || !strings.EqualFold(s.word(), "LEVEL") ||
-					!strings.EqualFold(s.word(), "REPEATABLE") ||
-					!strings.EqualFold(s.word(), "READ") {
-					return false, newError(sqlstateFeatureNotSupported,
-						"the SQL runtime supports only REPEATABLE READ snapshot isolation")
+				if seenIsolation || !strings.EqualFold(s.word(), "LEVEL") {
+					return transactionMode{}, newError(sqlstateSyntaxError,
+						"ISOLATION must be followed once by LEVEL and an isolation mode")
+				}
+				switch level := s.word(); {
+				case strings.EqualFold(level, "READ"):
+					if !strings.EqualFold(s.word(), "COMMITTED") {
+						return transactionMode{}, newError(sqlstateFeatureNotSupported,
+							"supported isolation levels are READ COMMITTED, REPEATABLE READ, and SERIALIZABLE")
+					}
+					mode.isolation = sqldriver.IsolationReadCommitted
+				case strings.EqualFold(level, "REPEATABLE"):
+					if !strings.EqualFold(s.word(), "READ") {
+						return transactionMode{}, newError(sqlstateSyntaxError,
+							"REPEATABLE must be followed by READ")
+					}
+					mode.isolation = sqldriver.IsolationRepeatableRead
+				case strings.EqualFold(level, "SERIALIZABLE"):
+					mode.isolation = sqldriver.IsolationSerializable
+				default:
+					return transactionMode{}, newError(sqlstateFeatureNotSupported,
+						"supported isolation levels are READ COMMITTED, REPEATABLE READ, and SERIALIZABLE")
 				}
 				seenIsolation = true
+				afterComma = s.symbol(',')
 			default:
-				return false, newError(sqlstateFeatureNotSupported,
+				return transactionMode{}, newError(sqlstateFeatureNotSupported,
 					"unsupported transaction mode").
-					withHint("supported modes are READ ONLY, READ WRITE, and " +
-						"ISOLATION LEVEL REPEATABLE READ")
+					withHint("supported access modes are READ ONLY and READ WRITE; " +
+						"supported isolation levels are READ COMMITTED, REPEATABLE READ, and SERIALIZABLE")
 			}
 		}
 	case kindCommit:
@@ -271,16 +299,16 @@ func parseTransactionCommandCancelable(
 			s.word()
 		}
 	default:
-		return false, newError(sqlstateInternalError, "invalid transaction command kind")
+		return transactionMode{}, newError(sqlstateInternalError, "invalid transaction command kind")
 	}
 	if !s.atEnd() {
 		// SAVEPOINT / RELEASE / ROLLBACK TO are classified separately. What
 		// remains here is AND CHAIN and other trailing modes this server
 		// refuses rather than silently ignore.
-		return false, newError(sqlstateFeatureNotSupported,
+		return transactionMode{}, newError(sqlstateFeatureNotSupported,
 			"chained transactions and additional transaction modes are not supported")
 	}
-	return false, nil
+	return mode, nil
 }
 
 // parseSavepointCommandCancelable admits SAVEPOINT, RELEASE [SAVEPOINT], and
@@ -971,9 +999,9 @@ var refusalHints = map[string]string{
 	"statement_timeout":                   "CancelRequest is supported, but this server has no SQL-configurable per-statement timer",
 	"lock_timeout":                        "there is no SQL lock manager; internal catalog ownership is not governed by PostgreSQL lock_timeout",
 	"idle_in_transaction_session_timeout": "there is no autonomous session timer for expiring an idle transaction",
-	"default_transaction_isolation":       "transactions use the runtime's fixed REPEATABLE READ snapshot isolation",
+	"default_transaction_isolation":       "transactions default to READ COMMITTED; choose another level explicitly on BEGIN",
 	"default_transaction_read_only":       "choose READ ONLY or READ WRITE explicitly on BEGIN",
-	"transaction_isolation":               "transactions use the runtime's fixed REPEATABLE READ snapshot isolation",
+	"transaction_isolation":               "choose READ COMMITTED, REPEATABLE READ, or SERIALIZABLE explicitly on BEGIN",
 	"role":                                "there is no role system",
 	"session_authorization":               "there is no role system",
 }

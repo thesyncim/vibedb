@@ -1,6 +1,6 @@
 # Contributing
 
-vibedb changes must preserve storage correctness, snapshot isolation,
+vibedb changes must preserve storage correctness, transaction isolation,
 durability, bounded memory, and format validation before improving a benchmark.
 The repository targets Go 1.26 and is unreleased. Format changes edit version
 0 in place, and every format or API break must leave the current tree

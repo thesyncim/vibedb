@@ -445,25 +445,30 @@ instant.
 
 ## Semantics
 
-### Isolation: snapshot isolation, named and bounded
+### Isolation: explicit, logical, and bounded
 
-Transactions provide snapshot isolation over one database on every surface.
-BEGIN captures one consistent multi-table cut — per-table generation-leased
-snapshots under `db.mu` for SQL, a `SnapshotCollections` cut for native.
-Reads see that cut plus the transaction's own staged writes; read-your-writes
-is mandatory on every surface. COMMIT succeeds only if no other committed
-transaction wrote any key in this transaction's write set after BEGIN
-(first-committer-wins over existence and value). The read set is not
-validated, so **write skew is possible**: T1 reads `oncall/alice` and writes
-`oncall/bob`; T2 reads `oncall/bob` and writes `oncall/alice`; both commit;
-a cross-row invariant can break. This is the model the driver already ships
-for one table, and the model DuckDB ships; it never blocks readers and never
-holds a writer across client think-time. A serializable opt-in via bounded
-read-set tracking (overflow degrading to a typed conflict) is a named
-follow-up, deliberately decoupled from the atomicity change.
+The native facade's read-write transactions are serializable. BEGIN registers
+a database-global logical revision before capturing one coherent
+`SnapshotCollections` cut. Exact point reads (including misses) retain bounded
+per-collection read dependencies; scans use a coarse collection marker.
+COMMIT locks the sorted union of read and written collections, validates those
+dependencies and the exact write set, then publishes and records one logical
+revision. This rejects write skew, phantoms, ABA changes, and a concurrent
+insert after an observed miss. Overflow fails closed with a conflict rather
+than weakening isolation.
 
-`database/sql` isolation acceptance is unchanged: LevelDefault and
-LevelSnapshot; anything else `ErrUnsupportedIsolation`.
+SQL and pgwire expose three policies. Default and Read Committed capture one
+coherent catalog cut per physical statement. Repeatable Read (also named
+Snapshot by the typed API) retains the BEGIN cut. Serializable retains the
+BEGIN cut and validates every physical relation read by a publishing
+transaction, in addition to exact first-committer-wins write validation. Every
+mode overlays staged writes and therefore preserves read-your-writes.
+
+`database/sql` accepts LevelDefault/LevelReadCommitted,
+LevelRepeatableRead/LevelSnapshot, and LevelSerializable. Read Uncommitted and
+Linearizable are refused with `ErrUnsupportedIsolation`. Conflict ordering is
+entirely logical; wall-clock time and clock synchronization are not part of the
+correctness protocol.
 
 ### Conflicts
 
@@ -826,7 +831,9 @@ file ownership, and per-task test obligations.
 - **Single-sync multi-collection commit** (shared redo in the decision log) —
   the perf follow-up, justified only by measured K+1-sync numbers; the
   decision-log format reserves room for it as an additive record kind.
-- **Serializable opt-in** via bounded read-set tracking — named follow-up.
+- **Exact SQL Serializable point-read dependencies** — a concurrency
+  refinement over the current relation-coarse validation, not a correctness
+  prerequisite.
 - **Buffered-volatile, async-COW, and chain-fence multi-collection
   transactions** — typed refusal this pass; the facade Buffered profile is
   therefore refused for native multi-collection transactions.

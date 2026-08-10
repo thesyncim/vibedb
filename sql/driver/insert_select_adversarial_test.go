@@ -119,7 +119,9 @@ func TestPreparedInsertSelectPhysicalSourceReplacementIsViewChanged(t *testing.T
 			var tx *stdsql.Tx
 			if transaction {
 				var err error
-				tx, err = db.Begin()
+				tx, err = db.BeginTx(context.Background(), &stdsql.TxOptions{
+					Isolation: stdsql.LevelRepeatableRead,
+				})
 				if err != nil {
 					t.Fatal(err)
 				}

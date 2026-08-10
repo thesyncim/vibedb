@@ -118,6 +118,22 @@ func (c *Clock) Conflict(
 	return "", false, false
 }
 
+// ChangedSince reports whether any write was recorded after begin. Unlike
+// Conflict, it does not consult or consume the bounded exact-key history: the
+// monotonic revision is sufficient for a relation-coarse read dependency.
+// Revision exhaustion fails closed for the same reason as Conflict.
+func (c *Clock) ChangedSince(begin uint64) bool {
+	return c.revisionStopped || c.revision > begin
+}
+
+// Observe returns the current revision without registering another active
+// holder. Callers use it to stamp work derived from a cut captured while their
+// publication mutex is held; the transaction's original Begin token remains
+// active and retains every exact-key history entry the newer stamp may need.
+func (c *Clock) Observe() uint64 {
+	return c.revision
+}
+
 // Finish drops one transaction begun at begin and releases history that no
 // remaining active transaction can observe.
 func (c *Clock) Finish(begin uint64) {

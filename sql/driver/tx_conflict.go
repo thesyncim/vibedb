@@ -52,6 +52,14 @@ func (c *txConflictClock) conflict(
 	return c.clock.Conflict(begin, keys)
 }
 
+func (c *txConflictClock) changedSince(begin uint64) bool {
+	return c.clock.ChangedSince(begin)
+}
+
+func (c *txConflictClock) observe() uint64 {
+	return c.clock.Observe()
+}
+
 func (c *txConflictClock) finish(begin uint64) {
 	c.clock.Finish(begin)
 	c.syncView()

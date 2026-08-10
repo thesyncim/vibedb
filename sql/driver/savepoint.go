@@ -163,6 +163,7 @@ func restoreSavepointTable(state *txTable, mark *savepointTableMark) {
 		}
 		entry.existed = previous.existed
 		entry.remove = previous.remove
+		entry.conflictRevision = previous.conflictRevision
 		if previous.remove {
 			entry.document = nil
 		} else {
@@ -178,7 +179,10 @@ func cloneTxMutation(src *txMutation) *txMutation {
 	if src == nil {
 		return nil
 	}
-	dst := &txMutation{remove: src.remove, existed: src.existed}
+	dst := &txMutation{
+		remove: src.remove, existed: src.existed,
+		conflictRevision: src.conflictRevision,
+	}
 	if len(src.document) != 0 {
 		dst.document = append([]byte(nil), src.document...)
 	}

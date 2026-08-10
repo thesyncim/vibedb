@@ -509,17 +509,20 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 				t := c.db.tables[s.query.Collection()]
 				if t != nil {
 					s.pointPredicate = s.query.DrivingPredicate()
-					s.primaryPoint = isPrimaryPredicate(
-						s.pointPredicate, t.meta.PrimaryKey)
-					if !s.primaryPoint {
-						s.pointPredicate = nil
-					}
+					s.pointPath, s.pointCandidate = primaryPredicateIdentity(
+						s.pointPredicate,
+					)
+					s.primaryPoint = s.pointCandidate &&
+						s.pointPath == t.meta.PrimaryKey
 				}
 				c.db.mu.RUnlock()
 			}
 		}
 	} else {
 		s.mutation, err = query.PrepareParsedDML(src, tree)
+		if err == nil {
+			s.dependencies = dmlExecutablePhysicalDependencies(tree)
+		}
 		if err == nil && tree.Kind == sqlast.KindInsert &&
 			tree.Insert.Source != nil {
 			s.applyInsertSourceDocumentParams()

@@ -351,3 +351,22 @@ func BenchmarkClockConflictNoWrites(b *testing.B) {
 		clock.Conflict(begin, keys)
 	}
 }
+
+func TestClockChangedSinceDoesNotDependOnExactHistory(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+	begin := clock.Begin()
+	if clock.ChangedSince(begin) {
+		t.Fatal("new clock changed before a publication")
+	}
+	for i := 0; i < HistoryKeys+1; i++ {
+		clock.RecordKeys([]string{fmt.Sprintf("key-%d", i)})
+	}
+	if !clock.ChangedSince(begin) {
+		t.Fatal("coarse dependency missed publications after exact-history overflow")
+	}
+	after := clock.Begin()
+	if clock.ChangedSince(after) {
+		t.Fatal("new begin token was older than the current revision")
+	}
+}

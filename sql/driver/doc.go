@@ -96,7 +96,7 @@
 // identity shape fuses into its defining plan. One recursively discovered
 // physical collection keeps the direct durable and exact-index path. Multiple
 // collections use one coherent reusable capture, and transactional execution
-// reads the BEGIN snapshot plus staged writes. All relation spools share
+// reads the current isolation cut plus staged writes. All relation spools share
 // ExecOptions.IntermediateBytes, publish no partial result on error or
 // cancellation, and retain no CTE state or marginal allocation when WITH is
 // absent.
@@ -119,7 +119,7 @@
 // The driver captures all participating durable collections in one coherent
 // leased snapshot. Generalized joins receive that catalog cut directly, so a
 // physical operand retains its durable scan and eligible exact-index path.
-// Transactions execute against the BEGIN cut plus the transaction overlay.
+// Transactions execute against their statement or BEGIN cut plus the overlay.
 // The legacy single-clause physical INNER/LEFT equi-join subset keeps its
 // established bounded heap path and storage-aware strategy; classification
 // happens once at preparation and ordinary point queries never initialize
@@ -135,10 +135,11 @@
 //
 // # Transactions
 //
-// BEGIN captures every cataloged table at one generation cut. Reads use that
-// cut overlaid with the transaction's own staged changes, providing snapshot
-// isolation, repeatable reads, phantom exclusion, and read-your-writes. Joins
-// execute the same BEGIN cut plus overlay under the relation and pair bounds.
+// Default and Read Committed transactions refresh every cataloged table at one
+// coherent generation cut before each physical statement. Repeatable Read and
+// Snapshot retain the BEGIN cut, providing repeatable reads and phantom
+// exclusion. Every mode overlays staged changes and preserves read-your-writes;
+// joins consume the same statement cut under the relation and pair bounds.
 //
 // A transaction may read and write several tables. COMMIT validates every
 // dirty table under the catalog lock (incarnation, bounded first-committer-wins
@@ -146,8 +147,9 @@
 // empty durable participants, then publishes: one dirty table through today's
 // Collection.Update path; two or more through durable.UpdateCollections against
 // the driver-owned decision log in <catalog>.tables/. Disjoint keys may commit
-// concurrently across tables. Write skew is possible under snapshot isolation:
-// the read set is not validated. An aborted or crashed transaction that wrote
+// concurrently across tables. Serializable publishing commits additionally
+// validate a bounded table-coarse read set, rejecting write skew rather than
+// silently weakening isolation. An aborted or crashed transaction that wrote
 // to a table absent at BEGIN can leave that empty table behind as catalog
 // residue. SAVEPOINT / RELEASE / ROLLBACK TO manage a bounded overlay stack
 // (64 frames); ROLLBACK TO does not lower high-water admission accounting and
@@ -158,7 +160,8 @@
 // durable.ErrCommitOutcomeUnknown: the unknown outcome is atomic across every
 // participating table, and further writes under the catalog refuse until reopen.
 //
-// Only default and database/sql snapshot isolation are accepted. Batch
+// Default/Read Committed, Repeatable Read/Snapshot, and Serializable are
+// accepted; weaker and linearizable levels are refused. Batch
 // document and byte bounds return ErrTransactionTooLarge wrapping
 // durable.ErrBatchTooLarge without partial publication. Catalog format version
 // 0 is the current and only accepted format; this unreleased driver does not

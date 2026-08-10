@@ -284,9 +284,9 @@ Any source, cancellation, budget, shape, schema, key, conflict, routing, or
 RETURNING error publishes no prefix. `ON CONFLICT DO NOTHING` preserves source
 order and RETURNING reports only admitted rows.
 
-Inside a transaction the source reads the `BEGIN` snapshot plus the overlay
-that existed when the statement began; successful rows enter that overlay as
-one atomic statement. The source and staged write share the normal result,
+Inside a transaction the source reads the isolation cut in effect when the
+statement began plus the overlay that already existed; successful rows enter
+that overlay as one atomic statement. The source and staged write share the normal result,
 intermediate, cancellation, transaction, and durable document/batch limits.
 The root query result is admitted while it grows against the remainder left by
 every simultaneously live derived, CTE, set, window, join, and scalar spool;
@@ -679,8 +679,8 @@ for containers until an index can certify structural completeness, and for
 second child row that must raise `21000`.
 
 All relations come from one coherent statement snapshot. Explicit transactions
-read their BEGIN snapshot plus pending writes, self-correlation reuses that same
-catalog generation, and prepared execution revalidates every physical
+read their current isolation cut plus pending writes, self-correlation reuses
+that same catalog generation, and prepared execution revalidates every physical
 dependency before scanning. Group tables, deduplicated value membership, and
 copied variable-width values are charged to the ordinary work-memory account.
 Cancellation, exact one-byte-short admission, and scalar cardinality errors
@@ -749,8 +749,9 @@ execution, including when the CTE is a generalized-join operand. Multiple
 physical collections execute from one reusable coherent generation cut;
 generalized joins consume that cut directly, while other catalog-requiring CTE
 shapes retain their bounded adapter materialization. In a transaction the same
-graph reads the BEGIN snapshot plus the transaction overlay, preserving
-repeatable reads and read-your-writes.
+graph reads the current isolation cut plus the transaction overlay. Repeatable
+Read and Serializable retain that cut from BEGIN; Read Committed refreshes it
+per physical statement. Every mode preserves read-your-writes.
 
 Relation spools share the statement-wide intermediate allowance described
 below. Admission, cancellation, or binding failure publishes no partial spool
@@ -821,9 +822,9 @@ The derived query reads the same catalog snapshot as the outer statement.
 Ordinary joined derived relations materialize once as bounded operands; a
 correlated `LATERAL` relation instead uses the APPLY path described above.
 
-Joins inside a transaction use the snapshots captured by BEGIN plus that
-transaction's staged overlay. They preserve repeatable reads and
-read-your-writes.
+Joins inside a transaction use the current isolation cut plus that
+transaction's staged overlay. Repeatable Read and Serializable preserve the
+BEGIN cut; Read Committed refreshes the complete cut per physical statement.
 
 ## UPDATE and DELETE
 
@@ -868,15 +869,13 @@ The collection's bounded batch admission still applies.
 
 ## Transactions
 
-BEGIN captures a generation-leased snapshot of every table present in the
-catalog while the driver excludes its writers. Every later SELECT and mutation
-reads that fixed cut overlaid with the transaction's staged writes. The result
-is snapshot isolation with repeatable reads, phantom exclusion, and
-read-your-writes. The read set is not validated, so write skew is possible:
-T1 reads `oncall/alice` and writes `oncall/bob`; T2 reads `oncall/bob` and
-writes `oncall/alice`; both commit; a cross-row invariant can break. This is
-the model the driver ships for one table and for many; it never blocks readers
-and never holds a writer across client think-time.
+Default and Read Committed transactions replace their committed base with one
+coherent catalog cut before every physical statement. Repeatable Read and the
+typed Snapshot alias retain the generation-leased BEGIN cut. Serializable also
+retains the BEGIN cut and validates the physical relations read by a publishing
+transaction, rejecting write skew and phantoms. Every policy overlays staged
+writes and preserves read-your-writes; none holds a writer across client
+think-time.
 
 A transaction may read and write several tables. One dirty table commits
 through today's `Collection.Update` path. Two or more dirty tables commit
@@ -887,15 +886,17 @@ lanes. Writes to tables absent at BEGIN materialize an empty durable file as a
 participant; an aborted or crashed transaction can leave that empty table
 behind as documented catalog residue. DDL is rejected inside a transaction.
 
-COMMIT uses a bounded per-table, per-key publication clock. If any written key
-was published after BEGIN, including a change-and-restore (ABA),
-`driver.ErrTransactionConflict` is returned (SQLSTATE `40001` on the wire) and
-nothing is published. This first-committer-wins check retains revisions rather
-than copies of the original documents, and disjoint-key writers remain
-independent. Conflict scope is handle-mediated — the same `*sql.DB` or pgwire
-endpoint. The clock retains at most 4,096 changed keys; overflow moves a
-history floor and conservatively rejects older transactions instead of risking
-a missed conflict. There is no auto-retry: a retry re-runs caller code.
+COMMIT uses a bounded per-table, per-key publication clock. Read Committed
+stamps a key when it first enters the overlay from a statement cut; fixed-cut
+modes stamp it at BEGIN. If that key was published after its observation,
+including a change-and-restore (ABA), `driver.ErrTransactionConflict` is
+returned (SQLSTATE `40001` on the wire) and nothing is published. This
+first-committer-wins check retains revisions rather than copies of the original
+documents, and disjoint-key writers remain independent. Conflict scope is
+handle-mediated — the same `*sql.DB` or pgwire endpoint. The clock retains at
+most 4,096 changed keys; overflow moves a history floor and conservatively
+rejects observations older than that floor instead of risking a missed
+conflict. There is no auto-retry: a retry re-runs caller code.
 Otherwise all staged puts and deletes are submitted — one dirty table through
 `Collection.Update`, several through `UpdateCollections` — including
 exact-index maintenance. ROLLBACK closes the leases and discards the overlay.
@@ -922,9 +923,11 @@ transaction is SQLSTATE `25P02`. `database/sql` users reach all three as
 statement text through `tx.Exec`. Nested native `Update` closures are a typed
 error, not an implicit savepoint.
 
-The typed runtime accepts only its default and snapshot isolation levels;
-`database/sql` maps those directly, and the PostgreSQL spellings admitted by
-`pgwire` are listed below. Read-only transactions reject mutations.
+The typed runtime accepts Default/Read Committed, Repeatable Read/Snapshot, and
+Serializable. `database/sql` maps its corresponding standard levels directly,
+and the PostgreSQL spellings admitted by `pgwire` are listed below. Read
+Uncommitted and Linearizable are refused rather than silently weakened.
+Read-only transactions reject mutations.
 
 Transactions and atomic multi-row statements are bounded by the collection's
 `MaxBatchDocuments` and `MaxBatchBytes`, plus cross-table `TxnLimits`
@@ -935,9 +938,9 @@ lanes refuse multi-table commits with
 `driver.ErrTransactionUnsupportedLane`.
 
 PostgreSQL sessions expose the same state as ReadyForQuery `I`, `T`, or `E`.
-`BEGIN`, `BEGIN READ WRITE`, `BEGIN READ ONLY`, and
-`BEGIN ISOLATION LEVEL REPEATABLE READ` map to the typed runtime; other
-isolation claims are rejected rather than silently weakened. An error inside
+`BEGIN`, `BEGIN READ WRITE`, `BEGIN READ ONLY`, and `BEGIN ISOLATION LEVEL` with
+`READ COMMITTED`, `REPEATABLE READ`, or `SERIALIZABLE` map to the typed runtime;
+other isolation claims are rejected rather than silently weakened. An error inside
 an explicit transaction leaves ROLLBACK and `ROLLBACK TO` usable; other
 commands report failed-transaction status (`25P02`) until one of those
 recovers the session. COMMIT in that failed state performs the rollback and

@@ -58,7 +58,7 @@ var (
 	// BEGIN and COMMIT/ROLLBACK.
 	ErrDDLInTransaction = errors.New("vibedb: schema definitions cannot run inside a transaction")
 	// ErrUnsupportedIsolation reports a requested transaction isolation level
-	// other than the default or snapshot isolation.
+	// other than Read Committed, Repeatable Read/Snapshot, or Serializable.
 	ErrUnsupportedIsolation = errors.New("vibedb: unsupported transaction isolation level")
 	// ErrTransactionTooLarge reports a transaction whose distinct write keys
 	// exceed the collection's atomic WriteBatch reservation.
