@@ -10,12 +10,10 @@ import (
 
 // These compact active-record directories turn cross-generation validation
 // into merge walks. They are planner metadata, not lifetime tombstones: the
-// high-waters remain constant-size under churn. Each reference is exactly eight
-// bytes and points back into already-retained immutable catalog arrays.
-type plannerIndexLineageRef struct {
-	table uint32
-	index uint32
-}
+// high-waters remain constant-size under churn. Each index reference is one
+// four-byte ordinal; plannerIndex already carries its owning placement ordinal.
+// Each shard reference is eight bytes and points into its immutable manifest.
+type plannerIndexLineageRef uint32
 
 type plannerShardLineageRef struct {
 	manifest uint32
@@ -24,21 +22,16 @@ type plannerShardLineageRef struct {
 
 func buildPlannerIndexLineage(
 	indexes []plannerIndex,
-	spans []plannerIndexSpan,
 ) []plannerIndexLineageRef {
 	if len(indexes) == 0 {
 		return nil
 	}
-	refs := make([]plannerIndexLineageRef, 0, len(indexes))
-	for tableOrdinal, span := range spans {
-		for i := uint32(0); i < span.count; i++ {
-			refs = append(refs, plannerIndexLineageRef{
-				table: uint32(tableOrdinal), index: span.first + i,
-			})
-		}
+	refs := make([]plannerIndexLineageRef, len(indexes))
+	for i := range indexes {
+		refs[i] = plannerIndexLineageRef(i)
 	}
 	slices.SortFunc(refs, func(a, b plannerIndexLineageRef) int {
-		return cmpUint64(indexes[a.index].indexID, indexes[b.index].indexID)
+		return cmpUint64(indexes[a].indexID, indexes[b].indexID)
 	})
 	return refs
 }
@@ -85,8 +78,56 @@ func cmpUint64(a, b uint64) int {
 }
 
 func (s *Snapshot) indexMetadataForLineage(ref plannerIndexLineageRef) IndexMetadata {
-	table := s.config.Placements[s.planner[ref.table].placement].Table
-	return s.indexMetadata(table, ref.index)
+	return s.indexMetadataForOrdinal(uint32(ref))
+}
+
+func (s *Snapshot) indexMetadataForOrdinal(ordinal uint32) IndexMetadata {
+	entry := s.plannerIndexes[ordinal]
+	table := s.config.Placements[entry.placement].Table
+	pathCount := entry.pathCount()
+	metadata := IndexMetadata{
+		IndexID: entry.indexID, Incarnation: entry.incarnation,
+		Table: table, Name: s.indexName(entry.name), PathCount: pathCount,
+		Flags: entry.flags(), Lifecycle: entry.lifecycle(),
+	}
+	for i := uint8(0); i < pathCount; i++ {
+		metadata.Paths[i] = s.indexString(s.plannerIndexPaths[entry.pathBase+uint32(i)])
+	}
+	return metadata
+}
+
+const plannerIndexDefinitionMask = plannerIndexFlagsMask | plannerIndexPathCountMask
+
+func samePlannerIndexLogicalIdentity(
+	aSnapshot *Snapshot,
+	a plannerIndex,
+	bSnapshot *Snapshot,
+	b plannerIndex,
+) bool {
+	return aSnapshot.config.Placements[a.placement].Table ==
+		bSnapshot.config.Placements[b.placement].Table &&
+		aSnapshot.indexName(a.name) == bSnapshot.indexName(b.name)
+}
+
+func samePlannerIndexDefinition(
+	aSnapshot *Snapshot,
+	a plannerIndex,
+	bSnapshot *Snapshot,
+	b plannerIndex,
+) bool {
+	if a.properties()&plannerIndexDefinitionMask !=
+		b.properties()&plannerIndexDefinitionMask ||
+		!samePlannerIndexLogicalIdentity(aSnapshot, a, bSnapshot, b) {
+		return false
+	}
+	pathCount := a.pathCount()
+	for i := uint8(0); i < pathCount; i++ {
+		if aSnapshot.indexString(aSnapshot.plannerIndexPaths[a.pathBase+uint32(i)]) !=
+			bSnapshot.indexString(bSnapshot.plannerIndexPaths[b.pathBase+uint32(i)]) {
+			return false
+		}
+	}
+	return true
 }
 
 func compareShardLineageRefsInConfig(
@@ -240,38 +281,39 @@ func advanceIndexIDHighWater(current, next *Snapshot) (uint64, error) {
 
 	currentOrdinal := 0
 	for _, nextRef := range next.indexLineage {
-		metadata := next.indexMetadataForLineage(nextRef)
+		nextEntry := next.plannerIndexes[nextRef]
 		for currentOrdinal < len(current.indexLineage) &&
-			current.plannerIndexes[current.indexLineage[currentOrdinal].index].indexID < metadata.IndexID {
+			current.plannerIndexes[current.indexLineage[currentOrdinal]].indexID < nextEntry.indexID {
 			currentOrdinal++
 		}
 		active := currentOrdinal < len(current.indexLineage) &&
-			current.plannerIndexes[current.indexLineage[currentOrdinal].index].indexID == metadata.IndexID
-		var old IndexMetadata
+			current.plannerIndexes[current.indexLineage[currentOrdinal]].indexID == nextEntry.indexID
+		var oldEntry plannerIndex
 		if active {
-			old = current.indexMetadataForLineage(current.indexLineage[currentOrdinal])
+			oldEntry = current.plannerIndexes[current.indexLineage[currentOrdinal]]
 		}
 		switch {
-		case active && metadata.Incarnation == old.Incarnation:
-			if !sameIndexDefinition(old, metadata) || metadata.Lifecycle < old.Lifecycle {
+		case active && nextEntry.incarnation == oldEntry.incarnation:
+			if !samePlannerIndexDefinition(current, oldEntry, next, nextEntry) ||
+				nextEntry.lifecycle() < oldEntry.lifecycle() {
 				return 0, &CatalogError{Reason: fmt.Sprintf(
 					"index %d changed definition or regressed lifecycle within one incarnation",
-					metadata.IndexID)}
+					nextEntry.indexID)}
 			}
-		case active && metadata.Incarnation > old.Incarnation:
-			if metadata.Table != old.Table || metadata.Name != old.Name {
+		case active && nextEntry.incarnation > oldEntry.incarnation:
+			if !samePlannerIndexLogicalIdentity(current, oldEntry, next, nextEntry) {
 				return 0, &CatalogError{Reason: fmt.Sprintf(
-					"index %d replacement changed logical identity", metadata.IndexID)}
+					"index %d replacement changed logical identity", nextEntry.indexID)}
 			}
 		case active:
 			return 0, &CatalogError{Reason: fmt.Sprintf(
-				"index %d incarnation regressed", metadata.IndexID)}
-		case metadata.IndexID <= current.indexIDHighWater:
+				"index %d incarnation regressed", nextEntry.indexID)}
+		case nextEntry.indexID <= current.indexIDHighWater:
 			return 0, &CatalogError{Reason: fmt.Sprintf(
 				"index id %d was reused below the lifetime high-water %d",
-				metadata.IndexID, current.indexIDHighWater)}
+				nextEntry.indexID, current.indexIDHighWater)}
 		}
-		highWater = max(highWater, metadata.IndexID)
+		highWater = max(highWater, nextEntry.indexID)
 	}
 	return highWater, nil
 }

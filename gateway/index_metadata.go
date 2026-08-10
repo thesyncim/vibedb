@@ -89,18 +89,68 @@ var (
 	_ [plannerStringRefBytes - 8]byte
 )
 
-// plannerIndex is deliberately 32 bytes: two stable 64-bit identity fields,
-// one name reference, one path run, and four one-byte properties. Its table is
-// implicit in the aligned per-table span directory.
+// plannerIndex is deliberately 32 bytes. The owning placement ordinal is
+// retained in the record so the ID-sorted transition directory needs only one
+// uint32 ordinal per active index. Name length and the remaining small
+// properties are packed beside its arena offset without narrowing their
+// validated domains.
+type plannerIndexNameRef struct {
+	offset           uint32
+	lengthProperties uint32
+}
+
 type plannerIndex struct {
 	indexID     uint64
 	incarnation uint64
-	name        plannerStringRef
+	name        plannerIndexNameRef
 	pathBase    uint32
-	flags       IndexFlags
-	lifecycle   IndexLifecycle
-	pathCount   uint8
-	_           uint8
+	placement   uint32
+}
+
+const (
+	plannerIndexFlagsMask      = uint16((1 << 4) - 1)
+	plannerIndexLifecycleShift = 4
+	plannerIndexLifecycleMask  = uint16((1<<3)-1) << plannerIndexLifecycleShift
+	plannerIndexPathCountShift = 7
+	plannerIndexPathCountMask  = uint16((1<<3)-1) << plannerIndexPathCountShift
+)
+
+func newPlannerIndex(
+	indexID, incarnation uint64,
+	name plannerStringRef,
+	pathBase, placement uint32,
+	flags IndexFlags,
+	lifecycle IndexLifecycle,
+	pathCount uint8,
+) plannerIndex {
+	properties := uint16(flags) |
+		uint16(lifecycle)<<plannerIndexLifecycleShift |
+		uint16(pathCount)<<plannerIndexPathCountShift
+	return plannerIndex{
+		indexID: indexID, incarnation: incarnation,
+		name: plannerIndexNameRef{
+			offset: name.offset,
+			lengthProperties: name.length |
+				uint32(properties)<<16,
+		},
+		pathBase: pathBase, placement: placement,
+	}
+}
+
+func (p plannerIndex) properties() uint16 {
+	return uint16(p.name.lengthProperties >> 16)
+}
+
+func (p plannerIndex) flags() IndexFlags {
+	return IndexFlags(p.properties() & plannerIndexFlagsMask)
+}
+
+func (p plannerIndex) lifecycle() IndexLifecycle {
+	return IndexLifecycle((p.properties() & plannerIndexLifecycleMask) >> plannerIndexLifecycleShift)
+}
+
+func (p plannerIndex) pathCount() uint8 {
+	return uint8((p.properties() & plannerIndexPathCountMask) >> plannerIndexPathCountShift)
 }
 
 const plannerIndexBytes = unsafe.Sizeof(plannerIndex{})
@@ -142,7 +192,7 @@ func (s IndexSet) Lookup(name string) (IndexMetadata, bool) {
 	lo, hi := uint32(0), s.span.count
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		candidate := s.snapshot.indexString(s.snapshot.plannerIndexes[s.span.first+mid].name)
+		candidate := s.snapshot.indexName(s.snapshot.plannerIndexes[s.span.first+mid].name)
 		if candidate < name {
 			lo = mid + 1
 		} else {
@@ -153,7 +203,7 @@ func (s IndexSet) Lookup(name string) (IndexMetadata, bool) {
 		return IndexMetadata{}, false
 	}
 	entry := s.snapshot.plannerIndexes[s.span.first+lo]
-	if s.snapshot.indexString(entry.name) != name {
+	if s.snapshot.indexName(entry.name) != name {
 		return IndexMetadata{}, false
 	}
 	return s.snapshot.indexMetadata(s.table, s.span.first+lo), true
@@ -231,14 +281,24 @@ func (s *Snapshot) indexString(ref plannerStringRef) string {
 	return s.plannerIndexStrings[ref.offset : ref.offset+ref.length]
 }
 
+func (s *Snapshot) indexName(ref plannerIndexNameRef) string {
+	length := ref.lengthProperties & uint32(math.MaxUint16)
+	return s.plannerIndexStrings[ref.offset : ref.offset+length]
+}
+
 func (s *Snapshot) indexMetadata(table string, ordinal uint32) IndexMetadata {
 	entry := s.plannerIndexes[ordinal]
+	return s.indexMetadataFromEntry(table, entry)
+}
+
+func (s *Snapshot) indexMetadataFromEntry(table string, entry plannerIndex) IndexMetadata {
+	pathCount := entry.pathCount()
 	metadata := IndexMetadata{
 		IndexID: entry.indexID, Incarnation: entry.incarnation,
-		Table: table, Name: s.indexString(entry.name), PathCount: entry.pathCount,
-		Flags: entry.flags, Lifecycle: entry.lifecycle,
+		Table: table, Name: s.indexName(entry.name), PathCount: pathCount,
+		Flags: entry.flags(), Lifecycle: entry.lifecycle(),
 	}
-	for i := uint8(0); i < entry.pathCount; i++ {
+	for i := uint8(0); i < pathCount; i++ {
 		metadata.Paths[i] = s.indexString(s.plannerIndexPaths[entry.pathBase+uint32(i)])
 	}
 	return metadata
@@ -281,20 +341,6 @@ func (s *Snapshot) forEachIndex(visit func(IndexMetadata)) {
 			visit(s.indexMetadata(table, span.first+i))
 		}
 	}
-}
-
-func sameIndexDefinition(a, b IndexMetadata) bool {
-	if a.IndexID != b.IndexID || a.Incarnation != b.Incarnation ||
-		a.Table != b.Table || a.Name != b.Name || a.PathCount != b.PathCount ||
-		a.Flags != b.Flags {
-		return false
-	}
-	for i := uint8(0); i < a.PathCount; i++ {
-		if a.Paths[i] != b.Paths[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTable, descriptors []IndexDescriptor) (plannerIndexBuild, error) {
@@ -434,11 +480,12 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		if err != nil {
 			return plannerIndexBuild{}, err
 		}
-		entry := plannerIndex{
-			indexID: d.IndexID, incarnation: d.Incarnation, name: name,
-			pathBase: pathBase, flags: d.Flags, lifecycle: d.Lifecycle,
-			pathCount: uint8(len(d.Paths)),
-		}
+		tableOrdinal := tableOrdinals[d.Table]
+		entry := newPlannerIndex(
+			d.IndexID, d.Incarnation, name, pathBase,
+			planner[tableOrdinal].placement,
+			d.Flags, d.Lifecycle, uint8(len(d.Paths)),
+		)
 		for _, path := range d.Paths {
 			ref, err := intern(path)
 			if err != nil {
@@ -448,7 +495,7 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 			pathBase++
 		}
 		build.indexes[i] = entry
-		span := &build.spans[tableOrdinals[d.Table]]
+		span := &build.spans[tableOrdinal]
 		if span.count == 0 {
 			span.first = uint32(i)
 		}

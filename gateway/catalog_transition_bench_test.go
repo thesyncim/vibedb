@@ -64,7 +64,7 @@ func benchmarkCatalogTransition(
 	if got := catalogLineagePayloadBytes(probe); got != 16 {
 		b.Fatalf("lineage payload = %d bytes, want 16", got)
 	}
-	wantTransitionBytes := uint64(16 + 8*(scale.indexes+scale.shards))
+	wantTransitionBytes := uint64(16 + 4*scale.indexes + 8*scale.shards)
 	if got := probe.CatalogTransitionMetadataBytes(); got != wantTransitionBytes {
 		b.Fatalf("transition metadata = %d bytes, want %d", got, wantTransitionBytes)
 	}

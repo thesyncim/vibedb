@@ -153,7 +153,7 @@ func NewSnapshotWithIndexes(config distribution.ClusterConfig, endpoints map[dis
 	if err != nil {
 		return nil, err
 	}
-	indexLineage := buildPlannerIndexLineage(indexBuild.indexes, indexBuild.spans)
+	indexLineage := buildPlannerIndexLineage(indexBuild.indexes)
 	shardLineage, err := buildPlannerShardLineage(cloned)
 	if err != nil {
 		return nil, err
@@ -278,7 +278,7 @@ func (s *Snapshot) CatalogTransitionMetadataBytes() uint64 {
 	if s == nil {
 		return 0
 	}
-	return uint64(cap(s.indexLineage))*uint64(unsafe.Sizeof(plannerIndexLineageRef{})) +
+	return uint64(cap(s.indexLineage))*uint64(unsafe.Sizeof(plannerIndexLineageRef(0))) +
 		uint64(cap(s.shardLineage))*uint64(unsafe.Sizeof(plannerShardLineageRef{})) +
 		uint64(cap(s.shardGenerationHighWaters))*uint64(unsafe.Sizeof(distribution.ShardAllocationGeneration(0))) +
 		uint64(unsafe.Sizeof(s.indexIDHighWater))

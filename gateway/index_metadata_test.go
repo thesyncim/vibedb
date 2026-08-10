@@ -234,6 +234,16 @@ func TestIndexCatalogPublicationFencesDefinitionAndLifecycle(t *testing.T) {
 	if publish(2, &changed) {
 		t.Fatal("same incarnation changed its certified flags")
 	}
+	changed = building
+	changed.Name = "renamed"
+	if publish(2, &changed) {
+		t.Fatal("same incarnation changed its logical name")
+	}
+	changed = building
+	changed.Paths = []string{"/tenant_id"}
+	if publish(2, &changed) {
+		t.Fatal("same incarnation changed its path count")
+	}
 	ready := building
 	ready.Lifecycle = IndexReady
 	if !publish(2, &ready) {
@@ -258,6 +268,12 @@ func TestIndexCatalogPublicationFencesDefinitionAndLifecycle(t *testing.T) {
 	rebuilt.Paths = []string{"/tenant_id", "/replacement"}
 	if !publish(11, &rebuilt) {
 		t.Fatal("generation jump did not admit a higher incarnation")
+	}
+	renamedRebuild := rebuilt
+	renamedRebuild.Incarnation++
+	renamedRebuild.Name = "renamed"
+	if publish(12, &renamedRebuild) {
+		t.Fatal("higher incarnation changed its logical name")
 	}
 	stale := rebuilt
 	stale.Incarnation--
@@ -458,11 +474,14 @@ func TestCompactIndexDirectory(t *testing.T) {
 	if got := unsafe.Sizeof(plannerIndex{}); got != 32 {
 		t.Fatalf("plannerIndex = %d bytes, want 32", got)
 	}
+	if got := unsafe.Sizeof(plannerIndexNameRef{}); got != 8 {
+		t.Fatalf("plannerIndexNameRef = %d bytes, want 8", got)
+	}
 	if got := unsafe.Sizeof(plannerStringRef{}); got != 8 {
 		t.Fatalf("plannerStringRef = %d bytes, want 8", got)
 	}
-	if got := unsafe.Sizeof(plannerIndexLineageRef{}); got != 8 {
-		t.Fatalf("plannerIndexLineageRef = %d bytes, want 8", got)
+	if got := unsafe.Sizeof(plannerIndexLineageRef(0)); got != 4 {
+		t.Fatalf("plannerIndexLineageRef = %d bytes, want 4", got)
 	}
 	without, err := NewSnapshotWithIndexes(testConfig(t), testEndpoints(), 1, nil)
 	if err != nil {
@@ -533,6 +552,86 @@ func TestIndexLineageDirectoryIsIDSortedIndependentlyOfNames(t *testing.T) {
 	second := snapshot.indexMetadataForLineage(snapshot.indexLineage[1])
 	if first.IndexID != 2 || second.IndexID != 9 {
 		t.Fatalf("index lineage order = %d,%d, want 2,9", first.IndexID, second.IndexID)
+	}
+}
+
+func TestPackedIndexPropertiesAndLineageTableOwnersRoundTrip(t *testing.T) {
+	config := testConfig(t)
+	config.Placements = append(config.Placements, distribution.TablePlacement{
+		Table: "events", Distribution: "tenant_data", Columns: []string{"/tenant_id"},
+	})
+	lifecycles := [...]IndexLifecycle{
+		IndexBuilding, IndexCatchingUp, IndexReady, IndexDraining,
+	}
+	flags := [...]IndexFlags{
+		IndexLocal,
+		IndexLocal | IndexUnique,
+		IndexLocal | IndexCovering,
+		IndexLocal | IndexOrdered,
+	}
+	descriptors := make([]IndexDescriptor, len(lifecycles))
+	for i := range descriptors {
+		paths := make([]string, i+1)
+		paths[0] = "/tenant_id"
+		for path := 1; path < len(paths); path++ {
+			paths[path] = fmt.Sprintf("/field_%d", path)
+		}
+		table := "messages"
+		if i&1 == 0 {
+			table = "events"
+		}
+		descriptors[i] = IndexDescriptor{
+			IndexID: uint64(100 - i), Incarnation: uint64(i + 1),
+			Table: table, Name: fmt.Sprintf("packed_%d", i), Paths: paths,
+			Flags: flags[i], Lifecycle: lifecycles[i],
+		}
+	}
+
+	snapshot, err := NewSnapshotWithIndexes(config, testEndpoints(), 1, descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range descriptors {
+		want := &descriptors[i]
+		got, ok := snapshot.Index(want.Table, want.Name)
+		if !ok || got.IndexID != want.IndexID || got.Incarnation != want.Incarnation ||
+			got.Table != want.Table || got.Name != want.Name ||
+			got.PathCount != uint8(len(want.Paths)) || got.Flags != want.Flags ||
+			got.Lifecycle != want.Lifecycle {
+			t.Fatalf("packed descriptor %d = %+v,%v, want %+v", i, got, ok, *want)
+		}
+		for path := range want.Paths {
+			if got.Paths[path] != want.Paths[path] {
+				t.Fatalf("packed descriptor %d path %d = %q, want %q",
+					i, path, got.Paths[path], want.Paths[path])
+			}
+		}
+	}
+	for i, ref := range snapshot.indexLineage {
+		got := snapshot.indexMetadataForLineage(ref)
+		wantID := uint64(97 + i)
+		if got.IndexID != wantID {
+			t.Fatalf("lineage ordinal %d id = %d, want %d", i, got.IndexID, wantID)
+		}
+		if want := descriptors[100-int(wantID)].Table; got.Table != want {
+			t.Fatalf("lineage ordinal %d table = %q, want %q", i, got.Table, want)
+		}
+	}
+}
+
+func TestPackedIndexNameLengthBoundary(t *testing.T) {
+	descriptor := testIndexDescriptor()
+	descriptor.Name = strings.Repeat("n", math.MaxUint16)
+	snapshot, err := NewSnapshotWithIndexes(
+		testConfig(t), testEndpoints(), 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok := snapshot.Index("messages", descriptor.Name)
+	if !ok || metadata.Name != descriptor.Name {
+		t.Fatalf("maximum-length packed name round trip = %d bytes,%v, want %d,true",
+			len(metadata.Name), ok, len(descriptor.Name))
 	}
 }
 
