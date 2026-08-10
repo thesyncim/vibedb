@@ -10,7 +10,9 @@ import (
 
 // MaxPositionIdentityBytes bounds each variable-width identity component of a
 // logical position. The log and index components are fixed width, so a valid
-// position always has a small, predictable wire and retained-memory footprint.
+// position always has a small, predictable wire footprint. In-process owners
+// that retain a caller-built Position must still clone its strings: a short
+// substring can otherwise keep an arbitrarily large caller buffer alive.
 const MaxPositionIdentityBytes = 255
 
 // ErrInvalidPosition is the sentinel every malformed logical position matches

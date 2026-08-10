@@ -262,6 +262,40 @@ func TestRoundTripValidatesReadPositionProof(t *testing.T) {
 	}
 }
 
+func TestClientRejectsMismatchedMinimumBeforeDial(t *testing.T) {
+	minimum := sessionPosition("tenant_data", "-80", 7, 40)
+	req := &shardservice.ShardRequest{
+		SQL:            "SELECT 1",
+		HasMinPosition: true,
+		MinPosition:    minimum,
+		Distribution:   minimum.Distribution,
+		Shard:          "80-",
+		ReadPolicy:     shardservice.ReadSession,
+		ExecutionMode:  shardservice.ExecutionReadOnly,
+		RoutingVersion: 1,
+		OwnershipEpoch: 1,
+	}
+	dials := 0
+	client := NewClient(func(context.Context, string) (net.Conn, error) {
+		dials++
+		return nil, errors.New("unexpected dial")
+	})
+	resp, err := client.Do(context.Background(), "unused", req)
+	if resp != nil {
+		t.Fatalf("response = %+v, want nil", resp)
+	}
+	if !errors.Is(err, ErrPositionIdentity) {
+		t.Fatalf("err = %v, want errors.Is ErrPositionIdentity", err)
+	}
+	var shardErr *ShardError
+	if !errors.As(err, &shardErr) || shardErr.Kind != shardservice.ErrorPositionIdentity {
+		t.Fatalf("err = %v, want typed PositionIdentity", err)
+	}
+	if dials != 0 {
+		t.Fatalf("dials = %d, want zero", dials)
+	}
+}
+
 func roundTripScriptedResponse(
 	t *testing.T,
 	req *shardservice.ShardRequest,

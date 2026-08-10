@@ -135,6 +135,9 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := validateRequestPosition(req); err != nil {
+		return nil, err
+	}
 	conn, err := c.dial(ctx, address)
 	if err != nil {
 		return nil, err
@@ -154,6 +157,9 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardRequest) (*shardservice.ShardResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := validateRequestPosition(req); err != nil {
+		return nil, err
 	}
 	// AfterFunc trips the socket's I/O deadline once ctx is done, unblocking a
 	// blocked Encode or Decode; stop cancels it on the fast path so a healthy
@@ -186,6 +192,27 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 		return nil, err
 	}
 	return resp, nil
+}
+
+// validateRequestPosition binds a session minimum to the logical shard named
+// by the request before any connection or wire work. Shard admission repeats
+// this check against authoritative ownership; the client-side gate prevents a
+// locally inconsistent request from reaching the network at all.
+func validateRequestPosition(req *shardservice.ShardRequest) error {
+	if req == nil || !req.HasMinPosition {
+		return nil
+	}
+	if err := req.MinPosition.Validate(); err != nil {
+		return fmt.Errorf("%w: invalid minimum position: %v", ErrMalformedRequest, err)
+	}
+	if req.MinPosition.Distribution != req.Distribution ||
+		req.MinPosition.Shard != req.Shard {
+		return clientPositionError(
+			shardservice.ErrorPositionIdentity,
+			"gateway: minimum position does not name the request's logical shard",
+		)
+	}
+	return nil
 }
 
 // validateReadPosition enforces the proof contract on a successful response.

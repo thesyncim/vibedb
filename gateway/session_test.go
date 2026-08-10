@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 func sessionPosition(distributionName, shard string, log byte, index uint64) Position {
@@ -48,6 +49,35 @@ func TestSessionVectorSortedMaxAndImmutable(t *testing.T) {
 	p, ok := v.PositionFor("z", "b")
 	if !ok || p.Index != 9 {
 		t.Fatalf("retained position = (%+v, %t), want index 9", p, ok)
+	}
+}
+
+func TestSessionVectorOwnsCompactIdentityStrings(t *testing.T) {
+	backing := make([]byte, 1<<20)
+	copy(backing, "distribution/shard")
+	distributionName := byteview.String(backing[:12])
+	shard := byteview.String(backing[13:18])
+	v, err := NewSessionVector(sessionPosition(distributionName, shard, 1, 1))
+	if err != nil {
+		t.Fatalf("NewSessionVector: %v", err)
+	}
+	_, err = NewSessionVector(
+		sessionPosition(distributionName, shard, 1, 1),
+		sessionPosition(distributionName, shard, 2, 1),
+	)
+	var lineage *PositionLineageError
+	if !errors.As(err, &lineage) {
+		t.Fatalf("lineage error = %v, want *PositionLineageError", err)
+	}
+	for i := range backing {
+		backing[i] = 'x'
+	}
+	p, ok := v.PositionFor("distribution", "shard")
+	if !ok || p.Distribution != "distribution" || p.Shard != "shard" {
+		t.Fatalf("retained position aliases caller backing: (%+v, %t)", p, ok)
+	}
+	if lineage.Distribution != "distribution" || lineage.Shard != "shard" {
+		t.Fatalf("lineage error aliases caller backing: %+v", lineage)
 	}
 }
 

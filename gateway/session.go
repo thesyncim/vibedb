@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -94,6 +95,10 @@ func NewSessionVector(positions ...Position) (SessionVector, error) {
 	out := make([]Position, 0, len(ordered))
 	for _, p := range ordered {
 		if len(out) == 0 || !out[len(out)-1].SameSource(p) {
+			p.Distribution = distribution.DistributionName(
+				strings.Clone(string(p.Distribution)),
+			)
+			p.Shard = distribution.ShardID(strings.Clone(string(p.Shard)))
 			out = append(out, p)
 			continue
 		}
@@ -225,10 +230,12 @@ func comparePositionSource(left, right Position) int {
 
 func positionLineageError(left, right Position) error {
 	return &PositionLineageError{
-		Distribution: left.Distribution,
-		Shard:        left.Shard,
-		LeftLogID:    left.LogID,
-		RightLogID:   right.LogID,
+		Distribution: distribution.DistributionName(
+			strings.Clone(string(left.Distribution)),
+		),
+		Shard:      distribution.ShardID(strings.Clone(string(left.Shard))),
+		LeftLogID:  left.LogID,
+		RightLogID: right.LogID,
 	}
 }
 
