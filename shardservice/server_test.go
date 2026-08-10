@@ -6,9 +6,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -85,6 +87,23 @@ func dial(t *testing.T, srv *Server) net.Conn {
 	go srv.ServeConn(server)
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+type gatedCloseConn struct {
+	net.Conn
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+	err     error
+}
+
+func (c *gatedCloseConn) Close() error {
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.release
+		c.err = c.Conn.Close()
+	})
+	return c.err
 }
 
 // roundTrip sends one request and reads one response over conn.
@@ -413,6 +432,16 @@ func TestNewServerValidation(t *testing.T) {
 	if _, err := NewServer(db, Ownership{Shard: "-80"}, Options{}); err == nil {
 		t.Fatal("NewServer(empty distribution) = nil error")
 	}
+	zeroEpoch := testOwner()
+	zeroEpoch.Epoch = 0
+	if _, err := NewServer(db, zeroEpoch, Options{}); err == nil {
+		t.Fatal("NewServer(zero epoch) = nil error")
+	}
+	zeroRouting := testOwner()
+	zeroRouting.RoutingVersion = 0
+	if _, err := NewServer(db, zeroRouting, Options{}); err == nil {
+		t.Fatal("NewServer(zero routing version) = nil error")
+	}
 	if _, err := NewServer(db, testOwner(), Options{MaxConnections: -2}); err == nil {
 		t.Fatal("NewServer(MaxConnections=-2) = nil error")
 	}
@@ -428,6 +457,121 @@ func TestNewServerValidation(t *testing.T) {
 	if srv.opts.MaxResultRows != DefaultMaxResultRows {
 		t.Fatalf("MaxResultRows default = %d, want %d",
 			srv.opts.MaxResultRows, DefaultMaxResultRows)
+	}
+}
+
+func TestNewServerClaimsDurableFenceAndReleasesAfterDrain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serving-fence.vdb")
+	db := openDB(t, path)
+	owner := testOwner()
+	srv1, err := NewServer(db, owner, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServer(db, owner, Options{}); !errors.Is(err, sqldriver.ErrShardStoreServingClaimed) {
+		t.Fatalf("second live server = %v, want ErrShardStoreServingClaimed", err)
+	}
+
+	client, rawServer := net.Pipe()
+	closeEntered := make(chan struct{})
+	closeRelease := make(chan struct{})
+	server := &gatedCloseConn{
+		Conn: rawServer, entered: closeEntered, release: closeRelease,
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		srv1.ServeConn(server)
+		close(serveDone)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		srv1.mu.Lock()
+		admitted := len(srv1.conns) == 1
+		srv1.mu.Unlock()
+		if admitted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connection was not admitted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- srv1.Close() }()
+	select {
+	case <-closeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not begin draining the admitted connection")
+	}
+	if _, err := NewServer(db, owner, Options{}); !errors.Is(err, sqldriver.ErrShardStoreServingClaimed) {
+		t.Fatalf("server claim released before connection drain = %v", err)
+	}
+	close(closeRelease)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close with admitted connection: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not finish after connection drain was released")
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close released before the admitted connection drained")
+	}
+	_ = client.Close()
+
+	// Equal coordinates are reusable only after Close has drained and released
+	// the first claim.
+	srv2, err := NewServer(db, owner, Options{})
+	if err != nil {
+		t.Fatalf("equal server restart: %v", err)
+	}
+	if err := srv2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	staleEpoch := owner
+	staleEpoch.Epoch--
+	if _, err := NewServer(db, staleEpoch, Options{}); !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("stale epoch server = %v, want ErrOwnershipEpoch", err)
+	}
+	staleRouting := owner
+	staleRouting.RoutingVersion--
+	if _, err := NewServer(db, staleRouting, Options{}); !errors.Is(err, distribution.ErrRoutingVersion) {
+		t.Fatalf("stale routing server = %v, want ErrRoutingVersion", err)
+	}
+
+	advanced := owner
+	advanced.Epoch++
+	advanced.RoutingVersion++
+	srv3, err := NewServer(db, advanced, Options{})
+	if err != nil {
+		t.Fatalf("advanced server: %v", err)
+	}
+	if err := srv3.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNewServerInvalidOptionsDoNotAdvanceServingFence(t *testing.T) {
+	db := openDB(t, filepath.Join(t.TempDir(), "option-fence.vdb"))
+	high := testOwner()
+	high.Epoch += 100
+	high.RoutingVersion += 100
+	if _, err := NewServer(db, high, Options{MaxConnections: -2}); err == nil {
+		t.Fatal("invalid options unexpectedly constructed server")
+	}
+
+	// If option validation happened after the durable claim, this lower but
+	// otherwise valid owner would now be rejected as stale.
+	srv, err := NewServer(db, testOwner(), Options{})
+	if err != nil {
+		t.Fatalf("valid owner after invalid options: %v", err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

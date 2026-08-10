@@ -47,10 +47,11 @@ const maxCatalogTables = 128
 const maxCatalogBytes = 16 << 20
 
 type catalogFile struct {
-	Version    int                   `json:"version"`
-	Tables     map[string]*tableMeta `json:"tables"`
-	Views      map[string]*viewMeta  `json:"views,omitempty"`
-	ShardStore *ShardStoreIdentity   `json:"shard_store,omitempty"`
+	Version         int                   `json:"version"`
+	Tables          map[string]*tableMeta `json:"tables"`
+	Views           map[string]*viewMeta  `json:"views,omitempty"`
+	ShardStore      *ShardStoreIdentity   `json:"shard_store,omitempty"`
+	ShardStoreFence *ShardStoreFence      `json:"shard_store_fence,omitempty"`
 }
 
 // viewMeta is immutable after publication. Prepared statements retain its
@@ -198,6 +199,10 @@ type database struct {
 	// publication can affect prepared dependency identity. It is protected by
 	// mu and deliberately independent of durable data generations.
 	layoutEpoch *catalogLayoutEpoch
+	// servingClaim is an in-process exclusion guard for one shard service over
+	// this writer-owning catalog. Its coordinates are also checked against the
+	// durable ShardStoreFence before the pointer is installed.
+	servingClaim *ShardStoreServingClaim
 }
 
 func (d *database) advanceLayoutEpochLocked() {
@@ -1153,6 +1158,25 @@ func checkCatalogSize(catalog catalogFile) error {
 }
 
 func catalogSizeUpperBound(catalog catalogFile) (int, error) {
+	if catalog.ShardStore != nil {
+		if err := validateShardStoreIdentity(*catalog.ShardStore); err != nil {
+			return maxCatalogBytes + 1, fmt.Errorf(
+				"vibedb: invalid shard store identity: %w", err,
+			)
+		}
+	}
+	if catalog.ShardStoreFence != nil {
+		if catalog.ShardStore == nil {
+			return maxCatalogBytes + 1, errors.New(
+				"vibedb: shard store fence requires a shard store identity",
+			)
+		}
+		if err := validateShardStoreFence(*catalog.ShardStoreFence); err != nil {
+			return maxCatalogBytes + 1, fmt.Errorf(
+				"vibedb: invalid shard store fence: %w", err,
+			)
+		}
+	}
 	if err := checkCatalogTableCount(len(catalog.Tables)); err != nil {
 		return maxCatalogBytes + 1, err
 	}
@@ -1171,6 +1195,11 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	if catalog.ShardStore != nil {
 		if !add(encodedJSONStringBytes(string(catalog.ShardStore.Distribution)) +
 			encodedJSONStringBytes(string(catalog.ShardStore.Shard)) + 512) {
+			return size, catalogSizeError(size)
+		}
+	}
+	if catalog.ShardStoreFence != nil {
+		if !add(256) {
 			return size, catalogSizeError(size)
 		}
 	}

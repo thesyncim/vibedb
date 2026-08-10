@@ -21,6 +21,8 @@ func TestRunArgumentHandling(t *testing.T) {
 		{"no_subcommand", []string{"vibedb-shard"}, 2},
 		{"unknown_subcommand", []string{"vibedb-shard", "wat"}, 2},
 		{"missing_required_flags", []string{"vibedb-shard", "serve", "-listen", "127.0.0.1:0"}, 2},
+		{"zero_epoch", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-routing-version", "1"}, 2},
+		{"zero_routing_version", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-epoch", "1"}, 2},
 		{"unparseable_flag", []string{"vibedb-shard", "serve", "-store"}, 2},
 		{"missing_init_flags", []string{"vibedb-shard", "init", "-store", "store.vdb"}, 2},
 		{"unparseable_init_flag", []string{"vibedb-shard", "init", "-store"}, 2},
@@ -33,6 +35,7 @@ func TestRunArgumentHandling(t *testing.T) {
 				"-store", t.TempDir(),
 				"-distribution", "tenant_data", "-shard", "-80",
 				"-allocation-generation", "1",
+				"-epoch", "1", "-routing-version", "1",
 			},
 			want: 1,
 		},
@@ -108,6 +111,7 @@ func TestRunServeRefusesMissingStoreWithoutInitializingIt(t *testing.T) {
 		"-store", path,
 		"-distribution", "tenant_data", "-shard", "-80",
 		"-allocation-generation", "1",
+		"-epoch", "1", "-routing-version", "1",
 	}
 	if got := run(args); got != 1 {
 		t.Fatalf("run(missing store) = %d, want 1", got)
@@ -128,6 +132,7 @@ func TestRunStoreOpenReportsPath(t *testing.T) {
 		"-store", missing,
 		"-distribution", "tenant_data", "-shard", "-80",
 		"-allocation-generation", "1",
+		"-epoch", "1", "-routing-version", "1",
 	}
 	if got := run(args); got != 1 {
 		t.Fatalf("run(missing store dir) = %d, want 1", got)

@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // ShardStoreBinding is the topology-owned part of one local shard store's
@@ -34,6 +36,14 @@ type ShardStoreIdentity struct {
 	LogID                [16]byte
 }
 
+// ShardStoreFence is the durable local serving high-water for one immutable
+// [ShardStoreIdentity]. Both coordinates are independently monotonic. It does
+// not grant a distributed lease or prove that this store is the elected copy.
+type ShardStoreFence struct {
+	OwnershipEpoch distribution.OwnershipEpoch `json:"ownership_epoch"`
+	RoutingVersion distribution.RoutingVersion `json:"routing_version"`
+}
+
 // Binding returns the topology-owned coordinates of identity.
 func (i ShardStoreIdentity) Binding() ShardStoreBinding {
 	return ShardStoreBinding{
@@ -51,6 +61,9 @@ var (
 	// not match a catalog's immutable binding, an attempt to initialize an
 	// existing unbound root, or a generic open of a shard-bound catalog.
 	ErrShardStoreIdentityMismatch = errors.New("vibedb: shard store identity mismatch")
+	// ErrShardStoreServingClaimed reports a second live in-process serving claim
+	// over the same writer-owning Database. Closing the first claim releases it.
+	ErrShardStoreServingClaimed = errors.New("vibedb: shard store already has a live serving claim")
 )
 
 // ShardStoreError retains structured expected and durable identities while
@@ -93,6 +106,99 @@ func (e *ShardStoreError) Unwrap() error {
 		return nil
 	}
 	return e.Err
+}
+
+// ShardStoreFenceError reports a zero or regressed local serving coordinate.
+// Unwrap exposes distribution.ErrOwnershipEpoch or
+// distribution.ErrRoutingVersion so topology callers can classify the stale
+// coordinate without parsing text.
+type ShardStoreFenceError struct {
+	Op        string
+	Path      string
+	Requested ShardStoreFence
+	Durable   ShardStoreFence
+	Err       error
+}
+
+func (e *ShardStoreFenceError) Error() string {
+	if e == nil {
+		return "vibedb: shard store serving fence error"
+	}
+	prefix := "vibedb: shard store serving fence"
+	if e.Op != "" {
+		prefix += " " + e.Op
+	}
+	if e.Path != "" {
+		prefix += " " + e.Path
+	}
+	return fmt.Sprintf(
+		"%s: requested ownership-epoch=%d routing-version=%d; "+
+			"durable high-water ownership-epoch=%d routing-version=%d: %v",
+		prefix,
+		e.Requested.OwnershipEpoch, e.Requested.RoutingVersion,
+		e.Durable.OwnershipEpoch, e.Durable.RoutingVersion,
+		e.Err,
+	)
+}
+
+// Unwrap exposes the typed distribution coordinate error.
+func (e *ShardStoreFenceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// ShardStoreServingClaim is one exclusive, process-local permission to serve a
+// shard Database at a durable fence. Close is idempotent. The claim protects
+// only other services sharing this exact open store; it is not a distributed
+// lease and cannot revoke a process serving a copied store. It also does not
+// discover or fence Sessions a trusted caller opens directly on Database.
+type ShardStoreServingClaim struct {
+	database *database
+	identity ShardStoreIdentity
+	fence    ShardStoreFence
+	once     sync.Once
+}
+
+// Identity returns the immutable store identity covered by the claim.
+func (c *ShardStoreServingClaim) Identity() ShardStoreIdentity {
+	if c == nil {
+		return ShardStoreIdentity{}
+	}
+	return c.identity
+}
+
+// Fence returns the durable serving coordinates covered by the claim.
+func (c *ShardStoreServingClaim) Fence() ShardStoreFence {
+	if c == nil {
+		return ShardStoreFence{}
+	}
+	return c.fence
+}
+
+// Close releases this process-local claim. It does not lower the durable
+// high-water, so an equal claim may be retried and a lower claim remains stale.
+// It does not drain directly opened Sessions; a claimant must stop producing
+// work and close those Sessions first. shardservice.Server provides that drain
+// for its own connections.
+func (c *ShardStoreServingClaim) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.once.Do(func() {
+		core := c.database
+		if core == nil {
+			return
+		}
+		core.mu.Lock()
+		if core.servingClaim == c {
+			core.servingClaim = nil
+		}
+		core.mu.Unlock()
+		c.database = nil
+	})
+	return nil
 }
 
 type shardStoreOpenMode uint8
@@ -215,6 +321,140 @@ func (d *Database) RequireShardStore(expected ShardStoreBinding) (ShardStoreIden
 	return identity, nil
 }
 
+// ClaimShardStoreServing durably advances this immutable store's local serving
+// high-waters and returns the sole live in-process serving claim. A successful
+// return means the requested fence was already durable or its catalog
+// publication and parent-directory fence completed before the claim became
+// visible. Lower coordinates return a typed distribution error. Close the
+// claim before retrying equal coordinates.
+//
+// This is a same-open-store safety boundary, not a distributed lease,
+// election, or copied-store revocation mechanism. NewSession remains a trusted
+// low-level API outside the claim: callers must not share a shard Database with
+// an independent direct-session producer and then treat Claim as fencing it.
+func (d *Database) ClaimShardStoreServing(
+	expected ShardStoreBinding,
+	fence ShardStoreFence,
+) (*ShardStoreServingClaim, error) {
+	return d.claimShardStoreServing(expected, fence, nil)
+}
+
+// claimShardStoreServing exposes the catalog-publication boundary to focused
+// package tests. Production callers always use ClaimShardStoreServing, whose
+// nil hook selects persistCatalogLocked.
+func (d *Database) claimShardStoreServing(
+	expected ShardStoreBinding,
+	fence ShardStoreFence,
+	persist func(*database) (bool, error),
+) (*ShardStoreServingClaim, error) {
+	if err := validateShardStoreBinding(expected); err != nil {
+		return nil, err
+	}
+	if err := validateShardStoreFence(fence); err != nil {
+		return nil, err
+	}
+	expected = ownedShardStoreBinding(expected)
+	if d == nil || d.connector == nil {
+		return nil, ErrDatabaseClosed
+	}
+	d.connector.mu.Lock()
+	if d.connector.closed || d.connector.db == nil {
+		d.connector.mu.Unlock()
+		return nil, ErrDatabaseClosed
+	}
+	core := d.connector.db
+	d.connector.mu.Unlock()
+
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if core.closed {
+		return nil, ErrDatabaseClosed
+	}
+	if core.catalog.ShardStore == nil {
+		return nil, &ShardStoreError{
+			Op: "claim serving", Path: core.path, Expected: expected,
+			Err: ErrShardStoreUnbound,
+		}
+	}
+	identity := *core.catalog.ShardStore
+	if identity.Binding() != expected {
+		return nil, &ShardStoreError{
+			Op: "claim serving", Path: core.path, Expected: expected,
+			Actual: identity, Err: ErrShardStoreIdentityMismatch,
+		}
+	}
+	durableFence := ShardStoreFence{}
+	if core.catalog.ShardStoreFence != nil {
+		durableFence = *core.catalog.ShardStoreFence
+	}
+	if fence.OwnershipEpoch < durableFence.OwnershipEpoch {
+		return nil, &ShardStoreFenceError{
+			Op: "claim", Path: core.path, Requested: fence, Durable: durableFence,
+			Err: distribution.ErrOwnershipEpoch,
+		}
+	}
+	if fence.RoutingVersion < durableFence.RoutingVersion {
+		return nil, &ShardStoreFenceError{
+			Op: "claim", Path: core.path, Requested: fence, Durable: durableFence,
+			Err: distribution.ErrRoutingVersion,
+		}
+	}
+	if core.servingClaim != nil {
+		return nil, fmt.Errorf(
+			"vibedb: claim shard store serving for %s: %w",
+			core.path, ErrShardStoreServingClaimed,
+		)
+	}
+
+	// An equal retry may follow a publication whose rename completed but whose
+	// directory fence failed. Settle every pending catalog/namespace phase before
+	// treating the in-memory high-water as durable enough to serve.
+	if err := core.settleCatalogLocked(); err != nil {
+		return nil, fmt.Errorf("vibedb: settle shard store serving fence: %w", err)
+	}
+	if fence != durableFence {
+		previousFence := core.catalog.ShardStoreFence
+		previousPending := core.catalogWritePending
+		claimedFence := fence
+		core.catalog.ShardStoreFence = &claimedFence
+		core.catalogWritePending = true
+
+		var published bool
+		var err error
+		if persist != nil {
+			published, err = persist(core)
+		} else {
+			published, err = core.persistCatalogLocked()
+		}
+		if err == nil && !published {
+			err = errors.New("catalog persistence returned without publication")
+		}
+		if err != nil {
+			if !published && !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+				// Nothing became externally visible, so restore the exact prior
+				// catalog state. This also prevents terminal cleanup from silently
+				// publishing a fence after Claim returned a definite failure.
+				core.catalog.ShardStoreFence = previousFence
+				core.catalogWritePending = previousPending
+			} else if !published {
+				// The hook could not prove whether publication happened. Keep the
+				// proposed high-water and force a later settle/reopen to reconcile;
+				// no serving claim is returned from this call.
+				core.catalogWritePending = true
+			}
+			return nil, fmt.Errorf("vibedb: publish shard store serving fence: %w", err)
+		}
+	}
+
+	claim := &ShardStoreServingClaim{
+		database: core,
+		identity: identity,
+		fence:    fence,
+	}
+	core.servingClaim = claim
+	return claim, nil
+}
+
 func validateShardStoreBinding(binding ShardStoreBinding) error {
 	if binding.Distribution == "" || binding.Shard == "" || binding.AllocationGeneration == 0 {
 		return fmt.Errorf(
@@ -241,6 +481,22 @@ func validateShardStoreIdentity(identity ShardStoreIdentity) error {
 	}
 	if identity.LogID == ([16]byte{}) {
 		return errors.New("vibedb: shard store identity has a zero log id")
+	}
+	return nil
+}
+
+func validateShardStoreFence(fence ShardStoreFence) error {
+	if fence.OwnershipEpoch == 0 {
+		return &ShardStoreFenceError{
+			Op: "validate", Requested: fence,
+			Err: distribution.ErrOwnershipEpoch,
+		}
+	}
+	if fence.RoutingVersion == 0 {
+		return &ShardStoreFenceError{
+			Op: "validate", Requested: fence,
+			Err: distribution.ErrRoutingVersion,
+		}
 	}
 	return nil
 }
@@ -348,5 +604,42 @@ func (i *ShardStoreIdentity) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*i = decoded
+	return nil
+}
+
+// UnmarshalJSON keeps the mutable fence as strict as the immutable identity:
+// missing, duplicate, unknown, null, negative, overflowing, and zero
+// coordinates all fail the catalog boundary.
+func (f *ShardStoreFence) UnmarshalJSON(data []byte) error {
+	var decoded ShardStoreFence
+	var ownershipPresent, routingPresent bool
+	err := decodeCatalogObject(data, "shard store fence", func(
+		name string,
+		decoder *json.Decoder,
+	) error {
+		switch name {
+		case "ownership_epoch":
+			ownershipPresent = true
+			return decoder.Decode(&decoded.OwnershipEpoch)
+		case "routing_version":
+			routingPresent = true
+			return decoder.Decode(&decoded.RoutingVersion)
+		default:
+			return unknownCatalogMember("shard store fence", name)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if !ownershipPresent {
+		return fmt.Errorf("vibedb: shard store fence is missing member %q", "ownership_epoch")
+	}
+	if !routingPresent {
+		return fmt.Errorf("vibedb: shard store fence is missing member %q", "routing_version")
+	}
+	if err := validateShardStoreFence(decoded); err != nil {
+		return err
+	}
+	*f = decoded
 	return nil
 }

@@ -8,6 +8,11 @@
 // planner. The wire contract carries SQL text plus typed parameters only; no
 // serialized execution plan crosses it.
 //
+// serve durably advances the bound store's local ownership-epoch and
+// routing-version high-waters before listening. That excludes stale or duplicate
+// serving over the same open store, but is not distributed election or lease
+// authority and cannot revoke a process serving a copied store.
+//
 // Usage:
 //
 //	vibedb-shard init -store <path> -distribution <name> -shard <id> \
@@ -118,7 +123,8 @@ func runServe(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *store == "" || *distName == "" || *shard == "" || *allocation == 0 {
+	if *store == "" || *distName == "" || *shard == "" || *allocation == 0 ||
+		*epoch == 0 || *routingVersion == 0 {
 		usage()
 		return 2
 	}
@@ -156,6 +162,7 @@ func runServe(args []string) int {
 		fmt.Fprintf(os.Stderr, "error configure shard: %v\n", err)
 		return 1
 	}
+	defer srv.Close()
 
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {

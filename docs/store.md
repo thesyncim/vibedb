@@ -659,11 +659,21 @@ requests carry a safe-zero read-only intent, and stale routing refusals reload
 only a strictly newer valid catalog generation. A shard catalog is created
 explicitly and durably bound to its distribution, shard ID, topology allocation
 generation, and a random local LogID before table recovery; serving is
-open-existing only and generic SQL opens reject a bound shard catalog. This
-fences accidental rebinding but is not a lease: an old running process or a
-byte-for-byte copied store still requires an external replicated authority to
-revoke. The tier is itself leader-only — no replication, failover, or online
-resharding — and its design contract lives in
+open-existing only and generic SQL opens reject a bound shard catalog. A shard
+server must then claim nonzero ownership-epoch and routing-version coordinates.
+The SQL catalog persists each as an independent monotonic high-water before
+startup succeeds, and one in-process claim excludes a second server over that
+exact open store until `Server.Close` drains its connections. A definite
+pre-publication failure restores the prior in-memory high-water; an ambiguous
+publication returns no claim and retains the proposed high-water so a stale
+retry cannot serve. This fences accidental rebinding and local stale restarts,
+but is not a distributed lease or election: an old process using another store
+handle or a byte-for-byte copied store still requires an external replicated
+authority to revoke. The low-level claim also does not discover or drain
+Sessions a trusted caller opens directly on the same `Database`; callers must
+not share such a producer with a shard server, and must drain direct work before
+releasing a claim. The tier is itself leader-only — no replication, failover,
+or online resharding — and its design contract lives in
 [distributed sharding](design/distributed-sharding.md) and
 [Vitess-compatible routing](design/vitess-compatible-routing.md). The PostgreSQL
 protocol-v3 server can expose the typed SQL catalog directly;

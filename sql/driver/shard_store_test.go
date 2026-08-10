@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 func testShardStoreBinding() ShardStoreBinding {
@@ -326,6 +328,12 @@ func TestShardStoreIdentitySurvivesDDLPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fence := ShardStoreFence{OwnershipEpoch: 17, RoutingVersion: 19}
+	claim, err := database.ClaimShardStoreServing(binding, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = claim.Close()
 
 	statements := []string{
 		`CREATE TABLE docs (id STRING PRIMARY KEY, kind STRING)`,
@@ -346,6 +354,9 @@ func TestShardStoreIdentitySurvivesDDLPublication(t *testing.T) {
 		if catalog.ShardStore == nil || *catalog.ShardStore != identity {
 			t.Fatalf("identity after %q = %+v, want %+v", statement, catalog.ShardStore, identity)
 		}
+		if catalog.ShardStoreFence == nil || *catalog.ShardStoreFence != fence {
+			t.Fatalf("serving fence after %q = %+v, want %+v", statement, catalog.ShardStoreFence, fence)
+		}
 	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
@@ -359,6 +370,11 @@ func TestShardStoreIdentitySurvivesDDLPublication(t *testing.T) {
 	if err != nil || got != identity {
 		t.Fatalf("identity after DDL reopen = (%+v, %v), want %+v", got, err, identity)
 	}
+	retried, err := reopened.ClaimShardStoreServing(binding, fence)
+	if err != nil {
+		t.Fatalf("serving fence after DDL reopen: %v", err)
+	}
+	_ = retried.Close()
 }
 
 func TestShardStoreIdentityStrictCatalogDecode(t *testing.T) {
@@ -378,6 +394,299 @@ func TestShardStoreIdentityStrictCatalogDecode(t *testing.T) {
 		if err := json.Unmarshal([]byte(input), &catalog); err == nil {
 			t.Fatalf("corrupt shard identity decoded: %s", input)
 		}
+	}
+}
+
+func TestShardStoreServingClaimPersistsMonotonicFence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serving.vdb")
+	binding := testShardStoreBinding()
+	database, err := InitializeShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstFence := ShardStoreFence{OwnershipEpoch: 11, RoutingVersion: 5}
+	claim, err := database.ClaimShardStoreServing(binding, firstFence)
+	if err != nil {
+		t.Fatalf("first ClaimShardStoreServing: %v", err)
+	}
+	if claim.Identity().Binding() != binding || claim.Fence() != firstFence {
+		t.Fatalf("claim = identity %+v fence %+v", claim.Identity(), claim.Fence())
+	}
+	if _, err := database.ClaimShardStoreServing(binding, firstFence); !errors.Is(err, ErrShardStoreServingClaimed) {
+		t.Fatalf("second live claim = %v, want ErrShardStoreServingClaimed", err)
+	}
+	if _, err := database.ClaimShardStoreServing(binding, ShardStoreFence{
+		OwnershipEpoch: firstFence.OwnershipEpoch - 1,
+		RoutingVersion: firstFence.RoutingVersion,
+	}); !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("live stale claim = %v, want typed ErrOwnershipEpoch", err)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatalf("idempotent claim close: %v", err)
+	}
+
+	// Equal retry after close does not need to advance the catalog.
+	equal, err := database.ClaimShardStoreServing(binding, firstFence)
+	if err != nil {
+		t.Fatalf("equal retry: %v", err)
+	}
+	_ = equal.Close()
+
+	routingAdvance := ShardStoreFence{OwnershipEpoch: 11, RoutingVersion: 6}
+	routingClaim, err := database.ClaimShardStoreServing(binding, routingAdvance)
+	if err != nil {
+		t.Fatalf("routing advance: %v", err)
+	}
+	_ = routingClaim.Close()
+	epochAdvance := ShardStoreFence{OwnershipEpoch: 12, RoutingVersion: 6}
+	epochClaim, err := database.ClaimShardStoreServing(binding, epochAdvance)
+	if err != nil {
+		t.Fatalf("epoch advance: %v", err)
+	}
+	_ = epochClaim.Close()
+
+	_, err = database.ClaimShardStoreServing(binding, ShardStoreFence{
+		OwnershipEpoch: 11, RoutingVersion: 6,
+	})
+	if !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("epoch regression = %v, want ErrOwnershipEpoch", err)
+	}
+	var fenceErr *ShardStoreFenceError
+	if !errors.As(err, &fenceErr) || fenceErr.Durable != epochAdvance {
+		t.Fatalf("epoch regression detail = %#v, want durable %+v", fenceErr, epochAdvance)
+	}
+	_, err = database.ClaimShardStoreServing(binding, ShardStoreFence{
+		OwnershipEpoch: 12, RoutingVersion: 5,
+	})
+	if !errors.Is(err, distribution.ErrRoutingVersion) {
+		t.Fatalf("routing regression = %v, want ErrRoutingVersion", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.ClaimShardStoreServing(binding, firstFence); !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("durable regression after reopen = %v, want ErrOwnershipEpoch", err)
+	}
+	retried, err := reopened.ClaimShardStoreServing(binding, epochAdvance)
+	if err != nil {
+		t.Fatalf("durable equal retry after reopen: %v", err)
+	}
+	_ = retried.Close()
+}
+
+func TestShardStoreServingClaimValidatesCoordinatesAndBinding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serving-validation.vdb")
+	binding := testShardStoreBinding()
+	database, err := InitializeShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if _, err := database.ClaimShardStoreServing(binding, ShardStoreFence{
+		RoutingVersion: 1,
+	}); !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("zero epoch = %v, want ErrOwnershipEpoch", err)
+	}
+	if _, err := database.ClaimShardStoreServing(binding, ShardStoreFence{
+		OwnershipEpoch: 1,
+	}); !errors.Is(err, distribution.ErrRoutingVersion) {
+		t.Fatalf("zero routing version = %v, want ErrRoutingVersion", err)
+	}
+	wrong := binding
+	wrong.AllocationGeneration++
+	if _, err := database.ClaimShardStoreServing(wrong, ShardStoreFence{
+		OwnershipEpoch: 1, RoutingVersion: 1,
+	}); !errors.Is(err, ErrShardStoreIdentityMismatch) {
+		t.Fatalf("wrong binding = %v, want ErrShardStoreIdentityMismatch", err)
+	}
+
+	ordinary, err := Open(filepath.Join(t.TempDir(), "ordinary.vdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ordinary.Close()
+	if _, err := ordinary.ClaimShardStoreServing(binding, ShardStoreFence{
+		OwnershipEpoch: 1, RoutingVersion: 1,
+	}); !errors.Is(err, ErrShardStoreUnbound) {
+		t.Fatalf("unbound claim = %v, want ErrShardStoreUnbound", err)
+	}
+}
+
+func TestShardStoreServingClaimDefiniteFailureRollsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serving-definite.vdb")
+	binding := testShardStoreBinding()
+	storeDB, err := InitializeShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := ShardStoreFence{OwnershipEpoch: 3, RoutingVersion: 4}
+	claim, err := storeDB.ClaimShardStoreServing(binding, baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = claim.Close()
+
+	cause := errors.New("injected definite pre-publication failure")
+	advanced := ShardStoreFence{OwnershipEpoch: 5, RoutingVersion: 6}
+	if _, err := storeDB.claimShardStoreServing(binding, advanced, func(*database) (bool, error) {
+		return false, cause
+	}); !errors.Is(err, cause) {
+		t.Fatalf("definite failure = %v, want injected cause", err)
+	}
+	core := storeDB.connector.db
+	core.mu.RLock()
+	gotFence := *core.catalog.ShardStoreFence
+	pending := core.catalogWritePending
+	core.mu.RUnlock()
+	if gotFence != baseline || pending {
+		t.Fatalf("tentative state survived: fence=%+v pending=%t", gotFence, pending)
+	}
+	retriedBaseline, err := storeDB.ClaimShardStoreServing(binding, baseline)
+	if err != nil {
+		t.Fatalf("definite failure retained a live claim: %v", err)
+	}
+	_ = retriedBaseline.Close()
+	if err := storeDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	core = reopened.connector.db
+	core.mu.RLock()
+	gotFence = *core.catalog.ShardStoreFence
+	core.mu.RUnlock()
+	if gotFence != baseline {
+		t.Fatalf("failed-close cleanup published tentative fence %+v, want %+v", gotFence, baseline)
+	}
+}
+
+func TestShardStoreServingClaimAmbiguousPublicationFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serving-ambiguous.vdb")
+	binding := testShardStoreBinding()
+	storeDB, err := InitializeShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeDB.Close()
+	baseline := ShardStoreFence{OwnershipEpoch: 7, RoutingVersion: 8}
+	claim, err := storeDB.ClaimShardStoreServing(binding, baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = claim.Close()
+
+	core := storeDB.connector.db
+	fenceFailure := errors.New("injected catalog directory fence failure")
+	core.mu.Lock()
+	core.syncDir = func(string) error { return fenceFailure }
+	core.mu.Unlock()
+	advanced := ShardStoreFence{OwnershipEpoch: 9, RoutingVersion: 10}
+	if claim, err := storeDB.ClaimShardStoreServing(binding, advanced); claim != nil ||
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("ambiguous claim = (%v, %v), want nil ErrCommitOutcomeUnknown", claim, err)
+	}
+	core.mu.RLock()
+	gotFence := *core.catalog.ShardStoreFence
+	pendingFence := core.catalogFencePending
+	core.mu.RUnlock()
+	if gotFence != advanced || !pendingFence {
+		t.Fatalf("ambiguous state = fence %+v pending=%t, want %+v,true", gotFence, pendingFence, advanced)
+	}
+	if _, err := storeDB.ClaimShardStoreServing(binding, baseline); !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("stale claim after ambiguity = %v, want ErrOwnershipEpoch", err)
+	}
+
+	core.mu.Lock()
+	core.syncDir = nil
+	core.mu.Unlock()
+	retried, err := storeDB.ClaimShardStoreServing(binding, advanced)
+	if err != nil {
+		t.Fatalf("equal retry after settling ambiguity: %v", err)
+	}
+	_ = retried.Close()
+
+	// A persistence boundary that cannot even prove whether rename happened is
+	// also fail-closed: retain the proposed high-water and force a later settle.
+	uncertain := ShardStoreFence{OwnershipEpoch: 11, RoutingVersion: 12}
+	unknown := fmt.Errorf("%w: injected unresolved publication", durable.ErrCommitOutcomeUnknown)
+	if claim, err := storeDB.claimShardStoreServing(binding, uncertain, func(*database) (bool, error) {
+		return false, unknown
+	}); claim != nil || !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("unresolved claim = (%v, %v), want nil ErrCommitOutcomeUnknown", claim, err)
+	}
+	core.mu.RLock()
+	gotFence = *core.catalog.ShardStoreFence
+	pendingWrite := core.catalogWritePending
+	core.mu.RUnlock()
+	if gotFence != uncertain || !pendingWrite {
+		t.Fatalf("unresolved state = fence %+v pending=%t, want %+v,true", gotFence, pendingWrite, uncertain)
+	}
+	if _, err := storeDB.ClaimShardStoreServing(binding, advanced); !errors.Is(err, distribution.ErrOwnershipEpoch) {
+		t.Fatalf("stale claim after unresolved publication = %v, want ErrOwnershipEpoch", err)
+	}
+	settled, err := storeDB.ClaimShardStoreServing(binding, uncertain)
+	if err != nil {
+		t.Fatalf("settle unresolved publication: %v", err)
+	}
+	_ = settled.Close()
+}
+
+func TestShardStoreFenceStrictCatalogDecodeAndBounds(t *testing.T) {
+	standaloneFence := ShardStoreFence{OwnershipEpoch: 1, RoutingVersion: 1}
+	if err := checkCatalogSize(catalogFile{
+		Version: catalogVersion, Tables: map[string]*tableMeta{},
+		ShardStoreFence: &standaloneFence,
+	}); err == nil {
+		t.Fatal("catalog encoder accepted a shard store fence without identity")
+	}
+	identity := `"shard_store":{"distribution":"tenant_data","shard":"-80",` +
+		`"allocation_generation":7,"log_id":"00112233445566778899aabbccddeeff"}`
+	validPrefix := `{"version":0,"tables":{},` + identity + `,"shard_store_fence":`
+	invalid := []string{
+		`{"version":0,"tables":{},"shard_store_fence":{"ownership_epoch":1,"routing_version":1}}`,
+		validPrefix + `null}`,
+		validPrefix + `{}}`,
+		validPrefix + `{"ownership_epoch":1}}`,
+		validPrefix + `{"routing_version":1}}`,
+		validPrefix + `{"ownership_epoch":0,"routing_version":1}}`,
+		validPrefix + `{"ownership_epoch":1,"routing_version":0}}`,
+		validPrefix + `{"ownership_epoch":-1,"routing_version":1}}`,
+		validPrefix + `{"ownership_epoch":1,"routing_version":18446744073709551616}}`,
+		validPrefix + `{"ownership_epoch":1,"routing_version":1,"unknown":1}}`,
+		validPrefix + `{"ownership_epoch":1,"ownership_epoch":2,"routing_version":1}}`,
+	}
+	for _, input := range invalid {
+		var catalog catalogFile
+		if err := json.Unmarshal([]byte(input), &catalog); err == nil {
+			t.Fatalf("corrupt shard fence decoded: %s", input)
+		}
+	}
+
+	max := validPrefix +
+		`{"ownership_epoch":18446744073709551615,"routing_version":18446744073709551615}}`
+	var catalog catalogFile
+	if err := json.Unmarshal([]byte(max), &catalog); err != nil {
+		t.Fatalf("maximum uint64 fence rejected: %v", err)
+	}
+	if catalog.ShardStoreFence == nil ||
+		catalog.ShardStoreFence.OwnershipEpoch != distribution.OwnershipEpoch(^uint64(0)) ||
+		catalog.ShardStoreFence.RoutingVersion != distribution.RoutingVersion(^uint64(0)) {
+		t.Fatalf("maximum fence decoded as %+v", catalog.ShardStoreFence)
 	}
 }
 

@@ -21,7 +21,15 @@
 // distribution, shard, and allocation generation before recovery. Generic
 // [Open] and [OpenCluster] reject shard-bound catalogs so a serving process
 // cannot bypass that identity check. The random LogID is local incarnation
-// metadata, not a lease or a distributed revocation mechanism.
+// metadata. [Database.ClaimShardStoreServing] durably advances the identity's
+// nonzero ownership-epoch and routing-version high-waters before returning one
+// exclusive in-process claim; closing it permits an equal local restart but
+// never lowers either high-water. This protects only the exact open store. It
+// is not a lease, leader election, replicated authority, or revocation
+// mechanism for another process or a copied store. It does not police trusted
+// callers that open Sessions directly on the same Database; such callers must
+// stop and drain that work before releasing a serving claim. shardservice does
+// so for every Session it owns.
 //
 // [Session.Prepare] parses and lowers exactly once. [Prepared] reports the
 // statement kind, placeholder count and scalar-versus-document [ParamKind], as

@@ -23,6 +23,7 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 	var versionPresent bool
 	var tablesPresent bool
 	var shardStorePresent bool
+	var shardStoreFencePresent bool
 	err := decodeCatalogObject(data, "root", func(
 		name string,
 		decoder *json.Decoder,
@@ -55,6 +56,15 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("vibedb: SQL catalog shard store identity must not be null")
 			}
 			return nil
+		case "shard_store_fence":
+			shardStoreFencePresent = true
+			if err := decoder.Decode(&decoded.ShardStoreFence); err != nil {
+				return err
+			}
+			if decoded.ShardStoreFence == nil {
+				return fmt.Errorf("vibedb: SQL catalog shard store fence must not be null")
+			}
+			return nil
 		default:
 			return unknownCatalogMember("root", name)
 		}
@@ -70,6 +80,14 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 	}
 	if !shardStorePresent {
 		decoded.ShardStore = nil
+	}
+	if !shardStoreFencePresent {
+		decoded.ShardStoreFence = nil
+	}
+	if decoded.ShardStoreFence != nil && decoded.ShardStore == nil {
+		return fmt.Errorf(
+			"vibedb: SQL catalog shard store fence requires a shard store identity",
+		)
 	}
 	*c = decoded
 	return nil

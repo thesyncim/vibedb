@@ -287,9 +287,15 @@ Every shard catalog must be created explicitly with `vibedb-shard init`. Its
 write-once SQL catalog identity binds the distribution, shard ID, and
 topology-issued allocation generation to a random local LogID; `serve` opens
 existing bound stores only, and generic SQL opens reject them. This prevents
-accidental local rebinding. It is not a lease or replication authority: it
-cannot revoke a running old process, distinguish a copied store, or prove that
-a replica is caught up.
+accidental local rebinding. Before a server starts, it also durably advances
+nonzero ownership-epoch and routing-version high-waters and holds the only live
+serving claim for that exact open store until all connections drain. Regressed
+coordinates and a second local server fail closed. This is same-store local
+fencing, not a lease, election, or replication authority: it cannot revoke a
+running process over another store handle, distinguish or revoke a copied
+store, police a trusted caller opening direct SQL sessions on the same
+`Database`, or prove that a replica is caught up. The shard server itself does
+not release its claim until its owned sessions drain.
 
 The shard service, gateway, and their binaries are server-only and not part of
 the embedded API. The one embedded touch point is opt-in and carries no
