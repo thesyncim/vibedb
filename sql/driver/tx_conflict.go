@@ -12,6 +12,11 @@ import (
 // exact per-key semantics.
 const txConflictHistoryKeys = txnclock.HistoryKeys
 
+const (
+	txSerializableReadKeys  = txnclock.HistoryKeys
+	txSerializableReadBytes = 1 << 20
+)
+
 // txConflictClock is the SQL driver's always-armed view of txnclock.Clock.
 //
 // Every method is called with database.mu held. The driver arms once on the

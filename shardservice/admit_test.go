@@ -73,8 +73,52 @@ func TestAdmit(t *testing.T) {
 		{
 			name:     "session_read_reserved",
 			mutate:   func(r *ShardRequest) { r.ReadPolicy = ReadSession },
-			wantKind: ErrorUnsupportedReadPolicy,
-			wantIs:   ErrUnsupportedReadPolicy,
+			wantKind: ErrorPositionUnsupported,
+			wantIs:   ErrPositionUnsupported,
+		},
+		{
+			name: "matching_minimum_reserved",
+			mutate: func(r *ShardRequest) {
+				r.HasMinPosition = true
+				r.MinPosition = testPosition("tenant_data", "-80", 12)
+			},
+			wantKind: ErrorPositionUnsupported,
+			wantIs:   ErrPositionUnsupported,
+		},
+		{
+			name: "minimum_wrong_distribution",
+			mutate: func(r *ShardRequest) {
+				r.HasMinPosition = true
+				r.MinPosition = testPosition("other", "-80", 12)
+			},
+			wantKind: ErrorPositionIdentity,
+			wantIs:   ErrPositionIdentity,
+		},
+		{
+			name: "minimum_wrong_shard",
+			mutate: func(r *ShardRequest) {
+				r.HasMinPosition = true
+				r.MinPosition = testPosition("tenant_data", "80-", 12)
+			},
+			wantKind: ErrorPositionIdentity,
+			wantIs:   ErrPositionIdentity,
+		},
+		{
+			name: "malformed_minimum",
+			mutate: func(r *ShardRequest) {
+				r.HasMinPosition = true
+				r.MinPosition = testPosition("tenant_data", "-80", 0)
+			},
+			wantKind: ErrorMalformedRequest,
+			wantIs:   ErrInvalidPosition,
+		},
+		{
+			name: "absent_minimum_with_payload",
+			mutate: func(r *ShardRequest) {
+				r.MinPosition = testPosition("tenant_data", "-80", 12)
+			},
+			wantKind: ErrorMalformedRequest,
+			wantIs:   errNonCanonicalPosition,
 		},
 		{
 			name:     "stale_read_reserved",

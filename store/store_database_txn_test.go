@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibejson"
 )
@@ -186,6 +187,31 @@ func TestDatabaseUpdateConvenience(t *testing.T) {
 	}
 	if got := db.Snapshot().Len(); got != 2 {
 		t.Fatalf("Len=%d", got)
+	}
+}
+
+func TestDatabaseUpdateCallbackMayChangeCatalog(t *testing.T) {
+	var db Database
+	mustCollection(t, &db, "existing")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Update(func(*DatabaseBatch) error {
+			_, err := db.CreateCollection("created", Options{})
+			return err
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Database.Update callback catalog change: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Database.Update held the catalog lock while invoking its callback")
+	}
+	if _, ok := db.Collection("created"); !ok {
+		t.Fatal("callback-created collection was not published")
 	}
 }
 

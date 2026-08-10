@@ -12,6 +12,21 @@ import (
 // requests carry the required session/applied-position metadata.
 var ErrUnsupportedReadPolicy = errors.New("shardservice: unsupported read policy")
 
+// Position admission sentinels. These failures are deliberately distinct from
+// routing-version and ownership-epoch refusals: a gateway must not refresh or
+// retry them as stale topology.
+var (
+	// ErrPositionUnsupported reports that no replicated apply log exists from
+	// which the shard can prove a requested minimum.
+	ErrPositionUnsupported = errors.New("shardservice: logical positions are not supported")
+	// ErrPositionIdentity reports a minimum naming a different distribution or
+	// shard. Its index is not comparable with this shard's log.
+	ErrPositionIdentity = errors.New("shardservice: logical position identity mismatch")
+	// ErrPositionNotReached reports a matching position above the serving
+	// replica's applied index. It is reserved until replicated apply exists.
+	ErrPositionNotReached = errors.New("shardservice: logical position has not been reached")
+)
+
 // Static ownership admission: the pure gate a shard applies to every request
 // before it parses or executes anything.
 //
@@ -59,7 +74,11 @@ func (e *AdmissionError) Response() *ShardResponse {
 //   - wrong distribution or shard  -> ErrorNotOwner       (ErrNotShardOwner)
 //   - stale routing version        -> ErrorRoutingVersion (ErrRoutingVersion)
 //   - mismatched ownership epoch    -> ErrorOwnershipEpoch (ErrOwnershipEpoch)
-//   - unsupported read policy       -> ErrorUnsupportedReadPolicy
+//   - malformed minimum position    -> ErrorMalformedRequest
+//   - mismatched position identity  -> ErrorPositionIdentity
+//   - any matching minimum position -> ErrorPositionUnsupported (Phase 0)
+//   - session read without minimum  -> ErrorPositionUnsupported (Phase 0)
+//   - unsupported stale read        -> ErrorUnsupportedReadPolicy
 func (o Ownership) Admit(req *ShardRequest) error {
 	if req == nil {
 		return &AdmissionError{
@@ -102,6 +121,43 @@ func (o Ownership) Admit(req *ShardRequest) error {
 				"shardservice: ownership epoch mismatch: request %d, configured %d",
 				req.OwnershipEpoch, o.Epoch),
 			sentinel: distribution.ErrOwnershipEpoch,
+		}
+	}
+	if !req.HasMinPosition && !req.MinPosition.IsZero() {
+		return &AdmissionError{
+			Kind:     ErrorMalformedRequest,
+			Message:  errNonCanonicalPosition.Error(),
+			sentinel: errNonCanonicalPosition,
+		}
+	}
+	if req.HasMinPosition {
+		if err := req.MinPosition.Validate(); err != nil {
+			return &AdmissionError{
+				Kind:     ErrorMalformedRequest,
+				Message:  err.Error(),
+				sentinel: err,
+			}
+		}
+		if req.MinPosition.Distribution != o.Distribution || req.MinPosition.Shard != o.Shard {
+			return &AdmissionError{
+				Kind: ErrorPositionIdentity,
+				Message: fmt.Sprintf(
+					"shardservice: logical position identity mismatch: request position names (%q, %q), this shard serves (%q, %q)",
+					req.MinPosition.Distribution, req.MinPosition.Shard, o.Distribution, o.Shard),
+				sentinel: ErrPositionIdentity,
+			}
+		}
+		return &AdmissionError{
+			Kind:     ErrorPositionUnsupported,
+			Message:  "shardservice: minimum position cannot be proved without a replicated apply log",
+			sentinel: ErrPositionUnsupported,
+		}
+	}
+	if req.ReadPolicy == ReadSession {
+		return &AdmissionError{
+			Kind:     ErrorPositionUnsupported,
+			Message:  "shardservice: session reads cannot be proved without a replicated apply log and applied position",
+			sentinel: ErrPositionUnsupported,
 		}
 	}
 	if req.ReadPolicy != ReadStrong {

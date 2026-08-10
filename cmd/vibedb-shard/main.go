@@ -73,6 +73,10 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
+	if err := requireLoopbackListen(*listen); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
 
 	db, err := sqldriver.Open(*store)
 	if err != nil {
@@ -119,4 +123,22 @@ func runServe(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// requireLoopbackListen keeps the unauthenticated shard protocol local until
+// an authenticated transport is available. Passing a non-loopback address
+// would let a peer issue shard SQL and DDL without credentials.
+func requireLoopbackListen(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("listen address %q is invalid: %w", address, err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("listen address %q must be loopback; remote unauthenticated serving is refused", address)
+	}
+	return nil
 }

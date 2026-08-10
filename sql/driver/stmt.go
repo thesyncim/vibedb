@@ -14,19 +14,21 @@ import (
 )
 
 type stmt struct {
-	conn           *conn
-	tree           *sqlast.Statement
-	query          *query.Statement
-	mutation       *query.DMLStatement
-	insertSource   *insertSelectPlan
-	views          *preparedViewState
-	pointPredicate *sqlast.Expr
-	pointPath      string
-	pointCandidate bool
-	primaryPoint   bool
-	catalogJoin    bool
-	params         int
-	paramKinds     []ParamKind
+	conn               *conn
+	tree               *sqlast.Statement
+	query              *query.Statement
+	mutation           *query.DMLStatement
+	insertSource       *insertSelectPlan
+	views              *preparedViewState
+	pointPredicate     *sqlast.Expr
+	pointPath          string
+	pointCandidate     bool
+	primaryPoint       bool
+	serialPointSafe    bool
+	serialMutationSafe bool
+	catalogJoin        bool
+	params             int
+	paramKinds         []ParamKind
 	// paramPositions stores authored byte positions plus one for document
 	// placeholders only. It remains nil for the scalar-only path.
 	paramPositions []int
@@ -95,6 +97,8 @@ func (s *stmt) Close() error {
 	s.pointPath = ""
 	s.pointCandidate = false
 	s.primaryPoint = false
+	s.serialPointSafe = false
+	s.serialMutationSafe = false
 	s.catalogJoin = false
 	s.paramKinds = nil
 	s.paramPositions = nil
@@ -264,12 +268,17 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		}
 		var source query.Source
 		pointPredicate := s.pointPredicate
-		if s.pointCandidate && s.pointPath == state.primaryKey {
+		pointRead := s.pointCandidate && s.pointPath == state.primaryKey
+		if pointRead && s.conn.tx.isolation == IsolationSerializable {
+			_, pointRead = s.conn.tx.serializablePointQuery(s)
+		}
+		if pointRead {
 			keys, keyErr := s.conn.bindPointPredicateKeys(
 				pointPredicate, args, state.limits.MaxKeyBytes)
 			if keyErr != nil {
 				return nil, keyErr
 			}
+			s.conn.tx.trackSerializablePointReads(state, keys)
 			source, err = s.conn.pointTransactionSource(ctx, state, keys)
 			if errors.Is(err, errPointMaterializationTooLarge) {
 				source, err = s.conn.tx.querySource(s.query.Collection())

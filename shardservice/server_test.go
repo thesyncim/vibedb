@@ -275,7 +275,7 @@ func TestServerMalformedRequest(t *testing.T) {
 	bad := ownedRequest(`SELECT id FROM docs`)
 	bad.Params = []Param{NullParam()}
 	raw := encodeRequest(t, bad)
-	// Overwrite the trailing parameter-kind byte with an out-of-range enumerator.
+	// Overwrite the trailing optional-position marker with an out-of-range value.
 	raw[len(raw)-1] = 0xFF
 	if _, err := conn.Write(raw); err != nil {
 		t.Fatalf("write malformed frame: %v", err)
@@ -424,6 +424,8 @@ func TestServerReadPolicyStrong(t *testing.T) {
 	req.ReadPolicy = ReadStrong
 	if got := exec(t, conn, req); got.Kind != ResponseRows {
 		t.Fatalf("strong read = %+v, want Rows", got)
+	} else if got.HasReadPosition || !got.ReadPosition.IsZero() {
+		t.Fatalf("strong read claimed unimplemented applied position %+v", got.ReadPosition)
 	}
 }
 
@@ -454,13 +456,43 @@ func TestServerReservedReadPoliciesFailClosed(t *testing.T) {
 	srv, _ := newServer(t, Options{})
 	conn := dial(t, srv)
 
-	for _, policy := range []ReadPolicy{ReadSession, ReadStale} {
+	tests := []struct {
+		policy ReadPolicy
+		want   ErrorKind
+	}{
+		{ReadSession, ErrorPositionUnsupported},
+		{ReadStale, ErrorUnsupportedReadPolicy},
+	}
+	for _, tc := range tests {
 		req := ownedRequest(`SELECT 1`)
-		req.ReadPolicy = policy
+		req.ReadPolicy = tc.policy
 		resp := roundTrip(t, conn, req)
-		if resp.Kind != ResponseError || resp.ErrorKind != ErrorUnsupportedReadPolicy {
-			t.Fatalf("policy %s = %+v, want UnsupportedReadPolicy", policy, resp)
+		if resp.Kind != ResponseError || resp.ErrorKind != tc.want {
+			t.Fatalf("policy %s = %+v, want %s", tc.policy, resp, tc.want)
 		}
+	}
+}
+
+// TestServerMinimumPositionRejectedBeforeSQL proves Phase 0 never executes a
+// statement when a minimum is present. The intentionally invalid SQL would be
+// classified MalformedRequest if preparation were reached.
+func TestServerMinimumPositionRejectedBeforeSQL(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+
+	req := ownedRequest(`this is intentionally not SQL`)
+	req.HasMinPosition = true
+	req.MinPosition = testPosition("tenant_data", "-80", 9)
+	resp := roundTrip(t, conn, req)
+	if resp.Kind != ResponseError || resp.ErrorKind != ErrorPositionUnsupported {
+		t.Fatalf("minimum-position request = %+v, want PositionUnsupported", resp)
+	}
+
+	session := ownedRequest(`this is also intentionally not SQL`)
+	session.ReadPolicy = ReadSession
+	resp = roundTrip(t, conn, session)
+	if resp.Kind != ResponseError || resp.ErrorKind != ErrorPositionUnsupported {
+		t.Fatalf("session-read request = %+v, want PositionUnsupported", resp)
 	}
 }
 

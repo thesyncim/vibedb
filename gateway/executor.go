@@ -285,7 +285,6 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	defer cancel()
 
 	results := make([]*shardservice.ShardResponse, len(pl.calls))
-	sem := make(chan struct{}, max(1, p.MaxConcurrency))
 
 	var (
 		mu         sync.Mutex
@@ -302,40 +301,51 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 		cancel()
 	}
 
+	jobs := make(chan int)
+	workers := min(max(1, p.MaxConcurrency), len(pl.calls))
 	var wg sync.WaitGroup
-	for i := range pl.calls {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-opctx.Done():
-				fail(opctx.Err())
-				return
-			}
-			defer func() { <-sem }()
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				select {
+				case <-opctx.Done():
+					return
+				default:
+				}
 
-			sctx, sc := context.WithTimeout(opctx, p.PerShardDeadline)
-			defer sc()
-			resp, err := e.client.Do(sctx, pl.calls[i].address, pl.calls[i].req)
-			if err != nil {
-				fail(err)
-				return
-			}
-			results[i] = resp
+				sctx, sc := context.WithTimeout(opctx, p.PerShardDeadline)
+				resp, err := e.client.Do(sctx, pl.calls[i].address, pl.calls[i].req)
+				sc()
+				if err != nil {
+					fail(err)
+					return
+				}
+				results[i] = resp
 
-			rows := uint64(len(resp.Rows))
-			b := responseBytes(resp)
-			mu.Lock()
-			totalRows += rows
-			totalBytes += b
-			over := checkAggregate(p, totalRows, totalBytes)
-			mu.Unlock()
-			if over != nil {
-				fail(over)
+				rows := uint64(len(resp.Rows))
+				b := responseBytes(resp)
+				mu.Lock()
+				totalRows += rows
+				totalBytes += b
+				over := checkAggregate(p, totalRows, totalBytes)
+				mu.Unlock()
+				if over != nil {
+					fail(over)
+					return
+				}
 			}
-		}(i)
+		})
 	}
+	go func() {
+		defer close(jobs)
+		for i := range pl.calls {
+			select {
+			case jobs <- i:
+			case <-opctx.Done():
+				return
+			}
+		}
+	}()
 	wg.Wait()
 
 	if firstErr != nil {

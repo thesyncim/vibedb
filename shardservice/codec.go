@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"time"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
 )
@@ -80,6 +81,18 @@ var errBadEnum = errors.New("shardservice: frame carries an out-of-range enumera
 // duration.
 var errNegativeDuration = errors.New("shardservice: request deadline is negative")
 
+// errBadPresence reports an optional-field marker other than absent (0) or
+// present (1).
+var errBadPresence = errors.New("shardservice: frame carries an invalid optional-field marker")
+
+// errUnexpectedReadPosition reports a position attached to a response shape
+// that cannot represent a read.
+var errUnexpectedReadPosition = errors.New("shardservice: read position is only valid on a row response")
+
+// errNonCanonicalPosition reports an absent optional paired with a nonzero
+// in-memory payload.
+var errNonCanonicalPosition = errors.New("shardservice: absent logical position has a nonzero payload")
+
 // encbuf accumulates a frame body. Its appenders never fail on a well-formed
 // value; a field that overruns the length bound latches err so the whole encode
 // reports it.
@@ -113,6 +126,30 @@ func (e *encbuf) str(s string) {
 	}
 	e.u32(uint32(len(s)))
 	e.b = append(e.b, s...)
+}
+
+// position appends one explicitly presence-tagged logical position. An absent
+// option must carry the zero payload in memory; a present partial value is
+// rejected.
+func (e *encbuf) position(has bool, p Position) error {
+	if !has {
+		if !p.IsZero() {
+			return errNonCanonicalPosition
+		}
+		e.u8(0)
+		return nil
+	}
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	e.u8(1)
+	e.u8(uint8(len(p.Distribution)))
+	e.b = append(e.b, p.Distribution...)
+	e.u8(uint8(len(p.Shard)))
+	e.b = append(e.b, p.Shard...)
+	e.b = append(e.b, p.LogID[:]...)
+	e.u64(p.Index)
+	return nil
 }
 
 // deccur is a cursor over one frame body. Every accessor is total: it either
@@ -162,6 +199,18 @@ func (d *deccur) u64() uint64 {
 	return v
 }
 
+// fixed16 consumes one fixed-width log identity.
+func (d *deccur) fixed16() [16]byte {
+	var v [16]byte
+	if len(d.b) < len(v) {
+		d.fail(errTruncated)
+		return v
+	}
+	copy(v[:], d.b[:len(v)])
+	d.b = d.b[len(v):]
+	return v
+}
+
 // slice consumes a uint32-length-prefixed byte run, refusing a length the
 // remaining body cannot satisfy.
 func (d *deccur) slice() []byte {
@@ -193,6 +242,67 @@ func (d *deccur) bytesCopy() []byte {
 	out := make([]byte, len(v))
 	copy(out, v)
 	return out
+}
+
+// position decodes one presence-tagged logical position and validates all of
+// its identity components before returning it to admission.
+func (d *deccur) position() (bool, Position, error) {
+	present := d.u8()
+	if d.bad() {
+		return false, Position{}, d.why
+	}
+	switch present {
+	case 0:
+		return false, Position{}, nil
+	case 1:
+		distributionName, err := d.positionIdentity("distribution")
+		if err != nil {
+			return false, Position{}, err
+		}
+		shard, err := d.positionIdentity("shard")
+		if err != nil {
+			return false, Position{}, err
+		}
+		p := Position{
+			Distribution: distribution.DistributionName(distributionName),
+			Shard:        distribution.ShardID(shard),
+			LogID:        d.fixed16(),
+			Index:        d.u64(),
+		}
+		if d.bad() {
+			return false, Position{}, d.why
+		}
+		if err := p.Validate(); err != nil {
+			return false, Position{}, err
+		}
+		return true, p, nil
+	default:
+		return false, Position{}, errBadPresence
+	}
+}
+
+// positionIdentity validates a length-prefixed identity directly against the
+// frame backing bytes before copying it into a retained string. A peer can
+// therefore never induce an allocation larger than MaxPositionIdentityBytes
+// through a position field.
+func (d *deccur) positionIdentity(field string) (string, error) {
+	n := int(d.u8())
+	if d.bad() {
+		return "", d.why
+	}
+	if n == 0 {
+		return "", &PositionValidationError{Reason: field + " is empty"}
+	}
+	if n > len(d.b) {
+		d.fail(errTruncated)
+		return "", d.why
+	}
+	raw := d.b[:n]
+	d.b = d.b[n:]
+	if !utf8.Valid(raw) {
+		return "", &PositionValidationError{Reason: field + " is not valid UTF-8"}
+	}
+	return string(raw), nil
 }
 
 // count reads a uint32 element count and refuses one that cannot fit: each
@@ -317,6 +427,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 			// no payload
 		}
 	}
+	if err := e.position(req.HasMinPosition, req.MinPosition); err != nil {
+		return err
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -368,13 +481,21 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			p := Param{Kind: kind}
 			switch kind {
 			case ParamBool:
-				p.Bool = d.u8() != 0
+				marker := d.u8()
+				if marker > 1 {
+					return nil, errBadEnum
+				}
+				p.Bool = marker == 1
 			case ParamNumber, ParamString, ParamDocument:
 				p.Text = d.str()
 			case ParamNull:
 			}
 			req.Params[i] = p
 		}
+	}
+	req.HasMinPosition, req.MinPosition, err = d.position()
+	if err != nil {
+		return nil, err
 	}
 	if err := d.end(); err != nil {
 		return nil, err
@@ -396,6 +517,9 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	}
 	if !resp.Kind.valid() {
 		return errBadEnum
+	}
+	if resp.HasReadPosition && resp.Kind != ResponseRows {
+		return errUnexpectedReadPosition
 	}
 
 	var e encbuf
@@ -437,6 +561,9 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 		}
 		e.u8(uint8(resp.ErrorKind))
 		e.str(resp.ErrorMessage)
+	}
+	if err := e.position(resp.HasReadPosition, resp.ReadPosition); err != nil {
+		return err
 	}
 	if e.err != nil {
 		return e.err
@@ -493,7 +620,11 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 			for i := 0; i < nr; i++ {
 				row := make([]Cell, nc)
 				for j := 0; j < nc; j++ {
-					if d.u8() != 0 {
+					marker := d.u8()
+					if marker > 1 {
+						return nil, errBadEnum
+					}
+					if marker == 1 {
 						row[j] = Cell{Null: true}
 					} else {
 						row[j] = Cell{Bytes: d.bytesCopy()}
@@ -517,6 +648,13 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 		}
 		resp.ErrorKind = ek
 		resp.ErrorMessage = d.str()
+	}
+	resp.HasReadPosition, resp.ReadPosition, err = d.position()
+	if err != nil {
+		return nil, err
+	}
+	if resp.HasReadPosition && kind != ResponseRows {
+		return nil, errUnexpectedReadPosition
 	}
 	if err := d.end(); err != nil {
 		return nil, err

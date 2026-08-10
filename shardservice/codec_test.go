@@ -209,7 +209,8 @@ func rawFrame(tag byte, body []byte) []byte {
 func TestDecodeRequestMalformed(t *testing.T) {
 	// A minimal valid request body for mutation: version, three empty strings,
 	// two u64 (routing, epoch), policy and execution-mode bytes, three u64
-	// (deadline, maxbytes, maxrows), and a zero param count.
+	// (deadline, maxbytes, maxrows), a zero param count, and an absent minimum
+	// position marker.
 	valid := func() []byte {
 		var e encbuf
 		e.u8(wireVersion1)
@@ -224,6 +225,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 		e.u64(0)
 		e.u64(0)
 		e.u32(0)
+		e.u8(0)
 		return e.b
 	}
 
@@ -273,6 +275,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u32(0)
+				e.u8(0)
 				return rawFrame(tagRequest, e.b)
 			}(),
 			want: errBadEnum,
@@ -293,6 +296,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u32(0)
+				e.u8(0)
 				return rawFrame(tagRequest, e.b)
 			}(),
 			want: errBadEnum,
@@ -362,6 +366,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.u64(0)
 				e.u64(0)
 				e.u32(0)
+				e.u8(0)
 				return rawFrame(tagRequest, e.b)
 			}(),
 			want: errNegativeDuration,

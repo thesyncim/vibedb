@@ -79,6 +79,19 @@ func Repack(src, out *os.File, options Options) (RepackReport, error) {
 	if err != nil {
 		return report, err
 	}
+	if report.Documents == 0 {
+		// The bulk primary path deliberately rejects empty input because it has
+		// no leaf record to seed. Repack must still preserve an empty source, so
+		// initialize the canonical empty store instead.
+		empty, createErr := Create(out, options)
+		if createErr != nil {
+			return report, createErr
+		}
+		if state := empty.state.Load(); state != nil {
+			report.OutputFileEnd = int64(state.fileEnd)
+		}
+		return report, empty.Close()
+	}
 	fileEnd, err := CreateFromPrimary(built, out, options)
 	if err != nil {
 		return report, err

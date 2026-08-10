@@ -448,11 +448,9 @@ func (f *RecursiveFixpoint) appendRow(row []Cell, iteration int) error {
 		return f.working.appendMeasuredRow(row, payload, f.options.cancel)
 	}
 
-	// DISTINCT must classify a candidate before row/depth admission: a duplicate
+	// DISTINCT must classify a candidate before row/byte admission: a duplicate
 	// at a saturated limit does not enlarge the fixpoint and is still admissible.
-	if err := f.admitBytes(rowBytes, f.identity.retainedBytes()); err != nil {
-		return err
-	}
+	// The temporary spool row is rolled back immediately after classification.
 	rowIndex := f.working.rows
 	if err := f.working.appendMeasuredRow(row, payload, f.options.cancel); err != nil {
 		return err
@@ -473,6 +471,10 @@ func (f *RecursiveFixpoint) appendRow(row []Cell, iteration int) error {
 	} else if found {
 		f.working.rollbackLastRow()
 		return nil
+	}
+	if err := f.admitBytes(rowBytes, f.identity.retainedBytes()); err != nil {
+		f.working.rollbackLastRow()
+		return err
 	}
 	if err := f.admitIterationAndRows(iteration, 0); err != nil {
 		f.working.rollbackLastRow()

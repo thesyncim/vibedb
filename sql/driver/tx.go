@@ -40,26 +40,32 @@ type insertSelectStageAccount struct {
 }
 
 type txTable struct {
-	name              string
-	incarnation       *table
-	snapshot          *durable.Snapshot
-	refreshSnapshot   *durable.Snapshot
-	refreshCaptured   bool
-	pending           map[string]*txMutation
-	order             []string
-	primaryKey        string
-	primary           vibejson.CompiledPointer
-	schema            *store.Schema
-	limits            durable.Options
-	conflicts         *txConflictClock
-	conflictRevision  uint64
-	statementRevision uint64
-	serialRead        bool
-	overlaySource     query.FileOverlaySource
-	emptyDocs         store.Segment
-	existenceScratch  []byte
-	validationTape    []vibejson.IndexEntry
-	stagedBytes       int
+	name               string
+	incarnation        *table
+	snapshot           *durable.Snapshot
+	refreshSnapshot    *durable.Snapshot
+	refreshCaptured    bool
+	pending            map[string]*txMutation
+	order              []string
+	primaryKey         string
+	primary            vibejson.CompiledPointer
+	schema             *store.Schema
+	limits             durable.Options
+	conflicts          *txConflictClock
+	conflictRevision   uint64
+	statementRevision  uint64
+	serialReadCoarse   bool
+	serialReadSet      map[string]struct{}
+	serialReadOrder    []string
+	serialReadBytes    int
+	serialReadArena    []byte
+	serialReadChunks   [][]byte
+	serialReadRetained int
+	overlaySource      query.FileOverlaySource
+	emptyDocs          store.Segment
+	existenceScratch   []byte
+	validationTape     []vibejson.IndexEntry
+	stagedBytes        int
 	// highWaterKeys and highWaterBytes track peak overlay occupancy for
 	// admission. ROLLBACK TO restores order and stagedBytes but does not lower
 	// these watermarks.
@@ -74,14 +80,17 @@ type txTable struct {
 // dirty set is every table with a non-empty overlay; COMMIT validates each
 // participant and publishes through Collection.Update or UpdateCollections.
 type tx struct {
-	conn       *conn
-	tables     map[string]*txTable
-	views      map[string]*viewMeta
-	savepoints []savepointFrame
-	readOnly   bool
-	isolation  IsolationLevel
-	done       bool
-	staged     []stagedTxMutation
+	conn               *conn
+	tables             map[string]*txTable
+	views              map[string]*viewMeta
+	savepoints         []savepointFrame
+	readOnly           bool
+	isolation          IsolationLevel
+	done               bool
+	staged             []stagedTxMutation
+	serialReadKeys     int
+	serialReadBytes    int
+	serialReadRetained int
 }
 
 var (
@@ -334,12 +343,199 @@ func joinRefreshError(primary, cleanup error) error {
 }
 
 func (t *tx) markSerializableRead(name string) {
-	if t.isolation != IsolationSerializable {
+	if t.isolation != IsolationSerializable || t.readOnly {
 		return
 	}
 	if state := t.tables[name]; state != nil {
-		state.serialRead = true
+		t.promoteSerializableRead(state)
 	}
+}
+
+// trackSerializablePointReads retains exact primary-key dependencies until the
+// transaction-wide key or owned-byte bound is reached. Promotion is monotonic:
+// a coarse dependency supersedes and releases the table's exact set, and a
+// later savepoint rollback can never narrow it again.
+func (t *tx) trackSerializablePointReads(state *txTable, keys []string) {
+	if t.isolation != IsolationSerializable || t.readOnly || state == nil ||
+		state.serialReadCoarse {
+		return
+	}
+	for _, key := range keys {
+		if _, exists := state.serialReadSet[key]; exists {
+			continue
+		}
+		if t.serialReadKeys >= txSerializableReadKeys ||
+			len(key) > txSerializableReadBytes-t.serialReadBytes {
+			t.promoteSerializableRead(state)
+			return
+		}
+		owned, ok := t.ownSerializableReadKey(state, key)
+		if !ok {
+			t.promoteSerializableRead(state)
+			return
+		}
+		if state.serialReadSet == nil {
+			state.serialReadSet = make(map[string]struct{})
+		}
+		state.serialReadSet[owned] = struct{}{}
+		state.serialReadOrder = append(state.serialReadOrder, owned)
+		state.serialReadBytes += len(owned)
+		t.serialReadKeys++
+		t.serialReadBytes += len(owned)
+	}
+}
+
+func (t *tx) trackSerializablePointRead(state *txTable, key string) {
+	keys := [...]string{key}
+	t.trackSerializablePointReads(state, keys[:])
+}
+
+func (t *tx) ownSerializableReadKey(
+	state *txTable,
+	key string,
+) (string, bool) {
+	if len(key) == 0 {
+		return "", true
+	}
+	if cap(state.serialReadArena)-len(state.serialReadArena) < len(key) {
+		remaining := txSerializableReadBytes - t.serialReadRetained
+		if remaining < len(key) {
+			return "", false
+		}
+		if cap(state.serialReadArena) != 0 {
+			state.serialReadChunks = append(
+				state.serialReadChunks, state.serialReadArena,
+			)
+		}
+		next := cap(state.serialReadArena) * 2
+		if next < 64 {
+			next = 64
+		}
+		if next < len(key) {
+			next = len(key)
+		}
+		if next > remaining {
+			next = remaining
+		}
+		state.serialReadArena = make([]byte, 0, next)
+		state.serialReadRetained += next
+		t.serialReadRetained += next
+	}
+	start := len(state.serialReadArena)
+	state.serialReadArena = append(state.serialReadArena, key...)
+	return byteview.String(
+		state.serialReadArena[start:len(state.serialReadArena):len(state.serialReadArena)],
+	), true
+}
+
+func (t *tx) promoteSerializableRead(state *txTable) {
+	if state == nil || state.serialReadCoarse {
+		return
+	}
+	state.serialReadCoarse = true
+	if t.serialReadKeys >= len(state.serialReadOrder) {
+		t.serialReadKeys -= len(state.serialReadOrder)
+	} else {
+		t.serialReadKeys = 0
+	}
+	if t.serialReadBytes >= state.serialReadBytes {
+		t.serialReadBytes -= state.serialReadBytes
+	} else {
+		t.serialReadBytes = 0
+	}
+	if t.serialReadRetained >= state.serialReadRetained {
+		t.serialReadRetained -= state.serialReadRetained
+	} else {
+		t.serialReadRetained = 0
+	}
+	state.serialReadSet = nil
+	state.serialReadOrder = nil
+	state.serialReadBytes = 0
+	state.serialReadArena = nil
+	state.serialReadChunks = nil
+	state.serialReadRetained = 0
+}
+
+func (t *tx) serializablePointQuery(statement *stmt) (*txTable, bool) {
+	if t.isolation != IsolationSerializable || statement == nil ||
+		statement.query == nil || !statement.serialPointSafe {
+		return nil, false
+	}
+	state := t.tables[statement.query.Collection()]
+	return state, state != nil && statement.pointCandidate &&
+		statement.pointPath == state.primaryKey
+}
+
+// serializableDirectRelationSelect proves that one SELECT has exactly one
+// physical root and no nested execution that could read another row (including
+// another reference to the same table, whose dependency name is deduplicated).
+// It is intentionally narrower than the executor's single-source fast path.
+func serializableDirectRelationSelect(
+	statement *sqlast.SelectStmt,
+	collection string,
+) bool {
+	if statement == nil || statement.With != nil || statement.Set != nil ||
+		len(statement.From) != 1 {
+		return false
+	}
+	relation := &statement.From[0]
+	if relation.Kind != sqlast.RelationCollection ||
+		relation.Name != collection || relation.Query != nil ||
+		relation.Lateral != nil || relation.On != nil {
+		return false
+	}
+	if serializableExprHasSubquery(statement.Where) ||
+		serializableExprHasSubquery(statement.Having) {
+		return false
+	}
+	for i := range statement.Columns {
+		if serializableScalarHasSubquery(statement.Columns[i].Scalar) {
+			return false
+		}
+	}
+	for i := range statement.OrderBy {
+		if serializableScalarHasSubquery(statement.OrderBy[i].Scalar) {
+			return false
+		}
+	}
+	return true
+}
+
+func serializableExprHasSubquery(expression *sqlast.Expr) bool {
+	if expression == nil {
+		return false
+	}
+	if expression.Subquery != nil ||
+		serializableScalarHasSubquery(expression.ScalarLeft) ||
+		serializableScalarHasSubquery(expression.ScalarRight) {
+		return true
+	}
+	for _, child := range expression.Kids {
+		if serializableExprHasSubquery(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func serializableScalarHasSubquery(expression *sqlast.ScalarExpr) bool {
+	if expression == nil {
+		return false
+	}
+	if serializableScalarHasSubquery(expression.Left) ||
+		serializableScalarHasSubquery(expression.Right) ||
+		serializableScalarHasSubquery(expression.Else) {
+		return true
+	}
+	for i := range expression.Whens {
+		when := &expression.Whens[i]
+		if serializableExprHasSubquery(when.Predicate) ||
+			serializableScalarHasSubquery(when.Match) ||
+			serializableScalarHasSubquery(when.Result) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *tx) beginQueryStatement(ctx context.Context, statement *stmt) error {
@@ -349,11 +545,19 @@ func (t *tx) beginQueryStatement(ctx context.Context, statement *stmt) error {
 	if t.isolation != IsolationSerializable || statement == nil {
 		return nil
 	}
+	_, exactDriving := t.serializablePointQuery(statement)
+	driving := ""
+	if statement.query != nil {
+		driving = statement.query.Collection()
+	}
 	for i := range statement.dependencies {
+		if exactDriving && statement.dependencies[i].name == driving {
+			continue
+		}
 		t.markSerializableRead(statement.dependencies[i].name)
 	}
-	if statement.query != nil {
-		t.markSerializableRead(statement.query.Collection())
+	if driving != "" && !exactDriving {
+		t.markSerializableRead(driving)
 	}
 	return nil
 }
@@ -369,9 +573,16 @@ func (t *tx) beginMutationStatement(
 	if t.isolation != IsolationSerializable || statement == nil {
 		return nil
 	}
-	t.markSerializableRead(statement.Collection())
+	target := statement.Collection()
+	exactTarget := t.serializablePointMutation(statement, prepared)
+	if !exactTarget {
+		t.markSerializableRead(target)
+	}
 	if prepared != nil {
 		for i := range prepared.dependencies {
+			if exactTarget && prepared.dependencies[i].name == target {
+				continue
+			}
 			t.markSerializableRead(prepared.dependencies[i].name)
 		}
 	}
@@ -384,6 +595,84 @@ func (t *tx) beginMutationStatement(
 		}
 	}
 	return nil
+}
+
+// serializablePointMutation recognizes target reads whose complete logical
+// dependency is a bounded set of primary keys. INSERT SELECT and every scan,
+// secondary/range predicate, join, or subquery remain relation-coarse.
+func (t *tx) serializablePointMutation(
+	statement *query.DMLStatement,
+	prepared *stmt,
+) bool {
+	if statement == nil {
+		return false
+	}
+	state := t.tables[statement.Collection()]
+	if state == nil {
+		return false
+	}
+	if prepared != nil {
+		if !prepared.serialMutationSafe {
+			return false
+		}
+		switch statement.Kind() {
+		case query.DMLInsert:
+			return true
+		case query.DMLUpdate, query.DMLDelete:
+			return prepared.pointCandidate &&
+				prepared.pointPath == state.primaryKey
+		default:
+			return false
+		}
+	}
+	tree := statement.Tree()
+	if tree == nil {
+		return false
+	}
+	if !serializableDirectMutationShape(tree) {
+		return false
+	}
+	switch statement.Kind() {
+	case query.DMLInsert:
+		return true
+	case query.DMLUpdate:
+		return isPrimaryPredicate(tree.Update.Filter.Where, state.primaryKey)
+	case query.DMLDelete:
+		return isPrimaryPredicate(tree.Delete.Filter.Where, state.primaryKey)
+	default:
+		return false
+	}
+}
+
+func serializableDirectMutationShape(statement *sqlast.Statement) bool {
+	if statement == nil {
+		return false
+	}
+	switch statement.Kind {
+	case sqlast.KindInsert:
+		return statement.Insert != nil && statement.Insert.Source == nil &&
+			(statement.Insert.Returning == nil || serializableDirectRelationSelect(
+				statement.Insert.Returning, statement.Insert.Table,
+			))
+	case sqlast.KindUpdate:
+		return statement.Update != nil && statement.Update.Filter != nil &&
+			serializableDirectRelationSelect(
+				statement.Update.Filter, statement.Update.Table,
+			) && (statement.Update.Returning == nil ||
+			serializableDirectRelationSelect(
+				statement.Update.Returning, statement.Update.Table,
+			))
+	case sqlast.KindDelete:
+		return statement.Delete != nil && statement.Delete.Filter != nil &&
+			serializableDirectRelationSelect(
+				statement.Delete.Filter, statement.Delete.Table,
+			) && (statement.Delete.Returning == nil ||
+			serializableDirectRelationSelect(
+				statement.Delete.Returning, statement.Delete.Table,
+			))
+	default:
+		return false
+	}
 }
 
 func (t *tx) querySource(tableName string) (query.Source, error) {
@@ -670,6 +959,7 @@ func (t *tx) execMutationCore(
 					ErrDuplicatePrimaryKey, key)
 			}
 			seen[key] = struct{}{}
+			t.trackSerializablePointRead(state, key)
 			var found bool
 			scratch, found, err = state.appendRaw(scratch[:0], key)
 			if err != nil {
@@ -715,7 +1005,7 @@ func (t *tx) execMutationCore(
 			return nil, err
 		}
 		keys, err := t.conn.matchingKeysTransaction(
-			ctx, statement, args, state, len(document))
+			ctx, t, statement, args, state, len(document))
 		if err != nil {
 			return nil, err
 		}
@@ -744,7 +1034,7 @@ func (t *tx) execMutationCore(
 			return nil, err
 		}
 		keys, err := t.conn.matchingKeysTransaction(
-			ctx, statement, args, state, 0)
+			ctx, t, statement, args, state, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1070,6 +1360,7 @@ func (t *tx) runInsertSource(
 // collection proportional to the base table is built.
 func (c *conn) matchingKeysTransaction(
 	ctx context.Context,
+	transaction *tx,
 	statement *query.DMLStatement,
 	args []any,
 	state *txTable,
@@ -1110,6 +1401,7 @@ func (c *conn) matchingKeysTransaction(
 		if err != nil {
 			return nil, err
 		}
+		transaction.trackSerializablePointReads(state, keys)
 		present := keys[:0]
 		selector := newMutationKeySelector(window, state.limits.MaxBatchDocuments)
 		selector.keys = c.matchKeys[:0]
@@ -1266,15 +1558,18 @@ func (t *tx) stage(state *txTable, key string, document []byte, remove bool) err
 	existed := false
 	if entry, present := state.pending[key]; present {
 		existed = entry.existed
-	} else if state.snapshot != nil {
-		raw, found, err := state.snapshot.AppendRaw(
-			state.existenceScratch[:0], []byte(key),
-		)
-		state.existenceScratch = raw[:0]
-		if err != nil {
-			return err
+	} else {
+		t.trackSerializablePointRead(state, key)
+		if state.snapshot != nil {
+			raw, found, err := state.snapshot.AppendRaw(
+				state.existenceScratch[:0], []byte(key),
+			)
+			state.existenceScratch = raw[:0]
+			if err != nil {
+				return err
+			}
+			existed = found
 		}
-		existed = found
 	}
 	t.stageKnown(state, key, document, remove, existed)
 	return nil
@@ -1320,6 +1615,7 @@ func (t *tx) resolveStagedMutationsContext(
 			mutation.existed = entry.existed
 			continue
 		}
+		t.trackSerializablePointRead(state, mutation.key)
 		if state.snapshot == nil {
 			continue
 		}
@@ -1440,7 +1736,7 @@ func (t *tx) Commit() error {
 	if t.isolation == IsolationSerializable {
 		readNames := make([]string, 0, len(t.tables))
 		for name, state := range t.tables {
-			if state.serialRead {
+			if state.serialReadCoarse || len(state.serialReadOrder) != 0 {
 				readNames = append(readNames, name)
 			}
 		}
@@ -1454,12 +1750,31 @@ func (t *tx) Commit() error {
 					ErrTransactionConflict, name,
 				)
 			}
-			if state.conflicts.changedSince(state.conflictRevision) {
+			if state.serialReadCoarse {
+				if state.conflicts.changedSince(state.conflictRevision) {
+					return fmt.Errorf(
+						"%w: serializable read table %q changed after BEGIN",
+						ErrTransactionConflict, name,
+					)
+				}
+				continue
+			}
+			key, historyOverflow, conflict := state.conflicts.conflict(
+				state.conflictRevision, state.serialReadOrder,
+			)
+			if !conflict {
+				continue
+			}
+			if historyOverflow {
 				return fmt.Errorf(
-					"%w: serializable read table %q changed after BEGIN",
+					"%w: serializable read table %q exceeded its bounded conflict history after BEGIN",
 					ErrTransactionConflict, name,
 				)
 			}
+			return fmt.Errorf(
+				"%w: serializable read table %q key %q changed after BEGIN",
+				ErrTransactionConflict, name, key,
+			)
 		}
 	}
 

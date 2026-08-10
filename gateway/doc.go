@@ -24,6 +24,12 @@
 // consistency, indeterminate-completion, and malformed refusals,
 // so a caller matches a failure with errors.Is.
 //
+// [SessionVector] is a bounded immutable aggregate of per-shard logical
+// positions, but it is intentionally not attached to Query or Result yet. The
+// current catalog cannot prove position continuity across split/merge topology
+// changes; routing integration requires a layout-provenance fence and certified
+// lineage translation rather than dropping or numerically comparing positions.
+//
 // This package uses only repository-native routing, SQL, durability, and shard
 // wire types; it imports no network-RPC or serialization framework.
 package gateway

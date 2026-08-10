@@ -88,6 +88,22 @@ func (p *plan) runSnapshotOverlayInto(e *Exec, snapshot store.Snapshot, overlay 
 	if rows < 0 {
 		return fmt.Errorf("query: FileOverlay LenDelta underflows the base snapshot")
 	}
+	if rows > int64(^uint(0)>>1) {
+		return &WorkBudgetError{
+			Resource: "snapshot overlay rows",
+			Bytes:    rows,
+			Limit:    e.Workspace.heapWorkBudget.limit,
+		}
+	}
+	// Reserve the fixed Segment workspace before copying any snapshot row. The
+	// generic Segment executor sees the same row count later and reuses this
+	// reservation, so an oversized overlay fails before it can materialize the
+	// whole base snapshot.
+	if err := e.Workspace.heapWorkBudget.admitRows(
+		p, int(rows), heapWorkSegment, e.Options.Workers,
+	); err != nil {
+		return err
+	}
 	if err := e.materializeSnapshotOverlay(snapshot, overlay); err != nil {
 		return err
 	}

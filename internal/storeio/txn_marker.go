@@ -166,12 +166,23 @@ type TxnMarker struct {
 // sets keyed by TxnID within the selected header's epoch, the retired StoreID
 // set, and the high-water TxnID / DCSN for counter seeding.
 type TxnDecisions struct {
+	sourceDir string
 	markerID  [16]byte
 	epoch     uint64
 	decisions map[uint64][]TxnParticipant
 	retired   map[[16]byte]struct{}
 	maxTxnID  uint64
 	maxDCSN   uint64
+}
+
+// SourceDir returns the canonical directory of the decision log that was
+// scanned. Durable collection opens use it to reject pairing a journal with a
+// decision log from another database directory.
+func (d *TxnDecisions) SourceDir() string {
+	if d == nil {
+		return ""
+	}
+	return d.sourceDir
 }
 
 // MarkerID returns the decision-log identity selected at Open.
@@ -726,7 +737,12 @@ func (m *TxnMarker) writeHeaderFaultable(slot uint32, header TxnMarkerHeader) er
 func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 	m.cursor = 0
 	m.nextSequence = m.header.BaseSequence + 1
+	sourceDir := filepath.Dir(m.path)
+	if resolved, err := filepath.EvalSymlinks(sourceDir); err == nil {
+		sourceDir = filepath.Clean(resolved)
+	}
 	*dst = TxnDecisions{
+		sourceDir: sourceDir,
 		markerID: m.header.MarkerID,
 		epoch:    m.header.Epoch,
 	}

@@ -24,6 +24,12 @@ var (
 	ErrTransactionLogMissing = errors.New(
 		"vibedb: collection journals hold conditional transaction records but the database's decision log is missing",
 	)
+	// ErrTransactionLogDirectoryMismatch reports a decision log paired with a
+	// collection file from another directory. Transaction identities are scoped
+	// to one catalog directory and must never be reused across databases.
+	ErrTransactionLogDirectoryMismatch = errors.New(
+		"vibedb: transaction decision log and collection belong to different directories",
+	)
 )
 
 // databaseTxnRecovery is the loaded decision-log state OpenDatabase and the
@@ -61,6 +67,22 @@ func RecoverDatabaseTransactions(
 func OpenWithTransactions(
 	file *os.File, options Options, txns *storeio.TxnDecisions,
 ) (*Collection, error) {
+	if file == nil {
+		return nil, fmt.Errorf("vibedb: nil collection file")
+	}
+	if txns != nil && txns.SourceDir() != "" {
+		collectionDir, err := filepath.Abs(filepath.Dir(file.Name()))
+		if err != nil {
+			return nil, err
+		}
+		collectionDir = filepath.Clean(collectionDir)
+		if resolved, err := filepath.EvalSymlinks(collectionDir); err == nil {
+			collectionDir = filepath.Clean(resolved)
+		}
+		if collectionDir != txns.SourceDir() {
+			return nil, ErrTransactionLogDirectoryMismatch
+		}
+	}
 	cfg := collectionOpenConfig{catalogOwned: true}
 	if txns == nil {
 		cfg.absentLog = true

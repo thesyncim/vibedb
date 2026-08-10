@@ -1143,6 +1143,16 @@ func (r *Ring) Close() error {
 			}
 		}
 	}
+	// A failed or incomplete drain must leave every mapping and registration
+	// alive. The kernel may still dereference request buffers after Submit has
+	// returned an error; unmapping them here turns a recoverable Close failure
+	// into a use-after-unmap. The caller can retry Close after the ring drains.
+	if r.outstanding != 0 {
+		if result == nil {
+			result = ErrOverflow
+		}
+		return result
+	}
 	if r.buffers != 0 || r.readBuffersRegistered {
 		if err := ioUringRegister(r.fd, ioUringUnregisterBuffers, nil, 0); err != nil {
 			result = errors.Join(result, fmt.Errorf("io_uring unregister buffers: %w", err))

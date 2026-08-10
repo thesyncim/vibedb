@@ -656,9 +656,30 @@ func (j *planJoin) collectFile(
 	var batchBudget fileJoinBatchBudget
 	var batchWork heapWorkBudget
 	var batchAccount *heapWorkBudget
+	var batchCharged int64
 	if workBudget != nil {
-		batchWork.begin(workBudget.limit)
+		// The join planner and membership structures have already consumed
+		// workBudget. A batch receives only the unreserved remainder; restarting
+		// it at the original limit lets planner and row materialization exceed
+		// the statement's MemoryBytes admission.
+		batchWork.begin(workBudget.remaining())
 		batchAccount = &batchWork
+	}
+	chargeBatch := func() error {
+		if batchAccount == nil {
+			return nil
+		}
+		used := batchWork.used.Load()
+		if used <= batchCharged {
+			return nil
+		}
+		if err := workBudget.admit(
+			"durable join batch workspace", used-batchCharged,
+		); err != nil {
+			return err
+		}
+		batchCharged = used
+		return nil
 	}
 
 	needKeys := j.innerPath == joinPrimaryKey
@@ -687,6 +708,9 @@ func (j *planJoin) collectFile(
 		if f.batchRows < joinBatchRows {
 			return nil
 		}
+		if err := chargeBatch(); err != nil {
+			return err
+		}
 		stop, drainErr := j.drainFile(b, limit, stoppable, workBudget)
 		if drainErr != nil {
 			return drainErr
@@ -709,6 +733,9 @@ func (j *planJoin) collectFile(
 			return false, err
 		}
 		return true, nil
+	}
+	if err := chargeBatch(); err != nil {
+		return false, err
 	}
 	stop, err := j.drainFile(b, limit, stoppable, workBudget)
 	if err != nil {

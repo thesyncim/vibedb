@@ -450,7 +450,13 @@ func (c *Collection) visitRangeRawCurrentBaseUntil(
 // borrowed only for the callback; overflow values reuse one bounded buffer.
 // Returning an error stops the scan immediately.
 func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
-	_, err := s.RangeRawBuffer(nil, fn)
+	if s == nil {
+		return ErrClosed
+	}
+	scratch, err := s.rangePrimaryGraphBuffer(
+		nil, nil, nil, s.scanSpliceScratch, fn,
+	)
+	s.scanSpliceScratch = scratch
 	return err
 }
 
@@ -464,7 +470,7 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	if fn == nil {
 		return scratch, nil
 	}
-	return scratch, s.rangePrimaryGraph(nil, nil, nil, fn)
+	return s.rangePrimaryGraphBuffer(nil, nil, nil, scratch, fn)
 }
 
 // rangePrimaryGraph is the ordered-primary scan core. lower is inclusive,
@@ -473,6 +479,17 @@ func (s *Snapshot) rangePrimaryGraph(
 	lower, upper, prefix []byte,
 	fn func(key, value []byte) error,
 ) error {
+	scratch, err := s.rangePrimaryGraphBuffer(
+		lower, upper, prefix, s.scanSpliceScratch, fn,
+	)
+	s.scanSpliceScratch = scratch
+	return err
+}
+
+func (s *Snapshot) rangePrimaryGraphBuffer(
+	lower, upper, prefix, scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
 	state := s.state
 	catalogBounds := storeio.GlobalTabletCatalogBounds{
 		StoreID:                state.root.StoreID,
@@ -501,13 +518,12 @@ func (s *Snapshot) rangePrimaryGraph(
 		)
 	}
 	if err != nil {
-		return err
+		return scratch, err
 	}
 	// Seed the cursor's splice buffer from the Snapshot's retained scratch and
 	// hand the grown buffer back when the scan ends, so class-5 row
 	// reconstruction reuses one allocation across every scan of this snapshot
 	// rather than growing a fresh buffer per scan.
-	cursor.AdoptSpliceScratch(s.scanSpliceScratch)
 	// The fused drain stops at each out-of-line row and returns its key and chain
 	// head; the resolved value is reassembled into one reused buffer and delivered
 	// to fn exactly like an inline value, then the drain is re-entered. Passing fn
@@ -515,7 +531,9 @@ func (s *Snapshot) rangePrimaryGraph(
 	var scanErr error
 	var decoder storeio.CompactPrimaryScanDecoder
 	for scanErr == nil {
+		cursor.AdoptSpliceScratch(scratch)
 		key, ref, err := cursor.VisitInlineDecoded(&decoder, fn)
+		scratch = cursor.ReleaseSpliceScratch()
 		if err != nil {
 			scanErr = err
 			break
@@ -523,21 +541,20 @@ func (s *Snapshot) rangePrimaryGraph(
 		if ref == (storeio.PageRef{}) {
 			break
 		}
-		s.overflowScanValue, err = s.collection.appendPrimaryOverflowValue(
-			s.overflowScanValue[:0], ref, leafBounds,
+		scratch, err = s.collection.appendPrimaryOverflowValue(
+			scratch[:0], ref, leafBounds,
 		)
 		if err != nil {
 			scanErr = err
 			break
 		}
-		if err := fn(key, s.overflowScanValue); err != nil {
+		if err := fn(key, scratch); err != nil {
 			scanErr = err
 			break
 		}
 	}
-	s.scanSpliceScratch = cursor.ReleaseSpliceScratch()
 	cursor.Close()
-	return scanErr
+	return scratch, scanErr
 }
 
 // RangeMasksRaw visits only the live stable slots named by ordered masks.

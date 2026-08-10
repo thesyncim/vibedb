@@ -38,6 +38,15 @@ type goldenResponse struct {
 	resp *ShardResponse
 }
 
+func goldenPosition(index uint64) Position {
+	return Position{
+		Distribution: "tenant_data",
+		Shard:        "-80",
+		LogID:        [16]byte{0x91, 0x22, 0x73, 0x44, 0x35, 0x66, 0x17, 0x88, 0x49, 0xaa, 0x5b, 0xcc, 0x7d, 0xee, 0x8f, 0x10},
+		Index:        index,
+	}
+}
+
 func goldenRequests() []goldenRequest {
 	return []goldenRequest{
 		{
@@ -73,6 +82,19 @@ func goldenRequests() []goldenRequest {
 			},
 		},
 		{
+			name: "session_minimum",
+			req: &ShardRequest{
+				SQL:            "SELECT id FROM messages",
+				Distribution:   "tenant_data",
+				Shard:          "-80",
+				RoutingVersion: 3,
+				OwnershipEpoch: 7,
+				ReadPolicy:     ReadSession,
+				HasMinPosition: true,
+				MinPosition:    goldenPosition(42),
+			},
+		},
+		{
 			name: "empty_and_zero_fields",
 			req: &ShardRequest{
 				SQL:    "",
@@ -97,6 +119,15 @@ func goldenResponses() []goldenResponse {
 		{
 			name: "rows_empty",
 			resp: RowsResponse([]Column{{Name: "n", TypeOID: 20}}, nil),
+		},
+		{
+			name: "rows_position",
+			resp: func() *ShardResponse {
+				resp := RowsResponse([]Column{{Name: "id", TypeOID: 20}}, nil)
+				resp.HasReadPosition = true
+				resp.ReadPosition = goldenPosition(43)
+				return resp
+			}(),
 		},
 		{
 			name: "completion",

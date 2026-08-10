@@ -94,6 +94,9 @@ func TestClientRoundTrip(t *testing.T) {
 	if sel.Kind != shardservice.ResponseRows || len(sel.Rows) != 1 {
 		t.Fatalf("SELECT = %+v, want one row", sel)
 	}
+	if sel.HasReadPosition || !sel.ReadPosition.IsZero() {
+		t.Fatalf("strong read claimed unimplemented applied position %+v", sel.ReadPosition)
+	}
 	if got := string(sel.Rows[0][0].Bytes); got != `"keep"` {
 		t.Fatalf("selected id = %s, want \"keep\"", got)
 	}
@@ -116,7 +119,7 @@ func TestClientErrorMapping(t *testing.T) {
 		{"wrong_shard", func(r *shardservice.ShardRequest) { r.Shard = "80-" }, shardservice.ErrorNotOwner, distribution.ErrNotShardOwner},
 		{"stale_routing_version", func(r *shardservice.ShardRequest) { r.RoutingVersion = 99 }, shardservice.ErrorRoutingVersion, distribution.ErrRoutingVersion},
 		{"stale_epoch", func(r *shardservice.ShardRequest) { r.OwnershipEpoch = 99 }, shardservice.ErrorOwnershipEpoch, distribution.ErrOwnershipEpoch},
-		{"unsupported_read_policy", func(r *shardservice.ShardRequest) { r.ReadPolicy = shardservice.ReadSession }, shardservice.ErrorUnsupportedReadPolicy, ErrReadPolicyUnsupported},
+		{"session_position_unsupported", func(r *shardservice.ShardRequest) { r.ReadPolicy = shardservice.ReadSession }, shardservice.ErrorPositionUnsupported, ErrPositionUnsupported},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,13 +150,140 @@ func TestClientExtendedErrorMapping(t *testing.T) {
 		{shardservice.ErrorReadOnly, ErrWriteNotSupported},
 		{shardservice.ErrorUnsupportedReadPolicy, ErrReadPolicyUnsupported},
 		{shardservice.ErrorCommitOutcomeUnknown, ErrCommitOutcomeUnknown},
+		{shardservice.ErrorPositionUnsupported, ErrPositionUnsupported},
+		{shardservice.ErrorPositionIdentity, ErrPositionIdentity},
+		{shardservice.ErrorPositionNotReached, ErrPositionNotReached},
 	}
 	for _, tc := range tests {
 		err := shardError(shardservice.NewErrorResponse(tc.kind, tc.kind.String()))
 		if !errors.Is(err, tc.sentinel) {
 			t.Fatalf("kind %s maps to %v, want errors.Is %v", tc.kind, err, tc.sentinel)
 		}
+		if isStaleErr(err) {
+			t.Fatalf("kind %s was classified as retryable stale topology", tc.kind)
+		}
 	}
+}
+
+// TestRoundTripValidatesReadPositionProof drives logically malicious but
+// wire-valid success responses through the client. A missing, unrelated, or
+// behind proof fails closed with no response value and is never classified as
+// retryable stale topology.
+func TestRoundTripValidatesReadPositionProof(t *testing.T) {
+	minimum := sessionPosition("tenant_data", "-80", 7, 40)
+	baseReq := func() *shardservice.ShardRequest {
+		return &shardservice.ShardRequest{
+			SQL:            "SELECT 1",
+			HasMinPosition: true,
+			MinPosition:    minimum,
+			Distribution:   minimum.Distribution,
+			Shard:          minimum.Shard,
+			ReadPolicy:     shardservice.ReadSession,
+			ExecutionMode:  shardservice.ExecutionReadOnly,
+			RoutingVersion: 1,
+			OwnershipEpoch: 1,
+		}
+	}
+	rowsAt := func(p Position) *shardservice.ShardResponse {
+		resp := shardservice.RowsResponse(nil, nil)
+		resp.HasReadPosition = true
+		resp.ReadPosition = p
+		return resp
+	}
+
+	tests := []struct {
+		name     string
+		resp     *shardservice.ShardResponse
+		wantKind shardservice.ErrorKind
+		wantIs   error
+	}{
+		{
+			name:     "missing",
+			resp:     shardservice.RowsResponse(nil, nil),
+			wantKind: shardservice.ErrorPositionUnsupported,
+			wantIs:   ErrPositionUnsupported,
+		},
+		{
+			name: "different_log",
+			resp: func() *shardservice.ShardResponse {
+				p := minimum
+				p.LogID[0]++
+				p.Index = 100
+				return rowsAt(p)
+			}(),
+			wantKind: shardservice.ErrorPositionIdentity,
+			wantIs:   ErrPositionIdentity,
+		},
+		{
+			name: "behind",
+			resp: func() *shardservice.ShardResponse {
+				p := minimum
+				p.Index--
+				return rowsAt(p)
+			}(),
+			wantKind: shardservice.ErrorPositionNotReached,
+			wantIs:   ErrPositionNotReached,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := roundTripScriptedResponse(t, baseReq(), tc.resp)
+			if got != nil {
+				t.Fatalf("response leaked on failed proof: %+v", got)
+			}
+			var se *ShardError
+			if !errors.As(err, &se) || se.Kind != tc.wantKind {
+				t.Fatalf("err = %v, want *ShardError kind %s", err, tc.wantKind)
+			}
+			if !errors.Is(err, tc.wantIs) {
+				t.Fatalf("err = %v, want errors.Is %v", err, tc.wantIs)
+			}
+			if isStaleErr(err) {
+				t.Fatalf("position proof failure %v classified as retryable stale topology", err)
+			}
+		})
+	}
+
+	ahead := minimum
+	ahead.Index++
+	for _, valid := range []Position{minimum, ahead} {
+		got, err := roundTripScriptedResponse(t, baseReq(), rowsAt(valid))
+		if err != nil || got == nil || !got.HasReadPosition || got.ReadPosition != valid {
+			t.Fatalf("valid proof = (%+v, %v), want accepted position %+v", got, err, valid)
+		}
+	}
+
+	withoutMinimum := baseReq()
+	withoutMinimum.HasMinPosition = false
+	withoutMinimum.MinPosition = Position{}
+	got, err := roundTripScriptedResponse(t, withoutMinimum, rowsAt(ahead))
+	if err != nil || got == nil || !got.HasReadPosition {
+		t.Fatalf("unsolicited valid read position = (%+v, %v), want accepted", got, err)
+	}
+}
+
+func roundTripScriptedResponse(
+	t *testing.T,
+	req *shardservice.ShardRequest,
+	resp *shardservice.ShardResponse,
+) (*shardservice.ShardResponse, error) {
+	t.Helper()
+	client, server := net.Pipe()
+	defer client.Close()
+	served := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		if _, err := shardservice.DecodeRequest(server); err != nil {
+			served <- err
+			return
+		}
+		served <- shardservice.EncodeResponse(server, resp)
+	}()
+	got, err := RoundTrip(context.Background(), client, req)
+	if serveErr := <-served; serveErr != nil {
+		t.Fatalf("scripted shard: %v", serveErr)
+	}
+	return got, err
 }
 
 // TestRoundTripHonorsContext proves a deadline or cancellation unblocks the

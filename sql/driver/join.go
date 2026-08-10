@@ -294,6 +294,9 @@ func (w *physicalDependencyWalk) appendSelect(statement *sqlast.SelectStmt) {
 		case sqlast.RelationDerived, sqlast.RelationCTE:
 			w.appendSelect(relation.Query)
 		}
+		if relation.On != nil {
+			w.appendExpr(relation.On.Expr)
+		}
 	}
 	w.appendExpr(statement.Where)
 	w.appendExpr(statement.Having)

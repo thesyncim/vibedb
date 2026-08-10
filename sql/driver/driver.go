@@ -512,6 +512,10 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 					s.pointPath, s.pointCandidate = primaryPredicateIdentity(
 						s.pointPredicate,
 					)
+					s.serialPointSafe = s.pointCandidate &&
+						serializableDirectRelationSelect(
+							tree.Select, s.query.Collection(),
+						)
 					s.primaryPoint = s.pointCandidate &&
 						s.pointPath == t.meta.PrimaryKey
 				}
@@ -551,6 +555,23 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 			s.query, err = query.PrepareParsedStatement(
 				src, tree.Delete.Returning,
 			)
+		}
+		if err == nil {
+			s.serialMutationSafe = serializableDirectMutationShape(tree) &&
+				(s.query == nil || !s.query.RequiresCatalog())
+			if s.serialMutationSafe {
+				var where *sqlast.Expr
+				switch tree.Kind {
+				case sqlast.KindUpdate:
+					where = tree.Update.Filter.Where
+				case sqlast.KindDelete:
+					where = tree.Delete.Filter.Where
+				}
+				if where != nil {
+					s.pointPath, s.pointCandidate =
+						primaryPredicateIdentity(where)
+				}
+			}
 		}
 	}
 	if err != nil {

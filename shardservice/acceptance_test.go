@@ -347,12 +347,14 @@ func TestAcceptanceResourceLimits(t *testing.T) {
 // typed parameters only — never a serialized plan or program — and the shard
 // re-parses the text locally.
 func TestAcceptanceNoSerializedPlan(t *testing.T) {
-	// (1) The request type carries only SQL text, typed params, ownership
-	// coordinates, and execution bounds — no plan-shaped field.
+	// (1) The request type carries only SQL text, typed params, ownership and
+	// optional session-position coordinates, and execution bounds — no
+	// plan-shaped field.
 	reqFields := structFieldNames(reflect.TypeOf(ShardRequest{}))
 	assertFieldSet(t, "ShardRequest", reqFields, map[string]bool{
 		"SQL": true, "Params": true, "Distribution": true, "Shard": true,
-		"RoutingVersion": true, "OwnershipEpoch": true, "ReadPolicy": true,
+		"RoutingVersion": true, "OwnershipEpoch": true,
+		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
 	})
