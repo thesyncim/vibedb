@@ -148,8 +148,11 @@
 // Collection.Update path; two or more through durable.UpdateCollections against
 // the driver-owned decision log in <catalog>.tables/. Disjoint keys may commit
 // concurrently across tables. Serializable publishing commits additionally
-// validate a bounded table-coarse read set, rejecting write skew rather than
-// silently weakening isolation. An aborted or crashed transaction that wrote
+// validate bounded exact primary-key reads (including misses) and promote
+// scans, nested execution, or exact-read overflow to a relation-coarse
+// dependency. This rejects write skew and phantoms without serializing
+// independent point writers on the same table. An aborted or crashed
+// transaction that wrote
 // to a table absent at BEGIN can leave that empty table behind as catalog
 // residue. SAVEPOINT / RELEASE / ROLLBACK TO manage a bounded overlay stack
 // (64 frames); ROLLBACK TO does not lower high-water admission accounting and

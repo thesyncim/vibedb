@@ -460,9 +460,12 @@ than weakening isolation.
 SQL and pgwire expose three policies. Default and Read Committed capture one
 coherent catalog cut per physical statement. Repeatable Read (also named
 Snapshot by the typed API) retains the BEGIN cut. Serializable retains the
-BEGIN cut and validates every physical relation read by a publishing
-transaction, in addition to exact first-committer-wins write validation. Every
-mode overlays staged writes and therefore preserves read-your-writes.
+BEGIN cut and tracks proven primary-key point reads exactly, including misses.
+Scans, ranges, secondary predicates, joins, nested execution, and bounded
+exact-read overflow promote that table to a relation-coarse dependency. COMMIT
+validates those reads in addition to exact first-committer-wins writes, so
+disjoint point writers can proceed without weakening phantom or write-skew
+protection. Every mode overlays staged writes and preserves read-your-writes.
 
 `database/sql` accepts LevelDefault/LevelReadCommitted,
 LevelRepeatableRead/LevelSnapshot, and LevelSerializable. Read Uncommitted and
@@ -831,9 +834,9 @@ file ownership, and per-task test obligations.
 - **Single-sync multi-collection commit** (shared redo in the decision log) —
   the perf follow-up, justified only by measured K+1-sync numbers; the
   decision-log format reserves room for it as an additive record kind.
-- **Exact SQL Serializable point-read dependencies** — a concurrency
-  refinement over the current relation-coarse validation, not a correctness
-  prerequisite.
+- **Certified secondary/range Serializable dependencies** — a future
+  concurrency refinement over the safe relation-coarse fallback; it requires
+  index/range change certificates that cannot miss phantoms.
 - **Buffered-volatile, async-COW, and chain-fence multi-collection
   transactions** — typed refusal this pass; the facade Buffered profile is
   therefore refused for native multi-collection transactions.

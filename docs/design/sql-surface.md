@@ -872,10 +872,12 @@ The collection's bounded batch admission still applies.
 Default and Read Committed transactions replace their committed base with one
 coherent catalog cut before every physical statement. Repeatable Read and the
 typed Snapshot alias retain the generation-leased BEGIN cut. Serializable also
-retains the BEGIN cut and validates the physical relations read by a publishing
-transaction, rejecting write skew and phantoms. Every policy overlays staged
-writes and preserves read-your-writes; none holds a writer across client
-think-time.
+retains the BEGIN cut. Proven primary-key point reads and misses are tracked
+exactly; scans, secondary/range predicates, joins, nested execution, and
+bounded-read overflow use a relation-coarse dependency. Publishing commits
+validate those dependencies, rejecting write skew and phantoms while allowing
+independent same-table point writers. Every policy overlays staged writes and
+preserves read-your-writes; none holds a writer across client think-time.
 
 A transaction may read and write several tables. One dirty table commits
 through today's `Collection.Update` path. Two or more dirty tables commit

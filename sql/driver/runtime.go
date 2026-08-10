@@ -110,7 +110,7 @@ const (
 	// IsolationRepeatableRead retains the coherent cut captured by BEGIN.
 	IsolationRepeatableRead
 	// IsolationSerializable retains the BEGIN cut and rejects a publishing
-	// commit when a table it read changed after BEGIN.
+	// commit when one of its exact or relation-coarse read dependencies changed.
 	IsolationSerializable
 
 	// IsolationSnapshot is an alias for the fixed-cut Repeatable Read mode.
