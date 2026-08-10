@@ -59,11 +59,15 @@ func (e *CatalogError) Unwrap() error { return ErrInvalidCatalog }
 // Validate) must be treated as read-only.
 type Snapshot struct {
 	distribution.ClusterConfig
-	endpoints  map[distribution.EndpointID]string
-	generation uint64
-	planner    []plannerTable
-	planSeed   maphash.Seed
-	planCache  atomic.Pointer[preparedPlanCache]
+	endpoints           map[distribution.EndpointID]string
+	generation          uint64
+	planner             []plannerTable
+	plannerIndexes      []plannerIndex
+	plannerIndexPaths   []plannerStringRef
+	plannerIndexSpans   []plannerIndexSpan
+	plannerIndexStrings string
+	planSeed            maphash.Seed
+	planCache           atomic.Pointer[preparedPlanCache]
 }
 
 // plannerTable is the compact, cache-friendly table directory used only by the
@@ -82,7 +86,16 @@ type plannerTable struct {
 // target always has a transport destination in the generation that routed it.
 // Inputs are defensively copied.
 func NewSnapshot(config distribution.ClusterConfig, endpoints map[distribution.EndpointID]string, generation uint64) (*Snapshot, error) {
+	return NewSnapshotWithIndexes(config, endpoints, generation, nil)
+}
+
+// NewSnapshotWithIndexes validates and defensively compacts routing, endpoint,
+// and distributed index metadata into one immutable catalog generation.
+func NewSnapshotWithIndexes(config distribution.ClusterConfig, endpoints map[distribution.EndpointID]string, generation uint64, indexes []IndexDescriptor) (*Snapshot, error) {
 	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if err := validateCompactPlannerDimensions(config); err != nil {
 		return nil, err
 	}
 	for _, spec := range config.Distributions {
@@ -106,12 +119,20 @@ func NewSnapshot(config distribution.ClusterConfig, endpoints map[distribution.E
 	}
 	cloned := cloneConfig(config)
 	planner := buildPlannerTables(cloned)
+	indexBuild, err := buildPlannerIndexes(cloned, planner, indexes)
+	if err != nil {
+		return nil, err
+	}
 	return &Snapshot{
-		ClusterConfig: cloned,
-		endpoints:     maps.Clone(endpoints),
-		generation:    generation,
-		planner:       planner,
-		planSeed:      maphash.MakeSeed(),
+		ClusterConfig:       cloned,
+		endpoints:           maps.Clone(endpoints),
+		generation:          generation,
+		planner:             planner,
+		plannerIndexes:      indexBuild.indexes,
+		plannerIndexPaths:   indexBuild.paths,
+		plannerIndexSpans:   indexBuild.spans,
+		plannerIndexStrings: indexBuild.arena,
+		planSeed:            maphash.MakeSeed(),
 	}, nil
 }
 
@@ -133,20 +154,11 @@ func (s *Snapshot) plannerTableFor(table string) (
 	*distribution.Manifest,
 	bool,
 ) {
-	lo, hi := 0, len(s.planner)
-	for lo < hi {
-		mid := lo + (hi-lo)/2
-		candidate := s.Placements[s.planner[mid].placement].Table
-		if candidate < table {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	if lo == len(s.planner) || s.Placements[s.planner[lo].placement].Table != table {
+	ordinal, ok := s.plannerTableOrdinal(table)
+	if !ok {
 		return distribution.TablePlacement{}, distribution.DistributionSpec{}, nil, false
 	}
-	entry := s.planner[lo]
+	entry := s.planner[ordinal]
 	return s.Placements[entry.placement],
 		s.Distributions[entry.spec],
 		s.Manifests[entry.manifest],
@@ -291,6 +303,9 @@ func (h *CatalogHolder) PublishNewer(s *Snapshot) bool {
 		if cur != nil && s.generation <= cur.generation {
 			return false
 		}
+		if cur != nil && !indexCatalogTransitionAllowed(cur, s) {
+			return false
+		}
 		if h.ptr.CompareAndSwap(cur, s) {
 			return true
 		}
@@ -314,6 +329,7 @@ type persistedCatalog struct {
 	Generation    uint64                  `json:"generation"`
 	Distributions []persistedDistribution `json:"distributions"`
 	Placements    []persistedPlacement    `json:"placements,omitempty"`
+	Indexes       []persistedIndex        `json:"indexes,omitempty"`
 	Manifests     []persistedManifest     `json:"manifests"`
 	Endpoints     []persistedEndpoint     `json:"endpoints"`
 }
@@ -328,6 +344,16 @@ type persistedPlacement struct {
 	Table        string   `json:"table"`
 	Distribution string   `json:"distribution"`
 	Columns      []string `json:"columns"`
+}
+
+type persistedIndex struct {
+	IndexID     uint64         `json:"index_id"`
+	Incarnation uint64         `json:"incarnation"`
+	Table       string         `json:"table"`
+	Name        string         `json:"name"`
+	Paths       []string       `json:"paths"`
+	Flags       IndexFlags     `json:"flags"`
+	Lifecycle   IndexLifecycle `json:"lifecycle"`
 }
 
 type persistedManifest struct {
@@ -363,6 +389,20 @@ func toPersisted(s *Snapshot) persistedCatalog {
 		pc.Placements = append(pc.Placements, persistedPlacement{
 			Table: p.Table, Distribution: string(p.Distribution), Columns: p.Columns,
 		})
+	}
+	for tableOrdinal := range s.plannerIndexSpans {
+		table := s.Placements[s.planner[tableOrdinal].placement].Table
+		span := s.plannerIndexSpans[tableOrdinal]
+		for i := uint32(0); i < span.count; i++ {
+			metadata := s.indexMetadata(table, span.first+i)
+			paths := make([]string, metadata.PathCount)
+			copy(paths, metadata.Paths[:metadata.PathCount])
+			pc.Indexes = append(pc.Indexes, persistedIndex{
+				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
+				Table: metadata.Table, Name: metadata.Name, Paths: paths,
+				Flags: metadata.Flags, Lifecycle: metadata.Lifecycle,
+			})
+		}
 	}
 	for _, m := range s.Manifests {
 		pm := persistedManifest{Distribution: string(m.Distribution()), Version: uint64(m.Version())}
@@ -481,16 +521,16 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	if pc.Version != catalogVersion {
 		return nil, &CatalogError{Reason: fmt.Sprintf("unsupported catalog version %d", pc.Version)}
 	}
-	config, endpoints, err := pc.toConfig()
+	config, endpoints, indexes, err := pc.toConfig()
 	if err != nil {
 		return nil, err
 	}
-	return NewSnapshot(config, endpoints, pc.Generation)
+	return NewSnapshotWithIndexes(config, endpoints, pc.Generation, indexes)
 }
 
 // toConfig reconstructs the routing configuration and endpoint membership from
 // the on-disk form, validating every manifest through NewManifest.
-func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribution.EndpointID]string, error) {
+func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribution.EndpointID]string, []IndexDescriptor, error) {
 	var config distribution.ClusterConfig
 	for _, d := range pc.Distributions {
 		config.Distributions = append(config.Distributions, distribution.DistributionSpec{
@@ -511,7 +551,7 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 		for i, ps := range pm.Shards {
 			shard, err := ps.toShard()
 			if err != nil {
-				return config, nil, err
+				return config, nil, nil, err
 			}
 			shards[i] = shard
 		}
@@ -521,21 +561,30 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 			shards,
 		)
 		if err != nil {
-			return config, nil, err
+			return config, nil, nil, err
 		}
 		config.Manifests = append(config.Manifests, m)
 	}
 	endpoints := make(map[distribution.EndpointID]string, len(pc.Endpoints))
 	for _, e := range pc.Endpoints {
 		if e.ID == "" {
-			return config, nil, &CatalogError{Reason: "endpoint has an empty id"}
+			return config, nil, nil, &CatalogError{Reason: "endpoint has an empty id"}
 		}
 		if _, dup := endpoints[distribution.EndpointID(e.ID)]; dup {
-			return config, nil, &CatalogError{Reason: "duplicate endpoint id " + e.ID}
+			return config, nil, nil, &CatalogError{Reason: "duplicate endpoint id " + e.ID}
 		}
 		endpoints[distribution.EndpointID(e.ID)] = e.Address
 	}
-	return config, endpoints, nil
+	indexes := make([]IndexDescriptor, len(pc.Indexes))
+	for i := range pc.Indexes {
+		index := &pc.Indexes[i]
+		indexes[i] = IndexDescriptor{
+			IndexID: index.IndexID, Incarnation: index.Incarnation,
+			Table: index.Table, Name: index.Name, Paths: slices.Clone(index.Paths),
+			Flags: index.Flags, Lifecycle: index.Lifecycle,
+		}
+	}
+	return config, endpoints, indexes, nil
 }
 
 // toShard reconstructs one manifest shard, decoding its big-endian hex keyspace
