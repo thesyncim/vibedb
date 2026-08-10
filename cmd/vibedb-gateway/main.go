@@ -14,11 +14,11 @@
 //	vibedb-gateway serve    -catalog <path> [-listen <addr>]
 //
 // inspect prints the generation, its distributions, per-shard geometry and
-// ownership epochs, and the endpoint membership. validate loads and re-validates
-// the generation and exits non-zero on any inconsistency. serve loads an initial
-// generation, reloads the catalog file after stale-shard refusals, and answers
-// newline-delimited JSON query requests over the listener, shutting down cleanly
-// on SIGINT/SIGTERM.
+// allocation identities, ownership epochs, and the endpoint membership.
+// validate loads and re-validates the generation and exits non-zero on any
+// inconsistency. serve loads an initial generation, reloads the catalog file
+// after stale-shard refusals, and answers newline-delimited JSON query requests
+// over the listener, shutting down cleanly on SIGINT/SIGTERM.
 package main
 
 import (
@@ -99,7 +99,8 @@ func runInspect(args []string) int {
 	}
 
 	fmt.Fprintf(os.Stdout, "generation %d\n", snap.Generation())
-	for _, spec := range snap.Distributions {
+	for i := 0; i < snap.DistributionCount(); i++ {
+		spec, _ := snap.DistributionAt(i)
 		fmt.Fprintf(os.Stdout, "distribution %q arity=%d mapper=%d\n",
 			spec.Name, spec.Arity, spec.MapperVersion)
 		man, ok := snap.Manifest(spec.Name)
@@ -115,12 +116,14 @@ func runInspect(args []string) int {
 					addr = a
 				}
 			}
-			fmt.Fprintf(os.Stdout, "    shard %q epoch=%d leader=%s\n", info.ID, info.Epoch, addr)
+			fmt.Fprintf(os.Stdout, "    shard %q allocation-generation=%d epoch=%d leader=%s\n",
+				info.ID, info.AllocationGeneration, info.Epoch, addr)
 		}
 	}
 
 	ids := make([]string, 0, snap.EndpointCount())
-	for _, spec := range snap.Distributions {
+	for i := 0; i < snap.DistributionCount(); i++ {
+		spec, _ := snap.DistributionAt(i)
 		man, ok := snap.Manifest(spec.Name)
 		if !ok {
 			continue

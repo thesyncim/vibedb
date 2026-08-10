@@ -135,11 +135,14 @@
 //
 // # Transactions
 //
-// Default and Read Committed transactions refresh every cataloged table at one
-// coherent generation cut before each physical statement. Repeatable Read and
-// Snapshot retain the BEGIN cut, providing repeatable reads and phantom
-// exclusion. Every mode overlays staged changes and preserves read-your-writes;
-// joins consume the same statement cut under the relation and pair bounds.
+// Default and Read Committed transactions capture only one statement's
+// executable physical dependency closure at a coherent generation cut.
+// BEGIN retains one shared immutable catalog-layout epoch; unrelated tables
+// allocate no transaction state, acquire no leases, and register no conflict
+// clocks. Repeatable Read and Snapshot retain the complete BEGIN cut, providing
+// repeatable reads and phantom exclusion. Every mode overlays staged changes
+// and preserves read-your-writes; joins consume the same statement cut under
+// the relation and pair bounds.
 //
 // A transaction may read and write several tables. COMMIT validates every
 // dirty table under the catalog lock (incarnation, bounded first-committer-wins

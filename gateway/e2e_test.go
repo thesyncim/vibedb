@@ -29,14 +29,15 @@ import (
 // e2eShard is one shard of the cluster: its ownership coordinates, keyspace
 // range, synthetic address, backing server, and the n values seeded into it.
 type e2eShard struct {
-	id       distribution.ShardID
-	endpoint distribution.EndpointID
-	epoch    distribution.OwnershipEpoch
-	kr       distribution.KeyRange
-	address  string
-	server   *shardservice.Server
-	keys     []string
-	ns       []int64
+	id                   distribution.ShardID
+	allocationGeneration distribution.ShardAllocationGeneration
+	endpoint             distribution.EndpointID
+	epoch                distribution.OwnershipEpoch
+	kr                   distribution.KeyRange
+	address              string
+	server               *shardservice.Server
+	keys                 []string
+	ns                   []int64
 }
 
 // e2eCluster is a running multi-shard cluster plus the counting dialer and
@@ -198,13 +199,15 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 	shards := make([]e2eShard, len(specs))
 	manShards := make([]distribution.Shard, len(specs))
 	for i, spec := range specs {
+		allocationGeneration := distribution.ShardAllocationGeneration(i + 1)
 		db, err := sqldriver.Open(filepath.Join(t.TempDir(), string(spec.id)+".vdb"))
 		if err != nil {
 			t.Fatalf("Open %s: %v", spec.id, err)
 		}
 		t.Cleanup(func() { _ = db.Close() })
 		srv, err := shardservice.NewServer(db, shardservice.Ownership{
-			Distribution: dist, Shard: spec.id, Epoch: spec.epoch, RoutingVersion: version,
+			Distribution: dist, Shard: spec.id, AllocationGeneration: allocationGeneration,
+			Epoch: spec.epoch, RoutingVersion: version,
 		}, shardservice.Options{})
 		if err != nil {
 			t.Fatalf("NewServer %s: %v", spec.id, err)
@@ -213,11 +216,13 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 		address := "shard-" + string(spec.id)
 		servers[address] = srv
 		shards[i] = e2eShard{
-			id: spec.id, endpoint: spec.endpoint, epoch: spec.epoch,
+			id: spec.id, allocationGeneration: allocationGeneration,
+			endpoint: spec.endpoint, epoch: spec.epoch,
 			kr: spec.kr, address: address, server: srv, ns: spec.ns,
 		}
 		manShards[i] = distribution.Shard{
-			ID: spec.id, Range: spec.kr, Leaders: []distribution.EndpointID{spec.endpoint}, Epoch: spec.epoch,
+			ID: spec.id, AllocationGeneration: allocationGeneration,
+			Range: spec.kr, Leaders: []distribution.EndpointID{spec.endpoint}, Epoch: spec.epoch,
 		}
 	}
 
@@ -260,7 +265,8 @@ func (c *e2eCluster) seed(t *testing.T, client *Client, sh e2eShard, sql string,
 	t.Helper()
 	req := &shardservice.ShardRequest{
 		SQL: sql, Params: params,
-		Distribution: c.dist, Shard: sh.id, RoutingVersion: c.version, OwnershipEpoch: sh.epoch,
+		Distribution: c.dist, Shard: sh.id, AllocationGeneration: sh.allocationGeneration,
+		RoutingVersion: c.version, OwnershipEpoch: sh.epoch,
 		ExecutionMode: shardservice.ExecutionReadWrite,
 	}
 	if _, err := client.Do(context.Background(), sh.address, req); err != nil {
@@ -285,7 +291,8 @@ func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribu
 			epoch = o
 		}
 		manShards[i] = distribution.Shard{
-			ID: s.id, Range: s.kr, Leaders: []distribution.EndpointID{s.endpoint}, Epoch: epoch,
+			ID: s.id, AllocationGeneration: s.allocationGeneration,
+			Range: s.kr, Leaders: []distribution.EndpointID{s.endpoint}, Epoch: epoch,
 		}
 		endpoints[s.endpoint] = s.address
 	}

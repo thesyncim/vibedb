@@ -1,7 +1,7 @@
 // Command vibedb-shard is the leader-only shard service: it opens one local
 // vibedb SQL catalog, adopts a static ownership identity (distribution, shard,
-// ownership epoch, and routing version), and serves the shard-service wire
-// contract over a stdlib length-prefixed transport.
+// topology allocation generation, ownership epoch, and routing version), and
+// serves the shard-service wire contract over a stdlib length-prefixed transport.
 //
 // It admits every request against its configured identity before executing, and
 // executes the admitted statement locally through the ordinary vibedb parser and
@@ -11,7 +11,8 @@
 // Usage:
 //
 //	vibedb-shard serve -store <path> -listen <addr> \
-//	    -distribution <name> -shard <id> -epoch <n> -routing-version <n>
+//	    -distribution <name> -shard <id> -allocation-generation <n> \
+//	    -epoch <n> -routing-version <n>
 //
 // It serves until interrupted, then closes the listener, drains in-flight
 // connections, and releases the catalog.
@@ -52,7 +53,8 @@ func run(args []string) int {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard serve -store <path> -listen <addr> "+
-		"-distribution <name> -shard <id> -epoch <n> -routing-version <n>")
+		"-distribution <name> -shard <id> -allocation-generation <n> "+
+		"-epoch <n> -routing-version <n>")
 }
 
 func runServe(args []string) int {
@@ -62,6 +64,7 @@ func runServe(args []string) int {
 		listen         = fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 		distName       = fs.String("distribution", "", "owned distribution group name")
 		shard          = fs.String("shard", "", "owned shard identifier")
+		allocation     = fs.Uint64("allocation-generation", 0, "topology shard allocation generation")
 		epoch          = fs.Uint64("epoch", 0, "static ownership epoch")
 		routingVersion = fs.Uint64("routing-version", 0, "routed manifest generation")
 		maxConns       = fs.Int("max-connections", 0, "0 selects the default; -1 is unlimited")
@@ -69,7 +72,7 @@ func runServe(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *store == "" || *distName == "" || *shard == "" {
+	if *store == "" || *distName == "" || *shard == "" || *allocation == 0 {
 		usage()
 		return 2
 	}
@@ -86,10 +89,11 @@ func runServe(args []string) int {
 	defer db.Close()
 
 	cfg := shardservice.Ownership{
-		Distribution:   distribution.DistributionName(*distName),
-		Shard:          distribution.ShardID(*shard),
-		Epoch:          distribution.OwnershipEpoch(*epoch),
-		RoutingVersion: distribution.RoutingVersion(*routingVersion),
+		Distribution:         distribution.DistributionName(*distName),
+		Shard:                distribution.ShardID(*shard),
+		AllocationGeneration: distribution.ShardAllocationGeneration(*allocation),
+		Epoch:                distribution.OwnershipEpoch(*epoch),
+		RoutingVersion:       distribution.RoutingVersion(*routingVersion),
 	}
 	srv, err := shardservice.NewServer(db, cfg, shardservice.Options{
 		MaxConnections: *maxConns,
@@ -107,8 +111,8 @@ func runServe(args []string) int {
 		fmt.Fprintf(os.Stderr, "error listen=%q: %v\n", *listen, err)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "vibedb-shard serving distribution=%q shard=%q epoch=%d routing-version=%d on %s\n",
-		*distName, *shard, *epoch, *routingVersion, listener.Addr())
+	fmt.Fprintf(os.Stderr, "vibedb-shard serving distribution=%q shard=%q allocation-generation=%d epoch=%d routing-version=%d on %s\n",
+		*distName, *shard, *allocation, *epoch, *routingVersion, listener.Addr())
 
 	// Close the server when the process is signaled, which unblocks Serve.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

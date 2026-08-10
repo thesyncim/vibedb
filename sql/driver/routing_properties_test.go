@@ -56,9 +56,9 @@ func threeShardFixture(t *testing.T) (binding *placementBinding, router *distrib
 	b0 := points[a].point
 	b1 := points[b].point
 	manifest, err := distribution.NewManifest("d", 1, []distribution.Shard{
-		{ID: "s0", Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: b0}}, Leaders: []distribution.EndpointID{"e0"}},
-		{ID: "s1", Range: distribution.KeyRange{Start: b0, End: distribution.KeyspaceEnd{Point: b1}}, Leaders: []distribution.EndpointID{"e1"}},
-		{ID: "s2", Range: distribution.KeyRange{Start: b1, End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"e2"}},
+		{ID: "s0", AllocationGeneration: 1, Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: b0}}, Leaders: []distribution.EndpointID{"e0"}},
+		{ID: "s1", AllocationGeneration: 2, Range: distribution.KeyRange{Start: b0, End: distribution.KeyspaceEnd{Point: b1}}, Leaders: []distribution.EndpointID{"e1"}},
+		{ID: "s2", AllocationGeneration: 3, Range: distribution.KeyRange{Start: b1, End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"e2"}},
 	})
 	if err != nil {
 		t.Fatalf("NewManifest three-shard: %v", err)

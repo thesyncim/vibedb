@@ -295,7 +295,9 @@ func TestBeginTxCancellationReleasesPartiallyCapturedSnapshots(t *testing.T) {
 		remaining: 3,
 	}
 	transaction, err := connection.(sqldriver.ConnBeginTx).BeginTx(
-		ctx, sqldriver.TxOptions{})
+		ctx, sqldriver.TxOptions{
+			Isolation: sqldriver.IsolationLevel(stdsql.LevelRepeatableRead),
+		})
 	if transaction != nil {
 		_ = transaction.Rollback()
 		t.Fatal("canceled BeginTx returned a transaction")
@@ -335,6 +337,15 @@ func TestReadCommittedCanceledRefreshKeepsPriorCutAndClosesStaging(t *testing.T)
 		t.Fatal(err)
 	}
 	transaction := raw.(*tx)
+	dependencies := []physicalDependency{
+		{name: "left_docs"},
+		{name: "right_docs"},
+	}
+	if err := transaction.refreshStatementCut(
+		context.Background(), "left_docs", dependencies, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
 	outside := &conn{
 		db: transaction.conn.db,
 		exec: query.Exec{Options: query.ExecOptions{
@@ -360,7 +371,9 @@ func TestReadCommittedCanceledRefreshKeepsPriorCutAndClosesStaging(t *testing.T)
 		// third, and the second table checkpoint cancels after one staged lease.
 		at: 4,
 	}
-	if err := transaction.refreshStatementCut(ctx); !errors.Is(err, context.Canceled) {
+	if err := transaction.refreshStatementCut(
+		ctx, "left_docs", dependencies, nil,
+	); !errors.Is(err, context.Canceled) {
 		t.Fatalf("refresh = %v, want context.Canceled", err)
 	}
 	if got := ctx.calls.Load(); got != ctx.at {
@@ -392,6 +405,43 @@ func TestReadCommittedCanceledRefreshKeepsPriorCutAndClosesStaging(t *testing.T)
 	// no-write COMMIT must release both the preserved active cut and staging.
 	if err := transaction.Commit(); err != nil {
 		t.Fatalf("commit after ignored refresh error: %v", err)
+	}
+}
+
+func TestReadCommittedCanceledFirstCaptureInstallsNoLazyState(t *testing.T) {
+	_, transaction := readCommittedDependencyFixture(t, 2)
+	dependencies := []physicalDependency{
+		{name: "docs_000"},
+		{name: "docs_001"},
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelOnNthErrContext{
+		Context: base,
+		cancel:  cancel,
+		// lockContext consumes two Err calls, the first table checkpoint the
+		// third, and the second dependency cancels before its snapshot.
+		at: 4,
+	}
+	if err := transaction.refreshStatementCut(
+		ctx, "docs_000", dependencies, nil,
+	); !errors.Is(err, context.Canceled) {
+		t.Fatalf("refresh = %v, want context.Canceled", err)
+	}
+	if len(transaction.tables) != 0 {
+		t.Fatalf("canceled first capture installed %d table states, want zero",
+			len(transaction.tables))
+	}
+	if len(transaction.refreshStates) != 0 || len(transaction.refreshStaged) != 0 {
+		t.Fatalf("canceled first capture retained staging: states=%d map=%d",
+			len(transaction.refreshStates), len(transaction.refreshStaged))
+	}
+	transaction.conn.db.mu.RLock()
+	defer transaction.conn.db.mu.RUnlock()
+	for name, table := range transaction.conn.db.tables {
+		if len(table.conflicts.active) != 0 {
+			t.Fatalf("canceled first capture registered conflict clock for %s", name)
+		}
 	}
 }
 

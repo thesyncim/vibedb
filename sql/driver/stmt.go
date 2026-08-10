@@ -189,7 +189,13 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 			return s.analyzeRows(ctx, args)
 		}
 		if s.conn.tx != nil {
-			if err := s.conn.tx.refreshStatementCut(ctx); err != nil {
+			var views []viewDependency
+			if s.views != nil {
+				views = s.views.dependencies
+			}
+			if err := s.conn.tx.refreshStatementCut(
+				ctx, s.query.Collection(), s.dependencies, views,
+			); err != nil {
 				return nil, err
 			}
 		}
@@ -226,6 +232,13 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	// this branch has no physical relation, so it cannot divert a stored-row
 	// query or its transaction snapshot.
 	if sourceIndependentStatement(s.query) {
+		if s.conn.tx != nil && s.views != nil && len(s.views.dependencies) != 0 {
+			if err := s.conn.tx.refreshStatementCut(
+				ctx, "", nil, s.views.dependencies,
+			); err != nil {
+				return nil, err
+			}
+		}
 		if err := s.validatePreparedViewDependencies(ctx); err != nil {
 			return nil, err
 		}

@@ -373,9 +373,12 @@ func (d *database) dropTableLockedContext(
 			d.tables[name] = t
 			d.retired = d.retired[:retiredBefore]
 			d.catalogWritePending = previousPending
+		} else {
+			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
 	}
+	d.advanceLayoutEpochLocked()
 	if err := d.settleDroppedTablesLocked(); err != nil {
 		return nil, err
 	}
@@ -455,9 +458,12 @@ func (d *database) createTableLockedContext(
 		if !published {
 			delete(d.catalog.Tables, definition.Name)
 			delete(d.tables, definition.Name)
+		} else {
+			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
 	}
+	d.advanceLayoutEpochLocked()
 	return result{}, nil
 }
 
@@ -550,6 +556,25 @@ func (d *database) createIndexContext(
 			ErrTransactionConflict, definition.Table,
 		)
 	}
+	if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		// The durable root may already expose the new index. Mirror whatever can
+		// be observed, retain a pending SQL-catalog repair even if the poisoned
+		// collection cannot be snapshotted, and fence the retained/unknown layout
+		// before returning the durability error.
+		d.mu.Lock()
+		if current, exists := d.tables[definition.Table]; !exists || current != t {
+			d.mu.Unlock()
+			return nil, fmt.Errorf(
+				"%w: table %q storage changed during CREATE INDEX",
+				ErrTransactionConflict, definition.Table,
+			)
+		}
+		_, _ = syncTableIndexMeta(t)
+		d.catalogWritePending = true
+		d.advanceLayoutEpochLocked()
+		d.mu.Unlock()
+		return nil, err
+	}
 	if errors.Is(err, store.ErrIndexExists) && definition.IfNotExists {
 		err = nil
 	}
@@ -583,6 +608,7 @@ func (d *database) createIndexContext(
 		}
 		_, _ = syncTableIndexMeta(t)
 		d.catalogWritePending = true
+		d.advanceLayoutEpochLocked()
 		d.mu.Unlock()
 		return nil, fmt.Errorf(
 			"%w: durable index committed before SQL catalog cancellation: %v",
@@ -596,6 +622,10 @@ func (d *database) createIndexContext(
 			ErrTransactionConflict, definition.Table,
 		)
 	}
+	// The durable index publication is already visible through snapshots of
+	// this exact table object, even if refreshing or persisting its SQL mirror
+	// fails below.
+	d.advanceLayoutEpochLocked()
 	if _, syncErr := syncTableIndexMeta(t); syncErr != nil {
 		d.catalogWritePending = true
 		return nil, fmt.Errorf(
@@ -669,9 +699,12 @@ func (d *database) createIndexLockedContext(
 	if published, err := d.persistCatalogLocked(); err != nil {
 		if !published {
 			t.meta.Indexes = previous
+		} else {
+			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
 	}
+	d.advanceLayoutEpochLocked()
 	return result{}, nil
 }
 

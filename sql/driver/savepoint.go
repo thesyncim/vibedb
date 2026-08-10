@@ -63,6 +63,29 @@ func (t *tx) savepoint(name string) error {
 	return nil
 }
 
+// attachTableToSavepoints extends every live mark when Read Committed first
+// materializes a dependency after the mark was created. The state is empty at
+// installation, so zero is the exact pre-statement overlay watermark for every
+// frame. A later ROLLBACK TO therefore removes writes to lazily touched tables
+// just as it does for tables materialized before SAVEPOINT.
+func (t *tx) attachTableToSavepoints(state *txTable) {
+	if state == nil || len(t.savepoints) == 0 {
+		return
+	}
+	for i := range t.savepoints {
+		frame := &t.savepoints[i]
+		if frame.tables == nil {
+			frame.tables = make(map[string]*savepointTableMark)
+		}
+		if frame.tables[state.name] != nil {
+			continue
+		}
+		frame.tables[state.name] = &savepointTableMark{
+			undo: make(map[string]*txMutation),
+		}
+	}
+}
+
 func (t *tx) releaseSavepoint(name string) error {
 	if t.done {
 		return fmt.Errorf("vibedb: transaction is finished")

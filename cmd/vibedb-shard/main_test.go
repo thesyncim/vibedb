@@ -26,6 +26,7 @@ func TestRunArgumentHandling(t *testing.T) {
 				"vibedb-shard", "serve",
 				"-store", t.TempDir(),
 				"-distribution", "tenant_data", "-shard", "-80",
+				"-allocation-generation", "1",
 			},
 			want: 1,
 		},
@@ -47,6 +48,7 @@ func TestRunStoreOpenReportsPath(t *testing.T) {
 		"vibedb-shard", "serve",
 		"-store", missing,
 		"-distribution", "tenant_data", "-shard", "-80",
+		"-allocation-generation", "1",
 	}
 	if got := run(args); got != 1 {
 		t.Fatalf("run(missing store dir) = %d, want 1", got)

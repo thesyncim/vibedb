@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/thesyncim/vibedb/distribution"
 )
 
 // TestFileCatalogRefresherPublishesOnlyNewerValidSnapshots proves on-demand
@@ -73,5 +75,43 @@ func TestFileCatalogRefresherRejectsInvalidConfiguration(t *testing.T) {
 		if _, err := refresher.Refresh(context.Background(), 0); !errors.Is(err, ErrInvalidRefreshSource) {
 			t.Fatalf("Refresh err = %v, want ErrInvalidRefreshSource", err)
 		}
+	}
+}
+
+func TestFileCatalogRefresherReportsInvalidCrossGenerationLineage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "catalog.json")
+	initial := testSnapshot(t, 1)
+	if err := SaveSnapshot(path, initial); err != nil {
+		t.Fatal(err)
+	}
+	holder := NewCatalogHolder(initial)
+
+	// This is a valid standalone snapshot, so it can be written by an isolated
+	// authority. Relative to the serving generation, however, it mutates an
+	// immutable manifest without advancing that manifest's routing version.
+	config := testConfig(t)
+	shards := manifestShards(t, config.Manifests[0])
+	shards[0].Epoch++
+	manifest, err := distribution.NewManifest("tenant_data", config.Manifests[0].Version(), shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Manifests[0] = manifest
+	invalid := testSnapshotFromConfig(t, config, testEndpoints(), 2)
+	replacement := filepath.Join(dir, "replacement.json")
+	if err := SaveSnapshot(replacement, invalid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+
+	refresher := NewFileCatalogRefresher(path, holder)
+	if _, err := refresher.Refresh(context.Background(), 1); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("Refresh invalid lineage err=%v, want ErrInvalidCatalog", err)
+	}
+	if holder.Current().Generation() != 1 {
+		t.Fatal("invalid lineage replaced the serving catalog")
 	}
 }

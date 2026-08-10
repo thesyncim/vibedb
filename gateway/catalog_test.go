@@ -8,8 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
 )
@@ -33,16 +36,18 @@ func testManifest(t testing.TB, version distribution.RoutingVersion) *distributi
 	t.Helper()
 	shards := []distribution.Shard{
 		{
-			ID:      "-80",
-			Range:   distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: point(0x80)}},
-			Leaders: []distribution.EndpointID{"ep-a"},
-			Epoch:   7,
+			ID:                   "-80",
+			AllocationGeneration: 1,
+			Range:                distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: point(0x80)}},
+			Leaders:              []distribution.EndpointID{"ep-a"},
+			Epoch:                7,
 		},
 		{
-			ID:      "80-",
-			Range:   distribution.KeyRange{Start: point(0x80), End: distribution.KeyspaceEnd{Max: true}},
-			Leaders: []distribution.EndpointID{"ep-b"},
-			Epoch:   9,
+			ID:                   "80-",
+			AllocationGeneration: 2,
+			Range:                distribution.KeyRange{Start: point(0x80), End: distribution.KeyspaceEnd{Max: true}},
+			Leaders:              []distribution.EndpointID{"ep-b"},
+			Epoch:                9,
 		},
 	}
 	m, err := distribution.NewManifest("tenant_data", version, shards)
@@ -75,6 +80,20 @@ func testSnapshot(t testing.TB, generation uint64) *Snapshot {
 		t.Fatalf("NewSnapshot: %v", err)
 	}
 	return s
+}
+
+func testSnapshotFromConfig(
+	t testing.TB,
+	config distribution.ClusterConfig,
+	endpoints map[distribution.EndpointID]string,
+	generation uint64,
+) *Snapshot {
+	t.Helper()
+	snapshot, err := NewSnapshot(config, endpoints, generation)
+	if err != nil {
+		t.Fatalf("NewSnapshot generation %d: %v", generation, err)
+	}
+	return snapshot
 }
 
 // TestSnapshotRejectsUnsupportedMapperVersion keeps mapper selection inside the
@@ -121,11 +140,163 @@ func TestSnapshotPersistRoundTrip(t *testing.T) {
 	if ep, ok := got.OwnershipEpoch("tenant_data", "80-"); !ok || ep != 9 {
 		t.Fatalf("OwnershipEpoch(80-) = %d,%v, want 9,true", ep, ok)
 	}
+	if allocation, ok := got.ShardAllocationGeneration("tenant_data", "80-"); !ok || allocation != 2 {
+		t.Fatalf("ShardAllocationGeneration(80-) = %d,%v, want 2,true", allocation, ok)
+	}
 	if addr, err := got.Address("ep-a"); err != nil || addr != "127.0.0.1:7001" {
 		t.Fatalf("Address(ep-a) = %q,%v", addr, err)
 	}
 	if p, ok := got.Placement("messages"); !ok || len(p.Columns) != 1 || p.Columns[0] != "/tenant_id" {
 		t.Fatalf("Placement(messages) = %+v,%v", p, ok)
+	}
+	if got.indexIDHighWater != 0 || len(got.shardGenerationHighWaters) != 1 ||
+		got.shardGenerationHighWaters[0] != 2 {
+		t.Fatalf("lineage = index %d shards %v, want 0/[2]",
+			got.indexIDHighWater, got.shardGenerationHighWaters)
+	}
+}
+
+func TestSnapshotReadAccessorsDoNotExposeMutableConfig(t *testing.T) {
+	snapshot := testSnapshot(t, 1)
+	placement, ok := snapshot.Placement("messages")
+	if !ok {
+		t.Fatal("messages placement is missing")
+	}
+	placement.Columns[0] = "/corrupted"
+	placementAgain, ok := snapshot.Placement("messages")
+	if !ok || len(placementAgain.Columns) != 1 || placementAgain.Columns[0] != "/tenant_id" {
+		t.Fatalf("mutating Placement result changed snapshot: %+v,%v", placementAgain, ok)
+	}
+
+	placementAt, ok := snapshot.PlacementAt(0)
+	if !ok {
+		t.Fatal("placement ordinal 0 is missing")
+	}
+	placementAt.Columns[0] = "/also_corrupted"
+	placementAgain, _ = snapshot.PlacementAt(0)
+	if placementAgain.Columns[0] != "/tenant_id" {
+		t.Fatalf("mutating PlacementAt result changed snapshot: %+v", placementAgain)
+	}
+
+	if snapshot.DistributionCount() != 1 || snapshot.PlacementCount() != 1 || snapshot.ManifestCount() != 1 {
+		t.Fatalf("catalog counts = %d/%d/%d, want 1/1/1",
+			snapshot.DistributionCount(), snapshot.PlacementCount(), snapshot.ManifestCount())
+	}
+	if _, ok := snapshot.DistributionAt(-1); ok {
+		t.Fatal("negative distribution ordinal succeeded")
+	}
+	if _, ok := snapshot.PlacementAt(snapshot.PlacementCount()); ok {
+		t.Fatal("out-of-range placement ordinal succeeded")
+	}
+	if _, ok := snapshot.ManifestAt(snapshot.ManifestCount()); ok {
+		t.Fatal("out-of-range manifest ordinal succeeded")
+	}
+}
+
+func TestSnapshotOwnsExactStringBacking(t *testing.T) {
+	tableBacking := strings.Repeat("x", 1<<20) + "messages"
+	columnBacking := strings.Repeat("x", 1<<20) + "/tenant_id"
+	addressBacking := strings.Repeat("x", 1<<20) + "127.0.0.1:7001"
+	table := tableBacking[len(tableBacking)-len("messages"):]
+	column := columnBacking[len(columnBacking)-len("/tenant_id"):]
+	address := addressBacking[len(addressBacking)-len("127.0.0.1:7001"):]
+
+	config := testConfig(t)
+	config.Placements[0].Table = table
+	config.Placements[0].Columns[0] = column
+	endpoints := testEndpoints()
+	endpoints["ep-a"] = address
+	snapshot, err := NewSnapshot(config, endpoints, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedTable := snapshot.config.Placements[0].Table
+	ownedColumn := snapshot.config.Placements[0].Columns[0]
+	ownedAddress := snapshot.endpoints["ep-a"]
+	if unsafe.StringData(ownedTable) == unsafe.StringData(table) ||
+		unsafe.StringData(ownedColumn) == unsafe.StringData(column) ||
+		unsafe.StringData(ownedAddress) == unsafe.StringData(address) {
+		t.Fatal("snapshot retained caller string backing")
+	}
+}
+
+func TestCatalogTransitionDirectoriesAreCompactAndExact(t *testing.T) {
+	snapshot := NewCatalogHolder(testSnapshot(t, 1)).Current()
+	if got := unsafe.Sizeof(plannerShardLineageRef{}); got != 8 {
+		t.Fatalf("plannerShardLineageRef = %d bytes, want 8", got)
+	}
+	want := uint64(2*8 + 1*8 + 8) // two shards, one distribution water, index scalar
+	if got := snapshot.CatalogTransitionMetadataBytes(); got != want {
+		t.Fatalf("transition metadata = %d bytes, want %d", got, want)
+	}
+}
+
+func TestShardLineageDirectoryIsIdentitySortedIndependentlyOfRanges(t *testing.T) {
+	config := testConfig(t)
+	shards := manifestShards(t, config.Manifests[0])
+	shards[0].ID = "z-left"
+	shards[1].ID = "a-right"
+	config.Manifests[0] = mustManifest(t, 3, shards)
+	snapshot := testSnapshotFromConfig(t, config, testEndpoints(), 1)
+	if len(snapshot.shardLineage) != 2 {
+		t.Fatalf("shard lineage refs = %d, want 2", len(snapshot.shardLineage))
+	}
+	firstRef, secondRef := snapshot.shardLineage[0], snapshot.shardLineage[1]
+	first, _ := snapshot.config.Manifests[firstRef.manifest].ShardMetadataAt(int(firstRef.shard))
+	second, _ := snapshot.config.Manifests[secondRef.manifest].ShardMetadataAt(int(secondRef.shard))
+	if first.ID != "a-right" || second.ID != "z-left" {
+		t.Fatalf("shard lineage order = %q,%q, want a-right,z-left", first.ID, second.ID)
+	}
+}
+
+func TestLoadSnapshotRejectsMissingOrContradictoryLineage(t *testing.T) {
+	normalized, err := initialCatalogState(testSnapshot(t, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := toPersisted(normalized)
+	tests := []struct {
+		name   string
+		mutate func(*persistedCatalog)
+	}{
+		{
+			name: "missing",
+			mutate: func(catalog *persistedCatalog) {
+				catalog.Lineage = nil
+			},
+		},
+		{
+			name: "wrong_distribution_count",
+			mutate: func(catalog *persistedCatalog) {
+				catalog.Lineage.ShardGenerationHighWaters = nil
+			},
+		},
+		{
+			name: "below_active_shard_allocation",
+			mutate: func(catalog *persistedCatalog) {
+				catalog.Lineage.ShardGenerationHighWaters[0] = 1
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			catalog := base
+			lineage := *base.Lineage
+			lineage.ShardGenerationHighWaters = slices.Clone(base.Lineage.ShardGenerationHighWaters)
+			catalog.Lineage = &lineage
+			tc.mutate(&catalog)
+			raw, err := json.Marshal(catalog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "catalog.json")
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadSnapshot(path); !errors.Is(err, ErrInvalidCatalog) {
+				t.Fatalf("LoadSnapshot err=%v, want ErrInvalidCatalog", err)
+			}
+		})
 	}
 }
 
@@ -199,6 +370,353 @@ func TestSaveSnapshotConcurrentPublishersConverge(t *testing.T) {
 	}
 	if got.Generation() != generations {
 		t.Fatalf("durable generation = %d, want %d", got.Generation(), generations)
+	}
+}
+
+func TestSaveSnapshotUsesOnePinnedParentNamespace(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	link := filepath.Join(t.TempDir(), "catalog-parent")
+	if err := os.Symlink(dirA, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	root, base, err := openCatalogRoot(filepath.Join(link, "catalog.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dirB, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSnapshotAtRoot(root, base, testSnapshot(t, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadSnapshot(filepath.Join(dirA, "catalog.json")); err != nil {
+		t.Fatalf("pinned directory A was not published: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dirB, "catalog.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retargeted directory B was mutated: %v", err)
+	}
+}
+
+func TestCatalogPublicationEntryProofRejectsReplacement(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, name := range []string{"catalog.json.lock", ".catalog.json.tmp-proof"} {
+		t.Run(name, func(t *testing.T) {
+			file, err := openCatalogRootFile(root, name, os.O_RDWR|os.O_CREATE, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := file.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.Rename(name, name+".detached"); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.WriteFile(name, []byte("replacement"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyCatalogEntryUnchanged(root, name, info); !errors.Is(err, ErrInvalidCatalog) {
+				t.Fatalf("replacement proof err=%v, want ErrInvalidCatalog", err)
+			}
+		})
+	}
+}
+
+func TestCatalogTransitionFencesRoutingIdentity(t *testing.T) {
+	base := testSnapshot(t, 1)
+	tests := []struct {
+		name      string
+		config    distribution.ClusterConfig
+		endpoints map[distribution.EndpointID]string
+	}{
+		{
+			name: "distribution_identity",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Distributions[0].Arity = 2
+				config.Placements[0].Columns = []string{"/tenant_id", "/bucket"}
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "placement_identity",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Placements[0].Columns = []string{"/other"}
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "placement_removal",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Placements = nil
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "routing_version_regression",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Manifests[0] = testManifest(t, 2)
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "same_version_changed_epoch",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				shards := manifestShards(t, config.Manifests[0])
+				shards[0].Epoch++
+				config.Manifests[0] = mustManifest(t, 3, shards)
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "active_shard_allocation_change",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				shards := manifestShards(t, config.Manifests[0])
+				shards[0].AllocationGeneration = 3
+				shards[0].Epoch++
+				config.Manifests[0] = mustManifest(t, 4, shards)
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "higher_version_lower_epoch",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				shards := manifestShards(t, config.Manifests[0])
+				shards[0].Epoch--
+				config.Manifests[0] = mustManifest(t, 4, shards)
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "ownership_change_without_epoch",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				shards := manifestShards(t, config.Manifests[0])
+				shards[0].Leaders = []distribution.EndpointID{"ep-c"}
+				config.Manifests[0] = mustManifest(t, 4, shards)
+				return config
+			}(),
+			endpoints: map[distribution.EndpointID]string{
+				"ep-a": "127.0.0.1:7001", "ep-b": "127.0.0.1:7002", "ep-c": "127.0.0.1:7003",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			next := testSnapshotFromConfig(t, tc.config, tc.endpoints, 2)
+			holder := NewCatalogHolder(base)
+			if holder.PublishNewer(next) {
+				t.Fatal("unsafe routing transition was published")
+			}
+		})
+	}
+}
+
+func manifestShards(t testing.TB, manifest *distribution.Manifest) []distribution.Shard {
+	t.Helper()
+	shards := make([]distribution.Shard, manifest.ShardCount())
+	for i := range shards {
+		shard, ok := manifest.ShardInfo(i)
+		if !ok {
+			t.Fatalf("ShardInfo(%d) missing", i)
+		}
+		shards[i] = shard
+	}
+	return shards
+}
+
+func mustManifest(
+	t testing.TB,
+	version distribution.RoutingVersion,
+	shards []distribution.Shard,
+) *distribution.Manifest {
+	t.Helper()
+	manifest, err := distribution.NewManifest("tenant_data", version, shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
+func TestSaveSnapshotRetainsDistributionShardAllocationHighWater(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, testSnapshot(t, 1)); err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(t)
+	config.Manifests[0] = mustManifest(t, 4, []distribution.Shard{{
+		ID: "all", AllocationGeneration: 3,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"ep-a"}, Epoch: 1,
+	}})
+	if err := SaveSnapshot(path, testSnapshotFromConfig(t, config, testEndpoints(), 2)); err != nil {
+		t.Fatal(err)
+	}
+
+	config = testConfig(t)
+	config.Manifests[0] = testManifest(t, 5)
+	if err := SaveSnapshot(path, testSnapshotFromConfig(t, config, testEndpoints(), 3)); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("reused retired shard identities err=%v, want ErrInvalidCatalog", err)
+	}
+	shards := manifestShards(t, config.Manifests[0])
+	shards[0].AllocationGeneration = 4
+	shards[1].AllocationGeneration = 5
+	shards[0].Epoch = 1
+	shards[1].Epoch = 1
+	config.Manifests[0] = mustManifest(t, 5, shards)
+	if err := SaveSnapshot(path, testSnapshotFromConfig(t, config, testEndpoints(), 3)); err != nil {
+		t.Fatalf("higher ownership incarnations were refused: %v", err)
+	}
+	loaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.shardGenerationHighWaters) != 1 || loaded.shardGenerationHighWaters[0] != 5 {
+		t.Fatalf("durable shard allocation high-water = %v, want [5]", loaded.shardGenerationHighWaters)
+	}
+}
+
+func TestShardAllocationHighWaterSupportsSkippedCatalogGenerations(t *testing.T) {
+	build := func(
+		catalogGeneration uint64,
+		routingVersion distribution.RoutingVersion,
+		shardID distribution.ShardID,
+		allocation distribution.ShardAllocationGeneration,
+	) *Snapshot {
+		t.Helper()
+		config := testConfig(t)
+		config.Manifests[0] = mustManifest(t, routingVersion, []distribution.Shard{{
+			ID: shardID, AllocationGeneration: allocation,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: []distribution.EndpointID{"ep-a"}, Epoch: 1,
+		}})
+		return testSnapshotFromConfig(t, config, testEndpoints(), catalogGeneration)
+	}
+
+	holder := NewCatalogHolder(testSnapshot(t, 1))
+	skipped := build(2, 4, "all", 3)
+	skipped.catalogLineagePresent = true
+	skipped.indexIDHighWater = 0
+	skipped.shardGenerationHighWaters = []distribution.ShardAllocationGeneration{10}
+	if !holder.PublishNewer(skipped) {
+		t.Fatal("generation jump with a monotonic shard allocation high-water was refused")
+	}
+	if holder.Current().shardGenerationHighWaters[0] != 10 {
+		t.Fatalf("shard allocation high-water = %d, want skipped value 10",
+			holder.Current().shardGenerationHighWaters[0])
+	}
+	if holder.PublishNewer(build(3, 5, "new", 5)) {
+		t.Fatal("shard allocation below the skipped high-water was admitted")
+	}
+	if !holder.PublishNewer(build(3, 5, "new", 11)) {
+		t.Fatal("shard allocation above the skipped high-water was refused")
+	}
+	if next, ok := holder.Current().NextShardAllocationGeneration("tenant_data"); !ok || next != 12 {
+		t.Fatalf("next shard allocation = %d,%v, want 12,true", next, ok)
+	}
+}
+
+func TestShardAllocationHighWatersFollowDistributionIdentityAcrossReorder(t *testing.T) {
+	manifest := func(name distribution.DistributionName, shard distribution.ShardID, allocation distribution.ShardAllocationGeneration, endpoint distribution.EndpointID) *distribution.Manifest {
+		t.Helper()
+		result, err := distribution.NewManifest(name, 1, []distribution.Shard{{
+			ID: shard, AllocationGeneration: allocation,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: []distribution.EndpointID{endpoint}, Epoch: 1,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	aManifest := manifest("a", "a0", 7, "ep-a")
+	bManifest := manifest("b", "b0", 91, "ep-b")
+	build := func(generation uint64, reverse bool) *Snapshot {
+		t.Helper()
+		config := distribution.ClusterConfig{
+			Distributions: []distribution.DistributionSpec{
+				{Name: "a", Arity: 1, MapperVersion: distribution.NativeMapperVersion},
+				{Name: "b", Arity: 1, MapperVersion: distribution.NativeMapperVersion},
+			},
+			Placements: []distribution.TablePlacement{
+				{Table: "a_table", Distribution: "a", Columns: []string{"/tenant_id"}},
+				{Table: "b_table", Distribution: "b", Columns: []string{"/tenant_id"}},
+			},
+			Manifests: []*distribution.Manifest{aManifest, bManifest},
+		}
+		if reverse {
+			slices.Reverse(config.Distributions)
+			slices.Reverse(config.Placements)
+			slices.Reverse(config.Manifests)
+		}
+		snapshot, err := NewSnapshot(config, map[distribution.EndpointID]string{
+			"ep-a": "127.0.0.1:1", "ep-b": "127.0.0.1:2",
+		}, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+
+	initial := build(1, false)
+	initial.catalogLineagePresent = true
+	initial.shardGenerationHighWaters = []distribution.ShardAllocationGeneration{100, 200}
+	holder := NewCatalogHolder(initial)
+	if !holder.PublishNewer(build(2, true)) {
+		t.Fatal("safe distribution reorder was refused")
+	}
+	if next, ok := holder.Current().NextShardAllocationGeneration("a"); !ok || next != 101 {
+		t.Fatalf("a next allocation = %d,%v, want 101,true", next, ok)
+	}
+	if next, ok := holder.Current().NextShardAllocationGeneration("b"); !ok || next != 201 {
+		t.Fatalf("b next allocation = %d,%v, want 201,true", next, ok)
+	}
+}
+
+func TestNextShardAllocationGenerationUsesActiveOrPersistedHighWater(t *testing.T) {
+	fresh := testSnapshot(t, 1)
+	if next, ok := fresh.NextShardAllocationGeneration("tenant_data"); !ok || next != 3 {
+		t.Fatalf("fresh next shard allocation = %d,%v, want 3,true", next, ok)
+	}
+	if _, ok := fresh.NextShardAllocationGeneration("missing"); ok {
+		t.Fatal("unknown distribution returned an allocation")
+	}
+	if _, ok := (*Snapshot)(nil).NextShardAllocationGeneration("tenant_data"); ok {
+		t.Fatal("nil snapshot returned an allocation")
+	}
+
+	exhausted := testSnapshot(t, 2)
+	exhausted.catalogLineagePresent = true
+	exhausted.shardGenerationHighWaters = []distribution.ShardAllocationGeneration{
+		^distribution.ShardAllocationGeneration(0),
+	}
+	if _, ok := exhausted.NextShardAllocationGeneration("tenant_data"); ok {
+		t.Fatal("exhausted shard allocation namespace wrapped")
 	}
 }
 

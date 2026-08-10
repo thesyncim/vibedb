@@ -3,12 +3,58 @@ package driver
 import (
 	"context"
 	stdsql "database/sql"
+	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func readCommittedDependencyFixture(
+	tb testing.TB,
+	tables int,
+) (sqldriver.Stmt, *tx) {
+	tb.Helper()
+	connection := directTestConn(tb)
+	for i := 0; i < tables; i++ {
+		name := fmt.Sprintf("docs_%03d", i)
+		directExec(tb, connection,
+			fmt.Sprintf(
+				`CREATE TABLE %s (id STRING PRIMARY KEY, n NUMBER NOT NULL)`,
+				name,
+			), nil,
+		)
+		directExec(tb, connection,
+			fmt.Sprintf(`INSERT INTO %s VALUES (?)`, name),
+			[]sqldriver.NamedValue{{
+				Ordinal: 1, Value: `{"id":"a","n":1}`,
+			}},
+		)
+	}
+	raw, err := connection.(sqldriver.ConnBeginTx).BeginTx(
+		context.Background(), sqldriver.TxOptions{Isolation: 2},
+	)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	transaction := raw.(*tx)
+	prepared, err := connection.Prepare(
+		`SELECT n FROM docs_000 WHERE id = ?`,
+	)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() {
+		if err := prepared.Close(); err != nil {
+			tb.Error(err)
+		}
+		if err := transaction.Rollback(); err != nil {
+			tb.Error(err)
+		}
+	})
+	return prepared, transaction
+}
 
 func isolationCount(t testing.TB, tx *stdsql.Tx) int64 {
 	t.Helper()
@@ -77,6 +123,175 @@ func TestDatabaseSQLReadCommittedRefreshAndRepeatableReadCut(t *testing.T) {
 	}
 }
 
+func TestReadCommittedCapturesSameIncarnationAfterFirstMaterialization(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelReadCommitted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := db.Exec(`INSERT INTO docs (id) VALUES ('materialized')`); err != nil {
+		t.Fatal(err)
+	}
+	if got := isolationCount(t, tx); got != 1 {
+		t.Fatalf("count after same-incarnation materialization = %d, want 1", got)
+	}
+}
+
+func TestReadCommittedCapturesOnlyStatementDependencies(t *testing.T) {
+	prepared, transaction := readCommittedDependencyFixture(t, 8)
+	if len(transaction.tables) != 0 {
+		t.Fatalf("READ COMMITTED BEGIN materialized %d table states, want zero",
+			len(transaction.tables))
+	}
+	transaction.conn.db.mu.RLock()
+	for name, table := range transaction.conn.db.tables {
+		if len(table.conflicts.active) != 0 {
+			transaction.conn.db.mu.RUnlock()
+			t.Fatalf("READ COMMITTED BEGIN registered conflict clock for %s", name)
+		}
+	}
+	transaction.conn.db.mu.RUnlock()
+	dest := make([]sqldriver.Value, 1)
+	if err := runDirectQuery(
+		prepared, []sqldriver.Value{"a"}, dest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(transaction.tables) != 1 {
+		t.Fatalf("point statement materialized %d table states, want one",
+			len(transaction.tables))
+	}
+	if state := transaction.tables["docs_000"]; state == nil || state.snapshot == nil {
+		t.Fatal("driving dependency was not captured")
+	}
+	transaction.conn.db.mu.RLock()
+	defer transaction.conn.db.mu.RUnlock()
+	for name, table := range transaction.conn.db.tables {
+		want := 0
+		if name == "docs_000" {
+			want = 1
+		}
+		if got := len(table.conflicts.active); got != want {
+			t.Fatalf("active conflict registrations for %s = %d, want %d",
+				name, got, want)
+		}
+	}
+}
+
+func TestReadCommittedCapturesRecursiveExecutableClosure(t *testing.T) {
+	point, transaction := readCommittedDependencyFixture(t, 4)
+	if err := point.Close(); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := transaction.conn.Prepare(`
+		WITH picked AS (SELECT id FROM docs_001)
+		SELECT d.n
+		FROM docs_000 AS d
+		JOIN picked AS p ON d.id = p.id
+		WHERE EXISTS (
+			SELECT 1 FROM docs_002 AS gate WHERE gate.id = 'a'
+		)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+	dest := make([]sqldriver.Value, 1)
+	if err := runDirectQuery(prepared, nil, dest); err != nil {
+		t.Fatal(err)
+	}
+	if len(transaction.tables) != 3 {
+		t.Fatalf("recursive statement materialized %d states, want three",
+			len(transaction.tables))
+	}
+	for _, name := range []string{"docs_000", "docs_001", "docs_002"} {
+		if state := transaction.tables[name]; state == nil || state.snapshot == nil {
+			t.Fatalf("dependency %s was not captured", name)
+		}
+	}
+	if state := transaction.tables["docs_003"]; state != nil {
+		t.Fatal("unrelated docs_003 acquired transaction state")
+	}
+}
+
+func TestReadCommittedDependencyRefreshWarmAllocations(t *testing.T) {
+	prepared, _ := readCommittedDependencyFixture(t, 8)
+	args := []sqldriver.Value{"a"}
+	dest := make([]sqldriver.Value, 1)
+	if err := runDirectQuery(prepared, args, dest); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	allocs := testing.AllocsPerRun(200, func() {
+		runErr = runDirectQuery(prepared, args, dest)
+	})
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if allocs != 0 {
+		t.Fatalf("warmed dependency refresh allocated %.2f times, want zero", allocs)
+	}
+}
+
+func BenchmarkReadCommittedDependencyScopedPointQuery(b *testing.B) {
+	for _, tables := range []int{1, 8, 64} {
+		b.Run(fmt.Sprintf("catalog_tables=%d/dependencies=1", tables), func(b *testing.B) {
+			prepared, _ := readCommittedDependencyFixture(b, tables)
+			args := []sqldriver.Value{"a"}
+			dest := make([]sqldriver.Value, 1)
+			if err := runDirectQuery(prepared, args, dest); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if err := runDirectQuery(prepared, args, dest); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestCatalogLayoutEpochAdvancesForEveryLayoutKind(t *testing.T) {
+	connection := directTestConn(t).(*conn)
+	epoch := func() *catalogLayoutEpoch {
+		connection.db.mu.RLock()
+		defer connection.db.mu.RUnlock()
+		return connection.db.layoutEpoch
+	}
+	previous := epoch()
+	publish := func(name, statement string, args []sqldriver.NamedValue) {
+		t.Helper()
+		directExec(t, connection, statement, args)
+		current := epoch()
+		if current == previous {
+			t.Fatalf("%s did not advance the catalog layout epoch", name)
+		}
+		previous = current
+	}
+	publish("table creation",
+		`CREATE TABLE docs (id STRING PRIMARY KEY, n NUMBER NOT NULL)`, nil)
+	publish("catalog-only index creation",
+		`CREATE INDEX by_n ON docs (n)`, nil)
+	publish("first materialization", `INSERT INTO docs VALUES (?)`,
+		[]sqldriver.NamedValue{{
+			Ordinal: 1, Value: `{"id":"a","n":1}`,
+		}})
+	publish("online index creation", `CREATE INDEX by_id ON docs (id)`, nil)
+	publish("index removal", `DROP INDEX by_id ON docs`, nil)
+	publish("table truncation", `TRUNCATE TABLE docs`, nil)
+	publish("view creation",
+		`CREATE VIEW selected AS SELECT id FROM docs`, nil)
+	publish("view removal", `DROP VIEW selected`, nil)
+	publish("table removal", `DROP TABLE docs`, nil)
+}
+
 func TestReadCommittedPreservesOverlayAndSavepointsAcrossRefresh(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
@@ -112,6 +327,41 @@ func TestReadCommittedPreservesOverlayAndSavepointsAcrossRefresh(t *testing.T) {
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReadCommittedSavepointPrecedesFirstTableDependency(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelReadCommitted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SAVEPOINT before_docs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO docs (id) VALUES ('rolled')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`ROLLBACK TO before_docs`); err != nil {
+		t.Fatal(err)
+	}
+	if got := isolationCount(t, tx); got != 0 {
+		t.Fatalf("rows after rollback to pre-dependency savepoint = %d, want 0", got)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("committed rows after lazy savepoint rollback = %d, want 0", count)
 	}
 }
 
@@ -717,7 +967,7 @@ func TestIsolationLevelRefusalsAndTypedReadCommitted(t *testing.T) {
 	}
 }
 
-func TestReadCommittedCatalogChangeFailsClosed(t *testing.T) {
+func TestReadCommittedUnrelatedCatalogChangeDoesNotInvalidateStatement(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
@@ -734,8 +984,40 @@ func TestReadCommittedCatalogChangeFailsClosed(t *testing.T) {
 	}
 	var count int64
 	err = tx.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count)
-	if !errors.Is(err, ErrTransactionConflict) {
-		t.Fatalf("statement after catalog change = %v, want ErrTransactionConflict", err)
+	if err != nil {
+		t.Fatalf("statement after unrelated catalog change: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("statement after unrelated catalog change count = %d, want 0", count)
+	}
+}
+
+func TestReadCommittedDirtyParticipantSurvivesUnrelatedDDL(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelReadCommitted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO docs (id) VALUES ('pending')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE unrelated (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit after unrelated DDL: %v", err)
+	}
+	var count int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("committed row count = %d, want 1", count)
 	}
 }
 
@@ -759,9 +1041,237 @@ func TestReadCommittedPlainExplainUsesStatementCatalogFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = tx.QueryRow(`EXPLAIN SELECT id FROM docs`).Scan(&plan)
-	if !errors.Is(err, ErrTransactionConflict) {
-		t.Fatalf("plain EXPLAIN after catalog change = %v, want ErrTransactionConflict", err)
+	if err != nil {
+		t.Fatalf("plain EXPLAIN after unrelated catalog change: %v", err)
 	}
+}
+
+func TestReadCommittedPlainExplainRejectsReferencedReplacement(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelReadCommitted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var plan string
+	if err := tx.QueryRow(`EXPLAIN SELECT id FROM docs`).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	err = tx.QueryRow(`EXPLAIN SELECT id FROM docs`).Scan(&plan)
+	if !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("plain EXPLAIN after table replacement = %v, want ErrTransactionConflict", err)
+	}
+}
+
+func TestReadCommittedReferencedLayoutChangesFailClosed(t *testing.T) {
+	t.Run("table incarnation before first dependency", func(t *testing.T) {
+		db := openTestDB(t)
+		if _, err := db.Exec(
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+			Isolation: stdsql.LevelReadCommitted,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var count int64
+		err = tx.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count)
+		if !errors.Is(err, ErrTransactionConflict) {
+			t.Fatalf("first dependency after table replacement = %v, want ErrTransactionConflict", err)
+		}
+	})
+
+	t.Run("table incarnation", func(t *testing.T) {
+		db := openTestDB(t)
+		if _, err := db.Exec(
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO docs (id) VALUES ('old')`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+			Isolation: stdsql.LevelReadCommitted,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if got := isolationCount(t, tx); got != 1 {
+			t.Fatalf("initial count = %d, want 1", got)
+		}
+		if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var count int64
+		err = tx.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count)
+		if !errors.Is(err, ErrTransactionConflict) {
+			t.Fatalf("replaced table query = %v, want ErrTransactionConflict", err)
+		}
+	})
+
+	t.Run("view generation before first dependency", func(t *testing.T) {
+		db := openTestDB(t)
+		for _, statement := range []string{
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+			`CREATE VIEW selected AS SELECT id FROM docs`,
+		} {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+			Isolation: stdsql.LevelReadCommitted,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := db.Exec(`DROP VIEW selected`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			`CREATE VIEW selected AS SELECT id FROM docs`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var id string
+		err = tx.QueryRow(`SELECT id FROM selected`).Scan(&id)
+		if !errors.Is(err, ErrViewChanged) {
+			t.Fatalf("first dependency after view replacement = %v, want ErrViewChanged", err)
+		}
+	})
+
+	t.Run("view generation", func(t *testing.T) {
+		db := openTestDB(t)
+		for _, statement := range []string{
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+			`INSERT INTO docs (id) VALUES ('kept')`,
+			`CREATE VIEW selected AS SELECT id FROM docs`,
+		} {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+			Isolation: stdsql.LevelReadCommitted,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var id string
+		if err := tx.QueryRow(`SELECT id FROM selected`).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DROP VIEW selected`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			`CREATE VIEW selected AS SELECT id FROM docs`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		err = tx.QueryRow(`SELECT id FROM selected`).Scan(&id)
+		if !errors.Is(err, ErrViewChanged) {
+			t.Fatalf("replaced view query = %v, want ErrViewChanged", err)
+		}
+	})
+
+	t.Run("source-independent view generation", func(t *testing.T) {
+		db := openTestDB(t)
+		if _, err := db.Exec(
+			`CREATE VIEW selected AS SELECT 'old' AS value`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+			Isolation: stdsql.LevelReadCommitted,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var value string
+		if err := tx.QueryRow(`SELECT value FROM selected`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "old" {
+			t.Fatalf("initial value = %q, want old", value)
+		}
+		if _, err := db.Exec(`DROP VIEW selected`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			`CREATE VIEW selected AS SELECT 'new' AS value`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		err = tx.QueryRow(`SELECT value FROM selected`).Scan(&value)
+		if !errors.Is(err, ErrViewChanged) {
+			t.Fatalf("replaced constant view query = %v, want ErrViewChanged", err)
+		}
+	})
+
+	t.Run("dirty participant", func(t *testing.T) {
+		db := openTestDB(t)
+		if _, err := db.Exec(
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+			Isolation: stdsql.LevelReadCommitted,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO docs (id) VALUES ('pending')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DROP TABLE docs`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			`CREATE TABLE docs (id STRING PRIMARY KEY)`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); !errors.Is(err, ErrTransactionConflict) {
+			t.Fatalf("commit after target replacement = %v, want ErrTransactionConflict", err)
+		}
+	})
 }
 
 func TestPreparedPointPlanRevalidatesPrimaryKeyAfterRecreate(t *testing.T) {

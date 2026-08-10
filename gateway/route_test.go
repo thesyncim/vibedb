@@ -82,8 +82,8 @@ func TestRouteGlue(t *testing.T) {
 }
 
 // TestRouteCarriesShardCoordinates proves a scatter route resolves each target's
-// endpoint to an address and carries that target's ownership epoch and shard id,
-// in keyspace order, into the per-shard request.
+// endpoint to an address and carries that target's allocation generation,
+// ownership epoch, and shard id in keyspace order into the per-shard request.
 func TestRouteCarriesShardCoordinates(t *testing.T) {
 	snap := testSnapshot(t, 1)
 	e := newRouteExecutor(t, snap)
@@ -95,12 +95,13 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 		t.Fatalf("scatter reason = %v, want UnknownRoute", pl.scatter)
 	}
 	want := []struct {
-		shard distribution.ShardID
-		epoch distribution.OwnershipEpoch
-		addr  string
+		shard      distribution.ShardID
+		allocation distribution.ShardAllocationGeneration
+		epoch      distribution.OwnershipEpoch
+		addr       string
 	}{
-		{"-80", 7, "127.0.0.1:7001"},
-		{"80-", 9, "127.0.0.1:7002"},
+		{"-80", 1, 7, "127.0.0.1:7001"},
+		{"80-", 2, 9, "127.0.0.1:7002"},
 	}
 	if len(pl.calls) != len(want) {
 		t.Fatalf("calls = %d, want %d", len(pl.calls), len(want))
@@ -109,6 +110,9 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 		c := pl.calls[i]
 		if c.target.Shard != w.shard || c.req.Shard != w.shard {
 			t.Fatalf("call %d shard = %q/%q, want %q", i, c.target.Shard, c.req.Shard, w.shard)
+		}
+		if c.req.AllocationGeneration != w.allocation {
+			t.Fatalf("call %d allocation = %d, want %d", i, c.req.AllocationGeneration, w.allocation)
 		}
 		if c.req.OwnershipEpoch != w.epoch {
 			t.Fatalf("call %d epoch = %d, want %d", i, c.req.OwnershipEpoch, w.epoch)

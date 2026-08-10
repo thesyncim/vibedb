@@ -1147,12 +1147,12 @@ func TestTransactionOversizedValuesNeverEnterPendingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection.tx = rolledBack
-	rolledState := rolledBack.tables["docs"]
 	if _, err := rolledBack.execMutation(
 		insert, []any{tooLarge},
 	); !errors.Is(err, durable.ErrDocumentTooLarge) {
 		t.Fatalf("rollback oversized INSERT = %v, want ErrDocumentTooLarge", err)
 	}
+	rolledState := rolledBack.tables["docs"]
 	assertEmptyTransactionPending(t, rolledState)
 	if err := rolledBack.Rollback(); err != nil {
 		t.Fatal(err)
@@ -1356,6 +1356,14 @@ func beginRawDocsTransaction(
 		t.Fatal(err)
 	}
 	connection.tx = transaction
+	if err := transaction.refreshStatementCut(
+		context.Background(), "docs",
+		[]physicalDependency{{name: "docs"}}, nil,
+	); err != nil {
+		_ = transaction.Rollback()
+		_ = database.close()
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		if !transaction.done {
 			_ = transaction.Rollback()

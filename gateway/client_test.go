@@ -16,20 +16,21 @@ import (
 // testOwnership is the static identity the in-process shard server adopts; every
 // owned request must carry these coordinates to be admitted.
 func testOwnership() shardservice.Ownership {
-	return shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", Epoch: 7, RoutingVersion: 3}
+	return shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", AllocationGeneration: 1, Epoch: 7, RoutingVersion: 3}
 }
 
 // ownedReq builds a request that admits against testOwnership.
 func ownedReq(sql string, params ...shardservice.Param) *shardservice.ShardRequest {
 	own := testOwnership()
 	return &shardservice.ShardRequest{
-		SQL:            sql,
-		Params:         params,
-		Distribution:   own.Distribution,
-		Shard:          own.Shard,
-		RoutingVersion: own.RoutingVersion,
-		OwnershipEpoch: own.Epoch,
-		ExecutionMode:  shardservice.ExecutionReadWrite,
+		SQL:                  sql,
+		Params:               params,
+		Distribution:         own.Distribution,
+		Shard:                own.Shard,
+		AllocationGeneration: own.AllocationGeneration,
+		RoutingVersion:       own.RoutingVersion,
+		OwnershipEpoch:       own.Epoch,
+		ExecutionMode:        shardservice.ExecutionReadWrite,
 	}
 }
 
@@ -104,7 +105,7 @@ func TestClientRoundTrip(t *testing.T) {
 
 // TestClientErrorMapping proves each admission refusal returns a typed
 // *ShardError whose Unwrap matches the expected sentinel — the distribution
-// ownership sentinels for these three kinds.
+// ownership sentinels for these routing-fence kinds.
 func TestClientErrorMapping(t *testing.T) {
 	c := pipeClient(newShardServer(t))
 	ctx := context.Background()
@@ -117,6 +118,7 @@ func TestClientErrorMapping(t *testing.T) {
 	}{
 		{"wrong_distribution", func(r *shardservice.ShardRequest) { r.Distribution = "other" }, shardservice.ErrorNotOwner, distribution.ErrNotShardOwner},
 		{"wrong_shard", func(r *shardservice.ShardRequest) { r.Shard = "80-" }, shardservice.ErrorNotOwner, distribution.ErrNotShardOwner},
+		{"stale_allocation", func(r *shardservice.ShardRequest) { r.AllocationGeneration++ }, shardservice.ErrorShardAllocation, distribution.ErrShardAllocation},
 		{"stale_routing_version", func(r *shardservice.ShardRequest) { r.RoutingVersion = 99 }, shardservice.ErrorRoutingVersion, distribution.ErrRoutingVersion},
 		{"stale_epoch", func(r *shardservice.ShardRequest) { r.OwnershipEpoch = 99 }, shardservice.ErrorOwnershipEpoch, distribution.ErrOwnershipEpoch},
 		{"session_position_unsupported", func(r *shardservice.ShardRequest) { r.ReadPolicy = shardservice.ReadSession }, shardservice.ErrorPositionUnsupported, ErrPositionUnsupported},

@@ -14,15 +14,18 @@ func compositeFastPathBinding(t *testing.T) *placementBinding {
 	second[0] = 0xaa
 	manifest, err := distribution.NewManifest("d", 17, []distribution.Shard{
 		{
-			ID: "s0", Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: first}},
+			ID: "s0", AllocationGeneration: 1,
+			Range:   distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: first}},
 			Leaders: []distribution.EndpointID{"ep-0a", "ep-0b"}, Epoch: 101,
 		},
 		{
-			ID: "s1", Range: distribution.KeyRange{Start: first, End: distribution.KeyspaceEnd{Point: second}},
+			ID: "s1", AllocationGeneration: 2,
+			Range:   distribution.KeyRange{Start: first, End: distribution.KeyspaceEnd{Point: second}},
 			Leaders: []distribution.EndpointID{"ep-1"}, Epoch: 202,
 		},
 		{
-			ID: "s2", Range: distribution.KeyRange{Start: second, End: distribution.KeyspaceEnd{Max: true}},
+			ID: "s2", AllocationGeneration: 3,
+			Range:   distribution.KeyRange{Start: second, End: distribution.KeyspaceEnd{Max: true}},
 			Leaders: []distribution.EndpointID{"ep-2"}, Epoch: 303,
 		},
 	})

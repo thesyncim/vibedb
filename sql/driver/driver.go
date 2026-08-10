@@ -506,7 +506,18 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 					s.query.Release()
 					return nil, lockErr
 				}
-				t := c.db.tables[s.query.Collection()]
+				var t *table
+				if c.tx != nil {
+					if layout, exists := c.tx.tableLayoutAtBegin(
+						s.query.Collection(),
+					); exists {
+						t = layout.incarnation
+					} else {
+						t = c.db.tables[s.query.Collection()]
+					}
+				} else {
+					t = c.db.tables[s.query.Collection()]
+				}
 				if t != nil {
 					s.pointPredicate = s.query.DrivingPredicate()
 					s.pointPath, s.pointCandidate = primaryPredicateIdentity(

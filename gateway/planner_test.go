@@ -366,10 +366,10 @@ func TestCompactPlannerDirectory(t *testing.T) {
 	// Every placement key is a view into one flat backing arena and shares the
 	// interned column spelling. Adjacent one-column slices therefore have
 	// adjacent element addresses.
-	if &snap.Placements[0].Columns[0] == &snap.Placements[1].Columns[0] {
+	if &snap.config.Placements[0].Columns[0] == &snap.config.Placements[1].Columns[0] {
 		t.Fatal("distinct column slots unexpectedly alias")
 	}
-	if snap.Placements[0].Columns[0] != snap.Placements[1].Columns[0] {
+	if snap.config.Placements[0].Columns[0] != snap.config.Placements[1].Columns[0] {
 		t.Fatal("interned placement column spellings differ")
 	}
 }

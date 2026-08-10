@@ -236,10 +236,12 @@ func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snap
 }
 
 // isStaleErr reports whether err is a shard's refusal of the pinned generation:
-// a stale routing version, a mismatched ownership epoch, or a not-owner refusal
-// after ownership moved. Each is retryable only against a newer generation.
+// a stale physical allocation, routing version, ownership epoch, or not-owner
+// refusal after ownership moved. Each is retryable only against a newer
+// generation.
 func isStaleErr(err error) bool {
 	return errors.Is(err, distribution.ErrRoutingVersion) ||
+		errors.Is(err, distribution.ErrShardAllocation) ||
 		errors.Is(err, distribution.ErrOwnershipEpoch) ||
 		errors.Is(err, distribution.ErrNotShardOwner)
 }

@@ -96,6 +96,59 @@ type table struct {
 	conflicts  txConflictClock
 }
 
+// transactionTableLayout is the immutable part of one table incarnation that
+// a transaction used to copy eagerly at BEGIN. Keeping it in the shared layout
+// epoch lets Read Committed materialize only statement dependencies while
+// retaining the exact primary-key, schema, admission, and incarnation identity
+// that existed when the transaction began.
+type transactionTableLayout struct {
+	incarnation *table
+	primaryKey  string
+	primary     vibejson.CompiledPointer
+	schema      *store.Schema
+	limits      durable.Options
+	limitsErr   error
+}
+
+// catalogLayoutEpoch is an immutable in-process catalog/layout generation.
+// Transactions retain one pointer instead of copying every table and view at
+// BEGIN. DDL is the cold copy-on-publish boundary: table layouts and the view
+// generation map are rebuilt once and then never mutated. Pointer identity has
+// no counter to wrap and no wall-clock dependency.
+type catalogLayoutEpoch struct {
+	generation byte
+	tables     map[string]transactionTableLayout
+	views      map[string]*viewMeta
+}
+
+func newCatalogLayoutEpoch(
+	tables map[string]*table,
+	views map[string]*viewMeta,
+) *catalogLayoutEpoch {
+	epoch := &catalogLayoutEpoch{generation: 1}
+	if len(tables) != 0 {
+		epoch.tables = make(map[string]transactionTableLayout, len(tables))
+		for name, table := range tables {
+			limits, err := tableMutationLimits(table)
+			epoch.tables[name] = transactionTableLayout{
+				incarnation: table,
+				primaryKey:  table.meta.PrimaryKey,
+				primary:     table.primary,
+				schema:      table.schema,
+				limits:      limits,
+				limitsErr:   err,
+			}
+		}
+	}
+	if len(views) != 0 {
+		epoch.views = make(map[string]*viewMeta, len(views))
+		for name, meta := range views {
+			epoch.views[name] = meta
+		}
+	}
+	return epoch
+}
+
 // retiredTable keeps the physical resources of a dropped or replaced table
 // incarnation alive until the durable collection can close. Existing SQL
 // cursors and transactions may still hold generation leases after the catalog
@@ -140,6 +193,14 @@ type database struct {
 	// OpenCluster facade. It is nil for the default single-store driver, whose
 	// write path is unchanged.
 	cluster *clusterRouting
+	// layoutEpoch changes whenever a retained table, view, or index layout
+	// publication can affect prepared dependency identity. It is protected by
+	// mu and deliberately independent of durable data generations.
+	layoutEpoch *catalogLayoutEpoch
+}
+
+func (d *database) advanceLayoutEpochLocked() {
+	d.layoutEpoch = newCatalogLayoutEpoch(d.tables, d.catalog.Views)
 }
 
 func openDatabase(path string) (*database, error) {
@@ -171,7 +232,8 @@ func openDatabaseWithSync(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
-		txnLimits: defaultDriverTxnLimits(),
+		layoutEpoch: newCatalogLayoutEpoch(nil, nil),
+		txnLimits:   defaultDriverTxnLimits(),
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -368,6 +430,9 @@ func openDatabaseWithSync(
 			)
 		}
 	}
+	// Publish the first immutable in-process layout only after catalog recovery,
+	// durable opens, and any index-mirror repair have all completed.
+	d.advanceLayoutEpochLocked()
 	opened = true
 	return d, nil
 }
@@ -1235,6 +1300,11 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	t.file, t.collection = file, collection
 	t.meta.Materialized = true
 	d.catalogWritePending = true
+	// First materialization changes the readable physical layout while retaining
+	// the same logical table object. Dependency-scoped Read Committed capture
+	// resolves that object directly, while the epoch records the retained
+	// nil-to-live transition for catalog-generation fencing.
+	d.advanceLayoutEpochLocked()
 	if err := d.settleCatalogLocked(); err != nil {
 		return t, err
 	}

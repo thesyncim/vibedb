@@ -162,6 +162,7 @@ func TestPositionWireStrictValidation(t *testing.T) {
 	body.str("")
 	body.u64(0)
 	body.u64(0)
+	body.u64(0)
 	body.u8(uint8(ReadStrong))
 	body.u8(uint8(ExecutionReadOnly))
 	body.u64(0)

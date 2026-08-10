@@ -83,6 +83,9 @@ type tx struct {
 	conn               *conn
 	tables             map[string]*txTable
 	views              map[string]*viewMeta
+	layoutEpoch        *catalogLayoutEpoch
+	refreshStates      []*txTable
+	refreshStaged      map[string]*txTable
 	savepoints         []savepointFrame
 	readOnly           bool
 	isolation          IsolationLevel
@@ -107,8 +110,7 @@ func (c *conn) beginTx(
 		return nil, err
 	}
 	transaction := &tx{
-		conn: c, tables: make(map[string]*txTable),
-		readOnly: options.ReadOnly, isolation: isolation,
+		conn: c, readOnly: options.ReadOnly, isolation: isolation,
 	}
 	if err := lockContext(ctx, &c.db.mu); err != nil {
 		return nil, err
@@ -117,34 +119,30 @@ func (c *conn) beginTx(
 	if c.db.closed {
 		return nil, sqldriver.ErrBadConn
 	}
-	if len(c.db.catalog.Views) != 0 {
-		transaction.views = make(map[string]*viewMeta, len(c.db.catalog.Views))
-		for name, meta := range c.db.catalog.Views {
-			transaction.views[name] = meta
+	transaction.layoutEpoch = c.db.layoutEpoch
+	transaction.views = transaction.layoutEpoch.views
+	if isolation == IsolationReadCommitted {
+		// Read Committed owns no table leases, overlays, or conflict-clock
+		// registrations until a statement names a physical dependency. The
+		// immutable layout epoch above is the complete O(1) BEGIN fence.
+		if err := contextCheckpoint(ctx); err != nil {
+			return nil, err
 		}
+		return transaction, nil
 	}
-	for name, table := range c.db.tables {
+	transaction.tables = make(map[string]*txTable, len(transaction.layoutEpoch.tables))
+	for name, layout := range transaction.layoutEpoch.tables {
 		if err := contextCheckpoint(ctx); err != nil {
 			transaction.releaseSnapshots()
 			return nil, err
 		}
-		limits, err := tableMutationLimits(table)
+		state, err := newTransactionTableState(name, layout, true)
 		if err != nil {
 			transaction.releaseSnapshots()
 			return nil, err
 		}
-		state := &txTable{
-			name:        name,
-			incarnation: table,
-			pending:     make(map[string]*txMutation),
-			primaryKey:  table.meta.PrimaryKey,
-			primary:     table.primary,
-			schema:      table.schema,
-			limits:      limits,
-		}
-		state.overlaySource = query.NewFileOverlaySource(state)
-		if table.collection != nil {
-			snapshot, err := table.collection.Snapshot()
+		if layout.incarnation.collection != nil {
+			snapshot, err := layout.incarnation.collection.Snapshot()
 			if err != nil {
 				transaction.releaseSnapshots()
 				return nil, err
@@ -152,7 +150,7 @@ func (c *conn) beginTx(
 			state.snapshot = snapshot
 		}
 		if !options.ReadOnly {
-			state.conflicts = &table.conflicts
+			state.conflicts = &layout.incarnation.conflicts
 		}
 		transaction.tables[name] = state
 	}
@@ -170,6 +168,51 @@ func (c *conn) beginTx(
 		}
 	}
 	return transaction, nil
+}
+
+func newTransactionTableState(
+	name string,
+	layout transactionTableLayout,
+	allocatePending bool,
+) (*txTable, error) {
+	if layout.limitsErr != nil {
+		return nil, layout.limitsErr
+	}
+	state := &txTable{
+		name:        name,
+		incarnation: layout.incarnation,
+		primaryKey:  layout.primaryKey,
+		primary:     layout.primary,
+		schema:      layout.schema,
+		limits:      layout.limits,
+	}
+	if allocatePending {
+		state.pending = make(map[string]*txMutation)
+	}
+	state.overlaySource = query.NewFileOverlaySource(state)
+	return state, nil
+}
+
+func (t *tx) tableLayoutAtBegin(
+	name string,
+) (transactionTableLayout, bool) {
+	if t == nil {
+		return transactionTableLayout{}, false
+	}
+	if state := t.tables[name]; state != nil {
+		return transactionTableLayout{
+			incarnation: state.incarnation,
+			primaryKey:  state.primaryKey,
+			primary:     state.primary,
+			schema:      state.schema,
+			limits:      state.limits,
+		}, true
+	}
+	if t.layoutEpoch == nil {
+		return transactionTableLayout{}, false
+	}
+	layout, ok := t.layoutEpoch.tables[name]
+	return layout, ok
 }
 
 func runtimeIsolationLevel(level sqldriver.IsolationLevel) (IsolationLevel, error) {
@@ -199,14 +242,18 @@ func driverIsolationLevel(level IsolationLevel) (sqldriver.IsolationLevel, error
 	}
 }
 
-// refreshStatementCut replaces only the committed base of every transaction
-// table. Pending mutations and savepoint marks remain attached to txTable, so
-// Read Committed sees a fresh coherent catalog cut without losing its overlay.
-// Catalog shape and storage identities are deliberately fail-closed: prepared
-// metadata cannot be rebound safely in the middle of a transaction. Every new
-// lease is captured into reusable staging first; cancellation or capture
-// failure closes staging and leaves the active cut completely untouched.
-func (t *tx) refreshStatementCut(ctx context.Context) error {
+// refreshStatementCut replaces only the committed bases in one statement's
+// executable physical dependency closure. Pending mutations and savepoint
+// marks remain attached to txTable, so Read Committed sees a fresh coherent cut
+// without losing its overlay. Every selected lease is staged under db.mu and
+// swapped only after the complete capture and final cancellation check; a
+// failure closes staging and leaves every active cut untouched.
+func (t *tx) refreshStatementCut(
+	ctx context.Context,
+	root string,
+	dependencies []physicalDependency,
+	viewDependencies []viewDependency,
+) error {
 	if t.isolation != IsolationReadCommitted {
 		return nil
 	}
@@ -225,69 +272,104 @@ func (t *tx) refreshStatementCut(ctx context.Context) error {
 		db.mu.Unlock()
 		return err
 	}
-	if len(db.tables) != len(t.tables) || len(db.catalog.Views) != len(t.views) {
+	fail := func(primary error) error {
+		cleanupErr := t.closeRefreshSnapshots()
 		db.mu.Unlock()
-		return fmt.Errorf(
-			"%w: catalog shape changed during a READ COMMITTED transaction",
-			ErrTransactionConflict,
-		)
+		return joinRefreshError(primary, cleanupErr)
 	}
-	for name, state := range t.tables {
-		if db.tables[name] != state.incarnation {
-			db.mu.Unlock()
+	if db.layoutEpoch != t.layoutEpoch {
+		for i := range viewDependencies {
+			dependency := &viewDependencies[i]
+			if t.views[dependency.name] != dependency.meta ||
+				db.catalog.Views[dependency.name] != dependency.meta {
+				return fail(&viewDependencyError{
+					name: dependency.name, pos: dependency.pos,
+					transaction: true,
+				})
+			}
+		}
+	}
+
+	position := func(name string) int {
+		for i := range dependencies {
+			if dependencies[i].name == name {
+				return dependencies[i].pos
+			}
+		}
+		return 0
+	}
+	capture := func(name string, pos int) error {
+		if name == "" {
+			return nil
+		}
+		state := t.tables[name]
+		if state == nil {
+			state = t.refreshStaged[name]
+		}
+		if state == nil {
+			layout, exists := t.tableLayoutAtBegin(name)
+			if !exists {
+				return missingTableDependency(name, pos, true)
+			}
+			var err error
+			state, err = newTransactionTableState(name, layout, !t.readOnly)
+			if err != nil {
+				return err
+			}
+			if !t.readOnly {
+				state.conflicts = &layout.incarnation.conflicts
+			}
+			if t.refreshStaged == nil {
+				t.refreshStaged = make(map[string]*txTable)
+			}
+			t.refreshStaged[name] = state
+		}
+		if state.refreshCaptured {
+			return nil
+		}
+		current := db.tables[name]
+		if current == nil || current != state.incarnation {
 			return fmt.Errorf(
 				"%w: table %q was dropped or replaced during a READ COMMITTED transaction",
 				ErrTransactionConflict, name,
 			)
 		}
-	}
-	for name, meta := range t.views {
-		if db.catalog.Views[name] != meta {
-			db.mu.Unlock()
-			return fmt.Errorf(
-				"%w: view %q changed during a READ COMMITTED transaction",
-				ErrTransactionConflict, name,
-			)
-		}
-	}
-
-	for name, state := range t.tables {
 		if err := contextCheckpoint(ctx); err != nil {
-			cleanupErr := t.closeRefreshSnapshots()
-			db.mu.Unlock()
-			return joinRefreshError(err, cleanupErr)
+			return err
 		}
-		collection := db.tables[name].collection
+		collection := current.collection
 		if collection == nil {
 			if state.snapshot != nil {
-				cleanupErr := t.closeRefreshSnapshots()
-				db.mu.Unlock()
-				return joinRefreshError(fmt.Errorf(
+				return fmt.Errorf(
 					"%w: table %q lost its storage incarnation during a READ COMMITTED transaction",
 					ErrTransactionConflict, name,
-				), cleanupErr)
+				)
 			}
-			continue
-		}
-		if state.refreshSnapshot == nil {
-			state.refreshSnapshot = new(durable.Snapshot)
-		}
-		if err := collection.SnapshotInto(state.refreshSnapshot); err != nil {
-			cleanupErr := t.closeRefreshSnapshots()
-			db.mu.Unlock()
-			return joinRefreshError(err, cleanupErr)
+		} else {
+			if state.refreshSnapshot == nil {
+				state.refreshSnapshot = new(durable.Snapshot)
+			}
+			if err := collection.SnapshotInto(state.refreshSnapshot); err != nil {
+				return err
+			}
 		}
 		state.refreshCaptured = true
+		t.refreshStates = append(t.refreshStates, state)
+		return nil
+	}
+	if err := capture(root, position(root)); err != nil {
+		return fail(err)
+	}
+	for i := range dependencies {
+		dependency := &dependencies[i]
+		if err := capture(dependency.name, dependency.pos); err != nil {
+			return fail(err)
+		}
 	}
 	if err := contextCheckpoint(ctx); err != nil {
-		cleanupErr := t.closeRefreshSnapshots()
-		db.mu.Unlock()
-		return joinRefreshError(err, cleanupErr)
+		return fail(err)
 	}
-	for _, state := range t.tables {
-		if !state.refreshCaptured {
-			continue
-		}
+	for _, state := range t.refreshStates {
 		state.snapshot, state.refreshSnapshot =
 			state.refreshSnapshot, state.snapshot
 		state.refreshCaptured = false
@@ -295,15 +377,27 @@ func (t *tx) refreshStatementCut(ctx context.Context) error {
 	// Sample only after the complete cut has installed, while db.mu still
 	// excludes publications. New pending keys inherit this exact statement
 	// observation; existing pending keys retain their earlier revision.
-	for _, state := range t.tables {
-		if state.conflicts != nil {
+	for _, state := range t.refreshStates {
+		if t.tables[state.name] == nil {
+			if t.tables == nil {
+				t.tables = make(map[string]*txTable)
+			}
+			if state.conflicts != nil {
+				state.conflictRevision = state.conflicts.begin()
+				state.statementRevision = state.conflictRevision
+			}
+			t.tables[state.name] = state
+			t.attachTableToSavepoints(state)
+		} else if state.conflicts != nil {
 			state.statementRevision = state.conflicts.observe()
 		}
 	}
+	clear(t.refreshStaged)
 	db.mu.Unlock()
 	var closeErr error
-	for _, state := range t.tables {
+	for i, state := range t.refreshStates {
 		if state.refreshSnapshot == nil {
+			t.refreshStates[i] = nil
 			continue
 		}
 		if err := state.refreshSnapshot.Close(); err != nil {
@@ -313,25 +407,33 @@ func (t *tx) refreshStatementCut(ctx context.Context) error {
 				closeErr = errors.Join(closeErr, err)
 			}
 		}
+		t.refreshStates[i] = nil
 	}
+	t.refreshStates = t.refreshStates[:0]
 	return closeErr
 }
 
 func (t *tx) closeRefreshSnapshots() error {
 	var closeErr error
-	for _, state := range t.tables {
+	for i, state := range t.refreshStates {
 		if !state.refreshCaptured {
+			t.refreshStates[i] = nil
 			continue
 		}
 		state.refreshCaptured = false
-		if err := state.refreshSnapshot.Close(); err != nil {
-			if closeErr == nil {
-				closeErr = err
-			} else {
-				closeErr = errors.Join(closeErr, err)
+		if state.refreshSnapshot != nil {
+			if err := state.refreshSnapshot.Close(); err != nil {
+				if closeErr == nil {
+					closeErr = err
+				} else {
+					closeErr = errors.Join(closeErr, err)
+				}
 			}
 		}
+		t.refreshStates[i] = nil
 	}
+	t.refreshStates = t.refreshStates[:0]
+	clear(t.refreshStaged)
 	return closeErr
 }
 
@@ -539,7 +641,21 @@ func serializableScalarHasSubquery(expression *sqlast.ScalarExpr) bool {
 }
 
 func (t *tx) beginQueryStatement(ctx context.Context, statement *stmt) error {
-	if err := t.refreshStatementCut(ctx); err != nil {
+	var (
+		root  string
+		views []viewDependency
+	)
+	if statement != nil {
+		if statement.query != nil {
+			root = statement.query.Collection()
+		}
+		if statement.views != nil {
+			views = statement.views.dependencies
+		}
+	}
+	if err := t.refreshStatementCut(
+		ctx, root, statementDependencies(statement), views,
+	); err != nil {
 		return err
 	}
 	if t.isolation != IsolationSerializable || statement == nil {
@@ -567,7 +683,30 @@ func (t *tx) beginMutationStatement(
 	statement *query.DMLStatement,
 	prepared *stmt,
 ) error {
-	if err := t.refreshStatementCut(ctx); err != nil {
+	var (
+		root         string
+		dependencies []physicalDependency
+		views        []viewDependency
+	)
+	if statement != nil {
+		switch statement.Kind() {
+		case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable,
+			query.DDLTruncate, query.DDLDropIndex:
+		default:
+			root = statement.Collection()
+			if prepared != nil {
+				dependencies = prepared.dependencies
+			} else {
+				dependencies = dmlExecutablePhysicalDependencies(statement.Tree())
+			}
+		}
+	}
+	if prepared != nil && prepared.views != nil {
+		views = prepared.views.dependencies
+	}
+	if err := t.refreshStatementCut(
+		ctx, root, dependencies, views,
+	); err != nil {
 		return err
 	}
 	if t.isolation != IsolationSerializable || statement == nil {
@@ -595,6 +734,13 @@ func (t *tx) beginMutationStatement(
 		}
 	}
 	return nil
+}
+
+func statementDependencies(statement *stmt) []physicalDependency {
+	if statement == nil {
+		return nil
+	}
+	return statement.dependencies
 }
 
 // serializablePointMutation recognizes target reads whose complete logical
@@ -692,9 +838,10 @@ func (t *tx) querySource(tableName string) (query.Source, error) {
 		return query.FromFileOverlay(state.snapshot, &state.overlaySource), nil
 	}
 
-	// A table without a durable file was empty at BEGIN. Its transaction view
-	// therefore consists only of the bounded pending set. Refill one retained
-	// Segment rather than allocate a heap Collection on every read.
+	// A table without a durable file was empty at the selected isolation cut.
+	// Its transaction view therefore consists only of the bounded pending set.
+	// Refill one retained Segment rather than allocate a heap Collection on
+	// every read.
 	state.emptyDocs.Reset()
 	for _, key := range state.order {
 		mutation := state.pending[key]
@@ -1513,7 +1660,7 @@ func admitTransactionSelection(
 }
 
 // transactionMatchBudget applies the transaction's distinct-key and byte
-// admission while a filtered mutation is still streaming its BEGIN snapshot.
+// admission while a filtered mutation is still streaming its isolation cut.
 // Existing pending entries are replacements rather than additional keys, and
 // their prior value bytes stop counting exactly as they will in execMutation's
 // final admission pass.
@@ -1881,7 +2028,8 @@ func stateHasDirtyOverlay(state *txTable) bool {
 		if entry == nil {
 			continue
 		}
-		// INSERT+DELETE of a key absent at BEGIN is a net no-op and must not
+		// INSERT+DELETE of a key absent at its first statement observation is a
+		// net no-op and must not
 		// force a durable participant.
 		if !entry.existed && entry.remove {
 			continue
@@ -1961,9 +2109,9 @@ func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
 func fillWriteBatchFromTxTable(batch *durable.WriteBatch, state *txTable) error {
 	for _, key := range state.order {
 		entry := state.pending[key]
-		// INSERT followed by DELETE in one transaction is a net no-op for
-		// a key absent at BEGIN. Do not make another transaction conflict
-		// with an event that was never published.
+		// INSERT followed by DELETE in one transaction is a net no-op for a key
+		// absent at its first statement observation. Do not make another
+		// transaction conflict with an event that was never published.
 		if !entry.existed && entry.remove {
 			continue
 		}
@@ -1978,11 +2126,12 @@ func fillWriteBatchFromTxTable(batch *durable.WriteBatch, state *txTable) error 
 	return nil
 }
 
-// validateWriteSet enforces optimistic-concurrency: every key the transaction
-// touched must still hold the value it held at BEGIN, otherwise a concurrent
-// commit changed it and this transaction must abort. It reads a fresh snapshot
-// of the currently committed state; the caller runs under db.mu, so that state
-// is stable for the duration of the check and the subsequent apply.
+// validateWriteSet enforces optimistic concurrency: every key the transaction
+// touched must still have the existence it had at its first statement
+// observation, otherwise a concurrent commit changed it and this transaction
+// must abort. It reads a fresh snapshot of the currently committed state; the
+// caller runs under db.mu, so that state is stable for the duration of the
+// check and the subsequent apply.
 func (t *tx) validateWriteSet(
 	collection *durable.Collection, tableName string, state *txTable,
 ) error {
@@ -2054,6 +2203,9 @@ func (t *tx) finish() {
 	t.conn = nil
 	t.tables = nil
 	t.views = nil
+	t.layoutEpoch = nil
+	t.refreshStates = nil
+	t.refreshStaged = nil
 	t.savepoints = nil
 }
 
@@ -2069,4 +2221,7 @@ func (t *tx) releaseSnapshots() {
 		}
 		table.refreshCaptured = false
 	}
+	clear(t.refreshStates)
+	t.refreshStates = t.refreshStates[:0]
+	clear(t.refreshStaged)
 }

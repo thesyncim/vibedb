@@ -15,10 +15,11 @@ import (
 // testOwner is the static identity every server test configures its shard with.
 func testOwner() Ownership {
 	return Ownership{
-		Distribution:   "tenant_data",
-		Shard:          "-80",
-		Epoch:          7,
-		RoutingVersion: 3,
+		Distribution:         "tenant_data",
+		Shard:                "-80",
+		AllocationGeneration: 1,
+		Epoch:                7,
+		RoutingVersion:       3,
 	}
 }
 
@@ -26,13 +27,14 @@ func testOwner() Ownership {
 func ownedRequest(sql string, params ...Param) *ShardRequest {
 	own := testOwner()
 	return &ShardRequest{
-		SQL:            sql,
-		Params:         params,
-		Distribution:   own.Distribution,
-		Shard:          own.Shard,
-		RoutingVersion: own.RoutingVersion,
-		OwnershipEpoch: own.Epoch,
-		ExecutionMode:  ExecutionReadWrite,
+		SQL:                  sql,
+		Params:               params,
+		Distribution:         own.Distribution,
+		Shard:                own.Shard,
+		AllocationGeneration: own.AllocationGeneration,
+		RoutingVersion:       own.RoutingVersion,
+		OwnershipEpoch:       own.Epoch,
+		ExecutionMode:        ExecutionReadWrite,
 	}
 }
 

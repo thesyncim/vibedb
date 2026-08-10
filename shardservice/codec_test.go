@@ -46,15 +46,16 @@ func TestRequestRoundTrip(t *testing.T) {
 		{
 			name: "select_no_params",
 			req: &ShardRequest{
-				SQL:            "SELECT 1",
-				Distribution:   "tenant_data",
-				Shard:          "-80",
-				RoutingVersion: 7,
-				OwnershipEpoch: 3,
-				ReadPolicy:     ReadStrong,
-				Deadline:       5 * time.Second,
-				MaxResultBytes: 1 << 20,
-				MaxRows:        1000,
+				SQL:                  "SELECT 1",
+				Distribution:         "tenant_data",
+				Shard:                "-80",
+				AllocationGeneration: 5,
+				RoutingVersion:       7,
+				OwnershipEpoch:       3,
+				ReadPolicy:           ReadStrong,
+				Deadline:             5 * time.Second,
+				MaxResultBytes:       1 << 20,
+				MaxRows:              1000,
 			},
 		},
 		{
@@ -69,10 +70,11 @@ func TestRequestRoundTrip(t *testing.T) {
 					StringParam("hello\x00world"),
 					DocumentParam(`{"a":[1,2,3]}`),
 				},
-				Distribution:   "tenant_data",
-				Shard:          "80-",
-				RoutingVersion: 42,
-				OwnershipEpoch: 9,
+				Distribution:         "tenant_data",
+				Shard:                "80-",
+				AllocationGeneration: 6,
+				RoutingVersion:       42,
+				OwnershipEpoch:       9,
 			},
 		},
 		{
@@ -178,13 +180,14 @@ func TestResponseRoundTrip(t *testing.T) {
 // across repeated calls, which the golden vectors depend on.
 func TestEncodeDeterministic(t *testing.T) {
 	req := &ShardRequest{
-		SQL:            "SELECT $1",
-		Params:         []Param{NumberParam("5"), StringParam("k")},
-		Distribution:   "d",
-		Shard:          "s",
-		RoutingVersion: 1,
-		OwnershipEpoch: 2,
-		MaxRows:        10,
+		SQL:                  "SELECT $1",
+		Params:               []Param{NumberParam("5"), StringParam("k")},
+		Distribution:         "d",
+		Shard:                "s",
+		AllocationGeneration: 3,
+		RoutingVersion:       1,
+		OwnershipEpoch:       2,
+		MaxRows:              10,
 	}
 	first := encodeRequest(t, req)
 	for i := 0; i < 8; i++ {
@@ -208,7 +211,7 @@ func rawFrame(tag byte, body []byte) []byte {
 // is rejected with a typed error rather than a panic or a large allocation.
 func TestDecodeRequestMalformed(t *testing.T) {
 	// A minimal valid request body for mutation: version, three empty strings,
-	// two u64 (routing, epoch), policy and execution-mode bytes, three u64
+	// three u64 (allocation, routing, epoch), policy and execution-mode bytes, three u64
 	// (deadline, maxbytes, maxrows), a zero param count, and an absent minimum
 	// position marker.
 	valid := func() []byte {
@@ -217,6 +220,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 		e.str("SELECT 1")
 		e.str("d")
 		e.str("s")
+		e.u64(0)
 		e.u64(0)
 		e.u64(0)
 		e.u8(uint8(ReadStrong))
@@ -269,6 +273,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.str("")
 				e.u64(0)
 				e.u64(0)
+				e.u64(0)
 				e.u8(0x7f) // policy byte out of range
 				e.u8(uint8(ExecutionReadOnly))
 				e.u64(0)
@@ -288,6 +293,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.str("")
 				e.str("")
 				e.str("")
+				e.u64(0)
 				e.u64(0)
 				e.u64(0)
 				e.u8(uint8(ReadStrong))
@@ -311,6 +317,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.str("")
 				e.u64(0)
 				e.u64(0)
+				e.u64(0)
 				e.u8(uint8(ReadStrong))
 				e.u8(uint8(ExecutionReadOnly))
 				e.u64(0)
@@ -329,6 +336,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.str("")
 				e.str("")
 				e.str("")
+				e.u64(0)
 				e.u64(0)
 				e.u64(0)
 				e.u8(uint8(ReadStrong))
@@ -358,6 +366,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 				e.str("")
 				e.str("")
 				e.str("")
+				e.u64(0)
 				e.u64(0)
 				e.u64(0)
 				e.u8(uint8(ReadStrong))
@@ -548,10 +557,11 @@ func TestParamRuntimeValue(t *testing.T) {
 // carries the distribution package's own typed IDs, not private copies.
 func TestReuseDistributionTypes(t *testing.T) {
 	req := &ShardRequest{
-		Distribution:   distribution.DistributionName("d"),
-		Shard:          distribution.ShardID("s"),
-		RoutingVersion: distribution.RoutingVersion(1),
-		OwnershipEpoch: distribution.OwnershipEpoch(1),
+		Distribution:         distribution.DistributionName("d"),
+		Shard:                distribution.ShardID("s"),
+		AllocationGeneration: distribution.ShardAllocationGeneration(1),
+		RoutingVersion:       distribution.RoutingVersion(1),
+		OwnershipEpoch:       distribution.OwnershipEpoch(1),
 	}
 	if req.Distribution != "d" {
 		t.Fatal("distribution type mismatch")

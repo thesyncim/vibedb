@@ -54,6 +54,7 @@ func TestAcceptanceEpochAdmissionNoExecution(t *testing.T) {
 	}{
 		{"wrong_distribution", func(r *ShardRequest) { r.Distribution = "other_tenant" }, ErrorNotOwner},
 		{"wrong_shard", func(r *ShardRequest) { r.Shard = "80-" }, ErrorNotOwner},
+		{"stale_allocation_generation", func(r *ShardRequest) { r.AllocationGeneration-- }, ErrorShardAllocation},
 		{"stale_routing_version", func(r *ShardRequest) { r.RoutingVersion = 2 }, ErrorRoutingVersion},
 		{"stale_epoch", func(r *ShardRequest) { r.OwnershipEpoch = 6 }, ErrorOwnershipEpoch},
 	}
@@ -267,6 +268,7 @@ func TestAcceptanceMalformedFraming(t *testing.T) {
 			e.str("SELECT id FROM docs")
 			e.str(string(own.Distribution))
 			e.str(string(own.Shard))
+			e.u64(uint64(own.AllocationGeneration))
 			e.u64(uint64(own.RoutingVersion))
 			e.u64(uint64(own.Epoch))
 			e.u8(uint8(ReadStrong))
@@ -353,7 +355,7 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 	reqFields := structFieldNames(reflect.TypeOf(ShardRequest{}))
 	assertFieldSet(t, "ShardRequest", reqFields, map[string]bool{
 		"SQL": true, "Params": true, "Distribution": true, "Shard": true,
-		"RoutingVersion": true, "OwnershipEpoch": true,
+		"AllocationGeneration": true, "RoutingVersion": true, "OwnershipEpoch": true,
 		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,

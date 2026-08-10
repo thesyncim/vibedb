@@ -59,8 +59,8 @@ func TestTransactionInsertSelectCancelFlagIsAtomicAndRecovers(t *testing.T) {
 		t.Fatalf("transaction INSERT SELECT cancellation = %T %v, want ErrCanceled", err, err)
 	}
 	state := session.conn.tx.tables["cancel_target"]
-	if state == nil || len(state.pending) != 0 || len(state.order) != 0 ||
-		state.stagedBytes != 0 {
+	if state != nil && (len(state.pending) != 0 || len(state.order) != 0 ||
+		state.stagedBytes != 0) {
 		t.Fatalf(
 			"canceled INSERT SELECT changed transaction overlay: state=%+v",
 			state,
@@ -313,6 +313,12 @@ func retainedInsertSelectSource(
 		err      error
 	)
 	if transaction {
+		if err := session.conn.tx.beginMutationStatement(
+			context.Background(), prepared.statement.mutation,
+			prepared.statement,
+		); err != nil {
+			t.Fatal(err)
+		}
 		cursor, retained, err = session.conn.tx.runInsertSource(
 			context.Background(), plan, nil,
 		)

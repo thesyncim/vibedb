@@ -287,9 +287,9 @@ func TestRouteDedupBeforeProduct(t *testing.T) {
 // wrong narrower target.
 func TestRoutePrefixWidensSubset(t *testing.T) {
 	man := mustManifest(t, []Shard{
-		{ID: "s0", Range: kr(0, hb(0x40)), Leaders: leader("0")},
-		{ID: "s1", Range: kr(hb(0x40), hb(0x80)), Leaders: leader("1")},
-		{ID: "s2", Range: krMax(hb(0x80)), Leaders: leader("2")},
+		{ID: "s0", AllocationGeneration: 1, Range: kr(0, hb(0x40)), Leaders: leader("0")},
+		{ID: "s1", AllocationGeneration: 2, Range: kr(hb(0x40), hb(0x80)), Leaders: leader("1")},
+		{ID: "s2", AllocationGeneration: 3, Range: krMax(hb(0x80)), Leaders: leader("2")},
 	})
 	fullPoint := pt(hb(0x50))                                        // inside s1
 	prefixSpan := KeyRange{Start: pt(hb(0x50)), End: kend(hb(0xc0))} // covers s1 and s2, and contains fullPoint
@@ -487,9 +487,9 @@ func TestRouteAdmissionTruthTable(t *testing.T) {
 // carries the manifest's distribution and routing version.
 func TestRouteClassificationAndTargets(t *testing.T) {
 	man := mustManifest(t, []Shard{
-		{ID: "s0", Range: kr(0, hb(0x80)), Leaders: []EndpointID{"ep-0a", "ep-0b"}, Epoch: 11},
-		{ID: "s1", Range: kr(hb(0x80), hb(0xc0)), Leaders: []EndpointID{"ep-1"}, Epoch: 22},
-		{ID: "s2", Range: krMax(hb(0xc0)), Leaders: []EndpointID{"ep-2"}, Epoch: 33},
+		{ID: "s0", AllocationGeneration: 1, Range: kr(0, hb(0x80)), Leaders: []EndpointID{"ep-0a", "ep-0b"}, Epoch: 11},
+		{ID: "s1", AllocationGeneration: 2, Range: kr(hb(0x80), hb(0xc0)), Leaders: []EndpointID{"ep-1"}, Epoch: 22},
+		{ID: "s2", AllocationGeneration: 3, Range: krMax(hb(0xc0)), Leaders: []EndpointID{"ep-2"}, Epoch: 33},
 	})
 	policy := NewRoutePolicy(AdmissionAllowScatter, RouteLimits{})
 
@@ -509,7 +509,7 @@ func TestRouteClassificationAndTargets(t *testing.T) {
 	if single.Kind != RouteSingle || len(single.Targets) != 1 {
 		t.Fatalf("single: route = %+v, want one RouteSingle target", single)
 	}
-	if got, want := single.Targets[0], (Target{Shard: "s0", Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}); got != want {
+	if got, want := single.Targets[0], (Target{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}); got != want {
 		t.Fatalf("single target = %+v, want %+v", got, want)
 	}
 
@@ -520,8 +520,8 @@ func TestRouteClassificationAndTargets(t *testing.T) {
 		t.Fatalf("targeted: route = %+v, want two RouteTargeted targets", targeted)
 	}
 	want := []Target{
-		{Shard: "s0", Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader},
-		{Shard: "s1", Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader},
+		{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader},
+		{Shard: "s1", AllocationGeneration: 2, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader},
 	}
 	for i := range want {
 		if targeted.Targets[i] != want[i] {

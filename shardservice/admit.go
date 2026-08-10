@@ -38,10 +38,11 @@ var (
 // Ownership is a shard's statically configured identity. PR 4a assigns it at
 // startup; PR 5 advances the epoch during movement.
 type Ownership struct {
-	Distribution   distribution.DistributionName
-	Shard          distribution.ShardID
-	Epoch          distribution.OwnershipEpoch
-	RoutingVersion distribution.RoutingVersion
+	Distribution         distribution.DistributionName
+	Shard                distribution.ShardID
+	AllocationGeneration distribution.ShardAllocationGeneration
+	Epoch                distribution.OwnershipEpoch
+	RoutingVersion       distribution.RoutingVersion
 }
 
 // AdmissionError is the typed refusal Admit returns. Kind selects the wire
@@ -72,6 +73,7 @@ func (e *AdmissionError) Response() *ShardResponse {
 // catalog before reconciling the finer fencing epoch.
 //
 //   - wrong distribution or shard  -> ErrorNotOwner       (ErrNotShardOwner)
+//   - stale shard allocation       -> ErrorShardAllocation (ErrShardAllocation)
 //   - stale routing version        -> ErrorRoutingVersion (ErrRoutingVersion)
 //   - mismatched ownership epoch    -> ErrorOwnershipEpoch (ErrOwnershipEpoch)
 //   - malformed minimum position    -> ErrorMalformedRequest
@@ -85,6 +87,13 @@ func (o Ownership) Admit(req *ShardRequest) error {
 			Kind:     ErrorMalformedRequest,
 			Message:  "shardservice: nil request",
 			sentinel: nil,
+		}
+	}
+	if o.Distribution == "" || o.Shard == "" || o.AllocationGeneration == 0 {
+		return &AdmissionError{
+			Kind:     ErrorNotOwner,
+			Message:  "shardservice: ownership is not configured",
+			sentinel: distribution.ErrNotShardOwner,
 		}
 	}
 	if req.Distribution != o.Distribution {
@@ -103,6 +112,15 @@ func (o Ownership) Admit(req *ShardRequest) error {
 				"shardservice: not owner: request shard %q, this shard serves %q",
 				req.Shard, o.Shard),
 			sentinel: distribution.ErrNotShardOwner,
+		}
+	}
+	if req.AllocationGeneration != o.AllocationGeneration {
+		return &AdmissionError{
+			Kind: ErrorShardAllocation,
+			Message: fmt.Sprintf(
+				"shardservice: shard allocation generation mismatch: request %d, configured %d",
+				req.AllocationGeneration, o.AllocationGeneration),
+			sentinel: distribution.ErrShardAllocation,
 		}
 	}
 	if req.RoutingVersion != o.RoutingVersion {

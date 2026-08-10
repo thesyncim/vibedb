@@ -12,19 +12,21 @@ import (
 // documented typed error and wire kind.
 func TestAdmit(t *testing.T) {
 	owner := Ownership{
-		Distribution:   "tenant_data",
-		Shard:          "-80",
-		Epoch:          7,
-		RoutingVersion: 3,
+		Distribution:         "tenant_data",
+		Shard:                "-80",
+		AllocationGeneration: 11,
+		Epoch:                7,
+		RoutingVersion:       3,
 	}
 	// base is a request that matches owner exactly.
 	base := func() *ShardRequest {
 		return &ShardRequest{
-			SQL:            "SELECT 1",
-			Distribution:   "tenant_data",
-			Shard:          "-80",
-			RoutingVersion: 3,
-			OwnershipEpoch: 7,
+			SQL:                  "SELECT 1",
+			Distribution:         "tenant_data",
+			Shard:                "-80",
+			AllocationGeneration: 11,
+			RoutingVersion:       3,
+			OwnershipEpoch:       7,
 		}
 	}
 
@@ -39,6 +41,12 @@ func TestAdmit(t *testing.T) {
 			mutate:   func(*ShardRequest) {},
 			wantKind: ErrorInvalid,
 			wantIs:   nil,
+		},
+		{
+			name:     "stale_allocation_generation",
+			mutate:   func(r *ShardRequest) { r.AllocationGeneration = 10 },
+			wantKind: ErrorShardAllocation,
+			wantIs:   distribution.ErrShardAllocation,
 		},
 		{
 			name:     "wrong_distribution",
@@ -160,19 +168,26 @@ func TestAdmit(t *testing.T) {
 }
 
 // TestAdmitPrecedence proves the documented outermost-first ordering: when more
-// than one field diverges, identity is reported before generation, and
-// generation before the fencing epoch.
+// than one field diverges, logical identity is reported before physical
+// allocation, allocation before routing generation, and routing before epoch.
 func TestAdmitPrecedence(t *testing.T) {
-	owner := Ownership{Distribution: "d", Shard: "s", Epoch: 5, RoutingVersion: 2}
+	owner := Ownership{Distribution: "d", Shard: "s", AllocationGeneration: 7, Epoch: 5, RoutingVersion: 2}
 
 	// Every field wrong at once: identity (not-owner) must win.
-	all := &ShardRequest{Distribution: "x", Shard: "y", RoutingVersion: 99, OwnershipEpoch: 99}
+	all := &ShardRequest{Distribution: "x", Shard: "y", AllocationGeneration: 99, RoutingVersion: 99, OwnershipEpoch: 99}
 	if err := owner.Admit(all); !errors.Is(err, distribution.ErrNotShardOwner) {
 		t.Fatalf("all-wrong: got %v, want not-owner", err)
 	}
 
-	// Identity correct, both generation and epoch wrong: generation wins.
-	gen := &ShardRequest{Distribution: "d", Shard: "s", RoutingVersion: 99, OwnershipEpoch: 99}
+	// Logical identity correct, but every finer fence wrong: allocation wins.
+	allocation := &ShardRequest{Distribution: "d", Shard: "s", AllocationGeneration: 99, RoutingVersion: 99, OwnershipEpoch: 99}
+	if err := owner.Admit(allocation); !errors.Is(err, distribution.ErrShardAllocation) {
+		t.Fatalf("allocation+routing+epoch wrong: got %v, want shard-allocation", err)
+	}
+
+	// Physical allocation correct, both routing generation and epoch wrong:
+	// routing generation wins.
+	gen := &ShardRequest{Distribution: "d", Shard: "s", AllocationGeneration: 7, RoutingVersion: 99, OwnershipEpoch: 99}
 	if err := owner.Admit(gen); !errors.Is(err, distribution.ErrRoutingVersion) {
 		t.Fatalf("gen+epoch wrong: got %v, want routing-version", err)
 	}
@@ -186,5 +201,14 @@ func TestAdmitNilRequest(t *testing.T) {
 	var ae *AdmissionError
 	if !errors.As(err, &ae) || ae.Kind != ErrorMalformedRequest {
 		t.Fatalf("Admit(nil) = %v, want malformed-request AdmissionError", err)
+	}
+}
+
+func TestAdmitZeroOwnershipFailsClosed(t *testing.T) {
+	err := (Ownership{}).Admit(&ShardRequest{})
+	var admission *AdmissionError
+	if !errors.As(err, &admission) || admission.Kind != ErrorNotOwner ||
+		!errors.Is(err, distribution.ErrNotShardOwner) {
+		t.Fatalf("zero ownership Admit = %v, want not-owner refusal", err)
 	}
 }

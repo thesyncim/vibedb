@@ -191,6 +191,10 @@ type ShardRequest struct {
 	// Distribution and Shard name the target the shard admits ownership of.
 	Distribution distribution.DistributionName
 	Shard        distribution.ShardID
+	// AllocationGeneration identifies the topology-created physical shard
+	// allocation. It is checked before routing and per-allocation ownership
+	// epochs, so a reused logical label cannot admit a stale request.
+	AllocationGeneration distribution.ShardAllocationGeneration
 	// RoutingVersion pins the manifest generation the caller routed against.
 	RoutingVersion distribution.RoutingVersion
 	// OwnershipEpoch is the caller's view of the shard's fencing epoch.
@@ -292,6 +296,9 @@ const (
 	// serving replica's applied index. Phase 0 reserves this refusal for the
 	// replicated apply path; it is never guessed from local storage state.
 	ErrorPositionNotReached
+	// ErrorShardAllocation reports a stale physical allocation generation for
+	// an otherwise matching distribution and shard id.
+	ErrorShardAllocation
 )
 
 // String renders the kind name for diagnostics.
@@ -321,13 +328,15 @@ func (k ErrorKind) String() string {
 		return "PositionIdentity"
 	case ErrorPositionNotReached:
 		return "PositionNotReached"
+	case ErrorShardAllocation:
+		return "ShardAllocation"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorPositionNotReached }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorShardAllocation }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.

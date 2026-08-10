@@ -177,7 +177,7 @@ func (w *selectTableValidation) setExpr(expression *sqlast.SetExpr) error {
 
 func (c *conn) selectTableExists(name string) bool {
 	if c.tx != nil {
-		if _, exists := c.tx.tables[name]; exists {
+		if _, exists := c.tx.tableLayoutAtBegin(name); exists {
 			return true
 		}
 	}

@@ -70,6 +70,8 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return distribution.ErrNotShardOwner
 	case shardservice.ErrorOwnershipEpoch:
 		return distribution.ErrOwnershipEpoch
+	case shardservice.ErrorShardAllocation:
+		return distribution.ErrShardAllocation
 	case shardservice.ErrorRoutingVersion:
 		return distribution.ErrRoutingVersion
 	case shardservice.ErrorDeadlineExceeded:

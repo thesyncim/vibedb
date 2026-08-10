@@ -17,9 +17,10 @@ import (
 func fullManifest(t *testing.T) *distribution.Manifest {
 	t.Helper()
 	m, err := distribution.NewManifest("d", 1, []distribution.Shard{{
-		ID:      "s0",
-		Range:   distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Max: true}},
-		Leaders: []distribution.EndpointID{"e0"},
+		ID:                   "s0",
+		AllocationGeneration: 1,
+		Range:                distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Max: true}},
+		Leaders:              []distribution.EndpointID{"e0"},
 	}})
 	if err != nil {
 		t.Fatalf("NewManifest full: %v", err)
@@ -33,8 +34,8 @@ func splitManifest(t *testing.T) *distribution.Manifest {
 	t.Helper()
 	mid := distribution.KeyspacePoint{0x80}
 	m, err := distribution.NewManifest("d", 1, []distribution.Shard{
-		{ID: "s0", Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: mid}}, Leaders: []distribution.EndpointID{"e0"}},
-		{ID: "s1", Range: distribution.KeyRange{Start: mid, End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"e1"}},
+		{ID: "s0", AllocationGeneration: 1, Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: mid}}, Leaders: []distribution.EndpointID{"e0"}},
+		{ID: "s1", AllocationGeneration: 2, Range: distribution.KeyRange{Start: mid, End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"e1"}},
 	})
 	if err != nil {
 		t.Fatalf("NewManifest split: %v", err)
@@ -335,8 +336,8 @@ func twoShardFixture(t *testing.T) (binding *placementBinding, router *distribut
 	}
 	boundary := points[mid].point
 	manifest, err := distribution.NewManifest("d", 1, []distribution.Shard{
-		{ID: "s0", Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: boundary}}, Leaders: []distribution.EndpointID{"e0"}},
-		{ID: "s1", Range: distribution.KeyRange{Start: boundary, End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"e1"}},
+		{ID: "s0", AllocationGeneration: 1, Range: distribution.KeyRange{Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Point: boundary}}, Leaders: []distribution.EndpointID{"e0"}},
+		{ID: "s1", AllocationGeneration: 2, Range: distribution.KeyRange{Start: boundary, End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"e1"}},
 	})
 	if err != nil {
 		t.Fatalf("NewManifest two-shard: %v", err)

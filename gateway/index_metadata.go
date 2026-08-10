@@ -180,7 +180,7 @@ func (s *Snapshot) Indexes(table string) IndexSet {
 	if !ok {
 		return IndexSet{}
 	}
-	canonical := s.Placements[s.planner[ordinal].placement].Table
+	canonical := s.config.Placements[s.planner[ordinal].placement].Table
 	return IndexSet{snapshot: s, span: s.plannerIndexSpans[ordinal], table: canonical}
 }
 
@@ -196,8 +196,10 @@ func (s *Snapshot) IndexIncarnation(table, name string, indexID, incarnation uin
 }
 
 // PlannerIndexMetadataBytes reports every retained byte owned exclusively by
-// the compact index directory: 32 bytes per index, 8 bytes per path reference,
-// 8 bytes per aligned table span, and the exact interned string-arena length.
+// the compact planner index directory: 32 bytes per index, 8 bytes per path
+// reference, 8 bytes per aligned table span, and the exact interned string-arena
+// length. The separate cold catalog-transition directory is reported by
+// CatalogTransitionMetadataBytes.
 func (s *Snapshot) PlannerIndexMetadataBytes() uint64 {
 	if s == nil {
 		return 0
@@ -212,14 +214,14 @@ func (s *Snapshot) plannerTableOrdinal(table string) (uint32, bool) {
 	lo, hi := 0, len(s.planner)
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		candidate := s.Placements[s.planner[mid].placement].Table
+		candidate := s.config.Placements[s.planner[mid].placement].Table
 		if candidate < table {
 			lo = mid + 1
 		} else {
 			hi = mid
 		}
 	}
-	if lo == len(s.planner) || s.Placements[s.planner[lo].placement].Table != table {
+	if lo == len(s.planner) || s.config.Placements[s.planner[lo].placement].Table != table {
 		return 0, false
 	}
 	return uint32(lo), true
@@ -269,51 +271,12 @@ func validateCompactPlannerCount(kind string, count uint64) error {
 	return nil
 }
 
-// indexCatalogTransitionAllowed fences prepared access paths across catalog
-// publication. A file-backed holder may skip intermediate generations, so it
-// enforces only snapshot-provable invariants: a definition is immutable and its
-// lifecycle cannot regress within one incarnation; a replacement must carry a
-// strictly higher incarnation for the same logical table/name. The catalog
-// authority owns transition choreography and the never-reuse IndexID rule.
-func indexCatalogTransitionAllowed(current, next *Snapshot) bool {
-	if current == nil || next == nil {
-		return current == nil && next != nil
-	}
-	oldByID := make(map[uint64]IndexMetadata, len(current.plannerIndexes))
-	current.forEachIndex(func(metadata IndexMetadata) {
-		oldByID[metadata.IndexID] = metadata
-	})
-	valid := true
-	next.forEachIndex(func(metadata IndexMetadata) {
-		old, existed := oldByID[metadata.IndexID]
-		if !existed {
-			return
-		}
-		switch {
-		case metadata.Incarnation == old.Incarnation:
-			if !sameIndexDefinition(old, metadata) || metadata.Lifecycle < old.Lifecycle {
-				valid = false
-			}
-		case metadata.Incarnation > old.Incarnation:
-			if metadata.Table != old.Table || metadata.Name != old.Name {
-				valid = false
-			}
-		default:
-			valid = false
-		}
-	})
-	if !valid {
-		return false
-	}
-	return true
-}
-
 func (s *Snapshot) forEachIndex(visit func(IndexMetadata)) {
 	if s == nil || visit == nil {
 		return
 	}
 	for tableOrdinal, span := range s.plannerIndexSpans {
-		table := s.Placements[s.planner[tableOrdinal].placement].Table
+		table := s.config.Placements[s.planner[tableOrdinal].placement].Table
 		for i := uint32(0); i < span.count; i++ {
 			visit(s.indexMetadata(table, span.first+i))
 		}
