@@ -136,7 +136,7 @@ func (v *vibeDBEngine) Tuning() string {
 	if v.cfg.Durability == DurabilityBufferedVisible {
 		mode = "Buffered-visible ordinarily keeps the persistence worker asleep until Checkpoint, uses bounded fresh-COW staging, groups the captured cut under one alternate root, and explicitly selects the ordinary two-phase filesystem-sync checkpoint used by this comparison; staging pressure can force an earlier checkpoint and comparative runs must verify the selected interval stays below that bound; "
 	}
-	layout := "the ordered primary graph (unified class-5 bulk / the primary mutation path for Put and Delete) is the only engine measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; "
+	layout := "the ordered primary graph (compact-stripe bulk / the primary mutation path for Put and Delete) is the only engine measured, including indexed rows: exact secondary-index posting tiles are maintained on the graph and updated in the same publish as each Put/Delete, so an indexed filter reads the graph's posting index; "
 	return mode + layout +
 		"ResidentBytes=64 MiB (the default, and the read-cache budget every other engine was matched to); " +
 		"PageSize=4 KiB default; buffered read and write modes (O_DIRECT is Linux-only); " +
@@ -145,7 +145,7 @@ func (v *vibeDBEngine) Tuning() string {
 		"worst-case transaction geometry; the explicit pool keeps this workload's staging capacity stable. " +
 		"BenchmarkPointWriteDurableDefaults measures the tuned/default pair directly. " +
 		"CommitCoalesce=0, i.e. no acknowledged-latency-for-throughput trade. " +
-		"CreateFromRecords emits the sole canonical class-5 representation directly from the borrowed bulk batch"
+		"CreateFromRecords emits the sole canonical compact-stripe representation directly from the borrowed bulk batch"
 }
 
 func (v *vibeDBEngine) options() durable.Options {

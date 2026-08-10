@@ -166,7 +166,7 @@ func seedBufferedInlinePrimaryLeaf(
 			t.Fatal("seed row is missing")
 		}
 		ref, _, _, err = collection.cowBufferedPrimaryMutation(
-			state, key, value, false, true, slot, route, &leaf,
+			state, key, value, false, true, slot, route, &leaf, nil,
 		)
 		if err != nil {
 			t.Fatal(err)

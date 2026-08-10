@@ -2558,6 +2558,68 @@ func TestConcurrentPrimaryScratchIsFixedAndLargeInputFallsBack(t *testing.T) {
 	}
 }
 
+func TestConcurrentPrimaryMaxExtentReplacementSplitsBeforeOverlay(t *testing.T) {
+	const documents = 16_384
+	keys, docs := unifiedPrimaryCorpus(documents, true)
+	options := Options{
+		ResidentBytes: 64 << 20,
+		Backend:       BackendPortable,
+		Durability:    DurabilityBufferedVisible,
+	}
+	collection := unifiedBenchStoreWith(t, keys, docs, options, options)
+	router := collection.primaryRouter.Load()
+	if router == nil {
+		t.Fatal("primary router is unavailable")
+	}
+
+	selected := -1
+	for i := range keys {
+		route, ok := router.Route([]byte(keys[i]))
+		if ok && route.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes {
+			selected = i
+			break
+		}
+	}
+	if selected < 0 {
+		t.Fatal("compact corpus produced no maximum-extent stripe")
+	}
+	canonical, err := vibejson.AppendCanonicalize(nil, docs[selected])
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := append([]byte(nil), canonical...)
+	const countryPrefix = `"country":"`
+	country := bytes.Index(replacement, []byte(countryPrefix))
+	if country < 0 || country+len(countryPrefix)+2 > len(replacement) {
+		t.Fatalf("selected document has no two-byte country: %s", replacement)
+	}
+	country += len(countryPrefix)
+	alternate := "ZZ"
+	if string(replacement[country:country+2]) == alternate {
+		alternate = "YY"
+	}
+	copy(replacement[country:country+2], alternate)
+
+	before := collection.Stats()
+	created, err := collection.Put([]byte(keys[selected]), replacement)
+	if err != nil || created {
+		t.Fatalf("maximum-extent replacement = created %v, err %v", created, err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatalf("flush maximum-extent replacement: %v", err)
+	}
+	after := collection.Stats()
+	if after.PrimaryLeafSplits <= before.PrimaryLeafSplits {
+		t.Fatal("maximum-extent codec change did not split before overlay admission")
+	}
+	if after.ConcurrentPrimaryReplaces != before.ConcurrentPrimaryReplaces {
+		t.Fatal("maximum-extent codec change entered the concurrent overlay")
+	}
+	assertConcurrentPrimaryRaw(
+		t, collection, []byte(keys[selected]), replacement,
+	)
+}
+
 func TestConcurrentPrimaryContextBackingIsLazy(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixtureMode(
 		t, 256, concurrentPrimaryTestOptions(), false,

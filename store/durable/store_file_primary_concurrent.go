@@ -3,6 +3,7 @@ package durable
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/bits"
 	"sync"
 	"sync/atomic"
@@ -747,7 +748,10 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	)
 	if !ok {
 		leafLease.Release()
-		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+		return false, false, fmt.Errorf(
+			"concurrent put admit compact bucket=%d: %w",
+			route.Bucket, storeio.ErrCommonPrimaryLeafCorrupt,
+		)
 	}
 	baseRank, baseFound := leaf.FindKey(key)
 	largeUnindexed := leaf.Len() > storeio.CommonPrimaryLeafWideSlots ||
@@ -758,7 +762,10 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	}
 	if baseFound && !slotOK {
 		leafLease.Release()
-		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+		return false, false, fmt.Errorf(
+			"concurrent put posting slot bucket=%d rank=%d: %w",
+			route.Bucket, baseRank, storeio.ErrCommonPrimaryLeafCorrupt,
+		)
 	}
 	current, disposition, overlaySlot := c.primaryUnifiedOverlay.lookup(
 		route.Bucket, route.Hash, key, logicalView.generation,
@@ -788,7 +795,10 @@ func (c *Collection) tryConcurrentPrimaryPut(
 			context.value, decoded = leaf.AppendValue(context.value[:0], baseRank)
 			if !decoded {
 				leafLease.Release()
-				return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+				return false, false, fmt.Errorf(
+					"concurrent put decode base bucket=%d rank=%d: %w",
+					route.Bucket, baseRank, storeio.ErrCommonPrimaryLeafCorrupt,
+				)
 			}
 			oldLen = len(context.value)
 			baseValue = context.value
@@ -821,7 +831,10 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		countDelta = 1
 	default:
 		leafLease.Release()
-		return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+		return false, false, fmt.Errorf(
+			"concurrent put overlay disposition bucket=%d kind=%d: %w",
+			route.Bucket, disposition, storeio.ErrCommonPrimaryLeafCorrupt,
+		)
 	}
 	if baseFound && baseValue == nil {
 		if _, overflow := leaf.OverflowRef(baseRank); overflow {
@@ -832,7 +845,10 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		context.value, decoded = leaf.AppendValue(context.value[:0], baseRank)
 		if !decoded {
 			leafLease.Release()
-			return false, false, storeio.ErrCommonPrimaryLeafCorrupt
+			return false, false, fmt.Errorf(
+				"concurrent put decode fallback bucket=%d rank=%d: %w",
+				route.Bucket, baseRank, storeio.ErrCommonPrimaryLeafCorrupt,
+			)
 		}
 		baseValue = context.value
 	}
@@ -861,6 +877,16 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	var scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
 	_ = canonicalIndex
 	leafLease.Release()
+	// A maximum-extent stripe has no physical room for an adverse codec change.
+	// Let the exclusive path prove the replacement immediately; if its exact
+	// encoding grows, that path returns the structural split signal while the
+	// overlay is still clean. Admitting the value here would defer the proof
+	// until pressure/Flush, when unrelated dirty buckets make a targeted split
+	// impossible and the fold could surface ErrCommonPrimaryLeafFull.
+	if !fixedExtent &&
+		route.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes {
+		return false, false, nil
+	}
 	if !fits {
 		return false, false, nil
 	}

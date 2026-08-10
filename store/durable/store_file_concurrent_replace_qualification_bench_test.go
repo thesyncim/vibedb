@@ -12,7 +12,10 @@ import (
 )
 
 const (
-	concurrentReplaceCorpusSize  = 16_384
+	// Compact stripes hold substantially more rows than the retired class-5
+	// leaves. Keep enough source rows for the 32-client disjoint-bucket arm to
+	// select 32 independently locked stripes after bulk packing.
+	concurrentReplaceCorpusSize  = 65_536
 	concurrentReplaceKeysPerLane = 4
 )
 
@@ -24,7 +27,7 @@ type concurrentReplaceLane struct {
 
 type concurrentReplaceBucket struct {
 	indices []int
-	unified bool
+	compact bool
 	stripe  uint32
 }
 
@@ -218,13 +221,13 @@ func concurrentReplaceLanes(
 			if err != nil {
 				b.Fatalf("acquire bucket %d: %v", route.Bucket, err)
 			}
-			unified := storeio.PrimaryLeafClass(lease.Page()) ==
-				storeio.CommonPrimaryLeafUnified
+			compact := storeio.PrimaryLeafClass(lease.Page()) ==
+				storeio.CommonPrimaryLeafCompact
 			lease.Release()
 			bucketAt = len(buckets)
 			byID[route.Bucket] = bucketAt
 			buckets = append(buckets, concurrentReplaceBucket{
-				unified: unified,
+				compact: compact,
 				stripe:  primaryConcurrentStripeIndex(route.Bucket),
 			})
 		}
@@ -235,7 +238,7 @@ func concurrentReplaceLanes(
 	if sameBucket {
 		needed := clients * concurrentReplaceKeysPerLane
 		for _, bucket := range buckets {
-			if !bucket.unified || len(bucket.indices) < needed {
+			if !bucket.compact || len(bucket.indices) < needed {
 				continue
 			}
 			for client := 0; client < clients; client++ {
@@ -250,7 +253,7 @@ func concurrentReplaceLanes(
 	} else {
 		usedStripes := make(map[uint32]struct{}, clients)
 		for _, bucket := range buckets {
-			if !bucket.unified ||
+			if !bucket.compact ||
 				len(bucket.indices) < concurrentReplaceKeysPerLane {
 				continue
 			}

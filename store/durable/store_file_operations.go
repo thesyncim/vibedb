@@ -829,6 +829,8 @@ func (c *Collection) Stats() Stats {
 		PrewrittenPageBytes:                  commit.PrewrittenPageBytes,
 		AutomaticCheckpoints:                 c.automaticCheckpoints.Load(),
 		PrimaryOverlayFolds:                  c.primaryOverlayFolds.Load(),
+		PrimaryCompactColumnPatchAttempts:    c.primaryCompactColumnPatchAttempts.Load(),
+		PrimaryCompactColumnPatches:          c.primaryCompactColumnPatches.Load(),
 		ConcurrentPrimaryReplaces:            c.concurrentPrimaryReplaces.Load(),
 		ConcurrentPrimaryFallbacks:           c.concurrentPrimaryFallbacks.Load(),
 		ConcurrentPrimaryPublishGroups:       c.concurrentPrimaryPublishGroups.Load(),

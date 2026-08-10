@@ -6,6 +6,36 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
+func TestVibeDBSameSizeUsesCompactColumnPatch(t *testing.T) {
+	factory, ok := FactoryNamed("vibedb")
+	if !ok {
+		t.Fatal("vibedb factory missing")
+	}
+	e, _, cleanup := newLoaded(t, factory, Config{
+		Durability: DurabilityBufferedVisible,
+	})
+	defer cleanup()
+	v := e.(*vibeDBEngine)
+	before := v.coll.Stats().PrimaryCompactColumnPatches
+	scratch := make([]byte, 0, 512)
+	const puts = 10_000
+	for i := 0; i < puts; i++ {
+		idx := probeIdx[i%len(probeIdx)]
+		scratch = AppendSameSizeUpdatedJSON(scratch[:0], docs, idx)
+		if err := e.Put(docs[idx].Key, scratch); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	after := v.coll.Stats().PrimaryCompactColumnPatches
+	if after == before {
+		stats := v.coll.Stats()
+		t.Fatalf(
+			"same-size workload did not engage compact column patching (attempts=%d folds=%d)",
+			stats.PrimaryCompactColumnPatchAttempts, stats.PrimaryOverlayFolds,
+		)
+	}
+}
+
 // TestVibeDBOrdinarySyncJournalsThroughPrimary proves the adapter now
 // measures the ordered primary graph: loadBulk builds through CreateFromRecords,
 // so every Put routes through the primary mutation path, and ordinary-sync's

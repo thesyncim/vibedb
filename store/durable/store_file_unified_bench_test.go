@@ -17,20 +17,20 @@ import (
 // competitive corpus (100k ~249 B documents) and reports p50 nanoseconds for
 // point pipelines and nanoseconds per document for scan-shaped lanes.
 
-func unifiedBenchSource(b *testing.B, keys []string, docs [][]byte) *store.Collection {
-	b.Helper()
+func unifiedBenchSource(tb testing.TB, keys []string, docs [][]byte) *store.Collection {
+	tb.Helper()
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	for i := range keys {
 		if err := builder.Append(keys[i], docs[i]); err != nil {
-			b.Fatal(err)
+			tb.Fatal(err)
 		}
 	}
 	built, err := builder.Build()
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	return built
 }
@@ -42,30 +42,30 @@ func unifiedBenchStore(b *testing.B, keys []string, docs [][]byte, options Optio
 }
 
 func unifiedBenchStoreWith(
-	b *testing.B, keys []string, docs [][]byte, createOptions, openOptions Options,
+	tb testing.TB, keys []string, docs [][]byte, createOptions, openOptions Options,
 ) *Collection {
-	b.Helper()
-	dir := b.TempDir()
+	tb.Helper()
+	dir := tb.TempDir()
 	path := filepath.Join(dir, "bench.vibe")
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
-	if _, err := CreateFromPrimary(unifiedBenchSource(b, keys, docs), file, createOptions); err != nil {
-		b.Fatalf("CreateFromPrimary: %v", err)
+	if _, err := CreateFromPrimary(unifiedBenchSource(tb, keys, docs), file, createOptions); err != nil {
+		tb.Fatalf("CreateFromPrimary: %v", err)
 	}
 	if err := file.Close(); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	reopened, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	collection, err := Open(reopened, openOptions)
 	if err != nil {
-		b.Fatalf("Open: %v", err)
+		tb.Fatalf("Open: %v", err)
 	}
-	b.Cleanup(func() {
+	tb.Cleanup(func() {
 		_ = collection.Close()
 		_ = reopened.Close()
 	})

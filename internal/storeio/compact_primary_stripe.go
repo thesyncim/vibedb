@@ -25,6 +25,29 @@ type compactPrimaryBuildScratch struct {
 	counts       []uint16
 	overflow     []byte
 	stream       compactStreamScratch
+	patchHeap    []byte
+	patchEnds    []uint32
+	patchValues  [][]byte
+	patchMods    []compactPrimaryReplacementPatch
+	patchGroups  []compactPrimaryStreamPatch
+	patchStreams []byte
+	shapeDeltas  []int
+}
+
+type compactPrimaryReplacementPatch struct {
+	shape   uint16
+	hole    uint16
+	ordinal uint16
+	value   []byte
+}
+
+type compactPrimaryStreamPatch struct {
+	shape    uint16
+	hole     uint16
+	offset   int
+	oldBytes int
+	newStart int
+	newEnd   int
 }
 
 // BuildCompactPrimaryStripePayload builds the replacement class-5 payload.
@@ -473,6 +496,329 @@ func CloneCompactPrimaryStripeGeneration(
 	return page, nil
 }
 
+// PatchCompactPrimaryStripeReplacements is the exact existing-row COW fast
+// path for compact stripes. Every replacement must retain its admitted JSON
+// shape and change at most one scalar hole. Each affected shape/hole column is
+// decoded once and run through the complete compact-stream planner; the page
+// is then assembled from the unchanged source ranges and the replanned
+// streams. Those certificates make the result identical to a complete compact
+// rebuild except for the requested generation. Any shape, slot, overflow, or
+// maximum-extent violation declines to the ordinary full planner.
+func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
+	dst []byte,
+	generation uint64,
+	replacements []CommonPrimaryUnifiedReplacement,
+	builder *UnifiedPrimaryLeafBuilder,
+) (page []byte, ok bool, err error) {
+	corrupt := func(what string) error {
+		return fmt.Errorf("%w: compact patch %s", ErrCommonPrimaryLeafCorrupt, what)
+	}
+	if v == nil || builder == nil || len(v.page) == 0 ||
+		len(dst) < len(v.page) || len(replacements) == 0 ||
+		generation <= v.header.Generation || generation >= uint64(1)<<48 ||
+		commonPrimaryLeafOverlaps(dst[:len(v.page)], v.page) {
+		return nil, false, nil
+	}
+	patch := &builder.compact
+	patch.patchHeap = patch.patchHeap[:0]
+	patch.patchMods = patch.patchMods[:0]
+	for replacementIndex := range replacements {
+		replacement := &replacements[replacementIndex]
+		if len(replacement.Key) == 0 || len(replacement.Value) == 0 {
+			return nil, false, nil
+		}
+		for previous := 0; previous < replacementIndex; previous++ {
+			if bytes.Equal(replacements[previous].Key, replacement.Key) {
+				return nil, false, nil
+			}
+		}
+		rank, found := v.FindKey(replacement.Key)
+		if !found || v.IsOverflow(rank) {
+			return nil, false, nil
+		}
+		if v.rows <= CommonPrimaryLeafWideSlots {
+			admittedSlot, slotOK := v.PostingSlot(rank)
+			if !slotOK {
+				return nil, false, corrupt("posting slot")
+			}
+			if admittedSlot != replacement.Slot {
+				return nil, false, nil
+			}
+		}
+		record := CommonPrimaryLeafRecord{
+			Key:   replacement.Key,
+			Value: CommonPrimaryLeafValue{Inline: replacement.Value},
+			Slot:  replacement.Slot,
+		}
+		if err := prepareCompactPrimaryStripe(
+			[]CommonPrimaryLeafRecord{record}, builder,
+		); err != nil {
+			return nil, false, err
+		}
+		canonical := builder.canonicalOf(0)
+		if !bytes.Equal(canonical, replacement.Value) {
+			return nil, false, nil
+		}
+		shape := v.rowShape(rank)
+		candidate, entryOK := v.shapeEntry(shape)
+		if !entryOK || len(builder.rows) != 1 || len(builder.shapes) != 1 {
+			return nil, false, corrupt("shape entry")
+		}
+		row := &builder.rows[0]
+		spans := builder.spans[row.spanStart:row.spanEnd]
+		if len(spans) != candidate.template.holes {
+			return nil, false, nil
+		}
+		ordinal := v.shapeOrdinal(rank, shape)
+		previousCanonical, previousStatic := uint32(0), uint32(0)
+		streamRaw := candidate.streamRaw
+		changedHole := -1
+		var changedValue []byte
+		for hole := 0; hole < candidate.template.holes; hole++ {
+			staticEnd := binary.LittleEndian.Uint32(candidate.template.ends[hole*4:])
+			span := spans[hole]
+			if staticEnd < previousStatic || span.Start < previousCanonical ||
+				int(staticEnd) > len(candidate.template.static) ||
+				int(span.End) > len(canonical) ||
+				!bytes.Equal(
+					candidate.template.static[previousStatic:staticEnd],
+					canonical[previousCanonical:span.Start],
+				) {
+				return nil, false, nil
+			}
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return nil, false, corrupt("source stream")
+			}
+			start := len(patch.patchHeap)
+			patch.patchHeap, admitted = stream.appendValue(patch.patchHeap, ordinal)
+			if !admitted {
+				return nil, false, corrupt("source value")
+			}
+			newValue := canonical[span.Start:span.End]
+			if !bytes.Equal(patch.patchHeap[start:], newValue) {
+				if changedHole >= 0 {
+					return nil, false, nil
+				}
+				changedHole = hole
+				changedValue = newValue
+			}
+			patch.patchHeap = patch.patchHeap[:start]
+			streamRaw = streamRaw[stream.encoded:]
+			previousCanonical = span.End
+			previousStatic = staticEnd
+		}
+		lastStatic := binary.LittleEndian.Uint32(
+			candidate.template.ends[candidate.template.holes*4:],
+		)
+		if lastStatic < previousStatic ||
+			int(lastStatic) != len(candidate.template.static) ||
+			int(previousCanonical) > len(canonical) ||
+			!bytes.Equal(
+				candidate.template.static[previousStatic:lastStatic],
+				canonical[previousCanonical:],
+			) {
+			return nil, false, nil
+		}
+		if changedHole < 0 {
+			continue
+		}
+		if shape < 0 || shape > int(^uint16(0)) ||
+			changedHole > int(^uint16(0)) ||
+			ordinal < 0 || ordinal > int(^uint16(0)) {
+			return nil, false, corrupt("replacement coordinates")
+		}
+		patch.patchMods = append(
+			patch.patchMods,
+			compactPrimaryReplacementPatch{
+				shape: uint16(shape), hole: uint16(changedHole),
+				ordinal: uint16(ordinal), value: changedValue,
+			},
+		)
+	}
+	if len(patch.patchMods) == 0 {
+		page, err := CloneCompactPrimaryStripeGeneration(dst, v.page, generation)
+		return page, err == nil, err
+	}
+
+	patch.patchGroups = patch.patchGroups[:0]
+	for _, modification := range patch.patchMods {
+		found := false
+		for _, group := range patch.patchGroups {
+			if group.shape == modification.shape && group.hole == modification.hole {
+				found = true
+				break
+			}
+		}
+		if !found {
+			patch.patchGroups = append(
+				patch.patchGroups,
+				compactPrimaryStreamPatch{
+					shape: modification.shape, hole: modification.hole,
+				},
+			)
+		}
+	}
+	patch.patchStreams = patch.patchStreams[:0]
+	for groupIndex := range patch.patchGroups {
+		group := &patch.patchGroups[groupIndex]
+		shape := int(group.shape)
+		entry, entryOK := v.shapeEntry(shape)
+		if !entryOK || int(group.hole) >= entry.template.holes {
+			return nil, false, corrupt("group shape")
+		}
+		shapeOffset := 0
+		if shape != 0 {
+			shapeOffset = int(binary.LittleEndian.Uint32(v.shapeDir[(shape-1)*4:]))
+		}
+		templateBytes := 8 + (entry.template.holes+1)*4 + len(entry.template.static)
+		streamRaw := entry.streamRaw
+		oldStreamOffset := 0
+		var oldStream compactStreamView
+		for hole := 0; hole <= int(group.hole); hole++ {
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return nil, false, corrupt("group stream")
+			}
+			if hole == int(group.hole) {
+				oldStream = stream
+				break
+			}
+			oldStreamOffset += stream.encoded
+			streamRaw = streamRaw[stream.encoded:]
+		}
+		group.offset = v.shapeStart + shapeOffset + compactPrimaryShapeHeader +
+			templateBytes + oldStreamOffset
+		group.oldBytes = oldStream.encoded
+		if group.offset < 0 || group.offset+group.oldBytes > len(v.payload) {
+			return nil, false, corrupt("group bounds")
+		}
+		patch.patchHeap = patch.patchHeap[:0]
+		patch.patchEnds = slices.Grow(
+			patch.patchEnds[:0], oldStream.count,
+		)[:oldStream.count]
+		for row := 0; row < oldStream.count; row++ {
+			var decoded bool
+			patch.patchHeap, decoded = oldStream.appendValue(patch.patchHeap, row)
+			if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
+				return nil, false, corrupt("group value")
+			}
+			patch.patchEnds[row] = uint32(len(patch.patchHeap))
+		}
+		patch.patchValues = slices.Grow(
+			patch.patchValues[:0], oldStream.count,
+		)[:oldStream.count]
+		start := uint32(0)
+		for row, end := range patch.patchEnds {
+			patch.patchValues[row] = patch.patchHeap[start:end:end]
+			start = end
+		}
+		for _, modification := range patch.patchMods {
+			if modification.shape != group.shape || modification.hole != group.hole {
+				continue
+			}
+			if int(modification.ordinal) >= oldStream.count {
+				return nil, false, corrupt("group ordinal")
+			}
+			patch.patchValues[modification.ordinal] = modification.value
+		}
+		encoded := patch.stream.encode(patch.patchValues)
+		group.newStart = len(patch.patchStreams)
+		patch.patchStreams, err = encoded.appendBinary(patch.patchStreams)
+		if err != nil {
+			return nil, false, err
+		}
+		group.newEnd = len(patch.patchStreams)
+	}
+	slices.SortFunc(patch.patchGroups, func(a, b compactPrimaryStreamPatch) int {
+		return a.offset - b.offset
+	})
+	delta := 0
+	for _, group := range patch.patchGroups {
+		delta += group.newEnd - group.newStart - group.oldBytes
+	}
+	newPayloadBytes := len(v.payload) + delta
+	need := PageHeaderSize + newPayloadBytes + PageTrailerSize
+	extent := (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+	if newPayloadBytes < compactPrimaryHeaderBytes ||
+		extent > CommonPrimaryLeafMaxExtentBytes || extent > len(dst) {
+		return nil, false, nil
+	}
+	logicalID, logicalOK := CommonPrimaryLeafLogicalID(v.header.Bucket)
+	if !logicalOK {
+		return nil, false, corrupt("logical identity")
+	}
+	payload, initErr := InitPage(dst[:extent], PageHeader{
+		StoreID: v.header.StoreID, Generation: generation,
+		LogicalID: logicalID, PageSize: uint32(extent),
+		PayloadLength: uint32(newPayloadBytes), Kind: PagePrimaryLeaf,
+	})
+	if initErr != nil {
+		return nil, false, initErr
+	}
+	cursor, sourceCursor := 0, 0
+	for _, group := range patch.patchGroups {
+		if group.offset < sourceCursor || group.offset+group.oldBytes > len(v.payload) {
+			return nil, false, corrupt("assembly bounds")
+		}
+		cursor += copy(payload[cursor:], v.payload[sourceCursor:group.offset])
+		cursor += copy(
+			payload[cursor:], patch.patchStreams[group.newStart:group.newEnd],
+		)
+		sourceCursor = group.offset + group.oldBytes
+	}
+	cursor += copy(payload[cursor:], v.payload[sourceCursor:])
+	if cursor != newPayloadBytes {
+		return nil, false, corrupt("assembly length")
+	}
+	if len(patch.patchGroups) != 0 {
+		shapeBytes := int64(binary.LittleEndian.Uint32(payload[24:])) + int64(delta)
+		if shapeBytes < 0 || shapeBytes > int64(^uint32(0)) {
+			return nil, false, corrupt("shape bytes")
+		}
+		binary.LittleEndian.PutUint32(payload[24:], uint32(shapeBytes))
+		patch.shapeDeltas = slices.Grow(
+			patch.shapeDeltas[:0], v.shapeCount,
+		)[:v.shapeCount]
+		clear(patch.shapeDeltas)
+		for _, group := range patch.patchGroups {
+			patch.shapeDeltas[group.shape] +=
+				group.newEnd - group.newStart - group.oldBytes
+		}
+		cumulative := 0
+		for shape := 0; shape < v.shapeCount; shape++ {
+			shapeOffset := 0
+			if shape != 0 {
+				shapeOffset = int(binary.LittleEndian.Uint32(v.shapeDir[(shape-1)*4:]))
+			}
+			if patch.shapeDeltas[shape] != 0 {
+				streamBytesAt := v.shapeStart + shapeOffset + cumulative + 12
+				streamBytes := int64(binary.LittleEndian.Uint32(payload[streamBytesAt:])) +
+					int64(patch.shapeDeltas[shape])
+				if streamBytes < 0 || streamBytes > int64(^uint32(0)) {
+					return nil, false, corrupt("stream bytes")
+				}
+				binary.LittleEndian.PutUint32(
+					payload[streamBytesAt:], uint32(streamBytes),
+				)
+			}
+			cumulative += patch.shapeDeltas[shape]
+			at := compactPrimaryHeaderBytes + shape*4
+			end := int64(binary.LittleEndian.Uint32(v.shapeDir[shape*4:])) +
+				int64(cumulative)
+			if end <= 0 || end > int64(^uint32(0)) {
+				return nil, false, corrupt("shape directory")
+			}
+			binary.LittleEndian.PutUint32(payload[at:], uint32(end))
+		}
+	}
+	page = dst[:extent]
+	if _, err := sealInitializedPage(page); err != nil {
+		return nil, false, err
+	}
+	return page, true, nil
+}
+
 type compactPrimaryTemplateView struct {
 	holes  int
 	ends   []byte
@@ -487,6 +833,7 @@ type compactPrimaryShapeView struct {
 
 type CompactPrimaryStripeView struct {
 	header      CommonPrimaryLeafHeader
+	page        []byte
 	payload     []byte
 	rows        int
 	shapeCount  int
@@ -499,6 +846,7 @@ type CompactPrimaryStripeView struct {
 	overflow    []byte
 	overflowRef []byte
 	shapeData   []byte
+	shapeStart  int
 }
 
 func OpenCompactPrimaryStripe(
@@ -527,10 +875,12 @@ func OpenCompactPrimaryStripe(
 		string(payload[:4]) != compactPrimaryMagic {
 		return corrupt("identity or magic")
 	}
-	return openCompactPrimaryStripePayload(
+	view, openErr := openCompactPrimaryStripePayload(
 		payload, pageHeader, storeID, bucket, bounds, true,
 		expected.Offset < bounds.FileEnd,
 	)
+	view.page = src[:pageHeader.PageSize:pageHeader.PageSize]
+	return view, openErr
 }
 
 // AdmittedCompactPrimaryStripe opens a page already selected and checksum-
@@ -552,6 +902,7 @@ func AdmittedCompactPrimaryStripe(
 	view, err := openCompactPrimaryStripePayload(
 		payload, pageHeader, storeID, bucket, CommonPrimaryLeafBounds{}, false, false,
 	)
+	view.page = src[:pageHeader.PageSize:pageHeader.PageSize]
 	return view, err == nil
 }
 
@@ -666,7 +1017,7 @@ func openCompactPrimaryStripePayload(
 		payload: payload, rows: rows, shapeCount: shapeCount, shapeWidth: shapeWidth,
 		key: key, slots: slots, overflow: overflowBitmap, overflowRef: overflowRefs,
 		shapeCodes: shapeCodes, rankTable: rankTable,
-		shapeDir: shapeDir, shapeData: shapeData,
+		shapeDir: shapeDir, shapeData: shapeData, shapeStart: cursor,
 	}
 	if validate {
 		if err := v.validate(bounds, validateOverflowBounds); err != nil {
@@ -903,6 +1254,13 @@ func (v *CompactPrimaryStripeView) PostingSlot(rank int) (uint8, bool) {
 func (v *CompactPrimaryStripeView) IsOverflow(row int) bool {
 	return v != nil && row >= 0 && row < v.rows && len(v.overflow) != 0 &&
 		v.overflow[row>>3]&(byte(1)<<uint(row&7)) != 0
+}
+
+// HasOverflowRows reports whether any compact row refers to an out-of-line
+// value. A false result certifies that cloning or column-patching the stripe
+// cannot preserve a volatile overflow reference across a checkpoint.
+func (v *CompactPrimaryStripeView) HasOverflowRows() bool {
+	return v != nil && len(v.overflow) != 0
 }
 
 // OverflowRef returns the out-of-line descriptor at row. Overflow values are

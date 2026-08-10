@@ -1,5 +1,22 @@
 # Competitive results
 
+> **2026-08-10 focused development result (not a published-suite
+> replacement).** Five isolated 1-second runs of
+> `BenchmarkPointWriteSameSize/(vibedb|badger)/durability=buffered-visible`
+> measured a 7.295 µs VibeDB median and 7.821 µs Badger median on the Apple M4
+> Max. VibeDB is 6.7% lower-latency in this same-size replacement gate. Its
+> median allocation result was 339 B and 0 allocations versus Badger's 3,311 B
+> and 46 allocations. Before the compact column-patch change the VibeDB median
+> was 39.562 µs, making the focused engine path 5.42× faster. The
+> new byte-equivalence oracles compare single- and multi-shape column patches
+> against a complete compact rebuild, and an end-to-end harness test requires
+> the lane to engage rather than silently fall back. No storage-format or bulk
+> footprint bytes changed. A separate three-sample disjoint-bucket qualification
+> measured median replacement rates of 166.5k, 394.5k, and 718.5k ops/s at 1,
+> 8, and 32 clients, with zero allocations and no materialization or exclusive
+> fallbacks. The full mixed-workload tables below retain their
+> 2026-08-03 provenance until that complete protocol is regenerated.
+
 > **Current published snapshot.** The mixed-throughput, concurrency, bulk
 > footprint, and CPU/scan-gate tables below were regenerated on 2026-08-03 from
 > engine commit `c1dea2b25d15d810efc85e65ad5f312f34b903e5` (branch `main`) on an
@@ -250,8 +267,8 @@ point-put apparent image (11.821 MiB) exceeds the immutable unified-bulk image
 ## Current CPU and scan gates
 
 These five-sample Go microbenchmarks were re-run on 2026-08-03 at engine commit
-`c1dea2b` on the same host. They are regression gates, not cross-engine database
-results.
+`c1dea2b` on the same host, except for the masked-scan row noted below. They are
+regression gates, not cross-engine database results.
 
 | gate | median | allocation |
 | --- | ---: | ---: |
@@ -260,17 +277,20 @@ results.
 | ordered scan, 100k three-scalar documents | 117.4 ns/document | 0 B, 0 allocs |
 | full competitive scan, low cardinality | 328.6 ns/document | 0 B, 0 allocs |
 | full competitive scan, high cardinality | 471.5 ns/document | 0 B, 0 allocs |
-| masked scan, one occupied row per live posting tile | not measurable at this tree | — |
+| masked scan, one occupied row per live posting tile | 631.5 ns/selected document | 0 B, 0 allocs |
 
 The certified native fold is about 136× faster than full replanning
 (248.532 / 1.826 µs). The ordered-scan and full-competitive-scan gates regressed
 against their pre-compact 2026-08-01 values (23.49 → 117.4 ns/document ordered;
 91.57 / 94.21 → 328.6 / 471.5 ns/document competitive): reconstructing a compact
 leaf on the read path is the same cost that depresses the update-heavy
-throughput lanes. `BenchmarkFileStoreScanMasked` currently **fails** at this tree
-(`store_file_read_bench_test.go:267: primary bucket 0 is not unified`), so no
-masked-scan value is published this pass; the prior 178.4 ns/selected-document
-figure is not carried forward as a current gate.
+throughput lanes. The masked-scan setup was repaired after compact stripes
+replaced the retired class-5 leaves it inspected. That row is the median of
+five 1-second samples run on 2026-08-10 at `387707c` plus the benchmark/test
+fix, with Go 1.26.0 on the same Apple M4 Max. Samples ranged from 626.3 to
+634.9 ns/selected document, with 0.2502 page pins per selected document, zero
+cache misses, and zero allocations. The prior 178.4 ns/selected-document figure
+is not carried forward because it predates compact primary storage.
 
 ## Publishing rules
 

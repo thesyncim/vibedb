@@ -270,6 +270,8 @@ type Collection struct {
 
 	automaticCheckpoints                 atomic.Uint64
 	primaryOverlayFolds                  atomic.Uint64
+	primaryCompactColumnPatchAttempts    atomic.Uint64
+	primaryCompactColumnPatches          atomic.Uint64
 	concurrentPrimaryReplaces            atomic.Uint64
 	concurrentPrimaryFallbacks           atomic.Uint64
 	concurrentPrimaryPublishGroups       atomic.Uint64
@@ -587,6 +589,12 @@ type Stats struct {
 	// device checkpoint; a later journal delta, explicit Flush, or Close supplies
 	// the crash-safety boundary.
 	PrimaryOverlayFolds uint64
+	// PrimaryCompactColumnPatchAttempts counts exact compact-stripe replacement
+	// qualifications, including safe declines to the complete planner.
+	PrimaryCompactColumnPatchAttempts uint64
+	// PrimaryCompactColumnPatches counts exact compact-stripe replacements that
+	// replanned only the changed scalar column instead of rebuilding every row.
+	PrimaryCompactColumnPatches uint64
 	// ConcurrentPrimaryReplaces counts existing inline rows published through
 	// the shared-writer, bucket-striped buffered lane. It advances only after the
 	// complete overlay/router/state publication, so qualification can detect a
@@ -663,9 +671,10 @@ type Stats struct {
 	// bounded-transaction latency in nanoseconds for each structural kind.
 	PrimarySplitMaxNS        uint64
 	PrimaryEmptyReclaimMaxNS uint64
-	// PrimaryMutationScratchBytes is the fixed leaf-promotion and raw
+	// PrimaryMutationScratchBytes is the retained leaf-promotion and raw
 	// segmented-root writer scratch plus the bounded unified-fold replacement
-	// vector, allocated only for PrimaryRoot stores.
+	// vector and compact-column planner workspace. It is allocated only for
+	// PrimaryRoot stores and reflects any capacity learned by completed folds.
 	PrimaryMutationScratchBytes uint64
 	// ConcurrentPrimaryScratchBytes is the retained stripe directory, publisher
 	// handoff, and fixed writer-private canonicalization context pool for the

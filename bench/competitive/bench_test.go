@@ -636,7 +636,7 @@ func BenchmarkParse(b *testing.B) {
 // this harness. Every engine must return its documented stored representation
 // for every one of the corpus's keys, and must visit every key exactly once
 // with those same bytes during a scan. Byte-preserving engines return the
-// submitted spelling; vibedb returns the sole class-5 canonical form.
+// submitted spelling; vibedb returns the sole compact-stripe canonical form.
 //
 // It replaced a check that verified one document — docs[42] — and validated
 // Scan by its count alone. An engine that returned correct bytes for docs[42]

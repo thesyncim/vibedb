@@ -1496,6 +1496,16 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	if err != nil || !eligible {
 		return false, false, false, err
 	}
+	// The maximum physical extent cannot absorb an adverse change in compact
+	// stream or dictionary encoding. Only a byte-identical immutable-base Put is
+	// provably safe there. Route every other Put through the exact COW encoder
+	// while this bucket has no pending delta; it can return the structural split
+	// signal immediately instead of leaving Flush with an unsplittable overlay.
+	if route.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes &&
+		(!baseFound || disposition != primaryUnifiedOverlayMissing ||
+			!bytes.Equal(canonical, oldRaw)) {
+		return false, false, false, nil
+	}
 	pendingRaw, pendingRows :=
 		overlay.pendingBucketDeltas(route.Bucket)
 	leafWasEmpty := stripe.Len()+pendingRows == 0

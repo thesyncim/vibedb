@@ -21,10 +21,10 @@ import (
 type Doc = benchcorpus.Document
 
 // AppendExpectedStoredJSON appends the representation an engine promises to
-// return for src. The durable class-5 format is canonical by construction;
-// byte-preserving competitors return the submitted spelling. Correctness
-// oracles use this outside timed regions so canonicalization is never charged
-// to, or hidden inside, a benchmarked read.
+// return for src. The durable compact-stripe format is canonical by
+// construction; byte-preserving competitors return the submitted spelling.
+// Correctness oracles use this outside timed regions so canonicalization is
+// never charged to, or hidden inside, a benchmarked read.
 func AppendExpectedStoredJSON(dst []byte, engineName string, src []byte) ([]byte, error) {
 	if engineName == "vibedb" {
 		return vibejson.AppendCanonicalize(dst, src)

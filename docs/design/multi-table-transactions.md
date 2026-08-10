@@ -1,14 +1,13 @@
 # Multi-table transactions
 
-**Status:** implemented on `feat/txn-multitable`. Projected behavior remains
-unclaimed until its named tests pass in CI. The staged delivery plan and
-executor task specs live outside the repository; this document is the design
-authority they implement.
+**Status:** implemented on `main`. The named crash, conformance, SQL-driver,
+pgwire, and verifier tests in this document are the executable acceptance
+surface. This document remains the design authority for the landed behavior.
 
 ## Purpose
 
-This pass removes three documented limitations and states the semantics that
-replace them:
+This work removed three former limitations and defines the semantics that
+replaced them. The bullets below record the preimplementation baseline:
 
 - a SQL transaction may read several tables but writes exactly one
   (`sql/driver/tx.go:364-368`; README "Important limitations";

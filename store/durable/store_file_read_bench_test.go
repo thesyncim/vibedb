@@ -2,6 +2,7 @@ package durable
 
 import (
 	"fmt"
+	"math/bits"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -39,6 +40,16 @@ func benchReadKey(i int) string { return fmt.Sprintf("user-%09d", i) }
 // instead.
 func openBenchReadCollection(tb testing.TB, count int) (*Collection, func()) {
 	tb.Helper()
+	return openBenchReadCollectionWithOptions(tb, count, Options{
+		ResidentBytes: 64 << 20,
+		Backend:       BackendPortable,
+	})
+}
+
+func openBenchReadCollectionWithOptions(
+	tb testing.TB, count int, options Options,
+) (*Collection, func()) {
+	tb.Helper()
 	path := filepath.Join(tb.TempDir(), "read.vibe")
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -57,7 +68,6 @@ func openBenchReadCollection(tb testing.TB, count int) (*Collection, func()) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	options := Options{ResidentBytes: 64 << 20, Backend: BackendPortable}
 	if _, err := CreateFromPrimary(built, file, options); err != nil {
 		tb.Fatal(err)
 	}
@@ -70,6 +80,107 @@ func openBenchReadCollection(tb testing.TB, count int) (*Collection, func()) {
 			tb.Fatal(closeErr)
 		}
 		_ = file.Close()
+	}
+}
+
+func benchMaskedReadOptions() Options {
+	return Options{
+		ResidentBytes: 64 << 20,
+		Backend:       BackendPortable,
+		Indexes: []store.IndexDefinition{{
+			Name: "country", Paths: []string{"/country"},
+		}},
+	}
+}
+
+// benchOneMaskPerLiveTile constructs the sparse candidate shape measured by
+// BenchmarkFileStoreScanMasked. Keeping this setup in a testable helper stops a
+// storage-format promotion from silently turning the benchmark into a setup
+// failure or an empty scan.
+func benchOneMaskPerLiveTile(
+	tb testing.TB, collection *Collection, snapshot *Snapshot,
+) []store.Mask {
+	tb.Helper()
+	router := collection.primaryRouter.Load()
+	if router == nil {
+		tb.Fatal("ordered-primary router is unavailable")
+	}
+	byChunk := make(map[uint32]uint64, router.Len()*2)
+	for rank := 0; rank < router.Len(); rank++ {
+		route, ok := router.RouteAtRank(rank)
+		if !ok {
+			tb.Fatalf("primary route %d is unavailable", rank)
+		}
+		lease, err := router.AcquireLeaf(collection.cache, route)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		stripe, admitted := storeio.AdmittedCompactPrimaryStripe(
+			lease.Page(), snapshot.state.root.StoreID, route.Bucket,
+		)
+		if !admitted {
+			lease.Release()
+			tb.Fatalf("primary bucket %d is not compact", route.Bucket)
+		}
+		for row := 0; row < stripe.Len(); row++ {
+			slot, ok := stripe.PostingSlot(row)
+			if !ok {
+				lease.Release()
+				tb.Fatalf(
+					"primary bucket %d row %d has no posting slot",
+					route.Bucket, row,
+				)
+			}
+			chunk := uint32(route.Bucket)<<2 | uint32(slot>>6)
+			if _, exists := byChunk[chunk]; !exists {
+				byChunk[chunk] = uint64(1) << uint(slot&63)
+			}
+		}
+		lease.Release()
+	}
+	chunks := make([]uint32, 0, len(byChunk))
+	for chunk := range byChunk {
+		chunks = append(chunks, chunk)
+	}
+	slices.Sort(chunks)
+	masks := make([]store.Mask, 0, len(chunks))
+	for _, chunk := range chunks {
+		masks = append(masks, store.Mask{Chunk: chunk, Bits: byChunk[chunk]})
+	}
+	if len(masks) == 0 {
+		tb.Fatal("masked benchmark found no live posting tiles")
+	}
+	return masks
+}
+
+func TestBenchReadMaskedFixture(t *testing.T) {
+	collection, done := openBenchReadCollectionWithOptions(
+		t, 1_000, benchMaskedReadOptions(),
+	)
+	defer done()
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	masks := benchOneMaskPerLiveTile(t, collection, snapshot)
+	for _, mask := range masks {
+		if bits.OnesCount64(mask.Bits) != 1 {
+			t.Fatalf("mask %+v selects more than one row", mask)
+		}
+	}
+	visited := 0
+	if _, err := snapshot.RangeMasksRawBuffer(
+		masks, nil,
+		func(_, _ []byte) error {
+			visited++
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if visited != len(masks) {
+		t.Fatalf("masked fixture visited %d rows, want %d", visited, len(masks))
 	}
 }
 
@@ -234,7 +345,9 @@ func BenchmarkFileStoreScanMasked(b *testing.B) {
 	if testing.Short() {
 		b.Skip("100k-document corpus is too slow for -short")
 	}
-	collection, done := openBenchReadCollection(b, benchReadCorpusSize)
+	collection, done := openBenchReadCollectionWithOptions(
+		b, benchReadCorpusSize, benchMaskedReadOptions(),
+	)
 	defer done()
 	snapshot, err := collection.Snapshot()
 	if err != nil {
@@ -242,59 +355,9 @@ func BenchmarkFileStoreScanMasked(b *testing.B) {
 	}
 	defer snapshot.Close()
 	// A fixed slot bit is not guaranteed to name a row in the stable hash
-	// directory. Derive one real occupied slot per live tile from
-	// the admitted unified leaves so setup does not benchmark an empty scan.
-	router := collection.primaryRouter.Load()
-	if router == nil {
-		b.Fatal("ordered-primary router is unavailable")
-	}
-	byChunk := make(map[uint32]uint64, router.Len()*2)
-	bounds := collection.primaryLeafBounds(snapshot.state)
-	for rank := 0; rank < router.Len(); rank++ {
-		route, ok := router.RouteAtRank(rank)
-		if !ok {
-			b.Fatalf("primary route %d is unavailable", rank)
-		}
-		lease, acquireErr := router.AcquireLeaf(collection.cache, route)
-		if acquireErr != nil {
-			b.Fatal(acquireErr)
-		}
-		view, admitted := storeio.AdmittedCommonPrimaryUnifiedLeaf(
-			lease.Page(), snapshot.state.root.StoreID, route.Bucket, bounds,
-		)
-		if !admitted {
-			lease.Release()
-			b.Fatalf("primary bucket %d is not unified", route.Bucket)
-		}
-		slots, slotsOK := view.PostingSlots()
-		if !slotsOK {
-			lease.Release()
-			b.Fatalf("primary bucket %d has invalid posting slots", route.Bucket)
-		}
-		for row := 0; row < view.Len(); row++ {
-			slot := slots[row]
-			chunk := uint32(route.Bucket)<<2 | uint32(slot>>6)
-			if _, exists := byChunk[chunk]; !exists {
-				byChunk[chunk] = uint64(1) << uint(slot&63)
-			}
-		}
-		lease.Release()
-	}
-	chunks := make([]uint32, 0, len(byChunk))
-	for chunk := range byChunk {
-		chunks = append(chunks, chunk)
-	}
-	slices.Sort(chunks)
-	masks := make([]store.Mask, 0, len(chunks))
-	for _, chunk := range chunks {
-		masks = append(masks, store.Mask{
-			Chunk: chunk,
-			Bits:  byChunk[chunk],
-		})
-	}
-	if len(masks) == 0 {
-		b.Fatal("masked benchmark found no live posting tiles")
-	}
+	// directory. Derive one real occupied slot per live tile from the admitted
+	// compact stripes so setup does not benchmark an empty scan.
+	masks := benchOneMaskPerLiveTile(b, collection, snapshot)
 	var scratch []byte
 	seen := 0
 	visit := func(_, value []byte) error {

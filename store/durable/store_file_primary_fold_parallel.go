@@ -125,7 +125,7 @@ func (c *Collection) setupPrimaryNativeFoldContexts() {
 				storeio.CommonPrimaryLeafWideSlots,
 			)
 		}
-		context.builder = storeio.NewUnifiedPrimaryScalarPatchBuilder()
+		context.builder = storeio.NewCompactPrimaryPatchBuilder()
 		if index != 0 {
 			context.jobs = make(chan primaryNativeFoldJob)
 			context.done = make(chan struct{})
@@ -216,9 +216,11 @@ func (c *Collection) preparePrimaryNativeFoldWave(
 	}
 }
 
-// preparePrimaryNativeFold admits the compact source in parallel, but leaves
-// encoding to the deterministic serial foreground fold. The retired class-5
-// byte-patcher cannot safely patch column streams in place.
+// preparePrimaryNativeFold performs the exact compact-column replacement
+// certificate before the serial foreground fold. A successful image changes
+// only its replanned scalar streams and is byte-identical to the complete
+// compact planner. Structural, volatile-overflow, or plan-changing buckets
+// decline to the deterministic serial fallback.
 func (c *Collection) preparePrimaryNativeFold(
 	context *primaryNativeFoldContext,
 	pending *filePrimaryPendingParent,
@@ -230,8 +232,7 @@ func (c *Collection) preparePrimaryNativeFold(
 	}
 	context.resetResult()
 	if c == nil || pending == nil || base == nil ||
-		visible == nil || c.primaryUnifiedOverlay == nil ||
-		!c.primaryUnifiedOverlay.pendingBucket(pending.leafRoute.Bucket) {
+		visible == nil || c.primaryUnifiedOverlay == nil {
 		return
 	}
 	var lease storeio.PageLease
@@ -257,7 +258,7 @@ func (c *Collection) preparePrimaryNativeFold(
 		context.err = storeio.ErrCommonPrimaryLeafCorrupt
 		return
 	}
-	_, ok := storeio.AdmittedCompactPrimaryStripe(
+	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
 		lease.Page(), c.storeID, pending.leafRoute.Bucket,
 	)
 	if !ok {
@@ -267,6 +268,63 @@ func (c *Collection) preparePrimaryNativeFold(
 			pending.leafRoute.Bucket, pending.volatileRef,
 			lease.Header(), len(lease.Page()),
 		)
+		return
+	}
+	context.sourceSafe = !stripe.HasOverflowRows() ||
+		pending.volatileRef.Offset < base.fileEnd
+	if !context.sourceSafe {
+		return
+	}
+	if !c.primaryUnifiedOverlay.pendingBucket(pending.leafRoute.Bucket) {
+		header := stripe.Header()
+		if generation < header.Generation {
+			context.err = storeio.ErrGenerationOrder
+			return
+		}
+		if generation == header.Generation {
+			context.image = context.page[:len(lease.Page())]
+			copy(context.image, lease.Page())
+			context.native = true
+			return
+		}
+		image, cloneErr := storeio.CloneCompactPrimaryStripeGeneration(
+			context.page, lease.Page(), generation,
+		)
+		if cloneErr != nil {
+			context.err = cloneErr
+			return
+		}
+		context.image = image
+		context.native = true
+		return
+	}
+	replacements, allPuts, inspectErr :=
+		c.primaryUnifiedOverlay.primaryUnifiedFixedReplacements(
+			context.replacements[:0], pending.leafRoute.Bucket,
+			generation,
+		)
+	context.inspected = true
+	context.allPuts = allPuts
+	context.replacements = replacements
+	if inspectErr != nil {
+		context.err = inspectErr
+		return
+	}
+	if !allPuts || len(replacements) == 0 {
+		return
+	}
+	image, patched, patchErr := stripe.PatchCompactPrimaryStripeReplacements(
+		context.page, generation, replacements, context.builder,
+	)
+	c.primaryCompactColumnPatchAttempts.Add(1)
+	if patchErr != nil {
+		context.err = patchErr
+		return
+	}
+	if patched {
+		context.image = image
+		context.native = true
+		c.primaryCompactColumnPatches.Add(1)
 	}
 }
 
@@ -279,7 +337,7 @@ func (c *Collection) primaryNativeFoldAdditionalScratchBytes() uint64 {
 			bytes += uint64(cap(context.replacements)) *
 				uint64(unsafe.Sizeof(storeio.CommonPrimaryUnifiedReplacement{}))
 		}
-		bytes += context.builder.ScalarPatchCapacityBytes()
+		bytes += context.builder.CompactPatchCapacityBytes()
 		bytes += uint64(unsafe.Sizeof(*context))
 		// Runtime channel headers are opaque. Charge a conservative two cache
 		// lines per retained unbuffered channel rather than silently omitting

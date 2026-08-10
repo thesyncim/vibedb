@@ -101,7 +101,7 @@ func CreateFromRecords(
 // Put/Delete through the ordered-primary COW path.
 //
 // Exact indexes are built as posting tiles beside the ordered primary. Every
-// document is canonicalized once and every leaf uses the unified class-5
+// document is canonicalized once and every leaf uses the compact stripe
 // grammar. Schemas and overflow values are not implemented by this entry;
 // create an empty collection with Create and load it through Put when required.
 func CreateFromPrimary(

@@ -78,6 +78,46 @@ func primaryNativeFoldDistinctRows(
 	return nil
 }
 
+func TestPrimaryMutationScratchAccountsCompactColumnPlanner(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityBufferedVisible,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "compact-column-scratch-accounting.vibe",
+	)
+	defer file.Close()
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+
+	before := collection.Stats()
+	value := primaryNativeFoldTestReplacement(t, values[0])
+	created, err := collection.Put([]byte(keys[0]), value)
+	if err != nil || created {
+		t.Fatalf("Put = created %v, err %v", created, err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	after := collection.Stats()
+	if after.PrimaryCompactColumnPatches <= before.PrimaryCompactColumnPatches {
+		t.Fatalf(
+			"compact patches = %d, started at %d",
+			after.PrimaryCompactColumnPatches, before.PrimaryCompactColumnPatches,
+		)
+	}
+	if after.PrimaryMutationScratchBytes <= before.PrimaryMutationScratchBytes {
+		t.Fatalf(
+			"mutation scratch = %d, started at %d; compact planner growth was not charged",
+			after.PrimaryMutationScratchBytes, before.PrimaryMutationScratchBytes,
+		)
+	}
+}
+
 // TestFilePrimaryNativeFoldForegroundOverlap uses a worker-side barrier to
 // prove two independently routed native leaves are inside their codec lane at
 // the same time. The materializer itself runs in a third goroutine because

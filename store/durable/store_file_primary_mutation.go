@@ -73,6 +73,11 @@ type filePrimaryMutationPath struct {
 	tabletLease  storeio.PageLease
 	anchorLease  storeio.PageLease
 	leafLease    storeio.PageLease
+	// compactSource is the checksum-admitted stripe borrowed by the buffered
+	// mutation lane. That lane already owns its cache lease outside this path;
+	// retaining the slice here lets an existing-row replacement use the compact
+	// column patcher before falling back to the rendered mutation envelope.
+	compactSource []byte
 
 	root    storeio.GlobalTabletCatalogNodeView
 	branch  storeio.GlobalTabletCatalogNodeView
@@ -796,7 +801,7 @@ retryAfterUnifiedFold:
 		_, becameEmpty, filledEmpty, mutationErr :=
 			c.cowBufferedPrimaryMutation(
 				state, keyBytes, src, false, found, slot,
-				resident, &leaf,
+				resident, &leaf, leafLease.Page(),
 			)
 		leafLease.Release()
 		if mutationErr != nil {
@@ -1109,7 +1114,7 @@ retryAfterUnifiedDeleteFold:
 		_, becameEmpty, _, mutationErr :=
 			c.cowBufferedPrimaryMutation(
 				state, keyBytes, nil, true, true, slot,
-				resident, &leaf,
+				resident, &leaf, leafLease.Page(),
 			)
 		leafLease.Release()
 		if mutationErr != nil {
@@ -1219,6 +1224,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	slot uint8,
 	resident storeio.ResidentPrimaryRoute,
 	leaf *storeio.CommonPrimaryLeafView,
+	compactSource []byte,
 ) (
 	nextLeaf storeio.PageRef,
 	becameEmpty bool,
@@ -1287,7 +1293,9 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	value := storeio.CommonPrimaryLeafValue{Inline: src}
 	var overflowBytes uint64
 	var overflowPages int
-	preparePath := filePrimaryMutationPath{leaf: *leaf}
+	preparePath := filePrimaryMutationPath{
+		leaf: *leaf, compactSource: compactSource,
+	}
 	leafBounds := c.primaryLeafBounds(state)
 	if !deleting && !c.primaryOverflowValueIsInline(len(src)) {
 		head, ovBytes, ovPages, mintErr := c.mintBufferedPrimaryOverflowChain(
@@ -2909,9 +2917,16 @@ func (c *Collection) preparePrimaryLeafMutation(
 		return nil, 0, 0, storeio.ErrInvalidWrite
 	}
 	if !deleting && found && !value.IsOverflow() &&
-		len(path.leafLease.Page()) != 0 {
+		(len(path.compactSource) != 0 || len(path.leafLease.Page()) != 0) {
+		source := path.compactSource
+		bucket := path.leafRoute.Bucket
+		if len(source) == 0 {
+			source = path.leafLease.Page()
+		} else {
+			bucket = path.leaf.Header().Bucket
+		}
 		stripe, ok := storeio.AdmittedCompactPrimaryStripe(
-			path.leafLease.Page(), c.storeID, path.leafRoute.Bucket,
+			source, c.storeID, bucket,
 		)
 		if !ok {
 			return nil, 0, 0, storeio.ErrCommonPrimaryLeafCorrupt
@@ -2932,9 +2947,34 @@ func (c *Collection) preparePrimaryLeafMutation(
 		}
 		if bytes.Equal(c.overflowValueScratch, value.Inline) {
 			image, err := storeio.CloneCompactPrimaryStripeGeneration(
-				c.primaryLeafScratch, path.leafLease.Page(), generation,
+				c.primaryLeafScratch, source, generation,
 			)
 			return image, len(image), slot, err
+		}
+		patchSlot := slot
+		if admittedSlot, slotOK := stripe.PostingSlot(rank); slotOK {
+			// The temporary raw mutation envelope is re-placed and may assign a
+			// different hash slot. A compact column patch preserves the compact
+			// source's posting identity, which is the slot the exact-index delta
+			// must continue to name.
+			patchSlot = admittedSlot
+		}
+		var replacement [1]storeio.CommonPrimaryUnifiedReplacement
+		replacement[0] = storeio.CommonPrimaryUnifiedReplacement{
+			Key: key, Value: value.Inline, Slot: patchSlot,
+		}
+		image, patched, patchErr :=
+			stripe.PatchCompactPrimaryStripeReplacements(
+				c.primaryLeafScratch, generation, replacement[:],
+				c.primaryUnifiedBuilder,
+			)
+		c.primaryCompactColumnPatchAttempts.Add(1)
+		if patchErr != nil {
+			return nil, 0, 0, patchErr
+		}
+		if patched {
+			c.primaryCompactColumnPatches.Add(1)
+			return image, len(image), patchSlot, nil
 		}
 	}
 

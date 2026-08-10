@@ -210,6 +210,408 @@ func TestCompactPrimaryStripeDeterministic(t *testing.T) {
 	}
 }
 
+func TestCompactPrimaryStripeScalarReplacementMatchesFullPlanner(t *testing.T) {
+	page, view, records := compactPrimaryTestPage(t, 200, false)
+	const rank = 73
+	updated, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	score := bytes.Index(updated, []byte(`"score":`))
+	if score < 0 {
+		t.Fatal("score field is missing")
+	}
+	score += len(`"score":`)
+	if updated[score] == '9' {
+		updated[score] = '8'
+	} else {
+		updated[score]++
+	}
+	fast, ok, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+		[]CommonPrimaryUnifiedReplacement{{
+			Key: records[rank].Key, Value: updated, Slot: rank,
+		}},
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || !ok {
+		t.Fatalf("compact scalar patch = ok %v, err %v", ok, err)
+	}
+	fullRecords := append([]CommonPrimaryLeafRecord(nil), records...)
+	fullRecords[rank].Value.Inline = updated
+	want, err := EncodeBestCompactPrimaryStripe(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 2, Bucket: 0,
+		},
+		unifiedTestStoreID(), fullRecords, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fast, want) {
+		t.Fatalf(
+			"compact scalar patch differs from full planner (fast=%d full=%d source=%d)",
+			len(fast), len(want), len(page),
+		)
+	}
+}
+
+func TestCompactPrimaryStripeMultiShapeReplacementsMatchFullPlanner(t *testing.T) {
+	page, view, records := compactPrimaryTestPage(t, 200, false)
+	selected := make(map[int]int)
+	for rank := range records {
+		shape := view.rowShape(rank)
+		if _, exists := selected[shape]; !exists {
+			selected[shape] = rank
+		}
+	}
+	if len(selected) < 2 {
+		t.Fatalf("fixture produced only %d compact shape", len(selected))
+	}
+	replacements := make([]CommonPrimaryUnifiedReplacement, 0, len(selected))
+	fullRecords := append([]CommonPrimaryLeafRecord(nil), records...)
+	for _, rank := range selected {
+		updated, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		score := bytes.Index(updated, []byte(`"score":`))
+		if score < 0 {
+			t.Fatal("score field is missing")
+		}
+		score += len(`"score":`)
+		if updated[score] == '9' {
+			updated[score] = '8'
+		} else {
+			updated[score]++
+		}
+		replacements = append(replacements, CommonPrimaryUnifiedReplacement{
+			Key: records[rank].Key, Value: updated, Slot: uint8(rank),
+		})
+		fullRecords[rank].Value.Inline = updated
+	}
+	fast, ok, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+		replacements, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || !ok {
+		t.Fatalf("compact multi-shape patch = ok %v, err %v", ok, err)
+	}
+	want, err := EncodeBestCompactPrimaryStripe(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 2, Bucket: 0,
+		},
+		unifiedTestStoreID(), fullRecords, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fast, want) {
+		t.Fatalf(
+			"compact multi-shape patch differs from full planner (fast=%d full=%d source=%d shapes=%d)",
+			len(fast), len(want), len(page), len(selected),
+		)
+	}
+}
+
+func TestCompactPrimaryStripeNetZeroMultiShapeDeltaMatchesFullPlanner(t *testing.T) {
+	const rowsPerShape = 64
+	records := make([]CommonPrimaryLeafRecord, 2*rowsPerShape)
+	for rank := range records {
+		value := []byte(`{"a":0}`)
+		if rank >= rowsPerShape {
+			value = []byte(`{"b":0}`)
+		}
+		records[rank] = CommonPrimaryLeafRecord{
+			Key: []byte(benchcorpus.Key(rank)),
+			Value: CommonPrimaryLeafValue{
+				Inline: value,
+			},
+		}
+	}
+	// The second shape begins with the same outlier the first shape gains below.
+	// Replanning the two independent streams therefore produces exact opposite
+	// nonzero byte deltas while leaving the complete payload length unchanged.
+	records[rowsPerShape].Value.Inline = []byte(`{"b":2147483647}`)
+	builder := NewUnifiedPrimaryLeafBuilder()
+	payload, err := BuildCompactPrimaryStripePayload(records, builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extent := int(physicalPageQuantum)
+	for extent < PageHeaderSize+len(payload)+PageTrailerSize {
+		extent <<= 1
+	}
+	storeID := unifiedTestStoreID()
+	page, err := EncodeCompactPrimaryStripe(
+		make([]byte, extent),
+		CommonPrimaryLeafHeader{
+			StoreID: storeID, Generation: 1, Bucket: 0,
+			PageSize: uint32(extent),
+		},
+		records, builder,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logicalID, _ := CommonPrimaryLeafLogicalID(0)
+	view, err := OpenCompactPrimaryStripe(
+		page, storeID, 0,
+		PageRef{
+			Offset: 4096, Length: uint32(extent), LogicalID: logicalID,
+			Generation: 1, Kind: PagePrimaryLeaf,
+		},
+		1, unifiedTestBounds(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sourcePayload, err := OpenPage(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.rowShape(0) == view.rowShape(rowsPerShape) {
+		t.Fatal("fixture did not produce two compact shapes")
+	}
+	replacements := []CommonPrimaryUnifiedReplacement{
+		{Key: records[0].Key, Value: []byte(`{"a":2147483647}`), Slot: 0},
+		{
+			Key: records[rowsPerShape].Key, Value: []byte(`{"b":0}`),
+			Slot: rowsPerShape,
+		},
+	}
+	var deltas [2]int
+	for index := range replacements {
+		patched, ok, patchErr := view.PatchCompactPrimaryStripeReplacements(
+			make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+			replacements[index:index+1], NewUnifiedPrimaryLeafBuilder(),
+		)
+		if patchErr != nil || !ok {
+			t.Fatalf("individual compact patch %d = ok %v, err %v", index, ok, patchErr)
+		}
+		_, individualPayload, openErr := OpenPage(patched)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		deltas[index] = len(individualPayload) - len(sourcePayload)
+	}
+	if deltas[0] == 0 || deltas[0]+deltas[1] != 0 {
+		t.Fatalf("fixture deltas are not nonzero opposites: %v", deltas)
+	}
+	fast, ok, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2, replacements,
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || !ok {
+		t.Fatalf("compact net-zero patch = ok %v, err %v", ok, err)
+	}
+	fullRecords := append([]CommonPrimaryLeafRecord(nil), records...)
+	fullRecords[0].Value.Inline = replacements[0].Value
+	fullRecords[rowsPerShape].Value.Inline = replacements[1].Value
+	want, err := EncodeBestCompactPrimaryStripe(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 2, Bucket: 0,
+		},
+		unifiedTestStoreID(), fullRecords, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, finalPayload, err := OpenPage(fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalPayload) != len(sourcePayload) {
+		t.Fatalf(
+			"net-zero payload length changed: source=%d final=%d deltas=%d,%d",
+			len(sourcePayload), len(finalPayload), deltas[0], deltas[1],
+		)
+	}
+	if !bytes.Equal(fast, want) {
+		t.Fatalf(
+			"net-zero compact patch differs from full planner (source=%d final=%d deltas=%d,%d shapes=%d,%d)",
+			len(sourcePayload), len(finalPayload), deltas[0], deltas[1],
+			view.rowShape(0), view.rowShape(rowsPerShape),
+		)
+	}
+}
+
+func TestCompactPrimaryStripeMultiColumnReplacementsMatchFullPlanner(t *testing.T) {
+	page, view, records := compactPrimaryTestPage(t, 200, false)
+	ranks := [...]int{11, 73, 129}
+	replacements := make([]CommonPrimaryUnifiedReplacement, 0, len(ranks))
+	fullRecords := append([]CommonPrimaryLeafRecord(nil), records...)
+	for index, rank := range ranks {
+		updated, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch index {
+		case 0:
+			at := bytes.Index(updated, []byte(`"score":`)) + len(`"score":`)
+			if at < len(`"score":`) || at >= len(updated) {
+				t.Fatal("score field is missing")
+			}
+			if updated[at] == '9' {
+				updated[at] = '8'
+			} else {
+				updated[at]++
+			}
+		case 1:
+			if at := bytes.Index(updated, []byte(`"active":true`)); at >= 0 {
+				updated = append(updated[:at], append([]byte(`"active":false`), updated[at+len(`"active":true`):]...)...)
+			} else if at := bytes.Index(updated, []byte(`"active":false`)); at >= 0 {
+				updated = append(updated[:at], append([]byte(`"active":true`), updated[at+len(`"active":false`):]...)...)
+			} else {
+				t.Fatal("active field is missing")
+			}
+		case 2:
+			at := bytes.Index(updated, []byte(`"country":"`)) + len(`"country":"`)
+			if at < len(`"country":"`) || at+2 > len(updated) {
+				t.Fatal("country field is missing")
+			}
+			copy(updated[at:at+2], "ZZ")
+		}
+		replacements = append(replacements, CommonPrimaryUnifiedReplacement{
+			Key: records[rank].Key, Value: updated, Slot: uint8(rank),
+		})
+		fullRecords[rank].Value.Inline = updated
+	}
+	fast, ok, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+		replacements, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || !ok {
+		t.Fatalf("compact multi-column patch = ok %v, err %v", ok, err)
+	}
+	want, err := EncodeBestCompactPrimaryStripe(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 2, Bucket: 0,
+		},
+		unifiedTestStoreID(), fullRecords, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fast, want) {
+		t.Fatalf(
+			"compact multi-column patch differs from full planner (fast=%d full=%d source=%d)",
+			len(fast), len(want), len(page),
+		)
+	}
+}
+
+func TestCompactPrimaryStripeDenseReplacementBatchMatchesFullPlanner(t *testing.T) {
+	for _, high := range []bool{false, true} {
+		page, view, records := compactPrimaryTestPage(t, 256, high)
+		replacements := make([]CommonPrimaryUnifiedReplacement, 0, 52)
+		fullRecords := append([]CommonPrimaryLeafRecord(nil), records...)
+		for rank := 0; rank < len(records); rank += 5 {
+			updated, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+			if err != nil {
+				t.Fatal(err)
+			}
+			score := bytes.Index(updated, []byte(`"score":`)) + len(`"score":`)
+			if score < len(`"score":`) || score >= len(updated) {
+				t.Fatal("score field is missing")
+			}
+			if updated[score] == '9' {
+				updated[score] = '8'
+			} else {
+				updated[score]++
+			}
+			replacements = append(replacements, CommonPrimaryUnifiedReplacement{
+				Key: records[rank].Key, Value: updated, Slot: uint8(rank),
+			})
+			fullRecords[rank].Value.Inline = updated
+		}
+		fast, ok, err := view.PatchCompactPrimaryStripeReplacements(
+			make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+			replacements, NewUnifiedPrimaryLeafBuilder(),
+		)
+		if err != nil || !ok {
+			t.Fatalf("high=%t dense compact patch = ok %v, err %v", high, ok, err)
+		}
+		want, err := EncodeBestCompactPrimaryStripe(
+			make([]byte, CommonPrimaryLeafMaxExtentBytes),
+			CommonPrimaryLeafHeader{
+				StoreID: unifiedTestStoreID(), Generation: 2, Bucket: 0,
+			},
+			unifiedTestStoreID(), fullRecords, NewUnifiedPrimaryLeafBuilder(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(fast, want) {
+			t.Fatalf(
+				"high=%t dense compact patch differs from full planner (fast=%d full=%d source=%d)",
+				high, len(fast), len(want), len(page),
+			)
+		}
+	}
+}
+
+func TestCompactPrimaryStripePatchRejectsDuplicateKey(t *testing.T) {
+	_, view, records := compactPrimaryTestPage(t, 200, false)
+	const rank = 73
+	first, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := append([]byte(nil), first...)
+	score := bytes.Index(first, []byte(`"score":`)) + len(`"score":`)
+	country := bytes.Index(second, []byte(`"country":"`)) + len(`"country":"`)
+	if score < len(`"score":`) || country < len(`"country":"`) {
+		t.Fatal("fixture fields are missing")
+	}
+	first[score] = '7'
+	copy(second[country:country+2], "ZZ")
+	_, ok, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+		[]CommonPrimaryUnifiedReplacement{
+			{Key: records[rank].Key, Value: first, Slot: rank},
+			{Key: records[rank].Key, Value: second, Slot: rank},
+		},
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || ok {
+		t.Fatalf("duplicate-key patch = ok %v, err %v; want safe decline", ok, err)
+	}
+}
+
+func TestCompactPrimaryStripePatchClipsLargerBackingBuffer(t *testing.T) {
+	page, _, records := compactPrimaryTestPage(t, 200, false)
+	larger := append(append([]byte(nil), page...), make([]byte, 4096)...)
+	view, ok := AdmittedCompactPrimaryStripe(larger, unifiedTestStoreID(), 0)
+	if !ok {
+		t.Fatal("larger backing buffer was not admitted")
+	}
+	const rank = 73
+	updated, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	score := bytes.Index(updated, []byte(`"score":`)) + len(`"score":`)
+	updated[score]++
+	patched, accepted, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+		[]CommonPrimaryUnifiedReplacement{{
+			Key: records[rank].Key, Value: updated, Slot: rank,
+		}},
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || !accepted || len(patched) > len(page) {
+		t.Fatalf(
+			"larger-buffer patch = bytes %d, accepted %v, err %v; source page %d",
+			len(patched), accepted, err, len(page),
+		)
+	}
+}
+
 func TestCompactPrimaryStripeCorruptionRejected(t *testing.T) {
 	page, _, _ := compactPrimaryTestPage(t, 1000, false)
 	corrupt := append([]byte(nil), page...)
