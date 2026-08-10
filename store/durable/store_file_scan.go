@@ -460,15 +460,24 @@ func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
 	return err
 }
 
-// RangeRawBuffer is RangeRaw with caller-owned overflow storage. The returned
-// slice preserves any grown capacity for the next scan. Inline-only scans and
-// warmed overflow scans allocate nothing when scratch has sufficient capacity.
+// RangeRawBuffer is RangeRaw with optional caller-owned overflow storage. When
+// scratch is nil, the snapshot retains the grown buffer for subsequent scans;
+// when scratch is non-nil, the returned slice preserves its grown capacity for
+// the caller. Inline-only scans and warmed overflow scans allocate nothing when
+// the selected scratch has sufficient capacity.
 func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return scratch, ErrClosed
 	}
 	if fn == nil {
 		return scratch, nil
+	}
+	if scratch == nil {
+		retained, err := s.rangePrimaryGraphBuffer(
+			nil, nil, nil, s.scanSpliceScratch, fn,
+		)
+		s.scanSpliceScratch = retained
+		return nil, err
 	}
 	return s.rangePrimaryGraphBuffer(nil, nil, nil, scratch, fn)
 }
