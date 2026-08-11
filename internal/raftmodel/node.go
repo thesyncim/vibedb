@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/confchange"
@@ -170,7 +171,7 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 		}
 		pub = reconciled.published
 	}
-	if err := validateConfState(pub.ConfState, last); err != nil {
+	if err := ValidateConfState(pub.ConfState, last); err != nil {
 		return nil, fmt.Errorf("raftmodel: published ConfState: %w", err)
 	}
 	if pub.Applied < base || pub.Applied > committed {
@@ -738,7 +739,7 @@ func (n *Node) applyEntry(entry *pb.Entry) error {
 		if err := predicted.Equivalent(confState); err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, fmt.Errorf("core ConfState differs from preflight: %w", err))
 		}
-		if err := validateConfState(confState, meta.Index); err != nil {
+		if err := ValidateConfState(confState, meta.Index); err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, fmt.Errorf("core ConfState is invalid: %w", err))
 		}
 		pub, err := n.machine.ApplyConfiguration(meta, confState)
@@ -864,7 +865,7 @@ func (n *Node) preflightConfChange(change pb.ConfChangeI, lastIndex uint64) (*pb
 	progress.Config = nextConfig
 	progress.Progress = nextMembers
 	predicted := progress.ConfState()
-	if err := validateConfState(predicted, lastIndex); err != nil {
+	if err := ValidateConfState(predicted, lastIndex); err != nil {
 		return nil, fmt.Errorf("raftmodel: resulting configuration is invalid: %w", err)
 	}
 	return predicted, nil
@@ -908,13 +909,18 @@ func validateSnapshotEnvelope(snapshot *pb.Snapshot) error {
 	if len(snapshot.GetData()) > MaxSnapshotBytes {
 		return fmt.Errorf("%w: snapshot bytes %d exceed %d", ErrAdmissionBound, len(snapshot.GetData()), MaxSnapshotBytes)
 	}
-	if err := validateConfState(metadata.GetConfState(), metadata.GetIndex()); err != nil {
+	if err := ValidateConfState(metadata.GetConfState(), metadata.GetIndex()); err != nil {
 		return fmt.Errorf("snapshot ConfState: %w", err)
 	}
 	return nil
 }
 
-func validateConfState(state *pb.ConfState, lastIndex uint64) error {
+// ValidateConfState proves that state is one bounded, canonical configuration
+// that the synchronous RawNode integration can restore at lastIndex. State is
+// borrowed and is never mutated or retained. State-machine codecs call this
+// before persistence so a durable publication can never become unrecoverable
+// only when a later Node is constructed.
+func ValidateConfState(state *pb.ConfState, lastIndex uint64) error {
 	if state == nil {
 		return errors.New("ConfState is nil")
 	}
@@ -932,6 +938,9 @@ func validateConfState(state *pb.ConfState, lastIndex uint64) error {
 		state.GetVoters(), state.GetVotersOutgoing(), state.GetLearners(), state.GetLearnersNext(),
 	}
 	for _, members := range memberSets {
+		if !slices.IsSorted(members) {
+			return errors.New("ConfState member lists are not canonically sorted")
+		}
 		if len(members) > MaxConfStateMembers-memberCount {
 			return fmt.Errorf("%w: ConfState members exceed %d", ErrAdmissionBound, MaxConfStateMembers)
 		}

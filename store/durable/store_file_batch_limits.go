@@ -53,3 +53,32 @@ func (c *Collection) MaxBatchBytes() int {
 	}
 	return c.options.MaxBatchBytes
 }
+
+// HasSchema reports whether the collection's sealed logical definition
+// enforces a document schema. The result is immutable for the collection
+// lifetime. Integration layers that accept an explicitly schema-free command
+// grammar use this at construction instead of trusting a caller assertion that
+// could make committed input fail only at apply time.
+func (c *Collection) HasSchema() bool {
+	return c != nil && c.options.Collection.Schema != nil
+}
+
+// HasIndexes reports whether the collection's current durable logical catalog
+// contains any exact index definitions. The result is captured under the same
+// publication gate as snapshots and online index changes.
+func (c *Collection) HasIndexes() bool {
+	if c == nil {
+		return false
+	}
+	c.snapshotGate.RLock()
+	defer c.snapshotGate.RUnlock()
+	return len(c.options.Indexes) != 0
+}
+
+// HasSynchronousDurability reports whether every acknowledged mutation is
+// fenced before it becomes visible. Replicated state-machine construction uses
+// this to refuse volatile or deferred-acknowledgement handles before a
+// committed entry can reach apply.
+func (c *Collection) HasSynchronousDurability() bool {
+	return c != nil && c.options.Durability == DurabilitySync
+}

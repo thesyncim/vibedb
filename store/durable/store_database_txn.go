@@ -221,6 +221,95 @@ func (l *TxnLog) Close() error {
 	return errors.Join(markerErr, rootErr)
 }
 
+// ValidateCollections proves that every named collection is an exact live
+// regular-file entry in the physical directory owned by this transaction log.
+// It performs no registration, marker minting, staging, or publication.
+//
+// Integration layers use this before they admit work whose apply path may
+// require a multi-collection decision. The commit path repeats the same proof:
+// this construction-time check prevents a static wiring error from being
+// discovered only after a committed command reaches apply; it is not a lease
+// over future namespace changes.
+func (l *TxnLog) ValidateCollections(members []NamedCollection) error {
+	ordered, err := validateTxnMembers(members)
+	if err != nil {
+		return err
+	}
+	if len(ordered) == 0 {
+		return nil
+	}
+	if l == nil {
+		return fmt.Errorf("%w: nil transaction log", ErrTxnParticipant)
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	if l.marker != nil {
+		current, currentErr := l.marker.EntryCurrent()
+		if currentErr != nil {
+			return fmt.Errorf("vibedb: prove transaction log entry: %w", currentErr)
+		}
+		if !current {
+			return fmt.Errorf(
+				"%w: transaction log entry changed while open",
+				storeio.ErrTxnMarkerCorrupt,
+			)
+		}
+	}
+	collections := make([]*Collection, len(ordered))
+	nameOf := make(map[*Collection]string, len(ordered))
+	for i := range ordered {
+		collections[i] = ordered[i].Collection
+		nameOf[ordered[i].Collection] = ordered[i].Name
+	}
+	sortCollectionSnapshotOrder(collections)
+	for _, collection := range collections {
+		collection.writer.Lock()
+	}
+	defer func() {
+		for i := len(collections) - 1; i >= 0; i-- {
+			collections[i].writer.Unlock()
+		}
+	}()
+	for _, collection := range collections {
+		name := nameOf[collection]
+		if collection.closed {
+			return fmt.Errorf("%w: closed collection %q", ErrTxnParticipant, name)
+		}
+		if failure := collection.PersistenceError(); failure != nil {
+			return fmt.Errorf("vibedb: collection %q persistence: %w", name, failure)
+		}
+		if !databaseTxnLaneSupported(collection) {
+			return fmt.Errorf("%w: %s", ErrDatabaseTransactionUnsupportedLane, name)
+		}
+		if collection.file == nil {
+			return fmt.Errorf("%w: closed collection %q", ErrTxnParticipant, name)
+		}
+		var matches bool
+		var matchErr error
+		if l.marker != nil {
+			matches, matchErr = l.marker.MatchesFileDirectory(collection.file)
+		} else {
+			matches, matchErr = storeio.FileMatchesDirectory(l.rootInfo, collection.file)
+		}
+		if matchErr != nil {
+			return fmt.Errorf(
+				"vibedb: prove collection %q transaction directory: %w",
+				name, matchErr,
+			)
+		}
+		if !matches {
+			return fmt.Errorf("%w: %s", ErrTransactionLogDirectoryMismatch, name)
+		}
+	}
+	return nil
+}
+
 // registerCollection records c as catalog-scoped under this log so a later
 // decision-sync failure poisons it alongside commit participants.
 func (l *TxnLog) registerCollection(c *Collection) {

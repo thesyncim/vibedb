@@ -857,12 +857,16 @@ func TestConfigurationResultCannotExceedRecoveryMemberBound(t *testing.T) {
 		learners[i] = uint64(i + 2)
 	}
 	exact := &pb.ConfState{Voters: []uint64{1}, Learners: learners}
-	if err := validateConfState(exact, 1); err != nil {
+	if err := ValidateConfState(exact, 1); err != nil {
 		t.Fatalf("exact member bound error = %v", err)
+	}
+	unsorted := &pb.ConfState{Voters: []uint64{2, 1}}
+	if err := ValidateConfState(unsorted, 1); err == nil {
+		t.Fatal("unsorted member list passed canonical validation")
 	}
 	overflow := cloneConfState(exact)
 	overflow.Learners = append(overflow.Learners, uint64(MaxConfStateMembers+1))
-	if err := validateConfState(overflow, 1); !errors.Is(err, ErrAdmissionBound) {
+	if err := ValidateConfState(overflow, 1); !errors.Is(err, ErrAdmissionBound) {
 		t.Fatalf("member bound overflow error = %v", err)
 	}
 

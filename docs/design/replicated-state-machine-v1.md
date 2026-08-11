@@ -1,0 +1,253 @@
+# Replicated state machine v1
+
+Status: Phase 1b unserved apply contract.
+
+This design defines the first production-refinable implementation of
+`raftmodel.StateMachine`. It applies one frozen `replication.CommandV1` to one
+durable user collection and publishes the matching completion and Raft applied
+state atomically through one hidden durable system collection.
+
+This is deliberately not a serving or high-availability milestone. It does not
+wire shard RPCs to Raft, permit replicated SQL writes, create runtime
+snapshots, compact the Raft WAL, reserve long-lived completion capacity, run a
+Multi-Raft scheduler, or authorize Read Committed or Serializable transactions
+across replicas. Its purpose is to make the local committed-entry boundary
+executable and crash-testable before those features depend on it.
+
+## Scope and construction
+
+One machine owns:
+
+- one exact replicated shard binding;
+- one hidden synchronous durable system collection;
+- one frozen named synchronous durable user collection;
+- the catalog-scoped `durable.TxnLog` shared by those collections; and
+- explicit nonzero cross-collection transaction limits.
+
+The v1 admission profile supports exactly one user collection and inline
+fixed-format mutation completions only. Both system and user handles must use
+the synchronous durability lane and must have no exact indexes. User values are
+JSON documents. Schema, indexes, and primary-key policy belong to the future
+SQL adapter; this slice accepts only a schema-free collection and verifies that
+profile against the sealed durable handle at construction. The collection and
+binding cannot change while the machine is open.
+
+Construction also proves that the transaction log and both collections are
+live entries in the same physical directory. This proof performs no marker
+minting or storage mutation, and the commit path repeats it before staging; a
+miswired log therefore cannot first be discovered after a committed entry has
+reached apply.
+
+The binding carries the immutable logical lineage needed to reject a command
+from another shard or recovery lineage:
+
+```text
+ClusterID and ClusterIncarnation
+TopologyRecoveryEpoch
+Distribution and Shard
+AllocationGeneration and ShardIncarnation
+GroupID
+```
+
+V1 also pins one accepted mutable authority profile at construction:
+
+```text
+ActivePolicyGeneration and ProtectionEpoch
+OwnershipEpoch
+SchemaGeneration
+RoutingVersion and RouteGeneration
+```
+
+`ReplicaSetVersion` is publication state rather than immutable construction
+identity. Configuration application advances it to the configuration entry's
+Raft index. The other authority generations are static only because this
+unserved slice has no topology-command grammar yet; the state record keeps
+them distinct from immutable lineage so a later committed authority update can
+advance them without rebuilding the machine. In particular, a future serving
+contract must represent election term/leader authority explicitly rather than
+silently treating this pinned `OwnershipEpoch` as a forever-static lease.
+
+The current SQL shard-store identity is intentionally insufficient here. Its
+random local `LogID` is neither the shared Raft `GroupID` nor a distributed
+serving lease. A later SQL binding must persist this full tuple and prove that
+its local `MemberID`, `StoreID`, and enrolled hosting `NodeID` match the Raft
+WAL before constructing a node. Those local coordinates fence one physical
+replica and do not belong in the portable logical snapshot, whose position is
+the shared `(ShardIncarnation, GroupID, AppliedSequence)` lineage.
+
+## Hidden system collection
+
+The system collection contains one fixed state key and one completion record
+per retained client command. Its values are strict versioned binary records
+wrapped in one canonical JSON string because durable collections accept JSON
+documents.
+
+The state record binds at least:
+
+- the exact construction binding;
+- `Applied`, the last entry term and type, and a digest of the exact normal
+  entry or the configuration apply identity;
+- the canonical logical data digest;
+- the exact deterministic `ConfState`;
+- `ReplicaSetVersion`;
+- the exact static-bootstrap snapshot identity; and
+- the retained completion count.
+
+Unknown versions, duplicate or noncanonical fields, invalid checksums, an
+inconsistent binding, an impossible index transition, or a state record that
+does not match the user collection fail closed.
+
+A completion key is a domain-separated SHA-256 digest of length-framed tenant,
+client ID, client epoch, and client sequence. `RetryHome` is deliberately not
+part of the key: changing it for the same client sequence must conflict with
+the retained command, not create a second command. The stored record repeats
+the full client tuple and retry home, retains a digest of the exact
+`CommandV1` bytes, and contains the exact `CompletionV1`; lookup never trusts a
+hash match without comparing those fields.
+
+## Ordered normal application
+
+Application accepts only the next index. Repeating the current index is
+idempotent only when term, entry type, and exact entry digest match the state
+record. Entry terms may not decrease. Gaps, regressions, term regressions, or
+different bytes at the same index are corruption.
+
+An empty normal entry advances only the state record. A nonempty entry is
+opened through the frozen command codec and checked against the complete
+binding and current mutable generations before any durable mutation. A
+committed entry carrying another cluster, shard, recovery lineage, or group is
+log corruption and fails the machine; it is not converted into a client
+rejection. Only mismatched mutable authority generations have deterministic
+no-op completion semantics.
+
+For a new valid client identity:
+
+1. Preserve mutation ordinal order and collapse repeated keys to their final
+   Put/Delete effect. This is semantic last-write-wins, not key sorting or
+   command normalization.
+2. Omit deletes of absent keys and puts whose exact value is already present.
+3. Validate every final key/value against the frozen collection profile.
+4. Compute the prospective logical digest from the canonical ordered
+   key/value image plus the final overlay.
+5. Stage changed user keys, the exact completion, and the next state record in
+   one `durable.UpdateCollections` call.
+6. Publish the in-memory reader state only after the durable operation has
+   published both collections.
+
+If no user key changes, the system collection is the only dirty participant.
+If user data changes, the transaction decision sync is the sole atomic commit
+point. Recovery therefore exposes either the old user data and old system
+state, or the new data, completion, and publication together—never a mixture.
+
+An exact later duplicate leaves user data and the original completion bytes
+unchanged, advances only `Applied`, and returns the original completion. The
+original `AppliedSequence` is not rewritten. Reusing a client sequence with a
+different fingerprint, retry home, collection, or exact command digest is a
+persisted no-op conflict: user data and the old completion remain unchanged,
+while the state record advances for the committed Raft entry.
+
+Stale mutable generations and other deterministic application refusals also
+advance as persisted no-ops with a bounded rejection completion. A corrupt
+command envelope, corrupt retained record, impossible state transition, or
+storage failure is terminal to the machine because replicas cannot safely
+choose different interpretations.
+
+The fixed v1 completion represents only this low-level unconditional mutation
+batch. `CommandV1` carries no arbitrary SQL result, expected row revisions,
+read set, predicate, or multi-collection intent. A later SQL command format is
+required before replicated SQL DML can preserve its existing transaction
+semantics.
+
+## Configuration and static snapshot
+
+A configuration entry mutates only the system state. It persists the exact
+core-produced `ConfState`, sets `ReplicaSetVersion` to the entry index, advances
+`Applied`, and leaves the logical data digest unchanged.
+
+The current state-machine port supplies configuration metadata plus the
+core-produced `ConfState`, not the original `ConfChange` bytes. Its retained
+configuration digest therefore binds index, term, entry type, and deterministic
+`ConfState`; it is exact at the apply-port boundary but is not a claim to retain
+the original configuration proposal envelope.
+
+V1 accepts only the exact static bootstrap snapshot fixed at construction.
+Installation is an idempotent verification at the same cut, including exact
+snapshot bytes/identity, logical digest, `ConfState`, binding, and replica-set
+version. A newer runtime snapshot is unsupported until the snapshot repository
+and WAL generation-swap protocol exist.
+
+## Reader publication and reopen
+
+`Applied()` and `Published()` read one immutable publication pointer. A
+coherent snapshot operation holds the machine publication lock while one
+`durable.SnapshotCollections` cut pins both the hidden system collection and
+the user collection, then captures the matching publication. The pin remains
+live through export and is closed on every outcome. Consumers must not pair an
+independently acquired raw collection snapshot with an applied index, and an
+exporter must not omit the completion bytes merely because the publication
+pointer itself is coherent.
+
+Open decodes the system state, compares the full binding, verifies the static
+snapshot contract, recomputes the canonical logical digest from user data, and
+publishes that exact state before returning. If an apply returned an unknown
+outcome after the transaction decision may have become durable, the machine
+fails stop. Reopen resolves the decision and observes either the old cut or the
+fully new cut; `raftmodel.NewNode` then resumes from the recovered `Applied`
+watermark without reapplying an already published entry.
+
+The first runtime snapshot interface must pin precisely this coherent cut. Its
+manifest must include user data, every retained completion, the exact binding
+and mutable authority profile, last-entry identity, logical digest,
+`ConfState`, replica-set version, and applied index. The pin need not itself be
+durable: the repository must create, verify, sync, and publish an immutable
+artifact before compaction. Snapshot publication and WAL compaction therefore
+depend on this state-machine boundary, not the reverse.
+
+## Isolation boundary
+
+VibeDB's local SQL engine already implements Read Committed and Serializable.
+That does not make those modes replicated automatically.
+
+This v1 command is a blind, unconditional, single-collection write set. It can
+be ordered and deduplicated safely, but it cannot encode a state-dependent SQL
+predicate, read dependencies, per-key/tombstone revisions, a relation-level
+phantom fence, or a multi-table atomic intent. Replicated SQL writes must remain
+disabled until a later bounded command/result grammar carries those
+preconditions and the apply path updates durable conflict metadata.
+
+Read-only local transactions may continue to use the existing engine. A
+distributed strong read additionally needs leader authority plus `ReadIndex`
+and a coherent machine snapshot at or beyond that index. Cross-shard
+Serializable remains a separate distributed concurrency-control phase.
+
+## Qualification and remaining gates
+
+The v1 apply slice must retain the following qualification before any serving
+integration:
+
+- frozen state/completion-key golden vectors, strict decoding, fuzzing, 32-bit
+  builds, and allocation bounds;
+- Put/Delete/repeated-key/no-op differential histories against a reference map;
+- exact duplicate, fingerprint conflict, retry-home conflict, terminal
+  immutable-binding mismatch, and every mutable-generation no-op mismatch;
+- empty normal entries and configuration publication/reopen;
+- crash injection before each participant prepare, decision append/sync,
+  collection flip, reader publication, return, and Raft advance;
+- reopen checks proving data, completion, state, and logical digest are wholly
+  old or wholly new;
+- same-index exact replay versus different term/type/data corruption;
+- coherent reader snapshots racing apply; and
+- bounded capacity failures that occur before a committed entry can enter a
+  serving system.
+
+Before serving, later phases must add all of:
+
+1. exact SQL catalog and Raft-WAL identity binding plus a persistent direct-write
+   fence;
+2. admission that reserves completion/system/data capacity for every committed
+   in-flight entry, with a safe completion GC protocol;
+3. crash-atomic runtime snapshots and WAL generation compaction;
+4. bounded Multi-Raft scheduling and authenticated transport;
+5. leader-aware routing, applied-position tokens, completion lookup, and
+   `ReadIndex` reads; and
+6. a replicated SQL command grammar capable of the advertised isolation mode.
