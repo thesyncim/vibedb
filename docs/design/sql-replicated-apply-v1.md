@@ -9,8 +9,12 @@ transaction log, and underlying machine remain private to the driver.
 
 It is not a serving milestone. It grants no proposal authority, leadership,
 lease, peer authentication, `ReadIndex`, replicated position token, runtime
-snapshot/compaction, or completion-capacity reservation. It cannot advertise
-replicated Read Committed or Serializable writes.
+snapshot/compaction, or physical completion/system/user byte reservation. A
+separate static-WAL qualification can prove finite logical completion-count
+headroom only after exact binding, claim health, completion count, applied cut,
+WAL commit, and last-index checks. The result is an instantaneous predicate,
+not a lease, and cannot advertise replicated Read Committed or Serializable
+writes.
 
 ## Catalog and storage ownership
 
@@ -19,6 +23,8 @@ exact `replicated_shard_store` binding. It freezes:
 
 - its own format version and random hidden storage identity;
 - the deterministic validation profile and SHA-256 profile digest;
+- for apply format v2, the exact one-column placement profile, native tuple and
+  mapper versions, and half-open target key range;
 - the exact hidden collection key, document, batch-document, and batch-byte
   limits;
 - the retained completion maximum; and
@@ -48,10 +54,10 @@ namespace or transaction recovery.
 
 A process can die after activation's catalog rename and before receiving the
 random hidden storage identity. The dedicated settlement open takes the exact
-base identity and intended completion/transaction profile. It compares those
-before recovery, then returns the catalog's complete apply identity for durable
-retention. A profile-only normal open and a storage-ID-only settlement are not
-available.
+base identity and intended completion/transaction/placement profile. It
+compares those before recovery, then returns the catalog's complete apply
+identity for durable retention. A profile-only normal open and a
+storage-ID-only settlement are not available.
 
 Retained identities reject independently prepared roots, but cannot distinguish
 a byte-identical copy of either the SQL root or WAL root. Revocation and serving
@@ -59,10 +65,19 @@ therefore still require an external witness or lease.
 
 ## Deterministic SQL mutation profile
 
-The profile digest is domain separated and binds the profile version, logical
-user-table name, canonical primary JSON pointer, ordered-key grammar version,
-and all four user mutation limits. It excludes local filenames, SQL `LogID`,
-WAL `StoreID`, and member identity so the logical digest remains portable.
+The legacy format-v1 profile digest is byte-for-byte frozen and binds the
+profile version, logical user-table name, canonical primary JSON pointer,
+ordered-key grammar version, and all four user mutation limits. A zero
+placement option selects this legacy format and its result-format-v1 grammar.
+
+Apply format v2 adds a strict `ReplicatedPlacementProfileV1`. The profile
+admits exactly one shard-key pointer, requires it to equal the table's sole
+primary pointer, freezes tuple version 1 and `NativeMapperVersion`, and stores
+one exact half-open `KeyRange`. Its separately domain-separated validation
+digest also binds `Distribution`, `Shard`, `AllocationGeneration`,
+`RoutingVersion`, `RouteGeneration`, and every placement field. It excludes
+local filenames, SQL `LogID`, WAL `StoreID`, member identity, and other
+member-local coordinates so the logical digest remains portable.
 `SchemaGeneration` is currently the external assertion that every replica was
 provisioned with the same profile; `CommandV1` does not carry the digest, so
 this slice makes no cryptographic peer-attestation claim.
@@ -82,6 +97,21 @@ must reproduce the same bytes. Primary mismatch or invalid shape produces a
 durable `ResultInvalidDocument`; an over-bound derived key produces
 `ResultTargetBound`. Neither semantic refusal wedges ordered apply.
 
+Under apply format v2, placement narrows the admitted primary scalar to the
+native mapper's closed String/Number set. After primary/document agreement, a
+put maps that scalar and must fall inside the exact target range. A present
+delete routes the current document; an absent delete decodes and routes its
+sole ordered-key scalar. The range start is inclusive and its concrete end is
+exclusive. An otherwise valid mutation outside the range produces durable
+`ResultWrongShard` under result format 2. Format 1 retains only its original
+codes 1 through 5; format 2 uses those codes plus wrong-shard code 6, and
+retained completions are checked against the machine's exact profile on open,
+lookup, and dedupe.
+
+Open and coherent snapshot digesting re-run placement validation over every
+extant row. A copied, corrupt, or out-of-band row that belongs to another shard
+therefore fails closed even when no new mutation mentions it.
+
 ## Publication and SQL isolation fence
 
 The wrapper holds `database.mu` across every machine mutation. A user-changing
@@ -98,10 +128,11 @@ The claim holds one connector lifetime reference. Acquisition requires
 Closing the claim releases only its singleton capability and connector
 reference. It never unbinds the root or removes the hidden participant.
 
-This profile proves that a document and its canonical primary key agree; it
-does not prove that the key belongs to this shard's range or hash placement.
-Key-to-shard routing validation is a separate required admission/apply contract
-before serving.
+This profile proves document/primary agreement and deterministic placement for
+the current `CommandV1` shape only: one primary key that is also the one shard
+key, one native mapper, and one exact target range. Composite primary or shard
+keys, placement migration, and an end-to-end proof that a serving router chose
+the same fenced range remain future command/routing contracts.
 
 Local reads are still local reads. Strong distributed reads must later use
 leader authority, `ReadIndex`, and the exact coherent state-machine snapshot;
@@ -111,14 +142,19 @@ pairing `Published()` with an independently captured SQL snapshot is forbidden.
 
 Before a client request can use this boundary, the runtime still needs:
 
-1. reservation for every committed in-flight user/state/completion byte and a
-   safe completion GC protocol;
+1. an exact healthy, initialized apply claim and static no-compaction WAL now
+   have a count-only qualification when their full binding matches,
+   `C <= A-1`, `A <= commit <= L`, capacity format is exactly static v1, and
+   sealed `MaxEntries <= MaxCompletions`. It remains finite, instantaneous, and
+   non-serving; every committed in-flight user/state/completion byte still
+   needs physical reservation, completion GC needs durable forgotten floors,
+   and a compacting WAL needs a reconstructed suffix ledger;
 2. crash-atomic runtime snapshot export/install and WAL generation compaction;
 3. bounded Multi-Raft scheduling plus authenticated ordinary and snapshot
    transport;
-4. leadership-aware routing, retry/indeterminate result grammar, and shared
-   `(ShardIncarnation, GroupID, AppliedSequence)` positions, including
-   deterministic key-to-shard/range validation at apply;
+4. leadership-aware routing, retry/indeterminate result grammar, shared
+   `(ShardIncarnation, GroupID, AppliedSequence)` positions, and routing proof
+   for composite keys or future placement profiles;
 5. `ReadIndex`-gated coherent reads; and
 6. a later SQL command/result grammar with durable key/tombstone revisions,
    predicate/read/range dependencies, and cross-shard coordination for any

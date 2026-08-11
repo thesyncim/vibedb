@@ -16,6 +16,19 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	_resultAppliedAtLeastFrozen           = ResultApplied - 1
+	_resultAppliedAtMostFrozen            = uint32(1) - ResultApplied
+	_resultStaleFenceAtLeastFrozen        = ResultStaleFence - 2
+	_resultStaleFenceAtMostFrozen         = uint32(2) - ResultStaleFence
+	_resultUnknownCollectionAtLeastFrozen = ResultUnknownCollection - 3
+	_resultUnknownCollectionAtMostFrozen  = uint32(3) - ResultUnknownCollection
+	_resultInvalidDocumentAtLeastFrozen   = ResultInvalidDocument - 4
+	_resultInvalidDocumentAtMostFrozen    = uint32(4) - ResultInvalidDocument
+	_resultTargetBoundAtLeastFrozen       = ResultTargetBound - 5
+	_resultTargetBoundAtMostFrozen        = uint32(5) - ResultTargetBound
+)
+
 func codecStateV1() StateV1 {
 	logical := sha256.Sum256([]byte("logical"))
 	bootstrap := sha256.Sum256([]byte("bootstrap"))
@@ -151,9 +164,13 @@ func TestStateV1RejectsResealedUnsortedConfStateMembers(t *testing.T) {
 }
 
 func codecCompletionV1(code uint32) ([]byte, CompletionRecordV1) {
+	return codecCompletion(ResultFormatMutationV1, code)
+}
+
+func codecCompletion(format uint16, code uint32) ([]byte, CompletionRecordV1) {
 	binding := testBinding()
 	fingerprint := sha256.Sum256([]byte("fingerprint"))
-	resultDigest := replication.CompletionResultDigestV1(code, ResultFormatMutationV1, nil)
+	resultDigest := replication.CompletionResultDigestV1(code, format, nil)
 	completion, err := replication.AppendCompletionV1(nil, replication.CompletionV1{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
@@ -165,7 +182,7 @@ func codecCompletionV1(code uint32) ([]byte, CompletionRecordV1) {
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
 		ClientID: id128(44), ClientEpoch: 2, ClientSequence: 3,
 		Fingerprint: fingerprint, AppliedSequence: 4, ResultCode: code,
-		ResultFormat: ResultFormatMutationV1, Storage: replication.CompletionInline,
+		ResultFormat: format, Storage: replication.CompletionInline,
 		ResultDigest: resultDigest,
 	})
 	if err != nil {
@@ -181,10 +198,25 @@ func codecCompletionV1(code uint32) ([]byte, CompletionRecordV1) {
 }
 
 func TestCompletionRecordV1RoundTripAndFixedGrammar(t *testing.T) {
+	if ValidationSchemaFreeJSONV1 != 1 || ValidationDeterministicMutationV1 != 2 ||
+		ValidationDeterministicMutationV2 != 3 ||
+		ResultFormatMutationV1 != 1 || ResultFormatMutationV2 != 2 ||
+		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
+		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 {
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d,%d formats=%d,%d codes=%d,%d,%d,%d,%d,%d",
+			ValidationSchemaFreeJSONV1, ValidationDeterministicMutationV1,
+			ValidationDeterministicMutationV2, ResultFormatMutationV1, ResultFormatMutationV2,
+			ResultApplied, ResultStaleFence, ResultUnknownCollection,
+			ResultInvalidDocument, ResultTargetBound, ResultWrongShard)
+	}
 	_, record := codecCompletionV1(ResultApplied)
 	encoded, err := AppendCompletionRecordV1(nil, record)
 	if err != nil {
 		t.Fatal(err)
+	}
+	const wantV1Digest = "6bd0b3a314c6cc4c7db668b768f1f7749d31872663fb6761fb58cb81e6bf2a13"
+	if got := sha256.Sum256(encoded); hex.EncodeToString(got[:]) != wantV1Digest {
+		t.Fatalf("v1 completion record golden digest = %x, want %s", got, wantV1Digest)
 	}
 	decoded, err := OpenCompletionRecordV1(encoded)
 	if err != nil || !bytes.Equal(decoded.Completion, record.Completion) ||
@@ -194,6 +226,27 @@ func TestCompletionRecordV1RoundTripAndFixedGrammar(t *testing.T) {
 	_, zeroCode := codecCompletionV1(0)
 	if _, err := AppendCompletionRecordV1(nil, zeroCode); !errors.Is(err, ErrCompletionCorrupt) {
 		t.Fatalf("zero result code error = %v", err)
+	}
+	v2Completion, v2 := codecCompletion(ResultFormatMutationV2, ResultWrongShard)
+	v2Encoded, err := AppendCompletionRecordV1(nil, v2)
+	if err != nil {
+		t.Fatalf("v2 wrong-shard grammar: %v", err)
+	}
+	const wantV2CompletionDigest = "8182bf0ca7a18a8f4c4e2e9dbcc373362d156b2c9c8a96e823c62c462070bd74"
+	if got := sha256.Sum256(v2Completion); hex.EncodeToString(got[:]) != wantV2CompletionDigest {
+		t.Fatalf("v2 completion envelope golden digest = %x, want %s", got, wantV2CompletionDigest)
+	}
+	const wantV2RecordDigest = "4e3b146aa9405864a852b427f8c960daeed1f33fe9e4995d1ec5483e9aa09851"
+	if got := sha256.Sum256(v2Encoded); hex.EncodeToString(got[:]) != wantV2RecordDigest {
+		t.Fatalf("v2 completion record golden digest = %x, want %s", got, wantV2RecordDigest)
+	}
+	_, v1WrongShard := codecCompletion(ResultFormatMutationV1, ResultWrongShard)
+	if _, err := AppendCompletionRecordV1(nil, v1WrongShard); !errors.Is(err, ErrCompletionCorrupt) {
+		t.Fatalf("v1 wrong-shard grammar error = %v", err)
+	}
+	_, v2Unknown := codecCompletion(ResultFormatMutationV2, ResultWrongShard+1)
+	if _, err := AppendCompletionRecordV1(nil, v2Unknown); !errors.Is(err, ErrCompletionCorrupt) {
+		t.Fatalf("v2 unknown result grammar error = %v", err)
 	}
 }
 

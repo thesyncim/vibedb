@@ -51,6 +51,9 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	if err != nil {
 		return CompletionLookup{}, m.fail(fmt.Errorf("%w: %v", ErrCompletionCorrupt, err))
 	}
+	if err := m.validateCompletionResult(completion); err != nil {
+		return CompletionLookup{}, m.fail(err)
+	}
 	result := CompletionLookup{
 		Key: digest, Bytes: bytes.Clone(record.Completion),
 		AppliedSequence: completion.AppliedSequence,
@@ -157,7 +160,8 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 		}
 	}
 	logical, err := logicalDigestV1(
-		m.userName, m.user.Validation, m.user.ValidationDigest, userSnapshot, nil,
+		m.userName, m.user.Validation, m.user.ValidationDigest, m.user.Validator,
+		userSnapshot, nil,
 	)
 	if err != nil {
 		return nil, m.fail(errors.Join(err, cut.Close()))

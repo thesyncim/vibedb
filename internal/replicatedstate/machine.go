@@ -50,6 +50,15 @@ type Machine struct {
 	poison      error
 }
 
+// CompletionCapacityState is the constant-size durable apply cut used by
+// higher-level completion-capacity proofs. Initialized distinguishes the empty
+// pre-bootstrap machine from the durable static snapshot at Applied index 1.
+type CompletionCapacityState struct {
+	Initialized     bool
+	Applied         uint64
+	CompletionCount uint64
+}
+
 // Open validates and freezes one system collection and exactly one user
 // collection. An empty system collection represents a not-yet-installed static
 // bootstrap and is valid only with an empty user collection.
@@ -154,7 +163,7 @@ func Open(
 		return nil, fmt.Errorf("user collection %q: %w", userName, err)
 	}
 	logical, err := logicalDigestV1(
-		userName, user.Validation, user.ValidationDigest, userSnapshot, nil,
+		userName, user.Validation, user.ValidationDigest, user.Validator, userSnapshot, nil,
 	)
 	if err != nil {
 		return nil, err
@@ -209,7 +218,8 @@ func checkedTxnBytesV1(userBatchBytes, systemBatchBytes int) (int64, bool) {
 }
 
 func validateExistingRows(snapshot *durable.Snapshot, target CollectionTarget) error {
-	if target.Validation != ValidationDeterministicMutationV1 {
+	if target.Validation != ValidationDeterministicMutationV1 &&
+		target.Validation != ValidationDeterministicMutationV2 {
 		return nil
 	}
 	return snapshot.RangeRaw(func(key, value []byte) error {
@@ -223,6 +233,8 @@ func validateExistingRows(snapshot *durable.Snapshot, target CollectionTarget) e
 			return fmt.Errorf("%w: mutation validator rejected an existing row", ErrSchemaProfile)
 		case MutationValidationTargetBound:
 			return fmt.Errorf("%w: existing row exceeds the mutation validator target", ErrSchemaProfile)
+		case MutationValidationWrongShard:
+			return fmt.Errorf("%w: existing row belongs to another shard", ErrSchemaProfile)
 		default:
 			return fmt.Errorf(
 				"%w: mutation validator returned %d for an existing row",
@@ -323,6 +335,9 @@ func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state 
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrCompletionCorrupt, err)
 		}
+		if err := m.validateCompletionResult(completion); err != nil {
+			return err
+		}
 		if completion.AppliedSequence < 2 || completion.AppliedSequence > state.Applied ||
 			completion.ClusterID != state.Binding.ClusterID ||
 			completion.ClusterIncarnation != state.Binding.ClusterIncarnation ||
@@ -365,6 +380,18 @@ func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state 
 	})
 }
 
+func (m *Machine) validateCompletionResult(completion replication.CompletionViewV1) error {
+	wantFormat, maxCode := ResultFormatMutationV1, uint32(ResultTargetBound)
+	if m.user.Validation == ValidationDeterministicMutationV2 {
+		wantFormat, maxCode = ResultFormatMutationV2, uint32(ResultWrongShard)
+	}
+	if completion.ResultFormat != wantFormat || completion.ResultCode < ResultApplied ||
+		completion.ResultCode > maxCode {
+		return fmt.Errorf("%w: completion result differs from machine validation profile", ErrCompletionCorrupt)
+	}
+	return nil
+}
+
 func publicationFromState(state StateV1) raftmodel.Publication {
 	return raftmodel.Publication{
 		Applied: state.Applied, LogicalDigest: state.LogicalDigest,
@@ -382,6 +409,25 @@ func (m *Machine) Applied() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.publication.Applied
+}
+
+// CompletionCapacityState returns a read-only, constant-size view of the
+// machine state needed by completion-capacity qualification. A poisoned
+// machine fails closed instead of advertising its last publication as usable.
+func (m *Machine) CompletionCapacityState() (CompletionCapacityState, error) {
+	if m == nil {
+		return CompletionCapacityState{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return CompletionCapacityState{}, err
+	}
+	return CompletionCapacityState{
+		Initialized:     m.initialized,
+		Applied:         m.state.Applied,
+		CompletionCount: m.state.CompletionCount,
+	}, nil
 }
 
 // Published implements raftmodel.StateMachine.

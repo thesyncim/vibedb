@@ -9,10 +9,14 @@ state atomically through one hidden durable system collection.
 
 This is deliberately not a serving or high-availability milestone. It does not
 wire shard RPCs to Raft, permit client-facing replicated SQL writes, create runtime
-snapshots, compact the Raft WAL, reserve long-lived completion capacity, run a
+snapshots, compact the Raft WAL, reserve physical system/user storage, run a
 Multi-Raft scheduler, or authorize Read Committed or Serializable transactions
-across replicas. Its purpose is to make the local committed-entry boundary
-executable and crash-testable before those features depend on it.
+across replicas. A later static-WAL qualification now proves finite logical
+completion-count headroom for one exact healthy, initialized WAL/apply pair
+after checking its binding and applied/committed/log cut. It does not reserve
+bytes, grant proposal authority, or produce a lease. Its purpose is to make the
+local committed-entry boundary executable and crash-testable before those
+features depend on it.
 
 ## Scope and construction
 
@@ -31,7 +35,10 @@ JSON documents. The legacy profile accepts a schema-free collection. The
 deterministic profile additionally binds a nonzero validation digest and pure
 mutation validator into every logical-image digest, scans every existing row at
 open, and validates collapsed final mutations before no-op elision. The landed
-SQL adapter uses that profile for its primary-pointer and ordered-key contract.
+SQL adapter uses deterministic profile v1 for its legacy primary-pointer and
+ordered-key contract and profile v2 for the exact one-shard-key placement
+contract. V2 also validates every extant row while computing a coherent
+snapshot digest.
 The collection, profile, and binding cannot change while the machine is open.
 
 Construction also proves that the transaction log and both collections are
@@ -167,8 +174,24 @@ reproduce the same bytes. These checks occur inside planning after dedupe,
 conflict, stale-fence, and unknown-collection routing, so committed semantic
 refusals still advance and remain deduplicable.
 
-The fixed v1 completion represents only this low-level unconditional mutation
-batch. `CommandV1` carries no arbitrary SQL result, expected row revisions,
+Completion result grammar is machine-profile-specific. Deterministic v1 emits
+result format 1 and retains its frozen codes 1 through 5. Deterministic v2 emits
+result format 2 and appends code 6 for `ResultWrongShard`. Generic record
+decoding recognizes both explicit formats, but open, lookup, and duplicate
+planning reject a retained completion from the other machine profile.
+
+The SQL v2 placement validator is intentionally narrower: the sole primary
+pointer must also be the sole shard-key pointer and must yield a String or exact
+Number accepted by tuple version 1 and the frozen native mapper. Puts route the
+validated document scalar; present deletes route the current document; absent
+deletes route the decoded ordered-key scalar. Points outside the exact
+half-open target range produce `ResultWrongShard`. Open and snapshot digesting
+route every extant row, so wrong-shard data cannot be legitimized by omission.
+Composite keys, placement changes, and proof tying a serving router decision to
+this exact range remain future command/topology work.
+
+The fixed format-1/format-2 completions represent only this low-level
+unconditional mutation batch. `CommandV1` carries no arbitrary SQL result, expected row revisions,
 read set, predicate, or multi-collection intent. A later SQL command format is
 required before replicated SQL DML can preserve its existing transaction
 semantics.
@@ -261,10 +284,15 @@ Before serving, later phases must add all of:
    [SQL replicated apply v1](sql-replicated-apply-v1.md) provide the exact
    SQL/WAL identity, persistent direct-write fence, hidden atomic participant,
    and opaque local apply claim, but deliberately grant no serving authority;
-2. admission that reserves completion/system/data capacity for every committed
-   in-flight entry, with a safe completion GC protocol;
+2. an exact healthy, initialized SQL/WAL pair can now prove finite logical
+   completion-count headroom when the live binding matches, `C <= A-1`,
+   `A <= commit <= L`, the capacity format is exactly static v1, and sealed
+   `MaxEntries <= MaxCompletions`. This instantaneous check is not a lease.
+   Serving still requires physical system/user byte reservation and safe
+   completion GC; any runtime snapshot/compaction also requires a reconstructed
+   suffix reservation ledger because the static-base proof then expires;
 3. crash-atomic runtime snapshots and WAL generation compaction;
 4. bounded Multi-Raft scheduling and authenticated transport;
-5. leader-aware routing, applied-position tokens, completion lookup, and
-   `ReadIndex` reads; and
+5. leader-aware routing with a fenced range proof, applied-position tokens,
+   completion lookup, and `ReadIndex` reads; and
 6. a replicated SQL command grammar capable of the advertised isolation mode.

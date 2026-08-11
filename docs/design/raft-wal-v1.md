@@ -180,6 +180,44 @@ may fit after worst-case reservation closes, and message-only, heartbeat, read,
 or otherwise durability-empty Ready batches remain accepted at physical,
 record-count, and logical-live limits.
 
+Format v1 also exposes a detached `CapacityProfile`: exact
+`CapacityFormatStaticV1`, authenticated log base index, and sealed
+`MaxEntries`. A future snapshot/compaction-capable format must expose another
+capacity format before it can compact. `raftmember.ValidateStaticNoGCCompletionCapacity`
+uses the profile for one finite, count-only state-machine proof. It first reads
+the locked apply claim's exact SQL/WAL binding and authority, derives the live
+WAL binding from that authority, and rejects any coordinate mismatch. The
+claim must be healthy and initialized. With retained completion count `C`,
+applied index `A`, committed index `H`, and last log index `L`, qualification
+checks `C <= A-1`, `1 <= A <= H <= L`, and `L-1 <= MaxEntries`.
+
+The claim also reports its exact apply format. Only current apply formats v1
+and v2, whose grammar creates at most one completion per entry, qualify; an
+unknown future apply format is rejected until its completion bound is proved.
+Consequently:
+
+`C + (L-A) <= L-1 <= MaxEntries <= MaxCompletions`
+
+Every normal entry creates at most one retained completion, so the inequality
+covers the entire existing and future admitted suffix without a dynamic
+per-entry ledger. The implementation also checks `C+(L-A) <= MaxCompletions`
+with overflow-safe subtraction. Qualification is an instantaneous predicate
+under caller-exclusive startup ownership, not a lease or reservation token. It
+must be repeated for every reopened exact WAL/apply pair and is invalid for any
+capacity format other than `CapacityFormatStaticV1`.
+
+This proof does not replace proposal ordering. A future owner that constructs
+and retains the exact WAL, apply claim, and `raftmodel.Node` must perform
+application `AdmitCommand`, then `ReserveReady`, then `Node.Propose` under the
+Node's single-scheduler contract. No such serving owner exists in this slice;
+an ordering helper that accepted an arbitrary Node could not prove that the
+Node was constructed from the qualified WAL/apply pair.
+
+Nor is the inequality a physical storage reservation. It closes the logical
+retained-completion-count bound only. The SQL system/user files still have
+per-mutation and transaction bounds but no aggregate persistent-byte reserve;
+that remains a separate serving prerequisite.
+
 Empty Ready batches still perform read-only namespace fencing, but issue zero
 WAL writes and zero syncs. `MustSync` does not change that property when there
 is no Snapshot, Entry, or HardState to persist.

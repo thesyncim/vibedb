@@ -79,10 +79,21 @@ func newValidatedMachineFixture(
 	validator MutationValidator,
 	observer MutationAttemptObserver,
 ) machineFixture {
+	return newValidatedMachineFixtureWithProfile(
+		t, ValidationDeterministicMutationV1, validator, observer,
+	)
+}
+
+func newValidatedMachineFixtureWithProfile(
+	t testing.TB,
+	profile ValidationProfile,
+	validator MutationValidator,
+	observer MutationAttemptObserver,
+) machineFixture {
 	t.Helper()
 	fixture := newMachineFixture(t)
 	target := fixture.user
-	target.Validation = ValidationDeterministicMutationV1
+	target.Validation = profile
 	target.ValidationDigest = testMutationValidationDigest
 	target.Validator = validator
 	target.ObserveMutationAttempt = observer
@@ -99,6 +110,11 @@ func newValidatedMachineFixture(
 }
 
 func completionResultCode(t testing.TB, machine *Machine, command []byte) uint32 {
+	code, _ := completionResult(t, machine, command)
+	return code
+}
+
+func completionResult(t testing.TB, machine *Machine, command []byte) (uint32, uint16) {
 	t.Helper()
 	lookup, err := machine.LookupCompletion(command)
 	if err != nil {
@@ -108,7 +124,7 @@ func completionResultCode(t testing.TB, machine *Machine, command []byte) uint32
 	if err != nil {
 		t.Fatalf("OpenCompletionV1: %v", err)
 	}
-	return completion.ResultCode
+	return completion.ResultCode, completion.ResultFormat
 }
 
 func TestCollectionTargetValidationProfiles(t *testing.T) {
@@ -141,6 +157,14 @@ func TestCollectionTargetValidationProfiles(t *testing.T) {
 			name: "validated",
 			mutate: func(target *CollectionTarget) {
 				target.Validation = ValidationDeterministicMutationV1
+				target.ValidationDigest = testMutationValidationDigest
+				target.Validator = accepting
+			},
+		},
+		{
+			name: "validated v2",
+			mutate: func(target *CollectionTarget) {
+				target.Validation = ValidationDeterministicMutationV2
 				target.ValidationDigest = testMutationValidationDigest
 				target.Validator = accepting
 			},
@@ -285,18 +309,30 @@ func equalObservedMutationKeys(a, b [][][]byte) bool {
 func TestValidatedMutationResultMappingAndPrestageObserver(t *testing.T) {
 	tests := []struct {
 		name       string
+		profile    ValidationProfile
 		validation MutationValidation
 		wantCode   uint32
+		wantFormat uint16
 		wantError  error
 	}{
-		{name: "invalid", validation: MutationValidationInvalid, wantCode: ResultInvalidDocument},
-		{name: "target bound", validation: MutationValidationTargetBound, wantCode: ResultTargetBound},
-		{name: "unknown", validation: 0, wantError: ErrInvalidCollection},
+		{name: "invalid", profile: ValidationDeterministicMutationV1,
+			validation: MutationValidationInvalid, wantCode: ResultInvalidDocument,
+			wantFormat: ResultFormatMutationV1},
+		{name: "target bound", profile: ValidationDeterministicMutationV1,
+			validation: MutationValidationTargetBound, wantCode: ResultTargetBound,
+			wantFormat: ResultFormatMutationV1},
+		{name: "wrong shard v2", profile: ValidationDeterministicMutationV2,
+			validation: MutationValidationWrongShard, wantCode: ResultWrongShard,
+			wantFormat: ResultFormatMutationV2},
+		{name: "wrong shard v1", profile: ValidationDeterministicMutationV1,
+			validation: MutationValidationWrongShard, wantError: ErrInvalidCollection},
+		{name: "unknown", profile: ValidationDeterministicMutationV1,
+			validation: 0, wantError: ErrInvalidCollection},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			observed := new(observedMutationKeys)
-			fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{
+			fixture := newValidatedMachineFixtureWithProfile(t, test.profile, mutationValidatorFuncs{
 				put: func([]byte, []byte) MutationValidation { return test.validation },
 			}, observed.callback)
 			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -314,8 +350,9 @@ func TestValidatedMutationResultMappingAndPrestageObserver(t *testing.T) {
 				if err != nil {
 					t.Fatalf("ApplyNormal: %v", err)
 				}
-				if got := completionResultCode(t, fixture.machine, command); got != test.wantCode {
-					t.Fatalf("completion result = %d, want %d", got, test.wantCode)
+				if code, format := completionResult(t, fixture.machine, command); code != test.wantCode || format != test.wantFormat {
+					t.Fatalf("completion result = code %d format %d, want code %d format %d",
+						code, format, test.wantCode, test.wantFormat)
 				}
 			}
 			if got := observed.snapshot(); len(got) != 0 {
@@ -412,6 +449,78 @@ func TestValidatedOpenScansRowsAndBindsDigest(t *testing.T) {
 		UserCollection{Name: "docs", Target: wrongDigest}, fixture.log, fixture.machine.options,
 	); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("wrong digest reopen error = %v, want ErrStateCorrupt", err)
+	}
+}
+
+func TestValidatedV2OpenAndSnapshotRouteEveryExtantRow(t *testing.T) {
+	validator := mutationValidatorFuncs{
+		put: func(key, _ []byte) MutationValidation {
+			if bytes.Equal(key, []byte("outside")) {
+				return MutationValidationWrongShard
+			}
+			return MutationValidationAccept
+		},
+	}
+	fixture := newValidatedMachineFixtureWithProfile(
+		t, ValidationDeterministicMutationV2, validator, nil,
+	)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	command := testCommand(fixture.binding, 1,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("inside"), Value: []byte(`{"n":1}`)},
+	)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.user.Collection.Put([]byte("outside"), []byte(`{"n":2}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	); !errors.Is(err, ErrSchemaProfile) {
+		t.Fatalf("v2 wrong-shard reopen = %v, want ErrSchemaProfile", err)
+	}
+	if snapshot, err := fixture.machine.Snapshot("docs"); snapshot != nil ||
+		!errors.Is(err, ErrSchemaProfile) {
+		if snapshot != nil {
+			_ = snapshot.Close()
+		}
+		t.Fatalf("v2 wrong-shard snapshot = %p,%v", snapshot, err)
+	}
+}
+
+func TestCompletionResultGrammarIsMachineProfileSpecific(t *testing.T) {
+	v1 := newValidatedMachineFixture(t, mutationValidatorFuncs{}, nil)
+	v2 := newValidatedMachineFixtureWithProfile(
+		t, ValidationDeterministicMutationV2, mutationValidatorFuncs{}, nil,
+	)
+	if err := v1.machine.validateCompletionResult(replication.CompletionViewV1{
+		ResultFormat: ResultFormatMutationV2, ResultCode: ResultApplied,
+	}); !errors.Is(err, ErrCompletionCorrupt) {
+		t.Fatalf("v1 accepted v2 completion grammar: %v", err)
+	}
+	if err := v2.machine.validateCompletionResult(replication.CompletionViewV1{
+		ResultFormat: ResultFormatMutationV1, ResultCode: ResultApplied,
+	}); !errors.Is(err, ErrCompletionCorrupt) {
+		t.Fatalf("v2 accepted v1 completion grammar: %v", err)
+	}
+	if err := v1.machine.validateCompletionResult(replication.CompletionViewV1{
+		ResultFormat: ResultFormatMutationV1, ResultCode: ResultTargetBound,
+	}); err != nil {
+		t.Fatalf("v1 rejected v1 completion grammar: %v", err)
+	}
+	if err := v2.machine.validateCompletionResult(replication.CompletionViewV1{
+		ResultFormat: ResultFormatMutationV2, ResultCode: ResultWrongShard,
+	}); err != nil {
+		t.Fatalf("v2 rejected v2 completion grammar: %v", err)
+	}
+	if err := v2.machine.validateCompletionResult(replication.CompletionViewV1{
+		ResultFormat: ResultFormatMutationV2, ResultCode: 0,
+	}); !errors.Is(err, ErrCompletionCorrupt) {
+		t.Fatalf("v2 accepted zero completion code: %v", err)
 	}
 }
 
@@ -519,19 +628,27 @@ func TestLogicalDigestValidationProfileGoldens(t *testing.T) {
 		{key: []byte("a"), value: []byte(`{"n":1}`)},
 	}
 	legacy, err := logicalDigestV1(
-		"docs", ValidationSchemaFreeJSONV1, [32]byte{}, nil, overlay,
+		"docs", ValidationSchemaFreeJSONV1, [32]byte{}, nil, nil, overlay,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	validated, err := logicalDigestV1(
-		"docs", ValidationDeterministicMutationV1, testMutationValidationDigest, nil, overlay,
+		"docs", ValidationDeterministicMutationV1, testMutationValidationDigest, nil, nil, overlay,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validatedV2, err := logicalDigestV1(
+		"docs", ValidationDeterministicMutationV2, testMutationValidationDigest,
+		mutationValidatorFuncs{}, nil, overlay,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "legacy", legacy, "8ba4f8aa91e17d78aacddad9003f3f8e40f39ee0534d7d8414ee9a37bf4fa786")
 	assertDigestHex(t, "validated", validated, "3370965d8c0b979ebf62a0366d9e55278b1f815ecfc1f4d321d0d3695f1495ec")
+	assertDigestHex(t, "validated-v2", validatedV2, "4dcbdae2c4f3e18d9c9d9e1a7b55e4445116f5f2a5a9e3fc6332a50267a0a660")
 }
 
 func assertDigestHex(t testing.TB, name string, got [32]byte, wantHex string) {
@@ -557,13 +674,13 @@ func FuzzLogicalDigestValidationProfile(f *testing.F) {
 		}}
 		beforeKey, beforeValue := bytes.Clone(overlay[0].key), bytes.Clone(overlay[0].value)
 		first, err := logicalDigestV1(
-			name, ValidationDeterministicMutationV1, testMutationValidationDigest, nil, overlay,
+			name, ValidationDeterministicMutationV1, testMutationValidationDigest, nil, nil, overlay,
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
 		second, err := logicalDigestV1(
-			name, ValidationDeterministicMutationV1, testMutationValidationDigest, nil, overlay,
+			name, ValidationDeterministicMutationV1, testMutationValidationDigest, nil, nil, overlay,
 		)
 		if err != nil {
 			t.Fatal(err)

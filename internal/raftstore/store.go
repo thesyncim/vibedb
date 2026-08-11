@@ -481,6 +481,22 @@ func (store *Store) CurrentIncarnation() uint64 {
 	return store.current.currentIncarnation
 }
 
+// CapacityProfile returns the authenticated static-base and sealed live-entry
+// bound used by higher-level admission proofs. It neither reserves WAL space
+// nor predicts whether ReserveReady will succeed for the next input.
+func (store *Store) CapacityProfile() (CapacityProfile, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if err := store.checkLocked(); err != nil {
+		return CapacityProfile{}, err
+	}
+	return CapacityProfile{
+		Format:       CapacityFormatStaticV1,
+		LogBaseIndex: store.header.snapshot.GetMetadata().GetIndex(),
+		MaxEntries:   store.options.maxEntries,
+	}, nil
+}
+
 // ReserveReady checks proposal or inbound-append admission headroom for one
 // worst-case durable Ready. Drivers must still capture and drain already
 // available Ready work; empty Ready batches remain zero-write/zero-sync even

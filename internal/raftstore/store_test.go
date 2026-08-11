@@ -211,6 +211,43 @@ func TestBeginIncarnationIsDurableAndNeverReused(t *testing.T) {
 	}
 }
 
+func TestCapacityProfileIsSealedAndSurvivesRestart(t *testing.T) {
+	path, store, options := createTestStore(t)
+	want := CapacityProfile{
+		Format:       CapacityFormatStaticV1,
+		LogBaseIndex: 1,
+		MaxEntries:   uint64(options.MaxEntries),
+	}
+	beforeIncarnation := store.CurrentIncarnation()
+	beforeRemaining := store.RemainingBytes()
+	beforeSyncs := store.SyncCount()
+	if got, err := store.CapacityProfile(); err != nil || got != want {
+		t.Fatalf("CapacityProfile = %+v, %v, want %+v", got, err, want)
+	}
+	if store.CurrentIncarnation() != beforeIncarnation ||
+		store.RemainingBytes() != beforeRemaining || store.SyncCount() != beforeSyncs {
+		t.Fatal("CapacityProfile mutated WAL state")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.CapacityProfile(); got != (CapacityProfile{}) || !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed CapacityProfile = %+v, %v, want zero, ErrClosed", got, err)
+	}
+
+	reopened, err := Open(
+		path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
+		testKey(), options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, err := reopened.CapacityProfile(); err != nil || got != want {
+		t.Fatalf("reopened CapacityProfile = %+v, %v, want %+v", got, err, want)
+	}
+}
+
 func TestSingleWriterWrongIdentityAndWrongKeyFailClosed(t *testing.T) {
 	path, store, options := createTestStore(t)
 	if _, err := Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch, testKey(), options); !errors.Is(err, ErrLocked) {

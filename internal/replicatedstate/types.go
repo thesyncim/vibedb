@@ -18,11 +18,20 @@ const (
 	// this low-level unconditional mutation adapter.
 	ResultFormatMutationV1 uint16 = 1
 
-	ResultApplied uint32 = iota
-	ResultStaleFence
-	ResultUnknownCollection
-	ResultInvalidDocument
-	ResultTargetBound
+	// These explicit values freeze the legacy grammar. In v1's original const
+	// block ResultFormatMutationV1 occupied iota zero, so code zero was never a
+	// valid result.
+	ResultApplied           uint32 = 1
+	ResultStaleFence        uint32 = 2
+	ResultUnknownCollection uint32 = 3
+	ResultInvalidDocument   uint32 = 4
+	ResultTargetBound       uint32 = 5
+
+	// ResultFormatMutationV2 extends the empty-payload mutation result grammar
+	// with an explicit deterministic wrong-shard refusal. V1 remains frozen and
+	// does not accept the added result code.
+	ResultFormatMutationV2 uint16 = 2
+	ResultWrongShard       uint32 = 6
 
 	// MaxStateEnvelopeBytes and MaxCompletionRecordBytes bound the two binary
 	// records before their canonical hexadecimal JSON wrapping.
@@ -107,6 +116,10 @@ const (
 	// mutation contract to the schema-free JSON profile. It requires a nonzero
 	// ValidationDigest and a non-nil MutationValidator.
 	ValidationDeterministicMutationV1 ValidationProfile = 2
+
+	// ValidationDeterministicMutationV2 retains V1 validation and adds the
+	// explicit wrong-shard outcome carried by ResultFormatMutationV2.
+	ValidationDeterministicMutationV2 ValidationProfile = 3
 )
 
 // MutationValidation is the closed result grammar returned by a
@@ -117,11 +130,13 @@ const (
 	MutationValidationAccept MutationValidation = iota + 1
 	MutationValidationInvalid
 	MutationValidationTargetBound
+	MutationValidationWrongShard
 )
 
 // MutationValidator supplies the deterministic application-specific portion
-// of ValidationDeterministicMutationV1. Implementations must be pure for a
-// fixed ValidationDigest and must not retain any input slices.
+// of ValidationDeterministicMutationV1 and ValidationDeterministicMutationV2.
+// Implementations must be pure for a fixed ValidationDigest and must not
+// retain any input slices. WrongShard is legal only under V2.
 //
 // ValidatePut is also used to validate every existing row during Open.
 // ValidateDelete receives the current snapshot value when found is true and a
@@ -193,7 +208,7 @@ func (t CollectionTarget) validate() error {
 		if !zeroDigest || t.Validator != nil {
 			return fmt.Errorf("%w: legacy validation requires zero digest and no validator", ErrInvalidCollection)
 		}
-	case ValidationDeterministicMutationV1:
+	case ValidationDeterministicMutationV1, ValidationDeterministicMutationV2:
 		if zeroDigest || t.Validator == nil {
 			return fmt.Errorf("%w: deterministic validation requires digest and validator", ErrInvalidCollection)
 		}

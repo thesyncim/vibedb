@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/store"
 )
@@ -102,6 +103,63 @@ func TestCatalogSizePreflightCoversIndentedEncoding(t *testing.T) {
 	}
 	if len(raw) > bound {
 		t.Fatalf("indented encoding = %d bytes, preflight upper bound %d", len(raw), bound)
+	}
+}
+
+func TestCatalogSizePreflightAccountsForV2PlacementShardKey(t *testing.T) {
+	_, database, base := bindReplicatedApplyTestRoot(t, "catalog-v2-bound")
+	claim, _, err := database.OpenReplicatedApply(
+		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = claim.Close()
+		_ = database.Close()
+	}()
+
+	core := database.connector.db
+	core.mu.RLock()
+	raw, err := json.Marshal(core.catalog)
+	core.mu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v2 catalogFile
+	if err := json.Unmarshal(raw, &v2); err != nil {
+		t.Fatal(err)
+	}
+	primary := "/" + strings.Repeat("x", 4096)
+	v2.ReplicatedShardStore.UserPrimaryKey = primary
+	v2.Tables[v2.ReplicatedShardStore.UserTable].PrimaryKey = primary
+	v2.ReplicatedApply.Placement.ShardKey = primary
+	v2.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigestV2(
+		*v2.ReplicatedShardStore, v2.ReplicatedApply.Placement,
+	)
+	v2Bound, err := catalogSizeUpperBound(v2)
+	if err != nil {
+		t.Fatalf("v2 catalog bound: %v", err)
+	}
+
+	v2Raw, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v1 catalogFile
+	if err := json.Unmarshal(v2Raw, &v1); err != nil {
+		t.Fatal(err)
+	}
+	v1.ReplicatedApply.Format = ReplicatedApplyFormatV1
+	v1.ReplicatedApply.ValidationProfile = uint8(replicatedstate.ValidationDeterministicMutationV1)
+	v1.ReplicatedApply.Placement = ReplicatedPlacementProfile{}
+	v1.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(*v1.ReplicatedShardStore)
+	v1Bound, err := catalogSizeUpperBound(v1)
+	if err != nil {
+		t.Fatalf("v1 catalog bound: %v", err)
+	}
+	if delta, want := v2Bound-v1Bound, encodedJSONStringBytes(primary); delta != want {
+		t.Fatalf("v2 placement bound delta = %d, want exact encoded shard-key bytes %d", delta, want)
 	}
 }
 

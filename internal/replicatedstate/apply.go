@@ -315,6 +315,13 @@ func (m *Machine) planCommand(
 		return commandPlan{}, err
 	}
 	if found {
+		completion, completionErr := replication.OpenCompletionV1(existing.Completion)
+		if completionErr != nil {
+			return commandPlan{}, fmt.Errorf("%w: %v", ErrCompletionCorrupt, completionErr)
+		}
+		if err := m.validateCompletionResult(completion); err != nil {
+			return commandPlan{}, err
+		}
 		if !recordTupleMatchesCommand(existing, command) {
 			return commandPlan{}, fmt.Errorf("%w: completion-key hash collision", ErrCompletionCorrupt)
 		}
@@ -341,7 +348,8 @@ func (m *Machine) planCommand(
 		}
 		if plan.resultCode == ResultApplied {
 			plan.logicalDigest, err = logicalDigestV1(
-				m.userName, m.user.Validation, m.user.ValidationDigest, userSnapshot, plan.changes,
+				m.userName, m.user.Validation, m.user.ValidationDigest, m.user.Validator,
+				userSnapshot, plan.changes,
 			)
 			if err != nil {
 				return commandPlan{}, err
@@ -394,7 +402,8 @@ func (m *Machine) planMutations(
 		if err != nil {
 			return nil, 0, err
 		}
-		if m.user.Validation == ValidationDeterministicMutationV1 {
+		if m.user.Validation == ValidationDeterministicMutationV1 ||
+			m.user.Validation == ValidationDeterministicMutationV2 {
 			validation := MutationValidation(0)
 			if mutation.delete {
 				validation = m.user.Validator.ValidateDelete(mutation.key, current, found)
@@ -407,6 +416,13 @@ func (m *Machine) planMutations(
 				return nil, ResultInvalidDocument, nil
 			case MutationValidationTargetBound:
 				return nil, ResultTargetBound, nil
+			case MutationValidationWrongShard:
+				if m.user.Validation != ValidationDeterministicMutationV2 {
+					return nil, 0, fmt.Errorf(
+						"%w: v1 mutation validator returned wrong-shard", ErrInvalidCollection,
+					)
+				}
+				return nil, ResultWrongShard, nil
 			default:
 				return nil, 0, fmt.Errorf(
 					"%w: mutation validator returned %d", ErrInvalidCollection, validation,
@@ -434,7 +450,11 @@ func (m *Machine) makeCompletionDocument(
 	applied uint64,
 	code uint32,
 ) ([]byte, error) {
-	resultDigest := replication.CompletionResultDigestV1(code, ResultFormatMutationV1, nil)
+	resultFormat := ResultFormatMutationV1
+	if m.user.Validation == ValidationDeterministicMutationV2 {
+		resultFormat = ResultFormatMutationV2
+	}
+	resultDigest := replication.CompletionResultDigestV1(code, resultFormat, nil)
 	completion, err := replication.AppendCompletionV1(nil, replication.CompletionV1{
 		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
 		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
@@ -448,7 +468,7 @@ func (m *Machine) makeCompletionDocument(
 		ClientID: command.ClientID, ClientEpoch: command.ClientEpoch,
 		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
 		RetryHome: command.RetryHome, AppliedSequence: applied,
-		ResultCode: code, ResultFormat: ResultFormatMutationV1,
+		ResultCode: code, ResultFormat: resultFormat,
 		Storage: replication.CompletionInline, ResultDigest: resultDigest,
 	})
 	if err != nil {

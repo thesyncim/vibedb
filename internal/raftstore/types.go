@@ -80,6 +80,31 @@ type Bootstrap struct {
 	Snapshot              *pb.Snapshot
 }
 
+// CapacityFormat identifies an exact WAL capacity-proof contract. Callers must
+// reject formats they do not explicitly understand.
+type CapacityFormat uint8
+
+const (
+	// CapacityFormatStaticV1 is the immutable bootstrap-base, no-compaction
+	// contract implemented by WAL format v1.
+	CapacityFormatStaticV1 CapacityFormat = 1
+)
+
+// CapacityProfile is a detached view of the immutable log-capacity facts
+// needed by higher-level admission proofs. MaxEntries is sealed into the WAL's
+// authenticated static header. LogBaseIndex is the authenticated durable
+// snapshot index selected by this handle. Format is a capability contract, not
+// a serving or capacity reservation.
+//
+// WAL format v1 always reports CapacityFormatStaticV1 and LogBaseIndex 1. A
+// future runtime-snapshot or compaction-capable WAL must report another format
+// even before its first compaction, preventing retention of an invalid proof.
+type CapacityProfile struct {
+	Format       CapacityFormat
+	LogBaseIndex uint64
+	MaxEntries   uint64
+}
+
 // Key identifies and opens one AES-256-GCM key. Wrapped is opaque key-provider
 // metadata persisted in the header; it is never interpreted by raftstore.
 // Open permits Wrapped to be nil when a key provider learned it from another

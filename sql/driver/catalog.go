@@ -1324,7 +1324,12 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 		}
 	}
 	if catalog.ReplicatedApply != nil {
-		if !add(encodedJSONStringBytes(catalog.ReplicatedApply.Storage) + 2048) {
+		apply := catalog.ReplicatedApply
+		placementBytes := 0
+		if apply.Placement != (ReplicatedPlacementProfile{}) {
+			placementBytes = encodedJSONStringBytes(apply.Placement.ShardKey)
+		}
+		if !add(encodedJSONStringBytes(apply.Storage) + placementBytes + 2048) {
 			return size, catalogSizeError(size)
 		}
 	}

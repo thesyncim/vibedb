@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -22,6 +23,11 @@ func testApplyOptions() sqldriver.ReplicatedApplyOptions {
 			MaxCollections: 16,
 			MaxDocuments:   256,
 			MaxBytes:       64 << 20,
+		},
+		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format: sqldriver.ReplicatedPlacementProfileV1, ShardKey: "/id",
+			TupleVersion: distribution.TupleVersion1, MapperVersion: distribution.NativeMapperVersion,
+			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
 	}
 }
@@ -140,5 +146,44 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenBoundSQLWithApplyForSettlementPropagatesPlacement(t *testing.T) {
+	walIdentity := testWALIdentity(102)
+	_, wal, _, _ := createWAL(t, walIdentity)
+	authority := testAuthorityProfile()
+	path, database, _ := prepareSQLRoot(t, walIdentity, "apply-settlement")
+	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := testApplyOptions()
+	claim, identity, err := OpenPreparedApply(wal, database, authority, base, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, reopenedClaim, settled, err := OpenBoundSQLWithApplyForSettlement(
+		path, wal, authority, base, options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = reopenedClaim.Close()
+		_ = reopened.Close()
+	}()
+	if settled != identity || settled.Placement != options.Placement {
+		t.Fatalf("settled apply identity = %+v, want %+v", settled, identity)
+	}
+	if actual, err := reopenedClaim.Identity(); err != nil || actual != identity {
+		t.Fatalf("settled claim identity = %+v,%v, want %+v", actual, err, identity)
 	}
 }

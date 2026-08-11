@@ -100,6 +100,10 @@ func TestPersistPartialCurrentSlotUnknownExactRetrySettles(t *testing.T) {
 	if _, err := store.LastIndex(); !errors.Is(err, ErrPersistenceUnknown) {
 		t.Fatalf("read with pending mutation = %v", err)
 	}
+	if got, err := store.CapacityProfile(); got != (CapacityProfile{}) ||
+		!errors.Is(err, ErrPersistenceUnknown) {
+		t.Fatalf("capacity profile with pending mutation = %+v, %v", got, err)
+	}
 	store.options.ops.writeAt = original
 	if err := store.Persist(batch); err != nil {
 		t.Fatalf("settle exact retry: %v", err)
@@ -369,6 +373,10 @@ func TestLeafReplacementAndAliasesPoisonEmptyReadyFence(t *testing.T) {
 			test.replace(t, path, options.MaxFileBytes)
 			if err := store.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1}); !errors.Is(err, ErrNamespaceChanged) {
 				t.Fatalf("empty Ready after leaf replacement = %v", err)
+			}
+			if got, err := store.CapacityProfile(); got != (CapacityProfile{}) ||
+				!errors.Is(err, ErrNamespaceChanged) {
+				t.Fatalf("capacity profile after namespace poison = %+v, %v", got, err)
 			}
 		})
 	}

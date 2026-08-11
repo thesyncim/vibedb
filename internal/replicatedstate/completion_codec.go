@@ -203,10 +203,12 @@ func validateCompletionRecordV1(record CompletionRecordV1) error {
 		completion.Fingerprint != record.Fingerprint {
 		return fmt.Errorf("%w: wrapper and completion differ", ErrCompletionCorrupt)
 	}
-	if completion.Storage != replication.CompletionInline ||
-		completion.ResultFormat != ResultFormatMutationV1 || completion.ResultLength != 0 ||
-		len(completion.InlineResult) != 0 || completion.ResultCode < ResultApplied ||
-		completion.ResultCode > ResultTargetBound {
+	resultGrammarValid := (completion.ResultFormat == ResultFormatMutationV1 &&
+		completion.ResultCode >= ResultApplied && completion.ResultCode <= ResultTargetBound) ||
+		(completion.ResultFormat == ResultFormatMutationV2 &&
+			completion.ResultCode >= ResultApplied && completion.ResultCode <= ResultWrongShard)
+	if completion.Storage != replication.CompletionInline || !resultGrammarValid ||
+		completion.ResultLength != 0 || len(completion.InlineResult) != 0 {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
 	return nil
