@@ -7,6 +7,10 @@ import (
 
 // PersistBatch is the durable portion of one Ready. ReadyID is stable across
 // retries of the same batch and is scoped to a Node incarnation.
+// NodeIncarnation is a durable, never-reused, strictly increasing boot counter
+// for one member store, not a random process token. A newly constructed Node
+// starts at ReadyID 1; StableStore rejects a regressed incarnation, a skipped
+// ReadyID, or reuse of one key with different batch bytes.
 //
 // The pointed-to values are owned by Node and are read-only. Persist must not
 // retain or mutate them. A nil return means that Snapshot, Entries, and
@@ -25,6 +29,9 @@ type PersistBatch struct {
 // retry-safe persistence boundary for Ready batches. Repeating a ReadyID after
 // an error must be safe, including when the earlier call reached storage before
 // returning the error. The idempotency key is (NodeIncarnation, ReadyID).
+// Production construction must allocate NodeIncarnation from the same durable
+// member store before the Node can accept protocol input; a caller-supplied
+// random value is not a stale-process fence.
 type StableStore interface {
 	raft.Storage
 	Persist(PersistBatch) error
@@ -52,9 +59,16 @@ type Publication struct {
 // mutating method must publish its returned state atomically before returning
 // nil. ApplyConfiguration must durably retain the returned ConfState as part of
 // Published so restart can recover the exact applied membership independently
-// of an older snapshot's ConfState. Normal entry data, configuration state, and
-// snapshots are borrowed only for the duration of the call and must not be
-// mutated or retained.
+// of an older snapshot's ConfState. InstallSnapshot must be idempotent for the
+// same exact snapshot: restart calls it both when the durable base is newer and
+// when it equals the published cut. The state machine must durably bind the
+// snapshot's exact identity/manifest, logical digest, ConfState, and expected
+// ReplicaSetVersion, reject different bytes at the same cut, and reject every
+// regressing field even after an earlier call published before returning an
+// error. A later Published call must expose an ambiguous successful
+// publication so retry does not reapply it.
+// Normal entry data, configuration state, and snapshots are borrowed only for
+// the duration of the call and must not be mutated or retained.
 type StateMachine interface {
 	Applied() uint64
 	Published() Publication

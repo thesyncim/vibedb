@@ -157,6 +157,245 @@ func TestRecoveryRejectsMalformedDurableRangesWithoutPanic(t *testing.T) {
 	}
 }
 
+func TestRecoveryReconcilesDurableSnapshotBeforeRawNode(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(5), uint64(3)
+	snapshot := &pb.Snapshot{
+		Data: []byte("durable-snapshot"),
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1}},
+			Index:     &index,
+			Term:      &term,
+		},
+	}
+	if err := stable.MemoryStorage.ApplySnapshot(snapshot); err != nil {
+		t.Fatalf("ApplySnapshot() error = %v", err)
+	}
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &index,
+	}); err != nil {
+		t.Fatalf("SetHardState() error = %v", err)
+	}
+
+	restarted, err := NewNode(1, 2, stable, machine)
+	if err != nil {
+		t.Fatalf("NewNode() error = %v", err)
+	}
+	if machine.snapshotCalls != 1 {
+		t.Fatalf("snapshot installs = %d, want 1", machine.snapshotCalls)
+	}
+	publication := machine.Published()
+	if publication.Applied != index || publication.LogicalDigest != sha256.Sum256(snapshot.GetData()) {
+		t.Fatalf("reconciled publication = %+v", publication)
+	}
+	if got := restarted.Published(); !equalPublication(got, publication) {
+		t.Fatalf("node publication = %+v, want %+v", got, publication)
+	}
+}
+
+func TestRecoveryBootstrapsEmptyMachineFromDurableSnapshot(t *testing.T) {
+	_, stable, _ := newTestNode(t, 1, []uint64{1})
+	machine := &fakeStateMachine{pub: Publication{ConfState: new(pb.ConfState)}}
+	restarted, err := NewNode(1, 2, stable, machine)
+	if err != nil {
+		t.Fatalf("NewNode() error = %v", err)
+	}
+	if machine.Applied() != 1 || machine.snapshotCalls != 1 {
+		t.Fatalf("bootstrap publication index=%d installs=%d", machine.Applied(), machine.snapshotCalls)
+	}
+	if got := restarted.Published(); got.ReplicaSetVersion != 1 || !confStateHasMembers(got.ConfState) {
+		t.Fatalf("bootstrap publication = %+v", got)
+	}
+}
+
+func TestRecoveryDurableSnapshotInstallFailureCanRetry(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(4), uint64(2)
+	snapshot := &pb.Snapshot{
+		Data: []byte("retryable-snapshot"),
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1}},
+			Index:     &index,
+			Term:      &term,
+		},
+	}
+	if err := stable.MemoryStorage.ApplySnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &index,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("injected snapshot install failure")
+	machine.fail = wantErr
+	if _, err := NewNode(1, 2, stable, machine); !errors.Is(err, wantErr) {
+		t.Fatalf("NewNode() error = %v, want %v", err, wantErr)
+	}
+	if machine.Applied() != 1 {
+		t.Fatalf("failed install published index %d, want 1", machine.Applied())
+	}
+	machine.fail = nil
+	if _, err := NewNode(1, 2, stable, machine); err != nil {
+		t.Fatalf("NewNode() retry error = %v", err)
+	}
+	if machine.Applied() != index || machine.snapshotCalls != 1 {
+		t.Fatalf("retry publication index=%d installs=%d", machine.Applied(), machine.snapshotCalls)
+	}
+}
+
+func TestRecoveryRevalidatesAlreadyPublishedDurableSnapshot(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(6), uint64(4)
+	snapshot := &pb.Snapshot{
+		Data: []byte("already-published"),
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1}},
+			Index:     &index,
+			Term:      &term,
+		},
+	}
+	if err := stable.MemoryStorage.ApplySnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &index,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := machine.InstallSnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if machine.snapshotCalls != 1 {
+		t.Fatalf("setup installs = %d, want 1", machine.snapshotCalls)
+	}
+	if _, err := NewNode(1, 2, stable, machine); err != nil {
+		t.Fatalf("NewNode() error = %v", err)
+	}
+	if machine.snapshotCalls != 2 {
+		t.Fatalf("restart exact-snapshot checks=%d, want 2", machine.snapshotCalls)
+	}
+}
+
+func TestRecoverySettlesSnapshotPublishedBeforeInstallError(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(7), uint64(5)
+	snapshot := &pb.Snapshot{
+		Data: []byte("published-before-error"),
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1}},
+			Index:     &index,
+			Term:      &term,
+		},
+	}
+	if err := stable.MemoryStorage.ApplySnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &index,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("snapshot publication outcome unknown")
+	machine.snapshotFailAfterPublish = wantErr
+	if _, err := NewNode(1, 2, stable, machine); !errors.Is(err, wantErr) {
+		t.Fatalf("NewNode() error = %v, want %v", err, wantErr)
+	}
+	if machine.Applied() != index || machine.snapshotCalls != 1 {
+		t.Fatalf("ambiguous install index=%d calls=%d", machine.Applied(), machine.snapshotCalls)
+	}
+	machine.snapshotFailAfterPublish = nil
+	if _, err := NewNode(1, 2, stable, machine); err != nil {
+		t.Fatalf("NewNode() settlement error = %v", err)
+	}
+	if machine.snapshotCalls != 2 {
+		t.Fatalf("settlement exact-snapshot checks=%d, want 2", machine.snapshotCalls)
+	}
+}
+
+func TestRecoveryRejectsDifferentSnapshotBytesAtPublishedCut(t *testing.T) {
+	_, _, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(1), uint64(1)
+	different := &pb.Snapshot{
+		Data: []byte("different-state-at-the-same-cut"),
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1}},
+			Index:     &index,
+			Term:      &term,
+		},
+	}
+	memory := raft.NewMemoryStorage()
+	if err := memory.ApplySnapshot(different); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.SetHardState(&pb.HardState{Term: &term, Commit: &index}); err != nil {
+		t.Fatal(err)
+	}
+	stable := &fakeStable{
+		MemoryStorage: memory,
+		conf:          cloneConfState(different.GetMetadata().GetConfState()),
+		durableIDs:    make(map[readyKey]struct{}),
+	}
+	if _, err := NewNode(1, 2, stable, machine); err == nil {
+		t.Fatal("NewNode accepted different snapshot bytes at the published cut")
+	}
+}
+
+func TestRecoveryRejectsAmbiguousSnapshotVersionRegression(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(8), uint64(6)
+	snapshot := &pb.Snapshot{
+		Data: []byte("version-bound-snapshot"),
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1}},
+			Index:     &index,
+			Term:      &term,
+		},
+	}
+	if err := stable.MemoryStorage.ApplySnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &index,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	badVersion := uint64(0)
+	wantErr := errors.New("ambiguous invalid snapshot publication")
+	machine.snapshotBadVersionAfterPublish = &badVersion
+	machine.snapshotFailAfterPublish = wantErr
+	if _, err := NewNode(1, 2, stable, machine); !errors.Is(err, wantErr) {
+		t.Fatalf("NewNode() error = %v, want %v", err, wantErr)
+	}
+	machine.snapshotBadVersionAfterPublish = nil
+	machine.snapshotFailAfterPublish = nil
+	if _, err := NewNode(1, 2, stable, machine); err == nil {
+		t.Fatal("NewNode accepted the regressed ambiguous snapshot publication")
+	}
+}
+
+func TestRecoveryRejectsPublicationMismatchAtDurableSnapshotCut(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	index, term := uint64(3), uint64(2)
+	snapshot := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
+		ConfState: &pb.ConfState{Voters: []uint64{1, 2}},
+		Index:     &index,
+		Term:      &term,
+	}}
+	if err := stable.MemoryStorage.ApplySnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &index,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	machine.pub.Applied = index
+	if _, err := NewNode(1, 2, stable, machine); err == nil {
+		t.Fatal("NewNode accepted a publication whose ConfState differs at the snapshot cut")
+	}
+}
+
 func TestMessageMicroStepsExposeCrashCuts(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2, 3})
 	if err := node.Campaign(); err != nil {
@@ -927,9 +1166,17 @@ type lastIndexStable struct {
 func (s *lastIndexStable) LastIndex() (uint64, error) { return s.last, nil }
 
 type fakeStateMachine struct {
-	pub   Publication
-	calls []applyCall
-	fail  error
+	pub                            Publication
+	calls                          []applyCall
+	fail                           error
+	snapshotFailAfterPublish       error
+	snapshotBadVersionAfterPublish *uint64
+	snapshotCalls                  int
+	snapshotIndex                  uint64
+	snapshotTerm                   uint64
+	snapshotDigest                 [32]byte
+	snapshotReplicaSetVersion      uint64
+	snapshotConfState              *pb.ConfState
 }
 
 func (m *fakeStateMachine) Applied() uint64 { return m.pub.Applied }
@@ -966,11 +1213,42 @@ func (m *fakeStateMachine) InstallSnapshot(snapshot *pb.Snapshot) (Publication, 
 	if m.fail != nil {
 		return Publication{}, m.fail
 	}
-	m.pub.Applied = snapshot.GetMetadata().GetIndex()
+	m.snapshotCalls++
+	metadata := snapshot.GetMetadata()
+	index := metadata.GetIndex()
+	digest := testSnapshotIdentity(snapshot)
+	if m.pub.Applied == index {
+		if m.snapshotIndex != index || m.snapshotTerm != metadata.GetTerm() ||
+			m.snapshotDigest != digest ||
+			m.snapshotReplicaSetVersion != m.pub.ReplicaSetVersion ||
+			m.snapshotConfState == nil ||
+			m.snapshotConfState.Equivalent(metadata.GetConfState()) != nil {
+			return Publication{}, errors.New("snapshot differs from the exact published snapshot")
+		}
+		return m.Published(), nil
+	}
+	if m.pub.Applied > index {
+		return Publication{}, errors.New("snapshot regresses applied index")
+	}
+	expectedVersion := m.pub.ReplicaSetVersion
+	if m.pub.ConfState == nil || m.pub.ConfState.Equivalent(metadata.GetConfState()) != nil ||
+		expectedVersion == 0 && confStateHasMembers(metadata.GetConfState()) {
+		expectedVersion = index
+	}
+	m.snapshotIndex = index
+	m.snapshotTerm = metadata.GetTerm()
+	m.snapshotDigest = digest
+	m.snapshotReplicaSetVersion = expectedVersion
+	m.snapshotConfState = cloneConfState(metadata.GetConfState())
+	m.pub.Applied = index
 	m.pub.LogicalDigest = sha256.Sum256(snapshot.GetData())
-	m.pub.ConfState = cloneConfState(snapshot.GetMetadata().GetConfState())
-	if m.pub.ReplicaSetVersion > m.pub.Applied {
-		m.pub.ReplicaSetVersion = m.pub.Applied
+	m.pub.ConfState = cloneConfState(metadata.GetConfState())
+	m.pub.ReplicaSetVersion = expectedVersion
+	if m.snapshotBadVersionAfterPublish != nil {
+		m.pub.ReplicaSetVersion = *m.snapshotBadVersionAfterPublish
+	}
+	if m.snapshotFailAfterPublish != nil {
+		return m.Published(), m.snapshotFailAfterPublish
 	}
 	return m.Published(), nil
 }
@@ -998,14 +1276,28 @@ func newTestNode(t *testing.T, incarnation uint64, voters []uint64) (*Node, *fak
 	}
 	machine := &fakeStateMachine{pub: Publication{
 		Applied:           index,
+		LogicalDigest:     sha256.Sum256(snapshot.GetData()),
 		ConfState:         cloneConfState(confState),
 		ReplicaSetVersion: index,
-	}}
+	}, snapshotIndex: index, snapshotTerm: term,
+		snapshotDigest:            testSnapshotIdentity(snapshot),
+		snapshotReplicaSetVersion: index,
+		snapshotConfState:         cloneConfState(confState),
+	}
 	node, err := NewNode(1, incarnation, stable, machine)
 	if err != nil {
 		t.Fatalf("NewNode() error = %v", err)
 	}
+	machine.snapshotCalls = 0
 	return node, stable, machine
+}
+
+func testSnapshotIdentity(snapshot *pb.Snapshot) [32]byte {
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+	if err != nil {
+		panic(err)
+	}
+	return sha256.Sum256(encoded)
 }
 
 func cloneTestMemoryStorage(t *testing.T, source *raft.MemoryStorage) *raft.MemoryStorage {

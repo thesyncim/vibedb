@@ -46,6 +46,14 @@ type MemoryMachine struct {
 	entries     []AppliedEntry
 	baseIndex   uint64
 	chain       [32]byte
+
+	// snapshotIdentity binds the exact canonical snapshot from which the
+	// machine's base publication was restored. Phase 0 does not model
+	// advancing application snapshots yet, but restart reconciliation must
+	// still prove that an already-published base came from the same durable
+	// snapshot rather than merely sharing its index and ConfState.
+	snapshotIdentity [32]byte
+	snapshotTerm     uint64
 }
 
 // NewMemoryMachine restores the same canonical index-one cut used by
@@ -59,11 +67,21 @@ func NewMemoryMachine(voters []uint64) (*MemoryMachine, error) {
 	if err != nil {
 		return nil, err
 	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	identity, err := modelSnapshotIdentity(snapshot)
+	if err != nil {
+		return nil, err
+	}
 	return &MemoryMachine{
 		publication: raftmodel.Publication{
 			Applied: 1, ConfState: cloneConfState(conf), ReplicaSetVersion: 1,
 		},
-		baseIndex: 1,
+		baseIndex:        1,
+		snapshotIdentity: identity,
+		snapshotTerm:     snapshot.GetMetadata().GetTerm(),
 	}, nil
 }
 
@@ -160,10 +178,45 @@ func (m *MemoryMachine) ApplyConfiguration(meta raftmodel.ApplyMeta, state *pb.C
 	return m.Published(), nil
 }
 
-// InstallSnapshot remains deliberately unsupported until the snapshot payload
-// codec can verify identity, applied term/index, ConfState, and chain digest.
-func (m *MemoryMachine) InstallSnapshot(*pb.Snapshot) (raftmodel.Publication, error) {
-	return raftmodel.Publication{}, errors.New("raftsim: snapshot install is not implemented in Phase-0 foundation")
+// InstallSnapshot reconciles the exact static bootstrap snapshot idempotently.
+// Advancing application snapshots remain outside the Phase-0 model, but an
+// already-published cut must still be bound to the exact durable snapshot on
+// every restart.
+func (m *MemoryMachine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication, error) {
+	if m == nil || snapshot == nil || snapshot.GetMetadata() == nil {
+		return raftmodel.Publication{}, fmt.Errorf("%w: nil snapshot", ErrMachineInvariant)
+	}
+	metadata := snapshot.GetMetadata()
+	identity, err := modelSnapshotIdentity(snapshot)
+	if err != nil {
+		return raftmodel.Publication{}, err
+	}
+	if metadata.GetIndex() != m.baseIndex || m.publication.Applied != m.baseIndex ||
+		metadata.GetTerm() != m.snapshotTerm || identity != m.snapshotIdentity ||
+		m.publication.ConfState == nil || metadata.GetConfState() == nil ||
+		m.publication.ConfState.Equivalent(metadata.GetConfState()) != nil ||
+		m.publication.ReplicaSetVersion != m.baseIndex {
+		return raftmodel.Publication{}, fmt.Errorf(
+			"%w: snapshot does not match the exact static publication", ErrMachineInvariant,
+		)
+	}
+	return m.Published(), nil
+}
+
+func modelSnapshotIdentity(snapshot *pb.Snapshot) ([32]byte, error) {
+	if snapshot == nil {
+		return [32]byte{}, fmt.Errorf("%w: nil snapshot", ErrMachineInvariant)
+	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("%w: marshal snapshot: %v", ErrMachineInvariant, err)
+	}
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte("VDBSIMSNAP/v1\x00"))
+	_, _ = hasher.Write(encoded)
+	var identity [32]byte
+	_ = hasher.Sum(identity[:0])
+	return identity, nil
 }
 
 func (m *MemoryMachine) validateNext(meta raftmodel.ApplyMeta) error {

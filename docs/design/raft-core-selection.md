@@ -97,6 +97,21 @@ storage writes, each `Ready` batch is processed under this minimum order:
    read index; and
 5. call `Advance` only after every required part of that batch has completed.
 
+Restart also closes the persistence-to-install crash cut explicitly: when the
+stable snapshot base is newer than or equal to the state machine's atomically
+published cut, node recovery idempotently reconciles that exact durable
+snapshot before it constructs `RawNode`. Equality is not trusted from index and
+configuration alone: the state machine verifies its persisted snapshot
+identity/manifest, logical digest, and replica-set version and rejects different
+bytes or a regressed publication at the same cut. A failure leaves the member
+non-serving and retryable; recovery never starts the protocol core with an
+applied index below its durable log base.
+
+Each member store also durably allocates a strictly increasing, never-reused
+node-incarnation counter before a reconstructed driver accepts input. Together
+with Ready's per-incarnation sequence, that counter is the persistence retry
+identity and stale-process fence; it is not a random startup token.
+
 Configuration entries are applied exactly once and passed to
 `ApplyConfChange` in committed order. The executable foundation currently
 accepts context-free add/remove/promote operations only after the durable log

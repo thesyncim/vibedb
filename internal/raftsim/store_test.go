@@ -244,6 +244,37 @@ func TestMemoryMachineAppliesExactOrderedPrefix(t *testing.T) {
 	}
 }
 
+func TestMemoryMachineReconcilesOnlyExactStaticSnapshot(t *testing.T) {
+	store, err := NewMemoryStore([]uint64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine, err := NewMemoryMachine([]uint64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := machine.InstallSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publication.Applied != 1 || publication.ReplicaSetVersion != 1 {
+		t.Fatalf("publication = %+v", publication)
+	}
+
+	different := cloneSnapshot(snapshot)
+	different.Data = []byte("different same-cut state")
+	if _, err := machine.InstallSnapshot(different); !errors.Is(err, ErrMachineInvariant) {
+		t.Fatalf("different same-cut snapshot error = %v", err)
+	}
+	if got := machine.Published(); got.Applied != 1 || got.ReplicaSetVersion != 1 {
+		t.Fatalf("publication changed after refusal = %+v", got)
+	}
+}
+
 func TestMemoryMachineFailsClosedAtAppliedExhaustion(t *testing.T) {
 	machine, err := NewMemoryMachine([]uint64{1})
 	if err != nil {

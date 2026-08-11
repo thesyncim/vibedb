@@ -53,8 +53,13 @@ type ReadyProgress struct {
 }
 
 // NewNode recovers a RawNode at the state machine's atomically published cut.
-// Incarnation is a non-zero, process-lifetime identity used to fence ReadIndex
-// results across restarts.
+// If StableStore has already advanced its snapshot past that cut, NewNode first
+// asks StateMachine to install and atomically publish the exact durable
+// snapshot. That closes the crash interval between Ready persistence and
+// InstallSnapshot without permitting RawNode to start from mismatched durable
+// and applied bases. Incarnation is the non-zero, durable, strictly increasing
+// member boot counter allocated by StableStore; it fences ReadIndex results and
+// Ready retries across restarts.
 func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (*Node, error) {
 	if id == raft.None {
 		return nil, errors.New("raftmodel: member ID must be non-zero")
@@ -105,12 +110,29 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 	if last < base || last == math.MaxUint64 {
 		return nil, fmt.Errorf("raftmodel: durable log range [%d,%d] is invalid", base, last)
 	}
-	if err := validateConfState(pub.ConfState, last); err != nil {
-		return nil, fmt.Errorf("raftmodel: published ConfState: %w", err)
+	durableSnapshot, err := stable.Snapshot()
+	if err != nil {
+		return nil, fmt.Errorf("raftmodel: read durable snapshot: %w", err)
+	}
+	if err := validateSnapshotEnvelope(durableSnapshot); err != nil {
+		return nil, fmt.Errorf("raftmodel: durable snapshot: %w", err)
+	}
+	metadata := durableSnapshot.GetMetadata()
+	if metadata.GetIndex() != base {
+		return nil, fmt.Errorf(
+			"raftmodel: durable snapshot index %d differs from log base %d",
+			metadata.GetIndex(), base,
+		)
 	}
 	baseTerm, err := stable.Term(base)
 	if err != nil || (base != 0 && baseTerm == 0) {
 		return nil, fmt.Errorf("raftmodel: read durable base term at %d: %v", base, err)
+	}
+	if metadata.GetTerm() != baseTerm {
+		return nil, fmt.Errorf(
+			"raftmodel: durable snapshot term %d differs from log base term %d",
+			metadata.GetTerm(), baseTerm,
+		)
 	}
 	lastTerm, err := stable.Term(last)
 	if err != nil {
@@ -124,8 +146,38 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 		}
 		committed = hs.GetCommit()
 	}
+	if pub.Applied <= base {
+		reconciled := &Node{machine: machine, published: pub}
+		installed, installErr := machine.InstallSnapshot(durableSnapshot)
+		if installErr != nil {
+			return nil, fmt.Errorf(
+				"raftmodel: reconcile durable snapshot at %d: %w",
+				base, installErr,
+			)
+		}
+		if acceptErr := reconciled.acceptSnapshotPublication(
+			base, metadata.GetConfState(), installed,
+		); acceptErr != nil {
+			return nil, fmt.Errorf(
+				"raftmodel: reconcile durable snapshot at %d: %w",
+				base, acceptErr,
+			)
+		}
+		pub = reconciled.published
+	}
+	if err := validateConfState(pub.ConfState, last); err != nil {
+		return nil, fmt.Errorf("raftmodel: published ConfState: %w", err)
+	}
 	if pub.Applied < base || pub.Applied > committed {
 		return nil, fmt.Errorf("raftmodel: published index %d outside durable committed range [%d,%d]", pub.Applied, base, committed)
+	}
+	if pub.Applied == base {
+		if equivalentErr := pub.ConfState.Equivalent(metadata.GetConfState()); equivalentErr != nil {
+			return nil, fmt.Errorf(
+				"raftmodel: publication at durable snapshot cut differs from snapshot ConfState: %w",
+				equivalentErr,
+			)
+		}
 	}
 
 	// ConfState becomes active at ordered application, not at Ready persistence.

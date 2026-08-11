@@ -52,7 +52,7 @@ func (n *Node) acceptSnapshotPublication(index uint64, state *pb.ConfState, retu
 	if err := n.validateObservedPublication(index, returned); err != nil {
 		return err
 	}
-	if !proto.Equal(returned.ConfState, state) {
+	if returned.ConfState == nil || returned.ConfState.Equivalent(state) != nil {
 		return errors.New("snapshot publication differs from snapshot ConfState")
 	}
 	if returned.ReplicaSetVersion < previous.ReplicaSetVersion {
