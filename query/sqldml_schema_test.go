@@ -52,6 +52,24 @@ func TestLowerTablePreservesSQLNullability(t *testing.T) {
 	}
 }
 
+func TestLowerTablePrimaryOnlyIsSchemaFree(t *testing.T) {
+	statement, err := PrepareDML(`CREATE TABLE docs (PRIMARY KEY (tenant.id))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	definition, err := statement.LowerTable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Schema != nil {
+		t.Fatalf("primary-only Schema = %+v, want nil schemaless profile", definition.Schema)
+	}
+	if got, want := definition.PrimaryKey, []string{"tenant.id"}; !slices.Equal(got, want) {
+		t.Fatalf("primary-only PrimaryKey = %q, want %q", got, want)
+	}
+}
+
 func TestLowerIndexDerivedNameIsDeterministicAndUnambiguous(t *testing.T) {
 	lower := func(src string) IndexDefinition {
 		t.Helper()

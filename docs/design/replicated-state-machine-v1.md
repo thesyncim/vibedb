@@ -242,8 +242,10 @@ integration:
 
 Before serving, later phases must add all of:
 
-1. exact SQL catalog and Raft-WAL identity binding plus a persistent direct-write
-   fence;
+1. the landed [SQL replicated binding v1](sql-replicated-binding-v1.md) must be
+   connected to the trusted apply adapter; it already provides exact SQL
+   catalog/Raft-WAL identity binding and a persistent direct-write fence, but
+   deliberately grants no serving or apply authority;
 2. admission that reserves completion/system/data capacity for every committed
    in-flight entry, with a safe completion GC protocol;
 3. crash-atomic runtime snapshots and WAL generation compaction;

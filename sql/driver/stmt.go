@@ -210,6 +210,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	}
 	var err error
 	if s.mutation != nil {
+		if err := s.conn.requireDirectWriteAllowed(); err != nil {
+			return nil, err
+		}
 		var cursor query.Cursor
 		if s.conn.tx != nil {
 			cursor, err = s.conn.tx.execPreparedMutationReturningContext(
@@ -879,6 +882,11 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 			return nil, err
 		}
 		return result{}, nil
+	}
+	if s.mutation != nil || (s.views != nil && s.views.ddl != nil) {
+		if err := s.conn.requireDirectWriteAllowed(); err != nil {
+			return nil, err
+		}
 	}
 	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
 		return nil, errors.New("vibedb: SELECT returns rows; use Query")

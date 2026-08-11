@@ -47,11 +47,12 @@ const maxCatalogTables = 128
 const maxCatalogBytes = 16 << 20
 
 type catalogFile struct {
-	Version         int                   `json:"version"`
-	Tables          map[string]*tableMeta `json:"tables"`
-	Views           map[string]*viewMeta  `json:"views,omitempty"`
-	ShardStore      *ShardStoreIdentity   `json:"shard_store,omitempty"`
-	ShardStoreFence *ShardStoreFence      `json:"shard_store_fence,omitempty"`
+	Version              int                           `json:"version"`
+	Tables               map[string]*tableMeta         `json:"tables"`
+	Views                map[string]*viewMeta          `json:"views,omitempty"`
+	ShardStore           *ShardStoreIdentity           `json:"shard_store,omitempty"`
+	ShardStoreFence      *ShardStoreFence              `json:"shard_store_fence,omitempty"`
+	ReplicatedShardStore *ReplicatedShardStoreIdentity `json:"replicated_shard_store,omitempty"`
 }
 
 // viewMeta is immutable after publication. Prepared statements retain its
@@ -297,6 +298,12 @@ func openDatabaseWithShardStorePolicy(
 			}
 		}
 	case shardStoreOpenInitialize:
+		if d.catalog.ReplicatedShardStore != nil {
+			return nil, fmt.Errorf(
+				"vibedb: initialize local shard store %s: %w",
+				absolute, ErrDirectWriteFenced,
+			)
+		}
 		if d.catalog.ShardStore != nil &&
 			d.catalog.ShardStore.Binding() != shardPolicy.expected {
 			return nil, &ShardStoreError{
@@ -335,12 +342,43 @@ func openDatabaseWithShardStorePolicy(
 				Err: ErrShardStoreUnbound,
 			}
 		}
+		if d.catalog.ReplicatedShardStore != nil {
+			return nil, fmt.Errorf(
+				"vibedb: open local shard store %s: %w",
+				absolute, ErrDirectWriteFenced,
+			)
+		}
 		if d.catalog.ShardStore.Binding() != shardPolicy.expected {
 			return nil, &ShardStoreError{
 				Op: "open", Path: absolute, Expected: shardPolicy.expected,
 				Actual: *d.catalog.ShardStore,
 				Err:    ErrShardStoreIdentityMismatch,
 			}
+		}
+	case shardStoreOpenReplicatedExisting:
+		if !exists || d.catalog.ReplicatedShardStore == nil {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreUnbound, absolute,
+			)
+		}
+		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreIdentityMismatch, absolute,
+			)
+		}
+	case shardStoreOpenReplicatedSettlement:
+		if !exists || d.catalog.ReplicatedShardStore == nil {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreUnbound, absolute,
+			)
+		}
+		actual := d.catalog.ReplicatedShardStore
+		if actual.Binding != shardPolicy.expectedReplicated.Binding ||
+			actual.LogID != shardPolicy.expectedReplicatedLogID ||
+			actual.UserTable != shardPolicy.expectedReplicatedUserTable {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreIdentityMismatch, absolute,
+			)
 		}
 	default:
 		return nil, errors.New("vibedb: invalid shard store open policy")
@@ -503,6 +541,12 @@ func openDatabaseWithShardStorePolicy(
 			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
 		}
 		t.file, t.collection = file, collection
+		if d.catalog.ReplicatedShardStore != nil {
+			// Replicated mode freezes the complete physical table profile. It
+			// must never adopt or mirror a durable layout that the bound catalog
+			// did not name.
+			continue
+		}
 		if !meta.Materialized {
 			// A table's unique storage identity is catalog-owned before its first
 			// mutation. First materialization publishes and fences the complete
@@ -523,6 +567,11 @@ func openDatabaseWithShardStorePolicy(
 		}
 		if changed {
 			d.catalogWritePending = true
+		}
+	}
+	if d.catalog.ReplicatedShardStore != nil {
+		if err := validateOpenedReplicatedCatalog(d); err != nil {
+			return nil, fmt.Errorf("vibedb: open replicated SQL catalog: %w", err)
 		}
 	}
 	if d.catalogWritePending {
@@ -758,7 +807,10 @@ func schemaMetaFrom(schema *store.Schema) *schemaMeta {
 
 func validatePrimarySchema(primaryKey string, schema *store.Schema) error {
 	if schema == nil {
-		return errors.New("the persisted schema is absent")
+		// Schema-free JSON tables still have a driver-owned physical primary
+		// key. documentKey validates that the pointer exists and resolves to a
+		// scalar on every mutation; a durable document schema is optional.
+		return nil
 	}
 	definition := schema.Definition()
 	if definition.Root != store.SchemaObject {
@@ -1177,6 +1229,11 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 			)
 		}
 	}
+	if err := validateReplicatedCatalog(catalog); err != nil {
+		return maxCatalogBytes + 1, fmt.Errorf(
+			"vibedb: invalid replicated shard store identity: %w", err,
+		)
+	}
 	if err := checkCatalogTableCount(len(catalog.Tables)); err != nil {
 		return maxCatalogBytes + 1, err
 	}
@@ -1200,6 +1257,16 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	}
 	if catalog.ShardStoreFence != nil {
 		if !add(256) {
+			return size, catalogSizeError(size)
+		}
+	}
+	if catalog.ReplicatedShardStore != nil {
+		r := catalog.ReplicatedShardStore
+		if !add(encodedJSONStringBytes(r.Binding.Distribution) +
+			encodedJSONStringBytes(r.Binding.Shard) +
+			encodedJSONStringBytes(r.UserTable) +
+			encodedJSONStringBytes(r.UserStorage) +
+			encodedJSONStringBytes(r.UserPrimaryKey) + 4096) {
 			return size, catalogSizeError(size)
 		}
 	}
@@ -1365,6 +1432,9 @@ func (d *database) ensureDataDir() error {
 func (d *database) materializeLocked(name string, documents []seedDocument) (*table, error) {
 	if err := d.settleCatalogLocked(); err != nil {
 		return nil, err
+	}
+	if d.catalog.ReplicatedShardStore != nil {
+		return nil, ErrDirectWriteFenced
 	}
 	t, ok := d.tables[name]
 	if !ok {
