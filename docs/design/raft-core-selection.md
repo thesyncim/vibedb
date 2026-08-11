@@ -1,11 +1,11 @@
 # Raft core selection and threat model
 
 **Status:** the core, dependency revision, baseline configuration, synchronous
-driver, bounded logical store/state-machine model, and replayable simulator
-foundation are executable. This is not a claim that production replication,
-failover, a Raft WAL, snapshots, or a network transport exists yet. Those
-claims remain gated by the
-[distributed delivery plan](distributed-sharding.md#delivery-plan).
+driver, bounded logical store/state-machine model, replayable simulator
+foundation, and Phase 1a static-snapshot disk WAL are executable. This is not
+a claim that production replication, failover, a serving/compacting Raft WAL,
+runtime snapshots, or a network transport exists yet. Those claims remain
+gated by the [distributed delivery plan](distributed-sharding.md#delivery-plan).
 
 ## Exact selection and provenance
 
@@ -83,6 +83,17 @@ or equal budgets.
 One serialized owner drives each `RawNode`; no concurrent caller may feed
 ticks, messages, proposals, reads, or membership changes. With synchronous
 storage writes, each `Ready` batch is processed under this minimum order:
+
+Before `CaptureReady`, the driver admits a bounded aggregation window only for
+Ready work caused by observed protocol input: at most 64 calls, 4,096 input
+units, and 64 MiB of Entry/Snapshot payload bytes. Every call costs at least one
+unit and an inbound append costs one unit per Entry. A Ready already exposed at
+construction or after `Advance` blocks further input until capture.
+Configuration proposals remain stricter and require no pending Ready. Capture
+closes the input window, and no new protocol input is accepted until that Ready
+is fully advanced. Combined with complete message and proposal byte limits,
+this keeps every durability-bearing Ready inside the disk store's sealed entry
+and byte envelope.
 
 1. append entries and persist `HardState` and any snapshot to the member's
    durable store; a snapshot always needs its crash-safe publication protocol,
@@ -189,7 +200,7 @@ while CI's `1.26` selector tracks current patch releases.
 
 ## Executable Phase-0 foundation
 
-Three deliberately separate packages now make the contract testable without
+Four deliberately separate packages now make the contract testable without
 claiming a production replicated store:
 
 - `internal/raftmodel` owns one actual upstream `RawNode`, proposal/read
@@ -211,13 +222,19 @@ claiming a production replicated store:
 - `internal/replication` freezes pure command and completion byte envelopes.
   Those codecs are intentionally unwired: they establish bounded canonical
   data, not a WAL, completion table, blob store, transport, or apply path.
+- `internal/raftstore` implements the Phase 1a identity-bound, encrypted,
+  preallocated append-only `StableStore` and exact Ready retry boundary on
+  Linux and macOS. It has a static bootstrap snapshot and no compaction,
+  transport, serving path, or general anti-rollback witness; its full qualified
+  contract and quarantine limits are in [Raft WAL v1](raft-wal-v1.md).
 
 The simulator's `MemoryStore` is an indivisible logical durability oracle, not
 an implementation template. It cannot represent torn sectors, fsync lies,
 snapshot files, compaction, or recovery-journal interaction. Its purpose is to
-prove integration ordering and make each logical failure trace byte-exact;
-Phase 1 must replace it with crash-tested on-disk formats while preserving the
-same driver boundary.
+prove integration ordering and make each logical failure trace byte-exact.
+Phase 1a now exercises the same driver boundary against a crash-tested static-
+snapshot disk format; runtime snapshot/compaction and serving qualification
+remain later gates.
 
 Simulator proposal references and completion lookups are model-local. A
 `RespondProposal` event means that a live replica has found the exact reference
@@ -235,8 +252,9 @@ Current executable bounds include nine voters per modeled group, 4,096 exact
 applied records, at most 4,096 scenario proposal inputs, 64 MiB of aggregate
 scenario proposal payloads, 65,536 network envelopes, 128 MiB of concurrently
 retained encoded network data, 16 MiB per logical snapshot, 1,024 pending
-reads, and 262,144 trace events. The driver independently caps an applied
-`ConfState` at 64 total incoming/outgoing voter and learner references; joint
-membership counts both voter sets. These are integration/model ceilings, not
-promises that a production deployment should use the largest value
+reads, 64 protocol calls, 4,096 input units, and 64 MiB of payload per
+uncaptured Ready, and 262,144 trace events. The driver independently caps an
+applied `ConfState` at 64 total incoming/outgoing voter and learner references;
+joint membership counts both voter sets. These are integration/model ceilings,
+not promises that a production deployment should use the largest value
 simultaneously.

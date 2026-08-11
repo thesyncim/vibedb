@@ -32,6 +32,17 @@ const (
 	// MaxMessageEntries prevents pointer-heavy empty-entry batches from
 	// bypassing the encoded-byte bound.
 	MaxMessageEntries = 4096
+	// MaxPendingInputUnits bounds weighted protocol input accumulated into one
+	// uncaptured Ready. A call costs at least one unit and one unit per Entry, so
+	// the same bound also caps accumulated unstable entries.
+	MaxPendingInputUnits = MaxMessageEntries
+	// MaxPendingInputCalls independently bounds message/read/control work that
+	// carries no unstable entries but can still grow an uncaptured Ready.
+	MaxPendingInputCalls = MaxInflightMsgs
+	// MaxPendingInputBytes bounds the Entry/Snapshot payload bytes accumulated
+	// into one uncaptured Ready. Followers do not apply the leader proposal
+	// watermark, so the integration boundary enforces it independently.
+	MaxPendingInputBytes int64 = MaxUncommittedEntriesSize
 	// MaxConfStateMembers bounds the total incoming/outgoing voter and learner
 	// references reconstructed by upstream Changer. Joint configurations count
 	// both voter sets because both are retained and safety-critical.
@@ -67,7 +78,7 @@ type ReadOutcome struct {
 // contexts are rejected because the core returns contexts as exact opaque
 // correlation keys.
 func (n *Node) ReadIndex(context []byte) error {
-	if err := n.requirePhase("ReadIndex", PhaseIdle); err != nil {
+	if err := n.admitProtocolInput("ReadIndex", 1, 0); err != nil {
 		return err
 	}
 	if len(context) == 0 {
@@ -105,6 +116,7 @@ func (n *Node) ReadIndex(context []byte) error {
 	}
 	n.readBytes += len(copyOfContext)
 	n.raw.ReadIndex(copyOfContext)
+	n.recordProtocolInput(1, 0)
 	return nil
 }
 

@@ -59,6 +59,105 @@ func TestReadyCannotSendOrAcceptInputBeforePersistence(t *testing.T) {
 	}
 }
 
+func TestPendingReadyInputIsBoundedBeforeCapture(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	term := uint64(2)
+	entries := make([]*pb.Entry, MaxPendingInputUnits)
+	for ordinal := range entries {
+		entries[ordinal] = &pb.Entry{Term: &term, Index: uint64Ptr(uint64(ordinal + 2))}
+	}
+	if err := node.Step(&pb.Message{
+		Type: pb.MsgApp.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
+		Index: uint64Ptr(1), LogTerm: uint64Ptr(1), Commit: uint64Ptr(1), Entries: entries,
+	}); err != nil {
+		t.Fatalf("Step(maximum entry batch) error = %v", err)
+	}
+	if ready, err := node.HasReady(); err != nil || !ready {
+		t.Fatalf("HasReady() = %v, %v", ready, err)
+	}
+
+	status := node.Status()
+	for name, err := range map[string]error{
+		"campaign": node.Campaign(),
+		"propose":  node.Propose([]byte("second")),
+		"read":     node.ReadIndex([]byte("pending")),
+		"step": node.Step(&pb.Message{
+			Type: pb.MsgHeartbeat.Enum(), From: uint64Ptr(2), To: uint64Ptr(1),
+			Term: uint64Ptr(status.GetTerm()), Commit: uint64Ptr(status.GetCommit()),
+		}),
+		"tick": node.Tick(),
+	} {
+		if !errors.Is(err, ErrReadyPending) || !errors.Is(err, ErrAdmissionBound) {
+			t.Errorf("%s beyond uncaptured Ready bound error = %v", name, err)
+		}
+	}
+	change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: uint64Ptr(2)}
+	if err := node.ProposeConfChange(change); !errors.Is(err, ErrReadyPending) || !errors.Is(err, ErrConfChangePending) {
+		t.Fatalf("ProposeConfChange with uncaptured Ready error = %v", err)
+	}
+	if node.PendingReads() != 0 {
+		t.Fatalf("rejected ReadIndex retained %d requests", node.PendingReads())
+	}
+
+	if captured, err := node.CaptureReady(); err != nil || !captured {
+		t.Fatalf("CaptureReady() = %v, %v", captured, err)
+	}
+	if len(node.ready.Entries) != MaxPendingInputUnits {
+		t.Fatalf("captured entries = %d, want %d", len(node.ready.Entries), MaxPendingInputUnits)
+	}
+}
+
+func TestPendingReadyControlCallsAreBoundedBeforeCapture(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	term := uint64(2)
+	heartbeat := &pb.Message{
+		Type: pb.MsgHeartbeat.Enum(), From: uint64Ptr(2), To: uint64Ptr(1),
+		Term: &term, Commit: uint64Ptr(1),
+	}
+	for call := range MaxPendingInputCalls {
+		if err := node.Step(heartbeat); err != nil {
+			t.Fatalf("Step(heartbeat %d) error = %v", call, err)
+		}
+	}
+	if err := node.Step(heartbeat); !errors.Is(err, ErrReadyPending) || !errors.Is(err, ErrAdmissionBound) {
+		t.Fatalf("Step beyond pending call bound error = %v", err)
+	}
+	if captured, err := node.CaptureReady(); err != nil || !captured {
+		t.Fatalf("CaptureReady() = %v, %v", captured, err)
+	}
+	if len(node.ready.Messages) != MaxPendingInputCalls {
+		t.Fatalf("captured messages = %d, want %d", len(node.ready.Messages), MaxPendingInputCalls)
+	}
+}
+
+func TestPendingReadyPayloadBytesAreBoundedBeforeCapture(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	term := uint64(2)
+	heartbeat := &pb.Message{
+		Type: pb.MsgHeartbeat.Enum(), From: uint64Ptr(2), To: uint64Ptr(1),
+		Term: &term, Commit: uint64Ptr(1),
+	}
+	if err := node.Step(heartbeat); err != nil {
+		t.Fatalf("Step(heartbeat) error = %v", err)
+	}
+	node.pendingInputBytes = MaxPendingInputBytes - 1
+	appendOne := &pb.Message{
+		Type: pb.MsgApp.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
+		Index: uint64Ptr(1), LogTerm: uint64Ptr(1), Commit: uint64Ptr(1),
+		Entries: []*pb.Entry{{Term: &term, Index: uint64Ptr(2), Data: []byte{'x'}}},
+	}
+	if err := node.Step(appendOne); err != nil {
+		t.Fatalf("Step at exact pending byte bound error = %v", err)
+	}
+	appendTwo := proto.Clone(appendOne).(*pb.Message)
+	appendTwo.Index = uint64Ptr(2)
+	appendTwo.LogTerm = &term
+	appendTwo.Entries[0].Index = uint64Ptr(3)
+	if err := node.Step(appendTwo); !errors.Is(err, ErrReadyPending) || !errors.Is(err, ErrAdmissionBound) {
+		t.Fatalf("Step beyond pending byte bound error = %v", err)
+	}
+}
+
 func TestStepOwnsRetainedMessageGraph(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
 	term, index, commit := uint64(2), uint64(2), uint64(1)
@@ -832,6 +931,7 @@ func TestReadIndexWaitsForOrderedPublication(t *testing.T) {
 	if err := node.Propose([]byte("visible-at-barrier")); err != nil {
 		t.Fatalf("Propose() error = %v", err)
 	}
+	driveAllReady(t, node)
 	context := []byte{0x00, 0x7f, 0x80, 0xff}
 	wantContext := slices.Clone(context)
 	if err := node.ReadIndex(context); err != nil {
@@ -887,8 +987,8 @@ func TestReadIndexWaitsForOrderedPublication(t *testing.T) {
 }
 
 func TestReadIndexRejectsLeadershipChangeBeforeRelease(t *testing.T) {
-	node, _, _ := newTestNode(t, 1, []uint64{1})
-	driveCampaign(t, node)
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	driveCampaignWithPeer(t, node, 2)
 	context := []byte("leadership-fence")
 	if err := node.ReadIndex(context); err != nil {
 		t.Fatalf("ReadIndex() error = %v", err)
@@ -940,13 +1040,17 @@ func TestApplyFailureIsFailStop(t *testing.T) {
 }
 
 func TestApplyNextExposesEntryLevelCrashCuts(t *testing.T) {
-	node, _, _ := newTestNode(t, 1, []uint64{1})
-	driveCampaign(t, node)
-	if err := node.Propose([]byte("first")); err != nil {
-		t.Fatalf("Propose(first) error = %v", err)
-	}
-	if err := node.Propose([]byte("second")); err != nil {
-		t.Fatalf("Propose(second) error = %v", err)
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	term, commit := uint64(2), uint64(3)
+	if err := node.Step(&pb.Message{
+		Type: pb.MsgApp.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
+		Index: uint64Ptr(1), LogTerm: uint64Ptr(1), Commit: &commit,
+		Entries: []*pb.Entry{
+			{Term: &term, Index: uint64Ptr(2), Data: []byte("first")},
+			{Term: &term, Index: uint64Ptr(3), Data: []byte("second")},
+		},
+	}); err != nil {
+		t.Fatalf("Step(two committed entries) error = %v", err)
 	}
 	captureCommittedReady(t, node, []byte("first"))
 	if err := node.PersistReady(); err != nil {
@@ -1038,6 +1142,7 @@ func TestSnapshotPersistsBeforeOrderedInstall(t *testing.T) {
 func TestInboundSnapshotConfStateIsValidatedBeforeCoreStep(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
 	index, term := uint64(5), uint64(2)
+	unknown := []byte{0x98, 0x06, 0x01}
 	message := func(state *pb.ConfState, data []byte) *pb.Message {
 		return &pb.Message{
 			Type: pb.MsgSnap.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
@@ -1062,6 +1167,18 @@ func TestInboundSnapshotConfStateIsValidatedBeforeCoreStep(t *testing.T) {
 		}, nil),
 		"oversized data": message(&pb.ConfState{Voters: []uint64{1, 2}}, make([]byte, MaxSnapshotBytes+1)),
 	}
+	unknownMessage := message(&pb.ConfState{Voters: []uint64{1, 2}}, nil)
+	unknownMessage.ProtoReflect().SetUnknown(unknown)
+	tests["unknown message fields"] = unknownMessage
+	unknownSnapshot := message(&pb.ConfState{Voters: []uint64{1, 2}}, nil)
+	unknownSnapshot.GetSnapshot().ProtoReflect().SetUnknown(unknown)
+	tests["unknown snapshot fields"] = unknownSnapshot
+	unknownMetadata := message(&pb.ConfState{Voters: []uint64{1, 2}}, nil)
+	unknownMetadata.GetSnapshot().GetMetadata().ProtoReflect().SetUnknown(unknown)
+	tests["unknown snapshot metadata fields"] = unknownMetadata
+	unknownConfState := message(&pb.ConfState{Voters: []uint64{1, 2}}, nil)
+	unknownConfState.GetSnapshot().GetMetadata().GetConfState().ProtoReflect().SetUnknown(unknown)
+	tests["unknown ConfState fields"] = unknownConfState
 	for name, malformed := range tests {
 		t.Run(name, func(t *testing.T) {
 			if err := node.Step(malformed); err == nil {
@@ -1077,9 +1194,62 @@ func TestInboundSnapshotConfStateIsValidatedBeforeCoreStep(t *testing.T) {
 	}
 }
 
+func TestInboundEntryStoreIncompatibleFieldsAreRejectedBeforeCoreStep(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	term, index := uint64(2), uint64(2)
+	base := func() *pb.Message {
+		return &pb.Message{
+			Type: pb.MsgApp.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
+			Index: uint64Ptr(1), LogTerm: uint64Ptr(1), Commit: uint64Ptr(1),
+			Entries: []*pb.Entry{{Term: &term, Index: &index}},
+		}
+	}
+	tests := map[string]func(*pb.Message){
+		"unknown Entry fields": func(message *pb.Message) {
+			message.GetEntries()[0].ProtoReflect().SetUnknown([]byte{0x98, 0x06, 0x01})
+		},
+		"maximum message term": func(message *pb.Message) { message.Term = uint64Ptr(math.MaxUint64) },
+		"zero message term":    func(message *pb.Message) { message.Term = uint64Ptr(0) },
+		"maximum Entry term":   func(message *pb.Message) { message.GetEntries()[0].Term = uint64Ptr(math.MaxUint64) },
+		"maximum Entry index":  func(message *pb.Message) { message.GetEntries()[0].Index = uint64Ptr(math.MaxUint64) },
+		"local storage responses": func(message *pb.Message) {
+			message.Responses = []*pb.Message{{Type: pb.MsgApp.Enum()}}
+		},
+		"local storage vote": func(message *pb.Message) { message.Vote = uint64Ptr(0) },
+		"unexpected context": func(message *pb.Message) { message.Context = []byte("unexpected") },
+		"oversized heartbeat context": func(message *pb.Message) {
+			message.Type = pb.MsgHeartbeat.Enum()
+			message.Entries = nil
+			message.Context = make([]byte, MaxReadContextBytes+1)
+		},
+		"Entry term above message term": func(message *pb.Message) {
+			message.GetEntries()[0].Term = uint64Ptr(term + 1)
+		},
+		"decreasing Entry terms": func(message *pb.Message) {
+			message.Entries = append(message.GetEntries(), &pb.Entry{Term: uint64Ptr(term - 1), Index: uint64Ptr(index + 1)})
+		},
+		"unknown Entry type": func(message *pb.Message) {
+			unknownType := pb.EntryType(255)
+			message.GetEntries()[0].Type = &unknownType
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			message := base()
+			mutate(message)
+			if err := node.Step(message); err == nil {
+				t.Fatal("Step accepted Store-incompatible message")
+			}
+			if ready, err := node.HasReady(); err != nil || ready {
+				t.Fatalf("HasReady() after rejected message = %v, %v", ready, err)
+			}
+		})
+	}
+}
+
 func TestReadAndProposalAdmissionBounds(t *testing.T) {
-	node, _, _ := newTestNode(t, 1, []uint64{1})
-	driveCampaign(t, node)
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	driveCampaignWithPeer(t, node, 2)
 	if err := admitProposalBytes(MaxProposalBytes); err != nil {
 		t.Fatalf("exact-size proposal admission error = %v", err)
 	}
@@ -1352,6 +1522,79 @@ func driveCampaign(t *testing.T, node *Node) {
 	if status.RaftState != raft.StateLeader || status.Lead != status.ID {
 		t.Fatalf("campaign status = %+v, want local leader", status)
 	}
+}
+
+func driveCampaignWithPeer(t *testing.T, node *Node, peer uint64) {
+	t.Helper()
+	if err := node.Campaign(); err != nil {
+		t.Fatalf("Campaign() error = %v", err)
+	}
+	preVote := collectVoteRequest(t, node, peer, pb.MsgPreVote)
+	if err := node.Step(voteResponse(preVote, pb.MsgPreVoteResp)); err != nil {
+		t.Fatalf("Step(MsgPreVoteResp) error = %v", err)
+	}
+	vote := collectVoteRequest(t, node, peer, pb.MsgVote)
+	if err := node.Step(voteResponse(vote, pb.MsgVoteResp)); err != nil {
+		t.Fatalf("Step(MsgVoteResp) error = %v", err)
+	}
+	driveAllReady(t, node)
+	status := node.Status()
+	if status.RaftState != raft.StateLeader || status.Lead != status.ID {
+		t.Fatalf("campaign status = %+v, want local leader", status)
+	}
+}
+
+func collectVoteRequest(t *testing.T, node *Node, peer uint64, messageType pb.MessageType) *pb.Message {
+	t.Helper()
+	var request *pb.Message
+	driveOneReady(t, node, func(message *pb.Message) error {
+		if message.GetTo() == peer && message.GetType() == messageType {
+			request = proto.Clone(message).(*pb.Message)
+		}
+		return nil
+	})
+	if request == nil {
+		t.Fatalf("Ready contained no %s request to peer %d", messageType, peer)
+	}
+	return request
+}
+
+func voteResponse(request *pb.Message, messageType pb.MessageType) *pb.Message {
+	term := request.GetTerm()
+	return &pb.Message{
+		Type: messageType.Enum(), From: uint64Ptr(request.GetTo()), To: uint64Ptr(request.GetFrom()), Term: &term,
+	}
+}
+
+func driveOneReady(t *testing.T, node *Node, send func(*pb.Message) error) []ReadOutcome {
+	t.Helper()
+	if send == nil {
+		send = func(*pb.Message) error { return nil }
+	}
+	captured, err := node.CaptureReady()
+	if err != nil || !captured {
+		t.Fatalf("CaptureReady() = %v, %v", captured, err)
+	}
+	if err := node.PersistReady(); err != nil {
+		t.Fatalf("PersistReady() error = %v", err)
+	}
+	if err := node.DrainMessages(send); err != nil {
+		t.Fatalf("DrainMessages() error = %v", err)
+	}
+	if err := node.InstallSnapshot(); err != nil {
+		t.Fatalf("InstallSnapshot() error = %v", err)
+	}
+	if err := node.ApplyCommitted(); err != nil {
+		t.Fatalf("ApplyCommitted() error = %v", err)
+	}
+	outcomes, err := node.RecordReadStates()
+	if err != nil {
+		t.Fatalf("RecordReadStates() error = %v", err)
+	}
+	if err := node.AdvanceReady(); err != nil {
+		t.Fatalf("AdvanceReady() error = %v", err)
+	}
+	return outcomes
 }
 
 func driveAllReady(t *testing.T, node *Node) []ReadOutcome {

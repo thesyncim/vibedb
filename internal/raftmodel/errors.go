@@ -18,6 +18,9 @@ var (
 	ErrReadLeadershipLost = errors.New("raftmodel: ReadIndex leadership changed")
 	// ErrAdmissionBound identifies input refused by a fixed memory or wire bound.
 	ErrAdmissionBound = errors.New("raftmodel: bounded admission refused")
+	// ErrReadyPending identifies protocol input refused because RawNode already
+	// exposes Ready work that must be captured and advanced first.
+	ErrReadyPending = errors.New("raftmodel: Ready work pending capture")
 	// ErrConfChangePending identifies configuration admission while the core has
 	// outstanding Ready/log work whose predecessor is not yet fully applied.
 	ErrConfChangePending = errors.New("raftmodel: configuration change pending")

@@ -9,8 +9,9 @@ import (
 // retries of the same batch and is scoped to a Node incarnation.
 // NodeIncarnation is a durable, never-reused, strictly increasing boot counter
 // for one member store, not a random process token. A newly constructed Node
-// starts at ReadyID 1; StableStore rejects a regressed incarnation, a skipped
-// ReadyID, or reuse of one key with different batch bytes.
+// starts at ReadyID 1; StableStore rejects a regressed incarnation or skipped
+// ReadyID. Once bounded canonical admission succeeds or persistence may have
+// begun, reuse of that key with different batch bytes must also be rejected.
 //
 // The pointed-to values are owned by Node and are read-only. Persist must not
 // retain or mutate them. A nil return means that Snapshot, Entries, and
@@ -29,6 +30,8 @@ type PersistBatch struct {
 // retry-safe persistence boundary for Ready batches. Repeating a ReadyID after
 // an error must be safe, including when the earlier call reached storage before
 // returning the error. The idempotency key is (NodeIncarnation, ReadyID).
+// A store may avoid retaining malformed or unsupported input that failed before
+// canonical admission and before any storage mutation.
 // Production construction must allocate NodeIncarnation from the same durable
 // member store before the Node can accept protocol input; a caller-supplied
 // random value is not a stale-process fence.

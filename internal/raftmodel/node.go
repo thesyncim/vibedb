@@ -36,6 +36,11 @@ type Node struct {
 	pendingReads []ReadBarrier
 	readBytes    int
 	readSeq      uint64
+
+	readyFromInput    bool
+	pendingInputCalls int
+	pendingInputUnits int
+	pendingInputBytes int64
 }
 
 // ReadyProgress is an allocation-free observation of one captured Ready. It
@@ -271,6 +276,10 @@ func (n *Node) CaptureReady() (bool, error) {
 	n.messagePos = 0
 	n.entryPos = 0
 	n.readPos = 0
+	n.readyFromInput = false
+	n.pendingInputCalls = 0
+	n.pendingInputUnits = 0
+	n.pendingInputBytes = 0
 	n.phase = PhaseCaptured
 	return true, nil
 }
@@ -495,13 +504,23 @@ func (n *Node) AdvanceReady() error {
 	n.messagePos = 0
 	n.entryPos = 0
 	n.readPos = 0
+	n.readyFromInput = false
+	n.pendingInputCalls = 0
+	n.pendingInputUnits = 0
+	n.pendingInputBytes = 0
 	n.phase = PhaseIdle
 	return nil
 }
 
-// Step applies one received Raft message while no Ready is outstanding.
+// Step applies one received Raft message within the bounded uncaptured-Ready
+// input window.
 func (n *Node) Step(message *pb.Message) error {
-	if err := n.requirePhase("Step", PhaseIdle); err != nil {
+	units := 1
+	if message != nil && len(message.GetEntries()) > units {
+		units = len(message.GetEntries())
+	}
+	inputBytes := inboundReadyBytes(message)
+	if err := n.admitProtocolInput("Step", units, inputBytes); err != nil {
 		return err
 	}
 	if message == nil {
@@ -513,7 +532,11 @@ func (n *Node) Step(message *pb.Message) error {
 	// RawNode may retain entry, snapshot, or ReadIndex protobuf backing beyond
 	// Step. The transport owns its message and is free to recycle it as soon as
 	// this call returns, so the integration boundary must detach the full graph.
-	return n.raw.Step(proto.Clone(message).(*pb.Message))
+	err := n.raw.Step(proto.Clone(message).(*pb.Message))
+	if err == nil {
+		n.recordProtocolInput(units, inputBytes)
+	}
+	return err
 }
 
 func (n *Node) validateInboundMessage(message *pb.Message) error {
@@ -521,59 +544,99 @@ func (n *Node) validateInboundMessage(message *pb.Message) error {
 		message.GetFrom() == n.id || message.GetTo() != n.id {
 		return errors.New("raftmodel: invalid remote message identity")
 	}
+	if len(message.ProtoReflect().GetUnknown()) != 0 {
+		return errors.New("raftmodel: remote message has unknown protobuf fields")
+	}
 	switch message.GetType() {
 	case pb.MsgApp, pb.MsgAppResp, pb.MsgVote, pb.MsgVoteResp, pb.MsgSnap,
 		pb.MsgHeartbeat, pb.MsgHeartbeatResp, pb.MsgPreVote, pb.MsgPreVoteResp:
 	default:
 		return &UnsupportedError{Feature: "remote message type " + message.GetType().String()}
 	}
-	if len(message.GetEntries()) > MaxMessageEntries || proto.Size(message) > MaxInboundMessageBytes {
-		return fmt.Errorf("%w: inbound Raft message exceeds bound", ErrAdmissionBound)
+	if message.GetTerm() == 0 || message.GetTerm() == math.MaxUint64 || message.GetIndex() == math.MaxUint64 ||
+		message.GetLogTerm() == math.MaxUint64 || message.GetCommit() == math.MaxUint64 {
+		return errors.New("raftmodel: remote message has invalid Raft term or terminal index")
+	}
+	if len(message.GetResponses()) != 0 || message.Vote != nil {
+		return errors.New("raftmodel: remote message carries local-storage fields")
+	}
+	contextBytes := len(message.GetContext())
+	switch message.GetType() {
+	case pb.MsgHeartbeat, pb.MsgHeartbeatResp, pb.MsgVote, pb.MsgPreVote:
+		if contextBytes > MaxReadContextBytes {
+			return fmt.Errorf("%w: inbound Raft context bytes %d exceed %d", ErrAdmissionBound, contextBytes, MaxReadContextBytes)
+		}
+	default:
+		if contextBytes != 0 {
+			return errors.New("raftmodel: remote message has unexpected context")
+		}
+	}
+	if len(message.GetEntries()) != 0 && message.GetType() != pb.MsgApp {
+		return errors.New("raftmodel: remote non-append message carries entries")
 	}
 	if message.GetType() == pb.MsgSnap {
 		if err := validateSnapshotEnvelope(message.GetSnapshot()); err != nil {
 			return fmt.Errorf("raftmodel: invalid inbound snapshot: %w", err)
 		}
 	}
-	var previous uint64
-	for i, entry := range message.GetEntries() {
-		if entry == nil || entry.GetIndex() == 0 || entry.GetTerm() == 0 ||
+	if len(message.GetEntries()) > MaxMessageEntries || proto.Size(message) > MaxInboundMessageBytes {
+		return fmt.Errorf("%w: inbound Raft message exceeds bound", ErrAdmissionBound)
+	}
+	previous := message.GetIndex()
+	previousTerm := message.GetLogTerm()
+	for _, entry := range message.GetEntries() {
+		if entry == nil || entry.GetIndex() == 0 || entry.GetIndex() == math.MaxUint64 ||
+			entry.GetTerm() == 0 || entry.GetTerm() == math.MaxUint64 ||
+			len(entry.ProtoReflect().GetUnknown()) != 0 ||
+			entry.GetType() < pb.EntryNormal || entry.GetType() > pb.EntryConfChangeV2 ||
 			len(entry.GetData()) > MaxProposalBytes ||
-			(i != 0 && (previous == math.MaxUint64 || entry.GetIndex() != previous+1)) {
+			previous == math.MaxUint64 || entry.GetIndex() != previous+1 ||
+			entry.GetTerm() < previousTerm || entry.GetTerm() > message.GetTerm() {
 			return errors.New("raftmodel: malformed inbound Raft entries")
 		}
 		previous = entry.GetIndex()
+		previousTerm = entry.GetTerm()
 	}
 	return nil
 }
 
-// Tick advances the logical election clock while no Ready is outstanding.
+// Tick advances the logical election clock within the bounded uncaptured-Ready
+// input window.
 func (n *Node) Tick() error {
-	if err := n.requirePhase("Tick", PhaseIdle); err != nil {
+	if err := n.admitProtocolInput("Tick", 1, 0); err != nil {
 		return err
 	}
 	n.raw.Tick()
+	n.recordProtocolInput(1, 0)
 	return nil
 }
 
-// Campaign starts an election while no Ready is outstanding.
+// Campaign starts an election within the bounded uncaptured-Ready input window.
 func (n *Node) Campaign() error {
-	if err := n.requirePhase("Campaign", PhaseIdle); err != nil {
+	if err := n.admitProtocolInput("Campaign", 1, 0); err != nil {
 		return err
 	}
-	return n.raw.Campaign()
+	err := n.raw.Campaign()
+	if err == nil {
+		n.recordProtocolInput(1, 0)
+	}
+	return err
 }
 
 // Propose submits a normal entry. The payload is copied before the core can
 // retain it.
 func (n *Node) Propose(data []byte) error {
-	if err := n.requirePhase("Propose", PhaseIdle); err != nil {
+	if err := n.admitProtocolInput("Propose", 1, int64(len(data))); err != nil {
 		return err
 	}
 	if err := admitProposalBytes(len(data)); err != nil {
 		return err
 	}
-	return n.raw.Propose(append([]byte(nil), data...))
+	err := n.raw.Propose(append([]byte(nil), data...))
+	if err == nil {
+		n.recordProtocolInput(1, int64(len(data)))
+	}
+	return err
 }
 
 // ProposeConfChange submits one of the two supported Raft configuration entry
@@ -593,7 +656,7 @@ func (n *Node) ProposeConfChange(change pb.ConfChangeI) error {
 	// exactly caught up to the published predecessor, so nil always means that
 	// the proposal was admitted as a configuration entry.
 	if n.raw.HasReady() {
-		return ErrConfChangePending
+		return errors.Join(ErrReadyPending, ErrConfChangePending)
 	}
 	lastIndex, err := n.stable.LastIndex()
 	if err != nil {
@@ -612,7 +675,14 @@ func (n *Node) ProposeConfChange(change pb.ConfChangeI) error {
 	if err := admitProposalBytes(len(encoded)); err != nil {
 		return fmt.Errorf("raftmodel: configuration proposal: %w", err)
 	}
-	return n.raw.ProposeConfChange(change)
+	if err := n.admitProtocolInput("ProposeConfChange", 1, int64(len(encoded))); err != nil {
+		return err
+	}
+	err = n.raw.ProposeConfChange(change)
+	if err == nil {
+		n.recordProtocolInput(1, int64(len(encoded)))
+	}
+	return err
 }
 
 func admitProposalBytes(size int) error {
@@ -826,6 +896,9 @@ func validateSnapshotEnvelope(snapshot *pb.Snapshot) error {
 		return errors.New("snapshot or metadata is nil")
 	}
 	metadata := snapshot.GetMetadata()
+	if len(snapshot.ProtoReflect().GetUnknown()) != 0 || len(metadata.ProtoReflect().GetUnknown()) != 0 {
+		return errors.New("snapshot has unknown protobuf fields")
+	}
 	if metadata.GetIndex() == 0 || metadata.GetIndex() == math.MaxUint64 {
 		return fmt.Errorf("snapshot index %d is invalid", metadata.GetIndex())
 	}
@@ -844,6 +917,9 @@ func validateSnapshotEnvelope(snapshot *pb.Snapshot) error {
 func validateConfState(state *pb.ConfState, lastIndex uint64) error {
 	if state == nil {
 		return errors.New("ConfState is nil")
+	}
+	if len(state.ProtoReflect().GetUnknown()) != 0 {
+		return errors.New("ConfState has unknown protobuf fields")
 	}
 	if state.GetAutoLeave() {
 		return &UnsupportedError{Feature: "automatic joint consensus ConfState"}
@@ -886,6 +962,63 @@ func (n *Node) requirePhase(operation string, want Phase) error {
 		return &PhaseError{Operation: operation, Have: n.phase, Want: want}
 	}
 	return nil
+}
+
+func (n *Node) admitProtocolInput(operation string, units int, inputBytes int64) error {
+	if err := n.requirePhase(operation, PhaseIdle); err != nil {
+		return err
+	}
+	if units <= 0 || units > MaxPendingInputUnits {
+		return fmt.Errorf("%w: protocol input units %d exceed %d", ErrAdmissionBound, units, MaxPendingInputUnits)
+	}
+	if inputBytes < 0 || inputBytes > MaxPendingInputBytes {
+		return fmt.Errorf("%w: protocol input bytes %d exceed %d", ErrAdmissionBound, inputBytes, MaxPendingInputBytes)
+	}
+	if n.raw.HasReady() && (!n.readyFromInput || n.pendingInputCalls >= MaxPendingInputCalls ||
+		n.pendingInputUnits > MaxPendingInputUnits-units || n.pendingInputBytes > MaxPendingInputBytes-inputBytes) {
+		return errors.Join(ErrReadyPending, ErrAdmissionBound)
+	}
+	return nil
+}
+
+func (n *Node) recordProtocolInput(units int, inputBytes int64) {
+	if !n.raw.HasReady() {
+		n.readyFromInput = false
+		n.pendingInputCalls = 0
+		n.pendingInputUnits = 0
+		n.pendingInputBytes = 0
+		return
+	}
+	if n.readyFromInput {
+		n.pendingInputCalls++
+		n.pendingInputUnits += units
+		n.pendingInputBytes += inputBytes
+		return
+	}
+	n.readyFromInput = true
+	n.pendingInputCalls = 1
+	n.pendingInputUnits = units
+	n.pendingInputBytes = inputBytes
+}
+
+func inboundReadyBytes(message *pb.Message) int64 {
+	if message == nil {
+		return 0
+	}
+	entries := message.GetEntries()
+	snapshotBytes := len(message.GetSnapshot().GetData())
+	if len(entries) > MaxMessageEntries || snapshotBytes > MaxSnapshotBytes {
+		return MaxPendingInputBytes + 1
+	}
+	total := int64(snapshotBytes)
+	for _, entry := range entries {
+		size := int64(len(entry.GetData()))
+		if size > MaxProposalBytes || total > MaxPendingInputBytes-size {
+			return MaxPendingInputBytes + 1
+		}
+		total += size
+	}
+	return total
 }
 
 func (n *Node) fail(stage Phase, index uint64, err error) error {
