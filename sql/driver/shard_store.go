@@ -209,6 +209,8 @@ const (
 	shardStoreOpenExisting
 	shardStoreOpenReplicatedExisting
 	shardStoreOpenReplicatedSettlement
+	shardStoreOpenReplicatedApplyExisting
+	shardStoreOpenReplicatedApplySettlement
 )
 
 type shardStoreOpenPolicy struct {
@@ -217,6 +219,8 @@ type shardStoreOpenPolicy struct {
 	expectedReplicated          ReplicatedShardStoreIdentity
 	expectedReplicatedLogID     [16]byte
 	expectedReplicatedUserTable string
+	expectedReplicatedApply     ReplicatedApplyIdentity
+	expectedReplicatedOptions   ReplicatedApplyOptions
 	persistIdentity             func(*database) (bool, error)
 }
 

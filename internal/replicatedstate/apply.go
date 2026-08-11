@@ -340,7 +340,9 @@ func (m *Machine) planCommand(
 			return commandPlan{}, err
 		}
 		if plan.resultCode == ResultApplied {
-			plan.logicalDigest, err = logicalDigestV1(m.userName, userSnapshot, plan.changes)
+			plan.logicalDigest, err = logicalDigestV1(
+				m.userName, m.user.Validation, m.user.ValidationDigest, userSnapshot, plan.changes,
+			)
 			if err != nil {
 				return commandPlan{}, err
 			}
@@ -391,6 +393,25 @@ func (m *Machine) planMutations(
 		current, found, err := snapshot.AppendRaw(nil, mutation.key)
 		if err != nil {
 			return nil, 0, err
+		}
+		if m.user.Validation == ValidationDeterministicMutationV1 {
+			validation := MutationValidation(0)
+			if mutation.delete {
+				validation = m.user.Validator.ValidateDelete(mutation.key, current, found)
+			} else {
+				validation = m.user.Validator.ValidatePut(mutation.key, mutation.value)
+			}
+			switch validation {
+			case MutationValidationAccept:
+			case MutationValidationInvalid:
+				return nil, ResultInvalidDocument, nil
+			case MutationValidationTargetBound:
+				return nil, ResultTargetBound, nil
+			default:
+				return nil, 0, fmt.Errorf(
+					"%w: mutation validator returned %d", ErrInvalidCollection, validation,
+				)
+			}
 		}
 		if mutation.delete && !found || !mutation.delete && found && bytes.Equal(current, mutation.value) {
 			continue
@@ -509,6 +530,9 @@ func (m *Machine) persistTransition(
 		}
 		return nil
 	})
+	if len(changes) != 0 && m.user.ObserveMutationAttempt != nil {
+		m.user.ObserveMutationAttempt(AttemptedMutationKeys{changes: changes})
+	}
 	if err != nil {
 		return err
 	}

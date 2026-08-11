@@ -95,10 +95,65 @@ func (b Binding) validate() error {
 }
 
 // ValidationProfile is a construction-time assertion about the exact
-// collection validation contract. V1 accepts only schema-free JSON.
+// collection validation contract.
 type ValidationProfile uint8
 
-const ValidationSchemaFreeJSONV1 ValidationProfile = 1
+const (
+	// ValidationSchemaFreeJSONV1 is the legacy schema-free JSON profile. It
+	// requires a zero ValidationDigest and no MutationValidator.
+	ValidationSchemaFreeJSONV1 ValidationProfile = 1
+
+	// ValidationDeterministicMutationV1 adds a caller-supplied deterministic
+	// mutation contract to the schema-free JSON profile. It requires a nonzero
+	// ValidationDigest and a non-nil MutationValidator.
+	ValidationDeterministicMutationV1 ValidationProfile = 2
+)
+
+// MutationValidation is the closed result grammar returned by a
+// MutationValidator. Zero and unknown values fail closed.
+type MutationValidation uint8
+
+const (
+	MutationValidationAccept MutationValidation = iota + 1
+	MutationValidationInvalid
+	MutationValidationTargetBound
+)
+
+// MutationValidator supplies the deterministic application-specific portion
+// of ValidationDeterministicMutationV1. Implementations must be pure for a
+// fixed ValidationDigest and must not retain any input slices.
+//
+// ValidatePut is also used to validate every existing row during Open.
+// ValidateDelete receives the current snapshot value when found is true and a
+// nil current value otherwise. In particular, an absent delete remains
+// available for deterministic validation before no-op elimination.
+type MutationValidator interface {
+	ValidatePut(key, value []byte) MutationValidation
+	ValidateDelete(key, current []byte, found bool) MutationValidation
+}
+
+// AttemptedMutationKeys is an opaque view of the exact distinct user keys in
+// one planned durable transition. Key bytes are borrowed and remain valid only
+// for the synchronous observer call.
+type AttemptedMutationKeys struct {
+	changes []finalMutation
+}
+
+// Len reports the number of exact distinct changed keys.
+func (keys AttemptedMutationKeys) Len() int { return len(keys.changes) }
+
+// Key returns the key at index. It panics when index is out of range. The
+// returned bytes are borrowed and must be cloned before retention.
+func (keys AttemptedMutationKeys) Key(index int) []byte { return keys.changes[index].key }
+
+// MutationAttemptObserver is invoked synchronously before ApplyNormal returns
+// after UpdateCollections has been attempted with nonempty user changes. This
+// deliberately includes definite and outcome-unknown failures. A caller that
+// needs to publish conflict clocks only for actual or uncertain storage
+// publication must compare the collection Generation captured before Apply to
+// the value observed in this callback and also inspect PersistenceError.
+// Implementations must not retain key slices or reenter the Machine.
+type MutationAttemptObserver func(AttemptedMutationKeys)
 
 // CollectionLimits repeats the collection's frozen durable bounds at the
 // integration boundary. Open compares every value to the live handle, so a
@@ -113,9 +168,12 @@ type CollectionLimits struct {
 // CollectionTarget binds a durable handle to its deterministic validation and
 // admission profile.
 type CollectionTarget struct {
-	Collection *durable.Collection
-	Validation ValidationProfile
-	Limits     CollectionLimits
+	Collection             *durable.Collection
+	Validation             ValidationProfile
+	ValidationDigest       [32]byte
+	Validator              MutationValidator
+	ObserveMutationAttempt MutationAttemptObserver
+	Limits                 CollectionLimits
 }
 
 // UserCollection is the single logical collection owned by a v1 Machine.
@@ -125,10 +183,22 @@ type UserCollection struct {
 }
 
 func (t CollectionTarget) validate() error {
-	if t.Collection == nil || t.Validation != ValidationSchemaFreeJSONV1 ||
-		t.Collection.HasSchema() || t.Collection.HasIndexes() ||
+	if t.Collection == nil || t.Collection.HasSchema() || t.Collection.HasIndexes() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() {
 		return ErrSchemaProfile
+	}
+	zeroDigest := t.ValidationDigest == ([32]byte{})
+	switch t.Validation {
+	case ValidationSchemaFreeJSONV1:
+		if !zeroDigest || t.Validator != nil {
+			return fmt.Errorf("%w: legacy validation requires zero digest and no validator", ErrInvalidCollection)
+		}
+	case ValidationDeterministicMutationV1:
+		if zeroDigest || t.Validator == nil {
+			return fmt.Errorf("%w: deterministic validation requires digest and validator", ErrInvalidCollection)
+		}
+	default:
+		return fmt.Errorf("%w: unknown validation profile", ErrInvalidCollection)
 	}
 	l := t.Limits
 	if l.MaxKeyBytes <= 0 || l.MaxDocumentBytes <= 0 ||

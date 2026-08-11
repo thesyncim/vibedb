@@ -156,7 +156,9 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 			return nil, m.fail(errors.Join(err, cut.Close()))
 		}
 	}
-	logical, err := logicalDigestV1(m.userName, userSnapshot, nil)
+	logical, err := logicalDigestV1(
+		m.userName, m.user.Validation, m.user.ValidationDigest, userSnapshot, nil,
+	)
 	if err != nil {
 		return nil, m.fail(errors.Join(err, cut.Close()))
 	}

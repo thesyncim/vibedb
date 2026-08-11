@@ -8,7 +8,12 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-var logicalDigestDomain = []byte("vibedb/replicated-state/logical-image/v1\x00")
+var (
+	logicalDigestDomain          = []byte("vibedb/replicated-state/logical-image/v1\x00")
+	logicalDigestValidatedDomain = []byte(
+		"vibedb/replicated-state/logical-image/validated/v1\x00",
+	)
+)
 
 type finalMutation struct {
 	key    []byte
@@ -18,11 +23,21 @@ type finalMutation struct {
 
 func logicalDigestV1(
 	name string,
+	validation ValidationProfile,
+	validationDigest [32]byte,
 	snapshot *durable.Snapshot,
 	overlay []finalMutation,
 ) ([32]byte, error) {
 	h := sha256.New()
-	_, _ = h.Write(logicalDigestDomain)
+	if validation == ValidationSchemaFreeJSONV1 && validationDigest == ([32]byte{}) {
+		// This branch is byte-for-byte compatible with the original v1 logical
+		// digest. Existing schema-free roots retain their exact publication.
+		_, _ = h.Write(logicalDigestDomain)
+	} else {
+		_, _ = h.Write(logicalDigestValidatedDomain)
+		_, _ = h.Write([]byte{byte(validation)})
+		_, _ = h.Write(validationDigest[:])
+	}
 	writeHashFrame(h, []byte(name))
 
 	ordered := slices.Clone(overlay)

@@ -46,13 +46,31 @@ the intended user table. These are compared before namespace and transaction
 recovery; only then does it return the catalog-computed full identity. There is
 no binding-only settlement path.
 
+## Trusted apply activation
+
+The follow-on [SQL replicated apply v1](sql-replicated-apply-v1.md) keeps this
+write-once binding intact and adds a separate strict `replicated_apply` catalog
+member. That activation owns a hidden system collection and one opaque apply
+claim; it never exposes the collection, transaction log, or underlying state
+machine and never relaxes the direct SQL write fence. Its deterministic profile
+binds the user table, primary pointer, ordered-key grammar, and durable limits,
+and committed puts/deletes are checked against that primary-key contract inside
+ordered apply.
+
+An activated root can no longer use this document's base-only open or
+settlement path. Exact restart retains a second complete apply identity,
+including the random hidden storage identity. A dedicated activation settlement
+path accepts the base identity plus the intended bounded profile and returns
+that full identity; both exact and settlement comparisons happen before SQL
+namespace or transaction recovery.
+
 ## Deliberate non-goals
 
-This slice has no public or hidden replicated-apply capability and no hidden
-system collection. It fences the public SQL mutation surface; a future runtime
-must supply a narrowly trusted apply boundary rather than relaxing that fence.
-It also does not yet bind or enforce the relationship between a `CommandV1`
-mutation key and the JSON value selected by the SQL primary pointer. Until that
-contract exists, the binding must not be described as a complete serving or
-replicated-runtime boundary. Runtime snapshot transfer is likewise separate
-work built after this durable identity/fence foundation.
+Neither binding nor trusted activation is serving authorization. There is no
+client proposal/RPC path, leader or lease proof, authenticated peer transport,
+`ReadIndex`, replicated position token, runtime snapshot/compaction, or reserved
+completion capacity. The current command remains a blind unconditional
+single-collection write set; it cannot represent SQL predicates, read sets,
+range/phantom dependencies, arbitrary results, or cross-shard coordination.
+Consequently local read-only SQL remains available, but no replicated Read
+Committed or Serializable write claim follows from this checkpoint.

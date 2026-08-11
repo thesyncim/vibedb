@@ -8,7 +8,7 @@ durable user collection and publishes the matching completion and Raft applied
 state atomically through one hidden durable system collection.
 
 This is deliberately not a serving or high-availability milestone. It does not
-wire shard RPCs to Raft, permit replicated SQL writes, create runtime
+wire shard RPCs to Raft, permit client-facing replicated SQL writes, create runtime
 snapshots, compact the Raft WAL, reserve long-lived completion capacity, run a
 Multi-Raft scheduler, or authorize Read Committed or Serializable transactions
 across replicas. Its purpose is to make the local committed-entry boundary
@@ -27,10 +27,12 @@ One machine owns:
 The v1 admission profile supports exactly one user collection and inline
 fixed-format mutation completions only. Both system and user handles must use
 the synchronous durability lane and must have no exact indexes. User values are
-JSON documents. Schema, indexes, and primary-key policy belong to the future
-SQL adapter; this slice accepts only a schema-free collection and verifies that
-profile against the sealed durable handle at construction. The collection and
-binding cannot change while the machine is open.
+JSON documents. The legacy profile accepts a schema-free collection. The
+deterministic profile additionally binds a nonzero validation digest and pure
+mutation validator into every logical-image digest, scans every existing row at
+open, and validates collapsed final mutations before no-op elision. The landed
+SQL adapter uses that profile for its primary-pointer and ordered-key contract.
+The collection, profile, and binding cannot change while the machine is open.
 
 Construction also proves that the transaction log and both collections are
 live entries in the same physical directory. This proof performs no marker
@@ -67,13 +69,14 @@ advance them without rebuilding the machine. In particular, a future serving
 contract must represent election term/leader authority explicitly rather than
 silently treating this pinned `OwnershipEpoch` as a forever-static lease.
 
-The current SQL shard-store identity is intentionally insufficient here. Its
-random local `LogID` is neither the shared Raft `GroupID` nor a distributed
-serving lease. A later SQL binding must persist this full tuple and prove that
-its local `MemberID`, `StoreID`, and enrolled hosting `NodeID` match the Raft
-WAL before constructing a node. Those local coordinates fence one physical
-replica and do not belong in the portable logical snapshot, whose position is
-the shared `(ShardIncarnation, GroupID, AppliedSequence)` lineage.
+The SQL replicated binding now persists this full tuple beside the independent
+local SQL `LogID`; `LogID` remains neither the shared Raft `GroupID` nor a
+distributed serving lease. The `raftmember` adapter derives `MemberID` and
+`StoreID` from a live healthy WAL before opening trusted apply. Enrolled hosting
+`NodeID` and external lease/authority remain later serving gates. Those local
+coordinates fence one physical replica and do not belong in the portable
+logical snapshot, whose position is the shared
+`(ShardIncarnation, GroupID, AppliedSequence)` lineage.
 
 ## Hidden system collection
 
@@ -125,8 +128,10 @@ For a new valid client identity:
 1. Preserve mutation ordinal order and collapse repeated keys to their final
    Put/Delete effect. This is semantic last-write-wins, not key sorting or
    command normalization.
-2. Omit deletes of absent keys and puts whose exact value is already present.
-3. Validate every final key/value against the frozen collection profile.
+2. Check every final key/value against the frozen collection and JSON bounds,
+   read its current row, and invoke the deterministic mutation profile.
+3. Only after validation, omit deletes of absent keys and puts whose exact
+   value is already present.
 4. Compute the prospective logical digest from the canonical ordered
    key/value image plus the final overlay.
 5. Stage changed user keys, the exact completion, and the next state record in
@@ -151,6 +156,16 @@ advance as persisted no-ops with a bounded rejection completion. A corrupt
 command envelope, corrupt retained record, impossible state transition, or
 storage failure is terminal to the machine because replicas cannot safely
 choose different interpretations.
+
+For the SQL deterministic profile, a put must derive exactly its mutation key
+from the configured JSON primary pointer. Missing, null, non-scalar, malformed,
+or mismatched primary values become deterministic `ResultInvalidDocument`
+completions; an over-bound derived key becomes `ResultTargetBound`. A delete
+must contain exactly one complete ascending non-null canonical ordered-key
+component. When its row exists, deriving the primary key from that row must
+reproduce the same bytes. These checks occur inside planning after dedupe,
+conflict, stale-fence, and unknown-collection routing, so committed semantic
+refusals still advance and remain deduplicable.
 
 The fixed v1 completion represents only this low-level unconditional mutation
 batch. `CommandV1` carries no arbitrary SQL result, expected row revisions,
@@ -242,10 +257,10 @@ integration:
 
 Before serving, later phases must add all of:
 
-1. the landed [SQL replicated binding v1](sql-replicated-binding-v1.md) must be
-   connected to the trusted apply adapter; it already provides exact SQL
-   catalog/Raft-WAL identity binding and a persistent direct-write fence, but
-   deliberately grants no serving or apply authority;
+1. the landed [SQL replicated binding v1](sql-replicated-binding-v1.md) and
+   [SQL replicated apply v1](sql-replicated-apply-v1.md) provide the exact
+   SQL/WAL identity, persistent direct-write fence, hidden atomic participant,
+   and opaque local apply claim, but deliberately grant no serving authority;
 2. admission that reserves completion/system/data capacity for every committed
    in-flight entry, with a safe completion GC protocol;
 3. crash-atomic runtime snapshots and WAL generation compaction;

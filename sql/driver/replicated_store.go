@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -461,6 +462,9 @@ func replicatedIdentityForTable(
 func validateReplicatedCatalog(catalog catalogFile) error {
 	r := catalog.ReplicatedShardStore
 	if r == nil {
+		if catalog.ReplicatedApply != nil {
+			return fmt.Errorf("%w: replicated apply requires a replicated shard binding", ErrReplicatedApplyMismatch)
+		}
 		return nil
 	}
 	if err := validateReplicatedShardStoreIdentity(*r); err != nil {
@@ -500,6 +504,9 @@ func validateReplicatedCatalog(catalog catalogFile) error {
 	if limits != r.UserLimits {
 		return fmt.Errorf("%w: durable user table limits differ", ErrReplicatedShardStoreProfile)
 	}
+	if err := validateReplicatedApplyMeta(catalog.ReplicatedApply, r); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -516,9 +523,19 @@ func validateOpenedReplicatedCatalog(d *database) error {
 	if actual != r {
 		return ErrReplicatedShardStoreIdentityMismatch
 	}
-	if err := d.txnLog.ValidateCollections([]durable.NamedCollection{{
+	members := []durable.NamedCollection{{
 		Name: r.UserTable, Collection: t.collection,
-	}}); err != nil {
+	}}
+	if d.catalog.ReplicatedApply != nil {
+		if err := validateReplicatedApplyCollection(d.replicatedApplyCollection); err != nil {
+			return err
+		}
+		members = append(members, durable.NamedCollection{
+			Name:       replicatedstate.SystemCollectionNameV1,
+			Collection: d.replicatedApplyCollection,
+		})
+	}
+	if err := d.txnLog.ValidateCollections(members); err != nil {
 		return fmt.Errorf("%w: transaction-log membership: %v", ErrReplicatedShardStoreProfile, err)
 	}
 	return nil

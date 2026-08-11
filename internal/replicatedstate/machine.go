@@ -13,11 +13,16 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
 
-const systemCollectionName = "__vibedb_replicated_state_v1"
+// SystemCollectionNameV1 is the reserved durable collection name owned by a
+// v1 Machine. Catalogs and adapters must reject it as a user collection name.
+const SystemCollectionNameV1 = "__vibedb_replicated_state_v1"
+
+const systemCollectionName = SystemCollectionNameV1
 
 var (
 	stateKey              = []byte{0}
@@ -64,6 +69,11 @@ func Open(
 	}
 	if err := system.validate(); err != nil {
 		return nil, fmt.Errorf("system collection: %w", err)
+	}
+	if system.Validation != ValidationSchemaFreeJSONV1 ||
+		system.ValidationDigest != ([32]byte{}) || system.Validator != nil ||
+		system.ObserveMutationAttempt != nil {
+		return nil, fmt.Errorf("%w: system collection requires the legacy validation profile", ErrInvalidCollection)
 	}
 	if txnLog == nil {
 		return nil, fmt.Errorf("%w: nil transaction log", ErrInvalidOptions)
@@ -140,7 +150,12 @@ func Open(
 	if !ok || userSnapshot == nil {
 		return nil, fmt.Errorf("%w: missing user snapshot", ErrInconsistentSnapshot)
 	}
-	logical, err := logicalDigestV1(userName, userSnapshot, nil)
+	if err := validateExistingRows(userSnapshot, user); err != nil {
+		return nil, fmt.Errorf("user collection %q: %w", userName, err)
+	}
+	logical, err := logicalDigestV1(
+		userName, user.Validation, user.ValidationDigest, userSnapshot, nil,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +206,30 @@ func checkedTxnBytesV1(userBatchBytes, systemBatchBytes int) (int64, bool) {
 		return 0, false
 	}
 	return userBytes + systemBytes, true
+}
+
+func validateExistingRows(snapshot *durable.Snapshot, target CollectionTarget) error {
+	if target.Validation != ValidationDeterministicMutationV1 {
+		return nil
+	}
+	return snapshot.RangeRaw(func(key, value []byte) error {
+		if err := vibejson.Validate(value); err != nil {
+			return fmt.Errorf("%w: malformed JSON in existing row", ErrSchemaProfile)
+		}
+		switch validation := target.Validator.ValidatePut(key, value); validation {
+		case MutationValidationAccept:
+			return nil
+		case MutationValidationInvalid:
+			return fmt.Errorf("%w: mutation validator rejected an existing row", ErrSchemaProfile)
+		case MutationValidationTargetBound:
+			return fmt.Errorf("%w: existing row exceeds the mutation validator target", ErrSchemaProfile)
+		default:
+			return fmt.Errorf(
+				"%w: mutation validator returned %d for an existing row",
+				ErrInvalidCollection, validation,
+			)
+		}
+	})
 }
 
 func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
