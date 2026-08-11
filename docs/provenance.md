@@ -5,8 +5,18 @@ vibedb. Each implementation site carries a stable `Provenance: ID` comment that
 maps to one row below.
 
 The repository has no root project license. `LICENSE-ROARING` contains the
-Apache-2.0 text required for the Roaring-derived algorithm named here; it does
-not license the repository as a whole.
+Apache-2.0 text required for the Roaring-derived algorithm named here, and
+`LICENSE-ETCD-RAFT` carries the exact license distributed with the pinned Raft
+module. `LICENSE-PROTOBUF` and `PATENTS-PROTOBUF` carry the notices from the
+protobuf runtime used directly by the integration and transitively by the core.
+None of these files licenses the repository as a whole.
+
+## Dependency ledger
+
+| Dependency | Pin, license, and treatment |
+| --- | --- |
+| `go.etcd.io/raft/v3` | `v3.7.0`, tag commit `b867cf13f6bc0dae21204302df97bc2355c3af55`, module sum `h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=`, Apache-2.0 (`LICENSE-ETCD-RAFT`). It is used unmodified as consensus protocol machinery whose transitions are deterministic for fixed internal timeout state and exact input order; upstream privately samples election jitter from `crypto/rand`. Vibedb owns scheduling, storage, transport, identity and admission, apply/publication, snapshots, encryption, and the safety checks around configuration changes. The selection, exact settings, exclusions, and threat model are recorded in [`design/raft-core-selection.md`](design/raft-core-selection.md). |
+| `google.golang.org/protobuf` | Direct runtime dependency of the local integration and the selected Raft core's sole runtime module dependency at `v1.36.11`, module sum `h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=`, BSD-3-Clause (`LICENSE-PROTOBUF`) plus the distributed additional IP rights grant (`PATENTS-PROTOBUF`). It supplies the generated Raft wire types and protobuf runtime; no protobuf source is copied or modified locally. |
 
 ## Algorithm ledger
 

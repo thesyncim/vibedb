@@ -40,7 +40,8 @@ ends are overflow-checked before conversion.
 
 `internal/storeio/common_primary_leaf.go`,
 `internal/storeio/global_tablet_catalog.go`,
-`internal/storeio/page_cache_inplace.go`, `store/segment.go`,
+`internal/storeio/page_cache_inplace.go`, `internal/replication/types.go`,
+`store/segment.go`,
 `store/segment_stream.go`, `store/store_document_template_read.go`,
 `query/exec.go`, `query/window_kernel.go`, and
 `query/correlated_mark_runtime.go` use pointer identity or address ranges to
@@ -51,6 +52,11 @@ owner's regrown backing block. Address arithmetic is bounded by the validated
 owning slice, and returned views never outlive that owner. `window_kernel.go`
 and `correlated_mark_runtime.go` also perform `unsafe.Sizeof` budget accounting
 described under exact capacity accounting below.
+
+`internal/replication/types.go` compares exact source and destination address
+ranges before a zero-allocation envelope append. The checked path proves both
+lengths and the precise writable suffix first; overlap is rejected before any
+write, and no derived address is dereferenced or retained.
 
 `internal/storeio/read_epochs.go` converts the address of a live stack marker
 to an opaque non-zero reader token. The integer is never converted back or
@@ -130,11 +136,12 @@ go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
 ```
 
 <!-- unsafe-file-list:start -->
-The root module contains 54 non-test Go files that import `unsafe`:
+The root module contains 55 non-test Go files that import `unsafe`:
 
 ```text
 gateway/catalog.go
 gateway/index_metadata.go
+internal/replication/types.go
 internal/storeio/common_primary_leaf.go
 internal/storeio/common_primary_unified_scalar_capacity.go
 internal/storeio/global_tablet_catalog.go
@@ -189,4 +196,3 @@ store/store_mapped_persist.go
 store/store_owned_documents.go
 ```
 <!-- unsafe-file-list:end -->
-
