@@ -226,7 +226,7 @@ claiming a production replicated store:
   preallocated append-only `StableStore` and exact Ready retry boundary on
   Linux and macOS. It has a static bootstrap snapshot and no compaction,
   transport, serving path, or general anti-rollback witness; its full qualified
-  contract and quarantine limits are in [Raft WAL v1](raft-wal-v1.md).
+  contract and quarantine limits are in [Raft WAL](raft-wal.md).
 
 The simulator's `MemoryStore` is an indivisible logical durability oracle, not
 an implementation template. It cannot represent torn sectors, fsync lies,

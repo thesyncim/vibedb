@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/store"
 )
@@ -106,8 +105,8 @@ func TestCatalogSizePreflightCoversIndentedEncoding(t *testing.T) {
 	}
 }
 
-func TestCatalogSizePreflightAccountsForV2PlacementShardKey(t *testing.T) {
-	_, database, base := bindReplicatedApplyTestRoot(t, "catalog-v2-bound")
+func TestCatalogSizePreflightAccountsForPlacementShardKey(t *testing.T) {
+	_, database, base := bindReplicatedApplyTestRoot(t, "catalog-placement-bound")
 	claim, _, err := database.OpenReplicatedApply(
 		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 	)
@@ -126,40 +125,34 @@ func TestCatalogSizePreflightAccountsForV2PlacementShardKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var v2 catalogFile
-	if err := json.Unmarshal(raw, &v2); err != nil {
+	var catalog catalogFile
+	if err := json.Unmarshal(raw, &catalog); err != nil {
 		t.Fatal(err)
+	}
+	baseBound, err := catalogSizeUpperBound(catalog)
+	if err != nil {
+		t.Fatalf("base catalog bound: %v", err)
 	}
 	primary := "/" + strings.Repeat("x", 4096)
-	v2.ReplicatedShardStore.UserPrimaryKey = primary
-	v2.Tables[v2.ReplicatedShardStore.UserTable].PrimaryKey = primary
-	v2.ReplicatedApply.Placement.ShardKey = primary
-	v2.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigestV2(
-		*v2.ReplicatedShardStore, v2.ReplicatedApply.Placement,
+	catalog.ReplicatedShardStore.UserPrimaryKey = primary
+	catalog.Tables[catalog.ReplicatedShardStore.UserTable].PrimaryKey = primary
+	catalog.ReplicatedApply.Placement.ShardKey = primary
+	catalog.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(
+		*catalog.ReplicatedShardStore, catalog.ReplicatedApply.Placement,
 	)
-	v2Bound, err := catalogSizeUpperBound(v2)
+	bound, err := catalogSizeUpperBound(catalog)
 	if err != nil {
-		t.Fatalf("v2 catalog bound: %v", err)
+		t.Fatalf("catalog bound: %v", err)
 	}
-
-	v2Raw, err := json.Marshal(v2)
+	encoded, err := json.Marshal(catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var v1 catalogFile
-	if err := json.Unmarshal(v2Raw, &v1); err != nil {
-		t.Fatal(err)
+	if len(encoded) > bound {
+		t.Fatalf("catalog encoding = %d bytes, bound %d", len(encoded), bound)
 	}
-	v1.ReplicatedApply.Format = ReplicatedApplyFormatV1
-	v1.ReplicatedApply.ValidationProfile = uint8(replicatedstate.ValidationDeterministicMutationV1)
-	v1.ReplicatedApply.Placement = ReplicatedPlacementProfile{}
-	v1.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(*v1.ReplicatedShardStore)
-	v1Bound, err := catalogSizeUpperBound(v1)
-	if err != nil {
-		t.Fatalf("v1 catalog bound: %v", err)
-	}
-	if delta, want := v2Bound-v1Bound, encodedJSONStringBytes(primary); delta != want {
-		t.Fatalf("v2 placement bound delta = %d, want exact encoded shard-key bytes %d", delta, want)
+	if delta, want := bound-baseBound, 3*(encodedJSONStringBytes(primary)-encodedJSONStringBytes("/id")); delta != want {
+		t.Fatalf("placement catalog bound delta = %d, want %d", delta, want)
 	}
 }
 

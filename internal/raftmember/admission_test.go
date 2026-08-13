@@ -17,12 +17,12 @@ import (
 
 func TestStaticNoGCCompletionCapacityBoundary(t *testing.T) {
 	base := raftstore.CapacityProfile{
-		Format:       raftstore.CapacityFormatStaticV1,
+		Format:       raftstore.CapacityFormatStatic,
 		LogBaseIndex: 1,
 		MaxEntries:   8192,
 	}
 	baseApply := sqldriver.ReplicatedApplyCapacityProfile{
-		ApplyFormat:    sqldriver.ReplicatedApplyFormatV2,
+		ApplyFormat:    sqldriver.ReplicatedApplyFormat,
 		MaxCompletions: 8192, Initialized: true, Applied: 1,
 	}
 	tests := []struct {
@@ -40,37 +40,32 @@ func TestStaticNoGCCompletionCapacityBoundary(t *testing.T) {
 			return result
 		}(), commit: 4, last: 5},
 		{name: "maximum arithmetic", profile: raftstore.CapacityProfile{
-			Format:       raftstore.CapacityFormatStaticV1,
+			Format:       raftstore.CapacityFormatStatic,
 			LogBaseIndex: 1,
 			MaxEntries:   math.MaxUint64,
 		}, apply: sqldriver.ReplicatedApplyCapacityProfile{
-			ApplyFormat: sqldriver.ReplicatedApplyFormatV2, MaxCompletions: math.MaxUint64,
+			ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: math.MaxUint64,
 			Initialized: true, Applied: math.MaxUint64 - 1, CompletionCount: math.MaxUint64 - 2,
 		}, commit: math.MaxUint64, last: math.MaxUint64},
 		{name: "maximum invalid count", profile: raftstore.CapacityProfile{
-			Format:       raftstore.CapacityFormatStaticV1,
+			Format:       raftstore.CapacityFormatStatic,
 			LogBaseIndex: 1,
 			MaxEntries:   math.MaxUint64,
 		}, apply: sqldriver.ReplicatedApplyCapacityProfile{
-			ApplyFormat: sqldriver.ReplicatedApplyFormatV2, MaxCompletions: math.MaxUint64,
+			ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: math.MaxUint64,
 			Initialized: true, Applied: math.MaxUint64, CompletionCount: math.MaxUint64,
 		}, commit: math.MaxUint64, last: math.MaxUint64, wantError: true},
 		{name: "maximum sealed suffix exceeded", profile: raftstore.CapacityProfile{
-			Format:       raftstore.CapacityFormatStaticV1,
+			Format:       raftstore.CapacityFormatStatic,
 			LogBaseIndex: 1,
 			MaxEntries:   math.MaxUint64 - 2,
 		}, apply: sqldriver.ReplicatedApplyCapacityProfile{
-			ApplyFormat: sqldriver.ReplicatedApplyFormatV2, MaxCompletions: math.MaxUint64,
+			ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: math.MaxUint64,
 			Initialized: true, Applied: math.MaxUint64 - 2,
 		}, commit: math.MaxUint64 - 1, last: math.MaxUint64, wantError: true},
-		{name: "apply format v1", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.ApplyFormat = sqldriver.ReplicatedApplyFormatV1
-			return result
-		}(), commit: 1, last: 1},
 		{name: "unknown apply format", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
-			result.ApplyFormat = 3
+			result.ApplyFormat = 2
 			return result
 		}(), commit: 1, last: 1, wantError: true},
 		{name: "one short", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
@@ -79,7 +74,7 @@ func TestStaticNoGCCompletionCapacityBoundary(t *testing.T) {
 			return result
 		}(), commit: 1, last: 1, wantError: true},
 		{name: "zero WAL entries", profile: raftstore.CapacityProfile{
-			Format: raftstore.CapacityFormatStaticV1, LogBaseIndex: 1,
+			Format: raftstore.CapacityFormatStatic, LogBaseIndex: 1,
 		}, apply: baseApply, commit: 1, last: 1, wantError: true},
 		{name: "zero completions", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
@@ -87,7 +82,7 @@ func TestStaticNoGCCompletionCapacityBoundary(t *testing.T) {
 			return result
 		}(), commit: 1, last: 1, wantError: true},
 		{name: "advanced base", profile: raftstore.CapacityProfile{
-			Format: raftstore.CapacityFormatStaticV1, LogBaseIndex: 2, MaxEntries: 8192,
+			Format: raftstore.CapacityFormatStatic, LogBaseIndex: 2, MaxEntries: 8192,
 		}, apply: baseApply, commit: 1, last: 1, wantError: true},
 		{name: "unknown capacity format", profile: raftstore.CapacityProfile{
 			Format: raftstore.CapacityFormat(2), LogBaseIndex: 1, MaxEntries: 8192,

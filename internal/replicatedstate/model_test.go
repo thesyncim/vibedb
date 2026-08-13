@@ -81,7 +81,9 @@ func TestRandomizedMutationHistoryMatchesReferenceMapAndDigest(t *testing.T) {
 
 func referenceLogicalDigest(name string, rows map[string][]byte) [32]byte {
 	h := sha256.New()
-	_, _ = h.Write([]byte("vibedb/replicated-state/logical-image/v1\x00"))
+	_, _ = h.Write([]byte("vibedb/replicated-state/logical-image\x00"))
+	_, _ = h.Write([]byte{byte(ValidationDeterministicMutation)})
+	_, _ = h.Write(defaultUserValidationDigest[:])
 	writeFrame := func(value []byte) {
 		var length [8]byte
 		binary.LittleEndian.PutUint64(length[:], uint64(len(value)))

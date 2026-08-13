@@ -11,11 +11,11 @@ import (
 
 func corruptRetainedCompletion(t testing.TB, fixture machineFixture, command []byte) {
 	t.Helper()
-	view, err := replication.OpenCommandV1(command)
+	view, err := replication.OpenCommand(command)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := CompletionKeyV1(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
+	digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
 	key := completionStorageKey(digest)
 	document, found, err := fixture.system.Collection.AppendRaw(nil, key[:])
 	if err != nil || !found {

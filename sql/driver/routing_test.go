@@ -350,10 +350,10 @@ func twoShardFixture(t *testing.T) (binding *placementBinding, router *distribut
 }
 
 func TestInsertPreflight(t *testing.T) {
-	binding, router, same, diff := twoShardFixture(t)
+	binding, _, same, diff := twoShardFixture(t)
 
 	t.Run("single row", func(t *testing.T) {
-		route, err := insertPreflight(binding, router, [][]byte{doc(t, same[0])})
+		route, err := insertPreflight(binding, [][]byte{doc(t, same[0])})
 		if err != nil {
 			t.Fatalf("insertPreflight: %v", err)
 		}
@@ -363,7 +363,7 @@ func TestInsertPreflight(t *testing.T) {
 	})
 
 	t.Run("same-shard multi row accepted", func(t *testing.T) {
-		route, err := insertPreflight(binding, router, [][]byte{doc(t, same[0]), doc(t, same[1])})
+		route, err := insertPreflight(binding, [][]byte{doc(t, same[0]), doc(t, same[1])})
 		if err != nil {
 			t.Fatalf("insertPreflight: %v", err)
 		}
@@ -373,28 +373,28 @@ func TestInsertPreflight(t *testing.T) {
 	})
 
 	t.Run("cross-shard multi row rejected", func(t *testing.T) {
-		_, err := insertPreflight(binding, router, [][]byte{doc(t, diff[0]), doc(t, diff[1])})
+		_, err := insertPreflight(binding, [][]byte{doc(t, diff[0]), doc(t, diff[1])})
 		if !errors.Is(err, ErrCrossShardWrite) {
 			t.Fatalf("err = %v, want ErrCrossShardWrite", err)
 		}
 	})
 
 	t.Run("missing shard-key column", func(t *testing.T) {
-		_, err := insertPreflight(binding, router, [][]byte{[]byte(`{"other":1}`)})
+		_, err := insertPreflight(binding, [][]byte{[]byte(`{"other":1}`)})
 		if err == nil {
 			t.Fatalf("expected an error for a missing shard-key column")
 		}
 	})
 
 	t.Run("null shard-key column", func(t *testing.T) {
-		_, err := insertPreflight(binding, router, [][]byte{[]byte(`{"tenant_id":null}`)})
+		_, err := insertPreflight(binding, [][]byte{[]byte(`{"tenant_id":null}`)})
 		if err == nil {
 			t.Fatalf("expected an error for a null shard-key column")
 		}
 	})
 
 	t.Run("bool shard-key value", func(t *testing.T) {
-		_, err := insertPreflight(binding, router, [][]byte{[]byte(`{"tenant_id":true}`)})
+		_, err := insertPreflight(binding, [][]byte{[]byte(`{"tenant_id":true}`)})
 		if err == nil {
 			t.Fatalf("expected an error for a non-scalar shard-key value")
 		}
@@ -444,7 +444,7 @@ func TestSingleShardRoute(t *testing.T) {
 func TestCheckShardKeyImmutable(t *testing.T) {
 	binding, router, _, diff := twoShardFixture(t)
 
-	target, err := insertPreflight(binding, router, [][]byte{doc(t, diff[0])})
+	target, err := insertPreflight(binding, [][]byte{doc(t, diff[0])})
 	if err != nil {
 		t.Fatalf("insertPreflight: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestInsertAndPredicateRouteConsistently(t *testing.T) {
 	router := distribution.NewRouter()
 
 	for _, v := range []string{"acme", "globex", "initech"} {
-		insertRoute, err := insertPreflight(binding, router, [][]byte{doc(t, v)})
+		insertRoute, err := insertPreflight(binding, [][]byte{doc(t, v)})
 		if err != nil {
 			t.Fatalf("insertPreflight(%q): %v", v, err)
 		}

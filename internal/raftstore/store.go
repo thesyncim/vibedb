@@ -491,7 +491,7 @@ func (store *Store) CapacityProfile() (CapacityProfile, error) {
 		return CapacityProfile{}, err
 	}
 	return CapacityProfile{
-		Format:       CapacityFormatStaticV1,
+		Format:       CapacityFormatStatic,
 		LogBaseIndex: store.header.snapshot.GetMetadata().GetIndex(),
 		MaxEntries:   store.options.maxEntries,
 	}, nil
@@ -823,7 +823,7 @@ func (store *Store) FirstIndex() (uint64, error) {
 	return store.image.first, nil
 }
 
-// Snapshot implements raft.Storage. Format v1 always returns the detached
+// Snapshot implements raft.Storage. The current format always returns the detached
 // static bootstrap snapshot.
 func (store *Store) Snapshot() (*pb.Snapshot, error) {
 	store.mu.RLock()
@@ -867,7 +867,7 @@ func (store *Store) TopologyRecoveryEpoch() uint64 {
 }
 
 // RecoveredTornCurrentSlot reports that Open selected one authenticated slot
-// while the other was checksum-invalid or unexpectedly all zero. V1 cannot
+// while the other was checksum-invalid or unexpectedly all zero. This format cannot
 // distinguish a local in-flight tear from post-ack media damage; callers must
 // emit high-severity telemetry and quarantine the member before serving or
 // topology rejoin.

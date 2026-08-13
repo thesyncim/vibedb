@@ -127,7 +127,7 @@ func TestUnsupportedScalarRejection(t *testing.T) {
 
 	prefix := []byte("existing-prefix")
 	dst := append([]byte(nil), prefix...)
-	got, err := V1.AppendScalar(dst, zero)
+	got, err := CurrentTupleCodec.AppendScalar(dst, zero)
 	if err == nil {
 		t.Fatal("AppendScalar(zero Scalar) succeeded, want *UnsupportedScalarError")
 	}
@@ -142,8 +142,8 @@ func TestUnsupportedScalarRejection(t *testing.T) {
 		t.Fatalf("AppendScalar(zero Scalar) modified dst: got %x, want unchanged %x", got, dst)
 	}
 
-	if V1.Version() != TupleVersion1 {
-		t.Fatalf("V1.Version() = %d, want %d", V1.Version(), TupleVersion1)
+	if CurrentTupleCodec.Version() != CurrentTupleVersion {
+		t.Fatalf("CurrentTupleCodec.Version() = %d, want %d", CurrentTupleCodec.Version(), CurrentTupleVersion)
 	}
 }
 
@@ -156,12 +156,12 @@ func TestUnsupportedScalarInTupleStopsAtFirstFailure(t *testing.T) {
 	var bad Scalar // zero value: KindInvalid
 	ok2 := NewString("after")
 
-	wantPrefix, err := V1.AppendScalar(nil, ok1)
+	wantPrefix, err := CurrentTupleCodec.AppendScalar(nil, ok1)
 	if err != nil {
 		t.Fatalf("AppendScalar(ok1): %v", err)
 	}
 
-	got, err := V1.AppendTuple(nil, []Scalar{ok1, bad, ok2})
+	got, err := CurrentTupleCodec.AppendTuple(nil, []Scalar{ok1, bad, ok2})
 	if err == nil {
 		t.Fatal("AppendTuple with an unsupported element succeeded, want error")
 	}
@@ -187,7 +187,7 @@ func TestNewStringAcceptsAnyBytes(t *testing.T) {
 		if !ok || got != raw {
 			t.Fatalf("NewString(%q).StringValue() = %q, %v", raw, got, ok)
 		}
-		if _, err := V1.AppendScalar(nil, s); err != nil {
+		if _, err := CurrentTupleCodec.AppendScalar(nil, s); err != nil {
 			t.Fatalf("AppendScalar(String(%q)): %v", raw, err)
 		}
 	}

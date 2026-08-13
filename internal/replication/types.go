@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	// CommandFormatV1 and CompletionFormatV1 are frozen byte grammars. Unknown
-	// versions are rejected; a decoder never guesses a compatible layout.
-	CommandFormatV1    = uint16(1)
-	CompletionFormatV1 = uint16(1)
+	// The wire header retains one private format sentinel so corrupt or foreign
+	// envelopes fail closed. There is exactly one supported grammar.
+	commandCodecFormat    = uint16(1)
+	completionCodecFormat = uint16(1)
 
 	// MaxCommandBytes is the intentionally narrower replicated-admission limit
 	// for one complete command, including its header and checksum. Admission must
@@ -62,7 +62,7 @@ const (
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed
-// only for AppendCommandV1. Its ordinal is part of the command's identity:
+// only for AppendCommand. Its ordinal is part of the command's identity:
 // order and duplicate keys are preserved exactly and are never normalized.
 type Mutation struct {
 	Kind  MutationKind
@@ -97,8 +97,8 @@ func semantic(reason string) error {
 	return fmt.Errorf("%w: %s", ErrEnvelopeSemantic, reason)
 }
 
-func unsupported(kind string, version uint16) error {
-	return fmt.Errorf("%w: %s version %d", ErrUnsupportedFormat, kind, version)
+func unsupported(kind string, format uint16) error {
+	return fmt.Errorf("%w: %s format %d", ErrUnsupportedFormat, kind, format)
 }
 
 func nonzero128(id ID128) bool    { return id != (ID128{}) }

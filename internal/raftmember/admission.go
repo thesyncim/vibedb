@@ -79,16 +79,15 @@ func validateStaticNoGCCompletionCapacity(
 	commit uint64,
 	last uint64,
 ) error {
-	if profile.Format != raftstore.CapacityFormatStaticV1 || profile.LogBaseIndex != 1 {
+	if profile.Format != raftstore.CapacityFormatStatic || profile.LogBaseIndex != 1 {
 		return fmt.Errorf(
-			"%w: require static-v1 snapshot base 1, got format=%d base=%d",
+			"%w: require static snapshot base 1, got format=%d base=%d",
 			ErrStaticCompletionCapacity,
 			profile.Format,
 			profile.LogBaseIndex,
 		)
 	}
-	if apply.ApplyFormat != sqldriver.ReplicatedApplyFormatV1 &&
-		apply.ApplyFormat != sqldriver.ReplicatedApplyFormatV2 {
+	if apply.ApplyFormat != sqldriver.ReplicatedApplyFormat {
 		return fmt.Errorf(
 			"%w: unsupported apply completion format %d",
 			ErrStaticCompletionCapacity, apply.ApplyFormat,

@@ -1,4 +1,4 @@
-# SQL replicated apply v1
+# SQL replicated apply
 
 Status: Phase 1b trusted, unserved local apply boundary.
 
@@ -21,9 +21,9 @@ writes.
 The strict optional `replicated_apply` catalog member is present only beside an
 exact `replicated_shard_store` binding. It freezes:
 
-- its own format version and random hidden storage identity;
+- its own strict current encoding and random hidden storage identity;
 - the deterministic validation profile and SHA-256 profile digest;
-- for apply format v2, the exact one-column placement profile, native tuple and
+- the required exact one-column placement profile, native tuple and
   mapper versions, and half-open target key range;
 - the exact hidden collection key, document, batch-document, and batch-byte
   limits;
@@ -47,7 +47,7 @@ retirement owner; no failure path drops a live writer or unlinks its inode.
 
 ## Exact open and settlement
 
-The base SQL identity deliberately remains format v1. An activated root refuses
+The base SQL identity remains a separate fence. An activated root refuses
 base-only replicated open. Ordinary restart supplies both the retained base
 identity and the complete retained apply identity; both are compared before
 namespace or transaction recovery.
@@ -65,31 +65,30 @@ therefore still require an external witness or lease.
 
 ## Deterministic SQL mutation profile
 
-The legacy format-v1 profile digest is byte-for-byte frozen and binds the
-profile version, logical user-table name, canonical primary JSON pointer,
-ordered-key grammar version, and all four user mutation limits. A zero
-placement option selects this legacy format and its result-format-v1 grammar.
-
-Apply format v2 adds a strict `ReplicatedPlacementProfileV1`. The profile
-admits exactly one shard-key pointer, requires it to equal the table's sole
-primary pointer, freezes tuple version 1 and `NativeMapperVersion`, and stores
-one exact half-open `KeyRange`. Its separately domain-separated validation
-digest also binds `Distribution`, `Shard`, `AllocationGeneration`,
-`RoutingVersion`, `RouteGeneration`, and every placement field. It excludes
+The single deterministic profile digest binds its current format identifier,
+logical user-table name, canonical primary JSON pointer, ordered-key grammar,
+all four user mutation limits, and a required strict placement profile. The
+placement profile admits exactly one shard-key pointer, requires it to equal
+the table's sole primary pointer, requires `CurrentTupleVersion` and
+`NativeMapperVersion`, and stores one exact half-open `KeyRange`. Its
+domain-separated validation digest also binds `Distribution`, `Shard`,
+`AllocationGeneration`, `RoutingVersion`, `RouteGeneration`, and every
+placement field. It excludes
 local filenames, SQL `LogID`, WAL `StoreID`, member identity, and other
 member-local coordinates so the logical digest remains portable.
 `SchemaGeneration` is currently the external assertion that every replica was
-provisioned with the same profile; `CommandV1` does not carry the digest, so
+provisioned with the same profile; `Command` does not carry the digest, so
 this slice makes no cryptographic peer-attestation claim.
 
-Planning first performs completion dedupe/conflict and stale/unknown-collection
-classification. It then collapses repeated keys to their final ordinal effect, checks
-ordinary collection/JSON bounds, reads the current row, invokes the SQL
-validator, and only then elides no-ops. Open runs the same JSON and put
-validation over every existing user row before accepting its logical digest.
+Planning first performs completion dedupe/conflict and
+stale/unknown-collection classification. It then collapses repeated keys to
+their final ordinal effect, checks ordinary collection/JSON bounds, reads the
+current row, invokes the SQL validator, and only then elides no-ops. Open runs
+the same JSON and put validation over every existing user row before accepting
+its logical digest.
 
 A put is valid only when the configured primary pointer resolves to a non-null
-Bool, Number, or String whose canonical ascending ordered-key encoding exactly
+Number or String whose canonical ascending ordered-key encoding exactly
 equals the mutation key. A delete key must decode as exactly one complete
 ascending non-null scalar component. An absent canonical delete is a valid
 no-op. For a present delete, deriving the primary key from the current document
@@ -97,16 +96,14 @@ must reproduce the same bytes. Primary mismatch or invalid shape produces a
 durable `ResultInvalidDocument`; an over-bound derived key produces
 `ResultTargetBound`. Neither semantic refusal wedges ordered apply.
 
-Under apply format v2, placement narrows the admitted primary scalar to the
-native mapper's closed String/Number set. After primary/document agreement, a
-put maps that scalar and must fall inside the exact target range. A present
-delete routes the current document; an absent delete decodes and routes its
-sole ordered-key scalar. The range start is inclusive and its concrete end is
-exclusive. An otherwise valid mutation outside the range produces durable
-`ResultWrongShard` under result format 2. Format 1 retains only its original
-codes 1 through 5; format 2 uses those codes plus wrong-shard code 6, and
-retained completions are checked against the machine's exact profile on open,
-lookup, and dedupe.
+After primary/document agreement, a put maps that scalar and must fall inside
+the exact target range. A present delete routes the current document; an absent
+delete decodes and routes its sole ordered-key scalar. The range start is
+inclusive and its concrete end is exclusive. An otherwise valid mutation
+outside the range produces durable `ResultWrongShard`. The one current result
+grammar uses codes 1 through 6, including wrong-shard code 6, and retained
+completions are checked against the machine's exact profile on open, lookup,
+and dedupe.
 
 Open and coherent snapshot digesting re-run placement validation over every
 extant row. A copied, corrupt, or out-of-band row that belongs to another shard
@@ -129,7 +126,7 @@ Closing the claim releases only its singleton capability and connector
 reference. It never unbinds the root or removes the hidden participant.
 
 This profile proves document/primary agreement and deterministic placement for
-the current `CommandV1` shape only: one primary key that is also the one shard
+the current `Command` shape only: one primary key that is also the one shard
 key, one native mapper, and one exact target range. Composite primary or shard
 keys, placement migration, and an end-to-end proof that a serving router chose
 the same fenced range remain future command/routing contracts.
@@ -144,7 +141,8 @@ Before a client request can use this boundary, the runtime still needs:
 
 1. an exact healthy, initialized apply claim and static no-compaction WAL now
    have a count-only qualification when their full binding matches,
-   `C <= A-1`, `A <= commit <= L`, capacity format is exactly static v1, and
+   `C <= A-1`, `A <= commit <= L`, the capacity format is exactly the current
+   static no-compaction profile, and
    sealed `MaxEntries <= MaxCompletions`. It remains finite, instantaneous, and
    non-serving; every committed in-flight user/state/completion byte still
    needs physical reservation, completion GC needs durable forgotten floors,

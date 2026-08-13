@@ -1,9 +1,9 @@
-# Replicated state machine v1
+# Replicated state machine
 
 Status: Phase 1b unserved apply contract.
 
 This design defines the first production-refinable implementation of
-`raftmodel.StateMachine`. It applies one frozen `replication.CommandV1` to one
+`raftmodel.StateMachine`. It applies one bounded `replication.Command` to one
 durable user collection and publishes the matching completion and Raft applied
 state atomically through one hidden durable system collection.
 
@@ -28,17 +28,14 @@ One machine owns:
 - the catalog-scoped `durable.TxnLog` shared by those collections; and
 - explicit nonzero cross-collection transaction limits.
 
-The v1 admission profile supports exactly one user collection and inline
-fixed-format mutation completions only. Both system and user handles must use
-the synchronous durability lane and must have no exact indexes. User values are
-JSON documents. The legacy profile accepts a schema-free collection. The
-deterministic profile additionally binds a nonzero validation digest and pure
-mutation validator into every logical-image digest, scans every existing row at
-open, and validates collapsed final mutations before no-op elision. The landed
-SQL adapter uses deterministic profile v1 for its legacy primary-pointer and
-ordered-key contract and profile v2 for the exact one-shard-key placement
-contract. V2 also validates every extant row while computing a coherent
-snapshot digest.
+The admission profile supports exactly one user collection and inline bounded
+mutation completions only. Both system and user handles must use the synchronous
+durability lane and must have no exact indexes. User values are JSON documents.
+The single deterministic profile binds a nonzero validation digest and pure
+mutation validator into every logical-image digest, requires the exact
+one-shard-key placement contract, scans and routes every existing row at open,
+and validates collapsed final mutations before no-op elision and while
+computing a coherent snapshot digest.
 The collection, profile, and binding cannot change while the machine is open.
 
 Construction also proves that the transaction log and both collections are
@@ -58,7 +55,7 @@ AllocationGeneration and ShardIncarnation
 GroupID
 ```
 
-V1 also pins one accepted mutable authority profile at construction:
+The machine also pins one accepted mutable authority profile at construction:
 
 ```text
 ActivePolicyGeneration and ProtectionEpoch
@@ -88,7 +85,7 @@ logical snapshot, whose position is the shared
 ## Hidden system collection
 
 The system collection contains one fixed state key and one completion record
-per retained client command. Its values are strict versioned binary records
+per retained client command. Its values use one strict binary record encoding
 wrapped in one canonical JSON string because durable collections accept JSON
 documents.
 
@@ -103,16 +100,16 @@ The state record binds at least:
 - the exact static-bootstrap snapshot identity; and
 - the retained completion count.
 
-Unknown versions, duplicate or noncanonical fields, invalid checksums, an
-inconsistent binding, an impossible index transition, or a state record that
-does not match the user collection fail closed.
+An unsupported format identifier, duplicate or noncanonical fields, invalid
+checksums, an inconsistent binding, an impossible index transition, or a state
+record that does not match the user collection fail closed.
 
 A completion key is a domain-separated SHA-256 digest of length-framed tenant,
 client ID, client epoch, and client sequence. `RetryHome` is deliberately not
 part of the key: changing it for the same client sequence must conflict with
 the retained command, not create a second command. The stored record repeats
 the full client tuple and retry home, retains a digest of the exact
-`CommandV1` bytes, and contains the exact `CompletionV1`; lookup never trusts a
+`Command` bytes, and contains the exact `Completion`; lookup never trusts a
 hash match without comparing those fields.
 
 ## Ordered normal application
@@ -174,15 +171,13 @@ reproduce the same bytes. These checks occur inside planning after dedupe,
 conflict, stale-fence, and unknown-collection routing, so committed semantic
 refusals still advance and remain deduplicable.
 
-Completion result grammar is machine-profile-specific. Deterministic v1 emits
-result format 1 and retains its frozen codes 1 through 5. Deterministic v2 emits
-result format 2 and appends code 6 for `ResultWrongShard`. Generic record
-decoding recognizes both explicit formats, but open, lookup, and duplicate
-planning reject a retained completion from the other machine profile.
+The one current completion result grammar uses codes 1 through 6, including
+code 6 for `ResultWrongShard`. Strict record decoding recognizes only this
+grammar; open, lookup, and duplicate planning reject any other result format.
 
-The SQL v2 placement validator is intentionally narrower: the sole primary
-pointer must also be the sole shard-key pointer and must yield a String or exact
-Number accepted by tuple version 1 and the frozen native mapper. Puts route the
+The SQL placement validator is intentionally narrow: the sole primary pointer
+must also be the sole shard-key pointer and must yield a String or exact Number
+accepted by the current tuple codec and native mapper. Puts route the
 validated document scalar; present deletes route the current document; absent
 deletes route the decoded ordered-key scalar. Points outside the exact
 half-open target range produce `ResultWrongShard`. Open and snapshot digesting
@@ -190,11 +185,11 @@ route every extant row, so wrong-shard data cannot be legitimized by omission.
 Composite keys, placement changes, and proof tying a serving router decision to
 this exact range remain future command/topology work.
 
-The fixed format-1/format-2 completions represent only this low-level
-unconditional mutation batch. `CommandV1` carries no arbitrary SQL result, expected row revisions,
-read set, predicate, or multi-collection intent. A later SQL command format is
-required before replicated SQL DML can preserve its existing transaction
-semantics.
+The fixed current completions represent only this low-level unconditional
+mutation batch. `Command` carries no arbitrary SQL result, expected row
+revisions, read set, predicate, or multi-collection intent. A later SQL command
+format is required before replicated SQL DML can preserve its existing
+transaction semantics.
 
 ## Configuration and static snapshot
 
@@ -208,11 +203,11 @@ configuration digest therefore binds index, term, entry type, and deterministic
 `ConfState`; it is exact at the apply-port boundary but is not a claim to retain
 the original configuration proposal envelope.
 
-V1 accepts only the exact static bootstrap snapshot fixed at construction.
-Installation is an idempotent verification at the same cut, including exact
-snapshot bytes/identity, logical digest, `ConfState`, binding, and replica-set
-version. A newer runtime snapshot is unsupported until the snapshot repository
-and WAL generation-swap protocol exist.
+The current machine accepts only the exact static bootstrap snapshot fixed at
+construction. Installation is an idempotent verification at the same cut,
+including exact snapshot bytes/identity, logical digest, `ConfState`, binding,
+and replica-set version. A newer runtime snapshot is unsupported until the
+snapshot repository and WAL generation-swap protocol exist.
 
 ## Reader publication and reopen
 
@@ -246,7 +241,7 @@ depend on this state-machine boundary, not the reverse.
 VibeDB's local SQL engine already implements Read Committed and Serializable.
 That does not make those modes replicated automatically.
 
-This v1 command is a blind, unconditional, single-collection write set. It can
+This command is a blind, unconditional, single-collection write set. It can
 be ordered and deduplicated safely, but it cannot encode a state-dependent SQL
 predicate, read dependencies, per-key/tombstone revisions, a relation-level
 phantom fence, or a multi-table atomic intent. Replicated SQL writes must remain
@@ -260,7 +255,7 @@ Serializable remains a separate distributed concurrency-control phase.
 
 ## Qualification and remaining gates
 
-The v1 apply slice must retain the following qualification before any serving
+The apply slice must retain the following qualification before any serving
 integration:
 
 - frozen state/completion-key golden vectors, strict decoding, fuzzing, 32-bit
@@ -280,13 +275,14 @@ integration:
 
 Before serving, later phases must add all of:
 
-1. the landed [SQL replicated binding v1](sql-replicated-binding-v1.md) and
-   [SQL replicated apply v1](sql-replicated-apply-v1.md) provide the exact
+1. the landed [SQL replicated binding](sql-replicated-binding.md) and
+   [SQL replicated apply](sql-replicated-apply.md) provide the exact
    SQL/WAL identity, persistent direct-write fence, hidden atomic participant,
    and opaque local apply claim, but deliberately grant no serving authority;
 2. an exact healthy, initialized SQL/WAL pair can now prove finite logical
    completion-count headroom when the live binding matches, `C <= A-1`,
-   `A <= commit <= L`, the capacity format is exactly static v1, and sealed
+   `A <= commit <= L`, the capacity format is exactly the current static
+   no-compaction profile, and sealed
    `MaxEntries <= MaxCompletions`. This instantaneous check is not a lease.
    Serving still requires physical system/user byte reservation and safe
    completion GC; any runtime snapshot/compaction also requires a reconstructed

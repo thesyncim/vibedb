@@ -23,6 +23,9 @@ func createTargetAt(t testing.TB, dir, name string, options durable.Options) Col
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = collection.Close() })
+	if name == "system" {
+		return systemTargetOf(collection)
+	}
 	return targetOf(collection)
 }
 
@@ -139,7 +142,7 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 	t.Cleanup(func() { _ = log.Close() })
 	maxSystem := len(stateKey) + 2*MaxStateEnvelopeBytes + 2 +
 		33 + 2*MaxCompletionRecordBytes + 2
-	required, ok := checkedTxnBytesV1(replication.MaxCommandBytes, maxSystem)
+	required, ok := checkedTxnBytes(replication.MaxCommandBytes, maxSystem)
 	if !ok {
 		t.Fatal("test byte proof overflowed")
 	}

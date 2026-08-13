@@ -101,7 +101,7 @@ func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BindReplicatedShardStore: %v", err)
 	}
-	if identity.Format != ReplicatedShardStoreFormatV1 || identity.LogID != local.LogID ||
+	if identity.Format != ReplicatedShardStoreFormat || identity.LogID != local.LogID ||
 		identity.Binding != binding || identity.UserTable != "docs" ||
 		len(identity.UserStorage) != storageIdentityBytes*2 || identity.UserPrimaryKey != "/id" {
 		t.Fatalf("bound identity = %+v, local = %+v", identity, local)
@@ -642,7 +642,7 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 
 func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 	identity := ReplicatedShardStoreIdentity{
-		Format:    ReplicatedShardStoreFormatV1,
+		Format:    ReplicatedShardStoreFormat,
 		Binding:   testReplicatedBinding(77),
 		LogID:     [16]byte{0xab, 1},
 		UserTable: "docs", UserStorage: strings.Repeat("a", storageIdentityBytes*2),

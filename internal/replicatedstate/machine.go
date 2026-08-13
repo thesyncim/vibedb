@@ -18,15 +18,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// SystemCollectionNameV1 is the reserved durable collection name owned by a
-// v1 Machine. Catalogs and adapters must reject it as a user collection name.
-const SystemCollectionNameV1 = "__vibedb_replicated_state_v1"
+// SystemCollectionName is the reserved durable collection name owned by a
+// Machine. Catalogs and adapters must reject it as a user collection name.
+const SystemCollectionName = "__vibedb_replicated_state"
 
-const systemCollectionName = SystemCollectionNameV1
+const systemCollectionName = SystemCollectionName
 
 var (
 	stateKey              = []byte{0}
-	bootstrapDigestDomain = []byte("vibedb/replicated-state/static-bootstrap/v1\x00")
+	bootstrapDigestDomain = []byte("vibedb/replicated-state/static-bootstrap\x00")
 )
 
 // Machine is a serial, unserved implementation of raftmodel.StateMachine.
@@ -44,7 +44,7 @@ type Machine struct {
 	txnLog          *durable.TxnLog
 	options         Options
 
-	state       StateV1
+	state       State
 	publication raftmodel.Publication
 	initialized bool
 	poison      error
@@ -79,10 +79,10 @@ func Open(
 	if err := system.validate(); err != nil {
 		return nil, fmt.Errorf("system collection: %w", err)
 	}
-	if system.Validation != ValidationSchemaFreeJSONV1 ||
+	if system.Validation != ValidationSchemaFreeJSON ||
 		system.ValidationDigest != ([32]byte{}) || system.Validator != nil ||
 		system.ObserveMutationAttempt != nil {
-		return nil, fmt.Errorf("%w: system collection requires the legacy validation profile", ErrInvalidCollection)
+		return nil, fmt.Errorf("%w: system collection requires schema-free validation", ErrInvalidCollection)
 	}
 	if txnLog == nil {
 		return nil, fmt.Errorf("%w: nil transaction log", ErrInvalidOptions)
@@ -96,10 +96,16 @@ func Open(
 	if err := user.validate(); err != nil {
 		return nil, fmt.Errorf("user collection %q: %w", userName, err)
 	}
+	if user.Validation != ValidationDeterministicMutation {
+		return nil, fmt.Errorf(
+			"user collection %q: %w: deterministic validation is required",
+			userName, ErrInvalidCollection,
+		)
+	}
 	if user.Limits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
 		user.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes ||
-		user.Limits.MaxDistinctMutations > MaxDistinctMutationsV1 {
-		return nil, fmt.Errorf("%w: user limits exceed the v1 command profile", ErrInvalidCollection)
+		user.Limits.MaxDistinctMutations > MaxDistinctMutations {
+		return nil, fmt.Errorf("%w: user limits exceed the command profile", ErrInvalidCollection)
 	}
 	if user.Collection == system.Collection {
 		return nil, fmt.Errorf("%w: system and user handles alias", ErrInvalidCollection)
@@ -115,7 +121,7 @@ func Open(
 		return nil, fmt.Errorf("%w: system collection cannot hold bounded records", ErrInvalidCollection)
 	}
 	maxUserBatchBytes := min(user.Limits.MaxBatchBytes, replication.MaxCommandBytes)
-	requiredTxnBytes, ok := checkedTxnBytesV1(maxUserBatchBytes, maxSystemBatchBytes)
+	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, maxSystemBatchBytes)
 	if !ok {
 		return nil, fmt.Errorf("%w: transaction byte proof overflows", ErrInvalidOptions)
 	}
@@ -162,7 +168,7 @@ func Open(
 	if err := validateExistingRows(userSnapshot, user); err != nil {
 		return nil, fmt.Errorf("user collection %q: %w", userName, err)
 	}
-	logical, err := logicalDigestV1(
+	logical, err := logicalDigest(
 		userName, user.Validation, user.ValidationDigest, user.Validator, userSnapshot, nil,
 	)
 	if err != nil {
@@ -180,7 +186,7 @@ func Open(
 		if completionCount != 0 || userSnapshot.Len() != 0 {
 			return nil, fmt.Errorf("%w: uninitialized system with durable rows", ErrStateCorrupt)
 		}
-		m.state = StateV1{
+		m.state = State{
 			Binding: binding, LogicalDigest: logical,
 			ConfState: new(pb.ConfState), BootstrapDigest: bootstrapDigest,
 		}
@@ -206,7 +212,7 @@ func Open(
 	return m, nil
 }
 
-func checkedTxnBytesV1(userBatchBytes, systemBatchBytes int) (int64, bool) {
+func checkedTxnBytes(userBatchBytes, systemBatchBytes int) (int64, bool) {
 	if userBatchBytes < 0 || systemBatchBytes < 0 {
 		return 0, false
 	}
@@ -218,8 +224,7 @@ func checkedTxnBytesV1(userBatchBytes, systemBatchBytes int) (int64, bool) {
 }
 
 func validateExistingRows(snapshot *durable.Snapshot, target CollectionTarget) error {
-	if target.Validation != ValidationDeterministicMutationV1 &&
-		target.Validation != ValidationDeterministicMutationV2 {
+	if target.Validation != ValidationDeterministicMutation {
 		return nil
 	}
 	return snapshot.RangeRaw(func(key, value []byte) error {
@@ -258,7 +263,7 @@ func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
 	}
 	if conf.GetAutoLeave() || len(conf.GetVotersOutgoing()) != 0 ||
 		len(conf.GetLearnersNext()) != 0 ||
-		len(conf.GetVoters())+len(conf.GetLearners()) > MaxStaticBootstrapMembersV1 {
+		len(conf.GetVoters())+len(conf.GetLearners()) > MaxStaticBootstrapMembers {
 		return nil, [32]byte{}, ErrStaticSnapshotOnly
 	}
 	if err := raftmodel.ValidateConfState(conf, 1); err != nil {
@@ -276,8 +281,8 @@ func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
 	return encoded, digest, nil
 }
 
-func scanSystemSnapshot(snapshot *durable.Snapshot, maxCompletions uint64) (StateV1, bool, uint64, error) {
-	var state StateV1
+func scanSystemSnapshot(snapshot *durable.Snapshot, maxCompletions uint64) (State, bool, uint64, error) {
+	var state State
 	var statePresent bool
 	var completions uint64
 	err := snapshot.RangeRaw(func(key, value []byte) error {
@@ -289,7 +294,7 @@ func scanSystemSnapshot(snapshot *durable.Snapshot, maxCompletions uint64) (Stat
 			if err != nil {
 				return err
 			}
-			state, err = OpenStateV1(raw)
+			state, err = OpenState(raw)
 			statePresent = err == nil
 			return err
 		}
@@ -300,11 +305,11 @@ func scanSystemSnapshot(snapshot *durable.Snapshot, maxCompletions uint64) (Stat
 		if err != nil {
 			return err
 		}
-		record, err := OpenCompletionRecordV1(raw)
+		record, err := OpenCompletionRecord(raw)
 		if err != nil {
 			return err
 		}
-		want := CompletionKeyV1(record.Tenant, record.ClientID, record.ClientEpoch, record.ClientSequence)
+		want := CompletionKey(record.Tenant, record.ClientID, record.ClientEpoch, record.ClientSequence)
 		if !bytes.Equal(key[1:], want[:]) {
 			return fmt.Errorf("%w: completion key mismatch", ErrCompletionCorrupt)
 		}
@@ -317,7 +322,7 @@ func scanSystemSnapshot(snapshot *durable.Snapshot, maxCompletions uint64) (Stat
 	return state, statePresent, completions, err
 }
 
-func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state StateV1) error {
+func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state State) error {
 	seenApplied := make(map[uint64]struct{}, int(state.CompletionCount))
 	return snapshot.RangeRaw(func(key, value []byte) error {
 		if bytes.Equal(key, stateKey) {
@@ -327,11 +332,11 @@ func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state 
 		if err != nil {
 			return err
 		}
-		record, err := OpenCompletionRecordV1(raw)
+		record, err := OpenCompletionRecord(raw)
 		if err != nil {
 			return err
 		}
-		completion, err := replication.OpenCompletionV1(record.Completion)
+		completion, err := replication.OpenCompletion(record.Completion)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrCompletionCorrupt, err)
 		}
@@ -380,19 +385,15 @@ func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state 
 	})
 }
 
-func (m *Machine) validateCompletionResult(completion replication.CompletionViewV1) error {
-	wantFormat, maxCode := ResultFormatMutationV1, uint32(ResultTargetBound)
-	if m.user.Validation == ValidationDeterministicMutationV2 {
-		wantFormat, maxCode = ResultFormatMutationV2, uint32(ResultWrongShard)
-	}
-	if completion.ResultFormat != wantFormat || completion.ResultCode < ResultApplied ||
-		completion.ResultCode > maxCode {
-		return fmt.Errorf("%w: completion result differs from machine validation profile", ErrCompletionCorrupt)
+func (m *Machine) validateCompletionResult(completion replication.CompletionView) error {
+	if completion.ResultFormat != ResultFormatMutation || completion.ResultCode < ResultApplied ||
+		completion.ResultCode > ResultWrongShard {
+		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
 	return nil
 }
 
-func publicationFromState(state StateV1) raftmodel.Publication {
+func publicationFromState(state State) raftmodel.Publication {
 	return raftmodel.Publication{
 		Applied: state.Applied, LogicalDigest: state.LogicalDigest,
 		ConfState: cloneConfState(state.ConfState), ReplicaSetVersion: state.ReplicaSetVersion,
@@ -454,7 +455,7 @@ func (m *Machine) checkUsable() error {
 	return nil
 }
 
-func (m *Machine) immutableBindingMatches(command replication.CommandViewV1) bool {
+func (m *Machine) immutableBindingMatches(command replication.CommandView) bool {
 	b := m.binding
 	return command.ClusterID == b.ClusterID &&
 		command.ClusterIncarnation == b.ClusterIncarnation &&
@@ -465,7 +466,7 @@ func (m *Machine) immutableBindingMatches(command replication.CommandViewV1) boo
 		command.ShardIncarnation == b.ShardIncarnation && command.GroupID == b.GroupID
 }
 
-func (m *Machine) mutableBindingMatches(command replication.CommandViewV1) bool {
+func (m *Machine) mutableBindingMatches(command replication.CommandView) bool {
 	b := m.binding
 	return command.ReplicaSetVersion == m.state.ReplicaSetVersion &&
 		command.ActivePolicyGeneration == b.ActivePolicyGeneration &&

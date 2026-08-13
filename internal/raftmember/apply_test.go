@@ -25,8 +25,8 @@ func testApplyOptions() sqldriver.ReplicatedApplyOptions {
 			MaxBytes:       64 << 20,
 		},
 		Placement: sqldriver.ReplicatedPlacementProfile{
-			Format: sqldriver.ReplicatedPlacementProfileV1, ShardKey: "/id",
-			TupleVersion: distribution.TupleVersion1, MapperVersion: distribution.NativeMapperVersion,
+			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
+			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
 	}
@@ -39,7 +39,7 @@ func testApplyCommand(
 ) []byte {
 	b := identity.Binding
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x7e})
-	encoded, err := replication.AppendCommandV1(nil, replication.CommandV1{
+	encoded, err := replication.AppendCommand(nil, replication.Command{
 		ClusterID:             replication.ID128(b.ClusterID),
 		ClusterIncarnation:    replication.ID128(b.ClusterIncarnation),
 		TopologyRecoveryEpoch: b.TopologyRecoveryEpoch,
@@ -100,7 +100,7 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupCompletion: %v", err)
 	}
-	completion, err := replication.OpenCompletionV1(lookup.Bytes)
+	completion, err := replication.OpenCompletion(lookup.Bytes)
 	if err != nil || completion.ResultCode != replicatedstate.ResultApplied {
 		t.Fatalf("completion = %+v,%v", completion, err)
 	}

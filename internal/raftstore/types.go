@@ -72,7 +72,7 @@ type Identity struct {
 	StoreID              [16]byte
 }
 
-// Bootstrap is the only snapshot accepted by format v1. The recovery epoch is
+// Bootstrap is the only snapshot accepted by the current format. The recovery epoch is
 // mutable committed topology state, so it is sealed into this snapshot record
 // and the selected current slot rather than the member's immutable identity.
 type Bootstrap struct {
@@ -85,9 +85,9 @@ type Bootstrap struct {
 type CapacityFormat uint8
 
 const (
-	// CapacityFormatStaticV1 is the immutable bootstrap-base, no-compaction
-	// contract implemented by WAL format v1.
-	CapacityFormatStaticV1 CapacityFormat = 1
+	// CapacityFormatStatic is the immutable bootstrap-base, no-compaction
+	// contract implemented by the current WAL format.
+	CapacityFormatStatic CapacityFormat = 1
 )
 
 // CapacityProfile is a detached view of the immutable log-capacity facts
@@ -96,7 +96,7 @@ const (
 // snapshot index selected by this handle. Format is a capability contract, not
 // a serving or capacity reservation.
 //
-// WAL format v1 always reports CapacityFormatStaticV1 and LogBaseIndex 1. A
+// The current WAL format always reports CapacityFormatStatic and LogBaseIndex 1. A
 // future runtime-snapshot or compaction-capable WAL must report another format
 // even before its first compaction, preventing retention of an invalid proof.
 type CapacityProfile struct {
@@ -116,7 +116,7 @@ type Key struct {
 }
 
 // Options are hard bounds for both normal operation and recovery. Zero values
-// select conservative defaults. Format v1 seals these exact values, so Open
+// select conservative defaults. The current format seals these exact values, so Open
 // must supply the same bounds used by Create.
 type Options struct {
 	MaxFileBytes   int64

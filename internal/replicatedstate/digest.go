@@ -9,12 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-var (
-	logicalDigestDomain          = []byte("vibedb/replicated-state/logical-image/v1\x00")
-	logicalDigestValidatedDomain = []byte(
-		"vibedb/replicated-state/logical-image/validated/v1\x00",
-	)
-)
+var logicalDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
 
 type finalMutation struct {
 	key    []byte
@@ -22,7 +17,7 @@ type finalMutation struct {
 	delete bool
 }
 
-func logicalDigestV1(
+func logicalDigest(
 	name string,
 	validation ValidationProfile,
 	validationDigest [32]byte,
@@ -30,16 +25,14 @@ func logicalDigestV1(
 	snapshot *durable.Snapshot,
 	overlay []finalMutation,
 ) ([32]byte, error) {
-	h := sha256.New()
-	if validation == ValidationSchemaFreeJSONV1 && validationDigest == ([32]byte{}) {
-		// This branch is byte-for-byte compatible with the original v1 logical
-		// digest. Existing schema-free roots retain their exact publication.
-		_, _ = h.Write(logicalDigestDomain)
-	} else {
-		_, _ = h.Write(logicalDigestValidatedDomain)
-		_, _ = h.Write([]byte{byte(validation)})
-		_, _ = h.Write(validationDigest[:])
+	if validation != ValidationDeterministicMutation ||
+		validationDigest == ([32]byte{}) || validator == nil {
+		return [32]byte{}, ErrInvalidCollection
 	}
+	h := sha256.New()
+	_, _ = h.Write(logicalDigestDomain)
+	_, _ = h.Write([]byte{byte(validation)})
+	_, _ = h.Write(validationDigest[:])
 	writeHashFrame(h, []byte(name))
 
 	ordered := slices.Clone(overlay)
@@ -48,21 +41,16 @@ func logicalDigestV1(
 	})
 	next := 0
 	hashMutation := func(key, value []byte) error {
-		if validation == ValidationDeterministicMutationV2 {
-			if validator == nil {
-				return ErrInvalidCollection
-			}
-			switch result := validator.ValidatePut(key, value); result {
-			case MutationValidationAccept:
-			case MutationValidationInvalid:
-				return fmt.Errorf("%w: logical image contains an invalid row", ErrSchemaProfile)
-			case MutationValidationTargetBound:
-				return fmt.Errorf("%w: logical image row exceeds the validator target", ErrSchemaProfile)
-			case MutationValidationWrongShard:
-				return fmt.Errorf("%w: logical image row belongs to another shard", ErrSchemaProfile)
-			default:
-				return fmt.Errorf("%w: mutation validator returned %d", ErrInvalidCollection, result)
-			}
+		switch result := validator.ValidatePut(key, value); result {
+		case MutationValidationAccept:
+		case MutationValidationInvalid:
+			return fmt.Errorf("%w: logical image contains an invalid row", ErrSchemaProfile)
+		case MutationValidationTargetBound:
+			return fmt.Errorf("%w: logical image row exceeds the validator target", ErrSchemaProfile)
+		case MutationValidationWrongShard:
+			return fmt.Errorf("%w: logical image row belongs to another shard", ErrSchemaProfile)
+		default:
+			return fmt.Errorf("%w: mutation validator returned %d", ErrInvalidCollection, result)
 		}
 		_, _ = h.Write([]byte{1})
 		writeHashFrame(h, key)

@@ -1,6 +1,6 @@
-# SQL replicated binding v1
+# SQL replicated binding
 
-The SQL replicated binding is a durable, write-once compatibility fence. It
+The SQL replicated binding is a durable, write-once identity fence. It
 converts an explicitly initialized local shard SQL root into a root whose
 ordinary SQL DML and DDL paths refuse writes with `ErrDirectWriteFenced`.
 Binding is not serving authorization: it does not elect a leader, establish a
@@ -8,8 +8,8 @@ lease, authorize HA reads, or make the root safe to expose to clients.
 
 ## Frozen identity and layout
 
-The catalog's optional version-0 `replicated_shard_store` member uses its own
-strict format version. It stores the complete WAL placement tuple, topology
+The catalog's optional `replicated_shard_store` member has one strict current
+encoding. It stores the complete WAL placement tuple, topology
 recovery epoch, six authority generations, and the WAL member/store identity.
 It also stores the preexisting SQL `LogID` and the explicit user table name,
 storage incarnation, primary JSON pointer, and durable mutation limits.
@@ -23,12 +23,12 @@ WAL tuple. The same identity-only limitation applies independently to a
 byte-identical WAL-root copy. Preventing either copy from serving requires an
 external authority witness or lease, which this binding does not provide.
 
-Format v1 accepts exactly one materialized, empty-at-bind, schema-free,
+The current binding accepts exactly one materialized, empty-at-bind, schema-free,
 index-free user table and no views. `CREATE TABLE t (PRIMARY KEY (p))` with no
 SQL column declarations creates this schema-free durable profile: the SQL
 driver still requires `p` to resolve to a non-null scalar on every direct SQL
 mutation, while additional JSON fields remain unconstrained. A table with a
-declared column list retains its durable schema and cannot be bound to v1.
+declared column list retains its durable schema and cannot be bound.
 
 ## Publication and restart settlement
 
@@ -48,14 +48,14 @@ no binding-only settlement path.
 
 ## Trusted apply activation
 
-The follow-on [SQL replicated apply v1](sql-replicated-apply-v1.md) keeps this
+The follow-on [SQL replicated apply](sql-replicated-apply.md) keeps this
 write-once binding intact and adds a separate strict `replicated_apply` catalog
 member. That activation owns a hidden system collection and one opaque apply
 claim; it never exposes the collection, transaction log, or underlying state
 machine and never relaxes the direct SQL write fence. Its deterministic profile
-binds the user table, primary pointer, ordered-key grammar, and durable limits,
-and committed puts/deletes are checked against that primary-key contract inside
-ordered apply.
+binds the user table, primary pointer, required shard placement, ordered-key
+grammar, and durable limits, and committed puts/deletes are checked against that
+primary-key and placement contract inside ordered apply.
 
 An activated root can no longer use this document's base-only open or
 settlement path. Exact restart retains a second complete apply identity,

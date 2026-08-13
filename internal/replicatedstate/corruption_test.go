@@ -18,13 +18,13 @@ func TestCompletionHashCollisionIsCorruptionNotTupleConflict(t *testing.T) {
 	}
 	a := encodeCommand(t, commandValue(fixture.binding, 1))
 	b := encodeCommand(t, commandValue(fixture.binding, 2))
-	viewA, _ := replication.OpenCommandV1(a)
-	viewB, _ := replication.OpenCommandV1(b)
+	viewA, _ := replication.OpenCommand(a)
+	viewB, _ := replication.OpenCommand(b)
 	document, err := fixture.machine.makeCompletionDocument(viewB, 2, ResultApplied)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digestA := CompletionKeyV1(viewA.Tenant, viewA.ClientID, viewA.ClientEpoch, viewA.ClientSequence)
+	digestA := CompletionKey(viewA.Tenant, viewA.ClientID, viewA.ClientEpoch, viewA.ClientSequence)
 	keyA := completionStorageKey(digestA)
 	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
 		return batch.Put(keyA[:], document)
@@ -83,7 +83,7 @@ func TestFutureReplicaSetVersionStaleCompletionReopens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	completion, _ := replication.OpenCompletionV1(lookup.Bytes)
+	completion, _ := replication.OpenCompletion(lookup.Bytes)
 	if completion.ResultCode != ResultStaleFence || completion.ReplicaSetVersion != 100 {
 		t.Fatalf("stale completion = %+v", completion)
 	}
@@ -154,7 +154,7 @@ func TestBootstrapExactnessAndBounds(t *testing.T) {
 	})
 	t.Run("static member ceiling", func(t *testing.T) {
 		bootstrap := testBootstrap()
-		bootstrap.Metadata.ConfState.Voters = make([]uint64, MaxStaticBootstrapMembersV1)
+		bootstrap.Metadata.ConfState.Voters = make([]uint64, MaxStaticBootstrapMembers)
 		for i := range bootstrap.Metadata.ConfState.Voters {
 			bootstrap.Metadata.ConfState.Voters[i] = uint64(i + 1)
 		}
@@ -162,7 +162,7 @@ func TestBootstrapExactnessAndBounds(t *testing.T) {
 			t.Fatalf("exact member ceiling: %v", err)
 		}
 		bootstrap.Metadata.ConfState.Voters = append(
-			bootstrap.Metadata.ConfState.Voters, MaxStaticBootstrapMembersV1+1,
+			bootstrap.Metadata.ConfState.Voters, MaxStaticBootstrapMembers+1,
 		)
 		if _, _, err := validateBootstrap(bootstrap); !errors.Is(err, ErrStaticSnapshotOnly) {
 			t.Fatalf("one-over member ceiling error = %v", err)
@@ -198,7 +198,7 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
-		envelope, err := AppendStateV1(nil, fixture.machine.state)
+		envelope, err := AppendState(nil, fixture.machine.state)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -292,12 +292,12 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		second := encodeCommand(t, commandValue(fixture.binding, 2))
-		view, _ := replication.OpenCommandV1(second)
+		view, _ := replication.OpenCommand(second)
 		document, err := fixture.machine.makeCompletionDocument(view, 2, ResultApplied)
 		if err != nil {
 			t.Fatal(err)
 		}
-		digest := CompletionKeyV1(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
+		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
 		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
 		state.CompletionCount = 2
@@ -317,12 +317,12 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		command := encodeCommand(t, commandValue(fixture.binding, 1))
-		view, _ := replication.OpenCommandV1(command)
+		view, _ := replication.OpenCommand(command)
 		document, err := fixture.machine.makeCompletionDocument(view, 1, ResultApplied)
 		if err != nil {
 			t.Fatal(err)
 		}
-		digest := CompletionKeyV1(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
+		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
 		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
 		state.CompletionCount = 1
@@ -344,12 +344,12 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		command := commandValue(fixture.binding, 1)
 		command.ReplicaSetVersion = 2
 		encoded := encodeCommand(t, command)
-		view, _ := replication.OpenCommandV1(encoded)
+		view, _ := replication.OpenCommand(encoded)
 		document, err := fixture.machine.makeCompletionDocument(view, 2, ResultApplied)
 		if err != nil {
 			t.Fatal(err)
 		}
-		digest := CompletionKeyV1(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
+		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
 		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
 		state.CompletionCount = 1
@@ -373,12 +373,12 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		command := commandValue(fixture.binding, 1)
 		command.ReplicaSetVersion = 2
 		encoded := encodeCommand(t, command)
-		view, _ := replication.OpenCommandV1(encoded)
+		view, _ := replication.OpenCommand(encoded)
 		document, err := fixture.machine.makeCompletionDocument(view, 3, ResultApplied)
 		if err != nil {
 			t.Fatal(err)
 		}
-		digest := CompletionKeyV1(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
+		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
 		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
 		state.CompletionCount = 1
@@ -402,12 +402,12 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		command := commandValue(fixture.binding, 1)
 		command.ReplicaSetVersion = 100
 		encoded := encodeCommand(t, command)
-		view, _ := replication.OpenCommandV1(encoded)
+		view, _ := replication.OpenCommand(encoded)
 		document, err := fixture.machine.makeCompletionDocument(view, 2, ResultStaleFence)
 		if err != nil {
 			t.Fatal(err)
 		}
-		digest := CompletionKeyV1(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
+		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
 		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
 		state.CompletionCount = 1
@@ -420,9 +420,9 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 	})
 }
 
-func putStateDocument(t testing.TB, collection *durable.Collection, state StateV1, extraKey, extraDocument []byte) {
+func putStateDocument(t testing.TB, collection *durable.Collection, state State, extraKey, extraDocument []byte) {
 	t.Helper()
-	envelope, err := AppendStateV1(nil, state)
+	envelope, err := AppendState(nil, state)
 	if err != nil {
 		t.Fatal(err)
 	}

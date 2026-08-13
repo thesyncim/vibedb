@@ -36,7 +36,7 @@ func BenchmarkAppendScalarNumber(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchNumberSmall)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchNumberSmall)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -48,7 +48,7 @@ func BenchmarkAppendScalarNumberWideExponent(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchNumberWide)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchNumberWide)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -60,7 +60,7 @@ func BenchmarkAppendScalarNumberHugeExponent(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchNumberHuge)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchNumberHuge)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func BenchmarkAppendScalarStringShort(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchStringShort)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchStringShort)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -84,7 +84,7 @@ func BenchmarkAppendScalarStringLong(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchStringLong)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchStringLong)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -99,7 +99,7 @@ func BenchmarkAppendTupleSingleColumn(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendTuple(dst[:0], values)
+		dst, err = CurrentTupleCodec.AppendTuple(dst[:0], values)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -112,7 +112,7 @@ func BenchmarkAppendTupleThreeColumns(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		var err error
-		dst, err = V1.AppendTuple(dst[:0], values)
+		dst, err = CurrentTupleCodec.AppendTuple(dst[:0], values)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func TestZeroAllocationAppendScalarNumber(t *testing.T) {
 	dst := make([]byte, 0, 64)
 	allocations := testing.AllocsPerRun(1000, func() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchNumberSmall)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchNumberSmall)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,7 +139,7 @@ func TestZeroAllocationAppendScalarString(t *testing.T) {
 	dst := make([]byte, 0, 64)
 	allocations := testing.AllocsPerRun(1000, func() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchStringShort)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchStringShort)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,7 +154,7 @@ func TestZeroAllocationAppendTuple(t *testing.T) {
 	dst := make([]byte, 0, 512)
 	allocations := testing.AllocsPerRun(1000, func() {
 		var err error
-		dst, err = V1.AppendTuple(dst[:0], values)
+		dst, err = CurrentTupleCodec.AppendTuple(dst[:0], values)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -173,7 +173,7 @@ func TestZeroAllocationAppendScalarWideExponent(t *testing.T) {
 	dst := make([]byte, 0, 256)
 	allocations := testing.AllocsPerRun(1000, func() {
 		var err error
-		dst, err = V1.AppendScalar(dst[:0], benchNumberHuge)
+		dst, err = CurrentTupleCodec.AppendScalar(dst[:0], benchNumberHuge)
 		if err != nil {
 			t.Fatal(err)
 		}

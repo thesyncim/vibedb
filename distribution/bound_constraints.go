@@ -45,7 +45,7 @@ func EmptyDomain() ValueDomain { return ValueDomain{Kind: DomainEmpty} }
 // placement scalar.
 func FiniteDomain(values ...Scalar) (ValueDomain, error) {
 	var b ConstraintBuilder
-	b.codec = V1
+	b.codec = CurrentTupleCodec
 	if err := b.AddMembership(values); err != nil {
 		return ValueDomain{}, err
 	}
@@ -70,15 +70,15 @@ type ConstraintBuilder struct {
 }
 
 // NewConstraintBuilder returns a builder that encodes canonical bytes with the
-// frozen version 1 tuple codec.
+// current tuple codec.
 func NewConstraintBuilder() *ConstraintBuilder {
-	return &ConstraintBuilder{codec: V1}
+	return &ConstraintBuilder{codec: CurrentTupleCodec}
 }
 
 // Reset clears accumulated predicates, reusing buffers for the next ordinal.
 func (b *ConstraintBuilder) Reset() {
 	if b.codec == nil {
-		b.codec = V1
+		b.codec = CurrentTupleCodec
 	}
 	b.running.reset()
 	b.incoming.reset()

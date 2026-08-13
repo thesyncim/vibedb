@@ -414,7 +414,7 @@ func createWAL(
 	store, err := raftstore.Create(path, identity, key, raftstore.Bootstrap{
 		TopologyRecoveryEpoch: testTopologyRecoveryEpoch,
 		Snapshot: &pb.Snapshot{
-			Data: []byte("raftmember-static-bootstrap-v1"),
+			Data: []byte("raftmember-static-bootstrap"),
 			Metadata: &pb.SnapshotMetadata{
 				Index: &index, Term: &term,
 				ConfState: &pb.ConfState{Voters: []uint64{identity.MemberID}},

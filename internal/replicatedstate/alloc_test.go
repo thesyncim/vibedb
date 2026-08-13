@@ -7,59 +7,59 @@ import "testing"
 var (
 	codecBytesSink  []byte
 	codecDigestSink [32]byte
-	codecStateSink  StateV1
-	codecRecordSink CompletionRecordV1
+	codecStateSink  State
+	codecRecordSink CompletionRecord
 )
 
 func TestDigestAndCompletionAppendAllocationBounds(t *testing.T) {
-	_, record := codecCompletionV1(ResultApplied)
-	encoded, err := AppendCompletionRecordV1(nil, record)
+	_, record := codecCompletion(ResultApplied)
+	encoded, err := AppendCompletionRecord(nil, record)
 	if err != nil {
 		t.Fatal(err)
 	}
 	scratch := make([]byte, 0, len(encoded))
 
 	if allocations := testing.AllocsPerRun(1000, func() {
-		codecDigestSink = CompletionKeyV1(record.Tenant, record.ClientID, record.ClientEpoch, record.ClientSequence)
+		codecDigestSink = CompletionKey(record.Tenant, record.ClientID, record.ClientEpoch, record.ClientSequence)
 	}); allocations != 0 {
-		t.Fatalf("CompletionKeyV1 allocations = %v, want 0", allocations)
+		t.Fatalf("CompletionKey allocations = %v, want 0", allocations)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
-		codecDigestSink = CommandDigestV1(record.Completion)
+		codecDigestSink = CommandDigest(record.Completion)
 	}); allocations != 0 {
-		t.Fatalf("CommandDigestV1 allocations = %v, want 0", allocations)
+		t.Fatalf("CommandDigest allocations = %v, want 0", allocations)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
 		var appendErr error
-		codecBytesSink, appendErr = AppendCompletionRecordV1(scratch[:0], record)
+		codecBytesSink, appendErr = AppendCompletionRecord(scratch[:0], record)
 		if appendErr != nil {
 			panic(appendErr)
 		}
 	}); allocations != 0 {
-		t.Fatalf("pre-sized AppendCompletionRecordV1 allocations = %v, want 0", allocations)
+		t.Fatalf("pre-sized AppendCompletionRecord allocations = %v, want 0", allocations)
 	}
 }
 
-func BenchmarkCompletionKeyV1(b *testing.B) {
-	_, record := codecCompletionV1(ResultApplied)
+func BenchmarkCompletionKey(b *testing.B) {
+	_, record := codecCompletion(ResultApplied)
 	b.ReportAllocs()
 	for b.Loop() {
-		codecDigestSink = CompletionKeyV1(record.Tenant, record.ClientID, record.ClientEpoch, record.ClientSequence)
+		codecDigestSink = CompletionKey(record.Tenant, record.ClientID, record.ClientEpoch, record.ClientSequence)
 	}
 }
 
-func BenchmarkCommandDigestV1(b *testing.B) {
-	_, record := codecCompletionV1(ResultApplied)
+func BenchmarkCommandDigest(b *testing.B) {
+	_, record := codecCompletion(ResultApplied)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(record.Completion)))
 	for b.Loop() {
-		codecDigestSink = CommandDigestV1(record.Completion)
+		codecDigestSink = CommandDigest(record.Completion)
 	}
 }
 
-func BenchmarkAppendStateV1(b *testing.B) {
-	state := codecStateV1()
-	encoded, err := AppendStateV1(nil, state)
+func BenchmarkAppendState(b *testing.B) {
+	state := codecState()
+	encoded, err := AppendState(nil, state)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -67,31 +67,31 @@ func BenchmarkAppendStateV1(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(encoded)))
 	for b.Loop() {
-		codecBytesSink, err = AppendStateV1(scratch[:0], state)
+		codecBytesSink, err = AppendState(scratch[:0], state)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkOpenStateV1(b *testing.B) {
-	encoded, err := AppendStateV1(nil, codecStateV1())
+func BenchmarkOpenState(b *testing.B) {
+	encoded, err := AppendState(nil, codecState())
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(encoded)))
 	for b.Loop() {
-		codecStateSink, err = OpenStateV1(encoded)
+		codecStateSink, err = OpenState(encoded)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkAppendCompletionRecordV1(b *testing.B) {
-	_, record := codecCompletionV1(ResultApplied)
-	encoded, err := AppendCompletionRecordV1(nil, record)
+func BenchmarkAppendCompletionRecord(b *testing.B) {
+	_, record := codecCompletion(ResultApplied)
+	encoded, err := AppendCompletionRecord(nil, record)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -99,23 +99,23 @@ func BenchmarkAppendCompletionRecordV1(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(encoded)))
 	for b.Loop() {
-		codecBytesSink, err = AppendCompletionRecordV1(scratch[:0], record)
+		codecBytesSink, err = AppendCompletionRecord(scratch[:0], record)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkOpenCompletionRecordV1(b *testing.B) {
-	_, record := codecCompletionV1(ResultApplied)
-	encoded, err := AppendCompletionRecordV1(nil, record)
+func BenchmarkOpenCompletionRecord(b *testing.B) {
+	_, record := codecCompletion(ResultApplied)
+	encoded, err := AppendCompletionRecord(nil, record)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(encoded)))
 	for b.Loop() {
-		codecRecordSink, err = OpenCompletionRecordV1(encoded)
+		codecRecordSink, err = OpenCompletionRecord(encoded)
 		if err != nil {
 			b.Fatal(err)
 		}

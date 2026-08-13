@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func FuzzOpenCommandV1(f *testing.F) {
+func FuzzOpenCommand(f *testing.F) {
 	valid := encodeCommand(f, testCommand())
 	ordered := testCommand()
 	ordered.Mutations = []Mutation{
@@ -23,7 +23,7 @@ func FuzzOpenCommandV1(f *testing.F) {
 		if len(data) > MaxCommandBytes+1 {
 			data = data[:MaxCommandBytes+1]
 		}
-		view, err := OpenCommandV1(data)
+		view, err := OpenCommand(data)
 		if err != nil {
 			return
 		}
@@ -31,7 +31,7 @@ func FuzzOpenCommandV1(f *testing.F) {
 	})
 }
 
-func FuzzOpenCommandV1ResealedFields(f *testing.F) {
+func FuzzOpenCommandResealedFields(f *testing.F) {
 	valid := encodeCommand(f, testCommand())
 	mutation := commandMutationOffset(valid)
 	distribution := commandHeaderBytes + len(testCommand().Tenant)
@@ -88,14 +88,14 @@ func FuzzOpenCommandV1ResealedFields(f *testing.F) {
 			candidate[200+int(value%32)] = byte(value >> 8)
 		}
 		sealEnvelope(candidate)
-		view, err := OpenCommandV1(candidate)
+		view, err := OpenCommand(candidate)
 		if err == nil {
 			assertFuzzCommandView(t, candidate, view)
 		}
 	})
 }
 
-func assertFuzzCommandView(t *testing.T, data []byte, view CommandViewV1) {
+func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 	t.Helper()
 	if !bytes.Equal(view.Bytes(), data) || cap(view.Bytes()) != len(view.Bytes()) ||
 		view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
@@ -139,7 +139,7 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandViewV1) {
 	}
 }
 
-func FuzzOpenCompletionV1(f *testing.F) {
+func FuzzOpenCompletion(f *testing.F) {
 	inline := encodeCompletion(f, testInlineCompletion())
 	reference := encodeCompletion(f, testReferenceCompletion())
 	f.Add(inline)
@@ -151,7 +151,7 @@ func FuzzOpenCompletionV1(f *testing.F) {
 		if len(data) > MaxCompletionEnvelopeBytes+1 {
 			data = data[:MaxCompletionEnvelopeBytes+1]
 		}
-		view, err := OpenCompletionV1(data)
+		view, err := OpenCompletion(data)
 		if err != nil {
 			return
 		}
@@ -159,7 +159,7 @@ func FuzzOpenCompletionV1(f *testing.F) {
 	})
 }
 
-func FuzzOpenCompletionV1ResealedFields(f *testing.F) {
+func FuzzOpenCompletionResealedFields(f *testing.F) {
 	valid := encodeCompletion(f, testInlineCompletion())
 	inline := completionInlineOffset(valid)
 	for _, seed := range []struct {
@@ -215,14 +215,14 @@ func FuzzOpenCompletionV1ResealedFields(f *testing.F) {
 			binary.LittleEndian.PutUint32(candidate[24:28], uint32(value))
 		}
 		sealEnvelope(candidate)
-		view, err := OpenCompletionV1(candidate)
+		view, err := OpenCompletion(candidate)
 		if err == nil {
 			assertFuzzCompletionView(t, candidate, view)
 		}
 	})
 }
 
-func assertFuzzCompletionView(t *testing.T, data []byte, view CompletionViewV1) {
+func assertFuzzCompletionView(t *testing.T, data []byte, view CompletionView) {
 	t.Helper()
 	if !bytes.Equal(view.Bytes(), data) || cap(view.Bytes()) != len(view.Bytes()) ||
 		view.ResultLength > MaxCompletionResultBytes {

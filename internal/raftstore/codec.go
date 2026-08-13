@@ -122,7 +122,7 @@ func makeObjectAEAD(dataKey [32]byte, domain string, sequence uint64, digest [32
 
 func deriveObjectKey(dataKey [32]byte, domain string, sequence uint64, digest [32]byte) [32]byte {
 	mac := hmac.New(sha256.New, dataKey[:])
-	_, _ = mac.Write([]byte("vibedb/raft-wal-v1/object/"))
+	_, _ = mac.Write([]byte("vibedb/raft-wal/object/"))
 	_, _ = mac.Write([]byte(domain))
 	var encoded [8]byte
 	binary.LittleEndian.PutUint64(encoded[:], sequence)
@@ -162,7 +162,7 @@ func deriveObjectNonce(key [32]byte, domain string, sequence uint64, digest [32]
 
 func deriveFileSecret(material [32]byte, fileID [16]byte, domain string) [32]byte {
 	mac := hmac.New(sha256.New, material[:])
-	_, _ = mac.Write([]byte("vibedb/raft-wal-v1/"))
+	_, _ = mac.Write([]byte("vibedb/raft-wal/"))
 	_, _ = mac.Write([]byte(domain))
 	_, _ = mac.Write(fileID[:])
 	var result [32]byte

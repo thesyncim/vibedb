@@ -8,7 +8,7 @@ package distribution
 // contradiction collapses to an empty domain, an unknown dynamic value never
 // narrows, and the overflow-safe candidate estimator is exact at its boundary
 // and never forms an overflowing product. Equality of values is asserted through
-// the frozen version 1 codec bytes, never Go equality or source spelling, so a
+// the current codec bytes, never Go equality or source spelling, so a
 // regression that lets "5" and "5.0" diverge is caught here.
 
 import (
@@ -24,10 +24,10 @@ func must(t *testing.T, err error) {
 	}
 }
 
-// canonOf returns a scalar's frozen version 1 canonical bytes as a string key.
+// canonOf returns a scalar's canonical bytes as a string key.
 func canonOf(t *testing.T, s Scalar) string {
 	t.Helper()
-	b, err := V1.AppendScalar(nil, s)
+	b, err := CurrentTupleCodec.AppendScalar(nil, s)
 	if err != nil {
 		t.Fatalf("AppendScalar(%v): %v", s, err)
 	}

@@ -21,10 +21,10 @@ type Router struct {
 	mapRanges [1]KeyRange
 }
 
-// NewRouter returns a Router that encodes canonical bytes with the frozen
-// version 1 tuple codec.
+// NewRouter returns a Router that encodes canonical bytes with the current
+// tuple codec.
 func NewRouter() *Router {
-	return &Router{codec: V1}
+	return &Router{codec: CurrentTupleCodec}
 }
 
 // Route resolves cons through mapper against man under policy and returns an

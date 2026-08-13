@@ -17,12 +17,12 @@ import (
 )
 
 var (
-	normalEntryDigestDomain = []byte("vibedb/replicated-state/normal-entry/v1\x00")
-	configEntryDigestDomain = []byte("vibedb/replicated-state/config-entry/v1\x00")
+	normalEntryDigestDomain = []byte("vibedb/replicated-state/normal-entry\x00")
+	configEntryDigestDomain = []byte("vibedb/replicated-state/config-entry\x00")
 )
 
 type commandPlan struct {
-	command        replication.CommandViewV1
+	command        replication.CommandView
 	key            [33]byte
 	completionDoc  []byte
 	changes        []finalMutation
@@ -61,7 +61,7 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 		}
 		return clonePublication(m.publication), nil
 	}
-	command, err := replication.OpenCommandV1(data)
+	command, err := replication.OpenCommand(data)
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
@@ -129,7 +129,7 @@ func (m *Machine) ApplyConfiguration(meta raftmodel.ApplyMeta, conf *pb.ConfStat
 	return clonePublication(m.publication), nil
 }
 
-// InstallSnapshot implements raftmodel.StateMachine. V1 accepts only the
+// InstallSnapshot implements raftmodel.StateMachine. It accepts only the
 // deterministic exact static bootstrap fixed at Open.
 func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication, error) {
 	m.mu.Lock()
@@ -149,7 +149,7 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		}
 		return raftmodel.Publication{}, m.fail(ErrStaticSnapshotOnly)
 	}
-	next := StateV1{
+	next := State{
 		Binding: m.binding, Applied: 1, LastTerm: 1,
 		LastKind: RecordStaticSnapshot, LastEntryType: pb.EntryNormal,
 		LastEntryDigest: m.bootstrapDigest, LogicalDigest: m.state.LogicalDigest,
@@ -162,11 +162,11 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 	return clonePublication(m.publication), nil
 }
 
-// AdmitCommand performs the complete non-reserving v1 pre-proposal check.
+// AdmitCommand performs the complete non-reserving pre-proposal check.
 // Serving remains forbidden because a successful return does not reserve the
 // proved storage for the future committed entry.
 func (m *Machine) AdmitCommand(data []byte) error {
-	command, err := replication.OpenCommandV1(data)
+	command, err := replication.OpenCommand(data)
 	if err != nil {
 		return err
 	}
@@ -210,7 +210,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 }
 
-func (m *Machine) hypotheticalState(command replication.CommandViewV1, plan commandPlan) StateV1 {
+func (m *Machine) hypotheticalState(command replication.CommandView, plan commandPlan) State {
 	meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 	next := m.nextState(meta, RecordNormal, normalEntryDigest(meta, command.Bytes()))
 	next.LogicalDigest = plan.logicalDigest
@@ -238,8 +238,8 @@ func (m *Machine) checkTransition(meta raftmodel.ApplyMeta, kind RecordKind, dig
 	return false, nil
 }
 
-func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [32]byte) StateV1 {
-	return StateV1{
+func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [32]byte) State {
+	return State{
 		Binding: m.binding, Applied: meta.Index, LastTerm: meta.Term,
 		LastKind: kind, LastEntryType: meta.Type, LastEntryDigest: digest,
 		LogicalDigest: m.state.LogicalDigest, ConfState: cloneConfState(m.state.ConfState),
@@ -303,19 +303,19 @@ func (m *Machine) captureApplyCutLocked() (durable.DatabaseSnapshot, *durable.Sn
 }
 
 func (m *Machine) planCommand(
-	command replication.CommandViewV1,
+	command replication.CommandView,
 	applied uint64,
 	systemSnapshot, userSnapshot *durable.Snapshot,
 ) (commandPlan, error) {
 	plan := commandPlan{command: command, logicalDigest: m.state.LogicalDigest}
-	digest := CompletionKeyV1(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
+	digest := CompletionKey(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
 	plan.key = completionStorageKey(digest)
 	existing, found, err := completionAt(systemSnapshot, plan.key)
 	if err != nil {
 		return commandPlan{}, err
 	}
 	if found {
-		completion, completionErr := replication.OpenCompletionV1(existing.Completion)
+		completion, completionErr := replication.OpenCompletion(existing.Completion)
 		if completionErr != nil {
 			return commandPlan{}, fmt.Errorf("%w: %v", ErrCompletionCorrupt, completionErr)
 		}
@@ -347,7 +347,7 @@ func (m *Machine) planCommand(
 			return commandPlan{}, err
 		}
 		if plan.resultCode == ResultApplied {
-			plan.logicalDigest, err = logicalDigestV1(
+			plan.logicalDigest, err = logicalDigest(
 				m.userName, m.user.Validation, m.user.ValidationDigest, m.user.Validator,
 				userSnapshot, plan.changes,
 			)
@@ -364,7 +364,7 @@ func (m *Machine) planCommand(
 }
 
 func (m *Machine) planMutations(
-	command replication.CommandViewV1,
+	command replication.CommandView,
 	snapshot *durable.Snapshot,
 ) ([]finalMutation, uint32, error) {
 	ordered := make([]finalMutation, 0, min(command.MutationCount(), m.user.Limits.MaxDistinctMutations+1))
@@ -402,8 +402,7 @@ func (m *Machine) planMutations(
 		if err != nil {
 			return nil, 0, err
 		}
-		if m.user.Validation == ValidationDeterministicMutationV1 ||
-			m.user.Validation == ValidationDeterministicMutationV2 {
+		if m.user.Validation == ValidationDeterministicMutation {
 			validation := MutationValidation(0)
 			if mutation.delete {
 				validation = m.user.Validator.ValidateDelete(mutation.key, current, found)
@@ -417,11 +416,6 @@ func (m *Machine) planMutations(
 			case MutationValidationTargetBound:
 				return nil, ResultTargetBound, nil
 			case MutationValidationWrongShard:
-				if m.user.Validation != ValidationDeterministicMutationV2 {
-					return nil, 0, fmt.Errorf(
-						"%w: v1 mutation validator returned wrong-shard", ErrInvalidCollection,
-					)
-				}
 				return nil, ResultWrongShard, nil
 			default:
 				return nil, 0, fmt.Errorf(
@@ -446,16 +440,12 @@ func (m *Machine) planMutations(
 }
 
 func (m *Machine) makeCompletionDocument(
-	command replication.CommandViewV1,
+	command replication.CommandView,
 	applied uint64,
 	code uint32,
 ) ([]byte, error) {
-	resultFormat := ResultFormatMutationV1
-	if m.user.Validation == ValidationDeterministicMutationV2 {
-		resultFormat = ResultFormatMutationV2
-	}
-	resultDigest := replication.CompletionResultDigestV1(code, resultFormat, nil)
-	completion, err := replication.AppendCompletionV1(nil, replication.CompletionV1{
+	resultDigest := replication.CompletionResultDigest(code, ResultFormatMutation, nil)
+	completion, err := replication.AppendCompletion(nil, replication.Completion{
 		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
 		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
 		Distribution:          string(command.Distribution), Shard: string(command.Shard),
@@ -468,17 +458,17 @@ func (m *Machine) makeCompletionDocument(
 		ClientID: command.ClientID, ClientEpoch: command.ClientEpoch,
 		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
 		RetryHome: command.RetryHome, AppliedSequence: applied,
-		ResultCode: code, ResultFormat: resultFormat,
+		ResultCode: code, ResultFormat: ResultFormatMutation,
 		Storage: replication.CompletionInline, ResultDigest: resultDigest,
 	})
 	if err != nil {
 		return nil, err
 	}
-	record, err := AppendCompletionRecordV1(nil, CompletionRecordV1{
+	record, err := AppendCompletionRecord(nil, CompletionRecord{
 		Tenant: command.Tenant, ClientID: command.ClientID,
 		ClientEpoch: command.ClientEpoch, ClientSequence: command.ClientSequence,
 		RetryHome: command.RetryHome, Fingerprint: command.Fingerprint,
-		CommandDigest: CommandDigestV1(command.Bytes()), Collection: string(command.Collection),
+		CommandDigest: CommandDigest(command.Bytes()), Collection: string(command.Collection),
 		Completion: completion,
 	})
 	if err != nil {
@@ -487,26 +477,26 @@ func (m *Machine) makeCompletionDocument(
 	return wrapJSONHex(nil, record), nil
 }
 
-func completionAt(snapshot *durable.Snapshot, key [33]byte) (CompletionRecordV1, bool, error) {
+func completionAt(snapshot *durable.Snapshot, key [33]byte) (CompletionRecord, bool, error) {
 	document, found, err := snapshot.AppendRaw(nil, key[:])
 	if err != nil || !found {
-		return CompletionRecordV1{}, found, err
+		return CompletionRecord{}, found, err
 	}
 	raw, err := unwrapJSONHex(document, MaxCompletionRecordBytes, ErrCompletionCorrupt)
 	if err != nil {
-		return CompletionRecordV1{}, false, err
+		return CompletionRecord{}, false, err
 	}
-	record, err := OpenCompletionRecordV1(raw)
+	record, err := OpenCompletionRecord(raw)
 	return record, err == nil, err
 }
 
 func (m *Machine) persistTransition(
-	next StateV1,
+	next State,
 	changes []finalMutation,
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
-	stateEnvelope, err := AppendStateV1(nil, next)
+	stateEnvelope, err := AppendState(nil, next)
 	if err != nil {
 		return err
 	}
@@ -563,12 +553,12 @@ func (m *Machine) persistTransition(
 }
 
 func (m *Machine) checkTransitionCapacity(
-	next StateV1,
+	next State,
 	changes []finalMutation,
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
-	stateEnvelope, err := AppendStateV1(nil, next)
+	stateEnvelope, err := AppendState(nil, next)
 	if err != nil {
 		return err
 	}

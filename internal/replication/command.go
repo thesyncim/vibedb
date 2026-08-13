@@ -8,13 +8,13 @@ import (
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 
-// CommandV1 is one deterministic, single-collection state-machine mutation.
+// Command is one deterministic, single-collection state-machine mutation.
 // It contains no Raft term, index, physical root generation, deadline, SQL text,
 // or serialized execution plan. Fingerprint is the already-canonical request
 // fingerprint minted by the request layer; this codec treats it as opaque.
 // Mutation order, including duplicate keys, is semantic and preserved exactly;
 // upstream fingerprinting must bind every mutation ordinal.
-type CommandV1 struct {
+type Command struct {
 	ClusterID             ID128
 	ClusterIncarnation    ID128
 	TopologyRecoveryEpoch uint64
@@ -44,10 +44,10 @@ type CommandV1 struct {
 	Mutations  []Mutation
 }
 
-// CommandViewV1 is a checksum- and semantics-validated borrowed command. Its
-// byte slices alias the OpenCommandV1 input and must be treated as immutable.
+// CommandView is a checksum- and semantics-validated borrowed command. Its
+// byte slices alias the OpenCommand input and must be treated as immutable.
 // Copying or retaining the view retains the complete bounded input envelope.
-type CommandViewV1 struct {
+type CommandView struct {
 	ClusterID             ID128
 	ClusterIncarnation    ID128
 	TopologyRecoveryEpoch uint64
@@ -81,39 +81,39 @@ type CommandViewV1 struct {
 
 // Bytes returns the exact validated envelope. The result aliases the decoder
 // input and is read-only for the view's lifetime.
-func (v CommandViewV1) Bytes() []byte {
+func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
 
 // MutationCount reports the number of mutations the iterator will produce.
-func (v CommandViewV1) MutationCount() int { return int(v.mutationCount) }
+func (v CommandView) MutationCount() int { return int(v.mutationCount) }
 
-// MutationViewV1 is one borrowed, validated mutation. Key and Value are
+// MutationView is one borrowed, validated mutation. Key and Value are
 // capacity-clamped, read-only aliases into the command envelope.
-type MutationViewV1 struct {
+type MutationView struct {
 	Kind  MutationKind
 	Key   []byte
 	Value []byte
 }
 
-// MutationIteratorV1 walks a validated command without materializing a slice.
-type MutationIteratorV1 struct {
+// MutationIterator walks a validated command without materializing a slice.
+type MutationIterator struct {
 	remaining uint32
 	b         []byte
-	current   MutationViewV1
+	current   MutationView
 }
 
 // Mutations returns a fresh iterator positioned before the first mutation.
-func (v CommandViewV1) Mutations() MutationIteratorV1 {
+func (v CommandView) Mutations() MutationIterator {
 	b := v.mutationBytes
-	return MutationIteratorV1{
+	return MutationIterator{
 		remaining: v.mutationCount,
 		b:         b[:len(b):len(b)],
 	}
 }
 
 // Next advances and reports whether one mutation is available.
-func (i *MutationIteratorV1) Next() bool {
+func (i *MutationIterator) Next() bool {
 	if i == nil || i.remaining == 0 {
 		return false
 	}
@@ -123,7 +123,7 @@ func (i *MutationIteratorV1) Next() bool {
 	keyStart := mutationHeaderBytes
 	valueStart := keyStart + keyLen
 	end := valueStart + valueLen
-	i.current = MutationViewV1{
+	i.current = MutationView{
 		Kind:  kind,
 		Key:   i.b[keyStart:valueStart:valueStart],
 		Value: i.b[valueStart:end:end],
@@ -135,19 +135,19 @@ func (i *MutationIteratorV1) Next() bool {
 
 // Mutation returns the current mutation. It is zero before the first successful
 // Next and remains the final mutation after exhaustion.
-func (i *MutationIteratorV1) Mutation() MutationViewV1 {
+func (i *MutationIterator) Mutation() MutationView {
 	if i == nil {
-		return MutationViewV1{}
+		return MutationView{}
 	}
 	return i.current
 }
 
-// AppendCommandV1 appends one deterministic command. On validation failure it
+// AppendCommand appends one deterministic command. On validation failure it
 // returns the original dst unchanged. A correctly pre-sized dst incurs no heap
 // allocation. Input slices must not overlap the writable append region in dst's
 // current backing array; such aliases are rejected before dst is modified.
-func AppendCommandV1(dst []byte, command CommandV1) ([]byte, error) {
-	total, err := measureCommandV1(command)
+func AppendCommand(dst []byte, command Command) ([]byte, error) {
+	total, err := measureCommand(command)
 	if err != nil {
 		return dst, err
 	}
@@ -159,7 +159,7 @@ func AppendCommandV1(dst []byte, command CommandV1) ([]byte, error) {
 	frame := dst[start:]
 
 	copy(frame[0:8], commandMagic[:])
-	appendU16(frame, 8, CommandFormatV1)
+	appendU16(frame, 8, commandCodecFormat)
 	frame[10] = commandKindMutationBatch
 	appendU16(frame, 12, commandHeaderBytes)
 	appendU32(frame, 16, uint32(total))
@@ -209,7 +209,7 @@ func AppendCommandV1(dst []byte, command CommandV1) ([]byte, error) {
 	return dst, nil
 }
 
-func commandOverlapsAppendRegion(dst []byte, total int, command CommandV1) bool {
+func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 	region := writableAppendRegion(dst, total)
 	if len(region) == 0 {
 		return false
@@ -229,8 +229,8 @@ func commandOverlapsAppendRegion(dst []byte, total int, command CommandV1) bool 
 	return false
 }
 
-func measureCommandV1(command CommandV1) (int, error) {
-	if err := validateCommandHeaderV1(command); err != nil {
+func measureCommand(command Command) (int, error) {
+	if err := validateCommandHeader(command); err != nil {
 		return 0, err
 	}
 	total := uint64(commandHeaderBytes + envelopeChecksumBytes)
@@ -246,7 +246,7 @@ func measureCommandV1(command CommandV1) (int, error) {
 	}
 	for index := range command.Mutations {
 		mutation := &command.Mutations[index]
-		if err := validateMutationV1(*mutation); err != nil {
+		if err := validateMutation(*mutation); err != nil {
 			return 0, err
 		}
 		var ok bool
@@ -264,7 +264,7 @@ func measureCommandV1(command CommandV1) (int, error) {
 	return int(total), nil
 }
 
-func validateCommandHeaderV1(command CommandV1) error {
+func validateCommandHeader(command Command) error {
 	if !nonzero128(command.ClusterID) || !nonzero128(command.ClusterIncarnation) ||
 		!nonzero128(command.ShardIncarnation) || !nonzero128(command.GroupID) ||
 		!nonzero128(command.ClientID) {
@@ -309,7 +309,7 @@ func validateTextIdentity(field, value string, limit int) error {
 	return nil
 }
 
-func validateMutationV1(mutation Mutation) error {
+func validateMutation(mutation Mutation) error {
 	if len(mutation.Key) == 0 || len(mutation.Key) > MaxMutationKeyBytes {
 		return semantic("mutation key length")
 	}
@@ -328,46 +328,46 @@ func validateMutationV1(mutation Mutation) error {
 	return nil
 }
 
-// OpenCommandV1 validates one exact command envelope and returns a borrowed
+// OpenCommand validates one exact command envelope and returns a borrowed
 // view. It performs no allocation on valid input.
-func OpenCommandV1(src []byte) (CommandViewV1, error) {
+func OpenCommand(src []byte) (CommandView, error) {
 	if len(src) < commandHeaderBytes+envelopeChecksumBytes {
-		return CommandViewV1{}, corrupt("short command")
+		return CommandView{}, corrupt("short command")
 	}
 	if len(src) > MaxCommandBytes {
-		return CommandViewV1{}, ErrEnvelopeTooLarge
+		return CommandView{}, ErrEnvelopeTooLarge
 	}
 	if !bytes.Equal(src[:8], commandMagic[:]) {
-		return CommandViewV1{}, corrupt("command magic")
+		return CommandView{}, corrupt("command magic")
 	}
-	version := binary.LittleEndian.Uint16(src[8:10])
-	if version != CommandFormatV1 {
-		return CommandViewV1{}, unsupported("command", version)
+	format := binary.LittleEndian.Uint16(src[8:10])
+	if format != commandCodecFormat {
+		return CommandView{}, unsupported("command", format)
 	}
 	if binary.LittleEndian.Uint16(src[12:14]) != commandHeaderBytes {
-		return CommandViewV1{}, corrupt("command header size")
+		return CommandView{}, corrupt("command header size")
 	}
 	total := binary.LittleEndian.Uint32(src[16:20])
 	bodyBytes := binary.LittleEndian.Uint32(src[20:24])
 	if uint64(total) != uint64(len(src)) ||
 		uint64(bodyBytes)+commandHeaderBytes+envelopeChecksumBytes != uint64(total) {
-		return CommandViewV1{}, corrupt("command total or body length")
+		return CommandView{}, corrupt("command total or body length")
 	}
 	if err := verifyEnvelopeChecksum(src); err != nil {
-		return CommandViewV1{}, err
+		return CommandView{}, err
 	}
 	if src[10] != commandKindMutationBatch || src[11] != 0 ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
 		binary.LittleEndian.Uint32(src[28:32]) != 0 ||
 		!allZero(src[248:256]) {
-		return CommandViewV1{}, semantic("command kind, flags, or reserved bytes")
+		return CommandView{}, semantic("command kind, flags, or reserved bytes")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
 	if count == 0 || uint64(count) > MaxMutations {
-		return CommandViewV1{}, semantic("mutation count")
+		return CommandView{}, semantic("mutation count")
 	}
 
-	var view CommandViewV1
+	var view CommandView
 	copy(view.ClusterID[:], src[32:48])
 	copy(view.ClusterIncarnation[:], src[48:64])
 	view.TopologyRecoveryEpoch = binary.LittleEndian.Uint64(src[64:72])
@@ -397,7 +397,7 @@ func OpenCommandV1(src []byte) (CommandViewV1, error) {
 		distributionLen == 0 || distributionLen > MaxIdentityBytes ||
 		shardLen == 0 || shardLen > MaxIdentityBytes || collectionLen == 0 ||
 		identityBytes < 0 || identityBytes > bodyEnd-commandHeaderBytes {
-		return CommandViewV1{}, semantic("command identity lengths")
+		return CommandView{}, semantic("command identity lengths")
 	}
 	cursor := commandHeaderBytes
 	end := cursor + tenantLen
@@ -414,14 +414,14 @@ func OpenCommandV1(src []byte) (CommandViewV1, error) {
 	cursor = end
 	if !utf8.Valid(view.Distribution) || !utf8.Valid(view.Shard) ||
 		!utf8.Valid(view.Collection) {
-		return CommandViewV1{}, semantic("command text identity is not valid UTF-8")
+		return CommandView{}, semantic("command text identity is not valid UTF-8")
 	}
 	if err := validateDecodedCommandScalars(view); err != nil {
-		return CommandViewV1{}, err
+		return CommandView{}, err
 	}
 	mutations := src[cursor:bodyEnd:bodyEnd]
-	if err := validateMutationBytesV1(mutations, count); err != nil {
-		return CommandViewV1{}, err
+	if err := validateMutationBytes(mutations, count); err != nil {
+		return CommandView{}, err
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationBytes = mutations
@@ -429,7 +429,7 @@ func OpenCommandV1(src []byte) (CommandViewV1, error) {
 	return view, nil
 }
 
-func validateDecodedCommandScalars(view CommandViewV1) error {
+func validateDecodedCommandScalars(view CommandView) error {
 	if !nonzero128(view.ClusterID) || !nonzero128(view.ClusterIncarnation) ||
 		!nonzero128(view.ShardIncarnation) || !nonzero128(view.GroupID) ||
 		!nonzero128(view.ClientID) || !nonzeroDigest(view.Fingerprint) {
@@ -446,7 +446,7 @@ func validateDecodedCommandScalars(view CommandViewV1) error {
 	return nil
 }
 
-func validateMutationBytesV1(src []byte, count uint32) error {
+func validateMutationBytes(src []byte, count uint32) error {
 	cursor := 0
 	for index := uint32(0); index < count; index++ {
 		if len(src)-cursor < mutationHeaderBytes {

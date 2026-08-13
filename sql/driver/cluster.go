@@ -214,7 +214,7 @@ func (c *conn) routeInsertStagedWithBinding(
 	return nil
 }
 
-// routeUpdate enforces version 1's write rules for a placed whole-document
+// routeUpdate enforces the current write rules for a placed whole-document
 // UPDATE: its predicate must resolve to exactly one physical shard, and the
 // replacement document must not move the row to another shard. It is a no-op for
 // an unplaced table or a non-cluster connection.
@@ -236,7 +236,7 @@ func (c *conn) routeUpdate(statement *query.DMLStatement, args []any, document [
 	return err
 }
 
-// routeDelete enforces version 1's single-shard-only rule for a placed DELETE:
+// routeDelete enforces the current single-shard-only rule for a placed DELETE:
 // its predicate must resolve to exactly one physical shard. It is a no-op for an
 // unplaced table or a non-cluster connection.
 func (c *conn) routeDelete(statement *query.DMLStatement, args []any) error {

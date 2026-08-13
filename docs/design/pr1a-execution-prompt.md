@@ -6,7 +6,7 @@ implementation ladder described in
 
 ---
 
-Implement **PR 1a — Frozen placement scalars and tuple codec v1** from:
+Implement **PR 1a — Frozen placement scalars and tuple codec** from:
 
 ```text
 docs/design/vitess-compatible-routing.md
@@ -36,7 +36,7 @@ Scope is only:
 
 - closed placement scalar set: `String` and exact `Number`;
 - frozen canonical scalar encoding;
-- frozen ordered tuple codec version 1;
+- frozen ordered tuple codec;
 - immutable golden vectors;
 - fuzz tests;
 - benchmarks;

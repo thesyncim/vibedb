@@ -14,34 +14,28 @@ import (
 )
 
 const (
-	// ResultFormatMutationV1 is the fixed, empty-payload result grammar used by
-	// this low-level unconditional mutation adapter.
-	ResultFormatMutationV1 uint16 = 1
+	// ResultFormatMutation is the fixed, empty-payload result grammar used by
+	// this low-level unconditional mutation adapter. It includes every closed
+	// result below, including the deterministic wrong-shard refusal.
+	ResultFormatMutation uint16 = 1
 
-	// These explicit values freeze the legacy grammar. In v1's original const
-	// block ResultFormatMutationV1 occupied iota zero, so code zero was never a
-	// valid result.
+	// Zero and unknown result codes are invalid.
 	ResultApplied           uint32 = 1
 	ResultStaleFence        uint32 = 2
 	ResultUnknownCollection uint32 = 3
 	ResultInvalidDocument   uint32 = 4
 	ResultTargetBound       uint32 = 5
-
-	// ResultFormatMutationV2 extends the empty-payload mutation result grammar
-	// with an explicit deterministic wrong-shard refusal. V1 remains frozen and
-	// does not accept the added result code.
-	ResultFormatMutationV2 uint16 = 2
-	ResultWrongShard       uint32 = 6
+	ResultWrongShard        uint32 = 6
 
 	// MaxStateEnvelopeBytes and MaxCompletionRecordBytes bound the two binary
 	// records before their canonical hexadecimal JSON wrapping.
 	MaxStateEnvelopeBytes           = 64 << 10
 	MaxCompletionRecordBytes        = 256 << 10
-	MaxRetainedCompletionsV1        = 1 << 20
+	MaxRetainedCompletions          = 1 << 20
 	MaxStaticBootstrapBytes         = 1 << 20
 	MaxStaticBootstrapEnvelopeBytes = MaxStaticBootstrapBytes + MaxStateEnvelopeBytes
-	MaxDistinctMutationsV1          = 64
-	MaxStaticBootstrapMembersV1     = 64
+	MaxDistinctMutations            = 64
+	MaxStaticBootstrapMembers       = 64
 )
 
 var (
@@ -58,7 +52,7 @@ var (
 	ErrApplyPoisoned        = errors.New("replicatedstate: machine is poisoned; reopen required")
 	ErrStaticSnapshotOnly   = errors.New("replicatedstate: only the exact static bootstrap snapshot is supported")
 	ErrAdmissionBound       = errors.New("replicatedstate: command exceeds the frozen apply profile")
-	ErrSchemaProfile        = errors.New("replicatedstate: v1 requires a schema-free JSON collection")
+	ErrSchemaProfile        = errors.New("replicatedstate: requires a schema-free JSON collection")
 	ErrInconsistentSnapshot = errors.New("replicatedstate: coherent snapshot disagrees with publication")
 	ErrCodecAlias           = errors.New("replicatedstate: codec input aliases destination append region")
 )
@@ -108,18 +102,14 @@ func (b Binding) validate() error {
 type ValidationProfile uint8
 
 const (
-	// ValidationSchemaFreeJSONV1 is the legacy schema-free JSON profile. It
+	// ValidationSchemaFreeJSON is reserved for the hidden system collection. It
 	// requires a zero ValidationDigest and no MutationValidator.
-	ValidationSchemaFreeJSONV1 ValidationProfile = 1
+	ValidationSchemaFreeJSON ValidationProfile = 1
 
-	// ValidationDeterministicMutationV1 adds a caller-supplied deterministic
-	// mutation contract to the schema-free JSON profile. It requires a nonzero
-	// ValidationDigest and a non-nil MutationValidator.
-	ValidationDeterministicMutationV1 ValidationProfile = 2
-
-	// ValidationDeterministicMutationV2 retains V1 validation and adds the
-	// explicit wrong-shard outcome carried by ResultFormatMutationV2.
-	ValidationDeterministicMutationV2 ValidationProfile = 3
+	// ValidationDeterministicMutation adds a caller-supplied deterministic
+	// mutation contract, including explicit wrong-shard refusals. It requires a
+	// nonzero ValidationDigest and a non-nil MutationValidator.
+	ValidationDeterministicMutation ValidationProfile = 2
 )
 
 // MutationValidation is the closed result grammar returned by a
@@ -134,9 +124,8 @@ const (
 )
 
 // MutationValidator supplies the deterministic application-specific portion
-// of ValidationDeterministicMutationV1 and ValidationDeterministicMutationV2.
-// Implementations must be pure for a fixed ValidationDigest and must not
-// retain any input slices. WrongShard is legal only under V2.
+// of ValidationDeterministicMutation. Implementations must be pure for a fixed
+// ValidationDigest and must not retain any input slices.
 //
 // ValidatePut is also used to validate every existing row during Open.
 // ValidateDelete receives the current snapshot value when found is true and a
@@ -191,7 +180,7 @@ type CollectionTarget struct {
 	Limits                 CollectionLimits
 }
 
-// UserCollection is the single logical collection owned by a v1 Machine.
+// UserCollection is the single logical collection owned by a Machine.
 type UserCollection struct {
 	Name   string
 	Target CollectionTarget
@@ -204,11 +193,11 @@ func (t CollectionTarget) validate() error {
 	}
 	zeroDigest := t.ValidationDigest == ([32]byte{})
 	switch t.Validation {
-	case ValidationSchemaFreeJSONV1:
+	case ValidationSchemaFreeJSON:
 		if !zeroDigest || t.Validator != nil {
-			return fmt.Errorf("%w: legacy validation requires zero digest and no validator", ErrInvalidCollection)
+			return fmt.Errorf("%w: schema-free validation requires zero digest and no validator", ErrInvalidCollection)
 		}
-	case ValidationDeterministicMutationV1, ValidationDeterministicMutationV2:
+	case ValidationDeterministicMutation:
 		if zeroDigest || t.Validator == nil {
 			return fmt.Errorf("%w: deterministic validation requires digest and validator", ErrInvalidCollection)
 		}
@@ -237,7 +226,7 @@ type Options struct {
 }
 
 func (o Options) validate() error {
-	if o.MaxCompletions == 0 || o.MaxCompletions > MaxRetainedCompletionsV1 ||
+	if o.MaxCompletions == 0 || o.MaxCompletions > MaxRetainedCompletions ||
 		o.TxnLimits.MaxCollections < 2 ||
 		o.TxnLimits.MaxDocuments < 3 || o.TxnLimits.MaxBytes <= 0 {
 		return ErrInvalidOptions

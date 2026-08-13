@@ -15,7 +15,7 @@ import (
 // collision-sensitive request field. A conflict returns the original exact
 // completion together with a typed RequestConflictError.
 func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
-	command, err := replication.OpenCommandV1(data)
+	command, err := replication.OpenCommand(data)
 	if err != nil {
 		return CompletionLookup{}, err
 	}
@@ -37,7 +37,7 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	if !ok || snapshot == nil {
 		return CompletionLookup{}, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
 	}
-	digest := CompletionKeyV1(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
+	digest := CompletionKey(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
 	key := completionStorageKey(digest)
 	record, found, readErr := completionAt(snapshot, key)
 	err = errors.Join(readErr, cut.Close())
@@ -47,7 +47,7 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	if !found {
 		return CompletionLookup{}, ErrCompletionNotFound
 	}
-	completion, err := replication.OpenCompletionV1(record.Completion)
+	completion, err := replication.OpenCompletion(record.Completion)
 	if err != nil {
 		return CompletionLookup{}, m.fail(fmt.Errorf("%w: %v", ErrCompletionCorrupt, err))
 	}
@@ -72,16 +72,16 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 type ReadSnapshot struct {
 	cut         durable.DatabaseSnapshot
 	publication raftmodel.Publication
-	state       StateV1
+	state       State
 	userName    string
 	once        sync.Once
 	closeErr    error
 }
 
 // State returns the complete durable state record paired with this cut.
-func (s *ReadSnapshot) State() StateV1 {
+func (s *ReadSnapshot) State() State {
 	if s == nil {
-		return StateV1{}
+		return State{}
 	}
 	return cloneState(s.state)
 }
@@ -135,7 +135,7 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 		return nil, err
 	}
 	if len(names) > 1 || len(names) == 1 && names[0] != m.userName {
-		return nil, fmt.Errorf("%w: v1 snapshot names", ErrInvalidCollection)
+		return nil, fmt.Errorf("%w: snapshot names", ErrInvalidCollection)
 	}
 	cut, systemSnapshot, userSnapshot, err := m.captureApplyCutLocked()
 	if err != nil {
@@ -159,7 +159,7 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 			return nil, m.fail(errors.Join(err, cut.Close()))
 		}
 	}
-	logical, err := logicalDigestV1(
+	logical, err := logicalDigest(
 		m.userName, m.user.Validation, m.user.ValidationDigest, m.user.Validator,
 		userSnapshot, nil,
 	)

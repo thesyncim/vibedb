@@ -1,6 +1,6 @@
 package distribution
 
-// This file loads testdata/tuple_v1_vectors.txt — the frozen tuple codec v1
+// This file loads testdata/tuple_vectors.txt — the current tuple codec
 // golden vectors — and asserts every one byte-for-byte against the live
 // codec. See that file's header for the grammar and for why it must never be
 // edited to make a failing assertion pass: a mismatch here means the
@@ -56,10 +56,10 @@ func splitFields(line string, n int) ([]string, string) {
 	return out, strings.TrimSpace(rest)
 }
 
-// loadGoldenVectors parses testdata/tuple_v1_vectors.txt.
+// loadGoldenVectors parses testdata/tuple_vectors.txt.
 func loadGoldenVectors(t *testing.T) ([]goldenRecord, []goldenDistinct) {
 	t.Helper()
-	f, err := os.Open("testdata/tuple_v1_vectors.txt")
+	f, err := os.Open("testdata/tuple_vectors.txt")
 	if err != nil {
 		t.Fatalf("open golden vectors: %v", err)
 	}
@@ -143,12 +143,12 @@ func decodeGoldenHex(t *testing.T, lineNo int, h string) []byte {
 	return b
 }
 
-// TestTupleV1GoldenVectors is the byte-for-byte load-and-assert test required
+// TestTupleGoldenVectors is the byte-for-byte load-and-assert test required
 // alongside the frozen fixture: every NUMBER/STRING/TUPLE record must
-// reproduce its recorded bytes from the live V1 codec, every equivalence
+// reproduce its recorded bytes from the live current codec, every equivalence
 // group's members must share identical bytes, and every DISTINCT pair must
 // differ.
-func TestTupleV1GoldenVectors(t *testing.T) {
+func TestTupleGoldenVectors(t *testing.T) {
 	records, distincts := loadGoldenVectors(t)
 
 	scalarsByName := make(map[string]Scalar)
@@ -163,7 +163,7 @@ func TestTupleV1GoldenVectors(t *testing.T) {
 			if err != nil {
 				t.Fatalf("line %d: NewNumber(%q): %v", r.lineNo, spelling, err)
 			}
-			got, err := V1.AppendScalar(nil, s)
+			got, err := CurrentTupleCodec.AppendScalar(nil, s)
 			if err != nil {
 				t.Fatalf("line %d: AppendScalar(%s=%q): %v", r.lineNo, r.name, spelling, err)
 			}
@@ -177,7 +177,7 @@ func TestTupleV1GoldenVectors(t *testing.T) {
 		case "STRING":
 			raw := r.elems[0]
 			s := NewString(raw)
-			got, err := V1.AppendScalar(nil, s)
+			got, err := CurrentTupleCodec.AppendScalar(nil, s)
 			if err != nil {
 				t.Fatalf("line %d: AppendScalar(%s=%q): %v", r.lineNo, r.name, raw, err)
 			}
@@ -199,7 +199,7 @@ func TestTupleV1GoldenVectors(t *testing.T) {
 				values[i] = s
 				concat = append(concat, bytesByName[elem]...)
 			}
-			got, err := V1.AppendTuple(nil, values)
+			got, err := CurrentTupleCodec.AppendTuple(nil, values)
 			if err != nil {
 				t.Fatalf("line %d: AppendTuple(%s): %v", r.lineNo, r.name, err)
 			}
@@ -256,11 +256,11 @@ func TestTupleV1GoldenVectors(t *testing.T) {
 	t.Logf("checked %d records (%d equivalence groups, %d distinct pairs)", len(records), len(groupMembers), len(distincts))
 }
 
-// TestTupleV1GoldenVectorsFileIsClean is a light sanity check on the fixture
+// TestTupleGoldenVectorsFileIsClean is a light sanity check on the fixture
 // itself: every hex column decodes, and record names are unique so a typo
 // in a TUPLE element list fails loudly rather than silently resolving to the
 // wrong scalar.
-func TestTupleV1GoldenVectorsFileIsClean(t *testing.T) {
+func TestTupleGoldenVectorsFileIsClean(t *testing.T) {
 	records, _ := loadGoldenVectors(t)
 	seen := make(map[string]int)
 	for _, r := range records {

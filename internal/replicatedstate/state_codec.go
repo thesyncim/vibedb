@@ -13,14 +13,14 @@ import (
 )
 
 const (
-	stateFormatV1     = uint16(1)
+	stateCodecFormat  = uint16(1)
 	stateHeaderBytes  = 296
 	recordChecksumLen = sha256.Size
 )
 
 var (
 	stateMagic          = [8]byte{'V', 'D', 'B', 'R', 'S', 'M', 0, 0}
-	stateChecksumDomain = []byte("vibedb/replicated-state/state-checksum/v1\x00")
+	stateChecksumDomain = []byte("vibedb/replicated-state/state-checksum\x00")
 	jsonHex             = []byte("0123456789abcdef")
 )
 
@@ -33,8 +33,8 @@ const (
 	RecordConfiguration  RecordKind = 3
 )
 
-// StateV1 is the exact durable publication stored at the fixed state key.
-type StateV1 struct {
+// State is the exact durable publication stored at the fixed state key.
+type State struct {
 	Binding           Binding
 	Applied           uint64
 	LastTerm          uint64
@@ -48,12 +48,12 @@ type StateV1 struct {
 	CompletionCount   uint64
 }
 
-// AppendStateV1 appends one strict binary StateV1 envelope. On error dst is
+// AppendState appends one strict binary State envelope. On error dst is
 // unchanged. Input strings must not overlap the writable append region in
 // dst's current backing array; such aliases are rejected before dst is
 // modified. Aliases into an old backing array are safe when append relocates.
-func AppendStateV1(dst []byte, state StateV1) ([]byte, error) {
-	if err := validateStateV1(state); err != nil {
+func AppendState(dst []byte, state State) ([]byte, error) {
+	if err := validateState(state); err != nil {
 		return dst, err
 	}
 	conf, err := proto.MarshalOptions{Deterministic: true}.Marshal(state.ConfState)
@@ -74,7 +74,7 @@ func AppendStateV1(dst []byte, state StateV1) ([]byte, error) {
 	dst = append(dst, make([]byte, total)...)
 	frame := dst[start:]
 	copy(frame[0:8], stateMagic[:])
-	binary.LittleEndian.PutUint16(frame[8:10], stateFormatV1)
+	binary.LittleEndian.PutUint16(frame[8:10], stateCodecFormat)
 	frame[10] = byte(state.LastKind)
 	frame[11] = byte(state.LastEntryType)
 	binary.LittleEndian.PutUint16(frame[12:14], stateHeaderBytes)
@@ -110,23 +110,23 @@ func AppendStateV1(dst []byte, state StateV1) ([]byte, error) {
 	return dst, nil
 }
 
-// OpenStateV1 strictly decodes one complete StateV1 envelope.
-func OpenStateV1(src []byte) (StateV1, error) {
+// OpenState strictly decodes one complete State envelope.
+func OpenState(src []byte) (State, error) {
 	if len(src) < stateHeaderBytes+recordChecksumLen || len(src) > MaxStateEnvelopeBytes {
-		return StateV1{}, fmt.Errorf("%w: state length", ErrStateCorrupt)
+		return State{}, fmt.Errorf("%w: state length", ErrStateCorrupt)
 	}
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
-		binary.LittleEndian.Uint16(src[8:10]) != stateFormatV1 ||
+		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
 		binary.LittleEndian.Uint16(src[12:14]) != stateHeaderBytes ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[288:296]) {
-		return StateV1{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
+		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
 	total64 := uint64(binary.LittleEndian.Uint32(src[16:20]))
 	body64 := uint64(binary.LittleEndian.Uint32(src[20:24]))
 	if total64 != uint64(len(src)) ||
 		body64 != uint64(len(src)-stateHeaderBytes-recordChecksumLen) ||
 		!verifyRecord(src, stateChecksumDomain) {
-		return StateV1{}, fmt.Errorf("%w: state size or checksum", ErrStateCorrupt)
+		return State{}, fmt.Errorf("%w: state size or checksum", ErrStateCorrupt)
 	}
 	distributionLen64 := uint64(binary.LittleEndian.Uint16(src[280:282]))
 	shardLen64 := uint64(binary.LittleEndian.Uint16(src[282:284]))
@@ -134,10 +134,10 @@ func OpenStateV1(src []byte) (StateV1, error) {
 	if distributionLen64+shardLen64+confLen64 != body64 || confLen64 == 0 ||
 		distributionLen64 > uint64(len(src)) || shardLen64 > uint64(len(src)) ||
 		confLen64 > uint64(len(src)) {
-		return StateV1{}, fmt.Errorf("%w: state body lengths", ErrStateCorrupt)
+		return State{}, fmt.Errorf("%w: state body lengths", ErrStateCorrupt)
 	}
 	distributionLen, shardLen, confLen := int(distributionLen64), int(shardLen64), int(confLen64)
-	var state StateV1
+	var state State
 	state.LastKind = RecordKind(src[10])
 	state.LastEntryType = pb.EntryType(src[11])
 	state.Applied = binary.LittleEndian.Uint64(src[24:32])
@@ -167,20 +167,20 @@ func OpenStateV1(src []byte) (StateV1, error) {
 	confBytes := src[cursor : cursor+confLen]
 	conf := new(pb.ConfState)
 	if err := proto.Unmarshal(confBytes, conf); err != nil || len(conf.ProtoReflect().GetUnknown()) != 0 {
-		return StateV1{}, fmt.Errorf("%w: ConfState", ErrStateCorrupt)
+		return State{}, fmt.Errorf("%w: ConfState", ErrStateCorrupt)
 	}
 	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(conf)
 	if err != nil || !bytes.Equal(canonical, confBytes) {
-		return StateV1{}, fmt.Errorf("%w: noncanonical ConfState", ErrStateCorrupt)
+		return State{}, fmt.Errorf("%w: noncanonical ConfState", ErrStateCorrupt)
 	}
 	state.ConfState = conf
-	if err := validateStateV1(state); err != nil {
-		return StateV1{}, err
+	if err := validateState(state); err != nil {
+		return State{}, err
 	}
 	return state, nil
 }
 
-func validateStateV1(state StateV1) error {
+func validateState(state State) error {
 	if err := state.Binding.validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrStateCorrupt, err)
 	}
@@ -300,17 +300,17 @@ func cloneConfState(state *pb.ConfState) *pb.ConfState {
 	return proto.Clone(state).(*pb.ConfState)
 }
 
-func equalStatePublication(state StateV1, applied uint64, digest [32]byte, conf *pb.ConfState, version uint64) bool {
+func equalStatePublication(state State, applied uint64, digest [32]byte, conf *pb.ConfState, version uint64) bool {
 	return state.Applied == applied && state.LogicalDigest == digest &&
 		state.ReplicaSetVersion == version && proto.Equal(state.ConfState, conf)
 }
 
-func cloneState(state StateV1) StateV1 {
+func cloneState(state State) State {
 	state.ConfState = cloneConfState(state.ConfState)
 	return state
 }
 
-func equalState(left, right StateV1) bool {
+func equalState(left, right State) bool {
 	return left.Binding == right.Binding && left.Applied == right.Applied &&
 		left.LastTerm == right.LastTerm && left.LastKind == right.LastKind &&
 		left.LastEntryType == right.LastEntryType &&

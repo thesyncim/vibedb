@@ -28,23 +28,17 @@ func testReplicatedApplyOptions() ReplicatedApplyOptions {
 		MaxCompletions: 128,
 		TxnLimits:      defaultDriverTxnLimits(),
 		Placement: ReplicatedPlacementProfile{
-			Format: ReplicatedPlacementProfileV1, ShardKey: "/id",
-			TupleVersion: distribution.TupleVersion1, MapperVersion: distribution.NativeMapperVersion,
+			Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
+			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
 	}
 }
 
-func testReplicatedApplyOptionsV1() ReplicatedApplyOptions {
-	options := testReplicatedApplyOptions()
-	options.Placement = ReplicatedPlacementProfile{}
-	return options
-}
-
 func testReplicatedApplyBootstrap() *pb.Snapshot {
 	index, term := uint64(1), uint64(1)
 	return &pb.Snapshot{
-		Data: []byte("sql-replicated-apply-bootstrap-v1"),
+		Data: []byte("sql-replicated-apply-bootstrap"),
 		Metadata: &pb.SnapshotMetadata{
 			Index: &index, Term: &term,
 			ConfState: &pb.ConfState{Voters: []uint64{1}},
@@ -72,7 +66,7 @@ func testReplicatedApplyCommand(
 ) []byte {
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x4a})
 	binding := identity.Binding
-	command, err := replication.AppendCommandV1(nil, replication.CommandV1{
+	command, err := replication.AppendCommand(nil, replication.Command{
 		ClusterID:             replication.ID128(binding.ClusterID),
 		ClusterIncarnation:    replication.ID128(binding.ClusterIncarnation),
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
@@ -165,9 +159,9 @@ func completionResult(
 	if err != nil {
 		t.Fatalf("LookupCompletion: %v", err)
 	}
-	completion, err := replication.OpenCompletionV1(lookup.Bytes)
+	completion, err := replication.OpenCompletion(lookup.Bytes)
 	if err != nil {
-		t.Fatalf("OpenCompletionV1: %v", err)
+		t.Fatalf("OpenCompletion: %v", err)
 	}
 	return completion.ResultCode, completion.ResultFormat
 }
@@ -182,7 +176,7 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	}
 
 	want := ReplicatedApplyCapacityProfile{
-		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormatV2,
+		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
 		MaxCompletions: options.MaxCompletions,
 	}
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
@@ -237,9 +231,9 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenReplicatedApply: %v", err)
 	}
-	if identity.Format != ReplicatedApplyFormatV2 || identity.Storage == "" ||
+	if identity.Format != ReplicatedApplyFormat || identity.Storage == "" ||
 		identity.ValidationDigest == ([32]byte{}) || identity.Placement != options.Placement ||
-		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutationV2) ||
+		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) ||
 		identity.TxnLimits != options.TxnLimits || identity.MaxCompletions != options.MaxCompletions {
 		t.Fatalf("apply identity = %+v", identity)
 	}
@@ -277,8 +271,8 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if got := completionResultCode(t, claim, valid); got != replicatedstate.ResultApplied {
 		t.Fatalf("valid result = %d, want applied", got)
 	}
-	if _, format := completionResult(t, claim, valid); format != replicatedstate.ResultFormatMutationV2 {
-		t.Fatalf("valid result format = %d, want v2", format)
+	if _, format := completionResult(t, claim, valid); format != replicatedstate.ResultFormatMutation {
+		t.Fatalf("valid result format = %d, want current format", format)
 	}
 	if after := core.tables["docs"].conflicts.observe(); after <= beforeClock {
 		t.Fatalf("conflict clock did not advance: before=%d after=%d", beforeClock, after)
@@ -489,7 +483,7 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), insidePut); err != nil {
 		t.Fatal(err)
 	}
-	if code, format := completionResult(t, claim, insidePut); code != replicatedstate.ResultApplied || format != replicatedstate.ResultFormatMutationV2 {
+	if code, format := completionResult(t, claim, insidePut); code != replicatedstate.ResultApplied || format != replicatedstate.ResultFormatMutation {
 		t.Fatalf("range start completion = code %d format %d", code, format)
 	}
 
@@ -512,7 +506,7 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 		if _, err := claim.ApplyNormal(testReplicatedApplyMeta(sequence+1), command); err != nil {
 			t.Fatal(err)
 		}
-		if code, format := completionResult(t, claim, command); code != replicatedstate.ResultWrongShard || format != replicatedstate.ResultFormatMutationV2 {
+		if code, format := completionResult(t, claim, command); code != replicatedstate.ResultWrongShard || format != replicatedstate.ResultFormatMutation {
 			t.Fatalf("wrong-shard %s completion = code %d format %d", probe.id, code, format)
 		}
 	}
@@ -526,7 +520,7 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), absentUpper); err != nil {
 		t.Fatal(err)
 	}
-	if code, format := completionResult(t, claim, absentUpper); code != replicatedstate.ResultWrongShard || format != replicatedstate.ResultFormatMutationV2 {
+	if code, format := completionResult(t, claim, absentUpper); code != replicatedstate.ResultWrongShard || format != replicatedstate.ResultFormatMutation {
 		t.Fatalf("absent wrong-shard DELETE = code %d format %d", code, format)
 	}
 
@@ -812,7 +806,7 @@ func TestReplicatedApplyPreflightAndPreRecoveryFences(t *testing.T) {
 	t.Run("reserved name before mutation", func(t *testing.T) {
 		_, database, base := bindReplicatedApplyTestRoot(t, "reserved-apply")
 		reserved := base
-		reserved.UserTable = replicatedstate.SystemCollectionNameV1
+		reserved.UserTable = replicatedstate.SystemCollectionName
 		claim, identity, err := database.OpenReplicatedApply(
 			reserved, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 		)
@@ -1100,7 +1094,7 @@ func TestReplicatedApplyIdentityStrictGrammar(t *testing.T) {
 	tests = append(tests, struct {
 		name string
 		raw  []byte
-	}{"v2_missing_placement", missingPlacementRaw})
+	}{"missing_placement", missingPlacementRaw})
 
 	var placementFields map[string]json.RawMessage
 	if err := json.Unmarshal(fields["placement"], &placementFields); err != nil {
@@ -1142,16 +1136,26 @@ func TestReplicatedApplyIdentityStrictGrammar(t *testing.T) {
 			raw  []byte
 		}{test.name, caseRaw})
 	}
-	v1WithPlacement := make(map[string]json.RawMessage, len(fields))
+	unsupportedFormat := make(map[string]json.RawMessage, len(fields))
 	for name, value := range fields {
-		v1WithPlacement[name] = bytes.Clone(value)
+		unsupportedFormat[name] = bytes.Clone(value)
 	}
-	v1WithPlacement["format"] = []byte("1")
-	v1WithPlacementRaw, _ := json.Marshal(v1WithPlacement)
+	unsupportedFormat["format"] = []byte("2")
+	unsupportedFormatRaw, _ := json.Marshal(unsupportedFormat)
 	tests = append(tests, struct {
 		name string
 		raw  []byte
-	}{"v1_forbids_placement", v1WithPlacementRaw})
+	}{"unsupported_format", unsupportedFormatRaw})
+	unsupportedValidation := make(map[string]json.RawMessage, len(fields))
+	for name, value := range fields {
+		unsupportedValidation[name] = bytes.Clone(value)
+	}
+	unsupportedValidation["validation_profile"] = []byte("3")
+	unsupportedValidationRaw, _ := json.Marshal(unsupportedValidation)
+	tests = append(tests, struct {
+		name string
+		raw  []byte
+	}{"unsupported_validation_profile", unsupportedValidationRaw})
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var decoded ReplicatedApplyIdentity
@@ -1338,21 +1342,7 @@ func TestReplicatedApplyConcurrentClaimRetirement(t *testing.T) {
 	_ = database.Close()
 }
 
-func TestReplicatedApplyProfileDigestV1Golden(t *testing.T) {
-	identity := ReplicatedShardStoreIdentity{
-		UserTable: "docs", UserPrimaryKey: "/id",
-		UserLimits: ReplicatedShardStoreLimits{
-			MaxKeyBytes: 123, MaxDocumentBytes: 456,
-			MaxBatchDocuments: 7, MaxBatchBytes: 890,
-		},
-	}
-	got := replicatedApplyProfileDigest(identity)
-	if gotHex := hex.EncodeToString(got[:]); gotHex != "7ad36d42b2e030a1483d4e34b92a1a21e375eae6a28d68c02b745c3644def697" {
-		t.Fatalf("profile digest = %s", gotHex)
-	}
-}
-
-func TestReplicatedApplyProfileDigestV2GoldenAndBindings(t *testing.T) {
+func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 	identity := ReplicatedShardStoreIdentity{
 		Binding: ReplicatedShardStoreBinding{
 			Distribution: "dist", Shard: "shard", AllocationGeneration: 11,
@@ -1367,17 +1357,17 @@ func TestReplicatedApplyProfileDigestV2GoldenAndBindings(t *testing.T) {
 		},
 	}
 	placement := ReplicatedPlacementProfile{
-		Format: ReplicatedPlacementProfileV1, ShardKey: "/id",
-		TupleVersion: distribution.TupleVersion1, MapperVersion: distribution.NativeMapperVersion,
+		Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 		Range: distribution.KeyRange{
 			Start: distribution.KeyspacePoint{0x10},
 			End:   distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{0x90}},
 		},
 	}
-	got := replicatedApplyProfileDigestV2(identity, placement)
-	const wantDigest = "89d75e7034935dd12b6b1a25d35da064a8a8b81e901fa5a1d89be0916de09587"
+	got := replicatedApplyProfileDigest(identity, placement)
+	const wantDigest = "d336346fcf5512c29ec40bbb713d6fa7b7ce9228c3909ebad362cadbb0788c5f"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
-		t.Fatalf("v2 profile digest = %s, want %s", gotHex, wantDigest)
+		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
 
 	boundMutations := []func(*ReplicatedShardStoreIdentity, *ReplicatedPlacementProfile){
@@ -1401,7 +1391,7 @@ func TestReplicatedApplyProfileDigestV2GoldenAndBindings(t *testing.T) {
 	for index, mutate := range boundMutations {
 		changedIdentity, changedPlacement := identity, placement
 		mutate(&changedIdentity, &changedPlacement)
-		if digest := replicatedApplyProfileDigestV2(changedIdentity, changedPlacement); digest == got {
+		if digest := replicatedApplyProfileDigest(changedIdentity, changedPlacement); digest == got {
 			t.Fatalf("bound mutation %d did not change digest", index)
 		}
 	}
@@ -1414,56 +1404,20 @@ func TestReplicatedApplyProfileDigestV2GoldenAndBindings(t *testing.T) {
 	for index, mutate := range localMutations {
 		changed := identity
 		mutate(&changed)
-		if digest := replicatedApplyProfileDigestV2(changed, placement); digest != got {
+		if digest := replicatedApplyProfileDigest(changed, placement); digest != got {
 			t.Fatalf("member-local mutation %d changed digest: %x != %x", index, digest, got)
 		}
 	}
 }
 
-func TestReplicatedApplyIdentityV1JSONGolden(t *testing.T) {
+func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	var validationDigest [32]byte
 	for index := range validationDigest {
 		validationDigest[index] = byte(index)
 	}
 	identity := ReplicatedApplyIdentity{
-		Format: ReplicatedApplyFormatV1, Storage: "storage-v1",
-		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutationV1),
-		ValidationDigest:  validationDigest,
-		SystemLimits: ReplicatedShardStoreLimits{
-			MaxKeyBytes: 1, MaxDocumentBytes: 2, MaxBatchDocuments: 3, MaxBatchBytes: 4,
-		},
-		MaxCompletions: 5,
-		TxnLimits:      durable.TxnLimits{MaxCollections: 6, MaxDocuments: 7, MaxBytes: 8},
-	}
-	encoded, err := json.Marshal(identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const want = `{"format":1,"storage":"storage-v1","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":1,"max_document_bytes":2,"max_batch_documents":3,"max_batch_bytes":4},"max_completions":5,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8}`
-	if string(encoded) != want {
-		t.Fatalf("v1 identity JSON = %s, want %s", encoded, want)
-	}
-	metaEncoded, err := json.Marshal(replicatedApplyMetaFromIdentity(identity))
-	if err != nil || string(metaEncoded) != want {
-		t.Fatalf("v1 catalog meta JSON = %s,%v, want %s", metaEncoded, err, want)
-	}
-	if bytes.Contains(encoded, []byte("placement")) {
-		t.Fatalf("v1 identity JSON gained placement: %s", encoded)
-	}
-	var decoded ReplicatedApplyIdentity
-	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != identity {
-		t.Fatalf("v1 identity round trip = %+v,%v", decoded, err)
-	}
-}
-
-func TestReplicatedApplyIdentityV2JSONGolden(t *testing.T) {
-	var validationDigest [32]byte
-	for index := range validationDigest {
-		validationDigest[index] = byte(index)
-	}
-	identity := ReplicatedApplyIdentity{
-		Format: ReplicatedApplyFormatV2, Storage: "storage-v2",
-		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutationV2),
+		Format: ReplicatedApplyFormat, Storage: "storage",
+		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
 		ValidationDigest:  validationDigest,
 		SystemLimits: ReplicatedShardStoreLimits{
 			MaxKeyBytes: 1, MaxDocumentBytes: 2, MaxBatchDocuments: 3, MaxBatchBytes: 4,
@@ -1471,8 +1425,8 @@ func TestReplicatedApplyIdentityV2JSONGolden(t *testing.T) {
 		MaxCompletions: 5,
 		TxnLimits:      durable.TxnLimits{MaxCollections: 6, MaxDocuments: 7, MaxBytes: 8},
 		Placement: ReplicatedPlacementProfile{
-			Format: ReplicatedPlacementProfileV1, ShardKey: "/id",
-			TupleVersion:  distribution.TupleVersion1,
+			Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
+			TupleVersion:  distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion,
 			Range: distribution.KeyRange{
 				Start: distribution.KeyspacePoint{0x10},
@@ -1484,64 +1438,17 @@ func TestReplicatedApplyIdentityV2JSONGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"format":2,"storage":"storage-v2","validation_profile":3,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":1,"max_document_bytes":2,"max_batch_documents":3,"max_batch_bytes":4},"max_completions":5,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":1,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false}}`
+	const want = `{"format":1,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":1,"max_document_bytes":2,"max_batch_documents":3,"max_batch_bytes":4},"max_completions":5,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":1,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false}}`
 	if string(encoded) != want {
-		t.Fatalf("v2 identity JSON = %s, want %s", encoded, want)
+		t.Fatalf("identity JSON = %s, want %s", encoded, want)
 	}
 	metaEncoded, err := json.Marshal(replicatedApplyMetaFromIdentity(identity))
 	if err != nil || string(metaEncoded) != want {
-		t.Fatalf("v2 catalog meta JSON = %s,%v, want %s", metaEncoded, err, want)
+		t.Fatalf("catalog meta JSON = %s,%v, want %s", metaEncoded, err, want)
 	}
 	var decoded ReplicatedApplyIdentity
 	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != identity {
-		t.Fatalf("v2 identity round trip = %+v,%v", decoded, err)
-	}
-}
-
-func TestReplicatedApplyLegacyV1ActivationAndExactReopen(t *testing.T) {
-	path, database, base := bindReplicatedApplyTestRoot(t, "legacy-v1")
-	options := testReplicatedApplyOptionsV1()
-	bootstrap := testReplicatedApplyBootstrap()
-	claim, identity, err := database.OpenReplicatedApply(base, bootstrap, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if identity.Format != ReplicatedApplyFormatV1 || identity.Placement != (ReplicatedPlacementProfile{}) ||
-		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutationV1) {
-		t.Fatalf("legacy identity = %+v", identity)
-	}
-	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
-		t.Fatal(err)
-	}
-	document := []byte(`{"id":"legacy"}`)
-	command := testReplicatedApplyCommand(base, 1, replication.Mutation{
-		Kind: replication.MutationPut, Key: testReplicatedApplyKey(t, database, document), Value: document,
-	})
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); err != nil {
-		t.Fatal(err)
-	}
-	if code, format := completionResult(t, claim, command); code != replicatedstate.ResultApplied || format != replicatedstate.ResultFormatMutationV1 {
-		t.Fatalf("legacy completion = code %d format %d", code, format)
-	}
-	if err := claim.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenReplicatedShardStoreWithApply(path, base, identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedClaim, actual, err := reopened.OpenReplicatedApply(base, bootstrap, options)
-	if err != nil || actual != identity {
-		t.Fatalf("legacy exact reopen = %p,%+v,%v", reopenedClaim, actual, err)
-	}
-	if err := reopenedClaim.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("identity round trip = %+v,%v", decoded, err)
 	}
 }
 
@@ -1556,6 +1463,7 @@ func TestReplicatedApplyPlacementOptionsFailClosed(t *testing.T) {
 		name   string
 		mutate func(*ReplicatedPlacementProfile)
 	}{
+		{"zero", func(p *ReplicatedPlacementProfile) { *p = ReplicatedPlacementProfile{} }},
 		{"format", func(p *ReplicatedPlacementProfile) { p.Format++ }},
 		{"shard key", func(p *ReplicatedPlacementProfile) { p.ShardKey += "x" }},
 		{"tuple version", func(p *ReplicatedPlacementProfile) { p.TupleVersion++ }},

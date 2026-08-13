@@ -38,7 +38,7 @@ func testIdentity() Identity {
 }
 
 func testKey() Key {
-	key := Key{ID: "test-key-1", Wrapped: []byte("opaque-wrapped-key-v1")}
+	key := Key{ID: "test-key-1", Wrapped: []byte("opaque-wrapped-key")}
 	for index := range key.Material {
 		key.Material[index] = byte(index + 1)
 	}
@@ -214,7 +214,7 @@ func TestBeginIncarnationIsDurableAndNeverReused(t *testing.T) {
 func TestCapacityProfileIsSealedAndSurvivesRestart(t *testing.T) {
 	path, store, options := createTestStore(t)
 	want := CapacityProfile{
-		Format:       CapacityFormatStaticV1,
+		Format:       CapacityFormatStatic,
 		LogBaseIndex: 1,
 		MaxEntries:   uint64(options.MaxEntries),
 	}

@@ -24,6 +24,18 @@ type machineFixture struct {
 	dir       string
 }
 
+var defaultUserValidationDigest = sha256.Sum256([]byte("replicatedstate/test-user-validation"))
+
+type acceptAllMutationValidator struct{}
+
+func (acceptAllMutationValidator) ValidatePut(_, _ []byte) MutationValidation {
+	return MutationValidationAccept
+}
+
+func (acceptAllMutationValidator) ValidateDelete(_, _ []byte, _ bool) MutationValidation {
+	return MutationValidationAccept
+}
+
 func newMachineFixture(t testing.TB) machineFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -41,6 +53,7 @@ func newMachineFixture(t testing.TB) machineFixture {
 		return targetOf(collection)
 	}
 	system := openCollection("system")
+	system = systemTargetOf(system.Collection)
 	user := openCollection("user")
 	log, err := durable.OpenTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
@@ -66,12 +79,22 @@ func newMachineFixture(t testing.TB) machineFixture {
 
 func targetOf(collection *durable.Collection) CollectionTarget {
 	return CollectionTarget{
-		Collection: collection, Validation: ValidationSchemaFreeJSONV1,
+		Collection: collection, Validation: ValidationDeterministicMutation,
+		ValidationDigest: defaultUserValidationDigest,
+		Validator:        acceptAllMutationValidator{},
 		Limits: CollectionLimits{
 			MaxKeyBytes: collection.MaxKeyBytes(), MaxDocumentBytes: collection.MaxDocumentBytes(),
 			MaxDistinctMutations: collection.MaxBatchDocuments(), MaxBatchBytes: collection.MaxBatchBytes(),
 		},
 	}
+}
+
+func systemTargetOf(collection *durable.Collection) CollectionTarget {
+	target := targetOf(collection)
+	target.Validation = ValidationSchemaFreeJSON
+	target.ValidationDigest = [32]byte{}
+	target.Validator = nil
+	return target
 }
 
 func testBinding() Binding {
@@ -95,7 +118,7 @@ func id128(seed byte) replication.ID128 {
 func testBootstrap() *pb.Snapshot {
 	index, term := uint64(1), uint64(1)
 	return &pb.Snapshot{
-		Data: []byte("static-bootstrap-v1"),
+		Data: []byte("static-bootstrap"),
 		Metadata: &pb.SnapshotMetadata{
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1}},
 		},
@@ -104,7 +127,7 @@ func testBootstrap() *pb.Snapshot {
 
 func testCommand(binding Binding, sequence uint64, mutations ...replication.Mutation) []byte {
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x91})
-	command, err := replication.AppendCommandV1(nil, replication.CommandV1{
+	command, err := replication.AppendCommand(nil, replication.Command{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		Distribution:          binding.Distribution, Shard: binding.Shard,
@@ -158,7 +181,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err != nil || first.AppliedSequence != 2 {
 		t.Fatalf("LookupCompletion = %+v,%v", first, err)
 	}
-	completion, err := replication.OpenCompletionV1(first.Bytes)
+	completion, err := replication.OpenCompletion(first.Bytes)
 	if err != nil || completion.ResultCode != ResultApplied {
 		t.Fatalf("completion = %+v,%v", completion, err)
 	}
@@ -172,11 +195,11 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	}
 
 	conflict := bytes.Clone(command)
-	view, err := replication.OpenCommandV1(command)
+	view, err := replication.OpenCommand(command)
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflictingCommand := replication.CommandV1{
+	conflictingCommand := replication.Command{
 		ClusterID: fixture.binding.ClusterID, ClusterIncarnation: fixture.binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: fixture.binding.TopologyRecoveryEpoch,
 		Distribution:          fixture.binding.Distribution, Shard: fixture.binding.Shard,
@@ -190,7 +213,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		Fingerprint: view.Fingerprint, RetryHome: replication.RetryHome{1}, Collection: "docs",
 		Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
 	}
-	conflict, err = replication.AppendCommandV1(conflict[:0], conflictingCommand)
+	conflict, err = replication.AppendCommand(conflict[:0], conflictingCommand)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,8 +232,8 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	stale := testCommand(fixture.binding, 2,
 		replication.Mutation{Kind: replication.MutationDelete, Key: []byte("k")},
 	)
-	staleView, _ := replication.OpenCommandV1(stale)
-	staleCommand := replication.CommandV1{
+	staleView, _ := replication.OpenCommand(stale)
+	staleCommand := replication.Command{
 		ClusterID: fixture.binding.ClusterID, ClusterIncarnation: fixture.binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: fixture.binding.TopologyRecoveryEpoch,
 		Distribution:          fixture.binding.Distribution, Shard: fixture.binding.Shard,
@@ -224,7 +247,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		ClientSequence: staleView.ClientSequence, Fingerprint: staleView.Fingerprint,
 		Collection: "docs", Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
 	}
-	stale, err = replication.AppendCommandV1(nil, staleCommand)
+	stale, err = replication.AppendCommand(nil, staleCommand)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +258,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	staleCompletion, err := replication.OpenCompletionV1(staleLookup.Bytes)
+	staleCompletion, err := replication.OpenCompletion(staleLookup.Bytes)
 	if err != nil || staleCompletion.ResultCode != ResultStaleFence {
 		t.Fatalf("stale completion = %+v,%v", staleCompletion, err)
 	}
@@ -345,6 +368,7 @@ func TestMachinePhysicalReopenRecoversAtomicUserCompletionAndState(t *testing.T)
 		return targetOf(collection)
 	}
 	system, user := open("system"), open("user")
+	system = systemTargetOf(system.Collection)
 	reopened, err := Open(
 		fixture.binding, fixture.bootstrap, system, UserCollection{Name: "docs", Target: user},
 		log, fixture.machine.options,
@@ -370,7 +394,7 @@ func TestMachineCommittedTargetBoundBecomesDeterministicNoop(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	mutations := make([]replication.Mutation, MaxDistinctMutationsV1+1)
+	mutations := make([]replication.Mutation, MaxDistinctMutations+1)
 	for i := range mutations {
 		mutations[i] = replication.Mutation{
 			Kind: replication.MutationPut, Key: []byte{byte(i + 1)}, Value: []byte(`{"n":1}`),
@@ -391,7 +415,7 @@ func TestMachineCommittedTargetBoundBecomesDeterministicNoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	completion, err := replication.OpenCompletionV1(lookup.Bytes)
+	completion, err := replication.OpenCompletion(lookup.Bytes)
 	if err != nil || completion.ResultCode != ResultTargetBound {
 		t.Fatalf("target-bound completion = %+v,%v", completion, err)
 	}

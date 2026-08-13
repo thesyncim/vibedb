@@ -11,26 +11,26 @@ import (
 )
 
 const (
-	completionRecordFormatV1    = uint16(1)
+	completionRecordCodecFormat = uint16(1)
 	completionRecordHeaderBytes = 144
 )
 
 var (
 	completionRecordMagic          = [8]byte{'V', 'D', 'B', 'R', 'C', 'P', 0, 0}
 	completionRecordChecksumDomain = []byte(
-		"vibedb/replicated-state/completion-record-checksum/v1\x00",
+		"vibedb/replicated-state/completion-record-checksum\x00",
 	)
 	completionKeyDomain = []byte(
-		"vibedb/replicated-state/completion-key/v1\x00",
+		"vibedb/replicated-state/completion-key\x00",
 	)
 	commandDigestDomain = []byte(
-		"vibedb/replicated-state/exact-command/v1\x00",
+		"vibedb/replicated-state/exact-command\x00",
 	)
 )
 
-// CompletionRecordV1 is the collision-verifiable retained request wrapper.
-// Completion contains one exact replication.CompletionV1 envelope.
-type CompletionRecordV1 struct {
+// CompletionRecord is the collision-verifiable retained request wrapper.
+// Completion contains one exact replication.Completion envelope.
+type CompletionRecord struct {
 	Tenant         []byte
 	ClientID       replication.ID128
 	ClientEpoch    uint64
@@ -42,10 +42,10 @@ type CompletionRecordV1 struct {
 	Completion     []byte
 }
 
-// CompletionKeyV1 derives the sole lookup key for a client sequence. RetryHome,
+// CompletionKey derives the sole lookup key for a client sequence. RetryHome,
 // fingerprint, and command bytes are intentionally verified values, not key
 // components.
-func CompletionKeyV1(
+func CompletionKey(
 	tenant []byte,
 	clientID replication.ID128,
 	clientEpoch uint64,
@@ -80,8 +80,8 @@ func completionStorageKey(digest [32]byte) [33]byte {
 	return key
 }
 
-// CommandDigestV1 binds retained dedupe state to the exact command envelope.
-func CommandDigestV1(command []byte) [32]byte {
+// CommandDigest binds retained dedupe state to the exact command envelope.
+func CommandDigest(command []byte) [32]byte {
 	h := sha256.New()
 	_, _ = h.Write(commandDigestDomain)
 	_, _ = h.Write(command)
@@ -90,13 +90,13 @@ func CommandDigestV1(command []byte) [32]byte {
 	return result
 }
 
-// AppendCompletionRecordV1 appends one strict retained-request envelope. On
+// AppendCompletionRecord appends one strict retained-request envelope. On
 // error dst is unchanged. Input slices and strings must not overlap the
 // writable append region in dst's current backing array; such aliases are
 // rejected before dst is modified. Aliases into an old backing array are safe
 // when append relocates.
-func AppendCompletionRecordV1(dst []byte, record CompletionRecordV1) ([]byte, error) {
-	if err := validateCompletionRecordV1(record); err != nil {
+func AppendCompletionRecord(dst []byte, record CompletionRecord) ([]byte, error) {
+	if err := validateCompletionRecord(record); err != nil {
 		return dst, err
 	}
 	total := completionRecordHeaderBytes + len(record.Tenant) +
@@ -114,7 +114,7 @@ func AppendCompletionRecordV1(dst []byte, record CompletionRecordV1) ([]byte, er
 	dst = append(dst, make([]byte, total)...)
 	frame := dst[start:]
 	copy(frame[0:8], completionRecordMagic[:])
-	binary.LittleEndian.PutUint16(frame[8:10], completionRecordFormatV1)
+	binary.LittleEndian.PutUint16(frame[8:10], completionRecordCodecFormat)
 	binary.LittleEndian.PutUint16(frame[12:14], completionRecordHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(total))
 	binary.LittleEndian.PutUint32(frame[20:24], uint32(total-completionRecordHeaderBytes-recordChecksumLen))
@@ -135,25 +135,25 @@ func AppendCompletionRecordV1(dst []byte, record CompletionRecordV1) ([]byte, er
 	return dst, nil
 }
 
-// OpenCompletionRecordV1 strictly decodes a complete retained-request record.
-func OpenCompletionRecordV1(src []byte) (CompletionRecordV1, error) {
+// OpenCompletionRecord strictly decodes a complete retained-request record.
+func OpenCompletionRecord(src []byte) (CompletionRecord, error) {
 	if len(src) < completionRecordHeaderBytes+recordChecksumLen ||
 		len(src) > MaxCompletionRecordBytes {
-		return CompletionRecordV1{}, fmt.Errorf("%w: record length", ErrCompletionCorrupt)
+		return CompletionRecord{}, fmt.Errorf("%w: record length", ErrCompletionCorrupt)
 	}
 	if !bytes.Equal(src[0:8], completionRecordMagic[:]) ||
-		binary.LittleEndian.Uint16(src[8:10]) != completionRecordFormatV1 ||
+		binary.LittleEndian.Uint16(src[8:10]) != completionRecordCodecFormat ||
 		binary.LittleEndian.Uint16(src[10:12]) != 0 ||
 		binary.LittleEndian.Uint16(src[12:14]) != completionRecordHeaderBytes ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[136:144]) {
-		return CompletionRecordV1{}, fmt.Errorf("%w: record header", ErrCompletionCorrupt)
+		return CompletionRecord{}, fmt.Errorf("%w: record header", ErrCompletionCorrupt)
 	}
 	total64 := uint64(binary.LittleEndian.Uint32(src[16:20]))
 	body64 := uint64(binary.LittleEndian.Uint32(src[20:24]))
 	if total64 != uint64(len(src)) ||
 		body64 != uint64(len(src)-completionRecordHeaderBytes-recordChecksumLen) ||
 		!verifyRecord(src, completionRecordChecksumDomain) {
-		return CompletionRecordV1{}, fmt.Errorf("%w: record size or checksum", ErrCompletionCorrupt)
+		return CompletionRecord{}, fmt.Errorf("%w: record size or checksum", ErrCompletionCorrupt)
 	}
 	tenantLen64 := uint64(binary.LittleEndian.Uint16(src[128:130]))
 	collectionLen64 := uint64(binary.LittleEndian.Uint16(src[130:132]))
@@ -161,10 +161,10 @@ func OpenCompletionRecordV1(src []byte) (CompletionRecordV1, error) {
 	if tenantLen64+collectionLen64+completionLen64 != body64 ||
 		tenantLen64 > uint64(len(src)) || collectionLen64 > uint64(len(src)) ||
 		completionLen64 > uint64(len(src)) {
-		return CompletionRecordV1{}, fmt.Errorf("%w: record body lengths", ErrCompletionCorrupt)
+		return CompletionRecord{}, fmt.Errorf("%w: record body lengths", ErrCompletionCorrupt)
 	}
 	tenantLen, collectionLen, completionLen := int(tenantLen64), int(collectionLen64), int(completionLen64)
-	var record CompletionRecordV1
+	var record CompletionRecord
 	copy(record.ClientID[:], src[24:40])
 	record.ClientEpoch = binary.LittleEndian.Uint64(src[40:48])
 	record.ClientSequence = binary.LittleEndian.Uint64(src[48:56])
@@ -177,13 +177,13 @@ func OpenCompletionRecordV1(src []byte) (CompletionRecordV1, error) {
 	record.Collection = string(src[cursor : cursor+collectionLen])
 	cursor += collectionLen
 	record.Completion = bytes.Clone(src[cursor : cursor+completionLen])
-	if err := validateCompletionRecordV1(record); err != nil {
-		return CompletionRecordV1{}, err
+	if err := validateCompletionRecord(record); err != nil {
+		return CompletionRecord{}, err
 	}
 	return record, nil
 }
 
-func validateCompletionRecordV1(record CompletionRecordV1) error {
+func validateCompletionRecord(record CompletionRecord) error {
 	if len(record.Tenant) == 0 || len(record.Tenant) > replication.MaxIdentityBytes ||
 		record.ClientID == (replication.ID128{}) || record.ClientEpoch == 0 ||
 		record.ClientSequence == 0 || record.Fingerprint == (replication.Digest{}) ||
@@ -191,7 +191,7 @@ func validateCompletionRecordV1(record CompletionRecordV1) error {
 		!utf8.ValidString(record.Collection) || len(record.Completion) == 0 {
 		return fmt.Errorf("%w: invalid retained request", ErrCompletionCorrupt)
 	}
-	completion, err := replication.OpenCompletionV1(record.Completion)
+	completion, err := replication.OpenCompletion(record.Completion)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrCompletionCorrupt, err)
 	}
@@ -203,10 +203,8 @@ func validateCompletionRecordV1(record CompletionRecordV1) error {
 		completion.Fingerprint != record.Fingerprint {
 		return fmt.Errorf("%w: wrapper and completion differ", ErrCompletionCorrupt)
 	}
-	resultGrammarValid := (completion.ResultFormat == ResultFormatMutationV1 &&
-		completion.ResultCode >= ResultApplied && completion.ResultCode <= ResultTargetBound) ||
-		(completion.ResultFormat == ResultFormatMutationV2 &&
-			completion.ResultCode >= ResultApplied && completion.ResultCode <= ResultWrongShard)
+	resultGrammarValid := completion.ResultFormat == ResultFormatMutation &&
+		completion.ResultCode >= ResultApplied && completion.ResultCode <= ResultWrongShard
 	if completion.Storage != replication.CompletionInline || !resultGrammarValid ||
 		completion.ResultLength != 0 || len(completion.InlineResult) != 0 {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
@@ -221,15 +219,15 @@ func writeHashFrame(h interface{ Write([]byte) (int, error) }, value []byte) {
 	_, _ = h.Write(value)
 }
 
-func recordMatchesCommand(record CompletionRecordV1, command replication.CommandViewV1) bool {
+func recordMatchesCommand(record CompletionRecord, command replication.CommandView) bool {
 	return recordTupleMatchesCommand(record, command) &&
 		record.RetryHome == command.RetryHome &&
 		record.Fingerprint == command.Fingerprint &&
 		record.Collection == string(command.Collection) &&
-		record.CommandDigest == CommandDigestV1(command.Bytes())
+		record.CommandDigest == CommandDigest(command.Bytes())
 }
 
-func recordTupleMatchesCommand(record CompletionRecordV1, command replication.CommandViewV1) bool {
+func recordTupleMatchesCommand(record CompletionRecord, command replication.CommandView) bool {
 	return bytes.Equal(record.Tenant, command.Tenant) &&
 		record.ClientID == command.ClientID &&
 		record.ClientEpoch == command.ClientEpoch &&

@@ -24,20 +24,17 @@ import (
 )
 
 const (
-	// ReplicatedApplyFormatV1 is the first catalog-owned hidden apply-store
+	// ReplicatedApplyFormat is the current catalog-owned hidden apply-store
 	// profile. It is deliberately separate from the public SQL table catalog:
 	// the hidden collection is a state-machine participant, never a SQL relation.
-	ReplicatedApplyFormatV1 uint16 = 1
-	// ReplicatedApplyFormatV2 adds a frozen native one-column placement profile
-	// and a result grammar with an explicit durable wrong-shard refusal.
-	ReplicatedApplyFormatV2 uint16 = 2
+	ReplicatedApplyFormat uint16 = 1
 
-	// ReplicatedPlacementProfileV1 is the first exact key-to-shard validation
-	// profile. It is deliberately limited to the sole primary-key column.
-	ReplicatedPlacementProfileV1 uint16 = 1
+	// ReplicatedPlacementProfileFormat is the current exact key-to-shard
+	// validation profile. It is deliberately limited to the sole primary-key
+	// column.
+	ReplicatedPlacementProfileFormat uint16 = 1
 
-	replicatedApplyKeyProfileV1 uint16 = 1
-	replicatedApplyKeyProfileV2 uint16 = 2
+	replicatedApplyKeyProfile uint16 = 1
 )
 
 var (
@@ -47,13 +44,10 @@ var (
 	ErrReplicatedApplyClosed        = errors.New("vibedb: replicated apply is closed")
 )
 
-var (
-	replicatedApplyProfileDomain   = []byte("vibedb/sql/replicated-apply-profile/v1\x00")
-	replicatedApplyProfileDomainV2 = []byte("vibedb/sql/replicated-apply-profile/v2\x00")
-)
+var replicatedApplyProfileDomain = []byte("vibedb/sql/replicated-apply-profile\x00")
 
 // ReplicatedPlacementProfile freezes the only placement proof supported by
-// replicated apply v2: one primary-key/shard-key scalar mapped by the native
+// replicated apply: one primary-key/shard-key scalar mapped by the native
 // tuple/mapper revisions into one exact half-open shard range.
 type ReplicatedPlacementProfile struct {
 	Format        uint16
@@ -412,7 +406,7 @@ func (d *Database) openReplicatedApply(
 		replicatedStateBinding(expected), bootstrap,
 		replicatedstate.CollectionTarget{
 			Collection: core.replicatedApplyCollection,
-			Validation: replicatedstate.ValidationSchemaFreeJSONV1,
+			Validation: replicatedstate.ValidationSchemaFreeJSON,
 			Limits:     replicatedStateCollectionLimits(identity.SystemLimits),
 		},
 		replicatedstate.UserCollection{
@@ -519,7 +513,7 @@ type replicatedSQLMutationValidator struct {
 	primaryKey  string
 	primary     vibejson.CompiledPointer
 	maxKeyBytes int
-	placement   *replicatedSQLPlacementValidator
+	placement   replicatedSQLPlacementValidator
 }
 
 type replicatedSQLPlacementValidator struct {
@@ -537,11 +531,8 @@ func newReplicatedSQLMutationValidator(
 		primaryKey: identity.UserPrimaryKey, primary: table.primary,
 		maxKeyBytes: identity.UserLimits.MaxKeyBytes,
 	}
-	if profile == (ReplicatedPlacementProfile{}) {
-		return validator
-	}
 	mapper := distribution.NewNativeMapper(1)
-	validator.placement = &replicatedSQLPlacementValidator{
+	validator.placement = replicatedSQLPlacementValidator{
 		binding: placementBinding{
 			placement: distribution.TablePlacement{
 				Table: identity.UserTable, Distribution: distribution.DistributionName(identity.Binding.Distribution),
@@ -567,19 +558,17 @@ func (v replicatedSQLMutationValidator) ValidatePut(key, value []byte) replicate
 	if err != nil || derived != string(key) {
 		return replicatedstate.MutationValidationInvalid
 	}
-	if v.placement != nil {
-		var scalarScratch [1]distribution.Scalar
-		values, _, err := documentShardKey(value, &v.placement.binding, scalarScratch[:0], nil)
-		if err != nil {
-			return replicatedstate.MutationValidationInvalid
-		}
-		point, err := v.placement.mapper.PointFor(values)
-		if err != nil {
-			return replicatedstate.MutationValidationInvalid
-		}
-		if !v.placement.target.Contains(point) {
-			return replicatedstate.MutationValidationWrongShard
-		}
+	var scalarScratch [1]distribution.Scalar
+	values, _, err := documentShardKey(value, &v.placement.binding, scalarScratch[:0], nil)
+	if err != nil {
+		return replicatedstate.MutationValidationInvalid
+	}
+	point, err := v.placement.mapper.PointFor(values)
+	if err != nil {
+		return replicatedstate.MutationValidationInvalid
+	}
+	if !v.placement.target.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
 	}
 	return replicatedstate.MutationValidationAccept
 }
@@ -594,9 +583,6 @@ func (v replicatedSQLMutationValidator) ValidateDelete(
 	}
 	if found {
 		return v.ValidatePut(key, current)
-	}
-	if v.placement == nil {
-		return replicatedstate.MutationValidationAccept
 	}
 	var scalar distribution.Scalar
 	switch component.Kind {
@@ -833,33 +819,14 @@ func (a *ReplicatedApply) LookupCompletion(
 	return a.machine.LookupCompletion(data)
 }
 
-func replicatedApplyProfileDigest(identity ReplicatedShardStoreIdentity) [32]byte {
-	h := sha256.New()
-	_, _ = h.Write(replicatedApplyProfileDomain)
-	var version [2]byte
-	binary.LittleEndian.PutUint16(version[:], replicatedApplyKeyProfileV1)
-	_, _ = h.Write(version[:])
-	writeReplicatedApplyHashFrame(h, []byte(identity.UserTable))
-	writeReplicatedApplyHashFrame(h, []byte(identity.UserPrimaryKey))
-	var limits [32]byte
-	binary.LittleEndian.PutUint64(limits[0:8], uint64(identity.UserLimits.MaxKeyBytes))
-	binary.LittleEndian.PutUint64(limits[8:16], uint64(identity.UserLimits.MaxDocumentBytes))
-	binary.LittleEndian.PutUint64(limits[16:24], uint64(identity.UserLimits.MaxBatchDocuments))
-	binary.LittleEndian.PutUint64(limits[24:32], uint64(identity.UserLimits.MaxBatchBytes))
-	_, _ = h.Write(limits[:])
-	var digest [32]byte
-	_ = h.Sum(digest[:0])
-	return digest
-}
-
-func replicatedApplyProfileDigestV2(
+func replicatedApplyProfileDigest(
 	identity ReplicatedShardStoreIdentity,
 	placement ReplicatedPlacementProfile,
 ) [32]byte {
 	h := sha256.New()
-	_, _ = h.Write(replicatedApplyProfileDomainV2)
+	_, _ = h.Write(replicatedApplyProfileDomain)
 	var keyProfile [2]byte
-	binary.LittleEndian.PutUint16(keyProfile[:], replicatedApplyKeyProfileV2)
+	binary.LittleEndian.PutUint16(keyProfile[:], replicatedApplyKeyProfile)
 	_, _ = h.Write(keyProfile[:])
 	writeReplicatedApplyHashFrame(h, []byte(identity.UserTable))
 	writeReplicatedApplyHashFrame(h, []byte(identity.UserPrimaryKey))
@@ -906,38 +873,32 @@ func newReplicatedApplyMeta(
 	storage string,
 	options ReplicatedApplyOptions,
 ) replicatedApplyMeta {
-	meta := replicatedApplyMeta{
-		Format:            ReplicatedApplyFormatV1,
+	return replicatedApplyMeta{
+		Format:            ReplicatedApplyFormat,
 		Storage:           strings.Clone(storage),
-		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutationV1),
-		ValidationDigest:  replicatedApplyProfileDigest(identity),
+		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+		ValidationDigest:  replicatedApplyProfileDigest(identity, options.Placement),
 		SystemLimits:      replicatedApplySystemLimits(),
 		MaxCompletions:    options.MaxCompletions,
 		TxnMaxCollections: options.TxnLimits.MaxCollections,
 		TxnMaxDocuments:   options.TxnLimits.MaxDocuments,
 		TxnMaxBytes:       options.TxnLimits.MaxBytes,
+		Placement:         ownedReplicatedPlacementProfile(options.Placement),
 	}
-	if options.Placement != (ReplicatedPlacementProfile{}) {
-		meta.Format = ReplicatedApplyFormatV2
-		meta.ValidationProfile = uint8(replicatedstate.ValidationDeterministicMutationV2)
-		meta.Placement = ownedReplicatedPlacementProfile(options.Placement)
-		meta.ValidationDigest = replicatedApplyProfileDigestV2(identity, options.Placement)
-	}
-	return meta
 }
 
 func validateReplicatedApplyOptions(
 	identity ReplicatedShardStoreIdentity,
 	options ReplicatedApplyOptions,
 ) error {
-	if identity.UserTable == replicatedstate.SystemCollectionNameV1 {
+	if identity.UserTable == replicatedstate.SystemCollectionName {
 		return fmt.Errorf(
 			"%w: user table uses the reserved system collection name",
 			ErrReplicatedApplyMismatch,
 		)
 	}
 	if options.MaxCompletions == 0 ||
-		options.MaxCompletions > replicatedstate.MaxRetainedCompletionsV1 ||
+		options.MaxCompletions > replicatedstate.MaxRetainedCompletions ||
 		options.TxnLimits.MaxCollections < 2 ||
 		options.TxnLimits.MaxDocuments < identity.UserLimits.MaxBatchDocuments+2 ||
 		options.TxnLimits.MaxBytes <= 0 {
@@ -950,10 +911,8 @@ func validateReplicatedApplyOptions(
 		options.TxnLimits.MaxBytes < int64(userBytes)+int64(systemBytes) {
 		return fmt.Errorf("%w: transaction byte limit does not cover one apply", ErrReplicatedApplyMismatch)
 	}
-	if options.Placement != (ReplicatedPlacementProfile{}) {
-		if err := validateReplicatedPlacementProfile(options.Placement, identity); err != nil {
-			return err
-		}
+	if err := validateReplicatedPlacementProfile(options.Placement, identity); err != nil {
+		return err
 	}
 	return nil
 }
@@ -974,9 +933,9 @@ func validateReplicatedPlacementProfile(
 
 func validateReplicatedPlacementProfileGrammar(profile ReplicatedPlacementProfile) error {
 	shardKey, err := vibejson.CompilePointer(profile.ShardKey)
-	if profile.Format != ReplicatedPlacementProfileV1 ||
+	if profile.Format != ReplicatedPlacementProfileFormat ||
 		err != nil || len(shardKey.Tokens) == 0 || shardKey.String() != profile.ShardKey ||
-		profile.TupleVersion != distribution.TupleVersion1 ||
+		profile.TupleVersion != distribution.CurrentTupleVersion ||
 		profile.MapperVersion != distribution.NativeMapperVersion ||
 		!profile.Range.Valid() ||
 		(profile.Range.End.Max && profile.Range.End.Point != (distribution.KeyspacePoint{})) {
@@ -1057,23 +1016,10 @@ func validateReplicatedApplyMeta(
 	if identity == nil {
 		return fmt.Errorf("%w: replicated shard binding is missing", ErrReplicatedApplyMismatch)
 	}
-	if m.ValidationDigest == ([32]byte{}) {
-		return ErrReplicatedApplyMismatch
-	}
-	switch m.Format {
-	case ReplicatedApplyFormatV1:
-		if m.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutationV1) ||
-			m.Placement != (ReplicatedPlacementProfile{}) ||
-			m.ValidationDigest != replicatedApplyProfileDigest(*identity) {
-			return ErrReplicatedApplyMismatch
-		}
-	case ReplicatedApplyFormatV2:
-		if m.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutationV2) ||
-			validateReplicatedPlacementProfile(m.Placement, *identity) != nil ||
-			m.ValidationDigest != replicatedApplyProfileDigestV2(*identity, m.Placement) {
-			return ErrReplicatedApplyMismatch
-		}
-	default:
+	if m.Format != ReplicatedApplyFormat ||
+		m.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) ||
+		validateReplicatedPlacementProfile(m.Placement, *identity) != nil ||
+		m.ValidationDigest != replicatedApplyProfileDigest(*identity, m.Placement) {
 		return ErrReplicatedApplyMismatch
 	}
 	if err := validateStorageIdentity(m.Storage); err != nil || m.Storage == "" ||
@@ -1091,7 +1037,13 @@ func validateReplicatedApplyMeta(
 }
 
 func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
-	type encodedV1 struct {
+	if m.Format != ReplicatedApplyFormat {
+		return nil, fmt.Errorf("vibedb: unsupported replicated apply format %d", m.Format)
+	}
+	if err := validateReplicatedPlacementProfileGrammar(m.Placement); err != nil {
+		return nil, err
+	}
+	type encoded struct {
 		Format            uint16                     `json:"format"`
 		Storage           string                     `json:"storage"`
 		ValidationProfile uint8                      `json:"validation_profile"`
@@ -1101,8 +1053,9 @@ func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
 		TxnMaxCollections int                        `json:"txn_max_collections"`
 		TxnMaxDocuments   int                        `json:"txn_max_documents"`
 		TxnMaxBytes       int64                      `json:"txn_max_bytes"`
+		Placement         ReplicatedPlacementProfile `json:"placement"`
 	}
-	legacy := encodedV1{
+	return json.Marshal(encoded{
 		Format: m.Format, Storage: m.Storage,
 		ValidationProfile: m.ValidationProfile,
 		ValidationDigest:  hex.EncodeToString(m.ValidationDigest[:]),
@@ -1111,21 +1064,8 @@ func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
 		TxnMaxCollections: m.TxnMaxCollections,
 		TxnMaxDocuments:   m.TxnMaxDocuments,
 		TxnMaxBytes:       m.TxnMaxBytes,
-	}
-	if m.Format == ReplicatedApplyFormatV1 {
-		if m.Placement != (ReplicatedPlacementProfile{}) {
-			return nil, errors.New("vibedb: replicated apply v1 must not contain placement")
-		}
-		return json.Marshal(legacy)
-	}
-	if m.Format != ReplicatedApplyFormatV2 {
-		return nil, fmt.Errorf("vibedb: unsupported replicated apply format %d", m.Format)
-	}
-	type encodedV2 struct {
-		encodedV1
-		Placement ReplicatedPlacementProfile `json:"placement"`
-	}
-	return json.Marshal(encodedV2{encodedV1: legacy, Placement: m.Placement})
+		Placement:         m.Placement,
+	})
 }
 
 func (profile ReplicatedPlacementProfile) MarshalJSON() ([]byte, error) {
@@ -1149,7 +1089,7 @@ func (profile ReplicatedPlacementProfile) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// MarshalJSON emits the same strict, versioned grammar stored in the SQL
+// MarshalJSON emits the same strict grammar stored in the SQL
 // catalog so orchestrators can retain an exact restart identity.
 func (identity ReplicatedApplyIdentity) MarshalJSON() ([]byte, error) {
 	return replicatedApplyMetaFromIdentity(identity).MarshalJSON()
@@ -1275,29 +1215,17 @@ func (m *replicatedApplyMeta) UnmarshalJSON(data []byte) error {
 	for _, name := range []string{
 		"format", "storage", "validation_profile", "validation_digest",
 		"system_limits", "max_completions", "txn_max_collections",
-		"txn_max_documents", "txn_max_bytes",
+		"txn_max_documents", "txn_max_bytes", "placement",
 	} {
 		if !present[name] {
 			return fmt.Errorf("vibedb: replicated apply is missing member %q", name)
 		}
 	}
-	switch decoded.Format {
-	case ReplicatedApplyFormatV1:
-		if present["placement"] {
-			return errors.New("vibedb: replicated apply v1 must not contain placement")
-		}
-		if decoded.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutationV1) {
-			return errors.New("vibedb: replicated apply v1 has the wrong validation profile")
-		}
-	case ReplicatedApplyFormatV2:
-		if !present["placement"] {
-			return errors.New("vibedb: replicated apply v2 is missing member \"placement\"")
-		}
-		if decoded.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutationV2) {
-			return errors.New("vibedb: replicated apply v2 has the wrong validation profile")
-		}
-	default:
+	if decoded.Format != ReplicatedApplyFormat {
 		return fmt.Errorf("vibedb: unsupported replicated apply format %d", decoded.Format)
+	}
+	if decoded.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) {
+		return errors.New("vibedb: replicated apply has the wrong validation profile")
 	}
 	*m = decoded
 	return nil

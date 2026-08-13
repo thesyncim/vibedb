@@ -17,22 +17,24 @@ import (
 )
 
 const (
-	_resultAppliedAtLeastFrozen           = ResultApplied - 1
-	_resultAppliedAtMostFrozen            = uint32(1) - ResultApplied
-	_resultStaleFenceAtLeastFrozen        = ResultStaleFence - 2
-	_resultStaleFenceAtMostFrozen         = uint32(2) - ResultStaleFence
-	_resultUnknownCollectionAtLeastFrozen = ResultUnknownCollection - 3
-	_resultUnknownCollectionAtMostFrozen  = uint32(3) - ResultUnknownCollection
-	_resultInvalidDocumentAtLeastFrozen   = ResultInvalidDocument - 4
-	_resultInvalidDocumentAtMostFrozen    = uint32(4) - ResultInvalidDocument
-	_resultTargetBoundAtLeastFrozen       = ResultTargetBound - 5
-	_resultTargetBoundAtMostFrozen        = uint32(5) - ResultTargetBound
+	_resultAppliedAtLeastExact           = ResultApplied - 1
+	_resultAppliedAtMostExact            = uint32(1) - ResultApplied
+	_resultStaleFenceAtLeastExact        = ResultStaleFence - 2
+	_resultStaleFenceAtMostExact         = uint32(2) - ResultStaleFence
+	_resultUnknownCollectionAtLeastExact = ResultUnknownCollection - 3
+	_resultUnknownCollectionAtMostExact  = uint32(3) - ResultUnknownCollection
+	_resultInvalidDocumentAtLeastExact   = ResultInvalidDocument - 4
+	_resultInvalidDocumentAtMostExact    = uint32(4) - ResultInvalidDocument
+	_resultTargetBoundAtLeastExact       = ResultTargetBound - 5
+	_resultTargetBoundAtMostExact        = uint32(5) - ResultTargetBound
+	_resultWrongShardAtLeastExact        = ResultWrongShard - 6
+	_resultWrongShardAtMostExact         = uint32(6) - ResultWrongShard
 )
 
-func codecStateV1() StateV1 {
+func codecState() State {
 	logical := sha256.Sum256([]byte("logical"))
 	bootstrap := sha256.Sum256([]byte("bootstrap"))
-	return StateV1{
+	return State{
 		Binding: testBinding(), Applied: 1, LastTerm: 1,
 		LastKind: RecordStaticSnapshot, LastEntryType: pb.EntryNormal,
 		LastEntryDigest: bootstrap, LogicalDigest: logical,
@@ -41,24 +43,24 @@ func codecStateV1() StateV1 {
 	}
 }
 
-func TestStateV1RoundTripGoldenAndStrictness(t *testing.T) {
-	state := codecStateV1()
-	encoded, err := AppendStateV1(nil, state)
+func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
+	state := codecState()
+	encoded, err := AppendState(nil, state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDigest = "3243e0a6ed78a44df8dcb2ac928d1a90721c9d17dce8f5c352ea114b753da89a"
+	const wantDigest = "f3f0320ae210a813536d165560bc58e7c3d4f1ccda284d84e1a5859b30f2357f"
 	gotDigest := sha256.Sum256(encoded)
 	if hex.EncodeToString(gotDigest[:]) != wantDigest {
 		t.Fatalf("state golden digest = %x, want %s", gotDigest, wantDigest)
 	}
-	decoded, err := OpenStateV1(encoded)
+	decoded, err := OpenState(encoded)
 	if err != nil || !equalState(decoded, state) {
-		t.Fatalf("OpenStateV1 = %+v,%v", decoded, err)
+		t.Fatalf("OpenState = %+v,%v", decoded, err)
 	}
 	corrupt := bytes.Clone(encoded)
 	corrupt[216] ^= 1
-	if _, err := OpenStateV1(corrupt); !errors.Is(err, ErrStateCorrupt) {
+	if _, err := OpenState(corrupt); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("corrupt state error = %v", err)
 	}
 	wrapper := wrapJSONHex(nil, encoded)
@@ -66,14 +68,14 @@ func TestStateV1RoundTripGoldenAndStrictness(t *testing.T) {
 	if _, err := unwrapJSONHex(wrapper, MaxStateEnvelopeBytes, ErrStateCorrupt); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("uppercase JSON hex error = %v", err)
 	}
-	unknown := codecStateV1()
+	unknown := codecState()
 	unknown.ConfState.ProtoReflect().SetUnknown([]byte{0x78, 0})
-	if _, err := AppendStateV1(nil, unknown); !errors.Is(err, ErrStateCorrupt) {
+	if _, err := AppendState(nil, unknown); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("unknown ConfState error = %v", err)
 	}
-	duplicate := codecStateV1()
+	duplicate := codecState()
 	duplicate.ConfState.Voters = []uint64{1, 1}
-	if _, err := AppendStateV1(nil, duplicate); !errors.Is(err, ErrStateCorrupt) {
+	if _, err := AppendState(nil, duplicate); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("duplicate voter error = %v", err)
 	}
 }
@@ -81,32 +83,32 @@ func TestStateV1RoundTripGoldenAndStrictness(t *testing.T) {
 func TestStateAndCompletionLengthFieldsCannotOverflowInt(t *testing.T) {
 	state := make([]byte, stateHeaderBytes+recordChecksumLen)
 	copy(state[:8], stateMagic[:])
-	binary.LittleEndian.PutUint16(state[8:10], stateFormatV1)
+	binary.LittleEndian.PutUint16(state[8:10], stateCodecFormat)
 	binary.LittleEndian.PutUint16(state[12:14], stateHeaderBytes)
 	binary.LittleEndian.PutUint32(state[16:20], uint32(len(state)))
 	binary.LittleEndian.PutUint32(state[20:24], 0)
 	binary.LittleEndian.PutUint32(state[284:288], math.MaxUint32)
 	sealRecord(state, stateChecksumDomain)
-	if _, err := OpenStateV1(state); !errors.Is(err, ErrStateCorrupt) {
+	if _, err := OpenState(state); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("maximum ConfState length error = %v", err)
 	}
 
 	completion := make([]byte, completionRecordHeaderBytes+recordChecksumLen)
 	copy(completion[:8], completionRecordMagic[:])
-	binary.LittleEndian.PutUint16(completion[8:10], completionRecordFormatV1)
+	binary.LittleEndian.PutUint16(completion[8:10], completionRecordCodecFormat)
 	binary.LittleEndian.PutUint16(completion[12:14], completionRecordHeaderBytes)
 	binary.LittleEndian.PutUint32(completion[16:20], uint32(len(completion)))
 	binary.LittleEndian.PutUint32(completion[20:24], 0)
 	binary.LittleEndian.PutUint32(completion[132:136], math.MaxUint32)
 	sealRecord(completion, completionRecordChecksumDomain)
-	if _, err := OpenCompletionRecordV1(completion); !errors.Is(err, ErrCompletionCorrupt) {
+	if _, err := OpenCompletionRecord(completion); !errors.Is(err, ErrCompletionCorrupt) {
 		t.Fatalf("maximum completion length error = %v", err)
 	}
 }
 
-func TestStateV1RejectsResealedReconstructibleDigestMismatch(t *testing.T) {
-	static := codecStateV1()
-	configuration := codecStateV1()
+func TestStateRejectsResealedReconstructibleDigestMismatch(t *testing.T) {
+	static := codecState()
+	configuration := codecState()
 	configuration.Applied = 2
 	configuration.LastTerm = 2
 	configuration.LastKind = RecordConfiguration
@@ -120,27 +122,27 @@ func TestStateV1RejectsResealedReconstructibleDigestMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for name, state := range map[string]StateV1{
+	for name, state := range map[string]State{
 		"static": static, "configuration": configuration,
 	} {
 		t.Run(name, func(t *testing.T) {
-			encoded, err := AppendStateV1(nil, state)
+			encoded, err := AppendState(nil, state)
 			if err != nil {
 				t.Fatal(err)
 			}
 			encoded[184] ^= 1
 			sealRecord(encoded, stateChecksumDomain)
-			if _, err := OpenStateV1(encoded); !errors.Is(err, ErrStateCorrupt) {
-				t.Fatalf("OpenStateV1 error = %v", err)
+			if _, err := OpenState(encoded); !errors.Is(err, ErrStateCorrupt) {
+				t.Fatalf("OpenState error = %v", err)
 			}
 		})
 	}
 }
 
-func TestStateV1RejectsResealedUnsortedConfStateMembers(t *testing.T) {
-	state := codecStateV1()
+func TestStateRejectsResealedUnsortedConfStateMembers(t *testing.T) {
+	state := codecState()
 	state.ConfState.Voters = []uint64{1, 2}
-	encoded, err := AppendStateV1(nil, state)
+	encoded, err := AppendState(nil, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,20 +160,16 @@ func TestStateV1RejectsResealedUnsortedConfStateMembers(t *testing.T) {
 	start := stateHeaderBytes + distributionLen + shardLen
 	copy(encoded[start:start+confLen], conf)
 	sealRecord(encoded, stateChecksumDomain)
-	if _, err := OpenStateV1(encoded); !errors.Is(err, ErrStateCorrupt) {
-		t.Fatalf("OpenStateV1 error = %v", err)
+	if _, err := OpenState(encoded); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("OpenState error = %v", err)
 	}
 }
 
-func codecCompletionV1(code uint32) ([]byte, CompletionRecordV1) {
-	return codecCompletion(ResultFormatMutationV1, code)
-}
-
-func codecCompletion(format uint16, code uint32) ([]byte, CompletionRecordV1) {
+func codecCompletion(code uint32) ([]byte, CompletionRecord) {
 	binding := testBinding()
 	fingerprint := sha256.Sum256([]byte("fingerprint"))
-	resultDigest := replication.CompletionResultDigestV1(code, format, nil)
-	completion, err := replication.AppendCompletionV1(nil, replication.CompletionV1{
+	resultDigest := replication.CompletionResultDigest(code, ResultFormatMutation, nil)
+	completion, err := replication.AppendCompletion(nil, replication.Completion{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		Distribution:          binding.Distribution, Shard: binding.Shard,
@@ -182,13 +180,13 @@ func codecCompletion(format uint16, code uint32) ([]byte, CompletionRecordV1) {
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
 		ClientID: id128(44), ClientEpoch: 2, ClientSequence: 3,
 		Fingerprint: fingerprint, AppliedSequence: 4, ResultCode: code,
-		ResultFormat: format, Storage: replication.CompletionInline,
+		ResultFormat: ResultFormatMutation, Storage: replication.CompletionInline,
 		ResultDigest: resultDigest,
 	})
 	if err != nil {
 		panic(err)
 	}
-	record := CompletionRecordV1{
+	record := CompletionRecord{
 		Tenant: []byte("tenant"), ClientID: id128(44), ClientEpoch: 2,
 		ClientSequence: 3, Fingerprint: fingerprint,
 		CommandDigest: sha256.Sum256([]byte("command")), Collection: "docs",
@@ -197,56 +195,51 @@ func codecCompletion(format uint16, code uint32) ([]byte, CompletionRecordV1) {
 	return completion, record
 }
 
-func TestCompletionRecordV1RoundTripAndFixedGrammar(t *testing.T) {
-	if ValidationSchemaFreeJSONV1 != 1 || ValidationDeterministicMutationV1 != 2 ||
-		ValidationDeterministicMutationV2 != 3 ||
-		ResultFormatMutationV1 != 1 || ResultFormatMutationV2 != 2 ||
+func TestCompletionRecordRoundTripAndFixedGrammar(t *testing.T) {
+	if ValidationSchemaFreeJSON != 1 || ValidationDeterministicMutation != 2 ||
+		ResultFormatMutation != 1 ||
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 {
-		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d,%d formats=%d,%d codes=%d,%d,%d,%d,%d,%d",
-			ValidationSchemaFreeJSONV1, ValidationDeterministicMutationV1,
-			ValidationDeterministicMutationV2, ResultFormatMutationV1, ResultFormatMutationV2,
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d",
+			ValidationSchemaFreeJSON, ValidationDeterministicMutation,
+			ResultFormatMutation,
 			ResultApplied, ResultStaleFence, ResultUnknownCollection,
 			ResultInvalidDocument, ResultTargetBound, ResultWrongShard)
 	}
-	_, record := codecCompletionV1(ResultApplied)
-	encoded, err := AppendCompletionRecordV1(nil, record)
+	_, record := codecCompletion(ResultApplied)
+	encoded, err := AppendCompletionRecord(nil, record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantV1Digest = "6bd0b3a314c6cc4c7db668b768f1f7749d31872663fb6761fb58cb81e6bf2a13"
-	if got := sha256.Sum256(encoded); hex.EncodeToString(got[:]) != wantV1Digest {
-		t.Fatalf("v1 completion record golden digest = %x, want %s", got, wantV1Digest)
+	const wantDigest = "d21396c86062885f7c5efc6f0686f3c164602d47c41acd2a8a629b9402ef5d05"
+	if got := sha256.Sum256(encoded); hex.EncodeToString(got[:]) != wantDigest {
+		t.Fatalf("completion record golden digest = %x, want %s", got, wantDigest)
 	}
-	decoded, err := OpenCompletionRecordV1(encoded)
+	decoded, err := OpenCompletionRecord(encoded)
 	if err != nil || !bytes.Equal(decoded.Completion, record.Completion) ||
 		!bytes.Equal(decoded.Tenant, record.Tenant) || decoded.Collection != record.Collection {
-		t.Fatalf("OpenCompletionRecordV1 = %+v,%v", decoded, err)
+		t.Fatalf("OpenCompletionRecord = %+v,%v", decoded, err)
 	}
-	_, zeroCode := codecCompletionV1(0)
-	if _, err := AppendCompletionRecordV1(nil, zeroCode); !errors.Is(err, ErrCompletionCorrupt) {
+	_, zeroCode := codecCompletion(0)
+	if _, err := AppendCompletionRecord(nil, zeroCode); !errors.Is(err, ErrCompletionCorrupt) {
 		t.Fatalf("zero result code error = %v", err)
 	}
-	v2Completion, v2 := codecCompletion(ResultFormatMutationV2, ResultWrongShard)
-	v2Encoded, err := AppendCompletionRecordV1(nil, v2)
+	wrongShardCompletion, wrongShard := codecCompletion(ResultWrongShard)
+	wrongShardEncoded, err := AppendCompletionRecord(nil, wrongShard)
 	if err != nil {
-		t.Fatalf("v2 wrong-shard grammar: %v", err)
+		t.Fatalf("wrong-shard grammar: %v", err)
 	}
-	const wantV2CompletionDigest = "8182bf0ca7a18a8f4c4e2e9dbcc373362d156b2c9c8a96e823c62c462070bd74"
-	if got := sha256.Sum256(v2Completion); hex.EncodeToString(got[:]) != wantV2CompletionDigest {
-		t.Fatalf("v2 completion envelope golden digest = %x, want %s", got, wantV2CompletionDigest)
+	const wantWrongShardCompletionDigest = "3f3696e22cc412db43999af1decc6311caf8b117f17263e98e71154ec033e788"
+	if got := sha256.Sum256(wrongShardCompletion); hex.EncodeToString(got[:]) != wantWrongShardCompletionDigest {
+		t.Fatalf("wrong-shard completion envelope golden digest = %x, want %s", got, wantWrongShardCompletionDigest)
 	}
-	const wantV2RecordDigest = "4e3b146aa9405864a852b427f8c960daeed1f33fe9e4995d1ec5483e9aa09851"
-	if got := sha256.Sum256(v2Encoded); hex.EncodeToString(got[:]) != wantV2RecordDigest {
-		t.Fatalf("v2 completion record golden digest = %x, want %s", got, wantV2RecordDigest)
+	const wantWrongShardRecordDigest = "d12136d0d8f1727e6f0b38f2c2e4b8c8d9da4a8876cefcb0e68bd2b64a1c7e55"
+	if got := sha256.Sum256(wrongShardEncoded); hex.EncodeToString(got[:]) != wantWrongShardRecordDigest {
+		t.Fatalf("wrong-shard completion record golden digest = %x, want %s", got, wantWrongShardRecordDigest)
 	}
-	_, v1WrongShard := codecCompletion(ResultFormatMutationV1, ResultWrongShard)
-	if _, err := AppendCompletionRecordV1(nil, v1WrongShard); !errors.Is(err, ErrCompletionCorrupt) {
-		t.Fatalf("v1 wrong-shard grammar error = %v", err)
-	}
-	_, v2Unknown := codecCompletion(ResultFormatMutationV2, ResultWrongShard+1)
-	if _, err := AppendCompletionRecordV1(nil, v2Unknown); !errors.Is(err, ErrCompletionCorrupt) {
-		t.Fatalf("v2 unknown result grammar error = %v", err)
+	_, unknown := codecCompletion(ResultWrongShard + 1)
+	if _, err := AppendCompletionRecord(nil, unknown); !errors.Is(err, ErrCompletionCorrupt) {
+		t.Fatalf("unknown result grammar error = %v", err)
 	}
 }
 
@@ -254,23 +247,23 @@ func TestCodecAppendErrorsLeaveDestinationUnchanged(t *testing.T) {
 	dst := make([]byte, 3, 1<<10)
 	copy(dst, "pre")
 	before := bytes.Clone(dst)
-	invalidState := codecStateV1()
+	invalidState := codecState()
 	invalidState.Applied = 0
-	got, err := AppendStateV1(dst, invalidState)
+	got, err := AppendState(dst, invalidState)
 	if !errors.Is(err, ErrStateCorrupt) || !bytes.Equal(got, before) {
-		t.Fatalf("AppendStateV1 = %q,%v", got, err)
+		t.Fatalf("AppendState = %q,%v", got, err)
 	}
-	_, invalidCompletion := codecCompletionV1(0)
-	got, err = AppendCompletionRecordV1(dst, invalidCompletion)
+	_, invalidCompletion := codecCompletion(0)
+	got, err = AppendCompletionRecord(dst, invalidCompletion)
 	if !errors.Is(err, ErrCompletionCorrupt) || !bytes.Equal(got, before) {
-		t.Fatalf("AppendCompletionRecordV1 = %q,%v", got, err)
+		t.Fatalf("AppendCompletionRecord = %q,%v", got, err)
 	}
 }
 
 func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testing.T) {
 	t.Run("state writable string", func(t *testing.T) {
-		state := codecStateV1()
-		safe, err := AppendStateV1(nil, state)
+		state := codecState()
+		safe, err := AppendState(nil, state)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,14 +273,14 @@ func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testin
 		copy(full[3:7], "dist")
 		state.Binding.Distribution = unsafe.String(unsafe.SliceData(full[3:7]), 4)
 		before := bytes.Clone(dst)
-		got, err := AppendStateV1(dst, state)
+		got, err := AppendState(dst, state)
 		if !errors.Is(err, ErrCodecAlias) || !bytes.Equal(got, before) {
-			t.Fatalf("AppendStateV1 = %q,%v", got, err)
+			t.Fatalf("AppendState = %q,%v", got, err)
 		}
 	})
 	t.Run("completion writable slice", func(t *testing.T) {
-		_, record := codecCompletionV1(ResultApplied)
-		safe, err := AppendCompletionRecordV1(nil, record)
+		_, record := codecCompletion(ResultApplied)
+		safe, err := AppendCompletionRecord(nil, record)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -297,52 +290,52 @@ func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testin
 		copy(full[3:3+len(record.Completion)], record.Completion)
 		record.Completion = full[3 : 3+len(record.Completion)]
 		before := bytes.Clone(dst)
-		got, err := AppendCompletionRecordV1(dst, record)
+		got, err := AppendCompletionRecord(dst, record)
 		if !errors.Is(err, ErrCodecAlias) || !bytes.Equal(got, before) {
-			t.Fatalf("AppendCompletionRecordV1 = %q,%v", got, err)
+			t.Fatalf("AppendCompletionRecord = %q,%v", got, err)
 		}
 	})
 	t.Run("relocation", func(t *testing.T) {
-		state := codecStateV1()
+		state := codecState()
 		statePrefix := make([]byte, 4, 4)
 		copy(statePrefix, "dist")
 		state.Binding.Distribution = unsafe.String(unsafe.SliceData(statePrefix), len(statePrefix))
-		encoded, err := AppendStateV1(statePrefix, state)
+		encoded, err := AppendState(statePrefix, state)
 		if err != nil || !bytes.Equal(encoded[:4], []byte("dist")) {
 			t.Fatalf("relocated state = %q,%v", encoded, err)
 		}
-		if _, err := OpenStateV1(encoded[4:]); err != nil {
+		if _, err := OpenState(encoded[4:]); err != nil {
 			t.Fatalf("relocated state decode: %v", err)
 		}
 
-		_, record := codecCompletionV1(ResultApplied)
+		_, record := codecCompletion(ResultApplied)
 		completionPrefix := make([]byte, len(record.Tenant), len(record.Tenant))
 		copy(completionPrefix, record.Tenant)
 		record.Tenant = completionPrefix
-		encoded, err = AppendCompletionRecordV1(completionPrefix, record)
+		encoded, err = AppendCompletionRecord(completionPrefix, record)
 		if err != nil || !bytes.Equal(encoded[:len(completionPrefix)], []byte("tenant")) {
 			t.Fatalf("relocated completion = %q,%v", encoded, err)
 		}
-		if _, err := OpenCompletionRecordV1(encoded[len(completionPrefix):]); err != nil {
+		if _, err := OpenCompletionRecord(encoded[len(completionPrefix):]); err != nil {
 			t.Fatalf("relocated completion decode: %v", err)
 		}
 	})
 }
 
-func TestCompletionKeyV1Golden(t *testing.T) {
-	key := CompletionKeyV1([]byte("tenant"), id128(9), 7, 11)
-	const want = "022db6ad71532d0863a7837a4243d5b501f4d08568dc2badef5f51da5df186cd"
+func TestCompletionKeyGolden(t *testing.T) {
+	key := CompletionKey([]byte("tenant"), id128(9), 7, 11)
+	const want = "539b735a2ca83fe658e130c674cc1acd89e2c0e999320166f41cb3708e447e02"
 	if hex.EncodeToString(key[:]) != want {
-		t.Fatalf("CompletionKeyV1 = %x, want %s", key, want)
+		t.Fatalf("CompletionKey = %x, want %s", key, want)
 	}
-	other := CompletionKeyV1([]byte("tenant-2"), id128(9), 7, 11)
+	other := CompletionKey([]byte("tenant-2"), id128(9), 7, 11)
 	if key == other {
 		t.Fatal("different tuple produced the same test key")
 	}
 }
 
-func FuzzOpenStateV1(f *testing.F) {
-	seed, err := AppendStateV1(nil, codecStateV1())
+func FuzzOpenState(f *testing.F) {
+	seed, err := AppendState(nil, codecState())
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -351,13 +344,13 @@ func FuzzOpenStateV1(f *testing.F) {
 		if len(data) > MaxStateEnvelopeBytes+1 {
 			data = data[:MaxStateEnvelopeBytes+1]
 		}
-		_, _ = OpenStateV1(data)
+		_, _ = OpenState(data)
 	})
 }
 
-func FuzzOpenCompletionRecordV1(f *testing.F) {
-	_, record := codecCompletionV1(ResultApplied)
-	seed, err := AppendCompletionRecordV1(nil, record)
+func FuzzOpenCompletionRecord(f *testing.F) {
+	_, record := codecCompletion(ResultApplied)
+	seed, err := AppendCompletionRecord(nil, record)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -366,12 +359,12 @@ func FuzzOpenCompletionRecordV1(f *testing.F) {
 		if len(data) > MaxCompletionRecordBytes+1 {
 			data = data[:MaxCompletionRecordBytes+1]
 		}
-		_, _ = OpenCompletionRecordV1(data)
+		_, _ = OpenCompletionRecord(data)
 	})
 }
 
-func FuzzOpenStateV1Resealed(f *testing.F) {
-	seed, err := AppendStateV1(nil, codecStateV1())
+func FuzzOpenStateResealed(f *testing.F) {
+	seed, err := AppendState(nil, codecState())
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -382,13 +375,13 @@ func FuzzOpenStateV1Resealed(f *testing.F) {
 		at := int(offset % uint32(len(candidate)-recordChecksumLen))
 		candidate[at] = value
 		sealRecord(candidate, stateChecksumDomain)
-		_, _ = OpenStateV1(candidate)
+		_, _ = OpenState(candidate)
 	})
 }
 
-func FuzzOpenCompletionRecordV1Resealed(f *testing.F) {
-	_, record := codecCompletionV1(ResultApplied)
-	seed, err := AppendCompletionRecordV1(nil, record)
+func FuzzOpenCompletionRecordResealed(f *testing.F) {
+	_, record := codecCompletion(ResultApplied)
+	seed, err := AppendCompletionRecord(nil, record)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -399,6 +392,6 @@ func FuzzOpenCompletionRecordV1Resealed(f *testing.F) {
 		at := int(offset % uint32(len(candidate)-recordChecksumLen))
 		candidate[at] = value
 		sealRecord(candidate, completionRecordChecksumDomain)
-		_, _ = OpenCompletionRecordV1(candidate)
+		_, _ = OpenCompletionRecord(candidate)
 	})
 }

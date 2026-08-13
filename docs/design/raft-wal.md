@@ -1,4 +1,4 @@
-# Raft WAL v1
+# Raft WAL
 
 Status: Phase 1a durable-storage contract.
 
@@ -7,21 +7,21 @@ This design defines the first disk-backed implementation of
 single-writer fencing, encryption at rest, and crash-ordered publication for
 one Raft member. It is not a serving or high-availability milestone.
 
-Format v1 deliberately does not provide Raft transport, Multi-Raft scheduling,
-shard allocation, serving fences, adaptive splitting, distributed query
-routing, log compaction, key rotation, or a snapshot newer than the static
-bootstrap snapshot. A file eventually reaches `ErrFull` and must not accept
-more durable Raft work. Later formats must preserve or explicitly migrate every
-identity and recovery invariant below.
+The current WAL deliberately does not provide Raft transport, Multi-Raft
+scheduling, shard allocation, serving fences, adaptive splitting, distributed
+query routing, log compaction, key rotation, or a snapshot newer than the
+static bootstrap snapshot. A file eventually reaches `ErrFull` and must not
+accept more durable Raft work. This document defines the only WAL contract
+accepted by the unreleased repository.
 
 ## Qualified platforms
 
 Runtime durability is qualified on Linux and macOS only. Windows and other
 targets retain compile gates, but `Create` and `Open` return
 `ErrPlatformUnsupported` before opening, creating, linking, truncating, or
-otherwise mutating a WAL path. In particular, v1 does not claim that flushing
-an ordinary read-only Windows directory handle durably publishes a hard link
-on every supported filesystem.
+otherwise mutating a WAL path. In particular, this contract does not claim
+that flushing an ordinary read-only Windows directory handle durably publishes
+a hard link on every supported filesystem.
 
 Linux creates and repairs the physical reservation with `fallocate(2)` mode 0.
 macOS creates it with `F_PREALLOCATE/F_ALLOCATEALL` from physical EOF and then
@@ -57,11 +57,11 @@ expected epoch and compares it exactly with the authenticated bootstrap record
 before returning a handle. A lower or higher epoch fails closed. A post-open
 getter is diagnostic only and is not the topology fence.
 
-The bootstrap snapshot is fixed at index 1, term 1 in v1. Its ConfState is
+The bootstrap snapshot is fixed at index 1, term 1. Its ConfState is
 static, bounded to 64 voters and learners, and preserves protobuf presence for
 `AutoLeave`. Unknown protobuf fields on Snapshot, SnapshotMetadata, ConfState,
-HardState, and Entry are rejected rather than silently discarded by the frozen
-v1 codec.
+HardState, and Entry are rejected rather than silently discarded by the strict
+current codec.
 
 ## Physical layout
 
@@ -77,7 +77,7 @@ granule.
 | selected WAL end | remaining fixed capacity | Unselected/preallocated tail |
 
 The file has one sealed, fixed logical size and is physically reserved at
-Create. There is no v1 truncate, rename, generation compaction, or reuse of
+Create. There is no truncate, rename, generation compaction, or reuse of
 selected record space.
 
 ### Static header
@@ -127,9 +127,9 @@ append from sharing a damage granule with an acknowledged prior record.
 
 ## Encryption and object identity
 
-V1 uses AES-256-GCM. The caller's master material is never used directly as a
-GCM key. Domain-separated HMAC-SHA-256 derives per-file data and nonce keys from
-the authenticated file ID.
+The WAL uses AES-256-GCM. The caller's master material is never used directly
+as a GCM key. Domain-separated HMAC-SHA-256 derives per-file data and nonce keys
+from the authenticated file ID.
 
 Static-header nonce derivation is unique within a freshly minted file. Current
 slots and records need a stronger rollback-safe construction because a torn,
@@ -148,8 +148,8 @@ tag, nonce, or chain field uses zero as a format sentinel. Randomly minted
 structural IDs do reserve zero and a random source that returns all zero bytes
 is rejected after one bounded read.
 
-V1 has no online key rotation. A wrong key ID, wrapped-metadata expectation, or
-master key fails closed.
+There is no online key rotation. A wrong key ID, wrapped-metadata expectation,
+or master key fails closed.
 
 ## Bounds and admission
 
@@ -180,10 +180,10 @@ may fit after worst-case reservation closes, and message-only, heartbeat, read,
 or otherwise durability-empty Ready batches remain accepted at physical,
 record-count, and logical-live limits.
 
-Format v1 also exposes a detached `CapacityProfile`: exact
-`CapacityFormatStaticV1`, authenticated log base index, and sealed
-`MaxEntries`. A future snapshot/compaction-capable format must expose another
-capacity format before it can compact. `raftmember.ValidateStaticNoGCCompletionCapacity`
+The WAL also exposes a detached `CapacityProfile`: exact
+`CapacityFormatStatic`, authenticated log base index, and sealed `MaxEntries`.
+Runtime snapshot and compaction are unsupported, and qualification rejects any
+non-static profile. `raftmember.ValidateStaticNoGCCompletionCapacity`
 uses the profile for one finite, count-only state-machine proof. It first reads
 the locked apply claim's exact SQL/WAL binding and authority, derives the live
 WAL binding from that authority, and rejects any coordinate mismatch. The
@@ -191,10 +191,9 @@ claim must be healthy and initialized. With retained completion count `C`,
 applied index `A`, committed index `H`, and last log index `L`, qualification
 checks `C <= A-1`, `1 <= A <= H <= L`, and `L-1 <= MaxEntries`.
 
-The claim also reports its exact apply format. Only current apply formats v1
-and v2, whose grammar creates at most one completion per entry, qualify; an
-unknown future apply format is rejected until its completion bound is proved.
-Consequently:
+The claim also reports its exact apply format. Only the current apply grammar,
+which creates at most one completion per entry, qualifies; any other identifier
+is rejected. Consequently:
 
 `C + (L-A) <= L-1 <= MaxEntries <= MaxCompletions`
 
@@ -204,7 +203,7 @@ per-entry ledger. The implementation also checks `C+(L-A) <= MaxCompletions`
 with overflow-safe subtraction. Qualification is an instantaneous predicate
 under caller-exclusive startup ownership, not a lease or reservation token. It
 must be repeated for every reopened exact WAL/apply pair and is invalid for any
-capacity format other than `CapacityFormatStaticV1`.
+capacity format other than `CapacityFormatStatic`.
 
 This proof does not replace proposal ordering. A future owner that constructs
 and retains the exact WAL, apply claim, and `raftmodel.Node` must perform
@@ -222,10 +221,10 @@ Empty Ready batches still perform read-only namespace fencing, but issue zero
 WAL writes and zero syncs. `MustSync` does not change that property when there
 is no Snapshot, Entry, or HardState to persist.
 
-The default v1 maximum record is 80 MiB; the public absolute cap is 96 MiB.
+The default maximum record is 80 MiB; the public absolute cap is 96 MiB.
 Recovery reads and decrypts one record at a time, so 96 MiB is the true
-worst-case single-record read/decrypt amplification. A later format should
-chunk large batches under one atomic current-slot commit.
+worst-case single-record read/decrypt amplification. Large-batch chunking under
+one atomic current-slot commit is unsupported.
 
 ## Incarnations and Ready order
 
@@ -238,7 +237,7 @@ Within one begun handle, the first Ready ID is 1 and each new Ready is exactly
 the prior ID plus one, including durability-empty Ready batches. Reusing the
 latest accepted key is allowed only for an exact canonical retry. Regressions,
 gaps, or changed bytes fail closed. Retry-key binding begins after an in-order
-batch passes v1's bounded canonical validation; rejected malformed or
+batch passes the bounded canonical validation; rejected malformed or
 unsupported input is not retained as attacker-controlled retry state.
 
 No Open resumes an old process's in-memory Ready sequence. Open resolves the
@@ -322,7 +321,7 @@ Interior corruption, valid-CRC envelope or GCM failure, wrong key or identity,
 record gaps, non-adjacent valid slot generations, impossible log transitions,
 and selected-record corruption fail closed. Bytes after the selected WAL end
 are ignored because the fixed tail may contain an orphan record or older
-preallocated contents. V1 never truncates that tail.
+preallocated contents. The WAL never truncates that tail.
 
 An all-zero current slot is absent. A checksum-invalid slot is the only explicit
 torn classification. If the other slot is authenticated, recovery may fall
@@ -332,10 +331,10 @@ every envelope, geometry, key, AEAD, payload, and semantic error is fatal and
 cannot trigger rollback.
 
 This rule has a deliberate but important limit: without an external monotonic
-witness, v1 cannot distinguish an in-flight torn write from post-ack bitrot or
+witness, this contract cannot distinguish an in-flight torn write from post-ack bitrot or
 tampering that makes the newest slot checksum-invalid or all zero. Such damage
 can roll recovery back to the older authenticated term, vote, log, and retry
-state. Whole-file rollback is likewise undetectable. Therefore v1 does not
+state. Whole-file rollback is likewise undetectable. Therefore this WAL does not
 claim general authenticated anti-rollback and its safety contract excludes
 post-ack media corruption, malicious storage, and whole-file rollback.
 
@@ -355,7 +354,7 @@ OS inode locks are advisory, and namespace proofs observe boundaries rather
 than continuously mediating the filesystem. Every process that can write a WAL
 inode must cooperate through `storeio.LockWriter`. The WAL directory, host
 administrator, and local storage stack are trusted not to mutate the inode or
-namespace between proofs. V1 does not defend against a malicious or
+namespace between proofs. The WAL does not defend against a malicious or
 non-cooperating local writer or administrator.
 
 The Store pins the parent directory and retains its canonical live path and
@@ -383,7 +382,7 @@ errors are unknown unless absence or a foreign existing leaf is proved.
 
 ## Validation gates
 
-The v1 seal includes deterministic byte goldens for static header, bootstrap
+The qualification seal includes deterministic byte goldens for static header, bootstrap
 record, and current slot; every current-slot short-write prefix; CRC-valid
 authentication corruption; full Open-level orphan/torn/full-selector crash
 cuts; record and slot write/sync faults; same-handle and close/reopen retry

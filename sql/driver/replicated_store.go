@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	// ReplicatedShardStoreFormatV1 is the first write-once SQL catalog binding
+	// ReplicatedShardStoreFormat is the current write-once SQL catalog binding
 	// between a prepared local shard store and one replicated WAL/apply lineage.
-	ReplicatedShardStoreFormatV1 uint16 = 1
+	ReplicatedShardStoreFormat uint16 = 1
 
 	replicatedMaxIdentityBytes     = 255
 	replicatedMaxKeyBytes          = 256
@@ -443,7 +443,7 @@ func replicatedIdentityForTable(
 		MaxBatchBytes:     t.collection.MaxBatchBytes(),
 	}
 	identity := ReplicatedShardStoreIdentity{
-		Format:         ReplicatedShardStoreFormatV1,
+		Format:         ReplicatedShardStoreFormat,
 		Binding:        binding,
 		LogID:          logID,
 		UserTable:      strings.Clone(name),
@@ -531,7 +531,7 @@ func validateOpenedReplicatedCatalog(d *database) error {
 			return err
 		}
 		members = append(members, durable.NamedCollection{
-			Name:       replicatedstate.SystemCollectionNameV1,
+			Name:       replicatedstate.SystemCollectionName,
 			Collection: d.replicatedApplyCollection,
 		})
 	}
@@ -573,7 +573,7 @@ func validateReplicatedUserTableName(name string) error {
 }
 
 func validateReplicatedShardStoreIdentity(i ReplicatedShardStoreIdentity) error {
-	if i.Format != ReplicatedShardStoreFormatV1 {
+	if i.Format != ReplicatedShardStoreFormat {
 		return fmt.Errorf("vibedb: unsupported replicated shard store format %d", i.Format)
 	}
 	if err := validateReplicatedShardStoreBinding(i.Binding); err != nil {
@@ -606,7 +606,7 @@ func validateReplicatedShardStoreLimits(l ReplicatedShardStoreLimits) error {
 		l.MaxDocumentBytes <= 0 || l.MaxDocumentBytes > replicatedMaxDocumentBytes ||
 		l.MaxBatchDocuments <= 0 || l.MaxBatchDocuments > replicatedMaxDistinctMutations ||
 		l.MaxBatchBytes <= 0 {
-		return fmt.Errorf("%w: user limits exceed replicated v1 bounds", ErrReplicatedShardStoreProfile)
+		return fmt.Errorf("%w: user limits exceed replicated bounds", ErrReplicatedShardStoreProfile)
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-// Package replication defines the frozen, deterministic state-machine command
+// Package replication defines the strict, deterministic state-machine command
 // and completion envelopes used at the replication boundary.
 //
 // The package deliberately contains no consensus, transport, persistence, or

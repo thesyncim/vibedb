@@ -48,7 +48,7 @@ func TestDeterministicRepeatedNumberEncoding(t *testing.T) {
 					dst = append([]byte(nil), "prefix-noise"...)
 				}
 				prefixLen := len(dst)
-				got, err := V1.AppendScalar(dst, s)
+				got, err := CurrentTupleCodec.AppendScalar(dst, s)
 				if err != nil {
 					t.Fatalf("iteration %d: AppendScalar: %v", i, err)
 				}
@@ -77,7 +77,7 @@ func TestDeterministicRepeatedStringEncoding(t *testing.T) {
 			s := NewString(raw)
 			var want []byte
 			for i := range 500 {
-				got, err := V1.AppendScalar(nil, s)
+				got, err := CurrentTupleCodec.AppendScalar(nil, s)
 				if err != nil {
 					t.Fatalf("iteration %d: AppendScalar: %v", i, err)
 				}
@@ -99,7 +99,7 @@ func TestDeterministicRepeatedTupleEncoding(t *testing.T) {
 	values := []Scalar{NewString("tenant"), five, NewString("")}
 	var want []byte
 	for i := range 500 {
-		got, err := V1.AppendTuple(nil, values)
+		got, err := CurrentTupleCodec.AppendTuple(nil, values)
 		if err != nil {
 			t.Fatalf("iteration %d: AppendTuple: %v", i, err)
 		}

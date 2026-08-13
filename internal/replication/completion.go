@@ -9,15 +9,12 @@ import (
 
 var completionMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'P', 0, 0}
 
-var completionResultDomain = [...]byte{
-	'v', 'i', 'b', 'e', 'd', 'b', '/', 'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/',
-	'c', 'o', 'm', 'p', 'l', 'e', 't', 'i', 'o', 'n', '-', 'r', 'e', 's', 'u', 'l', 't', '/', 'v', '1', 0,
-}
+var completionResultDomain = []byte("vibedb/replication/completion-result\x00")
 
-// CompletionV1 is the exact retained outcome of one retryable command. The
+// Completion is the exact retained outcome of one retryable command. The
 // origin lineage remains attached when completion state moves to another range.
 // ResultFormat is an application-owned, nonzero payload format identifier.
-type CompletionV1 struct {
+type Completion struct {
 	ClusterID             ID128
 	ClusterIncarnation    ID128
 	TopologyRecoveryEpoch uint64
@@ -49,12 +46,12 @@ type CompletionV1 struct {
 	InlineResult []byte
 }
 
-// CompletionViewV1 is a borrowed checksum-, digest-, and semantics-validated
+// CompletionView is a borrowed checksum-, digest-, and semantics-validated
 // completion. Tenant, Distribution, Shard, InlineResult, and Bytes alias the
-// OpenCompletionV1 input. Copying or retaining the view retains the complete
+// OpenCompletion input. Copying or retaining the view retains the complete
 // bounded input envelope; all borrowed slices are capacity-clamped and
 // read-only.
-type CompletionViewV1 struct {
+type CompletionView struct {
 	ClusterID              ID128
 	ClusterIncarnation     ID128
 	TopologyRecoveryEpoch  uint64
@@ -88,21 +85,21 @@ type CompletionViewV1 struct {
 }
 
 // Bytes returns the exact validated envelope, borrowing the decoder input.
-func (v CompletionViewV1) Bytes() []byte {
+func (v CompletionView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
 
-// CompletionResultDigestV1 computes the frozen, domain-separated SHA-256
+// CompletionResultDigest computes the domain-separated SHA-256
 // digest of one exact application result.
-func CompletionResultDigestV1(
+func CompletionResultDigest(
 	resultCode uint32,
 	resultFormat uint16,
 	result []byte,
 ) Digest {
-	return completionResultDigestV1(resultCode, resultFormat, uint64(len(result)), result)
+	return completionResultDigest(resultCode, resultFormat, uint64(len(result)), result)
 }
 
-func completionResultDigestV1(
+func completionResultDigest(
 	resultCode uint32,
 	resultFormat uint16,
 	resultLength uint64,
@@ -121,12 +118,12 @@ func completionResultDigestV1(
 	return digest
 }
 
-// AppendCompletionV1 appends one canonical completion envelope. On validation
+// AppendCompletion appends one canonical completion envelope. On validation
 // failure dst is unchanged. With sufficient capacity it allocates zero. Input
 // slices must not overlap the writable append region in dst's current backing
 // array; such aliases are rejected before dst is modified.
-func AppendCompletionV1(dst []byte, completion CompletionV1) ([]byte, error) {
-	total, err := measureCompletionV1(completion)
+func AppendCompletion(dst []byte, completion Completion) ([]byte, error) {
+	total, err := measureCompletion(completion)
 	if err != nil {
 		return dst, err
 	}
@@ -137,7 +134,7 @@ func AppendCompletionV1(dst []byte, completion CompletionV1) ([]byte, error) {
 	dst = extendZeroed(dst, total)
 	frame := dst[start:]
 	copy(frame[0:8], completionMagic[:])
-	appendU16(frame, 8, CompletionFormatV1)
+	appendU16(frame, 8, completionCodecFormat)
 	frame[10] = byte(completion.Storage)
 	appendU16(frame, 12, completionHeaderBytes)
 	appendU16(frame, 14, completion.ResultFormat)
@@ -180,7 +177,7 @@ func AppendCompletionV1(dst []byte, completion CompletionV1) ([]byte, error) {
 	return dst, nil
 }
 
-func completionOverlapsAppendRegion(dst []byte, total int, completion CompletionV1) bool {
+func completionOverlapsAppendRegion(dst []byte, total int, completion Completion) bool {
 	region := writableAppendRegion(dst, total)
 	return len(region) != 0 && (byteSlicesOverlap(region, completion.Tenant) ||
 		byteSliceStringOverlap(region, completion.Distribution) ||
@@ -188,8 +185,8 @@ func completionOverlapsAppendRegion(dst []byte, total int, completion Completion
 		byteSlicesOverlap(region, completion.InlineResult))
 }
 
-func measureCompletionV1(completion CompletionV1) (int, error) {
-	if err := validateCompletionV1(completion); err != nil {
+func measureCompletion(completion Completion) (int, error) {
+	if err := validateCompletion(completion); err != nil {
 		return 0, err
 	}
 	total := uint64(completionHeaderBytes + envelopeChecksumBytes)
@@ -206,7 +203,7 @@ func measureCompletionV1(completion CompletionV1) (int, error) {
 	return int(total), nil
 }
 
-func validateCompletionV1(completion CompletionV1) error {
+func validateCompletion(completion Completion) error {
 	if !nonzero128(completion.ClusterID) || !nonzero128(completion.ClusterIncarnation) ||
 		!nonzero128(completion.ShardIncarnation) || !nonzero128(completion.GroupID) ||
 		!nonzero128(completion.ClientID) || !nonzeroDigest(completion.Fingerprint) ||
@@ -241,7 +238,7 @@ func validateCompletionV1(completion CompletionV1) error {
 			completion.ResultLength != uint64(len(completion.InlineResult)) {
 			return semantic("inline completion length")
 		}
-		want := completionResultDigestV1(
+		want := completionResultDigest(
 			completion.ResultCode, completion.ResultFormat,
 			completion.ResultLength, completion.InlineResult,
 		)
@@ -259,38 +256,38 @@ func validateCompletionV1(completion CompletionV1) error {
 	return nil
 }
 
-// OpenCompletionV1 validates one exact completion and returns a borrowed view.
-func OpenCompletionV1(src []byte) (CompletionViewV1, error) {
+// OpenCompletion validates one exact completion and returns a borrowed view.
+func OpenCompletion(src []byte) (CompletionView, error) {
 	if len(src) < completionHeaderBytes+envelopeChecksumBytes {
-		return CompletionViewV1{}, corrupt("short completion")
+		return CompletionView{}, corrupt("short completion")
 	}
 	if len(src) > MaxCompletionEnvelopeBytes {
-		return CompletionViewV1{}, ErrEnvelopeTooLarge
+		return CompletionView{}, ErrEnvelopeTooLarge
 	}
 	if !bytes.Equal(src[:8], completionMagic[:]) {
-		return CompletionViewV1{}, corrupt("completion magic")
+		return CompletionView{}, corrupt("completion magic")
 	}
-	version := binary.LittleEndian.Uint16(src[8:10])
-	if version != CompletionFormatV1 {
-		return CompletionViewV1{}, unsupported("completion", version)
+	format := binary.LittleEndian.Uint16(src[8:10])
+	if format != completionCodecFormat {
+		return CompletionView{}, unsupported("completion", format)
 	}
 	if binary.LittleEndian.Uint16(src[12:14]) != completionHeaderBytes {
-		return CompletionViewV1{}, corrupt("completion header size")
+		return CompletionView{}, corrupt("completion header size")
 	}
 	total := binary.LittleEndian.Uint32(src[16:20])
 	bodyBytes := binary.LittleEndian.Uint32(src[28:32])
 	if uint64(total) != uint64(len(src)) ||
 		uint64(bodyBytes)+completionHeaderBytes+envelopeChecksumBytes != uint64(total) {
-		return CompletionViewV1{}, corrupt("completion total or body length")
+		return CompletionView{}, corrupt("completion total or body length")
 	}
 	if err := verifyEnvelopeChecksum(src); err != nil {
-		return CompletionViewV1{}, err
+		return CompletionView{}, err
 	}
 	if src[11] != 0 || !allZero(src[278:288]) {
-		return CompletionViewV1{}, semantic("completion flags or reserved bytes")
+		return CompletionView{}, semantic("completion flags or reserved bytes")
 	}
 
-	var view CompletionViewV1
+	var view CompletionView
 	view.Storage = CompletionStorage(src[10])
 	view.ResultFormat = binary.LittleEndian.Uint16(src[14:16])
 	inlineBytes := int(binary.LittleEndian.Uint32(src[20:24]))
@@ -325,7 +322,7 @@ func OpenCompletionV1(src []byte) (CompletionViewV1, error) {
 		shardLen == 0 || shardLen > MaxIdentityBytes || inlineBytes < 0 ||
 		identityBytes < 0 || identityBytes > bodyEnd-completionHeaderBytes ||
 		inlineBytes != bodyEnd-completionHeaderBytes-identityBytes {
-		return CompletionViewV1{}, semantic("completion body lengths")
+		return CompletionView{}, semantic("completion body lengths")
 	}
 	cursor := completionHeaderBytes
 	end := cursor + tenantLen
@@ -339,16 +336,16 @@ func OpenCompletionV1(src []byte) (CompletionViewV1, error) {
 	cursor = end
 	view.InlineResult = src[cursor:bodyEnd:bodyEnd]
 	if !utf8.Valid(view.Distribution) || !utf8.Valid(view.Shard) {
-		return CompletionViewV1{}, semantic("completion text identity is not valid UTF-8")
+		return CompletionView{}, semantic("completion text identity is not valid UTF-8")
 	}
-	if err := validateCompletionViewV1(view); err != nil {
-		return CompletionViewV1{}, err
+	if err := validateCompletionView(view); err != nil {
+		return CompletionView{}, err
 	}
 	view.raw = src[:len(src):len(src)]
 	return view, nil
 }
 
-func validateCompletionViewV1(view CompletionViewV1) error {
+func validateCompletionView(view CompletionView) error {
 	if !nonzero128(view.ClusterID) || !nonzero128(view.ClusterIncarnation) ||
 		!nonzero128(view.ShardIncarnation) || !nonzero128(view.GroupID) ||
 		!nonzero128(view.ClientID) || !nonzeroDigest(view.Fingerprint) ||
@@ -369,7 +366,7 @@ func validateCompletionViewV1(view CompletionViewV1) error {
 			view.ResultLength != uint64(len(view.InlineResult)) {
 			return semantic("inline completion length")
 		}
-		want := completionResultDigestV1(
+		want := completionResultDigest(
 			view.ResultCode, view.ResultFormat, view.ResultLength, view.InlineResult,
 		)
 		if view.ResultDigest != want {

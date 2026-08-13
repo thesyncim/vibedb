@@ -13,9 +13,9 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-func commandValue(binding Binding, sequence uint64) replication.CommandV1 {
+func commandValue(binding Binding, sequence uint64) replication.Command {
 	fingerprint := sha256.Sum256([]byte(fmt.Sprintf("request-%d", sequence)))
-	return replication.CommandV1{
+	return replication.Command{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		Distribution:          binding.Distribution, Shard: binding.Shard,
@@ -34,11 +34,11 @@ func commandValue(binding Binding, sequence uint64) replication.CommandV1 {
 	}
 }
 
-func encodeCommand(t testing.TB, command replication.CommandV1) []byte {
+func encodeCommand(t testing.TB, command replication.Command) []byte {
 	t.Helper()
-	encoded, err := replication.AppendCommandV1(nil, command)
+	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
-		t.Fatalf("AppendCommandV1: %v", err)
+		t.Fatalf("AppendCommand: %v", err)
 	}
 	return encoded
 }
@@ -46,16 +46,16 @@ func encodeCommand(t testing.TB, command replication.CommandV1) []byte {
 func TestEveryImmutableBindingMismatchIsTerminal(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*replication.CommandV1)
+		mutate func(*replication.Command)
 	}{
-		{"ClusterID", func(c *replication.CommandV1) { c.ClusterID = id128(101) }},
-		{"ClusterIncarnation", func(c *replication.CommandV1) { c.ClusterIncarnation = id128(102) }},
-		{"TopologyRecoveryEpoch", func(c *replication.CommandV1) { c.TopologyRecoveryEpoch++ }},
-		{"Distribution", func(c *replication.CommandV1) { c.Distribution += "-other" }},
-		{"Shard", func(c *replication.CommandV1) { c.Shard += "-other" }},
-		{"AllocationGeneration", func(c *replication.CommandV1) { c.AllocationGeneration++ }},
-		{"ShardIncarnation", func(c *replication.CommandV1) { c.ShardIncarnation = id128(103) }},
-		{"GroupID", func(c *replication.CommandV1) { c.GroupID = id128(104) }},
+		{"ClusterID", func(c *replication.Command) { c.ClusterID = id128(101) }},
+		{"ClusterIncarnation", func(c *replication.Command) { c.ClusterIncarnation = id128(102) }},
+		{"TopologyRecoveryEpoch", func(c *replication.Command) { c.TopologyRecoveryEpoch++ }},
+		{"Distribution", func(c *replication.Command) { c.Distribution += "-other" }},
+		{"Shard", func(c *replication.Command) { c.Shard += "-other" }},
+		{"AllocationGeneration", func(c *replication.Command) { c.AllocationGeneration++ }},
+		{"ShardIncarnation", func(c *replication.Command) { c.ShardIncarnation = id128(103) }},
+		{"GroupID", func(c *replication.Command) { c.GroupID = id128(104) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -78,15 +78,15 @@ func TestEveryImmutableBindingMismatchIsTerminal(t *testing.T) {
 func TestEveryMutableFenceMismatchPersistsStaleCompletion(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*replication.CommandV1)
+		mutate func(*replication.Command)
 	}{
-		{"ReplicaSetVersion", func(c *replication.CommandV1) { c.ReplicaSetVersion++ }},
-		{"ActivePolicyGeneration", func(c *replication.CommandV1) { c.ActivePolicyGeneration++ }},
-		{"ProtectionEpoch", func(c *replication.CommandV1) { c.ProtectionEpoch++ }},
-		{"OwnershipEpoch", func(c *replication.CommandV1) { c.OwnershipEpoch++ }},
-		{"SchemaGeneration", func(c *replication.CommandV1) { c.SchemaGeneration++ }},
-		{"RoutingVersion", func(c *replication.CommandV1) { c.RoutingVersion++ }},
-		{"RouteGeneration", func(c *replication.CommandV1) { c.RouteGeneration++ }},
+		{"ReplicaSetVersion", func(c *replication.Command) { c.ReplicaSetVersion++ }},
+		{"ActivePolicyGeneration", func(c *replication.Command) { c.ActivePolicyGeneration++ }},
+		{"ProtectionEpoch", func(c *replication.Command) { c.ProtectionEpoch++ }},
+		{"OwnershipEpoch", func(c *replication.Command) { c.OwnershipEpoch++ }},
+		{"SchemaGeneration", func(c *replication.Command) { c.SchemaGeneration++ }},
+		{"RoutingVersion", func(c *replication.Command) { c.RoutingVersion++ }},
+		{"RouteGeneration", func(c *replication.Command) { c.RouteGeneration++ }},
 	}
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -109,7 +109,7 @@ func TestEveryMutableFenceMismatchPersistsStaleCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			completion, err := replication.OpenCompletionV1(lookup.Bytes)
+			completion, err := replication.OpenCompletion(lookup.Bytes)
 			if err != nil || completion.ResultCode != ResultStaleFence {
 				t.Fatalf("completion=%+v err=%v", completion, err)
 			}
@@ -125,13 +125,13 @@ func TestDeterministicResultCodeMatrix(t *testing.T) {
 	tests := []struct {
 		name string
 		code uint32
-		edit func(*replication.CommandV1)
+		edit func(*replication.Command)
 	}{
-		{"applied", ResultApplied, func(*replication.CommandV1) {}},
-		{"unknown collection", ResultUnknownCollection, func(c *replication.CommandV1) { c.Collection = "missing" }},
-		{"invalid document", ResultInvalidDocument, func(c *replication.CommandV1) { c.Mutations[0].Value = []byte("{") }},
-		{"target bound", ResultTargetBound, func(c *replication.CommandV1) {
-			c.Mutations = make([]replication.Mutation, MaxDistinctMutationsV1+1)
+		{"applied", ResultApplied, func(*replication.Command) {}},
+		{"unknown collection", ResultUnknownCollection, func(c *replication.Command) { c.Collection = "missing" }},
+		{"invalid document", ResultInvalidDocument, func(c *replication.Command) { c.Mutations[0].Value = []byte("{") }},
+		{"target bound", ResultTargetBound, func(c *replication.Command) {
+			c.Mutations = make([]replication.Mutation, MaxDistinctMutations+1)
 			for i := range c.Mutations {
 				c.Mutations[i] = replication.Mutation{Kind: replication.MutationPut, Key: []byte{byte(i + 1)}, Value: []byte("null")}
 			}
@@ -149,7 +149,7 @@ func TestDeterministicResultCodeMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s lookup: %v", test.name, err)
 		}
-		completion, err := replication.OpenCompletionV1(lookup.Bytes)
+		completion, err := replication.OpenCompletion(lookup.Bytes)
 		if err != nil || completion.ResultCode != test.code {
 			t.Fatalf("%s completion=%+v err=%v", test.name, completion, err)
 		}
