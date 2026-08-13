@@ -498,6 +498,39 @@ func TestMemoInternReusesExpressionAddedDirectly(t *testing.T) {
 	}
 }
 
+func TestMemoIndexSeparatesIdenticalExpressionsAcrossGroups(t *testing.T) {
+	const count = 1024
+	memo := NewMemo(Limits{})
+	groups := make([]GroupID, count)
+	for i := range count {
+		logical := LogicalProperties{Rows: ExactEstimate(float64(i + 1))}
+		group, err := memo.NewGroup(logical)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := memo.Add(group, Expression{Op: OpLogicalScan}); err != nil {
+			t.Fatal(err)
+		}
+		groups[i] = group
+	}
+	for i := count - 1; i >= 0; i-- {
+		group, _, err := memo.Intern(
+			Expression{Op: OpLogicalScan},
+			LogicalProperties{Rows: ExactEstimate(float64(i + 1))},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if group != groups[i] {
+			t.Fatalf("Intern row estimate %d returned group %d, want %d", i+1, group, groups[i])
+		}
+	}
+	stats := memo.Statistics()
+	if stats.ExpressionIndexEntries != count*2 || stats.Expressions != count {
+		t.Fatalf("memo index statistics = %+v", stats)
+	}
+}
+
 func TestPlannerBudgetsAndCancellation(t *testing.T) {
 	t.Run("expression budget", func(t *testing.T) {
 		memo := NewMemo(Limits{MaxExpressions: 2, MaxRuleApplications: 10})
@@ -830,4 +863,20 @@ func BenchmarkMemoizedPropertyOptimization(b *testing.B) {
 		ownedMemoBytes = optimizer.Statistics().Memo.RetainedBytes
 	}
 	b.ReportMetric(float64(ownedMemoBytes), "owned-memo-B/op")
+}
+
+func BenchmarkMemoAddSameExpressionAcross1KGroups(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		memo := NewMemo(Limits{})
+		for i := range 1024 {
+			group, err := memo.NewGroup(LogicalProperties{Rows: ExactEstimate(float64(i + 1))})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, _, err := memo.Add(group, Expression{Op: OpLogicalScan}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
 }

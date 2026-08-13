@@ -66,6 +66,12 @@ A memo group denotes one relational result. Its expressions are alternatives
 with the same logical properties; child edges point to groups, not fixed child
 plans. Duplicate expressions are suppressed. A group can therefore cache one
 winner for singleton ordered output and another for hash-partitioned output.
+One seeded flat index uses separate group-deduplication and global-interning
+domains. Each expression contributes two index references, preventing identical
+scan shapes in thousands of groups from collapsing into one quadratic probe
+run. Hashes only route candidates; exact expression and logical-property
+comparison proves every hit, and the private per-memo salt does not participate
+in plan choice or deterministic counters.
 
 Rules are ordinary objects with a stable name, phase, priority, match, and
 apply function. Exploration and implementation are separate phases. Rules may
@@ -134,8 +140,8 @@ typed error; the optimizer never silently publishes the best plan observed
 before truncation. Positive and negative property results are memoized, so an
 impossible child requirement is not recomputed for every parent alternative.
 
-`OptimizerStatistics` reports memo groups, expressions, rule applications,
-accounted payload bytes, owned slice-capacity bytes, physical alternatives,
+`OptimizerStatistics` reports memo groups, expressions, expression-index
+references, rule applications, accounted payload bytes, owned slice-capacity bytes, physical alternatives,
 property states/cache entries/cache hits, enforcer alternatives/steps, plan
 nodes, deterministic search payload bytes, memory rejections, and peak search
 depth. It deliberately excludes a clock; benchmarks time `Optimize` at the
@@ -198,7 +204,8 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | same lookup in a 1,024-table catalog | about 36 ns | 0 | 154 bytes/table for one observed column and one heavy hitter |
 | heavy-hitter lookup among 1,024 skew values | about 29 ns | 0 | 16-byte directory entry plus one interned scalar |
 | per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
-| fresh memo/rules/property search, two physical alternatives | about 1.3 µs | 3,816 bytes / 31 allocations including construction | 352 owned memo bytes |
+| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,872 bytes / 28 allocations including construction | 352 owned memo bytes |
+| add the same scan shape to 1,024 distinct groups | about 0.17 ms | 804 KB / 54 allocations including construction | 2,048 bounded index references |
 | build and validate that 1,024-table catalog | about 0.71 ms | 3.10 MB / 13,347 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.

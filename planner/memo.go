@@ -3,6 +3,9 @@ package planner
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
+	"math"
+	"math/bits"
 	"slices"
 	"unsafe"
 )
@@ -91,6 +94,11 @@ type memoExpression struct {
 	next  ExprID
 }
 
+type expressionIndexEntry struct {
+	first      ExprID
+	collisions []ExprID
+}
+
 // Memo compactly stores equivalent relational expressions. It is mutable only
 // while being built and during its single atomic rule exploration. Successful
 // exploration seals it for physical search. Memo is not safe for concurrent
@@ -99,7 +107,8 @@ type Memo struct {
 	limits       Limits
 	groups       []memoGroup
 	expressions  []memoExpression
-	byHash       map[uint64][]ExprID
+	indexSalt    uint64
+	index        map[uint64]expressionIndexEntry
 	ruleApps     uint32
 	payloadBytes uint64
 	state        memoState
@@ -110,11 +119,12 @@ type Memo struct {
 // implementation overhead is deliberately excluded because it is runtime
 // version-specific.
 type MemoStatistics struct {
-	Groups           uint32
-	Expressions      uint32
-	RuleApplications uint32
-	PayloadBytes     uint64
-	RetainedBytes    uint64
+	Groups                 uint32
+	Expressions            uint32
+	ExpressionIndexEntries uint64
+	RuleApplications       uint32
+	PayloadBytes           uint64
+	RetainedBytes          uint64
 }
 
 // Statistics returns an instantaneous search-space snapshot.
@@ -124,7 +134,8 @@ func (m *Memo) Statistics() MemoStatistics {
 	}
 	stats := MemoStatistics{
 		Groups: uint32(len(m.groups)), Expressions: uint32(len(m.expressions)),
-		RuleApplications: m.ruleApps, PayloadBytes: m.payloadBytes,
+		ExpressionIndexEntries: uint64(len(m.expressions)) * 2,
+		RuleApplications:       m.ruleApps, PayloadBytes: m.payloadBytes,
 		RetainedBytes: uint64(cap(m.groups))*uint64(unsafe.Sizeof(memoGroup{})) +
 			uint64(cap(m.expressions))*uint64(unsafe.Sizeof(memoExpression{})),
 	}
@@ -143,8 +154,10 @@ func (m *Memo) Statistics() MemoStatistics {
 }
 
 func NewMemo(limits Limits) *Memo {
+	seed := maphash.MakeSeed()
 	return &Memo{
-		limits: limits.withDefaults(), byHash: make(map[uint64][]ExprID),
+		limits: limits.withDefaults(), indexSalt: maphash.Comparable(seed, uint64(0x766962656462)),
+		index: make(map[uint64]expressionIndexEntry),
 	}
 }
 
@@ -181,11 +194,18 @@ func (m *Memo) Intern(expr Expression, logical LogicalProperties) (GroupID, Expr
 	if m.state == memoSealed {
 		return NoGroup, NoExpr, ErrMemoSealed
 	}
-	hash := expressionHash(expr)
-	for _, id := range m.byHash[hash] {
+	hash := internExpressionHash(m.indexSalt, expr, logical)
+	if entry, exists := m.index[hash]; exists {
+		id := entry.first
 		record := m.expressions[id]
 		if expressionEqual(record.expr, expr) && logicalEqual(m.groups[record.group].logical, logical) {
 			return record.group, id, nil
+		}
+		for _, id = range entry.collisions {
+			record = m.expressions[id]
+			if expressionEqual(record.expr, expr) && logicalEqual(m.groups[record.group].logical, logical) {
+				return record.group, id, nil
+			}
 		}
 	}
 	if expr.Op == OpInvalid {
@@ -227,11 +247,18 @@ func (m *Memo) Add(group GroupID, expr Expression) (id ExprID, added bool, err e
 			return NoExpr, false, fmt.Errorf("%w: expression child group %d does not exist", ErrInvalidMemo, child)
 		}
 	}
-	hash := expressionHash(expr)
-	for _, candidate := range m.byHash[hash] {
+	groupHash := groupExpressionHash(m.indexSalt, group, expr)
+	if entry, exists := m.index[groupHash]; exists {
+		candidate := entry.first
 		record := m.expressions[candidate]
 		if record.group == group && expressionEqual(record.expr, expr) {
 			return candidate, false, nil
+		}
+		for _, candidate = range entry.collisions {
+			record = m.expressions[candidate]
+			if record.group == group && expressionEqual(record.expr, expr) {
+				return candidate, false, nil
+			}
 		}
 	}
 	if uint64(len(m.expressions)) >= uint64(m.limits.MaxExpressions) {
@@ -252,7 +279,9 @@ func (m *Memo) Add(group GroupID, expr Expression) (id ExprID, added bool, err e
 	}
 	owner.lastExpression = id
 	owner.expressionCount++
-	m.byHash[hash] = append(m.byHash[hash], id)
+	m.addIndexEntry(groupHash, id)
+	internHash := internExpressionHash(m.indexSalt, expr, owner.logical)
+	m.addIndexEntry(internHash, id)
 	m.payloadBytes += payload
 	return id, true, nil
 }
@@ -280,7 +309,7 @@ func (m *Memo) rollbackExploration(groups, expressions int, payload uint64, rule
 	m.expressions = m.expressions[:expressions]
 	m.payloadBytes = payload
 	m.ruleApps = ruleApps
-	m.byHash = make(map[uint64][]ExprID, expressions)
+	m.index = make(map[uint64]expressionIndexEntry, expressions*2)
 	for i := range m.groups {
 		m.groups[i].firstExpression = NoExpr
 		m.groups[i].lastExpression = NoExpr
@@ -298,9 +327,21 @@ func (m *Memo) rollbackExploration(groups, expressions int, payload uint64, rule
 		}
 		owner.lastExpression = id
 		owner.expressionCount++
-		hash := expressionHash(record.expr)
-		m.byHash[hash] = append(m.byHash[hash], id)
+		groupHash := groupExpressionHash(m.indexSalt, record.group, record.expr)
+		m.addIndexEntry(groupHash, id)
+		internHash := internExpressionHash(m.indexSalt, record.expr, owner.logical)
+		m.addIndexEntry(internHash, id)
 	}
+}
+
+func (m *Memo) addIndexEntry(hash uint64, id ExprID) {
+	entry, exists := m.index[hash]
+	if !exists {
+		m.index[hash] = expressionIndexEntry{first: id}
+		return
+	}
+	entry.collisions = append(entry.collisions, id)
+	m.index[hash] = entry
 }
 
 func groupPayloadBytes(logical LogicalProperties) (uint64, bool) {
@@ -393,13 +434,68 @@ func expressionEqual(a, b Expression) bool {
 	return a.Op == b.Op && a.Private == b.Private && slices.Equal(a.Children, b.Children)
 }
 
-func expressionHash(expr Expression) uint64 {
-	h := hashUint32(fnv64Offset, uint32(expr.Op))
-	h = hashUint32(h, uint32(expr.Private))
-	for _, child := range expr.Children {
-		h = hashUint32(h, uint32(child))
+func groupExpressionHash(salt uint64, group GroupID, expr Expression) uint64 {
+	hash := indexHashAdd(salt^1, salt, uint64(group))
+	return writeExpressionHash(hash, salt, expr)
+}
+
+func internExpressionHash(salt uint64, expr Expression, logical LogicalProperties) uint64 {
+	hash := writeExpressionHash(salt^2, salt, expr)
+	hash = writeEstimateHash(hash, salt, logical.Rows)
+	hash = writeEstimateHash(hash, salt, logical.RowBytes)
+	hash = indexHashAdd(hash, salt, uint64(len(logical.Columns)))
+	for _, column := range logical.Columns {
+		hash = indexHashAdd(hash, salt, uint64(column))
 	}
-	return h
+	hash = indexHashAdd(hash, salt, uint64(len(logical.UniqueKeys)))
+	for _, key := range logical.UniqueKeys {
+		hash = indexHashAdd(hash, salt, uint64(len(key)))
+		for _, column := range key {
+			hash = indexHashAdd(hash, salt, uint64(column))
+		}
+	}
+	return indexHashFinish(hash)
+}
+
+func writeExpressionHash(hash, salt uint64, expr Expression) uint64 {
+	hash = indexHashAdd(hash, salt, uint64(expr.Op))
+	hash = indexHashAdd(hash, salt, uint64(expr.Private))
+	hash = indexHashAdd(hash, salt, uint64(len(expr.Children)))
+	for _, child := range expr.Children {
+		hash = indexHashAdd(hash, salt, uint64(child))
+	}
+	return indexHashFinish(hash)
+}
+
+func writeEstimateHash(hash, salt uint64, estimate Estimate) uint64 {
+	hash = indexHashAdd(hash, salt, comparableFloatBits(estimate.Value))
+	hash = indexHashAdd(hash, salt, comparableFloatBits(estimate.Lower))
+	hash = indexHashAdd(hash, salt, comparableFloatBits(estimate.Upper))
+	return indexHashAdd(hash, salt, comparableFloatBits(estimate.Confidence))
+}
+
+func comparableFloatBits(value float64) uint64 {
+	if value == 0 {
+		return 0
+	}
+	return math.Float64bits(value)
+}
+
+func indexHashAdd(hash, salt, value uint64) uint64 {
+	value += salt + 0x9e3779b97f4a7c15
+	value = (value ^ value>>30) * 0xbf58476d1ce4e5b9
+	value = (value ^ value>>27) * 0x94d049bb133111eb
+	value ^= value >> 31
+	hash ^= value
+	return bits.RotateLeft64(hash, 27)*0x3c79ac492ba7b653 + 0x1c69b3f74ac4ae35
+}
+
+func indexHashFinish(hash uint64) uint64 {
+	hash ^= hash >> 33
+	hash *= 0xff51afd7ed558ccd
+	hash ^= hash >> 33
+	hash *= 0xc4ceb9fe1a85ec53
+	return hash ^ hash>>33
 }
 
 func logicalEqual(a, b LogicalProperties) bool {
