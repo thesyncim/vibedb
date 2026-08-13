@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"encoding/binary"
+	"math/bits"
 	"strconv"
 	"testing"
 )
@@ -264,6 +265,62 @@ func TestCompactAlphabetSequentialZeroWidthMiddle(t *testing.T) {
 		got, valid := state.appendValue(nil, view, row)
 		if !valid || !bytes.Equal(got, values[row]) {
 			t.Fatalf("row=%d got=%q valid=%v want=%q", row, got, valid, values[row])
+		}
+	}
+}
+
+func TestCompactAlphabetSequentialReservoirWidthsRestartsAndAllocations(t *testing.T) {
+	for _, cardinality := range []int{2, 3, 5, 9, 17, 33, 64} {
+		values := make([][]byte, 2*compactStreamRestart+1)
+		// Seed every symbol so the encoder must select the target width even
+		// when later rows happen to use a smaller subset.
+		values[0] = make([]byte, cardinality)
+		for symbol := range cardinality {
+			values[0][symbol] = byte('A' + symbol)
+		}
+		for row := 1; row < len(values); row++ {
+			length := 1 + row*7%17
+			values[row] = make([]byte, length)
+			for char := range length {
+				values[row][char] = byte('A' + (row*5+char*3)%cardinality)
+			}
+		}
+
+		var scratch compactStreamScratch
+		encoded, ok := scratch.encodeAlphabet(0, values, 0)
+		wantWidth := bits.Len(uint(cardinality - 1))
+		if !ok || int(encoded.width) != wantWidth {
+			t.Fatalf(
+				"cardinality=%d kind=%d width=%d want=%d ok=%v",
+				cardinality, encoded.kind, encoded.width, wantWidth, ok,
+			)
+		}
+		view := compactCodecRoundTrip(t, encoded, values)
+		backing := make([]byte, cardinality+17)
+		decode := func(checkRandom bool) {
+			var state compactStreamSequentialState
+			for row, want := range values {
+				for at := range backing {
+					backing[at] = 0xff
+				}
+				got, valid := state.appendValue(backing[:0], view, row)
+				if !valid || !bytes.Equal(got, want) {
+					panic("packed alphabet sequential decode")
+				}
+				if checkRandom {
+					random, randomValid := view.appendValue(nil, row)
+					if !randomValid || !bytes.Equal(got, random) {
+						panic("packed alphabet random parity")
+					}
+				}
+			}
+		}
+		decode(true)
+		if allocs := testing.AllocsPerRun(1_000, func() { decode(false) }); allocs != 0 {
+			t.Fatalf(
+				"cardinality=%d width=%d allocations=%v want 0",
+				cardinality, wantWidth, allocs,
+			)
 		}
 	}
 }

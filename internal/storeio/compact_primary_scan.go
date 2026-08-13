@@ -352,32 +352,47 @@ func (s *compactStreamSequentialState) appendValue(
 		start := len(dst)
 		dst = append(dst, prefix...)
 		middle := len(dst)
-		dst = append(dst, make([]byte, int(length))...)
+		middleLen := int(length)
+		// The decoder overwrites every middle byte, so a warm scan can extend
+		// its retained buffer without paying to clear the same bytes first.
+		if middleLen <= cap(dst)-len(dst) {
+			dst = dst[:len(dst)+middleLen]
+		} else {
+			dst = append(dst, make([]byte, middleLen)...)
+		}
 		if v.width == 0 {
-			for char := range int(length) {
+			for char := range middleLen {
 				dst[middle+char] = alphabet[0]
 			}
 			s.next++
 			return append(dst, suffix...), true
 		}
-		mask := uint16(1<<v.width) - 1
-		for char := 0; char < int(length); char++ {
-			byteAt := s.bit >> 3
-			shift := s.bit & 7
-			word := uint16(v.data[byteAt])
-			if shift+int(v.width) > 8 {
-				word |= uint16(v.data[byteAt+1]) << 8
+		width := int(v.width)
+		mask := uint64(1<<v.width) - 1
+		byteAt := s.bit >> 3
+		shift := s.bit & 7
+		var packed uint64
+		available := 0
+		if shift != 0 {
+			packed = uint64(v.data[byteAt]) >> shift
+			available = 8 - shift
+			byteAt++
+		}
+		for char := range middleLen {
+			for available < width {
+				packed |= uint64(v.data[byteAt]) << available
+				available += 8
+				byteAt++
 			}
-			code := int(word>>shift) & int(mask)
+			code := int(packed & mask)
 			if code >= len(alphabet) {
 				return dst[:start], false
 			}
 			dst[middle+char] = alphabet[code]
-			s.bit += int(v.width)
+			packed >>= width
+			available -= width
 		}
-		if s.bit != endBit {
-			return dst[:start], false
-		}
+		s.bit = endBit
 		s.next++
 		return append(dst, suffix...), true
 	}
