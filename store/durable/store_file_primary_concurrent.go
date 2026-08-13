@@ -258,6 +258,7 @@ func (p *primaryConcurrentContextPool) ensurePut(
 		[]storeio.UnifiedTokenSpan, 0, 2*p.indexEntries,
 	)
 	context.canonical = make([]byte, 0, 2*p.rawLimit)
+	context.value = make([]byte, 0, p.rawLimit)
 	context.workspace = storeio.NewCanonicalWorkspace(
 		p.indexEntries, p.rawLimit,
 	)
@@ -270,10 +271,11 @@ func (p *primaryConcurrentContextPool) putSlotCapacityBytes() uint64 {
 	spanBytes := uint64(2*p.indexEntries) *
 		uint64(unsafe.Sizeof(storeio.UnifiedTokenSpan{}))
 	canonicalBytes := uint64(2 * p.rawLimit)
+	valueBytes := uint64(p.rawLimit)
 	workspaceBytes := storeio.CanonicalWorkspaceCapacityBytes(
 		p.indexEntries, p.rawLimit,
 	)
-	return indexBytes + spanBytes + canonicalBytes + workspaceBytes
+	return indexBytes + spanBytes + canonicalBytes + valueBytes + workspaceBytes
 }
 
 func (p *primaryConcurrentContextPool) capacityBytes() uint64 {

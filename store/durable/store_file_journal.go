@@ -1265,6 +1265,25 @@ func (c *Collection) journalDepositLocked(
 	return c.journalGroup.depositBump(c.journal.Cursor()-before, 1), nil
 }
 
+// journalConcurrentOverlayAppend appends one explicit buffered-journal redo
+// record for the sole admission-cohort publisher. The caller holds writer.RLock
+// and has already proved Fits. It never checkpoints or poisons: the publisher
+// must first finalize any appended/published prefix as one logical cut, then
+// classify pressure or install a terminal failure before signaling callers.
+func (c *Collection) journalConcurrentOverlayAppend(
+	kind uint16, generation uint64, key, value []byte,
+) (uint64, error) {
+	if !c.bufferedJournalAckLane() || c.journalReplaying {
+		return 0, storeio.ErrInvalidWrite
+	}
+	before := c.journal.Cursor()
+	if _, err := c.journal.Append(kind, generation, key, value); err != nil {
+		return 0, err
+	}
+	c.journalAcks.Add(1)
+	return c.journalGroup.depositBump(c.journal.Cursor()-before, 1), nil
+}
+
 // journalBeforePublishLocked is the journal-backed synchronous lane's
 // acknowledgement. It appends one redo record and syncs it at the point of no
 // return of a primary canonical-frame mutation — after every fallible prepare

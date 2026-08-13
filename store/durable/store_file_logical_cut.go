@@ -78,7 +78,9 @@ func fileLogicalDocumentCount(base uint64, delta int) (uint64, bool) {
 // smaller sibling journal used by Flush to persist a complete overlay suffix.
 // It simply has no per-mutation durable-journal acknowledgement.
 func (c *Collection) packedLogicalCutEnabled() bool {
-	return c != nil && c.primaryConcurrentContexts != nil &&
+	return c != nil &&
+		(c.primaryConcurrentContexts != nil ||
+			c.primaryJournalCohortCutActive.Load()) &&
 		!c.packedLogicalCutDisabled.Load()
 }
 

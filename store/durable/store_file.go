@@ -126,8 +126,12 @@ type Collection struct {
 	// publication lane. Keeping that state separate avoids charging every later
 	// indexed read for a cut load and recheck.
 	packedLogicalCutDisabled atomic.Bool
-	visibilityMu             sync.Mutex
-	pendingVisible           []filePendingState
+	// primaryJournalCohortCutActive is a one-way, pay-for-use certificate. An
+	// explicit RecoveryJournal collection does not tax reads with packed-cut
+	// checks until its first cohort append has succeeded and is about to publish.
+	primaryJournalCohortCutActive atomic.Bool
+	visibilityMu                  sync.Mutex
+	pendingVisible                []filePendingState
 
 	committer *storeio.Committer
 	cache     *storeio.PageCache
@@ -298,6 +302,10 @@ type Collection struct {
 	concurrentPrimaryLargestPublishGroup  atomic.Uint64
 	concurrentPrimaryStripeWaitNS         atomicStatsHistogram
 	concurrentPrimaryPublishGroupSize     atomicStatsHistogram
+	journalCohortReplaces                 atomic.Uint64
+	journalCohortPublishGroups            atomic.Uint64
+	journalCohortLargestPublishGroup      atomic.Uint64
+	journalCohortPublishGroupSize         atomicStatsHistogram
 	retirementPressureCheckpoints         atomic.Uint64
 	materializationAttempts               atomic.Uint64
 	materializationUpdates                atomic.Uint64
@@ -690,6 +698,13 @@ type Stats struct {
 	// successful group and therefore has the same Count as PublishGroups.
 	ConcurrentPrimaryStripeWaitNS     StatsHistogram
 	ConcurrentPrimaryPublishGroupSize StatsHistogram
+	// JournalCohort* accounts only no-stripe RecoveryJournal admission groups.
+	// Keeping it separate prevents benchmark qualification from mistaking this
+	// caller-baton lane for the ordinary bucket-striped concurrent publisher.
+	JournalCohortReplaces            uint64
+	JournalCohortPublishGroups       uint64
+	JournalCohortLargestPublishGroup uint64
+	JournalCohortPublishGroupSize    StatsHistogram
 	// RetirementPressureCheckpoints counts retirement-capacity events that
 	// forced an otherwise-unrequested checkpoint before retry.
 	RetirementPressureCheckpoints uint64

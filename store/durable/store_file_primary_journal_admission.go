@@ -49,18 +49,19 @@ type primaryJournalAdmissionResult struct {
 // awaiting the returned durability continuation. The engine retains only
 // pointers and never interprets payload fields.
 type primaryJournalAdmissionRequest struct {
-	ordinal      uint64
-	kind         primaryMutationKind
-	key          []byte
-	raw          []byte
-	rawLength    int
-	canonical    []byte
-	preflightErr error
-	prepared     bool
-	context      *primaryConcurrentContext
-	result       primaryJournalAdmissionResult
-	signal       primaryJournalAdmissionSignal
-	signaled     bool
+	ordinal       uint64
+	kind          primaryMutationKind
+	key           []byte
+	raw           []byte
+	rawLength     int
+	canonical     []byte
+	preflightErr  error
+	prepared      bool
+	forceBaseline bool
+	context       *primaryConcurrentContext
+	result        primaryJournalAdmissionResult
+	signal        primaryJournalAdmissionSignal
+	signaled      bool
 }
 
 // primaryJournalAdmissionObservation is a possibly stale lock-free phase
@@ -284,6 +285,7 @@ func (r *primaryJournalAdmissionRequest) resetPayload() {
 	r.canonical = nil
 	r.preflightErr = nil
 	r.prepared = false
+	r.forceBaseline = false
 	r.context = nil
 	r.result = primaryJournalAdmissionResult{}
 	if r.signaled || r.signal != (primaryJournalAdmissionSignal{}) {
