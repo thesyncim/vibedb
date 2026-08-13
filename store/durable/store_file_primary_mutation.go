@@ -596,13 +596,14 @@ func (c *Collection) validatePrimarySchema(src []byte) error {
 // primaryPreparedPutInput retains both representations needed by a follower
 // admitted before it reaches the exclusive writer. raw is borrowed from the
 // blocked public caller; rawLength freezes its validation bound. canonical is
-// owned by that caller's bounded context until putPrimaryPrepared returns.
+// owned by that caller's bounded context until putPrimaryPreparedDetached has
+// finished Apply.
 //
 // prepared=false and document.ErrIndexFull are capacity declines, not document
 // errors: putPrimaryPrepared sends them through the unchanged raw path, which
 // owns an unbounded writer-private canonical workspace. Every other preflight
-// result stays provisional until putPrimaryInput has re-established the public
-// closed, persistence, key, and raw-document precedence under writer.
+// result stays provisional until putPrimaryInputLocked has re-established the
+// public closed, persistence, key, and raw-document precedence under writer.
 type primaryPreparedPutInput struct {
 	raw          []byte
 	rawLength    int
@@ -611,11 +612,82 @@ type primaryPreparedPutInput struct {
 	prepared     bool
 }
 
+type primaryMutationDurabilityKind uint8
+
+const (
+	primaryMutationDurabilityNone primaryMutationDurabilityKind = iota
+	primaryMutationDurabilityPublished
+	primaryMutationDurabilityJournal
+)
+
+// primaryMutationDurabilityContinuation is the caller-owned half of one
+// mutation acknowledgement. Apply constructs it while holding writer and after
+// registering durabilityWait, then returns only after writer is unlocked. The
+// caller may hand off ordered apply work before it awaits this value. A pending
+// continuation has exactly one owner and must be awaited exactly once.
+type primaryMutationDurabilityContinuation struct {
+	kind   primaryMutationDurabilityKind
+	target uint64
+}
+
+func (c primaryMutationDurabilityContinuation) pending() bool {
+	return c.kind != primaryMutationDurabilityNone
+}
+
+// registerPrimaryMutationDurabilityLocked preserves the established defer's
+// wait precedence. The caller holds writer, so Add happens before Close can set
+// closed and reach durabilityWait.Wait.
+func (c *Collection) registerPrimaryMutationDurabilityLocked(
+	generation, journalTarget uint64,
+) primaryMutationDurabilityContinuation {
+	continuation := primaryMutationDurabilityContinuation{}
+	switch {
+	case generation != 0 && c.synchronous():
+		continuation.kind = primaryMutationDurabilityPublished
+		continuation.target = generation
+	case journalTarget != 0:
+		continuation.kind = primaryMutationDurabilityJournal
+		continuation.target = journalTarget
+	default:
+		return continuation
+	}
+	c.durabilityWait.Add(1)
+	return continuation
+}
+
+func (c *Collection) awaitPrimaryMutationDurability(
+	continuation primaryMutationDurabilityContinuation,
+	mutationErr error,
+) error {
+	if !continuation.pending() {
+		return mutationErr
+	}
+	defer c.durabilityWait.Done()
+	var waitErr error
+	switch continuation.kind {
+	case primaryMutationDurabilityPublished:
+		waitErr = c.waitPublished(continuation.target)
+	case primaryMutationDurabilityJournal:
+		waitErr = c.journalGroupAwait(continuation.target)
+	default:
+		waitErr = storeio.ErrInvalidWrite
+	}
+	return errors.Join(mutationErr, waitErr)
+}
+
 func (c *Collection) putPrimary(
 	key []byte,
 	src []byte,
 ) (created bool, err error) {
-	return c.putPrimaryInput(key, primaryPreparedPutInput{
+	created, continuation, err := c.putPrimaryDetached(key, src)
+	return created, c.awaitPrimaryMutationDurability(continuation, err)
+}
+
+func (c *Collection) putPrimaryDetached(
+	key []byte,
+	src []byte,
+) (created bool, continuation primaryMutationDurabilityContinuation, err error) {
+	return c.putPrimaryInputDetached(key, primaryPreparedPutInput{
 		raw: src, rawLength: len(src),
 	})
 }
@@ -624,44 +696,63 @@ func (c *Collection) putPrimaryPrepared(
 	key []byte,
 	input primaryPreparedPutInput,
 ) (created bool, err error) {
+	created, continuation, err := c.putPrimaryPreparedDetached(key, input)
+	return created, c.awaitPrimaryMutationDurability(continuation, err)
+}
+
+func (c *Collection) putPrimaryPreparedDetached(
+	key []byte,
+	input primaryPreparedPutInput,
+) (created bool, continuation primaryMutationDurabilityContinuation, err error) {
 	if !input.prepared ||
 		errors.Is(input.preflightErr, document.ErrIndexFull) ||
 		c.options.Collection.Schema != nil {
-		return c.putPrimary(key, input.raw)
+		return c.putPrimaryDetached(key, input.raw)
 	}
-	return c.putPrimaryInput(key, input)
+	return c.putPrimaryInputDetached(key, input)
 }
 
-// putPrimaryInput is the one writer-owning Put body. The raw wrapper and a
-// prepared follower therefore share every mutation, journal, split signal,
-// telemetry, and durability-wait decision after canonical selection.
-func (c *Collection) putPrimaryInput(
+// putPrimaryInputDetached owns writer through mutation and wait registration,
+// but deliberately leaves the device wait to its returned continuation.
+func (c *Collection) putPrimaryInputDetached(
 	key []byte,
 	input primaryPreparedPutInput,
-) (created bool, err error) {
+) (
+	created bool,
+	continuation primaryMutationDurabilityContinuation,
+	err error,
+) {
 	c.writer.Lock()
 	var generation uint64
 	var journalTarget uint64
-	var canonicalCapacityEnsured bool
+	completed := false
 	defer func() {
-		syncWait := generation != 0 && c.synchronous()
-		// The buffered-journal lane deposited its redo record under the writer and
-		// now shares one journal sync across concurrent callers: release the writer
-		// first, then block on the group fence (phase 1 group commit).
-		groupWait := journalTarget != 0
-		if syncWait || groupWait {
-			c.durabilityWait.Add(1)
-		}
+		continuation = c.registerPrimaryMutationDurabilityLocked(
+			generation, journalTarget,
+		)
 		c.writer.Unlock()
-		if syncWait {
-			err = errors.Join(err, c.waitPublished(generation))
-		} else if groupWait {
-			err = errors.Join(err, c.journalGroupAwait(journalTarget))
-		}
-		if syncWait || groupWait {
-			c.durabilityWait.Done()
+		// Preserve the old panic boundary: if a future test seam or invariant
+		// panics after publishing a wait target, do not strand Close behind Add.
+		if !completed && continuation.pending() {
+			_ = c.awaitPrimaryMutationDurability(continuation, err)
 		}
 	}()
+	created, err = c.putPrimaryInputLocked(
+		key, input, &generation, &journalTarget,
+	)
+	completed = true
+	return created, continuation, err
+}
+
+// putPrimaryInputLocked is the one writer-owning Put body. Raw, prepared, and
+// detached wrappers therefore share every mutation, journal, split signal, and
+// telemetry decision after canonical selection. The caller holds writer.
+func (c *Collection) putPrimaryInputLocked(
+	key []byte,
+	input primaryPreparedPutInput,
+	generation, journalTarget *uint64,
+) (created bool, err error) {
+	var canonicalCapacityEnsured bool
 	if c.closed {
 		return false, ErrClosed
 	}
@@ -816,7 +907,7 @@ retryAfterUnifiedFold:
 				if ackErr != nil {
 					return false, ackErr
 				}
-				journalTarget = target
+				*journalTarget = target
 			}
 			return created, nil
 		}
@@ -918,7 +1009,7 @@ retryAfterUnifiedFold:
 			if ackErr != nil {
 				return created, ackErr
 			}
-			journalTarget = target
+			*journalTarget = target
 		}
 		return created, nil
 	}
@@ -1015,14 +1106,14 @@ transactionalPrimaryPut:
 		if ackErr != nil {
 			return created, ackErr
 		}
-		journalTarget = target
+		*journalTarget = target
 	}
 	// The journal-backed sync lane made this mutation durable with an append+sync
 	// inside cowPrimaryMutation, so it never takes the committer root fence; the
 	// outer generation stays zero. Async and buffered-with-reader publish through
 	// the committer and record their applied generation here.
 	if !c.syncJournalLane() {
-		generation = state.root.Generation + 1
+		*generation = state.root.Generation + 1
 	}
 	return created, nil
 }
@@ -1030,25 +1121,39 @@ transactionalPrimaryPut:
 func (c *Collection) deletePrimary(
 	key []byte,
 ) (deleted bool, err error) {
+	deleted, continuation, err := c.deletePrimaryDetached(key)
+	return deleted, c.awaitPrimaryMutationDurability(continuation, err)
+}
+
+func (c *Collection) deletePrimaryDetached(
+	key []byte,
+) (
+	deleted bool,
+	continuation primaryMutationDurabilityContinuation,
+	err error,
+) {
 	c.writer.Lock()
 	var generation uint64
 	var journalTarget uint64
+	completed := false
 	defer func() {
-		syncWait := generation != 0 && c.synchronous()
-		groupWait := journalTarget != 0
-		if syncWait || groupWait {
-			c.durabilityWait.Add(1)
-		}
+		continuation = c.registerPrimaryMutationDurabilityLocked(
+			generation, journalTarget,
+		)
 		c.writer.Unlock()
-		if syncWait {
-			err = errors.Join(err, c.waitPublished(generation))
-		} else if groupWait {
-			err = errors.Join(err, c.journalGroupAwait(journalTarget))
-		}
-		if syncWait || groupWait {
-			c.durabilityWait.Done()
+		if !completed && continuation.pending() {
+			_ = c.awaitPrimaryMutationDurability(continuation, err)
 		}
 	}()
+	deleted, err = c.deletePrimaryLocked(key, &generation, &journalTarget)
+	completed = true
+	return deleted, continuation, err
+}
+
+func (c *Collection) deletePrimaryLocked(
+	key []byte,
+	generation, journalTarget *uint64,
+) (deleted bool, err error) {
 	if c.closed {
 		return false, ErrClosed
 	}
@@ -1122,7 +1227,7 @@ retryAfterUnifiedDeleteFold:
 				if ackErr != nil {
 					return true, ackErr
 				}
-				journalTarget = target
+				*journalTarget = target
 			}
 			return overlayDeleted, nil
 		}
@@ -1224,7 +1329,7 @@ retryAfterUnifiedDeleteFold:
 			if ackErr != nil {
 				return true, ackErr
 			}
-			journalTarget = target
+			*journalTarget = target
 		}
 		return true, nil
 	}
@@ -1287,13 +1392,13 @@ retryAfterUnifiedDeleteFold:
 		if ackErr != nil {
 			return true, ackErr
 		}
-		journalTarget = target
+		*journalTarget = target
 	}
 	// The journal-backed sync lane made this delete durable inside
 	// cowPrimaryMutation; the outer generation stays zero and never takes the
 	// committer fence.
 	if !c.syncJournalLane() {
-		generation = state.root.Generation + 1
+		*generation = state.root.Generation + 1
 	}
 	return true, nil
 }
