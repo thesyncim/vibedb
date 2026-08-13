@@ -687,6 +687,41 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 	}, nil
 }
 
+// ClaimRuntimeOwnership proves that database is the live owner of this apply
+// claim, requires the claim's lifetime reference to be the connector's only
+// live reference, and atomically retires the connector against future SQL
+// sessions. This is a one-way ownership transfer: after success, the caller
+// must close the apply claim before the Database, and the root cannot return to
+// ordinary session ownership without a complete close/reopen.
+func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
+	if a == nil || database == nil || database.connector == nil {
+		return ErrReplicatedApplyClosed
+	}
+	connector := database.connector
+	connector.mu.Lock()
+	defer connector.mu.Unlock()
+	if connector.closed || connector.db == nil {
+		return ErrDatabaseClosed
+	}
+	if a.owner != connector || a.database != connector.db || connector.refs != 1 {
+		return fmt.Errorf(
+			"%w: runtime ownership requires the apply claim as the sole live reference",
+			ErrReplicatedApplyBusy,
+		)
+	}
+	core := connector.db
+	core.mu.RLock()
+	defer core.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return err
+	}
+	if core.replicatedApplyClaim != a {
+		return ErrReplicatedApplyClosed
+	}
+	connector.closed = true
+	return nil
+}
+
 // Close releases the singleton apply claim and its connector lifetime
 // reference. It does not unbind or remove the durable hidden participant.
 func (a *ReplicatedApply) Close() error {
@@ -801,7 +836,18 @@ func (a *ReplicatedApply) AdmitCommand(data []byte) error {
 	if err := a.checkLocked(); err != nil {
 		return err
 	}
-	return a.machine.AdmitCommand(data)
+	err := a.machine.AdmitCommand(data)
+	if err == nil {
+		return nil
+	}
+	// Machine admission returns the exact first causal error even when that
+	// error poisons the durable apply boundary. Attach the constant-size health
+	// result so a Runtime can terminally classify the first failure rather than
+	// discovering ErrApplyPoisoned only on a later proposal.
+	if _, healthErr := a.machine.CompletionCapacityState(); healthErr != nil {
+		return errors.Join(err, healthErr)
+	}
+	return err
 }
 
 // LookupCompletion returns an owned exact completion envelope.

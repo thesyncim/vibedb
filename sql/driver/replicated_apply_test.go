@@ -203,11 +203,35 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 		t.Fatalf("applied capacity profile = %+v, %v; want %+v", got, err, want)
 	}
 
-	conflict := testReplicatedApplyCommand(base, 2, replication.Mutation{
-		Kind: replication.MutationDelete, Key: key,
-	})
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), conflict); err == nil {
-		t.Fatal("conflicting replay did not poison claim")
+	view, err := replication.OpenCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := replicatedstate.CompletionKey(
+		view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence,
+	)
+	var storageKey [33]byte
+	storageKey[0] = 1
+	copy(storageKey[1:], digest[:])
+	core := database.connector.db
+	document, found, err := core.replicatedApplyCollection.AppendRaw(nil, storageKey[:])
+	if err != nil || !found {
+		t.Fatalf("retained completion = %q, %t, %v", document, found, err)
+	}
+	document = bytes.Clone(document)
+	if document[8] == '0' {
+		document[8] = '1'
+	} else {
+		document[8] = '0'
+	}
+	if err := core.replicatedApplyCollection.Update(func(batch *durable.WriteBatch) error {
+		return batch.Put(storageKey[:], document)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrCompletionCorrupt) ||
+		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {
+		t.Fatalf("first corrupt admission = %v, want completion corruption plus poison", err)
 	}
 	if got, err := claim.CapacityQualificationProfile(); got != (ReplicatedApplyCapacityProfile{}) ||
 		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {

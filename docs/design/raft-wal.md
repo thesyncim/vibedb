@@ -205,12 +205,25 @@ under caller-exclusive startup ownership, not a lease or reservation token. It
 must be repeated for every reopened exact WAL/apply pair and is invalid for any
 capacity format other than `CapacityFormatStatic`.
 
-This proof does not replace proposal ordering. A future owner that constructs
-and retains the exact WAL, apply claim, and `raftmodel.Node` must perform
-application `AdmitCommand`, then `ReserveReady`, then `Node.Propose` under the
-Node's single-scheduler contract. No such serving owner exists in this slice;
-an ordering helper that accepted an arbitrary Node could not prove that the
-Node was constructed from the qualified WAL/apply pair.
+This proof does not replace proposal ordering. `raftmember.Runtime` now
+constructs and exclusively retains the exact WAL, apply claim, SQL database,
+and `raftmodel.Node`. It performs application `AdmitCommand`, then
+`ReserveReady`, then `Node.Propose` under the Node's single-scheduler contract.
+The runtime remains non-serving: a nil proposal error means local core
+admission only, not leadership, commit, apply, or a client result.
+
+`internal/multiraft.Host` multiplexes a bounded set of those runtimes. Each
+range/shard is one independent Raft group; a one-range deployment is simply one
+runtime in the same Host path. Host retains no goroutine or wall-clock timer per
+group. After its initial adoption probe, a quiescent group leaves the runnable
+queue and consumes no scheduler-scan CPU while it has no message, proposal,
+explicit logical tick, campaign, or unfinished Ready work. The group still
+retains its ordinary runtime, memory, and WAL state. A dormant-group removal
+path closes and releases a retired range before reusing its bounded Host slot;
+topology authorization and generation fencing remain outside this kernel. A
+future production cadence must still deliver logical ticks efficiently (for
+example with a timer wheel); this kernel does not make election/heartbeat work
+free.
 
 Nor is the inequality a physical storage reservation. It closes the logical
 retained-completion-count bound only. The SQL system/user files still have

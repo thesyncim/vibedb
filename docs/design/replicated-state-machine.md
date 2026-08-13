@@ -9,14 +9,25 @@ state atomically through one hidden durable system collection.
 
 This is deliberately not a serving or high-availability milestone. It does not
 wire shard RPCs to Raft, permit client-facing replicated SQL writes, create runtime
-snapshots, compact the Raft WAL, reserve physical system/user storage, run a
-Multi-Raft scheduler, or authorize Read Committed or Serializable transactions
-across replicas. A later static-WAL qualification now proves finite logical
+snapshots, compact the Raft WAL, reserve physical system/user storage, provide
+authenticated network transport, or authorize Read Committed or Serializable
+transactions across replicas. A static-WAL qualification now proves finite logical
 completion-count headroom for one exact healthy, initialized WAL/apply pair
 after checking its binding and applied/committed/log cut. It does not reserve
 bytes, grant proposal authority, or produce a lease. Its purpose is to make the
 local committed-entry boundary executable and crash-testable before those
 features depend on it.
+
+The local non-serving runtime boundary is now executable. One
+`raftmember.Runtime` exclusively owns the exact WAL, SQL root, apply claim, and
+Raft Node for a range; `internal/multiraft.Host` schedules a bounded set of those
+independent range groups. One range uses the same path with one group. Idle
+groups have no goroutine, timer, or scheduler scan after their initial probe,
+while no Ready, input, or logical tick is queued, but still retain their normal
+in-memory and durable state. A later cadence layer must still schedule Raft
+ticks efficiently. This is operation-count fairness between completed
+synchronous steps, not latency,
+election-liveness, transport, or HA qualification.
 
 ## Scope and construction
 
@@ -288,7 +299,9 @@ Before serving, later phases must add all of:
    completion GC; any runtime snapshot/compaction also requires a reconstructed
    suffix reservation ledger because the static-base proof then expires;
 3. crash-atomic runtime snapshots and WAL generation compaction;
-4. bounded Multi-Raft scheduling and authenticated transport;
+4. the landed bounded in-process Multi-Raft host still needs authenticated
+   ordinary-message and snapshot transport, peer flow control, and deadline/
+   slow-disk isolation;
 5. leader-aware routing with a fenced range proof, applied-position tokens,
    completion lookup, and `ReadIndex` reads; and
 6. a replicated SQL command grammar capable of the advertised isolation mode.

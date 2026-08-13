@@ -298,8 +298,9 @@ remain predictable because their capacities and fold work are fixed at open.
   today; both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
-  the embedded surface. Replication, failover, and online resharding across
-  independent durable roots remain future work.
+  the embedded surface. Serving replication with authenticated transport,
+  failover, and online resharding across independent durable roots remain
+  future work.
 - [Unification](design/unification.md): the unified mutable collection and
   its remaining performance gates.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`

@@ -1,6 +1,8 @@
 // Package raftmember binds one open Raft WAL to one prepared replicated SQL
-// shard root. It deliberately owns no Node construction, incarnation minting,
-// proposal admission, transport, or serving authority.
+// shard root and can adopt that exact pair into one non-serving synchronous
+// Runtime. Runtime owns incarnation minting, Node construction, proposal
+// admission order, and Ready lifecycle; it deliberately owns no network
+// transport or serving authority.
 package raftmember
 
 import (

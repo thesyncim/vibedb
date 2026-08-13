@@ -1,10 +1,11 @@
 # Raft core selection and threat model
 
 **Status:** the core, dependency revision, baseline configuration, synchronous
-driver, bounded logical store/state-machine model, replayable simulator
-foundation, and Phase 1a static-snapshot disk WAL are executable. This is not
-a claim that production replication, failover, a serving/compacting Raft WAL,
-runtime snapshots, or a network transport exists yet. Those claims remain
+driver, bounded logical store/state-machine model, replayable simulator,
+Phase 1a static-snapshot disk WAL, exact member runtime, and bounded in-process
+Multi-Raft host are executable. This is not a claim that production
+replication, failover, a serving/compacting Raft WAL, runtime snapshots, or a
+network transport exists yet. Those claims remain
 gated by the [distributed delivery plan](distributed-sharding.md#delivery-plan).
 
 ## Exact selection and provenance
@@ -200,7 +201,7 @@ while CI's `1.26` selector tracks current patch releases.
 
 ## Executable Phase-0 foundation
 
-Four deliberately separate packages now make the contract testable without
+Deliberately separate packages now make the contract testable without
 claiming a production replicated store:
 
 - `internal/raftmodel` owns one actual upstream `RawNode`, proposal/read
@@ -219,14 +220,25 @@ claiming a production replicated store:
   pretends the core's private randomized follower/candidate timeout is
   seed-controlled. Leader heartbeat/check-quorum timing uses the fixed
   configured election threshold.
-- `internal/replication` freezes pure command and completion byte envelopes.
-  Those codecs are intentionally unwired: they establish bounded canonical
-  data, not a WAL, completion table, blob store, transport, or apply path.
+- `internal/replication` freezes pure command and completion byte envelopes
+  consumed by the replicated apply boundary. The codecs establish bounded
+  canonical data, not a WAL, blob store, transport, or serving path.
 - `internal/raftstore` implements the Phase 1a identity-bound, encrypted,
   preallocated append-only `StableStore` and exact Ready retry boundary on
   Linux and macOS. It has a static bootstrap snapshot and no compaction,
   transport, serving path, or general anti-rollback witness; its full qualified
   contract and quarantine limits are in [Raft WAL](raft-wal.md).
+- `internal/raftmember.Runtime` exclusively adopts one exact WAL, SQL root,
+  apply claim, and Node; mints a fresh incarnation; enforces
+  `AdmitCommand` -> `ReserveReady` -> `Node.Propose`; and drives one explicit
+  persistence-before-send Ready micro-step at a time. It rejects snapshots and
+  exposes no raw component, read, membership, or serving API.
+- `internal/multiraft.Host` owns a bounded set of independent range runtimes.
+  A single-range deployment adds one group to the same Host. A FIFO runnable
+  queue and rotating input classes provide operation-count fairness without a
+  goroutine, timer, or polling scan per idle group. It is an in-process outbox,
+  not peer transport, and one synchronous slow operation can still block its
+  caller.
 
 The simulator's `MemoryStore` is an indivisible logical durability oracle, not
 an implementation template. It cannot represent torn sectors, fsync lies,

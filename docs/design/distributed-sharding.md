@@ -1,7 +1,8 @@
 # Distributed sharding and replication
 
-**Status:** future design; contract and qualification plan only. No network
-routing, replica protocol, distributed ownership, or cross-shard guarantee is
+**Status:** future serving design. A bounded non-serving in-process Raft member
+runtime and Multi-Raft host exist, but no network transport, client routing,
+serving replica protocol, distributed ownership, or cross-shard guarantee is
 implemented today.
 
 **Idea:** place independent durable collections behind stateless routers, give
@@ -23,7 +24,13 @@ writer authority, and adds optional failover, by replicating each shard with
 one embedded Raft group, multiplexed by a Multi-Raft scheduler, using a pinned
 and audited version of [`etcd-io/raft`](https://github.com/etcd-io/raft); Raft
 is the chosen implementation, not a hard prerequisite for sharding or for
-running a shard leader-only. A shard may instead run leader-only under a
+running a shard leader-only. A one-range deployment registers one Runtime and
+one group in the same Host path used at larger scale. Range splits create
+additional independent groups; they do not extend one global consensus log
+across independently writable ranges. The bounded Host schedules only runnable
+groups and a dormant range can be removed to reclaim its slot, while topology
+authorization and split generation fencing remain later serving contracts. A
+shard may instead run leader-only under a
 statically configured ownership epoch and no replication protocol at all (see
 [Ownership, fencing, and failover](#ownership-fencing-and-failover)), and adopt
 Raft later without a placement or routing change. Vibedb implements the

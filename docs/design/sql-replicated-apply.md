@@ -137,7 +137,8 @@ pairing `Published()` with an independently captured SQL snapshot is forbidden.
 
 ## Remaining serving gates
 
-Before a client request can use this boundary, the runtime still needs:
+Before a client request can use this boundary, the remaining serving system
+still needs:
 
 1. an exact healthy, initialized apply claim and static no-compaction WAL now
    have a count-only qualification when their full binding matches,
@@ -148,8 +149,9 @@ Before a client request can use this boundary, the runtime still needs:
    needs physical reservation, completion GC needs durable forgotten floors,
    and a compacting WAL needs a reconstructed suffix ledger;
 2. crash-atomic runtime snapshot export/install and WAL generation compaction;
-3. bounded Multi-Raft scheduling plus authenticated ordinary and snapshot
-   transport;
+3. the landed bounded in-process Multi-Raft host still needs authenticated
+   ordinary and snapshot transport, peer flow control, and deadline/slow-disk
+   isolation;
 4. leadership-aware routing, retry/indeterminate result grammar, shared
    `(ShardIncarnation, GroupID, AppliedSequence)` positions, and routing proof
    for composite keys or future placement profiles;
