@@ -930,6 +930,26 @@ func TestCompactPrimaryScanDecoderZeroHoleShape(t *testing.T) {
 }
 
 func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
+	size := unsafe.Sizeof(CompactPrimaryScanDecoder{})
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		for _, pin := range []struct {
+			name string
+			got  uintptr
+			want uintptr
+		}{
+			{"shape metadata", unsafe.Sizeof(compactPrimaryScanShape{}), 96},
+			{"stream view", unsafe.Sizeof(compactStreamView{}), 104},
+			{"stream plan", unsafe.Sizeof(compactPrimaryScanStream{}), 4},
+			{"scan decoder", size, 30_672},
+		} {
+			if pin.got != pin.want {
+				t.Fatalf("64-bit %s bytes=%d, want %d", pin.name, pin.got, pin.want)
+			}
+		}
+	}
+	if size > 31<<10 {
+		t.Fatalf("scan decoder bytes=%d exceed bounded 31 KiB footprint", size)
+	}
 	for _, high := range []bool{false, true} {
 		rows := 4096
 		if high {
@@ -958,18 +978,8 @@ func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
 		}
 		t.Logf(
 			"high=%t dictionary bounds=%d largest=%d decoder-bytes=%d",
-			high, bounds, largest, unsafe.Sizeof(CompactPrimaryScanDecoder{}),
+			high, bounds, largest, size,
 		)
-		size := unsafe.Sizeof(CompactPrimaryScanDecoder{})
-		if unsafe.Sizeof(uintptr(0)) == 8 && size != 30_672 {
-			t.Fatalf(
-				"64-bit scan decoder bytes=%d, want 30672 (published base was 29136)",
-				size,
-			)
-		}
-		if size > 31<<10 {
-			t.Fatalf("scan decoder bytes=%d exceed bounded 31 KiB footprint", size)
-		}
 		if bounds > compactPrimaryScanDictionaryBounds {
 			t.Fatalf(
 				"high=%t dictionary bounds=%d exceed plan=%d",
@@ -996,7 +1006,7 @@ func TestCompactPrimaryScanDictionarySequentialParityAndBounds(t *testing.T) {
 	for row := range values {
 		var wantOK, gotOK bool
 		want, wantOK = stream.appendValue(want[:0], row)
-		got, gotOK = state.appendDictionary(got[:0], stream, row, bounds)
+		got, gotOK = state.appendDictionary(got[:0], &stream, row, bounds)
 		if !wantOK || !gotOK || !bytes.Equal(got, want) {
 			t.Fatalf("row %d dictionary scan = %q,%v want %q,%v", row, got, gotOK, want, wantOK)
 		}
@@ -1004,7 +1014,7 @@ func TestCompactPrimaryScanDictionarySequentialParityAndBounds(t *testing.T) {
 
 	// A non-sequential call keeps the complete admitted random-rank fallback.
 	state = compactStreamSequentialState{}
-	got, gotOK := state.appendDictionary(got[:0], stream, 73, bounds)
+	got, gotOK := state.appendDictionary(got[:0], &stream, 73, bounds)
 	want, wantOK := stream.appendValue(want[:0], 73)
 	if !wantOK || !gotOK || !bytes.Equal(got, want) || state.next != 0 {
 		t.Fatalf("random fallback = %q,%v next=%d want %q,%v", got, gotOK, state.next, want, wantOK)
@@ -1013,7 +1023,7 @@ func TestCompactPrimaryScanDictionarySequentialParityAndBounds(t *testing.T) {
 	// Prepared bounds are trusted only after their local range is rechecked.
 	bad := append([]uint16(nil), bounds...)
 	bad[1] = uint16(len(stream.dictData) + 1)
-	if _, ok := state.appendDictionary(got[:0], stream, 0, bad); ok {
+	if _, ok := state.appendDictionary(got[:0], &stream, 0, bad); ok {
 		t.Fatal("dictionary scan accepted an out-of-range prepared boundary")
 	}
 }

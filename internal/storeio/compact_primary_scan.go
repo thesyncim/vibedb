@@ -152,7 +152,7 @@ func (d *CompactPrimaryScanDecoder) appendKey(
 	}
 	d.prepare(v, bucket)
 	out, ok := d.keyState.appendFrontKey(
-		dst, d.key, row, d.keyPrior[:d.keyState.previousLen],
+		dst, &d.key, row, d.keyPrior[:d.keyState.previousLen],
 	)
 	if !ok || len(out) > len(d.keyPrior) {
 		return dst, false
@@ -181,7 +181,10 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 	if !d.supported || shape < 0 || shape >= v.shapeCount {
 		return v.appendValueOrdinal(dst, row, shape, ordinal)
 	}
-	meta := d.shapes[shape]
+	// Borrow decoder-owned metadata for this synchronous render. On 64-bit
+	// targets the shape is 96 bytes and each stream view is 104 bytes, so copying
+	// either inside the row/hole loop would turn metadata into scan bandwidth.
+	meta := &d.shapes[shape]
 	if int(meta.holes) > compactPrimaryScanHoles {
 		return dst, false
 	}
@@ -192,7 +195,7 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		dst = append(dst, meta.static[previous:end]...)
 		previous = end
 		streamAt := int(meta.first) + hole
-		stream := d.streamView[streamAt]
+		stream := &d.streamView[streamAt]
 		state := &d.streams[streamAt]
 		var ok bool
 		plan := d.streamPlan[streamAt]
@@ -215,7 +218,7 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 
 func (s *compactStreamSequentialState) appendDictionary(
 	dst []byte,
-	v compactStreamView,
+	v *compactStreamView,
 	row int,
 	bounds []uint16,
 ) ([]byte, bool) {
@@ -238,7 +241,7 @@ func (s *compactStreamSequentialState) appendDictionary(
 
 func (s *compactStreamSequentialState) appendFrontKey(
 	dst []byte,
-	v compactStreamView,
+	v *compactStreamView,
 	row int,
 	previous []byte,
 ) ([]byte, bool) {
@@ -301,7 +304,7 @@ func (s *compactStreamSequentialState) appendFrontKey(
 
 func (s *compactStreamSequentialState) appendValue(
 	dst []byte,
-	v compactStreamView,
+	v *compactStreamView,
 	row int,
 ) ([]byte, bool) {
 	if v.kind == compactStreamAlphabet {
