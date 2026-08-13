@@ -366,7 +366,11 @@ func createFromPrimaryGraphRecords(
 			recoveryJournalHeaderFor(
 				storeID, journalID, uint32(normalized.PageSize),
 				normalized.MaxKeyBytes, normalized.InlineValueBytes,
-				normalized.MaxDocumentBytes, 1,
+				recoveryJournalInitialDocumentBytes(
+					normalized.Durability,
+					normalized.InlineValueBytes,
+					normalized.MaxDocumentBytes,
+				), 1,
 				func() int {
 					if normalized.Durability == DurabilityBufferedVisible &&
 						!normalized.RecoveryJournal {

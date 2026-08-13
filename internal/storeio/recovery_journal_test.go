@@ -1067,6 +1067,95 @@ func TestRecoveryJournalFullForcesRecycle(t *testing.T) {
 	}
 }
 
+func TestRecoveryJournalGrowCapacityPreservesLivePrefix(t *testing.T) {
+	const initial = uint64(2 * RecoveryJournalMinSectorSize)
+	rj, path := createTestJournal(t, initial)
+	appendPut(t, rj, 2, "a", "before")
+	beforeCursor := rj.Cursor()
+	beforeSequence := rj.NextSequence()
+	beforeCount := rj.Header().RecycleCount
+
+	const grown = uint64(5 * RecoveryJournalMinSectorSize)
+	if err := rj.GrowCapacity(grown, true); err != nil {
+		t.Fatalf("GrowCapacity: %v", err)
+	}
+	if got := rj.Header().Capacity; got != grown {
+		t.Fatalf("grown capacity = %d, want %d", got, grown)
+	}
+	if rj.Cursor() != beforeCursor || rj.NextSequence() != beforeSequence ||
+		rj.Header().RecycleCount != beforeCount+1 || rj.headerSlot != 1 {
+		t.Fatalf(
+			"growth changed live state: cursor=%d sequence=%d count=%d slot=%d",
+			rj.Cursor(), rj.NextSequence(), rj.Header().RecycleCount,
+			rj.headerSlot,
+		)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(recoveryJournalRegionStart) + int64(grown); info.Size() != want {
+		t.Fatalf("grown file size = %d, want %d", info.Size(), want)
+	}
+	appendPut(t, rj, 3, "b", string(make([]byte, 1_200)))
+	if err := rj.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rj = reopenTestJournal(t, path)
+	defer rj.Close()
+	if rj.Header().Capacity != grown || rj.Cursor() <= beforeCursor {
+		t.Fatalf("reopened grown state = capacity %d cursor %d",
+			rj.Header().Capacity, rj.Cursor())
+	}
+	replayed := replayAll(t, rj, 1)
+	if len(replayed) != 2 || string(replayed[0].Key) != "a" ||
+		string(replayed[1].Key) != "b" || len(replayed[1].Value) != 1_200 {
+		t.Fatalf("replay after growth = %+v", replayed)
+	}
+}
+
+func TestRecoveryJournalGrowCapacityCrashFallsBack(t *testing.T) {
+	const initial = uint64(4 * RecoveryJournalMinSectorSize)
+	rj, path := createTestJournal(t, initial)
+	appendPut(t, rj, 2, "k", "v")
+	beforeCursor := rj.Cursor()
+	beforeSequence := rj.NextSequence()
+	beforeCount := rj.Header().RecycleCount
+	fault := NewFaultJournal(rj)
+	fault.Program(JournalFaultPlan{Phase: JournalFaultTornRecycle})
+	if err := rj.GrowCapacity(8*RecoveryJournalMinSectorSize, true); err == nil {
+		t.Fatal("torn growth returned nil error")
+	}
+	if !fault.Faulted() {
+		t.Fatal("growth header fault did not fire")
+	}
+	if rj.Header().Capacity != initial || rj.Cursor() != beforeCursor ||
+		rj.NextSequence() != beforeSequence ||
+		rj.Header().RecycleCount != beforeCount || rj.headerSlot != 0 {
+		t.Fatalf(
+			"failed growth changed manager: capacity=%d cursor=%d sequence=%d count=%d slot=%d",
+			rj.Header().Capacity, rj.Cursor(), rj.NextSequence(),
+			rj.Header().RecycleCount, rj.headerSlot,
+		)
+	}
+	if err := rj.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rj = reopenTestJournal(t, path)
+	defer rj.Close()
+	if rj.Header().Capacity != initial {
+		t.Fatalf("fallback capacity = %d, want %d",
+			rj.Header().Capacity, initial)
+	}
+	replayed := replayAll(t, rj, 1)
+	if len(replayed) != 1 || string(replayed[0].Key) != "k" ||
+		string(replayed[0].Value) != "v" {
+		t.Fatalf("fallback replay = %+v", replayed)
+	}
+}
+
 func TestRecoveryJournalRecycleCrashFallsBack(t *testing.T) {
 	rj, path := createTestJournal(t, 64*RecoveryJournalMinSectorSize)
 	fj := NewFaultJournal(rj)

@@ -253,6 +253,112 @@ func TestSyncPrimaryJournalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSyncJournalDefersOverflowCapacityUntilFirstLargeRecord(t *testing.T) {
+	options := syncPrimaryJournalTestOptions()
+	options.InlineValueBytes = 512
+	options.MaxDocumentBytes = 4 << 20
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.vibe")
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection, err := Create(file, options)
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("Create: %v", err)
+	}
+
+	header := collection.journal.Header()
+	wantInitial := recoveryJournalCapacityBytesFor(
+		header.SectorSize,
+		options.MaxKeyBytes,
+		options.InlineValueBytes,
+		options.InlineValueBytes,
+		0,
+	)
+	eagerOverflow := recoveryJournalCapacityBytesFor(
+		header.SectorSize,
+		options.MaxKeyBytes,
+		options.InlineValueBytes,
+		options.MaxDocumentBytes,
+		0,
+	)
+	if header.Capacity != wantInitial {
+		t.Fatalf("initial journal capacity = %d, want inline cadence %d", header.Capacity, wantInitial)
+	}
+	if header.Capacity >= eagerOverflow {
+		t.Fatalf("initial capacity %d did not defer eager overflow reserve %d", header.Capacity, eagerOverflow)
+	}
+	journalPath := RecoveryJournalPath(path)
+	info, err := os.Stat(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantInitialSize := int64(2*storeio.RecoveryJournalHeaderSize) + int64(wantInitial)
+	if info.Size() != wantInitialSize {
+		t.Fatalf("initial journal size = %d, want %d", info.Size(), wantInitialSize)
+	}
+
+	const small = `{"v":"prefix"}`
+	if _, err := collection.Put([]byte("small"), []byte(small)); err != nil {
+		t.Fatalf("small Put: %v", err)
+	}
+	checkpoints := collection.Stats().AutomaticCheckpoints
+	large := []byte(`{"pad":"` + strings.Repeat("x", 3<<20) + `"}`)
+	if _, err := collection.Put([]byte("large"), large); err != nil {
+		t.Fatalf("large Put: %v", err)
+	}
+	if got := collection.Stats().AutomaticCheckpoints; got <= checkpoints {
+		t.Fatalf("oversized record retained a live prefix: checkpoints=%d before=%d", got, checkpoints)
+	}
+	grown := collection.journal.Header().Capacity
+	if grown <= wantInitial {
+		t.Fatalf("large Put left journal capacity at %d, want growth past %d", grown, wantInitial)
+	}
+	if grown > eagerOverflow {
+		t.Fatalf("on-demand capacity = %d, exceeds old eager reserve %d", grown, eagerOverflow)
+	}
+	info, err = os.Stat(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantGrownSize := int64(2*storeio.RecoveryJournalHeaderSize) + int64(grown)
+	if info.Size() != wantGrownSize {
+		t.Fatalf("grown journal size = %d, want %d", info.Size(), wantGrownSize)
+	}
+	t.Logf(
+		"sync journal apparent bytes: initial=%d eager-overflow=%d grown-on-demand=%d",
+		wantInitialSize,
+		int64(2*storeio.RecoveryJournalHeaderSize)+int64(eagerOverflow),
+		wantGrownSize,
+	)
+
+	if err := collection.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_ = file.Close()
+	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	collection, err = Open(file, options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer collection.Close()
+	got, found, err := collection.AppendRaw(nil, []byte("large"))
+	if err != nil || !found || string(got) != string(large) {
+		t.Fatalf("large value after reopen: bytes=%d found=%v err=%v", len(got), found, err)
+	}
+	got, found, err = collection.AppendRaw(nil, []byte("small"))
+	if err != nil || !found || string(got) != small {
+		t.Fatalf("prefix value after reopen: got=%q found=%v err=%v", got, found, err)
+	}
+}
+
 // TestSyncPrimaryJournaledRecordReplayedAfterCrashWindow exercises the exact
 // window the reversed ordering opens: the redo record is appended and synced
 // durable, but the mutation is NOT yet applied to memory or published. The

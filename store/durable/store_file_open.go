@@ -381,7 +381,11 @@ func (c *Collection) createInitialState() error {
 		header := recoveryJournalHeaderFor(
 			c.cacheStoreID(), journalID, uint32(c.options.PageSize),
 			c.options.MaxKeyBytes, c.options.InlineValueBytes,
-			c.options.MaxDocumentBytes, 1,
+			recoveryJournalInitialDocumentBytes(
+				c.options.Durability,
+				c.options.InlineValueBytes,
+				c.options.MaxDocumentBytes,
+			), 1,
 			func() int {
 				if c.buffered() && !c.options.RecoveryJournal {
 					return c.options.primaryUnifiedOverlayBytes
