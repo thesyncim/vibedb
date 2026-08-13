@@ -3,6 +3,7 @@ package planner
 import (
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"unsafe"
 )
@@ -176,6 +177,64 @@ func TestStatisticsCatalogSpaceShape(t *testing.T) {
 	}
 }
 
+func TestCompactEstimatePreservesHugeLowerBound(t *testing.T) {
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "huge",
+		Rows: Estimate{
+			Value: 1e100, Lower: 5e99, Upper: 2e100, Confidence: .75,
+		},
+		RowBytes: ExactEstimate(8),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, _ := catalog.Table("huge")
+	rows := table.Rows()
+	if rows.Lower <= 0 || rows.Lower > 5e99 || rows.Lower > rows.Value || rows.Upper != 2e100 ||
+		math.Abs(rows.Lower-5e99)/5e99 > 1e-6 {
+		t.Fatalf("huge compact estimate = %+v", rows)
+	}
+	awkward := newCompactEstimate(Estimate{
+		Value: 2, Lower: 1.00000001, Upper: 2, Confidence: 1,
+	}, 0).public()
+	if awkward.Lower > 1.00000001 {
+		t.Fatalf("compact lower bound rounded upward: %+v", awkward)
+	}
+}
+
+func TestStatisticsHeavyHittersAreSortedForLookup(t *testing.T) {
+	descriptors := []TableStatistics{{
+		Table: "events", Rows: ExactEstimate(100), RowBytes: ExactEstimate(8),
+		Columns: []ColumnStatistics{{
+			Path: "/tenant", Distinct: ExactEstimate(10),
+			MostCommon: []ValueFrequency{
+				{Value: `"z"`, Frequency: .2},
+				{Value: `"a"`, Frequency: .1},
+				{Value: `"m"`, Frequency: .15},
+			},
+		}},
+	}}
+	catalog, err := NewStatisticsCatalog(1, descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, _ := catalog.Table("events")
+	column, _ := table.Column("/tenant")
+	for value, want := range map[string]float64{`"a"`: .1, `"m"`: .15, `"z"`: .2} {
+		if got := column.EqualitySelectivity(value); got != want {
+			t.Fatalf("EqualitySelectivity(%s) = %v, want %v", value, got, want)
+		}
+	}
+	descriptor := catalog.Descriptors()[0].Columns[0]
+	if descriptor.MostCommon[0].Value != `"a"` || descriptor.MostCommon[2].Value != `"z"` {
+		t.Fatalf("heavy hitters not stored in lookup order: %+v", descriptor.MostCommon)
+	}
+	if descriptors[0].Columns[0].MostCommon[0].Value != `"z"` {
+		t.Fatalf("catalog construction mutated caller-owned skew input: %+v",
+			descriptors[0].Columns[0].MostCommon)
+	}
+}
+
 func TestStatisticsValidation(t *testing.T) {
 	valid := TableStatistics{
 		Table: "t", Rows: ExactEstimate(10), RowBytes: ExactEstimate(8),
@@ -297,4 +356,29 @@ func BenchmarkPartitionStatisticsLookup1KPartitions(b *testing.B) {
 		_, _ = table.PartitionRows("shard-0512")
 	}
 	b.ReportMetric(float64(catalog.RetainedBytes())/1024, "retained-B/partition")
+}
+
+func BenchmarkStatisticsHeavyHitterLookup1KValues(b *testing.B) {
+	values := make([]ValueFrequency, 1024)
+	for i := range values {
+		values[len(values)-1-i] = ValueFrequency{
+			Value: fmt.Sprintf(`"tenant-%04d"`, i), Frequency: .0005,
+		}
+	}
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "events", Rows: ExactEstimate(1_000_000), RowBytes: ExactEstimate(128),
+		Columns: []ColumnStatistics{{
+			Path: "/tenant", Distinct: ExactEstimate(10_000), MostCommon: values,
+		}},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	table, _ := catalog.Table("events")
+	column, _ := table.Column("/tenant")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = column.EqualitySelectivity(`"tenant-0512"`)
+	}
 }

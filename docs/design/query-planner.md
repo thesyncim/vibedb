@@ -154,15 +154,20 @@ The compact representation is sparse and flat:
 | strings/scalars | one interned byte arena |
 
 Tables and columns are sorted and use allocation-free binary search. Heavy
-hitters avoid the uniformity error for skewed equality predicates. Sparse
+hitters avoid the uniformity error for skewed equality predicates; their
+canonical values are sorted, their total mass is stored in the otherwise spare
+bytes of the 64-byte column record, and lookup switches from a tiny linear run
+to binary search above eight values. Sparse
 equi-depth cumulative histograms support later range selectivity without a
 slice header or allocation per column. Estimates carry central value, lower and
 upper bounds, and confidence in the hot compact form; lower bound and confidence
-use float32 slots so both 64-byte directory shapes remain unchanged. The
-distributed cost model uses the upper row and width bounds. Missing table
-statistics use conservative defaults. JSON scalar statistics are canonicalized
-at publication, including exact numeric spelling variants, so `5`, `5.0`, and
-`50e-1` share one skew key.
+use float32 slots so both 64-byte directory shapes remain unchanged. Lower
+bounds use an absolute encoding at ordinary magnitudes and a scale-free
+lower/value ratio beyond float32 range, preserving finite uncertainty for huge
+cardinalities. The distributed cost model uses the upper row and width bounds.
+Missing table statistics use conservative defaults. JSON scalar statistics are
+canonicalized at publication, including exact numeric spelling variants, so
+`5`, `5.0`, and `50e-1` share one skew key.
 
 Optional per-shard row estimates prevent a targeted route from assuming rows
 are uniformly distributed. When every selected shard has an estimate, their
@@ -184,11 +189,12 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 
 | Benchmark | Time | Query-path allocation | Retained/search space |
 | --- | ---: | ---: | ---: |
-| table + column + heavy-hitter lookup, one table | about 14 ns | 0 | — |
+| table + column + heavy-hitter lookup, one table | about 15 ns | 0 | — |
 | same lookup in a 1,024-table catalog | about 36 ns | 0 | 154 bytes/table for one observed column and one heavy hitter |
+| heavy-hitter lookup among 1,024 skew values | about 29 ns | 0 | 16-byte directory entry plus one interned scalar |
 | per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
 | fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,816 bytes / 31 allocations including construction | 352 owned memo bytes |
-| build and validate that 1,024-table catalog | about 1.2 ms | 5.77 MB / 25,644 allocations on the cold publication path | compact result measured separately |
+| build and validate that 1,024-table catalog | about 0.71 ms | 3.10 MB / 13,347 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.
 The scaled catalog benchmark separates the generation-publication build cost

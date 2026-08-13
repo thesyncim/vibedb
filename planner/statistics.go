@@ -72,21 +72,42 @@ type statisticStringRef struct {
 type compactEstimate struct {
 	value      float64
 	upper      float64
-	lower      float32
+	lowerCode  float32
 	confidence float32
 }
 
 func newCompactEstimate(estimate Estimate, fallback float64) compactEstimate {
 	e := estimate.Normalize(fallback)
+	lowerCode := conservativeFloat32(e.Lower)
+	if e.Lower > math.MaxFloat32 && e.Value > 0 {
+		// Negative codes store a scale-free ratio. Ordinary magnitudes retain
+		// the previous absolute representation and its useful exact values. Both
+		// encodings round down so a compact lower bound never becomes optimistic.
+		lowerCode = -conservativeFloat32(min(1, e.Lower/e.Value))
+	}
 	return compactEstimate{
-		value: e.Value, upper: e.Upper, lower: float32(e.Lower), confidence: float32(e.Confidence),
+		value: e.Value, upper: e.Upper, lowerCode: lowerCode, confidence: float32(e.Confidence),
 	}
 }
 
+func conservativeFloat32(value float64) float32 {
+	encoded := float32(value)
+	if float64(encoded) > value {
+		encoded = math.Nextafter32(encoded, 0)
+	}
+	return encoded
+}
+
+func (e compactEstimate) lower() float64 {
+	if e.lowerCode < 0 {
+		return min(e.value, e.value*float64(-e.lowerCode))
+	}
+	return min(e.value, float64(e.lowerCode))
+}
+
 func (e compactEstimate) public() Estimate {
-	lower := min(float64(e.lower), e.value)
 	return Estimate{
-		Value: e.value, Lower: lower, Upper: e.upper, Confidence: float64(e.confidence),
+		Value: e.value, Lower: e.lower(), Upper: e.upper, Confidence: float64(e.confidence),
 	}
 }
 
@@ -112,7 +133,7 @@ type compactColumnStatistic struct {
 	commonCount   uint32
 	histBase      uint32
 	histCount     uint32
-	_             [8]byte
+	commonTotal   float64
 }
 
 type compactValueFrequency struct {
@@ -164,6 +185,9 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 		table := &ordered[i]
 		table.Columns = slices.Clone(table.Columns)
 		table.Partitions = slices.Clone(table.Partitions)
+		slices.SortFunc(table.Columns, func(a, b ColumnStatistics) int {
+			return strings.Compare(a.Path, b.Path)
+		})
 		if table.Table == "" || !utf8.ValidString(table.Table) {
 			return nil, statisticsError(table.Table, "table name is empty or invalid UTF-8")
 		}
@@ -189,12 +213,18 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 				}
 				column.MostCommon[valueIndex].Value = canonical
 			}
+			slices.SortFunc(column.MostCommon, func(a, b ValueFrequency) int {
+				return strings.Compare(a.Value, b.Value)
+			})
 			for bucketIndex := range column.Histogram {
 				canonical, err := CanonicalScalarJSON(column.Histogram[bucketIndex].Upper)
 				if err != nil {
 					return nil, statisticsError(table.Table, column.Path+": histogram: "+err.Error())
 				}
 				column.Histogram[bucketIndex].Upper = canonical
+			}
+			if err := validateColumnStatistic(table.Table, table.Columns, j); err != nil {
+				return nil, err
 			}
 			stringBytes += uint64(len(column.Path))
 			commonCount += uint64(len(column.MostCommon))
@@ -248,12 +278,10 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 	}
 	for i := range ordered {
 		table := &ordered[i]
-		columns := slices.Clone(table.Columns)
-		slices.SortFunc(columns, func(a, b ColumnStatistics) int { return strings.Compare(a.Path, b.Path) })
 		tableEntry := compactTableStatistic{
 			name: intern(table.Table), rows: newCompactEstimate(table.Rows, 1000),
 			rowBytes:   newCompactEstimate(table.RowBytes, 128),
-			columnBase: uint32(len(catalog.columns)), columnCount: uint32(len(columns)),
+			columnBase: uint32(len(catalog.columns)), columnCount: uint32(len(table.Columns)),
 		}
 		for partitionIndex := range table.Partitions {
 			partition := &table.Partitions[partitionIndex]
@@ -262,16 +290,14 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 				rows: newCompactEstimate(partition.Rows, 0),
 			})
 		}
-		for columnIndex := range columns {
-			column := &columns[columnIndex]
-			if err := validateColumnStatistic(table.Table, columns, columnIndex); err != nil {
-				return nil, err
-			}
+		for columnIndex := range table.Columns {
+			column := &table.Columns[columnIndex]
 			entry := compactColumnStatistic{
 				path: intern(column.Path), distinct: newCompactEstimate(column.Distinct, 100),
 				nullFraction: float32(column.NullFraction), avgValueBytes: float32(column.AvgValueBytes),
 				commonBase: uint32(len(catalog.common)), commonCount: uint32(len(column.MostCommon)),
 				histBase: uint32(len(catalog.histogram)), histCount: uint32(len(column.Histogram)),
+				commonTotal: commonFrequencyTotal(column.MostCommon),
 			}
 			for _, value := range column.MostCommon {
 				catalog.common = append(catalog.common, compactValueFrequency{
@@ -309,15 +335,10 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 		return statisticsError(table, column.Path+": average value width is invalid")
 	}
 	commonTotal := 0.0
-	seen := make(map[string]struct{}, len(column.MostCommon))
-	for _, value := range column.MostCommon {
-		if _, err := CanonicalScalarJSON(value.Value); err != nil {
-			return statisticsError(table, column.Path+": heavy hitter: "+err.Error())
-		}
-		if _, duplicate := seen[value.Value]; duplicate {
+	for valueIndex, value := range column.MostCommon {
+		if valueIndex != 0 && column.MostCommon[valueIndex-1].Value == value.Value {
 			return statisticsError(table, column.Path+": duplicate heavy hitter")
 		}
-		seen[value.Value] = struct{}{}
 		if !finiteFraction(value.Frequency) || value.Frequency == 0 {
 			return statisticsError(table, column.Path+": heavy-hitter frequency is outside (0,1]")
 		}
@@ -329,9 +350,6 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 	previousFrequency, previousDistinct := 0.0, 0.0
 	previousUpper := ""
 	for _, bucket := range column.Histogram {
-		if _, err := CanonicalScalarJSON(bucket.Upper); err != nil {
-			return statisticsError(table, column.Path+": histogram: "+err.Error())
-		}
 		if !finiteFraction(bucket.Frequency) || bucket.Frequency <= previousFrequency {
 			return statisticsError(table, column.Path+": histogram frequencies are not increasing")
 		}
@@ -351,6 +369,14 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 		return statisticsError(table, column.Path+": histogram exceeds non-null frequency")
 	}
 	return nil
+}
+
+func commonFrequencyTotal(values []ValueFrequency) float64 {
+	total := 0.0
+	for _, value := range values {
+		total += value.Frequency
+	}
+	return total
 }
 
 func validateEstimate(estimate Estimate, label string) error {
@@ -849,22 +875,43 @@ func (s ColumnStatistic) EqualitySelectivityEstimate(canonicalScalar string) Est
 		return Estimate{Value: 0.1, Lower: 0, Upper: 1, Confidence: 0}
 	}
 	entry := s.catalog.columns[s.index]
-	commonTotal := 0.0
-	for i := uint32(0); i < entry.commonCount; i++ {
-		value := s.catalog.common[entry.commonBase+i]
-		if s.catalog.string(value.value) == canonicalScalar {
-			return Estimate{
-				Value: value.frequency, Lower: value.frequency, Upper: value.frequency,
-				Confidence: float64(entry.distinct.confidence),
+	commonIndex := entry.commonCount
+	if entry.commonCount <= 8 {
+		for i := uint32(0); i < entry.commonCount; i++ {
+			value := s.catalog.common[entry.commonBase+i]
+			if s.catalog.string(value.value) == canonicalScalar {
+				commonIndex = i
+				break
 			}
 		}
-		commonTotal += value.frequency
+	} else {
+		lo, hi := uint32(0), entry.commonCount
+		for lo < hi {
+			mid := lo + (hi-lo)/2
+			value := s.catalog.common[entry.commonBase+mid]
+			if s.catalog.string(value.value) < canonicalScalar {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo < entry.commonCount &&
+			s.catalog.string(s.catalog.common[entry.commonBase+lo].value) == canonicalScalar {
+			commonIndex = lo
+		}
 	}
-	tail := max(0, 1-float64(entry.nullFraction)-commonTotal)
+	if commonIndex < entry.commonCount {
+		value := s.catalog.common[entry.commonBase+commonIndex]
+		return Estimate{
+			Value: value.frequency, Lower: value.frequency, Upper: value.frequency,
+			Confidence: float64(entry.distinct.confidence),
+		}
+	}
+	tail := max(0, 1-float64(entry.nullFraction)-entry.commonTotal)
 	common := float64(entry.commonCount)
 	valueDistinct := max(1, entry.distinct.value-common)
 	upperDistinct := max(1, entry.distinct.upper-common)
-	lowerDistinct := float64(entry.distinct.lower) - common
+	lowerDistinct := entry.distinct.lower() - common
 	upper := tail
 	if lowerDistinct > 1 {
 		upper = tail / lowerDistinct
