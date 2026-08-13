@@ -22,6 +22,7 @@ var (
 	primaryJournalCohortBeforePressureSealHook func(int)
 	primaryJournalCohortBeforeForcedSealHook   func()
 	primaryJournalCohortAfterTerminalDrainHook func()
+	primaryJournalCohortPlannedHook            func(int, storeio.BucketID, uint8)
 )
 
 type primaryJournalCohortPlan struct {
@@ -432,6 +433,11 @@ func (c *Collection) publishPrimaryJournalAdmissionCohort(
 			break
 		}
 		plans[index] = plan
+		if primaryJournalCohortPlannedHook != nil {
+			primaryJournalCohortPlannedHook(
+				index, plan.route.Bucket, plan.stableSlot,
+			)
+		}
 		outcome.planned++
 	}
 	if outcome.planned < 2 {
@@ -606,10 +612,14 @@ func (c *Collection) planPrimaryJournalAdmissionReplacement(
 		)
 	}
 	baseRank, baseFound := leaf.FindKey(request.key)
-	if leaf.Len() > storeio.CommonPrimaryLeafWideSlots || !baseFound {
+	if !baseFound {
 		return plan, false, nil
 	}
-	baseSlot, slotOK := leaf.PostingSlot(baseRank)
+	largeUnindexed := leaf.Len() > storeio.CommonPrimaryLeafWideSlots
+	baseSlot, slotOK := uint8(0), largeUnindexed
+	if !largeUnindexed {
+		baseSlot, slotOK = leaf.PostingSlot(baseRank)
+	}
 	if !slotOK {
 		return plan, false, fmt.Errorf(
 			"journal cohort posting slot bucket=%d rank=%d: %w",
@@ -647,6 +657,22 @@ func (c *Collection) planPrimaryJournalAdmissionReplacement(
 		oldLen = len(current)
 		plan.stableSlot = overlaySlot
 	case primaryUnifiedOverlayMissing:
+		if largeUnindexed {
+			var future [4]uint64
+			for _, shadow := range prior {
+				if shadow.route.Bucket == route.Bucket {
+					future[shadow.stableSlot>>6] |=
+						uint64(1) << uint(shadow.stableSlot&63)
+				}
+			}
+			plan.stableSlot, slotOK =
+				c.primaryUnifiedOverlay.chooseLargeUnindexedSlotWithOccupied(
+					route.Bucket, route.Hash, future,
+				)
+			if !slotOK {
+				return plan, false, nil
+			}
+		}
 	case primaryUnifiedOverlayDeleted:
 		return plan, false, nil
 	default:

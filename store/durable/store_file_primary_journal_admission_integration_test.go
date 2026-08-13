@@ -14,6 +14,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 type primaryJournalAdmissionMutationResult struct {
@@ -94,6 +95,7 @@ func blockPrimaryJournalAdmissionInitialApply(t *testing.T) (
 		primaryJournalCohortBeforePressureSealHook = nil
 		primaryJournalCohortBeforeForcedSealHook = nil
 		primaryJournalCohortAfterTerminalDrainHook = nil
+		primaryJournalCohortPlannedHook = nil
 	})
 	return enteredChannel, release
 }
@@ -318,6 +320,186 @@ func TestPrimaryJournalAdmissionCohortPublishesOneCutAndFence(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestPrimaryJournalAdmissionLargeUnindexedCohortSlots(t *testing.T) {
+	keys, docs := unifiedPrimaryCorpus(concurrentReplaceCorpusSize, true)
+	options := Options{
+		ResidentBytes: 64 << 20, Backend: BackendPortable,
+		Durability: DurabilityBufferedVisible, RecoveryJournal: true,
+		CheckpointStrength: CheckpointFilesystem,
+	}
+	for _, sameBucket := range []bool{true, false} {
+		t.Run(map[bool]string{true: "same-bucket", false: "disjoint-buckets"}[sameBucket], func(t *testing.T) {
+			collection := unifiedBenchStoreWith(t, keys, docs, options, options)
+			router := collection.primaryRouter.Load()
+			type largeCandidate struct {
+				key, first, second []byte
+				bucket             storeio.BucketID
+			}
+			byBucket := make(map[storeio.BucketID][]largeCandidate)
+			largeBuckets := make(map[storeio.BucketID]bool)
+			bucketOrder := make([]storeio.BucketID, 0, router.Len())
+			for index, key := range keys {
+				route, ok := router.Route([]byte(key))
+				if !ok {
+					continue
+				}
+				if _, seen := largeBuckets[route.Bucket]; !seen {
+					lease, err := router.AcquireLeaf(collection.cache, route)
+					if err != nil {
+						t.Fatal(err)
+					}
+					leaf, admitted := storeio.AdmittedCompactPrimaryStripe(
+						lease.Page(), collection.storeID, route.Bucket,
+					)
+					large := admitted && leaf.Len() > storeio.CommonPrimaryLeafWideSlots
+					lease.Release()
+					if !large {
+						largeBuckets[route.Bucket] = false
+						continue
+					}
+					largeBuckets[route.Bucket] = true
+					bucketOrder = append(bucketOrder, route.Bucket)
+				}
+				if !largeBuckets[route.Bucket] {
+					continue
+				}
+				first, err := vibejson.AppendCanonicalize(nil, docs[index])
+				if err != nil {
+					t.Fatal(err)
+				}
+				second := append([]byte(nil), first...)
+				country := bytes.Index(second, []byte(`"country":"`))
+				if country < 0 {
+					t.Fatalf("candidate %d has no country", index)
+				}
+				country += len(`"country":"`)
+				copy(second[country:country+2], "ZZ")
+				if bytes.Equal(first, second) {
+					copy(second[country:country+2], "YY")
+				}
+				byBucket[route.Bucket] = append(byBucket[route.Bucket], largeCandidate{
+					key: []byte(key), first: first, second: second, bucket: route.Bucket,
+				})
+			}
+
+			selected := make([]largeCandidate, 0, primaryJournalAdmissionLimit)
+			if sameBucket {
+				for _, bucket := range bucketOrder {
+					if len(byBucket[bucket]) >= primaryJournalAdmissionLimit+1 {
+						selected = append(selected, byBucket[bucket][:primaryJournalAdmissionLimit+1]...)
+						break
+					}
+				}
+			} else {
+				for _, bucket := range bucketOrder {
+					if len(byBucket[bucket]) == 0 {
+						continue
+					}
+					selected = append(selected, byBucket[bucket][0])
+					if len(selected) == primaryJournalAdmissionLimit+1 {
+						break
+					}
+				}
+			}
+			if len(selected) < primaryJournalAdmissionLimit+1 {
+				t.Fatalf("selected %d large-unindexed candidates", len(selected))
+			}
+
+			for _, size := range []int{2, 8, 32} {
+				t.Run(fmt.Sprintf("size-%d", size), func(t *testing.T) {
+					entered, release := blockPrimaryJournalAdmissionInitialApply(t)
+					var applied atomic.Int32
+					allApplied := make(chan struct{})
+					primaryJournalAdmissionRequestAppliedHook = func(*primaryJournalAdmissionRequest) {
+						if applied.Add(1) == int32(size) {
+							close(allApplied)
+						}
+					}
+					primaryJournalAdmissionInitialHandoffHook = func() { <-allApplied }
+					planned := make([]struct {
+						bucket storeio.BucketID
+						slot   uint8
+					}, size)
+					primaryJournalCohortPlannedHook = func(
+						index int, bucket storeio.BucketID, slot uint8,
+					) {
+						planned[index].bucket, planned[index].slot = bucket, slot
+					}
+					before := collection.Stats()
+					pilot := selected[len(selected)-1]
+					pilotDone := make(chan error, 1)
+					go func() {
+						_, err := collection.Put(pilot.key, pilot.second)
+						pilotDone <- err
+					}()
+					<-entered
+					results := make([]chan error, size)
+					// A max-extent route can only take this deliberately narrow
+					// cohort lane when the value is byte-identical to its immutable
+					// base. Same-bucket selection finds a non-max leaf and exercises
+					// distinct replacements; disjoint buckets exercise slot identity
+					// without widening their varied physical extents.
+					toSecond := sameBucket && size != 8
+					for index := range size {
+						selectedCandidate := selected[index]
+						value := selectedCandidate.first
+						if toSecond {
+							value = selectedCandidate.second
+						}
+						results[index] = make(chan error, 1)
+						go func(index int, selectedCandidate largeCandidate, value []byte) {
+							_, err := collection.Put(selectedCandidate.key, value)
+							results[index] <- err
+						}(index, selectedCandidate, value)
+						waitPrimaryJournalAdmissionQueueCount(
+							t, collection.primaryJournalAdmission, index+1,
+						)
+					}
+					release()
+					if err := <-pilotDone; err != nil {
+						t.Fatal(err)
+					}
+					for index := range size {
+						if err := <-results[index]; err != nil {
+							t.Fatalf("request %d: %v", index, err)
+						}
+					}
+					seen := make(map[[2]uint64]struct{}, size)
+					for index, plan := range planned {
+						identity := [2]uint64{uint64(plan.bucket), uint64(plan.slot)}
+						if _, duplicate := seen[identity]; duplicate {
+							t.Fatalf("planned slot collision at %d: bucket=%d slot=%d",
+								index, plan.bucket, plan.slot)
+						}
+						seen[identity] = struct{}{}
+					}
+					after := collection.Stats()
+					if groups := after.JournalCohortPublishGroups - before.JournalCohortPublishGroups; groups != 1 {
+						t.Fatalf("journal cohort groups = %d, want 1", groups)
+					}
+					if got := after.JournalCohortPublishGroupSize.Sum - before.JournalCohortPublishGroupSize.Sum; got != uint64(size) {
+						t.Fatalf("journal cohort size = %d, want %d", got, size)
+					}
+					if after.ConcurrentPrimaryStripeWaitNS.Count != before.ConcurrentPrimaryStripeWaitNS.Count {
+						t.Fatal("journal cohort used a bucket stripe")
+					}
+					for index := range size {
+						want := selected[index].first
+						if toSecond {
+							want = selected[index].second
+						}
+						got, found, err := collection.AppendRaw(nil, selected[index].key)
+						if err != nil || !found || !bytes.Equal(got, want) {
+							t.Fatalf("final value %d = (%q,%t,%v), want %q",
+								index, got, found, err, want)
+						}
+					}
+				})
+			}
+		})
 	}
 }
 

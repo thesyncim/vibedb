@@ -364,10 +364,20 @@ func (o *primaryUnifiedOverlay) pendingInsertSlots(
 func (o *primaryUnifiedOverlay) chooseLargeUnindexedSlot(
 	bucket storeio.BucketID, hash uint64,
 ) (uint8, bool) {
+	return o.chooseLargeUnindexedSlotWithOccupied(
+		bucket, hash, [4]uint64{},
+	)
+}
+
+// chooseLargeUnindexedSlotWithOccupied extends the live overlay occupancy with
+// caller-private future claims. A cohort planner uses it before any record is
+// published so disjoint keys in one finite batch cannot select the same slot.
+func (o *primaryUnifiedOverlay) chooseLargeUnindexedSlotWithOccupied(
+	bucket storeio.BucketID, hash uint64, used [4]uint64,
+) (uint8, bool) {
 	if o == nil {
 		return 0, false
 	}
-	var used [4]uint64
 	folded := o.folded.Load()
 	bucketSlot, found := o.bucketSlot(bucket)
 	if found {
