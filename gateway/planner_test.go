@@ -13,7 +13,7 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
-func routeBoundPlan(t *testing.T, plan *BoundPlan) distribution.Route {
+func routeBoundPlan(t testing.TB, plan *BoundPlan) distribution.Route {
 	t.Helper()
 	route, err := distribution.NewRouter().Route(
 		plan.constraints,

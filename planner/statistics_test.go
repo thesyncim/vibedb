@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -133,6 +134,50 @@ func TestCanonicalStatisticScalars(t *testing.T) {
 	}
 }
 
+func TestCanonicalStatisticStringMatchesJSONEncoding(t *testing.T) {
+	values := []string{
+		"", "plain", "quote\"slash\\", "\b\f\n\r\t\x00\x1f",
+		"<script>&", "café", "\u2028line\u2029paragraph", "😀",
+	}
+	for _, value := range values {
+		want, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := AppendCanonicalStatisticString([]byte("prefix:"), value)
+		if err != nil {
+			t.Fatalf("AppendCanonicalStatisticString(%q): %v", value, err)
+		}
+		if string(got) != "prefix:"+string(want) {
+			t.Fatalf("AppendCanonicalStatisticString(%q) = %q, want %q", value, got, "prefix:"+string(want))
+		}
+	}
+	if _, err := AppendCanonicalStatisticString(nil, string([]byte{0xff})); err == nil {
+		t.Fatal("invalid UTF-8 statistic string was accepted")
+	}
+}
+
+func TestCanonicalStatisticNumberValidation(t *testing.T) {
+	for _, value := range []string{"0", "-0", "1", "-1.25", "1e+2", "1E-02"} {
+		canonical, err := CanonicalStatisticNumber(value)
+		if err != nil {
+			t.Fatalf("CanonicalStatisticNumber(%q): %v", value, err)
+		}
+		generic, err := CanonicalScalarJSON(value)
+		if err != nil || canonical != generic {
+			t.Fatalf("direct/generic canonical number %q = %q/%q, %v", value, canonical, generic, err)
+		}
+	}
+	for _, value := range []string{"", "+1", "01", "-", ".1", "1.", "1e", "1e+", "1x", "NaN"} {
+		if _, err := CanonicalStatisticNumber(value); err == nil {
+			t.Fatalf("invalid number %q was accepted", value)
+		}
+	}
+	if canonical, err := CanonicalScalarJSON(" \n\t5.0\r "); err != nil || canonical != "5" {
+		t.Fatalf("JSON whitespace canonicalization = %q, %v", canonical, err)
+	}
+}
+
 func FuzzCanonicalScalarJSON(f *testing.F) {
 	for _, seed := range []string{
 		`0`, `-0`, `5.0`, `50e-1`, `1e1000000000`, `1e-1000000000`,
@@ -151,6 +196,22 @@ func FuzzCanonicalScalarJSON(f *testing.F) {
 		}
 		if second != canonical {
 			t.Fatalf("canonicalization is not idempotent: %q then %q", canonical, second)
+		}
+	})
+}
+
+func FuzzCanonicalStatisticNumber(f *testing.F) {
+	for _, seed := range []string{"", "0", "-0", "5.0", "50e-1", "1e1000000000", "01", "1e"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, value string) {
+		canonical, err := CanonicalStatisticNumber(value)
+		if err != nil {
+			return
+		}
+		second, err := CanonicalStatisticNumber(canonical)
+		if err != nil || second != canonical {
+			t.Fatalf("number canonicalization is not idempotent: %q then %q, %v", canonical, second, err)
 		}
 	})
 }

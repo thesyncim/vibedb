@@ -196,3 +196,27 @@ func TestSnapshotStatisticsRejectInactivePartition(t *testing.T) {
 		t.Fatalf("error = %v, want ErrInvalidCatalog", err)
 	}
 }
+
+func BenchmarkDistributedEstimatesSkewedPointRoute(b *testing.B) {
+	snapshot, err := NewSnapshotWithPlannerMetadata(
+		testConfig(b), testEndpoints(), 7, nil, gatewayTestStatistics(),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	prepared, err := snapshot.Prepare(b.Context(),
+		`SELECT n FROM messages WHERE tenant_id = 'acme'`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	bound, err := prepared.Bind(nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	route := routeBoundPlan(b, bound)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _, _, _ = distributedEstimates(snapshot, bound, route)
+	}
+}

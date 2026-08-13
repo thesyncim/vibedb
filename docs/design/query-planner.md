@@ -181,7 +181,10 @@ widths outside the finite compact domain are rejected at publication. The
 distributed cost model uses the upper row and width bounds.
 Missing table statistics use conservative defaults. JSON scalar statistics are
 canonicalized at publication, including exact numeric spelling variants, so
-`5`, `5.0`, and `50e-1` share one skew key.
+`5`, `5.0`, and `50e-1` share one skew key. Typed routing strings append the
+same canonical JSON escaping into request-local scratch and probe the compact
+skew directory by byte view, avoiding a generic JSON decoder and transient heap
+string on the planning path.
 
 Optional per-shard row estimates prevent a targeted route from assuming rows
 are uniformly distributed. When every selected shard has an estimate, their
@@ -218,6 +221,7 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
 | fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,872 bytes / 28 allocations including construction | 352 owned memo bytes |
 | add the same scan shape to 1,024 distinct groups | about 0.17 ms | 804 KB / 54 allocations including construction | 2,048 bounded index references |
+| selected-partition + skew estimate for one routed predicate | about 70 ns | 0 | request-local 256-byte scalar scratch |
 | build and validate that 1,024-table catalog | about 0.71 ms | 3.10 MB / 13,347 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.

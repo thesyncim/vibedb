@@ -1,14 +1,13 @@
 package planner
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"math/big"
 	"slices"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 	"unsafe"
@@ -413,29 +412,165 @@ func CanonicalScalarJSON(value string) (string, error) {
 	if value == "" || !utf8.ValidString(value) {
 		return "", errors.New("value is empty or invalid UTF-8")
 	}
-	var decoded any
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.UseNumber()
-	if err := decoder.Decode(&decoded); err != nil {
-		return "", fmt.Errorf("value %q is not JSON: %w", value, err)
+	value = trimJSONSpace(value)
+	if value == "" {
+		return "", errors.New("value is empty JSON")
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return "", fmt.Errorf("value %q has trailing JSON", value)
-	}
-	switch scalar := decoded.(type) {
-	case nil:
+	switch value[0] {
+	case 'n':
+		if value != "null" {
+			return "", fmt.Errorf("value %q is not JSON null", value)
+		}
 		return "null", nil
-	case bool:
-		return strconv.FormatBool(scalar), nil
-	case json.Number:
-		return canonicalJSONNumber(string(scalar))
-	case string:
-		encoded, err := json.Marshal(scalar)
-		return string(encoded), err
+	case 't', 'f':
+		if value != "true" && value != "false" {
+			return "", fmt.Errorf("value %q is not a JSON boolean", value)
+		}
+		return value, nil
+	case '"':
+		var scalar string
+		if err := json.Unmarshal([]byte(value), &scalar); err != nil {
+			return "", fmt.Errorf("value %q is not a JSON string: %w", value, err)
+		}
+		return CanonicalStatisticString(scalar)
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return CanonicalStatisticNumber(value)
 	default:
 		return "", fmt.Errorf("value %q is not a scalar", value)
 	}
+}
+
+// CanonicalStatisticString returns the canonical JSON spelling of one raw
+// UTF-8 string without reparsing an intermediate quoted representation.
+func CanonicalStatisticString(value string) (string, error) {
+	encoded, err := AppendCanonicalStatisticString(nil, value)
+	return string(encoded), err
+}
+
+// AppendCanonicalStatisticString appends the canonical JSON spelling of raw to
+// dst. Callers with request-local scratch can perform a skew lookup without a
+// transient heap string.
+func AppendCanonicalStatisticString(dst []byte, value string) ([]byte, error) {
+	if !utf8.ValidString(value) {
+		return dst, errors.New("string is invalid UTF-8")
+	}
+	const hex = "0123456789abcdef"
+	dst = append(dst, '"')
+	for index := 0; index < len(value); {
+		char := value[index]
+		if char < utf8.RuneSelf {
+			index++
+			switch char {
+			case '\\', '"':
+				dst = append(dst, '\\', char)
+			case '\b':
+				dst = append(dst, '\\', 'b')
+			case '\f':
+				dst = append(dst, '\\', 'f')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			case '<', '>', '&':
+				dst = append(dst, '\\', 'u', '0', '0', hex[char>>4], hex[char&0xf])
+			default:
+				if char < 0x20 {
+					dst = append(dst, '\\', 'u', '0', '0', hex[char>>4], hex[char&0xf])
+				} else {
+					dst = append(dst, char)
+				}
+			}
+			continue
+		}
+		runeValue, width := utf8.DecodeRuneInString(value[index:])
+		if runeValue == '\u2028' || runeValue == '\u2029' {
+			dst = append(dst, '\\', 'u', '2', '0', '2', hex[byte(runeValue)&0xf])
+		} else {
+			dst = append(dst, value[index:index+width]...)
+		}
+		index += width
+	}
+	return append(dst, '"'), nil
+}
+
+// CanonicalStatisticNumber validates and canonicalizes one JSON number. It is
+// the direct path for already typed routing numbers and avoids interface-based
+// generic JSON decoding.
+func CanonicalStatisticNumber(value string) (string, error) {
+	if value == "" || !utf8.ValidString(value) {
+		return "", errors.New("number is empty or invalid UTF-8")
+	}
+	if err := validateJSONNumber(value); err != nil {
+		return "", err
+	}
+	return canonicalJSONNumber(value)
+}
+
+func trimJSONSpace(value string) string {
+	start, end := 0, len(value)
+	for start < end && isJSONSpace(value[start]) {
+		start++
+	}
+	for end > start && isJSONSpace(value[end-1]) {
+		end--
+	}
+	return value[start:end]
+}
+
+func isJSONSpace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
+}
+
+func validateJSONNumber(value string) error {
+	index := 0
+	if value[index] == '-' {
+		index++
+		if index == len(value) {
+			return errors.New("number has no integer digits")
+		}
+	}
+	if value[index] == '0' {
+		index++
+		if index < len(value) && value[index] >= '0' && value[index] <= '9' {
+			return errors.New("number has a leading zero")
+		}
+	} else {
+		if value[index] < '1' || value[index] > '9' {
+			return errors.New("number has an invalid integer part")
+		}
+		for index < len(value) && value[index] >= '0' && value[index] <= '9' {
+			index++
+		}
+	}
+	if index < len(value) && value[index] == '.' {
+		index++
+		start := index
+		for index < len(value) && value[index] >= '0' && value[index] <= '9' {
+			index++
+		}
+		if index == start {
+			return errors.New("number has no fractional digits")
+		}
+	}
+	if index < len(value) && (value[index] == 'e' || value[index] == 'E') {
+		index++
+		if index < len(value) && (value[index] == '+' || value[index] == '-') {
+			index++
+		}
+		start := index
+		for index < len(value) && value[index] >= '0' && value[index] <= '9' {
+			index++
+		}
+		if index == start {
+			return errors.New("number has no exponent digits")
+		}
+	}
+	if index != len(value) {
+		return errors.New("number has trailing syntax")
+	}
+	return nil
 }
 
 func canonicalJSONNumber(value string) (string, error) {
@@ -881,7 +1016,7 @@ func (s ColumnStatistic) EqualitySelectivity(canonicalScalar string) float64 {
 // its zero-allocation contract.
 func (s ColumnStatistic) EqualitySelectivityEstimate(canonicalScalar string) Estimate {
 	if s.catalog == nil || int(s.index) >= len(s.catalog.columns) {
-		return Estimate{Value: 0.1, Lower: 0, Upper: 1, Confidence: 0}
+		return unknownEqualitySelectivity()
 	}
 	entry := s.catalog.columns[s.index]
 	commonIndex := entry.commonCount
@@ -909,6 +1044,50 @@ func (s ColumnStatistic) EqualitySelectivityEstimate(canonicalScalar string) Est
 			commonIndex = lo
 		}
 	}
+	return s.equalitySelectivityAt(entry, commonIndex)
+}
+
+// EqualitySelectivityEstimateBytes is the scratch-buffer form of
+// [ColumnStatistic.EqualitySelectivityEstimate]. canonicalScalar must contain
+// one canonical JSON scalar and is borrowed only for this call.
+func (s ColumnStatistic) EqualitySelectivityEstimateBytes(canonicalScalar []byte) Estimate {
+	if s.catalog == nil || int(s.index) >= len(s.catalog.columns) {
+		return unknownEqualitySelectivity()
+	}
+	entry := s.catalog.columns[s.index]
+	commonIndex := entry.commonCount
+	if entry.commonCount <= 8 {
+		for i := uint32(0); i < entry.commonCount; i++ {
+			value := s.catalog.common[entry.commonBase+i]
+			if bytes.Equal([]byte(s.catalog.string(value.value)), canonicalScalar) {
+				commonIndex = i
+				break
+			}
+		}
+	} else {
+		lo, hi := uint32(0), entry.commonCount
+		for lo < hi {
+			mid := lo + (hi-lo)/2
+			value := s.catalog.common[entry.commonBase+mid]
+			if bytes.Compare([]byte(s.catalog.string(value.value)), canonicalScalar) < 0 {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo < entry.commonCount &&
+			bytes.Equal([]byte(s.catalog.string(s.catalog.common[entry.commonBase+lo].value)), canonicalScalar) {
+			commonIndex = lo
+		}
+	}
+	return s.equalitySelectivityAt(entry, commonIndex)
+}
+
+func unknownEqualitySelectivity() Estimate {
+	return Estimate{Value: 0.1, Lower: 0, Upper: 1, Confidence: 0}
+}
+
+func (s ColumnStatistic) equalitySelectivityAt(entry compactColumnStatistic, commonIndex uint32) Estimate {
 	if commonIndex < entry.commonCount {
 		value := s.catalog.common[entry.commonBase+commonIndex]
 		return Estimate{

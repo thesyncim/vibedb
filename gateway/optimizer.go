@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"strconv"
 
 	"github.com/thesyncim/vibedb/distribution"
 	queryplanner "github.com/thesyncim/vibedb/planner"
@@ -357,7 +356,12 @@ func distributedEstimates(
 	if !placed {
 		return scanRows, scanBytes, outputRows, rowBytes
 	}
-	selectivities := make([]float64, 0, len(bound.constraints))
+	var inlineSelectivities [8]float64
+	selectivities := inlineSelectivities[:0]
+	if len(bound.constraints) > len(inlineSelectivities) {
+		selectivities = make([]float64, 0, len(bound.constraints))
+	}
+	var scalarScratch [256]byte
 	for ordinal, domain := range bound.constraints {
 		if domain.Kind == distribution.DomainEmpty {
 			return scanRows, scanBytes, 0, rowBytes
@@ -372,12 +376,12 @@ func distributedEstimates(
 		selectivity := 0.0
 		complete := true
 		for _, value := range domain.Values {
-			canonical, valid := boundStatisticScalar(value)
+			canonical, valid := appendBoundStatisticScalar(scalarScratch[:0], value)
 			if !valid {
 				complete = false
 				break
 			}
-			selectivity += column.EqualitySelectivityEstimate(canonical).Upper
+			selectivity += column.EqualitySelectivityEstimateBytes(canonical).Upper
 		}
 		if complete {
 			selectivities = append(selectivities, min(1, selectivity))
@@ -449,17 +453,20 @@ func boundedProduct(left, right float64) float64 {
 	return left * right
 }
 
-func boundStatisticScalar(value distribution.Scalar) (string, bool) {
-	var encoded string
+func appendBoundStatisticScalar(dst []byte, value distribution.Scalar) ([]byte, bool) {
 	switch value.Kind() {
 	case distribution.KindString:
 		raw, _ := value.StringValue()
-		encoded = strconv.Quote(raw)
+		canonical, err := queryplanner.AppendCanonicalStatisticString(dst, raw)
+		return canonical, err == nil
 	case distribution.KindNumber:
-		encoded, _ = value.NumberSpelling()
+		spelling, _ := value.NumberSpelling()
+		canonical, err := queryplanner.CanonicalStatisticNumber(spelling)
+		if err != nil {
+			return dst, false
+		}
+		return append(dst, canonical...), true
 	default:
-		return "", false
+		return dst, false
 	}
-	canonical, err := queryplanner.CanonicalScalarJSON(encoded)
-	return canonical, err == nil
 }
