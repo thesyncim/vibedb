@@ -320,6 +320,13 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 					return nil, fmt.Errorf("planner: child requirement for %s: %w", record.expr.Op, err)
 				}
 			}
+			childWorkspace, ok := addMemoRun(0, len(record.expr.Children), unsafe.Sizeof((*Plan)(nil)))
+			if !ok {
+				return nil, fmt.Errorf("%w: child-plan workspace overflow", ErrSearchBudget)
+			}
+			if err := o.reserveSearchPayload(childWorkspace); err != nil {
+				return nil, err
+			}
 			children := make([]*Plan, len(record.expr.Children))
 			eligible := true
 			for i, childGroup := range record.expr.Children {

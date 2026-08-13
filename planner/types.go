@@ -151,7 +151,7 @@ type Estimate struct {
 
 // ExactEstimate returns a certain non-negative estimate.
 func ExactEstimate(value float64) Estimate {
-	if value < 0 || math.IsNaN(value) {
+	if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		value = 0
 	}
 	return Estimate{Value: value, Lower: value, Upper: value, Confidence: 1}
@@ -176,7 +176,7 @@ func (e Estimate) Normalize(fallback float64) Estimate {
 	if e.Lower > e.Value {
 		e.Lower = e.Value
 	}
-	if e.Confidence < 0 || math.IsNaN(e.Confidence) {
+	if e.Confidence < 0 || math.IsNaN(e.Confidence) || math.IsInf(e.Confidence, 0) {
 		e.Confidence = 0
 	} else if e.Confidence > 1 {
 		e.Confidence = 1

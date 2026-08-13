@@ -30,6 +30,37 @@ type concurrentCompositionTestModel struct {
 	compositionTestModel
 }
 
+type wideChildrenTestModel struct{}
+
+func (wideChildrenTestModel) IsPhysical(expr Expression) bool { return expr.Op == OpRemoteQuery }
+func (wideChildrenTestModel) ChildPropertyAlternatives(
+	_ *Memo, _ GroupID, _ ExprID, expr Expression, _ PhysicalProperties,
+) ([][]PhysicalProperties, error) {
+	if len(expr.Children) == 0 {
+		return [][]PhysicalProperties{nil}, nil
+	}
+	required := make([]PhysicalProperties, len(expr.Children))
+	for i := range required {
+		required[i].Distribution.Kind = DistributionSingleton
+	}
+	return [][]PhysicalProperties{required}, nil
+}
+func (wideChildrenTestModel) Provided(
+	_ *Memo, _ GroupID, _ ExprID, _ Expression, _ []*Plan,
+) (PhysicalProperties, error) {
+	return PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}, nil
+}
+func (wideChildrenTestModel) LocalCost(
+	_ *Memo, _ GroupID, _ ExprID, _ Expression, _ []*Plan,
+) (Cost, error) {
+	return Cost{}, nil
+}
+func (wideChildrenTestModel) Enforcers(
+	_ *Memo, _ GroupID, _, _ PhysicalProperties,
+) ([]EnforcerChain, error) {
+	return nil, nil
+}
+
 func (m compositionTestModel) IsPhysical(expr Expression) bool { return expr.Op == OpRemoteQuery }
 func (m compositionTestModel) ChildPropertyAlternatives(
 	_ *Memo, _ GroupID, _ ExprID, expr Expression, _ PhysicalProperties,
@@ -403,6 +434,45 @@ func TestMemoGroupCreationIsAtomic(t *testing.T) {
 	if memo.GroupCount() != 1 || group != 0 {
 		t.Fatalf("failed Intern retained a group: groups=%d", memo.GroupCount())
 	}
+	if cap(memo.groups) > len(memo.groups) {
+		unused := memo.groups[:cap(memo.groups)][len(memo.groups)]
+		if unused.logical.Columns != nil || unused.logical.UniqueKeys != nil {
+			t.Fatal("failed Intern retained logical-property backing storage")
+		}
+	}
+
+	memo = NewMemo(Limits{})
+	if _, _, err := memo.Intern(Expression{Op: OpLogicalScan}, LogicalProperties{}); err != nil {
+		t.Fatal(err)
+	}
+	logical := LogicalProperties{Columns: []ColumnID{1, 2, 3}}
+	groupBytes, ok := groupPayloadBytes(logical)
+	if !ok {
+		t.Fatal("group payload overflow")
+	}
+	memo.limits.MaxMemoPayloadBytes = memo.payloadBytes + groupBytes
+	if _, _, err := memo.Intern(Expression{Op: OpLogicalScan, Private: 2}, logical); !errors.Is(err, ErrSearchBudget) {
+		t.Fatalf("payload-bound Intern error = %v, want ErrSearchBudget", err)
+	}
+	if cap(memo.groups) <= len(memo.groups) {
+		t.Fatal("test did not create an unused group-capacity slot")
+	}
+	unused := memo.groups[:cap(memo.groups)][len(memo.groups)]
+	if unused.logical.Columns != nil || unused.logical.UniqueKeys != nil {
+		t.Fatal("payload-bound failed Intern retained logical-property backing storage")
+	}
+}
+
+func TestEstimateNormalizationRejectsInfinity(t *testing.T) {
+	if got := ExactEstimate(math.Inf(1)); got != ExactEstimate(0) {
+		t.Fatalf("ExactEstimate(+Inf) = %+v", got)
+	}
+	got := (Estimate{
+		Value: 10, Lower: 5, Upper: 20, Confidence: math.Inf(1),
+	}).Normalize(1)
+	if got.Confidence != 0 || got.Value != 10 || got.Lower != 5 || got.Upper != 20 {
+		t.Fatalf("Normalize(infinite confidence) = %+v", got)
+	}
 }
 
 func TestMemoPayloadBudget(t *testing.T) {
@@ -603,6 +673,30 @@ func TestPlannerBudgetsAndCancellation(t *testing.T) {
 		stats := optimizer.Statistics()
 		if stats.SearchPayloadBytes != stateBytes || stats.PlanNodes != 0 {
 			t.Fatalf("search payload statistics = %+v, want %d bytes and zero plan nodes", stats, stateBytes)
+		}
+	})
+
+	t.Run("child workspace payload", func(t *testing.T) {
+		required := PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}
+		stateBytes, ok := propertyStatePayloadBytes(required)
+		if !ok {
+			t.Fatal("property payload overflow")
+		}
+		memo := NewMemo(Limits{MaxSearchPayloadBytes: stateBytes})
+		children := make([]GroupID, 2)
+		for i := range children {
+			children[i], _ = memo.NewGroup(LogicalProperties{})
+			_, _, _ = memo.Add(children[i], Expression{Op: OpRemoteQuery})
+		}
+		root, _ := memo.NewGroup(LogicalProperties{})
+		_, _, _ = memo.Add(root, Expression{Op: OpRemoteQuery, Children: children})
+		optimizer := &Optimizer{Memo: memo, Model: wideChildrenTestModel{}}
+		if _, err := optimizer.Optimize(t.Context(), root, required); !errors.Is(err, ErrSearchBudget) {
+			t.Fatalf("Optimize error = %v, want ErrSearchBudget", err)
+		}
+		stats := optimizer.Statistics()
+		if stats.PropertyStates != 1 || stats.PlanNodes != 0 || stats.SearchPayloadBytes != stateBytes {
+			t.Fatalf("child-workspace budget statistics = %+v", stats)
 		}
 	})
 }

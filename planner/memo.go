@@ -296,7 +296,9 @@ func (m *Memo) rollbackLastGroup() {
 		panic("planner: corrupt memo payload accounting")
 	}
 	m.payloadBytes -= payload
-	m.groups = m.groups[:len(m.groups)-1]
+	lastIndex := len(m.groups) - 1
+	m.groups[lastIndex] = memoGroup{}
+	m.groups = m.groups[:lastIndex]
 }
 
 // rollbackExploration restores the exact build-state boundary that preceded a

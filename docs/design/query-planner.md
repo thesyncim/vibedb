@@ -132,8 +132,9 @@ physical alternatives, property states, enforcer-chain steps, recursion depth,
 deterministic memo payload bytes, and deterministic top-down search payload
 bytes. The byte limits cover memo records, child edges, column identities,
 unique-key runs, cached property records, property slices, physical plan nodes,
-and their owned slices, so one wide expression or enforcer chain cannot bypass
-the cardinality limits. Go map buckets, model-owned returned alternatives, and
+their owned slices, and temporary child-plan pointer runs before allocation, so
+one wide expression or enforcer chain cannot bypass the cardinality limits. Go
+map buckets, model-owned returned alternatives, and
 allocator slack remain indirectly bounded by the count limits. Cancellation is
 checked during exploration and top-down search. Exceeding a limit returns a
 typed error; the optimizer never silently publishes the best plan observed

@@ -142,7 +142,7 @@ go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
 ```
 
 <!-- unsafe-file-list:start -->
-The root module contains 60 non-test Go files that import `unsafe`:
+The root module contains 61 non-test Go files that import `unsafe`:
 
 ```text
 gateway/catalog.go
@@ -165,6 +165,7 @@ internal/storeio/retired_interval_index.go
 internal/storeio/ring_linux.go
 internal/storeio/unified_canonical_form.go
 planner/memo.go
+planner/optimizer.go
 planner/statistics.go
 query/apply_cache.go
 query/apply_kernel.go
