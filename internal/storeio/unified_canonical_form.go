@@ -54,13 +54,29 @@ func NewCanonicalWorkspace(memberCapacity, scratchCapacity int) CanonicalWorkspa
 	}
 }
 
+// CanonicalWorkspaceCapacityBytes reports the exact retained backing bytes of
+// a workspace constructed with the supplied capacities, without allocating it.
+func CanonicalWorkspaceCapacityBytes(memberCapacity, scratchCapacity int) uint64 {
+	return canonicalWorkspaceCapacityBytes(
+		memberCapacity, memberCapacity, scratchCapacity,
+	)
+}
+
+func canonicalWorkspaceCapacityBytes(
+	memberCapacity, auxCapacity, scratchCapacity int,
+) uint64 {
+	return uint64(memberCapacity+auxCapacity)*
+		uint64(unsafe.Sizeof(canonicalMember{})) + uint64(scratchCapacity)
+}
+
 // CapacityBytes reports the retained backing storage owned by the workspace.
 func (w *CanonicalWorkspace) CapacityBytes() uint64 {
 	if w == nil {
 		return 0
 	}
-	return uint64(cap(w.members)+cap(w.aux))*uint64(unsafe.Sizeof(canonicalMember{})) +
-		uint64(cap(w.scratch))
+	return canonicalWorkspaceCapacityBytes(
+		cap(w.members), cap(w.aux), cap(w.scratch),
+	)
 }
 
 // canonicalMember is one object member reference during a canonical render:

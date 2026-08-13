@@ -80,6 +80,12 @@ type Collection struct {
 	// tape/canonicalization workspaces. It is nil for collections that cannot use
 	// the concurrent overlay lane.
 	primaryConcurrentContexts *primaryConcurrentContextPool
+	// primaryJournalAdmission serializes explicit recovery-journal callers into
+	// finite phases without taking overlay stripes. primaryJournalContexts owns
+	// preparation scratch only; admitted requests still execute through the
+	// established exclusive Put/Delete baseline.
+	primaryJournalAdmission *primaryJournalAdmission
+	primaryJournalContexts  *primaryConcurrentContextPool
 	// mutationCombiner is a short, bounded arrival lane for synchronous
 	// unindexed primary mutations. It shares one journal barrier across a
 	// contended group and hands the group to the existing atomic Update path.

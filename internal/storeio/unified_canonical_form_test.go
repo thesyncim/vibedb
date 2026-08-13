@@ -347,3 +347,31 @@ func TestCanonicalRenderZeroAllocs(t *testing.T) {
 		t.Error("IndexIsCanonical rejected the canonical render")
 	}
 }
+
+func TestCanonicalWorkspaceCapacityBytesMatchesBacking(t *testing.T) {
+	for _, capacity := range []struct {
+		members int
+		scratch int
+	}{{0, 0}, {1, 1}, {514, 512}, {8192, 32 << 10}} {
+		workspace := NewCanonicalWorkspace(capacity.members, capacity.scratch)
+		got := workspace.CapacityBytes()
+		want := CanonicalWorkspaceCapacityBytes(
+			capacity.members, capacity.scratch,
+		)
+		if got != want {
+			t.Fatalf(
+				"capacity members=%d scratch=%d: workspace=%d formula=%d",
+				capacity.members, capacity.scratch, got, want,
+			)
+		}
+	}
+	workspace := CanonicalWorkspace{
+		members: make([]canonicalMember, 0, 2),
+		aux:     make([]canonicalMember, 0, 3),
+		scratch: make([]byte, 0, 5),
+	}
+	if got, want := workspace.CapacityBytes(),
+		canonicalWorkspaceCapacityBytes(2, 3, 5); got != want {
+		t.Fatalf("asymmetric workspace capacity = %d, want %d", got, want)
+	}
+}

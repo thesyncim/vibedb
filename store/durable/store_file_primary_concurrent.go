@@ -130,8 +130,13 @@ type primaryConcurrentContextPool struct {
 	// contextOnce defers the sizeable per-caller JSON/canonical workspaces
 	// until an eligible mutation first claims the lane. initialized publishes
 	// those immutable slice/channel headers to lock-free Stats readers.
-	contextOnce  sync.Once
-	initialized  atomic.Bool
+	contextOnce sync.Once
+	initialized atomic.Bool
+	// journalLazy makes readiness per claimed slot for the separate explicit-RJ
+	// preparation pool. The ordinary concurrent lane retains eager first-use
+	// initialization.
+	journalLazy  bool
+	putReady     atomic.Uint64
 	indexEntries int
 	// free contains one bit per context. The ordinary path claims a bit with a
 	// bounded CAS attempt and never enters a channel or mutex. A caller that
@@ -158,6 +163,30 @@ func newPrimaryConcurrentContextPool(
 		options.primaryUnifiedOverlayBytes == 0 {
 		return nil
 	}
+	return newPrimaryContextPool(options)
+}
+
+// newPrimaryJournalAdmissionContextPool owns only CPU-private preparation
+// scratch for the explicit recovery-journal admission lane. It does not make
+// the concurrent overlay publisher eligible and receives no stripe directory.
+func newPrimaryJournalAdmissionContextPool(
+	options normalizedFileStoreOptions,
+) *primaryConcurrentContextPool {
+	if options.Durability != DurabilityBufferedVisible ||
+		!options.RecoveryJournal ||
+		options.Collection.Schema != nil ||
+		len(options.indexes) != 0 ||
+		options.primaryUnifiedOverlayBytes == 0 {
+		return nil
+	}
+	pool := newPrimaryContextPool(options)
+	pool.journalLazy = true
+	return pool
+}
+
+func newPrimaryContextPool(
+	options normalizedFileStoreOptions,
+) *primaryConcurrentContextPool {
 	count := min(
 		fileVisibilitySlots(options.QueueSlots),
 		primaryConcurrentContextLimit,
@@ -185,6 +214,9 @@ func (p *primaryConcurrentContextPool) ensureContexts() bool {
 	if p == nil {
 		return false
 	}
+	if p.journalLazy {
+		return p.free.Load()&primaryConcurrentPoolClosed == 0
+	}
 	p.contextOnce.Do(func() {
 		if p.free.Load()&primaryConcurrentPoolClosed != 0 {
 			return
@@ -211,12 +243,51 @@ func (p *primaryConcurrentContextPool) ensureContexts() bool {
 	return p.initialized.Load()
 }
 
+func (p *primaryConcurrentContextPool) ensurePut(
+	context *primaryConcurrentContext,
+) {
+	if p == nil || context == nil || !p.journalLazy {
+		return
+	}
+	bit := uint64(1) << uint(context.poolSlot)
+	if p.putReady.Load()&bit != 0 {
+		return
+	}
+	context.index = make([]vibejson.IndexEntry, 0, p.indexEntries)
+	context.patchSpans = make(
+		[]storeio.UnifiedTokenSpan, 0, 2*p.indexEntries,
+	)
+	context.canonical = make([]byte, 0, 2*p.rawLimit)
+	context.workspace = storeio.NewCanonicalWorkspace(
+		p.indexEntries, p.rawLimit,
+	)
+	p.putReady.Or(bit)
+}
+
+func (p *primaryConcurrentContextPool) putSlotCapacityBytes() uint64 {
+	indexBytes := uint64(p.indexEntries) *
+		uint64(unsafe.Sizeof(vibejson.IndexEntry{}))
+	spanBytes := uint64(2*p.indexEntries) *
+		uint64(unsafe.Sizeof(storeio.UnifiedTokenSpan{}))
+	canonicalBytes := uint64(2 * p.rawLimit)
+	workspaceBytes := storeio.CanonicalWorkspaceCapacityBytes(
+		p.indexEntries, p.rawLimit,
+	)
+	return indexBytes + spanBytes + canonicalBytes + workspaceBytes
+}
+
 func (p *primaryConcurrentContextPool) capacityBytes() uint64 {
 	if p == nil {
 		return 0
 	}
 	bytes := uint64(cap(p.contexts)) *
 		uint64(unsafe.Sizeof(primaryConcurrentContext{}))
+	if p.journalLazy {
+		putReady := p.putReady.Load() & p.allFree
+		bytes += uint64(bits.OnesCount64(putReady)) *
+			p.putSlotCapacityBytes()
+		return bytes
+	}
 	if !p.initialized.Load() {
 		return bytes
 	}
