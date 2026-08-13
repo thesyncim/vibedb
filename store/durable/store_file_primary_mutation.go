@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	vibejson "github.com/thesyncim/vibejson"
@@ -895,7 +896,7 @@ transactionalPrimaryPut:
 		}
 	}
 	if c.deferredCanonicalLane() && len(c.primaryPendingParents) != 0 {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
 			return false, err
 		}
 		state = c.state.Load()
@@ -1170,7 +1171,7 @@ retryAfterUnifiedDeleteFold:
 		return true, nil
 	}
 	if c.deferredCanonicalLane() && len(c.primaryPendingParents) != 0 {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
 			return false, fmt.Errorf(
 				"materialize before transactional delete: %w", err,
 			)
@@ -1882,8 +1883,43 @@ func (c *Collection) primaryCheckpointBaseState() *fileStoreState {
 	return base
 }
 
-func (c *Collection) materializePrimaryParentsLocked() error {
-	err := c.materializePrimaryParentsOnceLocked()
+type primaryMaterializationReason uint8
+
+const (
+	primaryMaterializationCheckpoint primaryMaterializationReason = iota
+	primaryMaterializationPressure
+	primaryMaterializationSnapshot
+	primaryMaterializationBarrier
+)
+
+func (c *Collection) materializePrimaryParentsLocked(
+	reason primaryMaterializationReason,
+) (err error) {
+	overlayPending := c.primaryUnifiedOverlay.hasPending()
+	if overlayPending {
+		started := time.Now()
+		defer func() {
+			if err != nil {
+				c.primaryOverlayMaterializationFailures.Add(1)
+				return
+			}
+			c.primaryOverlayFoldNS.observe(uint64(time.Since(started)))
+			switch reason {
+			case primaryMaterializationCheckpoint:
+				c.primaryOverlayCheckpointFolds.Add(1)
+			case primaryMaterializationPressure:
+				c.primaryOverlayPressureFolds.Add(1)
+				c.primaryOverlayFolds.Add(1)
+			case primaryMaterializationSnapshot:
+				c.primaryOverlaySnapshotFolds.Add(1)
+				c.primaryOverlayFolds.Add(1)
+			case primaryMaterializationBarrier:
+				c.primaryOverlayBarrierFolds.Add(1)
+				c.primaryOverlayFolds.Add(1)
+			}
+		}()
+	}
+	err = c.materializePrimaryParentsOnceLocked()
 	if !c.deferredCanonicalLane() ||
 		!errors.Is(err, storeio.ErrCheckpointRequired) {
 		return err
@@ -1911,10 +1947,9 @@ func (c *Collection) materializePrimaryParentsLocked() error {
 // device-silent materialization behavior.
 func (c *Collection) materializePrimaryOverlayPressureLocked() error {
 	if !c.bufferedJournalDeltaLane() {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryParentsLocked(primaryMaterializationPressure); err != nil {
 			return err
 		}
-		c.primaryOverlayFolds.Add(1)
 		return nil
 	}
 	handled, err := c.carryBufferedJournalDeltaBeforeFoldLocked()
@@ -1922,10 +1957,9 @@ func (c *Collection) materializePrimaryOverlayPressureLocked() error {
 		return err
 	}
 	if handled {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryParentsLocked(primaryMaterializationPressure); err != nil {
 			return err
 		}
-		c.primaryOverlayFolds.Add(1)
 		return nil
 	}
 	c.journalDeltaFullFallbacks.Add(1)
@@ -1937,9 +1971,18 @@ func (c *Collection) materializePrimaryOverlayPressureLocked() error {
 }
 
 func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
+	overlayPending := c.primaryUnifiedOverlay.hasPending()
 	if len(c.primaryPendingParents) == 0 &&
-		!c.primaryUnifiedOverlay.hasPending() {
+		!overlayPending {
 		return nil
+	}
+	if overlayPending {
+		c.primaryOverlayMaterializationAttempts.Add(1)
+		defer func() {
+			if err == nil {
+				c.primaryOverlayMaterializations.Add(1)
+			}
+		}()
 	}
 	logical, logicalOK := c.writerLogicalView()
 	if !logicalOK || logical.state == nil {

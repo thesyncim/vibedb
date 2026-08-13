@@ -4,7 +4,7 @@ func (c *Collection) checkpointBufferedLocked() error {
 	if failure := c.PersistenceError(); failure != nil {
 		return failure
 	}
-	if err := c.materializePrimaryParentsLocked(); err != nil {
+	if err := c.materializePrimaryParentsLocked(primaryMaterializationCheckpoint); err != nil {
 		return err
 	}
 	return c.flushBufferedPublishedLocked()

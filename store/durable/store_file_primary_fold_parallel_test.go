@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -118,6 +119,285 @@ func TestPrimaryMutationScratchAccountsCompactColumnPlanner(t *testing.T) {
 	}
 }
 
+// TestRecoveryJournalPrimaryNativeFoldMatchesSerial proves that retaining the
+// bounded foreground codec pool is independent of concurrent publication. The
+// explicit recovery-journal lane stays serialized, appends and syncs before it
+// acknowledges, and then produces the same physical checkpoint as the complete
+// serial planner.
+func TestRecoveryJournalPrimaryNativeFoldMatchesSerial(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend:            BackendPortable,
+		ResidentBytes:      32 << 20,
+		Durability:         DurabilityBufferedVisible,
+		CheckpointStrength: CheckpointFilesystem,
+		RecoveryJournal:    true,
+	}
+	nativeFile := createPrimaryPointFile(
+		t, built, options, "journal-native-fold.vibe",
+	)
+	serialFile := clonePrimaryCrashFile(
+		t, nativeFile, "journal-serial-fold.vibe",
+	)
+	defer serialFile.Close()
+	native, err := Open(nativeFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer native.Close()
+	serial, err := Open(serialFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serial.Close()
+	if native.primaryConcurrentContexts != nil ||
+		len(native.primaryNativeFoldContexts) != 1 ||
+		!native.primaryNativeFoldEligible() {
+		t.Fatalf(
+			"journal fold lanes concurrent=%v contexts=%d eligible=%v",
+			native.primaryConcurrentContexts != nil,
+			len(native.primaryNativeFoldContexts),
+			native.primaryNativeFoldEligible(),
+		)
+	}
+	if len(serial.primaryNativeFoldContexts) == 0 {
+		t.Fatal("serial oracle did not retain a fold context")
+	}
+	coordinator := &native.primaryNativeFoldContexts[0]
+	if len(coordinator.page) == 0 || len(native.primaryLeafScratch) == 0 ||
+		&coordinator.page[0] != &native.primaryLeafScratch[0] ||
+		coordinator.builder != native.primaryUnifiedBuilder ||
+		coordinator.jobs != nil || coordinator.done != nil {
+		t.Fatal("journal coordinator did not borrow writer fold scratch")
+	}
+	nativeInitialScratch := native.Stats().PrimaryMutationScratchBytes
+	serial.primaryNativeFoldContexts = nil
+	serialInitialScratch := serial.Stats().PrimaryMutationScratchBytes
+	if got := nativeInitialScratch - serialInitialScratch; got != uint64(unsafe.Sizeof(primaryNativeFoldContext{})) {
+		t.Fatalf(
+			"journal coordinator retained scratch = %d, want context-only %d",
+			got, unsafe.Sizeof(primaryNativeFoldContext{}),
+		)
+	}
+
+	value := primaryNativeFoldTestReplacement(t, values[0])
+	for _, collection := range []*Collection{native, serial} {
+		created, putErr := collection.Put([]byte(keys[0]), value)
+		if putErr != nil || created {
+			t.Fatalf("Put = created %v, err %v", created, putErr)
+		}
+	}
+	nativeBefore, serialBefore := native.Stats(), serial.Stats()
+	if err := native.Flush(); err != nil {
+		t.Fatalf("native Flush: %v", err)
+	}
+	if err := serial.Flush(); err != nil {
+		t.Fatalf("serial Flush: %v", err)
+	}
+	nativeAfter, serialAfter := native.Stats(), serial.Stats()
+	if got := nativeAfter.PrimaryCompactColumnPatchAttempts -
+		nativeBefore.PrimaryCompactColumnPatchAttempts; got != 1 {
+		t.Fatalf("native compact patch attempts = %d, want 1", got)
+	}
+	if got := nativeAfter.PrimaryCompactColumnPatches -
+		nativeBefore.PrimaryCompactColumnPatches; got != 1 {
+		t.Fatalf("native compact patches = %d, want 1", got)
+	}
+	if got := serialAfter.PrimaryCompactColumnPatchAttempts -
+		serialBefore.PrimaryCompactColumnPatchAttempts; got != 0 {
+		t.Fatalf("serial compact patch attempts = %d, want 0", got)
+	}
+	if nativeAfter.PrimaryMutationScratchBytes >
+		serialAfter.PrimaryMutationScratchBytes+
+			uint64(unsafe.Sizeof(primaryNativeFoldContext{})) {
+		t.Fatalf(
+			"post-fold journal scratch regressed: native=%d serial=%d context=%d",
+			nativeAfter.PrimaryMutationScratchBytes,
+			serialAfter.PrimaryMutationScratchBytes,
+			unsafe.Sizeof(primaryNativeFoldContext{}),
+		)
+	}
+	if nativeAfter.PrimaryOverlayMaterializations !=
+		nativeBefore.PrimaryOverlayMaterializations+1 ||
+		nativeAfter.PrimaryOverlayCheckpointFolds !=
+			nativeBefore.PrimaryOverlayCheckpointFolds+1 ||
+		nativeAfter.PrimaryOverlayFoldNS.Count !=
+			nativeBefore.PrimaryOverlayFoldNS.Count+1 {
+		t.Fatalf("native fold telemetry before=%+v after=%+v",
+			nativeBefore, nativeAfter)
+	}
+
+	nativeState, serialState := native.state.Load(), serial.state.Load()
+	if nativeState == nil || serialState == nil ||
+		nativeState.root != serialState.root ||
+		nativeState.fileEnd != serialState.fileEnd {
+		t.Fatalf("fold states differ: native=%+v serial=%+v",
+			nativeState, serialState)
+	}
+	nativeRoute, err := native.currentPrimaryResidentRoute(
+		nativeState, []byte(keys[0]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialRoute, err := serial.currentPrimaryResidentRoute(
+		serialState, []byte(keys[0]),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nativeRoute.Ref != serialRoute.Ref {
+		t.Fatalf("fold refs differ: native=%+v serial=%+v",
+			nativeRoute.Ref, serialRoute.Ref)
+	}
+	nativeLease, err := native.cache.Acquire(nativeRoute.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialLease, err := serial.cache.Acquire(serialRoute.Ref)
+	if err != nil {
+		nativeLease.Release()
+		t.Fatal(err)
+	}
+	equal := bytes.Equal(nativeLease.Page(), serialLease.Page())
+	nativeLease.Release()
+	serialLease.Release()
+	if !equal {
+		t.Fatal("journal native fold differs from serial physical leaf")
+	}
+	assertPrimaryRaw(t, native, keys[0], value, true)
+	assertPrimaryRaw(t, serial, keys[0], value, true)
+}
+
+// TestRecoveryJournalPrimaryNativeFoldDeleteFallback pins the safe decline:
+// a final tombstone cannot preserve a compact scalar envelope, so the retained
+// native context performs no patch attempt and the complete planner removes
+// the row. Flush still recycles the per-mutation journal through the ordinary
+// whole-cut durability boundary.
+func TestRecoveryJournalPrimaryNativeFoldDeleteFallback(t *testing.T) {
+	built, keys, _ := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend:            BackendPortable,
+		ResidentBytes:      32 << 20,
+		Durability:         DurabilityBufferedVisible,
+		CheckpointStrength: CheckpointFilesystem,
+		RecoveryJournal:    true,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "journal-native-delete-fallback.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collection.primaryNativeFoldContexts) == 0 {
+		t.Fatal("journal store did not retain native fold contexts")
+	}
+	deleted, err := collection.Delete([]byte(keys[0]))
+	if err != nil || !deleted {
+		t.Fatalf("Delete = %v,%v", deleted, err)
+	}
+	before := collection.Stats()
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	after := collection.Stats()
+	if after.PrimaryCompactColumnPatchAttempts !=
+		before.PrimaryCompactColumnPatchAttempts ||
+		after.PrimaryCompactColumnPatches != before.PrimaryCompactColumnPatches ||
+		after.PrimaryOverlayMaterializations !=
+			before.PrimaryOverlayMaterializations+1 ||
+		after.PrimaryOverlayCheckpointFolds !=
+			before.PrimaryOverlayCheckpointFolds+1 {
+		t.Fatalf("delete fallback telemetry before=%+v after=%+v", before, after)
+	}
+	assertPrimaryRaw(t, collection, keys[0], nil, false)
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertPrimaryRaw(t, reopened, keys[0], nil, false)
+}
+
+// TestRecoveryJournalPrimaryNativeFoldCorruptOverlayFailsClosed verifies that
+// native qualification never converts a damaged overlay record into a partial
+// checkpoint. The complete planner reports corruption, publishes no state, and
+// a corrected retry consumes the already-durable journaled mutation normally.
+func TestRecoveryJournalPrimaryNativeFoldCorruptOverlayFailsClosed(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend:            BackendPortable,
+		ResidentBytes:      32 << 20,
+		Durability:         DurabilityBufferedVisible,
+		CheckpointStrength: CheckpointFilesystem,
+		RecoveryJournal:    true,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "journal-native-corrupt-overlay.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+	value := primaryNativeFoldTestReplacement(t, values[0])
+	created, err := collection.Put([]byte(keys[0]), value)
+	if err != nil || created {
+		t.Fatalf("Put = created %v, err %v", created, err)
+	}
+	if collection.primaryUnifiedOverlay.count.Load() != 1 {
+		t.Fatalf("overlay records = %d, want 1",
+			collection.primaryUnifiedOverlay.count.Load())
+	}
+	record := &collection.primaryUnifiedOverlay.records[0]
+	record.kind = 0xff
+	stateBefore := collection.state.Load()
+	statsBefore := collection.Stats()
+	err = collection.Flush()
+	if !errors.Is(err, storeio.ErrCommonPrimaryLeafCorrupt) {
+		t.Fatalf("corrupt Flush error = %v, want ErrCommonPrimaryLeafCorrupt", err)
+	}
+	statsFailed := collection.Stats()
+	if collection.state.Load() != stateBefore {
+		t.Fatal("corrupt native fold published a state")
+	}
+	if statsFailed.PrimaryCompactColumnPatchAttempts !=
+		statsBefore.PrimaryCompactColumnPatchAttempts ||
+		statsFailed.PrimaryCompactColumnPatches !=
+			statsBefore.PrimaryCompactColumnPatches ||
+		statsFailed.PrimaryOverlayMaterializationFailures !=
+			statsBefore.PrimaryOverlayMaterializationFailures+1 ||
+		statsFailed.PrimaryOverlayMaterializations !=
+			statsBefore.PrimaryOverlayMaterializations ||
+		statsFailed.PrimaryOverlayFoldNS.Count !=
+			statsBefore.PrimaryOverlayFoldNS.Count {
+		t.Fatalf("corrupt fold telemetry before=%+v after=%+v",
+			statsBefore, statsFailed)
+	}
+
+	record.kind = primaryUnifiedOverlayPut
+	if err := collection.Flush(); err != nil {
+		t.Fatalf("corrected Flush: %v", err)
+	}
+	statsRetry := collection.Stats()
+	if statsRetry.PrimaryCompactColumnPatchAttempts !=
+		statsFailed.PrimaryCompactColumnPatchAttempts+1 ||
+		statsRetry.PrimaryCompactColumnPatches !=
+			statsFailed.PrimaryCompactColumnPatches+1 ||
+		statsRetry.PrimaryOverlayMaterializations !=
+			statsFailed.PrimaryOverlayMaterializations+1 ||
+		statsRetry.PrimaryOverlayMaterializationFailures !=
+			statsFailed.PrimaryOverlayMaterializationFailures {
+		t.Fatalf("corrected fold telemetry failed=%+v retry=%+v",
+			statsFailed, statsRetry)
+	}
+	assertPrimaryRaw(t, collection, keys[0], value, true)
+}
+
 // TestFilePrimaryNativeFoldForegroundOverlap uses a worker-side barrier to
 // prove two independently routed native leaves are inside their codec lane at
 // the same time. The materializer itself runs in a third goroutine because
@@ -180,7 +460,7 @@ func TestFilePrimaryNativeFoldForegroundOverlap(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		collection.writer.Lock()
-		err := collection.materializePrimaryParentsLocked()
+		err := collection.materializePrimaryParentsLocked(primaryMaterializationCheckpoint)
 		collection.writer.Unlock()
 		done <- err
 	}()
@@ -380,7 +660,7 @@ func TestFilePrimaryNativeFoldPrecomputeMatchesSerial(t *testing.T) {
 			worker.sourceSafe, worker.err,
 		)
 	}
-	if err := collection.materializePrimaryParentsLocked(); err != nil {
+	if err := collection.materializePrimaryParentsLocked(primaryMaterializationCheckpoint); err != nil {
 		collection.writer.Unlock()
 		t.Fatal(err)
 	}
@@ -473,7 +753,7 @@ func TestFilePrimaryNativeFoldWorkerCountIdentity(t *testing.T) {
 	fold := func(collection *Collection) error {
 		collection.writer.Lock()
 		defer collection.writer.Unlock()
-		return collection.materializePrimaryParentsLocked()
+		return collection.materializePrimaryParentsLocked(primaryMaterializationCheckpoint)
 	}
 	if err := fold(serial); err != nil {
 		t.Fatal(err)
@@ -594,8 +874,9 @@ func TestFilePrimaryNativeFoldLaterWaveErrorAbortsAndRetries(t *testing.T) {
 	}
 	before := collection.state.Load()
 	beforePinned := collection.cache.Stats().PinnedPages
+	beforeStats := collection.Stats()
 	collection.writer.Lock()
-	err = collection.materializePrimaryParentsLocked()
+	err = collection.materializePrimaryParentsLocked(primaryMaterializationCheckpoint)
 	collection.writer.Unlock()
 	if !errors.Is(err, injected) {
 		t.Fatalf("materialize error = %v, want %v", err, injected)
@@ -610,6 +891,24 @@ func TestFilePrimaryNativeFoldLaterWaveErrorAbortsAndRetries(t *testing.T) {
 		t.Fatalf("aborted native fold retained %d pins, started with %d",
 			got, beforePinned)
 	}
+	failedStats := collection.Stats()
+	if got := failedStats.PrimaryOverlayMaterializationAttempts -
+		beforeStats.PrimaryOverlayMaterializationAttempts; got != 1 {
+		t.Fatalf("failed materialization attempts = %d, want 1", got)
+	}
+	if failedStats.PrimaryOverlayMaterializations !=
+		beforeStats.PrimaryOverlayMaterializations ||
+		failedStats.PrimaryOverlayFoldNS.Count != beforeStats.PrimaryOverlayFoldNS.Count ||
+		failedStats.PrimaryOverlayMaterializationFailures !=
+			beforeStats.PrimaryOverlayMaterializationFailures+1 {
+		t.Fatalf(
+			"failed telemetry attempts=%d successes=%d failures=%d fold-count=%d; before=%+v",
+			failedStats.PrimaryOverlayMaterializationAttempts,
+			failedStats.PrimaryOverlayMaterializations,
+			failedStats.PrimaryOverlayMaterializationFailures,
+			failedStats.PrimaryOverlayFoldNS.Count, beforeStats,
+		)
+	}
 	for index := range collection.primaryNativeFoldContexts {
 		context := &collection.primaryNativeFoldContexts[index]
 		if context.image != nil || context.native || context.inspected ||
@@ -623,10 +922,22 @@ func TestFilePrimaryNativeFoldLaterWaveErrorAbortsAndRetries(t *testing.T) {
 	collection.primaryNativeFoldAcquire = nil
 	collection.primaryNativeFoldPrecomputeHook = nil
 	collection.writer.Lock()
-	err = collection.materializePrimaryParentsLocked()
+	err = collection.materializePrimaryParentsLocked(primaryMaterializationCheckpoint)
 	collection.writer.Unlock()
 	if err != nil {
 		t.Fatalf("retry materialize: %v", err)
+	}
+	retryStats := collection.Stats()
+	if retryStats.PrimaryOverlayMaterializationAttempts !=
+		failedStats.PrimaryOverlayMaterializationAttempts+1 ||
+		retryStats.PrimaryOverlayMaterializations !=
+			failedStats.PrimaryOverlayMaterializations+1 ||
+		retryStats.PrimaryOverlayMaterializationFailures !=
+			failedStats.PrimaryOverlayMaterializationFailures ||
+		retryStats.PrimaryOverlayFoldNS.Count != failedStats.PrimaryOverlayFoldNS.Count+1 ||
+		retryStats.PrimaryOverlayCheckpointFolds !=
+			failedStats.PrimaryOverlayCheckpointFolds+1 {
+		t.Fatalf("retry telemetry = %+v; failed = %+v", retryStats, failedStats)
 	}
 	for _, index := range selected {
 		assertPrimaryRaw(t, collection, keys[index], updated[index], true)

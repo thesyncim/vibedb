@@ -25,6 +25,7 @@ import (
 	"time"
 
 	competitive "github.com/thesyncim/vibedb/bench/competitive"
+	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -508,6 +509,12 @@ func main() {
 		printResult("checkpoint", checkpointSummary)
 	}
 	if diagnosticStats {
+		telemetry := buildTelemetryRecord(
+			factory.Name, *clients,
+			runtimeBefore, runtimeAfter,
+			durableBefore, durableAfter, durableOK,
+		)
+		check(mixedtelemetry.Write(os.Stderr, telemetry))
 		fmt.Fprintf(
 			os.Stderr,
 			"mixed-runtime engine=%s clients=%d total-alloc-bytes=%d mallocs=%d\n",
@@ -680,6 +687,223 @@ func durableStats(engine competitive.Engine) (durable.Stats, bool) {
 		return durable.Stats{}, false
 	}
 	return reporter.DurableStats(), true
+}
+
+// buildTelemetryRecord turns the two point-in-time snapshots into a versioned
+// transport record. Monotonic counters are deltas over the measured phase.
+// Largest-group fields are high-waters rather than counters, so retaining both
+// samples avoids the false precision of subtracting them.
+func buildTelemetryRecord(
+	engine string,
+	clients int,
+	runtimeBefore, runtimeAfter runtime.MemStats,
+	durableBefore, durableAfter durable.Stats,
+	durableOK bool,
+) mixedtelemetry.Record {
+	record := mixedtelemetry.Record{
+		Engine:                 engine,
+		Clients:                clients,
+		Available:              durableOK,
+		RuntimeTotalAllocBytes: counterDelta(runtimeBefore.TotalAlloc, runtimeAfter.TotalAlloc),
+		RuntimeMallocs:         counterDelta(runtimeBefore.Mallocs, runtimeAfter.Mallocs),
+	}
+	if !durableOK {
+		return record
+	}
+	record.ScalarPatchAttempts = counterDelta(
+		durableBefore.ConcurrentPrimaryScalarPatchAttempts,
+		durableAfter.ConcurrentPrimaryScalarPatchAttempts,
+	)
+	record.ScalarPatchAccepts = counterDelta(
+		durableBefore.ConcurrentPrimaryScalarPatches,
+		durableAfter.ConcurrentPrimaryScalarPatches,
+	)
+	record.CompactPatchAttempts = counterDelta(
+		durableBefore.PrimaryCompactColumnPatchAttempts,
+		durableAfter.PrimaryCompactColumnPatchAttempts,
+	)
+	record.CompactPatchAccepts = counterDelta(
+		durableBefore.PrimaryCompactColumnPatches,
+		durableAfter.PrimaryCompactColumnPatches,
+	)
+	record.OverlayFolds = counterDelta(
+		durableBefore.PrimaryOverlayFolds,
+		durableAfter.PrimaryOverlayFolds,
+	)
+	record.OverlayFoldAttempts = counterDelta(
+		durableBefore.PrimaryOverlayMaterializationAttempts,
+		durableAfter.PrimaryOverlayMaterializationAttempts,
+	)
+	record.OverlayMaterializations = counterDelta(
+		durableBefore.PrimaryOverlayMaterializations,
+		durableAfter.PrimaryOverlayMaterializations,
+	)
+	record.OverlayMaterializationFailures = counterDelta(
+		durableBefore.PrimaryOverlayMaterializationFailures,
+		durableAfter.PrimaryOverlayMaterializationFailures,
+	)
+	record.OverlayPressureFolds = counterDelta(
+		durableBefore.PrimaryOverlayPressureFolds,
+		durableAfter.PrimaryOverlayPressureFolds,
+	)
+	record.OverlaySnapshotFolds = counterDelta(
+		durableBefore.PrimaryOverlaySnapshotFolds,
+		durableAfter.PrimaryOverlaySnapshotFolds,
+	)
+	record.OverlayBarrierFolds = counterDelta(
+		durableBefore.PrimaryOverlayBarrierFolds,
+		durableAfter.PrimaryOverlayBarrierFolds,
+	)
+	record.OverlayCheckpointFolds = counterDelta(
+		durableBefore.PrimaryOverlayCheckpointFolds,
+		durableAfter.PrimaryOverlayCheckpointFolds,
+	)
+	record.ConcurrentReplaces = counterDelta(
+		durableBefore.ConcurrentPrimaryReplaces,
+		durableAfter.ConcurrentPrimaryReplaces,
+	)
+	record.ConcurrentFallbacks = counterDelta(
+		durableBefore.ConcurrentPrimaryFallbacks,
+		durableAfter.ConcurrentPrimaryFallbacks,
+	)
+	record.PublishGroups = counterDelta(
+		durableBefore.ConcurrentPrimaryPublishGroups,
+		durableAfter.ConcurrentPrimaryPublishGroups,
+	)
+	record.PublishGroupMaxBefore = durableBefore.ConcurrentPrimaryLargestPublishGroup
+	record.PublishGroupMax = durableAfter.ConcurrentPrimaryLargestPublishGroup
+	record.AutomaticCheckpoints = counterDelta(
+		durableBefore.AutomaticCheckpoints,
+		durableAfter.AutomaticCheckpoints,
+	)
+	record.OverlayArenaBytesBefore = durableBefore.PrimaryOverlayArenaBytes
+	record.OverlayArenaBytes = durableAfter.PrimaryOverlayArenaBytes
+	record.OverlayRetainedRecordsBefore = durableBefore.PrimaryOverlayRetainedRecords
+	record.OverlayRetainedRecords = durableAfter.PrimaryOverlayRetainedRecords
+	record.OverlayDirtyBucketsBefore = durableBefore.PrimaryOverlayDirtyBuckets
+	record.OverlayDirtyBuckets = durableAfter.PrimaryOverlayDirtyBuckets
+	record.OverlayReservedFoldBytesBefore = durableBefore.PrimaryOverlayReservedFoldBytes
+	record.OverlayReservedFoldBytes = durableAfter.PrimaryOverlayReservedFoldBytes
+	record.OverlayDirtyBucketLimit = durableAfter.PrimaryOverlayDirtyBucketLimit
+	record.OverlayDirtyByteLimit = durableAfter.PrimaryOverlayDirtyByteLimit
+	record.JournalAcks = counterDelta(durableBefore.JournalAcks, durableAfter.JournalAcks)
+	record.ChainAcks = counterDelta(durableBefore.ChainAcks, durableAfter.ChainAcks)
+	record.JournalSyncs = counterDelta(durableBefore.JournalSyncs, durableAfter.JournalSyncs)
+	record.JournalGroupMaxBefore = uint64(durableBefore.JournalLargestGroup)
+	record.JournalGroupMax = uint64(durableAfter.JournalLargestGroup)
+	record.JournalStrictSyncs = counterDelta(
+		durableBefore.JournalStrictSyncs,
+		durableAfter.JournalStrictSyncs,
+	)
+	record.JournalStrictRecords = counterDelta(
+		durableBefore.JournalStrictRecords,
+		durableAfter.JournalStrictRecords,
+	)
+	record.JournalStrictMutations = counterDelta(
+		durableBefore.JournalStrictMutations,
+		durableAfter.JournalStrictMutations,
+	)
+	record.JournalStrictBytes = counterDelta(
+		durableBefore.JournalStrictBytes,
+		durableAfter.JournalStrictBytes,
+	)
+	record.JournalDeltaCheckpoints = counterDelta(
+		durableBefore.JournalDeltaCheckpoints,
+		durableAfter.JournalDeltaCheckpoints,
+	)
+	record.JournalDeltaRecords = counterDelta(
+		durableBefore.JournalDeltaRecords,
+		durableAfter.JournalDeltaRecords,
+	)
+	record.JournalDeltaBytes = counterDelta(
+		durableBefore.JournalDeltaBytes,
+		durableAfter.JournalDeltaBytes,
+	)
+	record.JournalDeltaFallbacks = counterDelta(
+		durableBefore.JournalDeltaFullFallbacks,
+		durableAfter.JournalDeltaFullFallbacks,
+	)
+	record.DeviceBytes = counterDelta(durableBefore.DeviceBytes, durableAfter.DeviceBytes)
+	record.LeafSplits = counterDelta(
+		durableBefore.PrimaryLeafSplits,
+		durableAfter.PrimaryLeafSplits,
+	)
+	record.EmptyReclaims = counterDelta(
+		durableBefore.PrimaryEmptyReclaims,
+		durableAfter.PrimaryEmptyReclaims,
+	)
+	record.Histograms = map[string]mixedtelemetry.Histogram{
+		"primary-overlay-fold-ns": histogramDelta(
+			durableBefore.PrimaryOverlayFoldNS,
+			durableAfter.PrimaryOverlayFoldNS,
+		),
+		"concurrent-stripe-wait-ns": histogramDelta(
+			durableBefore.ConcurrentPrimaryStripeWaitNS,
+			durableAfter.ConcurrentPrimaryStripeWaitNS,
+		),
+		"concurrent-publish-group-size": histogramDelta(
+			durableBefore.ConcurrentPrimaryPublishGroupSize,
+			durableAfter.ConcurrentPrimaryPublishGroupSize,
+		),
+		"journal-group-records": histogramDelta(
+			durableBefore.JournalGroupRecords,
+			durableAfter.JournalGroupRecords,
+		),
+		"journal-group-mutations": histogramDelta(
+			durableBefore.JournalGroupMutations,
+			durableAfter.JournalGroupMutations,
+		),
+		"journal-group-bytes": histogramDelta(
+			durableBefore.JournalGroupBytes,
+			durableAfter.JournalGroupBytes,
+		),
+		"journal-group-sync-ns": histogramDelta(
+			durableBefore.JournalGroupSyncNS,
+			durableAfter.JournalGroupSyncNS,
+		),
+		"journal-strict-sync-ns": histogramDelta(
+			durableBefore.JournalStrictSyncNS,
+			durableAfter.JournalStrictSyncNS,
+		),
+		"journal-delta-batch-records": histogramDelta(
+			durableBefore.JournalDeltaBatchRecords,
+			durableAfter.JournalDeltaBatchRecords,
+		),
+		"journal-delta-batch-bytes": histogramDelta(
+			durableBefore.JournalDeltaBatchBytes,
+			durableAfter.JournalDeltaBatchBytes,
+		),
+		"journal-delta-sync-ns": histogramDelta(
+			durableBefore.JournalDeltaSyncNS,
+			durableAfter.JournalDeltaSyncNS,
+		),
+	}
+	return record
+}
+
+func histogramDelta(
+	before, after durable.StatsHistogram,
+) mixedtelemetry.Histogram {
+	buckets := make([]uint64, durable.StatsHistogramBuckets)
+	for index := range buckets {
+		buckets[index] = counterDelta(before.Buckets[index], after.Buckets[index])
+	}
+	return mixedtelemetry.Histogram{
+		Count:     counterDelta(before.Count, after.Count),
+		Sum:       counterDelta(before.Sum, after.Sum),
+		MaxBefore: before.Max,
+		Max:       after.Max,
+		Buckets:   buckets,
+	}
+}
+
+// counterDelta fails closed if a future reporter resets a counter between
+// snapshots; wrapping uint64 arithmetic would manufacture a huge metric.
+func counterDelta(before, after uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
 }
 
 func automaticCheckpointCount(engine competitive.Engine) uint64 {

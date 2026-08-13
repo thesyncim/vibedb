@@ -1573,7 +1573,7 @@ func TestBufferedJournalDeltaRetainsCarryAcrossOlderStagedFlush(t *testing.T) {
 	lostCarryImage := journalDeltaImageBeforeSync(
 		t, path, durableJournalCut,
 	)
-	if err := coll.materializePrimaryParentsLocked(); err != nil {
+	if err := coll.materializePrimaryParentsLocked(primaryMaterializationCheckpoint); err != nil {
 		coll.writer.Unlock()
 		t.Fatalf("materialize carried cut: %v", err)
 	}

@@ -41,10 +41,12 @@ func TestPrimaryUnifiedOverlayLazyBacking(t *testing.T) {
 		len(overlay.arena) != 0 {
 		t.Fatal("lazy overlay allocated backing before first mutation")
 	}
-	if capacity, resident, dirty := overlay.stats(); capacity != arenaBytes || resident != 0 || dirty != 0 {
+	if stats := overlay.stats(); stats.capacityBytes != arenaBytes ||
+		stats.arenaBytes != 0 || stats.logicalDirtyBytes != 0 {
 		t.Fatalf(
 			"lazy stats = (%d, %d, %d), want (%d, 0, 0)",
-			capacity, resident, dirty, arenaBytes,
+			stats.capacityBytes, stats.arenaBytes,
+			stats.logicalDirtyBytes, arenaBytes,
 		)
 	}
 	if _, disposition, _ := overlay.lookup(1, 7, []byte("key"), 1); disposition != primaryUnifiedOverlayMissing {
@@ -66,6 +68,50 @@ func TestPrimaryUnifiedOverlayLazyBacking(t *testing.T) {
 	value, disposition, _ := overlay.lookup(1, 7, []byte("key"), 1)
 	if disposition != primaryUnifiedOverlayValue || string(value) != "value" {
 		t.Fatalf("lazy lookup = (%q, %d)", value, disposition)
+	}
+}
+
+func TestPrimaryUnifiedOverlayStatsSeparateRetainedOccupancyFromDebt(t *testing.T) {
+	const (
+		maxLeaf = uint32(64 << 10)
+		parents = uint32(16 << 10)
+	)
+	overlay := newPrimaryUnifiedOverlay(
+		64<<10, 2, 2*uint64(maxLeaf+parents), maxLeaf, parents,
+	)
+	publish := func(bucket storeio.BucketID, generation uint64, key string) {
+		t.Helper()
+		prepared, err := overlay.prepareWithLeafReservation(
+			bucket, uint64(bucket), generation, []byte(key), []byte(`{"v":1}`),
+			0, 0, primaryUnifiedOverlayPut, 1, 4<<10, false,
+			storeio.CommonPrimaryUnifiedScalarPatch{},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		overlay.publish(prepared)
+	}
+
+	publish(1, 1, "first")
+	before := overlay.stats()
+	if before.retainedRecords != 1 || before.arenaBytes == 0 ||
+		before.dirtyBuckets != 1 || before.reservedFoldBytes == 0 {
+		t.Fatalf("pending stats = %+v", before)
+	}
+	overlay.markFolded(1, false)
+	pinned := overlay.stats()
+	if pinned.retainedRecords != before.retainedRecords ||
+		pinned.arenaBytes != before.arenaBytes || pinned.dirtyBuckets != 0 ||
+		pinned.reservedFoldBytes != 0 || pinned.logicalDirtyBytes != 0 {
+		t.Fatalf("reader-pinned folded stats = %+v; before = %+v", pinned, before)
+	}
+
+	publish(2, 2, "second")
+	after := overlay.stats()
+	if after.retainedRecords != 2 || after.arenaBytes <= pinned.arenaBytes ||
+		after.dirtyBuckets != 1 || after.reservedFoldBytes == 0 ||
+		after.logicalDirtyBytes == 0 {
+		t.Fatalf("new-window stats = %+v; pinned = %+v", after, pinned)
 	}
 }
 

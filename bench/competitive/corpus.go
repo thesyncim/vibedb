@@ -118,13 +118,19 @@ func CorpusOf(n int, card Cardinality) []Doc {
 	return benchcorpus.Corpus(n, card == HighCardinality)
 }
 
-// UpdatedJSON returns a same-shape replacement body for document i, used by
-// the point-write workload. It keeps the country field unchanged so that
-// replacing a document does not perturb index selectivity, and differs from
-// the original so no engine can elide the write.
+// UpdatedJSON returns a longer replacement body for document i, used by the
+// point-write workload. It keeps the country field unchanged so that replacing
+// a document does not perturb index selectivity, and differs from the original
+// so no engine can elide the write.
 func UpdatedJSON(docs []Doc, i int) []byte {
+	return AppendUpdatedJSON(nil, docs, i)
+}
+
+// AppendUpdatedJSON is UpdatedJSON with caller-owned scratch. Benchmarks use
+// it so JSON fixture construction is not charged to any storage engine.
+func AppendUpdatedJSON(dst []byte, docs []Doc, i int) []byte {
 	src := docs[i%len(docs)].JSON
-	out := make([]byte, 0, len(src)+4)
+	out := dst
 	// Rewrite "score":N to "score":999 without reparsing: append a trailing
 	// field instead, which every engine stores verbatim and every JSON reader
 	// accepts.

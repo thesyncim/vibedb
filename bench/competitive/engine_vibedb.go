@@ -31,6 +31,27 @@ type vibeDBEngine struct {
 	scan        *vibeDBScanState
 }
 
+type vibeDBWriteCounters struct {
+	patchAttempts uint64
+	patches       uint64
+	folds         uint64
+	replacements  uint64
+}
+
+func vibeDBWriteCountersOf(engine Engine) (vibeDBWriteCounters, bool) {
+	v, ok := engine.(*vibeDBEngine)
+	if !ok || v.coll == nil {
+		return vibeDBWriteCounters{}, false
+	}
+	stats := v.coll.Stats()
+	return vibeDBWriteCounters{
+		patchAttempts: stats.ConcurrentPrimaryScalarPatchAttempts,
+		patches:       stats.ConcurrentPrimaryScalarPatches,
+		folds:         stats.PrimaryOverlayFolds,
+		replacements:  stats.ConcurrentPrimaryReplaces,
+	}, true
+}
+
 func vibeDBPointKey(
 	buf *[vibeDBKeyBytes]byte,
 	key string,

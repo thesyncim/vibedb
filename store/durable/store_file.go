@@ -268,20 +268,32 @@ type Collection struct {
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
 
-	automaticCheckpoints                 atomic.Uint64
-	primaryOverlayFolds                  atomic.Uint64
-	primaryCompactColumnPatchAttempts    atomic.Uint64
-	primaryCompactColumnPatches          atomic.Uint64
-	concurrentPrimaryReplaces            atomic.Uint64
-	concurrentPrimaryFallbacks           atomic.Uint64
-	concurrentPrimaryPublishGroups       atomic.Uint64
-	concurrentPrimaryLargestPublishGroup atomic.Uint64
-	retirementPressureCheckpoints        atomic.Uint64
-	materializationAttempts              atomic.Uint64
-	materializationUpdates               atomic.Uint64
-	materializationFallbacks             atomic.Uint64
-	materializationSnapshotSkips         atomic.Uint64
-	materializationBusySkips             atomic.Uint64
+	automaticCheckpoints                  atomic.Uint64
+	primaryOverlayFolds                   atomic.Uint64
+	primaryOverlayMaterializationAttempts atomic.Uint64
+	primaryOverlayMaterializations        atomic.Uint64
+	primaryOverlayMaterializationFailures atomic.Uint64
+	primaryOverlayFoldNS                  atomicStatsHistogram
+	primaryOverlayPressureFolds           atomic.Uint64
+	primaryOverlaySnapshotFolds           atomic.Uint64
+	primaryOverlayBarrierFolds            atomic.Uint64
+	primaryOverlayCheckpointFolds         atomic.Uint64
+	primaryCompactColumnPatchAttempts     atomic.Uint64
+	primaryCompactColumnPatches           atomic.Uint64
+	concurrentPrimaryScalarPatchAttempts  atomic.Uint64
+	concurrentPrimaryScalarPatches        atomic.Uint64
+	concurrentPrimaryReplaces             atomic.Uint64
+	concurrentPrimaryFallbacks            atomic.Uint64
+	concurrentPrimaryPublishGroups        atomic.Uint64
+	concurrentPrimaryLargestPublishGroup  atomic.Uint64
+	concurrentPrimaryStripeWaitNS         atomicStatsHistogram
+	concurrentPrimaryPublishGroupSize     atomicStatsHistogram
+	retirementPressureCheckpoints         atomic.Uint64
+	materializationAttempts               atomic.Uint64
+	materializationUpdates                atomic.Uint64
+	materializationFallbacks              atomic.Uint64
+	materializationSnapshotSkips          atomic.Uint64
+	materializationBusySkips              atomic.Uint64
 	// journalAcks counts frame-deferred mutations made durable by a single journal
 	// append plus one sync, the redo lane's fast acknowledgement. chainAcks counts
 	// mutations whose durability instead came from a committer root fence — the
@@ -296,9 +308,21 @@ type Collection struct {
 	// group commit.
 	journalSyncs              atomic.Uint64
 	journalLargestGroup       atomic.Uint32
+	journalGroupRecords       atomicStatsHistogram
+	journalGroupMutations     atomicStatsHistogram
+	journalGroupBytes         atomicStatsHistogram
+	journalGroupSyncNS        atomicStatsHistogram
+	journalStrictSyncs        atomic.Uint64
+	journalStrictRecords      atomic.Uint64
+	journalStrictMutations    atomic.Uint64
+	journalStrictBytes        atomic.Uint64
+	journalStrictSyncNS       atomicStatsHistogram
 	journalDeltaCheckpoints   atomic.Uint64
 	journalDeltaRecords       atomic.Uint64
 	journalDeltaBytes         atomic.Uint64
+	journalDeltaBatchRecords  atomicStatsHistogram
+	journalDeltaBatchBytes    atomicStatsHistogram
+	journalDeltaSyncNS        atomicStatsHistogram
 	journalDeltaFullFallbacks atomic.Uint64
 	primaryLeafSplitRequired  atomic.Uint64
 	primaryEmptyLeaves        atomic.Uint64
@@ -589,12 +613,49 @@ type Stats struct {
 	// device checkpoint; a later journal delta, explicit Flush, or Close supplies
 	// the crash-safety boundary.
 	PrimaryOverlayFolds uint64
+	// PrimaryOverlayMaterializationAttempts counts every non-empty class-5
+	// overlay fold attempt, including a bounded-capacity decline that drains a
+	// prior staged cut and retries. PrimaryOverlayMaterializations counts the
+	// successful physical attempts. PrimaryOverlayMaterializationFailures counts
+	// logical wrapper calls that ultimately failed; a handled capacity decline can
+	// therefore make Attempts exceed Materializations+Failures. FoldNS measures
+	// successful logical foreground calls, including any drain-and-retry latency.
+	PrimaryOverlayMaterializationAttempts uint64
+	PrimaryOverlayMaterializations        uint64
+	PrimaryOverlayMaterializationFailures uint64
+	PrimaryOverlayFoldNS                  StatsHistogram
+	// PrimaryOverlay*Folds classify successful logical materializations by the
+	// foreground boundary that requested them. PrimaryOverlayFolds is the sum of
+	// Pressure, Snapshot, and Barrier; physical Checkpoint folds are separate.
+	PrimaryOverlayPressureFolds   uint64
+	PrimaryOverlaySnapshotFolds   uint64
+	PrimaryOverlayBarrierFolds    uint64
+	PrimaryOverlayCheckpointFolds uint64
+	// PrimaryOverlay* debt fields expose the current bounded fold input without
+	// scanning records: retained arena bytes/records, dirty leaf buckets, and the
+	// conservative physical bytes reserved for their next materialization.
+	// Records can remain retained after a fold while an old reader pins them;
+	// DirtyBuckets and ReservedFoldBytes describe only generations newer than the
+	// folded base.
+	PrimaryOverlayArenaBytes        uint64
+	PrimaryOverlayRetainedRecords   uint64
+	PrimaryOverlayDirtyBuckets      uint64
+	PrimaryOverlayReservedFoldBytes uint64
+	PrimaryOverlayDirtyBucketLimit  uint64
+	PrimaryOverlayDirtyByteLimit    uint64
 	// PrimaryCompactColumnPatchAttempts counts exact compact-stripe replacement
 	// qualifications, including safe declines to the complete planner.
 	PrimaryCompactColumnPatchAttempts uint64
 	// PrimaryCompactColumnPatches counts exact compact-stripe replacements that
 	// replanned only the changed scalar column instead of rebuilding every row.
 	PrimaryCompactColumnPatches uint64
+	// ConcurrentPrimaryScalarPatchAttempts counts existing compact-row
+	// replacements checked against the canonical span certificate produced by
+	// concurrent admission.
+	ConcurrentPrimaryScalarPatchAttempts uint64
+	// ConcurrentPrimaryScalarPatches counts those attempts that published an
+	// exact or one-scalar certificate for compact-fold reuse.
+	ConcurrentPrimaryScalarPatches uint64
 	// ConcurrentPrimaryReplaces counts existing inline rows published through
 	// the shared-writer, bucket-striped buffered lane. It advances only after the
 	// complete overlay/router/state publication, so qualification can detect a
@@ -609,6 +670,11 @@ type Stats struct {
 	// ConcurrentPrimaryLargestPublishGroup is the largest successful prefix
 	// made visible by one concurrent publisher group.
 	ConcurrentPrimaryLargestPublishGroup uint64
+	// ConcurrentPrimaryStripeWaitNS measures only contended bucket-stripe waits;
+	// uncontended acquisitions take no clock read. PublishGroupSize records every
+	// successful group and therefore has the same Count as PublishGroups.
+	ConcurrentPrimaryStripeWaitNS     StatsHistogram
+	ConcurrentPrimaryPublishGroupSize StatsHistogram
 	// RetirementPressureCheckpoints counts retirement-capacity events that
 	// forced an otherwise-unrequested checkpoint before retry.
 	RetirementPressureCheckpoints uint64
@@ -644,6 +710,22 @@ type Stats struct {
 	// share one fence. Both are zero unless a recovery journal is configured.
 	JournalSyncs        uint64
 	JournalLargestGroup uint32
+	// JournalGroup* histograms describe each successful shared buffered-journal
+	// fence by redo records, logical mutations, padded bytes, and sync latency.
+	// A batch is one record but can contain several logical mutations.
+	JournalGroupRecords   StatsHistogram
+	JournalGroupMutations StatsHistogram
+	JournalGroupBytes     StatsHistogram
+	JournalGroupSyncNS    StatsHistogram
+	// JournalStrict* accounts for the synchronous journal-before-publish lane,
+	// which cannot share the buffered lane's post-publication fence. Syncs counts
+	// successful fences; Records/Mutations/Bytes count the records those fences
+	// made durable.
+	JournalStrictSyncs     uint64
+	JournalStrictRecords   uint64
+	JournalStrictMutations uint64
+	JournalStrictBytes     uint64
+	JournalStrictSyncNS    StatsHistogram
 	// JournalDelta* accounts for ordinary buffered-visible journal checkpoints.
 	// Checkpoints counts explicit Flush fences. Records is the number of logical
 	// overlay mutations appended (including an unsynced pressure carry), Bytes
@@ -653,6 +735,11 @@ type Stats struct {
 	JournalDeltaRecords       uint64
 	JournalDeltaBytes         uint64
 	JournalDeltaFullFallbacks uint64
+	// JournalDeltaBatch* describes every successfully appended checkpoint/carry
+	// batch. JournalDeltaSyncNS describes successful explicit delta fences.
+	JournalDeltaBatchRecords StatsHistogram
+	JournalDeltaBatchBytes   StatsHistogram
+	JournalDeltaSyncNS       StatsHistogram
 	// PrimaryLeafSplitRequired counts inserts rejected before publication
 	// because the selected wide leaf needs the deferred structural split.
 	PrimaryLeafSplitRequired uint64

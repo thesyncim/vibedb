@@ -312,11 +312,14 @@ func BenchmarkPointRead(b *testing.B) {
 	}
 }
 
-// BenchmarkPointWrite replaces one existing document. This is the workload
-// where durability dominates, so it runs in each engine's explicitly named
-// durability configurations. Equal slice positions are not claims of
-// equivalent guarantees. Each repetition builds its own store so writes from
-// one repetition cannot affect another.
+// BenchmarkPointWrite alternates one existing document between its original
+// value and a longer structural replacement. Every iteration therefore changes
+// bytes and length; after one corpus pass it does not silently become an
+// idempotent Put benchmark. This is the workload where durability dominates,
+// so it runs in each engine's explicitly named durability configurations.
+// Equal slice positions are not claims of equivalent guarantees. Each
+// repetition builds its own store so writes from one repetition cannot affect
+// another.
 func BenchmarkPointWrite(b *testing.B) {
 	for _, factory := range Factories() {
 		for _, durability := range BenchmarkDurabilityModes(factory.Name) {
@@ -328,22 +331,62 @@ func BenchmarkPointWrite(b *testing.B) {
 					Durability: durability,
 				})
 				defer cleanup()
+				before, vibeDB := vibeDBWriteCountersOf(e)
 				i := 0
+				var replacement []byte
+				updated := make([]bool, len(docs))
 				b.ReportAllocs()
 				b.ResetTimer()
 				for b.Loop() {
 					idx := probeIdx[i]
-					if err := e.Put(docs[idx].Key, UpdatedJSON(docs, idx)); err != nil {
+					if updated[idx] {
+						replacement = append(replacement[:0], docs[idx].JSON...)
+					} else {
+						replacement = AppendUpdatedJSON(replacement[:0], docs, idx)
+					}
+					if err := e.Put(docs[idx].Key, replacement); err != nil {
 						b.Fatal(err)
 					}
+					updated[idx] = !updated[idx]
 					i++
 					if i == len(probeIdx) {
 						i = 0
 					}
 				}
+				b.StopTimer()
+				if vibeDB {
+					reportVibeDBWriteCounters(b, before, e, false)
+				}
 			})
 		}
 	}
+}
+
+func reportVibeDBWriteCounters(
+	b *testing.B,
+	before vibeDBWriteCounters,
+	engine Engine,
+	requirePatch bool,
+) {
+	b.Helper()
+	after, ok := vibeDBWriteCountersOf(engine)
+	if !ok {
+		return
+	}
+	attempts := after.patchAttempts - before.patchAttempts
+	patches := after.patches - before.patches
+	folds := after.folds - before.folds
+	replacements := after.replacements - before.replacements
+	if requirePatch && patches == 0 {
+		b.Fatalf("claimed compact-patch workload accepted no patches (attempts=%d)", attempts)
+	}
+	operations := float64(max(1, b.N))
+	b.ReportMetric(float64(attempts)/operations, "patch-attempts/op")
+	if attempts != 0 {
+		b.ReportMetric(100*float64(patches)/float64(attempts), "patch-accept-%")
+	}
+	b.ReportMetric(float64(folds)/operations, "overlay-folds/op")
+	b.ReportMetric(float64(replacements)/operations, "concurrent-replaces/op")
 }
 
 // BenchmarkPointWriteDurableDefaults shows what store/durable's own default
@@ -361,13 +404,21 @@ func BenchmarkPointWriteDurableDefaults(b *testing.B) {
 			e, _, cleanup := newLoaded(b, durableFactory, Config{Untuned: untuned})
 			defer cleanup()
 			i := 0
+			var replacement []byte
+			updated := make([]bool, len(docs))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
 				idx := probeIdx[i]
-				if err := e.Put(docs[idx].Key, UpdatedJSON(docs, idx)); err != nil {
+				if updated[idx] {
+					replacement = append(replacement[:0], docs[idx].JSON...)
+				} else {
+					replacement = AppendUpdatedJSON(replacement[:0], docs, idx)
+				}
+				if err := e.Put(docs[idx].Key, replacement); err != nil {
 					b.Fatal(err)
 				}
+				updated[idx] = !updated[idx]
 				i++
 				if i == len(probeIdx) {
 					i = 0

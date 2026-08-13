@@ -76,10 +76,17 @@ type journalCommitGroup struct {
 	// waiter. It is advanced under c.writer AND this mu (a deposit holds both) and
 	// read by the leader under this mu.
 	deposited uint64
+	// depositedBytes and depositedMutations carry the same cumulative ticket
+	// boundary in padded journal bytes and logical mutations. One batch is one
+	// deposited record but may advance both by much more than one.
+	depositedBytes     uint64
+	depositedMutations uint64
 	// synced is the highest deposited ticket a completed sync — or a checkpoint
 	// recycle, which folds every deposited record into the durable root — has
 	// proven durable. A waiter returns once synced >= its target.
-	synced uint64
+	synced          uint64
+	syncedBytes     uint64
+	syncedMutations uint64
 	// syncing is true while a leader holds a sync in flight; arrivals queue and
 	// are taken by the next leader, so the device's own sync latency is the
 	// natural, self-tuning group window.
@@ -112,7 +119,11 @@ func (c *Collection) initJournalGroupLocked() {
 	g.linger = c.options.CommitCoalesce
 	g.cond.L = &g.mu
 	g.deposited = 0
+	g.depositedBytes = 0
+	g.depositedMutations = 0
 	g.synced = 0
+	g.syncedBytes = 0
+	g.syncedMutations = 0
 	g.syncing = false
 	g.syncCaptured = false
 	g.syncingThrough = 0
@@ -124,9 +135,11 @@ func (c *Collection) initJournalGroupLocked() {
 // depositBump records one appended record and returns the caller's target
 // ticket. It is called under c.writer, immediately after a successful journal
 // Append, so ticket order equals append order.
-func (g *journalCommitGroup) depositBump() uint64 {
+func (g *journalCommitGroup) depositBump(bytes, mutations uint64) uint64 {
 	g.mu.Lock()
 	g.deposited++
+	g.depositedBytes += bytes
+	g.depositedMutations += mutations
 	t := g.deposited
 	g.mu.Unlock()
 	return t
@@ -141,6 +154,8 @@ func (g *journalCommitGroup) recycleAdvance() {
 	g.mu.Lock()
 	if g.deposited > g.synced {
 		g.synced = g.deposited
+		g.syncedBytes = g.depositedBytes
+		g.syncedMutations = g.depositedMutations
 	}
 	g.cond.Broadcast()
 	g.mu.Unlock()
@@ -212,14 +227,19 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 		}
 		g.mu.Lock()
 		captured := g.deposited
+		capturedBytes := g.depositedBytes
+		capturedMutations := g.depositedMutations
 		g.syncCaptured = true
 		g.syncingThrough = captured
 		groupSize := captured - g.synced
+		groupBytes := capturedBytes - g.syncedBytes
+		groupMutations := capturedMutations - g.syncedMutations
 		g.mu.Unlock()
 		if recoveryJournalGroupBeforeSyncHook != nil {
 			recoveryJournalGroupBeforeSyncHook(captured)
 		}
 
+		started := time.Now()
 		err := g.journal.Sync(g.powerSafe)
 		if err != nil {
 			// Preserve the collection's first poison while retaining this fence's
@@ -242,6 +262,10 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 			continue
 		}
 		c.journalSyncs.Add(1)
+		c.journalGroupRecords.observe(groupSize)
+		c.journalGroupMutations.observe(groupMutations)
+		c.journalGroupBytes.observe(groupBytes)
+		c.journalGroupSyncNS.observe(uint64(time.Since(started)))
 		for {
 			prev := c.journalLargestGroup.Load()
 			if uint32(groupSize) <= prev ||
@@ -255,6 +279,8 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 		g.syncingThrough = 0
 		if captured > g.synced {
 			g.synced = captured
+			g.syncedBytes = capturedBytes
+			g.syncedMutations = capturedMutations
 		}
 		g.cond.Broadcast()
 		// Loop: synced now covers target (target <= captured, since the caller

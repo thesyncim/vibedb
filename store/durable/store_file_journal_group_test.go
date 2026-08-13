@@ -172,6 +172,18 @@ func TestRecoveryJournalGroupCommitSharesSync(t *testing.T) {
 				t.Fatalf("no group commit occurred: largestGroup=%d (acks=%d syncs=%d)",
 					stats.JournalLargestGroup, stats.JournalAcks, stats.JournalSyncs)
 			}
+			if stats.JournalGroupRecords.Count != stats.JournalSyncs ||
+				stats.JournalGroupRecords.Sum != stats.JournalAcks ||
+				stats.JournalGroupMutations.Sum != uint64(writers*putsPer) ||
+				stats.JournalGroupBytes.Sum == 0 ||
+				stats.JournalGroupSyncNS.Count != stats.JournalSyncs {
+				t.Fatalf(
+					"group telemetry records=%+v mutations=%+v bytes=%+v sync=%+v acks=%d syncs=%d",
+					stats.JournalGroupRecords, stats.JournalGroupMutations,
+					stats.JournalGroupBytes, stats.JournalGroupSyncNS,
+					stats.JournalAcks, stats.JournalSyncs,
+				)
+			}
 
 			// Every acknowledged record survives a reopen: fold to a durable root,
 			// close, and replay from a fresh Open.

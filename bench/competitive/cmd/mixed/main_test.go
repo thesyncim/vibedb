@@ -12,6 +12,7 @@ import (
 	"time"
 
 	competitive "github.com/thesyncim/vibedb/bench/competitive"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 func TestOutputHeaderRequiresResolvedDurabilityAndCheckpoint(t *testing.T) {
@@ -37,6 +38,68 @@ func TestOutputHeaderRequiresResolvedDurabilityAndCheckpoint(t *testing.T) {
 	}
 	if contains("sync") {
 		t.Fatalf("header retained ambiguous sync column: %q", out.String())
+	}
+}
+
+func TestBuildTelemetryRecordUsesCounterDeltasAndExplicitHighWaters(t *testing.T) {
+	runtimeBefore := runtime.MemStats{TotalAlloc: 100, Mallocs: 10}
+	runtimeAfter := runtime.MemStats{TotalAlloc: 175, Mallocs: 17}
+	durableBefore := durable.Stats{
+		ConcurrentPrimaryScalarPatchAttempts: 10,
+		ConcurrentPrimaryScalarPatches:       9,
+		ConcurrentPrimaryPublishGroups:       3,
+		ConcurrentPrimaryLargestPublishGroup: 4,
+		JournalAcks:                          20,
+		JournalSyncs:                         5,
+		JournalLargestGroup:                  6,
+		JournalDeltaRecords:                  30,
+		JournalDeltaBytes:                    4096,
+		JournalDeltaFullFallbacks:            1,
+		DeviceBytes:                          8192,
+		ConcurrentPrimaryStripeWaitNS: durable.StatsHistogram{
+			Count: 2, Sum: 10, Max: 8,
+		},
+	}
+	durableAfter := durableBefore
+	durableAfter.ConcurrentPrimaryScalarPatchAttempts += 11
+	durableAfter.ConcurrentPrimaryScalarPatches += 10
+	durableAfter.ConcurrentPrimaryPublishGroups += 7
+	durableAfter.ConcurrentPrimaryLargestPublishGroup = 12
+	durableAfter.JournalAcks += 40
+	durableAfter.JournalSyncs += 8
+	durableAfter.JournalLargestGroup = 14
+	durableAfter.JournalDeltaRecords += 50
+	durableAfter.JournalDeltaBytes += 12_288
+	durableAfter.JournalDeltaFullFallbacks += 2
+	durableAfter.DeviceBytes += 16_384
+	durableAfter.ConcurrentPrimaryStripeWaitNS.Count += 3
+	durableAfter.ConcurrentPrimaryStripeWaitNS.Sum += 30
+	durableAfter.ConcurrentPrimaryStripeWaitNS.Max = 16
+	durableAfter.ConcurrentPrimaryStripeWaitNS.Buckets[4] = 3
+
+	got := buildTelemetryRecord(
+		"vibedb", 8, runtimeBefore, runtimeAfter,
+		durableBefore, durableAfter, true,
+	)
+	if got.Engine != "vibedb" || got.Clients != 8 || !got.Available ||
+		got.RuntimeTotalAllocBytes != 75 || got.RuntimeMallocs != 7 ||
+		got.ScalarPatchAttempts != 11 || got.ScalarPatchAccepts != 10 ||
+		got.PublishGroups != 7 || got.PublishGroupMaxBefore != 4 ||
+		got.PublishGroupMax != 12 || got.JournalAcks != 40 ||
+		got.JournalSyncs != 8 || got.JournalGroupMaxBefore != 6 ||
+		got.JournalGroupMax != 14 || got.JournalDeltaRecords != 50 ||
+		got.JournalDeltaBytes != 12_288 || got.JournalDeltaFallbacks != 2 ||
+		got.DeviceBytes != 16_384 {
+		t.Fatalf("telemetry = %+v", got)
+	}
+	stripe := got.Histograms["concurrent-stripe-wait-ns"]
+	if stripe.Count != 3 || stripe.Sum != 30 || stripe.MaxBefore != 8 ||
+		stripe.Max != 16 || len(stripe.Buckets) != durable.StatsHistogramBuckets ||
+		stripe.Buckets[4] != 3 {
+		t.Fatalf("stripe wait histogram = %+v", stripe)
+	}
+	if got := counterDelta(10, 9); got != 0 {
+		t.Fatalf("reset counter delta = %d, want 0", got)
 	}
 }
 

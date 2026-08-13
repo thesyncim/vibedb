@@ -24,6 +24,23 @@ func TestSameSizeUpdatedJSON(t *testing.T) {
 	}
 }
 
+func TestUpdatedJSON(t *testing.T) {
+	var scratch []byte
+	for i := range min(1000, len(docs)) {
+		scratch = AppendUpdatedJSON(scratch[:0], docs, i)
+		if !json.Valid(scratch) {
+			t.Fatalf("document %d update is invalid JSON: %s", i, scratch)
+		}
+		if len(scratch) <= len(docs[i].JSON) {
+			t.Fatalf("document %d update length = %d, want > %d",
+				i, len(scratch), len(docs[i].JSON))
+		}
+		if bytes.Equal(scratch, docs[i].JSON) {
+			t.Fatalf("document %d update did not change bytes", i)
+		}
+	}
+}
+
 // BenchmarkPointWriteSameSize isolates a replacement that changes bytes but
 // not document length, key routing, or the indexed country. It belongs beside
 // BenchmarkPointWrite, whose appended revision field grows the value.
@@ -38,6 +55,7 @@ func BenchmarkPointWriteSameSize(b *testing.B) {
 					Durability: durability,
 				})
 				defer cleanup()
+				before, vibeDB := vibeDBWriteCountersOf(e)
 				i := 0
 				replacement := make([]byte, 0, 512)
 				updated := make([]bool, len(docs))
@@ -58,6 +76,13 @@ func BenchmarkPointWriteSameSize(b *testing.B) {
 					if i == len(probeIdx) {
 						i = 0
 					}
+				}
+				b.StopTimer()
+				if vibeDB {
+					reportVibeDBWriteCounters(
+						b, before, e,
+						durability == DurabilityBufferedVisible,
+					)
 				}
 			})
 		}

@@ -9,7 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
+func TestPrimaryUnifiedCheckpointEntriesKeepFullRedoForBaseRelativeCertificate(t *testing.T) {
 	t.Run("tiny top-level scalar falls back to full value", func(t *testing.T) {
 		docs := make(map[string][]byte, 256)
 		for i := range 256 {
@@ -26,9 +26,9 @@ func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
 			t.Fatalf("Put = %v,%v", created, err)
 		}
 		if coll.primaryUnifiedOverlay.count.Load() != 1 ||
-			coll.primaryUnifiedOverlay.records[0].scalarPatch !=
+			coll.primaryUnifiedOverlay.records[0].scalarPatch ==
 				(storeio.CommonPrimaryUnifiedScalarPatch{}) {
-			t.Fatal("compact replacement retained a legacy scalar-patch certificate")
+			t.Fatal("compact replacement dropped its scalar-patch certificate")
 		}
 		entries, complete, err :=
 			coll.primaryUnifiedOverlay.checkpointEntriesMode(
@@ -69,6 +69,10 @@ func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
 		if err != nil || created {
 			t.Fatalf("Put = %v,%v", created, err)
 		}
+		if fixture.collection.primaryUnifiedOverlay.records[0].scalarPatch ==
+			(storeio.CommonPrimaryUnifiedScalarPatch{}) {
+			t.Fatal("document scalar dropped its compact admission certificate")
+		}
 		entries, complete, err :=
 			fixture.collection.primaryUnifiedOverlay.checkpointEntriesMode(
 				make([]storeio.RecoveryBatchEntry, 0, 1),
@@ -82,6 +86,66 @@ func TestPrimaryUnifiedCheckpointEntriesScalarPatchMustSaveBytes(t *testing.T) {
 				entries, complete, err)
 		}
 	})
+}
+
+func TestPrimaryUnifiedCheckpointEntriesDoNotReplayBaseRelativePatchOnPredecessor(
+	t *testing.T,
+) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 512, concurrentPrimaryTestOptions(),
+	)
+	same, _ := concurrentPrimaryTestTargets(t, fixture)
+	key := []byte(fixture.keys[same[0]])
+	base := canonicalConcurrentPrimaryValue(t, fixture.values[same[0]])
+	first := append([]byte(nil), base...)
+	group := bytes.Index(first, []byte(`"group":`)) + len(`"group":`)
+	if group < len(`"group":`) || group >= len(first) {
+		t.Fatal("group scalar missing")
+	}
+	if first[group] == '9' {
+		first[group] = '8'
+	} else {
+		first[group]++
+	}
+	second := append([]byte(nil), base...)
+	id := bytes.Index(second, []byte(`"id":`)) + len(`"id":`)
+	if id < len(`"id":`) || id >= len(second) {
+		t.Fatal("id scalar missing")
+	}
+	if second[id] == '9' {
+		second[id] = '8'
+	} else {
+		second[id]++
+	}
+
+	baseGeneration := fixture.collection.Generation()
+	for index, value := range [][]byte{first, second} {
+		created, err := fixture.collection.Put(key, value)
+		if err != nil || created {
+			t.Fatalf("Put %d = %v,%v", index, created, err)
+		}
+	}
+	for index := 0; index < 2; index++ {
+		if fixture.collection.primaryUnifiedOverlay.records[index].scalarPatch ==
+			(storeio.CommonPrimaryUnifiedScalarPatch{}) {
+			t.Fatalf("record %d dropped compact fold certificate", index)
+		}
+	}
+	entries, complete, err :=
+		fixture.collection.primaryUnifiedOverlay.checkpointEntriesMode(
+			make([]storeio.RecoveryBatchEntry, 0, 2),
+			baseGeneration, fixture.collection.Generation(), true,
+		)
+	if err != nil || !complete || len(entries) != 2 {
+		t.Fatalf("checkpoint entries = %d complete=%v err=%v", len(entries), complete, err)
+	}
+	for index, want := range [][]byte{first, second} {
+		if entries[index].Kind != storeio.RecoveryRecordKindPut ||
+			!bytes.Equal(entries[index].Value, want) ||
+			entries[index].ScalarPatch != (storeio.RecoveryScalarPatchMetadata{}) {
+			t.Fatalf("entry %d = %#v, want full Put %q", index, entries[index], want)
+		}
+	}
 }
 
 // TestConcurrentPrimaryScalarPatchRequestReuse pins the context-reuse boundary:
@@ -124,8 +188,8 @@ func TestConcurrentPrimaryScalarPatchRequestReuse(t *testing.T) {
 		t.Fatalf("overlay count after Put = %d, want 1", got)
 	}
 	zero := storeio.CommonPrimaryUnifiedScalarPatch{}
-	if overlay.records[0].scalarPatch != zero {
-		t.Fatal("existing-key compact Put retained a legacy certificate")
+	if overlay.records[0].scalarPatch == zero {
+		t.Fatal("existing-key compact Put dropped its certificate")
 	}
 
 	deleted, err := fixture.collection.Delete(key)

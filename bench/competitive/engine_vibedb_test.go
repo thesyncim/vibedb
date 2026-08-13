@@ -16,7 +16,7 @@ func TestVibeDBSameSizeUsesCompactColumnPatch(t *testing.T) {
 	})
 	defer cleanup()
 	v := e.(*vibeDBEngine)
-	before := v.coll.Stats().PrimaryCompactColumnPatches
+	beforeStats := v.coll.Stats()
 	scratch := make([]byte, 0, 512)
 	const puts = 10_000
 	for i := 0; i < puts; i++ {
@@ -26,9 +26,16 @@ func TestVibeDBSameSizeUsesCompactColumnPatch(t *testing.T) {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
-	after := v.coll.Stats().PrimaryCompactColumnPatches
-	if after == before {
-		stats := v.coll.Stats()
+	stats := v.coll.Stats()
+	if stats.ConcurrentPrimaryScalarPatches ==
+		beforeStats.ConcurrentPrimaryScalarPatches {
+		t.Fatalf(
+			"same-size workload dropped concurrent scalar metadata (attempts=%d accepted=%d)",
+			stats.ConcurrentPrimaryScalarPatchAttempts,
+			stats.ConcurrentPrimaryScalarPatches,
+		)
+	}
+	if stats.PrimaryCompactColumnPatches == beforeStats.PrimaryCompactColumnPatches {
 		t.Fatalf(
 			"same-size workload did not engage compact column patching (attempts=%d folds=%d)",
 			stats.PrimaryCompactColumnPatchAttempts, stats.PrimaryOverlayFolds,

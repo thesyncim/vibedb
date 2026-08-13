@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
 )
 
 const (
@@ -61,6 +63,13 @@ type runRecord struct {
 	position   int
 	requested  string
 	row        rawRow
+}
+
+type telemetryRunRecord struct {
+	repetition int
+	position   int
+	requested  string
+	record     mixedtelemetry.Record
 }
 
 type summary struct {
@@ -107,7 +116,7 @@ func run(args []string, stdout, stderr io.Writer) (result error) {
 				stderr, "conditioning %d/%d: %s\n",
 				position+1, len(base), engine,
 			)
-			childHeader, rows, err := executeMixed(cfg, engine)
+			childHeader, rows, _, err := executeMixed(cfg, engine)
 			if err != nil {
 				return fmt.Errorf("conditioning %s: %w", engine, err)
 			}
@@ -120,9 +129,10 @@ func run(args []string, stdout, stderr io.Writer) (result error) {
 	}
 
 	var (
-		header       []string
-		records      []runRecord
-		wroteRawHead bool
+		header           []string
+		records          []runRecord
+		telemetryRecords []telemetryRunRecord
+		wroteRawHead     bool
 	)
 	for repetition, order := range schedule {
 		writeMetadata(
@@ -135,7 +145,7 @@ func run(args []string, stdout, stderr io.Writer) (result error) {
 				stderr, "repetition %d/%d, position %d/%d: %s\n",
 				repetition+1, cfg.repetitions, position+1, len(order), engine,
 			)
-			childHeader, rows, err := executeMixed(cfg, engine)
+			childHeader, rows, telemetry, err := executeMixed(cfg, engine)
 			if err != nil {
 				return fmt.Errorf(
 					"repetition %d position %d engine %s: %w",
@@ -177,6 +187,12 @@ func run(args []string, stdout, stderr io.Writer) (result error) {
 					strings.Join(record.row.values, "\t"),
 				)
 			}
+			telemetryRecords = append(telemetryRecords, telemetryRunRecord{
+				repetition: repetition + 1,
+				position:   position + 1,
+				requested:  engine,
+				record:     telemetry,
+			})
 		}
 	}
 	if len(records) == 0 {
@@ -199,9 +215,12 @@ func run(args []string, stdout, stderr io.Writer) (result error) {
 		strconv.FormatBool(forced == 0 && cfg.repetitions >= 9),
 	)
 	writeMetadata(out, "maximum-forced-checkpoints", formatNumber(forced))
+	writeMetadata(out, "mixed-telemetry-schema", strconv.Itoa(mixedtelemetry.Schema))
+	writeTelemetryRows(out, telemetryRecords)
 	if err := writeSummaries(out, header, records); err != nil {
 		return err
 	}
+	writeTelemetrySummaries(out, telemetryRecords)
 	writeMetadata(out, "finished-utc", time.Now().UTC().Format(time.RFC3339Nano))
 	writeMetadata(out, "elapsed", time.Since(started).String())
 	return checkpointCadenceError(forced, cfg.allowDiagnostic)
@@ -316,7 +335,10 @@ func latinSquareSchedule(engines []string, repetitions int, seed int64) [][]stri
 	return schedule
 }
 
-func executeMixed(cfg config, engine string) ([]string, []rawRow, error) {
+func executeMixed(
+	cfg config,
+	engine string,
+) ([]string, []rawRow, mixedtelemetry.Record, error) {
 	args := []string{
 		"-header",
 		"-engine=" + engine,
@@ -333,27 +355,71 @@ func executeMixed(cfg config, engine string) ([]string, []rawRow, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cfg.mixedBin, args...)
-	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	cmd.Env = environmentWith(
+		os.Environ(),
+		"LC_ALL=C", "LANG=C", "VIBEDB_MIXED_INTERNAL_STATS=1",
+	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if ctx.Err() != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, mixedtelemetry.Record{}, fmt.Errorf(
 			"timed out after %s; stderr: %s",
 			cfg.timeout, strings.TrimSpace(stderr.String()),
 		)
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, mixedtelemetry.Record{}, fmt.Errorf(
 			"%w; stderr: %s", err, strings.TrimSpace(stderr.String()),
 		)
 	}
 	header, rows, err := parseMixedOutput(stdout.Bytes())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, mixedtelemetry.Record{}, err
 	}
-	return header, rows, nil
+	telemetry, err := mixedtelemetry.Parse(stderr.Bytes())
+	if err != nil {
+		return nil, nil, mixedtelemetry.Record{}, fmt.Errorf(
+			"parse successful child telemetry: %w; stderr: %s",
+			err, strings.TrimSpace(stderr.String()),
+		)
+	}
+	if telemetry.Engine != engine {
+		return nil, nil, mixedtelemetry.Record{}, fmt.Errorf(
+			"child telemetry engine = %q, want %q", telemetry.Engine, engine,
+		)
+	}
+	if telemetry.Clients != cfg.clients {
+		return nil, nil, mixedtelemetry.Record{}, fmt.Errorf(
+			"child telemetry clients = %d, want %d", telemetry.Clients, cfg.clients,
+		)
+	}
+	if telemetry.Available != (engine == "vibedb") {
+		return nil, nil, mixedtelemetry.Record{}, fmt.Errorf(
+			"child telemetry durable-stats availability = %t for engine %s",
+			telemetry.Available, engine,
+		)
+	}
+	return header, rows, telemetry, nil
+}
+
+// environmentWith applies deterministic overrides without leaving duplicate
+// keys whose first/last-wins behavior can vary between child runtimes.
+func environmentWith(base []string, overrides ...string) []string {
+	keys := make(map[string]struct{}, len(overrides))
+	for _, override := range overrides {
+		key, _, _ := strings.Cut(override, "=")
+		keys[key] = struct{}{}
+	}
+	environment := make([]string, 0, len(base)+len(overrides))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, replaced := keys[key]; !replaced {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, overrides...)
 }
 
 func parseMixedOutput(src []byte) ([]string, []rawRow, error) {
@@ -444,6 +510,65 @@ func validateMixedRows(cfg config, requested string, header []string, rows []raw
 		}
 	}
 	return nil
+}
+
+func writeTelemetryRows(w io.Writer, records []telemetryRunRecord) {
+	fmt.Fprintln(
+		w,
+		"record\trepetition\tposition\trequested-engine\ttelemetry-schema\t"+
+			"durable-stats\tscope\tmetric\tvalue",
+	)
+	for _, run := range records {
+		for _, metric := range run.record.Metrics() {
+			fmt.Fprintf(
+				w, "telemetry\t%d\t%d\t%s\t%d\t%t\t%s\t%s\t%d\n",
+				run.repetition, run.position, run.requested,
+				run.record.Schema, run.record.Available,
+				metric.Scope, metric.Name, metric.Value,
+			)
+		}
+	}
+}
+
+func writeTelemetrySummaries(w io.Writer, records []telemetryRunRecord) {
+	type group struct {
+		engine, scope, metric string
+		values                []float64
+	}
+	groups := make(map[string]*group)
+	for _, run := range records {
+		for _, metric := range run.record.Metrics() {
+			key := strings.Join([]string{run.requested, metric.Scope, metric.Name}, "\x00")
+			g := groups[key]
+			if g == nil {
+				g = &group{engine: run.requested, scope: metric.Scope, metric: metric.Name}
+				groups[key] = g
+			}
+			g.values = append(g.values, float64(metric.Value))
+		}
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	fmt.Fprintln(
+		w,
+		"record\trequested-engine\tscope\tmetric\tsamples\tmedian\tmad\t"+
+			"q1\tq3\tiqr\tmin\tmax",
+	)
+	for _, key := range keys {
+		g := groups[key]
+		stats := summarize(g.values)
+		fmt.Fprintf(
+			w, "telemetry-summary\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			g.engine, g.scope, g.metric, stats.n,
+			formatNumber(stats.median), formatNumber(stats.mad),
+			formatNumber(stats.q1), formatNumber(stats.q3),
+			formatNumber(stats.iqr), formatNumber(stats.min),
+			formatNumber(stats.max),
+		)
+	}
 }
 
 func writeSummaries(w io.Writer, header []string, records []runRecord) error {

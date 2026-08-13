@@ -186,10 +186,9 @@ func (c *Collection) stagePrimaryBatchLocked(
 	batch *WriteBatch,
 ) (stagedPrimaryBatch, error) {
 	if c.primaryUnifiedOverlay.hasPending() {
-		if err := c.materializePrimaryParentsLocked(); err != nil {
+		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
 			return stagedPrimaryBatch{}, err
 		}
-		c.primaryOverlayFolds.Add(1)
 	}
 	// Each split strictly grows its tablet and each capacity checkpoint drains the
 	// pending set, so both make monotonic progress; the budget bounds a pathological

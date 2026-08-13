@@ -49,7 +49,7 @@ selectivity. A cross-engine number is not publishable unless both pass.
 | `BenchmarkBulkLoad` | whole-corpus batch construction, with and without a secondary index |
 | `BenchmarkBulkLoadVariants` | durable unified bulk, mutation replay, and untuned replay at three sizes |
 | `BenchmarkPointRead` | one document by key |
-| `BenchmarkPointWrite` | replacement with a growing value |
+| `BenchmarkPointWrite` | length-changing replacement, alternating grow/shrink |
 | `BenchmarkPointWriteSameSize` | replacement without length or indexed-value change |
 | `BenchmarkDeleteRestore` | random delete plus exact reinsertion |
 | `BenchmarkMixedWorkload` | deterministic Zipfian YCSB A/B/F, churn, indexed churn, and scan-under-write |
@@ -134,7 +134,18 @@ Output contains:
 - `meta`: Git commit and dirty fingerprint, binary hash/build information,
   machine, platform, filesystem, workload, seed, and engine order;
 - `raw`: every child row with repetition and position;
+- `telemetry`: versioned, measured-phase runtime allocation counters for every
+  engine plus VibeDB-only fast-path, fold/debt, journal, device-byte, and bounded
+  histogram observations. `cmd/mixedsuite` requests the child record over an
+  internal stderr channel, so the stable latency table on stdout is unchanged;
+- `telemetry-summary`: the same robust cross-process summary statistics for each
+  long-form telemetry metric; and
 - `summary`: sample count, median, MAD, Q1/Q3, IQR, minimum, and maximum.
+
+Histogram count/sum/buckets are measured-phase deltas. Maxima are process
+high-water marks and therefore retain both `max-before` and `max` instead of
+pretending that subtraction produces a phase maximum. The fixed buckets are
+coarse power-of-16 ranges; exact count, sum, and maximum remain available.
 
 The output path is exclusive. Before publishing, every TSV must report all of
 the following:

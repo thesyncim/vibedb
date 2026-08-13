@@ -232,6 +232,18 @@ func TestSyncPrimaryJournalRoundTrip(t *testing.T) {
 		t.Fatalf("sync primary lane must not take the retired chain fence, got chain=%d",
 			stats.ChainAcks)
 	}
+	if stats.JournalStrictSyncs != stats.JournalAcks ||
+		stats.JournalStrictRecords != stats.JournalAcks ||
+		stats.JournalStrictMutations != n ||
+		stats.JournalStrictBytes == 0 ||
+		stats.JournalStrictSyncNS.Count != stats.JournalStrictSyncs {
+		t.Fatalf(
+			"strict telemetry syncs=%d records=%d mutations=%d bytes=%d histogram=%+v acks=%d",
+			stats.JournalStrictSyncs, stats.JournalStrictRecords,
+			stats.JournalStrictMutations, stats.JournalStrictBytes,
+			stats.JournalStrictSyncNS, stats.JournalAcks,
+		)
+	}
 	t.Logf("sync round-trip acks: journal=%d chain=%d", stats.JournalAcks, stats.ChainAcks)
 	if err := coll.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

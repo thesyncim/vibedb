@@ -547,7 +547,13 @@ func (c *PrimaryGraphCursor) visitCurrentLeafInlineUntil(
 	for c.row < limit {
 		if ref, overflow := c.leaf.OverflowRef(c.row); overflow {
 			var ok bool
-			c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
+			if decoder == nil {
+				c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
+			} else {
+				c.spliceScratch, ok = decoder.appendKey(
+					c.spliceScratch[:0], &c.leaf, c.leafBucket, c.row,
+				)
+			}
 			if !ok {
 				return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 			}
@@ -555,7 +561,13 @@ func (c *PrimaryGraphCursor) visitCurrentLeafInlineUntil(
 			return c.spliceScratch, ref, nil
 		}
 		var ok bool
-		c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
+		if decoder == nil {
+			c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
+		} else {
+			c.spliceScratch, ok = decoder.appendKey(
+				c.spliceScratch[:0], &c.leaf, c.leafBucket, c.row,
+			)
+		}
 		if !ok {
 			return nil, PageRef{}, ErrCommonPrimaryLeafCorrupt
 		}

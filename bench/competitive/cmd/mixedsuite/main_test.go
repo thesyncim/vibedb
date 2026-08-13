@@ -59,6 +59,17 @@ func TestParseEnginesRejectsAmbiguousLists(t *testing.T) {
 	}
 }
 
+func TestEnvironmentWithReplacesExistingValues(t *testing.T) {
+	got := environmentWith(
+		[]string{"KEEP=yes", "LANG=old", "VIBEDB_MIXED_INTERNAL_STATS="},
+		"LANG=C", "VIBEDB_MIXED_INTERNAL_STATS=1",
+	)
+	want := []string{"KEEP=yes", "LANG=C", "VIBEDB_MIXED_INTERNAL_STATS=1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("environment = %v, want %v", got, want)
+	}
+}
+
 func TestSummarizeReportsMedianMADQuartilesAndRange(t *testing.T) {
 	got := summarize([]float64{100, 1, 2})
 	if got.n != 3 || got.median != 2 || got.mad != 1 ||
@@ -164,14 +175,17 @@ func TestRunDiscardsConditioningAndRecordsRawAndSummaryRows(t *testing.T) {
 	helper := filepath.Join(dir, "mixed-helper")
 	const script = `#!/bin/sh
 engine=
+available=false
 for arg in "$@"; do
 	case "$arg" in
 		-engine=*) engine=${arg#-engine=} ;;
 	esac
 done
+[ "$engine" = vibedb ] && available=true
 printf '%s\n' "$engine" >> "$MIXEDSUITE_TEST_LOG"
 printf '%s\n' 'engine durability workload card docs measured warmup checkpoint forced-cp indexed clients operation calls p50-us p95-us p99-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB'
 printf '%s\n' "$engine buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 1 2 3 1000 1 1 2 3 4"
+printf 'mixed-telemetry-json\t%s\n' "{\"schema\":1,\"engine\":\"$engine\",\"clients\":1,\"durable_stats_available\":$available,\"runtime_total_alloc_bytes\":100,\"runtime_mallocs\":10,\"scalar_patch_attempts\":20,\"scalar_patch_accepts\":19,\"publish_groups\":5,\"publish_group_max\":4,\"journal_acks\":8,\"journal_syncs\":2,\"journal_group_max\":4,\"journal_delta_records\":7,\"journal_delta_bytes\":4096,\"journal_delta_fallbacks\":1,\"device_bytes\":8192}" >&2
 `
 	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
@@ -180,7 +194,7 @@ printf '%s\n' "$engine buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 
 	var stdout, stderr bytes.Buffer
 	err := run([]string{
 		"-mixed-bin=" + helper,
-		"-engines=a,b",
+		"-engines=vibedb,b",
 		"-repetitions=2",
 		"-allow-diagnostic",
 		"-conditioning=true",
@@ -200,11 +214,15 @@ printf '%s\n' "$engine buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 
 		t.Fatalf("child invocations = %v, want conditioning 2 + recorded 4", invocations)
 	}
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	raw, summaries := 0, 0
+	raw, summaries, telemetryRows, telemetrySummaries := 0, 0, 0, 0
 	for _, line := range lines {
 		switch {
 		case strings.HasPrefix(line, "raw\t"):
 			raw++
+		case strings.HasPrefix(line, "telemetry\t"):
+			telemetryRows++
+		case strings.HasPrefix(line, "telemetry-summary\t"):
+			telemetrySummaries++
 		case strings.HasPrefix(line, "summary\t"):
 			summaries++
 			if !strings.Contains(line, "\t2\t") {
@@ -217,6 +235,17 @@ printf '%s\n' "$engine buffered-visible ycsb-a low 10 20 2 64 0 false 1 read 10 
 	}
 	if summaries == 0 {
 		t.Fatalf("no summary rows; output:\n%s", stdout.String())
+	}
+	if telemetryRows == 0 || telemetrySummaries == 0 {
+		t.Fatalf(
+			"telemetry rows/summaries = %d/%d; output:\n%s",
+			telemetryRows, telemetrySummaries, stdout.String(),
+		)
+	}
+	if !strings.Contains(
+		stdout.String(), "\tvibedb\t1\ttrue\tvibedb\tscalar-patch-attempts\t20\n",
+	) {
+		t.Fatalf("VibeDB patch telemetry missing:\n%s", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "meta\tconditioning\tone discarded pass") {
 		t.Fatalf("conditioning metadata missing:\n%s", stdout.String())

@@ -110,7 +110,7 @@ func seizeSnapshotCut(order []*Collection) (snapshotCutHold, error) {
 			collection.primaryRouter.Load() != nil &&
 			(len(collection.primaryPendingParents) != 0 ||
 				collection.primaryUnifiedOverlay.hasPending()) {
-			if err := collection.materializePrimaryParentsLocked(); err != nil {
+			if err := collection.materializePrimaryParentsLocked(primaryMaterializationSnapshot); err != nil {
 				hold.release()
 				return snapshotCutHold{}, err
 			}
@@ -153,7 +153,7 @@ func seizeSnapshotCutContext(
 			collection.primaryRouter.Load() != nil &&
 			(len(collection.primaryPendingParents) != 0 ||
 				collection.primaryUnifiedOverlay.hasPending()) {
-			if err := collection.materializePrimaryParentsLocked(); err != nil {
+			if err := collection.materializePrimaryParentsLocked(primaryMaterializationSnapshot); err != nil {
 				hold.release()
 				return snapshotCutHold{}, err
 			}

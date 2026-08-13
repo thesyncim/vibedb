@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -1211,6 +1212,7 @@ func (c *Collection) journalDepositLocked(
 		c.chainAcks.Add(1)
 		return 0, nil
 	}
+	before := c.journal.Cursor()
 	if _, err := c.journal.Append(kind, generation, key, value); err != nil {
 		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
 			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
@@ -1228,7 +1230,7 @@ func (c *Collection) journalDepositLocked(
 		return 0, poisoned
 	}
 	c.journalAcks.Add(1)
-	return c.journalGroup.depositBump(), nil
+	return c.journalGroup.depositBump(c.journal.Cursor()-before, 1), nil
 }
 
 // journalBeforePublishLocked is the journal-backed synchronous lane's
@@ -1255,16 +1257,25 @@ func (c *Collection) journalBeforePublishLocked(
 		kind = storeio.RecoveryRecordKindDelete
 		value = nil
 	}
+	before := c.journal.Cursor()
 	if _, err := c.journal.Append(kind, generation, key, value); err != nil {
 		return c.poisonJournal(err)
 	}
+	bytes := c.journal.Cursor() - before
+	started := time.Now()
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
 		return c.poisonJournalCommitOutcomeUnknown(err)
 	}
+	syncNS := uint64(time.Since(started))
 	if recoveryJournalPostSyncHook != nil {
 		recoveryJournalPostSyncHook()
 	}
 	c.journalAcks.Add(1)
+	c.journalStrictSyncs.Add(1)
+	c.journalStrictRecords.Add(1)
+	c.journalStrictMutations.Add(1)
+	c.journalStrictBytes.Add(bytes)
+	c.journalStrictSyncNS.observe(syncNS)
 	return nil
 }
 
@@ -1285,16 +1296,25 @@ func (c *Collection) journalBatchBeforePublishLocked(
 	if !c.syncJournalLane() || c.journalReplaying {
 		return nil
 	}
+	before := c.journal.Cursor()
 	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
 		return c.poisonJournal(err)
 	}
+	bytes := c.journal.Cursor() - before
+	started := time.Now()
 	if err := c.journal.Sync(c.journalPowerSafe); err != nil {
 		return c.poisonJournalCommitOutcomeUnknown(err)
 	}
+	syncNS := uint64(time.Since(started))
 	if recoveryJournalPostSyncHook != nil {
 		recoveryJournalPostSyncHook()
 	}
 	c.journalAcks.Add(1)
+	c.journalStrictSyncs.Add(1)
+	c.journalStrictRecords.Add(1)
+	c.journalStrictMutations.Add(uint64(len(entries)))
+	c.journalStrictBytes.Add(bytes)
+	c.journalStrictSyncNS.observe(syncNS)
 	return nil
 }
 
@@ -1314,6 +1334,7 @@ func (c *Collection) journalBatchDepositLocked(
 	if !c.bufferedJournalAckLane() || c.journalReplaying {
 		return 0, nil
 	}
+	before := c.journal.Cursor()
 	if _, err := c.journal.AppendBatch(generation, entries); err != nil {
 		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
 			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
@@ -1328,7 +1349,9 @@ func (c *Collection) journalBatchDepositLocked(
 		return 0, poisoned
 	}
 	c.journalAcks.Add(1)
-	return c.journalGroup.depositBump(), nil
+	return c.journalGroup.depositBump(
+		c.journal.Cursor()-before, uint64(len(entries)),
+	), nil
 }
 
 // ensurePrimaryBatchJournalRoom guarantees the whole batch record fits the
@@ -1482,6 +1505,8 @@ func (c *Collection) appendPreparedBufferedJournalDeltaLocked(
 	c.journalDeltaAppendedGeneration.Store(target)
 	c.journalDeltaRecords.Add(uint64(len(entries)))
 	c.journalDeltaBytes.Add(uint64(plan.PaddedSize()))
+	c.journalDeltaBatchRecords.observe(uint64(len(entries)))
+	c.journalDeltaBatchBytes.observe(uint64(plan.PaddedSize()))
 	return true, nil
 }
 
@@ -1692,9 +1717,11 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	if recoveryJournalDeltaPreSyncHook != nil {
 		recoveryJournalDeltaPreSyncHook(target)
 	}
+	started := time.Now()
 	if syncErr := c.journal.Sync(c.journalPowerSafe); syncErr != nil {
 		return true, c.poisonJournalCommitOutcomeUnknown(syncErr)
 	}
+	syncNS := uint64(time.Since(started))
 	if recoveryJournalDeltaPostSyncHook != nil {
 		recoveryJournalDeltaPostSyncHook(target)
 	}
@@ -1705,6 +1732,7 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	// decisions until pressure or Close performs a full fold.
 	c.journalDeltaGeneration.Store(target)
 	c.journalDeltaCheckpoints.Add(1)
+	c.journalDeltaSyncNS.observe(syncNS)
 	return true, nil
 }
 

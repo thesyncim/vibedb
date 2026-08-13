@@ -228,6 +228,30 @@ func (b *UnifiedPrimaryLeafBuilder) buildIndex(src []byte) (vibejson.Index, erro
 	}
 }
 
+// canonicalSpanIndex reuses the builder's tape, canonical workspace, and span
+// storage to certify one already-canonical document. It is the allocation-free
+// single-row sibling of extract: compact replacement qualification needs only
+// the scalar spans and must not make a temporary one-record slice escape once
+// per replacement.
+func (b *UnifiedPrimaryLeafBuilder) canonicalSpanIndex(
+	src []byte,
+) (CanonicalSpanIndex, bool, error) {
+	if b == nil || len(src) == 0 {
+		return CanonicalSpanIndex{}, false, nil
+	}
+	index, err := b.buildIndex(src)
+	if err != nil {
+		return CanonicalSpanIndex{}, false, err
+	}
+	b.spans = slices.Grow(b.spans[:0], len(index.Entries))[:0]
+	canonical, ok := CanonicalSpanIndexOf(index, &b.ws, b.spans)
+	if !ok {
+		return CanonicalSpanIndex{}, false, nil
+	}
+	b.spans = canonical.spans
+	return canonical, true, nil
+}
+
 // appendHoleSpans extracts the ordered scalar-leaf spans of one canonical
 // document from its tape. A hole is a non-key tape leaf with Next == 1, which
 // places holes at scalar leaves of arbitrary depth and makes empty containers

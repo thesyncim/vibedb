@@ -88,7 +88,7 @@ func (c *Collection) resetPrimaryNativeFoldResults(count int) {
 // pending-parent window.
 func (c *Collection) setupPrimaryNativeFoldContexts() {
 	if c == nil || c.primaryUnifiedOverlay == nil ||
-		!c.primaryNativeFoldEligible() ||
+		!c.primaryNativeFoldContextEligible() ||
 		c.primaryUnifiedBuilder == nil ||
 		len(c.primaryLeafScratch) < storeio.CommonPrimaryLeafMaxExtentBytes ||
 		cap(c.primaryPendingParents) == 0 ||
@@ -101,6 +101,13 @@ func (c *Collection) setupPrimaryNativeFoldContexts() {
 		primaryNativeFoldResidentBytesPerWorker)
 	workers = min(workers, max(1, residentWorkers))
 	workers = min(workers, cap(c.primaryPendingParents))
+	if c.options.RecoveryJournal {
+		// Per-mutation durability is device-bound and serialized. Keep its native
+		// fold acceleration footprint to the coordinator that borrows the writer's
+		// existing page, replacement, and builder scratch: no extra 64 KiB images,
+		// channels, or idle goroutines for a lane that cannot publish concurrently.
+		workers = min(workers, 1)
+	}
 	if workers <= 0 {
 		return
 	}
@@ -125,22 +132,36 @@ func (c *Collection) setupPrimaryNativeFoldContexts() {
 				storeio.CommonPrimaryLeafWideSlots,
 			)
 		}
-		context.builder = storeio.NewCompactPrimaryPatchBuilder()
-		if index != 0 {
+		if index == 0 {
+			context.builder = c.primaryUnifiedBuilder
+		} else {
+			context.builder = storeio.NewCompactPrimaryPatchBuilder()
 			context.jobs = make(chan primaryNativeFoldJob)
 			context.done = make(chan struct{})
 		}
 	}
 }
 
-// primaryNativeFoldEligible mirrors the deliberately narrow concurrent
-// publication lane that can mint scalar certificates. Schema, index, journal,
-// and exact-index-epoch collections retain the established serial fold; starting
-// workers for their zero certificates would only duplicate pins and scans.
+// primaryNativeFoldContextEligible is the construction-time ownership
+// predicate for the bounded foreground codec pool. It deliberately does not
+// depend on primaryConcurrentContexts: the serialized buffered-journal lane
+// publishes into the same compact-leaf overlay and can precompute the same
+// device-independent fold even though it must retain exclusive publication and
+// recovery-journal ordering.
+func (c *Collection) primaryNativeFoldContextEligible() bool {
+	return c != nil && c.buffered() && c.primaryUnifiedOverlay != nil &&
+		c.options.Collection.Schema == nil && len(c.options.indexes) == 0
+}
+
+// primaryNativeFoldEligible is the runtime use predicate. An online index
+// cutover may make a pool retained at construction ineligible later; recovery
+// replay likewise stays on the established serial fold. RecoveryJournal is not
+// a veto: preparation reads only the immutable compact base and overlay, while
+// allocation, staging, retirement, journal recycle, and whole-cut publication
+// remain on the exclusive writer goroutine.
 func (c *Collection) primaryNativeFoldEligible() bool {
-	return c != nil && c.primaryConcurrentContexts != nil && c.buffered() &&
-		!c.options.RecoveryJournal && c.options.Collection.Schema == nil &&
-		len(c.options.indexes) == 0 && c.primaryEpoch == nil &&
+	return c != nil && len(c.primaryNativeFoldContexts) != 0 &&
+		c.primaryNativeFoldContextEligible() && c.primaryEpoch == nil &&
 		!c.onlineIndexBuild.Load() && !c.journalReplaying
 }
 
@@ -337,7 +358,11 @@ func (c *Collection) primaryNativeFoldAdditionalScratchBytes() uint64 {
 			bytes += uint64(cap(context.replacements)) *
 				uint64(unsafe.Sizeof(storeio.CommonPrimaryUnifiedReplacement{}))
 		}
-		bytes += context.builder.CompactPatchCapacityBytes()
+		if index != 0 {
+			// Context zero borrows primaryUnifiedBuilder, whose compact capacity is
+			// already charged by PrimaryMutationScratchBytes.
+			bytes += context.builder.CompactPatchCapacityBytes()
+		}
 		bytes += uint64(unsafe.Sizeof(*context))
 		// Runtime channel headers are opaque. Charge a conservative two cache
 		// lines per retained unbuffered channel rather than silently omitting

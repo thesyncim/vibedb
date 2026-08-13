@@ -32,15 +32,15 @@ const commonPrimaryUnifiedScalarPatchValid = uint8(1 << 7)
 // CommonPrimaryUnifiedScalarPatch is a compact, opaque admission certificate
 // for either an exact admitted templated row or one dictionary-neutral scalar
 // replacement in that row. Its six bytes fit the existing tail padding in a
-// durable overlay record. Offsets are relative to the admitted encoded body
-// and the replacement's canonical spelling; the high bit of bodyLength is the
-// validity bit and its low seven bits hold the old encoded token length.
+// durable overlay record. canonicalOffset and canonicalLength always name the
+// replacement spelling. The other coordinates are leaf-class-specific: a
+// unified row records its encoded body token, while a compact stripe records
+// the changed hole ordinal and old scalar spelling length. The high bit of
+// bodyLength is the validity bit.
 //
-// Values are intentionally constructible only by the admitted-leaf verifier.
-// The fold still validates every offset, static template byte, unchanged token,
-// and changed scalar before trusting the shortcut. A zero or damaged value is
-// declined by the strict parallel planner; the broader serial planner can
-// still re-enter its complete generic proof.
+// Values are intentionally constructible only by an admitted-leaf verifier.
+// A zero or damaged value is declined by the strict parallel planner; the
+// broader serial planner can still re-enter its complete generic proof.
 type CommonPrimaryUnifiedScalarPatch struct {
 	bodyOffset      uint16
 	canonicalOffset uint16
@@ -48,13 +48,13 @@ type CommonPrimaryUnifiedScalarPatch struct {
 	canonicalLength uint8
 }
 
-// RecoveryCanonicalPatch exposes only the canonical splice coordinates needed
-// by the recovery journal. The opaque body coordinates remain private to the
-// admitted-leaf validator. rawDelta is the complete canonical document length
-// change recorded for this mutation; a scalar certificate proves every other
-// byte is unchanged, so it also derives the replaced scalar's old length.
-// Exact (byte-identical) certificates deliberately decline: a normal Put entry
-// is both simpler and unambiguous for generation-only publications.
+// RecoveryCanonicalPatch exposes the certificate's canonical splice
+// coordinates. The certificate is relative to its admitted immutable leaf;
+// callers must independently prove that the journal's immediate predecessor is
+// the same preimage before using these coordinates for sequential redo. The
+// opaque body coordinates remain private to the admitted-leaf validator.
+// rawDelta derives the replaced scalar's old length. Exact (byte-identical)
+// certificates deliberately decline.
 func (c CommonPrimaryUnifiedScalarPatch) RecoveryCanonicalPatch(
 	rawDelta int32,
 ) (canonicalOffset uint16, oldLength, newLength uint8, ok bool) {

@@ -1199,16 +1199,20 @@ func (o *primaryUnifiedOverlay) checkpointEntries(
 	)
 }
 
-// checkpointEntriesMode optionally emits compact scalar-patch redo for the
-// versioned ordinary-delta journal. Legacy journals and every other caller keep
-// the original full-value entry grammar, so reopening a format-0 store never
-// writes a record an older binary could silently truncate.
+// checkpointEntriesMode retains the format switch for recovery compatibility,
+// but currently emits complete Put values. Compact fold certificates are
+// relative to the immutable routed leaf, whereas journal entries replay
+// sequentially against the preceding logical value. Reusing a base-relative
+// certificate after another same-key overlay mutation would splice the wrong
+// preimage. A future compact redo lane must mint and validate separate
+// predecessor-relative metadata.
 func (o *primaryUnifiedOverlay) checkpointEntriesMode(
 	dst []storeio.RecoveryBatchEntry,
 	afterGeneration, targetGeneration uint64,
 	compactScalarPatches bool,
 ) (entries []storeio.RecoveryBatchEntry, complete bool, err error) {
 	dst = dst[:0]
+	_ = compactScalarPatches
 	if o == nil || targetGeneration <= afterGeneration {
 		return dst, targetGeneration == afterGeneration, nil
 	}
@@ -1240,28 +1244,8 @@ func (o *primaryUnifiedOverlay) checkpointEntriesMode(
 			if record.valueLen == 0 {
 				return dst[:0], false, storeio.ErrCommonPrimaryLeafCorrupt
 			}
-			value := o.arena[record.valueOff:valueEnd:valueEnd]
-			offset, oldLength, newLength, patchOK :=
-				record.scalarPatch.RecoveryCanonicalPatch(record.rawDelta)
-			patchEnd := uint64(offset) + uint64(newLength)
-			// Key and entry-header bytes are identical in both encodings. Pay the
-			// metadata and whole-document checksum only when the compact payload is
-			// strictly smaller than carrying the complete canonical value.
-			if compactScalarPatches && patchOK &&
-				storeio.RecoveryScalarPatchMetadataSize+int(newLength) <
-					len(value) &&
-				patchEnd <= uint64(len(value)) {
-				entry.Kind = storeio.RecoveryRecordKindScalarPatch
-				entry.Value = value[offset:patchEnd:patchEnd]
-				entry.ScalarPatch = storeio.RecoveryScalarPatchMetadata{
-					CanonicalOffset:        offset,
-					OldScalarLength:        oldLength,
-					ExpectedResultChecksum: storeio.PageChecksum(value),
-				}
-			} else {
-				entry.Kind = storeio.RecoveryRecordKindPut
-				entry.Value = value
-			}
+			entry.Kind = storeio.RecoveryRecordKindPut
+			entry.Value = o.arena[record.valueOff:valueEnd:valueEnd]
 		case primaryUnifiedOverlayDelete:
 			if record.valueLen != 0 {
 				return dst[:0], false, storeio.ErrCommonPrimaryLeafCorrupt
@@ -1326,16 +1310,37 @@ func (c *Collection) recyclePrimaryUnifiedOverlayIfSafe() {
 	c.snapshotGate.Unlock()
 }
 
-func (o *primaryUnifiedOverlay) stats() (capacity, resident, dirty uint64) {
+type primaryUnifiedOverlayStats struct {
+	capacityBytes     uint64
+	arenaBytes        uint64
+	logicalDirtyBytes uint64
+	reservedFoldBytes uint64
+	retainedRecords   uint64
+	dirtyBuckets      uint64
+	dirtyBucketLimit  uint64
+	dirtyByteLimit    uint64
+}
+
+func (o *primaryUnifiedOverlay) stats() primaryUnifiedOverlayStats {
 	if o == nil {
-		return 0, 0, 0
+		return primaryUnifiedOverlayStats{}
 	}
-	capacity = uint64(o.capacityBytes())
-	resident = uint64(o.used.Load())
+	resident := uint64(o.used.Load())
+	result := primaryUnifiedOverlayStats{
+		capacityBytes:     uint64(o.capacityBytes()),
+		arenaBytes:        resident,
+		retainedRecords:   uint64(o.count.Load()),
+		dirtyBuckets:      uint64(o.bucketCount.Load()),
+		reservedFoldBytes: o.dirtyBytes.Load(),
+		dirtyBucketLimit:  uint64(o.bucketLimit),
+		dirtyByteLimit:    o.dirtyByteLimit,
+	}
 	if o.hasPending() {
-		dirty = resident
+		// DirtyBytes is cache-style logical residency. The conservative physical
+		// fold reservation is exported separately as dirtyBytes.
+		result.logicalDirtyBytes = resident
 	}
-	return capacity, resident, dirty
+	return result
 }
 
 // canonicalPrimaryMutationValue returns the one logical representation exposed

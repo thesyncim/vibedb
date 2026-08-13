@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -592,6 +593,7 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 		}
 		groupSize := uint64(published)
 		c.concurrentPrimaryPublishGroups.Add(1)
+		c.concurrentPrimaryPublishGroupSize.observe(groupSize)
 		for largest := c.concurrentPrimaryLargestPublishGroup.Load(); groupSize > largest &&
 			!c.concurrentPrimaryLargestPublishGroup.CompareAndSwap(largest, groupSize); largest = c.concurrentPrimaryLargestPublishGroup.Load() {
 		}
@@ -721,7 +723,9 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		if concurrentPrimaryStripeContendedHook != nil {
 			concurrentPrimaryStripeContendedHook(route.Bucket)
 		}
+		started := time.Now()
 		stripe.mu.Lock()
+		c.concurrentPrimaryStripeWaitNS.observe(uint64(time.Since(started)))
 	}
 	defer stripe.mu.Unlock()
 
@@ -875,7 +879,21 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	// same-length integer can widen a leaf-wide FOR/delta stream.
 	fixedExtent := baseFound && bytes.Equal(canonical, baseValue)
 	var scalarPatch storeio.CommonPrimaryUnifiedScalarPatch
-	_ = canonicalIndex
+	scalarPatchAccepted := false
+	if baseFound && countDelta == 0 {
+		c.concurrentPrimaryScalarPatchAttempts.Add(1)
+		var resolved bool
+		scalarPatch, context.value, resolved, err =
+			leaf.PatchStableCanonicalReplacementScalarPatch(
+				key, stableSlot, canonicalIndex, context.value[:0],
+			)
+		if err != nil {
+			leafLease.Release()
+			return false, false, err
+		}
+		scalarPatchAccepted = resolved &&
+			scalarPatch != (storeio.CommonPrimaryUnifiedScalarPatch{})
+	}
 	leafLease.Release()
 	// A maximum-extent stripe has no physical room for an adverse codec change.
 	// Let the exclusive path prove the replacement immediately; if its exact
@@ -916,6 +934,9 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	request.stableSlot = 0
 	request.fixedExtent = false
 	request.fillsEmpty = false
+	if handled && scalarPatchAccepted {
+		c.concurrentPrimaryScalarPatches.Add(1)
+	}
 	return handled, handled && created, publishErr
 }
 
@@ -988,7 +1009,9 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		if concurrentPrimaryStripeContendedHook != nil {
 			concurrentPrimaryStripeContendedHook(route.Bucket)
 		}
+		started := time.Now()
 		stripe.mu.Lock()
+		c.concurrentPrimaryStripeWaitNS.observe(uint64(time.Since(started)))
 	}
 	defer stripe.mu.Unlock()
 

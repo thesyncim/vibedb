@@ -496,6 +496,128 @@ func CloneCompactPrimaryStripeGeneration(
 	return page, nil
 }
 
+// PatchStableCanonicalReplacementScalarPatch consumes the scalar spans already
+// produced by concurrent canonical admission and certifies an exact compact
+// row or one int/bool/null hole change against this immutable stripe. scratch
+// is caller-owned decode storage and is returned so a bounded context retains
+// any capacity it learned. The certificate deliberately excludes inserts,
+// overflow rows, shape changes, and multi-hole changes; those keep using the
+// complete compact planner.
+func (v *CompactPrimaryStripeView) PatchStableCanonicalReplacementScalarPatch(
+	key []byte,
+	slot uint8,
+	canonical CanonicalSpanIndex,
+	scratch []byte,
+) (
+	patch CommonPrimaryUnifiedScalarPatch,
+	out []byte,
+	resolved bool,
+	err error,
+) {
+	out = scratch[:0]
+	if v == nil || len(key) == 0 || !canonical.valid ||
+		len(canonical.canonical) == 0 {
+		return CommonPrimaryUnifiedScalarPatch{}, out, false, nil
+	}
+	rank, found := v.FindKey(key)
+	if !found || v.IsOverflow(rank) {
+		return CommonPrimaryUnifiedScalarPatch{}, out, false, nil
+	}
+	if v.rows <= CommonPrimaryLeafWideSlots {
+		admittedSlot, slotOK := v.PostingSlot(rank)
+		if !slotOK {
+			return CommonPrimaryUnifiedScalarPatch{}, out, false,
+				fmt.Errorf("%w: compact patch posting slot", ErrCommonPrimaryLeafCorrupt)
+		}
+		if admittedSlot != slot {
+			return CommonPrimaryUnifiedScalarPatch{}, out, false, nil
+		}
+	}
+	shape := v.rowShape(rank)
+	entry, entryOK := v.shapeEntry(shape)
+	if !entryOK {
+		return CommonPrimaryUnifiedScalarPatch{}, out, false,
+			fmt.Errorf("%w: compact patch shape entry", ErrCommonPrimaryLeafCorrupt)
+	}
+	spans := canonical.spans
+	if len(spans) != entry.template.holes {
+		return CommonPrimaryUnifiedScalarPatch{}, out, true, nil
+	}
+	ordinal := v.shapeOrdinal(rank, shape)
+	if ordinal < 0 || ordinal >= entry.rows {
+		return CommonPrimaryUnifiedScalarPatch{}, out, false,
+			fmt.Errorf("%w: compact patch shape ordinal", ErrCommonPrimaryLeafCorrupt)
+	}
+
+	previousCanonical, previousStatic := uint32(0), uint32(0)
+	streamRaw := entry.streamRaw
+	changedHole := -1
+	for hole := 0; hole < entry.template.holes; hole++ {
+		staticEnd := binary.LittleEndian.Uint32(entry.template.ends[hole*4:])
+		span := spans[hole]
+		if staticEnd < previousStatic || span.Start < previousCanonical ||
+			span.End < span.Start || int(staticEnd) > len(entry.template.static) ||
+			int(span.End) > len(canonical.canonical) ||
+			!bytes.Equal(
+				entry.template.static[previousStatic:staticEnd],
+				canonical.canonical[previousCanonical:span.Start],
+			) {
+			return CommonPrimaryUnifiedScalarPatch{}, out, true, nil
+		}
+		stream, admitted := admittedCompactStream(streamRaw)
+		if !admitted {
+			return CommonPrimaryUnifiedScalarPatch{}, out, false,
+				fmt.Errorf("%w: compact patch source stream", ErrCommonPrimaryLeafCorrupt)
+		}
+		out = out[:0]
+		out, admitted = stream.appendValue(out, ordinal)
+		if !admitted {
+			return CommonPrimaryUnifiedScalarPatch{}, out, false,
+				fmt.Errorf("%w: compact patch source value", ErrCommonPrimaryLeafCorrupt)
+		}
+		newValue := canonical.canonical[span.Start:span.End]
+		if !bytes.Equal(out, newValue) {
+			if changedHole >= 0 {
+				return CommonPrimaryUnifiedScalarPatch{}, out, true, nil
+			}
+			_, oldScalar := unifiedScalarPatchValueClass(out)
+			_, newScalar := unifiedScalarPatchValueClass(newValue)
+			if !oldScalar || !newScalar || hole > int(^uint16(0)) ||
+				int(span.Start) > int(^uint16(0)) || len(out) == 0 ||
+				len(out) >= int(commonPrimaryUnifiedScalarPatchValid) ||
+				len(newValue) == 0 || len(newValue) > int(^uint8(0)) {
+				return CommonPrimaryUnifiedScalarPatch{}, out, true, nil
+			}
+			patch = CommonPrimaryUnifiedScalarPatch{
+				bodyOffset:      uint16(hole),
+				canonicalOffset: uint16(span.Start),
+				bodyLength: commonPrimaryUnifiedScalarPatchValid |
+					uint8(len(out)),
+				canonicalLength: uint8(len(newValue)),
+			}
+			changedHole = hole
+		}
+		streamRaw = streamRaw[stream.encoded:]
+		previousCanonical = span.End
+		previousStatic = staticEnd
+	}
+	lastStatic := binary.LittleEndian.Uint32(
+		entry.template.ends[entry.template.holes*4:],
+	)
+	if lastStatic < previousStatic || int(lastStatic) != len(entry.template.static) ||
+		int(previousCanonical) > len(canonical.canonical) ||
+		!bytes.Equal(
+			entry.template.static[previousStatic:lastStatic],
+			canonical.canonical[previousCanonical:],
+		) {
+		return CommonPrimaryUnifiedScalarPatch{}, out, true, nil
+	}
+	if changedHole < 0 {
+		patch.bodyLength = commonPrimaryUnifiedScalarPatchValid
+	}
+	return patch, out, true, nil
+}
+
 // PatchCompactPrimaryStripeReplacements is the exact existing-row COW fast
 // path for compact stripes. Every replacement must retain its admitted JSON
 // shape and change at most one scalar hole. Each affected shape/hole column is
@@ -545,27 +667,91 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 				return nil, false, nil
 			}
 		}
-		record := CommonPrimaryLeafRecord{
-			Key:   replacement.Key,
-			Value: CommonPrimaryLeafValue{Inline: replacement.Value},
-			Slot:  replacement.Slot,
+		if replacement.ScalarPatch.valid() {
+			patch.patchHeap = patch.patchHeap[:0]
+			var decoded bool
+			patch.patchHeap, decoded = v.AppendValue(patch.patchHeap, rank)
+			if !decoded {
+				return nil, false, corrupt("certified base value")
+			}
+			if replacement.ScalarPatch.exact() {
+				if !bytes.Equal(patch.patchHeap, replacement.Value) {
+					return nil, false, nil
+				}
+				continue
+			}
+			shape := v.rowShape(rank)
+			candidate, entryOK := v.shapeEntry(shape)
+			hole := int(replacement.ScalarPatch.bodyOffset)
+			start := int(replacement.ScalarPatch.canonicalOffset)
+			end := start + int(replacement.ScalarPatch.canonicalLength)
+			ordinal := v.shapeOrdinal(rank, shape)
+			if !entryOK || hole < 0 || hole >= candidate.template.holes ||
+				ordinal < 0 || ordinal > int(^uint16(0)) ||
+				shape < 0 || shape > int(^uint16(0)) || start < 0 ||
+				end <= start || end > len(replacement.Value) {
+				return nil, false, nil
+			}
+			streamRaw := candidate.streamRaw
+			var oldStream compactStreamView
+			for at := 0; at <= hole; at++ {
+				stream, admitted := admittedCompactStream(streamRaw)
+				if !admitted {
+					return nil, false, corrupt("certified source stream")
+				}
+				if at == hole {
+					oldStream = stream
+					break
+				}
+				streamRaw = streamRaw[stream.encoded:]
+			}
+			baseBytes := len(patch.patchHeap)
+			oldLength := replacement.ScalarPatch.oldBodyLength()
+			if oldLength <= 0 || start > baseBytes ||
+				oldLength > baseBytes-start || len(replacement.Value) !=
+				baseBytes-oldLength+int(replacement.ScalarPatch.canonicalLength) ||
+				!bytes.Equal(patch.patchHeap[:start], replacement.Value[:start]) ||
+				!bytes.Equal(
+					patch.patchHeap[start+oldLength:], replacement.Value[end:],
+				) {
+				return nil, false, nil
+			}
+			patch.patchHeap, decoded = oldStream.appendValue(
+				patch.patchHeap, ordinal,
+			)
+			oldValue := patch.patchHeap[baseBytes:]
+			newValue := replacement.Value[start:end:end]
+			_, oldScalar := unifiedScalarPatchValueClass(oldValue)
+			_, newScalar := unifiedScalarPatchValueClass(newValue)
+			if !decoded || !oldScalar || !newScalar ||
+				len(oldValue) != oldLength ||
+				!bytes.Equal(oldValue, patch.patchHeap[start:start+oldLength]) ||
+				bytes.Equal(oldValue, newValue) {
+				return nil, false, nil
+			}
+			patch.patchMods = append(
+				patch.patchMods,
+				compactPrimaryReplacementPatch{
+					shape: uint16(shape), hole: uint16(hole),
+					ordinal: uint16(ordinal), value: newValue,
+				},
+			)
+			continue
 		}
-		if err := prepareCompactPrimaryStripe(
-			[]CommonPrimaryLeafRecord{record}, builder,
-		); err != nil {
-			return nil, false, err
+		canonical, canonicalOK, canonicalErr :=
+			builder.canonicalSpanIndex(replacement.Value)
+		if canonicalErr != nil {
+			return nil, false, canonicalErr
 		}
-		canonical := builder.canonicalOf(0)
-		if !bytes.Equal(canonical, replacement.Value) {
+		if !canonicalOK {
 			return nil, false, nil
 		}
 		shape := v.rowShape(rank)
 		candidate, entryOK := v.shapeEntry(shape)
-		if !entryOK || len(builder.rows) != 1 || len(builder.shapes) != 1 {
+		if !entryOK {
 			return nil, false, corrupt("shape entry")
 		}
-		row := &builder.rows[0]
-		spans := builder.spans[row.spanStart:row.spanEnd]
+		spans := canonical.spans
 		if len(spans) != candidate.template.holes {
 			return nil, false, nil
 		}
@@ -579,10 +765,10 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			span := spans[hole]
 			if staticEnd < previousStatic || span.Start < previousCanonical ||
 				int(staticEnd) > len(candidate.template.static) ||
-				int(span.End) > len(canonical) ||
+				int(span.End) > len(canonical.canonical) ||
 				!bytes.Equal(
 					candidate.template.static[previousStatic:staticEnd],
-					canonical[previousCanonical:span.Start],
+					canonical.canonical[previousCanonical:span.Start],
 				) {
 				return nil, false, nil
 			}
@@ -595,7 +781,7 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			if !admitted {
 				return nil, false, corrupt("source value")
 			}
-			newValue := canonical[span.Start:span.End]
+			newValue := canonical.canonical[span.Start:span.End]
 			if !bytes.Equal(patch.patchHeap[start:], newValue) {
 				if changedHole >= 0 {
 					return nil, false, nil
@@ -613,10 +799,10 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 		)
 		if lastStatic < previousStatic ||
 			int(lastStatic) != len(candidate.template.static) ||
-			int(previousCanonical) > len(canonical) ||
+			int(previousCanonical) > len(canonical.canonical) ||
 			!bytes.Equal(
 				candidate.template.static[previousStatic:lastStatic],
-				canonical[previousCanonical:],
+				canonical.canonical[previousCanonical:],
 			) {
 			return nil, false, nil
 		}

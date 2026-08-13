@@ -658,7 +658,7 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 	}
 	assertFold := func(
 		t *testing.T, collection *Collection, before Stats,
-		wantDeviceCommits uint64,
+		wantDeviceCommits uint64, reason primaryMaterializationReason,
 	) {
 		t.Helper()
 		after := collection.Stats()
@@ -673,6 +673,32 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 		if got := after.DeviceCommits - before.DeviceCommits; got != wantDeviceCommits {
 			t.Fatalf("device commit delta = %d, want %d",
 				got, wantDeviceCommits)
+		}
+		if got := after.PrimaryOverlayMaterializationAttempts -
+			before.PrimaryOverlayMaterializationAttempts; got != 1 {
+			t.Fatalf("materialization attempts = %d, want 1", got)
+		}
+		if got := after.PrimaryOverlayMaterializations -
+			before.PrimaryOverlayMaterializations; got != 1 {
+			t.Fatalf("materializations = %d, want 1", got)
+		}
+		if got := after.PrimaryOverlayFoldNS.Count -
+			before.PrimaryOverlayFoldNS.Count; got != 1 {
+			t.Fatalf("fold latency observations = %d, want 1", got)
+		}
+		var gotReason uint64
+		switch reason {
+		case primaryMaterializationPressure:
+			gotReason = after.PrimaryOverlayPressureFolds - before.PrimaryOverlayPressureFolds
+		case primaryMaterializationSnapshot:
+			gotReason = after.PrimaryOverlaySnapshotFolds - before.PrimaryOverlaySnapshotFolds
+		case primaryMaterializationBarrier:
+			gotReason = after.PrimaryOverlayBarrierFolds - before.PrimaryOverlayBarrierFolds
+		default:
+			t.Fatalf("unsupported device-silent reason %d", reason)
+		}
+		if gotReason != 1 {
+			t.Fatalf("reason %d folds = %d, want 1", reason, gotReason)
 		}
 	}
 
@@ -691,7 +717,7 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 			!deleted {
 			t.Fatalf("Delete = %v,%v", deleted, err)
 		}
-		assertFold(t, collection, before, 0)
+		assertFold(t, collection, before, 0, primaryMaterializationPressure)
 	})
 
 	t.Run("batch-pre-fold", func(t *testing.T) {
@@ -722,7 +748,42 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 		}
 		// The compact foreground fold seals one physical publication before the
 		// batch's own publication; it is not an automatic durability checkpoint.
-		assertFold(t, collection, before, quietDeviceCommits+1)
+		assertFold(t, collection, before, quietDeviceCommits+1, primaryMaterializationBarrier)
+	})
+
+	t.Run("snapshot-fold", func(t *testing.T) {
+		collection, keys := open(t)
+		if _, err := collection.Put(
+			[]byte(keys[0]), []byte(`{"fold":"before-snapshot"}`),
+		); err != nil {
+			t.Fatal(err)
+		}
+		before := collection.Stats()
+		snapshot, err := collection.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot.Close()
+		assertFold(t, collection, before, 0, primaryMaterializationSnapshot)
+	})
+
+	t.Run("checkpoint-fold", func(t *testing.T) {
+		collection, keys := open(t)
+		if _, err := collection.Put(
+			[]byte(keys[0]), []byte(`{"fold":"before-checkpoint"}`),
+		); err != nil {
+			t.Fatal(err)
+		}
+		before := collection.Stats()
+		if err := collection.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		after := collection.Stats()
+		if after.PrimaryOverlayFolds != before.PrimaryOverlayFolds ||
+			after.PrimaryOverlayCheckpointFolds != before.PrimaryOverlayCheckpointFolds+1 ||
+			after.PrimaryOverlayFoldNS.Count != before.PrimaryOverlayFoldNS.Count+1 {
+			t.Fatalf("checkpoint fold stats before=%+v after=%+v", before, after)
+		}
 	})
 }
 

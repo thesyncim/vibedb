@@ -229,15 +229,32 @@ func TestCompactPrimaryStripeScalarReplacementMatchesFullPlanner(t *testing.T) {
 	} else {
 		updated[score]++
 	}
+	certificate := unifiedScalarCanonicalIndex(t, updated)
+	scalarPatch, _, resolved, err :=
+		view.PatchStableCanonicalReplacementScalarPatch(
+			records[rank].Key, rank, certificate,
+			make([]byte, 0, len(updated)),
+		)
+	if err != nil || !resolved || !scalarPatch.valid() || scalarPatch.exact() {
+		t.Fatalf(
+			"compact admission patch = valid %v exact %v resolved %v err %v",
+			scalarPatch.valid(), scalarPatch.exact(), resolved, err,
+		)
+	}
+	builder := NewUnifiedPrimaryLeafBuilder()
 	fast, ok, err := view.PatchCompactPrimaryStripeReplacements(
 		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
 		[]CommonPrimaryUnifiedReplacement{{
-			Key: records[rank].Key, Value: updated, Slot: rank,
+			Key: records[rank].Key, Value: updated,
+			ScalarPatch: scalarPatch, Slot: rank,
 		}},
-		NewUnifiedPrimaryLeafBuilder(),
+		builder,
 	)
 	if err != nil || !ok {
 		t.Fatalf("compact scalar patch = ok %v, err %v", ok, err)
+	}
+	if len(builder.rows) != 0 {
+		t.Fatalf("certified compact patch rebuilt %d replacement rows", len(builder.rows))
 	}
 	fullRecords := append([]CommonPrimaryLeafRecord(nil), records...)
 	fullRecords[rank].Value.Inline = updated
@@ -256,6 +273,77 @@ func TestCompactPrimaryStripeScalarReplacementMatchesFullPlanner(t *testing.T) {
 			"compact scalar patch differs from full planner (fast=%d full=%d source=%d)",
 			len(fast), len(want), len(page),
 		)
+	}
+}
+
+func TestCompactPrimaryStripeScalarCertificateDamageDeclines(t *testing.T) {
+	_, view, records := compactPrimaryTestPage(t, 200, false)
+	const rank = 73
+	base, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := append([]byte(nil), base...)
+	score := bytes.Index(updated, []byte(`"score":`)) + len(`"score":`)
+	if score < len(`"score":`) || score >= len(updated) {
+		t.Fatal("score field is missing")
+	}
+	if updated[score] == '9' {
+		updated[score] = '8'
+	} else {
+		updated[score]++
+	}
+	certificate := unifiedScalarCanonicalIndex(t, updated)
+	patch, _, resolved, err := view.PatchStableCanonicalReplacementScalarPatch(
+		records[rank].Key, rank, certificate, make([]byte, 0, len(updated)),
+	)
+	if err != nil || !resolved || !patch.valid() || patch.exact() {
+		t.Fatalf("scalar certificate = %#v resolved=%v err=%v", patch, resolved, err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*CommonPrimaryUnifiedScalarPatch)
+	}{
+		{name: "hole", edit: func(p *CommonPrimaryUnifiedScalarPatch) { p.bodyOffset++ }},
+		{name: "canonical-offset", edit: func(p *CommonPrimaryUnifiedScalarPatch) { p.canonicalOffset++ }},
+		{name: "old-length", edit: func(p *CommonPrimaryUnifiedScalarPatch) { p.bodyLength++ }},
+		{name: "new-length", edit: func(p *CommonPrimaryUnifiedScalarPatch) { p.canonicalLength++ }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			damaged := patch
+			test.edit(&damaged)
+			_, ok, patchErr := view.PatchCompactPrimaryStripeReplacements(
+				make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+				[]CommonPrimaryUnifiedReplacement{{
+					Key: records[rank].Key, Value: updated,
+					ScalarPatch: damaged, Slot: rank,
+				}},
+				NewUnifiedPrimaryLeafBuilder(),
+			)
+			if patchErr != nil || ok {
+				t.Fatalf("damaged patch = ok %v err %v", ok, patchErr)
+			}
+		})
+	}
+
+	exact, _, resolved, err := view.PatchStableCanonicalReplacementScalarPatch(
+		records[rank].Key, rank, unifiedScalarCanonicalIndex(t, base), nil,
+	)
+	if err != nil || !resolved || !exact.exact() {
+		t.Fatalf("exact certificate = %#v resolved=%v err=%v", exact, resolved, err)
+	}
+	_, ok, err := view.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 2,
+		[]CommonPrimaryUnifiedReplacement{{
+			Key: records[rank].Key, Value: updated,
+			ScalarPatch: exact, Slot: rank,
+		}},
+		NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || ok {
+		t.Fatalf("misbound exact patch = ok %v err %v", ok, err)
 	}
 }
 
@@ -315,6 +403,41 @@ func TestCompactPrimaryStripeMultiShapeReplacementsMatchFullPlanner(t *testing.T
 			"compact multi-shape patch differs from full planner (fast=%d full=%d source=%d shapes=%d)",
 			len(fast), len(want), len(page), len(selected),
 		)
+	}
+}
+
+func TestCompactPrimaryStripeReplacementPatchAllocatesZeroWhenWarm(t *testing.T) {
+	_, view, records := compactPrimaryTestPage(t, 200, false)
+	const rank = 73
+	updated, err := vibejson.AppendCanonicalize(nil, records[rank].Value.Inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	score := bytes.Index(updated, []byte(`"score":`))
+	if score < 0 {
+		t.Fatal("score field is missing")
+	}
+	score += len(`"score":`)
+	if updated[score] == '9' {
+		updated[score] = '8'
+	} else {
+		updated[score]++
+	}
+	replacements := []CommonPrimaryUnifiedReplacement{{
+		Key: records[rank].Key, Value: updated, Slot: rank,
+	}}
+	dst := make([]byte, CommonPrimaryLeafMaxExtentBytes)
+	builder := NewUnifiedPrimaryLeafBuilder()
+	patch := func() {
+		if _, ok, patchErr := view.PatchCompactPrimaryStripeReplacements(
+			dst, 2, replacements, builder,
+		); patchErr != nil || !ok {
+			panic("compact replacement patch")
+		}
+	}
+	patch()
+	if allocs := testing.AllocsPerRun(1_000, patch); allocs != 0 {
+		t.Fatalf("warm compact replacement allocations=%v want 0", allocs)
 	}
 }
 
@@ -729,9 +852,24 @@ func TestCompactPrimaryScanDecoderMatchesRandomAccess(t *testing.T) {
 	_, view, records := compactPrimaryTestPage(t, 1000, false)
 	var decoder CompactPrimaryScanDecoder
 	ordinals := make([]int, view.ShapeCount())
+	keyWant := make([]byte, 0, 64)
+	keyGot := make([]byte, 0, 64)
 	want := make([]byte, 0, 512)
 	got := make([]byte, 0, 512)
 	for row := range records {
+		var keyWantOK, keyGotOK bool
+		keyWant, keyWantOK = view.AppendKey(keyWant[:0], row)
+		keyGot, keyGotOK = decoder.appendKey(
+			keyGot[:0], &view, view.header.Bucket, row,
+		)
+		if !keyWantOK || !keyGotOK || !bytes.Equal(keyGot, keyWant) {
+			t.Fatalf("row %d sequential key mismatch wantOK=%v gotOK=%v", row, keyWantOK, keyGotOK)
+		}
+		// Borrowed callback data is not retained by the cursor. Mutating it must
+		// not poison the decoder's private prefix for the next front-coded key.
+		for at := range keyGot {
+			keyGot[at] = 0xff
+		}
 		shape := view.rowShape(row)
 		ordinal := ordinals[shape]
 		ordinals[shape]++
@@ -748,6 +886,13 @@ func TestCompactPrimaryScanDecoderMatchesRandomAccess(t *testing.T) {
 	// its scalar cursors when lexical iteration starts over.
 	clear(ordinals)
 	for row := range records {
+		keyWant, _ = view.AppendKey(keyWant[:0], row)
+		keyGot, keyGotOK := decoder.appendKey(
+			keyGot[:0], &view, view.header.Bucket, row,
+		)
+		if !keyGotOK || !bytes.Equal(keyGot, keyWant) {
+			t.Fatalf("reused decoder key row %d mismatch", row)
+		}
 		shape := view.rowShape(row)
 		ordinal := ordinals[shape]
 		ordinals[shape]++
@@ -758,6 +903,28 @@ func TestCompactPrimaryScanDecoderMatchesRandomAccess(t *testing.T) {
 		if !gotOK || !bytes.Equal(got, want) {
 			t.Fatalf("reused decoder row %d mismatch", row)
 		}
+	}
+}
+
+// A zero-hole prepared shape is a constant canonical document. Compact pages
+// currently choose another legal encoding for that input, but the scan plan's
+// complete executor must still preserve this representation case rather than
+// rejecting a template that needs no scalar stream.
+func TestCompactPrimaryScanDecoderZeroHoleShape(t *testing.T) {
+	static := []byte(`{"constant":true}`)
+	view := CompactPrimaryStripeView{
+		header: CommonPrimaryLeafHeader{Generation: 1, Bucket: 7},
+		rows:   1, shapeCount: 1,
+	}
+	decoder := CompactPrimaryScanDecoder{
+		bucket: 7, generation: 1, lastRow: -1,
+		prepared: true, supported: true,
+	}
+	decoder.shapes[0].ends[0] = uint32(len(static))
+	decoder.shapes[0].static = static
+	got, ok := decoder.appendValue(nil, &view, 7, 0, 0, 0)
+	if !ok || !bytes.Equal(got, static) {
+		t.Fatalf("zero-hole scan render = %q,%v want %q", got, ok, static)
 	}
 }
 

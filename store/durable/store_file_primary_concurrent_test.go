@@ -785,6 +785,20 @@ func TestConcurrentPrimaryActiveSnapshotPressureIsBounded(t *testing.T) {
 		t.Fatalf("pressure overlay records = %d, want %d",
 			got, primaryUnifiedOverlayRecords)
 	}
+	debt := coll.Stats()
+	if debt.PrimaryOverlayRetainedRecords != primaryUnifiedOverlayRecords ||
+		debt.PrimaryOverlayArenaBytes == 0 ||
+		debt.PrimaryOverlayDirtyBuckets != 1 ||
+		debt.PrimaryOverlayReservedFoldBytes == 0 ||
+		debt.PrimaryOverlayReservedFoldBytes > debt.PrimaryOverlayDirtyByteLimit {
+		t.Fatalf(
+			"overlay debt = records %d arena %d buckets %d reserved %d limit %d",
+			debt.PrimaryOverlayRetainedRecords, debt.PrimaryOverlayArenaBytes,
+			debt.PrimaryOverlayDirtyBuckets,
+			debt.PrimaryOverlayReservedFoldBytes,
+			debt.PrimaryOverlayDirtyByteLimit,
+		)
+	}
 	final := values[primaryUnifiedOverlayRecords&1]
 	created, err := coll.Put(key, final)
 	if err != nil || created {
@@ -797,6 +811,20 @@ func TestConcurrentPrimaryActiveSnapshotPressureIsBounded(t *testing.T) {
 	after := coll.Stats()
 	if got := after.PrimaryOverlayFolds - baseStats.PrimaryOverlayFolds; got != 1 {
 		t.Fatalf("snapshot pressure folds = %d, want 1", got)
+	}
+	if got := after.PrimaryOverlayPressureFolds - baseStats.PrimaryOverlayPressureFolds; got != 1 {
+		t.Fatalf("classified pressure folds = %d, want 1", got)
+	}
+	if got := after.PrimaryOverlayMaterializationAttempts -
+		baseStats.PrimaryOverlayMaterializationAttempts; got != 1 {
+		t.Fatalf("materialization attempts = %d, want 1", got)
+	}
+	if got := after.PrimaryOverlayMaterializations -
+		baseStats.PrimaryOverlayMaterializations; got != 1 {
+		t.Fatalf("materializations = %d, want 1", got)
+	}
+	if got := after.PrimaryOverlayFoldNS.Count - baseStats.PrimaryOverlayFoldNS.Count; got != 1 {
+		t.Fatalf("logical fold latency observations = %d, want 1", got)
 	}
 	if got := after.ConcurrentPrimaryFallbacks - baseStats.ConcurrentPrimaryFallbacks; got != 1 {
 		t.Fatalf("snapshot pressure fallbacks = %d, want 1", got)
