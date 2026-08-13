@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/query"
@@ -265,22 +267,30 @@ func (p *portal) resetForBind(name string, stmt *prepared) {
 func newSession(s *Server, conn net.Conn) *session {
 	session := &session{
 		server:     s,
-		conn:       conn,
-		r:          newReader(conn, 16<<10),
-		w:          newWriter(conn, 16<<10),
 		params:     map[string]string{},
 		statements: map[string]*prepared{},
 		portals:    map[string]*portal{},
 	}
+	session.setTransport(conn)
 	session.bindCancellationCheck()
+	return session
+}
+
+// setTransport installs one protocol transport. It is called once for the raw
+// connection and once more after a successful TLS handshake. PostgreSQL's
+// SSLRequest exchange is outside TLS, so its buffered reader and writer must
+// not be reused for encrypted records.
+func (s *session) setTransport(conn net.Conn) {
+	s.conn = conn
+	s.r = newReader(conn, 16<<10)
+	s.w = newWriter(conn, 16<<10)
 	// bufio.Writer may flush from inside Write when one DataRow is larger than
 	// its buffer. Arming only session.flush is therefore too late: the socket
 	// write has already happened. Refresh immediately before every operation
 	// that can reach the connection, including an automatic flush.
-	session.w.beforeWrite = func() {
-		deadline(conn, conn.SetWriteDeadline, s.opts.WriteTimeout)
+	s.w.beforeWrite = func() {
+		deadline(conn, conn.SetWriteDeadline, s.server.opts.WriteTimeout)
 	}
-	return session
 }
 
 // out and push implement authConn, which is how a SASL mechanism reaches the
@@ -404,10 +414,10 @@ func (s *session) flush() error {
 	return s.w.flush()
 }
 
-// startup negotiates the connection: SSL and GSS refusals, the startup packet,
-// authentication, the parameter report, and the backend key.
+// startup negotiates the connection: optional TLS, GSS refusal, the startup
+// packet, authentication, the parameter report, and the backend key.
 func (s *session) startup() error {
-	var sawSSLRequest, sawGSSENCRequest bool
+	var sawSSLRequest, sawGSSENCRequest, tlsActive bool
 	for {
 		deadline(s.conn, s.conn.SetReadDeadline, s.server.opts.ReadTimeout)
 		code, body, err := s.r.startup()
@@ -430,6 +440,33 @@ func (s *session) startup() error {
 					requestName+" may be sent at most once during startup")
 			}
 			*seen = true
+			if tlsActive {
+				return fatal(sqlstateProtocolViolation,
+					requestName+" cannot be sent after TLS is established")
+			}
+			if code == codeSSLRequest && s.server.opts.TLSConfig != nil {
+				// The SSLRequest packet and the TLS ClientHello are separate
+				// request/response steps. Refusing already-buffered bytes prevents
+				// plaintext selected by the old reader from crossing the transport
+				// boundary or disappearing when that reader is replaced.
+				if s.r.br.Buffered() != 0 {
+					return fatal(sqlstateProtocolViolation,
+						"SSLRequest must not be pipelined with a TLS handshake")
+				}
+				s.w.write([]byte{'S'})
+				if err := s.flush(); err != nil {
+					return err
+				}
+				tlsConn := tls.Server(s.conn, s.server.opts.TLSConfig)
+				deadline(tlsConn, tlsConn.SetDeadline, s.server.opts.ReadTimeout)
+				if err := tlsConn.Handshake(); err != nil {
+					return fmt.Errorf("pgwire: TLS handshake: %w", err)
+				}
+				_ = tlsConn.SetDeadline(time.Time{})
+				s.setTransport(tlsConn)
+				tlsActive = true
+				continue
+			}
 			// A single byte, not a framed message: this reply is read before
 			// the client has agreed on a framing. 'N' means "not available",
 			// after which a conforming client continues in the clear or gives
@@ -447,6 +484,11 @@ func (s *session) startup() error {
 			continue
 
 		case codeCancelRequest:
+			if s.server.opts.RequireTLS && !tlsActive {
+				// CancelRequest never receives a reply. Closing without one also
+				// avoids revealing whether the supplied backend key was valid.
+				return errors.New("pgwire: plaintext CancelRequest rejected: TLS is required")
+			}
 			f := fields{b: body}
 			pid := f.int32()
 			secret := f.int32()
@@ -461,6 +503,10 @@ func (s *session) startup() error {
 			return nil
 
 		case protocolVersion30:
+			if s.server.opts.RequireTLS && !tlsActive {
+				return fatal(sqlstateInvalidAuthorization,
+					"TLS is required for this server")
+			}
 			return s.negotiate(body)
 
 		default:

@@ -28,11 +28,11 @@ import (
 //
 // # What is and is not implemented
 //
-// SCRAM-SHA-256 is implemented; SCRAM-SHA-256-PLUS is not, because channel
-// binding binds the authentication to a TLS channel and this server does not
-// speak TLS. That is not a gap to paper over: a client configured to *require*
-// channel binding is told so, with a clear message, rather than being quietly
-// downgraded. A client that merely supports it sends the gs2 flag "y", meaning
+// SCRAM-SHA-256 is implemented; SCRAM-SHA-256-PLUS channel binding is not,
+// including on a connection protected by [Options.TLSConfig]. That is not a
+// gap to paper over: a client configured to *require* channel binding is told
+// so, with a clear message, rather than being quietly downgraded. A client that
+// merely supports it sends the gs2 flag "y", meaning
 // "I support channel binding and you did not advertise it", and this server
 // verifies that flag is echoed intact in the client's final message — which is
 // the entire point of the flag, since an attacker stripping the -PLUS mechanism
@@ -355,8 +355,8 @@ func parseSASLInitial(body []byte) (clientFirst, error) {
 	if mechanism != "SCRAM-SHA-256" {
 		if mechanism == "SCRAM-SHA-256-PLUS" {
 			return clientFirst{}, fatal(sqlstateFeatureNotSupported,
-				"SCRAM-SHA-256-PLUS is not available: this server does not speak TLS, so there "+
-					"is no channel to bind to")
+				"SCRAM-SHA-256-PLUS channel binding is not implemented; "+
+					"this server offers SCRAM-SHA-256")
 		}
 		return clientFirst{}, fatal(sqlstateInvalidAuthorization,
 			fmt.Sprintf("unsupported SASL mechanism %q; this server offers SCRAM-SHA-256",
@@ -369,9 +369,9 @@ func parseSASLInitial(body []byte) (clientFirst, error) {
 //
 // The gs2 header is one of "n,,", "y,,", "p=<name>,,", each optionally carrying
 // an authzid in the second field. Only the first two are acceptable here: "p="
-// demands channel binding, which this server has not advertised and cannot
-// provide, and answering it with anything but a refusal would be pretending to
-// bind a channel that does not exist.
+// demands channel binding, which this server has not advertised or
+// implemented, and answering it with anything but a refusal would be
+// pretending to bind a channel.
 func parseClientFirst(msg string) (clientFirst, error) {
 	flag, rest, ok := strings.Cut(msg, ",")
 	if !ok {
@@ -385,8 +385,7 @@ func parseClientFirst(msg string) (clientFirst, error) {
 	case flag == "n" || flag == "y":
 	case strings.HasPrefix(flag, "p="):
 		return clientFirst{}, fatal(sqlstateFeatureNotSupported,
-			"the client requires SCRAM channel binding, which this server cannot provide "+
-				"because it does not speak TLS")
+			"the client requires SCRAM channel binding over TLS, which this server has not implemented")
 	default:
 		return clientFirst{}, malformedSCRAM()
 	}

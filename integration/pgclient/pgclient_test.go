@@ -2,8 +2,15 @@ package pgclient_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	stdsql "database/sql"
 	"errors"
+	"math/big"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -51,6 +58,70 @@ func TestPostgreSQLClients(t *testing.T) {
 	second.stop()
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("close reopened catalog owner: %v", err)
+	}
+}
+
+func TestPGXTLSWithSCRAM(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	database := openCatalog(t, filepath.Join(t.TempDir(), "tls.vdb"))
+	server, dsn := serveCatalogAt(t, database, "127.0.0.1:0", func(options *pgwire.Options) {
+		options.TLSConfig = integrationTLSConfig(t)
+		options.RequireTLS = true
+	})
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse test DSN: %v", err)
+	}
+	query := parsed.Query()
+	query.Set("sslmode", "require")
+	parsed.RawQuery = query.Encode()
+
+	conn, err := pgx.Connect(ctx, parsed.String())
+	if err != nil {
+		t.Fatalf("pgx connect over TLS+SCRAM: %v", err)
+	}
+	if _, ok := conn.PgConn().Conn().(*tls.Conn); !ok {
+		t.Fatalf("pgx transport is %T, want *tls.Conn", conn.PgConn().Conn())
+	}
+	var one []byte
+	if err := conn.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		t.Fatalf("query over TLS+SCRAM: %v", err)
+	}
+	if string(one) != "1" {
+		t.Fatalf("TLS query returned %q, want 1", one)
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatalf("close pgx TLS connection: %v", err)
+	}
+	server.stop()
+}
+
+func integrationTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate TLS key: %v", err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create TLS certificate: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
 	}
 }
 

@@ -72,8 +72,10 @@
 //
 // # What works
 //
-//   - Startup, including SSLRequest and GSSENCRequest (both refused in the
-//     clear), protocol version negotiation, and the parameter report.
+//   - Startup, including PostgreSQL SSLRequest negotiation through
+//     [Options.TLSConfig], GSSENCRequest refusal, protocol version negotiation,
+//     and the parameter report. [Options.RequireTLS] removes the plaintext
+//     startup and cancellation path.
 //   - Authentication: trust, or SCRAM-SHA-256. See "Authentication" below.
 //   - The simple query protocol, including up to 1,024 statements in one
 //     message.
@@ -136,8 +138,10 @@
 //   - EXPLAIN and EXPLAIN ANALYZE return one JSON QUERY PLAN row for the
 //     documented SELECT subset. The report is VibeDB's stable plan schema, not
 //     PostgreSQL's textual plan format.
-//   - TLS. SSLRequest is answered 'N'. Put this behind a unix socket, a
-//     loopback bind, or a TLS-terminating proxy.
+//   - PostgreSQL 17's direct TLS negotiation, which omits SSLRequest. Use the
+//     traditional PostgreSQL negotiation (libpq's sslnegotiation=postgres).
+//     SCRAM-SHA-256-PLUS channel binding is also not implemented; TLS and
+//     SCRAM-SHA-256 remain independently available.
 //   - The SQL constructs the dialect itself refuses — unsupported correlated
 //     subquery shapes, data-modifying CTEs, NATURAL joins, searched CASE
 //     predicate families outside the executable scalar subset, and scalar
@@ -187,13 +191,14 @@
 // # Driver compatibility evidence
 //
 // The package tests verify startup, SCRAM, simple and extended query flows,
-// pipelining and resynchronization, cancellation framing, every emitted type
-// and format, and client connect-sequence shims directly at the protocol
-// boundary. The nested integration/pgclient module is deliberately outside the
-// root dependency graph and imports pinned pgx v5 and lib/pq releases. CI runs
-// those clients and an official, digest-pinned PostgreSQL 18.4 psql client
-// against a real TCP listener. Its gates cover encryption refusal and cleartext
-// fallback; SCRAM startup; CREATE TABLE and CREATE INDEX; whole-document and
+// pipelining and resynchronization, cancellation framing, certificate-verified
+// TLS negotiation, every emitted type and format, and client connect-sequence
+// shims directly at the protocol boundary. The nested integration/pgclient
+// module is deliberately outside the root dependency graph and imports pinned
+// pgx v5 and lib/pq releases. CI runs those clients and an official,
+// digest-pinned PostgreSQL 18.4 psql client against a real TCP listener. Its
+// gates cover encryption refusal, cleartext fallback, and a native TLS+SCRAM
+// pgx session; SCRAM startup; CREATE TABLE and CREATE INDEX; whole-document and
 // flat writes; schema and duplicate-key SQLSTATEs; recovery after a
 // simple-query error; pgx named prepared statements; a declared-field JOIN;
 // lib/pq database/sql transactions; rollback, read-your-writes, and commit;
@@ -243,13 +248,19 @@
 // which authenticates nobody a choice someone wrote down rather than an
 // omitted production setting.
 //
+// [Options.TLSConfig] enables the traditional PostgreSQL SSLRequest handshake;
+// it is cloned by [NewServer], and [Options.RequireTLS] rejects plaintext
+// startup and cancellation packets. The startup [Options.ReadTimeout] also
+// bounds the TLS handshake. A nil TLSConfig answers SSLRequest with 'N',
+// preserving local plaintext compatibility. A network listener should combine
+// RequireTLS with SCRAM rather than treating encryption as authentication.
+//
 // [SCRAM] implements SCRAM-SHA-256 (RFC 5802, RFC 7677) from the standard
 // library. md5 authentication is deliberately not implemented. SCRAM-SHA-256-
-// PLUS is not implemented either, because channel binding needs a TLS channel
-// and there is none; a client that requires channel binding is told so rather
-// than downgraded. Passwords must be printable ASCII, because SASLprep is not
-// implemented and this package will not guess at a normalization — see
-// [NewVerifier].
+// PLUS channel binding is not implemented even when TLS is active; a client
+// that requires channel binding is told so rather than downgraded. Passwords
+// must be printable ASCII, because SASLprep is not implemented and this package
+// will not guess at a normalization — see [NewVerifier].
 //
 // # Concurrency
 //
@@ -318,10 +329,11 @@
 // the server cannot know whether a newly accepted socket carries CancelRequest
 // or an ordinary startup packet until it reads that packet, so slow ordinary
 // startups can occupy every cushion slot. The finite default ReadTimeout bounds
-// each partial read, and SSLRequest and GSSENCRequest are each accepted at most
-// once, so negotiation cannot reset that deadline forever. Explicitly disabling
-// ReadTimeout removes the partial-read bound and can make cancel admission
-// starvation indefinite under a hostile or stalled peer.
+// each partial read and a negotiated TLS handshake, and SSLRequest and
+// GSSENCRequest are each accepted at most once, so negotiation cannot reset
+// that deadline forever. Explicitly disabling ReadTimeout removes the
+// partial-read and TLS-handshake bound and can make cancel admission starvation
+// indefinite under a hostile or stalled peer.
 //
 // Cancellation is cooperative rather than an abandoned execution goroutine.
 // Its latency is one bounded protocol pre-parser interval, then the executor's
@@ -386,7 +398,8 @@
 // [DefaultMaxIntermediateBytes]; [UnlimitedResults] is the explicit opt-out.
 // Exhaustion is reported as SQLSTATE 54000 and never emits a partial DataRow.
 // Socket admission is likewise finite by default, and read, idle, and write
-// deadlines cover startup, message reads, and every underlying socket write.
+// deadlines cover startup and TLS negotiation, message reads, and every
+// underlying socket write.
 //
 // Executor intermediates have independent finite zero-value limits as well.
 // [query.ExecOptions.MemoryBytes] admits row-proportional heap columns,
