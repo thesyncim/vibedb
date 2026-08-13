@@ -975,21 +975,35 @@ func (c *Collection) commitRemoveEmptyLeaf(
 func (c *Collection) putPrimaryWithSplit(
 	key []byte, src []byte,
 ) (created bool, err error) {
+	created, continuation, err := c.putPrimaryWithSplitDetached(key, src)
+	return created, c.awaitPrimaryMutationDurability(continuation, err)
+}
+
+func (c *Collection) putPrimaryWithSplitDetached(
+	key []byte, src []byte,
+) (
+	created bool,
+	continuation primaryMutationDurabilityContinuation,
+	err error,
+) {
 	for attempt := 0; ; attempt++ {
-		created, err = c.putPrimary(key, src)
+		created, continuation, err = c.putPrimaryDetached(key, src)
 		if !errors.Is(err, ErrPrimaryLeafSplitRequired) {
 			if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-				return created, fmt.Errorf(
+				return created, continuation, fmt.Errorf(
 					"put primary attempt %d without split signal: %w", attempt, err,
 				)
 			}
-			return created, err
+			return created, continuation, err
+		}
+		if continuation.pending() {
+			panic("vibedb: split-required Put registered durability")
 		}
 		if attempt >= primaryStructuralRetryLimit {
-			return false, err
+			return false, continuation, err
 		}
 		if splitErr := c.splitPrimaryLeafForKey(key); splitErr != nil {
-			return false, errors.Join(
+			return false, continuation, errors.Join(
 				err, fmt.Errorf("split primary after attempt %d: %w", attempt, splitErr),
 			)
 		}
@@ -1004,21 +1018,35 @@ func (c *Collection) putPrimaryWithSplit(
 func (c *Collection) putPrimaryPreparedWithSplit(
 	key []byte, input primaryPreparedPutInput,
 ) (created bool, err error) {
+	created, continuation, err := c.putPrimaryPreparedWithSplitDetached(key, input)
+	return created, c.awaitPrimaryMutationDurability(continuation, err)
+}
+
+func (c *Collection) putPrimaryPreparedWithSplitDetached(
+	key []byte, input primaryPreparedPutInput,
+) (
+	created bool,
+	continuation primaryMutationDurabilityContinuation,
+	err error,
+) {
 	for attempt := 0; ; attempt++ {
-		created, err = c.putPrimaryPrepared(key, input)
+		created, continuation, err = c.putPrimaryPreparedDetached(key, input)
 		if !errors.Is(err, ErrPrimaryLeafSplitRequired) {
 			if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-				return created, fmt.Errorf(
+				return created, continuation, fmt.Errorf(
 					"put primary attempt %d without split signal: %w", attempt, err,
 				)
 			}
-			return created, err
+			return created, continuation, err
+		}
+		if continuation.pending() {
+			panic("vibedb: split-required prepared Put registered durability")
 		}
 		if attempt >= primaryStructuralRetryLimit {
-			return false, err
+			return false, continuation, err
 		}
 		if splitErr := c.splitPrimaryLeafForKey(key); splitErr != nil {
-			return false, errors.Join(
+			return false, continuation, errors.Join(
 				err, fmt.Errorf("split primary after attempt %d: %w", attempt, splitErr),
 			)
 		}
@@ -1075,7 +1103,19 @@ func (c *Collection) splitPrimaryLeafForKey(key []byte) (err error) {
 func (c *Collection) deletePrimaryWithEmptyReclaim(
 	key []byte,
 ) (deleted bool, err error) {
-	deleted, err = c.deletePrimary(key)
+	deleted, continuation, err := c.deletePrimaryDetached(key)
+	return c.awaitDeletePrimaryWithEmptyReclaim(
+		key, deleted, continuation, err,
+	)
+}
+
+func (c *Collection) awaitDeletePrimaryWithEmptyReclaim(
+	key []byte,
+	deleted bool,
+	continuation primaryMutationDurabilityContinuation,
+	err error,
+) (bool, error) {
+	err = c.awaitPrimaryMutationDurability(continuation, err)
 	if err != nil || !deleted {
 		return deleted, err
 	}
