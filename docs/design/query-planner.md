@@ -175,7 +175,10 @@ upper bounds, and confidence in the hot compact form; lower bound and confidence
 use float32 slots so both 64-byte directory shapes remain unchanged. Lower
 bounds use an absolute encoding at ordinary magnitudes and a scale-free
 lower/value ratio beyond float32 range, preserving finite uncertainty for huge
-cardinalities. The distributed cost model uses the upper row and width bounds.
+cardinalities. Compact fields round in the safe direction: lower bounds,
+confidence, and null fraction round down, while average value width rounds up;
+widths outside the finite compact domain are rejected at publication. The
+distributed cost model uses the upper row and width bounds.
 Missing table statistics use conservative defaults. JSON scalar statistics are
 canonicalized at publication, including exact numeric spelling variants, so
 `5`, `5.0`, and `50e-1` share one skew key.

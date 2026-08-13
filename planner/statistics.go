@@ -86,7 +86,7 @@ func newCompactEstimate(estimate Estimate, fallback float64) compactEstimate {
 		lowerCode = -conservativeFloat32(min(1, e.Lower/e.Value))
 	}
 	return compactEstimate{
-		value: e.Value, upper: e.Upper, lowerCode: lowerCode, confidence: float32(e.Confidence),
+		value: e.Value, upper: e.Upper, lowerCode: lowerCode, confidence: conservativeFloat32(e.Confidence),
 	}
 }
 
@@ -94,6 +94,14 @@ func conservativeFloat32(value float64) float32 {
 	encoded := float32(value)
 	if float64(encoded) > value {
 		encoded = math.Nextafter32(encoded, 0)
+	}
+	return encoded
+}
+
+func conservativeUpperFloat32(value float64) float32 {
+	encoded := float32(value)
+	if float64(encoded) < value {
+		encoded = math.Nextafter32(encoded, float32(math.Inf(1)))
 	}
 	return encoded
 }
@@ -294,8 +302,9 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 			column := &table.Columns[columnIndex]
 			entry := compactColumnStatistic{
 				path: intern(column.Path), distinct: newCompactEstimate(column.Distinct, 100),
-				nullFraction: float32(column.NullFraction), avgValueBytes: float32(column.AvgValueBytes),
-				commonBase: uint32(len(catalog.common)), commonCount: uint32(len(column.MostCommon)),
+				nullFraction:  conservativeFloat32(column.NullFraction),
+				avgValueBytes: conservativeUpperFloat32(column.AvgValueBytes),
+				commonBase:    uint32(len(catalog.common)), commonCount: uint32(len(column.MostCommon)),
 				histBase: uint32(len(catalog.histogram)), histCount: uint32(len(column.Histogram)),
 				commonTotal: commonFrequencyTotal(column.MostCommon),
 			}
@@ -331,7 +340,7 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 	if !finiteFraction(column.NullFraction) {
 		return statisticsError(table, column.Path+": null fraction is outside [0,1]")
 	}
-	if !finiteNonNegative(column.AvgValueBytes) {
+	if !finiteNonNegative(column.AvgValueBytes) || column.AvgValueBytes > math.MaxFloat32 {
 		return statisticsError(table, column.Path+": average value width is invalid")
 	}
 	commonTotal := 0.0

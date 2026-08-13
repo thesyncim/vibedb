@@ -202,6 +202,38 @@ func TestCompactEstimatePreservesHugeLowerBound(t *testing.T) {
 	}
 }
 
+func TestCompactStatisticsRoundInConservativeDirections(t *testing.T) {
+	const (
+		nullFraction  = 0.123456789123
+		avgValueBytes = 123.123456789
+		confidence    = 0.876543219876
+	)
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "events", Rows: ExactEstimate(100), RowBytes: ExactEstimate(128),
+		Columns: []ColumnStatistics{{
+			Path: "/value",
+			Distinct: Estimate{
+				Value: 10, Lower: 5, Upper: 20, Confidence: confidence,
+			},
+			NullFraction: nullFraction, AvgValueBytes: avgValueBytes,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, _ := catalog.Table("events")
+	column, _ := table.Column("/value")
+	if column.NullFraction() > nullFraction {
+		t.Fatalf("compact null fraction rounded up: %.12f > %.12f", column.NullFraction(), nullFraction)
+	}
+	if column.AvgValueBytes() < avgValueBytes {
+		t.Fatalf("compact average width rounded down: %.12f < %.12f", column.AvgValueBytes(), avgValueBytes)
+	}
+	if column.Distinct().Confidence > confidence {
+		t.Fatalf("compact confidence rounded up: %.12f > %.12f", column.Distinct().Confidence, confidence)
+	}
+}
+
 func TestStatisticsHeavyHittersAreSortedForLookup(t *testing.T) {
 	descriptors := []TableStatistics{{
 		Table: "events", Rows: ExactEstimate(100), RowBytes: ExactEstimate(8),
@@ -249,6 +281,7 @@ func TestStatisticsValidation(t *testing.T) {
 		{"missing table", func(s *TableStatistics) { s.Table = "" }},
 		{"bad row interval", func(s *TableStatistics) { s.Rows.Upper = 1 }},
 		{"bad null fraction", func(s *TableStatistics) { s.Columns[0].NullFraction = 2 }},
+		{"unrepresentable average width", func(s *TableStatistics) { s.Columns[0].AvgValueBytes = math.MaxFloat64 }},
 		{"container heavy hitter", func(s *TableStatistics) {
 			s.Columns[0].MostCommon = []ValueFrequency{{Value: `{}`, Frequency: .1}}
 		}},
