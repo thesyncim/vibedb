@@ -213,9 +213,11 @@ psql -X "host=127.0.0.1 port=5433 user=demo dbname=demo sslmode=disable"
 
 The server supports the simple and extended protocols, prepared statements,
 SCRAM-SHA-256, transaction state, cancellation, text and binary results, and a
-small compatibility layer for basic `psql` introspection commands. It does not
-provide a queryable PostgreSQL catalog, general ORM/BI discovery, or TLS. Bind
-it to a trusted local interface or place it behind a TLS-terminating proxy.
+small compatibility layer for basic `psql` introspection commands. The example
+is intentionally local and plaintext. For a network listener, set
+`Options.TLSConfig`, require encrypted startup and cancellation with
+`Options.RequireTLS`, and use SCRAM authentication. It does not provide a
+queryable PostgreSQL catalog or general ORM/BI discovery.
 
 See the [pgwire contract](pgwire/doc.go) for the exact protocol and client
 compatibility boundary.
@@ -255,8 +257,10 @@ blindly retrying.
   residue.
 - Arbitrary `pg_catalog` queries and general ORM schema discovery are not
   supported.
-- Pgwire does not implement TLS, replication, `COPY`, `LISTEN`/`NOTIFY`, or the
-  full PostgreSQL type and function systems.
+- Pgwire does not implement replication, `COPY`, `LISTEN`/`NOTIFY`,
+  SCRAM-SHA-256-PLUS channel binding, or the full PostgreSQL type and function
+  systems. TLS is available through PostgreSQL's traditional `SSLRequest`
+  negotiation, not the newer direct-negotiation mode.
 - Materialized views are not implemented; ordinary durable views are read-only.
 - Memory and work are explicitly bounded. Exceeding a limit returns an error
   without publishing a partial query result or mutation.

@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -83,6 +84,19 @@ type Options struct {
 	// forgotten production setting from silently disabling authentication.
 	Auth Authenticator
 
+	// TLSConfig enables PostgreSQL SSLRequest negotiation. NewServer clones the
+	// configuration before serving, so callers must use callbacks such as
+	// GetCertificate for live certificate rotation instead of mutating the
+	// supplied value. A nil configuration preserves plaintext-only operation
+	// and answers SSLRequest with 'N'.
+	TLSConfig *tls.Config
+
+	// RequireTLS rejects ordinary startup and cancellation packets received in
+	// plaintext. It requires TLSConfig. Leave it false only when plaintext is an
+	// intentional compatibility path, such as a loopback or unix-socket
+	// listener inside a trust boundary.
+	RequireTLS bool
+
 	// Database, when non-empty, is the only database name a client may ask
 	// for. An empty Database accepts any name, which is what a single-store
 	// server usually wants: the name is a label here, because the Database is
@@ -96,11 +110,11 @@ type Options struct {
 	// ordinary limit is full; see the ReadTimeout caveat below.
 	MaxConnections int
 
-	// ReadTimeout bounds reading the startup packet and each authentication
-	// reply — the phase before the peer is known to be anything at all, and the
-	// one where a connection that opens, sends half a message, and stops would
-	// otherwise hold a goroutine forever. Zero selects DefaultReadTimeout; a
-	// negative value explicitly disables the deadline.
+	// ReadTimeout bounds reading the startup packet, a negotiated TLS handshake,
+	// and each authentication reply — the phase before the peer is known to be
+	// anything at all, and the one where a connection that opens, sends half a
+	// message, and stops would otherwise hold a goroutine forever. Zero selects
+	// DefaultReadTimeout; a negative value explicitly disables the deadline.
 	ReadTimeout time.Duration
 
 	// WriteTimeout bounds how long any underlying socket write may block. Zero
@@ -174,6 +188,18 @@ func NewServer(db *sqldriver.Database, opts Options) (*Server, error) {
 	}
 	if err := opts.Auth.validate(); err != nil {
 		return nil, err
+	}
+	if opts.RequireTLS && opts.TLSConfig == nil {
+		return nil, errors.New("pgwire: RequireTLS requires a non-nil TLSConfig")
+	}
+	if opts.TLSConfig != nil {
+		if len(opts.TLSConfig.Certificates) == 0 &&
+			opts.TLSConfig.GetCertificate == nil &&
+			opts.TLSConfig.GetConfigForClient == nil {
+			return nil, errors.New(
+				"pgwire: TLSConfig must provide a certificate or certificate callback")
+		}
+		opts.TLSConfig = opts.TLSConfig.Clone()
 	}
 	if opts.MaxConnections < UnlimitedConnections {
 		return nil, fmt.Errorf("pgwire: MaxConnections must be >= %d", UnlimitedConnections)
