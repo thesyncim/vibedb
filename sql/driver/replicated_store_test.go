@@ -12,8 +12,36 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
 )
+
+func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
+	required := storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		storeio.RecoveryJournalMinSectorSize,
+		replicatedMaxDistinctMutations,
+		replicatedMaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+	)
+	if required <= 0 || uint64(required) != storeio.RecoveryJournalMaxCapacityBytes {
+		t.Fatalf(
+			"replicated batch ceiling record = %d, journal clamp = %d",
+			required, storeio.RecoveryJournalMaxCapacityBytes,
+		)
+	}
+	limits := ReplicatedShardStoreLimits{
+		MaxKeyBytes:       replicatedMaxKeyBytes,
+		MaxDocumentBytes:  replicatedMaxDocumentBytes,
+		MaxBatchDocuments: replicatedMaxDistinctMutations,
+		MaxBatchBytes:     replicatedMaxBatchBytes,
+	}
+	if err := validateReplicatedShardStoreLimits(limits); err != nil {
+		t.Fatalf("replicated batch ceiling: %v", err)
+	}
+	limits.MaxBatchBytes++
+	if err := validateReplicatedShardStoreLimits(limits); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+		t.Fatalf("replicated batch ceiling + 1 = %v, want profile error", err)
+	}
+}
 
 func testReplicatedBinding(seed byte) ReplicatedShardStoreBinding {
 	id := func(offset byte) [16]byte {

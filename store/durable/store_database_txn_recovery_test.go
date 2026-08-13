@@ -210,7 +210,7 @@ func prepareUnpublishedOn(
 	if err := batch.Put([]byte(key), []byte(doc)); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := coll.stagePrimaryBatchLocked(batch)
+	staged, err := coll.stagePrimaryBatchConditionalLocked(batch)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
@@ -332,7 +332,7 @@ func prepareMaybePublish(
 	if err := batch.Put([]byte(key), []byte(doc)); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := coll.stagePrimaryBatchLocked(batch)
+	staged, err := coll.stagePrimaryBatchConditionalLocked(batch)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}

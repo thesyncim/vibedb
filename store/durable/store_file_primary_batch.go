@@ -185,6 +185,22 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 func (c *Collection) stagePrimaryBatchLocked(
 	batch *WriteBatch,
 ) (stagedPrimaryBatch, error) {
+	return c.stagePrimaryBatchForJournalLocked(batch, false)
+}
+
+// stagePrimaryBatchConditionalLocked stages a multi-collection participant
+// after reserving room for its larger kind-5 conditional journal record. The
+// ordinary buffered single-collection lane keeps its compact kind-3 journal
+// policy and physical-checkpoint fallback.
+func (c *Collection) stagePrimaryBatchConditionalLocked(
+	batch *WriteBatch,
+) (stagedPrimaryBatch, error) {
+	return c.stagePrimaryBatchForJournalLocked(batch, true)
+}
+
+func (c *Collection) stagePrimaryBatchForJournalLocked(
+	batch *WriteBatch, conditional bool,
+) (stagedPrimaryBatch, error) {
 	if c.primaryUnifiedOverlay.hasPending() {
 		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
 			return stagedPrimaryBatch{}, err
@@ -241,7 +257,7 @@ func (c *Collection) stagePrimaryBatchLocked(
 		if !c.primaryBatchHasLiveLeaf() {
 			return stagedPrimaryBatch{}, nil
 		}
-		checkpointed, err := c.ensurePrimaryBatchCapacity()
+		checkpointed, err := c.ensurePrimaryBatchCapacity(conditional)
 		if err != nil {
 			return stagedPrimaryBatch{}, err
 		}
@@ -295,8 +311,10 @@ func (c *Collection) unwindStagedPrimaryBatch(staged *stagedPrimaryBatch) {
 // fences before the decision record. Append and sync failures both poison with
 // plain poisonJournal — a conditional record without a decision cannot have
 // committed, so ErrCommitOutcomeUnknown is reserved for the decision sync.
-// Journal-region capacity shortfalls take the existing pressure-checkpoint
-// path and are neither poisons nor rejects. The writer must already be held.
+// Conditional staging has already reserved the exact kind-5 bytes before any
+// frame admission. This phase therefore only rechecks that immutable plan and
+// appends it; it must never checkpoint, remint, or grow after dirty frames have
+// been admitted. The writer must already be held.
 func (c *Collection) preparePrimaryBatchConditionalLocked(
 	staged *stagedPrimaryBatch,
 	markerID [16]byte,
@@ -315,37 +333,24 @@ func (c *Collection) preparePrimaryBatchConditionalLocked(
 			ErrConditionalPrepareUnsupportedJournal,
 		)
 	}
-	if err := c.ensureConditionalJournalFormatLocked(); err != nil {
+	if format := c.journal.Header().FormatVersion; format != storeio.RecoveryJournalFormatConditional {
+		return fmt.Errorf(
+			"%w: journal format %d",
+			ErrConditionalPrepareUnsupportedJournal, format,
+		)
+	}
+	plan, err := c.journal.PrepareConditionalBatch(c.batchJournalEntries)
+	if err != nil {
 		return err
 	}
-	if err := c.ensurePrimaryBatchConditionalJournalRoom(
-		c.batchJournalEntries,
-	); err != nil {
-		return err
+	if !c.journal.PreparedBatchFits(plan) {
+		return storeio.ErrRecoveryJournalFull
 	}
-	if _, err := c.journal.AppendConditionalBatch(
-		staged.generation, markerID, markerEpoch, txnID, c.batchJournalEntries,
+	if _, err := c.journal.AppendPreparedConditionalBatch(
+		staged.generation, markerID, markerEpoch, txnID,
+		c.batchJournalEntries, plan,
 	); err != nil {
-		if errors.Is(err, storeio.ErrRecoveryJournalFull) {
-			if cpErr := c.checkpointBufferedLocked(); cpErr != nil {
-				return cpErr
-			}
-			c.automaticCheckpoints.Add(1)
-			if err := c.ensureConditionalJournalFormatLocked(); err != nil {
-				return err
-			}
-			if _, retryErr := c.journal.AppendConditionalBatch(
-				staged.generation, markerID, markerEpoch, txnID,
-				c.batchJournalEntries,
-			); retryErr != nil {
-				if errors.Is(retryErr, storeio.ErrRecoveryJournalFull) {
-					return retryErr
-				}
-				return c.poisonJournal(retryErr)
-			}
-		} else {
-			return c.poisonJournal(err)
-		}
+		return c.poisonJournal(err)
 	}
 	if forceSync {
 		if err := c.journal.Sync(c.journalPowerSafe); err != nil {
@@ -606,7 +611,7 @@ func (c *Collection) primaryBatchHasLiveLeaf() bool {
 //   - deferred retirement room for superseded leaves and volatile overflow pages;
 //   - durable retirement room for every superseded on-device overflow page;
 //   - admission bookkeeping for every new chain page and leaf.
-func (c *Collection) ensurePrimaryBatchCapacity() (bool, error) {
+func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) {
 	before := c.automaticCheckpoints.Load()
 	newDistinct := 0
 	liveLeaves := 0
@@ -637,8 +642,14 @@ func (c *Collection) ensurePrimaryBatchCapacity() (bool, error) {
 		c.automaticCheckpoints.Add(1)
 		return true, nil
 	}
-	if err := c.ensurePrimaryBatchJournalRoom(c.batchJournalEntries); err != nil {
-		return false, err
+	var journalErr error
+	if conditional {
+		journalErr = c.ensurePrimaryBatchConditionalJournalRoom(c.batchJournalEntries)
+	} else {
+		journalErr = c.ensurePrimaryBatchJournalRoom(c.batchJournalEntries)
+	}
+	if journalErr != nil {
+		return false, journalErr
 	}
 	if c.automaticCheckpoints.Load() != before {
 		return true, nil

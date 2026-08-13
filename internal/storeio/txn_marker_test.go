@@ -386,6 +386,18 @@ func TestTxnMarkerHostileCapacityClamp(t *testing.T) {
 	}
 }
 
+func TestTxnMarkerCapacityClampIsIndependent(t *testing.T) {
+	if got, want := TxnMarkerMaxCapacityBytes, uint64(16)<<20; got != want {
+		t.Fatalf("transaction marker capacity clamp = %d, want %d", got, want)
+	}
+	if TxnMarkerMaxCapacityBytes >= RecoveryJournalMaxCapacityBytes {
+		t.Fatalf(
+			"transaction marker clamp %d inherited recovery-journal clamp %d",
+			TxnMarkerMaxCapacityBytes, RecoveryJournalMaxCapacityBytes,
+		)
+	}
+}
+
 func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 	t.Run("torn-append", func(t *testing.T) {
 		m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)

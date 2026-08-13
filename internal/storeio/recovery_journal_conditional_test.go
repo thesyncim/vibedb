@@ -29,6 +29,28 @@ func testConditionalEntries() []RecoveryBatchEntry {
 	}
 }
 
+func TestRecoveryJournalReplicatedSQLConditionalCeiling(t *testing.T) {
+	const (
+		entryCount   = 64
+		payloadBytes = (16 << 20) + entryCount*256
+	)
+	want := (16 << 20) + 34*RecoveryJournalMinSectorSize
+	got := RecoveryBatchRecordPaddedSizeForPayload(
+		RecoveryJournalMinSectorSize,
+		entryCount,
+		payloadBytes+RecoveryConditionalHeaderSize,
+	)
+	if got != want {
+		t.Fatalf("replicated SQL conditional ceiling = %d, want %d", got, want)
+	}
+	if uint64(got) != RecoveryJournalMaxCapacityBytes {
+		t.Fatalf(
+			"replicated SQL conditional ceiling = %d, journal clamp = %d",
+			got, RecoveryJournalMaxCapacityBytes,
+		)
+	}
+}
+
 func replayConditionalAll(
 	t *testing.T, rj *RecoveryJournal, base uint64,
 ) []RecoveryRecord {

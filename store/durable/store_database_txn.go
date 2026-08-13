@@ -667,7 +667,7 @@ func (l *TxnLog) commitMulti(
 
 	for i, c := range order {
 		wb := byName[nameOf[c]]
-		st, stageErr := c.stagePrimaryBatchLocked(wb)
+		st, stageErr := c.stagePrimaryBatchConditionalLocked(wb)
 		if stageErr != nil {
 			return stageErr
 		}

@@ -36,9 +36,11 @@ const (
 	txnMarkerRegionStart = TxnMarkerHeaderSize * txnMarkerHeaderSlots
 	// TxnMarkerMinSectorSize is the append/damage granule.
 	TxnMarkerMinSectorSize = 512
-	// TxnMarkerMaxCapacityBytes mirrors RecoveryJournalMaxCapacityBytes so a
-	// checksummed hostile header cannot drive an unbounded allocation.
-	TxnMarkerMaxCapacityBytes = RecoveryJournalMaxCapacityBytes
+	// TxnMarkerMaxCapacityBytes is the independent decision-log clamp. It does
+	// not inherit recovery-journal envelope overhead: decision records have their
+	// own fixed participant ceiling, and a checksummed hostile header must not
+	// gain allocation authority when the recovery-journal bound changes.
+	TxnMarkerMaxCapacityBytes = uint64(16) << 20
 	// txnMarkerDefaultCapacityBytes is the create-time default record region.
 	txnMarkerDefaultCapacityBytes = uint64(1) << 20
 

@@ -302,7 +302,7 @@ func TestPrimaryBatchPhasePrepareFailureClassification(t *testing.T) {
 				coll.writer.Unlock()
 				t.Fatal(err)
 			}
-			staged, err := coll.stagePrimaryBatchLocked(batch)
+			staged, err := coll.stagePrimaryBatchConditionalLocked(batch)
 			if err != nil {
 				coll.releaseFileWriteBatch(batch)
 				coll.writer.Unlock()

@@ -540,7 +540,7 @@ func (c *Collection) ensureSyncJournalMutationRoomLocked(
 		c.options.MaxKeyBytes,
 		valueBytes,
 	)
-	if err := c.growSyncJournalForRecordLocked(recordBytes); err != nil {
+	if err := c.growJournalForRecordLocked(recordBytes); err != nil {
 		return false, err
 	}
 	if c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {
@@ -553,7 +553,7 @@ func (c *Collection) ensureSyncJournalMutationRoomLocked(
 	if c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {
 		return true, nil
 	}
-	if err := c.growSyncJournalForRecordLocked(recordBytes); err != nil {
+	if err := c.growJournalForRecordLocked(recordBytes); err != nil {
 		return true, err
 	}
 	if !c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {

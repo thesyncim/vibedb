@@ -78,6 +78,13 @@ is supplying a sealed profile for an ordinary sidecar. The lower-level generic
 `OpenRecoveryJournal` can self-describe and reprove a persisted seal, but its
 immutable handle is not an externally qualified durable profile.
 
+The recovery-journal hard ceiling is 16 MiB plus 17,408 bytes, enough for the
+current replicated SQL profile's 16 MiB command budget, 64 maximum-size keys,
+conditional framing, trailer, and sector padding. The transaction decision log
+keeps a separate 16 MiB ceiling. These are allocation and hostile-header clamps;
+arbitrary larger durable collection options remain unsealable and fail option
+normalization.
+
 The explicit `OpenTxnLog` and `RecoverDatabaseTransactions` APIs accept
 `TxnLogOptions`. `durable.Database` does not yet thread those options, so it
 cannot mint or reopen a sealed `txn.vtm`; this checkpoint makes no sealed
