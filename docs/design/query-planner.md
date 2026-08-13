@@ -72,7 +72,11 @@ apply function. Exploration and implementation are separate phases. Rules may
 add an equivalent expression or create a child group, but all mutation passes
 through memo limits. Registration order cannot change the winner: rules are
 scheduled by phase, descending priority, and name, and equal-cost plans use a
-stable structural fingerprint.
+stable 128-bit structural digest with exact structural comparison as the
+collision fallback. Rule exploration is atomic: failure or cancellation rolls
+back every yielded group/expression and counter. Success seals the memo against
+mutation. The same optimizer can then search that immutable memo for multiple
+root property requirements without replaying rules.
 
 The initial gateway rules implement a remote query and an algebraic final
 aggregate. The operator vocabulary already reserves table/index scans, filters,
@@ -113,19 +117,24 @@ expensive than CPU; a future workload class can replace those weights without
 changing rules.
 
 Search has independent hard limits for groups, expressions, rule applications,
-physical alternatives, recursion depth, and deterministic memo payload bytes. The byte limit
-covers memo records, child edges, column identities, and unique-key runs, so a
-single wide expression cannot bypass the cardinality limits; Go map buckets and
+physical alternatives, property states, enforcer-chain steps, recursion depth,
+deterministic memo payload bytes, and deterministic top-down search payload
+bytes. The byte limits cover memo records, child edges, column identities,
+unique-key runs, cached property records, property slices, physical plan nodes,
+and their owned slices, so one wide expression or enforcer chain cannot bypass
+the cardinality limits. Go map buckets, model-owned returned alternatives, and
 allocator slack remain indirectly bounded by the count limits. Cancellation is
 checked during exploration and top-down search. Exceeding a limit returns a
 typed error; the optimizer never silently publishes the best plan observed
-before truncation.
+before truncation. Positive and negative property results are memoized, so an
+impossible child requirement is not recomputed for every parent alternative.
 
 `OptimizerStatistics` reports memo groups, expressions, rule applications,
 accounted payload bytes, owned slice-capacity bytes, physical alternatives,
-property-cache hits, enforcer plans, memory rejections, and peak search depth.
-It deliberately excludes a clock; benchmarks time `Optimize` at the call
-boundary.
+property states/cache entries/cache hits, enforcer alternatives/steps, plan
+nodes, deterministic search payload bytes, memory rejections, and peak search
+depth. It deliberately excludes a clock; benchmarks time `Optimize` at the
+call boundary.
 
 ## Statistics
 
@@ -178,7 +187,7 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | table + column + heavy-hitter lookup, one table | about 14 ns | 0 | — |
 | same lookup in a 1,024-table catalog | about 36 ns | 0 | 154 bytes/table for one observed column and one heavy hitter |
 | per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
-| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,832 bytes / 33 allocations including construction | 352 owned memo bytes |
+| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,816 bytes / 31 allocations including construction | 352 owned memo bytes |
 | build and validate that 1,024-table catalog | about 1.2 ms | 5.77 MB / 25,644 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.

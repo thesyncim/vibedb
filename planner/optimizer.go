@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"strconv"
 	"strings"
+	"unsafe"
 )
 
 var (
@@ -51,7 +51,12 @@ type Plan struct {
 	Children    []*Plan
 	Provided    PhysicalProperties
 	Cost        Cost
-	fingerprint string
+	fingerprint planDigest
+}
+
+type planDigest struct {
+	high uint64
+	low  uint64
 }
 
 // Fingerprint is a stable structural tie-breaker and diagnostic identity.
@@ -59,7 +64,10 @@ func (p *Plan) Fingerprint() string {
 	if p == nil {
 		return ""
 	}
-	return p.fingerprint
+	var text [32]byte
+	encodeHex64(text[:16], p.fingerprint.high)
+	encodeHex64(text[16:], p.fingerprint.low)
+	return string(text[:])
 }
 
 // String renders a compact, deterministic physical tree.
@@ -100,6 +108,10 @@ type Optimizer struct {
 	ctx    context.Context
 	stats  OptimizerStatistics
 	depth  uint32
+	// exploredMemo makes rule exploration a one-time transition while allowing
+	// this optimizer to search the sealed memo for multiple root requirements.
+	exploredMemo  *Memo
+	searchPayload uint64
 }
 
 // OptimizerStatistics makes planning work and space directly benchmarkable.
@@ -108,8 +120,13 @@ type Optimizer struct {
 type OptimizerStatistics struct {
 	Memo                 MemoStatistics
 	PhysicalAlternatives uint32
+	PropertyStates       uint32
 	PropertyCacheHits    uint32
+	PropertyCacheEntries uint32
 	EnforcerPlans        uint32
+	EnforcerSteps        uint32
+	PlanNodes            uint32
+	SearchPayloadBytes   uint64
 	MemoryRejected       uint32
 	PeakSearchDepth      uint32
 }
@@ -145,12 +162,29 @@ func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required Physica
 	}
 	o.stats = OptimizerStatistics{}
 	o.plans = 0
+	o.searchPayload = 0
 	defer func() {
 		o.stats.Memo = o.Memo.Statistics()
 		o.stats.PhysicalAlternatives = o.plans
+		o.stats.SearchPayloadBytes = o.searchPayload
 	}()
-	if err := o.Memo.Explore(ctx, o.Rules); err != nil {
-		return nil, err
+	if o.exploredMemo != nil && o.exploredMemo != o.Memo {
+		return nil, fmt.Errorf("%w: optimizer cannot change memos after exploration", ErrInvalidMemo)
+	}
+	if o.exploredMemo == nil {
+		switch o.Memo.state {
+		case memoBuilding:
+			if err := o.Memo.Explore(ctx, o.Rules); err != nil {
+				return nil, err
+			}
+		case memoSealed:
+			if len(o.Rules) != 0 {
+				return nil, fmt.Errorf("%w: cannot apply rules to an already explored memo", ErrMemoSealed)
+			}
+		default:
+			return nil, fmt.Errorf("%w: memo is already being explored", ErrInvalidMemo)
+		}
+		o.exploredMemo = o.Memo
 	}
 	o.ctx = ctx
 	o.Objective = o.Objective.withDefaults()
@@ -160,7 +194,7 @@ func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required Physica
 	o.cache = make(map[bestKey][]bestEntry)
 	o.active = make(map[bestKey][]PhysicalProperties)
 	o.depth = 0
-	plan, err := o.optimizeGroup(root, clonePhysicalProperties(required))
+	plan, err := o.optimizeGroup(root, required)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +215,9 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 	for _, entry := range o.cache[key] {
 		if entry.required.Equal(required) {
 			o.stats.PropertyCacheHits++
+			if entry.plan == nil {
+				return nil, noPlanFor(group, required)
+			}
 			return entry.plan, nil
 		}
 	}
@@ -189,6 +226,17 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 			return nil, fmt.Errorf("%w: cyclic dependency at group %d requiring %s", ErrInvalidMemo, group, required.String())
 		}
 	}
+	if o.stats.PropertyStates >= o.Memo.limits.MaxPropertyStates {
+		return nil, fmt.Errorf("%w: property states reached %d", ErrSearchBudget, o.Memo.limits.MaxPropertyStates)
+	}
+	statePayload, ok := propertyStatePayloadBytes(required)
+	if !ok {
+		return nil, fmt.Errorf("%w: property-state payload overflow", ErrSearchBudget)
+	}
+	if err := o.reserveSearchPayload(statePayload); err != nil {
+		return nil, err
+	}
+	o.stats.PropertyStates++
 	o.active[key] = append(o.active[key], clonePhysicalProperties(required))
 	defer func() {
 		values := o.active[key]
@@ -255,10 +303,17 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 		}
 	}
 	if best == nil {
-		return nil, fmt.Errorf("%w: group %d requires %s", ErrNoPlan, group, required.String())
+		o.cache[key] = append(o.cache[key], bestEntry{required: clonePhysicalProperties(required)})
+		o.stats.PropertyCacheEntries++
+		return nil, noPlanFor(group, required)
 	}
 	o.cache[key] = append(o.cache[key], bestEntry{required: clonePhysicalProperties(required), plan: best})
+	o.stats.PropertyCacheEntries++
 	return best, nil
+}
+
+func noPlanFor(group GroupID, required PhysicalProperties) error {
+	return fmt.Errorf("%w: group %d requires %s", ErrNoPlan, group, required.String())
 }
 
 func (o *Optimizer) buildCandidate(
@@ -285,6 +340,9 @@ func (o *Optimizer) buildCandidate(
 	cost := local
 	for _, child := range children {
 		cost = cost.Plus(child.Cost)
+	}
+	if err := o.reservePlanNode(planPayloadBytes(len(expr.Children), len(children), provided)); err != nil {
+		return nil, err
 	}
 	base := &Plan{
 		Group: group, Expr: id, Expression: cloneExpression(expr),
@@ -315,15 +373,28 @@ func (o *Optimizer) buildCandidate(
 		}
 		candidate := base
 		for _, step := range chain {
+			if o.stats.EnforcerSteps >= o.Memo.limits.MaxEnforcerSteps {
+				return nil, fmt.Errorf("%w: enforcer steps reached %d", ErrSearchBudget, o.Memo.limits.MaxEnforcerSteps)
+			}
+			o.stats.EnforcerSteps++
+			if o.stats.EnforcerSteps&63 == 0 {
+				if err := o.ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			if step.Op == OpInvalid || !step.Cost.valid() {
 				return nil, fmt.Errorf("%w: invalid enforcer for group %d", ErrInvalidCost, group)
 			}
 			if err := step.Provided.validateProvided(); err != nil {
 				return nil, fmt.Errorf("planner: enforcer properties for group %d: %w", group, err)
 			}
+			if err := o.reservePlanNode(planPayloadBytes(1, 1, step.Provided)); err != nil {
+				return nil, err
+			}
+			enforcerExpr := Expression{Op: step.Op, Private: step.Private, Children: []GroupID{group}}
 			candidate = &Plan{
 				Group: group, Expr: NoExpr,
-				Expression: Expression{Op: step.Op, Private: step.Private, Children: []GroupID{group}},
+				Expression: enforcerExpr,
 				Children:   []*Plan{candidate}, Provided: clonePhysicalProperties(step.Provided),
 				Cost: candidate.Cost.Plus(step.Cost),
 			}
@@ -365,39 +436,173 @@ func betterPlan(candidate, current *Plan, objective Objective) bool {
 			return pair[0] < pair[1]
 		}
 	}
-	return candidate.fingerprint < current.fingerprint
+	if candidate.fingerprint.high != current.fingerprint.high {
+		return candidate.fingerprint.high < current.fingerprint.high
+	}
+	if candidate.fingerprint.low != current.fingerprint.low {
+		return candidate.fingerprint.low < current.fingerprint.low
+	}
+	// The digest only accelerates the common path. Exact structure remains the
+	// authority, so even a constructed 128-bit collision cannot make the winner
+	// depend on rule or enforcer registration order.
+	return comparePlanStructure(candidate, current) < 0
 }
 
-func planFingerprint(p *Plan) string {
-	b := make([]byte, 0, 64)
-	b = strconv.AppendUint(b, uint64(p.Expression.Op), 10)
-	b = append(b, ':')
-	b = strconv.AppendUint(b, uint64(p.Expression.Private), 10)
-	b = append(b, '{')
-	b = strconv.AppendUint(b, uint64(p.Provided.Distribution.Kind), 10)
-	b = append(b, '/')
-	b = strconv.AppendUint(b, uint64(p.Provided.Distribution.Partitions), 10)
-	b = append(b, ':')
+func (o *Optimizer) reserveSearchPayload(bytes uint64) error {
+	if bytes > o.Memo.limits.MaxSearchPayloadBytes ||
+		o.searchPayload > o.Memo.limits.MaxSearchPayloadBytes-bytes {
+		return fmt.Errorf("%w: search payload exceeds %d bytes", ErrSearchBudget, o.Memo.limits.MaxSearchPayloadBytes)
+	}
+	o.searchPayload += bytes
+	return nil
+}
+
+func (o *Optimizer) reservePlanNode(bytes uint64, ok bool) error {
+	if !ok {
+		return fmt.Errorf("%w: physical-plan payload overflow", ErrSearchBudget)
+	}
+	if err := o.reserveSearchPayload(bytes); err != nil {
+		return err
+	}
+	o.stats.PlanNodes++
+	return nil
+}
+
+func propertyStatePayloadBytes(required PhysicalProperties) (uint64, bool) {
+	// One active property and one completed cache entry can coexist while a
+	// recursive state unwinds. Charge both records and both owned runs.
+	total := uint64(unsafe.Sizeof(PhysicalProperties{})) + uint64(unsafe.Sizeof(bestEntry{}))
+	var ok bool
+	if total, ok = addMemoRun(total, len(required.Distribution.Keys), unsafe.Sizeof(ColumnID(0))); !ok {
+		return 0, false
+	}
+	if total, ok = addMemoRun(total, len(required.Distribution.Keys), unsafe.Sizeof(ColumnID(0))); !ok {
+		return 0, false
+	}
+	if total, ok = addMemoRun(total, len(required.Ordering), unsafe.Sizeof(OrderingColumn{})); !ok {
+		return 0, false
+	}
+	return addMemoRun(total, len(required.Ordering), unsafe.Sizeof(OrderingColumn{}))
+}
+
+func planPayloadBytes(expressionChildren, planChildren int, provided PhysicalProperties) (uint64, bool) {
+	total := uint64(unsafe.Sizeof(Plan{}))
+	var ok bool
+	if total, ok = addMemoRun(total, expressionChildren, unsafe.Sizeof(GroupID(0))); !ok {
+		return 0, false
+	}
+	if total, ok = addMemoRun(total, planChildren, unsafe.Sizeof((*Plan)(nil))); !ok {
+		return 0, false
+	}
+	if total, ok = addMemoRun(total, len(provided.Distribution.Keys), unsafe.Sizeof(ColumnID(0))); !ok {
+		return 0, false
+	}
+	return addMemoRun(total, len(provided.Ordering), unsafe.Sizeof(OrderingColumn{}))
+}
+
+func planFingerprint(p *Plan) planDigest {
+	digest := planDigest{high: fnv64Offset, low: 0x6c62272e07bb0142}
+	digest.add(uint64(p.Expression.Op))
+	digest.add(uint64(p.Expression.Private))
+	digest.add(uint64(p.Provided.Distribution.Kind))
+	digest.add(uint64(p.Provided.Distribution.Partitions))
+	digest.add(uint64(len(p.Provided.Distribution.Keys)))
 	for _, key := range p.Provided.Distribution.Keys {
-		b = strconv.AppendUint(b, uint64(key), 10)
-		b = append(b, ',')
+		digest.add(uint64(key))
 	}
-	b = append(b, '|')
+	digest.add(uint64(len(p.Provided.Ordering)))
 	for _, term := range p.Provided.Ordering {
-		b = strconv.AppendUint(b, uint64(term.Column), 10)
-		b = append(b, '/')
-		b = strconv.AppendUint(b, uint64(term.Direction), 10)
-		b = append(b, '/', boolByte(term.NullsFirst), ',')
+		digest.add(uint64(term.Column))
+		digest.add(uint64(term.Direction))
+		digest.add(uint64(boolByte(term.NullsFirst)))
 	}
-	b = append(b, '}', '[')
-	for i, child := range p.Children {
-		if i != 0 {
-			b = append(b, ',')
+	digest.add(uint64(len(p.Children)))
+	for _, child := range p.Children {
+		digest.add(child.fingerprint.high)
+		digest.add(child.fingerprint.low)
+	}
+	return digest
+}
+
+func (d *planDigest) add(value uint64) {
+	for range 8 {
+		d.high = hashByte(d.high, byte(value))
+		d.low ^= uint64(byte(value))
+		d.low *= 0x9e3779b185ebca87
+		value >>= 8
+	}
+}
+
+func encodeHex64(dst []byte, value uint64) {
+	const digits = "0123456789abcdef"
+	for i := 15; i >= 0; i-- {
+		dst[i] = digits[value&0xf]
+		value >>= 4
+	}
+}
+
+func comparePlanStructure(a, b *Plan) int {
+	if result := compareUint64(uint64(a.Expression.Op), uint64(b.Expression.Op)); result != 0 {
+		return result
+	}
+	if result := compareUint64(uint64(a.Expression.Private), uint64(b.Expression.Private)); result != 0 {
+		return result
+	}
+	if result := compareUint64(uint64(a.Provided.Distribution.Kind), uint64(b.Provided.Distribution.Kind)); result != 0 {
+		return result
+	}
+	if result := compareUint64(uint64(a.Provided.Distribution.Partitions), uint64(b.Provided.Distribution.Partitions)); result != 0 {
+		return result
+	}
+	if result := compareColumnRun(a.Provided.Distribution.Keys, b.Provided.Distribution.Keys); result != 0 {
+		return result
+	}
+	if result := compareOrderingRun(a.Provided.Ordering, b.Provided.Ordering); result != 0 {
+		return result
+	}
+	if result := compareUint64(uint64(len(a.Children)), uint64(len(b.Children))); result != 0 {
+		return result
+	}
+	for i := range a.Children {
+		if result := comparePlanStructure(a.Children[i], b.Children[i]); result != 0 {
+			return result
 		}
-		b = append(b, child.fingerprint...)
 	}
-	b = append(b, ']')
-	return string(b)
+	return 0
+}
+
+func compareColumnRun(a, b []ColumnID) int {
+	for i := 0; i < min(len(a), len(b)); i++ {
+		if result := compareUint64(uint64(a[i]), uint64(b[i])); result != 0 {
+			return result
+		}
+	}
+	return compareUint64(uint64(len(a)), uint64(len(b)))
+}
+
+func compareOrderingRun(a, b []OrderingColumn) int {
+	for i := 0; i < min(len(a), len(b)); i++ {
+		if result := compareUint64(uint64(a[i].Column), uint64(b[i].Column)); result != 0 {
+			return result
+		}
+		if result := compareUint64(uint64(a[i].Direction), uint64(b[i].Direction)); result != 0 {
+			return result
+		}
+		if result := compareUint64(uint64(boolByte(a[i].NullsFirst)), uint64(boolByte(b[i].NullsFirst))); result != 0 {
+			return result
+		}
+	}
+	return compareUint64(uint64(len(a)), uint64(len(b)))
+}
+
+func compareUint64(a, b uint64) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
 }
 
 // Score reports a plan's objective score.

@@ -92,6 +92,15 @@ func (m *Memo) Explore(ctx context.Context, rules []Rule) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.state == memoSealed {
+		return ErrMemoSealed
+	}
+	if m.state == memoExploring {
+		return fmt.Errorf("%w: recursive rule exploration", ErrInvalidMemo)
+	}
 	ordered := slices.Clone(rules)
 	for i := range ordered {
 		if ordered[i] == nil || ordered[i].Name() == "" {
@@ -121,6 +130,20 @@ func (m *Memo) Explore(ctx context.Context, rules []Rule) error {
 		}
 		return 0
 	})
+	startGroups, startExpressions := len(m.groups), len(m.expressions)
+	startPayload, startRuleApps := m.payloadBytes, m.ruleApps
+	m.state = memoExploring
+	err := m.exploreRules(ctx, ordered)
+	if err != nil {
+		m.rollbackExploration(startGroups, startExpressions, startPayload, startRuleApps)
+		m.state = memoBuilding
+		return err
+	}
+	m.state = memoSealed
+	return nil
+}
+
+func (m *Memo) exploreRules(ctx context.Context, ordered []Rule) error {
 	// Reach an exploration fixed point before any implementation rule runs.
 	// Otherwise an implementation rule attached to an earlier expression can
 	// miss a logical equivalent yielded later in the same group.

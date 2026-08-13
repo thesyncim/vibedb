@@ -13,6 +13,9 @@ var (
 	ErrSearchBudget = errors.New("planner: search budget exceeded")
 	// ErrInvalidMemo reports a malformed group or expression reference.
 	ErrInvalidMemo = errors.New("planner: invalid memo")
+	// ErrMemoSealed reports a mutation or second rule exploration after a memo
+	// has become the immutable input to physical search.
+	ErrMemoSealed = errors.New("planner: memo is sealed")
 )
 
 // Limits bound optimizer work and retained search state. Zero selects a
@@ -22,11 +25,18 @@ type Limits struct {
 	MaxExpressions      uint32
 	MaxRuleApplications uint32
 	MaxPlans            uint32
+	MaxPropertyStates   uint32
+	MaxEnforcerSteps    uint32
 	MaxSearchDepth      uint32
 	// MaxMemoPayloadBytes bounds deterministic memo-owned records and slice
 	// elements. Runtime map buckets and allocator capacity are bounded
 	// indirectly by the cardinality limits and reported separately where stable.
 	MaxMemoPayloadBytes uint64
+	// MaxSearchPayloadBytes bounds deterministic property-state and physical
+	// plan records allocated during one top-down search. Runtime map buckets,
+	// model-owned alternatives, and allocator slack are bounded indirectly by
+	// cardinality limits and are not charged here.
+	MaxSearchPayloadBytes uint64
 }
 
 func (l Limits) withDefaults() Limits {
@@ -42,14 +52,31 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxPlans == 0 {
 		l.MaxPlans = 65536
 	}
+	if l.MaxPropertyStates == 0 {
+		l.MaxPropertyStates = 65536
+	}
+	if l.MaxEnforcerSteps == 0 {
+		l.MaxEnforcerSteps = 65536
+	}
 	if l.MaxSearchDepth == 0 {
 		l.MaxSearchDepth = 1024
 	}
 	if l.MaxMemoPayloadBytes == 0 {
 		l.MaxMemoPayloadBytes = 64 << 20
 	}
+	if l.MaxSearchPayloadBytes == 0 {
+		l.MaxSearchPayloadBytes = 256 << 20
+	}
 	return l
 }
+
+type memoState uint8
+
+const (
+	memoBuilding memoState = iota
+	memoExploring
+	memoSealed
+)
 
 type memoGroup struct {
 	logical         LogicalProperties
@@ -65,7 +92,9 @@ type memoExpression struct {
 }
 
 // Memo compactly stores equivalent relational expressions. It is mutable only
-// during one optimization and is not safe for concurrent use.
+// while being built and during its single atomic rule exploration. Successful
+// exploration seals it for physical search. Memo is not safe for concurrent
+// use.
 type Memo struct {
 	limits       Limits
 	groups       []memoGroup
@@ -73,6 +102,7 @@ type Memo struct {
 	byHash       map[uint64][]ExprID
 	ruleApps     uint32
 	payloadBytes uint64
+	state        memoState
 }
 
 // MemoStatistics reports bounded optimizer state. RetainedBytes covers the
@@ -123,6 +153,9 @@ func (m *Memo) NewGroup(logical LogicalProperties) (GroupID, error) {
 	if m == nil {
 		return NoGroup, ErrInvalidMemo
 	}
+	if m.state == memoSealed {
+		return NoGroup, ErrMemoSealed
+	}
 	if uint64(len(m.groups)) >= uint64(m.limits.MaxGroups) {
 		return NoGroup, fmt.Errorf("%w: groups reached %d", ErrSearchBudget, m.limits.MaxGroups)
 	}
@@ -144,6 +177,9 @@ func (m *Memo) NewGroup(logical LogicalProperties) (GroupID, error) {
 func (m *Memo) Intern(expr Expression, logical LogicalProperties) (GroupID, ExprID, error) {
 	if m == nil {
 		return NoGroup, NoExpr, ErrInvalidMemo
+	}
+	if m.state == memoSealed {
+		return NoGroup, NoExpr, ErrMemoSealed
 	}
 	hash := expressionHash(expr)
 	for _, id := range m.byHash[hash] {
@@ -182,6 +218,9 @@ func (m *Memo) Intern(expr Expression, logical LogicalProperties) (GroupID, Expr
 func (m *Memo) Add(group GroupID, expr Expression) (id ExprID, added bool, err error) {
 	if m == nil || int(group) >= len(m.groups) || expr.Op == OpInvalid {
 		return NoExpr, false, ErrInvalidMemo
+	}
+	if m.state == memoSealed {
+		return NoExpr, false, ErrMemoSealed
 	}
 	for _, child := range expr.Children {
 		if int(child) >= len(m.groups) {
@@ -229,6 +268,39 @@ func (m *Memo) rollbackLastGroup() {
 	}
 	m.payloadBytes -= payload
 	m.groups = m.groups[:len(m.groups)-1]
+}
+
+// rollbackExploration restores the exact build-state boundary that preceded a
+// failed or canceled rule run. Rules can only append groups and expressions,
+// so rebuilding the compact links and hash directory is sufficient.
+func (m *Memo) rollbackExploration(groups, expressions int, payload uint64, ruleApps uint32) {
+	clear(m.groups[groups:])
+	clear(m.expressions[expressions:])
+	m.groups = m.groups[:groups]
+	m.expressions = m.expressions[:expressions]
+	m.payloadBytes = payload
+	m.ruleApps = ruleApps
+	m.byHash = make(map[uint64][]ExprID, expressions)
+	for i := range m.groups {
+		m.groups[i].firstExpression = NoExpr
+		m.groups[i].lastExpression = NoExpr
+		m.groups[i].expressionCount = 0
+	}
+	for i := range m.expressions {
+		id := ExprID(i)
+		record := &m.expressions[i]
+		record.next = NoExpr
+		owner := &m.groups[record.group]
+		if owner.firstExpression == NoExpr {
+			owner.firstExpression = id
+		} else {
+			m.expressions[owner.lastExpression].next = id
+		}
+		owner.lastExpression = id
+		owner.expressionCount++
+		hash := expressionHash(record.expr)
+		m.byHash[hash] = append(m.byHash[hash], id)
+	}
 }
 
 func groupPayloadBytes(logical LogicalProperties) (uint64, bool) {
