@@ -10,7 +10,7 @@ state atomically through one hidden durable system collection.
 This is deliberately not a serving or high-availability milestone. It does not
 wire shard RPCs to Raft, permit client-facing replicated SQL writes, create runtime
 snapshots, compact the Raft WAL, reserve physical system/user storage, provide
-authenticated network transport, or authorize Read Committed or Serializable
+peer authentication or network I/O, or authorize Read Committed or Serializable
 transactions across replicas. A static-WAL qualification now proves finite logical
 completion-count headroom for one exact healthy, initialized WAL/apply pair
 after checking its binding and applied/committed/log cut. It does not reserve
@@ -299,9 +299,10 @@ Before serving, later phases must add all of:
    completion GC; any runtime snapshot/compaction also requires a reconstructed
    suffix reservation ledger because the static-base proof then expires;
 3. crash-atomic runtime snapshots and WAL generation compaction;
-4. the landed bounded in-process Multi-Raft host still needs authenticated
-   ordinary-message and snapshot transport, peer flow control, and deadline/
-   slow-disk isolation;
+4. the landed bounded in-process Multi-Raft host and static post-auth ordinary
+   frame/roster boundary still need NodeID enrollment, mutually authenticated
+   network I/O, shared per-peer flow control, snapshot transport, dynamic
+   membership reconciliation, and deadline/slow-disk isolation;
 5. leader-aware routing with a fenced range proof, applied-position tokens,
    completion lookup, and `ReadIndex` reads; and
 6. a replicated SQL command grammar capable of the advertised isolation mode.

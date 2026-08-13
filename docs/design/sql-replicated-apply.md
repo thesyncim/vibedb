@@ -149,9 +149,10 @@ still needs:
    needs physical reservation, completion GC needs durable forgotten floors,
    and a compacting WAL needs a reconstructed suffix ledger;
 2. crash-atomic runtime snapshot export/install and WAL generation compaction;
-3. the landed bounded in-process Multi-Raft host still needs authenticated
-   ordinary and snapshot transport, peer flow control, and deadline/slow-disk
-   isolation;
+3. the landed bounded in-process Multi-Raft host and static post-auth ordinary
+   frame/roster boundary still need NodeID enrollment, mutually authenticated
+   network I/O, shared per-peer flow control, snapshot transport, dynamic
+   membership reconciliation, and deadline/slow-disk isolation;
 4. leadership-aware routing, retry/indeterminate result grammar, shared
    `(ShardIncarnation, GroupID, AppliedSequence)` positions, and routing proof
    for composite keys or future placement profiles;

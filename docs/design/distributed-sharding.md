@@ -1,7 +1,8 @@
 # Distributed sharding and replication
 
 **Status:** future serving design. A bounded non-serving in-process Raft member
-runtime and Multi-Raft host exist, but no network transport, client routing,
+runtime, Multi-Raft host, and static post-auth ordinary-message frame/roster
+boundary exist, but no peer authenticator, network transport, client routing,
 serving replica protocol, distributed ownership, or cross-shard guarantee is
 implemented today.
 
@@ -1885,7 +1886,8 @@ full-log behavior; and no store read-path change.
 - Bound every per-group mailbox and reserve fair heartbeat, vote, persistence,
   apply, and snapshot capacity so a hot group or catch-up stream cannot starve
   another group. Enforce maximum groups per node and per-peer flow control.
-- Implement mutually authenticated transport, batching, flow control,
+- Extend the static post-auth ordinary frame into mutually authenticated
+  network transport, batching, flow control,
   persistence-before-message ordering, ordered apply, `ReadIndex`, replicated
   completions, eventual/session reads, and snapshot transfer.
 - Add shard full/incremental backup and restore into fresh identities.

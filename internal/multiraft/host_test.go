@@ -270,6 +270,54 @@ func TestHostQueueDetachesAndRotatesInputClasses(t *testing.T) {
 	}
 }
 
+func TestHostAdoptMessageTransfersExactOwnedMessageOnlyOnSuccess(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(73)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	key := runtime.identity.Group
+	message := hostMessage(99, runtime.identity.MemberID, "owned")
+	if err := host.AdoptMessage(key, message); err != nil {
+		t.Fatal(err)
+	}
+	queued := host.groups[key].messages.items[0].message
+	if queued != message {
+		t.Fatal("AdoptMessage cloned instead of transferring the detached message")
+	}
+	if host.queueItems != 1 {
+		t.Fatalf("queue items = %d, want 1", host.queueItems)
+	}
+
+	limits := testHostLimits()
+	limits.MaxGroupItems = 1
+	limits.MaxPendingTicks = 1
+	full, err := NewHost(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := newFakeRuntime(74)
+	if err := full.addRuntime(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := full.RequestTick(other.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	rejected := hostMessage(99, other.identity.MemberID, "caller-retains")
+	if err := full.AdoptMessage(other.identity.Group, rejected); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("AdoptMessage at bound = %v, want ErrQueueFull", err)
+	}
+	if got := string(rejected.GetContext()); got != "caller-retains" {
+		t.Fatalf("rejected message changed to %q", got)
+	}
+	if full.groups[other.identity.Group].messages.len() != 0 {
+		t.Fatal("failed AdoptMessage retained caller message")
+	}
+}
+
 func TestHostIdleGroupLeavesRunnableQueue(t *testing.T) {
 	host, err := NewHost(testHostLimits())
 	if err != nil {
