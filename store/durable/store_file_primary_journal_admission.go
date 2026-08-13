@@ -61,12 +61,63 @@ type primaryJournalAdmissionTicket struct {
 // never sends it itself: the caller releases the mutex before signaling leader,
 // so channels and future writer/journal work never run under admissionMu.
 type primaryJournalAdmissionDecision struct {
-	role   primaryJournalAdmissionRole
-	ticket primaryJournalAdmissionTicket
-	leader *primaryJournalAdmissionRequest
-	stale  bool
-	closed bool
-	queued bool
+	role      primaryJournalAdmissionRole
+	ticket    primaryJournalAdmissionTicket
+	leader    *primaryJournalAdmissionRequest
+	completed primaryJournalAdmissionCompletion
+	stale     bool
+	closed    bool
+	queued    bool
+	selfBaton bool
+}
+
+// primaryJournalAdmissionCompletion owns the request pointers completed by one
+// state transition. It is returned by value, so its storage never aliases the
+// engine's batch/queue arrays and remains stable while a later phase reuses
+// them. Integration signals and releases these requests only after seal or
+// sealPressure returns.
+type primaryJournalAdmissionCompletion struct {
+	requests [primaryJournalAdmissionLimit]*primaryJournalAdmissionRequest
+	count    int
+}
+
+func (c *primaryJournalAdmissionCompletion) detached() []*primaryJournalAdmissionRequest {
+	if c == nil || c.count == 0 {
+		return nil
+	}
+	return c.requests[:c.count:c.count]
+}
+
+// primaryJournalAdmissionActive describes work that was already detached to a
+// caller when Close published the terminal phase. Close owns and detaches the
+// passive queue; this active caller continues to own its prepared pilot or
+// complete cohort and later seals the ticket only to release engine references.
+type primaryJournalAdmissionActive struct {
+	role       primaryJournalAdmissionRole
+	ticket     primaryJournalAdmissionTicket
+	leader     *primaryJournalAdmissionRequest
+	batchCount int
+	prepared   bool
+}
+
+// primaryJournalAdmissionDrain transfers request ownership out of the engine.
+// A close drain contains only passive queued requests and reports the active
+// owner separately. A terminal drain contains the complete active phase first,
+// followed by later queued arrivals; unresolvedAt identifies the first failed
+// active request. Fixed storage keeps the transition allocation-free.
+type primaryJournalAdmissionDrain struct {
+	requests     [primaryJournalAdmissionLimit]*primaryJournalAdmissionRequest
+	count        int
+	activeCount  int
+	unresolvedAt int
+	active       primaryJournalAdmissionActive
+}
+
+func (d *primaryJournalAdmissionDrain) detached() []*primaryJournalAdmissionRequest {
+	if d == nil || d.count == 0 {
+		return nil
+	}
+	return d.requests[:d.count:d.count]
 }
 
 // primaryJournalAdmission is a bounded caller-driven admission state machine.
@@ -92,6 +143,8 @@ type primaryJournalAdmission struct {
 	// context. The initial literal-baseline pilot owns none. Counting it keeps
 	// batch + queue + promoted pilot within the future context-pool bound.
 	preparedPilot bool
+	activeLeader  *primaryJournalAdmissionRequest
+	activeRole    primaryJournalAdmissionRole
 }
 
 func packPrimaryJournalAdmissionWord(
@@ -135,7 +188,9 @@ func (a *primaryJournalAdmission) tryStartInitialPilot() (
 	if a.phase != primaryJournalAdmissionIdle {
 		return primaryJournalAdmissionTicket{}, false
 	}
-	return a.openLocked(primaryJournalAdmissionBaselineRole), true
+	return a.openLocked(
+		primaryJournalAdmissionBaselineRole, nil, false,
+	), true
 }
 
 // admitPrepared binds a prepared follower to the current phase. The observation
@@ -158,8 +213,9 @@ func (a *primaryJournalAdmission) admitPrepared(
 	case primaryJournalAdmissionClosed:
 		return primaryJournalAdmissionDecision{stale: stale, closed: true}
 	case primaryJournalAdmissionIdle:
-		ticket := a.openLocked(primaryJournalAdmissionBaselineRole)
-		a.preparedPilot = true
+		ticket := a.openLocked(
+			primaryJournalAdmissionBaselineRole, request, true,
+		)
 		return primaryJournalAdmissionDecision{
 			role: primaryJournalAdmissionBaselineRole, ticket: ticket,
 			leader: request, stale: stale,
@@ -195,21 +251,32 @@ func (a *primaryJournalAdmission) seal(
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.phase == primaryJournalAdmissionClosed &&
+		a.ticketOwnsActiveLocked(ticket) {
+		completion := a.completeActiveLocked(ticket)
+		a.clearActiveLocked()
+		return primaryJournalAdmissionDecision{
+			completed: completion, closed: true,
+		}, true
+	}
 	if !a.ticketOwnsCurrentLocked(ticket) {
 		return primaryJournalAdmissionDecision{}, false
 	}
-	if ticket.role == primaryJournalAdmissionCohortRole {
-		a.clearBatchLocked()
-	} else {
-		a.preparedPilot = false
-	}
-	return a.selectNextLocked(false), true
+	completion := a.completeActiveLocked(ticket)
+	decision := a.selectNextLocked(false, false)
+	decision.completed = completion
+	return decision, true
 }
 
 // sealPressure completes a cohort after a successful prefix and moves the
 // untouched suffix ahead of every arrival accumulated during publication. Its
 // first member is forced through the established baseline path; the remaining
 // suffix stays ahead of later arrivals while that pilot resolves pressure.
+//
+// Integration must call sealPressure BEFORE signaling or releasing successful
+// prefix contexts. Until this transition completes, batchCount deliberately
+// accounts for every context owned by the phase; releasing one early could let
+// a new claimant make the conservative ownership sum appear over capacity.
 func (a *primaryJournalAdmission) sealPressure(
 	ticket primaryJournalAdmissionTicket, suffixAt int,
 ) (primaryJournalAdmissionDecision, bool) {
@@ -228,6 +295,9 @@ func (a *primaryJournalAdmission) sealPressure(
 	if suffixCount+a.count > len(a.queue) {
 		panic("vibedb: recovery-journal admission ownership exceeds bound")
 	}
+	var completion primaryJournalAdmissionCompletion
+	copy(completion.requests[:suffixAt], a.batch[:suffixAt])
+	completion.count = suffixAt
 	copy(
 		a.queue[suffixCount:suffixCount+a.count],
 		a.queue[:a.count],
@@ -235,7 +305,10 @@ func (a *primaryJournalAdmission) sealPressure(
 	copy(a.queue[:suffixCount], a.batch[suffixAt:a.batchCount])
 	a.count += suffixCount
 	a.clearBatchLocked()
-	return a.selectNextLocked(true), true
+	a.clearActiveLocked()
+	decision := a.selectNextLocked(true, suffixAt == 0)
+	decision.completed = completion
+	return decision, true
 }
 
 // cohortBatch returns the immutable snapshot for the current cohort leader.
@@ -249,7 +322,7 @@ func (a *primaryJournalAdmission) cohortBatch(
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.ticketOwnsCurrentLocked(ticket) ||
+	if !a.ticketOwnsActiveLocked(ticket) ||
 		ticket.role != primaryJournalAdmissionCohortRole ||
 		a.batchCount < 2 {
 		return nil, false
@@ -257,8 +330,100 @@ func (a *primaryJournalAdmission) cohortBatch(
 	return a.batch[:a.batchCount:a.batchCount], true
 }
 
+// closeAndDrain atomically rejects future admission and detaches every passive
+// queued request for signaling after mu is released. Work already detached to
+// a baseline pilot or cohort remains owned by that caller; active reports the
+// exact ticket and request population. That caller must finish its established
+// result path and call seal, which observes Closed and only clears references --
+// it can never select a later baton.
+func (a *primaryJournalAdmission) closeAndDrain() primaryJournalAdmissionDrain {
+	var drain primaryJournalAdmissionDrain
+	if a == nil {
+		return drain
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.phase == primaryJournalAdmissionClosed {
+		return drain
+	}
+
+	if a.activeRole != primaryJournalAdmissionNoRole {
+		drain.active = primaryJournalAdmissionActive{
+			role: a.activeRole,
+			ticket: primaryJournalAdmissionTicket{
+				role: a.activeRole, epoch: a.epoch,
+			},
+			leader: a.activeLeader, batchCount: a.batchCount,
+			prepared: a.preparedPilot,
+		}
+	}
+	copy(drain.requests[:a.count], a.queue[:a.count])
+	drain.count = a.count
+	clear(a.queue[:a.count])
+	a.count = 0
+	a.phase = primaryJournalAdmissionClosed
+	a.word.Store(packPrimaryJournalAdmissionWord(a.phase, a.epoch))
+	return drain
+}
+
+// terminateAndDrain is the poison transition owned by the current caller. It
+// publishes Closed and transfers the complete active phase plus every later
+// arrival into one fixed drain. Unlike seal, it never chooses or signals a
+// baton. For a cohort, unresolvedAt is the first request whose terminal result
+// applies; earlier active entries are the already-published prefix. A baseline
+// caller passes zero. The caller itself carries any returned self request.
+func (a *primaryJournalAdmission) terminateAndDrain(
+	ticket primaryJournalAdmissionTicket, unresolvedAt int,
+) (primaryJournalAdmissionDrain, bool) {
+	var drain primaryJournalAdmissionDrain
+	if a == nil {
+		return drain, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.ticketOwnsActiveLocked(ticket) {
+		return drain, false
+	}
+
+	switch ticket.role {
+	case primaryJournalAdmissionBaselineRole:
+		if unresolvedAt != 0 {
+			return drain, false
+		}
+		if a.activeLeader != nil {
+			drain.requests[drain.count] = a.activeLeader
+			drain.count++
+			drain.activeCount = 1
+		}
+	case primaryJournalAdmissionCohortRole:
+		if unresolvedAt < 0 || unresolvedAt >= a.batchCount {
+			return drain, false
+		}
+		copy(drain.requests[:a.batchCount], a.batch[:a.batchCount])
+		drain.count = a.batchCount
+		drain.activeCount = a.batchCount
+		drain.unresolvedAt = unresolvedAt
+	default:
+		return drain, false
+	}
+	if drain.count+a.count > len(drain.requests) {
+		panic("vibedb: recovery-journal admission ownership exceeds bound")
+	}
+	copy(drain.requests[drain.count:drain.count+a.count], a.queue[:a.count])
+	drain.count += a.count
+	clear(a.queue[:a.count])
+	a.count = 0
+	a.clearBatchLocked()
+	a.clearActiveLocked()
+	a.phase = primaryJournalAdmissionClosed
+	a.word.Store(packPrimaryJournalAdmissionWord(a.phase, a.epoch))
+	return drain, true
+}
+
 func (a *primaryJournalAdmission) openLocked(
 	role primaryJournalAdmissionRole,
+	leader *primaryJournalAdmissionRequest,
+	prepared bool,
 ) primaryJournalAdmissionTicket {
 	if a.epoch == ^uint64(0)>>primaryJournalAdmissionPhaseBits {
 		panic("vibedb: recovery-journal admission epoch exhausted")
@@ -267,18 +432,35 @@ func (a *primaryJournalAdmission) openLocked(
 	switch role {
 	case primaryJournalAdmissionBaselineRole:
 		a.phase = primaryJournalAdmissionBaselinePilot
+		if prepared != (leader != nil) {
+			panic("vibedb: invalid prepared recovery-journal pilot")
+		}
 	case primaryJournalAdmissionCohortRole:
 		a.phase = primaryJournalAdmissionCohort
+		if leader == nil || !prepared {
+			panic("vibedb: invalid recovery-journal cohort leader")
+		}
 	default:
 		panic("vibedb: invalid recovery-journal admission role")
 	}
+	a.activeRole = role
+	a.activeLeader = leader
+	a.preparedPilot = role == primaryJournalAdmissionBaselineRole && prepared
 	a.word.Store(packPrimaryJournalAdmissionWord(a.phase, a.epoch))
 	return primaryJournalAdmissionTicket{role: role, epoch: a.epoch}
 }
 
 func (a *primaryJournalAdmission) setIdleLocked() {
+	a.clearActiveLocked()
 	a.phase = primaryJournalAdmissionIdle
 	a.word.Store(packPrimaryJournalAdmissionWord(a.phase, a.epoch))
+}
+
+func (a *primaryJournalAdmission) ticketOwnsActiveLocked(
+	ticket primaryJournalAdmissionTicket,
+) bool {
+	return ticket.epoch == a.epoch && ticket.role == a.activeRole &&
+		ticket.role != primaryJournalAdmissionNoRole
 }
 
 func (a *primaryJournalAdmission) ticketOwnsCurrentLocked(
@@ -287,14 +469,15 @@ func (a *primaryJournalAdmission) ticketOwnsCurrentLocked(
 	if ticket.epoch != a.epoch {
 		return false
 	}
-	return ticket.role == primaryJournalAdmissionBaselineRole &&
-		a.phase == primaryJournalAdmissionBaselinePilot ||
-		ticket.role == primaryJournalAdmissionCohortRole &&
-			a.phase == primaryJournalAdmissionCohort
+	return a.ticketOwnsActiveLocked(ticket) &&
+		(ticket.role == primaryJournalAdmissionBaselineRole &&
+			a.phase == primaryJournalAdmissionBaselinePilot ||
+			ticket.role == primaryJournalAdmissionCohortRole &&
+				a.phase == primaryJournalAdmissionCohort)
 }
 
 func (a *primaryJournalAdmission) selectNextLocked(
-	forceBaseline bool,
+	forceBaseline, selfBaton bool,
 ) primaryJournalAdmissionDecision {
 	if a.count == 0 {
 		a.setIdleLocked()
@@ -305,11 +488,12 @@ func (a *primaryJournalAdmission) selectNextLocked(
 		copy(a.queue[:a.count-1], a.queue[1:a.count])
 		a.count--
 		a.queue[a.count] = nil
-		a.preparedPilot = true
-		ticket := a.openLocked(primaryJournalAdmissionBaselineRole)
+		ticket := a.openLocked(
+			primaryJournalAdmissionBaselineRole, leader, true,
+		)
 		return primaryJournalAdmissionDecision{
 			role:   primaryJournalAdmissionBaselineRole,
-			ticket: ticket, leader: leader,
+			ticket: ticket, leader: leader, selfBaton: selfBaton,
 		}
 	}
 
@@ -320,7 +504,9 @@ func (a *primaryJournalAdmission) selectNextLocked(
 	a.batchCount = a.count
 	clear(a.queue[:a.count])
 	a.count = 0
-	ticket := a.openLocked(primaryJournalAdmissionCohortRole)
+	ticket := a.openLocked(
+		primaryJournalAdmissionCohortRole, a.batch[0], true,
+	)
 	return primaryJournalAdmissionDecision{
 		role:   primaryJournalAdmissionCohortRole,
 		ticket: ticket, leader: a.batch[0],
@@ -330,4 +516,29 @@ func (a *primaryJournalAdmission) selectNextLocked(
 func (a *primaryJournalAdmission) clearBatchLocked() {
 	clear(a.batch[:a.batchCount])
 	a.batchCount = 0
+}
+
+func (a *primaryJournalAdmission) completeActiveLocked(
+	ticket primaryJournalAdmissionTicket,
+) primaryJournalAdmissionCompletion {
+	var completion primaryJournalAdmissionCompletion
+	switch ticket.role {
+	case primaryJournalAdmissionBaselineRole:
+		if a.preparedPilot && a.activeLeader != nil {
+			completion.requests[0] = a.activeLeader
+			completion.count = 1
+		}
+	case primaryJournalAdmissionCohortRole:
+		copy(completion.requests[:a.batchCount], a.batch[:a.batchCount])
+		completion.count = a.batchCount
+		a.clearBatchLocked()
+	}
+	a.clearActiveLocked()
+	return completion
+}
+
+func (a *primaryJournalAdmission) clearActiveLocked() {
+	a.activeLeader = nil
+	a.activeRole = primaryJournalAdmissionNoRole
+	a.preparedPilot = false
 }
