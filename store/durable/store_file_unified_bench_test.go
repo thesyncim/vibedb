@@ -66,8 +66,12 @@ func unifiedBenchStoreWith(
 		tb.Fatalf("Open: %v", err)
 	}
 	tb.Cleanup(func() {
-		_ = collection.Close()
-		_ = reopened.Close()
+		if err := collection.Close(); err != nil {
+			tb.Errorf("close benchmark collection: %v", err)
+		}
+		if err := reopened.Close(); err != nil {
+			tb.Errorf("close benchmark file: %v", err)
+		}
 	})
 	return collection
 }
