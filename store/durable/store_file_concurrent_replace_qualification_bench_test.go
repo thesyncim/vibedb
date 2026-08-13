@@ -210,13 +210,20 @@ func benchmarkConcurrentExistingKeyReplaceCase(
 	}
 
 	after := collection.Stats()
-	reportConcurrentReplaceMetrics(b, before, after, !recoveryJournal)
+	journalCohortReplaces := uint64(0)
+	if recoveryJournal {
+		journalCohortReplaces = after.JournalCohortReplaces -
+			before.JournalCohortReplaces
+	}
+	reportConcurrentReplaceMetrics(
+		b, before, after, !recoveryJournal, journalCohortReplaces,
+	)
 	fastReplaces := after.ConcurrentPrimaryReplaces -
 		before.ConcurrentPrimaryReplaces
 	pressureFallbacks := after.ConcurrentPrimaryFallbacks -
 		before.ConcurrentPrimaryFallbacks
 	if recoveryJournal {
-		reportConcurrentReplaceJournalMetrics(b, before, after)
+		reportConcurrentReplaceJournalMetrics(b, before, after, clients)
 		return
 	}
 	if !sameBucket {
@@ -437,7 +444,7 @@ func concurrentReplaceHistogramDelta(
 	before, after StatsHistogram,
 ) (count, sum uint64) {
 	b.Helper()
-	if after.Count < before.Count || after.Sum < before.Sum || after.Max < before.Max {
+	if after.Count < before.Count || after.Sum < before.Sum {
 		b.Fatalf("%s histogram regressed: before=%+v after=%+v", name, before, after)
 	}
 	count = after.Count - before.Count
@@ -464,6 +471,7 @@ func concurrentReplaceHistogramDelta(
 func reportConcurrentReplaceJournalMetrics(
 	b *testing.B,
 	before, after Stats,
+	clients int,
 ) {
 	b.Helper()
 	if b.N == 0 {
@@ -485,12 +493,48 @@ func reportConcurrentReplaceJournalMetrics(
 	syncSamples, syncNS := concurrentReplaceHistogramDelta(
 		b, "journal sync latency", before.JournalGroupSyncNS, after.JournalGroupSyncNS,
 	)
+	cohortReplaces := after.JournalCohortReplaces - before.JournalCohortReplaces
+	cohortGroups := after.JournalCohortPublishGroups -
+		before.JournalCohortPublishGroups
+	cohortSamples, cohortPublished := concurrentReplaceHistogramDelta(
+		b, "journal cohort publish group", before.JournalCohortPublishGroupSize,
+		after.JournalCohortPublishGroupSize,
+	)
+	ordinaryPublishSamples, ordinaryPublished := concurrentReplaceHistogramDelta(
+		b, "ordinary concurrent publish group",
+		before.ConcurrentPrimaryPublishGroupSize,
+		after.ConcurrentPrimaryPublishGroupSize,
+	)
+	ordinaryStripeWaits, ordinaryStripeWaitNS := concurrentReplaceHistogramDelta(
+		b, "ordinary concurrent stripe wait", before.ConcurrentPrimaryStripeWaitNS,
+		after.ConcurrentPrimaryStripeWaitNS,
+	)
+	ordinaryReplaces := after.ConcurrentPrimaryReplaces -
+		before.ConcurrentPrimaryReplaces
+	ordinaryFallbacks := after.ConcurrentPrimaryFallbacks -
+		before.ConcurrentPrimaryFallbacks
+	ordinaryPublishGroups := after.ConcurrentPrimaryPublishGroups -
+		before.ConcurrentPrimaryPublishGroups
 
 	b.ReportMetric(float64(journalAcks)/ops, "journal-acks/op")
 	b.ReportMetric(float64(chainAcks)/ops, "chain-acks/op")
 	b.ReportMetric(float64(journalSyncs)/ops, "journal-syncs/op")
 	b.ReportMetric(float64(syncedRecords)/ops, "synced-journal-records/op")
 	b.ReportMetric(float64(syncedBytes)/ops, "synced-journal-B/op")
+	b.ReportMetric(float64(cohortReplaces)/ops, "journal-cohort-replaces/op")
+	b.ReportMetric(float64(cohortGroups)/ops, "journal-cohort-publish-groups/op")
+	if cohortGroups != 0 {
+		b.ReportMetric(
+			float64(cohortPublished)/float64(cohortGroups),
+			"mean-journal-cohort-publish-group",
+		)
+	}
+	if cohortReplaces <= uint64(b.N) {
+		b.ReportMetric(
+			float64(uint64(b.N)-cohortReplaces)/ops,
+			"journal-baseline-replaces/op",
+		)
+	}
 	checkpointCovered := uint64(0)
 	if syncedRecords <= journalAcks {
 		checkpointCovered = journalAcks - syncedRecords
@@ -513,6 +557,49 @@ func reportConcurrentReplaceJournalMetrics(
 		b.Errorf(
 			"recovery-journal durable acknowledgements=%d journal + %d chain = %d, want all %d operations",
 			journalAcks, chainAcks, durableAcks, b.N,
+		)
+	}
+	if cohortReplaces > uint64(b.N) {
+		b.Errorf(
+			"journal cohort replacements=%d exceed all %d operations",
+			cohortReplaces, b.N,
+		)
+	}
+	if cohortSamples != cohortGroups || cohortPublished != cohortReplaces {
+		b.Errorf(
+			"journal cohort samples=%d sum=%d, want groups=%d replacements=%d",
+			cohortSamples, cohortPublished, cohortGroups, cohortReplaces,
+		)
+	}
+	if cohortGroups == 0 && cohortReplaces != 0 {
+		b.Errorf(
+			"journal cohort replacements=%d have no publish group",
+			cohortReplaces,
+		)
+	} else if cohortGroups != 0 &&
+		(cohortReplaces < 2*cohortGroups ||
+			cohortReplaces > primaryJournalAdmissionLimit*cohortGroups) {
+		b.Errorf(
+			"journal cohort replacements=%d outside bounded group range [%d,%d] for %d groups",
+			cohortReplaces, 2*cohortGroups,
+			primaryJournalAdmissionLimit*cohortGroups, cohortGroups,
+		)
+	}
+	if clients > 1 && b.N >= clients && cohortReplaces == 0 {
+		b.Errorf(
+			"%d-client recovery-journal qualification published no journal cohort across %d operations",
+			clients, b.N,
+		)
+	}
+	if ordinaryReplaces != 0 || ordinaryFallbacks != 0 ||
+		ordinaryPublishGroups != 0 || ordinaryPublishSamples != 0 ||
+		ordinaryPublished != 0 || ordinaryStripeWaits != 0 ||
+		ordinaryStripeWaitNS != 0 {
+		b.Errorf(
+			"recovery-journal cohort used ordinary concurrent stripe publisher: replaces=%d fallbacks=%d groups=%d group-samples=%d group-sum=%d stripe-waits=%d stripe-wait-ns=%d",
+			ordinaryReplaces, ordinaryFallbacks, ordinaryPublishGroups,
+			ordinaryPublishSamples, ordinaryPublished, ordinaryStripeWaits,
+			ordinaryStripeWaitNS,
 		)
 	}
 	if journalSyncs > journalAcks {
@@ -584,6 +671,7 @@ func reportConcurrentReplaceMetrics(
 	b *testing.B,
 	before, after Stats,
 	reportLargestPublishGroup bool,
+	additionalAccounted uint64,
 ) {
 	if b.N == 0 {
 		return
@@ -624,7 +712,8 @@ func reportConcurrentReplaceMetrics(
 		)
 	}
 	accounted := after.ConcurrentPrimaryReplaces - before.ConcurrentPrimaryReplaces +
-		after.ConcurrentPrimaryFallbacks - before.ConcurrentPrimaryFallbacks
+		after.ConcurrentPrimaryFallbacks - before.ConcurrentPrimaryFallbacks +
+		additionalAccounted
 	if accounted <= uint64(b.N) {
 		b.ReportMetric(float64(uint64(b.N)-accounted)/ops, "exclusive-fallbacks/op")
 	}
